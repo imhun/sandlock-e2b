@@ -76,6 +76,13 @@ fork 分支 `feature/network-netns`（基于 feature/network-wildcard）：
    root 环境性失败）、integration 430 passed（1 既有 root 环境性失败）、
    wheel 可构建、Python `Sandbox(netns=True, net_allow=["*.example.com:443"])`
    可用。
+8. **并行安全（fork 8709846）**：`WorkerLocalHost` 改为每实例独立
+   `198.18.0.x` 地址（首个空闲，进程级互斥锁保护地址与 `/etc/hosts`
+   读写，Drop 只删自己的行/地址），三个本地服务器用例绑定实例地址。
+   netns 套件在**默认并行**下 5/5 通过（0.2s），不再需要
+   `--test-threads=1`。注意：既有 `test_control` 族在并行下随机互踩
+   （每次失败成员不同、单独跑都过），与 netns 无关；并行全量基线
+   429+2（control 随机 + txn root 环境性），串行基线 430+1。
 
 环境注意：`sandlock-dev:latest` 已加 iproute2；集成测试需
 `--privileged --network host`；e2e 连接用例临时改容器 resolv.conf 为
