@@ -57,7 +57,15 @@ python:                  430 passed, 0 skipped
 
 - The DNS gateway binds a per-sandbox `127.0.1.x` loopback port — no root
   network privileges; each sandbox gets its own address because resolv.conf
-  cannot carry a port.
+  cannot carry a port. The one deployment knob: glibc's resolv.conf cannot
+  express a port, so the gateway uses the standard DNS port 53, which is
+  below 1024. The platform must either allow unprivileged low-port binding
+  once (`sysctl net.ipv4.ip_unprivileged_port_start=0`, or
+  `CAP_NET_BIND_SERVICE` on the sandlock binary) or run the supervisor with
+  that capability — after that one-time setting the whole product runs as a
+  normal unprivileged user (verified: Landlock/seccomp sandbox, HTTP ACL
+  proxy, virtual chroot, and the wildcard DNS+connect path all work as
+  uid 65534).
 - The netlink view adds one fixed documentation-only interface (`192.0.2.1`,
   RFC 5737) so `getaddrinfo`/`AI_ADDRCONFIG` performs DNS; the address is
   unreachable and leaks nothing.
