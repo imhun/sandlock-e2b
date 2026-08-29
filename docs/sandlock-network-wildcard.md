@@ -1,20 +1,28 @@
-# sandlock 扩展方案：网络规则域名通配符（与 E2B 标准一致）
+# sandlock 扩展方案：E2B Network API 能力对齐总纲
 
 > 状态：提案。目标版本基线：sandlock 0.8.6（main 分支 2026-08-23，含
 > credential injection 但未发版）。
 
 ## 1. 背景与目标
 
-E2B 官方 `network.allowOut` 把 `*.example.com` 列为合法条目，且**与是否配置
-`egressProxy` 无关**——官方平台的所有出站流量都经过统一的域名规则引擎。
+E2B 官方 Network API 有三块能力本项目尚未与标准对齐，它们都依赖 sandlock
+层能力：
 
-本项目当前：
+- **Block A — 域名通配符**：`allowOut` 的 `*.example.com` 是官方合法条目，
+  与是否配置 `egressProxy` 无关；
+- **Block B — HTTP(S) header 注入 / 改写**：`rules[domain].transform.headers`
+  与 `maskRequestHost`；
+- **Block C — egressProxy on-behalf 完整化**：SOCKS5 隧道由 sandlock
+  on-behalf 路径执行（替代 LD_PRELOAD，覆盖静态/Go 应用与 IPv6）。
 
-- `egressProxy` 模式：通配域名已支持（LD_PRELOAD 库内 `*.suffix` 过滤）；
-- 普通模式：显式 400（sandlock `net_allow` 无法表达后缀通配）。
+现状：
 
-目标：**普通模式也支持 `*.example.com`，且不降低安全模型**（保持 sandlock
-内核级强制，沙箱 unaware、静态/Go 应用同样受限），与 E2B 标准一致。
+- 通配域名：egressProxy 模式已支持（LD_PRELOAD 库内过滤）；普通模式 400；
+- headers/maskRequestHost：API 层显式 400（依赖 B2 能力）；
+- egressProxy：LD_PRELOAD 实现，仅 IPv4、仅动态链接应用。
+
+目标：三块能力都由 sandlock 内核/on-behalf 层执行，不降低安全模型（沙箱
+unaware、静态/Go 应用同样受限），与 E2B 标准一致。
 
 ## 2. 为什么必须改 sandlock（不能走 LD_PRELOAD）
 
@@ -27,7 +35,7 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 - 沙箱内可检测并规避（`LD_PRELOAD` 可被清空、`dlsym(RTLD_NEXT)` 可被绕开）；
 - 违反 E2B "sandbox unaware / 平台强制" 语义。
 
-因此通配域名规则必须下沉到 sandlock 的 on-behalf 路径。
+因此这些规则必须下沉到 sandlock 的 on-behalf / transparent-proxy 路径。
 
 ## 3. 现状：sandlock 0.8.6 网络模型（源码依据）
 
@@ -45,7 +53,7 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 `*.example.com`，必须让 supervisor 在**连接时**知道目标 hostname 并做后缀
 匹配。
 
-## 4. 需求点（编号 + 验收）
+## 4. 需求点（Block A：域名通配符）
 
 ### R1 — 规则语法：`net_allow` 接受通配域名
 
@@ -110,7 +118,68 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 - 单机与多节点（共享 workspace、迁移、Redis）回归全绿；
 - 动态更新（`PUT /sandboxes/{id}/network`）下一条命令生效。
 
-## 5. 技术方案（逐文件改动）
+## 4B. 需求点（Block B：HTTP(S) header 注入 / 改写）
+
+### R8 — 暴露 credential injection（ffi + Python）
+
+- 上游 Rust 层已有 `credential.rs`（`InjectRule { name, matcher: HttpRule,
+  auth: AuthShape, secret: SecretString, on_existing }`）与
+  `transparent_proxy/service.rs` 的注入执行，但 **ffi / Python 未暴露**：
+  - `sandlock-ffi/src/lib.rs` 新增 inject-rule builder（沿用现有
+    `http_*` builder 模式）；
+  - `python/src/sandlock/sandbox.py` 新增 `http_inject` 参数
+    （`list[dict]`：matcher / auth shape / secret 源 / on_existing）。
+- 映射 E2B `rules[domain].transform.headers`：matcher=域名，auth shape=
+  header 名，secret 源=`env:`/`file:`（对应 E2B IAM 占位符
+  `${e2b.identity.tokens.*}` → 平台注入 env 或文件后引用）。
+- 验收：沙箱对注册域名的请求携带注入 header；明文 HTTP 触发一次性告警；
+  secret 不出沙箱（`SecretString` 零化语义保持）；denied 请求不触达 secret。
+
+### R9 — HTTPS MITM 复用
+
+- 复用现有 `http_ca` / `http_key` / `http_inject_ca`（0.8.6 已有）：
+  注入执行发生在 MITM 代理内，HTTPS 走 CA 注入 + per-SNI 证书。
+- 验收：HTTPS 请求 header 注入生效，沙箱信任链含代理 CA。
+
+### R10 — maskRequestHost（host 掩码）
+
+- 上游无对应物：`transparent_proxy/service.rs` 转发前改写请求
+  authority / `Host`（`*.example.com` → 掩码 host）。
+- 验收：匹配域名的请求 `Host` 被改写为目标掩码，上游收到掩码 host。
+
+### R11 — HTTP ACL 域名通配（与 R5 合并的正式化）
+
+- `http_allow` / `http_deny` 的 host 位置支持 `*.suffix`（当前仅字面或
+  `*`）；为 R8 的 matcher 提供通配能力。
+- 验收：`http_allow=["GET *.example.com/*"]` 放行子域、拒绝裸域。
+
+## 4C. 需求点（Block C：egressProxy on-behalf 完整化）
+
+### R12 — `ConnectPlan` 增加 SOCKS5 上游分支
+
+- `network/connect.rs` 的 `ConnectPlan` 增加 `Socks5Upstream`：
+  - allow/deny 过滤通过后，TCP 目标改为用户代理地址；
+  - 域名目标用 SOCKS5 `ATYP=domain`（远程 DNS），IP 目标用
+    `ATYP=IPv4/IPv6`；
+  - RFC 1929 认证（username/password）；
+  - UDP/ICMP 不隧道（与 E2B 语义一致）。
+- 验收：python/node/静态二进制（不走 libc getaddrinfo 的直连）都经代理；
+  代理收到 `ATYP=domain`；UDP 直出。
+
+### R13 — fail closed 与地址校验
+
+- 代理不可达 / 握手失败 / 非 SOCKS5 → `ECONNREFUSED`（绝不回退直连）；
+- 创建前校验代理地址（控制面已有：公网 IPv4；扩展支持 IPv6 时同步
+  校验规则）。
+- 验收：代理宕机时沙箱出站失败；内网代理创建被拒。
+
+### R14 — LD_PRELOAD 库退役策略
+
+- on-behalf SOCKS5 落地后，LD_PRELOAD 库（`envd_service/egress/`）退役或
+  保留为"沙箱外兜底"（二选一，默认退役）；
+- 退役后普通模式/egressProxy 模式的过滤统一由 sandlock 执行。
+
+## 5. 技术方案（Block A：逐文件改动）
 
 ### 5.1 `network/rules.rs` — 规则解析
 
@@ -161,6 +230,48 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
   仅保留给 egressProxy 模式。
 - 测试：`tests/security/test_network_enforcement.py` 新增通配用例
   （`*.example.com` 子域成功 / 裸域拒绝 / 静态直连 IP 不可绕过）。
+
+## 5B. 技术方案（Block B：header 注入 / 改写）
+
+### 5B.1 `sandlock-ffi/src/lib.rs` — 暴露 inject rule
+
+- 参照现有 `sandlock_sandbox_builder_http_*` builder，新增
+  `sandlock_sandbox_builder_http_inject_rule(builder, matcher, auth_shape,
+  secret_source, on_existing)`；`_sdk.rs` 增加对应 `_b_http_inject`。
+
+### 5B.2 `python/src/sandlock/` — 参数与序列化
+
+- `sandbox.py` 新增 `http_inject: Sequence[Mapping]`（字段校验 + 默认空）；
+- `_sdk.py` / `_profile.py` 序列化规则（JSON 表达 matcher/auth/secret 源）。
+
+### 5B.3 `transparent_proxy/` — maskRequestHost 与通配 matcher
+
+- `service.rs`：转发前改写 authority/Host（新增 `host_mask` 配置）；
+- `mod.rs` / `service.rs`：`HttpRule` host 匹配支持 `*.suffix`
+  （R11）；注入执行已就绪（R8 只差配置暴露）。
+
+### 5B.4 本项目接入
+
+- `gateway_common/network.py`：`rules[domain].transform.headers` 与
+  `maskRequestHost` 从"400 拒绝"改为映射到 `http_inject` / `host_mask`；
+  IAM 占位符解析（平台注入 secret env/file）。
+- `SandlockExecutor`：`http_inject` / `host_mask` 透传；CA 注入复用现有
+  每沙箱信任副本逻辑。
+
+## 5C. 技术方案（Block C：egressProxy on-behalf）
+
+### 5C.1 `network/connect.rs` + `verdict.rs` — SOCKS5 分支
+
+- `ConnectPlan::Socks5Upstream { proxy, creds, dest: DomainOrIp }`；
+- 过滤（Block A 的 hostname 判定）通过后执行：先 real connect 代理
+  （net_allow 放行代理端点），再 SOCKS5 握手（RFC 1928/1929），域名目标
+  ATYP=domain；全部失败 → `ECONNREFUSED`。
+- 代理地址在 supervisor 侧解析（支持 hostname/IPv4/IPv6）。
+
+### 5C.2 配置透传
+
+- `sandbox.py` 新增 `egress_proxy` 参数（address/user/pass）；ffi 新增
+  builder；`SandlockExecutor` 普通模式也把过滤统一交给 sandlock。
 
 ## 6. 需要维护的所有部分
 
@@ -230,6 +341,24 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 - 上游合入并发版后：切回官方 wheel，fork 分支归档；回切前跑同一测试矩阵
   确认行为一致。
 
+### 6.9 Secret 管理（Block B 新增）
+
+- `SecretString` 的 `env:/file:/fd:` 源选择：E2B IAM 占位符由平台解析并
+  注入 worker 环境/文件，sandlock 只持有引用；
+- 不得把明文 secret 写入沙箱可见文件/环境（只经 supervisor 渲染到出站
+  请求）；`literal:` 源保持拒绝；
+- 轮换：更新 `network.rules` 时替换 secret 引用（env 文件更新后重建
+  runtime context）。
+
+### 6.10 与 LD_PRELOAD egress 库的并存/退役
+
+- Block C 落地前：两套过滤并存（sandlock 普通模式 / LD_PRELOAD 代理模式），
+  需各自回归；
+- Block C 落地后（R14）：LD_PRELOAD 库退役，删除 `envd_service/egress/`
+  相关代码与镜像内 `/opt/egress/libegress_proxy.so`，`Dockerfile.envd`
+  的 builder 阶段移除（镜像更小）；
+- 退役前跑一次双实现行为一致性对照（同一规则集）。
+
 ## 7. 里程碑
 
 | 阶段 | 内容 | 产出 |
@@ -237,15 +366,18 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 | M0 | fork + Rust 工具链 + 复现官方 wheel 构建（x86_64） | 可构建的 fork 基线 |
 | M1 | R1+R2：规则解析 + DNS 合成 + 映射表 + 单元测试 | `net_allow=["*.example.com:443"]` 可解析、沙箱内返回合成 IP |
 | M2 | R3+R4：connect 反查/匹配/实时解析代连 + 防绕过 | 通配子域可连、裸域/直连合成 IP 拒绝 |
-| M3 | R5（可选）+ 项目接入（R6）+ 文档 | 普通模式 API 放开、SDK 级用例通过 |
-| M4 | wheel 矩阵（cp310-314 × x86_64/aarch64）+ Dockerfile 切源 | 可发布、可部署 |
-| M5 | 全量回归（双架构）+ 上游 PR | 与官方对齐、可回切 |
+| M3 | R6：项目接入（普通模式通配放开）+ SDK 用例 | 普通模式 API 放开 |
+| M4 | Block B：ffi/Python 暴露 inject + maskRequestHost + http 通配（R8-R11） | header 注入与 host 掩码可用 |
+| M5 | Block C：SOCKS5 on-behalf 分支（R12-R14） | egressProxy 完整化、LD_PRELOAD 退役 |
+| M6 | wheel 矩阵（cp310-314 × x86_64/aarch64）+ Dockerfile 切源 | 可发布、可部署 |
+| M7 | 全量回归（双架构）+ 上游 PR（按 Block 拆分提交） | 与官方对齐、可回切 |
 
 ## 8. 备选与渐进路径
 
 - **短期**：维持"egressProxy 模式支持通配、普通模式 400"现状（README 已
   标注差异），不阻塞现有功能；
-- **中期**：若不想动 Rust，可把通配域名规则收敛为"HTTP 层规则"
-  （`rules`/`http_allow` 通配），但 TCP/非 HTTP 协议仍无法覆盖，不是完整
-  一致；
-- **长期**（本方案）：sandlock on-behalf 域名规则引擎，完整对齐 E2B。
+- **中期（部分一致）**：Block B 优先于 A/C——header 注入靠上游 credential
+  injection（Rust 已就绪，只需 ffi/Python 暴露），通配域名继续走
+  egressProxy；
+- **长期（本方案）**：sandlock on-behalf 域名规则引擎 + SOCKS5 分支 +
+  inject 暴露，完整对齐 E2B。
