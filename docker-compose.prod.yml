@@ -91,6 +91,9 @@ services:
       # Per-sandbox network policies (allowOut/denyOut/egressProxy) are only
       # enforced when the platform switch is on.
       E2B_ENABLE_NETWORK: "true"
+      # Per-sandbox netns (fork sandlock): loopback isolation + wildcard
+      # allowOut. Requires NET_ADMIN + net.ipv4.ip_forward (below).
+      E2B_ENABLE_NETNS: ${E2B_ENABLE_NETNS:-true}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.11-slim}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_IMAGE_REGISTRY_USERNAME: ${E2B_IMAGE_REGISTRY_USERNAME:-}
@@ -104,6 +107,9 @@ services:
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
     cap_add:
       - SYS_ADMIN
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
     security_opt:
       - seccomp=unconfined
     restart: unless-stopped

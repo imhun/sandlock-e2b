@@ -216,9 +216,54 @@ def test_sandlock_executor_maps_network_policy():
     assert kwargs.net_allow == ["tcp://8.8.8.8:*"]
     assert kwargs.net_deny == []
     assert kwargs.http_allow == ["* api.example.com/*"]
+    assert kwargs.netns is False
 
     # Dynamic update replaces the policy for the next command.
     executor.update_network({"denyOut": ["169.254.169.254"]})
     kwargs = executor._build_sandbox(config)
     assert kwargs.net_allow == []
     assert kwargs.net_deny == ["169.254.169.254"]
+
+
+def test_netns_wildcard_allowout_accepted_and_passed_through(monkeypatch):
+    """With E2B_ENABLE_NETNS on, wildcard allowOut is accepted (no egress
+    proxy needed) and the executor enables per-sandbox netns."""
+    from gateway_common import network
+
+    monkeypatch.setenv("E2B_ENABLE_NETNS", "1")
+    normalized = network.normalize_network_config(
+        {"allowOut": ["*.example.com:443"], "denyOut": ["10.0.0.0/8"]}
+    )
+    assert normalized == {"allowOut": ["*.example.com:443"], "denyOut": ["10.0.0.0/8"]}
+
+    from envd_service.executors.base import ExecConfig
+    from envd_service.executors.sandlock import SandlockExecutor
+
+    executor = SandlockExecutor(
+        workspace_dir="/tmp/ws",
+        base_image=None,
+        image_rootfs=None,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=True,
+        enable_netns=True,
+        network=normalized,
+    )
+    config = ExecConfig(cmd=["true"], env={}, cwd="/tmp/ws", stdin_enabled=False)
+    kwargs = executor._build_sandbox(config)
+    assert kwargs.netns is True
+    assert kwargs.net_allow == ["*.example.com:443"]
+
+
+def test_netns_wildcard_rejected_without_flag(monkeypatch):
+    """Without E2B_ENABLE_NETNS the previous behavior stands: wildcard
+    allowOut needs the egress proxy (no fake success on the old runtime)."""
+    from gateway_common import network
+
+    monkeypatch.delenv("E2B_ENABLE_NETNS", raising=False)
+    with pytest.raises(network.NetworkConfigError):
+        network.normalize_network_config({"allowOut": ["*.example.com:443"]})

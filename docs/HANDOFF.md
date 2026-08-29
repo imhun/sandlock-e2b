@@ -29,12 +29,47 @@
 
 ### 下一步（Block A 未完）
 
-- **R2 运行层（DNS 响应器）**：每沙箱 UDP DNS listener + `resolv.conf`
-  memfd 虚拟化 + 解析端点豁免；或 netlink 合成网卡 DNS。**没落地前不要
-  放开普通模式 API**（避免 fake success）。详细见
-  `docs/sandlock-network-wildcard.md` §9。
-- M3 接入：`gateway_common/network.py` 放开通配 + SandlockExecutor 透传
-  + security 通配用例（在响应器之后）。
+- **M3 项目接入已接线（2026-08-29）**：`gateway_common/network.py` 在
+  `E2B_ENABLE_NETNS` 时放开通配 allowOut（否则维持 400）；
+  `SandlockExecutor` 增加 `enable_netns`（kwargs `netns`，默认 False 兼容
+  旧 wheel）；`docker-compose.prod.yml` worker 加 `NET_ADMIN` +
+  `net.ipv4.ip_forward=1` + `E2B_ENABLE_NETNS`；`envd_service/netns.py`
+  在 worker 启动时配 ip_forward + veth 网段 MASQUERADE；`Dockerfile.envd`/
+  `test-runner` 加 iptables；fork wheel（含 `netns` FFI/Python 绑定）已可
+  构建。**待办**：把 worker/测试镜像的 sandlock 来源切到 fork wheel
+  （M6 wheel 矩阵/私有源），跑 security 通配 e2e + 全量回归；HTTP ACL +
+  netns 组合用例。
+
+## 本会话已完成（Block A 第二阶段 — per-sandbox netns 完整落地）
+
+fork 分支 `feature/network-netns`（基于 feature/network-wildcard）：
+
+1. **netns/veth**：子进程在 userns 之前 `unshare(CLONE_NEWNET)`；父进程
+   从全局池（10.200.0.0/16 → /30，沙箱=+2 网关=+1）分配、`IFLA_NET_NS_FD`
+   建 veth（修过 VETH_INFO_PEER 嵌套与 `IFLA_NET_NS_FD=28` 常量）、配
+   网关端、两端口 UP；子进程经 pipe 收地址后配置自己一端（地址 + 默认
+   路由）并回传 ifindex。失败路径删 host 端 veth，teardown 显式删。
+2. **DNS 网关**：`gateway:53` UDP listener，通配 A 查询 → `SyntheticDns`
+   合成 IP（TTL=0、RA/RD），其余转发 worker 上游；`/etc/resolv.conf`
+   memfd 虚拟化；connect 与 send 路径豁免网关端点（glibc res_send 先
+   connect UDP socket——connect 不豁免则 res_query 直接 -1，排查最久的坑）。
+3. **netlink 视图**：`NetlinkState` 增 `VethView`（子进程回传 ifindex），
+   GETLINK/GETADDR dump 加入 veth（否则 glibc AI_ADDRCONFIG 只见回环，
+   getaddrinfo 不发 DNS 直接 -3）。
+4. **HTTP 代理**：`spawn_transparent_proxy` 增 `bind_ip`，netns 模式绑
+   网关地址（代理创建移到 veth 建立之后）。
+5. **SSRF 护栏**：通配解析后的真实 IP 拒绝私网/回环/链路本地/CGNAT/ULA/
+   组播（放行 198.18/15 与 TEST-NET，防透明代理/拦截 DNS 误伤）；二次
+   校验带 hostname 上下文（AllowList 下真实 IP 才能通过通配规则）。
+6. **测试**：lib `762 passed`（2 个既有 cow::seccomp root 环境性失败）；
+   integration `428 passed`（1 个事务合并 root 环境性失败）。新增
+   `test_netns.rs` 三用例全绿：loopback 隔离 / 通配 DNS 合成 IP /
+   通配 connect 到真实目标。
+
+环境注意：`sandlock-dev:latest` 已加 iproute2；集成测试需
+`--privileged --network host`；e2e 连接用例临时改容器 resolv.conf 为
+8.8.8.8 并配 ip_forward + MASQUERADE（本环境 DNS 被透明代理改写为
+198.18.x，护栏已放行）。
 
 ## 本会话已完成（Network API 阶段 B1 — egressProxy）
 

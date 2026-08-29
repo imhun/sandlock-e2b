@@ -280,10 +280,13 @@ SDK → Envd Gateway :49983（按 E2b-Sandbox-Id 路由代理）
     隧道（LD_PRELOAD 透明拦截 `getaddrinfo`/`connect`，沙箱内无感知；
     域名走 SOCKS5 ATYP=domain 远程 DNS；allow/deny 在库内先过滤再进代理，
     fail closed）。**通配域名在 egressProxy 模式下支持**（`*.example.com`
-    匹配子域、不匹配裸域名，过滤在库内做）；普通模式（sandlock
-    `net_allow`）无法表达后缀通配，仍显式 400。控制面校验代理地址必须
-    解析到公网 IPv4（拒绝私网/内网，防 SSRF）。限制：仅 IPv4 代理、
-    仅动态链接应用（python/node 等）生效、
+    匹配子域、不匹配裸域名，过滤在库内做）；普通模式在 fork sandlock +
+    `E2B_ENABLE_NETNS=true` 下同样支持（每沙箱独立 netns：网关 DNS 把
+    通配子域解析为合成 IP，connect 由 supervisor 代连并二次校验，静态/
+    Go 应用同样受限；worker 需 `NET_ADMIN` + `net.ipv4.ip_forward` +
+    veth 网段 MASQUERADE，见 `envd_service/netns.py`）。控制面校验代理
+    地址必须解析到公网 IPv4（拒绝私网/内网，防 SSRF）。限制：仅 IPv4
+    代理、仅动态链接应用（python/node 等）生效、
     worker 需 `gcc` + `libc6-dev`（首次构建 `libegress_proxy.so` 缓存于
     `E2B_IMAGE_CACHE_DIR/egress/`）、过滤规则通过环境变量传入沙箱。
   - 未实现并显式 400 拒绝：`maskRequestHost`、`rules.transform`

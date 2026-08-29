@@ -268,6 +268,7 @@ class SandlockExecutor(Executor):
         max_open_files: int,
         allow_internet_access: bool,
         enable_network: bool,
+        enable_netns: bool = False,
         network: dict | None = None,
         egress_lib_dir: str | Path | None = None,
         extra_fs_writable: list[str] | None = None,
@@ -283,6 +284,7 @@ class SandlockExecutor(Executor):
         self._max_open_files = max_open_files
         self._allow_internet_access = allow_internet_access
         self._enable_network = enable_network
+        self._enable_netns = enable_netns
         self._network = dict(network) if network else None
         self._egress_lib_dir = Path(egress_lib_dir) if egress_lib_dir else None
         self._egress_resolved: tuple[str, int] | None = None
@@ -453,6 +455,7 @@ class SandlockExecutor(Executor):
             "max_processes": self._max_processes,
             "max_open_files": self._max_open_files,
             "max_cpu": min(100, max(1, self._cpu_percent)),
+            "netns": self._enable_netns,
             "clean_env": True,
             "env": dict(config.env),
             "cwd": config.cwd,

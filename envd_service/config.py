@@ -24,6 +24,9 @@ class Settings:
     enable_network: bool = field(
         default_factory=lambda: _env_bool("E2B_ENABLE_NETWORK", False)
     )
+    enable_netns: bool = field(
+        default_factory=lambda: _env_bool("E2B_ENABLE_NETNS", False)
+    )
     default_memory_mb: int = field(
         default_factory=lambda: _env_int("E2B_DEFAULT_MEMORY_MB", 512)
     )

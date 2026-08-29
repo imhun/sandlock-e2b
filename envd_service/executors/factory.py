@@ -83,6 +83,7 @@ def create_executor(
                 max_open_files=max_open_files,
                 allow_internet_access=allow_internet_access,
                 enable_network=settings.enable_network,
+                enable_netns=settings.enable_netns,
                 network=network,
                 egress_lib_dir=egress_lib_dir or (settings.image_cache_dir / "egress"),
                 extra_fs_writable=extra_fs_writable,

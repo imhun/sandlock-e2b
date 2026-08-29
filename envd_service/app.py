@@ -42,6 +42,10 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        if settings.enable_netns:
+            from envd_service.netns import ensure_worker_netns_plumbing
+
+            ensure_worker_netns_plumbing()
         agent.start()
         yield
         await agent.stop()

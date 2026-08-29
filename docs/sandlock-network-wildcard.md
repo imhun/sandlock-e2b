@@ -422,14 +422,20 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 
 ### 未落地（下一步，按序）
 
-- **R2 运行层（DNS 响应器）**：sandlock 无独立 netns（沙箱共享宿主
-  loopback），静态 `/etc/hosts` 无法表达任意子域。需要：每沙箱 UDP DNS
-  listener（`127.0.0.1` 独立端口）+ `openat("/etc/resolv.conf")` memfd
-  虚拟化 + 解析端点在 verdict/send 路径的豁免（仿 HTTP ACL 的
-  loopback 处理）；或用 netlink 合成网卡提供沙箱内 DNS 地址。涉及
-  seccomp/send 安全面，建议作为独立变更走完。
+- **R2 运行层已改为 per-sandbox netns（2026-08-29 落地）**：沙箱子进程在
+  userns 之前 `unshare(CLONE_NEWNET)`（netns 归属 supervisor userns，
+  子进程仍持 CAP_NET_ADMIN 可配自己一端）；父进程分配 `/30`、经
+  `IFLA_NET_NS_FD` 建 veth、配网关端，子进程配置沙箱端地址/默认路由
+  （地址经 pipe 传递）；每沙箱 DNS 网关（`gateway:53`）应答通配 A 查询
+  （合成 IP、TTL=0、非通配转发上游），`/etc/resolv.conf` memfd 指向网关；
+  connect/send 路径对网关端点豁免（glibc res_send 会先 connect UDP
+  socket 到 nameserver，connect 也必须豁免）；netlink 合成视图加入 veth
+  地址（否则 glibc AI_ADDRCONFIG 只看到回环直接放弃）；HTTP 代理改绑
+  网关地址。`SandboxBuilder::netns(true)` 开关。集成验证：loopback 隔离、
+  通配 DNS 返回合成 IP、通配 connect 到达真实目标（privileged 容器内）。
 - **M3 项目接入**：`gateway_common/network.py` 普通模式放开通配 +
-  `SandlockExecutor` 透传 + `tests/security` 通配用例。**在 DNS 响应器
-  落地前不要放开 API**（避免"规则接受但不生效"的 fake success）。
+  `SandlockExecutor` 透传（需 executor 对每个沙箱开 `netns`）+ worker
+  特权（`CAP_NET_ADMIN`、`ip_forward`、veth 网段 MASQUERADE）+
+  `tests/security` 通配用例。
 - M4（Block B）/ M5（Block C）/ M6（wheel 矩阵）/ M7（上游 PR）维持
   原计划不变。

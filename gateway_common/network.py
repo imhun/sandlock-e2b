@@ -18,6 +18,7 @@ explicitly rather than silently accepted (no fake success).
 from __future__ import annotations
 
 import ipaddress
+import os
 from typing import Any
 
 
@@ -176,6 +177,12 @@ def _normalize_bool(value: Any, name: str) -> bool | None:
     return value
 
 
+def _netns_wildcards_enabled() -> bool:
+    """Wildcard allowOut works without an egress proxy once the worker runs
+    the fork sandlock with per-sandbox netns (`E2B_ENABLE_NETNS=1`)."""
+    return os.getenv("E2B_ENABLE_NETNS", "").strip().lower() in {"1", "true", "yes"}
+
+
 def normalize_network_config(raw: Any) -> dict[str, Any] | None:
     """Validate a create-body ``network`` object into its canonical form."""
     if raw is None:
@@ -186,13 +193,14 @@ def normalize_network_config(raw: Any) -> dict[str, Any] | None:
     egress_proxy = _normalize_egress_proxy(raw)
     _check_mask_request_host(raw)
     _check_rules(raw)
-    # Wildcard domains (``*.example.com``) are only expressible when the
-    # egress proxy library does the filtering; the sandlock net_allow path
-    # cannot represent them and keeps rejecting them.
+    # Wildcard domains (``*.example.com``) are expressible either through the
+    # egress proxy library (in-sandbox filtering) or, with
+    # ``E2B_ENABLE_NETNS``, through the fork sandlock's net_allow + gateway
+    # DNS path.
     allow_out = _normalize_str_list(
         raw.get("allowOut"),
         "allowOut",
-        allow_wildcard_domain=egress_proxy is not None,
+        allow_wildcard_domain=egress_proxy is not None or _netns_wildcards_enabled(),
     )
     deny_out = _normalize_str_list(
         raw.get("denyOut"), "denyOut", allow_wildcard_domain=False
@@ -229,7 +237,7 @@ def normalize_network_update(raw: Any) -> dict[str, Any] | None:
     allow_out = _normalize_str_list(
         raw.get("allowOut"),
         "allowOut",
-        allow_wildcard_domain=egress_proxy is not None,
+        allow_wildcard_domain=egress_proxy is not None or _netns_wildcards_enabled(),
     )
     deny_out = _normalize_str_list(
         raw.get("denyOut"), "denyOut", allow_wildcard_domain=False
