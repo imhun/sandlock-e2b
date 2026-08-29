@@ -96,12 +96,39 @@ async def test_network_update_unknown_sandbox_404(multinode_two_workers):
 async def test_network_rejects_unsupported_parts(multinode_two_workers):
     harness = multinode_two_workers
     for network in [
-        {"maskRequestHost": "internal.example.com"},
-        {"rules": {"api.example.com": [{"transform": {"headers": {"X-A": "1"}}}]}},
         {"denyOut": ["example.com"]},
+        {"maskRequestHost": "bad host"},
+        {"rules": {"api.example.com": [{"transform": {"body": {}}}]}},
     ]:
         resp = await _create_with_network(harness, network)
         assert resp.status_code == 400, network
+
+    # Block B: maskRequestHost + rules[].transform.headers are accepted and
+    # echoed (requires the fork wheel in the worker).
+    created = await _create_with_network(
+        harness,
+        {
+            "maskRequestHost": "localhost:${PORT}",
+            "rules": {
+                "api.example.com": [
+                    {"transform": {"headers": {"X-API-Key": "sk-test"}}}
+                ]
+            },
+        },
+    )
+    assert created.status_code == 201
+    try:
+        detail = await _detail(harness, created.json()["sandboxID"])
+        assert detail["network"]["maskRequestHost"] == "localhost:${PORT}"
+        assert detail["network"]["rules"]["api.example.com"] == [
+            {"transform": {"headers": {"X-API-Key": "sk-test"}}}
+        ]
+    finally:
+        async with httpx.AsyncClient(base_url=harness["api_url"]) as client:
+            await client.delete(
+                f"/sandboxes/{created.json()['sandboxID']}",
+                headers={"X-API-Key": "local-key"},
+            )
 
     # Wildcard allowOut is accepted without an egress proxy (per-sandbox DNS
     # gateway) and echoed back.

@@ -27,7 +27,19 @@ RUN sed -i \
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
-RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple "sandlock==0.8.6"
+
+# sandlock fork wheel (Block A/B/C: wildcard allowOut, header inject,
+# host mask, SOCKS5 egress on-behalf). wheels/fork/ holds per-arch wheels;
+# the build arg picks the platform-matched file.
+ARG TARGETARCH
+COPY wheels/fork/ /tmp/wheels/
+RUN SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-linux_$(case "$TARGETARCH" in \
+        amd64) echo x86_64 ;; \
+        arm64) echo aarch64 ;; \
+        *) echo "$TARGETARCH" ;; \
+    esac).whl 2>/dev/null || ls /tmp/wheels/*.whl | head -1) \
+    && pip install --no-cache-dir "$SANLOCK_WHL" \
+    && rm -rf /tmp/wheels
 
 COPY gateway_common/ gateway_common/
 COPY envd_service/ envd_service/

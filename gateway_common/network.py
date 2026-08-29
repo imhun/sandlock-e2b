@@ -10,9 +10,10 @@ SDK clients send):
         "rules": {"api.example.com": []},
     }
 
-The egress proxy layer is not implemented yet, so ``egressProxy``,
-``maskRequestHost`` and rule ``transform`` (header injection) are rejected
-explicitly rather than silently accepted (no fake success).
+``egressProxy`` is tunneled by the sandlock fork's SOCKS5 on-behalf path,
+``maskRequestHost`` and ``rules[].transform.headers`` are mapped onto the
+fork's ``host_mask`` / ``http_inject`` kwargs (requires the fork wheel —
+PyPI 0.8.6 rejects those kwargs).
 """
 
 from __future__ import annotations
@@ -119,33 +120,72 @@ def _normalize_egress_proxy(raw: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _check_mask_request_host(raw: dict[str, Any]) -> None:
-    if raw.get("maskRequestHost"):
+    mask = raw.get("maskRequestHost")
+    if mask is None:
+        return
+    if not isinstance(mask, str) or not mask.strip():
+        raise NetworkConfigError("maskRequestHost must be a non-empty string")
+    mask = mask.strip()
+    if any(c.isspace() for c in mask):
+        raise NetworkConfigError("maskRequestHost must not contain whitespace")
+    if "://" in mask or "@" in mask or "/" in mask:
         raise NetworkConfigError(
-            "maskRequestHost is not supported: it requires the egress "
-            "proxy layer"
+            "maskRequestHost must be a host[:port] value "
+            "(no scheme, userinfo, or path)"
         )
 
 
-def _check_rules(raw: dict[str, Any]) -> None:
+def _normalize_rules(raw: dict[str, Any]) -> dict[str, list[dict[str, Any]]] | None:
     rules = raw.get("rules")
     if rules is None:
-        return
+        return None
     if not isinstance(rules, dict):
         raise NetworkConfigError("rules must be an object keyed by domain")
+    out: dict[str, list[dict[str, Any]]] = {}
     for domain, rule_list in rules.items():
         if not isinstance(domain, str) or not domain:
             raise NetworkConfigError("rules keys must be non-empty domains")
         if not isinstance(rule_list, list):
             raise NetworkConfigError(f"rules[{domain}] must be a list")
+        normalized: list[dict[str, Any]] = []
         for rule in rule_list:
             if not isinstance(rule, dict):
                 raise NetworkConfigError(f"rules[{domain}] entries must be objects")
             transform = rule.get("transform")
-            if transform is not None:
+            if transform is None:
+                continue
+            if not isinstance(transform, dict):
                 raise NetworkConfigError(
-                    f"rules[{domain}].transform (header injection) is not "
-                    "supported: it requires the egress proxy layer"
+                    f"rules[{domain}].transform must be an object"
                 )
+            unknown_transform = set(transform) - {"headers"}
+            if unknown_transform:
+                raise NetworkConfigError(
+                    f"rules[{domain}].transform unsupported field(s): "
+                    f"{sorted(unknown_transform)}"
+                )
+            headers = transform.get("headers")
+            if headers is None:
+                continue
+            if not isinstance(headers, dict) or not headers:
+                raise NetworkConfigError(
+                    f"rules[{domain}].transform.headers must be a non-empty "
+                    "object of header name -> value"
+                )
+            for name, value in headers.items():
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or not isinstance(value, str)
+                    or not value
+                ):
+                    raise NetworkConfigError(
+                        f"rules[{domain}].transform.headers entries must be "
+                        "non-empty strings"
+                    )
+            normalized.append({"transform": {"headers": dict(headers)}})
+        out[domain] = normalized
+    return out
 
 
 def _normalize_str_list(
@@ -186,7 +226,7 @@ def normalize_network_config(raw: Any) -> dict[str, Any] | None:
     _check_unknown(raw, _CREATE_FIELDS, "network")
     egress_proxy = _normalize_egress_proxy(raw)
     _check_mask_request_host(raw)
-    _check_rules(raw)
+    rules = _normalize_rules(raw)
     # Wildcard domains (``*.example.com``) are expressible either through the
     # egress proxy library (in-sandbox filtering) or through the fork
     # sandlock's net_allow + per-sandbox DNS gateway (the default,
@@ -213,8 +253,10 @@ def normalize_network_config(raw: Any) -> dict[str, Any] | None:
         out["allowPublicTraffic"] = allow_public_traffic
     if egress_proxy is not None:
         out["egressProxy"] = egress_proxy
-    if raw.get("rules") is not None:
-        out["rules"] = raw["rules"]
+    if rules is not None:
+        out["rules"] = rules
+    if raw.get("maskRequestHost") is not None:
+        out["maskRequestHost"] = raw["maskRequestHost"].strip()
     return out
 
 
@@ -228,7 +270,6 @@ def normalize_network_update(raw: Any) -> dict[str, Any] | None:
         raise NetworkConfigError("network update body must be an object")
     _check_unknown(raw, _UPDATE_FIELDS, "network update")
     egress_proxy = _normalize_egress_proxy(raw)
-    _check_rules(raw)
     allow_out = _normalize_str_list(
         raw.get("allowOut"),
         "allowOut",
@@ -252,8 +293,9 @@ def normalize_network_update(raw: Any) -> dict[str, Any] | None:
     if "egressProxy" in raw:
         # Explicit null clears the proxy (atomic-replace semantics).
         out["egressProxy"] = egress_proxy
-    if raw.get("rules") is not None:
-        out["rules"] = raw["rules"]
+    rules = _normalize_rules(raw)
+    if rules is not None:
+        out["rules"] = rules
     return out
 
 
@@ -281,15 +323,30 @@ def sandlock_network_policy(
     """Map a normalized network config onto sandlock net/http primitives.
 
     Returns the subset of ``Sandbox`` kwargs this project controls:
-    ``net_allow`` / ``net_deny`` / ``http_allow``. ``net_allow`` and
-    ``net_deny`` are mutually exclusive in sandlock, so when both
-    ``allowOut`` and ``denyOut`` are present the allowlist model wins and
-    allow entries covered by a deny CIDR are dropped (deny precedence).
+    ``net_allow`` / ``net_deny`` / ``http_allow`` / ``http_inject`` /
+    ``host_mask`` / ``egress_proxy``. ``net_allow`` and ``net_deny`` are
+    mutually exclusive in sandlock, so when both ``allowOut`` and ``denyOut``
+    are present the allowlist model wins and allow entries covered by a deny
+    CIDR are dropped (deny precedence).
     """
     if not enable_network:
-        return {"net_allow": [], "net_deny": [], "http_allow": []}
+        return {
+            "net_allow": [],
+            "net_deny": [],
+            "http_allow": [],
+            "http_inject": [],
+            "host_mask": None,
+            "egress_proxy": None,
+        }
     if network is None:
-        return {"net_allow": [], "net_deny": [], "http_allow": []}
+        return {
+            "net_allow": [],
+            "net_deny": [],
+            "http_allow": [],
+            "http_inject": [],
+            "host_mask": None,
+            "egress_proxy": None,
+        }
 
     allow_out = network.get("allowOut")
     deny_out = network.get("denyOut")
@@ -303,21 +360,67 @@ def sandlock_network_policy(
             continue
         http_allow.append(f"* {domain}/*")
 
+    # Block B (5B.4): rules[domain].transform.headers → http_inject. The
+    # literal header values are materialized into supervisor-only secret files
+    # by the executor (sandlock refuses inline literals); `${e2b.identity.tokens.*}`
+    # placeholders map to E2B_IDENTITY_TOKEN_<NAME> env vars.
+    http_inject: list[dict[str, Any]] = []
+    for domain, rule_list in (network.get("rules") or {}).items():
+        if not domain or domain.startswith("*"):
+            continue
+        for rule in rule_list:
+            headers = (rule.get("transform") or {}).get("headers") or {}
+            for name, value in headers.items():
+                safe_domain = "".join(
+                    c if c.isalnum() else "_" for c in domain
+                ).lower()
+                safe_name = "".join(c if c.isalnum() else "_" for c in name).lower()
+                http_inject.append(
+                    {
+                        "matcher": domain,
+                        "auth": f"header:{name}",
+                        "value": value,
+                        "name": f"hdr_{safe_domain}_{safe_name}",
+                        "on_existing": "replace",
+                    }
+                )
+
+    egress_proxy = network.get("egressProxy")
     if allow_out is not None:
         return {
             "net_allow": _to_net_allow(allow_out, deny_out),
             "net_deny": [],
             "http_allow": http_allow,
+            "http_inject": http_inject,
+            "host_mask": network.get("maskRequestHost"),
+            "egress_proxy": egress_proxy,
         }
     if deny_out is not None:
         return {
             "net_allow": [],
             "net_deny": [_to_net_deny(e) for e in deny_out],
             "http_allow": http_allow,
+            "http_inject": http_inject,
+            "host_mask": network.get("maskRequestHost"),
+            "egress_proxy": egress_proxy,
         }
     if not allow_internet:
-        return {"net_allow": [], "net_deny": [], "http_allow": http_allow}
-    return {"net_allow": ["*:*"], "net_deny": [], "http_allow": http_allow}
+        return {
+            "net_allow": [],
+            "net_deny": [],
+            "http_allow": http_allow,
+            "http_inject": http_inject,
+            "host_mask": network.get("maskRequestHost"),
+            "egress_proxy": egress_proxy,
+        }
+    return {
+        "net_allow": ["*:*"],
+        "net_deny": [],
+        "http_allow": http_allow,
+        "http_inject": http_inject,
+        "host_mask": network.get("maskRequestHost"),
+        "egress_proxy": egress_proxy,
+    }
 
 
 def _to_net_allow(

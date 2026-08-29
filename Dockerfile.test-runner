@@ -19,6 +19,17 @@ COPY requirements.txt /tmp/requirements.txt
 COPY requirements-test.txt /tmp/requirements-test.txt
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-test.txt
 
+# sandlock fork wheel (Block A/B/C) — see Dockerfile.envd for the arch mapping.
+ARG TARGETARCH
+COPY wheels/fork/ /tmp/wheels/
+RUN SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-linux_$(case "$TARGETARCH" in \
+        amd64) echo x86_64 ;; \
+        arm64) echo aarch64 ;; \
+        *) echo "$TARGETARCH" ;; \
+    esac).whl 2>/dev/null || ls /tmp/wheels/*.whl | head -1) \
+    && pip install --no-cache-dir "$SANLOCK_WHL" \
+    && rm -rf /tmp/wheels
+
 WORKDIR /workspace
 
 COPY envd_service/mcp/gateway.py /usr/bin/mcp-gateway

@@ -270,7 +270,7 @@ class SandlockExecutor(Executor):
         enable_network: bool,
         enable_netns: bool = False,
         network: dict | None = None,
-        egress_lib_dir: str | Path | None = None,
+        secrets_dir: str | Path | None = None,
         extra_fs_writable: list[str] | None = None,
         fs_mounts: dict[str, str] | None = None,
     ) -> None:
@@ -286,99 +286,64 @@ class SandlockExecutor(Executor):
         self._enable_network = enable_network
         self._enable_netns = enable_netns
         self._network = dict(network) if network else None
-        self._egress_lib_dir = Path(egress_lib_dir) if egress_lib_dir else None
-        self._egress_resolved: tuple[str, int] | None = None
+        self._secrets_dir = Path(secrets_dir) if secrets_dir else None
         self._extra_fs_writable = list(extra_fs_writable or [])
         self._fs_mounts = dict(fs_mounts or {})
 
     def update_network(self, network: dict | None) -> None:
         """Replace the network policy; the next command uses it."""
         self._network = dict(network) if network else None
-        self._egress_resolved = None
 
-    def _egress_endpoint(self) -> tuple[str, int] | None:
-        """Resolve the egress proxy address to (ip, port); hostnames are
-        resolved here (the supervisor has DNS) so the LD_PRELOAD library only
-        ever dials a literal IP."""
-        proxy = (self._network or {}).get("egressProxy")
-        if not proxy or not isinstance(proxy, dict):
-            return None
-        if self._egress_resolved is not None:
-            return self._egress_resolved
-        import socket as py_socket
+    def _materialize_http_inject(
+        self, entries: list[dict]
+    ) -> list[dict]:
+        """Turn ``http_inject`` entries carrying literal header values into
+        sandlock ``secret`` sources.
 
-        address = str(proxy.get("address", ""))
-        host, _, port_s = address.rpartition(":")
-        if not host or not port_s.isdigit():
-            raise RuntimeError(f"invalid egress proxy address: {address!r}")
-        port = int(port_s)
-        if not 1 <= port <= 65535:
-            raise RuntimeError(f"invalid egress proxy port: {port}")
-        infos = py_socket.getaddrinfo(host, port, type=py_socket.SOCK_STREAM)
-        ip = next(
-            (info[4][0] for info in infos if info[0] == py_socket.AF_INET),
-            None,
-        )
-        if ip is None:
-            raise RuntimeError(
-                f"egress proxy {address!r} does not resolve to an IPv4 address"
-            )
-        self._egress_resolved = (ip, port)
-        return self._egress_resolved
-
-    def _egress_library(self) -> Path:
-        """Return the LD_PRELOAD egress proxy library.
-
-        Prefers the platform-matched library baked into the worker image
-        (``/opt/egress/libegress_proxy.so``); otherwise builds it once from
-        source into ``egress_lib_dir`` (dev/test fallback, requires cc).
+        A literal value becomes a supervisor-only secret file (mode 0600,
+        never granted to the sandbox); a ``${e2b.identity.tokens.<NAME>}``
+        placeholder maps to the ``E2B_IDENTITY_TOKEN_<NAME>`` env var of the
+        worker (platform-injected secret). Raises when a placeholder has no
+        backing env var, so a misconfigured IAM secret fails at sandbox
+        creation instead of silently sending the request unauthenticated.
         """
-        if self._egress_lib_dir is None:
-            raise RuntimeError("egress proxy requires egress_lib_dir")
-        lib = self._egress_lib_dir / "libegress_proxy.so"
-        if lib.is_file():
-            return lib
-        baked = Path("/opt/egress/libegress_proxy.so")
-        if baked.is_file():
-            self._egress_lib_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(baked, lib)
-            return lib
-        import shutil as _shutil
-        import subprocess as _subprocess
+        if not entries:
+            return []
+        if self._secrets_dir is None:
+            raise RuntimeError(
+                "http_inject (rules[].transform.headers) requires a "
+                "supervisor secrets dir"
+            )
+        out: list[dict] = []
+        for entry in entries:
+            value = str(entry["value"])
+            import re
 
-        src = (
-            Path(__file__).resolve().parent.parent.parent
-            / "envd_service"
-            / "egress"
-            / "libegress_proxy.c"
-        )
-        if not src.is_file():
-            raise RuntimeError(f"egress proxy library source missing: {src}")
-        if _shutil.which("cc") is None:
-            raise RuntimeError(
-                "egress proxy requires a C compiler (cc) to build "
-                "libegress_proxy.so"
-            )
-        self._egress_lib_dir.mkdir(parents=True, exist_ok=True)
-        result = _subprocess.run(
-            [
-                "cc",
-                "-shared",
-                "-fPIC",
-                "-O2",
-                "-o",
-                str(lib),
-                str(src),
-                "-ldl",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0 or not lib.is_file():
-            raise RuntimeError(
-                f"failed to build libegress_proxy.so: {result.stderr.strip()}"
-            )
-        return lib
+            m = re.fullmatch(r"\$\{e2b\.identity\.tokens\.([A-Za-z0-9_]+)\}", value)
+            if m is not None:
+                var = f"E2B_IDENTITY_TOKEN_{m.group(1)}"
+                if var not in os.environ:
+                    raise RuntimeError(
+                        f"header transform for {entry['matcher']} references "
+                        f"identity token {m.group(1)!r} but {var} is not set"
+                    )
+                entry = dict(entry)
+                entry.pop("value", None)
+                entry["secret"] = f"env:{var}"
+            else:
+                secret_dir = self._secrets_dir / os.path.basename(
+                    self._workspace_dir.rstrip("/")
+                )
+                secret_dir.mkdir(parents=True, exist_ok=True)
+                path = secret_dir / f"{entry['name']}.secret"
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(value)
+                os.chmod(path, 0o600)
+                entry = dict(entry)
+                entry.pop("value", None)
+                entry["secret"] = f"file:{path}"
+            out.append(entry)
+        return out
 
     @staticmethod
     def resolve_cmd(cmd: list[str]) -> list[str]:
@@ -390,11 +355,6 @@ class SandlockExecutor(Executor):
         return cmd
 
     def _build_sandbox(self, config: ExecConfig):
-        egress_endpoint = None
-        egress_lib: Path | None = None
-        if self._network and self._network.get("egressProxy"):
-            egress_endpoint = self._egress_endpoint()
-            egress_lib = self._egress_library()
         fs_writable = [self._workspace_dir]
         fs_writable.extend(self._extra_fs_writable)
         fs_readable = ["/usr", "/lib", "/bin", "/opt"]
@@ -413,16 +373,10 @@ class SandlockExecutor(Executor):
         net_allow: list[str] = []
         net_deny: list[str] = []
         http_allow: list[str] = []
-        if egress_endpoint is not None:
-            # Egress-proxy mode: the only reachable endpoint is the user's
-            # SOCKS5 proxy; allowOut/denyOut filtering happens inside the
-            # LD_PRELOAD library, and rules (header transforms) need the
-            # proxy layer (rejected at the API).
-            ip, port = egress_endpoint
-            net_allow = [f"{ip}:{port}"]
-            if egress_lib is not None:
-                fs_readable = list(fs_readable) + [str(egress_lib.parent)]
-        elif self._network:
+        http_inject: list[dict] = []
+        host_mask: str | None = None
+        egress_proxy: dict | None = None
+        if self._network:
             from gateway_common.network import sandlock_network_policy
 
             policy = sandlock_network_policy(
@@ -433,6 +387,9 @@ class SandlockExecutor(Executor):
             net_allow = policy["net_allow"]
             net_deny = policy["net_deny"]
             http_allow = policy["http_allow"]
+            http_inject = self._materialize_http_inject(policy["http_inject"])
+            host_mask = policy["host_mask"]
+            egress_proxy = policy["egress_proxy"]
         elif self._allow_internet_access and self._enable_network:
             net_allow = [
                 "files.pythonhosted.org:443",
@@ -451,6 +408,9 @@ class SandlockExecutor(Executor):
             "net_allow": net_allow,
             "net_deny": net_deny,
             "http_allow": http_allow,
+            "http_inject": http_inject,
+            "host_mask": host_mask,
+            "egress_proxy": egress_proxy,
             "max_memory": f"{self._memory_mb}M",
             "max_processes": self._max_processes,
             "max_open_files": self._max_open_files,
@@ -503,40 +463,19 @@ class SandlockExecutor(Executor):
                 except OSError:
                     ca_dst = None
                 if ca_dst is not None:
-                    kwargs["http_inject_ca"] = [str(ca_dst)]
-                    env = dict(kwargs.get("env") or {})
+                    # sandlock resolves http_inject_ca in the sandbox's view:
+                    # the chroot-visible path, not the host path (the host
+                    # path would be resolved under the rootfs and "not found").
                     ca_inside = (
                         Path("/home/user/.e2b-ca/ca-certificates.crt")
                         if kwargs.get("chroot")
                         else ca_dst
                     )
+                    kwargs["http_inject_ca"] = [str(ca_inside)]
+                    env = dict(kwargs.get("env") or {})
                     env["SSL_CERT_FILE"] = str(ca_inside)
                     env["CURL_CA_BUNDLE"] = str(ca_inside)
                     kwargs["env"] = env
-        if egress_endpoint is not None and egress_lib is not None:
-            env = dict(kwargs.get("env") or {})
-            ip, port = egress_endpoint
-            if kwargs.get("chroot"):
-                # Inside the chroot the workspace is /home/user; copy the
-                # library there so the sandboxed loader can reach it.
-                ws_lib = Path(self._workspace_dir) / ".egress"
-                ws_lib.mkdir(parents=True, exist_ok=True)
-                ws_lib = ws_lib / "libegress_proxy.so"
-                shutil.copy2(egress_lib, ws_lib)
-                env["LD_PRELOAD"] = "/home/user/.egress/libegress_proxy.so"
-            else:
-                env["LD_PRELOAD"] = str(egress_lib)
-            env["EGRESS_PROXY"] = f"{ip}:{port}"
-            proxy = self._network["egressProxy"]
-            if proxy.get("username"):
-                env["EGRESS_PROXY_USER"] = str(proxy["username"])
-            if proxy.get("password"):
-                env["EGRESS_PROXY_PASS"] = str(proxy["password"])
-            if self._network.get("allowOut"):
-                env["EGRESS_ALLOW"] = json.dumps(self._network["allowOut"])
-            if self._network.get("denyOut"):
-                env["EGRESS_DENY"] = json.dumps(self._network["denyOut"])
-            kwargs["env"] = env
         if sandlock is None:
             # Non-Linux / missing native library: return a plain object so the
             # policy mapping stays unit-testable without executing anything.

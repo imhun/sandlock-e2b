@@ -36,3 +36,39 @@ async def test_network_deny_then_allow_via_update(multinode_two_workers):
         assert allowed.exit_code == 0
     finally:
         sandbox.kill()
+
+
+@pytest.mark.usefixtures("require_sandlock")
+async def test_header_inject_and_host_mask_accepted_end_to_end(
+    multinode_two_workers,
+):
+    """Block B over the real API+worker: ``rules[].transform.headers`` and
+    ``maskRequestHost`` map onto the fork wheel's kwargs and a sandbox still
+    runs commands. (The vendored SDK has no ``mask_request_host`` field, so
+    the API acceptance/echo of that field is covered by the raw-HTTP contract
+    test; the proxy-side injection and Host rewriting are covered hermeticly
+    by the fork integration tests.)"""
+    harness = multinode_two_workers
+    sandbox = Sandbox.create(
+        network={
+            "allow_out": ["example.com"],
+            "rules": {
+                "example.com": [
+                    {
+                        "transform": {
+                            "headers": {"X-API-Key": "sk-secret"}
+                        }
+                    }
+                ]
+            },
+        },
+        **_opts(harness),
+    )
+    try:
+        result = sandbox.commands.run(
+            "/usr/local/bin/python3 -c \"print('injected-ok')\""
+        )
+        assert result.exit_code == 0
+        assert "injected-ok" in result.stdout
+    finally:
+        sandbox.kill()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from gateway_common.network import (
@@ -24,11 +26,25 @@ def test_normalize_create_keeps_supported_fields():
 
 def test_normalize_create_rejects_unsupported():
     cases = [
-        {"maskRequestHost": "internal.example.com"},
-        {"rules": {"api.example.com": [{"transform": {"headers": {"X-A": "1"}}}]}},
         {"denyOut": ["example.com"]},
         {"allowOut": "8.8.8.8"},
         {"allowPublicTraffic": "yes"},
+        {"maskRequestHost": "bad host"},
+        {"maskRequestHost": "https://x.com"},
+        {
+            "rules": {
+                "api.example.com": [
+                    {"transform": {"headers": {"X-A": ""}}}
+                ]
+            }
+        },
+        {
+            "rules": {
+                "api.example.com": [
+                    {"transform": {"body": {"foo": "bar"}}}
+                ]
+            }
+        },
         {"bogus": 1},
     ]
     for raw in cases:
@@ -94,6 +110,28 @@ def test_wildcard_domains_allowed_without_egress_proxy():
     assert net["allowOut"] == ["*.example.com"]
     update = normalize_network_update({"allowOut": ["*.example.com"]})
     assert update["allowOut"] == ["*.example.com"]
+
+
+def test_normalize_accepts_mask_request_host_and_transform_headers():
+    net = normalize_network_config(
+        {
+            "maskRequestHost": "localhost:${PORT}",
+            "rules": {
+                "api.example.com": [
+                    {"transform": {"headers": {"X-API-Key": "secret"}}}
+                ]
+            },
+        }
+    )
+    assert net["maskRequestHost"] == "localhost:${PORT}"
+    assert net["rules"] == {
+        "api.example.com": [
+            {"transform": {"headers": {"X-API-Key": "secret"}}}
+        ]
+    }
+    # maskRequestHost is create-only (rejected on update, like the official API).
+    with pytest.raises(NetworkConfigError):
+        normalize_network_update({"maskRequestHost": "localhost:${PORT}"})
 
 
 def test_policy_allow_only_is_default_deny():
@@ -170,6 +208,55 @@ def test_policy_rules_become_http_allow():
     assert policy["http_allow"] == ["* api.example.com/*"]
 
 
+def test_policy_transform_headers_and_host_mask_map_to_sandlock_kwargs():
+    policy = sandlock_network_policy(
+        {
+            "rules": {
+                "api.example.com": [
+                    {"transform": {"headers": {"X-API-Key": "secret"}}}
+                ]
+            },
+            "maskRequestHost": "localhost:${PORT}",
+            "allowInternetAccess": True,
+        },
+        allow_internet_access=True,
+        enable_network=True,
+    )
+    assert policy["host_mask"] == "localhost:${PORT}"
+    assert policy["http_inject"] == [
+        {
+            "matcher": "api.example.com",
+            "auth": "header:X-API-Key",
+            "value": "secret",
+            "name": "hdr_api_example_com_x_api_key",
+            "on_existing": "replace",
+        }
+    ]
+
+
+def test_policy_egress_proxy_passes_through():
+    policy = sandlock_network_policy(
+        {
+            "egressProxy": {
+                "address": "1.1.1.1:1080",
+                "username": "u",
+                "password": "p",
+            },
+            "allowOut": ["example.com"],
+        },
+        allow_internet_access=True,
+        enable_network=True,
+    )
+    assert policy["egress_proxy"] == {
+        "address": "1.1.1.1:1080",
+        "username": "u",
+        "password": "p",
+    }
+    # In egress mode the filter stays on the real destination; the proxy
+    # endpoint is dialed by the supervisor and not part of net_allow.
+    assert policy["net_allow"] == ["tcp://example.com:*"]
+
+
 def test_sandlock_executor_maps_network_policy():
     from envd_service.executors.base import ExecConfig
     from envd_service.executors.sandlock import SandlockExecutor
@@ -198,6 +285,100 @@ def test_sandlock_executor_maps_network_policy():
     )
     kwargs = executor._build_sandbox(config)
     assert kwargs.net_allow == ["tcp://8.8.8.8:*"]
+    assert kwargs.http_inject == []
+    assert kwargs.host_mask is None
+    assert kwargs.egress_proxy is None
+
+
+def test_executor_materializes_transform_headers_and_egress_proxy(tmp_path):
+    from envd_service.executors.base import ExecConfig
+    from envd_service.executors.sandlock import SandlockExecutor
+
+    secrets = tmp_path / "secrets"
+    executor = SandlockExecutor(
+        workspace_dir=str(tmp_path / "sbx_1"),
+        base_image=None,
+        image_rootfs=None,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=True,
+        network={
+            "allowOut": ["api.example.com"],
+            "maskRequestHost": "internal.test:${PORT}",
+            "egressProxy": {"address": "1.1.1.1:1080"},
+            "rules": {
+                "api.example.com": [
+                    {"transform": {"headers": {"X-API-Key": "sk-literal"}}}
+                ]
+            },
+        },
+        secrets_dir=secrets,
+    )
+    config = ExecConfig(
+        cmd=["true"],
+        env={},
+        cwd=str(tmp_path / "sbx_1"),
+        stdin_enabled=False,
+    )
+    kwargs = executor._build_sandbox(config)
+    assert kwargs.host_mask == "internal.test:${PORT}"
+    assert kwargs.egress_proxy == {"address": "1.1.1.1:1080"}
+    assert len(kwargs.http_inject) == 1
+    entry = kwargs.http_inject[0]
+    assert entry["secret"].startswith("file:")
+    secret_path = Path(entry["secret"].split(":", 1)[1])
+    assert secret_path.read_text(encoding="utf-8") == "sk-literal"
+    assert oct(secret_path.stat().st_mode & 0o777) == "0o600"
+
+
+def test_executor_identity_token_placeholder_requires_env(tmp_path, monkeypatch):
+    from envd_service.executors.base import ExecConfig
+    from envd_service.executors.sandlock import SandlockExecutor
+
+    executor = SandlockExecutor(
+        workspace_dir=str(tmp_path / "sbx_2"),
+        base_image=None,
+        image_rootfs=None,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=True,
+        network={
+            "allowOut": ["api.example.com"],
+            "rules": {
+                "api.example.com": [
+                    {
+                        "transform": {
+                            "headers": {
+                                "Authorization": "${e2b.identity.tokens.openai}"
+                            }
+                        }
+                    }
+                ]
+            },
+        },
+        secrets_dir=tmp_path / "secrets",
+    )
+    config = ExecConfig(
+        cmd=["true"],
+        env={},
+        cwd=str(tmp_path / "sbx_2"),
+        stdin_enabled=False,
+    )
+    monkeypatch.delenv("E2B_IDENTITY_TOKEN_openai", raising=False)
+    with pytest.raises(RuntimeError, match="E2B_IDENTITY_TOKEN_openai"):
+        executor._build_sandbox(config)
+
+    monkeypatch.setenv("E2B_IDENTITY_TOKEN_openai", "sk-token")
+    kwargs = executor._build_sandbox(config)
+    assert kwargs.http_inject[0]["secret"] == "env:E2B_IDENTITY_TOKEN_openai"
     assert kwargs.net_deny == []
     assert kwargs.http_allow == ["* api.example.com/*"]
     assert kwargs.netns is False
