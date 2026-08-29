@@ -44,20 +44,27 @@ upstream=multikernel）。分支：`feature/network-wildcard`（R1–R4 通配�
 - security 通配 e2e（fork wheel + privileged worker 下跑
   `tests/security` 新增用例）、迁移（跨 worker netns 重建）验证。
 
-**验证基线（fork，Linux 容器）**：lib `763 passed + 2 root 环境性`；
-integration 并行 `432 passed + 1 root 环境性`（`test_control` 族并行偶发
-flaky，单独跑全过）；netns 套件 5/5；无特权 shared-netns 2/2；
-netlink_virt 14/14。项目 unit+contract `164 passed`。
+**验证基线（fork，Linux 容器，全程非 root uid=65534）**：lib
+`780 passed, 0 failed`（feature/network-socks5；netns-free PR 分支
+`770 passed`）；integration `437 passed, 0 failed`（PR 分支 `432`；netns
+用例在无 CAP_NET_ADMIN 时按能力跳过）；Python `414 passed + 16 skipped`
+（skip = 镜像缺 `/usr/bin/python3`）。
 
 **环境注意事项**：
 
 - 容器 `sandlock-dev:latest`（e2b-sandlock-test + rustup/rsproxy +
-  iproute2）；宿主 `~/.cargo/registry` 挂载到 `/opt/cargo/registry` 离线
-  构建；`RUSTC_WRAPPER=` 禁用 sccache（增量编译正常，改一行约 3.5s）。
-- netns 集成测试需 `--privileged --network host`；跑前清 VM 残留
-  （`ip addr del 198.18.0.9x` + 删非 master 的 veth），避免池地址冲突。
-- 无特权测试也需容器 root（绑 :53）；纯无特权运行需入口一次
-  `sysctl net.ipv4.ip_unprivileged_port_start=0`。
+  iproute2 + **入口脚本**（root 一次：`ip_unprivileged_port_start=0` +
+  预置 198.18.0.99–103 回环地址与 /etc/hosts fixture，chmod 共享
+  target，然后 `setpriv` 降为 nobody 再执行命令）。宿主
+  `~/.cargo/registry` 挂载到 `/opt/cargo/registry` 离线构建。
+- **构建以 root 跑一次**（`--user root --entrypoint bash`，见下），**测试
+  全程非 root**——这是 sandlock 无 root 原则的落地；整个套件不再有
+  "root 环境性失败"。需要 root 的操作显式
+  `--user root --entrypoint bash`。
+- netns 集成测试（fork 专属）仍需 `--privileged --network host` +
+  `CAP_NET_ADMIN`，非特权环境下自动跳过（`net_admin_available()`）。
+- 跑前清 VM 残留（`ip addr del 198.18.0.9x` + 删非 master 的 veth）仅
+  root 会话需要。
 - 本环境外部 DNS 被透明代理改写为 198.18.x，SSRF 护栏已放行该段；
   e2e 测试用本地 fixture（worker /etc/hosts → 198.18.0.9x）不依赖外网。
 
@@ -211,10 +218,9 @@ fork 分支 `feature/network-netns`（基于 feature/network-wildcard）：
    DNS 基线问题）。**默认路径完全无特权**；per-sandbox netns（veth +
    loopback 隔离）保留为 `netns(true)` / `E2B_ENABLE_NETNS` 可选增强。
    项目侧 wildcard allowOut 默认放行（不再依赖 egressProxy 或
-   E2B_ENABLE_NETNS）。验证：lib 763+2、integration 432+1（均 root
-   环境性）、netns 5/5、无特权 shared_netns 2/2、netlink_virt 14/14、
-   项目 unit+contract 164。Block B/C 可在同一无特权 seccomp/loopback
-   模型上实现。
+   E2B_ENABLE_NETNS）。验证（历史基线）：lib 763+2、integration 432+1
+   （root 环境性，后已改为全程非 root 全绿，见"验证基线"）。
+   Block B/C 在同一无特权 seccomp/loopback 模型上实现。
 
 环境注意：`sandlock-dev:latest` 已加 iproute2；集成测试需
 `--privileged --network host`；e2e 连接用例临时改容器 resolv.conf 为
@@ -396,28 +402,29 @@ docker run --rm --privileged --network host \
 ### sandlock fork 验证（Linux 容器）
 
 ```bash
-# 容器（privileged + network host，挂宿主 cargo registry 离线构建）
+# 1) 一次性 root 构建（FFI/测试二进制；入口脚本会 chmod 共享 target）
+docker run --rm --privileged --network host --user root --entrypoint bash \
+  -v "$(pwd)/tmp/sandlock-src:/src" \
+  -v ~/.cargo/registry:/opt/cargo/registry \
+  -v "$(pwd)/tmp/sandlock-dev/cargo-config.toml:/opt/cargo/config.toml" \
+  -w /src sandlock-dev:latest -c '
+    cd /src && CARGO_TARGET_DIR=/src/target-linux cargo build -p sandlock-ffi --offline
+    chmod -R a+rwX /src/target-linux'
+
+# 2) 全程非 root 测试（入口 root 准备后自动降权 nobody；命令用 bash -c，
+#    不要 bash -lc —— login shell 会重置 PATH）
 docker run --rm --privileged --network host \
   -v "$(pwd)/tmp/sandlock-src:/src" \
   -v ~/.cargo/registry:/opt/cargo/registry \
   -v "$(pwd)/tmp/sandlock-dev/cargo-config.toml:/opt/cargo/config.toml" \
-  -w /src sandlock-dev:latest bash -lc '
+  -w /src sandlock-dev:latest bash -c '
     cd /src && CARGO_TARGET_DIR=/src/target-linux \
     cargo test -p sandlock-core --offline --lib
-  '
+    cargo test -p sandlock-core --offline --test integration -- --test-threads=1
+    cd python && PYTHONPATH=/src/python/src python -m pytest tests -q -p no:cacheprovider'
 
-# netns 套件（串行）+ 无特权套件
+# netns 套件（需要 CAP_NET_ADMIN；非特权环境自动跳过）
 cargo test -p sandlock-core --offline --test integration test_netns -- --test-threads=1
-cargo test -p sandlock-core --offline --test integration test_shared_netns -- --test-threads=1
-
-# 全量 integration（并行；test_control 族偶发 flaky，单独跑全过）
-cargo test -p sandlock-core --offline --test integration
-
-# 跑前清理 VM 残留（避免池地址冲突）
-for a in 99 100 101; do ip addr del 198.18.0.$a/32 dev lo 2>/dev/null; done
-for l in $(ip -o link | awk -F": " '{print $2}' | grep '^veth' | cut -d@ -f1); do
-  ip link show "$l" | grep -q "master " || ip link del "$l" 2>/dev/null
-done
 ```
 
 ## 关键文件索引

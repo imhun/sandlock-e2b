@@ -1,8 +1,8 @@
 # Upstream PR: unprivileged domain-wildcard networking + header inject / host mask
 
 > Branch: `imhun/sandlock` → `upstream-pr/netns-free-clean` (base:
-> `multikernel/sandlock` `main` @ `f6a3e39`, single squashed commit `d3a28cc`).
-> Purely unprivileged — no `CLONE_NEWNET` / veth / `CAP_NET_ADMIN`.
+> `multikernel/sandlock` `main` @ `f6a3e39`). Purely unprivileged — no
+> `CLONE_NEWNET` / veth / `CAP_NET_ADMIN`.
 
 ## Summary
 
@@ -29,20 +29,28 @@ Both are exercised hermeticly: unit tests for the verdicts/matcher/SOCKS5 wire
 protocol, and integration tests that run real sandboxes against local
 fixtures (loopback DNS gateway, transparent proxy, no external network).
 
-## Commit
+## Commits (all on `upstream-pr/netns-free-clean`)
 
-- `d3a28cc` (squashed, one commit on top of `f6a3e39`) — the fork's
-  `feature/network-socks5` tree with the per-sandbox netns/veth machinery
-  removed (verified: identical tree hash to the multi-commit branch that ran
-  the full test matrix). The optional per-sandbox netns branch stays on the
-  fork and is deliberately excluded.
+- `d3a28cc` Block A (domain wildcards + loopback DNS gateway) + Block B
+  (header inject / host mask / HTTP `*.suffix`) — the fork's tree with the
+  per-sandbox netns/veth machinery removed.
+- `55709f2` Block C — SOCKS5 egress on-behalf (unprivileged).
+- `b6ef050` non-root test setup: shared pre-seeded fixtures +
+  `stderr_tee` fallback, so the whole suite passes as an unprivileged uid.
+
+The optional per-sandbox netns branch stays on the fork and is deliberately
+excluded.
 
 ## Verification
 
+All green **as an unprivileged user** (uid 65534; the container entrypoint
+does the one-time root prep — sysctl for the `:53` gateway + pre-seeded
+`198.18.0.x`/`/etc/hosts` fixtures — then drops privileges):
+
 ```text
-sandlock-core lib:       761 passed, 2 pre-existing root-env failures
-integration (serial):    428 passed, 1 pre-existing txn root-env failure
-python:                  412 passed, 16 skipped
+sandlock-core lib:       770 passed, 0 failed
+integration (serial):    432 passed, 0 failed
+python:                  414 passed, 16 skipped (/usr/bin/python3 absent)
 ```
 
 ## Notes for review
@@ -68,7 +76,7 @@ git push origin upstream-pr/netns-free-clean
 # then open a PR: multikernel/sandlock main ← imhun/sandlock upstream-pr/netns-free-clean
 ```
 
-> ⚠️ 本环境无法推送：仓库已备好（`upstream-pr/netns-free-clean` @ `d3a28cc`），
+> ⚠️ 本环境无法推送：仓库已备好（`upstream-pr/netns-free-clean`，tip `b6ef050`），
 > 但当前 `GITHUB_TOKEN` 是只读 PAT（API 写操作返回 403 "Resource not
 > accessible"），git push 同样 403。需要换一个有写权限的 token 或手动推送后
 > 再开 PR。
