@@ -386,3 +386,50 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
   egressProxy；
 - **长期（本方案）**：sandlock on-behalf 域名规则引擎 + SOCKS5 分支 +
   inject 暴露，完整对齐 E2B。
+
+## 9. 实现状态（2026-08-29，fork: imhun/sandlock @ feature/network-wildcard）
+
+### 已落地（sandlock-core 0.8.6 fork，全部带单测）
+
+- **R1 规则解析**：`NetTarget::HostWildcard`（`*.suffix`，剥离前缀存
+  suffix）；`net_allow` 接受 `*.example.com[:ports]`（TCP/UDP；ICMP 显式
+  拒绝）；非法形态（`**` / `*.` / `*.com` / `*.*.x` / 带 path / 端口 0）
+  报清晰错误；`net_deny` 仍拒绝域名（含通配）。`resolve_net_allow` 把
+  通配条目放入新的 `ResolvedNetAllow.wildcard_domains`，**不做 DNS、不
+  产生 per-IP / `/etc/hosts` 条目**。`format_net_rule` 反序列化支持
+  `*.suffix` 往返。
+- **R2 映射表（新模块 `network/dns_synth.rs`）**：`SyntheticDns` ——
+  hostname ↔ 合成 IP（`127.0.0.2/8`，与 egress 库同段）双向映射，LRU
+  容量上限（默认 4096，防沙箱耗尽 supervisor 内存），合成段耗尽 fail
+  closed；`wildcard_suffix_matches` 后缀匹配（匹配任意子域、不匹配裸域
+  与部分后缀如 `badexample.com`、大小写不敏感）。
+- **R3/R4 连接判定**：`destination_verdict_with_host` —— 带 hostname 时
+  先做通配匹配（后缀 + 端口），未命中回落普通 IP 判定（hostname 不能
+  借合成段绕过字面规则）；`connect_on_behalf` 对合成段地址先反查映射
+  （无映射直接 `ECONNREFUSED`，防直连合成 IP 绕过），命中后 supervisor
+  实时 DNS 解析（dial-time，失败 fail closed）并改写 sockaddr 代连，
+  解析结果再过一次 IP 级判定（防 DNS rebinding + 通配规则绕过）。
+  `NetworkPolicy::AllowList` 增加 `wildcard_domains`，`NetworkState`
+  增加 `synthetic_dns`。
+
+测试与产物：
+
+- sandlock-core 新增 20 个用例（解析 8 + resolve 2 + dns_synth 7 +
+  verdict 5）；lib 全量 `745 passed`（2 个既有 cow/seccomp 用例在容器
+  root 下环境性失败，改动前后一致）。
+- M0 基线：`cargo build --workspace` 通过；wheel
+  `sandlock-0.8.6-cp311-cp311-linux_x86_64.whl` 可在容器内构建。
+
+### 未落地（下一步，按序）
+
+- **R2 运行层（DNS 响应器）**：sandlock 无独立 netns（沙箱共享宿主
+  loopback），静态 `/etc/hosts` 无法表达任意子域。需要：每沙箱 UDP DNS
+  listener（`127.0.0.1` 独立端口）+ `openat("/etc/resolv.conf")` memfd
+  虚拟化 + 解析端点在 verdict/send 路径的豁免（仿 HTTP ACL 的
+  loopback 处理）；或用 netlink 合成网卡提供沙箱内 DNS 地址。涉及
+  seccomp/send 安全面，建议作为独立变更走完。
+- **M3 项目接入**：`gateway_common/network.py` 普通模式放开通配 +
+  `SandlockExecutor` 透传 + `tests/security` 通配用例。**在 DNS 响应器
+  落地前不要放开 API**（避免"规则接受但不生效"的 fake success）。
+- M4（Block B）/ M5（Block C）/ M6（wheel 矩阵）/ M7（上游 PR）维持
+  原计划不变。

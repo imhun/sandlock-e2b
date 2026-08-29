@@ -4,6 +4,38 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
+## 本会话已完成（Block A 第一阶段 — sandlock fork：通配域名规则）
+
+1. **fork 基线（M0）**：`tmp/sandlock-src`（imhun/sandlock，0.8.6，
+   origin=fork / upstream=multikernel）。构建链：
+   `sandlock-dev:latest`（e2b-sandlock-test + rustup/rsproxy）；容器内
+   `cargo build --workspace --offline`（宿主 `~/.cargo/registry` 挂载做
+   缓存）通过；`sandlock-0.8.6-cp311-cp311-linux_x86_64.whl` 可构建。
+   macOS 无法编译 sandlock-core（seccomp/Landlock 仅 Linux），stub
+   编译加了非 Linux 宿主宽容（build.rs，Linux 上仍致命）。
+2. **R1 通配解析**：`NetTarget::HostWildcard` + 校验（`**`/`*.`/`*.com`/
+   `*.*.x` 拒绝）+ `ResolvedNetAllow.wildcard_domains`（不 DNS）；
+   `format_net_rule` 往返。
+3. **R2 映射表**：`network/dns_synth.rs` —— `SyntheticDns`
+   （127.0.0.2/8、双向映射、LRU 4096、耗尽 fail closed）+
+   `wildcard_suffix_matches`（子域匹配/裸域不匹配/大小写不敏感）。
+4. **R3/R4 连接判定**：`destination_verdict_with_host`；
+   `connect_on_behalf` 合成段反查（无映射拒连）→ 实时 DNS 解析改写
+   sockaddr 代连 → 解析结果二次 IP 校验。`NetworkPolicy::AllowList` 增
+   `wildcard_domains`；`NetworkState` 增 `synthetic_dns`。
+5. **测试**：fork 新增 20 用例；`cargo test -p sandlock-core --lib`
+   `745 passed`（2 个 cow/seccomp 容器 root 环境性失败，基线一致）。
+   fork 改动在 `feature/network-wildcard` 分支。
+
+### 下一步（Block A 未完）
+
+- **R2 运行层（DNS 响应器）**：每沙箱 UDP DNS listener + `resolv.conf`
+  memfd 虚拟化 + 解析端点豁免；或 netlink 合成网卡 DNS。**没落地前不要
+  放开普通模式 API**（避免 fake success）。详细见
+  `docs/sandlock-network-wildcard.md` §9。
+- M3 接入：`gateway_common/network.py` 放开通配 + SandlockExecutor 透传
+  + security 通配用例（在响应器之后）。
+
 ## 本会话已完成（Network API 阶段 B1 — egressProxy）
 
 1. **LD_PRELOAD SOCKS5 隧道库** `envd_service/egress/libegress_proxy.c`：
