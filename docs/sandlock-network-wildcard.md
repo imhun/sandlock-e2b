@@ -277,9 +277,14 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 
 ### 6.1 fork 仓库
 
-- fork `multikernel/sandlock`；基于上游 tag（当前 0.8.6 或更新）建
-  `feature/network-wildcard` 分支；改动以 patch 形式维护，禁止整体改写。
-- 上游同步：每次上游发版 rebase 一次，冲突集中在 rules/connect 两文件。
+- fork：**`https://github.com/imhun/sandlock`**（默认分支 `main`，已验证
+  可克隆；上游 `multikernel/sandlock`）。所有改动在 fork 上进行：
+  - 基于上游 tag（当前 0.8.6 或更新）建 `feature/network-wildcard`
+    分支（Block A/B/C 可拆 `feature/network-inject`、
+    `feature/network-socks5` 等独立分支）；
+  - 改动以 patch 形式维护，禁止整体改写；
+  - 本地协作：fork 为 `origin`，上游 `multikernel/sandlock` 为 `upstream`；
+    每次上游发版 rebase 一次，冲突集中在 rules/connect 两文件。
 
 ### 6.2 Rust 核心（`sandlock-core`）
 

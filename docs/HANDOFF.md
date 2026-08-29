@@ -145,7 +145,10 @@ root_squash、uid=1000 映射、命令 IO 延迟未实测。部署验证时注�
 - **普通模式通配域名（与 E2B 标准一致）**：完整需求点/方案/维护面见
   `docs/sandlock-network-wildcard.md`——需要 fork sandlock 在 on-behalf
   connect 路径加域名规则引擎（合成 IP 映射 + hostname 反查匹配），
-  不能走 LD_PRELOAD（安全降级）。
+  不能走 LD_PRELOAD（安全降级）。**fork 载体已确定：
+  `https://github.com/imhun/sandlock`（默认分支 main，已验证可克隆）**，
+  改动在其 `feature/*` 分支上进行，上游 `multikernel/sandlock` 作为
+  upstream 定期同步。
 - **LD_PRELOAD 隧道已知限制**：静态/Go 应用不受影响（可后续用 sandlock
   on-behalf connect 的 SOCKS5 分支替代，语义更完整）；IPv6 目标/代理未
   隧道（直接 real connect）。
