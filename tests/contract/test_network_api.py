@@ -98,11 +98,24 @@ async def test_network_rejects_unsupported_parts(multinode_two_workers):
     for network in [
         {"maskRequestHost": "internal.example.com"},
         {"rules": {"api.example.com": [{"transform": {"headers": {"X-A": "1"}}}]}},
-        {"allowOut": ["*.example.com"]},
         {"denyOut": ["example.com"]},
     ]:
         resp = await _create_with_network(harness, network)
         assert resp.status_code == 400, network
+
+    # Wildcard allowOut is accepted without an egress proxy (per-sandbox DNS
+    # gateway) and echoed back.
+    created = await _create_with_network(harness, {"allowOut": ["*.example.com"]})
+    assert created.status_code == 201
+    try:
+        detail = await _detail(harness, created.json()["sandboxID"])
+        assert detail["network"]["allowOut"] == ["*.example.com"]
+    finally:
+        async with httpx.AsyncClient(base_url=harness["api_url"]) as client:
+            await client.delete(
+                f"/sandboxes/{created.json()['sandboxID']}",
+                headers={"X-API-Key": "local-key"},
+            )
 
     # A public egress proxy is now accepted and echoed.
     created = await _create_with_network(

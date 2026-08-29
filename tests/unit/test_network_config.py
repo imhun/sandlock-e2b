@@ -27,7 +27,6 @@ def test_normalize_create_rejects_unsupported():
         {"maskRequestHost": "internal.example.com"},
         {"rules": {"api.example.com": [{"transform": {"headers": {"X-A": "1"}}}]}},
         {"denyOut": ["example.com"]},
-        {"allowOut": ["*.example.com"]},
         {"allowOut": "8.8.8.8"},
         {"allowPublicTraffic": "yes"},
         {"bogus": 1},
@@ -88,27 +87,12 @@ def test_egress_proxy_validation():
         )
 
 
-def test_wildcard_domains_allowed_only_with_egress_proxy():
-    """``*.example.com`` needs the egress-proxy filter: rejected on the
-    sandlock net_allow path, accepted once an egress proxy is configured."""
-    with pytest.raises(NetworkConfigError):
-        normalize_network_config({"allowOut": ["*.example.com"]})
-    with pytest.raises(NetworkConfigError):
-        normalize_network_update({"allowOut": ["*.example.com"]})
-
-    net = normalize_network_config(
-        {
-            "egressProxy": {"address": "1.1.1.1:1080"},
-            "allowOut": ["*.example.com"],
-        }
-    )
+def test_wildcard_domains_allowed_without_egress_proxy():
+    """``*.example.com`` is accepted on the fork sandlock net_allow path
+    (per-sandbox DNS gateway), with or without an egress proxy."""
+    net = normalize_network_config({"allowOut": ["*.example.com"]})
     assert net["allowOut"] == ["*.example.com"]
-    update = normalize_network_update(
-        {
-            "egressProxy": {"address": "1.1.1.1:1080"},
-            "allowOut": ["*.example.com"],
-        }
-    )
+    update = normalize_network_update({"allowOut": ["*.example.com"]})
     assert update["allowOut"] == ["*.example.com"]
 
 
@@ -226,8 +210,9 @@ def test_sandlock_executor_maps_network_policy():
 
 
 def test_netns_wildcard_allowout_accepted_and_passed_through(monkeypatch):
-    """With E2B_ENABLE_NETNS on, wildcard allowOut is accepted (no egress
-    proxy needed) and the executor enables per-sandbox netns."""
+    """Wildcard allowOut is accepted without an egress proxy (the fork
+    sandlock's per-sandbox DNS gateway serves it); the executor enables
+    per-sandbox netns only when E2B_ENABLE_NETNS is on."""
     from gateway_common import network
 
     monkeypatch.setenv("E2B_ENABLE_NETNS", "1")
@@ -259,11 +244,13 @@ def test_netns_wildcard_allowout_accepted_and_passed_through(monkeypatch):
     assert kwargs.net_allow == ["*.example.com:443"]
 
 
-def test_netns_wildcard_rejected_without_flag(monkeypatch):
-    """Without E2B_ENABLE_NETNS the previous behavior stands: wildcard
-    allowOut needs the egress proxy (no fake success on the old runtime)."""
+def test_wildcard_allowout_accepted_without_netns_flag(monkeypatch):
+    """Wildcard allowOut no longer requires E2B_ENABLE_NETNS: the default
+    unprivileged shared-netns DNS gateway serves it."""
     from gateway_common import network
 
     monkeypatch.delenv("E2B_ENABLE_NETNS", raising=False)
-    with pytest.raises(network.NetworkConfigError):
-        network.normalize_network_config({"allowOut": ["*.example.com:443"]})
+    normalized = network.normalize_network_config(
+        {"allowOut": ["*.example.com:443"]}
+    )
+    assert normalized == {"allowOut": ["*.example.com:443"]}
