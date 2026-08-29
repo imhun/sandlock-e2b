@@ -130,6 +130,13 @@ E2B_API_URL=http://127.0.0.1:3000 \
 E2B_SANDBOX_URL=http://127.0.0.1:49983 \
 E2B_API_KEY=local-key \
 python scripts/multinode_smoke.py
+
+# 部署级验证（追加：跨 worker 迁移 + 共享 workspace 文件保留 + network
+# 配置回显/原子更新，三 worker 分布）
+E2B_API_URL=http://127.0.0.1:3000 \
+E2B_SANDBOX_URL=http://127.0.0.1:49983 \
+E2B_API_KEY=local-key \
+python scripts/deployment_smoke.py
 ```
 
 要点：

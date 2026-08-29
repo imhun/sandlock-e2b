@@ -115,6 +115,13 @@ services:
       E2B_NODE_ADDRESS: http://worker-2:49983
       E2B_NODE_ID: worker-2
 
+  worker-3:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      E2B_NODE_ADDRESS: http://worker-3:49983
+      E2B_NODE_ID: worker-3
+
   # Optional local registry for template distribution. For HTTP registries,
   # add it to the Docker daemon's insecure-registries on every host.
   registry:

@@ -35,14 +35,17 @@
 2. **构建脚本** `scripts/build-images.sh`：buildx 多架构
    （`linux/amd64,linux/arm64`），多平台需 `PUSH=1`。
 3. **部署示例** `docker-compose.prod.yml` + `.env.example`：控制面 +
-   gateway + worker-1/2（YAML anchor）+ Redis（共享状态）+ 可选本地
+   gateway + worker-1/2/3（YAML anchor）+ Redis（共享状态）+ 可选本地
    registry（profile）；`docker-compose.yml` 单机示例控制面改为
    `E2B_ENABLE_LOCAL_NODE=false`。
 4. **验证**：两镜像构建成功（镜像内容分离确认）；`compose config` 有效；
-   macOS 起栈 `multinode_smoke.py` 全绿（跨节点分布/命令/文件/stdin/
-   配额释放）。踩坑记录：宿主 3000 端口被占用需换端口；本机 docker daemon
-   里 `python:3.11-slim` 曾被 arm64 spike 覆盖导致沙箱 qemu-arm64——
-   拉回 amd64 后正常（顺带验证了 rootfs digest 缓存失效）。
+   macOS 起栈（`--no-build` 强制用分离镜像）三 worker 验证全绿：
+   `multinode_smoke.py`（跨节点分布覆盖 3 worker/命令/文件/stdin/配额释放）
+   + `scripts/deployment_smoke.py`（追加迁移 worker-2→worker-1 共享
+   workspace 文件保留、network 回显/原子更新）。踩坑记录：宿主 3000 端口
+   被占用需换端口；本机 docker daemon 里 `python:3.11-slim` 曾被 arm64
+   spike 覆盖导致沙箱 qemu-arm64——拉回 amd64 后正常（顺带验证了 rootfs
+   digest 缓存失效）。
 
 ## 本会话已完成（Network API，阶段 A + C）
 
@@ -166,7 +169,8 @@ docker run --rm --privileged --network host \
 - `--network host` + `E2B_HOST_PROJECT` 是容器内 docker CLI 访问宿主
   localhost 端口 / 挂载宿主路径的前提（registry/Redis 端口映射、htpasswd
   挂载）。
-- 多节点冒烟：`scripts/multinode_smoke.py`；compose：
+- 多节点冒烟：`scripts/multinode_smoke.py` + `scripts/deployment_smoke.py`
+  （后者含迁移/共享 workspace/network 更新）；compose：
   `docker compose -f docker-compose.multinode.yml up -d`。
 
 ## 关键文件索引
