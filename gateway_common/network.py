@@ -186,8 +186,13 @@ def normalize_network_config(raw: Any) -> dict[str, Any] | None:
     egress_proxy = _normalize_egress_proxy(raw)
     _check_mask_request_host(raw)
     _check_rules(raw)
+    # Wildcard domains (``*.example.com``) are only expressible when the
+    # egress proxy library does the filtering; the sandlock net_allow path
+    # cannot represent them and keeps rejecting them.
     allow_out = _normalize_str_list(
-        raw.get("allowOut"), "allowOut", allow_wildcard_domain=False
+        raw.get("allowOut"),
+        "allowOut",
+        allow_wildcard_domain=egress_proxy is not None,
     )
     deny_out = _normalize_str_list(
         raw.get("denyOut"), "denyOut", allow_wildcard_domain=False
@@ -222,7 +227,9 @@ def normalize_network_update(raw: Any) -> dict[str, Any] | None:
     egress_proxy = _normalize_egress_proxy(raw)
     _check_rules(raw)
     allow_out = _normalize_str_list(
-        raw.get("allowOut"), "allowOut", allow_wildcard_domain=False
+        raw.get("allowOut"),
+        "allowOut",
+        allow_wildcard_domain=egress_proxy is not None,
     )
     deny_out = _normalize_str_list(
         raw.get("denyOut"), "denyOut", allow_wildcard_domain=False

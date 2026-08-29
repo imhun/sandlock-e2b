@@ -140,8 +140,8 @@ root_squash、uid=1000 映射、命令 IO 延迟未实测。部署验证时注�
   main 分支已有 credential injection（`InjectRule`/`AuthShape`，透明代理内
   header 注入），但 PyPI 0.8.6 未发版。接入方式：等上游发版，或 fork
   sandlock 把 inject 暴露到 Python 绑定（`credential.rs`/ffi 已就绪）。
-  `allowOut` 通配域名（`*.example.com`）在 egressProxy 模式下可在库内过滤
-  实现（规则已支持 `*.suffix` 匹配），普通模式仍依赖代理层。
+  `allowOut` 通配域名（`*.example.com`）已在 egressProxy 模式下支持
+  （库内 `*.suffix` 匹配：匹配子域、不匹配裸域名），普通模式仍 400。
 - **LD_PRELOAD 隧道已知限制**：静态/Go 应用不受影响（可后续用 sandlock
   on-behalf connect 的 SOCKS5 分支替代，语义更完整）；IPv6 目标/代理未
   隧道（直接 real connect）。

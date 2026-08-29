@@ -88,6 +88,30 @@ def test_egress_proxy_validation():
         )
 
 
+def test_wildcard_domains_allowed_only_with_egress_proxy():
+    """``*.example.com`` needs the egress-proxy filter: rejected on the
+    sandlock net_allow path, accepted once an egress proxy is configured."""
+    with pytest.raises(NetworkConfigError):
+        normalize_network_config({"allowOut": ["*.example.com"]})
+    with pytest.raises(NetworkConfigError):
+        normalize_network_update({"allowOut": ["*.example.com"]})
+
+    net = normalize_network_config(
+        {
+            "egressProxy": {"address": "1.1.1.1:1080"},
+            "allowOut": ["*.example.com"],
+        }
+    )
+    assert net["allowOut"] == ["*.example.com"]
+    update = normalize_network_update(
+        {
+            "egressProxy": {"address": "1.1.1.1:1080"},
+            "allowOut": ["*.example.com"],
+        }
+    )
+    assert update["allowOut"] == ["*.example.com"]
+
+
 def test_policy_allow_only_is_default_deny():
     policy = sandlock_network_policy(
         {"allowOut": ["8.8.8.8", "10.0.0.0/8"]},

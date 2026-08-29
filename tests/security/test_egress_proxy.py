@@ -181,3 +181,41 @@ async def test_egress_proxy_deny_out_blocks():
         assert all(addr != "example.org" for _a, addr, _p in proxy.log)
     finally:
         await proxy.stop()
+
+
+@pytest.mark.usefixtures("require_sandlock")
+async def test_egress_proxy_wildcard_domain():
+    """``*.example.com`` matches subdomains (remote DNS via the proxy) but
+    not the bare apex domain."""
+    proxy = Socks5Server()
+    await proxy.start()
+    try:
+        ws = tempfile.mkdtemp()
+        lib_dir = Path(tempfile.mkdtemp())
+        executor = _executor(
+            ws,
+            lib_dir,
+            {
+                "egressProxy": {"address": f"127.0.0.1:{proxy.port}"},
+                "allowOut": ["*.example.com"],
+            },
+        )
+
+        subdomain = (
+            "import urllib.request; "
+            "print(urllib.request.urlopen('https://www.example.com', "
+            "timeout=10).status)"
+        )
+        exit_code, out, err = await _run(executor, ws, subdomain)
+        assert exit_code == 0, err.decode()
+        assert out.decode().strip() == "200"
+        assert (3, "www.example.com", 443) in proxy.log, proxy.log
+
+        apex = (
+            "import urllib.request; "
+            "urllib.request.urlopen('https://example.com', timeout=10)"
+        )
+        exit_code, _out, _err = await _run(executor, ws, apex)
+        assert exit_code != 0
+    finally:
+        await proxy.stop()
