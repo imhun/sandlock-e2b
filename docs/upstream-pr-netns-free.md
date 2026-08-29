@@ -50,7 +50,7 @@ does the one-time root prep — sysctl for the `:53` gateway + pre-seeded
 ```text
 sandlock-core lib:       770 passed, 0 failed
 integration (serial):    432 passed, 0 failed
-python:                  414 passed, 16 skipped (/usr/bin/python3 absent)
+python:                  430 passed, 0 skipped
 ```
 
 ## Notes for review

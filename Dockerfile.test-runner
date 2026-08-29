@@ -19,6 +19,11 @@ COPY requirements.txt /tmp/requirements.txt
 COPY requirements-test.txt /tmp/requirements-test.txt
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-test.txt
 
+# The sandlock Python test suite (and the sandboxes it spawns) exec the
+# system interpreter at /usr/bin/python3; the python:3.11-slim image installs
+# it under /usr/local, so expose the conventional path.
+RUN ln -sf /usr/local/bin/python3 /usr/bin/python3
+
 # sandlock fork wheel (Block A/B/C) — see Dockerfile.envd for the arch mapping.
 ARG TARGETARCH
 COPY wheels/fork/ /tmp/wheels/

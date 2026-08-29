@@ -47,8 +47,9 @@ upstream=multikernel）。分支：`feature/network-wildcard`（R1–R4 通配�
 **验证基线（fork，Linux 容器，全程非 root uid=65534）**：lib
 `780 passed, 0 failed`（feature/network-socks5；netns-free PR 分支
 `770 passed`）；integration `437 passed, 0 failed`（PR 分支 `432`；netns
-用例在无 CAP_NET_ADMIN 时按能力跳过）；Python `414 passed + 16 skipped`
-（skip = 镜像缺 `/usr/bin/python3`）。
+用例在无 CAP_NET_ADMIN 时按能力跳过）；Python `430 passed, 0 skipped`
+（`Dockerfile.test-runner` 已补 `/usr/bin/python3 -> /usr/local/bin/python3`
+符号链接）。
 
 **环境注意事项**：
 
