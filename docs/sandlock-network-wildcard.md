@@ -1,7 +1,8 @@
 # sandlock 扩展方案：E2B Network API 能力对齐总纲
 
-> 状态：提案。目标版本基线：sandlock 0.8.6（main 分支 2026-08-23，含
-> credential injection 但未发版）。
+> 状态：Block A（通配域名）与 Block B（header 注入 / host 掩码）已在 fork
+> 落地；Block C（SOCKS5 on-behalf）未开始。目标版本基线：sandlock 0.8.6
+> （main 分支 2026-08-23，含 credential injection 但未发版）。
 
 ## 1. 背景与目标
 
@@ -372,7 +373,7 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 | M1 | R1+R2：规则解析 + DNS 合成 + 映射表 + 单元测试 | `net_allow=["*.example.com:443"]` 可解析、沙箱内返回合成 IP |
 | M2 | R3+R4：connect 反查/匹配/实时解析代连 + 防绕过 | 通配子域可连、裸域/直连合成 IP 拒绝 |
 | M3 | R6：项目接入（普通模式通配放开）+ SDK 用例 | 普通模式 API 放开 |
-| M4 | Block B：ffi/Python 暴露 inject + maskRequestHost + http 通配（R8-R11） | header 注入与 host 掩码可用 |
+| M4 | Block B：ffi/Python 暴露 inject + maskRequestHost + http 通配（R8-R11） | ✅ `feature/network-inject` 已落地（header 注入与 host 掩码可用；项目侧 5B.4 映射待 fork wheel 切源） |
 | M5 | Block C：SOCKS5 on-behalf 分支（R12-R14） | egressProxy 完整化、LD_PRELOAD 退役 |
 | M6 | wheel 矩阵（cp310-314 × x86_64/aarch64）+ Dockerfile 切源 | 可发布、可部署 |
 | M7 | 全量回归（双架构）+ 上游 PR（按 Block 拆分提交） | 与官方对齐、可回切 |
@@ -387,7 +388,11 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 - **长期（本方案）**：sandlock on-behalf 域名规则引擎 + SOCKS5 分支 +
   inject 暴露，完整对齐 E2B。
 
-## 9. 实现状态（2026-08-29，fork: imhun/sandlock @ feature/network-wildcard）
+## 9. 实现状态（2026-08-29，fork: imhun/sandlock）
+
+> 分支：Block A → `feature/network-wildcard` / `feature/network-netns`
+> （当前主线，含无特权默认路径 + per-sandbox netns 可选增强）；Block B →
+> `feature/network-inject`（基于 network-netns）。
 
 ### 已落地（sandlock-core 0.8.6 fork，全部带单测）
 
@@ -420,11 +425,27 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 - M0 基线：`cargo build --workspace` 通过；wheel
   `sandlock-0.8.6-cp311-cp311-linux_x86_64.whl` 可在容器内构建。
 
+### 已落地（Block B — `feature/network-inject`）
+
+- **R11 HTTP 通配 matcher**：`HttpRule::matches` host 位置支持 `*.suffix`
+  （子域匹配、裸域不匹配、大小写不敏感），`parse` 校验非法形态；
+  `extend_net_allow_for_http` 对 `*.suffix` 规则映射
+  `NetTarget::HostWildcard`（走 DNS 合成 + SSRF 护栏）。
+- **R8 credential injection 暴露**：FFI `credential` / `http_auth` builder；
+  Python `Sandbox.http_inject`（matcher/auth/secret/name/on_existing）；
+  secret 仅存 supervisor（`env:` 变量从子进程剥离）。
+- **R10 maskRequestHost**：`host_mask` 贯穿 Sandbox/builder/CLI/FFI/Python/
+  profile；透明代理转发前只改 wire `Host`（`${PORT}` 替换），URI 保持真实
+  目标驱动连接；非法掩码 fail closed。
+- **R9 HTTPS MITM 复用**：注入/掩码在明文与 MITM 共用 handler，TLS 终止
+  路径既有测试覆盖。
+- 验证：lib 763→771（2 个既有 root 环境性失败）、http_acl integration
+  16/16、hermetic 代理测试、Python 412 passed、wheel 可构建。
+
 ### 未落地（下一步，按序）
 
-- **Block B（M4）— header 注入 / maskRequestHost / HTTP 通配**：上游
-  `credential.rs` 已就绪，缺 FFI/Python 暴露 + 透明代理 host 掩码 +
-  HTTP 规则 `*.suffix` 匹配（R8–R11）。无特权模型可实现。
+- **Block C（M5）— SOCKS5 on-behalf**：`ConnectPlan::Socks5Upstream`
+  替代 LD_PRELOAD egress 库（R12–R14），纯 TCP 握手无特权可实现。
 - **Block C（M5）— SOCKS5 on-behalf**：`ConnectPlan::Socks5Upstream`
   替代 LD_PRELOAD egress 库（R12–R14），纯 TCP 握手无特权可实现。
 - **M6 — wheel 矩阵**：cp310–314 × x86_64/aarch64 + 私有 index / git

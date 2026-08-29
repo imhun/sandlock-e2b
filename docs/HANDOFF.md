@@ -25,9 +25,8 @@ upstream=multikernel）。分支：`feature/network-wildcard`（R1–R4 通配�
 
 **未完成（sandlock 本身）**：
 
-- **Block B**（R8–R11）：header 注入 / `maskRequestHost` / HTTP 通配
-  matcher。上游 `credential.rs` 已就绪，只差 FFI/Python 暴露 + 透明代理
-  host 掩码 + HTTP 规则 `*.suffix` 匹配。**无特权模型即可实现**。
+- **Block B（R8–R11）已完成**（分支 `feature/network-inject`，2026-08-29，
+  见下方会话记录）；剩 Block C（R12–R14）与 M6/M7。
 - **Block C**（R12–R14）：SOCKS5 on-behalf（`ConnectPlan::Socks5Upstream`，
   替代 LD_PRELOAD egress 库）。纯 TCP 数据交换，无特权可实现。
 - **M6**：wheel 矩阵（cp310–314 × x86_64/aarch64）+ 私有源/安装切换。
@@ -59,8 +58,39 @@ netlink_virt 14/14。项目 unit+contract `164 passed`。
 - 本环境外部 DNS 被透明代理改写为 198.18.x，SSRF 护栏已放行该段；
   e2e 测试用本地 fixture（worker /etc/hosts → 198.18.0.9x）不依赖外网。
 
-**下一步建议顺序**：① Block B（工作量小、依赖现成 credential.rs）；
-② fork wheel 发布 + 项目切源 + security e2e；③ Block C；④ 上游 PR。
+**下一步建议顺序**：① ~~Block B~~（已完成）；② fork wheel 发布 + 项目切源
+（`rules.transform.headers` / `maskRequestHost` 项目侧映射 + security e2e，
+见 5B.4）；③ Block C；④ 上游 PR。
+
+## 本会话已完成（Block B — header 注入 / maskRequestHost / HTTP 通配）
+
+fork 分支 `feature/network-inject`（基于 feature/network-netns）：
+
+1. **R11 HTTP 通配 matcher**：`HttpRule::matches` 的 host 位置支持
+   `*.suffix`（只匹配子域、不匹配裸域、大小写不敏感，与 `net_allow`
+   通配语义一致）；`parse` 校验非法形态（`**`/`*.`/`*.*`/内嵌 `*` 拒绝）；
+   `extend_net_allow_for_http` 对 `*.suffix` HTTP 规则映射到
+   `NetTarget::HostWildcard`（不再当字面 hostname 解析），走 DNS 合成 +
+   SSRF 护栏。
+2. **R8 credential injection 暴露**：FFI 新增
+   `sandlock_sandbox_builder_credential(name, source)` /
+   `sandlock_sandbox_builder_http_auth(rule)`；Python 新增
+   `Sandbox.http_inject`（list[dict]：matcher/auth/secret/name/on_existing，
+   校验 + 序列化）；CLI 沿用既有 `--credential`/`--http-auth`。secret 仍
+   只存 supervisor（`SecretString` 零化、env: 变量从子进程剥离）。
+3. **R10 host_mask**：`Sandbox`/builder/CLI（`--host-mask`）/FFI/Python
+   （`host_mask`）/TOML profile 新增；`transparent_proxy/service.rs` 转发前
+   只改写 wire `Host` 头（`${PORT}` 替换为真实目标端口），URI authority
+   保持真实（驱动上游连接，hyper-util 保留显式 Host 头）；非法掩码 502
+   fail closed。
+4. **R9 HTTPS MITM 复用**：注入/掩码在明文与 MITM 共用同一 handler，TLS
+   终止路径既有测试覆盖。
+5. **验证**：lib 763→771（2 个既有 cow/seccomp root 环境性失败）；integration
+   http_acl 16/16（新增 host-mask e2e）；hermetic 代理测试（本地上游断言
+   注入头 + 掩码 Host）；Python 全量 412 passed；wheel 可构建且含新符号；
+   `Sandbox(http_allow=[...], http_inject=[...], host_mask=...)` 原生构建通过。
+   注意：本环境 `target/` 已改为指向 `target-linux` 的符号链接（Python
+   `_find_lib` 需要），旧 `target/` 残留已清理。
 
 ## 本会话已完成（Block A 第一阶段 — sandlock fork：通配域名规则）
 
@@ -292,10 +322,9 @@ root_squash、uid=1000 映射、命令 IO 延迟未实测。部署验证时注�
 
 - 迁移导出 tar 仍含卷挂载符号链接空条目（功能等价，可显式排除）；
 - 未配置 `E2B_GATEWAY_URL` 时迁移后路由依赖 gateway 30s 缓存 TTL（文档已知）；
-- **Block B — header 改写（rules.transform / maskRequestHost）**：上游
-  `credential.rs`（`InjectRule`/`AuthShape`）已就绪，缺 FFI/Python 暴露 +
-  透明代理 host 掩码 + HTTP 规则 `*.suffix` 匹配（R8–R11）。**无特权模型
-  可实现**（代理是 supervisor 用户态进程）。
+- ~~**Block B — header 改写（rules.transform / maskRequestHost）**~~：fork
+  `feature/network-inject` 已完成（R8–R11，见上）；剩项目侧 5B.4 映射
+  （依赖 fork wheel 切源后生效）。
 - **Block C — SOCKS5 on-behalf**：`ConnectPlan::Socks5Upstream` 替代
   LD_PRELOAD egress 库（R12–R14），纯 TCP 握手无特权可实现。
 - **M6 — wheel 矩阵**：cp310–314 × x86_64/aarch64 + 私有 index / git 安装
