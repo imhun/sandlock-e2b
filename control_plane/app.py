@@ -23,7 +23,33 @@ from control_plane.registry.snapshots import SnapshotRegistry
 from control_plane.registry.templates import TemplateRegistry
 from control_plane.registry.ttl import TTLSweeper
 from control_plane.registry.volumes import VolumeRegistry
-from envd_service.runtime.registry import RuntimeRegistry
+
+
+class _NoopRuntimeRegistry:
+    """Empty runtime registry for the separated control-plane deployment.
+
+    The envd service (and its runtime registry) only exists on worker hosts;
+    the control plane never provisions local sandboxes when
+    ``E2B_ENABLE_LOCAL_NODE=false``, so every registry call is a safe no-op.
+    """
+
+    def register(self, **kwargs):
+        return None
+
+    def get(self, sandbox_id):
+        return None
+
+    def unregister(self, sandbox_id) -> None:
+        pass
+
+    def set_state(self, sandbox_id, state) -> None:
+        pass
+
+    def freeze(self, sandbox_id) -> None:
+        pass
+
+    def thaw(self, sandbox_id) -> None:
+        pass
 
 
 def create_app(
@@ -85,9 +111,21 @@ def create_app(
     app = FastAPI(title="E2B Sandlock Gateway - Control Plane", lifespan=lifespan)
     app.state.settings = settings
     app.state.registry = registry
-    app.state.runtime_registry = runtime_registry or RuntimeRegistry(
-        workspace_base or settings.workspace_base
-    )
+    if runtime_registry is None:
+        # The envd service is only imported on the single-host deployment:
+        # a separated control-plane image (E2B_ENABLE_LOCAL_NODE=false) runs
+        # without it and uses a no-op registry instead.
+        try:
+            from envd_service.runtime.registry import RuntimeRegistry
+        except ImportError:  # pragma: no cover - separated control plane
+            RuntimeRegistry = None  # type: ignore[assignment]
+        if RuntimeRegistry is not None:
+            runtime_registry = RuntimeRegistry(
+                workspace_base or settings.workspace_base
+            )
+        else:
+            runtime_registry = _NoopRuntimeRegistry()
+    app.state.runtime_registry = runtime_registry
     app.state.workspace_base = workspace_base or settings.workspace_base
     app.state.workspace_base.mkdir(parents=True, exist_ok=True)
     volume_root = settings.shared_volume_root or (

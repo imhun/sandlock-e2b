@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from control_plane.config import _env_bool, _env_int
+from gateway_common.env import _env_bool, _env_int
 
 
 @dataclass

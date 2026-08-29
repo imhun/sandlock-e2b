@@ -95,6 +95,57 @@ Dockerfile 使用清华 apt/pip 镜像源、JS SDK 测试使用 npmmirror 源，
 profile 会拦截 sandlock 安装自己的 seccomp 过滤器，`docker-compose.test.yml`
 已配置）。
 
+## 容器镜像与部署
+
+**镜像分离**：`Dockerfile.control-plane` 只打包控制面
+（`gateway_common` + `control_plane`），`Dockerfile.envd` 只打包 worker
+（`gateway_common` + `envd_service`，含 Sandlock、mcp-gateway 和按平台
+预编译的 `libegress_proxy.so`）。两者在代码层已解耦（env 工具函数收敛到
+`gateway_common.env`；控制面在分离模式下用 no-op runtime registry），所以
+控制面镜像不依赖 envd_service、worker 镜像不依赖 control_plane。
+
+**构建（多架构）**：
+
+```bash
+# 单平台加载到本地 docker
+TAG=e2b-sandlock:1.0 PLATFORMS=linux/amd64 ./scripts/build-images.sh
+
+# 多架构（x86_64 + arm64）需推送到 registry
+TAG=registry.example.com/e2b:1.0 \
+PLATFORMS=linux/amd64,linux/arm64 \
+PUSH=1 ./scripts/build-images.sh
+```
+
+产出两个镜像：`<tag>-control-plane` 与 `<tag>-worker`。
+
+**生产部署示例**（控制面 + gateway + 多 worker + Redis 共享状态 + 可选本地
+镜像仓库）：
+
+```bash
+cp .env.example .env        # 修改密钥/端口/仓库
+docker compose -f docker-compose.prod.yml up -d --build
+
+# 冒烟验证（沙箱跨节点分布、经 gateway 的命令/文件/stdin、kill 后配额释放）
+E2B_API_URL=http://127.0.0.1:3000 \
+E2B_SANDBOX_URL=http://127.0.0.1:49983 \
+E2B_API_KEY=local-key \
+python scripts/multinode_smoke.py
+```
+
+要点：
+- worker 需要 `security_opt: [seccomp=unconfined]`（嵌套 seccomp 过滤器）与
+  Docker daemon socket（模板 rootfs 解析）；`E2B_ENABLE_NETWORK=true` 时
+  网络 API 策略才生效；
+- 控制面设置 `E2B_SHARED_WORKSPACE_ROOT` + worker 挂同一存储（示例用
+  named volume 模拟；跨机部署指向同一 NFS/CSI 挂载），迁移只切路由；
+- `E2B_REDIS_URL` 指向 Redis 后多控制面副本共享注册表/配额/迁移锁；
+- 模板镜像仓库（`E2B_IMAGE_REGISTRY`）留空时保持单机行为；启用本地
+  `registry` 服务（`--profile registry`）需把其地址加入 daemon
+  insecure-registries；
+- macOS 冒烟如遇宿主端口占用，通过 `.env` 的 `CONTROL_PLANE_PORT` /
+  `GATEWAY_PORT` 换端口；Docker Desktop/OrbStack 用户把 `DOCKER_SOCK`
+  指向本机 docker.sock。
+
 ## 环境变量
 
 控制面与 envd 的全部配置见 spec §7.2，默认值与之一致。常用：

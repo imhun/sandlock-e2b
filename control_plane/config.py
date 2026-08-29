@@ -7,42 +7,12 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None or value.strip() == "":
-        return default
-    return int(value)
-
-
-def _env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
-    value = os.getenv(name)
-    if value is None or value.strip() == "":
-        return default
-    items: list[str] = []
-    for part in value.split(","):
-        part = part.strip()
-        if part:
-            items.append(part)
-    return tuple(items)
-
-
-def _env_json_dict(name: str) -> dict[str, str]:
-    value = os.getenv(name)
-    if not value:
-        return {}
-    parsed = json.loads(value)
-    if not isinstance(parsed, dict):
-        raise ValueError(f"{name} must be a JSON object")
-    return {str(k): str(v) for k, v in parsed.items()}
-
+from gateway_common.env import (
+    _env_bool,
+    _env_int,
+    _env_json_dict,
+    _env_list,
+)
 
 @dataclass
 class Settings:

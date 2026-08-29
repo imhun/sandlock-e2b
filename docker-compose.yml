@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile.control-plane
     environment:
       E2B_API_KEYS: local-key
+      E2B_ENABLE_LOCAL_NODE: "false"
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_MAX_SANDBOXES: 100
       E2B_BASE_IMAGE: python:3.11-slim
@@ -40,4 +41,3 @@ services:
 
 volumes:
   sandbox-data:
-

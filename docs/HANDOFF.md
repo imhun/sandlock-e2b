@@ -24,6 +24,26 @@
 5. **限制**：仅 IPv4 代理；仅动态链接应用（python/node）；过滤在沙箱内
    库做（LD_PRELOAD 方案固有妥协）；rules/maskRequestHost 仍 400。
 
+## 本会话已完成（最终容器镜像 + 分离部署）
+
+1. **镜像分离**：`Dockerfile.control-plane` 只含 `gateway_common` +
+   `control_plane`；`Dockerfile.envd` 只含 `gateway_common` + `envd_service`，
+   且 multi-stage 预编译 `libegress_proxy.so` 到 `/opt/egress/`（最终镜像
+   不带 gcc）。代码层解耦：env 工具函数移到 `gateway_common/env.py`；
+   控制面 `create_app` 对 `RuntimeRegistry` 懒导入，分离模式用 no-op
+   哨兵（pause/resume/snapshots/kill 等调用安全）。
+2. **构建脚本** `scripts/build-images.sh`：buildx 多架构
+   （`linux/amd64,linux/arm64`），多平台需 `PUSH=1`。
+3. **部署示例** `docker-compose.prod.yml` + `.env.example`：控制面 +
+   gateway + worker-1/2（YAML anchor）+ Redis（共享状态）+ 可选本地
+   registry（profile）；`docker-compose.yml` 单机示例控制面改为
+   `E2B_ENABLE_LOCAL_NODE=false`。
+4. **验证**：两镜像构建成功（镜像内容分离确认）；`compose config` 有效；
+   macOS 起栈 `multinode_smoke.py` 全绿（跨节点分布/命令/文件/stdin/
+   配额释放）。踩坑记录：宿主 3000 端口被占用需换端口；本机 docker daemon
+   里 `python:3.11-slim` 曾被 arm64 spike 覆盖导致沙箱 qemu-arm64——
+   拉回 amd64 后正常（顺带验证了 rootfs digest 缓存失效）。
+
 ## 本会话已完成（Network API，阶段 A + C）
 
 1. **network 配置全链路**：`POST /sandboxes` 的 `network` 字段与
@@ -177,6 +197,10 @@ docker run --rm --privileged --network host \
 | `tests/contract/test_template_upload.py` | COPY 上传契约 |
 | `tests/sdk/python/test_templates.py` | 构建、COPY、registry push/pull/认证 |
 | `tests/unit/test_sandbox_registry.py` / `test_redis_multireplica.py` | 迁移锁单元测试（内存 + fakeredis） |
+| `Dockerfile.control-plane` / `Dockerfile.envd` | 分离的最终镜像（envd multi-stage 预编译 egress 库，最终镜像无 gcc） |
+| `docker-compose.prod.yml` / `.env.example` | 生产部署示例（控制面+gateway+worker+Redis+可选 registry） |
+| `scripts/build-images.sh` | buildx 多架构（amd64/arm64）镜像构建脚本 |
+| `gateway_common/env.py` | env 工具函数（消除 control_plane↔envd_service 交叉导入） |
 
 ## 配置速查（新增项）
 

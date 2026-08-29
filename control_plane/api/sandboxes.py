@@ -533,7 +533,8 @@ async def kill_sandbox(sandbox_id: str, request: Request) -> Response:
     node = request.app.state.nodes.get(record.node_id or "local")
     if node is not None and node.address != "local://":
         await _destroy_remote(request, record, node)
-    request.app.state.runtime_registry.unregister(sandbox_id)
+    if request.app.state.runtime_registry is not None:
+        request.app.state.runtime_registry.unregister(sandbox_id)
     registry.cleanup_workspace(record)
     return Response(status_code=204)
 

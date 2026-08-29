@@ -1,0 +1,132 @@
+# Production deployment example: separated control plane, gateway and
+# Sandlock workers, with Redis shared state and an optional local image
+# registry for template distribution.
+#
+#   cp .env.example .env        # adjust secrets / image registry
+#   docker compose -f docker-compose.prod.yml up -d --build
+#   docker compose -f docker-compose.prod.yml ps
+#
+# Multi-host note: to run workers on several machines, point every worker's
+# E2B_WORKSPACE_BASE at the same NFS/CSI share, keep the control plane on one
+# host (or add replicas behind a LB + Redis), and set E2B_NODE_ADDRESS to the
+# worker's reachable address. The egress-proxy and template-rootfs features
+# need the worker's Docker daemon socket and a C-compiled library that is
+# already baked into this image per platform.
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.control-plane
+    image: ${CONTROL_PLANE_IMAGE:-e2b-sandlock:latest-control-plane}
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      E2B_API_KEYS: ${E2B_API_KEYS:-local-key}
+      E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
+      E2B_ENABLE_LOCAL_NODE: "false"
+      E2B_REDIS_URL: redis://redis:6379/0
+      E2B_GATEWAY_URL: http://gateway:49983
+      # Shared workspace root: workers mount the same storage, so migration
+      # only switches routes (no archive transfer).
+      E2B_SHARED_WORKSPACE_ROOT: /var/lib/e2b-sandboxes
+      E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # Template images are pushed here after build; workers pull on demand.
+      # Leave empty to keep single-host behavior (image stays local).
+      E2B_IMAGE_REGISTRY: ${E2B_IMAGE_REGISTRY:-}
+      E2B_IMAGE_REGISTRY_USERNAME: ${E2B_IMAGE_REGISTRY_USERNAME:-}
+      E2B_IMAGE_REGISTRY_PASSWORD: ${E2B_IMAGE_REGISTRY_PASSWORD:-}
+      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.11-slim}
+      E2B_MAX_SANDBOXES: ${E2B_MAX_SANDBOXES:-100}
+      E2B_MAX_TOTAL_MEMORY_MB: ${E2B_MAX_TOTAL_MEMORY_MB:-8192}
+      E2B_MAX_TOTAL_CPU_PERCENT: ${E2B_MAX_TOTAL_CPU_PERCENT:-400}
+      E2B_MAX_TOTAL_DISK_MB: ${E2B_MAX_TOTAL_DISK_MB:-10240}
+      E2B_MAX_TOTAL_PROCESSES: ${E2B_MAX_TOTAL_PROCESSES:-2048}
+    ports:
+      - "${CONTROL_PLANE_PORT:-3000}:3000"
+    volumes:
+      - sandbox-shared:/var/lib/e2b-sandboxes
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.envd
+    image: ${WORKER_IMAGE:-e2b-sandlock:latest-worker}
+    command: python -m envd_service.gateway_main
+    depends_on:
+      - control-plane
+    environment:
+      E2B_CONTROL_PLANE_URL: http://control-plane:3000
+      E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
+      E2B_GATEWAY_PORT: 49983
+    ports:
+      - "${GATEWAY_PORT:-49983}:49983"
+    restart: unless-stopped
+
+  worker-1: &worker
+    build:
+      context: .
+      dockerfile: Dockerfile.envd
+    image: ${WORKER_IMAGE:-e2b-sandlock:latest-worker}
+    depends_on:
+      - control-plane
+    environment: &worker-env
+      E2B_CONTROL_PLANE_URL: http://control-plane:3000
+      E2B_NODE_ADDRESS: http://worker-1:49983
+      E2B_NODE_ID: worker-1
+      E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
+      # Per-sandbox network policies (allowOut/denyOut/egressProxy) are only
+      # enforced when the platform switch is on.
+      E2B_ENABLE_NETWORK: "true"
+      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.11-slim}
+      E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_IMAGE_REGISTRY_USERNAME: ${E2B_IMAGE_REGISTRY_USERNAME:-}
+      E2B_IMAGE_REGISTRY_PASSWORD: ${E2B_IMAGE_REGISTRY_PASSWORD:-}
+      E2B_NODE_MEMORY_MB: ${E2B_NODE_MEMORY_MB:-2048}
+      E2B_NODE_CPU_PERCENT: ${E2B_NODE_CPU_PERCENT:-200}
+      E2B_NODE_DISK_MB: ${E2B_NODE_DISK_MB:-4096}
+      E2B_NODE_PROCESSES: ${E2B_NODE_PROCESSES:-256}
+    volumes: &worker-volumes
+      - sandbox-shared:/var/lib/e2b-sandboxes
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+    restart: unless-stopped
+
+  worker-2:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      E2B_NODE_ADDRESS: http://worker-2:49983
+      E2B_NODE_ID: worker-2
+
+  # Optional local registry for template distribution. For HTTP registries,
+  # add it to the Docker daemon's insecure-registries on every host.
+  registry:
+    image: registry:2
+    profiles: ["registry"]
+    ports:
+      - "${REGISTRY_PORT:-5000}:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  sandbox-shared:
+  registry-data:

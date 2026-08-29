@@ -325,11 +325,21 @@ class SandlockExecutor(Executor):
         return self._egress_resolved
 
     def _egress_library(self) -> Path:
-        """Build (once, cached) the LD_PRELOAD egress proxy library."""
+        """Return the LD_PRELOAD egress proxy library.
+
+        Prefers the platform-matched library baked into the worker image
+        (``/opt/egress/libegress_proxy.so``); otherwise builds it once from
+        source into ``egress_lib_dir`` (dev/test fallback, requires cc).
+        """
         if self._egress_lib_dir is None:
             raise RuntimeError("egress proxy requires egress_lib_dir")
         lib = self._egress_lib_dir / "libegress_proxy.so"
         if lib.is_file():
+            return lib
+        baked = Path("/opt/egress/libegress_proxy.so")
+        if baked.is_file():
+            self._egress_lib_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(baked, lib)
             return lib
         import shutil as _shutil
         import subprocess as _subprocess
