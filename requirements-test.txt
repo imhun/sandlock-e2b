@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=8.0
+pytest-asyncio>=0.23
+e2b==2.46.0
+sandlock==0.8.6; sys_platform == "linux"
+fakeredis>=2.20

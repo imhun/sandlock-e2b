@@ -1,0 +1,32 @@
+[project]
+name = "e2b-sandlock-gateway"
+version = "2.0.0"
+description = "Local E2B-compatible gateway backed by Sandlock (Landlock + seccomp)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "httpx>=0.27",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "e2b==2.46.0",
+    "sandlock==0.8.6; sys_platform == 'linux'",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra"
+markers = [
+    "perf: performance tests (run with --perf)",
+    "sdk: official SDK integration tests",
+]
+
+[tool.setuptools.packages.find]
+include = ["control_plane*", "envd_service*", "gateway_common*"]

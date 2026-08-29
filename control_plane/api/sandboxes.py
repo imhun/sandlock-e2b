@@ -1,0 +1,1039 @@
+"""Sandbox lifecycle endpoints mirroring the official Sandbox OpenAPI."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import tarfile
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter, Depends, Query, Request, Response
+
+from control_plane.api.errors import OfficialError
+from control_plane.auth import require_api_key
+from control_plane.registry.manager import (
+    ResourceUnavailableError,
+    SandboxStateConflictError,
+    SandboxRegistry,
+    UnknownSandboxError,
+)
+from control_plane.registry.snapshots import UnknownSnapshotError
+from control_plane.registry.templates import UnknownTemplateBuildError
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# Unsupported fields that must produce an explicit 400 (no fake success).
+UNSUPPORTED_FIELDS = ("image", "network", "iam", "lifecycle")
+UNSUPPORTED_ENDPOINTS = ("network",)
+
+
+def _registry(request: Request) -> SandboxRegistry:
+    return request.app.state.registry
+
+
+def _unsupported_field_error(field: str) -> OfficialError:
+    return OfficialError(400, f"Unsupported field: {field}")
+
+
+def _unsupported_endpoint_error(feature: str) -> OfficialError:
+    return OfficialError(501, f"Unsupported: {feature}")
+
+
+for _feature in UNSUPPORTED_ENDPOINTS:
+
+    @router.api_route(
+        f"/sandboxes/{{sandbox_id}}/{_feature}",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+        include_in_schema=False,
+    )
+    async def _unsupported_sandbox_endpoint(
+        sandbox_id: str, request: Request, _feature: str = _feature
+    ) -> None:
+        raise _unsupported_endpoint_error(_feature)
+
+    @router.api_route(
+        f"/v2/sandboxes/{{sandbox_id}}/{_feature}",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+        include_in_schema=False,
+    )
+    async def _unsupported_v2_endpoint(
+        sandbox_id: str, request: Request, _feature: str = _feature
+    ) -> None:
+        raise _unsupported_endpoint_error(_feature)
+
+
+@router.api_route(
+    "/templates/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    include_in_schema=False,
+)
+async def unsupported_templates(path: str, request: Request) -> None:
+    raise _unsupported_endpoint_error("templates")
+
+
+def _parse_metadata(metadata: str | None) -> dict[str, str]:
+    """Parse URL-encoded ``key=value&key2=value2`` metadata filters."""
+    if not metadata:
+        return {}
+    from urllib.parse import parse_qsl
+
+    return dict(parse_qsl(metadata))
+
+
+def _parse_cursor(next_token: str | None) -> int:
+    """Parse a cursor token into an item offset."""
+    if not next_token:
+        return 0
+    try:
+        return max(0, int(next_token))
+    except ValueError:
+        return 0
+
+
+def _log_ts(log: dict[str, str]) -> int:
+    try:
+        return int(
+            datetime.fromisoformat(
+                log["timestamp"].replace("Z", "+00:00")
+            ).timestamp()
+        )
+    except (ValueError, KeyError):
+        return 0
+
+
+async def _command_logs(request, record) -> list[dict[str, str]]:
+    """Command stdout/stderr lines recorded on the sandbox node."""
+    node = request.app.state.nodes.get(record.node_id or "local")
+    if node is not None and node.address != "local://":
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"{node.address}/agent/sandboxes/{record.sandbox_id}/logs",
+                    headers={
+                        "X-Internal-Key": request.app.state.settings.internal_api_key
+                    },
+                )
+            if resp.status_code == 200:
+                payload = resp.json()
+                if isinstance(payload, list):
+                    return [
+                        dict(e)
+                        for e in payload
+                        if isinstance(e, dict)
+                        and "line" in e
+                        and "timestamp" in e
+                    ]
+        except (httpx.HTTPError, ValueError):
+            pass
+        return []
+    workspace = record.workspace_dir or (
+        request.app.state.workspace_base / record.sandbox_id
+    )
+    log_path = Path(workspace) / "command-logs.jsonl"
+    entries: list[dict[str, str]] = []
+    if log_path.is_file():
+        try:
+            for line in log_path.read_text(encoding="utf-8").splitlines():
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict) and "line" in entry and "timestamp" in entry:
+                    entries.append(dict(entry))
+        except OSError:
+            pass
+    return entries
+    try:
+        return max(0, int(next_token))
+    except ValueError:
+        return 0
+
+
+@router.post("/sandboxes", status_code=201, dependencies=[Depends(require_api_key)])
+async def create_sandbox(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise OfficialError(400, "Invalid JSON body")
+    if not isinstance(body, dict):
+        raise OfficialError(400, "Request body must be a JSON object")
+
+    for field in UNSUPPORTED_FIELDS:
+        if field in body and body[field] is not None:
+            raise _unsupported_field_error(field)
+
+    template_id = body.get("templateID")
+    if not isinstance(template_id, str) or not template_id:
+        raise OfficialError(400, "templateID is required")
+
+    settings = request.app.state.settings
+    base_image = settings.resolve_template_image(template_id)
+    snapshot = None
+    template_record = None
+    if base_image is None and (
+        template_id != "base"
+        and template_id != "mcp-gateway"
+        and template_id not in settings.template_images
+    ):
+        try:
+            snapshot = request.app.state.snapshots.get(template_id)
+        except UnknownSnapshotError:
+            snapshot = None
+        if snapshot is None:
+            try:
+                template_record = request.app.state.templates.get(template_id)
+            except UnknownTemplateBuildError:
+                try:
+                    template_record = request.app.state.templates.get_by_name(
+                        template_id
+                    )
+                except UnknownTemplateBuildError:
+                    template_record = None
+        if snapshot is None and template_record is None:
+            raise OfficialError(400, f"Template {template_id} not found")
+
+    timeout = body.get("timeout", settings.default_timeout)
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
+        raise OfficialError(400, "timeout must be a positive integer")
+
+    metadata = body.get("metadata") or (snapshot.metadata if snapshot else {})
+    env_vars = body.get("envVars") or (snapshot.env_vars if snapshot else {})
+    if not isinstance(metadata, dict) or not isinstance(env_vars, dict):
+        raise OfficialError(400, "metadata and envVars must be objects")
+
+    # MCP: only local stdio base servers are supported.
+    mcp = body.get("mcp")
+    if mcp is not None:
+        if not isinstance(mcp, dict) or not isinstance(mcp.get("command"), str):
+            raise OfficialError(
+                400,
+                "Unsupported MCP server: only base servers with a command are supported",
+            )
+        if "github" in mcp.get("name", "").lower():
+            raise OfficialError(
+                400, "Unsupported MCP server: GitHub servers are not supported"
+            )
+
+    # Volume mounts: [{name: <volumeID>, path: <mount path>}]
+    volume_mounts: list[dict[str, str]] = []
+    raw_mounts = body.get("volumeMounts")
+    if raw_mounts is None and snapshot is not None:
+        raw_mounts = snapshot.volume_mounts
+    if raw_mounts:
+        if not isinstance(raw_mounts, list):
+            raise OfficialError(400, "volumeMounts must be a list")
+        volume_registry = request.app.state.volumes
+        for mount in raw_mounts:
+            if not isinstance(mount, dict):
+                raise OfficialError(400, "volumeMounts entries must be objects")
+            name = mount.get("name")
+            path = mount.get("path")
+            if not isinstance(name, str) or not isinstance(path, str):
+                raise OfficialError(400, "volumeMounts entries need name and path")
+            try:
+                volume_registry.get(name)
+            except Exception:
+                raise OfficialError(404, f"Volume {name} not found")
+            volume_mounts.append({"name": name, "path": path})
+
+    secure = body.get("secure", True)
+    allow_internet_access = body.get("allow_internet_access", False)
+    if not isinstance(secure, bool) or not isinstance(allow_internet_access, bool):
+        raise OfficialError(400, "secure and allow_internet_access must be booleans")
+
+    registry = _registry(request)
+    secrets = request.app.state.secrets
+    try:
+        resolved_env = secrets.resolve_env_refs(
+            {str(k): str(v) for k, v in env_vars.items()}
+        )
+        record = registry.create(
+            template_id=template_id,
+            timeout=timeout,
+            metadata={str(k): str(v) for k, v in metadata.items()},
+            env_vars=resolved_env,
+            secure=secure,
+            allow_internet_access=(
+                allow_internet_access
+                if snapshot is None
+                else snapshot.allow_internet_access
+            ),
+            base_image=(
+                base_image
+                or (snapshot.base_image if snapshot else None)
+                or (template_record.image if template_record else None)
+            ),
+            volume_mounts=volume_mounts,
+            mcp=dict(mcp) if mcp is not None else None,
+        )
+    except ResourceUnavailableError as e:
+        raise OfficialError(503, str(e))
+    except ValueError as e:
+        raise OfficialError(400, str(e))
+
+    # Select a compute node and reserve its quota (volume/snapshot affinity).
+    settings = request.app.state.settings
+    volume_node_id: str | None = None
+    if snapshot is not None:
+        volume_node_id = snapshot.node_id
+    elif volume_mounts:
+        volume_records = [
+            request.app.state.volumes.get(m["name"]) for m in volume_mounts
+        ]
+        shared_root = settings.shared_volume_root
+        shared = bool(
+            shared_root
+            and all(
+                r.path is not None and r.path.is_relative_to(Path(shared_root).resolve())
+                for r in volume_records
+            )
+        )
+        if not shared:
+            node_ids = {r.node_id for r in volume_records}
+            if len(node_ids) > 1:
+                registry.delete(record.sandbox_id)
+                raise OfficialError(400, "all volume mounts must be on the same node")
+            volume_node_id = next(iter(node_ids)) if node_ids else None
+    node = request.app.state.select_node(
+        base_image=record.base_image,
+        volume_node_id=volume_node_id,
+        memory_mb=record.memory_mb,
+        cpu_percent=record.cpu_count * 100,
+        disk_mb=record.disk_size_mb,
+        processes=record.max_processes,
+    )
+    if node is None:
+        registry.delete(record.sandbox_id)
+        raise OfficialError(503, "No resources available")
+    record.node_id = node.node_id
+    registry.save(record)
+
+    try:
+        if node.address == "local://":
+            workspace_dir = _provision_local(
+                request, record, snapshot, volume_mounts, settings
+            )
+        else:
+            await _provision_remote(
+                request,
+                record,
+                node,
+                settings,
+                snapshot,
+                volume_mounts,
+                snapshot_id=snapshot.snapshot_id if snapshot else None,
+            )
+        record.append_log("sandbox created")
+        registry.save(record)
+    except OfficialError:
+        registry.delete(record.sandbox_id)
+        raise
+    except Exception as e:
+        registry.delete(record.sandbox_id)
+        raise OfficialError(500, f"Failed to provision sandbox runtime: {e}") from e
+
+    logger.info(
+        "created sandbox %s (template=%s image=%s node=%s)",
+        record.sandbox_id,
+        template_id,
+        base_image,
+        node.node_id,
+    )
+    return record.as_sandbox()
+
+
+def _provision_local(request, record, snapshot, volume_mounts, settings) -> None:
+    """Provision the sandbox on the in-process (local) worker."""
+    workspace_dir = request.app.state.workspace_base / record.sandbox_id
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    if snapshot is not None:
+        request.app.state.snapshots.expand_to(snapshot, workspace_dir)
+    else:
+        (workspace_dir / "workspace").mkdir(parents=True, exist_ok=True)
+    record.workspace_dir = workspace_dir
+    mount_paths: list[dict[str, str]] = []
+    for mount in volume_mounts:
+        volume = request.app.state.volumes.get(mount["name"])
+        rel_path = mount["path"].lstrip("/")
+        if not rel_path:
+            raise OfficialError(400, "volumeMounts path must not be empty")
+        target = workspace_dir / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            if target.is_dir() and not target.is_symlink():
+                raise OfficialError(
+                    400, f"Mount path {mount['path']} already exists"
+                )
+            # Replace a stale mount symlink (e.g. migration rollback
+            # re-provisioning the source node).
+            target.unlink()
+        target.symlink_to(volume.path, target_is_directory=True)
+        mount_paths.append({"path": rel_path, "hostPath": str(volume.path)})
+    request.app.state.runtime_registry.register(
+        sandbox_id=record.sandbox_id,
+        access_token=record.envd_access_token,
+        workspace_dir=str(workspace_dir),
+        env_vars=record.env_vars,
+        base_image=record.base_image,
+        memory_mb=record.memory_mb,
+        cpu_percent=record.cpu_count * 100,
+        disk_mb=record.disk_size_mb,
+        max_processes=record.max_processes,
+        allow_internet_access=record.allow_internet_access,
+        max_command_timeout=settings.max_command_timeout,
+        volume_mounts=mount_paths,
+        mcp=record.mcp,
+    )
+
+
+async def _provision_remote(
+    request, record, node, settings, snapshot, volume_mounts, snapshot_id=None
+) -> None:
+    """Provision the sandbox on a remote worker through its agent API."""
+    import httpx
+
+    payload = {
+        "sandboxID": record.sandbox_id,
+        "accessToken": record.envd_access_token,
+        "envVars": record.env_vars,
+        "baseImage": record.base_image,
+        "memoryMB": record.memory_mb,
+        "cpuPercent": record.cpu_count * 100,
+        "diskMB": record.disk_size_mb,
+        "maxProcesses": record.max_processes,
+        "allowInternetAccess": record.allow_internet_access,
+        "maxCommandTimeout": settings.max_command_timeout,
+        "volumeMounts": [
+            {
+                "path": m["path"].lstrip("/"),
+                "name": m["name"],
+                "hostPath": str(
+                    request.app.state.volumes.get(m["name"]).path
+                ),
+            }
+            for m in volume_mounts
+        ],
+        "mcp": record.mcp,
+        "snapshotTar": None,
+        "snapshotID": snapshot_id,
+    }
+    internal_key = settings.internal_api_key
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                f"{node.address}/agent/sandboxes",
+                json=payload,
+                headers={"X-Internal-Key": internal_key},
+            )
+    except httpx.HTTPError as e:
+        raise OfficialError(502, f"Node {node.node_id} unavailable: {e}") from e
+    if resp.status_code >= 300:
+        raise OfficialError(502, f"Node {node.node_id} failed to provision: {resp.text}")
+    record.workspace_dir = None
+
+
+@router.get("/sandboxes", dependencies=[Depends(require_api_key)])
+async def list_sandboxes_legacy(request: Request) -> list[dict[str, Any]]:
+    registry = _registry(request)
+    records = registry.list(limit=None)
+    return [r.as_listed() for r in records]
+
+
+@router.get("/v2/sandboxes", dependencies=[Depends(require_api_key)])
+async def list_sandboxes(
+    request: Request,
+    response: Response,
+    metadata: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    order: str = Query(default="desc"),
+    startedAfter: datetime | None = Query(default=None, alias="startedAfter"),
+    template: str | None = Query(default=None),
+    nextToken: str | None = Query(default=None, alias="nextToken"),
+    limit: int = Query(default=100, ge=1, le=100),
+) -> list[dict[str, Any]]:
+    if order not in ("asc", "desc"):
+        raise OfficialError(400, "order must be asc or desc")
+    state_filter = None
+    if state is not None:
+        state_filter = [s for s in state.split(",") if s]
+    registry = _registry(request)
+    total = len(
+        registry.list(
+            metadata_filter=_parse_metadata(metadata),
+            state_filter=state_filter,
+            order=order,
+            started_after=startedAfter,
+            template=template,
+            limit=None,
+        )
+    )
+    offset = _parse_cursor(nextToken)
+    page = registry.list(
+        metadata_filter=_parse_metadata(metadata),
+        state_filter=state_filter,
+        order=order,
+        started_after=startedAfter,
+        template=template,
+        limit=limit,
+        offset=offset,
+    )
+    # Cursor pagination: the next token encodes the absolute offset of the
+    # following page.
+    if offset + len(page) < total:
+        response.headers["X-Next-Token"] = str(offset + len(page))
+    return [r.as_listed() for r in page]
+
+
+@router.get("/sandboxes/{sandbox_id}", dependencies=[Depends(require_api_key)])
+async def get_sandbox_info(sandbox_id: str, request: Request) -> dict[str, Any]:
+    registry = _registry(request)
+    try:
+        return registry.get(sandbox_id).as_detail()
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+
+
+@router.delete("/sandboxes/{sandbox_id}", status_code=204, dependencies=[Depends(require_api_key)])
+async def kill_sandbox(sandbox_id: str, request: Request) -> Response:
+    registry = _registry(request)
+    try:
+        record = registry.delete(sandbox_id)
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+    node = request.app.state.nodes.get(record.node_id or "local")
+    if node is not None and node.address != "local://":
+        await _destroy_remote(request, record, node)
+    request.app.state.runtime_registry.unregister(sandbox_id)
+    registry.cleanup_workspace(record)
+    return Response(status_code=204)
+
+
+async def _destroy_remote(request, record, node, keep_files: bool = False) -> None:
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            url = f"{node.address}/agent/sandboxes/{record.sandbox_id}"
+            if keep_files:
+                url += "?keepFiles=true"
+            await client.delete(
+                url,
+                headers={
+                    "X-Internal-Key": request.app.state.settings.internal_api_key
+                },
+            )
+    except httpx.HTTPError:
+        pass
+
+
+def _destroy_local(request, record, keep_files: bool = False) -> None:
+    request.app.state.runtime_registry.unregister(record.sandbox_id)
+    if not keep_files:
+        shutil.rmtree(
+            request.app.state.workspace_base / record.sandbox_id, ignore_errors=True
+        )
+
+
+async def _destroy_on_node(request, record, node, keep_files: bool = False) -> None:
+    if node.address == "local://":
+        _destroy_local(request, record, keep_files=keep_files)
+        return
+    await _destroy_remote(request, record, node, keep_files=keep_files)
+
+
+async def _stop_source_runtime(request, record, node) -> bool:
+    """Stop the sandbox runtime on the source node, keeping its files.
+
+    Unregistering the runtime kills the process tree, closing the dual-active
+    window: once the gateway route switches, no command can still be served
+    by the old node. Returns ``False`` when the node did not acknowledge the
+    stop, in which case the caller must abort the migration.
+    """
+    if node.address == "local://":
+        _destroy_local(request, record, keep_files=True)
+        return True
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.delete(
+                f"{node.address}/agent/sandboxes/{record.sandbox_id}"
+                "?keepFiles=true",
+                headers={
+                    "X-Internal-Key": request.app.state.settings.internal_api_key
+                },
+            )
+    except httpx.HTTPError:
+        return False
+    return resp.status_code == 204
+
+
+def _migration_volume_node_id(request, record) -> str | None:
+    """Return the node pinning non-shared volumes, else ``None``."""
+    if not record.volume_mounts:
+        return None
+    volume_registry = request.app.state.volumes
+    settings = request.app.state.settings
+    shared_root = settings.shared_volume_root
+    volume_records = [volume_registry.get(m["name"]) for m in record.volume_mounts]
+    shared = bool(
+        shared_root
+        and all(
+            r.path is not None
+            and r.path.is_relative_to(Path(shared_root).resolve())
+            for r in volume_records
+        )
+    )
+    if shared:
+        return None
+    node_ids = {r.node_id for r in volume_records}
+    if len(node_ids) > 1:
+        raise OfficialError(400, "all volume mounts must be on the same node")
+    return next(iter(node_ids)) if node_ids else None
+
+
+def _extract_sandbox_archive(archive_path: Path, dest: Path) -> None:
+    """Extract a sandbox tar.gz, skipping absolute symlink members.
+
+    Volume mounts are archived as symlinks to host paths that only exist on
+    the source node; provisioning re-creates them on the target.
+    """
+    with tarfile.open(archive_path) as tar:
+        members = []
+        for member in tar.getmembers():
+            target = (dest / member.name).resolve()
+            if not target.is_relative_to(dest.resolve()):
+                raise ValueError(f"archive member escapes workspace: {member.name}")
+            if member.issym() and os.path.isabs(member.linkname):
+                continue
+            members.append(member)
+        try:
+            tar.extractall(dest, members=members, filter="data")
+        except TypeError:  # pragma: no cover - Python < 3.12
+            tar.extractall(dest, members=members)
+
+
+async def _export_sandbox_archive(request, record, node) -> Path:
+    """Return a local tar.gz path containing the sandbox workspace."""
+    migrate_dir = request.app.state.workspace_base / "_migrate"
+    migrate_dir.mkdir(parents=True, exist_ok=True)
+    tar_path = migrate_dir / f"{record.sandbox_id}.tar.gz"
+    if node.address == "local://":
+        workspace = request.app.state.workspace_base / record.sandbox_id
+        if not workspace.is_dir():
+            raise OfficialError(
+                404, f"Sandbox workspace not found on node {node.node_id}"
+            )
+        with tarfile.open(tar_path, "w:gz") as tar:
+            tar.add(workspace, arcname=".", recursive=True)
+        return tar_path
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.get(
+                f"{node.address}/agent/sandboxes/{record.sandbox_id}/export",
+                headers={
+                    "X-Internal-Key": request.app.state.settings.internal_api_key
+                },
+            )
+    except httpx.HTTPError as e:
+        raise OfficialError(502, f"Node {node.node_id} unavailable: {e}") from e
+    if resp.status_code != 200:
+        raise OfficialError(
+            502, f"Node {node.node_id} failed to export: {resp.text}"
+        )
+    tar_path.write_bytes(resp.content)
+    return tar_path
+
+
+async def _import_sandbox_archive(request, record, node, tar_path) -> None:
+    """Restore the sandbox workspace on the target node from a tar.gz."""
+    if node.address == "local://":
+        workspace = request.app.state.workspace_base / record.sandbox_id
+        if workspace.exists():
+            shutil.rmtree(workspace, ignore_errors=True)
+        workspace.mkdir(parents=True, exist_ok=True)
+        try:
+            _extract_sandbox_archive(tar_path, workspace)
+        except (tarfile.TarError, OSError, ValueError) as e:
+            raise OfficialError(400, f"Invalid sandbox archive: {e}") from e
+        return
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{node.address}/agent/sandboxes/{record.sandbox_id}/import",
+                content=tar_path.read_bytes(),
+                headers={
+                    "X-Internal-Key": request.app.state.settings.internal_api_key
+                },
+            )
+    except httpx.HTTPError as e:
+        raise OfficialError(502, f"Node {node.node_id} unavailable: {e}") from e
+    if resp.status_code != 204:
+        raise OfficialError(
+            502, f"Node {node.node_id} failed to import: {resp.text}"
+        )
+
+
+async def _invalidate_gateway_route(request, sandbox_id) -> None:
+    gateway_url = request.app.state.settings.gateway_url
+    if not gateway_url:
+        return
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"{gateway_url.rstrip('/')}/internal/routes/{sandbox_id}/invalidate",
+                headers={
+                    "X-Internal-Key": request.app.state.settings.internal_api_key
+                },
+            )
+    except httpx.HTTPError:
+        pass
+
+
+@router.post(
+    "/sandboxes/{sandbox_id}/migrate",
+    status_code=200,
+    dependencies=[Depends(require_api_key)],
+)
+async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
+    """Filesystem-level migration to another healthy node.
+
+    Without a shared workspace the sandbox directory is exported from the
+    source node, imported on the target, and the record/routes/quota are
+    moved. With ``E2B_SHARED_WORKSPACE_ROOT`` the directory already lives on
+    shared storage visible to every node, so migration only re-provisions the
+    target (runtime + volume mounts), switches the record and releases the
+    source quota -- no archive transfer, and the source directory is kept.
+    Running processes are not migrated: the sandbox cold-starts on the target.
+
+    A per-sandbox migration lock (Redis ``SETNX`` marker with TTL, or an
+    in-process equivalent) guarantees that concurrent ``migrate`` requests --
+    even across control-plane replicas -- cannot both run: the second request
+    fails with 409. The source runtime is stopped before the target is
+    provisioned so no command can be served by the old node after the route
+    switches, and a failed migration re-provisions the source node.
+    """
+    registry = _registry(request)
+    token = registry.try_acquire_migration(sandbox_id)
+    if token is None:
+        raise OfficialError(409, f"Sandbox {sandbox_id} is already being migrated")
+    settings = request.app.state.settings
+    shared = bool(settings.shared_workspace_root)
+    nodes = request.app.state.nodes
+    record = None
+    source = None
+    target = None
+    old_node_id = None
+    source_stopped = False
+    tar_path: Path | None = None
+    try:
+        try:
+            record = registry.get(sandbox_id)
+        except UnknownSandboxError:
+            raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+        source = nodes.get(record.node_id or "local")
+        if source is None:
+            raise OfficialError(502, f"Node {record.node_id} not found")
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            body = {}
+        target_node_id = body.get("nodeID") if isinstance(body, dict) else None
+        if target_node_id == source.node_id:
+            raise OfficialError(400, "Sandbox is already on this node")
+
+        dims = {
+            "memory_mb": record.memory_mb,
+            "cpu_percent": record.cpu_count * 100,
+            "disk_mb": record.disk_size_mb,
+            "processes": record.max_processes,
+        }
+        if target_node_id:
+            target = nodes.reserve_node(target_node_id, **dims)
+            if target is None:
+                raise OfficialError(
+                    503,
+                    f"Node {target_node_id} has no capacity or is unavailable",
+                )
+        else:
+            volume_node_id = _migration_volume_node_id(request, record)
+            if volume_node_id == source.node_id:
+                raise OfficialError(
+                    409, "Volume pins the sandbox to the source node"
+                )
+            target = nodes.select_and_reserve(
+                base_image=record.base_image,
+                volume_node_id=volume_node_id,
+                exclude_node_id=source.node_id,
+                **dims,
+            )
+            if target is None:
+                raise OfficialError(503, "No resources available for migration")
+
+        old_node_id = record.node_id
+
+        # Close the dual-active window: stop the source runtime (keeping its
+        # files so the workspace can still be exported) before the target is
+        # touched and the route switches. On failure the source is
+        # re-provisioned below so the sandbox keeps serving from its node.
+        if not await _stop_source_runtime(request, record, source):
+            raise OfficialError(
+                502, f"Node {source.node_id} failed to stop sandbox runtime"
+            )
+        source_stopped = True
+        try:
+            if not shared:
+                tar_path = await _export_sandbox_archive(request, record, source)
+            try:
+                if not shared:
+                    await _import_sandbox_archive(request, record, target, tar_path)
+                if target.address == "local://":
+                    _provision_local(
+                        request, record, None, record.volume_mounts, settings
+                    )
+                else:
+                    await _provision_remote(
+                        request,
+                        record,
+                        target,
+                        settings,
+                        None,
+                        record.volume_mounts,
+                        snapshot_id=None,
+                    )
+                record.node_id = target.node_id
+                registry.save(record)
+                nodes.release_quota(old_node_id, **dims)
+                await _destroy_on_node(request, record, source, keep_files=shared)
+                note = f"migrated to node {target.node_id}"
+                if shared:
+                    note += " (shared workspace)"
+                record.append_log(note)
+                registry.save(record)
+            except Exception:
+                # Roll back the target reservation and any partial target
+                # files; the source workspace itself is untouched. With a
+                # shared workspace the target directory is the shared one, so
+                # never delete it -- only drop a partial runtime registration.
+                nodes.release_quota(target.node_id, **dims)
+                if target.address == "local://":
+                    _destroy_local(request, record, keep_files=shared)
+                else:
+                    await _destroy_remote(request, record, target, keep_files=shared)
+                raise
+        finally:
+            if tar_path is not None:
+                tar_path.unlink(missing_ok=True)
+    except Exception:
+        # Migration failed: restore the source runtime stopped above so the
+        # sandbox keeps serving from its original node, and undo any record
+        # switch that was already persisted.
+        if source_stopped and record is not None and source is not None:
+            try:
+                if source.address == "local://":
+                    _provision_local(
+                        request, record, None, record.volume_mounts, settings
+                    )
+                else:
+                    await _provision_remote(
+                        request,
+                        record,
+                        source,
+                        settings,
+                        None,
+                        record.volume_mounts,
+                        snapshot_id=None,
+                    )
+            except Exception:
+                # Never mask the migration error itself; the source runtime
+                # re-provision is best-effort recovery.
+                logger.exception(
+                    "failed to restore runtime for sandbox %s on node %s "
+                    "after migration error",
+                    sandbox_id,
+                    source.node_id,
+                )
+        if (
+            record is not None
+            and old_node_id is not None
+            and record.node_id != old_node_id
+        ):
+            record.node_id = old_node_id
+            registry.save(record)
+        raise
+    finally:
+        registry.release_migration(sandbox_id, token)
+    await _invalidate_gateway_route(request, sandbox_id)
+    logger.info(
+        "migrated sandbox %s from %s to %s",
+        sandbox_id,
+        source.node_id,
+        target.node_id,
+    )
+    return {
+        "sandboxID": record.sandbox_id,
+        "nodeID": target.node_id,
+        "state": record.state,
+    }
+
+
+@router.post("/sandboxes/{sandbox_id}/connect", dependencies=[Depends(require_api_key)])
+async def connect_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise OfficialError(400, "Invalid JSON body")
+    timeout = body.get("timeout") if isinstance(body, dict) else None
+    if timeout is None:
+        timeout = request.app.state.settings.default_timeout
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
+        raise OfficialError(400, "timeout must be a positive integer")
+    registry = _registry(request)
+    try:
+        record = registry.get(sandbox_id)
+        if record.state == "paused":
+            record.resume(timeout)
+            request.app.state.runtime_registry.set_state(sandbox_id, "running")
+        registry.connect(sandbox_id, timeout)
+        return record.as_sandbox()
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+
+
+@router.post("/sandboxes/{sandbox_id}/timeout", status_code=204, dependencies=[Depends(require_api_key)])
+async def set_timeout(sandbox_id: str, request: Request) -> Response:
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise OfficialError(400, "Invalid JSON body")
+    timeout = body.get("timeout") if isinstance(body, dict) else None
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
+        raise OfficialError(400, "timeout must be a positive integer")
+    registry = _registry(request)
+    try:
+        registry.set_timeout(sandbox_id, timeout)
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+    except ValueError as e:
+        raise OfficialError(400, str(e))
+    return Response(status_code=204)
+
+
+@router.post(
+    "/sandboxes/{sandbox_id}/pause",
+    status_code=204,
+    dependencies=[Depends(require_api_key)],
+)
+async def pause_sandbox(sandbox_id: str, request: Request) -> Response:
+    registry = _registry(request)
+    try:
+        record = registry.get(sandbox_id)
+        record.pause()
+        registry.save(record)
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+    except SandboxStateConflictError:
+        raise OfficialError(409, "Sandbox is already paused")
+    request.app.state.runtime_registry.set_state(sandbox_id, "paused")
+    return Response(status_code=204)
+
+
+@router.post(
+    "/sandboxes/{sandbox_id}/resume",
+    status_code=204,
+    dependencies=[Depends(require_api_key)],
+)
+async def resume_sandbox(sandbox_id: str, request: Request) -> Response:
+    registry = _registry(request)
+    try:
+        record = registry.get(sandbox_id)
+        record.resume()
+        registry.save(record)
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+    except SandboxStateConflictError:
+        raise OfficialError(409, "Sandbox is already running")
+    request.app.state.runtime_registry.set_state(sandbox_id, "running")
+    return Response(status_code=204)
+
+
+@router.get(
+    "/sandboxes/{sandbox_id}/metrics",
+    dependencies=[Depends(require_api_key)],
+)
+async def get_sandbox_metrics(
+    sandbox_id: str,
+    request: Request,
+    start: int | None = Query(default=None),
+    end: int | None = Query(default=None),
+) -> list[dict[str, Any]]:
+    registry = _registry(request)
+    try:
+        record = registry.get(sandbox_id)
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+    sample = record.sample_metric()
+    now = int(__import__("time").time())
+    if start is not None and sample["timestampUnix"] < start:
+        return []
+    if end is not None and sample["timestampUnix"] > end:
+        return []
+    return [sample]
+
+
+@router.get(
+    "/sandboxes/{sandbox_id}/logs",
+    dependencies=[Depends(require_api_key)],
+)
+async def get_sandbox_logs(
+    sandbox_id: str,
+    request: Request,
+    start: int | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> list[dict[str, str]]:
+    registry = _registry(request)
+    try:
+        record = registry.get(sandbox_id)
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+    logs = record.logs + await _command_logs(request, record)
+    logs.sort(key=_log_ts)
+    if start is not None:
+        logs = [log for log in logs if _log_ts(log) >= start]
+    return logs[-limit:]
+
+
+@router.get(
+    "/v2/sandboxes/{sandbox_id}/logs",
+    dependencies=[Depends(require_api_key)],
+)
+async def get_sandbox_logs_v2(
+    sandbox_id: str,
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> list[dict[str, str]]:
+    registry = _registry(request)
+    try:
+        record = registry.get(sandbox_id)
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+    logs = record.logs + await _command_logs(request, record)
+    logs.sort(key=_log_ts)
+    return logs[-limit:]

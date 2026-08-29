@@ -1,0 +1,43 @@
+services:
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.control-plane
+    environment:
+      E2B_API_KEYS: local-key
+      E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_MAX_SANDBOXES: 100
+      E2B_BASE_IMAGE: python:3.11-slim
+      E2B_TEMPLATE_IMAGES: '{"python3.12": "python:3.12-slim", "node22": "node:22-slim"}'
+      E2B_DEFAULT_MEMORY_MB: 512
+      E2B_DEFAULT_CPU_PERCENT: 100
+      E2B_DEFAULT_DISK_MB: 1024
+      E2B_DEFAULT_MAX_PROCESSES: 64
+      E2B_MAX_TOTAL_MEMORY_MB: 8192
+      E2B_MAX_TOTAL_CPU_PERCENT: 400
+      E2B_MAX_TOTAL_DISK_MB: 10240
+      E2B_MAX_TOTAL_PROCESSES: 2048
+    ports:
+      - "3000:3000"
+    volumes:
+      - sandbox-data:/var/lib/e2b-sandboxes
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  envd:
+    build:
+      context: .
+      dockerfile: Dockerfile.envd
+    environment:
+      E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+    ports:
+      - "49983:49983"
+    volumes:
+      - sandbox-data:/var/lib/e2b-sandboxes
+      - /var/run/docker.sock:/var/run/docker.sock
+    cap_add:
+      - SYS_ADMIN
+    privileged: false
+
+volumes:
+  sandbox-data:
+

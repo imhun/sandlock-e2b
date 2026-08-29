@@ -1,0 +1,121 @@
+"""Control plane FastAPI application factory."""
+
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from control_plane.api.errors import OfficialError, official_error_handler
+from control_plane.api.internal import router as internal_router
+from control_plane.api.nodes import router as nodes_router
+from control_plane.api.sandboxes import router as sandboxes_router
+from control_plane.api.secrets import router as secrets_router
+from control_plane.api.snapshots import router as snapshots_router
+from control_plane.api.templates import router as templates_router
+from control_plane.api.volumes import router as volumes_router
+from control_plane.config import Settings
+from control_plane.registry.manager import SandboxRegistry
+from control_plane.registry.nodes import NodeRegistry
+from control_plane.registry.secrets import SecretRegistry
+from control_plane.registry.snapshots import SnapshotRegistry
+from control_plane.registry.templates import TemplateRegistry
+from control_plane.registry.ttl import TTLSweeper
+from control_plane.registry.volumes import VolumeRegistry
+from envd_service.runtime.registry import RuntimeRegistry
+
+
+def create_app(
+    *,
+    settings: Settings | None = None,
+    registry: SandboxRegistry | None = None,
+    runtime_registry=None,
+    workspace_base=None,
+    volumes_registry=None,
+    secrets_registry=None,
+    snapshots_registry=None,
+    nodes_registry=None,
+    templates_registry=None,
+) -> FastAPI:
+    settings = settings or Settings()
+    redis_client = None
+    if settings.redis_url:
+        from control_plane.registry.redis_backend import create_redis_client
+
+        redis_client = create_redis_client(settings.redis_url)
+    registry = registry or SandboxRegistry(settings, redis_client=redis_client)
+
+    def _release_node_quota(record) -> None:
+        app.state.nodes.release_quota(
+            record.node_id or "local",
+            memory_mb=record.memory_mb,
+            cpu_percent=record.cpu_count * 100,
+            disk_mb=record.disk_size_mb,
+            processes=record.max_processes,
+        )
+
+    registry.add_on_removed(_release_node_quota)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        def _on_sandbox_removed(record):
+            node = app.state.nodes.get(record.node_id or "local")
+            if node is not None and node.address != "local://":
+                import httpx
+
+                try:
+                    httpx.delete(
+                        f"{node.address}/agent/sandboxes/{record.sandbox_id}",
+                        headers={
+                            "X-Internal-Key": settings.internal_api_key
+                        },
+                        timeout=30,
+                    )
+                except httpx.HTTPError:
+                    pass
+            app.state.runtime_registry.unregister(record.sandbox_id)
+
+        sweeper = TTLSweeper(on_expired=_on_sandbox_removed)
+        app.state.sweeper = sweeper
+        sweeper.start(registry)
+        yield
+        await sweeper.stop()
+
+    app = FastAPI(title="E2B Sandlock Gateway - Control Plane", lifespan=lifespan)
+    app.state.settings = settings
+    app.state.registry = registry
+    app.state.runtime_registry = runtime_registry or RuntimeRegistry(
+        workspace_base or settings.workspace_base
+    )
+    app.state.workspace_base = workspace_base or settings.workspace_base
+    app.state.workspace_base.mkdir(parents=True, exist_ok=True)
+    volume_root = settings.shared_volume_root or (
+        (workspace_base or settings.workspace_base) / "_volumes"
+    )
+    app.state.volumes = volumes_registry or VolumeRegistry(volume_root)
+    app.state.secrets = secrets_registry or SecretRegistry()
+    app.state.snapshots = snapshots_registry or SnapshotRegistry(
+        (workspace_base or settings.workspace_base)
+    )
+    app.state.nodes = nodes_registry or NodeRegistry(redis_client=redis_client)
+    app.state.templates = templates_registry or TemplateRegistry()
+    if settings.enable_local_node and app.state.nodes.get("local") is None:
+        app.state.nodes.add_local_node(
+            total_memory_mb=settings.max_total_memory_mb,
+            total_cpu_percent=settings.max_total_cpu_percent,
+            total_disk_mb=settings.max_total_disk_mb,
+            total_processes=settings.max_total_processes,
+        )
+    app.state.select_node = app.state.nodes.select_and_reserve
+    app.add_exception_handler(OfficialError, official_error_handler)
+    # Snapshots first so DELETE /templates/{snapshotID} wins over the
+    # templates catch-all in the sandboxes router.
+    app.include_router(snapshots_router)
+    app.include_router(templates_router)
+    app.include_router(sandboxes_router)
+    app.include_router(volumes_router)
+    app.include_router(secrets_router)
+    app.include_router(nodes_router)
+    app.include_router(internal_router)
+    return app

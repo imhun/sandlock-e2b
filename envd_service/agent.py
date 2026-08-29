@@ -1,0 +1,395 @@
+"""Worker agent: node registration, heartbeat and sandbox lifecycle API."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import shutil
+import tarfile
+from pathlib import Path
+from typing import Any
+
+import httpx
+from fastapi import APIRouter, Query, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from envd_service.config import Settings
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+def _extract_sandbox_archive(archive_path: Path, dest: Path) -> None:
+    """Extract a sandbox tar.gz, skipping absolute symlink members.
+
+    Volume mounts are archived as symlinks to host paths that only exist on
+    the source node; provisioning re-creates them on the target.
+    """
+    with tarfile.open(archive_path) as tar:
+        members = []
+        for member in tar.getmembers():
+            target = (dest / member.name).resolve()
+            if not target.is_relative_to(dest.resolve()):
+                raise ValueError(f"archive member escapes workspace: {member.name}")
+            if member.issym() and os.path.isabs(member.linkname):
+                continue
+            members.append(member)
+        try:
+            tar.extractall(dest, members=members, filter="data")
+        except TypeError:  # pragma: no cover - Python < 3.12
+            tar.extractall(dest, members=members)
+
+
+def _require_internal_key(request: Request, settings: Settings) -> None:
+    key = request.headers.get("X-Internal-Key")
+    if key != settings.internal_api_key:
+        raise PermissionError("Unauthorized")
+
+
+def _node_resources(settings: Settings) -> dict[str, int]:
+    """Report node capacity: explicit env overrides, else host probing."""
+    memory_mb = int(os.getenv("E2B_NODE_MEMORY_MB", "0"))
+    if memory_mb <= 0:
+        try:
+            memory_mb = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
+        except (ValueError, OSError):
+            memory_mb = settings.default_memory_mb * 100
+    cpu = int(os.getenv("E2B_NODE_CPU_PERCENT", "0"))
+    if cpu <= 0:
+        cpu = os.cpu_count() * 100 or 100
+    disk = int(os.getenv("E2B_NODE_DISK_MB", "0"))
+    if disk <= 0:
+        try:
+            disk = shutil.disk_usage(settings.workspace_base).total // (1024 * 1024)
+        except OSError:
+            disk = settings.default_disk_mb * 100
+    processes = int(os.getenv("E2B_NODE_PROCESSES", "0"))
+    if processes <= 0:
+        processes = settings.default_max_processes * 100
+    return {
+        "totalMemoryMB": memory_mb,
+        "totalCPUPercent": cpu,
+        "totalDiskMB": disk,
+        "totalProcesses": processes,
+    }
+
+
+def _node_type() -> str:
+    if os.path.exists("/.dockerenv"):
+        return "container"
+    return "physical"
+
+
+def _register_payload(settings: Settings) -> dict[str, Any]:
+    return {
+        "nodeID": os.getenv("E2B_NODE_ID"),
+        "address": os.getenv("E2B_NODE_ADDRESS"),
+        "images": [i for i in (settings.base_image,) if i],
+        "labels": {
+            "node-type": os.getenv("E2B_NODE_TYPE") or _node_type(),
+        },
+        **_node_resources(settings),
+    }
+
+
+class NodeAgent:
+    """Periodically registers with the control plane and sends heartbeats."""
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        runtime_registry,
+        control_plane_url: str | None,
+        node_address: str | None,
+    ) -> None:
+        self._settings = settings
+        self._runtime_registry = runtime_registry
+        self._control_url = (control_plane_url or "").rstrip("/")
+        self._node_address = node_address or ""
+        self._node_id: str | None = None
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        if not self._control_url or not self._node_address:
+            return
+        self._task = asyncio.create_task(self._loop())
+
+    async def _loop(self) -> None:
+        headers = {"X-Internal-Key": self._settings.internal_api_key}
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    payload = _register_payload(self._settings)
+                    payload["address"] = self._node_address
+                    if self._node_id is None:
+                        resp = await client.post(
+                            f"{self._control_url}/internal/nodes/register",
+                            json=payload,
+                            headers=headers,
+                        )
+                        if resp.status_code == 200:
+                            self._node_id = resp.json().get("nodeID")
+                            logger.info(
+                                "registered node %s at %s", self._node_id, self._node_address
+                            )
+                    else:
+                        resp = await client.post(
+                            f"{self._control_url}/internal/nodes/{self._node_id}/heartbeat",
+                            headers=headers,
+                        )
+                        if resp.status_code == 404:
+                            # The control plane lost us (e.g. it restarted);
+                            # re-register on the next cycle.
+                            self._node_id = None
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("node agent heartbeat failed", exc_info=True)
+            await asyncio.sleep(5)
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+
+def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -> None:
+    runtime_registry = request.app.state.runtime_registry
+    workspace_base = settings.workspace_base
+    sandbox_id = payload.get("sandboxID")
+    if not sandbox_id:
+        raise ValueError("sandboxID is required")
+    workspace_dir = workspace_base / sandbox_id
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_id = payload.get("snapshotID")
+    if snapshot_id:
+        snapshot_fs = workspace_base / "_snapshots" / snapshot_id / "fs"
+        if not snapshot_fs.is_dir():
+            raise ValueError(f"Snapshot {snapshot_id} not found on this node")
+        shutil.copytree(snapshot_fs, workspace_dir, dirs_exist_ok=True, symlinks=True)
+    else:
+        (workspace_dir / "workspace").mkdir(parents=True, exist_ok=True)
+    volume_mounts = payload.get("volumeMounts") or []
+    mount_paths: list[dict[str, str]] = []
+    shared_root = settings.shared_volume_root
+    for mount in volume_mounts:
+        host = mount.get("hostPath")
+        rel = str(mount.get("path", "")).lstrip("/")
+        if not host or not rel:
+            raise ValueError("volumeMounts need hostPath and path")
+        if shared_root:
+            host_path = Path(host).resolve()
+            if not host_path.is_relative_to(Path(shared_root).resolve()):
+                raise ValueError("volume hostPath is outside the shared volume root")
+        target = workspace_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        target.symlink_to(host, target_is_directory=True)
+        mount_paths.append({"path": rel, "hostPath": str(host)})
+    runtime_registry.register(
+        sandbox_id=sandbox_id,
+        access_token=payload.get("accessToken", ""),
+        workspace_dir=str(workspace_dir),
+        env_vars=dict(payload.get("envVars") or {}),
+        base_image=payload.get("baseImage"),
+        memory_mb=int(payload.get("memoryMB", settings.default_memory_mb)),
+        cpu_percent=int(payload.get("cpuPercent", settings.default_cpu_percent)),
+        disk_mb=int(payload.get("diskMB", settings.default_disk_mb)),
+        max_processes=int(
+            payload.get("maxProcesses", settings.default_max_processes)
+        ),
+        allow_internet_access=bool(payload.get("allowInternetAccess", False)),
+        max_command_timeout=int(
+            payload.get("maxCommandTimeout", 3600)
+        ),
+        mcp=payload.get("mcp"),
+        volume_mounts=mount_paths,
+    )
+
+
+@router.post("/agent/sandboxes", status_code=201)
+async def agent_create_sandbox(request: Request) -> Response:
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+        payload = await request.json()
+        _agent_create_sandbox(request, settings, payload)
+    except PermissionError:
+        return Response(status_code=401)
+    except (ValueError, json.JSONDecodeError) as e:
+        return Response(status_code=400, content=str(e))
+    except Exception:
+        logger.exception("agent create sandbox failed")
+        return Response(status_code=500)
+    return Response(status_code=201)
+
+
+@router.delete("/agent/sandboxes/{sandbox_id}", status_code=204)
+async def agent_delete_sandbox(
+    sandbox_id: str,
+    request: Request,
+    keepFiles: bool = Query(default=False),
+) -> Response:
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    request.app.state.runtime_registry.unregister(sandbox_id)
+    if not keepFiles:
+        # Shared-workspace deployments keep the directory: the same storage
+        # hosts the sandbox on every node, so removing it would destroy the
+        # live sandbox's files.
+        shutil.rmtree(settings.workspace_base / sandbox_id, ignore_errors=True)
+    return Response(status_code=204)
+
+
+@router.get("/agent/sandboxes/{sandbox_id}/export")
+async def agent_export_sandbox(sandbox_id: str, request: Request) -> Response:
+    """Stream a tar.gz of the sandbox workspace for filesystem migration."""
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    workspace = settings.workspace_base / sandbox_id
+    if not workspace.is_dir():
+        return Response(status_code=404)
+    migrate_dir = settings.workspace_base / "_migrate"
+    migrate_dir.mkdir(parents=True, exist_ok=True)
+    tar_path = migrate_dir / f"{sandbox_id}.tar.gz"
+    try:
+        with tarfile.open(tar_path, "w:gz") as tar:
+            tar.add(workspace, arcname=".", recursive=True)
+    except OSError:
+        return Response(status_code=500)
+
+    def _stream():
+        try:
+            with open(tar_path, "rb") as f:
+                while chunk := f.read(64 * 1024):
+                    yield chunk
+        finally:
+            tar_path.unlink(missing_ok=True)
+
+    return StreamingResponse(_stream(), media_type="application/gzip")
+
+
+@router.post("/agent/sandboxes/{sandbox_id}/import", status_code=204)
+async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
+    """Restore a sandbox workspace from a raw tar.gz body."""
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    body = await request.body()
+    if not body:
+        return Response(status_code=400, content="Upload body is empty")
+    workspace = settings.workspace_base / sandbox_id
+    if workspace.exists():
+        # Retry-friendly: a previous failed migration may have left partial
+        # files; the incoming archive is the full source of truth.
+        shutil.rmtree(workspace, ignore_errors=True)
+    workspace.mkdir(parents=True, exist_ok=True)
+    migrate_dir = settings.workspace_base / "_migrate"
+    migrate_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = migrate_dir / f"{sandbox_id}.tar.gz"
+    try:
+        tmp_path.write_bytes(body)
+        logger.info(
+            "import %s: received %d bytes",
+            sandbox_id,
+            len(body),
+        )
+        _extract_sandbox_archive(tmp_path, workspace)
+    except (OSError, tarfile.TarError) as e:
+        logger.warning("import %s failed: %s", sandbox_id, e, exc_info=True)
+        return Response(status_code=400, content="Invalid tar archive")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return Response(status_code=204)
+
+
+@router.get("/agent/sandboxes/{sandbox_id}/logs")
+async def agent_sandbox_logs(sandbox_id: str, request: Request) -> Response:
+    """Return the sandbox's command output log (JSON list)."""
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    log_path = settings.workspace_base / sandbox_id / "command-logs.jsonl"
+    if not log_path.is_file():
+        return JSONResponse(content=[])
+    entries: list[dict[str, Any]] = []
+    try:
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        return Response(status_code=500)
+    return JSONResponse(content=entries)
+
+
+@router.get("/agent/health")
+async def agent_health(request: Request) -> dict[str, Any]:
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    payload = _register_payload(settings)
+    payload["nodeID"] = os.getenv("E2B_NODE_ID")
+    return payload
+
+
+@router.post("/agent/snapshots", status_code=201)
+async def agent_create_snapshot(request: Request) -> Response:
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+        body = await request.json()
+        snapshot_id = body.get("snapshotID")
+        sandbox_id = body.get("sandboxID")
+        if not snapshot_id or not sandbox_id:
+            return Response(status_code=400, content="snapshotID and sandboxID required")
+        src = settings.workspace_base / sandbox_id
+        dst = settings.workspace_base / "_snapshots" / snapshot_id / "fs"
+        if not src.is_dir():
+            return Response(status_code=404, content=f"Sandbox {sandbox_id} not found")
+        if dst.exists():
+            return Response(status_code=409, content="snapshot already exists")
+        shutil.copytree(src, dst, symlinks=True)
+    except PermissionError:
+        return Response(status_code=401)
+    except Exception:
+        logger.exception("agent create snapshot failed")
+        return Response(status_code=500)
+    return Response(status_code=201)
+
+
+@router.delete("/agent/snapshots/{snapshot_id}", status_code=204)
+async def agent_delete_snapshot(snapshot_id: str, request: Request) -> Response:
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    shutil.rmtree(
+        settings.workspace_base / "_snapshots" / snapshot_id, ignore_errors=True
+    )
+    return Response(status_code=204)

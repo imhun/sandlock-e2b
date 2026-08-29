@@ -1,0 +1,116 @@
+services:
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.control-plane
+    environment:
+      E2B_API_KEYS: local-key
+      E2B_INTERNAL_API_KEY: internal-key
+      E2B_ENABLE_LOCAL_NODE: "false"
+      E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # 模板构建完成后推送到镜像仓库，worker 按需 docker pull。
+      # 自建 HTTP 仓库需在 docker daemon 配置 insecure-registries。
+      E2B_IMAGE_REGISTRY: registry.example.com/e2b
+      # 私有仓库认证（控制面 push 与 worker pull 都需配置）。
+      E2B_IMAGE_REGISTRY_USERNAME: ""
+      E2B_IMAGE_REGISTRY_PASSWORD: ""
+      E2B_MAX_SANDBOXES: 100
+      E2B_BASE_IMAGE: python:3.11-slim
+      E2B_DEFAULT_MEMORY_MB: 512
+      E2B_DEFAULT_CPU_PERCENT: 100
+      E2B_DEFAULT_DISK_MB: 1024
+      E2B_DEFAULT_MAX_PROCESSES: 64
+      E2B_MAX_TOTAL_MEMORY_MB: 8192
+      E2B_MAX_TOTAL_CPU_PERCENT: 400
+      E2B_MAX_TOTAL_DISK_MB: 10240
+      E2B_MAX_TOTAL_PROCESSES: 2048
+    ports:
+      - "3100:3000"
+    volumes:
+      - control-data:/var/lib/e2b-sandboxes
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.envd
+    command: python -m envd_service.gateway_main
+    environment:
+      E2B_CONTROL_PLANE_URL: http://control-plane:3000
+      E2B_INTERNAL_API_KEY: internal-key
+      E2B_GATEWAY_PORT: 49983
+    ports:
+      - "4100:49983"
+
+  worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.envd
+    environment:
+      E2B_CONTROL_PLANE_URL: http://control-plane:3000
+      E2B_NODE_ADDRESS: http://worker-1:49983
+      E2B_NODE_ID: worker-1
+      E2B_BASE_IMAGE: python:3.11-slim
+      E2B_INTERNAL_API_KEY: internal-key
+      E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_NODE_MEMORY_MB: 2048
+      E2B_NODE_CPU_PERCENT: 200
+      E2B_NODE_DISK_MB: 4096
+      E2B_NODE_PROCESSES: 256
+    volumes:
+      - worker-data:/var/lib/e2b-sandboxes
+      - /var/run/docker.sock:/var/run/docker.sock
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+
+  worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.envd
+    environment:
+      E2B_CONTROL_PLANE_URL: http://control-plane:3000
+      E2B_NODE_ADDRESS: http://worker-2:49983
+      E2B_NODE_ID: worker-2
+      E2B_BASE_IMAGE: python:3.11-slim
+      E2B_INTERNAL_API_KEY: internal-key
+      E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_NODE_MEMORY_MB: 2048
+      E2B_NODE_CPU_PERCENT: 200
+      E2B_NODE_DISK_MB: 4096
+      E2B_NODE_PROCESSES: 256
+    volumes:
+      - worker-data:/var/lib/e2b-sandboxes
+      - /var/run/docker.sock:/var/run/docker.sock
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+
+  worker-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.envd
+    environment:
+      E2B_CONTROL_PLANE_URL: http://control-plane:3000
+      E2B_NODE_ADDRESS: http://worker-3:49983
+      E2B_NODE_ID: worker-3
+      E2B_BASE_IMAGE: python:3.11-slim
+      E2B_INTERNAL_API_KEY: internal-key
+      E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_NODE_MEMORY_MB: 2048
+      E2B_NODE_CPU_PERCENT: 200
+      E2B_NODE_DISK_MB: 4096
+      E2B_NODE_PROCESSES: 256
+    volumes:
+      - worker-data:/var/lib/e2b-sandboxes
+      - /var/run/docker.sock:/var/run/docker.sock
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+
+volumes:
+  control-data:
+  worker-data:

@@ -1,0 +1,25 @@
+FROM python:3.11-slim
+
+RUN sed -i \
+        's|http://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g; s|http://security.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    docker.io \
+    docker-cli \
+    redis-server \
+    bash \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /tmp/requirements.txt
+COPY requirements-test.txt /tmp/requirements-test.txt
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-test.txt
+
+WORKDIR /workspace
+
+COPY envd_service/mcp/gateway.py /usr/bin/mcp-gateway
+RUN chmod +x /usr/bin/mcp-gateway \
+    && ln -sf /usr/bin/mcp-gateway /usr/local/bin/mcp-gateway
+
+CMD ["pytest", "tests/unit", "tests/contract"]
