@@ -65,6 +65,17 @@ fork 分支 `feature/network-netns`（基于 feature/network-wildcard）：
    integration `428 passed`（1 个事务合并 root 环境性失败）。新增
    `test_netns.rs` 三用例全绿：loopback 隔离 / 通配 DNS 合成 IP /
    通配 connect 到真实目标。
+7. **补充（fork abe7bf8）**：UDP 通配落地——sendto/sendmsg/sendmmsg 对
+   合成 IP 反查 hostname、通配判定、实时解析 + SSRF 护栏、改写 sockaddr
+   后代连（QUIC 等 UDP 通配可用）；`check_ip_destination` 被新的
+   `resolve_send_destination` 取代。`test_netns.rs` 扩为 5 用例全绿：
+   loopback 隔离 / 通配 DNS 合成 IP / 通配 TCP connect（本地 fixture，
+   不依赖外部 DNS）/ 通配 UDP 到达真实目标 / HTTP ACL 经网关代理重定向。
+   全部改 multi_thread runtime（current-thread 会饿死 supervisor/DNS 任务
+   导致 create 挂起）+ 30s 快速失败超时。全量：lib 762 passed（2 既有
+   root 环境性失败）、integration 430 passed（1 既有 root 环境性失败）、
+   wheel 可构建、Python `Sandbox(netns=True, net_allow=["*.example.com:443"])`
+   可用。
 
 环境注意：`sandlock-dev:latest` 已加 iproute2；集成测试需
 `--privileged --network host`；e2e 连接用例临时改容器 resolv.conf 为
