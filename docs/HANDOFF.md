@@ -23,15 +23,18 @@ upstream=multikernel）。分支：`feature/network-wildcard`（R1–R4 通配�
 - UDP 通配（send 路径）、HTTP ACL 代理经网关重定向、FFI/Python `netns`
   绑定、wheel 可构建。
 
-**未完成（sandlock 本身）**：
+**sandlock 本身状态**：
 
-- **Block B（R8–R11）已完成**（分支 `feature/network-inject`，2026-08-29，
-  见下方会话记录）；剩 Block C（R12–R14）与 M6/M7。
-- **Block C**（R12–R14）：SOCKS5 on-behalf（`ConnectPlan::Socks5Upstream`，
-  替代 LD_PRELOAD egress 库）。纯 TCP 数据交换，无特权可实现。
-- **M6**：wheel 矩阵（cp310–314 × x86_64/aarch64）+ 私有源/安装切换。
-- **M7**：整理成面向上游 `multikernel/sandlock` 的 PR（只带无特权部分；
-  netns 留 fork 分支）。
+- **Block B（R8–R11）已完成**（`feature/network-inject`）；**Block C
+  （R12–R14）已完成**（`feature/network-socks5`：SOCKS5 on-behalf 替代
+  LD_PRELOAD，fail closed，ATYP=domain/IPv4/IPv6，RFC 1929）。
+- **上游 PR 已备好**：`upstream-pr/netns-free-clean`（单提交 `d3a28cc`，
+  基 `f6a3e39`，无 netns/veth）；**未推送**——当前 `GITHUB_TOKEN` 只读
+  （push/API 写均 403），需换写权限 token 或手动推送，见
+  `docs/upstream-pr-netns-free.md`。
+- **M6 部分完成**：cp311 x86_64 fork wheel 已提交 `wheels/fork/`，
+  Dockerfile 按 TARGETARCH 安装；aarch64 wheel 待网络/registry 恢复后构建
+  （Docker Hub 在本环境不可达）；cp310/312–314 未做。
 
 **未完成（项目侧 sandlock 落地）**：
 
@@ -58,9 +61,9 @@ netlink_virt 14/14。项目 unit+contract `164 passed`。
 - 本环境外部 DNS 被透明代理改写为 198.18.x，SSRF 护栏已放行该段；
   e2e 测试用本地 fixture（worker /etc/hosts → 198.18.0.9x）不依赖外网。
 
-**下一步建议顺序**：① ~~Block B~~（已完成）；② fork wheel 发布 + 项目切源
-（`rules.transform.headers` / `maskRequestHost` 项目侧映射 + security e2e，
-见 5B.4）；③ Block C；④ 上游 PR。
+**下一步**：① 换写权限 token 推送 `upstream-pr/netns-free-clean` 并开上游
+PR；② 构建 aarch64 wheel（网络恢复后）+ cp310/312–314 矩阵；③ 全量双架构
+回归 + 生产镜像重建验证。
 
 ## 本会话已完成（Block B — header 注入 / maskRequestHost / HTTP 通配）
 
@@ -91,6 +94,34 @@ fork 分支 `feature/network-inject`（基于 feature/network-netns）：
    `Sandbox(http_allow=[...], http_inject=[...], host_mask=...)` 原生构建通过。
    注意：本环境 `target/` 已改为指向 `target-linux` 的符号链接（Python
    `_find_lib` 需要），旧 `target/` 残留已清理。
+
+## 本会话已完成（② 项目切源 + 5B.4 映射 + e2e；③ Block C；④ 上游 PR）
+
+1. **Block C（fork `feature/network-socks5`，e84d65b）**：`network/egress.rs`
+   —— SOCKS5 客户端（RFC 1928/1929、poll 驱动、10s 超时、fail closed）；
+   `connect_on_behalf` 在 allow/deny 过滤后对所有 TCP 走隧道（通配目标
+   ATYP=domain 远程 DNS，字面目标 IPv4/IPv6；UDP/ICMP 直出；loopback remap
+   与 DNS 网关豁免）；代理端点由 supervisor 代拨且不进 net_allow（沙箱无法
+   直连绕过）；Sandbox/builder/CLI/FFI/Python/profile 暴露 `egress_proxy`
+   （含 RFC 1929 凭据，不序列化）。验证：7 单测 + 3 hermetic 集成（隧道/
+   fail closed/ATYP=domain）；lib 778、integration 436、Python 414。
+2. **② 项目侧**：`gateway_common/network.py` 接受 `maskRequestHost`
+   （create-only）与 `rules[].transform.headers`，映射到 `http_inject` /
+   `host_mask`；executor 把字面 header 值写入 supervisor-only 0600 文件
+   （`E2B_IMAGE_CACHE_DIR/secrets/<sbx>/`），`${e2b.identity.tokens.*}` 映射
+   `E2B_IDENTITY_TOKEN_*` env（缺失则创建失败）；修复 chroot 模式下
+   `http_inject_ca` 传宿主路径导致 popen 失败的既有 bug（改为沙箱视图路径
+   `/home/user/.e2b-ca/...`）；LD_PRELOAD egress 库退役（R14），egressProxy
+   统一走 sandlock on-behalf。镜像切 fork wheel（`wheels/fork/`，TARGETARCH
+   选择）；requirements-test 不再锁 PyPI 0.8.6。验证：全量 257 passed +
+   JS skip；修复过程发现并解决了 SDK 无 `mask_request_host` 字段、
+   `api.example.com` 在测试容器不可解析等环境问题。
+3. **④ 上游 PR**：`upstream-pr/netns-free-clean` = fork 特性树去掉
+   netns/veth（删除 `network/netns.rs`、`netlink/ops.rs`、test_netns、context
+   netns pipe、sandbox veth 阶段、`netns` flag/FFI/Python、VethView、
+   CLONE_NEWNET），保留无特权 loopback DNS gateway + 虚拟 eth0 +
+   wildcard/UDP + Block B + Block C；lib 761、integration 428、Python 412。
+   **未推送**（token 只读）；PR 文案见 `docs/upstream-pr-netns-free.md`。
 
 ## 本会话已完成（Block A 第一阶段 — sandlock fork：通配域名规则）
 
