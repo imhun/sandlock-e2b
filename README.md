@@ -218,11 +218,20 @@ SDK → Envd Gateway :49983（按 E2b-Sandbox-Id 路由代理）
   - `rules` — 注册域名并映射到 Sandlock `http_allow`（80/443 透明 MITM
     按域名 ACL；镜像 rootfs 模式下把临时 CA 拼进每沙箱信任副本并注入
     `SSL_CERT_FILE`，HTTPS 可用）。
-  - 未实现并显式 400 拒绝：`egressProxy`、`maskRequestHost`、
-    `rules.transform`（header 改写）——都需要 egress 代理层（阶段 B）。
+  - `egressProxy` — 已支持（阶段 B1）：沙箱出站 TCP 经用户 SOCKS5 代理
+    隧道（LD_PRELOAD 透明拦截 `getaddrinfo`/`connect`，沙箱内无感知；
+    域名走 SOCKS5 ATYP=domain 远程 DNS；allow/deny 在库内先过滤再进代理，
+    fail closed）。控制面校验代理地址必须解析到公网 IPv4（拒绝私网/内网，
+    防 SSRF）。限制：仅 IPv4 代理、仅动态链接应用（python/node 等）生效、
+    worker 需 `gcc` + `libc6-dev`（首次构建 `libegress_proxy.so` 缓存于
+    `E2B_IMAGE_CACHE_DIR/egress/`）、过滤规则通过环境变量传入沙箱。
+  - 未实现并显式 400 拒绝：`maskRequestHost`、`rules.transform`
+    （header 改写）——需要 sandlock 的 credential-injection 能力
+    （上游 main 分支已有，0.8.6 未发版，B2 待 fork/发版后接入）。
   - 注意：需 worker 设置 `E2B_ENABLE_NETWORK=true`（默认 false 时全局
-    拒绝出站，网络 API 策略不生效）；沙箱内 DNS 依赖 Sandlock 的 hostname
-    pinning，`allowOut` 用域名形式（如 `example.com:443`）最可靠。
+    拒绝出站，网络 API 策略不生效）；普通模式沙箱内 DNS 依赖 Sandlock 的
+    hostname pinning，`allowOut` 用域名形式（如 `example.com:443`）最可靠；
+    egressProxy 模式下 DNS 由代理侧解析（ATYP=domain）。
 - **共享工作目录**：所有节点把 `E2B_WORKSPACE_BASE` 指向同一共享挂载点
   （NFS/CSI），并在控制面设置 `E2B_SHARED_WORKSPACE_ROOT` 后，迁移不再
   打包传输——沙箱目录已在共享存储，只重新 provision 目标节点（runtime +

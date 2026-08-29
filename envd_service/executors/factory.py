@@ -47,6 +47,7 @@ def create_executor(
     max_open_files: int,
     allow_internet_access: bool,
     network: dict | None = None,
+    egress_lib_dir: str | Path | None = None,
     extra_fs_writable: list[str] | None = None,
     fs_mounts: dict[str, str] | None = None,
 ) -> Executor:
@@ -83,6 +84,7 @@ def create_executor(
                 allow_internet_access=allow_internet_access,
                 enable_network=settings.enable_network,
                 network=network,
+                egress_lib_dir=egress_lib_dir or (settings.image_cache_dir / "egress"),
                 extra_fs_writable=extra_fs_writable,
                 fs_mounts=fs_mounts,
             )

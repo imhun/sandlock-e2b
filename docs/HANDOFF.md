@@ -1,8 +1,28 @@
 # 会话交接记录（2026-08-29）
 
 > 供新会话快速接续。当前基线：Linux 容器（privileged + host 网络）
-> `244 passed, 1 skipped`；macOS `225 passed, 16 skipped`
+> `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
+
+## 本会话已完成（Network API 阶段 B1 — egressProxy）
+
+1. **LD_PRELOAD SOCKS5 隧道库** `envd_service/egress/libegress_proxy.c`：
+   hook `getaddrinfo`（域名→合成 127.0.0.2/8 + hostname 映射，沙箱内不发
+   DNS）与 `connect`（恢复 hostname/直连 IP → 库内 allowOut/denyOut 过滤 →
+   SOCKS5 RFC1928/1929 握手，域名走 ATYP=domain 远程 DNS；非阻塞 fd 同步
+   等待连接完成；代理不可达/握手失败 → ECONNREFUSED，fail closed）。
+2. **执行器集成**：`egressProxy` 模式下 net_allow 只放行代理端点，库经
+   LD_PRELOAD 注入（chroot 模式复制进 workspace/.egress 并以
+   /home/user/.egress 路径加载），EGRESS_PROXY/ALLOW/DENY/USER/PASS 走
+   env；库源码由 worker 首次使用时 `cc` 构建并缓存到
+   `E2B_IMAGE_CACHE_DIR/egress/`。动态更新复用 `update_network`。
+3. **控制面校验**：`egressProxy.address` 必须解析到公网 IPv4（拒绝
+   私网/loopback/link-local，防 SSRF），username/password ≤255；update 中
+   `egressProxy: null` 显式清除。create/update/detail 全链路。
+4. **测试**：安全用例 2 个（隧道 + ATYP=domain 断言、deny 拦截），单元
+   校验用例；测试镜像加 `gcc`/`libc6-dev`。
+5. **限制**：仅 IPv4 代理；仅动态链接应用（python/node）；过滤在沙箱内
+   库做（LD_PRELOAD 方案固有妥协）；rules/maskRequestHost 仍 400。
 
 ## 本会话已完成（Network API，阶段 A + C）
 
@@ -93,11 +113,15 @@ root_squash、uid=1000 映射、命令 IO 延迟未实测。部署验证时注�
 
 - 迁移导出 tar 仍含卷挂载符号链接空条目（功能等价，可显式排除）；
 - 未配置 `E2B_GATEWAY_URL` 时迁移后路由依赖 gateway 30s 缓存 TTL（文档已知）；
-- Network API 的 egress 代理部分（`egressProxy`/`maskRequestHost`/
-  `rules.transform` header 改写）待阶段 B：需要宿主侧 SOCKS5 透明隧道 +
-  HTTP 改写代理（sandlock 的 on-behalf connect 是天然挂钩点，但 0.8.6 未
-  暴露 SOCKS5 上游，需扩展 sandlock 或引入 netns+redsocks）。`rules`
-  通配域名、`allowOut` 通配域名（`*.example.com`）同样依赖代理层。
+- **B2 — header 改写（rules.transform / maskRequestHost）**：sandlock 上游
+  main 分支已有 credential injection（`InjectRule`/`AuthShape`，透明代理内
+  header 注入），但 PyPI 0.8.6 未发版。接入方式：等上游发版，或 fork
+  sandlock 把 inject 暴露到 Python 绑定（`credential.rs`/ffi 已就绪）。
+  `allowOut` 通配域名（`*.example.com`）在 egressProxy 模式下可在库内过滤
+  实现（规则已支持 `*.suffix` 匹配），普通模式仍依赖代理层。
+- **LD_PRELOAD 隧道已知限制**：静态/Go 应用不受影响（可后续用 sandlock
+  on-behalf connect 的 SOCKS5 分支替代，语义更完整）；IPv6 目标/代理未
+  隧道（直接 real connect）。
 - spec.md 其余官方 API 面（iam/lifecycle 等）仍未支持，入口处
   `UNSUPPORTED_FIELDS`/`UNSUPPORTED_ENDPOINTS` 明确拒绝。
 
@@ -139,9 +163,12 @@ docker run --rm --privileged --network host \
 | `envd_service/gateway.py` | 路由缓存 + `/internal/routes/{id}/invalidate` |
 | `gateway_common/network.py` | network 校验/规范化 + sandlock 策略映射 |
 | `envd_service/executors/sandlock.py` | network→net_allow/net_deny/http_allow + 每沙箱 CA 注入 |
+| `envd_service/egress/libegress_proxy.c` | LD_PRELOAD SOCKS5 隧道库（getaddrinfo/connect hook + 过滤 + ATYP=domain） |
+| `envd_service/egress/build.sh` | 库构建脚本（gcc） |
 | `envd_service/runtime/context.py` | `update_network` + RPC drift 检测 |
 | `tests/contract/test_network_api.py` | network 契约（回显/更新/拒绝/allowPublicTraffic） |
 | `tests/security/test_network_enforcement.py` | deny→update→allow 强制用例 |
+| `tests/security/test_egress_proxy.py` | SOCKS5 隧道 + 远程 DNS + deny 拦截用例 |
 | `tests/unit/test_network_config.py` | network 校验 + sandlock 映射单测 |
 | `tests/conftest.py` | live/multinode/registry/redis fixtures（session 级） |
 | `tests/contract/test_migration.py` | 迁移 + 共享 workspace + 持锁 409 + 失败回滚用例 |

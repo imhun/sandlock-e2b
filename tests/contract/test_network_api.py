@@ -96,7 +96,6 @@ async def test_network_update_unknown_sandbox_404(multinode_two_workers):
 async def test_network_rejects_unsupported_parts(multinode_two_workers):
     harness = multinode_two_workers
     for network in [
-        {"egressProxy": {"address": "proxy.example.com:1080"}},
         {"maskRequestHost": "internal.example.com"},
         {"rules": {"api.example.com": [{"transform": {"headers": {"X-A": "1"}}}]}},
         {"allowOut": ["*.example.com"]},
@@ -105,12 +104,27 @@ async def test_network_rejects_unsupported_parts(multinode_two_workers):
         resp = await _create_with_network(harness, network)
         assert resp.status_code == 400, network
 
+    # A public egress proxy is now accepted and echoed.
+    created = await _create_with_network(
+        harness, {"egressProxy": {"address": "1.1.1.1:1080"}}
+    )
+    assert created.status_code == 201
+    try:
+        detail = await _detail(harness, created.json()["sandboxID"])
+        assert detail["network"]["egressProxy"] == {"address": "1.1.1.1:1080"}
+    finally:
+        async with httpx.AsyncClient(base_url=harness["api_url"]) as client:
+            await client.delete(
+                f"/sandboxes/{created.json()['sandboxID']}",
+                headers={"X-API-Key": "local-key"},
+            )
+
     sandbox = Sandbox.create(**_opts(harness))
     try:
         rejected = await _put_network(
             harness, sandbox.sandbox_id, {"egressProxy": None}
         )
-        # Explicit null egress_proxy means "no proxy" and is accepted.
+        # Explicit null egressProxy clears the proxy.
         assert rejected.status_code == 204
         rejected = await _put_network(
             harness,

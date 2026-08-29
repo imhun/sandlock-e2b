@@ -24,7 +24,6 @@ def test_normalize_create_keeps_supported_fields():
 
 def test_normalize_create_rejects_unsupported():
     cases = [
-        {"egressProxy": {"address": "proxy.example.com:1080"}},
         {"maskRequestHost": "internal.example.com"},
         {"rules": {"api.example.com": [{"transform": {"headers": {"X-A": "1"}}}]}},
         {"denyOut": ["example.com"]},
@@ -41,12 +40,52 @@ def test_normalize_create_rejects_unsupported():
 def test_normalize_update_clears_omitted_fields():
     update = normalize_network_update({"allowInternetAccess": False})
     assert update == {"allowInternetAccess": False}
-    # Explicit null egressProxy means "no proxy" and is accepted.
-    assert normalize_network_update({"egressProxy": None}) == {}
+    # Explicit null egressProxy clears the proxy (atomic-replace semantics).
+    assert normalize_network_update({"egressProxy": None}) == {
+        "egressProxy": None
+    }
     with pytest.raises(NetworkConfigError):
         normalize_network_update(None)
     with pytest.raises(NetworkConfigError):
         normalize_network_update({"egressProxy": {"address": "p:1080"}})
+
+
+def test_egress_proxy_validation():
+    net = normalize_network_config(
+        {"egressProxy": {"address": "1.1.1.1:1080"}}
+    )
+    assert net["egressProxy"] == {"address": "1.1.1.1:1080"}
+    net = normalize_network_config(
+        {
+            "egressProxy": {
+                "address": "1.1.1.1:1080",
+                "username": "u",
+                "password": "p",
+            }
+        }
+    )
+    assert net["egressProxy"]["username"] == "u"
+    assert net["egressProxy"]["password"] == "p"
+    for address in (
+        "127.0.0.1:1080",
+        "10.0.0.1:1080",
+        "192.168.1.1:1080",
+        "169.254.1.1:1080",
+        "no-port",
+        "x:70000",
+        "1.1.1.1",
+    ):
+        with pytest.raises(NetworkConfigError):
+            normalize_network_config({"egressProxy": {"address": address}})
+    with pytest.raises(NetworkConfigError):
+        normalize_network_config(
+            {
+                "egressProxy": {
+                    "address": "1.1.1.1:1080",
+                    "username": "x" * 256,
+                }
+            }
+        )
 
 
 def test_policy_allow_only_is_default_deny():

@@ -269,6 +269,7 @@ class SandlockExecutor(Executor):
         allow_internet_access: bool,
         enable_network: bool,
         network: dict | None = None,
+        egress_lib_dir: str | Path | None = None,
         extra_fs_writable: list[str] | None = None,
         fs_mounts: dict[str, str] | None = None,
     ) -> None:
@@ -283,12 +284,89 @@ class SandlockExecutor(Executor):
         self._allow_internet_access = allow_internet_access
         self._enable_network = enable_network
         self._network = dict(network) if network else None
+        self._egress_lib_dir = Path(egress_lib_dir) if egress_lib_dir else None
+        self._egress_resolved: tuple[str, int] | None = None
         self._extra_fs_writable = list(extra_fs_writable or [])
         self._fs_mounts = dict(fs_mounts or {})
 
     def update_network(self, network: dict | None) -> None:
         """Replace the network policy; the next command uses it."""
         self._network = dict(network) if network else None
+        self._egress_resolved = None
+
+    def _egress_endpoint(self) -> tuple[str, int] | None:
+        """Resolve the egress proxy address to (ip, port); hostnames are
+        resolved here (the supervisor has DNS) so the LD_PRELOAD library only
+        ever dials a literal IP."""
+        proxy = (self._network or {}).get("egressProxy")
+        if not proxy or not isinstance(proxy, dict):
+            return None
+        if self._egress_resolved is not None:
+            return self._egress_resolved
+        import socket as py_socket
+
+        address = str(proxy.get("address", ""))
+        host, _, port_s = address.rpartition(":")
+        if not host or not port_s.isdigit():
+            raise RuntimeError(f"invalid egress proxy address: {address!r}")
+        port = int(port_s)
+        if not 1 <= port <= 65535:
+            raise RuntimeError(f"invalid egress proxy port: {port}")
+        infos = py_socket.getaddrinfo(host, port, type=py_socket.SOCK_STREAM)
+        ip = next(
+            (info[4][0] for info in infos if info[0] == py_socket.AF_INET),
+            None,
+        )
+        if ip is None:
+            raise RuntimeError(
+                f"egress proxy {address!r} does not resolve to an IPv4 address"
+            )
+        self._egress_resolved = (ip, port)
+        return self._egress_resolved
+
+    def _egress_library(self) -> Path:
+        """Build (once, cached) the LD_PRELOAD egress proxy library."""
+        if self._egress_lib_dir is None:
+            raise RuntimeError("egress proxy requires egress_lib_dir")
+        lib = self._egress_lib_dir / "libegress_proxy.so"
+        if lib.is_file():
+            return lib
+        import shutil as _shutil
+        import subprocess as _subprocess
+
+        src = (
+            Path(__file__).resolve().parent.parent.parent
+            / "envd_service"
+            / "egress"
+            / "libegress_proxy.c"
+        )
+        if not src.is_file():
+            raise RuntimeError(f"egress proxy library source missing: {src}")
+        if _shutil.which("cc") is None:
+            raise RuntimeError(
+                "egress proxy requires a C compiler (cc) to build "
+                "libegress_proxy.so"
+            )
+        self._egress_lib_dir.mkdir(parents=True, exist_ok=True)
+        result = _subprocess.run(
+            [
+                "cc",
+                "-shared",
+                "-fPIC",
+                "-O2",
+                "-o",
+                str(lib),
+                str(src),
+                "-ldl",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 or not lib.is_file():
+            raise RuntimeError(
+                f"failed to build libegress_proxy.so: {result.stderr.strip()}"
+            )
+        return lib
 
     @staticmethod
     def resolve_cmd(cmd: list[str]) -> list[str]:
@@ -300,6 +378,11 @@ class SandlockExecutor(Executor):
         return cmd
 
     def _build_sandbox(self, config: ExecConfig):
+        egress_endpoint = None
+        egress_lib: Path | None = None
+        if self._network and self._network.get("egressProxy"):
+            egress_endpoint = self._egress_endpoint()
+            egress_lib = self._egress_library()
         fs_writable = [self._workspace_dir]
         fs_writable.extend(self._extra_fs_writable)
         fs_readable = ["/usr", "/lib", "/bin", "/opt"]
@@ -318,7 +401,16 @@ class SandlockExecutor(Executor):
         net_allow: list[str] = []
         net_deny: list[str] = []
         http_allow: list[str] = []
-        if self._network:
+        if egress_endpoint is not None:
+            # Egress-proxy mode: the only reachable endpoint is the user's
+            # SOCKS5 proxy; allowOut/denyOut filtering happens inside the
+            # LD_PRELOAD library, and rules (header transforms) need the
+            # proxy layer (rejected at the API).
+            ip, port = egress_endpoint
+            net_allow = [f"{ip}:{port}"]
+            if egress_lib is not None:
+                fs_readable = list(fs_readable) + [str(egress_lib.parent)]
+        elif self._network:
             from gateway_common.network import sandlock_network_policy
 
             policy = sandlock_network_policy(
@@ -408,6 +500,30 @@ class SandlockExecutor(Executor):
                     env["SSL_CERT_FILE"] = str(ca_inside)
                     env["CURL_CA_BUNDLE"] = str(ca_inside)
                     kwargs["env"] = env
+        if egress_endpoint is not None and egress_lib is not None:
+            env = dict(kwargs.get("env") or {})
+            ip, port = egress_endpoint
+            if kwargs.get("chroot"):
+                # Inside the chroot the workspace is /home/user; copy the
+                # library there so the sandboxed loader can reach it.
+                ws_lib = Path(self._workspace_dir) / ".egress"
+                ws_lib.mkdir(parents=True, exist_ok=True)
+                ws_lib = ws_lib / "libegress_proxy.so"
+                shutil.copy2(egress_lib, ws_lib)
+                env["LD_PRELOAD"] = "/home/user/.egress/libegress_proxy.so"
+            else:
+                env["LD_PRELOAD"] = str(egress_lib)
+            env["EGRESS_PROXY"] = f"{ip}:{port}"
+            proxy = self._network["egressProxy"]
+            if proxy.get("username"):
+                env["EGRESS_PROXY_USER"] = str(proxy["username"])
+            if proxy.get("password"):
+                env["EGRESS_PROXY_PASS"] = str(proxy["password"])
+            if self._network.get("allowOut"):
+                env["EGRESS_ALLOW"] = json.dumps(self._network["allowOut"])
+            if self._network.get("denyOut"):
+                env["EGRESS_DENY"] = json.dumps(self._network["denyOut"])
+            kwargs["env"] = env
         if sandlock is None:
             # Non-Linux / missing native library: return a plain object so the
             # policy mapping stays unit-testable without executing anything.

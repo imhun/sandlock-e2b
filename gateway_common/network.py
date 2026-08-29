@@ -52,13 +52,69 @@ def _check_unknown(raw: dict[str, Any], allowed: set[str], where: str) -> None:
         )
 
 
-def _check_egress_proxy(raw: dict[str, Any]) -> None:
+def _normalize_egress_proxy(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate the user-provided SOCKS5 proxy.
+
+    The address must resolve to a public IPv4 endpoint: private / loopback /
+    link-local ranges are rejected before the sandbox exists (SSRF guard,
+    matching the official API). The runtime tunnels all egress through it.
+    """
     proxy = raw.get("egressProxy")
-    if proxy is not None:
+    if proxy is None:
+        return None
+    if not isinstance(proxy, dict):
+        raise NetworkConfigError("egressProxy must be an object")
+    address = proxy.get("address")
+    if not isinstance(address, str) or not address:
+        raise NetworkConfigError("egressProxy.address is required")
+    host, _, port_s = address.rpartition(":")
+    if not host or not port_s.isdigit():
+        raise NetworkConfigError(f"invalid egressProxy address: {address!r}")
+    port = int(port_s)
+    if not 1 <= port <= 65535:
+        raise NetworkConfigError("egressProxy port must be in 1-65535")
+    for key in ("username", "password"):
+        value = proxy.get(key)
+        if value is not None and (
+            not isinstance(value, str) or len(value) > 255
+        ):
+            raise NetworkConfigError(
+                f"egressProxy.{key} must be a string of at most 255 bytes"
+            )
+    import ipaddress
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
         raise NetworkConfigError(
-            "egressProxy is not supported: the egress proxy layer is not "
-            "implemented"
+            f"egressProxy address {address!r} does not resolve"
+        ) from None
+    ipv4 = [info[4][0] for info in infos if info[0] == socket.AF_INET]
+    if not ipv4:
+        raise NetworkConfigError(
+            f"egressProxy {address!r} must resolve to an IPv4 address"
         )
+    for ip in ipv4:
+        addr = ipaddress.ip_address(ip)
+        if (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_multicast
+            or addr.is_reserved
+            or addr.is_unspecified
+        ):
+            raise NetworkConfigError(
+                f"egressProxy {address!r} resolves to a non-public address "
+                f"({ip})"
+            )
+    out: dict[str, Any] = {"address": address}
+    if proxy.get("username") is not None:
+        out["username"] = proxy["username"]
+    if proxy.get("password") is not None:
+        out["password"] = proxy["password"]
+    return out
 
 
 def _check_mask_request_host(raw: dict[str, Any]) -> None:
@@ -127,7 +183,7 @@ def normalize_network_config(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         raise NetworkConfigError("network must be an object")
     _check_unknown(raw, _CREATE_FIELDS, "network")
-    _check_egress_proxy(raw)
+    egress_proxy = _normalize_egress_proxy(raw)
     _check_mask_request_host(raw)
     _check_rules(raw)
     allow_out = _normalize_str_list(
@@ -147,6 +203,8 @@ def normalize_network_config(raw: Any) -> dict[str, Any] | None:
         out["denyOut"] = deny_out
     if allow_public_traffic is not None:
         out["allowPublicTraffic"] = allow_public_traffic
+    if egress_proxy is not None:
+        out["egressProxy"] = egress_proxy
     if raw.get("rules") is not None:
         out["rules"] = raw["rules"]
     return out
@@ -161,7 +219,7 @@ def normalize_network_update(raw: Any) -> dict[str, Any] | None:
     if raw is None or not isinstance(raw, dict):
         raise NetworkConfigError("network update body must be an object")
     _check_unknown(raw, _UPDATE_FIELDS, "network update")
-    _check_egress_proxy(raw)
+    egress_proxy = _normalize_egress_proxy(raw)
     _check_rules(raw)
     allow_out = _normalize_str_list(
         raw.get("allowOut"), "allowOut", allow_wildcard_domain=False
@@ -181,6 +239,9 @@ def normalize_network_update(raw: Any) -> dict[str, Any] | None:
         out["denyOut"] = deny_out
     if allow_internet_access is not None:
         out["allowInternetAccess"] = allow_internet_access
+    if "egressProxy" in raw:
+        # Explicit null clears the proxy (atomic-replace semantics).
+        out["egressProxy"] = egress_proxy
     if raw.get("rules") is not None:
         out["rules"] = raw["rules"]
     return out

@@ -6,6 +6,8 @@ RUN sed -i \
     && apt-get update && apt-get install -y --no-install-recommends \
     docker.io \
     docker-cli \
+    gcc \
+    libc6-dev \
     redis-server \
     bash \
     git \

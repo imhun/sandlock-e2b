@@ -42,7 +42,7 @@
 
 ### 1.4 明确不支持
 
-Template 构建、Volume、Secret、Snapshot、Network 动态更新（egressProxy/header 改写部分）、IAM、MCP、Events/Logs、Pause/Resume/Fork、多节点调度。
+Template 构建、Volume、Secret、Snapshot、Network 动态更新（header 改写部分）、IAM、MCP、Events/Logs、Pause/Resume/Fork、多节点调度。
 
 不支持 API 必须返回官方 `Error` JSON，禁止返回假成功。
 
@@ -164,7 +164,7 @@ python3 -c "import sandlock; print(sandlock.landlock_abi_version())"
 | `secure` | 始终启用并返回 `envdAccessToken` |
 | `allow_internet_access` | 映射到 Sandlock 网络策略 |
 | `image`（非官方字段） | 不支持，返回 `400 Error` |
-| `network` | 支持 `allowOut`/`denyOut`/`allowPublicTraffic`/`rules`（域名级 HTTP ACL）；`egressProxy`/`maskRequestHost`/`rules.transform` 因缺代理层返回 `400` |
+| `network` | 支持 `allowOut`/`denyOut`/`allowPublicTraffic`/`rules`（域名级 HTTP ACL）/`egressProxy`（SOCKS5 隧道）；`maskRequestHost`/`rules.transform`（header 改写）返回 `400` |
 | `iam`、`mcp`、`volumeMounts` | 不支持，返回 `400 Error` |
 
 模板与基础镜像映射：
@@ -984,8 +984,9 @@ docker compose -f docker-compose.test.yml run --rm test-runner
 - Sandlock 是进程级隔离，不等同 VM 内核隔离；强对抗场景不作为 VM 替代。
 - 不支持 GPU。
 - 不支持 pause/resume 内存快照。
-- 不支持 Template/Volume/Secret/Snapshot/IAM/MCP；Network 仅支持 egress 白/黑名单与
-  域名级 HTTP ACL（`rules`），`egressProxy`/`maskRequestHost`/header 改写未实现。
+- 不支持 Template/Volume/Secret/Snapshot/IAM/MCP；Network 支持 egress 白/黑名单、
+  域名级 HTTP ACL（`rules`）与 `egressProxy`（SOCKS5 隧道），
+  `maskRequestHost`/header 改写待 sandlock 注入能力发版。
 - 单机部署。
 
 ### 10.2 路线图

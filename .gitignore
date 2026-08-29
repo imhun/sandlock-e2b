@@ -6,3 +6,4 @@ tests/sdk/js/node_modules/
 tests/sdk/js/package-lock.json
 .DS_Store
 
+envd_service/egress/*.so

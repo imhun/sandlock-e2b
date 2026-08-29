@@ -1050,7 +1050,13 @@ async def update_sandbox_network(sandbox_id: str, request: Request) -> Response:
     # update omits are cleared. ``allow_public_traffic`` is not updatable
     # through this endpoint (official API keeps it create-only).
     network = dict(record.network or {})
-    for field in ("allowOut", "denyOut", "rules", "allowInternetAccess"):
+    for field in (
+        "allowOut",
+        "denyOut",
+        "rules",
+        "allowInternetAccess",
+        "egressProxy",
+    ):
         if field in update:
             network[field] = update[field]
         else:
