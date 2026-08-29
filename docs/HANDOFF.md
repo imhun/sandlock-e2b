@@ -4,6 +4,64 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
+## ⚡ sandlock fork 交接总览（新会话从这里开始）
+
+**位置与分支**：`tmp/sandlock-src`（imhun/sandlock 0.8.6 fork；origin=fork，
+upstream=multikernel）。分支：`feature/network-wildcard`（R1–R4 通配规则，
+已合入 netns 分支）、`feature/network-netns`（当前主线：netns 可选增强 +
+无特权默认网关路径）。
+
+**已完成（Block A 全部）**：
+
+- R1 通配解析（`NetTarget::HostWildcard`，deny 拒绝域名）、R2 合成映射
+  （`SyntheticDns`，10.250.0.0/16、LRU 4096）、R3/R4 连接判定 + SSRF 护栏。
+- **默认路径（无特权）**：每沙箱 loopback DNS 网关（`127.0.0.x:53`）+
+  resolv.conf memfd + connect/send 豁免；netlink 合成视图含虚拟 eth0
+  （192.0.2.1/24 + 2001:db8::1/64）修复 glibc AI_ADDRCONFIG。
+- **可选隔离增强**：per-sandbox netns（veth + 网关代连），
+  `SandboxBuilder::netns(true)` / `E2B_ENABLE_NETNS`，默认关闭。
+- UDP 通配（send 路径）、HTTP ACL 代理经网关重定向、FFI/Python `netns`
+  绑定、wheel 可构建。
+
+**未完成（sandlock 本身）**：
+
+- **Block B**（R8–R11）：header 注入 / `maskRequestHost` / HTTP 通配
+  matcher。上游 `credential.rs` 已就绪，只差 FFI/Python 暴露 + 透明代理
+  host 掩码 + HTTP 规则 `*.suffix` 匹配。**无特权模型即可实现**。
+- **Block C**（R12–R14）：SOCKS5 on-behalf（`ConnectPlan::Socks5Upstream`，
+  替代 LD_PRELOAD egress 库）。纯 TCP 数据交换，无特权可实现。
+- **M6**：wheel 矩阵（cp310–314 × x86_64/aarch64）+ 私有源/安装切换。
+- **M7**：整理成面向上游 `multikernel/sandlock` 的 PR（只带无特权部分；
+  netns 留 fork 分支）。
+
+**未完成（项目侧 sandlock 落地）**：
+
+- worker/测试镜像的 sandlock 来源切到 fork wheel（当前仍装 PyPI
+  `sandlock==0.8.6`；`E2B_ENABLE_NETNS` 与 executor `netns` 参数需 fork
+  wheel 才有效，切源前保持默认关闭）。
+- security 通配 e2e（fork wheel + privileged worker 下跑
+  `tests/security` 新增用例）、迁移（跨 worker netns 重建）验证。
+
+**验证基线（fork，Linux 容器）**：lib `763 passed + 2 root 环境性`；
+integration 并行 `432 passed + 1 root 环境性`（`test_control` 族并行偶发
+flaky，单独跑全过）；netns 套件 5/5；无特权 shared-netns 2/2；
+netlink_virt 14/14。项目 unit+contract `164 passed`。
+
+**环境注意事项**：
+
+- 容器 `sandlock-dev:latest`（e2b-sandlock-test + rustup/rsproxy +
+  iproute2）；宿主 `~/.cargo/registry` 挂载到 `/opt/cargo/registry` 离线
+  构建；`RUSTC_WRAPPER=` 禁用 sccache（增量编译正常，改一行约 3.5s）。
+- netns 集成测试需 `--privileged --network host`；跑前清 VM 残留
+  （`ip addr del 198.18.0.9x` + 删非 master 的 veth），避免池地址冲突。
+- 无特权测试也需容器 root（绑 :53）；纯无特权运行需入口一次
+  `sysctl net.ipv4.ip_unprivileged_port_start=0`。
+- 本环境外部 DNS 被透明代理改写为 198.18.x，SSRF 护栏已放行该段；
+  e2e 测试用本地 fixture（worker /etc/hosts → 198.18.0.9x）不依赖外网。
+
+**下一步建议顺序**：① Block B（工作量小、依赖现成 credential.rs）；
+② fork wheel 发布 + 项目切源 + security e2e；③ Block C；④ 上游 PR。
+
 ## 本会话已完成（Block A 第一阶段 — sandlock fork：通配域名规则）
 
 1. **fork 基线（M0）**：`tmp/sandlock-src`（imhun/sandlock，0.8.6，
@@ -230,23 +288,20 @@ Linux: 225 passed, 1 skipped（全量含 Sandlock/registry/真实 Redis/模板�
 root_squash、uid=1000 映射、命令 IO 延迟未实测。部署验证时注意
 `E2B_SHARED_VOLUME_ROOT` / `E2B_SHARED_WORKSPACE_ROOT` 各节点路径语义一致。
 
-### P3 — 遗留优化
+### P3 — 遗留优化 / 后续 Block（sandlock fork）
 
 - 迁移导出 tar 仍含卷挂载符号链接空条目（功能等价，可显式排除）；
 - 未配置 `E2B_GATEWAY_URL` 时迁移后路由依赖 gateway 30s 缓存 TTL（文档已知）；
-- **B2 — header 改写（rules.transform / maskRequestHost）**：sandlock 上游
-  main 分支已有 credential injection（`InjectRule`/`AuthShape`，透明代理内
-  header 注入），但 PyPI 0.8.6 未发版。接入方式：等上游发版，或 fork
-  sandlock 把 inject 暴露到 Python 绑定（`credential.rs`/ffi 已就绪）。
-  `allowOut` 通配域名（`*.example.com`）已在 egressProxy 模式下支持
-  （库内 `*.suffix` 匹配：匹配子域、不匹配裸域名），普通模式仍 400。
-- **普通模式通配域名（与 E2B 标准一致）**：完整需求点/方案/维护面见
-  `docs/sandlock-network-wildcard.md`——需要 fork sandlock 在 on-behalf
-  connect 路径加域名规则引擎（合成 IP 映射 + hostname 反查匹配），
-  不能走 LD_PRELOAD（安全降级）。**fork 载体已确定：
-  `https://github.com/imhun/sandlock`（默认分支 main，已验证可克隆）**，
-  改动在其 `feature/*` 分支上进行，上游 `multikernel/sandlock` 作为
-  upstream 定期同步。
+- **Block B — header 改写（rules.transform / maskRequestHost）**：上游
+  `credential.rs`（`InjectRule`/`AuthShape`）已就绪，缺 FFI/Python 暴露 +
+  透明代理 host 掩码 + HTTP 规则 `*.suffix` 匹配（R8–R11）。**无特权模型
+  可实现**（代理是 supervisor 用户态进程）。
+- **Block C — SOCKS5 on-behalf**：`ConnectPlan::Socks5Upstream` 替代
+  LD_PRELOAD egress 库（R12–R14），纯 TCP 握手无特权可实现。
+- **M6 — wheel 矩阵**：cp310–314 × x86_64/aarch64 + 私有 index / git 安装
+  切换（worker 与测试镜像当前仍装 PyPI 0.8.6）。
+- **M7 — 上游 PR**：把无特权部分整理成面向 `multikernel/sandlock` 的 PR；
+  netns 留 fork 分支（上游是无特权项目，netns 特权要求难被接受）。
 - **LD_PRELOAD 隧道已知限制**：静态/Go 应用不受影响（可后续用 sandlock
   on-behalf connect 的 SOCKS5 分支替代，语义更完整）；IPv6 目标/代理未
   隧道（直接 real connect）。
@@ -277,6 +332,33 @@ docker run --rm --privileged --network host \
 - 多节点冒烟：`scripts/multinode_smoke.py` + `scripts/deployment_smoke.py`
   （后者含迁移/共享 workspace/network 更新）；compose：
   `docker compose -f docker-compose.multinode.yml up -d`。
+
+### sandlock fork 验证（Linux 容器）
+
+```bash
+# 容器（privileged + network host，挂宿主 cargo registry 离线构建）
+docker run --rm --privileged --network host \
+  -v "$(pwd)/tmp/sandlock-src:/src" \
+  -v ~/.cargo/registry:/opt/cargo/registry \
+  -v "$(pwd)/tmp/sandlock-dev/cargo-config.toml:/opt/cargo/config.toml" \
+  -w /src sandlock-dev:latest bash -lc '
+    cd /src && CARGO_TARGET_DIR=/src/target-linux \
+    cargo test -p sandlock-core --offline --lib
+  '
+
+# netns 套件（串行）+ 无特权套件
+cargo test -p sandlock-core --offline --test integration test_netns -- --test-threads=1
+cargo test -p sandlock-core --offline --test integration test_shared_netns -- --test-threads=1
+
+# 全量 integration（并行；test_control 族偶发 flaky，单独跑全过）
+cargo test -p sandlock-core --offline --test integration
+
+# 跑前清理 VM 残留（避免池地址冲突）
+for a in 99 100 101; do ip addr del 198.18.0.$a/32 dev lo 2>/dev/null; done
+for l in $(ip -o link | awk -F": " '{print $2}' | grep '^veth' | cut -d@ -f1); do
+  ip link show "$l" | grep -q "master " || ip link del "$l" 2>/dev/null
+done
+```
 
 ## 关键文件索引
 

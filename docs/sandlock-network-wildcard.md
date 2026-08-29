@@ -422,20 +422,20 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 
 ### 未落地（下一步，按序）
 
-- **R2 运行层已改为 per-sandbox netns（2026-08-29 落地）**：沙箱子进程在
-  userns 之前 `unshare(CLONE_NEWNET)`（netns 归属 supervisor userns，
-  子进程仍持 CAP_NET_ADMIN 可配自己一端）；父进程分配 `/30`、经
-  `IFLA_NET_NS_FD` 建 veth、配网关端，子进程配置沙箱端地址/默认路由
-  （地址经 pipe 传递）；每沙箱 DNS 网关（`gateway:53`）应答通配 A 查询
-  （合成 IP、TTL=0、非通配转发上游），`/etc/resolv.conf` memfd 指向网关；
-  connect/send 路径对网关端点豁免（glibc res_send 会先 connect UDP
-  socket 到 nameserver，connect 也必须豁免）；netlink 合成视图加入 veth
-  地址（否则 glibc AI_ADDRCONFIG 只看到回环直接放弃）；HTTP 代理改绑
-  网关地址。`SandboxBuilder::netns(true)` 开关。集成验证：loopback 隔离、
-  通配 DNS 返回合成 IP、通配 connect 到达真实目标（privileged 容器内）。
-- **M3 项目接入**：`gateway_common/network.py` 普通模式放开通配 +
-  `SandlockExecutor` 透传（需 executor 对每个沙箱开 `netns`）+ worker
-  特权（`CAP_NET_ADMIN`、`ip_forward`、veth 网段 MASQUERADE）+
-  `tests/security` 通配用例。
-- M4（Block B）/ M5（Block C）/ M6（wheel 矩阵）/ M7（上游 PR）维持
-  原计划不变。
+- **Block B（M4）— header 注入 / maskRequestHost / HTTP 通配**：上游
+  `credential.rs` 已就绪，缺 FFI/Python 暴露 + 透明代理 host 掩码 +
+  HTTP 规则 `*.suffix` 匹配（R8–R11）。无特权模型可实现。
+- **Block C（M5）— SOCKS5 on-behalf**：`ConnectPlan::Socks5Upstream`
+  替代 LD_PRELOAD egress 库（R12–R14），纯 TCP 握手无特权可实现。
+- **M6 — wheel 矩阵**：cp310–314 × x86_64/aarch64 + 私有 index / git
+  安装切换（worker 与测试镜像当前仍装 PyPI 0.8.6）。
+- **M7 — 上游 PR**：把无特权部分整理成面向 `multikernel/sandlock` 的 PR；
+  netns 留 fork 分支（上游是无特权项目）。
+- **项目侧**：security 通配 e2e（fork wheel 下）、迁移（跨 worker netns
+  重建）验证。
+
+> 说明：R2 运行层的两条路径均已落地——默认**无特权共享 netns**（每沙箱
+> loopback DNS 网关 `127.0.0.x:53`、合成 IP 段 10.250.0.0/16、netlink 虚拟
+> eth0 修复 AI_ADDRCONFIG）与可选 **per-sandbox netns**（veth + 网关代连、
+> `netns(true)`）。M3 项目接入已完成（wildcard 默认放行，netns 仅作隔离
+> 增强）。
