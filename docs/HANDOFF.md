@@ -83,6 +83,19 @@ fork 分支 `feature/network-netns`（基于 feature/network-wildcard）：
    `--test-threads=1`。注意：既有 `test_control` 族在并行下随机互踩
    （每次失败成员不同、单独跑都过），与 netns 无关；并行全量基线
    429+2（control 随机 + txn root 环境性），串行基线 430+1。
+9. **无特权默认路径（fork 89b31d9）**：通配运行时改回共享 netns +
+   loopback DNS 网关（每沙箱绑 `127.0.0.x:53`，resolv.conf 不支持端口故
+   每沙箱独立 loopback 地址）；合成 IP 段迁到 `10.250.0.0/16`（与网关
+   段彻底分开，connect 豁免优先于合成反查）；netlink 合成视图新增固定
+   文档地址虚拟 `eth0`（192.0.2.1/24 + 2001:db8::1/64）让 glibc
+   `__check_pf`/AI_ADDRCONFIG 看到非 loopback 族（顺带修复无特权实时
+   DNS 基线问题）。**默认路径完全无特权**；per-sandbox netns（veth +
+   loopback 隔离）保留为 `netns(true)` / `E2B_ENABLE_NETNS` 可选增强。
+   项目侧 wildcard allowOut 默认放行（不再依赖 egressProxy 或
+   E2B_ENABLE_NETNS）。验证：lib 763+2、integration 432+1（均 root
+   环境性）、netns 5/5、无特权 shared_netns 2/2、netlink_virt 14/14、
+   项目 unit+contract 164。Block B/C 可在同一无特权 seccomp/loopback
+   模型上实现。
 
 环境注意：`sandlock-dev:latest` 已加 iproute2；集成测试需
 `--privileged --network host`；e2e 连接用例临时改容器 resolv.conf 为
