@@ -142,6 +142,10 @@ root_squash、uid=1000 映射、命令 IO 延迟未实测。部署验证时注�
   sandlock 把 inject 暴露到 Python 绑定（`credential.rs`/ffi 已就绪）。
   `allowOut` 通配域名（`*.example.com`）已在 egressProxy 模式下支持
   （库内 `*.suffix` 匹配：匹配子域、不匹配裸域名），普通模式仍 400。
+- **普通模式通配域名（与 E2B 标准一致）**：完整需求点/方案/维护面见
+  `docs/sandlock-network-wildcard.md`——需要 fork sandlock 在 on-behalf
+  connect 路径加域名规则引擎（合成 IP 映射 + hostname 反查匹配），
+  不能走 LD_PRELOAD（安全降级）。
 - **LD_PRELOAD 隧道已知限制**：静态/Go 应用不受影响（可后续用 sandlock
   on-behalf connect 的 SOCKS5 分支替代，语义更完整）；IPv6 目标/代理未
   隧道（直接 real connect）。
