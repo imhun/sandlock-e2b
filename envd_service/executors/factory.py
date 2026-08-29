@@ -46,6 +46,7 @@ def create_executor(
     max_processes: int,
     max_open_files: int,
     allow_internet_access: bool,
+    network: dict | None = None,
     extra_fs_writable: list[str] | None = None,
     fs_mounts: dict[str, str] | None = None,
 ) -> Executor:
@@ -81,6 +82,7 @@ def create_executor(
                 max_open_files=max_open_files,
                 allow_internet_access=allow_internet_access,
                 enable_network=settings.enable_network,
+                network=network,
                 extra_fs_writable=extra_fs_writable,
                 fs_mounts=fs_mounts,
             )

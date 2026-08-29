@@ -270,6 +270,10 @@ def _start_multinode(
                     executor="auto",
                     envd_port=worker_port,
                     workspace_base=worker_base,
+                    # The E2B network API is per-sandbox: the platform-level
+                    # switch must be on so sandbox-level allow/deny policies
+                    # are enforced (default off denies all egress).
+                    enable_network=True,
                     shared_volume_root=str(shared_volumes),
                     image_registry_username=image_registry_username,
                     image_registry_password=image_registry_password,

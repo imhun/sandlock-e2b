@@ -212,6 +212,8 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
             payload.get("maxCommandTimeout", 3600)
         ),
         mcp=payload.get("mcp"),
+        network=payload.get("network"),
+        allow_public_traffic=bool(payload.get("allowPublicTraffic", False)),
         volume_mounts=mount_paths,
     )
 
@@ -250,6 +252,46 @@ async def agent_delete_sandbox(
         # hosts the sandbox on every node, so removing it would destroy the
         # live sandbox's files.
         shutil.rmtree(settings.workspace_base / sandbox_id, ignore_errors=True)
+    return Response(status_code=204)
+
+
+@router.post("/agent/sandboxes/{sandbox_id}/network", status_code=204)
+async def agent_update_sandbox_network(
+    sandbox_id: str,
+    request: Request,
+) -> Response:
+    """Apply a control-plane network update to a live sandbox runtime."""
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+        payload = await request.json()
+    except PermissionError:
+        return Response(status_code=401)
+    except json.JSONDecodeError:
+        return Response(status_code=400, content="Invalid JSON body")
+    runtime = request.app.state.runtime_registry.get(sandbox_id)
+    if runtime is None:
+        return Response(status_code=404)
+    if not isinstance(payload, dict):
+        return Response(status_code=400, content="Request body must be an object")
+    network = payload.get("network")
+    if network is not None and not isinstance(network, dict):
+        return Response(status_code=400, content="network must be an object")
+    runtime.network = dict(network) if network else None
+    allow_internet = payload.get("allowInternetAccess")
+    if isinstance(allow_internet, bool):
+        runtime.allow_internet_access = allow_internet
+    allow_public = payload.get("allowPublicTraffic")
+    if isinstance(allow_public, bool):
+        runtime.allow_public_traffic = allow_public
+    ctx = request.app.state.runtimes.get(sandbox_id)
+    if ctx is not None and hasattr(ctx, "update_network"):
+        ctx.update_network(runtime.network)
+    logger.info(
+        "agent network update for sandbox %s: %s",
+        sandbox_id,
+        runtime.network,
+    )
     return Response(status_code=204)
 
 

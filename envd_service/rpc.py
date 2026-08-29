@@ -32,6 +32,13 @@ def _context(request: Request, runtime) -> Any:
     if ctx is None:
         ctx = request.app.state.context_factory(runtime)
         runtimes[runtime.sandbox_id] = ctx
+    elif getattr(ctx, "_network", None) != runtime.network:
+        # The control plane may have pushed a network update into the shared
+        # runtime record; apply it to the live context so the next command
+        # uses the new policy.
+        updater = getattr(ctx, "update_network", None)
+        if updater is not None:
+            updater(runtime.network)
     return ctx
 
 

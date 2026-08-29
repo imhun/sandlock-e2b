@@ -9,6 +9,7 @@ import pytest
 from control_plane.config import Settings
 from control_plane.registry.manager import (
     ResourceUnavailableError,
+    SandboxRecord,
     SandboxRegistry,
     UnknownSandboxError,
 )
@@ -83,6 +84,23 @@ def test_migration_lock_expires_in_memory():
     assert token is not None
     time.sleep(1.1)
     assert registry.try_acquire_migration("sbx_expiring") is not None
+
+
+def test_network_field_round_trip_and_detail(workspace):
+    registry = SandboxRegistry(_settings())
+    network = {"allowOut": ["8.8.8.8"], "allowPublicTraffic": True}
+    record = _create(registry, network=network)
+    assert record.network == network
+    assert record.as_detail()["network"] == network
+    restored = SandboxRecord.from_storage_dict(record.to_storage_dict())
+    assert restored.network == network
+
+
+def test_network_field_defaults_to_none(workspace):
+    registry = SandboxRegistry(_settings())
+    record = _create(registry)
+    assert record.network is None
+    assert record.as_detail()["network"] == {}
 
 
 def test_delete_releases_entry(workspace):

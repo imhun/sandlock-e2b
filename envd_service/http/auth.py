@@ -37,6 +37,10 @@ def require_http_sandbox(request: Request, health: bool = False) -> Any:
             raise HttpAuthError(502, f"Sandbox {sandbox_id} not found")
         raise HttpAuthError(404, f"Sandbox {sandbox_id} not found")
     token = request.headers.get("X-Access-Token")
-    if runtime.access_token and token != runtime.access_token:
+    if (
+        not runtime.allow_public_traffic
+        and runtime.access_token
+        and token != runtime.access_token
+    ):
         raise HttpAuthError(401, "Invalid access token")
     return runtime

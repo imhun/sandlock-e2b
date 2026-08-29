@@ -31,6 +31,7 @@ class SandboxRuntimeContext:
             max_processes=record.max_processes,
             max_open_files=record.max_open_files,
             allow_internet_access=record.allow_internet_access,
+            network=record.network,
             extra_fs_writable=[m["hostPath"] for m in record.volume_mounts],
             fs_mounts={
                 # Inside the image-rootfs chroot the sandbox directory is
@@ -49,6 +50,15 @@ class SandboxRuntimeContext:
         self.watchers = WatcherRegistry(self.files)
         self.watch_stream = WatchDirStream(self.files)
         self._mcp_gateway = None
+        self._network = dict(record.network) if record.network else None
+
+    def update_network(self, network: dict | None) -> None:
+        """Apply an updated network config; the next command uses it."""
+        self.record.network = dict(network) if network else None
+        self._network = self.record.network
+        updater = getattr(self.executor, "update_network", None)
+        if updater is not None:
+            updater(self.record.network)
 
     def _on_command_log(self, proc, event, payload) -> None:
         writer = self.command_logs

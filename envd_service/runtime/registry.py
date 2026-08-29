@@ -35,6 +35,8 @@ class RuntimeSandbox:
     state: str = "running"
     volume_mounts: list[dict[str, str]] = field(default_factory=list)
     mcp: dict | None = None
+    network: dict | None = None
+    allow_public_traffic: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -85,6 +87,8 @@ class RuntimeRegistry:
         max_command_timeout: int = 3600,
         volume_mounts: list[dict[str, str]] | None = None,
         mcp: dict | None = None,
+        network: dict | None = None,
+        allow_public_traffic: bool = False,
     ) -> RuntimeSandbox:
         if not validate_sandbox_id(sandbox_id):
             raise ValueError(f"invalid sandbox id: {sandbox_id}")
@@ -103,6 +107,8 @@ class RuntimeRegistry:
             max_command_timeout=max_command_timeout,
             volume_mounts=list(volume_mounts or []),
             mcp=mcp,
+            network=dict(network) if network else None,
+            allow_public_traffic=bool(allow_public_traffic),
         )
         with self._lock:
             self._records[sandbox_id] = record

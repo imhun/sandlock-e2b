@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -267,6 +268,7 @@ class SandlockExecutor(Executor):
         max_open_files: int,
         allow_internet_access: bool,
         enable_network: bool,
+        network: dict | None = None,
         extra_fs_writable: list[str] | None = None,
         fs_mounts: dict[str, str] | None = None,
     ) -> None:
@@ -280,8 +282,13 @@ class SandlockExecutor(Executor):
         self._max_open_files = max_open_files
         self._allow_internet_access = allow_internet_access
         self._enable_network = enable_network
+        self._network = dict(network) if network else None
         self._extra_fs_writable = list(extra_fs_writable or [])
         self._fs_mounts = dict(fs_mounts or {})
+
+    def update_network(self, network: dict | None) -> None:
+        """Replace the network policy; the next command uses it."""
+        self._network = dict(network) if network else None
 
     @staticmethod
     def resolve_cmd(cmd: list[str]) -> list[str]:
@@ -309,7 +316,20 @@ class SandlockExecutor(Executor):
             # fs_writable directory.
             fs_readable = list(fs_readable) + ["/"]
         net_allow: list[str] = []
-        if self._allow_internet_access and self._enable_network:
+        net_deny: list[str] = []
+        http_allow: list[str] = []
+        if self._network:
+            from gateway_common.network import sandlock_network_policy
+
+            policy = sandlock_network_policy(
+                self._network,
+                allow_internet_access=self._allow_internet_access,
+                enable_network=self._enable_network,
+            )
+            net_allow = policy["net_allow"]
+            net_deny = policy["net_deny"]
+            http_allow = policy["http_allow"]
+        elif self._allow_internet_access and self._enable_network:
             net_allow = [
                 "files.pythonhosted.org:443",
                 "pypi.org:443",
@@ -325,6 +345,8 @@ class SandlockExecutor(Executor):
             "fs_readable": fs_readable,
             "fs_denied": fs_denied,
             "net_allow": net_allow,
+            "net_deny": net_deny,
+            "http_allow": http_allow,
             "max_memory": f"{self._memory_mb}M",
             "max_processes": self._max_processes,
             "max_open_files": self._max_open_files,
@@ -361,6 +383,31 @@ class SandlockExecutor(Executor):
             # materialized; volume mounts live inside the sandbox directory as
             # symlinks created by the control plane.
             pass
+        if http_allow and self._image_rootfs is not None:
+            # HTTPS MITM for rule-registered domains: sandlock intercepts 443
+            # with an ephemeral CA; splice that CA into a per-sandbox copy of
+            # the image trust bundle (never mutate the shared rootfs) and pin
+            # the copy via SSL_CERT_FILE so in-sandbox clients trust it.
+            ca_src = self._image_rootfs / "etc/ssl/certs/ca-certificates.crt"
+            if ca_src.is_file():
+                ca_dir = Path(self._workspace_dir) / ".e2b-ca"
+                ca_dir.mkdir(parents=True, exist_ok=True)
+                ca_dst = ca_dir / "ca-certificates.crt"
+                try:
+                    shutil.copy2(ca_src, ca_dst)
+                except OSError:
+                    ca_dst = None
+                if ca_dst is not None:
+                    kwargs["http_inject_ca"] = [str(ca_dst)]
+                    env = dict(kwargs.get("env") or {})
+                    ca_inside = (
+                        Path("/home/user/.e2b-ca/ca-certificates.crt")
+                        if kwargs.get("chroot")
+                        else ca_dst
+                    )
+                    env["SSL_CERT_FILE"] = str(ca_inside)
+                    env["CURL_CA_BUNDLE"] = str(ca_inside)
+                    kwargs["env"] = env
         if sandlock is None:
             # Non-Linux / missing native library: return a plain object so the
             # policy mapping stays unit-testable without executing anything.

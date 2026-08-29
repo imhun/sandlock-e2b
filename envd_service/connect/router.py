@@ -44,7 +44,11 @@ def _find_sandbox(request: Request) -> Any:
     if runtime is None:
         raise unauthenticated(f"Sandbox {sandbox_id} not found")
     token = request.headers.get("X-Access-Token")
-    if runtime.access_token and token != runtime.access_token:
+    if (
+        not runtime.allow_public_traffic
+        and runtime.access_token
+        and token != runtime.access_token
+    ):
         raise unauthenticated("Invalid access token")
     return runtime
 
@@ -170,4 +174,3 @@ def register_routes(
             )
 
     app.include_router(router)
-

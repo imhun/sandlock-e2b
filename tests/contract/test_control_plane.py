@@ -67,10 +67,24 @@ async def test_image_field_rejected_400(control_client):
     assert response.json() == {"code": 400, "message": "Unsupported field: image"}
 
 
-async def test_network_field_rejected_400(control_client):
-    response = await _create(control_client, network={"denyOut": ["0.0.0.0/0"]})
-    assert response.status_code == 400
-    assert response.json() == {"code": 400, "message": "Unsupported field: network"}
+async def test_network_field_accepted(control_client):
+    response = await _create(
+        control_client, network={"denyOut": ["10.0.0.0/8"]}
+    )
+    assert response.status_code == 201
+    sandbox_id = response.json()["sandboxID"]
+    try:
+        detail = (
+            await control_client.get(
+                f"/sandboxes/{sandbox_id}",
+                headers={"X-API-Key": "local-key"},
+            )
+        ).json()
+        assert detail["network"]["denyOut"] == ["10.0.0.0/8"]
+    finally:
+        await control_client.delete(
+            f"/sandboxes/{sandbox_id}", headers={"X-API-Key": "local-key"}
+        )
 
 
 async def test_wrong_api_key_401(control_client):
@@ -221,14 +235,15 @@ async def test_resource_exhausted_503(control_client):
 async def test_unsupported_endpoints_return_official_error(control_client):
     sandbox = (await _create(control_client)).json()
     sid = sandbox["sandboxID"]
-    for feature in ("network",):
-        response = await control_client.post(
-            f"/sandboxes/{sid}/{feature}",
-            headers={"X-API-Key": "local-key"},
-            json={},
-        )
-        assert response.status_code == 501
-        assert response.json() == {"code": 501, "message": f"Unsupported: {feature}"}
+    # The network API is implemented; only the egress proxy parts are
+    # rejected, and those return an explicit 400 (not a fake success).
+    response = await control_client.put(
+        f"/sandboxes/{sid}/network",
+        headers={"X-API-Key": "local-key"},
+        json={"egressProxy": {"address": "p:1080"}},
+    )
+    assert response.status_code == 400
+    assert "egressProxy" in response.json()["message"]
 
     templates = await control_client.post(
         "/templates/anything", headers={"X-API-Key": "local-key"}, json={}

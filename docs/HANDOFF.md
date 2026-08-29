@@ -1,8 +1,35 @@
 # 会话交接记录（2026-08-29）
 
 > 供新会话快速接续。当前基线：Linux 容器（privileged + host 网络）
-> `225 passed, 1 skipped`；macOS `200 passed, 6 skipped`
-> （unit + contract + sdk/python + sdk/js，JS SDK 本会话已在宿主跑通）。
+> `244 passed, 1 skipped`；macOS `225 passed, 16 skipped`
+> （unit + contract + sdk/python + sdk/js + security 跳过项）。
+
+## 本会话已完成（Network API，阶段 A + C）
+
+1. **network 配置全链路**：`POST /sandboxes` 的 `network` 字段与
+   `PUT /sandboxes/{id}/network`（官方 `update_network`，原子替换、省略字段
+   清空、`allowPublicTraffic` 仅创建时可设）。wire 格式为 camelCase
+   （`allowOut`/`denyOut`/`allowPublicTraffic`/`rules`；更新体 `allow_internet_access`
+   兼容 SDK 的 snake_case 拼写）。`SandboxRecord`/`RuntimeSandbox` 新增
+   `network` 字段并持久化（Redis 可见），`as_detail` 回显。
+2. **运行时映射（阶段 A）**：`allowOut`/`denyOut`/`allowInternetAccess` →
+   Sandlock `net_allow`/`net_deny`（互斥：两者都在时 allowlist 模型胜出、
+   deny CIDR 覆盖的 allow 条目被剔除）；`rules` 域名 → `http_allow`
+   （80/443 透明 MITM ACL，镜像 rootfs 模式把临时 CA 拼进每沙箱信任副本并
+   注入 `SSL_CERT_FILE`/`CURL_CA_BUNDLE`）。`LocalExecutor` no-op。
+3. **动态更新**：控制面保存后 `_push_network_config` 推送到节点 agent
+   （`POST /agent/sandboxes/{id}/network`），agent 更新 `RuntimeSandbox` 并
+   调用 `SandboxRuntimeContext.update_network`；RPC `_context` 增加网络配置
+   drift 检测，下条命令用新策略。
+4. **allowPublicTraffic**：envd HTTP/Connect 鉴权在
+   `runtime.allow_public_traffic` 时跳过 token 校验（仍校验 sandbox id）。
+5. **显式拒绝（no fake success）**：`egressProxy`、`maskRequestHost`、
+   `rules.transform`（header 改写）返回 400，标注依赖阶段 B 代理层。
+6. **测试**：单元（校验/映射/序列化/executor kwargs）14 个；契约 5 个
+   （回显/原子更新/404/拒绝/allowPublicTraffic/SDK 往返）；Sandlock 强制
+   1 个（deny 后 update_network 恢复 egress，`example.com:443` 实测 200）。
+   注意：多节点 harness worker 现设 `enable_network=True`（默认 false 时
+   网络策略不生效）。
 
 ## 本会话已完成
 
@@ -66,7 +93,12 @@ root_squash、uid=1000 映射、命令 IO 延迟未实测。部署验证时注�
 
 - 迁移导出 tar 仍含卷挂载符号链接空条目（功能等价，可显式排除）；
 - 未配置 `E2B_GATEWAY_URL` 时迁移后路由依赖 gateway 30s 缓存 TTL（文档已知）；
-- spec.md 其余官方 API 面（network/iam/lifecycle 等）仍未支持，入口处
+- Network API 的 egress 代理部分（`egressProxy`/`maskRequestHost`/
+  `rules.transform` header 改写）待阶段 B：需要宿主侧 SOCKS5 透明隧道 +
+  HTTP 改写代理（sandlock 的 on-behalf connect 是天然挂钩点，但 0.8.6 未
+  暴露 SOCKS5 上游，需扩展 sandlock 或引入 netns+redsocks）。`rules`
+  通配域名、`allowOut` 通配域名（`*.example.com`）同样依赖代理层。
+- spec.md 其余官方 API 面（iam/lifecycle 等）仍未支持，入口处
   `UNSUPPORTED_FIELDS`/`UNSUPPORTED_ENDPOINTS` 明确拒绝。
 
 ## 验证命令与基线
@@ -97,14 +129,20 @@ docker run --rm --privileged --network host \
 
 | 文件 | 内容 |
 |------|------|
-| `control_plane/api/sandboxes.py` | migrate（per-sandbox 锁 + 先停源 runtime + 失败回滚）、logs 合并、`_command_logs`、keep_files 销毁 |
+| `control_plane/api/sandboxes.py` | migrate（per-sandbox 锁 + 先停源 runtime + 失败回滚）、network 创建/`PUT /sandboxes/{id}/network`/`_push_network_config`、logs 合并、keep_files 销毁 |
 | `control_plane/registry/manager.py` | Redis save/get/list、TTL 回收、`try_acquire_migration`/`release_migration`（SETNX + TTL / 内存锁） |
 | `control_plane/api/templates.py` | COPY 上传链路、registry push/login |
 | `control_plane/registry/nodes.py` | `select_and_reserve(exclude_node_id)`、`reserve_node` |
-| `envd_service/agent.py` | export/import/logs/keepFiles 端点 |
+| `envd_service/agent.py` | export/import/logs/keepFiles 端点、`POST /agent/sandboxes/{id}/network` 更新端点 |
 | `envd_service/process/logs.py` | 命令输出 JSONL 采集 |
 | `envd_service/runtime/image_resolver.py` | rootfs 解包、pull、registry login、digest 缓存 key |
 | `envd_service/gateway.py` | 路由缓存 + `/internal/routes/{id}/invalidate` |
+| `gateway_common/network.py` | network 校验/规范化 + sandlock 策略映射 |
+| `envd_service/executors/sandlock.py` | network→net_allow/net_deny/http_allow + 每沙箱 CA 注入 |
+| `envd_service/runtime/context.py` | `update_network` + RPC drift 检测 |
+| `tests/contract/test_network_api.py` | network 契约（回显/更新/拒绝/allowPublicTraffic） |
+| `tests/security/test_network_enforcement.py` | deny→update→allow 强制用例 |
+| `tests/unit/test_network_config.py` | network 校验 + sandlock 映射单测 |
 | `tests/conftest.py` | live/multinode/registry/redis fixtures（session 级） |
 | `tests/contract/test_migration.py` | 迁移 + 共享 workspace + 持锁 409 + 失败回滚用例 |
 | `tests/contract/test_redis_multireplica_e2e.py` | 真实 Redis 多副本 |

@@ -24,14 +24,19 @@ from control_plane.registry.manager import (
 )
 from control_plane.registry.snapshots import UnknownSnapshotError
 from control_plane.registry.templates import UnknownTemplateBuildError
+from gateway_common.network import (
+    NetworkConfigError,
+    normalize_network_config,
+    normalize_network_update,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 # Unsupported fields that must produce an explicit 400 (no fake success).
-UNSUPPORTED_FIELDS = ("image", "network", "iam", "lifecycle")
-UNSUPPORTED_ENDPOINTS = ("network",)
+UNSUPPORTED_FIELDS = ("image", "iam", "lifecycle")
+UNSUPPORTED_ENDPOINTS = ()
 
 
 def _registry(request: Request) -> SandboxRegistry:
@@ -252,6 +257,11 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
     if not isinstance(secure, bool) or not isinstance(allow_internet_access, bool):
         raise OfficialError(400, "secure and allow_internet_access must be booleans")
 
+    try:
+        network = normalize_network_config(body.get("network"))
+    except NetworkConfigError as e:
+        raise OfficialError(400, str(e))
+
     registry = _registry(request)
     secrets = request.app.state.secrets
     try:
@@ -276,6 +286,7 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
             ),
             volume_mounts=volume_mounts,
             mcp=dict(mcp) if mcp is not None else None,
+            network=network,
         )
     except ResourceUnavailableError as e:
         raise OfficialError(503, str(e))
@@ -394,6 +405,10 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
         max_command_timeout=settings.max_command_timeout,
         volume_mounts=mount_paths,
         mcp=record.mcp,
+        network=record.network,
+        allow_public_traffic=bool(
+            (record.network or {}).get("allowPublicTraffic", False)
+        ),
     )
 
 
@@ -413,6 +428,10 @@ async def _provision_remote(
         "diskMB": record.disk_size_mb,
         "maxProcesses": record.max_processes,
         "allowInternetAccess": record.allow_internet_access,
+        "allowPublicTraffic": bool(
+            (record.network or {}).get("allowPublicTraffic", False)
+        ),
+        "network": record.network,
         "maxCommandTimeout": settings.max_command_timeout,
         "volumeMounts": [
             {
@@ -933,6 +952,114 @@ async def set_timeout(sandbox_id: str, request: Request) -> Response:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
     except ValueError as e:
         raise OfficialError(400, str(e))
+    return Response(status_code=204)
+
+
+async def _push_network_config(request, record) -> None:
+    """Apply a persisted network update on the node hosting the sandbox."""
+    node = request.app.state.nodes.get(record.node_id or "local")
+    if node is None:
+        logger.warning(
+            "node %s not found; network update for sandbox %s not pushed",
+            record.node_id,
+            record.sandbox_id,
+        )
+        return
+    allow_public_traffic = bool(
+        (record.network or {}).get("allowPublicTraffic", False)
+    )
+    if node.address == "local://":
+        runtime = request.app.state.runtime_registry.get(record.sandbox_id)
+        if runtime is None:
+            return
+        runtime.network = dict(record.network) if record.network else None
+        runtime.allow_internet_access = record.allow_internet_access
+        runtime.allow_public_traffic = allow_public_traffic
+        # If this process also hosts a live runtime context, update it; the
+        # envd side additionally applies drift when records are shared.
+        ctx = getattr(request.app.state, "runtimes", {}).get(record.sandbox_id)
+        if ctx is not None and hasattr(ctx, "update_network"):
+            ctx.update_network(record.network)
+        return
+    import httpx
+
+    logger.info(
+        "pushing network update for sandbox %s to node %s",
+        record.sandbox_id,
+        node.node_id,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{node.address}/agent/sandboxes/{record.sandbox_id}/network",
+                json={
+                    "network": record.network,
+                    "allowInternetAccess": record.allow_internet_access,
+                    "allowPublicTraffic": allow_public_traffic,
+                },
+                headers={
+                    "X-Internal-Key": request.app.state.settings.internal_api_key
+                },
+            )
+    except httpx.HTTPError as e:
+        logger.warning(
+            "failed to push network update for sandbox %s to node %s: %s",
+            record.sandbox_id,
+            node.node_id,
+            e,
+        )
+        return
+    if resp.status_code >= 300:
+        logger.warning(
+            "node %s rejected network update for sandbox %s: %s",
+            node.node_id,
+            record.sandbox_id,
+            resp.text,
+        )
+
+
+@router.put(
+    "/sandboxes/{sandbox_id}/network",
+    status_code=204,
+    dependencies=[Depends(require_api_key)],
+)
+async def update_sandbox_network(sandbox_id: str, request: Request) -> Response:
+    """Replace the sandbox network egress configuration atomically.
+
+    Mirrors the official ``Sandbox.update_network``: omitted fields are
+    cleared. The change is persisted on the control plane and pushed to the
+    node hosting the sandbox; the next command uses the new policy.
+    """
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise OfficialError(400, "Invalid JSON body")
+    if not isinstance(body, dict):
+        raise OfficialError(400, "Request body must be a JSON object")
+    try:
+        update = normalize_network_update(body)
+    except NetworkConfigError as e:
+        raise OfficialError(400, str(e))
+    registry = _registry(request)
+    try:
+        record = registry.get(sandbox_id)
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+
+    # Atomic replace: overlay the update on the current config; fields the
+    # update omits are cleared. ``allow_public_traffic`` is not updatable
+    # through this endpoint (official API keeps it create-only).
+    network = dict(record.network or {})
+    for field in ("allowOut", "denyOut", "rules", "allowInternetAccess"):
+        if field in update:
+            network[field] = update[field]
+        else:
+            network.pop(field, None)
+    if "allowInternetAccess" in update:
+        record.allow_internet_access = update["allowInternetAccess"]
+    record.network = network or None
+    registry.save(record)
+    await _push_network_config(request, record)
     return Response(status_code=204)
 
 

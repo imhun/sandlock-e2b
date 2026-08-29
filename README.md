@@ -130,7 +130,7 @@ profile 会拦截 sandlock 安装自己的 seccomp 过滤器，`docker-compose.t
   pty 桥」实现（沙箱内创建真实 pty，命令挂到 slave，master 数据经 PIPED stdio
   转发，resize 走带内控制帧）。限制：桥需要沙箱内有 Python 3 解释器
   （python 系镜像与纯 Sandlock 环境满足；node 系镜像暂不支持）。
-- 不支持的 API（fork/snapshots/network/templates）一律返回官方 Error JSON
+- 不支持的 API（fork/snapshots/templates 等）一律返回官方 Error JSON
   （`501`），不返回假成功。
 
 ## v2.1 扩展功能说明与限制
@@ -208,6 +208,21 @@ SDK → Envd Gateway :49983（按 E2b-Sandbox-Id 路由代理）
   关闭"路由已切换但旧节点进程还活着"的双活窗口；迁移失败会自动在源节点
   重新 provision，沙箱保持可用。控制面通过 `E2B_GATEWAY_URL` 通知 gateway
   失效旧路由。
+- **Network API**：`POST /sandboxes` 的 `network` 字段与
+  `PUT /sandboxes/{id}/network`（官方 `Sandbox.update_network`，原子替换、
+  省略字段清空）已支持：
+  - `allowOut` / `denyOut` — 出站白/黑名单（IP/CIDR/域名；`denyOut` 仅
+    IP/CIDR，与官方一致），映射到 Sandlock `net_allow`/`net_deny`；
+  - `allowPublicTraffic` — 为 true 时 envd HTTP/Connect 端点免
+    `X-Access-Token`（仍校验 `E2b-Sandbox-Id`）；
+  - `rules` — 注册域名并映射到 Sandlock `http_allow`（80/443 透明 MITM
+    按域名 ACL；镜像 rootfs 模式下把临时 CA 拼进每沙箱信任副本并注入
+    `SSL_CERT_FILE`，HTTPS 可用）。
+  - 未实现并显式 400 拒绝：`egressProxy`、`maskRequestHost`、
+    `rules.transform`（header 改写）——都需要 egress 代理层（阶段 B）。
+  - 注意：需 worker 设置 `E2B_ENABLE_NETWORK=true`（默认 false 时全局
+    拒绝出站，网络 API 策略不生效）；沙箱内 DNS 依赖 Sandlock 的 hostname
+    pinning，`allowOut` 用域名形式（如 `example.com:443`）最可靠。
 - **共享工作目录**：所有节点把 `E2B_WORKSPACE_BASE` 指向同一共享挂载点
   （NFS/CSI），并在控制面设置 `E2B_SHARED_WORKSPACE_ROOT` 后，迁移不再
   打包传输——沙箱目录已在共享存储，只重新 provision 目标节点（runtime +
