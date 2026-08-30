@@ -1,8 +1,8 @@
 services:
   control-plane:
     build:
-      context: .
-      dockerfile: Dockerfile.control-plane-gateway
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.control-plane-gateway
     environment:
       E2B_API_KEYS: local-key
       E2B_INTERNAL_API_KEY: internal-key
@@ -34,8 +34,8 @@ services:
 
   worker-1:
     build:
-      context: .
-      dockerfile: Dockerfile.envd
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.envd
     environment:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-1:49983
@@ -56,8 +56,8 @@ services:
 
   worker-2:
     build:
-      context: .
-      dockerfile: Dockerfile.envd
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.envd
     environment:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-2:49983
@@ -78,8 +78,8 @@ services:
 
   worker-3:
     build:
-      context: .
-      dockerfile: Dockerfile.envd
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.envd
     environment:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-3:49983

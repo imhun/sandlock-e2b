@@ -1,6 +1,6 @@
 # Production stack for the sandlock target host (Rocky Linux / aarch64 / 4C-7.3G).
 # Control plane and envd gateway run as ONE service on ONE port (merged
-# image Dockerfile.control-plane-gateway, :3000 for both API and gateway
+# image deploy/docker/Dockerfile.control-plane-gateway, :3000 for both API and gateway
 # routing; E2B_API_URL == E2B_SANDBOX_URL). 2 workers to fit the host memory;
 # add worker-N blocks (mirroring worker-2) when scaling out.
 #

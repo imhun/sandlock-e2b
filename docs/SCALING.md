@@ -83,7 +83,7 @@ max(min_replicas,
 | `envd_service/runtime/image_resolver.py` | 把 base image 提取为 chroot rootfs | `docker create` + `docker export`，需要 daemon socket |
 | `control_plane/api/templates.py` | 模板构建 | `docker build` / `tag` / `push`，需要 daemon socket |
 
-运行时镜像（`Dockerfile.envd` / `Dockerfile.control-plane`）目前都安装了
+运行时镜像（`deploy/docker/Dockerfile.envd` / `deploy/docker/Dockerfile.control-plane`）目前都安装了
 `docker.io docker-cli`，compose 文件都挂载了 `/var/run/docker.sock`。
 
 ### 4.2 Worker：registry 直拉 rootfs 提取器（核心改造）
@@ -120,7 +120,7 @@ max(min_replicas,
 仅把该目录当作 chroot 使用（不读镜像 config 的 ENV / Entrypoint），
 因此**无需解析 config blob**，改造不触碰执行器。
 
-依赖变化：`Dockerfile.envd` 移除 `docker.io docker-cli`；compose / k8s
+依赖变化：`deploy/docker/Dockerfile.envd` 移除 `docker.io docker-cli`；compose / k8s
 manifest 移除 `/var/run/docker.sock` 挂载。
 
 ### 4.3 控制面：模板构建去 daemon 化
@@ -136,7 +136,7 @@ manifest 移除 `/var/run/docker.sock` 挂载。
   buildkitd，不走 docker socket）或 K8s 内 kaniko 提供构建，控制面把
   Dockerfile 交给 Builder，产物 push 回仓库。改动大，作为二期。
 
-一期控制面 `Dockerfile.control-plane` 移除 `docker.io docker-cli`；模板构建
+一期控制面 `deploy/docker/Dockerfile.control-plane` 移除 `docker.io docker-cli`；模板构建
 接口在 CI 路径未接通前保持"构建失败并提示改用 CI"的降级行为（或由配置
 开关 `E2B_TEMPLATE_BUILD_ENABLED=false` 直接禁用）。
 
@@ -158,7 +158,7 @@ manifest 移除 `/var/run/docker.sock` 挂载。
   隐式 Docker Hub 解析；
 - 私有仓库凭据只通过 `E2B_IMAGE_REGISTRY_USERNAME` /
   `E2B_IMAGE_REGISTRY_PASSWORD` 注入（worker 提取与 CI push 共用）；
-- `scripts/build-images.sh` 默认 `TAG` 改为上述 registry 前缀，`PUSH=1`
+- `deploy/scripts/build-images.sh` 默认 `TAG` 改为上述 registry 前缀，`PUSH=1`
   才推送。
 
 ## 5. 自适应预热 + 延迟 ID 幂等创建（孤儿沙箱的解法）
@@ -388,20 +388,20 @@ K8s 侧再叠加 `terminationGracePeriodSeconds`（如 120s）+ PDB
 
 ### Phase 0：仓库与镜像基建
 
-- `scripts/build-images.sh` 默认 TAG 指向
+- `deploy/scripts/build-images.sh` 默认 TAG 指向
   `registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock`；
-- `.env.example` 补充 ACR 仓库地址与凭据占位；CI 增加 buildx push 任务。
+- `deploy/compose/.env.example` 补充 ACR 仓库地址与凭据占位；CI 增加 buildx push 任务。
 
 ### Phase 1：去 Docker socket
 
 - `envd_service/runtime/image_resolver.py`：重写为 registry v2 直拉
   （第 4.2 节），保留 `resolve_image_rootfs` 签名；
-- `Dockerfile.envd` / `Dockerfile.control-plane`：移除 docker CLI；
-- `docker-compose*.yml`：移除 socket 挂载；worker / control-plane 环境变量
+- `deploy/docker/Dockerfile.envd` / `deploy/docker/Dockerfile.control-plane`：移除 docker CLI；
+- `deploy/compose/docker-compose*.yml`：移除 socket 挂载；worker / control-plane 环境变量
   指向 ACR；
 - 单元测试：本地起一个最小 OCI 假仓库（Python http.server 实现 manifest/
   blob），覆盖白 out / 不透明目录 / 鉴权 / 重定向 / 并发锁；
-- `scripts/smoke-prod-worker.sh`：去掉 docker socket 前置说明，改为验证
+- `deploy/scripts/smoke-prod-worker.sh`：去掉 docker socket 前置说明，改为验证
   registry 直拉路径。
 
 ### Phase 2：控制面扩缩容能力
@@ -420,7 +420,7 @@ K8s 侧再叠加 `terminationGracePeriodSeconds`（如 120s）+ PDB
 ### Phase 3：Autoscaler + 本地后端
 
 - 新增 `autoscaler/`：`policy.py` / `loop.py` / `backends/local.py`；
-- 新增 `docker-compose.autoscale.yml`（control-plane + gateway + autoscaler +
+- 新增 `deploy/compose/docker-compose.autoscale.yml`（control-plane + gateway + autoscaler +
   worker pool 参数）；
 - 本机端到端验证：并发创建压到阈值 -> 自动起 worker -> 请求成功；空闲后
   自动回收。

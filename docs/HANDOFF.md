@@ -36,7 +36,7 @@ origin=fork，upstream=multikernel）。**运行时基线：`upstream-pr/netns-f
   手动推送，见 `docs/upstream-pr-netns-free.md`。
 - **M6 cp314 双架构完成 + 运行时统一 3.14**：`wheels/fork/` 现有 cp314
   x86_64 + aarch64 wheel（版本 0.9.0-beta，`manylinux_2_34` 标签；
-  `scripts/build-sandlock-wheels.sh`，一个 amd64 manylinux builder 内用
+  `deploy/scripts/build-sandlock-wheels.sh`，一个 amd64 manylinux builder 内用
   **zig 交叉编译**两个架构，zig glibc pin 2.34 + auditwheel 修复，无需
   QEMU 编译；镜像源：apt=清华、rustup/crates=rsproxy、pip=清华）；worker/
   control-plane/test-runner 与 `E2B_BASE_IMAGE` 默认模板统一切到
@@ -71,7 +71,7 @@ origin=fork，upstream=multikernel）。**运行时基线：`upstream-pr/netns-f
 **生产形态验证（seccomp）**：`unshare(CLONE_NEWUSER)` 会被 Docker 默认
 seccomp profile 以 EPERM 拦截（capability 无法绕过），所以 worker 容器必须
 `security_opt: [seccomp=unconfined]`（compose 已有）。已新增
-`scripts/smoke-prod-worker.sh`：非 privileged + seccomp=unconfined 形态下跑
+`deploy/scripts/smoke-prod-worker.sh`：非 privileged + seccomp=unconfined 形态下跑
 沙箱创建（无 root）、rootfs chroot（CA splice）、SOCKS5 出口三个用例，
 实测 3 passed。**全量测试套件已切非特权形态**：`--security-opt
 seccomp=unconfined --cap-add NET_ADMIN --network host`（无 `--privileged`），
@@ -96,7 +96,7 @@ origin 需跑在后台线程。
 `780 passed, 0 failed`（feature/network-socks5；netns-free PR 分支
 `770 passed`）；integration `437 passed, 0 failed`（PR 分支 `432`；netns
 用例在无 CAP_NET_ADMIN 时按能力跳过）；Python `430 passed, 0 skipped`
-（`Dockerfile.test-runner` 已补 `/usr/bin/python3 -> /usr/local/bin/python3`
+（`deploy/docker/Dockerfile.test-runner` 已补 `/usr/bin/python3 -> /usr/local/bin/python3`
 符号链接）。
 
 **环境注意事项**：
@@ -115,7 +115,7 @@ origin 需跑在后台线程。
   sandlock 的 no_new_privs 禁用——所以 sysctl 声明是唯一干净的方式。
   **注意**：`--network host` 的容器 Docker 拒绝应用 net sysctl（宿主
   netns 不允许），所以测试容器（host 网络）必须靠入口脚本 root 写一次；
-  生产 worker 用桥接网络，compose `sysctls` 生效（docker-compose.prod.yml
+  生产 worker 用桥接网络，compose `sysctls` 生效（deploy/compose/docker-compose.prod.yml
   已加）。
 - **构建以 root 跑一次**（`--user root --entrypoint bash`，见下），**测试
   全程非 root**——这是 sandlock 无 root 原则的落地；整个套件不再有
@@ -219,9 +219,9 @@ fork 分支 `feature/network-inject`（基于 feature/network-netns）：
 - **M3 项目接入已接线（2026-08-29）**：`gateway_common/network.py` 在
   `E2B_ENABLE_NETNS` 时放开通配 allowOut（否则维持 400）；
   `SandlockExecutor` 增加 `enable_netns`（kwargs `netns`，默认 False 兼容
-  旧 wheel）；`docker-compose.prod.yml` worker 加 `NET_ADMIN` +
+  旧 wheel）；`deploy/compose/docker-compose.prod.yml` worker 加 `NET_ADMIN` +
   `net.ipv4.ip_forward=1` + `E2B_ENABLE_NETNS`；`envd_service/netns.py`
-  在 worker 启动时配 ip_forward + veth 网段 MASQUERADE；`Dockerfile.envd`/
+  在 worker 启动时配 ip_forward + veth 网段 MASQUERADE；`deploy/docker/Dockerfile.envd`/
   `test-runner` 加 iptables；fork wheel（含 `netns` FFI/Python 绑定）已可
   构建。**待办**：把 worker/测试镜像的 sandlock 来源切到 fork wheel
   （M6 wheel 矩阵/私有源），跑 security 通配 e2e + 全量回归；HTTP ACL +
@@ -310,22 +310,22 @@ fork 分支 `feature/network-netns`（基于 feature/network-wildcard）：
 
 ## 本会话已完成（最终容器镜像 + 分离部署）
 
-1. **镜像分离**：`Dockerfile.control-plane` 只含 `gateway_common` +
-   `control_plane`；`Dockerfile.envd` 只含 `gateway_common` + `envd_service`，
+1. **镜像分离**：`deploy/docker/Dockerfile.control-plane` 只含 `gateway_common` +
+   `control_plane`；`deploy/docker/Dockerfile.envd` 只含 `gateway_common` + `envd_service`，
    且 multi-stage 预编译 `libegress_proxy.so` 到 `/opt/egress/`（最终镜像
    不带 gcc）。代码层解耦：env 工具函数移到 `gateway_common/env.py`；
    控制面 `create_app` 对 `RuntimeRegistry` 懒导入，分离模式用 no-op
    哨兵（pause/resume/snapshots/kill 等调用安全）。
-2. **构建脚本** `scripts/build-images.sh`：buildx 多架构
+2. **构建脚本** `deploy/scripts/build-images.sh`：buildx 多架构
    （`linux/amd64,linux/arm64`），多平台需 `PUSH=1`。
-3. **部署示例** `docker-compose.prod.yml` + `.env.example`：控制面 +
+3. **部署示例** `deploy/compose/docker-compose.prod.yml` + `deploy/compose/.env.example`：控制面 +
    gateway + worker-1/2/3（YAML anchor）+ Redis（共享状态）+ 可选本地
-   registry（profile）；`docker-compose.yml` 单机示例控制面改为
+   registry（profile）；`deploy/compose/docker-compose.yml` 单机示例控制面改为
    `E2B_ENABLE_LOCAL_NODE=false`。
 4. **验证**：两镜像构建成功（镜像内容分离确认）；`compose config` 有效；
    macOS 起栈（`--no-build` 强制用分离镜像）三 worker 验证全绿：
    `multinode_smoke.py`（跨节点分布覆盖 3 worker/命令/文件/stdin/配额释放）
-   + `scripts/deployment_smoke.py`（追加迁移 worker-2→worker-1 共享
+   + `deploy/scripts/deployment_smoke.py`（追加迁移 worker-2→worker-1 共享
    workspace 文件保留、network 回显/原子更新）。踩坑记录：宿主 3000 端口
    被占用需换端口；本机 docker daemon 里 `python:3.11-slim` 曾被 arm64
    spike 覆盖导致沙箱 qemu-arm64——拉回 amd64 后正常（顺带验证了 rootfs
@@ -451,14 +451,14 @@ docker run --rm --privileged --network host \
   e2b-sandlock-test:latest pytest tests --perf -q -p no:cacheprovider
 ```
 
-- 测试镜像 `e2b-sandlock-test:latest`（Dockerfile.test-runner，国内源，
+- 测试镜像 `e2b-sandlock-test:latest`（deploy/docker/Dockerfile.test-runner，国内源，
   已含 redis-server）；改依赖后需重建。
 - `--network host` + `E2B_HOST_PROJECT` 是容器内 docker CLI 访问宿主
   localhost 端口 / 挂载宿主路径的前提（registry/Redis 端口映射、htpasswd
   挂载）。
-- 多节点冒烟：`scripts/multinode_smoke.py` + `scripts/deployment_smoke.py`
+- 多节点冒烟：`deploy/scripts/multinode_smoke.py` + `deploy/scripts/deployment_smoke.py`
   （后者含迁移/共享 workspace/network 更新）；compose：
-  `docker compose -f docker-compose.multinode.yml up -d`。
+  `docker compose -f deploy/compose/docker-compose.multinode.yml up -d`。
 
 ### sandlock fork 验证（Linux 容器）
 
@@ -516,9 +516,9 @@ cargo test -p sandlock-core --offline --test integration test_netns -- --test-th
 | `tests/contract/test_template_upload.py` | COPY 上传契约 |
 | `tests/sdk/python/test_templates.py` | 构建、COPY、registry push/pull/认证 |
 | `tests/unit/test_sandbox_registry.py` / `test_redis_multireplica.py` | 迁移锁单元测试（内存 + fakeredis） |
-| `Dockerfile.control-plane` / `Dockerfile.envd` | 分离的最终镜像（envd multi-stage 预编译 egress 库，最终镜像无 gcc） |
-| `docker-compose.prod.yml` / `.env.example` | 生产部署示例（控制面+gateway+worker+Redis+可选 registry） |
-| `scripts/build-images.sh` | buildx 多架构（amd64/arm64）镜像构建脚本 |
+| `deploy/docker/Dockerfile.control-plane` / `deploy/docker/Dockerfile.envd` | 分离的最终镜像（envd multi-stage 预编译 egress 库，最终镜像无 gcc） |
+| `deploy/compose/docker-compose.prod.yml` / `deploy/compose/.env.example` | 生产部署示例（控制面+gateway+worker+Redis+可选 registry） |
+| `deploy/scripts/build-images.sh` | buildx 多架构（amd64/arm64）镜像构建脚本 |
 | `gateway_common/env.py` | env 工具函数（消除 control_plane↔envd_service 交叉导入） |
 
 ## 配置速查（新增项）

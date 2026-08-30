@@ -5,8 +5,8 @@
 # The autoscaler runs on the Docker host and uses the docker CLI to manage
 # worker containers; the workers themselves need no Docker socket.
 #
-#   cp .env.example .env
-#   docker compose -f docker-compose.autoscale.yml up -d --build
+#   cp deploy/compose/.env.example deploy/compose/.env
+#   docker compose -f deploy/compose/docker-compose.autoscale.yml up -d --build
 services:
   redis:
     image: redis:8-alpine
@@ -16,8 +16,8 @@ services:
 
   control-plane:
     build:
-      context: .
-      dockerfile: Dockerfile.control-plane-gateway
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.control-plane-gateway
     image: ${CONTROL_PLANE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-control-plane-gateway:0.1.0}
     depends_on:
       - redis
@@ -46,8 +46,8 @@ services:
 
   autoscaler:
     build:
-      context: .
-      dockerfile: Dockerfile.autoscaler
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.autoscaler
     image: ${AUTOSCALER_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-autoscaler:0.1.0}
     depends_on:
       - control-plane

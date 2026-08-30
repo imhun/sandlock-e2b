@@ -3,9 +3,9 @@
 # workers, Redis shared state and an optional local image registry for
 # template distribution.
 #
-#   cp .env.example .env        # adjust secrets / image registry
-#   docker compose -f docker-compose.prod.yml up -d --build
-#   docker compose -f docker-compose.prod.yml ps
+#   cp deploy/compose/.env.example deploy/compose/.env  # secrets / registry
+#   docker compose -f deploy/compose/docker-compose.prod.yml up -d --build
+#   docker compose -f deploy/compose/docker-compose.prod.yml ps
 #
 # Multi-host note: to run workers on several machines, point every worker's
 # E2B_WORKSPACE_BASE at the same NFS/CSI share, keep the control plane on one
@@ -27,8 +27,8 @@ services:
 
   control-plane:
     build:
-      context: .
-      dockerfile: Dockerfile.control-plane-gateway
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.control-plane-gateway
     image: ${CONTROL_PLANE_IMAGE:-e2b-sandlock-control-plane-gateway:0.1.0}
     depends_on:
       redis:
@@ -67,8 +67,8 @@ services:
 
   worker-1: &worker
     build:
-      context: .
-      dockerfile: Dockerfile.envd
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.envd
     image: ${WORKER_IMAGE:-e2b-sandlock-worker:0.1.0}
     depends_on:
       - control-plane

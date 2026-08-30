@@ -4,7 +4,7 @@
 目标机 `root@172.18.80.140`（堡垒机免密）→ 应用用户 `deploy`（docker 组）。
 
 服务拓扑：**control-plane 与 gateway 合并为一个服务**（合并镜像
-`Dockerfile.control-plane-gateway`，单容器单端口 `:3000`，API 与 gateway
+`deploy/docker/Dockerfile.control-plane-gateway`，单容器单端口 `:3000`，API 与 gateway
 路由同端口，`E2B_API_URL == E2B_SANDBOX_URL`）+ 2 个 worker + redis，
 共 4 个容器。
 

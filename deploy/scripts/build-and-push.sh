@@ -30,7 +30,7 @@ require_acr_creds
 say "检查 sandlock wheels（构建 worker 镜像需要）"
 WHEELS="$(cd "$SCRIPT_DIR/../.." && pwd)/wheels/fork"
 if ! ls "$WHEELS"/*.whl >/dev/null 2>&1; then
-    echo "wheels/fork/ 缺少 wheel，先执行 ./scripts/build-sandlock-wheels.sh" >&2
+    echo "wheels/fork/ 缺少 wheel，先执行 ./deploy/scripts/build-sandlock-wheels.sh" >&2
     exit 1
 fi
 
@@ -54,14 +54,14 @@ REGISTRY="$REGISTRY_URL" \
 VERSION="$VERSION" \
 PLATFORMS="$PLATFORMS" \
 PUSH=1 \
-"$SCRIPT_DIR/../../scripts/build-images.sh"
+"$SCRIPT_DIR/build-images.sh"
 
 say "build & push merged image control-plane-gateway (single port :3000: API + gateway)"
 BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker buildx build \
     --builder multiarch \
     --platform "$PLATFORMS" \
     --push \
-    -f "$SCRIPT_DIR/../../Dockerfile.control-plane-gateway" \
+    -f "$SCRIPT_DIR/../docker/Dockerfile.control-plane-gateway" \
     -t "$REGISTRY_URL/e2b-sandlock-control-plane-gateway:$VERSION" \
     "$SCRIPT_DIR/../.."
 
@@ -87,7 +87,7 @@ say "build & push MCP-capable base image (mcp + uvicorn + mcp-gateway)"
 BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker buildx build \
     --builder multiarch \
     --platform "$PLATFORMS" \
-    -f "$SCRIPT_DIR/../../Dockerfile.mcp-base" \
+    -f "$SCRIPT_DIR/../docker/Dockerfile.mcp-base" \
     -t "$REGISTRY_URL/python-mcp:3.14" \
     --push \
     "$SCRIPT_DIR/../.."

@@ -312,15 +312,15 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
   a. 私有 wheel index（如 `pip index`/`devpi`/OSS 私有桶），Dockerfile 指向；
   b. 镜像构建时从 fork 源码 `pip install git+https://github.com/<org>/sandlock@<rev>`
      （`setuptools-rust` 需在构建镜像内装 Rust 工具链，镜像变大、构建变慢）；
-- 建议 a：保持 `Dockerfile.envd` / `Dockerfile.test-runner` 只改一行
+- 建议 a：保持 `deploy/docker/Dockerfile.envd` / `deploy/docker/Dockerfile.test-runner` 只改一行
   `sandlock==<fork-version>` 来源。
 
 ### 6.5 镜像与依赖锁定
 
-- `Dockerfile.envd` / `Dockerfile.test-runner`：sandlock 安装来源改为
+- `deploy/docker/Dockerfile.envd` / `deploy/docker/Dockerfile.test-runner`：sandlock 安装来源改为
   fork wheel/index；
 - 锁定 fork 版本（`requirements` 或 pip `==`），升级需重新跑全量；
-- 多架构镜像构建（`scripts/build-images.sh`）需在 CI 里对两个架构各编译
+- 多架构镜像构建（`deploy/scripts/build-images.sh`）需在 CI 里对两个架构各编译
   wheel 一次。
 
 ### 6.6 测试矩阵
@@ -361,7 +361,7 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 - Block C 落地前：两套过滤并存（sandlock 普通模式 / LD_PRELOAD 代理模式），
   需各自回归；
 - Block C 落地后（R14）：LD_PRELOAD 库退役，删除 `envd_service/egress/`
-  相关代码与镜像内 `/opt/egress/libegress_proxy.so`，`Dockerfile.envd`
+  相关代码与镜像内 `/opt/egress/libegress_proxy.so`，`deploy/docker/Dockerfile.envd`
   的 builder 阶段移除（镜像更小）；
 - 退役前跑一次双实现行为一致性对照（同一规则集）。
 

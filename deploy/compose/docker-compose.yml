@@ -1,8 +1,8 @@
 services:
   control-plane:
     build:
-      context: .
-      dockerfile: Dockerfile.control-plane
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.control-plane
     environment:
       E2B_API_KEYS: local-key
       E2B_ENABLE_LOCAL_NODE: "false"
@@ -25,8 +25,8 @@ services:
 
   envd:
     build:
-      context: .
-      dockerfile: Dockerfile.envd
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.envd
     environment:
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
     ports:

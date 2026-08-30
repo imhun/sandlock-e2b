@@ -1,6 +1,7 @@
 #!/bin/sh
 # Production-shape worker smoke: exercise the worker-side sandlock stack the
-# way docker-compose.prod.yml deploys it — NON-privileged container, seccomp
+# way deploy/compose/docker-compose.prod.yml deploys it — NON-privileged
+# container, seccomp
 # unconfined (sandlock installs its own seccomp filters and needs a user
 # namespace for the uid/gid map, which Docker's default profile would block),
 # image rootfs pulled directly from the OCI registry (no Docker daemon) — then
@@ -11,7 +12,7 @@
 #   * the SOCKS5 egress on-behalf path (sandbox network)
 #
 # Usage:
-#   ./scripts/smoke-prod-worker.sh [image]
+#   ./deploy/scripts/smoke-prod-worker.sh [image]
 set -eu
 
 IMAGE="${1:-e2b-sandlock-test:latest}"

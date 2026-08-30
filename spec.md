@@ -391,8 +391,8 @@ e2b-sandlock-gateway/
 │   ├── http/files.py
 │   ├── http/health.py
 │   └── runtime/sandlock_executor.py
-├── Dockerfile.test-runner
-├── docker-compose.test.yml
+├── deploy/docker/Dockerfile.test-runner
+├── deploy/compose/docker-compose.test.yml
 ├── tests/
 │   ├── unit/
 │   ├── contract/
@@ -502,7 +502,7 @@ macOS 开发机
 - 模板配置了基础镜像时，测试和运行时统一使用该镜像；`base` 使用 `E2B_BASE_IMAGE`，其他模板使用 `E2B_TEMPLATE_IMAGES`。
 - Control Plane 创建沙箱时按 `templateID` -> `E2B_TEMPLATE_IMAGES` -> `E2B_BASE_IMAGE` 解析镜像名，并让 Envd/Runtime 使用 Sandlock 镜像 rootfs 模式；SDK 请求本身不接受 `image` 字段。
 - 模板未配置基础镜像时，该模板使用纯 Sandlock 模式，不创建外层容器。
-- 项目提供 `Dockerfile.test-runner` 和 `docker-compose.test.yml`，test runner 基于 Linux Python 3.11，安装 `sandlock==0.8.6`，挂载源码与 `tmp/sandboxes/`。
+- 项目提供 `deploy/docker/Dockerfile.test-runner` 和 `deploy/compose/docker-compose.test.yml`，test runner 基于 Linux Python 3.11，安装 `sandlock==0.8.6`，挂载源码与 `tmp/sandboxes/`。
 - macOS 本机通过 Docker 启动 test runner；Linux CI 可直接运行同一测试命令，避免两套测试路径。
 - 镜像解析走 Docker daemon API；test runner 必须有 Docker daemon 访问权限，但沙箱执行不依赖容器运行时。
 - 镜像 rootfs 内的命令仍受 Landlock 文件系统规则、seccomp 过滤、网络规则和资源限制约束。
@@ -666,8 +666,8 @@ await sandbox.kill()
 services:
   control-plane:
     build:
-      context: .
-      dockerfile: Dockerfile.control-plane
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.control-plane
     environment:
       E2B_API_KEYS: local-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
@@ -689,8 +689,8 @@ services:
 
   envd:
     build:
-      context: .
-      dockerfile: Dockerfile.envd
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.envd
     environment:
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
     ports:
@@ -912,7 +912,7 @@ test('command result', async () => {
 | Job | 系统 | 命令 |
 |-----|------|------|
 | 单元 + 契约 | macOS/Ubuntu | `pytest tests/unit tests/contract` |
-| macOS 真实执行（可选） | macOS + Docker Desktop | `docker compose -f docker-compose.test.yml run --rm test-runner pytest tests/sdk/python` |
+| macOS 真实执行（可选） | macOS + Docker Desktop | `docker compose -f deploy/compose/docker-compose.test.yml run --rm test-runner pytest tests/sdk/python` |
 | Python SDK | ubuntu-24.04 + Docker daemon | `E2B_BASE_IMAGE=python:3.11-slim pytest tests/sdk/python` |
 | JS SDK | ubuntu-24.04 + Docker daemon | `E2B_BASE_IMAGE=python:3.11-slim pnpm test --run tests/sdk/js` |
 | 安全 | ubuntu-24.04 + Docker daemon | `E2B_BASE_IMAGE=python:3.11-slim pytest tests/security` |
@@ -921,14 +921,14 @@ test('command result', async () => {
 
 ### 8.11 macOS 本机运行真实执行测试
 
-macOS 本机不能直接执行 Sandlock。`docker-compose.test.yml` 负责启动 Linux test runner：
+macOS 本机不能直接执行 Sandlock。`deploy/compose/docker-compose.test.yml` 负责启动 Linux test runner：
 
 ```yaml
 services:
   test-runner:
     build:
-      context: .
-      dockerfile: Dockerfile.test-runner
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.test-runner
     image: e2b-sandlock-test:latest
     working_dir: /workspace
     privileged: true
@@ -944,7 +944,7 @@ services:
     command: pytest tests/sdk/python
 ```
 
-`Dockerfile.test-runner` 基线：
+`deploy/docker/Dockerfile.test-runner` 基线：
 
 ```dockerfile
 FROM python:3.11-slim
@@ -957,8 +957,8 @@ RUN pip install --no-cache-dir sandlock==0.8.6 e2b==2.46.1 pytest pytest-asyncio
 执行命令：
 
 ```bash
-docker compose -f docker-compose.test.yml build
-docker compose -f docker-compose.test.yml run --rm test-runner
+docker compose -f deploy/compose/docker-compose.test.yml build
+docker compose -f deploy/compose/docker-compose.test.yml run --rm test-runner
 ```
 
 启动前必须检查 test runner 内 `sandlock.landlock_abi_version() >= 6`；不满足时改用 Linux CI runner。

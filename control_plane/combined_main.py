@@ -2,7 +2,7 @@
 
 ``python -m control_plane.combined_main`` serves both on
 ``E2B_CONTROL_PLANE_PORT`` (default 3000) in a single process (used by the
-merged ``Dockerfile.control-plane-gateway`` image):
+merged ``deploy/docker/Dockerfile.control-plane-gateway`` image):
 
   * control plane API routes (``/v3/...``, ``/internal/...``, ...)
   * envd gateway catch-all proxy for ``E2b-Sandbox-Id`` traffic

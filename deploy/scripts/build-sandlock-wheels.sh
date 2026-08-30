@@ -9,7 +9,7 @@
 # third_party/sandlock-wheel-builder/ (both versioned in this repo).
 #
 # Usage:
-#   ./scripts/build-sandlock-wheels.sh
+#   ./deploy/scripts/build-sandlock-wheels.sh
 #
 # Environment:
 #   PLATFORM    buildx platform for the native builder (default: host arch)

@@ -65,8 +65,8 @@ sandbox.kill()
 Linux test runner：
 
 ```bash
-docker compose -f docker-compose.test.yml build
-docker compose -f docker-compose.test.yml run --rm test-runner pytest tests/sdk/python
+docker compose -f deploy/compose/docker-compose.test.yml build
+docker compose -f deploy/compose/docker-compose.test.yml run --rm test-runner pytest tests/sdk/python
 ```
 
 全量验收直接跑容器，**非特权形态**：不挂 `--privileged`，改用
@@ -95,39 +95,39 @@ macOS 本机只运行不依赖 Sandlock 的单元/契约测试，SDK 测试在 L
 
 Dockerfile 使用清华 apt/pip 镜像源、JS SDK 测试使用 npmmirror 源，构建与安装
 走国内网络。test runner 容器需要 `privileged: true`（Docker 默认 seccomp
-profile 会拦截 sandlock 安装自己的 seccomp 过滤器，`docker-compose.test.yml`
+profile 会拦截 sandlock 安装自己的 seccomp 过滤器，`deploy/compose/docker-compose.test.yml`
 已配置）。
 
 ## 容器镜像与部署
 
 **镜像**：
-- `Dockerfile.control-plane-gateway` 打包**控制面 + envd gateway 合并镜像**
+- `deploy/docker/Dockerfile.control-plane-gateway` 打包**控制面 + envd gateway 合并镜像**
   （`gateway_common` + `control_plane` + `envd_service`，单服务单端口
   `:3000` 同时服务 API 与沙箱路由，`E2B_API_URL` 与 `E2B_SANDBOX_URL`
   指向同一地址，不带 sandlock wheel）；
-- `Dockerfile.envd` 只打包 worker（`gateway_common` + `envd_service`，含
+- `deploy/docker/Dockerfile.envd` 只打包 worker（`gateway_common` + `envd_service`，含
   **fork sandlock wheel**（`wheels/fork/`，按 TARGETARCH 选择；通配
   allowOut / header 注入 / host 掩码 / SOCKS5 on-behalf）与 mcp-gateway）。
 
 控制面与 worker 在代码层已解耦（env 工具函数收敛到 `gateway_common.env`；
 控制面在分离模式下用 no-op runtime registry），所以合并镜像不依赖
-sandlock wheel、worker 镜像不依赖 control_plane。`Dockerfile.control-plane`
-仅保留给单机本地构建示例（`docker-compose.yml`）使用。
+sandlock wheel、worker 镜像不依赖 control_plane。`deploy/docker/Dockerfile.control-plane`
+仅保留给单机本地构建示例（`deploy/compose/docker-compose.yml`）使用。
 
 `wheels/fork/` 是构建产物、不入库（fork 源码固定于 `third_party/sandlock`
-子模块）：构建镜像前先执行 `./scripts/build-sandlock-wheels.sh` 生成 wheel。
+子模块）：构建镜像前先执行 `./deploy/scripts/build-sandlock-wheels.sh` 生成 wheel。
 
 **构建（多架构）**：
 
 ```bash
 # 单平台加载到本地 docker
-REGISTRY=e2b-sandlock VERSION=1.0 PLATFORMS=linux/amd64 ./scripts/build-images.sh
+REGISTRY=e2b-sandlock VERSION=1.0 PLATFORMS=linux/amd64 ./deploy/scripts/build-images.sh
 
 # 多架构（x86_64 + arm64）需推送到 registry
 REGISTRY=registry.example.com/e2b \
 VERSION=1.0 \
 PLATFORMS=linux/amd64,linux/arm64 \
-PUSH=1 ./scripts/build-images.sh
+PUSH=1 ./deploy/scripts/build-images.sh
 ```
 
 产出镜像，**名称区分服务、tag 区分版本**：
@@ -139,28 +139,28 @@ PUSH=1 ./scripts/build-images.sh
 镜像仓库）：
 
 ```bash
-cp .env.example .env        # 修改密钥/端口/仓库
-docker compose -f docker-compose.prod.yml up -d --build
+cp deploy/compose/.env.example deploy/compose/.env   # 修改密钥/端口/仓库
+docker compose -f deploy/compose/docker-compose.prod.yml up -d --build
 
 # 冒烟验证（沙箱跨节点分布、经 gateway 的命令/文件/stdin、kill 后配额释放）
 E2B_API_URL=http://127.0.0.1:3000 \
 E2B_SANDBOX_URL=http://127.0.0.1:3000 \
 E2B_API_KEY=local-key \
-python scripts/multinode_smoke.py
+python deploy/scripts/multinode_smoke.py
 
 # 部署级验证（追加：跨 worker 迁移 + 共享 workspace 文件保留 + network
 # 配置回显/原子更新，三 worker 分布）
 E2B_API_URL=http://127.0.0.1:3000 \
 E2B_SANDBOX_URL=http://127.0.0.1:3000 \
 E2B_API_KEY=local-key \
-python scripts/deployment_smoke.py
+python deploy/scripts/deployment_smoke.py
 ```
 
 生产形态容器冒烟（非 privileged + `seccomp=unconfined`，验证沙箱创建 /
 rootfs chroot / SOCKS5 出口，与 compose 部署一致）：
 
 ```bash
-./scripts/smoke-prod-worker.sh
+./deploy/scripts/smoke-prod-worker.sh
 ```
 
 要点：
@@ -265,7 +265,7 @@ SDK → Control Plane + Envd Gateway :3000（注册表 / 调度 / 准入 / 按
   → 均衡；全局 `E2B_MAX_TOTAL_*` 与节点级配额双重准入，超限 `503`。
 - **路由代理**：Gateway 查询控制面路由表（缓存 30s），Connect 流式与
   `/files` 等 HTTP 请求原样透传（`E2b-Sandbox-Id`、`X-Access-Token` 保留）。
-- **管理**：`docker compose -f docker-compose.multinode.yml up` 起
+- **管理**：`docker compose -f deploy/compose/docker-compose.multinode.yml up` 起
   1 控制面 + 1 gateway + 3 worker；物理节点在另一台 Linux 跑同一
   `python -m envd_service`（agent 自动注册）。
 - **镜像仓库**：控制面设置 `E2B_IMAGE_REGISTRY`（如
@@ -333,7 +333,7 @@ SDK → Control Plane + Envd Gateway :3000（注册表 / 调度 / 准入 / 按
   命令文件 IO 走网络；同一沙箱同时只在一个节点运行（路由保证单点）。
 - **真实多节点验证**：compose 起来后运行
   `E2B_API_URL=http://127.0.0.1:3100 E2B_SANDBOX_URL=http://127.0.0.1:3100
-  python scripts/multinode_smoke.py`，验证沙箱跨节点分布、经 gateway 的
+  python deploy/scripts/multinode_smoke.py`，验证沙箱跨节点分布、经 gateway 的
   命令/文件/stdin、以及 kill 后节点配额释放。worker 容器需要
   `security_opt: [seccomp=unconfined]`（sandlock 需安装嵌套 seccomp 过滤器）
   和 docker CLI（镜像 rootfs 解析）；多节点部署建议

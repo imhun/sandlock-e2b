@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Deployment-level multi-node smoke against the separated container images.
 
-Usage (after ``docker compose -f docker-compose.prod.yml up -d --no-build``):
+Usage (after ``docker compose -f deploy/compose/docker-compose.prod.yml up -d --no-build``):
 
     E2B_API_URL=http://127.0.0.1:3000 \\
     E2B_SANDBOX_URL=http://127.0.0.1:3000 \\
     E2B_API_KEY=local-key \\
-    python scripts/deployment_smoke.py
+    python deploy/scripts/deployment_smoke.py
 
 Covers what ``multinode_smoke.py`` does plus: filesystem migration across
 workers (shared workspace => route switch only), network config echo/update,

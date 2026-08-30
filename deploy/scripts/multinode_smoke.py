@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Multi-node smoke test against a live compose deployment.
 
-Usage (after ``docker compose -f docker-compose.multinode.yml up -d``):
+Usage (after ``docker compose -f deploy/compose/docker-compose.multinode.yml up -d``):
 
     E2B_API_URL=http://127.0.0.1:3100 \\
     E2B_SANDBOX_URL=http://127.0.0.1:3100 \\
     E2B_API_KEY=local-key \\
-    python scripts/multinode_smoke.py
+    python deploy/scripts/multinode_smoke.py
 
 Verifies: sandbox spread across nodes, commands/files/health/stdin through
 the envd gateway, and per-node quota release after kill.

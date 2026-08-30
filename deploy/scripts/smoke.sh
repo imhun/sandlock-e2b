@@ -10,8 +10,8 @@ set -euo pipefail
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 say "上传冒烟脚本"
-upload_file "$REPO_DIR/scripts/multinode_smoke.py" "$REMOTE_DIR/multinode_smoke.py" "$DEPLOY_USER"
-upload_file "$REPO_DIR/scripts/deployment_smoke.py" "$REMOTE_DIR/deployment_smoke.py" "$DEPLOY_USER"
+upload_file "$REPO_DIR/deploy/scripts/multinode_smoke.py" "$REMOTE_DIR/multinode_smoke.py" "$DEPLOY_USER"
+upload_file "$REPO_DIR/deploy/scripts/deployment_smoke.py" "$REMOTE_DIR/deployment_smoke.py" "$DEPLOY_USER"
 
 say "准备 venv（e2b SDK）"
 run_as_deploy '

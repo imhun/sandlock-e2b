@@ -1,8 +1,8 @@
 services:
   test-runner:
     build:
-      context: .
-      dockerfile: Dockerfile.test-runner
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.test-runner
     image: e2b-sandlock-test:latest
     working_dir: /workspace
     # Non-privileged production shape: seccomp must be unconfined (sandlock
