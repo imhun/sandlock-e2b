@@ -179,3 +179,26 @@ def test_register_clears_draining():
         total_processes=128,
     )
     assert record.draining is False
+
+
+def test_set_reserved_restores_accounting():
+    registry, record = _node(total_memory_mb=1024)
+    restored = registry.set_reserved(
+        "node_a",
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        processes=64,
+    )
+    assert restored is record
+    assert record.reserved_memory_mb == 512
+    assert record.reserved_cpu_percent == 100
+    assert not record.can_fit(600, 100, 1024, 64)
+    assert record.can_fit(256, 50, 512, 32)
+    assert registry.set_reserved(
+        "missing",
+        memory_mb=0,
+        cpu_percent=0,
+        disk_mb=0,
+        processes=0,
+    ) is None

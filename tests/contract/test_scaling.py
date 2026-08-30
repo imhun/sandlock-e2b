@@ -140,3 +140,55 @@ async def test_drain_undrain_and_fleet_metrics(apps):
         )
         by_id2 = {n["nodeID"]: n for n in metrics2.json()["nodes"]}
         assert by_id2["worker-x"]["draining"] is False
+
+
+async def test_re_register_rebuilds_node_reservations(apps):
+    control, _ = apps
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control), base_url="http://test"
+    ) as client:
+        body = {
+            "nodeID": "worker-x",
+            "address": "http://worker-x:49983",
+            "totalMemoryMB": 2048,
+            "totalCPUPercent": 200,
+            "totalDiskMB": 4096,
+            "totalProcesses": 128,
+            "labels": {"node-type": "container"},
+        }
+        reg = await client.post(
+            "/internal/nodes/register",
+            headers={"X-Internal-Key": "internal-key"},
+            json=body,
+        )
+        assert reg.status_code == 200
+
+        # Create sandbox records pinned to worker-x (what survives in Redis
+        # when the in-memory node reservations are wiped by a restart).
+        settings = control.state.settings
+        registry = control.state.registry
+        for _ in range(2):
+            record = registry.create(
+                template_id="base",
+                timeout=300,
+                metadata={},
+                env_vars={},
+                secure=True,
+                allow_internet_access=False,
+                base_image=None,
+            )
+            record.node_id = "worker-x"
+            registry.save(record)
+
+        # Simulate re-registration after a control-plane restart.
+        reg2 = await client.post(
+            "/internal/nodes/register",
+            headers={"X-Internal-Key": "internal-key"},
+            json=body,
+        )
+        assert reg2.status_code == 200
+        node = control.state.nodes.get("worker-x")
+        assert node.reserved_memory_mb == 2 * settings.default_memory_mb
+        assert node.reserved_cpu_percent == 2 * settings.default_cpu_percent
+        assert node.reserved_disk_mb == 2 * settings.default_disk_mb
+        assert node.reserved_processes == 2 * settings.default_max_processes

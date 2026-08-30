@@ -40,7 +40,33 @@ async def register_node(request: Request) -> dict[str, Any]:
         images=body.get("images") or [],
         labels=body.get("labels") or {},
     )
+    _rebuild_node_reservations(request, record)
     return {"nodeID": record.node_id}
+
+
+def _rebuild_node_reservations(request: Request, record) -> None:
+    """Restore a re-registering node's reserved quota from sandbox records.
+
+    Sandbox records persist in Redis across control-plane restarts but the
+    node registry's reserved fields are in-memory; on re-registration the
+    reservations start at zero, so fleet utilization would be misreported
+    (and nodes over-committed). Aggregating the node's records here keeps the
+    two views consistent.
+    """
+    dims = {"memory": 0, "cpu": 0, "disk": 0, "processes": 0}
+    for sandbox in request.app.state.registry.list():
+        if sandbox.node_id == record.node_id:
+            dims["memory"] += sandbox.memory_mb
+            dims["cpu"] += sandbox.cpu_count * 100
+            dims["disk"] += sandbox.disk_size_mb
+            dims["processes"] += sandbox.max_processes
+    request.app.state.nodes.set_reserved(
+        record.node_id,
+        memory_mb=dims["memory"],
+        cpu_percent=dims["cpu"],
+        disk_mb=dims["disk"],
+        processes=dims["processes"],
+    )
 
 
 @router.post("/internal/nodes/{node_id}/heartbeat")

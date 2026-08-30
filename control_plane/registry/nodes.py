@@ -147,6 +147,33 @@ class NodeRegistry:
             record.draining = draining
             return record
 
+    def set_reserved(
+        self,
+        node_id: str,
+        *,
+        memory_mb: int,
+        cpu_percent: int,
+        disk_mb: int,
+        processes: int,
+    ) -> NodeRecord | None:
+        """Restore reservation accounting from the sandbox registry.
+
+        Node reservations live in memory while sandbox records persist in
+        Redis; after a control-plane restart the reserved fields start at
+        zero until workers re-register. Callers aggregate the node's active
+        sandbox records and call this to keep fleet utilization accurate and
+        avoid over-committing nodes.
+        """
+        with self._lock:
+            record = self._nodes.get(node_id)
+            if record is None:
+                return None
+            record.reserved_memory_mb = max(0, memory_mb)
+            record.reserved_cpu_percent = max(0, cpu_percent)
+            record.reserved_disk_mb = max(0, disk_mb)
+            record.reserved_processes = max(0, processes)
+            return record
+
     def get(self, node_id: str) -> NodeRecord | None:
         self._sweep_health()
         with self._lock:
