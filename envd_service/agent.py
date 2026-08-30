@@ -318,7 +318,9 @@ def _executor_needs_images(mode: str) -> bool:
     try:
         import sandlock  # noqa: F401
 
-        return True
+        # auto: images only when the sandlock executor will actually run
+        # (factory falls back to local when Landlock ABI < 6).
+        return sandlock.landlock_abi_version() >= 6
     except Exception:
         return False
 

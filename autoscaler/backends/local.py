@@ -57,6 +57,9 @@ class DockerPoolBackend:
         result = _run("ps", "-q", "-f", f"label={_WORKER_LABEL}")
         return len([line for line in result.stdout.splitlines() if line.strip()])
 
+    def has_node(self, node_id: str) -> bool:
+        return _run("inspect", node_id).returncode == 0
+
     def scale_to(self, replicas: int) -> None:
         needed = replicas - self.current()
         if needed <= 0:

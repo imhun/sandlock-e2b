@@ -63,7 +63,7 @@ def _executor_needs_images(mode: str) -> bool:
     try:
         import sandlock  # noqa: F401
 
-        return True
+        return sandlock.landlock_abi_version() >= 6
     except Exception:
         return False
 

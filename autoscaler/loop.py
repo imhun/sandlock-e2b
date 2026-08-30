@@ -72,7 +72,31 @@ class AutoscalerLoop:
 
         current = self._backend.current()
 
-        # 2) Scale up on utilization / 503 pressure.
+        # 2) Enforce the warm-pool floor (min_replicas) regardless of load.
+        floor = desired_for_demand(snapshot, self._policy)
+        if current < floor:
+            await asyncio.to_thread(self._backend.scale_to, floor)
+            self._last_scale_up = now
+            logger.info("scaled up to warm-pool floor %s -> %s", current, floor)
+
+        # 3) Reconcile orphaned drains (e.g. after an autoscaler restart the
+        #    in-memory drain state is lost): retire any healthy draining node
+        #    that no longer has sandboxes.
+        for node in snapshot.nodes:
+            if (
+                node.draining
+                and node.active_sandboxes == 0
+                and node.status == "healthy"
+                and node.node_id != self._draining_node_id
+                and await asyncio.to_thread(self._backend.has_node, node.node_id)
+            ):
+                logger.info("reconciling orphaned drained node %s", node.node_id)
+                await self._retire(node.node_id)
+                self._last_scale_down = now
+
+        current = self._backend.current()
+
+        # 4) Scale up further on utilization / 503 pressure.
         if (
             scale_up_triggered(snapshot, self._policy)
             and now - self._last_scale_up >= self._policy.scale_up_cooldown_s
@@ -92,9 +116,13 @@ class AutoscalerLoop:
                     snapshot.recent503_count,
                 )
 
-        # 3) Scale down: drain one idle node, retire on the next tick.
-        elif (
+        # 5) Scale down: drain one idle node, retire on the next tick. This
+        #    is an independent branch: a stale recent503 latch (5-minute
+        #    window) must not block scale-down once demand has cleared. The
+        #    scale-up cooldown guard prevents same-tick scale-up + scale-down.
+        if (
             now - self._last_scale_down >= self._policy.scale_down_cooldown_s
+            and now - self._last_scale_up >= self._policy.scale_up_cooldown_s
             and current > self._policy.min_replicas
         ):
             candidates = scale_down_candidates(snapshot, self._policy)

@@ -62,6 +62,12 @@ class KubernetesBackend:
         resp.raise_for_status()
         return int(resp.json().get("spec", {}).get("replicas", 0))
 
+    def has_node(self, node_id: str) -> bool:
+        resp = self._client.get(
+            f"/api/v1/namespaces/{self._namespace}/pods/{node_id}"
+        )
+        return resp.status_code == 200
+
     def scale_to(self, replicas: int) -> None:
         resp = self._client.put(
             f"{self._deploy_url()}/scale",

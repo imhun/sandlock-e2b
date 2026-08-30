@@ -11,7 +11,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from envd_service.config import Settings
-from envd_service.agent import NodeAgent, router as agent_router
+from envd_service.agent import (
+    NodeAgent,
+    _executor_needs_images,
+    router as agent_router,
+)
 from envd_service.http.auth import HttpAuthError, http_error_response
 from envd_service.http.files import router as files_router
 from envd_service.http.health import router as health_router
@@ -71,7 +75,7 @@ def create_app(
 
             ensure_worker_netns_plumbing()
         agent.start()
-        if settings.base_image:
+        if settings.base_image and _executor_needs_images(settings.executor):
             app.state.warm_task = asyncio.create_task(_warm_base_image(settings))
         yield
         warm_task = getattr(app.state, "warm_task", None)

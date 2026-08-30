@@ -124,3 +124,49 @@ async def test_no_scale_down_when_fleet_guard_blocks():
     await loop.tick()
     assert control.drained == []
     assert backend.removed == []
+
+
+async def test_warm_pool_floor_enforced_when_idle():
+    backend = FakeBackend(current=0)
+    control = FakeControl(
+        [_payload([], fleet_util=0.0, active=0)]
+    )
+    loop = _loop(control, backend, min_replicas=1)
+    await loop.tick()
+    assert backend.scaled == [1]
+
+
+async def test_orphaned_draining_node_is_retired():
+    class NodeBackend(FakeBackend):
+        def has_node(self, node_id):
+            return True
+
+    backend = NodeBackend(current=2)
+    control = FakeControl(
+        [
+            _payload(
+                [_node("zombie", draining=True), _node("ok")],
+                fleet_util=0.1,
+            )
+        ]
+    )
+    loop = _loop(control, backend, min_replicas=1, scale_down_util=0.4)
+    await loop.tick()
+    assert backend.removed == ["zombie"]
+
+
+async def test_stale_503_latch_does_not_block_scale_down():
+    backend = FakeBackend(current=3)
+    control = FakeControl(
+        [
+            _payload(
+                [_node("a"), _node("b"), _node("c")],
+                fleet_util=0.1,
+                recent503=5,
+            )
+        ]
+    )
+    loop = _loop(control, backend, min_replicas=1, scale_down_util=0.4)
+    await loop.tick()
+    assert control.drained == ["a"]
+    assert backend.removed == ["a"]

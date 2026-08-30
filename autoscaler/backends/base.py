@@ -10,6 +10,10 @@ class ScaleBackend(Protocol):
         """Number of worker instances currently running."""
         ...
 
+    def has_node(self, node_id: str) -> bool:
+        """Whether a specific worker instance still exists."""
+        ...
+
     def scale_to(self, replicas: int) -> None:
         """Grow the pool to ``replicas`` instances (never shrinks)."""
         ...
