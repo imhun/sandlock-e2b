@@ -100,14 +100,19 @@ profile 会拦截 sandlock 安装自己的 seccomp 过滤器，`docker-compose.t
 
 ## 容器镜像与部署
 
-**镜像分离**：`Dockerfile.control-plane` 只打包控制面
-（`gateway_common` + `control_plane`），`Dockerfile.envd` 只打包 worker
-（`gateway_common` + `envd_service`，含 **fork sandlock wheel**
-（`wheels/fork/`，按 TARGETARCH 选择；通配 allowOut / header 注入 /
-host 掩码 / SOCKS5 on-behalf）与 mcp-gateway）。两者在代码层已解耦
-（env 工具函数收敛到 `gateway_common.env`；控制面在分离模式下用 no-op
-runtime registry），所以控制面镜像不依赖 envd_service、worker 镜像不依赖
-control_plane。
+**镜像**：
+- `Dockerfile.control-plane-gateway` 打包**控制面 + envd gateway 合并镜像**
+  （`gateway_common` + `control_plane` + `envd_service`，单服务单端口
+  `:3000` 同时服务 API 与沙箱路由，`E2B_API_URL` 与 `E2B_SANDBOX_URL`
+  指向同一地址，不带 sandlock wheel）；
+- `Dockerfile.envd` 只打包 worker（`gateway_common` + `envd_service`，含
+  **fork sandlock wheel**（`wheels/fork/`，按 TARGETARCH 选择；通配
+  allowOut / header 注入 / host 掩码 / SOCKS5 on-behalf）与 mcp-gateway）。
+
+控制面与 worker 在代码层已解耦（env 工具函数收敛到 `gateway_common.env`；
+控制面在分离模式下用 no-op runtime registry），所以合并镜像不依赖
+sandlock wheel、worker 镜像不依赖 control_plane。`Dockerfile.control-plane`
+仅保留给单机本地构建示例（`docker-compose.yml`）使用。
 
 `wheels/fork/` 是构建产物、不入库（fork 源码固定于 `third_party/sandlock`
 子模块）：构建镜像前先执行 `./scripts/build-sandlock-wheels.sh` 生成 wheel。
@@ -116,17 +121,21 @@ control_plane。
 
 ```bash
 # 单平台加载到本地 docker
-TAG=e2b-sandlock:1.0 PLATFORMS=linux/amd64 ./scripts/build-images.sh
+REGISTRY=e2b-sandlock VERSION=1.0 PLATFORMS=linux/amd64 ./scripts/build-images.sh
 
 # 多架构（x86_64 + arm64）需推送到 registry
-TAG=registry.example.com/e2b:1.0 \
+REGISTRY=registry.example.com/e2b \
+VERSION=1.0 \
 PLATFORMS=linux/amd64,linux/arm64 \
 PUSH=1 ./scripts/build-images.sh
 ```
 
-产出两个镜像：`<tag>-control-plane` 与 `<tag>-worker`。
+产出镜像，**名称区分服务、tag 区分版本**：
+`<registry>/e2b-sandlock-control-plane-gateway:<version>`（合并服务，见
+`deploy/scripts/build-and-push.sh`）、`<registry>/e2b-sandlock-worker:<version>`、
+`<registry>/e2b-sandlock-autoscaler:<version>`。
 
-**生产部署示例**（控制面 + gateway + 多 worker + Redis 共享状态 + 可选本地
+**生产部署示例**（合并控制面/gateway + 多 worker + Redis 共享状态 + 可选本地
 镜像仓库）：
 
 ```bash
@@ -135,14 +144,14 @@ docker compose -f docker-compose.prod.yml up -d --build
 
 # 冒烟验证（沙箱跨节点分布、经 gateway 的命令/文件/stdin、kill 后配额释放）
 E2B_API_URL=http://127.0.0.1:3000 \
-E2B_SANDBOX_URL=http://127.0.0.1:49983 \
+E2B_SANDBOX_URL=http://127.0.0.1:3000 \
 E2B_API_KEY=local-key \
 python scripts/multinode_smoke.py
 
 # 部署级验证（追加：跨 worker 迁移 + 共享 workspace 文件保留 + network
 # 配置回显/原子更新，三 worker 分布）
 E2B_API_URL=http://127.0.0.1:3000 \
-E2B_SANDBOX_URL=http://127.0.0.1:49983 \
+E2B_SANDBOX_URL=http://127.0.0.1:3000 \
 E2B_API_KEY=local-key \
 python scripts/deployment_smoke.py
 ```
@@ -242,8 +251,8 @@ rootfs chroot / SOCKS5 出口，与 compose 部署一致）：
 envd worker + agent 代码），SDK 零修改：
 
 ```text
-SDK → Control Plane :3000（注册表 / 调度 / 准入）
-SDK → Envd Gateway :49983（按 E2b-Sandbox-Id 路由代理）
+SDK → Control Plane + Envd Gateway :3000（注册表 / 调度 / 准入 / 按
+      E2b-Sandbox-Id 路由代理，同端口）
         ├── worker-1（Docker 容器节点）
         ├── worker-2（物理 Linux 节点）
         └── worker-3（…）
@@ -323,7 +332,7 @@ SDK → Envd Gateway :49983（按 E2b-Sandbox-Id 路由代理）
   重建挂载符号链接。注意：共享目录在 NFS 上受 root_squash/uid 映射影响，
   命令文件 IO 走网络；同一沙箱同时只在一个节点运行（路由保证单点）。
 - **真实多节点验证**：compose 起来后运行
-  `E2B_API_URL=http://127.0.0.1:3100 E2B_SANDBOX_URL=http://127.0.0.1:4100
+  `E2B_API_URL=http://127.0.0.1:3100 E2B_SANDBOX_URL=http://127.0.0.1:3100
   python scripts/multinode_smoke.py`，验证沙箱跨节点分布、经 gateway 的
   命令/文件/stdin、以及 kill 后节点配额释放。worker 容器需要
   `security_opt: [seccomp=unconfined]`（sandlock 需安装嵌套 seccomp 过滤器）

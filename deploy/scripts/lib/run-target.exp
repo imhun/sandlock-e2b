@@ -1,0 +1,64 @@
+#!/usr/bin/expect -f
+# Run a command on the target server through the bastion.
+#
+# Usage: run-target.exp <base64-command> <user>
+#
+# The command is transported as base64 to avoid quoting issues through the
+# two SSH hops, written to /tmp/sandlock-task.sh on the target and executed
+# as <user> (root is executed directly; other users via `su -`).
+#
+# Connection parameters come from the environment (see lib/helpers.sh):
+#   BASTION_HOST / BASTION_USER / TARGET_HOST / TARGET_SSH_USER
+#   SSH_KEY / SSH_PASSPHRASE / TASK_TIMEOUT
+
+set timeout [expr {[info exists env(TASK_TIMEOUT)] ? $env(TASK_TIMEOUT) : 600}]
+set cmd [lindex $argv 0]
+set user [lindex $argv 1]
+set ssh_key $env(SSH_KEY)
+set bastion_user $env(BASTION_USER)
+set bastion_host $env(BASTION_HOST)
+set target_user $env(TARGET_SSH_USER)
+set target_host $env(TARGET_HOST)
+set passphrase $env(SSH_PASSPHRASE)
+
+if {$user eq $target_user} {
+    set run "bash /tmp/sandlock-task.sh"
+} else {
+    set run "chown $user /tmp/sandlock-task.sh && su - $user -c 'bash /tmp/sandlock-task.sh'"
+}
+set remote "echo '$cmd' | base64 -d > /tmp/sandlock-task.sh && $run"
+
+if {[string length $passphrase] == 0} {
+    log_user 1
+} else {
+    # Hide the spawn echo and credential prompts; show remote output after auth.
+    log_user 0
+}
+
+spawn ssh -i $ssh_key \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o ConnectTimeout=15 \
+    -o ServerAliveInterval=30 \
+    $bastion_user@$bastion_host \
+    "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 $target_user@$target_host \"$remote\""
+
+expect {
+    -re "passphrase for key" {
+        send -- "$passphrase\r"
+        log_user 1
+        exp_continue
+    }
+    -re "(P|p)assword:" {
+        send -- "$passphrase\r"
+        log_user 1
+        exp_continue
+    }
+    -re "Permission denied" { puts stderr "AUTH FAILED"; exit 2 }
+    timeout { puts stderr "TIMEOUT (TASK_TIMEOUT=$env(TASK_TIMEOUT)s)"; exit 3 }
+    eof
+}
+
+catch wait result
+set code [lindex $result 3]
+exit $code

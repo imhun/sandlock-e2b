@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
+from pathlib import Path
 
 from envd_service.config import Settings
 from envd_service.executors.factory import create_executor
@@ -14,6 +17,18 @@ from envd_service.process.manager import ProcessManager
 from envd_service.runtime.registry import RuntimeSandbox
 
 logger = logging.getLogger(__name__)
+
+_MCP_PORT_BASE = 51000
+_mcp_port_counter = 0
+_mcp_port_lock = threading.Lock()
+
+
+def _next_mcp_port() -> int:
+    """Per-sandbox MCP gateway port (sandboxes share the worker netns)."""
+    global _mcp_port_counter
+    with _mcp_port_lock:
+        _mcp_port_counter += 1
+        return _MCP_PORT_BASE + _mcp_port_counter
 
 
 class SandboxRuntimeContext:
@@ -37,8 +52,9 @@ class SandboxRuntimeContext:
             extra_fs_writable=[m["hostPath"] for m in record.volume_mounts],
             fs_mounts={
                 # Inside the image-rootfs chroot the sandbox directory is
-                # /home/user, so mount paths map under it.
-                f"/home/user/{m['path']}": m["hostPath"]
+                # /workspace (official SDK default cwd), so mount paths map
+                # under it.
+                f"/workspace/{m['path']}": m["hostPath"]
                 for m in record.volume_mounts
             },
         )
@@ -52,7 +68,17 @@ class SandboxRuntimeContext:
         self.watchers = WatcherRegistry(self.files)
         self.watch_stream = WatchDirStream(self.files)
         self._mcp_gateway = None
+        self._mcp_port: int | None = None
+        self._mcp_token: str | None = None
         self._network = dict(record.network) if record.network else None
+
+    @property
+    def mcp_port(self) -> int | None:
+        return self._mcp_port
+
+    @property
+    def mcp_token(self) -> str | None:
+        return self._mcp_token
 
     def update_network(self, network: dict | None) -> None:
         """Apply an updated network config; the next command uses it."""
@@ -98,15 +124,37 @@ class SandboxRuntimeContext:
         from envd_service.executors.base import ExecConfig
 
         gateway_bin = "/usr/bin/mcp-gateway"
-        import os
-
         if not os.path.exists(gateway_bin):
             gateway_bin = "/usr/local/bin/mcp-gateway"
         config_json = json.dumps(config, separators=(",", ":"))
+        port = _next_mcp_port()
+        self._mcp_port = port
+        self._mcp_token = token
+        # The SDK reads the gateway token from /etc/mcp-gateway/.token via the
+        # files API (resolved under the sandbox workspace).
+        token_dir = Path(self.record.workspace_dir) / "etc" / "mcp-gateway"
+        token_dir.mkdir(parents=True, exist_ok=True)
+        (token_dir / ".token").write_text(token, encoding="utf-8")
         proc = await self.executor.start(
             ExecConfig(
-                cmd=[gateway_bin, "--config", config_json, "--foreground"],
-                env={"GATEWAY_ACCESS_TOKEN": token},
+                # Run the gateway through the interpreter explicitly: the
+                # sandlock chroot exec handler supports ELF binaries only,
+                # so a shebang script cannot be exec'd directly in image
+                # rootfs mode (EACCES on the script path).
+                cmd=[
+                    "/usr/local/bin/python3",
+                    gateway_bin,
+                    "--config",
+                    config_json,
+                    "--foreground",
+                ],
+                env={
+                    "GATEWAY_ACCESS_TOKEN": token,
+                    "MCP_PORT": str(port),
+                    # clean_env strips PATH; the gateway spawns the configured
+                    # MCP server by command name (e.g. python3) via stdio.
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                },
                 cwd=self.record.workspace_dir,
                 stdin_enabled=False,
             )

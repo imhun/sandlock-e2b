@@ -2,11 +2,14 @@ services:
   control-plane:
     build:
       context: .
-      dockerfile: Dockerfile.control-plane
+      dockerfile: Dockerfile.control-plane-gateway
     environment:
       E2B_API_KEYS: local-key
       E2B_INTERNAL_API_KEY: internal-key
       E2B_ENABLE_LOCAL_NODE: "false"
+      # Embedded gateway: route lookups and invalidation stay in-process.
+      E2B_CONTROL_PLANE_URL: http://control-plane:3000
+      E2B_GATEWAY_URL: http://control-plane:3000
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       # 模板构建完成后推送到镜像仓库，worker 按需从 OCI registry 直拉 rootfs。
       # 自建 HTTP 仓库需在 docker daemon 配置 insecure-registries。
@@ -28,18 +31,6 @@ services:
       - "3100:3000"
     volumes:
       - control-data:/var/lib/e2b-sandboxes
-
-  gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile.envd
-    command: python -m envd_service.gateway_main
-    environment:
-      E2B_CONTROL_PLANE_URL: http://control-plane:3000
-      E2B_INTERNAL_API_KEY: internal-key
-      E2B_GATEWAY_PORT: 49983
-    ports:
-      - "4100:49983"
 
   worker-1:
     build:

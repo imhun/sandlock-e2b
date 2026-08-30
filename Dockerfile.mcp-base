@@ -1,0 +1,12 @@
+# MCP-capable sandbox base image: python slim + mcp/uvicorn + the
+# mcp-gateway script, so every image-rootfs sandbox can run the official
+# e2b MCP flow (Sandbox.create(mcp=...)).
+FROM python:3.14-slim
+
+RUN pip install --no-cache-dir \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple \
+        mcp uvicorn
+
+COPY envd_service/mcp/gateway.py /usr/bin/mcp-gateway
+RUN chmod +x /usr/bin/mcp-gateway \
+    && ln -sf /usr/bin/mcp-gateway /usr/local/bin/mcp-gateway

@@ -102,10 +102,10 @@ def _extract_build_context(build_dir: Path) -> Path:
     return ctx_dir
 
 
-async def _run_docker(*args: str) -> tuple[int, str]:
-    """Run a docker CLI command, returning (exit code, combined output)."""
+async def _run_buildctl(*args: str) -> tuple[int, str]:
+    """Run the buildkit CLI, returning (exit code, combined output)."""
     proc = await asyncio.create_subprocess_exec(
-        "docker",
+        "buildctl",
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -115,68 +115,27 @@ async def _run_docker(*args: str) -> tuple[int, str]:
     return proc.returncode or 0, out.decode("utf-8", "replace")
 
 
-async def _ensure_registry_login(app: Any, registry: str) -> str | None:
-    """Log the daemon into the registry when credentials are configured.
+def _write_docker_config(settings: Any) -> None:
+    """Write registry credentials for buildctl's push auth.
 
-    The password is passed via stdin (``--password-stdin``) so it never
-    appears in the docker CLI argument list. Returns an error message on
-    failure, else ``None``.
+    buildctl resolves registry credentials from the Docker config file
+    (~/.docker/config.json); the buildkit daemon itself has no credential
+    config. The password never appears on a command line.
     """
-    settings = app.state.settings
     username = settings.image_registry_username
     password = settings.image_registry_password
-    if not username or not password:
-        return None
-    proc = await asyncio.create_subprocess_exec(
-        "docker",
-        "login",
-        registry,
-        "-u",
-        username,
-        "--password-stdin",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    assert proc.stdin is not None and proc.stdout is not None
-    proc.stdin.write(password.encode())
-    await proc.stdin.drain()
-    proc.stdin.close()
-    out = await proc.stdout.read()
-    code = await proc.wait()
-    if code != 0:
-        return out.decode("utf-8", "replace").strip()[-500:]
-    return None
+    registry = (settings.image_registry or "").rstrip("/")
+    if not username or not password or not registry:
+        return
+    import base64
+    import json
 
-
-async def _push_template_image(
-    app: Any, template: TemplateRecord, build: BuildRecord
-) -> None:
-    """Tag and push the locally built image to the configured registry."""
-    registry = (app.state.settings.image_registry or "").rstrip("/")
-    if not registry:
-        return
-    remote = f"{registry}/{template.template_id}"
-    build.append_log(f"pushing image to {remote}")
-    login_error = await _ensure_registry_login(app, registry)
-    if login_error:
-        build.status = "error"
-        build.error = f"docker login to {registry} failed: {login_error}"
-        return
-    code, output = await _run_docker("tag", template.image, remote)
-    if code != 0:
-        build.status = "error"
-        build.error = f"docker tag failed: {output.strip()[-500:]}"
-        return
-    code, output = await _run_docker("push", remote)
-    if code != 0:
-        build.status = "error"
-        build.error = f"docker push failed: {output.strip()[-500:]}"
-        return
-    # From here on, sandboxes reference the registry image so worker nodes
-    # can pull it instead of depending on the control plane's local daemon.
-    template.image = remote
-    build.append_log(f"pushed image to {remote}")
+    host = registry.split("/")[0]
+    auth = base64.b64encode(f"{username}:{password}".encode()).decode()
+    config = {"auths": {host: {"auth": auth}}}
+    path = Path.home() / ".docker" / "config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config), encoding="utf-8")
 
 
 async def _run_build(
@@ -196,29 +155,42 @@ async def _run_build(
         build.error = f"failed to prepare build context: {e}"
         build.append_log(build.error)
         return
+    # buildctl's dockerfile frontend reads the Dockerfile from a file in a
+    # --local dockerfile source (unlike docker build's stdin).
+    (ctx_dir / "Dockerfile").write_text(dockerfile, encoding="utf-8")
+    settings = app.state.settings
+    _write_docker_config(settings)
+
+    registry = (settings.image_registry or "").rstrip("/")
+    if registry:
+        remote = f"{registry}/{template.template_id}"
+        output = f"type=image,name={remote}:latest,push=true"
+    else:
+        remote = None
+        output = f"type=image,name={template.image}"
+    build.append_log(f"building template (buildkit: {settings.buildkit_addr})")
     try:
         proc = await asyncio.create_subprocess_exec(
-            "docker",
+            "buildctl",
+            "--addr",
+            settings.buildkit_addr,
             "build",
-            "-t",
-            template.image,
-            "-f",
-            "-",
-            ".",
-            cwd=str(ctx_dir),
-            stdin=asyncio.subprocess.PIPE,
+            "--frontend",
+            "dockerfile.v0",
+            "--local",
+            f"context={ctx_dir}",
+            "--local",
+            f"dockerfile={ctx_dir}",
+            "--output",
+            output,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
     except FileNotFoundError:
         build.status = "error"
-        build.error = "docker daemon is not available on this host"
+        build.error = "buildctl is not available in this image"
         build.append_log(build.error)
         return
-    assert proc.stdin is not None and proc.stdout is not None
-    proc.stdin.write(dockerfile.encode())
-    await proc.stdin.drain()
-    proc.stdin.close()
     while True:
         line = await proc.stdout.readline()
         if not line:
@@ -227,13 +199,17 @@ async def _run_build(
         build.append_log(text)
     code = await proc.wait()
     if code == 0:
-        await _push_template_image(app, template, build)
+        if remote is not None:
+            # From here on, sandboxes reference the registry image so worker
+            # nodes can pull it via OCI instead of a local daemon.
+            template.image = remote
+            build.append_log(f"pushed image to {remote}")
         if build.status != "error":
             build.status = "ready"
             build.append_log("Build finished successfully")
     else:
         build.status = "error"
-        build.error = f"docker build exited with code {code}"
+        build.error = f"buildkit build exited with code {code}"
         build.append_log(build.error)
 
 

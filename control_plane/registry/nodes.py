@@ -105,6 +105,7 @@ class NodeRegistry:
             record = self._nodes.get(node_id) if node_id else None
             if record is None:
                 node_id = node_id or sandbox_id().replace("sbx_", "node_")
+                reserved = self._reserved_from_store(node_id)
                 record = NodeRecord(
                     node_id=node_id,
                     address=address,
@@ -114,6 +115,10 @@ class NodeRegistry:
                     total_processes=total_processes,
                     images=list(images or []),
                     labels=dict(labels or {}),
+                    reserved_memory_mb=reserved.get("memory", 0),
+                    reserved_cpu_percent=reserved.get("cpu", 0),
+                    reserved_disk_mb=reserved.get("disk", 0),
+                    reserved_processes=reserved.get("processes", 0),
                 )
                 self._nodes[node_id] = record
             else:
@@ -128,6 +133,21 @@ class NodeRegistry:
             record.heartbeat_at = time.time()
             record.status = "healthy"
             return record
+
+    def _reserved_from_store(self, node_id: str) -> dict[str, int]:
+        """Restore reservations from Redis on (re)registration.
+
+        Redis quota keys survive control-plane restarts, so a fresh in-memory
+        record must start from the shared ledger; otherwise reservations made
+        before the restart become invisible and later releases cannot clear
+        them (in-memory/Redis drift, spurious 503s).
+        """
+        if self._quota_store is None:
+            return {}
+        try:
+            return self._quota_store.get(node_id)
+        except Exception:  # pragma: no cover - defensive
+            return {}
 
     def heartbeat(self, node_id: str) -> NodeRecord | None:
         with self._lock:

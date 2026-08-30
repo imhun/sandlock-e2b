@@ -7,6 +7,7 @@ is skipped with the reason recorded.
 
 from __future__ import annotations
 
+import os
 import shutil
 import time
 
@@ -14,6 +15,10 @@ import pytest
 
 
 def _gateway_available() -> bool:
+    if os.environ.get("E2B_TEST_PROXY_URL"):
+        # The remote deployment uses the MCP-capable base image, so the
+        # gateway exists inside the sandbox even when this machine lacks it.
+        return True
     return shutil.which("mcp-gateway") is not None
 
 
@@ -43,26 +48,42 @@ def test_mcp_gateway_tools(live_servers):
         mcp={"name": "echo", "command": "python3", "args": ["-c", ECHO_SERVER]}
     )
     try:
-        # Non-debug mode builds a cloud domain URL; the local gateway always
-        # listens on 127.0.0.1:50005/mcp.
-        url = "http://127.0.0.1:50005/mcp"
         token = sandbox.get_mcp_token()
         assert sandbox.get_mcp_url().endswith("/mcp")
         assert token
 
+        remote = os.environ.get("E2B_TEST_PROXY_URL")
+        if remote:
+            # Remote sandbox: reach the gateway through the envd proxy
+            # (E2b-Sandbox-Id routes /mcp to the sandbox's mcp-gateway).
+            url = f"{os.environ['E2B_SANDBOX_URL'].rstrip('/')}/mcp"
+            sandbox_headers = {
+                "E2b-Sandbox-Id": sandbox.sandbox_id,
+            }
+        else:
+            # Local sandbox: the gateway listens on 127.0.0.1:50005/mcp.
+            url = "http://127.0.0.1:50005/mcp"
+            sandbox_headers = {}
+
         # The SDK started mcp-gateway as a background command; wait for the
         # HTTP port to accept connections.
-        import socket
-
         deadline = time.time() + 15
         while time.time() < deadline:
             try:
-                with socket.create_connection(("127.0.0.1", 50005), timeout=1):
+                import httpx
+
+                resp = httpx.get(
+                    url,
+                    headers={**sandbox_headers, "Authorization": f"Bearer {token}"},
+                    timeout=2,
+                )
+                # 4xx means the endpoint answers; only connection errors retry.
+                if resp.status_code < 500:
                     break
-            except OSError:
+            except (httpx.HTTPError, OSError):
                 time.sleep(0.3)
         else:
-            raise AssertionError("mcp-gateway did not start listening on 50005")
+            raise AssertionError("mcp-gateway did not start listening")
 
         import asyncio
 
@@ -71,7 +92,12 @@ def test_mcp_gateway_tools(live_servers):
         from httpx2 import AsyncClient
 
         async def call():
-            async with AsyncClient(headers={"Authorization": f"Bearer {token}"}) as http:
+            async with AsyncClient(
+                headers={
+                    **sandbox_headers,
+                    "Authorization": f"Bearer {token}",
+                }
+            ) as http:
                 async with streamable_http_client(url, http_client=http) as (read, write):
                     async with ClientSession(read, write) as session:
                         await session.initialize()

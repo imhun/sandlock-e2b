@@ -1,6 +1,6 @@
 [project]
 name = "e2b-sandlock-gateway"
-version = "2.0.0"
+version = "0.1.0"
 description = "Local E2B-compatible gateway backed by Sandlock (Landlock + seccomp)"
 requires-python = ">=3.11"
 dependencies = [

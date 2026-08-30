@@ -111,7 +111,21 @@ def create_app(
 
     app = FastAPI(title="E2B Sandlock Gateway - Control Plane", lifespan=lifespan)
     app.state.settings = settings
+    app.state.redis_client = redis_client
     app.state.registry = registry
+
+    # Health endpoints for load balancer / monitoring. These are registered
+    # before the gateway mount (combined_main), so they win over the gateway
+    # catch-all; the sandbox-scoped /health with E2b-Sandbox-Id still routes
+    # through the gateway proxy untouched.
+    @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+    async def root_health() -> dict[str, str]:
+        return {"status": "ok", "service": "e2b-sandlock"}
+
+    @app.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
     if runtime_registry is None:
         # The envd service is only imported on the single-host deployment:
         # a separated control-plane image (E2B_ENABLE_LOCAL_NODE=false) runs

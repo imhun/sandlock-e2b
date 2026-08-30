@@ -1,0 +1,35 @@
+# Merged control plane + envd gateway image (one service, one port :3000).
+#   * control plane API routes
+#   * envd gateway catch-all proxy (same port; SDK points E2B_API_URL and
+#     E2B_SANDBOX_URL at the same address)
+# Template builds run through a rootless buildkit daemon (buildctl client
+# copied from the official image; no Docker socket in this container).
+# The gateway only needs fastapi/httpx (envd_service.gateway), so this image
+# stays free of the sandlock runtime wheel (worker image keeps that).
+FROM moby/buildkit:latest AS buildkit
+
+FROM python:3.14-slim
+
+WORKDIR /app
+
+RUN sed -i \
+        's|http://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g; s|http://security.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && rm -rf /var/lib/apt/lists/*
+
+# Static buildkit CLI used by Template.build (talks to the shared rootless
+# buildkitd socket; no daemon socket or credentials inside this image).
+COPY --from=buildkit /usr/bin/buildctl /usr/bin/buildctl
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+
+COPY gateway_common/ gateway_common/
+COPY control_plane/ control_plane/
+COPY envd_service/ envd_service/
+
+ENV E2B_WORKSPACE_BASE=/var/lib/e2b-sandboxes
+EXPOSE 3000
+
+CMD ["python", "-m", "control_plane.combined_main"]

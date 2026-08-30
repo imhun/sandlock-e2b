@@ -88,8 +88,21 @@ def main() -> int:
                 while True:
                     start = pending.find(FRAME_START)
                     if start < 0:
-                        keep = max(0, len(FRAME_START) - 1)
-                        flush = pending[:-keep] if len(pending) > keep else b""
+                        # Keep only a tail that could be the start of a
+                        # FRAME_START marker; plain data flushes in full
+                        # (keeping len(FRAME_START)-1 unconditionally used to
+                        # swallow short inputs byte by byte).
+                        keep = 0
+                        for k in range(len(FRAME_START) - 1, 0, -1):
+                            if FRAME_START[:k] == pending[-k:]:
+                                keep = k
+                                break
+                        # NB: pending[:-0] is empty in Python, so handle
+                        # keep == 0 (no frame prefix) explicitly.
+                        if keep:
+                            flush = pending[:-keep] if len(pending) > keep else b""
+                        else:
+                            flush = pending
                         if flush:
                             os.write(master, flush)
                         pending = pending[-keep:] if keep else b""
@@ -190,7 +203,14 @@ class SandlockRunningProcess(RunningProcess):
                         return
                     try:
                         self._proc.stdin.write(data)
-                    except (OSError, ValueError):
+                        self._proc.stdin.flush()
+                        logger.debug(
+                            "sandlock stdin wrote %d bytes (fd=%s)",
+                            len(data),
+                            getattr(self._proc.stdin, "fileno", lambda: None)(),
+                        )
+                    except Exception as e:  # noqa: BLE001 - keep the loop alive
+                        logger.warning("sandlock stdin write failed: %r", e)
                         return
             except Exception:  # pragma: no cover - defensive
                 logger.exception("sandlock stdin writer failed")
@@ -205,7 +225,7 @@ class SandlockRunningProcess(RunningProcess):
         try:
             self._stdin_queue.put_nowait(data)
         except asyncio.QueueFull:
-            pass
+            logger.warning("sandlock stdin queue full; dropping %d bytes", len(data))
 
     def close_stdin(self) -> None:
         if self._closed:
@@ -431,7 +451,11 @@ class SandlockExecutor(Executor):
         fs_writable = [self._workspace_dir]
         fs_writable.extend(self._extra_fs_writable)
         fs_readable = ["/usr", "/lib", "/bin", "/opt"]
-        fs_denied = ["/proc/kcore", "/sys"]
+        # /dev is mounted from the container (chroot image mode) or shared
+        # directly (pure sandlock), so deny the shared tmpfs/queue paths:
+        # /dev/shm and /dev/mqueue are common to every sandbox on the worker
+        # (same uid), which would allow cross-sandbox reads and DoS.
+        fs_denied = ["/proc/kcore", "/sys", "/dev/shm", "/dev/mqueue"]
         if config.pty:
             # The in-sandbox PTY bridge needs the pty device nodes.
             fs_writable += ["/dev/ptmx", "/dev/pts"]
@@ -496,25 +520,43 @@ class SandlockExecutor(Executor):
         }
         if "mcp-gateway" in " ".join(config.cmd):
             # The SDK starts the MCP gateway inside the sandbox; it must be
-            # allowed to bind its HTTP port.
-            kwargs["net_allow_bind"] = ["50005"]
+            # allowed to bind its HTTP port (per-sandbox MCP_PORT, since
+            # sandboxes share the worker network namespace).
+            mcp_port = str((config.env or {}).get("MCP_PORT", "50005"))
+            kwargs["net_allow_bind"] = [mcp_port]
         if self._base_image and self._image_rootfs is not None:
             # Image rootfs mode: chroot into the extracted image and expose
-            # the sandbox directory as /home/user inside it.
-            # fs_mount only takes effect at runtime, so the mount point must
-            # already exist inside the rootfs for chdir(/home/user) to work.
-            home = Path(self._image_rootfs) / "home" / "user"
-            home.mkdir(parents=True, exist_ok=True)
-            # Volume mount targets must exist inside the rootfs too.
-            for virtual in self._fs_mounts:
-                home.joinpath(virtual.removeprefix("/home/user/")).mkdir(
+            # the sandbox directory as /workspace (official SDK default cwd)
+            # and /home/user (legacy home) inside it. fs_mount only takes
+            # effect at runtime, so the mount points must already exist
+            # inside the rootfs for chdir() to work.
+            for mount_point in ("workspace", "home/user"):
+                Path(self._image_rootfs).joinpath(mount_point).mkdir(
                     parents=True, exist_ok=True
                 )
+            # Volume mount targets must exist inside the rootfs too.
+            for virtual in self._fs_mounts:
+                Path(self._image_rootfs).joinpath(
+                    virtual.removeprefix("/")
+                ).mkdir(parents=True, exist_ok=True)
             kwargs["chroot"] = str(self._image_rootfs)
-            mount_map = {"/home/user": self._workspace_dir}
+            mount_map = {
+                "/workspace": self._workspace_dir,
+                "/home/user": self._workspace_dir,
+            }
             mount_map.update(self._fs_mounts)
+            # The extracted image /dev is empty; expose the container's /dev
+            # so the sandbox gets /dev/ptmx + devpts (PTY bridge), /dev/null,
+            # /dev/urandom etc. fs_mount treats the host target as a
+            # directory root, so the whole /dev tree must be mounted (a
+            # single-file mount would resolve with ENOTDIR).
+            mount_map["/dev"] = "/dev"
             kwargs["fs_mount"] = mount_map
-            kwargs["cwd"] = "/home/user"
+            cwd = (config.cwd or "").strip()
+            if not cwd or cwd.startswith(str(self._workspace_dir)):
+                kwargs["cwd"] = "/workspace"
+            else:
+                kwargs["cwd"] = cwd
         elif self._fs_mounts:
             # Without a chroot (pure Sandlock), virtual mount paths cannot be
             # materialized; volume mounts live inside the sandbox directory as
@@ -539,7 +581,7 @@ class SandlockExecutor(Executor):
                     # the chroot-visible path, not the host path (the host
                     # path would be resolved under the rootfs and "not found").
                     ca_inside = (
-                        Path("/home/user/.e2b-ca/ca-certificates.crt")
+                        Path("/workspace/.e2b-ca/ca-certificates.crt")
                         if kwargs.get("chroot")
                         else ca_dst
                     )

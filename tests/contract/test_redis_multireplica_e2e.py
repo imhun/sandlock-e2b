@@ -206,6 +206,104 @@ async def test_redis_multireplica_concurrent_create_never_over_commits(
                 await ca.delete(f"/sandboxes/{sandbox_id}")
 
 
+async def test_connect_resume_persists_state(workspace, redis_url):
+    """Regression: connect() on a paused sandbox must persist state=running.
+    Redis-backed get() reconstructs from the store on every read, so the
+    resume mutation has to be saved before connect() re-reads the record."""
+    replica = _replica(workspace / "a", redis_url)
+    async with _client(replica) as client:
+        sandbox = await _create(client)
+        sid = sandbox.json()["sandboxID"]
+
+        paused = await client.post(
+            f"/sandboxes/{sid}/pause",
+            headers={"X-API-Key": "local-key"},
+            json={},
+        )
+        assert paused.status_code == 204
+
+        connected = await client.post(
+            f"/sandboxes/{sid}/connect",
+            headers={"X-API-Key": "local-key"},
+            json={},
+        )
+        assert connected.status_code == 200
+
+        info = await client.get(
+            f"/sandboxes/{sid}", headers={"X-API-Key": "local-key"}
+        )
+        assert info.json()["state"] == "running"
+
+
+async def test_fork_persists_node_id(workspace, redis_url):
+    """Regression: a forked sandbox's node assignment must be persisted so
+    the gateway can route to it (Redis get() reconstructs from the store)."""
+    replica = _replica(workspace / "f", redis_url)
+    async with _client(replica) as client:
+        sandbox = await _create(client)
+        sid = sandbox.json()["sandboxID"]
+
+        snap = await client.post(
+            f"/sandboxes/{sid}/snapshots",
+            headers={"X-API-Key": "local-key"},
+            json={"name": "s"},
+        )
+        assert snap.status_code == 201
+
+        forked = await client.post(
+            f"/sandboxes/{sid}/fork",
+            headers={"X-API-Key": "local-key"},
+            json={"count": 1},
+        )
+        assert forked.status_code == 201
+        results = forked.json()
+        assert results and "sandbox" in results[0], results
+        fork_id = results[0]["sandbox"]["sandboxID"]
+
+        record = replica.state.registry.get(fork_id)
+        assert record.node_id is not None
+
+
+async def test_node_quota_restored_after_restart(workspace, redis_url):
+    """Regression: reservations survive a control-plane restart in Redis and
+    must be restored into the fresh in-memory node record on re-registration
+    (otherwise in-memory/Redis drift causes spurious 503s)."""
+    replica = _replica(workspace / "q", redis_url)
+    replica.state.nodes.register(
+        node_id="worker-1",
+        address="http://worker-1:49983",
+        total_memory_mb=2048,
+        total_cpu_percent=200,
+        total_disk_mb=4096,
+        total_processes=256,
+    )
+    node = replica.state.nodes.select_and_reserve(
+        base_image=None,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        processes=64,
+    )
+    assert node is not None and node.node_id == "worker-1"
+    assert node.reserved_cpu_percent == 100
+
+    # Simulate a restart: a brand-new replica (same Redis) re-registers the
+    # worker; its in-memory record must start from the shared ledger.
+    restarted = _replica(workspace / "q2", redis_url)
+    node2 = restarted.state.nodes.register(
+        node_id="worker-1",
+        address="http://worker-1:49983",
+        total_memory_mb=2048,
+        total_cpu_percent=200,
+        total_disk_mb=4096,
+        total_processes=256,
+    )
+    assert node2.reserved_memory_mb == 512
+    assert node2.reserved_cpu_percent == 100
+    assert node2.reserved_disk_mb == 1024
+    assert node2.reserved_processes == 64
+
+
 async def test_redis_multireplica_ttl_reap_releases_quota(workspace, redis_url):
     replica_a = _replica(workspace / "ta", redis_url)
     replica_b = _replica(workspace / "tb", redis_url)

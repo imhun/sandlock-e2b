@@ -1,0 +1,15 @@
+# Rootless buildkitd config: route docker.io base-image pulls through a
+# reachable mirror (Docker Hub is blocked from the target host).
+[grpc]
+  address = ["tcp://0.0.0.0:1234"]
+
+# Running rootless buildkitd inside a container: without this, runc cannot
+# mount /proc in build steps ("operation not permitted").
+[worker.oci]
+  noProcessSandbox = true
+
+[registry."docker.io"]
+  mirrors = ["https://docker.m.daocloud.io"]
+
+[registry."docker.m.daocloud.io"]
+  http = false

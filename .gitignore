@@ -3,6 +3,10 @@ __pycache__/
 .pytest_cache/
 tmp/
 wheels/fork/
+deploy/stack/.env
+deploy/stack/.version
+deploy/scripts/bastion.env
+deploy/scripts/acr.env
 tests/sdk/js/node_modules/
 tests/sdk/js/package-lock.json
 .DS_Store

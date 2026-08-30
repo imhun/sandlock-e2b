@@ -1,6 +1,7 @@
-# Production deployment example: separated control plane, gateway and
-# Sandlock workers, with Redis shared state and an optional local image
-# registry for template distribution.
+# Production deployment example: control plane with embedded envd gateway
+# (one service, one port 3000: API + gateway routing share it), Sandlock
+# workers, Redis shared state and an optional local image registry for
+# template distribution.
 #
 #   cp .env.example .env        # adjust secrets / image registry
 #   docker compose -f docker-compose.prod.yml up -d --build
@@ -14,7 +15,7 @@
 # image per platform.
 services:
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
@@ -27,8 +28,8 @@ services:
   control-plane:
     build:
       context: .
-      dockerfile: Dockerfile.control-plane
-    image: ${CONTROL_PLANE_IMAGE:-e2b-sandlock:latest-control-plane}
+      dockerfile: Dockerfile.control-plane-gateway
+    image: ${CONTROL_PLANE_IMAGE:-e2b-sandlock-control-plane-gateway:0.1.0}
     depends_on:
       redis:
         condition: service_healthy
@@ -37,7 +38,12 @@ services:
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
       E2B_ENABLE_LOCAL_NODE: "false"
       E2B_REDIS_URL: redis://redis:6379/0
-      E2B_GATEWAY_URL: http://gateway:49983
+      # Embedded gateway: route lookups and invalidation stay in-process.
+      E2B_CONTROL_PLANE_URL: http://control-plane:3000
+      E2B_GATEWAY_URL: http://control-plane:3000
+      # Route cache TTL (s); on stale routes the gateway retries once after
+      # re-resolving, so this only bounds lookups, not recovery.
+      E2B_GATEWAY_ROUTE_TTL: ${E2B_GATEWAY_ROUTE_TTL:-30}
       # Shared workspace root: workers mount the same storage, so migration
       # only switches routes (no archive transfer).
       E2B_SHARED_WORKSPACE_ROOT: /var/lib/e2b-sandboxes
@@ -59,27 +65,11 @@ services:
       - sandbox-shared:/var/lib/e2b-sandboxes
     restart: unless-stopped
 
-  gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile.envd
-    image: ${WORKER_IMAGE:-e2b-sandlock:latest-worker}
-    command: python -m envd_service.gateway_main
-    depends_on:
-      - control-plane
-    environment:
-      E2B_CONTROL_PLANE_URL: http://control-plane:3000
-      E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
-      E2B_GATEWAY_PORT: 49983
-    ports:
-      - "${GATEWAY_PORT:-49983}:49983"
-    restart: unless-stopped
-
   worker-1: &worker
     build:
       context: .
       dockerfile: Dockerfile.envd
-    image: ${WORKER_IMAGE:-e2b-sandlock:latest-worker}
+    image: ${WORKER_IMAGE:-e2b-sandlock-worker:0.1.0}
     depends_on:
       - control-plane
     environment: &worker-env

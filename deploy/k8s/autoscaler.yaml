@@ -49,7 +49,7 @@ spec:
       serviceAccountName: autoscaler
       containers:
         - name: autoscaler
-          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-autoscaler:latest
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-autoscaler:0.1.0
           env:
             - name: E2B_AS_CONTROL_PLANE_URL
               value: http://control-plane:3000

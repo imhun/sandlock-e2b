@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from gateway_common.env import _env_bool, _env_int
+from gateway_common.env import _env_bool, _env_int, _env_json_dict
 
 
 @dataclass
@@ -21,6 +21,9 @@ class Settings:
         default_factory=lambda: os.getenv("E2B_EXECUTOR", "auto").lower()
     )
     base_image: str | None = field(default_factory=lambda: os.getenv("E2B_BASE_IMAGE"))
+    template_images: dict[str, str] = field(
+        default_factory=lambda: _env_json_dict("E2B_TEMPLATE_IMAGES")
+    )
     enable_network: bool = field(
         default_factory=lambda: _env_bool("E2B_ENABLE_NETWORK", False)
     )

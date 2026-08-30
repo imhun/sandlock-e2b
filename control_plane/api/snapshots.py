@@ -226,6 +226,9 @@ async def _create_sandbox_from_snapshot(
         registry.delete(record.sandbox_id)
         raise OfficialError(503, "No resources available")
     record.node_id = node.node_id
+    # Persist the node assignment: Redis-backed get() reconstructs records
+    # from the store, so without save() the gateway cannot route to the fork.
+    registry.save(record)
     try:
         if node.address == "local://":
             workspace_dir.mkdir(parents=True, exist_ok=True)

@@ -197,3 +197,43 @@ def test_user_cli_install_within_workspace_persists():
     second = executor._build_sandbox(cfg).run([f"{ws}/bin/tool"])
     assert second.exit_code == 0
     assert second.stdout.strip() == b"hi"
+
+
+@pytest.mark.usefixtures("require_sandlock")
+def test_dev_shm_denied_but_ptmx_available(tmp_path):
+    """The container /dev is mounted into the image-rootfs chroot; the shared
+    /dev/shm (cross-sandbox leakage/DoS) must be denied while the PTY bridge
+    devices stay usable."""
+    from envd_service.executors.base import ExecConfig
+    from envd_service.executors.sandlock import SandlockExecutor
+    from envd_service.runtime.image_resolver import resolve_image_rootfs
+
+    rootfs = resolve_image_rootfs("python:3.11-slim", tmp_path / "cache")
+    executor = SandlockExecutor(
+        workspace_dir=str(tmp_path / "ws"),
+        base_image="python:3.11-slim",
+        image_rootfs=rootfs,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=False,
+    )
+    probe = (
+        "test -e /dev/shm && echo SHM_VISIBLE || echo SHM_DENIED; "
+        "test -e /dev/ptmx && echo PTMX_OK || echo PTMX_MISSING; "
+        "echo x > /dev/shm/leak 2>/dev/null && echo SHM_WRITABLE || echo SHM_READONLY"
+    )
+    result = executor._build_sandbox(
+        ExecConfig(
+            cmd=["/bin/sh", "-c", probe],
+            env={},
+            cwd=str(tmp_path / "ws"),
+            stdin_enabled=False,
+        )
+    ).run(["/bin/sh", "-c", probe])
+    assert b"SHM_DENIED" in result.stdout
+    assert b"SHM_READONLY" in result.stdout
+    assert b"PTMX_OK" in result.stdout

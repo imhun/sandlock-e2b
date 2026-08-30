@@ -30,6 +30,7 @@ from gateway_common.network import (
     normalize_network_config,
     normalize_network_update,
 )
+from gateway_common import GATEWAY_ROUTE_INVALIDATE_CHANNEL
 from gateway_common.paths import validate_sandbox_id
 
 logger = logging.getLogger(__name__)
@@ -974,20 +975,28 @@ async def _import_sandbox_archive(request, record, node, tar_path) -> None:
 
 async def _invalidate_gateway_route(request, sandbox_id) -> None:
     gateway_url = request.app.state.settings.gateway_url
-    if not gateway_url:
-        return
-    import httpx
+    if gateway_url:
+        import httpx
 
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
-                f"{gateway_url.rstrip('/')}/internal/routes/{sandbox_id}/invalidate",
-                headers={
-                    "X-Internal-Key": request.app.state.settings.internal_api_key
-                },
-            )
-    except httpx.HTTPError:
-        pass
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    f"{gateway_url.rstrip('/')}/internal/routes/{sandbox_id}/invalidate",
+                    headers={
+                        "X-Internal-Key": request.app.state.settings.internal_api_key
+                    },
+                )
+        except httpx.HTTPError:
+            pass
+    # Broadcast invalidation to EVERY gateway replica so stale route caches
+    # are dropped immediately (multi-replica support). Best-effort: if Redis
+    # is down the route TTL still bounds staleness.
+    redis_client = getattr(request.app.state, "redis_client", None)
+    if redis_client is not None:
+        try:
+            redis_client.publish(GATEWAY_ROUTE_INVALIDATE_CHANNEL, sandbox_id)
+        except Exception:
+            pass
 
 
 @router.post(
@@ -1193,6 +1202,10 @@ async def connect_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
         record = registry.get(sandbox_id)
         if record.state == "paused":
             record.resume(timeout)
+            # Persist the resumed state before connect() re-reads the record
+            # (Redis-backed registries reconstruct from the store on every
+            # get(), so an unsaved in-memory mutation would be lost).
+            registry.save(record)
             request.app.state.runtime_registry.set_state(sandbox_id, "running")
         registry.connect(sandbox_id, timeout)
         return record.as_sandbox()

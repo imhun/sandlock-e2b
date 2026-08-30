@@ -95,6 +95,11 @@ class Settings:
     )
     redis_url: str | None = field(default_factory=lambda: os.getenv("E2B_REDIS_URL"))
     gateway_url: str | None = field(default_factory=lambda: os.getenv("E2B_GATEWAY_URL"))
+    buildkit_addr: str = field(
+        default_factory=lambda: os.getenv(
+            "E2B_BUILDKIT_ADDR", "unix:///run/buildkit/buildkitd.sock"
+        )
+    )
     shared_workspace_root: str | None = field(
         default_factory=lambda: os.getenv("E2B_SHARED_WORKSPACE_ROOT")
     )

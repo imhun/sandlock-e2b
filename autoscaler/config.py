@@ -64,7 +64,7 @@ class Settings:
     docker_image: str = field(
         default_factory=lambda: os.getenv(
             "E2B_AS_DOCKER_IMAGE",
-            "registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock:worker",
+            "registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0",
         )
     )
     docker_network: str = field(

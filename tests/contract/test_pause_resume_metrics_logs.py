@@ -43,6 +43,27 @@ async def test_pause_resume_lifecycle(control_client):
     assert conflict.status_code == 409
 
 
+async def test_connect_resumes_paused_sandbox(control_client):
+    """Sandbox.connect() auto-resumes: the persisted state must flip back to
+    running (regression: the resumed record was previously overwritten by
+    connect()'s re-read of the stale store payload)."""
+    sandbox = await _create(control_client)
+    sid = sandbox["sandboxID"]
+
+    paused = await control_client.post(
+        f"/sandboxes/{sid}/pause", headers={"X-API-Key": "local-key"}, json={}
+    )
+    assert paused.status_code == 204
+
+    connected = await control_client.post(
+        f"/sandboxes/{sid}/connect", headers={"X-API-Key": "local-key"}, json={}
+    )
+    assert connected.status_code == 200
+
+    info = await control_client.get(f"/sandboxes/{sid}", headers={"X-API-Key": "local-key"})
+    assert info.json()["state"] == "running"
+
+
 async def test_metrics_shape(control_client):
     sandbox = await _create(control_client)
     response = await control_client.get(
@@ -73,4 +94,3 @@ async def test_logs_shape(control_client):
     logs = response.json()
     assert isinstance(logs, list)
     assert any(log["line"] == "sandbox created" for log in logs)
-

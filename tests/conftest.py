@@ -45,6 +45,72 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+@pytest.fixture(scope="session")
+def buildkitd():
+    """Rootless buildkit daemon (TCP) for local template builds."""
+    if shutil.which("docker") is None:
+        pytest.skip("docker is required for template build tests")
+    port = _free_port()
+    import tempfile
+
+    cfg_dir = Path(tempfile.mkdtemp(prefix="buildkit-test-"))
+    cfg = cfg_dir / "buildkitd.toml"
+    cfg.write_text(
+        f'[grpc]\n  address = ["tcp://0.0.0.0:{port}"]\n\n'
+        "[worker.oci]\n  noProcessSandbox = true\n\n"
+        '[registry."docker.io"]\n  mirrors = ["https://docker.m.daocloud.io"]\n\n'
+        # Local test registry is plain HTTP on 127.0.0.1 (any port).
+        '[registry."127.0.0.1"]\n  http = true\n',
+        encoding="utf-8",
+    )
+    name = f"buildkit-test-{uuid.uuid4().hex[:8]}"
+    volume = f"buildkit-test-vol-{uuid.uuid4().hex[:8]}"
+    start = subprocess.run(
+        [
+            "docker",
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            name,
+            "--security-opt",
+            "seccomp=unconfined",
+            "--security-opt",
+            "label=disable",
+            "--network",
+            "host",
+            "-v",
+            f"{cfg}:/home/user/.config/buildkit/buildkitd.toml:ro",
+            "-v",
+            f"{volume}:/home/user/.local/share/buildkit",
+            "moby/buildkit:rootless",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if start.returncode != 0:
+        pytest.skip(f"cannot start buildkit container: {start.stderr.strip()}")
+    container = start.stdout.strip()
+    try:
+        deadline = time.time() + 90
+        ready = False
+        while time.time() < deadline:
+            state = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", container],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if state == "true":
+                ready = True
+                break
+            time.sleep(0.5)
+        if not ready:
+            pytest.skip("buildkit did not become ready")
+        yield f"tcp://127.0.0.1:{port}"
+    finally:
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+
+
 @pytest.fixture()
 def workspace(tmp_path) -> Path:
     """Project-local workspace for one test (spec: temp data in tmp/)."""
@@ -134,8 +200,19 @@ class _ServerThread:
 
 
 @pytest.fixture(scope="session")
-def live_servers():
+def live_servers(buildkitd):
     """Real uvicorn servers for the official SDK tests."""
+    remote = os.environ.get("E2B_TEST_PROXY_URL")
+    if remote:
+        # Point the SDK suite at a deployed instance (e.g. through the SLB
+        # proxy) instead of starting local servers.
+        url = remote.rstrip("/")
+        os.environ["E2B_API_URL"] = url
+        os.environ["E2B_SANDBOX_URL"] = url
+        os.environ["E2B_VOLUME_API_URL"] = url
+        # E2B_API_KEY / E2B_INTERNAL_API_KEY come from the environment.
+        yield {"api_url": url, "sandbox_url": url}
+        return
     runtime_registry = RuntimeRegistry(PROJECT_ROOT / "tmp" / "sdk-workspace")
     control_port = _free_port()
     envd_port = _free_port()
@@ -150,6 +227,7 @@ def live_servers():
             max_total_cpu_percent=0,
             max_total_disk_mb=0,
             max_total_processes=0,
+            buildkit_addr=buildkitd,
         ),
         runtime_registry=runtime_registry,
         workspace_base=PROJECT_ROOT / "tmp" / "sdk-workspace",
@@ -193,9 +271,11 @@ def live_servers():
 
 
 @pytest.fixture(scope="session")
-def multinode_servers():
+def multinode_servers(buildkitd):
     """Real control plane + one remote worker + envd gateway."""
-    harness = _start_multinode(PROJECT_ROOT / "tmp" / "multinode", 1)
+    harness = _start_multinode(
+        PROJECT_ROOT / "tmp" / "multinode", 1, buildkit_addr=buildkitd
+    )
     yield {
         "api_url": harness["api_url"],
         "sandbox_url": harness["sandbox_url"],
@@ -213,6 +293,7 @@ def _start_multinode(
     image_registry: str | None = None,
     image_registry_username: str | None = None,
     image_registry_password: str | None = None,
+    buildkit_addr: str | None = None,
 ) -> dict:
     """Shared harness: control plane + N workers + envd gateway."""
     root.mkdir(parents=True, exist_ok=True)
@@ -249,6 +330,7 @@ def _start_multinode(
             image_registry_password=image_registry_password,
             shared_volume_root=str(shared_volumes),
             gateway_url=f"http://127.0.0.1:{gateway_port}",
+            buildkit_addr=buildkit_addr,
         ),
         runtime_registry=RuntimeRegistry(shared_workspace_dir),
         workspace_base=shared_workspace_dir,
@@ -324,18 +406,23 @@ def _start_multinode(
 
 
 @pytest.fixture(scope="session")
-def multinode_two_workers():
+def multinode_two_workers(buildkitd):
     """Real control plane + two remote workers + envd gateway."""
-    harness = _start_multinode(PROJECT_ROOT / "tmp" / "multinode-two", 2)
+    harness = _start_multinode(
+        PROJECT_ROOT / "tmp" / "multinode-two", 2, buildkit_addr=buildkitd
+    )
     yield harness
     harness["_stop"]()
 
 
 @pytest.fixture(scope="session")
-def multinode_shared_workspace():
+def multinode_shared_workspace(buildkitd):
     """Two workers sharing one E2B_WORKSPACE_BASE (NFS-style shared storage)."""
     harness = _start_multinode(
-        PROJECT_ROOT / "tmp" / "multinode-shared", 2, shared_workspace=True
+        PROJECT_ROOT / "tmp" / "multinode-shared",
+        2,
+        shared_workspace=True,
+        buildkit_addr=buildkitd,
     )
     yield harness
     harness["_stop"]()
@@ -474,6 +561,7 @@ def _start_live_servers(
     image_registry: str | None = None,
     image_registry_username: str | None = None,
     image_registry_password: str | None = None,
+    buildkit_addr: str | None = None,
 ) -> dict:
     """Real control plane + envd servers for registry template builds."""
     workspace = PROJECT_ROOT / "tmp" / name
@@ -488,6 +576,7 @@ def _start_live_servers(
             image_registry=image_registry,
             image_registry_username=image_registry_username,
             image_registry_password=image_registry_password,
+            buildkit_addr=buildkit_addr,
             max_sandboxes=500,
             max_total_memory_mb=0,
             max_total_cpu_percent=0,
@@ -518,35 +607,39 @@ def _start_live_servers(
 
 
 @pytest.fixture(scope="session")
-def live_servers_registry(image_registry_url):
+def live_servers_registry(buildkitd, image_registry_url):
     """Real servers whose template builds push to a local Docker registry."""
     harness = _start_live_servers(
-        "sdk-workspace-registry", image_registry=image_registry_url
+        "sdk-workspace-registry",
+        image_registry=image_registry_url,
+        buildkit_addr=buildkitd,
     )
     yield harness
     harness["_stop"]()
 
 
 @pytest.fixture(scope="session")
-def live_servers_registry_auth(authenticated_registry):
+def live_servers_registry_auth(buildkitd, authenticated_registry):
     """Real servers pushing to a registry that requires basic auth."""
     harness = _start_live_servers(
         "sdk-workspace-registry-auth",
         image_registry=authenticated_registry["url"],
         image_registry_username=authenticated_registry["username"],
         image_registry_password=authenticated_registry["password"],
+        buildkit_addr=buildkitd,
     )
     yield {**harness, "auth": authenticated_registry}
     harness["_stop"]()
 
 
 @pytest.fixture(scope="session")
-def multinode_servers_registry(image_registry_url):
+def multinode_servers_registry(buildkitd, image_registry_url):
     """Single worker + control plane that pushes templates to a registry."""
     harness = _start_multinode(
         PROJECT_ROOT / "tmp" / "multinode-registry",
         1,
         image_registry=image_registry_url,
+        buildkit_addr=buildkitd,
     )
     yield {
         "api_url": harness["api_url"],
@@ -559,7 +652,7 @@ def multinode_servers_registry(image_registry_url):
 
 
 @pytest.fixture(scope="session")
-def multinode_servers_registry_auth(authenticated_registry):
+def multinode_servers_registry_auth(buildkitd, authenticated_registry):
     """Single worker + control plane pushing to an authenticated registry."""
     harness = _start_multinode(
         PROJECT_ROOT / "tmp" / "multinode-registry-auth",
@@ -567,6 +660,7 @@ def multinode_servers_registry_auth(authenticated_registry):
         image_registry=authenticated_registry["url"],
         image_registry_username=authenticated_registry["username"],
         image_registry_password=authenticated_registry["password"],
+        buildkit_addr=buildkitd,
     )
     yield {
         "api_url": harness["api_url"],

@@ -25,4 +25,3 @@ async def async_sandbox(live_servers):
         await sb.kill()
     except Exception:
         pass
-

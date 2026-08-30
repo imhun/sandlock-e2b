@@ -24,7 +24,7 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.server.lowlevel import Server
 
-PORT = 50005
+PORT = int(os.environ.get("MCP_PORT", "50005"))
 
 
 def _authorized(scope: dict, token: str) -> bool:

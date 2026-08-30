@@ -73,6 +73,15 @@ class RedisQuotaStore:
                 pipe.hincrby(key, dim, -value)
             pipe.execute()
 
+    def get(self, name: str) -> dict[str, int]:
+        """Current reserved values for a name ({} when never reserved)."""
+        key = self._key(name)
+        raw = self._client.hgetall(key)
+        return {
+            (k.decode() if isinstance(k, bytes) else k): int(v)
+            for k, v in raw.items()
+        }
+
 
 class RedisRecordStore:
     """JSON records shared across replicas."""

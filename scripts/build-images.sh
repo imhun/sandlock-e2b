@@ -1,22 +1,27 @@
 #!/bin/sh
-# Build the final control-plane and worker images (multi-arch by default).
+# Build the worker / autoscaler images (the control plane + gateway run as
+# the merged e2b-sandlock-control-plane-gateway image, see
+# Dockerfile.control-plane-gateway / deploy/scripts/build-and-push.sh).
+#
+# Naming convention: the image NAME distinguishes the service and the TAG
+# distinguishes the version:
+#   $REGISTRY/e2b-sandlock-{worker,autoscaler}:$VERSION
 #
 # Usage:
-#   TAG=myrepo/e2b:1.0 PLATFORMS=linux/amd64,linux/arm64 ./scripts/build-images.sh
+#   REGISTRY=myrepo/e2b VERSION=1.0 PLATFORMS=linux/amd64 ./scripts/build-images.sh
+#   REGISTRY=registry.cn-shanghai.aliyuncs.com/byteplan VERSION=1.0 PUSH=1 ./scripts/build-images.sh
 #
-# Defaults push nothing; set PUSH=1 to push after building.
+# Multi-platform output must go to a registry (buildx --push); single
+# platform defaults to --load. Defaults push nothing.
 set -eu
 
-TAG="${TAG:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock:latest}"
+REGISTRY="${REGISTRY:-registry.cn-shanghai.aliyuncs.com/byteplan}"
+VERSION="${VERSION:-$(git describe --tags --always 2>/dev/null || echo 0.1.0)}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 PUSH="${PUSH:-0}"
 
-CONTROL_TAG="${CONTROL_TAG:-$TAG-control-plane}"
-WORKER_TAG="${WORKER_TAG:-$TAG-worker}"
-
 case "$PLATFORMS" in
 *","*)
-    # Multi-platform output must go to a registry.
     if [ "$PUSH" != "1" ]; then
         echo "multi-platform builds require PUSH=1 (output goes to a registry)" >&2
         exit 1
@@ -28,29 +33,20 @@ case "$PLATFORMS" in
     ;;
 esac
 
-echo "==> building $CONTROL_TAG ($PLATFORMS)"
-docker buildx build "$OUT_FLAG" \
-    --platform "$PLATFORMS" \
-    -f Dockerfile.control-plane \
-    -t "$CONTROL_TAG" \
-    .
-
-echo "==> building $WORKER_TAG ($PLATFORMS)"
+echo "==> building $REGISTRY/e2b-sandlock-worker:$VERSION ($PLATFORMS)"
 docker buildx build "$OUT_FLAG" \
     --platform "$PLATFORMS" \
     -f Dockerfile.envd \
-    -t "$WORKER_TAG" \
+    -t "$REGISTRY/e2b-sandlock-worker:$VERSION" \
     .
 
-AUTOSCALER_TAG="${AUTOSCALER_TAG:-$TAG-autoscaler}"
-echo "==> building $AUTOSCALER_TAG ($PLATFORMS)"
+echo "==> building $REGISTRY/e2b-sandlock-autoscaler:$VERSION ($PLATFORMS)"
 docker buildx build "$OUT_FLAG" \
     --platform "$PLATFORMS" \
     -f Dockerfile.autoscaler \
-    -t "$AUTOSCALER_TAG" \
+    -t "$REGISTRY/e2b-sandlock-autoscaler:$VERSION" \
     .
 
 echo "done:"
-echo "  control-plane: $CONTROL_TAG"
-echo "  worker:        $WORKER_TAG"
-echo "  autoscaler:    $AUTOSCALER_TAG"
+echo "  worker:        $REGISTRY/e2b-sandlock-worker:$VERSION"
+echo "  autoscaler:    $REGISTRY/e2b-sandlock-autoscaler:$VERSION"

@@ -16,7 +16,7 @@ spec:
       terminationGracePeriodSeconds: 120
       containers:
         - name: worker
-          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock:worker
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
           ports:
             - containerPort: 49983
           env:

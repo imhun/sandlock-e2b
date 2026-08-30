@@ -19,6 +19,7 @@ from envd_service.agent import (
 from envd_service.http.auth import HttpAuthError, http_error_response
 from envd_service.http.files import router as files_router
 from envd_service.http.health import router as health_router
+from envd_service.http.mcp import router as mcp_router
 from envd_service.rpc import register_rpc
 from envd_service.runtime.context import SandboxRuntimeContext
 from envd_service.runtime.registry import RuntimeRegistry
@@ -27,24 +28,25 @@ logger = logging.getLogger(__name__)
 
 
 async def _warm_base_image(settings: Settings) -> None:
-    """Pre-extract the configured base image rootfs at worker startup."""
+    """Pre-extract the configured base image + template images at startup."""
     from envd_service.runtime.image_resolver import resolve_image_rootfs
 
-    try:
-        await asyncio.to_thread(
-            resolve_image_rootfs,
-            settings.base_image,
-            settings.image_cache_dir,
-            registry_username=settings.image_registry_username,
-            registry_password=settings.image_registry_password,
-        )
-        logger.info("worker base image warmed: %s", settings.base_image)
-    except Exception:
-        logger.warning(
-            "worker base image warm failed: %s",
-            settings.base_image,
-            exc_info=True,
-        )
+    images = [settings.base_image]
+    images.extend(v for v in settings.template_images.values() if v)
+    for image in dict.fromkeys(images):  # dedupe, keep order
+        if not image:
+            continue
+        try:
+            await asyncio.to_thread(
+                resolve_image_rootfs,
+                image,
+                settings.image_cache_dir,
+                registry_username=settings.image_registry_username,
+                registry_password=settings.image_registry_password,
+            )
+            logger.info("worker image warmed: %s", image)
+        except Exception:
+            logger.warning("worker image warm failed: %s", image, exc_info=True)
 
 
 def create_app(
@@ -113,6 +115,7 @@ def create_app(
     app.add_exception_handler(HttpAuthError, http_error_response)
     app.include_router(health_router)
     app.include_router(files_router)
+    app.include_router(mcp_router)
     app.include_router(agent_router)
     register_rpc(app)
     return app

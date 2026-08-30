@@ -76,7 +76,7 @@ def test_image_rootfs_cannot_reach_host_filesystem():
         enable_network=False,
     )
     probe = (
-        "if [ -d /workspace ]; then echo HOST_VISIBLE; "
+        f"if [ -e {tempfile.mkdtemp(prefix='e2b-host-marker-')} ]; then echo HOST_VISIBLE; "
         "else echo HOST_HIDDEN; fi"
     )
     result = executor._build_sandbox(
@@ -87,6 +87,7 @@ def test_image_rootfs_cannot_reach_host_filesystem():
             stdin_enabled=False,
         )
     ).run(["/bin/sh", "-c", probe])
-    # Inside the chroot /workspace does not exist: the host filesystem is
-    # unreachable even though Landlock "/" covers the image rootfs.
+    # A host-only random path is not visible inside the chroot: the host
+    # filesystem is unreachable even though Landlock "/" covers the image
+    # rootfs (/workspace is the sandbox's own mount, so it is not a probe).
     assert result.stdout.strip() == b"HOST_HIDDEN"

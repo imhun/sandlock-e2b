@@ -6,11 +6,14 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
+
+from gateway_common import GATEWAY_ROUTE_INVALIDATE_CHANNEL
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,95 @@ class RouteCache:
     def put(self, sandbox_id: str, address: str) -> None:
         self._routes[sandbox_id] = (time.time(), address)
 
+    def invalidate(self, sandbox_id: str) -> None:
+        self._routes.pop(sandbox_id, None)
+
+
+def _route_ttl() -> float:
+    """Route cache TTL from ``E2B_GATEWAY_ROUTE_TTL`` (seconds, >= 0.5)."""
+    try:
+        return max(0.5, float(os.getenv("E2B_GATEWAY_ROUTE_TTL", "30.0")))
+    except ValueError:
+        return 30.0
+
+
+class RouteInvalidationSubscriber:
+    """Drop cached routes on every replica via Redis pub/sub.
+
+    The control plane publishes the sandbox id on
+    ``GATEWAY_ROUTE_INVALIDATE_CHANNEL`` after migration/kill; this subscriber
+    listens and invalidates the local ``RouteCache`` immediately, closing the
+    stale-route window that the per-replica HTTP invalidation cannot cover.
+    Best-effort: if Redis is unavailable the TTL still bounds staleness.
+    """
+
+    def __init__(
+        self,
+        routes: RouteCache,
+        redis_url: str | None = None,
+        client=None,
+    ) -> None:
+        self._routes = routes
+        self._redis_url = redis_url
+        self._client = client  # injected client (tests); None -> from URL
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        if not self._redis_url and self._client is None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="gateway-route-invalidate",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._listen()
+            except Exception:
+                logger.exception("gateway route invalidation subscriber error")
+            self._stop.wait(2.0)
+
+    def _listen(self) -> None:
+        client = self._client
+        pubsub = None
+        try:
+            if client is None:
+                import redis
+
+                client = redis.from_url(self._redis_url, decode_responses=True)
+            pubsub = client.pubsub()
+            pubsub.subscribe(GATEWAY_ROUTE_INVALIDATE_CHANNEL)
+            while not self._stop.is_set():
+                message = pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=1.0
+                )
+                if message is None:
+                    continue
+                if message.get("type") != "message":
+                    continue
+                sandbox_id = message.get("data")
+                if isinstance(sandbox_id, bytes):
+                    sandbox_id = sandbox_id.decode()
+                if sandbox_id:
+                    self._routes.invalidate(sandbox_id)
+        finally:
+            if pubsub is not None:
+                try:
+                    pubsub.close()
+                except Exception:
+                    pass
+
 
 def create_gateway(
     *,
@@ -45,15 +137,19 @@ def create_gateway(
     internal_key = internal_api_key or os.getenv(
         "E2B_INTERNAL_API_KEY", "internal-key"
     )
-    routes = RouteCache()
+    routes = RouteCache(ttl=_route_ttl())
 
     app = FastAPI(title="E2B Sandlock Gateway - Envd Router")
+    app.state.route_cache = routes
+    app.state.route_subscriber = RouteInvalidationSubscriber(
+        routes, redis_url=os.getenv("E2B_REDIS_URL")
+    )
 
     @app.post("/internal/routes/{sandbox_id}/invalidate")
     async def invalidate_route(sandbox_id: str, request: Request) -> Response:
         if request.headers.get("X-Internal-Key") != internal_key:
             return Response(status_code=401)
-        routes._routes.pop(sandbox_id, None)
+        routes.invalidate(sandbox_id)
         return Response(status_code=204)
 
     async def _resolve_address(sandbox_id: str) -> str:
@@ -82,6 +178,10 @@ def create_gateway(
         "accept",
         "connect-protocol-version",
         "x-mcp-access-token",
+        # MCP streamable-HTTP sessions: the client sends Mcp-Session-Id on
+        # every request after the first POST; dropping it makes the upstream
+        # gateway lose the session and fail tool calls.
+        "mcp-session-id",
     }
 
     def _forward_headers(request: Request) -> dict[str, str]:
@@ -93,6 +193,47 @@ def create_gateway(
             if lower.startswith("x-metadata-") or lower in _FORWARD_HEADERS:
                 headers[key] = value
         return headers
+
+    async def _forward(
+        address: str, path: str, request: Request, body: bytes
+    ) -> tuple[httpx.AsyncClient, httpx.Response]:
+        url = f"{address}/{path}"
+        if request.url.query:
+            url += f"?{request.url.query}"
+        client = httpx.AsyncClient(timeout=None)
+        upstream = await client.send(
+            client.build_request(
+                request.method,
+                url,
+                headers=_forward_headers(request),
+                content=body,
+            ),
+            stream=True,
+        )
+        return client, upstream
+
+    def _stream(
+        client: httpx.AsyncClient, upstream: httpx.Response
+    ) -> StreamingResponse:
+        async def _body():
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+
+        response_headers = {
+            k: v
+            for k, v in upstream.headers.items()
+            if k.lower()
+            not in ("content-length", "transfer-encoding", "connection")
+        }
+        return StreamingResponse(
+            _body(),
+            status_code=upstream.status_code,
+            headers=response_headers,
+        )
 
     @app.api_route(
         "/{path:path}",
@@ -113,43 +254,51 @@ def create_gateway(
             # ``is_running()`` reports False when the node is gone.
             return Response(status_code=502, content="Sandbox route not found")
 
-        url = f"{address}/{path}"
-        if request.url.query:
-            url += f"?{request.url.query}"
-        headers = _forward_headers(request)
-        try:
-            client = httpx.AsyncClient(timeout=None)
-            upstream = await client.send(
-                client.build_request(
-                    request.method,
-                    url,
-                    headers=headers,
-                    content=request.stream(),
-                ),
-                stream=True,
-            )
-        except httpx.HTTPError as e:
-            logger.info("proxy to %s failed: %s", address, e)
-            return Response(status_code=502, content=f"Node unavailable: {e}")
+        # Buffer the request body once so a single retry can replay it after
+        # the node moved (migration) or the stale route failed. Trade-off:
+        # uploads are buffered in memory instead of streamed.
+        body = await request.body()
 
-        async def _body():
+        for attempt in (1, 2):
             try:
-                async for chunk in upstream.aiter_bytes():
-                    yield chunk
-            finally:
+                client, upstream = await _forward(address, path, request, body)
+            except httpx.HTTPError as e:
+                logger.info(
+                    "proxy to %s failed (attempt %d): %s", address, attempt, e
+                )
+                if attempt == 1:
+                    # Node may be gone (migration / crash): drop the cached
+                    # route and resolve once more before giving up.
+                    routes.invalidate(sandbox_id)
+                    try:
+                        address = await _resolve_address(sandbox_id)
+                    except Exception as re:
+                        logger.info(
+                            "re-resolve failed for %s: %s", sandbox_id, re
+                        )
+                        return Response(
+                            status_code=502, content=f"Node unavailable: {e}"
+                        )
+                    continue
+                return Response(
+                    status_code=502, content=f"Node unavailable: {e}"
+                )
+            if attempt == 1 and upstream.status_code == 502:
+                # The node answered but no longer hosts this sandbox (e.g.
+                # migration): invalidate and re-resolve once, then replay.
                 await upstream.aclose()
                 await client.aclose()
+                routes.invalidate(sandbox_id)
+                try:
+                    address = await _resolve_address(sandbox_id)
+                except Exception as re:
+                    logger.info("re-resolve failed for %s: %s", sandbox_id, re)
+                    return Response(
+                        status_code=502, content="Sandbox route not found"
+                    )
+                continue
+            return _stream(client, upstream)
 
-        response_headers = {
-            k: v
-            for k, v in upstream.headers.items()
-            if k.lower()
-            not in ("content-length", "transfer-encoding", "connection")
-        }
-        return StreamingResponse(
-            _body(),
-            status_code=upstream.status_code,
-            headers=response_headers,
-        )
+        return Response(status_code=502, content="Sandbox route not found")
 
     return app

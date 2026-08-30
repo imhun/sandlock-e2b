@@ -1,0 +1,7 @@
+# buildx docker-container builder config: route docker.io through a reachable
+# mirror (Docker Hub is unreachable from this Mac / the target).
+[registry."docker.io"]
+  mirrors = ["https://docker.m.daocloud.io"]
+
+[registry."docker.m.daocloud.io"]
+  http = false

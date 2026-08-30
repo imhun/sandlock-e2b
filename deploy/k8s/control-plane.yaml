@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: control-plane
-          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock:control-plane
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-control-plane-gateway:0.1.0
           ports:
             - containerPort: 3000
           env:
@@ -27,8 +27,10 @@ spec:
               value: "false"
             - name: E2B_REDIS_URL
               value: redis://redis:6379/0
+            - name: E2B_CONTROL_PLANE_URL
+              value: http://control-plane:3000
             - name: E2B_GATEWAY_URL
-              value: http://gateway:49983
+              value: http://control-plane:3000
             - name: E2B_SHARED_WORKSPACE_ROOT
               value: /var/lib/e2b-sandboxes
             - name: E2B_WORKSPACE_BASE

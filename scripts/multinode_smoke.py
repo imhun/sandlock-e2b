@@ -4,7 +4,7 @@
 Usage (after ``docker compose -f docker-compose.multinode.yml up -d``):
 
     E2B_API_URL=http://127.0.0.1:3100 \\
-    E2B_SANDBOX_URL=http://127.0.0.1:4100 \\
+    E2B_SANDBOX_URL=http://127.0.0.1:3100 \\
     E2B_API_KEY=local-key \\
     python scripts/multinode_smoke.py
 
@@ -81,4 +81,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     sys.exit(main())
-

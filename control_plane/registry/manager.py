@@ -190,6 +190,9 @@ class SandboxRecord:
             "network": self.network,
             "iam_tokens": self.iam_tokens,
             "node_id": self.node_id,
+            "workspace_dir": (
+                str(self.workspace_dir) if self.workspace_dir is not None else None
+            ),
         }
 
     @classmethod
@@ -228,6 +231,9 @@ class SandboxRecord:
             network=data.get("network"),
             iam_tokens=dict(data.get("iam_tokens", {})),
             node_id=data.get("node_id", "local"),
+            workspace_dir=(
+                Path(data["workspace_dir"]) if data.get("workspace_dir") else None
+            ),
         )
 
 
