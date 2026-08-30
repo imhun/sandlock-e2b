@@ -1,5 +1,5 @@
-# Control plane final image: API + registry + scheduler only.
-# The worker (Dockerfile.envd) runs sandboxes; this image never does.
+# Autoscaler: polls the control plane and grows/retires the worker pool
+# (local Docker pool manager or Kubernetes Deployment).
 FROM python:3.14-slim
 
 WORKDIR /app
@@ -13,10 +13,6 @@ RUN sed -i \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
-COPY gateway_common/ gateway_common/
-COPY control_plane/ control_plane/
+COPY autoscaler/ autoscaler/
 
-ENV E2B_WORKSPACE_BASE=/var/lib/e2b-sandboxes
-EXPOSE 3000
-
-CMD ["python", "-m", "control_plane"]
+CMD ["python", "-m", "autoscaler"]

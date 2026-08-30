@@ -22,7 +22,6 @@ services:
       - "3000:3000"
     volumes:
       - sandbox-data:/var/lib/e2b-sandboxes
-      - /var/run/docker.sock:/var/run/docker.sock
 
   envd:
     build:
@@ -34,7 +33,6 @@ services:
       - "49983:49983"
     volumes:
       - sandbox-data:/var/lib/e2b-sandboxes
-      - /var/run/docker.sock:/var/run/docker.sock
     cap_add:
       - SYS_ADMIN
     privileged: false

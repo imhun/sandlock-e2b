@@ -9,9 +9,9 @@
 # Multi-host note: to run workers on several machines, point every worker's
 # E2B_WORKSPACE_BASE at the same NFS/CSI share, keep the control plane on one
 # host (or add replicas behind a LB + Redis), and set E2B_NODE_ADDRESS to the
-# worker's reachable address. The egress-proxy and template-rootfs features
-# need the worker's Docker daemon socket and a C-compiled library that is
-# already baked into this image per platform.
+# worker's reachable address. Image rootfs is pulled directly from the OCI
+# registry (no Docker daemon); the egress-proxy library ships prebuilt in the
+# image per platform.
 services:
   redis:
     image: redis:7-alpine
@@ -57,7 +57,6 @@ services:
       - "${CONTROL_PLANE_PORT:-3000}:3000"
     volumes:
       - sandbox-shared:/var/lib/e2b-sandboxes
-      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
     restart: unless-stopped
 
   gateway:
@@ -105,7 +104,6 @@ services:
       E2B_NODE_PROCESSES: ${E2B_NODE_PROCESSES:-256}
     volumes: &worker-volumes
       - sandbox-shared:/var/lib/e2b-sandboxes
-      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
     cap_add:
       - SYS_ADMIN
     sysctls:

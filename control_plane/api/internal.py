@@ -177,6 +177,12 @@ async def fleet_metrics(request: Request) -> dict[str, Any]:
     return {
         "nodes": node_metrics,
         "fleet": fleet,
+        "standardSandboxDims": {
+            "memory": settings.default_memory_mb,
+            "cpu": settings.default_cpu_percent,
+            "disk": settings.default_disk_mb,
+            "processes": settings.default_max_processes,
+        },
         "remainingSandboxCapacity": (
             None if unlimited_node else remaining_capacity
         ),

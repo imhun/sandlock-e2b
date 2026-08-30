@@ -8,7 +8,7 @@ services:
       E2B_INTERNAL_API_KEY: internal-key
       E2B_ENABLE_LOCAL_NODE: "false"
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
-      # 模板构建完成后推送到镜像仓库，worker 按需 docker pull。
+      # 模板构建完成后推送到镜像仓库，worker 按需从 OCI registry 直拉 rootfs。
       # 自建 HTTP 仓库需在 docker daemon 配置 insecure-registries。
       E2B_IMAGE_REGISTRY: registry.example.com/e2b
       # 私有仓库认证（控制面 push 与 worker pull 都需配置）。
@@ -28,7 +28,6 @@ services:
       - "3100:3000"
     volumes:
       - control-data:/var/lib/e2b-sandboxes
-      - /var/run/docker.sock:/var/run/docker.sock
 
   gateway:
     build:
@@ -59,7 +58,6 @@ services:
       E2B_NODE_PROCESSES: 256
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
-      - /var/run/docker.sock:/var/run/docker.sock
     cap_add:
       - SYS_ADMIN
     security_opt:
@@ -82,7 +80,6 @@ services:
       E2B_NODE_PROCESSES: 256
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
-      - /var/run/docker.sock:/var/run/docker.sock
     cap_add:
       - SYS_ADMIN
     security_opt:
@@ -105,7 +102,6 @@ services:
       E2B_NODE_PROCESSES: 256
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
-      - /var/run/docker.sock:/var/run/docker.sock
     cap_add:
       - SYS_ADMIN
     security_opt:

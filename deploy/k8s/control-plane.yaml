@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: sandlock
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: control-plane
+  template:
+    metadata:
+      labels:
+        app: control-plane
+    spec:
+      containers:
+        - name: control-plane
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock:control-plane
+          ports:
+            - containerPort: 3000
+          env:
+            - name: E2B_API_KEYS
+              value: "local-key"
+            - name: E2B_INTERNAL_API_KEY
+              value: "internal-key"
+            - name: E2B_ENABLE_LOCAL_NODE
+              value: "false"
+            - name: E2B_REDIS_URL
+              value: redis://redis:6379/0
+            - name: E2B_GATEWAY_URL
+              value: http://gateway:49983
+            - name: E2B_SHARED_WORKSPACE_ROOT
+              value: /var/lib/e2b-sandboxes
+            - name: E2B_WORKSPACE_BASE
+              value: /var/lib/e2b-sandboxes
+            - name: E2B_BASE_IMAGE
+              value: python:3.14-slim
+            - name: E2B_MAX_SANDBOXES
+              value: "1000"
+          volumeMounts:
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: sandbox-shared
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane
+  namespace: sandlock
+spec:
+  selector:
+    app: control-plane
+  ports:
+    - port: 3000

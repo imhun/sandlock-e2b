@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sandbox-shared
+  namespace: sandlock
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+  # Storage class must support RWX (NFS/CephFS). Replace as needed.
+  # storageClassName: nfs

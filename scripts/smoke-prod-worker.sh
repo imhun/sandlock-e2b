@@ -3,7 +3,8 @@
 # way docker-compose.prod.yml deploys it — NON-privileged container, seccomp
 # unconfined (sandlock installs its own seccomp filters and needs a user
 # namespace for the uid/gid map, which Docker's default profile would block),
-# docker socket for image rootfs extraction — then run representative tests:
+# image rootfs pulled directly from the OCI registry (no Docker daemon) — then
+# run representative tests:
 #
 #   * a confined sandbox process (no-root child)
 #   * a real image-rootfs sandbox (chroot + CA splice)

@@ -42,6 +42,15 @@ docker buildx build "$OUT_FLAG" \
     -t "$WORKER_TAG" \
     .
 
+AUTOSCALER_TAG="${AUTOSCALER_TAG:-$TAG-autoscaler}"
+echo "==> building $AUTOSCALER_TAG ($PLATFORMS)"
+docker buildx build "$OUT_FLAG" \
+    --platform "$PLATFORMS" \
+    -f Dockerfile.autoscaler \
+    -t "$AUTOSCALER_TAG" \
+    .
+
 echo "done:"
 echo "  control-plane: $CONTROL_TAG"
 echo "  worker:        $WORKER_TAG"
+echo "  autoscaler:    $AUTOSCALER_TAG"

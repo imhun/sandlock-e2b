@@ -1,0 +1,82 @@
+# Local auto-scaling deployment: control plane + gateway + autoscaler that
+# grows/retires a Docker worker pool (no static worker services).
+#
+# The autoscaler runs on the Docker host and uses the docker CLI to manage
+# worker containers; the workers themselves need no Docker socket.
+#
+#   cp .env.example .env
+#   docker compose -f docker-compose.autoscale.yml up -d --build
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.control-plane
+    image: ${CONTROL_PLANE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock:control-plane}
+    depends_on:
+      - redis
+    environment:
+      E2B_API_KEYS: ${E2B_API_KEYS:-local-key}
+      E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
+      E2B_ENABLE_LOCAL_NODE: "false"
+      E2B_REDIS_URL: redis://redis:6379/0
+      E2B_GATEWAY_URL: http://gateway:49983
+      E2B_SHARED_WORKSPACE_ROOT: /var/lib/e2b-sandboxes
+      E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
+      E2B_MAX_SANDBOXES: ${E2B_MAX_SANDBOXES:-1000}
+    ports:
+      - "${CONTROL_PLANE_PORT:-3000}:3000"
+    volumes:
+      - sandbox-shared:/var/lib/e2b-sandboxes
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.envd
+    image: ${WORKER_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock:worker}
+    command: python -m envd_service.gateway_main
+    depends_on:
+      - control-plane
+    environment:
+      E2B_CONTROL_PLANE_URL: http://control-plane:3000
+      E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
+      E2B_GATEWAY_PORT: 49983
+    ports:
+      - "${GATEWAY_PORT:-49983}:49983"
+
+  autoscaler:
+    build:
+      context: .
+      dockerfile: Dockerfile.autoscaler
+    image: ${AUTOSCALER_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-autoscaler:latest}
+    depends_on:
+      - control-plane
+    environment:
+      E2B_AS_CONTROL_PLANE_URL: http://control-plane:3000
+      E2B_AS_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
+      E2B_AS_BACKEND: local
+      E2B_AS_MIN_REPLICAS: ${E2B_AS_MIN_REPLICAS:-1}
+      E2B_AS_MAX_REPLICAS: ${E2B_AS_MAX_REPLICAS:-8}
+      E2B_AS_DOCKER_IMAGE: ${WORKER_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock:worker}
+      E2B_AS_DOCKER_NETWORK: sandlock
+      E2B_AS_WORKSPACE_VOLUME: sandlock_sandbox-shared
+      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-python:3.14-slim}", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
+    volumes:
+      # The pool manager needs the docker CLI/socket on the host; worker
+      # containers themselves never mount it.
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+networks:
+  default:
+    name: sandlock
+
+volumes:
+  redis-data:
+  sandbox-shared:
