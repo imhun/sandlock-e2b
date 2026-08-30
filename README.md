@@ -109,6 +109,9 @@ host 掩码 / SOCKS5 on-behalf）与 mcp-gateway）。两者在代码层已解�
 runtime registry），所以控制面镜像不依赖 envd_service、worker 镜像不依赖
 control_plane。
 
+`wheels/fork/` 是构建产物、不入库（fork 源码固定于 `third_party/sandlock`
+子模块）：构建镜像前先执行 `./scripts/build-sandlock-wheels.sh` 生成 wheel。
+
 **构建（多架构）**：
 
 ```bash

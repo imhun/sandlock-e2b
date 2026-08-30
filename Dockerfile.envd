@@ -29,7 +29,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
 # sandlock fork wheel (Block A/B/C: wildcard allowOut, header inject,
-# host mask, SOCKS5 egress on-behalf). wheels/fork/ holds per-arch wheels;
+# host mask, SOCKS5 egress on-behalf). wheels/fork/ is gitignored build
+# output (run ./scripts/build-sandlock-wheels.sh first; fork source lives in
+# the third_party/sandlock submodule); holds per-arch wheels;
 # the pick is scoped to the image's own CPython ABI + TARGETARCH so future
 # cp-matrix wheels in the same dir cannot be selected by accident.
 ARG TARGETARCH

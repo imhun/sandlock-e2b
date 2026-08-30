@@ -2,8 +2,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 tmp/
+wheels/fork/
 tests/sdk/js/node_modules/
 tests/sdk/js/package-lock.json
 .DS_Store
 
 envd_service/egress/*.so
+.patchloom/backups/

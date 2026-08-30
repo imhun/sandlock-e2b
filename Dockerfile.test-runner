@@ -26,6 +26,8 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /t
 RUN ln -sf /usr/local/bin/python3 /usr/bin/python3
 
 # sandlock fork wheel (Block A/B/C) — see Dockerfile.envd for the mapping;
+# wheels/fork/ is gitignored build output: run
+# ./scripts/build-sandlock-wheels.sh before building this image;
 # the pick is scoped to the image's own CPython ABI + TARGETARCH.
 ARG TARGETARCH
 COPY wheels/fork/ /tmp/wheels/
