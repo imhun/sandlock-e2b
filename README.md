@@ -99,10 +99,12 @@ profile 会拦截 sandlock 安装自己的 seccomp 过滤器，`docker-compose.t
 
 **镜像分离**：`Dockerfile.control-plane` 只打包控制面
 （`gateway_common` + `control_plane`），`Dockerfile.envd` 只打包 worker
-（`gateway_common` + `envd_service`，含 Sandlock、mcp-gateway 和按平台
-预编译的 `libegress_proxy.so`）。两者在代码层已解耦（env 工具函数收敛到
-`gateway_common.env`；控制面在分离模式下用 no-op runtime registry），所以
-控制面镜像不依赖 envd_service、worker 镜像不依赖 control_plane。
+（`gateway_common` + `envd_service`，含 **fork sandlock wheel**
+（`wheels/fork/`，按 TARGETARCH 选择；通配 allowOut / header 注入 /
+host 掩码 / SOCKS5 on-behalf）与 mcp-gateway）。两者在代码层已解耦
+（env 工具函数收敛到 `gateway_common.env`；控制面在分离模式下用 no-op
+runtime registry），所以控制面镜像不依赖 envd_service、worker 镜像不依赖
+control_plane。
 
 **构建（多架构）**：
 
@@ -276,22 +278,23 @@ SDK → Envd Gateway :49983（按 E2b-Sandbox-Id 路由代理）
   - `rules` — 注册域名并映射到 Sandlock `http_allow`（80/443 透明 MITM
     按域名 ACL；镜像 rootfs 模式下把临时 CA 拼进每沙箱信任副本并注入
     `SSL_CERT_FILE`，HTTPS 可用）。
-  - `egressProxy` — 已支持（阶段 B1）：沙箱出站 TCP 经用户 SOCKS5 代理
-    隧道（LD_PRELOAD 透明拦截 `getaddrinfo`/`connect`，沙箱内无感知；
-    域名走 SOCKS5 ATYP=domain 远程 DNS；allow/deny 在库内先过滤再进代理，
-    fail closed）。**通配域名在 egressProxy 模式下支持**（`*.example.com`
-    匹配子域、不匹配裸域名，过滤在库内做）；普通模式在 fork sandlock +
-    `E2B_ENABLE_NETNS=true` 下同样支持（每沙箱独立 netns：网关 DNS 把
-    通配子域解析为合成 IP，connect 由 supervisor 代连并二次校验，静态/
-    Go 应用同样受限；worker 需 `NET_ADMIN` + `net.ipv4.ip_forward` +
-    veth 网段 MASQUERADE，见 `envd_service/netns.py`）。控制面校验代理
-    地址必须解析到公网 IPv4（拒绝私网/内网，防 SSRF）。限制：仅 IPv4
-    代理、仅动态链接应用（python/node 等）生效、
-    worker 需 `gcc` + `libc6-dev`（首次构建 `libegress_proxy.so` 缓存于
-    `E2B_IMAGE_CACHE_DIR/egress/`）、过滤规则通过环境变量传入沙箱。
-  - 未实现并显式 400 拒绝：`maskRequestHost`、`rules.transform`
-    （header 改写）——需要 sandlock 的 credential-injection 能力
-    （上游 main 分支已有，0.8.6 未发版，B2 待 fork/发版后接入）。
+  - `egressProxy` — 支持：fork sandlock 的 SOCKS5 **on-behalf** 隧道
+    （R12–R14，替代早期 LD_PRELOAD 库）：allow/deny 过滤通过后由
+    supervisor 代连用户代理，通配目标走 ATYP=domain 远程 DNS，字面目标
+    IPv4/IPv6，RFC 1929 认证，fail closed（代理不可达 → ECONNREFUSED，
+    绝不回退直连）；代理端点由 supervisor 拨号、不进沙箱 allowlist。
+    控制面校验代理地址必须解析到公网 IPv4（拒绝私网/内网，防 SSRF）。
+  - `maskRequestHost` 与 `rules[].transform.headers` — 支持（fork wheel）：
+    映射到 sandlock 的 `host_mask`（改写 wire Host，`${PORT}` 替换）与
+    `http_inject`（credential 注入，secret 只存 supervisor；字面值落
+    supervisor-only 0600 文件，`${e2b.identity.tokens.*}` 映射
+    `E2B_IDENTITY_TOKEN_*` env）。
+  - **通配域名**：普通模式（无需 egressProxy / netns）经每沙箱 loopback
+    DNS 网关（`127.0.1.x:53`，需一次 `net.ipv4.ip_unprivileged_port_start=0`
+    或 `CAP_NET_BIND_SERVICE`）把通配子域解析为合成 IP，connect 由
+    supervisor 代连并二次校验（SSRF 护栏拒绝私网/回环），静态/Go 应用
+    同样受限。per-sandbox netns（`E2B_ENABLE_NETNS=true`，需
+    `NET_ADMIN` + ip_forward + veth MASQUERADE）仍是可选隔离增强。
   - 注意：需 worker 设置 `E2B_ENABLE_NETWORK=true`（默认 false 时全局
     拒绝出站，网络 API 策略不生效）；普通模式沙箱内 DNS 依赖 Sandlock 的
     hostname pinning，`allowOut` 用域名形式（如 `example.com:443`）最可靠；
