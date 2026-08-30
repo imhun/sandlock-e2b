@@ -229,9 +229,9 @@ def normalize_network_config(raw: Any) -> dict[str, Any] | None:
     rules = _normalize_rules(raw)
     # Wildcard domains (``*.example.com``) are expressible either through the
     # egress proxy library (in-sandbox filtering) or through the fork
-    # sandlock's net_allow + per-sandbox DNS gateway (the default,
-    # unprivileged shared-netns path; netns mode is an optional isolation
-    # enhancement, not a requirement for wildcard support).
+    # sandlock's net_allow + per-sandbox DNS gateway (the unprivileged
+    # shared-netns path; the fork tracks the netns-free upstream PR line, so
+    # there is no per-sandbox netns mode anymore).
     allow_out = _normalize_str_list(
         raw.get("allowOut"),
         "allowOut",

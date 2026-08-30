@@ -6,10 +6,10 @@
 
 ## ⚡ sandlock fork 交接总览（新会话从这里开始）
 
-**位置与分支**：`tmp/sandlock-src`（imhun/sandlock 0.8.6 fork；origin=fork，
-upstream=multikernel）。分支：`feature/network-wildcard`（R1–R4 通配规则，
-已合入 netns 分支）、`feature/network-netns`（当前主线：netns 可选增强 +
-无特权默认网关路径）。
+**位置与分支**：`third_party/sandlock`（imhun/sandlock fork 子模块，版本 0.9.0-beta；
+origin=fork，upstream=multikernel）。**运行时基线：`upstream-pr/netns-free-clean`
+（无 netns/veth 的无特权版本，全程无 root）**；`feature/network-socks5` 是
+含 per-sandbox netns 的旧主线，仅作参考，不再用于运行时 wheel。
 
 **已完成（Block A 全部）**：
 
@@ -18,31 +18,79 @@ upstream=multikernel）。分支：`feature/network-wildcard`（R1–R4 通配�
 - **默认路径（无特权）**：每沙箱 loopback DNS 网关（`127.0.0.x:53`）+
   resolv.conf memfd + connect/send 豁免；netlink 合成视图含虚拟 eth0
   （192.0.2.1/24 + 2001:db8::1/64）修复 glibc AI_ADDRCONFIG。
-- **可选隔离增强**：per-sandbox netns（veth + 网关代连），
-  `SandboxBuilder::netns(true)` / `E2B_ENABLE_NETNS`，默认关闭。
-- UDP 通配（send 路径）、HTTP ACL 代理经网关重定向、FFI/Python `netns`
-  绑定、wheel 可构建。
+- UDP 通配（send 路径）、HTTP ACL 代理经网关重定向、wheel 可构建。
+- **netns 已从运行时基线移除**：`upstream-pr/netns-free-clean` 删掉了
+  per-sandbox netns/veth（`network/netns.rs`、test_netns、`netns` flag/
+  FFI/Python），wildcard 全程走无特权共享路径；executor 不再传 `netns`
+  参数，`E2B_ENABLE_NETNS` 仅兼容保留（默认 false）。
 
 **sandlock 本身状态**：
 
 - **Block B（R8–R11）已完成**（`feature/network-inject`）；**Block C
   （R12–R14）已完成**（`feature/network-socks5`：SOCKS5 on-behalf 替代
   LD_PRELOAD，fail closed，ATYP=domain/IPv4/IPv6，RFC 1929）。
-- **上游 PR 已备好**：`upstream-pr/netns-free-clean`（单提交 `d3a28cc`，
-  基 `f6a3e39`，无 netns/veth）；**未推送**——当前 `GITHUB_TOKEN` 只读
-  （push/API 写均 403），需换写权限 token 或手动推送，见
-  `docs/upstream-pr-netns-free.md`。
-- **M6 部分完成**：cp311 x86_64 fork wheel 已提交 `wheels/fork/`，
-  Dockerfile 按 TARGETARCH 安装；aarch64 wheel 待网络/registry 恢复后构建
-  （Docker Hub 在本环境不可达）；cp310/312–314 未做。
+- **上游 PR 已备好**：`upstream-pr/netns-free-clean`（`d3a28cc` +
+  `55709f2`（Block C）+ `b6ef050`（非 root 测试入口），基 `f6a3e39`，
+  无 netns/veth；**同时是项目运行时 wheel 的构建基线**）；**未推送**——
+  当前 `GITHUB_TOKEN` 只读（push/API 写均 403），需换写权限 token 或
+  手动推送，见 `docs/upstream-pr-netns-free.md`。
+- **M6 cp314 双架构完成 + 运行时统一 3.14**：`wheels/fork/` 现有 cp314
+  x86_64 + aarch64 wheel（版本 0.9.0-beta，`manylinux_2_34` 标签；
+  `scripts/build-sandlock-wheels.sh`，一个 amd64 manylinux builder 内用
+  **zig 交叉编译**两个架构，zig glibc pin 2.34 + auditwheel 修复，无需
+  QEMU 编译；镜像源：apt=清华、rustup/crates=rsproxy、pip=清华）；worker/
+  control-plane/test-runner 与 `E2B_BASE_IMAGE` 默认模板统一切到
+  `python:3.14-slim`，Dockerfile 按镜像内 CPython ABI 选 wheel
+  （cp 矩阵混放不会选错）；fork 侧 build.rs 加 `-mcmodel=large`
+  （manylinux gcc-toolset-14 下 restore-stub 的 32 位绝对重定位溢出）；
+  cp310/312–313 未做。
 
 **未完成（项目侧 sandlock 落地）**：
 
-- worker/测试镜像的 sandlock 来源切到 fork wheel（当前仍装 PyPI
-  `sandlock==0.8.6`；`E2B_ENABLE_NETNS` 与 executor `netns` 参数需 fork
-  wheel 才有效，切源前保持默认关闭）。
-- security 通配 e2e（fork wheel + privileged worker 下跑
-  `tests/security` 新增用例）、迁移（跨 worker netns 重建）验证。
+- 3.14 + netns-free wheel 下全量回归（unit/contract/security/sdk 已跑，
+  见下）；worker/测试镜像已切 fork wheel（0.9.0b0 manylinux_2_34）。
+- 上游 PR 推送（换写权限 token）+ 上游合入后回切官方 wheel 的流程。
+
+**e2b 对接覆盖（补齐 5 个缺口，`tests/security/test_fork_network_features.py`）**：
+
+- 通配 `allowOut` 走无特权 DNS 网关 + 合成 IP + supervisor 代连（198.18.0.99
+  loopback 别名 fixture，SSRF 护栏放行段；test-runner 已装 iproute2）；
+- HTTP 注入 + `maskRequestHost` 在 origin 侧断言 wire 头（`Host` 改写、
+  字面量 secret 与 `${e2b.identity.tokens.*}` env token 各一条；fork 注入
+  是 first-match-wins，一个 matcher 一条 header）；
+- 镜像 rootfs 模式下 HTTPS MITM CA splice（`.e2b-ca` + `SSL_CERT_FILE`）；
+- 沙箱子进程恒为 uid/gid 1000（无 root 断言）。
+
+**fork 改动：多 header 注入**（`transparent_proxy/service.rs`）：注入循环去掉
+`break`，同一 matcher 的多条 credential 规则全部应用（此前 first-match-wins，
+`transform.headers` 多 header 只有第一个生效）；同 header 名多条规则按序
+后者覆盖，AddOnly 语义不变；新增 hermetic 用例
+`http_injects_multiple_credentials_per_request`（Linux 容器跑通）。wheel 已
+重建（0.9.0b0 manylinux_2_34 双架构），e2b 测试改为单规则双 header 组合断言。
+
+**生产形态验证（seccomp）**：`unshare(CLONE_NEWUSER)` 会被 Docker 默认
+seccomp profile 以 EPERM 拦截（capability 无法绕过），所以 worker 容器必须
+`security_opt: [seccomp=unconfined]`（compose 已有）。已新增
+`scripts/smoke-prod-worker.sh`：非 privileged + seccomp=unconfined 形态下跑
+沙箱创建（无 root）、rootfs chroot（CA splice）、SOCKS5 出口三个用例，
+实测 3 passed。**全量测试套件已切非特权形态**：`--security-opt
+seccomp=unconfined --cap-add NET_ADMIN --network host`（无 `--privileged`），
+257 passed；`--network host` 仅 registry/Redis 测试基础设施需要（Docker
+daemon 只对 localhost 默认放行 HTTP registry），`NET_ADMIN` 仅通配域名
+本地 origin fixture 需要。顺带修了 authenticated_registry fixture 的
+htpasswd 路径 bug：容器内写文件必须走 `/workspace` 挂载视图（daemon 在
+宿主解析 `-v` 源路径，写宿主绝对路径会落进容器自身文件系统、daemon 在
+宿主建目录导致 registry 登录 400）。
+
+**iam（SDK 工作负载身份）已实现**：控制面 create 接受 `iam.tokens`
+（兼容 wire 的 camelCase `tokenType` 与 snake_case），存到沙箱记录并透传
+worker；executor 在注入时把 `${e2b.identity.tokens.<name>}` 占位符（含
+`Bearer ${...}` 内嵌形式）替换为 HS256 JWT-SVID（aud=audience，
+`E2B_IAM_SIGNING_KEY` 签名，默认本地开发密钥），env `E2B_IDENTITY_TOKEN_*`
+作为回退；新增契约测试（接受/非法 name/token 拒绝）、单元 JWT 签发测试、
+SDK iam 端到端（origin 收到 `Authorization: Bearer <jwt>` 且 aud 正确）。
+另发现并规避：同步 e2b SDK 会阻塞测试事件循环，harness 用例里的本地
+origin 需跑在后台线程。
 
 **验证基线（fork，Linux 容器，全程非 root uid=65534）**：lib
 `780 passed, 0 failed`（feature/network-socks5；netns-free PR 分支
@@ -81,8 +129,8 @@ upstream=multikernel）。分支：`feature/network-wildcard`（R1–R4 通配�
   e2e 测试用本地 fixture（worker /etc/hosts → 198.18.0.9x）不依赖外网。
 
 **下一步**：① 换写权限 token 推送 `upstream-pr/netns-free-clean` 并开上游
-PR；② 构建 aarch64 wheel（网络恢复后）+ cp310/312–314 矩阵；③ 全量双架构
-回归 + 生产镜像重建验证。
+PR；② cp310/312–313 wheel 矩阵（沿用 zig 交叉编译流程）；③ 3.14 全量双架构
+回归 + 生产镜像重建验证（worker/测试镜像已切 fork wheel）。
 
 ## 本会话已完成（Block B — header 注入 / maskRequestHost / HTTP 通配）
 
@@ -140,11 +188,12 @@ fork 分支 `feature/network-inject`（基于 feature/network-netns）：
    netns pipe、sandbox veth 阶段、`netns` flag/FFI/Python、VethView、
    CLONE_NEWNET），保留无特权 loopback DNS gateway + 虚拟 eth0 +
    wildcard/UDP + Block B + Block C；lib 761、integration 428、Python 412。
-   **未推送**（token 只读）；PR 文案见 `docs/upstream-pr-netns-free.md`。
+   已推送 `origin/upstream-pr/netns-free-clean`（tip `53a8ee2`）；PR 文案见
+   `docs/upstream-pr-netns-free.md`。
 
 ## 本会话已完成（Block A 第一阶段 — sandlock fork：通配域名规则）
 
-1. **fork 基线（M0）**：`tmp/sandlock-src`（imhun/sandlock，0.8.6，
+1. **fork 基线（M0）**：`third_party/sandlock`（imhun/sandlock 子模块，0.8.6 起步，
    origin=fork / upstream=multikernel）。构建链：
    `sandlock-dev:latest`（e2b-sandlock-test + rustup/rsproxy）；容器内
    `cargo build --workspace --offline`（宿主 `~/.cargo/registry` 挂载做
@@ -416,7 +465,7 @@ docker run --rm --privileged --network host \
 ```bash
 # 1) 一次性 root 构建（FFI/测试二进制；入口脚本会 chmod 共享 target）
 docker run --rm --privileged --network host --user root --entrypoint bash \
-  -v "$(pwd)/tmp/sandlock-src:/src" \
+  -v "$(pwd)/third_party/sandlock:/src" \
   -v ~/.cargo/registry:/opt/cargo/registry \
   -v "$(pwd)/tmp/sandlock-dev/cargo-config.toml:/opt/cargo/config.toml" \
   -w /src sandlock-dev:latest -c '
@@ -426,7 +475,7 @@ docker run --rm --privileged --network host --user root --entrypoint bash \
 # 2) 全程非 root 测试（入口 root 准备后自动降权 nobody；命令用 bash -c，
 #    不要 bash -lc —— login shell 会重置 PATH）
 docker run --rm --privileged --network host \
-  -v "$(pwd)/tmp/sandlock-src:/src" \
+  -v "$(pwd)/third_party/sandlock:/src" \
   -v ~/.cargo/registry:/opt/cargo/registry \
   -v "$(pwd)/tmp/sandlock-dev/cargo-config.toml:/opt/cargo/config.toml" \
   -w /src sandlock-dev:latest bash -c '

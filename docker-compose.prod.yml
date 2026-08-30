@@ -47,7 +47,7 @@ services:
       E2B_IMAGE_REGISTRY: ${E2B_IMAGE_REGISTRY:-}
       E2B_IMAGE_REGISTRY_USERNAME: ${E2B_IMAGE_REGISTRY_USERNAME:-}
       E2B_IMAGE_REGISTRY_PASSWORD: ${E2B_IMAGE_REGISTRY_PASSWORD:-}
-      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.11-slim}
+      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
       E2B_MAX_SANDBOXES: ${E2B_MAX_SANDBOXES:-100}
       E2B_MAX_TOTAL_MEMORY_MB: ${E2B_MAX_TOTAL_MEMORY_MB:-8192}
       E2B_MAX_TOTAL_CPU_PERCENT: ${E2B_MAX_TOTAL_CPU_PERCENT:-400}
@@ -91,10 +91,11 @@ services:
       # Per-sandbox network policies (allowOut/denyOut/egressProxy) are only
       # enforced when the platform switch is on.
       E2B_ENABLE_NETWORK: "true"
-      # Per-sandbox netns (fork sandlock): loopback isolation + wildcard
-      # allowOut. Requires NET_ADMIN + net.ipv4.ip_forward (below).
-      E2B_ENABLE_NETNS: ${E2B_ENABLE_NETNS:-true}
-      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.11-slim}
+      # Fork sandlock now tracks the netns-free upstream PR line; wildcard
+      # allowOut works on the unprivileged shared-netns path, so netns is
+      # gone and E2B_ENABLE_NETNS is accepted but ignored.
+      E2B_ENABLE_NETNS: ${E2B_ENABLE_NETNS:-false}
+      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_IMAGE_REGISTRY_USERNAME: ${E2B_IMAGE_REGISTRY_USERNAME:-}
       E2B_IMAGE_REGISTRY_PASSWORD: ${E2B_IMAGE_REGISTRY_PASSWORD:-}
@@ -107,9 +108,7 @@ services:
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
     cap_add:
       - SYS_ADMIN
-      - NET_ADMIN
     sysctls:
-      - net.ipv4.ip_forward=1
       # The wildcard DNS gateway binds 127.0.1.x:53; resolv.conf cannot carry
       # a port, so allow unprivileged low-port binding (namespaced per
       # container). This is the one deployment knob the sandlock fork needs.

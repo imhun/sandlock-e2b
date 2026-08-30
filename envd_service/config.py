@@ -27,6 +27,11 @@ class Settings:
     enable_netns: bool = field(
         default_factory=lambda: _env_bool("E2B_ENABLE_NETNS", False)
     )
+    iam_signing_key: str = field(
+        default_factory=lambda: os.getenv(
+            "E2B_IAM_SIGNING_KEY", "e2b-sandlock-local-iam-key"
+        )
+    )
     default_memory_mb: int = field(
         default_factory=lambda: _env_int("E2B_DEFAULT_MEMORY_MB", 512)
     )

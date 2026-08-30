@@ -1,6 +1,6 @@
 """Sandlock executor: Landlock + seccomp-bpf + seccomp user notification.
 
-Requires Linux with Landlock ABI >= 6 and ``sandlock==0.8.6``. The Sandbox
+Requires Linux with Landlock ABI >= 6 and ``sandlock==0.9.0-beta``. The Sandbox
 instance policy maps directly from the E2B sandbox configuration (spec
 section 6.4). A fresh Sandbox instance is created per command, matching
 sandlock's one-running-process-per-instance contract; the E2B sandbox
@@ -270,6 +270,8 @@ class SandlockExecutor(Executor):
         enable_network: bool,
         enable_netns: bool = False,
         network: dict | None = None,
+        iam_tokens: dict[str, dict[str, str]] | None = None,
+        iam_signing_key: str | None = None,
         secrets_dir: str | Path | None = None,
         extra_fs_writable: list[str] | None = None,
         fs_mounts: dict[str, str] | None = None,
@@ -284,8 +286,14 @@ class SandlockExecutor(Executor):
         self._max_open_files = max_open_files
         self._allow_internet_access = allow_internet_access
         self._enable_network = enable_network
+        # Accepted for config compatibility (E2B_ENABLE_NETNS), but the fork
+        # now tracks the upstream PR line (upstream-pr/netns-free-clean),
+        # which dropped per-sandbox netns/veth: wildcard rules and isolation
+        # run on the unprivileged shared-netns path, so this flag is a no-op.
         self._enable_netns = enable_netns
         self._network = dict(network) if network else None
+        self._iam_tokens = dict(iam_tokens or {})
+        self._iam_signing_key = iam_signing_key or "e2b-sandlock-local-iam-key"
         self._secrets_dir = Path(secrets_dir) if secrets_dir else None
         self._extra_fs_writable = list(extra_fs_writable or [])
         self._fs_mounts = dict(fs_mounts or {})
@@ -302,10 +310,13 @@ class SandlockExecutor(Executor):
 
         A literal value becomes a supervisor-only secret file (mode 0600,
         never granted to the sandbox); a ``${e2b.identity.tokens.<NAME>}``
-        placeholder maps to the ``E2B_IDENTITY_TOKEN_<NAME>`` env var of the
-        worker (platform-injected secret). Raises when a placeholder has no
-        backing env var, so a misconfigured IAM secret fails at sandbox
-        creation instead of silently sending the request unauthenticated.
+        placeholder resolves either from the sandbox's registered ``iam``
+        workload tokens (minting a JWT-SVID for the audience) or, as a
+        fallback, from the ``E2B_IDENTITY_TOKEN_<NAME>`` env var of the
+        worker (platform-injected literal secret). Raises when a placeholder
+        has no backing source, so a misconfigured IAM secret fails at
+        sandbox creation instead of silently sending the request
+        unauthenticated.
         """
         if not entries:
             return []
@@ -319,32 +330,94 @@ class SandlockExecutor(Executor):
             value = str(entry["value"])
             import re
 
-            m = re.fullmatch(r"\$\{e2b\.identity\.tokens\.([A-Za-z0-9_]+)\}", value)
-            if m is not None:
+            placeholder = re.compile(
+                r"\$\{e2b\.identity\.tokens\.([A-Za-z0-9_]+)\}"
+            )
+            m = placeholder.fullmatch(value)
+            if m is not None and m.group(1) not in self._iam_tokens:
+                # Pure env-backed placeholder: keep the supervisor env source
+                # (sandlock reads it at build time) instead of a file.
                 var = f"E2B_IDENTITY_TOKEN_{m.group(1)}"
                 if var not in os.environ:
                     raise RuntimeError(
                         f"header transform for {entry['matcher']} references "
-                        f"identity token {m.group(1)!r} but {var} is not set"
+                        f"identity token {m.group(1)!r} but {var} is not set "
+                        f"(and no iam token named {m.group(1)!r} was registered)"
                     )
                 entry = dict(entry)
                 entry.pop("value", None)
                 entry["secret"] = f"env:{var}"
-            else:
-                secret_dir = self._secrets_dir / os.path.basename(
-                    self._workspace_dir.rstrip("/")
-                )
-                secret_dir.mkdir(parents=True, exist_ok=True)
-                path = secret_dir / f"{entry['name']}.secret"
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(value)
-                os.chmod(path, 0o600)
-                entry = dict(entry)
-                entry.pop("value", None)
-                entry["secret"] = f"file:{path}"
+                out.append(entry)
+                continue
+            if "${e2b.identity.tokens." in value:
+
+                def _resolve(mm: re.Match) -> str:
+                    name = mm.group(1)
+                    token_cfg = self._iam_tokens.get(name)
+                    if token_cfg is not None:
+                        # SDK workload identity (iam=...): mint a JWT-SVID for
+                        # the requested audience (supports "Bearer ${...}").
+                        return self._mint_iam_jwt(
+                            audience=str(token_cfg.get("audience", ""))
+                        )
+                    var = f"E2B_IDENTITY_TOKEN_{name}"
+                    if var in os.environ:
+                        return os.environ[var]
+                    raise RuntimeError(
+                        f"header transform for {entry['matcher']} references "
+                        f"identity token {name!r} but {var} is not set "
+                        f"(and no iam token named {name!r} was registered)"
+                    )
+
+                value = placeholder.sub(_resolve, value)
+            secret_dir = self._secrets_dir / os.path.basename(
+                self._workspace_dir.rstrip("/")
+            )
+            secret_dir.mkdir(parents=True, exist_ok=True)
+            path = secret_dir / f"{entry['name']}.secret"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(value)
+            os.chmod(path, 0o600)
+            entry = dict(entry)
+            entry.pop("value", None)
+            entry["secret"] = f"file:{path}"
             out.append(entry)
         return out
 
+    def _mint_iam_jwt(self, audience: str) -> str:
+        """Mint a JWT-SVID for a registered workload identity.
+
+        Local compatible layer: HS256-signed with the worker's IAM signing key
+        (``E2B_IAM_SIGNING_KEY``), carrying the requested audience. Upstreams
+        that validate must be configured with the same key.
+        """
+        import base64
+        import hashlib
+        import hmac
+        import json
+        import time
+
+        def _b64(data: bytes) -> bytes:
+            return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+        header = _b64(b'{"alg":"HS256","typ":"JWT"}')
+        now = int(time.time())
+        payload = _b64(
+            json.dumps(
+                {
+                    "aud": audience,
+                    "iss": "e2b-sandlock",
+                    "iat": now,
+                    "exp": now + 600,
+                },
+                separators=(",", ":"),
+            ).encode()
+        )
+        signing_input = header + b"." + payload
+        sig = hmac.new(
+            self._iam_signing_key.encode(), signing_input, hashlib.sha256
+        ).digest()
+        return (signing_input + b"." + _b64(sig)).decode()
     @staticmethod
     def resolve_cmd(cmd: list[str]) -> list[str]:
         """Translate ``/bin/bash`` to ``/bin/sh`` when bash is unavailable
@@ -415,7 +488,6 @@ class SandlockExecutor(Executor):
             "max_processes": self._max_processes,
             "max_open_files": self._max_open_files,
             "max_cpu": min(100, max(1, self._cpu_percent)),
-            "netns": self._enable_netns,
             "clean_env": True,
             "env": dict(config.env),
             "cwd": config.cwd,

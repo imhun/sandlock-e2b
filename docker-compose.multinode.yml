@@ -15,7 +15,7 @@ services:
       E2B_IMAGE_REGISTRY_USERNAME: ""
       E2B_IMAGE_REGISTRY_PASSWORD: ""
       E2B_MAX_SANDBOXES: 100
-      E2B_BASE_IMAGE: python:3.11-slim
+      E2B_BASE_IMAGE: python:3.14-slim
       E2B_DEFAULT_MEMORY_MB: 512
       E2B_DEFAULT_CPU_PERCENT: 100
       E2B_DEFAULT_DISK_MB: 1024
@@ -50,7 +50,7 @@ services:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-1:49983
       E2B_NODE_ID: worker-1
-      E2B_BASE_IMAGE: python:3.11-slim
+      E2B_BASE_IMAGE: python:3.14-slim
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_NODE_MEMORY_MB: 2048
@@ -73,7 +73,7 @@ services:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-2:49983
       E2B_NODE_ID: worker-2
-      E2B_BASE_IMAGE: python:3.11-slim
+      E2B_BASE_IMAGE: python:3.14-slim
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_NODE_MEMORY_MB: 2048
@@ -96,7 +96,7 @@ services:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-3:49983
       E2B_NODE_ID: worker-3
-      E2B_BASE_IMAGE: python:3.11-slim
+      E2B_BASE_IMAGE: python:3.14-slim
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_NODE_MEMORY_MB: 2048

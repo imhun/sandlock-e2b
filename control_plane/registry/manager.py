@@ -65,6 +65,7 @@ class SandboxRecord:
     volume_mounts: list[dict[str, str]] = field(default_factory=list)
     mcp: dict[str, Any] | None = None
     network: dict[str, Any] | None = None
+    iam_tokens: dict[str, dict[str, str]] = field(default_factory=dict)
     logs: list[dict[str, str]] = field(default_factory=list)
     metrics: list[dict[str, Any]] = field(default_factory=list)
     node_id: str = "local"
@@ -182,6 +183,7 @@ class SandboxRecord:
             "volume_mounts": self.volume_mounts,
             "mcp": self.mcp,
             "network": self.network,
+            "iam_tokens": self.iam_tokens,
             "node_id": self.node_id,
         }
 
@@ -219,6 +221,7 @@ class SandboxRecord:
             volume_mounts=list(data.get("volume_mounts", [])),
             mcp=data.get("mcp"),
             network=data.get("network"),
+            iam_tokens=dict(data.get("iam_tokens", {})),
             node_id=data.get("node_id", "local"),
         )
 
@@ -395,6 +398,7 @@ class SandboxRegistry:
         volume_mounts: list[dict[str, str]] | None = None,
         mcp: dict[str, Any] | None = None,
         network: dict[str, Any] | None = None,
+        iam_tokens: dict[str, dict[str, str]] | None = None,
     ) -> SandboxRecord:
         s = self._settings
         timeout = timeout if timeout is not None else s.default_timeout
@@ -445,6 +449,7 @@ class SandboxRegistry:
                 volume_mounts=list(volume_mounts or []),
                 mcp=dict(mcp) if mcp else None,
                 network=dict(network) if network else None,
+                iam_tokens=dict(iam_tokens or {}),
             )
             self._reserve(record)
         if self._quota_store is not None:
@@ -468,6 +473,7 @@ class SandboxRegistry:
                 volume_mounts=list(volume_mounts or []),
                 mcp=dict(mcp) if mcp else None,
                 network=dict(network) if network else None,
+                iam_tokens=dict(iam_tokens or {}),
             )
             self._record_store.put(
                 record.sandbox_id,

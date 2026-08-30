@@ -8,8 +8,8 @@ services:
       E2B_ENABLE_LOCAL_NODE: "false"
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_MAX_SANDBOXES: 100
-      E2B_BASE_IMAGE: python:3.11-slim
-      E2B_TEMPLATE_IMAGES: '{"python3.12": "python:3.12-slim", "node22": "node:22-slim"}'
+      E2B_BASE_IMAGE: python:3.14-slim
+      E2B_TEMPLATE_IMAGES: '{"python3.14": "python:3.14-slim", "node22": "node:22-slim"}'
       E2B_DEFAULT_MEMORY_MB: 512
       E2B_DEFAULT_CPU_PERCENT: 100
       E2B_DEFAULT_DISK_MB: 1024

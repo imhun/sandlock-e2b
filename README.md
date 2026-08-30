@@ -59,8 +59,8 @@ sandbox.kill()
 | L1 单元 + L2 契约 | `pytest tests/unit tests/contract` | macOS / Ubuntu |
 | L3 Python SDK | `pytest tests/sdk/python` | Linux test runner（Sandlock）；macOS 可用 Local 执行器跑通协议 |
 | L3 JS SDK | `pytest tests/sdk/js`（内部 `npm test`） | macOS / Linux；首次需 `cd tests/sdk/js && npm install` |
-| L4 安全 | `E2B_BASE_IMAGE=python:3.11-slim pytest tests/security` | Linux 6.12+ + Docker daemon |
-| L5 性能 | `E2B_BASE_IMAGE=python:3.11-slim pytest tests/perf --perf` | Linux + Docker；profile 写入 `tmp/perf/` |
+| L4 安全 | `E2B_BASE_IMAGE=python:3.14-slim pytest tests/security` | Linux 6.12+ + Docker daemon |
+| L5 性能 | `E2B_BASE_IMAGE=python:3.14-slim pytest tests/perf --perf` | Linux + Docker；profile 写入 `tmp/perf/` |
 
 Linux test runner：
 
@@ -69,13 +69,16 @@ docker compose -f docker-compose.test.yml build
 docker compose -f docker-compose.test.yml run --rm test-runner pytest tests/sdk/python
 ```
 
-全量验收（含 Docker registry 分发测试）建议直接跑容器，并加
-`--network host`，让测试容器能访问 Docker daemon 动态映射的本地端口
-（registry/Redis 容器绑定在宿主 localhost）：
+全量验收直接跑容器，**非特权形态**：不挂 `--privileged`，改用
+`seccomp=unconfined`（sandlock 需要用户命名空间，Docker 默认 seccomp 会
+EPERM）+ `--cap-add NET_ADMIN`（仅通配域名本地 origin fixture 需要在 lo
+挂 198.18.0.99）。`--network host` 仅用于测试基础设施（registry/Redis 容器
+发布在宿主 localhost，Docker daemon 也只对 localhost 默认放行 HTTP
+registry），不是 sandlock 的需要：
 
 ```bash
-docker run --rm --privileged --network host \
-  -e E2B_BASE_IMAGE=python:3.11-slim \
+docker run --rm --security-opt seccomp=unconfined --cap-add NET_ADMIN --network host \
+  -e E2B_BASE_IMAGE=python:3.14-slim \
   -e E2B_HOST_PROJECT="$(pwd)" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$(pwd):/workspace" -w /workspace \
@@ -139,6 +142,13 @@ E2B_API_URL=http://127.0.0.1:3000 \
 E2B_SANDBOX_URL=http://127.0.0.1:49983 \
 E2B_API_KEY=local-key \
 python scripts/deployment_smoke.py
+```
+
+生产形态容器冒烟（非 privileged + `seccomp=unconfined`，验证沙箱创建 /
+rootfs chroot / SOCKS5 出口，与 compose 部署一致）：
+
+```bash
+./scripts/smoke-prod-worker.sh
 ```
 
 要点：
@@ -288,13 +298,16 @@ SDK → Envd Gateway :49983（按 E2b-Sandbox-Id 路由代理）
     映射到 sandlock 的 `host_mask`（改写 wire Host，`${PORT}` 替换）与
     `http_inject`（credential 注入，secret 只存 supervisor；字面值落
     supervisor-only 0600 文件，`${e2b.identity.tokens.*}` 映射
-    `E2B_IDENTITY_TOKEN_*` env）。
+    `E2B_IDENTITY_TOKEN_*` env；若沙箱注册了 `iam` 工作负载令牌
+    （`Sandbox.create(iam={"tokens": {...}})`），占位符会替换为签发的
+    JWT-SVID，签名密钥 `E2B_IAM_SIGNING_KEY`，默认本地开发密钥）。
   - **通配域名**：普通模式（无需 egressProxy / netns）经每沙箱 loopback
     DNS 网关（`127.0.1.x:53`，需一次 `net.ipv4.ip_unprivileged_port_start=0`
     或 `CAP_NET_BIND_SERVICE`）把通配子域解析为合成 IP，connect 由
     supervisor 代连并二次校验（SSRF 护栏拒绝私网/回环），静态/Go 应用
-    同样受限。per-sandbox netns（`E2B_ENABLE_NETNS=true`，需
-    `NET_ADMIN` + ip_forward + veth MASQUERADE）仍是可选隔离增强。
+    同样受限。fork 已切到上游 PR 的无 netns 版本（netns-free），
+    `E2B_ENABLE_NETNS` 仅作兼容保留、不再生效，全程无需 root /
+    `NET_ADMIN`。
   - 注意：需 worker 设置 `E2B_ENABLE_NETWORK=true`（默认 false 时全局
     拒绝出站，网络 API 策略不生效）；普通模式沙箱内 DNS 依赖 Sandlock 的
     hostname pinning，`allowOut` 用域名形式（如 `example.com:443`）最可靠；
@@ -355,6 +368,6 @@ Redis WATCH 事务（原子，跨进程不超用），TTL 扫描跨副本一致�
   建议指向节点本地盘（默认 `tmp/sandboxes/_images` 为相对 cwd 的本地
   路径），与共享的 `E2B_WORKSPACE_BASE` 解耦——**workspace 只存用户文件，
   镜像 rootfs 始终在节点本地存储**。缓存目录名包含镜像 digest
-  （`{image}-{sha256 前缀}`），基础镜像 tag 更新（如 `python:3.11-slim`
+  （`{image}-{sha256 前缀}`），基础镜像 tag 更新（如 `python:3.14-slim`
   出新版）后自动落到新目录，不会误用旧 rootfs；旧 digest 目录保留，
   需要时手动清理 `E2B_IMAGE_CACHE_DIR` 下的历史目录。

@@ -164,8 +164,10 @@ python3 -c "import sandlock; print(sandlock.landlock_abi_version())"
 | `secure` | 始终启用并返回 `envdAccessToken` |
 | `allow_internet_access` | 映射到 Sandlock 网络策略 |
 | `image`（非官方字段） | 不支持，返回 `400 Error` |
-| `network` | 支持 `allowOut`/`denyOut`/`allowPublicTraffic`/`rules`（域名级 HTTP ACL）/`egressProxy`（SOCKS5 隧道）；`maskRequestHost`/`rules.transform`（header 改写）返回 `400` |
-| `iam`、`mcp`、`volumeMounts` | 不支持，返回 `400 Error` |
+| `network` | 支持 `allowOut`/`denyOut`/`allowPublicTraffic`/`rules`（域名级 HTTP ACL）/`maskRequestHost`/`rules.transform.headers`（header 注入）/`egressProxy`（SOCKS5 隧道，含 username/password） |
+| `iam` | 支持：`{tokens: {name: {audience, tokenType}}}`；`${e2b.identity.tokens.<name>}` 占位符在代理内替换为签发的 JWT-SVID（HS256，`E2B_IAM_SIGNING_KEY`，默认本地开发密钥） |
+| `mcp` | 支持：base stdio server（command）；GitHub MCP 返回 `400` |
+| `volumeMounts` | 支持：挂载到 rootfs 内 `/home/user/<path>`（或工作区符号链接） |
 
 模板与基础镜像映射：
 

@@ -307,7 +307,7 @@ LD_PRELOAD 是沙箱进程内的用户态 hook：
 - 构建工具：`setuptools-rust`（仓库自带 `python/setup.py`）；
 - 必须产出的 wheel 矩阵（与官方 0.8.6 对齐）：
   - Python：cp310 / cp311 / cp312 / cp313 / cp314；
-  - 平台：`manylinux_2_28_x86_64` + `manylinux_2_28_aarch64`；
+  - 平台：`manylinux_2_34_x86_64` + `manylinux_2_34_aarch64`；
 - 发布方式二选一：
   a. 私有 wheel index（如 `pip index`/`devpi`/OSS 私有桶），Dockerfile 指向；
   b. 镜像构建时从 fork 源码 `pip install git+https://github.com/<org>/sandlock@<rev>`

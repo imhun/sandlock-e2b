@@ -1,6 +1,6 @@
 # Control plane final image: API + registry + scheduler only.
 # The worker (Dockerfile.envd) runs sandboxes; this image never does.
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 WORKDIR /app
 

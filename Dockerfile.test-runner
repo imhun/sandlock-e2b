@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 RUN sed -i \
         's|http://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g; s|http://security.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
@@ -9,6 +9,7 @@ RUN sed -i \
     iptables \
     gcc \
     libc6-dev \
+    iproute2 \
     redis-server \
     bash \
     git \
@@ -20,18 +21,24 @@ COPY requirements-test.txt /tmp/requirements-test.txt
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-test.txt
 
 # The sandlock Python test suite (and the sandboxes it spawns) exec the
-# system interpreter at /usr/bin/python3; the python:3.11-slim image installs
+# system interpreter at /usr/bin/python3; the python:3.14-slim image installs
 # it under /usr/local, so expose the conventional path.
 RUN ln -sf /usr/local/bin/python3 /usr/bin/python3
 
-# sandlock fork wheel (Block A/B/C) — see Dockerfile.envd for the arch mapping.
+# sandlock fork wheel (Block A/B/C) — see Dockerfile.envd for the mapping;
+# the pick is scoped to the image's own CPython ABI + TARGETARCH.
 ARG TARGETARCH
 COPY wheels/fork/ /tmp/wheels/
-RUN SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-linux_$(case "$TARGETARCH" in \
+RUN PY_ABI=$(python3 -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")') \
+    && ARCH_SUFFIX=$(case "$TARGETARCH" in \
         amd64) echo x86_64 ;; \
         arm64) echo aarch64 ;; \
         *) echo "$TARGETARCH" ;; \
-    esac).whl 2>/dev/null || ls /tmp/wheels/*.whl | head -1) \
+    esac) \
+    && SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-${PY_ABI}-${PY_ABI}-manylinux*${ARCH_SUFFIX}.whl 2>/dev/null | head -1) \
+    && [ -n "$SANLOCK_WHL" ] || SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-${PY_ABI}-${PY_ABI}-linux_${ARCH_SUFFIX}.whl 2>/dev/null | head -1) \
+    && [ -n "$SANLOCK_WHL" ] || SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-${PY_ABI}-${PY_ABI}-*.whl 2>/dev/null | head -1) \
+    && [ -n "$SANLOCK_WHL" ] || SANLOCK_WHL=$(ls /tmp/wheels/*.whl | head -1) \
     && pip install --no-cache-dir "$SANLOCK_WHL" \
     && rm -rf /tmp/wheels
 

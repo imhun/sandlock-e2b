@@ -5,15 +5,22 @@ services:
       dockerfile: Dockerfile.test-runner
     image: e2b-sandlock-test:latest
     working_dir: /workspace
-    privileged: true
+    # Non-privileged production shape: seccomp must be unconfined (sandlock
+    # needs a user namespace; Docker's default profile would EPERM it),
+    # NET_ADMIN for the wildcard local-origin fixture, host network for
+    # registry/Redis localhost ports.
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - NET_ADMIN
+    network_mode: host
     environment:
       E2B_API_KEY: local-key
       E2B_API_URL: http://127.0.0.1:3000
       E2B_SANDBOX_URL: http://127.0.0.1:49983
-      E2B_BASE_IMAGE: python:3.11-slim
+      E2B_BASE_IMAGE: python:3.14-slim
       E2B_WORKSPACE_BASE: /workspace/tmp/sandboxes
     volumes:
       - .:/workspace
       - /var/run/docker.sock:/var/run/docker.sock
     command: pytest tests/sdk/python
-

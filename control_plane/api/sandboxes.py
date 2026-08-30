@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Unsupported fields that must produce an explicit 400 (no fake success).
-UNSUPPORTED_FIELDS = ("image", "iam", "lifecycle")
+UNSUPPORTED_FIELDS = ("image", "lifecycle")
 UNSUPPORTED_ENDPOINTS = ()
 
 
@@ -49,6 +49,56 @@ def _unsupported_field_error(field: str) -> OfficialError:
 
 def _unsupported_endpoint_error(feature: str) -> OfficialError:
     return OfficialError(501, f"Unsupported: {feature}")
+
+
+def _normalize_iam(body: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """Validate the SDK workload-identity config (``iam``).
+
+    Wire shape: ``{"tokens": {"<name>": {"audience": str, "tokenType": str}}}``
+    (the SDK serializes the client model with camelCase; ``token_type`` is
+    accepted too).
+    Token names must be placeholder-safe (no ``{``/``}``/control chars) because
+    they are interpolated into ``${e2b.identity.tokens.<name>}`` header values.
+    """
+    iam = body.get("iam")
+    if iam is None:
+        return {}
+    if not isinstance(iam, dict):
+        raise OfficialError(400, "iam must be an object")
+    tokens = iam.get("tokens")
+    if tokens is None:
+        return {}
+    if not isinstance(tokens, dict):
+        raise OfficialError(400, "iam.tokens must be an object")
+    out: dict[str, dict[str, str]] = {}
+    for name, token in tokens.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or any(c in name for c in "{}")
+            or any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in name)
+        ):
+            raise OfficialError(
+                400,
+                f"iam token name {name!r} is not usable: must be a non-empty "
+                "string without '{', '}' or control characters",
+            )
+        token_type = token.get("token_type", token.get("tokenType"))
+        if (
+            not isinstance(token, dict)
+            or not isinstance(token.get("audience"), str)
+            or not isinstance(token_type, str)
+        ):
+            raise OfficialError(
+                400,
+                f"iam token {name!r} must be an object with string "
+                "'audience' and 'token_type' values",
+            )
+        out[name] = {
+            "audience": token["audience"],
+            "token_type": token_type,
+        }
+    return out
 
 
 for _feature in UNSUPPORTED_ENDPOINTS:
@@ -261,6 +311,7 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
         network = normalize_network_config(body.get("network"))
     except NetworkConfigError as e:
         raise OfficialError(400, str(e))
+    iam_tokens = _normalize_iam(body)
 
     registry = _registry(request)
     secrets = request.app.state.secrets
@@ -287,6 +338,7 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
             volume_mounts=volume_mounts,
             mcp=dict(mcp) if mcp is not None else None,
             network=network,
+            iam_tokens=iam_tokens,
         )
     except ResourceUnavailableError as e:
         raise OfficialError(503, str(e))
@@ -406,6 +458,7 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
         volume_mounts=mount_paths,
         mcp=record.mcp,
         network=record.network,
+        iam_tokens=record.iam_tokens,
         allow_public_traffic=bool(
             (record.network or {}).get("allowPublicTraffic", False)
         ),
@@ -444,6 +497,7 @@ async def _provision_remote(
             for m in volume_mounts
         ],
         "mcp": record.mcp,
+        "iamTokens": record.iam_tokens,
         "snapshotTar": None,
         "snapshotID": snapshot_id,
     }

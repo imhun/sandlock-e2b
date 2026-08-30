@@ -37,6 +37,7 @@ class RuntimeSandbox:
     mcp: dict | None = None
     network: dict | None = None
     allow_public_traffic: bool = False
+    iam_tokens: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -89,6 +90,7 @@ class RuntimeRegistry:
         mcp: dict | None = None,
         network: dict | None = None,
         allow_public_traffic: bool = False,
+        iam_tokens: dict[str, dict[str, str]] | None = None,
     ) -> RuntimeSandbox:
         if not validate_sandbox_id(sandbox_id):
             raise ValueError(f"invalid sandbox id: {sandbox_id}")
@@ -109,6 +111,7 @@ class RuntimeRegistry:
             mcp=mcp,
             network=dict(network) if network else None,
             allow_public_traffic=bool(allow_public_traffic),
+            iam_tokens=dict(iam_tokens or {}),
         )
         with self._lock:
             self._records[sandbox_id] = record

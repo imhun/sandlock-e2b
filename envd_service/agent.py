@@ -215,6 +215,7 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
         network=payload.get("network"),
         allow_public_traffic=bool(payload.get("allowPublicTraffic", False)),
         volume_mounts=mount_paths,
+        iam_tokens=payload.get("iamTokens"),
     )
 
 

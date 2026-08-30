@@ -1,7 +1,7 @@
 # Worker final image: envd service + Sandlock executor + egress proxy lib.
 # The control plane never runs here; the runtime C compiler is only needed
 # in the builder stage (the egress library ships prebuilt per platform).
-FROM python:3.11-slim AS builder
+FROM python:3.14-slim AS builder
 
 RUN sed -i \
         's|http://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g; s|http://security.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
@@ -14,7 +14,7 @@ COPY envd_service/egress/ /tmp/egress/
 RUN cc -shared -fPIC -O2 -Wall -o /tmp/egress/libegress_proxy.so \
         /tmp/egress/libegress_proxy.c -ldl
 
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 WORKDIR /app
 
@@ -22,7 +22,7 @@ RUN sed -i \
         's|http://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g; s|http://security.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
         /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends docker.io docker-cli bash iptables \
+    && apt-get install -y --no-install-recommends docker.io docker-cli bash \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -30,14 +30,20 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r re
 
 # sandlock fork wheel (Block A/B/C: wildcard allowOut, header inject,
 # host mask, SOCKS5 egress on-behalf). wheels/fork/ holds per-arch wheels;
-# the build arg picks the platform-matched file.
+# the pick is scoped to the image's own CPython ABI + TARGETARCH so future
+# cp-matrix wheels in the same dir cannot be selected by accident.
 ARG TARGETARCH
 COPY wheels/fork/ /tmp/wheels/
-RUN SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-linux_$(case "$TARGETARCH" in \
+RUN PY_ABI=$(python3 -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")') \
+    && ARCH_SUFFIX=$(case "$TARGETARCH" in \
         amd64) echo x86_64 ;; \
         arm64) echo aarch64 ;; \
         *) echo "$TARGETARCH" ;; \
-    esac).whl 2>/dev/null || ls /tmp/wheels/*.whl | head -1) \
+    esac) \
+    && SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-${PY_ABI}-${PY_ABI}-manylinux*${ARCH_SUFFIX}.whl 2>/dev/null | head -1) \
+    && [ -n "$SANLOCK_WHL" ] || SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-${PY_ABI}-${PY_ABI}-linux_${ARCH_SUFFIX}.whl 2>/dev/null | head -1) \
+    && [ -n "$SANLOCK_WHL" ] || SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-${PY_ABI}-${PY_ABI}-*.whl 2>/dev/null | head -1) \
+    && [ -n "$SANLOCK_WHL" ] || SANLOCK_WHL=$(ls /tmp/wheels/*.whl | head -1) \
     && pip install --no-cache-dir "$SANLOCK_WHL" \
     && rm -rf /tmp/wheels
 

@@ -1,0 +1,4 @@
+[submodule "third_party/sandlock"]
+	path = third_party/sandlock
+	url = https://github.com/imhun/sandlock.git
+	branch = upstream-pr/netns-free-clean

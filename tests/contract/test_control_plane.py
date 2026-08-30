@@ -61,6 +61,35 @@ async def test_create_unknown_template_400(control_client):
     assert response.json() == {"code": 400, "message": "Template does-not-exist not found"}
 
 
+async def test_create_with_iam_accepted(control_client):
+    """The SDK workload-identity config (iam) is accepted end to end."""
+    response = await _create(
+        control_client,
+        iam={
+            "tokens": {
+                "openai": {"audience": "test-aud", "token_type": "JWT-SVID"}
+            }
+        },
+    )
+    assert response.status_code == 201
+
+
+async def test_create_with_invalid_iam_name_rejected(control_client):
+    response = await _create(
+        control_client,
+        iam={"tokens": {"bad{name": {"audience": "a", "token_type": "JWT-SVID"}}},
+    )
+    assert response.status_code == 400
+
+
+async def test_create_with_invalid_iam_token_rejected(control_client):
+    response = await _create(
+        control_client,
+        iam={"tokens": {"openai": {"audience": 42}}},
+    )
+    assert response.status_code == 400
+
+
 async def test_image_field_rejected_400(control_client):
     response = await _create(control_client, image="python:3.11-slim")
     assert response.status_code == 400

@@ -32,6 +32,7 @@ class SandboxRuntimeContext:
             max_open_files=record.max_open_files,
             allow_internet_access=record.allow_internet_access,
             network=record.network,
+            iam_tokens=record.iam_tokens,
             egress_lib_dir=settings.image_cache_dir / "egress",
             extra_fs_writable=[m["hostPath"] for m in record.volume_mounts],
             fs_mounts={

@@ -79,12 +79,11 @@ python:                  430 passed, 0 skipped
 ## Push / create
 
 ```bash
-cd tmp/sandlock-src
+cd third_party/sandlock
 git push origin upstream-pr/netns-free-clean
 # then open a PR: multikernel/sandlock main ← imhun/sandlock upstream-pr/netns-free-clean
 ```
 
-> ⚠️ 本环境无法推送：仓库已备好（`upstream-pr/netns-free-clean`，tip `b6ef050`），
-> 但当前 `GITHUB_TOKEN` 是只读 PAT（API 写操作返回 403 "Resource not
-> accessible"），git push 同样 403。需要换一个有写权限的 token 或手动推送后
+> 已推送：`origin/upstream-pr/netns-free-clean`（tip `53a8ee2`）。fork 以
+> 子模块形式固定在本仓库 `third_party/sandlock`；改动先提交到子模块并 push，
 > 再开 PR。

@@ -381,7 +381,8 @@ def test_executor_identity_token_placeholder_requires_env(tmp_path, monkeypatch)
     assert kwargs.http_inject[0]["secret"] == "env:E2B_IDENTITY_TOKEN_openai"
     assert kwargs.net_deny == []
     assert kwargs.http_allow == ["* api.example.com/*"]
-    assert kwargs.netns is False
+    # netns-free fork line: the executor no longer forwards a netns flag.
+    assert not hasattr(kwargs, "netns")
 
     # Dynamic update replaces the policy for the next command.
     executor.update_network({"denyOut": ["169.254.169.254"]})
@@ -390,10 +391,11 @@ def test_executor_identity_token_placeholder_requires_env(tmp_path, monkeypatch)
     assert kwargs.net_deny == ["169.254.169.254"]
 
 
-def test_netns_wildcard_allowout_accepted_and_passed_through(monkeypatch):
+def test_netns_flag_accepted_but_not_passed_through(monkeypatch):
     """Wildcard allowOut is accepted without an egress proxy (the fork
-    sandlock's per-sandbox DNS gateway serves it); the executor enables
-    per-sandbox netns only when E2B_ENABLE_NETNS is on."""
+    sandlock's unprivileged DNS gateway serves it). The netns-free fork line
+    dropped per-sandbox netns, so enable_netns/E2B_ENABLE_NETNS are accepted
+    for config compatibility but no netns kwarg reaches the sandbox."""
     from gateway_common import network
 
     monkeypatch.setenv("E2B_ENABLE_NETNS", "1")
@@ -421,8 +423,77 @@ def test_netns_wildcard_allowout_accepted_and_passed_through(monkeypatch):
     )
     config = ExecConfig(cmd=["true"], env={}, cwd="/tmp/ws", stdin_enabled=False)
     kwargs = executor._build_sandbox(config)
-    assert kwargs.netns is True
+    assert not hasattr(kwargs, "netns")
     assert kwargs.net_allow == ["*.example.com:443"]
+
+
+def test_executor_mints_iam_jwt_for_registered_token(tmp_path, monkeypatch):
+    """A ${e2b.identity.tokens.<name>} placeholder resolves to a minted
+    JWT-SVID when the sandbox registered an iam token for that name (falls
+    back to the worker env only when no iam token is registered)."""
+    from envd_service.executors.base import ExecConfig
+    from envd_service.executors.sandlock import SandlockExecutor
+
+    monkeypatch.delenv("E2B_IDENTITY_TOKEN_openai", raising=False)
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    executor = SandlockExecutor(
+        workspace_dir=str(tmp_path / "ws"),
+        base_image=None,
+        image_rootfs=None,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=True,
+        iam_tokens={
+            "openai": {"audience": "test-aud", "token_type": "JWT-SVID"}
+        },
+        network={
+            "rules": {
+                "api.example.com": [
+                    {
+                        "transform": {
+                            "headers": {
+                                "Authorization": (
+                                    "Bearer ${e2b.identity.tokens.openai}"
+                                )
+                            }
+                        }
+                    }
+                ]
+            }
+        },
+        secrets_dir=str(secrets),
+    )
+    kwargs = executor._build_sandbox(
+        ExecConfig(
+            cmd=["true"],
+            env={},
+            cwd=str(tmp_path / "ws"),
+            stdin_enabled=False,
+        )
+    )
+    secret = kwargs.http_inject[0]["secret"]
+    assert secret.startswith("file:"), secret
+    import base64
+    import json
+
+    jwt = Path(secret.split(":", 1)[1]).read_text(encoding="utf-8").strip()
+    # The placeholder was substituted in place: "Bearer ${...}" -> "Bearer <jwt>".
+    jwt = jwt.split("Bearer ", 1)[1]
+    header, payload, signature = jwt.split(".")
+
+    def _b64decode(part: str) -> dict:
+        return json.loads(
+            base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+        )
+
+    assert _b64decode(header)["alg"] == "HS256"
+    assert _b64decode(payload)["aud"] == "test-aud"
+    assert signature
 
 
 def test_wildcard_allowout_accepted_without_netns_flag(monkeypatch):

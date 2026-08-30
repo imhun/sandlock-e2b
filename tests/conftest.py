@@ -403,14 +403,24 @@ def authenticated_registry():
     if ht.returncode != 0:
         pytest.skip(f"cannot generate htpasswd: {ht.stderr.strip()}")
     # The htpasswd file is bind-mounted by a docker CLI running inside the
-    # test container; the daemon resolves the source path on the HOST, so the
-    # path must be the host-side project root (passed via E2B_HOST_PROJECT),
-    # not the container's /workspace view.
+    # test container. The daemon resolves the -v source path on the HOST, so
+    # the file must physically exist at host_root — which, when running
+    # inside the container, means writing through the /workspace mount (the
+    # container view of the same host tree), not the host-absolute path
+    # (that would land in the container's own filesystem and the daemon
+    # would create a directory at the missing host path).
     host_root = Path(os.environ.get("E2B_HOST_PROJECT") or str(PROJECT_ROOT))
-    htpasswd_dir = host_root / "tmp" / "registry-auth"
+    write_root = Path("/workspace") if os.environ.get("E2B_HOST_PROJECT") else PROJECT_ROOT
+    htpasswd_dir = write_root / "tmp" / "registry-auth"
     htpasswd_dir.mkdir(parents=True, exist_ok=True)
     htpasswd_path = htpasswd_dir / "htpasswd"
+    # Self-heal: if a previous run left a directory here (docker creates
+    # missing bind sources as dirs), the registry would mount a directory as
+    # the htpasswd file and return 400 on login.
+    if htpasswd_path.is_dir():
+        shutil.rmtree(htpasswd_path)
     htpasswd_path.write_text(ht.stdout, encoding="utf-8")
+    mount_src = host_root / "tmp" / "registry-auth" / "htpasswd"
 
     port = _free_port()
     start = subprocess.run(
@@ -428,7 +438,7 @@ def authenticated_registry():
             "-e",
             "REGISTRY_AUTH_HTPASSWD_REALM=Registry",
             "-v",
-            f"{htpasswd_path}:/auth/htpasswd",
+            f"{mount_src}:/auth/htpasswd",
             "registry:2",
         ],
         capture_output=True,
