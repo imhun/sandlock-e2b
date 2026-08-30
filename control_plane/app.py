@@ -16,6 +16,7 @@ from control_plane.api.snapshots import router as snapshots_router
 from control_plane.api.templates import router as templates_router
 from control_plane.api.volumes import router as volumes_router
 from control_plane.config import Settings
+from control_plane.metrics import SlidingWindowCounter
 from control_plane.registry.manager import SandboxRegistry
 from control_plane.registry.nodes import NodeRegistry
 from control_plane.registry.secrets import SecretRegistry
@@ -137,6 +138,7 @@ def create_app(
         (workspace_base or settings.workspace_base)
     )
     app.state.nodes = nodes_registry or NodeRegistry(redis_client=redis_client)
+    app.state.recent_failures = SlidingWindowCounter()
     app.state.templates = templates_registry or TemplateRegistry()
     if settings.enable_local_node and app.state.nodes.get("local") is None:
         app.state.nodes.add_local_node(

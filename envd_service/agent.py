@@ -16,6 +16,10 @@ from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from envd_service.config import Settings
+from envd_service.runtime.image_resolver import (
+    peek_image_warm,
+    resolve_image_rootfs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +258,69 @@ async def agent_delete_sandbox(
         # live sandbox's files.
         shutil.rmtree(settings.workspace_base / sandbox_id, ignore_errors=True)
     return Response(status_code=204)
+
+
+@router.get("/agent/images/{image:path}/warm")
+async def agent_image_warm_peek(image: str, request: Request) -> Response:
+    """Return ``{cached, digest}`` for a base image without extracting it.
+
+    Used by the control plane to decide fast path (image cached -> create
+    directly) vs slow path (image cold -> require ``X-Sandbox-Id`` and warm
+    before creating the sandbox record).
+    """
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    if not _executor_needs_images(settings.executor):
+        return JSONResponse({"cached": True, "required": False, "digest": None})
+    return JSONResponse(
+        peek_image_warm(
+            image,
+            settings.image_cache_dir,
+            registry_username=settings.image_registry_username,
+            registry_password=settings.image_registry_password,
+        )
+    )
+
+
+@router.post("/agent/images/{image:path}/warm")
+async def agent_image_warm_now(image: str, request: Request) -> Response:
+    """Ensure a base image rootfs is extracted (idempotent, may take long)."""
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    if not _executor_needs_images(settings.executor):
+        return JSONResponse({"cached": True, "required": False, "digest": None})
+    try:
+        rootfs = await asyncio.to_thread(
+            resolve_image_rootfs,
+            image,
+            settings.image_cache_dir,
+            registry_username=settings.image_registry_username,
+            registry_password=settings.image_registry_password,
+        )
+    except Exception as e:
+        logger.warning("agent warm failed for %s: %s", image, e)
+        return Response(status_code=500, content=str(e)[:500])
+    return JSONResponse({"cached": True, "rootfs": str(rootfs)})
+
+
+def _executor_needs_images(mode: str) -> bool:
+    """Whether this worker's executor resolves image rootfs at all."""
+    if mode == "local":
+        return False
+    if mode == "sandlock":
+        return True
+    try:
+        import sandlock  # noqa: F401
+
+        return True
+    except Exception:
+        return False
 
 
 @router.post("/agent/sandboxes/{sandbox_id}/network", status_code=204)

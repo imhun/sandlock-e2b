@@ -1,0 +1,259 @@
+"""OCI registry client + rootfs resolver against an in-process fake registry."""
+
+from __future__ import annotations
+
+import gzip
+import hashlib
+import io
+import json
+import tarfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+from envd_service.runtime.image_resolver import (
+    ImageResolutionError,
+    peek_image_warm,
+    resolve_image_rootfs,
+)
+from envd_service.runtime.oci_registry import (
+    parse_image_ref,
+    select_platform_manifest,
+)
+
+
+def _sha256(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _tar_gz(files: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def _manifest_json(layers: list[dict], config_digest: str) -> dict:
+    return {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "size": 2, "digest": config_digest},
+        "layers": layers,
+    }
+
+
+class FakeRegistry:
+    def __init__(self, *, require_auth: bool = False, redirect_blobs: bool = False):
+        self.require_auth = require_auth
+        self.redirect_blobs = redirect_blobs
+        self.layers: dict[str, bytes] = {}
+        self.manifests: dict[str, dict] = {}
+        self.manifest_requests = 0
+        self.blob_requests = 0
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._make_handler())
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def host(self) -> str:
+        return f"127.0.0.1:{self.server.server_port}"
+
+    def add_layer(self, files: dict[str, bytes]) -> str:
+        data = _tar_gz(files)
+        digest = _sha256(data)
+        self.layers[digest] = data
+        return digest
+
+    def add_manifest(self, tag: str, manifest: dict) -> str:
+        raw = json.dumps(manifest).encode()
+        self.manifests[f"{tag}"] = manifest
+        self.manifests[f"{_sha256(raw)}"] = manifest
+        return _sha256(raw)
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+
+    def _make_handler(self):
+        # type() dict avoids the class-body scoping gotcha: a class body
+        # cannot read enclosing function locals (``registry`` would resolve
+        # to the module-level pytest fixture instead).
+        return type("RegistryHandler", (_RegistryHandler,), {"registry": self})
+
+
+class _RegistryHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):  # silence
+        pass
+
+    registry: FakeRegistry
+
+    def _send(self, status: int, body: bytes, headers: dict[str, str] | None = None):
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authed(self) -> bool:
+        if not self.registry.require_auth:
+            return True
+        return self.headers.get("Authorization") == "Bearer test-token"
+
+    def do_GET(self):
+        path = self.path
+        if path.startswith("/token"):
+            self._send(200, b'{"token": "test-token"}')
+            return
+        if not self._authed():
+            self.send_response(401)
+            self.send_header(
+                "WWW-Authenticate",
+                f'Bearer realm="http://{self.headers["Host"]}/token",'
+                'service="fake",scope="repository:test/py:pull"',
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path.startswith("/v2/test/py/manifests/"):
+            self.registry.manifest_requests += 1
+            tag = path.rsplit("/", 1)[1]
+            manifest = self.registry.manifests.get(tag)
+            if manifest is None:
+                self._send(404, b"not found")
+                return
+            raw = json.dumps(manifest).encode()
+            self._send(
+                200,
+                raw,
+                {
+                    "Content-Type": manifest.get("mediaType", "application/json"),
+                    "Docker-Content-Digest": _sha256(raw),
+                },
+            )
+            return
+        if path.startswith("/v2/test/py/blobs/"):
+            self.registry.blob_requests += 1
+            digest = path.rsplit("/", 1)[1]
+            data = self.registry.layers.get(digest)
+            if data is None:
+                self._send(404, b"no blob")
+                return
+            if self.registry.redirect_blobs:
+                self.send_response(302)
+                self.send_header("Location", f"/blobdata/{digest}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._send(200, data)
+            return
+        if path.startswith("/blobdata/"):
+            digest = path.rsplit("/", 1)[1]
+            self._send(200, self.registry.layers.get(digest, b""))
+            return
+        self._send(404, b"not found")
+
+
+@pytest.fixture()
+def registry():
+    reg = FakeRegistry()
+    yield reg
+    reg.stop()
+
+
+def _base_registry(registry: FakeRegistry, tmp_path: Path):
+    config_digest = _sha256(b"{}")
+    l1 = registry.add_layer({"bin/sh": b"#!/bin/sh\n", "etc/os-release": b"ID=debian\n"})
+    manifest = _manifest_json(
+        [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "size": 1, "digest": l1}],
+        config_digest,
+    )
+    registry.add_manifest("latest", manifest)
+    return f"{registry.host}/test/py:latest"
+
+
+def test_parse_image_ref_variants():
+    assert parse_image_ref("python:3.14-slim").host == "registry-1.docker.io"
+    assert parse_image_ref("python:3.14-slim").repository == "library/python"
+    assert parse_image_ref("imhun/sandlock:tag").repository == "imhun/sandlock"
+    ref = parse_image_ref("registry.cn-shanghai.aliyuncs.com/byteplan/x:1")
+    assert ref.host == "registry.cn-shanghai.aliyuncs.com"
+    assert ref.repository == "byteplan/x"
+    assert parse_image_ref("x@sha256:abc").reference == "sha256:abc"
+
+
+def test_resolve_extracts_rootfs_and_caches(registry, tmp_path):
+    image = _base_registry(registry, tmp_path)
+    rootfs = resolve_image_rootfs(image, tmp_path)
+    assert (rootfs / "bin" / "sh").is_file()
+    assert (rootfs / "etc" / "os-release").read_text() == "ID=debian\n"
+    assert (rootfs / ".complete").is_file()
+
+    blob_requests_after_first = registry.blob_requests
+    again = resolve_image_rootfs(image, tmp_path)
+    assert again == rootfs
+    # Manifest is re-fetched (to compute the current digest), but cached
+    # rootfs skips the blob downloads and extraction.
+    assert registry.blob_requests == blob_requests_after_first
+
+
+def test_resolve_applies_whiteouts(registry, tmp_path):
+    config_digest = _sha256(b"{}")
+    l1 = registry.add_layer(
+        {"bin/sh": b"#!/bin/sh\n", "a.txt": b"old", "sub/x.txt": b"x"}
+    )
+    l2 = registry.add_layer(
+        {".wh.a.txt": b"", "sub/.wh..wh..opq": b"", "sub/y.txt": b"y"}
+    )
+    manifest = _manifest_json(
+        [
+            {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "size": 1, "digest": l1},
+            {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "size": 1, "digest": l2},
+        ],
+        config_digest,
+    )
+    registry.add_manifest("latest", manifest)
+    rootfs = resolve_image_rootfs(f"{registry.host}/test/py:latest", tmp_path)
+    assert not (rootfs / "a.txt").exists()
+    assert not (rootfs / "sub" / "x.txt").exists()
+    assert (rootfs / "sub" / "y.txt").read_text() == "y"
+
+
+def test_resolve_with_bearer_auth_and_redirect(registry, tmp_path):
+    registry.require_auth = True
+    registry.redirect_blobs = True
+    image = _base_registry(registry, tmp_path)
+    rootfs = resolve_image_rootfs(image, tmp_path)
+    assert (rootfs / "bin" / "sh").is_file()
+    assert registry.blob_requests >= 1
+
+
+def test_select_platform_manifest_prefers_current_arch():
+    index = {
+        "manifests": [
+            {"digest": "sha256:arm", "platform": {"os": "linux", "architecture": "arm64"}},
+            {"digest": "sha256:amd", "platform": {"os": "linux", "architecture": "amd64"}},
+        ]
+    }
+    assert select_platform_manifest(index, arch="amd64")["digest"] == "sha256:amd"
+    assert select_platform_manifest(index, arch="arm64")["digest"] == "sha256:arm"
+
+
+def test_peek_warm_reflects_cache(registry, tmp_path):
+    image = _base_registry(registry, tmp_path)
+    assert peek_image_warm(image, tmp_path)["cached"] is False
+    resolve_image_rootfs(image, tmp_path)
+    assert peek_image_warm(image, tmp_path)["cached"] is True
+    assert peek_image_warm("", tmp_path)["cached"] is False
+
+
+def test_unknown_image_fails(registry, tmp_path):
+    with pytest.raises(ImageResolutionError):
+        resolve_image_rootfs(f"{registry.host}/test/py:missing", tmp_path)

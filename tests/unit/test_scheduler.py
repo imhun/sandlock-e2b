@@ -84,3 +84,17 @@ def test_select_none_when_full():
     )
     assert node is None
 
+
+def test_select_filters_draining():
+    registry = _node_registry()
+    registry.set_draining("a", True)
+    node = select_node(
+        registry.list(healthy_only=True),
+        base_image="python:3.11-slim",
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        processes=64,
+    )
+    assert node is not None
+    assert node.node_id == "b"

@@ -147,3 +147,35 @@ def test_release_quota_under_lock():
     )
     assert node.reserved_memory_mb == 0
     assert node.reserved_processes == 0
+
+
+def test_set_draining_excludes_node():
+    registry, record = _node()
+    assert registry.set_draining("missing", True) is None
+    assert registry.set_draining("node_a", True) is record
+    assert record.draining is True
+    assert registry.get("node_a").draining is True
+    assert "draining" in record.to_dict()
+    # Healthy but draining nodes are not schedulable.
+    picked = registry.select_and_reserve(
+        base_image=None,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        processes=64,
+    )
+    assert picked is None
+
+
+def test_register_clears_draining():
+    registry, record = _node()
+    registry.set_draining("node_a", True)
+    registry.register(
+        node_id="node_a",
+        address="http://127.0.0.1:49983",
+        total_memory_mb=1024,
+        total_cpu_percent=200,
+        total_disk_mb=2048,
+        total_processes=128,
+    )
+    assert record.draining is False

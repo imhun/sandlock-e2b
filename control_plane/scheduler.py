@@ -20,7 +20,7 @@ def select_node(
 ) -> NodeRecord | None:
     """Pick the best node or ``None`` when no node can fit the sandbox."""
     return pick_best(
-        [n for n in nodes if n.status == "healthy"],
+        [n for n in nodes if n.status == "healthy" and not n.draining],
         base_image=base_image,
         volume_node_id=volume_node_id,
         memory_mb=memory_mb,

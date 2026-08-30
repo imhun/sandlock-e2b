@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import shutil
@@ -13,7 +14,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from gateway_common.ids import access_token, client_id, sandbox_id
+from gateway_common.ids import (
+    access_token,
+    client_id,
+    sandbox_id as _gen_sandbox_id,
+)
 from gateway_common.paths import validate_sandbox_id
 from gateway_common.timeutil import to_iso_z, utcnow
 
@@ -242,6 +247,7 @@ class SandboxRegistry:
         self._reserved_disk = 0
         self._reserved_processes = 0
         self._migration_locks: dict[str, tuple[str, float]] = {}
+        self._pending: dict[str, tuple[dict[str, Any], float]] = {}
         self._on_removed_callbacks: list[Callable[[SandboxRecord], None]] = []
         self._lock = threading.Lock()
         self._redis = None
@@ -319,6 +325,59 @@ class SandboxRegistry:
             if existing is not None and existing[0] == token:
                 del self._migration_locks[sandbox_id]
 
+    # -- pending create (idempotent X-Sandbox-Id slow path) -----------------
+
+    def claim_pending(
+        self, sandbox_id: str, payload: dict[str, Any], ttl: int = 300
+    ) -> bool:
+        """Atomically claim the idempotent-create marker for ``sandbox_id``.
+
+        Returns ``False`` when another request already owns the pending
+        marker (callers should wait for it to resolve).
+        """
+        if self._redis is not None:
+            key = f"{self._ns}:pending:{sandbox_id}"
+            return bool(
+                self._redis.set(
+                    key, json.dumps(payload, separators=(",", ":")), nx=True, ex=ttl
+                )
+            )
+        with self._lock:
+            now = time.monotonic()
+            existing = self._pending.get(sandbox_id)
+            if existing is not None and existing[1] > now:
+                return False
+            self._pending[sandbox_id] = (payload, now + ttl)
+            return True
+
+    def get_pending(self, sandbox_id: str) -> dict[str, Any] | None:
+        if self._redis is not None:
+            raw = self._redis.get(f"{self._ns}:pending:{sandbox_id}")
+            if not raw:
+                return None
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+        with self._lock:
+            entry = self._pending.get(sandbox_id)
+            if entry is None:
+                return None
+            payload, deadline = entry
+            if time.monotonic() > deadline:
+                self._pending.pop(sandbox_id, None)
+                return None
+            return payload
+
+    def release_pending(self, sandbox_id: str) -> None:
+        if sandbox_id is None:
+            return
+        if self._redis is not None:
+            self._redis.delete(f"{self._ns}:pending:{sandbox_id}")
+            return
+        with self._lock:
+            self._pending.pop(sandbox_id, None)
+
     # -- quota ------------------------------------------------------------
 
     def _quota_allows_locked(
@@ -389,6 +448,7 @@ class SandboxRegistry:
         self,
         *,
         template_id: str,
+        sandbox_id: str | None = None,
         timeout: int,
         metadata: dict[str, str],
         env_vars: dict[str, str],
@@ -401,6 +461,8 @@ class SandboxRegistry:
         iam_tokens: dict[str, dict[str, str]] | None = None,
     ) -> SandboxRecord:
         s = self._settings
+        if sandbox_id is not None and not validate_sandbox_id(sandbox_id):
+            raise ValueError("sandbox_id must be a valid sandbox id")
         timeout = timeout if timeout is not None else s.default_timeout
         if timeout < 1:
             raise ValueError("timeout must be a positive integer")
@@ -432,7 +494,7 @@ class SandboxRegistry:
             now = utcnow()
             record = SandboxRecord(
                 template_id=template_id,
-                sandbox_id=sandbox_id(),
+                sandbox_id=sandbox_id or _gen_sandbox_id(),
                 client_id=client_id(),
                 envd_access_token=access_token() if secure else "",
                 started_at=now,
@@ -456,7 +518,7 @@ class SandboxRegistry:
             now = utcnow()
             record = SandboxRecord(
                 template_id=template_id,
-                sandbox_id=sandbox_id(),
+                sandbox_id=sandbox_id or _gen_sandbox_id(),
                 client_id=client_id(),
                 envd_access_token=access_token() if secure else "",
                 started_at=now,

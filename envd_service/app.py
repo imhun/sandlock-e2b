@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -17,6 +18,29 @@ from envd_service.http.health import router as health_router
 from envd_service.rpc import register_rpc
 from envd_service.runtime.context import SandboxRuntimeContext
 from envd_service.runtime.registry import RuntimeRegistry
+
+logger = logging.getLogger(__name__)
+
+
+async def _warm_base_image(settings: Settings) -> None:
+    """Pre-extract the configured base image rootfs at worker startup."""
+    from envd_service.runtime.image_resolver import resolve_image_rootfs
+
+    try:
+        await asyncio.to_thread(
+            resolve_image_rootfs,
+            settings.base_image,
+            settings.image_cache_dir,
+            registry_username=settings.image_registry_username,
+            registry_password=settings.image_registry_password,
+        )
+        logger.info("worker base image warmed: %s", settings.base_image)
+    except Exception:
+        logger.warning(
+            "worker base image warm failed: %s",
+            settings.base_image,
+            exc_info=True,
+        )
 
 
 def create_app(
@@ -47,7 +71,12 @@ def create_app(
 
             ensure_worker_netns_plumbing()
         agent.start()
+        if settings.base_image:
+            app.state.warm_task = asyncio.create_task(_warm_base_image(settings))
         yield
+        warm_task = getattr(app.state, "warm_task", None)
+        if warm_task is not None:
+            warm_task.cancel()
         await agent.stop()
         for ctx in app.state.runtimes.values():
             ctx.shutdown()

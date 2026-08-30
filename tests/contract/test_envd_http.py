@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import httpx
 
+from envd_service.config import Settings as EnvdSettings
+
 
 async def _create_sandbox(control_client) -> dict:
     response = await control_client.post(
@@ -127,3 +129,35 @@ async def test_envd_unauthorized(control_client, envd_client):
         },
     )
     assert response.status_code == 401
+
+
+async def test_warm_peek_requires_internal_key(envd_client):
+    response = await envd_client.get("/agent/images/127.0.0.1:1/nope:latest/warm")
+    assert response.status_code == 401
+
+
+async def test_warm_peek_returns_uncached_for_unknown(make_apps):
+    _, envd = make_apps(envd_settings=EnvdSettings(executor="sandlock"))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=envd), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/agent/images/127.0.0.1:1/nope:latest/warm",
+            headers={"X-Internal-Key": "internal-key"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["cached"] is False
+    assert body["digest"] is None
+
+
+async def test_warm_now_fails_fast_for_unreachable_registry(make_apps):
+    _, envd = make_apps(envd_settings=EnvdSettings(executor="sandlock"))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=envd), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/agent/images/127.0.0.1:1/nope:latest/warm",
+            headers={"X-Internal-Key": "internal-key"},
+        )
+    assert response.status_code == 500

@@ -23,6 +23,7 @@ class NodeRecord:
     reserved_cpu_percent: int = 0
     reserved_disk_mb: int = 0
     reserved_processes: int = 0
+    draining: bool = False
     images: list[str] = field(default_factory=list)
     labels: dict[str, str] = field(default_factory=dict)
     status: str = "healthy"
@@ -67,6 +68,7 @@ class NodeRecord:
             "reservedDiskMB": self.reserved_disk_mb,
             "totalProcesses": self.total_processes,
             "reservedProcesses": self.reserved_processes,
+            "draining": self.draining,
         }
 
 
@@ -122,6 +124,7 @@ class NodeRegistry:
                 record.total_processes = total_processes
                 record.images = list(images or [])
                 record.labels = dict(labels or {})
+                record.draining = False
             record.heartbeat_at = time.time()
             record.status = "healthy"
             return record
@@ -133,6 +136,15 @@ class NodeRegistry:
                 return None
             record.heartbeat_at = time.time()
             record.status = "healthy"
+            return record
+
+    def set_draining(self, node_id: str, draining: bool) -> NodeRecord | None:
+        """Mark/unmark a node as draining; returns the record or ``None``."""
+        with self._lock:
+            record = self._nodes.get(node_id)
+            if record is None:
+                return None
+            record.draining = draining
             return record
 
     def get(self, node_id: str) -> NodeRecord | None:
@@ -212,6 +224,7 @@ class NodeRegistry:
                 for n in self._nodes.values()
                 if n.status == "healthy"
                 and n.node_id != exclude_node_id
+                and not n.draining
                 and n.can_fit(memory_mb, cpu_percent, disk_mb, processes)
             ]
             node = pick_best(

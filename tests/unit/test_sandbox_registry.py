@@ -132,3 +132,51 @@ def test_connect_refreshes_end_at(workspace):
     old_end = record.end_at
     registry.connect(record.sandbox_id, timeout=600)
     assert record.end_at > old_end
+
+
+def test_create_with_explicit_sandbox_id(workspace):
+    registry = SandboxRegistry(_settings())
+    record = registry.create(
+        template_id="base",
+        sandbox_id="sbx_clientprovided",
+        timeout=300,
+        metadata={},
+        env_vars={},
+        secure=True,
+        allow_internet_access=False,
+        base_image=None,
+    )
+    assert record.sandbox_id == "sbx_clientprovided"
+    assert registry.get("sbx_clientprovided") is record
+
+
+def test_create_rejects_invalid_sandbox_id(workspace):
+    registry = SandboxRegistry(_settings())
+    with pytest.raises(ValueError):
+        registry.create(
+            template_id="base",
+            sandbox_id="../../etc/passwd",
+            timeout=300,
+            metadata={},
+            env_vars={},
+            secure=True,
+            allow_internet_access=False,
+            base_image=None,
+        )
+
+
+def test_pending_claim_get_release(workspace):
+    registry = SandboxRegistry(_settings())
+    assert registry.claim_pending("sbx_p", {"node": "n1"}, ttl=30) is True
+    assert registry.claim_pending("sbx_p", {"node": "n2"}, ttl=30) is False
+    assert registry.get_pending("sbx_p") == {"node": "n1"}
+    registry.release_pending("sbx_p")
+    assert registry.get_pending("sbx_p") is None
+    assert registry.claim_pending("sbx_p", {"node": "n2"}, ttl=30) is True
+    registry.release_pending(None)  # no-op
+
+
+def test_pending_expires(workspace):
+    registry = SandboxRegistry(_settings())
+    assert registry.claim_pending("sbx_e", {"node": "n1"}, ttl=-1)
+    assert registry.get_pending("sbx_e") is None

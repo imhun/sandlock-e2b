@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from gateway_common.network import (
     normalize_network_config,
     normalize_network_update,
 )
+from gateway_common.paths import validate_sandbox_id
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,133 @@ router = APIRouter()
 # Unsupported fields that must produce an explicit 400 (no fake success).
 UNSUPPORTED_FIELDS = ("image", "lifecycle")
 UNSUPPORTED_ENDPOINTS = ()
+
+# Idempotent-create (X-Sandbox-Id) slow-path tuning.
+_PENDING_TTL_S = 300
+_PENDING_WAIT_S = 10.0
+
+
+def _default_dims(settings) -> tuple[int, int, int, int]:
+    return (
+        settings.default_memory_mb,
+        settings.default_cpu_percent,
+        settings.default_disk_mb,
+        settings.default_max_processes,
+    )
+
+
+def _executor_needs_images(mode: str) -> bool:
+    """Whether the local executor resolves image rootfs at all."""
+    if mode == "local":
+        return False
+    if mode == "sandlock":
+        return True
+    try:
+        import sandlock  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _release_node_quota(request, node, dims: tuple[int, int, int, int]) -> None:
+    memory_mb, cpu, disk_mb, processes = dims
+    request.app.state.nodes.release_quota(
+        node.node_id,
+        memory_mb=memory_mb,
+        cpu_percent=cpu,
+        disk_mb=disk_mb,
+        processes=processes,
+    )
+
+
+async def _image_warm(request, node, base_image, settings) -> bool:
+    """Peek whether ``base_image`` is already extracted on ``node``."""
+    if not base_image:
+        return True
+    if node.address == "local://":
+        if not _executor_needs_images(settings.executor):
+            return True
+        from envd_service.runtime.image_resolver import peek_image_warm
+
+        state = await asyncio.to_thread(
+            peek_image_warm,
+            base_image,
+            settings.image_cache_dir,
+            registry_username=settings.image_registry_username,
+            registry_password=settings.image_registry_password,
+        )
+        return bool(state.get("cached"))
+    import httpx
+    from urllib.parse import quote
+
+    url = (
+        f"{node.address}/agent/images/{quote(base_image, safe='/:')}"
+        "/warm"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                url, headers={"X-Internal-Key": settings.internal_api_key}
+            )
+            if resp.status_code == 200:
+                body = resp.json()
+                if body.get("required") is False:
+                    return True
+                return bool(body.get("cached"))
+    except httpx.HTTPError:
+        pass
+    # Unknown/older worker: fall back to the fast path; provisioning will
+    # fail loudly if the image is actually missing.
+    return True
+
+
+async def _warm_node(request, node, base_image, settings) -> None:
+    """Ensure the base image rootfs is extracted on ``node`` (may be slow)."""
+    if not base_image:
+        return
+    if node.address == "local://":
+        from envd_service.runtime.image_resolver import resolve_image_rootfs
+
+        await asyncio.to_thread(
+            resolve_image_rootfs,
+            base_image,
+            settings.image_cache_dir,
+            registry_username=settings.image_registry_username,
+            registry_password=settings.image_registry_password,
+        )
+        return
+    import httpx
+    from urllib.parse import quote
+
+    url = (
+        f"{node.address}/agent/images/{quote(base_image, safe='/:')}"
+        "/warm"
+    )
+    async with httpx.AsyncClient(timeout=settings.warm_timeout_s) as client:
+        resp = await client.post(
+            url, headers={"X-Internal-Key": settings.internal_api_key}
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"warm failed: {resp.status_code} {resp.text[:200]}")
+
+
+async def _wait_pending(
+    registry, sandbox_id: str, budget_s: float
+) -> Any | None:
+    """Wait up to ``budget_s`` for a pending create to resolve into a record."""
+    deadline = time.monotonic() + budget_s
+    while time.monotonic() < deadline:
+        try:
+            record = registry.get(sandbox_id)
+        except UnknownSandboxError:
+            record = None
+        if record is not None:
+            return record
+        if registry.get_pending(sandbox_id) is None:
+            return None
+        await asyncio.sleep(0.5)
+    return None
 
 
 def _registry(request: Request) -> SandboxRegistry:
@@ -313,7 +442,115 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
         raise OfficialError(400, str(e))
     iam_tokens = _normalize_iam(body)
 
+    settings = request.app.state.settings
+    dims = _default_dims(settings)
     registry = _registry(request)
+
+    # Idempotent create: a client-supplied sandbox ID short-circuits an
+    # existing record (retry after timeout -> immediate 201).
+    sandbox_id_hdr = request.headers.get("X-Sandbox-Id")
+    if sandbox_id_hdr is not None:
+        if not validate_sandbox_id(sandbox_id_hdr):
+            raise OfficialError(400, "X-Sandbox-Id must be a valid sandbox id")
+        try:
+            existing = registry.get(sandbox_id_hdr)
+        except UnknownSandboxError:
+            existing = None
+        if existing is not None:
+            return existing.as_sandbox()
+        if registry.get_pending(sandbox_id_hdr) is not None:
+            resolved = await _wait_pending(
+                registry, sandbox_id_hdr, _PENDING_WAIT_S
+            )
+            if resolved is not None:
+                return resolved.as_sandbox()
+            if registry.get_pending(sandbox_id_hdr) is not None:
+                raise OfficialError(503, "Sandbox create still in progress")
+
+    # Select a compute node and reserve its quota (volume/snapshot affinity).
+    volume_node_id: str | None = None
+    if snapshot is not None:
+        volume_node_id = snapshot.node_id
+    elif volume_mounts:
+        volume_records = [
+            request.app.state.volumes.get(m["name"]) for m in volume_mounts
+        ]
+        shared_root = settings.shared_volume_root
+        shared = bool(
+            shared_root
+            and all(
+                r.path is not None and r.path.is_relative_to(Path(shared_root).resolve())
+                for r in volume_records
+            )
+        )
+        if not shared:
+            node_ids = {r.node_id for r in volume_records}
+            if len(node_ids) > 1:
+                raise OfficialError(400, "all volume mounts must be on the same node")
+            volume_node_id = next(iter(node_ids)) if node_ids else None
+    node = request.app.state.select_node(
+        base_image=base_image,
+        volume_node_id=volume_node_id,
+        memory_mb=dims[0],
+        cpu_percent=dims[1],
+        disk_mb=dims[2],
+        processes=dims[3],
+    )
+    if node is None:
+        request.app.state.recent_failures.record()
+        raise OfficialError(503, "No resources available")
+
+    # Adaptive warm: image cached -> fast path (server-side ID, SDK no-op);
+    # image cold -> slow path requiring X-Sandbox-Id, warming before any
+    # sandbox record exists (no orphans, idempotent retries).
+    if sandbox_id_hdr is not None:
+        if not registry.claim_pending(
+            sandbox_id_hdr,
+            {"node": node.node_id, "status": "warming"},
+            ttl=_PENDING_TTL_S,
+        ):
+            resolved = await _wait_pending(
+                registry, sandbox_id_hdr, _PENDING_WAIT_S
+            )
+            _release_node_quota(request, node, dims)
+            if resolved is not None:
+                return resolved.as_sandbox()
+            if registry.get_pending(sandbox_id_hdr) is not None:
+                raise OfficialError(503, "Sandbox create still in progress")
+            # Marker expired (owner crashed): take ownership and continue.
+            registry.claim_pending(
+                sandbox_id_hdr,
+                {"node": node.node_id, "status": "warming"},
+                ttl=_PENDING_TTL_S,
+            )
+
+    slow_path = not await _image_warm(request, node, base_image, settings)
+    if slow_path and sandbox_id_hdr is None:
+        _release_node_quota(request, node, dims)
+        request.app.state.recent_failures.record()
+        raise OfficialError(
+            428,
+            "warm_required: base image not cached on the target node; "
+            "retry with the X-Sandbox-Id header to enable idempotent create",
+        )
+    if slow_path:
+        try:
+            await _warm_node(request, node, base_image, settings)
+        except Exception as e:
+            registry.release_pending(sandbox_id_hdr)
+            _release_node_quota(request, node, dims)
+            request.app.state.recent_failures.record()
+            raise OfficialError(503, f"Image warm failed: {e}") from e
+        try:
+            existing = registry.get(sandbox_id_hdr)
+        except UnknownSandboxError:
+            existing = None
+        if existing is not None:
+            # A concurrent attempt finished while we warmed.
+            registry.release_pending(sandbox_id_hdr)
+            _release_node_quota(request, node, dims)
+            return existing.as_sandbox()
+
     secrets = request.app.state.secrets
     try:
         resolved_env = secrets.resolve_env_refs(
@@ -321,6 +558,7 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
         )
         record = registry.create(
             template_id=template_id,
+            sandbox_id=sandbox_id_hdr,
             timeout=timeout,
             metadata={str(k): str(v) for k, v in metadata.items()},
             env_vars=resolved_env,
@@ -341,46 +579,17 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
             iam_tokens=iam_tokens,
         )
     except ResourceUnavailableError as e:
-        raise OfficialError(503, str(e))
+        _release_node_quota(request, node, dims)
+        registry.release_pending(sandbox_id_hdr)
+        request.app.state.recent_failures.record()
+        raise OfficialError(503, str(e)) from e
     except ValueError as e:
-        raise OfficialError(400, str(e))
-
-    # Select a compute node and reserve its quota (volume/snapshot affinity).
-    settings = request.app.state.settings
-    volume_node_id: str | None = None
-    if snapshot is not None:
-        volume_node_id = snapshot.node_id
-    elif volume_mounts:
-        volume_records = [
-            request.app.state.volumes.get(m["name"]) for m in volume_mounts
-        ]
-        shared_root = settings.shared_volume_root
-        shared = bool(
-            shared_root
-            and all(
-                r.path is not None and r.path.is_relative_to(Path(shared_root).resolve())
-                for r in volume_records
-            )
-        )
-        if not shared:
-            node_ids = {r.node_id for r in volume_records}
-            if len(node_ids) > 1:
-                registry.delete(record.sandbox_id)
-                raise OfficialError(400, "all volume mounts must be on the same node")
-            volume_node_id = next(iter(node_ids)) if node_ids else None
-    node = request.app.state.select_node(
-        base_image=record.base_image,
-        volume_node_id=volume_node_id,
-        memory_mb=record.memory_mb,
-        cpu_percent=record.cpu_count * 100,
-        disk_mb=record.disk_size_mb,
-        processes=record.max_processes,
-    )
-    if node is None:
-        registry.delete(record.sandbox_id)
-        raise OfficialError(503, "No resources available")
+        _release_node_quota(request, node, dims)
+        registry.release_pending(sandbox_id_hdr)
+        raise OfficialError(400, str(e)) from e
     record.node_id = node.node_id
     registry.save(record)
+    registry.release_pending(sandbox_id_hdr)
 
     try:
         if node.address == "local://":

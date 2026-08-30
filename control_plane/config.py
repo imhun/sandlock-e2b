@@ -30,9 +30,20 @@ class Settings:
         default_factory=lambda: _env_int("E2B_CONTROL_PLANE_PORT", 3000)
     )
     envd_port: int = field(default_factory=lambda: _env_int("E2B_ENVD_PORT", 49983))
+    warm_timeout_s: int = field(
+        default_factory=lambda: _env_int("E2B_WARM_TIMEOUT_S", 180)
+    )
+    executor: str = field(
+        default_factory=lambda: os.getenv("E2B_EXECUTOR", "auto").lower()
+    )
     workspace_base: Path = field(
         default_factory=lambda: Path(
             os.getenv("E2B_WORKSPACE_BASE", "tmp/sandboxes")
+        ).resolve()
+    )
+    image_cache_dir: Path = field(
+        default_factory=lambda: Path(
+            os.getenv("E2B_IMAGE_CACHE_DIR", "tmp/sandboxes/_images")
         ).resolve()
     )
     max_sandboxes: int = field(

@@ -1,6 +1,6 @@
 # Sandlock E2B 容器化 Worker 自动扩缩容方案
 
-> 状态：设计稿（v3，补充 SDK 行为约束）
+> 状态：设计稿（v4，请求队列改为自适应预热 + 延迟 ID 幂等创建）
 > 范围：worker 节点容器化部署、按请求容量自动扩缩容；同时支持本地 Docker 扩容与 Kubernetes 扩容。
 > 强制前提：运行时不再依赖 Docker daemon socket；镜像统一存放于
 > `registry.cn-shanghai.aliyuncs.com/byteplan/`。
@@ -14,8 +14,9 @@
 3. 运行时（控制面 / worker / gateway / autoscaler）完全去掉 Docker socket 依赖，
    镜像 rootfs 提取改为直接走 OCI Registry v2 API。
 4. 缩容不丢沙箱：只回收"无活跃沙箱"的节点，回收前先进入 draining 状态。
-5. 容量不足时创建请求进入有界等待队列（而非立即 503），autoscaler 按队列
-   深度快速扩容，超时或队满才失败。
+5. 创建请求按镜像预热状态自适应：镜像已缓存时服务端直接创建（官方 SDK
+   无感）；需要长时间预热时要求客户端携带幂等 sandbox-id，预热成功前不
+   创建记录，重试同 ID 立即返回，杜绝孤儿沙箱与重复创建。
 
 ## 2. 现状与结论
 
@@ -30,49 +31,48 @@
 - gateway 按 `sandbox_id -> node address` 路由，worker 只需对 gateway
   HTTP 可达；共享 workspace 卷已支持跨节点迁移。
 
-结论：**扩缩容的本质是"根据集群剩余容量与等待队列调整 worker 副本数"**，
-需要新增的是一个决策者（Autoscaler）+ 两个执行后端，外加四块前置改造：
+结论：**扩缩容的本质是"根据集群剩余容量调整 worker 副本数"**，需要新增
+的是一个决策者（Autoscaler）+ 两个执行后端，外加四块前置改造：
 
 1. 去掉 Docker socket（本方案第 4 节）；
-2. 控制面增加请求队列（本方案第 5 节）；
+2. 控制面增加自适应预热 + 延迟 ID 幂等创建（本方案第 5 节）；
 3. 控制面增加 draining 状态与聚合指标接口（第 9 节）；
 4. worker 增加优雅停机与镜像预热（第 10 节）。
 
 ## 3. 总体架构
 
 ```
-请求 -> gateway -> control plane（调度 + 配额预留 + 容量不足入队）
+请求 -> gateway -> control plane（调度 + 配额预留 + 预热预判）
                      │  /internal/nodes（每节点 reserved/total）
                      ▼
          Autoscaler 决策循环（5~10s）
-                     │  desired = f(利用率, 队列深度, 503 率, 冷却)
+                     │  desired = f(利用率, 503 率, 冷却)
                      ├── backend: local   （Docker Pool Manager）
                      └── backend: k8s     （Deployment replicas）
 ```
 
 决策指标（"请求容量"语义）：
 
-- 主指标：集群剩余容量 + 队列深度。剩余容量聚合每节点 `reserved/total`
-  （四维），换算为"还能容纳多少个标准沙箱"：
-  `Σ floor((total_i - reserved_i) / 单沙箱需求)`，通常内存是瓶颈维度；
-  队列深度（等待中的创建请求数）直接反映瞬时需求缺口，是扩容的最强信号。
-- 辅助指标：最近 N 分钟队满 / 超时导致的 503 错误率（兜底快扩）。
+- 主指标：集群剩余容量。聚合每节点 `reserved/total`（四维），换算为
+  "还能容纳多少个标准沙箱"：`Σ floor((total_i - reserved_i) / 单沙箱需求)`，
+  通常内存是瓶颈维度。
+- 辅助指标：最近 N 分钟 503 "No resources available" 错误率（兜底快扩）。
 - 可选增强：控制面记录创建请求 RPS，指数平滑后做预测扩容。
 
 desired 副本数：
 
 ```
 max(min_replicas,
-    ceil((活跃沙箱数 + 队列深度 + 预测增量) / 每 worker 可容纳数)
-    + warmup_buffer)
+    ceil((活跃沙箱数 + 预测增量) / 每 worker 可容纳数) + warmup_buffer)
 ```
 
-预计并发沙箱数 = 活跃沙箱 + 队列深度（+ 可选 RPS × 扩容延迟的预测增量）。
+预计并发沙箱数 = 活跃沙箱（+ 可选 RPS × 扩容延迟的预测增量）。
 每 worker 可容纳数 = 各维度 `E2B_NODE_*_MB / 默认沙箱需求` 的最小值
 （`can_fit` 的逆运算）。
 
-冷却策略：扩容冷却 60s；缩容冷却 10min，且只对"连续空闲 + 0 活跃沙箱"
-的节点生效。
+冷却策略：扩容冷却 60s；缩容冷却 10min，且仅当集群聚合利用率低于
+`E2B_AS_SCALE_DOWN_UTIL`（默认 0.40）、候选节点连续空闲且 0 活跃沙箱时
+才生效。
 
 ## 4. 去掉 Docker Socket（强制前提）
 
@@ -161,74 +161,77 @@ manifest 移除 `/var/run/docker.sock` 挂载。
 - `scripts/build-images.sh` 默认 `TAG` 改为上述 registry 前缀，`PUSH=1`
   才推送。
 
-## 5. 请求队列（容量不足时有界等待）
+## 5. 自适应预热 + 延迟 ID 幂等创建（孤儿沙箱的解法）
 
-### 5.1 语义与目标
+### 5.1 问题与思路
 
-- 现状：容量不足立即返回 503 "No resources available"，扩容只能靠提前量，
-  突发流量会直接失败。
-- 目标：创建请求在容量不足时进入有界等待队列，autoscaler 按队列深度快速
-  扩容；请求在超时或队满时返回 503，不做无限等待。
+- 根因：客户端超时（SDK 默认请求超时 60s）后服务端可能仍在预热 / 创建，
+  沙箱实际存在但客户端拿不到 sandbox_id -> 孤儿。
+- 思路：**预热成功前不创建任何记录**（无孤儿可言）；需要长时间预热时
+  强制客户端携带幂等 sandbox-id，重试同 ID 立即命中已有记录（不重复创建）。
+- 自适应：镜像已缓存 -> 快路径，服务端直接创建（官方 SDK 无感）；镜像
+  未缓存 -> 慢路径，要求 `X-Sandbox-Id`。
 
-### 5.2 位置与存储
+### 5.2 预热预判
 
-- 队列挂在控制面创建流程上：`registry.create` 之后、`select_and_reserve`
-  失败时入队，保留 template / snapshot / volume 亲和参数与已生成的
-  `sandbox_id`（记录状态置 `pending`）。
-- 控制面是多副本部署（Redis 已支持），队列必须 **Redis-backed**：
-  - 用 Redis ZSET（score = 到期时间）存储，便于按 deadline 取队首和超时
-    淘汰；或 LIST + 重试循环，推荐 ZSET；
-  - 每个控制面副本运行 Dispatcher 协程：按 `E2B_SANDBOX_QUEUE_POLL_S`
-    周期弹出到期项 -> 尝试 `select_and_reserve` -> 成功则继续 provision；
-    失败则按剩余 deadline 重新入队或淘汰；
-  - 创建请求本身长轮询等待结果（HTTP 挂起），结果通过 Redis pub/sub 或
-    状态轮询返回；客户端断开时丢弃对应队列项。
-  - 半成品回滚：客户端在 provisioning 开始后断开 / 超时，处理协程必须
-    删除已建沙箱（调 worker `/agent/sandboxes/{id}`）并释放节点配额，
-    杜绝孤儿沙箱（SDK 侧影响与约束见 5.6）。
+- 预热成本 = 镜像 rootfs 提取（拉取 + 解包），digest 级缓存
+  （`<rootfs>/.complete` 标记），幂等且可预判。
+- 新增 worker 端点 `GET /agent/images/{image}/warm` -> `{cached, digest}`，
+  只查缓存标记（毫秒级），供控制面决定快 / 慢路径。
+- 控制面流程：`select_and_reserve`（选节点 + 预留配额）后调用该端点预判；
+  可选：worker 注册 / 心跳时上报缓存镜像列表，控制面本地预判（省一次 RPC，
+  但 digest 可能过期，准确性低于端点）。
 
-### 5.3 队列参数
+### 5.3 快路径（镜像已缓存）
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `E2B_SANDBOX_QUEUE_CAPACITY` | 200 | 队列上限，满则立即 503 |
-| `E2B_SANDBOX_QUEUE_TIMEOUT_S` | 30 | 单请求最大等待，超时 503 |
-| `E2B_SANDBOX_QUEUE_POLL_S` | 1 | Dispatcher 重试周期 |
+- 服务端生成 `sandbox_id` -> `registry.create` -> provision -> 201 直接返回；
+- 官方 SDK 默认行为不变（不带任何 header 也能创建）；
+- 边界：探针与 provision 之间镜像可能失效（tag 更新），快路径 provision
+  因镜像问题失败时兜底走慢路径或直接报错，不留半成品。
 
-### 5.4 公平性与亲和
+### 5.4 慢路径（镜像未缓存，强制幂等）
 
-- FIFO + 超时淘汰；
-- 保留 volume / snapshot 节点亲和：入队项携带 `volume_node_id`，重试仍走
-  同一亲和路径；目标节点 draining 或已被移除时直接失败返回（避免无限等待）；
-- draining 节点不会获得新调度（调度器过滤），排队项同样不会落到
-  draining 节点。
+- 客户端通过 `api_headers={"X-Sandbox-Id": "sbx_..."}` 携带自生成的 ID
+  （官方 e2b SDK 2.46 的 `api_headers` 会附加到 create 请求头，无需 fork）；
+- 带 ID：
+  1. Redis `SET NX` 抢占 pending（`key -> {node, status}`，带 TTL），并发同
+     ID 请求输家等待，避免重复预热；
+  2. 节点预热 `resolve_image_rootfs`（digest 缓存幂等）；
+  3. 预热成功才用客户端 ID 建记录 -> provision -> 201；
+  4. 预热 / provision 失败：释放配额、清 pending、删除已建记录，不留孤儿。
+- 不带 ID：**快速失败**——返回 428 + 错误码 `warm_required` + 结构化提示
+  （"重试时带上 X-Sandbox-Id"），释放配额，不挂起不预热。
+- 重试语义：
+  - 同 ID 已有记录 -> 立即 201；
+  - pending 中 -> 等待落定（剩余请求超时内）；
+  - 全新 -> 重走慢路径（缓存命中后即快路径）。
 
-### 5.5 与 autoscaler 的关系
+### 5.5 幂等保证边界
 
-- 队列深度是"请求容量"最直接的信号：`/internal/fleet/metrics` 返回
-  `queueDepth`，autoscaler 以"剩余容量 + 队列深度 + 503 率"组合作为主指标；
-- Dispatcher 只负责重试投递，不负责扩容；扩容由 autoscaler 按指标驱动，
-  避免同一组件既消费队列又扩缩容的耦合。
+- 只对携带 `X-Sandbox-Id` 的客户端生效；官方 SDK 默认路径（不带 header）
+  在快路径下无感，在冷图上得到可读的 `SandboxException`（428
+  `warm_required`），由调用方决定是否带 ID 重试；
+- ID 校验：`sbx_` 前缀 + 合法字符，防注入 / 碰撞；
+- TTL sweeper 仍为最终兜底：任何原因产生的孤儿都会被定时回收（默认 TTL
+  300s），不是永久泄漏。
 
 ### 5.6 SDK 行为影响与约束
 
 基于官方 e2b SDK 2.46.0 源码核实（本项目测试锁定的版本；JS SDK 2.46.1
 为同一套 REST 语义）：
 
-- **协议无感**：仍然是同一个 `POST /sandboxes`，排队成功返回 201、超时 /
-  队满返回 503；SDK 的调用方式、参数、返回结构均不变。
-- **SDK 无客户端重试**：503 映射为 `SandboxException`（429 ->
-  `RateLimitException`，401 -> `AuthenticationException`）；SDK 不读
-  `Retry-After` 也不自动重试，排队逻辑只能做在服务端。
+- **协议无感**：仍然是同一个 `POST /sandboxes`，快路径 201 直接返回、慢
+  路径带 ID 重试后同样 201；SDK 调用方式、参数、返回结构均不变。
+- **幂等键载体**：官方 SDK 2.46 的 `api_headers` 会附加到 create 请求头
+  （`connection_config.py` 已核实），无需 fork SDK；
+- **SDK 无客户端重试**：503 / 428 均映射为 `SandboxException`（429 ->
+  `RateLimitException`，401 -> `AuthenticationException`）；重试由调用方
+  决定（建议带同 ID + 退避）。
 - **请求超时是硬约束**：SDK 默认请求超时 60s（`REQUEST_TIMEOUT`，可用
-  `request_timeout` 参数覆盖）。必须满足
-  `E2B_SANDBOX_QUEUE_TIMEOUT_S + 扩容冷启动预算 < 60s`；不满足时调小
-  队列超时，或在使用文档中要求调用方显式传 `request_timeout`（如 90~120s）。
-- **孤儿沙箱防护**：客户端超时 / 断开后若已进入 provisioning，仅丢弃队列
-  项不够，必须回滚（删除已建沙箱 + 释放配额），见 5.2。
-- **重试提示**：客户端超时后盲目重试会叠加并发（thundering herd）且可能
-  同时存在两个沙箱；建议调用方配合退避策略，或引入幂等键（当前服务端
-  未支持，列为可选增强）。
+  `request_timeout` 覆盖）。慢路径预热 + 创建必须远小于 60s，否则客户端
+  超时；缓解：worker 启动预热、warm pool、预热缓存（第二次即快路径）。
+- **孤儿防护**：预热成功前无记录；带 ID 的请求即使客户端超时，重试同 ID
+  也能命中；TTL sweeper 兜底，见 5.5。
 
 ## 6. Autoscaler 组件设计
 
@@ -246,9 +249,10 @@ manifest 移除 `/var/run/docker.sock` 挂载。
 | `E2B_AS_MIN_REPLICAS` | 1 | 常驻 warm pool 下限 |
 | `E2B_AS_MAX_REPLICAS` | 16 | 上限 |
 | `E2B_AS_UTIL_THRESHOLD` | 0.70 | 主维度利用率达到即扩 |
-| `E2B_AS_QUEUE_THRESHOLD` | 5 | 队列深度超过即扩（与利用率互为补充） |
 | `E2B_AS_SCALE_UP_COOLDOWN_S` | 60 | 扩容冷却 |
 | `E2B_AS_SCALE_DOWN_COOLDOWN_S` | 600 | 缩容冷却 |
+| `E2B_AS_SCALE_DOWN_UTIL` | 0.40 | 集群聚合利用率低于该值才允许缩容 |
+| `E2B_AS_NODE_SCALE_DOWN_UTIL` | 0 | 候选节点利用率低于该值（0=完全空闲） |
 | `E2B_AS_IDLE_BEFORE_DRAIN_S` | 300 | 节点空闲多久才允许 drain |
 | `E2B_AS_WARMUP_BUFFER` | 1 | 额外缓冲副本数（覆盖冷启动） |
 | `E2B_AS_POLL_S` | 5 | 决策周期 |
@@ -351,10 +355,14 @@ env:
 
 ### 9.3 回收条件（autoscaler 判定）
 
-1. 节点连续 `E2B_AS_IDLE_BEFORE_DRAIN_S` 秒利用率 = 0；
-2. 调 drain 后活跃沙箱数 = 0；
-3. 全局副本数仍 >= min_replicas；
-4. 缩容冷却已过。
+1. 集群级：聚合主维度利用率（Σreserved / Σtotal）<
+   `E2B_AS_SCALE_DOWN_UTIL`（默认 0.40），整体需求低时才允许缩容——避免
+   高负载下误缩造成扩容抖动（缩下去马上又扩回来）；
+2. 节点级：候选节点利用率 < `E2B_AS_NODE_SCALE_DOWN_UTIL`（默认 0，完全
+   空闲），且连续 `E2B_AS_IDLE_BEFORE_DRAIN_S` 秒无新沙箱；
+3. 调 drain 后活跃沙箱数 = 0；
+4. 全局副本数仍 >= min_replicas；
+5. 缩容冷却已过。
 
 K8s 侧再叠加 `terminationGracePeriodSeconds`（如 120s）+ PDB
 （`minAvailable: 1`）；SIGTERM 后 worker 停止心跳、拒绝新沙箱，存量沙箱
@@ -370,7 +378,11 @@ K8s 侧再叠加 `terminationGracePeriodSeconds`（如 120s）+ PDB
 2. warm pool：`min_replicas` 常驻，镜像已缓存；
 3. worker 启动时预热：agent 启动阶段按 `E2B_BASE_IMAGE`（或配置的模板
    列表）调用一次 `resolve_image_rootfs`，把常用 rootfs 提前解包；
-4. 模板镜像 CI 预推仓库，worker 首拉由 registry CDN 加速（Aliyun ACR）。
+4. 模板镜像 CI 预推仓库，worker 首拉由 registry CDN 加速（Aliyun ACR）；
+5. provisioning 预算约束：慢路径（预热 + 创建）全程必须远小于 SDK 默认
+   请求超时 60s，不满足时要求调用方显式传 `request_timeout`，或降低预热
+   成本（预热列表收敛、预推镜像）；
+6. TTL sweeper 为最终孤儿兜底（默认 TTL 300s），与第 5.5 节一致。
 
 ## 11. 落地路线图与改动清单
 
@@ -397,12 +409,13 @@ K8s 侧再叠加 `terminationGracePeriodSeconds`（如 120s）+ PDB
 - `control_plane/registry/nodes.py`：draining 字段 + 过滤；
 - `control_plane/scheduler.py`：排除 draining；
 - `control_plane/api/internal.py`：drain 接口 + fleet metrics 聚合接口；
-- 新增 `control_plane/queue.py`（或 `registry/queue.py`）：Redis ZSET 有界
-  队列 + Dispatcher 协程；
-- `control_plane/api/sandboxes.py`：创建流程接入队列（容量不足 -> 入队
-  长轮询，队满/超时 -> 503，客户端断开 -> 清理）；
-- 单测：draining 不调度、metrics 聚合正确性、队列入队/超时/队满/亲和/
-  断开清理。
+- `envd_service/http/`：新增 `GET /agent/images/{image}/warm` 缓存预判端点；
+- `control_plane/registry/manager.py`：`registry.create` 支持显式
+  `sandbox_id`；
+- `control_plane/api/sandboxes.py`：创建流程自适应（快 / 慢路径 +
+  `X-Sandbox-Id` 幂等 + Redis pending `SET NX` 去重 + 428 `warm_required`）；
+- 单测：draining 不调度、metrics 聚合正确性、幂等创建（同 ID 重试不重复、
+  冷图无 ID 快速失败、并发同 ID 去重）。
 
 ### Phase 3：Autoscaler + 本地后端
 
@@ -429,11 +442,10 @@ K8s 侧再叠加 `terminationGracePeriodSeconds`（如 120s）+ PDB
 1. 运行时任何组件都不挂 docker socket，镜像全量来自
    `registry.cn-shanghai.aliyuncs.com/byteplan/`；
 2. 本地模式：构造请求压力，worker 容器自动从 min 扩到 N，请求无
-   503（阈值内），压力消失后缩回 min；
-3. 容量不足时请求入队等待而非立即 503；autoscaler 按队列深度扩容后
-   请求成功，超时 / 队满才返回 503；
-4. SDK 视角：排队场景下 create 要么 201 成功、要么 503 / 超时，且客户端
-   超时 / 断开后无遗留沙箱（无孤儿）；
+   503（阈值内）；压力消失且集群利用率低于缩容阈值后才缩回 min；
+3. 快路径：镜像已缓存时官方 SDK 无感创建（201 直接返回，不带 header）；
+4. 慢路径：冷图无 ID 快速失败（428 `warm_required`）且无残留；带
+   `X-Sandbox-Id` 重试同 ID 不重复创建，客户端超时 / 断开后无孤儿；
 5. K8s 模式：同一套决策逻辑驱动 Deployment 副本数，worker pod 自动注册
    到控制面并被 gateway 正常路由；
 6. 缩容全程活跃沙箱存活率 100%（drain 后新请求不落该节点）；
@@ -441,6 +453,8 @@ K8s 侧再叠加 `terminationGracePeriodSeconds`（如 120s）+ PDB
 
 ## 13. 可选增强（暂不进入一期）
 
+- 服务端有界请求队列：容量不足时由服务端代为排队等 headroom（延迟 ID +
+  客户端幂等重试已覆盖主要场景，仅在需要服务端吸收突发时启用）；
 - 模板构建 Builder 服务（BuildKit / kaniko），恢复"控制面触发构建"能力；
 - HPA + custom metrics 原生扩缩容；
 - cluster-autoscaler 节点级伸缩。
