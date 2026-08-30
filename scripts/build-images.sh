@@ -7,7 +7,7 @@
 # Defaults push nothing; set PUSH=1 to push after building.
 set -eu
 
-TAG="${TAG:-e2b-sandlock:latest}"
+TAG="${TAG:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock:latest}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 PUSH="${PUSH:-0}"
 
