@@ -110,6 +110,10 @@ services:
       - NET_ADMIN
     sysctls:
       - net.ipv4.ip_forward=1
+      # The wildcard DNS gateway binds 127.0.1.x:53; resolv.conf cannot carry
+      # a port, so allow unprivileged low-port binding (namespaced per
+      # container). This is the one deployment knob the sandlock fork needs.
+      - net.ipv4.ip_unprivileged_port_start=0
     security_opt:
       - seccomp=unconfined
     restart: unless-stopped

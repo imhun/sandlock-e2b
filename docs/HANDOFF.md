@@ -58,6 +58,17 @@ upstream=multikernel）。分支：`feature/network-wildcard`（R1–R4 通配�
   预置 198.18.0.99–103 回环地址与 /etc/hosts fixture，chmod 共享
   target，然后 `setpriv` 降为 nobody 再执行命令）。宿主
   `~/.cargo/registry` 挂载到 `/opt/cargo/registry` 离线构建。
+- **:53 低端口设置的固化**：`net.ipv4.ip_unprivileged_port_start` 是内核
+  设置，写不进镜像文件，但可以固化到容器运行时清单——`docker run
+  --sysctl net.ipv4.ip_unprivileged_port_start=0`、compose `sysctls:`、
+  K8s `securityContext.sysctls`（实测无需 privileged、按容器隔离，容器可
+  全程非 root，连入口 root 都不需要）。`--cap-add=NET_BIND_SERVICE` 对非
+  root 进程无效（Docker 不注入 ambient caps），`setcap` 文件能力也被
+  sandlock 的 no_new_privs 禁用——所以 sysctl 声明是唯一干净的方式。
+  **注意**：`--network host` 的容器 Docker 拒绝应用 net sysctl（宿主
+  netns 不允许），所以测试容器（host 网络）必须靠入口脚本 root 写一次；
+  生产 worker 用桥接网络，compose `sysctls` 生效（docker-compose.prod.yml
+  已加）。
 - **构建以 root 跑一次**（`--user root --entrypoint bash`，见下），**测试
   全程非 root**——这是 sandlock 无 root 原则的落地；整个套件不再有
   "root 环境性失败"。需要 root 的操作显式
