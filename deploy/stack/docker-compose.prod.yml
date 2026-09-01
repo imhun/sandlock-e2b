@@ -17,9 +17,6 @@ services:
     volumes:
       - buildkit-data:/home/user/.local/share/buildkit
       - ./buildkitd.toml:/home/user/.config/buildkit/buildkitd.toml:ro
-      # Unix socket shared with the control plane: no TCP listener at all,
-      # so a full-egress sandbox cannot reach the build daemon.
-      - buildkit-sock:/run/buildkit
     restart: unless-stopped
 
   redis:
@@ -68,7 +65,9 @@ services:
       - "${CONTROL_PLANE_PORT:-3000}:3000"
     volumes:
       - sandbox-shared:/var/lib/e2b-sandboxes
-      - buildkit-sock:/run/buildkit
+      # Rootless buildkitd's socket (its data volume), mounted read-only so
+      # the control plane reaches the daemon with no TCP listener at all.
+      - buildkit-data:/run/buildkit:ro
     restart: unless-stopped
 
   worker-1: &worker
@@ -113,4 +112,3 @@ volumes:
   redis-data:
   sandbox-shared:
   buildkit-data:
-  buildkit-sock:
