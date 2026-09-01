@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -171,6 +172,15 @@ def create_app(
     )
     app.state.create_limiter = SlidingWindowRateLimiter(
         settings.create_rate_limit_per_min
+    )
+    # E3.5: template build admission. The slot counter bounds concurrent
+    # buildkit builds (the actual CPU/disk consumer); the per-key limiter
+    # additionally throttles serial build bombardment. Both are per-process
+    # (same shape as the create limiter; single control-plane deployment).
+    app.state.template_build_slots = 0
+    app.state.template_build_slots_lock = threading.Lock()
+    app.state.template_build_limiter = SlidingWindowRateLimiter(
+        settings.template_build_rate_limit_per_min
     )
     app.state.tenant_create_limiter = SlidingWindowRateLimiter(
         settings.create_rate_limit_per_min

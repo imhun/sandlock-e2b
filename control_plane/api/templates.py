@@ -213,6 +213,48 @@ async def _run_build(
         build.append_log(build.error)
 
 
+async def _run_build_with_slot(
+    app: Any,
+    template: TemplateRecord,
+    build: BuildRecord,
+    dockerfile: str,
+    workspace_base: Path,
+    release_slot: Any,
+) -> None:
+    """Run a build and always release its concurrency slot afterwards."""
+    try:
+        await _run_build(app, template, build, dockerfile, workspace_base)
+    except Exception as e:  # defensive: never leave a stuck "building"
+        build.status = "error"
+        build.error = f"build failed unexpectedly: {e}"
+        build.append_log(build.error)
+    finally:
+        release_slot()
+
+
+def _acquire_build_slot(request: Request) -> Any:
+    """Reserve one build concurrency slot; raises 429 when full."""
+    limit = request.app.state.settings.template_build_concurrency
+    if limit <= 0:
+        return lambda: None
+    lock = request.app.state.template_build_slots_lock
+    with lock:
+        if request.app.state.template_build_slots >= limit:
+            raise OfficialError(
+                429, "Template build concurrency limit exceeded"
+            )
+        request.app.state.template_build_slots += 1
+        slots = request.app.state.template_build_slots
+
+    def release() -> None:
+        with lock:
+            request.app.state.template_build_slots = max(
+                0, request.app.state.template_build_slots - 1
+            )
+
+    return release
+
+
 @router.post("/v3/templates", status_code=202, dependencies=[Depends(require_api_key)])
 async def create_template_build(request: Request) -> dict[str, Any]:
     try:
@@ -321,21 +363,35 @@ async def trigger_template_build(
         build = record.get_build(build_id)
     except UnknownTemplateBuildError:
         raise OfficialError(404, f"Template build {build_id} not found")
+    # E3.5: per-key build rate limit (0 = disabled), then the global
+    # concurrency cap. A malicious key cannot flood buildkit with parallel
+    # builds; over-capacity triggers are rejected with 429.
+    if not request.app.state.template_build_limiter.allow(
+        request.headers.get("X-API-Key") or ""
+    ):
+        raise OfficialError(429, "Template build rate limit exceeded")
+    release_slot = _acquire_build_slot(request)
     try:
         body = await request.json()
     except json.JSONDecodeError:
+        release_slot()
         raise OfficialError(400, "Invalid JSON body")
     try:
         dockerfile = _steps_to_dockerfile(
             (body or {}).get("fromImage"), (body or {}).get("steps") or []
         )
     except ValueError as e:
+        release_slot()
         build.status = "error"
         build.error = str(e)
         return Response(status_code=202)
     app = request.app
     workspace_base = app.state.workspace_base
-    asyncio.create_task(_run_build(app, record, build, dockerfile, workspace_base))
+    asyncio.create_task(
+        _run_build_with_slot(
+            app, record, build, dockerfile, workspace_base, release_slot
+        )
+    )
     return Response(status_code=202)
 
 
