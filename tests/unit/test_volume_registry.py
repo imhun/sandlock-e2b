@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 
 import pytest
@@ -12,6 +13,20 @@ from control_plane.registry.volumes import (
     VolumeRegistry,
 )
 from gateway_common.timeutil import to_iso_z, utcnow
+
+
+def _make_pre_e33_disk_record(registry, record):
+    """Rewrite a record's meta file as a genuine pre-E3.3 payload.
+
+    Current ``to_storage_dict()`` always writes the E3.3 token fields
+    (even when unset), so simulating a legacy disk record requires
+    dropping those keys, exactly as E3.2-era code did.
+    """
+    payload = record.to_storage_dict()
+    payload.pop("token_expires_at", None)
+    payload.pop("token_revoked", None)
+    path = registry._record_path(record.volume_id)
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def test_create_get_list_delete(workspace):
@@ -116,6 +131,7 @@ def test_redis_mode_backfills_legacy_disk_records(workspace):
     # Pre-Redis volume: created by a disk-only registry, never in Redis.
     legacy = VolumeRegistry(workspace / "volumes")
     record = legacy.create("legacy")
+    _make_pre_e33_disk_record(legacy, record)
 
     upgraded = VolumeRegistry(
         workspace / "volumes",
@@ -152,6 +168,7 @@ def test_redis_backfill_is_idempotent_and_preserves_revocation(workspace):
     server = fakeredis.FakeServer()
     legacy = VolumeRegistry(workspace / "volumes")
     record = legacy.create("legacy")
+    _make_pre_e33_disk_record(legacy, record)
 
     client = fakeredis.FakeRedis(server=server)
     upgraded = VolumeRegistry(workspace / "volumes", redis_client=client)
@@ -199,6 +216,140 @@ def test_redis_shared_record_and_revocation_visibility(workspace):
     registry.delete(record.volume_id)
     with pytest.raises(UnknownVolumeError):
         replica.get(record.volume_id)
+
+
+def test_redis_delete_survives_restart_with_stale_replica_disk_copy(workspace):
+    """E3.3 fix2: replica A deletes a volume; replica B, which wrote a
+    disk copy earlier, must not resurrect it after restarting (its stale
+    disk copy must never be backfilled into the shared store)."""
+    fakeredis = pytest.importorskip("fakeredis")
+    server = fakeredis.FakeServer()
+    base_a = workspace / "replica-a"
+    base_b = workspace / "replica-b"
+    registry_a = VolumeRegistry(
+        base_a, redis_client=fakeredis.FakeRedis(server=server)
+    )
+    registry_b = VolumeRegistry(
+        base_b, redis_client=fakeredis.FakeRedis(server=server)
+    )
+    record = registry_a.create("data")
+    # Replica B saved the shared record, leaving its own disk copy.
+    registry_b.save(registry_b.get(record.volume_id))
+    assert (base_b / "_meta" / f"{record.volume_id}.json").is_file()
+
+    # Replica A deletes the volume: Redis key tombstoned, A's disk copy
+    # removed, B's stale disk copy untouched.
+    registry_a.delete(record.volume_id)
+    with pytest.raises(UnknownVolumeError):
+        registry_a.get(record.volume_id)
+
+    # Replica B restarts with its stale disk copy: volume invisible and
+    # its token invalid.
+    restarted_b = VolumeRegistry(
+        base_b, redis_client=fakeredis.FakeRedis(server=server)
+    )
+    with pytest.raises(UnknownVolumeError):
+        restarted_b.get(record.volume_id)
+    assert [v.volume_id for v in restarted_b.list()] == []
+    with pytest.raises(UnknownVolumeError):
+        restarted_b.verify_token(record.volume_id, record.token)
+
+
+def test_redis_backfill_skips_redis_mode_disk_copies(workspace):
+    """Only pre-E3.3 disk records (without token_expires_at/token_revoked)
+    qualify for backfill; a Redis-mode replica's disk copy is a stale cache
+    and must never be mirrored back on a Redis miss."""
+    fakeredis = pytest.importorskip("fakeredis")
+    base = workspace / "volumes"
+    replica = VolumeRegistry(
+        base, redis_client=fakeredis.FakeRedis(server=fakeredis.FakeServer())
+    )
+    record = replica.create("data")
+    disk_copy = replica._record_path(record.volume_id)
+    assert disk_copy.is_file()
+    assert "token_expires_at" in json.loads(disk_copy.read_text(encoding="utf-8"))
+
+    # A fresh process with the same disk and an empty shared store (e.g.
+    # Redis reset) must not resurrect the record from the disk copy.
+    fresh = VolumeRegistry(
+        base, redis_client=fakeredis.FakeRedis(server=fakeredis.FakeServer())
+    )
+    with pytest.raises(UnknownVolumeError):
+        fresh.get(record.volume_id)
+    assert [v.volume_id for v in fresh.list()] == []
+
+
+def test_redis_tombstone_blocks_backfill_of_legacy_disk_record(workspace):
+    """A deletion by another replica (Redis tombstone) keeps even a
+    qualifying pre-E3.3 disk record deleted after a restart."""
+    fakeredis = pytest.importorskip("fakeredis")
+    server = fakeredis.FakeServer()
+    base = workspace / "volumes"
+    # Pre-Redis legacy record (no token fields) on this replica's disk.
+    legacy = VolumeRegistry(base)
+    record = legacy.create("legacy")
+    _make_pre_e33_disk_record(legacy, record)
+
+    upgraded = VolumeRegistry(
+        base, redis_client=fakeredis.FakeRedis(server=server)
+    )
+    assert upgraded.get(record.volume_id).volume_id == record.volume_id
+
+    # Another replica deletes the volume; this replica's legacy disk copy
+    # is left untouched.
+    deleter = VolumeRegistry(
+        workspace / "deleter", redis_client=fakeredis.FakeRedis(server=server)
+    )
+    deleter.delete(record.volume_id)
+
+    # Fresh process over the same disk: the Redis tombstone wins over the
+    # legacy disk copy.
+    restarted = VolumeRegistry(
+        base, redis_client=fakeredis.FakeRedis(server=server)
+    )
+    with pytest.raises(UnknownVolumeError):
+        restarted.get(record.volume_id)
+    assert [v.volume_id for v in restarted.list()] == []
+    with pytest.raises(UnknownVolumeError):
+        restarted.verify_token(record.volume_id, record.token)
+
+
+def test_disk_tombstone_keeps_restored_meta_deleted(workspace):
+    """The disk tombstone marker survives restarts even if the record file
+    reappears (partial delete / restored copy), so a deleted volume cannot
+    come back in disk-only mode either."""
+    registry = VolumeRegistry(workspace / "volumes")
+    record = registry.create("data")
+    registry.delete(record.volume_id)
+    assert not registry._record_path(record.volume_id).exists()
+
+    stale = record.to_storage_dict()
+    path = registry._record_path(record.volume_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(stale), encoding="utf-8")
+
+    restarted = VolumeRegistry(workspace / "volumes")
+    with pytest.raises(UnknownVolumeError):
+        restarted.get(record.volume_id)
+    assert [v.volume_id for v in restarted.list()] == []
+
+
+def test_redis_list_reflects_cross_replica_delete(workspace):
+    """list() in Redis mode re-checks the shared store, so a volume
+    deleted by another replica disappears even without a restart."""
+    fakeredis = pytest.importorskip("fakeredis")
+    server = fakeredis.FakeServer()
+    registry_a = VolumeRegistry(
+        workspace / "a", redis_client=fakeredis.FakeRedis(server=server)
+    )
+    registry_b = VolumeRegistry(
+        workspace / "b", redis_client=fakeredis.FakeRedis(server=server)
+    )
+    record = registry_a.create("data")
+    assert registry_b.get(record.volume_id).volume_id == record.volume_id
+
+    registry_a.delete(record.volume_id)
+    assert [v.volume_id for v in registry_b.list()] == []
 
 
 def test_create_with_per_sandbox_quota_mb(workspace):

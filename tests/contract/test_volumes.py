@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -156,6 +157,14 @@ async def test_legacy_disk_volume_visible_and_accessible_after_redis_upgrade(
     volume_root = workspace / "_volumes"
     legacy = VolumeRegistry(volume_root)
     record = legacy.create("pre-upgrade")
+    # Current create() writes the E3.3 token fields even when unset; rewrite
+    # the meta file as a genuine pre-E3.3 payload (keys absent).
+    payload = record.to_storage_dict()
+    payload.pop("token_expires_at", None)
+    payload.pop("token_revoked", None)
+    legacy._record_path(record.volume_id).write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
     vid = record.volume_id
     token = record.token
 
@@ -195,6 +204,63 @@ async def test_legacy_disk_volume_visible_and_accessible_after_redis_upgrade(
         listed = await client.get("/volumes", headers={"X-API-Key": "local-key"})
         assert listed.status_code == 200
         assert [v["volumeID"] for v in listed.json()] == [vid]
+
+
+async def test_deleted_volume_not_resurrected_by_replica_restart(workspace):
+    """E3.3 fix2: replica A deletes a volume while replica B holds a stale
+    disk copy; after B restarts the volume stays invisible (404) and its
+    token stays invalid (401)."""
+    fakeredis = pytest.importorskip("fakeredis")
+    server = fakeredis.FakeServer()
+    base_a = workspace / "_volumes-a"
+    base_b = workspace / "_volumes-b"
+
+    registry_a = VolumeRegistry(
+        base_a, redis_client=fakeredis.FakeRedis(server=server)
+    )
+    registry_b = VolumeRegistry(
+        base_b, redis_client=fakeredis.FakeRedis(server=server)
+    )
+    record = registry_a.create("shared")
+    # Replica B saved the shared record, leaving its own disk copy.
+    registry_b.save(registry_b.get(record.volume_id))
+
+    control_a = create_control_app(
+        settings=Settings(api_keys=("local-key",)),
+        runtime_registry=RuntimeRegistry(workspace),
+        workspace_base=workspace,
+        volumes_registry=registry_a,
+    )
+    async with _client(control_a) as client:
+        deleted = await client.delete(
+            f"/volumes/{record.volume_id}", headers={"X-API-Key": "local-key"}
+        )
+        assert deleted.status_code == 204
+
+    # Replica B restarts with its stale disk copy.
+    restarted_b = VolumeRegistry(
+        base_b, redis_client=fakeredis.FakeRedis(server=server)
+    )
+    control_b = create_control_app(
+        settings=Settings(api_keys=("local-key",)),
+        runtime_registry=RuntimeRegistry(workspace),
+        workspace_base=workspace,
+        volumes_registry=restarted_b,
+    )
+    async with _client(control_b) as client:
+        info = await client.get(
+            f"/volumes/{record.volume_id}", headers={"X-API-Key": "local-key"}
+        )
+        assert info.status_code == 404
+        read = await client.get(
+            f"/volumecontent/{record.volume_id}/file",
+            headers={"Authorization": f"Bearer {record.token}"},
+            params={"path": "a.txt"},
+        )
+        assert read.status_code == 401
+        listed = await client.get("/volumes", headers={"X-API-Key": "local-key"})
+        assert listed.status_code == 200
+        assert listed.json() == []
 
 
 async def test_volume_token_expires_after_ttl(make_apps):

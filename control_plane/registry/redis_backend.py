@@ -20,6 +20,12 @@ try:
 except ImportError:  # pragma: no cover
     redis = None  # type: ignore[assignment]
 
+#: Marker stored under a record key to remember a deletion. It is not valid
+#: JSON, so ``get()`` naturally treats the key as absent, while
+#: ``is_tombstoned()`` lets backfill logic distinguish "never existed"
+#: from "was deleted" (deleted must never be resurrected from disk).
+TOMBSTONE = "__deleted__"
+
 
 class RedisQuotaStore:
     """Atomic quota reservations shared across replicas."""
@@ -110,6 +116,19 @@ class RedisRecordStore:
 
     def delete(self, record_id: str) -> None:
         self._client.delete(self._key(record_id))
+
+    def tombstone(self, record_id: str) -> None:
+        """Keep the key but mark the record as deleted.
+
+        Unlike ``delete``, the key stays present so a replica's stale
+        on-disk copy can never be mirrored back over the deletion (see
+        ``VolumeRegistry._ensure_backfilled``).
+        """
+        self._client.set(self._key(record_id), TOMBSTONE)
+
+    def is_tombstoned(self, record_id: str) -> bool:
+        raw = self._client.get(self._key(record_id))
+        return raw == TOMBSTONE or raw == TOMBSTONE.encode()
 
     def keys(self) -> list[str]:
         pattern = f"{self._ns}:record:*"

@@ -165,6 +165,9 @@ class VolumeRegistry:
             volume_id = sandbox_id().replace("sbx_", "vol_")
             while volume_id in self._volumes:
                 volume_id = sandbox_id().replace("sbx_", "vol_")
+            tombstone = self._tombstone_path(volume_id)
+            if tombstone.exists():
+                tombstone.unlink()
             token_expires_at = (
                 utcnow() + timedelta(seconds=ttl) if ttl > 0 else None
             )
@@ -197,6 +200,32 @@ class VolumeRegistry:
         # exposed through the volume content API.
         return self._base / "_meta" / f"{volume_id}.json"
 
+    def _tombstone_path(self, volume_id: str) -> Path:
+        # Disk tombstone marker: written by delete() before the record is
+        # removed so a stale copy of the record (this replica's own disk,
+        # a restored backup, ...) can never be backfilled after a restart.
+        return self._base / "_meta" / f"{volume_id}.deleted"
+
+    def _is_tombstoned_on_disk(self, volume_id: str) -> bool:
+        return self._tombstone_path(volume_id).is_file()
+
+    @staticmethod
+    def _is_legacy_disk_payload(payload: dict[str, Any]) -> bool:
+        """True only for records written before E3.3 (no token fields).
+
+        E3.3+ ``_write_record`` always persists ``token_expires_at`` and
+        ``token_revoked``, so a disk copy carrying either key is a stale
+        cache of a Redis-mode replica. The shared store is authoritative
+        for those records; mirroring them back on a Redis miss would
+        resurrect volumes that another replica already deleted.
+        """
+        if not isinstance(payload, dict):
+            return False
+        return (
+            "token_expires_at" not in payload
+            and "token_revoked" not in payload
+        )
+
     def _write_record(self, record: VolumeRecord) -> None:
         path = self._record_path(record.volume_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,7 +247,7 @@ class VolumeRegistry:
                 payload, self._base / volume_id
             )
         path = self._record_path(volume_id)
-        if not path.is_file():
+        if self._is_tombstoned_on_disk(volume_id) or not path.is_file():
             raise UnknownVolumeError(volume_id)
         payload = json.loads(path.read_text(encoding="utf-8"))
         return VolumeRecord.from_storage_dict(payload, self._base / volume_id)
@@ -232,6 +261,13 @@ class VolumeRegistry:
         first access writes any disk record Redis does not know yet into
         the shared store; records already present are never overwritten,
         so a concurrent replica's revocation/expiry stays authoritative.
+
+        Two guards keep deleted volumes dead:
+        * only pre-E3.3 records (no ``token_expires_at``/``token_revoked``
+          keys) qualify — disk copies written by Redis-mode replicas are
+          stale caches, not a source of truth;
+        * tombstoned records (Redis marker or local ``.deleted`` file) are
+          skipped, so a deletion by any replica survives restarts.
         """
         if self._record_store is None:
             return
@@ -244,10 +280,19 @@ class VolumeRegistry:
                 return
             for path in sorted(meta_dir.glob("*.json")):
                 volume_id = path.stem
+                if self._is_tombstoned_on_disk(volume_id):
+                    continue
                 try:
                     payload = json.loads(path.read_text(encoding="utf-8"))
-                    if self._record_store.get(volume_id) is not None:
-                        continue
+                except (OSError, ValueError, TypeError):
+                    continue
+                if not self._is_legacy_disk_payload(payload):
+                    continue
+                if self._record_store.is_tombstoned(volume_id):
+                    continue
+                if self._record_store.get(volume_id) is not None:
+                    continue
+                try:
                     record = VolumeRecord.from_storage_dict(
                         payload, self._base / volume_id
                     )
@@ -304,8 +349,14 @@ class VolumeRegistry:
         record = self.get(volume_id)
         with self._lock:
             self._volumes.pop(volume_id, None)
+        # Tombstone first: the marker (shared store + this replica's disk)
+        # stops any stale disk copy — this replica's or another one's —
+        # from being backfilled into the shared store after a restart.
+        tombstone = self._tombstone_path(volume_id)
+        tombstone.parent.mkdir(parents=True, exist_ok=True)
+        tombstone.write_text("deleted\n", encoding="utf-8")
         if self._record_store is not None:
-            self._record_store.delete(volume_id)
+            self._record_store.tombstone(volume_id)
         self._record_path(volume_id).unlink(missing_ok=True)
         if record.path is not None:
             import shutil
@@ -321,18 +372,39 @@ class VolumeRegistry:
         tenant_id: str | None = None,
     ) -> list[VolumeRecord]:
         self._ensure_backfilled()
-        with self._lock:
+        if self._record_store is not None:
+            # The shared store decides what exists: re-validate every
+            # candidate (local disk glob + in-process cache) against Redis
+            # so a volume deleted by another replica drops out of the
+            # listing immediately, even without a restart.
+            candidates = set(self._volumes)
             meta_dir = self._base / "_meta"
             if meta_dir.is_dir():
-                for path in sorted(meta_dir.glob("*.json")):
-                    volume_id = path.stem
-                    if volume_id in self._volumes:
-                        continue
-                    try:
-                        self._volumes[volume_id] = self._load_record(volume_id)
-                    except (OSError, ValueError, KeyError):
-                        continue
-            records = list(self._volumes.values())
+                with self._lock:
+                    for path in meta_dir.glob("*.json"):
+                        candidates.add(path.stem)
+            records = []
+            for volume_id in candidates:
+                try:
+                    records.append(self.get(volume_id))
+                except UnknownVolumeError:
+                    with self._lock:
+                        self._volumes.pop(volume_id, None)
+        else:
+            with self._lock:
+                meta_dir = self._base / "_meta"
+                if meta_dir.is_dir():
+                    for path in sorted(meta_dir.glob("*.json")):
+                        volume_id = path.stem
+                        if volume_id in self._volumes:
+                            continue
+                        try:
+                            self._volumes[volume_id] = self._load_record(
+                                volume_id
+                            )
+                        except (OSError, ValueError, KeyError):
+                            continue
+                records = list(self._volumes.values())
         if tenant_id is not None:
             records = [r for r in records if r.tenant_id == tenant_id]
         records = sorted(
