@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 import envd_service.agent as agent
+import envd_service.xfs_quota as xfs_quota
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
@@ -173,6 +174,81 @@ async def test_create_reprovision_reuses_existing_project_id(workspace, monkeypa
     assert app.state.runtime_registry.get("sbx_again").project_id == 42
 
 
+async def test_create_reprovision_failure_persists_none_after_cleanup(
+    workspace, monkeypatch, caplog
+):
+    """Re-provision failure after cleanup must not persist the stale projid:
+    limit fails, project -C succeeds, sandbox.json records project_id=None
+    (E2.2 review Important: otherwise quota silently stops applying)."""
+    app = _make_app(workspace)
+    app.state.runtime_registry.register(
+        sandbox_id="sbx_reprov_fail",
+        access_token="tok",
+        workspace_dir=str(workspace / "sbx_reprov_fail"),
+        disk_mb=1024,
+        project_id=777,
+    )
+
+    class _FakeProc:
+        def __init__(self, returncode, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        command = args[args.index("-c") + 1]
+        if command.startswith("project -s -p"):
+            return _FakeProc(0)
+        if command.startswith("limit -p"):
+            return _FakeProc(1, "", "limit boom")
+        if command.startswith("project -C -p"):
+            return _FakeProc(0)
+        raise AssertionError(f"unexpected xfs_quota command: {command}")
+
+    monkeypatch.setattr(
+        agent, "xfs_project_supported", lambda _mp, via_agent=False: (True, "")
+    )
+    monkeypatch.setattr(xfs_quota.subprocess, "run", fake_run)
+    caplog.set_level(logging.WARNING)
+
+    response = await _post_sandbox(app, "sbx_reprov_fail")
+    assert response.status_code == 201
+    record = app.state.runtime_registry.get("sbx_reprov_fail")
+    assert record is not None
+    assert record.project_id is None
+    payload = json.loads(
+        (workspace / "sbx_reprov_fail" / "sandbox.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["project_id"] is None
+    assert calls == [
+        [
+            "xfs_quota",
+            "-x",
+            "-c",
+            f"project -s -p {workspace}/sbx_reprov_fail 777",
+            str(workspace),
+        ],
+        ["xfs_quota", "-x", "-c", "limit -p bhard=1024M 777", str(workspace)],
+        [
+            "xfs_quota",
+            "-x",
+            "-c",
+            f"project -C -p {workspace}/sbx_reprov_fail 777",
+            str(workspace),
+        ],
+    ]
+    assert [r.message for r in caplog.records] == [
+        "XFS project quota setup failed for sbx_reprov_fail: "
+        "quota limit setup failed for sbx_reprov_fail: xfs_quota "
+        "'limit -p bhard=1024M 777' failed: limit boom",
+    ]
+
+
 async def test_delete_releases_project_and_removes_dir(workspace, monkeypatch):
     app = _make_app(workspace)
     app.state.runtime_registry.register(
@@ -198,6 +274,37 @@ async def test_delete_releases_project_and_removes_dir(workspace, monkeypatch):
         "via_agent": False,
     }
     assert not (workspace / "sbx_del").exists()
+
+
+async def test_delete_release_uses_record_workspace_dir(workspace, monkeypatch):
+    """Delete derives project_dir and removal target from the record, not the
+    workspace_base/id convention (E2.2 review Minor)."""
+    app = _make_app(workspace)
+    recorded_dir = workspace / "custom" / "sbx_relocated"
+    recorded_dir.mkdir(parents=True)
+    app.state.runtime_registry.register(
+        sandbox_id="sbx_relocated",
+        access_token="tok",
+        workspace_dir=str(recorded_dir),
+        disk_mb=1024,
+        project_id=42,
+    )
+    calls: dict = {}
+
+    def fake_release(**kwargs):
+        calls.update(kwargs)
+
+    monkeypatch.setattr(agent, "release_project", fake_release)
+
+    response = await _delete_sandbox(app, "sbx_relocated")
+    assert response.status_code == 204
+    assert calls == {
+        "project_dir": recorded_dir,
+        "mount_point": workspace,
+        "projid": 42,
+        "via_agent": False,
+    }
+    assert not recorded_dir.exists()
 
 
 async def test_delete_keep_files_skips_release_and_keeps_dir(workspace, monkeypatch):

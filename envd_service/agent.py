@@ -224,6 +224,12 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
             logger.warning(
                 "XFS project quota setup failed for %s: %s", sandbox_id, exc
             )
+            # A failed provision may have cleared the project state
+            # (project -C after a half-created setup), so the sandbox must
+            # not keep a stale projid: persisting it would claim quota is
+            # active while the files no longer belong to any project, and
+            # delete would only leave an orphan quota table entry.
+            project_id = None
     runtime_registry.register(
         sandbox_id=sandbox_id,
         access_token=payload.get("accessToken", ""),
@@ -280,6 +286,14 @@ async def agent_delete_sandbox(
     runtime_registry = request.app.state.runtime_registry
     record = runtime_registry.get(sandbox_id)
     project_id = record.project_id if record is not None else None
+    # Derive the project dir from the record so release and rmtree always
+    # target the directory the sandbox was registered with; fall back to
+    # the workspace_base/id convention for unregistered sandboxes.
+    workspace_dir = (
+        Path(record.workspace_dir)
+        if record is not None
+        else settings.workspace_base / sandbox_id
+    )
     runtime_registry.unregister(sandbox_id)
     # Shared-workspace deployments keep the directory (keepFiles=true): the
     # same storage hosts the sandbox on every node, so removing it would
@@ -289,7 +303,7 @@ async def agent_delete_sandbox(
         if project_id is not None:
             try:
                 release_project(
-                    project_dir=settings.workspace_base / sandbox_id,
+                    project_dir=workspace_dir,
                     mount_point=settings.workspace_base,
                     projid=project_id,
                     via_agent=settings.quota_via_agent,
@@ -300,7 +314,7 @@ async def agent_delete_sandbox(
                     sandbox_id,
                     exc,
                 )
-        shutil.rmtree(settings.workspace_base / sandbox_id, ignore_errors=True)
+        shutil.rmtree(workspace_dir, ignore_errors=True)
     return Response(status_code=204)
 
 
