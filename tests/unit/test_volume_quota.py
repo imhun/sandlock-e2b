@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -184,6 +186,124 @@ def test_provision_failure_degrades_and_removes_empty_subdir(
         "volume quota setup failed for sbx_a" in r.message
         for r in caplog.records
     )
+
+
+# ------------------------------------------- E3.2 host-uid permission model
+
+
+def _chownable(tmp_path):
+    if os.geteuid() != 0:
+        pytest.skip("E3.2 ownership assertions require root (Docker runner)")
+
+
+def test_provision_with_host_uid_sets_root_1777_and_slice_owner(
+    monkeypatch, tmp_path
+):
+    _chownable(tmp_path)
+    volume_path = tmp_path / "vol_1"
+    volume_path.mkdir()
+    monkeypatch.setattr(volumes, "xfs_project_supported", _supported)
+    monkeypatch.setattr(volumes, "provision_project", lambda **kw: 4242)
+    monkeypatch.setattr(volumes, "containing_mount_point", lambda _path: None)
+    view, projid = provision_sandbox_volume_mount(
+        sandbox_id="sbx_a",
+        volume_id="vol_1",
+        mount_path="mnt/data",
+        volume_path=volume_path,
+        per_sandbox_quota_mb=512,
+        fallback_mount_point="/srv",
+        via_agent=False,
+        host_uid=10000,
+    )
+    assert projid == 4242
+    assert view == volume_path / "sbx_a"
+    # Volume root: shared 1777 (world rwx + sticky), owner = creator uid.
+    root_st = volume_path.stat()
+    assert stat.S_IMODE(root_st.st_mode) == 0o1777
+    assert root_st.st_uid == 10000
+    # Slice: owned by the mounting sandbox uid, tightened to 0700.
+    slice_st = view.stat()
+    assert slice_st.st_uid == 10000
+    assert stat.S_IMODE(slice_st.st_mode) == 0o700
+
+
+def test_provision_quota_zero_with_host_uid_makes_root_1777(
+    monkeypatch, tmp_path
+):
+    _chownable(tmp_path)
+    volume_path = tmp_path / "vol_1"
+    volume_path.mkdir()
+    calls = []
+    monkeypatch.setattr(
+        volumes, "provision_project", lambda **kw: calls.append(kw)
+    )
+    view, projid = provision_sandbox_volume_mount(
+        sandbox_id="sbx_a",
+        volume_id="vol_1",
+        mount_path="mnt/data",
+        volume_path=volume_path,
+        per_sandbox_quota_mb=0,
+        fallback_mount_point="/srv",
+        via_agent=False,
+        host_uid=10000,
+    )
+    assert view == volume_path
+    assert projid is None
+    assert calls == []
+    st = volume_path.stat()
+    assert stat.S_IMODE(st.st_mode) == 0o1777
+    assert st.st_uid == 10000
+
+
+def test_provision_without_host_uid_keeps_legacy_permissions(
+    monkeypatch, tmp_path
+):
+    volume_path = tmp_path / "vol_1"
+    volume_path.mkdir()
+    monkeypatch.setattr(volumes, "xfs_project_supported", _supported)
+    monkeypatch.setattr(volumes, "provision_project", lambda **kw: 4242)
+    view, projid = provision_sandbox_volume_mount(
+        sandbox_id="sbx_a",
+        volume_id="vol_1",
+        mount_path="mnt/data",
+        volume_path=volume_path,
+        per_sandbox_quota_mb=512,
+        fallback_mount_point="/srv",
+        via_agent=False,
+    )
+    assert projid == 4242
+    root_st = volume_path.stat()
+    assert stat.S_IMODE(root_st.st_mode) == 0o755
+    assert root_st.st_uid != 10000
+
+
+def test_build_volume_mounts_passes_host_uid_to_slice(
+    monkeypatch, tmp_path
+):
+    _chownable(tmp_path)
+    volume_path = tmp_path / "vol_1"
+    volume_path.mkdir()
+    monkeypatch.setattr(volumes, "xfs_project_supported", _supported)
+    monkeypatch.setattr(volumes, "provision_project", lambda **kw: 4242)
+    workspace = tmp_path / "sbx_a"
+    workspace.mkdir()
+    mount_paths, volume_projects = build_volume_mounts(
+        sandbox_id="sbx_a",
+        volume_mounts=[_mount_input(volume_path, quota=512)],
+        shared_volume_root=tmp_path,
+        workspace_dir=workspace,
+        fallback_mount_point="/srv",
+        via_agent=False,
+        host_uid=10000,
+    )
+    slice_dir = volume_path / "sbx_a"
+    assert mount_paths == [
+        {"path": "mnt/data", "hostPath": str(slice_dir)}
+    ]
+    assert slice_dir.stat().st_uid == 10000
+    assert stat.S_IMODE(slice_dir.stat().st_mode) == 0o700
+    assert volume_path.stat().st_uid == 10000
+    assert stat.S_IMODE(volume_path.stat().st_mode) == 0o1777
 
 
 # ------------------------------------------------------ mount view builder

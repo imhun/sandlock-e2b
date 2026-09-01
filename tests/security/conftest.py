@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
@@ -36,6 +37,10 @@ def require_sandlock():
     from envd_service.executors.sandlock import SandlockExecutor
 
     ws = tempfile.mkdtemp()
+    # mkdtemp creates 0700; the sandbox host uid (root workers: 1000, or an
+    # allocated pool uid) needs traverse permission on the workspace and its
+    # parents, mirroring the 0755 workspace_base of real deployments.
+    os.chmod(ws, 0o755)
     executor = SandlockExecutor(
         workspace_dir=ws,
         base_image=None,

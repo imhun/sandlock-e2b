@@ -24,7 +24,15 @@ from envd_service.gateway import create_gateway
 from envd_service.runtime.registry import RuntimeRegistry
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-TMP_ROOT = PROJECT_ROOT / "tmp" / "test-runtime"
+# Ownership-sensitive tests (E3.2 per-sandbox uids) need a filesystem where
+# chown works. On macOS hosts the repo bind mount is virtiofs (chown is a
+# no-op there), so CI/local Linux runners keep the project-local default
+# while Docker runners can point this at container-native storage.
+TMP_ROOT = Path(
+    os.environ.get(
+        "E2B_TEST_TMP_ROOT", PROJECT_ROOT / "tmp" / "test-runtime"
+    )
+)
 
 
 def pytest_addoption(parser):
