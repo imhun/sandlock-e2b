@@ -81,6 +81,15 @@ def create_app(
     settings = settings or Settings()
     control_plane_url = control_plane_url or os.getenv("E2B_CONTROL_PLANE_URL")
     node_address = node_address or os.getenv("E2B_NODE_ADDRESS")
+    quota_agent_client = None
+    if settings.quota_via_agent:
+        from envd_service.quota_agent import configure_quota_agent_client
+
+        quota_agent_client = configure_quota_agent_client(
+            url=settings.quota_agent_url,
+            token=settings.quota_agent_token,
+            timeout_s=settings.quota_agent_timeout_s,
+        )
     runtime_registry = runtime_registry or RuntimeRegistry(
         workspace_base or settings.workspace_base
     )
@@ -130,12 +139,16 @@ def create_app(
                 logger.warning("startup reconcile task failed", exc_info=True)
         await agent.stop()
         await quota_monitor.stop()
+        quota_agent_client = getattr(app.state, "quota_agent_client", None)
+        if quota_agent_client is not None:
+            quota_agent_client.close()
         for ctx in app.state.runtimes.values():
             ctx.shutdown()
         app.state.runtimes.clear()
 
     app = FastAPI(title="E2B Sandlock Gateway - Envd Service", lifespan=lifespan)
     app.state.settings = settings
+    app.state.quota_agent_client = quota_agent_client
     app.state.runtime_registry = runtime_registry
     app.state.runtimes: dict[str, SandboxRuntimeContext] = {}
     app.state.context_factory = lambda record: SandboxRuntimeContext(record, settings)

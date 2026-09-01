@@ -161,6 +161,19 @@ def _local_in_use_projids(mount_point: str | Path) -> set[int]:
     return _parse_project_report(output)
 
 
+def _probe_free_projid(sandbox_id: str, in_use: set[int]) -> int:
+    """Pick a free projid: stable sandbox-id hash, linear-probed on conflict.
+
+    Shared by the local allocator (probe against the local ``report -p``
+    output) and the quota-agent client (probe against the server-side
+    project table fetched over HTTP, E2.6).
+    """
+    candidate = _hash_projid(sandbox_id)
+    while candidate in in_use:
+        candidate = _PROJID_MIN if candidate >= _PROJID_MAX else candidate + 1
+    return candidate
+
+
 def project_quota_table(
     mount_point: str | Path, via_agent: bool = False
 ) -> dict[int, ProjectQuotaUsage]:
@@ -197,11 +210,7 @@ def project_quota_table(
 
 def allocate_project_id(sandbox_id: str, mount_point: str | Path) -> int:
     """Pick a free projid: stable sandbox-id hash, linear-probed on conflict."""
-    in_use = _local_in_use_projids(mount_point)
-    candidate = _hash_projid(sandbox_id)
-    while candidate in in_use:
-        candidate = _PROJID_MIN if candidate >= _PROJID_MAX else candidate + 1
-    return candidate
+    return _probe_free_projid(sandbox_id, _local_in_use_projids(mount_point))
 
 
 def _agent_call(op: str, **kwargs) -> Any:

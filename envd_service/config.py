@@ -75,6 +75,18 @@ class Settings:
     quota_via_agent: bool = field(
         default_factory=lambda: _env_bool("E2B_QUOTA_VIA_AGENT", False)
     )
+    # NFS form (E2.6): server-side quota-agent URL/token. Wired by
+    # envd_service.quota_agent.configure_quota_agent_client when
+    # quota_via_agent is enabled; missing values degrade quota with warnings.
+    quota_agent_url: str | None = field(
+        default_factory=lambda: os.getenv("E2B_QUOTA_AGENT_URL") or None
+    )
+    quota_agent_token: str | None = field(
+        default_factory=lambda: os.getenv("E2B_QUOTA_AGENT_TOKEN") or None
+    )
+    quota_agent_timeout_s: float = field(
+        default_factory=lambda: _env_float("E2B_QUOTA_AGENT_TIMEOUT_S", 5.0)
+    )
     default_max_processes: int = field(
         default_factory=lambda: _env_int("E2B_DEFAULT_MAX_PROCESSES", 64)
     )
