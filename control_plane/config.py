@@ -11,6 +11,7 @@ from gateway_common.env import (
     _env_bool,
     _env_int,
     _env_json_dict,
+    _env_json,
     _env_list,
 )
 
@@ -124,13 +125,60 @@ class Settings:
     shared_volume_root: str | None = field(
         default_factory=lambda: os.getenv("E2B_SHARED_VOLUME_ROOT")
     )
+    # Tenant isolation (E3.1). When E2B_TENANTS is unset the control plane
+    # runs in single-tenant compatible mode: all keys share every resource
+    # and resources are created with tenant_id=None.
+    tenant_map: dict[str, list[str]] = field(
+        default_factory=lambda: _env_json("E2B_TENANTS", {}) or {}
+    )
+    admin_api_keys: tuple[str, ...] = field(
+        default_factory=lambda: _env_list("E2B_ADMIN_API_KEYS", ())
+    )
+    tenant_limits: dict[str, dict[str, int]] = field(
+        default_factory=lambda: _env_json("E2B_TENANT_LIMITS", {}) or {}
+    )
+    tenant_rate_limits: dict[str, int] = field(
+        default_factory=lambda: _env_json("E2B_TENANT_RATE_LIMITS", {}) or {}
+    )
+
+    def __post_init__(self) -> None:
+        normalized: dict[str, list[str]] = {}
+        for tenant, keys in (self.tenant_map or {}).items():
+            if not isinstance(keys, list):
+                raise ValueError(
+                    f"E2B_TENANTS[{tenant!r}] must be a list of API keys"
+                )
+            normalized[str(tenant)] = [str(k) for k in keys]
+        self.tenant_map = normalized
+        self.tenant_limits = {
+            str(t): {str(k): int(v) for k, v in limits.items()}
+            for t, limits in (self.tenant_limits or {}).items()
+        }
+        self.tenant_rate_limits = {
+            str(t): int(v) for t, v in (self.tenant_rate_limits or {}).items()
+        }
 
     @property
     def all_api_keys(self) -> tuple[str, ...]:
         keys = list(self.api_keys)
         if self.api_key:
             keys.append(self.api_key)
+        keys.extend(self.admin_api_keys)
+        for tenant_keys in self.tenant_map.values():
+            keys.extend(tenant_keys)
         return tuple(dict.fromkeys(keys))
+
+    @property
+    def tenants_enabled(self) -> bool:
+        """True when tenant isolation is configured (E2B_TENANTS non-empty)."""
+        return bool(self.tenant_map)
+
+    def tenant_of_key(self, key: str) -> str | None:
+        """Map an API key to its tenant, ``None`` when unassigned."""
+        for tenant, keys in self.tenant_map.items():
+            if key in keys:
+                return tenant
+        return None
 
     @property
     def tls_enabled(self) -> bool:

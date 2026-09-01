@@ -49,6 +49,7 @@ class SandboxRecord:
     template_id: str
     sandbox_id: str
     client_id: str
+    tenant_id: str | None = None
     envd_version: str = "0.6.4+sandlock"
     envd_access_token: str = ""
     traffic_access_token: str | None = None
@@ -168,6 +169,7 @@ class SandboxRecord:
             "template_id": self.template_id,
             "sandbox_id": self.sandbox_id,
             "client_id": self.client_id,
+            "tenant_id": self.tenant_id,
             "envd_version": self.envd_version,
             "envd_access_token": self.envd_access_token,
             "traffic_access_token": self.traffic_access_token,
@@ -209,6 +211,7 @@ class SandboxRecord:
             template_id=data["template_id"],
             sandbox_id=data["sandbox_id"],
             client_id=data["client_id"],
+            tenant_id=data.get("tenant_id"),
             envd_version=data.get("envd_version", "0.6.4+sandlock"),
             envd_access_token=data.get("envd_access_token", ""),
             traffic_access_token=data.get("traffic_access_token"),
@@ -252,6 +255,10 @@ class SandboxRegistry:
         self._reserved_cpu = 0
         self._reserved_disk = 0
         self._reserved_processes = 0
+        # Per-tenant reservation ledger, parallel to the global one. Only
+        # populated for tenants with configured limits; dims are the same as
+        # the global ledger plus a sandbox count.
+        self._tenant_reserved: dict[str, dict[str, int]] = {}
         self._migration_locks: dict[str, tuple[str, float]] = {}
         self._pending: dict[str, tuple[dict[str, Any], float]] = {}
         self._on_removed_callbacks: list[Callable[[SandboxRecord], None]] = []
@@ -386,6 +393,15 @@ class SandboxRegistry:
 
     # -- quota ------------------------------------------------------------
 
+    _TENANT_DIMS = ("sandboxes", "memory", "cpu", "disk", "processes")
+    _TENANT_LIMIT_KEYS = {
+        "max_sandboxes": "sandboxes",
+        "max_total_memory_mb": "memory",
+        "max_total_cpu_percent": "cpu",
+        "max_total_disk_mb": "disk",
+        "max_total_processes": "processes",
+    }
+
     def _quota_allows_locked(
         self, memory_mb: int, cpu: int, disk_mb: int, processes: int
     ) -> bool:
@@ -414,12 +430,66 @@ class SandboxRegistry:
             return False
         return True
 
+    def _tenant_limits(self, tenant_id: str | None, is_admin: bool) -> dict[str, int] | None:
+        """Per-tenant admission limits keyed by ledger dim, or ``None`` when
+        the tenant has no configured limits (or the caller is an admin /
+        has no tenant)."""
+        if is_admin or not tenant_id:
+            return None
+        raw = self._settings.tenant_limits.get(tenant_id)
+        if not raw:
+            return None
+        return {
+            dim: int(raw[key])
+            for key, dim in self._TENANT_LIMIT_KEYS.items()
+            if key in raw and raw[key] > 0
+        }
+
+    def _tenant_quota_allows_locked(
+        self,
+        tenant_id: str,
+        limits: dict[str, int],
+        memory_mb: int,
+        cpu: int,
+        disk_mb: int,
+        processes: int,
+    ) -> bool:
+        used = self._tenant_reserved.setdefault(
+            tenant_id, {dim: 0 for dim in self._TENANT_DIMS}
+        )
+        demand = {
+            "sandboxes": 1,
+            "memory": memory_mb,
+            "cpu": cpu,
+            "disk": disk_mb,
+            "processes": processes,
+        }
+        return all(
+            used[dim] + demand[dim] <= limit
+            for dim, limit in limits.items()
+        )
+
+    def _tenant_dims(self, record: SandboxRecord) -> dict[str, int]:
+        return {
+            "sandboxes": 1,
+            "memory": record.memory_mb,
+            "cpu": record.cpu_count * 100,
+            "disk": record.disk_size_mb,
+            "processes": record.max_processes,
+        }
+
     def _reserve(self, record: SandboxRecord) -> None:
         self._sandboxes[record.sandbox_id] = record
         self._reserved_memory += record.memory_mb
         self._reserved_cpu += record.cpu_count * 100
         self._reserved_disk += record.disk_size_mb
         self._reserved_processes += record.max_processes
+        if record.tenant_id:
+            used = self._tenant_reserved.setdefault(
+                record.tenant_id, {dim: 0 for dim in self._TENANT_DIMS}
+            )
+            for dim, value in self._tenant_dims(record).items():
+                used[dim] += value
 
     def _release(self, record: SandboxRecord) -> None:
         if self._quota_store is not None:
@@ -432,6 +502,12 @@ class SandboxRegistry:
                     "processes": record.max_processes,
                 },
             )
+            tenant_limits = self._tenant_limits(record.tenant_id, is_admin=False)
+            if tenant_limits is not None:
+                self._quota_store.release(
+                    f"tenant:{record.tenant_id}",
+                    self._tenant_dims(record),
+                )
             self._record_store.delete(record.sandbox_id)
         with self._lock:
             self._sandboxes.pop(record.sandbox_id, None)
@@ -441,6 +517,11 @@ class SandboxRegistry:
             self._reserved_processes = max(
                 0, self._reserved_processes - record.max_processes
             )
+            if record.tenant_id:
+                used = self._tenant_reserved.get(record.tenant_id)
+                if used is not None:
+                    for dim, value in self._tenant_dims(record).items():
+                        used[dim] = max(0, used[dim] - value)
             callbacks = list(self._on_removed_callbacks)
         for callback in callbacks:
             try:
@@ -465,6 +546,8 @@ class SandboxRegistry:
         mcp: dict[str, Any] | None = None,
         network: dict[str, Any] | None = None,
         iam_tokens: dict[str, dict[str, str]] | None = None,
+        tenant_id: str | None = None,
+        is_admin: bool = False,
     ) -> SandboxRecord:
         s = self._settings
         if sandbox_id is not None and not validate_sandbox_id(sandbox_id):
@@ -490,18 +573,36 @@ class SandboxRegistry:
             "disk": disk_mb,
             "processes": processes,
         }
+        if is_admin:
+            # Admin-created resources are unowned (visible only to admins)
+            # and exempt from tenant limits.
+            tenant_id = None
+        tenant_limits = self._tenant_limits(tenant_id, is_admin)
         if self._quota_store is not None:
             if not self._quota_store.reserve("global", limits, dims):
                 raise ResourceUnavailableError("No resources available")
+            if tenant_limits is not None:
+                tenant_dims = dict(dims)
+                tenant_dims["sandboxes"] = 1
+                if not self._quota_store.reserve(
+                    f"tenant:{tenant_id}", tenant_limits, tenant_dims
+                ):
+                    self._quota_store.release("global", dims)
+                    raise ResourceUnavailableError("tenant quota exceeded")
         else:
             with self._lock:
                 if not self._quota_allows_locked(memory_mb, cpu, disk_mb, processes):
                     raise ResourceUnavailableError("No resources available")
+                if tenant_limits is not None and not self._tenant_quota_allows_locked(
+                    tenant_id, tenant_limits, memory_mb, cpu, disk_mb, processes
+                ):
+                    raise ResourceUnavailableError("tenant quota exceeded")
             now = utcnow()
             record = SandboxRecord(
                 template_id=template_id,
                 sandbox_id=sandbox_id or _gen_sandbox_id(),
                 client_id=client_id(),
+                tenant_id=tenant_id,
                 envd_access_token=access_token() if secure else "",
                 started_at=now,
                 end_at=now + timedelta(seconds=max(1, timeout)),
@@ -526,6 +627,7 @@ class SandboxRegistry:
                 template_id=template_id,
                 sandbox_id=sandbox_id or _gen_sandbox_id(),
                 client_id=client_id(),
+                tenant_id=tenant_id,
                 envd_access_token=access_token() if secure else "",
                 started_at=now,
                 end_at=now + timedelta(seconds=max(1, timeout)),
@@ -622,6 +724,7 @@ class SandboxRegistry:
         template: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        tenant_id: str | None = None,
     ) -> list[SandboxRecord]:
         if self._record_store is not None:
             records = []
@@ -632,6 +735,8 @@ class SandboxRegistry:
                     continue
         else:
             records = list(self._sandboxes.values())
+        if tenant_id is not None:
+            records = [r for r in records if r.tenant_id == tenant_id]
         if metadata_filter:
             records = [
                 r
@@ -651,6 +756,38 @@ class SandboxRegistry:
 
     def count(self) -> int:
         return len(self._sandboxes)
+
+    def tenant_usage(self) -> dict[str, dict[str, int]]:
+        """Per-tenant usage from live records (independent of reservation
+        ledger, so unconfigured tenants and admin-created records are also
+        counted)."""
+        usage: dict[str, dict[str, int]] = {}
+        if self._record_store is not None:
+            for sandbox_id in self._record_store.keys():
+                try:
+                    record = self.get(sandbox_id)
+                except UnknownSandboxError:
+                    continue
+                self._accumulate_usage(usage, record)
+        else:
+            for record in self._sandboxes.values():
+                self._accumulate_usage(usage, record)
+        return usage
+
+    @staticmethod
+    def _accumulate_usage(
+        usage: dict[str, dict[str, int]], record: SandboxRecord
+    ) -> None:
+        tenant = record.tenant_id
+        entry = usage.setdefault(
+            tenant,
+            {"sandboxes": 0, "memoryMB": 0, "cpuPercent": 0, "diskMB": 0, "processes": 0},
+        )
+        entry["sandboxes"] += 1
+        entry["memoryMB"] += record.memory_mb
+        entry["cpuPercent"] += record.cpu_count * 100
+        entry["diskMB"] += record.disk_size_mb
+        entry["processes"] += record.max_processes
 
     def remove_expired(self, now: datetime | None = None) -> list[SandboxRecord]:
         if self._record_store is not None:

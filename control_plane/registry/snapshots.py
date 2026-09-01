@@ -38,6 +38,7 @@ class SnapshotRecord:
     allow_internet_access: bool = False
     node_id: str = "local"
     fs_path: Path | None = None
+    tenant_id: str | None = None
 
     def as_snapshot_info(self) -> dict[str, Any]:
         return {
@@ -72,6 +73,7 @@ class SnapshotRecord:
             allow_internet_access=bool(payload.get("allow_internet_access", False)),
             node_id=payload.get("node_id", "local"),
             fs_path=fs_path,
+            tenant_id=payload.get("tenant_id"),
         )
 
 
@@ -102,6 +104,7 @@ class SnapshotRegistry:
         name: str | None = None,
         snapshot_id: str | None = None,
         copy_fs: bool = True,
+        tenant_id: str | None = None,
     ) -> SnapshotRecord:
         snapshot_id = snapshot_id or sandbox_id().replace("sbx_", "snap_")
         fs_path = self._fs_path(snapshot_id)
@@ -120,6 +123,7 @@ class SnapshotRegistry:
             allow_internet_access=bool(allow_internet_access),
             node_id=node_id,
             fs_path=fs_path,
+            tenant_id=tenant_id,
         )
         self._write_record(record)
         with self._lock:
@@ -163,10 +167,13 @@ class SnapshotRegistry:
         name: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        tenant_id: str | None = None,
     ) -> list[SnapshotRecord]:
         records = sorted(
             self._snapshots.values(), key=lambda r: r.created_at, reverse=True
         )
+        if tenant_id is not None:
+            records = [r for r in records if r.tenant_id == tenant_id]
         if name:
             records = [r for r in records if name in r.names]
         if limit is not None:

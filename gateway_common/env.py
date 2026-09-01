@@ -49,9 +49,18 @@ def env_json_dict(name: str) -> dict[str, str]:
     return {str(k): str(v) for k, v in parsed.items()}
 
 
+def env_json(name: str, default=None):
+    """Parse an arbitrary JSON env var; ``default`` when unset or empty."""
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return json.loads(value)
+
+
 # Backwards-compatible aliases for the historical private names.
 _env_bool = env_bool
 _env_int = env_int
 _env_float = env_float
 _env_list = env_list
 _env_json_dict = env_json_dict
+_env_json = env_json

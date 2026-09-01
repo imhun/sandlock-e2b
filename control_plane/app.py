@@ -154,13 +154,17 @@ def create_app(
         (workspace_base or settings.workspace_base) / "_volumes"
     )
     app.state.volumes = volumes_registry or VolumeRegistry(volume_root)
-    app.state.secrets = secrets_registry or SecretRegistry()
+    app.state.secrets = secrets_registry or SecretRegistry(
+        (workspace_base or settings.workspace_base) / "_secrets"
+    )
     app.state.snapshots = snapshots_registry or SnapshotRegistry(
         (workspace_base or settings.workspace_base)
     )
     app.state.nodes = nodes_registry or NodeRegistry(redis_client=redis_client)
     app.state.recent_failures = SlidingWindowCounter()
-    app.state.templates = templates_registry or TemplateRegistry()
+    app.state.templates = templates_registry or TemplateRegistry(
+        (workspace_base or settings.workspace_base) / "_templates"
+    )
     app.state.create_limiter = SlidingWindowRateLimiter(
         settings.create_rate_limit_per_min
     )
