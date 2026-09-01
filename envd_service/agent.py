@@ -9,7 +9,7 @@ import os
 import shutil
 import tarfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from fastapi import APIRouter, Query, Request, Response
@@ -105,6 +105,36 @@ def _register_payload(settings: Settings) -> dict[str, Any]:
     }
 
 
+def _heartbeat_usage_payload(
+    settings: Settings,
+    metrics_provider: Callable[[], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Disk usage + quota alert snapshot carried by each worker heartbeat."""
+    payload: dict[str, Any] = {}
+    try:
+        usage = shutil.disk_usage(settings.workspace_base)
+        payload["diskUsedMB"] = usage.used // (1024 * 1024)
+        payload["diskTotalMB"] = usage.total // (1024 * 1024)
+    except OSError:
+        pass
+    if metrics_provider is not None:
+        try:
+            metrics = metrics_provider()
+        except Exception:
+            logger.warning("quota metrics provider failed", exc_info=True)
+            return payload
+        if isinstance(metrics, dict):
+            for key in (
+                "quotaOverLimit",
+                "quotaNearLimit",
+                "quotaOverLimitCount",
+                "quotaNearLimitCount",
+            ):
+                if key in metrics:
+                    payload[key] = metrics[key]
+    return payload
+
+
 class NodeAgent:
     """Periodically registers with the control plane and sends heartbeats."""
 
@@ -115,11 +145,13 @@ class NodeAgent:
         runtime_registry,
         control_plane_url: str | None,
         node_address: str | None,
+        metrics_provider: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self._settings = settings
         self._runtime_registry = runtime_registry
         self._control_url = (control_plane_url or "").rstrip("/")
         self._node_address = node_address or ""
+        self._metrics_provider = metrics_provider
         self._node_id: str | None = None
         self._task: asyncio.Task | None = None
 
@@ -149,6 +181,9 @@ class NodeAgent:
                     else:
                         resp = await client.post(
                             f"{self._control_url}/internal/nodes/{self._node_id}/heartbeat",
+                            json=_heartbeat_usage_payload(
+                                self._settings, self._metrics_provider
+                            ),
                             headers=headers,
                         )
                         if resp.status_code == 404:

@@ -103,6 +103,23 @@ class Settings:
     command_queue_timeout_s: float = field(
         default_factory=lambda: _env_float("E2B_COMMAND_QUEUE_TIMEOUT_S", 30)
     )
+    # Quota maintenance (E2.4): periodic over-limit + disk watermark scans and
+    # startup orphan project reconciliation.
+    quota_monitor_interval_s: float = field(
+        default_factory=lambda: _env_float("E2B_QUOTA_MONITOR_INTERVAL_S", 60)
+    )
+    quota_warn_ratio: float = field(
+        default_factory=lambda: _env_float("E2B_QUOTA_WARN_RATIO", 0.9)
+    )
+    disk_warn_ratio: float = field(
+        default_factory=lambda: _env_float("E2B_DISK_WARN_RATIO", 0.9)
+    )
+    disk_error_ratio: float = field(
+        default_factory=lambda: _env_float("E2B_DISK_ERROR_RATIO", 0.98)
+    )
+    quota_reconcile_on_startup: bool = field(
+        default_factory=lambda: _env_bool("E2B_QUOTA_RECONCILE_ON_STARTUP", True)
+    )
     log_level: str = field(default_factory=lambda: os.getenv("E2B_LOG_LEVEL", "INFO"))
     internal_api_key: str = field(
         default_factory=lambda: os.getenv("E2B_INTERNAL_API_KEY", "internal-key")

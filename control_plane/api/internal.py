@@ -72,9 +72,25 @@ def _rebuild_node_reservations(request: Request, record) -> None:
 @router.post("/internal/nodes/{node_id}/heartbeat")
 async def node_heartbeat(node_id: str, request: Request) -> Response:
     _require_internal_key(request)
+    body: dict[str, Any] = {}
+    raw = await request.body()
+    if raw:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OfficialError(400, "Invalid JSON body")
+        if not isinstance(body, dict):
+            raise OfficialError(400, "Heartbeat body must be a JSON object")
     record = request.app.state.nodes.heartbeat(node_id)
     if record is None:
         raise OfficialError(404, f"Node {node_id} not found")
+    record.update_usage(
+        used_disk_mb=body.get("diskUsedMB"),
+        quota_over_limit=body.get("quotaOverLimit"),
+        quota_near_limit=body.get("quotaNearLimit"),
+        quota_over_limit_count=body.get("quotaOverLimitCount"),
+        quota_near_limit_count=body.get("quotaNearLimitCount"),
+    )
     return Response(status_code=204)
 
 

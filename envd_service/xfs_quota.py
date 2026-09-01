@@ -24,24 +24,37 @@ Project management (E2.2):
   best-effort cleared before raising so callers degrade with a warning.
 - delete: ``project -C -p <dir> <projid>``; the caller removes the directory
   afterwards, which releases the quota accounting automatically.
+- orphan reconciliation (E2.4): compare the project table (``report -p``)
+  against the ``project_id`` persisted in every ``sandbox.json``; project ids
+  no record references are orphaned and removed — directory project state is
+  cleared when the directory still exists (files are never deleted) and the
+  block limits are reset to 0, which makes XFS drop the zero-usage record.
+- monitoring (E2.4): ``project_quota_table`` returns used/soft/hard blocks per
+  project so callers can detect over-limit and near-limit sandboxes.
 
 The agent branch is reserved for E2.6: ``agent_ops`` maps op names to
 callables — ``provision(sandbox_id, project_dir, disk_mb, mount_point,
-project_id=None) -> int`` and ``release(project_dir, projid, mount_point)
--> None`` — installed via :func:`configure_agent_ops`. Unconfigured agent
-ops raise :class:`ProjectQuotaError` so callers degrade.
+project_id=None) -> int``, ``release(project_dir, projid, mount_point)
+-> None``, ``report(mount_point) -> {"projects": {...}}`` and
+``reconcile(workspace_base, mount_point) -> {"cleaned": [...], "skipped":
+[...]}`` — installed via :func:`configure_agent_ops`. Unconfigured agent ops
+raise :class:`ProjectQuotaError` so callers degrade.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import shlex
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+from gateway_common.paths import validate_sandbox_id
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +76,13 @@ _PASS: tuple[bool, str] = (True, "")
 _OCTAL_ESCAPE = re.compile(r"\\([0-7]{3})")
 _PROJID32BIT = re.compile(r"\bprojid32bit=([01])\b")
 _PROJECT_ID_LINE = re.compile(r"^\s*#?(\d+)(?:\s|$)", re.MULTILINE)
+#: ``report -p`` rows: ``#<id> <used> <soft> <hard> <warn/grace> ...`` (1 KiB
+#: blocks). Soft/hard 0 means "no limit".
+_PROJECT_USAGE_LINE = re.compile(
+    r"^\s*#?(\d+)\s+(\d+)\s+(\d+)\s+(\d+)(?:\s|$)", re.MULTILINE
+)
+#: ``lsattr -p -d`` rows: ``<projid> <attributes> <path>``.
+_LSATTR_PROJID_LINE = re.compile(r"^\s*(\d+)\s+([A-Za-z_+-]+)\s+(\S.*)$")
 
 #: Project id range for sandboxes (design doc §3.2: 1..2^31).
 _PROJID_MIN = 1
@@ -71,6 +91,20 @@ _PROJID_MAX = 1 << 31
 
 class ProjectQuotaError(RuntimeError):
     """A quota management operation failed; callers degrade with a warning."""
+
+
+@dataclass(frozen=True)
+class ProjectQuotaUsage:
+    """Usage snapshot of one project id from ``xfs_quota report -p``.
+
+    Blocks are 1 KiB XFS blocks (``report -p`` default units); soft/hard of 0
+    means "no limit" (unlimited).
+    """
+
+    projid: int
+    used_blocks: int
+    soft_blocks: int
+    hard_blocks: int
 
 
 def _hash_projid(sandbox_id: str) -> int:
@@ -83,6 +117,20 @@ def _hash_projid(sandbox_id: str) -> int:
 def _parse_project_report(output: str) -> set[int]:
     """Extract the defined project ids from ``xfs_quota report -p`` output."""
     return {int(match.group(1)) for match in _PROJECT_ID_LINE.finditer(output)}
+
+
+def _parse_project_usage(output: str) -> dict[int, ProjectQuotaUsage]:
+    """Parse ``report -p`` rows into projid -> used/soft/hard block counts."""
+    rows: dict[int, ProjectQuotaUsage] = {}
+    for match in _PROJECT_USAGE_LINE.finditer(output):
+        projid, used, soft, hard = (int(group) for group in match.groups())
+        rows[projid] = ProjectQuotaUsage(
+            projid=projid,
+            used_blocks=used,
+            soft_blocks=soft,
+            hard_blocks=hard,
+        )
+    return rows
 
 
 def _local_run_xfs_quota(mount_point: str | Path, command: str) -> str:
@@ -111,6 +159,40 @@ def _local_in_use_projids(mount_point: str | Path) -> set[int]:
     """Return the project ids currently defined in the XFS project table."""
     output = _local_run_xfs_quota(mount_point, "report -p")
     return _parse_project_report(output)
+
+
+def project_quota_table(
+    mount_point: str | Path, via_agent: bool = False
+) -> dict[int, ProjectQuotaUsage]:
+    """Return the full project quota table: projid -> used/soft/hard blocks.
+
+    Local (``via_agent=False``): runs ``xfs_quota -x -c "report -p"`` on the
+    worker. NFS form (``via_agent=True``): asks quota-agent for the
+    server-side report (E2.6 contract: ``agent_ops["report"](mount_point) ->
+    {"projects": {projid: {"used_blocks", "soft_blocks", "hard_blocks"}}}``).
+    """
+    if via_agent:
+        data = _agent_call("report", mount_point=str(mount_point))
+        if not isinstance(data, dict) or "projects" not in data:
+            raise ProjectQuotaError(
+                f"quota-agent report returned invalid data: {data!r}"
+            )
+        try:
+            return {
+                int(projid): ProjectQuotaUsage(
+                    projid=int(projid),
+                    used_blocks=int(row["used_blocks"]),
+                    soft_blocks=int(row["soft_blocks"]),
+                    hard_blocks=int(row["hard_blocks"]),
+                )
+                for projid, row in data["projects"].items()
+            }
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ProjectQuotaError(
+                f"quota-agent report returned invalid rows: {exc}"
+            ) from exc
+    output = _local_run_xfs_quota(mount_point, "report -p")
+    return _parse_project_usage(output)
 
 
 def allocate_project_id(sandbox_id: str, mount_point: str | Path) -> int:
@@ -224,6 +306,176 @@ def release_project(
         return
     command = f"project -C -p {shlex.quote(str(project_dir))} {projid}"
     _local_run_xfs_quota(mount_point, command)
+
+
+def _recorded_projids(workspace_base: str | Path) -> set[int]:
+    """Project ids referenced by any ``sandbox.json`` under workspace_base."""
+    base = Path(workspace_base)
+    recorded: set[int] = set()
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return recorded
+    for entry in entries:
+        record_path = entry / "sandbox.json"
+        if not record_path.is_file():
+            continue
+        try:
+            payload = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        projid = payload.get("project_id")
+        if isinstance(projid, int) and projid > 0:
+            recorded.add(projid)
+    return recorded
+
+
+def _scan_project_dirs(workspace_base: str | Path) -> dict[int, Path]:
+    """Map projid -> sandbox directory via ``lsattr -p -d``.
+
+    Only top-level directories with a valid sandbox id are considered, so
+    ``_snapshots`` / ``_migrate`` / ``_cow`` and foreign trees are never
+    touched. Returns {} on any failure; callers skip rather than risk
+    mis-identifying a directory.
+    """
+    base = Path(workspace_base)
+    mapping: dict[int, Path] = {}
+    try:
+        candidates = [
+            entry
+            for entry in base.iterdir()
+            if entry.is_dir()
+            and not entry.is_symlink()
+            and validate_sandbox_id(entry.name)
+        ]
+    except OSError:
+        return mapping
+    if not candidates:
+        return mapping
+    argv = ["lsattr", "-p", "-d", *(str(c) for c in sorted(candidates))]
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_XFS_QUOTA_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return mapping
+    if proc.returncode != 0:
+        logger.warning(
+            "lsattr project scan failed for %s: %s", base, proc.stderr.strip()
+        )
+        return mapping
+    for line in proc.stdout.splitlines():
+        match = _LSATTR_PROJID_LINE.match(line)
+        if match is None:
+            continue
+        mapping[int(match.group(1))] = Path(match.group(3))
+    return mapping
+
+
+def cleanup_orphan_project(
+    *,
+    projid: int,
+    mount_point: str | Path,
+    project_dir: str | Path | None = None,
+) -> None:
+    """Remove an orphan project id from the quota table (local only).
+
+    When ``project_dir`` still carries the project state, ``project -C``
+    first returns its accounting to the default project; resetting the block
+    limits to 0 (``limit -p bsoft=0 bhard=0``) then makes XFS drop the quota
+    record once usage is zero (E2.4 verified behavior). The directory itself
+    is never deleted: orphan cleanup only touches quota metadata, so user
+    files stay untouched for a later record-driven decision.
+    """
+    if project_dir is not None:
+        command = f"project -C -p {shlex.quote(str(project_dir))} {projid}"
+        _local_run_xfs_quota(mount_point, command)
+    _local_run_xfs_quota(mount_point, f"limit -p bsoft=0 bhard=0 {projid}")
+
+
+def _local_reconcile(
+    workspace_base: str | Path, mount_point: str | Path
+) -> dict[str, Any]:
+    """Local reconciliation: quota table entries no record references are
+    orphaned and cleaned; recorded projids and project 0 are never touched."""
+    table = project_quota_table(mount_point)
+    recorded = _recorded_projids(workspace_base)
+    orphans = sorted(
+        projid for projid in table if projid != 0 and projid not in recorded
+    )
+    cleaned: list[int] = []
+    skipped: list[dict[str, Any]] = []
+    dir_by_projid: dict[int, Path] | None = None
+    for projid in orphans:
+        usage = table[projid]
+        project_dir: Path | None = None
+        if usage.used_blocks > 0:
+            if dir_by_projid is None:
+                dir_by_projid = _scan_project_dirs(workspace_base)
+            project_dir = dir_by_projid.get(projid)
+            if project_dir is None:
+                skipped.append(
+                    {
+                        "projid": projid,
+                        "reason": (
+                            f"{usage.used_blocks} used blocks but no project "
+                            "directory; entry left for manual review"
+                        ),
+                    }
+                )
+                continue
+        try:
+            cleanup_orphan_project(
+                projid=projid,
+                mount_point=mount_point,
+                project_dir=project_dir,
+            )
+        except ProjectQuotaError as exc:
+            skipped.append({"projid": projid, "reason": str(exc)})
+            logger.warning("orphan project %s cleanup failed: %s", projid, exc)
+            continue
+        cleaned.append(projid)
+        logger.info("cleaned orphan project %s", projid)
+    return {"cleaned": cleaned, "skipped": skipped}
+
+
+def reconcile_orphan_projects(
+    *,
+    workspace_base: str | Path,
+    mount_point: str | Path,
+    via_agent: bool = False,
+) -> dict[str, Any]:
+    """Reconcile the quota table against ``sandbox.json`` project ids.
+
+    Every project id in ``report -p`` that no sandbox record references is an
+    orphan and is removed from the quota table (project state cleared on the
+    directory when present; zero-usage records dropped by resetting limits).
+    Normal sandbox quotas are never touched and directories are never
+    deleted.
+
+    NFS form: ``via_agent=True`` delegates the server-side reconciliation to
+    quota-agent (E2.6 contract: ``agent_ops["reconcile"](workspace_base,
+    mount_point) -> {"cleaned": [projid], "skipped": [{"projid", "reason"}]}``).
+
+    Returns ``{"cleaned": [projid], "skipped": [{"projid", "reason"}]}``.
+    """
+    if via_agent:
+        data = _agent_call(
+            "reconcile",
+            workspace_base=str(workspace_base),
+            mount_point=str(mount_point),
+        )
+        if not isinstance(data, dict):
+            raise ProjectQuotaError(
+                f"quota-agent reconcile returned invalid data: {data!r}"
+            )
+        return data
+    return _local_reconcile(workspace_base, mount_point)
 
 
 def _fail(reason: str) -> tuple[bool, str]:

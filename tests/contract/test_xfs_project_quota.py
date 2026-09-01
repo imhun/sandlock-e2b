@@ -26,7 +26,11 @@ import pytest
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
-from envd_service.xfs_quota import _local_run_xfs_quota, xfs_project_supported
+from envd_service.xfs_quota import (
+    _local_run_xfs_quota,
+    reconcile_orphan_projects,
+    xfs_project_supported,
+)
 
 XFS_MOUNT = Path(os.environ.get("E2B_XFS_TEST_MOUNT", "/var/lib/e2b-sandboxes"))
 
@@ -158,3 +162,41 @@ async def test_agent_delete_clears_project_and_dir(xfs_app):
     # cleanup milestone (design doc §3.3).
     assert _report_rows()[projid][0] == 0
     assert not (XFS_MOUNT / sandbox_id).exists()
+
+
+async def test_reconcile_removes_zero_usage_orphan_entry(xfs_app):
+    """Reconciliation drops the zero-usage quota entry E2.2 deletion leaves."""
+    sandbox_id, record = await _create_sandbox(xfs_app, disk_mb=8)
+    projid = record.project_id
+    assert projid in _report_rows()
+    await _delete_sandbox(xfs_app, sandbox_id)
+    assert _report_rows()[projid][0] == 0
+    result = reconcile_orphan_projects(
+        workspace_base=XFS_MOUNT,
+        mount_point=XFS_MOUNT,
+    )
+    assert projid in result["cleaned"]
+    assert result["skipped"] == []
+    assert projid not in _report_rows()
+
+
+async def test_reconcile_removes_record_lost_project_but_keeps_dir(xfs_app):
+    """A project whose sandbox.json record vanished is cleaned without
+    deleting the leftover directory (E2.4 conservative directory policy)."""
+    sandbox_id, record = await _create_sandbox(xfs_app, disk_mb=8)
+    projid = record.project_id
+    record_path = XFS_MOUNT / sandbox_id / "sandbox.json"
+    assert record_path.is_file()
+    record_path.unlink()
+    target = XFS_MOUNT / sandbox_id / "workspace" / "attributed.bin"
+    target.write_bytes(b"\0" * 1024 * 1024)
+    assert _report_rows()[projid][0] >= 1024
+    result = reconcile_orphan_projects(
+        workspace_base=XFS_MOUNT,
+        mount_point=XFS_MOUNT,
+    )
+    assert projid in result["cleaned"]
+    assert projid not in _report_rows()
+    # Files are disowned from the orphan project but never deleted.
+    assert (XFS_MOUNT / sandbox_id).is_dir()
+    await _delete_sandbox(xfs_app, sandbox_id)

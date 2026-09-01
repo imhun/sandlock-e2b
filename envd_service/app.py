@@ -20,9 +20,11 @@ from envd_service.http.auth import HttpAuthError, http_error_response
 from envd_service.http.files import router as files_router
 from envd_service.http.health import router as health_router
 from envd_service.http.mcp import router as mcp_router
+from envd_service.quota_maintenance import QuotaMonitor
 from envd_service.rpc import register_rpc
 from envd_service.runtime.context import SandboxRuntimeContext
 from envd_service.runtime.registry import RuntimeRegistry
+from envd_service.xfs_quota import ProjectQuotaError, reconcile_orphan_projects
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,25 @@ async def _warm_base_image(settings: Settings) -> None:
             logger.warning("worker image warm failed: %s", image, exc_info=True)
 
 
+async def _startup_reconcile(settings: Settings) -> None:
+    """Reconcile quota table vs sandbox.json records once at worker startup."""
+    try:
+        result = await asyncio.to_thread(
+            reconcile_orphan_projects,
+            workspace_base=settings.workspace_base,
+            mount_point=settings.workspace_base,
+            via_agent=settings.quota_via_agent,
+        )
+    except ProjectQuotaError as exc:
+        logger.warning("startup quota reconciliation skipped: %s", exc)
+        return
+    logger.info(
+        "startup quota reconciliation: cleaned=%s skipped=%s",
+        result.get("cleaned"),
+        result.get("skipped"),
+    )
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -60,14 +81,24 @@ def create_app(
     settings = settings or Settings()
     control_plane_url = control_plane_url or os.getenv("E2B_CONTROL_PLANE_URL")
     node_address = node_address or os.getenv("E2B_NODE_ADDRESS")
+    runtime_registry = runtime_registry or RuntimeRegistry(
+        workspace_base or settings.workspace_base
+    )
+    quota_monitor = QuotaMonitor(
+        workspace_base=settings.workspace_base,
+        mount_point=settings.workspace_base,
+        via_agent=settings.quota_via_agent,
+        interval_s=settings.quota_monitor_interval_s,
+        quota_warn_ratio=settings.quota_warn_ratio,
+        disk_warn_ratio=settings.disk_warn_ratio,
+        disk_error_ratio=settings.disk_error_ratio,
+    )
     agent = NodeAgent(
         settings=settings,
         runtime_registry=runtime_registry,
         control_plane_url=control_plane_url,
         node_address=node_address,
-    )
-    runtime_registry = runtime_registry or RuntimeRegistry(
-        workspace_base or settings.workspace_base
+        metrics_provider=quota_monitor.metrics,
     )
 
     @asynccontextmanager
@@ -76,6 +107,12 @@ def create_app(
             from envd_service.netns import ensure_worker_netns_plumbing
 
             ensure_worker_netns_plumbing()
+        app.state.quota_monitor = quota_monitor
+        quota_monitor.start()
+        reconcile_task: asyncio.Task | None = None
+        if settings.quota_reconcile_on_startup:
+            reconcile_task = asyncio.create_task(_startup_reconcile(settings))
+            app.state.reconcile_task = reconcile_task
         agent.start()
         if settings.base_image and _executor_needs_images(settings.executor):
             app.state.warm_task = asyncio.create_task(_warm_base_image(settings))
@@ -83,7 +120,16 @@ def create_app(
         warm_task = getattr(app.state, "warm_task", None)
         if warm_task is not None:
             warm_task.cancel()
+        if reconcile_task is not None:
+            reconcile_task.cancel()
+            try:
+                await reconcile_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning("startup reconcile task failed", exc_info=True)
         await agent.stop()
+        await quota_monitor.stop()
         for ctx in app.state.runtimes.values():
             ctx.shutdown()
         app.state.runtimes.clear()

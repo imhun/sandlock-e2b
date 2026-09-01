@@ -19,6 +19,11 @@ class NodeRecord:
     total_cpu_percent: int = 0
     total_disk_mb: int = 0
     total_processes: int = 0
+    used_disk_mb: int = 0
+    quota_over_limit: list[int] = field(default_factory=list)
+    quota_near_limit: list[int] = field(default_factory=list)
+    quota_over_limit_count: int = 0
+    quota_near_limit_count: int = 0
     reserved_memory_mb: int = 0
     reserved_cpu_percent: int = 0
     reserved_disk_mb: int = 0
@@ -53,6 +58,27 @@ class NodeRecord:
         self.reserved_disk_mb = max(0, self.reserved_disk_mb - disk_mb)
         self.reserved_processes = max(0, self.reserved_processes - processes)
 
+    def update_usage(
+        self,
+        *,
+        used_disk_mb: int | None = None,
+        quota_over_limit: list[int] | None = None,
+        quota_near_limit: list[int] | None = None,
+        quota_over_limit_count: int | None = None,
+        quota_near_limit_count: int | None = None,
+    ) -> None:
+        """Store the worker heartbeat's disk/quota usage snapshot."""
+        if used_disk_mb is not None:
+            self.used_disk_mb = int(used_disk_mb)
+        if quota_over_limit is not None:
+            self.quota_over_limit = list(quota_over_limit)
+        if quota_near_limit is not None:
+            self.quota_near_limit = list(quota_near_limit)
+        if quota_over_limit_count is not None:
+            self.quota_over_limit_count = int(quota_over_limit_count)
+        if quota_near_limit_count is not None:
+            self.quota_near_limit_count = int(quota_near_limit_count)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "nodeID": self.node_id,
@@ -65,7 +91,12 @@ class NodeRecord:
             "totalCPUPercent": self.total_cpu_percent,
             "reservedCPUPercent": self.reserved_cpu_percent,
             "totalDiskMB": self.total_disk_mb,
+            "usedDiskMB": self.used_disk_mb,
             "reservedDiskMB": self.reserved_disk_mb,
+            "quotaOverLimit": self.quota_over_limit,
+            "quotaNearLimit": self.quota_near_limit,
+            "quotaOverLimitCount": self.quota_over_limit_count,
+            "quotaNearLimitCount": self.quota_near_limit_count,
             "totalProcesses": self.total_processes,
             "reservedProcesses": self.reserved_processes,
             "draining": self.draining,
