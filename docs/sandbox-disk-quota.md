@@ -95,6 +95,27 @@ project id，定期清理。
 并发命令排队（或返回 429）。这是与 quota 无关的独立修复（当前无任何并发
 防护，[manager.py](/Users/polus/project/ai/sandlock-e2b/envd_service/process/manager.py:73)）。
 
+### 3.6 NFS 形态：quota-agent（E2.6）
+
+NFS 部署下 worker 只能看到 NFS 客户端挂载，真正的 XFS 文件系统在 NFS
+服务器上。worker 不直接跑 `xfs_quota`，而是把配额操作转发给部署在服务器
+侧的 quota-agent（小 HTTP 服务，`deploy/quota_agent`），由 agent 在服务器
+本地执行 `xfs_quota`：
+
+- 请求面：`GET /detect?mount=`（服务端检测 facts）/ `POST /project_create`
+  （`{projid, path, limit_mb, mount}`）/ `POST /project_delete`
+  （`{projid, path, mount}`）/ `GET /report?mount=`（项目配额表）/
+  `POST /reconcile`（`{workspace_base, mount}`）；
+- 鉴权：`X-Internal-Key` 携带 `E2B_QUOTA_AGENT_TOKEN`（与 worker 的
+  internal key 风格一致），token 未配置时服务拒绝启动/应答；
+- worker 侧：`E2B_QUOTA_VIA_AGENT=true` + `E2B_QUOTA_AGENT_URL/TOKEN` 时
+  `envd_service.app.create_app` 自动 wire `xfs_quota.agent_query/agent_ops`
+  HTTP 客户端；默认不设置即本地直连（零回归）。agent 不可达/401/协议错误
+  一律抛 `ProjectQuotaError`，由既有调用方降级跳过 + 警告，不阻塞沙箱；
+- 部署：`deploy/docker/Dockerfile.quota-agent` +
+  `deploy/compose/docker-compose.quota-agent.yml`（NFS 服务器形态说明、
+  `E2B_QUOTA_AGENT_PATH_MAP` 客户端→服务器路径映射）。
+
 ## 4. 本地验证（OrbStack）
 
 OrbStack 容器内可挂载 XFS + prjquota（实测通过）：
