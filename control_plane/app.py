@@ -102,7 +102,13 @@ def create_app(
                     )
                 except httpx.HTTPError:
                     pass
-            app.state.runtime_registry.unregister(record.sandbox_id)
+                app.state.runtime_registry.unregister(record.sandbox_id)
+            else:
+                # Local runtime: full teardown (unregister + workspace and
+                # per-sandbox volume slice cleanup, E2.5).
+                from control_plane.api.sandboxes import _destroy_local
+
+                _destroy_local(app.state, record)
 
         sweeper = TTLSweeper(on_expired=_on_sandbox_removed)
         app.state.sweeper = sweeper

@@ -639,24 +639,36 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
     else:
         (workspace_dir / "workspace").mkdir(parents=True, exist_ok=True)
     record.workspace_dir = workspace_dir
-    mount_paths: list[dict[str, str]] = []
+    try:
+        from envd_service.volumes import build_volume_mounts
+    except ImportError:  # pragma: no cover - separated control plane
+        raise OfficialError(500, "local node requires the envd service")
+    mount_inputs = []
     for mount in volume_mounts:
         volume = request.app.state.volumes.get(mount["name"])
-        rel_path = mount["path"].lstrip("/")
-        if not rel_path:
-            raise OfficialError(400, "volumeMounts path must not be empty")
-        target = workspace_dir / rel_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() or target.is_symlink():
-            if target.is_dir() and not target.is_symlink():
-                raise OfficialError(
-                    400, f"Mount path {mount['path']} already exists"
-                )
-            # Replace a stale mount symlink (e.g. migration rollback
-            # re-provisioning the source node).
-            target.unlink()
-        target.symlink_to(volume.path, target_is_directory=True)
-        mount_paths.append({"path": rel_path, "hostPath": str(volume.path)})
+        mount_inputs.append(
+            {
+                "name": mount["name"],
+                "path": mount["path"].lstrip("/"),
+                "hostPath": str(volume.path),
+                "perSandboxQuotaMb": volume.per_sandbox_quota_mb,
+            }
+        )
+    existing = request.app.state.runtime_registry.get(record.sandbox_id)
+    try:
+        mount_paths, volume_projects = build_volume_mounts(
+            sandbox_id=record.sandbox_id,
+            volume_mounts=mount_inputs,
+            shared_volume_root=settings.shared_volume_root,
+            workspace_dir=workspace_dir,
+            fallback_mount_point=settings.workspace_base,
+            via_agent=False,
+            existing_volume_projects=(
+                existing.volume_projects if existing is not None else []
+            ),
+        )
+    except ValueError as e:
+        raise OfficialError(400, str(e))
     request.app.state.runtime_registry.register(
         sandbox_id=record.sandbox_id,
         access_token=record.envd_access_token,
@@ -676,6 +688,7 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
         allow_public_traffic=bool(
             (record.network or {}).get("allowPublicTraffic", False)
         ),
+        volume_projects=volume_projects,
     )
 
 
@@ -707,6 +720,9 @@ async def _provision_remote(
                 "hostPath": str(
                     request.app.state.volumes.get(m["name"]).path
                 ),
+                "perSandboxQuotaMb": request.app.state.volumes.get(
+                    m["name"]
+                ).per_sandbox_quota_mb,
             }
             for m in volume_mounts
         ],
@@ -801,9 +817,8 @@ async def kill_sandbox(sandbox_id: str, request: Request) -> Response:
     node = request.app.state.nodes.get(record.node_id or "local")
     if node is not None and node.address != "local://":
         await _destroy_remote(request, record, node)
-    if request.app.state.runtime_registry is not None:
-        request.app.state.runtime_registry.unregister(sandbox_id)
-    registry.cleanup_workspace(record)
+    else:
+        _destroy_local(request.app.state, record)
     return Response(status_code=204)
 
 
@@ -825,17 +840,36 @@ async def _destroy_remote(request, record, node, keep_files: bool = False) -> No
         pass
 
 
-def _destroy_local(request, record, keep_files: bool = False) -> None:
-    request.app.state.runtime_registry.unregister(record.sandbox_id)
+def _destroy_local(state, record, keep_files: bool = False) -> None:
+    """Stop and clean a local sandbox runtime, including volume slices."""
+    runtime_registry = getattr(state, "runtime_registry", None)
+    runtime = (
+        runtime_registry.get(record.sandbox_id)
+        if runtime_registry is not None
+        else None
+    )
     if not keep_files:
+        if runtime is not None and runtime.volume_projects:
+            try:
+                from envd_service.volumes import cleanup_volume_projects
+            except ImportError:  # pragma: no cover - separated control plane
+                pass
+            else:
+                cleanup_volume_projects(
+                    volume_projects=runtime.volume_projects,
+                    fallback_mount_point=state.workspace_base,
+                    via_agent=False,
+                )
         shutil.rmtree(
-            request.app.state.workspace_base / record.sandbox_id, ignore_errors=True
+            state.workspace_base / record.sandbox_id, ignore_errors=True
         )
+    if runtime_registry is not None:
+        runtime_registry.unregister(record.sandbox_id)
 
 
 async def _destroy_on_node(request, record, node, keep_files: bool = False) -> None:
     if node.address == "local://":
-        _destroy_local(request, record, keep_files=keep_files)
+        _destroy_local(request.app.state, record, keep_files=keep_files)
         return
     await _destroy_remote(request, record, node, keep_files=keep_files)
 
@@ -849,7 +883,7 @@ async def _stop_source_runtime(request, record, node) -> bool:
     stop, in which case the caller must abort the migration.
     """
     if node.address == "local://":
-        _destroy_local(request, record, keep_files=True)
+        _destroy_local(request.app.state, record, keep_files=True)
         return True
     import httpx
 
@@ -1130,7 +1164,7 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
                 # never delete it -- only drop a partial runtime registration.
                 nodes.release_quota(target.node_id, **dims)
                 if target.address == "local://":
-                    _destroy_local(request, record, keep_files=shared)
+                    _destroy_local(request.app.state, record, keep_files=shared)
                 else:
                     await _destroy_remote(request, record, target, keep_files=shared)
                 raise

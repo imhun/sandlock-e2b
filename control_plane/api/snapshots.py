@@ -234,16 +234,33 @@ async def _create_sandbox_from_snapshot(
             workspace_dir.mkdir(parents=True, exist_ok=True)
             _snapshots(request).expand_to(snapshot, workspace_dir)
             record.workspace_dir = workspace_dir
-            mount_paths: list[dict[str, str]] = []
+            try:
+                from envd_service.volumes import build_volume_mounts
+            except ImportError:  # pragma: no cover - separated control plane
+                raise OfficialError(500, "local node requires the envd service")
+            mount_inputs = []
             for mount in record.volume_mounts:
                 volume = request.app.state.volumes.get(mount["name"])
-                rel_path = mount["path"].lstrip("/")
-                target = workspace_dir / rel_path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if target.exists() or target.is_symlink():
-                    target.unlink()
-                target.symlink_to(volume.path, target_is_directory=True)
-                mount_paths.append({"path": rel_path, "hostPath": str(volume.path)})
+                mount_inputs.append(
+                    {
+                        "name": mount["name"],
+                        "path": mount["path"].lstrip("/"),
+                        "hostPath": str(volume.path),
+                        "perSandboxQuotaMb": volume.per_sandbox_quota_mb,
+                    }
+                )
+            try:
+                mount_paths, volume_projects = build_volume_mounts(
+                    sandbox_id=record.sandbox_id,
+                    volume_mounts=mount_inputs,
+                    shared_volume_root=settings.shared_volume_root,
+                    workspace_dir=workspace_dir,
+                    fallback_mount_point=settings.workspace_base,
+                    via_agent=False,
+                    existing_volume_projects=[],
+                )
+            except ValueError as e:
+                raise OfficialError(400, str(e))
             request.app.state.runtime_registry.register(
                 sandbox_id=record.sandbox_id,
                 access_token=record.envd_access_token,
@@ -257,6 +274,7 @@ async def _create_sandbox_from_snapshot(
                 allow_internet_access=record.allow_internet_access,
                 max_command_timeout=settings.max_command_timeout,
                 volume_mounts=mount_paths,
+                volume_projects=volume_projects,
             )
         else:
             await _provision_remote(
