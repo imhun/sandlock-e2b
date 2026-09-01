@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import tarfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +72,9 @@ def _extract_build_context(build_dir: Path) -> Path:
     if not archives.is_dir():
         return ctx_dir
     for archive in sorted(archives.iterdir()):
-        if not archive.is_file():
+        # Staging temp files (E3.4 unique-name uploads) are never build
+        # context; only published archives are extracted.
+        if not archive.is_file() or archive.name.startswith("."):
             continue
         try:
             tar = tarfile.open(archive)
@@ -329,18 +332,31 @@ async def template_file_upload(
     archives = workspace_base / "_builds" / template_id / "archives"
     archives.mkdir(parents=True, exist_ok=True)
     target = archives / f"{file_hash}.tar.gz"
+    # Unique temp file: concurrent PUTs of the same file_hash each stage
+    # their own archive and atomically rename it into place, so one upload
+    # can never truncate or delete another's in-flight file (E3.4 review
+    # I2). The loser of claim_file_upload must not unlink the winner's
+    # archive, so only the temp file is ever cleaned up on failure.
+    tmp = archives / f".{file_hash}.{uuid.uuid4().hex}.tmp"
     try:
-        with open(target, "wb") as f:
+        with open(tmp, "wb") as f:
             f.write(body)
-        # Validate the payload is a readable tar/gzip archive before caching.
-        with tarfile.open(target) as tar:
+        # Validate the payload is a readable tar/gzip archive before it is
+        # published under the final name.
+        with tarfile.open(tmp) as tar:
             tar.getmembers()
     except (OSError, tarfile.TarError):
-        target.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
         raise OfficialError(400, "Uploaded file is not a valid tar archive")
+    try:
+        os.replace(tmp, target)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise OfficialError(500, "Failed to store uploaded file")
     if not _templates(request).claim_file_upload(template_id, file_hash):
-        # A concurrent upload won the race; discard ours and reject.
-        target.unlink(missing_ok=True)
+        # A concurrent upload won the race. Our archive was already
+        # atomically renamed into place (same file_hash => same content),
+        # so unlink here would delete the winner's archive.
         raise OfficialError(409, "File already uploaded")
     return Response(status_code=204)
 

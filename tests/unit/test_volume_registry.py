@@ -109,6 +109,69 @@ def test_legacy_storage_dict_without_expiry_is_valid(workspace):
     assert legacy.is_token_valid() is True
 
 
+def test_redis_mode_backfills_legacy_disk_records(workspace):
+    """E3.3 review I1: enabling Redis must not hide existing volumes."""
+    fakeredis = pytest.importorskip("fakeredis")
+    server = fakeredis.FakeServer()
+    # Pre-Redis volume: created by a disk-only registry, never in Redis.
+    legacy = VolumeRegistry(workspace / "volumes")
+    record = legacy.create("legacy")
+
+    upgraded = VolumeRegistry(
+        workspace / "volumes",
+        redis_client=fakeredis.FakeRedis(server=server),
+    )
+    loaded = upgraded.get(record.volume_id)
+    assert loaded.volume_id == record.volume_id
+    assert loaded.token == record.token
+    # Legacy records keep the never-expiring token semantics.
+    assert loaded.token_expires_at is None
+    assert loaded.is_token_valid() is True
+    assert (
+        upgraded.verify_token(record.volume_id, record.token).volume_id
+        == record.volume_id
+    )
+    assert [v.volume_id for v in upgraded.list()] == [record.volume_id]
+
+    # The record was mirrored into Redis: a fresh replica with its own
+    # empty disk can verify the token through the shared store alone.
+    replica = VolumeRegistry(
+        workspace / "volumes-replica",
+        redis_client=fakeredis.FakeRedis(server=server),
+    )
+    assert (
+        replica.verify_token(record.volume_id, record.token).volume_id
+        == record.volume_id
+    )
+
+
+def test_redis_backfill_is_idempotent_and_preserves_revocation(workspace):
+    """Backfill never overwrites an existing Redis record (e.g. a
+    revocation written by another replica)."""
+    fakeredis = pytest.importorskip("fakeredis")
+    server = fakeredis.FakeServer()
+    legacy = VolumeRegistry(workspace / "volumes")
+    record = legacy.create("legacy")
+
+    client = fakeredis.FakeRedis(server=server)
+    upgraded = VolumeRegistry(workspace / "volumes", redis_client=client)
+    assert upgraded.get(record.volume_id).volume_id == record.volume_id
+
+    # A second replica revokes the token in the shared store.
+    replica = VolumeRegistry(
+        workspace / "volumes-replica",
+        redis_client=fakeredis.FakeRedis(server=server),
+    )
+    replica.revoke_token(record.volume_id)
+
+    # A fresh process over the same disk must not resurrect the stale
+    # disk copy: existing Redis records win over backfill.
+    reupgraded = VolumeRegistry(workspace / "volumes", redis_client=client)
+    assert reupgraded.get(record.volume_id).token_revoked is True
+    with pytest.raises(UnknownVolumeError):
+        reupgraded.verify_token(record.volume_id, record.token)
+
+
 def test_redis_shared_record_and_revocation_visibility(workspace):
     fakeredis = pytest.importorskip("fakeredis")
     server = fakeredis.FakeServer()

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import tarfile
+import threading
 
 import httpx
 
@@ -111,6 +113,86 @@ async def test_uploaded_file_token_cleared_and_overwrite_rejected(apps):
         with tarfile.open(archive, mode="r:gz") as tar:
             extracted = tar.extractfile("requirements.txt").read()
         assert extracted == b"requests==2.32.0\n"
+
+
+async def test_concurrent_upload_same_file_hash_keeps_winner_archive(
+    apps, monkeypatch
+):
+    """E3.4 review I2: two PUTs racing on one file_hash keep one archive.
+
+    Both requests stage unique temp files and atomically rename them into
+    place; the loser of claim_file_upload must not unlink the winner's
+    archive. Exactly one PUT wins (204), the other is rejected (409), and
+    the final archive still exists with the uploaded content.
+    """
+    control, _ = apps
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control), base_url="http://test"
+    ) as client:
+        info = await _create_template(client)
+        template_id = info["templateID"]
+        file_hash = "race-hash"
+        link = await client.get(
+            f"/templates/{template_id}/files/{file_hash}",
+            headers={"X-API-Key": "local-key"},
+        )
+        assert link.status_code == 201
+        assert link.json()["present"] is False
+        url = link.json()["url"]
+        payload = _tar_bytes("requirements.txt", "requests==2.32.0\n")
+
+    # Force both PUTs to finish staging (os.replace) before either claims,
+    # so a buggy loser cleanup would deterministically delete the archive
+    # the winner just claimed.
+    barrier = threading.Barrier(2)
+    real_replace = os.replace
+
+    def delayed_replace(src, dst):
+        barrier.wait(timeout=5)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", delayed_replace)
+
+    statuses: list[int] = []
+    errors: list[BaseException] = []
+
+    async def _put() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=control), base_url="http://test"
+        ) as client:
+            resp = await client.put(url, content=payload)
+            statuses.append(resp.status_code)
+
+    def _run() -> None:
+        try:
+            asyncio.run(_put())
+        except BaseException as exc:  # noqa: BLE001 - surface any thread failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert sorted(statuses) == [204, 409]
+
+    record = control.state.templates.get(template_id)
+    assert record.is_file_uploaded(file_hash) is True
+    assert file_hash not in record.upload_tokens
+
+    archive = (
+        control.state.workspace_base
+        / "_builds"
+        / template_id
+        / "archives"
+        / f"{file_hash}.tar.gz"
+    )
+    assert archive.is_file()
+    with tarfile.open(archive, mode="r:gz") as tar:
+        extracted = tar.extractfile("requirements.txt").read()
+    assert extracted == b"requests==2.32.0\n"
 
 
 async def test_upload_token_per_file_independent(apps):

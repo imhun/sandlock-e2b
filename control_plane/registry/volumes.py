@@ -125,6 +125,10 @@ class VolumeRegistry:
         self._lock = threading.Lock()
         self._token_ttl_seconds = token_ttl_seconds
         self._record_store = None
+        #: True once legacy disk-only records have been mirrored into the
+        #: shared store (E3.3 review I1); the scan runs at most once per
+        #: process so per-request lookups stay cheap.
+        self._backfilled = False
         if redis_client is not None:
             from control_plane.registry.redis_backend import RedisRecordStore
 
@@ -219,6 +223,39 @@ class VolumeRegistry:
         payload = json.loads(path.read_text(encoding="utf-8"))
         return VolumeRecord.from_storage_dict(payload, self._base / volume_id)
 
+    def _ensure_backfilled(self) -> None:
+        """Mirror legacy disk-only volume records into Redis once.
+
+        Pre-Redis deployments keep volume records only in ``_meta/*.json``
+        on disk. Enabling ``E2B_REDIS_URL`` without a migration would make
+        every existing volume 404/401 and drop it from ``list()``. The
+        first access writes any disk record Redis does not know yet into
+        the shared store; records already present are never overwritten,
+        so a concurrent replica's revocation/expiry stays authoritative.
+        """
+        if self._record_store is None:
+            return
+        with self._lock:
+            if self._backfilled:
+                return
+            self._backfilled = True
+            meta_dir = self._base / "_meta"
+            if not meta_dir.is_dir():
+                return
+            for path in sorted(meta_dir.glob("*.json")):
+                volume_id = path.stem
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    if self._record_store.get(volume_id) is not None:
+                        continue
+                    record = VolumeRecord.from_storage_dict(
+                        payload, self._base / volume_id
+                    )
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+                self._record_store.put(volume_id, payload, ttl=None)
+                self._volumes[volume_id] = record
+
     def save(self, record: VolumeRecord) -> VolumeRecord:
         """Persist a mutated record (revocation / expiry bookkeeping)."""
         with self._lock:
@@ -241,6 +278,7 @@ class VolumeRegistry:
             # Redis-backed registries always read the shared store so a
             # mutation (token revocation, expiry) by another replica is
             # visible immediately.
+            self._ensure_backfilled()
             payload = self._record_store.get(volume_id)
             if payload is None:
                 raise UnknownVolumeError(volume_id)
@@ -282,6 +320,7 @@ class VolumeRegistry:
         offset: int = 0,
         tenant_id: str | None = None,
     ) -> list[VolumeRecord]:
+        self._ensure_backfilled()
         with self._lock:
             meta_dir = self._base / "_meta"
             if meta_dir.is_dir():

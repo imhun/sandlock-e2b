@@ -5,8 +5,12 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 
+from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings
+from control_plane.registry.volumes import VolumeRegistry
+from envd_service.runtime.registry import RuntimeRegistry
 
 
 def _client(app):
@@ -137,6 +141,60 @@ async def test_volume_token_revoked_returns_401(make_apps):
         )
         assert info.status_code == 200
         assert info.json()["volumeID"] == vid
+
+
+async def test_legacy_disk_volume_visible_and_accessible_after_redis_upgrade(
+    workspace,
+):
+    """E3.3 review I1: pre-Redis volumes survive an upgrade to Redis mode.
+
+    A volume created by a disk-only registry (no E2B_REDIS_URL) must stay
+    visible, listable, and usable with its original token once the control
+    plane runs with a Redis-backed VolumeRegistry.
+    """
+    fakeredis = pytest.importorskip("fakeredis")
+    volume_root = workspace / "_volumes"
+    legacy = VolumeRegistry(volume_root)
+    record = legacy.create("pre-upgrade")
+    vid = record.volume_id
+    token = record.token
+
+    server = fakeredis.FakeServer()
+    upgraded = VolumeRegistry(
+        volume_root, redis_client=fakeredis.FakeRedis(server=server)
+    )
+    control = create_control_app(
+        settings=Settings(api_keys=("local-key",)),
+        runtime_registry=RuntimeRegistry(workspace),
+        workspace_base=workspace,
+        volumes_registry=upgraded,
+    )
+    async with _client(control) as client:
+        info = await client.get(
+            f"/volumes/{vid}", headers={"X-API-Key": "local-key"}
+        )
+        assert info.status_code == 200
+        assert info.json()["volumeID"] == vid
+
+        headers = {"Authorization": f"Bearer {token}"}
+        write = await client.put(
+            f"/volumecontent/{vid}/file",
+            headers=headers,
+            params={"path": "a.txt"},
+            content=b"legacy-data",
+        )
+        assert write.status_code == 201
+        read = await client.get(
+            f"/volumecontent/{vid}/file",
+            headers=headers,
+            params={"path": "a.txt"},
+        )
+        assert read.status_code == 200
+        assert read.content == b"legacy-data"
+
+        listed = await client.get("/volumes", headers={"X-API-Key": "local-key"})
+        assert listed.status_code == 200
+        assert [v["volumeID"] for v in listed.json()] == [vid]
 
 
 async def test_volume_token_expires_after_ttl(make_apps):
