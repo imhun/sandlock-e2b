@@ -153,7 +153,11 @@ def create_app(
     volume_root = settings.shared_volume_root or (
         (workspace_base or settings.workspace_base) / "_volumes"
     )
-    app.state.volumes = volumes_registry or VolumeRegistry(volume_root)
+    app.state.volumes = volumes_registry or VolumeRegistry(
+        volume_root,
+        redis_client=redis_client,
+        token_ttl_seconds=settings.volume_token_ttl_s,
+    )
     app.state.secrets = secrets_registry or SecretRegistry(
         (workspace_base or settings.workspace_base) / "_secrets"
     )

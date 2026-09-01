@@ -87,6 +87,9 @@ class Settings:
     create_rate_limit_per_min: int = field(
         default_factory=lambda: _env_int("E2B_CREATE_RATE_LIMIT_PER_MIN", 120)
     )
+    volume_token_ttl_s: int = field(
+        default_factory=lambda: _env_int("E2B_VOLUME_TOKEN_TTL_S", 0)
+    )
     enable_network: bool = field(
         default_factory=lambda: _env_bool("E2B_ENABLE_NETWORK", False)
     )

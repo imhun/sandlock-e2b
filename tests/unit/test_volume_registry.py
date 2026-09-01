@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
-from control_plane.registry.volumes import UnknownVolumeError, VolumeRegistry
+from control_plane.registry.volumes import (
+    UnknownVolumeError,
+    VolumeRecord,
+    VolumeRegistry,
+)
+from gateway_common.timeutil import to_iso_z, utcnow
 
 
 def test_create_get_list_delete(workspace):
@@ -36,6 +43,99 @@ def test_token_verification(workspace):
     assert registry.verify_token(record.volume_id, record.token).volume_id == record.volume_id
     with pytest.raises(UnknownVolumeError):
         registry.verify_token(record.volume_id, "wrong")
+
+
+def test_token_ttl_zero_is_never_expiring(workspace):
+    registry = VolumeRegistry(workspace / "volumes")
+    record = registry.create("data")
+    assert record.token_expires_at is None
+    assert record.is_token_valid() is True
+    assert "tokenExpiresAt" not in record.as_volume_and_token()
+
+
+def test_token_ttl_sets_expiry_and_verification_fails_after(workspace):
+    registry = VolumeRegistry(workspace / "volumes", token_ttl_seconds=3600)
+    record = registry.create("data")
+    assert record.token_expires_at is not None
+    assert record.as_volume_and_token()["tokenExpiresAt"].endswith("Z")
+    assert record.is_token_valid() is True
+    assert record.is_token_valid(utcnow() + timedelta(hours=2)) is False
+
+    record.token_expires_at = utcnow() - timedelta(seconds=1)
+    registry.save(record)
+    with pytest.raises(UnknownVolumeError):
+        registry.verify_token(record.volume_id, record.token)
+
+
+def test_revoked_token_rejected_but_volume_remains(workspace):
+    registry = VolumeRegistry(workspace / "volumes")
+    record = registry.create("data")
+    registry.revoke_token(record.volume_id)
+    reloaded = registry.get(record.volume_id)
+    assert reloaded.token_revoked is True
+    assert reloaded.is_token_valid() is False
+    with pytest.raises(UnknownVolumeError):
+        registry.verify_token(record.volume_id, record.token)
+    # Revocation is idempotent.
+    registry.revoke_token(record.volume_id)
+    assert registry.get(record.volume_id).token_revoked is True
+
+
+def test_token_expiry_and_revocation_persist_across_restart(workspace):
+    registry = VolumeRegistry(workspace / "volumes", token_ttl_seconds=3600)
+    record = registry.create("data")
+    registry.revoke_token(record.volume_id)
+
+    restarted = VolumeRegistry(workspace / "volumes")
+    loaded = restarted.get(record.volume_id)
+    assert loaded.token == record.token
+    # Storage serializes with millisecond precision (to_iso_z).
+    assert to_iso_z(loaded.token_expires_at) == to_iso_z(record.token_expires_at)
+    assert loaded.token_revoked is True
+    with pytest.raises(UnknownVolumeError):
+        restarted.verify_token(record.volume_id, record.token)
+
+
+def test_legacy_storage_dict_without_expiry_is_valid(workspace):
+    registry = VolumeRegistry(workspace / "volumes")
+    record = registry.create("data")
+    payload = record.to_storage_dict()
+    payload.pop("token_expires_at")
+    payload.pop("token_revoked")
+
+    legacy = VolumeRecord.from_storage_dict(payload, record.path)
+    assert legacy.token_expires_at is None
+    assert legacy.token_revoked is False
+    assert legacy.is_token_valid() is True
+
+
+def test_redis_shared_record_and_revocation_visibility(workspace):
+    fakeredis = pytest.importorskip("fakeredis")
+    server = fakeredis.FakeServer()
+    registry = VolumeRegistry(
+        workspace / "volumes",
+        redis_client=fakeredis.FakeRedis(server=server),
+        token_ttl_seconds=3600,
+    )
+    record = registry.create("data")
+
+    replica = VolumeRegistry(
+        workspace / "volumes-replica",
+        redis_client=fakeredis.FakeRedis(server=server),
+    )
+    loaded = replica.get(record.volume_id)
+    assert loaded.token == record.token
+    assert to_iso_z(loaded.token_expires_at) == to_iso_z(record.token_expires_at)
+    assert loaded.token_revoked is False
+    assert replica.verify_token(record.volume_id, record.token).volume_id == record.volume_id
+
+    replica.revoke_token(record.volume_id)
+    with pytest.raises(UnknownVolumeError):
+        registry.verify_token(record.volume_id, record.token)
+
+    registry.delete(record.volume_id)
+    with pytest.raises(UnknownVolumeError):
+        replica.get(record.volume_id)
 
 
 def test_create_with_per_sandbox_quota_mb(workspace):

@@ -6,7 +6,7 @@ import json
 import os
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,19 @@ class VolumeRecord:
     #: (backward-compatible: sandboxes mount the volume root as before).
     per_sandbox_quota_mb: int = 0
     tenant_id: str | None = None
+    #: E3.3: token expiry (UTC; ``None`` = never expires, legacy semantics)
+    #: and revocation flag. Revocation invalidates the token immediately;
+    #: an expired token behaves identically (401 on the content API).
+    token_expires_at: datetime | None = None
+    token_revoked: bool = False
+
+    def is_token_valid(self, now: datetime | None = None) -> bool:
+        """True while the token is neither revoked nor past its TTL."""
+        if self.token_revoked:
+            return False
+        if self.token_expires_at is None:
+            return True
+        return (now or utcnow()) < self.token_expires_at
 
     def as_volume(self) -> dict:
         return {
@@ -44,6 +57,8 @@ class VolumeRecord:
     def as_volume_and_token(self) -> dict:
         payload = self.as_volume()
         payload["token"] = self.token
+        if self.token_expires_at is not None:
+            payload["tokenExpiresAt"] = to_iso_z(self.token_expires_at)
         return payload
 
     def to_storage_dict(self) -> dict[str, Any]:
@@ -55,6 +70,12 @@ class VolumeRecord:
             "created_at": to_iso_z(self.created_at),
             "per_sandbox_quota_mb": self.per_sandbox_quota_mb,
             "tenant_id": self.tenant_id,
+            "token_expires_at": (
+                to_iso_z(self.token_expires_at)
+                if self.token_expires_at is not None
+                else None
+            ),
+            "token_revoked": self.token_revoked,
         }
 
     @classmethod
@@ -68,6 +89,14 @@ class VolumeRecord:
             created_dt = _dt.fromisoformat(created.replace("Z", "+00:00"))
         except (ValueError, AttributeError):
             created_dt = utcnow()
+        expires = data.get("token_expires_at")
+        if expires:
+            try:
+                expires_dt = _dt.fromisoformat(expires.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                expires_dt = None
+        else:
+            expires_dt = None
         return cls(
             volume_id=data["volume_id"],
             name=data["name"],
@@ -77,15 +106,29 @@ class VolumeRecord:
             path=path,
             per_sandbox_quota_mb=int(data.get("per_sandbox_quota_mb", 0)),
             tenant_id=data.get("tenant_id"),
+            token_expires_at=expires_dt,
+            token_revoked=bool(data.get("token_revoked", False)),
         )
 
 
 class VolumeRegistry:
-    def __init__(self, base_dir: str | Path) -> None:
+    def __init__(
+        self,
+        base_dir: str | Path,
+        redis_client=None,
+        token_ttl_seconds: int = 0,
+        namespace: str = "e2b",
+    ) -> None:
         self._base = Path(base_dir).resolve()
         self._base.mkdir(parents=True, exist_ok=True)
         self._volumes: dict[str, VolumeRecord] = {}
         self._lock = threading.Lock()
+        self._token_ttl_seconds = token_ttl_seconds
+        self._record_store = None
+        if redis_client is not None:
+            from control_plane.registry.redis_backend import RedisRecordStore
+
+            self._record_store = RedisRecordStore(redis_client, namespace)
 
     def create(
         self,
@@ -93,6 +136,7 @@ class VolumeRegistry:
         node_id: str = "local",
         per_sandbox_quota_mb: int = 0,
         tenant_id: str | None = None,
+        token_ttl_seconds: int | None = None,
     ) -> VolumeRecord:
         if not name or not isinstance(name, str):
             raise ValueError("name must be a non-empty string")
@@ -102,10 +146,24 @@ class VolumeRegistry:
             or per_sandbox_quota_mb < 0
         ):
             raise ValueError("per_sandbox_quota_mb must be a non-negative integer")
+        ttl = (
+            self._token_ttl_seconds
+            if token_ttl_seconds is None
+            else token_ttl_seconds
+        )
+        if (
+            not isinstance(ttl, int)
+            or isinstance(ttl, bool)
+            or ttl < 0
+        ):
+            raise ValueError("token_ttl_seconds must be a non-negative integer")
         with self._lock:
             volume_id = sandbox_id().replace("sbx_", "vol_")
             while volume_id in self._volumes:
                 volume_id = sandbox_id().replace("sbx_", "vol_")
+            token_expires_at = (
+                utcnow() + timedelta(seconds=ttl) if ttl > 0 else None
+            )
             record = VolumeRecord(
                 volume_id=volume_id,
                 name=name,
@@ -114,6 +172,7 @@ class VolumeRegistry:
                 path=self._base / volume_id,
                 per_sandbox_quota_mb=per_sandbox_quota_mb,
                 tenant_id=tenant_id,
+                token_expires_at=token_expires_at,
             )
             record.path.mkdir(parents=True, exist_ok=True)
             # E3.2 volume permission model: the volume root is shared across
@@ -141,17 +200,56 @@ class VolumeRegistry:
             json.dumps(record.to_storage_dict(), separators=(",", ":")),
             encoding="utf-8",
         )
+        if self._record_store is not None:
+            self._record_store.put(
+                record.volume_id, record.to_storage_dict(), ttl=None
+            )
 
     def _load_record(self, volume_id: str) -> VolumeRecord:
+        if self._record_store is not None:
+            payload = self._record_store.get(volume_id)
+            if payload is None:
+                raise UnknownVolumeError(volume_id)
+            return VolumeRecord.from_storage_dict(
+                payload, self._base / volume_id
+            )
         path = self._record_path(volume_id)
         if not path.is_file():
             raise UnknownVolumeError(volume_id)
         payload = json.loads(path.read_text(encoding="utf-8"))
         return VolumeRecord.from_storage_dict(payload, self._base / volume_id)
 
+    def save(self, record: VolumeRecord) -> VolumeRecord:
+        """Persist a mutated record (revocation / expiry bookkeeping)."""
+        with self._lock:
+            self._volumes[record.volume_id] = record
+        self._write_record(record)
+        return record
+
+    def revoke_token(self, volume_id: str) -> VolumeRecord:
+        """Invalidate the volume's access token immediately (idempotent)."""
+        record = self.get(volume_id)
+        if not record.token_revoked:
+            record.token_revoked = True
+            self.save(record)
+        return record
+
     def get(self, volume_id: str) -> VolumeRecord:
         if not validate_sandbox_id(volume_id):
             raise UnknownVolumeError(volume_id)
+        if self._record_store is not None:
+            # Redis-backed registries always read the shared store so a
+            # mutation (token revocation, expiry) by another replica is
+            # visible immediately.
+            payload = self._record_store.get(volume_id)
+            if payload is None:
+                raise UnknownVolumeError(volume_id)
+            record = VolumeRecord.from_storage_dict(
+                payload, self._base / volume_id
+            )
+            with self._lock:
+                self._volumes[volume_id] = record
+            return record
         with self._lock:
             record = self._volumes.get(volume_id)
             if record is None:
@@ -168,6 +266,8 @@ class VolumeRegistry:
         record = self.get(volume_id)
         with self._lock:
             self._volumes.pop(volume_id, None)
+        if self._record_store is not None:
+            self._record_store.delete(volume_id)
         self._record_path(volume_id).unlink(missing_ok=True)
         if record.path is not None:
             import shutil
@@ -205,6 +305,6 @@ class VolumeRegistry:
 
     def verify_token(self, volume_id: str, token: str) -> VolumeRecord:
         record = self.get(volume_id)
-        if record.token != token:
+        if not record.is_token_valid() or record.token != token:
             raise UnknownVolumeError(volume_id)
         return record

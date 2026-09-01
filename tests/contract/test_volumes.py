@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
+
+from control_plane.config import Settings
 
 
 def _client(app):
@@ -100,6 +104,70 @@ async def test_volume_bad_token(control_client):
         params={"path": "a.txt"},
     )
     assert response.status_code == 401
+
+
+async def test_volume_token_revoked_returns_401(make_apps):
+    control, _ = make_apps()
+    async with _client(control) as client:
+        created = await client.post(
+            "/volumes", headers={"X-API-Key": "local-key"}, json={"name": "data"}
+        )
+        assert created.status_code == 201
+        vid = created.json()["volumeID"]
+        token = created.json()["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        upload = await client.put(
+            f"/volumecontent/{vid}/file",
+            headers=headers,
+            params={"path": "a.txt"},
+            content=b"data",
+        )
+        assert upload.status_code == 201
+
+        control.state.volumes.revoke_token(vid)
+        read = await client.get(
+            f"/volumecontent/{vid}/file",
+            headers=headers,
+            params={"path": "a.txt"},
+        )
+        assert read.status_code == 401
+        # The volume itself still exists and stays listable.
+        info = await client.get(
+            f"/volumes/{vid}", headers={"X-API-Key": "local-key"}
+        )
+        assert info.status_code == 200
+        assert info.json()["volumeID"] == vid
+
+
+async def test_volume_token_expires_after_ttl(make_apps):
+    control, _ = make_apps(
+        control_settings=Settings(api_keys=("local-key",), volume_token_ttl_s=1)
+    )
+    async with _client(control) as client:
+        created = await client.post(
+            "/volumes", headers={"X-API-Key": "local-key"}, json={"name": "data"}
+        )
+        assert created.status_code == 201
+        payload = created.json()
+        assert payload["tokenExpiresAt"].endswith("Z")
+        vid = payload["volumeID"]
+        token = payload["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        write = await client.put(
+            f"/volumecontent/{vid}/file",
+            headers=headers,
+            params={"path": "a.txt"},
+            content=b"data",
+        )
+        assert write.status_code == 201
+
+        await asyncio.sleep(1.2)
+        read = await client.get(
+            f"/volumecontent/{vid}/file",
+            headers=headers,
+            params={"path": "a.txt"},
+        )
+        assert read.status_code == 401
 
 
 async def test_volume_mount_persists_across_sandboxes(make_apps, workspace):
