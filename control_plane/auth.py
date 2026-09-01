@@ -19,6 +19,13 @@ async def require_api_key(
         key = request.headers.get("X-API-KEY")
     if key is None or key not in settings.all_api_keys:
         raise OfficialError(401, "Unauthorized")
+    # E3.1 fail-closed: with E2B_TENANTS configured every non-admin key must
+    # be mapped to a tenant. Legacy E2B_API_KEYS/E2B_API_KEY that were never
+    # mapped must not list/read/delete tenant resources or bypass tenant
+    # quota/rate limits, so they are rejected here before any handler runs.
+    if settings.tenants_enabled and key not in settings.admin_api_keys:
+        if settings.tenant_of_key(key) is None:
+            raise OfficialError(403, "API key is not mapped to any tenant")
     return key
 
 

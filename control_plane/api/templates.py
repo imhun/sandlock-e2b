@@ -303,13 +303,19 @@ async def trigger_template_build(
 ) -> Response:
     try:
         record = _templates(request).get(template_id)
+    except UnknownTemplateBuildError:
+        raise OfficialError(404, f"Template {template_id} not found")
+    # Ownership is checked before build lookup so a cross-tenant template
+    # returns the same 404 as a missing one (no existence leak).
+    _require_owned(request, record, resource_id=template_id, label="Template")
+    try:
         build = record.get_build(build_id)
-        body = await request.json()
     except UnknownTemplateBuildError:
         raise OfficialError(404, f"Template build {build_id} not found")
+    try:
+        body = await request.json()
     except json.JSONDecodeError:
         raise OfficialError(400, "Invalid JSON body")
-    _require_owned(request, record, resource_id=template_id, label="Template")
     try:
         dockerfile = _steps_to_dockerfile(
             (body or {}).get("fromImage"), (body or {}).get("steps") or []
@@ -336,10 +342,15 @@ async def template_build_status(
 ) -> dict[str, Any]:
     try:
         record = _templates(request).get(template_id)
+    except UnknownTemplateBuildError:
+        raise OfficialError(404, f"Template {template_id} not found")
+    # Same 404 unification as trigger_template_build: a cross-tenant
+    # template is indistinguishable from a missing one.
+    _require_owned(request, record, resource_id=template_id, label="Template")
+    try:
         build = record.get_build(build_id)
     except UnknownTemplateBuildError:
         raise OfficialError(404, f"Template build {build_id} not found")
-    _require_owned(request, record, resource_id=template_id, label="Template")
     info = build.as_info(record.template_id)
     info["logs"] = info["logs"][logsOffset:]
     info["logEntries"] = info["logEntries"][logsOffset:]

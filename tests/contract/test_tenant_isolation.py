@@ -322,3 +322,163 @@ async def test_sandbox_delete_checks_ownership(control):
             f"/sandboxes/{sandbox_id}", headers={"X-API-Key": "keyA"}
         )
     ).status_code == 200
+
+
+async def test_unmapped_key_fail_closed_in_isolation_mode(make_apps):
+    """A legacy key that maps to no tenant is rejected on every resource."""
+    control, _envd = make_apps(
+        control_settings=_tenant_settings(api_keys=("legacy-key",))
+    )
+    async with await _client(control) as client:
+        sbx = await _create_sandbox(client, "keyA")
+        assert sbx.status_code == 201
+        sandbox_id = sbx.json()["sandboxID"]
+        vol = await client.post(
+            "/volumes", headers={"X-API-Key": "keyA"}, json={"name": "t1-vol"}
+        )
+        assert vol.status_code == 201
+        volume_id = vol.json()["volumeID"]
+        sec = await client.post(
+            "/secrets",
+            headers={"X-API-Key": "keyA"},
+            json={"name": "t1-secret", "value": "v"},
+        )
+        assert sec.status_code == 201
+        secret_id = sec.json()["secretID"]
+        tpl = await client.post(
+            "/v3/templates", headers={"X-API-Key": "keyA"}, json={"name": "t1-tpl"}
+        )
+        assert tpl.status_code == 202
+        template_id = tpl.json()["templateID"]
+
+        forbidden = {"code": 403, "message": "API key is not mapped to any tenant"}
+        # Lists are rejected wholesale (no partial visibility).
+        for path in ("/sandboxes", "/volumes", "/secrets", "/templates", "/nodes"):
+            resp = await client.get(path, headers={"X-API-Key": "legacy-key"})
+            assert resp.status_code == 403
+            assert resp.json() == forbidden
+        # Single-resource reads and deletes are rejected.
+        for path in (
+            f"/sandboxes/{sandbox_id}",
+            f"/volumes/{volume_id}",
+            f"/secrets/{secret_id}",
+            f"/templates/{template_id}/files/abc123",
+        ):
+            assert (
+                await client.get(path, headers={"X-API-Key": "legacy-key"})
+            ).status_code == 403
+        for path in (f"/sandboxes/{sandbox_id}", f"/volumes/{volume_id}"):
+            assert (
+                await client.delete(path, headers={"X-API-Key": "legacy-key"})
+            ).status_code == 403
+        # Creates (including secret-injection attempts) are rejected, so the
+        # key cannot create unowned resources either.
+        assert (
+            await _create_sandbox(
+                client, "legacy-key", envVars={"TOKEN": "${t1-secret}"}
+            )
+        ).status_code == 403
+        assert (
+            await client.post(
+                "/volumes",
+                headers={"X-API-Key": "legacy-key"},
+                json={"name": "legacy-vol"},
+            )
+        ).status_code == 403
+        # The tenant's resources are untouched by the rejected requests.
+        assert (
+            await client.get(
+                f"/sandboxes/{sandbox_id}", headers={"X-API-Key": "keyA"}
+            )
+        ).status_code == 200
+        assert (
+            await client.get(
+                f"/volumes/{volume_id}", headers={"X-API-Key": "keyA"}
+            )
+        ).status_code == 200
+
+
+async def test_unmapped_key_cannot_bypass_tenant_quota_or_rate_limit(make_apps):
+    control, _envd = make_apps(
+        control_settings=_tenant_settings(
+            api_keys=("legacy-key",),
+            tenant_limits={T1: {"max_sandboxes": 1}},
+        )
+    )
+    async with await _client(control) as client:
+        assert (
+            await _create_sandbox(client, "legacy-key")
+        ).status_code == 403
+        first = await _create_sandbox(client, "keyA")
+        assert first.status_code == 201
+        second = await _create_sandbox(client, "keyB")
+        assert second.status_code == 503
+        assert second.json() == {"code": 503, "message": "tenant quota exceeded"}
+
+    control, _envd = make_apps(
+        control_settings=_tenant_settings(
+            api_keys=("legacy-key",),
+            tenant_rate_limits={T1: 1},
+        )
+    )
+    async with await _client(control) as client:
+        first = await _create_sandbox(client, "keyA")
+        assert first.status_code == 201
+        second = await _create_sandbox(client, "keyB")
+        assert second.status_code == 429
+
+
+async def test_template_trigger_status_cross_tenant_404_matches_missing(make_apps):
+    control, _envd = make_apps(control_settings=_tenant_settings())
+    async with await _client(control) as client:
+        tpl = await client.post(
+            "/v3/templates", headers={"X-API-Key": "keyC"}, json={"name": "t2-tpl"}
+        )
+        assert tpl.status_code == 202
+        template_id = tpl.json()["templateID"]
+        build_id = tpl.json()["buildID"]
+
+        missing = await client.get(
+            "/templates/tpl_missing/builds/bld_missing/status",
+            headers={"X-API-Key": "keyA"},
+        )
+        assert missing.status_code == 404
+        assert missing.json() == {
+            "code": 404,
+            "message": "Template tpl_missing not found",
+        }
+
+        # Cross-tenant trigger and status return the same 404 as a missing
+        # template: the attacker cannot tell "exists, not mine" apart from
+        # "does not exist".
+        status = await client.get(
+            f"/templates/{template_id}/builds/{build_id}/status",
+            headers={"X-API-Key": "keyA"},
+        )
+        assert status.status_code == 404
+        assert status.json() == {
+            "code": 404,
+            "message": f"Template {template_id} not found",
+        }
+        trigger = await client.post(
+            f"/v2/templates/{template_id}/builds/{build_id}",
+            headers={"X-API-Key": "keyA"},
+            json={"fromImage": "python:3.11-slim", "steps": []},
+        )
+        assert trigger.status_code == 404
+        assert trigger.json() == {
+            "code": 404,
+            "message": f"Template {template_id} not found",
+        }
+
+        # An owned template with a missing build keeps the build-scoped
+        # message (only reachable for the owner's own resources).
+        owned = await client.get(
+            f"/templates/{template_id}/builds/bld_unknown/status",
+            headers={"X-API-Key": "keyC"},
+        )
+        assert owned.status_code == 404
+        assert owned.json() == {
+            "code": 404,
+            "message": "Template build bld_unknown not found",
+        }
