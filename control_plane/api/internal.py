@@ -234,3 +234,44 @@ async def fleet_metrics(request: Request) -> dict[str, Any]:
         "activeSandboxes": len(records),
         "recent503Count": request.app.state.recent_failures.count(),
     }
+
+
+_EMPTY_TENANT_USAGE = {
+    "sandboxes": 0,
+    "memoryMB": 0,
+    "cpuPercent": 0,
+    "diskMB": 0,
+    "processes": 0,
+}
+
+
+@router.get("/internal/tenants")
+async def internal_tenants(request: Request) -> dict[str, Any]:
+    """Per-tenant usage and configured limits (ops reconciliation, E3.1).
+
+    Internal API: authenticated with X-Internal-Key, never tenant-scoped.
+    ``unowned`` usage (tenant_id None) is included when present so operators
+    can detect resources that still need the migration script.
+    """
+    _require_internal_key(request)
+    settings = request.app.state.settings
+    usage = request.app.state.registry.tenant_usage()
+    tenant_ids = (
+        set(settings.tenant_map) | set(settings.tenant_limits) | set(usage)
+    )
+    tenant_ids.discard(None)
+    tenants = [
+        {
+            "tenantID": tenant_id,
+            "used": usage.get(tenant_id, dict(_EMPTY_TENANT_USAGE)),
+            "limits": settings.tenant_limits.get(tenant_id, {}),
+        }
+        for tenant_id in sorted(tenant_ids)
+    ]
+    body: dict[str, Any] = {
+        "tenants": tenants,
+        "compatibleMode": not settings.tenants_enabled,
+    }
+    if usage.get(None):
+        body["unowned"] = usage[None]
+    return body
