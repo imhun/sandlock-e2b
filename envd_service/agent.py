@@ -20,6 +20,7 @@ from envd_service.runtime.image_resolver import (
     peek_image_warm,
     resolve_image_rootfs,
 )
+from envd_service.uid_pool import apply_sandbox_ownership
 from envd_service.xfs_quota import (
     ProjectQuotaError,
     provision_project,
@@ -227,6 +228,17 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
         (workspace_dir / "workspace").mkdir(parents=True, exist_ok=True)
     volume_mounts = payload.get("volumeMounts") or []
     existing = runtime_registry.get(sandbox_id)
+    # E3.2: allocate the sandbox's host uid before materializing volumes so
+    # per-sandbox volume slices can be chowned to it. Only a root worker can
+    # map arbitrary host uids (S1.2); non-root workers keep the fixed-uid +
+    # Landlock model and never allocate.
+    host_uid = None
+    pool = getattr(runtime_registry, "uid_pool", None)
+    if settings.per_sandbox_uid and os.geteuid() == 0 and pool is not None:
+        host_uid = pool.acquire(
+            sandbox_id,
+            preferred=existing.host_uid if existing is not None else None,
+        )
     mount_paths, volume_projects = build_volume_mounts(
         sandbox_id=sandbox_id,
         volume_mounts=volume_mounts,
@@ -237,6 +249,7 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
         existing_volume_projects=(
             existing.volume_projects if existing is not None else []
         ),
+        host_uid=host_uid,
     )
     disk_mb = int(payload.get("diskMB", settings.default_disk_mb))
     project_id = None
@@ -262,12 +275,15 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
             # active while the files no longer belong to any project, and
             # delete would only leave an orphan quota table entry.
             project_id = None
+    if host_uid is not None:
+        apply_sandbox_ownership(workspace_dir, host_uid)
     runtime_registry.register(
         sandbox_id=sandbox_id,
         access_token=payload.get("accessToken", ""),
         workspace_dir=str(workspace_dir),
         env_vars=dict(payload.get("envVars") or {}),
         base_image=payload.get("baseImage"),
+        host_uid=host_uid,
         memory_mb=int(payload.get("memoryMB", settings.default_memory_mb)),
         cpu_percent=int(payload.get("cpuPercent", settings.default_cpu_percent)),
         disk_mb=disk_mb,

@@ -275,12 +275,16 @@ class SandlockRunningProcess(RunningProcess):
 class SandlockExecutor(Executor):
     """Runs each command inside a fresh ``sandlock.Sandbox`` instance."""
 
+    _non_root_fallback_warned = False
+
     def __init__(
         self,
         *,
         workspace_dir: str,
         base_image: str | None,
         image_rootfs: Path | None,
+        host_uid: int | None = None,
+        per_sandbox_uid: bool = False,
         memory_mb: int,
         cpu_percent: int,
         disk_mb: int,
@@ -301,6 +305,8 @@ class SandlockExecutor(Executor):
         self._workspace_dir = workspace_dir
         self._base_image = base_image
         self._image_rootfs = image_rootfs
+        self._host_uid = host_uid
+        self._per_sandbox_uid = per_sandbox_uid
         self._memory_mb = memory_mb
         self._cpu_percent = cpu_percent
         self._disk_mb = disk_mb
@@ -408,6 +414,37 @@ class SandlockExecutor(Executor):
             out.append(entry)
         return out
 
+    def _run_as_identity(self) -> tuple[int, int]:
+        """Host uid/gid passed to sandlock ``RunAs`` (S1.2 contract).
+
+        With per-sandbox uid enabled the allocated ``host_uid`` becomes the
+        sandbox's host identity (inside the namespace it is still uid 0).
+        A non-root worker cannot map an arbitrary host uid (S1.2 fail-closed:
+        single-entry userns maps only the caller's own euid), so it degrades
+        to the worker identity — fixed uid + Landlock, the E5.1 model.
+        A root worker with per-sandbox uid enabled but no allocated uid is a
+        configuration error and fails loudly instead of silently downgrading
+        to a shared uid.
+        """
+        if self._per_sandbox_uid:
+            if self._host_uid is not None:
+                return self._host_uid, self._host_uid
+            if os.geteuid() != 0:
+                if not type(self)._non_root_fallback_warned:
+                    type(self)._non_root_fallback_warned = True
+                    logger.warning(
+                        "non-root worker: cannot map per-sandbox host uids "
+                        "(single-entry userns); using fixed worker identity "
+                        "+ Landlock"
+                    )
+                return os.geteuid(), os.getegid()
+            raise RuntimeError(
+                "per-sandbox uid enabled but sandbox has no allocated "
+                "host_uid (worker uid pool did not provision it)"
+            )
+        # Legacy default: all sandboxes share host uid 1000 (root worker).
+        return 1000, 1000
+
     def _mint_iam_jwt(self, audience: str) -> str:
         """Mint a JWT-SVID for a registered workload identity.
 
@@ -503,6 +540,7 @@ class SandlockExecutor(Executor):
                 "raw.githubusercontent.com:443",
             ]
 
+        sandbox_uid, sandbox_gid = self._run_as_identity()
         kwargs: dict = {
             "fs_writable": fs_writable,
             "fs_readable": fs_readable,
@@ -522,8 +560,8 @@ class SandlockExecutor(Executor):
             "clean_env": True,
             "env": dict(config.env),
             "cwd": config.cwd,
-            "uid": 1000,
-            "gid": 1000,
+            "uid": sandbox_uid,
+            "gid": sandbox_gid,
         }
         if "mcp-gateway" in " ".join(config.cmd):
             # The SDK starts the MCP gateway inside the sandbox; it must be

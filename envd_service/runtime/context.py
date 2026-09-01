@@ -40,6 +40,8 @@ class SandboxRuntimeContext:
             settings,
             workspace_dir=record.workspace_dir,
             base_image=record.base_image,
+            host_uid=record.host_uid,
+            per_sandbox_uid=settings.per_sandbox_uid,
             memory_mb=record.memory_mb,
             cpu_percent=record.cpu_percent,
             disk_mb=record.disk_mb,

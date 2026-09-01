@@ -25,6 +25,11 @@ class RuntimeSandbox:
     workspace_dir: str
     env_vars: dict[str, str] = field(default_factory=dict)
     base_image: str | None = None
+    #: Host uid allocated from the worker uid pool (E3.2). The sandbox runs
+    #: as uid 0 inside its user namespace while the host sees this uid, so
+    #: distinct sandboxes get kernel-enforced file isolation. ``None`` =
+    #: legacy shared-uid mode (fixed uid + Landlock).
+    host_uid: int | None = None
     memory_mb: int = 512
     cpu_percent: int = 100
     disk_mb: int = 1024
@@ -57,12 +62,21 @@ class RuntimeSandbox:
 class RuntimeRegistry:
     """Maps sandbox IDs to runtime records; filesystem-backed fallback."""
 
-    def __init__(self, workspace_base: str | Path) -> None:
+    def __init__(
+        self,
+        workspace_base: str | Path,
+        *,
+        uid_pool=None,
+    ) -> None:
         self._workspace_base = Path(workspace_base)
         self._records: dict[str, RuntimeSandbox] = {}
         self._lock = threading.Lock()
         self._unregister_callbacks: list[Callable[[str], None]] = []
         self._state_callbacks: list[Callable[[str, str], None]] = []
+        #: E3.2 host-uid allocator shared by every app that provisions
+        #: sandboxes on this workspace (worker agent + local-node control
+        #: plane). ``None`` = independent-uid mode disabled.
+        self.uid_pool = uid_pool
 
     def add_unregister_callback(self, callback) -> None:
         """Invoke ``callback(sandbox_id)`` after a sandbox is unregistered."""
@@ -85,6 +99,7 @@ class RuntimeRegistry:
         workspace_dir: str,
         env_vars: dict[str, str] | None = None,
         base_image: str | None = None,
+        host_uid: int | None = None,
         memory_mb: int = 512,
         cpu_percent: int = 100,
         disk_mb: int = 1024,
@@ -108,6 +123,7 @@ class RuntimeRegistry:
             workspace_dir=workspace_dir,
             env_vars=dict(env_vars or {}),
             base_image=base_image,
+            host_uid=host_uid,
             memory_mb=memory_mb,
             cpu_percent=cpu_percent,
             disk_mb=disk_mb,

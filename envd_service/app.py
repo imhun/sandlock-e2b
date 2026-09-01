@@ -24,6 +24,7 @@ from envd_service.quota_maintenance import QuotaMonitor
 from envd_service.rpc import register_rpc
 from envd_service.runtime.context import SandboxRuntimeContext
 from envd_service.runtime.registry import RuntimeRegistry
+from envd_service.uid_pool import UidPool
 from envd_service.xfs_quota import ProjectQuotaError, reconcile_orphan_projects
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,19 @@ async def _startup_reconcile(settings: Settings) -> None:
     )
 
 
+async def _startup_uid_reconcile(pool: UidPool) -> None:
+    """Reclaim orphan host uids once at worker startup (E3.2)."""
+    result = await asyncio.to_thread(pool.reconcile)
+    logger.info(
+        "startup uid reconciliation: referenced=%s reclaimed=%s cleaned=%s "
+        "skipped=%s",
+        result.get("referenced"),
+        result.get("reclaimed"),
+        result.get("cleaned"),
+        result.get("skipped"),
+    )
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -93,6 +107,15 @@ def create_app(
     runtime_registry = runtime_registry or RuntimeRegistry(
         workspace_base or settings.workspace_base
     )
+    if settings.per_sandbox_uid:
+        runtime_registry.uid_pool = UidPool(
+            start=settings.uid_pool_start,
+            size=settings.uid_pool_size,
+            workspace_base=workspace_base or settings.workspace_base,
+        )
+        runtime_registry.add_unregister_callback(
+            runtime_registry.uid_pool.release
+        )
     quota_monitor = QuotaMonitor(
         workspace_base=settings.workspace_base,
         mount_point=settings.workspace_base,
@@ -122,6 +145,16 @@ def create_app(
         if settings.quota_reconcile_on_startup:
             reconcile_task = asyncio.create_task(_startup_reconcile(settings))
             app.state.reconcile_task = reconcile_task
+        uid_reconcile_task: asyncio.Task | None = None
+        if (
+            settings.per_sandbox_uid
+            and settings.uid_reconcile_on_startup
+            and os.geteuid() == 0
+            and runtime_registry.uid_pool is not None
+        ):
+            uid_reconcile_task = asyncio.create_task(
+                _startup_uid_reconcile(runtime_registry.uid_pool)
+            )
         agent.start()
         if settings.base_image and _executor_needs_images(settings.executor):
             app.state.warm_task = asyncio.create_task(_warm_base_image(settings))
@@ -137,6 +170,16 @@ def create_app(
                 pass
             except Exception:
                 logger.warning("startup reconcile task failed", exc_info=True)
+        if uid_reconcile_task is not None:
+            uid_reconcile_task.cancel()
+            try:
+                await uid_reconcile_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning(
+                    "startup uid reconcile task failed", exc_info=True
+                )
         await agent.stop()
         await quota_monitor.stop()
         quota_agent_client = getattr(app.state, "quota_agent_client", None)

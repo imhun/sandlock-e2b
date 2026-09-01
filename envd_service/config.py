@@ -115,6 +115,25 @@ class Settings:
     command_queue_timeout_s: float = field(
         default_factory=lambda: _env_float("E2B_COMMAND_QUEUE_TIMEOUT_S", 30)
     )
+    # Per-sandbox host uid isolation (E3.2): when enabled (and the worker
+    # runs as root / CAP_SETUID), every sandbox gets a distinct host uid
+    # from the pool and its workspace is chowned to that uid with 0700.
+    # Non-root workers cannot map arbitrary host uids (S1.2 fail-closed), so
+    # they degrade to the fixed worker identity + Landlock.
+    per_sandbox_uid: bool = field(
+        default_factory=lambda: _env_bool("E2B_PER_SANDBOX_UID", False)
+    )
+    # Host uid pool range (10000+i by default, away from image uids like
+    # 1000). Workers sharing one workspace must use disjoint ranges.
+    uid_pool_start: int = field(
+        default_factory=lambda: _env_int("E2B_UID_POOL_START", 10000)
+    )
+    uid_pool_size: int = field(
+        default_factory=lambda: _env_int("E2B_UID_POOL_SIZE", 1000)
+    )
+    uid_reconcile_on_startup: bool = field(
+        default_factory=lambda: _env_bool("E2B_UID_RECONCILE_ON_STARTUP", True)
+    )
     # Quota maintenance (E2.4): periodic over-limit + disk watermark scans and
     # startup orphan project reconciliation.
     quota_monitor_interval_s: float = field(
