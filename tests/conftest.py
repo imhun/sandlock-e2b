@@ -290,6 +290,7 @@ def _start_multinode(
     worker_count: int,
     *,
     shared_workspace: bool = False,
+    warm_base_image: bool = False,
     image_registry: str | None = None,
     image_registry_username: str | None = None,
     image_registry_password: str | None = None,
@@ -391,6 +392,16 @@ def _start_multinode(
     else:
         raise RuntimeError("worker nodes did not register with the control plane")
 
+    if warm_base_image:
+        base_image = control_app.state.settings.base_image
+        if base_image:
+            for worker_url in (f"http://127.0.0.1:{p}" for p in worker_ports):
+                _warm_worker_base_image(
+                    worker_url,
+                    base_image,
+                    control_app.state.settings.internal_api_key,
+                )
+
     return {
         "api_url": f"http://127.0.0.1:{control_port}",
         "sandbox_url": f"http://127.0.0.1:{gateway_port}",
@@ -405,11 +416,42 @@ def _start_multinode(
     }
 
 
+def _warm_worker_base_image(
+    worker_url: str, image: str, internal_api_key: str
+) -> None:
+    """Ensure ``image`` is extracted on a worker (idempotent peek + warm).
+
+    Security e2e tests create base-image sandboxes through the SDK without
+    the ``X-Sandbox-Id`` header; on a cold image cache the control plane
+    answers 428 ``warm_required``. Warming every worker up front makes the
+    harness deterministic regardless of the local image cache state.
+    """
+    from urllib.parse import quote
+
+    import httpx
+
+    url = f"{worker_url}/agent/images/{quote(image, safe='/:')}/warm"
+    headers = {"X-Internal-Key": internal_api_key}
+    with httpx.Client(timeout=30) as client:
+        peek = client.get(url, headers=headers)
+        if peek.status_code == 200 and peek.json().get("cached"):
+            return
+        warm = client.post(url, headers=headers)
+        if warm.status_code != 200:
+            raise RuntimeError(
+                f"worker {worker_url} failed to warm base image {image}: "
+                f"{warm.status_code} {warm.text[:200]}"
+            )
+
+
 @pytest.fixture(scope="session")
 def multinode_two_workers(buildkitd):
     """Real control plane + two remote workers + envd gateway."""
     harness = _start_multinode(
-        PROJECT_ROOT / "tmp" / "multinode-two", 2, buildkit_addr=buildkitd
+        PROJECT_ROOT / "tmp" / "multinode-two",
+        2,
+        buildkit_addr=buildkitd,
+        warm_base_image=True,
     )
     yield harness
     harness["_stop"]()

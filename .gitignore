@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+tmp_pytest/
 tmp/
 wheels/fork/
 deploy/stack/.env
