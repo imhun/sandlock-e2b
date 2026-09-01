@@ -1,0 +1,30 @@
+# quota-agent: NFS server-side XFS project quota manager (E2.6).
+#
+# Runs on the NFS server host where the shared XFS filesystem lives (or next
+# to it with the filesystem bind-mounted) and executes xfs_quota locally on
+# behalf of workers that only see the NFS client mount.
+#
+# The XFS filesystem must be mounted with prjquota + projid32bit. When the
+# container mounts the filesystem itself (loop device / direct device), run
+# it privileged with the device attached; when the host already mounts it,
+# bind-mount the directory instead (no privileged needed).
+FROM python:3.14-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xfsprogs \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+
+COPY gateway_common/ gateway_common/
+COPY envd_service/ envd_service/
+COPY deploy/ deploy/
+
+ENV E2B_QUOTA_AGENT_HOST=0.0.0.0
+ENV E2B_QUOTA_AGENT_PORT=49984
+EXPOSE 49984
+
+CMD ["python", "-m", "deploy.quota_agent"]

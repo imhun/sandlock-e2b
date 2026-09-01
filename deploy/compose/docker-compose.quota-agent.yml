@@ -1,0 +1,41 @@
+# quota-agent: NFS server-side XFS project quota manager (E2.6).
+#
+# NFS form: workers see the shared filesystem through an NFS client mount,
+# so xfs_quota must run on the server that owns the filesystem. This service
+# runs there (or next to it with the filesystem bind-mounted) and executes
+# the project quota operations locally on behalf of the workers.
+#
+# Deployment notes:
+# - The XFS filesystem must be mounted with prjquota + projid32bit. If the
+#   container mounts it itself (loop device / direct device), run privileged
+#   with the device attached; if the host already mounts it, bind-mount the
+#   directory instead (no privileged needed) — see the volumes below.
+# - Worker/agent path layout: workers pass paths as seen from the NFS
+#   client. When the server-side paths differ, set E2B_QUOTA_AGENT_PATH_MAP
+#   (client=server, comma-separated), e.g.
+#     E2B_QUOTA_AGENT_PATH_MAP=/mnt/sandboxes=/var/lib/e2b-sandboxes
+#   When both sides use the same path layout (common same-path export),
+#   leave it empty.
+# - Workers enable the agent path:
+#     E2B_QUOTA_VIA_AGENT=true
+#     E2B_QUOTA_AGENT_URL=http://quota-agent:49984
+#     E2B_QUOTA_AGENT_TOKEN=<same token as below>
+# - The agent port must never be exposed publicly; bind it to the internal
+#   network only (this example publishes it container-wide — firewall it).
+
+services:
+  quota-agent:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.quota-agent
+    container_name: sandlock-quota-agent
+    restart: unless-stopped
+    environment:
+      E2B_QUOTA_AGENT_TOKEN: ${E2B_QUOTA_AGENT_TOKEN:?set E2B_QUOTA_AGENT_TOKEN}
+      E2B_QUOTA_AGENT_PATH_MAP: ${E2B_QUOTA_AGENT_PATH_MAP:-}
+    volumes:
+      # NFS server form: the shared XFS filesystem already mounted on the host.
+      # Adjust to the actual server-side path the agent should manage.
+      - /var/lib/e2b-sandboxes:/var/lib/e2b-sandboxes
+    ports:
+      - "49984:49984"
