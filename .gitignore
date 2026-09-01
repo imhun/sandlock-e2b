@@ -13,3 +13,4 @@ tests/sdk/js/package-lock.json
 
 envd_service/egress/*.so
 .patchloom/backups/
+.superpowers/
