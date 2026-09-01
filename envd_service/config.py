@@ -72,6 +72,9 @@ class Settings:
     default_disk_mb: int = field(
         default_factory=lambda: _env_int("E2B_DEFAULT_DISK_MB", 1024)
     )
+    quota_via_agent: bool = field(
+        default_factory=lambda: _env_bool("E2B_QUOTA_VIA_AGENT", False)
+    )
     default_max_processes: int = field(
         default_factory=lambda: _env_int("E2B_DEFAULT_MAX_PROCESSES", 64)
     )

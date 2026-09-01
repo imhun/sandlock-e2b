@@ -28,6 +28,7 @@ class RuntimeSandbox:
     memory_mb: int = 512
     cpu_percent: int = 100
     disk_mb: int = 1024
+    project_id: int | None = None
     max_processes: int = 64
     max_open_files: int = 4096
     allow_internet_access: bool = False
@@ -82,6 +83,7 @@ class RuntimeRegistry:
         memory_mb: int = 512,
         cpu_percent: int = 100,
         disk_mb: int = 1024,
+        project_id: int | None = None,
         max_processes: int = 64,
         max_open_files: int = 4096,
         allow_internet_access: bool = False,
@@ -103,6 +105,7 @@ class RuntimeRegistry:
             memory_mb=memory_mb,
             cpu_percent=cpu_percent,
             disk_mb=disk_mb,
+            project_id=project_id,
             max_processes=max_processes,
             max_open_files=max_open_files,
             allow_internet_access=allow_internet_access,

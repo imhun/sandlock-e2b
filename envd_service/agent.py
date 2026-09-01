@@ -20,6 +20,12 @@ from envd_service.runtime.image_resolver import (
     peek_image_warm,
     resolve_image_rootfs,
 )
+from envd_service.xfs_quota import (
+    ProjectQuotaError,
+    provision_project,
+    release_project,
+    xfs_project_supported,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +205,25 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
             target.unlink()
         target.symlink_to(host, target_is_directory=True)
         mount_paths.append({"path": rel, "hostPath": str(host)})
+    disk_mb = int(payload.get("diskMB", settings.default_disk_mb))
+    project_id = None
+    existing = runtime_registry.get(sandbox_id)
+    if existing is not None:
+        project_id = existing.project_id
+    if xfs_project_supported(workspace_base, via_agent=settings.quota_via_agent)[0]:
+        try:
+            project_id = provision_project(
+                sandbox_id=sandbox_id,
+                project_dir=workspace_dir,
+                mount_point=workspace_base,
+                disk_mb=disk_mb,
+                via_agent=settings.quota_via_agent,
+                project_id=project_id,
+            )
+        except ProjectQuotaError as exc:
+            logger.warning(
+                "XFS project quota setup failed for %s: %s", sandbox_id, exc
+            )
     runtime_registry.register(
         sandbox_id=sandbox_id,
         access_token=payload.get("accessToken", ""),
@@ -207,7 +232,8 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
         base_image=payload.get("baseImage"),
         memory_mb=int(payload.get("memoryMB", settings.default_memory_mb)),
         cpu_percent=int(payload.get("cpuPercent", settings.default_cpu_percent)),
-        disk_mb=int(payload.get("diskMB", settings.default_disk_mb)),
+        disk_mb=disk_mb,
+        project_id=project_id,
         max_processes=int(
             payload.get("maxProcesses", settings.default_max_processes)
         ),
@@ -251,11 +277,29 @@ async def agent_delete_sandbox(
         _require_internal_key(request, settings)
     except PermissionError:
         return Response(status_code=401)
-    request.app.state.runtime_registry.unregister(sandbox_id)
+    runtime_registry = request.app.state.runtime_registry
+    record = runtime_registry.get(sandbox_id)
+    project_id = record.project_id if record is not None else None
+    runtime_registry.unregister(sandbox_id)
+    # Shared-workspace deployments keep the directory (keepFiles=true): the
+    # same storage hosts the sandbox on every node, so removing it would
+    # destroy the live sandbox's files, and its project id must stay until
+    # the sandbox is really deleted.
     if not keepFiles:
-        # Shared-workspace deployments keep the directory: the same storage
-        # hosts the sandbox on every node, so removing it would destroy the
-        # live sandbox's files.
+        if project_id is not None:
+            try:
+                release_project(
+                    project_dir=settings.workspace_base / sandbox_id,
+                    mount_point=settings.workspace_base,
+                    projid=project_id,
+                    via_agent=settings.quota_via_agent,
+                )
+            except ProjectQuotaError as exc:
+                logger.warning(
+                    "XFS project quota cleanup failed for %s: %s",
+                    sandbox_id,
+                    exc,
+                )
         shutil.rmtree(settings.workspace_base / sandbox_id, ignore_errors=True)
     return Response(status_code=204)
 

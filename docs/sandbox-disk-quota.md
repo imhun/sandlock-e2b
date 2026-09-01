@@ -26,7 +26,9 @@
 - 每个沙箱目录分配独立 project id（projid），限额 = `RuntimeSandbox.disk_mb`
   （控制面已下发的沙箱配额）；
 - 目录设置 `PROJINHERIT`，沙箱内新建文件自动继承 project id；
-- 写超限 → 内核返回 `EDQUOT`（零滞后、内核强制、跨命令累计）；
+- 写超限 → 内核返回 `ENOSPC`（XFS project quota 语义：`xfs_trans_dqresv`
+  对 project quota 硬限返回 `-ENOSPC`，`EDQUOT` 仅用于 user/group quota；
+  硬限强制不变：零滞后、内核强制、跨命令累计）；
 - 沙箱删除 → 删除目录 + 清理 project 记录；
 - 非 XFS 环境（macOS 本地 / Docker Desktop / OrbStack 默认 / ext4 容器）：
   `_xfs_project_supported` 检测失败 → 跳过 quota + 警告，沙箱照常运行。
@@ -49,13 +51,21 @@ def _xfs_project_supported(workspace_base: Path) -> tuple[bool, str]:
 ### 3.2 沙箱创建（`agent_create_sandbox`）
 
 ```bash
-# projid 分配：沙箱 id 哈希到 1..2^31（冲突时递增），或 worker 递增计数器
 xfs_quota -x -c "project -s -p /var/lib/e2b-sandboxes/<id> <projid>" <mount>
 xfs_quota -x -c "limit -p bhard=<disk_mb>M <projid>" <mount>
 ```
 
-projid 与沙箱 id 的映射持久化到 `sandbox.json`（`RuntimeSandbox` 增加
-`project_id: int | None`）。
+**projid 分配（已实现，E2.2）**：`sandbox_id` 的 SHA-256 哈希映射到
+`1..2^31`（含 2^31，实测 `xfs_quota` 接受），分配前用
+`xfs_quota -x -c "report -p"` 读取当前 project 表做冲突探测，命中已占用
+projid 时线性递增（到 2^31 回绕到 1）。选择哈希而非 worker 计数器的原因：
+映射确定、worker 重启/多 worker 共享存储时无需跨节点协调；探测避免复用
+仍活跃的 projid（共享 projid 会共享限额）。
+
+创建时若 `project -s` 成功但 `limit` 失败（半创建状态），先尽力
+`project -C` 清理再抛出，调用方记警告降级、沙箱照常创建；projid 与沙箱
+id 的映射持久化到 `sandbox.json`（`RuntimeSandbox.project_id: int | None`）。
+已存在 `project_id` 的沙箱（迁移回滚重 prov 等）复用原 projid，不重新分配。
 
 ### 3.3 沙箱删除（`agent_delete_sandbox`）
 
@@ -63,6 +73,12 @@ projid 与沙箱 id 的映射持久化到 `sandbox.json`（`RuntimeSandbox` 增�
 xfs_quota -x -c "project -C -p /var/lib/e2b-sandboxes/<id> <projid>" <mount>
 rm -rf <sandbox_dir>          # 删除目录后 quota 计数自动释放
 ```
+
+`project -C` 清除目录的 project 状态并递归归还计账；`rm -rf` 后使用量归零。
+quota 表项（0 使用量 + 原硬限）仍保留为孤儿记录，由 M4 定期清理；实测
+`project -d` 只操作 `/etc/projects`（本方案不维护），不能删除 quota 表项。
+`keepFiles=true`（迁移停源节点）不执行 `project -C`：文件保留、project
+状态保留，迁移失败回滚时配额仍生效。
 
 孤儿 project 记录：worker 启动时扫描 `sandbox.json` 与 quota 表不一致的
 project id，定期清理。
@@ -99,7 +115,7 @@ mount -t xfs -o prjquota /dev/loop0 /var/lib/e2b-sandboxes
 
 | 环境 | quota 行为 | 验证内容 |
 |---|---|---|
-| 生产目标机（XFS + prjquota） | 生效 | 配额超限 EDQUOT、跨命令累计、迁移保留 |
+| 生产目标机（XFS + prjquota） | 生效 | 配额超限 ENOSPC（project quota 语义）、跨命令累计、迁移保留 |
 | OrbStack 容器（XFS loop） | 生效 | 本地完整验证 |
 | macOS 本地（LocalExecutor / 无 XFS） | 降级跳过 | 沙箱照常、日志警告 |
 | CI（mock） | mock xfs_quota | 创建/删除/清理逻辑单测 |
