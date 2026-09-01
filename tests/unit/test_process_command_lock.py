@@ -302,6 +302,71 @@ async def test_queue_timeout_returns_429_and_slot_not_lost():
 
 
 @pytest.mark.asyncio
+async def test_cancel_after_slot_handoff_does_not_overcount_available():
+    """Cancelling a waiter after release() handed it the slot must transfer
+    (not also free) that slot: a new acquire must queue, never return
+    immediately while another command holds the slot (E2.3 Critical)."""
+    executor = _FakeExecutor()
+    manager = ProcessManager(
+        executor,
+        sandbox_id="sbx_handoff",
+        max_concurrent_commands=1,
+        max_queued_commands=3,
+        queue_timeout_s=None,
+    )
+    task_a = asyncio.create_task(manager.start(**_start_kwargs("a")))
+    proc_a = await asyncio.wait_for(task_a, timeout=5)
+    queue_a = proc_a.subscribe(replay=False)
+    assert executor.events == ["enter:a"]
+
+    task_b = asyncio.create_task(manager.start(**_start_kwargs("b")))
+    task_c = asyncio.create_task(manager.start(**_start_kwargs("c")))
+    await asyncio.sleep(0)  # b and c queue behind a
+    assert not task_b.done()
+    assert not task_c.done()
+    assert executor.events == ["enter:a"]
+
+    # a ends: _drive broadcasts the end event before gate.release(), so our
+    # _wait_end wakeup is queued ahead of b's wakeup. release() has already
+    # handed the slot to b (waiter popped and resolved) but b has not
+    # resumed yet -- the deterministic handoff window.
+    executor.finish(proc_a.pid)
+    assert await _wait_end(manager, proc_a, queue_a) == ("end", 0, "exited")
+    task_b.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task_b, timeout=5)
+
+    # b's slot must be transferred to c, not also returned to _available:
+    # the gate must not expose a free slot while c is the sole holder.
+    assert manager._locks["sbx_handoff"]._available == 0
+    proc_c = await asyncio.wait_for(task_c, timeout=5)
+    queue_c = proc_c.subscribe(replay=False)
+    assert executor.events == ["enter:a", "end:a", "enter:c"]
+
+    # A new acquire must queue behind c, not return immediately.
+    task_d = asyncio.create_task(manager.start(**_start_kwargs("d")))
+    await asyncio.sleep(0)
+    assert not task_d.done()
+    assert executor.events == ["enter:a", "end:a", "enter:c"]
+
+    executor.finish(proc_c.pid)
+    assert await _wait_end(manager, proc_c, queue_c) == ("end", 0, "exited")
+    proc_d = await asyncio.wait_for(task_d, timeout=5)
+    queue_d = proc_d.subscribe(replay=False)
+    executor.finish(proc_d.pid)
+    assert await _wait_end(manager, proc_d, queue_d) == ("end", 0, "exited")
+    assert executor.events == [
+        "enter:a",
+        "end:a",
+        "enter:c",
+        "end:c",
+        "enter:d",
+        "end:d",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_real_executor_commands_run_serially(workspace):
     executor = LocalExecutor()
     manager = ProcessManager(

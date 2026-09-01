@@ -163,13 +163,16 @@ class _CommandGate:
         if not queued and waiter.done() and not waiter.cancelled():
             # The slot had already been handed to this waiter (e.g. it was
             # cancelled after release() woke it); give the slot back so the
-            # queue cannot stall.
-            self._available += 1
+            # queue cannot stall. Hand it to the next waiter if any -- the
+            # slot is transferred, not freed, so _available must not also be
+            # incremented (that would double-count the slot and break the
+            # mutual-exclusion invariant).
             while self._waiters:
                 next_waiter = self._waiters.popleft()
                 if not next_waiter.done():
                     next_waiter.set_result(None)
                     return
+            self._available += 1
 
 
 class ProcessManager:
