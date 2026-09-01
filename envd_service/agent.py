@@ -26,6 +26,7 @@ from envd_service.xfs_quota import (
     release_project,
     xfs_project_supported,
 )
+from envd_service.volumes import build_volume_mounts, cleanup_volume_projects
 
 logger = logging.getLogger(__name__)
 
@@ -225,26 +226,20 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
     else:
         (workspace_dir / "workspace").mkdir(parents=True, exist_ok=True)
     volume_mounts = payload.get("volumeMounts") or []
-    mount_paths: list[dict[str, str]] = []
-    shared_root = settings.shared_volume_root
-    for mount in volume_mounts:
-        host = mount.get("hostPath")
-        rel = str(mount.get("path", "")).lstrip("/")
-        if not host or not rel:
-            raise ValueError("volumeMounts need hostPath and path")
-        if shared_root:
-            host_path = Path(host).resolve()
-            if not host_path.is_relative_to(Path(shared_root).resolve()):
-                raise ValueError("volume hostPath is outside the shared volume root")
-        target = workspace_dir / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() or target.is_symlink():
-            target.unlink()
-        target.symlink_to(host, target_is_directory=True)
-        mount_paths.append({"path": rel, "hostPath": str(host)})
+    existing = runtime_registry.get(sandbox_id)
+    mount_paths, volume_projects = build_volume_mounts(
+        sandbox_id=sandbox_id,
+        volume_mounts=volume_mounts,
+        shared_volume_root=settings.shared_volume_root,
+        workspace_dir=workspace_dir,
+        fallback_mount_point=settings.workspace_base,
+        via_agent=settings.quota_via_agent,
+        existing_volume_projects=(
+            existing.volume_projects if existing is not None else []
+        ),
+    )
     disk_mb = int(payload.get("diskMB", settings.default_disk_mb))
     project_id = None
-    existing = runtime_registry.get(sandbox_id)
     if existing is not None:
         project_id = existing.project_id
     if xfs_project_supported(workspace_base, via_agent=settings.quota_via_agent)[0]:
@@ -288,6 +283,7 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
         network=payload.get("network"),
         allow_public_traffic=bool(payload.get("allowPublicTraffic", False)),
         volume_mounts=mount_paths,
+        volume_projects=volume_projects,
         iam_tokens=payload.get("iamTokens"),
     )
 
@@ -323,6 +319,7 @@ async def agent_delete_sandbox(
     runtime_registry = request.app.state.runtime_registry
     record = runtime_registry.get(sandbox_id)
     project_id = record.project_id if record is not None else None
+    volume_projects = record.volume_projects if record is not None else []
     # Derive the project dir from the record so release and rmtree always
     # target the directory the sandbox was registered with; fall back to
     # the workspace_base/id convention for unregistered sandboxes.
@@ -351,6 +348,11 @@ async def agent_delete_sandbox(
                     sandbox_id,
                     exc,
                 )
+        cleanup_volume_projects(
+            volume_projects=volume_projects,
+            fallback_mount_point=settings.workspace_base,
+            via_agent=settings.quota_via_agent,
+        )
         shutil.rmtree(workspace_dir, ignore_errors=True)
     return Response(status_code=204)
 

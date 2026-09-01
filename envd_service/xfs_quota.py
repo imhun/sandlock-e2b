@@ -309,7 +309,12 @@ def release_project(
 
 
 def _recorded_projids(workspace_base: str | Path) -> set[int]:
-    """Project ids referenced by any ``sandbox.json`` under workspace_base."""
+    """Project ids referenced by any ``sandbox.json`` under workspace_base.
+
+    Both the workspace project (``project_id``) and every per-sandbox volume
+    project (``volume_projects[].projid``, E2.5) are referenced, so the E2.4
+    reconciliation never treats a live volume quota as an orphan.
+    """
     base = Path(workspace_base)
     recorded: set[int] = set()
     try:
@@ -329,6 +334,12 @@ def _recorded_projids(workspace_base: str | Path) -> set[int]:
         projid = payload.get("project_id")
         if isinstance(projid, int) and projid > 0:
             recorded.add(projid)
+        for item in payload.get("volume_projects", []):
+            if not isinstance(item, dict):
+                continue
+            projid = item.get("projid")
+            if isinstance(projid, int) and projid > 0:
+                recorded.add(projid)
     return recorded
 
 
@@ -521,6 +532,32 @@ def _find_mount(
     if best is None:
         return None
     return best[1], best[2]
+
+
+def containing_mount_point(path: str | Path) -> str | None:
+    """Return the deepest mount point containing ``path``, or None.
+
+    Used by the volume quota path (E2.5): a volume subdirectory may live on
+    a different filesystem than the sandbox workspace, and ``xfs_quota``
+    commands must target the filesystem's own mount point.
+    """
+    mounts_text = _read_proc_mounts()
+    if mounts_text is None:
+        return None
+    target = str(Path(path).resolve())
+    best: tuple[int, str] | None = None
+    for line in mounts_text.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        mount_path = _unescape_mount_path(parts[1])
+        if mount_path != target and not target.startswith(
+            mount_path.rstrip("/") + "/"
+        ):
+            continue
+        if best is None or len(mount_path) > best[0]:
+            best = (len(mount_path), mount_path)
+    return best[1] if best is not None else None
 
 
 def _run_xfs_info(mount_point: str | Path) -> str | None:

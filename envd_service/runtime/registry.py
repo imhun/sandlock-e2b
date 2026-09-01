@@ -35,6 +35,11 @@ class RuntimeSandbox:
     max_command_timeout: int = 3600
     state: str = "running"
     volume_mounts: list[dict[str, str]] = field(default_factory=list)
+    #: Per-sandbox volume quota state (E2.5): one entry per quota-limited
+    #: mount — ``{"volume_id", "sandbox_id", "mount_path", "sandbox_dir",
+    #: "projid"}``. Persisted so deletion and migration re-provision can
+    #: release / reuse the exact project id.
+    volume_projects: list[dict[str, Any]] = field(default_factory=list)
     mcp: dict | None = None
     network: dict | None = None
     allow_public_traffic: bool = False
@@ -89,6 +94,7 @@ class RuntimeRegistry:
         allow_internet_access: bool = False,
         max_command_timeout: int = 3600,
         volume_mounts: list[dict[str, str]] | None = None,
+        volume_projects: list[dict[str, Any]] | None = None,
         mcp: dict | None = None,
         network: dict | None = None,
         allow_public_traffic: bool = False,
@@ -111,6 +117,7 @@ class RuntimeRegistry:
             allow_internet_access=allow_internet_access,
             max_command_timeout=max_command_timeout,
             volume_mounts=list(volume_mounts or []),
+            volume_projects=list(volume_projects or []),
             mcp=mcp,
             network=dict(network) if network else None,
             allow_public_traffic=bool(allow_public_traffic),
