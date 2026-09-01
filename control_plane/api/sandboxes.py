@@ -687,6 +687,18 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
     else:
         (workspace_dir / "workspace").mkdir(parents=True, exist_ok=True)
     record.workspace_dir = workspace_dir
+    existing = request.app.state.runtime_registry.get(record.sandbox_id)
+    # E3.2: allocate the sandbox's host uid through the shared worker uid
+    # pool before materializing volumes so per-sandbox volume slices are
+    # chowned to it. Only a root worker maps arbitrary host uids (S1.2);
+    # otherwise the fixed-uid + Landlock model applies.
+    host_uid = None
+    pool = getattr(request.app.state.runtime_registry, "uid_pool", None)
+    if pool is not None and os.geteuid() == 0:
+        host_uid = pool.acquire(
+            record.sandbox_id,
+            preferred=existing.host_uid if existing is not None else None,
+        )
     try:
         from envd_service.volumes import build_volume_mounts
     except ImportError:  # pragma: no cover - separated control plane
@@ -702,7 +714,6 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
                 "perSandboxQuotaMb": volume.per_sandbox_quota_mb,
             }
         )
-    existing = request.app.state.runtime_registry.get(record.sandbox_id)
     try:
         mount_paths, volume_projects = build_volume_mounts(
             sandbox_id=record.sandbox_id,
@@ -714,15 +725,21 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
             existing_volume_projects=(
                 existing.volume_projects if existing is not None else []
             ),
+            host_uid=host_uid,
         )
     except ValueError as e:
         raise OfficialError(400, str(e))
+    if host_uid is not None:
+        from envd_service.uid_pool import apply_sandbox_ownership
+
+        apply_sandbox_ownership(workspace_dir, host_uid)
     request.app.state.runtime_registry.register(
         sandbox_id=record.sandbox_id,
         access_token=record.envd_access_token,
         workspace_dir=str(workspace_dir),
         env_vars=record.env_vars,
         base_image=record.base_image,
+        host_uid=host_uid,
         memory_mb=record.memory_mb,
         cpu_percent=record.cpu_count * 100,
         disk_mb=record.disk_size_mb,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -115,6 +116,15 @@ class VolumeRegistry:
                 tenant_id=tenant_id,
             )
             record.path.mkdir(parents=True, exist_ok=True)
+            # E3.2 volume permission model: the volume root is shared across
+            # sandboxes with distinct host uids, so it must be world
+            # rwx (single-entry userns has no supplementary groups) with the
+            # sticky bit preventing cross-uid deletion. Best-effort: a
+            # filesystem that refuses the chmod keeps the platform default.
+            try:
+                os.chmod(record.path, 0o1777)
+            except OSError:
+                pass
             self._write_record(record)
             self._volumes[volume_id] = record
             return record

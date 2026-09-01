@@ -36,6 +36,7 @@ quota-agent server-side (E2.6 wiring); unconfigured agent ops raise
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,38 @@ def _volume_fs_mount(path: Path, fallback: str | Path) -> Path:
     return Path(mount) if mount else Path(fallback)
 
 
+def _ensure_shared_volume_root(volume_root: Path, host_uid: int) -> None:
+    """Apply the E3.2 shared-volume permission model to the volume root.
+
+    A volume is shared across sandboxes with different host uids, so the root
+    must be world-readable/writable for every mounting sandbox (S1.2:
+    single-entry userns has no supplementary groups, ``0770`` + common group
+    is impossible). ``1777`` (sticky) additionally prevents a sandbox from
+    deleting files it does not own. The root owner is set to the uid of the
+    first mounting sandbox ("creator"), unless it is already owned by a
+    non-root identity — that owner is never stolen. Best-effort: a volume on
+    a filesystem that refuses the change degrades to whatever the platform
+    allows, with a warning.
+    """
+    try:
+        st = volume_root.stat()
+    except OSError as exc:
+        logger.warning(
+            "cannot stat volume root %s for shared perms: %s", volume_root, exc
+        )
+        return
+    try:
+        if st.st_uid == 0:
+            os.chown(volume_root, host_uid, host_uid)
+        os.chmod(volume_root, 0o1777)
+    except OSError as exc:
+        logger.warning(
+            "cannot apply shared perms to volume root %s: %s",
+            volume_root,
+            exc,
+        )
+
+
 def provision_sandbox_volume_mount(
     *,
     sandbox_id: str,
@@ -79,6 +112,7 @@ def provision_sandbox_volume_mount(
     fallback_mount_point: str | Path,
     via_agent: bool,
     existing_projid: int | None = None,
+    host_uid: int | None = None,
 ) -> tuple[Path, int | None]:
     """Return the sandbox's mount view plus its volume projid (or None).
 
@@ -87,8 +121,16 @@ def provision_sandbox_volume_mount(
     project + hard limit. Unsupported filesystems and provisioning failures
     degrade to the volume root with a warning, matching the workspace quota
     degradation contract.
+
+    ``host_uid`` (the sandbox's allocated host uid, E3.2): the volume root is
+    made ``1777`` for cross-sandbox sharing and, when a per-sandbox slice
+    exists, the slice is chowned to ``host_uid`` with ``0700`` so the slice
+    is kernel-isolated from other sandboxes. ``None`` keeps the legacy
+    single-uid ownership model (worker identity).
     """
     volume_root = Path(volume_path)
+    if host_uid is not None and os.geteuid() == 0:
+        _ensure_shared_volume_root(volume_root, host_uid)
     if per_sandbox_quota_mb <= 0:
         return volume_root, None
     fs_mount = _volume_fs_mount(volume_root, fallback_mount_point)
@@ -98,6 +140,9 @@ def provision_sandbox_volume_mount(
     sandbox_dir = volume_root / sandbox_id
     try:
         sandbox_dir.mkdir(parents=True, exist_ok=True)
+        if host_uid is not None and os.geteuid() == 0:
+            os.chown(sandbox_dir, host_uid, host_uid)
+            os.chmod(sandbox_dir, 0o700)
         projid = provision_project(
             sandbox_id=volume_projid_key(sandbox_id, volume_id, mount_path),
             project_dir=sandbox_dir,
@@ -147,6 +192,7 @@ def build_volume_mounts(
     fallback_mount_point: str | Path,
     via_agent: bool,
     existing_volume_projects: list[dict[str, Any]] | None = None,
+    host_uid: int | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     """Materialize the sandbox-visible volume mounts and their quota state.
 
@@ -155,6 +201,8 @@ def build_volume_mounts(
     Returns ``(mount_paths, volume_projects)`` where ``mount_paths`` entries
     are ``{"path", "hostPath"}`` with ``hostPath`` pointing at the sandbox's
     view, and ``volume_projects`` entries carry the quota lifecycle metadata.
+    ``host_uid`` is passed through to the mount provisioning for the E3.2
+    volume permission model (shared 1777 root + per-uid slices).
 
     Raises :class:`ValueError` on invalid mount configs (mirrors the worker
     agent contract); each caller maps it to its own error response.
@@ -193,6 +241,7 @@ def build_volume_mounts(
             fallback_mount_point=fallback_mount_point,
             via_agent=via_agent,
             existing_projid=_existing_projid(existing, volume_id, rel),
+            host_uid=host_uid,
         )
         target = workspace / rel
         target.parent.mkdir(parents=True, exist_ok=True)
