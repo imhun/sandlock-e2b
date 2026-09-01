@@ -10,6 +10,8 @@ import threading
 
 import httpx
 
+from control_plane.config import Settings
+
 
 def _tar_bytes(filename: str = "requirements.txt", content: str = "requests==2.32.0\n") -> bytes:
     buf = io.BytesIO()
@@ -113,6 +115,46 @@ async def test_uploaded_file_token_cleared_and_overwrite_rejected(apps):
         with tarfile.open(archive, mode="r:gz") as tar:
             extracted = tar.extractfile("requirements.txt").read()
         assert extracted == b"requests==2.32.0\n"
+
+
+async def test_upload_over_limit_413_and_token_stays_valid(make_apps):
+    """E4.2: oversized template archive PUT is rejected with 413 before tar
+    validation, leaves no archive/temp file, and keeps the upload token."""
+    control, _ = make_apps(
+        control_settings=Settings(api_keys=("local-key",), max_file_write_mb=1)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control), base_url="http://test"
+    ) as client:
+        info = await _create_template(client)
+        template_id = info["templateID"]
+        file_hash = "oversize"
+        link = await client.get(
+            f"/templates/{template_id}/files/{file_hash}",
+            headers={"X-API-Key": "local-key"},
+        )
+        assert link.status_code == 201
+        url = link.json()["url"]
+
+        over = await client.put(
+            url, content=b"\0" * (1024 * 1024 + 1)
+        )
+        assert over.status_code == 413
+        assert over.json() == {
+            "code": 413,
+            "message": "Uploaded file exceeds maximum size",
+        }
+
+        # No archive and no leftover temp file were published.
+        archives = control.state.workspace_base / "_builds" / template_id / "archives"
+        assert not (archives / f"{file_hash}.tar.gz").exists()
+        assert not list(archives.glob(f".{file_hash}.*.tmp"))
+
+        # The failed upload did not consume the token: a valid archive PUT
+        # with the same URL still succeeds.
+        upload = await client.put(url, content=_tar_bytes())
+        assert upload.status_code == 204
+        assert control.state.templates.get(template_id).is_file_uploaded(file_hash)
 
 
 async def test_concurrent_upload_same_file_hash_keeps_winner_archive(

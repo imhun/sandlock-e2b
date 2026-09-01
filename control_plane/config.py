@@ -98,6 +98,11 @@ class Settings:
             "E2B_TEMPLATE_BUILD_RATE_LIMIT_PER_MIN", 0
         )
     )
+    # E4.2: max bytes accepted by file-write endpoints (volumecontent PUT,
+    # template archive upload). 0 disables the limit (repo convention).
+    max_file_write_mb: int = field(
+        default_factory=lambda: _env_int("E2B_MAX_FILE_WRITE_MB", 512)
+    )
     enable_network: bool = field(
         default_factory=lambda: _env_bool("E2B_ENABLE_NETWORK", False)
     )

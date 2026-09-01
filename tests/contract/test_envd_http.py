@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 
 from envd_service.config import Settings as EnvdSettings
@@ -100,6 +102,70 @@ async def test_file_multipart_upload(control_client, envd_client):
             "metadata": None,
         }
     ]
+
+
+async def test_file_octet_stream_over_limit_413(make_apps):
+    """E4.2: oversized worker files.write is rejected with 413 and leaves no
+    partial file."""
+    control, envd = make_apps(
+        envd_settings=EnvdSettings(executor="local", max_file_write_mb=1)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control), base_url="http://test"
+    ) as control_client:
+        sandbox = await _create_sandbox(control_client)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=envd), base_url="http://test"
+    ) as envd_client:
+        response = await envd_client.post(
+            "/files",
+            headers={
+                **_headers(sandbox),
+                "Content-Type": "application/octet-stream",
+            },
+            params={"path": "workspace/big.bin"},
+            content=b"\0" * (1024 * 1024 + 1),
+        )
+        assert response.status_code == 413
+        assert response.json() == {
+            "message": "File exceeds maximum upload size"
+        }
+
+        missing = await envd_client.get(
+            "/files", headers=_headers(sandbox), params={"path": "workspace/big.bin"}
+        )
+        assert missing.status_code == 404
+        runtime = envd.state.runtime_registry.get(sandbox["sandboxID"])
+        leftovers = list((Path(runtime.workspace_dir) / "workspace").glob(".*.tmp"))
+        assert leftovers == []
+
+
+async def test_file_multipart_over_limit_413(make_apps):
+    """E4.2: oversized multipart file part is rejected with 413."""
+    control, envd = make_apps(
+        envd_settings=EnvdSettings(executor="local", max_file_write_mb=1)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control), base_url="http://test"
+    ) as control_client:
+        sandbox = await _create_sandbox(control_client)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=envd), base_url="http://test"
+    ) as envd_client:
+        response = await envd_client.post(
+            "/files",
+            headers=_headers(sandbox),
+            files={"file": ("workspace/multi.bin", b"\0" * (1024 * 1024 + 1))},
+        )
+        assert response.status_code == 413
+        assert response.json() == {
+            "message": "File exceeds maximum upload size"
+        }
+
+        missing = await envd_client.get(
+            "/files", headers=_headers(sandbox), params={"path": "workspace/multi.bin"}
+        )
+        assert missing.status_code == 404
 
 
 async def test_file_missing_404(control_client, envd_client):

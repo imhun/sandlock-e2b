@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,13 @@ from envd_service.filesystem.ops import FilesystemOps, _entry
 from envd_service.http.auth import HttpAuthError, http_error_response, require_http_sandbox
 from gateway_common.errors import invalid_argument, not_found
 from gateway_common.paths import PathTraversalError, resolve_under_root
+from gateway_common.upload import (
+    UploadTooLargeError,
+    check_content_length,
+    limit_bytes_from_mb,
+    stream_body_to_file,
+    stream_upload_file_to_file,
+)
 
 router = APIRouter()
 
@@ -68,6 +76,10 @@ def _upload_response(ops: FilesystemOps, path: Path, metadata: dict[str, str]) -
     }
 
 
+def _write_limit(request: Request) -> int | None:
+    return limit_bytes_from_mb(request.app.state.settings.max_file_write_mb)
+
+
 @router.get("/files")
 async def download_file(
     request: Request, path: str, username: str | None = None
@@ -103,10 +115,20 @@ async def upload_file(
         if content_type == "application/octet-stream":
             if not path:
                 raise HttpAuthError(400, "path is required for octet-stream uploads")
-            body = await request.body()
             target = _resolve_or_error(ops, path)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(body)
+            # E4.2: stream to a sibling temp file and atomically rename so an
+            # over-limit upload (413) leaves no partial file and the worker
+            # memory does not grow with the body.
+            limit = _write_limit(request)
+            tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                check_content_length(request, limit)
+                await stream_body_to_file(request, tmp, limit)
+                os.replace(tmp, target)
+            except UploadTooLargeError:
+                tmp.unlink(missing_ok=True)
+                raise HttpAuthError(413, "File exceeds maximum upload size")
             _persist_metadata(target, metadata)
             return JSONResponse(content=[_upload_response(ops, target, metadata)])
 
@@ -117,13 +139,19 @@ async def upload_file(
         results: list[dict[str, Any]] = []
         for _, file_obj in files:
             assert isinstance(file_obj, UploadFile)
-            data = await file_obj.read()
             file_path = path or (file_obj.filename or "")
             if not file_path:
                 raise HttpAuthError(400, "file path is required")
             target = _resolve_or_error(ops, file_path)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
+            limit = _write_limit(request)
+            tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                await stream_upload_file_to_file(file_obj, tmp, limit)
+                os.replace(tmp, target)
+            except UploadTooLargeError:
+                tmp.unlink(missing_ok=True)
+                raise HttpAuthError(413, "File exceeds maximum upload size")
             _persist_metadata(target, metadata)
             results.append(_upload_response(ops, target, metadata))
         return JSONResponse(content=results)

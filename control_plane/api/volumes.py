@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,12 @@ from control_plane.api.errors import OfficialError
 from control_plane.auth import _require_owned, require_api_key, tenant_of, tenant_scope
 from control_plane.registry.volumes import UnknownVolumeError
 from gateway_common.paths import PathTraversalError, resolve_under_root
+from gateway_common.upload import (
+    UploadTooLargeError,
+    check_content_length,
+    limit_bytes_from_mb,
+    stream_body_to_file,
+)
 
 router = APIRouter()
 
@@ -205,7 +213,18 @@ async def volume_write_file(
     if target.exists() and force is False:
         raise OfficialError(409, f"Path {path} already exists")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(await request.body())
+    # E4.2: stream to a sibling temp file and atomically rename so an
+    # over-limit upload (413) never leaves a partial file or clobbers the
+    # previous content, and the worker memory never holds the whole body.
+    limit = limit_bytes_from_mb(request.app.state.settings.max_file_write_mb)
+    tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        check_content_length(request, limit)
+        await stream_body_to_file(request, tmp, limit)
+        os.replace(tmp, target)
+    except UploadTooLargeError:
+        tmp.unlink(missing_ok=True)
+        raise OfficialError(413, "File exceeds maximum upload size")
     return _entry(target, volume.path)
 
 

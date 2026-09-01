@@ -127,6 +127,11 @@ class Settings:
     command_capture_limit_mb: int = field(
         default_factory=lambda: _env_int("E2B_COMMAND_CAPTURE_LIMIT_MB", 10)
     )
+    # E4.2: max bytes accepted by the worker ``/files`` write endpoint.
+    # 0 disables the limit (repo convention).
+    max_file_write_mb: int = field(
+        default_factory=lambda: _env_int("E2B_MAX_FILE_WRITE_MB", 512)
+    )
     # Per-sandbox host uid isolation (E3.2): when enabled (and the worker
     # runs as root / CAP_SETUID), every sandbox gets a distinct host uid
     # from the pool and its workspace is chowned to that uid with 0700.

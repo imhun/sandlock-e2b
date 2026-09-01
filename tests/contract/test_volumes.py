@@ -98,6 +98,60 @@ async def test_volume_create_per_sandbox_quota_metadata(control_client):
     assert bad.status_code == 400
 
 
+async def test_volume_write_over_limit_413_and_preserves_existing(make_apps):
+    """E4.2: oversized volumecontent PUT is rejected with 413, leaves no
+    partial file, and cannot clobber the previous content."""
+    control, _ = make_apps(
+        control_settings=Settings(api_keys=("local-key",), max_file_write_mb=1)
+    )
+    async with _client(control) as client:
+        created = await client.post(
+            "/volumes", headers={"X-API-Key": "local-key"}, json={"name": "data"}
+        )
+        assert created.status_code == 201
+        vid = created.json()["volumeID"]
+        headers = {"Authorization": f"Bearer {created.json()['token']}"}
+
+        upload = await client.put(
+            f"/volumecontent/{vid}/file",
+            headers=headers,
+            params={"path": "a.txt"},
+            content=b"v" * 1024 * 1024,
+        )
+        assert upload.status_code == 201
+
+        over = await client.put(
+            f"/volumecontent/{vid}/file",
+            headers=headers,
+            params={"path": "a.txt"},
+            content=b"x" * (1024 * 1024 + 1),
+        )
+        assert over.status_code == 413
+        assert over.json() == {
+            "code": 413,
+            "message": "File exceeds maximum upload size",
+        }
+        # Previous content is untouched (temp+rename; no partial clobber).
+        read = await client.get(
+            f"/volumecontent/{vid}/file", headers=headers, params={"path": "a.txt"}
+        )
+        assert read.status_code == 200
+        assert read.content == b"v" * 1024 * 1024
+
+        # A brand-new path over the limit is rejected and never appears.
+        missing = await client.put(
+            f"/volumecontent/{vid}/file",
+            headers=headers,
+            params={"path": "new.bin"},
+            content=b"x" * (1024 * 1024 + 1),
+        )
+        assert missing.status_code == 413
+        gone = await client.get(
+            f"/volumecontent/{vid}/file", headers=headers, params={"path": "new.bin"}
+        )
+        assert gone.status_code == 404
+
+
 async def test_volume_bad_token(control_client):
     created = await control_client.post(
         "/volumes", headers={"X-API-Key": "local-key"}, json={"name": "data"}

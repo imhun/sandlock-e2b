@@ -20,6 +20,12 @@ from control_plane.registry.templates import (
     TemplateRecord,
     UnknownTemplateBuildError,
 )
+from gateway_common.upload import (
+    UploadTooLargeError,
+    check_content_length,
+    limit_bytes_from_mb,
+    stream_body_to_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -324,9 +330,6 @@ async def template_file_upload(
         raise OfficialError(409, "File already uploaded")
     if not record.verify_upload_token(file_hash, token):
         raise OfficialError(401, "Invalid upload token")
-    body = await request.body()
-    if not body:
-        raise OfficialError(400, "Upload body is empty")
     app = request.app
     workspace_base = app.state.workspace_base
     archives = workspace_base / "_builds" / template_id / "archives"
@@ -339,12 +342,21 @@ async def template_file_upload(
     # archive, so only the temp file is ever cleaned up on failure.
     tmp = archives / f".{file_hash}.{uuid.uuid4().hex}.tmp"
     try:
-        with open(tmp, "wb") as f:
-            f.write(body)
+        # E4.2: stream the body to disk (never buffer it in memory), bounded
+        # by E2B_MAX_FILE_WRITE_MB; over-limit uploads get 413.
+        limit = limit_bytes_from_mb(app.state.settings.max_file_write_mb)
+        check_content_length(request, limit)
+        size = await stream_body_to_file(request, tmp, limit)
+        if size == 0:
+            tmp.unlink(missing_ok=True)
+            raise OfficialError(400, "Upload body is empty")
         # Validate the payload is a readable tar/gzip archive before it is
         # published under the final name.
         with tarfile.open(tmp) as tar:
             tar.getmembers()
+    except UploadTooLargeError:
+        tmp.unlink(missing_ok=True)
+        raise OfficialError(413, "Uploaded file exceeds maximum size")
     except (OSError, tarfile.TarError):
         tmp.unlink(missing_ok=True)
         raise OfficialError(400, "Uploaded file is not a valid tar archive")
