@@ -62,6 +62,9 @@ sandbox.kill()
 | L4 安全 | `E2B_BASE_IMAGE=python:3.14-slim pytest tests/security` | Linux 6.12+ + Docker daemon |
 | L5 性能 | `E2B_BASE_IMAGE=python:3.14-slim pytest tests/perf --perf` | Linux + Docker；profile 写入 `tmp/perf/` |
 
+本地直连远程部署实例跑 SDK 测试（无需起本地服务）：见
+[docs/remote-testing.md](docs/remote-testing.md)。
+
 Linux test runner：
 
 ```bash
