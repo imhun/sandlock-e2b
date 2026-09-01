@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, Request, Response
 
 from control_plane.api.errors import OfficialError
-from control_plane.auth import require_api_key
+from control_plane.auth import _require_owned, require_api_key, tenant_of, tenant_scope
 from control_plane.api.sandboxes import _provision_remote
 from control_plane.registry.manager import (
     ResourceUnavailableError,
@@ -36,6 +36,7 @@ def _capture_snapshot(request: Request, sandbox_id: str, name: str | None):
     """Freeze the sandbox, copy its filesystem, thaw it."""
     registry = _registry(request)
     record = registry.get(sandbox_id)
+    _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
     if record.state != "running":
         raise OfficialError(409, f"Sandbox {sandbox_id} is not running")
     node = request.app.state.nodes.get(record.node_id or "local")
@@ -58,6 +59,7 @@ def _capture_snapshot(request: Request, sandbox_id: str, name: str | None):
                 allow_internet_access=record.allow_internet_access,
                 node_id=node.node_id,
                 name=name,
+                tenant_id=record.tenant_id,
             )
         # Remote snapshot: ask the worker to copy the sandbox directory into
         # its local snapshot store; the control plane keeps only metadata.
@@ -86,6 +88,7 @@ def _capture_snapshot(request: Request, sandbox_id: str, name: str | None):
             name=name,
             snapshot_id=snapshot_id,
             copy_fs=False,
+            tenant_id=record.tenant_id,
         )
     finally:
         request.app.state.runtime_registry.thaw(sandbox_id)
@@ -131,8 +134,12 @@ async def list_snapshots(
         name=name,
         limit=limit,
         offset=offset,
+        tenant_id=tenant_scope(request),
     )
-    if offset + len(records) < len(_snapshots(request).list(name=name)):
+    total = len(
+        _snapshots(request).list(name=name, tenant_id=tenant_scope(request))
+    )
+    if offset + len(records) < total:
         response.headers["X-Next-Token"] = str(offset + len(records))
     return [r.as_snapshot_info() for r in records]
 
@@ -144,6 +151,8 @@ async def list_snapshots(
 )
 async def delete_snapshot(snapshot_id: str, request: Request) -> Response:
     try:
+        record = _snapshots(request).get(snapshot_id)
+        _require_owned(request, record, resource_id=snapshot_id, label="Snapshot")
         _snapshots(request).delete(snapshot_id)
     except UnknownSnapshotError:
         raise OfficialError(404, f"Snapshot {snapshot_id} not found")
@@ -179,9 +188,12 @@ async def fork_sandbox(sandbox_id: str, request: Request) -> list[dict[str, Any]
         raise OfficialError(409, f"Sandbox {sandbox_id} is not running")
 
     results: list[dict[str, Any]] = []
+    tenant, is_admin = tenant_of(request)
     for _ in range(count):
         try:
-            sandbox = await _create_sandbox_from_snapshot(request, snapshot, timeout)
+            sandbox = await _create_sandbox_from_snapshot(
+                request, snapshot, timeout, tenant_id=tenant, is_admin=is_admin
+            )
             results.append({"sandbox": sandbox})
         except OfficialError as e:
             results.append({"error": {"code": e.code, "message": e.message}})
@@ -191,7 +203,7 @@ async def fork_sandbox(sandbox_id: str, request: Request) -> list[dict[str, Any]
 
 
 async def _create_sandbox_from_snapshot(
-    request: Request, snapshot, timeout: int
+    request: Request, snapshot, timeout: int, *, tenant_id: str | None, is_admin: bool
 ) -> dict[str, Any]:
     """Create one sandbox from a snapshot's filesystem + metadata."""
     registry = _registry(request)
@@ -209,6 +221,8 @@ async def _create_sandbox_from_snapshot(
                 {"name": m["name"], "path": m["path"]}
                 for m in snapshot.volume_mounts
             ],
+            tenant_id=tenant_id,
+            is_admin=is_admin,
         )
     except ResourceUnavailableError as e:
         raise OfficialError(503, str(e))

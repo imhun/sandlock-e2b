@@ -16,13 +16,20 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, Request, Response
 
 from control_plane.api.errors import OfficialError
-from control_plane.auth import require_api_key
+from control_plane.auth import (
+    _require_owned,
+    _require_related,
+    require_api_key,
+    tenant_of,
+    tenant_scope,
+)
 from control_plane.registry.manager import (
     ResourceUnavailableError,
     SandboxStateConflictError,
     SandboxRegistry,
     UnknownSandboxError,
 )
+from control_plane.registry.secrets import SecretTenantMismatchError
 from control_plane.registry.snapshots import UnknownSnapshotError
 from control_plane.registry.templates import UnknownTemplateBuildError
 from gateway_common.network import (
@@ -347,10 +354,20 @@ async def _command_logs(request, record) -> list[dict[str, str]]:
 
 @router.post("/sandboxes", status_code=201, dependencies=[Depends(require_api_key)])
 async def create_sandbox(request: Request) -> dict[str, Any]:
+    settings = request.app.state.settings
+    tenant, is_admin = tenant_of(request)
     limiter = request.app.state.create_limiter
     key = request.headers.get("X-API-Key") or request.headers.get("X-API-KEY", "")
     if not limiter.allow(key):
         raise OfficialError(429, "Sandbox create rate limit exceeded")
+    # Per-tenant create rate limit (E2B_TENANT_RATE_LIMITS; falls back to
+    # the global per-minute budget). Admin keys and compatible mode skip it.
+    if settings.tenants_enabled and tenant is not None and not is_admin:
+        tenant_limiter = request.app.state.tenant_limiters.get(
+            tenant
+        ) or request.app.state.tenant_create_limiter
+        if not tenant_limiter.allow(tenant):
+            raise OfficialError(429, "Sandbox create rate limit exceeded")
     try:
         body = await request.json()
     except json.JSONDecodeError:
@@ -366,7 +383,6 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
     if not isinstance(template_id, str) or not template_id:
         raise OfficialError(400, "templateID is required")
 
-    settings = request.app.state.settings
     base_image = settings.resolve_template_image(template_id)
     snapshot = None
     template_record = None
@@ -391,6 +407,17 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
                     template_record = None
         if snapshot is None and template_record is None:
             raise OfficialError(400, f"Template {template_id} not found")
+    if snapshot is not None:
+        _require_related(
+            request, snapshot, resource_id=snapshot.snapshot_id, label="Snapshot"
+        )
+    if template_record is not None:
+        _require_related(
+            request,
+            template_record,
+            resource_id=template_record.template_id,
+            label="Template",
+        )
 
     timeout = body.get("timeout", settings.default_timeout)
     if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
@@ -431,9 +458,10 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
             if not isinstance(name, str) or not isinstance(path, str):
                 raise OfficialError(400, "volumeMounts entries need name and path")
             try:
-                volume_registry.get(name)
+                volume = volume_registry.get(name)
             except Exception:
                 raise OfficialError(404, f"Volume {name} not found")
+            _require_related(request, volume, resource_id=name, label="Volume")
             volume_mounts.append({"name": name, "path": path})
 
     secure = body.get("secure", True)
@@ -447,7 +475,6 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
         raise OfficialError(400, str(e))
     iam_tokens = _normalize_iam(body)
 
-    settings = request.app.state.settings
     dims = _default_dims(settings)
     registry = _registry(request)
 
@@ -462,12 +489,21 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
         except UnknownSandboxError:
             existing = None
         if existing is not None:
+            _require_owned(
+                request, existing, resource_id=existing.sandbox_id, label="Sandbox"
+            )
             return existing.as_sandbox()
         if registry.get_pending(sandbox_id_hdr) is not None:
             resolved = await _wait_pending(
                 registry, sandbox_id_hdr, _PENDING_WAIT_S
             )
             if resolved is not None:
+                _require_owned(
+                    request,
+                    resolved,
+                    resource_id=resolved.sandbox_id,
+                    label="Sandbox",
+                )
                 return resolved.as_sandbox()
             if registry.get_pending(sandbox_id_hdr) is not None:
                 raise OfficialError(503, "Sandbox create still in progress")
@@ -554,13 +590,23 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
             # A concurrent attempt finished while we warmed.
             registry.release_pending(sandbox_id_hdr)
             _release_node_quota(request, node, dims)
+            _require_owned(
+                request, existing, resource_id=existing.sandbox_id, label="Sandbox"
+            )
             return existing.as_sandbox()
 
     secrets = request.app.state.secrets
     try:
         resolved_env = secrets.resolve_env_refs(
-            {str(k): str(v) for k, v in env_vars.items()}
+            {str(k): str(v) for k, v in env_vars.items()},
+            tenant_id=tenant,
+            is_admin=is_admin,
         )
+    except SecretTenantMismatchError as e:
+        _release_node_quota(request, node, dims)
+        registry.release_pending(sandbox_id_hdr)
+        raise OfficialError(403, str(e)) from e
+    try:
         record = registry.create(
             template_id=template_id,
             sandbox_id=sandbox_id_hdr,
@@ -582,6 +628,8 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
             mcp=dict(mcp) if mcp is not None else None,
             network=network,
             iam_tokens=iam_tokens,
+            tenant_id=tenant,
+            is_admin=is_admin,
         )
     except ResourceUnavailableError as e:
         _release_node_quota(request, node, dims)
@@ -749,7 +797,7 @@ async def _provision_remote(
 @router.get("/sandboxes", dependencies=[Depends(require_api_key)])
 async def list_sandboxes_legacy(request: Request) -> list[dict[str, Any]]:
     registry = _registry(request)
-    records = registry.list(limit=None)
+    records = registry.list(limit=None, tenant_id=tenant_scope(request))
     return [r.as_listed() for r in records]
 
 
@@ -771,6 +819,7 @@ async def list_sandboxes(
     if state is not None:
         state_filter = [s for s in state.split(",") if s]
     registry = _registry(request)
+    tenant = tenant_scope(request)
     total = len(
         registry.list(
             metadata_filter=_parse_metadata(metadata),
@@ -779,6 +828,7 @@ async def list_sandboxes(
             started_after=startedAfter,
             template=template,
             limit=None,
+            tenant_id=tenant,
         )
     )
     offset = _parse_cursor(nextToken)
@@ -790,6 +840,7 @@ async def list_sandboxes(
         template=template,
         limit=limit,
         offset=offset,
+        tenant_id=tenant,
     )
     # Cursor pagination: the next token encodes the absolute offset of the
     # following page.
@@ -802,7 +853,9 @@ async def list_sandboxes(
 async def get_sandbox_info(sandbox_id: str, request: Request) -> dict[str, Any]:
     registry = _registry(request)
     try:
-        return registry.get(sandbox_id).as_detail()
+        record = registry.get(sandbox_id)
+        _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
+        return record.as_detail()
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
 
@@ -811,7 +864,9 @@ async def get_sandbox_info(sandbox_id: str, request: Request) -> dict[str, Any]:
 async def kill_sandbox(sandbox_id: str, request: Request) -> Response:
     registry = _registry(request)
     try:
-        record = registry.delete(sandbox_id)
+        record = registry.get(sandbox_id)
+        _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
+        registry.delete(sandbox_id)
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
     node = request.app.state.nodes.get(record.node_id or "local")
@@ -1117,6 +1172,7 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
     try:
         try:
             record = registry.get(sandbox_id)
+            _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
         except UnknownSandboxError:
             raise OfficialError(404, f"Sandbox {sandbox_id} not found")
         source = nodes.get(record.node_id or "local")
@@ -1300,6 +1356,7 @@ async def connect_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
     registry = _registry(request)
     try:
         record = registry.get(sandbox_id)
+        _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
         if record.state == "paused":
             record.resume(timeout)
             # Persist the resumed state before connect() re-reads the record
@@ -1324,6 +1381,8 @@ async def set_timeout(sandbox_id: str, request: Request) -> Response:
         raise OfficialError(400, "timeout must be a positive integer")
     registry = _registry(request)
     try:
+        record = registry.get(sandbox_id)
+        _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
         registry.set_timeout(sandbox_id, timeout)
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
@@ -1420,6 +1479,7 @@ async def update_sandbox_network(sandbox_id: str, request: Request) -> Response:
     registry = _registry(request)
     try:
         record = registry.get(sandbox_id)
+        _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
 
@@ -1455,6 +1515,7 @@ async def pause_sandbox(sandbox_id: str, request: Request) -> Response:
     registry = _registry(request)
     try:
         record = registry.get(sandbox_id)
+        _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
         record.pause()
         registry.save(record)
     except UnknownSandboxError:
@@ -1474,6 +1535,7 @@ async def resume_sandbox(sandbox_id: str, request: Request) -> Response:
     registry = _registry(request)
     try:
         record = registry.get(sandbox_id)
+        _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
         record.resume()
         registry.save(record)
     except UnknownSandboxError:
@@ -1497,6 +1559,7 @@ async def get_sandbox_metrics(
     registry = _registry(request)
     try:
         record = registry.get(sandbox_id)
+        _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
     sample = record.sample_metric()
@@ -1521,6 +1584,7 @@ async def get_sandbox_logs(
     registry = _registry(request)
     try:
         record = registry.get(sandbox_id)
+        _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
     logs = record.logs + await _command_logs(request, record)
@@ -1542,6 +1606,7 @@ async def get_sandbox_logs_v2(
     registry = _registry(request)
     try:
         record = registry.get(sandbox_id)
+        _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
     logs = record.logs + await _command_logs(request, record)

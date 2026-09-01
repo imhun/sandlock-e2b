@@ -120,7 +120,9 @@ class VolumeRegistry:
             return record
 
     def _record_path(self, volume_id: str) -> Path:
-        return self._base / volume_id / "volume.json"
+        # Records live outside the volume data directory so they are never
+        # exposed through the volume content API.
+        return self._base / "_meta" / f"{volume_id}.json"
 
     def _write_record(self, record: VolumeRecord) -> None:
         path = self._record_path(record.volume_id)
@@ -156,6 +158,7 @@ class VolumeRegistry:
         record = self.get(volume_id)
         with self._lock:
             self._volumes.pop(volume_id, None)
+        self._record_path(volume_id).unlink(missing_ok=True)
         if record.path is not None:
             import shutil
 
@@ -170,18 +173,16 @@ class VolumeRegistry:
         tenant_id: str | None = None,
     ) -> list[VolumeRecord]:
         with self._lock:
-            if self._base.is_dir():
-                for entry in sorted(self._base.iterdir()):
-                    if not entry.is_dir():
-                        continue
-                    volume_id = entry.name
+            meta_dir = self._base / "_meta"
+            if meta_dir.is_dir():
+                for path in sorted(meta_dir.glob("*.json")):
+                    volume_id = path.stem
                     if volume_id in self._volumes:
                         continue
-                    if self._record_path(volume_id).is_file():
-                        try:
-                            self._volumes[volume_id] = self._load_record(volume_id)
-                        except (OSError, ValueError, KeyError):
-                            continue
+                    try:
+                        self._volumes[volume_id] = self._load_record(volume_id)
+                    except (OSError, ValueError, KeyError):
+                        continue
             records = list(self._volumes.values())
         if tenant_id is not None:
             records = [r for r in records if r.tenant_id == tenant_id]

@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from control_plane.api.errors import OfficialError
-from control_plane.auth import require_api_key
+from control_plane.auth import _require_owned, require_api_key, tenant_of, tenant_scope
 from control_plane.registry.volumes import UnknownVolumeError
 from gateway_common.paths import PathTraversalError, resolve_under_root
 
@@ -80,9 +80,10 @@ async def create_volume(request: Request) -> dict[str, Any]:
     per_sandbox_quota_mb = (
         body.get("perSandboxQuotaMb", 0) if isinstance(body, dict) else 0
     )
+    tenant, _is_admin = tenant_of(request)
     try:
         record = _volumes(request).create(
-            name, per_sandbox_quota_mb=per_sandbox_quota_mb
+            name, per_sandbox_quota_mb=per_sandbox_quota_mb, tenant_id=tenant
         )
     except ValueError as e:
         raise OfficialError(400, str(e))
@@ -97,8 +98,11 @@ async def list_volumes(
     limit: int = Query(default=100, ge=1, le=100),
 ) -> list[dict[str, Any]]:
     offset = int(nextToken) if nextToken and nextToken.isdigit() else 0
-    records = _volumes(request).list(limit=limit, offset=offset)
-    if len(records) == limit and offset + len(records) < len(_volumes(request).list()):
+    records = _volumes(request).list(
+        limit=limit, offset=offset, tenant_id=tenant_scope(request)
+    )
+    total = len(_volumes(request).list(tenant_id=tenant_scope(request)))
+    if len(records) == limit and offset + len(records) < total:
         response.headers["X-Next-Token"] = str(offset + len(records))
     return [r.as_volume() for r in records]
 
@@ -106,7 +110,9 @@ async def list_volumes(
 @router.get("/volumes/{volume_id}", dependencies=[Depends(require_api_key)])
 async def get_volume(volume_id: str, request: Request) -> dict[str, Any]:
     try:
-        return _volumes(request).get(volume_id).as_volume_and_token()
+        record = _volumes(request).get(volume_id)
+        _require_owned(request, record, resource_id=volume_id, label="Volume")
+        return record.as_volume_and_token()
     except UnknownVolumeError:
         raise OfficialError(404, f"Volume {volume_id} not found")
 
@@ -116,6 +122,8 @@ async def get_volume(volume_id: str, request: Request) -> dict[str, Any]:
 )
 async def delete_volume(volume_id: str, request: Request) -> Response:
     try:
+        record = _volumes(request).get(volume_id)
+        _require_owned(request, record, resource_id=volume_id, label="Volume")
         _volumes(request).delete(volume_id)
     except UnknownVolumeError:
         raise OfficialError(404, f"Volume {volume_id} not found")

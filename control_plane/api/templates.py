@@ -13,7 +13,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, Request, Response
 
 from control_plane.api.errors import OfficialError
-from control_plane.auth import require_api_key
+from control_plane.auth import _require_owned, require_api_key, tenant_of, tenant_scope
 from control_plane.registry.templates import (
     BuildRecord,
     TemplateRecord,
@@ -222,7 +222,8 @@ async def create_template_build(request: Request) -> dict[str, Any]:
     name = (body or {}).get("name") if isinstance(body, dict) else None
     if not name or not isinstance(name, str):
         raise OfficialError(400, "name is required")
-    record, build = _templates(request).create(name)
+    tenant, _is_admin = tenant_of(request)
+    record, build = _templates(request).create(name, tenant_id=tenant)
     return {
         "templateID": record.template_id,
         "buildID": build.build_id,
@@ -245,6 +246,7 @@ async def template_file_upload_link(
         record = _templates(request).get(template_id)
     except UnknownTemplateBuildError:
         raise OfficialError(404, f"Template {template_id} not found")
+    _require_owned(request, record, resource_id=template_id, label="Template")
     if record.is_file_uploaded(file_hash):
         return {"present": True, "url": None}
     token = record.upload_url_token(file_hash)
@@ -307,6 +309,7 @@ async def trigger_template_build(
         raise OfficialError(404, f"Template build {build_id} not found")
     except json.JSONDecodeError:
         raise OfficialError(400, "Invalid JSON body")
+    _require_owned(request, record, resource_id=template_id, label="Template")
     try:
         dockerfile = _steps_to_dockerfile(
             (body or {}).get("fromImage"), (body or {}).get("steps") or []
@@ -336,6 +339,7 @@ async def template_build_status(
         build = record.get_build(build_id)
     except UnknownTemplateBuildError:
         raise OfficialError(404, f"Template build {build_id} not found")
+    _require_owned(request, record, resource_id=template_id, label="Template")
     info = build.as_info(record.template_id)
     info["logs"] = info["logs"][logsOffset:]
     info["logEntries"] = info["logEntries"][logsOffset:]
@@ -346,5 +350,5 @@ async def template_build_status(
 async def list_templates(request: Request) -> list[dict[str, Any]]:
     return [
         {"templateID": t.template_id, "name": t.name, "image": t.image}
-        for t in _templates(request).list()
+        for t in _templates(request).list(tenant_id=tenant_scope(request))
     ]

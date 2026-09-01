@@ -168,6 +168,13 @@ def create_app(
     app.state.create_limiter = SlidingWindowRateLimiter(
         settings.create_rate_limit_per_min
     )
+    app.state.tenant_create_limiter = SlidingWindowRateLimiter(
+        settings.create_rate_limit_per_min
+    )
+    app.state.tenant_limiters = {
+        tenant_id: SlidingWindowRateLimiter(limit)
+        for tenant_id, limit in settings.tenant_rate_limits.items()
+    }
     if settings.enable_local_node and app.state.nodes.get("local") is None:
         app.state.nodes.add_local_node(
             total_memory_mb=settings.max_total_memory_mb,
