@@ -20,6 +20,13 @@ def env_int(name: str, default: int) -> int:
     return int(value)
 
 
+def env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return float(value)
+
+
 def env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     value = os.getenv(name)
     if value is None or value.strip() == "":
@@ -45,5 +52,6 @@ def env_json_dict(name: str) -> dict[str, str]:
 # Backwards-compatible aliases for the historical private names.
 _env_bool = env_bool
 _env_int = env_int
+_env_float = env_float
 _env_list = env_list
 _env_json_dict = env_json_dict

@@ -66,6 +66,7 @@ class SandboxRuntimeContext:
             sandbox_id=record.sandbox_id,
             max_concurrent_commands=settings.max_concurrent_commands_per_sandbox,
             max_queued_commands=settings.max_queued_commands_per_sandbox,
+            queue_timeout_s=settings.command_queue_timeout_s,
         )
         self.files = FilesystemOps(record.workspace_dir)
         self.watchers = WatcherRegistry(self.files)

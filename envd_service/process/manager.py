@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,35 +75,101 @@ class _CommandGate:
     """Per-sandbox command gate: bounded concurrency + bounded wait queue.
 
     At most ``max_concurrent`` commands hold a slot at once; further commands
-    wait on the semaphore. When ``max_queued`` commands are already waiting,
-    a new acquire fails fast with a 429 ``resource_exhausted`` error so an
-    unbounded backlog cannot build up.
+    wait FIFO. When ``max_queued`` commands are already waiting, a new acquire
+    fails fast with a 429 ``resource_exhausted`` error so an unbounded backlog
+    cannot build up. A waiter that waits longer than ``queue_timeout`` seconds
+    also fails with 429. ``remove()`` revokes the gate: every queued waiter
+    and every future acquire raises ``not_found`` so no command can spawn on a
+    deleted sandbox.
     """
 
     def __init__(
-        self, sandbox_id: str, max_concurrent: int, max_queued: int
+        self,
+        sandbox_id: str,
+        max_concurrent: int,
+        max_queued: int,
+        queue_timeout: float | None,
     ) -> None:
         self._sandbox_id = sandbox_id
         self._max_concurrent = max_concurrent
         self._max_queued = max_queued
-        self._slots = asyncio.Semaphore(max_concurrent)
-        self._waiters = 0
+        self._queue_timeout = queue_timeout
+        self._available = max_concurrent
+        self._waiters: deque[asyncio.Future[None]] = deque()
+        self._removed = False
+
+    def _removed_error(self) -> ConnectError:
+        return not_found(
+            f"sandbox {self._sandbox_id} removed; queued command canceled"
+        )
 
     async def acquire(self) -> None:
-        if self._slots.locked() and self._waiters >= self._max_queued:
+        if self._removed:
+            raise self._removed_error()
+        if self._available > 0:
+            self._available -= 1
+            return
+        if len(self._waiters) >= self._max_queued:
             raise resource_exhausted(
                 f"sandbox {self._sandbox_id}: too many concurrent commands "
                 f"(running limit {self._max_concurrent}, "
                 f"queue limit {self._max_queued})"
             )
-        self._waiters += 1
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
         try:
-            await self._slots.acquire()
-        finally:
-            self._waiters -= 1
+            if self._queue_timeout is None:
+                await waiter
+            else:
+                try:
+                    await asyncio.wait_for(waiter, timeout=self._queue_timeout)
+                except asyncio.TimeoutError:
+                    self._discard_waiter(waiter)
+                    raise resource_exhausted(
+                        f"sandbox {self._sandbox_id}: command queue timed out "
+                        f"after {self._queue_timeout:g}s"
+                    )
+        except asyncio.CancelledError:
+            self._discard_waiter(waiter)
+            raise
+        if self._removed:
+            raise self._removed_error()
+        # The slot was handed over directly by release(); nothing to consume.
 
     def release(self) -> None:
-        self._slots.release()
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if waiter.done():
+                continue
+            waiter.set_result(None)
+            return
+        self._available += 1
+
+    def remove(self) -> None:
+        """Revoke the gate: queued and future acquires fail immediately."""
+        self._removed = True
+        err = self._removed_error()
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                waiter.set_exception(err)
+
+    def _discard_waiter(self, waiter: asyncio.Future[None]) -> None:
+        queued = True
+        try:
+            self._waiters.remove(waiter)
+        except ValueError:
+            queued = False
+        if not queued and waiter.done() and not waiter.cancelled():
+            # The slot had already been handed to this waiter (e.g. it was
+            # cancelled after release() woke it); give the slot back so the
+            # queue cannot stall.
+            self._available += 1
+            while self._waiters:
+                next_waiter = self._waiters.popleft()
+                if not next_waiter.done():
+                    next_waiter.set_result(None)
+                    return
 
 
 class ProcessManager:
@@ -117,6 +184,7 @@ class ProcessManager:
         sandbox_id: str | None = None,
         max_concurrent_commands: int = 1,
         max_queued_commands: int | None = None,
+        queue_timeout_s: float | None = 30,
     ) -> None:
         self._executor = executor
         self._max_command_timeout = max_command_timeout
@@ -130,23 +198,42 @@ class ProcessManager:
             self._max_queued_commands = self._max_concurrent_commands
         else:
             self._max_queued_commands = max(0, int(max_queued_commands))
+        self._queue_timeout = (
+            None
+            if queue_timeout_s is None
+            else max(0.0, float(queue_timeout_s))
+        )
         # Per-sandbox gates; one entry per sandbox served by this manager.
         self._locks: dict[str, _CommandGate] = {}
+        self._removed_sandboxes: set[str] = set()
 
     def _gate(self) -> _CommandGate:
+        if self._sandbox_id in self._removed_sandboxes:
+            raise not_found(
+                f"sandbox {self._sandbox_id} removed; command rejected"
+            )
         gate = self._locks.get(self._sandbox_id)
         if gate is None:
             gate = _CommandGate(
                 self._sandbox_id,
                 self._max_concurrent_commands,
                 self._max_queued_commands,
+                self._queue_timeout,
             )
             self._locks[self._sandbox_id] = gate
         return gate
 
     def remove_sandbox(self, sandbox_id: str | None = None) -> None:
-        """Drop the per-sandbox command gate (called on sandbox deletion)."""
-        self._locks.pop(sandbox_id or self._sandbox_id, None)
+        """Revoke the per-sandbox gate (called on sandbox deletion).
+
+        Queued commands fail with ``not_found`` instead of spawning on the
+        deleted sandbox, and later commands are rejected the same way.
+        """
+        target = sandbox_id or self._sandbox_id
+        gate = self._locks.pop(target, None)
+        if gate is not None:
+            gate.remove()
+        self._removed_sandboxes.add(target)
 
     async def start(
         self,

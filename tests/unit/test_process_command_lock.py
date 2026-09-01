@@ -208,6 +208,100 @@ async def test_remove_sandbox_drops_lock_registry_entry():
 
 
 @pytest.mark.asyncio
+async def test_remove_sandbox_cancels_queued_command():
+    executor = _FakeExecutor()
+    manager = ProcessManager(
+        executor,
+        sandbox_id="sbx_removed",
+        max_concurrent_commands=1,
+        max_queued_commands=1,
+    )
+    task_a = asyncio.create_task(manager.start(**_start_kwargs("a")))
+    proc_a = await asyncio.wait_for(task_a, timeout=5)
+    queue_a = proc_a.subscribe(replay=False)
+    assert executor.events == ["enter:a"]
+
+    task_b = asyncio.create_task(manager.start(**_start_kwargs("b")))
+    await asyncio.sleep(0)  # b queues behind a
+    assert not task_b.done()
+
+    manager.remove_sandbox()
+
+    with pytest.raises(ConnectError) as exc_info:
+        await asyncio.wait_for(task_b, timeout=5)
+    err = exc_info.value
+    assert err.code == "not_found"
+    assert err.http_status == 404
+    assert "sbx_removed" in err.message
+
+    # b was canceled before spawning; a still completes normally.
+    assert executor.events == ["enter:a"]
+    executor.finish(proc_a.pid)
+    assert await _wait_end(manager, proc_a, queue_a) == ("end", 0, "exited")
+    assert executor.events == ["enter:a", "end:a"]
+
+
+@pytest.mark.asyncio
+async def test_start_after_remove_sandbox_rejected():
+    executor = _FakeExecutor()
+    manager = ProcessManager(executor, sandbox_id="sbx_gone")
+    task_a = asyncio.create_task(manager.start(**_start_kwargs("a")))
+    proc_a = await asyncio.wait_for(task_a, timeout=5)
+    queue_a = proc_a.subscribe(replay=False)
+
+    manager.remove_sandbox()
+
+    with pytest.raises(ConnectError) as exc_info:
+        await manager.start(**_start_kwargs("b"))
+    assert exc_info.value.code == "not_found"
+    assert "sbx_gone" in exc_info.value.message
+    assert executor.events == ["enter:a"]  # b never spawned
+
+    executor.finish(proc_a.pid)
+    assert await _wait_end(manager, proc_a, queue_a) == ("end", 0, "exited")
+
+
+@pytest.mark.asyncio
+async def test_queue_timeout_returns_429_and_slot_not_lost():
+    executor = _FakeExecutor()
+    manager = ProcessManager(
+        executor,
+        sandbox_id="sbx_timeout",
+        max_concurrent_commands=1,
+        max_queued_commands=1,
+        queue_timeout_s=0.05,
+    )
+    task_a = asyncio.create_task(manager.start(**_start_kwargs("a")))
+    proc_a = await asyncio.wait_for(task_a, timeout=5)
+    queue_a = proc_a.subscribe(replay=False)
+
+    task_b = asyncio.create_task(manager.start(**_start_kwargs("b")))
+    await asyncio.sleep(0)  # b queues behind a
+    assert not task_b.done()
+
+    with pytest.raises(ConnectError) as exc_info:
+        await asyncio.wait_for(task_b, timeout=5)
+    err = exc_info.value
+    assert err.code == "resource_exhausted"
+    assert err.http_status == 429
+    assert "sbx_timeout" in err.message
+    assert "timed out" in err.message
+
+    # b timed out without ever spawning; c must be able to queue afterwards
+    # (the timed-out waiter did not consume the slot).
+    assert executor.events == ["enter:a"]
+    task_c = asyncio.create_task(manager.start(**_start_kwargs("c")))
+    await asyncio.sleep(0)
+    executor.finish(proc_a.pid)
+    assert await _wait_end(manager, proc_a, queue_a) == ("end", 0, "exited")
+    proc_c = await asyncio.wait_for(task_c, timeout=5)
+    queue_c = proc_c.subscribe(replay=False)
+    executor.finish(proc_c.pid)
+    assert await _wait_end(manager, proc_c, queue_c) == ("end", 0, "exited")
+    assert executor.events == ["enter:a", "end:a", "enter:c", "end:c"]
+
+
+@pytest.mark.asyncio
 async def test_real_executor_commands_run_serially(workspace):
     executor = LocalExecutor()
     manager = ProcessManager(

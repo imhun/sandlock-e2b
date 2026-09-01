@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from gateway_common.env import _env_bool, _env_int, _env_json_dict
+from gateway_common.env import _env_bool, _env_float, _env_int, _env_json_dict
 
 # Default private-egress denylist applied to the implicit full-egress branch
 # (no explicit allowOut/denyOut + internet allowed). Covers RFC1918, loopback,
@@ -97,6 +97,11 @@ class Settings:
             if os.getenv("E2B_MAX_QUEUED_COMMANDS_PER_SANDBOX") in (None, "")
             else _env_int("E2B_MAX_QUEUED_COMMANDS_PER_SANDBOX", 0)
         )
+    )
+    # Max seconds a command may wait in the per-sandbox queue before it is
+    # rejected with 429 (resource_exhausted).
+    command_queue_timeout_s: float = field(
+        default_factory=lambda: _env_float("E2B_COMMAND_QUEUE_TIMEOUT_S", 30)
     )
     log_level: str = field(default_factory=lambda: os.getenv("E2B_LOG_LEVEL", "INFO"))
     internal_api_key: str = field(
