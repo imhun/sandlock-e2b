@@ -103,6 +103,24 @@ class Settings:
     max_file_write_mb: int = field(
         default_factory=lambda: _env_int("E2B_MAX_FILE_WRITE_MB", 512)
     )
+    # E5.3: sandbox metadata/envVars size caps (serialized JSON bytes) so
+    # sandbox.json cannot be inflated by hostile create bodies. 0 disables
+    # the limit (repo convention).
+    max_metadata_bytes: int = field(
+        default_factory=lambda: _env_int("E2B_MAX_METADATA_BYTES", 64 * 1024)
+    )
+    max_envvars_bytes: int = field(
+        default_factory=lambda: _env_int("E2B_MAX_ENVVARS_BYTES", 64 * 1024)
+    )
+    # E5.3: cap on JSON request bodies for create/build/fork endpoints
+    # (bounded read, 413 beyond the limit).
+    max_json_body_bytes: int = field(
+        default_factory=lambda: _env_int("E2B_MAX_JSON_BODY_BYTES", 256 * 1024)
+    )
+    # E5.3: max UTF-8 bytes for user-supplied names (template/snapshot).
+    max_name_bytes: int = field(
+        default_factory=lambda: _env_int("E2B_MAX_NAME_BYTES", 1024)
+    )
     enable_network: bool = field(
         default_factory=lambda: _env_bool("E2B_ENABLE_NETWORK", False)
     )

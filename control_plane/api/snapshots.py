@@ -18,6 +18,7 @@ from control_plane.registry.manager import (
 )
 from control_plane.registry.snapshots import UnknownSnapshotError
 from gateway_common.ids import sandbox_id as new_sandbox_id
+from gateway_common.upload import UploadTooLargeError, read_json_body
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,15 @@ def _registry(request: Request):
 
 def _snapshots(request: Request):
     return request.app.state.snapshots
+
+
+def _check_name_size(settings, name: str) -> None:
+    """E5.3: cap user-supplied snapshot names (UTF-8 bytes)."""
+    if (
+        settings.max_name_bytes > 0
+        and len(name.encode("utf-8")) > settings.max_name_bytes
+    ):
+        raise OfficialError(400, f"name exceeds {settings.max_name_bytes}-byte limit")
 
 
 def _capture_snapshot(request: Request, sandbox_id: str, name: str | None):
@@ -103,12 +113,18 @@ async def create_snapshot(
     sandbox_id: str, request: Request
 ) -> dict[str, Any]:
     try:
-        body = await request.json()
+        body = await read_json_body(
+            request, request.app.state.settings.max_json_body_bytes
+        )
+    except UploadTooLargeError:
+        raise OfficialError(413, "Request body exceeds maximum size")
     except json.JSONDecodeError:
         body = {}
     name = body.get("name") if isinstance(body, dict) else None
     if name is not None and not isinstance(name, str):
         raise OfficialError(400, "name must be a string")
+    if name is not None:
+        _check_name_size(request.app.state.settings, name)
     try:
         record = _capture_snapshot(request, sandbox_id, name)
     except UnknownSandboxError:
@@ -166,7 +182,11 @@ async def delete_snapshot(snapshot_id: str, request: Request) -> Response:
 )
 async def fork_sandbox(sandbox_id: str, request: Request) -> list[dict[str, Any]]:
     try:
-        body = await request.json()
+        body = await read_json_body(
+            request, request.app.state.settings.max_json_body_bytes
+        )
+    except UploadTooLargeError:
+        raise OfficialError(413, "Request body exceeds maximum size")
     except json.JSONDecodeError:
         body = {}
     if not isinstance(body, dict):

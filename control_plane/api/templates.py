@@ -24,6 +24,7 @@ from gateway_common.upload import (
     UploadTooLargeError,
     check_content_length,
     limit_bytes_from_mb,
+    read_json_body,
     stream_body_to_file,
 )
 
@@ -68,6 +69,15 @@ def _steps_to_dockerfile(from_image: str | None, steps: list[dict]) -> str:
         else:
             raise ValueError(f"unsupported template step type: {kind}")
     return "\n".join(lines) + "\n"
+
+
+def _check_name_size(settings, name: str) -> None:
+    """E5.3: cap user-supplied template names (UTF-8 bytes)."""
+    if (
+        settings.max_name_bytes > 0
+        and len(name.encode("utf-8")) > settings.max_name_bytes
+    ):
+        raise OfficialError(400, f"name exceeds {settings.max_name_bytes}-byte limit")
 
 
 def _extract_build_context(build_dir: Path) -> Path:
@@ -267,12 +277,17 @@ def _acquire_build_slot(request: Request) -> Any:
 @router.post("/v3/templates", status_code=202, dependencies=[Depends(require_api_key)])
 async def create_template_build(request: Request) -> dict[str, Any]:
     try:
-        body = await request.json()
+        body = await read_json_body(
+            request, request.app.state.settings.max_json_body_bytes
+        )
+    except UploadTooLargeError:
+        raise OfficialError(413, "Request body exceeds maximum size")
     except json.JSONDecodeError:
         raise OfficialError(400, "Invalid JSON body")
     name = (body or {}).get("name") if isinstance(body, dict) else None
     if not name or not isinstance(name, str):
         raise OfficialError(400, "name is required")
+    _check_name_size(request.app.state.settings, name)
     tenant, _is_admin = tenant_of(request)
     record, build = _templates(request).create(name, tenant_id=tenant)
     return {
@@ -400,7 +415,12 @@ async def trigger_template_build(
         raise OfficialError(429, "Template build rate limit exceeded")
     release_slot = _acquire_build_slot(request)
     try:
-        body = await request.json()
+        body = await read_json_body(
+            request, request.app.state.settings.max_json_body_bytes
+        )
+    except UploadTooLargeError:
+        release_slot()
+        raise OfficialError(413, "Request body exceeds maximum size")
     except json.JSONDecodeError:
         release_slot()
         raise OfficialError(400, "Invalid JSON body")

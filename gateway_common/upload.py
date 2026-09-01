@@ -9,8 +9,10 @@ soon as the configured byte limit is crossed.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterable
 from pathlib import Path
+from typing import Any
 
 from fastapi import Request
 
@@ -47,6 +49,26 @@ def check_content_length(request: Request, limit_bytes: int | None) -> None:
     length = declared_content_length(request)
     if length is not None and length > limit_bytes:
         raise UploadTooLargeError(limit_bytes)
+
+
+async def read_json_body(request: Request, limit_bytes: int | None) -> Any:
+    """Read a JSON request body, bounded by ``limit_bytes`` (E5.3).
+
+    Over-limit bodies (declared or actual) raise
+    :class:`UploadTooLargeError` (the caller maps it to 413); malformed JSON
+    raises :class:`json.JSONDecodeError` (the caller maps it to 400).
+    """
+    if limit_bytes is not None:
+        check_content_length(request, limit_bytes)
+    raw = await request.body()
+    if limit_bytes is not None and len(raw) > limit_bytes:
+        raise UploadTooLargeError(limit_bytes)
+    return json.loads(raw)
+
+
+def json_size(value: Any) -> int:
+    """Serialized UTF-8 byte length of a JSON value (compact separators)."""
+    return len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
 
 
 async def stream_body_to_file(

@@ -37,6 +37,11 @@ from gateway_common.network import (
     normalize_network_config,
     normalize_network_update,
 )
+from gateway_common.upload import (
+    UploadTooLargeError,
+    json_size,
+    read_json_body,
+)
 from gateway_common import GATEWAY_ROUTE_INVALIDATE_CHANNEL
 from gateway_common.paths import validate_sandbox_id
 
@@ -74,6 +79,24 @@ def _executor_needs_images(mode: str) -> bool:
         return sandlock.landlock_abi_version() >= 6
     except Exception:
         return False
+
+
+def _check_metadata_envvars_size(settings, metadata: dict, env_vars: dict) -> None:
+    """E5.3: keep sandbox.json bounded (metadata/envVars serialized bytes)."""
+    if settings.max_metadata_bytes > 0:
+        meta_bytes = json_size(metadata)
+        if meta_bytes > settings.max_metadata_bytes:
+            raise OfficialError(
+                413,
+                f"metadata exceeds {settings.max_metadata_bytes}-byte limit",
+            )
+    if settings.max_envvars_bytes > 0:
+        env_bytes = json_size(env_vars)
+        if env_bytes > settings.max_envvars_bytes:
+            raise OfficialError(
+                413,
+                f"envVars exceeds {settings.max_envvars_bytes}-byte limit",
+            )
 
 
 def _release_node_quota(request, node, dims: tuple[int, int, int, int]) -> None:
@@ -369,7 +392,9 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
         if not tenant_limiter.allow(tenant):
             raise OfficialError(429, "Sandbox create rate limit exceeded")
     try:
-        body = await request.json()
+        body = await read_json_body(request, settings.max_json_body_bytes)
+    except UploadTooLargeError:
+        raise OfficialError(413, "Request body exceeds maximum size")
     except json.JSONDecodeError:
         raise OfficialError(400, "Invalid JSON body")
     if not isinstance(body, dict):
@@ -427,6 +452,7 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
     env_vars = body.get("envVars") or (snapshot.env_vars if snapshot else {})
     if not isinstance(metadata, dict) or not isinstance(env_vars, dict):
         raise OfficialError(400, "metadata and envVars must be objects")
+    _check_metadata_envvars_size(settings, metadata, env_vars)
 
     # MCP: only local stdio base servers are supported.
     mcp = body.get("mcp")
@@ -597,11 +623,16 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
 
     secrets = request.app.state.secrets
     try:
+        raw_env_vars = {str(k): str(v) for k, v in env_vars.items()}
         resolved_env = secrets.resolve_env_refs(
-            {str(k): str(v) for k, v in env_vars.items()},
+            raw_env_vars,
             tenant_id=tenant,
             is_admin=is_admin,
         )
+        # Secret expansion replaces a short ``${name}`` ref with the secret
+        # value, which can be much larger than the raw envVars. Re-check the
+        # resolved envVars so sandbox.json stays bounded.
+        _check_metadata_envvars_size(settings, metadata, resolved_env)
     except SecretTenantMismatchError as e:
         _release_node_quota(request, node, dims)
         registry.release_pending(sandbox_id_hdr)
