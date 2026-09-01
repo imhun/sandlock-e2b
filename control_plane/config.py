@@ -93,6 +93,12 @@ class Settings:
     internal_api_key: str = field(
         default_factory=lambda: os.getenv("E2B_INTERNAL_API_KEY", "internal-key")
     )
+    tls_cert_file: str | None = field(
+        default_factory=lambda: os.getenv("E2B_TLS_CERT")
+    )
+    tls_key_file: str | None = field(
+        default_factory=lambda: os.getenv("E2B_TLS_KEY")
+    )
     enable_local_node: bool = field(
         default_factory=lambda: _env_bool("E2B_ENABLE_LOCAL_NODE", True)
     )
@@ -126,6 +132,11 @@ class Settings:
             keys.append(self.api_key)
         return tuple(dict.fromkeys(keys))
 
+    @property
+    def tls_enabled(self) -> bool:
+        """HTTPS is on only when both cert and key are configured."""
+        return bool(self.tls_cert_file and self.tls_key_file)
+
     def resolve_template_image(self, template_id: str) -> str | None:
         """Resolve ``templateID`` to a base image, ``None`` for pure Sandlock."""
         if template_id in self.template_images:
@@ -135,3 +146,18 @@ class Settings:
         if template_id == "base":
             return self.base_image
         return None
+
+
+def uvicorn_ssl_kwargs(settings: Settings) -> dict[str, str]:
+    """uvicorn.run kwargs enabling HTTPS; empty dict keeps plain HTTP.
+
+    Both ``E2B_TLS_CERT`` and ``E2B_TLS_KEY`` must be set together; a
+    half-configured pair is a deployment error, not a silent HTTP fallback.
+    """
+    cert_file = settings.tls_cert_file
+    key_file = settings.tls_key_file
+    if (cert_file is None) != (key_file is None):
+        raise ValueError("E2B_TLS_CERT and E2B_TLS_KEY must be set together")
+    if cert_file is None:
+        return {}
+    return {"ssl_certfile": cert_file, "ssl_keyfile": key_file}

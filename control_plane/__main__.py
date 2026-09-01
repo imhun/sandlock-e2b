@@ -5,7 +5,7 @@ from __future__ import annotations
 import uvicorn
 
 from control_plane.app import create_app
-from control_plane.config import Settings
+from control_plane.config import Settings, uvicorn_ssl_kwargs
 
 
 def main() -> None:
@@ -16,9 +16,9 @@ def main() -> None:
         host="0.0.0.0",
         port=settings.control_plane_port,
         log_level=settings.log_level.lower(),
+        **uvicorn_ssl_kwargs(settings),
     )
 
 
 if __name__ == "__main__":
     main()
-

@@ -139,6 +139,15 @@ def create_gateway(
     )
     routes = RouteCache(ttl=_route_ttl())
 
+    # Merged TLS mode (control_plane.combined_main) uses a self-signed
+    # loopback cert for in-process route lookups; skip verification only for
+    # https loopback URLs so remote https control-plane URLs keep the default
+    # verified transport.
+    control_verify = not (
+        control_url.startswith("https://127.0.0.1")
+        or control_url.startswith("https://localhost")
+    )
+
     app = FastAPI(title="E2B Sandlock Gateway - Envd Router")
     app.state.route_cache = routes
     app.state.route_subscriber = RouteInvalidationSubscriber(
@@ -156,7 +165,7 @@ def create_gateway(
         cached = routes.get(sandbox_id)
         if cached:
             return cached
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, verify=control_verify) as client:
             resp = await client.get(
                 f"{control_url}/internal/routes/{sandbox_id}",
                 headers={"X-Internal-Key": internal_key},

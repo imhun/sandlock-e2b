@@ -26,14 +26,21 @@ import uvicorn
 
 def main() -> None:
     from control_plane.app import create_app
-    from control_plane.config import Settings
+    from control_plane.config import Settings, uvicorn_ssl_kwargs
 
     settings = Settings()
     port = settings.control_plane_port
 
     # Route lookup/invalidation through the merged process itself when unset.
-    os.environ.setdefault("E2B_CONTROL_PLANE_URL", f"http://127.0.0.1:{port}")
-    os.environ.setdefault("E2B_GATEWAY_URL", f"http://127.0.0.1:{port}")
+    # With TLS the loopback is https (self-signed in local deploys; the
+    # gateway skips verification for https loopback URLs only). The control
+    # plane's best-effort gateway invalidation POST may fail TLS verification
+    # on the loopback and is tolerated by design (Redis pub/sub covers it).
+    loopback_scheme = "https" if settings.tls_enabled else "http"
+    os.environ.setdefault(
+        "E2B_CONTROL_PLANE_URL", f"{loopback_scheme}://127.0.0.1:{port}"
+    )
+    os.environ.setdefault("E2B_GATEWAY_URL", f"{loopback_scheme}://127.0.0.1:{port}")
 
     from envd_service.gateway import create_gateway
 
@@ -51,6 +58,7 @@ def main() -> None:
         host="0.0.0.0",
         port=port,
         log_level=settings.log_level.lower(),
+        **uvicorn_ssl_kwargs(settings),
     )
 
 
