@@ -59,6 +59,86 @@ async def test_file_upload_link_then_present(apps):
         assert cached.json() == {"present": True, "url": None}
 
 
+async def test_uploaded_file_token_cleared_and_overwrite_rejected(apps):
+    control, _ = apps
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control), base_url="http://test"
+    ) as client:
+        info = await _create_template(client)
+        template_id = info["templateID"]
+        file_hash = "abc123"
+        first = _tar_bytes("requirements.txt", "requests==2.32.0\n")
+        second = _tar_bytes("requirements.txt", "torch==2.1.0\n")
+
+        link = await client.get(
+            f"/templates/{template_id}/files/{file_hash}",
+            headers={"X-API-Key": "local-key"},
+        )
+        url = link.json()["url"]
+        assert link.json()["present"] is False
+        upload = await client.put(url, content=first)
+        assert upload.status_code == 204
+
+        # The token is cleared: a replayed PUT is rejected and cannot
+        # overwrite the already-cached build context.
+        replay = await client.put(url, content=second)
+        assert replay.status_code == 409
+        assert replay.json() == {"code": 409, "message": "File already uploaded"}
+
+        record = control.state.templates.get(template_id)
+        assert record.is_file_uploaded(file_hash) is True
+        assert file_hash not in record.upload_tokens
+
+        # A fresh link keeps returning "already present" with no new token.
+        cached = await client.get(
+            f"/templates/{template_id}/files/{file_hash}",
+            headers={"X-API-Key": "local-key"},
+        )
+        assert cached.status_code == 201
+        assert cached.json() == {"present": True, "url": None}
+        assert file_hash not in control.state.templates.get(template_id).upload_tokens
+
+        # The cached archive on disk is the first upload, untouched.
+        import tarfile
+
+        archive = (
+            control.state.workspace_base
+            / "_builds"
+            / template_id
+            / "archives"
+            / f"{file_hash}.tar.gz"
+        )
+        with tarfile.open(archive, mode="r:gz") as tar:
+            extracted = tar.extractfile("requirements.txt").read()
+        assert extracted == b"requests==2.32.0\n"
+
+
+async def test_upload_token_per_file_independent(apps):
+    """Each file hash gets its own token; uploading one keeps the others."""
+    control, _ = apps
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control), base_url="http://test"
+    ) as client:
+        info = await _create_template(client)
+        template_id = info["templateID"]
+        hash_a, hash_b = "hash-a", "hash-b"
+        link_a = await client.get(
+            f"/templates/{template_id}/files/{hash_a}",
+            headers={"X-API-Key": "local-key"},
+        )
+        link_b = await client.get(
+            f"/templates/{template_id}/files/{hash_b}",
+            headers={"X-API-Key": "local-key"},
+        )
+        assert link_a.json()["url"] != link_b.json()["url"]
+        assert (await client.put(link_a.json()["url"], content=_tar_bytes())).status_code == 204
+        # hash_a is locked; hash_b's token still works.
+        replay = await client.put(link_a.json()["url"], content=_tar_bytes())
+        assert replay.status_code == 409
+        upload_b = await client.put(link_b.json()["url"], content=_tar_bytes("pkg.txt", "x\n"))
+        assert upload_b.status_code == 204
+
+
 async def test_file_upload_rejects_bad_token(apps):
     control, _ = apps
     async with httpx.AsyncClient(

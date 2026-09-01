@@ -99,7 +99,14 @@ class TemplateRecord:
         return self.files.get(file_hash, False)
 
     def mark_file_uploaded(self, file_hash: str) -> None:
+        """Record an uploaded file and drop its upload token (E3.4).
+
+        Idempotent: clearing a missing token is a no-op, so repeated calls
+        leave the uploaded state intact. The token is gone once the file is
+        uploaded, so a later PUT with the old URL can never overwrite it.
+        """
         self.files[file_hash] = True
+        self.upload_tokens.pop(file_hash, None)
 
     def upload_url_token(self, file_hash: str) -> str:
         """Return (and lazily create) the token guarding the upload URL."""
@@ -194,6 +201,31 @@ class TemplateRegistry:
         if template_id is None:
             raise UnknownTemplateBuildError(name)
         return self.get(template_id)
+
+    def save(self, record: TemplateRecord) -> None:
+        """Persist a mutated record (upload tokens / uploaded state)."""
+        with self._lock:
+            self._templates[record.template_id] = record
+            self._by_name[record.name] = record.template_id
+        self._write_record(record)
+
+    def claim_file_upload(self, template_id: str, file_hash: str) -> bool:
+        """Atomically mark ``file_hash`` uploaded; False when already done.
+
+        Runs under the registry lock so two concurrent PUTs carrying the
+        same token cannot both pass the "already uploaded" check; the loser
+        is rejected with 409 and must discard its archive.
+        """
+        with self._lock:
+            record = self._templates.get(template_id)
+            if record is None:
+                raise UnknownTemplateBuildError(template_id)
+            if record.is_file_uploaded(file_hash):
+                return False
+            record.files[file_hash] = True
+            record.upload_tokens.pop(file_hash, None)
+            self._write_record(record)
+            return True
 
     def list(self, *, tenant_id: str | None = None) -> list[TemplateRecord]:
         with self._lock:

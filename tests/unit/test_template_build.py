@@ -11,6 +11,7 @@ import pytest
 
 from control_plane.api import templates as tmpl
 from control_plane.config import Settings
+from control_plane.registry.templates import TemplateRecord, TemplateRegistry
 
 
 class _FakeStream:
@@ -136,3 +137,34 @@ def test_write_docker_config_skips_without_creds(
     settings = Settings(api_keys=("k",), image_registry="reg.example.com/e2b")
     tmpl._write_docker_config(settings)
     assert not (tmp_path / ".docker" / "config.json").exists()
+
+
+def test_mark_file_uploaded_clears_token_idempotently():
+    record = TemplateRecord(template_id="tpl_x", name="x", image="img")
+    token = record.upload_url_token("h1")
+    assert record.verify_upload_token("h1", token) is True
+
+    record.mark_file_uploaded("h1")
+    assert record.is_file_uploaded("h1") is True
+    assert "h1" not in record.upload_tokens
+    assert record.verify_upload_token("h1", token) is False
+
+    record.mark_file_uploaded("h1")
+    assert record.is_file_uploaded("h1") is True
+    assert "h1" not in record.upload_tokens
+
+
+def test_claim_file_upload_is_atomic_and_persists(workspace):
+    registry = TemplateRegistry(workspace / "templates")
+    record, _ = registry.create("x")
+    record.upload_url_token("h1")
+
+    assert registry.claim_file_upload(record.template_id, "h1") is True
+    assert registry.claim_file_upload(record.template_id, "h1") is False
+
+    loaded = registry.get(record.template_id)
+    assert loaded.is_file_uploaded("h1") is True
+    assert "h1" not in loaded.upload_tokens
+    # Persisted on disk: a fresh registry sees the uploaded state.
+    restarted = TemplateRegistry(workspace / "templates")
+    assert restarted.get(record.template_id).is_file_uploaded("h1") is True

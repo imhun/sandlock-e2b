@@ -250,6 +250,7 @@ async def template_file_upload_link(
     if record.is_file_uploaded(file_hash):
         return {"present": True, "url": None}
     token = record.upload_url_token(file_hash)
+    _templates(request).save(record)
     base = str(request.base_url).rstrip("/")
     url = f"{base}/templates/{template_id}/files/{file_hash}/upload?token={token}"
     return {"present": False, "url": url}
@@ -271,6 +272,11 @@ async def template_file_upload(
         record = _templates(request).get(template_id)
     except UnknownTemplateBuildError:
         raise OfficialError(404, f"Template {template_id} not found")
+    # E3.4: once uploaded, the token is cleared and the file cannot be
+    # overwritten. A replayed PUT (old URL or a stale retry) is rejected
+    # before token verification so the error is unambiguous.
+    if record.is_file_uploaded(file_hash):
+        raise OfficialError(409, "File already uploaded")
     if not record.verify_upload_token(file_hash, token):
         raise OfficialError(401, "Invalid upload token")
     body = await request.body()
@@ -290,7 +296,10 @@ async def template_file_upload(
     except (OSError, tarfile.TarError):
         target.unlink(missing_ok=True)
         raise OfficialError(400, "Uploaded file is not a valid tar archive")
-    record.mark_file_uploaded(file_hash)
+    if not _templates(request).claim_file_upload(template_id, file_hash):
+        # A concurrent upload won the race; discard ours and reject.
+        target.unlink(missing_ok=True)
+        raise OfficialError(409, "File already uploaded")
     return Response(status_code=204)
 
 @router.post(
