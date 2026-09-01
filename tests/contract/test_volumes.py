@@ -152,6 +152,50 @@ async def test_volume_write_over_limit_413_and_preserves_existing(make_apps):
         assert gone.status_code == 404
 
 
+async def test_volume_write_replace_failure_500_cleans_tmp(make_apps):
+    """E4.2 review (Minor): when os.replace fails (target is a directory) the
+    temp file is removed and the error is an explicit 500, not a bare 500."""
+    control, _ = make_apps(
+        control_settings=Settings(api_keys=("local-key",), max_file_write_mb=1)
+    )
+    async with _client(control) as client:
+        created = await client.post(
+            "/volumes", headers={"X-API-Key": "local-key"}, json={"name": "data"}
+        )
+        assert created.status_code == 201
+        vid = created.json()["volumeID"]
+        headers = {"Authorization": f"Bearer {created.json()['token']}"}
+
+        made = await client.post(
+            f"/volumecontent/{vid}/dir",
+            headers=headers,
+            params={"path": "adir"},
+        )
+        assert made.status_code == 201
+
+        response = await client.put(
+            f"/volumecontent/{vid}/file",
+            headers=headers,
+            params={"path": "adir"},
+            content=b"x" * 100,
+        )
+        assert response.status_code == 500
+        assert response.json() == {
+            "code": 500,
+            "message": "Failed to store uploaded file",
+        }
+
+        # The directory is untouched and no temp file is left in the volume.
+        stat = await client.get(
+            f"/volumecontent/{vid}/path", headers=headers, params={"path": "adir"}
+        )
+        assert stat.status_code == 200
+        assert stat.json()["type"] == "directory"
+        volume_path = control.state.volumes.get(vid).path
+        assert volume_path is not None
+        assert list(volume_path.glob(".*.tmp")) == []
+
+
 async def test_volume_bad_token(control_client):
     created = await control_client.post(
         "/volumes", headers={"X-API-Key": "local-key"}, json={"name": "data"}

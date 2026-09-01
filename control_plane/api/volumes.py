@@ -225,6 +225,12 @@ async def volume_write_file(
     except UploadTooLargeError:
         tmp.unlink(missing_ok=True)
         raise OfficialError(413, "File exceeds maximum upload size")
+    except OSError:
+        # E4.2 review (Minor): a failed os.replace (e.g. the target is a
+        # directory) must not leave the temp file behind or surface as an
+        # unhandled 500; mirror templates.py.
+        tmp.unlink(missing_ok=True)
+        raise OfficialError(500, "Failed to store uploaded file")
     return _entry(target, volume.path)
 
 

@@ -132,7 +132,16 @@ async def upload_file(
             _persist_metadata(target, metadata)
             return JSONResponse(content=[_upload_response(ops, target, metadata)])
 
-        form = await request.form()
+        limit = _write_limit(request)
+        try:
+            # E4.2 review (Important): reject an oversized multipart request
+            # from its Content-Length before request.form() consumes the whole
+            # body (Starlette spools parts >1MB to disk), so the limit also
+            # covers the receive phase, not just the per-part write phase.
+            check_content_length(request, limit)
+            form = await request.form()
+        except UploadTooLargeError:
+            raise HttpAuthError(413, "File exceeds maximum upload size")
         files = [item for item in form.multi_items() if item[0] == "file"]
         if not files:
             raise HttpAuthError(400, "no file parts in multipart upload")
@@ -144,7 +153,6 @@ async def upload_file(
                 raise HttpAuthError(400, "file path is required")
             target = _resolve_or_error(ops, file_path)
             target.parent.mkdir(parents=True, exist_ok=True)
-            limit = _write_limit(request)
             tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
             try:
                 await stream_upload_file_to_file(file_obj, tmp, limit)
