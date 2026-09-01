@@ -323,13 +323,20 @@ def _recorded_projids(workspace_base: str | Path) -> set[int]:
     Both the workspace project (``project_id``) and every per-sandbox volume
     project (``volume_projects[].projid``, E2.5) are referenced, so the E2.4
     reconciliation never treats a live volume quota as an orphan.
+
+    Raises :class:`ProjectQuotaError` when ``workspace_base`` is missing or
+    unreadable: reconciliation must never read an unreadable base as "no
+    recorded projects" and wipe live quotas (E2.6 review: fail-closed).
     """
     base = Path(workspace_base)
     recorded: set[int] = set()
     try:
         entries = list(base.iterdir())
-    except OSError:
-        return recorded
+    except OSError as exc:
+        raise ProjectQuotaError(
+            f"reconcile workspace_base missing or unreadable: "
+            f"{base} ({type(exc).__name__})"
+        ) from exc
     for entry in entries:
         record_path = entry / "sandbox.json"
         if not record_path.is_file():

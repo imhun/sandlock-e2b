@@ -348,6 +348,33 @@ def test_reconcile_ignores_malformed_and_none_records(tmp_path, monkeypatch):
     ]
 
 
+def test_reconcile_fail_closed_when_workspace_base_missing(tmp_path, monkeypatch):
+    # A zero-usage projid that would be cleaned if the missing base were read
+    # as "no recorded projects"; the base is missing so reconcile must refuse.
+    calls = _fake_subprocess(
+        monkeypatch,
+        {
+            "report -p": (
+                0,
+                _report(
+                    "#0                  4          0          0    00 [--------]",
+                    "#200                0          0       2048    00 [--------]",
+                ),
+                "",
+            )
+        },
+    )
+    missing = tmp_path / "no-such-workspace"
+    with pytest.raises(ProjectQuotaError) as excinfo:
+        reconcile_orphan_projects(workspace_base=missing, mount_point=MOUNT)
+    assert str(excinfo.value) == (
+        "reconcile workspace_base missing or unreadable: "
+        f"{missing} (FileNotFoundError)"
+    )
+    # Read-only report only: no limit reset ran (fail-closed, nothing wiped).
+    assert calls == [["xfs_quota", "-x", "-c", "report -p", MOUNT]]
+
+
 def test_reconcile_via_agent_dispatches(monkeypatch):
     seen: dict = {}
 

@@ -21,7 +21,10 @@
 #     E2B_QUOTA_AGENT_URL=http://quota-agent:49984
 #     E2B_QUOTA_AGENT_TOKEN=<same token as below>
 # - The agent port must never be exposed publicly; bind it to the internal
-#   network only (this example publishes it container-wide — firewall it).
+#   network only. This example binds it to the host loopback (workers on the
+#   same host reach it via http://127.0.0.1:49984); for remote workers, run
+#   the agent on each host or publish on an internal network explicitly and
+#   firewall it.
 
 services:
   quota-agent:
@@ -38,4 +41,5 @@ services:
       # Adjust to the actual server-side path the agent should manage.
       - /var/lib/e2b-sandboxes:/var/lib/e2b-sandboxes
     ports:
-      - "49984:49984"
+      # Loopback only: never expose the agent port on all host interfaces.
+      - "127.0.0.1:49984:49984"

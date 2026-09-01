@@ -102,6 +102,14 @@ services:
       E2B_NODE_CPU_PERCENT: ${E2B_NODE_CPU_PERCENT:-200}
       E2B_NODE_DISK_MB: ${E2B_NODE_DISK_MB:-4096}
       E2B_NODE_PROCESSES: ${E2B_NODE_PROCESSES:-256}
+      # NFS form (E2.6): route quota operations to the server-side
+      # quota-agent (deploy/compose/docker-compose.quota-agent.yml).
+      # Default false = local direct XFS; unreachable/rejecting agent
+      # degrades with warnings.
+      E2B_QUOTA_VIA_AGENT: ${E2B_QUOTA_VIA_AGENT:-false}
+      E2B_QUOTA_AGENT_URL: ${E2B_QUOTA_AGENT_URL:-}
+      E2B_QUOTA_AGENT_TOKEN: ${E2B_QUOTA_AGENT_TOKEN:-}
+      E2B_QUOTA_AGENT_TIMEOUT_S: ${E2B_QUOTA_AGENT_TIMEOUT_S:-5}
     volumes: &worker-volumes
       - sandbox-shared:/var/lib/e2b-sandboxes
     cap_add:

@@ -258,6 +258,76 @@ async def test_reconcile_delegates_to_local_reconcile(monkeypatch):
     }
 
 
+async def test_reconcile_fail_closed_when_workspace_base_missing_or_unreadable(
+    monkeypatch,
+):
+    """Missing/unreadable workspace_base -> 500 and no quota entry cleaned."""
+
+    def fake_table(mount):
+        return {
+            0: ProjectQuotaUsage(
+                projid=0, used_blocks=4, soft_blocks=0, hard_blocks=0
+            ),
+            7: ProjectQuotaUsage(
+                projid=7, used_blocks=0, soft_blocks=0, hard_blocks=1024
+            ),
+        }
+
+    monkeypatch.setattr(xfs_quota, "project_quota_table", fake_table)
+
+    def fake_cleanup(**kwargs):
+        raise AssertionError(
+            "reconcile must not clean quota entries when workspace_base "
+            "is missing or unreadable"
+        )
+
+    monkeypatch.setattr(xfs_quota, "cleanup_orphan_project", fake_cleanup)
+    app = create_app(settings=Settings(token=KEY))
+    async with _client(app) as client:
+        # Missing workspace_base: iterdir raises FileNotFoundError (OSError).
+        missing = await client.post(
+            "/reconcile",
+            headers={"X-Internal-Key": KEY},
+            json={
+                "workspace_base": "/nonexistent/sandboxes",
+                "mount": "/srv/sandboxes",
+            },
+        )
+    assert missing.status_code == 500
+    assert missing.json() == {
+        "error": "reconcile workspace_base missing or unreadable: "
+        "/nonexistent/sandboxes (FileNotFoundError)"
+    }
+
+    # Unreadable workspace_base: simulate PermissionError on the directory
+    # listing (running as root makes a real chmod-000 dir still readable).
+    class _PermissionDeniedPath:
+        def __init__(self, path):
+            self._path = path
+
+        def iterdir(self):
+            raise PermissionError("permission denied")
+
+        def __str__(self):
+            return str(self._path)
+
+    monkeypatch.setattr(xfs_quota, "Path", _PermissionDeniedPath)
+    async with _client(app) as client:
+        denied = await client.post(
+            "/reconcile",
+            headers={"X-Internal-Key": KEY},
+            json={
+                "workspace_base": "/srv/sandboxes",
+                "mount": "/srv/sandboxes",
+            },
+        )
+    assert denied.status_code == 500
+    assert denied.json() == {
+        "error": "reconcile workspace_base missing or unreadable: "
+        "/srv/sandboxes (PermissionError)"
+    }
+
+
 async def test_path_map_rewrites_client_paths_to_server_paths(monkeypatch):
     seen: dict = {}
 

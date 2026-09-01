@@ -77,7 +77,7 @@ def test_detect_agent_unreachable_raises_quota_error():
     client = _client(handler)
     with pytest.raises(ProjectQuotaError) as excinfo:
         client.detect("/mnt/nfs")
-    assert str(excinfo.value).startswith("quota-agent unreachable: ")
+    assert str(excinfo.value) == "quota-agent unreachable: connection refused"
 
 
 def test_detect_401_raises_auth_error():
