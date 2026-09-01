@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import io
 import json
+import posixpath
 import tarfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,6 +39,24 @@ def _tar_gz(files: dict[str, bytes]) -> bytes:
     return buf.getvalue()
 
 
+def _tar_gz_with_symlinks(
+    files: dict[str, bytes], links: dict[str, str]
+) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+        for name, target in links.items():
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.SYMTYPE
+            info.linkname = target
+            info.size = 0
+            tar.addfile(info)
+    return buf.getvalue()
+
+
 def _manifest_json(layers: list[dict], config_digest: str) -> dict:
     return {
         "schemaVersion": 2,
@@ -63,8 +82,12 @@ class FakeRegistry:
     def host(self) -> str:
         return f"127.0.0.1:{self.server.server_port}"
 
-    def add_layer(self, files: dict[str, bytes]) -> str:
-        data = _tar_gz(files)
+    def add_layer(
+        self, files: dict[str, bytes], links: dict[str, str] | None = None
+    ) -> str:
+        data = (
+            _tar_gz(files) if not links else _tar_gz_with_symlinks(files, links)
+        )
         digest = _sha256(data)
         self.layers[digest] = data
         return digest
@@ -224,6 +247,52 @@ def test_resolve_applies_whiteouts(registry, tmp_path):
     assert not (rootfs / "a.txt").exists()
     assert not (rootfs / "sub" / "x.txt").exists()
     assert (rootfs / "sub" / "y.txt").read_text() == "y"
+
+
+def test_resolve_preserves_absolute_symlinks_as_relative(registry, tmp_path):
+    """Image-rootfs fidelity: absolute symlink targets (e.g. ``/usr/lib/
+    ssl/cert.pem -> /etc/ssl/certs/ca-certificates.crt``) must survive
+    extraction as chroot-safe relative links. tarfile's ``data`` filter
+    drops raw absolute links, which would break Python's default CA path
+    resolution inside the chroot (``ssl.get_default_verify_paths()``)."""
+    config_digest = _sha256(b"{}")
+    l1 = registry.add_layer(
+        {
+            "etc/ssl/certs/ca-certificates.crt": b"CA\n",
+            "usr/bin/sh": b"#!/bin/sh\n",
+        },
+        links={
+            "usr/lib/ssl/cert.pem": "/etc/ssl/certs/ca-certificates.crt",
+            "usr/lib/ssl/certs": "/etc/ssl/certs",
+        },
+    )
+    manifest = _manifest_json(
+        [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "size": 1,
+                "digest": l1,
+            }
+        ],
+        config_digest,
+    )
+    registry.add_manifest("latest", manifest)
+    rootfs = resolve_image_rootfs(f"{registry.host}/test/py:latest", tmp_path)
+
+    cert_link = rootfs / "usr/lib/ssl/cert.pem"
+    assert cert_link.is_symlink()
+    target = cert_link.readlink()
+    assert not posixpath.isabs(target)
+    assert (cert_link.parent / target).resolve() == (
+        rootfs / "etc/ssl/certs/ca-certificates.crt"
+    ).resolve()
+    assert (cert_link.parent / target).read_text() == "CA\n"
+
+    certs_link = rootfs / "usr/lib/ssl/certs"
+    assert certs_link.is_symlink()
+    assert (certs_link.parent / certs_link.readlink()).resolve() == (
+        rootfs / "etc/ssl/certs"
+    ).resolve()
 
 
 def test_resolve_with_bearer_auth_and_redirect(registry, tmp_path):

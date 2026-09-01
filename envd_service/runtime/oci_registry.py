@@ -301,7 +301,10 @@ def extract_layer(layer_bytes: bytes, dest: Path) -> None:
     Whiteout members are applied before the remaining members are extracted:
     ``.wh.<name>`` deletes an entry from a lower layer, ``.wh..wh..opq``
     clears the directory it sits in (opaque). Path traversal and absolute
-    symlink members are rejected.
+    member names are rejected; absolute symlink targets are rewritten to
+    chroot-relative links (the rootfs is consumed inside a chroot, so an
+    absolute target like ``/etc/ssl`` must keep resolving inside it, and
+    the ``data`` extraction filter would otherwise drop the member).
     """
     dest = dest.resolve()
     dest.mkdir(parents=True, exist_ok=True)
@@ -322,6 +325,7 @@ def extract_layer(layer_bytes: bytes, dest: Path) -> None:
             m for m in members if _whiteout_parts(m.name) is None
         ]
         safe_members = [m for m in safe_members if _member_is_safe(m, dest)]
+        _chroot_symlinks(safe_members)
         try:
             tar.extractall(dest, members=safe_members, filter="data")
         except TypeError:  # pragma: no cover - Python < 3.12
@@ -339,9 +343,31 @@ def _member_is_safe(member: tarfile.TarInfo, dest: Path) -> bool:
     name = posixpath.normpath(member.name)
     if name.startswith("/") or ".." in name.split("/"):
         return False
-    if member.issym() and posixpath.isabs(member.linkname):
-        return False
     return True
+
+
+def _chroot_symlinks(members: Iterable[tarfile.TarInfo]) -> None:
+    """Rewrite absolute symlink targets to chroot-safe relative targets.
+
+    Images ship links such as ``/usr/lib/ssl/cert.pem -> /etc/ssl/certs/
+    ca-certificates.crt``. The extracted tree is used as a chroot root, so
+    the absolute target must resolve inside the tree; tarfile's ``data``
+    filter rejects absolute links outright, and a raw absolute link would
+    also escape the rootfs when the tree is read from the host. Converting
+    to a relative link keeps the in-chroot semantics identical and the
+    link inside the rootfs from the host side too.
+    """
+    for member in members:
+        if not (member.issym() and posixpath.isabs(member.linkname)):
+            continue
+        target = posixpath.normpath(member.linkname)
+        link_dir = posixpath.dirname(posixpath.normpath(member.name)) or "."
+        # Relate the target to the chroot root (where the member lives),
+        # not to the host cwd: ``posixpath.relpath`` with a relative start
+        # would anchor at cwd and produce an escaping ``../../..`` chain.
+        member.linkname = posixpath.relpath(
+            target, posixpath.normpath(posixpath.join("/", link_dir))
+        )
 
 
 def _extractall_compat(
