@@ -442,8 +442,14 @@ class SandlockExecutor(Executor):
                 "per-sandbox uid enabled but sandbox has no allocated "
                 "host_uid (worker uid pool did not provision it)"
             )
-        # Legacy default: all sandboxes share host uid 1000 (root worker).
-        return 1000, 1000
+        # Legacy default: all sandboxes share host uid 1000. Only a root
+        # worker can map that uid; a non-root worker would be rejected by
+        # S1.2's fail-closed RunAs check (single-entry userns maps only the
+        # caller's own identity), so it falls back to the worker identity —
+        # fixed uid + Landlock, the E5.1 model — instead of hardcoding 1000.
+        if os.geteuid() == 0:
+            return 1000, 1000
+        return os.geteuid(), os.getegid()
 
     def _mint_iam_jwt(self, audience: str) -> str:
         """Mint a JWT-SVID for a registered workload identity.

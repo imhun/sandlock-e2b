@@ -17,6 +17,20 @@ orphan uids — pool-range uids that own a workspace directory with no
 persist) — reclaims them and chowns the stale directories away from the pool
 so a later allocation cannot inherit foreign files.
 
+Cross-process safety (I1): ``acquire`` briefly takes an exclusive ``flock``
+on the shared state file ``<workspace_base>/.uid_pool.lock`` while it
+recomputes the free set and atomically writes a reservation marker
+(``<workspace_base>/.uid_reservations/<sandbox_id>``). The marker makes the
+reservation visible to every other worker sharing the workspace from the
+moment the uid is handed out — the acquire→register window (volume
+provisioning, recursive chown) can be long, so waiting for the record would
+leave a collision window. The caller persists the ``sandbox.json`` record and
+calls :meth:`UidPool.commit` to drop the marker, or abandons the allocation
+via :meth:`UidPool.release` (failed create / delete), which drops the marker
+and frees the uid. ``flock`` serializes the compute+marker-write critical
+section across processes; the marker keeps the picked uid out of every other
+worker's view until the record is durable.
+
 Independent per-sandbox uids require a privileged (root) supervisor: a
 non-root supervisor cannot map an arbitrary host uid (S1.2 fail-closed
 contract), so allocation / ownership changes only happen when the worker
@@ -33,9 +47,17 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import fcntl
+
 from gateway_common.paths import validate_sandbox_id
 
 logger = logging.getLogger(__name__)
+
+#: Directory (under ``workspace_base``) holding transient cross-process
+#: reservation markers written by ``acquire`` and removed by ``commit`` /
+#: ``release``. A marker file is named after the sandbox id and contains the
+#: reserved uid as decimal text.
+_RESERVATION_DIR = ".uid_reservations"
 
 
 class UidPoolError(RuntimeError):
@@ -85,6 +107,15 @@ def _recorded_uids(
     return used
 
 
+def _read_uid_marker(marker: Path) -> int | None:
+    """The uid stored in a reservation marker, or None when malformed."""
+    try:
+        uid = int(marker.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    return uid if uid > 0 else None
+
+
 def _chown_tree(path: Path, uid: int, gid: int) -> None:
     """Recursively chown ``path`` (symlinks themselves, never their targets)."""
     os.lchown(path, uid, gid)
@@ -113,11 +144,15 @@ def apply_sandbox_ownership(workspace_dir: str | Path, host_uid: int) -> None:
 class UidPool:
     """Host uid allocation for sandboxes on one worker.
 
-    The pool is advisory across processes: allocation recomputes the used set
-    from ``sandbox.json`` records on disk, so a separate-process worker
-    sharing the workspace never collides with records persisted by another
-    process. Deployments that share one workspace between multiple workers
-    must configure disjoint ``E2B_UID_POOL_START`` ranges per worker.
+    Correct across processes: allocation recomputes the used set from
+    ``sandbox.json`` records **and** reservation markers on disk under a
+    cross-process ``flock``, so a separate-process worker sharing the
+    workspace never collides with an allocation another worker handed out
+    but has not persisted yet. ``acquire`` holds the reservation marker until
+    the caller persists the record (:meth:`commit`) or abandons the
+    allocation (:meth:`release`). Deployments that share one workspace
+    between multiple workers should still use disjoint ``E2B_UID_POOL_START``
+    ranges for the other shared state (quota tables, reconcile scans).
     """
 
     def __init__(
@@ -146,6 +181,126 @@ class UidPool:
     def size(self) -> int:
         return self._size
 
+    @property
+    def lock_path(self) -> Path:
+        """Cross-process serialization point for the free-set computation."""
+        return self._workspace_base / ".uid_pool.lock"
+
+    def _open_reservation_lock(self) -> int:
+        """Open and exclusively flock the shared state file.
+
+        Blocks until any other worker's free-set recompute + marker write
+        critical section finishes. The kernel drops the lock if the holder
+        dies, so a crashed create cannot wedge the pool.
+        """
+        self._workspace_base.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    @staticmethod
+    def _close_reservation_lock(fd: int) -> None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _marker_path(self, sandbox_id: str) -> Path:
+        return self._workspace_base / _RESERVATION_DIR / sandbox_id
+
+    def _write_reservation(self, sandbox_id: str, uid: int) -> None:
+        """Atomically persist the reservation marker (under the flock)."""
+        marker = self._marker_path(sandbox_id)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker.parent / f".{sandbox_id}.tmp"
+        tmp.write_text(f"{uid}\n", encoding="utf-8")
+        os.replace(tmp, marker)
+
+    def _remove_reservation(self, sandbox_id: str) -> None:
+        marker = self._marker_path(sandbox_id)
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _clear_reservations(self) -> None:
+        """Drop every reservation marker (startup reconcile only).
+
+        At a clean startup no create is in flight, so every marker is either a
+        stale duplicate of a durable record (harmless) or the leftover of a
+        create that crashed between ``acquire`` and ``register`` — the same
+        class of orphan the reconcile scan reclaims. Reconcile is a
+        startup-only scan; the multi-worker concurrent-startup caveat is the
+        documented one for orphan reclaim (report §5 / Concerns §3).
+        """
+        marker_dir = self._workspace_base / _RESERVATION_DIR
+        if not marker_dir.is_dir():
+            return
+        try:
+            entries = list(marker_dir.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                if entry.is_file():
+                    entry.unlink()
+            except OSError:
+                continue
+
+    def _reserved_uids(self) -> set[int]:
+        """Pool-range uids held by reservation markers (cross-process)."""
+        marker_dir = self._workspace_base / _RESERVATION_DIR
+        reserved: set[int] = set()
+        if not marker_dir.is_dir():
+            return reserved
+        try:
+            entries = list(marker_dir.iterdir())
+        except OSError:
+            return reserved
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            uid = _read_uid_marker(entry)
+            if (
+                uid is not None
+                and self._start <= uid < self._start + self._size
+            ):
+                reserved.add(uid)
+        return reserved
+
+    def _scan_records(self) -> tuple[set[int], dict[str, int]]:
+        """Pool-range uids referenced by records, plus the sandbox→uid map.
+
+        The reverse map is what lets :meth:`release` free a pre-restart
+        sandbox's uid after :meth:`reconcile` rebuilt the in-memory state
+        from disk (I2): without it, deleting such a sandbox leaks its uid in
+        ``_allocated`` until the next restart.
+        """
+        referenced: set[int] = set()
+        by_sandbox: dict[str, int] = {}
+        base = self._workspace_base
+        if not base.is_dir():
+            return referenced, by_sandbox
+        try:
+            entries = list(base.iterdir())
+        except OSError:
+            return referenced, by_sandbox
+        for entry in entries:
+            if not entry.is_dir() or not validate_sandbox_id(entry.name):
+                continue
+            uid = _recorded_uid(base, entry.name)
+            if (
+                uid is not None
+                and self._start <= uid < self._start + self._size
+            ):
+                referenced.add(uid)
+                by_sandbox[entry.name] = uid
+        return referenced, by_sandbox
+
     def acquire(
         self, sandbox_id: str, *, preferred: int | None = None
     ) -> int:
@@ -153,47 +308,84 @@ class UidPool:
 
         ``preferred`` (e.g. the uid already persisted for a re-provisioned /
         migrated sandbox) wins when it lies inside the pool range; otherwise
-        the lowest free uid is picked. Records on disk count as allocated, so
-        a uid is never reused while any sandbox record references it.
+        the lowest free uid is picked. Records on disk and reservation
+        markers count as allocated, so a uid is never reused while any other
+        sandbox record *or in-flight allocation* references it. The caller
+        must persist the record and call :meth:`commit`, or abandon the
+        allocation via :meth:`release`, to drop the reservation marker.
         """
         if not validate_sandbox_id(sandbox_id):
             raise UidPoolError(f"invalid sandbox id: {sandbox_id!r}")
         with self._lock:
-            recorded = _recorded_uid(self._workspace_base, sandbox_id)
-            if (
-                recorded is not None
-                and self._start <= recorded < self._start + self._size
-            ):
-                self._allocated.add(recorded)
-                self._by_sandbox[sandbox_id] = recorded
-                return recorded
-            if (
-                preferred is not None
-                and self._start <= preferred < self._start + self._size
-                and preferred not in self._allocated
-            ):
-                self._allocated.add(preferred)
-                self._by_sandbox[sandbox_id] = preferred
-                return preferred
-            used = _recorded_uids(
-                self._workspace_base, self._start, self._size
-            )
-            used.update(self._allocated)
-            for uid in range(self._start, self._start + self._size):
-                if uid not in used:
-                    self._allocated.add(uid)
-                    self._by_sandbox[sandbox_id] = uid
-                    return uid
-            raise UidPoolError(
-                f"uid pool exhausted "
-                f"({self._start}..{self._start + self._size - 1})"
-            )
+            fd = self._open_reservation_lock()
+            try:
+                recorded = _recorded_uid(self._workspace_base, sandbox_id)
+                if (
+                    recorded is not None
+                    and self._start <= recorded < self._start + self._size
+                ):
+                    uid = recorded
+                else:
+                    used = _recorded_uids(
+                        self._workspace_base, self._start, self._size
+                    )
+                    used.update(self._allocated)
+                    used.update(self._reserved_uids())
+                    if (
+                        preferred is not None
+                        and self._start <= preferred
+                        < self._start + self._size
+                        and preferred not in used
+                    ):
+                        uid = preferred
+                    else:
+                        uid = None
+                        for candidate in range(
+                            self._start, self._start + self._size
+                        ):
+                            if candidate not in used:
+                                uid = candidate
+                                break
+                        if uid is None:
+                            raise UidPoolError(
+                                f"uid pool exhausted "
+                                f"({self._start}.."
+                                f"{self._start + self._size - 1})"
+                            )
+                self._write_reservation(sandbox_id, uid)
+                self._allocated.add(uid)
+                self._by_sandbox[sandbox_id] = uid
+                return uid
+            finally:
+                self._close_reservation_lock(fd)
 
-    def release(self, sandbox_id: str) -> None:
-        """Return the sandbox's uid to the pool (idempotent)."""
+    def commit(self, sandbox_id: str) -> None:
+        """Drop the reservation marker once the record is durable.
+
+        Call after the ``sandbox.json`` record referencing the uid has been
+        persisted: the record now pins the uid for every worker, so the
+        transient marker is no longer needed. If the record is not on disk
+        (persist failed), the marker is kept so another worker cannot reuse
+        the uid — fail-safe. Idempotent.
+        """
         if not validate_sandbox_id(sandbox_id):
             return
         with self._lock:
+            if _recorded_uid(self._workspace_base, sandbox_id) is None:
+                return
+            self._remove_reservation(sandbox_id)
+
+    def release(self, sandbox_id: str) -> None:
+        """Return the sandbox's uid to the pool (idempotent).
+
+        Also abandons a still-held reservation marker (failed create path),
+        so a uid picked by a create that never persisted a record is free
+        again instead of leaking a pool slot.
+        """
+        if not validate_sandbox_id(sandbox_id):
+            return
+        with self._lock:
+            self._remove_reservation(sandbox_id)
             uid = self._by_sandbox.pop(sandbox_id, None)
             if uid is not None:
                 self._allocated.discard(uid)
@@ -213,78 +405,88 @@ class UidPool:
         directory is chowned away from the pool to the worker identity so a
         later allocation never inherits foreign files. Directories are never
         deleted. Uids referenced by records — and directories owned by uids
-        outside the pool — are never touched.
+        outside the pool — are never touched. Reservation markers (in-flight
+        allocations that never became durable) are dropped, and the
+        sandbox→uid reverse map is rebuilt from disk records so deleting a
+        pre-restart sandbox releases its uid (I2).
 
         Returns ``{"referenced", "reclaimed", "cleaned", "skipped"}``.
         """
         with self._lock:
-            referenced = _recorded_uids(
-                self._workspace_base, self._start, self._size
-            )
-            self._allocated = set(referenced)
-            self._by_sandbox = {}
-            pool = _pool_range(self._start, self._size)
-            cleaned: list[dict[str, Any]] = []
-            skipped: list[dict[str, Any]] = []
-            reclaimed: set[int] = set()
-            base = self._workspace_base
-            if not base.is_dir():
-                return {
-                    "referenced": sorted(referenced),
-                    "reclaimed": [],
-                    "cleaned": [],
-                    "skipped": [],
-                }
+            fd = self._open_reservation_lock()
             try:
-                entries = list(base.iterdir())
-            except OSError as exc:
-                logger.warning(
-                    "uid reconcile cannot scan %s: %s", base, exc
-                )
-                return {
-                    "referenced": sorted(referenced),
-                    "reclaimed": [],
-                    "cleaned": [],
-                    "skipped": [{"reason": f"scan failed: {exc}"}],
-                }
-            for entry in entries:
-                if not entry.is_dir() or not validate_sandbox_id(entry.name):
-                    continue
-                if (entry / "sandbox.json").is_file():
-                    continue
-                try:
-                    st = entry.stat()
-                except OSError:
-                    continue
-                if st.st_uid not in pool or st.st_uid in referenced:
-                    continue
-                reclaimed.add(st.st_uid)
-                try:
-                    _chown_tree(entry, os.geteuid(), os.getegid())
-                except OSError as exc:
-                    skipped.append(
-                        {
-                            "uid": st.st_uid,
-                            "path": str(entry),
-                            "reason": str(exc),
-                        }
-                    )
-                    logger.warning(
-                        "orphan uid %s cleanup failed for %s: %s",
-                        st.st_uid,
-                        entry,
-                        exc,
-                    )
-                    continue
-                cleaned.append({"uid": st.st_uid, "path": str(entry)})
-                logger.info(
-                    "cleaned orphan uid %s (stale workspace %s)",
-                    st.st_uid,
-                    entry,
-                )
+                return self._reconcile_locked()
+            finally:
+                self._close_reservation_lock(fd)
+
+    def _reconcile_locked(self) -> dict[str, Any]:
+        """Reconcile body; caller holds ``self._lock`` and the flock."""
+        referenced, by_sandbox = self._scan_records()
+        self._allocated = set(referenced)
+        self._by_sandbox = by_sandbox
+        self._clear_reservations()
+        pool = _pool_range(self._start, self._size)
+        cleaned: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        reclaimed: set[int] = set()
+        base = self._workspace_base
+        if not base.is_dir():
             return {
                 "referenced": sorted(referenced),
-                "reclaimed": sorted(reclaimed),
-                "cleaned": cleaned,
-                "skipped": skipped,
+                "reclaimed": [],
+                "cleaned": [],
+                "skipped": [],
             }
+        try:
+            entries = list(base.iterdir())
+        except OSError as exc:
+            logger.warning(
+                "uid reconcile cannot scan %s: %s", base, exc
+            )
+            return {
+                "referenced": sorted(referenced),
+                "reclaimed": [],
+                "cleaned": [],
+                "skipped": [{"reason": f"scan failed: {exc}"}],
+            }
+        for entry in entries:
+            if not entry.is_dir() or not validate_sandbox_id(entry.name):
+                continue
+            if (entry / "sandbox.json").is_file():
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            if st.st_uid not in pool or st.st_uid in referenced:
+                continue
+            reclaimed.add(st.st_uid)
+            try:
+                _chown_tree(entry, os.geteuid(), os.getegid())
+            except OSError as exc:
+                skipped.append(
+                    {
+                        "uid": st.st_uid,
+                        "path": str(entry),
+                        "reason": str(exc),
+                    }
+                )
+                logger.warning(
+                    "orphan uid %s cleanup failed for %s: %s",
+                    st.st_uid,
+                    entry,
+                    exc,
+                )
+                continue
+            cleaned.append({"uid": st.st_uid, "path": str(entry)})
+            logger.info(
+                "cleaned orphan uid %s (stale workspace %s)",
+                st.st_uid,
+                entry,
+            )
+        return {
+            "referenced": sorted(referenced),
+            "reclaimed": sorted(reclaimed),
+            "cleaned": cleaned,
+            "skipped": skipped,
+        }

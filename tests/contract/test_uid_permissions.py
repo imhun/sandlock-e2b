@@ -245,3 +245,91 @@ async def test_agent_uid_lifecycle_and_orphan_reconcile(make_apps, workspace):
         second_record = registry.get(second_id)
         assert second_record is not None
         assert second_record.host_uid == POOL_START
+
+
+async def test_agent_create_failure_releases_uid(make_apps, workspace):
+    """I3 (agent path): a create that fails between acquire and register
+    (invalid volumeMounts -> 400) must return the reserved uid to the pool
+    instead of leaking a slot on every bad request."""
+    control, envd = make_apps(envd_settings=_envd_settings(workspace))
+    registry = envd.state.runtime_registry
+    pool = registry.uid_pool
+    assert pool is not None
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=envd), base_url="http://test"
+    ) as client:
+        failed_id = f"sbx_{uuid.uuid4().hex[:12]}"
+        failed = await client.post(
+            "/agent/sandboxes",
+            headers={"X-Internal-Key": "internal-key"},
+            json={
+                "sandboxID": failed_id,
+                "accessToken": "token",
+                # Missing hostPath/path: build_volume_mounts rejects it after
+                # the uid was already reserved.
+                "volumeMounts": [{"name": "vol_1"}],
+            },
+        )
+        assert failed.status_code == 400
+        assert failed.text == "volumeMounts need hostPath and path"
+        # The failed create must not leak a pool slot: the next successful
+        # create gets the lowest uid again.
+        ok_id = f"sbx_{uuid.uuid4().hex[:12]}"
+        ok = await client.post(
+            "/agent/sandboxes",
+            headers={"X-Internal-Key": "internal-key"},
+            json={"sandboxID": ok_id, "accessToken": "token"},
+        )
+        assert ok.status_code == 201
+        record = registry.get(ok_id)
+        assert record is not None
+        assert record.host_uid == POOL_START
+
+
+async def test_local_create_failure_releases_uid(make_apps, workspace):
+    """I3 (local control-plane path): a provisioning failure after acquire
+    (mount path already exists -> 400) returns the reserved uid to the pool
+    instead of leaking a slot."""
+    control, envd = make_apps(envd_settings=_envd_settings(workspace))
+    pool = envd.state.runtime_registry.uid_pool
+    assert pool is not None
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/volumes",
+            headers={"X-API-Key": "local-key"},
+            json={"name": "shared"},
+        )
+        assert created.status_code == 201
+        vid = created.json()["volumeID"]
+        # Every fresh sandbox workspace contains a real "workspace" directory,
+        # so mounting onto it fails inside build_volume_mounts after the uid
+        # was allocated.
+        bad = await client.post(
+            "/sandboxes",
+            headers={"X-API-Key": "local-key"},
+            json={
+                "templateID": "base",
+                "timeout": 300,
+                "volumeMounts": [{"name": vid, "path": "workspace"}],
+            },
+        )
+        assert bad.status_code == 400
+        assert bad.json() == {
+            "code": 400,
+            "message": "Mount path workspace already exists",
+        }
+        # The failed create must not leak a pool slot: the next successful
+        # create gets the lowest uid again.
+        ok = await client.post(
+            "/sandboxes",
+            headers={"X-API-Key": "local-key"},
+            json={"templateID": "base", "timeout": 300},
+        )
+        assert ok.status_code == 201
+        record = envd.state.runtime_registry.get(ok.json()["sandboxID"])
+        assert record is not None
+        assert record.host_uid == POOL_START

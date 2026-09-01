@@ -700,61 +700,72 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
             preferred=existing.host_uid if existing is not None else None,
         )
     try:
-        from envd_service.volumes import build_volume_mounts
-    except ImportError:  # pragma: no cover - separated control plane
-        raise OfficialError(500, "local node requires the envd service")
-    mount_inputs = []
-    for mount in volume_mounts:
-        volume = request.app.state.volumes.get(mount["name"])
-        mount_inputs.append(
-            {
-                "name": mount["name"],
-                "path": mount["path"].lstrip("/"),
-                "hostPath": str(volume.path),
-                "perSandboxQuotaMb": volume.per_sandbox_quota_mb,
-            }
-        )
-    try:
-        mount_paths, volume_projects = build_volume_mounts(
-            sandbox_id=record.sandbox_id,
-            volume_mounts=mount_inputs,
-            shared_volume_root=settings.shared_volume_root,
-            workspace_dir=workspace_dir,
-            fallback_mount_point=settings.workspace_base,
-            via_agent=False,
-            existing_volume_projects=(
-                existing.volume_projects if existing is not None else []
-            ),
-            host_uid=host_uid,
-        )
-    except ValueError as e:
-        raise OfficialError(400, str(e))
-    if host_uid is not None:
-        from envd_service.uid_pool import apply_sandbox_ownership
+        try:
+            from envd_service.volumes import build_volume_mounts
+        except ImportError:  # pragma: no cover - separated control plane
+            raise OfficialError(500, "local node requires the envd service")
+        mount_inputs = []
+        for mount in volume_mounts:
+            volume = request.app.state.volumes.get(mount["name"])
+            mount_inputs.append(
+                {
+                    "name": mount["name"],
+                    "path": mount["path"].lstrip("/"),
+                    "hostPath": str(volume.path),
+                    "perSandboxQuotaMb": volume.per_sandbox_quota_mb,
+                }
+            )
+        try:
+            mount_paths, volume_projects = build_volume_mounts(
+                sandbox_id=record.sandbox_id,
+                volume_mounts=mount_inputs,
+                shared_volume_root=settings.shared_volume_root,
+                workspace_dir=workspace_dir,
+                fallback_mount_point=settings.workspace_base,
+                via_agent=False,
+                existing_volume_projects=(
+                    existing.volume_projects if existing is not None else []
+                ),
+                host_uid=host_uid,
+            )
+        except ValueError as e:
+            raise OfficialError(400, str(e))
+        if host_uid is not None:
+            from envd_service.uid_pool import apply_sandbox_ownership
 
-        apply_sandbox_ownership(workspace_dir, host_uid)
-    request.app.state.runtime_registry.register(
-        sandbox_id=record.sandbox_id,
-        access_token=record.envd_access_token,
-        workspace_dir=str(workspace_dir),
-        env_vars=record.env_vars,
-        base_image=record.base_image,
-        host_uid=host_uid,
-        memory_mb=record.memory_mb,
-        cpu_percent=record.cpu_count * 100,
-        disk_mb=record.disk_size_mb,
-        max_processes=record.max_processes,
-        allow_internet_access=record.allow_internet_access,
-        max_command_timeout=settings.max_command_timeout,
-        volume_mounts=mount_paths,
-        mcp=record.mcp,
-        network=record.network,
-        iam_tokens=record.iam_tokens,
-        allow_public_traffic=bool(
-            (record.network or {}).get("allowPublicTraffic", False)
-        ),
-        volume_projects=volume_projects,
-    )
+            apply_sandbox_ownership(workspace_dir, host_uid)
+        request.app.state.runtime_registry.register(
+            sandbox_id=record.sandbox_id,
+            access_token=record.envd_access_token,
+            workspace_dir=str(workspace_dir),
+            env_vars=record.env_vars,
+            base_image=record.base_image,
+            host_uid=host_uid,
+            memory_mb=record.memory_mb,
+            cpu_percent=record.cpu_count * 100,
+            disk_mb=record.disk_size_mb,
+            max_processes=record.max_processes,
+            allow_internet_access=record.allow_internet_access,
+            max_command_timeout=settings.max_command_timeout,
+            volume_mounts=mount_paths,
+            mcp=record.mcp,
+            network=record.network,
+            iam_tokens=record.iam_tokens,
+            allow_public_traffic=bool(
+                (record.network or {}).get("allowPublicTraffic", False)
+            ),
+            volume_projects=volume_projects,
+        )
+    except BaseException:
+        # I3: a provisioning failure after acquire (invalid mount config,
+        # ownership/quota errors, register failure) must return the reserved
+        # uid to the pool instead of leaking a slot.
+        if host_uid is not None and pool is not None:
+            pool.release(record.sandbox_id)
+        raise
+    # I1: the record is durable — drop the cross-process reservation marker.
+    if host_uid is not None and pool is not None:
+        pool.commit(record.sandbox_id)
 
 
 async def _provision_remote(

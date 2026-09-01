@@ -239,69 +239,94 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
             sandbox_id,
             preferred=existing.host_uid if existing is not None else None,
         )
-    mount_paths, volume_projects = build_volume_mounts(
-        sandbox_id=sandbox_id,
-        volume_mounts=volume_mounts,
-        shared_volume_root=settings.shared_volume_root,
-        workspace_dir=workspace_dir,
-        fallback_mount_point=settings.workspace_base,
-        via_agent=settings.quota_via_agent,
-        existing_volume_projects=(
-            existing.volume_projects if existing is not None else []
-        ),
-        host_uid=host_uid,
-    )
-    disk_mb = int(payload.get("diskMB", settings.default_disk_mb))
-    project_id = None
-    if existing is not None:
-        project_id = existing.project_id
-    if xfs_project_supported(workspace_base, via_agent=settings.quota_via_agent)[0]:
-        try:
-            project_id = provision_project(
-                sandbox_id=sandbox_id,
-                project_dir=workspace_dir,
-                mount_point=workspace_base,
-                disk_mb=disk_mb,
-                via_agent=settings.quota_via_agent,
-                project_id=project_id,
-            )
-        except ProjectQuotaError as exc:
-            logger.warning(
-                "XFS project quota setup failed for %s: %s", sandbox_id, exc
-            )
-            # A failed provision may have cleared the project state
-            # (project -C after a half-created setup), so the sandbox must
-            # not keep a stale projid: persisting it would claim quota is
-            # active while the files no longer belong to any project, and
-            # delete would only leave an orphan quota table entry.
-            project_id = None
-    if host_uid is not None:
-        apply_sandbox_ownership(workspace_dir, host_uid)
-    runtime_registry.register(
-        sandbox_id=sandbox_id,
-        access_token=payload.get("accessToken", ""),
-        workspace_dir=str(workspace_dir),
-        env_vars=dict(payload.get("envVars") or {}),
-        base_image=payload.get("baseImage"),
-        host_uid=host_uid,
-        memory_mb=int(payload.get("memoryMB", settings.default_memory_mb)),
-        cpu_percent=int(payload.get("cpuPercent", settings.default_cpu_percent)),
-        disk_mb=disk_mb,
-        project_id=project_id,
-        max_processes=int(
-            payload.get("maxProcesses", settings.default_max_processes)
-        ),
-        allow_internet_access=bool(payload.get("allowInternetAccess", False)),
-        max_command_timeout=int(
-            payload.get("maxCommandTimeout", 3600)
-        ),
-        mcp=payload.get("mcp"),
-        network=payload.get("network"),
-        allow_public_traffic=bool(payload.get("allowPublicTraffic", False)),
-        volume_mounts=mount_paths,
-        volume_projects=volume_projects,
-        iam_tokens=payload.get("iamTokens"),
-    )
+    try:
+        mount_paths, volume_projects = build_volume_mounts(
+            sandbox_id=sandbox_id,
+            volume_mounts=volume_mounts,
+            shared_volume_root=settings.shared_volume_root,
+            workspace_dir=workspace_dir,
+            fallback_mount_point=settings.workspace_base,
+            via_agent=settings.quota_via_agent,
+            existing_volume_projects=(
+                existing.volume_projects if existing is not None else []
+            ),
+            host_uid=host_uid,
+        )
+        disk_mb = int(payload.get("diskMB", settings.default_disk_mb))
+        project_id = None
+        if existing is not None:
+            project_id = existing.project_id
+        if xfs_project_supported(
+            workspace_base, via_agent=settings.quota_via_agent
+        )[0]:
+            try:
+                project_id = provision_project(
+                    sandbox_id=sandbox_id,
+                    project_dir=workspace_dir,
+                    mount_point=workspace_base,
+                    disk_mb=disk_mb,
+                    via_agent=settings.quota_via_agent,
+                    project_id=project_id,
+                )
+            except ProjectQuotaError as exc:
+                logger.warning(
+                    "XFS project quota setup failed for %s: %s",
+                    sandbox_id,
+                    exc,
+                )
+                # A failed provision may have cleared the project state
+                # (project -C after a half-created setup), so the sandbox
+                # must not keep a stale projid: persisting it would claim
+                # quota is active while the files no longer belong to any
+                # project, and delete would only leave an orphan quota table
+                # entry.
+                project_id = None
+        if host_uid is not None:
+            apply_sandbox_ownership(workspace_dir, host_uid)
+        runtime_registry.register(
+            sandbox_id=sandbox_id,
+            access_token=payload.get("accessToken", ""),
+            workspace_dir=str(workspace_dir),
+            env_vars=dict(payload.get("envVars") or {}),
+            base_image=payload.get("baseImage"),
+            host_uid=host_uid,
+            memory_mb=int(
+                payload.get("memoryMB", settings.default_memory_mb)
+            ),
+            cpu_percent=int(
+                payload.get("cpuPercent", settings.default_cpu_percent)
+            ),
+            disk_mb=disk_mb,
+            project_id=project_id,
+            max_processes=int(
+                payload.get("maxProcesses", settings.default_max_processes)
+            ),
+            allow_internet_access=bool(
+                payload.get("allowInternetAccess", False)
+            ),
+            max_command_timeout=int(
+                payload.get("maxCommandTimeout", 3600)
+            ),
+            mcp=payload.get("mcp"),
+            network=payload.get("network"),
+            allow_public_traffic=bool(
+                payload.get("allowPublicTraffic", False)
+            ),
+            volume_mounts=mount_paths,
+            volume_projects=volume_projects,
+            iam_tokens=payload.get("iamTokens"),
+        )
+    except BaseException:
+        # I3: any failure between acquire and register (invalid volume
+        # mounts -> 400, quota/ownership errors -> 500) must return the
+        # reserved uid to the pool instead of leaking a slot.
+        if host_uid is not None and pool is not None:
+            pool.release(sandbox_id)
+        raise
+    # I1: the record is durable — drop the cross-process reservation marker
+    # so other workers can reuse the free set without seeing a stale hold.
+    if host_uid is not None and pool is not None:
+        pool.commit(sandbox_id)
 
 
 @router.post("/agent/sandboxes", status_code=201)
