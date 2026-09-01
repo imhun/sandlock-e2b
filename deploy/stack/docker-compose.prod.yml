@@ -39,6 +39,9 @@ services:
       E2B_API_KEYS: ${E2B_API_KEYS}
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY}
       E2B_INTERNAL_API_KEYS: ${E2B_INTERNAL_API_KEYS:-}
+      # Secret at-rest encryption + Redis persistence (E5.4).
+      E2B_SECRET_MASTER_KEY: ${E2B_SECRET_MASTER_KEY:-}
+      E2B_SECRET_MASTER_KEYS: ${E2B_SECRET_MASTER_KEYS:-}
       # The embedded gateway resolves routes through the control plane API
       # and receives invalidation pushes; both hops stay in this container.
       E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}

@@ -160,7 +160,10 @@ def create_app(
         token_ttl_seconds=settings.volume_token_ttl_s,
     )
     app.state.secrets = secrets_registry or SecretRegistry(
-        (workspace_base or settings.workspace_base) / "_secrets"
+        (workspace_base or settings.workspace_base) / "_secrets",
+        redis_client=redis_client,
+        master_key=settings.secret_master_key,
+        legacy_master_keys=settings.secret_master_keys,
     )
     app.state.snapshots = snapshots_registry or SnapshotRegistry(
         (workspace_base or settings.workspace_base)

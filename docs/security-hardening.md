@@ -176,8 +176,15 @@ CPU/磁盘）。恶意 key 可并发构建轰炸（`/sandboxes` 已限流，模�
 ## 7. secret 明文驻留与凭据落盘（低）
 
 - `SecretRegistry` value 明文存控制面内存，无持久化（重启丢失）、无加密；
-- `.env`（ACR 密码/API key/redis 密码）、`bastion.env`（SSH 口令）明文落盘
-  （权限 600，建议上密钥管理）。
+- 已修复（E5.4）：配置 `E2B_SECRET_MASTER_KEY` 后 secret 以 Fernet
+  （AES）加密落盘并镜像到 Redis，重启不丢；轮换走
+  `E2B_SECRET_MASTER_KEYS` 双 key 窗口（`upgrade.sh
+  --rotate-secret-master-key` / `--finalize-secret-master-key-rotation`）。
+  未配置 master key 时保持降级（内存 + 明文盘）并启动告警。
+- `.env`（ACR 密码/API key/redis 密码/secret master key）、`bastion.env`
+  （SSH 口令）明文落盘（权限 600）；生产建议 master key 与 ACR 口令上
+  密钥管理（O3：Secret Manager / KMS，启动时注入环境变量，避免 `.env`
+  明文长期驻留）。
 
 ## 8. 内存 DoS 与进程权限（新增，2026-09-01 二轮评估）
 

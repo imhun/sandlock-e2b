@@ -6,6 +6,9 @@ services:
     environment:
       E2B_API_KEYS: local-key
       E2B_ENABLE_LOCAL_NODE: "false"
+      # Secret at-rest encryption (E5.4); unset = degraded with a warning.
+      E2B_SECRET_MASTER_KEY: ${E2B_SECRET_MASTER_KEY:-}
+      E2B_SECRET_MASTER_KEYS: ${E2B_SECRET_MASTER_KEYS:-}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_MAX_SANDBOXES: 100
       E2B_BASE_IMAGE: python:3.14-slim

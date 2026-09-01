@@ -36,6 +36,9 @@ services:
     environment:
       E2B_API_KEYS: ${E2B_API_KEYS:-local-key}
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
+      # Secret at-rest encryption + Redis persistence (E5.4).
+      E2B_SECRET_MASTER_KEY: ${E2B_SECRET_MASTER_KEY:-}
+      E2B_SECRET_MASTER_KEYS: ${E2B_SECRET_MASTER_KEYS:-}
       E2B_ENABLE_LOCAL_NODE: "false"
       E2B_REDIS_URL: redis://:${E2B_REDIS_PASSWORD:-local-redis-password}@redis:6379/0
       # Embedded gateway: route lookups and invalidation stay in-process.

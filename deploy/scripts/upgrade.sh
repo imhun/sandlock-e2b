@@ -11,6 +11,7 @@
 #
 # Usage: ./deploy/scripts/upgrade.sh [--build] [--version <v>] [--env-file <path>] [--skip-smoke] [--force-env] [--keep-image-tags]
 #                                     [--rotate-internal-key] [--finalize-internal-key-rotation <old-key>]
+#                                     [--rotate-secret-master-key] [--finalize-secret-master-key-rotation <old-key>]
 
 set -euo pipefail
 . "$(cd "$(dirname "$0")" && pwd)/lib/helpers.sh"
@@ -21,6 +22,8 @@ FORCE_ENV=0
 KEEP_IMAGE_TAGS=0
 ROTATE_INTERNAL=0
 FINALIZE_INTERNAL=""
+ROTATE_SECRET_MASTER=0
+FINALIZE_SECRET_MASTER=""
 ENV_FILE=""
 VERSION_ARG=""
 while [ $# -gt 0 ]; do
@@ -33,6 +36,8 @@ while [ $# -gt 0 ]; do
         --keep-image-tags) KEEP_IMAGE_TAGS=1 ;;
         --rotate-internal-key) ROTATE_INTERNAL=1 ;;
         --finalize-internal-key-rotation) FINALIZE_INTERNAL="${2:-}"; shift ;;
+        --rotate-secret-master-key) ROTATE_SECRET_MASTER=1 ;;
+        --finalize-secret-master-key-rotation) FINALIZE_SECRET_MASTER="${2:-}"; shift ;;
         *) echo "未知参数: $1" >&2; exit 1 ;;
     esac
     shift
@@ -70,9 +75,11 @@ if [ -z "$ENV_FILE" ]; then
         API_KEY="$(openssl rand -hex 24)"
         INTERNAL_KEY="$(openssl rand -hex 24)"
         REDIS_PASSWORD="$(openssl rand -hex 24)"
+        SECRET_MASTER_KEY="$(openssl rand -hex 32)"
         sed -e "s|__E2B_API_KEYS__|$API_KEY|" \
             -e "s|__E2B_INTERNAL_API_KEY__|$INTERNAL_KEY|" \
             -e "s|__E2B_REDIS_PASSWORD__|$REDIS_PASSWORD|" \
+            -e "s|__E2B_SECRET_MASTER_KEY__|$SECRET_MASTER_KEY|" \
             -e "s|__ACR_USERNAME__|$ACR_USERNAME|" \
             -e "s|__ACR_PASSWORD__|$ACR_PASSWORD|" \
             "$STACK_DIR/.env.example" > "$STACK_DIR/.env"
@@ -83,7 +90,7 @@ fi
 
 # --- 保留远端密钥（默认）---
 if [ -n "$ENV_FILE" ] && [ "$FORCE_ENV" != "1" ]; then
-    for key in E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_INTERNAL_API_KEYS E2B_IMAGE_REGISTRY_PASSWORD E2B_REDIS_PASSWORD; do
+    for key in E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_INTERNAL_API_KEYS E2B_IMAGE_REGISTRY_PASSWORD E2B_REDIS_PASSWORD E2B_SECRET_MASTER_KEY E2B_SECRET_MASTER_KEYS; do
         if grep -qE "^$key=(__.*__)?$" "$ENV_FILE"; then
             remote_val="$(remote_env_value "$key" || true)"
             if [ -n "$remote_val" ]; then
@@ -142,6 +149,58 @@ print(",".join(keys))
     fi
     sed "s|^E2B_INTERNAL_API_KEYS=.*|E2B_INTERNAL_API_KEYS=$REMAINING|" "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
     say "已从 E2B_INTERNAL_API_KEYS 移除 $FINALIZE_INTERNAL：该 key 立即失效"
+fi
+
+# --- secret master key 轮换（E5.4）---
+# 轮换 = 生成新主 key 并保留旧 key 在 E2B_SECRET_MASTER_KEYS（轮换窗口内
+# 旧密文仍可解密）；控制面滚动后旧密文会被主 key 重新加密，再 finalize
+# 从列表移除旧 key。
+if [ "$ROTATE_SECRET_MASTER" = "1" ]; then
+    [ -n "$ENV_FILE" ] || { echo "--rotate-secret-master-key 需要 .env（首次部署会自动生成）" >&2; exit 1; }
+    NEW_MASTER="$(openssl rand -hex 32)"
+    CURRENT_MASTER="$(sed -n 's/^E2B_SECRET_MASTER_KEY=//p' "$ENV_FILE" | tail -1)"
+    if [ -z "$CURRENT_MASTER" ] || [ "$CURRENT_MASTER" = "__E2B_SECRET_MASTER_KEY__" ]; then
+        echo "无法确定当前 secret master key（.env 缺少 E2B_SECRET_MASTER_KEY）" >&2
+        exit 1
+    fi
+    CURRENT_LEGACY="$(sed -n 's/^E2B_SECRET_MASTER_KEYS=//p' "$ENV_FILE" | tail -1)"
+    NEW_LIST="$(MASTER_OLD="$CURRENT_MASTER" MASTER_LEGACY="$CURRENT_LEGACY" python3 -c '
+import os
+keys = [k for k in os.environ["MASTER_LEGACY"].split(",") if k]
+keys = list(dict.fromkeys(keys + [os.environ["MASTER_OLD"]]))
+print(",".join(keys))
+')"
+    if grep -q '^E2B_SECRET_MASTER_KEYS=' "$ENV_FILE"; then
+        sed "s|^E2B_SECRET_MASTER_KEYS=.*|E2B_SECRET_MASTER_KEYS=$NEW_LIST|" "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
+    else
+        printf '\nE2B_SECRET_MASTER_KEYS=%s\n' "$NEW_LIST" >> "$ENV_FILE"
+    fi
+    sed "s|^E2B_SECRET_MASTER_KEY=.*|E2B_SECRET_MASTER_KEY=$NEW_MASTER|" "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
+    say "已轮换 secret master key：新主 key 写入 E2B_SECRET_MASTER_KEY；旧 key 保留在 E2B_SECRET_MASTER_KEYS（轮换窗口内旧密文仍可解密）"
+    say "所有控制面滚动并重新加密后，执行 upgrade.sh --finalize-secret-master-key-rotation <旧key> 移除旧 key"
+fi
+
+if [ -n "$FINALIZE_SECRET_MASTER" ]; then
+    [ -n "$ENV_FILE" ] || { echo "--finalize-secret-master-key-rotation 需要 .env" >&2; exit 1; }
+    PRIMARY_MASTER="$(sed -n 's/^E2B_SECRET_MASTER_KEY=//p' "$ENV_FILE" | tail -1)"
+    if [ "$FINALIZE_SECRET_MASTER" = "$PRIMARY_MASTER" ]; then
+        echo "不能移除当前主 key；请先 --rotate-secret-master-key 生成新主 key" >&2
+        exit 1
+    fi
+    CURRENT_LEGACY="$(sed -n 's/^E2B_SECRET_MASTER_KEYS=//p' "$ENV_FILE" | tail -1)"
+    [ -n "$CURRENT_LEGACY" ] || { echo "E2B_SECRET_MASTER_KEYS 为空：旧 key 已不在生效列表" >&2; exit 1; }
+    REMAINING="$(MASTER_OLD="$FINALIZE_SECRET_MASTER" MASTER_LEGACY="$CURRENT_LEGACY" python3 -c '
+import os
+old = os.environ["MASTER_OLD"]
+keys = [k for k in os.environ["MASTER_LEGACY"].split(",") if k and k != old]
+print(",".join(keys))
+')"
+    if [ "$REMAINING" = "$CURRENT_LEGACY" ]; then
+        echo "E2B_SECRET_MASTER_KEYS 中未找到 $FINALIZE_SECRET_MASTER" >&2
+        exit 1
+    fi
+    sed "s|^E2B_SECRET_MASTER_KEYS=.*|E2B_SECRET_MASTER_KEYS=$REMAINING|" "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
+    say "已从 E2B_SECRET_MASTER_KEYS 移除 $FINALIZE_SECRET_MASTER：旧 key 立即失效"
 fi
 
 # --- 镜像 tag 固定为当前版本（除非 --keep-image-tags）---

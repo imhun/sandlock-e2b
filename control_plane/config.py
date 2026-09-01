@@ -134,6 +134,18 @@ class Settings:
     internal_api_keys: tuple[str, ...] = field(
         default_factory=lambda: _env_list("E2B_INTERNAL_API_KEYS", ())
     )
+    # E5.4: secret-at-rest encryption. When E2B_SECRET_MASTER_KEY is unset
+    # the secret registry degrades to the previous in-memory + plaintext
+    # disk behavior with a startup warning and is never persisted to Redis.
+    # During rotation keep the previous key in E2B_SECRET_MASTER_KEYS so
+    # records encrypted with it still decrypt until every replica has
+    # re-encrypted them with the primary key.
+    secret_master_key: str | None = field(
+        default_factory=lambda: os.getenv("E2B_SECRET_MASTER_KEY") or None
+    )
+    secret_master_keys: tuple[str, ...] = field(
+        default_factory=lambda: _env_list("E2B_SECRET_MASTER_KEYS", ())
+    )
     tls_cert_file: str | None = field(
         default_factory=lambda: os.getenv("E2B_TLS_CERT")
     )
