@@ -547,6 +547,8 @@ def test_heartbeat_usage_payload_includes_disk_and_quota(monkeypatch, tmp_path):
             "quotaNearLimit": [20],
             "quotaOverLimitCount": 3,
             "quotaNearLimitCount": 2,
+            "diskWarnCount": 1,
+            "diskErrorCount": 2,
         },
     )
     assert payload == {
@@ -556,6 +558,8 @@ def test_heartbeat_usage_payload_includes_disk_and_quota(monkeypatch, tmp_path):
         "quotaNearLimit": [20],
         "quotaOverLimitCount": 3,
         "quotaNearLimitCount": 2,
+        "diskWarnCount": 1,
+        "diskErrorCount": 2,
     }
 
 
@@ -587,17 +591,23 @@ def test_node_record_update_usage_exposed_in_to_dict():
     )
     record.update_usage(
         used_disk_mb=1234,
+        disk_total_mb=4096,
         quota_over_limit=[9, 10],
         quota_near_limit=[11],
         quota_over_limit_count=5,
         quota_near_limit_count=2,
+        disk_warn_count=1,
+        disk_error_count=3,
     )
     data = record.to_dict()
     assert data["usedDiskMB"] == 1234
+    assert data["diskTotalMB"] == 4096
     assert data["quotaOverLimit"] == [9, 10]
     assert data["quotaNearLimit"] == [11]
     assert data["quotaOverLimitCount"] == 5
     assert data["quotaNearLimitCount"] == 2
+    assert data["diskWarnCount"] == 1
+    assert data["diskErrorCount"] == 3
 
 
 async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
@@ -627,19 +637,25 @@ async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
             headers=headers,
             json={
                 "diskUsedMB": 42,
+                "diskTotalMB": 4096,
                 "quotaOverLimit": [9],
                 "quotaNearLimit": [],
                 "quotaOverLimitCount": 5,
                 "quotaNearLimitCount": 0,
+                "diskWarnCount": 1,
+                "diskErrorCount": 2,
             },
         )
         assert response.status_code == 204
         record = control.state.nodes.get(node_id)
         assert record.used_disk_mb == 42
+        assert record.disk_total_mb == 4096
         assert record.quota_over_limit == [9]
         assert record.quota_near_limit == []
         assert record.quota_over_limit_count == 5
         assert record.quota_near_limit_count == 0
+        assert record.disk_warn_count == 1
+        assert record.disk_error_count == 2
 
 
 # ------------------------------------------------------------- app lifespan

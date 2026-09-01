@@ -86,10 +86,13 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
         raise OfficialError(404, f"Node {node_id} not found")
     record.update_usage(
         used_disk_mb=body.get("diskUsedMB"),
+        disk_total_mb=body.get("diskTotalMB"),
         quota_over_limit=body.get("quotaOverLimit"),
         quota_near_limit=body.get("quotaNearLimit"),
         quota_over_limit_count=body.get("quotaOverLimitCount"),
         quota_near_limit_count=body.get("quotaNearLimitCount"),
+        disk_warn_count=body.get("diskWarnCount"),
+        disk_error_count=body.get("diskErrorCount"),
     )
     return Response(status_code=204)
 

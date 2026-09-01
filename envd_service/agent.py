@@ -129,6 +129,8 @@ def _heartbeat_usage_payload(
                 "quotaNearLimit",
                 "quotaOverLimitCount",
                 "quotaNearLimitCount",
+                "diskWarnCount",
+                "diskErrorCount",
             ):
                 if key in metrics:
                     payload[key] = metrics[key]

@@ -24,6 +24,9 @@ class NodeRecord:
     quota_near_limit: list[int] = field(default_factory=list)
     quota_over_limit_count: int = 0
     quota_near_limit_count: int = 0
+    disk_total_mb: int = 0
+    disk_warn_count: int = 0
+    disk_error_count: int = 0
     reserved_memory_mb: int = 0
     reserved_cpu_percent: int = 0
     reserved_disk_mb: int = 0
@@ -62,14 +65,19 @@ class NodeRecord:
         self,
         *,
         used_disk_mb: int | None = None,
+        disk_total_mb: int | None = None,
         quota_over_limit: list[int] | None = None,
         quota_near_limit: list[int] | None = None,
         quota_over_limit_count: int | None = None,
         quota_near_limit_count: int | None = None,
+        disk_warn_count: int | None = None,
+        disk_error_count: int | None = None,
     ) -> None:
         """Store the worker heartbeat's disk/quota usage snapshot."""
         if used_disk_mb is not None:
             self.used_disk_mb = int(used_disk_mb)
+        if disk_total_mb is not None:
+            self.disk_total_mb = int(disk_total_mb)
         if quota_over_limit is not None:
             self.quota_over_limit = list(quota_over_limit)
         if quota_near_limit is not None:
@@ -78,6 +86,10 @@ class NodeRecord:
             self.quota_over_limit_count = int(quota_over_limit_count)
         if quota_near_limit_count is not None:
             self.quota_near_limit_count = int(quota_near_limit_count)
+        if disk_warn_count is not None:
+            self.disk_warn_count = int(disk_warn_count)
+        if disk_error_count is not None:
+            self.disk_error_count = int(disk_error_count)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -92,6 +104,9 @@ class NodeRecord:
             "reservedCPUPercent": self.reserved_cpu_percent,
             "totalDiskMB": self.total_disk_mb,
             "usedDiskMB": self.used_disk_mb,
+            "diskTotalMB": self.disk_total_mb,
+            "diskWarnCount": self.disk_warn_count,
+            "diskErrorCount": self.disk_error_count,
             "reservedDiskMB": self.reserved_disk_mb,
             "quotaOverLimit": self.quota_over_limit,
             "quotaNearLimit": self.quota_near_limit,
