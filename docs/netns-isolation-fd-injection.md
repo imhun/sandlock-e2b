@@ -102,6 +102,30 @@ sysctl 不再需要**——比现状更"无特权"。
 5. 入站端口映射（可选）：supervisor 宿主监听 → accept → 注入；
 6. 与 egressProxy / HTTP 代理 / 通配域名路径集成与回归。
 
+### S2.2 已落地（2026-09-01）：`SandboxBuilder::net_isolation`
+
+- 新开关 `net_isolation(true)`（默认 `false`）：沙箱 spawn 路径在 userns
+  之后 `unshare(CLONE_NEWNET)`，进入独立 netns（仅 loopback）；`lo up`
+  由沙箱 userns 内进程通过 `SIOCSIFFLAGS` 完成（新 netns 的 owner userns
+  即沙箱 userns，无需父命名空间特权）。默认 `false` 保持共享 netns 无特权
+  路径，全量回归零破坏。
+- 与 S2.1 `fd_inject_connect` 的关系（两开关互相独立）：
+  - `(false, false)`：默认共享 netns + legacy dup 代连（现状，回归保障）；
+  - `(false, true)`：共享 netns + fd 注入（S2.1）；
+  - `(true, false)`：loopback-only 沙箱——外部 IP connect 在内核层失败
+    （沙箱 netns 无路由），语义正确、不逃逸；
+  - `(true, true)`：方案 1 完整路径——沙箱 connect 走宿主建连 + ADDFD
+    注入；注入路径的 dup 回退在 `net_isolation` 下失效（dup 的 socket 在
+    沙箱 loopback-only netns，永远到不了目标），改为 fail-closed
+    `ECONNREFUSED`，绝不静默降级。
+- 通配域名受限（待 S2.3）：共享 netns 的 `127.0.1.x:53` DNS 网关在
+  netns 沙箱内不可达；`net_isolation` + 通配域名规则在 spawn 时 fail-fast
+  报错（"restricted until the in-netns DNS gateway lands (S2.3)"），默认
+  路径不受影响。
+- netlink 视图：netns 沙箱仍走 NETLINK_ROUTE 虚拟化，但合成视图为
+  loopback-only（去掉共享 netns 模式的虚拟 eth0），`ip addr` 只见 lo，
+  与真实内核视图一致；send/recv 安全中介路径保持不变。
+
 ### E2B 侧（小-中）
 
 - MCP/gateway 到沙箱内 MCP 的路径适配；
