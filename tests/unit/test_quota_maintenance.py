@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import httpx
@@ -715,3 +716,50 @@ async def test_app_lifespan_starts_quota_maintenance(tmp_path, monkeypatch):
             "via_agent": False,
         }
     assert app.state.quota_monitor._task is None
+
+
+def test_create_app_nonroot_discloses_direct_quota_downgrade(
+    tmp_path, monkeypatch, caplog
+):
+    """E5.1 review (Important): a non-root worker with the direct local
+    quota path (E2B_QUOTA_VIA_AGENT=false) must get a startup warning with
+    the required configuration instead of silently losing disk hard limits."""
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    caplog.set_level(logging.WARNING)
+    create_envd_app(
+        settings=EnvdSettings(executor="local", workspace_base=tmp_path),
+        runtime_registry=RuntimeRegistry(tmp_path),
+    )
+    assert [r.message for r in caplog.records if r.name == "envd_service.app"] == [
+        f"{xfs_quota.NONROOT_DIRECT_QUOTA_REASON} (direct xfs_quota requires "
+        "root/CAP_SYS_ADMIN; per-sandbox disk hard limits are disabled while "
+        "E2B_QUOTA_VIA_AGENT=false; set E2B_QUOTA_VIA_AGENT=true and deploy "
+        "quota-agent, or run the worker as root)",
+    ]
+
+
+def test_create_app_root_direct_quota_no_disclosure(tmp_path, monkeypatch, caplog):
+    """Root workers keep the direct xfs_quota path; no downgrade warning."""
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    caplog.set_level(logging.WARNING)
+    create_envd_app(
+        settings=EnvdSettings(executor="local", workspace_base=tmp_path),
+        runtime_registry=RuntimeRegistry(tmp_path),
+    )
+    assert [r for r in caplog.records if "磁盘配额不可用" in r.message] == []
+
+
+def test_create_app_nonroot_via_agent_no_disclosure(tmp_path, monkeypatch, caplog):
+    """Non-root + E2B_QUOTA_VIA_AGENT=true delegates to quota-agent, so the
+    direct-path downgrade warning must not fire."""
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    caplog.set_level(logging.WARNING)
+    create_envd_app(
+        settings=EnvdSettings(
+            executor="local",
+            workspace_base=tmp_path,
+            quota_via_agent=True,
+        ),
+        runtime_registry=RuntimeRegistry(tmp_path),
+    )
+    assert [r for r in caplog.records if "磁盘配额不可用" in r.message] == []

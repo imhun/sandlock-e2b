@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
 
 import envd_service.xfs_quota as xfs_quota
 from envd_service.xfs_quota import xfs_project_supported
+
+
+@pytest.fixture(autouse=True)
+def _local_detection_runs_as_root(monkeypatch):
+    """Pin euid to root so local-detection tests stay host-independent; the
+    non-root behavior has dedicated tests that override this value."""
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
 
 
 def _mounts(*lines: str) -> str:
@@ -112,6 +120,61 @@ def test_local_proc_mounts_unreadable_degrades_without_raising(monkeypatch):
         "filesystem detection unavailable: cannot read /proc/mounts",
     )
     assert calls == []
+
+
+def test_local_nonroot_direct_quota_disclosed_with_guidance(monkeypatch, caplog):
+    """E5.1 review (Important): a non-root worker cannot run xfs_quota
+    directly (EPERM). Detection must disclose the quota-agent requirement
+    instead of silently skipping per-sandbox disk hard limits, and must not
+    attempt any filesystem probe or xfs_quota run that would fail."""
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_mounts",
+        lambda: _mounts("/dev/nvme0n1p2 /srv/sandboxes xfs rw,prjquota 0 0"),
+    )
+    monkeypatch.setattr(
+        xfs_quota,
+        "_run_xfs_info",
+        lambda _mp: calls.append("xfs_info") or _xfs_info(1),
+    )
+    monkeypatch.setattr(
+        xfs_quota,
+        "_xfs_quota_available",
+        lambda: calls.append("tool") or True,
+    )
+    caplog.set_level(logging.WARNING)
+    assert xfs_project_supported("/srv/sandboxes") == (
+        False,
+        xfs_quota.NONROOT_DIRECT_QUOTA_REASON,
+    )
+    # The euid guard short-circuits before any filesystem probe / xfs_quota.
+    assert calls == []
+    assert [r.message for r in caplog.records] == [
+        "XFS project quota unavailable for /srv/sandboxes: "
+        + xfs_quota.NONROOT_DIRECT_QUOTA_REASON,
+    ]
+
+
+def test_local_nonroot_via_agent_ignores_euid(monkeypatch, caplog):
+    """The euid guard only applies to the direct local path: with
+    quota-agent the server runs xfs_quota, so a non-root worker can still
+    get quota support."""
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    monkeypatch.setattr(
+        xfs_quota,
+        "agent_query",
+        lambda _mp: {
+            "fs_type": "xfs",
+            "projid32bit": True,
+            "prjquota": True,
+            "xfs_quota": True,
+        },
+    )
+    caplog.set_level(logging.WARNING)
+    assert xfs_project_supported("/mnt/nfs", via_agent=True) == (True, "")
+    assert [r.message for r in caplog.records] == []
 
 
 def test_local_mount_not_found_fails(monkeypatch):

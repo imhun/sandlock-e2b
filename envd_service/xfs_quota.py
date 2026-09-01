@@ -46,6 +46,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -57,6 +58,15 @@ from typing import Any, Callable
 from gateway_common.paths import validate_sandbox_id
 
 logger = logging.getLogger(__name__)
+
+#: Non-root workers (E5.1) cannot run ``xfs_quota -x`` directly: project
+#: quota administration needs root/CAP_SYS_ADMIN and every call fails with
+#: EPERM, which callers would silently skip. Detection reports this exact
+#: guidance so the degraded per-sandbox disk-hard-limit control is disclosed
+#: at startup instead of failing per sandbox.
+NONROOT_DIRECT_QUOTA_REASON = (
+    "磁盘配额不可用：非 root 需配置 E2B_QUOTA_VIA_AGENT + quota-agent"
+)
 
 #: E2.6 wires the quota-agent client here. Contract:
 #: ``agent_query(mount_point: str) -> dict[str, Any]`` returning server-side
@@ -651,6 +661,12 @@ def _evaluate_facts(facts: dict[str, Any]) -> tuple[bool, str]:
 
 
 def _detect_local(mount_point: str | Path) -> tuple[bool, str]:
+    # E5.1 review (Important): a non-root worker always gets EPERM from
+    # ``xfs_quota -x`` regardless of the mount, so the direct path is
+    # unusable. Disclose the quota-agent requirement up front instead of
+    # silently skipping every per-sandbox disk hard limit.
+    if os.geteuid() != 0:
+        return _fail(NONROOT_DIRECT_QUOTA_REASON)
     return _evaluate_facts(_local_facts(mount_point))
 
 

@@ -25,7 +25,11 @@ from envd_service.rpc import register_rpc
 from envd_service.runtime.context import SandboxRuntimeContext
 from envd_service.runtime.registry import RuntimeRegistry
 from envd_service.uid_pool import UidPool
-from envd_service.xfs_quota import ProjectQuotaError, reconcile_orphan_projects
+from envd_service.xfs_quota import (
+    NONROOT_DIRECT_QUOTA_REASON,
+    ProjectQuotaError,
+    reconcile_orphan_projects,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +88,24 @@ async def _startup_uid_reconcile(pool: UidPool) -> None:
     )
 
 
+def _disclose_nonroot_direct_quota(settings: Settings) -> None:
+    """Startup disclosure (E5.1 review, Important): a non-root worker cannot
+    run ``xfs_quota`` directly (every call fails with EPERM), so with
+    ``E2B_QUOTA_VIA_AGENT=false`` the per-sandbox disk hard limit silently
+    degrades. Detect euid at startup and surface the required configuration
+    once instead of letting each quota operation fail per sandbox.
+    """
+    if settings.quota_via_agent or os.geteuid() == 0:
+        return
+    logger.warning(
+        "%s (direct xfs_quota requires root/CAP_SYS_ADMIN; per-sandbox "
+        "disk hard limits are disabled while E2B_QUOTA_VIA_AGENT=false; "
+        "set E2B_QUOTA_VIA_AGENT=true and deploy quota-agent, or run the "
+        "worker as root)",
+        NONROOT_DIRECT_QUOTA_REASON,
+    )
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -127,6 +149,7 @@ def create_app(
             "as root; per-sandbox host uids are disabled (non-root workers "
             "use the fixed identity + Landlock model, E5.1)"
         )
+    _disclose_nonroot_direct_quota(settings)
     quota_monitor = QuotaMonitor(
         workspace_base=settings.workspace_base,
         mount_point=settings.workspace_base,
