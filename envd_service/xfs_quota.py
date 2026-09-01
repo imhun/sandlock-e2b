@@ -1,24 +1,43 @@
-"""XFS project quota capability detection (E2.1).
+"""XFS project quota capability detection and project management (E2.1/E2.2).
 
 Two quota domains:
 
 - local (``via_agent=False``): inspect the worker's own mount of
-  ``mount_point`` — filesystem type from ``/proc/mounts``, ``projid32bit``
-  from ``xfs_info``, the ``prjquota`` mount option, and the ``xfs_quota``
-  tool on PATH.
+  ``mount_point``, and run ``xfs_quota`` directly on the worker.
 - NFS server side (``via_agent=True``): the worker only sees an NFS mount,
   so the real filesystem lives on the server. Ask quota-agent (E2.6) for
-  the server-side facts and evaluate them with the same rules.
+  the server-side facts and let it execute the project operations.
 
-Detection is strictly read-only: it never mounts, never enables quotas and
-never writes files. Any unsupported result is logged as a warning so callers
-can degrade (skip quota, sandbox still created).
+Detection (E2.1) is strictly read-only: it never mounts, never enables
+quotas and never writes files. Any unsupported result is logged as a warning
+so callers can degrade (skip quota, sandbox still created).
+
+Project management (E2.2):
+
+- projid allocation: deterministic SHA-256 hash of the sandbox id into
+  ``1..2^31``, linear-probed against the projects defined in the XFS project
+  table (``report -p``). The stable hash survives worker restarts and needs
+  no cross-worker coordination on shared storage; the probe avoids reusing a
+  projid while another sandbox still uses it.
+- create: ``project -s -p <dir> <projid>`` + ``limit -p bhard=<disk_mb>M``.
+  On partial failure (project created, limit failed) the project state is
+  best-effort cleared before raising so callers degrade with a warning.
+- delete: ``project -C -p <dir> <projid>``; the caller removes the directory
+  afterwards, which releases the quota accounting automatically.
+
+The agent branch is reserved for E2.6: ``agent_ops`` maps op names to
+callables — ``provision(sandbox_id, project_dir, disk_mb, mount_point,
+project_id=None) -> int`` and ``release(project_dir, projid, mount_point)
+-> None`` — installed via :func:`configure_agent_ops`. Unconfigured agent
+ops raise :class:`ProjectQuotaError` so callers degrade.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -32,10 +51,179 @@ logger = logging.getLogger(__name__)
 #: ``{"error": reason}`` dict when the server cannot answer.
 agent_query: Callable[[str], dict[str, Any]] | None = None
 
+#: E2.6 wires quota-agent project operations here. Contract:
+#: ``agent_ops["provision"](sandbox_id, project_dir, disk_mb, mount_point,
+#: project_id=None) -> int`` and ``agent_ops["release"](project_dir, projid,
+#: mount_point) -> None``.
+agent_ops: dict[str, Callable[..., Any]] | None = None
+
 _XFS_INFO_TIMEOUT_SECONDS = 5
+_XFS_QUOTA_TIMEOUT_SECONDS = 10
 _PASS: tuple[bool, str] = (True, "")
 _OCTAL_ESCAPE = re.compile(r"\\([0-7]{3})")
 _PROJID32BIT = re.compile(r"\bprojid32bit=([01])\b")
+_PROJECT_ID_LINE = re.compile(r"^\s*#?(\d+)(?:\s|$)", re.MULTILINE)
+
+#: Project id range for sandboxes (design doc §3.2: 1..2^31).
+_PROJID_MIN = 1
+_PROJID_MAX = 1 << 31
+
+
+class ProjectQuotaError(RuntimeError):
+    """A quota management operation failed; callers degrade with a warning."""
+
+
+def _hash_projid(sandbox_id: str) -> int:
+    """Map a sandbox id to a stable projid in ``[_PROJID_MIN, _PROJID_MAX]``."""
+    digest = hashlib.sha256(sandbox_id.encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], "big")
+    return _PROJID_MIN + value % (_PROJID_MAX - _PROJID_MIN + 1)
+
+
+def _parse_project_report(output: str) -> set[int]:
+    """Extract the defined project ids from ``xfs_quota report -p`` output."""
+    return {int(match.group(1)) for match in _PROJECT_ID_LINE.finditer(output)}
+
+
+def _local_run_xfs_quota(mount_point: str | Path, command: str) -> str:
+    """Run one ``xfs_quota -x -c`` command; return stdout or raise."""
+    argv = ["xfs_quota", "-x", "-c", command, str(mount_point)]
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_XFS_QUOTA_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ProjectQuotaError(f"xfs_quota '{command}' failed: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (
+            proc.stderr.strip()
+            or proc.stdout.strip()
+            or f"exit code {proc.returncode}"
+        )
+        raise ProjectQuotaError(f"xfs_quota '{command}' failed: {detail}")
+    return proc.stdout
+
+
+def _local_in_use_projids(mount_point: str | Path) -> set[int]:
+    """Return the project ids currently defined in the XFS project table."""
+    output = _local_run_xfs_quota(mount_point, "report -p")
+    return _parse_project_report(output)
+
+
+def allocate_project_id(sandbox_id: str, mount_point: str | Path) -> int:
+    """Pick a free projid: stable sandbox-id hash, linear-probed on conflict."""
+    in_use = _local_in_use_projids(mount_point)
+    candidate = _hash_projid(sandbox_id)
+    while candidate in in_use:
+        candidate = _PROJID_MIN if candidate >= _PROJID_MAX else candidate + 1
+    return candidate
+
+
+def _agent_call(op: str, **kwargs) -> Any:
+    """Invoke a quota-agent project op, wrapping failures as ProjectQuotaError."""
+    ops = agent_ops
+    if ops is None:
+        raise ProjectQuotaError("quota-agent not configured (E2.6)")
+    fn = ops.get(op)
+    if fn is None:
+        raise ProjectQuotaError(f"quota-agent op '{op}' not configured (E2.6)")
+    try:
+        return fn(**kwargs)
+    except Exception as exc:
+        raise ProjectQuotaError(f"quota-agent {op} failed: {exc}") from exc
+
+
+def configure_agent_ops(
+    ops: dict[str, Callable[..., Any]] | None,
+) -> None:
+    """Wire quota-agent project operations; E2.6 replaces the default None."""
+    global agent_ops
+    agent_ops = ops
+
+
+def provision_project(
+    *,
+    sandbox_id: str,
+    project_dir: str | Path,
+    mount_point: str | Path,
+    disk_mb: int,
+    via_agent: bool = False,
+    project_id: int | None = None,
+) -> int:
+    """Assign projid + hard quota to ``project_dir`` and return the projid.
+
+    With ``project_id`` set (existing sandbox re-provision, e.g. migration
+    rollback) the id is reused instead of allocating a new one. On partial
+    failure the project state is best-effort cleared before raising, so the
+    caller can degrade (skip quota, keep the sandbox).
+    """
+    if via_agent:
+        return _agent_call(
+            "provision",
+            sandbox_id=sandbox_id,
+            project_dir=str(project_dir),
+            mount_point=str(mount_point),
+            disk_mb=disk_mb,
+            project_id=project_id,
+        )
+    projid = (
+        project_id
+        if project_id is not None
+        else allocate_project_id(sandbox_id, mount_point)
+    )
+    quoted_dir = shlex.quote(str(project_dir))
+    setup = f"project -s -p {quoted_dir} {projid}"
+    try:
+        _local_run_xfs_quota(mount_point, setup)
+    except ProjectQuotaError as exc:
+        raise ProjectQuotaError(
+            f"project setup failed for {sandbox_id}: {exc}"
+        ) from exc
+    limit = f"limit -p bhard={disk_mb}M {projid}"
+    try:
+        _local_run_xfs_quota(mount_point, limit)
+    except ProjectQuotaError as exc:
+        clear = f"project -C -p {quoted_dir} {projid}"
+        try:
+            _local_run_xfs_quota(mount_point, clear)
+        except ProjectQuotaError as cleanup_exc:
+            logger.warning(
+                "project cleanup failed for %s (projid %s): %s",
+                sandbox_id,
+                projid,
+                cleanup_exc,
+            )
+        raise ProjectQuotaError(
+            f"quota limit setup failed for {sandbox_id}: {exc}"
+        ) from exc
+    return projid
+
+
+def release_project(
+    *,
+    project_dir: str | Path,
+    mount_point: str | Path,
+    projid: int,
+    via_agent: bool = False,
+) -> None:
+    """Clear the project state on ``project_dir``; the caller removes the dir.
+
+    Raises :class:`ProjectQuotaError` on failure; callers degrade with a
+    warning (sandbox deletion still proceeds).
+    """
+    if via_agent:
+        _agent_call(
+            "release",
+            project_dir=str(project_dir),
+            mount_point=str(mount_point),
+            projid=projid,
+        )
+        return
+    command = f"project -C -p {shlex.quote(str(project_dir))} {projid}"
+    _local_run_xfs_quota(mount_point, command)
 
 
 def _fail(reason: str) -> tuple[bool, str]:
