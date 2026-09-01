@@ -241,15 +241,23 @@ async def test_header_inject_and_host_mask_on_the_wire(tmp_path, monkeypatch):
 
 @pytest.mark.usefixtures("require_sandlock")
 async def test_sandbox_child_runs_unprivileged():
-    """The confined child always drops to uid/gid 1000 — sandlock needs no
-    root and never grants the sandbox process privileges."""
+    """S1.2 user-namespace semantics: the single entry maps the host uid
+    1000 into the sandbox as uid 0, so the child sees ``0 0`` — but it holds
+    no root privileges (Landlock keeps every host path outside the workspace
+    unwritable, so a uid-0 child still cannot touch host root paths)."""
     ws = tempfile.mkdtemp()
     executor = _executor(ws, None)
     exit_code, out, err = await _run(
         executor, ws, "import os; print(os.getuid(), os.getgid())"
     )
     assert exit_code == 0, err.decode()
-    assert out.decode().strip() == "1000 1000"
+    assert out.decode().strip() == "0 0"
+
+    # uid 0 inside the namespace must not grant root capabilities: writing
+    # to a host system path is denied by the sandbox policy.
+    denied_code = "open('/bin/root-cap-probe', 'w').write('x')"
+    exit_code, out, err = await _run(executor, ws, denied_code)
+    assert exit_code != 0, "uid 0 child must not write host system paths"
 
 
 @pytest.mark.usefixtures("require_sandlock")
@@ -277,10 +285,12 @@ async def test_https_mitm_ca_spliced_in_image_rootfs(multinode_two_workers):
         assert result.exit_code == 0, result.error
         assert "BEGIN CERTIFICATE" in result.stdout, result.stdout
 
+        # The executor pins SSL_CERT_FILE to the chroot-visible path
+        # (/workspace is the sandbox cwd; /home/user is the legacy alias).
         env = sandbox.commands.run(
             "python3 -c \"import os; print(os.environ.get('SSL_CERT_FILE',''))\""
         )
-        assert env.stdout.strip() == "/home/user/.e2b-ca/ca-certificates.crt"
+        assert env.stdout.strip() == "/workspace/.e2b-ca/ca-certificates.crt"
     finally:
         sandbox.kill()
 
