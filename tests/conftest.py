@@ -179,9 +179,22 @@ async def envd_client(apps):
 
 
 class _ServerThread:
-    def __init__(self, app, port: int) -> None:
+    def __init__(
+        self,
+        app,
+        port: int,
+        *,
+        ssl_certfile: str | None = None,
+        ssl_keyfile: str | None = None,
+    ) -> None:
         config = uvicorn.Config(
-            app, host="127.0.0.1", port=port, log_level="warning", lifespan="on"
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+            lifespan="on",
+            ssl_certfile=ssl_certfile,
+            ssl_keyfile=ssl_keyfile,
         )
         self.server = uvicorn.Server(config)
         self.thread = threading.Thread(target=self.server.run, daemon=True)
