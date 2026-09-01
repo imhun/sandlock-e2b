@@ -6,6 +6,8 @@ tmp/
 wheels/fork/
 deploy/stack/.env
 deploy/stack/.version
+deploy/stack/tls/
+deploy/compose/tls/
 deploy/scripts/bastion.env
 deploy/scripts/acr.env
 tests/sdk/js/node_modules/

@@ -39,11 +39,18 @@ services:
       E2B_ENABLE_LOCAL_NODE: "false"
       E2B_REDIS_URL: redis://:${E2B_REDIS_PASSWORD:-local-redis-password}@redis:6379/0
       # Embedded gateway: route lookups and invalidation stay in-process.
-      E2B_CONTROL_PLANE_URL: http://control-plane:3000
-      E2B_GATEWAY_URL: http://control-plane:3000
+      E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}
+      E2B_GATEWAY_URL: ${E2B_GATEWAY_URL:-http://control-plane:3000}
       # Route cache TTL (s); on stale routes the gateway retries once after
       # re-resolving, so this only bounds lookups, not recovery.
       E2B_GATEWAY_ROUTE_TTL: ${E2B_GATEWAY_ROUTE_TTL:-30}
+      # TLS for the API+gateway port (E1.4). Both unset => HTTP (default).
+      # With TLS enabled also point E2B_CONTROL_PLANE_URL at https:// and
+      # make workers trust the CA (self-signed certs need client-side
+      # verification disabled or the CA installed; production should swap in
+      # a real certificate instead).
+      E2B_TLS_CERT: ${E2B_TLS_CERT:-}
+      E2B_TLS_KEY: ${E2B_TLS_KEY:-}
       # Shared workspace root: workers mount the same storage, so migration
       # only switches routes (no archive transfer).
       E2B_SHARED_WORKSPACE_ROOT: /var/lib/e2b-sandboxes
@@ -63,6 +70,10 @@ services:
       - "${CONTROL_PLANE_PORT:-3000}:3000"
     volumes:
       - sandbox-shared:/var/lib/e2b-sandboxes
+      # E1.4: TLS cert/key directory (deploy/scripts/gen-tls-cert.sh), always
+      # mounted read-only; TLS only activates when E2B_TLS_CERT/E2B_TLS_KEY
+      # are both set, so the default stack stays HTTP.
+      - ./tls:/tls:ro
     restart: unless-stopped
 
   worker-1: &worker
@@ -73,7 +84,7 @@ services:
     depends_on:
       - control-plane
     environment: &worker-env
-      E2B_CONTROL_PLANE_URL: http://control-plane:3000
+      E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}
       E2B_NODE_ADDRESS: http://worker-1:49983
       E2B_NODE_ID: worker-1
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
