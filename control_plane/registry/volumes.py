@@ -24,12 +24,17 @@ class VolumeRecord:
     node_id: str = "local"
     created_at: datetime = field(default_factory=utcnow)
     path: Path | None = None
+    #: Per-sandbox disk quota (MB) applied to every sandbox mounting this
+    #: volume, set uniformly at creation (E2.5). 0 = no per-sandbox limit
+    #: (backward-compatible: sandboxes mount the volume root as before).
+    per_sandbox_quota_mb: int = 0
 
     def as_volume(self) -> dict:
         return {
             "volumeID": self.volume_id,
             "name": self.name,
             "createdAt": to_iso_z(self.created_at),
+            "perSandboxQuotaMb": self.per_sandbox_quota_mb,
         }
 
     def as_volume_and_token(self) -> dict:
@@ -45,9 +50,20 @@ class VolumeRegistry:
         self._volumes: dict[str, VolumeRecord] = {}
         self._lock = threading.Lock()
 
-    def create(self, name: str, node_id: str = "local") -> VolumeRecord:
+    def create(
+        self,
+        name: str,
+        node_id: str = "local",
+        per_sandbox_quota_mb: int = 0,
+    ) -> VolumeRecord:
         if not name or not isinstance(name, str):
             raise ValueError("name must be a non-empty string")
+        if (
+            not isinstance(per_sandbox_quota_mb, int)
+            or isinstance(per_sandbox_quota_mb, bool)
+            or per_sandbox_quota_mb < 0
+        ):
+            raise ValueError("per_sandbox_quota_mb must be a non-negative integer")
         with self._lock:
             volume_id = sandbox_id().replace("sbx_", "vol_")
             while volume_id in self._volumes:
@@ -58,6 +74,7 @@ class VolumeRegistry:
                 token=access_token(),
                 node_id=node_id,
                 path=self._base / volume_id,
+                per_sandbox_quota_mb=per_sandbox_quota_mb,
             )
             record.path.mkdir(parents=True, exist_ok=True)
             self._volumes[volume_id] = record

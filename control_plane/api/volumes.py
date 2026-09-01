@@ -77,8 +77,13 @@ async def create_volume(request: Request) -> dict[str, Any]:
     except json.JSONDecodeError:
         raise OfficialError(400, "Invalid JSON body")
     name = body.get("name") if isinstance(body, dict) else None
+    per_sandbox_quota_mb = (
+        body.get("perSandboxQuotaMb", 0) if isinstance(body, dict) else 0
+    )
     try:
-        record = _volumes(request).create(name)
+        record = _volumes(request).create(
+            name, per_sandbox_quota_mb=per_sandbox_quota_mb
+        )
     except ValueError as e:
         raise OfficialError(400, str(e))
     return record.as_volume_and_token()

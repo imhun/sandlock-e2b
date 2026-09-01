@@ -37,3 +37,24 @@ def test_token_verification(workspace):
     with pytest.raises(UnknownVolumeError):
         registry.verify_token(record.volume_id, "wrong")
 
+
+def test_create_with_per_sandbox_quota_mb(workspace):
+    registry = VolumeRegistry(workspace / "volumes")
+    record = registry.create("data", per_sandbox_quota_mb=1024)
+    assert record.per_sandbox_quota_mb == 1024
+    assert record.as_volume()["perSandboxQuotaMb"] == 1024
+    assert record.as_volume_and_token()["perSandboxQuotaMb"] == 1024
+
+
+def test_default_per_sandbox_quota_is_zero(workspace):
+    registry = VolumeRegistry(workspace / "volumes")
+    record = registry.create("data")
+    assert record.per_sandbox_quota_mb == 0
+    assert record.as_volume()["perSandboxQuotaMb"] == 0
+
+
+@pytest.mark.parametrize("quota", [-1, "1024", 1.5, True, None])
+def test_invalid_per_sandbox_quota_rejected(workspace, quota):
+    registry = VolumeRegistry(workspace / "volumes")
+    with pytest.raises(ValueError):
+        registry.create("data", per_sandbox_quota_mb=quota)

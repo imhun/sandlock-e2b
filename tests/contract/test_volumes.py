@@ -56,6 +56,39 @@ async def test_volume_crud_and_content(control_client):
     assert gone.status_code == 404
 
 
+async def test_volume_create_per_sandbox_quota_metadata(control_client):
+    created = await control_client.post(
+        "/volumes",
+        headers={"X-API-Key": "local-key"},
+        json={"name": "data", "perSandboxQuotaMb": 1024},
+    )
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["perSandboxQuotaMb"] == 1024
+    vid = payload["volumeID"]
+
+    info = await control_client.get(
+        f"/volumes/{vid}", headers={"X-API-Key": "local-key"}
+    )
+    assert info.status_code == 200
+    assert info.json()["perSandboxQuotaMb"] == 1024
+
+    default = await control_client.post(
+        "/volumes",
+        headers={"X-API-Key": "local-key"},
+        json={"name": "plain"},
+    )
+    assert default.status_code == 201
+    assert default.json()["perSandboxQuotaMb"] == 0
+
+    bad = await control_client.post(
+        "/volumes",
+        headers={"X-API-Key": "local-key"},
+        json={"name": "bad", "perSandboxQuotaMb": -5},
+    )
+    assert bad.status_code == 400
+
+
 async def test_volume_bad_token(control_client):
     created = await control_client.post(
         "/volumes", headers={"X-API-Key": "local-key"}, json={"name": "data"}
@@ -125,4 +158,3 @@ async def test_missing_volume_mount_404(control_client):
     )
     assert response.status_code == 404
     assert response.json()["code"] == 404
-
