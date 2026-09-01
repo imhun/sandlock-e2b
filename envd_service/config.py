@@ -121,6 +121,12 @@ class Settings:
     command_queue_timeout_s: float = field(
         default_factory=lambda: _env_float("E2B_COMMAND_QUEUE_TIMEOUT_S", 30)
     )
+    # E4.1: per-stream command output capture cap (MiB). 0 disables the cap
+    # (unlimited, matching repo convention); the default keeps replays and
+    # command-log merging bounded against ``cat /dev/zero`` style output.
+    command_capture_limit_mb: int = field(
+        default_factory=lambda: _env_int("E2B_COMMAND_CAPTURE_LIMIT_MB", 10)
+    )
     # Per-sandbox host uid isolation (E3.2): when enabled (and the worker
     # runs as root / CAP_SETUID), every sandbox gets a distinct host uid
     # from the pool and its workspace is chowned to that uid with 0700.

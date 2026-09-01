@@ -19,6 +19,14 @@ from envd_service.executors.base import (
 
 logger = logging.getLogger(__name__)
 
+# E4.1: per-stream capture cap for ``ManagedProcess.captured``. A sandbox
+# command like ``cat /dev/zero`` would otherwise grow the bytearray without
+# bound and exhaust the worker's memory. Once a stream crosses the cap the
+# tail is replaced by the marker inside the cap, so replays and logs show
+# exactly where output was dropped.
+CAPTURE_LIMIT_DEFAULT = 10 * 1024 * 1024
+TRUNCATED_MARK = b"\n... output truncated ...\n"
+
 SIGNAL_MAP: dict[str, int] = {
     "SIGNAL_SIGTERM": signal.SIGTERM,
     "SIGNAL_SIGKILL": signal.SIGKILL,
@@ -49,6 +57,10 @@ class ManagedProcess:
     captured: dict[str, bytearray] = field(
         default_factory=lambda: {"stdout": bytearray(), "stderr": bytearray(), "pty": bytearray()}
     )
+    # ``None`` = unlimited; otherwise the cap per stream in bytes.
+    capture_limit: int | None = CAPTURE_LIMIT_DEFAULT
+    # Streams that crossed the capture cap (their replay ends with the marker).
+    captured_truncated: set[str] = field(default_factory=set)
     ended: bool = False
     exit_code: int | None = None
     killed: bool = False
@@ -69,6 +81,44 @@ class ManagedProcess:
             self.subscribers.remove(queue)
         except ValueError:
             pass
+
+
+def append_captured(proc: ManagedProcess, kind: str, chunk: bytes) -> bool:
+    """Append ``chunk`` to the capped capture buffer for ``kind``.
+
+    Keeps the first ``capture_limit`` bytes of each stream; the truncation
+    marker replaces the tail inside the cap so a replay never exceeds the
+    cap and still marks the drop point. Returns ``True`` when this call
+    crossed the cap (the caller emits the marker to logs/subscribers).
+    """
+    if kind in proc.captured_truncated:
+        return False
+    buf = proc.captured[kind]
+    limit = proc.capture_limit
+    if limit is None:
+        buf.extend(chunk)
+        return False
+    room = limit - len(buf)
+    if room <= 0:
+        # The buffer is already exactly full (e.g. chunk-aligned output like
+        # /dev/zero reads): the marker still replaces the tail so replays
+        # mark the truncation point.
+        marker = TRUNCATED_MARK
+        if len(marker) <= limit:
+            del buf[limit - len(marker):]
+            buf.extend(marker)
+        proc.captured_truncated.add(kind)
+        return True
+    if len(chunk) <= room:
+        buf.extend(chunk)
+        return False
+    buf.extend(chunk[:room])
+    marker = TRUNCATED_MARK
+    if len(marker) <= limit:
+        del buf[limit - len(marker):]
+        buf.extend(marker)
+    proc.captured_truncated.add(kind)
+    return True
 
 
 class _CommandGate:
@@ -188,6 +238,7 @@ class ProcessManager:
         max_concurrent_commands: int = 1,
         max_queued_commands: int | None = None,
         queue_timeout_s: float | None = 30,
+        capture_limit_bytes: int | None = CAPTURE_LIMIT_DEFAULT,
     ) -> None:
         self._executor = executor
         self._max_command_timeout = max_command_timeout
@@ -205,6 +256,12 @@ class ProcessManager:
             None
             if queue_timeout_s is None
             else max(0.0, float(queue_timeout_s))
+        )
+        # E4.1: ``None`` = unlimited; the default is the 10MB cap. Settings
+        # map ``E2B_COMMAND_CAPTURE_LIMIT_MB=0`` to ``None`` before this
+        # point (repo convention: 0 disables a dimension).
+        self._capture_limit_bytes = (
+            None if capture_limit_bytes is None else max(0, int(capture_limit_bytes))
         )
         # Per-sandbox gates; one entry per sandbox served by this manager.
         self._locks: dict[str, _CommandGate] = {}
@@ -280,6 +337,7 @@ class ProcessManager:
                 config=config,
                 tag=tag,
                 _running=running,
+                capture_limit=self._capture_limit_bytes,
             )
             self._processes[proc.pid] = proc
             if self._on_command_log is not None:
@@ -313,10 +371,17 @@ class ProcessManager:
                         continue
                     buf = proc.captured.get(kind)
                     if buf is not None:
-                        buf.extend(chunk)
+                        truncated_now = append_captured(proc, kind, chunk)
+                    else:
+                        truncated_now = False
                     if self._on_command_log is not None:
                         self._on_command_log(proc, kind, chunk)
                     self._broadcast(proc, ("data", kind, chunk))
+                    if truncated_now:
+                        marker = TRUNCATED_MARK
+                        if self._on_command_log is not None:
+                            self._on_command_log(proc, kind, marker)
+                        self._broadcast(proc, ("data", kind, marker))
                 exit_code = await running.exit_code()
             except asyncio.CancelledError:
                 running.kill(signal.SIGKILL)
