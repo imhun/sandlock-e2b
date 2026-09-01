@@ -20,3 +20,63 @@ async def require_api_key(
     if key is None or key not in settings.all_api_keys:
         raise OfficialError(401, "Unauthorized")
     return key
+
+
+def tenant_of(request: Request) -> tuple[str | None, bool]:
+    """Resolve the request key to ``(tenant_id, is_admin)``.
+
+    Admin keys return ``(None, True)`` (all tenants). Tenant keys return
+    ``(tenant_id, False)``. In compatible mode (E2B_TENANTS unset) every
+    key returns ``(None, False)`` — no isolation, matching legacy behavior.
+    """
+    settings = request.app.state.settings
+    key = request.headers.get("X-API-Key") or request.headers.get("X-API-KEY")
+    if key is None:
+        return None, False
+    if key in settings.admin_api_keys:
+        return None, True
+    return settings.tenant_of_key(key), False
+
+
+def tenant_scope(request: Request) -> str | None:
+    """Tenant to filter list endpoints by; ``None`` means no filtering
+    (admin keys and compatible mode)."""
+    tenant, is_admin = tenant_of(request)
+    return None if is_admin else tenant
+
+
+def _require_owned(
+    request: Request,
+    record,
+    *,
+    resource_id: str | None = None,
+    label: str = "resource",
+) -> None:
+    """Single-resource ownership guard: a non-matching tenant gets the same
+    404 as a missing resource (no existence leak)."""
+    tenant, is_admin = tenant_of(request)
+    if is_admin or tenant is None:
+        return
+    if getattr(record, "tenant_id", None) != tenant:
+        if resource_id:
+            raise OfficialError(404, f"{label} {resource_id} not found")
+        raise OfficialError(404, f"{label} not found")
+
+
+def _require_related(
+    request: Request,
+    record,
+    *,
+    resource_id: str | None = None,
+    label: str = "resource",
+) -> None:
+    """Cross-resource guard (mount a volume, fork from a snapshot/template,
+    inject a secret): mismatched tenants are rejected with 403."""
+    tenant, is_admin = tenant_of(request)
+    if is_admin or tenant is None:
+        return
+    if getattr(record, "tenant_id", None) != tenant:
+        suffix = f" {resource_id}" if resource_id else ""
+        raise OfficialError(
+            403, f"{label}{suffix} does not belong to this tenant"
+        )
