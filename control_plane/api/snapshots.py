@@ -257,6 +257,10 @@ async def _create_sandbox_from_snapshot(
                     workspace_dir=workspace_dir,
                     fallback_mount_point=settings.workspace_base,
                     via_agent=False,
+                    # A fork is a new sandbox: with per-sandbox volume quota
+                    # it provisions its own fresh slice (the parent's slice
+                    # is never inherited — snapshots capture the workspace
+                    # only, not volume contents).
                     existing_volume_projects=[],
                 )
             except ValueError as e:

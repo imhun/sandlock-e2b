@@ -310,6 +310,7 @@ async def agent_delete_sandbox(
     sandbox_id: str,
     request: Request,
     keepFiles: bool = Query(default=False),
+    keepVolumeSlices: bool = Query(default=False),
 ) -> Response:
     settings = request.app.state.settings
     try:
@@ -333,6 +334,10 @@ async def agent_delete_sandbox(
     # same storage hosts the sandbox on every node, so removing it would
     # destroy the live sandbox's files, and its project id must stay until
     # the sandbox is really deleted.
+    # keepVolumeSlices=true is the migration counterpart: the workspace may
+    # be removed (non-shared workspace export finished), but per-sandbox
+    # volume slices under a shared volume root are still in use by the
+    # target node and must never be deleted by a migration stop/rollback.
     if not keepFiles:
         if project_id is not None:
             try:
@@ -348,11 +353,12 @@ async def agent_delete_sandbox(
                     sandbox_id,
                     exc,
                 )
-        cleanup_volume_projects(
-            volume_projects=volume_projects,
-            fallback_mount_point=settings.workspace_base,
-            via_agent=settings.quota_via_agent,
-        )
+        if not keepVolumeSlices:
+            cleanup_volume_projects(
+                volume_projects=volume_projects,
+                fallback_mount_point=settings.workspace_base,
+                via_agent=settings.quota_via_agent,
+            )
         shutil.rmtree(workspace_dir, ignore_errors=True)
     return Response(status_code=204)
 

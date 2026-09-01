@@ -23,7 +23,10 @@ per-sandbox limit.
 Lifecycle: sandbox deletion calls :func:`cleanup_volume_projects`, which
 releases the project state and removes only the sandbox's own slice. The
 volume root and other sandboxes' slices are never touched (reference
-counting lives on the volume side).
+counting lives on the volume side). Migration stop/rollback must NOT call
+it for shared volumes: the target node re-provisions the same slice, so a
+``keepVolumeSlices`` destroy only releases the runtime (the slice follows
+the sandbox until the sandbox itself is deleted).
 
 NFS form: ``via_agent=True`` delegates every ``xfs_quota`` operation to
 quota-agent server-side (E2.6 wiring); unconfigured agent ops raise

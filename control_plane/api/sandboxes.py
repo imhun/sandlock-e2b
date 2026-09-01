@@ -822,14 +822,25 @@ async def kill_sandbox(sandbox_id: str, request: Request) -> Response:
     return Response(status_code=204)
 
 
-async def _destroy_remote(request, record, node, keep_files: bool = False) -> None:
+async def _destroy_remote(
+    request,
+    record,
+    node,
+    keep_files: bool = False,
+    keep_volume_slices: bool = False,
+) -> None:
     import httpx
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             url = f"{node.address}/agent/sandboxes/{record.sandbox_id}"
+            params = []
             if keep_files:
-                url += "?keepFiles=true"
+                params.append("keepFiles=true")
+            if keep_volume_slices:
+                params.append("keepVolumeSlices=true")
+            if params:
+                url += "?" + "&".join(params)
             await client.delete(
                 url,
                 headers={
@@ -840,8 +851,17 @@ async def _destroy_remote(request, record, node, keep_files: bool = False) -> No
         pass
 
 
-def _destroy_local(state, record, keep_files: bool = False) -> None:
-    """Stop and clean a local sandbox runtime, including volume slices."""
+def _destroy_local(
+    state, record, keep_files: bool = False, keep_volume_slices: bool = False
+) -> None:
+    """Stop and clean a local sandbox runtime, including volume slices.
+
+    ``keep_files=True`` keeps the workspace and volume slices (migration
+    source stop / shared-workspace teardown). ``keep_volume_slices=True``
+    keeps only the per-sandbox volume slices while still removing the
+    workspace — used by migration success and rollback, where the shared
+    volume slice is already in use by the target sandbox and must survive.
+    """
     runtime_registry = getattr(state, "runtime_registry", None)
     runtime = (
         runtime_registry.get(record.sandbox_id)
@@ -849,7 +869,11 @@ def _destroy_local(state, record, keep_files: bool = False) -> None:
         else None
     )
     if not keep_files:
-        if runtime is not None and runtime.volume_projects:
+        if (
+            not keep_volume_slices
+            and runtime is not None
+            and runtime.volume_projects
+        ):
             try:
                 from envd_service.volumes import cleanup_volume_projects
             except ImportError:  # pragma: no cover - separated control plane
@@ -867,11 +891,28 @@ def _destroy_local(state, record, keep_files: bool = False) -> None:
         runtime_registry.unregister(record.sandbox_id)
 
 
-async def _destroy_on_node(request, record, node, keep_files: bool = False) -> None:
+async def _destroy_on_node(
+    request,
+    record,
+    node,
+    keep_files: bool = False,
+    keep_volume_slices: bool = False,
+) -> None:
     if node.address == "local://":
-        _destroy_local(request.app.state, record, keep_files=keep_files)
+        _destroy_local(
+            request.app.state,
+            record,
+            keep_files=keep_files,
+            keep_volume_slices=keep_volume_slices,
+        )
         return
-    await _destroy_remote(request, record, node, keep_files=keep_files)
+    await _destroy_remote(
+        request,
+        record,
+        node,
+        keep_files=keep_files,
+        keep_volume_slices=keep_volume_slices,
+    )
 
 
 async def _stop_source_runtime(request, record, node) -> bool:
@@ -1151,7 +1192,17 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
                 record.node_id = target.node_id
                 registry.save(record)
                 nodes.release_quota(old_node_id, **dims)
-                await _destroy_on_node(request, record, source, keep_files=shared)
+                # The source workspace is released (non-shared) or kept
+                # (shared), but per-sandbox volume slices under a shared
+                # volume root are still mounted by the target sandbox:
+                # migration must never delete them (C1 E2.5 review).
+                await _destroy_on_node(
+                    request,
+                    record,
+                    source,
+                    keep_files=shared,
+                    keep_volume_slices=True,
+                )
                 note = f"migrated to node {target.node_id}"
                 if shared:
                     note += " (shared workspace)"
@@ -1164,9 +1215,20 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
                 # never delete it -- only drop a partial runtime registration.
                 nodes.release_quota(target.node_id, **dims)
                 if target.address == "local://":
-                    _destroy_local(request.app.state, record, keep_files=shared)
+                    _destroy_local(
+                        request.app.state,
+                        record,
+                        keep_files=shared,
+                        keep_volume_slices=True,
+                    )
                 else:
-                    await _destroy_remote(request, record, target, keep_files=shared)
+                    await _destroy_remote(
+                        request,
+                        record,
+                        target,
+                        keep_files=shared,
+                        keep_volume_slices=True,
+                    )
                 raise
         finally:
             if tar_path is not None:

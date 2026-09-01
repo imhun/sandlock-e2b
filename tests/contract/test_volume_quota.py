@@ -21,6 +21,7 @@ from __future__ import annotations
 import errno
 import os
 import re
+import shutil
 import uuid
 from pathlib import Path
 
@@ -74,6 +75,38 @@ def xfs_envd_app():
     )
 
 
+@pytest.fixture
+def xfs_two_envd_apps():
+    """Two worker agents with distinct workspace bases on the same XFS mount.
+
+    Non-shared workspace (each worker owns its sandbox directory) + a shared
+    volume root: the exact deployment shape the E2.5 migration review C1
+    covers — the target re-provisions the *same* volume slice.
+    """
+    if not _xfs_ready():
+        pytest.skip(
+            "XFS quota integration requires E2B_XFS_QUOTA_INTEGRATION=1 "
+            f"and prjquota support on {XFS_MOUNT}"
+        )
+    src_base = XFS_MOUNT / f"src_{uuid.uuid4().hex[:8]}"
+    dst_base = XFS_MOUNT / f"dst_{uuid.uuid4().hex[:8]}"
+    src_base.mkdir(parents=True)
+    dst_base.mkdir(parents=True)
+    src_app = create_envd_app(
+        settings=EnvdSettings(executor="local", workspace_base=src_base),
+        runtime_registry=RuntimeRegistry(src_base),
+    )
+    dst_app = create_envd_app(
+        settings=EnvdSettings(executor="local", workspace_base=dst_base),
+        runtime_registry=RuntimeRegistry(dst_base),
+    )
+    try:
+        yield src_app, dst_app, src_base, dst_base
+    finally:
+        shutil.rmtree(src_base, ignore_errors=True)
+        shutil.rmtree(dst_base, ignore_errors=True)
+
+
 async def _agent_create_sandbox(
     xfs_envd_app, *, sandbox_id: str, disk_mb: int, volume_mounts: list[dict]
 ) -> object:
@@ -103,12 +136,14 @@ async def _agent_create_sandbox(
     return record
 
 
-async def _agent_delete_sandbox(xfs_envd_app, sandbox_id: str) -> None:
+async def _agent_delete_sandbox(
+    xfs_envd_app, sandbox_id: str, params: str = ""
+) -> None:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=xfs_envd_app), base_url="http://test"
     ) as client:
         response = await client.delete(
-            f"/agent/sandboxes/{sandbox_id}",
+            f"/agent/sandboxes/{sandbox_id}{params}",
             headers={"X-Internal-Key": "internal-key"},
         )
     assert response.status_code == 204
@@ -294,3 +329,169 @@ async def test_quota_unsupported_degrades_to_volume_root(make_apps, workspace):
             )
             assert deleted.status_code == 204
         assert volume_root.is_dir()
+
+
+def _quota_mount(volume_root: Path) -> dict:
+    return {
+        "name": volume_root.name,
+        "path": "mnt/data",
+        "hostPath": str(volume_root),
+        "perSandboxQuotaMb": 8,
+    }
+
+
+async def test_migration_shared_volume_slice_survives_source_destroy(
+    xfs_two_envd_apps,
+):
+    """C1+I2: cross-node migration keeps the shared slice and its data.
+
+    Source and target are separate workers (distinct workspace bases) that
+    share the same volume root on the XFS mount. Migration success destroys
+    the source runtime/workspace with ``keepVolumeSlices=true``: the shared
+    slice the target re-provisioned must survive with its data, and the
+    target gets a fresh projid while the source's original projid drops to
+    zero usage (E2.4 reconciles the orphan).
+    """
+    src_app, dst_app, src_base, dst_base = xfs_two_envd_apps
+    volume_id = f"vol_{uuid.uuid4().hex[:12]}"
+    volume_root = XFS_MOUNT / volume_id
+    volume_root.mkdir(parents=True, exist_ok=True)
+    mount = _quota_mount(volume_root)
+    sandbox_id = f"sbx_{uuid.uuid4().hex[:12]}"
+    try:
+        src_record = await _agent_create_sandbox(
+            src_app, sandbox_id=sandbox_id, disk_mb=32, volume_mounts=[mount]
+        )
+        projid_src = src_record.volume_projects[0]["projid"]
+        slice_dir = volume_root / sandbox_id
+        assert src_record.volume_mounts[0]["hostPath"] == str(slice_dir)
+        (slice_dir / "payload.bin").write_bytes(b"migration-data")
+
+        # Migration stop: source runtime released, workspace + slice kept
+        # so the workspace can still be exported.
+        await _agent_delete_sandbox(
+            src_app, sandbox_id, params="?keepFiles=true"
+        )
+        assert (slice_dir / "payload.bin").read_bytes() == b"migration-data"
+
+        # Target re-provision: same shared slice, fresh projid (the original
+        # projid is still in the project table, so a new one is allocated).
+        dst_record = await _agent_create_sandbox(
+            dst_app, sandbox_id=sandbox_id, disk_mb=32, volume_mounts=[mount]
+        )
+        projid_dst = dst_record.volume_projects[0]["projid"]
+        assert dst_record.volume_mounts[0]["hostPath"] == str(slice_dir)
+        assert projid_dst != projid_src
+        rows = _report_rows()
+        assert (rows[projid_dst][1], rows[projid_dst][2]) == (0, 8 * 1024)
+
+        # Migration success cleanup: the source workspace is gone but the
+        # shared slice survives (C1 — the target still serves it).
+        await _agent_delete_sandbox(
+            src_app, sandbox_id, params="?keepVolumeSlices=true"
+        )
+        assert not (src_base / sandbox_id).exists()
+        assert (slice_dir / "payload.bin").read_bytes() == b"migration-data"
+
+        # I2: the target's new projid owns the slice usage; the original
+        # source projid is a zero-usage orphan for E2.4 reconciliation.
+        rows = _report_rows()
+        assert rows[projid_dst][0] >= 1
+        assert rows[projid_src][0] == 0
+    finally:
+        # Real sandbox deletion (on the target) is what finally frees the
+        # slice; the source workspace was already released above.
+        await _agent_delete_sandbox(dst_app, sandbox_id)
+        if volume_root.exists() and not list(volume_root.iterdir()):
+            volume_root.rmdir()
+
+
+async def test_migration_rollback_keeps_shared_slice(xfs_two_envd_apps):
+    """C1 rollback: a failed target provision never deletes the shared slice.
+
+    The partial target runtime is destroyed with ``keepVolumeSlices=true``,
+    the slice (with the original data) survives, and re-provisioning the
+    source restores the mount view.
+    """
+    src_app, dst_app, src_base, dst_base = xfs_two_envd_apps
+    volume_id = f"vol_{uuid.uuid4().hex[:12]}"
+    volume_root = XFS_MOUNT / volume_id
+    volume_root.mkdir(parents=True, exist_ok=True)
+    mount = _quota_mount(volume_root)
+    sandbox_id = f"sbx_{uuid.uuid4().hex[:12]}"
+    try:
+        src_record = await _agent_create_sandbox(
+            src_app, sandbox_id=sandbox_id, disk_mb=32, volume_mounts=[mount]
+        )
+        slice_dir = volume_root / sandbox_id
+        assert src_record.volume_mounts[0]["hostPath"] == str(slice_dir)
+        (slice_dir / "payload.bin").write_bytes(b"rollback-data")
+
+        await _agent_delete_sandbox(
+            src_app, sandbox_id, params="?keepFiles=true"
+        )
+        dst_record = await _agent_create_sandbox(
+            dst_app, sandbox_id=sandbox_id, disk_mb=32, volume_mounts=[mount]
+        )
+        assert dst_record.volume_projects[0]["projid"] != src_record.volume_projects[0]["projid"]
+
+        # Rollback: destroy the partial target without touching the slice.
+        await _agent_delete_sandbox(
+            dst_app, sandbox_id, params="?keepVolumeSlices=true"
+        )
+        assert not (dst_base / sandbox_id).exists()
+        assert (slice_dir / "payload.bin").read_bytes() == b"rollback-data"
+
+        # Re-provision on the source: data is still there.
+        restored = await _agent_create_sandbox(
+            src_app, sandbox_id=sandbox_id, disk_mb=32, volume_mounts=[mount]
+        )
+        assert restored.volume_mounts[0]["hostPath"] == str(slice_dir)
+        assert (slice_dir / "payload.bin").read_bytes() == b"rollback-data"
+    finally:
+        await _agent_delete_sandbox(src_app, sandbox_id)
+        if volume_root.exists() and not list(volume_root.iterdir()):
+            volume_root.rmdir()
+
+
+async def test_snapshot_fork_quota_gets_fresh_slice(xfs_envd_app):
+    """I1: forking a quota-limited volume yields a fresh, empty slice.
+
+    Snapshots capture the workspace only; volume contents stay inside the
+    parent sandbox's per-sandbox slice. A fork is a new sandbox with a new
+    id, so it provisions its own empty slice (per-sandbox quota isolation)
+    and never inherits the parent's slice or projid.
+    """
+    volume_id = f"vol_{uuid.uuid4().hex[:12]}"
+    volume_root = XFS_MOUNT / volume_id
+    volume_root.mkdir(parents=True, exist_ok=True)
+    mount = _quota_mount(volume_root)
+    parent_id = f"sbx_{uuid.uuid4().hex[:12]}"
+    fork_id = f"sbx_{uuid.uuid4().hex[:12]}"
+    try:
+        parent = await _agent_create_sandbox(
+            xfs_envd_app, sandbox_id=parent_id, disk_mb=32, volume_mounts=[mount]
+        )
+        parent_slice = volume_root / parent_id
+        (parent_slice / "parent.bin").write_bytes(b"parent-data")
+
+        # The control-plane fork path re-provisions with the fork's own
+        # sandbox id and empty existing_volume_projects.
+        fork = await _agent_create_sandbox(
+            xfs_envd_app, sandbox_id=fork_id, disk_mb=32, volume_mounts=[mount]
+        )
+        fork_slice = volume_root / fork_id
+        assert fork.volume_mounts[0]["hostPath"] == str(fork_slice)
+        assert (
+            fork.volume_projects[0]["projid"]
+            != parent.volume_projects[0]["projid"]
+        )
+        assert fork_slice.is_dir()
+        assert list(fork_slice.iterdir()) == []
+        # The parent's slice and data are untouched by the fork.
+        assert (parent_slice / "parent.bin").read_bytes() == b"parent-data"
+    finally:
+        await _agent_delete_sandbox(xfs_envd_app, parent_id)
+        await _agent_delete_sandbox(xfs_envd_app, fork_id)
+        if volume_root.exists() and not list(volume_root.iterdir()):
+            volume_root.rmdir()

@@ -674,3 +674,46 @@ async def test_agent_delete_keepfiles_skips_volume_cleanup(tmp_path, monkeypatch
     assert cleanup_calls == []
     # Files (workspace + volume slice) survive for migration rollback.
     assert (volume_root / sandbox_id).is_dir()
+
+
+async def test_agent_delete_keep_volume_slices_removes_workspace_but_keeps_slices(
+    tmp_path, monkeypatch
+):
+    """C1: migration cleanup removes the workspace, never the shared slice."""
+    cleanup_calls = []
+    app = _agent_app(tmp_path, monkeypatch, cleanup_calls)
+    sandbox_id = "sbx_migrated"
+    volume_root = tmp_path / "vol_1"
+    volume_root.mkdir()
+    response = await _agent_post(
+        app,
+        sandbox_id,
+        [
+            {
+                "name": "vol_1",
+                "path": "mnt/data",
+                "hostPath": str(volume_root),
+                "perSandboxQuotaMb": 512,
+            }
+        ],
+    )
+    assert response.status_code == 201
+    slice_dir = volume_root / sandbox_id
+    (slice_dir / "payload.bin").write_bytes(b"keep-me")
+    workspace_dir = tmp_path / sandbox_id
+
+    import httpx
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        deleted = await client.delete(
+            f"/agent/sandboxes/{sandbox_id}?keepVolumeSlices=true",
+            headers={"X-Internal-Key": "internal-key"},
+        )
+    assert deleted.status_code == 204
+    # Volume slice cleanup is skipped (the target node re-provisioned the
+    # same shared slice), while the migrated workspace is released.
+    assert cleanup_calls == []
+    assert (slice_dir / "payload.bin").read_bytes() == b"keep-me"
+    assert not workspace_dir.exists()
