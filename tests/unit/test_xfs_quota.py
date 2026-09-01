@@ -233,3 +233,132 @@ def test_configure_agent_query_wires_module_hook(monkeypatch):
     finally:
         xfs_quota.configure_agent_query(None)
     assert xfs_quota.agent_query is None
+
+
+def test_local_xfs_info_failure_degrades(monkeypatch, caplog):
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_mounts",
+        lambda: _mounts("/dev/nvme0n1p2 /srv/sandboxes xfs rw,prjquota 0 0"),
+    )
+    monkeypatch.setattr(xfs_quota, "_run_xfs_info", lambda _mp: None)
+    caplog.set_level(logging.WARNING)
+    assert xfs_project_supported("/srv/sandboxes") == (
+        False,
+        "cannot determine projid32bit: xfs_info unavailable or failed",
+    )
+    assert [r.message for r in caplog.records] == [
+        "XFS project quota unavailable for /srv/sandboxes: "
+        "cannot determine projid32bit: xfs_info unavailable or failed",
+    ]
+
+
+def test_local_xfs_info_output_missing_projid32bit_degrades(monkeypatch):
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_mounts",
+        lambda: _mounts("/dev/nvme0n1p2 /srv/sandboxes xfs rw,prjquota 0 0"),
+    )
+    monkeypatch.setattr(
+        xfs_quota,
+        "_run_xfs_info",
+        lambda _mp: "meta-data=/dev/nvme0n1p2     isize=512    agcount=4\n",
+    )
+    assert xfs_project_supported("/srv/sandboxes") == (
+        False,
+        "cannot determine projid32bit: xfs_info output has no projid32bit",
+    )
+
+
+def test_local_mount_path_with_octal_escape(monkeypatch):
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_mounts",
+        lambda: _mounts("/dev/sda1 /srv/sandbox\\040space xfs rw,prjquota 0 0"),
+    )
+    monkeypatch.setattr(xfs_quota, "_run_xfs_info", lambda _mp: _xfs_info(1))
+    monkeypatch.setattr(xfs_quota, "_xfs_quota_available", lambda: True)
+    assert xfs_project_supported("/srv/sandbox space") == (True, "")
+
+
+def test_local_deepest_mount_wins(monkeypatch):
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_mounts",
+        lambda: _mounts(
+            "/dev/sda1 /srv xfs rw,prjquota 0 0",
+            "/dev/sda2 /srv/sandboxes ext4 rw 0 0",
+        ),
+    )
+    assert xfs_project_supported("/srv/sandboxes") == (
+        False,
+        "filesystem is ext4, not xfs",
+    )
+
+
+def test_local_deeper_xfs_over_shallower_non_xfs(monkeypatch):
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_mounts",
+        lambda: _mounts(
+            "/dev/sda1 /srv ext4 rw 0 0",
+            "/dev/sda2 /srv/sandboxes xfs rw,prjquota 0 0",
+        ),
+    )
+    monkeypatch.setattr(xfs_quota, "_run_xfs_info", lambda _mp: _xfs_info(1))
+    monkeypatch.setattr(xfs_quota, "_xfs_quota_available", lambda: True)
+    assert xfs_project_supported("/srv/sandboxes") == (True, "")
+
+
+def test_local_short_mount_lines_skipped(monkeypatch):
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_mounts",
+        lambda: _mounts(
+            "/dev/sda1 /srv/sandboxes",
+            "/dev/nvme0n1p2 /srv/sandboxes xfs rw,prjquota 0 0",
+        ),
+    )
+    monkeypatch.setattr(xfs_quota, "_run_xfs_info", lambda _mp: _xfs_info(1))
+    monkeypatch.setattr(xfs_quota, "_xfs_quota_available", lambda: True)
+    assert xfs_project_supported("/srv/sandboxes") == (True, "")
+
+
+def test_via_agent_error_dict_degrades(monkeypatch, caplog):
+    monkeypatch.setattr(
+        xfs_quota,
+        "agent_query",
+        lambda _mp: {"error": "server cannot determine fs"},
+    )
+    caplog.set_level(logging.WARNING)
+    assert xfs_project_supported("/mnt/nfs", via_agent=True) == (
+        False,
+        "server cannot determine fs",
+    )
+    assert [r.message for r in caplog.records] == [
+        "XFS project quota unavailable for /mnt/nfs: server cannot determine fs",
+    ]
+
+
+@pytest.mark.parametrize(
+    "facts",
+    [
+        {"projid32bit": True, "prjquota": True, "xfs_quota": True},
+        {"fs_type": "", "projid32bit": True, "prjquota": True, "xfs_quota": True},
+    ],
+)
+def test_via_agent_missing_or_empty_fs_type_fails(monkeypatch, facts):
+    monkeypatch.setattr(xfs_quota, "agent_query", lambda _mp: facts)
+    assert xfs_project_supported("/mnt/nfs", via_agent=True) == (
+        False,
+        "filesystem is unknown, not xfs",
+    )
+
+
+@pytest.mark.parametrize("payload", [None, "oops", ["xfs"]])
+def test_via_agent_non_dict_payload_degrades(monkeypatch, payload):
+    monkeypatch.setattr(xfs_quota, "agent_query", lambda _mp: payload)
+    assert xfs_project_supported("/mnt/nfs", via_agent=True) == (
+        False,
+        "invalid facts from quota-agent",
+    )

@@ -142,6 +142,8 @@ def _local_facts(mount_point: str | Path) -> dict[str, Any]:
 
 def _evaluate_facts(facts: dict[str, Any]) -> tuple[bool, str]:
     """Apply the quota decision rules to server-side or local facts."""
+    if not isinstance(facts, dict):
+        return _fail("invalid facts from quota-agent")
     if "error" in facts:
         return _fail(str(facts["error"]))
     if facts.get("fs_type") != "xfs":
