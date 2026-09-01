@@ -92,12 +92,24 @@ SDK iam 端到端（origin 收到 `Authorization: Bearer <jwt>` 且 aud 正确�
 另发现并规避：同步 e2b SDK 会阻塞测试事件循环，harness 用例里的本地
 origin 需跑在后台线程。
 
-**验证基线（fork，Linux 容器，全程非 root uid=65534）**：lib
-`780 passed, 0 failed`（feature/network-socks5；netns-free PR 分支
-`770 passed`）；integration `437 passed, 0 failed`（PR 分支 `432`；netns
+**验证基线（fork，Linux 容器，全程非 root uid=65534，2026-09-01 更新）**：
+lib `773 passed, 0 failed`；integration `445 passed, 0 failed`（netns
 用例在无 CAP_NET_ADMIN 时按能力跳过）；Python `430 passed, 0 skipped`
 （`deploy/docker/Dockerfile.test-runner` 已补 `/usr/bin/python3 -> /usr/local/bin/python3`
 符号链接）。
+
+**内核级隔离（S1.1/S1.2 已落地，`upstream-pr/netns-free-clean`）**：
+
+- **PID namespace（`pid_ns=true` 开关，默认 false）**：`CLONE_NEWPID` 两级
+  fork，沙箱内 pid 1 = 首进程；`kill(host_pid,0)` 返回 ESRCH（不再可枚举）；
+  procfs 按 ns pid 重编号；on-behalf `/proc` open 只读元数据白名单
+  （root/mem/fd 等 EACCES）；freeze/thaw/checkpoint/throttle/tty/stat 家族/
+  线程 tid 全覆盖测试。
+- **独立 uid（userns 单 entry，`RunAs` 任意 host uid）**：root supervisor
+  下不同沙箱不同 host uid → 同路径文件（0700）与 unix socket 真隔离（内核
+  DAC，非仅 Landlock）。**约束：非 root supervisor 无法映射任意 host uid，
+  请求不同 uid 的 RunAs 会 fail-closed 拒绝——每沙箱独立 uid 需要
+  root/CAP_SETUID 或等价机制**（E3.2/E5.1 架构输入）。
 
 **环境注意事项**：
 
