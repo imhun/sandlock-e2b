@@ -24,6 +24,19 @@ Assignment rules (``--mapping``, JSON):
 * anything still unassigned falls back to ``--default-tenant``;
 * anything still unowned is reported (and fails with ``--strict``).
 
+Volume records: pre-E3.1 volumes have no ``_meta`` record, and their
+``name``/``token``/``node_id`` were never persisted anywhere on disk. The
+script synthesizes placeholders (``name=<volume_id>``, empty token, local
+node) and prints an explicit warning: the original values are unrecoverable
+and the volume content API (token-auth) will reject the migrated volume
+until a token is assigned.
+
+Redis sandbox backfill: when ``--redis-url`` is given, the script also
+seeds the tenant quota ledger (``<namespace>:quota:tenant:*``) from the
+migrated sandbox records so pre-existing sandboxes count against
+``E2B_TENANT_LIMITS`` (no over-create after migration, no negative ledger
+on delete).
+
 Misconfiguration guard: when E2B_ADMIN_API_KEYS is empty the script refuses
 to run unless E2B_TENANTS (or ``--tenant-map``) is configured, so an
 intended isolation rollout cannot silently leave every key without a tenant
@@ -135,6 +148,18 @@ def migrate_volume_dir(
     if meta_path.is_file():
         payload = json.loads(meta_path.read_text(encoding="utf-8"))
     else:
+        # Pre-E3.1 volume records never persisted name/token/node_id; the
+        # directory name is all that survives on disk. Rebuild the record
+        # with explicit placeholders and warn loudly instead of silently
+        # fabricating values that look authoritative.
+        print(
+            f"WARNING: volume {volume_id} has no _meta record; "
+            "name/token/node_id were never persisted pre-E3.1 and are "
+            "unrecoverable. Using name={volume_id}, token=\"\", "
+            "node_id=local; the volume content API will reject requests "
+            "until a token is assigned.",
+            file=sys.stderr,
+        )
         payload = {
             "volume_id": volume_id,
             "name": volume_id,
@@ -193,30 +218,83 @@ def migrate_redis_sandboxes(
     *,
     dry_run: bool,
 ) -> Counter:
-    """Migrate sandbox records in the shared Redis store; per-tenant counts."""
+    """Migrate sandbox records in the shared Redis store; per-tenant counts.
+
+    After assigning tenants the tenant quota ledger
+    (``<namespace>:quota:tenant:*``) is reconciled from the existing records
+    so pre-existing sandboxes are counted against E2B_TENANT_LIMITS and
+    deleting them cannot drive the ledger negative.
+    """
     counts: Counter = Counter()
+    ledger: dict[str, dict[str, int]] = {}
     pattern = f"{namespace}:record:*"
     for key in client.keys(pattern):
         raw = client.get(key)
         if not raw:
             continue
         payload = json.loads(raw)
-        if payload.get("tenant_id") is not None:
-            continue
-        tenant = assign_tenant(
-            _resource_name(payload),
-            payload.get("started_at"),
-            rules,
-            default_tenant,
-        )
-        payload["tenant_id"] = tenant
-        if tenant is not None:
-            counts[tenant] += 1
-        else:
-            counts["<unowned>"] += 1
-        if not dry_run:
-            client.set(key, json.dumps(payload, separators=(",", ":")))
+        if payload.get("tenant_id") is None:
+            tenant = assign_tenant(
+                _resource_name(payload),
+                payload.get("started_at"),
+                rules,
+                default_tenant,
+            )
+            payload["tenant_id"] = tenant
+            if tenant is not None:
+                counts[tenant] += 1
+            else:
+                counts["<unowned>"] += 1
+            if not dry_run:
+                client.set(key, json.dumps(payload, separators=(",", ":")))
+        tenant = payload.get("tenant_id")
+        if tenant:
+            dims = _sandbox_ledger_dims(payload)
+            entry = ledger.setdefault(
+                tenant, {dim: 0 for dim in _SANDBOX_LEDGER_DIMS}
+            )
+            for dim, value in dims.items():
+                entry[dim] += value
+    if not dry_run:
+        _write_tenant_ledger(client, namespace, ledger)
     return counts
+
+
+_SANDBOX_LEDGER_DIMS = ("sandboxes", "memory", "cpu", "disk", "processes")
+
+
+def _sandbox_ledger_dims(payload: dict[str, Any]) -> dict[str, int]:
+    """Quota ledger dims for one sandbox record (mirrors manager.py)."""
+    return {
+        "sandboxes": 1,
+        "memory": int(payload.get("memory_mb", 512)),
+        "cpu": int(payload.get("cpu_count", 1)) * 100,
+        "disk": int(payload.get("disk_size_mb", 1024)),
+        "processes": int(payload.get("max_processes", 64)),
+    }
+
+
+def _write_tenant_ledger(
+    client,
+    namespace: str,
+    ledger: dict[str, dict[str, int]],
+) -> None:
+    """Reconcile ``<namespace>:quota:tenant:*`` with existing records.
+
+    SET-style (not increment) so re-running the script is idempotent, and
+    keys for tenants with no remaining sandboxes are removed.
+    """
+    quota_prefix = f"{namespace}:quota:tenant:"
+    for tenant, dims in ledger.items():
+        client.hset(
+            quota_prefix + tenant,
+            mapping={dim: value for dim, value in dims.items() if value > 0},
+        )
+    for key in client.keys(quota_prefix + "*"):
+        full_key = key.decode() if isinstance(key, bytes) else key
+        tenant = full_key.split(quota_prefix, 1)[1]
+        if tenant not in ledger:
+            client.delete(key)
 
 
 def _validate_deployment_config(tenant_map: dict[str, Any] | None) -> None:

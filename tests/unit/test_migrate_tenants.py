@@ -100,6 +100,42 @@ def test_migrate_volume_dir_skips_owned(workspace):
     assert (tenant, changed) == ("t1", False)
 
 
+def test_migrate_volume_dir_warns_on_synthesized_meta(workspace, capsys):
+    volumes = workspace / "_volumes"
+    vol_dir = volumes / "vol_legacy"
+    vol_dir.mkdir(parents=True)
+    meta_dir = volumes / "_meta"
+
+    _volume_id, tenant, changed = migrate_tenants.migrate_volume_dir(
+        vol_dir, meta_dir, {}, "t1", dry_run=False
+    )
+    assert (tenant, changed) == ("t1", True)
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "vol_legacy" in err
+    assert "unrecoverable" in err
+
+    # A volume that already has a _meta record warns nothing.
+    (meta_dir / "vol_legacy.json").write_text(
+        json.dumps(
+            {
+                "volume_id": "vol_legacy",
+                "name": "real-name",
+                "token": "tok",
+                "node_id": "local",
+                "created_at": _iso(2025),
+                "per_sandbox_quota_mb": 0,
+                "tenant_id": "t1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    migrate_tenants.migrate_volume_dir(
+        vol_dir, meta_dir, {}, "t2", dry_run=False
+    )
+    assert capsys.readouterr().err == ""
+
+
 def test_migrate_snapshot_json(workspace):
     snap_dir = workspace / "snap_old"
     snap_dir.mkdir(parents=True)
@@ -187,6 +223,135 @@ def test_redis_sandbox_migration():
     assert dict(counts) == {"t1": 1, "t2": 1}
     assert json.loads(client.get("e2b:record:sbx_old1"))["tenant_id"] == "t1"
     assert json.loads(client.get("e2b:record:sbx_old2"))["tenant_id"] == "t2"
+
+
+def _seed_sandbox_record(
+    client, sandbox_id: str, *, tenant_id=None, started_at=_iso(2025)
+) -> None:
+    client.set(
+        f"e2b:record:{sandbox_id}",
+        json.dumps(
+            {
+                "sandbox_id": sandbox_id,
+                "template_id": "base",
+                "client_id": "cli_x",
+                "started_at": started_at,
+                "end_at": _iso(2025),
+                "tenant_id": tenant_id,
+                "memory_mb": 512,
+                "cpu_count": 1,
+                "disk_size_mb": 1024,
+                "max_processes": 64,
+            }
+        ),
+    )
+
+
+def test_redis_migration_backfills_tenant_ledger():
+    server = fakeredis.FakeServer()
+    client = fakeredis.FakeRedis(server=server)
+    _seed_sandbox_record(client, "sbx_old", started_at=_iso(2025))
+
+    counts = migrate_tenants.migrate_redis_sandboxes(
+        client, "e2b", {"t1": {"before": _iso(2026)}}, None, dry_run=False
+    )
+    assert dict(counts) == {"t1": 1}
+    raw = client.hgetall("e2b:quota:tenant:t1")
+    assert {k.decode(): int(v) for k, v in raw.items()} == {
+        "sandboxes": 1,
+        "memory": 512,
+        "cpu": 100,
+        "disk": 1024,
+        "processes": 64,
+    }
+
+
+def test_redis_migration_ledger_enforces_quota_and_stays_non_negative():
+    from control_plane.config import Settings
+    from control_plane.registry.manager import (
+        ResourceUnavailableError,
+        SandboxRegistry,
+    )
+
+    server = fakeredis.FakeServer()
+    client = fakeredis.FakeRedis(server=server)
+    _seed_sandbox_record(client, "sbx_old", started_at=_iso(2025))
+    migrate_tenants.migrate_redis_sandboxes(
+        client, "e2b", {"t1": {"before": _iso(2026)}}, None, dry_run=False
+    )
+
+    settings = Settings(
+        api_keys=("local-key",),
+        max_sandboxes=100,
+        max_total_memory_mb=4096,
+        max_total_cpu_percent=0,
+        max_total_disk_mb=0,
+        max_total_processes=0,
+        tenant_limits={"t1": {"max_sandboxes": 1}},
+    )
+    registry = SandboxRegistry(
+        settings, redis_client=fakeredis.FakeRedis(server=server)
+    )
+    # The migrated pre-existing sandbox is already on the ledger, so a
+    # limit=1 tenant cannot over-create.
+    with pytest.raises(ResourceUnavailableError) as exc:
+        registry.create(
+            template_id="base",
+            timeout=300,
+            metadata={},
+            env_vars={},
+            secure=True,
+            allow_internet_access=False,
+            base_image=None,
+            tenant_id="t1",
+        )
+    assert str(exc.value) == "tenant quota exceeded"
+
+    # Deleting the migrated sandbox releases exactly its dims: no negative
+    # ledger, and one more create fits.
+    registry.delete("sbx_old")
+    assert registry._quota_store.get("tenant:t1") == {
+        "sandboxes": 0,
+        "memory": 0,
+        "cpu": 0,
+        "disk": 0,
+        "processes": 0,
+    }
+    created = registry.create(
+        template_id="base",
+        timeout=300,
+        metadata={},
+        env_vars={},
+        secure=True,
+        allow_internet_access=False,
+        base_image=None,
+        tenant_id="t1",
+    )
+    assert created.tenant_id == "t1"
+
+
+def test_redis_migration_ledger_reconcile_is_idempotent():
+    server = fakeredis.FakeServer()
+    client = fakeredis.FakeRedis(server=server)
+    _seed_sandbox_record(client, "sbx_t1a", tenant_id="t1")
+    _seed_sandbox_record(client, "sbx_t2a", tenant_id="t2", started_at=_iso(2027))
+    _seed_sandbox_record(client, "sbx_t2b", started_at=_iso(2027))
+    # Stale ledger from a tenant that no longer has records.
+    client.hset("e2b:quota:tenant:t9", mapping={"sandboxes": 3})
+
+    migrate_tenants.migrate_redis_sandboxes(
+        client, "e2b", {"t2": {"after": _iso(2026)}}, None, dry_run=False
+    )
+    assert client.hget("e2b:quota:tenant:t1", "sandboxes") == b"1"
+    assert client.hget("e2b:quota:tenant:t2", "sandboxes") == b"2"
+    assert client.exists("e2b:quota:tenant:t9") == 0
+
+    # Re-running the script recomputes the same ledger (no double counting).
+    migrate_tenants.migrate_redis_sandboxes(
+        client, "e2b", {"t2": {"after": _iso(2026)}}, None, dry_run=False
+    )
+    assert client.hget("e2b:quota:tenant:t1", "sandboxes") == b"1"
+    assert client.hget("e2b:quota:tenant:t2", "sandboxes") == b"2"
 
 
 def test_redis_migration_dry_run_keeps_records():
