@@ -15,6 +15,10 @@ async def test_total_memory_503_no_runtime(make_apps, workspace):
     control, envd = make_apps(
         control_settings=Settings(
             api_keys=("local-key",),
+            # Admission-only test: never require a base image on the local
+            # node (executor=auto would warm-peek E2B_BASE_IMAGE and 428 on
+            # a cold image cache).
+            executor="local",
             default_memory_mb=512,
             max_total_memory_mb=512,
             max_total_cpu_percent=0,
@@ -57,6 +61,7 @@ async def test_total_cpu_503(make_apps):
     control, envd = make_apps(
         control_settings=Settings(
             api_keys=("local-key",),
+            executor="local",
             default_cpu_percent=100,
             max_total_cpu_percent=100,
             max_total_memory_mb=0,
@@ -83,6 +88,7 @@ async def test_ttl_release_restores_creation(make_apps):
     control, envd = make_apps(
         control_settings=Settings(
             api_keys=("local-key",),
+            executor="local",
             default_memory_mb=512,
             max_total_memory_mb=512,
             max_total_cpu_percent=0,
@@ -108,4 +114,3 @@ async def test_ttl_release_restores_creation(make_apps):
             json={"templateID": "base", "timeout": 300},
         )
         assert second.status_code == 201
-
