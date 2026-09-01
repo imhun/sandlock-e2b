@@ -8,7 +8,7 @@ import signal
 from dataclasses import dataclass, field
 from typing import Any
 
-from gateway_common.errors import ConnectError, not_found
+from gateway_common.errors import ConnectError, not_found, resource_exhausted
 from envd_service.executors.base import (
     ExecConfig,
     Executor,
@@ -70,6 +70,41 @@ class ManagedProcess:
             pass
 
 
+class _CommandGate:
+    """Per-sandbox command gate: bounded concurrency + bounded wait queue.
+
+    At most ``max_concurrent`` commands hold a slot at once; further commands
+    wait on the semaphore. When ``max_queued`` commands are already waiting,
+    a new acquire fails fast with a 429 ``resource_exhausted`` error so an
+    unbounded backlog cannot build up.
+    """
+
+    def __init__(
+        self, sandbox_id: str, max_concurrent: int, max_queued: int
+    ) -> None:
+        self._sandbox_id = sandbox_id
+        self._max_concurrent = max_concurrent
+        self._max_queued = max_queued
+        self._slots = asyncio.Semaphore(max_concurrent)
+        self._waiters = 0
+
+    async def acquire(self) -> None:
+        if self._slots.locked() and self._waiters >= self._max_queued:
+            raise resource_exhausted(
+                f"sandbox {self._sandbox_id}: too many concurrent commands "
+                f"(running limit {self._max_concurrent}, "
+                f"queue limit {self._max_queued})"
+            )
+        self._waiters += 1
+        try:
+            await self._slots.acquire()
+        finally:
+            self._waiters -= 1
+
+    def release(self) -> None:
+        self._slots.release()
+
+
 class ProcessManager:
     """Owns all running commands/PTYs of one sandbox runtime."""
 
@@ -78,6 +113,10 @@ class ProcessManager:
         executor: Executor,
         max_command_timeout: int = 3600,
         on_command_log=None,
+        *,
+        sandbox_id: str | None = None,
+        max_concurrent_commands: int = 1,
+        max_queued_commands: int | None = None,
     ) -> None:
         self._executor = executor
         self._max_command_timeout = max_command_timeout
@@ -85,6 +124,29 @@ class ProcessManager:
         # Optional ``callback(proc, event, payload)`` for command output
         # logging; events are start/stdout/stderr/pty/end.
         self._on_command_log = on_command_log
+        self._sandbox_id = sandbox_id or "default"
+        self._max_concurrent_commands = max(1, int(max_concurrent_commands))
+        if max_queued_commands is None:
+            self._max_queued_commands = self._max_concurrent_commands
+        else:
+            self._max_queued_commands = max(0, int(max_queued_commands))
+        # Per-sandbox gates; one entry per sandbox served by this manager.
+        self._locks: dict[str, _CommandGate] = {}
+
+    def _gate(self) -> _CommandGate:
+        gate = self._locks.get(self._sandbox_id)
+        if gate is None:
+            gate = _CommandGate(
+                self._sandbox_id,
+                self._max_concurrent_commands,
+                self._max_queued_commands,
+            )
+            self._locks[self._sandbox_id] = gate
+        return gate
+
+    def remove_sandbox(self, sandbox_id: str | None = None) -> None:
+        """Drop the per-sandbox command gate (called on sandbox deletion)."""
+        self._locks.pop(sandbox_id or self._sandbox_id, None)
 
     async def start(
         self,
@@ -107,67 +169,84 @@ class ProcessManager:
             rows=rows,
             cols=cols,
         )
+        # Per-sandbox gate: commands to the same sandbox serialize on write
+        # access. Concurrent commands queue; a full wait queue fails fast
+        # with 429. The gate stays held until the command ends (released by
+        # _drive), so with the default limit of 1 commands run strictly
+        # serially.
+        gate = self._gate()
+        await gate.acquire()
         try:
-            running = await self._executor.start(config)
-        except FileNotFoundError:
-            running = FailedRunningProcess(
-                f"envd: {cmd[0] if cmd else ''}: command not found\n"
-            )
-        except Exception as e:
-            running = FailedRunningProcess(str(e) or type(e).__name__)
-        proc = ManagedProcess(
-            pid=running.pid,
-            config=config,
-            tag=tag,
-            _running=running,
-        )
-        self._processes[proc.pid] = proc
-        if self._on_command_log is not None:
-            self._on_command_log(proc, "start", None)
-        asyncio.create_task(self._drive(proc, running))
-        return proc
-
-    async def _drive(self, proc: ManagedProcess, running: RunningProcess) -> None:
-        timed_out = False
-
-        async def _watchdog() -> None:
-            nonlocal timed_out
             try:
-                await asyncio.sleep(self._max_command_timeout)
-                timed_out = True
-                running.kill(signal.SIGKILL)
-            except asyncio.CancelledError:
-                pass
-
-        watchdog = asyncio.create_task(_watchdog())
-        try:
-            async for kind, chunk in running.output():
-                if kind not in ("stdout", "stderr", "pty"):
-                    continue
-                buf = proc.captured.get(kind)
-                if buf is not None:
-                    buf.extend(chunk)
-                if self._on_command_log is not None:
-                    self._on_command_log(proc, kind, chunk)
-                self._broadcast(proc, ("data", kind, chunk))
-            exit_code = await running.exit_code()
-        except asyncio.CancelledError:
-            running.kill(signal.SIGKILL)
-            watchdog.cancel()
+                running = await self._executor.start(config)
+            except FileNotFoundError:
+                running = FailedRunningProcess(
+                    f"envd: {cmd[0] if cmd else ''}: command not found\n"
+                )
+            except Exception as e:
+                running = FailedRunningProcess(str(e) or type(e).__name__)
+            proc = ManagedProcess(
+                pid=running.pid,
+                config=config,
+                tag=tag,
+                _running=running,
+            )
+            self._processes[proc.pid] = proc
+            if self._on_command_log is not None:
+                self._on_command_log(proc, "start", None)
+            asyncio.create_task(self._drive(proc, running, gate))
+            return proc
+        except BaseException:
+            # Cancel/error before _drive was scheduled must not leak the slot.
+            gate.release()
             raise
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("process %s output loop failed", proc.pid)
-            exit_code = -1
-        finally:
-            watchdog.cancel()
 
-        proc.exit_code = exit_code
-        proc.ended = True
-        status = "killed" if (timed_out or exit_code < 0) else "exited"
-        if self._on_command_log is not None:
-            self._on_command_log(proc, "end", exit_code)
-        self._broadcast(proc, ("end", exit_code, status))
-        self._processes.pop(proc.pid, None)
+    async def _drive(
+        self, proc: ManagedProcess, running: RunningProcess, gate: _CommandGate
+    ) -> None:
+        try:
+            timed_out = False
+
+            async def _watchdog() -> None:
+                nonlocal timed_out
+                try:
+                    await asyncio.sleep(self._max_command_timeout)
+                    timed_out = True
+                    running.kill(signal.SIGKILL)
+                except asyncio.CancelledError:
+                    pass
+
+            watchdog = asyncio.create_task(_watchdog())
+            try:
+                async for kind, chunk in running.output():
+                    if kind not in ("stdout", "stderr", "pty"):
+                        continue
+                    buf = proc.captured.get(kind)
+                    if buf is not None:
+                        buf.extend(chunk)
+                    if self._on_command_log is not None:
+                        self._on_command_log(proc, kind, chunk)
+                    self._broadcast(proc, ("data", kind, chunk))
+                exit_code = await running.exit_code()
+            except asyncio.CancelledError:
+                running.kill(signal.SIGKILL)
+                watchdog.cancel()
+                raise
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("process %s output loop failed", proc.pid)
+                exit_code = -1
+            finally:
+                watchdog.cancel()
+
+            proc.exit_code = exit_code
+            proc.ended = True
+            status = "killed" if (timed_out or exit_code < 0) else "exited"
+            if self._on_command_log is not None:
+                self._on_command_log(proc, "end", exit_code)
+            self._broadcast(proc, ("end", exit_code, status))
+            self._processes.pop(proc.pid, None)
+        finally:
+            gate.release()
 
     @staticmethod
     def _broadcast(proc: ManagedProcess, item: tuple) -> None:

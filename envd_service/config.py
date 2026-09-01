@@ -81,6 +81,23 @@ class Settings:
     default_max_open_files: int = field(
         default_factory=lambda: _env_int("E2B_DEFAULT_MAX_OPEN_FILES", 4096)
     )
+    # Per-sandbox command serialization (E2.3): max commands that may run
+    # concurrently for one sandbox (default 1 = strictly serial); commands
+    # beyond the limit queue.
+    max_concurrent_commands_per_sandbox: int = field(
+        default_factory=lambda: _env_int(
+            "E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX", 1
+        )
+    )
+    # Max commands allowed to wait for a slot; beyond this a new command is
+    # rejected with 429. None (default) = max_concurrent_commands_per_sandbox.
+    max_queued_commands_per_sandbox: int | None = field(
+        default_factory=lambda: (
+            None
+            if os.getenv("E2B_MAX_QUEUED_COMMANDS_PER_SANDBOX") in (None, "")
+            else _env_int("E2B_MAX_QUEUED_COMMANDS_PER_SANDBOX", 0)
+        )
+    )
     log_level: str = field(default_factory=lambda: os.getenv("E2B_LOG_LEVEL", "INFO"))
     internal_api_key: str = field(
         default_factory=lambda: os.getenv("E2B_INTERNAL_API_KEY", "internal-key")

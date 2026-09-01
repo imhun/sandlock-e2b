@@ -63,6 +63,9 @@ class SandboxRuntimeContext:
             self.executor,
             max_command_timeout=record.max_command_timeout,
             on_command_log=self._on_command_log,
+            sandbox_id=record.sandbox_id,
+            max_concurrent_commands=settings.max_concurrent_commands_per_sandbox,
+            max_queued_commands=settings.max_queued_commands_per_sandbox,
         )
         self.files = FilesystemOps(record.workspace_dir)
         self.watchers = WatcherRegistry(self.files)
@@ -99,6 +102,7 @@ class SandboxRuntimeContext:
 
     def shutdown(self) -> None:
         self.processes.kill_all()
+        self.processes.remove_sandbox()
         if self._mcp_gateway is not None:
             try:
                 self._mcp_gateway.kill(9)
