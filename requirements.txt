@@ -1,7 +1,9 @@
-fastapi>=0.110
-uvicorn[standard]>=0.29
-httpx>=0.27
-python-multipart>=0.0.9
-pydantic>=2.6
-mcp>=2.0
-redis>=5.0
+# E5.2: pinned exact versions so production installs are reproducible
+# (kept in sync with the test image e2b-sandlock-test:s3).
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+httpx==0.28.1
+python-multipart==0.0.32
+pydantic==2.13.5
+mcp==2.1.1
+redis==8.1.0
