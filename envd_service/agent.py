@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import shutil
 import tarfile
 from pathlib import Path
@@ -57,7 +58,12 @@ def _extract_sandbox_archive(archive_path: Path, dest: Path) -> None:
 
 def _require_internal_key(request: Request, settings: Settings) -> None:
     key = request.headers.get("X-Internal-Key")
-    if key != settings.internal_api_key:
+    # E3.6: accept any key in the rotation window list (falls back to the
+    # single E2B_INTERNAL_API_KEY when the list is empty).
+    if key is None or not any(
+        secrets.compare_digest(key, candidate)
+        for candidate in settings.all_internal_api_keys
+    ):
         raise PermissionError("Unauthorized")
 
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import secrets
+
 from fastapi import Header, Request
 
 from control_plane.api.errors import OfficialError
@@ -27,6 +29,27 @@ async def require_api_key(
         if settings.tenant_of_key(key) is None:
             raise OfficialError(403, "API key is not mapped to any tenant")
     return key
+
+
+def verify_internal_key(provided: str | None, settings) -> bool:
+    """Constant-time check of X-Internal-Key against the active key list.
+
+    E3.6: ``settings.internal_api_keys`` (E2B_INTERNAL_API_KEYS) carries the
+    rotation window — every listed key is valid. When the list is empty the
+    legacy single ``internal_api_key`` is the only credential. Workers and
+    the gateway accept the same list, so a deploy can add the new key,
+    roll the fleet, then drop the old key from the list.
+    """
+    if provided is None:
+        return False
+    keys = getattr(settings, "all_internal_api_keys", None)
+    if keys is None:
+        keys = (
+            getattr(settings, "internal_api_key", None) or "internal-key",
+        )
+    if not keys:
+        return False
+    return any(secrets.compare_digest(provided, key) for key in keys)
 
 
 def tenant_of(request: Request) -> tuple[str | None, bool]:

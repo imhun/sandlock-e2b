@@ -7,7 +7,12 @@ from types import SimpleNamespace
 import pytest
 
 from control_plane.api.errors import OfficialError
-from control_plane.auth import _require_owned, _require_related, tenant_of
+from control_plane.auth import (
+    _require_owned,
+    _require_related,
+    tenant_of,
+    verify_internal_key,
+)
 from control_plane.config import Settings
 
 
@@ -72,6 +77,42 @@ def test_all_api_keys_includes_tenant_and_admin_keys():
         "keyC",
         "admin-key",
     }
+
+
+def test_all_internal_api_keys_falls_back_to_single_key():
+    settings = _settings()
+    assert settings.all_internal_api_keys == ("internal-key",)
+
+
+def test_all_internal_api_keys_rotation_window():
+    settings = _settings(
+        internal_api_key="new-key", internal_api_keys=("old-key", "new-key")
+    )
+    assert set(settings.all_internal_api_keys) == {"old-key", "new-key"}
+
+
+def test_verify_internal_key_single_key():
+    settings = _settings()
+    assert verify_internal_key("internal-key", settings) is True
+    assert verify_internal_key("wrong", settings) is False
+    assert verify_internal_key(None, settings) is False
+
+
+def test_verify_internal_key_rotation_window_both_valid():
+    settings = _settings(
+        internal_api_key="new-key", internal_api_keys=("old-key", "new-key")
+    )
+    assert verify_internal_key("old-key", settings) is True
+    assert verify_internal_key("new-key", settings) is True
+    assert verify_internal_key("stale-key", settings) is False
+
+
+def test_verify_internal_key_old_invalid_after_finalize():
+    settings = _settings(
+        internal_api_key="new-key", internal_api_keys=("new-key",)
+    )
+    assert verify_internal_key("new-key", settings) is True
+    assert verify_internal_key("old-key", settings) is False
 
 
 def test_tenant_map_requires_list_values():

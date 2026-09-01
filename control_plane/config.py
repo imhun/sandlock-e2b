@@ -105,6 +105,12 @@ class Settings:
     internal_api_key: str = field(
         default_factory=lambda: os.getenv("E2B_INTERNAL_API_KEY", "internal-key")
     )
+    # E3.6: rotation window. When E2B_INTERNAL_API_KEYS is set, every listed
+    # key authenticates X-Internal-Key (old + new valid during rotation);
+    # once the old key is removed from the list it stops working.
+    internal_api_keys: tuple[str, ...] = field(
+        default_factory=lambda: _env_list("E2B_INTERNAL_API_KEYS", ())
+    )
     tls_cert_file: str | None = field(
         default_factory=lambda: os.getenv("E2B_TLS_CERT")
     )
@@ -177,6 +183,14 @@ class Settings:
         keys.extend(self.admin_api_keys)
         for tenant_keys in self.tenant_map.values():
             keys.extend(tenant_keys)
+        return tuple(dict.fromkeys(keys))
+
+    @property
+    def all_internal_api_keys(self) -> tuple[str, ...]:
+        """Active X-Internal-Key credentials (list first, single fallback)."""
+        keys = list(self.internal_api_keys)
+        if self.internal_api_key:
+            keys.append(self.internal_api_key)
         return tuple(dict.fromkeys(keys))
 
     @property

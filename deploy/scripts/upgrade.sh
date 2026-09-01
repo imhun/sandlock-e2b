@@ -10,6 +10,7 @@
 #   * run smoke tests (skip with --skip-smoke)
 #
 # Usage: ./deploy/scripts/upgrade.sh [--build] [--version <v>] [--env-file <path>] [--skip-smoke] [--force-env] [--keep-image-tags]
+#                                     [--rotate-internal-key] [--finalize-internal-key-rotation <old-key>]
 
 set -euo pipefail
 . "$(cd "$(dirname "$0")" && pwd)/lib/helpers.sh"
@@ -18,6 +19,8 @@ BUILD=0
 SKIP_SMOKE=0
 FORCE_ENV=0
 KEEP_IMAGE_TAGS=0
+ROTATE_INTERNAL=0
+FINALIZE_INTERNAL=""
 ENV_FILE=""
 VERSION_ARG=""
 while [ $# -gt 0 ]; do
@@ -28,6 +31,8 @@ while [ $# -gt 0 ]; do
         --skip-smoke) SKIP_SMOKE=1 ;;
         --force-env) FORCE_ENV=1 ;;
         --keep-image-tags) KEEP_IMAGE_TAGS=1 ;;
+        --rotate-internal-key) ROTATE_INTERNAL=1 ;;
+        --finalize-internal-key-rotation) FINALIZE_INTERNAL="${2:-}"; shift ;;
         *) echo "未知参数: $1" >&2; exit 1 ;;
     esac
     shift
@@ -78,7 +83,7 @@ fi
 
 # --- 保留远端密钥（默认）---
 if [ -n "$ENV_FILE" ] && [ "$FORCE_ENV" != "1" ]; then
-    for key in E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_IMAGE_REGISTRY_PASSWORD E2B_REDIS_PASSWORD; do
+    for key in E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_INTERNAL_API_KEYS E2B_IMAGE_REGISTRY_PASSWORD E2B_REDIS_PASSWORD; do
         if grep -qE "^$key=(__.*__)?$" "$ENV_FILE"; then
             remote_val="$(remote_env_value "$key" || true)"
             if [ -n "$remote_val" ]; then
@@ -87,6 +92,56 @@ if [ -n "$ENV_FILE" ] && [ "$FORCE_ENV" != "1" ]; then
             fi
         fi
     done
+fi
+
+# --- internal key 轮换（E3.6）---
+# 轮换 = 生成新主 key 并把它追加到 E2B_INTERNAL_API_KEYS（旧 key 保留，
+# 轮换窗口内新旧 key 均可用）；finalize = 从列表移除旧 key（立即失效）。
+if [ "$ROTATE_INTERNAL" = "1" ]; then
+    [ -n "$ENV_FILE" ] || { echo "--rotate-internal-key 需要 .env（首次部署会自动生成）" >&2; exit 1; }
+    NEW_INTERNAL_KEY="$(openssl rand -hex 24)"
+    CURRENT_KEYS="$(sed -n 's/^E2B_INTERNAL_API_KEYS=//p' "$ENV_FILE" | tail -1)"
+    if [ -z "$CURRENT_KEYS" ] || [ "$CURRENT_KEYS" = "__E2B_INTERNAL_API_KEYS__" ]; then
+        CURRENT_KEYS="$(sed -n 's/^E2B_INTERNAL_API_KEY=//p' "$ENV_FILE" | tail -1)"
+    fi
+    [ -n "$CURRENT_KEYS" ] || { echo "无法确定当前 internal key（.env 缺少 E2B_INTERNAL_API_KEY）" >&2; exit 1; }
+    NEW_LIST="$(INTERNAL_NEW_KEY="$NEW_INTERNAL_KEY" INTERNAL_CURRENT="$CURRENT_KEYS" python3 -c '
+import os
+keys = [k for k in os.environ["INTERNAL_CURRENT"].split(",") if k]
+keys = list(dict.fromkeys(keys + [os.environ["INTERNAL_NEW_KEY"]]))
+print(",".join(keys))
+')"
+    if grep -q '^E2B_INTERNAL_API_KEYS=' "$ENV_FILE"; then
+        sed "s|^E2B_INTERNAL_API_KEYS=.*|E2B_INTERNAL_API_KEYS=$NEW_LIST|" "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
+    else
+        printf '\nE2B_INTERNAL_API_KEYS=%s\n' "$NEW_LIST" >> "$ENV_FILE"
+    fi
+    sed "s|^E2B_INTERNAL_API_KEY=.*|E2B_INTERNAL_API_KEY=$NEW_INTERNAL_KEY|" "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
+    say "已轮换 internal key：新主 key 写入 E2B_INTERNAL_API_KEY；旧 key 保留在 E2B_INTERNAL_API_KEYS（轮换窗口内仍可用）"
+    say "所有节点滚动到新 key 后，执行 upgrade.sh --finalize-internal-key-rotation <旧key> 移除旧 key"
+fi
+
+if [ -n "$FINALIZE_INTERNAL" ]; then
+    [ -n "$ENV_FILE" ] || { echo "--finalize-internal-key-rotation 需要 .env" >&2; exit 1; }
+    PRIMARY_KEY="$(sed -n 's/^E2B_INTERNAL_API_KEY=//p' "$ENV_FILE" | tail -1)"
+    if [ "$FINALIZE_INTERNAL" = "$PRIMARY_KEY" ]; then
+        echo "不能移除当前主 key；请先 --rotate-internal-key 生成新主 key" >&2
+        exit 1
+    fi
+    CURRENT_KEYS="$(sed -n 's/^E2B_INTERNAL_API_KEYS=//p' "$ENV_FILE" | tail -1)"
+    [ -n "$CURRENT_KEYS" ] || { echo "E2B_INTERNAL_API_KEYS 为空：旧 key 已不在生效列表" >&2; exit 1; }
+    REMAINING="$(INTERNAL_OLD_KEY="$FINALIZE_INTERNAL" INTERNAL_CURRENT="$CURRENT_KEYS" python3 -c '
+import os
+old = os.environ["INTERNAL_OLD_KEY"]
+keys = [k for k in os.environ["INTERNAL_CURRENT"].split(",") if k and k != old]
+print(",".join(keys))
+')"
+    if [ "$REMAINING" = "$CURRENT_KEYS" ]; then
+        echo "E2B_INTERNAL_API_KEYS 中未找到 $FINALIZE_INTERNAL" >&2
+        exit 1
+    fi
+    sed "s|^E2B_INTERNAL_API_KEYS=.*|E2B_INTERNAL_API_KEYS=$REMAINING|" "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
+    say "已从 E2B_INTERNAL_API_KEYS 移除 $FINALIZE_INTERNAL：该 key 立即失效"
 fi
 
 # --- 镜像 tag 固定为当前版本（除非 --keep-image-tags）---

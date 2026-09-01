@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import threading
 import time
 
@@ -130,13 +131,24 @@ def create_gateway(
     *,
     control_plane_url: str | None = None,
     internal_api_key: str | None = None,
+    internal_api_keys: tuple[str, ...] | None = None,
 ) -> FastAPI:
     control_url = (
         control_plane_url or os.getenv("E2B_CONTROL_PLANE_URL", "")
     ).rstrip("/")
-    internal_key = internal_api_key or os.getenv(
+    keys: list[str] = []
+    if internal_api_keys:
+        keys.extend(internal_api_keys)
+    single = internal_api_key or os.getenv(
         "E2B_INTERNAL_API_KEY", "internal-key"
     )
+    if single:
+        keys.append(single)
+    for env_key in os.getenv("E2B_INTERNAL_API_KEYS", "").split(","):
+        if env_key.strip():
+            keys.append(env_key.strip())
+    internal_keys = tuple(dict.fromkeys(keys))
+    internal_key = internal_keys[0] if internal_keys else "internal-key"
     routes = RouteCache(ttl=_route_ttl())
 
     # Merged TLS mode (control_plane.combined_main) uses a self-signed
@@ -156,7 +168,11 @@ def create_gateway(
 
     @app.post("/internal/routes/{sandbox_id}/invalidate")
     async def invalidate_route(sandbox_id: str, request: Request) -> Response:
-        if request.headers.get("X-Internal-Key") != internal_key:
+        provided = request.headers.get("X-Internal-Key")
+        if provided is None or not any(
+            secrets.compare_digest(provided, candidate)
+            for candidate in internal_keys
+        ):
             return Response(status_code=401)
         routes.invalidate(sandbox_id)
         return Response(status_code=204)

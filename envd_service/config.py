@@ -6,7 +6,13 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from gateway_common.env import _env_bool, _env_float, _env_int, _env_json_dict
+from gateway_common.env import (
+    _env_bool,
+    _env_float,
+    _env_int,
+    _env_json_dict,
+    _env_list,
+)
 
 # Default private-egress denylist applied to the implicit full-egress branch
 # (no explicit allowOut/denyOut + internet allowed). Covers RFC1918, loopback,
@@ -155,6 +161,11 @@ class Settings:
     internal_api_key: str = field(
         default_factory=lambda: os.getenv("E2B_INTERNAL_API_KEY", "internal-key")
     )
+    # E3.6: rotation window (see control_plane/config.py). Workers accept
+    # every key in E2B_INTERNAL_API_KEYS while the list is populated.
+    internal_api_keys: tuple[str, ...] = field(
+        default_factory=lambda: _env_list("E2B_INTERNAL_API_KEYS", ())
+    )
     image_registry_username: str | None = field(
         default_factory=lambda: os.getenv("E2B_IMAGE_REGISTRY_USERNAME")
     )
@@ -169,3 +180,11 @@ class Settings:
             os.getenv("E2B_IMAGE_CACHE_DIR", "tmp/sandboxes/_images")
         ).resolve()
     )
+
+    @property
+    def all_internal_api_keys(self) -> tuple[str, ...]:
+        """Active X-Internal-Key credentials (list first, single fallback)."""
+        keys = list(self.internal_api_keys)
+        if self.internal_api_key:
+            keys.append(self.internal_api_key)
+        return tuple(dict.fromkeys(keys))

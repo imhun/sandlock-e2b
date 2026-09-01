@@ -9,15 +9,16 @@ from typing import Any
 from fastapi import APIRouter, Header, Request, Response
 
 from control_plane.api.errors import OfficialError
+from control_plane.auth import verify_internal_key
 
 router = APIRouter()
 
 
 def _require_internal_key(request: Request) -> None:
-    key = request.headers.get("X-Internal-Key")
     settings = request.app.state.settings
-    internal_key = getattr(settings, "internal_api_key", None) or "internal-key"
-    if key != internal_key:
+    if not verify_internal_key(
+        request.headers.get("X-Internal-Key"), settings
+    ):
         raise OfficialError(401, "Unauthorized")
 
 
