@@ -59,7 +59,18 @@ RUN cp envd_service/mcp/gateway.py /usr/bin/mcp-gateway \
     && chmod +x /usr/bin/mcp-gateway \
     && ln -sf /usr/bin/mcp-gateway /usr/local/bin/mcp-gateway
 
+# E5.1: the worker/supervisor must not run as root (escape amplification:
+# a sandbox that fully bypasses Landlock/seccomp would get container root).
+# sandlock officially supports uid 65534 with no privileged capabilities
+# (S1.3). The workspace base and the per-worker image cache directory are
+# created up front and owned by 65534; the named volume initialized from
+# this image inherits that ownership, so no root-side chown is needed on a
+# fresh deployment.
 ENV E2B_WORKSPACE_BASE=/var/lib/e2b-sandboxes
+RUN mkdir -p /var/lib/e2b-sandboxes /app/tmp/sandboxes \
+    && chown -R 65534:65534 /var/lib/e2b-sandboxes /app/tmp
+VOLUME /var/lib/e2b-sandboxes
+USER 65534:65534
 EXPOSE 49983
 
 CMD ["python", "-m", "envd_service"]

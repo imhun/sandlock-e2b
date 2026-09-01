@@ -107,7 +107,12 @@ def create_app(
     runtime_registry = runtime_registry or RuntimeRegistry(
         workspace_base or settings.workspace_base
     )
-    if settings.per_sandbox_uid:
+    # E5.1: per-sandbox host uids need a privileged supervisor (root /
+    # CAP_SETUID + chown). A non-root worker (uid 65534) cannot map
+    # arbitrary host uids (S1.2 fail-closed), so the switch is auto-disabled
+    # and the worker keeps the fixed-identity + Landlock model instead of
+    # crash-looping on EPERM.
+    if settings.per_sandbox_uid and os.geteuid() == 0:
         runtime_registry.uid_pool = UidPool(
             start=settings.uid_pool_start,
             size=settings.uid_pool_size,
@@ -115,6 +120,12 @@ def create_app(
         )
         runtime_registry.add_unregister_callback(
             runtime_registry.uid_pool.release
+        )
+    elif settings.per_sandbox_uid:
+        logger.warning(
+            "E2B_PER_SANDBOX_UID is enabled but the worker is not running "
+            "as root; per-sandbox host uids are disabled (non-root workers "
+            "use the fixed identity + Landlock model, E5.1)"
         )
     quota_monitor = QuotaMonitor(
         workspace_base=settings.workspace_base,

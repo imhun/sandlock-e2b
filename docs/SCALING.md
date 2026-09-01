@@ -324,6 +324,10 @@ env:
   必须等于 limits（容器内探测会看到宿主机全部资源，不显式覆盖会严重超卖）；
 - 权限：`securityContext.capabilities.add: [SYS_ADMIN]`、
   `securityContext.seccompProfile.type: Unconfined`（K8s 1.19+）；
+- 非 root（E5.1）：worker 镜像以 uid 65534 运行，Pod 同步声明
+  `securityContext.runAsNonRoot: true`、`runAsUser: 65534`、
+  `runAsGroup: 65534`（镜像已预建 `/var/lib/e2b-sandboxes` 且属主 65534；
+  既有 RWX PVC 需一次性 chown 到 65534，或由 initContainer 完成）；
 - 低端口：优先给 `NET_BIND_SERVICE` capability（替代
   `net.ipv4.ip_unprivileged_port_start=0` 这个 unsafe sysctl）；若仍走
   sysctl 方案，需 kubelet `--allowed-unsafe-sysctls` 放行；

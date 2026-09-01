@@ -163,8 +163,18 @@ if [ -n "$ENV_FILE" ]; then
     upload_file "$ENV_FILE" "$REMOTE_DIR/.env" "$DEPLOY_USER"
 fi
 
-say "拉取镜像并重建（deploy 用户）"
-run_as_deploy "cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml pull --quiet && docker compose -f docker-compose.prod.yml up -d --no-build --remove-orphans"
+say "拉取镜像（deploy 用户）"
+run_as_deploy "cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml pull --quiet"
+
+# E5.1: one-time shared-volume ownership migration for the non-root worker.
+# The worker image now runs as uid 65534, but a volume created by an older
+# (root) image is root-owned and would make the worker crash-loop. When the
+# deployed worker image is non-root, chown the volume once to the image's
+# uid (the control plane keeps running as root and is unaffected).
+run_as_deploy "cd '$REMOTE_DIR' && WORKER_UID=\$(docker compose -f docker-compose.prod.yml run --rm -T --no-deps --entrypoint id worker-1 -u 2>/dev/null || echo 0) && if [ \"\$WORKER_UID\" != 0 ]; then OWNER=\$(docker compose -f docker-compose.prod.yml run --rm -T --no-deps --user root --entrypoint python worker-1 -c 'import os;print(os.stat(\"/var/lib/e2b-sandboxes\").st_uid)' 2>/dev/null || echo 0); if [ \"\$OWNER\" != \"\$WORKER_UID\" ]; then echo \"migrating shared volume ownership to uid \$WORKER_UID\"; docker compose -f docker-compose.prod.yml run --rm -T --no-deps --user root worker-1 chown -R \"\$WORKER_UID\":\"\$WORKER_UID\" /var/lib/e2b-sandboxes; fi; fi"
+
+say "重建容器（deploy 用户）"
+run_as_deploy "cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml up -d --no-build --remove-orphans"
 
 say "等待就绪并检查容器"
 run_as_deploy "sleep 8 && cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml ps --format 'table {{.Name}}\t{{.Status}}'"

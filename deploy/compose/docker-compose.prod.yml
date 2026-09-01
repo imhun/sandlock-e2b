@@ -81,6 +81,10 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.envd
     image: ${WORKER_IMAGE:-e2b-sandlock-worker:0.1.0}
+    # E5.1: non-root supervisor (uid 65534). The image pre-creates
+    # /var/lib/e2b-sandboxes owned by 65534; upgrade.sh migrates an
+    # existing root-owned volume once.
+    user: "65534:65534"
     depends_on:
       - control-plane
     environment: &worker-env

@@ -36,6 +36,9 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.envd
+    # E5.1: non-root supervisor (uid 65534); upgrade.sh migrates existing
+    # root-owned worker-data volumes once.
+    user: "65534:65534"
     environment:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-1:49983
@@ -58,6 +61,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.envd
+    user: "65534:65534"
     environment:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-2:49983
@@ -80,6 +84,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.envd
+    user: "65534:65534"
     environment:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-3:49983
