@@ -16,11 +16,11 @@
 services:
   redis:
     image: redis:8-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${E2B_REDIS_PASSWORD:-local-redis-password}"]
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${E2B_REDIS_PASSWORD:-local-redis-password}", "--no-auth-warning", "ping"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -37,7 +37,7 @@ services:
       E2B_API_KEYS: ${E2B_API_KEYS:-local-key}
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
       E2B_ENABLE_LOCAL_NODE: "false"
-      E2B_REDIS_URL: redis://redis:6379/0
+      E2B_REDIS_URL: redis://:${E2B_REDIS_PASSWORD:-local-redis-password}@redis:6379/0
       # Embedded gateway: route lookups and invalidation stay in-process.
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_GATEWAY_URL: http://control-plane:3000
@@ -80,6 +80,7 @@ services:
       # Per-sandbox network policies (allowOut/denyOut/egressProxy) are only
       # enforced when the platform switch is on.
       E2B_ENABLE_NETWORK: "true"
+      E2B_NETWORK_DENY_CIDRS: ${E2B_NETWORK_DENY_CIDRS:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,169.254.0.0/16,fd00::/8}
       # Fork sandlock now tracks the netns-free upstream PR line; wildcard
       # allowOut works on the unprivileged shared-netns path, so netns is
       # gone and E2B_ENABLE_NETNS is accepted but ignored.

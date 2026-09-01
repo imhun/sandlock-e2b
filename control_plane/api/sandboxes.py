@@ -347,6 +347,10 @@ async def _command_logs(request, record) -> list[dict[str, str]]:
 
 @router.post("/sandboxes", status_code=201, dependencies=[Depends(require_api_key)])
 async def create_sandbox(request: Request) -> dict[str, Any]:
+    limiter = request.app.state.create_limiter
+    key = request.headers.get("X-API-Key") or request.headers.get("X-API-KEY", "")
+    if not limiter.allow(key):
+        raise OfficialError(429, "Sandbox create rate limit exceeded")
     try:
         body = await request.json()
     except json.JSONDecodeError:

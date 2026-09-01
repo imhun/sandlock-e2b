@@ -86,6 +86,8 @@ def create_executor(
                 enable_network=settings.enable_network,
                 enable_netns=settings.enable_netns,
                 network=network,
+                network_deny_cidrs=settings.network_deny_cidrs,
+                notify_rate_limit=settings.sandbox_notify_rate_limit,
                 iam_tokens=iam_tokens,
                 iam_signing_key=settings.iam_signing_key,
                 secrets_dir=settings.image_cache_dir / "secrets",

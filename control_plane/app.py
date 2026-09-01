@@ -22,6 +22,7 @@ from control_plane.registry.nodes import NodeRegistry
 from control_plane.registry.secrets import SecretRegistry
 from control_plane.registry.snapshots import SnapshotRegistry
 from control_plane.registry.templates import TemplateRegistry
+from control_plane.ratelimit import SlidingWindowRateLimiter
 from control_plane.registry.ttl import TTLSweeper
 from control_plane.registry.volumes import VolumeRegistry
 
@@ -154,6 +155,9 @@ def create_app(
     app.state.nodes = nodes_registry or NodeRegistry(redis_client=redis_client)
     app.state.recent_failures = SlidingWindowCounter()
     app.state.templates = templates_registry or TemplateRegistry()
+    app.state.create_limiter = SlidingWindowRateLimiter(
+        settings.create_rate_limit_per_min
+    )
     if settings.enable_local_node and app.state.nodes.get("local") is None:
         app.state.nodes.add_local_node(
             total_memory_mb=settings.max_total_memory_mb,

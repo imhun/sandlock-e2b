@@ -319,6 +319,7 @@ def sandlock_network_policy(
     *,
     allow_internet_access: bool,
     enable_network: bool,
+    private_deny_cidrs: list[str] | None = None,
 ) -> dict[str, Any]:
     """Map a normalized network config onto sandlock net/http primitives.
 
@@ -328,6 +329,13 @@ def sandlock_network_policy(
     mutually exclusive in sandlock, so when both ``allowOut`` and ``denyOut``
     are present the allowlist model wins and allow entries covered by a deny
     CIDR are dropped (deny precedence).
+
+    ``private_deny_cidrs`` only affects the *implicit* full-egress branch
+    (no explicit ``allowOut``/``denyOut`` with internet allowed): instead of
+    ``net_allow=["*:*"]`` the policy becomes a ``net_deny`` DenyList
+    (default-allow for the public internet, private/loopback/link-local
+    ranges refused). Explicit ``allowOut`` entries are never filtered here,
+    so a caller that deliberately grants a private IP/CIDR keeps it.
     """
     if not enable_network:
         return {
@@ -408,6 +416,18 @@ def sandlock_network_policy(
         return {
             "net_allow": [],
             "net_deny": [],
+            "http_allow": http_allow,
+            "http_inject": http_inject,
+            "host_mask": network.get("maskRequestHost"),
+            "egress_proxy": egress_proxy,
+        }
+    if private_deny_cidrs:
+        # Sandlock resolves net_deny into a per-protocol DenyList
+        # (default-allow + denied CIDRs); http_allow keeps working through
+        # the HTTP-ACL transparent proxy independently of the net policy.
+        return {
+            "net_allow": [],
+            "net_deny": list(private_deny_cidrs),
             "http_allow": http_allow,
             "http_inject": http_inject,
             "host_mask": network.get("maskRequestHost"),

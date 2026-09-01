@@ -1,7 +1,7 @@
 # Rootless buildkitd config: route docker.io base-image pulls through a
 # reachable mirror (Docker Hub is blocked from the target host).
 [grpc]
-  address = ["tcp://0.0.0.0:1234"]
+  address = ["unix:///run/buildkit/buildkitd.sock"]
 
 # Running rootless buildkitd inside a container: without this, runc cannot
 # mount /proc in build steps ("operation not permitted").

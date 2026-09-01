@@ -17,15 +17,18 @@ services:
     volumes:
       - buildkit-data:/home/user/.local/share/buildkit
       - ./buildkitd.toml:/home/user/.config/buildkit/buildkitd.toml:ro
+      # Unix socket shared with the control plane: no TCP listener at all,
+      # so a full-egress sandbox cannot reach the build daemon.
+      - buildkit-sock:/run/buildkit
     restart: unless-stopped
 
   redis:
     image: redis:8-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${E2B_REDIS_PASSWORD}"]
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${E2B_REDIS_PASSWORD}", "--no-auth-warning", "ping"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -45,10 +48,10 @@ services:
       # Route cache TTL (s); on stale routes the gateway retries once after
       # re-resolving, so this only bounds lookups, not recovery.
       E2B_GATEWAY_ROUTE_TTL: ${E2B_GATEWAY_ROUTE_TTL:-30}
-      # Rootless buildkitd reached over the compose network (TCP).
-      E2B_BUILDKIT_ADDR: tcp://buildkit:1234
+      # Rootless buildkitd reached over a shared unix socket (no TCP).
+      E2B_BUILDKIT_ADDR: unix:///run/buildkit/buildkitd.sock
       E2B_ENABLE_LOCAL_NODE: "false"
-      E2B_REDIS_URL: redis://redis:6379/0
+      E2B_REDIS_URL: redis://:${E2B_REDIS_PASSWORD}@redis:6379/0
       E2B_SHARED_WORKSPACE_ROOT: /var/lib/e2b-sandboxes
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_IMAGE_REGISTRY: ${E2B_IMAGE_REGISTRY:-}
@@ -65,6 +68,7 @@ services:
       - "${CONTROL_PLANE_PORT:-3000}:3000"
     volumes:
       - sandbox-shared:/var/lib/e2b-sandboxes
+      - buildkit-sock:/run/buildkit
     restart: unless-stopped
 
   worker-1: &worker
@@ -77,6 +81,7 @@ services:
       E2B_NODE_ID: worker-1
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY}
       E2B_ENABLE_NETWORK: "true"
+      E2B_NETWORK_DENY_CIDRS: ${E2B_NETWORK_DENY_CIDRS:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,169.254.0.0/16,fd00::/8}
       E2B_ENABLE_NETNS: "false"
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE}
       E2B_TEMPLATE_IMAGES: ${E2B_TEMPLATE_IMAGES:-}
@@ -108,3 +113,4 @@ volumes:
   redis-data:
   sandbox-shared:
   buildkit-data:
+  buildkit-sock:

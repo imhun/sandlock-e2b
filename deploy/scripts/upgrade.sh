@@ -64,8 +64,10 @@ if [ -z "$ENV_FILE" ]; then
         require_acr_creds
         API_KEY="$(openssl rand -hex 24)"
         INTERNAL_KEY="$(openssl rand -hex 24)"
+        REDIS_PASSWORD="$(openssl rand -hex 24)"
         sed -e "s|__E2B_API_KEYS__|$API_KEY|" \
             -e "s|__E2B_INTERNAL_API_KEY__|$INTERNAL_KEY|" \
+            -e "s|__E2B_REDIS_PASSWORD__|$REDIS_PASSWORD|" \
             -e "s|__ACR_USERNAME__|$ACR_USERNAME|" \
             -e "s|__ACR_PASSWORD__|$ACR_PASSWORD|" \
             "$STACK_DIR/.env.example" > "$STACK_DIR/.env"
@@ -76,7 +78,7 @@ fi
 
 # --- 保留远端密钥（默认）---
 if [ -n "$ENV_FILE" ] && [ "$FORCE_ENV" != "1" ]; then
-    for key in E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_IMAGE_REGISTRY_PASSWORD; do
+    for key in E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_IMAGE_REGISTRY_PASSWORD E2B_REDIS_PASSWORD; do
         if grep -qE "^$key=(__.*__)?$" "$ENV_FILE"; then
             remote_val="$(remote_env_value "$key" || true)"
             if [ -n "$remote_val" ]; then

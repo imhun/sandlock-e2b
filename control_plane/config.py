@@ -83,6 +83,9 @@ class Settings:
     max_total_processes: int = field(
         default_factory=lambda: _env_int("E2B_MAX_TOTAL_PROCESSES", 2048)
     )
+    create_rate_limit_per_min: int = field(
+        default_factory=lambda: _env_int("E2B_CREATE_RATE_LIMIT_PER_MIN", 120)
+    )
     enable_network: bool = field(
         default_factory=lambda: _env_bool("E2B_ENABLE_NETWORK", False)
     )

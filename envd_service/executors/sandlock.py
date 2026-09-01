@@ -290,6 +290,8 @@ class SandlockExecutor(Executor):
         enable_network: bool,
         enable_netns: bool = False,
         network: dict | None = None,
+        network_deny_cidrs: tuple[str, ...] = (),
+        notify_rate_limit: int = 0,
         iam_tokens: dict[str, dict[str, str]] | None = None,
         iam_signing_key: str | None = None,
         secrets_dir: str | Path | None = None,
@@ -306,6 +308,8 @@ class SandlockExecutor(Executor):
         self._max_open_files = max_open_files
         self._allow_internet_access = allow_internet_access
         self._enable_network = enable_network
+        self._network_deny_cidrs = tuple(network_deny_cidrs)
+        self._notify_rate_limit = notify_rate_limit
         # Accepted for config compatibility (E2B_ENABLE_NETNS), but the fork
         # now tracks the upstream PR line (upstream-pr/netns-free-clean),
         # which dropped per-sandbox netns/veth: wildcard rules and isolation
@@ -480,6 +484,7 @@ class SandlockExecutor(Executor):
                 self._network,
                 allow_internet_access=self._allow_internet_access,
                 enable_network=self._enable_network,
+                private_deny_cidrs=list(self._network_deny_cidrs),
             )
             net_allow = policy["net_allow"]
             net_deny = policy["net_deny"]
@@ -512,6 +517,8 @@ class SandlockExecutor(Executor):
             "max_processes": self._max_processes,
             "max_open_files": self._max_open_files,
             "max_cpu": min(100, max(1, self._cpu_percent)),
+            "max_disk": f"{self._disk_mb}M",
+            "notify_rate_limit": self._notify_rate_limit or None,
             "clean_env": True,
             "env": dict(config.env),
             "cwd": config.cwd,

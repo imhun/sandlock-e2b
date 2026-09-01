@@ -27,6 +27,10 @@ spec:
               value: "false"
             - name: E2B_REDIS_URL
               value: redis://redis:6379/0
+              # SECURITY: once redis auth is enabled (see redis.yaml), this
+              # must become redis://:<password>@redis:6379/0 via secretKeyRef.
+              # Also mirror E2B_NETWORK_DENY_CIDRS + E2B_CREATE_RATE_LIMIT_PER_MIN
+              # from the compose stack.
             - name: E2B_CONTROL_PLANE_URL
               value: http://control-plane:3000
             - name: E2B_GATEWAY_URL

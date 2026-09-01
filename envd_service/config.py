@@ -8,6 +8,28 @@ from pathlib import Path
 
 from gateway_common.env import _env_bool, _env_int, _env_json_dict
 
+# Default private-egress denylist applied to the implicit full-egress branch
+# (no explicit allowOut/denyOut + internet allowed). Covers RFC1918, loopback,
+# link-local / cloud metadata, and ULA. Override with E2B_NETWORK_DENY_CIDRS;
+# an explicit empty value disables the protection.
+DEFAULT_NETWORK_DENY_CIDRS = (
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "fd00::/8",
+)
+
+
+def _network_deny_cidrs() -> tuple[str, ...]:
+    value = os.getenv("E2B_NETWORK_DENY_CIDRS")
+    if value is None:
+        return DEFAULT_NETWORK_DENY_CIDRS
+    if value.strip() == "":
+        return ()
+    return tuple(p.strip() for p in value.split(",") if p.strip())
+
 
 @dataclass
 class Settings:
@@ -29,6 +51,12 @@ class Settings:
     )
     enable_netns: bool = field(
         default_factory=lambda: _env_bool("E2B_ENABLE_NETNS", False)
+    )
+    network_deny_cidrs: tuple[str, ...] = field(
+        default_factory=_network_deny_cidrs
+    )
+    sandbox_notify_rate_limit: int = field(
+        default_factory=lambda: _env_int("E2B_SANDBOX_NOTIFY_RATE_LIMIT", 5000)
     )
     iam_signing_key: str = field(
         default_factory=lambda: os.getenv(

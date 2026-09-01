@@ -187,6 +187,48 @@ def test_policy_internet_on_allows_all():
     assert policy["net_allow"] == ["*:*"]
 
 
+def test_policy_internet_on_with_private_deny_uses_denylist():
+    """The implicit full-egress branch becomes a private-range DenyList
+    (default-allow for the public internet) when private_deny_cidrs is set."""
+    cidrs = ["10.0.0.0/8", "172.16.0.0/12", "127.0.0.0/8"]
+    policy = sandlock_network_policy(
+        {"allowInternetAccess": True},
+        allow_internet_access=False,
+        enable_network=True,
+        private_deny_cidrs=cidrs,
+    )
+    assert policy["net_allow"] == []
+    assert policy["net_deny"] == cidrs
+
+
+def test_policy_explicit_allowout_keeps_private_entries():
+    """Explicit allowOut grants are never filtered by the private denylist:
+    a caller that deliberately allows an internal service keeps it."""
+    policy = sandlock_network_policy(
+        {"allowOut": ["10.0.0.5:443", "8.8.8.8"]},
+        allow_internet_access=True,
+        enable_network=True,
+        private_deny_cidrs=["10.0.0.0/8", "127.0.0.0/8"],
+    )
+    assert "10.0.0.5:443" in policy["net_allow"]
+    assert "tcp://8.8.8.8:*" in policy["net_allow"]
+    assert policy["net_deny"] == []
+
+
+def test_policy_internet_on_with_rules_and_private_deny():
+    """rules (http_allow) coexist with the private-range DenyList: the HTTP
+    ACL still maps and the net policy stays a DenyList (sandlock gives
+    net_deny precedence; http_allow works through the transparent proxy)."""
+    policy = sandlock_network_policy(
+        {"rules": {"api.example.com": []}, "allowInternetAccess": True},
+        allow_internet_access=False,
+        enable_network=True,
+        private_deny_cidrs=["10.0.0.0/8"],
+    )
+    assert policy["http_allow"] == ["* api.example.com/*"]
+    assert policy["net_deny"] == ["10.0.0.0/8"]
+
+
 def test_policy_network_disabled_denies_all():
     policy = sandlock_network_policy(
         {"allowInternetAccess": True},

@@ -17,6 +17,11 @@ spec:
         - name: redis
           image: redis:7-alpine
           command: ["redis-server", "--appendonly", "yes"]
+          # SECURITY: production must enable authentication. Mirror the
+          # compose stack: add "--requirepass", "$(REDIS_PASSWORD)" and feed
+          # REDIS_PASSWORD from a Secret, then point control-plane's
+          # E2B_REDIS_URL at redis://:<password>@redis:6379/0. Without this,
+          # a full-egress sandbox can read/write the shared ledger.
           ports:
             - containerPort: 6379
 ---
