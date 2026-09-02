@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -27,6 +28,8 @@ try:
 except ImportError:  # pragma: no cover
     redis = None  # type: ignore[assignment]
 
+logger = logging.getLogger(__name__)
+
 
 class UnknownSandboxError(KeyError):
     """Raised when a sandbox ID is not in the registry."""
@@ -49,6 +52,15 @@ class SandboxStateConflictError(RuntimeError):
 PRIORITY_MIN = 0
 PRIORITY_MAX = 10
 PRIORITY_DEFAULT = 5
+
+#: E9.3: hard cap for the in-memory eviction-notice table (the Redis-backed
+#: table is bounded by its key TTL instead). Lazy expiry drops stale entries,
+#: and the cap drops the oldest entry so a flood of evictions cannot grow the
+#: table without bound in a single process.
+_MAX_EVICTION_NOTICES = 10_000
+
+#: E9.3: canonical eviction reason used in logs, notices and the 404 payload.
+EVICTION_REASON = "evicted-idle"
 
 
 def _safe_priority(value: object) -> int:
@@ -316,6 +328,26 @@ class SandboxRecord:
         )
 
 
+@dataclass
+class EvictionResult:
+    """One sandbox acted on by :meth:`SandboxRegistry.evict_for_capacity`.
+
+    ``record`` is the victim as it was when the action ran: for a pause it is
+    still in the registry (``state == "paused"``, ``quota_released``); for a
+    kill it was removed through the normal delete chain, and the record object
+    is kept only so the caller can tear down the runtime afterwards.
+    """
+
+    sandbox_id: str
+    action: str  # "paused" | "killed"
+    reason: str = EVICTION_REASON
+    at: datetime = field(default_factory=utcnow)
+    record: SandboxRecord | None = None
+    tenant_id: str | None = None
+    priority: int = PRIORITY_DEFAULT
+    idle_seconds: float = 0.0
+
+
 class SandboxRegistry:
     """Thread-safe in-memory registry.
 
@@ -340,6 +372,16 @@ class SandboxRegistry:
         #: E9.1: when each record's activity timestamp was last pushed to the
         #: shared store (bounds write amplification; see :meth:`mark_active`).
         self._persisted_activity: dict[str, datetime] = {}
+        #: E9.3: eviction notices for killed sandboxes (in-memory fallback;
+        #: Redis stores them under ``{ns}:evicted:*`` with a real TTL). Each
+        #: value carries a monotonic deadline so reads expire lazily without a
+        #: sweeper; the table is capped so it cannot grow without bound.
+        self._eviction_notices: dict[str, dict[str, Any]] = {}
+        #: E9.3: per-process eviction throttle (``eviction_min_interval_s``).
+        #: Multi-replica deployments do NOT share this state (known limitation,
+        #: see docs/resource-contention.md §8); injectable clock for tests.
+        self._last_eviction_at = 0.0
+        self._eviction_clock: Callable[[], float] = time.monotonic
         self._on_removed_callbacks: list[Callable[[SandboxRecord], None]] = []
         self._lock = threading.Lock()
         self._redis = None
@@ -702,6 +744,267 @@ class SandboxRegistry:
             raise
         self.save(record)
         return record
+
+    # -- eviction (E9.3) --------------------------------------------------
+
+    def eviction_candidates(
+        self,
+        *,
+        tenant_id: str | None = None,
+        is_admin: bool = False,
+        exclude_ids: tuple[str, ...] = (),
+        now: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[SandboxRecord]:
+        """Idle ``running`` victims in eviction order (pure selection).
+
+        No side effects, so selection can be unit-tested in isolation. Only
+        records that are ``running`` AND idle past ``sandbox_idle_threshold_s``
+        qualify: ``paused`` records already released their reservation and
+        ``orphaned`` records sit on a node the control plane lost (E6.1) —
+        neither may be evicted. Ordering is priority (low first) -> idle
+        oldest -> tenant weight -> ``sandbox_id`` for determinism.
+
+        Cross-tenant protection: unless the caller is an admin or
+        ``eviction_cross_tenant`` is enabled, only victims of the requester's
+        own tenant are returned — otherwise any tenant could use "create a
+        sandbox" to evict other tenants' idle sandboxes (denial of service).
+        """
+        settings = self._settings
+        if not settings.eviction_enabled or settings.sandbox_idle_threshold_s <= 0:
+            return []
+        moment = now or utcnow()
+        cross_tenant = is_admin or bool(settings.eviction_cross_tenant)
+        candidates: list[SandboxRecord] = []
+        for record in self.list():
+            if record.state != "running":
+                continue
+            if record.sandbox_id in exclude_ids:
+                continue
+            if not record.is_idle(settings.sandbox_idle_threshold_s, moment):
+                continue
+            if not cross_tenant and record.tenant_id != tenant_id:
+                # 默认只踢请求者自己的租户（无租户请求只看无租户记录）。
+                continue
+            candidates.append(record)
+        candidates.sort(
+            key=lambda r: (
+                r.priority,
+                r.last_active_at,
+                self._eviction_tenant_key(r.tenant_id),
+                r.sandbox_id,
+            )
+        )
+        if limit is not None and limit > 0:
+            candidates = candidates[:limit]
+        return candidates
+
+    def _eviction_tenant_key(self, tenant_id: str | None) -> tuple[int, int]:
+        """Tenant weight used in eviction ordering (E9.3).
+
+        Tenants with a configured ``tenant_limits[tenant].max_sandboxes`` are
+        evicted before tenants without one, and a smaller quota sorts first;
+        unconfigured / unowned records go last.
+        """
+        if tenant_id is None:
+            return (1, 0)
+        raw = self._settings.tenant_limits.get(tenant_id) or {}
+        cap = raw.get("max_sandboxes")
+        if isinstance(cap, int) and cap > 0:
+            return (0, cap)
+        return (1, 0)
+
+    def evict_for_capacity(
+        self,
+        *,
+        tenant_id: str | None = None,
+        is_admin: bool = False,
+        exclude_ids: tuple[str, ...] = (),
+        now: datetime | None = None,
+        max_victims: int | None = None,
+        prefer_pause: bool | None = None,
+        actor: str | None = None,
+        pause_action: Callable[[SandboxRecord], None] | None = None,
+        kill_action: Callable[[SandboxRecord], None] | None = None,
+    ) -> list[EvictionResult]:
+        """Evict idle victims so a create can be retried (E9.3).
+
+        The registry only owns admission records: pausing returns the global /
+        tenant reservation and killing removes the record through the regular
+        delete chain (which releases node quota via ``add_on_removed``). The
+        registry never talks to worker teardown directly — the API layer parks
+        node capacity / freezes the runtime through ``pause_action`` and
+        destroys killed runtimes from the returned results.
+
+        One call processes at most ``max_victims`` (default
+        ``eviction_max_per_create``) candidates, never more than once per
+        ``eviction_min_interval_s`` (per-process throttle; replicas do not
+        share it). Returns an empty list when eviction is disabled, throttled,
+        or there is no candidate, and in that case no quota changes at all.
+        """
+        settings = self._settings
+        if not settings.eviction_enabled:
+            return []
+        if max_victims is None:
+            max_victims = settings.eviction_max_per_create
+        if prefer_pause is None:
+            prefer_pause = settings.eviction_prefer_pause
+        interval = settings.eviction_min_interval_s
+        if interval > 0:
+            with self._lock:
+                clock_now = self._eviction_clock()
+                if clock_now - self._last_eviction_at < interval:
+                    # 防驱逐风暴：最小间隔内不再动手（进程内节流；多副本不
+                    # 共享节流状态——docs/resource-contention.md §8 已知限制）。
+                    return []
+                self._last_eviction_at = clock_now
+        candidates = self.eviction_candidates(
+            tenant_id=tenant_id,
+            is_admin=is_admin,
+            exclude_ids=exclude_ids,
+            now=now,
+            limit=max_victims,
+        )
+        results: list[EvictionResult] = []
+        for victim in candidates:
+            if prefer_pause:
+                self._evict_pause(victim)
+                if pause_action is not None:
+                    pause_action(victim)
+                action = "paused"
+            else:
+                self._evict_kill(victim, actor=actor)
+                if kill_action is not None:
+                    kill_action(victim)
+                action = "killed"
+            moment = now or utcnow()
+            results.append(
+                EvictionResult(
+                    sandbox_id=victim.sandbox_id,
+                    action=action,
+                    reason=EVICTION_REASON,
+                    at=moment,
+                    record=victim,
+                    tenant_id=victim.tenant_id,
+                    priority=victim.priority,
+                    idle_seconds=victim.idle_seconds(moment),
+                )
+            )
+            logger.warning(
+                "evicted sandbox %s (reason=%s, tenant=%s, priority=%s, idle=%.0fs)",
+                victim.sandbox_id,
+                EVICTION_REASON,
+                victim.tenant_id,
+                victim.priority,
+                victim.idle_seconds(moment),
+            )
+        return results
+
+    def _evict_pause(self, record: SandboxRecord) -> None:
+        """E9.3 pause action: keep the record, return its reservation.
+
+        The API layer additionally returns the victim's node reservation and
+        freezes the runtime through the injected ``pause_action`` hook; the
+        registry itself only knows the admission ledgers.
+        """
+        self.pause(record)
+        record.append_log(f"sandbox evicted (reason={EVICTION_REASON})")
+        self.save(record)
+
+    def _evict_kill(self, record: SandboxRecord, *, actor: str | None = None) -> None:
+        """E9.3 kill action: log + persist the notice, then remove.
+
+        The eviction log line is written and the notice stored *before* the
+        record disappears, so a user that queries the id afterwards gets the
+        "evicted" 404 instead of a plain not-found. Deletion goes through the
+        normal ``_release`` chain (``add_on_removed`` + quota release).
+        """
+        record.append_log(f"sandbox evicted (reason={EVICTION_REASON})")
+        self.record_eviction(
+            record.sandbox_id,
+            reason=EVICTION_REASON,
+            actor=actor,
+            tenant_id=record.tenant_id,
+        )
+        self._release(record)
+
+    def record_eviction(
+        self,
+        sandbox_id: str,
+        *,
+        reason: str = EVICTION_REASON,
+        at: datetime | None = None,
+        actor: str | None = None,
+        tenant_id: str | None = None,
+    ) -> None:
+        """Persist a kill-eviction notice for ``sandbox_id``.
+
+        Redis-backed registries store it under ``{ns}:evicted:*`` with a TTL of
+        ``eviction_notice_ttl_s``; the in-memory fallback expires lazily on
+        read and is capped at ``_MAX_EVICTION_NOTICES`` entries. ``tenant_id``
+        is kept so the API can hide an eviction notice from other tenants.
+        """
+        moment = at or utcnow()
+        notice: dict[str, Any] = {
+            "reason": reason,
+            "at": to_iso_z(moment),
+            "actor": actor,
+            "tenant_id": tenant_id,
+        }
+        ttl = self._settings.eviction_notice_ttl_s
+        if self._redis is not None:
+            key = f"{self._ns}:evicted:{sandbox_id}"
+            payload = json.dumps(notice, separators=(",", ":"))
+            if ttl > 0:
+                self._redis.set(key, payload, ex=ttl)
+            else:
+                self._redis.set(key, payload)
+            return
+        with self._lock:
+            if ttl > 0:
+                notice["_expires_at"] = self._eviction_clock() + ttl
+            self._eviction_notices[sandbox_id] = notice
+            self._prune_eviction_notices_locked()
+
+    def eviction_notice(self, sandbox_id: str) -> dict[str, Any] | None:
+        """Return the stored eviction notice, or ``None`` (expired/absent)."""
+        if self._redis is not None:
+            raw = self._redis.get(f"{self._ns}:evicted:{sandbox_id}")
+            if not raw:
+                return None
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+            return payload if isinstance(payload, dict) else None
+        with self._lock:
+            notice = self._eviction_notices.get(sandbox_id)
+            if notice is None:
+                return None
+            deadline = notice.get("_expires_at", 0)
+            if deadline and deadline <= self._eviction_clock():
+                self._eviction_notices.pop(sandbox_id, None)
+                return None
+            return {k: v for k, v in notice.items() if k != "_expires_at"}
+
+    def _prune_eviction_notices_locked(self) -> None:
+        """Drop expired notices, then the oldest beyond the cap.
+
+        In-memory fallback only; callers must hold ``self._lock``.
+        """
+        now = self._eviction_clock()
+        expired = [
+            sid
+            for sid, notice in self._eviction_notices.items()
+            if notice.get("_expires_at", 0) and notice["_expires_at"] <= now
+        ]
+        for sid in expired:
+            self._eviction_notices.pop(sid, None)
+        while len(self._eviction_notices) > _MAX_EVICTION_NOTICES:
+            oldest = next(iter(self._eviction_notices), None)
+            if oldest is None:
+                break
+            self._eviction_notices.pop(oldest, None)
 
     def _reserve(self, record: SandboxRecord) -> None:
         self._sandboxes[record.sandbox_id] = record

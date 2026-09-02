@@ -28,6 +28,7 @@ from control_plane.registry.manager import (
     PRIORITY_MAX,
     PRIORITY_MIN,
     ResourceUnavailableError,
+    SandboxRecord,
     SandboxStateConflictError,
     SandboxRegistry,
     UnknownSandboxError,
@@ -59,6 +60,16 @@ UNSUPPORTED_ENDPOINTS = ()
 # Idempotent-create (X-Sandbox-Id) slow-path tuning.
 _PENDING_TTL_S = 300
 _PENDING_WAIT_S = 10.0
+
+
+class _CapacityExhausted(Exception):
+    """Internal control-flow marker: admission found no room (E9.3).
+
+    Raised by one create attempt at the two capacity failure points (no node,
+    or global/tenant quota refused) after the attempt rolled back any partial
+    state it held; the outer ``create_sandbox`` dispatcher turns it into an
+    eviction round + retry or the original 503.
+    """
 
 
 def _default_dims(settings) -> tuple[int, int, int, int]:
@@ -456,20 +467,110 @@ async def _command_logs(request, record) -> list[dict[str, str]]:
 
 @router.post("/sandboxes", status_code=201, dependencies=[Depends(require_api_key)])
 async def create_sandbox(request: Request) -> dict[str, Any]:
+    """Create a sandbox, retrying once after a bounded eviction round (E9.3).
+
+    When admission fails for *capacity* (no node, or global/tenant quota) and
+    ``E2B_EVICTION_ENABLED`` is on, the dispatcher evicts at most
+    ``E2B_EVICTION_MAX_PER_CREATE`` idle victims (own tenant only unless admin
+    or ``E2B_EVICTION_CROSS_TENANT``) and retries. Prefer-pause victims that
+    still did not make room are killed before one final retry. Anything that is
+    not a capacity failure propagates untouched, and the final 503 keeps
+    ``recent_failures.record()`` exactly like before.
+    """
     settings = request.app.state.settings
     tenant, is_admin = tenant_of(request)
-    limiter = request.app.state.create_limiter
-    key = request.headers.get("X-API-Key") or request.headers.get("X-API-KEY", "")
-    if not limiter.allow(key):
-        raise OfficialError(429, "Sandbox create rate limit exceeded")
-    # Per-tenant create rate limit (E2B_TENANT_RATE_LIMITS; falls back to
-    # the global per-minute budget). Admin keys and compatible mode skip it.
-    if settings.tenants_enabled and tenant is not None and not is_admin:
-        tenant_limiter = request.app.state.tenant_limiters.get(
-            tenant
-        ) or request.app.state.tenant_create_limiter
-        if not tenant_limiter.allow(tenant):
+    registry = _registry(request)
+    sandbox_id_hdr = request.headers.get("X-Sandbox-Id")
+    paused_victims: list[SandboxRecord] = []
+
+    def _pause_hook(victim: SandboxRecord) -> None:
+        """Pause hook: return the victim's node reservation and freeze the
+        runtime (mirrors the manual pause endpoint, E9.2)."""
+        _park_capacity(request, victim)
+        request.app.state.runtime_registry.set_state(victim.sandbox_id, "paused")
+        paused_victims.append(victim)
+
+    async def _evict_one() -> bool:
+        """Evict one idle victim; False when disabled/throttled/no candidate."""
+        results = registry.evict_for_capacity(
+            tenant_id=tenant,
+            is_admin=is_admin,
+            exclude_ids=(sandbox_id_hdr,) if sandbox_id_hdr else (),
+            max_victims=1,
+            prefer_pause=settings.eviction_prefer_pause,
+            pause_action=_pause_hook,
+        )
+        for result in results:
+            if result.action == "killed":
+                # kill 受害者复用 contract 的销毁路径：记录已删除，这里只
+                # 销毁节点上的运行时（远程 agent DELETE / 本地清理）。
+                await _destroy_evicted(request, result.record)
+        return bool(results)
+
+    async def _final_503(message: str) -> None:
+        request.app.state.recent_failures.record()
+        raise OfficialError(503, message)
+
+    max_victims = settings.eviction_max_per_create if settings.eviction_enabled else 0
+    evicted = 0
+    message = "No resources available"
+    while True:
+        try:
+            return await _create_sandbox_attempt(request, rate_limited=evicted == 0)
+        except _CapacityExhausted as exc:
+            message = str(exc) or "No resources available"
+        if evicted >= max_victims or not await _evict_one():
+            break
+        evicted += 1
+    if paused_victims:
+        # prefer_pause 一轮仍拿不到配额：pause 保留了现场但没有腾出足够的
+        # 容量，kill 掉这些候选（含现场清理）后再做最后一次尝试。
+        for victim in paused_victims:
+            registry.record_eviction(
+                victim.sandbox_id,
+                tenant_id=victim.tenant_id,
+            )
+            registry.delete(victim.sandbox_id)
+            await _destroy_evicted(request, victim)
+        paused_victims.clear()
+        try:
+            return await _create_sandbox_attempt(request, rate_limited=False)
+        except _CapacityExhausted as exc:
+            message = str(exc) or "No resources available"
+    await _final_503(message)
+
+
+async def _create_sandbox_attempt(
+    request: Request, *, rate_limited: bool = True
+) -> dict[str, Any]:
+    """One admission + provision attempt for ``POST /sandboxes`` (E9.3).
+
+    Capacity failures roll back every partial reservation first (node quota,
+    pending marker — in that order) and then raise ``_CapacityExhausted`` so
+    the dispatcher can evict and retry without ever interleaving eviction into
+    a half-finished create.
+
+    ``rate_limited`` is ``False`` for the dispatcher's retries: one client
+    request must spend exactly one create-rate-limit token, whichever attempt
+    inside it wins admission.
+    """
+    settings = request.app.state.settings
+    tenant, is_admin = tenant_of(request)
+    if rate_limited:
+        limiter = request.app.state.create_limiter
+        key = (
+            request.headers.get("X-API-Key") or request.headers.get("X-API-KEY", "")
+        )
+        if not limiter.allow(key):
             raise OfficialError(429, "Sandbox create rate limit exceeded")
+        # Per-tenant create rate limit (E2B_TENANT_RATE_LIMITS; falls back to
+        # the global per-minute budget). Admin keys and compatible mode skip it.
+        if settings.tenants_enabled and tenant is not None and not is_admin:
+            tenant_limiter = request.app.state.tenant_limiters.get(
+                tenant
+            ) or request.app.state.tenant_create_limiter
+            if not tenant_limiter.allow(tenant):
+                raise OfficialError(429, "Sandbox create rate limit exceeded")
     try:
         body = await read_json_body(request, settings.max_json_body_bytes)
     except UploadTooLargeError:
@@ -656,8 +757,8 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
         processes=dims[3],
     )
     if node is None:
-        request.app.state.recent_failures.record()
-        raise OfficialError(503, "No resources available")
+        # 节点层无容量：还没有任何状态可回滚，直接交给调度器决定是否驱逐。
+        raise _CapacityExhausted("No resources available")
 
     # Adaptive warm: image cached -> fast path (server-side ID, SDK no-op);
     # image cold -> slow path requiring X-Sandbox-Id, warming before any
@@ -756,10 +857,11 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
             priority=priority,
         )
     except ResourceUnavailableError as e:
+        # 保持既有回滚顺序：先还节点配额，再释放 pending 标记。驱逐重试由
+        # 外层调度器接管，绝不插进这个半成品状态里。
         _release_node_quota(request, node, dims)
         registry.release_pending(sandbox_id_hdr)
-        request.app.state.recent_failures.record()
-        raise OfficialError(503, str(e)) from e
+        raise _CapacityExhausted(str(e)) from e
     except ValueError as e:
         _release_node_quota(request, node, dims)
         registry.release_pending(sandbox_id_hdr)
@@ -1009,6 +1111,19 @@ async def get_sandbox_info(sandbox_id: str, request: Request) -> dict[str, Any]:
         _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
         return record.as_detail()
     except UnknownSandboxError:
+        notice = registry.eviction_notice(sandbox_id)
+        if notice is not None:
+            # 驱逐不静默消失（E9.3）：带原因的 404 + 响应头。跨租户请求仍
+            # 保持普通 404，避免拿驱逐提示当存在性探测。
+            tenant, is_admin = tenant_of(request)
+            notice_tenant = notice.get("tenant_id")
+            if is_admin or tenant is None or tenant == notice_tenant:
+                reason = notice.get("reason", "evicted-idle")
+                raise OfficialError(
+                    404,
+                    f"Sandbox {sandbox_id} not found (evicted: {reason})",
+                    headers={"x-e2b-eviction-reason": reason},
+                )
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
 
 
@@ -1120,6 +1235,20 @@ async def _destroy_on_node(
         keep_files=keep_files,
         keep_volume_slices=keep_volume_slices,
     )
+
+
+async def _destroy_evicted(request, record) -> None:
+    """Tear down the runtime of an eviction-killed sandbox (E9.3).
+
+    The registry already removed the record (and released its admission/node
+    quota through the normal delete chain); this mirrors ``kill_sandbox``'s
+    teardown so the worker actually stops the runtime and drops its files.
+    """
+    node = request.app.state.nodes.get(record.node_id or "local")
+    if node is not None and node.address != "local://":
+        await _destroy_remote(request, record, node)
+    else:
+        _destroy_local(request.app.state, record)
 
 
 async def _stop_source_runtime(request, record, node) -> bool:

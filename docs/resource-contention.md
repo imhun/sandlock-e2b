@@ -45,22 +45,52 @@ TTL 到期或被显式 kill。
 
 ### 3.3 驱逐策略（资源紧张时）
 
-按序选择驱逐目标：
+最终实现（E9.3；用户决策 2026-09-01：驱逐**默认开启**）：
+
+创建沙箱在容量准入失败（`select_node` 无节点，或全局/租户配额不足）时，
+控制面按以下顺序驱逐**空闲**（`running` 且超过 `E2B_SANDBOX_IDLE_THRESHOLD_S`
+未活跃）沙箱后重试：
 
 1. **优先级**：沙箱创建时带 `priority`（如 0-10，默认 5）；先踢低优先级；
 2. **空闲最久**：同优先级内踢 `last_active_at` 最旧的；
-3. **租户权重**（如启用租户隔离）：低配额租户的沙箱先踢（可选）。
+3. **租户权重**：配置了 `tenant_limits[tenant].max_sandboxes` 的租户先踢，
+   配额小者更先；未配限租户/无租户记录排最后；
+4. `sandbox_id` 兜底保证确定性。
+
+候选过滤：
+
+- 只有 `state == "running"` 且 `is_idle(...)` 的记录可被选；`paused`（已无
+  配额、现场保留）与 `orphaned`（E6.1 节点失联）永不参与。
+- **跨租户保护**：默认（`E2B_EVICTION_CROSS_TENANT=false`）候选只限请求者
+  自己的租户；admin key 或显式开启开关才允许踢别人的沙箱——否则任何租户都
+  能用“创建沙箱”把别的租户空闲沙箱全踢掉（DoS）。
+- 防风暴：单次创建最多驱逐 `E2B_EVICTION_MAX_PER_CREATE`（默认 3）个受害者；
+  驱逐轮次间隔不得小于 `E2B_EVICTION_MIN_INTERVAL_S`（默认 1 秒，控制面进程内
+  节流）。**多副本不共享节流**（已知限制，见 §8）。
 
 驱逐动作：
 
-- **kill**（默认）：终止沙箱 + 释放配额 + 清理；
-- **pause**（可选）：先尝试休眠（释放资源、保留现场），资源仍不足再 kill；
-- **通知**：被驱逐沙箱通过 SDK 事件/日志通知用户（`e2b.sandbox.killed` 或
-  类似），带原因 `evicted-idle`。
+- **kill**（默认）：删除记录前写
+  `append_log("sandbox evicted (reason=evicted-idle)")` 并存驱逐通知
+  （`sandbox_id -> {reason, at, actor}`；Redis 可用时存 Redis，TTL =
+  `E2B_EVICTION_NOTICE_TTL_S` 默认 3600；否则进程内字典 + 惰性过期 + 容量
+  上限）。之后 `GET /sandboxes/{id}` 返回 404，文案为
+  `Sandbox <id> not found (evicted: evicted-idle)`，响应头带
+  `x-e2b-eviction-reason: evicted-idle`；普通不存在的沙箱文案/响应头不变。
+- **pause**（`E2B_EVICTION_PREFER_PAUSE=true`）：先 `registry.pause(victim)`
+  （E9.2：释放全局/租户配额、现场保留）+ API 归还节点配额 + 冻结运行时；
+  pause 仍拿不到配额才 kill 已 pause 的候选，再继续。
+- 每次驱逐打
+  `logger.warning("evicted sandbox %s (reason=evicted-idle, tenant=%s, priority=%s, idle=%.0fs)", ...)`，
+  不静默消失。
 
 ### 3.4 pause 释放配额改造（关键前置）
 
-当前 pause 不释放资源。改造：
+E9.2 已完成：`pause` = 释放配额 + 冻结现场（状态保留）；`resume` =
+重新分配资源（配额不足则失败）。“把空闲沙箱休眠腾资源”因此成立，E9.3 的
+prefer-pause 直接复用它。
+
+原文（改造前的目标描述）：
 
 - `pause` = 释放配额 + 持久化现场（进程停止、状态保留）；
 - `resume` = 重新分配资源（配额不足则失败/排队）；
@@ -77,7 +107,7 @@ TTL 到期或被显式 kill。
 | 机制 | 关系 |
 |---|---|
 | TTL | 驱逐是"资源驱动的提前回收"，TTL 是"时间驱动的兜底"；驱逐不影响 TTL 到期逻辑 |
-| pause/resume | 需改造（§3.4）后才能参与驱逐 |
+| pause/resume | E9.2 已完成配额释放语义；E9.3 prefer-pause 复用（§3.4） |
 | 配额（XFS project quota / 全局池） | 驱逐释放的是准入配额；磁盘配额由 XFS 独立生效 |
 | 租户隔离 | 驱逐可感知租户（优先级/权重），但基础机制与租户无关 |
 | `recent_failures` | 创建排队后仍保留计数（超时失败计入） |
@@ -86,11 +116,17 @@ TTL 到期或被显式 kill。
 
 ```env
 E2B_SANDBOX_IDLE_THRESHOLD_S=300     # 空闲判定阈值
-E2B_EVICTION_ENABLED=true            # 是否允许驱逐
-E2B_EVICTION_PREFER_PAUSE=false      # 优先 pause 而非 kill
+E2B_EVICTION_ENABLED=true            # 驱逐总开关（用户决策：默认开启）
+E2B_EVICTION_PREFER_PAUSE=false      # true = 先 pause（保留现场）再 kill
+E2B_EVICTION_MAX_PER_CREATE=3        # 单次创建最多驱逐受害者数（防风暴）
+E2B_EVICTION_MIN_INTERVAL_S=1        # 驱逐轮次最小间隔（进程内节流）
+E2B_EVICTION_NOTICE_TTL_S=3600       # 驱逐通知可查窗口（Redis TTL/惰性过期）
+E2B_EVICTION_CROSS_TENANT=false      # 跨租户驱逐开关（安全默认关；admin 放行）
 E2B_CREATE_QUEUE_TIMEOUT_S=30        # 创建排队超时（0 = 不排队）
 E2B_CREATE_QUEUE_MAX=100             # 排队上限
 ```
+
+> 排队（`E2B_CREATE_QUEUE_*`）属于 E9.4，尚未实现；上表仅保留占位。
 
 ## 6. 实施步骤
 
@@ -119,11 +155,24 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限
 2. **驱逐风暴**：批量创建时连续驱逐多个空闲沙箱——需节流（每次驱逐
    间隔/每轮上限）；
 3. **与用户预期冲突**：用户可能不期望沙箱被自动踢——驱逐需默认关闭或
-   配置显式开启；
+   配置显式开启；**用户决策 2026-09-01：改为默认开启**
+   （`E2B_EVICTION_ENABLED` 默认 `true`），用空闲阈值 + 优先级 + 通知兜底；
 4. **空闲判定可靠性**：无命令但网络活跃的沙箱（长驻服务）会被误判空闲
    ——空闲检测需含网络/进程活跃信号；
 5. **pause 语义**：pause 释放配额后现场保留的实现（进程冻结 vs 停止+
    恢复），与 sandlock 能力相关。
+
+**E9.3 已实现机制对应的已知限制（与代码注释口径一致）：**
+
+- **驱逐节流是进程内状态**：`E2B_EVICTION_MIN_INTERVAL_S` 在每个控制面副本
+  内独立计数，多副本**不共享**节流；同一瞬间多个副本可能各自发起驱逐轮次
+  （单副本仍受每轮上限约束）。若需全局节流，可把节流时间戳迁到 Redis
+  （带 TTL 的原子 set）。
+- **驱逐通知表**：Redis 形态靠 key TTL 自然过期；无 Redis 的进程内字典用
+  惰性过期 + 容量上限（10 000 条，超限丢最旧），不做主动扫描。TTL 过期后
+  `GET /sandboxes/{id}` 回到普通 404。
+- **创建期驱逐只处理“容量不足”失败**：镜像预热失败 / 428 / 其他非容量错误
+  不会触发驱逐，行为与接入驱逐前一致。
 
 ## 9. 排期
 

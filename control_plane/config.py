@@ -99,6 +99,43 @@ class Settings:
     activity_persist_interval_s: int = field(
         default_factory=lambda: _env_int("E2B_ACTIVITY_PERSIST_INTERVAL_S", 30)
     )
+    # E9.3: resource-driven eviction (resource-contention.md §5). Default ON
+    # is a user decision (2026-09-01) that overrides the earlier design doc's
+    # "default off" draft: when the fleet is full, idle low-priority sandboxes
+    # are evicted to make room for a new create.
+    eviction_enabled: bool = field(
+        default_factory=lambda: _env_bool("E2B_EVICTION_ENABLED", True)
+    )
+    # E9.3: prefer pausing an idle victim (state preserved, reservation
+    # returned) over killing it. The caller still kills a paused victim when
+    # pausing alone did not make room.
+    eviction_prefer_pause: bool = field(
+        default_factory=lambda: _env_bool("E2B_EVICTION_PREFER_PAUSE", False)
+    )
+    # E9.3: how many idle sandboxes a single create request may evict at most
+    # (storm bound; see E2B_EVICTION_MIN_INTERVAL_S for the temporal bound).
+    eviction_max_per_create: int = field(
+        default_factory=lambda: _env_int("E2B_EVICTION_MAX_PER_CREATE", 3)
+    )
+    # E9.3: minimum wall-clock gap between eviction rounds, per control-plane
+    # process. Replicas do NOT share this throttle (known limitation, see
+    # docs/resource-contention.md §8).
+    eviction_min_interval_s: int = field(
+        default_factory=lambda: _env_int("E2B_EVICTION_MIN_INTERVAL_S", 1)
+    )
+    # E9.3: how long a kill-eviction notice stays queryable so GET on an
+    # evicted sandbox can explain the 404. Redis keys get this as a real TTL;
+    # the in-memory fallback expires lazily and is capacity-capped.
+    eviction_notice_ttl_s: int = field(
+        default_factory=lambda: _env_int("E2B_EVICTION_NOTICE_TTL_S", 3600)
+    )
+    # E9.3: cross-tenant eviction is OFF by default (security decision): a
+    # tenant key may only evict idle sandboxes of its own tenant, otherwise
+    # "create a sandbox" would be a weapon to evict other tenants' sandboxes.
+    # Admin keys and this switch may cross tenants.
+    eviction_cross_tenant: bool = field(
+        default_factory=lambda: _env_bool("E2B_EVICTION_CROSS_TENANT", False)
+    )
     volume_token_ttl_s: int = field(
         default_factory=lambda: _env_int("E2B_VOLUME_TOKEN_TTL_S", 0)
     )
