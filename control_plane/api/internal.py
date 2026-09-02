@@ -10,6 +10,7 @@ from fastapi import APIRouter, Header, Request, Response
 
 from control_plane.api.errors import OfficialError
 from control_plane.auth import verify_internal_key
+from gateway_common.paths import validate_sandbox_id
 
 router = APIRouter()
 
@@ -96,6 +97,45 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
         disk_error_count=body.get("diskErrorCount"),
     )
     return Response(status_code=204)
+
+
+@router.get("/internal/nodes/{node_id}/sandboxes")
+async def node_sandboxes(node_id: str, request: Request) -> dict[str, Any]:
+    """Control-plane view of one node's sandbox records (E6.1 recovery).
+
+    The worker uses this as the authoritative list when reconciling its
+    local runtime after a partition: any local runtime not in this list is
+    an orphan and is torn down locally.
+    """
+    _require_internal_key(request)
+    records = request.app.state.registry.list_by_node(node_id)
+    return {"nodeID": node_id, "sandboxIDs": [r.sandbox_id for r in records]}
+
+
+@router.post("/internal/nodes/{node_id}/reconcile")
+async def node_reconcile(node_id: str, request: Request) -> dict[str, Any]:
+    """Reconcile control-plane records against the worker's local runtime.
+
+    Body: ``{"sandboxIDs": [...]}`` — the sandboxes this worker currently
+    runs. Records for the node that the worker still has are un-orphaned
+    (recovery); records the worker no longer has are removed. The result
+    mirrors :meth:`SandboxRegistry.recover_node`.
+    """
+    _require_internal_key(request)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise OfficialError(400, "Invalid JSON body")
+    if not isinstance(body, dict) or not isinstance(body.get("sandboxIDs"), list):
+        raise OfficialError(400, "Body must be {\"sandboxIDs\": [...]}")
+    sandbox_ids = [s for s in body["sandboxIDs"] if isinstance(s, str)]
+    if any(not validate_sandbox_id(s) for s in sandbox_ids):
+        raise OfficialError(400, "sandboxIDs must be valid sandbox ids")
+    return request.app.state.registry.recover_node(
+        node_id,
+        set(sandbox_ids),
+        timeout=request.app.state.settings.default_timeout,
+    )
 
 
 @router.get("/internal/routes/{sandbox_id}")

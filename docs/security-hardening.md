@@ -222,7 +222,11 @@ sandlock 官方支持非 root 运行（uid 65534 全绿）——worker 应以非
 
 - **节点失联僵尸沙箱**（中低）：unhealthy 节点不清理沙箱；网络分区窗口内
   worker 沙箱继续跑、控制面 TTL 删目录 → 进程持有已删 inode + 恢复后记录
-  不一致。修复：unhealthy 触发清理 / worker 恢复对账。
+  不一致。已修复（E6.1）：控制面周期扫描把失联节点沙箱标记为
+  `orphaned`（TTL 跳过，不再删运行中沙箱的 workspace）；worker 恢复后
+  通过 `POST /internal/nodes/{id}/reconcile` 双向对账——本地不再运行的
+  记录删除、仍在运行的记录恢复 `running`、控制面已删除记录的本地运行时
+  由 worker 侧清理。
 - **镜像 tag 非 digest**（低-中，供应链）：`E2B_BASE_IMAGE` 用 tag，
   tag 可被替换。修复：配置 `@sha256:` digest。
 - **MCP 端口只增不减**（低）：`_next_mcp_port` 从 51000 只增不回收，

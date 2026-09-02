@@ -683,6 +683,64 @@ class SandboxRegistry:
         self._release(record)
         return record
 
+    def list_by_node(self, node_id: str) -> list[SandboxRecord]:
+        """All live sandbox records scheduled onto ``node_id``."""
+        return [r for r in self.list() if r.node_id == node_id]
+
+    def mark_orphaned(self, node_id: str) -> list[SandboxRecord]:
+        """Mark every sandbox on an unhealthy node as ``orphaned`` (E6.1).
+
+        Called by the periodic node-health sweep when a remote node stops
+        heartbeating. Orphaned records are skipped by TTL expiry, so a
+        partitioned worker's live sandboxes are never torn down underneath
+        its running processes (which would keep the deleted inode open).
+        Recovery reconciliation (``recover_node``) flips them back to
+        ``running`` when the worker reconnects and reports them.
+        """
+        marked: list[SandboxRecord] = []
+        for record in self.list_by_node(node_id):
+            if record.state != "orphaned":
+                record.state = "orphaned"
+                record.append_log("node unreachable; sandbox orphaned")
+                self.save(record)
+            marked.append(record)
+        return marked
+
+    def recover_node(
+        self,
+        node_id: str,
+        sandbox_ids: set[str],
+        *,
+        timeout: int | None = None,
+    ) -> dict[str, list[str]]:
+        """Reconcile control-plane records for a node against the worker's
+        local runtime (E6.1 recovery path).
+
+        ``sandbox_ids`` is the authoritative list of sandboxes the worker
+        currently runs. Records the worker still has are un-orphaned (and
+        refreshed); records the worker no longer has are removed entirely.
+        Returns ``{"recovered", "removed", "kept"}`` sandbox id lists so
+        callers and operators can see exactly what the reconcile changed.
+        """
+        recovered: list[str] = []
+        removed: list[str] = []
+        kept: list[str] = []
+        for record in self.list_by_node(node_id):
+            if record.sandbox_id in sandbox_ids:
+                if record.state == "orphaned":
+                    record.state = "running"
+                    record.append_log("worker recovered; sandbox restored")
+                    recovered.append(record.sandbox_id)
+                else:
+                    kept.append(record.sandbox_id)
+                if timeout is not None:
+                    record.refresh(timeout)
+                self.save(record)
+            else:
+                removed.append(record.sandbox_id)
+                self.delete(record.sandbox_id)
+        return {"recovered": recovered, "removed": removed, "kept": kept}
+
     def save(self, record: SandboxRecord) -> SandboxRecord:
         """Persist a mutated record (node_id, timeout, state, ...).
 
@@ -797,12 +855,16 @@ class SandboxRegistry:
                     record = self.get(sandbox_id)
                 except UnknownSandboxError:
                     continue
-                if record.is_expired(now):
+                if record.is_expired(now) and record.state != "orphaned":
                     expired.append(record)
                     self._release(record)
             return expired
         now = now or utcnow()
-        expired = [r for r in self._sandboxes.values() if r.is_expired(now)]
+        expired = [
+            r
+            for r in self._sandboxes.values()
+            if r.is_expired(now) and r.state != "orphaned"
+        ]
         for record in expired:
             self._release(record)
         return expired

@@ -267,6 +267,26 @@ class NodeRegistry:
             if now - record.heartbeat_at > self._heartbeat_timeout:
                 record.status = "unhealthy"
 
+    def reap_unhealthy(self, sandbox_registry) -> list[str]:
+        """Mark sandboxes on unhealthy remote nodes as orphaned (E6.1).
+
+        Called periodically from the control-plane lifespan. Local (in-
+        process) nodes are never considered. Returns the node ids whose
+        sandbox records were marked, for logging/metrics.
+        """
+        with self._lock:
+            self._sweep_health_locked()
+            node_ids = [
+                n.node_id
+                for n in self._nodes.values()
+                if n.status == "unhealthy" and n.address != "local://"
+            ]
+        marked_nodes: list[str] = []
+        for node_id in node_ids:
+            if sandbox_registry.mark_orphaned(node_id):
+                marked_nodes.append(node_id)
+        return marked_nodes
+
     def remove(self, node_id: str) -> None:
         with self._lock:
             self._nodes.pop(node_id, None)

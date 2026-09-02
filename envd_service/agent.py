@@ -145,6 +145,61 @@ def _heartbeat_usage_payload(
     return payload
 
 
+def _delete_sandbox_runtime(
+    settings: Settings,
+    runtime_registry,
+    sandbox_id: str,
+    *,
+    keep_files: bool = False,
+    keep_volume_slices: bool = False,
+) -> None:
+    """Full local teardown for one sandbox runtime (shared by the delete
+    endpoint and E6.1 orphan reconciliation)."""
+    record = runtime_registry.get(sandbox_id)
+    project_id = record.project_id if record is not None else None
+    volume_projects = record.volume_projects if record is not None else []
+    # Derive the project dir from the record so release and rmtree always
+    # target the directory the sandbox was registered with; fall back to
+    # the workspace_base/id convention for unregistered sandboxes.
+    workspace_dir = (
+        Path(record.workspace_dir)
+        if record is not None
+        else settings.workspace_base / sandbox_id
+    )
+    runtime_registry.unregister(sandbox_id)
+    # Shared-workspace deployments keep the directory (keep_files=true): the
+    # same storage hosts the sandbox on every node, so removing it would
+    # destroy the live sandbox's files, and its project id must stay until
+    # the sandbox is really deleted.
+    # keep_volume_slices=true is the migration counterpart: the workspace may
+    # be removed (non-shared workspace export finished), but per-sandbox
+    # volume slices under a shared volume root are still in use by the
+    # target node and must never be deleted by a migration stop/rollback.
+    if keep_files:
+        return
+    if project_id is not None:
+        try:
+            release_project(
+                project_dir=workspace_dir,
+                mount_point=settings.workspace_base,
+                projid=project_id,
+                via_agent=settings.quota_via_agent,
+            )
+        except ProjectQuotaError as exc:
+            logger.warning(
+                "XFS project quota cleanup failed for %s: %s",
+                sandbox_id,
+                exc,
+            )
+    if not keep_volume_slices:
+        cleanup_volume_projects(
+            volume_projects=volume_projects,
+            fallback_mount_point=settings.workspace_base,
+            via_agent=settings.quota_via_agent,
+        )
+    shutil.rmtree(workspace_dir, ignore_errors=True)
+
+
 class NodeAgent:
     """Periodically registers with the control plane and sends heartbeats."""
 
@@ -164,6 +219,10 @@ class NodeAgent:
         self._metrics_provider = metrics_provider
         self._node_id: str | None = None
         self._task: asyncio.Task | None = None
+        # E6.1: set when the control plane may have missed this worker (first
+        # start, heartbeat failures). The next successful heartbeat after a
+        # registration runs a local-runtime reconciliation.
+        self._reconcile_pending = True
 
     def start(self) -> None:
         if not self._control_url or not self._node_address:
@@ -188,6 +247,7 @@ class NodeAgent:
                             logger.info(
                                 "registered node %s at %s", self._node_id, self._node_address
                             )
+                            await self._reconcile_with_control_plane(client, headers)
                     else:
                         resp = await client.post(
                             f"{self._control_url}/internal/nodes/{self._node_id}/heartbeat",
@@ -200,11 +260,80 @@ class NodeAgent:
                             # The control plane lost us (e.g. it restarted);
                             # re-register on the next cycle.
                             self._node_id = None
+                        elif self._reconcile_pending:
+                            # A previous heartbeat/registration failed (e.g.
+                            # a network partition): the control plane may
+                            # have orphaned our sandboxes, so reconcile now
+                            # that we can reach it again.
+                            self._reconcile_pending = False
+                            await self._reconcile_with_control_plane(client, headers)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                self._reconcile_pending = True
                 logger.warning("node agent heartbeat failed", exc_info=True)
             await asyncio.sleep(5)
+
+    async def _reconcile_with_control_plane(self, client, headers) -> None:
+        """Reconcile this worker's local runtimes against the control plane
+        after (re)registration (E6.1 recovery path).
+
+        During a partition the control plane marks this node's sandbox
+        records ``orphaned`` instead of deleting their workspaces. When the
+        worker reconnects:
+
+        * local runtimes the control plane no longer knows are torn down
+          here (their records were deleted while we were unreachable);
+        * the remaining local ids are reported back so the control plane
+          un-orphans the records it still has and removes records for
+          sandboxes we no longer run.
+        """
+        if not self._control_url or not self._node_id:
+            return
+        try:
+            resp = await client.get(
+                f"{self._control_url}/internal/nodes/{self._node_id}/sandboxes",
+                headers=headers,
+            )
+            resp.raise_for_status()
+            known = set(resp.json().get("sandboxIDs") or [])
+        except (httpx.HTTPError, ValueError):
+            logger.warning(
+                "reconcile: cannot fetch control-plane sandbox list",
+                exc_info=True,
+            )
+            return
+        local = {r.sandbox_id for r in self._runtime_registry.list()}
+        for sandbox_id in sorted(local - known):
+            logger.warning(
+                "reconcile: removing orphan runtime %s (not in control plane)",
+                sandbox_id,
+            )
+            _delete_sandbox_runtime(self._settings, self._runtime_registry, sandbox_id)
+        remaining = local & known
+        try:
+            resp = await client.post(
+                f"{self._control_url}/internal/nodes/{self._node_id}/reconcile",
+                json={"sandboxIDs": sorted(remaining)},
+                headers=headers,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            if result.get("recovered"):
+                logger.info(
+                    "reconcile: restored sandboxes %s",
+                    ",".join(result["recovered"]),
+                )
+            if result.get("removed"):
+                logger.info(
+                    "reconcile: removed stale records %s",
+                    ",".join(result["removed"]),
+                )
+        except (httpx.HTTPError, ValueError):
+            logger.warning(
+                "reconcile: control-plane record update failed",
+                exc_info=True,
+            )
 
     async def stop(self) -> None:
         if self._task is not None:
@@ -365,48 +494,13 @@ async def agent_delete_sandbox(
     except PermissionError:
         return Response(status_code=401)
     runtime_registry = request.app.state.runtime_registry
-    record = runtime_registry.get(sandbox_id)
-    project_id = record.project_id if record is not None else None
-    volume_projects = record.volume_projects if record is not None else []
-    # Derive the project dir from the record so release and rmtree always
-    # target the directory the sandbox was registered with; fall back to
-    # the workspace_base/id convention for unregistered sandboxes.
-    workspace_dir = (
-        Path(record.workspace_dir)
-        if record is not None
-        else settings.workspace_base / sandbox_id
+    _delete_sandbox_runtime(
+        settings,
+        runtime_registry,
+        sandbox_id,
+        keep_files=keepFiles,
+        keep_volume_slices=keepVolumeSlices,
     )
-    runtime_registry.unregister(sandbox_id)
-    # Shared-workspace deployments keep the directory (keepFiles=true): the
-    # same storage hosts the sandbox on every node, so removing it would
-    # destroy the live sandbox's files, and its project id must stay until
-    # the sandbox is really deleted.
-    # keepVolumeSlices=true is the migration counterpart: the workspace may
-    # be removed (non-shared workspace export finished), but per-sandbox
-    # volume slices under a shared volume root are still in use by the
-    # target node and must never be deleted by a migration stop/rollback.
-    if not keepFiles:
-        if project_id is not None:
-            try:
-                release_project(
-                    project_dir=workspace_dir,
-                    mount_point=settings.workspace_base,
-                    projid=project_id,
-                    via_agent=settings.quota_via_agent,
-                )
-            except ProjectQuotaError as exc:
-                logger.warning(
-                    "XFS project quota cleanup failed for %s: %s",
-                    sandbox_id,
-                    exc,
-                )
-        if not keepVolumeSlices:
-            cleanup_volume_projects(
-                volume_projects=volume_projects,
-                fallback_mount_point=settings.workspace_base,
-                via_agent=settings.quota_via_agent,
-            )
-        shutil.rmtree(workspace_dir, ignore_errors=True)
     return Response(status_code=204)
 
 

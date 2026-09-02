@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 
+from control_plane.config import Settings
+from control_plane.registry.manager import SandboxRegistry
 from control_plane.registry.nodes import NodeRegistry
 
 
@@ -202,3 +204,73 @@ def test_set_reserved_restores_accounting():
         disk_mb=0,
         processes=0,
     ) is None
+
+
+def test_reap_unhealthy_marks_sandboxes_orphaned():
+    """E6.1: the periodic health sweep marks sandbox records on unhealthy
+    remote nodes as orphaned and never touches healthy nodes or the local
+    in-process node."""
+    registry = NodeRegistry(heartbeat_timeout=1.0)
+    registry.add_local_node(
+        total_memory_mb=1024,
+        total_cpu_percent=200,
+        total_disk_mb=2048,
+        total_processes=128,
+    )
+    dead = registry.register(
+        node_id="node_dead",
+        address="http://dead:49983",
+        total_memory_mb=1024,
+        total_cpu_percent=200,
+        total_disk_mb=2048,
+        total_processes=128,
+    )
+    alive = registry.register(
+        node_id="node_alive",
+        address="http://alive:49983",
+        total_memory_mb=1024,
+        total_cpu_percent=200,
+        total_disk_mb=2048,
+        total_processes=128,
+    )
+
+    sandboxes = SandboxRegistry(Settings(api_keys=("local-key",)))
+
+    def _on_node(record, node_id):
+        record.node_id = node_id
+        sandboxes.save(record)
+
+    rec_dead = sandboxes.create(
+        template_id="base",
+        timeout=300,
+        metadata={},
+        env_vars={},
+        secure=True,
+        allow_internet_access=False,
+        base_image=None,
+    )
+    _on_node(rec_dead, dead.node_id)
+    rec_alive = sandboxes.create(
+        template_id="base",
+        timeout=300,
+        metadata={},
+        env_vars={},
+        secure=True,
+        allow_internet_access=False,
+        base_image=None,
+    )
+    _on_node(rec_alive, alive.node_id)
+
+    dead.heartbeat_at = time.time() - 10
+    assert registry.reap_unhealthy(sandboxes) == ["node_dead"]
+    assert sandboxes.get(rec_dead.sandbox_id).state == "orphaned"
+    assert sandboxes.get(rec_alive.sandbox_id).state == "running"
+    # Local in-process node is never swept; healthy node untouched either.
+    assert registry.get("local").status == "healthy"
+    assert registry.get("node_alive").status == "healthy"
+
+    # A heartbeat revives the node but the mark persists until the worker
+    # reconciles its local runtimes (recovery path).
+    registry.heartbeat("node_dead")
+    assert registry.get("node_dead").status == "healthy"
+    assert sandboxes.get(rec_dead.sandbox_id).state == "orphaned"

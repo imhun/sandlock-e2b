@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -114,7 +115,37 @@ def create_app(
         sweeper = TTLSweeper(on_expired=_on_sandbox_removed)
         app.state.sweeper = sweeper
         sweeper.start(registry)
-        yield
+
+        async def _node_health_loop() -> None:
+            """Mark sandboxes on lost remote nodes orphaned (E6.1)."""
+            while True:
+                try:
+                    marked = await asyncio.to_thread(
+                        app.state.nodes.reap_unhealthy, registry
+                    )
+                    if marked:
+                        logging.getLogger(__name__).warning(
+                            "node health sweep: orphaned sandboxes on %s",
+                            ", ".join(marked),
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # pragma: no cover - defensive
+                    logging.getLogger(__name__).exception(
+                        "node health sweep failed"
+                    )
+                await asyncio.sleep(1)
+
+        health_task = asyncio.create_task(_node_health_loop())
+        app.state.node_health_task = health_task
+        try:
+            yield
+        finally:
+            health_task.cancel()
+            try:
+                await health_task
+            except asyncio.CancelledError:
+                pass
         await sweeper.stop()
 
     app = FastAPI(title="E2B Sandlock Gateway - Control Plane", lifespan=lifespan)

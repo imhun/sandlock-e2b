@@ -13,6 +13,7 @@ from control_plane.registry.manager import (
     SandboxRegistry,
     UnknownSandboxError,
 )
+from gateway_common.timeutil import utcnow
 
 
 def _settings(**overrides) -> Settings:
@@ -111,6 +112,57 @@ def test_delete_releases_entry(workspace):
     assert registry.count() == 0
     with pytest.raises(UnknownSandboxError):
         registry.delete(record.sandbox_id)
+
+
+def test_mark_orphaned_skips_ttl_and_recovers(workspace):
+    """E6.1: sandboxes on a lost node are marked orphaned; TTL never reaps
+    them while orphaned; recovery flips them back to running."""
+    from datetime import timedelta
+
+    registry = SandboxRegistry(_settings())
+    rec_a = _create(registry)
+    rec_a.node_id = "node_a"
+    registry.save(rec_a)
+
+    assert registry.mark_orphaned("node_a") == [rec_a]
+    assert registry.get(rec_a.sandbox_id).state == "orphaned"
+    assert registry.mark_orphaned("node_a") == [rec_a]  # idempotent
+
+    rec_a.end_at = utcnow() - timedelta(seconds=10)
+    assert registry.remove_expired() == []  # orphaned records are protected
+
+    result = registry.recover_node("node_a", {rec_a.sandbox_id}, timeout=60)
+    assert result == {"recovered": [rec_a.sandbox_id], "removed": [], "kept": []}
+    record = registry.get(rec_a.sandbox_id)
+    assert record.state == "running"
+    assert record.end_at > utcnow()  # refreshed on recovery
+    record.end_at = utcnow() - timedelta(seconds=10)
+    assert registry.remove_expired() == [record]  # expiry applies again
+
+
+def test_recover_node_removes_stale_records_only(workspace):
+    """E6.1: the worker's local runtime list is authoritative — records it no
+    longer has are deleted; other nodes' records are untouched."""
+    registry = SandboxRegistry(_settings())
+    rec_keep = _create(registry)
+    rec_keep.node_id = "node_a"
+    registry.save(rec_keep)
+    rec_gone = _create(registry)
+    rec_gone.node_id = "node_a"
+    registry.save(rec_gone)
+    rec_other = _create(registry)
+    rec_other.node_id = "node_b"
+    registry.save(rec_other)
+    registry.mark_orphaned("node_a")
+
+    result = registry.recover_node("node_a", {rec_keep.sandbox_id}, timeout=60)
+    assert result["recovered"] == [rec_keep.sandbox_id]
+    assert result["removed"] == [rec_gone.sandbox_id]
+    assert registry.get(rec_keep.sandbox_id).state == "running"
+    with pytest.raises(UnknownSandboxError):
+        registry.get(rec_gone.sandbox_id)
+    assert registry.get(rec_other.sandbox_id).node_id == "node_b"
+    assert registry.list_by_node("node_b") == [rec_other]
 
 
 def test_max_sandboxes_rejected(workspace):
