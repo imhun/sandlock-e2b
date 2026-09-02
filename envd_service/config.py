@@ -58,6 +58,28 @@ class Settings:
     enable_netns: bool = field(
         default_factory=lambda: _env_bool("E2B_ENABLE_NETNS", False)
     )
+    # E7.2: per-sandbox network isolation (S2.2 `net_isolation`): each
+    # sandlock sandbox spawns in its own network namespace (loopback only)
+    # and all egress is mediated by the supervisor. Default off keeps the
+    # shared-netns path (zero regression); when enabled, outbound connects
+    # need `fd_inject_connect` and inbound listeners need `port_mappings`.
+    enable_net_isolation: bool = field(
+        default_factory=lambda: _env_bool("E2B_ENABLE_NET_ISOLATION", False)
+    )
+    # E7.2: sandlock connect fd-injection switch (S2.1). The supervisor
+    # performs the connect on a host-side socket and injects the connected fd
+    # at the child's own socket fd, so the trapped connect() returns 0 and
+    # CPython's socket.connect() keeps working. Default off (legacy on-behalf
+    # connect); `net_isolation` without it is a loopback-only sandbox.
+    fd_inject_connect: bool = field(
+        default_factory=lambda: _env_bool("E2B_FD_INJECT_CONNECT", False)
+    )
+    # E7.2: inbound port mappings {host_port: sandbox_port} (S2.5), JSON.
+    # Host ports live in the reserved 50005+ range. The MCP gateway path adds
+    # its per-sandbox port automatically when net_isolation is enabled.
+    port_mappings: dict[str, str] = field(
+        default_factory=lambda: _env_json_dict("E2B_PORT_MAPPINGS")
+    )
     network_deny_cidrs: tuple[str, ...] = field(
         default_factory=_network_deny_cidrs
     )

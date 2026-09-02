@@ -293,6 +293,9 @@ class SandlockExecutor(Executor):
         allow_internet_access: bool,
         enable_network: bool,
         enable_netns: bool = False,
+        enable_net_isolation: bool = False,
+        fd_inject_connect: bool = False,
+        port_mappings: dict | None = None,
         network: dict | None = None,
         network_deny_cidrs: tuple[str, ...] = (),
         notify_rate_limit: int = 0,
@@ -314,12 +317,24 @@ class SandlockExecutor(Executor):
         self._max_open_files = max_open_files
         self._allow_internet_access = allow_internet_access
         self._enable_network = enable_network
+        self._enable_net_isolation = enable_net_isolation
+        self._fd_inject_connect = fd_inject_connect
+        self._port_mappings = {
+            int(host): int(sandbox) for host, sandbox in (port_mappings or {}).items()
+        }
+        if self._port_mappings and not enable_net_isolation:
+            raise ValueError(
+                "port_mappings require net isolation "
+                "(E2B_ENABLE_NET_ISOLATION=true): host ports in the 50005+ "
+                "range map onto the sandbox's own netns listeners"
+            )
         self._network_deny_cidrs = tuple(network_deny_cidrs)
         self._notify_rate_limit = notify_rate_limit
         # Accepted for config compatibility (E2B_ENABLE_NETNS), but the fork
-        # now tracks the upstream PR line (upstream-pr/netns-free-clean),
-        # which dropped per-sandbox netns/veth: wildcard rules and isolation
-        # run on the unprivileged shared-netns path, so this flag is a no-op.
+        # dropped per-sandbox netns/veth in favor of the unprivileged
+        # loopback-netns mode: the real switch is `enable_net_isolation`
+        # (E2B_ENABLE_NET_ISOLATION -> sandlock `net_isolation`), so this
+        # legacy flag is a no-op.
         self._enable_netns = enable_netns
         self._network = dict(network) if network else None
         self._iam_tokens = dict(iam_tokens or {})
@@ -575,6 +590,28 @@ class SandlockExecutor(Executor):
             # sandboxes share the worker network namespace).
             mcp_port = str((config.env or {}).get("MCP_PORT", "50005"))
             kwargs["net_allow_bind"] = [mcp_port]
+            if self._enable_net_isolation:
+                # E7.1: under net_isolation the gateway listens inside the
+                # sandbox's own loopback-only netns, unreachable from the
+                # worker; S2.5 inbound mapping serves the sandbox's accept()
+                # from a supervisor host-loopback listener on the same port,
+                # which is what the /mcp proxy dials (127.0.0.1:<port>).
+                port = int(mcp_port)
+                self._port_mappings.setdefault(port, port)
+        if self._enable_net_isolation:
+            kwargs["net_isolation"] = True
+            if self._port_mappings:
+                kwargs["port_mappings"] = dict(self._port_mappings)
+            if self._fd_inject_connect:
+                kwargs["fd_inject_connect"] = True
+            elif not getattr(type(self), "_netns_no_inject_warned", False):
+                type(self)._netns_no_inject_warned = True
+                logger.warning(
+                    "net_isolation enabled without fd_inject_connect: "
+                    "sandboxes are loopback-only (all external egress fails)"
+                )
+        elif self._fd_inject_connect:
+            kwargs["fd_inject_connect"] = True
         if self._base_image and self._image_rootfs is not None:
             # Image rootfs mode: chroot into the extracted image and expose
             # the sandbox directory as /workspace (official SDK default cwd)
