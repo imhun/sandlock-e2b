@@ -103,6 +103,11 @@ class SandboxRecord:
     #: E9.3: eviction priority, 0-10 (default 5). When the fleet runs out of
     #: capacity, idle sandboxes with the *lowest* priority are evicted first.
     priority: int = 5
+    #: E9.2: this record's admission reservation was released (it is paused).
+    #: Owned by the registry (``pause`` / ``resume`` / ``_release``), never by
+    #: the record's own state helpers. Records created before E9.2 read as
+    #: ``False``, so an upgrade cannot release a reservation twice.
+    quota_released: bool = False
 
     def refresh(self, timeout: int) -> None:
         self.end_at = utcnow() + timedelta(seconds=max(1, timeout))
@@ -259,6 +264,7 @@ class SandboxRecord:
             "node_id": self.node_id,
             "last_active_at": to_iso_z(self.last_active_at),
             "priority": int(self.priority),
+            "quota_released": bool(self.quota_released),
             "workspace_dir": (
                 str(self.workspace_dir) if self.workspace_dir is not None else None
             ),
@@ -303,6 +309,7 @@ class SandboxRecord:
             node_id=data.get("node_id", "local"),
             last_active_at=_parse(data.get("last_active_at") or data.get("started_at")),
             priority=_safe_priority(data.get("priority")),
+            quota_released=bool(data.get("quota_released", False)),
             workspace_dir=(
                 Path(data["workspace_dir"]) if data.get("workspace_dir") else None
             ),
@@ -478,7 +485,9 @@ class SandboxRegistry:
         self, memory_mb: int, cpu: int, disk_mb: int, processes: int
     ) -> bool:
         s = self._settings
-        if s.max_sandboxes > 0 and len(self._sandboxes) >= s.max_sandboxes:
+        # Paused sandboxes hold no reservation (E9.2), so they do not consume
+        # a slot of the concurrency cap either.
+        if s.max_sandboxes > 0 and self._held_count_locked() >= s.max_sandboxes:
             return False
         if (
             s.max_total_memory_mb > 0
@@ -501,6 +510,13 @@ class SandboxRegistry:
         ):
             return False
         return True
+
+    def _held_count_locked(self) -> int:
+        """Records currently holding a reservation (E9.2: not paused).
+
+        Callers must hold ``self._lock``.
+        """
+        return sum(1 for r in self._sandboxes.values() if not r.quota_released)
 
     def _tenant_limits(self, tenant_id: str | None, is_admin: bool) -> dict[str, int] | None:
         """Per-tenant admission limits keyed by ledger dim, or ``None`` when
@@ -550,6 +566,143 @@ class SandboxRegistry:
             "processes": record.max_processes,
         }
 
+    def _global_dims(self, record: SandboxRecord) -> dict[str, int]:
+        """The admission dimensions one record occupies (global and node)."""
+        return {
+            "memory": record.memory_mb,
+            "cpu": record.cpu_count * 100,
+            "disk": record.disk_size_mb,
+            "processes": record.max_processes,
+        }
+
+    def _global_limits(self) -> dict[str, int]:
+        s = self._settings
+        return {
+            "memory": s.max_total_memory_mb,
+            "cpu": s.max_total_cpu_percent,
+            "disk": s.max_total_disk_mb,
+            "processes": s.max_total_processes,
+        }
+
+    # -- pause / resume accounting (E9.2) ---------------------------------
+
+    def release_quota(self, record: SandboxRecord) -> bool:
+        """Give back ``record``'s admission reservation (paused sandbox).
+
+        Idempotent: a record whose reservation is already out (or a record
+        created before E9.2 that was never accounted for) returns ``False``
+        and changes nothing, so the delete path can never underflow the
+        ledgers by releasing twice.
+        """
+        if record.quota_released:
+            return False
+        dims = self._global_dims(record)
+        if self._quota_store is not None:
+            self._quota_store.release("global", dims)
+            tenant_limits = self._tenant_limits(record.tenant_id, is_admin=False)
+            if tenant_limits is not None:
+                self._quota_store.release(
+                    f"tenant:{record.tenant_id}", self._tenant_dims(record)
+                )
+        else:
+            with self._lock:
+                self._reserved_memory = max(0, self._reserved_memory - record.memory_mb)
+                self._reserved_cpu = max(0, self._reserved_cpu - record.cpu_count * 100)
+                self._reserved_disk = max(
+                    0, self._reserved_disk - record.disk_size_mb
+                )
+                self._reserved_processes = max(
+                    0, self._reserved_processes - record.max_processes
+                )
+                if record.tenant_id:
+                    used = self._tenant_reserved.get(record.tenant_id)
+                    if used is not None:
+                        for dim, value in self._tenant_dims(record).items():
+                            used[dim] = max(0, used[dim] - value)
+        record.quota_released = True
+        return True
+
+    def hold_quota(self, record: SandboxRecord) -> bool:
+        """Re-acquire a reservation released by :meth:`release_quota`.
+
+        Raises :class:`ResourceUnavailableError` when the fleet (or the
+        tenant ledger) has no room; the record is left untouched so the
+        caller can keep it paused. Returns ``True`` when the reservation was
+        taken by this call.
+        """
+        if not record.quota_released:
+            return False
+        dims = self._global_dims(record)
+        tenant_limits = self._tenant_limits(record.tenant_id, is_admin=False)
+        if self._quota_store is not None:
+            if not self._quota_store.reserve("global", self._global_limits(), dims):
+                raise ResourceUnavailableError("No resources available")
+            if tenant_limits is not None and not self._quota_store.reserve(
+                f"tenant:{record.tenant_id}", tenant_limits, self._tenant_dims(record)
+            ):
+                self._quota_store.release("global", dims)
+                raise ResourceUnavailableError("tenant quota exceeded")
+            record.quota_released = False
+            return True
+        with self._lock:
+            if not self._quota_allows_locked(
+                dims["memory"], dims["cpu"], dims["disk"], dims["processes"]
+            ):
+                raise ResourceUnavailableError("No resources available")
+            if tenant_limits is not None and not self._tenant_quota_allows_locked(
+                record.tenant_id,
+                tenant_limits,
+                dims["memory"],
+                dims["cpu"],
+                dims["disk"],
+                dims["processes"],
+            ):
+                raise ResourceUnavailableError("tenant quota exceeded")
+            self._reserved_memory += dims["memory"]
+            self._reserved_cpu += dims["cpu"]
+            self._reserved_disk += dims["disk"]
+            self._reserved_processes += dims["processes"]
+            if record.tenant_id:
+                used = self._tenant_reserved.setdefault(
+                    record.tenant_id, {dim: 0 for dim in self._TENANT_DIMS}
+                )
+                for dim, value in self._tenant_dims(record).items():
+                    used[dim] += value
+        record.quota_released = False
+        return True
+
+    def pause(self, record: SandboxRecord) -> SandboxRecord:
+        """Pause ``record`` and release its admission reservation (E9.2).
+
+        A paused sandbox stops counting against the global, tenant and node
+        pools, which is what makes "hibernate the idle ones to make room"
+        (E9.3) worth doing: the processes are frozen on the worker and the
+        workspace stays, but the capacity is bookable again.
+        """
+        record.pause()
+        self.release_quota(record)
+        self.save(record)
+        return record
+
+    def resume(
+        self, record: SandboxRecord, timeout: int | None = None
+    ) -> SandboxRecord:
+        """Resume a paused sandbox, re-acquiring capacity first.
+
+        Admission happens *before* the state flip: with no room the caller
+        gets ``ResourceUnavailableError`` (→ 503 / queue) and the sandbox
+        stays paused instead of running unaccounted.
+        """
+        acquired = self.hold_quota(record)
+        try:
+            record.resume(timeout)
+        except SandboxStateConflictError:
+            if acquired:
+                self.release_quota(record)
+            raise
+        self.save(record)
+        return record
+
     def _reserve(self, record: SandboxRecord) -> None:
         self._sandboxes[record.sandbox_id] = record
         self._reserved_memory += record.memory_mb
@@ -564,42 +717,24 @@ class SandboxRegistry:
                 used[dim] += value
 
     def _release(self, record: SandboxRecord) -> None:
+        """Drop ``record``: remove it, notify, then release what it held.
+
+        The reservation is given back *after* the removal callbacks so they
+        can still tell whether the record held one (a paused sandbox already
+        released its node quota in E9.2 and must not release it twice).
+        """
         if self._quota_store is not None:
-            self._quota_store.release(
-                "global",
-                {
-                    "memory": record.memory_mb,
-                    "cpu": record.cpu_count * 100,
-                    "disk": record.disk_size_mb,
-                    "processes": record.max_processes,
-                },
-            )
-            tenant_limits = self._tenant_limits(record.tenant_id, is_admin=False)
-            if tenant_limits is not None:
-                self._quota_store.release(
-                    f"tenant:{record.tenant_id}",
-                    self._tenant_dims(record),
-                )
             self._record_store.delete(record.sandbox_id)
         with self._lock:
             self._sandboxes.pop(record.sandbox_id, None)
-            self._reserved_memory = max(0, self._reserved_memory - record.memory_mb)
-            self._reserved_cpu = max(0, self._reserved_cpu - record.cpu_count * 100)
-            self._reserved_disk = max(0, self._reserved_disk - record.disk_size_mb)
-            self._reserved_processes = max(
-                0, self._reserved_processes - record.max_processes
-            )
-            if record.tenant_id:
-                used = self._tenant_reserved.get(record.tenant_id)
-                if used is not None:
-                    for dim, value in self._tenant_dims(record).items():
-                        used[dim] = max(0, used[dim] - value)
+            self._persisted_activity.pop(record.sandbox_id, None)
             callbacks = list(self._on_removed_callbacks)
         for callback in callbacks:
             try:
                 callback(record)
             except Exception:  # pragma: no cover - defensive
                 pass
+        self.release_quota(record)
 
     # -- lifecycle --------------------------------------------------------
 
@@ -1004,6 +1139,7 @@ class SandboxRegistry:
         entry["processes"] += record.max_processes
 
     def remove_expired(self, now: datetime | None = None) -> list[SandboxRecord]:
+        """Reap sandboxes whose TTL elapsed and release their reservations."""
         if self._record_store is not None:
             expired = []
             for sandbox_id in self._record_store.keys():
@@ -1011,19 +1147,33 @@ class SandboxRegistry:
                     record = self.get(sandbox_id)
                 except UnknownSandboxError:
                     continue
-                if record.is_expired(now) and record.state != "orphaned":
+                if self._ttl_reapable(record, now):
                     expired.append(record)
                     self._release(record)
             return expired
         now = now or utcnow()
         expired = [
-            r
-            for r in self._sandboxes.values()
-            if r.is_expired(now) and r.state != "orphaned"
+            r for r in list(self._sandboxes.values()) if self._ttl_reapable(r, now)
         ]
         for record in expired:
             self._release(record)
         return expired
+
+    @staticmethod
+    def _ttl_reapable(record: SandboxRecord, now: datetime | None) -> bool:
+        """Whether the TTL sweep may delete ``record``.
+
+        Two states survive their deadline:
+
+        * ``orphaned`` (E6.1) — the worker may still be running the sandbox,
+          and deleting the workspace underneath it orphans live inodes;
+        * ``paused`` (E9.2) — parking a sandbox is supposed to preserve the
+          session, and a parked sandbox holds no admission reservation, so
+          reaping it would buy capacity while destroying user state.
+        """
+        if record.state in ("orphaned", "paused"):
+            return False
+        return record.is_expired(now)
 
     def cleanup_workspace(self, record: SandboxRecord) -> None:
         if record.workspace_dir is not None:

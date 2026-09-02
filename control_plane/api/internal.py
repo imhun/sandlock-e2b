@@ -57,11 +57,14 @@ def _rebuild_node_reservations(request: Request, record) -> None:
     """
     dims = {"memory": 0, "cpu": 0, "disk": 0, "processes": 0}
     for sandbox in request.app.state.registry.list():
-        if sandbox.node_id == record.node_id:
-            dims["memory"] += sandbox.memory_mb
-            dims["cpu"] += sandbox.cpu_count * 100
-            dims["disk"] += sandbox.disk_size_mb
-            dims["processes"] += sandbox.max_processes
+        # E9.2: a paused sandbox gave its reservation back, so it must not be
+        # re-booked here (that would strand capacity forever).
+        if sandbox.node_id != record.node_id or sandbox.quota_released:
+            continue
+        dims["memory"] += sandbox.memory_mb
+        dims["cpu"] += sandbox.cpu_count * 100
+        dims["disk"] += sandbox.disk_size_mb
+        dims["processes"] += sandbox.max_processes
     request.app.state.nodes.set_reserved(
         record.node_id,
         memory_mb=dims["memory"],

@@ -113,6 +113,70 @@ def _release_node_quota(request, node, dims: tuple[int, int, int, int]) -> None:
     )
 
 
+def _record_quota_dims(record) -> tuple[int, int, int, int]:
+    return (
+        record.memory_mb,
+        record.cpu_count * 100,
+        record.disk_size_mb,
+        record.max_processes,
+    )
+
+
+def _park_capacity(request, record) -> None:
+    """Give back the node reservation of a sandbox that just paused (E9.2).
+
+    The global/tenant ledger is handled by ``SandboxRegistry.pause``; the node
+    pool lives in the node registry, so it is released here. A node the
+    registry no longer knows about simply has nothing to release (the same
+    tolerance the delete path has).
+    """
+    node = request.app.state.nodes.get(record.node_id or "local")
+    if node is None:
+        return
+    _release_node_quota(request, node, _record_quota_dims(record))
+
+
+def _resume_with_capacity(request, registry, record, *, timeout: int | None = None):
+    """Re-book capacity for a paused sandbox, then resume it (E9.2).
+
+    Node admission happens first (the workspace pins the sandbox to its node,
+    so a different node is not an option), then the global/tenant ledger. Any
+    reservation taken before a later step fails is rolled back: a refused
+    resume must never consume capacity, and a successful one must never run
+    unaccounted.
+
+    Raises ``OfficialError`` 503 (no room; the sandbox stays paused) or 409
+    (already running).
+    """
+    nodes = request.app.state.nodes
+    node = nodes.get(record.node_id or "local")
+    dims = _record_quota_dims(record)
+    reserved_on: object | None = None
+    if node is not None:
+        reserved_on = nodes.reserve_node(
+            node.node_id,
+            memory_mb=dims[0],
+            cpu_percent=dims[1],
+            disk_mb=dims[2],
+            processes=dims[3],
+        )
+        if reserved_on is None:
+            # Same message as the global pool: callers (and the E9.3/E9.4
+            # retry paths) can treat a full node and a full fleet alike.
+            raise OfficialError(503, "No resources available")
+    try:
+        resumed = registry.resume(record, timeout)
+    except ResourceUnavailableError as e:
+        if reserved_on is not None:
+            _release_node_quota(request, reserved_on, dims)
+        raise OfficialError(503, str(e)) from e
+    except SandboxStateConflictError as e:
+        if reserved_on is not None:
+            _release_node_quota(request, reserved_on, dims)
+        raise OfficialError(409, str(e)) from e
+    return resumed
+
+
 async def _image_warm(request, node, base_image, settings) -> bool:
     """Peek whether ``base_image`` is already extracted on ``node``."""
     if not base_image:
@@ -1446,11 +1510,11 @@ async def connect_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
         record = registry.get(sandbox_id)
         _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
         if record.state == "paused":
-            record.resume(timeout)
-            # Persist the resumed state before connect() re-reads the record
-            # (Redis-backed registries reconstruct from the store on every
-            # get(), so an unsaved in-memory mutation would be lost).
-            registry.save(record)
+            # E9.2: a paused sandbox holds no reservation, so the SDK's
+            # auto-resume has to buy capacity back before the sandbox runs
+            # again (503 when the fleet is full; it stays paused).
+            record.touch()
+            _resume_with_capacity(request, registry, record, timeout=timeout)
             request.app.state.runtime_registry.set_state(sandbox_id, "running")
         connected = registry.connect(sandbox_id, timeout)
         _mark_active(request, connected)
@@ -1607,13 +1671,13 @@ async def pause_sandbox(sandbox_id: str, request: Request) -> Response:
     try:
         record = registry.get(sandbox_id)
         _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
-        record.pause()
-        record.touch()  # E9.1: a user action, persisted by the save below
-        registry.save(record)
+        record.touch()  # E9.1: a user action
+        registry.pause(record)  # E9.2: releases the global/tenant reservation
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
     except SandboxStateConflictError:
         raise OfficialError(409, "Sandbox is already paused")
+    _park_capacity(request, record)
     request.app.state.runtime_registry.set_state(sandbox_id, "paused")
     return Response(status_code=204)
 
@@ -1628,13 +1692,10 @@ async def resume_sandbox(sandbox_id: str, request: Request) -> Response:
     try:
         record = registry.get(sandbox_id)
         _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
-        record.resume()
-        record.touch()  # E9.1: a user action, persisted by the save below
-        registry.save(record)
+        record.touch()  # E9.1: a user action
+        _resume_with_capacity(request, registry, record)  # E9.2
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
-    except SandboxStateConflictError:
-        raise OfficialError(409, "Sandbox is already running")
     request.app.state.runtime_registry.set_state(sandbox_id, "running")
     return Response(status_code=204)
 

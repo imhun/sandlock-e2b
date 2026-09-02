@@ -77,6 +77,11 @@ def create_app(
     registry = registry or SandboxRegistry(settings, redis_client=redis_client)
 
     def _release_node_quota(record) -> None:
+        if record.quota_released:
+            # E9.2: a paused sandbox already handed its node reservation back;
+            # releasing it again on delete would steal quota from the
+            # sandboxes that still hold it.
+            return
         app.state.nodes.release_quota(
             record.node_id or "local",
             memory_mb=record.memory_mb,
