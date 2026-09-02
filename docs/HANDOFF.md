@@ -505,6 +505,15 @@ E2B_CREATE_QUEUE_MAX             100   # 并发排队上限；满 → 429 + retr
   EPERM，用例目前带证据跳过）；顺带核对 `E2B_PER_SANDBOX_UID=true` 的组合。
 - **T2** `third_party/sandlock`：把 `notify_rate_limit` 登记进
   `_NativePolicy._HANDLED_FIELDS`（一行，消掉每次建沙箱的假告警）。
+- **OCI 形态（`E2B_BASE_IMAGE=python:3.11-slim`）在本机仍不能全绿**：本轮实测
+  `73 failed / 744 passed / 28 errors in 788s`（日志 `tmp/final-oci-linux.log`），
+  主因是**每次建沙箱都要向 Docker Hub 取一次 manifest**（缓存目录名带 digest，
+  用于 tag 更新自动失效），匿名配额耗尽后就是成片 401/429 与建沙箱失败后的
+  `KeyError: 'sandboxID'` 连锁；也发现一例 `token exchange failed: 401`
+  （携带了凭据去换 Docker Hub 的匿名 token，属 fixture 环境变量污染，待清）。
+  两类出路，需要产品决策：(a) 按文档要求给可认证 registry（ACR，现成路径）;
+  (b) 让解析器在 registry 不可用/限流时回落到“上次成功的 digest”（写一个
+  `<image>.digest` 侧车），代价是限流期间感知不到 tag 更新。本轮没有改这个策略。
 - **T3** 复现并修 `SnapshotRegistry.expand_to` 的快照自嵌套
   （`snapshots/snap_X/fs/snapshots/snap_X/fs/...`，见证据目录
   `tmp/stale-20260902/`）；当前无用例覆盖这条路径。
@@ -545,7 +554,7 @@ no_root_squash 组合（OrbStack 宿主 NFS 代理使容器化自动探针不稳
 ## 2026-09-02（测试环境专项）：Linux 容器与 macOS 全量清零
 
 上一轮记为"抖动用例/环境类失败"的东西几乎都有确定根因。本轮之后：
-**Linux 容器全量 `842 passed / 18 skipped / 0 failed / 0 error`**（此前基线
+**Linux 容器全量 `843 passed / 18 skipped / 0 failed / 0 error`**（此前基线
 `28 failed / 804 passed / 6 errors`），**macOS 全量（unit+contract+sdk python+
 sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
 记为 `2 failed / 732 passed`，并写着"单独重跑都会通过"——实际是稳定复现的）。
