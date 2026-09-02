@@ -1,4 +1,10 @@
 .git
 tmp/
+tmp_pytest/
+# The sandlock submodule is 13G of sources + cargo target dirs and no
+# Dockerfile COPYs it (wheels/fork/ is the build input), so keeping it out of
+# the context is what makes image rebuilds fast.
+third_party/
+tests/**/__pycache__/
 __pycache__/
 .pytest_cache/
