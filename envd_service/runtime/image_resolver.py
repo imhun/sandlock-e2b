@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import threading
+import time
 from pathlib import Path
 
 import tarfile
@@ -73,6 +75,28 @@ def _client_for(
     return ref, client
 
 
+# Manifest lookups are per create, and a node serving one template can ask
+# for the same tag hundreds of times a minute. Docker Hub (and most registries)
+# answer that with 429 TOOMANYREQUESTS for anonymous pulls, which then looks
+# like a sandbox failure. Cache the resolved digest briefly, per process.
+_DIGEST_CACHE: dict[str, tuple[float, str]] = {}
+_DIGEST_CACHE_LOCK = threading.Lock()
+_DEFAULT_MANIFEST_TTL_S = 60.0
+
+
+def _manifest_ttl_s() -> float:
+    raw = os.environ.get("E2B_IMAGE_MANIFEST_TTL_S", "")
+    if not raw:
+        return _DEFAULT_MANIFEST_TTL_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "ignoring invalid E2B_IMAGE_MANIFEST_TTL_S=%r (expected seconds)", raw
+        )
+        return _DEFAULT_MANIFEST_TTL_S
+
+
 def _platform_digest(
     image: str,
     *,
@@ -80,6 +104,16 @@ def _platform_digest(
     registry_password: str | None,
     scheme: str | None = None,
 ) -> str:
+    ttl = _manifest_ttl_s()
+    # Credentials and scheme are part of the key: re-authenticating or
+    # switching registry endpoint must not be answered from the old lookup.
+    key = f"{image}|{scheme or ''}|{registry_username or ''}"
+    now = time.monotonic()
+    if ttl > 0:
+        with _DIGEST_CACHE_LOCK:
+            hit = _DIGEST_CACHE.get(key)
+            if hit and now - hit[0] <= ttl:
+                return hit[1]
     _ref, client = _client_for(
         image,
         registry_username=registry_username,
@@ -87,6 +121,9 @@ def _platform_digest(
         scheme=scheme,
     )
     _manifest, digest = fetch_platform_manifest(client)
+    if ttl > 0:
+        with _DIGEST_CACHE_LOCK:
+            _DIGEST_CACHE[key] = (now, digest)
     return digest
 
 

@@ -326,3 +326,53 @@ def test_peek_warm_reflects_cache(registry, tmp_path):
 def test_unknown_image_fails(registry, tmp_path):
     with pytest.raises(ImageResolutionError):
         resolve_image_rootfs(f"{registry.host}/test/py:missing", tmp_path)
+
+
+def test_platform_digest_is_cached_within_the_ttl(monkeypatch, tmp_path):
+    """One tag is looked up once per TTL window, not once per create."""
+    from envd_service.runtime import image_resolver
+
+    calls: list[str] = []
+
+    def fake_fetch(client):
+        calls.append(client._ref.reference)
+        return {"layers": []}, "sha256:aaaa"
+
+    monkeypatch.setattr(image_resolver, "fetch_platform_manifest", fake_fetch)
+    monkeypatch.setenv("E2B_IMAGE_MANIFEST_TTL_S", "60")
+    image_resolver._DIGEST_CACHE.clear()
+
+    for _ in range(5):
+        assert image_resolver._platform_digest(
+            "python:3.11-slim", registry_username=None, registry_password=None
+        ) == "sha256:aaaa"
+    assert len(calls) == 1
+
+    # Credentials and scheme take part in the key: a different lookup path is
+    # not answered from the previous one.
+    image_resolver._platform_digest(
+        "python:3.11-slim", registry_username="u", registry_password="p"
+    )
+    assert len(calls) == 2
+    image_resolver._DIGEST_CACHE.clear()
+
+
+def test_platform_digest_ttl_zero_always_refetches(monkeypatch):
+    from envd_service.runtime import image_resolver
+
+    calls: list[str] = []
+
+    def fake_fetch(client):
+        calls.append(client._ref.reference)
+        return {"layers": []}, "sha256:bbbb"
+
+    monkeypatch.setattr(image_resolver, "fetch_platform_manifest", fake_fetch)
+    monkeypatch.setenv("E2B_IMAGE_MANIFEST_TTL_S", "0")
+    image_resolver._DIGEST_CACHE.clear()
+
+    for _ in range(3):
+        image_resolver._platform_digest(
+            "python:3.11-slim", registry_username=None, registry_password=None
+        )
+    assert len(calls) == 3
+    image_resolver._DIGEST_CACHE.clear()

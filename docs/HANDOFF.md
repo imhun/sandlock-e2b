@@ -586,6 +586,16 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
 
 ### 仍未解决（已定位，需要环境/上游动作）
 
+- **复跑基线现在会被 Docker Hub 匿名配额卡住**（不是代码问题）：解析器按
+  "每次 create 查一次 manifest" 设计（缓存目录名带 digest，用于 tag 更新自动
+  失效），本轮多次全量+OCI 复跑把配额打满，最后一次复跑
+  `3 failed / 789 passed / 54 errors`（日志 `tmp/final3-linux.log`）全部是
+  `registry-1.docker.io ... 429 TOOMANYREQUESTS`（含 harness 预热 session
+  fixture 的连锁）。已把查询频率降为"每进程每 tag 60s 一次"
+  （`E2B_IMAGE_MANIFEST_TTL_S`，0 关闭）；要彻底摆脱公共仓库配额，走文档既有
+  路径：把基础镜像镜像到 ACR（`deploy/scripts/build-and-push.sh`）并把
+  `E2B_BASE_IMAGE` 指过去。配额恢复前，本机这条基线无法复验；最后一次干净
+  复跑是 `843 passed / 18 skipped / 0 failed`（`tmp/final2-linux.log`）。
 - **overlayfs 上沙箱改不了自己文件的权限**：Docker 容器存储（OrbStack/Desktop 的
   overlayfs）里，沙箱新建文件的属主是挂载属主，沙箱内 `chmod`/`touch` 返回 EPERM ⇒
   `pip install` 这类流程在该存储上不可用。受影响的
@@ -740,4 +750,6 @@ E2B_IMAGE_REGISTRY             模板镜像 push 目标
 E2B_IMAGE_REGISTRY_USERNAME    仓库认证（控制面 push / worker pull）
 E2B_IMAGE_REGISTRY_PASSWORD    仓库认证
 E2B_GATEWAY_URL                迁移后通知 gateway 失效路由
+E2B_IMAGE_MANIFEST_TTL_S       60    # 同一镜像 tag 的 manifest 查询缓存秒数
+                                     # （0 = 每次 create 都查；见 image_resolver）
 ```
