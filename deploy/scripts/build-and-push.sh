@@ -92,6 +92,16 @@ BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker buildx build \
     --push \
     "$SCRIPT_DIR/../.."
 
+# E6.2: print the pushed base-image digest so the operator can pin
+# E2B_BASE_IMAGE to it (upgrade.sh refuses tag-only refs in production).
+# Non-fatal: the image is already pushed; the operator can query it later.
+if digest="$(docker buildx imagetools inspect "$REGISTRY_URL/python-mcp:3.14" \
+    --format '{{.Manifest.Digest}}' 2>/dev/null)"; then
+    echo "python-mcp:3.14 digest: $digest"
+else
+    echo "python-mcp:3.14 digest: 解析失败（镜像已推送；用 docker buildx imagetools inspect 手动查询）" >&2
+fi
+
 printf '%s\n' "$VERSION" > "$VERSION_FILE"
 say "记录本次构建版本：$VERSION -> $VERSION_FILE"
 say "完成。升级目标机：./deploy/scripts/upgrade.sh"

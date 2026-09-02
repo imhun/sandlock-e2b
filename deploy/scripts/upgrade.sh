@@ -9,7 +9,7 @@
 #   * wait, then verify containers and worker registration
 #   * run smoke tests (skip with --skip-smoke)
 #
-# Usage: ./deploy/scripts/upgrade.sh [--build] [--version <v>] [--env-file <path>] [--skip-smoke] [--force-env] [--keep-image-tags]
+# Usage: ./deploy/scripts/upgrade.sh [--build] [--version <v>] [--env-file <path>] [--skip-smoke] [--force-env] [--keep-image-tags] [--allow-tag-base-image]
 #                                     [--rotate-internal-key] [--finalize-internal-key-rotation <old-key>]
 #                                     [--rotate-secret-master-key] [--finalize-secret-master-key-rotation <old-key>]
 
@@ -20,6 +20,7 @@ BUILD=0
 SKIP_SMOKE=0
 FORCE_ENV=0
 KEEP_IMAGE_TAGS=0
+ALLOW_TAG_BASE_IMAGE=0
 ROTATE_INTERNAL=0
 FINALIZE_INTERNAL=""
 ROTATE_SECRET_MASTER=0
@@ -34,6 +35,7 @@ while [ $# -gt 0 ]; do
         --skip-smoke) SKIP_SMOKE=1 ;;
         --force-env) FORCE_ENV=1 ;;
         --keep-image-tags) KEEP_IMAGE_TAGS=1 ;;
+        --allow-tag-base-image) ALLOW_TAG_BASE_IMAGE=1 ;;
         --rotate-internal-key) ROTATE_INTERNAL=1 ;;
         --finalize-internal-key-rotation) FINALIZE_INTERNAL="${2:-}"; shift ;;
         --rotate-secret-master-key) ROTATE_SECRET_MASTER=1 ;;
@@ -201,6 +203,14 @@ print(",".join(keys))
     fi
     sed "s|^E2B_SECRET_MASTER_KEYS=.*|E2B_SECRET_MASTER_KEYS=$REMAINING|" "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
     say "已从 E2B_SECRET_MASTER_KEYS 移除 $FINALIZE_SECRET_MASTER：旧 key 立即失效"
+fi
+
+# --- 基础镜像 digest 固定（E6.2）---
+# 生产部署要求 E2B_BASE_IMAGE 以 @sha256: digest 形式固定；tag-only 或
+# 未解析占位符会被拒绝（--allow-tag-base-image 显式放行非生产场景）。
+# tag 变更必须同时显式更新 digest，禁止“改了 tag 静默部署”。
+if [ -n "$ENV_FILE" ]; then
+    validate_env_file_base_image "$ENV_FILE" || exit 1
 fi
 
 # --- 镜像 tag 固定为当前版本（除非 --keep-image-tags）---

@@ -228,7 +228,9 @@ sandlock 官方支持非 root 运行（uid 65534 全绿）——worker 应以非
   记录删除、仍在运行的记录恢复 `running`、控制面已删除记录的本地运行时
   由 worker 侧清理。
 - **镜像 tag 非 digest**（低-中，供应链）：`E2B_BASE_IMAGE` 用 tag，
-  tag 可被替换。修复：配置 `@sha256:` digest。
+  tag 可被替换。已修复（E6.2）：`.env.example` 改 `@sha256:` 形式；
+  `upgrade.sh` 校验 digest 格式（`--allow-tag-base-image` 显式放行 tag），
+  tag 变更必须同步显式更新 digest；`build-and-push.sh` 推送后打印 digest。
 - **MCP 端口只增不减**（低）：`_next_mcp_port` 从 51000 只增不回收，
   长期 worker 端口漂移。修复：端口回收复用。
 - **命令 env 大小**：无限制（归 8.5）；已确认 `clean_env=True`，

@@ -82,3 +82,60 @@ remote_env_value() {
     run_target "grep -E '^$1=' '$REMOTE_DIR/.env' | tail -1 | cut -d= -f2-" \
         | tr -d '\r' | grep -vE '^[[:space:]]*$' | tail -1
 }
+
+# --- E6.2 image digest pinning ---------------------------------------------
+
+# parse_image_ref <ref> — split an image reference into "repo|tag|digest".
+# digest includes the leading @sha256: prefix (empty when absent); tag is
+# empty when the reference carries no explicit tag.
+parse_image_ref() {
+    local ref="$1" digest="" tag="" last_seg
+    if [[ "$ref" == *"@"* ]]; then
+        digest="${ref##*@}"
+        ref="${ref%@*}"
+        digest="@$digest"
+    fi
+    last_seg="${ref##*/}"
+    if [[ "$last_seg" == *":"* ]]; then
+        tag="${last_seg##*:}"
+        ref="${ref%:$tag}"
+    fi
+    printf '%s|%s|%s\n' "$ref" "$tag" "$digest"
+}
+
+# validate_env_file_base_image <env_file> — fail closed unless
+# E2B_BASE_IMAGE is pinned with a well-formed @sha256: digest (E6.2).
+# Tag-only refs are refused by default; set ALLOW_TAG_BASE_IMAGE=1 to
+# accept them explicitly (non-production). A tag change therefore requires
+# the operator to explicitly update the digest in the same edit.
+validate_env_file_base_image() {
+    local env_file="$1"
+    local ref digest hex
+    ref="$(sed -n 's/^E2B_BASE_IMAGE=//p' "$env_file" | tail -1 | tr -d '\r')"
+    if [ -z "$ref" ]; then
+        echo "E2B_BASE_IMAGE 未在 $env_file 中配置" >&2
+        return 1
+    fi
+    digest="$(parse_image_ref "$ref" | cut -d'|' -f3)"
+    if [[ "$digest" != @sha256:* ]]; then
+        if [ "${ALLOW_TAG_BASE_IMAGE:-0}" = "1" ]; then
+            say "警告：E2B_BASE_IMAGE 未固定 digest（--allow-tag-base-image，仅限非生产）"
+            return 0
+        fi
+        echo "E2B_BASE_IMAGE 必须固定 @sha256: digest（供应链要求 E6.2）：$ref" >&2
+        echo "解析方法：docker buildx imagetools inspect <镜像:tag> --format '{{.Manifest.Digest}}'" >&2
+        echo "然后显式更新为 <镜像:tag>@sha256:<digest>；tag 变更必须同步更新 digest。" >&2
+        return 1
+    fi
+    hex="${digest#@sha256:}"
+    if [[ "$hex" == *"__"* ]]; then
+        echo "E2B_BASE_IMAGE 的 digest 是未解析占位符：$ref" >&2
+        echo "按上方方法解析真实 digest 并替换后再部署。" >&2
+        return 1
+    fi
+    if ! [[ "$hex" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "E2B_BASE_IMAGE 的 digest 格式非法（需 @sha256: 后接 64 位十六进制）：$ref" >&2
+        return 1
+    fi
+    return 0
+}
