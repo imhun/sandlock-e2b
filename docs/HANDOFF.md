@@ -478,6 +478,18 @@ E2B_CREATE_QUEUE_MAX             100   # 并发排队上限；满 → 429 + retr
 - **活动来源有边界**：只有"经过 envd/Connect 鉴权的请求 + 控制面生命周期调用"
   算活动（`/mcp` 代理已单独打点）；沙箱自身**出站**流量、纯 CPU 长任务不算，
   这类沙箱要用高 `priority` 或调大阈值保护。
+- **fork 侧一条假告警（不影响功能，未在本仓库修）**：容器测试里每个沙箱都会打
+  `UserWarning: Policy field 'notify_rate_limit' is set but not wired through FFI`。
+  实际 `sandlock._sdk._build_from_policy` 确实调用了
+  `sandlock_sandbox_builder_notify_rate_limit`，只是同文件里的守卫清单
+  `_NativePolicy._HANDLED_FIELDS` 漏登记了该字段名（tip `be387c7` 仍如此）。
+  属 `third_party/sandlock` 的一行修复（往集合里加名字），我们的
+  `E2B_SANDBOX_NOTIFY_RATE_LIMIT` 是生效的；记录以免下次误判成"配额没起作用"。
+- **`wheels/fork` 与子模块 tip 的一致性无法从产物本身判定**：wheel 时间
+  （09-02 11:11）早于 E7 的两个 sandlock 提交（11:12 `2eb3e7f`、`be387c7`），
+  所以发布前**照例重跑** `scripts/build-sandlock-wheels.sh` + 重建镜像最稳妥；
+  已验证的是：当前 wheel 下 E7 门控套件
+  `E2B_TEST_NET_ISOLATION=1 pytest tests/contract/test_mcp_netns.py` 3/3 通过。
 
 ## 未完成 / 待办（按优先级）
 
