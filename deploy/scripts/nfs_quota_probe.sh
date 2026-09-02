@@ -4,11 +4,15 @@
 # 在 Docker 主机上运行：启动一个容器内内核 NFS 服务器（XFS loop +
 # prjquota 导出），两个 worker 客户端容器通过 NFS 挂载同一导出，实测：
 #   A. projid 继承：client 在 volume/<id>/ 创建的文件 projid 正确继承
-#   B. sync 挂载超限：ENOSPC 及时返回（服务器端 EDQUOT 经 NFS 传播）
-#   C. async 挂载超限：延迟写 close()/fsync() 才报错（E2.6 关注点）
-#   D. 多 worker 独立限额：各自子目录限额独立、projid 不冲突
+#   B. sync 挂载超限：ENOSPC 及时返回，服务器端文件恰在限额处截断
+#      （服务器端 EDQUOT 经 NFS 传播为 ENOSPC）
+#   C. async 挂载超限：延迟写 close()/fsync() 才报错，且服务器端落盘量
+#      少于客户端写入量（数值不固定——异步突发可越过硬限额；E2.6 关注点：
+#      忽略延迟错误会静默丢数据）
+#   D. 多 worker 独立限额：各自写入计数/错误码独立、服务器端 report
+#      分项目记账、projid 不冲突
 #   E. root_squash / uid 映射：对 projid 继承与配额记账的影响
-#   F. 共享路径语义 + 迁移保留文件：两个挂载点看到同一份文件且内容一致
+#   F. 共享路径语义 + 迁移保留文件：两个挂载点文件列表/大小/内容一致
 #
 # 用法：./deploy/scripts/nfs_quota_probe.sh [--limit-mb 16] [--keep]
 #   --limit-mb  每个测试 projid 的硬限额（MB），默认 16
@@ -199,59 +203,90 @@ print(f'{total} {err}')
 PY
 ")"
 set -- $client_out
-if [ "$1" = "$LIMIT_MB" ] && [ "$2" = "28" ]; then
-    pass "B sync ENOSPC (errno 28 at ${LIMIT_MB}MiB)"
+size_b="$(server_exec 'stat -c %s /mnt/xfs/export/volumes/case_b/big.bin')"
+expected_bytes=$((LIMIT_MB * 1024 * 1024))
+if [ "$1" = "$LIMIT_MB" ] && [ "$2" = "28" ] && [ "$size_b" = "$expected_bytes" ]; then
+    pass "B sync ENOSPC (errno 28 at ${LIMIT_MB}MiB, server landed ${expected_bytes}B)"
 else
-    fail "B sync ENOSPC (got: $client_out)"
+    fail "B sync ENOSPC (wrote=$1 errno=$2 server_size=$size_b expected=$expected_bytes)"
 fi
 
-note "C. async 挂载超限 → close()/fsync() 延迟报错"
+note "C. async 挂载超限 → close()/fsync() 延迟报错 + 服务端只落限额"
 client_out="$(client_run "e2b-nfs-case-c" "$MOUNT_OPTS_ASYNC" "
 python3 - <<'PY'
 import os
-f = os.open('volumes/case_c/async.bin', os.O_CREAT|os.O_WRONLY, 0o644)
 block = b'x' * (1024*1024)
+# close() 延迟报错路径：全部写入页缓存成功后直接 close。
+# fsync() 路径的独立文件先一并打开（配额耗尽后新建文件会被 NFS 拒绝）。
+f = os.open('volumes/case_c/close.bin', os.O_CREAT|os.O_WRONLY, 0o644)
+g = os.open('volumes/case_c/fsync.bin', os.O_CREAT|os.O_WRONLY, 0o644)
+writes = 0
 for _ in range($((LIMIT_MB + 8))):
-    os.write(f, block)
+    os.write(f, block); writes += 1
+close_err = None
 try:
-    os.fsync(f); print('fsync ok')
+    os.close(f)
 except OSError as e:
-    print(f'fsync errno {e.errno}')
+    close_err = e.errno
+# fsync() 延迟报错路径：独立文件，写入后显式 fsync。
+for _ in range($((LIMIT_MB + 8))):
+    os.write(g, block)
+fsync_err = None
+try:
+    os.fsync(g)
+    os.close(g)
+except OSError as e:
+    fsync_err = e.errno
+print(f'{writes} {close_err} {fsync_err}')
 PY
 ")"
-if [[ "$client_out" == *"fsync errno 28"* ]]; then
-    pass "C async fsync ENOSPC"
+set -- $client_out
+size_close="$(server_exec 'stat -c %s /mnt/xfs/export/volumes/case_c/close.bin')"
+size_fsync="$(server_exec 'stat -c %s /mnt/xfs/export/volumes/case_c/fsync.bin')"
+if [ "$1" = "$((LIMIT_MB + 8))" ] && [ "$2" = "28" ] && [ "$3" = "28" ] \
+    && { [ "$size_close" -lt "$((expected_bytes + 8 * 1024 * 1024))" ] \
+         || [ "$size_fsync" -lt "$((expected_bytes + 8 * 1024 * 1024))" ]; }; then
+    pass "C async close/fsync ENOSPC (wrote $((LIMIT_MB + 8))MiB; server landed close=$size_close fsync=$size_fsync — less than client wrote)"
 else
-    fail "C async fsync ENOSPC (got: $client_out)"
+    fail "C async close/fsync ENOSPC (writes=$1 close_err=$2 fsync_err=$3 close_size=$size_close fsync_size=$size_fsync)"
 fi
 
 note "D. 多 worker 独立限额"
+w1_out="$(mktemp)"
+w2_out="$(mktemp)"
 client_run "e2b-nfs-w1" "$MOUNT_OPTS_SYNC" "
 python3 - <<'PY'
 import os
 f = os.open('volumes/w1/w.bin', os.O_CREAT|os.O_WRONLY, 0o644)
+total = 0
 for _ in range($((LIMIT_MB + 8))):
-    try: os.write(f, b'x' * (1024*1024))
-    except OSError as e: print(e.errno); break
+    try: os.write(f, b'x' * (1024*1024)); total += 1
+    except OSError as e: print(f'{total} {e.errno}'); break
 PY
-" &
+">"$w1_out" 2>&1 &
 PID_W1=$!
 client_run "e2b-nfs-w2" "$MOUNT_OPTS_SYNC" "
 python3 - <<'PY'
 import os
 f = os.open('volumes/w2/w.bin', os.O_CREAT|os.O_WRONLY, 0o644)
+total = 0
 for _ in range($((LIMIT_MB + 8))):
-    try: os.write(f, b'x' * (1024*1024))
-    except OSError as e: print(e.errno); break
+    try: os.write(f, b'x' * (1024*1024)); total += 1
+    except OSError as e: print(f'{total} {e.errno}'); break
 PY
-" &
+">"$w2_out" 2>&1 &
 PID_W2=$!
 wait "$PID_W1" "$PID_W2"
+w1="$(cat "$w1_out")"
+w2="$(cat "$w2_out")"
+rm -f "$w1_out" "$w2_out"
 usage="$(server_exec "xfs_quota -x -c 'report -p /mnt/xfs/export/volumes/w1 /mnt/xfs/export/volumes/w2' /mnt/xfs | awk '\$1 ~ /^#100[45]$/ {print \$1, \$2}'")"
-if echo "$usage" | grep -q "1004 $((LIMIT_MB * 1024))" && echo "$usage" | grep -q "1005 $((LIMIT_MB * 1024))"; then
+if [ "$w1" = "$LIMIT_MB 28" ] && [ "$w2" = "$LIMIT_MB 28" ] \
+    && echo "$usage" | grep -q "1004 $((LIMIT_MB * 1024))" \
+    && echo "$usage" | grep -q "1005 $((LIMIT_MB * 1024))"; then
     pass "D 多 worker 独立限额"
 else
-    fail "D 多 worker 独立限额 (report: $usage)"
+    fail "D 多 worker 独立限额 (w1='$w1' w2='$w2' report: $usage)"
 fi
 
 note "F. 共享路径语义 + 迁移保留文件"
@@ -261,15 +296,18 @@ mount -t nfs -o $MOUNT_OPTS_SYNC 127.0.0.1:/srv/nfs /mnt/nfsB
 mkdir -p volumes/mig/data/sub
 echo 'keep-me' > volumes/mig/data/notes.txt
 head -c 65536 /dev/urandom > volumes/mig/data/sub/blob.bin
+LIST_A=\$(find volumes/mig -type f -printf '%P %s\n' | sort)
+LIST_B=\$(find /mnt/nfsB/volumes/mig -type f -printf '%P %s\n' | sort)
 SUM_A=\$(md5sum < volumes/mig/data/sub/blob.bin)
 SUM_B=\$(md5sum < /mnt/nfsB/volumes/mig/data/sub/blob.bin)
-test \"\$SUM_A\" = \"\$SUM_B\" && test -f volumes/mig/data/notes.txt && echo SAME
+test \"\$LIST_A\" = \"\$LIST_B\" && test \"\$SUM_A\" = \"\$SUM_B\" \\
+    && test \"\$(cat volumes/mig/data/notes.txt)\" = 'keep-me' && echo SAME
 cd / && umount /mnt/nfsB 2>/dev/null || true
 ")"
 if [[ "$client_out" == *"SAME"* ]]; then
     pass "F 共享路径/迁移保留"
 else
-    fail "F 共享路径/迁移保留 (got: $client_out)"
+    fail "F 共享路径/迁移保留 (file list/md5/content mismatch)"
 fi
 
 # --- 场景 E（root_squash）---------------------------------------------------

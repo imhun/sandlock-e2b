@@ -113,14 +113,18 @@ rm -rf /var/lib/e2b-sandboxes/<id>
    **ENOSPC（errno 28）**，不是 EDQUOT——沙箱内工具需同时处理
    ENOSPC（多数只处理 ENOSPC 的程序反而正确）。
 3. **sync 挂载**（建议，E2.6 concern）：写入在达到硬限额的写调用上
-   立即返回 ENOSPC（实测恰好在限额处截断，写入计数 = 限额）。
-4. **async 挂载**（不推荐）：页缓存写满后才在 `fsync()/close()`
-   返回 ENOSPC（实测文件 size 24MiB > 16MiB 限额，服务端只落 16MiB），
-   应用忽略 fsync 错误会**静默丢数据**。生产必须 `sync` 挂载，且命令
-   执行器在写路径上显式 `fsync` 并透传错误。
+   立即返回 ENOSPC（探针断言：客户端写入计数 = 限额且 errno 28；服务器端
+   `stat -c %s` = 限额字节，文件恰在限额处截断）。
+4. **async 挂载**（不推荐）：全部写入进入页缓存后，`close()` 与
+   `fsync()` 均返回 ENOSPC（探针断言：客户端写入 `限额+8` MiB 全部成功、
+   两个错误路径均 errno 28；服务器端 `stat -c %s` 落盘量**少于客户端
+   写入量且不固定**——本轮实测 close.bin 22MiB / fsync.bin 0MiB，异步
+   突发下服务器可能已越过硬限额——忽略延迟错误会**静默丢数据**）。生产
+   必须 `sync` 挂载，且命令执行器在写路径上显式 `fsync` 并透传错误。
 5. **多 worker 独立限额**：两个 worker 同时写各自
    `volume/<id>/`（不同 projid），各自独立达到硬限额，服务器端 report
-   分项目记账、互不串扰（实测 projid 1004/1005 各自 16MiB 截断）。
+   分项目记账、互不串扰（探针断言：两客户端各自写入计数 = 限额、errno 28，
+   report 显示 projid 1004/1005 各自 16MiB 截断）。
 6. **root_squash / uid 映射**：
    - `root_squash` 下客户端 root 映射为 nobody：projid 继承与配额记账
      不受影响（实测文件属 nobody、projid 仍继承、限额仍生效）；
@@ -142,8 +146,9 @@ rm -rf /var/lib/e2b-sandboxes/<id>
 **以下项需在真实生产 NFS（Linux 目标机）上复核**：
 
 - `deploy/scripts/nfs_quota_probe.sh` 在目标机 NFS 挂载点重跑全 6 项
-  （A projid 继承 / B sync ENOSPC / C async fsync ENOSPC / D 多 worker
-  独立限额 / E root_squash / F 共享路径+迁移保留）；
+  （A projid 继承 / B sync ENOSPC + 服务端截断 / C async close/fsync
+  延迟报错 + 服务端落盘量核对（少于客户端写入） / D 多 worker 独立限额 /
+  E root_squash / F 共享路径+迁移保留）；
 - 生产 NFS 的 `no_root_squash` 与 per-sandbox uid 组合是否保留 uid 隔离；
 - NFSv4 与 v3 在目标内核/导出配置下的行为差异（本次用 v3）；
 - 配额巡检（`xfs_quota report -p`）在服务器端持续校验，与 worker

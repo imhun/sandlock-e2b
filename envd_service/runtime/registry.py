@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -23,6 +24,13 @@ class RuntimeSandbox:
     sandbox_id: str
     access_token: str
     workspace_dir: str
+    #: Wall-clock time this runtime was registered on the worker (E6.1).
+    #: Used by node-agent reconciliation to distinguish runtimes that
+    #: already existed when the control-plane snapshot was taken from
+    #: runtimes created concurrently during the reconcile window: anything
+    #: registered after the snapshot request started is a live create and
+    #: must never be treated as an orphan.
+    created_at: float = field(default_factory=lambda: time.time())
     env_vars: dict[str, str] = field(default_factory=dict)
     base_image: str | None = None
     #: Host uid allocated from the worker uid pool (E3.2). The sandbox runs

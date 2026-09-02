@@ -710,6 +710,7 @@ class SandboxRegistry:
         self,
         node_id: str,
         sandbox_ids: set[str],
+        snapshot_ids: set[str],
         *,
         timeout: int | None = None,
     ) -> dict[str, list[str]]:
@@ -718,7 +719,11 @@ class SandboxRegistry:
 
         ``sandbox_ids`` is the authoritative list of sandboxes the worker
         currently runs. Records the worker still has are un-orphaned (and
-        refreshed); records the worker no longer has are removed entirely.
+        refreshed); records the worker no longer has are removed — but only
+        when they were part of the ``snapshot_ids`` the worker reconciled
+        against. A record created/assigned to the node *after* that snapshot
+        is a concurrent create and is left untouched even if the worker's
+        report (computed before the create landed) does not include it.
         Returns ``{"recovered", "removed", "kept"}`` sandbox id lists so
         callers and operators can see exactly what the reconcile changed.
         """
@@ -737,8 +742,16 @@ class SandboxRegistry:
                     record.refresh(timeout)
                 self.save(record)
             else:
-                removed.append(record.sandbox_id)
-                self.delete(record.sandbox_id)
+                if record.sandbox_id in snapshot_ids:
+                    removed.append(record.sandbox_id)
+                    self.delete(record.sandbox_id)
+                else:
+                    # Created/assigned after the snapshot was taken: a
+                    # concurrent create racing the reconcile. The worker may
+                    # not have reported it yet (its diff predated the create),
+                    # so it must survive; tearing it down would kill a live
+                    # sandbox the control plane just scheduled here.
+                    kept.append(record.sandbox_id)
         return {"recovered": recovered, "removed": removed, "kept": kept}
 
     def save(self, record: SandboxRecord) -> SandboxRecord:

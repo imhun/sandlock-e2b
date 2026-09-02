@@ -9,6 +9,7 @@ import os
 import secrets
 import shutil
 import tarfile
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -283,13 +284,23 @@ class NodeAgent:
         worker reconnects:
 
         * local runtimes the control plane no longer knows are torn down
-          here (their records were deleted while we were unreachable);
-        * the remaining local ids are reported back so the control plane
-          un-orphans the records it still has and removes records for
-          sandboxes we no longer run.
+          here (their records were deleted while we were unreachable) — but
+          only runtimes that already existed when the control-plane snapshot
+          was requested. A runtime registered *during* the reconcile window
+          is a concurrent create that raced the snapshot; it is kept and
+          reported back so the control plane never deletes its record;
+        * the remaining local ids are reported back together with the
+          snapshot ids, so the control plane un-orphans the records it
+          still has, removes records for sandboxes we no longer run (only
+          ones that were in the snapshot), and leaves records created after
+          the snapshot untouched.
         """
         if not self._control_url or not self._node_id:
             return
+        # Wall-clock boundary captured *before* the snapshot request. Any
+        # local runtime registered after this point cannot have been in the
+        # control-plane snapshot, so it must be a concurrent create.
+        reconcile_started_at = time.time()
         try:
             resp = await client.get(
                 f"{self._control_url}/internal/nodes/{self._node_id}/sandboxes",
@@ -303,22 +314,38 @@ class NodeAgent:
                 exc_info=True,
             )
             return
-        local = {r.sandbox_id for r in self._runtime_registry.list()}
-        for sandbox_id in sorted(local - known):
+        local = {r.sandbox_id: r for r in self._runtime_registry.list()}
+        concurrent_creates = {
+            sandbox_id
+            for sandbox_id, record in local.items()
+            if record.created_at > reconcile_started_at
+        }
+        orphaned = set(local) - known - concurrent_creates
+        for sandbox_id in sorted(orphaned):
             logger.warning(
                 "reconcile: removing orphan runtime %s (not in control plane)",
                 sandbox_id,
             )
             _delete_sandbox_runtime(self._settings, self._runtime_registry, sandbox_id)
-        remaining = local & known
+        remaining = (set(local) & known) | concurrent_creates
         try:
             resp = await client.post(
                 f"{self._control_url}/internal/nodes/{self._node_id}/reconcile",
-                json={"sandboxIDs": sorted(remaining)},
+                json={
+                    "sandboxIDs": sorted(remaining),
+                    "snapshotIDs": sorted(known),
+                },
                 headers=headers,
             )
             resp.raise_for_status()
             result = resp.json()
+            if concurrent_creates:
+                logger.info(
+                    "reconcile: kept %d concurrent create(s) started during "
+                    "reconcile window: %s",
+                    len(concurrent_creates),
+                    ",".join(sorted(concurrent_creates)),
+                )
             if result.get("recovered"):
                 logger.info(
                     "reconcile: restored sandboxes %s",

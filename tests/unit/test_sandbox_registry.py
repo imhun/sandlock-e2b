@@ -131,7 +131,12 @@ def test_mark_orphaned_skips_ttl_and_recovers(workspace):
     rec_a.end_at = utcnow() - timedelta(seconds=10)
     assert registry.remove_expired() == []  # orphaned records are protected
 
-    result = registry.recover_node("node_a", {rec_a.sandbox_id}, timeout=60)
+    result = registry.recover_node(
+        "node_a",
+        {rec_a.sandbox_id},
+        snapshot_ids={rec_a.sandbox_id},
+        timeout=60,
+    )
     assert result == {"recovered": [rec_a.sandbox_id], "removed": [], "kept": []}
     record = registry.get(rec_a.sandbox_id)
     assert record.state == "running"
@@ -155,7 +160,12 @@ def test_recover_node_removes_stale_records_only(workspace):
     registry.save(rec_other)
     registry.mark_orphaned("node_a")
 
-    result = registry.recover_node("node_a", {rec_keep.sandbox_id}, timeout=60)
+    result = registry.recover_node(
+        "node_a",
+        {rec_keep.sandbox_id},
+        snapshot_ids={rec_keep.sandbox_id, rec_gone.sandbox_id},
+        timeout=60,
+    )
     assert result["recovered"] == [rec_keep.sandbox_id]
     assert result["removed"] == [rec_gone.sandbox_id]
     assert registry.get(rec_keep.sandbox_id).state == "running"
@@ -163,6 +173,45 @@ def test_recover_node_removes_stale_records_only(workspace):
         registry.get(rec_gone.sandbox_id)
     assert registry.get(rec_other.sandbox_id).node_id == "node_b"
     assert registry.list_by_node("node_b") == [rec_other]
+
+
+def test_recover_node_protects_records_created_after_snapshot(workspace):
+    """E6.1 race: a sandbox created/assigned to the node after the worker's
+    snapshot was taken is a concurrent create — even if the worker's report
+    (computed before the create landed) omits it, the record must survive."""
+    registry = SandboxRegistry(_settings())
+    rec_keep = _create(registry)
+    rec_keep.node_id = "node_a"
+    registry.save(rec_keep)
+    rec_gone = _create(registry)
+    rec_gone.node_id = "node_a"
+    registry.save(rec_gone)
+    registry.mark_orphaned("node_a")
+    # Snapshot taken when only keep/gone existed.
+    snapshot_ids = {rec_keep.sandbox_id, rec_gone.sandbox_id}
+
+    # Concurrent create: a brand-new record lands on node_a after the
+    # snapshot but before the worker's report is processed.
+    rec_new = _create(registry)
+    rec_new.node_id = "node_a"
+    registry.save(rec_new)
+
+    result = registry.recover_node(
+        "node_a",
+        {rec_keep.sandbox_id},  # worker never saw rec_new (created after diff)
+        snapshot_ids=snapshot_ids,
+        timeout=60,
+    )
+    assert result["recovered"] == [rec_keep.sandbox_id]
+    assert result["removed"] == [rec_gone.sandbox_id]
+    assert result["kept"] == [rec_new.sandbox_id]
+    assert registry.get(rec_keep.sandbox_id).state == "running"
+    with pytest.raises(UnknownSandboxError):
+        registry.get(rec_gone.sandbox_id)
+    # The live concurrent create was not deleted.
+    survivor = registry.get(rec_new.sandbox_id)
+    assert survivor.state == "running"
+    assert survivor.node_id == "node_a"
 
 
 def test_max_sandboxes_rejected(workspace):

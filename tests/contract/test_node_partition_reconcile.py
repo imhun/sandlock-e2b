@@ -116,12 +116,16 @@ async def test_recovery_reconcile_endpoints(workspace):
             "/internal/nodes/node_a/sandboxes", headers=headers
         )
         assert listed.status_code == 200
-        assert listed.json()["sandboxIDs"] == ["sbx_rec_gone", "sbx_rec_keep"]
+        snapshot = listed.json()
+        assert snapshot["sandboxIDs"] == ["sbx_rec_gone", "sbx_rec_keep"]
 
         resp = await client.post(
             "/internal/nodes/node_a/reconcile",
             headers=headers,
-            json={"sandboxIDs": ["sbx_rec_keep"]},
+            json={
+                "sandboxIDs": ["sbx_rec_keep"],
+                "snapshotIDs": snapshot["sandboxIDs"],
+            },
         )
         assert resp.status_code == 200
         assert resp.json() == {
@@ -149,11 +153,184 @@ async def test_recovery_reconcile_endpoints(workspace):
             json={},
         )
         assert bad_missing_key.status_code == 400
+        bad_missing_snapshot = await client.post(
+            "/internal/nodes/node_a/reconcile",
+            headers=headers,
+            json={"sandboxIDs": ["sbx_rec_keep"]},
+        )
+        assert bad_missing_snapshot.status_code == 400
         unauthorized = await client.get(
             "/internal/nodes/node_a/sandboxes",
             headers={"X-Internal-Key": "wrong"},
         )
         assert unauthorized.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_reconcile_post_snapshot_create_not_deleted(workspace):
+    """E6.1 race (control-plane side): a sandbox record created after the
+    worker's snapshot must survive reconcile even when the worker's report
+    (computed before the create landed) omits it."""
+    nodes, registry, app = _make_control(workspace)
+    _register_node(nodes, "node_a", "http://127.0.0.1:11111")
+    rec_keep = _sandbox_on(registry, "node_a", "sbx_race_keep")
+    nodes.get("node_a").heartbeat_at = time.time() - 10
+    nodes.reap_unhealthy(registry)
+
+    headers = {"X-Internal-Key": ControlSettings(api_keys=("local-key",)).internal_api_key}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://control"
+    ) as client:
+        listed = await client.get(
+            "/internal/nodes/node_a/sandboxes", headers=headers
+        )
+        snapshot = listed.json()
+        assert snapshot["sandboxIDs"] == ["sbx_race_keep"]
+
+        # Concurrent create: the record lands on node_a after the snapshot.
+        rec_new = _sandbox_on(registry, "node_a", "sbx_race_new")
+        assert rec_new.state == "running"
+
+        # The worker's diff was computed before the create, so its report
+        # only lists the snapshot sandbox.
+        resp = await client.post(
+            "/internal/nodes/node_a/reconcile",
+            headers=headers,
+            json={
+                "sandboxIDs": ["sbx_race_keep"],
+                "snapshotIDs": snapshot["sandboxIDs"],
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "recovered": ["sbx_race_keep"],
+            "removed": [],
+            "kept": ["sbx_race_new"],
+        }
+        assert registry.get("sbx_race_keep").state == "running"
+        # The live concurrent create was NOT deleted by recovery.
+        survivor = registry.get("sbx_race_new")
+        assert survivor.state == "running"
+        assert survivor.node_id == "node_a"
+
+
+class _RacingCreateClient:
+    """Wraps the ASGI client to simulate a create landing on the worker
+    between the snapshot GET and the reconcile diff: the control-plane
+    record and the local runtime appear while the snapshot response is
+    already in flight, so the GET result still lacks the new sandbox."""
+
+    def __init__(self, inner, on_snapshot):
+        self._inner = inner
+        self._on_snapshot = on_snapshot
+        self.last_post: dict | None = None
+
+    async def get(self, url, headers):
+        resp = await self._inner.get(url, headers=headers)
+        self._on_snapshot()
+        return resp
+
+    async def post(self, url, json=None, headers=None):
+        self.last_post = json
+        return await self._inner.post(url, json=json, headers=headers)
+
+
+@pytest.mark.asyncio
+async def test_worker_reconcile_concurrent_create_not_killed(workspace):
+    """E6.1 race (worker side): a runtime registered while reconciliation is
+    in flight is a concurrent create — the worker must not tear it down, and
+    must report it back so the control plane keeps its record."""
+    control_nodes = NodeRegistry(heartbeat_timeout=1.0)
+    _register_node(control_nodes, "node_a", "http://127.0.0.1:11111")
+    registry = SandboxRegistry(ControlSettings(api_keys=("local-key",)))
+    control_app = create_control_app(
+        settings=ControlSettings(api_keys=("local-key",)),
+        registry=registry,
+        nodes_registry=control_nodes,
+        workspace_base=workspace,
+    )
+    rec_keep = _sandbox_on(registry, "node_a", "sbx_race_keep")
+    registry.mark_orphaned("node_a")
+
+    runtime_registry = RuntimeRegistry(workspace)
+    envd_settings = EnvdSettings(executor="local")
+    envd_app = create_envd_app(
+        settings=envd_settings,
+        runtime_registry=runtime_registry,
+        workspace_base=workspace,
+    )
+    keep_dir = workspace / "sbx_race_keep"
+    keep_dir.mkdir(parents=True)
+    (keep_dir / "workspace").mkdir()
+    runtime_registry.register(
+        sandbox_id="sbx_race_keep",
+        access_token="tok",
+        workspace_dir=str(keep_dir),
+    )
+    shutdowns: list[str] = []
+    envd_app.state.runtimes["sbx_race_keep"] = SimpleNamespace(
+        shutdown=lambda: shutdowns.append("sbx_race_keep")
+    )
+
+    def create_between_snapshot_and_diff():
+        # The control plane schedules a new sandbox on this node and the
+        # worker registers its runtime right after the snapshot response
+        # was built (but before the agent computes local - known).
+        rec_new = registry.create(
+            template_id="base",
+            sandbox_id="sbx_race_new",
+            timeout=300,
+            metadata={},
+            env_vars={},
+            secure=True,
+            allow_internet_access=False,
+            base_image=None,
+        )
+        rec_new.node_id = "node_a"
+        registry.save(rec_new)
+        new_dir = workspace / "sbx_race_new"
+        new_dir.mkdir(parents=True)
+        (new_dir / "workspace").mkdir()
+        runtime_registry.register(
+            sandbox_id="sbx_race_new",
+            access_token="tok",
+            workspace_dir=str(new_dir),
+        )
+        envd_app.state.runtimes["sbx_race_new"] = SimpleNamespace(
+            shutdown=lambda: shutdowns.append("sbx_race_new")
+        )
+
+    agent = NodeAgent(
+        settings=envd_settings,
+        runtime_registry=runtime_registry,
+        control_plane_url="http://control",
+        node_address="http://127.0.0.1:11111",
+    )
+    agent._node_id = "node_a"
+    headers = {
+        "X-Internal-Key": ControlSettings(api_keys=("local-key",)).internal_api_key
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control_app), base_url="http://control"
+    ) as client:
+        racing = _RacingCreateClient(client, create_between_snapshot_and_diff)
+        await agent._reconcile_with_control_plane(racing, headers)
+
+    # The concurrent create was reported back with the snapshot ids.
+    assert racing.last_post == {
+        "sandboxIDs": ["sbx_race_keep", "sbx_race_new"],
+        "snapshotIDs": ["sbx_race_keep"],
+    }
+    # The live sandbox was not torn down locally...
+    assert runtime_registry.get("sbx_race_new") is not None
+    assert shutdowns == []
+    assert (workspace / "sbx_race_new").exists()
+    # ...and its control-plane record survived.
+    assert registry.get("sbx_race_new").state == "running"
+    # The pre-existing orphan was restored as usual.
+    assert registry.get("sbx_race_keep").state == "running"
+    assert runtime_registry.get("sbx_race_keep") is not None
+    assert rec_keep.sandbox_id in racing.last_post["sandboxIDs"]
 
 
 @pytest.mark.asyncio

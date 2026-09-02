@@ -105,7 +105,11 @@ async def node_sandboxes(node_id: str, request: Request) -> dict[str, Any]:
 
     The worker uses this as the authoritative list when reconciling its
     local runtime after a partition: any local runtime not in this list is
-    an orphan and is torn down locally.
+    an orphan and is torn down locally. The returned ``sandboxIDs`` are the
+    reconcile snapshot — the worker must echo them back in
+    ``POST .../reconcile``'s ``snapshotIDs`` so the control plane only ever
+    removes records that existed when the snapshot was taken (a record
+    created after the snapshot is a concurrent create and must survive).
     """
     _require_internal_key(request)
     records = request.app.state.registry.list_by_node(node_id)
@@ -116,24 +120,37 @@ async def node_sandboxes(node_id: str, request: Request) -> dict[str, Any]:
 async def node_reconcile(node_id: str, request: Request) -> dict[str, Any]:
     """Reconcile control-plane records against the worker's local runtime.
 
-    Body: ``{"sandboxIDs": [...]}`` — the sandboxes this worker currently
-    runs. Records for the node that the worker still has are un-orphaned
-    (recovery); records the worker no longer has are removed. The result
-    mirrors :meth:`SandboxRegistry.recover_node`.
+    Body: ``{"sandboxIDs": [...], "snapshotIDs": [...]}`` — ``sandboxIDs``
+    are the sandboxes this worker currently runs; ``snapshotIDs`` are the
+    records the worker saw in ``GET .../sandboxes`` before computing its
+    diff. Records the worker still has are un-orphaned (recovery); records
+    it no longer has are removed only when they were part of the snapshot —
+    records created after the snapshot (concurrent creates) are kept. The
+    result mirrors :meth:`SandboxRegistry.recover_node`.
     """
     _require_internal_key(request)
     try:
         body = await request.json()
     except json.JSONDecodeError:
         raise OfficialError(400, "Invalid JSON body")
-    if not isinstance(body, dict) or not isinstance(body.get("sandboxIDs"), list):
-        raise OfficialError(400, "Body must be {\"sandboxIDs\": [...]}")
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("sandboxIDs"), list)
+        or not isinstance(body.get("snapshotIDs"), list)
+    ):
+        raise OfficialError(
+            400, "Body must be {\"sandboxIDs\": [...], \"snapshotIDs\": [...]}"
+        )
     sandbox_ids = [s for s in body["sandboxIDs"] if isinstance(s, str)]
-    if any(not validate_sandbox_id(s) for s in sandbox_ids):
-        raise OfficialError(400, "sandboxIDs must be valid sandbox ids")
+    snapshot_ids = [s for s in body["snapshotIDs"] if isinstance(s, str)]
+    if any(not validate_sandbox_id(s) for s in sandbox_ids) or any(
+        not validate_sandbox_id(s) for s in snapshot_ids
+    ):
+        raise OfficialError(400, "sandboxIDs/snapshotIDs must be valid sandbox ids")
     return request.app.state.registry.recover_node(
         node_id,
         set(sandbox_ids),
+        set(snapshot_ids),
         timeout=request.app.state.settings.default_timeout,
     )
 
