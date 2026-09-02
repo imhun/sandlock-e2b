@@ -195,11 +195,14 @@ async def _run_build(
         # envd_service for exactly this (build + resolution) code path.
         from envd_service.runtime.image_resolver import local_oci_paths
 
-        oci_tar, _link = local_oci_paths(settings.image_cache_dir, template.image)
+        oci_tar, oci_link = local_oci_paths(settings.image_cache_dir, template.image)
         oci_tar.parent.mkdir(parents=True, exist_ok=True)
-        with suppress(OSError):
-            # A rebuilt template must not reuse the previous layout tar.
-            oci_tar.unlink(missing_ok=True)
+        # A rebuilt template must not reuse the previous layout tar -- nor the
+        # sidecar that points at the rootfs extracted from it, which would
+        # otherwise keep serving the old filesystem.
+        for stale in (oci_tar, oci_link):
+            with suppress(OSError):
+                stale.unlink(missing_ok=True)
         output = f"type=oci,dest={oci_tar}"
     build.append_log(f"building template (buildkit: {settings.buildkit_addr})")
     try:

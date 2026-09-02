@@ -96,6 +96,7 @@ def test_resolve_extracts_layers_with_whiteouts(tmp_path: Path, monkeypatch: pyt
     upper = _layer(
         {
             "etc/hosts": b"5.6.7.8 host\n",
+            "bin/sh": b"#!/bin/sh\n",
             "app/run.sh": b"#!/bin/sh\n",
             "app/stale": b"dropped by the next layer\n",
         }
@@ -144,3 +145,14 @@ def test_unreadable_layout_reports_which_file_is_broken(tmp_path: Path) -> None:
         resolve_image_rootfs(IMAGE, tmp_path)
     assert not isinstance(excinfo.value, image_resolver.RegistryError)
     assert tar_path.is_file()
+
+
+def test_empty_rootfs_is_not_marked_complete(tmp_path: Path) -> None:
+    """A layout whose layers add no filesystem fails instead of being cached."""
+    from envd_service.runtime.image_resolver import ImageResolutionError
+
+    payload, _digest = _oci_layout_tar([_layer({"README": b"no filesystem here\n"})])
+    _write_local_oci(tmp_path, "e2b-local/tpl_empty", payload)
+    with pytest.raises(ImageResolutionError, match="empty rootfs"):
+        resolve_image_rootfs("e2b-local/tpl_empty", tmp_path)
+    assert peek_image_warm("e2b-local/tpl_empty", tmp_path)["cached"] is False

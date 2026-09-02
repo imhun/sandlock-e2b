@@ -180,6 +180,12 @@ def _extract_local_oci(image: str, cache: Path, tar_path: Path) -> tuple[Path, s
                         algo, _, hexpart = layer_digest.partition(":")
                         member = tar.getmember(f"blobs/{algo}/{hexpart}")
                         extract_layer(tar.extractfile(member).read(), rootfs)
+                    if not (rootfs / "bin").is_dir() and not (
+                        rootfs / "usr" / "bin"
+                    ).is_dir():
+                        raise ImageResolutionError(
+                            f"image {image} produced an empty rootfs"
+                        )
                 except Exception:
                     shutil.rmtree(rootfs.parent, ignore_errors=True)
                     raise
