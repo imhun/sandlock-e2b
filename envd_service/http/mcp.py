@@ -38,6 +38,11 @@ async def mcp_proxy(request: Request, path: str = "") -> Response:
     x_token = request.headers.get("x-mcp-access-token")
     if not (auth == f"Bearer {token}" or x_token == token):
         raise HttpAuthError(401, "Invalid MCP access token")
+    # E9.1: this route authenticates inline (it targets the per-sandbox
+    # mcp-gateway port, not a runtime), so it must mark activity itself --
+    # otherwise an MCP-only sandbox would keep looking idle and could be
+    # evicted while it is serving requests.
+    request.app.state.runtime_registry.mark_active(sandbox_id)
 
     url = f"http://127.0.0.1:{port}/mcp"
     if path:

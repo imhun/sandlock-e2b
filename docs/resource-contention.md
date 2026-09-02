@@ -30,11 +30,21 @@ TTL 到期或被显式 kill。
 
 ### 3.1 空闲检测
 
-- `SandboxRecord` 增加 `last_active_at`（命令执行、API 访问、网络活动时
-  更新时间戳）；
-- 空闲定义：`now - last_active_at > E2B_SANDBOX_IDLE_THRESHOLD_S`
-  （默认如 300s，可配置）；
-- worker 心跳/命令完成时上报活跃时间，控制面记录。
+E9.1 已实现。`SandboxRecord` 增加 `last_active_at`（tz-aware，**只前进不回退**）
+与 `priority`（0–10，默认 5），随记录持久化；空闲定义
+`now - last_active_at > E2B_SANDBOX_IDLE_THRESHOLD_S`（默认 300s，`0` = 永不空闲）。
+
+**算活动的来源**（两处，缺一不可）：
+
+| 来源 | 采集点 | 送达控制面的路径 |
+|---|---|---|
+| worker 侧：任何通过 envd 鉴权的请求（Connect 进程/文件 RPC、`/files`、`/envs` 等 HTTP、`/mcp` 代理） | `envd_service/http/auth.py::require_http_sandbox`、`envd_service/connect/router.py::_find_sandbox`、`envd_service/http/mcp.py`（该路由自带鉴权，故单独打点） | `RuntimeRegistry.mark_active`（10s 合并）→ 心跳 `sandboxActivity` → `POST /internal/nodes/{id}/heartbeat` → `apply_activity_report`；组合部署（控制面+worker 同进程）走 `add_activity_callback` |
+| 控制面侧：生命周期/变更类调用 | `connect` / `timeout` / `pause` / `resume` / `PUT network` | `SandboxRegistry.mark_active`（直改记录） |
+
+**故意不算活动**：只读轮询（`GET /sandboxes/{id}`、`/metrics`、`/logs`）与内部端点
+（reconcile、节点沙箱清单）——否则一个监控轮询循环或控制面自身的对账就能让空闲沙箱
+永远逃过驱逐。落库按 `E2B_ACTIVITY_PERSIST_INTERVAL_S`（默认 30s）节流，
+因为空闲阈值本身是分钟级精度。
 
 ### 3.2 分层资源池（可选更优雅）
 
@@ -178,8 +188,14 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after�
 3. **与用户预期冲突**：用户可能不期望沙箱被自动踢——驱逐需默认关闭或
    配置显式开启；**用户决策 2026-09-01：改为默认开启**
    （`E2B_EVICTION_ENABLED` 默认 `true`），用空闲阈值 + 优先级 + 通知兜底；
-4. **空闲判定可靠性**：无命令但网络活跃的沙箱（长驻服务）会被误判空闲
-   ——空闲检测需含网络/进程活跃信号；
+4. **空闲判定可靠性（E9.1 后的剩余边界）**：活动信号来自「经过 envd/控制面
+   鉴权层的请求」（见 §3.1 来源表），因此这些仍然会被判为空闲：
+   沙箱内部进程自己的**出站**流量（egress on-behalf 由 supervisor 代发，不经
+   envd）、纯 CPU/内存型长任务、以及沙箱内服务之间的互访。
+   现阶段的兜底手段是把这类沙箱建成高 `priority`（或调大
+   `E2B_SANDBOX_IDLE_THRESHOLD_S`、对关键租户关闭驱逐）；若要彻底解决，需
+   worker 侧采到进程/连接级活跃（cgroup 或 `/proc/<pid>` 采样）再随心跳上报，
+   本期未做。TTL 仍是独立的时间兜底，与空闲判定互不影响。
 5. **pause 语义**：pause 释放配额后现场保留的实现（进程冻结 vs 停止+
    恢复），与 sandlock 能力相关。
 

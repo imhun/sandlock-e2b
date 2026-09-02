@@ -307,9 +307,26 @@ async def test_gateway_start_failure_releases_port(
     assert pool.allocate() == allocated[0]
 
 
+class _ActivityRegistry:
+    """Stub for the E9.1 activity mark that ``/mcp`` performs.
+
+    The real end-to-end marking (worker heartbeat -> control plane) is covered
+    by ``tests/contract/test_idle_activity.py``; here we only need the route's
+    collaborator so it can be asserted: marked on an authenticated request,
+    untouched on a rejected one.
+    """
+
+    def __init__(self) -> None:
+        self.marked: list[str] = []
+
+    def mark_active(self, sandbox_id: str) -> None:
+        self.marked.append(sandbox_id)
+
+
 def _proxy_app(runtimes: dict) -> FastAPI:
     app = FastAPI()
     app.state.runtimes = runtimes
+    app.state.runtime_registry = _ActivityRegistry()
     app.add_exception_handler(HttpAuthError, http_error_response)
     app.include_router(mcp_router)
     return app
@@ -342,6 +359,9 @@ async def test_mcp_proxy_routes_to_sandbox_gateway() -> None:
             )
             assert resp.status_code == 200
             assert resp.json() == {"ok": True, "method": "GET"}
+            # An authenticated MCP call is activity (E9.1): the route
+            # authenticates inline and must mark the sandbox itself.
+            assert app.state.runtime_registry.marked == ["sbx_1"]
     finally:
         server.stop()
 
@@ -373,6 +393,8 @@ async def test_mcp_proxy_auth_and_lookup() -> None:
             headers={"E2b-Sandbox-Id": "sbx_1", "Authorization": "Bearer nope"},
         )
         assert resp.status_code == 401
+        # Nothing above was authenticated -> nothing was marked active.
+        assert app.state.runtime_registry.marked == []
 
 
 @pytest.mark.asyncio

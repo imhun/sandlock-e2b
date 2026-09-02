@@ -427,6 +427,10 @@ Linux: 225 passed, 1 skipped（全量含 Sandlock/registry/真实 Redis/模板�
    `sandboxActivity`（`envd_service/agent.py`），控制面 `apply_activity_report`
    合并进共享 registry，落库按 `E2B_ACTIVITY_PERSIST_INTERVAL_S` 写节流；
    `E2B_SANDBOX_IDLE_THRESHOLD_S` 判定空闲（≤0 = 永不空闲）。
+   活动来源 = 经 envd/Connect 鉴权的请求（**含 `/mcp` 代理**：该路由自带鉴权，
+   单独打点）+ 控制面生命周期调用；只读轮询与内部端点故意不算活动
+   （否则监控轮询循环就能让空闲沙箱永远逃过驱逐），清单见
+   `docs/resource-contention.md` §3.1。
 2. **E9.2 pause 释放配额 / resume 重新准入**：pause 置 `paused` 并幂等归还
    全局/租户/节点配额（现场保留）；resume 先重新准入（不足 → 503，记录保持
    paused）再翻状态；`paused`/`orphaned` 不被 TTL 回收；彻底删除在回调之后才
@@ -460,6 +464,20 @@ E2B_EVICTION_CROSS_TENANT        false # 跨租户驱逐开关（安全默认关
 E2B_CREATE_QUEUE_TIMEOUT_S       30    # 创建排队超时秒；0 = 关闭排队（驱逐后直接 503）
 E2B_CREATE_QUEUE_MAX             100   # 并发排队上限；满 → 429 + retry-after: 1
 ```
+
+注意事项（上线前必读，细节见 `docs/resource-contention.md` §3.1/§5/§8）：
+
+- **默认值会改变客户端可观察行为**：`E2B_EVICTION_ENABLED=true` 会踢掉空闲沙箱
+  （默认阈值 300s）；`E2B_CREATE_QUEUE_TIMEOUT_S=30` 意味着满池时 `POST /sandboxes`
+  最长挂 30s 才拿 503 —— 客户端/网关读超时更短的部署必须把它调到读超时以下或设 0。
+- **跨租户驱逐默认关闭**（`E2B_EVICTION_CROSS_TENANT=false`）：租户只能踢自己
+  租户的空闲沙箱，否则"创建沙箱"就成了打别人空闲沙箱的武器；admin key 放行。
+- **节流与排队都是控制面进程内状态**：`E2B_EVICTION_MIN_INTERVAL_S` 与
+  `CreateQueue` 深度不跨副本共享（不超卖由共享配额 ledger 保证），需要全局
+  节流/全局队列得把状态迁到 Redis。
+- **活动来源有边界**：只有"经过 envd/Connect 鉴权的请求 + 控制面生命周期调用"
+  算活动（`/mcp` 代理已单独打点）；沙箱自身**出站**流量、纯 CPU 长任务不算，
+  这类沙箱要用高 `priority` 或调大阈值保护。
 
 ## 未完成 / 待办（按优先级）
 
@@ -559,6 +577,12 @@ docker run --rm --privileged --network host \
   command_logs）全是既有环境类：端口绑定 PermissionError、docker/buildkit
   不可用、registry·ACR 凭据 env 污染；23 skipped = XFS 配额集成未开（10）+
   需 root/root worker 的 chown·uid 断言（10）+ net-isolation 形态未开（3）。
+  ⚠️ 这组数字**随 runner 权限而变**：同一棵树在"可绑定任意端口 + 可访问
+  docker"的终端环境下是 `2 failed / 732 passed / 23 skipped`（原 33 errors 里的
+  绝大多数其实只是端口权限受限），且剩下这 2 例（`test_tls.py::test_plain_http_against_tls_port_fails`、
+  `test_command_logs.py::test_remote_command_output_in_logs`）单独重跑都会通过
+  ——前者 pre-E9 快照同样失败，后者是需活体远程 worker 的抖动用例。
+  对比 E9 前后的回归时，务必在**同一权限环境**下取数。
 
 ### sandlock fork 验证（Linux 容器）
 

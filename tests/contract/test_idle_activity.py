@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import httpx
 import pytest
 
 from gateway_common.timeutil import to_iso_z, utcnow
@@ -231,3 +232,45 @@ async def test_heartbeat_rejects_malformed_activity(apps, control_client):
     )
     assert bad.status_code == 400
     assert bad.json()["message"] == "sandboxActivity must be a JSON object"
+
+
+async def test_mcp_proxy_traffic_counts_as_activity(apps, control_client, envd_client, monkeypatch):
+    """E9.1 gap: /mcp authenticates inline, so it must mark activity itself."""
+    from types import SimpleNamespace
+
+    import envd_service.http.mcp as mcp_module
+
+    control_app, envd_app = apps
+    registry = control_app.state.registry
+    sandbox = await _create(control_client)
+    sid = sandbox["sandboxID"]
+    envd_app.state.runtimes[sid] = SimpleNamespace(mcp_port=59999, mcp_token="mtok")
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def request(self, method, url, headers=None, content=None):
+            assert url.startswith("http://127.0.0.1:59999/mcp")
+            return httpx.Response(
+                200, content=b'{"ok":true}', headers={"content-type": "application/json"}
+            )
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(mcp_module.httpx, "AsyncClient", _FakeClient)
+    stamp = _backdate(registry, sid)
+
+    wrong = await envd_client.post(
+        "/mcp", headers={"E2b-Sandbox-Id": sid, "x-mcp-access-token": "nope"}, json={}
+    )
+    assert wrong.status_code == 401
+    assert registry.get(sid).last_active_at == stamp
+
+    served = await envd_client.post(
+        "/mcp", headers={"E2b-Sandbox-Id": sid, "x-mcp-access-token": "mtok"}, json={}
+    )
+    assert served.status_code == 200
+    assert await served.aread() == b'{"ok":true}'
+    assert registry.get(sid).last_active_at > stamp
