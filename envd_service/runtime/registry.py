@@ -70,6 +70,11 @@ class RuntimeSandbox:
 class RuntimeRegistry:
     """Maps sandbox IDs to runtime records; filesystem-backed fallback."""
 
+    #: E9.1: coalesce activity marks so a busy sandbox does not turn every
+    #: proxied request into a callback / heartbeat-payload update. The idle
+    #: threshold these feed is minutes wide (default 300s).
+    ACTIVITY_COALESCE_S = 10.0
+
     def __init__(
         self,
         workspace_base: str | Path,
@@ -81,6 +86,13 @@ class RuntimeRegistry:
         self._lock = threading.Lock()
         self._unregister_callbacks: list[Callable[[str], None]] = []
         self._state_callbacks: list[Callable[[str, str], None]] = []
+        #: E9.1: ``sandbox_id -> unix seconds`` of the last request the
+        #: sandbox served. In-memory only (never written into ``sandbox.json``:
+        #: it would turn every proxied call into a disk write); the worker
+        #: ships it to the control plane on each heartbeat, and an in-process
+        #: (combined) deployment gets it through ``_activity_callbacks``.
+        self._activity: dict[str, float] = {}
+        self._activity_callbacks: list[Callable[[str, float], None]] = []
         #: E3.2 host-uid allocator shared by every app that provisions
         #: sandboxes on this workspace (worker agent + local-node control
         #: plane). ``None`` = independent-uid mode disabled.
@@ -95,6 +107,37 @@ class RuntimeRegistry:
         """Invoke ``callback(sandbox_id, state)`` when a sandbox pauses/resumes."""
         with self._lock:
             self._state_callbacks.append(callback)
+
+    def add_activity_callback(self, callback) -> None:
+        """Invoke ``callback(sandbox_id, unix_seconds)`` on sandbox activity.
+
+        Used by the combined (control plane + worker in one process)
+        deployment, where there is no heartbeat to carry the report.
+        """
+        with self._lock:
+            self._activity_callbacks.append(callback)
+
+    def mark_active(self, sandbox_id: str) -> None:
+        """Note that ``sandbox_id`` just served a request (E9.1)."""
+        moment = time.time()
+        with self._lock:
+            if sandbox_id not in self._records:
+                return
+            previous = self._activity.get(sandbox_id)
+            if previous is not None and moment - previous < self.ACTIVITY_COALESCE_S:
+                return
+            self._activity[sandbox_id] = moment
+            callbacks = list(self._activity_callbacks)
+        for callback in callbacks:
+            try:
+                callback(sandbox_id, moment)
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    def activity_snapshot(self) -> dict[str, float]:
+        """Copy of the per-sandbox activity timestamps, for the heartbeat."""
+        with self._lock:
+            return dict(self._activity)
 
     def _record_path(self, sandbox_id: str) -> Path:
         return self._workspace_base / sandbox_id / "sandbox.json"
@@ -184,6 +227,7 @@ class RuntimeRegistry:
             return
         with self._lock:
             removed = self._records.pop(sandbox_id, None) is not None
+            self._activity.pop(sandbox_id, None)
             callbacks = list(self._unregister_callbacks)
         if removed:
             for callback in callbacks:

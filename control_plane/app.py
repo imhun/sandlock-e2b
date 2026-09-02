@@ -180,6 +180,18 @@ def create_app(
         else:
             runtime_registry = _NoopRuntimeRegistry()
     app.state.runtime_registry = runtime_registry
+    # E9.1: a single-process (combined/local-node) deployment has no worker
+    # heartbeat to carry sandbox activity, so the shared runtime registry
+    # reports it straight into the sandbox registry's idle accounting.
+    add_activity_callback = getattr(
+        runtime_registry, "add_activity_callback", None
+    )
+    if callable(add_activity_callback):
+        add_activity_callback(
+            lambda sandbox_id, moment: registry.apply_activity_report(
+                None, {sandbox_id: moment}
+            )
+        )
     app.state.workspace_base = workspace_base or settings.workspace_base
     app.state.workspace_base.mkdir(parents=True, exist_ok=True)
     volume_root = settings.shared_volume_root or (

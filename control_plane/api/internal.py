@@ -96,6 +96,13 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
         disk_warn_count=body.get("diskWarnCount"),
         disk_error_count=body.get("diskErrorCount"),
     )
+    activity = body.get("sandboxActivity")
+    if activity is not None and not isinstance(activity, dict):
+        raise OfficialError(400, "sandboxActivity must be a JSON object")
+    if isinstance(activity, dict) and activity:
+        # E9.1: the worker is the only observer of in-sandbox traffic, so its
+        # report is what makes idle detection (and eviction) possible.
+        request.app.state.registry.apply_activity_report(node_id, activity)
     return Response(status_code=204)
 
 

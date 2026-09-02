@@ -43,4 +43,7 @@ def require_http_sandbox(request: Request, health: bool = False) -> Any:
         and token != runtime.access_token
     ):
         raise HttpAuthError(401, "Invalid access token")
+    # E9.1: an authenticated call is activity; the worker reports it to the
+    # control plane on its next heartbeat (idle detection / eviction).
+    request.app.state.runtime_registry.mark_active(sandbox_id)
     return runtime

@@ -24,6 +24,9 @@ from control_plane.auth import (
     tenant_scope,
 )
 from control_plane.registry.manager import (
+    PRIORITY_DEFAULT,
+    PRIORITY_MAX,
+    PRIORITY_MIN,
     ResourceUnavailableError,
     SandboxStateConflictError,
     SandboxRegistry,
@@ -201,6 +204,18 @@ async def _wait_pending(
 
 def _registry(request: Request) -> SandboxRegistry:
     return request.app.state.registry
+
+
+def _mark_active(request: Request, record) -> None:
+    """Record control-plane-side activity for idle detection (E9.1).
+
+    Only lifecycle/mutating endpoints call this (connect, timeout, pause,
+    resume, network update): the worker reports in-sandbox traffic
+    separately through its heartbeat, and read-only polling (info, metrics,
+    logs) plus internal endpoints (reconcile, node sandbox listing) must not
+    keep an unused sandbox out of reach of the eviction selector.
+    """
+    _registry(request).mark_active(record)
 
 
 def _unsupported_field_error(field: str) -> OfficialError:
@@ -448,6 +463,19 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
     if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
         raise OfficialError(400, "timeout must be a positive integer")
 
+    # Eviction priority (E9.1/E9.3): optional 0-10, default 5, low = first
+    # to be evicted when the fleet is out of capacity.
+    priority = body.get("priority", PRIORITY_DEFAULT)
+    if (
+        not isinstance(priority, int)
+        or isinstance(priority, bool)
+        or not PRIORITY_MIN <= priority <= PRIORITY_MAX
+    ):
+        raise OfficialError(
+            400,
+            f"priority must be an integer between {PRIORITY_MIN} and {PRIORITY_MAX}",
+        )
+
     metadata = body.get("metadata") or (snapshot.metadata if snapshot else {})
     env_vars = body.get("envVars") or (snapshot.env_vars if snapshot else {})
     if not isinstance(metadata, dict) or not isinstance(env_vars, dict):
@@ -661,6 +689,7 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
             iam_tokens=iam_tokens,
             tenant_id=tenant,
             is_admin=is_admin,
+            priority=priority,
         )
     except ResourceUnavailableError as e:
         _release_node_quota(request, node, dims)
@@ -1423,8 +1452,9 @@ async def connect_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
             # get(), so an unsaved in-memory mutation would be lost).
             registry.save(record)
             request.app.state.runtime_registry.set_state(sandbox_id, "running")
-        registry.connect(sandbox_id, timeout)
-        return record.as_sandbox()
+        connected = registry.connect(sandbox_id, timeout)
+        _mark_active(request, connected)
+        return connected.as_sandbox()
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
 
@@ -1442,7 +1472,8 @@ async def set_timeout(sandbox_id: str, request: Request) -> Response:
     try:
         record = registry.get(sandbox_id)
         _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
-        registry.set_timeout(sandbox_id, timeout)
+        updated = registry.set_timeout(sandbox_id, timeout)
+        _mark_active(request, updated)
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
     except ValueError as e:
@@ -1560,6 +1591,7 @@ async def update_sandbox_network(sandbox_id: str, request: Request) -> Response:
     if "allowInternetAccess" in update:
         record.allow_internet_access = update["allowInternetAccess"]
     record.network = network or None
+    record.touch()  # E9.1: a user mutation, persisted by the save below
     registry.save(record)
     await _push_network_config(request, record)
     return Response(status_code=204)
@@ -1576,6 +1608,7 @@ async def pause_sandbox(sandbox_id: str, request: Request) -> Response:
         record = registry.get(sandbox_id)
         _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
         record.pause()
+        record.touch()  # E9.1: a user action, persisted by the save below
         registry.save(record)
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
@@ -1596,6 +1629,7 @@ async def resume_sandbox(sandbox_id: str, request: Request) -> Response:
         record = registry.get(sandbox_id)
         _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
         record.resume()
+        record.touch()  # E9.1: a user action, persisted by the save below
         registry.save(record)
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")

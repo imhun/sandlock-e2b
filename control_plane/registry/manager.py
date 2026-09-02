@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +44,26 @@ class SandboxStateConflictError(RuntimeError):
     """Raised on pause/resume state conflicts."""
 
 
+# Eviction priority range accepted from clients (E9.3). Lower priority
+# sandboxes are evicted first when the fleet is out of capacity.
+PRIORITY_MIN = 0
+PRIORITY_MAX = 10
+PRIORITY_DEFAULT = 5
+
+
+def _safe_priority(value: object) -> int:
+    """Coerce a supplied/stored ``priority`` into the accepted range.
+
+    Reading a record must never fail because of a malformed stored value,
+    so out-of-range or non-numeric input falls back to the default.
+    """
+    try:
+        priority = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return PRIORITY_DEFAULT
+    return max(PRIORITY_MIN, min(PRIORITY_MAX, priority))
+
+
 @dataclass
 class SandboxRecord:
     template_id: str
@@ -75,12 +95,53 @@ class SandboxRecord:
     logs: list[dict[str, str]] = field(default_factory=list)
     metrics: list[dict[str, Any]] = field(default_factory=list)
     node_id: str = "local"
+    #: E9.1: wall-clock of the last activity observed for this sandbox —
+    #: a control-plane API call on the sandbox, or a worker heartbeat that
+    #: reported in-sandbox traffic (commands, file access, HTTP). Feeds the
+    #: idle threshold used by resource-driven eviction (E9.3).
+    last_active_at: datetime = field(default_factory=utcnow)
+    #: E9.3: eviction priority, 0-10 (default 5). When the fleet runs out of
+    #: capacity, idle sandboxes with the *lowest* priority are evicted first.
+    priority: int = 5
 
     def refresh(self, timeout: int) -> None:
         self.end_at = utcnow() + timedelta(seconds=max(1, timeout))
 
     def is_expired(self, now: datetime | None = None) -> bool:
         return (now or utcnow()) >= self.end_at
+
+    def touch(self, when: datetime | None = None) -> bool:
+        """Mark the sandbox active at ``when`` (default: now).
+
+        The timestamp only ever moves forward: activity reports arrive out of
+        order (worker heartbeats every few seconds, concurrent API calls) and
+        a stale report must never make a busy sandbox look idle. Returns
+        ``True`` when the record actually changed.
+        """
+        moment = when or utcnow()
+        if moment.tzinfo is None:  # defensive: callers may pass naive times
+            moment = moment.replace(tzinfo=timezone.utc)
+        if moment <= self.last_active_at:
+            return False
+        self.last_active_at = moment
+        return True
+
+    def idle_seconds(self, now: datetime | None = None) -> float:
+        """Seconds since the last observed activity (never negative)."""
+        now = now or utcnow()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return max(0.0, (now - self.last_active_at).total_seconds())
+
+    def is_idle(self, threshold_s: int, now: datetime | None = None) -> bool:
+        """Idle = quieter than ``threshold_s`` (E2B_SANDBOX_IDLE_THRESHOLD_S).
+
+        A threshold of ``0`` disables idleness entirely: nothing is ever
+        considered idle, so nothing is ever an eviction candidate.
+        """
+        if threshold_s <= 0:
+            return False
+        return self.idle_seconds(now) > threshold_s
 
     def append_log(self, line: str, limit: int = 500) -> None:
         self.logs.append({"timestamp": to_iso_z(utcnow()), "line": line})
@@ -148,6 +209,10 @@ class SandboxRecord:
             "metadata": self.metadata,
             "state": self.state,
             "envdVersion": self.envd_version,
+            # E9.1/E9.3 additions (informational; official SDKs ignore
+            # unknown fields, and the eviction UI needs both to be listable).
+            "lastActiveAt": to_iso_z(self.last_active_at),
+            "priority": self.priority,
         }
 
     def as_detail(self) -> dict[str, Any]:
@@ -192,6 +257,8 @@ class SandboxRecord:
             "network": self.network,
             "iam_tokens": self.iam_tokens,
             "node_id": self.node_id,
+            "last_active_at": to_iso_z(self.last_active_at),
+            "priority": int(self.priority),
             "workspace_dir": (
                 str(self.workspace_dir) if self.workspace_dir is not None else None
             ),
@@ -234,6 +301,8 @@ class SandboxRecord:
             network=data.get("network"),
             iam_tokens=dict(data.get("iam_tokens", {})),
             node_id=data.get("node_id", "local"),
+            last_active_at=_parse(data.get("last_active_at") or data.get("started_at")),
+            priority=_safe_priority(data.get("priority")),
             workspace_dir=(
                 Path(data["workspace_dir"]) if data.get("workspace_dir") else None
             ),
@@ -261,6 +330,9 @@ class SandboxRegistry:
         self._tenant_reserved: dict[str, dict[str, int]] = {}
         self._migration_locks: dict[str, tuple[str, float]] = {}
         self._pending: dict[str, tuple[dict[str, Any], float]] = {}
+        #: E9.1: when each record's activity timestamp was last pushed to the
+        #: shared store (bounds write amplification; see :meth:`mark_active`).
+        self._persisted_activity: dict[str, datetime] = {}
         self._on_removed_callbacks: list[Callable[[SandboxRecord], None]] = []
         self._lock = threading.Lock()
         self._redis = None
@@ -548,6 +620,7 @@ class SandboxRegistry:
         iam_tokens: dict[str, dict[str, str]] | None = None,
         tenant_id: str | None = None,
         is_admin: bool = False,
+        priority: int = PRIORITY_DEFAULT,
     ) -> SandboxRecord:
         s = self._settings
         if sandbox_id is not None and not validate_sandbox_id(sandbox_id):
@@ -555,6 +628,7 @@ class SandboxRegistry:
         timeout = timeout if timeout is not None else s.default_timeout
         if timeout < 1:
             raise ValueError("timeout must be a positive integer")
+        priority = _safe_priority(priority)
 
         memory_mb = s.default_memory_mb
         cpu = s.default_cpu_percent
@@ -619,6 +693,8 @@ class SandboxRegistry:
                 mcp=dict(mcp) if mcp else None,
                 network=dict(network) if network else None,
                 iam_tokens=dict(iam_tokens or {}),
+                priority=priority,
+                last_active_at=now,
             )
             self._reserve(record)
         if self._quota_store is not None:
@@ -644,6 +720,8 @@ class SandboxRegistry:
                 mcp=dict(mcp) if mcp else None,
                 network=dict(network) if network else None,
                 iam_tokens=dict(iam_tokens or {}),
+                priority=priority,
+                last_active_at=now,
             )
             self._record_store.put(
                 record.sandbox_id,
@@ -767,6 +845,7 @@ class SandboxRegistry:
             self._record_store.put(
                 record.sandbox_id, record.to_storage_dict(), ttl=None
             )
+            self._persisted_activity[record.sandbox_id] = record.last_active_at
         return record
 
     def connect(self, sandbox_id: str, timeout: int) -> SandboxRecord:
@@ -782,6 +861,70 @@ class SandboxRegistry:
         record.refresh(timeout)
         self.save(record)
         return record
+
+    # -- activity (E9.1) --------------------------------------------------
+
+    def mark_active(
+        self, record: SandboxRecord, *, when: datetime | None = None
+    ) -> bool:
+        """Record activity on ``record`` and persist it on a coarse interval.
+
+        Returns ``True`` when the timestamp moved forward. The shared store is
+        only written when the previous value is older than
+        ``E2B_ACTIVITY_PERSIST_INTERVAL_S``: activity arrives on every
+        proxied request and every worker heartbeat, while the idle threshold
+        it feeds is minutes wide — sub-second accuracy buys nothing and a
+        Redis write per request would not.
+        """
+        if not record.touch(when):
+            return False
+        if self._record_store is None:
+            self.save(record)
+            return True
+        interval = self._settings.activity_persist_interval_s
+        if interval <= 0:
+            self.save(record)
+            return True
+        persisted = self._persisted_activity.get(record.sandbox_id)
+        if persisted is None or (utcnow() - persisted).total_seconds() >= interval:
+            self._persisted_activity[record.sandbox_id] = record.last_active_at
+            self.save(record)
+        return True
+
+    def touch(self, sandbox_id: str, *, when: datetime | None = None) -> SandboxRecord:
+        """Mark a sandbox active by id (raises ``UnknownSandboxError``)."""
+        record = self.get(sandbox_id)
+        self.mark_active(record, when=when)
+        return record
+
+    def apply_activity_report(
+        self, node_id: str | None, activity: dict[str, Any] | None
+    ) -> int:
+        """Merge per-sandbox activity timestamps from a worker heartbeat.
+
+        The worker sees traffic the control plane never does (commands, file
+        access, in-sandbox HTTP through the gateway), so its report is the
+        authoritative idle signal. Entries are ``{sandbox_id: unix_seconds}``;
+        ``node_id`` guards against a worker reporting for sandboxes it does
+        not host (pass ``None`` from an in-process deployment, where there is
+        no node boundary). Unknown/foreign sandboxes and malformed values are
+        ignored. Returns the number of records updated.
+        """
+        updated = 0
+        for sandbox_id, value in (activity or {}).items():
+            try:
+                moment = datetime.fromtimestamp(float(value), tz=timezone.utc)
+            except (TypeError, ValueError, OSError, OverflowError):
+                continue
+            try:
+                record = self.get(str(sandbox_id))
+            except UnknownSandboxError:
+                continue
+            if node_id is not None and record.node_id != node_id:
+                continue
+            if self.mark_active(record, when=moment):
+                updated += 1
+        return updated
 
     # -- listing ----------------------------------------------------------
 

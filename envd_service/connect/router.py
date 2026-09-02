@@ -50,6 +50,9 @@ def _find_sandbox(request: Request) -> Any:
         and token != runtime.access_token
     ):
         raise unauthenticated("Invalid access token")
+    # E9.1: an authenticated call is activity; the worker reports it to the
+    # control plane on its next heartbeat (idle detection / eviction).
+    request.app.state.runtime_registry.mark_active(sandbox_id)
     return runtime
 
 

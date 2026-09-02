@@ -117,6 +117,7 @@ def _register_payload(settings: Settings) -> dict[str, Any]:
 def _heartbeat_usage_payload(
     settings: Settings,
     metrics_provider: Callable[[], dict[str, Any]] | None = None,
+    activity_provider: Callable[[], dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     """Disk usage + quota alert snapshot carried by each worker heartbeat."""
     payload: dict[str, Any] = {}
@@ -126,6 +127,16 @@ def _heartbeat_usage_payload(
         payload["diskTotalMB"] = usage.total // (1024 * 1024)
     except OSError:
         pass
+    if activity_provider is not None:
+        try:
+            # E9.1: per-sandbox last-activity timestamps; the control plane
+            # turns them into ``last_active_at`` for idle detection.
+            activity = activity_provider()
+        except Exception:
+            logger.warning("sandbox activity provider failed", exc_info=True)
+            activity = None
+        if isinstance(activity, dict) and activity:
+            payload["sandboxActivity"] = activity
     if metrics_provider is not None:
         try:
             metrics = metrics_provider()
@@ -218,6 +229,11 @@ class NodeAgent:
         self._control_url = (control_plane_url or "").rstrip("/")
         self._node_address = node_address or ""
         self._metrics_provider = metrics_provider
+        #: E9.1: per-sandbox activity to ship with each heartbeat (registries
+        #: without activity tracking simply report nothing).
+        self._activity_provider = getattr(
+            runtime_registry, "activity_snapshot", None
+        )
         self._node_id: str | None = None
         self._task: asyncio.Task | None = None
         # E6.1: set when the control plane may have missed this worker (first
@@ -253,7 +269,9 @@ class NodeAgent:
                         resp = await client.post(
                             f"{self._control_url}/internal/nodes/{self._node_id}/heartbeat",
                             json=_heartbeat_usage_payload(
-                                self._settings, self._metrics_provider
+                                self._settings,
+                                self._metrics_provider,
+                                self._activity_provider,
                             ),
                             headers=headers,
                         )

@@ -87,6 +87,18 @@ class Settings:
     create_rate_limit_per_min: int = field(
         default_factory=lambda: _env_int("E2B_CREATE_RATE_LIMIT_PER_MIN", 120)
     )
+    # E9.1: idle detection (resource-contention.md §3.1). A running sandbox
+    # whose last observed activity is older than this becomes an eviction
+    # candidate once the fleet is out of capacity. 0 disables idleness.
+    sandbox_idle_threshold_s: int = field(
+        default_factory=lambda: _env_int("E2B_SANDBOX_IDLE_THRESHOLD_S", 300)
+    )
+    # E9.1: activity timestamps are high-churn while the idle threshold they
+    # feed is minutes wide, so the registry keeps them in memory and writes
+    # through to the shared store at most this often. 0 = write every update.
+    activity_persist_interval_s: int = field(
+        default_factory=lambda: _env_int("E2B_ACTIVITY_PERSIST_INTERVAL_S", 30)
+    )
     volume_token_ttl_s: int = field(
         default_factory=lambda: _env_int("E2B_VOLUME_TOKEN_TTL_S", 0)
     )
