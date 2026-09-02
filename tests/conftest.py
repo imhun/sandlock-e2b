@@ -316,6 +316,7 @@ def _start_multinode(
     image_registry_username: str | None = None,
     image_registry_password: str | None = None,
     buildkit_addr: str | None = None,
+    envd_settings_extra: dict | None = None,
 ) -> dict:
     """Shared harness: control plane + N workers + envd gateway."""
     root.mkdir(parents=True, exist_ok=True)
@@ -363,6 +364,7 @@ def _start_multinode(
 
     worker_apps = []
     worker_dirs = []
+    envd_extra = dict(envd_settings_extra or {})
     for index, worker_port in enumerate(worker_ports):
         worker_dir = root / f"worker-{index + 1}"
         worker_dir.mkdir(parents=True, exist_ok=True)
@@ -381,6 +383,7 @@ def _start_multinode(
                     shared_volume_root=str(shared_volumes),
                     image_registry_username=image_registry_username,
                     image_registry_password=image_registry_password,
+                    **envd_extra,
                 ),
                 runtime_registry=RuntimeRegistry(worker_base),
                 workspace_base=worker_base,

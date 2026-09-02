@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from envd_service.executors.base import ExecConfig
 from envd_service.executors.sandlock import SandlockExecutor
 
@@ -115,3 +117,112 @@ def test_mcp_gateway_bind_default_port(tmp_path: Path) -> None:
         )
     )
     assert sb.net_allow_bind == ["50005"]
+
+
+def test_net_isolation_fd_inject_and_port_mappings_passthrough(tmp_path: Path) -> None:
+    """E7.2: net_isolation / fd_inject_connect / port_mappings flow into the
+    sandlock Sandbox kwargs; port_mappings requires net_isolation."""
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    executor = SandlockExecutor(
+        workspace_dir=str(ws),
+        base_image="python:3.11-slim",
+        image_rootfs=rootfs,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=False,
+        enable_net_isolation=True,
+        fd_inject_connect=True,
+        port_mappings={"50006": "8080"},
+    )
+    sb = _policy(executor, cwd="/workspace")
+    assert sb.net_isolation is True
+    assert sb.fd_inject_connect is True
+    assert sb.port_mappings == {50006: 8080}
+
+
+def test_fd_inject_without_net_isolation_passthrough(tmp_path: Path) -> None:
+    """S2.1 shape: shared netns + fd injection stays available independently."""
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    executor = SandlockExecutor(
+        workspace_dir=str(ws),
+        base_image="python:3.11-slim",
+        image_rootfs=rootfs,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=False,
+        fd_inject_connect=True,
+    )
+    sb = _policy(executor, cwd="/workspace")
+    assert getattr(sb, "net_isolation", False) is False
+    assert sb.fd_inject_connect is True
+
+
+def test_port_mappings_require_net_isolation(tmp_path: Path) -> None:
+    """S2.5 mappings without net_isolation fail closed at executor creation."""
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with pytest.raises(ValueError, match="net isolation"):
+        SandlockExecutor(
+            workspace_dir=str(ws),
+            base_image="python:3.11-slim",
+            image_rootfs=rootfs,
+            memory_mb=512,
+            cpu_percent=100,
+            disk_mb=1024,
+            max_processes=64,
+            max_open_files=4096,
+            allow_internet_access=False,
+            enable_network=False,
+            port_mappings={"50006": "8080"},
+        )
+
+
+def test_mcp_gateway_netns_identity_mapping(tmp_path: Path) -> None:
+    """E7.1: under net_isolation the MCP gateway port is mapped onto the
+    sandbox's own listener (host 50005+ -> same sandbox port), so the /mcp
+    proxy keeps dialing 127.0.0.1:<port> on the worker."""
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    executor = SandlockExecutor(
+        workspace_dir=str(ws),
+        base_image="python:3.11-slim",
+        image_rootfs=rootfs,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=False,
+        enable_net_isolation=True,
+        fd_inject_connect=True,
+    )
+    sb = executor._build_sandbox(
+        ExecConfig(
+            cmd=["/usr/local/bin/python3", "/usr/bin/mcp-gateway", "--config", "{}"],
+            env={"MCP_PORT": "51234"},
+            cwd="/workspace",
+            stdin_enabled=False,
+        )
+    )
+    assert sb.net_isolation is True
+    assert sb.fd_inject_connect is True
+    assert sb.port_mappings == {51234: 51234}
