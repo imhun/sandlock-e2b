@@ -19,16 +19,53 @@ from envd_service.runtime.registry import RuntimeSandbox
 logger = logging.getLogger(__name__)
 
 _MCP_PORT_BASE = 51000
-_mcp_port_counter = 0
-_mcp_port_lock = threading.Lock()
+
+
+class McpPortPool:
+    """Allocates per-sandbox MCP gateway ports and reuses freed ones (E6.3).
+
+    Sandboxes share the worker network namespace, so each MCP gateway needs
+    a distinct host port. The old allocator only ever incremented, so a
+    long-lived worker's port numbers drifted upward forever. This pool keeps
+    a monotonic counter plus a free set: ``release`` returns a port to the
+    pool and the next ``allocate`` reuses it. Allocation and release are
+    serialized under a lock, so concurrent sandbox create/delete cannot hand
+    out the same port twice.
+    """
+
+    def __init__(self, base: int = _MCP_PORT_BASE) -> None:
+        self._base = base
+        self._counter = 0
+        self._free: set[int] = set()
+        self._lock = threading.Lock()
+
+    def allocate(self) -> int:
+        with self._lock:
+            if self._free:
+                return self._free.pop()
+            self._counter += 1
+            return self._base + self._counter
+
+    def release(self, port: int | None) -> None:
+        """Return ``port`` to the free set, ignoring out-of-range values
+        (never-allocated ports) and duplicate releases."""
+        if port is None:
+            return
+        with self._lock:
+            if port <= self._base or port > self._base + self._counter:
+                return
+            self._free.add(port)
+
+
+_mcp_port_pool = McpPortPool()
 
 
 def _next_mcp_port() -> int:
-    """Per-sandbox MCP gateway port (sandboxes share the worker netns)."""
-    global _mcp_port_counter
-    with _mcp_port_lock:
-        _mcp_port_counter += 1
-        return _MCP_PORT_BASE + _mcp_port_counter
+    return _mcp_port_pool.allocate()
+
+
+def _release_mcp_port(port: int | None) -> None:
+    _mcp_port_pool.release(port)
 
 
 class SandboxRuntimeContext:
@@ -117,6 +154,9 @@ class SandboxRuntimeContext:
             except Exception:
                 pass
             self._mcp_gateway = None
+        if self._mcp_port is not None:
+            _release_mcp_port(self._mcp_port)
+            self._mcp_port = None
 
     def pause(self) -> None:
         self.processes.pause_all()
@@ -147,29 +187,37 @@ class SandboxRuntimeContext:
         token_dir = Path(self.record.workspace_dir) / "etc" / "mcp-gateway"
         token_dir.mkdir(parents=True, exist_ok=True)
         (token_dir / ".token").write_text(token, encoding="utf-8")
-        proc = await self.executor.start(
-            ExecConfig(
-                # Run the gateway through the interpreter explicitly: the
-                # sandlock chroot exec handler supports ELF binaries only,
-                # so a shebang script cannot be exec'd directly in image
-                # rootfs mode (EACCES on the script path).
-                cmd=[
-                    "/usr/local/bin/python3",
-                    gateway_bin,
-                    "--config",
-                    config_json,
-                    "--foreground",
-                ],
-                env={
-                    "GATEWAY_ACCESS_TOKEN": token,
-                    "MCP_PORT": str(port),
-                    # clean_env strips PATH; the gateway spawns the configured
-                    # MCP server by command name (e.g. python3) via stdio.
-                    "PATH": "/usr/local/bin:/usr/bin:/bin",
-                },
-                cwd=self.record.workspace_dir,
-                stdin_enabled=False,
+        try:
+            proc = await self.executor.start(
+                ExecConfig(
+                    # Run the gateway through the interpreter explicitly:
+                    # the sandlock chroot exec handler supports ELF binaries
+                    # only, so a shebang script cannot be exec'd directly in
+                    # image rootfs mode (EACCES on the script path).
+                    cmd=[
+                        "/usr/local/bin/python3",
+                        gateway_bin,
+                        "--config",
+                        config_json,
+                        "--foreground",
+                    ],
+                    env={
+                        "GATEWAY_ACCESS_TOKEN": token,
+                        "MCP_PORT": str(port),
+                        # clean_env strips PATH; the gateway spawns the
+                        # configured MCP server by command name (e.g.
+                        # python3) via stdio.
+                        "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    },
+                    cwd=self.record.workspace_dir,
+                    stdin_enabled=False,
+                )
             )
-        )
+        except BaseException:
+            # Never leak the allocated port when the gateway fails to start.
+            _release_mcp_port(port)
+            self._mcp_port = None
+            self._mcp_token = None
+            raise
         self._mcp_gateway = proc
         return proc

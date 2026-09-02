@@ -190,23 +190,121 @@ async def test_start_mcp_gateway_primary_bin_and_full_config(
     assert cfg.env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
 
 
-def test_next_mcp_port_monotonic() -> None:
-    from envd_service.runtime.context import _MCP_PORT_BASE, _next_mcp_port
+def test_mcp_port_pool_reuses_freed_ports() -> None:
+    """E6.3: freed ports are reused instead of the counter drifting upward."""
+    from envd_service.runtime.context import _MCP_PORT_BASE, McpPortPool
 
-    a = _next_mcp_port()
-    b = _next_mcp_port()
-    assert a >= _MCP_PORT_BASE + 1
-    assert b == a + 1
+    pool = McpPortPool()
+    first = pool.allocate()
+    second = pool.allocate()
+    assert first == _MCP_PORT_BASE + 1
+    assert second == first + 1
+
+    pool.release(first)
+    assert pool.allocate() == first  # freed port is reused
+    pool.release(second)
+    pool.release(second)  # duplicate release is idempotent
+    assert pool.allocate() == second
+
+    # Out-of-range releases (never allocated / above the watermark) are
+    # ignored and cannot corrupt the pool.
+    pool.release(_MCP_PORT_BASE)
+    pool.release(_MCP_PORT_BASE + 1000)
+    # Both freed ports were already reused above; the counter continues.
+    assert pool.allocate() == _MCP_PORT_BASE + 3
 
 
-def test_next_mcp_port_thread_safe() -> None:
+def test_mcp_port_pool_concurrent_allocations_never_conflict() -> None:
+    """E6.3: concurrent create/delete cannot hand out the same port twice."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from envd_service.runtime.context import _next_mcp_port
+    from envd_service.runtime.context import _MCP_PORT_BASE, McpPortPool
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        ports = list(pool.map(lambda _: _next_mcp_port(), range(64)))
+    pool = McpPortPool()
+    with ThreadPoolExecutor(max_workers=8) as exec:
+        ports = list(exec.map(lambda _: pool.allocate(), range(64)))
     assert len(set(ports)) == 64
+    assert all(p >= _MCP_PORT_BASE + 1 for p in ports)
+
+    # Release everything, then re-allocate under the same contention: the
+    # pool reuses the freed set and still never duplicates.
+    with ThreadPoolExecutor(max_workers=8) as exec:
+        list(exec.map(pool.release, ports))
+    with ThreadPoolExecutor(max_workers=8) as exec:
+        reused = list(exec.map(lambda _: pool.allocate(), range(64)))
+    assert set(reused) == set(ports)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_releases_mcp_port_for_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E6.3: deleting a sandbox returns its MCP port; the next sandbox gets
+    the same port again."""
+    import envd_service.runtime.context as context_mod
+
+    pool = context_mod.McpPortPool()
+    monkeypatch.setattr(context_mod, "_next_mcp_port", pool.allocate)
+    monkeypatch.setattr(context_mod, "_release_mcp_port", pool.release)
+    record = RuntimeSandbox(
+        sandbox_id="sbx_mcp_reuse_1",
+        access_token="at",
+        workspace_dir=str(tmp_path),
+        base_image="python-mcp:3.14",
+        mcp={"name": "echo", "command": "python3"},
+    )
+    ctx = SandboxRuntimeContext(record, Settings(executor="local"))
+    monkeypatch.setattr(ctx, "executor", _FakeExecutor())
+    await ctx.start_mcp_gateway({"name": "echo"}, "tok")
+    port = ctx.mcp_port
+    assert port is not None
+    ctx.shutdown()
+    assert ctx.mcp_port is None
+
+    ctx2 = SandboxRuntimeContext(record, Settings(executor="local"))
+    monkeypatch.setattr(ctx2, "executor", _FakeExecutor())
+    await ctx2.start_mcp_gateway({"name": "echo"}, "tok2")
+    assert ctx2.mcp_port == port
+
+
+@pytest.mark.asyncio
+async def test_gateway_start_failure_releases_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E6.3: a failed gateway start must not leak its allocated port."""
+    import envd_service.runtime.context as context_mod
+
+    pool = context_mod.McpPortPool()
+    allocated: list[int] = []
+    original_allocate = pool.allocate
+
+    def _alloc():
+        port = original_allocate()
+        allocated.append(port)
+        return port
+
+    monkeypatch.setattr(context_mod, "_next_mcp_port", _alloc)
+    monkeypatch.setattr(context_mod, "_release_mcp_port", pool.release)
+    record = RuntimeSandbox(
+        sandbox_id="sbx_mcp_fail",
+        access_token="at",
+        workspace_dir=str(tmp_path),
+        base_image="python-mcp:3.14",
+        mcp={"name": "echo", "command": "python3"},
+    )
+    ctx = SandboxRuntimeContext(record, Settings(executor="local"))
+
+    class _FailExecutor:
+        async def start(self, config):  # noqa: ANN001
+            raise RuntimeError("gateway start failed")
+
+    monkeypatch.setattr(ctx, "executor", _FailExecutor())
+    with pytest.raises(RuntimeError, match="gateway start failed"):
+        await ctx.start_mcp_gateway({"name": "echo"}, "tok")
+    assert ctx.mcp_port is None
+    assert len(allocated) == 1
+    # The port was returned to the pool: the next allocation reuses it.
+    assert pool.allocate() == allocated[0]
 
 
 def _proxy_app(runtimes: dict) -> FastAPI:

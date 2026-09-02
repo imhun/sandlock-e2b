@@ -232,7 +232,8 @@ sandlock 官方支持非 root 运行（uid 65534 全绿）——worker 应以非
   `upgrade.sh` 校验 digest 格式（`--allow-tag-base-image` 显式放行 tag），
   tag 变更必须同步显式更新 digest；`build-and-push.sh` 推送后打印 digest。
 - **MCP 端口只增不减**（低）：`_next_mcp_port` 从 51000 只增不回收，
-  长期 worker 端口漂移。修复：端口回收复用。
+  长期 worker 端口漂移。已修复（E6.3）：`McpPortPool` 空闲表 + 复用，
+  沙箱删除/网关启动失败均归还端口，并发分配加锁不冲突。
 - **命令 env 大小**：无限制（归 8.5）；已确认 `clean_env=True`，
   worker 环境变量（含 registry 密码）不泄漏进沙箱。
 - **绝对 cwd**：无约束但 fs 策略兜底，无实际影响。
