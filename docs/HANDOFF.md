@@ -420,7 +420,53 @@ Linux: 225 passed, 1 skipped（全量含 Sandlock/registry/真实 Redis/模板�
 7. **镜像仓库认证**：`E2B_IMAGE_REGISTRY_USERNAME/PASSWORD`（控制面+worker），
    `docker login --password-stdin`（密码不进 argv）。
 
+## 本会话已完成（E9.1–E9.4 资源争用闭环）
+
+1. **E9.1 活动/空闲检测**：`SandboxRecord` 增 `last_active_at`（tz-aware、只前进）与
+   `priority`（0–10，默认 5，越界/脏值钳制）；worker 心跳携带每沙箱
+   `sandboxActivity`（`envd_service/agent.py`），控制面 `apply_activity_report`
+   合并进共享 registry，落库按 `E2B_ACTIVITY_PERSIST_INTERVAL_S` 写节流；
+   `E2B_SANDBOX_IDLE_THRESHOLD_S` 判定空闲（≤0 = 永不空闲）。
+2. **E9.2 pause 释放配额 / resume 重新准入**：pause 置 `paused` 并幂等归还
+   全局/租户/节点配额（现场保留）；resume 先重新准入（不足 → 503，记录保持
+   paused）再翻状态；`paused`/`orphaned` 不被 TTL 回收；彻底删除在回调之后才
+   归还配额，不二次释放。创建可带 `priority`，非法值 400。
+3. **E9.3 驱逐（默认开启）**：容量准入失败时按「低 `priority` → 空闲最久 →
+   租户配额权重 → `sandbox_id`」顺序驱逐 `running`+idle 受害者后重试；跨租户
+   默认关闭（admin key / `E2B_EVICTION_CROSS_TENANT` 才放行）；动作默认 kill，
+   `E2B_EVICTION_PREFER_PAUSE=true` 先 pause（仍不够才 kill 已 pause 候选）；
+   被驱逐沙箱 `GET` 404 文案含 `(evicted: evicted-idle)`，响应头
+   `x-e2b-eviction-reason: evicted-idle`；防风暴 = 单次创建最多
+   `E2B_EVICTION_MAX_PER_CREATE` 个 + 轮次最小间隔 `E2B_EVICTION_MIN_INTERVAL_S`
+   （进程内节流，多副本不共享）；驱逐通知可查窗口 `E2B_EVICTION_NOTICE_TTL_S`。
+4. **E9.4 创建排队（默认 30s / 100）**：驱逐后仍无容量时进 `CreateQueue`
+   （`control_plane/queue.py`）等 registry 真正归还配额（
+   `add_on_quota_released` 广播唤醒）或 ≤1s 兜底 tick，超时才回原 503；队列满
+   → 429 `Sandbox create queue is full` + `retry-after: 1`，**且计入
+   `recent_failures`**（扩缩容信号）；排队不占配额/pending marker，同 id 并发
+   重试幂等 201，不超卖；无 FIFO/公平性承诺（多副本各自排队）。
+
+配置项与默认值：
+
+```text
+E2B_SANDBOX_IDLE_THRESHOLD_S     300   # 空闲阈值秒；0 = 永不空闲
+E2B_ACTIVITY_PERSIST_INTERVAL_S  30    # 活动时间戳落库节流秒；0 = 每次更新都写
+E2B_EVICTION_ENABLED             true  # 驱逐总开关（用户决策：默认开启）
+E2B_EVICTION_PREFER_PAUSE        false # true = 先 pause 保留现场再 kill
+E2B_EVICTION_MAX_PER_CREATE      3     # 单次创建最多驱逐数（防风暴）
+E2B_EVICTION_MIN_INTERVAL_S      1     # 驱逐轮次最小间隔秒（进程内节流）
+E2B_EVICTION_NOTICE_TTL_S        3600  # 驱逐通知可查窗口秒
+E2B_EVICTION_CROSS_TENANT        false # 跨租户驱逐开关（安全默认关；admin 放行）
+E2B_CREATE_QUEUE_TIMEOUT_S       30    # 创建排队超时秒；0 = 关闭排队（驱逐后直接 503）
+E2B_CREATE_QUEUE_MAX             100   # 并发排队上限；满 → 429 + retry-after: 1
+```
+
 ## 未完成 / 待办（按优先级）
+
+**E9 已完成**（E9.1–E9.4，见上；Linux 容器全量零新增回归，基线见下）。剩余：
+**E8.1 部署后远程 smoke**（受"不做远程部署"约束暂缓）、运维 **O1/O2/O3**
+（目标机 XFS prjquota / TLS 代理层 / 凭据管理），以及**上线前必须**：重建
+`wheels/fork`（E7 最终 sandlock tip）→ 重建 worker/测试镜像 → 推 ACR。
 
 ### P2 — 真实 NFS 部署未验证
 
@@ -458,11 +504,24 @@ no_root_squash 组合（OrbStack 宿主 NFS 代理使容器化自动探针不稳
 ## 验证命令与基线
 
 ```bash
-# macOS（端口绑定需提权）
-tmp/venv/bin/python -m pytest tests/unit tests/contract tests/sdk/python \
+# macOS 基线（E8.2：unit + contract；端口绑定等环境类失败见下）
+tmp/testenv/bin/python -m pytest tests/unit tests/contract -q -p no:cacheprovider
+
+# macOS 扩展（含 SDK python）
+tmp/testenv/bin/python -m pytest tests/unit tests/contract tests/sdk/python \
   -q -p no:cacheprovider
 
-# Linux 容器全量（含真实 Redis / registry 认证 / Sandlock 用例）
+# Linux 容器全量基线（E8.2 正式数字：local executor，**不带** E2B_BASE_IMAGE；
+# 含真实 Redis / registry 认证 / Sandlock / perf 用例）
+docker run --rm --privileged --network host \
+  -e E2B_HOST_PROJECT="$(pwd)" \
+  -v ~/.orbstack/run/docker.sock:/var/run/docker.sock \
+  -v "$(pwd):/workspace" -w /workspace \
+  e2b-sandlock-test:latest pytest tests --perf -q -p no:cacheprovider
+
+# OCI rootfs 模式（E2B_BASE_IMAGE=…）需要可认证 registry（ACR）或未被限流的
+# 出网，否则 Docker Hub 匿名拉取限流让建沙箱用例拿 428 warm_required
+# （2026-09-02 两次全量尝试均如此；环境前提，非代码缺陷）
 docker run --rm --privileged --network host \
   -e E2B_BASE_IMAGE=python:3.11-slim \
   -e E2B_HOST_PROJECT="$(pwd)" \
@@ -479,6 +538,27 @@ docker run --rm --privileged --network host \
 - 多节点冒烟：`deploy/scripts/multinode_smoke.py` + `deploy/scripts/deployment_smoke.py`
   （后者含迁移/共享 workspace/network 更新）；compose：
   `docker compose -f deploy/compose/docker-compose.multinode.yml up -d`。
+
+### E8.2 基线（2026-09-02 确认，日志 `tmp/e82-linux-local.log` / `tmp/e82-macos.log`）
+
+- **Linux 容器全量**（local executor，无 `E2B_BASE_IMAGE`）：
+  `28 failed / 804 passed / 17 skipped / 6 errors in 219.63s`（perf 用例无失败）。
+  failed/error 名单与 pre-E9 快照（HEAD bc597a8：28 failed / 709 passed / 19
+  skipped / 6 errors in 107.66s，日志 `tmp/e82-linux-base.log`）**逐名比对完全
+  相同** → E9 零新增回归；28+6 全是既有环境依赖类：
+  registry/buildkit（`python-mcp:3.14` Docker Hub 拉取 401、模板构建
+  `buildctl is not available in this image`）、内核/特权（`sandlock_popen
+  failed`、uid 归属断言、shm/egress 断言）、SDK 建沙箱 fixture 撞 create 限流
+  429（`test_stdin`/`test_snapshots` 各 3 ERROR）、mcp-gateway 未监听。17 skipped
+  = XFS 配额集成未开（10）+ net-isolation 形态未开（3）+ JS SDK 需 npm（1）+
+  NET_ADMIN / `E2B_BASE_IMAGE` 门控（3）。
+- **macOS 本机 venv**（`tmp/testenv/bin/python`，unit + contract）：
+  `11 failed / 689 passed / 23 skipped / 33 errors in 36.91s`。11 failed
+  （gateway / mcp_gateway / template_build）与 33 errors（oci_registry /
+  migration / multinode / network_api / redis_multireplica_e2e / tls /
+  command_logs）全是既有环境类：端口绑定 PermissionError、docker/buildkit
+  不可用、registry·ACR 凭据 env 污染；23 skipped = XFS 配额集成未开（10）+
+  需 root/root worker 的 chown·uid 断言（10）+ net-isolation 形态未开（3）。
 
 ### sandlock fork 验证（Linux 容器）
 
@@ -512,11 +592,13 @@ cargo test -p sandlock-core --offline --test integration test_netns -- --test-th
 
 | 文件 | 内容 |
 |------|------|
-| `control_plane/api/sandboxes.py` | migrate（per-sandbox 锁 + 先停源 runtime + 失败回滚）、network 创建/`PUT /sandboxes/{id}/network`/`_push_network_config`、logs 合并、keep_files 销毁 |
-| `control_plane/registry/manager.py` | Redis save/get/list、TTL 回收、`try_acquire_migration`/`release_migration`（SETNX + TTL / 内存锁） |
+| `control_plane/api/sandboxes.py` | migrate（per-sandbox 锁 + 先停源 runtime + 失败回滚）、network 创建/`PUT /sandboxes/{id}/network`/`_push_network_config`、logs 合并、keep_files 销毁、create 调度（E9.3 驱逐重试 / E9.4 排队段，429 满队列计入 `recent_failures`）、pause/resume 端点 |
+| `control_plane/registry/manager.py` | Redis save/get/list、TTL 回收、`try_acquire_migration`/`release_migration`（SETNX + TTL / 内存锁）、E9 记录字段与配额语义（`last_active_at`/`priority`/`touch`/`is_idle`、`pause`/`resume`、`evict_for_capacity`、`add_on_quota_released`、paused/orphaned 不被 TTL 回收） |
+| `control_plane/queue.py` | E9.4 `CreateQueue`（asyncio 排队：容量释放广播唤醒 + ≤1s 兜底 tick、超时/满队列 429、无全局状态） |
+| `control_plane/config.py` | E9 配置项（`E2B_SANDBOX_IDLE_THRESHOLD_S`、`E2B_ACTIVITY_PERSIST_INTERVAL_S`、`E2B_EVICTION_*`、`E2B_CREATE_QUEUE_*`，默认值见「本会话已完成（E9）」节） |
+| `envd_service/agent.py` | export/import/logs/keepFiles 端点、`POST /agent/sandboxes/{id}/network` 更新端点、心跳携带每沙箱 `sandboxActivity`（E9.1 上报入口） |
 | `control_plane/api/templates.py` | COPY 上传链路、registry push/login |
 | `control_plane/registry/nodes.py` | `select_and_reserve(exclude_node_id)`、`reserve_node` |
-| `envd_service/agent.py` | export/import/logs/keepFiles 端点、`POST /agent/sandboxes/{id}/network` 更新端点 |
 | `envd_service/process/logs.py` | 命令输出 JSONL 采集 |
 | `envd_service/runtime/image_resolver.py` | rootfs 解包、pull、registry login、digest 缓存 key |
 | `envd_service/gateway.py` | 路由缓存 + `/internal/routes/{id}/invalidate` |
@@ -536,6 +618,8 @@ cargo test -p sandlock-core --offline --test integration test_netns -- --test-th
 | `tests/contract/test_template_upload.py` | COPY 上传契约 |
 | `tests/sdk/python/test_templates.py` | 构建、COPY、registry push/pull/认证 |
 | `tests/unit/test_sandbox_registry.py` / `test_redis_multireplica.py` | 迁移锁单元测试（内存 + fakeredis） |
+| `tests/unit/test_sandbox_activity.py` / `test_pause_quota.py` / `test_eviction_execution.py` / `test_eviction_selector.py` / `test_create_queue.py` | E9.1–E9.4 单测（活动上报/空闲、pause 配额、驱逐选择与执行、排队） |
+| `tests/contract/test_idle_activity.py` / `test_pause_resume_quota.py` / `test_pause_resume_metrics_logs.py` / `test_eviction_api.py` / `test_create_queue_api.py` | E9.1–E9.4 契约（含驱逐 404 通知 + `x-e2b-eviction-reason`、排队 429/503） |
 | `deploy/docker/Dockerfile.control-plane` / `deploy/docker/Dockerfile.envd` | 分离的最终镜像（envd multi-stage 预编译 egress 库，最终镜像无 gcc） |
 | `deploy/compose/docker-compose.prod.yml` / `deploy/compose/.env.example` | 生产部署示例（控制面+gateway+worker+Redis+可选 registry） |
 | `deploy/scripts/build-images.sh` | buildx 多架构（amd64/arm64）镜像构建脚本 |

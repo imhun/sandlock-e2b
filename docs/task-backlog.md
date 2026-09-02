@@ -59,9 +59,9 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | E9.1 | 空闲检测（`last_active_at` + worker 活动上报 + 阈值配置） | ✅ 完成 | `07b3555` |
 | E9.2 | pause 释放配额 / resume 重新准入 | ✅ 完成 | `8448d64` |
 | E9.3 | 驱逐选择器 + kill/pause + 通知（默认开启） | ✅ 完成 | `bcee688` |
-| E9.4 | 创建排队 / 超时 / 队列上限 | 🔄 进行中 | — |
+| E9.4 | 创建排队 / 超时 / 队列上限 | ✅ 完成 | `59c64d9` |
 | E8.1 | 部署后远程 smoke 回归 | ⏸ 受"不做远程部署"约束暂缓 | — |
-| E8.2 | 本地测试基线确认 + HANDOFF/backlog 更新 | 🔄 待 E9.4 合并后执行（Linux 容器全量） | — |
+| E8.2 | 本地测试基线确认 + HANDOFF/backlog 更新 | ✅ 完成（Linux 容器全量 28 failed / 804 passed / 17 skipped / 6 errors，219.63s；macOS unit+contract 11 failed / 689 passed / 23 skipped / 33 errors，36.91s；详见 HANDOFF「验证命令与基线」） | — |
 
 ## 运维侧任务
 
@@ -73,7 +73,5 @@ ACR 镜像推送照常，git 远程推送暂缓。
 
 ## 剩余工作
 
-1. **E9.4** 创建排队（进行中）；
-2. **E8.2** Linux 容器全量基线（unit + contract + sdk + security + perf）并把数字写进 `docs/HANDOFF.md`；
-3. 上线前：`wheels/fork` 重建（E7 最终 tip）+ 镜像重建推 ACR；
-4. 用户解除"不做远程部署"约束后：O1（prjquota）、E1.2/E8.1 目标机部署与远程复测、O2/O3。
+1. 上线前：`wheels/fork` 重建（E7 最终 tip）+ 镜像重建推 ACR；
+2. 用户解除"不做远程部署"约束后：O1（prjquota）、E1.2/E8.1 目标机部署与远程复测、O2/O3。
