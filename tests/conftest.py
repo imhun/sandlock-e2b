@@ -132,7 +132,12 @@ def workspace(tmp_path) -> Path:
 def apps(workspace):
     """Control plane + envd apps sharing a runtime registry (in-process)."""
     runtime_registry = RuntimeRegistry(workspace)
-    control_settings = ControlSettings(api_keys=("local-key",))
+    control_settings = ControlSettings(
+        api_keys=("local-key",),
+        # E9.4: keep the shared fixture on the pre-queue behavior (immediate
+        # 503 on full pools); queue tests opt in via make_apps(...).
+        create_queue_timeout_s=0,
+    )
     envd_settings = EnvdSettings(executor="local")
     control_app = create_control_app(
         settings=control_settings,
@@ -154,7 +159,11 @@ def make_apps(workspace):
     def _make(*, control_settings=None, envd_settings=None):
         runtime_registry = RuntimeRegistry(workspace)
         control = create_control_app(
-            settings=control_settings or ControlSettings(api_keys=("local-key",)),
+            settings=control_settings
+            or ControlSettings(
+                api_keys=("local-key",),
+                create_queue_timeout_s=0,
+            ),
             runtime_registry=runtime_registry,
             workspace_base=workspace,
         )

@@ -26,7 +26,8 @@
   （memory / cpu / disk / processes），之后每 5s 心跳；`select_and_reserve`
   在锁内做容量检查与原子预留（`control_plane/registry/nodes.py`）。
 - 调度器：过滤 healthy 节点 -> 镜像亲和 -> 剩余容量打分；无节点可容纳时
-  返回 503 "No resources available"（`control_plane/api/sandboxes.py`）。
+  先驱逐空闲沙箱（E9.3）并等待容量释放（E9.4 创建排队，默认 30s），
+  超时才返回 503 "No resources available"（`control_plane/api/sandboxes.py`）。
 - Redis 配额存储已支持控制面多副本（`control_plane/registry/redis_backend.py`）。
 - gateway 按 `sandbox_id -> node address` 路由，worker 只需对 gateway
   HTTP 可达；共享 workspace 卷已支持跨节点迁移。
@@ -457,8 +458,9 @@ K8s 侧再叠加 `terminationGracePeriodSeconds`（如 120s）+ PDB
 
 ## 13. 可选增强（暂不进入一期）
 
-- 服务端有界请求队列：容量不足时由服务端代为排队等 headroom（延迟 ID +
-  客户端幂等重试已覆盖主要场景，仅在需要服务端吸收突发时启用）；
+- 服务端有界请求队列已落地（E9.4：`E2B_CREATE_QUEUE_TIMEOUT_S` /
+  `E2B_CREATE_QUEUE_MAX`，驱逐后仍无容量时等待配额释放，超时 503）；
+  延迟 ID + 客户端幂等重试仍负责客户端断连 / 超时场景；
 - 模板构建 Builder 服务（BuildKit / kaniko），恢复"控制面触发构建"能力；
 - HPA + custom metrics 原生扩缩容；
 - cluster-autoscaler 节点级伸缩。

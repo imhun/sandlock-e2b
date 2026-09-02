@@ -118,6 +118,9 @@ def _replica(workspace, redis_url: str) -> object:
             max_total_cpu_percent=0,
             max_total_disk_mb=0,
             max_total_processes=0,
+            # E9.4 isolation: the shared-ledger 503 case asserts the old
+            # immediate behavior; queueing would stall past the client timeout.
+            create_queue_timeout_s=0,
         ),
         runtime_registry=RuntimeRegistry(workspace),
         workspace_base=workspace,

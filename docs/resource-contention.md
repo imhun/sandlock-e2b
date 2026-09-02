@@ -12,7 +12,7 @@
 | 准入 | 预留配额制：创建时校验全局+节点配额，不足 → `503 No resources available`（`manager.py:495`） |
 | 回收 | 仅 TTL 到期：`TTLSweeper` 定期 `remove_expired` 清理到期沙箱并释放配额（`manager.py:655`）——时间驱动，非资源驱动 |
 | pause/resume | 只改 state，**不释放资源配额**（`manager.py:110`） |
-| 创建失败 | 直接 503，无排队、无重试（仅 `recent_failures` 计数用于退避/告警） |
+| 创建失败 | 驱逐（E9.3）后仍无容量时排队等释放（E9.4），超时才 503 |
 | 优先级/驱逐 | 无 |
 
 **结论**：没有"资源紧张时驱逐空闲沙箱"的路径；空闲沙箱占着配额直到
@@ -96,11 +96,34 @@ prefer-pause 直接复用它。
 - `resume` = 重新分配资源（配额不足则失败/排队）；
 - 这样"把空闲沙箱休眠腾资源"才成立（否则 pause 无意义）。
 
-### 3.5 创建排队（可选）
+### 3.5 创建排队（E9.4 已实现）
 
-- `503` 改为"排队等待资源释放"（TTL/驱逐/删除释放后自动补建）；
-- 队列带超时（如 `E2B_CREATE_QUEUE_TIMEOUT_S`，默认 30s），超时仍失败；
-- 与幂等创建（`X-Sandbox-Id`）兼容。
+顺序固定为：尝试准入 →（E9.3）驱逐空闲沙箱 → 仍不足 →（E9.4）排队等待
+容量释放 → 超时才 503。队列按需启用（`E2B_CREATE_QUEUE_TIMEOUT_S`，默认
+30s；`0` = 保持驱逐后的直接 503）：
+
+- **等待语义**：准入失败（无节点 / 全局/租户配额不足，或驱逐后仍不足）时，
+  请求进入 `CreateQueue` 等待，期间**既不占节点配额也不占 pending marker**
+  （attempt 失败前已回滚）——同 id 的客户端重试不会被自己的 marker 卡住，
+  且仍可命中 `registry.get()` 短路返回既有沙箱；
+- **唤醒**：`SandboxRegistry.release_quota` 真正归还配额后触发
+  `add_on_quota_released` 钩子 → `CreateQueue.notify_capacity()`（线程安全，
+  `loop.call_soon_threadsafe`），等待者被唤醒后重跑完整准入（每次都是原子
+  准入，因此不会超卖）；另有一个上限 `min(1s, 剩余超时)` 的兜底 tick，
+  防止唤醒信号丢失导致白等整个超时窗口；
+- **超时 / 上限**：超过 `E2B_CREATE_QUEUE_TIMEOUT_S` → 原 503
+  `No resources available`（`recent_failures.record()` 语义不变）；
+  并发排队数达到 `E2B_CREATE_QUEUE_MAX` → 立即 429
+  `Sandbox create queue is full` + `retry-after: 1`（429 同样计入
+  `recent_failures`：能走到队列满说明池子确实饱和，autoscaler 需要这个信号）；
+
+> 运维提示：默认 30s 意味着“满池”时 `POST /sandboxes` 最长挂起 30s 才拿
+> 到 503。若客户端/网关的读超时更短，会把“排队”变成客户端超时——那种
+> 部署应显式设 `E2B_CREATE_QUEUE_TIMEOUT_S=0`（回到驱逐后立即 503）或把
+> 该值调到客户端超时之下。
+
+- **不保证顺序公平性**：多副本各自排队（已知限制，见 §8），单副本内也是
+  release 广播唤醒 + 竞速准入，没有 FIFO 承诺。
 
 ## 4. 与现有机制集成
 
@@ -122,11 +145,9 @@ E2B_EVICTION_MAX_PER_CREATE=3        # 单次创建最多驱逐受害者数（�
 E2B_EVICTION_MIN_INTERVAL_S=1        # 驱逐轮次最小间隔（进程内节流）
 E2B_EVICTION_NOTICE_TTL_S=3600       # 驱逐通知可查窗口（Redis TTL/惰性过期）
 E2B_EVICTION_CROSS_TENANT=false      # 跨租户驱逐开关（安全默认关；admin 放行）
-E2B_CREATE_QUEUE_TIMEOUT_S=30        # 创建排队超时（0 = 不排队）
-E2B_CREATE_QUEUE_MAX=100             # 排队上限
+E2B_CREATE_QUEUE_TIMEOUT_S=30        # 创建排队超时（0 = 不排队，驱逐后直接 503）
+E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after）
 ```
-
-> 排队（`E2B_CREATE_QUEUE_*`）属于 E9.4，尚未实现；上表仅保留占位。
 
 ## 6. 实施步骤
 
@@ -168,6 +189,15 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限
   内独立计数，多副本**不共享**节流；同一瞬间多个副本可能各自发起驱逐轮次
   （单副本仍受每轮上限约束）。若需全局节流，可把节流时间戳迁到 Redis
   （带 TTL 的原子 set）。
+
+**E9.4 创建排队对应的已知限制：**
+
+- **多副本各自排队**：`CreateQueue` 是每个控制面进程内的状态，多个副本之间
+  不共享"哪些请求在等、排到第几个"；副本 A 释放的容量可能被刚好到达副本 B
+  的新请求抢走（唤醒的是 A 的等待者，准入结果仍由共享配额/节点 ledger 保证
+  不超卖）。如需全局队列，需把排队状态迁到 Redis。
+- **无顺序公平性**：release 广播唤醒所有等待者后各自竞速准入，不保证 FIFO；
+  对客户端可观察的影响仅是"谁抢到容量"不确定，不丢请求、不超卖。
 - **驱逐通知表**：Redis 形态靠 key TTL 自然过期；无 Redis 的进程内字典用
   惰性过期 + 容量上限（10 000 条，超限丢最旧），不做主动扫描。TTL 过期后
   `GET /sandboxes/{id}` 回到普通 404。

@@ -23,6 +23,7 @@ from control_plane.auth import (
     tenant_of,
     tenant_scope,
 )
+from control_plane.queue import QueueOutcome
 from control_plane.registry.manager import (
     PRIORITY_DEFAULT,
     PRIORITY_MAX,
@@ -475,7 +476,10 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
     or ``E2B_EVICTION_CROSS_TENANT``) and retries. Prefer-pause victims that
     still did not make room are killed before one final retry. Anything that is
     not a capacity failure propagates untouched, and the final 503 keeps
-    ``recent_failures.record()`` exactly like before.
+    ``recent_failures.record()`` exactly like before. With E9.4 queueing on
+    (``E2B_CREATE_QUEUE_TIMEOUT_S``), a request that survived eviction but
+    still has no room waits for a capacity release instead of failing right
+    away; only the eventual timeout answers the original 503.
     """
     settings = request.app.state.settings
     tenant, is_admin = tenant_of(request)
@@ -537,6 +541,46 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
             return await _create_sandbox_attempt(request, rate_limited=False)
         except _CapacityExhausted as exc:
             message = str(exc) or "No resources available"
+    # E9.4：驱逐已无力回天——直接 503 之前先给“等容量释放”一个窗口。
+    # 排队发生在 attempt 内部回滚（先还节点配额、再放 pending 标记）之后，
+    # 因此等待中的请求既不占节点配额也不占 pending marker：同 id 的客户端
+    # 重试不会被自己的 marker 卡住；每次被唤醒仍走完整准入（不超卖）。
+    create_queue = request.app.state.create_queue
+    if create_queue is not None and settings.create_queue_timeout_s > 0:
+        admitted: dict[str, Any] = {}
+
+        async def _queued_admission() -> bool:
+            """One queued retry: True only when admission actually succeeded
+            (probe consumed capacity atomically), False keeps waiting."""
+            try:
+                admitted["result"] = await _create_sandbox_attempt(
+                    request, rate_limited=False
+                )
+                return True
+            except _CapacityExhausted:
+                return False
+
+        outcome = await create_queue.wait_for_capacity(
+            _queued_admission,
+            timeout_s=settings.create_queue_timeout_s,
+            max_waiters=settings.create_queue_max,
+        )
+        if outcome is QueueOutcome.ADMITTED:
+            return admitted["result"]
+        if outcome is QueueOutcome.FULL:
+            # 并发排队数已达上限：不占配额、不重试，429 让客户端 1s 后重试
+            # （OfficialError.headers 由 E9.3 引入）。
+            #
+            # 仍然计入 recent_failures：走到这里说明池子既满又没人肯腾容量，
+            # 正是 autoscaler 需要的扩缩容信号（只是客户端拿到的是 load-shedding
+            # 的 429，而不是 503）。
+            request.app.state.recent_failures.record()
+            raise OfficialError(
+                429,
+                "Sandbox create queue is full",
+                headers={"retry-after": "1"},
+            )
+        # TIMEOUT / DISABLED：等待窗口耗尽（或排队未启用），保留原 503。
     await _final_503(message)
 
 

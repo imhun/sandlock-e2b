@@ -383,6 +383,11 @@ class SandboxRegistry:
         self._last_eviction_at = 0.0
         self._eviction_clock: Callable[[], float] = time.monotonic
         self._on_removed_callbacks: list[Callable[[SandboxRecord], None]] = []
+        #: E9.4: fired after a real quota release (pause / delete / expiry)
+        #: so create waiters can retry admission as soon as room exists.
+        self._on_quota_released_callbacks: list[
+            Callable[[SandboxRecord], None]
+        ] = []
         self._lock = threading.Lock()
         self._redis = None
         self._quota_store = None
@@ -400,6 +405,12 @@ class SandboxRegistry:
 
     def add_on_removed(self, callback: Callable[[SandboxRecord], None]) -> None:
         self._on_removed_callbacks.append(callback)
+
+    def add_on_quota_released(
+        self, callback: Callable[[SandboxRecord], None]
+    ) -> None:
+        """Register a callback fired when a record's reservation returns."""
+        self._on_quota_released_callbacks.append(callback)
 
     # -- migration lock ------------------------------------------------------
 
@@ -662,6 +673,16 @@ class SandboxRegistry:
                         for dim, value in self._tenant_dims(record).items():
                             used[dim] = max(0, used[dim] - value)
         record.quota_released = True
+        with self._lock:
+            callbacks = list(self._on_quota_released_callbacks)
+        # Wake capacity waiters (E9.4) *only* on the real-release path, never
+        # on the idempotent no-op above. Callbacks may run outside the event
+        # loop (TTLSweeper removal chain), so each hook must be thread-safe.
+        for callback in callbacks:
+            try:
+                callback(record)
+            except Exception:  # pragma: no cover - defensive
+                pass
         return True
 
     def hold_quota(self, record: SandboxRecord) -> bool:

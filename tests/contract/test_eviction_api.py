@@ -33,6 +33,9 @@ def _settings(**overrides) -> ControlSettings:
         max_total_processes=128,
         sandbox_idle_threshold_s=600,
         eviction_min_interval_s=0,
+        # E9.4 isolation: these cases assert E9.3 eviction semantics (503
+        # once eviction cannot help); the create queue must not stall them.
+        create_queue_timeout_s=0,
     )
     defaults.update(overrides)
     return ControlSettings(**defaults)

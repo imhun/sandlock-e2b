@@ -136,6 +136,19 @@ class Settings:
     eviction_cross_tenant: bool = field(
         default_factory=lambda: _env_bool("E2B_EVICTION_CROSS_TENANT", False)
     )
+    # E9.4: create queue (resource-contention.md §3.5/§5). When admission
+    # still fails after an eviction round, wait up to this long for capacity
+    # to be released before answering the original 503. 0 disables queueing
+    # (today's direct-503 behavior after eviction).
+    create_queue_timeout_s: float = field(
+        default_factory=lambda: _env_int("E2B_CREATE_QUEUE_TIMEOUT_S", 30)
+    )
+    # E9.4: max number of create requests waiting for capacity at once. A
+    # full queue answers 429 immediately (no ordering/fairness guarantee;
+    # queue state is per replica, see docs/resource-contention.md §8).
+    create_queue_max: int = field(
+        default_factory=lambda: _env_int("E2B_CREATE_QUEUE_MAX", 100)
+    )
     volume_token_ttl_s: int = field(
         default_factory=lambda: _env_int("E2B_VOLUME_TOKEN_TTL_S", 0)
     )

@@ -28,6 +28,9 @@ def _settings(**overrides) -> ControlSettings:
         max_total_cpu_percent=200,
         max_total_disk_mb=2048,
         max_total_processes=128,
+        # E9.4 isolation: these cases assert E9.2 semantics (immediate 503 on
+        # a full pool); the create queue must not stall them.
+        create_queue_timeout_s=0,
     )
     defaults.update(overrides)
     return ControlSettings(**defaults)

@@ -19,6 +19,7 @@ from control_plane.api.templates import router as templates_router
 from control_plane.api.volumes import router as volumes_router
 from control_plane.config import Settings
 from control_plane.metrics import SlidingWindowCounter
+from control_plane.queue import CreateQueue
 from control_plane.registry.manager import SandboxRegistry
 from control_plane.registry.nodes import NodeRegistry
 from control_plane.registry.secrets import SecretRegistry
@@ -75,6 +76,15 @@ def create_app(
 
         redis_client = create_redis_client(settings.redis_url)
     registry = registry or SandboxRegistry(settings, redis_client=redis_client)
+    # E9.4: capacity-release queue for creates that survive an eviction round
+    # (E9.3) but still have no room. The registry fires the callback on every
+    # real quota release (pause / delete / expiry); CreateQueue turns it into
+    # event-loop wakeups for waiting POST /sandboxes requests.
+    create_queue = CreateQueue(
+        timeout_s=settings.create_queue_timeout_s,
+        max_waiters=settings.create_queue_max,
+    )
+    registry.add_on_quota_released(create_queue.notify_capacity)
 
     def _release_node_quota(record) -> None:
         if record.quota_released:
@@ -157,6 +167,7 @@ def create_app(
     app.state.settings = settings
     app.state.redis_client = redis_client
     app.state.registry = registry
+    app.state.create_queue = create_queue
 
     # Health endpoints for load balancer / monitoring. These are registered
     # before the gateway mount (combined_main), so they win over the gateway

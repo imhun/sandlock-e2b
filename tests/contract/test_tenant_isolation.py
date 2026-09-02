@@ -23,6 +23,9 @@ def _tenant_settings(**overrides) -> Settings:
         max_total_cpu_percent=0,
         max_total_disk_mb=0,
         max_total_processes=0,
+        # E9.4 isolation: full-tenant creates below assert an immediate 503;
+        # the create queue must not stall them (5s httpx default timeout).
+        create_queue_timeout_s=0,
     )
     defaults.update(overrides)
     return Settings(**defaults)
