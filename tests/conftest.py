@@ -35,6 +35,27 @@ TMP_ROOT = Path(
 )
 
 
+# --- hermetic test network -------------------------------------------------
+# ``httpx`` (and ``urllib``) fall back to the *system* proxy on macOS and to
+# the Windows registry: a local Clash/PAC setup then silently intercepts every
+# request, including the ones aimed at the ephemeral loopback ports these
+# tests listen on. Concretely, a plaintext request against a TLS port came
+# back as the proxy's own ``502`` instead of a handshake failure, and SDK
+# log reads gained an extra hop. Nothing in this suite needs egress, so pin
+# loopback to the no-proxy list before any client or server is constructed.
+_LOCAL_NO_PROXY = ("127.0.0.1", "localhost", "::1")
+
+
+def _keep_test_traffic_off_the_system_proxy() -> None:
+    for key in ("NO_PROXY", "no_proxy"):
+        entries = {e.strip() for e in os.environ.get(key, "").split(",") if e.strip()}
+        entries.update(_LOCAL_NO_PROXY)
+        os.environ[key] = ",".join(sorted(entries))
+
+
+_keep_test_traffic_off_the_system_proxy()
+
+
 def pytest_addoption(parser):
     parser.addoption("--perf", action="store_true", default=False, help="run perf tests")
 
