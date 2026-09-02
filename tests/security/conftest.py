@@ -31,16 +31,26 @@ def make_sandbox_visible(*paths: str | Path) -> None:
     then fails for a reason unrelated to the behaviour under test (and
     ``exit_code != 0`` denial assertions would pass vacuously). Real workers
     put sandboxes under a 0755 ``workspace_base``, so widen the same way here.
-    Existing permissions are only ever added to, and only where "other"
-    cannot traverse (world-writable sticky dirs such as /tmp stay as they are).
+
+    Best effort, and only additive: a directory "other" can already enter ends
+    the walk, and one we are not allowed to change stops it (macOS refuses
+    ``chmod`` on parts of the per-user temp tree, and the tests that would care
+    about that skip there anyway).
     """
     for raw in paths:
         candidate = Path(raw)
         while candidate != candidate.parent:
-            if candidate.is_dir():
+            try:
                 mode = candidate.stat().st_mode
-                if not mode & 0o001:
-                    os.chmod(candidate, mode | 0o055)
+            except OSError:  # not created yet: the parent chain still matters
+                candidate = candidate.parent
+                continue
+            if mode & 0o001:
+                break
+            try:
+                os.chmod(candidate, mode | 0o055)
+            except OSError:
+                break
             candidate = candidate.parent
 
 
