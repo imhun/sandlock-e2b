@@ -7,6 +7,8 @@ import shutil
 
 import pytest
 
+from tests.security.conftest import sandbox_tmpdir
+
 
 @pytest.mark.usefixtures("require_sandlock")
 def test_image_rootfs_execution():
@@ -23,9 +25,9 @@ def test_image_rootfs_execution():
     import tempfile
 
     image_name = image
-    cache = tempfile.mkdtemp()
+    cache = str(sandbox_tmpdir())
     rootfs = resolve_image_rootfs(image_name, cache)
-    ws = tempfile.mkdtemp()
+    ws = str(sandbox_tmpdir())
     executor = SandlockExecutor(
         workspace_dir=ws,
         base_image=image_name,
@@ -61,8 +63,8 @@ def test_image_rootfs_cannot_reach_host_filesystem():
 
     import tempfile
 
-    rootfs = resolve_image_rootfs("python:3.11-slim", tempfile.mkdtemp())
-    ws = tempfile.mkdtemp()
+    rootfs = resolve_image_rootfs("python:3.11-slim", str(sandbox_tmpdir()))
+    ws = str(sandbox_tmpdir())
     executor = SandlockExecutor(
         workspace_dir=ws,
         base_image="python:3.11-slim",

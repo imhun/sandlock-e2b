@@ -6,6 +6,8 @@ import asyncio
 
 import pytest
 
+from tests.security.conftest import sandbox_tmpdir
+
 from envd_service.executors.local import LocalExecutor
 from envd_service.process.manager import ProcessManager
 
@@ -34,7 +36,7 @@ def test_max_processes_limits_forks():
 
     import tempfile
 
-    ws = tempfile.mkdtemp()
+    ws = str(sandbox_tmpdir())
     executor = SandlockExecutor(
         workspace_dir=ws,
         base_image=None,

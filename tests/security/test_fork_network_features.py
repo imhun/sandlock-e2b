@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.security.conftest import sandbox_tmpdir
+
 from envd_service.executors.base import ExecConfig
 from envd_service.executors.sandlock import SandlockExecutor
 
@@ -161,7 +163,7 @@ async def test_wildcard_allowout_unprivileged_dns_gateway(loopback_alias):
     origin = RecordingOrigin(host="198.18.0.99")
     await origin.start()
     try:
-        ws = tempfile.mkdtemp()
+        ws = str(sandbox_tmpdir())
         executor = _executor(ws, {"allowOut": [f"*.wild.test:{origin.port}"]})
         code = (
             "import urllib.request; "
@@ -245,7 +247,7 @@ async def test_sandbox_child_runs_unprivileged():
     1000 into the sandbox as uid 0, so the child sees ``0 0`` — but it holds
     no root privileges (Landlock keeps every host path outside the workspace
     unwritable, so a uid-0 child still cannot touch host root paths)."""
-    ws = tempfile.mkdtemp()
+    ws = str(sandbox_tmpdir())
     executor = _executor(ws, None)
     exit_code, out, err = await _run(
         executor, ws, "import os; print(os.getuid(), os.getgid())"

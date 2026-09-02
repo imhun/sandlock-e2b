@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.security.conftest import sandbox_tmpdir
+
 from envd_service.executors.base import ExecConfig
 from envd_service.executors.sandlock import SandlockExecutor
 
@@ -150,7 +152,7 @@ async def test_egress_proxy_tunnels_tcp_after_filter():
     origin = OriginServer()
     await origin.start()
     try:
-        ws = tempfile.mkdtemp()
+        ws = str(sandbox_tmpdir())
         executor = _executor(
             ws,
             {
@@ -193,7 +195,7 @@ async def test_egress_proxy_deny_out_blocks():
     origin = OriginServer()
     await origin.start()
     try:
-        ws = tempfile.mkdtemp()
+        ws = str(sandbox_tmpdir())
         executor = _executor(
             ws,
             {
@@ -227,7 +229,7 @@ async def test_egress_proxy_wildcard_uses_atyp_domain():
     try:
         with open("/etc/hosts", "a", encoding="utf-8") as f:
             f.write(hosts_line)
-        ws = tempfile.mkdtemp()
+        ws = str(sandbox_tmpdir())
         executor = _executor(
             ws,
             {

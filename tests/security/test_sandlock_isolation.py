@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from tests.security.conftest import sandbox_tmpdir
+
 
 @pytest.mark.usefixtures("require_sandlock")
 def test_read_etc_passwd_denied():
@@ -12,7 +14,7 @@ def test_read_etc_passwd_denied():
 
     import tempfile
 
-    ws = tempfile.mkdtemp()
+    ws = str(sandbox_tmpdir())
     executor = SandlockExecutor(
         workspace_dir=ws,
         base_image=None,
@@ -40,7 +42,7 @@ def test_write_outside_workspace_denied():
 
     import tempfile
 
-    ws = tempfile.mkdtemp()
+    ws = str(sandbox_tmpdir())
     executor = SandlockExecutor(
         workspace_dir=ws,
         base_image=None,
@@ -71,7 +73,7 @@ def test_sys_and_proc_kcore_denied():
 
     import tempfile
 
-    ws = tempfile.mkdtemp()
+    ws = str(sandbox_tmpdir())
     executor = SandlockExecutor(
         workspace_dir=ws,
         base_image=None,
@@ -103,7 +105,7 @@ def test_default_network_denied():
 
     import tempfile
 
-    ws = tempfile.mkdtemp()
+    ws = str(sandbox_tmpdir())
     executor = SandlockExecutor(
         workspace_dir=ws,
         base_image=None,
@@ -138,7 +140,7 @@ def test_install_to_system_path_denied():
 
     import tempfile
 
-    ws = tempfile.mkdtemp()
+    ws = str(sandbox_tmpdir())
     executor = SandlockExecutor(
         workspace_dir=ws,
         base_image=None,
@@ -162,7 +164,7 @@ def test_install_to_system_path_denied():
     assert result.exit_code != 0
 
 
-@pytest.mark.usefixtures("require_sandlock")
+@pytest.mark.usefixtures("require_sandlock", "require_sandbox_file_ownership")
 def test_user_cli_install_within_workspace_persists():
     """User-level installs into the sandbox dir survive across commands."""
     from envd_service.executors.base import ExecConfig
@@ -170,7 +172,7 @@ def test_user_cli_install_within_workspace_persists():
 
     import tempfile
 
-    ws = tempfile.mkdtemp()
+    ws = str(sandbox_tmpdir())
     executor = SandlockExecutor(
         workspace_dir=ws,
         base_image=None,
