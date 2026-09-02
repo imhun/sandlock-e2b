@@ -1,3 +1,5 @@
+FROM moby/buildkit:latest AS buildkit
+
 FROM python:3.14-slim
 
 RUN sed -i \
@@ -43,6 +45,18 @@ RUN PY_ABI=$(python3 -c 'import sys; print(f"cp{sys.version_info.major}{sys.vers
     && [ -n "$SANLOCK_WHL" ] || SANLOCK_WHL=$(ls /tmp/wheels/*.whl | head -1) \
     && pip install --no-cache-dir "$SANLOCK_WHL" \
     && rm -rf /tmp/wheels
+
+# buildctl is what ``Template.build`` drives: the buildkitd test fixture starts
+# a rootless buildkit daemon container, and the control plane in this image
+# speaks to it with this client (same source as Dockerfile.control-plane-gateway).
+COPY --from=buildkit /usr/bin/buildctl /usr/bin/buildctl
+
+# Test scratch space has to be container-native storage. /workspace is a bind
+# mount of the host repo (virtiofs on an OrbStack/Docker Desktop host), where
+# chown is a no-op, so the per-sandbox uid tests would assert against a
+# filesystem that cannot express ownership at all.
+ENV E2B_TEST_TMP_ROOT=/var/lib/e2b-test-runtime
+RUN mkdir -p /var/lib/e2b-test-runtime
 
 WORKDIR /workspace
 
