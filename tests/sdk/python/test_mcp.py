@@ -52,18 +52,12 @@ def test_mcp_gateway_tools(live_servers):
         assert sandbox.get_mcp_url().endswith("/mcp")
         assert token
 
-        remote = os.environ.get("E2B_TEST_PROXY_URL")
-        if remote:
-            # Remote sandbox: reach the gateway through the envd proxy
-            # (E2b-Sandbox-Id routes /mcp to the sandbox's mcp-gateway).
-            url = f"{os.environ['E2B_SANDBOX_URL'].rstrip('/')}/mcp"
-            sandbox_headers = {
-                "E2b-Sandbox-Id": sandbox.sandbox_id,
-            }
-        else:
-            # Local sandbox: the gateway listens on 127.0.0.1:50005/mcp.
-            url = "http://127.0.0.1:50005/mcp"
-            sandbox_headers = {}
+        # Both shapes reach the gateway the same way: the envd/merged
+        # gateway proxy routes ``/mcp`` to the sandbox's own per-sandbox
+        # gateway port from the E2b-Sandbox-Id header. A sandbox no longer
+        # owns a fixed 50005 listener (MCP_PORT is allocated per sandbox).
+        url = f"{os.environ['E2B_SANDBOX_URL'].rstrip('/')}/mcp"
+        sandbox_headers = {"E2b-Sandbox-Id": sandbox.sandbox_id}
 
         # The SDK started mcp-gateway as a background command; wait for the
         # HTTP port to accept connections.

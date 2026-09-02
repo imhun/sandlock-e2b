@@ -93,6 +93,26 @@ async def test_auth_middleware_passes_authorized() -> None:
         assert resp.json() == {"ok": True}
 
 
+@pytest.fixture(autouse=True)
+def _no_registry_roundtrip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep these unit tests off the network.
+
+    ``create_executor`` resolves ``base_image`` through the OCI distribution
+    API before building the executor, and the fixture replaces the executor
+    with a fake right afterwards. ``python-mcp:3.14`` is the project's own MCP
+    base image (built by deploy/scripts/build-and-push.sh into the configured
+    registry), so a bare-name lookup against Docker Hub can only fail -- the
+    resolution is stubbed here, and the real OCI path has its own tests.
+    """
+    from envd_service.executors import factory
+
+    rootfs = tmp_path / "stub-rootfs"
+    rootfs.mkdir(exist_ok=True)
+    monkeypatch.setattr(
+        factory, "resolve_image_rootfs", lambda image, cache_dir, **kw: rootfs
+    )
+
+
 class _FakeExecutor:
     def __init__(self) -> None:
         self.started: list = []

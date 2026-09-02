@@ -68,6 +68,43 @@ def pytest_collection_modifyitems(config, items):
                 item.add_marker(skip_perf)
 
 
+def _fresh_dir(path: Path) -> Path:
+    """Start a test session from empty harness storage.
+
+    The live/multinode fixtures keep their workspaces under ``tmp/`` between
+    runs, which leaks state across sessions: a template record persisted with
+    the registry port of an earlier run, for example, points at a registry that
+    no longer exists. These directories are scratch data, so wipe them.
+    """
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _warm_local_template_images(settings: ControlSettings) -> None:
+    """Extract every image the local node can serve before the tests start.
+
+    A create for a cold image fast-fails with 428 ``warm_required`` unless the
+    caller opts into the slow path with ``X-Sandbox-Id``, and the official SDK
+    does not send it. The multinode harness warms its remote workers the same
+    way (``_warm_worker_base_image``); this covers the single-node shape.
+    """
+    from control_plane.api.sandboxes import _executor_needs_images
+
+    if not _executor_needs_images(settings.executor):
+        return
+    from envd_service.runtime.image_resolver import resolve_image_rootfs
+
+    images = {settings.base_image, *settings.template_images.values()} - {None, ""}
+    for image in sorted(images):
+        resolve_image_rootfs(
+            image,
+            settings.image_cache_dir,
+            registry_username=settings.image_registry_username,
+            registry_password=settings.image_registry_password,
+        )
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -80,10 +117,21 @@ def buildkitd():
     if shutil.which("docker") is None:
         pytest.skip("docker is required for template build tests")
     port = _free_port()
-    import tempfile
-
-    cfg_dir = Path(tempfile.mkdtemp(prefix="buildkit-test-"))
+    # The config is bind-mounted into a container that the HOST daemon
+    # creates: ``-v`` sources resolve on the host, so writing it to a
+    # container-native path (tempfile.mkdtemp) leaves the daemon with a
+    # missing source it fills in with an empty directory, and buildkitd dies
+    # on ``read .../buildkitd.toml: is a directory``. Write it through the
+    # project's host-visible tree instead (same rule as authenticated_registry).
+    host_root = Path(os.environ.get("E2B_HOST_PROJECT") or str(PROJECT_ROOT))
+    write_root = (
+        Path("/workspace") if os.environ.get("E2B_HOST_PROJECT") else PROJECT_ROOT
+    )
+    cfg_name = f"buildkit-test-{uuid.uuid4().hex[:8]}"
+    cfg_dir = write_root / "tmp" / cfg_name
+    cfg_dir.mkdir(parents=True, exist_ok=True)
     cfg = cfg_dir / "buildkitd.toml"
+    mount_src = host_root / "tmp" / cfg_name / "buildkitd.toml"
     cfg.write_text(
         f'[grpc]\n  address = ["tcp://0.0.0.0:{port}"]\n\n'
         "[worker.oci]\n  noProcessSandbox = true\n\n"
@@ -109,7 +157,7 @@ def buildkitd():
             "--network",
             "host",
             "-v",
-            f"{cfg}:/home/user/.config/buildkit/buildkitd.toml:ro",
+            f"{mount_src}:/home/user/.config/buildkit/buildkitd.toml:ro",
             "-v",
             f"{volume}:/home/user/.local/share/buildkit",
             "moby/buildkit:rootless",
@@ -134,10 +182,17 @@ def buildkitd():
                 break
             time.sleep(0.5)
         if not ready:
-            pytest.skip("buildkit did not become ready")
+            logs = subprocess.run(
+                ["docker", "logs", container], capture_output=True, text=True
+            )
+            pytest.skip(
+                "buildkit did not become ready: "
+                f"{(logs.stderr or logs.stdout).strip()[-300:]}"
+            )
         yield f"tcp://127.0.0.1:{port}"
     finally:
         subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+        shutil.rmtree(cfg_dir, ignore_errors=True)
 
 
 @pytest.fixture()
@@ -264,7 +319,8 @@ def live_servers(buildkitd):
         # E2B_API_KEY / E2B_INTERNAL_API_KEY come from the environment.
         yield {"api_url": url, "sandbox_url": url}
         return
-    runtime_registry = RuntimeRegistry(PROJECT_ROOT / "tmp" / "sdk-workspace")
+    sdk_workspace = _fresh_dir(PROJECT_ROOT / "tmp" / "sdk-workspace")
+    runtime_registry = RuntimeRegistry(sdk_workspace)
     control_port = _free_port()
     envd_port = _free_port()
     control_app = create_control_app(
@@ -278,10 +334,14 @@ def live_servers(buildkitd):
             max_total_cpu_percent=0,
             max_total_disk_mb=0,
             max_total_processes=0,
+            # The suite creates far more sandboxes per minute than a
+            # production budget allows (120/min by default), which shows up
+            # as 429 in SDK fixtures; the limiter itself has its own tests.
+            create_rate_limit_per_min=0,
             buildkit_addr=buildkitd,
         ),
         runtime_registry=runtime_registry,
-        workspace_base=PROJECT_ROOT / "tmp" / "sdk-workspace",
+        workspace_base=sdk_workspace,
     )
     envd_app = create_envd_app(
         settings=EnvdSettings(
@@ -289,8 +349,9 @@ def live_servers(buildkitd):
             envd_port=envd_port,
         ),
         runtime_registry=runtime_registry,
-        workspace_base=PROJECT_ROOT / "tmp" / "sdk-workspace",
+        workspace_base=sdk_workspace,
     )
+    _warm_local_template_images(control_app.state.settings)
     control = _ServerThread(control_app, control_port)
     envd = _ServerThread(envd_app, envd_port)
     control.start()
@@ -349,7 +410,7 @@ def _start_multinode(
     envd_settings_extra: dict | None = None,
 ) -> dict:
     """Shared harness: control plane + N workers + envd gateway."""
-    root.mkdir(parents=True, exist_ok=True)
+    _fresh_dir(root)
     control_dir = root / "control"
     shared_volumes = root / "shared-volumes"
     shared_workspace_dir = (
@@ -374,6 +435,10 @@ def _start_multinode(
             max_total_cpu_percent=0,
             max_total_disk_mb=0,
             max_total_processes=0,
+            # The suite creates far more sandboxes per minute than a
+            # production budget allows (120/min by default), which shows up
+            # as 429 in SDK fixtures; the limiter itself has its own tests.
+            create_rate_limit_per_min=0,
             workspace_base=shared_workspace_dir,
             shared_workspace_root=(
                 str(shared_workspace_dir) if shared_workspace else None
@@ -660,7 +725,7 @@ def _start_live_servers(
     buildkit_addr: str | None = None,
 ) -> dict:
     """Real control plane + envd servers for registry template builds."""
-    workspace = PROJECT_ROOT / "tmp" / name
+    workspace = _fresh_dir(PROJECT_ROOT / "tmp" / name)
     runtime_registry = RuntimeRegistry(workspace)
     control_port = _free_port()
     envd_port = _free_port()
@@ -678,6 +743,10 @@ def _start_live_servers(
             max_total_cpu_percent=0,
             max_total_disk_mb=0,
             max_total_processes=0,
+            # The suite creates far more sandboxes per minute than a
+            # production budget allows (120/min by default), which shows up
+            # as 429 in SDK fixtures; the limiter itself has its own tests.
+            create_rate_limit_per_min=0,
         ),
         runtime_registry=runtime_registry,
         workspace_base=workspace,
@@ -690,6 +759,7 @@ def _start_live_servers(
         runtime_registry=runtime_registry,
         workspace_base=workspace,
     )
+    _warm_local_template_images(control_app.state.settings)
     control = _ServerThread(control_app, control_port)
     envd = _ServerThread(envd_app, envd_port)
     control.start()

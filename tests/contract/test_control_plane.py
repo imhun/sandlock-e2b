@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 import httpx
 import pytest
@@ -16,7 +17,7 @@ def _client(app):
     )
 
 
-async def _create(client, **overrides):
+async def _create(client, headers=None, **overrides):
     body = {
         "templateID": "base",
         "timeout": 300,
@@ -26,7 +27,11 @@ async def _create(client, **overrides):
         "allow_internet_access": False,
     }
     body.update(overrides)
-    return await client.post("/sandboxes", headers={"X-API-Key": "local-key"}, json=body)
+    return await client.post(
+        "/sandboxes",
+        headers={"X-API-Key": "local-key", **(headers or {})},
+        json=body,
+    )
 
 
 async def test_create_sandbox_201(control_client):
@@ -43,16 +48,28 @@ async def test_create_sandbox_201(control_client):
 
 
 async def test_create_with_template_image(make_apps, workspace):
+    """A template mapped to an OCI image creates through the documented path.
+
+    The create carries a client-chosen ``X-Sandbox-Id``: that is what lets the
+    control plane take the slow path and warm a cold image on the node, where
+    a header-less create fast-fails with ``428 warm_required`` instead
+    (covered by ``test_scaling.py``, because that branch needs the sandlock
+    executor and so is not portable to the macOS runner).
+    """
     control, envd = make_apps(
         control_settings=Settings(
             api_keys=("local-key",),
             template_images={"python3.12": "python:3.12-slim"},
         )
     )
+    sandbox_id = f"sbx_{uuid.uuid4().hex[:16]}"
     async with _client(control) as client:
-        response = await _create(client, templateID="python3.12")
+        response = await _create(
+            client, templateID="python3.12", headers={"X-Sandbox-Id": sandbox_id}
+        )
     assert response.status_code == 201
     assert response.json()["templateID"] == "python3.12"
+    assert response.json()["sandboxID"] == sandbox_id
 
 
 async def test_create_unknown_template_400(control_client):
