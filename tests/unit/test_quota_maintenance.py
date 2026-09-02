@@ -721,10 +721,18 @@ async def test_app_lifespan_starts_quota_maintenance(tmp_path, monkeypatch):
 def test_create_app_nonroot_discloses_direct_quota_downgrade(
     tmp_path, monkeypatch, caplog
 ):
-    """E5.1 review (Important): a non-root worker with the direct local
-    quota path (E2B_QUOTA_VIA_AGENT=false) must get a startup warning with
-    the required configuration instead of silently losing disk hard limits."""
+    """E5.1 review (Important-1/2): a non-root worker without effective
+    CAP_SYS_ADMIN on an XFS workspace with the direct local quota path
+    (E2B_QUOTA_VIA_AGENT=false) must get a startup warning with the required
+    configuration instead of silently losing disk hard limits."""
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    monkeypatch.setattr(xfs_quota, "_has_effective_cap_sys_admin", lambda: False)
+    mount_path = str(Path(tmp_path).resolve())
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_mounts",
+        lambda: f"/dev/nvme0n1p2 {mount_path} xfs rw,prjquota 0 0\n",
+    )
     caplog.set_level(logging.WARNING)
     create_envd_app(
         settings=EnvdSettings(executor="local", workspace_base=tmp_path),
@@ -736,6 +744,48 @@ def test_create_app_nonroot_discloses_direct_quota_downgrade(
         "E2B_QUOTA_VIA_AGENT=false; set E2B_QUOTA_VIA_AGENT=true and deploy "
         "quota-agent, or run the worker as root)",
     ]
+
+
+def test_create_app_nonroot_with_sys_admin_cap_no_disclosure(
+    tmp_path, monkeypatch, caplog
+):
+    """E5.1 review (Important-2): a non-root worker with effective
+    CAP_SYS_ADMIN (k8s runAsUser 65534 + SYS_ADMIN) keeps the direct quota
+    path, so the startup downgrade warning must not fire."""
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_self_status",
+        lambda: "Name:\tpytest\nCapEff:\t0000003fffffffff\n",
+    )
+    caplog.set_level(logging.WARNING)
+    create_envd_app(
+        settings=EnvdSettings(executor="local", workspace_base=tmp_path),
+        runtime_registry=RuntimeRegistry(tmp_path),
+    )
+    assert [r for r in caplog.records if "磁盘配额不可用" in r.message] == []
+
+
+def test_create_app_nonroot_non_xfs_host_no_disclosure(
+    tmp_path, monkeypatch, caplog
+):
+    """E5.1 review (Minor-13): on a non-XFS host the startup warning must
+    not blame missing root/CAP_SYS_ADMIN; the real filesystem reason is
+    reported by detection instead."""
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    monkeypatch.setattr(xfs_quota, "_has_effective_cap_sys_admin", lambda: False)
+    mount_path = str(Path(tmp_path).resolve())
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_mounts",
+        lambda: f"/dev/disk1s5 {mount_path} apfs rw,local 0 0\n",
+    )
+    caplog.set_level(logging.WARNING)
+    create_envd_app(
+        settings=EnvdSettings(executor="local", workspace_base=tmp_path),
+        runtime_registry=RuntimeRegistry(tmp_path),
+    )
+    assert [r for r in caplog.records if "磁盘配额不可用" in r.message] == []
 
 
 def test_create_app_root_direct_quota_no_disclosure(tmp_path, monkeypatch, caplog):

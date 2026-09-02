@@ -59,11 +59,15 @@ from gateway_common.paths import validate_sandbox_id
 
 logger = logging.getLogger(__name__)
 
-#: Non-root workers (E5.1) cannot run ``xfs_quota -x`` directly: project
-#: quota administration needs root/CAP_SYS_ADMIN and every call fails with
-#: EPERM, which callers would silently skip. Detection reports this exact
-#: guidance so the degraded per-sandbox disk-hard-limit control is disclosed
-#: at startup instead of failing per sandbox.
+#: Non-root workers (E5.1) without effective CAP_SYS_ADMIN cannot run
+#: ``xfs_quota -x`` directly: the kernel gates quota administration on
+#: CAP_SYS_ADMIN (not on euid), and every call fails with EPERM, which
+#: callers would silently skip. Detection reports this exact guidance so
+#: the degraded per-sandbox disk-hard-limit control is disclosed at startup
+#: instead of failing per sandbox. The guard only applies on XFS mounts
+#: (non-XFS hosts keep their real filesystem reason, E5.1 review Minor-13),
+#: and non-root with effective SYS_ADMIN (k8s runAsUser + SYS_ADMIN) keeps
+#: the direct path (E5.1 review Important-2).
 NONROOT_DIRECT_QUOTA_REASON = (
     "磁盘配额不可用：非 root 需配置 E2B_QUOTA_VIA_AGENT + quota-agent"
 )
@@ -528,6 +532,15 @@ def _read_proc_mounts() -> str | None:
         return None
 
 
+def _read_proc_self_status() -> str | None:
+    """Return ``/proc/self/status`` text, or None when unavailable."""
+    try:
+        with open("/proc/self/status", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
 def _unescape_mount_path(value: str) -> str:
     """Decode octal escapes (\040 space, \011 tab, \134 backslash) in mount paths."""
 
@@ -660,13 +673,78 @@ def _evaluate_facts(facts: dict[str, Any]) -> tuple[bool, str]:
     return _PASS
 
 
+def _has_effective_cap_sys_admin() -> bool:
+    """True when the process holds effective CAP_SYS_ADMIN (bit 21).
+
+    ``xfs_quota -x`` administration is gated by effective CAP_SYS_ADMIN in
+    the kernel, not by euid: Docker clears the effective set for non-root
+    users (CapEff=0 -> EPERM), while k8s ``runAsUser: 65534`` +
+    ``capabilities.add [SYS_ADMIN]`` keeps it (E5.1 review Important-2).
+    """
+    status = _read_proc_self_status()
+    if status is None:
+        return False
+    for line in status.splitlines():
+        if not line.startswith("CapEff:"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            return False
+        try:
+            cap_eff = int(parts[1], 16)
+        except ValueError:
+            return False
+        return (cap_eff >> 21) & 1 == 1
+    return False
+
+
+def direct_quota_privileged() -> bool:
+    """True when this process may run ``xfs_quota -x`` directly.
+
+    Root always qualifies; non-root qualifies only with effective
+    CAP_SYS_ADMIN — exactly how the kernel gates quotactl/ioctl.
+    """
+    return os.geteuid() == 0 or _has_effective_cap_sys_admin()
+
+
+def local_fs_type(mount_point: str | Path) -> str | None:
+    """Return the fs_type of the deepest mount containing ``mount_point``.
+
+    None when ``/proc/mounts`` is unavailable or the path has no mount
+    entry; callers keep their real failure reason in that case.
+    """
+    mounts_text = _read_proc_mounts()
+    if mounts_text is None:
+        return None
+    entry = _find_mount(mounts_text, mount_point)
+    return entry[0] if entry is not None else None
+
+
+def direct_quota_unprivileged_reason(mount_point: str | Path) -> str | None:
+    """Return :data:`NONROOT_DIRECT_QUOTA_REASON` when this process lacks
+    direct ``xfs_quota`` privilege on an XFS mount; None otherwise.
+
+    The privilege guard only applies to XFS mounts: on non-XFS hosts (macOS
+    local dev, ext4 workspaces) the real filesystem reason reported by
+    detection takes priority (E5.1 review Minor-13).
+    """
+    if direct_quota_privileged():
+        return None
+    if local_fs_type(mount_point) != "xfs":
+        return None
+    return NONROOT_DIRECT_QUOTA_REASON
+
+
 def _detect_local(mount_point: str | Path) -> tuple[bool, str]:
-    # E5.1 review (Important): a non-root worker always gets EPERM from
-    # ``xfs_quota -x`` regardless of the mount, so the direct path is
-    # unusable. Disclose the quota-agent requirement up front instead of
-    # silently skipping every per-sandbox disk hard limit.
-    if os.geteuid() != 0:
-        return _fail(NONROOT_DIRECT_QUOTA_REASON)
+    # E5.1 review: direct ``xfs_quota -x`` is gated by effective
+    # CAP_SYS_ADMIN, not euid. Non-root without the capability (Docker
+    # clears CapEff) always gets EPERM -> disclose the quota-agent
+    # requirement before any XFS probe; non-root with effective SYS_ADMIN
+    # (k8s) keeps the direct path. The guard only applies on XFS mounts:
+    # non-XFS hosts keep their real reason.
+    reason = direct_quota_unprivileged_reason(mount_point)
+    if reason is not None:
+        return _fail(reason)
     return _evaluate_facts(_local_facts(mount_point))
 
 

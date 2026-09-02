@@ -122,12 +122,16 @@ def test_local_proc_mounts_unreadable_degrades_without_raising(monkeypatch):
     assert calls == []
 
 
-def test_local_nonroot_direct_quota_disclosed_with_guidance(monkeypatch, caplog):
-    """E5.1 review (Important): a non-root worker cannot run xfs_quota
-    directly (EPERM). Detection must disclose the quota-agent requirement
-    instead of silently skipping per-sandbox disk hard limits, and must not
-    attempt any filesystem probe or xfs_quota run that would fail."""
+def test_local_nonroot_without_sys_admin_cap_disclosed_with_guidance(
+    monkeypatch, caplog
+):
+    """E5.1 review (Important-1/2): a non-root worker without effective
+    CAP_SYS_ADMIN cannot run xfs_quota -x directly (Docker clears CapEff ->
+    EPERM). Detection must disclose the quota-agent requirement instead of
+    silently skipping per-sandbox disk hard limits, and must not attempt
+    any XFS probe or xfs_quota run that would fail."""
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    monkeypatch.setattr(xfs_quota, "_has_effective_cap_sys_admin", lambda: False)
     calls: list[str] = []
     monkeypatch.setattr(
         xfs_quota,
@@ -154,6 +158,78 @@ def test_local_nonroot_direct_quota_disclosed_with_guidance(monkeypatch, caplog)
     assert [r.message for r in caplog.records] == [
         "XFS project quota unavailable for /srv/sandboxes: "
         + xfs_quota.NONROOT_DIRECT_QUOTA_REASON,
+    ]
+
+
+def test_local_nonroot_with_effective_sys_admin_cap_allows_direct_quota(
+    monkeypatch, caplog
+):
+    """E5.1 review (Important-2): xfs_quota -x is gated by effective
+    CAP_SYS_ADMIN, not euid. A non-root worker with SYS_ADMIN in CapEff
+    (k8s runAsUser 65534 + SYS_ADMIN) must keep the direct quota path and
+    not be misblocked with the quota-agent guidance."""
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_self_status",
+        lambda: "Name:\tpytest\nCapEff:\t0000003fffffffff\n",
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_mounts",
+        lambda: _mounts("/dev/nvme0n1p2 /srv/sandboxes xfs rw,prjquota,relatime 0 0"),
+    )
+    monkeypatch.setattr(
+        xfs_quota,
+        "_run_xfs_info",
+        lambda _mp: calls.append("xfs_info") or _xfs_info(1),
+    )
+    monkeypatch.setattr(
+        xfs_quota,
+        "_xfs_quota_available",
+        lambda: calls.append("tool") or True,
+    )
+    caplog.set_level(logging.WARNING)
+    assert xfs_project_supported("/srv/sandboxes") == (True, "")
+    # The capability check must not short-circuit the real XFS detection.
+    assert calls == ["tool", "xfs_info"]
+    assert [r.message for r in caplog.records] == []
+
+
+def test_local_nonroot_non_xfs_host_reports_real_reason(monkeypatch, caplog):
+    """E5.1 review (Minor-13): on a non-XFS host (macOS apfs, ext4
+    workspace) the real filesystem reason takes priority over the non-root
+    quota-agent guidance; the privilege guard only applies to XFS mounts."""
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    monkeypatch.setattr(xfs_quota, "_has_effective_cap_sys_admin", lambda: False)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        xfs_quota,
+        "_read_proc_mounts",
+        lambda: _mounts("/dev/disk1s5 /srv/sandboxes apfs rw,local 0 0"),
+    )
+    monkeypatch.setattr(
+        xfs_quota,
+        "_run_xfs_info",
+        lambda _mp: calls.append("xfs_info") or "unused",
+    )
+    monkeypatch.setattr(
+        xfs_quota,
+        "_xfs_quota_available",
+        lambda: calls.append("tool") or True,
+    )
+    caplog.set_level(logging.WARNING)
+    assert xfs_project_supported("/srv/sandboxes") == (
+        False,
+        "filesystem is apfs, not xfs",
+    )
+    # Only the read-only tool-availability probe runs; no XFS-specific
+    # xfs_info probe is attempted on a non-XFS mount.
+    assert calls == ["tool"]
+    assert [r.message for r in caplog.records] == [
+        "XFS project quota unavailable for /srv/sandboxes: "
+        "filesystem is apfs, not xfs",
     ]
 
 
@@ -425,3 +501,27 @@ def test_via_agent_non_dict_payload_degrades(monkeypatch, payload):
         False,
         "invalid facts from quota-agent",
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("Name:\tpytest\nCapEff:\t0000003fffffffff\n", True),
+        ("Name:\tpytest\nCapEff:\t0000000000200000\n", True),
+        ("Name:\tpytest\nCapEff:\t0000000001dfffff\n", False),
+        ("Name:\tpytest\nCapPrm:\t0000003fffffffff\n", False),
+        ("Name:\tpytest\nCapEff:\tzzzz\n", False),
+        ("", False),
+    ],
+)
+def test_has_effective_cap_sys_admin_parses_proc_self_status(
+    monkeypatch, status, expected
+):
+    """CapEff bit 21 (CAP_SYS_ADMIN) drives direct-quota privilege."""
+    monkeypatch.setattr(xfs_quota, "_read_proc_self_status", lambda: status)
+    assert xfs_quota._has_effective_cap_sys_admin() is expected
+
+
+def test_has_effective_cap_sys_admin_unreadable_is_false(monkeypatch):
+    monkeypatch.setattr(xfs_quota, "_read_proc_self_status", lambda: None)
+    assert xfs_quota._has_effective_cap_sys_admin() is False

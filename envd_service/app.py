@@ -28,6 +28,7 @@ from envd_service.uid_pool import UidPool
 from envd_service.xfs_quota import (
     NONROOT_DIRECT_QUOTA_REASON,
     ProjectQuotaError,
+    direct_quota_unprivileged_reason,
     reconcile_orphan_projects,
 )
 
@@ -89,13 +90,18 @@ async def _startup_uid_reconcile(pool: UidPool) -> None:
 
 
 def _disclose_nonroot_direct_quota(settings: Settings) -> None:
-    """Startup disclosure (E5.1 review, Important): a non-root worker cannot
-    run ``xfs_quota`` directly (every call fails with EPERM), so with
-    ``E2B_QUOTA_VIA_AGENT=false`` the per-sandbox disk hard limit silently
-    degrades. Detect euid at startup and surface the required configuration
-    once instead of letting each quota operation fail per sandbox.
+    """Startup disclosure (E5.1 review): a non-root worker without effective
+    CAP_SYS_ADMIN cannot run ``xfs_quota -x`` directly (every call fails
+    with EPERM), so with ``E2B_QUOTA_VIA_AGENT=false`` the per-sandbox disk
+    hard limit silently degrades. Surface the required configuration once
+    at startup. The effective-capability check (not euid alone) keeps the
+    k8s form (runAsUser 65534 + SYS_ADMIN) working without a spurious
+    warning, and non-XFS hosts keep their real detection reason
+    (Important-2 / Minor-13).
     """
-    if settings.quota_via_agent or os.geteuid() == 0:
+    if settings.quota_via_agent:
+        return
+    if direct_quota_unprivileged_reason(settings.workspace_base) is None:
         return
     logger.warning(
         "%s (direct xfs_quota requires root/CAP_SYS_ADMIN; per-sandbox "
