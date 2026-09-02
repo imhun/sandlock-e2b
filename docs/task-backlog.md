@@ -1,6 +1,6 @@
 # 任务总清单（路线图）
 
-汇总 2026-08-31 ~ 09-02 分析产生的待办。**状态最后更新：2026-09-02**
+汇总 2026-08-31 ~ 09-02 分析产生的待办。**状态最后更新：2026-09-02（E8.3 测试环境清零）**
 （细粒度执行记录见 `.superpowers/sdd/progress.md`，两阶段总路线见
 `docs/superpowers/plans/2026-09-01-sandlock-e2b-completion-roadmap.md`）。
 
@@ -62,6 +62,10 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | E9.4 | 创建排队 / 超时 / 队列上限 | ✅ 完成 | `59c64d9` |
 | E8.1 | 部署后远程 smoke 回归 | ⏸ 受"不做远程部署"约束暂缓 | — |
 | E8.2 | 本地测试基线确认 + HANDOFF/backlog 更新 | ✅ 完成（Linux 容器全量 28 failed / 804 passed / 17 skipped / 6 errors，219.63s；macOS unit+contract 11 failed / 689 passed / 23 skipped / 33 errors，36.91s；详见 HANDOFF「验证命令与基线」） | — |
+| E8.3 | 测试环境失败清零（把 E8.2 的"环境类失败"逐条定根因） | ✅ 完成（Linux 容器全量 **0 failed / 0 error**，842 passed / 18 skipped，226.21s；macOS 全量（含 sdk python/js + security）**0 failed**，803 passed / 53 skipped；顺带修掉 2 个产品缺陷（模板镜像切换未落盘、无 registry 构建产物无法解析） | `ac59152` `d8b7f41` `87874a0` `0a235b4` `22e5acc` |
+| T1 | 真实 XFS/ext4 目标机上验证沙箱可 chmod 自己创建的文件（overlayfs 上 EPERM，用例暂带证据跳过） | ⬜ 待环境 | — |
+| T2 | `third_party/sandlock`：`_HANDLED_FIELDS` 登记 `notify_rate_limit`，消掉假告警 | ⬜ 待做（一行） | — |
+| T3 | 复现并修 `SnapshotRegistry.expand_to` 快照自嵌套（`snap_X/fs/snap_X/fs/...`） | ⬜ 新发现，无用例覆盖 | — |
 
 ## 运维侧任务
 
@@ -74,4 +78,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 ## 剩余工作
 
 1. 上线前：`wheels/fork` 重建（E7 最终 tip）+ 镜像重建推 ACR；
-2. 用户解除"不做远程部署"约束后：O1（prjquota）、E1.2/E8.1 目标机部署与远程复测、O2/O3。
+2. 用户解除"不做远程部署"约束后：O1（prjquota）、E1.2/E8.1 目标机部署与远程复测、O2/O3；
+   T1（真实 XFS/ext4 上复测沙箱文件属主，去掉那条带证据的 skip）随 O1 一起做；
+3. 不需要环境就能做的：T2（fork 里 `_HANDLED_FIELDS` 一行）、T3（快照展开自嵌套，
+   先写复现用例）。

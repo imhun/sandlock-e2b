@@ -493,10 +493,21 @@ E2B_CREATE_QUEUE_MAX             100   # 并发排队上限；满 → 429 + retr
 
 ## 未完成 / 待办（按优先级）
 
-**E9 已完成**（E9.1–E9.4，见上；Linux 容器全量零新增回归，基线见下）。剩余：
+**E9 已完成**（E9.1–E9.4，见上）。**测试环境也已清零**（2026-09-02 晚，见
+「2026-09-02（测试环境专项）」一节：Linux 容器全量 0 failed / 0 error）。剩余：
 **E8.1 部署后远程 smoke**（受"不做远程部署"约束暂缓）、运维 **O1/O2/O3**
 （目标机 XFS prjquota / TLS 代理层 / 凭据管理），以及**上线前必须**：重建
 `wheels/fork`（E7 最终 sandlock tip）→ 重建 worker/测试镜像 → 推 ACR。
+
+新增待办（本轮定位、需要环境或上游动作）：
+
+- **T1** 在真实 XFS/ext4 目标机上验证"沙箱 chmod 自己创建的文件"（overlayfs 上
+  EPERM，用例目前带证据跳过）；顺带核对 `E2B_PER_SANDBOX_UID=true` 的组合。
+- **T2** `third_party/sandlock`：把 `notify_rate_limit` 登记进
+  `_NativePolicy._HANDLED_FIELDS`（一行，消掉每次建沙箱的假告警）。
+- **T3** 复现并修 `SnapshotRegistry.expand_to` 的快照自嵌套
+  （`snapshots/snap_X/fs/snapshots/snap_X/fs/...`，见证据目录
+  `tmp/stale-20260902/`）；当前无用例覆盖这条路径。
 
 ### P2 — 真实 NFS 部署未验证
 
@@ -531,15 +542,62 @@ no_root_squash 组合（OrbStack 宿主 NFS 代理使容器化自动探针不稳
 - spec.md 其余官方 API 面（iam/lifecycle 等）仍未支持，入口处
   `UNSUPPORTED_FIELDS`/`UNSUPPORTED_ENDPOINTS` 明确拒绝。
 
+## 2026-09-02（测试环境专项）：Linux 容器与 macOS 全量清零
+
+上一轮记为"抖动用例/环境类失败"的东西几乎都有确定根因。本轮之后：
+**Linux 容器全量 `842 passed / 18 skipped / 0 failed / 0 error`**（此前基线
+`28 failed / 804 passed / 6 errors`），**macOS 全量（unit+contract+sdk python+
+sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
+记为 `2 failed / 732 passed`，并写着"单独重跑都会通过"——实际是稳定复现的）。
+
+| 症状 | 真根因 | 处理 |
+|------|--------|------|
+| macOS `test_tls::test_plain_http_against_tls_port_fails` 稳定失败、`test_command_logs::test_remote_command_output_in_logs` 抖动 | httpx 的 `trust_env` 在 macOS 会回落到**系统代理**（本机 127.0.0.1:7897），发往测试临时端口的请求被代理截走：明文打到 TLS 端口拿到的是代理自己的 `502`（不是 TLS 握手失败），日志读取也多一跳 | `tests/conftest.py` 导入时把 loopback 固定进 `NO_PROXY`（`ac59152`） |
+| `tests/unit/test_mcp_gateway.py` 3 例 registry 401 | 单测里 `base_image="python-mcp:3.14"` 是项目自建镜像（Docker Hub 无此 repo），`create_executor` 却真的去做 registry 解析，而下一行就把 executor 换成 fake | autouse fixture 打桩 `resolve_image_rootfs`（`87874a0`） |
+| SDK fixtures 429（`test_stdin`/`test_snapshots` 6 ERROR、`test_metadata_filter_via_query`） | 全套件一分钟创建量超过生产默认的 create 限流 120/min | 真起服务的 fixtures 显式 `create_rate_limit_per_min=0`（限流本身有自己的用例） |
+| 9 例 `buildctl is not available in this image` | test-runner 镜像里没有 buildctl（只有 `Dockerfile.control-plane-gateway` COPY 了） | `Dockerfile.test-runner` 同法 `COPY --from=moby/buildkit`（`22e5acc`） |
+| 有 buildctl 之后 9 例仍 `buildkit build exited with code 1` | buildkitd fixture 把配置文件写在**容器本地路径**再 `-v` 出去；daemon 在宿主解析源路径，找不到就挂成空目录 → buildkitd 直接退出（`read .../buildkitd.toml: is a directory`） | 改走 `/workspace` 写入 + 宿主路径挂载（与 htpasswd 同一条已记录规则），not-ready 时把容器日志带进 skip 原因 |
+| 4 例 `st_uid == 0` / `assert 0 != 0` 类 uid 断言 | `/workspace` 是 virtiofs，**chown 是 no-op**，per-sandbox uid 断言在这块盘上没有意义 | 镜像内 `ENV E2B_TEST_TMP_ROOT=/var/lib/e2b-test-runtime`（容器原生存储；此前 conftest 注释已建议但没人设过） |
+| 7 例 `sandlock_create failed` / `sandlock_popen failed`（egress 3、fork network 2、rootfs/uid 2） | 测试把 0700、runner 所有的 `mkdtemp()`/`tmp_path` 交给以 uid 1000 运行的沙箱，沙箱进不去自己的工作目录/走不到 chroot；更糟的是 `exit_code != 0` 的"拒绝"断言因此**空过** | `tests/security/conftest.py` 统一补齐沙箱可见性 + 把工作目录属主给沙箱 uid（模拟 `apply_sandbox_ownership`），并加沙箱能力探针（`0a235b4`） |
+| `test_create_with_template_image` 428、`test_volume_mount_paths...` 428 | 单机 harness 没像 multinode 那样预热模板镜像：冷缓存 + 官方 SDK 不带 `X-Sandbox-Id` → 按契约快速失败 428 | fixtures 预热本节点会用到的镜像；顺带修掉跨会话残留（harness 目录复用导致模板记录里带着**上一轮已消失的 registry 端口**） |
+| `test_mcp_gateway_tools` "mcp-gateway did not start listening" | 用例还连已退役的固定 50005 端口；现在每沙箱一个 `MCP_PORT`，只能经 `/mcp` 代理 + `E2b-Sandbox-Id` 路由 | 本地/远端统一走代理路由 |
+
+顺带修掉的**产品缺陷**（不是测试问题，`d8b7f41`）：
+
+1. **构建产物切镜像名没落盘**：`Template.build` 配了 `E2B_IMAGE_REGISTRY` 后把记录改成
+   `{registry}/{templateID}`，但只改内存，而 `TemplateRegistry.get_by_name` 每次都从磁盘
+   重读 → 下一次 create 又去解析 `e2b-local/...`（Docker Hub 401）。现在 save。
+2. **无 registry（单机形态）的构建产物谁都解析不了**：`type=image,name=...` 的输出只留在
+   buildkit 内部，而 worker 侧只会走 OCI distribution API（去 docker socket 那步在
+   `27c6c62` 删了）→ 本地建的模板沙箱根本起不来（README 却写着可用）。现在导出
+   **OCI layout tar** 到 `E2B_IMAGE_CACHE_DIR/_oci/`，resolver/peek 命中本地 tar；跨节点
+   仍需 registry，这成了两种形态的明确分界。
+3. **registry 连接失败不带地址**：`[Errno 111] Connection refused` 从解析器深处冒出来，
+   看不出在连谁。现在 `RegistryError` 带上 URL（这次定位就靠它）。
+
+### 仍未解决（已定位，需要环境/上游动作）
+
+- **overlayfs 上沙箱改不了自己文件的权限**：Docker 容器存储（OrbStack/Desktop 的
+  overlayfs）里，沙箱新建文件的属主是挂载属主，沙箱内 `chmod`/`touch` 返回 EPERM ⇒
+  `pip install` 这类流程在该存储上不可用。受影响的
+  `test_user_cli_install_within_workspace_persists` 改为**带证据跳过**（skip 原因里带着
+  实测 stderr），需要在真实 XFS/ext4 目标机复测（与运维项 O1 一起做）。
+- **fork 侧假告警**：`Policy field 'notify_rate_limit' is set but not wired through FFI`
+  仍在（`_NativePolicy._HANDLED_FIELDS` 漏登记，一行修复，属 `third_party/sandlock`）。
+  顺带核实：当前 `wheels/fork` 的 `.so` **确实导出**了
+  `egress_proxy/http_auth/credential/host_mask/notify_rate_limit/pid_ns/net_isolation/fd_inject_connect`
+  全部符号（此前只按时间戳存疑）；发布前重跑构建脚本仍是硬性步骤。
+- **新发现，未复现未修**：`tmp/stale-20260902/test-runtime/**/snapshots/snap_X/fs/snapshots/snap_X/fs/...`
+  出现同一快照自嵌套，路径长到 `ENAMETOOLONG`（`SnapshotRegistry.expand_to` 会把快照存储
+  复制进快照自身）。本轮没有用例失败，只在这份被移走的旧 scratch 里发现；证据保留在
+  `tmp/stale-20260902/`（5.0G，确认无用即可删）。
+
 ## 验证命令与基线
 
 ```bash
-# macOS 基线（E8.2：unit + contract；端口绑定等环境类失败见下）
-tmp/testenv/bin/python -m pytest tests/unit tests/contract -q -p no:cacheprovider
-
-# macOS 扩展（含 SDK python）
+# macOS 全量（含 SDK python/js 与 security；security 里需要 sandlock 的用例会跳过）
 tmp/testenv/bin/python -m pytest tests/unit tests/contract tests/sdk/python \
-  -q -p no:cacheprovider
+  tests/sdk/js tests/security -q -p no:cacheprovider
 
 # Linux 容器全量基线（E8.2 正式数字：local executor，**不带** E2B_BASE_IMAGE；
 # 含真实 Redis / registry 认证 / Sandlock / perf 用例）
@@ -561,7 +619,8 @@ docker run --rm --privileged --network host \
 ```
 
 - 测试镜像 `e2b-sandlock-test:latest`（deploy/docker/Dockerfile.test-runner，国内源，
-  已含 redis-server）；改依赖后需重建。
+  已含 redis-server、**buildctl** 与 `E2B_TEST_TMP_ROOT=/var/lib/e2b-test-runtime`）；
+  改依赖后需重建：`docker build -f deploy/docker/Dockerfile.test-runner -t e2b-sandlock-test:latest .`
 - `--network host` + `E2B_HOST_PROJECT` 是容器内 docker CLI 访问宿主
   localhost 端口 / 挂载宿主路径的前提（registry/Redis 端口映射、htpasswd
   挂载）。
@@ -569,7 +628,9 @@ docker run --rm --privileged --network host \
   （后者含迁移/共享 workspace/network 更新）；compose：
   `docker compose -f deploy/compose/docker-compose.multinode.yml up -d`。
 
-### E8.2 基线（2026-09-02 确认，日志 `tmp/e82-linux-local.log` / `tmp/e82-macos.log`）
+### E8.2 基线（2026-09-02 上午确认，日志 `tmp/e82-linux-local.log` / `tmp/e82-macos.log`）——**已被下一节取代，仅作历史**
+
+> 下面这组数字里的 28 failed / 6 errors 全部在当天晚上的专项里定到了根因并修掉（见「2026-09-02（测试环境专项）」一节）；保留原文是为了不丢掉当时的取证。
 
 - **Linux 容器全量**（local executor，无 `E2B_BASE_IMAGE`）：
   `28 failed / 804 passed / 17 skipped / 6 errors in 219.63s`（perf 用例无失败）。
@@ -591,10 +652,9 @@ docker run --rm --privileged --network host \
   需 root/root worker 的 chown·uid 断言（10）+ net-isolation 形态未开（3）。
   ⚠️ 这组数字**随 runner 权限而变**：同一棵树在"可绑定任意端口 + 可访问
   docker"的终端环境下是 `2 failed / 732 passed / 23 skipped`（原 33 errors 里的
-  绝大多数其实只是端口权限受限），且剩下这 2 例（`test_tls.py::test_plain_http_against_tls_port_fails`、
-  `test_command_logs.py::test_remote_command_output_in_logs`）单独重跑都会通过
-  ——前者 pre-E9 快照同样失败，后者是需活体远程 worker 的抖动用例。
-  对比 E9 前后的回归时，务必在**同一权限环境**下取数。
+  绝大多数其实只是端口权限受限）。当时把这 2 例记成"单独重跑都会通过的抖动"，
+  **这个判断是错的**：`test_tls` 稳定失败（宿主系统代理劫持了测试流量），
+  `test_remote_command_output_in_logs` 同因，只是被时序掩盖。两者见下一节。
 
 ### sandlock fork 验证（Linux 容器）
 
@@ -637,6 +697,7 @@ cargo test -p sandlock-core --offline --test integration test_netns -- --test-th
 | `control_plane/registry/nodes.py` | `select_and_reserve(exclude_node_id)`、`reserve_node` |
 | `envd_service/process/logs.py` | 命令输出 JSONL 采集 |
 | `envd_service/runtime/image_resolver.py` | rootfs 解包、pull、registry login、digest 缓存 key |
+| `E2B_IMAGE_CACHE_DIR/_oci/` | 无 registry 时本地构建的 OCI layout tar + `.link` 侧车（resolver 优先读它） |
 | `envd_service/gateway.py` | 路由缓存 + `/internal/routes/{id}/invalidate` |
 | `gateway_common/network.py` | network 校验/规范化 + sandlock 策略映射 |
 | `envd_service/executors/sandlock.py` | network→net_allow/net_deny/http_allow + 每沙箱 CA 注入 |
@@ -648,6 +709,7 @@ cargo test -p sandlock-core --offline --test integration test_netns -- --test-th
 | `tests/security/test_egress_proxy.py` | SOCKS5 隧道 + 远程 DNS + deny 拦截用例 |
 | `tests/unit/test_network_config.py` | network 校验 + sandlock 映射单测 |
 | `tests/conftest.py` | live/multinode/registry/redis fixtures（session 级） |
+| `tests/security/conftest.py` | 沙箱存储可见性 helper（`make_sandbox_visible`/`sandbox_tmpdir`）与能力探针（`sandbox_owns_files_it_creates`） |
 | `tests/contract/test_migration.py` | 迁移 + 共享 workspace + 持锁 409 + 失败回滚用例 |
 | `tests/contract/test_redis_multireplica_e2e.py` | 真实 Redis 多副本 |
 | `tests/contract/test_command_logs.py` | 命令日志合并（本地 + 远程） |

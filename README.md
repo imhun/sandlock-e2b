@@ -378,8 +378,13 @@ Redis WATCH 事务（原子，跨进程不超用），TTL 扫描跨副本一致�
   同一哈希只上传一次。构建产物为 `e2b-local/{templateID}` 镜像，Sandlock
   模式下沙箱在镜像 rootfs 内执行，COPY 的文件在镜像内可见。
 - **镜像分发**：配置 `E2B_IMAGE_REGISTRY` 后构建产物会 push 到仓库并把
-  模板镜像名切到 `{registry}/{templateID}`，worker 节点按需 `docker pull`
-  （见多节点调度一节）。`E2B_IMAGE_CACHE_DIR` 控制 rootfs 解包缓存位置，
+  模板镜像名切到 `{registry}/{templateID}`（这一步会**落盘**到模板记录），
+  worker 节点按需从仓库拉取（见多节点调度一节）。**改了 registry 之后，
+  之前构建的模板仍指向旧地址，需要重新构建。**
+- **不配 registry 的单机形态**：没有可 push 的目标，构建改为把
+  **OCI layout tar** 导出到 `E2B_IMAGE_CACHE_DIR/_oci/`，本节点的 worker
+  从该 tar 解析 rootfs（解析与 `warm` 探测都不需要 registry）。这条路径只
+  覆盖"建镜像的这台节点"——远端 worker 仍然必须有 `E2B_IMAGE_REGISTRY`。`E2B_IMAGE_CACHE_DIR` 控制 rootfs 解包缓存位置，
   建议指向节点本地盘（默认 `tmp/sandboxes/_images` 为相对 cwd 的本地
   路径），与共享的 `E2B_WORKSPACE_BASE` 解耦——**workspace 只存用户文件，
   镜像 rootfs 始终在节点本地存储**。缓存目录名包含镜像 digest
