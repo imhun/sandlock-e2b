@@ -428,6 +428,14 @@ Linux: 225 passed, 1 skipped（全量含 Sandlock/registry/真实 Redis/模板�
 root_squash、uid=1000 映射、命令 IO 延迟未实测。部署验证时注意
 `E2B_SHARED_VOLUME_ROOT` / `E2B_SHARED_WORKSPACE_ROOT` 各节点路径语义一致。
 
+**E6.4 进展（2026-09-02）**：已在容器内内核 nfsd + XFS prjquota 导出 +
+双 NFS 客户端上实测：路径语义一致、迁移保留文件、projid 继承、sync 挂载
+超限即时 ENOSPC、async 挂载 fsync/close 延迟报错（建议 sync）、多 worker
+独立限额、root_squash 影响。探针 `deploy/scripts/nfs_quota_probe.sh` 与
+结论已写入 `docs/production-deployment-requirements.md §5`。**仍待办**：
+在真实生产 NFS（Linux 目标机）上重跑探针并核对 per-sandbox uid ×
+no_root_squash 组合（OrbStack 宿主 NFS 代理使容器化自动探针不稳定）。
+
 ### P3 — 遗留优化 / 后续 Block（sandlock fork）
 
 - 迁移导出 tar 仍含卷挂载符号链接空条目（功能等价，可显式排除）；

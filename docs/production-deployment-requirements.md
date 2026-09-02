@@ -1,5 +1,7 @@
 # 生产部署要求（XFS project quota 磁盘配额）
 
+<!-- 本文档同时收录 E6.4 NFS 共享存储形态部署要求与实测结论（§5）。 -->
+
 ## 1. 前置条件（已确认目标机满足）
 
 | 要求 | 目标机现状 | 达标 |
@@ -81,3 +83,68 @@ rm -rf /var/lib/e2b-sandboxes/<id>
 5. 删除沙箱后 project 记录清理；
 6. 迁移沙箱（worker 间）→ 配额保留；
 7. 非 XFS 环境创建沙箱 → 正常创建 + 日志警告"project quota unavailable"。
+
+## 5. NFS 共享存储形态（E6.4 实测结论与部署要求）
+
+多节点共享 workspace/volume 采用 NFS（或等价 CSI）时，必须满足以下
+语义；实测（2026-09-02，容器内核 nfsd + XFS prjquota 导出 + 两个 NFS
+客户端挂载）结论如下。
+
+### 5.1 路径语义与迁移
+
+- **路径语义**：同一导出挂在两个 worker 上，`volume/<sandbox_id>/` 与
+  workspace 目录完全一致（两挂载点文件列表、md5 相同），worker 侧无需
+  区分“本机目录”与“共享目录”。
+- **迁移保留文件**：`E2B_SHARED_WORKSPACE_ROOT` / `E2B_SHARED_VOLUME_ROOT`
+  下的迁移只切路由、不搬文件（keepFiles），实测 NFS 上文件与 projid
+  均保留；跨挂载点读写正常（迁移目标 worker 直接读到源文件）。
+- **各节点挂载选项必须一致**：`rw,sync,no_subtree_check`（及 NFSv3
+  `nolock` 如无锁服务）；`vers` 与 `sec` 需一致，否则配额与权限行为
+  随节点漂移。
+
+### 5.2 配额专项（服务器端 XFS + prjquota）
+
+配额在 NFS **服务器端**执行；客户端通过 NFS 拿到的行为：
+
+1. **projid 继承**：服务器端 `xfs_quota project -s` 设置
+   `volume/<sandbox_id>/` 后，NFS 客户端在该目录创建的文件（含子目录
+   递归）projid 正确继承（实测 `lsattr -p` = 目标 projid）。
+2. **EDQUOT 传播形态**：服务器端超限返回 EDQUOT，NFS 客户端表现为
+   **ENOSPC（errno 28）**，不是 EDQUOT——沙箱内工具需同时处理
+   ENOSPC（多数只处理 ENOSPC 的程序反而正确）。
+3. **sync 挂载**（建议，E2.6 concern）：写入在达到硬限额的写调用上
+   立即返回 ENOSPC（实测恰好在限额处截断，写入计数 = 限额）。
+4. **async 挂载**（不推荐）：页缓存写满后才在 `fsync()/close()`
+   返回 ENOSPC（实测文件 size 24MiB > 16MiB 限额，服务端只落 16MiB），
+   应用忽略 fsync 错误会**静默丢数据**。生产必须 `sync` 挂载，且命令
+   执行器在写路径上显式 `fsync` 并透传错误。
+5. **多 worker 独立限额**：两个 worker 同时写各自
+   `volume/<id>/`（不同 projid），各自独立达到硬限额，服务器端 report
+   分项目记账、互不串扰（实测 projid 1004/1005 各自 16MiB 截断）。
+6. **root_squash / uid 映射**：
+   - `root_squash` 下客户端 root 映射为 nobody：projid 继承与配额记账
+     不受影响（实测文件属 nobody、projid 仍继承、限额仍生效）；
+   - 但**沙箱目录权限必须可写**：volume 根建议 `1777` + 每沙箱独立
+     子目录（E3.2 模型），否则 squashed 写被 EACCES 拒绝（实测 755
+     root 属主目录 → EACCES）；
+   - **E5.1 独立 uid 模型与 root_squash 冲突**：sandbox 内 uid 0 经
+     NFS 被 squash 后失去独立 uid 语义，文件统一为 nobody 属主，租户间
+     NFS 文件隔离退化为“目录权限”而非“uid”。生产若开启 per-sandbox
+     uid + NFS 共享卷，建议导出用 `no_root_squash`（内网可信 NFS）或
+     改用 `anonuid=<per-sandbox-uid>` 映射（需 NFS 支持 per-export
+     配置），并在部署验证中逐项核对。
+
+### 5.3 部署待验证项（环境限制）
+
+本次实测在 OrbStack 容器内内核 nfsd 完成；OrbStack 宿主自带 NFS 代理
+占用标准端口（2049/20048）且状态随宿主变化，容器化 nfsd 的线程/导出
+表为 VM 内核全局状态，重复自动化运行不稳定（ESTALE / 挂载竞态），因此
+**以下项需在真实生产 NFS（Linux 目标机）上复核**：
+
+- `deploy/scripts/nfs_quota_probe.sh` 在目标机 NFS 挂载点重跑全 6 项
+  （A projid 继承 / B sync ENOSPC / C async fsync ENOSPC / D 多 worker
+  独立限额 / E root_squash / F 共享路径+迁移保留）；
+- 生产 NFS 的 `no_root_squash` 与 per-sandbox uid 组合是否保留 uid 隔离；
+- NFSv4 与 v3 在目标内核/导出配置下的行为差异（本次用 v3）；
+- 配额巡检（`xfs_quota report -p`）在服务器端持续校验，与 worker
+  心跳告警对齐。

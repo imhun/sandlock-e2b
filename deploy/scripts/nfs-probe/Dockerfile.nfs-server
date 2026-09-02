@@ -1,0 +1,5 @@
+FROM debian:13
+RUN apt-get update && apt-get install -y --no-install-recommends nfs-kernel-server nfs-common xfsprogs procps rpcbind e2fsprogs && rm -rf /var/lib/apt/lists/* && for i in $(seq 0 63); do mknod /dev/loop$i b 7 $i 2>/dev/null || true; done
+COPY nfs-entry.sh /usr/local/bin/nfs-entry.sh
+RUN chmod +x /usr/local/bin/nfs-entry.sh
+ENTRYPOINT ["/usr/local/bin/nfs-entry.sh"]
