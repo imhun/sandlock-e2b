@@ -147,7 +147,9 @@ def buildkitd():
             "docker",
             "run",
             "-d",
-            "--rm",
+            # No --rm: the teardown below removes the container, and keeping it
+            # alive in `docker ps -a` is what makes the "did not become ready"
+            # report able to quote buildkitd's own log.
             "--name",
             name,
             "--security-opt",
