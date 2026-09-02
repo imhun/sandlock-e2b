@@ -141,18 +141,28 @@ class RegistryClient:
         auth_header = self._authorization()
         if auth_header:
             headers["Authorization"] = auth_header
-        resp = httpx.request(
-            method,
-            url,
-            headers=headers,
-            timeout=self._timeout,
-            follow_redirects=True,
-            **kwargs,
-        )
+        resp = self._send(method, url, headers, **kwargs)
         if resp.status_code in (401, 403) and not self._token:
             self._challenge(resp)
             headers["Authorization"] = self._authorization()
-            resp = httpx.request(
+            resp = self._send(method, url, headers, **kwargs)
+        if resp.status_code >= 400:
+            raise RegistryError(
+                f"registry {self._ref.host} {method} {url} -> {resp.status_code}: "
+                f"{resp.text[:300]}"
+            )
+        return resp
+
+    def _send(
+        self, method: str, url: str, headers: dict[str, str], **kwargs: Any
+    ) -> httpx.Response:
+        """One registry request, with the URL in the failure message.
+
+        A bare ``[Errno 111] Connection refused`` from deep inside the resolver
+        says nothing about which registry was dialed; keep it attached.
+        """
+        try:
+            return httpx.request(
                 method,
                 url,
                 headers=headers,
@@ -160,12 +170,10 @@ class RegistryClient:
                 follow_redirects=True,
                 **kwargs,
             )
-        if resp.status_code >= 400:
+        except httpx.HTTPError as e:
             raise RegistryError(
-                f"registry {self._ref.host} {method} {url} -> {resp.status_code}: "
-                f"{resp.text[:300]}"
-            )
-        return resp
+                f"registry {self._ref.host} {method} {url} -> {type(e).__name__}: {e}"
+            ) from e
 
     def _challenge(self, resp: httpx.Response) -> None:
         header = resp.headers.get("WWW-Authenticate", "")

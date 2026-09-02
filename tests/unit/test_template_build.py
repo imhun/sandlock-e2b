@@ -31,8 +31,20 @@ class _FakeProc:
         return self._code
 
 
+class _FakeTemplateRegistry:
+    """Records save() calls: a mutated record must be persisted."""
+
+    def __init__(self) -> None:
+        self.saved: list = []
+
+    def save(self, record) -> None:  # noqa: ANN001
+        self.saved.append(record)
+
+
 def _app(settings: Settings) -> SimpleNamespace:
-    return SimpleNamespace(state=SimpleNamespace(settings=settings))
+    return SimpleNamespace(
+        state=SimpleNamespace(settings=settings, templates=_FakeTemplateRegistry())
+    )
 
 
 def _template() -> SimpleNamespace:
@@ -51,7 +63,7 @@ async def _run_build(
     monkeypatch: pytest.MonkeyPatch,
     settings: Settings,
     workspace: Path,
-) -> tuple[list, SimpleNamespace, SimpleNamespace]:
+) -> tuple[list, SimpleNamespace, SimpleNamespace, SimpleNamespace]:
     captured: dict = {}
 
     async def fake_exec(*args, **kwargs):  # noqa: ANN002, ANN003
@@ -62,10 +74,11 @@ async def _run_build(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     build = _build()
     template = _template()
+    app = _app(settings)
     await tmpl._run_build(
-        _app(settings), template, build, "FROM python:3.11-slim\n", workspace
+        app, template, build, "FROM python:3.11-slim\n", workspace
     )
-    return captured["args"], build, template
+    return captured["args"], build, template, app
 
 
 @pytest.mark.asyncio
@@ -78,7 +91,7 @@ async def test_buildctl_builds_and_pushes_to_registry(
         image_registry_username="user",
         image_registry_password="pass",
     )
-    args, build, template = await _run_build(monkeypatch, settings, tmp_path)
+    args, build, template, app = await _run_build(monkeypatch, settings, tmp_path)
 
     assert args[0] == "buildctl"
     assert "--addr" in args
@@ -94,6 +107,10 @@ async def test_buildctl_builds_and_pushes_to_registry(
     )
     assert build.status == "ready"
     assert template.image == "registry.example.com/e2b/tpl_abc"
+    # The record is re-read from disk on every lookup by name, so the switch
+    # only holds if it was persisted; otherwise the next create resolves the
+    # un-pushable e2b-local name again.
+    assert app.state.templates.saved == [template]
 
 
 @pytest.mark.asyncio
@@ -101,13 +118,19 @@ async def test_buildctl_builds_without_registry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     settings = Settings(api_keys=("k",), image_registry="")
-    args, build, template = await _run_build(monkeypatch, settings, tmp_path)
+    args, build, template, app = await _run_build(monkeypatch, settings, tmp_path)
 
     output = args[args.index("--output") + 1]
-    assert output == "type=image,name=e2b-sandlock-template:tpl_abc"
+    # Without a registry there is nothing to push to: buildkit exports an OCI
+    # layout tar into the node image cache, and that tar is what the worker
+    # resolves the template image from.
+    assert output.startswith("type=oci,dest=")
+    tar = Path(output.removeprefix("type=oci,dest="))
+    assert tar.parent == settings.image_cache_dir / "_oci"
+    assert tar.name == "e2b-sandlock-template_tpl_abc.oci.tar"
     assert build.status == "ready"
-    # No registry: the template keeps its local image name.
     assert template.image == "e2b-sandlock-template:tpl_abc"
+    assert app.state.templates.saved == []
 
 
 def test_write_docker_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

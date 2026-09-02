@@ -8,6 +8,7 @@ import logging
 import os
 import tarfile
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -185,8 +186,21 @@ async def _run_build(
         remote = f"{registry}/{template.template_id}"
         output = f"type=image,name={remote}:latest,push=true"
     else:
+        # No registry: nobody can pull this image over OCI, so export the
+        # build as an OCI layout tar into the node image cache (buildctl
+        # writes ``dest`` client-side). The worker on this node resolves it
+        # from there; a remote worker still needs E2B_IMAGE_REGISTRY.
         remote = None
-        output = f"type=image,name={template.image}"
+        # Imported lazily: the separated control-plane image ships
+        # envd_service for exactly this (build + resolution) code path.
+        from envd_service.runtime.image_resolver import local_oci_paths
+
+        oci_tar, _link = local_oci_paths(settings.image_cache_dir, template.image)
+        oci_tar.parent.mkdir(parents=True, exist_ok=True)
+        with suppress(OSError):
+            # A rebuilt template must not reuse the previous layout tar.
+            oci_tar.unlink(missing_ok=True)
+        output = f"type=oci,dest={oci_tar}"
     build.append_log(f"building template (buildkit: {settings.buildkit_addr})")
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -220,8 +234,13 @@ async def _run_build(
     if code == 0:
         if remote is not None:
             # From here on, sandboxes reference the registry image so worker
-            # nodes can pull it via OCI instead of a local daemon.
+            # nodes can pull it via OCI instead of a local daemon. The record
+            # has to be persisted: the registry re-reads records from disk on
+            # every lookup by name, so an in-memory-only switch would be lost
+            # and the next create would resolve the un-pushable
+            # ``e2b-local/{id}`` name again.
             template.image = remote
+            app.state.templates.save(template)
             build.append_log(f"pushed image to {remote}")
         if build.status != "error":
             build.status = "ready"

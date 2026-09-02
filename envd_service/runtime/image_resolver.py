@@ -9,10 +9,15 @@ tag self-invalidates the cache and a warm image resolves instantly.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+import shutil
 import threading
 from pathlib import Path
+
+import tarfile
+from contextlib import suppress
 
 from envd_service.runtime.oci_registry import (
     RegistryClient,
@@ -90,6 +95,107 @@ def _cache_rootfs(cache_dir: Path, image: str, digest: str) -> Path:
     return cache_dir / cache_name / "rootfs"
 
 
+# --- locally built images (no registry configured) --------------------------
+# ``Template.build`` without ``E2B_IMAGE_REGISTRY`` has no registry to push
+# to, so the control plane exports the build as an OCI layout tar into the
+# image cache. The node that owns that cache (the single-node shape: control
+# plane and worker share ``E2B_IMAGE_CACHE_DIR``) resolves the image from the
+# tar instead of a registry round-trip; every other node keeps failing with
+# the usual "cannot resolve image" error, which is correct — the image was
+# never distributed.
+LOCAL_OCI_DIRNAME = "_oci"
+_OCI_LINK_SUFFIX = ".link"
+
+
+def local_oci_paths(cache_dir: str | Path, image: str) -> tuple[Path, Path]:
+    """``(oci layout tar, sidecar link file)`` for one locally built image."""
+    root = Path(cache_dir) / LOCAL_OCI_DIRNAME
+    slug = _image_cache_name(image)
+    return root / f"{slug}.oci.tar", root / f"{slug}{_OCI_LINK_SUFFIX}"
+
+
+def _link_digest(link: Path) -> str | None:
+    """The manifest digest recorded next to the rootfs path in the sidecar."""
+    with suppress(OSError):
+        digest, _, _rest = link.read_text(encoding="utf-8").partition("\n")
+        return digest or None
+    return None
+
+
+def _rootfs_from_local_link(link: Path) -> Path | None:
+    """The completed rootfs recorded by an earlier local-OCI resolve."""
+    if not link.is_file():
+        return None
+    with suppress(OSError, ValueError):
+        _digest, _, recorded = link.read_text(encoding="utf-8").partition("\n")
+        rootfs = Path(recorded.strip())
+        if rootfs.joinpath(".complete").is_file():
+            return rootfs
+    return None
+
+
+def _read_oci_manifest(tar: tarfile.TarFile) -> tuple[bytes, str]:
+    """Return ``(manifest_bytes, manifest_digest)`` from an OCI layout tar."""
+    index_member = None
+    with suppress(KeyError):
+        index_member = tar.getmember("index.json")
+    if index_member is None:
+        raise ImageResolutionError("oci layout has no index.json")
+    index = json.loads(tar.extractfile(index_member).read())
+    manifests = index.get("manifests") or []
+    if not manifests:
+        raise ImageResolutionError("oci layout index.json lists no manifests")
+    descriptor = manifests[0]
+    digest = str(descriptor.get("digest") or "")
+    if ":" not in digest:
+        raise ImageResolutionError(f"oci layout manifest has bad digest {digest!r}")
+    algo, _, hexpart = digest.partition(":")
+    member_name = f"blobs/{algo}/{hexpart}"
+    try:
+        member = tar.getmember(member_name)
+    except KeyError as e:
+        raise ImageResolutionError(f"oci layout is missing {member_name}") from e
+    blob = tar.extractfile(member).read()
+    return blob, digest
+
+
+def _extract_local_oci(image: str, cache: Path, tar_path: Path) -> tuple[Path, str]:
+    """Assemble the rootfs for ``image`` from its OCI layout tar."""
+    with tarfile.open(tar_path, mode="r:*") as tar:
+        manifest_bytes, digest = _read_oci_manifest(tar)
+        manifest = json.loads(manifest_bytes)
+        rootfs = _cache_rootfs(cache, image, digest)
+        if (rootfs / ".complete").is_file():
+            return rootfs, digest
+        with _cache_lock(_image_cache_name(image)):
+            if not (rootfs / ".complete").is_file():
+                rootfs.mkdir(parents=True, exist_ok=True)
+                try:
+                    for layer in manifest.get("layers", []):
+                        layer_digest = str(layer.get("digest") or "")
+                        if ":" not in layer_digest:
+                            raise ImageResolutionError(
+                                f"image {image} manifest layer missing digest"
+                            )
+                        algo, _, hexpart = layer_digest.partition(":")
+                        member = tar.getmember(f"blobs/{algo}/{hexpart}")
+                        extract_layer(tar.extractfile(member).read(), rootfs)
+                except Exception:
+                    shutil.rmtree(rootfs.parent, ignore_errors=True)
+                    raise
+                rootfs.joinpath(".complete").write_text("ok", encoding="utf-8")
+        return rootfs, digest
+
+
+def _resolve_local_oci(image: str, cache: Path, tar_path: Path, link: Path) -> Path:
+    """Extract the local OCI tar once and remember the result in the sidecar."""
+    rootfs, digest = _extract_local_oci(image, cache, tar_path)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.write_text(f"{digest}\n{rootfs}", encoding="utf-8")
+    logger.info("resolved locally built image %s to rootfs %s", image, rootfs)
+    return rootfs
+
+
 def peek_image_warm(
     image: str,
     cache_dir: str | Path,
@@ -105,6 +211,12 @@ def peek_image_warm(
     ``{"cached": False, "digest": None}`` so callers can decide policy.
     """
     if not image:
+        return {"cached": False, "digest": None}
+    rootfs = _rootfs_from_local_link(local_oci_paths(Path(cache_dir), image)[1])
+    if rootfs is not None:
+        return {"cached": True, "digest": _link_digest(local_oci_paths(Path(cache_dir), image)[1])}
+    if local_oci_paths(Path(cache_dir), image)[0].is_file():
+        # Built on this node but not extracted yet: a create that may warm it.
         return {"cached": False, "digest": None}
     try:
         digest = _platform_digest(
@@ -133,6 +245,12 @@ def resolve_image_rootfs(
         raise ImageResolutionError("no base image configured")
 
     cache = Path(cache_dir)
+    tar_path, link = local_oci_paths(cache, image)
+    cached_local = _rootfs_from_local_link(link)
+    if cached_local is not None:
+        return cached_local
+    if tar_path.is_file():
+        return _resolve_local_oci(image, cache, tar_path, link)
     _ref, client = _client_for(
         image,
         registry_username=registry_username,
