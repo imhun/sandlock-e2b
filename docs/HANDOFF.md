@@ -6,6 +6,11 @@
 
 ## ⚡ sandlock fork 交接总览（新会话从这里开始）
 
+> 📄 **集成事实源已下沉到 fork 仓库**：`third_party/sandlock/docs/e2b-integration.md`
+> （已落地方案 R*/S*/E*/M*、待实施 P1–P8、未解决 SL-1/T4/T5、缓解与验证矩阵）。
+> 本文件保留 E2B 侧上下文与命令，条目细节以上述文档为准；
+> E2B 仓库的 `docs/sandlock-upstream-issues.md` 只剩编号映射。
+
 **位置与分支**：`third_party/sandlock`（imhun/sandlock fork 子模块，版本 0.9.0-beta；
 origin=fork，upstream=multikernel）。**运行时基线：`upstream-pr/netns-free-clean`
 （无 netns/veth 的无特权版本，全程无 root）**；`feature/network-socks5` 是
@@ -617,6 +622,8 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
   顺带核实：当前 `wheels/fork` 的 `.so` **确实导出**了
   `egress_proxy/http_auth/credential/host_mask/notify_rate_limit/pid_ns/net_isolation/fd_inject_connect`
   全部符号（此前只按时间戳存疑）；发布前重跑构建脚本仍是硬性步骤。
+  子模块 `upstream-pr/netns-free-clean` 现多一个**纯文档**提交 `afe4921`
+  （`docs/e2b-integration.md`），代码基线仍是 `be387c7` ⇒ 不需要因此重建 wheel。
 - **新发现，未复现未修**：`tmp/stale-20260902/test-runtime/**/snapshots/snap_X/fs/snapshots/snap_X/fs/...`
   出现同一快照自嵌套，路径长到 `ENAMETOOLONG`（`SnapshotRegistry.expand_to` 会把快照存储
   复制进快照自身）。本轮没有用例失败，只在这份被移走的旧 scratch 里发现；证据保留在
@@ -676,7 +683,8 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
    `lsattr -p -d`，镜像里没这个二进制时 `reconcile_orphan_projects` 静默返回
    `skipped: 用了 block 但找不到 project 目录`；补 `e2fsprogs` 并让缺失时打 WARN，
    生产节点要求也写进 `docs/production-deployment-requirements.md`。
-3. **SL-1（上游 sandlock 问题，已完整记录）：路径中介以 supervisor 身份执行系统调用**。
+3. **SL-1（上游 sandlock 问题，正文已并入 fork 仓库
+   `third_party/sandlock/docs/e2b-integration.md` §3.1）：路径中介以 supervisor 身份执行系统调用**。
    启用路径中介时（实测：`fs_denied` 非空或 chroot；源码另含 COW 一组），fork 通过 `SECCOMP_RET_USER_NOTIF` 把
    `openat/unlinkat/mkdirat/renameat2/fchmodat/fchownat/utimensat/...` 交给 supervisor
    代执行，而 `seccomp/notif.rs` 里没有 `setfsuid/seteuid`——于是沙箱自己创建的文件属主是
@@ -819,6 +827,8 @@ cargo test -p sandlock-core --offline --test integration test_netns -- --test-th
 | `envd_service/process/logs.py` | 命令输出 JSONL 采集 |
 | `envd_service/runtime/image_resolver.py` | rootfs 解包、pull、registry login、digest 缓存 key |
 | `E2B_IMAGE_CACHE_DIR/_oci/` | 无 registry 时本地构建的 OCI layout tar + `.link` 侧车（resolver 优先读它） |
+| `third_party/sandlock/docs/e2b-integration.md` | sandlock 侧唯一事实源：已落地方案 / 待实施 P1–P8 / 未解决 SL-1、T4、T5 / 验证矩阵（fork `upstream-pr/netns-free-clean`，文档提交 `afe4921`） |
+| `docs/sandlock-upstream-issues.md` | 编号映射索引（内容以上述 fork 文档为准） |
 | `envd_service/gateway.py` | 路由缓存 + `/internal/routes/{id}/invalidate` |
 | `gateway_common/network.py` | network 校验/规范化 + sandlock 策略映射 |
 | `envd_service/executors/sandlock.py` | network→net_allow/net_deny/http_allow + 每沙箱 CA 注入 |
