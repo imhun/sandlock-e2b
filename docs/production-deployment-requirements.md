@@ -10,6 +10,7 @@
 | XFS 支持 project quota（`projid32bit=1`） | `projid32bit=1` | ✅ |
 | 内核 ≥ 4.5 | 6.12（EL 10.2） | ✅ |
 | `xfs_quota` 工具 | quota 4.09 | ✅ |
+| `lsattr`（e2fsprogs）| 未装则孤儿 project 只报不清 | ⚠️ **需安装**（`_scan_project_dirs` 靠它把 projid 映射回沙箱目录）|
 | 挂载启用 `prjquota` | 当前 `noquota` | ⚠️ **需启用** |
 
 ## 2. 启用步骤（需维护窗口）

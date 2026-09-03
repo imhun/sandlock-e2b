@@ -16,6 +16,10 @@ RUN sed -i \
     bash \
     git \
     curl \
+    xfsprogs \
+    e2fsprogs \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/requirements.txt
@@ -70,5 +74,25 @@ WORKDIR /workspace
 COPY envd_service/mcp/gateway.py /usr/bin/mcp-gateway
 RUN chmod +x /usr/bin/mcp-gateway \
     && ln -sf /usr/bin/mcp-gateway /usr/local/bin/mcp-gateway
+
+# The official JS SDK job installs from a domestic registry (no dependency on
+# the public npm registry being reachable from the runner).
+ENV NPM_CONFIG_REGISTRY=https://registry.npmmirror.com
+
+# Run the shapes that used to be opt-in: sandboxes execute inside an image
+# rootfs (the production worker shape) and the per-sandbox netns/fd-injection
+# contract suite runs too. Both were previously invisible because the default
+# run left them gated off, and the strict gate below forbids that.
+ENV E2B_BASE_IMAGE=python:3.11-slim \
+    E2B_TEST_NET_ISOLATION=1
+
+# A gate this runner can satisfy must not skip: an unsatisfied gate fails the
+# run loudly instead of quietly dropping coverage (see tests/conftest.py).
+ENV E2B_TEST_STRICT_SKIPS=1
+
+# Loop-mounts XFS with prjquota (and puts the sandbox workspaces on it) before
+# handing over to pytest, so the quota/ownership tests run for real.
+COPY deploy/docker/entrypoint.test-runner.sh /usr/local/bin/entrypoint.test-runner.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint.test-runner.sh"]
 
 CMD ["pytest", "tests/unit", "tests/contract"]

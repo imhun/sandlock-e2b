@@ -175,7 +175,7 @@ async def test_reconcile_removes_zero_usage_orphan_entry(xfs_app):
         workspace_base=XFS_MOUNT,
         mount_point=XFS_MOUNT,
     )
-    assert projid in result["cleaned"]
+    assert projid in result["cleaned"], f"reconcile returned {result}"
     assert result["skipped"] == []
     assert projid not in _report_rows()
 
@@ -195,7 +195,7 @@ async def test_reconcile_removes_record_lost_project_but_keeps_dir(xfs_app):
         workspace_base=XFS_MOUNT,
         mount_point=XFS_MOUNT,
     )
-    assert projid in result["cleaned"]
+    assert projid in result["cleaned"], f"reconcile returned {result}"
     assert projid not in _report_rows()
     # Files are disowned from the orphan project but never deleted.
     assert (XFS_MOUNT / sandbox_id).is_dir()

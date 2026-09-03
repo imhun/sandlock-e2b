@@ -96,6 +96,16 @@ def _result(messages) -> tuple[int, bytes, bytes]:
     return ends[0]["event"]["end"]["exitCode"], stdout, stderr
 
 
+@pytest.mark.xfail(
+    bool(os.environ.get("E2B_BASE_IMAGE")),
+    reason=(
+        "image-rootfs (chroot) shape: sandlock enforces the shared-path "
+        "fs_denied rules through its on-behalf open path, so files the sandbox "
+        "writes belong to the supervisor (host uid 0) and per-uid volume "
+        "protection cannot hold (docs/HANDOFF.md, open item T5)"
+    ),
+    strict=True,
+)
 async def test_volume_shared_rw_across_distinct_uids(make_apps, workspace):
     control, envd = make_apps(envd_settings=_envd_settings(workspace))
     async with httpx.AsyncClient(
@@ -142,9 +152,9 @@ async def test_volume_shared_rw_across_distinct_uids(make_apps, workspace):
         assert code_a == 0
         assert out_a == b""
         assert err_a == b""
-        # Who really owns what A's sandbox wrote? Capture it now: the unlink at
-        # the end of the test removes the file, and the answer decides whether
-        # the sticky-bit protection below is assertable at all.
+        # Who really owns what A's sandbox wrote? Capture it now -- the unlink
+        # below removes the file, and the answer is the precondition of the
+        # per-uid protection being asserted.
         written_by = (vol_path / "a.txt").stat().st_uid
         code_b, out_b, err_b = _result(
             await _run_cmd(client, b_payload, "echo from-B > mnt/data/b.txt")
@@ -175,20 +185,14 @@ async def test_volume_shared_rw_across_distinct_uids(make_apps, workspace):
             await _run_cmd(client, b_payload, "rm mnt/data/a.txt")
         )
         # The protection is a kernel DAC decision: the sticky bit denies B the
-        # unlink because A owns the file. That only exists if the storage
-        # recorded A's sandbox host uid as the owner -- in the image-rootfs
-        # (chroot) shape on Docker/overlayfs runner storage the write is
-        # attributed to the mount owner instead, both children then act as the
-        # same identity and the unlink succeeds (docs/HANDOFF.md, T1: measure
-        # this on host-local XFS/ext4 before trusting the guarantee). Skipped
-        # with the observed owner rather than quietly relaxed.
-        if written_by != ra.host_uid:
-            pytest.skip(
-                "sandbox writes land owned by uid "
-                f"{written_by}, not the sandbox host uid {ra.host_uid}: "
-                "per-uid file protection is not expressible on this worker "
-                "storage/image-rootfs shape"
-            )
+        # unlink because A owns the file, so the storage has to have recorded
+        # A's sandbox host uid as the owner. Assert that instead of assuming it
+        # -- the same measurement is what surfaces T5 in the image-rootfs
+        # shape, where it is tracked by the xfail mark on this test.
+        assert written_by == ra.host_uid, (
+            f"sandbox writes landed owned by uid {written_by}, not the sandbox "
+            f"host uid {ra.host_uid}: per-uid isolation is not in effect"
+        )
         assert code_bd != 0
         assert (
             err_bd

@@ -403,7 +403,15 @@ def _scan_project_dirs(workspace_base: str | Path) -> dict[int, Path]:
             text=True,
             timeout=_XFS_QUOTA_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Without the mapping a non-empty orphan can only be reported, never
+        # cleaned -- say so loudly, because a node missing e2fsprogs otherwise
+        # degrades silently and orphan projects pile up forever.
+        logger.warning(
+            "cannot read project ids with lsattr (%s): orphan reconciliation "
+            "will report non-empty projects instead of cleaning them",
+            exc,
+        )
         return mapping
     if proc.returncode != 0:
         logger.warning(

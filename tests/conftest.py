@@ -65,6 +65,55 @@ def pytest_addoption(parser):
     parser.addoption("--perf", action="store_true", default=False, help="run perf tests")
 
 
+# --- strict skip gate -------------------------------------------------------
+# Every gate below is something the Docker test runner can genuinely satisfy
+# (it ships xfsprogs + node/npm, loop-mounts XFS with prjquota at startup, and
+# selects the image-rootfs / net-isolation shapes), so a skip that matches one
+# of these reasons means coverage quietly disappeared. With
+# E2B_TEST_STRICT_SKIPS=1 (set in the test-runner image) such a skip is
+# reported as a failure instead.
+# Only *runner* capabilities are forbidden here -- XFS prjquota, node/npm,
+# NET_ADMIN, the storage-ownership measurements -- because the image installs
+# and prepares all of them, so a skip that names one of them means setup
+# regressed. Deployment-shape selectors (E2B_BASE_IMAGE, E2B_TEST_NET_ISOLATION)
+# are deliberately not in this list: switching them off is a supported way to
+# run a narrower matrix, not lost coverage.
+_STRICT_SKIP_FORBIDDEN = (
+    "XFS quota integration requires",
+    "does not support XFS project quota",
+    "npm is not installed",
+    "needs NET_ADMIN",
+    "sandbox writes land owned by",
+    "worker storage does not give the sandbox ownership",
+)
+
+
+def _strict_skips_enabled() -> bool:
+    return os.environ.get("E2B_TEST_STRICT_SKIPS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    if not report.skipped or not _strict_skips_enabled():
+        return report
+    reason = str(report.longrepr or "")
+    matched = next((marker for marker in _STRICT_SKIP_FORBIDDEN if marker in reason), None)
+    if matched is None:
+        return report
+    report.outcome = "failed"
+    report.longrepr = (
+        f"{item.nodeid}: this runner is expected to satisfy the gate "
+        f"(matched {matched!r} in E2B_TEST_STRICT_SKIPS mode), but the test "
+        f"skipped with: {reason.strip()[:400]}"
+    )
+    return report
+
+
 def pytest_collection_modifyitems(config, items):
     if not config.getoption("--perf"):
         skip_perf = pytest.mark.skip(reason="perf tests require --perf")

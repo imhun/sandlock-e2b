@@ -647,7 +647,53 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
   NET_ADMIN"，把 fork 的无特权通配 DNS 路径整条跳过；现在把"已存在"当成功（只有
   自己加的才回收），其它失败把 iproute2 原文写进 skip 原因（`08a21dc`）。
 
-### 容器全量剩下的 skip（18 条，默认形态）
+### 09-03（续）：把"能跑却在跳"的用例真正跑起来，并禁止再次跳
+
+测试镜像现在自己把环境补齐（`deploy/docker/entrypoint.test-runner.sh` + Dockerfile）：
+
+- `xfsprogs` + `e2fsprogs` + `nodejs`/`npm`（npm 走 `registry.npmmirror.com`）；
+- 启动时 losetup + `mkfs.xfs` + `mount -o prjquota` 挂到 `/var/lib/e2b-sandboxes`，
+  并把 `E2B_TEST_TMP_ROOT` 挪到这块 XFS 上（容器内 loop 设备与宿主共享、节点可能缺失，
+  脚本会 `mknod` 显式分配并在退出时只解绑自己那个）；成功后导出
+  `E2B_XFS_QUOTA_INTEGRATION=1`；
+- 默认就跑两种形态：`E2B_BASE_IMAGE=python:3.11-slim`（镜像 rootfs）与
+  `E2B_TEST_NET_ISOLATION=1`（netns + fd 注入 connect）；
+- `E2B_TEST_STRICT_SKIPS=1`：**运行器能力型** skip（XFS prjquota、`lsattr`/npm、
+  NET_ADMIN、沙箱文件属主测量）一律判为失败，杜绝"环境没配好 → 覆盖率悄悄掉"。
+  部署形态开关（`E2B_BASE_IMAGE` / `E2B_TEST_NET_ISOLATION`）不在禁用清单里：
+  主动关它们是合法的窄矩阵，不是丢覆盖率。
+
+跑起来之后当场暴露三个真问题（前两个已修，第三个转为跟踪项）：
+
+1. **`fs_denied` 会废掉 per-sandbox host uid 隔离（已修，重要）**。非 chroot 形态下
+   `/proc/kcore`、`/sys`、`/dev/shm` 本来就不在 Landlock 可读白名单里，denial 是冗余的；
+   但一旦下发，fork 就走"代打开"路径，**沙箱自己创建的文件属主变成 supervisor（host uid 0）**
+   ⇒ 沙箱内 `chmod`/`touch` 自己文件 EPERM，共享卷 1777+sticky 的跨 uid 保护也失效。
+   现在 denial 只在镜像 rootfs 形态下发；实测（真 XFS）纯 sandlock 形态下
+   `uid=1000/4242/4243` 归属正确、`chmod` 正常、跨 uid sticky 保护真的生效
+   —— 以前这条用例在 virtiofs/overlay 上的"通过"是没有意义的。
+2. **`lsattr` 缺失让孤儿 project 只报不清（已修）**。`_scan_project_dirs` 依赖
+   `lsattr -p -d`，镜像里没这个二进制时 `reconcile_orphan_projects` 静默返回
+   `skipped: 用了 block 但找不到 project 目录`；补 `e2fsprogs` 并让缺失时打 WARN，
+   生产节点要求也写进 `docs/production-deployment-requirements.md`。
+3. **T4/T5：镜像 rootfs(chroot) 形态的两个已测出缺陷（strict xfail 跟踪，不 skip）**
+   - T4 `net_isolation` + chroot：MCP 入站端口映射起不来（`/mcp` 代理整段连不上），
+     纯 sandlock 形态 3/3 通过 ⇒ `test_mcp_full_path_under_net_isolation` 在该形态
+     `xfail(strict=True, run=False)`；
+   - T5 chroot 形态下共享卷写入仍经 supervisor 归属（`fs_denied` 的代打开路径在
+     chroot 里无法回避，见上）⇒ `test_volume_shared_rw_across_distinct_uids` 在该形态
+     `xfail(strict=True)`，非 chroot 形态必须真通过（并新增断言
+     `written_by == ra.host_uid`，回归即红）。
+   两条都在"意外通过"时立刻失败，逼我们摘掉标记。
+
+全开一次（镜像 rootfs + netns + XFS + npm + strict）：
+
+- `867 passed / 1 skipped / 2 xfailed / 0 failed / 0 error`（`tmp/session-scratch/full-final.log`）
+- 2 条 xfail = T4/T5（chroot 形态那两个真缺陷）；唯一 skip 是
+  `test_volume_quota.py:274`（"XFS supported: degradation path not exercised"）——
+  它测的是"XFS 不可用时的降级路径"，本机 XFS 可用所以走另一分支，属于互斥分支而非能力缺失。
+
+### （历史）容器全量剩下的 18 条 skip，09-03 续已消除其中 17 条
 
 | 分组 | 数量 | 为什么跳 | 怎么跑起来 |
 |---|---|---|---|

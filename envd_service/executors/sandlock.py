@@ -513,11 +513,18 @@ class SandlockExecutor(Executor):
         fs_writable = [self._workspace_dir]
         fs_writable.extend(self._extra_fs_writable)
         fs_readable = ["/usr", "/lib", "/bin", "/opt"]
-        # /dev is mounted from the container (chroot image mode) or shared
-        # directly (pure sandlock), so deny the shared tmpfs/queue paths:
-        # /dev/shm and /dev/mqueue are common to every sandbox on the worker
-        # (same uid), which would allow cross-sandbox reads and DoS.
-        fs_denied = ["/proc/kcore", "/sys", "/dev/shm", "/dev/mqueue"]
+        # Shared-path denials (/dev/shm, /dev/mqueue are common to every
+        # sandbox on the worker) are only needed where the sandbox can actually
+        # see them: with an image rootfs the whole tree is readable, so they
+        # have to be carved out explicitly. Without a chroot, Landlock is an
+        # allow-list and those paths are already unreachable (not in
+        # fs_readable), so the rules add nothing -- and issuing them would cost
+        # the sandbox its own file ownership: sandlock enforces denials through
+        # its on-behalf open path, so every file the sandbox creates is then
+        # attributed to the supervisor (host uid 0) instead of the sandbox host
+        # uid, which silently voids both ``chmod`` inside the sandbox and the
+        # per-uid isolation of shared volumes.
+        fs_denied: list[str] = []
         if config.pty:
             # The in-sandbox PTY bridge needs the pty device nodes.
             fs_writable += ["/dev/ptmx", "/dev/pts"]
@@ -527,8 +534,13 @@ class SandlockExecutor(Executor):
             # rootfs), so the whole image is readable as its own filesystem.
             # The host filesystem stays unreachable: the chroot restricts the
             # path space, and shared volumes are only exposed via their exact
-            # fs_writable directory.
+            # fs_writable directory. The container /dev is mounted into the
+            # chroot for the PTY bridge, so the shared tmpfs/queue paths need
+            # the explicit denials here (accepting the supervisor-attributed
+            # writes that come with that path -- see the note above, and
+            # docs/HANDOFF.md T1 for the open fork question).
             fs_readable = list(fs_readable) + ["/"]
+            fs_denied = ["/proc/kcore", "/sys", "/dev/shm", "/dev/mqueue"]
         net_allow: list[str] = []
         net_deny: list[str] = []
         http_allow: list[str] = []
