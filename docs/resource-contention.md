@@ -227,6 +227,9 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after�
   `Sandbox.create(mcp=...)` 的网关是长驻实例，`background=True` 的命令也各持实例。
   本文件的节点台账仍按沙箱预留一次 `memory_mb`（`_record_quota_dims`），所以这会直接变成
   **节点超卖**：实际 RSS 早于准入判定冲破节点，OOM 由驱逐/扩缩信号之外的路径发生。
+  并发命令数由 `_CommandGate` 限着（默认 `E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=1`），但
+  MCP 网关不走闸口且长驻 ⇒ **默认 K=2**：实测网关 + 一条命令各占 450M 同时成功，
+  900M / 标称 512M = 1.76x；闸口调到 N 则约 (N+1)x。
   磁盘不受影响（XFS project id 按沙箱目录设置、被所有实例共享，限额是真加总）。
   修法二选一：fork 提供跨实例共享资源组（`e2b-integration.md` §3.8 / 提案 P10），或
   E2B 侧给每个沙箱建一个 cgroup v2 并把每次命令的子进程放进去（需要 worker 有 cgroup 写权限）。
