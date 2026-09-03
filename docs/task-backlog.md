@@ -36,7 +36,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | S3.2 | 私有源/镜像安装切换 | ✅ 完成（Dockerfile 按 ABI+ARCH 从 `wheels/fork` 安装） |
 | S3.3 | 上游 PR 分支整理 | ✅ 完成（推送按约束暂缓） |
 
-| E10 | 每沙箱一实例（fork §7，M0–M4）：三层拆分 + E2B 接线。含 Q10 风险：`max_processes` 从『每命令 64』变『整箱 64』，落地时必须同步上调默认值并写变更说明；另含 Q6 网络策略语义、Q7 控制目录身份、Q8 泄漏回收 | ⬜ 未开始（等 fork M0 落地） | — |
+| E10 | 每沙箱一实例（fork §8，M0–M4）：三层拆分 + E2B 接线。含 Q10 风险：`max_processes` 从『每命令 64』变『整箱 64』，落地时必须同步上调默认值并写变更说明；另含 Q6 网络策略语义、Q7 控制目录身份、Q8 泄漏回收 | ⬜ 未开始（等 fork M0 落地） | — |
 | SL-1 | 路径中介（USER_NOTIF）以 supervisor 身份执行 `openat/unlinkat/fchmodat/...`：沙箱文件属主变 root、`chmod` 失效、共享目录 per-uid 保护不成立 | ⬜ 待修（正文+复现+修法在 `third_party/sandlock/docs/e2b-integration.md` §3.1/§2 P1；`gh` 不可用 + token 只读，暂无法直接开上游 issue） |：`wheels/fork` 需按 E7 最终 sandlock tip 重建（`scripts/build-sandlock-wheels.sh`），
 镜像内 wheel 与 fork 提交一致后才能推 ACR。
 
@@ -69,7 +69,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | T4 | net_isolation + 镜像 rootfs(chroot) 形态下 MCP 入站端口映射起不来（纯 sandlock 形态 3/3 通过） | ⬜ 新发现，已用 strict xfail 跟踪 | — |
 | T5 | chroot 形态共享卷写入经 supervisor 归属（fs_denied 代打开路径），per-uid 卷保护无法成立 | ⬜ 即上游 **SL-1**（notif 代执行未切 caller 身份），本仓库 strict xfail 跟踪；正文见 `third_party/sandlock/docs/e2b-integration.md` §3.1 | — |
 | T1 | 真实 XFS/ext4 目标机上复测沙箱文件属主：① 沙箱能否 `chmod` 自己写的文件（本机 EPERM）；② 共享卷 1777+sticky 的跨 uid 保护是否真生效（本机 A 写的文件宿主属主是 uid 0，而沙箱 host_uid 是 20000） | ⬜ 待环境（两条用例已改为带证据跳过，不再靠巧合通过） | — |
-| T6 | 内存/CPU/进程配额按实例而非按沙箱 ⇒ 超卖（默认 K=2 实测 1.76x），放大为节点超卖 | ✅ 已定方案：改为**每沙箱一个 sandlock 实例**（fork 文档 §7，取代 P10 共享资源组） | — |
+| T6 | 内存/CPU/进程配额按实例而非按沙箱 ⇒ 超卖（默认 K=2 实测 1.76x），放大为节点超卖 | ✅ 已定方案：改为**每沙箱一个 sandlock 实例**（fork 文档 §8，取代 P10 共享资源组） | — |
 | T2 | `third_party/sandlock`：`_HANDLED_FIELDS` 登记 `notify_rate_limit`，消掉假告警 | ⬜ 待做（一行） | — |
 | T3 | 复现并修 `SnapshotRegistry.expand_to` 快照自嵌套（`snap_X/fs/snap_X/fs/...`） | ⬜ 新发现，无用例覆盖 | — |
 
