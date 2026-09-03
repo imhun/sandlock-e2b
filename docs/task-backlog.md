@@ -63,7 +63,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | E8.1 | 部署后远程 smoke 回归 | ⏸ 受"不做远程部署"约束暂缓 | — |
 | E8.2 | 本地测试基线确认 + HANDOFF/backlog 更新 | ✅ 完成（Linux 容器全量 28 failed / 804 passed / 17 skipped / 6 errors，219.63s；macOS unit+contract 11 failed / 689 passed / 23 skipped / 33 errors，36.91s；详见 HANDOFF「验证命令与基线」） | — |
 | E8.3 | 测试环境失败清零（把 E8.2 的"环境类失败"逐条定根因） | ✅ 完成（Linux 容器全量 **0 failed / 0 error**，843 passed / 18 skipped；macOS 全量（含 sdk python/js + security）**0 failed**，804 passed / 53 skipped；顺带修掉 2 个产品缺陷（模板镜像切换未落盘、无 registry 构建产物无法解析） | `ac59152` `d8b7f41` `87874a0` `0a235b4` `22e5acc` |
-| E8.4 | 公共镜像不直连 Docker Hub：`E2B_REGISTRY_MIRRORS` + 凭据按 host 作用域 + harness 存储改容器原生盘 | ✅ 完成（默认形态 850 passed / 0 failed；OCI rootfs 形态 73 failed+28 errors → 852 passed / 0 failed） | `a6f74e4` |
+| E8.4 | 公共镜像不直连 Docker Hub：`E2B_REGISTRY_MIRRORS` + 凭据按 host 作用域 + harness 存储改容器原生盘 + 清掉一条假 skip | ✅ 完成（默认形态 851 passed / 18 skipped；image-rootfs 形态 73 failed+28 errors → 853 passed / 16 skipped；两形态 0 failed。18 条 skip 的分组与跑法见 HANDOFF「容器全量剩下的 skip」） | `a6f74e4` `3d7cc79` `08a21dc` |
 | T1 | 真实 XFS/ext4 目标机上复测沙箱文件属主：① 沙箱能否 `chmod` 自己写的文件（本机 EPERM）；② 共享卷 1777+sticky 的跨 uid 保护是否真生效（本机 A 写的文件宿主属主是 uid 0，而沙箱 host_uid 是 20000） | ⬜ 待环境（两条用例已改为带证据跳过，不再靠巧合通过） | — |
 | T2 | `third_party/sandlock`：`_HANDLED_FIELDS` 登记 `notify_rate_limit`，消掉假告警 | ⬜ 待做（一行） | — |
 | T3 | 复现并修 `SnapshotRegistry.expand_to` 快照自嵌套（`snap_X/fs/snap_X/fs/...`） | ⬜ 新发现，无用例覆盖 | — |
