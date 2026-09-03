@@ -586,16 +586,21 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
 
 ### 仍未解决（已定位，需要环境/上游动作）
 
-- **复跑基线现在会被 Docker Hub 匿名配额卡住**（不是代码问题）：解析器按
-  "每次 create 查一次 manifest" 设计（缓存目录名带 digest，用于 tag 更新自动
-  失效），本轮多次全量+OCI 复跑把配额打满，最后一次复跑
-  `3 failed / 789 passed / 54 errors`（日志 `tmp/final3-linux.log`）全部是
-  `registry-1.docker.io ... 429 TOOMANYREQUESTS`（含 harness 预热 session
-  fixture 的连锁）。已把查询频率降为"每进程每 tag 60s 一次"
-  （`E2B_IMAGE_MANIFEST_TTL_S`，0 关闭）；要彻底摆脱公共仓库配额，走文档既有
-  路径：把基础镜像镜像到 ACR（`deploy/scripts/build-and-push.sh`）并把
-  `E2B_BASE_IMAGE` 指过去。配额恢复前，本机这条基线无法复验；最后一次干净
-  复跑是 `843 passed / 18 skipped / 0 failed`（`tmp/final2-linux.log`）。
+- **公共镜像不再直连 Docker Hub**（09-03 处理）：09-02 的复跑把匿名配额打满，
+  `3 failed / 789 passed / 54 errors` 全是 `registry-1.docker.io 429
+  TOOMANYREQUESTS`（含 harness 预热 fixture 的连锁）。两层处理：查询频率降为
+  "每进程每 tag 60s 一次"（`E2B_IMAGE_MANIFEST_TTL_S`），并且解析器现在支持
+  `E2B_REGISTRY_MIRRORS`（`host=mirrorA|mirrorB,...`，按端点依次尝试、origin
+  兜底、token 每端点重新换发；404 不做无谓重试）。测试镜像默认走
+  `docker.m.daocloud.io|docker.1ms.run`（与 buildkitd 用的同一个源，实测两个
+  镜像源的 digest 与 Docker Hub 一致）。生产要彻底摆脱公共仓库配额，仍建议把
+  基础镜像镜像到 ACR（`deploy/scripts/build-and-push.sh`）并把
+  `E2B_BASE_IMAGE` 指过去。
+- **顺带修掉的凭据外泄**：`E2B_IMAGE_REGISTRY_USERNAME/PASSWORD` 是一对按部署
+  配的凭据，过去解析**任意**镜像都会带着它去换 token —— 解析公共镜像时既被源站
+  拒（`token exchange failed: 401 incorrect username or password`，09-02 OCI
+  复跑里出现过），也把凭据发给了第三方 host。现在只有 `E2B_IMAGE_REGISTRY`
+  的 host 与镜像 host 一致时才带（`registry_credential_host()`）。
 - **overlayfs 上沙箱改不了自己文件的权限**：Docker 容器存储（OrbStack/Desktop 的
   overlayfs）里，沙箱新建文件的属主是挂载属主，沙箱内 `chmod`/`touch` 返回 EPERM ⇒
   `pip install` 这类流程在该存储上不可用。受影响的
@@ -752,4 +757,7 @@ E2B_IMAGE_REGISTRY_PASSWORD    仓库认证
 E2B_GATEWAY_URL                迁移后通知 gateway 失效路由
 E2B_IMAGE_MANIFEST_TTL_S       60    # 同一镜像 tag 的 manifest 查询缓存秒数
                                      # （0 = 每次 create 都查；见 image_resolver）
+E2B_REGISTRY_MIRRORS                  # 公共仓库镜像源：host=mirrorA|mirrorB,...
+                                     # Origin 始终作为最后一个端点兜底；测试镜像
+                                     # 已默认走 docker.m.daocloud.io|docker.1ms.run
 ```

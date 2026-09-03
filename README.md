@@ -381,6 +381,10 @@ Redis WATCH 事务（原子，跨进程不超用），TTL 扫描跨副本一致�
   模板镜像名切到 `{registry}/{templateID}`（这一步会**落盘**到模板记录），
   worker 节点按需从仓库拉取（见多节点调度一节）。**改了 registry 之后，
   之前构建的模板仍指向旧地址，需要重新构建。**
+- **公共镜像源**：`E2B_REGISTRY_MIRRORS=host=mirrorA|mirrorB,...`（如
+  `registry-1.docker.io=docker.m.daocloud.io`）让 worker 经镜像源解析公共镜像，
+  避免 Docker Hub 匿名配额（429）拖垮建沙箱；origin host 始终作为最后一个端点
+  兜底，`E2B_IMAGE_MANIFEST_TTL_S`（默认 60s）再压一层查询频率。
 - **不配 registry 的单机形态**：没有可 push 的目标，构建改为把
   **OCI layout tar** 导出到 `E2B_IMAGE_CACHE_DIR/_oci/`，本节点的 worker
   从该 tar 解析 rootfs（解析与 `warm` 探测都不需要 registry）。这条路径只

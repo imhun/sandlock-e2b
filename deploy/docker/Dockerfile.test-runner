@@ -51,6 +51,13 @@ RUN PY_ABI=$(python3 -c 'import sys; print(f"cp{sys.version_info.major}{sys.vers
 # speaks to it with this client (same source as Dockerfile.control-plane-gateway).
 COPY --from=buildkit /usr/bin/buildctl /usr/bin/buildctl
 
+# Public images must not be pulled straight from Docker Hub: anonymous pulls
+# hit 429 TOOMANYREQUESTS long before a test session is over, and that shows up
+# as sandbox-create failures. Look them up through domestic mirrors first (the
+# origin stays as the last endpoint, so a dead mirror cannot break a pull).
+# Same mirror the buildkitd config already uses for image builds.
+ENV E2B_REGISTRY_MIRRORS="registry-1.docker.io=docker.m.daocloud.io|docker.1ms.run"
+
 # Test scratch space has to be container-native storage. /workspace is a bind
 # mount of the host repo (virtiofs on an OrbStack/Docker Desktop host), where
 # chown is a no-op, so the per-sandbox uid tests would assert against a

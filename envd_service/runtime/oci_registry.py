@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import platform
 import posixpath
 import tarfile
@@ -44,7 +45,21 @@ _INDEX_MEDIA_TYPES = {
 
 
 class RegistryError(RuntimeError):
-    pass
+    """A registry lookup failure.
+
+    ``retryable`` marks the failures that say something about the *endpoint*
+    rather than about the image (rate limit, server error, connection problem),
+    so a configured mirror can fall through to the origin registry. A 404 for a
+    tag is the same answer everywhere and is not retried.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _status_is_retryable(status: int) -> bool:
+    return status == 408 or status == 429 or status >= 500
 
 
 @dataclass(frozen=True)
@@ -62,6 +77,59 @@ def _default_scheme(host: str) -> str:
     if host.startswith("localhost") or host.startswith("127.0.0.1"):
         return "http"
     return "https"
+
+
+def _normalize_endpoint(value: str) -> str:
+    """``https://docker.m.daocloud.io/`` -> ``docker.m.daocloud.io``."""
+    host = value.strip()
+    for prefix in ("https://", "http://"):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+            break
+    return host.strip("/").lower()
+
+
+def registry_mirrors() -> dict[str, list[str]]:
+    """``E2B_REGISTRY_MIRRORS``: ``host=mirrorA|mirrorB,host2=mirrorC``.
+
+    Public registries rate-limit anonymous pulls (Docker Hub answers
+    ``429 TOOMANYREQUESTS`` well before a node's worth of creates), so the
+    lookup can be pointed at mirrors instead of at the origin. Alternatives are
+    tried in order and the origin host is always appended as the last endpoint.
+    """
+    raw = os.environ.get("E2B_REGISTRY_MIRRORS", "")
+    mapping: dict[str, list[str]] = {}
+    for pair in raw.split(","):
+        if "=" not in pair:
+            continue
+        source, _, targets = pair.partition("=")
+        source = _normalize_endpoint(source)
+        if not source:
+            continue
+        buckets = mapping.setdefault(source, [])
+        for target in targets.split("|"):
+            host = _normalize_endpoint(target)
+            if host and host not in buckets:
+                buckets.append(host)
+    return mapping
+
+
+def registry_mirrors_for(host: str) -> list[str]:
+    return registry_mirrors().get(_normalize_endpoint(host), [])
+
+
+def registry_credential_host() -> str | None:
+    """The host ``E2B_IMAGE_REGISTRY_USERNAME/PASSWORD`` belong to.
+
+    One credential pair is configured per deployment, and it names a specific
+    registry; sending it while resolving an unrelated public image makes the
+    origin reject the token exchange (``401 incorrect username or password``)
+    and leaks the credential to a third-party host.
+    """
+    registry = (os.environ.get("E2B_IMAGE_REGISTRY") or "").strip()
+    if not registry:
+        return None
+    return _normalize_endpoint(registry.split("/")[0])
 
 
 def parse_image_ref(image: str) -> ImageRef:
@@ -114,6 +182,15 @@ class RegistryClient:
         timeout: float = 30.0,
     ) -> None:
         self._ref = ref
+        creds_host = registry_credential_host()
+        if username and creds_host and _normalize_endpoint(ref.host) != creds_host:
+            logger.debug(
+                "registry credentials are for %s, not %s: pulling anonymously",
+                creds_host,
+                ref.host,
+            )
+            username = None
+            password = None
         self._username = username
         self._password = password
         self._scheme = scheme or _default_scheme(ref.host)
@@ -122,8 +199,15 @@ class RegistryClient:
         self._basic_auth: tuple[str, str] | None = None
 
     @property
-    def _base(self) -> str:
-        return f"{self._scheme}://{self._ref.host}/v2"
+    def _bases(self) -> list[str]:
+        hosts = [*registry_mirrors_for(self._ref.host), self._ref.host]
+        seen: list[str] = []
+        for host in hosts:
+            scheme = self._scheme if host == self._ref.host else _default_scheme(host)
+            base = f"{scheme}://{host}/v2"
+            if base not in seen:
+                seen.append(base)
+        return seen
 
     def _authorization(self) -> str | None:
         if self._token:
@@ -135,7 +219,33 @@ class RegistryClient:
             return f"Basic {base64.b64encode(raw).decode()}"
         return None
 
-    def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Fetch ``path`` (registry-relative), trying each configured endpoint.
+
+        The token is issued per endpoint, so the auth dance runs again for
+        every one of them.
+        """
+        bases = self._bases
+        last: RegistryError | None = None
+        for index, base in enumerate(bases):
+            self._token = None
+            self._basic_auth = None
+            url = f"{base}/{path}"
+            try:
+                return self._request_one(method, url, **kwargs)
+            except RegistryError as e:
+                if not e.retryable or index == len(bases) - 1:
+                    raise
+                last = e
+                logger.warning(
+                    "registry endpoint %s unusable for %s (%s); falling through",
+                    base,
+                    path,
+                    e,
+                )
+        raise last  # pragma: no cover - the loop always returns or raises
+
+    def _request_one(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         headers = dict(kwargs.pop("headers", {}) or {})
         headers.setdefault("Accept", _MANIFEST_ACCEPT)
         auth_header = self._authorization()
@@ -148,8 +258,9 @@ class RegistryClient:
             resp = self._send(method, url, headers, **kwargs)
         if resp.status_code >= 400:
             raise RegistryError(
-                f"registry {self._ref.host} {method} {url} -> {resp.status_code}: "
-                f"{resp.text[:300]}"
+                f"registry {url.split('//', 1)[1].split('/', 1)[0]} "
+                f"{method} {url} -> {resp.status_code}: {resp.text[:300]}",
+                retryable=_status_is_retryable(resp.status_code),
             )
         return resp
 
@@ -172,7 +283,9 @@ class RegistryClient:
             )
         except httpx.HTTPError as e:
             raise RegistryError(
-                f"registry {self._ref.host} {method} {url} -> {type(e).__name__}: {e}"
+                f"registry {url.split('//', 1)[1].split('/', 1)[0]} "
+                f"{method} {url} -> {type(e).__name__}: {e}",
+                retryable=True,
             ) from e
 
     def _challenge(self, resp: httpx.Response) -> None:
@@ -218,23 +331,21 @@ class RegistryClient:
     def manifest(self, reference: str | None = None) -> tuple[dict[str, Any], str]:
         """Return (manifest dict, content digest)."""
         ref = reference or self._ref.reference
-        url = (
-            f"{self._base}/{self._ref.repository}"
-            f"/manifests/{quote(ref, safe=':')}"
+        path = (
+            f"{self._ref.repository}/manifests/{quote(ref, safe=':')}"
         )
-        resp = self._request("GET", url)
+        resp = self._request("GET", path)
         try:
             manifest = resp.json()
         except json.JSONDecodeError as e:
-            raise RegistryError(f"invalid manifest JSON from {url}: {e}") from e
+            raise RegistryError(f"invalid manifest JSON from {path}: {e}") from e
         digest = resp.headers.get("Docker-Content-Digest")
         if not digest:
             digest = "sha256:" + hashlib.sha256(resp.content).hexdigest()
         return manifest, digest
 
     def blob(self, digest: str) -> bytes:
-        url = f"{self._base}/{self._ref.repository}/blobs/{digest}"
-        return self._request("GET", url).content
+        return self._request("GET", f"{self._ref.repository}/blobs/{digest}").content
 
 
 def _machine_platform() -> tuple[str, str]:

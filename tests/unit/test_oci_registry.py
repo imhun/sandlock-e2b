@@ -376,3 +376,167 @@ def test_platform_digest_ttl_zero_always_refetches(monkeypatch):
         )
     assert len(calls) == 3
     image_resolver._DIGEST_CACHE.clear()
+
+
+# --- mirror / endpoint fallback / credential scoping ------------------------
+
+
+class _RecordingResponse:
+    def __init__(self, status: int = 200, body: bytes = b"{}", headers=None) -> None:
+        self.status_code = status
+        self.content = body
+        self.text = body.decode()
+        self.headers = headers or {}
+
+    def json(self) -> dict:
+        return json.loads(self.content)
+
+
+def _recorder(responses):
+    """Fake ``httpx.request`` returning ``responses`` per URL, in call order."""
+    import httpx
+
+    calls: list[tuple[str, dict[str, str]]] = []
+    queue = list(responses)
+
+    def fake_request(method, url, headers=None, **kwargs):
+        calls.append((url, dict(headers or {})))
+        assert queue, f"unexpected extra request to {url}"
+        response = queue.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    return fake_request, calls
+
+
+def test_registry_mirrors_parsing(monkeypatch):
+    from envd_service.runtime import oci_registry
+
+    monkeypatch.setenv(
+        "E2B_REGISTRY_MIRRORS",
+        "https://registry-1.docker.io/=docker.m.daocloud.io|docker.1ms.run,"
+        "gcr.io=mirror.gcr.io",
+    )
+    assert oci_registry.registry_mirrors() == {
+        "registry-1.docker.io": ["docker.m.daocloud.io", "docker.1ms.run"],
+        "gcr.io": ["mirror.gcr.io"],
+    }
+    assert oci_registry.registry_mirrors_for("registry-1.docker.io") == [
+        "docker.m.daocloud.io",
+        "docker.1ms.run",
+    ]
+    assert oci_registry.registry_mirrors_for("quay.io") == []
+
+
+def test_pull_prefers_the_mirror(monkeypatch):
+    import httpx
+
+    from envd_service.runtime import oci_registry
+
+    monkeypatch.setenv("E2B_REGISTRY_MIRRORS", "registry-1.docker.io=mirror.example")
+    fake, calls = _recorder([_RecordingResponse(body=json.dumps({"layers": []}).encode())])
+    monkeypatch.setattr(httpx, "request", fake)
+
+    client = oci_registry.RegistryClient(
+        parse_image_ref("python:3.11-slim"), timeout=5
+    )
+    client.manifest()
+    assert calls[0][0] == (
+        "https://mirror.example/v2/library/python/manifests/3.11-slim"
+    )
+
+
+def test_dead_mirror_falls_back_to_the_origin(monkeypatch):
+    import httpx
+
+    from envd_service.runtime import oci_registry
+
+    monkeypatch.setenv(
+        "E2B_REGISTRY_MIRRORS", "registry-1.docker.io=dead.example|also-dead.example"
+    )
+    fake, calls = _recorder(
+        [
+            httpx.ConnectError("no route"),
+            _RecordingResponse(429, b'{"errors":[{"code":"TOOMANYREQUESTS"}]}'),
+            _RecordingResponse(body=json.dumps({"layers": []}).encode()),
+        ]
+    )
+    monkeypatch.setattr(httpx, "request", fake)
+
+    client = oci_registry.RegistryClient(
+        parse_image_ref("python:3.11-slim"), timeout=5
+    )
+    assert client.manifest()[0] == {"layers": []}
+    assert [url.split("//", 1)[1].split("/")[0] for url, _ in calls] == [
+        "dead.example",
+        "also-dead.example",
+        "registry-1.docker.io",
+    ]
+
+
+def test_missing_tag_is_not_retried_against_the_origin(monkeypatch):
+    """A 404 is an answer, not an endpoint problem: no extra mirror round-trip."""
+    import httpx
+
+    from envd_service.runtime import oci_registry
+
+    monkeypatch.setenv("E2B_REGISTRY_MIRRORS", "registry-1.docker.io=mirror.example")
+    fake, calls = _recorder([_RecordingResponse(404, b"{}")])
+    monkeypatch.setattr(httpx, "request", fake)
+
+    client = oci_registry.RegistryClient(parse_image_ref("python:9.99"), timeout=5)
+    with pytest.raises(oci_registry.RegistryError, match="404"):
+        client.manifest()
+    assert len(calls) == 1
+
+
+def test_registry_credentials_stay_on_their_own_host(monkeypatch):
+    import httpx
+
+    from envd_service.runtime import oci_registry
+
+    monkeypatch.delenv("E2B_REGISTRY_MIRRORS", raising=False)
+    monkeypatch.setenv("E2B_IMAGE_REGISTRY", "acr.example.com/e2b")
+    fake, calls = _recorder(
+        [
+            # Docker Hub challenges; the ACR password must not be sent there.
+            _RecordingResponse(
+                401,
+                b"{}",
+                {"WWW-Authenticate": 'Bearer realm="https://token.example/token"'},
+            ),
+            _RecordingResponse(body=json.dumps({"layers": []}).encode()),
+        ]
+    )
+    monkeypatch.setattr(httpx, "request", fake)
+    token_calls: list[str] = []
+
+    def fake_get(url, **kwargs):
+        token_calls.append(url)
+        return _RecordingResponse(body=json.dumps({"token": "tok-1"}).encode())
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    client = oci_registry.RegistryClient(
+        parse_image_ref("python:3.11-slim"),
+        username="acr-user",
+        password="acr-secret",
+        timeout=5,
+    )
+    client.manifest()
+    assert client._username is None
+    assert len(token_calls) == 1
+    assert token_calls[0].startswith("https://token.example/token?")
+    assert "scope=repository%3Alibrary/python%3Apull" in token_calls[0]
+    assert "Authorization" not in calls[0][1]
+    assert calls[1][1]["Authorization"] == "Bearer tok-1"
+    assert all("acr-secret" not in json.dumps(headers) for _, headers in calls)
+
+    same_host = oci_registry.RegistryClient(
+        parse_image_ref("acr.example.com/e2b/tpl_1:latest"),
+        username="acr-user",
+        password="acr-secret",
+        timeout=5,
+    )
+    assert same_host._username == "acr-user"
