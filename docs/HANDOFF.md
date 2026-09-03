@@ -524,6 +524,13 @@ E2B_CREATE_QUEUE_MAX             100   # 并发排队上限；满 → 429 + retr
   两类出路，需要产品决策：(a) 按文档要求给可认证 registry（ACR，现成路径）;
   (b) 让解析器在 registry 不可用/限流时回落到“上次成功的 digest”（写一个
   `<image>.digest` 侧车），代价是限流期间感知不到 tag 更新。本轮没有改这个策略。
+- **已决策：每沙箱一个 sandlock 实例**（fork 文档 §7，取代共享资源组 P10），用来根除 §3.8 的配额
+  超卖。改造实质是 Policy/Instance/Child 三层拆分（不是删一个 guard）：现状每次 create 都新建
+  Sandbox+runtime、运行时状态是单槽（`child_pid`/`leader_pid`/三个 stdio 端）、
+  `Process<'a>` 借 `&mut Sandbox` ⇒ 结构上只能一个活子进程、`ResourceState` 在 `do_create_stdio`
+  里 new、控制目录靠 `kill(pid,0)` 判活。问题清单 Q1–Q15、里程碑 M0–M4 与验收标准见
+  `third_party/sandlock/docs/e2b-integration.md` §7；E2B 侧接线记 backlog **E10**。
+  **回归风险最大的是 Q10**：`max_processes` 从"每命令 64"变成"整箱 64"，必须同步调默认值。
 - **T3** 复现并修 `SnapshotRegistry.expand_to` 的快照自嵌套
   （`snapshots/snap_X/fs/snapshots/snap_X/fs/...`，见证据目录
   `tmp/stale-20260902/`）；当前无用例覆盖这条路径。
