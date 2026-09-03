@@ -68,6 +68,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | T4 | net_isolation + 镜像 rootfs(chroot) 形态下 MCP 入站端口映射起不来（纯 sandlock 形态 3/3 通过） | ⬜ 新发现，已用 strict xfail 跟踪 | — |
 | T5 | chroot 形态共享卷写入经 supervisor 归属（fs_denied 代打开路径），per-uid 卷保护无法成立 | ⬜ 即上游 **SL-1**（notif 代执行未切 caller 身份），本仓库 strict xfail 跟踪；正文见 `third_party/sandlock/docs/e2b-integration.md` §3.1 | — |
 | T1 | 真实 XFS/ext4 目标机上复测沙箱文件属主：① 沙箱能否 `chmod` 自己写的文件（本机 EPERM）；② 共享卷 1777+sticky 的跨 uid 保护是否真生效（本机 A 写的文件宿主属主是 uid 0，而沙箱 host_uid 是 20000） | ⬜ 待环境（两条用例已改为带证据跳过，不再靠巧合通过） | — |
+| T6 | **内存/CPU/进程配额按实例而非按沙箱 ⇒ 并发命令超卖（实测 3×200M 在 512M 沙箱内全成功），并放大为节点超卖** | ⬜ 待决策：fork 侧共享资源组（上游 P10）或 E2B 侧 per-sandbox cgroup 兜底 | — |
 | T2 | `third_party/sandlock`：`_HANDLED_FIELDS` 登记 `notify_rate_limit`，消掉假告警 | ⬜ 待做（一行） | — |
 | T3 | 复现并修 `SnapshotRegistry.expand_to` 快照自嵌套（`snap_X/fs/snap_X/fs/...`） | ⬜ 新发现，无用例覆盖 | — |
 

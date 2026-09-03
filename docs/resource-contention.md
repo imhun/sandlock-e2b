@@ -220,6 +220,18 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after�
 - **创建期驱逐只处理“容量不足”失败**：镜像预热失败 / 428 / 其他非容量错误
   不会触发驱逐，行为与接入驱逐前一致。
 
+- **配额按 sandlock 实例记账，不是按沙箱 ⇒ 并发命令可超卖**：`max_memory` / `max_processes` /
+  `max_cpu` 由 sandlock 在每个实例的运行时状态里核算（`brk`/`mmap` 的 USER_NOTIF 记账），而 E2B
+  是"每条命令一个实例"，于是同一沙箱 K 个并发命令各拿一份配额。实测 `max_memory=512M` 时
+  单实例申请 600M 被拒，但 3 个并发实例各占 200M 全部成功（峰值 600M）。K≥2 是常态：
+  `Sandbox.create(mcp=...)` 的网关是长驻实例，`background=True` 的命令也各持实例。
+  本文件的节点台账仍按沙箱预留一次 `memory_mb`（`_record_quota_dims`），所以这会直接变成
+  **节点超卖**：实际 RSS 早于准入判定冲破节点，OOM 由驱逐/扩缩信号之外的路径发生。
+  磁盘不受影响（XFS project id 按沙箱目录设置、被所有实例共享，限额是真加总）。
+  修法二选一：fork 提供跨实例共享资源组（`e2b-integration.md` §3.8 / 提案 P10），或
+  E2B 侧给每个沙箱建一个 cgroup v2 并把每次命令的子进程放进去（需要 worker 有 cgroup 写权限）。
+
+
 ## 9. 排期
 
 资源管理层增强，优先级低于安全修复（E1）与磁盘配额（E2）。排期见
