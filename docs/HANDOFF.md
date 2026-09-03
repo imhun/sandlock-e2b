@@ -677,7 +677,7 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
    `skipped: 用了 block 但找不到 project 目录`；补 `e2fsprogs` 并让缺失时打 WARN，
    生产节点要求也写进 `docs/production-deployment-requirements.md`。
 3. **SL-1（上游 sandlock 问题，已完整记录）：路径中介以 supervisor 身份执行系统调用**。
-   启用 `fs_denied`／chroot／COW 任一路径中介时，fork 通过 `SECCOMP_RET_USER_NOTIF` 把
+   启用路径中介时（实测：`fs_denied` 非空或 chroot；源码另含 COW 一组），fork 通过 `SECCOMP_RET_USER_NOTIF` 把
    `openat/unlinkat/mkdirat/renameat2/fchmodat/fchownat/utimensat/...` 交给 supervisor
    代执行，而 `seccomp/notif.rs` 里没有 `setfsuid/seteuid`——于是沙箱自己创建的文件属主是
    uid 0、请求的 mode 不生效，`unlinkat/renameat2` 也按 root 判定，共享目录上的 per-uid

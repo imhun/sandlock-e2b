@@ -16,7 +16,7 @@
 
 ### 结论
 
-当策略启用**路径中介**（`fs_denied` 非空，或 chroot/镜像 rootfs，或默认的 COW 分支）时，
+当策略启用**路径中介**时（实测触发条件：`fs_denied` 非空、或 chroot/镜像 rootfs；源码里还有第三组 `cow_path_syscalls()`，对应 COW 分支，本文未单独验证其触发条件），
 fork 会用 seccomp `SECCOMP_RET_USER_NOTIF` 把一批文件系统调用交给 supervisor 代执行：
 
 ```text
