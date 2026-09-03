@@ -8,6 +8,11 @@
 
 > 📄 **集成事实源已下沉到 fork 仓库**：`third_party/sandlock/docs/e2b-integration.md`
 > （已落地方案 R*/S*/E*/M*、待实施 P1–P8、未解决 SL-1/T4/T5、缓解与验证矩阵）。
+> E2B 为 sandlock 写的方案文档也已迁入该仓库 `docs/`（原文件名不变）：
+> `sandlock-network-wildcard.md`（R1–R14 总纲，已落地）、
+> `netns-isolation-fd-injection.md`（loopback netns + fd 注入，落地为 S1.1/S2.x）、
+> `sandbox-level-cow.md`（**已否决**，最终走 XFS prjquota）、
+> `upstream-pr-netns-free.md`（无特权上游 PR 范围与推送状态）。
 > 本文件保留 E2B 侧上下文与命令，条目细节以上述文档为准；
 > E2B 仓库的 `docs/sandlock-upstream-issues.md` 只剩编号映射。
 
@@ -38,7 +43,7 @@ origin=fork，upstream=multikernel）。**运行时基线：`upstream-pr/netns-f
   `55709f2`（Block C）+ `b6ef050`（非 root 测试入口），基 `f6a3e39`，
   无 netns/veth；**同时是项目运行时 wheel 的构建基线**）；**未推送**——
   当前 `GITHUB_TOKEN` 只读（push/API 写均 403），需换写权限 token 或
-  手动推送，见 `docs/upstream-pr-netns-free.md`。
+  手动推送，见 `third_party/sandlock/docs/upstream-pr-netns-free.md`。
 - **M6 cp314 双架构完成 + 运行时统一 3.14**：`wheels/fork/` 现有 cp314
   x86_64 + aarch64 wheel（版本 0.9.0-beta，`manylinux_2_34` 标签；
   `deploy/scripts/build-sandlock-wheels.sh`，一个 amd64 manylinux builder 内用
@@ -206,7 +211,7 @@ fork 分支 `feature/network-inject`（基于 feature/network-netns）：
    CLONE_NEWNET），保留无特权 loopback DNS gateway + 虚拟 eth0 +
    wildcard/UDP + Block B + Block C；lib 761、integration 428、Python 412。
    已推送 `origin/upstream-pr/netns-free-clean`（tip `53a8ee2`）；PR 文案见
-   `docs/upstream-pr-netns-free.md`。
+   `third_party/sandlock/docs/upstream-pr-netns-free.md`。
 
 ## 本会话已完成（Block A 第一阶段 — sandlock fork：通配域名规则）
 
@@ -714,7 +719,7 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
 | 分组 | 数量 | 为什么跳 | 怎么跑起来 |
 |---|---|---|---|
 | XFS project quota（`test_xfs_project_quota.py` / `test_volume_quota.py`） | 10 | 需要 `E2B_XFS_QUOTA_INTEGRATION=1` **且**工作目录在带 `prjquota` 的真实 XFS 上；容器根是 overlay，镜像里也没有 `xfs_quota`（日志里 `FileNotFoundError: 'xfs_quota'`） | 测试镜像装 `xfsprogs`，容器里 losetup 一个 XFS+prjquota 挂到 `/var/lib/e2b-sandboxes`（`docs/sandbox-disk-quota.md §4` 有步骤），再加 `-e E2B_XFS_QUOTA_INTEGRATION=1`；生产上就是运维项 O1 |
-| netns 隔离形态（`test_mcp_netns.py`） | 3 | 显式门控：`E2B_TEST_NET_ISOLATION=1` + worker 侧 `E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true`（默认关，因为运行时基线是无 netns 的无特权形态） | 按 `docs/netns-isolation-fd-injection.md` 的那套开关跑一遍专用作业 |
+| netns 隔离形态（`test_mcp_netns.py`） | 3 | 显式门控：`E2B_TEST_NET_ISOLATION=1` + worker 侧 `E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true`（默认关，因为运行时基线是无 netns 的无特权形态） | 按 `third_party/sandlock/docs/netns-isolation-fd-injection.md` 的那套开关跑一遍专用作业 |
 | 沙箱文件属主（T1 的两条：`test_sandlock_isolation::test_user_cli_install...`、`test_uid_permissions::test_volume_shared_rw...`） | 2 | 实测本机 overlayfs 上沙箱写的文件宿主属主是 uid 0（沙箱 host_uid 是 20000），于是 ① 沙箱 `chmod` 自己文件 EPERM，② 共享卷 1777+sticky 的跨 uid 保护无法成立。两条都改成"先量再断言"，不匹配带证据跳过 | 真实 XFS/ext4 目标机复测（O1/T1）；若 chroot 形态仍落 root 属主，则是 fork 的写入身份问题 |
 | 需要 OCI 形态（`test_fork_network_features`、`test_template_isolation`） | 2 | 只有设了 `E2B_BASE_IMAGE`（镜像 rootfs 沙箱）才有意义 | 已在带 `E2B_BASE_IMAGE=python:3.11-slim` 的那次全量里执行（所以那一轮是 16 skip） |
 | JS SDK（`tests/sdk/js`） | 1 | 测试镜像里没有 npm | 本机 macOS 全量里跑（`812 passed`）；或镜像装 `nodejs`/`npm` 后在容器里跑 |
@@ -829,6 +834,7 @@ cargo test -p sandlock-core --offline --test integration test_netns -- --test-th
 | `E2B_IMAGE_CACHE_DIR/_oci/` | 无 registry 时本地构建的 OCI layout tar + `.link` 侧车（resolver 优先读它） |
 | `third_party/sandlock/docs/e2b-integration.md` | sandlock 侧唯一事实源：已落地方案 / 待实施 P1–P8 / 未解决 SL-1、T4、T5 / 验证矩阵（fork `upstream-pr/netns-free-clean`，文档提交 `afe4921`） |
 | `docs/sandlock-upstream-issues.md` | 编号映射索引（内容以上述 fork 文档为准） |
+| `third_party/sandlock/docs/{e2b-integration,sandlock-network-wildcard,netns-isolation-fd-injection,sandbox-level-cow,upstream-pr-netns-free}.md` | sandlock 侧全部方案与问题文档（E2B 撰写的部分已迁入 fork 仓库） |
 | `envd_service/gateway.py` | 路由缓存 + `/internal/routes/{id}/invalidate` |
 | `gateway_common/network.py` | network 校验/规范化 + sandlock 策略映射 |
 | `envd_service/executors/sandlock.py` | network→net_allow/net_deny/http_allow + 每沙箱 CA 注入 |

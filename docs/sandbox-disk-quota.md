@@ -164,4 +164,4 @@ mount -t xfs -o prjquota /dev/loop0 /var/lib/e2b-sandboxes
 ## 7. 相关文档
 
 - 生产部署要求：[production-deployment-requirements.md](production-deployment-requirements.md)
-- COW 评估记录（已否决）：[sandbox-level-cow.md](sandbox-level-cow.md)
+- COW 评估记录（已否决）：[third_party/sandlock/docs/sandbox-level-cow.md](../third_party/sandlock/docs/sandbox-level-cow.md)

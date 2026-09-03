@@ -19,3 +19,12 @@
 E2B 侧对应的跟踪条目在 [`task-backlog.md`](task-backlog.md)（`SL-1`、`T1`、`T4`、`T5`）与
 [`HANDOFF.md`](HANDOFF.md)「09-03（续）」小节；修好后由 `xfail(strict=True)` 的 XPASS
 提醒摘除标记（`tests/contract/test_uid_permissions.py`、`tests/contract/test_mcp_netns.py`）。
+
+## 已迁出的 sandlock 方案文档（现在 fork 仓库 `docs/`）
+
+| 文档 | 内容 | 状态 |
+|---|---|---|
+| [`sandlock-network-wildcard.md`](../third_party/sandlock/docs/sandlock-network-wildcard.md) | E2B Network API 能力对齐总纲（R1–R14） | ✅ 已落地 |
+| [`netns-isolation-fd-injection.md`](../third_party/sandlock/docs/netns-isolation-fd-injection.md) | loopback netns + supervisor fd 注入（ADDFD 无特权 PoC） | ✅ 落地为 S1.1/S2.x；netns 已移出运行时基线 |
+| [`sandbox-level-cow.md`](../third_party/sandlock/docs/sandbox-level-cow.md) | 沙箱级 COW（常驻 supervisor）路线评估 | ❌ 已否决，改用 [`sandbox-disk-quota.md`](sandbox-disk-quota.md) |
+| [`upstream-pr-netns-free.md`](../third_party/sandlock/docs/upstream-pr-netns-free.md) | 无特权上游 PR 范围/分支/推送状态 | ⏸ 推送受 token 权限阻塞 |

@@ -178,7 +178,7 @@ cargo test --workspace --offline
 
 ## S2. per-sandbox 网络隔离（方案 1：loopback netns + fd 注入）
 
-**方案文档:** `docs/netns-isolation-fd-injection.md`（PoC 已验证 ADDFD 无特权可行，注入 fd RTT 0.006ms / ~14Gbps）
+**方案文档:** `third_party/sandlock/docs/netns-isolation-fd-injection.md`（PoC 已验证 ADDFD 无特权可行，注入 fd RTT 0.006ms / ~14Gbps）
 
 ### Task S2.1: connect handler ADDFD 注入改造
 
@@ -296,7 +296,7 @@ cargo test --workspace --offline
 
 ### Task S3.3: 上游 PR 分支整理与文案（推送暂缓）
 
-**Files:** `docs/upstream-pr-netns-free.md`（更新 tip commit：含 S1/S2 可选，或保持 PR 范围不变仅记录）
+**Files:** `third_party/sandlock/docs/upstream-pr-netns-free.md`（更新 tip commit：含 S1/S2 可选，或保持 PR 范围不变仅记录）
 
 **验证:** 分支 `upstream-pr/netns-free-clean` 与 PR 文案一致；`git status` 干净
 **依赖:** S2.6
