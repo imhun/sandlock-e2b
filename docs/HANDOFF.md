@@ -641,6 +641,8 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
   - OCI rootfs 形态（`E2B_BASE_IMAGE=python:3.11-slim`）：从 `73 failed / 28 errors`
     变成 `852 passed / 17 skipped / 0 failed / 0 error`
     （`tmp/session-scratch/fin-B-oci.log`）。
+  - macOS 全量（unit+contract+sdk python/js+security）：`812 passed / 53 skipped /
+    0 failed`（不依赖 Docker Hub：本机用 local executor，镜像解析用例跳过）。
 
 ## 验证命令与基线
 
