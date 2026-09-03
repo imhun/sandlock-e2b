@@ -570,6 +570,7 @@ async def agent_image_warm_peek(image: str, request: Request) -> Response:
             settings.image_cache_dir,
             registry_username=settings.image_registry_username,
             registry_password=settings.image_registry_password,
+            credential_host=settings.image_registry_host,
         )
     )
 
@@ -591,6 +592,7 @@ async def agent_image_warm_now(image: str, request: Request) -> Response:
             settings.image_cache_dir,
             registry_username=settings.image_registry_username,
             registry_password=settings.image_registry_password,
+            credential_host=settings.image_registry_host,
         )
     except Exception as e:
         logger.warning("agent warm failed for %s: %s", image, e)

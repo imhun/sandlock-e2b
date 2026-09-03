@@ -601,11 +601,17 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
   拒（`token exchange failed: 401 incorrect username or password`，09-02 OCI
   复跑里出现过），也把凭据发给了第三方 host。现在只有 `E2B_IMAGE_REGISTRY`
   的 host 与镜像 host 一致时才带（`registry_credential_host()`）。
-- **overlayfs 上沙箱改不了自己文件的权限**：Docker 容器存储（OrbStack/Desktop 的
-  overlayfs）里，沙箱新建文件的属主是挂载属主，沙箱内 `chmod`/`touch` 返回 EPERM ⇒
-  `pip install` 这类流程在该存储上不可用。受影响的
-  `test_user_cli_install_within_workspace_persists` 改为**带证据跳过**（skip 原因里带着
-  实测 stderr），需要在真实 XFS/ext4 目标机复测（与运维项 O1 一起做）。
+- **overlayfs 上"沙箱自己写的文件"归属不对**（T1，现在有两种实测表现，都要在真实
+  XFS/ext4 目标机上复测）：
+  1. 沙箱内对自己刚写的文件 `chmod`/`touch` 返回 EPERM（宿主侧看该文件属主是 root，
+     而沙箱 host uid 是池内 uid）⇒ `pip install` 这类流程在本机不可用；受影响用例
+     `test_user_cli_install_within_workspace_persists` 带证据跳过。
+  2. 共享卷的 **1777 + sticky"他人不可删"保护在本机测不出来**：
+     `test_volume_shared_rw_across_distinct_uids` 现在会先量一下 A 写入文件的真实宿主
+     属主（实测 uid 0，而 A 的 host_uid 是 20000），不匹配就带原因跳过——原先这条
+     断言"通过"其实是在一个未被施加的身份上碰巧成立。要点：这不是测试能修的问题，
+     要么目标机复测确认，要么确认 fork 的 chroot/on-behalf 写路径是否以 supervisor
+     身份落盘（若是，属 fork 侧隔离语义问题）。
 - **fork 侧假告警**：`Policy field 'notify_rate_limit' is set but not wired through FFI`
   仍在（`_NativePolicy._HANDLED_FIELDS` 漏登记，一行修复，属 `third_party/sandlock`）。
   顺带核实：当前 `wheels/fork` 的 `.so` **确实导出**了
@@ -615,6 +621,26 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
   出现同一快照自嵌套，路径长到 `ENAMETOOLONG`（`SnapshotRegistry.expand_to` 会把快照存储
   复制进快照自身）。本轮没有用例失败，只在这份被移走的旧 scratch 里发现；证据保留在
   `tmp/stale-20260902/`（5.0G，确认无用即可删）。
+
+### 09-03：公共镜像改走国内镜像源，两种形态全量复跑
+
+- 解析器新增 `E2B_REGISTRY_MIRRORS`（`host=mirrorA|mirrorB,...`）：镜像**身份**仍是
+  `registry-1.docker.io/library/python`，但按端点依次拨号（mirror 优先、origin 最后
+  兜底），token 每个端点重新换发（各 mirror 有自己的 realm），404 视为答案而非端点
+  故障（不重复重试）。实测 `docker.m.daocloud.io` 与 `docker.1ms.run` 对
+  `python:3.11-slim` 返回的 platform digest 与 Docker Hub 完全一致
+  （`sha256:d10533…`），测试镜像默认带上这两个源。
+- 凭据作用域：`E2B_IMAGE_REGISTRY_USERNAME/PASSWORD` 之前解析**任意**镜像都会带上，
+  既被公共源拒（`401 incorrect username or password` / `403 DENIED`），也把部署凭据
+  发给无关 host。现在按调用方 Settings 的 `image_registry_host` 精确匹配；worker 的
+  `EnvdSettings` 和生产 compose 的 worker 环境变量都补齐了 `E2B_IMAGE_REGISTRY`
+  （否则 worker 无从知道凭据属于哪个 host）。
+- 复跑（镜像源生效后，配额不再是变量）：
+  - 默认形态（不带 `E2B_BASE_IMAGE`）：`850 passed / 19 skipped / 0 failed / 0 error`
+    （`tmp/session-scratch/fin-A-default.log`）；
+  - OCI rootfs 形态（`E2B_BASE_IMAGE=python:3.11-slim`）：从 `73 failed / 28 errors`
+    变成 `852 passed / 17 skipped / 0 failed / 0 error`
+    （`tmp/session-scratch/fin-B-oci.log`）。
 
 ## 验证命令与基线
 

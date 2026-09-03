@@ -74,6 +74,7 @@ def create_executor(
                     settings.image_cache_dir,
                     registry_username=settings.image_registry_username,
                     registry_password=settings.image_registry_password,
+                    credential_host=settings.image_registry_host,
                 )
             return SandlockExecutor(
                 workspace_dir=workspace_dir,

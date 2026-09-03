@@ -204,6 +204,7 @@ async def _image_warm(request, node, base_image, settings) -> bool:
             settings.image_cache_dir,
             registry_username=settings.image_registry_username,
             registry_password=settings.image_registry_password,
+            credential_host=settings.image_registry_host,
         )
         return bool(state.get("cached"))
     import httpx
@@ -243,6 +244,7 @@ async def _warm_node(request, node, base_image, settings) -> None:
             settings.image_cache_dir,
             registry_username=settings.image_registry_username,
             registry_password=settings.image_registry_password,
+            credential_host=settings.image_registry_host,
         )
         return
     import httpx

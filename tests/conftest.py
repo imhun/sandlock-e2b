@@ -34,6 +34,11 @@ TMP_ROOT = Path(
     )
 )
 
+# Harness workspaces and shared volume roots live under TMP_ROOT as well, so a
+# Docker runner puts them on container-native storage too: on the virtiofs bind
+# mount of the repo, chown is a no-op, which silently voids every uid-ownership
+# assertion (shared volume slices across distinct sandbox uids, for one).
+
 
 # --- hermetic test network -------------------------------------------------
 # ``httpx`` (and ``urllib``) fall back to the *system* proxy on macOS and to
@@ -102,6 +107,7 @@ def _warm_local_template_images(settings: ControlSettings) -> None:
             settings.image_cache_dir,
             registry_username=settings.image_registry_username,
             registry_password=settings.image_registry_password,
+            credential_host=settings.image_registry_host,
         )
 
 
@@ -321,7 +327,7 @@ def live_servers(buildkitd):
         # E2B_API_KEY / E2B_INTERNAL_API_KEY come from the environment.
         yield {"api_url": url, "sandbox_url": url}
         return
-    sdk_workspace = _fresh_dir(PROJECT_ROOT / "tmp" / "sdk-workspace")
+    sdk_workspace = _fresh_dir(TMP_ROOT / "sdk-workspace")
     runtime_registry = RuntimeRegistry(sdk_workspace)
     control_port = _free_port()
     envd_port = _free_port()
@@ -388,7 +394,7 @@ def live_servers(buildkitd):
 def multinode_servers(buildkitd):
     """Real control plane + one remote worker + envd gateway."""
     harness = _start_multinode(
-        PROJECT_ROOT / "tmp" / "multinode", 1, buildkit_addr=buildkitd
+        TMP_ROOT / "multinode", 1, buildkit_addr=buildkitd
     )
     yield {
         "api_url": harness["api_url"],
@@ -478,6 +484,10 @@ def _start_multinode(
                     # are enforced (default off denies all egress).
                     enable_network=True,
                     shared_volume_root=str(shared_volumes),
+                    # The worker needs the registry host too: the pull
+                    # credentials are scoped to it (public images stay
+                    # anonymous).
+                    image_registry=image_registry,
                     image_registry_username=image_registry_username,
                     image_registry_password=image_registry_password,
                     **envd_extra,
@@ -569,7 +579,7 @@ def _warm_worker_base_image(
 def multinode_two_workers(buildkitd):
     """Real control plane + two remote workers + envd gateway."""
     harness = _start_multinode(
-        PROJECT_ROOT / "tmp" / "multinode-two",
+        TMP_ROOT / "multinode-two",
         2,
         buildkit_addr=buildkitd,
         warm_base_image=True,
@@ -582,7 +592,7 @@ def multinode_two_workers(buildkitd):
 def multinode_shared_workspace(buildkitd):
     """Two workers sharing one E2B_WORKSPACE_BASE (NFS-style shared storage)."""
     harness = _start_multinode(
-        PROJECT_ROOT / "tmp" / "multinode-shared",
+        TMP_ROOT / "multinode-shared",
         2,
         shared_workspace=True,
         buildkit_addr=buildkitd,
@@ -727,7 +737,7 @@ def _start_live_servers(
     buildkit_addr: str | None = None,
 ) -> dict:
     """Real control plane + envd servers for registry template builds."""
-    workspace = _fresh_dir(PROJECT_ROOT / "tmp" / name)
+    workspace = _fresh_dir(TMP_ROOT / name)
     runtime_registry = RuntimeRegistry(workspace)
     control_port = _free_port()
     envd_port = _free_port()
@@ -804,7 +814,7 @@ def live_servers_registry_auth(buildkitd, authenticated_registry):
 def multinode_servers_registry(buildkitd, image_registry_url):
     """Single worker + control plane that pushes templates to a registry."""
     harness = _start_multinode(
-        PROJECT_ROOT / "tmp" / "multinode-registry",
+        TMP_ROOT / "multinode-registry",
         1,
         image_registry=image_registry_url,
         buildkit_addr=buildkitd,
@@ -823,7 +833,7 @@ def multinode_servers_registry(buildkitd, image_registry_url):
 def multinode_servers_registry_auth(buildkitd, authenticated_registry):
     """Single worker + control plane pushing to an authenticated registry."""
     harness = _start_multinode(
-        PROJECT_ROOT / "tmp" / "multinode-registry-auth",
+        TMP_ROOT / "multinode-registry-auth",
         1,
         image_registry=authenticated_registry["url"],
         image_registry_username=authenticated_registry["username"],

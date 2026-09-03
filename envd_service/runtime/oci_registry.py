@@ -180,9 +180,14 @@ class RegistryClient:
         password: str | None = None,
         scheme: str | None = None,
         timeout: float = 30.0,
+        credential_host: str | None = None,
     ) -> None:
         self._ref = ref
-        creds_host = registry_credential_host()
+        # None means "not stated by the caller": fall back to the configured
+        # E2B_IMAGE_REGISTRY host so env-only deployments are still scoped.
+        creds_host = (
+            registry_credential_host() if credential_host is None else credential_host
+        )
         if username and creds_host and _normalize_endpoint(ref.host) != creds_host:
             logger.debug(
                 "registry credentials are for %s, not %s: pulling anonymously",

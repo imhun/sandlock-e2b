@@ -64,6 +64,7 @@ def _client_for(
     registry_username: str | None,
     registry_password: str | None,
     scheme: str | None = None,
+    credential_host: str | None = None,
 ) -> tuple[ImageRef, RegistryClient]:
     ref = parse_image_ref(image)
     client = RegistryClient(
@@ -71,6 +72,7 @@ def _client_for(
         username=registry_username,
         password=registry_password,
         scheme=scheme,
+        credential_host=credential_host,
     )
     return ref, client
 
@@ -103,11 +105,12 @@ def _platform_digest(
     registry_username: str | None,
     registry_password: str | None,
     scheme: str | None = None,
+    credential_host: str | None = None,
 ) -> str:
     ttl = _manifest_ttl_s()
     # Credentials and scheme are part of the key: re-authenticating or
     # switching registry endpoint must not be answered from the old lookup.
-    key = f"{image}|{scheme or ''}|{registry_username or ''}"
+    key = f"{image}|{scheme or ''}|{registry_username or ''}|{credential_host or ''}"
     now = time.monotonic()
     if ttl > 0:
         with _DIGEST_CACHE_LOCK:
@@ -119,6 +122,7 @@ def _platform_digest(
         registry_username=registry_username,
         registry_password=registry_password,
         scheme=scheme,
+        credential_host=credential_host,
     )
     _manifest, digest = fetch_platform_manifest(client)
     if ttl > 0:
@@ -246,6 +250,7 @@ def peek_image_warm(
     registry_username: str | None = None,
     registry_password: str | None = None,
     scheme: str | None = None,
+    credential_host: str | None = None,
 ) -> dict[str, object]:
     """Return ``{"cached": bool, "digest": str | None}`` without extracting.
 
@@ -267,6 +272,7 @@ def peek_image_warm(
             registry_username=registry_username,
             registry_password=registry_password,
             scheme=scheme,
+            credential_host=credential_host,
         )
         rootfs = _cache_rootfs(Path(cache_dir), image, digest)
         return {"cached": (rootfs / ".complete").is_file(), "digest": digest}
@@ -282,6 +288,7 @@ def resolve_image_rootfs(
     registry_username: str | None = None,
     registry_password: str | None = None,
     scheme: str | None = None,
+    credential_host: str | None = None,
 ) -> Path:
     """Return the extracted rootfs path for ``image``, creating it if needed."""
     if not image:
@@ -299,6 +306,7 @@ def resolve_image_rootfs(
         registry_username=registry_username,
         registry_password=registry_password,
         scheme=scheme,
+        credential_host=credential_host,
     )
     try:
         manifest, digest = fetch_platform_manifest(client)

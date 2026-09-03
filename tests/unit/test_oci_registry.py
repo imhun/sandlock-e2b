@@ -540,3 +540,29 @@ def test_registry_credentials_stay_on_their_own_host(monkeypatch):
         timeout=5,
     )
     assert same_host._username == "acr-user"
+
+
+def test_explicit_credential_host_overrides_the_environment(monkeypatch):
+    """Callers pass the host their own Settings name (fixtures, not env)."""
+    from envd_service.runtime import oci_registry
+
+    monkeypatch.delenv("E2B_IMAGE_REGISTRY", raising=False)
+    ref = parse_image_ref("127.0.0.1:5000/tpl_1:latest")
+    matched = oci_registry.RegistryClient(
+        ref,
+        username="u",
+        password="p",
+        credential_host="127.0.0.1:5000",
+        timeout=5,
+    )
+    assert matched._username == "u"
+
+    other = oci_registry.RegistryClient(
+        ref,
+        username="u",
+        password="p",
+        credential_host="registry.example.com",
+        timeout=5,
+    )
+    assert other._username is None
+    assert other._password is None

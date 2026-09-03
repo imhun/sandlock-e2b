@@ -105,6 +105,11 @@ services:
       E2B_ENABLE_NETNS: ${E2B_ENABLE_NETNS:-false}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # The registry host belongs to the pull credentials above: the worker
+      # only sends them when the image it resolves lives on that host, so a
+      # public base image is pulled anonymously instead of leaking the
+      # credential (and being rejected for it).
+      E2B_IMAGE_REGISTRY: ${E2B_IMAGE_REGISTRY:-}
       E2B_IMAGE_REGISTRY_USERNAME: ${E2B_IMAGE_REGISTRY_USERNAME:-}
       E2B_IMAGE_REGISTRY_PASSWORD: ${E2B_IMAGE_REGISTRY_PASSWORD:-}
       E2B_NODE_MEMORY_MB: ${E2B_NODE_MEMORY_MB:-2048}

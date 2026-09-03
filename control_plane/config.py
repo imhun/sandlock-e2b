@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from gateway_common.env import registry_host
 from gateway_common.env import (
     _env_bool,
     _env_int,
@@ -236,6 +237,17 @@ class Settings:
     image_registry_password: str | None = field(
         default_factory=lambda: os.getenv("E2B_IMAGE_REGISTRY_PASSWORD")
     )
+    # Pull credentials belong to one registry host; public images are pulled
+    # anonymously (see ``oci_registry.RegistryClient``). The worker needs the
+    # host too, not just the user/password pair.
+    image_registry: str | None = field(
+        default_factory=lambda: os.getenv("E2B_IMAGE_REGISTRY")
+    )
+
+    @property
+    def image_registry_host(self) -> str | None:
+        """Host the ``image_registry_*`` credentials are meant for."""
+        return registry_host(self.image_registry)
     shared_volume_root: str | None = field(
         default_factory=lambda: os.getenv("E2B_SHARED_VOLUME_ROOT")
     )

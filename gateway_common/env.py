@@ -64,3 +64,15 @@ _env_float = env_float
 _env_list = env_list
 _env_json_dict = env_json_dict
 _env_json = env_json
+
+
+def registry_host(image_registry: str | None) -> str | None:
+    """Host part of an ``E2B_IMAGE_REGISTRY`` value (``host[:port][/ns]``).
+
+    The registry credentials are configured for this host only, and the same
+    value also tells the resolver which host they must never be sent to.
+    """
+    raw = (image_registry or "").strip()
+    if not raw:
+        return None
+    return raw.split("/")[0].strip().lower()
