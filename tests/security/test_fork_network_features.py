@@ -127,12 +127,21 @@ def loopback_alias():
         ["ip", "addr", "add", f"{addr}/32", "dev", "lo"],
         check=False,
         capture_output=True,
+        text=True,
     )
-    if add.returncode != 0:
+    # "Address already assigned" means the address is on lo and usable (a
+    # shared-VM netns usually keeps it from an earlier session). Reporting that
+    # as "no NET_ADMIN" skipped a test that could really run.
+    detail = (add.stderr or add.stdout or "").strip()
+    already_there = add.returncode != 0 and (
+        "already assigned" in detail.lower() or "file exists" in detail.lower()
+    )
+    if add.returncode != 0 and not already_there:
         pytest.skip(
-            "wildcard local-origin fixture needs NET_ADMIN "
-            "(run with --cap-add NET_ADMIN)"
+            f"cannot put {addr}/32 on lo (needs NET_ADMIN, run with "
+            f"--cap-add NET_ADMIN): {detail[:160]}"
         )
+    added_by_us = add.returncode == 0
     hosts_line = f"{addr} {hostname}\n"
     with open("/etc/hosts", "a", encoding="utf-8") as f:
         f.write(hosts_line)
@@ -146,11 +155,12 @@ def loopback_alias():
                 f.writelines(lines)
         except OSError:
             pass
-        subprocess.run(
-            ["ip", "addr", "del", f"{addr}/32", "dev", "lo"],
-            check=False,
-            capture_output=True,
-        )
+        if added_by_us:
+            subprocess.run(
+                ["ip", "addr", "del", f"{addr}/32", "dev", "lo"],
+                check=False,
+                capture_output=True,
+            )
 
 
 @pytest.mark.usefixtures("require_sandlock")
