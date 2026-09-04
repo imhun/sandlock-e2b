@@ -59,7 +59,7 @@ sandbox.kill()
 | L1 单元 + L2 契约 | `pytest tests/unit tests/contract` | macOS / Ubuntu |
 | L3 Python SDK | `pytest tests/sdk/python` | Linux test runner（Sandlock）；macOS 可用 Local 执行器跑通协议 |
 | L3 JS SDK | `pytest tests/sdk/js`（内部 `npm test`） | macOS / Linux；首次需 `cd tests/sdk/js && npm install` |
-| L4 安全 | `E2B_BASE_IMAGE=python:3.14-slim pytest tests/security` | Linux 6.12+ + Docker daemon |
+| L4 安全 | `E2B_BASE_IMAGE=python:3.14-slim pytest tests/security` | 容器运行时 VM 需 Landlock ABI ≥6（内核 6.12+）+ Docker daemon |
 | L5 性能 | `E2B_BASE_IMAGE=python:3.14-slim pytest tests/perf --perf` | Linux + Docker；profile 写入 `tmp/perf/` |
 
 本地直连远程部署实例跑 SDK 测试（无需起本地服务）：见
@@ -91,10 +91,23 @@ docker run --rm --security-opt seccomp=unconfined --cap-add NET_ADMIN --network 
 `E2B_HOST_PROJECT` 让容器内执行的 docker CLI 能拿到宿主侧的项目路径
 （用于给带认证的 registry 挂载 htpasswd 文件）。
 
-启动前必须确认 test runner 内 `sandlock.landlock_abi_version() >= 6`；macOS
-Docker Desktop 的 Linux VM 内核不满足时，不得将本机作为 Sandlock 验收环境。
-macOS 本机只运行不依赖 Sandlock 的单元/契约测试，SDK 测试在 Local 执行器下
-验证协议兼容性（隔离能力在 Linux 上验收）。
+验收环境只看**容器运行时 VM 的内核**，不看宿主是 macOS 还是 Linux：
+
+```bash
+docker run --rm --security-opt seccomp=unconfined e2b-sandlock-test:latest \
+  python3 -c "import sandlock; print(sandlock.landlock_abi_version())"   # 必须 >= 6
+```
+
+- **>= 6 即可以此为 Sandlock 验收环境**（ABI v6 对应内核 6.12+）。本机实测：
+  OrbStack `7.0.14-orbstack` 容器内 **ABI = 8** ⇒ 隔离 / 网络 / exec / 记账面都能在本机容器验收；
+  历史上 E8.2/E8.3 的"Linux 容器全量"基线本来也都是通过 OrbStack 的 docker.sock 跑的
+  （见 `docs/HANDOFF.md` 的验证命令）。
+- **旧版 Docker Desktop 的 Linux VM 常低于该 ABI** ⇒ 那种机器上不得把本机当作 Sandlock 验收环境：
+  宿主 macOS 本身永远跑不了 sandlock（Landlock/seccomp 仅 Linux），此时 macOS 宿主只跑
+  不依赖 sandlock 的单元/契约测试，SDK 测试用 Local 执行器验证协议兼容性，隔离能力换真 Linux 验收。
+- **与运行时无关、本机一律不可用的**：XFS project quota 类用例（容器根是 overlay、无
+  `/dev/loop-control`，启动会打印 `XFS gates unavailable`）⇒ 属真机/运维项（`docs/sandbox-disk-quota.md`、
+  `docs/production-deployment-requirements.md`）。
 
 Dockerfile 使用清华 apt/pip 镜像源、JS SDK 测试使用 npmmirror 源，构建与安装
 走国内网络。test runner 容器需要 `privileged: true`（Docker 默认 seccomp

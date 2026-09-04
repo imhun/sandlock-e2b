@@ -231,8 +231,16 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after�
   MCP 网关不走闸口且长驻 ⇒ **默认 K=2**：实测网关 + 一条命令各占 450M 同时成功，
   900M / 标称 512M = 1.76x；闸口调到 N 则约 (N+1)x。
   磁盘不受影响（XFS project id 按沙箱目录设置、被所有实例共享，限额是真加总）。
-  修法二选一：fork 提供跨实例共享资源组（`e2b-integration.md` §3.8 / 提案 P10），或
-  E2B 侧给每个沙箱建一个 cgroup v2 并把每次命令的子进程放进去（需要 worker 有 cgroup 写权限）。
+  **已采纳的修法**：改为"每沙箱一个 sandlock 实例、命令是往实例里 `exec`"
+  （`e2b-integration.md` §8，取代早期的跨实例共享资源组提案 P10）；备选是 E2B 侧给每沙箱建
+  cgroup v2 并把子进程放进去（需 worker 有 cgroup 写权限）。
+  2026-09-04 本机容器（OrbStack，Landlock ABI 8）**补测确认**：同一实例内两个 child 各申请
+  300 MB（上限 512 MiB）⇒ 只有 1 个成功；同样两条命令放进两个容器 ⇒ 都成功，宿主 RSS
+  `316608+316712 kB ≈ 600 MB`。⇒ 超卖与"合并即修复"两边都有直接证据
+  （数据与实验编号见 `third_party/sandlock/docs/sandbox-exec-security.md` §10.2 V5）。
+  **同时实测到合并的前置缺陷**：`proc_count` 的唯一归还点是拦截到阻塞 `wait4`（fork 侧 SL-8），
+  setsid 孤儿生灭一轮后计数 `1/7→2/8→2/5`、第二轮 `2/5→3/6→3/5` ⇒ 合并后孤儿会**永久吃掉
+  沙箱进程预算**，必须与实例化同批修（pidfd 兜底 + `pid_ns`/subreaper 收养回收）。
 
 
 ## 9. 排期
