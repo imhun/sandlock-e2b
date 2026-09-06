@@ -65,6 +65,24 @@ def test_close_is_idempotent_and_releases_handle(monkeypatch) -> None:
     assert ex.instance_handle is None
 
 
+def test_close_then_ensure_creates_new_instance_with_same_name(monkeypatch) -> None:
+    """Closing releases the handle; the next ``_ensure_instance`` (e.g. after
+    a delete/evict round-trip on a reused executor) launches a fresh instance
+    carrying the same stable sandbox-id name (M4 D1)."""
+    ex = _executor(monkeypatch, "sbx_recreate")
+    first = ex._ensure_instance()
+    assert first.name == "sbx_recreate"
+
+    ex.close()
+    assert ex.instance_handle is None
+
+    second = ex._ensure_instance()
+    assert second is not first
+    assert second.name == "sbx_recreate"
+    assert first.closed is True
+    assert second.closed is False
+
+
 def test_long_sandbox_id_derives_stable_64b_name(monkeypatch) -> None:
     sandbox_id = "z" * 80
     ex = _executor(monkeypatch, sandbox_id)
