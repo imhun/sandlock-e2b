@@ -26,7 +26,11 @@
   `control_plane/registry/snapshots.py::_prune_store` 留下 boundary note。
 - **Open-FUP 最终态**：仍 open 仅 #4（SDK 可见性，产品决策）、#5（T5 route-B 后摘
   xfail）、#11（bisect 日志头纪律，约定）、#13/#14（G2 评审登记）；下方各历史块中
-  的 FUP 编号列表以本块与 task-backlog 为准。
+  的 FUP 编号列表以本块与 task-backlog 为准。**新增（2026-09-06 用户指示列入主要
+  计划）**：fork **F12 — ProcessIndex 一 TGID 一 entry**（线程 tid 懒登记建模收口，
+  ⬜ 计划中）：fork 详细计划 `third_party/sandlock/docs/fork-plan-2026-09-f12.md`，
+  main 登记 task-backlog #15，fork followups A 节 F12；收口流程 = fork 实现 + 门禁
+  + wheel → E2B 指针 bump + thread/gateway 探针 + full gate A/B 复跑。
 
 门禁摘要（容器 strict：image 默认 `E2B_BASE_IMAGE=python:3.11-slim` + privileged
 host-net，`E2B_TEST_STRICT_SKIPS=1`；macOS host 见下）：

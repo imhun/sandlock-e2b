@@ -178,3 +178,14 @@ ACR 镜像推送照常，git 远程推送暂缓。
     marker 缺失/改名的存储、权限/竞态异常都会按普通目录带入快照（单测正例只固定了
     同名普通目录保留一档）。该边界不会自身再造指数链，但会携带存储字节；见
     `control_plane/registry/snapshots.py` `_prune_store` 的 boundary note。
+15. **F12（fork，2026-09-06 已列入主要计划）: ProcessIndex 一 TGID 一 entry** —
+    ⬜ 计划中（fork 侧执行）。来源：F11 report concern #1（row #2 的
+    thread-tid-keying 残余）升级为独立 fork 计划。问题：`register_pid_if_new`
+    对发出被中介 syscall 的非 leader 线程以 tid 懒登记独立 entry，一个 TGID 可
+    多 key；F11 只在 freeze 侧归一化。完整修法 = 线程通知一律路由到 TGID leader
+    entry、删除 per-tid 登记、逐消费点复核（freeze/内存记账/cwd/exit/枚举），
+    RED 先行。fork 详细计划与审计清单：
+    `third_party/sandlock/docs/fork-plan-2026-09-f12.md`；
+    followups 登记 `third_party/sandlock/docs/fork-plan-followups.md`（A 节 F12）。
+    收口流程：fork 实现 + 门禁 + wheel → E2B 指针 bump + thread/gateway 探针 +
+    full gate A/B 复跑（沿用 F11 的 E2B 接线模式）。
