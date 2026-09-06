@@ -308,6 +308,12 @@ class SandlockExecutor(Executor):
         self._sandbox_id = sandbox_id
         self._instance = None
         self._instance_name: str | None = None
+        # Serializes the instance lifecycle (creation/rebuild in
+        # ``_ensure_instance``, teardown in ``close``) against
+        # ``update_network``'s validate+apply section: a command exec racing
+        # a network update must never interleave preflight and application
+        # with instance creation (M4 D4 review Important-1).
+        self._lifecycle_lock = threading.Lock()
         # D4=A: full merged network state the live instance was launched
         # with (``_ensure_instance``), kept for diagnostics. Applicability is
         # checked against the *applied* state below, which starts as this
@@ -378,14 +384,15 @@ class SandlockExecutor(Executor):
         apply, so a rejection never leaves the record and runtime diverging.
         """
         merged = dict(network) if network else None
-        if self._instance is not None:
-            self.validate_update(merged)
-            if self._merged_state(merged) != self._applied_state():
-                self._apply_instance_update(merged)
-        self._network = merged
-        allow_internet = (merged or {}).get("allowInternetAccess")
-        if allow_internet is not None:
-            self._allow_internet_access = bool(allow_internet)
+        with self._lifecycle_lock:
+            if self._instance is not None:
+                self.validate_update(merged)
+                if self._merged_state(merged) != self._applied_state():
+                    self._apply_instance_update(merged)
+            self._network = merged
+            allow_internet = (merged or {}).get("allowInternetAccess")
+            if allow_internet is not None:
+                self._allow_internet_access = bool(allow_internet)
 
     def _apply_instance_update(self, network: dict | None) -> None:
         """Bind an accepted narrowing to the live instance's new execs."""
@@ -463,7 +470,18 @@ class SandlockExecutor(Executor):
         return "sbx_" + hashlib.sha256(sid.encode()).hexdigest()[:16]
 
     def _ensure_instance(self):
-        """Lazily create the one long-lived exec instance (M4 D1/D3)."""
+        """Lazily create the one long-lived exec instance (M4 D1/D3).
+
+        The creation segment (policy build + ``SandboxInstance`` construction
+        + the rebuild-once retry after a closed/dead launch) runs under the
+        lifecycle lock so an ``update_network`` cannot observe a half-created
+        instance or interleave preflight/apply with it.
+        """
+        with self._lifecycle_lock:
+            return self._ensure_instance_locked()
+
+    def _ensure_instance_locked(self):
+        """Creation core; caller must hold ``_lifecycle_lock``."""
         if self._instance is None and SandboxInstance is not None:
             if self._instance_name is None:
                 self._instance_name = self._instance_name_for()
@@ -492,11 +510,12 @@ class SandlockExecutor(Executor):
 
     def close(self) -> None:
         """Close the exec instance and release the handle (idempotent)."""
-        if self._instance is not None:
-            self._instance.close()
-            self._instance = None
-        self._instance_network_snapshot = None
-        self._child_registry.clear()
+        with self._lifecycle_lock:
+            if self._instance is not None:
+                self._instance.close()
+                self._instance = None
+            self._instance_network_snapshot = None
+            self._child_registry.clear()
 
     def _materialize_http_inject(
         self, entries: list[dict]
@@ -1113,7 +1132,11 @@ class SandlockExecutor(Executor):
         """
         if sandlock is None:
             raise unimplemented("Sandlock is not available on this platform")
-        inst = self._ensure_instance()
+        # The normal exec path takes the lifecycle lock around instance
+        # creation too, so a concurrent ``update_network`` serializes against
+        # it exactly like any other ``_ensure_instance`` caller.
+        with self._lifecycle_lock:
+            inst = self._ensure_instance_locked()
         if inst is None:
             raise unimplemented("Sandlock is not available on this platform")
         stdio = ExecStdio.PTY if config.pty else ExecStdio.PIPED

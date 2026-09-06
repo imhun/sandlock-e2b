@@ -38,6 +38,7 @@ from control_plane.registry.secrets import SecretTenantMismatchError
 from control_plane.registry.snapshots import UnknownSnapshotError
 from control_plane.registry.templates import UnknownTemplateBuildError
 from gateway_common.network import (
+    NetworkUpdateConflictError,
     NetworkConfigError,
     normalize_network_config,
     normalize_network_update,
@@ -1793,59 +1794,37 @@ async def _remote_network_decision(
     return True, None
 
 
-def _validate_local_instance_update(request, record, network) -> None:
-    """In-process D4=A preflight for a ``local://`` node.
+def _apply_local_network_update(request, record, network) -> None:
+    """Atomically validate + apply a ``local://`` update on a live context.
 
-    Runs before the registry record is mutated. A live context whose executor
-    rejects the proposal raises ``OfficialError(409)``; with no context (or no
-    launched instance) every normalized update is applicable.
+    Runs **before** the control-plane record is saved (M4 D4 review
+    Important-1): a live context's ``update_network`` performs the executor
+    validate+apply in one critical section and persists the worker runtime
+    state only on success. A rejection raises
+    :class:`NetworkUpdateConflictError`, which the caller maps to HTTP 409 --
+    no 204 and no persisted record. With no live context there is no launched
+    instance and the update is applicable (it becomes the future static
+    policy); the runtime-registry copy is synced after the record save.
     """
     ctx = getattr(request.app.state, "runtimes", {}).get(record.sandbox_id)
     if ctx is None:
         return
-    validate = getattr(getattr(ctx, "executor", None), "validate_update", None)
-    if validate is None:
+    updater = getattr(ctx, "update_network", None)
+    if updater is None:
         return
-    from gateway_common.network import NetworkUpdateConflictError
-
-    try:
-        validate(network or None)
-    except NetworkUpdateConflictError as exc:
-        raise OfficialError(409, str(exc)) from exc
+    updater(network)
 
 
-def _apply_local_network_update(request, record) -> None:
-    """Apply a persisted update to the in-process runtime copy + context.
-
-    The local ``local://`` push goes through the same ctx validation as the
-    agent route: the context applies first and its copy is only mutated on
-    success (a race rejection leaves both copies unchanged, matching the
-    remote agent contract).
-    """
+def _sync_local_runtime_copy(request, record) -> None:
+    """Mirror the persisted record into the control-plane runtime registry."""
     runtime = request.app.state.runtime_registry.get(record.sandbox_id)
     if runtime is None:
         return
-    allow_public_traffic = bool(
-        (record.network or {}).get("allowPublicTraffic", False)
-    )
-    ctx = getattr(request.app.state, "runtimes", {}).get(record.sandbox_id)
-    updater = getattr(ctx, "update_network", None) if ctx is not None else None
-    if updater is not None:
-        from gateway_common.network import NetworkUpdateConflictError
-
-        try:
-            updater(record.network)
-        except NetworkUpdateConflictError as exc:
-            logger.warning(
-                "local network update for sandbox %s not expressible; "
-                "runtime copy unchanged: %s",
-                record.sandbox_id,
-                exc,
-            )
-            return
     runtime.network = dict(record.network) if record.network else None
     runtime.allow_internet_access = record.allow_internet_access
-    runtime.allow_public_traffic = allow_public_traffic
+    runtime.allow_public_traffic = bool(
+        (record.network or {}).get("allowPublicTraffic", False)
+    )
 
 
 @router.put(
@@ -1915,7 +1894,10 @@ async def update_sandbox_network(sandbox_id: str, request: Request) -> Response:
         if accepted is False:
             raise OfficialError(409, rejection or "network update conflicts")
     elif node is not None:
-        _validate_local_instance_update(request, record, network or None)
+        try:
+            _apply_local_network_update(request, record, network or None)
+        except NetworkUpdateConflictError as exc:
+            raise OfficialError(409, str(exc)) from exc
     else:
         logger.warning(
             "node %s not found; network update for sandbox %s not pushed",
@@ -1930,7 +1912,7 @@ async def update_sandbox_network(sandbox_id: str, request: Request) -> Response:
     record.touch()  # E9.1: a user mutation, persisted by the save below
     registry.save(record)
     if node is not None and node.address == "local://":
-        _apply_local_network_update(request, record)
+        _sync_local_runtime_copy(request, record)
     return Response(status_code=204)
 
 

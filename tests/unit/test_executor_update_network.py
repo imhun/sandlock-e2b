@@ -10,7 +10,9 @@ unit-testable on macOS / CI.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -413,3 +415,189 @@ def test_close_clears_stale_child_registry_and_snapshot(monkeypatch) -> None:
     ex.update_network({"denyOut": ["10.0.0.0/8"]})
     assert ex.instance_handle is None
     assert ex._network == {"denyOut": ["10.0.0.0/8"]}
+
+
+def test_instance_creation_serializes_with_update_network(monkeypatch) -> None:
+    """M4 D4 review: a network update racing instance creation must not run
+    its preflight against a half-created executor.
+
+    The fake instance constructor blocks mid-creation; an update started
+    while the constructor is blocked may only run **after** creation
+    completes (under the lifecycle lock), where the model flip it proposes is
+    a live-instance 409 -- not a silently-stored pre-launch policy.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    update_attempted = threading.Event()
+
+    class _BlockingInstance(_RecordingInstance):
+        def __init__(self, policy, name=None):
+            started.set()
+            assert release.wait(timeout=10)
+            super().__init__(policy, name=name)
+
+    ex = _executor(
+        monkeypatch,
+        network={"allowOut": ["8.8.8.8"]},
+        allow_internet_access=True,
+    )
+    monkeypatch.setattr(sl, "SandboxInstance", _BlockingInstance)
+
+    create_errors: list[BaseException] = []
+
+    def _create() -> None:
+        try:
+            ex._ensure_instance()
+        except BaseException as exc:  # pragma: no cover - failure probe
+            create_errors.append(exc)
+
+    creator = threading.Thread(target=_create)
+    creator.start()
+    assert started.wait(timeout=5)
+
+    outcome: list[str] = []
+
+    def _update() -> None:
+        update_attempted.set()
+        try:
+            # A model flip: applicable pre-launch, a 409 once the instance is
+            # live.
+            ex.update_network({"denyOut": ["10.0.0.0/8"]})
+            outcome.append("applied")
+        except NetworkUpdateConflictError:
+            outcome.append("conflict")
+
+    updater = threading.Thread(target=_update)
+    updater.start()
+    assert update_attempted.wait(timeout=5)
+    release.set()
+    creator.join(timeout=5)
+    updater.join(timeout=5)
+
+    assert not creator.is_alive()
+    assert not updater.is_alive()
+    assert create_errors == []
+    # The update ran only after creation finished, so it was rejected as a
+    # live model flip. Unserialized, it would have stored the pre-launch
+    # policy ("applied") while the constructor was still blocked.
+    assert outcome == ["conflict"]
+    assert ex.instance_handle is not None
+    ex.close()
+
+
+def test_start_path_serializes_instance_creation_with_update_network(
+    monkeypatch,
+) -> None:
+    """The normal exec path (``start()``) holds the lifecycle lock around
+    instance creation: an update racing the first exec applies only after the
+    instance exists and binds to it instead of racing the constructor."""
+    started = threading.Event()
+    release = threading.Event()
+    update_attempted = threading.Event()
+
+    class _BlockingExecInstance(_ExecRecordingInstance):
+        def __init__(self, policy, name=None):
+            started.set()
+            assert release.wait(timeout=10)
+            super().__init__(policy, name=name)
+
+    ex = _exec_ready_executor(
+        monkeypatch,
+        network={"allowOut": ["8.8.8.8"]},
+        allow_internet_access=False,
+    )
+    monkeypatch.setattr(sl, "SandboxInstance", _BlockingExecInstance)
+    cfg = ExecConfig(
+        cmd=["/bin/sh", "-c", "true"],
+        env={},
+        cwd="/tmp/ws",
+        stdin_enabled=False,
+    )
+
+    start_errors: list[BaseException] = []
+
+    def _start() -> None:
+        try:
+            asyncio.run(ex.start(cfg))
+        except BaseException as exc:  # pragma: no cover - failure probe
+            start_errors.append(exc)
+
+    runner = threading.Thread(target=_start)
+    runner.start()
+    assert started.wait(timeout=5)
+
+    outcome: list[str] = []
+
+    def _update() -> None:
+        update_attempted.set()
+        try:
+            ex.update_network({"allowOut": []})
+            outcome.append("applied")
+        except NetworkUpdateConflictError:
+            outcome.append("conflict")
+
+    updater = threading.Thread(target=_update)
+    updater.start()
+    assert update_attempted.wait(timeout=5)
+    release.set()
+    runner.join(timeout=5)
+    updater.join(timeout=5)
+
+    assert not runner.is_alive()
+    assert not updater.is_alive()
+    assert start_errors == []
+    assert outcome == ["applied"]
+    inst = ex.instance_handle
+    assert inst is not None
+    # The narrowing was applied to the created instance (bound [] for new
+    # execs); unserialized it would have been stored pre-launch with no call.
+    assert inst.update_calls == [[]]
+    assert ex._network == {"allowOut": []}
+    ex.close()
+
+
+def test_update_network_holds_lifecycle_lock_across_apply(monkeypatch) -> None:
+    """The lifecycle lock is held for the whole validate+apply segment: while
+    the fake instance is inside ``update_network``, ``_ensure_instance`` (and
+    any other lifecycle mutation) cannot proceed."""
+    apply_entered = threading.Event()
+    release_apply = threading.Event()
+
+    class _SlowApplyInstance(_ExecRecordingInstance):
+        def update_network(self, ips):
+            self.update_calls.append(list(ips))
+            apply_entered.set()
+            assert release_apply.wait(timeout=10)
+            return list(self.stale_child_ids)
+
+    ex = _exec_ready_executor(
+        monkeypatch,
+        network={"allowOut": ["8.8.8.8", "1.1.1.1"]},
+        allow_internet_access=True,
+    )
+    monkeypatch.setattr(sl, "SandboxInstance", _SlowApplyInstance)
+    inst = ex._ensure_instance()
+    errors: list[BaseException] = []
+
+    def _update() -> None:
+        try:
+            ex.update_network({"allowOut": ["8.8.8.8"]})
+        except BaseException as exc:  # pragma: no cover - failure probe
+            errors.append(exc)
+
+    updater = threading.Thread(target=_update)
+    updater.start()
+    assert apply_entered.wait(timeout=5)
+    try:
+        # The executor lock must be held by the update while the instance
+        # apply is blocked; a non-blocking acquire therefore fails.
+        acquired = ex._lifecycle_lock.acquire(blocking=False)
+        assert acquired is False
+    finally:
+        release_apply.set()
+        updater.join(timeout=5)
+    assert not updater.is_alive()
+    assert errors == []
+    assert inst.update_calls == [["8.8.8.8"]]
+    assert ex._network == {"allowOut": ["8.8.8.8"]}
+    ex.close()
