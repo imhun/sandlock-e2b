@@ -27,6 +27,158 @@ class NetworkConfigError(ValueError):
     """Raised when a network configuration is invalid or unsupported."""
 
 
+class NetworkUpdateConflictError(ValueError):
+    """D4=A: a live-instance network update is not expressible.
+
+    Raised by the executor (and propagated through the runtime context) when
+    an already-launched ``SandboxInstance`` cannot represent the proposed
+    state. Every layer maps it to an HTTP 409 **before** persisting its own
+    record, so neither the control-plane registry nor the worker runtime copy
+    changes on rejection.
+    """
+
+
+_INSTANCE_STATIC_FIELDS = (
+    "rules",
+    "egressProxy",
+    "maskRequestHost",
+    "allowPublicTraffic",
+)
+
+
+def merged_network_state(
+    network: dict[str, Any] | None,
+    *,
+    allow_internet_access: bool,
+    allow_public_traffic: bool = False,
+) -> dict[str, Any]:
+    """Canonical full network state for D4=A live-update comparisons.
+
+    The merged network dict is folded together with the two record mirrors
+    (``allowInternetAccess`` / ``allowPublicTraffic``) into one dictionary so
+    a static/proposed pair is compared deterministically regardless of which
+    side carried a field in the dict. Explicit nulls (``egressProxy: null``
+    after an atomic-replace update) are dropped like the normalization layer
+    treats them.
+    """
+    state = dict(network) if network else {}
+    state["allowInternetAccess"] = bool(allow_internet_access)
+    state.setdefault("allowPublicTraffic", bool(allow_public_traffic))
+    for key in ("rules", "egressProxy", "maskRequestHost"):
+        if key in state and state[key] is None:
+            del state[key]
+    return state
+
+
+def _egress_model(state: dict[str, Any]) -> str:
+    """Classify the outbound model of a canonical network state.
+
+    Presence of ``allowOut`` wins over ``denyOut`` (matching
+    :func:`sandlock_network_policy`'s allowlist-precedence); with neither
+    list the ``allowInternetAccess`` flag selects the implicit default-allow
+    or deny-all model.
+    """
+    if state.get("allowOut") is not None:
+        return "allowOut"
+    if state.get("denyOut") is not None:
+        return "denyOut"
+    if not state.get("allowInternetAccess"):
+        return "deny-all implicit"
+    return "default-allow implicit"
+
+
+def _is_bare_ip_literal(entry: Any) -> bool:
+    """Whether an ``allowOut`` entry is a bare IP the fork can bind online.
+
+    The fork ``SandboxInstance.update_network(ips)`` parses every entry as
+    ``std::net::IpAddr``: domains, CIDRs and host:port forms are not
+    expressible through the session verb.
+    """
+    if not isinstance(entry, str):
+        return False
+    try:
+        ipaddress.ip_address(entry)
+    except ValueError:
+        return False
+    return True
+
+
+def network_update_conflict_reason(
+    static: dict[str, Any],
+    proposed: dict[str, Any],
+) -> str | None:
+    """Return why ``proposed`` cannot be applied to a launched instance.
+
+    ``static``/``proposed`` are canonical states from
+    :func:`merged_network_state`. ``None`` means the update is expressible.
+    The comparison is monotone against the **currently applied** state (which
+    starts as the first-launch snapshot): after a live narrowing, re-widening
+    toward the launch ceiling is still rejected (the D4=A contract forbids
+    ``allowOut`` ``[]`` -> ``["8.8.8.8"]`` even though the latter equals the
+    launch-time ceiling).
+    """
+    if static == proposed:
+        return None
+    static_model = _egress_model(static)
+    if static_model != _egress_model(proposed):
+        return (
+            f"network egress model cannot change on a launched sandbox "
+            f"({static_model} -> {_egress_model(proposed)})"
+        )
+    for key in _INSTANCE_STATIC_FIELDS:
+        if static.get(key) != proposed.get(key):
+            return f"network field {key} cannot change on a launched sandbox"
+    if static.get("allowInternetAccess") != proposed.get("allowInternetAccess"):
+        return "allowInternetAccess cannot change on a launched sandbox"
+    if static_model == "allowOut":
+        return _allow_out_conflict(static, proposed)
+    if static_model == "denyOut":
+        return _deny_out_conflict(static, proposed)
+    return "an implicit egress model has no expressible online narrowing"
+
+
+def _allow_out_conflict(
+    static: dict[str, Any],
+    proposed: dict[str, Any],
+) -> str | None:
+    static_list = list(static.get("allowOut") or [])
+    proposed_list = list(proposed.get("allowOut") or [])
+    if not set(proposed_list) <= set(static_list):
+        return "allowOut can only be narrowed on a launched sandbox"
+    # The fork binds ip literals only: every entry the update removes or
+    # keeps must be a bare IP, or the online state would silently differ from
+    # the textual record (domain/CIDR-level narrowing is not expressible).
+    changed = set(static_list) ^ set(proposed_list)
+    kept = set(proposed_list)
+    for entry in sorted(changed | kept):
+        if not _is_bare_ip_literal(entry):
+            return (
+                f"allowOut entry {entry!r} cannot be expressed on a launched "
+                "sandbox (ip literals only)"
+            )
+    return None
+
+
+def _deny_out_conflict(
+    static: dict[str, Any],
+    proposed: dict[str, Any],
+) -> str | None:
+    static_list = list(static.get("denyOut") or [])
+    proposed_list = list(proposed.get("denyOut") or [])
+    if not set(static_list) <= set(proposed_list):
+        return "denyOut can only grow (deny more) on a launched sandbox"
+    if set(proposed_list) != set(static_list):
+        # The fork verb replaces the outbound allow set for new execs; a
+        # DenyList ceiling cannot gain entries at runtime, so accepting the
+        # update would leave the instance granting destinations the record
+        # claims are denied. D4=A rejects instead of drifting.
+        return (
+            "adding denyOut entries on a launched sandbox is not expressible "
+            "(the fork binds ip allowlists only)"
+        )
+    return None
+
+
 _CREATE_FIELDS = {
     "allowOut",
     "denyOut",

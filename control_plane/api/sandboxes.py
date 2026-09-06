@@ -1720,32 +1720,36 @@ async def set_timeout(sandbox_id: str, request: Request) -> Response:
     return Response(status_code=204)
 
 
-async def _push_network_config(request, record) -> None:
-    """Apply a persisted network update on the node hosting the sandbox."""
-    node = request.app.state.nodes.get(record.node_id or "local")
+def _network_rejection_message(resp) -> str:
+    """Stable machine-readable rejection text from the worker agent."""
+    try:
+        body = resp.json()
+    except Exception:
+        return "network update conflicts with the launched sandbox"
+    if isinstance(body, dict) and body.get("message"):
+        return str(body["message"])
+    return "network update conflicts with the launched sandbox"
+
+
+async def _remote_network_decision(
+    request, node, record, payload
+) -> tuple[bool | None, str | None]:
+    """Ask the hosting node to validate + apply before the record is saved.
+
+    Returns ``(True, None)`` when the node applied the update,
+    ``(False, message)`` when it rejected it with HTTP 409 (nothing persisted
+    anywhere), and ``(None, None)`` when no semantic decision is available
+    (missing/unreachable node or an unexpected status) -- the caller keeps
+    the pre-existing best-effort persist-and-warn behavior for those
+    transport-level failures.
+    """
     if node is None:
         logger.warning(
             "node %s not found; network update for sandbox %s not pushed",
             record.node_id,
             record.sandbox_id,
         )
-        return
-    allow_public_traffic = bool(
-        (record.network or {}).get("allowPublicTraffic", False)
-    )
-    if node.address == "local://":
-        runtime = request.app.state.runtime_registry.get(record.sandbox_id)
-        if runtime is None:
-            return
-        runtime.network = dict(record.network) if record.network else None
-        runtime.allow_internet_access = record.allow_internet_access
-        runtime.allow_public_traffic = allow_public_traffic
-        # If this process also hosts a live runtime context, update it; the
-        # envd side additionally applies drift when records are shared.
-        ctx = getattr(request.app.state, "runtimes", {}).get(record.sandbox_id)
-        if ctx is not None and hasattr(ctx, "update_network"):
-            ctx.update_network(record.network)
-        return
+        return None, None
     import httpx
 
     logger.info(
@@ -1757,11 +1761,7 @@ async def _push_network_config(request, record) -> None:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{node.address}/agent/sandboxes/{record.sandbox_id}/network",
-                json={
-                    "network": record.network,
-                    "allowInternetAccess": record.allow_internet_access,
-                    "allowPublicTraffic": allow_public_traffic,
-                },
+                json=payload,
                 headers={
                     "X-Internal-Key": request.app.state.settings.internal_api_key
                 },
@@ -1773,7 +1773,15 @@ async def _push_network_config(request, record) -> None:
             node.node_id,
             e,
         )
-        return
+        return None, None
+    if resp.status_code == 409:
+        logger.warning(
+            "node %s rejected network update for sandbox %s: %s",
+            node.node_id,
+            record.sandbox_id,
+            resp.text,
+        )
+        return False, _network_rejection_message(resp)
     if resp.status_code >= 300:
         logger.warning(
             "node %s rejected network update for sandbox %s: %s",
@@ -1781,6 +1789,63 @@ async def _push_network_config(request, record) -> None:
             record.sandbox_id,
             resp.text,
         )
+        return None, None
+    return True, None
+
+
+def _validate_local_instance_update(request, record, network) -> None:
+    """In-process D4=A preflight for a ``local://`` node.
+
+    Runs before the registry record is mutated. A live context whose executor
+    rejects the proposal raises ``OfficialError(409)``; with no context (or no
+    launched instance) every normalized update is applicable.
+    """
+    ctx = getattr(request.app.state, "runtimes", {}).get(record.sandbox_id)
+    if ctx is None:
+        return
+    validate = getattr(getattr(ctx, "executor", None), "validate_update", None)
+    if validate is None:
+        return
+    from gateway_common.network import NetworkUpdateConflictError
+
+    try:
+        validate(network or None)
+    except NetworkUpdateConflictError as exc:
+        raise OfficialError(409, str(exc)) from exc
+
+
+def _apply_local_network_update(request, record) -> None:
+    """Apply a persisted update to the in-process runtime copy + context.
+
+    The local ``local://`` push goes through the same ctx validation as the
+    agent route: the context applies first and its copy is only mutated on
+    success (a race rejection leaves both copies unchanged, matching the
+    remote agent contract).
+    """
+    runtime = request.app.state.runtime_registry.get(record.sandbox_id)
+    if runtime is None:
+        return
+    allow_public_traffic = bool(
+        (record.network or {}).get("allowPublicTraffic", False)
+    )
+    ctx = getattr(request.app.state, "runtimes", {}).get(record.sandbox_id)
+    updater = getattr(ctx, "update_network", None) if ctx is not None else None
+    if updater is not None:
+        from gateway_common.network import NetworkUpdateConflictError
+
+        try:
+            updater(record.network)
+        except NetworkUpdateConflictError as exc:
+            logger.warning(
+                "local network update for sandbox %s not expressible; "
+                "runtime copy unchanged: %s",
+                record.sandbox_id,
+                exc,
+            )
+            return
+    runtime.network = dict(record.network) if record.network else None
+    runtime.allow_internet_access = record.allow_internet_access
+    runtime.allow_public_traffic = allow_public_traffic
 
 
 @router.put(
@@ -1793,7 +1858,11 @@ async def update_sandbox_network(sandbox_id: str, request: Request) -> Response:
 
     Mirrors the official ``Sandbox.update_network``: omitted fields are
     cleared. The change is persisted on the control plane and pushed to the
-    node hosting the sandbox; the next command uses the new policy.
+    node hosting the sandbox; the next command uses the new policy. D4=A:
+    on an already-launched instance only expressible monotone narrowings are
+    accepted -- everything else is an HTTP 409 raised **before** the
+    registry record is persisted (and the worker runtime copy is validated
+    before it is mutated), so a rejection changes neither side.
     """
     try:
         body = await request.json()
@@ -1812,9 +1881,10 @@ async def update_sandbox_network(sandbox_id: str, request: Request) -> Response:
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
 
-    # Atomic replace: overlay the update on the current config; fields the
-    # update omits are cleared. ``allow_public_traffic`` is not updatable
-    # through this endpoint (official API keeps it create-only).
+    # Atomic replace (pure, computed before any record mutation): overlay the
+    # update on the current config; fields the update omits are cleared.
+    # ``allow_public_traffic`` is not updatable through this endpoint
+    # (official API keeps it create-only).
     network = dict(record.network or {})
     for field in (
         "allowOut",
@@ -1827,12 +1897,40 @@ async def update_sandbox_network(sandbox_id: str, request: Request) -> Response:
             network[field] = update[field]
         else:
             network.pop(field, None)
+    proposed_internet = record.allow_internet_access
+    if "allowInternetAccess" in update:
+        proposed_internet = update["allowInternetAccess"]
+    allow_public_traffic = bool(network.get("allowPublicTraffic", False))
+    node = request.app.state.nodes.get(record.node_id or "local")
+    payload = {
+        "network": network or None,
+        "allowInternetAccess": proposed_internet,
+        "allowPublicTraffic": allow_public_traffic,
+    }
+
+    if node is not None and node.address != "local://":
+        accepted, rejection = await _remote_network_decision(
+            request, node, record, payload
+        )
+        if accepted is False:
+            raise OfficialError(409, rejection or "network update conflicts")
+    elif node is not None:
+        _validate_local_instance_update(request, record, network or None)
+    else:
+        logger.warning(
+            "node %s not found; network update for sandbox %s not pushed",
+            record.node_id,
+            record.sandbox_id,
+        )
+
+    # Only expressible/no-instance updates reach the persistence below.
     if "allowInternetAccess" in update:
         record.allow_internet_access = update["allowInternetAccess"]
     record.network = network or None
     record.touch()  # E9.1: a user mutation, persisted by the save below
     registry.save(record)
-    await _push_network_config(request, record)
+    if node is not None and node.address == "local://":
+        _apply_local_network_update(request, record)
     return Response(status_code=204)
 
 

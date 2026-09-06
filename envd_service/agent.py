@@ -621,7 +621,14 @@ async def agent_update_sandbox_network(
     sandbox_id: str,
     request: Request,
 ) -> Response:
-    """Apply a control-plane network update to a live sandbox runtime."""
+    """Apply a control-plane network update to a live sandbox runtime.
+
+    D4=A: validation runs before either record copy is mutated. A launched
+    instance accepts only expressible (monotone ip-only narrowing) updates;
+    a rejection returns HTTP 409 with the stable ``{"code": 409, "message"}``
+    body and leaves ``runtime.network`` / ``runtime.allow_internet_access``
+    untouched, so the control plane can refuse to persist it.
+    """
     settings = request.app.state.settings
     try:
         _require_internal_key(request, settings)
@@ -638,16 +645,37 @@ async def agent_update_sandbox_network(
     network = payload.get("network")
     if network is not None and not isinstance(network, dict):
         return Response(status_code=400, content="network must be an object")
-    runtime.network = dict(network) if network else None
+    merged_network = dict(network) if network else None
     allow_internet = payload.get("allowInternetAccess")
+    allow_public = payload.get("allowPublicTraffic")
+    ctx = request.app.state.runtimes.get(sandbox_id)
+    updater = getattr(ctx, "update_network", None) if ctx is not None else None
+    if updater is not None:
+        from gateway_common.network import NetworkUpdateConflictError
+
+        try:
+            # Validates + applies first; ``ctx.record`` is the runtime record
+            # object, so ``runtime.network`` persists only on success.
+            updater(merged_network)
+        except NetworkUpdateConflictError as exc:
+            logger.warning(
+                "agent network update rejected for sandbox %s: %s",
+                sandbox_id,
+                exc,
+            )
+            return JSONResponse(
+                status_code=409,
+                content={"code": 409, "message": str(exc)},
+            )
+    else:
+        # No live runtime context -> no instance launched: the update is
+        # applicable and simply becomes the static policy the future
+        # instance is built with.
+        runtime.network = merged_network
     if isinstance(allow_internet, bool):
         runtime.allow_internet_access = allow_internet
-    allow_public = payload.get("allowPublicTraffic")
     if isinstance(allow_public, bool):
         runtime.allow_public_traffic = allow_public
-    ctx = request.app.state.runtimes.get(sandbox_id)
-    if ctx is not None and hasattr(ctx, "update_network"):
-        ctx.update_network(runtime.network)
     logger.info(
         "agent network update for sandbox %s: %s",
         sandbox_id,

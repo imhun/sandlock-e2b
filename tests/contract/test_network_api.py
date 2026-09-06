@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 
 from e2b import Sandbox
@@ -50,7 +52,11 @@ async def _create_with_network(harness, network) -> httpx.Response:
         )
 
 
-async def test_network_create_echo_and_atomic_update(multinode_two_workers):
+async def test_network_prelaunch_create_echo_and_atomic_update(
+    multinode_two_workers,
+):
+    """D4=A (a): before any command launches the instance, updates atomically
+    replace the record and stay 204 (they become the future static policy)."""
     harness = multinode_two_workers
     created = await _create_with_network(
         harness,
@@ -85,6 +91,37 @@ async def test_network_create_echo_and_atomic_update(multinode_two_workers):
             await client.delete(
                 f"/sandboxes/{sandbox_id}", headers={"X-API-Key": "local-key"}
             )
+
+
+async def test_network_postlaunch_model_flip_409_keeps_record_byte_identical(
+    multinode_two_workers,
+):
+    """D4=A (b): once a command has launched the instance, flipping the
+    egress model (allowOut -> denyOut) is an HTTP 409 that is raised before
+    the control-plane record is persisted, leaving ``detail["network"]``
+    byte-identical."""
+    harness = multinode_two_workers
+    sandbox = Sandbox.create(
+        network={"allow_out": ["8.8.8.8"]}, **_opts(harness)
+    )
+    try:
+        launched = sandbox.commands.run("/bin/echo launch-ok")
+        assert launched.exit_code == 0
+
+        before = (await _detail(harness, sandbox.sandbox_id))["network"]
+        resp = await _put_network(
+            harness,
+            sandbox.sandbox_id,
+            {"denyOut": ["10.0.0.0/8"]},
+        )
+        assert resp.status_code == 409
+        after = (await _detail(harness, sandbox.sandbox_id))["network"]
+        assert after == before
+        assert json.dumps(
+            after, sort_keys=True, separators=(",", ":")
+        ) == json.dumps(before, sort_keys=True, separators=(",", ":"))
+    finally:
+        sandbox.kill()
 
 
 async def test_network_update_unknown_sandbox_404(multinode_two_workers):

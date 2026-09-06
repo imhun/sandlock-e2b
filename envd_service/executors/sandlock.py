@@ -20,6 +20,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from gateway_common.errors import ConnectError, unimplemented
+from gateway_common.network import NetworkUpdateConflictError
 from envd_service.executors.base import ExecConfig, Executor, RunningProcess
 
 logger = logging.getLogger(__name__)
@@ -307,15 +308,130 @@ class SandlockExecutor(Executor):
         self._sandbox_id = sandbox_id
         self._instance = None
         self._instance_name: str | None = None
+        # D4=A: full merged network state the live instance was launched
+        # with (``_ensure_instance``), kept for diagnostics. Applicability is
+        # checked against the *applied* state below, which starts as this
+        # snapshot and ratchets down on every accepted narrowing.
+        self._instance_network_snapshot: dict | None = None
+        # F4.3/S2 staleness mapping: fork child id -> (host pid, resolved
+        # argv). Registered in ``start()`` before the process is returned.
+        self._child_registry: dict[int, tuple[int, list[str]]] = {}
         self._mcp_bind_port: int | None = None
         # SSL_CERT_FILE/CURL_CA_BUNDLE overrides merged into every per-exec
         # env when the chroot HTTPS-MITM CA branch is active (the policy
         # ceiling itself no longer carries env).
         self._http_inject_env: dict[str, str] = {}
 
+    def _merged_state(self, network: dict | None) -> dict:
+        """Canonical D4=A state for ``network`` folded with this executor's
+        record mirrors (``allowInternetAccess``; ``allowPublicTraffic`` is
+        carried by the network dict itself)."""
+        from gateway_common.network import merged_network_state
+
+        allow_internet = (network or {}).get("allowInternetAccess")
+        if allow_internet is None:
+            allow_internet = self._allow_internet_access
+        return merged_network_state(
+            network, allow_internet_access=bool(allow_internet)
+        )
+
+    def _applied_state(self) -> dict:
+        """Canonical state currently applied to the instance (or, before the
+        first launch, the static policy the future instance would build)."""
+        from gateway_common.network import merged_network_state
+
+        return merged_network_state(
+            self._network, allow_internet_access=self._allow_internet_access
+        )
+
+    def validate_update(self, network: dict | None) -> None:
+        """Raise :class:`NetworkUpdateConflictError` when ``network`` cannot
+        be applied to an already-launched instance.
+
+        D4=A: with no instance yet every normalized update is applicable (it
+        becomes the static policy the future instance is built with). Once
+        launched, only monotone narrowings the fork verb can represent are
+        accepted; everything else must be rejected with HTTP 409 before any
+        record is persisted. This method is pure -- it never mutates the
+        executor or calls the instance.
+        """
+        if self._instance is None:
+            return
+        from gateway_common.network import network_update_conflict_reason
+
+        reason = network_update_conflict_reason(
+            self._applied_state(), self._merged_state(network)
+        )
+        if reason is not None:
+            raise NetworkUpdateConflictError(reason)
+
     def update_network(self, network: dict | None) -> None:
-        """Replace the network policy; the next command uses it."""
-        self._network = dict(network) if network else None
+        """Replace the network policy for new execs (M4 D4, S2 semantics).
+
+        With no live instance the update simply becomes the static policy of
+        the future instance. On a launched instance the update is validated
+        first (raising :class:`NetworkUpdateConflictError` without mutating
+        anything when it is not expressible); expressible narrowings call
+        ``instance.update_network(ip_set)`` with the IP-literal allow set of
+        the proposed ``allowOut`` and log the fork's stale-children report.
+        The executor's own policy copy is only replaced after a successful
+        apply, so a rejection never leaves the record and runtime diverging.
+        """
+        merged = dict(network) if network else None
+        if self._instance is not None:
+            self.validate_update(merged)
+            if self._merged_state(merged) != self._applied_state():
+                self._apply_instance_update(merged)
+        self._network = merged
+        allow_internet = (merged or {}).get("allowInternetAccess")
+        if allow_internet is not None:
+            self._allow_internet_access = bool(allow_internet)
+
+    def _apply_instance_update(self, network: dict | None) -> None:
+        """Bind an accepted narrowing to the live instance's new execs."""
+        allow_out = (network or {}).get("allowOut")
+        ip_set = list(allow_out) if allow_out is not None else []
+        try:
+            stale_child_ids = self._instance.update_network(ip_set)
+        except PermissionError as exc:
+            # Defense in depth: a fork EPERM (widening past the static
+            # ceiling) maps to the same 409 without persisting.
+            raise NetworkUpdateConflictError(
+                str(exc) or "instance refused the network update (EPERM)"
+            ) from exc
+        self._log_stale_children(stale_child_ids)
+
+    def _log_stale_children(self, stale_child_ids: list[int]) -> None:
+        """INFO log one line per stale fork child plus a count summary."""
+        sandbox_id = self._sandbox_id or "-"
+        for child_id in stale_child_ids:
+            entry = self._child_registry.get(child_id)
+            if entry is None:
+                logger.info(
+                    "sandbox_id=%s instance_name=%s stale_child_id=%s "
+                    "pid=%s cmd=%s",
+                    sandbox_id,
+                    self.instance_name,
+                    child_id,
+                    "-",
+                    "-",
+                )
+                continue
+            pid, cmd = entry
+            logger.info(
+                "sandbox_id=%s instance_name=%s stale_child_id=%s pid=%s cmd=%s",
+                sandbox_id,
+                self.instance_name,
+                child_id,
+                pid,
+                " ".join(cmd),
+            )
+        logger.info(
+            "sandbox_id=%s instance_name=%s network_update stale_child_count=%d",
+            sandbox_id,
+            self.instance_name,
+            len(stale_child_ids),
+        )
 
     def set_mcp_bind_port(self, port: int | None) -> None:
         """Set the per-sandbox MCP gateway host port for the bind ceiling.
@@ -367,6 +483,11 @@ class SandlockExecutor(Executor):
                 self._instance = SandboxInstance(
                     policy, name=self._instance_name
                 )
+        if self._instance is not None and self._instance_network_snapshot is None:
+            # D4=A: the static full state at first launch. Applicability uses
+            # the applied state (which ratchets down from this snapshot), so
+            # the snapshot is kept for diagnostics/rebuild reference.
+            self._instance_network_snapshot = self._applied_state()
         return self._instance
 
     def close(self) -> None:
@@ -374,6 +495,8 @@ class SandlockExecutor(Executor):
         if self._instance is not None:
             self._instance.close()
             self._instance = None
+        self._instance_network_snapshot = None
+        self._child_registry.clear()
 
     def _materialize_http_inject(
         self, entries: list[dict]
@@ -1003,6 +1126,10 @@ class SandlockExecutor(Executor):
                 config, bind_ports=self._bind_ports_for(config)
             ),
         )
+        # F4.3/S2 staleness mapping: register the fork child (id -> pid +
+        # resolved argv) before the running process is returned so a later
+        # ``update_network`` can log which children keep their old policy.
+        self._child_registry[proc.child_id] = (proc.pid, resolved)
         queue: asyncio.Queue = asyncio.Queue()
         stdin_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         loop = asyncio.get_running_loop()

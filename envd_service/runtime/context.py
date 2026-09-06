@@ -139,12 +139,22 @@ class SandboxRuntimeContext:
         return self._mcp_token
 
     def update_network(self, network: dict | None) -> None:
-        """Apply an updated network config; the next command uses it."""
-        self.record.network = dict(network) if network else None
-        self._network = self.record.network
+        """Apply an updated network config; the next command uses it.
+
+        D4=A: the executor validates and applies first and raises
+        ``NetworkUpdateConflictError`` when the update is not expressible on
+        a launched instance. The record and this context's network copy are
+        persisted only after a successful apply, so a rejection leaves both
+        unchanged (HTTP 409 without record mutation).
+        """
+        merged = dict(network) if network else None
         updater = getattr(self.executor, "update_network", None)
         if updater is not None:
-            updater(self.record.network)
+            updater(merged)
+        if merged is not None and "allowInternetAccess" in merged:
+            self.record.allow_internet_access = bool(merged["allowInternetAccess"])
+        self.record.network = merged
+        self._network = merged
 
     def _on_command_log(self, proc, event, payload) -> None:
         writer = self.command_logs

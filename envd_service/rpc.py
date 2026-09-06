@@ -38,7 +38,21 @@ def _context(request: Request, runtime) -> Any:
         # uses the new policy.
         updater = getattr(ctx, "update_network", None)
         if updater is not None:
-            updater(runtime.network)
+            from gateway_common.network import NetworkUpdateConflictError
+
+            try:
+                updater(runtime.network)
+            except NetworkUpdateConflictError as exc:
+                # D4=A: an out-of-band record change that the launched
+                # instance cannot express must not break the command path;
+                # the live runtime policy stays authoritative until the
+                # record is reconciled.
+                logger.warning(
+                    "drift network update for sandbox %s is not expressible "
+                    "on the live instance (%s); keeping runtime policy",
+                    runtime.sandbox_id,
+                    exc,
+                )
     return ctx
 
 
