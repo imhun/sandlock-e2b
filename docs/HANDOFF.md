@@ -5,6 +5,37 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
+## ⚡ G3 final wave（FUP #12 egress 证据 + G1/G2 台账收口，2026-09-06）
+
+主仓库两个提交（fork 未动，子模块指针仍 `bc6c892`）：
+`0e15572`（`test(sandlock): pin worker-side egress after rejected network widen
+(FUP12)`）+ docs commit（本块所在提交，见 git log）。报告
+`tmp/sdd/g3-final-wave-report.md`；门禁日志 `tmp/g3-*.log`。
+
+- **FUP #12 行为证据**：`tests/security/test_network_enforcement.py` 新增
+  `test_rejected_rewiden_leaves_worker_runtime_copy_narrowed`——IP-literal allowOut
+  建箱（198.18.0.99 loopback 别名 + 本地 RecordingOrigin，NET_ADMIN 门控与
+  `test_fork_network_features` 一致）→ launch → 放行探针 exit 0 → 收窄 `[]` 204
+  （探针拒绝）→ 放宽 409 且 record 与收窄态相等 → 新命令再探仍拒绝：worker 运行时
+  副本未被 409 改回。断言全精确，无 substring。
+- **Ledger close-out**（`docs/task-backlog.md`）：FUP #1（`7a98755`+`aa844b7`）、
+  #7（`8ac02a7`）、#8（`84e807f`）、#9（`710ddd2`）、#10（`beff30f`）、#12
+  （`0e15572`）→ ✅；#4（产品决策）、#5（route-B 前置）、#11（约定）⬜ open 并显式
+  标注；新增两条 G2 评审登记（#13 本地 snapshot fork × per-sandbox-uid uid 分配
+  缺口、#14 快照剪枝启发边界风险）；FUP #6 / T3 ✅ 原样保留。快照剪枝边界同时在
+  `control_plane/registry/snapshots.py::_prune_store` 留下 boundary note。
+- **Open-FUP 最终态**：仍 open 仅 #4（SDK 可见性，产品决策）、#5（T5 route-B 后摘
+  xfail）、#11（bisect 日志头纪律，约定）、#13/#14（G2 评审登记）；下方各历史块中
+  的 FUP 编号列表以本块与 task-backlog 为准。
+
+门禁摘要（容器 strict：image 默认 `E2B_BASE_IMAGE=python:3.11-slim` + privileged
+host-net，`E2B_TEST_STRICT_SKIPS=1`；macOS host 见下）：
+- 容器：新 egress 测试独立跑 1 passed（`tmp/g3-egress-r1.log`）；network
+  enforcement 文件全量 3 passed / 0 failed（`tmp/g3-network-file.log`，新测试第二遍
+  在内）。两条均 0 skip 0 error。
+- macOS：security 文件（含新测试）off-Linux 干净 skip 3/3
+  （`tmp/g3-macos-security.log`），无额外依赖或重 fixture 启动。
+
 ## ⚡ F11 E2B 集成收口（2026-09-06）
 
 fork F11（argv-safety exec freeze × 多线程进程树，fork 本地 `edd8c76` fix +
@@ -32,11 +63,12 @@ stdout `''` / stderr ∈ {"", "Killed\n"} / error None）、450+50 控制命令 
   0 failed / 0 error`（`tmp/f11-e2b-macos.log`；60 条 skip 全为平台能力，其中含本波
   新增 gateway+command 契约文件的 sandlock 平台 skip 1 条，无掩盖）。
 
-Open-FUP 列表据此更新：② fork F11、③ 网关 ledger headroom 已关闭（thread-tid-keying
-fork 内部残余随 ② 登记，见 `docs/task-backlog.md` row 2）；仍 open：① 远程
-pause/resume 投递、④ 网关启动失败 SDK 可见性、⑤ T5 xfail route-B 后摘除、
-7–12（task-backlog「M4 收口后的 open follow-ups」同号条目）。⑥ pure-shape workspace
-属主对齐（gate B trio）已由 G2 关闭（见下）。
+Open-FUP 列表据此更新（最终态见顶部 ⚡ G3 块）：② fork F11、③ 网关 ledger headroom
+已关闭（thread-tid-keying fork 内部残余随 ② 登记，见 `docs/task-backlog.md`
+row 2）；① 远程 pause/resume 投递、⑥ pure-shape workspace 属主对齐（gate B trio）、
+⑦–⑩、⑫ 已分别由 G1a/G2/G3 关闭（见 ⚡ G2 与顶部 ⚡ G3 块）；仍 open：④ 网关启动
+失败 SDK 可见性（产品决策）、⑤ T5 xfail route-B 后摘除、⑪ bisect 日志头纪律
+（约定），外加 G2 评审登记 #13/#14（task-backlog 同号条目）。
 
 ## ⚡ G2（FUP #6 pure-shape workspace 属主对齐 + T3 快照自嵌套守卫，2026-09-06）
 
@@ -133,12 +165,13 @@ commit `4f34e55` 的同一 pure 形态下以相同方式失败（`tmp/m4-bisect-
 pre-M4 基线 `tmp/e2b-base-20260906.log` 已含同族 migration 失败（chroot 形态；mediation
 修复后 gate A 同批已全绿）→ 判定为既有 pure 形态缺陷，登记下方 FUP #6。
 
-**Open follow-ups（详情与指针见 `docs/task-backlog.md`「M4 收口后的 open follow-ups」）**：
-① 远程 pause/resume 投递；② fork F11（argv-safety freeze × 多线程进程树，探针
-`tmp/task8_fup3_probe.py`）；③ 网关 ledger headroom——E2B 侧已关闭（FUP #3，默认
-512→1024 MiB；fork 逻辑未动）；④ 网关启动失败 SDK 可见性（日志已落地，产品决策待定）；
-⑤ T5 xfail route-B 后摘除；⑥ pure-shape workspace 属主对齐（gate B pre-existing
-trio，见上）——⑥ 已由 G2 关闭（本文件顶部 ⚡ G2 块；门禁 `tmp/g2-*.log`）。
+**Open follow-ups（详情与指针见 `docs/task-backlog.md`「M4 收口后的 open
+follow-ups」；最终态见顶部 ⚡ G3 块）**：① 远程 pause/resume 投递、② fork F11、
+③ 网关 ledger headroom（E2B 侧已关闭，FUP #3）、⑥ pure-shape workspace 属主对齐
+（gate B trio）、⑦–⑩、⑫ —— 均 ✅ 已关闭（G1a/G2/G3，提交 hash 见 task-backlog
+同号条目；门禁 `tmp/g1-*`/`tmp/g2-*`/`tmp/g3-*.log`）；仍 open：④ 网关启动失败 SDK
+可见性（日志已落地，产品决策待定）、⑤ T5 xfail route-B 后摘除、⑪ bisect 日志头
+纪律（约定），外加 G2 评审登记 #13/#14（task-backlog 同号条目）。
 
 Release note / 变更段（M4；fork 侧行为变化引用
 `third_party/sandlock/docs/CHANGELOG.md` F0–F10 段）：
@@ -160,6 +193,19 @@ Release note / 变更段（M4；fork 侧行为变化引用
 - per-sandbox 默认内存 512→1024 MiB（`E2B_DEFAULT_MEMORY_MB`）：网关 ledger headroom
   FUP 在 E2B 侧关闭——1 GiB 箱给网关 allocator reservations 与 450M MCP server 目标留出
   空间；fork 逻辑未改动，fork F11 保持 open。
+- 远程 pause/resume 投递（FUP #1，`7a98755` + review `aa844b7`）：control plane 对
+  非 `local://` 节点 push pause/resume（agent 路由；显式拒绝回滚 + 502、transport
+  loss best-effort），SDK pause/connect 在 multinode 下真正冻结/恢复 worker 运行时
+  （multinode pause 契约）。
+- 网络 remote push fail-closed（FUP #7，`8ac02a7`）：worker 显式 ≥400 的拒绝不再
+  静默落库 204——409 保持 409，其余显式错误映射 502 且 record 不变；仅
+  transport-loss/missing-node 保留既有 best-effort caveat。
+- 属主对齐（FUP #6，`b3bfe2d`）：pure-sandlock root worker 的 root-owned workspace
+  在 provision/import/fork 缝整树 chown 到共享 RunAs uid 1000 + 0700；per-sandbox
+  uid 路径不变（gate-B migration trio 转绿）。
+- 快照守卫（T3，`c5867be`）：`create_from_sandbox`/`expand_to` 拒绝"目标落在源之
+  内"（显式 `ValueError`），复制剪掉工作区里嵌入的快照存储根（只剪最外层、直接含
+  `snapshot.json` 根的目录；普通同名目录保留）。
 
 ## ⚡ sandlock fork 交接总览（新会话从这里开始）
 

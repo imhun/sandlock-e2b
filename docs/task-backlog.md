@@ -1,7 +1,7 @@
 # 任务总清单（路线图）
 
-汇总 2026-08-31 ~ 09-02 分析产生的待办。**状态最后更新：2026-09-06（M4/Task 11 +
-F11 E2B 集成收口）**
+汇总 2026-08-31 ~ 09-02 分析产生的待办。**状态最后更新：2026-09-06（G3 final
+wave：G1/G2 follow-ups 台账收口）**
 （细粒度执行记录见 `.superpowers/sdd/progress.md`，两阶段总路线见
 `docs/superpowers/plans/2026-09-01-sandlock-e2b-completion-roadmap.md`）。
 
@@ -90,12 +90,16 @@ ACR 镜像推送照常，git 远程推送暂缓。
 3. 不需要环境就能做的：~~T3（快照展开自嵌套守卫）~~ ✅ 已完成（G2，2026-09-06，见上表行）；
    T2 已随 fork P3 完成。
 
-## M4 收口后的 open follow-ups（Task 11 登记，2026-09-06）
+## M4 收口后的 open follow-ups（Task 11 登记，2026-09-06；G3 收口 2026-09-06）
 
-1. **FUP 远程 pause/resume 投递**（Task 5 登记）：control plane 的 pause 只对自身 registry
-   `set_state`，`envd_service/agent.py` 无 pause/resume 路由，multinode 下 SDK pause 到不了
-   worker。修复方向 = agent 路由或 state bridge，并恢复 multinode pause 契约槽。证据：
-   `.superpowers/sdd/progress.md` Task 5 段 / `tmp/sdd/task-5-report.md`。
+1. **FUP 远程 pause/resume 投递**（Task 5 登记）: ✅ 已关闭（G1a + G1a review，
+   2026-09-06；commit `7a98755` + `aa844b7`）：control plane 对非 `local://` 节点
+   push pause/resume（`_push_pause_state` / `_push_evicted_pause`，agent 新增
+   pause/resume 路由），显式非 404 拒绝回滚状态并 502、transport loss 保持既有
+   best-effort caveat；SDK pause/connect 在 multinode 下真正投到 worker。
+   契约 `tests/contract/test_pause_resume_sandlock_multinode.py` + 单测
+   `tests/unit/test_remote_pause_delivery.py`；证据
+   `tmp/sdd/g1-remote-pause-report.md`。
 2. **FUP fork F11：argv-safety freeze × 多线程进程树**（Task 8/FUP-E3 登记）: ✅ 已关闭
    （2026-09-06；fork 本地提交 `edd8c76` fix + `927d015` docs/门禁收口，未推送；wheel 已按
    927d015 重建并同步 `wheels/fork/`）。修法 = exec 冻结前把 ProcessIndex keys 归一化为
@@ -111,13 +115,14 @@ ACR 镜像推送照常，git 远程推送暂缓。
    命令 exit 0（stdout `post-gateway-ok\n`）、第二 450M 命令精确拒绝（exit 137 /
    stdout `''` / stderr ∈ {"", "Killed\n"} / error None）、450+50 控制命令 exit 0 且网关
    持续服务、record `memoryMB == 1024`。thread-tid-keying 残余登记随 row 2。
-4. **FUP 网关启动失败 SDK 可见性**（Task 10/11）：Task 11 已落地 ERROR 日志
-   （sandbox_id/port/stderr/exit text，`envd_service/runtime/context.py` watcher），SDK 仍按
-   契约先收 exit-0；SDK 可见的错误上抛是未来产品决策，未定。
-5. **FUP T5 xfail 摘除 + reason 清理**：route-B supervise 部署（supervise 进程
-   euid == 沙箱 host uid）后摘除 `tests/contract/test_uid_permissions.py:99` 的 strict xfail
-   并回归 T5；`mediation_run_as='supervisor'` 降级档与 WARN/`mediation_downgrades` 计数随之
-   移除。
+4. **FUP 网关启动失败 SDK 可见性**（Task 10/11）: ⬜ open（产品决策，未定）——
+   Task 11 已落地 ERROR 日志（sandbox_id/port/stderr/exit text，
+   `envd_service/runtime/context.py` watcher），SDK 仍按契约先收 exit-0；SDK 可见的
+   错误上抛是未来产品决策，未定。
+5. **FUP T5 xfail 摘除 + reason 清理**: ⬜ open（route-B 部署前置）——route-B
+   supervise 部署（supervise 进程 euid == 沙箱 host uid）后摘除
+   `tests/contract/test_uid_permissions.py:99` 的 strict xfail 并回归 T5；
+   `mediation_run_as='supervisor'` 降级档与 WARN/`mediation_downgrades` 计数随之移除。
 6. **FUP pure-shape workspace 属主对齐**（Task 11 gate B 首跑暴露，确未修）: ✅ 已关闭
    （G2，2026-09-06）：无 base image
    的 pure-sandlock 沙箱（root worker + 共享 uid）无法 shell 写入 workspace 根目录
@@ -133,19 +138,43 @@ ACR 镜像推送照常，git 远程推送暂缓。
    `tests/contract/test_pure_shape_workspace_ownership.py`（shell 写 workspace 根 +
    migration 跨 worker 保留 + 导出 tar 属主 == 1000）+ gate B migration trio +
    macOS 单测；门禁日志 `tmp/g2-*.log`，报告 `tmp/sdd/g2-ownership-snapshot-report.md`。
-7. **FUP 远程 network update 显式拒绝判定**（Ohm review 登记）：remote push 路径在 worker
-   返回显式 ≥300 且非 409 错误时仍落库 204——当前只把 transport-loss 视为失败；
-   应区分"显式 worker 拒绝"与"传输丢失"（fail-closed 候选：显式拒绝不落库）。
-8. **FUP pause/resume killpg-fallback 语义**（Ohm review 登记）：killpg 兜底若走
-   sandlock `kill(sig)` 实际投 SIGKILL 而非 SIGSTOP，与 pause 语义不符——fail-loud 或
-   文档化并校验。
-9. **FUP rpc drift 告警节流**（Ohm review 登记）：worker 侧 drift 检测重复告警无节流，
-   长漂移场景会刷屏。
-10. **FUP `_instance_network_snapshot` 死状态**（Ohm review 登记）：executor 的
-    `_instance_network_snapshot` 目前只写不读——或用于重建基线，或删除。
-11. **FUP bisect 证据日志头纪律**（Ohm review 登记）：容器/宿主复现与 bisect 日志应带
-    环境头（commit、env、镜像/loop、时间）便于跨会话归因。
+7. **FUP 远程 network update 显式拒绝判定**（Ohm review 登记）: ✅ 已关闭（G1b，
+   2026-09-06；commit `8ac02a7`）：`_remote_network_decision` 三态化——worker 显式
+   ≥400（404/409/500…）均为"拒绝"并在 persist 前抛错（409→409，其余→502，record
+   不变）；仅 transport loss / missing node / 非决策 3xx 保留 best-effort
+   persist + WARNING caveat。单测 `tests/unit/test_control_plane_network_remote.py`。
+8. **FUP pause/resume killpg-fallback 语义**（Ohm review 登记）: ✅ 已关闭（G1b，
+   2026-09-06；commit `84e807f`）：`RunningProcess.supports_signal_pause` 标记——
+   sandlock 后端（`SandlockRunningProcess`）为 False，killpg 失败时 fail-loud-skip
+   （WARNING 点名 pid + 命令），不再走会实际 SIGKILL 的 direct-signal 兜底。
+   单测 `tests/unit/test_process_pause_fallback.py`。
+9. **FUP rpc drift 告警节流**（Ohm review 登记）: ✅ 已关闭（G1b，2026-09-06；
+   commit `710ddd2`）：worker 侧 drift WARNING 按沙箱 60s 窗口节流
+   （`DRIFT_WARN_THROTTLE_SECONDS` + per-sandbox `_drift_warned_at`）。单测
+   `tests/unit/test_rpc_drift_throttle.py`。
+10. **FUP `_instance_network_snapshot` 死状态**（Ohm review 登记）: ✅ 已关闭（G1b，
+    2026-09-06；commit `beff30f`）：删除 executor 只写不读的
+    `_instance_network_snapshot` 状态与赋值/清理；D4=A ratchet 只读
+    `_applied_state()`。
+11. **FUP bisect 证据日志头纪律**（Ohm review 登记）: ⬜ open（约定项，无代码修复
+    计划）——容器/宿主复现与 bisect 日志应带环境头（commit、env、镜像/loop、时间）
+    便于跨会话归因。
 12. **FUP worker 侧 409 无 egress 探针断言**（Task 4 Minor 登记，随 final review
-    入 backlog 可见）：`PUT /sandboxes/{id}/network` 的 409 后 worker 运行时副本不变，
-    当前仅断言控制面 record 未变，缺 worker 侧 egress 探针断言（实际流量仍按旧策略）；
-    详见 `.superpowers/sdd/progress.md` Task 4 Minors (1)。
+    入 backlog 可见）: ✅ 已关闭（G3 final wave，2026-09-06；test commit
+    `0e15572`）：`tests/security/test_network_enforcement.py` 新增
+    `test_rejected_rewiden_leaves_worker_runtime_copy_narrowed`——IP-literal
+    allowOut 建箱 → launch → 放行探针 exit 0 → 收窄 [] 204（探针拒绝）→ 放宽 409
+    且 record 与收窄态相等 → 新命令再探仍拒绝，证明 worker 运行时副本未被 409 改回；
+    目的地址 = 198.18.0.99 loopback 别名 + 本地 RecordingOrigin（NET_ADMIN 门控
+    与 `test_fork_network_features` 一致），断言全精确、无 substring。
+13. **G2 评审登记：本地 snapshot fork × per-sandbox-uid uid 分配缺口**（2026-09-06）:
+    ⬜ open——`control_plane/api/snapshots.py` 本地分支在 per-sandbox uid
+    （`host_uid`/`E2B_PER_SANDBOX_UID`）模式下从不 acquire/apply `host_uid`
+    （pre-existing gap；remote fork 走 agent create 无此缺口）。G2（`b3bfe2d`）
+    只在 `uid_pool is None`（legacy 共享 uid）档补了属主对齐；per-sandbox 档若要用
+    本地 fork 需另做（可复用 `_provision_local` 的 acquire 流程）。
+14. **G2 评审登记：快照剪枝启发边界风险**（2026-09-06）: ⬜ open——`_prune_store`
+    只剪"本身是快照根、或直接装着 `snapshot.json` 根"的最外层目录：更深层嵌入、
+    marker 缺失/改名的存储、权限/竞态异常都会按普通目录带入快照（单测正例只固定了
+    同名普通目录保留一档）。该边界不会自身再造指数链，但会携带存储字节；见
+    `control_plane/registry/snapshots.py` `_prune_store` 的 boundary note。

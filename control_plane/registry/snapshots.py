@@ -57,6 +57,16 @@ def _prune_store(directory: str, names: list[str]) -> set[str]:
 
     Only the outermost store directory is dropped: the walk never descends
     into it, so an embedded ``snap_X/fs/snap_X/fs/...`` chain cannot form.
+
+    Boundary note (G2 review; registered in docs/task-backlog.md): detection
+    is heuristic -- a directory counts as store only when it is itself a
+    snapshot root or directly holds one (``snapshot.json`` present). A store
+    nested deeper than one level, one whose marker is missing or renamed, or
+    a permission/race failure inside ``_holds_snapshots`` degrades to copying
+    the directory as ordinary content: that alone cannot re-form the
+    exponential chain, but it can still carry store bytes into a snapshot.
+    The positive same-name case is pinned in tests/unit/test_snapshot_registry.py;
+    the boundary is deliberate and accepted for now.
     """
     here = Path(directory)
     return {
