@@ -136,23 +136,13 @@ server.run(transport="stdio")
 """
 
 
-# The inbound port mapping (S2.5) is established by the supervisor for the
-# sandbox's own netns listener, and it only works on the shared-path layout:
-# with an image rootfs the MCP gateway is exec'd inside the chroot and the
-# supervisor-side listener never comes up (the /mcp proxy then gets connection
-# refused for the whole 15s window). Pure-Sandlock workers are unaffected --
-# all three contracts pass there -- so this is tracked as a real gap, not
-# something to skip away: strict xfail fails the run the moment it starts
-# passing, and reports the shape that broke while it does not.
-@pytest.mark.xfail(
-    bool(os.environ.get("E2B_BASE_IMAGE")),
-    reason=(
-        "net_isolation + image-rootfs (chroot) MCP inbound port mapping does not "
-        "start the gateway listener (docs/HANDOFF.md, open item T4)"
-    ),
-    strict=True,
-    run=False,
-)
+# FUP-E1 closed (2026-09-06): the image-rootfs (chroot) shape passes end to end
+# when the base image carries the MCP runtime (mcp + uvicorn + mcp-gateway, see
+# deploy/docker/Dockerfile.mcp-base -> python-mcp:3.14). A plain python slim
+# rootfs cannot exec the worker's gateway (ENOENT), which is a base-image
+# composition requirement, not an inbound-mapping defect: with an MCP-capable
+# image the S2.5 mapping serves the chroot netns listener and this contract
+# asserts the full path unconditionally.
 def test_mcp_full_path_under_net_isolation(netns_servers):
     """SDK -> gateway -> envd /mcp proxy -> S2.5 inbound mapping -> sandbox
     mcp-gateway: list_tools and call_tool must work end to end."""
