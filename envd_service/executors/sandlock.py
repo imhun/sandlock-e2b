@@ -335,11 +335,6 @@ class SandlockExecutor(Executor):
         # a network update must never interleave preflight and application
         # with instance creation (M4 D4 review Important-1).
         self._lifecycle_lock = threading.Lock()
-        # D4=A: full merged network state the live instance was launched
-        # with (``_ensure_instance``), kept for diagnostics. Applicability is
-        # checked against the *applied* state below, which starts as this
-        # snapshot and ratchets down on every accepted narrowing.
-        self._instance_network_snapshot: dict | None = None
         # F4.3/S2 staleness mapping: fork child id -> (host pid, resolved
         # argv). Registered in ``start()`` before the process is returned.
         self._child_registry: dict[int, tuple[int, list[str]]] = {}
@@ -605,11 +600,6 @@ class SandlockExecutor(Executor):
                     if self._base_image and self._image_rootfs is not None
                     else "no",
                 )
-        if self._instance is not None and self._instance_network_snapshot is None:
-            # D4=A: the static full state at first launch. Applicability uses
-            # the applied state (which ratchets down from this snapshot), so
-            # the snapshot is kept for diagnostics/rebuild reference.
-            self._instance_network_snapshot = self._applied_state()
         return self._instance
 
     def close(self) -> None:
@@ -630,7 +620,6 @@ class SandlockExecutor(Executor):
                 )
                 self._instance.close()
                 self._instance = None
-            self._instance_network_snapshot = None
             self._child_registry.clear()
 
     def _child_exited(self, child_id: int, pid: int) -> None:

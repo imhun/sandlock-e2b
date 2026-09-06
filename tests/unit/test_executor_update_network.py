@@ -400,17 +400,15 @@ def test_fork_permission_error_maps_to_conflict_without_persisting(
         ex.close()
 
 
-def test_close_clears_stale_child_registry_and_snapshot(monkeypatch) -> None:
-    """Closing the instance releases the child mapping and the launch
-    snapshot; a subsequent update is pre-launch applicable again."""
+def test_close_clears_stale_child_registry(monkeypatch) -> None:
+    """Closing the instance releases the child mapping; a subsequent update
+    (no live instance) is applicable as the future static policy."""
     ex = _executor(monkeypatch, network={"allowOut": ["8.8.8.8"]})
     inst = ex._ensure_instance()
-    assert ex._instance_network_snapshot is not None
     ex._child_registry[7] = (4242, ["/bin/sh"])
     ex.close()
     assert inst.closed is True
     assert ex._child_registry == {}
-    assert ex._instance_network_snapshot is None
 
     ex.update_network({"denyOut": ["10.0.0.0/8"]})
     assert ex.instance_handle is None
