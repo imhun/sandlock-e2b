@@ -15,11 +15,15 @@ a real uvicorn stub worker:
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Awaitable, Callable
+
 import httpx
 import pytest
 from fastapi import FastAPI, Request, Response
 
 from control_plane.config import Settings as ControlSettings
+from control_plane.registry.manager import UnknownSandboxError
 from tests.conftest import _ServerThread, _free_port
 
 API = {"X-API-Key": "local-key"}
@@ -53,6 +57,9 @@ class _StubWorker:
         self.pause_calls: list[str] = []
         self.resume_calls: list[str] = []
         self.create_calls: list[str] = []
+        self.delete_calls: list[str] = []
+        self.before_pause: Callable[[str], Awaitable[None]] | None = None
+        self.before_resume: Callable[[str], Awaitable[None]] | None = None
         self.app = FastAPI()
         self._wire_routes()
 
@@ -68,15 +75,20 @@ class _StubWorker:
         @self.app.post("/agent/sandboxes/{sandbox_id}/pause")
         async def _agent_pause(sandbox_id: str) -> Response:
             stub.pause_calls.append(sandbox_id)
+            if stub.before_pause is not None:
+                await stub.before_pause(sandbox_id)
             return Response(status_code=stub.pause_status)
 
         @self.app.post("/agent/sandboxes/{sandbox_id}/resume")
         async def _agent_resume(sandbox_id: str) -> Response:
             stub.resume_calls.append(sandbox_id)
+            if stub.before_resume is not None:
+                await stub.before_resume(sandbox_id)
             return Response(status_code=stub.resume_status)
 
         @self.app.delete("/agent/sandboxes/{sandbox_id}")
         async def _agent_delete(sandbox_id: str) -> Response:
+            stub.delete_calls.append(sandbox_id)
             return Response(status_code=204)
 
 
@@ -123,6 +135,53 @@ def remote_harness(make_remote_harness):
     return make_remote_harness()
 
 
+@pytest.fixture()
+def live_remote_harness(make_apps):
+    """Factory: real HTTP control plane + one registered remote worker stub.
+
+    The control app is served over uvicorn so the stub worker can reach the
+    control plane mid-request — required to simulate the push-await window
+    where a concurrent delete removes the sandbox before an explicit push
+    error lands.
+    """
+    servers: list[_ServerThread] = []
+
+    def _make(**overrides) -> dict:
+        control, _envd = make_apps(control_settings=_settings(**overrides))
+        control_port = _free_port()
+        control_server = _ServerThread(control, control_port)
+        control_server.start()
+        stub = _StubWorker()
+        stub_port = _free_port()
+        stub_server = _ServerThread(stub.app, stub_port)
+        stub_server.start()
+        try:
+            control.state.nodes.register(
+                node_id="worker-1",
+                address=f"http://127.0.0.1:{stub_port}",
+                total_memory_mb=4096,
+                total_cpu_percent=400,
+                total_disk_mb=8192,
+                total_processes=512,
+            )
+            control.state.nodes.remove("local")
+        except BaseException:
+            control_server.stop()
+            stub_server.stop()
+            raise
+        servers.append(control_server)
+        servers.append(stub_server)
+        return {
+            "control": control,
+            "control_url": f"http://127.0.0.1:{control_port}",
+            "stub": stub,
+        }
+
+    yield _make
+    for server in servers:
+        server.stop()
+
+
 async def _create(control, sandbox_id: str):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=control), base_url="http://c"
@@ -158,7 +217,7 @@ def _ledgers(control, sandbox_id: str) -> tuple[int, int, str]:
     record = registry.get(sandbox_id)
     return (
         registry._reserved_memory,
-        node.reserved_memory_mb,
+        node.reserved_memory_mb if node is not None else 0,
         record.state,
     )
 
@@ -377,3 +436,158 @@ async def test_eviction_remote_pause_explicit_error_rolls_back_victim(
     assert victim.state == "running"
     assert victim.quota_released is False
     assert control.state.registry._reserved_memory == 1024
+
+
+async def _delete_sandbox(control_url: str, sandbox_id: str) -> None:
+    async with httpx.AsyncClient(timeout=15) as client:
+        deleted = await client.delete(
+            f"{control_url}/sandboxes/{sandbox_id}", headers=API
+        )
+    assert deleted.status_code == 204
+
+
+async def test_pause_rollback_skips_record_deleted_while_push_in_flight(
+    live_remote_harness,
+):
+    """An explicit pause error after a mid-push delete must not resurrect
+    the sandbox or leak its reservation (G1a review)."""
+    harness = live_remote_harness()
+    control = harness["control"]
+    control_url = harness["control_url"]
+    stub = harness["stub"]
+    sandbox_id = "sbx_pause_delete_race"
+    stub.pause_status = 500
+    stub.before_pause = lambda sid: _delete_sandbox(control_url, sid)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        created = await client.post(
+            f"{control_url}/sandboxes",
+            headers={**API, "X-Sandbox-Id": sandbox_id},
+            json={"templateID": "base", "timeout": 300},
+        )
+        assert created.status_code == 201
+        assert control.state.registry._reserved_memory == 512
+        assert control.state.nodes.get("worker-1").reserved_memory_mb == 512
+
+        paused = await client.post(
+            f"{control_url}/sandboxes/{sandbox_id}/pause", headers=API, json={}
+        )
+
+    assert paused.status_code == 502
+    assert paused.json()["code"] == 502
+    assert stub.pause_calls == [sandbox_id]
+    assert stub.delete_calls == [sandbox_id]
+    registry = control.state.registry
+    with pytest.raises(UnknownSandboxError):
+        registry.get(sandbox_id)
+    assert registry.count() == 0
+    assert registry._reserved_memory == 0
+    assert control.state.nodes.get("worker-1").reserved_memory_mb == 0
+
+
+async def test_resume_rollback_skips_record_deleted_while_push_in_flight(
+    live_remote_harness,
+):
+    """An explicit resume error after a mid-push delete must not resurrect
+    the sandbox or leak its reservation (G1a review)."""
+    harness = live_remote_harness()
+    control = harness["control"]
+    control_url = harness["control_url"]
+    stub = harness["stub"]
+    sandbox_id = "sbx_resume_delete_race"
+    stub.resume_status = 500
+    stub.before_resume = lambda sid: _delete_sandbox(control_url, sid)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        created = await client.post(
+            f"{control_url}/sandboxes",
+            headers={**API, "X-Sandbox-Id": sandbox_id},
+            json={"templateID": "base", "timeout": 300},
+        )
+        assert created.status_code == 201
+        paused = await client.post(
+            f"{control_url}/sandboxes/{sandbox_id}/pause", headers=API, json={}
+        )
+        assert paused.status_code == 204
+        assert control.state.registry._reserved_memory == 0
+
+        resumed = await client.post(
+            f"{control_url}/sandboxes/{sandbox_id}/resume",
+            headers=API,
+            json={},
+        )
+
+    assert resumed.status_code == 502
+    assert resumed.json()["code"] == 502
+    assert stub.resume_calls == [sandbox_id]
+    assert stub.delete_calls == [sandbox_id]
+    registry = control.state.registry
+    with pytest.raises(UnknownSandboxError):
+        registry.get(sandbox_id)
+    assert registry.count() == 0
+    assert registry._reserved_memory == 0
+    assert control.state.nodes.get("worker-1").reserved_memory_mb == 0
+
+
+def _assert_missing_node_warning(caplog, sandbox_id: str, verb: str) -> None:
+    expected = (
+        f"node worker-1 not found; {verb} for sandbox "
+        f"{sandbox_id} not pushed"
+    )
+    assert any(
+        record.levelno == logging.WARNING
+        and record.getMessage() == expected
+        for record in caplog.records
+    )
+
+
+async def test_pause_missing_node_warns_and_keeps_204(
+    remote_harness, caplog
+):
+    """A health-removed node emits the network-push WARNING instead of
+    silently taking the local branch (G1a review, minor 1)."""
+    control = remote_harness["control"]
+    sandbox_id = "sbx_pause_missing_node"
+    assert (await _create(control, sandbox_id)).status_code == 201
+    control.state.nodes.remove("worker-1")
+
+    with caplog.at_level(logging.WARNING, logger="control_plane.api.sandboxes"):
+        paused = await _call(control, sandbox_id, "pause")
+
+    assert paused.status_code == 204
+    _assert_missing_node_warning(caplog, sandbox_id, "pause")
+    assert _ledgers(control, sandbox_id) == (0, 0, "paused")
+
+
+async def test_resume_missing_node_warns_and_keeps_204(
+    remote_harness, caplog
+):
+    control = remote_harness["control"]
+    sandbox_id = "sbx_resume_missing_node"
+    assert (await _create(control, sandbox_id)).status_code == 201
+    assert (await _call(control, sandbox_id, "pause")).status_code == 204
+    control.state.nodes.remove("worker-1")
+
+    with caplog.at_level(logging.WARNING, logger="control_plane.api.sandboxes"):
+        resumed = await _call(control, sandbox_id, "resume")
+
+    assert resumed.status_code == 204
+    _assert_missing_node_warning(caplog, sandbox_id, "resume")
+    assert _ledgers(control, sandbox_id) == (512, 0, "running")
+
+
+async def test_connect_missing_node_warns_and_resumes(
+    remote_harness, caplog
+):
+    control = remote_harness["control"]
+    sandbox_id = "sbx_connect_missing_node"
+    assert (await _create(control, sandbox_id)).status_code == 201
+    assert (await _call(control, sandbox_id, "pause")).status_code == 204
+    control.state.nodes.remove("worker-1")
+
+    with caplog.at_level(logging.WARNING, logger="control_plane.api.sandboxes"):
+        connected = await _connect(control, sandbox_id)
+
+    assert connected.status_code == 200
+    _assert_missing_node_warning(caplog, sandbox_id, "resume")
+    assert _ledgers(control, sandbox_id) == (512, 0, "running")

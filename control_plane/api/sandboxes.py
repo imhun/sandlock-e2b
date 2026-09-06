@@ -192,7 +192,7 @@ def _resume_with_capacity(request, registry, record, *, timeout: int | None = No
 
 async def _push_pause_state(
     request: Request, record, *, paused: bool
-) -> None:
+) -> bool:
     """Push a pause/resume decision to the hosting worker agent (G1a).
 
     ``local://`` nodes need no HTTP push: control plane and envd service
@@ -209,7 +209,11 @@ async def _push_pause_state(
       unreachable, so its runtime cannot be acting on commands anyway.
 
     ``record.node_id`` missing from the node registry is also best-effort
-    (WARNING): there is no address to push to.
+    (WARNING): there is no address to push to. Returns ``True`` when the
+    hosting node is remote (delivery completed, 404-treated-as-success, or
+    transport-loss best-effort) and ``False`` when the caller must apply the
+    shared-registry state callback instead (``local://`` node, or a missing
+    node that was WARNINGed).
     """
     node = request.app.state.nodes.get(record.node_id or "local")
     if node is None:
@@ -219,9 +223,9 @@ async def _push_pause_state(
             "pause" if paused else "resume",
             record.sandbox_id,
         )
-        return
+        return False
     if node.address == "local://":
-        return
+        return False
     verb = "pause" if paused else "resume"
     import httpx
 
@@ -247,9 +251,9 @@ async def _push_pause_state(
             node.node_id,
             exc,
         )
-        return
+        return True
     if resp.status_code == 204:
-        return
+        return True
     if resp.status_code == 404:
         logger.info(
             "node %s has no live runtime for sandbox %s; %s delivery skipped",
@@ -257,7 +261,7 @@ async def _push_pause_state(
             record.sandbox_id,
             verb,
         )
-        return
+        return True
     logger.warning(
         "node %s rejected %s for sandbox %s: %s",
         node.node_id,
@@ -272,17 +276,35 @@ async def _push_pause_state(
     )
 
 
-def _rollback_pause(
-    request: Request, registry, record, sandbox_id: str
-) -> bool:
+def _rollback_pause(request: Request, registry, sandbox_id: str) -> str:
     """Undo a pause whose worker push failed with an explicit error (G1a).
 
-    Re-runs admission (node then global/tenant ledgers) and flips the record
-    back to running. When the freed capacity was already booked by another
-    sandbox the rollback itself has no room: the record stays paused (a
-    consistent ledger state) and the caller still surfaces the original 502.
-    Returns ``True`` only when the record is running again.
+    The push-await window can overlap a concurrent delete/resume: by the
+    time an explicit worker error lands, the record may be gone or already
+    flipped. Re-fetch the record first and roll back only when it still
+    exists AND is still paused (the state this request set); rolling back a
+    stale object would ``registry.save()`` a resurrected sandbox and leak
+    its reservation. Returns ``"rolled_back"`` (record running again),
+    ``"skipped"`` (record deleted or no longer paused; WARNING logged with
+    the observed state), or ``"failed"`` (still paused but admission has no
+    room: the record stays paused and the caller still surfaces the 502).
     """
+    try:
+        record = registry.get(sandbox_id)
+    except UnknownSandboxError:
+        logger.warning(
+            "pause rollback skipped for sandbox %s: deleted while pause "
+            "push was in flight",
+            sandbox_id,
+        )
+        return "skipped"
+    if record.state != "paused":
+        logger.warning(
+            "pause rollback skipped for sandbox %s: state is %s, not paused",
+            sandbox_id,
+            record.state,
+        )
+        return "skipped"
     try:
         _resume_with_capacity(request, registry, record)
     except OfficialError as rollback_error:
@@ -291,24 +313,50 @@ def _rollback_pause(
             sandbox_id,
             rollback_error.message,
         )
-        return False
+        return "failed"
     request.app.state.runtime_registry.set_state(sandbox_id, "running")
-    return True
+    return "rolled_back"
 
 
-def _rollback_resume(request, registry, record, sandbox_id: str) -> None:
+def _rollback_resume(request: Request, registry, sandbox_id: str) -> str:
     """Undo a resume whose worker push failed with an explicit error (G1a).
 
-    Returns the record to the paused ledger state (state + global/tenant and
-    node reservations released) so the client can retry and the sandbox
-    stays paused.
+    The push-await window can overlap a concurrent delete/pause: re-fetch the
+    record first and roll back only when it still exists AND is still running
+    (the state this request set). Returns ``"rolled_back"`` (record paused
+    again), ``"skipped"`` (record deleted or no longer running; WARNING
+    logged with the observed state), or ``"failed"`` (defensive; the record
+    could not be parked).
     """
+    try:
+        record = registry.get(sandbox_id)
+    except UnknownSandboxError:
+        logger.warning(
+            "resume rollback skipped for sandbox %s: deleted while resume "
+            "push was in flight",
+            sandbox_id,
+        )
+        return "skipped"
+    if record.state != "running":
+        logger.warning(
+            "resume rollback skipped for sandbox %s: state is %s, "
+            "not running",
+            sandbox_id,
+            record.state,
+        )
+        return "skipped"
     try:
         registry.pause(record)
     except SandboxStateConflictError:  # pragma: no cover - defensive
-        pass
+        logger.warning(
+            "resume rollback failed for sandbox %s: state is %s",
+            sandbox_id,
+            record.state,
+        )
+        return "failed"
     _park_capacity(request, record)
     request.app.state.runtime_registry.set_state(sandbox_id, "paused")
+    return "rolled_back"
 
 
 async def _image_warm(request, node, base_image, settings) -> bool:
@@ -625,25 +673,24 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
         callback in ``_pause_hook``; a remote victim needs the agent pause
         push. Transport loss stays best-effort (WARNING): the record keeps
         its paused bookkeeping and a later kill pass cleans the worker
-        runtime. An explicit non-404 worker error rolls the record back to
-        running (state + capacity) so a later kill pass never destroys a
-        runtime the worker still believes is running; when the rollback
-        cannot re-book the freed capacity the victim stays paused (consistent
-        ledger) and the kill pass still cleans it up.
+        runtime. An explicit non-404 worker error attempts a guarded rollback
+        (record re-fetched; only a record that still exists and is still
+        paused is rolled back). When the rollback succeeds, or was skipped
+        because the record vanished or its state moved off ``paused``, the
+        victim leaves the kill-pass list; only a ``paused`` record the
+        rollback could not re-admit stays in the list so the kill pass still
+        cleans it up.
         """
-        node = request.app.state.nodes.get(victim.node_id or "local")
-        if node is None or node.address == "local://":
-            return
         try:
             await _push_pause_state(request, victim, paused=True)
         except OfficialError as push_error:
             logger.warning(
-                "eviction pause push failed for sandbox %s on node %s: %s",
+                "eviction pause push failed for sandbox %s: %s",
                 victim.sandbox_id,
-                node.node_id,
                 push_error.message,
             )
-            if _rollback_pause(request, registry, victim, victim.sandbox_id):
+            outcome = _rollback_pause(request, registry, victim.sandbox_id)
+            if outcome != "failed":
                 try:
                     paused_victims.remove(victim)
                 except ValueError:  # pragma: no cover - defensive
@@ -1845,25 +1892,24 @@ async def connect_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
             # again (503 when the fleet is full; it stays paused).
             record.touch()
             _resume_with_capacity(request, registry, record, timeout=timeout)
-            node = request.app.state.nodes.get(record.node_id or "local")
-            if node is not None and node.address != "local://":
-                # G1a: the SDK's only public resume surface is
-                # ``Sandbox.connect``, so the auto-resume must thaw the
-                # remote worker too. An explicit worker error rolls the
-                # reservation/state back (sandbox stays paused, client can
-                # retry) and surfaces 502; transport loss is best-effort
-                # (documented caveat).
-                try:
-                    await _push_pause_state(request, record, paused=False)
-                except OfficialError:
-                    logger.warning(
-                        "worker resume push failed for sandbox %s during "
-                        "connect; rolling back to paused",
-                        sandbox_id,
-                    )
-                    _rollback_resume(request, registry, record, sandbox_id)
-                    raise
-            else:
+            # G1a: the SDK's only public resume surface is
+            # ``Sandbox.connect``, so the auto-resume must thaw the remote
+            # worker too. An explicit worker error attempts a guarded
+            # rollback (sandbox stays paused, client can retry) and surfaces
+            # 502; transport loss and a missing node are best-effort
+            # (documented caveat; the missing node is WARNINGed by the
+            # helper).
+            try:
+                pushed = await _push_pause_state(request, record, paused=False)
+            except OfficialError:
+                logger.warning(
+                    "worker resume push failed for sandbox %s during "
+                    "connect; rolling back to paused",
+                    sandbox_id,
+                )
+                _rollback_resume(request, registry, sandbox_id)
+                raise
+            if not pushed:
                 request.app.state.runtime_registry.set_state(
                     sandbox_id, "running"
                 )
@@ -2122,21 +2168,21 @@ async def pause_sandbox(sandbox_id: str, request: Request) -> Response:
     except SandboxStateConflictError:
         raise OfficialError(409, "Sandbox is already paused")
     _park_capacity(request, record)
-    node = request.app.state.nodes.get(record.node_id or "local")
-    if node is not None and node.address != "local://":
-        try:
-            await _push_pause_state(request, record, paused=True)
-        except OfficialError:
-            logger.warning(
-                "worker pause push failed for sandbox %s; rolling back "
-                "local state",
-                sandbox_id,
-            )
-            _rollback_pause(request, registry, record, sandbox_id)
-            raise
-    else:
-        # Combined deployment: the shared runtime-registry state callback
-        # freezes the in-process context.
+    try:
+        pushed = await _push_pause_state(request, record, paused=True)
+    except OfficialError:
+        logger.warning(
+            "worker pause push failed for sandbox %s; rolling back "
+            "local state",
+            sandbox_id,
+        )
+        _rollback_pause(request, registry, sandbox_id)
+        raise
+    if not pushed:
+        # Combined deployment (or a node the registry no longer knows, which
+        # the helper WARNINGed): the shared runtime-registry state callback
+        # freezes the in-process context; a missing remote node has no agent
+        # to reach.
         request.app.state.runtime_registry.set_state(sandbox_id, "paused")
     return Response(status_code=204)
 
@@ -2165,21 +2211,21 @@ async def resume_sandbox(sandbox_id: str, request: Request) -> Response:
         _resume_with_capacity(request, registry, record)  # E9.2
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
-    node = request.app.state.nodes.get(record.node_id or "local")
-    if node is not None and node.address != "local://":
-        try:
-            await _push_pause_state(request, record, paused=False)
-        except OfficialError:
-            logger.warning(
-                "worker resume push failed for sandbox %s; rolling back "
-                "to paused",
-                sandbox_id,
-            )
-            _rollback_resume(request, registry, record, sandbox_id)
-            raise
-    else:
-        # Combined deployment: the shared runtime-registry state callback
-        # thaws the in-process context.
+    try:
+        pushed = await _push_pause_state(request, record, paused=False)
+    except OfficialError:
+        logger.warning(
+            "worker resume push failed for sandbox %s; rolling back "
+            "to paused",
+            sandbox_id,
+        )
+        _rollback_resume(request, registry, sandbox_id)
+        raise
+    if not pushed:
+        # Combined deployment (or a node the registry no longer knows, which
+        # the helper WARNINGed): the shared runtime-registry state callback
+        # thaws the in-process context; a missing remote node has no agent
+        # to reach.
         request.app.state.runtime_registry.set_state(sandbox_id, "running")
     return Response(status_code=204)
 

@@ -7,7 +7,9 @@ pushes pause/resume to the hosting worker agent (``/agent/sandboxes/{id}/
 pause|resume``), and a real sandlock worker must freeze a background command
 until the SDK's ``Sandbox.connect`` auto-resume thaws it.
 
-Shape notes (identical to the combined contract):
+Shape notes (same thread+queue pattern and assertions as the combined
+contract, with the multinode sleep length, 1.2s, chosen so the child would
+finish inside the 2.0s silence window if pause never reached the worker):
 
 * one background ``sleep 1.2; echo done`` command;
 * ``sandbox.pause()`` then a 2.0s silence window in which the child must
@@ -96,4 +98,3 @@ def test_pause_delivery_freezes_remote_child_until_connect_resumes(
         if waiter is not None:
             waiter.join(timeout=5)
         sandbox.kill()
-
