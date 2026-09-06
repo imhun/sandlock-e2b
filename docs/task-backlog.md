@@ -189,3 +189,11 @@ ACR 镜像推送照常，git 远程推送暂缓。
     followups 登记 `third_party/sandlock/docs/fork-plan-followups.md`（A 节 F12）。
     收口流程：fork 实现 + 门禁 + wheel → E2B 指针 bump + thread/gateway 探针 +
     full gate A/B 复跑（沿用 F11 的 E2B 接线模式）。
+16. **fork C 类设计项评估（2026-09-06）**: 已评估（fork docs
+    `third_party/sandlock/docs/fork-c-class-design-assessment.md`，fork 提交
+    `9d60058`）。结论：FUP-22（non-root-but-CAP_SETUID launcher gate）→ 立项，
+    随 route-B ③ launcher 部署前完成（高优先，安全 gate）；FUP-05（目录挂载点
+    rmdir 语义）+ FUP-04（link 直击）→ fs 收尾小批立项（中优先）；FUP-19
+    （per-child fs/bind 强制）、FUP-20（credential per-child 归因）、FUP-21
+    （port-aware update_network）→ 候补（触发式，E2B/产品当前无需求；F12 完成
+    后再评估与 pid 穿透设计合并）。
