@@ -4,18 +4,22 @@ Once a command has launched the instance, the network endpoint only accepts
 monotone, ip-only allowOut narrowings: deny-all -> allowOut widening and any
 re-widening after a narrow are HTTP 409s that leave the record unchanged,
 and a narrowed update really denies the previously allowed destination for
-the next command.
+the next command. A rejected re-widen (409) leaves the worker's runtime copy
+on the narrowed policy: the next command to the formerly-allowed destination
+still fails (FUP #12).
 """
 
 from __future__ import annotations
 
 import socket
+import subprocess
 
 import httpx
 import pytest
 
 from e2b import Sandbox
 from e2b.sandbox.commands.command_handle import CommandExitException
+from tests.security.test_fork_network_features import _start_bg_origin
 
 
 def _opts(harness):
@@ -51,14 +55,47 @@ def _target_ip() -> str:
     return infos[0][4][0]
 
 
-def _tcp_probe(ip: str) -> str:
+def _tcp_probe(ip: str, port: int = 80) -> str:
     """Plain TCP connect probe: exit 0 when the destination is reachable
     under the current policy, exit 3 when egress is denied."""
     return (
         "/usr/local/bin/python3 -c \"import socket, sys; "
         f"s = socket.socket(); s.settimeout(5); "
-        f"sys.exit(0 if s.connect_ex(('{ip}', 80)) == 0 else 3)\""
+        f"sys.exit(0 if s.connect_ex(('{ip}', {port})) == 0 else 3)\""
     )
+
+
+@pytest.fixture()
+def loopback_alias_ip():
+    """Put 198.18.0.99/32 (the SSRF-guard-allowed benchmark range) on ``lo``
+    so a bare-IP ``allowOut`` can target a hermetic local origin; same
+    NET_ADMIN gating as ``test_fork_network_features.loopback_alias``."""
+    addr = "198.18.0.99"
+    add = subprocess.run(
+        ["ip", "addr", "add", f"{addr}/32", "dev", "lo"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    detail = (add.stderr or add.stdout or "").strip()
+    already_there = add.returncode != 0 and (
+        "already assigned" in detail.lower() or "file exists" in detail.lower()
+    )
+    if add.returncode != 0 and not already_there:
+        pytest.skip(
+            f"cannot put {addr}/32 on lo (needs NET_ADMIN, run with "
+            f"--cap-add NET_ADMIN): {detail[:160]}"
+        )
+    added_by_us = add.returncode == 0
+    try:
+        yield addr
+    finally:
+        if added_by_us:
+            subprocess.run(
+                ["ip", "addr", "del", f"{addr}/32", "dev", "lo"],
+                check=False,
+                capture_output=True,
+            )
 
 
 @pytest.mark.usefixtures("require_sandlock")
@@ -112,6 +149,60 @@ async def test_network_update_live_instance_is_monotone_narrowing(
         assert detail_after_409 == detail_narrowed
     finally:
         narrow.kill()
+
+
+@pytest.mark.usefixtures("require_sandlock")
+async def test_rejected_rewiden_leaves_worker_runtime_copy_narrowed(
+    multinode_two_workers, loopback_alias_ip
+):
+    """FUP #12: a successful narrow (204) denies the formerly-allowed
+    destination, and the rejected re-widen (409, record unchanged) must not
+    mutate the worker runtime copy back — a fresh command to that hermetic
+    destination still fails."""
+    harness = multinode_two_workers
+    addr = loopback_alias_ip
+    origin, thread, loop, state = _start_bg_origin(addr, 0)
+    try:
+        sandbox = Sandbox.create(
+            network={"allow_out": [addr]},
+            allow_internet_access=False,
+            **_opts(harness),
+        )
+        try:
+            launched = sandbox.commands.run("/bin/echo launch-ok")
+            assert launched.exit_code == 0
+
+            allowed = sandbox.commands.run(_tcp_probe(addr, origin.port))
+            assert allowed.exit_code == 0
+
+            narrowed = await _put_network(
+                harness, sandbox.sandbox_id, {"allowOut": []}
+            )
+            assert narrowed.status_code == 204
+            with pytest.raises(CommandExitException):
+                sandbox.commands.run(_tcp_probe(addr, origin.port))
+
+            narrow_record = (await _detail(harness, sandbox.sandbox_id))["network"]
+            assert narrow_record["allowOut"] == []
+
+            rewiden = await _put_network(
+                harness, sandbox.sandbox_id, {"allowOut": [addr]}
+            )
+            assert rewiden.status_code == 409
+            after_409 = (await _detail(harness, sandbox.sandbox_id))["network"]
+            assert after_409 == narrow_record
+
+            # The rejected widen must not have reached the worker runtime:
+            # the narrowed policy (deny all) still applies to this new exec.
+            with pytest.raises(CommandExitException):
+                sandbox.commands.run(_tcp_probe(addr, origin.port))
+        finally:
+            sandbox.kill()
+    finally:
+        origin._server.close()
+        loop.call_soon_threadsafe(state["shutdown"].set)
+        thread.join(timeout=5)
+        loop.close()
 
 
 @pytest.mark.usefixtures("require_sandlock")
