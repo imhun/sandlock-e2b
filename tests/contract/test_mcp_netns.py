@@ -9,6 +9,12 @@ executor) + the envd gateway with ``enable_net_isolation`` and
   own accept() -> in-sandbox mcp-gateway -> stdio MCP server;
 * in-sandbox CPython ``socket.connect()`` to an allowed host works on the
   fd-injection path (connect must return 0, not the injected fd number).
+
+Run requirement: when ``E2B_BASE_IMAGE`` is set (image-rootfs/chroot shape)
+the base image must be MCP-capable (``python-mcp:3.14`` built from
+``deploy/docker/Dockerfile.mcp-base``); a plain python slim rootfs cannot exec
+the envd gateway (``/usr/local/bin/mcp-gateway`` missing -> ENOENT, exit 2),
+which is a base-image composition property, not a defect of this contract.
 """
 
 from __future__ import annotations
