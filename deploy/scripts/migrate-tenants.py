@@ -267,13 +267,13 @@ def _sandbox_ledger_dims(payload: dict[str, Any]) -> dict[str, int]:
     """Quota ledger dims for one sandbox record (mirrors manager.py)."""
     return {
         "sandboxes": 1,
-        "memory": int(payload.get("memory_mb", 512)),
+        "memory": int(payload.get("memory_mb", 1024)),
         "cpu": int(payload.get("cpu_count", 1)) * 100,
         "disk": int(payload.get("disk_size_mb", 1024)),
-        # M4 D6: max_processes is the whole-box per-sandbox budget, so legacy
-        # payloads missing the field are re-created under the current default
-        # 256 (the old 64 was the pre-M4 per-command default). Explicit legacy
-        # values pass through untouched.
+        # Missing-field fallbacks mirror the current defaults (FUP3 memory
+        # 1024 MiB; M4 D6 whole-box max_processes 256). Legacy payloads
+        # missing the field are re-created under these current defaults.
+        # Explicit legacy values pass through untouched.
         "processes": int(payload.get("max_processes", 256)),
     }
 

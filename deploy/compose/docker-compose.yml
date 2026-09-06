@@ -13,7 +13,8 @@ services:
       E2B_MAX_SANDBOXES: 100
       E2B_BASE_IMAGE: python:3.14-slim
       E2B_TEMPLATE_IMAGES: '{"python3.14": "python:3.14-slim", "node22": "node:22-slim"}'
-      E2B_DEFAULT_MEMORY_MB: 512
+      # Per-sandbox default memory 1024 MiB (FUP3, 2026-09-06).
+      E2B_DEFAULT_MEMORY_MB: 1024
       E2B_DEFAULT_CPU_PERCENT: 100
       E2B_DEFAULT_DISK_MB: 1024
       # Whole-box semantics (M4 D6): max_processes is the per-sandbox

@@ -219,7 +219,7 @@ python3 -c "import sandlock; print(sandlock.landlock_abi_version())"
   "startedAt": "2026-08-28T10:00:00.000Z",
   "endAt": "2026-08-28T10:05:00.000Z",
   "cpuCount": 1,
-  "memoryMB": 512,
+  "memoryMB": 1024,
   "diskSizeMB": 1024,
   "metadata": {"user": "alice"},
   "state": "running",
@@ -429,7 +429,7 @@ e2b-sandlock-gateway/
 | `fs_readable` | `/usr`、`/lib`、`/bin` |
 | `fs_writable` | 仅沙箱工作目录 |
 | `fs_denied` | `/proc/kcore`、`/sys` |
-| `max_memory` | `max_memory="512M"`，seccomp user notification 内存跟踪 |
+| `max_memory` | `max_memory="1024M"`，seccomp user notification 内存跟踪（updated 2026-09-06: per-sandbox default 1024, FUP3） |
 | `max_cpu` | `max_cpu=100`，SIGSTOP/SIGCONT 按单核百分比限流 |
 | `max_processes` | `max_processes=256`，seccomp user notification 并发进程计数（M4 D6 whole-box semantics, 2026-09-06） |
 | `max_open_files` | `max_open_files`，RLIMIT_NOFILE |
@@ -569,7 +569,7 @@ Control Plane 必须同时限制沙箱数量和宿主总资源，避免 `E2B_MAX
 
 | 资源 | 默认值 |
 |------|--------|
-| 内存 | `E2B_DEFAULT_MEMORY_MB=512` |
+| 内存 | `E2B_DEFAULT_MEMORY_MB=1024`（updated 2026-09-06: per-sandbox default 1024, FUP3） |
 | CPU | `E2B_DEFAULT_CPU_PERCENT=100`，映射 `max_cpu=100` |
 | 磁盘 | `E2B_DEFAULT_DISK_MB=1024`，非 COW 时为准入预留 |
 | 并发进程 | `E2B_DEFAULT_MAX_PROCESSES=256`，映射 `max_processes=256`（M4 D6 whole-box semantics, 2026-09-06） |
@@ -652,7 +652,7 @@ await sandbox.kill()
 | `E2B_MAX_SANDBOXES` | `100` | 最大并发 |
 | `E2B_DEFAULT_TIMEOUT` | `300` | 默认 TTL |
 | `E2B_MAX_COMMAND_TIMEOUT` | `3600` | 命令最大超时 |
-| `E2B_DEFAULT_MEMORY_MB` | `512` | 默认内存 |
+| `E2B_DEFAULT_MEMORY_MB` | `1024` | 默认内存（updated 2026-09-06: per-sandbox default 1024, FUP3） |
 | `E2B_DEFAULT_CPU_PERCENT` | `100` | 单沙箱 CPU |
 | `E2B_DEFAULT_DISK_MB` | `1024` | 单沙箱磁盘 |
 | `E2B_DEFAULT_MAX_PROCESSES` | `256` | 单沙箱最大并发进程数（M4 D6 whole-box semantics, 2026-09-06） |
@@ -679,7 +679,7 @@ services:
       E2B_MAX_SANDBOXES: 100
       E2B_BASE_IMAGE: python:3.11-slim
       E2B_TEMPLATE_IMAGES: '{"python3.12": "python:3.12-slim", "node22": "node:22-slim"}'
-      E2B_DEFAULT_MEMORY_MB: 512
+      E2B_DEFAULT_MEMORY_MB: 1024  # updated 2026-09-06: per-sandbox default 1024, FUP3
       E2B_DEFAULT_CPU_PERCENT: 100
       E2B_DEFAULT_DISK_MB: 1024
       E2B_DEFAULT_MAX_PROCESSES: 256  # M4 D6 whole-box semantics, 2026-09-06

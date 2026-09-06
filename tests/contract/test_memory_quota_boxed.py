@@ -95,9 +95,10 @@ def start_holder_waiter(handle):
     """Consume the background holder's stream on a waiter thread.
 
     Returns ``(ready, done, thread)``: ``ready`` carries the holder MiB
-    exactly when the accumulated stdout equals ``got 800\n``; ``done``
-    carries the holder's terminal ``("ok", CommandResult)`` / ``("err",
-    CommandExitException)``. Only this thread may consume the handle.
+    exactly when the accumulated stdout equals the ``HOLDER_MB`` allocation
+    marker printed by ``alloc_script``; ``done`` carries the holder's terminal
+    ``("ok", CommandResult)`` / ``("err", CommandExitException)``. Only this
+    thread may consume the handle.
     """
     ready: queue.Queue[str] = queue.Queue(maxsize=1)
     done: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
@@ -125,8 +126,8 @@ def start_holder_waiter(handle):
 
 
 def wait_for_holder_allocation(ready, done, deadline_s: float = 30.0) -> None:
-    """Wait until the holder's stdout is exactly ``got 800\n`` (loud on early
-    holder exit or timeout)."""
+    """Wait until the holder's stdout is exactly its ``HOLDER_MB`` allocation
+    marker (loud on early holder exit or timeout)."""
     deadline = time.time() + deadline_s
     holder_ended: tuple[str, object] | None = None
     while time.time() < deadline:
