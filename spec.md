@@ -438,6 +438,11 @@ e2b-sandlock-gateway/
 
 ### 6.4.1 Sandlock API 对齐审计
 
+> **superseded（2026-09-06，M4）**：本节描述的是 pre-M4 每命令一个 Sandlock 实例的
+> 架构假设；M4 起 E2B 每沙箱持有一只 exec-only `SandboxInstance`，命令与 MCP 网关都经
+> `instance.exec()`（整箱预算、`update_network` D4=A、PTY 走 `ExecStdio.PTY`）。
+> 下文逐条仅作历史对齐审计记录，当前语义以 `docs/HANDOFF.md`「M4 收口」为准。
+
 当前 spec 必须按 `sandlock==0.8.6` 的真实 API 调整，不能沿用“cgroup v2 + 每沙箱一个常驻进程”的假设：
 
 - 一个 `Sandbox` 实例同一时刻只能运行一个命令。Envd Process Manager 必须为每个命令创建独立 Sandlock 实例。

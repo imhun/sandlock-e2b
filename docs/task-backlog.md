@@ -132,3 +132,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
     `_instance_network_snapshot` 目前只写不读——或用于重建基线，或删除。
 11. **FUP bisect 证据日志头纪律**（Ohm review 登记）：容器/宿主复现与 bisect 日志应带
     环境头（commit、env、镜像/loop、时间）便于跨会话归因。
+12. **FUP worker 侧 409 无 egress 探针断言**（Task 4 Minor 登记，随 final review
+    入 backlog 可见）：`PUT /sandboxes/{id}/network` 的 409 后 worker 运行时副本不变，
+    当前仅断言控制面 record 未变，缺 worker 侧 egress 探针断言（实际流量仍按旧策略）；
+    详见 `.superpowers/sdd/progress.md` Task 4 Minors (1)。

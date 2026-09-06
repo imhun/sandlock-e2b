@@ -14,8 +14,8 @@
 > **进度账本**：`.superpowers/sdd/progress.md`（本仓库，git-ignored）。
 > **Task 11 报告**：`tmp/sdd/task-11-report.md`（提交 hash、门禁摘要行、xfail 清单、FUP 列表）。
 
-任务状态与提交（main；fork 子模块 docs commit `8c5f020`（docs-only，位于 fork core
-F10 tip `b955ae9` 之上），本地未推送）：
+任务状态与提交（main；fork 子模块 docs commit `48ec096`（docs-only，位于 docs commit
+`8c5f020` 与 fork core F10 tip `b955ae9` 之上），本地未推送）：
 
 - Task 0/0.5/0.6（fork F10 前置）：fork 修复 `9dd134e..b955ae9`（评审 clean，门禁非 root
   822/532/98/98/36/3/0/454 + root oci 144/supervise_root 2/mediation_2uid 8）；

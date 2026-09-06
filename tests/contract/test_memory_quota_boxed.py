@@ -4,18 +4,19 @@ The original plan paired the over-budget command with a live MCP gateway
 (gateway holds 450M, command 450M denied, command 50M accepted). That pairing
 is not expressible on the current sandlock fork wheel: a multithreaded
 gateway process poisons later exec creations (argv-safety freeze EPERM, exit
-127), and the gateway's own ledger leaves <200M headroom inside the 512M box,
-so a 450M MCP server child cannot start. Those fork-level blockers are
-tracked as follow-up F11; the D8-allowed pure-sandlock sibling variant below
-formalizes the exact same-instance accounting through the SDK:
+127; gateway-shape blocker evidence: ``tmp/perf/task8-fup3-evidence-100-450-50.txt``),
+and the gateway's own ledger leaves <200M headroom inside the 512M box, so a
+450M MCP server child cannot start. Those fork-level blockers are tracked as
+follow-up F11; the D8-allowed pure-sandlock sibling variant below formalizes
+the exact same-instance accounting through the SDK:
 
 * one background command child holds 450 MiB (touched pages) on the sandbox's
   single long-lived instance;
 * a second concurrent 450 MiB command must be denied with the exact SDK
   signature recorded in ``tmp/perf/task8-fup3-sdk-signature-variants.txt``
-  and ``tmp/perf/task8-fup3-evidence-100-450-50.txt`` (host-present evidence;
-  ``CommandExitException`` exit_code 137, empty stdout, error None, stderr one
-  of the recorded exact set ``{"", "Killed\\n"}``);
+  (host-present evidence; ``CommandExitException`` exit_code 137, empty
+  stdout, error None, stderr one of the recorded exact set
+  ``{"", "Killed\\n"}``);
 * with the same 450 MiB holder, a concurrent 50 MiB command succeeds exactly
   (exit 0, stdout ``got 50\n``) and the holder later finishes cleanly.
 
