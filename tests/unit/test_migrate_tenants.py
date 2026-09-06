@@ -228,6 +228,9 @@ def test_redis_sandbox_migration():
 def _seed_sandbox_record(
     client, sandbox_id: str, *, tenant_id=None, started_at=_iso(2025)
 ) -> None:
+    # Explicit legacy value: pre-M4 per-command max_processes 64 passes
+    # through untouched (only the missing-field fallback aligns to the M4 D6
+    # whole-box default 256 in deploy/scripts/migrate-tenants.py).
     client.set(
         f"e2b:record:{sandbox_id}",
         json.dumps(
@@ -263,6 +266,41 @@ def test_redis_migration_backfills_tenant_ledger():
         "cpu": 100,
         "disk": 1024,
         "processes": 64,
+    }
+
+
+def test_redis_migration_missing_max_processes_backfills_under_whole_box_default():
+    """M4 D6: legacy payloads missing ``max_processes`` are re-created under
+    the current whole-box default 256 (the old 64 was the pre-M4 per-command
+    default, which no longer exists as a per-sandbox budget)."""
+    server = fakeredis.FakeServer()
+    client = fakeredis.FakeRedis(server=server)
+    client.set(
+        "e2b:record:sbx_noproc",
+        json.dumps(
+            {
+                "sandbox_id": "sbx_noproc",
+                "template_id": "base",
+                "client_id": "cli_x",
+                "started_at": _iso(2025),
+                "end_at": _iso(2025),
+                "memory_mb": 512,
+                "cpu_count": 1,
+                "disk_size_mb": 1024,
+            }
+        ),
+    )
+    counts = migrate_tenants.migrate_redis_sandboxes(
+        client, "e2b", {"t1": {"before": _iso(2026)}}, None, dry_run=False
+    )
+    assert dict(counts) == {"t1": 1}
+    raw = client.hgetall("e2b:quota:tenant:t1")
+    assert {k.decode(): int(v) for k, v in raw.items()} == {
+        "sandboxes": 1,
+        "memory": 512,
+        "cpu": 100,
+        "disk": 1024,
+        "processes": 256,
     }
 
 

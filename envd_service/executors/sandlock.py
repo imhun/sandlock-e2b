@@ -493,13 +493,49 @@ class SandlockExecutor(Executor):
             except RuntimeError as exc:
                 message = str(exc)
                 if "closed" not in message and "dead" not in message:
+                    logger.warning(
+                        "sandlock instance launch failed sandbox_id=%s "
+                        "instance_name=%s error=%s",
+                        self._sandbox_id or "-",
+                        self._instance_name,
+                        message,
+                    )
                     raise
                 # The prior session was closed (shutdown/idle reclaim) or died
                 # (machinery failure): rebuild exactly once, and let a second
                 # failure bubble up unchanged.
-                self._instance = None
-                self._instance = SandboxInstance(
-                    policy, name=self._instance_name
+                reason = "closed" if "closed" in message else "dead"
+                logger.info(
+                    "sandlock instance relaunching after %s sandbox_id=%s "
+                    "instance_name=%s",
+                    reason,
+                    self._sandbox_id or "-",
+                    self._instance_name,
+                )
+                try:
+                    self._instance = SandboxInstance(
+                        policy, name=self._instance_name
+                    )
+                except RuntimeError as exc2:
+                    logger.warning(
+                        "sandlock instance relaunch failed sandbox_id=%s "
+                        "instance_name=%s error=%s",
+                        self._sandbox_id or "-",
+                        self._instance_name,
+                        str(exc2),
+                    )
+                    raise
+            if self._instance is not None:
+                logger.info(
+                    "sandlock instance created sandbox_id=%s instance_name=%s "
+                    "max_memory=%s max_processes=%d chroot=%s",
+                    self._sandbox_id or "-",
+                    self._instance_name,
+                    f"{self._memory_mb}M",
+                    self._max_processes,
+                    "yes"
+                    if self._base_image and self._image_rootfs is not None
+                    else "no",
                 )
         if self._instance is not None and self._instance_network_snapshot is None:
             # D4=A: the static full state at first launch. Applicability uses
@@ -512,6 +548,11 @@ class SandlockExecutor(Executor):
         """Close the exec instance and release the handle (idempotent)."""
         with self._lifecycle_lock:
             if self._instance is not None:
+                logger.info(
+                    "sandlock instance closed sandbox_id=%s instance_name=%s",
+                    self._sandbox_id or "-",
+                    self._instance_name,
+                )
                 self._instance.close()
                 self._instance = None
             self._instance_network_snapshot = None
@@ -1141,14 +1182,26 @@ class SandlockExecutor(Executor):
             raise unimplemented("Sandlock is not available on this platform")
         stdio = ExecStdio.PTY if config.pty else ExecStdio.PIPED
         resolved = self.resolve_cmd(config.cmd)
-        proc = await asyncio.to_thread(
-            inst.exec,
-            resolved,
-            stdio,
-            **self._exec_params(
-                config, bind_ports=self._bind_ports_for(config)
-            ),
-        )
+        try:
+            proc = await asyncio.to_thread(
+                inst.exec,
+                resolved,
+                stdio,
+                **self._exec_params(
+                    config, bind_ports=self._bind_ports_for(config)
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "sandlock exec failed sandbox_id=%s instance_name=%s argv=%s "
+                "error_type=%s error=%s",
+                self._sandbox_id or "-",
+                self.instance_name,
+                resolved,
+                type(exc).__name__,
+                exc,
+            )
+            raise
         # F4.3/S2 staleness mapping: register the fork child (id -> pid +
         # resolved argv) before the running process is returned so a later
         # ``update_network`` can log which children keep their old policy.

@@ -9,6 +9,7 @@ closed/dead launch -- is unit-testable on macOS / CI.
 from __future__ import annotations
 
 import hashlib
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -56,6 +57,20 @@ def test_lazy_instance_created_once_with_sandbox_id_name(monkeypatch) -> None:
     assert inst1.name == "sbx_lazy"
 
 
+def test_instance_created_logs_ceiling_summary(monkeypatch, caplog) -> None:
+    """D10: instance creation logs sandbox_id/instance_name plus a short
+    ceiling summary (memory, process budget, chroot yes/no)."""
+    ex = _executor(monkeypatch, "sbx_log")
+    with caplog.at_level(
+        logging.INFO, logger="envd_service.executors.sandlock"
+    ):
+        ex._ensure_instance()
+    assert [r.message for r in caplog.records] == [
+        "sandlock instance created sandbox_id=sbx_log instance_name=sbx_log "
+        "max_memory=512M max_processes=256 chroot=no"
+    ]
+
+
 def test_close_is_idempotent_and_releases_handle(monkeypatch) -> None:
     ex = _executor(monkeypatch)
     inst = ex._ensure_instance()
@@ -63,6 +78,21 @@ def test_close_is_idempotent_and_releases_handle(monkeypatch) -> None:
     ex.close()
     assert inst.closed is True
     assert ex.instance_handle is None
+
+
+def test_close_logs_once_and_second_close_is_silent(monkeypatch, caplog) -> None:
+    """D10: explicit close logs one INFO line; an idempotent second close
+    (no live instance) adds nothing."""
+    ex = _executor(monkeypatch)
+    ex._ensure_instance()
+    with caplog.at_level(
+        logging.INFO, logger="envd_service.executors.sandlock"
+    ):
+        ex.close()
+        ex.close()
+    assert [r.message for r in caplog.records] == [
+        "sandlock instance closed sandbox_id=sbx_abc instance_name=sbx_abc"
+    ]
 
 
 def test_close_then_ensure_creates_new_instance_with_same_name(monkeypatch) -> None:
@@ -110,7 +140,7 @@ def test_ensure_instance_returns_none_without_sandlock(monkeypatch) -> None:
     "message", ["sandlock instance is closed", "sandlock instance is dead"]
 )
 def test_ensure_instance_rebuilds_once_after_closed_or_dead_launch(
-    monkeypatch, message
+    monkeypatch, message, caplog
 ) -> None:
     attempts = [0]
 
@@ -123,9 +153,19 @@ def test_ensure_instance_rebuilds_once_after_closed_or_dead_launch(
 
     ex = _executor(monkeypatch)
     monkeypatch.setattr(sl, "SandboxInstance", _ClosedOnce)
-    inst = ex._ensure_instance()
+    with caplog.at_level(
+        logging.INFO, logger="envd_service.executors.sandlock"
+    ):
+        inst = ex._ensure_instance()
     assert attempts[0] == 2
     assert inst.name == "sbx_abc"
+    reason = "closed" if "closed" in message else "dead"
+    assert [r.message for r in caplog.records] == [
+        "sandlock instance relaunching after "
+        f"{reason} sandbox_id=sbx_abc instance_name=sbx_abc",
+        "sandlock instance created sandbox_id=sbx_abc instance_name=sbx_abc "
+        "max_memory=512M max_processes=256 chroot=no",
+    ]
 
 
 def test_second_closed_launch_failure_bubbles(monkeypatch) -> None:
@@ -144,7 +184,7 @@ def test_second_closed_launch_failure_bubbles(monkeypatch) -> None:
     assert ex.instance_handle is None
 
 
-def test_unrelated_runtime_error_does_not_retry(monkeypatch) -> None:
+def test_unrelated_runtime_error_does_not_retry(monkeypatch, caplog) -> None:
     attempts = [0]
 
     class _LaunchFailed(_FakeInstance):
@@ -154,9 +194,16 @@ def test_unrelated_runtime_error_does_not_retry(monkeypatch) -> None:
 
     ex = _executor(monkeypatch)
     monkeypatch.setattr(sl, "SandboxInstance", _LaunchFailed)
-    with pytest.raises(RuntimeError, match=r"^sandlock_instance_launch failed$"):
-        ex._ensure_instance()
+    with caplog.at_level(
+        logging.WARNING, logger="envd_service.executors.sandlock"
+    ):
+        with pytest.raises(RuntimeError, match=r"^sandlock_instance_launch failed$"):
+            ex._ensure_instance()
     assert attempts[0] == 1
+    assert [r.message for r in caplog.records] == [
+        "sandlock instance launch failed sandbox_id=sbx_abc "
+        "instance_name=sbx_abc error=sandlock_instance_launch failed"
+    ]
 
 
 # --- Task 2 (M4 D3): per-exec start path on the held instance ---------------

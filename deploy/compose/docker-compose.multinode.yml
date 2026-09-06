@@ -22,7 +22,11 @@ services:
       E2B_DEFAULT_MEMORY_MB: 512
       E2B_DEFAULT_CPU_PERCENT: 100
       E2B_DEFAULT_DISK_MB: 1024
-      E2B_DEFAULT_MAX_PROCESSES: 64
+      # Whole-box semantics (M4 D6): max_processes is the per-sandbox
+      # instance budget shared by every command and the MCP gateway, so the
+      # default is 256 (fork's whole-box default), not the pre-M4 per-command
+      # 64. Node capacity math: E2B_MAX_TOTAL_PROCESSES / 256.
+      E2B_DEFAULT_MAX_PROCESSES: 256
       E2B_MAX_TOTAL_MEMORY_MB: 8192
       E2B_MAX_TOTAL_CPU_PERCENT: 400
       E2B_MAX_TOTAL_DISK_MB: 10240

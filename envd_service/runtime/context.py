@@ -19,6 +19,59 @@ from envd_service.runtime.registry import RuntimeSandbox
 logger = logging.getLogger(__name__)
 
 _MCP_PORT_BASE = 51000
+_GATEWAY_STDERR_TAIL_BYTES = 4096
+
+
+async def _watch_mcp_gateway_exit(
+    proc, *, sandbox_id: str, port: int
+) -> None:
+    """Log a gateway process that terminates with its stderr/exit text.
+
+    Task 10 found gateway start failures were silent: the SDK's gateway start
+    command reports an immediate exit-0 while the real gateway process keeps
+    running, and nothing consumes its streams, so an early non-zero exit (e.g.
+    a missing interpreter or a bad config) vanished. This watcher drains the
+    gateway output (bounded stderr tail) and logs the exit code plus stderr
+    text when the process ends. Logging only -- the SDK contract is unchanged.
+    The task is cancelled by ``shutdown()`` before the gateway is killed, so a
+    normal teardown SIGKILL is not reported as a failure.
+    """
+    stderr_tail = bytearray()
+    try:
+        async for kind, chunk in proc.output():
+            if kind == "stderr":
+                stderr_tail.extend(chunk)
+                if len(stderr_tail) > _GATEWAY_STDERR_TAIL_BYTES:
+                    del stderr_tail[
+                        : len(stderr_tail) - _GATEWAY_STDERR_TAIL_BYTES
+                    ]
+        code = await proc.exit_code()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:  # noqa: BLE001 - never kill the worker watcher
+        logger.error(
+            "MCP gateway watch failed sandbox_id=%s port=%s error_type=%s "
+            "error=%s",
+            sandbox_id,
+            port,
+            type(exc).__name__,
+            exc,
+        )
+        return
+    if code == 0:
+        logger.info(
+            "MCP gateway exited sandbox_id=%s port=%s exit_code=0",
+            sandbox_id,
+            port,
+        )
+        return
+    logger.error(
+        "MCP gateway exited sandbox_id=%s port=%s exit_code=%d stderr=%r",
+        sandbox_id,
+        port,
+        code,
+        stderr_tail.decode("utf-8", "replace"),
+    )
 
 
 class McpPortPool:
@@ -117,6 +170,7 @@ class SandboxRuntimeContext:
         self.watchers = WatcherRegistry(self.files)
         self.watch_stream = WatchDirStream(self.files)
         self._mcp_gateway = None
+        self._mcp_gateway_watch: asyncio.Task | None = None
         self._mcp_port: int | None = None
         self._mcp_token: str | None = None
         self._network = dict(record.network) if record.network else None
@@ -168,6 +222,9 @@ class SandboxRuntimeContext:
     def shutdown(self) -> None:
         self.processes.kill_all()
         self.processes.remove_sandbox()
+        if self._mcp_gateway_watch is not None:
+            self._mcp_gateway_watch.cancel()
+            self._mcp_gateway_watch = None
         if self._mcp_gateway is not None:
             try:
                 self._mcp_gateway.kill(9)
@@ -257,13 +314,31 @@ class SandboxRuntimeContext:
                     stdin_enabled=False,
                 )
             )
-        except BaseException:
+        except BaseException as exc:
             # M4 D3: the allocated port is this sandbox's instance bind
             # ceiling (pushed before the first exec), so it stays allocated
             # for the sandbox even when this start fails -- a retry must
             # reuse the same port or the exec would exceed the fixed
             # ceiling. shutdown() returns it to the pool.
+            logger.error(
+                "MCP gateway start failed sandbox_id=%s port=%s "
+                "error_type=%s error=%s",
+                self.record.sandbox_id,
+                port,
+                type(exc).__name__,
+                exc,
+            )
             self._mcp_token = None
             raise
         self._mcp_gateway = proc
+        # Task 10: gateway failures are silent to the SDK, so watch the real
+        # process and log non-zero exits with their stderr text (logging only).
+        if getattr(proc, "output", None) is not None:
+            self._mcp_gateway_watch = asyncio.create_task(
+                _watch_mcp_gateway_exit(
+                    proc,
+                    sandbox_id=self.record.sandbox_id,
+                    port=port,
+                )
+            )
         return proc

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +19,10 @@ import envd_service.mcp.gateway as gw
 from envd_service.config import Settings
 from envd_service.http.auth import HttpAuthError, http_error_response
 from envd_service.http.mcp import router as mcp_router
-from envd_service.runtime.context import SandboxRuntimeContext
+from envd_service.runtime.context import (
+    SandboxRuntimeContext,
+    _watch_mcp_gateway_exit,
+)
 from envd_service.runtime.registry import RuntimeSandbox
 from tests.conftest import _ServerThread, _free_port
 
@@ -344,6 +348,72 @@ async def test_gateway_start_failure_keeps_port_for_retry_until_shutdown(
     ctx.shutdown()
     assert ctx.mcp_port is None
     assert pool.allocate() == allocated[0]
+
+
+@pytest.mark.asyncio
+async def test_gateway_start_failure_logs_error_with_port_and_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """D10: an executor.start failure in the MCP gateway path logs ERROR with
+    sandbox_id/port and the exception text (logging only; the SDK contract --
+    port pinned for retry, token cleared -- is unchanged)."""
+    import envd_service.runtime.context as context_mod
+
+    pool = context_mod.McpPortPool()
+    monkeypatch.setattr(context_mod, "_next_mcp_port", pool.allocate)
+    monkeypatch.setattr(context_mod, "_release_mcp_port", pool.release)
+    record = RuntimeSandbox(
+        sandbox_id="sbx_mcp_fail",
+        access_token="at",
+        workspace_dir=str(tmp_path),
+        base_image="python-mcp:3.14",
+        mcp={"name": "echo", "command": "python3"},
+    )
+    ctx = SandboxRuntimeContext(record, Settings(executor="local"))
+
+    class _FailExecutor:
+        async def start(self, config):  # noqa: ANN001
+            raise RuntimeError("gateway start failed")
+
+    monkeypatch.setattr(ctx, "executor", _FailExecutor())
+    with caplog.at_level(
+        logging.ERROR, logger="envd_service.runtime.context"
+    ):
+        with pytest.raises(RuntimeError, match="gateway start failed"):
+            await ctx.start_mcp_gateway({"name": "echo"}, "tok")
+    assert ctx.mcp_port == 51001  # port stays pinned to the sandbox
+    assert [r.message for r in caplog.records] == [
+        "MCP gateway start failed sandbox_id=sbx_mcp_fail "
+        "port=51001 error_type=RuntimeError error=gateway start failed"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mcp_gateway_early_exit_logs_error_with_stderr_text(
+    caplog,
+) -> None:
+    """D10/Task 10: a gateway process that terminates non-zero (the failure
+    mode that is silent to the SDK) logs ERROR with port/sandbox_id and its
+    stderr/exit text."""
+
+    class _EarlyExitGateway:
+        async def output(self):
+            yield ("stdout", b"ignored")
+            yield ("stderr", b"gateway boom\n")
+
+        async def exit_code(self) -> int:
+            return 2
+
+    with caplog.at_level(
+        logging.ERROR, logger="envd_service.runtime.context"
+    ):
+        await _watch_mcp_gateway_exit(
+            _EarlyExitGateway(), sandbox_id="sbx_gw", port=51001
+        )
+    assert [r.message for r in caplog.records] == [
+        "MCP gateway exited sandbox_id=sbx_gw port=51001 exit_code=2 "
+        "stderr='gateway boom\\n'"
+    ]
 
 
 @pytest.mark.asyncio
