@@ -34,9 +34,50 @@ stdout `''` / stderr ∈ {"", "Killed\n"} / error None）、450+50 控制命令 
 
 Open-FUP 列表据此更新：② fork F11、③ 网关 ledger headroom 已关闭（thread-tid-keying
 fork 内部残余随 ② 登记，见 `docs/task-backlog.md` row 2）；仍 open：① 远程
-pause/resume 投递、④ 网关启动失败 SDK 可见性、⑤ T5 xfail route-B 后摘除、⑥ pure-shape
-workspace 属主对齐（gate B trio）、7–12（task-backlog「M4 收口后的 open follow-ups」
-同号条目）。
+pause/resume 投递、④ 网关启动失败 SDK 可见性、⑤ T5 xfail route-B 后摘除、
+7–12（task-backlog「M4 收口后的 open follow-ups」同号条目）。⑥ pure-shape workspace
+属主对齐（gate B trio）已由 G2 关闭（见下）。
+
+## ⚡ G2（FUP #6 pure-shape workspace 属主对齐 + T3 快照自嵌套守卫，2026-09-06）
+
+主仓库两个提交（见 git log，fork 未动）：`fix(sandlock): align pure-shape workspace
+ownership with run-as identity (FUP6)`、`fix(snapshots): refuse self-nesting copies and
+prune embedded store roots (T3)`。报告 `tmp/sdd/g2-ownership-snapshot-report.md`。
+
+- **FUP #6 根因与修法**：pure-sandlock（无 base image）沙箱命令以 host RunAs 身份直写
+  workspace（无 chroot ⇒ 无 supervisor 中介），而 root worker provision 出的 workspace
+  是 root:root 0755（gate-B migration trio 首个命令 EACCES；`tmp/m4-bisect-t1-pure.log`
+  与 M4 基线证据同前）。修法 = `envd_service/uid_pool.py` 新增 `align_shared_uid_workspace`：
+  worker 为 root 且 workspace 属主仍为 root 时，整树 chown 到 legacy 共享 RunAs uid
+  `1000` 并收紧 0700（复用 `apply_sandbox_ownership` 语义；**不** blanket-chmod 0777，
+  不触碰共享卷 slice——per-uid 隔离模型不变）。接入四处 provision 缝：agent create、
+  agent import（tar `data` filter 会丢 uid/gid，展开后需重对齐）、control-plane 本地
+  provision、本地 snapshot fork。per-sandbox uid（`host_uid`）路径原样保留；非 root
+  worker 无操作（创建者身份 == RunAs 身份）。新增 pure-shape 回归契约
+  `tests/contract/test_pure_shape_workspace_ownership.py`（shell 写 workspace 根 +
+  migration 跨 worker 保留 + 目标导出 tar 属主 == 1000）与单测
+  `tests/unit/test_workspace_ownership.py`（决策部分全平台 + chown 部分 root）。
+- **T3 根因与守卫**：`SnapshotRegistry` base 默认 = workspace_base
+  （`control_plane/app.py`），快照目录与沙箱工作区同级；`expand_to`/`create_from_sandbox`
+  若把存储复制进快照自身会指数嵌套到 `ENAMETOOLONG`（证据 `tmp/stale-20260902/`）。守卫 =
+  复制前拒绝"目标落在源之内"（显式 `ValueError`），并用 ignore 回调剪掉工作区里嵌入的
+  快照存储根（只剪最外层：目录本身是快照根、或直接装着快照根；普通同名目录原样保留）。
+  用例 `tests/unit/test_snapshot_registry.py` 3 条（先 RED 后 GREEN），snapshot 契约回归全绿。
+
+门禁摘要（日志 `tmp/g2-*.log`）：
+- macOS full（unit+contract+sdk python/js+security）：`916 passed / 64 skipped /
+  0 failed / 0 error`（`tmp/g2-macos-full.log`；新单测决策部分全平台跑，chown 部分 root
+  标记跳过，skip 全为平台能力）。
+- 容器 pure（`E2B_BASE_IMAGE=` + netns + strict）：migration 全套 + pure-shape 属主契约 +
+  snapshot 契约/单测 `22 passed / 0 skipped / 0 failed`（`tmp/g2-pure-container.log`）；
+  full gate B `981 passed / 3 skipped / 0 failed / 0 error`（`tmp/g2-full-gate-b.log`，
+  基线 921/3/3 —— gate-B migration trio 转绿）。
+- 容器 image-rootfs（`E2B_BASE_IMAGE=python-mcp:3.14` + netns + strict）：migration 全套
+  `7 passed / 0 failed`（`tmp/g2-gateA-migration-container.log`）；full gate A
+  `981 passed / 2 skipped / 1 xfailed (T5) / 0 failed / 0 error`
+  （`tmp/g2-full-gate-a.log`）。
+- M4 narrow（canonical 10-file list，image-rootfs `python:3.14-slim` strict）：
+  `80 passed / 0 skipped / 0 failed`（`tmp/g2-m4narrow-container.log`）。
 
 ## ⚡ M4 收口（2026-09-06，Task 0/0.5/0.6/1–11 全部完成）
 
@@ -648,9 +689,12 @@ E2B_CREATE_QUEUE_MAX             100   # 并发排队上限；满 → 429 + retr
   里 new、控制目录靠 `kill(pid,0)` 判活。问题清单 Q1–Q15、里程碑 M0–M4 与验收标准见
   `third_party/sandlock/docs/e2b-integration.md` §8；E2B 侧接线记 backlog **E10**。
   **回归风险最大的是 Q10**：`max_processes` 从"每命令 64"变成"整箱 64"，必须同步调默认值。
-- **T3** 复现并修 `SnapshotRegistry.expand_to` 的快照自嵌套
-  （`snapshots/snap_X/fs/snapshots/snap_X/fs/...`，见证据目录
-  `tmp/stale-20260902/`）；当前无用例覆盖这条路径。
+- **T3** ✅ 已修（G2，2026-09-06，见本文件顶部 ⚡ G2 块）：`SnapshotRegistry` 的
+  `create_from_sandbox`/`expand_to` 复制前拒绝"目标落在源之内"（`ValueError`），并以
+  ignore 回调剪掉工作区里嵌入的快照存储根——不再出现
+  `snapshots/snap_X/fs/snapshots/snap_X/fs/...` 自嵌套；普通同名目录不受影响
+  （`tests/unit/test_snapshot_registry.py` 3 条 + snapshot 契约回归全绿）。事故证据目录
+  `tmp/stale-20260902/`（4.9G，确认无用即可单独删除）。
 
 ### P2 — 真实 NFS 部署未验证
 
@@ -753,10 +797,10 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
   全部符号（此前只按时间戳存疑）；发布前重跑构建脚本仍是硬性步骤。
   子模块 `upstream-pr/netns-free-clean` 现多一个**纯文档**提交 `afe4921`
   （`docs/e2b-integration.md`），代码基线仍是 `be387c7` ⇒ 不需要因此重建 wheel。
-- **新发现，未复现未修**：`tmp/stale-20260902/test-runtime/**/snapshots/snap_X/fs/snapshots/snap_X/fs/...`
-  出现同一快照自嵌套，路径长到 `ENAMETOOLONG`（`SnapshotRegistry.expand_to` 会把快照存储
-  复制进快照自身）。本轮没有用例失败，只在这份被移走的旧 scratch 里发现；证据保留在
-  `tmp/stale-20260902/`（5.0G，确认无用即可删）。
+- **已修（G2，2026-09-06）**：`tmp/stale-20260902/test-runtime/**/snapshots/snap_X/fs/snapshots/snap_X/fs/...`
+  的同一快照自嵌套（路径长到 `ENAMETOOLONG`，根因 = `SnapshotRegistry` base 默认 =
+  workspace_base，展开会把存储复制进快照自身）。守卫与用例见本文件顶部 ⚡ G2 块；
+  证据目录 `tmp/stale-20260902/`（4.9G，确认无用即可删）。
 
 ### 09-03：公共镜像改走国内镜像源，两种形态全量复跑
 

@@ -72,7 +72,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | T1 | 真实 XFS/ext4 目标机上复测沙箱文件属主：① 沙箱能否 `chmod` 自己写的文件（本机 EPERM）；② 共享卷 1777+sticky 的跨 uid 保护是否真生效（本机 A 写的文件宿主属主是 uid 0，而沙箱 host_uid 是 20000） | ⬜ 待环境（两条用例已改为带证据跳过，不再靠巧合通过） | — |
 | T6 | 内存/CPU/进程配额按实例而非按沙箱 ⇒ 超卖（默认 K=2 实测 1.76x），放大为节点超卖 | ✅ 已定方案：改为**每沙箱一个 sandlock 实例**（fork 文档 §8，取代 P10 共享资源组） | — |
 | T2 | `third_party/sandlock`：`_HANDLED_FIELDS` 登记 `notify_rate_limit`，消掉假告警 | ✅ 完成（fork P3：`17ee48d` fix + `fad056a` doc，子模块 b955ae9 内） | `17ee48d` |
-| T3 | 复现并修 `SnapshotRegistry.expand_to` 快照自嵌套（`snap_X/fs/snap_X/fs/...`） | ⬜ 仍未落地（本仓库无守卫/无测试/无提交；设计见 `docs/superpowers/plans/2026-09-04-sandlock-remaining-goals.md` Task 0.2，登记在下方 follow-ups） | — |
+| T3 | 复现并修 `SnapshotRegistry.expand_to` 快照自嵌套（`snap_X/fs/snap_X/fs/...`） | ✅ 已落地（G2，2026-09-06）：`create_from_sandbox`/`expand_to` 复制前拒绝"目标落在源之内"（`ValueError`），并用 ignore 回调剪掉工作区里嵌入的快照存储根（只剪最外层，普通同名目录保留）；用例 `tests/unit/test_snapshot_registry.py` 3 条 + snapshot 契约回归全绿；设计见 `docs/superpowers/plans/2026-09-04-sandlock-remaining-goals.md` Task 0.2 | 见 git log（fix(snapshots) commit） |
 
 ## 运维侧任务
 
@@ -87,9 +87,8 @@ ACR 镜像推送照常，git 远程推送暂缓。
 1. 上线前：`wheels/fork` 重建（E7 最终 tip）+ 镜像重建推 ACR；
 2. 用户解除"不做远程部署"约束后：O1（prjquota）、E1.2/E8.1 目标机部署与远程复测、O2/O3；
    T1（真实 XFS/ext4 上复测沙箱文件属主，去掉那条带证据的 skip）随 O1 一起做；
-3. 不需要环境就能做的：T3（快照展开自嵌套守卫——设计已在
-   `docs/superpowers/plans/2026-09-04-sandlock-remaining-goals.md` Task 0.2，先写复现用例
-   再加 `create_from_sandbox`/`expand_to` 的存储剪除/拒绝守卫；T2 已随 fork P3 完成）。
+3. 不需要环境就能做的：~~T3（快照展开自嵌套守卫）~~ ✅ 已完成（G2，2026-09-06，见上表行）；
+   T2 已随 fork P3 完成。
 
 ## M4 收口后的 open follow-ups（Task 11 登记，2026-09-06）
 

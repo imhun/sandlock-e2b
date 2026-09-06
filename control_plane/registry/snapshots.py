@@ -21,6 +21,51 @@ from gateway_common.paths import validate_sandbox_id
 from gateway_common.timeutil import to_iso_z, utcnow
 
 
+def _is_within(child: Path, parent: Path) -> bool:
+    """``child`` is equal to or under ``parent`` (both already resolved)."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_snapshot_root(path: Path) -> bool:
+    """The directory itself is a snapshot root (``_write_record`` always
+    emits ``snapshot.json`` there)."""
+    return (path / "snapshot.json").is_file()
+
+
+def _holds_snapshots(path: Path) -> bool:
+    """``path`` is a snapshot root, or directly holds snapshot roots
+    (i.e. a registry store directory was carried into the workspace)."""
+    if _is_snapshot_root(path):
+        return True
+    try:
+        return any(
+            child.is_dir() and _is_snapshot_root(child)
+            for child in path.iterdir()
+        )
+    except OSError:
+        # Permission/race: copy it as an ordinary directory rather than
+        # dropping the whole tree.
+        return False
+
+
+def _prune_store(directory: str, names: list[str]) -> set[str]:
+    """``copytree`` ignore callback pruning embedded snapshot stores.
+
+    Only the outermost store directory is dropped: the walk never descends
+    into it, so an embedded ``snap_X/fs/snap_X/fs/...`` chain cannot form.
+    """
+    here = Path(directory)
+    return {
+        name
+        for name in names
+        if _holds_snapshots(here / name)
+    }
+
+
 class UnknownSnapshotError(KeyError):
     pass
 
@@ -109,8 +154,18 @@ class SnapshotRegistry:
         snapshot_id = snapshot_id or sandbox_id().replace("sbx_", "snap_")
         fs_path = self._fs_path(snapshot_id)
         if copy_fs:
+            src = Path(workspace_dir).resolve()
+            dst = Path(fs_path).resolve()
+            if _is_within(dst, src):
+                raise ValueError(
+                    f"snapshot destination {dst} is inside its source {src}"
+                )
             shutil.copytree(
-                Path(workspace_dir), fs_path, symlinks=True, dirs_exist_ok=False
+                src,
+                dst,
+                symlinks=True,
+                dirs_exist_ok=False,
+                ignore=_prune_store,
             )
         record = SnapshotRecord(
             snapshot_id=snapshot_id,
@@ -182,8 +237,13 @@ class SnapshotRegistry:
 
     def expand_to(self, record: SnapshotRecord, dest: str | Path) -> Path:
         """Copy a snapshot's filesystem into a new sandbox workspace."""
-        target = Path(dest)
+        target = Path(dest).resolve()
+        source = Path(record.fs_path).resolve()
+        if _is_within(target, source):
+            raise ValueError(
+                f"snapshot destination {target} is inside its source {source}"
+            )
         shutil.copytree(
-            record.fs_path, target, symlinks=True, dirs_exist_ok=True
+            source, target, symlinks=True, dirs_exist_ok=True, ignore=_prune_store
         )
         return target
