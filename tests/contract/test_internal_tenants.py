@@ -60,7 +60,9 @@ async def test_internal_tenants_reports_usage_and_limits(make_apps):
             "memoryMB": 512,
             "cpuPercent": 100,
             "diskMB": 1024,
-            "processes": 64,
+            # M4 D6: max_processes is the whole-box per-sandbox budget,
+            # default 256 (the old 64 was the pre-M4 per-command value).
+            "processes": 256,
         }
         assert by_tenant[T1]["limits"] == {
             "max_sandboxes": 3,
@@ -106,7 +108,8 @@ async def test_internal_tenants_compat_mode(make_apps):
             "memoryMB": 512,
             "cpuPercent": 100,
             "diskMB": 1024,
-            "processes": 64,
+            # M4 D6: whole-box default 256.
+            "processes": 256,
         }
 
 
@@ -136,5 +139,6 @@ async def test_internal_tenants_reports_unowned_after_mixed_creates(make_apps):
             "memoryMB": 512,
             "cpuPercent": 100,
             "diskMB": 1024,
-            "processes": 64,
+            # M4 D6: whole-box default 256.
+            "processes": 256,
         }

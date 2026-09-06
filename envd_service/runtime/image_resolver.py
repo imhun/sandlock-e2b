@@ -136,6 +136,35 @@ def _cache_rootfs(cache_dir: Path, image: str, digest: str) -> Path:
     return cache_dir / cache_name / "rootfs"
 
 
+def _shared_cache_dir() -> Path | None:
+    """The node's configured image cache (``E2B_IMAGE_CACHE_DIR`` or the
+    config default), when it differs from the cache a caller passed in.
+
+    Image-rootfs resolution is normally called with the sandbox's own cache
+    root, but locally built images (e.g. the MCP-capable ``python-mcp:3.14``
+    staged via the local-OCI sidecar) live in the node cache. Falling back to
+    that shared link lets every caller resolve a locally provisioned image
+    without a registry round-trip (which would 403 for a tag the mirror does
+    not carry).
+    """
+    raw = os.environ.get("E2B_IMAGE_CACHE_DIR", "tmp/sandboxes/_images")
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def _shared_cache_rootfs(image: str, cache: Path) -> Path | None:
+    """Completed rootfs for ``image`` from the node's shared image cache."""
+    shared = _shared_cache_dir()
+    if shared is None:
+        return None
+    shared = shared.resolve()
+    if shared == Path(cache).resolve():
+        return None
+    link = local_oci_paths(shared, image)[1]
+    return _rootfs_from_local_link(link)
+
+
 # --- locally built images (no registry configured) --------------------------
 # ``Template.build`` without ``E2B_IMAGE_REGISTRY`` has no registry to push
 # to, so the control plane exports the build as an OCI layout tar into the
@@ -301,6 +330,9 @@ def resolve_image_rootfs(
         return cached_local
     if tar_path.is_file():
         return _resolve_local_oci(image, cache, tar_path, link)
+    shared_rootfs = _shared_cache_rootfs(image, cache)
+    if shared_rootfs is not None:
+        return shared_rootfs
     _ref, client = _client_for(
         image,
         registry_username=registry_username,

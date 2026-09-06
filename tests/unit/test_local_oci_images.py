@@ -138,6 +138,32 @@ def test_peek_warm_tracks_the_local_tar_without_network(
     assert peek_image_warm(IMAGE, tmp_path) == {"cached": True, "digest": digest}
 
 
+def test_resolve_falls_back_to_shared_cache_link_for_local_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed rootfs registered in the node's shared cache
+    (``E2B_IMAGE_CACHE_DIR``, e.g. a locally built MCP-capable base image)
+    resolves from any caller cache without a registry round-trip."""
+
+    def _no_registry(*args, **kwargs):  # pragma: no cover - must not run
+        raise AssertionError("shared-cache image must not hit a registry")
+
+    monkeypatch.setattr(image_resolver, "_client_for", _no_registry)
+    shared = tmp_path / "shared"
+    other = tmp_path / "other"
+    shared.mkdir()
+    other.mkdir()
+    rootfs = shared / "python-mcp_3.14-fake" / "rootfs"
+    rootfs.mkdir(parents=True)
+    (rootfs / ".complete").touch()
+    _tar, link = local_oci_paths(shared, "python-mcp:3.14")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.write_text(f"sha256:fake\n{rootfs}\n", encoding="utf-8")
+    monkeypatch.setenv("E2B_IMAGE_CACHE_DIR", str(shared))
+
+    assert resolve_image_rootfs("python-mcp:3.14", other) == rootfs
+
+
 def test_unreadable_layout_reports_which_file_is_broken(tmp_path: Path) -> None:
     """A truncated/foreign tar fails as an image error, not a registry call."""
     tar_path = _write_local_oci(tmp_path, IMAGE, _tar_bytes({"README": b"nope"}))
