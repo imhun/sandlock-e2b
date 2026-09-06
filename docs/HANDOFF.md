@@ -4,38 +4,66 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
-## ⚡ M4 会话交接（2026-09-06，新会话从这里开始）
+## ⚡ M4 收口（2026-09-06，Task 0/0.5/0.6/1–11 全部完成）
 
-> 主线目标：E2B 侧 M4 接线（fork §8 / fork-plan-followups FUP-E2）+ FUP-E1（T4 复测）+
-> FUP-E3（超卖断言化）+ 发布前置，最终 E2B 全量绿。
+> 主线目标已达成：E2B 侧 M4 接线（fork §8 / fork-plan-followups FUP-E2）+ FUP-E1（T4 复测）+
+> FUP-E3（超卖断言化）+ 发布前置；E2B 全量门禁通过。
 > **执行计划（唯一入口）**：`docs/superpowers/plans/2026-09-06-e2b-m4-wiring.md`
-> （Task 0 基线归因 / 0.5 mediation 下发 / 0.6 fork F10 / 1–11 M4 主线；含 ⚠️ 待拍板项）。
+> （Task 0 基线归因 / 0.5 mediation 下发 / 0.6 fork F10 / 1–11 M4 主线）。
 > **进度账本**：`.superpowers/sdd/progress.md`（本仓库，git-ignored）。
+> **Task 11 报告**：`tmp/sdd/task-11-report.md`（提交 hash、门禁摘要行、xfail 清单、FUP 列表）。
 
-当前状态（2026-09-06 收口）：
-- fork F9 tip wheel 基线：E2B 全量 **24 failed / 843 passed / 1 skipped / 2 xfailed**
-  （`tmp/e2b-base-20260906.log`；root+privileged+XFS+strict+`E2B_BASE_IMAGE=python:3.14-slim`）。
-- 根因分叉：E2B 从未下发 `mediation_run_as`，F6.1 默认 caller 关停 root worker +
-  RunAs(1000) + chroot 现网形态；且 fork tip 另有 supervisor×chroot create/launch 回归。
-- **fork F10 已修并评审 clean**：`9dd134e..b955ae9`（`upstream-pr/netns-free-clean` 本地，
-  未推送；根因 = remap 前置 chdir + Landlock 规则构建顺序；门禁非 root
-  822/532/98/98/36/3/0/454 + root oci 144/supervise_root 2/mediation_2uid 8）。
-  报告/评审：`third_party/sandlock/tmp/sdd/f10-report.md` / `f10-review.md`。
-- e2b 子模块指针仍钉 `6a5cfec`；fork 本地 HEAD 已到 `b955ae9`（下次提交 bump）。
+任务状态与提交（main；fork 子模块钉 `b955ae9` = F10 tip，本地未推送）：
 
-新会话第一步（按序）：
-1. 重建 fork tip wheel 并 verify（HEAD `b955ae9`；`third_party/sandlock/python/build-wheels.sh`，
-   产出该仓库 `wheels/` + manifest，参照 `tmp/sdd/f9-wheel-*.log`）。
-2. e2b 提交子模块 bump（`b955ae9`）→ 跑 E2B Task 0.5 窄矩阵（mediation 下发 + `tmp/mediation_probe.py`/
-   `tmp/instance_probe.py` 转绿）→ 基线 24 failed 归组核验（G1 转绿、G2 独立判定）。
-3. M4 主线 Task 1–11（计划按序执行；大块任务用子 agent，沿用 subagent-driven-development）。
-4. 用户 ⚠️ 待拍板项（计划文末）：D4 update 放宽 409 / D5 不加 fork kill(sig) / D6
-   max_processes 64→256 / D7 删 PTY_BRIDGE_SCRIPT / D8 超卖断言档位。
+- Task 0/0.5/0.6（fork F10 前置）：fork 修复 `9dd134e..b955ae9`（评审 clean，门禁非 root
+  822/532/98/98/36/3/0/454 + root oci 144/supervise_root 2/mediation_2uid 8）；
+  E2B 提交 `5d38537`（Task 0.5：显式 `mediation_run_as='supervisor'`）+ 子模块 bump `614224f`；
+  基线 24 failed 归零（Task 0.5 全量 878 passed / 0 failed / 1 skipped / 2 xfailed）。
+- Task 1–3：`4f34e55` / `e0f5507` / `6de41db` / `05f349f`（实例持有、per-exec、
+  MCP 端口 ceiling、生命周期与 127 契约）+ 容器门禁收敛 `cb36b7a`。
+- Task 4（含 Task 9 验收）：`4149a1f` + review fix `4d617b9`（update_network S2，D4=A：
+  放宽/模型翻转 HTTP 409 不落库；local apply 原子）。
+- Task 5：`f64d7ab`（pause/resume 按 child 进程组 SIGSTOP/SIGCONT，语义保持；网关不暂停）。
+- Task 6：`19dc1f5`（chroot 用 `minimal_dev` 六键；T5 strict xfail 保持）。
+- Task 7：`f337724`（`max_processes` 整箱默认 64→256 全链 + 容量口径 2048/256=8）。
+- Task 8：`3bf5d0e`（FUP-E3 sibling-exec 超卖断言；网关+命令变体 fork-blocked → F11）。
+- Task 10：`883d38d` + `f67a6b9`（T4 摘标：根因 = envd base-image 组成——slim rootfs 无
+  mcp-gateway；改用 MCP-capable `python-mcp:3.14` 后 chroot+netns 契约两形态 3/3 绿）。
+- Task 11（本任务）：D10 可观测性日志点 + caplog pin、deploy/compose 与 migrate-tenants
+  默认对账 64→256、五处文档一致性 + 计划 checklist、三轮全量门禁、FUP 登记；提交与
+  门禁摘要见 `tmp/sdd/task-11-report.md`。
+
+全量门禁基线（日志 `tmp/m4-full-gate-a.log` / `tmp/m4-full-gate-b.log` /
+`tmp/m4-full-gate-macos.log`；精确 summary 行与 xfail 清单见 `tmp/sdd/task-11-report.md`）：
+
+- 容器 full gate A：image-rootfs + netns + XFS + npm + strict（`E2B_BASE_IMAGE=python-mcp:3.14`，
+  `E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2`）→ 0 failed / 0 error；唯一 xfail = T5。
+- 容器 full gate B：pure sandlock + netns + strict（`E2B_BASE_IMAGE=` 空）→ 0 failed / 0 error。
+- macOS 宿主 full（unit + contract + sdk python/js + security）→ 0 failed。
+
+Release note / 变更段（M4；fork 侧行为变化引用
+`third_party/sandlock/docs/CHANGELOG.md` F0–F10 段）：
+
+- `max_processes` 默认按整箱 64→256（D6）：单沙箱实例内命令与 MCP 网关共享整箱预算；
+  节点进程维度容量 = `total_processes / 256`（默认 2048 → 8 个标准沙箱），compose 与
+  migrate-tenants 回退已同步。
+- chroot 形态用 `minimal_dev` 六节点（ptmx/pts/null/urandom/zero/tty）替换整树宿主 `/dev`；
+  `/dev/shm`、`/dev/mqueue` 在沙箱视图中构造上不存在，无需 carve-out（D7）。
+- 每沙箱一只 exec-only `SandboxInstance`（M4 D1–D3）：exec 是 envd 唯一命令路径（无
+  `popen` 残留）；实例惰性创建、delete/kill/TTL/evict/migrate/worker 停全部幂等收敛到
+  `close()`，closed/dead 后重建一次并重试，仍败才向 SDK 报错。
+- 网络 update 语义（D4=A）：live-expressible = IP-literal `allowOut` 收窄（只影响新 exec，
+  在跑 child 保旧策略，staleness 回报日志）；`denyOut`/default-allow 实例 live-immutable；
+  放宽/模型翻转在 persist 前 HTTP 409；local apply 原子；remote push-then-persist 带既有
+  transport-loss caveat。
+- pause 冻结 `ProcessManager` 命令组（网关不在命令组、不暂停）；T5 xfail 在 route-B
+  supervise 部署前保持（属预期）。
 
 ## ⚡ sandlock fork 交接总览（新会话从这里开始）
 
 > 📄 **集成事实源已下沉到 fork 仓库**：`third_party/sandlock/docs/e2b-integration.md`
-> （已落地方案 R*/S*/E*/M*、待实施 P1–P8、未解决 SL-1/T4/T5、缓解与验证矩阵）。
+> （已落地方案 R*/S*/E*/M*、待实施 P1–P8、未解决 SL-1/T5（T4 已随 FUP-E1 关闭，
+> 见顶部「M4 收口」块）、缓解与验证矩阵）。
 > E2B 为 sandlock 写的方案文档也已迁入该仓库 `docs/`（原文件名不变）：
 > `sandlock-network-wildcard.md`（R1–R14 总纲，已落地）、
 > `netns-isolation-fd-injection.md`（loopback netns + fd 注入，落地为 S1.1/S2.x）、
@@ -735,17 +763,21 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
 4. **T4/T5：镜像 rootfs(chroot) 形态的两个已测出缺陷（strict xfail 跟踪，不 skip）**
    - T4 `net_isolation` + chroot：MCP 入站端口映射起不来（`/mcp` 代理整段连不上），
      纯 sandlock 形态 3/3 通过 ⇒ `test_mcp_full_path_under_net_isolation` 在该形态
-     `xfail(strict=True, run=False)`；
+     `xfail(strict=True, run=False)`。**状态更新（2026-09-06，Task 10/FUP-E1）：已关闭**——
+     根因是 envd 侧 base-image 组成（slim rootfs 无 mcp-gateway → ENOENT exit 2），非 fork；
+     改用 MCP-capable 基镜像 `python-mcp:3.14`（`deploy/docker/Dockerfile.mcp-base`）后
+     chroot+netns MCP 契约两形态 3/3 绿，xfail 已摘。详见顶部「M4 收口」块。
    - T5 chroot 形态下共享卷写入仍经 supervisor 归属（`fs_denied` 的代打开路径在
      chroot 里无法回避，见上）⇒ `test_volume_shared_rw_across_distinct_uids` 在该形态
      `xfail(strict=True)`，非 chroot 形态必须真通过（并新增断言
-     `written_by == ra.host_uid`，回归即红）。
-   两条都在"意外通过"时立刻失败，逼我们摘掉标记。
+     `written_by == ra.host_uid`，回归即红）。**仍开（唯一 xfail）**：route-B supervise
+     部署（euid == 沙箱 host uid）后摘除，见顶部 follow-up 列表。
 
 全开一次（镜像 rootfs + netns + XFS + npm + strict）：
 
 - `867 passed / 1 skipped / 2 xfailed / 0 failed / 0 error`（`tmp/session-scratch/full-final.log`）
-- 2 条 xfail = T4/T5（chroot 形态那两个真缺陷）；唯一 skip 是
+- 2 条 xfail = T4/T5（chroot 形态那两个真缺陷，2026-09-03 观测；T4 已于 2026-09-06
+  Task 10 关闭，剩余 T5 见顶部「M4 收口」块）；唯一 skip 是
   `test_volume_quota.py:274`（"XFS supported: degradation path not exercised"）——
   它测的是"XFS 不可用时的降级路径"，本机 XFS 可用所以走另一分支，属于互斥分支而非能力缺失。
 
@@ -867,7 +899,7 @@ cargo test -p sandlock-core --offline --test integration test_netns -- --test-th
 | `envd_service/process/logs.py` | 命令输出 JSONL 采集 |
 | `envd_service/runtime/image_resolver.py` | rootfs 解包、pull、registry login、digest 缓存 key |
 | `E2B_IMAGE_CACHE_DIR/_oci/` | 无 registry 时本地构建的 OCI layout tar + `.link` 侧车（resolver 优先读它） |
-| `third_party/sandlock/docs/e2b-integration.md` | sandlock 侧唯一事实源：已落地方案 / 待实施 P1–P8 / 未解决 SL-1、T4、T5 / 验证矩阵（fork `upstream-pr/netns-free-clean`，文档提交 `afe4921`） |
+| `third_party/sandlock/docs/e2b-integration.md` | sandlock 侧唯一事实源：已落地方案 / 待实施 P1–P8 / 未解决 SL-1（T5 摘除前置 route-B）/ 验证矩阵；T4 已于 2026-09-06 关闭（fork `upstream-pr/netns-free-clean`，M4 状态随 Task 11 收口） |
 | `docs/sandlock-upstream-issues.md` | 编号映射索引（内容以上述 fork 文档为准） |
 | `third_party/sandlock/docs/{e2b-integration,sandlock-network-wildcard,netns-isolation-fd-injection,sandbox-level-cow,upstream-pr-netns-free}.md` | sandlock 侧全部方案与问题文档（E2B 撰写的部分已迁入 fork 仓库） |
 | `envd_service/gateway.py` | 路由缓存 + `/internal/routes/{id}/invalidate` |

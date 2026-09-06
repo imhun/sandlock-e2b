@@ -1,6 +1,6 @@
 # 任务总清单（路线图）
 
-汇总 2026-08-31 ~ 09-02 分析产生的待办。**状态最后更新：2026-09-02（E8.3 测试环境清零）**
+汇总 2026-08-31 ~ 09-02 分析产生的待办。**状态最后更新：2026-09-06（M4/Task 11 收口）**
 （细粒度执行记录见 `.superpowers/sdd/progress.md`，两阶段总路线见
 `docs/superpowers/plans/2026-09-01-sandlock-e2b-completion-roadmap.md`）。
 
@@ -36,7 +36,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | S3.2 | 私有源/镜像安装切换 | ✅ 完成（Dockerfile 按 ABI+ARCH 从 `wheels/fork` 安装） |
 | S3.3 | 上游 PR 分支整理 | ✅ 完成（推送按约束暂缓） |
 
-| E10 | 每沙箱一实例（fork §8，M0–M4）：三层拆分 + E2B 接线。含 Q10 风险：`max_processes` 从『每命令 64』变『整箱 64』，落地时必须同步上调默认值并写变更说明；另含 Q6 网络策略语义、Q7 控制目录身份、Q8 泄漏回收。**安全前置（fork §7 M0′：SL-4/SL-5 +组级 kill/freeze 拆 per-child + `proc_count` 对账）未清零前不得在 envd 开 `exec`**；M4 第一步只做「网关+命令」半合并 | ⬜ 未开始（等 fork M0 落地） | — |
+| E10 | 每沙箱一实例（fork §8，M0–M4）：三层拆分 + E2B 接线。含 Q10 风险：`max_processes` 从『每命令 64』变『整箱 64』，落地时必须同步上调默认值并写变更说明；另含 Q6 网络策略语义、Q7 控制目录身份、Q8 泄漏回收。**安全前置（fork §7 M0′）未清零前不得在 envd 开 `exec`**；M4 第一步只做「网关+命令」半合并 | ✅ 完成（fork 侧 M0–M4/F0–F10 在子模块 b955ae9；E2B 接线 5d38537（Task 0.5 supervisor 档）→ 4f34e55/e0f5507/6de41db/05f349f/cb36b7a/f64d7ab/19dc1f5/f337724/4149a1f/4d617b9/3bf5d0e/883d38d/f67a6b9 → Task 11 收口；全量门禁见 HANDOFF。剩余 follow-ups 见下方「M4 收口后的 open follow-ups」） | `5d38537`…`f67a6b9`（+Task 11） |
 | SL-1 | 路径中介（USER_NOTIF）以 supervisor 身份执行 `openat/unlinkat/fchmodat/...`：沙箱文件属主变 root、`chmod` 失效、共享目录 per-uid 保护不成立 | ⬜ 待修（正文+复现+修法在 `third_party/sandlock/docs/e2b-integration.md` §3.1/§2 P1；`gh` 不可用 + token 只读，暂无法直接开上游 issue） |：`wheels/fork` 需按 E7 最终 sandlock tip 重建（`scripts/build-sandlock-wheels.sh`），
 镜像内 wheel 与 fork 提交一致后才能推 ACR。
 
@@ -66,12 +66,12 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | E8.3 | 测试环境失败清零（把 E8.2 的"环境类失败"逐条定根因） | ✅ 完成（Linux 容器全量 **0 failed / 0 error**，843 passed / 18 skipped；macOS 全量（含 sdk python/js + security）**0 failed**，804 passed / 53 skipped；顺带修掉 2 个产品缺陷（模板镜像切换未落盘、无 registry 构建产物无法解析） | `ac59152` `d8b7f41` `87874a0` `0a235b4` `22e5acc` |
 | E8.4 | 公共镜像不直连 Docker Hub：`E2B_REGISTRY_MIRRORS` + 凭据按 host 作用域 + harness 存储改容器原生盘 + 清掉一条假 skip | ✅ 完成（默认形态 851 passed / 18 skipped；image-rootfs 形态 73 failed+28 errors → 853 passed / 16 skipped；两形态 0 failed。18 条 skip 的分组与跑法见 HANDOFF「容器全量剩下的 skip」） | `a6f74e4` `3d7cc79` `08a21dc` |
 | E8.5 | 把"能跑却在跳"的用例真正跑起来：镜像自带 XFS prjquota/npm/netns/双形态 + `E2B_TEST_STRICT_SKIPS` 能力型 skip 直接判失败 | ✅ 完成（全开跑见下；顺带修掉 fs_denied 废掉 per-uid 隔离、lsattr 缺失导致孤儿只报不清） | 本次提交 |
-| T4 | net_isolation + 镜像 rootfs(chroot) 形态下 MCP 入站端口映射起不来（纯 sandlock 形态 3/3 通过） | ⬜ 新发现，已用 strict xfail 跟踪 | — |
-| T5 | chroot 形态共享卷写入经 supervisor 归属（fs_denied 代打开路径），per-uid 卷保护无法成立 | ⬜ 即上游 **SL-1**（notif 代执行未切 caller 身份），本仓库 strict xfail 跟踪；正文见 `third_party/sandlock/docs/e2b-integration.md` §3.1 | — |
+| T4 | net_isolation + 镜像 rootfs(chroot) 形态下 MCP 入站端口映射起不来（纯 sandlock 形态 3/3 通过） | ✅ 已关闭（Task 10，FUP-E1）：根因 = envd 侧 base-image 组成（slim rootfs 无 mcp-gateway，ENOENT exit 2），非 fork；改用 MCP-capable 基镜像 `python-mcp:3.14`（deploy/docker/Dockerfile.mcp-base）后 chroot+netns MCP 契约两形态 3/3 绿；xfail 已摘 | `883d38d` `f67a6b9` |
+| T5 | chroot 形态共享卷写入经 supervisor 归属（fs_denied 代打开路径），per-uid 卷保护无法还原 | ⬜ 仍 strict xfail（route-B supervise 部署前属预期；`tests/contract/test_uid_permissions.py:99`）；follow-up = route-B supervise 部署后摘除 + reason 清理；正文见 `third_party/sandlock/docs/e2b-integration.md` §3.1 | — |
 | T1 | 真实 XFS/ext4 目标机上复测沙箱文件属主：① 沙箱能否 `chmod` 自己写的文件（本机 EPERM）；② 共享卷 1777+sticky 的跨 uid 保护是否真生效（本机 A 写的文件宿主属主是 uid 0，而沙箱 host_uid 是 20000） | ⬜ 待环境（两条用例已改为带证据跳过，不再靠巧合通过） | — |
 | T6 | 内存/CPU/进程配额按实例而非按沙箱 ⇒ 超卖（默认 K=2 实测 1.76x），放大为节点超卖 | ✅ 已定方案：改为**每沙箱一个 sandlock 实例**（fork 文档 §8，取代 P10 共享资源组） | — |
-| T2 | `third_party/sandlock`：`_HANDLED_FIELDS` 登记 `notify_rate_limit`，消掉假告警 | ⬜ 待做（一行） | — |
-| T3 | 复现并修 `SnapshotRegistry.expand_to` 快照自嵌套（`snap_X/fs/snap_X/fs/...`） | ⬜ 新发现，无用例覆盖 | — |
+| T2 | `third_party/sandlock`：`_HANDLED_FIELDS` 登记 `notify_rate_limit`，消掉假告警 | ✅ 完成（fork P3：`17ee48d` fix + `fad056a` doc，子模块 b955ae9 内） | `17ee48d` |
+| T3 | 复现并修 `SnapshotRegistry.expand_to` 快照自嵌套（`snap_X/fs/snap_X/fs/...`） | ⬜ 仍未落地（本仓库无守卫/无测试/无提交；设计见 `docs/superpowers/plans/2026-09-04-sandlock-remaining-goals.md` Task 0.2，登记在下方 follow-ups） | — |
 
 ## 运维侧任务
 
@@ -86,5 +86,28 @@ ACR 镜像推送照常，git 远程推送暂缓。
 1. 上线前：`wheels/fork` 重建（E7 最终 tip）+ 镜像重建推 ACR；
 2. 用户解除"不做远程部署"约束后：O1（prjquota）、E1.2/E8.1 目标机部署与远程复测、O2/O3；
    T1（真实 XFS/ext4 上复测沙箱文件属主，去掉那条带证据的 skip）随 O1 一起做；
-3. 不需要环境就能做的：T2（fork 里 `_HANDLED_FIELDS` 一行）、T3（快照展开自嵌套，
-   先写复现用例）。
+3. 不需要环境就能做的：T3（快照展开自嵌套守卫——设计已在
+   `docs/superpowers/plans/2026-09-04-sandlock-remaining-goals.md` Task 0.2，先写复现用例
+   再加 `create_from_sandbox`/`expand_to` 的存储剪除/拒绝守卫；T2 已随 fork P3 完成）。
+
+## M4 收口后的 open follow-ups（Task 11 登记，2026-09-06）
+
+1. **FUP 远程 pause/resume 投递**（Task 5 登记）：control plane 的 pause 只对自身 registry
+   `set_state`，`envd_service/agent.py` 无 pause/resume 路由，multinode 下 SDK pause 到不了
+   worker。修复方向 = agent 路由或 state bridge，并恢复 multinode pause 契约槽。证据：
+   `.superpowers/sdd/progress.md` Task 5 段 / `tmp/sdd/task-5-report.md`。
+2. **FUP fork F11：argv-safety freeze × 多线程进程树**（Task 8/FUP-E3 登记）：MCP
+   gateway/uvicorn/threaded python 一旦进入实例，后续任何 exec 都报
+   `argv-safety freeze failed ... Operation not permitted`（fork 侧缺陷），网关+命令同实例
+   形态与 FUP-E3 gateway 变体都依赖其修复。参数化探针就绪：`tmp/task8_fup3_probe.py`；
+   证据：`tmp/sdd/task-8-report.md`。
+3. **FUP 网关 ledger headroom**（Task 8）：512M 箱内网关自身 allocator reservations 计入后，
+   MCP server 子进程只剩 ~180M（450M holder 起不来）。与 fork F11 一并决定箱预算或 ledger
+   排除规则；证据同上。
+4. **FUP 网关启动失败 SDK 可见性**（Task 10/11）：Task 11 已落地 ERROR 日志
+   （sandbox_id/port/stderr/exit text，`envd_service/runtime/context.py` watcher），SDK 仍按
+   契约先收 exit-0；SDK 可见的错误上抛是未来产品决策，未定。
+5. **FUP T5 xfail 摘除 + reason 清理**：route-B supervise 部署（supervise 进程
+   euid == 沙箱 host uid）后摘除 `tests/contract/test_uid_permissions.py:99` 的 strict xfail
+   并回归 T5；`mediation_run_as='supervisor'` 降级档与 WARN/`mediation_downgrades` 计数随之
+   移除。

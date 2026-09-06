@@ -76,6 +76,13 @@ max(min_replicas,
 容纳 `2048 / 256 = 8` 个标准沙箱（此前 `2048 / 64 = 32`）——默认上调后
 进程维度不再是富余维度，四维容量换算必须显式计入。
 
+M4 收口（2026-09-06）：执行边界 = 产品边界——每沙箱一只 exec-only
+`SandboxInstance`（命令与 MCP 网关共享箱内预算），"每命令一个实例可超卖"的形态已随
+`third_party/sandlock/docs/e2b-integration.md` §3.8 关闭。两个 fork-blocked 边界未在容量
+公式内放宽，见 `docs/task-backlog.md`「M4 收口后的 open follow-ups」：fork F11
+（多线程进程存在后 argv-safety exec 冻结 EPERM）与网关 ledger headroom（512M 箱内网关
+reservations 计入后 MCP server 子进程只剩 ~180M）。
+
 冷却策略：扩容冷却 60s；缩容冷却 10min，且仅当集群聚合利用率低于
 `E2B_AS_SCALE_DOWN_UTIL`（默认 0.40）、候选节点连续空闲且 0 活跃沙箱时
 才生效。

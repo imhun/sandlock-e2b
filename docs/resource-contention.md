@@ -237,6 +237,14 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after�
   `E2B_DEFAULT_MAX_PROCESSES` 默认 256，与 fork 出厂整箱默认对齐；节点容量口径见
   `docs/SCALING.md` §3（`total_processes` 默认 2048 ÷ 256 = 每节点 8 个标准沙箱）。
 
+**M4 关闭（2026-09-06，§3.8 / FUP-E3）**：执行边界 = 产品边界——同沙箱 K 个并发命令 +
+网关共享一只 exec-only 实例的整箱预算，实例化前"K 份各自配额"的超卖形态已由构造消除；
+FUP-E3 sibling-exec 断言（`tests/contract/test_memory_quota_boxed.py`）落成真档。
+两个 fork-blocked 边界登记在 `docs/task-backlog.md`「M4 收口后的 open follow-ups」：
+fork F11（多线程 MCP gateway/uvicorn 进程进入实例后，后续 exec 触发 argv-safety 冻结
+EPERM——网关+命令同实例变体依赖其修复，探针 `tmp/task8_fup3_probe.py`）与网关 ledger
+headroom（512M 箱内网关 allocator reservations 计入后 MCP server 子进程只剩 ~180M）。
+
 
 ## 9. 排期
 
