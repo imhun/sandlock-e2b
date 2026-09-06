@@ -31,14 +31,21 @@ trap cleanup EXIT
 # /dev/loopN nodes are not created by udev inside a container, so `losetup -f`
 # can pick a minor with no node and fail ("device node /dev/loopN is lost",
 # typically after other runs leaked loop bindings). Allocate explicitly and
-# mknod the node when it is missing.
+# mknod the node when it is missing. Host loop bindings leak across runs
+# (shared with the VM), so free minors routinely sit above 63 -- scan a wide
+# range instead of failing when the first 64 are all occupied.
 attach_loop() {
     local image="$1" dev minor candidate
     if dev="$(losetup -f --show "${image}" 2>/dev/null)" && [ -b "${dev}" ]; then
         printf '%s' "${dev}"
         return 0
     fi
-    for minor in $(seq 0 63); do
+    # losetup -f may have bound a minor whose node is missing in-container;
+    # detach it again so the scan below does not leak a second binding.
+    if [ -n "${dev:-}" ]; then
+        losetup -d "${dev}" >/dev/null 2>&1 || true
+    fi
+    for minor in $(seq 0 255); do
         candidate="/dev/loop${minor}"
         [ -e "${candidate}" ] || mknod "${candidate}" b 7 "${minor}" 2>/dev/null || continue
         if losetup "${candidate}" "${image}" 2>/dev/null; then
