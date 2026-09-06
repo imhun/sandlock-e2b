@@ -1,13 +1,20 @@
-"""E2B request to sandlock==0.8.6 API mapping."""
+"""E2B executor request to sandlock policy API mapping.
+
+The long-lived instance policy (``_build_instance_policy``) maps the
+command-independent ceiling; per-command ``cwd``/``env``/``clean_env`` and
+bind allowances are exec parameters (``_exec_params``) and never appear on
+the policy object.
+"""
 
 from __future__ import annotations
 
 import os
 
-import pytest
-
-from envd_service.executors.base import ExecConfig
 from envd_service.executors.sandlock import SandlockExecutor
+
+
+def _policy(executor: SandlockExecutor):
+    return executor._build_instance_policy()
 
 
 def test_policy_mapping_fields():
@@ -23,14 +30,7 @@ def test_policy_mapping_fields():
         allow_internet_access=False,
         enable_network=False,
     )
-    sandbox = executor._build_sandbox(
-        ExecConfig(
-            cmd=["/bin/bash", "-c", "x"],
-            env={"A": "b"},
-            cwd="/tmp/ws",
-            stdin_enabled=False,
-        )
-    )
+    sandbox = _policy(executor)
     assert sandbox.max_memory == "512M"
     assert sandbox.max_cpu == 100
     assert sandbox.max_processes == 64
@@ -46,6 +46,11 @@ def test_policy_mapping_fields():
     assert "/proc/kcore" not in sandbox.fs_readable
     assert "/dev/shm" not in sandbox.fs_readable
     assert sandbox.net_allow == []
+    # Per-command fields are exec params, never policy fields.
+    assert getattr(sandbox, "cwd", None) is None
+    assert getattr(sandbox, "env", None) is None
+    assert getattr(sandbox, "clean_env", None) is None
+    assert getattr(sandbox, "net_allow_bind", None) is None
 
 
 def test_image_rootfs_shape_carries_the_shared_path_denials(tmp_path) -> None:
@@ -64,12 +69,7 @@ def test_image_rootfs_shape_carries_the_shared_path_denials(tmp_path) -> None:
         allow_internet_access=False,
         enable_network=False,
     )
-    sandbox = executor._build_sandbox(
-        ExecConfig(
-            cmd=["/bin/sh", "-c", "x"], env={}, cwd=str(tmp_path / "ws"),
-            stdin_enabled=False,
-        )
-    )
+    sandbox = _policy(executor)
     assert "/" in sandbox.fs_readable
     for denied in ("/proc/kcore", "/sys", "/dev/shm", "/dev/mqueue"):
         assert denied in sandbox.fs_denied
@@ -96,12 +96,7 @@ def test_root_image_rootfs_policy_carries_supervisor_mediation(
         allow_internet_access=False,
         enable_network=False,
     )
-    sandbox = executor._build_sandbox(
-        ExecConfig(
-            cmd=["/bin/sh", "-c", "x"], env={}, cwd=str(tmp_path / "ws"),
-            stdin_enabled=False,
-        )
-    )
+    sandbox = _policy(executor)
     assert sandbox.mediation_run_as == "supervisor"
 
 
@@ -120,14 +115,7 @@ def test_nonroot_policy_keeps_caller_mediation(monkeypatch) -> None:
         allow_internet_access=False,
         enable_network=False,
     )
-    sandbox = executor._build_sandbox(
-        ExecConfig(
-            cmd=["/bin/bash", "-c", "x"],
-            env={},
-            cwd="/tmp/ws",
-            stdin_enabled=False,
-        )
-    )
+    sandbox = _policy(executor)
     assert sandbox.mediation_run_as == "caller"
 
 
@@ -144,11 +132,7 @@ def test_network_enabled_maps_to_allowlist():
         allow_internet_access=True,
         enable_network=True,
     )
-    sandbox = executor._build_sandbox(
-        ExecConfig(
-            cmd=["x"], env={}, cwd="/tmp/ws", stdin_enabled=False
-        )
-    )
+    sandbox = _policy(executor)
     assert "pypi.org:443" in sandbox.net_allow
 
 

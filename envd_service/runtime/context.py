@@ -120,6 +120,15 @@ class SandboxRuntimeContext:
         self._mcp_port: int | None = None
         self._mcp_token: str | None = None
         self._network = dict(record.network) if record.network else None
+        if record.mcp:
+            # M4 D3: pre-allocate the MCP gateway port at context creation so
+            # the executor's instance ceiling (``net_allow_bind``) is fixed
+            # before the first exec; ``start_mcp_gateway`` consumes it.
+            port = _next_mcp_port()
+            self._mcp_port = port
+            setter = getattr(self.executor, "set_mcp_bind_port", None)
+            if setter is not None:
+                setter(port)
 
     @property
     def mcp_port(self) -> int | None:
@@ -186,8 +195,16 @@ class SandboxRuntimeContext:
         if not os.path.exists(gateway_bin):
             gateway_bin = "/usr/local/bin/mcp-gateway"
         config_json = json.dumps(config, separators=(",", ":"))
-        port = _next_mcp_port()
-        self._mcp_port = port
+        port = self._mcp_port
+        if port is None:
+            # Defensive fallback: a sandbox without ``record.mcp`` was still
+            # asked to run the gateway -- allocate on first start so the
+            # executor ceiling gets the port before the exec.
+            port = _next_mcp_port()
+            self._mcp_port = port
+            setter = getattr(self.executor, "set_mcp_bind_port", None)
+            if setter is not None:
+                setter(port)
         self._mcp_token = token
         # The SDK reads the gateway token from /etc/mcp-gateway/.token via the
         # files API (resolved under the sandbox workspace).

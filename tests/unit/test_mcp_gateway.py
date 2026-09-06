@@ -137,9 +137,15 @@ async def test_start_mcp_gateway_allocates_port_writes_token(
     fake = _FakeExecutor()
     monkeypatch.setattr(ctx, "executor", fake)
 
+    # M4 D3: the MCP port is pre-allocated at context creation (record.mcp
+    # present) and pushed into the executor as the instance bind ceiling;
+    # start_mcp_gateway consumes it instead of allocating again.
+    port_at_create = ctx.mcp_port
+    assert port_at_create is not None and port_at_create >= 51000
+
     await ctx.start_mcp_gateway({"name": "echo", "command": "python3"}, "tok-123")
 
-    assert ctx.mcp_port is not None and ctx.mcp_port >= 51000
+    assert ctx.mcp_port == port_at_create
     assert ctx.mcp_token == "tok-123"
     cfg = fake.started[0]
     # The gateway runs through the interpreter (sandlock chroot exec handler
@@ -147,7 +153,7 @@ async def test_start_mcp_gateway_allocates_port_writes_token(
     assert cfg.cmd[0] == "/usr/local/bin/python3"
     assert cfg.cmd[1].endswith("mcp-gateway")
     assert cfg.env["GATEWAY_ACCESS_TOKEN"] == "tok-123"
-    assert cfg.env["MCP_PORT"] == str(ctx.mcp_port)
+    assert cfg.env["MCP_PORT"] == str(port_at_create)
     assert cfg.env["PATH"].startswith("/usr/local/bin")
     # The SDK reads the token via the files API at /etc/mcp-gateway/.token
     # (resolved under the workspace).
