@@ -4,6 +4,34 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
+## ⚡ M4 会话交接（2026-09-06，新会话从这里开始）
+
+> 主线目标：E2B 侧 M4 接线（fork §8 / fork-plan-followups FUP-E2）+ FUP-E1（T4 复测）+
+> FUP-E3（超卖断言化）+ 发布前置，最终 E2B 全量绿。
+> **执行计划（唯一入口）**：`docs/superpowers/plans/2026-09-06-e2b-m4-wiring.md`
+> （Task 0 基线归因 / 0.5 mediation 下发 / 0.6 fork F10 / 1–11 M4 主线；含 ⚠️ 待拍板项）。
+> **进度账本**：`.superpowers/sdd/progress.md`（本仓库，git-ignored）。
+
+当前状态（2026-09-06 收口）：
+- fork F9 tip wheel 基线：E2B 全量 **24 failed / 843 passed / 1 skipped / 2 xfailed**
+  （`tmp/e2b-base-20260906.log`；root+privileged+XFS+strict+`E2B_BASE_IMAGE=python:3.14-slim`）。
+- 根因分叉：E2B 从未下发 `mediation_run_as`，F6.1 默认 caller 关停 root worker +
+  RunAs(1000) + chroot 现网形态；且 fork tip 另有 supervisor×chroot create/launch 回归。
+- **fork F10 已修并评审 clean**：`9dd134e..b955ae9`（`upstream-pr/netns-free-clean` 本地，
+  未推送；根因 = remap 前置 chdir + Landlock 规则构建顺序；门禁非 root
+  822/532/98/98/36/3/0/454 + root oci 144/supervise_root 2/mediation_2uid 8）。
+  报告/评审：`third_party/sandlock/tmp/sdd/f10-report.md` / `f10-review.md`。
+- e2b 子模块指针仍钉 `6a5cfec`；fork 本地 HEAD 已到 `b955ae9`（下次提交 bump）。
+
+新会话第一步（按序）：
+1. 重建 fork tip wheel 并 verify（HEAD `b955ae9`；`third_party/sandlock/python/build-wheels.sh`，
+   产出该仓库 `wheels/` + manifest，参照 `tmp/sdd/f9-wheel-*.log`）。
+2. e2b 提交子模块 bump（`b955ae9`）→ 跑 E2B Task 0.5 窄矩阵（mediation 下发 + `tmp/mediation_probe.py`/
+   `tmp/instance_probe.py` 转绿）→ 基线 24 failed 归组核验（G1 转绿、G2 独立判定）。
+3. M4 主线 Task 1–11（计划按序执行；大块任务用子 agent，沿用 subagent-driven-development）。
+4. 用户 ⚠️ 待拍板项（计划文末）：D4 update 放宽 409 / D5 不加 fork kill(sig) / D6
+   max_processes 64→256 / D7 删 PTY_BRIDGE_SCRIPT / D8 超卖断言档位。
+
 ## ⚡ sandlock fork 交接总览（新会话从这里开始）
 
 > 📄 **集成事实源已下沉到 fork 仓库**：`third_party/sandlock/docs/e2b-integration.md`
