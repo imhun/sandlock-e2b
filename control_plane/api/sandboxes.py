@@ -1208,6 +1208,15 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
             from envd_service.uid_pool import apply_sandbox_ownership
 
             apply_sandbox_ownership(workspace_dir, host_uid)
+        elif pool is None:
+            # FUP #6: local (combined) worker in the legacy shared-uid shape
+            # — no uid pool means no per-sandbox host uid, so a root worker
+            # must chown the root-created workspace to the shared RunAs uid
+            # 1000 (same identity sandlock maps; the pure no-chroot sandbox
+            # shell writes it directly). Non-root workers no-op inside.
+            from envd_service.uid_pool import align_shared_uid_workspace
+
+            align_shared_uid_workspace(workspace_dir)
         request.app.state.runtime_registry.register(
             sandbox_id=record.sandbox_id,
             access_token=record.envd_access_token,

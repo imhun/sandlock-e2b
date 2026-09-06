@@ -59,6 +59,12 @@ logger = logging.getLogger(__name__)
 #: reserved uid as decimal text.
 _RESERVATION_DIR = ".uid_reservations"
 
+#: Legacy shared-uid RunAs identity (S1.2): with ``E2B_PER_SANDBOX_UID`` off
+#: a root worker maps every sandbox to host uid/gid 1000 (the same constant
+#: ``SandlockExecutor._run_as_identity`` returns; kept in parity by unit
+#: tests). A non-root worker degrades to its own identity instead.
+LEGACY_SHARED_UID = 1000
+
 
 class UidPoolError(RuntimeError):
     """Raised when the pool cannot satisfy an allocation."""
@@ -139,6 +145,58 @@ def apply_sandbox_ownership(workspace_dir: str | Path, host_uid: int) -> None:
     path = Path(workspace_dir)
     _chown_tree(path, host_uid, host_uid)
     os.chmod(path, 0o700)
+
+
+def _alignment_target_uid(*, worker_euid: int, owner_uid: int) -> int | None:
+    """Shared-uid workspace alignment decision (pure; unit-testable off-Linux).
+
+    Returns the uid a workspace should be chowned to, or ``None`` when no
+    ownership change is needed:
+
+    * non-root worker: the workspace was created as the worker's own
+      identity, which is also the RunAs identity (S1.2 / E5.1) — and the
+      worker could not chown to another uid anyway;
+    * root worker, workspace not root-owned: already aligned by someone else
+      (e.g. a previous provision or an external storage owner) — never
+      fight it.
+    """
+    if worker_euid != 0 or owner_uid != 0:
+        return None
+    return LEGACY_SHARED_UID
+
+
+def align_shared_uid_workspace(workspace_dir: str | Path) -> None:
+    """Align a root-created workspace to the legacy shared RunAs uid (FUP #6).
+
+    Pure-sandlock workspaces (no chroot) are written directly by the sandbox
+    shell with the host RunAs identity — there is no supervisor mediation
+    tier to create files on the shell's behalf (unlike the image-rootfs
+    chroot shape). A root worker creates the workspace as root:root, so the
+    shared-uid sandbox (host uid 1000) cannot write its own root directory.
+    When the worker is root and the workspace is still root-owned, chown the
+    whole tree to the shared uid with the same semantics as
+    :func:`apply_sandbox_ownership`; anything else is left untouched.
+
+    Shared-volume per-uid isolation is not weakened: this only touches the
+    sandbox workspace directory (never shared volume slices) and never
+    widens permissions to world-writable.
+    """
+    if os.geteuid() != 0:
+        return
+    path = Path(workspace_dir)
+    try:
+        owner_uid = path.stat().st_uid
+    except OSError:
+        logger.warning(
+            "cannot stat workspace %s for shared-uid ownership alignment",
+            path,
+        )
+        return
+    uid = _alignment_target_uid(
+        worker_euid=os.geteuid(), owner_uid=owner_uid
+    )
+    if uid is not None:
+        apply_sandbox_ownership(path, uid)
 
 
 class UidPool:

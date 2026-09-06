@@ -22,7 +22,10 @@ from envd_service.runtime.image_resolver import (
     peek_image_warm,
     resolve_image_rootfs,
 )
-from envd_service.uid_pool import apply_sandbox_ownership
+from envd_service.uid_pool import (
+    align_shared_uid_workspace,
+    apply_sandbox_ownership,
+)
 from envd_service.xfs_quota import (
     ProjectQuotaError,
     provision_project,
@@ -463,6 +466,16 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
                 project_id = None
         if host_uid is not None:
             apply_sandbox_ownership(workspace_dir, host_uid)
+        elif not settings.per_sandbox_uid:
+            # FUP #6: legacy shared-uid shape under a root worker — every
+            # sandlock shell runs as host uid 1000. The pure no-chroot
+            # workspace is written directly by that identity (no supervisor
+            # mediation tier), so a root-created workspace must be chowned
+            # to it or the first command is EACCES; the image-rootfs chroot
+            # shape's supervisor-mediated writes are unaffected. Per-sandbox
+            # uid mode is handled above; non-root workers create the
+            # workspace as their own RunAs identity.
+            align_shared_uid_workspace(workspace_dir)
         runtime_registry.register(
             sandbox_id=sandbox_id,
             access_token=payload.get("accessToken", ""),
@@ -808,6 +821,13 @@ async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
         return Response(status_code=400, content="Invalid tar archive")
     finally:
         tmp_path.unlink(missing_ok=True)
+    if not settings.per_sandbox_uid:
+        # FUP #6: archive extraction with the ``data`` filter drops uid/gid
+        # metadata, so the imported workspace is root-owned again — re-align
+        # it to the legacy shared RunAs identity the same way create does.
+        # With per-sandbox uids the follow-up agent create allocates and
+        # chowns to the sandbox's own host uid instead.
+        align_shared_uid_workspace(workspace)
     return Response(status_code=204)
 
 

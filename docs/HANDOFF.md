@@ -97,7 +97,7 @@ pre-M4 基线 `tmp/e2b-base-20260906.log` 已含同族 migration 失败（chroot
 `tmp/task8_fup3_probe.py`）；③ 网关 ledger headroom——E2B 侧已关闭（FUP #3，默认
 512→1024 MiB；fork 逻辑未动）；④ 网关启动失败 SDK 可见性（日志已落地，产品决策待定）；
 ⑤ T5 xfail route-B 后摘除；⑥ pure-shape workspace 属主对齐（gate B pre-existing
-trio，见上）。
+trio，见上）——⑥ 已由 G2 关闭（本文件顶部 ⚡ G2 块；门禁 `tmp/g2-*.log`）。
 
 Release note / 变更段（M4；fork 侧行为变化引用
 `third_party/sandlock/docs/CHANGELOG.md` F0–F10 段）：

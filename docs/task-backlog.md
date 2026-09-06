@@ -119,15 +119,21 @@ ACR 镜像推送照常，git 远程推送暂缓。
    euid == 沙箱 host uid）后摘除 `tests/contract/test_uid_permissions.py:99` 的 strict xfail
    并回归 T5；`mediation_run_as='supervisor'` 降级档与 WARN/`mediation_downgrades` 计数随之
    移除。
-6. **FUP pure-shape workspace 属主对齐**（Task 11 gate B 首跑暴露，确未修）：无 base image
+6. **FUP pure-shape workspace 属主对齐**（Task 11 gate B 首跑暴露，确未修）: ✅ 已关闭
+   （G2，2026-09-06）：无 base image
    的 pure-sandlock 沙箱（root worker + 共享 uid）无法 shell 写入 workspace 根目录
    （root:root 0755 vs sandbox host uid 1000），migration 三用例在其首个命令即红
    （`test_migrate_*_between_workers` / `failure_restores_source_runtime` /
    `shared_workspace_skips_transfer`）。同 3 条在 M4 前置 commit `4f34e55` 同一 pure
    形态同样失败（`tmp/m4-bisect-t1-pure.log`），pre-M4 基线 `tmp/e2b-base-20260906.log`
-   亦含同族 migration 失败 ⇒ 非 M4 回归。修复方向 = provision/import 时把 workspace
-   属主对齐到运行时 RunAs 身份（legacy 共享 uid 档），或单独决定 pure 形态属主模型；
-   证据 `tmp/m4-full-gate-b.log`。
+   亦含同族 migration 失败 ⇒ 非 M4 回归。修法 = `envd_service/uid_pool.py` 新增
+   `align_shared_uid_workspace`（root worker + 属主为 root 时整树 chown 到 legacy 共享
+   RunAs uid 1000 + 0700，复用 `apply_sandbox_ownership` 语义；不 blanket-chmod 0777、
+   不动共享卷 slice），接入 agent create / agent import / 本地 provision / 本地 fork 四处
+   provision 缝；per-sandbox uid 路径（`host_uid`）原样保留。回归：pure-shape 契约
+   `tests/contract/test_pure_shape_workspace_ownership.py`（shell 写 workspace 根 +
+   migration 跨 worker 保留 + 导出 tar 属主 == 1000）+ gate B migration trio +
+   macOS 单测；门禁日志 `tmp/g2-*.log`，报告 `tmp/sdd/g2-ownership-snapshot-report.md`。
 7. **FUP 远程 network update 显式拒绝判定**（Ohm review 登记）：remote push 路径在 worker
    返回显式 ≥300 且非 409 错误时仍落库 204——当前只把 transport-loss 视为失败；
    应区分"显式 worker 拒绝"与"传输丢失"（fail-closed 候选：显式拒绝不落库）。

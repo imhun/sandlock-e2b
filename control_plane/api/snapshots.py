@@ -299,6 +299,21 @@ async def _create_sandbox_from_snapshot(
                 )
             except ValueError as e:
                 raise OfficialError(400, str(e))
+            if (
+                getattr(
+                    request.app.state.runtime_registry, "uid_pool", None
+                )
+                is None
+            ):
+                # FUP #6: same legacy shared-uid alignment as the create
+                # path — the local sandlock shell (host uid 1000, pure
+                # no-chroot shape) must own the workspace copied out of the
+                # snapshot. Per-sandbox-uid local forks are handled by the
+                # agent create path on remote nodes; this branch predates a
+                # uid allocation and stays as-is when a pool is present.
+                from envd_service.uid_pool import align_shared_uid_workspace
+
+                align_shared_uid_workspace(workspace_dir)
             request.app.state.runtime_registry.register(
                 sandbox_id=record.sandbox_id,
                 access_token=record.envd_access_token,
