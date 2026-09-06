@@ -202,10 +202,11 @@ def test_user_cli_install_within_workspace_persists():
 
 
 @pytest.mark.usefixtures("require_sandlock")
-def test_dev_shm_denied_but_ptmx_available(tmp_path):
-    """The container /dev is mounted into the image-rootfs chroot; the shared
-    /dev/shm (cross-sandbox leakage/DoS) must be denied while the PTY bridge
-    devices stay usable."""
+def test_dev_shm_absent_but_dev_null_writable(tmp_path):
+    """minimal_dev replaces the whole-tree /dev mount in the image-rootfs
+    chroot: only the six single-node mounts exist, so /dev/shm is not present
+    at all (no cross-sandbox tmpfs/queue surface) while /dev/null stays a
+    writable host chardev."""
     from envd_service.executors.base import ExecConfig
     from envd_service.executors.sandlock import SandlockExecutor
     from envd_service.runtime.image_resolver import resolve_image_rootfs
@@ -224,9 +225,9 @@ def test_dev_shm_denied_but_ptmx_available(tmp_path):
         enable_network=False,
     )
     probe = (
-        "test -e /dev/shm && echo SHM_VISIBLE || echo SHM_DENIED; "
-        "test -e /dev/ptmx && echo PTMX_OK || echo PTMX_MISSING; "
-        "echo x > /dev/shm/leak 2>/dev/null && echo SHM_WRITABLE || echo SHM_READONLY"
+        "test -e /dev/shm && echo SHM_VISIBLE || echo SHM_ABSENT; "
+        "if echo x > /dev/null 2>/dev/null; then echo DEV_NULL_WRITABLE; "
+        "else echo DEV_NULL_BLOCKED; fi"
     )
     result = executor._build_sandbox(
         ExecConfig(
@@ -236,6 +237,6 @@ def test_dev_shm_denied_but_ptmx_available(tmp_path):
             stdin_enabled=False,
         )
     ).run(["/bin/sh", "-c", probe])
-    assert b"SHM_DENIED" in result.stdout
-    assert b"SHM_READONLY" in result.stdout
-    assert b"PTMX_OK" in result.stdout
+    assert result.exit_code == 0
+    assert result.stderr == b""
+    assert result.stdout.strip() == b"SHM_ABSENT\nDEV_NULL_WRITABLE"

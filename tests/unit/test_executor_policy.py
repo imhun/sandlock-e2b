@@ -54,7 +54,9 @@ def _params(
     return executor._exec_params(config, bind_ports=bind_ports)
 
 
-def test_image_rootfs_mounts_workspace_dev_and_maps_cwd(tmp_path: Path) -> None:
+def test_image_rootfs_mounts_workspace_minimal_dev_and_maps_cwd(
+    tmp_path: Path,
+) -> None:
     rootfs = tmp_path / "rootfs"
     rootfs.mkdir()
     ws = tmp_path / "ws"
@@ -65,9 +67,22 @@ def test_image_rootfs_mounts_workspace_dev_and_maps_cwd(tmp_path: Path) -> None:
     assert sb.chroot == str(rootfs)
     assert sb.fs_mount["/workspace"] == str(ws)
     assert sb.fs_mount["/home/user"] == str(ws)
-    # The whole-tree /dev mount stays in place until the minimal_dev swap
-    # (a later task, M4 D7); this task only moves cwd out of the policy.
-    assert sb.fs_mount["/dev"] == "/dev"
+    # minimal_dev replaces the whole-tree host /dev mount: only the six
+    # single-node mounts (ptmx, pts, null, urandom, zero, tty) are visible
+    # under the chroot's /dev, so /dev/shm and /dev/mqueue cannot leak in.
+    minimal_dev_keys = {
+        "/dev/ptmx",
+        "/dev/pts",
+        "/dev/null",
+        "/dev/urandom",
+        "/dev/zero",
+        "/dev/tty",
+    }
+    assert {k for k in sb.fs_mount if k == "/dev" or k.startswith("/dev/")} == (
+        minimal_dev_keys
+    )
+    # The rootfs carries the /dev parent dir for traversal and listings.
+    assert (rootfs / "dev").is_dir()
     # cwd is a per-exec parameter now, never part of the ceiling.
     assert getattr(sb, "cwd", None) is None
     assert getattr(sb, "env", None) in (None, {})
@@ -104,21 +119,24 @@ def test_non_chroot_cwd_passes_through_unchanged() -> None:
     assert params["cwd"] == "/tmp/ws"
 
 
-def test_dev_shared_paths_denied_but_ptmx_writable(tmp_path: Path) -> None:
+def test_dev_shared_paths_absent_with_minimal_dev_mounts(tmp_path: Path) -> None:
     rootfs = tmp_path / "rootfs"
     rootfs.mkdir()
     ws = tmp_path / "ws"
     ws.mkdir()
     sb = _policy(_executor(rootfs, ws))
-    assert "/dev/shm" in sb.fs_denied
-    assert "/dev/mqueue" in sb.fs_denied
-    # The instance may serve pty commands at any point, so the pty device
-    # grants are part of the ceiling (they leave with minimal_dev in the
-    # later /dev task; native ExecStdio.PTY is host-side and needs none).
-    assert "/dev/ptmx" in sb.fs_writable
-    assert "/dev/pts" in sb.fs_writable
-    assert "/dev/ptmx" in sb.fs_readable
-    assert "/dev/pts" in sb.fs_readable
+    # minimal_dev keeps only the six single-node /dev mounts: /dev/shm and
+    # /dev/mqueue never exist in the sandbox view, so the carve-out denials
+    # are gone; /proc/kcore and /sys stay as defensive entries.
+    assert set(sb.fs_denied) == {"/proc/kcore", "/sys"}
+    assert "/dev/shm" not in sb.fs_denied
+    assert "/dev/mqueue" not in sb.fs_denied
+    # Native ExecStdio.PTY is host-side, so the chroot grants no pty device
+    # nodes in the sandbox view.
+    assert "/dev/ptmx" not in sb.fs_writable
+    assert "/dev/pts" not in sb.fs_writable
+    assert "/dev/ptmx" not in sb.fs_readable
+    assert "/dev/pts" not in sb.fs_readable
 
 
 def test_set_mcp_bind_port_controls_instance_bind_ceiling(tmp_path: Path) -> None:

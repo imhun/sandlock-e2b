@@ -54,8 +54,10 @@ def test_policy_mapping_fields():
     assert getattr(sandbox, "net_allow_bind", None) in (None, [])
 
 
-def test_image_rootfs_shape_carries_the_shared_path_denials(tmp_path) -> None:
-    """With an image rootfs the whole tree is readable, so carve them out."""
+def test_image_rootfs_shape_keeps_only_defensive_denials(tmp_path) -> None:
+    """With an image rootfs the whole tree is readable, so deny the two
+    defensive paths; minimal_dev removed the /dev/shm + /dev/mqueue carve-out
+    requirement (those paths never exist in the chroot's /dev view)."""
     rootfs = tmp_path / "rootfs"
     rootfs.mkdir()
     executor = SandlockExecutor(
@@ -72,8 +74,9 @@ def test_image_rootfs_shape_carries_the_shared_path_denials(tmp_path) -> None:
     )
     sandbox = _policy(executor)
     assert "/" in sandbox.fs_readable
-    for denied in ("/proc/kcore", "/sys", "/dev/shm", "/dev/mqueue"):
-        assert denied in sandbox.fs_denied
+    assert set(sandbox.fs_denied) == {"/proc/kcore", "/sys"}
+    assert "/dev/shm" not in sandbox.fs_denied
+    assert "/dev/mqueue" not in sandbox.fs_denied
 
 
 def test_root_image_rootfs_policy_carries_supervisor_mediation(

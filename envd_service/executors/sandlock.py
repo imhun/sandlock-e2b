@@ -38,6 +38,42 @@ except Exception:  # pragma: no cover - macOS / missing package
     SandlockSandbox = None  # type: ignore[assignment]
 
 
+# The six single-node /dev mounts of the fork ``sandlock.minimal_dev()``
+# (third_party/sandlock/python/src/sandlock/sandbox.py, importable only on
+# Linux). The mirror keeps the chroot policy shape unit-testable off-Linux,
+# where the native module is absent and nothing is ever mounted.
+_MINIMAL_DEV_MOUNTS = {
+    "/dev/ptmx": "/dev/ptmx",
+    "/dev/pts": "/dev/pts",
+    "/dev/null": "/dev/null",
+    "/dev/urandom": "/dev/urandom",
+    "/dev/zero": "/dev/zero",
+    "/dev/tty": "/dev/tty",
+}
+
+
+def _minimal_dev_mounts() -> dict[str, str]:
+    """The chroot shape's ``fs_mount`` /dev set (minimal_dev, six nodes).
+
+    With the native library present this delegates to the fork helper -- the
+    host sources the mounts are taken from -- after a fail-closed pre-check
+    that the host exposes a readable ``/dev/pts`` directory (the ``pts``
+    mount binds the host devpts directory). There is deliberately no silent
+    fallback to a whole-tree host ``/dev`` mount when devpts is missing.
+    Off-Linux (policy-shape unit tests only) the module mirror is returned.
+    """
+    if sandlock is not None:
+        pts = Path("/dev/pts")
+        if not pts.is_dir() or not os.access(pts, os.R_OK):
+            raise RuntimeError(
+                "sandlock chroot shape requires a readable host /dev/pts "
+                "directory (devpts) for the minimal_dev /dev/pts bind "
+                "mount; refusing to fall back to a whole-tree /dev mount"
+            )
+        return sandlock.minimal_dev()
+    return dict(_MINIMAL_DEV_MOUNTS)
+
+
 class SandlockRunningProcess(RunningProcess):
     """Wraps a fork ``ExecProcess`` returned by ``SandboxInstance.exec``.
 
@@ -574,33 +610,26 @@ class SandlockExecutor(Executor):
         fs_writable = [self._workspace_dir]
         fs_writable.extend(self._extra_fs_writable)
         fs_readable = ["/usr", "/lib", "/bin", "/opt"]
-        # Shared-path denials (/dev/shm, /dev/mqueue are common to every
-        # sandbox on the worker) are only needed where the sandbox can
-        # actually see them: with an image rootfs the whole tree is readable,
-        # so they have to be carved out explicitly. Without a chroot,
-        # Landlock is an allow-list and those paths are already unreachable
-        # (not in fs_readable), so the rules add nothing -- and issuing them
-        # would cost the sandbox its own file ownership: sandlock enforces
-        # denials through its on-behalf open path, so every file the sandbox
-        # creates is then attributed to the supervisor (host uid 0) instead
-        # of the sandbox host uid.
+        # Denials are only issued where the sandbox can actually see the
+        # path: without a chroot, Landlock is an allow-list and shared paths
+        # like /dev/shm are already unreachable (not in fs_readable), so
+        # rules would add nothing -- and issuing them would cost the sandbox
+        # its own file ownership: sandlock enforces denials through its
+        # on-behalf open path, so every file the sandbox creates is then
+        # attributed to the supervisor (host uid 0) instead of the sandbox
+        # host uid.
         fs_denied: list[str] = []
-        # The instance may serve pty commands at any point, so the pty
-        # device-node grants are part of the ceiling (native ExecStdio.PTY
-        # lives host-side and needs none of them; the minimal_dev /dev task
-        # removes them together with the whole-tree /dev mount).
-        fs_writable += ["/dev/ptmx", "/dev/pts"]
-        fs_readable += ["/dev/ptmx", "/dev/pts"]
         if self._base_image and self._image_rootfs is not None:
             # Image rootfs mode: "/" resolves inside the chroot (the image
             # rootfs), so the whole image is readable as its own filesystem.
             # The host filesystem stays unreachable: the chroot restricts the
             # path space, and shared volumes are only exposed via their exact
-            # fs_writable directory. The container /dev is mounted into the
-            # chroot (until the minimal_dev task), so the shared tmpfs/queue
-            # paths need the explicit denials here.
+            # fs_writable directory. minimal_dev mounts only the six /dev
+            # nodes, so /dev/shm and /dev/mqueue never exist in the sandbox
+            # view and need no carve-out; /proc/kcore and /sys stay denied
+            # as defensive entries.
             fs_readable = list(fs_readable) + ["/"]
-            fs_denied = ["/proc/kcore", "/sys", "/dev/shm", "/dev/mqueue"]
+            fs_denied = ["/proc/kcore", "/sys"]
         net_allow: list[str] = []
         net_deny: list[str] = []
         http_allow: list[str] = []
@@ -688,7 +717,11 @@ class SandlockExecutor(Executor):
             # and /home/user (legacy home) inside it. fs_mount only takes
             # effect at runtime, so the mount points must already exist
             # inside the rootfs for chdir() to work.
-            for mount_point in ("workspace", "home/user"):
+            # The rootfs must carry the standard /dev parent dir for
+            # traversal and listings (minimal_dev provides the node names);
+            # slim base images extract without one, so pre-create it like the
+            # other mount points.
+            for mount_point in ("workspace", "home/user", "dev"):
                 Path(self._image_rootfs).joinpath(mount_point).mkdir(
                     parents=True, exist_ok=True
                 )
@@ -703,12 +736,13 @@ class SandlockExecutor(Executor):
                 "/home/user": self._workspace_dir,
             }
             mount_map.update(self._fs_mounts)
-            # The extracted image /dev is empty; expose the container's /dev
-            # for /dev/null, /dev/urandom etc. until the minimal_dev task
-            # narrows it to the six single-node mounts. fs_mount treats the
-            # host target as a directory root, so the whole /dev tree must be
-            # mounted (a single-file mount would resolve with ENOTDIR).
-            mount_map["/dev"] = "/dev"
+            # minimal_dev replaces the whole-tree host /dev mount: only the
+            # six single-node mounts (ptmx, pts, null, urandom, zero, tty)
+            # are visible under the chroot's /dev, so /dev/shm and
+            # /dev/mqueue cannot leak in and no fs_deny carve-out is needed.
+            # Native ExecStdio.PTY lives host-side, so no devpts node grants
+            # are part of the ceiling either.
+            mount_map.update(_minimal_dev_mounts())
             kwargs["fs_mount"] = mount_map
         elif self._fs_mounts:
             # Without a chroot (pure Sandlock), virtual mount paths cannot be
@@ -762,36 +796,27 @@ class SandlockExecutor(Executor):
         fs_writable = [self._workspace_dir]
         fs_writable.extend(self._extra_fs_writable)
         fs_readable = ["/usr", "/lib", "/bin", "/opt"]
-        # Shared-path denials (/dev/shm, /dev/mqueue are common to every
-        # sandbox on the worker) are only needed where the sandbox can actually
-        # see them: with an image rootfs the whole tree is readable, so they
-        # have to be carved out explicitly. Without a chroot, Landlock is an
-        # allow-list and those paths are already unreachable (not in
-        # fs_readable), so the rules add nothing -- and issuing them would cost
-        # the sandbox its own file ownership: sandlock enforces denials through
-        # its on-behalf open path, so every file the sandbox creates is then
-        # attributed to the supervisor (host uid 0) instead of the sandbox host
-        # uid, which silently voids both ``chmod`` inside the sandbox and the
-        # per-uid isolation of shared volumes.
+        # Denials are only issued where the sandbox can actually see the
+        # path: without a chroot, Landlock is an allow-list and shared paths
+        # like /dev/shm are already unreachable (not in fs_readable), so
+        # rules would add nothing -- and issuing them would cost the sandbox
+        # its own file ownership: sandlock enforces denials through its
+        # on-behalf open path, so every file the sandbox creates is then
+        # attributed to the supervisor (host uid 0) instead of the sandbox
+        # host uid, which silently voids both ``chmod`` inside the sandbox
+        # and the per-uid isolation of shared volumes.
         fs_denied: list[str] = []
-        if config.pty:
-            # Historical one-shot pty grants (the removed in-sandbox bridge
-            # needed them; the instance ceiling carries them until the
-            # minimal_dev /dev task).
-            fs_writable += ["/dev/ptmx", "/dev/pts"]
-            fs_readable += ["/dev/ptmx", "/dev/pts"]
         if self._base_image and self._image_rootfs is not None:
             # Image rootfs mode: "/" resolves inside the chroot (the image
             # rootfs), so the whole image is readable as its own filesystem.
             # The host filesystem stays unreachable: the chroot restricts the
             # path space, and shared volumes are only exposed via their exact
-            # fs_writable directory. The container /dev is mounted into the
-            # chroot for the PTY bridge, so the shared tmpfs/queue paths need
-            # the explicit denials here (accepting the supervisor-attributed
-            # writes that come with that path -- see the note above, and
-            # docs/HANDOFF.md T1 for the open fork question).
+            # fs_writable directory. minimal_dev mounts only the six /dev
+            # nodes, so /dev/shm and /dev/mqueue never exist in the sandbox
+            # view and need no carve-out; /proc/kcore and /sys stay denied
+            # as defensive entries.
             fs_readable = list(fs_readable) + ["/"]
-            fs_denied = ["/proc/kcore", "/sys", "/dev/shm", "/dev/mqueue"]
+            fs_denied = ["/proc/kcore", "/sys"]
         net_allow: list[str] = []
         net_deny: list[str] = []
         http_allow: list[str] = []
@@ -882,7 +907,11 @@ class SandlockExecutor(Executor):
             # and /home/user (legacy home) inside it. fs_mount only takes
             # effect at runtime, so the mount points must already exist
             # inside the rootfs for chdir() to work.
-            for mount_point in ("workspace", "home/user"):
+            # The rootfs must carry the standard /dev parent dir for
+            # traversal and listings (minimal_dev provides the node names);
+            # slim base images extract without one, so pre-create it like the
+            # other mount points.
+            for mount_point in ("workspace", "home/user", "dev"):
                 Path(self._image_rootfs).joinpath(mount_point).mkdir(
                     parents=True, exist_ok=True
                 )
@@ -897,12 +926,13 @@ class SandlockExecutor(Executor):
                 "/home/user": self._workspace_dir,
             }
             mount_map.update(self._fs_mounts)
-            # The extracted image /dev is empty; expose the container's /dev
-            # so the sandbox gets /dev/ptmx + devpts (PTY bridge), /dev/null,
-            # /dev/urandom etc. fs_mount treats the host target as a
-            # directory root, so the whole /dev tree must be mounted (a
-            # single-file mount would resolve with ENOTDIR).
-            mount_map["/dev"] = "/dev"
+            # minimal_dev replaces the whole-tree host /dev mount: only the
+            # six single-node mounts (ptmx, pts, null, urandom, zero, tty)
+            # are visible under the chroot's /dev, so /dev/shm and
+            # /dev/mqueue cannot leak in and no fs_deny carve-out is needed.
+            # Native ExecStdio.PTY lives host-side, so no devpts node grants
+            # are part of this shape either.
+            mount_map.update(_minimal_dev_mounts())
             kwargs["fs_mount"] = mount_map
             cwd = (config.cwd or "").strip()
             if not cwd or cwd.startswith(str(self._workspace_dir)):
