@@ -179,7 +179,8 @@ ACR 镜像推送照常，git 远程推送暂缓。
     同名普通目录保留一档）。该边界不会自身再造指数链，但会携带存储字节；见
     `control_plane/registry/snapshots.py` `_prune_store` 的 boundary note。
 15. **F12（fork，2026-09-06 已列入主要计划）: ProcessIndex 一 TGID 一 entry** —
-    ⬜ 计划中（fork 侧执行）。来源：F11 report concern #1（row #2 的
+    ✅ fork 侧完成（2026-09-07；fork 本地提交 `68e7e84` fix + `194ffed` docs，
+    未推送；报告 `third_party/sandlock/tmp/sdd/f12-report.md`）。来源：F11 report concern #1（row #2 的
     thread-tid-keying 残余）升级为独立 fork 计划。问题：`register_pid_if_new`
     对发出被中介 syscall 的非 leader 线程以 tid 懒登记独立 entry，一个 TGID 可
     多 key；F11 只在 freeze 侧归一化。完整修法 = 线程通知一律路由到 TGID leader
@@ -188,7 +189,14 @@ ACR 镜像推送照常，git 远程推送暂缓。
     `third_party/sandlock/docs/fork-plan-2026-09-f12.md`；
     followups 登记 `third_party/sandlock/docs/fork-plan-followups.md`（A 节 F12）。
     收口流程：fork 实现 + 门禁 + wheel → E2B 指针 bump + thread/gateway 探针 +
-    full gate A/B 复跑（沿用 F11 的 E2B 接线模式）。
+    full gate A/B 复跑（沿用 F11 的 E2B 接线模式）。**F12 侧结果**：核心登记
+    归一化到 TGID leader + 查询面 leader 解析 + freeze 归一化保留为防御；
+    core_lib 823→827（+4 unit）、core_integ 533 不变（F11 argv-safety 回归保持
+    绿）；pidfd leader watcher 的组退出语义 C 探针实证。fork 全门禁绿 +
+    wheel（4d5f385）双架构重建 verify 全绿。E2B 真栈 thread 探针（新 wheel +
+    重建 e2b-sandlock-test）GREEN：线程化 python 存活时后续 exec exit 0 /
+    `b-ok\n`（`tmp/perf/f14-thread-probe.log`）。**仍待 E2B 下一波**：FUP-E3
+    gateway+命令变体复跑 + full gate A/B（本行 bump 后执行）。
 16. **fork C 类设计项评估（2026-09-06）**: 已评估（fork docs
     `third_party/sandlock/docs/fork-c-class-design-assessment.md`，fork 提交
     `9d60058`）。结论：FUP-22（non-root-but-CAP_SETUID launcher gate）→ 立项，
@@ -197,14 +205,29 @@ ACR 镜像推送照常，git 远程推送暂缓。
     （per-child fs/bind 强制）、FUP-20（credential per-child 归因）、FUP-21
     （port-aware update_network）→ 候补（触发式，E2B/产品当前无需求；F12 完成
     后再评估与 pid 穿透设计合并）。
-17. **fork F13（已排入计划，2026-09-06）: fs 写家族挂载保护收尾** — ⬜ 计划中。
+17. **fork F13（已排入计划，2026-09-06）: fs 写家族挂载保护收尾** —
+    ✅ fork 侧完成（2026-09-07；fork 本地提交 `4576615` fix + `6a8cec1` docs；
+    报告 `third_party/sandlock/tmp/sdd/f13-report.md`）。
     范围：FUP-04 `link()` 于 rw 挂载点直击 + 断言精度收敛；FUP-05 目录挂载点
     `rmdir` 语义（与真实 bind-mount 一致返回 EBUSY，禁止删除活动挂载点）；
     文档 §3.1 注记随实现闭环。fork 计划：
-    `third_party/sandlock/docs/fork-plan-2026-09-f13.md`。
+    `third_party/sandlock/docs/fork-plan-2026-09-f13.md`。**F13 侧结果**：
+    chroot dispatch 对 `unlinkat(AT_REMOVEDIR)` 命中目录 mount leaf 返回 EBUSY
+    （宿主目录不再可被沙箱 rmdir 删除；文件/chardev leaf 回落 ENOTDIR）；ffi
+    98→100（+2 测试：link 直击 pin + 目录 rmdir EBUSY）；RED 先证「沙箱 rmdir
+    删除空宿主目录」（`tmp/sdd/f13-red-rmdir.log`）；fork 全门禁绿；wheel 随
+    F14 最终 tip（4d5f385）统一重建 verify 全绿。
 18. **fork F14（已排入计划，2026-09-06）: capability-aware 特权 remap gate** —
-    ⬜ 计划中（route-B ③ file-cap launcher 部署前必须完成，安全 gate）。范围：
+    ✅ fork 侧完成（2026-09-07；fork 本地提交 `ba6963e` fix + `4d5f385` docs；
+    报告 `third_party/sandlock/tmp/sdd/f14-report.md`；route-B ③ 部署前必须
+    完成的 gate 已就位）。范围：
     把 C 档 gate 从 `euid==0` 升级为 effective-capability 判定（CAP_SETUID/
     SETGID 即使 euid 非 0 也 fail-closed 拒绝），RED 用 capability 夹具模拟，
     不引入真实 file-cap 部署；supervise B 档交接不受影响。fork 计划：
-    `third_party/sandlock/docs/fork-plan-2026-09-f14.md`。
+    `third_party/sandlock/docs/fork-plan-2026-09-f14.md`。**F14 侧结果**：
+    `privileged_userns` 分类与 C 档 gate 升级为 capability-aware（CapEff 含
+    CAP_SETUID|CAP_SETGID 即特权跨 uid remap）；默认 caller 档对 euid 非 0 +
+    caps 的调用方（file-cap launcher 形态）以点名能力的新消息建箱前拒绝，不再
+    落到暗示无 caps 的晚拒；root 行为/消息不变。core_lib 827→828（+1 纯决策
+    单测）、mediation_2uid 8→9（setcap eip + setpriv 65533 真执行夹具）；
+    fork 全门禁绿；wheel（4d5f385）双架构重建 verify 全绿。

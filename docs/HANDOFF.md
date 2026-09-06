@@ -5,6 +5,42 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
+## ⚡ Fork F12–F14 全部完成（2026-09-07，fork 侧收口 + E2B wheel/探针）
+
+`third_party/sandlock`（fork 子模块，分支 `upstream-pr/netns-free-clean`）本地
+提交链：`68e7e84`+`194ffed`（F12 ProcessIndex 一 TGID 一 entry）、`4576615`+
+`6a8cec1`（F13 fs 写家族挂载保护收尾）、`ba6963e`+`4d5f385`（F14 capability-
+aware 特权 remap gate），均未推送。三份计划文档状态 → ✅（f12/f13/f14）。
+
+- **F12**：线程通知一律路由/注册到 TGID leader（删除 `PIDFD_THREAD` 独立 tid key
+  路径），`key_for`/`entry_for`/`contains`/`addr_space_state`/cwd 对未登记 tid
+  leader 解析，freeze TGID 归一化保留为防御；core_lib 823→827（+4 unit），
+  core_integ 533 不变；pidfd leader watcher 组退出语义 C 探针实证。用户可见：
+  `stats().live_watchers` 按进程组计数、6.9+ 虚拟化 /proc 不再单列被中介线程 tid。
+- **F13**：目录挂载点 rmdir 与真实 bind-mount 一致 EBUSY（宿主目录不再可被沙箱
+  视图删除；文件/chardev leaf 回落 ENOTDIR；挂载点内普通目录不受影响）+ link
+  直击 pin + 断言精度；ffi 98→100。
+- **F14**：`privileged_userns`/C 档 gate 从 `euid==0` 升级为 effective-caps 判定
+  （CapEff 含 `CAP_SETUID|CAP_SETGID`）；file-cap launcher（euid 非 0 + caps）
+  以点名能力的新消息建箱前 fail-closed，不再落到暗示无 caps 的晚拒；root/无
+  caps/同 uid/route-B 不受影响；core_lib 827→828、mediation_2uid 8→9。
+- **fork 终态门禁（各任务逐轮全绿，最后一次 = 4d5f385 树）**：non-root
+  core_lib 828 / core_integ 533 / ffi 100 / cli 98 / supervise 36 /
+  supervise_cost 3 / cli_build 0 / python 454；root oci 144 / supervise_root 2 /
+  mediation_2uid 9（fork `tmp/sdd/f1[234]-gate-*.log`）。
+- **wheel（F12–F14 最终 tip 统一重建，4d5f385）**：fork `python/build-wheels.sh`
+  cp314 x86_64+aarch64 双 wheel + supervise 双架构 + HEAD 钉住
+  `SHA256SUMS.supervise`（`tmp/sdd/f14-wheel-build.log`）；`verify-wheel.sh` 全绿
+  （FFI 156=156 双架构双向相等、supervise 三方指纹一致、x86_64 `--uid` 拒绝冒烟，
+  `tmp/sdd/f14-wheel-verify.log`）；已同步 `wheels/fork/` 并重建
+  `e2b-sandlock-test:latest`。
+- **E2B 真栈 thread 探针 GREEN**（新 wheel + 重建镜像，
+  `tmp/perf/f14-thread-probe.log`）：线程化 python A 存活时后续 exec B exit 0 /
+  stdout `b-ok\n`（F11/F12 argv-safety × 多线程回归在 E2B 栈上保持绿）。
+- **仍待 E2B 下一波**：FUP-E3 gateway+命令变体复跑（`tmp/f11_fup3_probe.py`，
+  需 multinode harness）+ full gate A/B/macOS 复跑（沿用 F11 流程；task-backlog
+  #15/#17/#18 已标 fork 侧完成、E2B 复跑待执行）。指针 bump = 4d5f385。
+
 ## ⚡ G3 final wave（FUP #12 egress 证据 + G1/G2 台账收口，2026-09-06）
 
 主仓库两个提交（fork 未动，子模块指针仍 `bc6c892`）：
