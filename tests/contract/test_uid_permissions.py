@@ -99,10 +99,12 @@ def _result(messages) -> tuple[int, bytes, bytes]:
 @pytest.mark.xfail(
     bool(os.environ.get("E2B_BASE_IMAGE")),
     reason=(
-        "image-rootfs (chroot) shape: sandlock enforces the shared-path "
-        "fs_denied rules through its on-behalf open path, so files the sandbox "
-        "writes belong to the supervisor (host uid 0) and per-uid volume "
-        "protection cannot hold (docs/HANDOFF.md, open item T5)"
+        "image-rootfs (chroot) shape: the first shared-volume write fails "
+        "with Permission denied under the supervisor mediation tier "
+        "(observed on the F10b wheel 2026-09-06: on-behalf open-path "
+        "semantics differ from the pure shape; SL-1 family). Expected until "
+        "route-B supervise deployment (euid == sandbox host uid); "
+        "docs/HANDOFF.md, open item T5"
     ),
     strict=True,
 )

@@ -45,9 +45,9 @@ pytestmark = pytest.mark.skipif(
 
 # The SDK ``CommandHandle.wait`` has no timeout, so completion is observed
 # through a thread that pushes the outcome onto a queue. The window while the
-# sandbox is paused is 0.5s: short enough to catch an un-frozen child that
-# would have ended on its own, long enough not to trip on scheduling noise.
-PAUSED_SILENCE_WINDOW_S = 0.5
+# sandbox is paused is 2.0s: if pause failed, the sleep-0.6 child would have
+# ended within this window; a frozen child stays silent the whole time.
+PAUSED_SILENCE_WINDOW_S = 2.0
 
 
 @pytest.fixture()

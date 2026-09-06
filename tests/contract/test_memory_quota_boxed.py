@@ -12,9 +12,10 @@ formalizes the exact same-instance accounting through the SDK:
 * one background command child holds 450 MiB (touched pages) on the sandbox's
   single long-lived instance;
 * a second concurrent 450 MiB command must be denied with the exact SDK
-  signature recorded in ``tmp/perf/task8-fup3-sdk-signatures.txt``
-  (``CommandExitException`` exit_code 137, empty stdout, error None, stderr
-  one of the recorded exact set ``{"", "Killed\\n"}``);
+  signature recorded in ``tmp/perf/task8-fup3-sdk-signature-variants.txt``
+  and ``tmp/perf/task8-fup3-evidence-100-450-50.txt`` (host-present evidence;
+  ``CommandExitException`` exit_code 137, empty stdout, error None, stderr one
+  of the recorded exact set ``{"", "Killed\\n"}``);
 * with the same 450 MiB holder, a concurrent 50 MiB command succeeds exactly
   (exit 0, stdout ``got 50\n``) and the holder later finishes cleanly.
 
@@ -49,7 +50,7 @@ pytestmark = pytest.mark.skipif(
 DEFAULT_MEMORY_MB = 512
 
 #: Exact SDK-visible denial signature recorded by the Step-1 probe
-#: (tmp/perf/task8-fup3-sdk-signatures.txt): the sandlock supervisor SIGKILLs
+#: (tmp/perf/task8-fup3-sdk-signature-variants.txt): the sandlock supervisor SIGKILLs
 #: the over-budget python task and its bash wrapper reports 128+9. The
 #: wrapper's stderr carries an optional shell notice ("Killed") depending on
 #: how the kill lands, so the exact observed set is asserted, never a
