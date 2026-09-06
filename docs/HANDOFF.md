@@ -5,6 +5,39 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
+## ⚡ F11 E2B 集成收口（2026-09-06）
+
+fork F11（argv-safety exec freeze × 多线程进程树，fork 本地 `edd8c76` fix +
+`927d015` 收口）的 E2B 侧收口：wheel 按 F11 tip 重建同步 `wheels/fork/` 并重建
+`e2b-sandlock-test:latest`；FUP-E3 gateway+命令变体在 1 GiB 默认箱复跑全绿——MCP
+gateway + 450M stdio server 可达（`list_tools == ['echo']`）、网关后普通命令恢复
+（exit 0，stdout `post-gateway-ok\n`）、第二 450M 命令精确拒绝（exit 137 /
+stdout `''` / stderr ∈ {"", "Killed\n"} / error None）、450+50 控制命令 exit 0 且网关
+持续服务、record `memoryMB == 1024`。契约：`tests/contract/test_memory_quota_gateway_command.py`
+（pure 2/2 绿 + gate A 内通过）；探针日志 `tmp/perf/f11-gateway-probe-450-450-50*.log`，
+门禁日志 `tmp/f11-e2b-*.log`，报告 `tmp/sdd/f11-e2b-integration-report.md`。
+
+主提交：`36fe28d`（子模块 bump——指针 = fork core F11 tip `927d015` + fork docs commit
+`bc6c892`，均本地未推送）、`7685126`（gateway+command 契约，FUP-E3/F11）、docs commit
+（本块所在提交，见 git log）。fork 侧 docs 编辑（e2b-integration §5/§8）在子模块内提交
+并折入 bump。
+
+门禁摘要：
+- pure 契约（`E2B_BASE_IMAGE=`，concurrency=2）：gateway+command 文件 2/2 绿 +
+  boxed sibling 2/2 绿（`tmp/f11-e2b-contract-gw{2,3}.log`、`-boxed{1,2}.log`）；
+- 容器 gate A（image-rootfs `python-mcp:3.14` + netns + XFS + npm + strict，
+  concurrency=2）：`933 passed / 1 skipped / 1 xfailed (T5) / 0 failed / 0 error`
+  （`tmp/f11-e2b-gate-a.log`；skip = volume_quota:274 互斥分支，历史一致）；
+- macOS full（unit+contract+sdk python/js+security）：`871 passed / 60 skipped /
+  0 failed / 0 error`（`tmp/f11-e2b-macos.log`；60 条 skip 全为平台能力，其中含本波
+  新增 gateway+command 契约文件的 sandlock 平台 skip 1 条，无掩盖）。
+
+Open-FUP 列表据此更新：② fork F11、③ 网关 ledger headroom 已关闭（thread-tid-keying
+fork 内部残余随 ② 登记，见 `docs/task-backlog.md` row 2）；仍 open：① 远程
+pause/resume 投递、④ 网关启动失败 SDK 可见性、⑤ T5 xfail route-B 后摘除、⑥ pure-shape
+workspace 属主对齐（gate B trio）、7–12（task-backlog「M4 收口后的 open follow-ups」
+同号条目）。
+
 ## ⚡ M4 收口（2026-09-06，Task 0/0.5/0.6/1–11 全部完成）
 
 > 主线目标已达成：E2B 侧 M4 接线（fork §8 / fork-plan-followups FUP-E2）+ FUP-E1（T4 复测）+

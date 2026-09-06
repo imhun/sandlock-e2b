@@ -1,6 +1,7 @@
 # 任务总清单（路线图）
 
-汇总 2026-08-31 ~ 09-02 分析产生的待办。**状态最后更新：2026-09-06（M4/Task 11 收口）**
+汇总 2026-08-31 ~ 09-02 分析产生的待办。**状态最后更新：2026-09-06（M4/Task 11 +
+F11 E2B 集成收口）**
 （细粒度执行记录见 `.superpowers/sdd/progress.md`，两阶段总路线见
 `docs/superpowers/plans/2026-09-01-sandlock-e2b-completion-roadmap.md`）。
 
@@ -96,15 +97,21 @@ ACR 镜像推送照常，git 远程推送暂缓。
    `set_state`，`envd_service/agent.py` 无 pause/resume 路由，multinode 下 SDK pause 到不了
    worker。修复方向 = agent 路由或 state bridge，并恢复 multinode pause 契约槽。证据：
    `.superpowers/sdd/progress.md` Task 5 段 / `tmp/sdd/task-5-report.md`。
-2. **FUP fork F11：argv-safety freeze × 多线程进程树**（Task 8/FUP-E3 登记）：MCP
-   gateway/uvicorn/threaded python 一旦进入实例，后续任何 exec 都报
-   `argv-safety freeze failed ... Operation not permitted`（fork 侧缺陷），网关+命令同实例
-   形态与 FUP-E3 gateway 变体都依赖其修复。参数化探针就绪：`tmp/task8_fup3_probe.py`；
-   证据：`tmp/sdd/task-8-report.md`。
-3. **FUP 网关 ledger headroom**（Task 8）: ✅ E2B 侧已关闭（FUP #3，2026-09-06）——per-sandbox
-   默认内存 512→1024 MiB（`E2B_DEFAULT_MEMORY_MB`），1 GiB 箱给网关 ledger
-   （~250–330M）与 450M MCP server 目标留出空间；fork 逻辑未改动。FUP-E3 gateway+命令
-   变体仍等 fork F11（见 row 2），保持 open。
+2. **FUP fork F11：argv-safety freeze × 多线程进程树**（Task 8/FUP-E3 登记）: ✅ 已关闭
+   （2026-09-06；fork 本地提交 `edd8c76` fix + `927d015` docs/门禁收口，未推送；wheel 已按
+   927d015 重建并同步 `wheels/fork/`）。修法 = exec 冻结前把 ProcessIndex keys 归一化为
+   唯一 TGID，每线程组只冻结一次；**线程 tid 懒登记本身保留**（fork F11 报告 concern #1）：
+   属 fork 内部建模细节，本次在冻结侧归一化、行为面最小；若后续要彻底消除"一个 TGID 多
+   key"，另做 fork FUP（改登记策略，需逐消费点复核）——残余随本行登记。E2B 侧复跑与契约
+   见 `tmp/sdd/f11-e2b-integration-report.md`（探针日志 `tmp/perf/f11-gateway-probe-450-450-50*.log`；
+   契约 commit `7685126`，`tests/contract/test_memory_quota_gateway_command.py`）。
+3. **FUP 网关 ledger headroom**（Task 8）: ✅ 已关闭（FUP #3，2026-09-06）：per-sandbox
+   默认内存 512→1024 MiB（`E2B_DEFAULT_MEMORY_MB`）给网关 ledger（~250–330M）与
+   450M MCP server 目标留出空间；fork F11（row 2）落地后，FUP-E3 gateway+命令变体在
+   1 GiB 箱复跑全绿：gateway+450M MCP server 可达（`list_tools == ['echo']`）、网关后
+   命令 exit 0（stdout `post-gateway-ok\n`）、第二 450M 命令精确拒绝（exit 137 /
+   stdout `''` / stderr ∈ {"", "Killed\n"} / error None）、450+50 控制命令 exit 0 且网关
+   持续服务、record `memoryMB == 1024`。thread-tid-keying 残余登记随 row 2。
 4. **FUP 网关启动失败 SDK 可见性**（Task 10/11）：Task 11 已落地 ERROR 日志
    （sandbox_id/port/stderr/exit text，`envd_service/runtime/context.py` watcher），SDK 仍按
    契约先收 exit-0；SDK 可见的错误上抛是未来产品决策，未定。
