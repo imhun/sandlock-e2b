@@ -22,6 +22,15 @@ class ExecConfig:
 class RunningProcess:
     """A live process with streamed output and control methods."""
 
+    # M4 D5 / FUP #8: whether ``kill(sig)`` can genuinely deliver a pause
+    # signal (SIGSTOP/SIGCONT). Local backends send the requested signal, so
+    # ProcessManager may fall back to a direct ``kill(SIGSTOP)`` when the
+    # process-group signal fails. SandlockRunningProcess overrides this to
+    # ``False`` because its ``kill(sig)`` always SIGKILLs the child subtree:
+    # the fallback must WARNING and skip that child instead of silently
+    # turning a pause into a kill.
+    supports_signal_pause: bool = True
+
     @property
     def pid(self) -> int:
         raise NotImplementedError

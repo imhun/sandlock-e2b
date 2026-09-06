@@ -477,7 +477,11 @@ class ProcessManager:
         exec child is its own process-group leader (host pid == pgid), so
         ``killpg`` covers the shell and its descendants in one stop. Fall back
         to a direct per-process SIGSTOP only when the group is already gone or
-        the group signal is not permitted.
+        the group signal is not permitted -- and only for backends whose
+        ``kill(sig)`` genuinely delivers the signal (``supports_signal_pause``).
+        A backend that cannot signal-pause (sandlock: ``kill`` always SIGKILLs)
+        is WARNINGed and skipped, so a pause never silently kills a child
+        (FUP #8).
         """
         for proc in list(self._processes.values()):
             if proc._running is None:
@@ -487,6 +491,15 @@ class ProcessManager:
 
                 os.killpg(os.getpgid(proc.pid), signal.SIGSTOP)
             except (ProcessLookupError, PermissionError):
+                if not proc._running.supports_signal_pause:
+                    logger.warning(
+                        "pause fallback skipped pid=%s cmd=%s: running "
+                        "backend cannot signal-pause (kill(sig) SIGKILLs); "
+                        "child stays running",
+                        proc.pid,
+                        " ".join(proc.config.cmd),
+                    )
+                    continue
                 try:
                     proc._running.kill(signal.SIGSTOP)
                 except Exception:
@@ -497,7 +510,11 @@ class ProcessManager:
 
         Mirrors ``pause_all``: SIGCONT the child's process group first, then
         fall back to the process itself when the group no longer exists or the
-        group signal is not permitted (M4 D5).
+        group signal is not permitted (M4 D5). The same capability gate as
+        ``pause_all`` applies: a backend whose ``kill`` cannot deliver SIGCONT
+        (``supports_signal_pause`` False, e.g. sandlock's SIGKILL-only kill)
+        is WARNINGed and skipped so a resume never silently kills a child
+        (FUP #8).
         """
         for proc in list(self._processes.values()):
             if proc._running is None:
@@ -507,6 +524,15 @@ class ProcessManager:
 
                 os.killpg(os.getpgid(proc.pid), signal.SIGCONT)
             except (ProcessLookupError, PermissionError):
+                if not proc._running.supports_signal_pause:
+                    logger.warning(
+                        "resume fallback skipped pid=%s cmd=%s: running "
+                        "backend cannot signal-pause (kill(sig) SIGKILLs); "
+                        "child stays paused",
+                        proc.pid,
+                        " ".join(proc.config.cmd),
+                    )
+                    continue
                 try:
                     proc._running.kill(signal.SIGCONT)
                 except Exception:

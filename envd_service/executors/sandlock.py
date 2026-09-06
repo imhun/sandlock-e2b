@@ -202,10 +202,16 @@ class SandlockRunningProcess(RunningProcess):
         except (OSError, RuntimeError) as e:
             logger.warning("sandlock pty resize failed: %r", e)
 
+    # M4 D5 / FUP #8: ``kill(sig)`` always SIGKILLs (see below); a
+    # pause/resume fallback must never use it to deliver SIGSTOP/SIGCONT.
+    supports_signal_pause = False
+
     def kill(self, sig: int) -> None:
         # The fork registry delivers SIGKILL to the child's whole command
-        # subtree regardless of the requested signal (Task 5 handles the
-        # pause-bypass question separately).
+        # subtree regardless of the requested signal. ``supports_signal_pause``
+        # is False above, so ProcessManager's pause/resume fallback skips
+        # this child with a WARNING instead of routing a SIGSTOP/SIGCONT
+        # through this kill (FUP #8).
         try:
             self._proc.kill()
         except Exception:
