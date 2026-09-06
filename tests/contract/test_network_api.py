@@ -5,8 +5,23 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 
 from e2b import Sandbox
+
+
+def _linux_sandlock_ready() -> bool:
+    import os
+    import sys
+
+    if sys.platform != "linux":
+        return False
+    try:
+        import sandlock
+
+        return sandlock.landlock_abi_version() >= 6
+    except Exception:
+        return False
 
 
 def _opts(harness):
@@ -93,6 +108,11 @@ async def test_network_prelaunch_create_echo_and_atomic_update(
             )
 
 
+@pytest.mark.skipif(
+    not _linux_sandlock_ready(),
+    reason="D4=A instance-ceiling 409 semantics need a launched sandlock "
+    "instance (run inside the Docker test runner)",
+)
 async def test_network_postlaunch_model_flip_409_keeps_record_byte_identical(
     multinode_two_workers,
 ):
