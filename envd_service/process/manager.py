@@ -471,7 +471,14 @@ class ProcessManager:
         self._processes.clear()
 
     def pause_all(self) -> None:
-        """Freeze every running process tree (SIGSTOP)."""
+        """Freeze every running process tree (SIGSTOP).
+
+        Group-first by design (M4 D5): under sandlock fork F1.7 every confined
+        exec child is its own process-group leader (host pid == pgid), so
+        ``killpg`` covers the shell and its descendants in one stop. Fall back
+        to a direct per-process SIGSTOP only when the group is already gone or
+        the group signal is not permitted.
+        """
         for proc in list(self._processes.values()):
             if proc._running is None:
                 continue
@@ -486,7 +493,12 @@ class ProcessManager:
                     pass
 
     def resume_all(self) -> None:
-        """Unfreeze every running process tree (SIGCONT)."""
+        """Unfreeze every running process tree (SIGCONT).
+
+        Mirrors ``pause_all``: SIGCONT the child's process group first, then
+        fall back to the process itself when the group no longer exists or the
+        group signal is not permitted (M4 D5).
+        """
         for proc in list(self._processes.values()):
             if proc._running is None:
                 continue
