@@ -223,27 +223,19 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after�
 - **创建期驱逐只处理“容量不足”失败**：镜像预热失败 / 428 / 其他非容量错误
   不会触发驱逐，行为与接入驱逐前一致。
 
-- **配额按 sandlock 实例记账，不是按沙箱 ⇒ 并发命令可超卖**：`max_memory` / `max_processes` /
-  `max_cpu` 由 sandlock 在每个实例的运行时状态里核算（`brk`/`mmap` 的 USER_NOTIF 记账），而 E2B
-  是"每条命令一个实例"，于是同一沙箱 K 个并发命令各拿一份配额。实测 `max_memory=512M` 时
-  单实例申请 600M 被拒，但 3 个并发实例各占 200M 全部成功（峰值 600M）。K≥2 是常态：
-  `Sandbox.create(mcp=...)` 的网关是长驻实例，`background=True` 的命令也各持实例。
-  本文件的节点台账仍按沙箱预留一次 `memory_mb`（`_record_quota_dims`），所以这会直接变成
-  **节点超卖**：实际 RSS 早于准入判定冲破节点，OOM 由驱逐/扩缩信号之外的路径发生。
-  并发命令数由 `_CommandGate` 限着（默认 `E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=1`），但
-  MCP 网关不走闸口且长驻 ⇒ **默认 K=2**：实测网关 + 一条命令各占 450M 同时成功，
-  900M / 标称 512M = 1.76x；闸口调到 N 则约 (N+1)x。
-  磁盘不受影响（XFS project id 按沙箱目录设置、被所有实例共享，限额是真加总）。
-  **已采纳的修法**：改为"每沙箱一个 sandlock 实例、命令是往实例里 `exec`"
-  （`e2b-integration.md` §8，取代早期的跨实例共享资源组提案 P10）；备选是 E2B 侧给每沙箱建
-  cgroup v2 并把子进程放进去（需 worker 有 cgroup 写权限）。
-  2026-09-04 本机容器（OrbStack，Landlock ABI 8）**补测确认**：同一实例内两个 child 各申请
-  300 MB（上限 512 MiB）⇒ 只有 1 个成功；同样两条命令放进两个容器 ⇒ 都成功，宿主 RSS
-  `316608+316712 kB ≈ 600 MB`。⇒ 超卖与"合并即修复"两边都有直接证据
-  （数据与实验编号见 `third_party/sandlock/docs/sandbox-exec-security.md` §10.2 V5）。
-  **同时实测到合并的前置缺陷**：`proc_count` 的唯一归还点是拦截到阻塞 `wait4`（fork 侧 SL-8），
-  setsid 孤儿生灭一轮后计数 `1/7→2/8→2/5`、第二轮 `2/5→3/6→3/5` ⇒ 合并后孤儿会**永久吃掉
-  沙箱进程预算**，必须与实例化同批修（pidfd 兜底 + `pid_ns`/subreaper 收养回收）。
+- **已修（M4 整箱实例化 + D6 默认上调）：配额按沙箱记账，不是按实例**。M4 D1–D3 起每个
+  沙箱只持有一个 `SandboxInstance`，命令与 MCP 网关都以 `exec` 进同一实例 ⇒
+  `max_memory` / `max_processes` / `max_cpu` 是**整箱预算**
+  （`envd_service/executors/sandlock.py` 模块头），同沙箱 K 个并发命令共享一份、不再各拿
+  一份；节点台账 `_record_quota_dims` 按沙箱预留与实际核算同维度，"实际 RSS 先于准入
+  冲破节点"的超卖路径关闭。修复依据（历史实测）：按实例记账时期网关 + 一条命令各占
+  450M 同时成功（900M / 标称 512M ≈ 1.76x）、同实例两 child 各 300M 只有 1 个成功
+  （数据与实验编号见 `third_party/sandlock/docs/sandbox-exec-security.md` §10.2 V5）；
+  同批的前置缺陷（`proc_count` 只靠阻塞 `wait4` 归还 ⇒ setsid 孤儿永久吃掉进程预算）由
+  fork pidfd 权威归还（F1.4）+ init subreaper 收养（F1.5）关闭。
+- **进程维度默认 64→256（M4 D6）**：整箱语义下 `max_processes` 就是整箱进程预算上限，
+  `E2B_DEFAULT_MAX_PROCESSES` 默认 256，与 fork 出厂整箱默认对齐；节点容量口径见
+  `docs/SCALING.md` §3（`total_processes` 默认 2048 ÷ 256 = 每节点 8 个标准沙箱）。
 
 
 ## 9. 排期

@@ -67,7 +67,7 @@ class Settings:
         default_factory=lambda: _env_int("E2B_DEFAULT_DISK_MB", 1024)
     )
     default_max_processes: int = field(
-        default_factory=lambda: _env_int("E2B_DEFAULT_MAX_PROCESSES", 64)
+        default_factory=lambda: _env_int("E2B_DEFAULT_MAX_PROCESSES", 256)
     )
     base_image: str | None = field(default_factory=lambda: os.getenv("E2B_BASE_IMAGE"))
     template_images: dict[str, str] = field(

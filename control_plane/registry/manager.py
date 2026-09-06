@@ -98,7 +98,7 @@ class SandboxRecord:
     alias: str = "base"
     workspace_dir: Path | None = None
     base_image: str | None = None
-    max_processes: int = 64
+    max_processes: int = 256
     secure: bool = True
     volume_mounts: list[dict[str, str]] = field(default_factory=list)
     mcp: dict[str, Any] | None = None
@@ -312,7 +312,7 @@ class SandboxRecord:
             allow_internet_access=bool(data.get("allow_internet_access", False)),
             alias=data.get("alias", "base"),
             base_image=data.get("base_image"),
-            max_processes=int(data.get("max_processes", 64)),
+            max_processes=int(data.get("max_processes", 256)),
             secure=bool(data.get("secure", True)),
             volume_mounts=list(data.get("volume_mounts", [])),
             mcp=data.get("mcp"),

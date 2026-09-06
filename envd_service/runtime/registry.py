@@ -42,7 +42,7 @@ class RuntimeSandbox:
     cpu_percent: int = 100
     disk_mb: int = 1024
     project_id: int | None = None
-    max_processes: int = 64
+    max_processes: int = 256
     max_open_files: int = 4096
     allow_internet_access: bool = False
     max_command_timeout: int = 3600
@@ -155,7 +155,7 @@ class RuntimeRegistry:
         cpu_percent: int = 100,
         disk_mb: int = 1024,
         project_id: int | None = None,
-        max_processes: int = 64,
+        max_processes: int = 256,
         max_open_files: int = 4096,
         allow_internet_access: bool = False,
         max_command_timeout: int = 3600,

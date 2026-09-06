@@ -117,7 +117,7 @@ class Settings:
         default_factory=lambda: _env_float("E2B_QUOTA_AGENT_TIMEOUT_S", 5.0)
     )
     default_max_processes: int = field(
-        default_factory=lambda: _env_int("E2B_DEFAULT_MAX_PROCESSES", 64)
+        default_factory=lambda: _env_int("E2B_DEFAULT_MAX_PROCESSES", 256)
     )
     default_max_open_files: int = field(
         default_factory=lambda: _env_int("E2B_DEFAULT_MAX_OPEN_FILES", 4096)
