@@ -1942,28 +1942,31 @@ async def set_timeout(sandbox_id: str, request: Request) -> Response:
     return Response(status_code=204)
 
 
-def _network_rejection_message(resp) -> str:
+def _network_rejection_message(resp, fallback: str) -> str:
     """Stable machine-readable rejection text from the worker agent."""
     try:
         body = resp.json()
     except Exception:
-        return "network update conflicts with the launched sandbox"
+        return fallback
     if isinstance(body, dict) and body.get("message"):
         return str(body["message"])
-    return "network update conflicts with the launched sandbox"
+    return fallback
 
 
 async def _remote_network_decision(
     request, node, record, payload
-) -> tuple[bool | None, str | None]:
+) -> tuple[bool | None, str | None, int | None]:
     """Ask the hosting node to validate + apply before the record is saved.
 
-    Returns ``(True, None)`` when the node applied the update,
-    ``(False, message)`` when it rejected it with HTTP 409 (nothing persisted
-    anywhere), and ``(None, None)`` when no semantic decision is available
-    (missing/unreachable node or an unexpected status) -- the caller keeps
+    Returns ``(True, None, None)`` when the node applied the update,
+    ``(False, message, worker_status)`` when it explicitly rejected it with
+    an HTTP status >= 400 (FUP #7): a worker 409 maps to HTTP 409 and any
+    other explicit status maps to HTTP 502 at the endpoint, both raised
+    **before** the record is persisted (fail closed). ``(None, None, None)``
+    means no semantic decision is available (missing/unreachable node or an
+    unexpected non-decision status such as a redirect) -- the caller keeps
     the pre-existing best-effort persist-and-warn behavior for those
-    transport-level failures.
+    transport-level failures (documented caveat).
     """
     if node is None:
         logger.warning(
@@ -1971,7 +1974,7 @@ async def _remote_network_decision(
             record.node_id,
             record.sandbox_id,
         )
-        return None, None
+        return None, None, None
     import httpx
 
     logger.info(
@@ -1995,24 +1998,43 @@ async def _remote_network_decision(
             node.node_id,
             e,
         )
-        return None, None
-    if resp.status_code == 409:
+        return None, None, None
+    if resp.status_code >= 400:
         logger.warning(
             "node %s rejected network update for sandbox %s: %s",
             node.node_id,
             record.sandbox_id,
             resp.text,
         )
-        return False, _network_rejection_message(resp)
+        if resp.status_code == 409:
+            return (
+                False,
+                _network_rejection_message(
+                    resp,
+                    "network update conflicts with the launched sandbox",
+                ),
+                resp.status_code,
+            )
+        return (
+            False,
+            _network_rejection_message(
+                resp,
+                f"node {node.node_id} returned HTTP {resp.status_code} "
+                "for the network update",
+            ),
+            resp.status_code,
+        )
     if resp.status_code >= 300:
         logger.warning(
-            "node %s rejected network update for sandbox %s: %s",
+            "node %s returned unexpected status %s for network update for "
+            "sandbox %s: %s",
             node.node_id,
+            resp.status_code,
             record.sandbox_id,
             resp.text,
         )
-        return None, None
-    return True, None
+        return None, None, None
+    return True, None, None
 
 
 def _apply_local_network_update(request, record, network) -> None:
@@ -2060,9 +2082,12 @@ async def update_sandbox_network(sandbox_id: str, request: Request) -> Response:
     cleared. The change is persisted on the control plane and pushed to the
     node hosting the sandbox; the next command uses the new policy. D4=A:
     on an already-launched instance only expressible monotone narrowings are
-    accepted -- everything else is an HTTP 409 raised **before** the
-    registry record is persisted (and the worker runtime copy is validated
-    before it is mutated), so a rejection changes neither side.
+    accepted -- a worker conflict is an HTTP 409 and any other explicit
+    worker rejection (404/5xx) is an HTTP 502, both raised **before** the
+    registry record is persisted (the worker runtime copy is validated
+    before it is mutated), so an explicit rejection changes neither side.
+    Only transport loss or a missing node keeps the pre-existing
+    best-effort persist-and-warn behavior (documented caveat).
     """
     try:
         body = await request.json()
@@ -2109,11 +2134,24 @@ async def update_sandbox_network(sandbox_id: str, request: Request) -> Response:
     }
 
     if node is not None and node.address != "local://":
-        accepted, rejection = await _remote_network_decision(
+        accepted, rejection, worker_status = await _remote_network_decision(
             request, node, record, payload
         )
         if accepted is False:
-            raise OfficialError(409, rejection or "network update conflicts")
+            # FUP #7: every explicit worker rejection is a decision and must
+            # fail closed before the record is persisted. A worker 409 is
+            # the client's conflict to fix (HTTP 409); any other explicit
+            # status means the node cannot take the update (HTTP 502).
+            if worker_status == 409:
+                raise OfficialError(
+                    409, rejection or "network update conflicts"
+                )
+            raise OfficialError(
+                502,
+                rejection
+                or f"Node {node.node_id} rejected network update for sandbox "
+                f"{record.sandbox_id}",
+            )
     elif node is not None:
         try:
             _apply_local_network_update(request, record, network or None)
