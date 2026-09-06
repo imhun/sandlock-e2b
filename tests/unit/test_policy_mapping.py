@@ -47,10 +47,11 @@ def test_policy_mapping_fields():
     assert "/dev/shm" not in sandbox.fs_readable
     assert sandbox.net_allow == []
     # Per-command fields are exec params, never policy fields.
+    # (real fork defaults: cwd=None, env={}, clean_env=False, net_allow_bind=[])
     assert getattr(sandbox, "cwd", None) is None
-    assert getattr(sandbox, "env", None) is None
-    assert getattr(sandbox, "clean_env", None) is None
-    assert getattr(sandbox, "net_allow_bind", None) is None
+    assert getattr(sandbox, "env", None) in (None, {})
+    assert getattr(sandbox, "clean_env", None) in (None, False)
+    assert getattr(sandbox, "net_allow_bind", None) in (None, [])
 
 
 def test_image_rootfs_shape_carries_the_shared_path_denials(tmp_path) -> None:

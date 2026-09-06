@@ -170,8 +170,8 @@ def test_set_mcp_bind_port_lands_on_ensure_instance_policy(monkeypatch) -> None:
     inst = ex._ensure_instance()
     assert inst.policy.net_allow_bind == [51234]
     assert getattr(inst.policy, "cwd", None) is None
-    assert getattr(inst.policy, "env", None) is None
-    assert getattr(inst.policy, "clean_env", None) is None
+    assert getattr(inst.policy, "env", None) in (None, {})
+    assert getattr(inst.policy, "clean_env", None) in (None, False)
 
 
 class _FakePolicy:
@@ -338,6 +338,7 @@ async def test_start_raises_unimplemented_without_native_sandlock(
 ) -> None:
     """Without the native library start() fails loudly (macOS / D11)."""
     ex = _executor(monkeypatch)
+    monkeypatch.setattr(sl, "sandlock", None)
     with pytest.raises(ConnectError, match="not available on this platform"):
         await ex.start(
             ExecConfig(

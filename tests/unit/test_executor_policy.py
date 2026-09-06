@@ -70,7 +70,7 @@ def test_image_rootfs_mounts_workspace_dev_and_maps_cwd(tmp_path: Path) -> None:
     assert sb.fs_mount["/dev"] == "/dev"
     # cwd is a per-exec parameter now, never part of the ceiling.
     assert getattr(sb, "cwd", None) is None
-    assert getattr(sb, "env", None) is None
+    assert getattr(sb, "env", None) in (None, {})
     # A host workspace cwd maps to /workspace inside the chroot.
     params = _params(executor, cmd=["/bin/sh"], cwd=str(ws))
     assert params["cwd"] == "/workspace"
@@ -128,7 +128,8 @@ def test_set_mcp_bind_port_controls_instance_bind_ceiling(tmp_path: Path) -> Non
     ws.mkdir()
     executor = _executor(rootfs, ws)
     # Without an allocated MCP port no bind allowance exists on the ceiling.
-    assert getattr(_policy(executor), "net_allow_bind", None) is None
+    # (real fork default is an empty list, off-Linux namespace omits the key).
+    assert getattr(_policy(executor), "net_allow_bind", None) in (None, [])
     executor.set_mcp_bind_port(51234)
     assert _policy(executor).net_allow_bind == [51234]
 

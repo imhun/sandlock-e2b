@@ -45,19 +45,27 @@ def test_pty_echo_resize_exit_on_sandlock_instance(multinode_two_workers) -> Non
         pty = sandbox.pty.create(PtySize(rows=24, cols=80))
         try:
             assert pty.pid > 0
-            sandbox.pty.send_stdin(pty.pid, b"echo pty-ok\n")
+            sandbox.pty.send_stdin(pty.pid, b"PS1=\necho pty-ok\n")
             sandbox.pty.resize(pty.pid, PtySize(rows=40, cols=120))
             sandbox.pty.send_stdin(pty.pid, b"exit\n")
             chunks = []
             result = pty.wait(on_pty=lambda data: chunks.append(data))
             assert result.exit_code == 0
             output = b"".join(chunks)
-            # Terminal echo + the command's own output must appear as the
-            # exact transcript fragment (no partial-marker matching): the
-            # echoed command line is followed by its output on the next line.
+            # PS1= empties every prompt after the first line is parsed, but
+            # the shell's first prompt (default `# ` root / `$ ` non-root) is
+            # printed before it can parse PS1= and may land before or after
+            # the echoed input chunk depending on scheduling. The transcript
+            # therefore ends in one of the four exact tails (echoed input +
+            # marker output + echoed exit), never a partial match.
             normalized = output.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-            transcript = b"echo pty-ok\npty-ok"
-            assert transcript in normalized
+            transcript_tails = (
+                b"PS1=\necho pty-ok\n# pty-ok\nexit\n",
+                b"PS1=\necho pty-ok\n$ pty-ok\nexit\n",
+                b"# PS1=\necho pty-ok\npty-ok\nexit\n",
+                b"$ PS1=\necho pty-ok\npty-ok\nexit\n",
+            )
+            assert normalized.endswith(transcript_tails)
         finally:
             pty.kill()
     finally:
