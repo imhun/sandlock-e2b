@@ -120,3 +120,15 @@ ACR 镜像推送照常，git 远程推送暂缓。
    亦含同族 migration 失败 ⇒ 非 M4 回归。修复方向 = provision/import 时把 workspace
    属主对齐到运行时 RunAs 身份（legacy 共享 uid 档），或单独决定 pure 形态属主模型；
    证据 `tmp/m4-full-gate-b.log`。
+7. **FUP 远程 network update 显式拒绝判定**（Ohm review 登记）：remote push 路径在 worker
+   返回显式 ≥300 且非 409 错误时仍落库 204——当前只把 transport-loss 视为失败；
+   应区分"显式 worker 拒绝"与"传输丢失"（fail-closed 候选：显式拒绝不落库）。
+8. **FUP pause/resume killpg-fallback 语义**（Ohm review 登记）：killpg 兜底若走
+   sandlock `kill(sig)` 实际投 SIGKILL 而非 SIGSTOP，与 pause 语义不符——fail-loud 或
+   文档化并校验。
+9. **FUP rpc drift 告警节流**（Ohm review 登记）：worker 侧 drift 检测重复告警无节流，
+   长漂移场景会刷屏。
+10. **FUP `_instance_network_snapshot` 死状态**（Ohm review 登记）：executor 的
+    `_instance_network_snapshot` 目前只写不读——或用于重建基线，或删除。
+11. **FUP bisect 证据日志头纪律**（Ohm review 登记）：容器/宿主复现与 bisect 日志应带
+    环境头（commit、env、镜像/loop、时间）便于跨会话归因。

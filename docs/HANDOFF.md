@@ -1,6 +1,7 @@
 # 会话交接记录（2026-08-29）
 
-> 供新会话快速接续。当前基线：Linux 容器（privileged + host 网络）
+> **历史基线（2026-08-29；已被下方「M4 收口」块取代，仅存档）**：
+> 当时基线：Linux 容器（privileged + host 网络）
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
@@ -13,7 +14,8 @@
 > **进度账本**：`.superpowers/sdd/progress.md`（本仓库，git-ignored）。
 > **Task 11 报告**：`tmp/sdd/task-11-report.md`（提交 hash、门禁摘要行、xfail 清单、FUP 列表）。
 
-任务状态与提交（main；fork 子模块钉 `b955ae9` = F10 tip，本地未推送）：
+任务状态与提交（main；fork 子模块 docs commit `8c5f020`（docs-only，位于 fork core
+F10 tip `b955ae9` 之上），本地未推送）：
 
 - Task 0/0.5/0.6（fork F10 前置）：fork 修复 `9dd134e..b955ae9`（评审 clean，门禁非 root
   822/532/98/98/36/3/0/454 + root oci 144/supervise_root 2/mediation_2uid 8）；

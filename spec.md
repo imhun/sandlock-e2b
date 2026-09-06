@@ -1,7 +1,7 @@
 # E2B-Sandlock 网关：完整方案文档
 
 **文档版本**：v2.0.0
-**最后更新**：2026-08-28
+**最后更新**：2026-09-06（M4 D6：`max_processes` 整箱默认 64→256）
 **状态**：设计就绪，待实现
 
 ## 1. 目标与兼容定义
@@ -431,7 +431,7 @@ e2b-sandlock-gateway/
 | `fs_denied` | `/proc/kcore`、`/sys` |
 | `max_memory` | `max_memory="512M"`，seccomp user notification 内存跟踪 |
 | `max_cpu` | `max_cpu=100`，SIGSTOP/SIGCONT 按单核百分比限流 |
-| `max_processes` | `max_processes=64`，seccomp user notification 并发进程计数 |
+| `max_processes` | `max_processes=256`，seccomp user notification 并发进程计数（M4 D6 whole-box semantics, 2026-09-06） |
 | `max_open_files` | `max_open_files`，RLIMIT_NOFILE |
 | `max_disk` | `max_disk`，仅作用于 COW storage 配额 |
 | 默认用户 | 非 Root 用户 |
@@ -567,7 +567,7 @@ Control Plane 必须同时限制沙箱数量和宿主总资源，避免 `E2B_MAX
 | 内存 | `E2B_DEFAULT_MEMORY_MB=512` |
 | CPU | `E2B_DEFAULT_CPU_PERCENT=100`，映射 `max_cpu=100` |
 | 磁盘 | `E2B_DEFAULT_DISK_MB=1024`，非 COW 时为准入预留 |
-| 并发进程 | `E2B_DEFAULT_MAX_PROCESSES=64`，映射 `max_processes=64` |
+| 并发进程 | `E2B_DEFAULT_MAX_PROCESSES=256`，映射 `max_processes=256`（M4 D6 whole-box semantics, 2026-09-06） |
 
 宿主总上限：
 
@@ -650,7 +650,7 @@ await sandbox.kill()
 | `E2B_DEFAULT_MEMORY_MB` | `512` | 默认内存 |
 | `E2B_DEFAULT_CPU_PERCENT` | `100` | 单沙箱 CPU |
 | `E2B_DEFAULT_DISK_MB` | `1024` | 单沙箱磁盘 |
-| `E2B_DEFAULT_MAX_PROCESSES` | `64` | 单沙箱最大并发进程数 |
+| `E2B_DEFAULT_MAX_PROCESSES` | `256` | 单沙箱最大并发进程数（M4 D6 whole-box semantics, 2026-09-06） |
 | `E2B_BASE_IMAGE` | 未配置 | `base` 模板的基础镜像；配置后该模板启用容器隔离 |
 | `E2B_TEMPLATE_IMAGES` | `{}` | 模板 ID 到基础镜像的 JSON 映射；条目存在即该模板启用容器隔离 |
 | `E2B_MAX_TOTAL_MEMORY_MB` | `8192` | 宿主总内存上限 |
@@ -677,7 +677,7 @@ services:
       E2B_DEFAULT_MEMORY_MB: 512
       E2B_DEFAULT_CPU_PERCENT: 100
       E2B_DEFAULT_DISK_MB: 1024
-      E2B_DEFAULT_MAX_PROCESSES: 64
+      E2B_DEFAULT_MAX_PROCESSES: 256  # M4 D6 whole-box semantics, 2026-09-06
       E2B_MAX_TOTAL_MEMORY_MB: 8192
       E2B_MAX_TOTAL_CPU_PERCENT: 400
       E2B_MAX_TOTAL_DISK_MB: 10240
