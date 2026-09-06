@@ -53,6 +53,7 @@ def create_executor(
     egress_lib_dir: str | Path | None = None,
     extra_fs_writable: list[str] | None = None,
     fs_mounts: dict[str, str] | None = None,
+    sandbox_id: str | None = None,
 ) -> Executor:
     """Pick the executor honoring ``E2B_EXECUTOR`` (``auto``|``local``|``sandlock``)."""
     mode = settings.executor
@@ -101,6 +102,7 @@ def create_executor(
                 secrets_dir=settings.image_cache_dir / "secrets",
                 extra_fs_writable=extra_fs_writable,
                 fs_mounts=fs_mounts,
+                sandbox_id=sandbox_id,
             )
 
     logger.info("using local executor for sandbox %s", workspace_dir)

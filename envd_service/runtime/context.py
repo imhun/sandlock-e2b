@@ -76,6 +76,7 @@ class SandboxRuntimeContext:
         self.executor = create_executor(
             settings,
             workspace_dir=record.workspace_dir,
+            sandbox_id=record.sandbox_id,
             base_image=record.base_image,
             host_uid=record.host_uid,
             per_sandbox_uid=settings.per_sandbox_uid,
@@ -157,6 +158,12 @@ class SandboxRuntimeContext:
         if self._mcp_port is not None:
             _release_mcp_port(self._mcp_port)
             self._mcp_port = None
+        # Release the long-lived exec instance (idempotent). The getattr
+        # keeps duck-typed fakes safe; the base Executor no-op covers the
+        # stateless backends.
+        closer = getattr(self.executor, "close", None)
+        if closer is not None:
+            closer()
 
     def pause(self) -> None:
         self.processes.pause_all()

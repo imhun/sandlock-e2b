@@ -143,10 +143,16 @@ if __name__ == "__main__":
 
 try:  # sandlock is Linux-only; keep the import optional for macOS dev.
     import sandlock
-    from sandlock import BranchAction, Sandbox as SandlockSandbox, StdioMode
+    from sandlock import (
+        BranchAction,
+        Sandbox as SandlockSandbox,
+        SandboxInstance,
+        StdioMode,
+    )
 except Exception:  # pragma: no cover - macOS / missing package
     sandlock = None  # type: ignore[assignment]
     BranchAction = None  # type: ignore[assignment]
+    SandboxInstance = None  # type: ignore[assignment]
     StdioMode = None  # type: ignore[assignment]
     SandlockSandbox = None  # type: ignore[assignment]
 
@@ -273,7 +279,15 @@ class SandlockRunningProcess(RunningProcess):
 
 
 class SandlockExecutor(Executor):
-    """Runs each command inside a fresh ``sandlock.Sandbox`` instance."""
+    """Holds one lazily-created ``sandlock.SandboxInstance`` per executor.
+
+    M4 D1/D2 lifecycle shell: the instance is created on first
+    ``_ensure_instance()`` with a stable ``sandbox_id``-derived name, rebuilt
+    exactly once after a closed/dead launch, and released by ``close()``.
+    ``start()`` still builds a fresh one-shot ``Sandbox`` per command until a
+    later step rewires it onto the instance's ``exec()``; on non-Linux hosts
+    sandlock is unavailable and the instance stays ``None`` (D11).
+    """
 
     _non_root_fallback_warned = False
 
@@ -304,6 +318,7 @@ class SandlockExecutor(Executor):
         secrets_dir: str | Path | None = None,
         extra_fs_writable: list[str] | None = None,
         fs_mounts: dict[str, str] | None = None,
+        sandbox_id: str | None = None,
     ) -> None:
         self._workspace_dir = workspace_dir
         self._base_image = base_image
@@ -342,10 +357,75 @@ class SandlockExecutor(Executor):
         self._secrets_dir = Path(secrets_dir) if secrets_dir else None
         self._extra_fs_writable = list(extra_fs_writable or [])
         self._fs_mounts = dict(fs_mounts or {})
+        self._sandbox_id = sandbox_id
+        self._instance = None
 
     def update_network(self, network: dict | None) -> None:
         """Replace the network policy; the next command uses it."""
         self._network = dict(network) if network else None
+
+    @property
+    def instance_name(self) -> str:
+        """Stable instance identity: ``sandbox_id`` (or its hash) when given,
+        otherwise the workspace directory basename."""
+        return self._instance_name_for()
+
+    @property
+    def instance_handle(self):
+        """Live ``SandboxInstance``, or ``None`` until ``_ensure_instance()``."""
+        return self._instance
+
+    def _instance_name_for(self) -> str:
+        sid = self._sandbox_id or Path(self._workspace_dir).name
+        if len(sid.encode()) <= 64:
+            return sid
+        import hashlib
+
+        return "sbx_" + hashlib.sha256(sid.encode()).hexdigest()[:16]
+
+    def _ensure_instance(self):
+        """Lazily create the one long-lived exec instance (M4 D1).
+
+        The instance policy is a placeholder: the current ``_build_sandbox``
+        shape for an empty command config (``_build_instance_policy()`` lands
+        with Task 2). A launch reporting a closed/dead session is retried
+        exactly once; any second failure propagates unchanged. Without the
+        native library (non-Linux) this is a silent no-op returning ``None``
+        (D11).
+        """
+        if self._instance is None and SandboxInstance is not None:
+            # Placeholder policy: current _build_sandbox shape for an empty
+            # command config; Task 2 replaces it with _build_instance_policy().
+            policy = self._build_sandbox(
+                ExecConfig(
+                    cmd=[],
+                    env={},
+                    cwd=self._workspace_dir,
+                    stdin_enabled=False,
+                )
+            )
+            try:
+                self._instance = SandboxInstance(
+                    policy, name=self._instance_name_for()
+                )
+            except RuntimeError as exc:
+                message = str(exc)
+                if "closed" not in message and "dead" not in message:
+                    raise
+                # The prior session was closed (shutdown/idle reclaim) or died
+                # (machinery failure): rebuild exactly once, and let a second
+                # failure bubble up unchanged.
+                self._instance = None
+                self._instance = SandboxInstance(
+                    policy, name=self._instance_name_for()
+                )
+        return self._instance
+
+    def close(self) -> None:
+        """Close the exec instance and release the handle (idempotent)."""
+        if self._instance is not None:
+            self._instance.close()
+            self._instance = None
 
     def _materialize_http_inject(
         self, entries: list[dict]

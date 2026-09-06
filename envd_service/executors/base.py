@@ -53,6 +53,9 @@ class Executor:
     async def start(self, config: ExecConfig) -> RunningProcess:
         raise NotImplementedError
 
+    def close(self) -> None:
+        """Release executor-held resources (no-op for stateless backends)."""
+
     @staticmethod
     def resolve_cmd(cmd: list[str]) -> list[str]:
         return cmd
