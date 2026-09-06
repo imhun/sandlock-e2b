@@ -198,8 +198,18 @@ class SandboxRuntimeContext:
         port = self._mcp_port
         if port is None:
             # Defensive fallback: a sandbox without ``record.mcp`` was still
-            # asked to run the gateway -- allocate on first start so the
+            # asked to run the gateway. If the executor instance already
+            # exists its bind ceiling is fixed and cannot widen (M4 D3), so
+            # fail loudly instead of letting the exec die on a deep EPERM.
+            # Before the instance exists, allocate on first start so the
             # executor ceiling gets the port before the exec.
+            holder = getattr(self.executor, "instance_handle", None)
+            if holder is not None:
+                raise RuntimeError(
+                    "MCP gateway requested after the executor instance was "
+                    "created without a bind allowance; the instance ceiling "
+                    "cannot widen (M4 D3)"
+                )
             port = _next_mcp_port()
             self._mcp_port = port
             setter = getattr(self.executor, "set_mcp_bind_port", None)
@@ -238,9 +248,11 @@ class SandboxRuntimeContext:
                 )
             )
         except BaseException:
-            # Never leak the allocated port when the gateway fails to start.
-            _release_mcp_port(port)
-            self._mcp_port = None
+            # M4 D3: the allocated port is this sandbox's instance bind
+            # ceiling (pushed before the first exec), so it stays allocated
+            # for the sandbox even when this start fails -- a retry must
+            # reuse the same port or the exec would exceed the fixed
+            # ceiling. shutdown() returns it to the pool.
             self._mcp_token = None
             raise
         self._mcp_gateway = proc

@@ -52,7 +52,12 @@ def test_pty_echo_resize_exit_on_sandlock_instance(multinode_two_workers) -> Non
             result = pty.wait(on_pty=lambda data: chunks.append(data))
             assert result.exit_code == 0
             output = b"".join(chunks)
-            assert b"pty-ok" in output
+            # Terminal echo + the command's own output must appear as the
+            # exact transcript fragment (no partial-marker matching): the
+            # echoed command line is followed by its output on the next line.
+            normalized = output.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            transcript = b"echo pty-ok\npty-ok"
+            assert transcript in normalized
         finally:
             pty.kill()
     finally:

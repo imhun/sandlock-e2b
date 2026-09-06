@@ -294,10 +294,12 @@ async def test_shutdown_releases_mcp_port_for_reuse(
 
 
 @pytest.mark.asyncio
-async def test_gateway_start_failure_releases_port(
+async def test_gateway_start_failure_keeps_port_for_retry_until_shutdown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """E6.3: a failed gateway start must not leak its allocated port."""
+    """M4 D3: a failed gateway start keeps the allocated port pinned to the
+    sandbox (it is the instance bind ceiling), so a retry reuses the same
+    port; shutdown returns it to the pool."""
     import envd_service.runtime.context as context_mod
 
     pool = context_mod.McpPortPool()
@@ -327,10 +329,91 @@ async def test_gateway_start_failure_releases_port(
     monkeypatch.setattr(ctx, "executor", _FailExecutor())
     with pytest.raises(RuntimeError, match="gateway start failed"):
         await ctx.start_mcp_gateway({"name": "echo"}, "tok")
-    assert ctx.mcp_port is None
+    # The port stays allocated to this sandbox (no second allocation).
+    assert ctx.mcp_port == allocated[0]
+    assert ctx.mcp_token is None
     assert len(allocated) == 1
-    # The port was returned to the pool: the next allocation reuses it.
+    # A retry goes through the same path and reuses the same port.
+    with pytest.raises(RuntimeError, match="gateway start failed"):
+        await ctx.start_mcp_gateway({"name": "echo"}, "tok2")
+    assert ctx.mcp_port == allocated[0]
+    assert len(allocated) == 1
+    # While the sandbox lives the port is not reusable elsewhere...
+    assert pool.allocate() != allocated[0]
+    # ...shutdown returns it, and the next allocation reuses it.
+    ctx.shutdown()
+    assert ctx.mcp_port is None
     assert pool.allocate() == allocated[0]
+
+
+@pytest.mark.asyncio
+async def test_gateway_late_start_with_existing_instance_fails_loudly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M4 D3: a gateway start after the instance exists (no bind allowance in
+    the fixed ceiling) must fail loudly instead of allocating a port the exec
+    can never bind."""
+    import envd_service.runtime.context as context_mod
+
+    pool = context_mod.McpPortPool()
+    allocated: list[int] = []
+    original_allocate = pool.allocate
+
+    def _alloc():
+        port = original_allocate()
+        allocated.append(port)
+        return port
+
+    monkeypatch.setattr(context_mod, "_next_mcp_port", _alloc)
+    record = RuntimeSandbox(
+        sandbox_id="sbx_mcp_late",
+        access_token="at",
+        workspace_dir=str(tmp_path),
+        base_image="python-mcp:3.14",
+        mcp=None,
+    )
+    ctx = SandboxRuntimeContext(record, Settings(executor="local"))
+
+    class _FixedCeilingExecutor:
+        instance_handle = object()
+
+        async def start(self, config):  # noqa: ANN001
+            raise AssertionError("start must not be reached")
+
+    monkeypatch.setattr(ctx, "executor", _FixedCeilingExecutor())
+    with pytest.raises(RuntimeError, match="ceiling cannot widen"):
+        await ctx.start_mcp_gateway({"name": "echo"}, "tok")
+    assert ctx.mcp_port is None
+    assert allocated == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_late_start_before_instance_allocates_and_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M4 D3 defensive path: no record.mcp and no instance yet -- the first
+    gateway start allocates the port, and shutdown returns it."""
+    import envd_service.runtime.context as context_mod
+
+    pool = context_mod.McpPortPool()
+    monkeypatch.setattr(context_mod, "_next_mcp_port", pool.allocate)
+    monkeypatch.setattr(context_mod, "_release_mcp_port", pool.release)
+    record = RuntimeSandbox(
+        sandbox_id="sbx_mcp_late_ok",
+        access_token="at",
+        workspace_dir=str(tmp_path),
+        base_image="python-mcp:3.14",
+        mcp=None,
+    )
+    ctx = SandboxRuntimeContext(record, Settings(executor="local"))
+    monkeypatch.setattr(ctx, "executor", _FakeExecutor())
+
+    await ctx.start_mcp_gateway({"name": "echo"}, "tok")
+    port = ctx.mcp_port
+    assert port is not None
+    ctx.shutdown()
+    assert ctx.mcp_port is None
+    assert pool.allocate() == port
 
 
 class _ActivityRegistry:
