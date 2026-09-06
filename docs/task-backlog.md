@@ -111,3 +111,12 @@ ACR 镜像推送照常，git 远程推送暂缓。
    euid == 沙箱 host uid）后摘除 `tests/contract/test_uid_permissions.py:99` 的 strict xfail
    并回归 T5；`mediation_run_as='supervisor'` 降级档与 WARN/`mediation_downgrades` 计数随之
    移除。
+6. **FUP pure-shape workspace 属主对齐**（Task 11 gate B 首跑暴露，确未修）：无 base image
+   的 pure-sandlock 沙箱（root worker + 共享 uid）无法 shell 写入 workspace 根目录
+   （root:root 0755 vs sandbox host uid 1000），migration 三用例在其首个命令即红
+   （`test_migrate_*_between_workers` / `failure_restores_source_runtime` /
+   `shared_workspace_skips_transfer`）。同 3 条在 M4 前置 commit `4f34e55` 同一 pure
+   形态同样失败（`tmp/m4-bisect-t1-pure.log`），pre-M4 基线 `tmp/e2b-base-20260906.log`
+   亦含同族 migration 失败 ⇒ 非 M4 回归。修复方向 = provision/import 时把 workspace
+   属主对齐到运行时 RunAs 身份（legacy 共享 uid 档），或单独决定 pure 形态属主模型；
+   证据 `tmp/m4-full-gate-b.log`。

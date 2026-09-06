@@ -37,9 +37,31 @@
 `tmp/m4-full-gate-macos.log`；精确 summary 行与 xfail 清单见 `tmp/sdd/task-11-report.md`）：
 
 - 容器 full gate A：image-rootfs + netns + XFS + npm + strict（`E2B_BASE_IMAGE=python-mcp:3.14`，
-  `E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2`）→ 0 failed / 0 error；唯一 xfail = T5。
-- 容器 full gate B：pure sandlock + netns + strict（`E2B_BASE_IMAGE=` 空）→ 0 failed / 0 error。
-- macOS 宿主 full（unit + contract + sdk python/js + security）→ 0 failed。
+  `E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2`）→ 925 passed / 1 skipped / 1 xfailed /
+  0 failed / 0 error（282.69s）；唯一 xfail = T5（route-B 前置）；唯一 skip =
+  `test_volume_quota.py:274`（XFS-degradation 互斥分支，历史每轮一致）。
+- 容器 full gate B：pure sandlock + netns + strict（`E2B_BASE_IMAGE=` 空）→
+  921 passed / 3 skipped / **3 failed（pre-existing pure-shape trio，见下）** /
+  0 error（314.38s）；3 条 skip = `test_volume_quota.py:274` 互斥分支 +
+  `test_fork_network_features.py:281` / `test_template_isolation.py:17`
+  （pure 形态无 `E2B_BASE_IMAGE` 的声明性 gate skip）。
+- macOS 宿主 full（unit + contract + sdk python/js + security）→
+  865 passed / 58 skipped / 0 failed / 0 error（136.97s）。
+
+**Gate B pre-existing trio（确未修 inventory，非 M4 回归）**：
+`test_migrate_sandbox_files_between_workers` / `test_migrate_failure_restores_source_runtime` /
+`test_migrate_shared_workspace_skips_transfer` 在 pure-sandlock（无 base image）形态下，
+沙箱 shell 无法写入自己的 workspace 根目录（`/bin/sh: cannot create …: Permission denied`；
+workspace 根 root:root 0755，共享 uid 沙箱按 host uid 1000 直写）。同 3 条在 M4 前置
+commit `4f34e55` 的同一 pure 形态下以相同方式失败（`tmp/m4-bisect-t1-pure.log`），且
+pre-M4 基线 `tmp/e2b-base-20260906.log` 已含同族 migration 失败（chroot 形态；mediation
+修复后 gate A 同批已全绿）→ 判定为既有 pure 形态缺陷，登记下方 FUP #6。
+
+**Open follow-ups（详情与指针见 `docs/task-backlog.md`「M4 收口后的 open follow-ups」）**：
+① 远程 pause/resume 投递；② fork F11（argv-safety freeze × 多线程进程树，探针
+`tmp/task8_fup3_probe.py`）；③ 网关 ledger headroom（512M 箱 ~180M）；④ 网关启动失败
+SDK 可见性（日志已落地，产品决策待定）；⑤ T5 xfail route-B 后摘除；⑥ pure-shape
+workspace 属主对齐（gate B pre-existing trio，见上）。
 
 Release note / 变更段（M4；fork 侧行为变化引用
 `third_party/sandlock/docs/CHANGELOG.md` F0–F10 段）：
