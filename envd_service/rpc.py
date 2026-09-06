@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import shlex
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -23,6 +24,14 @@ from gateway_common.errors import (
 )
 
 logger = logging.getLogger(__name__)
+
+# FUP #9: while a drifted record stays unreconciled, every command RPC would
+# otherwise repeat the same WARNING. Log at most one drift warning per sandbox
+# per window; ``_drift_warn_clock`` is injectable so unit tests can advance
+# time without sleeping.
+DRIFT_WARN_THROTTLE_SECONDS = 60.0
+_drift_warn_clock = time.monotonic
+_drift_warned_at: dict[str, float] = {}
 
 
 def _context(request: Request, runtime) -> Any:
@@ -46,13 +55,22 @@ def _context(request: Request, runtime) -> Any:
                 # D4=A: an out-of-band record change that the launched
                 # instance cannot express must not break the command path;
                 # the live runtime policy stays authoritative until the
-                # record is reconciled.
-                logger.warning(
-                    "drift network update for sandbox %s is not expressible "
-                    "on the live instance (%s); keeping runtime policy",
-                    runtime.sandbox_id,
-                    exc,
-                )
+                # record is reconciled. FUP #9 throttles the WARNING to one
+                # per sandbox per DRIFT_WARN_THROTTLE_SECONDS.
+                now = _drift_warn_clock()
+                last_warn = _drift_warned_at.get(runtime.sandbox_id)
+                if (
+                    last_warn is None
+                    or now - last_warn >= DRIFT_WARN_THROTTLE_SECONDS
+                ):
+                    logger.warning(
+                        "drift network update for sandbox %s is not "
+                        "expressible on the live instance (%s); keeping "
+                        "runtime policy",
+                        runtime.sandbox_id,
+                        exc,
+                    )
+                    _drift_warned_at[runtime.sandbox_id] = now
     return ctx
 
 
