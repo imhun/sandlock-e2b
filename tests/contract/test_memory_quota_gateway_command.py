@@ -14,7 +14,7 @@ the original scenario on the F11 wheel:
 * a trivial command after the gateway runs with exit 0 (the F11 regression
   guard: pre-F11 every later exec died exit 127);
 * a second concurrent 450 MiB command is denied with the exact SDK signature
-  recorded by the F11 probe (``tmp/perf/f11-gateway-450-450-50-*.log`` and
+  recorded by the F11 probe (``tmp/perf/f11-gateway-probe-450-450-50*.log`` and
   ``tmp/perf/f11-gateway-sdk-signature-variants.txt``): exit code 137, empty
   stdout, ``error is None``, stderr exactly one of the recorded set -- never
   a substring match and never an unobserved value;
