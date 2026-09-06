@@ -466,6 +466,15 @@ class SandlockExecutor(Executor):
             return 1000, 1000
         return os.geteuid(), os.getegid()
 
+    def _mediation_run_as(self) -> str:
+        """F6.1 C 档 fail-closed 与现网形态的桥：
+        root worker + RunAs(非 0) + chroot 路径中介 ⇒ 默认 caller 会在建箱前被拒。
+        E2B 部署 route-B（supervise 进程 euid==沙箱 uid）前，显式降级档恢复 F9 前语义
+        （fork 每次 launch WARN + stats.mediation_downgrades 计数）；非 root 无降级。"""
+        if os.geteuid() == 0 and self._base_image and self._image_rootfs is not None:
+            return "supervisor"
+        return "caller"
+
     def _mint_iam_jwt(self, audience: str) -> str:
         """Mint a JWT-SVID for a registered workload identity.
 
@@ -595,6 +604,7 @@ class SandlockExecutor(Executor):
             "cwd": config.cwd,
             "uid": sandbox_uid,
             "gid": sandbox_gid,
+            "mediation_run_as": self._mediation_run_as(),
         }
         if "mcp-gateway" in " ".join(config.cmd):
             # The SDK starts the MCP gateway inside the sandbox; it must be

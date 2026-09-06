@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from envd_service.executors.base import ExecConfig
@@ -71,6 +73,62 @@ def test_image_rootfs_shape_carries_the_shared_path_denials(tmp_path) -> None:
     assert "/" in sandbox.fs_readable
     for denied in ("/proc/kcore", "/sys", "/dev/shm", "/dev/mqueue"):
         assert denied in sandbox.fs_denied
+
+
+def test_root_image_rootfs_policy_carries_supervisor_mediation(
+    monkeypatch, tmp_path
+) -> None:
+    """Root worker + image-rootfs shape opts into the supervisor mediation tier
+    (pre-M4 baseline: explicit downgrade tier restoring F9-era semantics; to be
+    removed once route-B per-sandbox supervision lands)."""
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    executor = SandlockExecutor(
+        workspace_dir=str(tmp_path / "ws"),
+        base_image="python:3.11-slim",
+        image_rootfs=rootfs,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=False,
+    )
+    sandbox = executor._build_sandbox(
+        ExecConfig(
+            cmd=["/bin/sh", "-c", "x"], env={}, cwd=str(tmp_path / "ws"),
+            stdin_enabled=False,
+        )
+    )
+    assert sandbox.mediation_run_as == "supervisor"
+
+
+def test_nonroot_policy_keeps_caller_mediation(monkeypatch) -> None:
+    """Non-root worker keeps the fork's default caller mediation tier."""
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    executor = SandlockExecutor(
+        workspace_dir="/tmp/ws",
+        base_image=None,
+        image_rootfs=None,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=False,
+    )
+    sandbox = executor._build_sandbox(
+        ExecConfig(
+            cmd=["/bin/bash", "-c", "x"],
+            env={},
+            cwd="/tmp/ws",
+            stdin_enabled=False,
+        )
+    )
+    assert sandbox.mediation_run_as == "caller"
 
 
 def test_network_enabled_maps_to_allowlist():
