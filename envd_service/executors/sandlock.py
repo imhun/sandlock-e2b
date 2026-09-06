@@ -93,6 +93,7 @@ class SandlockRunningProcess(RunningProcess):
         loop: asyncio.AbstractEventLoop,
         stdin_queue: asyncio.Queue,
         pty_mode: bool = False,
+        on_exit=None,
     ) -> None:
         self._proc = proc
         self._queue = queue
@@ -100,6 +101,8 @@ class SandlockRunningProcess(RunningProcess):
         self._stdin_queue = stdin_queue
         self._pty_mode = pty_mode
         self._pid = proc.pid if proc.pid is not None else -1
+        self._on_exit = on_exit
+        self._reaped = False
         self._writer_thread: threading.Thread | None = None
         self._closed = False
         self._stdin_closed = False
@@ -122,6 +125,10 @@ class SandlockRunningProcess(RunningProcess):
             item = await self._queue.get()
             if item is None:
                 break
+            # Internal stream-termination markers are not output; the local
+            # executor filters them the same way before yielding.
+            if item[0] == "__eof__":
+                continue
             yield item
 
     def _start_stdin_writer(self) -> None:
@@ -222,6 +229,9 @@ class SandlockRunningProcess(RunningProcess):
 
     async def exit_code(self) -> int:
         result = await asyncio.to_thread(self._proc.wait)
+        if self._on_exit is not None and not self._reaped:
+            self._reaped = True
+            self._on_exit(self._proc.child_id, self._pid)
         return result.exit_code
 
 
@@ -308,6 +318,11 @@ class SandlockExecutor(Executor):
         self._sandbox_id = sandbox_id
         self._instance = None
         self._instance_name: str | None = None
+        # Set by ``close()`` (the single shutdown point). Guards the
+        # closed/dead rebuild-once paths: after an explicit close/shutdown a
+        # fresh instance must never be leaked, so ``start()`` fails loudly
+        # instead of rebuilding.
+        self._closed = False
         # Serializes the instance lifecycle (creation/rebuild in
         # ``_ensure_instance``, teardown in ``close``) against
         # ``update_network``'s validate+apply section: a command exec racing
@@ -395,11 +410,58 @@ class SandlockExecutor(Executor):
                 self._allow_internet_access = bool(allow_internet)
 
     def _apply_instance_update(self, network: dict | None) -> None:
-        """Bind an accepted narrowing to the live instance's new execs."""
+        """Bind an accepted narrowing to the live instance's new execs.
+
+        A closed/dead ``RuntimeError`` from ``instance.update_network``
+        (idle/24h expiry surfaced at apply time) rebuilds the instance
+        exactly once under the already-held lifecycle lock and retries the
+        apply; after an explicit ``close()``/shutdown the failure propagates
+        instead of leaking a fresh instance.
+        """
         allow_out = (network or {}).get("allowOut")
         ip_set = list(allow_out) if allow_out is not None else []
         try:
             stale_child_ids = self._instance.update_network(ip_set)
+        except RuntimeError as exc:
+            message = str(exc)
+            if "closed" not in message and "dead" not in message:
+                raise
+            if self._closed:
+                logger.warning(
+                    "not rebuilding %s instance after executor shutdown "
+                    "during network update sandbox_id=%s instance_name=%s",
+                    "closed" if "closed" in message else "dead",
+                    self._sandbox_id or "-",
+                    self.instance_name,
+                )
+                raise
+            reason = "closed" if "closed" in message else "dead"
+            logger.info(
+                "sandlock instance %s during network update; rebuilding once "
+                "sandbox_id=%s instance_name=%s",
+                reason,
+                self._sandbox_id or "-",
+                self.instance_name,
+            )
+            inst = self._instance
+            try:
+                inst.close()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+            if self._instance is inst:
+                self._instance = None
+            inst = self._ensure_instance_locked()
+            if inst is None:
+                raise RuntimeError(
+                    "no sandlock instance available after closed/dead rebuild"
+                )
+            try:
+                # Exactly one retry; a second closed/dead failure propagates.
+                stale_child_ids = inst.update_network(ip_set)
+            except PermissionError as exc2:
+                raise NetworkUpdateConflictError(
+                    str(exc2) or "instance refused the network update (EPERM)"
+                ) from exc2
         except PermissionError as exc:
             # Defense in depth: a fork EPERM (widening past the static
             # ceiling) maps to the same 409 without persisting.
@@ -545,8 +607,15 @@ class SandlockExecutor(Executor):
         return self._instance
 
     def close(self) -> None:
-        """Close the exec instance and release the handle (idempotent)."""
+        """Close the exec instance and release the handle (idempotent).
+
+        Marks the executor shut down: later ``start()`` calls fail loudly
+        instead of rebuilding a fresh instance (the closed/dead rebuild-once
+        retry is for idle/24h expiry during a live sandbox, not for after an
+        explicit teardown).
+        """
         with self._lifecycle_lock:
+            self._closed = True
             if self._instance is not None:
                 logger.info(
                     "sandlock instance closed sandbox_id=%s instance_name=%s",
@@ -557,6 +626,17 @@ class SandlockExecutor(Executor):
                 self._instance = None
             self._instance_network_snapshot = None
             self._child_registry.clear()
+
+    def _child_exited(self, child_id: int, pid: int) -> None:
+        """Drop a reaped child from the staleness registry.
+
+        ``pid`` guards against removing a newer entry if the fork recycles a
+        child id after an instance rebuild: the entry is only removed while
+        it still points at the process that just ended.
+        """
+        entry = self._child_registry.get(child_id)
+        if entry is not None and entry[0] == pid:
+            del self._child_registry[child_id]
 
     def _materialize_http_inject(
         self, entries: list[dict]
@@ -1169,10 +1249,20 @@ class SandlockExecutor(Executor):
         PTY commands use the fork-native ``ExecStdio.PTY`` (host-side master,
         resized through ``ExecProcess.resize``) instead of the removed
         in-sandbox bridge; everything else uses ``ExecStdio.PIPED``. Per-exec
-        cwd/env/clean_env/bind_ports come from ``_exec_params``.
+        cwd/env/clean_env/bind_ports come from ``_exec_params``. A
+        closed/dead ``RuntimeError`` from ``inst.exec`` (idle-15min/24h
+        instance expiry surfaces at exec time, not construction) rebuilds the
+        instance exactly once under the lifecycle lock and retries the exec;
+        after an explicit ``close()``/shutdown the executor fails loudly
+        instead of rebuilding.
         """
         if sandlock is None:
             raise unimplemented("Sandlock is not available on this platform")
+        if self._closed:
+            raise RuntimeError(
+                "sandlock executor is shut down; refusing to start a command "
+                "on a rebuilt instance"
+            )
         # The normal exec path takes the lifecycle lock around instance
         # creation too, so a concurrent ``update_network`` serializes against
         # it exactly like any other ``_ensure_instance`` caller.
@@ -1182,15 +1272,70 @@ class SandlockExecutor(Executor):
             raise unimplemented("Sandlock is not available on this platform")
         stdio = ExecStdio.PTY if config.pty else ExecStdio.PIPED
         resolved = self.resolve_cmd(config.cmd)
-        try:
-            proc = await asyncio.to_thread(
-                inst.exec,
+
+        async def _exec_once(target) -> object:
+            return await asyncio.to_thread(
+                target.exec,
                 resolved,
                 stdio,
                 **self._exec_params(
                     config, bind_ports=self._bind_ports_for(config)
                 ),
             )
+
+        try:
+            proc = await _exec_once(inst)
+        except RuntimeError as exc:
+            message = str(exc)
+            if "closed" not in message and "dead" not in message:
+                logger.warning(
+                    "sandlock exec failed sandbox_id=%s instance_name=%s "
+                    "argv=%s error_type=%s error=%s",
+                    self._sandbox_id or "-",
+                    self.instance_name,
+                    resolved,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
+            # Idle/24h expiry or machinery death surfaced at exec time:
+            # rebuild exactly once and retry. Never after an explicit close()
+            # (a concurrent shutdown must not leak a fresh instance).
+            reason = "closed" if "closed" in message else "dead"
+            logger.info(
+                "sandlock instance %s during exec; rebuilding once "
+                "sandbox_id=%s instance_name=%s argv=%s",
+                reason,
+                self._sandbox_id or "-",
+                self.instance_name,
+                resolved,
+            )
+            with self._lifecycle_lock:
+                if self._closed:
+                    logger.warning(
+                        "not rebuilding %s exec instance after executor "
+                        "shutdown sandbox_id=%s instance_name=%s",
+                        reason,
+                        self._sandbox_id or "-",
+                        self.instance_name,
+                    )
+                    raise
+                if self._instance is inst:
+                    # The instance is closed/dead already; release the handle
+                    # so ``_ensure_instance_locked`` builds a fresh one. A
+                    # concurrent caller may have rebuilt it meanwhile.
+                    try:
+                        inst.close()
+                    except Exception:  # noqa: BLE001 - best-effort teardown
+                        pass
+                    self._instance = None
+                inst = self._ensure_instance_locked()
+                if inst is None:
+                    raise unimplemented(
+                        "Sandlock is not available on this platform"
+                    )
+            # Exactly one retry; a second closed/dead failure propagates.
+            proc = await _exec_once(inst)
         except Exception as exc:
             logger.warning(
                 "sandlock exec failed sandbox_id=%s instance_name=%s argv=%s "
@@ -1215,6 +1360,7 @@ class SandlockExecutor(Executor):
             loop=loop,
             stdin_queue=stdin_queue,
             pty_mode=config.pty,
+            on_exit=self._child_exited,
         )
         if config.pty:
             # The removed in-sandbox bridge applied the requested window size

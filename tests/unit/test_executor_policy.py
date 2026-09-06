@@ -18,6 +18,20 @@ from envd_service.executors.base import ExecConfig
 from envd_service.executors.sandlock import SandlockExecutor
 
 
+def test_minimal_dev_mirror_matches_native_helper() -> None:
+    """The off-Linux ``_MINIMAL_DEV_MOUNTS`` mirror must stay identical to
+    the fork's ``sandlock.minimal_dev()`` so policy-shape assertions cannot
+    drift from the real chroot /dev set (skip the assert when the native
+    module is not importable, i.e. off-Linux)."""
+    import envd_service.executors.sandlock as sandlock_mod
+
+    if sandlock_mod.sandlock is None:
+        pytest.skip("native sandlock module unavailable off-Linux")
+    assert (
+        sandlock_mod._MINIMAL_DEV_MOUNTS == sandlock_mod.sandlock.minimal_dev()
+    )
+
+
 def _executor(rootfs: Path, ws: Path) -> SandlockExecutor:
     return SandlockExecutor(
         workspace_dir=str(ws),

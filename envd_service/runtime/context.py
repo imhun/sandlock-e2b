@@ -273,8 +273,22 @@ class SandboxRuntimeContext:
         sandbox creation.
         """
         if sys.platform != "linux" or os.geteuid() != 0:
+            logger.debug(
+                "skipping chroot volume bind materialization for sandbox %s "
+                "(requires a Linux root worker; current platform=%s euid=%s) "
+                "-- keeping the workspace symlink",
+                self.record.sandbox_id,
+                sys.platform,
+                os.geteuid(),
+            )
             return
         if getattr(self.executor, "_image_rootfs", None) is None:
+            logger.debug(
+                "skipping chroot volume bind materialization for sandbox %s "
+                "(executor has no image rootfs; pure-sandlock/local shape "
+                "relies on the workspace symlink)",
+                self.record.sandbox_id,
+            )
             return
         for mount in self.record.volume_mounts:
             rel = str(mount.get("path", "")).lstrip("/")

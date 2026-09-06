@@ -601,3 +601,46 @@ def test_update_network_holds_lifecycle_lock_across_apply(monkeypatch) -> None:
     assert inst.update_calls == [["8.8.8.8"]]
     assert ex._network == {"allowOut": ["8.8.8.8"]}
     ex.close()
+
+
+def test_update_network_rebuilds_once_after_closed_instance(
+    monkeypatch,
+) -> None:
+    """I1: a closed/dead RuntimeError from ``instance.update_network`` (idle/
+    24h expiry surfaced at apply time) rebuilds the instance exactly once and
+    retries the apply on the fresh instance."""
+    created = [0]
+    raise_once = [True]
+    instances: list = []
+
+    class _ClosedOnceUpdate(_RecordingInstance):
+        def __init__(self, policy, name=None):
+            super().__init__(policy, name=name)
+            created[0] += 1
+            instances.append(self)
+
+        def update_network(self, ips):
+            self.update_calls.append(list(ips))
+            if raise_once[0]:
+                raise_once[0] = False
+                raise RuntimeError("sandlock instance is closed")
+            return list(self.stale_child_ids)
+
+    ex = _executor(
+        monkeypatch,
+        network={"allowOut": ["8.8.8.8"]},
+        allow_internet_access=True,
+    )
+    monkeypatch.setattr(sl, "SandboxInstance", _ClosedOnceUpdate)
+    first = ex._ensure_instance()
+    assert created[0] == 1
+
+    ex.update_network({"allowOut": []})
+
+    assert created[0] == 2
+    assert len(instances) == 2
+    assert first.closed is True
+    assert ex.instance_handle is instances[1]
+    assert instances[1].update_calls == [[]]
+    assert ex._network == {"allowOut": []}
+    ex.close()

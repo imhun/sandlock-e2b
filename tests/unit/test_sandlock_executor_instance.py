@@ -8,6 +8,7 @@ closed/dead launch -- is unit-testable on macOS / CI.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from types import SimpleNamespace
@@ -16,7 +17,10 @@ import pytest
 
 import envd_service.executors.sandlock as sl
 from envd_service.executors.base import ExecConfig
-from envd_service.executors.sandlock import SandlockExecutor
+from envd_service.executors.sandlock import (
+    SandlockExecutor,
+    SandlockRunningProcess,
+)
 from gateway_common.errors import ConnectError
 
 
@@ -395,3 +399,135 @@ async def test_start_raises_unimplemented_without_native_sandlock(
                 stdin_enabled=False,
             )
         )
+
+
+async def test_start_rebuilds_once_after_closed_exec_and_retries(
+    monkeypatch,
+) -> None:
+    """I1: idle/24h expiry surfaces as a closed RuntimeError from
+    ``inst.exec``; start() rebuilds the instance exactly once and retries the
+    exec. The reaped child is also dropped from the staleness registry."""
+    attempts = [0]
+    instances: list = []
+
+    class _ClosedOnceExec(_ExecRecordingInstance):
+        def __init__(self, policy, name=None):
+            super().__init__(policy, name=name)
+            instances.append(self)
+
+        def exec(self, cmd, stdio=..., **kwargs):  # noqa: ANN001
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise RuntimeError("sandlock instance is closed")
+            return super().exec(cmd, stdio=stdio, **kwargs)
+
+    ex = _exec_ready_executor(monkeypatch)
+    monkeypatch.setattr(sl, "SandboxInstance", _ClosedOnceExec)
+    cfg = ExecConfig(
+        cmd=["/bin/sh", "-c", "echo retried"],
+        env={},
+        cwd="/tmp/ws",
+        stdin_enabled=False,
+    )
+    running = await ex.start(cfg)
+
+    assert attempts[0] == 2
+    assert len(instances) == 2
+    assert ex.instance_handle is instances[1]
+    assert len(instances[1].exec_calls) == 1
+    # The retried child was registered for staleness reporting...
+    assert ex._child_registry == {7: (4242, ["/bin/sh", "-c", "echo retried"])}
+    # ...and dropped again once the process is reaped.
+    assert await running.exit_code() == 0
+    assert ex._child_registry == {}
+
+
+async def test_start_second_closed_exec_failure_propagates(monkeypatch) -> None:
+    """I1: if the rebuilt instance's exec also raises closed/dead, the
+    second failure propagates unchanged (no endless rebuild loop)."""
+    created = [0]
+
+    class _AlwaysClosedExec(_ExecRecordingInstance):
+        def __init__(self, policy, name=None):
+            super().__init__(policy, name=name)
+            created[0] += 1
+
+        def exec(self, cmd, stdio=..., **kwargs):  # noqa: ANN001
+            raise RuntimeError("sandlock instance is closed")
+
+    ex = _exec_ready_executor(monkeypatch)
+    monkeypatch.setattr(sl, "SandboxInstance", _AlwaysClosedExec)
+    cfg = ExecConfig(
+        cmd=["/bin/sh", "-c", "true"],
+        env={},
+        cwd="/tmp/ws",
+        stdin_enabled=False,
+    )
+    with pytest.raises(RuntimeError, match=r"^sandlock instance is closed$"):
+        await ex.start(cfg)
+    assert created[0] == 2
+
+
+async def test_start_after_close_fails_without_rebuilding(monkeypatch) -> None:
+    """I1: an explicit close()/shutdown must not leak a fresh instance -- a
+    later start() fails loudly instead of rebuilding."""
+    created = [0]
+
+    class _CountingInstance(_ExecRecordingInstance):
+        def __init__(self, policy, name=None):
+            super().__init__(policy, name=name)
+            created[0] += 1
+
+    ex = _exec_ready_executor(monkeypatch)
+    monkeypatch.setattr(sl, "SandboxInstance", _CountingInstance)
+    ex._ensure_instance()
+    ex.close()
+    cfg = ExecConfig(
+        cmd=["/bin/sh", "-c", "true"],
+        env={},
+        cwd="/tmp/ws",
+        stdin_enabled=False,
+    )
+    with pytest.raises(RuntimeError, match="shut down"):
+        await ex.start(cfg)
+    assert created[0] == 1
+    assert ex.instance_handle is None
+
+
+def test_child_registry_exit_removal_is_pid_guarded(monkeypatch) -> None:
+    """I1/cheap-win: a reaped child leaves the staleness registry, but an
+    older exit must not remove a newer entry if the fork recycled the child
+    id after an instance rebuild."""
+    ex = _exec_ready_executor(monkeypatch)
+    ex._child_registry[7] = (4242, ["/bin/old"])
+    ex._child_exited(7, 4242)
+    assert ex._child_registry == {}
+
+    ex._child_registry[7] = (9999, ["/bin/new"])
+    ex._child_exited(7, 4242)
+    assert ex._child_registry == {7: (9999, ["/bin/new"])}
+    ex._child_exited(7, 9999)
+    assert ex._child_registry == {}
+
+
+async def test_consume_filters_internal_eof_markers() -> None:
+    """Cheap-win: ``("__eof__", kind)`` stream markers are internal and never
+    surface to consumers (parity with the local executor)."""
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    running = SandlockRunningProcess(
+        proc=_FakeExecProcess(),
+        queue=queue,
+        loop=loop,
+        stdin_queue=asyncio.Queue(maxsize=1),
+    )
+    for item in (
+        ("stderr", b"x"),
+        ("__eof__", "stderr"),
+        ("stdout", b"y"),
+        ("__eof__", "stdout"),
+        None,
+    ):
+        queue.put_nowait(item)
+    events = [item async for item in running.output()]
+    assert events == [("stderr", b"x"), ("stdout", b"y")]
