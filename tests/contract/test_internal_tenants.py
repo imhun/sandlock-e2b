@@ -57,7 +57,7 @@ async def test_internal_tenants_reports_usage_and_limits(make_apps):
         assert set(by_tenant) == {T1, T2}
         assert by_tenant[T1]["used"] == {
             "sandboxes": 1,
-            "memoryMB": 512,
+            "memoryMB": 1024,
             "cpuPercent": 100,
             "diskMB": 1024,
             # M4 D6: max_processes is the whole-box per-sandbox budget,
@@ -105,7 +105,7 @@ async def test_internal_tenants_compat_mode(make_apps):
         # Unowned usage is reported so migration gaps stay visible.
         assert body["unowned"] == {
             "sandboxes": 1,
-            "memoryMB": 512,
+            "memoryMB": 1024,
             "cpuPercent": 100,
             "diskMB": 1024,
             # M4 D6: whole-box default 256.
@@ -136,7 +136,7 @@ async def test_internal_tenants_reports_unowned_after_mixed_creates(make_apps):
         )).json()
         assert body["unowned"] == {
             "sandboxes": 1,
-            "memoryMB": 512,
+            "memoryMB": 1024,
             "cpuPercent": 100,
             "diskMB": 1024,
             # M4 D6: whole-box default 256.

@@ -113,7 +113,7 @@ def test_metrics(live_servers):
         metrics = sandbox.get_metrics()
         assert len(metrics) >= 1
         assert metrics[0].cpu_count == 1
-        assert metrics[0].mem_total == 512 * 1024 * 1024
+        assert metrics[0].mem_total == 1024 * 1024 * 1024
         assert metrics[0].disk_total > 0
         assert metrics[0].timestamp is not None
     finally:

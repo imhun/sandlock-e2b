@@ -61,9 +61,10 @@ pre-M4 基线 `tmp/e2b-base-20260906.log` 已含同族 migration 失败（chroot
 
 **Open follow-ups（详情与指针见 `docs/task-backlog.md`「M4 收口后的 open follow-ups」）**：
 ① 远程 pause/resume 投递；② fork F11（argv-safety freeze × 多线程进程树，探针
-`tmp/task8_fup3_probe.py`）；③ 网关 ledger headroom（512M 箱 ~180M）；④ 网关启动失败
-SDK 可见性（日志已落地，产品决策待定）；⑤ T5 xfail route-B 后摘除；⑥ pure-shape
-workspace 属主对齐（gate B pre-existing trio，见上）。
+`tmp/task8_fup3_probe.py`）；③ 网关 ledger headroom——E2B 侧已关闭（FUP #3，默认
+512→1024 MiB；fork 逻辑未动）；④ 网关启动失败 SDK 可见性（日志已落地，产品决策待定）；
+⑤ T5 xfail route-B 后摘除；⑥ pure-shape workspace 属主对齐（gate B pre-existing
+trio，见上）。
 
 Release note / 变更段（M4；fork 侧行为变化引用
 `third_party/sandlock/docs/CHANGELOG.md` F0–F10 段）：
@@ -82,6 +83,9 @@ Release note / 变更段（M4；fork 侧行为变化引用
   transport-loss caveat。
 - pause 冻结 `ProcessManager` 命令组（网关不在命令组、不暂停）；T5 xfail 在 route-B
   supervise 部署前保持（属预期）。
+- per-sandbox 默认内存 512→1024 MiB（`E2B_DEFAULT_MEMORY_MB`）：网关 ledger headroom
+  FUP 在 E2B 侧关闭——1 GiB 箱给网关 allocator reservations 与 450M MCP server 目标留出
+  空间；fork 逻辑未改动，fork F11 保持 open。
 
 ## ⚡ sandlock fork 交接总览（新会话从这里开始）
 

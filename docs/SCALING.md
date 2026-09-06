@@ -75,13 +75,18 @@ max(min_replicas,
 本地节点取 `E2B_MAX_TOTAL_PROCESSES`，默认 2048），因此该维度每节点最多
 容纳 `2048 / 256 = 8` 个标准沙箱（此前 `2048 / 64 = 32`）——默认上调后
 进程维度不再是富余维度，四维容量换算必须显式计入。
+内存维度随 FUP #3 同步上调（2026-09-06）：单沙箱默认内存从 512 MiB 提到
+1 GiB（`E2B_DEFAULT_MEMORY_MB`），默认 8192 MiB 节点因此容纳
+`8192 / 1024 = 8` 个标准沙箱（此前 `8192 / 512 = 16`），与进程维度同为
+容量主约束；换算必须同时显式计入内存与进程维度。
 
 M4 收口（2026-09-06）：执行边界 = 产品边界——每沙箱一只 exec-only
 `SandboxInstance`（命令与 MCP 网关共享箱内预算），"每命令一个实例可超卖"的形态已随
-`third_party/sandlock/docs/e2b-integration.md` §3.8 关闭。两个 fork-blocked 边界未在容量
-公式内放宽，见 `docs/task-backlog.md`「M4 收口后的 open follow-ups」：fork F11
-（多线程进程存在后 argv-safety exec 冻结 EPERM）与网关 ledger headroom（512M 箱内网关
-reservations 计入后 MCP server 子进程只剩 ~180M）。
+`third_party/sandlock/docs/e2b-integration.md` §3.8 关闭。未在容量公式内放宽的
+fork-blocked 边界只剩 fork F11（多线程进程存在后 argv-safety exec 冻结 EPERM，
+见 `docs/task-backlog.md`「M4 收口后的 open follow-ups」）。网关 ledger headroom
+已关闭在 E2B 侧（FUP #3）：默认箱从 512 MiB 提到 1 GiB 后，网关 allocator
+reservations（~250–330M）与 450M MCP server 目标可共存，fork 逻辑未改动。
 
 冷却策略：扩容冷却 60s；缩容冷却 10min，且仅当集群聚合利用率低于
 `E2B_AS_SCALE_DOWN_UTIL`（默认 0.40）、候选节点连续空闲且 0 活跃沙箱时

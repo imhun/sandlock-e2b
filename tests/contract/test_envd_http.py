@@ -59,7 +59,7 @@ async def test_metrics(control_client, envd_client):
     assert response.status_code == 200
     payload = response.json()
     assert set(payload) == {"cpu", "memory", "disk"}
-    assert payload["memory"]["totalBytes"] == 512 * 1024 * 1024
+    assert payload["memory"]["totalBytes"] == 1024 * 1024 * 1024
 
 
 async def test_file_download_exact(control_client, envd_client):

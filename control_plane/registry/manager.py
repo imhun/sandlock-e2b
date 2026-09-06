@@ -89,7 +89,7 @@ class SandboxRecord:
     started_at: datetime = field(default_factory=utcnow)
     end_at: datetime = field(default_factory=lambda: utcnow() + timedelta(seconds=300))
     cpu_count: int = 1
-    memory_mb: int = 512
+    memory_mb: int = 1024
     disk_size_mb: int = 1024
     metadata: dict[str, str] = field(default_factory=dict)
     env_vars: dict[str, str] = field(default_factory=dict)
@@ -304,7 +304,7 @@ class SandboxRecord:
             started_at=_parse(data["started_at"]),
             end_at=_parse(data["end_at"]),
             cpu_count=int(data.get("cpu_count", 1)),
-            memory_mb=int(data.get("memory_mb", 512)),
+            memory_mb=int(data.get("memory_mb", 1024)),
             disk_size_mb=int(data.get("disk_size_mb", 1024)),
             metadata=dict(data.get("metadata", {})),
             env_vars=dict(data.get("env_vars", {})),

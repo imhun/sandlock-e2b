@@ -38,7 +38,7 @@ class RuntimeSandbox:
     #: distinct sandboxes get kernel-enforced file isolation. ``None`` =
     #: legacy shared-uid mode (fixed uid + Landlock).
     host_uid: int | None = None
-    memory_mb: int = 512
+    memory_mb: int = 1024
     cpu_percent: int = 100
     disk_mb: int = 1024
     project_id: int | None = None
@@ -151,7 +151,7 @@ class RuntimeRegistry:
         env_vars: dict[str, str] | None = None,
         base_image: str | None = None,
         host_uid: int | None = None,
-        memory_mb: int = 512,
+        memory_mb: int = 1024,
         cpu_percent: int = 100,
         disk_mb: int = 1024,
         project_id: int | None = None,

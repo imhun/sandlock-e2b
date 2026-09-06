@@ -101,9 +101,10 @@ ACR 镜像推送照常，git 远程推送暂缓。
    `argv-safety freeze failed ... Operation not permitted`（fork 侧缺陷），网关+命令同实例
    形态与 FUP-E3 gateway 变体都依赖其修复。参数化探针就绪：`tmp/task8_fup3_probe.py`；
    证据：`tmp/sdd/task-8-report.md`。
-3. **FUP 网关 ledger headroom**（Task 8）：512M 箱内网关自身 allocator reservations 计入后，
-   MCP server 子进程只剩 ~180M（450M holder 起不来）。与 fork F11 一并决定箱预算或 ledger
-   排除规则；证据同上。
+3. **FUP 网关 ledger headroom**（Task 8）: ✅ E2B 侧已关闭（FUP #3，2026-09-06）——per-sandbox
+   默认内存 512→1024 MiB（`E2B_DEFAULT_MEMORY_MB`），1 GiB 箱给网关 ledger
+   （~250–330M）与 450M MCP server 目标留出空间；fork 逻辑未改动。FUP-E3 gateway+命令
+   变体仍等 fork F11（见 row 2），保持 open。
 4. **FUP 网关启动失败 SDK 可见性**（Task 10/11）：Task 11 已落地 ERROR 日志
    （sandbox_id/port/stderr/exit text，`envd_service/runtime/context.py` watcher），SDK 仍按
    契约先收 exit-0；SDK 可见的错误上抛是未来产品决策，未定。

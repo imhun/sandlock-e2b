@@ -202,7 +202,7 @@ async def test_migrate_explicit_target_and_quota_move(multinode_two_workers):
             n for n in harness["nodes"].list() if n.node_id == target_node.node_id
         )
         assert source.reserved_memory_mb == 0
-        assert target.reserved_memory_mb == 512
+        assert target.reserved_memory_mb == 1024
 
         # Migrating back to the current node is rejected.
         same = await _migrate(harness, sandbox_id, body={"nodeID": target_node.node_id})

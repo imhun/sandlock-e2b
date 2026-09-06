@@ -58,7 +58,7 @@ class Settings:
         default_factory=lambda: _env_int("E2B_MAX_COMMAND_TIMEOUT", 3600)
     )
     default_memory_mb: int = field(
-        default_factory=lambda: _env_int("E2B_DEFAULT_MEMORY_MB", 512)
+        default_factory=lambda: _env_int("E2B_DEFAULT_MEMORY_MB", 1024)
     )
     default_cpu_percent: int = field(
         default_factory=lambda: _env_int("E2B_DEFAULT_CPU_PERCENT", 100)

@@ -81,7 +81,7 @@ async def test_metrics_shape(control_client):
         "diskUsed",
         "timestamp",
     }
-    assert metric["memTotal"] == 512 * 1024 * 1024
+    assert metric["memTotal"] == 1024 * 1024 * 1024
 
 
 async def test_logs_shape(control_client):
