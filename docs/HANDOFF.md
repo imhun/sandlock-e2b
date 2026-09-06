@@ -31,6 +31,13 @@
   ⬜ 计划中）：fork 详细计划 `third_party/sandlock/docs/fork-plan-2026-09-f12.md`，
   main 登记 task-backlog #15，fork followups A 节 F12；收口流程 = fork 实现 + 门禁
   + wheel → E2B 指针 bump + thread/gateway 探针 + full gate A/B 复跑。
+  **再增（2026-09-06，C 类评估后按建议排入计划）**：fork **F13 — fs 写家族挂载
+  保护收尾**（FUP-04 link 直击 + FUP-05 目录挂载点 rmdir + 断言精度，中优先，
+  ⬜ 计划中）与 **F14 — capability-aware 特权 remap gate**（FUP-22，route-B ③
+  部署前完成，⬜ 计划中）：fork 计划
+  `third_party/sandlock/docs/fork-plan-2026-09-f13.md` /
+  `third_party/sandlock/docs/fork-plan-2026-09-f14.md`；main 登记 task-backlog
+  #17/#18。C 类评估全文 `third_party/sandlock/docs/fork-c-class-design-assessment.md`。
 
 门禁摘要（容器 strict：image 默认 `E2B_BASE_IMAGE=python:3.11-slim` + privileged
 host-net，`E2B_TEST_STRICT_SKIPS=1`；macOS host 见下）：

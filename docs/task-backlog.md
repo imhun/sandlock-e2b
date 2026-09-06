@@ -197,3 +197,14 @@ ACR 镜像推送照常，git 远程推送暂缓。
     （per-child fs/bind 强制）、FUP-20（credential per-child 归因）、FUP-21
     （port-aware update_network）→ 候补（触发式，E2B/产品当前无需求；F12 完成
     后再评估与 pid 穿透设计合并）。
+17. **fork F13（已排入计划，2026-09-06）: fs 写家族挂载保护收尾** — ⬜ 计划中。
+    范围：FUP-04 `link()` 于 rw 挂载点直击 + 断言精度收敛；FUP-05 目录挂载点
+    `rmdir` 语义（与真实 bind-mount 一致返回 EBUSY，禁止删除活动挂载点）；
+    文档 §3.1 注记随实现闭环。fork 计划：
+    `third_party/sandlock/docs/fork-plan-2026-09-f13.md`。
+18. **fork F14（已排入计划，2026-09-06）: capability-aware 特权 remap gate** —
+    ⬜ 计划中（route-B ③ file-cap launcher 部署前必须完成，安全 gate）。范围：
+    把 C 档 gate 从 `euid==0` 升级为 effective-capability 判定（CAP_SETUID/
+    SETGID 即使 euid 非 0 也 fail-closed 拒绝），RED 用 capability 夹具模拟，
+    不引入真实 file-cap 部署；supervise B 档交接不受影响。fork 计划：
+    `third_party/sandlock/docs/fork-plan-2026-09-f14.md`。
