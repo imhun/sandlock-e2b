@@ -549,6 +549,66 @@ async def agent_delete_sandbox(
     return Response(status_code=204)
 
 
+def _agent_set_paused(
+    request: Request, sandbox_id: str, *, paused: bool
+) -> Response:
+    """Freeze/thaw one sandbox's running exec children on this worker.
+
+    Delivery counterpart of the control-plane pause/resume endpoints (FUP
+    G1a): a separated worker never shares the control plane's runtime
+    registry, so the control plane asks the hosting agent directly. The
+    handler mirrors the internal-key auth and shape of the network/delete
+    agent routes.
+
+    * Runtime missing -> 404: the control plane keeps its own state
+      bookkeeping and treats this as "no live runtime to freeze/thaw".
+    * No live context (nothing launched yet) -> 204: there is no process
+      tree to stop/continue.
+    * Idempotent: ``ctx.pause()``/``ctx.resume()`` delegate to
+      ``ProcessManager.pause_all/resume_all``, which are no-ops with no
+      running children, matching the combined (shared-registry) path.
+    * No new-command gating: pause freezes the currently running command
+      groups; it does not gate future execs (parity with the combined
+      deployment).
+
+    Any JSON body is accepted and ignored for symmetry with the other agent
+    routes (none is needed).
+    """
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    runtime = request.app.state.runtime_registry.get(sandbox_id)
+    if runtime is None:
+        return Response(status_code=404)
+    ctx = request.app.state.runtimes.get(sandbox_id)
+    if ctx is not None:
+        if paused:
+            ctx.pause()
+        else:
+            ctx.resume()
+    logger.info(
+        "agent %s sandbox %s (%s)",
+        "pause" if paused else "resume",
+        sandbox_id,
+        "live context" if ctx is not None else "no live context",
+    )
+    return Response(status_code=204)
+
+
+@router.post("/agent/sandboxes/{sandbox_id}/pause", status_code=204)
+async def agent_pause_sandbox(sandbox_id: str, request: Request) -> Response:
+    """Freeze the sandbox's running exec child groups on this worker."""
+    return _agent_set_paused(request, sandbox_id, paused=True)
+
+
+@router.post("/agent/sandboxes/{sandbox_id}/resume", status_code=204)
+async def agent_resume_sandbox(sandbox_id: str, request: Request) -> Response:
+    """Thaw the sandbox's paused exec child groups on this worker."""
+    return _agent_set_paused(request, sandbox_id, paused=False)
+
+
 @router.get("/agent/images/{image:path}/warm")
 async def agent_image_warm_peek(image: str, request: Request) -> Response:
     """Return ``{cached, digest}`` for a base image without extracting it.
