@@ -195,8 +195,15 @@ ACR 镜像推送照常，git 远程推送暂缓。
     绿）；pidfd leader watcher 的组退出语义 C 探针实证。fork 全门禁绿 +
     wheel（4d5f385）双架构重建 verify 全绿。E2B 真栈 thread 探针（新 wheel +
     重建 e2b-sandlock-test）GREEN：线程化 python 存活时后续 exec exit 0 /
-    `b-ok\n`（`tmp/perf/f14-thread-probe.log`）。**仍待 E2B 下一波**：FUP-E3
-    gateway+命令变体复跑 + full gate A/B（本行 bump 后执行）。
+    `b-ok\n`（`tmp/perf/f14-thread-probe.log`）。**E2B 下一波完成
+    （2026-09-07）**：FUP-E3 gateway+命令变体 pure 探针 4/4 GREEN
+    （`tmp/perf/f14-gateway-probe-450-450-50{,-run2,-run3,-run4}.log`）、
+    gateway+命令与 boxed 契约 pure 各 2 轮全绿（`tmp/f14-e2b-contract-*.log`）、
+    full gate A 982/2skip/1xfail(T5)/0（`tmp/f14-e2b-gate-a.log`）、full gate B
+    982/3skip/0（`tmp/f14-e2b-gate-b.log`）、macOS 916/65skip/0
+    （`tmp/f14-e2b-macos.log`）；gate A/B 需
+    `E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2`（漏参首轮 boxed 队列超时，非回归；
+    聚焦复跑 `tmp/f14-e2b-boxed-gateA-focused.log`）。
 16. **fork C 类设计项评估（2026-09-06）**: 已评估（fork docs
     `third_party/sandlock/docs/fork-c-class-design-assessment.md`，fork 提交
     `9d60058`）。结论：FUP-22（non-root-but-CAP_SETUID launcher gate）→ 立项，
@@ -216,7 +223,8 @@ ACR 镜像推送照常，git 远程推送暂缓。
     （宿主目录不再可被沙箱 rmdir 删除；文件/chardev leaf 回落 ENOTDIR）；ffi
     98→100（+2 测试：link 直击 pin + 目录 rmdir EBUSY）；RED 先证「沙箱 rmdir
     删除空宿主目录」（`tmp/sdd/f13-red-rmdir.log`）；fork 全门禁绿；wheel 随
-    F14 最终 tip（4d5f385）统一重建 verify 全绿。
+    F14 最终 tip（4d5f385）统一重建 verify 全绿；E2B 复跑 2026-09-07 完成
+    （见 #15）。
 18. **fork F14（已排入计划，2026-09-06）: capability-aware 特权 remap gate** —
     ✅ fork 侧完成（2026-09-07；fork 本地提交 `ba6963e` fix + `4d5f385` docs；
     报告 `third_party/sandlock/tmp/sdd/f14-report.md`；route-B ③ 部署前必须
@@ -230,4 +238,5 @@ ACR 镜像推送照常，git 远程推送暂缓。
     caps 的调用方（file-cap launcher 形态）以点名能力的新消息建箱前拒绝，不再
     落到暗示无 caps 的晚拒；root 行为/消息不变。core_lib 827→828（+1 纯决策
     单测）、mediation_2uid 8→9（setcap eip + setpriv 65533 真执行夹具）；
-    fork 全门禁绿；wheel（4d5f385）双架构重建 verify 全绿。
+    fork 全门禁绿；wheel（4d5f385）双架构重建 verify 全绿；E2B 复跑
+    2026-09-07 完成（见 #15）。

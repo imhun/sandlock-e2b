@@ -5,7 +5,7 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
-## ⚡ Fork F12–F14 全部完成（2026-09-07，fork 侧收口 + E2B wheel/探针）
+## ⚡ Fork F12–F14 全部完成（2026-09-07，fork 侧收口 + E2B wheel/探针/全量复跑）
 
 `third_party/sandlock`（fork 子模块，分支 `upstream-pr/netns-free-clean`）本地
 提交链：`68e7e84`+`194ffed`（F12 ProcessIndex 一 TGID 一 entry）、`4576615`+
@@ -37,9 +37,27 @@ aware 特权 remap gate），均未推送。三份计划文档状态 → ✅（f
 - **E2B 真栈 thread 探针 GREEN**（新 wheel + 重建镜像，
   `tmp/perf/f14-thread-probe.log`）：线程化 python A 存活时后续 exec B exit 0 /
   stdout `b-ok\n`（F11/F12 argv-safety × 多线程回归在 E2B 栈上保持绿）。
-- **仍待 E2B 下一波**：FUP-E3 gateway+命令变体复跑（`tmp/f11_fup3_probe.py`，
-  需 multinode harness）+ full gate A/B/macOS 复跑（沿用 F11 流程；task-backlog
-  #15/#17/#18 已标 fork 侧完成、E2B 复跑待执行）。指针 bump = 4d5f385。
+- **E2B 下一波收口（2026-09-07，wheel = 4d5f385）**：FUP-E3 gateway+命令变体
+  pure 形态探针 4/4 GREEN（`list_tools == ['echo']`、网关后命令 exit 0 /
+  stdout `post-gateway-ok\n`、450M 超卖命令拒绝 exit 137 / stdout `''` /
+  stderr ∈ {"", "Killed\n"}、50M 控制命令 exit 0、record `memoryMB == 1024`；
+  `tmp/perf/f14-gateway-probe-450-450-50{,-run2,-run3,-run4}.log` +
+  `tmp/perf/f14-gateway-evidence.txt`）；契约 `test_memory_quota_gateway_command.py`
+  与 `test_memory_quota_boxed.py` pure 各 2 轮全绿（`tmp/f14-e2b-contract-gw{1,2}.log`
+  / `-boxed{1,2}.log`）；full gate A（image-rootfs python-mcp:3.14）
+  **982 passed / 2 skipped / 1 xfailed(T5) / 0 failed**（`tmp/f14-e2b-gate-a.log`）、
+  full gate B（pure sandlock）**982 passed / 3 skipped / 0 failed**
+  （`tmp/f14-e2b-gate-b.log`）、macOS 全量 **916 passed / 65 skipped / 0 failed**
+  （`tmp/f14-e2b-macos.log`）。task-backlog #15/#17/#18 的 E2B 复跑随之关闭
+  （fork 侧早于 `bc54b26` 完成；E2B 侧收口见下方提交与 `.superpowers/sdd/progress.md`）。
+  指针 bump = 4d5f385（`bc54b26`）+ 本波 fork docs commit（e2b-integration §5/§8、
+  CHANGELOG、followups、f12 计划）。
+- **gate A 复跑说明（参数纪律）**：full gate A/B 需要
+  `E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2`（boxed 两并发命令共享槽位）；
+  首轮漏传该参数时 `test_boxed_memory_quota_denies_sibling_overcommit` 以
+  "command queue timed out after 30s" 失败，补参后同一用例 gate A 形态
+  33.81s 通过（`tmp/f14-e2b-boxed-gateA-focused.log`），full gate A 复跑绿——
+  非 fork 回归，属门禁运行参数。
 
 ## ⚡ G3 final wave（FUP #12 egress 证据 + G1/G2 台账收口，2026-09-06）
 
