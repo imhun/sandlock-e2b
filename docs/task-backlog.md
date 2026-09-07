@@ -327,6 +327,15 @@ ACR 镜像推送照常，git 远程推送暂缓。
     的读端**（`write(1)` ⇒ EBADF），即上面那条循环把兄弟流的另一端 dup2 覆盖了；
     `stderr` 通路在同一布局下也受影响（`echo hi >&2` 退 1）。N=0（下一个可用
     fd=3）必现，N≥1（≥4）全部正常 ⇒ 只要客户端 fd 表把三端挤到 0/1/2 邻域就翻车。
+    **收窄对照（`tmp/f11_direct_exec_probe.py`，同一镜像同一 wheel，N=0）**：不经
+    in-process 控制面/网关/SDK，直接 `SandlockExecutor.start()` 跑
+    `python3 -c "print('direct-ok')"` ⇒ `{"exit": 0, "stdout": "direct-ok\n"}`
+    ——**低 fd 布局下直接执行器路线是好的**。所以缺陷面收窄为
+    「in-process harness（uvicorn 线程 + 控制面 + SDK 流式回传）+ 网关 + 低 fd 表」
+    的组合路径，而不是裸 exec stdio 装配单独出错；但 `.so` A/B 又确实证明
+    fork 侧改动是触发方（旧 tip 绿 / `7671240` 红）⇒ 修复会话要从
+    **「FUP-14 让 init 多占一个低位 fd（signalfd）后，谁在依赖 fd 号假设」**
+    入手（fork `docs/fork-plan-followups.md` FUP-23 待补这条对照数据）。
     为何本轮才暴露：FUP-14 给 init 增加了 signalfd，改变了低段 fd 的占用情况，
     使「三端正好落在会被覆盖的位置」成为可能（潜伏缺陷被编号位移触发，
     非 FUP-11 引入）。
