@@ -240,3 +240,99 @@ ACR 镜像推送照常，git 远程推送暂缓。
     单测）、mediation_2uid 8→9（setcap eip + setpriv 65533 真执行夹具）；
     fork 全门禁绿；wheel（4d5f385）双架构重建 verify 全绿；E2B 复跑
     2026-09-07 完成（见 #15）。
+19. **A/B cleanup 剩余任务收口（2026-09-07）**: ✅ 完成。计划
+    `docs/superpowers/plans/2026-09-07-ab-cleanup-remaining.md`（Task 0–5 全走完，
+    未推送）。fork 侧最后一个 open 代码项 FUP-11 六子项全关（1a supervise 全部
+    error-path `contains` 断言转整行/整串；1b `FORBIDDEN_RUNTIME_MEDIATOR_REMAP`
+    获得常量原文 + CLI flag 面测试引用；1c registered slot 异常连接日志改
+    `AbnormalEndLog` 节流＝首条点名 + 每 256 条一条带累计数；1d harness
+    120 s connect 与 30 s verb I/O 不对称提为命名常量 + 取舍注释 + 契约单测；
+    1e 非 root registered path stats settle 补 `proc_count_vs_live == 0`；1f
+    validate-and-exit × `--program` 审计＝模式仍在并补 3 例）。fork 计数
+    supervise 36→42 / supervise_root 3→4，其余档不变；fork 非 root 8 档 + root
+    三档全绿。wheel：最终 tip 重建 + verify 全绿（FFI 156=156 双向、RECORD 精确、
+    mode 755、三方指纹、`--uid` 冒烟），体积 10.4/9.5 → 8.3/7.4 MB（FUP-15
+    `panic=abort`+`strip`）；**本波修掉 verify 自身假失败**（无 `unzip` 时
+    `python3 -m zipfile -e` 不还原 mode，正确 wheel 也被判 0644 红）⇒ 改以 wheel
+    中央目录记录的 mode 为权威。docs 提交后重钉 manifest，重跑构建产物逐字节一致
+    ⇒ fork HEAD == manifest HEAD == 子模块指针 == `ee66234`（三次重建的 wheel/supervise
+    sha256 逐个相同 ⇒ 文档提交不动产物）。E2B：镜像重建后
+    pip 真机落 0755 + 镜像内 supervise sha256 = manifest（FUP-16 遗留项闭环）；
+    thread 探针 GREEN；**gate A 982/2skip/1xfail/0failed、gate B 982/3skip/0、
+    macOS 916/65skip/0**（与上一波逐项一致，无漂移）。CHANGELOG 补记前波漏写的
+    A/B 行为条目（FUP-01/03/07/10/11c/14/15/16/17）。
+20. **OCI 镜像解析对「坏镜像源」无防御（2026-09-07）**: ⬜ open（E2B 侧，发布前建议修）。
+    本轮公共 Docker Hub 源整体劣化，暴露三处：
+    ① `envd_service/runtime/oci_registry.py:352` `blob()` 直接返回 `.content`，
+    **不校验层 digest** ⇒ 镜像源交付截断/错误层时被静默解进 rootfs，症状漂移到
+    远端（gate A r3 出现 `sandlock child: execvp '/bin/echo': No such file or
+    directory`；同一用例在换源后 0.09 s 内即 exit=1/120、沙箱内连
+    `/tmp` 都写不出来）。建议：下载后按 manifest 里的 digest 校验 + 不匹配即
+    按可重试错误走下一个 endpoint。
+    ② 客户端请求预算 30 s（`RegistryClient(timeout=30.0)`）对慢源必输：实测
+    daocloud 拉 29.8 MB 层 37.2 s（0.8 MB/s）⇒ 必然 `ReadTimeout`；而
+    `tests/conftest.py:193` 给 buildkitd 的 mirror 硬编码 daocloud，于是
+    `test_template_build_and_create_sandbox` 也变成同源抖动（单跑 282 s 过、
+    全量档内偶发 `buildkit build exited with code 1`）。建议：blob 拉取用独立
+    （更大或按体积伸缩的）超时，且 buildkitd mirror 跟随 `E2B_REGISTRY_MIRRORS`。
+    ③ `_request_one` 在 challenge 之后无条件
+    `headers["Authorization"] = self._authorization()`（`oci_registry.py:262`），
+    匿名拉取遇到只给 Basic challenge 的 mirror 时该值为 `None` ⇒ httpx 抛
+    `TypeError: Header value must be str or bytes, not NoneType`，而
+    `_request` 的镜像源 fall-through 只捕 `RegistryError` ⇒ 一个坏源直接打断
+    整次拉取而不是换下一个源（实测两个候选源触发）。
+    本轮规避：本地 `registry:2` 作镜像源（`127.0.0.1:5080`，预置 amd64
+    `library/python` 3.11/3.12/3.14-slim + `library/node:22-slim`）后三档全绿；
+    注：404 按既有语义不重试，故本地源必须**镜像全集**（缺 `python:3.12-slim`
+    时 `test_create_with_template_image` 直接 503）。
+21. **`tmp/f11_fup3_probe.py` 独立脚本形态不可复现（2026-09-07）**: ⬜ open
+    （**已定性，见 #22**；本条保留现象与已排除项）。同一镜像、同一 pure 形态下，
+    该脚本自建的 harness 里
+    **任何写 stdout 的命令**都拿 `exit=120`/`stdout=''`（`/bin/echo x` → 1、
+    `echo hi > /tmp/o.txt` → 2、沙箱内文件写不出来），而入库契约
+    `tests/contract/test_memory_quota_gateway_command.py`（断言同样五项：
+    `['echo']`、网关后命令 exit 0 + `post-gateway-ok\n`、450M 超卖 137、
+    50M 控制命令 0、`memoryMB==1024`）在同一 wheel 下 pure 与 image-rootfs
+    两形态均绿、并包含在 gate A/B 全档内。已排除：镜像源/rootfs 缓存（隔离
+    `tmp/sandboxes/_images/python_3.11-slim-*` 与改用干净 `E2B_IMAGE_CACHE_DIR`
+    均不变）、harness 根目录所在文件系统、worker 数、`E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX`、
+    `PYTEST_*` 环境变量、`e2b` 模块解析路径、SDK 调用形态（`commands.run(cmd,
+    timeout=60)` 逐字一致）、以及把脚本 `main()` 塞进 pytest 里跑（同样红）。
+    **决定性对照（`tmp/f11_fdcount_probe.py`，同一脚本同一环境，只在客户端进程
+    里多开 N 个 `/dev/null` fd）**：`N=0` ⇒ `FAILURES: [trivial exit=120, control
+    exit=120]`；`N=8 / 24 / 64` ⇒ `FAILURES: []` 且 trivial exit 0 /
+    `post-gateway-ok\n`。⇒ 不是脚本"接线"问题，而是**客户端 fd 表越空、沙箱
+    stdio 管道落到的 fd 号越低 ⇒ exec 装配越容易接错**（见 #22）。结论不变：
+    FUP-E3 gateway+命令变体的验证由入库契约 + 两形态门禁承担（探针 4 轮均红已如实留档
+    `tmp/perf/f11-gateway-probe-450-450-50-run{1..4}.log`）。
+22. **exec stdio 装配存在低 fd 号依赖（2026-09-07，P1，fork 侧）**: ⬜ open —
+    **建议立项修，先于 route-B 部署**。现象（#21 的对照实验）：pure 形态下 SDK 命令
+    的 stdout 在「客户端 fd 表很空」时丢失/写错（python 因 stdout flush 失败退出
+    120、`/bin/echo` 退 1、`> /tmp/x` 退 2），多开 8 个 fd 即消失。
+    代码面：`third_party/sandlock/crates/sandlock-core/src/init/mod.rs:167-178`
+    的子进程 stdio 装配是裸循环
+
+    ```rust
+    for (i, &fd) in fds.iter().enumerate() { libc::dup2(fd, i as i32); }
+    for &fd in &fds { if fd > 2 { libc::close(fd); } }
+    ```
+
+    既不排除「某个源 fd 恰号等于另一路的 dup2 目标（0/1/2）」，也不检查 `dup2`
+    返回值；而同一仓库的进程内 spawn 路径早已为此写过防护
+    （`sandbox.rs:2496-2514` + `:3376` 注释：「先把每一端搬到一个 ≥3、与 0/1/2
+    不相交的 fd，再 dup2 下来」）。SCM_RIGHTS 收到的描述符号 = 内核挑的空隙号，
+    低 fd 表下正好落进危险区，故症状随客户端 fd 数漂移。
+    观察与机制（同一次 N 扫描）：子进程确实起来了（python 跑到 flush 才失败 ⇒
+    exit 120），且 `/bin/echo x` 以「写错误」退 1 ⇒ 子进程的 **fd 1 被接到了管道
+    的读端**（`write(1)` ⇒ EBADF），即上面那条循环把兄弟流的另一端 dup2 覆盖了；
+    `stderr` 通路在同一布局下也受影响（`echo hi >&2` 退 1）。N=0（下一个可用
+    fd=3）必现，N≥1（≥4）全部正常 ⇒ 只要客户端 fd 表把三端挤到 0/1/2 邻域就翻车。
+    为何本轮才暴露：FUP-14 给 init 增加了 signalfd，改变了低段 fd 的占用情况，
+    使「三端正好落在会被覆盖的位置」成为可能（潜伏缺陷被编号位移触发，
+    非 FUP-11 引入）。
+    待办：① fork 侧 RED（可控 fd 表把 stdio 三端钉到 0/1/2 邻域，断言子进程
+    stdout 精确到达且三端互不串流），②按 `sandbox.rs` 同款「先搬到与 0/1/2
+    不相交的高 fd，再 dup2 下来」修 init 路径，并把 `dup2`/`close` 的返回值
+    处理一并收紧（异步信号安全前提下失败即 `_exit` 点名），③修完重跑 fork 门禁 +
+    wheel + E2B 三档，并把 #21 的 N=0 对照并入回归门。
+    本轮未修：不在 A/B 计划范围内，且需要完整重跑一轮 fork + wheel + E2B 门禁。

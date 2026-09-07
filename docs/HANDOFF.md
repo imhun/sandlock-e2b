@@ -5,6 +5,71 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
+## ⚡ A/B cleanup 剩余任务收口（2026-09-07，fork FUP-11 硬化 + wheel 重钉 + E2B 三档复跑）
+
+计划 `docs/superpowers/plans/2026-09-07-ab-cleanup-remaining.md`（Task 0–5 全部走完，
+未推送）。fork 侧提交链（`upstream-pr/netns-free-clean`，本地）：`1bd3b82`
+registered slot 日志节流 → `8e65476` 错误面精确断言 + remap 常量/validate-exit 覆盖
+→ `eadd383` foreign-uid slot 节流与预算契约 → `d054c11` docs 关闭 FUP-11 →
+`6b76e71` **wheel verify 口径修正** → `603b546`/`ee66234` docs（§5 两行 +
+FUP-23 登记）。
+
+- **FUP-11 六项全关**（fork 最后一个 open 代码项）：1a supervise 的 13 处 error-path
+  `contains` 断言清零转整行/整串（唯一留白 = OS 分配 fd 号与 elapsed 计数）；1b
+  `FORBIDDEN_RUNTIME_MEDIATOR_REMAP` 获得测试引用（常量原文 + CLI 无任何运行期 remap
+  flag + registered path 也钉 `unknown verb: map-uid`）；1c registered slot 异常连接
+  日志改 `AbnormalEndLog`（首条点名 + 每 256 条一条带累计数；root 档实测 300 条被拒
+  连接 ⇒ 恰好 2 行）；1d 120 s connect 重试 vs 30 s verb I/O 提为命名常量 + 取舍注释
+  + 契约单测；1e 非 root registered path settle 补 `proc_count_vs_live == 0`；1f
+  validate-and-exit × `--program` 审计＝模式仍在并补 3 例。计数 supervise 36→42、
+  supervise_root 3→4。fork 门禁：非 root 8 档 + root 三档全绿
+  （`third_party/sandlock/tmp/sdd/f11-gate-nonroot-final.log` /
+  `f11-gate-root-final.log`；首轮 cli `learn` 外部 HTTPS flake 按 FUP-09 留红档另跑）。
+- **wheel**：最终 tip 重建 cp314 双架构 + supervise 注入，verify 全绿（FFI 156=156
+  双向、RECORD 精确、指纹三方一致、wheel 内 mode 755、`--uid` 冒烟点名双 uid）。
+  体积 10.4/9.5 MB → 8.3/7.4 MB（FUP-15 `panic=abort`+`strip`）。**本波抓到并修掉
+  verify 自身的假失败**：`sandlock-dev` 无 `unzip` ⇒ 回退 `python3 -m zipfile -e`
+  不还原 unix mode，任何正确 wheel 都会被判 0644 红；改为以 wheel 中央目录记录的
+  mode 为权威（= pip 安装依据）。文档提交后重钉 manifest HEAD，重跑构建产物
+  **逐字节一致**（四份 sha256 全等，仅 HEAD 行变化）⇒ fork HEAD == wheel manifest
+  HEAD == 子模块指针 == `ee66234`；三次重建（`d054c11`/`603b546`/`ee66234`）双 wheel 与双
+  supervise 的 sha256 **逐个相同** ⇒ 文档提交不动产物，门禁/探针证据对终态 tip 仍成立。
+- **E2B 复跑**（main `8ae1a40`/`8c5b50f`，镜像 `39ed2a82b08b`）：pip 真机落
+  `-rwxr-xr-x`（0755）且镜像内 supervise sha256 = manifest x86_64 行（FUP-16 遗留
+  的「pip 真机 0755 未直接验证」闭环）；thread 探针 GREEN（exec B exit 0 /
+  `b-ok\n`，`tmp/perf/f11-thread-probe.log`）；**full gate A 982 passed / 2 skipped /
+  1 xfailed(T5) / 0 failed**、**gate B 982 passed / 3 skipped / 0 failed**、
+  **macOS 916 passed / 65 skipped / 0 failed** —— 三档与 F12–F14 收口档逐项相同，
+  无漂移（`tmp/f11-e2b-gate-a.log`＋前四档 `-r1..r5`、`tmp/f11-e2b-gate-b.log`＋
+  `-r1-with-scratch-test.log`、`tmp/f11-e2b-macos-r2.log`）。
+- **⚠ 本波暴露的真实回归（FUP-23 / 本文 #22，未修，升级前必读）**：网关+命令探针
+  （`tmp/f11_fup3_probe.py`）从上一波「4/4 全绿」翻为本轮「任何写 stdout 的命令都
+  `exit=120`/`stdout=''`」。两步二分定性：①只在**承载 harness 的客户端进程 fd 表只剩
+  0/1/2**（下一个可用 fd=3）时必现，预先多开 1 个 fd 即全绿；②同一镜像只热替换 debug
+  `libsandlock_ffi.so` 做 A/B ⇒ 本波之前 tip `4d5f385` 绿、FUP-14 `7671240` 红
+  ⇒ **本波使潜伏缺陷可达**（非 FUP-11 引入）。子进程侧 `/proc/self/fd/1` 存在但
+  `write` 失败 ⇒ exec stdio 装配的「搬到 ≥3」下界与桩/控制通道固定低位号
+  （`CONTROL_FD = 3` + READY/GO）可重叠，被 dup2/dup3 覆盖后 fd 1 不可写；FUP-14 新增
+  signalfd 使低位 fd 分配位移而暴露。**三档门禁与入库契约全绿不能反证它不存在**——
+  pytest 进程天然持有几十个 fd，落不进危险号段。生产 envd 启动后即持有监听 socket ⇒
+  不在触发条件内，但「以近乎空的 fd 表嵌入沙箱」的形态会踩到。修法与取证见 fork
+  `docs/fork-plan-followups.md` FUP-23 + fork `docs/CHANGELOG.md` 升级警示 +
+  本文 #22；`tmp/f11_fdcount_probe.py`（N=0 vs N≥1）是现成回归门。
+- **环境教训（新增 open 项 #19/#20/#21）**：本轮公共 Docker Hub 源整体劣化
+  ——daocloud 拉 29.8 MB 层实测 37.2 s > 客户端 30 s 请求预算（必然 ReadTimeout）、
+  1ms.run TLS EOF/Cloudflare 403、dockerproxy.net 曾交付**损坏层**却因
+  `RegistryClient.blob()` 不校验 digest 而被静默解出（表现为 rootfs 里
+  `execvp '/bin/echo': No such file or directory`）。gate A 前四档红全部源于此；
+  最终用本地 `registry:2` 镜像源（amd64 `library/python` 3.11/3.12/3.14-slim +
+  `library/node:22-slim`）跑绿；`tests/conftest.py:193` 给 buildkitd 的 mirror 是
+  硬编码 daocloud，故 `test_template_build_and_create_sandbox` 也变同源抖动
+  （单跑 282 s 过、全量档内偶发 `buildkit build exited with code 1`）。
+  FUP-E3 gateway+命令变体的正式验证由入库契约
+  `test_memory_quota_gateway_command.py`（pure + image-rootfs 两形态全绿，含在
+  gate A/B 档内）承担；探针脚本形态另见上一条。
+- 报告：fork `third_party/sandlock/tmp/sdd/ab-cleanup-report.md`、
+  E2B `tmp/sdd/ab-e2b-report.md`。
+
 ## ⚡ Fork F12–F14 全部完成（2026-09-07，fork 侧收口 + E2B wheel/探针/全量复跑）
 
 `third_party/sandlock`（fork 子模块，分支 `upstream-pr/netns-free-clean`）本地
