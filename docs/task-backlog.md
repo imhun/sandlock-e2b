@@ -261,8 +261,10 @@ ACR 镜像推送照常，git 远程推送暂缓。
     thread 探针 GREEN；**gate A 982/2skip/1xfail/0failed、gate B 982/3skip/0、
     macOS 916/65skip/0**（与上一波逐项一致，无漂移）。CHANGELOG 补记前波漏写的
     A/B 行为条目（FUP-01/03/07/10/11c/14/15/16/17）。
-19b. **修复回合（2026-09-08）**: ✅ 完成 —— 上一行的「探针不可复现」已定性为
-    **真实回归**（#22 = fork FUP-23），并以 fork `bb1cb42` 回退 FUP-14 作为缓解：
+19b. **修复回合（2026-09-08）**: ✅ 完成（**并被「修复回合 2」取代**：FUP-23 已按根因
+    修复、FUP-14 回退撤销，终态 fork `e045881` / wheel `d5cab47` 产物，见本文顶部 ⚡ 块与 #22）
+    —— 上一行的「探针不可复现」曾定性为**真实回归**（#22 = fork FUP-23），并以 fork
+    `bb1cb42` 回退 FUP-14 作为缓解：
     回退后同一探针 N=0 场景 `FAILURES: []`（五项签名逐字回归）。终态
     fork HEAD == wheel manifest HEAD == 子模块指针 == `0770e59`（`d9b379c`→`0770e59`
     仅文档增量，重建产物四份 sha256 相同 ⇒ 证据成立）。复跑：fork 非 root 8 档 +
@@ -317,10 +319,20 @@ ACR 镜像推送照常，git 远程推送暂缓。
     `tmp/perf/f11-gateway-probe-450-450-50-run{1..4}.log`）。
     **2026-09-08 结案**：本条现象 = #22 的回归，非「脚本接线问题」；回退 FUP-14 后
     同一脚本 `FAILURES: []`（`tmp/perf/f23-gateway-probe-run{1..4}.log`），本条关闭。
-22. **exec stdio 装配存在低 fd 号依赖（2026-09-07，P1，fork 侧）**: 🟡 **已缓解、
-    根因 open** —— 触发方（fork FUP-14 `7671240` 的 signalfd）已以 `bb1cb42` 回退，
-    当前 wheel `0770e59` 不带该用户可见故障；「立项修 + 重做 FUP-14」仍先于 route-B
-    部署需要。现象（#21 的对照实验）：pure 形态下 SDK 命令
+22. **exec stdio 装配存在低 fd 号依赖（2026-09-07，P1，fork 侧）**: ✅ **已修复
+    （2026-09-08，fork `880a1ec`；wheel = `d5cab47` 产物、指针 = fork HEAD `e045881`）**
+    —— 根因：fork 后、子进程第一条指令前，**外部方**把一条无关管道装进新生子进程的低号位，
+    顶掉了 init 刚收到的某个 stdio 端；SCM_RIGHTS 收发链路经六点身份快照（`(O_ACCMODE,
+    st_dev, st_ino)`）证明清白，「多开 1 个 fd 即恢复」只是把损坏槽位从 stdout 挪到 stderr。
+    修法 = init fork 前把三端搬到保留号段 64+（保留号不全空则整体退回，绝不覆盖他人描述符）
+     + 子进程装配前逐槽校验身份、被换端即以退出码 **124** 明确失败（不再静默丢输出）。
+    验证：`tmp/f11_fdcount_probe.py` N=0/1/2/8 全部 `FAILURES: []`、gateway 探针 4/4、
+    thread 探针 GREEN、gate A/B（982/2/1xfail/0、982/3/0）、macOS 916/65/0、
+    fork 非 root 8 档 + root 三档全绿。FUP-14（signalfd 事件化 reap，exec 往返
+    p50 101.75 → 5.35 ms）的回退同时撤销。细节见 fork
+    `docs/fork-plan-followups.md`「FUP-23 根因闭环与修复」与本文顶部 ⚡ 修复回合 2。
+    历史（缓解阶段，保留备查）：触发方（fork FUP-14 `7671240` 的 signalfd）一度以
+    `bb1cb42` 回退，当时 wheel `0770e59` 不带该用户可见故障。现象（#21 的对照实验）：pure 形态下 SDK 命令
     的 stdout 在「客户端 fd 表很空」时丢失/写错（python 因 stdout flush 失败退出
     120、`/bin/echo` 退 1、`> /tmp/x` 退 2），多开 8 个 fd 即消失。
     代码面：`third_party/sandlock/crates/sandlock-core/src/init/mod.rs:167-178`

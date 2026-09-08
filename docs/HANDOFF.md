@@ -5,7 +5,53 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
-## ⚡ 修复回合：回退 FUP-14 消除 FUP-23 用户可见故障（2026-09-08，终态 wheel `0770e59`）
+## ⚡ 修复回合 2（2026-09-08）：FUP-23 根因闭环 + 修复，FUP-14 重新上线（终态 fork `e045881` / 代码 `880a1ec` / wheel `d5cab47` 产物）
+
+上一块的「回退 FUP-14 缓解」已被**真修复**取代。成对探针加上六个快照点
+（父端送出 → init `fdrecv::recv` 返回 → 装配前 → `dup3` 前 → `fork` 前 →
+`fork` 后 init 自身 → 子进程第一条指令）用 `(O_ACCMODE, st_dev, st_ino)` 取身份、
+由子进程经**自己的 stdout 端**回送，彻底堵住「两端采到不同次 exec」的测量漏洞。
+结果：**前五个点全对，只有子进程第一条指令处第 3 端已是另一条管道的读端**（其写端在
+子进程 fd 8；marker 管道实验证明父子 fd 表不共享）⇒ SCM_RIGHTS 收发链路清白，
+是**外部方在 `fork()` 与子进程第一条指令之间往新生儿低号位装描述符**（E2B 宿主形态特有）。
+「客户端多开 1 个 fd 就恢复」被证伪为假象：损坏每次都在，只是从 stdout 槽挪到 stderr 槽。
+
+- **修法（fork `880a1ec`，双保险）**：① init 在 `fork()` **之前**把三端 `dup3` 到保留号段
+  `EXEC_STDIO_BASE = 64`（三个保留号必须全空才搬，否则整体退回原号 —— `dup3` 会静默覆盖
+  占用号，毁掉别人还持有的描述符比本竞态更糟；`RLIMIT_NOFILE` 低于该号段时同样退回 ⇒
+  不可能劣于修复前）；② 子进程 dup2 前逐槽校验身份，被换端 ⇒ **拒绝装配**，消息写到仍完好的流
+  并以退出码 **124** 结束该 exec（新增语义，与 125 chdir / 126 setpgid / 127 execvp 并列）；
+  ③ 父进程 fork 后关闭保留副本、子进程关闭保留号与原始接收号（不漏描述符、不破坏宿主侧 EOF）。
+- **FUP-14 重新上线**：signalfd 事件化 reap 的回退（`bb1cb42`）撤销，exec 往返 p50
+  **101.75 → 5.35 ms** 收益回来；本轮全部验证都在「FUP-14 + FUP-23 修复」同一棵树上做。
+- **取证与复现（E2B 侧）**：`tmp/f11_fdcount_probe.py N` 的 **N=0 / 1 / 2 / 8 全部
+  `FAILURES: []`**（此前 N=0 必红）；`tmp/f23_multi_probe.py 0 4` 四条不同 marker 连发各得
+  自己那条 stdout；gateway 探针 4/4、thread 探针 GREEN（`tmp/perf/f23c-*.log`）。
+  fork 夹具：core_lib +4（搬迁与身份 / 占号退让 / 三端精确不串流 / 换端拒装配）、
+  root 档 oci +1（真 `run_init` 控制环 40 轮 exec：逐轮输出精确 + init fd 表逐轮回基线）。
+- **终态门禁（fork tip `e045881`，代码 tip `880a1ec`，非 root 8 档 + root 三档 + wheel + E2B 三档）**：
+  fork `837 / 534 / 100 / 100 / 42 / 3 / 0 / 454` + `145 / 4 / 9`
+  （`third_party/sandlock/tmp/sdd/f23b-gate-{nonroot,root}-final.log`）；
+  wheel 双架构 verify 全绿（符号 156=156、RECORD 精确、supervise 三方指纹一致、mode 755、
+  `--uid` 拒绝冒烟；`tmp/sdd/f23c-wheel-build.log`）；镜像 `959c9e8d383f` 内 supervise
+  sha256 = manifest x86_64 行 + mode 0755 + `landlock_abi 8`；
+  **gate A 982 passed / 2 skipped / 1 xfailed(T5) / 0 failed**（`tmp/f23c-e2b-gate-a.log`）、
+  **gate B 982 / 3 skipped / 0**（`tmp/f23c-e2b-gate-b.log`）、**macOS 916 / 65 skipped / 0**
+  （`tmp/f23c-macos.log`）。不变量：wheel = 代码 tip `880a1ec`（`880a1ec..e045881` 为 docs-only，
+  `git diff --stat 880a1ec..HEAD -- crates Cargo.toml Cargo.lock` 为空 ⇒ 按既定约定不重钉），
+  子模块指针 = fork HEAD `e045881`。
+- **两条新的环境教训（已写进 fork `scripts/test-all.sh` 头与 §5）**：
+  ① **门禁必须从短路径跑** —— 嵌套 git worktree 里 `repo_tmp_dir()` 变长，supervise 注册套接字
+  路径超过 108 字节 `sun_path` 上限 ⇒ `test_supervise_path_serve_...` 假红（15 s 超时），
+  在 fork 根 `/src` 跑即绿（0.4 s）；② **gate B 档必须带 `E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2`**
+  —— 漏传会让兄弟命令串行化、holder 30 s 后释放配额，`test_boxed_memory_quota_denies_sibling_overcommit`
+  以「DID NOT RAISE」假红（首档红档留 `tmp/f23c-e2b-gate-b-r1.log`，补 env 复跑即 982/3skip/0）；
+  ③ 批量复跑前 `losetup -D`（本轮起跑前仍有 18 个泄漏 loop）。
+- **仍未做（单独排期）**：init 控制通道 SOCK_STREAM 多帧合并时「本读单元全部 fd 当本帧 fd」
+  的独立协议缺陷（候选补丁存档 `tmp/fup23-candidate-frame-fd-count.patch`，需 bump
+  `FRAME_VERSION`）；本因与它无因果（实测排除）。
+
+## ⚡ 修复回合 1（已被上面的修复取代）：回退 FUP-14 消除 FUP-23 用户可见故障（2026-09-08，wheel `0770e59`）
 
 上一块收口后，网关+命令探针从「4/4 全绿」翻红（命令 stdout 整条丢失，CPython
 `exit 120`）。两步取证钉死触发方：① 判别变量 = 承载沙箱的进程 fd 表是否只剩

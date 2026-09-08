@@ -163,3 +163,40 @@ CHANGELOG 顶部有升级警示。**三档门禁的绿不排除它**（pytest �
   fork 侧 RED），以及 FUP-14 事件化 reap 的重做；另有已存档但未上车的
   「帧头声明 fd 数 + `MSG_CTRUNC` fail-closed」候选补丁
   `tmp/fup23-candidate-frame-fd-count.patch`（需 bump FRAME_VERSION，单独验证）。
+
+---
+
+## 追加：修复回合 2 —— FUP-23 根因闭环与修复、FUP-14 重新上线（2026-09-08，全部本地提交）
+
+上一段的「仍未修（下一波）」已全部完成，计划外追加的一轮：
+
+- [x] **R2-1 堵住成对测量的漏洞**：探针改为「同一 argv token 过滤 + 父端打印 `child_id`
+      + 子进程经**自己的 stdout 端**（`VIA1:`）把快照回送宿主」，退出码即 packed 身份，
+      两端不可能来自不同次 exec。夹具导出存档
+      `third_party/sandlock/tmp/sdd/f24b-paired-identity-probes.patch`（基线 `f623184`）。
+- [x] **R2-2 六点身份快照定案**：`(O_ACCMODE, st_dev, st_ino)` 在父端送出 /
+      `fdrecv::recv` 返回（含 cmsg 计数与 `msg_flags`）/ 装配前 / `dup3` 前 / `fork` 前 /
+      `fork` 后 init 自身**全部正确**，只有子进程第一条指令处第 3 端换成另一条管道读端
+      （marker 管道实验证明父子不共享 fd 表）⇒ SCM_RIGHTS 清白；「多开 1 个 fd」只是移动损坏槽位。
+- [x] **R2-3 修复（fork `880a1ec`）**：init fork 前把三端 `dup3` 到保留号段 64+
+      （保留号不全空则整体退回，绝不 `dup3` 覆盖他人描述符；`RLIMIT_NOFILE` 不足同样退回）
+      + 子进程 dup2 前逐槽校验身份，被换端 ⇒ 拒绝装配并以 **124** 明确失败
+      + 父/子各自关闭自己分配的号。
+- [x] **R2-4 撤销 FUP-14 回退**：`bb1cb42` 的反向提交并入同一棵树，exec 往返
+      p50 101.75 → 5.35 ms 收益恢复，`supervise_cost` 紧预算回归有效。
+- [x] **R2-5 夹具**：core_lib 833 → 837（搬迁与身份 / 占号退让 / 三端精确不串流 /
+      换端拒装配），root 档 oci 144 → 145（真 `run_init` 控制环 40 轮 exec：逐轮输出精确
+      且 init fd 表逐轮回基线、EOF 后仍基线）。
+- [x] **R2-6 全链复验（fork `e045881` / 代码 `880a1ec` / wheel `d5cab47` 产物 /
+      镜像 `959c9e8d383f`）**：fork 非 root `837/534/100/100/42/3/0/454` +
+      root `145/4/9`；wheel verify 双架构全绿；E2B gateway 探针 4/4、
+      `f11_fdcount_probe` N=0/1/2/8 全绿、thread 探针 GREEN、
+      **gate A 982/2skip/1xfail(T5)/0**、**gate B 982/3skip/0**、**macOS 916/65skip/0**；
+      子模块指针 = fork HEAD `e045881`（docs-only 增量按约定不重钉 wheel）。
+- [x] **R2-7 环境教训入库**：门禁须从短路径跑（worktree 长路径会把 supervise 套接字
+      推过 108 字节 `sun_path` ⇒ 假红，已写进 fork `scripts/test-all.sh`）；
+      gate B 档必须带 `E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2`（漏传 ⇒
+      boxed 超卖用例 DID NOT RAISE 假红）；批量复跑前 `losetup -D`。
+- ⬜ **仍未做**：`tmp/fup23-candidate-frame-fd-count.patch`（帧头声明 fd 数 +
+      `MSG_CTRUNC` fail-closed）—— 与本因无因果的独立协议缺陷，需 bump `FRAME_VERSION`，
+      仍单独排期。
