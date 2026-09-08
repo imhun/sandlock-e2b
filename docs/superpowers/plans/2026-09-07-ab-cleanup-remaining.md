@@ -145,3 +145,21 @@ Task 0–5 全部走完，未推送。终态：**fork HEAD == wheel manifest HEA
 （stdout 全丢）。登记为 fork FUP-23 / main task-backlog #22（含复现配方与修法），
 CHANGELOG 顶部有升级警示。**三档门禁的绿不排除它**（pytest 进程持有几十个 fd）。
 建议：推 worker/测试镜像上线前先修 FUP-23（或临时回退 `7671240`）。
+
+
+### 修复回合（2026-09-08，追加）
+
+计划收口后，网关+命令探针翻红被追成**本波引入的真实回归**（fork FUP-23 /
+本文 #22）：唯一判别变量是「承载沙箱的进程 fd 表是否只剩 0/1/2」，
+`.so` 热替换 A/B 定位到 FUP-14 `7671240`。处置 = fork `bb1cb42` 回退该实现
+（≈19× exec 往返收益撤回，FUP-14 重新 open），并以 `d9b379c`/`0770e59` 记档。
+
+- 终态不变量：fork HEAD == wheel manifest HEAD == 子模块指针 == **`0770e59`**
+  （`d9b379c`→`0770e59` 为文档增量，重建产物四份 sha256 相同）。
+- 回退后复跑全绿：fork 非 root 8 档 + root 三档、wheel verify、
+  **gate A 982/2skip/1xfail/0**、**gate B 982/3skip/0**、**macOS 916/65skip/0**、
+  thread 探针 GREEN、**gateway 探针 4/4**（本计划唯一未复现项就此闭环）。
+- 仍未修（下一波）：FUP-23 根因（要一个能把 fd 表压到「下一个可用 = 3」的
+  fork 侧 RED），以及 FUP-14 事件化 reap 的重做；另有已存档但未上车的
+  「帧头声明 fd 数 + `MSG_CTRUNC` fail-closed」候选补丁
+  `tmp/fup23-candidate-frame-fd-count.patch`（需 bump FRAME_VERSION，单独验证）。

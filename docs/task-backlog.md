@@ -261,6 +261,16 @@ ACR 镜像推送照常，git 远程推送暂缓。
     thread 探针 GREEN；**gate A 982/2skip/1xfail/0failed、gate B 982/3skip/0、
     macOS 916/65skip/0**（与上一波逐项一致，无漂移）。CHANGELOG 补记前波漏写的
     A/B 行为条目（FUP-01/03/07/10/11c/14/15/16/17）。
+19b. **修复回合（2026-09-08）**: ✅ 完成 —— 上一行的「探针不可复现」已定性为
+    **真实回归**（#22 = fork FUP-23），并以 fork `bb1cb42` 回退 FUP-14 作为缓解：
+    回退后同一探针 N=0 场景 `FAILURES: []`（五项签名逐字回归）。终态
+    fork HEAD == wheel manifest HEAD == 子模块指针 == `0770e59`（`d9b379c`→`0770e59`
+    仅文档增量，重建产物四份 sha256 相同 ⇒ 证据成立）。复跑：fork 非 root 8 档 +
+    root 三档全绿、wheel verify 全绿、**gate A 982/2skip/1xfail(T5)/0 failed**、
+    **gate B 982/3skip/0**、**macOS 916/65skip/0**、thread 探针 GREEN、
+    gateway 探针 4/4（日志 `tmp/f23-*`、`tmp/perf/f23-gateway-probe-run*.log`、
+    fork `tmp/sdd/f23-*`）。FUP-14 的 ≈19× exec 往返收益随回退撤回，
+    `supervise_cost` 预算回 200/300/2000 ms。
 20. **OCI 镜像解析对「坏镜像源」无防御（2026-09-07）**: ⬜ open（E2B 侧，发布前建议修）。
     本轮公共 Docker Hub 源整体劣化，暴露三处：
     ① `envd_service/runtime/oci_registry.py:352` `blob()` 直接返回 `.content`，
@@ -305,8 +315,12 @@ ACR 镜像推送照常，git 远程推送暂缓。
     stdio 管道落到的 fd 号越低 ⇒ exec 装配越容易接错**（见 #22）。结论不变：
     FUP-E3 gateway+命令变体的验证由入库契约 + 两形态门禁承担（探针 4 轮均红已如实留档
     `tmp/perf/f11-gateway-probe-450-450-50-run{1..4}.log`）。
-22. **exec stdio 装配存在低 fd 号依赖（2026-09-07，P1，fork 侧）**: ⬜ open —
-    **建议立项修，先于 route-B 部署**。现象（#21 的对照实验）：pure 形态下 SDK 命令
+    **2026-09-08 结案**：本条现象 = #22 的回归，非「脚本接线问题」；回退 FUP-14 后
+    同一脚本 `FAILURES: []`（`tmp/perf/f23-gateway-probe-run{1..4}.log`），本条关闭。
+22. **exec stdio 装配存在低 fd 号依赖（2026-09-07，P1，fork 侧）**: 🟡 **已缓解、
+    根因 open** —— 触发方（fork FUP-14 `7671240` 的 signalfd）已以 `bb1cb42` 回退，
+    当前 wheel `0770e59` 不带该用户可见故障；「立项修 + 重做 FUP-14」仍先于 route-B
+    部署需要。现象（#21 的对照实验）：pure 形态下 SDK 命令
     的 stdout 在「客户端 fd 表很空」时丢失/写错（python 因 stdout flush 失败退出
     120、`/bin/echo` 退 1、`> /tmp/x` 退 2），多开 8 个 fd 即消失。
     代码面：`third_party/sandlock/crates/sandlock-core/src/init/mod.rs:167-178`

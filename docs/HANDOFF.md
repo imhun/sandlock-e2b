@@ -5,7 +5,48 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
-## ⚡ A/B cleanup 剩余任务收口（2026-09-07，fork FUP-11 硬化 + wheel 重钉 + E2B 三档复跑）
+## ⚡ 修复回合：回退 FUP-14 消除 FUP-23 用户可见故障（2026-09-08，终态 wheel `0770e59`）
+
+上一块收口后，网关+命令探针从「4/4 全绿」翻红（命令 stdout 整条丢失，CPython
+`exit 120`）。两步取证钉死触发方：① 判别变量 = 承载沙箱的进程 fd 表是否只剩
+0/1/2（多开 1 个 fd 即恢复正常）；② 同一测试镜像只热替换 debug `.so` 做 A/B ⇒
+本波之前的 `4d5f385` 绿、FUP-14 `7671240` 红。⇒ **本波的 signalfd 事件化让
+fork 里一处潜伏的 stdio fd 号敏感变成可达**（记为 FUP-23 / 本文 #22）。
+
+- **处置**：fork 以 `bb1cb42` **回退 FUP-14**（≈19× 的 exec 往返收益一并撤回，
+  `supervise_cost` 预算回到 200/300/2000 ms），`d9b379c`/`0770e59` 记录取证、缓解、根因与 §5 终态行；
+  FUP-14 重新 open。回退后同一探针 N=0 场景 `FAILURES: []`，五项签名逐字回归：
+  `list_tools == ['echo']`、网关后命令 exit 0 / `post-gateway-ok\n`、450M 超卖
+  exit 137 / stdout `''`、50M 控制命令 exit 0 / `got 50\n`、`memoryMB == 1024`。
+- **终态门禁**（wheel = fork tip `d9b379c`，全部 ENV-HEADER 留档）：
+  fork 非 root `core_lib 833 / core_integ 534 / ffi 100 / cli 100 / supervise 42 /
+  supervise_cost 3 / cli_build 0 / python 454` + root `oci 144 / supervise_root 4 /
+  mediation_2uid 9`（`third_party/sandlock/tmp/sdd/f23-gates.log`）；
+  wheel verify 全绿（`f23-wheel-verify.log`）；E2B **gate A 982 passed / 2 skipped /
+  1 xfailed(T5) / 0 failed**（`tmp/f23-e2b-gate-a.log`）、**gate B 982 / 3 skipped /
+  0 failed**（`tmp/f23-e2b-gate-b-rerun.log`）、**macOS 916 / 65 skipped / 0 failed**
+  （`tmp/f23-e2b-macos.log`）、thread 探针 GREEN、gateway 探针 **4/4 GREEN**
+  （`tmp/perf/f23-gateway-probe-run{1..4}.log`）；镜像 `caaed60847f3` 内 supervise
+  = manifest x86_64 行、mode **0755**（`tmp/f23-e2b-image.log`）。
+  不变量保持：fork HEAD == wheel manifest HEAD == 子模块指针 == `0770e59`
+  （`d9b379c`→`0770e59` 只是 §5 文档行的增量，重建产物四份 sha256 逐个相同 ⇒ 门禁/探针证据继续成立）。
+- **根因仍 open**：为什么 init 多占一个低位 fd 就能让子进程 fd 1 不可写，还没有
+  fork 侧可控 RED（cargo/pytest 进程都持有几十个 fd，落不进危险号段 ⇒ 门禁看不见）。
+  RED 姿势与候选修法（搬迁下界避开保留 fd 号段、`dup2`/`close` 失败点名退出码）记在
+  fork `docs/fork-plan-followups.md` FUP-23；重做 FUP-14 时必须与它一起验证。
+- **顺带发现并已排除的另一个缺陷**：init 控制通道是 SOCK_STREAM，一次 `recvmsg`
+  可并入多帧，而 SCM_RIGHTS 描述符是一条拼接列表，现有代码把「本读单元全部 fd」
+  当成「本帧的 fd」，且不看 `MSG_CTRUNC` ⇒ 前帧带 fd 时后帧 stdio 整体位移。它与本次
+  故障无因果（实测排除），候选补丁（帧头声明 fd 数 + 按声明分配 + CTRUNC
+  fail-closed + 4 条纯函数单测）存档 `tmp/fup23-candidate-frame-fd-count.patch`
+  （fork 同步一份 `tmp/sdd/fup23-wip-frame-fd-count.patch`）；因要 bump
+  `FRAME_VERSION`，单独排期验证，未随本回合上车。
+- **两条环境教训**（已记 #20）：公共镜像源当日不可用（见下块）；**本轮还发现
+  loop 设备泄漏** —— 反复跑 test-runner 后 VM 内积累 293 个 loop，导致一次 gate B
+  出现 10 个 `XFS 门禁` error（strict skips 把「环境不满足」如实判错，不是掩盖）；
+  `losetup -D` 释放后复跑即 982/3skip/0。以后批量复跑前后各查一次 `losetup -a`。
+
+## ⚡ A/B cleanup 剩余任务收口（2026-09-07，fork FUP-11 硬化 + wheel 重钉 + E2B 三档复跑；**wheel 已被上面的回退版本取代**）
 
 计划 `docs/superpowers/plans/2026-09-07-ab-cleanup-remaining.md`（Task 0–5 全部走完，
 未推送）。fork 侧提交链（`upstream-pr/netns-free-clean`，本地）：`1bd3b82`
