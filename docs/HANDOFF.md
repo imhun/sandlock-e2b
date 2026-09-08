@@ -5,6 +5,41 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
+## ⚡ F15（2026-09-08）：控制帧按声明归属描述符（`FRAME_VERSION` 1 → 2，终态 fork `3020ea0` / wheel `3020ea0` 产物）
+
+init 控制通道是 `SOCK_STREAM`：一次 `recvmsg` 可并入多帧，而内核交回的 SCM_RIGHTS
+描述符是**一条拼接列表**。旧实现把「本读单元的全部 fd」当成「本帧的 fd」
+（`fdrecv::recv(ctl, 3)` + `received.fds[0..3]`），前一帧带 fd 时后一帧的 stdio 整体位移——
+两个 `RunExec` 合并进一次读时，exec #2 的 stdout 写进 exec #1 的管道并整条丢失。
+修法 = 帧头新增 1 字节 `n_fds`（`FRAME_HEADER_LEN` 10 → 11，`FRAME_VERSION` 1 → 2），
+发送侧按实际随 `sendmsg` 交出的 fd 数声明（只有 `RunExec` = 3），接收侧用纯函数
+`take_frame_fds` 按声明从读单元队列切分；声明与队列不符 ⇒ 整读单元拒绝；
+`MSG_CTRUNC` / `MSG_TRUNC` fail-closed（不再把被内核截断的描述符当完整帧用）。
+
+- **fork 提交**：`c50f407`（F15 RED：两帧一次写出六端，红档证明 exec #2 拿不到自己的三端）、
+  `8640223`（fix：`proto.rs` / `fdrecv.rs` / `init/mod.rs` / `executor.rs` / oci 两侧 +
+  夹具 + baseline 同 commit）、`3020ea0`（docs：CHANGELOG F15 条目 + e2b-integration §7
+  wire 升级约束：`sandlock-supervise` 与 `_sandlock*.so` 必须同批替换，混装 fail-closed 点名版本）。
+- **门禁**：fork 11 档全绿 —— core_lib `841`（+4 fd_assignment）/ core_integ `534` /
+  ffi `100` / cli `100` / supervise `42` / supervise_cost `3` / cli_build `0` / python `454`，
+  root oci `150`（+2 init.rs 头校验，lib+bin 双编译；+1 integration RED 转绿）/
+  supervise_root `4` / mediation_2uid `9`（`third_party/sandlock/tmp/sdd/f15-gate-*.log`）。
+- **wheel**：cp314 x86_64 + aarch64 重建 @ `3020ea0`，verify 全绿（符号 156=156、RECORD 精确、
+  supervise 三方指纹一致、mode 755、`--uid` 拒绝冒烟）；`wheels/fork/` 磁盘产物 sha256：
+  aarch64 `9db6ca85…` / x86_64 `48969f2d…`。镜像 `e2b-sandlock-test:latest`
+  （`6d208d63`）内 supervise sha256 = manifest x86_64 行 + mode 0755。
+- **E2B 三档门禁无漂移**：低 fd 表探针 N=0/1/2/8 全部 `FAILURES: []` + 多探针 4 marker 全绿
+  （`tmp/f15-fdcount-*.log` / `tmp/f15-multi.log`）；网关+boxed 契约 2 轮 `2 passed`
+  （`tmp/f15-contract-run{1,2}.log`）；**gate A 982 passed / 2 skipped / 1 xfailed(T5) /
+  0 failed**（`tmp/f15-e2b-gate-a.log`）、**gate B 982 / 3 skipped / 0**
+  （`tmp/f15-e2b-gate-b.log`）、**macOS 916 / 65 skipped / 0**（`tmp/f15-macos.log`）。
+- **环境注记**：本机 docker 容器 pid-1（bash）不再及时回收孤儿进程 ⇒ fork 门禁的
+  `pgid_entry_survives_leader_exit_with_live_member` 类用例在无 init 容器里必红；本轮 fork
+  门禁统一加 `--init`（tini 作 pid1）后稳定绿（红档 `f15-gate-nonroot-r1.log` 另含一条
+  cow 并行偶发，单测/串行/两次并行复跑全绿，与 F15 无因果）。
+- **T5 前置更新**：本条修复与 T5/F16 无关（F16 仍是 route-B worker 侧 Python 接入面，
+  见本计划 Task 9）；T5 xfail 保持。
+
 ## ⚡ 修复回合 2（2026-09-08）：FUP-23 根因闭环 + 修复，FUP-14 重新上线（终态 fork `e045881` / 代码 `880a1ec` / wheel `d5cab47` 产物）
 
 上一块的「回退 FUP-14 缓解」已被**真修复**取代。成对探针加上六个快照点

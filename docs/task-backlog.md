@@ -68,7 +68,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | E8.4 | 公共镜像不直连 Docker Hub：`E2B_REGISTRY_MIRRORS` + 凭据按 host 作用域 + harness 存储改容器原生盘 + 清掉一条假 skip | ✅ 完成（默认形态 851 passed / 18 skipped；image-rootfs 形态 73 failed+28 errors → 853 passed / 16 skipped；两形态 0 failed。18 条 skip 的分组与跑法见 HANDOFF「容器全量剩下的 skip」） | `a6f74e4` `3d7cc79` `08a21dc` |
 | E8.5 | 把"能跑却在跳"的用例真正跑起来：镜像自带 XFS prjquota/npm/netns/双形态 + `E2B_TEST_STRICT_SKIPS` 能力型 skip 直接判失败 | ✅ 完成（全开跑见下；顺带修掉 fs_denied 废掉 per-uid 隔离、lsattr 缺失导致孤儿只报不清） | 本次提交 |
 | T4 | net_isolation + 镜像 rootfs(chroot) 形态下 MCP 入站端口映射起不来（纯 sandlock 形态 3/3 通过） | ✅ 已关闭（Task 10，FUP-E1）：根因 = envd 侧 base-image 组成（slim rootfs 无 mcp-gateway，ENOENT exit 2），非 fork；改用 MCP-capable 基镜像 `python-mcp:3.14`（deploy/docker/Dockerfile.mcp-base）后 chroot+netns MCP 契约两形态 3/3 绿；xfail 已摘 | `883d38d` `f67a6b9` |
-| T5 | chroot 形态共享卷写入经 supervisor 归属（fs_denied 代打开路径），per-uid 卷保护无法还原 | ⬜ 仍 strict xfail（route-B supervise 部署前属预期；`tests/contract/test_uid_permissions.py:99`）；follow-up = route-B supervise 部署后摘除 + reason 清理；正文见 `third_party/sandlock/docs/e2b-integration.md` §3.1 | — |
+| T5 | chroot 形态共享卷写入经 supervisor 归属（fs_denied 代打开路径），per-uid 卷保护无法还原 | ⬜ 仍 strict xfail（`tests/contract/test_uid_permissions.py:99`）。**fork 侧语义已闭环**（§3.1 标「已修（构造消除 + fail-closed）」，B 档 `test_two_supervisors_distinct_uids_isolate_files` 已是跨 uid 硬证据）⇒ 剩余三步：① **fork F16**（route-B worker 侧客户端的 FFI/Python 接入面，今天 `connect_and_request` 只有 Rust，FFI 无导出 ⇒ envd 当不了 route-B worker）；② E2B 侧 envd 接线 + 部署 route-B（选 W1/W2 槽位模型）；③ 摘 xfail + 删 `mediation_run_as='supervisor'` 降级档。F16 计划见 `docs/superpowers/plans/2026-09-08-sandlock-fork-remaining.md` Task 9 | — |
 | T1 | 真实 XFS/ext4 目标机上复测沙箱文件属主：① 沙箱能否 `chmod` 自己写的文件（本机 EPERM）；② 共享卷 1777+sticky 的跨 uid 保护是否真生效（本机 A 写的文件宿主属主是 uid 0，而沙箱 host_uid 是 20000） | ⬜ 待环境（两条用例已改为带证据跳过，不再靠巧合通过） | — |
 | T6 | 内存/CPU/进程配额按实例而非按沙箱 ⇒ 超卖（默认 K=2 实测 1.76x），放大为节点超卖 | ✅ 已定方案：改为**每沙箱一个 sandlock 实例**（fork 文档 §8，取代 P10 共享资源组） | — |
 | T2 | `third_party/sandlock`：`_HANDLED_FIELDS` 登记 `notify_rate_limit`，消掉假告警 | ✅ 完成（fork P3：`17ee48d` fix + `fad056a` doc，子模块 b955ae9 内） | `17ee48d` |
@@ -119,10 +119,16 @@ ACR 镜像推送照常，git 远程推送暂缓。
    Task 11 已落地 ERROR 日志（sandbox_id/port/stderr/exit text，
    `envd_service/runtime/context.py` watcher），SDK 仍按契约先收 exit-0；SDK 可见的
    错误上抛是未来产品决策，未定。
-5. **FUP T5 xfail 摘除 + reason 清理**: ⬜ open（route-B 部署前置）——route-B
-   supervise 部署（supervise 进程 euid == 沙箱 host uid）后摘除
+5. **FUP T5 xfail 摘除 + reason 清理**: ⬜ open（**非纯部署项**：前置含 fork 侧 F16）——
+   fork 的 route-B 语义/门禁已齐，但 worker 侧接入只有 Rust（`control.rs:1634 ·
+   connect_and_request`，FFI 142 个导出无任何 connect/attach 面）⇒ 需先做 **F16**
+   （`sandlock_supervise_connect/request/free` + Python `SuperviseChannel`，含 exec 的
+   SCM_RIGHTS stdio 交接；计划见 `docs/superpowers/plans/2026-09-08-sandlock-fork-remaining.md`
+   Task 9）。之后才是 envd 接线与 route-B supervise 部署（supervise 进程 euid == 沙箱 host uid，
+   注意 `sun_path` 108 字节与「一 uid = 一代沙箱，复用需重启」两条约束），最后摘除
    `tests/contract/test_uid_permissions.py:99` 的 strict xfail 并回归 T5；
-   `mediation_run_as='supervisor'` 降级档与 WARN/`mediation_downgrades` 计数随之移除。
+   `mediation_run_as='supervisor'` 降级档（`envd_service/executors/sandlock.py:755-761`）
+   与 WARN/`mediation_downgrades` 计数随之移除。
 6. **FUP pure-shape workspace 属主对齐**（Task 11 gate B 首跑暴露，确未修）: ✅ 已关闭
    （G2，2026-09-06）：无 base image
    的 pure-sandlock 沙箱（root worker + 共享 uid）无法 shell 写入 workspace 根目录
@@ -371,3 +377,20 @@ ACR 镜像推送照常，git 远程推送暂缓。
     处理一并收紧（异步信号安全前提下失败即 `_exit` 点名），③修完重跑 fork 门禁 +
     wheel + E2B 三档，并把 #21 的 N=0 对照并入回归门。
     本轮未修：不在 A/B 计划范围内，且需要完整重跑一轮 fork + wheel + E2B 门禁。
+23. **F15（fork，2026-09-08，已排入计划后完成）: 控制帧按声明归属描述符
+    （`FRAME_VERSION` 1 → 2）** — ✅ fork 侧完成（fork 提交 `c50f407` RED + `8640223` fix +
+    `3020ea0` docs；主仓指针 `018afdd`；wheel `3020ea0` 产物 = 子模块指针 = manifest HEAD）。
+    来源：#22 末段「协议缺陷（候选补丁存档）」升级为独立计划（`docs/superpowers/plans/
+    2026-09-08-sandlock-fork-remaining.md`）。问题：init 控制通道是 SOCK_STREAM，一次
+    `recvmsg` 可并入多帧，而 SCM_RIGHTS 描述符是**一条拼接列表**；旧实现把「本读单元
+    全部 fd」当「本帧的 fd」，前一帧带 fd 时后一帧 stdio 整体位移（exec #2 输出进 exec #1
+    的管道并整条丢失）；且不检查 `MSG_CTRUNC`/`MSG_TRUNC`。修法 = 帧头 1 字节 `n_fds` +
+    纯函数 `take_frame_fds` 按声明切队列（不符 ⇒ 整读单元拒绝）+ 截断 fail-closed。
+    **F15 侧结果**：core_lib 837→841（+4 fd_assignment）、root 档 oci 145→150
+    （+2 init.rs 头校验 lib+bin 双编译 +1 两帧一次写出六端各归其主 integration）；fork
+    11 档门禁全绿、wheel 双架构重建 verify 全绿（156=156 / RECORD / 三方指纹 / 0755 /
+    `--uid` 冒烟）；E2B 复跑 2026-09-08 完成：低 fd 表探针 N=0/1/2/8 全 `FAILURES: []` +
+    多探针全绿、网关+boxed 契约 2 轮全绿、**gate A 982/2skip/1xfail(T5)/0**、**gate B
+    982/3skip/0**、**macOS 916/65skip/0**。wire 升级约束（同批替换 supervise 与 wheel，
+    混装 fail-closed 点名版本）见 fork `docs/e2b-integration.md` §7。环境注记：本机
+    容器 pid-1 不再回收孤儿 ⇒ 本轮 fork 门禁统一加 `--init` 跑（红档 `f15-gate-nonroot-r1.log`）。
