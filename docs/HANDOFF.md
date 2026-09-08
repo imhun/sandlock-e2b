@@ -90,6 +90,11 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   `test_nested_store_markers_are_pruned_within_bounded_depth`。
 - **#11 bisect 日志头纪律**（约定已登记，无代码）：复现/bisect 日志带 ENV-HEADER
   （commit/env/镜像/loop/时间）；本轮全部门禁日志已按此执行。
+- **最终完整测试（2026-09-08，E2B 修复后三档）**：macOS `921 passed / 65 skipped /
+  0 failed`（`tmp/final-macos.log`；916→921 = 新增 5 条单测）、容器 gate A
+  `987 passed / 2 skipped / 1 xfailed(T5) / 0 failed`（`tmp/final-e2b-gate-a.log`）、
+  gate B `987 passed / 3 skipped / 0 failed`（`tmp/final-e2b-gate-b.log`）——含
+  oci_registry/snapshot/provision 新单测与既有快照 fork/模板构建契约回归。
 - **仍未做（需用户决策/环境）**：#4（网关启动失败 SDK 可见性 = 产品决策）、
   #5 剩余（envd route-B 接线 = 先选 W1/W2 槽位模型）、T1/O1–O3（真实 XFS/部署窗口）、
   fork Task 10/11（推送/PR/ACR 需授权）。
