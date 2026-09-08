@@ -73,6 +73,27 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   108 字节上限（E2B registry 根路径长度进部署检查表）；一 uid = 一个 supervise =
   一代沙箱（复用只能靠重启）。
 
+## ⚡ E2B 侧剩余代码项收口（2026-09-08）：backlog #20 / #13 / #14 / #11
+
+- **#20 OCI 坏镜像源防御**（发布前建议修项，已落地）：① `blob()` 校验层 digest，
+  不匹配按可重试错误走下一个 endpoint（坏层不进 rootfs）；② blob 独立 600 s 超时
+  （`RegistryClient(blob_timeout=...)`）+ buildkitd mirror 跟随
+  `E2B_REGISTRY_MIRRORS`（docker.io 桶；无配置回落 daocloud）；③ challenge 后
+  Authorization=None 不再写入（匿名 + Basic-only mirror 不再 TypeError 打断整次
+  拉取）。单测 2 条（`tests/unit/test_oci_registry.py`）。
+- **#13 本地 snapshot fork × per-sandbox uid 缺口**（已关闭）：snapshots 本地 fork
+  分支删重复内联 provision，直接复用 `_provision_local`（create 同路径）——uid 池档
+  从此 acquire/apply/commit `host_uid`，register 带 `host_uid`/volume_projects/mcp/
+  network/iam，I3 失败 release 保留。单测 `tests/unit/test_provision_local_uid.py`。
+- **#14 快照剪枝启发边界**（已加固）：`_holds_snapshots` 有界递归（深度 3），更深层
+  marker 完好的嵌入存储整容器剪除；marker 缺失/改名余量保留为文档化边界。单测
+  `test_nested_store_markers_are_pruned_within_bounded_depth`。
+- **#11 bisect 日志头纪律**（约定已登记，无代码）：复现/bisect 日志带 ENV-HEADER
+  （commit/env/镜像/loop/时间）；本轮全部门禁日志已按此执行。
+- **仍未做（需用户决策/环境）**：#4（网关启动失败 SDK 可见性 = 产品决策）、
+  #5 剩余（envd route-B 接线 = 先选 W1/W2 槽位模型）、T1/O1–O3（真实 XFS/部署窗口）、
+  fork Task 10/11（推送/PR/ACR 需授权）。
+
 ## ⚡ 修复回合 2（2026-09-08）：FUP-23 根因闭环 + 修复，FUP-14 重新上线（终态 fork `e045881` / 代码 `880a1ec` / wheel `d5cab47` 产物）
 
 上一块的「回退 FUP-14 缓解」已被**真修复**取代。成对探针加上六个快照点

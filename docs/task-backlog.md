@@ -122,15 +122,15 @@ ACR 镜像推送照常，git 远程推送暂缓。
    `envd_service/runtime/context.py` watcher），SDK 仍按契约先收 exit-0；SDK 可见的
    错误上抛是未来产品决策，未定。
 5. **FUP T5 xfail 摘除 + reason 清理**: ⬜ open（**非纯部署项**：前置含 fork 侧 F16）——
-   fork 的 route-B 语义/门禁已齐，但 worker 侧接入只有 Rust（`control.rs:1634 ·
-   connect_and_request`，FFI 142 个导出无任何 connect/attach 面）⇒ 需先做 **F16**
-   （`sandlock_supervise_connect/request/free` + Python `SuperviseChannel`，含 exec 的
-   SCM_RIGHTS stdio 交接；计划见 `docs/superpowers/plans/2026-09-08-sandlock-fork-remaining.md`
-   Task 9）。之后才是 envd 接线与 route-B supervise 部署（supervise 进程 euid == 沙箱 host uid，
-   注意 `sun_path` 108 字节与「一 uid = 一代沙箱，复用需重启」两条约束），最后摘除
+   fork 侧前置 **F16 已完成（2026-09-08）**：`sandlock_supervise_connect/request/free`
+   C ABI + Python `SuperviseChannel`（含 exec 的 SCM_RIGHTS stdio 交接；fork `1159525`/
+   `6571c36`、主仓 `f8c4020`，见 #24）。剩余 = envd 接线与 route-B supervise 部署
+   （supervise 进程 euid == 沙箱 host uid，须先选 **W1/W2 槽位模型**；注意 `sun_path`
+   108 字节与「一 uid = 一代沙箱，复用需重启」两条约束），最后摘除
    `tests/contract/test_uid_permissions.py:99` 的 strict xfail 并回归 T5；
    `mediation_run_as='supervisor'` 降级档（`envd_service/executors/sandlock.py:755-761`）
-   与 WARN/`mediation_downgrades` 计数随之移除。
+   与 WARN/`mediation_downgrades` 计数随之移除。**W1/W2 选择属部署/设计决策，等用户定
+   （fork 侧已就绪，不阻塞代码面）。**
 6. **FUP pure-shape workspace 属主对齐**（Task 11 gate B 首跑暴露，确未修）: ✅ 已关闭
    （G2，2026-09-06）：无 base image
    的 pure-sandlock 沙箱（root worker + 共享 uid）无法 shell 写入 workspace 根目录
@@ -164,9 +164,10 @@ ACR 镜像推送照常，git 远程推送暂缓。
     2026-09-06；commit `beff30f`）：删除 executor 只写不读的
     `_instance_network_snapshot` 状态与赋值/清理；D4=A ratchet 只读
     `_applied_state()`。
-11. **FUP bisect 证据日志头纪律**（Ohm review 登记）: ⬜ open（约定项，无代码修复
-    计划）——容器/宿主复现与 bisect 日志应带环境头（commit、env、镜像/loop、时间）
-    便于跨会话归因。
+11. **FUP bisect 证据日志头纪律**（Ohm review 登记）: ✅ 已登记约定（2026-09-08，
+    无代码修复计划）——容器/宿主复现与 bisect 日志必须带环境头（commit、env、
+    镜像/loop、时间）便于跨会话归因；本轮 F15/F16 所有门禁/探针日志已按此执行
+    （ENV-HEADER 首行）。
 12. **FUP worker 侧 409 无 egress 探针断言**（Task 4 Minor 登记，随 final review
     入 backlog 可见）: ✅ 已关闭（G3 final wave，2026-09-06；test commit
     `0e15572`）：`tests/security/test_network_enforcement.py` 新增
@@ -176,16 +177,18 @@ ACR 镜像推送照常，git 远程推送暂缓。
     目的地址 = 198.18.0.99 loopback 别名 + 本地 RecordingOrigin（NET_ADMIN 门控
     与 `test_fork_network_features` 一致），断言全精确、无 substring。
 13. **G2 评审登记：本地 snapshot fork × per-sandbox-uid uid 分配缺口**（2026-09-06）:
-    ⬜ open——`control_plane/api/snapshots.py` 本地分支在 per-sandbox uid
-    （`host_uid`/`E2B_PER_SANDBOX_UID`）模式下从不 acquire/apply `host_uid`
-    （pre-existing gap；remote fork 走 agent create 无此缺口）。G2（`b3bfe2d`）
-    只在 `uid_pool is None`（legacy 共享 uid）档补了属主对齐；per-sandbox 档若要用
-    本地 fork 需另做（可复用 `_provision_local` 的 acquire 流程）。
-14. **G2 评审登记：快照剪枝启发边界风险**（2026-09-06）: ⬜ open——`_prune_store`
-    只剪"本身是快照根、或直接装着 `snapshot.json` 根"的最外层目录：更深层嵌入、
-    marker 缺失/改名的存储、权限/竞态异常都会按普通目录带入快照（单测正例只固定了
-    同名普通目录保留一档）。该边界不会自身再造指数链，但会携带存储字节；见
-    `control_plane/registry/snapshots.py` `_prune_store` 的 boundary note。
+    ✅ 已关闭（2026-09-08）：`control_plane/api/snapshots.py` 本地 fork 分支删掉
+    重复内联 provision，改为直接调用 `_provision_local`（create 同路径）——per-sandbox
+    uid 档从此 acquire/apply/commit `host_uid`、register 带 `host_uid`/volume_projects/
+    mcp/network/iam（I3 失败 release 保留）；legacy 无池档保持共享 uid 对齐。单测
+    `tests/unit/test_provision_local_uid.py`（acquire→ownership→register(host_uid)→commit
+    + 失败 release 两条）。
+14. **G2 评审登记：快照剪枝启发边界风险**（2026-09-06）: ✅ 已关闭（2026-09-08）——
+    `_holds_snapshots` 改有界递归（深度 3），更深层嵌入
+    且 marker 完好的存储（`cache/mirror/snap_X/...`）整容器剪除；marker 缺失/改名与
+    权限/竞态余量保留为文档化边界（不自身再造指数链，仍可能携带存储字节）。单测
+    `tests/unit/test_snapshot_registry.py::test_nested_store_markers_are_pruned_within_bounded_depth`
+    + 既有同名普通目录正例保持。
 15. **F12（fork，2026-09-06 已列入主要计划）: ProcessIndex 一 TGID 一 entry** —
     ✅ fork 侧完成（2026-09-07；fork 本地提交 `68e7e84` fix + `194ffed` docs，
     未推送；报告 `third_party/sandlock/tmp/sdd/f12-report.md`）。来源：F11 report concern #1（row #2 的
@@ -281,8 +284,21 @@ ACR 镜像推送照常，git 远程推送暂缓。
     gateway 探针 4/4（日志 `tmp/f23-*`、`tmp/perf/f23-gateway-probe-run*.log`、
     fork `tmp/sdd/f23-*`）。FUP-14 的 ≈19× exec 往返收益随回退撤回，
     `supervise_cost` 预算回 200/300/2000 ms。
-20. **OCI 镜像解析对「坏镜像源」无防御（2026-09-07）**: ⬜ open（E2B 侧，发布前建议修）。
-    本轮公共 Docker Hub 源整体劣化，暴露三处：
+20. **OCI 镜像解析对「坏镜像源」无防御（2026-09-07）**: ✅ 已修复（2026-09-08，
+    E2B 侧）——三处全落地：
+    ① `oci_registry.py` `blob()` 下载后按请求 digest 校验 sha256，不匹配 ⇒
+    `RegistryError(retryable=True)` 走下一个 endpoint，坏层绝不进 rootfs；
+    ② blob 拉取用独立超时（`blob_timeout=600s`，`RegistryClient` 新参数），
+    30 s 请求预算只管 manifest/交互往返；`tests/conftest.py` buildkitd mirror
+    改从 `E2B_REGISTRY_MIRRORS` 的 docker.io 桶取值（无配置才回落 daocloud），
+    不再硬编码单源；
+    ③ challenge 后仅在 `_authorization()` 非 None 时才写 Authorization 头，
+    匿名 + Basic-only mirror 不再因 `TypeError` 打断整次拉取（走既有
+    fall-through）。
+    单测：`tests/unit/test_oci_registry.py`（blob digest mismatch retryable +
+    anonymous Basic challenge 不写 None 头，18 passed）。
+    原始描述（2026-09-07 观测）：
+   本轮公共 Docker Hub 源整体劣化，暴露三处：
     ① `envd_service/runtime/oci_registry.py:352` `blob()` 直接返回 `.content`，
     **不校验层 digest** ⇒ 镜像源交付截断/错误层时被静默解进 rootfs，症状漂移到
     远端（gate A r3 出现 `sandlock child: execvp '/bin/echo': No such file or

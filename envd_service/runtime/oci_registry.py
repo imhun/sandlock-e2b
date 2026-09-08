@@ -180,6 +180,7 @@ class RegistryClient:
         password: str | None = None,
         scheme: str | None = None,
         timeout: float = 30.0,
+        blob_timeout: float = 600.0,
         credential_host: str | None = None,
     ) -> None:
         self._ref = ref
@@ -200,6 +201,11 @@ class RegistryClient:
         self._password = password
         self._scheme = scheme or _default_scheme(ref.host)
         self._timeout = timeout
+        # Blob downloads are a different budget than a manifest round-trip:
+        # slow mirrors routinely need minutes for a 30+ MB layer, while the
+        # request budget that guards interactive verbs must stay short. One
+        # per-blob deadline covers both the connect and the transfer.
+        self._blob_timeout = blob_timeout
         self._token: str | None = None
         self._basic_auth: tuple[str, str] | None = None
 
@@ -224,7 +230,14 @@ class RegistryClient:
             return f"Basic {base64.b64encode(raw).decode()}"
         return None
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
         """Fetch ``path`` (registry-relative), trying each configured endpoint.
 
         The token is issued per endpoint, so the auth dance runs again for
@@ -237,7 +250,7 @@ class RegistryClient:
             self._basic_auth = None
             url = f"{base}/{path}"
             try:
-                return self._request_one(method, url, **kwargs)
+                return self._request_one(method, url, timeout=timeout, **kwargs)
             except RegistryError as e:
                 if not e.retryable or index == len(bases) - 1:
                     raise
@@ -250,17 +263,30 @@ class RegistryClient:
                 )
         raise last  # pragma: no cover - the loop always returns or raises
 
-    def _request_one(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    def _request_one(
+        self,
+        method: str,
+        url: str,
+        *,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
         headers = dict(kwargs.pop("headers", {}) or {})
         headers.setdefault("Accept", _MANIFEST_ACCEPT)
         auth_header = self._authorization()
         if auth_header:
             headers["Authorization"] = auth_header
-        resp = self._send(method, url, headers, **kwargs)
+        resp = self._send(method, url, headers, timeout=timeout, **kwargs)
         if resp.status_code in (401, 403) and not self._token:
             self._challenge(resp)
-            headers["Authorization"] = self._authorization()
-            resp = self._send(method, url, headers, **kwargs)
+            # An anonymous pull facing a Basic-only mirror has no credentials
+            # to attach; a None header must not be written (httpx raises
+            # TypeError) and must not abort the whole fetch — the endpoint
+            # falls through below like any other refusal.
+            auth_header = self._authorization()
+            if auth_header:
+                headers["Authorization"] = auth_header
+            resp = self._send(method, url, headers, timeout=timeout, **kwargs)
         if resp.status_code >= 400:
             raise RegistryError(
                 f"registry {url.split('//', 1)[1].split('/', 1)[0]} "
@@ -270,7 +296,13 @@ class RegistryClient:
         return resp
 
     def _send(
-        self, method: str, url: str, headers: dict[str, str], **kwargs: Any
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        *,
+        timeout: float | None = None,
+        **kwargs: Any,
     ) -> httpx.Response:
         """One registry request, with the URL in the failure message.
 
@@ -282,7 +314,7 @@ class RegistryClient:
                 method,
                 url,
                 headers=headers,
-                timeout=self._timeout,
+                timeout=self._timeout if timeout is None else timeout,
                 follow_redirects=True,
                 **kwargs,
             )
@@ -350,7 +382,27 @@ class RegistryClient:
         return manifest, digest
 
     def blob(self, digest: str) -> bytes:
-        return self._request("GET", f"{self._ref.repository}/blobs/{digest}").content
+        content = self._request(
+            "GET",
+            f"{self._ref.repository}/blobs/{digest}",
+            timeout=self._blob_timeout,
+        ).content
+        if not digest.startswith("sha256:"):
+            raise RegistryError(
+                f"unsupported blob digest {digest!r}: only sha256 is supported",
+                retryable=True,
+            )
+        actual = "sha256:" + hashlib.sha256(content).hexdigest()
+        if actual != digest:
+            # The endpoint delivered a corrupt/truncated layer. Never unpack
+            # it into a rootfs: the failure is the endpoint's, so the mirror
+            # chain falls through to the next one (retryable).
+            raise RegistryError(
+                f"blob digest mismatch for {digest}: endpoint delivered {actual} "
+                f"({len(content)} bytes); treating the endpoint as corrupt",
+                retryable=True,
+            )
+        return content
 
 
 def _machine_platform() -> tuple[str, str]:

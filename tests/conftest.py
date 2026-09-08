@@ -187,10 +187,32 @@ def buildkitd():
     cfg_dir.mkdir(parents=True, exist_ok=True)
     cfg = cfg_dir / "buildkitd.toml"
     mount_src = host_root / "tmp" / cfg_name / "buildkitd.toml"
+
+    # Public-image pulls go through mirrors the same way the envd resolver
+    # does (E2B_REGISTRY_MIRRORS, docker.io bucket); the daocloud default is
+    # only a fallback for environments that did not configure one. Mirror
+    # hosts without a scheme get https://, except loopback (plain HTTP).
+    docker_mirrors = []
+    for pair in os.environ.get("E2B_REGISTRY_MIRRORS", "").split(","):
+        source, _, targets = pair.partition("=")
+        if source.strip().lower() in ("docker.io", "registry-1.docker.io", "index.docker.io"):
+            docker_mirrors = [t.strip() for t in targets.split("|") if t.strip()]
+            break
+    if not docker_mirrors:
+        docker_mirrors = ["https://docker.m.daocloud.io"]
+
+    def _mirror_url(mirror: str) -> str:
+        if mirror.startswith(("http://", "https://")):
+            return mirror
+        host = mirror.split(":")[0]
+        scheme = "http" if host in ("127.0.0.1", "localhost") else "https"
+        return f"{scheme}://{mirror}"
+
+    mirror_entries = ", ".join(f'"{_mirror_url(m)}"' for m in docker_mirrors)
     cfg.write_text(
         f'[grpc]\n  address = ["tcp://0.0.0.0:{port}"]\n\n'
         "[worker.oci]\n  noProcessSandbox = true\n\n"
-        '[registry."docker.io"]\n  mirrors = ["https://docker.m.daocloud.io"]\n\n'
+        f'[registry."docker.io"]\n  mirrors = [{mirror_entries}]\n\n'
         # Local test registry is plain HTTP on 127.0.0.1 (any port).
         '[registry."127.0.0.1"]\n  http = true\n',
         encoding="utf-8",

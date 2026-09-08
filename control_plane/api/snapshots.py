@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 
 from control_plane.api.errors import OfficialError
 from control_plane.auth import _require_owned, require_api_key, tenant_of, tenant_scope
-from control_plane.api.sandboxes import _provision_remote
+from control_plane.api.sandboxes import _provision_local, _provision_remote
 from control_plane.registry.manager import (
     ResourceUnavailableError,
     SandboxStateConflictError,
@@ -265,70 +265,13 @@ async def _create_sandbox_from_snapshot(
     registry.save(record)
     try:
         if node.address == "local://":
-            workspace_dir.mkdir(parents=True, exist_ok=True)
-            _snapshots(request).expand_to(snapshot, workspace_dir)
-            record.workspace_dir = workspace_dir
-            try:
-                from envd_service.volumes import build_volume_mounts
-            except ImportError:  # pragma: no cover - separated control plane
-                raise OfficialError(500, "local node requires the envd service")
-            mount_inputs = []
-            for mount in record.volume_mounts:
-                volume = request.app.state.volumes.get(mount["name"])
-                mount_inputs.append(
-                    {
-                        "name": mount["name"],
-                        "path": mount["path"].lstrip("/"),
-                        "hostPath": str(volume.path),
-                        "perSandboxQuotaMb": volume.per_sandbox_quota_mb,
-                    }
-                )
-            try:
-                mount_paths, volume_projects = build_volume_mounts(
-                    sandbox_id=record.sandbox_id,
-                    volume_mounts=mount_inputs,
-                    shared_volume_root=settings.shared_volume_root,
-                    workspace_dir=workspace_dir,
-                    fallback_mount_point=settings.workspace_base,
-                    via_agent=False,
-                    # A fork is a new sandbox: with per-sandbox volume quota
-                    # it provisions its own fresh slice (the parent's slice
-                    # is never inherited — snapshots capture the workspace
-                    # only, not volume contents).
-                    existing_volume_projects=[],
-                )
-            except ValueError as e:
-                raise OfficialError(400, str(e))
-            if (
-                getattr(
-                    request.app.state.runtime_registry, "uid_pool", None
-                )
-                is None
-            ):
-                # FUP #6: same legacy shared-uid alignment as the create
-                # path — the local sandlock shell (host uid 1000, pure
-                # no-chroot shape) must own the workspace copied out of the
-                # snapshot. Per-sandbox-uid local forks are handled by the
-                # agent create path on remote nodes; this branch predates a
-                # uid allocation and stays as-is when a pool is present.
-                from envd_service.uid_pool import align_shared_uid_workspace
-
-                align_shared_uid_workspace(workspace_dir)
-            request.app.state.runtime_registry.register(
-                sandbox_id=record.sandbox_id,
-                access_token=record.envd_access_token,
-                workspace_dir=str(workspace_dir),
-                env_vars=record.env_vars,
-                base_image=record.base_image,
-                memory_mb=record.memory_mb,
-                cpu_percent=record.cpu_count * 100,
-                disk_mb=record.disk_size_mb,
-                max_processes=record.max_processes,
-                allow_internet_access=record.allow_internet_access,
-                max_command_timeout=settings.max_command_timeout,
-                volume_mounts=mount_paths,
-                volume_projects=volume_projects,
-            )
+            # Reuse the create path's local provisioner so a per-sandbox-uid
+            # fork acquires/applies/commits a host uid through the shared pool
+            # exactly like `_provision_local` does (I3 release on failure),
+            # and the legacy no-pool shape gets the shared-uid workspace
+            # alignment. The duplicate inline provisioning predated uid
+            # allocation and silently registered forks without a host_uid.
+            _provision_local(request, record, snapshot, record.volume_mounts, settings)
         else:
             await _provision_remote(
                 request,

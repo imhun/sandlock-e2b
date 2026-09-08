@@ -36,20 +36,31 @@ def _is_snapshot_root(path: Path) -> bool:
     return (path / "snapshot.json").is_file()
 
 
-def _holds_snapshots(path: Path) -> bool:
-    """``path`` is a snapshot root, or directly holds snapshot roots
-    (i.e. a registry store directory was carried into the workspace)."""
+def _contains_snapshot_root(path: Path, depth: int) -> bool:
+    """``path`` is a snapshot root, or a bounded-depth subtree of it holds
+    one.  The bound keeps the copytree ignore callback cheap on ordinary
+    workspaces (a few levels per visited directory) while still catching a
+    registry store that was carried in with its markers intact but nested
+    deeper than the direct-child shape (``snap_X/fs/snap_Y/...``)."""
     if _is_snapshot_root(path):
         return True
+    if depth <= 0:
+        return False
     try:
-        return any(
-            child.is_dir() and _is_snapshot_root(child)
-            for child in path.iterdir()
-        )
+        for child in path.iterdir():
+            if child.is_dir() and _contains_snapshot_root(child, depth - 1):
+                return True
     except OSError:
         # Permission/race: copy it as an ordinary directory rather than
         # dropping the whole tree.
-        return False
+        pass
+    return False
+
+
+def _holds_snapshots(path: Path) -> bool:
+    """``path`` is a snapshot root, or its subtree (bounded) holds one —
+    i.e. a registry store directory was carried into the workspace."""
+    return _contains_snapshot_root(path, depth=3)
 
 
 def _prune_store(directory: str, names: list[str]) -> set[str]:
@@ -58,15 +69,15 @@ def _prune_store(directory: str, names: list[str]) -> set[str]:
     Only the outermost store directory is dropped: the walk never descends
     into it, so an embedded ``snap_X/fs/snap_X/fs/...`` chain cannot form.
 
-    Boundary note (G2 review; registered in docs/task-backlog.md): detection
-    is heuristic -- a directory counts as store only when it is itself a
-    snapshot root or directly holds one (``snapshot.json`` present). A store
-    nested deeper than one level, one whose marker is missing or renamed, or
-    a permission/race failure inside ``_holds_snapshots`` degrades to copying
-    the directory as ordinary content: that alone cannot re-form the
-    exponential chain, but it can still carry store bytes into a snapshot.
-    The positive same-name case is pinned in tests/unit/test_snapshot_registry.py;
-    the boundary is deliberate and accepted for now.
+    Boundary note (G2 review; #14): detection is heuristic -- a directory
+    counts as a store when it is itself a snapshot root or its subtree holds
+    one within a bounded depth (3 levels; markers intact). A store whose
+    marker is missing or renamed, or a permission/race failure inside
+    ``_holds_snapshots``, still degrades to copying the directory as ordinary
+    content: that alone cannot re-form the exponential chain, but it can
+    still carry store bytes into a snapshot. The positive same-name case and
+    the nested-store case are pinned in tests/unit/test_snapshot_registry.py;
+    the marker-less remainder is deliberate and accepted for now.
     """
     here = Path(directory)
     return {

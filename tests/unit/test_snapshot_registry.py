@@ -98,3 +98,30 @@ def test_store_named_dir_without_snapshot_root_is_preserved(tmp_path):
     assert (expanded / "snapshots" / "notes" / "keep.txt").read_text(
         encoding="utf-8"
     ) == "n"
+
+
+def test_nested_store_markers_are_pruned_within_bounded_depth(tmp_path):
+    """#14: a store carried in nested below the direct-child shape (markers
+    intact) is pruned by the bounded-depth scan — the whole container
+    directory goes instead of copying store bytes into the snapshot."""
+    store = tmp_path / "snapshots"
+    reg = _registry(store)
+    victim = _snapshot_from(reg, _seed(tmp_path / "sbx_victim"), "snap_victim")
+
+    ws = tmp_path / "sbx_nested"
+    (ws / "workspace").mkdir(parents=True)
+    (ws / "workspace" / "keep.txt").write_text("keep", encoding="utf-8")
+    # The container directory is not itself a store; the snapshot root sits
+    # two levels below it (mirror/snap_victim/snapshot.json).
+    shutil.copytree(
+        store / "snap_victim",
+        ws / "cache" / "mirror" / "snap_victim",
+        symlinks=True,
+    )
+
+    out = _snapshot_from(reg, ws, "snap_nested")
+    assert (out.fs_path / "workspace" / "keep.txt").read_text(
+        encoding="utf-8"
+    ) == "keep"
+    assert not (out.fs_path / "cache").exists()
+    assert list(out.fs_path.rglob("snapshot.json")) == []

@@ -328,6 +328,56 @@ def test_unknown_image_fails(registry, tmp_path):
         resolve_image_rootfs(f"{registry.host}/test/py:missing", tmp_path)
 
 
+def test_blob_digest_mismatch_fails_closed_as_retryable(registry):
+    """A corrupt/truncated layer must never unpack into a rootfs: the blob()
+    call verifies sha256 against the requested digest and raises a retryable
+    RegistryError so the mirror chain falls through to the next endpoint."""
+    from envd_service.runtime.oci_registry import RegistryClient, RegistryError
+
+    l1 = registry.add_layer({"bin/true": b"\x7fELF-corruptible"})
+    ref = parse_image_ref(f"{registry.host}/test/py:latest")
+    client = RegistryClient(ref, scheme="http")
+    # Serve different bytes than the digest advertises (truncated-layer shape).
+    registry.layers[l1] = b"corrupted-bytes"
+    with pytest.raises(RegistryError) as ei:
+        client.blob(l1)
+    assert ei.value.retryable is True
+    assert "digest mismatch" in str(ei.value)
+    assert f"sha256:{hashlib.sha256(b'corrupted-bytes').hexdigest()}" in str(ei.value)
+
+
+def test_anonymous_basic_challenge_does_not_write_none_authorization(monkeypatch):
+    """An anonymous pull facing a Basic-only mirror must not write a None
+    Authorization header after the challenge (httpx TypeError used to abort
+    the whole fetch instead of falling through to the next endpoint)."""
+    import httpx
+
+    from envd_service.runtime.oci_registry import RegistryClient
+
+    calls: list[object] = []
+
+    def fake_request(method, url, **kwargs):
+        headers = kwargs.get("headers") or {}
+        calls.append(headers.get("Authorization"))
+        req = httpx.Request("GET", url)
+        if len(calls) == 1:
+            return httpx.Response(
+                401,
+                headers={"WWW-Authenticate": 'Basic realm="fake"'},
+                request=req,
+            )
+        return httpx.Response(200, content=b"{}", request=req)
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    client = RegistryClient(parse_image_ref("example.com/test/py:latest"))
+    manifest, digest = client.manifest()
+    assert manifest == {}
+    assert digest == "sha256:" + hashlib.sha256(b"{}").hexdigest()
+    assert len(calls) == 2
+    assert calls[0] is None, "no credentials before the challenge"
+    assert calls[1] is None, "anonymous Basic challenge must not attach a None header"
+
+
 def test_platform_digest_is_cached_within_the_ttl(monkeypatch, tmp_path):
     """One tag is looked up once per TTL window, not once per create."""
     from envd_service.runtime import image_resolver
