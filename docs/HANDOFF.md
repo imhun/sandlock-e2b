@@ -40,6 +40,39 @@ init 控制通道是 `SOCK_STREAM`：一次 `recvmsg` 可并入多帧，而内�
 - **T5 前置更新**：本条修复与 T5/F16 无关（F16 仍是 route-B worker 侧 Python 接入面，
   见本计划 Task 9）；T5 xfail 保持。
 
+## ⚡ F16（2026-09-08）：route-B worker 侧语言客户端（fork `6571c36` / wheel `6571c36` 产物）
+
+registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的 worker 面
+此前只有 Rust（`channel_request_with_fds` 不带 fd 的 `connect_and_request` 之上没有
+语言绑定），envd（E2B）当不了 route-B worker。F16 新增：
+
+- **C ABI**：`sandlock_supervise_connect(path, token, err, err_msg)` /
+  `sandlock_supervise_request(h, verb, args_json, fds, n_fds, err, err_msg)`（返回
+  `ControlResponse` JSON 原文；`exec` 三端 stdio 随帧 SCM_RIGHTS 交付）/
+  `sandlock_supervise_free(h)`；错误沿用既有 `err`/`err_msg` 约定。FFI 动态符号
+  156 → 159（wheel verify 双向相等随之更新）。
+- **Python**：`sandlock.supervise.SuperviseChannel(path, token).request(verb, args,
+  fds=()) -> data`；`exec`/`wait_child`/`kill_child`/`update_network`/`shutdown`
+  语义全由服务端 Generation 定义；非 ok 响应抛 `SandboxError`，transport 错误抛
+  `SandlockError`。
+- **T5 所需 Python 可达证据已钉在 fork 侧**：`mediation_2uid` 新增
+  `test_python_client_execs_distinct_uids_on_shared_sticky_dir`（10 passed）——
+  两个不同 uid 的 registered slot 由 Python 客户端 exec + wait_child + shutdown
+  驱动：X 的 exec 建文件宿主属主 == X、自 chmod 生效；Y 的 exec 对该文件
+  rm/chmod 均 EPERM（1777+sticky 真语义）。python 档 +1（455，
+  `test_supervise_channel.py` 同 uid exec-with-fds 往返）。剩余 T5 动作 =
+  envd 接线 + route-B supervise 部署（选 W1/W2）+ 摘 xfail（main backlog #5）。
+- **门禁/产物**：fork 11 档全绿（core_lib 841 / core_integ 534 / ffi 101 / cli 100 /
+  supervise 42 / supervise_cost 3 / cli_build 0 / python 455；oci 150 /
+  supervise_root 4 / mediation_2uid 10；`third_party/sandlock/tmp/sdd/f16-gate-*.log`）；
+  wheel cp314 双架构重建 @ 6571c36 + verify 全绿（159=159、RECORD、三方指纹、0755、
+  `--uid` 冒烟；`tmp/sdd/f16-wheel-{build,verify}.log`；产物 sha256 aarch64
+  `83cfad16…` / x86_64 `db7e0720…`）；E2B 三档无漂移：gate A 982/2/1xfail(T5)/0、
+  gate B 982/3/0、macOS 916/65/0（`tmp/f16-e2b-gate-{a,b}.log` / `tmp/f16-macos.log`）。
+- **两条部署约束**（见 fork `docs/supervise-identity-handoff.md` §10）：`sun_path`
+  108 字节上限（E2B registry 根路径长度进部署检查表）；一 uid = 一个 supervise =
+  一代沙箱（复用只能靠重启）。
+
 ## ⚡ 修复回合 2（2026-09-08）：FUP-23 根因闭环 + 修复，FUP-14 重新上线（终态 fork `e045881` / 代码 `880a1ec` / wheel `d5cab47` 产物）
 
 上一块的「回退 FUP-14 缓解」已被**真修复**取代。成对探针加上六个快照点

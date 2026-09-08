@@ -1,7 +1,7 @@
 # 任务总清单（路线图）
 
-汇总 2026-08-31 ~ 09-02 分析产生的待办。**状态最后更新：2026-09-06（G3 final
-wave：G1/G2 follow-ups 台账收口）**
+汇总 2026-08-31 ~ 09-02 分析产生的待办。**状态最后更新：2026-09-08（F15 收口；
+FUP-01/07/09/10/15/17 台账关闭，见 fork `docs/fork-plan-followups.md`）**
 （细粒度执行记录见 `.superpowers/sdd/progress.md`，两阶段总路线见
 `docs/superpowers/plans/2026-09-01-sandlock-e2b-completion-roadmap.md`）。
 
@@ -84,11 +84,13 @@ ACR 镜像推送照常，git 远程推送暂缓。
 
 ## 剩余工作
 
-1. 上线前：`wheels/fork` 重建（E7 最终 tip）+ 镜像重建推 ACR；
+1. 上线前：`wheels/fork` 重建（E7 最终 tip）+ 镜像重建推 ACR —— ✅ 代码/产物侧已完成
+   （F15 终态 fork `3020ea0` / wheel `3020ea0` 产物，见 #23）；**仍剩 ACR 推送**（受
+   "不推送远程"约束暂缓，Task 11）；
 2. 用户解除"不做远程部署"约束后：O1（prjquota）、E1.2/E8.1 目标机部署与远程复测、O2/O3；
    T1（真实 XFS/ext4 上复测沙箱文件属主，去掉那条带证据的 skip）随 O1 一起做；
 3. 不需要环境就能做的：~~T3（快照展开自嵌套守卫）~~ ✅ 已完成（G2，2026-09-06，见上表行）；
-   T2 已随 fork P3 完成。
+   T2 已随 fork P3 完成；~~#22 候选补丁（协议缺陷）~~ ✅ 已完成（F15，见 #23）。
 
 ## M4 收口后的 open follow-ups（Task 11 登记，2026-09-06；G3 收口 2026-09-06）
 
@@ -394,3 +396,16 @@ ACR 镜像推送照常，git 远程推送暂缓。
     982/3skip/0**、**macOS 916/65skip/0**。wire 升级约束（同批替换 supervise 与 wheel，
     混装 fail-closed 点名版本）见 fork `docs/e2b-integration.md` §7。环境注记：本机
     容器 pid-1 不再回收孤儿 ⇒ 本轮 fork 门禁统一加 `--init` 跑（红档 `f15-gate-nonroot-r1.log`）。
+24. **F16（fork，2026-09-08，已排入计划后完成）: route-B worker 侧语言客户端
+    （T5 的真前置）** — ✅ fork 侧完成（fork `1159525` feat + `6571c36` docs/python；
+    主仓指针 `f8c4020`；wheel `6571c36` 产物）。新增 C ABI
+    `sandlock_supervise_connect/request/free`（`exec` 三端 stdio 随帧 SCM_RIGHTS）
+    + Python `sandlock.supervise.SuperviseChannel`；FFI 符号 156→159。证据：
+    `mediation_2uid` 9→10（Python 客户端驱动两个不同 uid 的 registered slot，
+    per-uid 卷保护三断言精确成立 = T5 所缺的 Python 可达证据）、python 档 454→455
+    （同 uid exec-with-fds 往返）、ffi 100→101（C smoke 编译+链接+失败路径契约）。
+    fork 11 档门禁全绿 + wheel 双架构 verify 全绿（159=159）+ E2B 三档无漂移
+    （gate A 982/2/1xfail(T5)/0、gate B 982/3/0、macOS 916/65/0）。**剩余 = E2B
+    envd 接线 + route-B supervise 部署（W1/W2 槽位模型；`sun_path` 108 与
+    「一 uid = 一代沙箱」两条约束）+ 摘 T5 xfail + 删 `mediation_run_as='supervisor'`
+    降级档**（main backlog #5）。
