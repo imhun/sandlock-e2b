@@ -111,6 +111,13 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   （容器实跑）：两个不同 uid 槽位经 `SuperviseChannel` exec —— X 建文件宿主属主 X、
   自 chmod 生效；Y 对该文件 rm/chmod 均 EPERM（1777+sticky 真语义）；W1 uid 复用/
   耗尽语义。这是 T5 在 envd 侧的硬证据（fork `mediation_2uid` B档 的 Python 复刻）。
+- **最终门禁（2026-09-09，route-B 基础落地后）**：macOS `921 passed / 67 skipped /
+  0 failed`（`tmp/final2-macos.log`）、gate A `989 passed / 2 skipped /
+  1 xfailed(T5) / 0 failed`（`tmp/final2-e2b-gate-a.log`；r1–r3 红 =
+  `worker_nonroot` rootfs `/bin/echo` 缺失，VM 磁盘水位 ~91% 下的 docker export
+  抖动——单跑/route_b+worker 配对/contract+perf+sdk 切片均绿，释放 14GB 后复跑全绿，
+  与本次改动无因果）、gate B `989 passed / 3 skipped / 0 failed`
+  （`tmp/final2-e2b-gate-b.log`）。
 - 剩余 = executor 全面接线（设计 + 分步清单见
   `docs/superpowers/plans/2026-09-09-envd-route-b-wiring.md`「后续接线 Task」）：
   policy→supervise JSON、M0 停车程序、exec/PTY/update_network/pause/收口 verb 面迁移、
