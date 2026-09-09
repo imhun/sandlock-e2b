@@ -121,12 +121,41 @@ ACR 镜像推送照常，git 远程推送暂缓。
    Task 11 已落地 ERROR 日志（sandbox_id/port/stderr/exit text，
    `envd_service/runtime/context.py` watcher），SDK 仍按契约先收 exit-0；SDK 可见的
    错误上抛是未来产品决策，未定。
-5. **FUP T5 xfail 摘除 + reason 清理**: ⬜ open（envd 接线中，2026-09-09 进度：fork F16
+5. **FUP T5 xfail 摘除 + reason 清理**: 🟡 executor 接线完成、T5 已摘（2026-09-09：
+   **executor 已全面走
+   supervise** ⇒ `tests/contract/test_uid_permissions.py` 的 strict xfail **已摘**，
+   chroot 形态容器实跑 4 passed，日志里两个沙箱分别租到 uid 20000/20001 的
+   `sandlock-supervise` 槽位）。新增开关 `E2B_ROUTE_B=auto|on|off` +
+   `E2B_ROUTE_B_SLOTS`（auto 档只在 root worker + per-sandbox uid + chroot 形态 +
+   wheel 带 supervise 时启用；强开而前置不满足 ⇒ 建箱报错，不静默退 route-A）。
+   执行面证据三份契约：`tests/contract/test_route_b_executor.py`（executor↔槽位
+   端到端：子进程 uid、文件属主 + 自 chmod、**停车 M0 零 CPU**、PTY 尺寸、
+   SIGSTOP 真停 + 信号退出码 -1、close 后 uid 干净可复用）、
+   `test_route_b_slot_pool.py`（跨 uid 卷保护）、`test_uid_permissions.py`（T5 本体）。
+   实现期推翻的两条设计：停车程序**不能**用 `read x < /dev/zero`（exec 会话 M0
+   stdio 被 core 固定为 /dev/null ⇒ 死循环跑满一核），改成自 `kill -STOP $$`；
+   槽位**必须按沙箱自己的 host uid 定向租用**（换 uid 就连自己 workspace 都进不去）。
+   其余 5 条约束（串行 accept、先 bind 后 launch、scratch 目录可遍历性 +
+   文档 0440 root:uid、`SandboxError ⊂ SandlockError` 的捕获顺序、token 走 argv）
+   见 `docs/superpowers/plans/2026-09-09-envd-route-b-wiring.md` 文末表。
+   ✅ 三档门禁已在终态树上复跑全绿：gate A（chroot，base=python-mcp:3.14，
+   concurrency=2）`1048 passed / 2 skipped / 0 failed`（`tmp/rb-gate-a2.log`；
+   本轮早先一次 1047/2/0 见 `tmp/rb-gate-a.log`，差额就是新增的那条单槽位并发契约）、
+   gate B（pure）`1046 passed / 3 skipped / 0 failed`（`tmp/rb-gate-b.log`）、
+   macOS `972 passed / 74 skipped / 0 failed`（`tmp/rb-macos2.log`）；route-B 专题切片
+   （槽位池 + executor 契约 + T5 + 两份单测）容器实跑 `64 passed`（`tmp/rb-focused.log`）。
+   首次命令延迟代价已实测：租槽位只发生在**每沙箱第一条命令**上
+   （in-process 10.63 ms → route-B 57.11 ms，+46 ms；warm p50 4.29 → 4.35 ms 无差），
+   证据 `tmp/perf/route-b-first-exec.txt`。
+   ⬜ 仍开一项：**删 `mediation_run_as='supervisor'` 降级档** —— 它现在是「route-B 不可用」
+   （现网默认 `E2B_PER_SANDBOX_UID=false` ⇒ 无独立 host uid）时 chroot 形态唯一
+   逃生门，删档要先让 per-sandbox uid 成为部署默认，属独立决策。
+   进度留痕（2026-09-09 早）：fork F16
    ✅、**W1 槽位管理器 ✅（`envd_service/route_b.py` + 契约
    `tests/contract/test_route_b_slot_pool.py`：两个不同 uid 槽位经 SuperviseChannel
    exec，X 建文件属主 X + 自 chmod、Y rm/chmod EPERM —— envd 侧 T5 证据已立）**；剩余
    = executor 全面接线（设计见 `docs/superpowers/plans/2026-09-09-envd-route-b-wiring.md`
-   「后续接线 Task」））——
+   「接线 Task」）——
    fork 侧前置 **F16 已完成（2026-09-08）**：`sandlock_supervise_connect/request/free`
    C ABI + Python `SuperviseChannel`（含 exec 的 SCM_RIGHTS stdio 交接；fork `1159525`/
    `6571c36`、主仓 `f8c4020`，见 #24）。路线：envd 接线与 route-B supervise 部署

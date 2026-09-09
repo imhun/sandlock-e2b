@@ -99,6 +99,65 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   #5 剩余（envd route-B 接线 = 先选 W1/W2 槽位模型）、T1/O1–O3（真实 XFS/部署窗口）、
   fork Task 10/11（推送/PR/ACR 需授权）。
 
+## ⚡ executor 全面走 supervise（2026-09-09，route-B 接线收口 / backlog #5）
+
+chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-supervise` 槽位**上
+（euid == 该沙箱 host uid），路径中介不再是 root worker 进程 ⇒ T5（代打开文件属主
+变 root、1777+sticky per-uid 卷保护失效）在 E2B 侧构造性消失。
+`tests/contract/test_uid_permissions.py` 的 **strict xfail 已摘**。
+
+- **开关**：`E2B_ROUTE_B=auto|on|off` + `E2B_ROUTE_B_SLOTS`（>0 亦为强开信号）+
+  `E2B_ROUTE_B_TMP_ROOT`。`auto` 只在「root worker + `E2B_PER_SANDBOX_UID` + 已分配
+  host_uid + chroot 形态 + wheel 带 supervise」成立时启用；显式 `on`/`SLOTS>0` 而前置
+  不满足 ⇒ 建箱直接报错（route A/B 是部署决策，绝不静默降级）。
+- **实现**：`_build_instance_policy()` 拆出 `_policy_ceiling()`（kwargs）→
+  `route_b.supervise_policy_document()`（`fs_mount` 转 `VIRT:HOST`、丢 `None` 与
+  `mediation_run_as`、未知字段按名拒绝；字段表由单测与 fork
+  `policy.rs::POLICY_FIELDS` 逐名钉住，53 项）；`route_b.RouteBInstance` /
+  `RouteBExecProcess` 复刻 `SandboxInstance`/`ExecProcess` 面
+  （exec/wait_child/kill_child/update_network/shutdown），executor **只剩一条代码路径**；
+  建槽/收槽走 `asyncio.to_thread`（不阻塞事件循环），`_CommandGate` 语义不变。
+- **实现期推翻的两条设计**（详见计划文档「实现期的修正」表）：
+  ① 停车程序不能用 `read x < /dev/zero` —— exec 会话 M0 的 stdio 被 core 固定为
+  `/dev/null`，dash/bash 都会为它跑满一核；改成 `while :; do kill -STOP $$; done`
+  （契约 `test_parked_main_program_costs_nothing` 钉「1 s 墙钟整棵槽位树 ≤2 tick」）。
+  ② 槽位必须**按沙箱自己的 host uid 定向租用**（workspace 已按该 uid chown 0700，
+  换 uid 的槽位连自己沙箱目录都进不去）⇒ route-B 天然要求 per-sandbox uid；
+  uid 台账加锁、进程未确认退出前不归还 uid。
+- **另外三条硬约束**（都进了代码注释 + 部署检查表）：registered 槽位是**单线程串行
+  accept** ⇒ `wait()` 先轮询宿主 pid 消失再发 `wait_child`（`CHILD_POLL_CAP_S` 兜底）；
+  `--serve-path` 先 bind 后 launch ⇒ `acquire` 用 `stats(launched:true)` 做就绪门；
+  fork 里 `SandboxError ⊂ SandlockError` ⇒ 服务端「拒绝」必须先原样抛，否则策略错误
+  会被误判成「槽位死了」并触发无谓重启。
+- **踩到的环境坑（已在池里根治）**：scratch 根若为 0700（pytest `tmp_path`、
+  umask 077 都会）则槽位读不到自己的 policy（`Permission denied`），而 policy 里有
+  egress 代理口令/secret 路径 ⇒ 池现在强制 目录 0755/0711 + 文档 `0440 root:<uid>`。
+- **route-B 反而更强的一点**：`kill_child` 带信号号 ⇒ route-B 子进程
+  `supports_signal_pause=True`（SIGSTOP 真停，进程内后端仍 False/SIGKILL-only）。
+- **仍未删**：`mediation_run_as='supervisor'` 降级档 —— 它现在是「route-B 不可用」
+  （现网默认无 per-sandbox uid；prod compose worker `user: 65534`、k8s worker 无
+  CAP_SETUID）时 chroot 形态唯一逃生门；删档要先让 per-sandbox uid 成为部署默认，
+  属独立决策（backlog #5 已记）。
+- **新增测试**：单测 `tests/unit/test_route_b_wiring.py`（28）+
+  `tests/unit/test_sandlock_executor_route_b.py`（23，FakePool/FakeChannel 注入，
+  macOS 可跑）；契约 `tests/contract/test_route_b_executor.py`（7，root+Linux 实跑：
+  子进程 uid、文件属主+自 chmod、停车零 CPU、PTY 尺寸回读、SIGSTOP/信号退出码 -1、
+  close 后 uid 干净可复用、**单槽位并发命令不互堵**）。
+- **终态门禁（同一棵树复跑）**：gate A（chroot，base=python-mcp:3.14，concurrency=2、
+  strict skips、netns 开）`1048 passed / 2 skipped / 0 failed`（`tmp/rb-gate-a2.log`；
+  本轮早先一次 `1047/2/0` 见 `tmp/rb-gate-a.log`，差额 = 中途新增的那条「单槽位多命令
+  不互堵」契约）；gate B（pure）`1046 passed / 3 skipped / 0 failed`
+  （`tmp/rb-gate-b.log`）；macOS `972 passed / 74 skipped / 0 failed`
+  （`tmp/rb-macos2.log`）；route-B 专题切片（槽位池 2 + executor 契约 7 + T5 4 +
+  两份 route-B 单测 51）容器实跑 `64 passed`（`tmp/rb-focused.log`，同一终态树）。
+  **T5 从此在两份门禁日志里都不再出现 xfail**。
+- **性能（必录）**：租槽位只发生在每沙箱第一条命令 ——
+  in-process first-exec `10.63 ms` → route-B `57.11 ms`（+46 ms：spawn supervise +
+  launch 一代 + 等 registered channel），稳态 exec 无差异
+  （warm p50 `4.29 → 4.35 ms`，n=20）；证据 `tmp/perf/route-b-first-exec.txt`。
+  另注意 route-B 的 `max_lifetime=None` + 常驻 M0 ⇒ core 的 15 min idle reclaim
+  不再触发，沙箱回收完全由 envd 生命周期（TTL/evict/`ctx.shutdown`→`close()`）驱动。
+
 ## ⚡ envd route-B 接线起步（2026-09-09）：W1 槽位管理器 + envd 侧 T5 证据
 
 - **W1 已定**（沿用 2026-09-04 决策；窗口 = 同时在世槽数 N；W2 为可选升级）。
@@ -123,6 +182,8 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   policy→supervise JSON、M0 停车程序、exec/PTY/update_network/pause/收口 verb 面迁移、
   摘 xfail、删 supervisor 降级档。等用户决策/资源的主要是生产 spawner 形态与完整
   executor 迁移的验收窗口。
+  **（本块的「剩余」已在上方「executor 全面走 supervise」块完成 —— 除删 supervisor
+  降级档与生产 spawner 两项，见该块与 backlog #5。）**
 
 ## ⚡ 修复回合 2（2026-09-08）：FUP-23 根因闭环 + 修复，FUP-14 重新上线（终态 fork `e045881` / 代码 `880a1ec` / wheel `d5cab47` 产物）
 
