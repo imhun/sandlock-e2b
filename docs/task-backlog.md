@@ -143,11 +143,21 @@ ACR 镜像推送照常，git 远程推送暂缓。
    实测 foreign uid 21501 直接读出 21500 槽位的 `--token <64hex>` ⇒ **是暴露面**；
    今天不构成攻击面只因为 registered 路径先查 `SO_PEERCRED` ∈ `--peer-uid` 再查 token
    （实测非白名单 uid **带正确 token** 也被静默关连接，连沙箱自己的 uid 都被拒）。
-   登记 fork 侧 **SL-10**（`--token-fd` / `--token-env` / 0400 token 文件三选一）；
-   同一轮实测抓到 **SL-9**：F16 Python 客户端错误分支抛 `AttributeError`
-   （`_take_err_msg` 收到 `ctypes.byref(...)` 却取 `.contents`）⇒ 服务端错误文本全丢，
-   envd 侧已免疫（`RouteBInstance.request` 把非 `SandboxError` 的通道失败统一归类成
-   `SlotDeadError`，单测钉住）。
+   登记 fork 侧 **SL-10**；同一轮实测抓到 **SL-9**（F16 Python 客户端错误分支抛
+   `AttributeError`，`_take_err_msg` 收到 `ctypes.byref(...)` 却取 `.contents`）。
+   ✅ **两条都已闭（2026-09-09，fork F17 `c0f7bf5`）**：选了「给语言面补 transport 1
+   （fd handoff）」这条路 —— C ABI 加 `sandlock_supervise_connect_fd` /
+   `sandlock_supervise_check_fd` / `sandlock_supervise_set_timeout`（request 签名不变、
+   按 handle 分派），Python `SuperviseChannel(fd=...)`；持久单流在 Rust 侧串行 + 失败退役会话；
+   FFI 动态符号 159→162。envd 默认 `E2B_ROUTE_B_TRANSPORT=fd` ⇒ **槽位 argv 里再无 token、
+   `/tmp` 里再无注册 socket**，并白得「worker 崩溃 ⇒ 槽位按 EOF 自收口」的生命周期保证
+   （契约 `test_worker_death_ends_the_generation`）。老 wheel 没有该符号时 `auto` 退回进程内、
+   强开则报错点名重建 wheel —— 不静默改用 token 进 argv 的 registered 形态。
+   顺带修掉一处**发布链陷阱**：`deploy/scripts/build-sandlock-wheels.sh` 跑的是
+   F2b.5 之前的旧配方，产出的 wheel **不含 `sandlock/bin/sandlock-supervise`** 且退出码 0
+   （实测 2.2 MB vs 7.4 MB），route-B 会因此静默失效；现在该脚本委托 fork 的
+   `python/build-wheels.sh`（同批 cross-build supervise + 注入 + HEAD 指纹 manifest +
+   缺件即错），旧 Dockerfile 标 SUPERSEDED。
    ✅ 三档门禁已在终态树上复跑全绿：gate A（chroot，base=python-mcp:3.14，
    concurrency=2）`1048 passed / 2 skipped / 0 failed`（`tmp/rb-gate-a2.log`；
    本轮早先一次 1047/2/0 见 `tmp/rb-gate-a.log`，差额就是新增的那条单槽位并发契约）、

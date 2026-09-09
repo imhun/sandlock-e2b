@@ -99,6 +99,60 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   #5 剩余（envd route-B 接线 = 先选 W1/W2 槽位模型）、T1/O1–O3（真实 XFS/部署窗口）、
   fork Task 10/11（推送/PR/ACR 需授权）。
 
+## ⚡ route-B transport 1：token 从 argv 消失（2026-09-09，SL-10 闭口 / fork F17）
+
+上一块留的「要彻底闭口需 fork 提供 token-by-fd/env」按**给语言面补 transport 1（fd
+handoff）**实现：route-B 槽位的凭证现在是**一条继承来的 unix 描述符**，argv 里没有
+`--token`，`/tmp` 里也没有注册 socket（`sun_path` 108 字节约束随之消失）。
+
+- **fork F17**（`e290059` + `f20d034` + `c0f7bf5`，未推送）：
+  - C ABI 新增 `sandlock_supervise_connect_fd(fd, token, err, err_msg)`（取 fd 的私有
+    dup 作**持久会话**；`token` 可为 NULL）、`sandlock_supervise_check_fd(fd)`（交付前
+    预检 open/`SOCK_STREAM`/`AF_UNIX`）、`sandlock_supervise_set_timeout(h, ms, ...)`
+    （`0`=一直等）；`sandlock_supervise_request` 签名不变、按 handle 形状分派 ⇒ Python
+    面只有一个类：`SuperviseChannel(fd=..., token="", timeout_ms=...)` +
+    `check_control_fd(fd)`。FFI 动态符号 **159 → 162**。
+  - 持久单流两条纪律在 Rust 侧：handle 内互斥锁串行所有 verb；任一 verb 失败即
+    **退役会话**（后续调用点名 `frame alignment`）⇒ 新会话默认仍是 fail-fast 的
+    `CHANNEL_REQUEST_TIMEOUT`（提为常量 + `channel_request_with_fds_timeout`），
+    要 park 必须显式 `set_timeout(0)`。
+  - **修 SL-9**：`_take_err_msg` 对 `ctypes.byref(...)` 取 `.contents` ⇒ 每个
+    transport 失败都抛 `AttributeError` 并吞掉服务端文本；改为按地址读+释放。
+    E2B 侧同时加免疫（非服务端 `SandboxError` 的通道失败一律归成 `SlotDeadError`）。
+  - **附带硬化**：`serve_control_fd` 在启动实例前把 `FD_CLOEXEC` 置回（否则主管自己的
+    控制端可能被 `sandlock-init` 及以下继承 = SL-4 同族）。**实测本树未观察到泄漏**
+    （fix 前后 `/proc/<stats.pid>/fd` 比对结果相同），所以这是护栏不是 bug 复现，
+    已钉成 fork 用例。
+- **envd 侧**：`W1SlotPool` 默认 `transport="fd"`（`socketpair()` + `pass_fds` 同号交付
+  `--control-fd N --serve`）；新开关 `E2B_ROUTE_B_TRANSPORT=fd|path`、
+  `E2B_ROUTE_B_VERB_TIMEOUT_S`（默认 15 s，动词超时即退役会话 ⇒ 按死箱重启一次）；
+  池缓存键含 transport；`--peer-uid` 只在 `path` 形态相关。
+  **白得的收口保证**：worker 崩溃 ⇒ 通道 EOF ⇒ 槽位按 `finish()` 异常收口自杀
+  （registered 形态下 socket 比 worker 活得久）。
+- **两条被实测纠正的判断（都写进文档与注释）**：
+  ① 先前记「跨 uid 读 `/proc/<pid>/cmdline` 需要 ptrace 权限」是**错的** —— cmdline 0444
+  且不受该门约束（`environ` 才 0400），这正是 SL-10 值得修的理由；
+  ② 「槽位随 worker 死掉即消失」不能用 `/proc/<pid>` 存在性判定 —— 容器 pid 1 未必及时回收
+  孤儿，退出的槽位会以 **zombie** 形式保留 `/proc` 条目（fork 门禁同一条环境注记）。
+  契约改成 `_proc_state()`：running / zombie / gone 三态，断言「不再 running」+ 整棵树。
+- **踩到并修掉的构建链陷阱**：`deploy/scripts/build-sandlock-wheels.sh` 跑的是
+  `third_party/sandlock-wheel-builder/Dockerfile` —— 那是 **F2b.5 之前**的旧配方，
+  产出的 wheel **不含 `sandlock/bin/sandlock-supervise`**（本次实测 2.2 MB vs 正确 7.4 MB），
+  而且**退出码 0**：装上后 route-B 只会静默退回进程内后端。现该脚本改为委托
+  fork 的 `python/build-wheels.sh`（它同批 cross-build supervise、注入 wheel、
+  写 HEAD 钉住的 `SHA256SUMS.supervise`，缺任何一件**就地报错**），旧配方文件头标
+  SUPERSEDED。wheel 复验：`162 == 162` 双向符号相等、supervise 指纹与 manifest
+  一致、mode 755、`--uid` 拒绝冒烟过。
+- **门禁（终态）**：fork 非 root 8 档 core_lib 841 / core_integ 534 / ffi 101 / cli 100 /
+  supervise 42 / supervise_cost 3 / cli_build 0 / **python 461**；root 三档 oci 150 /
+  supervise_root 4 / mediation_2uid 10（全部「matches baseline」）。
+  E2B（同一棵树 + 同一批 wheel）：gate A `1054 passed / 2 skipped / 0 failed`
+  （`tmp/rb-f17r2-gate-a.log`）、gate B `1053 / 3 / 0`（`tmp/rb-f17r2-gate-b.log`）、
+  route-B 专题切片（槽位池 + executor 契约 + T5 + 两份单测）**`70 passed`**
+  （`tmp/rb-f17-focused.log`）、macOS `977 passed / 75 skipped / 0 failed`
+  （`tmp/rb-f17-macos2.log`）。r1 一轮（加 fd-client 守卫之前）在
+  `tmp/rb-f17-gate-a.log` / `tmp/rb-f17-gate-b.log`，同样 0 failed。
+
 ## ⚡ executor 全面走 supervise（2026-09-09，route-B 接线收口 / backlog #5）
 
 chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-supervise` 槽位**上
