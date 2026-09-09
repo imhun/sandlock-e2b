@@ -1,3 +1,13 @@
+# SUPERSEDED (2026-09-09): do not use this recipe to build a release.
+# It predates F2b.5 and therefore ships no `sandlock-supervise`: wheels
+# built here install cleanly but lack `sandlock/bin/sandlock-supervise`,
+# so route B silently declines to start a slot and the worker keeps the
+# in-process mediator. The wheel pipeline is the fork's
+# `python/build-wheels.sh` (+ `python/wheel-builder/`), which builds the
+# supervise binary in the same run, injects it, writes the HEAD-pinned
+# `SHA256SUMS.supervise` manifest, and fails loudly if any of that is
+# missing. `deploy/scripts/build-sandlock-wheels.sh` now delegates there.
+# Kept only as history of the pre-submodule builder.
 # Cross-compile the sandlock fork wheel (0.9.0-beta) for BOTH linux/amd64 and
 # linux/arm64 inside a pypa manylinux_2_34 builder, then auditwheel-repair
 # both wheels to manylinux_2_34_* tags. zig is the Rust cross-linker, so the

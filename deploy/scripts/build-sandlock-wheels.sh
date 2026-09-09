@@ -1,42 +1,49 @@
 #!/bin/sh
-# Cross-compile the sandlock fork wheels (manylinux_2_34 for amd64 + arm64)
-# with zig inside a pypa manylinux_2_34 builder and land them in wheels/fork/.
-# Runs in one native builder — no QEMU, no native arm64 node — so both wheels
-# build in a single pass, then auditwheel verifies/repairs the manylinux tag.
+# E2B-side entry point for the sandlock fork wheels that the service images
+# install (`wheels/fork/`, git-ignored build output).
 #
-# Requires the sandlock fork submodule at third_party/sandlock
-# (`git submodule update --init`) and the builder files under
-# third_party/sandlock-wheel-builder/ (both versioned in this repo).
+# The wheel pipeline itself lives in the fork -- `python/build-wheels.sh` plus
+# `python/wheel-builder/` -- because a release wheel has to carry more than the
+# FFI extension: F2b.5 cross-builds the `sandlock-supervise` release binary in
+# the same builder, injects it as `sandlock/bin/sandlock-supervise` after
+# auditwheel repair (RECORD rewritten, exec bit restored), and writes the
+# HEAD-pinned `SHA256SUMS.supervise` manifest that `python/verify-wheel.sh`
+# checks against both copies. So this script only delegates, with the artifacts
+# landing here.
+#
+# It used to run its own buildx recipe (`third_party/sandlock-wheel-builder/`),
+# which predates F2b.5 and produces wheels *without* the supervise binary -- and
+# did so with exit code 0. Measured 2026-09-09: such a wheel installs fine but
+# `sandlock/bin/sandlock-supervise` is missing, so route B quietly refuses to
+# start a slot and the worker keeps the in-process mediator (i.e. silently loses
+# the T5 ownership fix). Anything that can half-build the release must not be a
+# second code path; the fork's script also fails loudly if supervise is absent.
 #
 # Usage:
 #   ./deploy/scripts/build-sandlock-wheels.sh
 #
-# Environment:
-#   PLATFORM    buildx platform for the native builder (default: host arch)
-#   BUILDER     buildx builder name (default: multiarch)
-#   BASE_IMAGE  manylinux builder image (default: host-arch manylinux_2_28)
+# Environment (passed through to the fork's script):
+#   PLATFORM / BUILDER / BASE_IMAGE   see third_party/sandlock/python/build-wheels.sh
 set -eu
+cd "$(dirname "$0")/../.."                       # repo root
+FORK="third_party/sandlock"
 
-BUILDER="${BUILDER:-multiarch}"
+if [ ! -f "$FORK/python/build-wheels.sh" ]; then
+    echo "build-sandlock-wheels: $FORK is not populated." >&2
+    echo "  run: git submodule update --init --recursive" >&2
+    exit 1
+fi
 
-case "$(uname -m)" in
-    x86_64)
-        PLATFORM="${PLATFORM:-linux/amd64}"
-        BASE_IMAGE="${BASE_IMAGE:-quay.io/pypa/manylinux_2_34_x86_64}" ;;
-    arm64 | aarch64)
-        PLATFORM="${PLATFORM:-linux/arm64}"
-        BASE_IMAGE="${BASE_IMAGE:-quay.io/pypa/manylinux_2_34_aarch64}" ;;
-    *)
-        PLATFORM="${PLATFORM:-linux/amd64}"
-        BASE_IMAGE="${BASE_IMAGE:-quay.io/pypa/manylinux_2_28_x86_64}" ;;
-esac
+mkdir -p wheels/fork tmp
+OUT_DIR="$PWD/wheels/fork" \
+CONTEXT_DIR="${CONTEXT_DIR:-$PWD/tmp/wheel-context}" \
+    sh "$FORK/python/build-wheels.sh"
 
-echo "==> cross-building sandlock wheels ($PLATFORM builder, targets amd64+arm64, manylinux_2_34)"
-docker buildx build --builder "$BUILDER" --platform "$PLATFORM" \
-    --build-arg BASE_IMAGE="$BASE_IMAGE" \
-    -f third_party/sandlock-wheel-builder/Dockerfile \
-    -o type=local,dest=wheels/fork \
-    .
-
-echo "==> wheels in wheels/fork/:"
+echo "==> E2B wheel inputs refreshed in wheels/fork/:"
 ls -lh wheels/fork/*.whl
+ls -l  wheels/fork/supervise/*/sandlock-supervise
+if [ ! -f wheels/fork/supervise/x86_64/sandlock-supervise ] \
+   || [ ! -f wheels/fork/supervise/aarch64/sandlock-supervise ]; then
+    echo "build-sandlock-wheels: supervise binaries missing from wheels/fork/" >&2
+    exit 1
+fi
