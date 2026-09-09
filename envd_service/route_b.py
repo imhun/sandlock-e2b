@@ -947,13 +947,20 @@ class RouteBInstance:
             # subclass of ``SandlockError`` in this fork, so the order of the
             # two handlers below is load-bearing.
             raise
-        except SandlockError as exc:
-            # Transport level: the slot stopped answering (killed, crashed,
-            # or its socket removed). Same treatment as a dead in-process
+        except (SandlockError, OSError, AttributeError) as exc:
+            # Transport level: the slot stopped answering (killed, crashed, or
+            # its socket removed). Same treatment as a dead in-process
             # instance -- the executor rebuilds once.
+            #
+            # ``OSError``/``AttributeError`` are listed because the F16 client's
+            # own error path cannot build its exception (it hands
+            # ``ctypes.byref(...)`` to a helper that dereferences ``.contents``,
+            # so a refused connect surfaces as ``AttributeError`` and hides the
+            # server's text). Classified here rather than propagated as an
+            # opaque error; registered as fork issue SL-9.
             raise SlotDeadError(
                 f"route-B instance {self.name} is dead: verb "
-                f"{verb!r} lost the slot: {exc}"
+                f"{verb!r} lost the slot: {type(exc).__name__}: {exc}"
             ) from exc
 
     def exec(

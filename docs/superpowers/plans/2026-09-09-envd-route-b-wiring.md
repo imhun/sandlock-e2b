@@ -123,9 +123,23 @@ acquire 重新生成；socket =
    由 worker 现有机制调 `executor.close()` → `shutdown` verb 收口。
 8. **一 uid 一代沙箱（W1）**：`release` 后同一 uid 可再租（重启进程，clean slate）；
    槽位进程活着时**拒绝**第二个沙箱同 uid 租用。
-9. `/proc/<pid>/cmdline` 里有 token：跨 uid 读它需要 ptrace 权限（foreign uid 默认
-   被拒），同沙箱内进程能读到自家 token（等于拿到自己 ceiling 内的 exec 权，不提权）。
-   要彻底闭口需 fork 侧提供 token-by-fd/env（已登记为 fork 后续项）。
+9. **channel token 在 supervise 的 argv 里 ⇒ 本机任何 uid 都能看到**（实测 2026-09-09，
+   见下「token 暴露面实测」）：`/proc/<pid>/cmdline` 是 0444、**不受 ptrace 门约束**
+   （`environ` 才是 0400 被挡），foreign uid 直接读到 `--token <64hex>` 与 socket 路径。
+   它之所以**今天还不构成攻击面**：registered 路径的鉴权顺序是
+   ①`SO_PEERCRED` ∈ `--peer-uid` 白名单（不在名单里直接静默关连接、不发响应、不记日志）
+   ②才是 token。实测槽位（白名单只有 worker uid 0）：
+   | 客户端身份 | token | 结果 |
+   |---|---|---|
+   | uid 0（在白名单） | 正确 | 正常服务（`instance_state=Live`） |
+   | uid 0 | 错误 | `SandboxError: requires a valid channel token` |
+   | uid 21501（别的租户） | **正确** | 连接被静默关闭（拿不到任何 verb） |
+   | uid 21500（沙箱自己，token 就在它的可见 argv 里） | 正确 | 同上，被拒 |
+   ⇒ 只有「能以白名单 uid 起进程」才用得上偷到的 token，而那种身份本来就有 worker 权限。
+   **但这仍是必须记录的暴露面**：任何一次 `ps`/coredump/审计日志都会把 token 落到别人眼前，
+   且 `--peer-uid` 一旦配宽（比如把某个共享 uid 放进白名单）就立刻变成真漏洞。
+   闭口方案见 `docs/sandlock-upstream-issues.md` SL-10（fork 侧需要动，envd 侧已把
+   「不是服务端拒绝」统一归类成槽位失效）。
 
 ## 测试（Task 1）
 

@@ -134,6 +134,22 @@ chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-s
   egress 代理口令/secret 路径 ⇒ 池现在强制 目录 0755/0711 + 文档 `0440 root:<uid>`。
 - **route-B 反而更强的一点**：`kill_child` 带信号号 ⇒ route-B 子进程
   `supports_signal_pause=True`（SIGSTOP 真停，进程内后端仍 False/SIGKILL-only）。
+- **口径更正（重要，实测推翻本块上一版的一句结论）**：本块初版写「token 在 argv 里，
+  但跨 uid 读 `/proc/<pid>/cmdline` 需要 ptrace 权限 ⇒ 租户读不到」—— **错的**。
+  特权容器实测（`tmp/rb_token_probe.py`）：`cmdline` 是 0444 且**不走** ptrace 门
+  （只有 `environ` 0400 被挡），foreign uid 21501 直接读出 21500 槽位的
+  `--token <64hex>`。真正挡住攻击的是 registered 路径的鉴权顺序
+  ①`SO_PEERCRED` ∈ `--peer-uid`（不在名单里静默关连接）②token —— 实测非白名单 uid
+  **即使带正确 token** 也拿不到任何 verb，连沙箱自己的 uid 都被拒。
+  所以结论从「不是暴露面」改成「**是暴露面，但被 peer 白名单兜住；配置漂移即成真漏洞**」，
+  登记为 fork 侧 SL-10（`--token-fd` / `--token-env` / token 文件三选一）。
+- **顺带抓到 fork 一个真 bug（SL-9）**：F16 Python 客户端 `_take_err_msg` 的错误分支
+  必坏（调用点传 `ctypes.byref(...)`，helper 却取 `.contents`）⇒ 任何 connect/transport
+  失败抛 `AttributeError` 而不是 `SandlockError`，服务端错误文本全丢。
+  envd 侧已免疫：`RouteBInstance.request` 把 `SandlockError`/`OSError`/`AttributeError`
+  一并归类成 `SlotDeadError`（只放行服务端 `SandboxError`），单测
+  `test_a_client_side_channel_failure_is_not_a_policy_refusal` 钉住。
+  fork 侧修法（≈10 行 + 1 条回归用例）与影响见 `docs/sandlock-upstream-issues.md` SL-9。
 - **仍未删**：`mediation_run_as='supervisor'` 降级档 —— 它现在是「route-B 不可用」
   （现网默认无 per-sandbox uid；prod compose worker `user: 65534`、k8s worker 无
   CAP_SETUID）时 chroot 形态唯一逃生门；删档要先让 per-sandbox uid 成为部署默认，

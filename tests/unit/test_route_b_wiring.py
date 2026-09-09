@@ -632,6 +632,31 @@ def test_transport_loss_is_reported_as_a_dead_instance(tmp_path):
         inst.exec(["/bin/true"], 1)
 
 
+def test_a_client_side_channel_failure_is_not_a_policy_refusal(tmp_path):
+    """The F16 client's error path is broken (it raises ``AttributeError``
+    instead of ``SandlockError`` on a refused connect), and a broken channel
+    must still read as "slot dead" rather than as an opaque failure or as a
+    served refusal: the executor's rebuild-once keys off the dead class.
+    """
+
+    class _BrokenChannel:
+        def __init__(self, path, token):
+            pass
+
+        def request(self, verb, args=None, fds=()):
+            raise AttributeError(
+                "'_ctypes.CArgObject' object has no attribute 'contents'"
+            )
+
+        def close(self):
+            pass
+
+    inst, log, handle = _instance(tmp_path)
+    inst._channel_factory = _BrokenChannel
+    with pytest.raises(SlotDeadError, match="lost the slot: AttributeError"):
+        inst.request("stats")
+
+
 def test_verbs_after_close_never_reach_a_released_slot(tmp_path):
     inst, log, handle = _instance(
         tmp_path, {"shutdown": {}, "exec": {"child_id": 1, "pid": 1}}

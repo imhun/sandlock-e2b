@@ -138,6 +138,16 @@ ACR 镜像推送照常，git 远程推送暂缓。
    其余 5 条约束（串行 accept、先 bind 后 launch、scratch 目录可遍历性 +
    文档 0440 root:uid、`SandboxError ⊂ SandlockError` 的捕获顺序、token 走 argv）
    见 `docs/superpowers/plans/2026-09-09-envd-route-b-wiring.md` 文末表。
+   ⚠️ 其中「token 走 argv」一条本块初版的判断被实测推翻，已更正：
+   `/proc/<pid>/cmdline` 是 0444 且**不受 ptrace 门约束**（只有 `environ` 0400 被挡），
+   实测 foreign uid 21501 直接读出 21500 槽位的 `--token <64hex>` ⇒ **是暴露面**；
+   今天不构成攻击面只因为 registered 路径先查 `SO_PEERCRED` ∈ `--peer-uid` 再查 token
+   （实测非白名单 uid **带正确 token** 也被静默关连接，连沙箱自己的 uid 都被拒）。
+   登记 fork 侧 **SL-10**（`--token-fd` / `--token-env` / 0400 token 文件三选一）；
+   同一轮实测抓到 **SL-9**：F16 Python 客户端错误分支抛 `AttributeError`
+   （`_take_err_msg` 收到 `ctypes.byref(...)` 却取 `.contents`）⇒ 服务端错误文本全丢，
+   envd 侧已免疫（`RouteBInstance.request` 把非 `SandboxError` 的通道失败统一归类成
+   `SlotDeadError`，单测钉住）。
    ✅ 三档门禁已在终态树上复跑全绿：gate A（chroot，base=python-mcp:3.14，
    concurrency=2）`1048 passed / 2 skipped / 0 failed`（`tmp/rb-gate-a2.log`；
    本轮早先一次 1047/2/0 见 `tmp/rb-gate-a.log`，差额就是新增的那条单槽位并发契约）、
