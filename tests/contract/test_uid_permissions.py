@@ -10,6 +10,12 @@ Covers the two worker-visible contracts:
   uid owning a stale workspace with no record) without touching live ones.
 
 Requires a root worker + sandlock (the privileged S1.2 RunAs path).
+
+The image-rootfs (chroot) shape of the ownership assertions below is the T5
+regression suite: there mediation runs in a ``sandlock-supervise`` slot whose
+euid *is* the sandbox host uid (route B, ``envd_service/route_b.py``) instead
+of in the root worker process, so a mediated write lands owned by the sandbox
+in both shapes.
 """
 
 from __future__ import annotations
@@ -96,18 +102,6 @@ def _result(messages) -> tuple[int, bytes, bytes]:
     return ends[0]["event"]["end"]["exitCode"], stdout, stderr
 
 
-@pytest.mark.xfail(
-    bool(os.environ.get("E2B_BASE_IMAGE")),
-    reason=(
-        "image-rootfs (chroot) shape: the first shared-volume write fails "
-        "with Permission denied under the supervisor mediation tier "
-        "(observed on the F10b wheel 2026-09-06: on-behalf open-path "
-        "semantics differ from the pure shape; SL-1 family). Expected until "
-        "route-B supervise deployment (euid == sandbox host uid); "
-        "docs/HANDOFF.md, open item T5"
-    ),
-    strict=True,
-)
 async def test_volume_shared_rw_across_distinct_uids(make_apps, workspace):
     control, envd = make_apps(envd_settings=_envd_settings(workspace))
     async with httpx.AsyncClient(
@@ -189,8 +183,10 @@ async def test_volume_shared_rw_across_distinct_uids(make_apps, workspace):
         # The protection is a kernel DAC decision: the sticky bit denies B the
         # unlink because A owns the file, so the storage has to have recorded
         # A's sandbox host uid as the owner. Assert that instead of assuming it
-        # -- the same measurement is what surfaces T5 in the image-rootfs
-        # shape, where it is tracked by the xfail mark on this test.
+        # -- the measurement that used to surface T5 in the image-rootfs
+        # shape (supervisor-tier mediation attributed the write to the worker
+        # instead); route B leases a supervise slot at this sandbox's own host
+        # uid for that shape, so the same assertion now holds in both shapes.
         assert written_by == ra.host_uid, (
             f"sandbox writes landed owned by uid {written_by}, not the sandbox "
             f"host uid {ra.host_uid}: per-uid isolation is not in effect"

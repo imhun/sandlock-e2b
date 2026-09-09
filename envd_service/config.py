@@ -174,6 +174,38 @@ class Settings:
     uid_reconcile_on_startup: bool = field(
         default_factory=lambda: _env_bool("E2B_UID_RECONCILE_ON_STARTUP", True)
     )
+    # Route B (backlog #5 / T5): run each sandbox's path mediator as its own
+    # ``sandlock-supervise`` process whose euid IS the sandbox host uid, so
+    # mediated (``fs_denied`` carve-out) writes are owned by the sandbox and
+    # 1777+sticky per-uid volume protection holds. ``auto`` starts a slot for
+    # every sandbox that has its own host uid *and* the chroot (image-rootfs)
+    # policy -- the only shape where mediation is active; ``on`` also covers
+    # the pure shape; ``off`` keeps the in-process ``SandboxInstance``.
+    # Starting a slot at another uid needs a privileged starter, so a non-root
+    # worker stays on the in-process path in ``auto``/``off`` and fails loudly
+    # in ``on`` (route A vs route B is a deployment decision, never a silent
+    # downgrade -- docs/supervise-identity-handoff.md §8).
+    route_b: str = field(
+        default_factory=lambda: os.getenv("E2B_ROUTE_B", "auto").lower()
+    )
+    # Maximum live slots. W1 recycle semantics: one uid = one supervise
+    # process = one sandbox generation, and reuse means restarting in place,
+    # so the uid-reuse window is the number of concurrently live slots
+    # (docs/superpowers/plans/2026-09-09-envd-route-b-wiring.md). ``0`` means
+    # "no extra cap": the per-sandbox host uid pool bounds concurrency by
+    # construction, and ``E2B_ROUTE_B_SLOTS>0`` is also an explicit opt-in for
+    # shapes ``auto`` would leave on the in-process path.
+    route_b_slots: int = field(
+        default_factory=lambda: _env_int("E2B_ROUTE_B_SLOTS", 0)
+    )
+    # Scratch root for the per-slot policy/program documents (never the
+    # channel path: the registered socket lives in the fork's per-uid
+    # registry, /tmp/sandlock-ctl-<uid>-registry).
+    route_b_tmp_root: Path = field(
+        default_factory=lambda: Path(
+            os.getenv("E2B_ROUTE_B_TMP_ROOT", "/tmp/sandlock-route-b")
+        ).resolve()
+    )
     # Quota maintenance (E2.4): periodic over-limit + disk watermark scans and
     # startup orphan project reconciliation.
     quota_monitor_interval_s: float = field(

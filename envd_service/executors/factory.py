@@ -68,6 +68,7 @@ def create_executor(
             logger.warning("Landlock ABI < 6 on Linux; falling back to local executor")
         else:
             from envd_service.executors.sandlock import SandlockExecutor
+            from envd_service.route_b import RouteBConfig
 
             if base_image:
                 image_rootfs = resolve_image_rootfs(
@@ -103,6 +104,7 @@ def create_executor(
                 extra_fs_writable=extra_fs_writable,
                 fs_mounts=fs_mounts,
                 sandbox_id=sandbox_id,
+                route_b=RouteBConfig.from_settings(settings),
             )
 
     logger.info("using local executor for sandbox %s", workspace_dir)

@@ -1,11 +1,16 @@
 """Sandlock executor: Landlock + seccomp-bpf + seccomp user notification.
 
 Requires Linux with Landlock ABI >= 6 and ``sandlock==0.9.0-beta``. Each
-executor holds one lazily-created ``SandboxInstance``; every command execs
-onto it (``start()`` -> ``instance.exec``) with per-exec cwd/env/clean_env
-and optional native pty stdio, while the policy ceiling (fs/chroot/network/
-limits) is fixed at instance creation (M4 D1-D3). Non-Linux hosts import
-nothing and ``start()`` raises unimplemented.
+executor holds one lazily-created exec instance; every command execs onto it
+(``start()`` -> ``instance.exec``) with per-exec cwd/env/clean_env and
+optional pty stdio, while the policy ceiling (fs/chroot/network/limits) is
+fixed at instance creation (M4 D1-D3). Non-Linux hosts import nothing and
+``start()`` raises unimplemented.
+
+The instance is either in-process (``sandlock.SandboxInstance``) or a
+route-B ``sandlock-supervise`` slot running as the sandbox's own host uid,
+where path mediation and DAC ownership are correct by construction
+(``envd_service/route_b.py``, backlog #5 / T5).
 """
 
 from __future__ import annotations
@@ -22,6 +27,13 @@ from pathlib import Path
 from gateway_common.errors import ConnectError, unimplemented
 from gateway_common.network import NetworkUpdateConflictError
 from envd_service.executors.base import ExecConfig, Executor, RunningProcess
+from envd_service.route_b import (
+    RouteBConfig,
+    RouteBInstance,
+    SlotDeadError,
+    supervise_policy_document,
+    slot_pool_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +106,7 @@ class SandlockRunningProcess(RunningProcess):
         stdin_queue: asyncio.Queue,
         pty_mode: bool = False,
         on_exit=None,
+        signal_pause_supported: bool | None = None,
     ) -> None:
         self._proc = proc
         self._queue = queue
@@ -107,6 +120,10 @@ class SandlockRunningProcess(RunningProcess):
         self._closed = False
         self._stdin_closed = False
         self._eof_count = 0
+        if signal_pause_supported is not None:
+            # Instance-level override of the class flag: a route-B child can
+            # be signalled by number, an in-process one cannot.
+            self.supports_signal_pause = signal_pause_supported
 
     @property
     def pid(self) -> int:
@@ -207,13 +224,20 @@ class SandlockRunningProcess(RunningProcess):
     supports_signal_pause = False
 
     def kill(self, sig: int) -> None:
-        # The fork registry delivers SIGKILL to the child's whole command
-        # subtree regardless of the requested signal. ``supports_signal_pause``
-        # is False above, so ProcessManager's pause/resume fallback skips
-        # this child with a WARNING instead of routing a SIGSTOP/SIGCONT
-        # through this kill (FUP #8).
+        # In-process: the fork registry delivers SIGKILL to the child's whole
+        # command subtree regardless of the requested signal, so
+        # ``supports_signal_pause`` stays False and ProcessManager's
+        # pause/resume fallback skips such a child with a WARNING instead of
+        # turning a pause into a kill (FUP #8).
+        #
+        # Route B: ``kill_child`` carries the signal number through the slot's
+        # registered pidfd, so the requested signal really arrives and
+        # pause/resume may use it.
         try:
-            self._proc.kill()
+            if self.supports_signal_pause:
+                self._proc.kill(sig)
+            else:
+                self._proc.kill()
         except Exception:
             pass
 
@@ -242,18 +266,29 @@ class SandlockRunningProcess(RunningProcess):
 
 
 class SandlockExecutor(Executor):
-    """Holds one lazily-created ``sandlock.SandboxInstance`` per executor.
+    """Holds one lazily-created exec instance per sandbox.
 
     M4 D1-D3: the instance is created on first ``_ensure_instance()`` with a
     stable ``sandbox_id``-derived name and the command-independent policy
-    ceiling from ``_build_instance_policy()`` (rebuilt exactly once after a
+    ceiling from ``_policy_ceiling()`` (rebuilt exactly once after a
     closed/dead launch), and released by ``close()``. Every ``start()``
     execs onto that instance with per-exec cwd/env/clean_env/bind_ports and
-    native PIPED/PTY stdio. On non-Linux hosts sandlock is unavailable and
-    the instance stays ``None`` (D11).
+    PIPED/PTY stdio. On non-Linux hosts sandlock is unavailable and the
+    instance stays ``None`` (D11).
+
+    The instance has two interchangeable backends, chosen once per sandbox by
+    :meth:`_route_b_selected`: the **in-process** ``sandlock.SandboxInstance``
+    (the mediator is the worker process), or a **route-B** ``sandlock-supervise``
+    slot leased from :mod:`envd_service.route_b` (the mediator is a process
+    whose euid *is* this sandbox's host uid, so mediated path operations land
+    with the sandbox's own ownership). Route B speaks the same
+    ``exec``/``wait_child``/``kill_child``/``update_network``/``shutdown`` verb
+    surface through :class:`~envd_service.route_b.RouteBInstance`, which
+    mirrors ``SandboxInstance`` -- everything below is one code path.
     """
 
     _non_root_fallback_warned = False
+    _route_b_no_starter_warned = False
 
     def __init__(
         self,
@@ -283,6 +318,7 @@ class SandlockExecutor(Executor):
         extra_fs_writable: list[str] | None = None,
         fs_mounts: dict[str, str] | None = None,
         sandbox_id: str | None = None,
+        route_b: RouteBConfig | None = None,
     ) -> None:
         self._workspace_dir = workspace_dir
         self._base_image = base_image
@@ -322,6 +358,12 @@ class SandlockExecutor(Executor):
         self._extra_fs_writable = list(extra_fs_writable or [])
         self._fs_mounts = dict(fs_mounts or {})
         self._sandbox_id = sandbox_id
+        # Route B (one ``sandlock-supervise`` per sandbox, euid == the
+        # sandbox's host uid). ``None`` / ``off`` keeps the in-process
+        # instance; the decision itself is made once here because every input
+        # (shape, uid, platform, starter privilege) is fixed at construction.
+        self._route_b = route_b
+        self._route_b_active = self._route_b_selected()
         self._instance = None
         self._instance_name: str | None = None
         # Set by ``close()`` (the single shutdown point). Guards the
@@ -437,6 +479,21 @@ class SandlockExecutor(Executor):
                 )
                 raise
             reason = "closed" if "closed" in message else "dead"
+            if self._route_b_active:
+                # Rebuilding here would spawn a supervise process on the event
+                # loop (this method is synchronous). Refuse instead: the
+                # executor's own policy copy stays untouched, so the record and
+                # the runtime never diverge, and the next exec rebuilds the
+                # slot off the loop with whatever network state is current.
+                logger.warning(
+                    "route-B instance %s during network update; refusing the "
+                    "update instead of restarting the slot from the request "
+                    "path sandbox_id=%s instance_name=%s",
+                    reason,
+                    self._sandbox_id or "-",
+                    self.instance_name,
+                )
+                raise
             logger.info(
                 "sandlock instance %s during network update; rebuilding once "
                 "sandbox_id=%s instance_name=%s",
@@ -532,6 +589,179 @@ class SandlockExecutor(Executor):
 
         return "sbx_" + hashlib.sha256(sid.encode()).hexdigest()[:16]
 
+    def _route_b_selected(self) -> bool:
+        """Decide once whether this sandbox's commands run on a supervise slot.
+
+        Route B needs a *per-sandbox host uid*: the slot process **is** that
+        uid (``docs/supervise-identity-handoff.md`` §5), and W1 forbids two
+        live generations on one uid, so a shared-uid sandbox cannot have a
+        slot. It also needs the native library, the ``sandlock-supervise``
+        binary the wheel ships, and a starter that can drop privileges.
+
+        ``auto`` applies it where it matters: the chroot (image-rootfs) shape
+        is the only one where ``fs_denied`` mediation runs, and mediating as
+        the sandbox's own uid is exactly what fixes the supervisor-owned
+        writes behind T5. ``E2B_ROUTE_B_SLOTS>0`` or ``E2B_ROUTE_B=on`` asks
+        for the slot in every shape instead. An operator who explicitly asked
+        for route B and cannot get it fails loudly -- route A vs route B is a
+        deployment decision, never a silent downgrade (§8).
+        """
+        cfg = self._route_b
+        if cfg is None or cfg.mode == "off" or sandlock is None:
+            return False
+        forced = cfg.mode == "on" or cfg.slots > 0
+        mediation_shape = bool(self._base_image and self._image_rootfs is not None)
+        if not (forced or mediation_shape):
+            return False
+        if not self._per_sandbox_uid or self._host_uid is None:
+            if forced:
+                raise RuntimeError(
+                    "route B was requested (E2B_ROUTE_B=on / E2B_ROUTE_B_SLOTS>0) "
+                    "but this sandbox has no per-sandbox host uid: a "
+                    "sandlock-supervise slot runs as the sandbox's own uid, so "
+                    "E2B_PER_SANDBOX_UID and an allocated host_uid are required"
+                )
+            return False
+        if not cfg.privileged_starter:
+            if forced:
+                raise RuntimeError(
+                    "route B was requested but this worker cannot start a slot "
+                    f"as uid {self._host_uid} (needs root / CAP_SETUID or an "
+                    "injected launcher spawner)"
+                )
+            if not type(self)._route_b_no_starter_warned:
+                type(self)._route_b_no_starter_warned = True
+                logger.warning(
+                    "route B unavailable for sandbox_id=%s: a slot must be "
+                    "started as the sandbox host uid and this worker is not "
+                    "privileged; mediation stays on the in-process "
+                    "supervisor tier (T5 owner semantics apply)",
+                    self._sandbox_id or "-",
+                )
+            return False
+        from envd_service.route_b import default_supervise_bin
+
+        if not default_supervise_bin().exists():
+            if forced:
+                raise RuntimeError(
+                    f"route B was requested but {default_supervise_bin()} is "
+                    "missing (the sandlock wheel ships the supervise binary)"
+                )
+            logger.warning(
+                "route B unavailable: %s missing from the sandlock wheel; "
+                "running the in-process instance",
+                default_supervise_bin(),
+            )
+            return False
+        return True
+
+    def _slot_key(self) -> str:
+        """The pool key for this sandbox (slots are leased per sandbox)."""
+        return self._sandbox_id or self.instance_name
+
+    def _open_route_b_instance(self):
+        """Lease this sandbox's slot and wrap it in the instance shim.
+
+        The ceiling travels as a full-field ``--policy`` document (the same
+        field set the in-process builder gets, in wire spellings), and the
+        generation's main program is the parking shell: an envd instance has
+        no main process, but launch-first is what brings the slot's session up
+        and the generation ends when that process ends.
+        """
+        cfg = self._route_b
+        document = supervise_policy_document(self._policy_ceiling())
+        pool = slot_pool_for(cfg)
+        uid = self._host_uid
+
+        def _start():
+            return pool.acquire_sync(
+                self._slot_key(),
+                document,
+                uid=uid,
+                name=self.instance_name,
+            )
+
+        try:
+            handle = _start()
+        except SlotDeadError as exc:
+            if self._closed:
+                raise
+            # W1 recycles a uid by restarting its process, so a slot that died
+            # on the way up is restarted exactly once here; a second failure
+            # surfaces unchanged.
+            logger.info(
+                "route-B slot for sandbox_id=%s failed to start (%s); "
+                "restarting once",
+                self._sandbox_id or "-",
+                exc,
+            )
+            handle = _start()
+        logger.info(
+            "route-B instance ready sandbox_id=%s instance_name=%s uid=%s "
+            "slot=%s sock=%s",
+            self._sandbox_id or "-",
+            self.instance_name,
+            uid,
+            handle.name,
+            handle.sock_path,
+        )
+        return RouteBInstance(pool=pool, handle=handle, name=self.instance_name)
+
+    async def _ensure_instance_async(self):
+        """:meth:`_ensure_instance` without ever blocking the event loop.
+
+        Creating an in-process instance is a quick native call, so it runs
+        inline under the lifecycle lock as before. Creating a route-B instance
+        spawns a process and waits for its registered channel to answer, which
+        takes the same lock on a worker thread.
+        """
+        if self._route_b_active:
+            return await asyncio.to_thread(self._ensure_instance)
+        with self._lifecycle_lock:
+            return self._ensure_instance_locked()
+
+    async def _reopen_instance_after(self, reason: str, previous) -> object:
+        """Release a closed/dead instance and build its replacement once.
+
+        Shared by both backends: the executor must never leak a fresh
+        instance after an explicit ``close()``/shutdown, and the replacement
+        may block (route B restarts a slot process), so it runs off the loop.
+        """
+        retire = self._retire_previous_instance
+
+        if self._route_b_active:
+            # Closing a route-B instance ends a *process* (shutdown verb +
+            # reap), so it goes off the loop like the creation next to it.
+            await asyncio.to_thread(retire, reason, previous)
+        else:
+            retire(reason, previous)
+        return await self._ensure_instance_async()
+
+    def _retire_previous_instance(self, reason: str, previous) -> None:
+        """Drop a closed/dead instance handle under the lifecycle lock.
+
+        Shared by both backends; only the in-process one is cheap enough to
+        run inline on the event loop.
+        """
+        with self._lifecycle_lock:
+            if self._closed:
+                logger.warning(
+                    "not rebuilding %s exec instance after executor shutdown "
+                    "sandbox_id=%s instance_name=%s",
+                    reason,
+                    self._sandbox_id or "-",
+                    self.instance_name,
+                )
+                raise RuntimeError(
+                    f"sandlock instance is {reason} and the executor is shut down"
+                )
+            if self._instance is previous:
+                try:
+                    previous.close()
+                except Exception:  # noqa: BLE001 - best-effort teardown
+                    pass
+                self._instance = None
+
     def _ensure_instance(self):
         """Lazily create the one long-lived exec instance (M4 D1/D3).
 
@@ -544,50 +774,64 @@ class SandlockExecutor(Executor):
             return self._ensure_instance_locked()
 
     def _ensure_instance_locked(self):
-        """Creation core; caller must hold ``_lifecycle_lock``."""
-        if self._instance is None and SandboxInstance is not None:
+        """Creation core; caller must hold ``_lifecycle_lock``.
+
+        A route-B instance needs the supervise binary and the native channel
+        client (checked by :meth:`_route_b_selected`), not the in-process
+        ``SandboxInstance`` class, so the availability guard only applies to
+        the in-process backend.
+        """
+        if self._instance is None and (
+            self._route_b_active or SandboxInstance is not None
+        ):
             if self._instance_name is None:
                 self._instance_name = self._instance_name_for()
-            policy = self._build_instance_policy()
-            try:
-                self._instance = SandboxInstance(
-                    policy, name=self._instance_name
-                )
-            except RuntimeError as exc:
-                message = str(exc)
-                if "closed" not in message and "dead" not in message:
-                    logger.warning(
-                        "sandlock instance launch failed sandbox_id=%s "
-                        "instance_name=%s error=%s",
-                        self._sandbox_id or "-",
-                        self._instance_name,
-                        message,
-                    )
-                    raise
-                # The prior session was closed (shutdown/idle reclaim) or died
-                # (machinery failure): rebuild exactly once, and let a second
-                # failure bubble up unchanged.
-                reason = "closed" if "closed" in message else "dead"
-                logger.info(
-                    "sandlock instance relaunching after %s sandbox_id=%s "
-                    "instance_name=%s",
-                    reason,
-                    self._sandbox_id or "-",
-                    self._instance_name,
-                )
+            # Route B: the "instance" is a supervise slot leased to this
+            # sandbox, so the ceiling travels as a policy document and the
+            # exec verbs cross the channel instead of the FFI.
+            if self._route_b_active:
+                self._instance = self._open_route_b_instance()
+            else:
+                policy = self._build_instance_policy()
                 try:
                     self._instance = SandboxInstance(
                         policy, name=self._instance_name
                     )
-                except RuntimeError as exc2:
-                    logger.warning(
-                        "sandlock instance relaunch failed sandbox_id=%s "
-                        "instance_name=%s error=%s",
+                except RuntimeError as exc:
+                    message = str(exc)
+                    if "closed" not in message and "dead" not in message:
+                        logger.warning(
+                            "sandlock instance launch failed sandbox_id=%s "
+                            "instance_name=%s error=%s",
+                            self._sandbox_id or "-",
+                            self._instance_name,
+                            message,
+                        )
+                        raise
+                    # The prior session was closed (shutdown/idle reclaim) or died
+                    # (machinery failure): rebuild exactly once, and let a second
+                    # failure bubble up unchanged.
+                    reason = "closed" if "closed" in message else "dead"
+                    logger.info(
+                        "sandlock instance relaunching after %s sandbox_id=%s "
+                        "instance_name=%s",
+                        reason,
                         self._sandbox_id or "-",
                         self._instance_name,
-                        str(exc2),
                     )
-                    raise
+                    try:
+                        self._instance = SandboxInstance(
+                            policy, name=self._instance_name
+                        )
+                    except RuntimeError as exc2:
+                        logger.warning(
+                            "sandlock instance relaunch failed sandbox_id=%s "
+                            "instance_name=%s error=%s",
+                            self._sandbox_id or "-",
+                            self._instance_name,
+                            str(exc2),
+                        )
+                        raise
             if self._instance is not None:
                 logger.info(
                     "sandlock instance created sandbox_id=%s instance_name=%s "
@@ -753,10 +997,18 @@ class SandlockExecutor(Executor):
         return os.geteuid(), os.getegid()
 
     def _mediation_run_as(self) -> str:
-        """F6.1 C 档 fail-closed 与现网形态的桥：
-        root worker + RunAs(非 0) + chroot 路径中介 ⇒ 默认 caller 会在建箱前被拒。
-        E2B 部署 route-B（supervise 进程 euid==沙箱 uid）前，显式降级档恢复 F9 前语义
-        （fork 每次 launch WARN + stats.mediation_downgrades 计数）；非 root 无降级。"""
+        """F6.1 C 档 fail-closed 与现网形态的桥（仅进程内后端用到）。
+        root worker + RunAs(非 0) + chroot 路径中介 ⇒ 默认 caller 会在建箱前被拒，
+        显式降级档恢复 F9 前语义（fork 每次 launch WARN + stats.mediation_downgrades
+        计数）；非 root 无降级。代价就是 T5：代打开的文件属主是 worker（root），
+        per-uid 卷保护回不来。
+
+        route-B 选中时这个键根本不下发（``supervise_policy_document`` 丢弃
+        ``mediation_run_as``）——slot 的中介就是沙箱自己的 host uid，不需要降级。
+        因此本档只服务「route-B 不可用」的形态（非 root worker、无 per-sandbox uid、
+        显式 ``E2B_ROUTE_B=off``），随 route-B 成为该形态默认档后可整体移除
+        （docs/task-backlog.md #5 剩余项）。
+        """
         if os.geteuid() == 0 and self._base_image and self._image_rootfs is not None:
             return "supervisor"
         return "caller"
@@ -852,8 +1104,8 @@ class SandlockExecutor(Executor):
         }
         return {k: v for k, v in params.items() if v is not None}
 
-    def _build_instance_policy(self):
-        """Command-independent policy ceiling for the long-lived instance.
+    def _policy_ceiling(self) -> dict:
+        """Command-independent policy ceiling for the long-lived instance, as kwargs.
 
         Everything the instance grants regardless of the individual command:
         fs writable/readable/denied, the network ceiling (net_allow/deny,
@@ -1036,9 +1288,13 @@ class SandlockExecutor(Executor):
                         "SSL_CERT_FILE": str(ca_inside),
                         "CURL_CA_BUNDLE": str(ca_inside),
                     }
+        return kwargs
+
+    def _build_instance_policy(self):
+        """The ceiling as a native ``Sandbox`` policy object (or a plain
+        namespace off-Linux, so the mapping stays unit-testable)."""
+        kwargs = self._policy_ceiling()
         if sandlock is None:
-            # Non-Linux / missing native library: return a plain object so the
-            # policy mapping stays unit-testable without executing anything.
             from types import SimpleNamespace
 
             return SimpleNamespace(**kwargs)
@@ -1260,9 +1516,9 @@ class SandlockExecutor(Executor):
             )
         # The normal exec path takes the lifecycle lock around instance
         # creation too, so a concurrent ``update_network`` serializes against
-        # it exactly like any other ``_ensure_instance`` caller.
-        with self._lifecycle_lock:
-            inst = self._ensure_instance_locked()
+        # it exactly like any other ``_ensure_instance`` caller -- but a
+        # route-B creation (spawn + readiness probe) runs off the loop.
+        inst = await self._ensure_instance_async()
         if inst is None:
             raise unimplemented("Sandlock is not available on this platform")
         stdio = ExecStdio.PTY if config.pty else ExecStdio.PIPED
@@ -1305,30 +1561,9 @@ class SandlockExecutor(Executor):
                 self.instance_name,
                 resolved,
             )
-            with self._lifecycle_lock:
-                if self._closed:
-                    logger.warning(
-                        "not rebuilding %s exec instance after executor "
-                        "shutdown sandbox_id=%s instance_name=%s",
-                        reason,
-                        self._sandbox_id or "-",
-                        self.instance_name,
-                    )
-                    raise
-                if self._instance is inst:
-                    # The instance is closed/dead already; release the handle
-                    # so ``_ensure_instance_locked`` builds a fresh one. A
-                    # concurrent caller may have rebuilt it meanwhile.
-                    try:
-                        inst.close()
-                    except Exception:  # noqa: BLE001 - best-effort teardown
-                        pass
-                    self._instance = None
-                inst = self._ensure_instance_locked()
-                if inst is None:
-                    raise unimplemented(
-                        "Sandlock is not available on this platform"
-                    )
+            inst = await self._reopen_instance_after(reason, inst)
+            if inst is None:
+                raise unimplemented("Sandlock is not available on this platform")
             # Exactly one retry; a second closed/dead failure propagates.
             proc = await _exec_once(inst)
         except Exception as exc:
@@ -1356,6 +1591,11 @@ class SandlockExecutor(Executor):
             stdin_queue=stdin_queue,
             pty_mode=config.pty,
             on_exit=self._child_exited,
+            # ``kill(sig)`` on an in-process child is always SIGKILL (see
+            # ``SandlockRunningProcess.kill``); a slot child takes the signal
+            # number through ``kill_child``, so the pause/resume fallback may
+            # use it (M4 D5 / FUP #8).
+            signal_pause_supported=self._route_b_active,
         )
         if config.pty:
             # The removed in-sandbox bridge applied the requested window size
