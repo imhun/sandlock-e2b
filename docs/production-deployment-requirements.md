@@ -39,6 +39,26 @@ xfs_quota -x -c "state" /        # 应显示 Project quota enabled
 > 回退：`mount -o remount,noquota /` + 还原 fstab。XFS 的 quota 挂载选项
 > 支持在线切换，无持久副作用。
 
+## 2.4 每沙箱 host uid（E3.2）与 route-B 槽位（2026-09-09 起为默认开）
+
+`E2B_PER_SANDBOX_UID` 现在默认 **true**：每个沙箱从池里拿一个独立 host uid，
+workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，而是另外两件事的地基：
+
+- 共享卷的跨租户保护靠真实 DAC（1777+sticky），需要写者身份互不相同；
+- chroot（镜像 rootfs）形态的 route-B `sandlock-supervise` 槽位就以该 uid 运行
+  （`E2B_ROUTE_B` 默认 `auto`），路径中介的代打开由此落在沙箱自己身上（T5）。
+
+要求与影响（逐条对照）：
+
+| 项 | 说明 |
+|---|---|
+| 权限 | 只有 root（或 `CAP_SETUID`+`CAP_SETGID`+`CAP_CHOWN`+`CAP_SYS_ADMIN`）worker 能用。非 root worker 自动关闭 uid 池并保持「固定身份 + Landlock」（E5.1），启动时打一条 WARNING —— 也就是说现网 `user: "65534:65534"` 的 compose/k8s worker 行为与翻默认前**完全一致**。 |
+| 容量 | 并发沙箱数受 `E2B_UID_POOL_SIZE` 约束（默认 1000，起始 `E2B_UID_POOL_START=10000`）；池满即建箱失败。多 worker 共用同一 workspace 时必须配**互不重叠**的段。 |
+| 进程/内存 | chroot 形态每沙箱多一棵 supervise 进程树（supervise + sandlock-init + 停车 M0）。它在沙箱 cgroup **之外**，不计入 `max_memory`/`max_disk`，并在 `max_processes` 里占 1；容量表按「N 沙箱 = N 额外进程」重算。 |
+| 回收 | route-B 代次的结束由 envd 生命周期（TTL/idle eviction/删除 → `executor.close()`）决定，不再依赖 core 的 15 min idle；槽位进程退出前该 uid 不会被再次租出（W1）。 |
+| 文件系统 | uid 只对**支持属主的存储**有意义：repo 的 virtiofs bind 挂载上 chown 是 no-op，生产请用容器原生 / XFS（本项目门禁把 workspace 放 `/var/lib/e2b-sandboxes` 的 XFS+prjquota 上）。 |
+| 关掉它 | 显式 `E2B_PER_SANDBOX_UID=false` 回到旧的共享 uid（1000）形态；此时 chroot 形态会走 `mediation_run_as='supervisor'` 降级档（代打开文件属主变 worker，即 T5 症状）。 |
+
 ## 3. 运维要求
 
 ### 3.1 quota 管理（E2B worker 自动执行）

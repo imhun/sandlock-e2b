@@ -4,7 +4,7 @@
 > 摘 T5 xfail）已落地（2026-09-09）**，Task 5 的三档门禁复跑全绿。
 > fork 侧 F16 语言客户端见 `6571c36`。
 >
-> 落地时推翻/新增了 6 条本文件原先没写的事实，见文末「实现期的修正」——
+> 落地时推翻/新增了 7 条本文件原先没写的事实，见文末「实现期的修正」——
 > 尤其：**停车程序不能用 `/dev/zero`**，**槽位按沙箱自己的 host uid 定向租用**。
 
 ## 背景与目标
@@ -93,6 +93,8 @@ acquire 重新生成；socket =
 
 ## 部署检查表（route-B 上线前逐条确认）
 
+   > 更新（2026-09-09 晚）：`E2B_PER_SANDBOX_UID` 已成默认开 ⇒ 下面第 2 条的前置
+   > 在「worker 有特权」时自动满足；非 root worker 仍旧自动缩退（E5.1）+ 一条 WARNING。
 1. **worker 特权**：默认 spawner 用 util-linux `setpriv` 把槽位起在沙箱 host uid 上
    ⇒ worker 必须 root（或注入 launcher `spawner=`）。非 root + `E2B_ROUTE_B=on` ⇒
    建箱即报错（不静默退 route-A）；非 root + `auto` ⇒ 走进程内后端并保留
@@ -103,7 +105,7 @@ acquire 重新生成；socket =
    进程内后端。要在生产开 route-B：worker 改 root（+ `CAP_SETUID`/`CAP_SETGID`
    在Capability里显式列出），或按 fork §2/§8 的边界由**外部 launcher/槽位池**起
    槽位（`W1SlotPool(spawner=...)` 注入），worker 自己永不装特权。
-2. **`E2B_PER_SANDBOX_UID=true`**：槽位按沙箱自己的 host uid 定向租用；共享 uid
+2. **`E2B_PER_SANDBOX_UID=true`（2026-09-09 起为代码默认）**：槽位按沙箱自己的 host uid 定向租用；共享 uid
    形态租不到槽位（route-B 的整个身份论证依赖「一个 uid 一代沙箱」）。
 3. **wheel 带 supervise**：`<site-packages>/sandlock/bin/sandlock-supervise`
    存在且 0755；`sandlock-supervise` 与 `_sandlock*.so` **必须同批替换**
@@ -159,6 +161,8 @@ acquire 重新生成；socket =
 | 5 | fork 里 `SandboxError` 是 `SandlockError` 的**子类** | 服务端「拒绝」不能被当成「槽位死了」⇒ `request()` 必须先原样抛 `SandboxError`；否则一个策略错误会触发一次无谓的槽位重启 |
 | 6 | registered 形态的 channel token 只能走 **argv**（fork F16 只有 transport 2 的语言面）（`/proc/<pid>/cmdline` 0444，**不受** ptrace 门约束） | envd 默认改用 **transport 1（fd handoff）**：fork F17 为 `--control-fd` 通道补了 C ABI（`sandlock_supervise_connect_fd` / `sandlock_supervise_set_timeout` / `sandlock_supervise_check_fd`）与 Python 面，池用 `socketpair()` + `pass_fds` 交付 worker 端 ⇒ 无 socket 路径、无 argv 秘密（SL-10 关闭），并附带「worker 崩溃 → 通道 EOF → 槽位自收口」。持久单流 ⇒ 动词在客户端侧也串行化；verb 超时（`E2B_ROUTE_B_VERB_TIMEOUT_S`，默认 15 s）即退役会话并按死箱处理 |
 
+| 7 | **route-B 沙箱内不再是 root**：core 的 userns 只在「请求身份 ≠ 当前 euid」时创建（`context.rs` 的 `userns_needed`），而槽位本来就以沙箱 host uid 运行 ⇒ 不建 ns、不映射 `0 → X` | 实测（root worker + chroot，同一负载两档对照）：in-process `id -u`=**0**（ns 内 root，宿主侧仍是 X），route-B `id -u`=**X**。文件属主 / T5 两侧一致（宿主 X），差别只在**客体内**是否 root：`apt-get`/`chown`/bind :80 这类「容器内 root」用法在 route-B 沙箱不再可用。要复原需 fork 侧让槽位自己 `unshare(CLONE_NEWUSER)` + 写 `0 X 1`（非特权即可，可行性见 `tmp/unprivileged_userns_probe.py`）——**语义决策，未擅自改**。这也解释了一条门禁红：shell 的「无控制终端」banner 与首个提示符（`# ` vs `$ `）的交错位置两档不同，PTY 契约因此改成「每片恰好一次」并补了 resize 到达证明 |
+
 另外两条也钉进了代码：
 
 - **槽位 uid = 沙箱 host uid**（不是池里随便挑空闲 uid）：workspace 已按该 uid
@@ -176,6 +180,9 @@ acquire 重新生成；socket =
   真槽位 —— 子进程 uid、文件属主 + 自 chmod、停车零 CPU、PTY 窗口尺寸、
   SIGSTOP 真停 + 信号退出码 -1、close 后 uid 干净可复用、单槽位多命令不互堵。
 - `tests/contract/test_uid_permissions.py`：T5 本体（chroot 形态共享卷跨 uid）。
+- `tests/contract/test_pty_sandlock.py`（改后）：按「每一片恰好出现一次」断言转录，并新增
+  `stty size` → `40 120` 的 resize 到达证明（route B 的 pty 主端在 worker 进程里，正是
+  该验的地方）；旧断言钉死四种交错顺序之一，既证明不了 resize，也会被合法的另一交错绊倒。
 - 单测 `tests/unit/test_route_b_wiring.py` / `tests/unit/test_sandlock_executor_route_b.py`
   （FakePool + 注入 channel，macOS 可跑）：wire 字段表与 fork 对齐、按 uid 定向
   租用与 W1 二次拒绝、就绪门、退役语义、交付的描述符可用性、verb 参数面。

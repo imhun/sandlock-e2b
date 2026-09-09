@@ -167,6 +167,13 @@ ACR 镜像推送照常，git 远程推送暂缓。
    首次命令延迟代价已实测：租槽位只发生在**每沙箱第一条命令**上
    （in-process 10.63 ms → route-B 57.11 ms，+46 ms；warm p50 4.29 → 4.35 ms 无差），
    证据 `tmp/perf/route-b-first-exec.txt`。
+   ✅ **`E2B_PER_SANDBOX_UID` 已改为部署默认（2026-09-09 晚）**：有特权的 worker 从此
+   自动拿到 per-sandbox host uid ⇒ chroot 形态的 route-B 槽位也自动生效；非 root worker
+   仍自动缩退到 E5.1 固定身份 + 一条 WARNING（现网 compose/k8s worker 行为因此不变）。
+   部署要求见 `docs/production-deployment-requirements.md` §2.4（池容量 = 并发沙箱上限、
+   每沙箱多一棵不计入内存上限的 supervise 树）+ compose 注释。
+   ⚠️ 实测暴露**第 7 条语义差异待决策**：route-B 沙箱**内**不再是 root（in-process 是
+   ns 内 root，宿主侧同为一个 X）；要保持就得让 fork 侧槽位自 `unshare` + 写 `0 X 1`。
    ⬜ 仍开一项：**删 `mediation_run_as='supervisor'` 降级档** —— 它现在是「route-B 不可用」
    （现网默认 `E2B_PER_SANDBOX_UID=false` ⇒ 无独立 host uid）时 chroot 形态唯一
    逃生门，删档要先让 per-sandbox uid 成为部署默认，属独立决策。

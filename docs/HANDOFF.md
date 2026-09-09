@@ -99,6 +99,47 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   #5 剩余（envd route-B 接线 = 先选 W1/W2 槽位模型）、T1/O1–O3（真实 XFS/部署窗口）、
   fork Task 10/11（推送/PR/ACR 需授权）。
 
+## ⚡ E3.2 成为部署默认（2026-09-09 晚，per-sandbox host uid 默认开）
+
+`E2B_PER_SANDBOX_UID` 默认 **false → true**。意义：有特权的 worker 从此自动给每个沙箱
+一个独立 host uid，于是 chroot（镜像 rootfs）形态的 **route-B 槽位也自动生效**（`auto`
+档四条件里最后一条前置补齐）；共享卷的跨租户保护靠真 DAC 成立。
+
+- **不动现网行为**：非 root worker（现网 compose `user: "65534:65534"`、k8s 无
+  CAP_SETUID）本就映射不了 uid 也 chown 不动 ⇒ 自动关闭 uid 池、保持 E5.1
+  固定身份 + Landlock，只在启动时多一条 WARNING（`envd_service/app.py:PER_UID_NONROOT_WARNING`，
+  单测把「非 root 不建池 + 说清楚」钉住）。要真拿到 per-sandbox uid 需给 worker
+  root 或 CAP_SETUID/SETGID/CHOWN。
+- **容量/成本进文档**：`docs/production-deployment-requirements.md` 新增 §2.4
+  （`E2B_UID_POOL_SIZE` = 并发沙箱上限、多 worker 必须不重叠段、每沙箱多一棵
+  **不计入** `max_memory`/`max_disk` 的 supervise 进程树、uid 只在支持属主的文件系统上有意义、
+  显式 `false` 才回到共享 uid 1000 形态），compose 里同段注释。
+- **翻默认翻出来的三处，全部改掉**：
+  1. 5 条启动日志单测（quota 系列）原本钉死「非 root worker 的 WARNING 列表」，
+     现在多一条 E3.2 披露 ⇒ 改成 `_uid_disclosure()`（root 档 []、非 root 档恰好那条），
+     两档都精确；
+  2. `test_sandbox_lifecycle_rebuild` 手工 register（没有 host_uid）与「有 per-sandbox
+     uid 却没分配」的新默认冲突 ⇒ 显式钉 `per_sandbox_uid=False`（它测的是 exec 失败语义），
+     并补 route-B 版对照契约 `test_missing_binary_exits_127_through_the_slot`（实测槽位
+     同样 exit 127 且无输出，与进程内一致）；
+  3. `test_pure_shape_workspace_ownership` 原本硬编码属主 1000 ⇒ 改成形状无关但同样精确：
+     目录与沙箱写出的文件同属一个身份、非 root、0700（chown 而非放开权限），
+     且该 uid 必须是 worker 记录里的 host_uid 或旧共享档的 1000。
+- **PTY 契约顺手变严**：`test_pty_sandlock` 旧断言钉「四种交错顺序之一」，既没证明
+  resize 到达子进程，也会被合法的另一交错绊倒（route-B 下 shell 的「无控制终端」banner
+  与首个提示符 `# `/`$ ` 位置不同）。改成「每一片恰好出现一次」+ `stty size`→`40 120`
+  的到达证明，两档（进程内 / 槽位）都过。
+- **⚠️ 实测出一个语义差异，未擅自改（要用户拍）**：route-B 沙箱**内**不再是 root
+  （in-process 是「ns 内 root、宿主为 X」；槽位本来就是 X，core 因此不建 userns、
+  不映射 `0 → X`）。文件属主/T5 两侧一致，差别在客体内 `apt-get`/`chown`/bind :80
+  这类用法。要在 route B 复原 in-guest root，fork 侧让槽位自 `unshare(CLONE_NEWUSER)`
+  + 写 `0 X 1` 即可（可行性已实测：`tmp/unprivileged_userns_probe.py` 以 uid 21850
+  成功映射，`in-ns euid: 0`）。见计划文档「实现期的修正」#7。
+- **门禁（终态，默认开之后）**：gate A `1057 passed / 3 skipped / 0 failed`
+  （`tmp/e32-default-gate-a.log`）、gate B `1056 / 4 / 0`
+  （`tmp/e32-default-gate-b.log`）、macOS `979 / 77 / 0`（`tmp/rb-e32-macos.log`）。
+  中途 r3/r4 的红（7 条、1 条）就是上面 1–3 与 PTY 那条，全部按上述方式收口。
+
 ## ⚡ route-B transport 1：token 从 argv 消失（2026-09-09，SL-10 闭口 / fork F17）
 
 上一块留的「要彻底闭口需 fork 提供 token-by-fd/env」按**给语言面补 transport 1（fd
