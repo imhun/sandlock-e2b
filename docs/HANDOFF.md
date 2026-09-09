@@ -151,6 +151,9 @@ chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-s
   （`tmp/rb-macos2.log`）；route-B 专题切片（槽位池 2 + executor 契约 7 + T5 4 +
   两份 route-B 单测 51）容器实跑 `64 passed`（`tmp/rb-focused.log`，同一终态树）。
   **T5 从此在两份门禁日志里都不再出现 xfail**。
+  口径说明：gate A2/B 起跑后本树只发生过 **注释与一个未用 import 的删除**
+  （`from dataclasses import …, field`），不动行为；macOS 全量与
+  `tmp/rb-focused.log` 切片则直接跑在终态字节上 ⇒ 三份数字对终态 tip 都成立。
 - **性能（必录）**：租槽位只发生在每沙箱第一条命令 ——
   in-process first-exec `10.63 ms` → route-B `57.11 ms`（+46 ms：spawn supervise +
   launch 一代 + 等 registered channel），稳态 exec 无差异
