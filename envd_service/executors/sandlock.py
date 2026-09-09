@@ -289,6 +289,7 @@ class SandlockExecutor(Executor):
 
     _non_root_fallback_warned = False
     _route_b_no_starter_warned = False
+    _route_b_no_fd_client_warned = False
 
     def __init__(
         self,
@@ -639,7 +640,33 @@ class SandlockExecutor(Executor):
                     self._sandbox_id or "-",
                 )
             return False
-        from envd_service.route_b import default_supervise_bin
+        from envd_service.route_b import (
+            default_supervise_bin,
+            fd_client_available,
+        )
+
+        if cfg.transport == "fd" and not fd_client_available():
+            # The wheel predates fork F17: it can *serve* an fd handoff but the
+            # worker cannot drive one. Falling back to `path` would put a
+            # channel token into the slot's argv, so that is an operator
+            # decision, not something to do quietly.
+            if forced:
+                raise RuntimeError(
+                    "route B was requested with transport=fd, but the installed"
+                    " sandlock wheel has no sandlock_supervise_connect_fd "
+                    "(needs fork F17 or newer): rebuild wheels/fork/ or set "
+                    "E2B_ROUTE_B_TRANSPORT=path"
+                )
+            if not type(self)._route_b_no_fd_client_warned:
+                type(self)._route_b_no_fd_client_warned = True
+                logger.warning(
+                    "route B unavailable for sandbox_id=%s: the wheel's FFI has "
+                    "no fd-handoff client (fork F17+); running the in-process "
+                    "instance instead of putting a channel token in argv "
+                    "(rebuild wheels/fork/ or set E2B_ROUTE_B_TRANSPORT=path)",
+                    self._sandbox_id or "-",
+                )
+            return False
 
         if not default_supervise_bin().exists():
             if forced:
@@ -698,12 +725,18 @@ class SandlockExecutor(Executor):
             handle = _start()
         logger.info(
             "route-B instance ready sandbox_id=%s instance_name=%s uid=%s "
-            "slot=%s sock=%s",
+            "slot=%s channel=%s",
             self._sandbox_id or "-",
             self.instance_name,
             uid,
             handle.name,
-            handle.sock_path,
+            # transport 1 has no path at all; naming the handoff keeps the log
+            # honest about why there is nothing to look at in /tmp.
+            (
+                f"fd-handoff(pid {handle.process.pid})"
+                if handle.sock_path is None
+                else handle.sock_path
+            ),
         )
         return RouteBInstance(pool=pool, handle=handle, name=self.instance_name)
 

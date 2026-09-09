@@ -44,6 +44,7 @@ import logging
 import os
 import secrets
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -91,6 +92,7 @@ def _spawn_slot(
     worker_uid: int,
     stdout,
     stderr,
+    control_fd: int | None = None,
 ) -> subprocess.Popen:
     if os.geteuid() != 0:
         raise PermissionError(
@@ -119,6 +121,30 @@ def _spawn_slot(
         str(policy_path),
         "--uid",
         str(uid),
+    ]
+    if control_fd is not None:
+        # transport 1 (the default): the descriptor is the credential, so no
+        # channel token and no registry path exist at all.
+        argv += [
+            "--control-fd",
+            str(control_fd),
+            "--serve",
+            "--program",
+            str(program_path),
+        ]
+        return subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            env=env,
+            # pass_fds clears CLOEXEC on exactly this descriptor and keeps the
+            # same number in the child, which is what --control-fd names.
+            pass_fds=(control_fd,),
+        )
+    # transport 2: for a slot this pool did not start (an external W1 fleet
+    # reached through an injected spawner + channel factory).
+    argv += [
         "--serve-path",
         name,
         "--token",
@@ -139,16 +165,27 @@ def _spawn_slot(
 
 @dataclass
 class SlotHandle:
-    """A live route-B slot leased to one sandbox."""
+    """A live route-B slot leased to one sandbox.
+
+    ``control_socket`` is set for transport 1 (the pool started the slot and
+    kept one end of the handoff ``socketpair()``); then ``sock_path``/``token``
+    stay ``None`` because no path and no argv secret exist. A slot reached
+    through an external fleet carries the registered-path pair instead --
+    :func:`default_channel_factory` picks whichever the handle provides.
+    """
 
     sandbox_id: str
     uid: int
     name: str
-    token: str
-    sock_path: Path
-    policy_path: Path
-    program_path: Path
-    process: subprocess.Popen
+    token: str | None = None
+    sock_path: Path | None = None
+    policy_path: Path | None = None
+    program_path: Path | None = None
+    process: subprocess.Popen | None = None
+    #: Transport 1 only: the worker end of the handoff socketpair.
+    control_socket: object | None = None
+    #: Response deadline for a single verb on this slot's channel.
+    verb_timeout_s: float = 15.0
     #: The generation's launched instance pid (from the slot's first
     #: ``stats`` reply); ``None`` only when the fleet was built by a caller
     #: that does not probe readiness.
@@ -205,11 +242,31 @@ PARKING_PROGRAM: dict[str, list[str]] = {
 }
 
 
-def default_channel_factory(path: str, token: str):
-    """The fork's worker-side client for a registered slot (F16)."""
+def fd_client_available() -> bool:
+    """Does the installed wheel's FFI export the transport-1 client?
+
+    ``sandlock_supervise_connect_fd`` arrived with fork F17. An older wheel
+    still has the *server* side (``--control-fd N --serve`` predates F17), so
+    the failure would otherwise surface as a missing ctypes attribute during
+    the readiness probe -- indistinguishable from a wedged slot.
+    """
+    try:
+        from sandlock import _sdk
+    except Exception:  # pragma: no cover - non-Linux / missing wheel
+        return False
+    return hasattr(_sdk._lib, "sandlock_supervise_connect_fd")
+
+
+def default_channel_factory(handle: "SlotHandle"):
+    """The fork's worker-side client for a slot (F16 path / F17 fd)."""
     from sandlock.supervise import SuperviseChannel
 
-    return SuperviseChannel(path, token)
+    if handle.control_socket is not None:
+        return SuperviseChannel(
+            fd=handle.control_socket.fileno(),
+            timeout_ms=int(handle.verb_timeout_s * 1000),
+        )
+    return SuperviseChannel(str(handle.sock_path), handle.token or "")
 
 
 class W1SlotPool:
@@ -235,9 +292,17 @@ class W1SlotPool:
         tmp_root: Path | None = None,
         supervise_bin: Path | None = None,
         spawner: Callable[..., subprocess.Popen] | None = None,
-        channel_factory: Callable[[str, str], object] | None = None,
+        channel_factory: Callable[["SlotHandle"], object] | None = None,
         socket_timeout_s: float = 30.0,
+        transport: str = "fd",
+        verb_timeout_s: float = 15.0,
     ) -> None:
+        if transport not in ("fd", "path"):
+            raise ValueError(
+                "route-B transport must be 'fd' (handoff, the default: no "
+                "registry path and no token in the slot's argv) or 'path' "
+                "(a registered slot an external fleet started)"
+            )
         if size < 1:
             raise ValueError("route-B slot pool size must be >= 1")
         self._uids = list(range(uid_start, uid_start + size))
@@ -253,6 +318,8 @@ class W1SlotPool:
                 **kw,
             )
         )
+        self.transport = transport
+        self.verb_timeout_s = verb_timeout_s
         self.channel_factory = channel_factory or default_channel_factory
         self._socket_timeout_s = socket_timeout_s
         # Guards the uid ledger (``_slots`` / ``_free``): the executor calls
@@ -343,6 +410,10 @@ class W1SlotPool:
             uid = self._take_uid_locked(sandbox_id, uid)
         program = program_json or PARKING_PROGRAM
         slot_name = name or f"rb-{sandbox_id}"
+        # The token is only ever a *registered*-transport credential. On the fd
+        # handoff it is generated and never sent: nothing secret may land in the
+        # slot's argv, where every local uid can read it back out of
+        # /proc/<pid>/cmdline (SL-10).
         token = secrets.token_hex(32)
         uid_dir = self._tmp_root / str(uid)
         slot_dir = uid_dir / slot_name
@@ -352,17 +423,27 @@ class W1SlotPool:
         self._write_slot_documents(self._tmp_root, uid_dir, slot_dir,
                                    policy_path, program_path, policy_json,
                                    program, uid, slot_name)
-        sock_path = _registry_sock_path(uid, slot_name)
+        registered = self.transport == "path"
+        sock_path = _registry_sock_path(uid, slot_name) if registered else None
 
         def _start() -> SlotHandle:
-            # A socket nobody listens on (a slot this pool had to kill, or a
-            # crashed generation) would make the readiness wait below succeed
-            # against nothing, so clear it before the spawn. Safe to do: the
-            # only way another *live* process owns this path is a second
-            # worker leasing the same uid, and the persistent host-uid pool
-            # (``envd_service/uid_pool.py``) is what refuses that -- route B's
-            # segment *is* that pool's segment.
-            if sock_path.exists():
+            handoff = None
+            server = None
+            control_fd: int | None = None
+            if not registered:
+                # Transport 1: one end goes to the slot as ``--control-fd``
+                # (inherited, same number), the other stays here as the client.
+                # No filesystem path, no sun_path budget, no argv secret.
+                handoff, server = socket.socketpair()
+                control_fd = server.fileno()
+            elif sock_path.exists():
+                # A socket nobody listens on (a slot this pool had to kill, or
+                # a crashed generation) would make the readiness wait below
+                # succeed against nothing. Safe to clear: the only way another
+                # live process owns this path is a second worker leasing the
+                # same uid, and the persistent host-uid pool
+                # (``envd_service/uid_pool.py``) refuses that -- route B's
+                # segment *is* that pool's segment.
                 try:
                     sock_path.unlink()
                     logger.warning(
@@ -375,56 +456,43 @@ class W1SlotPool:
                         f"route-B slot {slot_name}: stale socket {sock_path} "
                         f"cannot be removed: {e}"
                     ) from e
-            process = self._spawner(
+            try:
+                process = self._spawner(
+                    uid=uid,
+                    policy_path=policy_path,
+                    program_path=program_path,
+                    name=slot_name,
+                    token=token,
+                    worker_uid=self._worker_uid,
+                    control_fd=control_fd,
+                )
+            except BaseException:
+                for end in (handoff, server):
+                    if end is not None:
+                        end.close()
+                raise
+            if server is not None:
+                # The slot's exec kept its own dup; holding our end would keep
+                # the generation alive-looking after this worker goes away.
+                server.close()
+            handle = SlotHandle(
+                sandbox_id=sandbox_id,
                 uid=uid,
+                name=slot_name,
+                token=token if registered else None,
+                sock_path=sock_path,
                 policy_path=policy_path,
                 program_path=program_path,
-                name=slot_name,
-                token=token,
-                worker_uid=self._worker_uid,
+                process=process,
+                control_socket=handoff,
+                verb_timeout_s=self.verb_timeout_s,
             )
-            deadline = time.monotonic() + self._socket_timeout_s
-            while time.monotonic() < deadline:
-                if sock_path.exists():
-                    # The slot binds *before* launching the instance
-                    # (main.rs: the worker may connect while the instance is
-                    # coming up), so the socket alone does not mean "exec
-                    # works". ``stats`` is served by the same single-threaded
-                    # accept loop, so it blocks until the generation is up --
-                    # one request is both the readiness probe and the proof
-                    # that the token/path work.
-                    reply = self._ready_probe(
-                        sock_path,
-                        token,
-                        process,
-                        deadline,
-                        self.channel_factory,
-                    )
-                    return SlotHandle(
-                        sandbox_id=sandbox_id,
-                        uid=uid,
-                        name=slot_name,
-                        token=token,
-                        sock_path=sock_path,
-                        policy_path=policy_path,
-                        program_path=program_path,
-                        process=process,
-                        instance_pid=reply.get("pid"),
-                    )
-                if process.poll() is not None:
-                    err = ""
-                    if process.stderr is not None:
-                        err = process.stderr.read().decode("utf-8", "replace")
-                    raise SlotDeadError(
-                        f"route-B slot {slot_name} (uid {uid}) exited before "
-                        f"binding {sock_path}: {err}"
-                    )
-                time.sleep(0.05)
-            process.kill()
-            raise SlotDeadError(
-                f"route-B slot {slot_name} (uid {uid}) did not bind "
-                f"{sock_path} within {self._socket_timeout_s}s"
-            )
+            # The slot binds/accepts *before* it launches the instance, so a
+            # live channel does not yet mean "exec works": ``stats`` is served
+            # by the same single-threaded loop and blocks until the generation
+            # is up -- one request is both the readiness probe and the proof
+            # the credential works.
+            return self._wait_until_launched(handle)
 
         try:
             handle = _start()
@@ -502,46 +570,47 @@ class W1SlotPool:
             else:
                 os.chmod(path, 0o440)
 
-    def _ready_probe(
-        self,
-        sock_path: Path,
-        token: str,
-        process: subprocess.Popen,
-        deadline: float,
-        factory: Callable[[str, str], object],
-    ) -> dict:
+    def _wait_until_launched(self, handle: SlotHandle) -> SlotHandle:
         """Block until the slot answers ``stats`` with a launched instance.
 
-        A refused/broken connection is normal here (the generation is still
-        launching, and the socket is bound before that happens), so it is only
-        *reported* -- as the last error seen -- if the deadline runs out.
+        A channel that drops or refuses the probe is normal while the
+        generation is still coming up, so it is only *reported* -- as the last
+        error seen -- when the deadline runs out.
         """
+        process = handle.process
+        where = (
+            str(handle.sock_path)
+            if handle.sock_path is not None
+            else f"control fd of slot {handle.name}"
+        )
+        deadline = time.monotonic() + self._socket_timeout_s
         last_error: str | None = None
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                err = ""
-                if process.stderr is not None:
-                    err = process.stderr.read().decode("utf-8", "replace")
                 raise SlotDeadError(
-                    f"route-B slot at {sock_path} exited before its first "
-                    f"reply: {err}"
+                    f"route-B slot {handle.name} (uid {handle.uid}) exited "
+                    f"before answering on {where}: {_slot_stderr(process)}"
                 )
             try:
-                with factory(str(sock_path), token) as ch:
-                    stats = ch.request("stats")
+                stats = self.channel_for(handle).request("stats")
             except Exception as e:  # noqa: BLE001 - instance still launching
                 last_error = f"{type(e).__name__}: {e}"
                 time.sleep(0.05)
                 continue
             if isinstance(stats, dict) and stats.get("launched"):
-                return stats
+                handle.instance_pid = stats.get("pid")
+                return handle
             time.sleep(0.05)
         process.kill()
         raise SlotDeadError(
-            f"route-B slot at {sock_path} never reported a launched instance "
-            f"within {self._socket_timeout_s}s"
+            f"route-B slot {handle.name} (uid {handle.uid}) never reported a "
+            f"launched instance on {where} within {self._socket_timeout_s}s"
             + (f" (last channel error: {last_error})" if last_error else "")
         )
+
+    def channel_for(self, handle: SlotHandle):
+        """A worker-side client for one slot, from the fleet's factory."""
+        return self.channel_factory(handle)
 
     async def acquire(
         self,
@@ -591,7 +660,7 @@ class W1SlotPool:
         """Teardown core; caller holds ``_ledger``."""
         if handle.process.poll() is None:
             try:
-                with self.channel_factory(str(handle.sock_path), handle.token) as ch:
+                with self.channel_for(handle) as ch:
                     ch.request("shutdown")
             except Exception as e:  # noqa: BLE001 - best-effort teardown
                 logger.warning(
@@ -620,11 +689,33 @@ class W1SlotPool:
                     handle.uid,
                 )
                 return
+        # Closing the handoff end is part of the clean slate: a transport-1
+        # slot that outlives its channel would keep serving a dead worker.
+        if handle.control_socket is not None:
+            try:
+                handle.control_socket.close()
+            except OSError:
+                pass
+            handle.control_socket = None
         self._return_uid_locked(handle.uid)
         logger.info("route-B slot %s released uid %d", handle.name, handle.uid)
 
     async def release(self, sandbox_id: str) -> None:
         await asyncio.to_thread(self.release_sync, sandbox_id)
+
+
+def _slot_stderr(process) -> str:
+    """Best-effort slot stderr for a startup failure message."""
+    stream = getattr(process, "stderr", None)
+    if stream is None:
+        return "<no captured stderr>"
+    try:
+        data = stream.read()
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the cause
+        return "<unreadable slot stderr>"
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", "replace")
+    return (data or "").strip() or "<empty slot stderr>"
 
 
 class SlotDeadError(RuntimeError):
@@ -887,20 +978,22 @@ class RouteBExecProcess:
 class RouteBInstance:
     """``SandboxInstance``-shaped client for one route-B slot.
 
-    ``exec`` / ``update_network`` / ``close`` mean the slot's verbs; the
-    executor therefore keeps one code path for both backends. The channel is
-    the fork's F16 client, which opens a fresh connection per verb and keeps
-    only the (path, token) identity between calls, so sharing one instance
-    across the executor's threads is safe.
+    ``exec`` / ``update_network`` / ``close`` mean the slot's verbs, so the
+    executor keeps one code path for both backends. The channel is the fork's
+    client for whichever transport the handle carries: on the default fd
+    handoff it is **one persistent stream** for the life of the generation,
+    serialised by the client's own lock (a verb that fails mid flight retires
+    the stream, which the classification below reads as a dead slot -- exactly
+    like a killed in-process instance, so the executor rebuilds once).
     """
 
     def __init__(
         self,
         *,
-        pool: W1SlotPool,
+        pool: "W1SlotPool",
         handle: SlotHandle,
         name: str | None = None,
-        channel_factory: Callable[[str, str], object] | None = None,
+        channel_factory: Callable[[SlotHandle], object] | None = None,
     ) -> None:
         self._pool = pool
         self._handle = handle
@@ -915,7 +1008,8 @@ class RouteBInstance:
         return self._handle.instance_pid
 
     @property
-    def sock_path(self) -> Path:
+    def sock_path(self) -> Path | None:
+        """The registered socket, or ``None`` on the fd handoff."""
         return self._handle.sock_path
 
     def slot_dead(self) -> bool:
@@ -935,9 +1029,7 @@ class RouteBInstance:
         try:
             ch = self._channel
             if ch is None:
-                ch = self._channel_factory(
-                    str(self._handle.sock_path), self._handle.token
-                )
+                ch = self._channel_factory(self._handle)
                 self._channel = ch
             return ch.request(verb, args, fds=tuple(fds))
         except SandboxError:
@@ -1126,7 +1218,15 @@ def slot_pool_for(
     size = int(config.uid_size)
     if config.slots > 0:
         size = min(size, int(config.slots))
-    key = (int(config.uid_start), size, str(config.tmp_root))
+    # The transport belongs in the cache key: a path-shaped fleet and an
+    # fd-handoff fleet cannot share one ledger.
+    key = (
+        int(config.uid_start),
+        size,
+        str(config.tmp_root),
+        config.transport,
+        float(config.verb_timeout_s),
+    )
     pool = _POOLS.get(key)
     if pool is None:
         pool = W1SlotPool(
@@ -1136,6 +1236,8 @@ def slot_pool_for(
             spawner=config.spawner,
             channel_factory=channel_factory,
             supervise_bin=supervise_bin,
+            transport=config.transport,
+            verb_timeout_s=config.verb_timeout_s,
         )
         _POOLS[key] = pool
     return pool
@@ -1158,6 +1260,12 @@ class RouteBConfig:
     uid_size: int = 1000
     tmp_root: Path = Path("/tmp/sandlock-route-b")
     spawner: Callable[..., subprocess.Popen] | None = None
+    #: ``fd`` (default) hands the slot a control descriptor -- no registry path
+    #: and no channel token in argv. ``path`` drives an already-started
+    #: registered slot instead.
+    transport: str = "fd"
+    #: Per-verb response deadline on the slot channel (seconds).
+    verb_timeout_s: float = 15.0
 
     @classmethod
     def from_settings(cls, settings) -> "RouteBConfig":
@@ -1175,6 +1283,10 @@ class RouteBConfig:
             uid_size=int(getattr(settings, "uid_pool_size", 1000)),
             tmp_root=Path(
                 getattr(settings, "route_b_tmp_root", "/tmp/sandlock-route-b")
+            ),
+            transport=str(getattr(settings, "route_b_transport", "fd")).lower(),
+            verb_timeout_s=float(
+                getattr(settings, "route_b_verb_timeout_s", 15.0)
             ),
         )
 

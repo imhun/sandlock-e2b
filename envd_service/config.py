@@ -201,6 +201,21 @@ class Settings:
     # Scratch root for the per-slot policy/program documents (never the
     # channel path: the registered socket lives in the fork's per-uid
     # registry, /tmp/sandlock-ctl-<uid>-registry).
+    # Slot control transport: ``fd`` (default) hands the slot a descriptor
+    # from the worker's own socketpair, so neither a registry path nor a
+    # channel token ever appears in the slot's argv (world-readable
+    # /proc/<pid>/cmdline); ``path`` attaches to a registered slot started by
+    # an external fleet.
+    route_b_transport: str = field(
+        default_factory=lambda: os.getenv("E2B_ROUTE_B_TRANSPORT", "fd").lower()
+    )
+    # Per-verb response deadline on the slot channel, in seconds. One verb
+    # that outlives it retires the session and the executor restarts the slot
+    # once, so this is the "a wedged generation must not hang the worker"
+    # bound -- not a command timeout (that is E2B_MAX_COMMAND_TIMEOUT_S).
+    route_b_verb_timeout_s: float = field(
+        default_factory=lambda: _env_float("E2B_ROUTE_B_VERB_TIMEOUT_S", 15.0)
+    )
     route_b_tmp_root: Path = field(
         default_factory=lambda: Path(
             os.getenv("E2B_ROUTE_B_TMP_ROOT", "/tmp/sandlock-route-b")

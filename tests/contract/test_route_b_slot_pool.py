@@ -1,8 +1,10 @@
-"""T5 route-B evidence at the envd layer (backlog #5 remaining piece).
+"""T5 route-B evidence at the envd layer (backlog #5).
 
 The envd W1 slot pool starts two ``sandlock-supervise`` slots at two
 distinct host uids over the shared 1777+sticky directory, and the worker
-drives both through ``sandlock.supervise.SuperviseChannel`` (F16):
+drives both through the fleet's own channel client -- transport 1, the
+handed-over control descriptor (fork F17), so neither a registry socket path
+nor a channel token ever appears in the slot's argv:
 
 * uid X's exec creates a file through the mediated path — the host-side
   owner must be X, and X's own chmod must take effect;
@@ -10,9 +12,8 @@ drives both through ``sandlock.supervise.SuperviseChannel`` (F16):
   semantics), proving per-uid volume protection is reachable from Python on
   the envd worker side.
 
-This is the envd-side counterpart of the fork ``mediation_2uid`` B档 and the
-precondition for removing the ``test_uid_permissions`` strict xfail once the
-executor routes chroot sandboxes through route B.
+This is the envd-side counterpart of the fork ``mediation_2uid`` B档, and the
+precondition the ``test_uid_permissions`` xfail was waiting on.
 """
 
 from __future__ import annotations
@@ -149,10 +150,13 @@ async def test_w1_slot_pool_two_uids_share_sticky_dir_through_python_client():
         assert sx.uid == UID_X
         sy = await pool.acquire("sbx_y", _policy(shared, evidence))
         assert sy.uid == UID_Y
+        # Transport 1 invariants: the credential is a descriptor, so there is
+        # no path to guess and no secret in the slot's argv.
+        for slot in (sx, sy):
+            assert slot.sock_path is None and slot.token is None
+            assert slot.control_socket is not None
 
-        from sandlock.supervise import SuperviseChannel
-
-        with SuperviseChannel(str(sx.sock_path), sx.token) as chx:
+        with pool.channel_for(sx) as chx:
             _run_exec(chx, X_CODE, str(shared), str(evidence))
 
         x_file = shared / "x.txt"
@@ -161,7 +165,7 @@ async def test_w1_slot_pool_two_uids_share_sticky_dir_through_python_client():
         assert stat.S_IMODE(meta.st_mode) == 0o644
         assert (evidence / "x-done").read_text(encoding="utf-8") == "created\n"
 
-        with SuperviseChannel(str(sy.sock_path), sy.token) as chy:
+        with pool.channel_for(sy) as chy:
             _run_exec(chy, Y_CODE, str(shared), str(evidence))
 
         report = json.loads(

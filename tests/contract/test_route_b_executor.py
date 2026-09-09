@@ -23,6 +23,7 @@ and the supervise binary from the wheel.
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import time
@@ -61,6 +62,21 @@ def _clock_ticks(*pids: int) -> int:
         # After the comm field: state, ppid, ... utime is the 12th, stime 13th.
         total += int(fields[11]) + int(fields[12])
     return total
+
+
+def _proc_state(pid: int) -> str:
+    """``"running"``, ``"zombie"`` (ended, not yet reaped) or ``"gone"``.
+
+    Distinguishing the last two matters: the runner's pid 1 does not always
+    reap an adopted orphan, so a *deleted* worker leaves its exited slot behind
+    as a zombie, which still has a /proc entry.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return "gone"
+    state = stat.rsplit(")", 1)[1].split()[0]
+    return "zombie" if state == "Z" else "running"
 
 
 def _tree_pids(root_pid: int) -> list[int]:
@@ -261,21 +277,26 @@ async def test_stdin_round_trip_and_kill_by_signal(workspace) -> None:
 
 
 async def test_close_leaves_no_slot_and_the_uid_is_reusable(workspace) -> None:
-    """W1 recycle is a *clean* restart: process, channel and state dir gone
-    before the uid can serve another generation."""
+    """W1 recycle is a *clean* restart: process, channel and control-dir
+    residue all go before the uid may serve another generation."""
     ex = _executor(workspace, "sbx_rbe_recycle")
     pool = slot_pool_for(ex._route_b)
     first = ex._ensure_instance()
     pid = first._handle.process.pid
-    sock = Path(first.sock_path)
-    assert sock.exists()
+    # Transport 1: there is no socket path and no token to leave behind.
+    assert first.sock_path is None and first._handle.token is None
+    worker_fd = first._handle.control_socket.fileno()
     ex.close()
 
     deadline = time.monotonic() + 10.0
     while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
         time.sleep(0.05)
     assert not Path(f"/proc/{pid}").exists(), f"slot pid {pid} survived close()"
-    assert not sock.exists(), f"registered socket {sock} survived close()"
+    with pytest.raises(OSError):
+        os.fstat(worker_fd)
+    ctl_root = Path(f"/tmp/sandlock-ctl-{UID}")
+    residue = sorted(str(x) for x in ctl_root.rglob("control.sock")) if ctl_root.exists() else []
+    assert residue == [], f"the generation left its control socket behind: {residue}"
     assert pool.acquired_uid("sbx_rbe_recycle") is None
 
     # Same uid, next generation (the pool still holds the segment).
@@ -291,10 +312,11 @@ async def test_close_leaves_no_slot_and_the_uid_is_reusable(workspace) -> None:
 
 
 async def test_concurrent_commands_share_one_slot_without_stalling(workspace) -> None:
-    """A registered slot serves one request at a time -- that must not turn
-    into one command at a time.
+    """A slot answers one verb at a time -- that must not turn into one command
+    at a time.
 
-    ``serve_registered_path`` accepts and answers sequentially, so a
+    Both transports serialise: ``serve_registered_path`` accepts sequentially,
+    and the fd transport guards its single persistent stream. So a
     ``wait_child`` issued while its child is still running would park the whole
     generation. The contract that keeps this usable is (a) the executor never
     waits on a live child (it watches the host pid first) and (b) a long-lived
@@ -322,5 +344,84 @@ async def test_concurrent_commands_share_one_slot_without_stalling(workspace) ->
         sleeper.kill(9)
         code = await sleeper.exit_code()
         assert code == -1
+    finally:
+        ex.close()
+
+
+LEASE_HELPER = '''
+import asyncio, json, sys
+from pathlib import Path
+sys.path.insert(0, "/workspace")
+from envd_service.route_b import W1SlotPool
+
+async def main():
+    policy = json.loads(Path(sys.argv[1]).read_text())
+    pool = W1SlotPool(uid_start=int(sys.argv[2]), size=1,
+                      tmp_root=Path(sys.argv[3]) / "slots")
+    handle = await pool.acquire("sbx_orphan_probe", policy)
+    print(handle.process.pid, flush=True)
+    await asyncio.sleep(600)
+
+asyncio.run(main())
+'''
+
+
+def test_worker_death_ends_the_generation(workspace) -> None:
+    """Transport 1's lifecycle guarantee: the slot's control stream is owned by
+    the worker that leased it, so a worker that dies takes the generation with
+    it instead of leaving a live, unattended sandbox.
+
+    Over the registered transport the socket file outlives the worker and the
+    slot keeps serving whoever presents the token; that is exactly the
+    orphan shape this transport removes.
+    """
+    import subprocess
+    import sys
+
+    ex = _executor(workspace, "sbx_orphan_owner")
+    try:
+        policy_path = workspace / "lease-policy.json"
+        # A minimal ceiling the slot can read; the lease is only about the
+        # channel, not about what the sandbox may do.
+        policy_path.write_text(json.dumps({
+            "fs_readable": ["/usr", "/lib", "/lib64", "/bin", "/etc"],
+            "fs_writable": [str(workspace)],
+            "env": {"PATH": "/usr/bin:/bin"},
+        }), encoding="utf-8")
+        os.chmod(policy_path, 0o644)
+        scratch = workspace.parent / "route-b-orphan"
+        scratch.mkdir(parents=True, exist_ok=True)
+        helper = subprocess.Popen(
+            [sys.executable, "-B", "-c", LEASE_HELPER, str(policy_path), str(UID),
+             str(scratch)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd="/workspace",
+        )
+        line = helper.stdout.readline().decode().strip()
+        assert line.isdigit(), (line, helper.stderr.read().decode()[:400])
+        slot_pid = int(line)
+        assert Path(f"/proc/{slot_pid}").exists()
+
+        helper.kill()
+        helper.wait(timeout=30)
+        # The helper was the slot's only reaper, so after it dies the exited
+        # slot can only be waited on by the container's pid 1 -- which does not
+        # always reap promptly. A zombie is the proof we want ("the process
+        # ended"); a live process is not.
+        deadline = time.monotonic() + 30.0
+        while _proc_state(slot_pid) == "running" and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert _proc_state(slot_pid) != "running", (
+            f"slot pid {slot_pid} was still running 30 s after the worker that "
+            "held its control descriptor died: the generation did not tear "
+            "itself down on channel EOF"
+        )
+        # Nothing of the generation may outlive it either: the tree under the
+        # slot (init + the parked main) must be gone or unreaped-but-dead.
+        for pid in _tree_pids(slot_pid):
+            assert _proc_state(pid) != "running", (
+                f"process {pid} of the generation survived its slot"
+            )
     finally:
         ex.close()

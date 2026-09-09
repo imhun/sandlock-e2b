@@ -106,8 +106,15 @@ class FakePool:
     def channel_factory(self):
         return self._factory
 
-    def _factory(self, path, token):
-        return FakeChannel(path, token, self.log, self.replies, self.child_output)
+    def _factory(self, handle):
+        assert handle.sock_path is None, "the executor leases fd-handoff slots"
+        return FakeChannel(
+            f"fd:{id(handle.control_socket)}",
+            handle.token,
+            self.log,
+            self.replies,
+            self.child_output,
+        )
 
     def acquire_sync(
         self, sandbox_id, policy_json, program_json=None, *, uid=None, name=None
@@ -125,8 +132,10 @@ class FakePool:
             sandbox_id=sandbox_id,
             uid=uid,
             name=name or f"rb-{sandbox_id}",
-            token=f"tok-{len(self.acquire_calls)}",
-            sock_path=self.tmp / f"control-{len(self.acquire_calls)}.sock",
+            # transport 1: no registered path, no token in the spawn argv.
+            token=None,
+            sock_path=None,
+            control_socket=object(),
             policy_path=self.tmp / "policy.json",
             program_path=self.tmp / "program.json",
             process=FakeSlotProcess(),
@@ -172,6 +181,9 @@ def _route_b_capable(monkeypatch, tmp_path):
     binary = tmp_path / "sandlock-supervise"
     binary.write_text("#!/bin/sh\nexit 0\n")
     monkeypatch.setattr(rb, "default_supervise_bin", lambda: binary)
+    # an F17-or-newer wheel: the fd-handoff client exists (off-Linux the real
+    # import fails, which would read as an old wheel)
+    monkeypatch.setattr(rb, "fd_client_available", lambda: True)
     monkeypatch.setattr(sl, "sandlock", FakeSandlock())
     monkeypatch.setattr(sl, "ExecStdio", FakeExecStdio)
     monkeypatch.setattr(sl, "SandboxInstance", type("FakeInstance", (), {}))
@@ -317,6 +329,26 @@ def test_forced_route_b_without_a_host_uid_fails_loudly(monkeypatch) -> None:
         r"but this sandbox has no per-sandbox host uid",
     ):
         _executor(monkeypatch, route_b=_config(mode="on"), host_uid=None)
+
+
+def test_an_old_wheel_without_the_fd_client_falls_back(monkeypatch) -> None:
+    """No `sandlock_supervise_connect_fd` in the installed FFI means no
+    transport-1 client. `auto` keeps the in-process backend rather than
+    silently downgrading to a token-in-argv registered lease; a forced request
+    says what to rebuild."""
+    import envd_service.route_b as route_b_mod
+
+    monkeypatch.setattr(route_b_mod, "fd_client_available", lambda: False)
+    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    assert ex._route_b_active is False
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"^route B was requested with transport=fd, but the installed "
+            r"sandlock wheel has no sandlock_supervise_connect_fd"
+        ),
+    ):
+        _executor(monkeypatch, route_b=_config(mode="on"))
 
 
 def test_missing_supervise_binary_keeps_the_in_process_backend(

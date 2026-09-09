@@ -107,7 +107,7 @@ class FakeChannel:
 
 
 def _pool(tmp_path, *, replies=None, log=None, size=2, uid_start=20000, spawner=None,
-          channel_factory=None, socket_timeout_s=2.0):
+          channel_factory=None, socket_timeout_s=2.0, transport="fd"):
     """A fleet whose spawner binds the registered socket like a real slot.
 
     Returns ``(pool, spawned, log, channels)``; ``spawned`` grows one
@@ -116,19 +116,26 @@ def _pool(tmp_path, *, replies=None, log=None, size=2, uid_start=20000, spawner=
     """
     log = log if log is not None else []
     replies = replies if replies is not None else {"stats": {"launched": True, "pid": 7}}
+    pool_transport = transport
     spawned: list[FakeProcess] = []
     channels: list[FakeChannel] = []
 
     def _spawn(**kw):
-        sock = rb._registry_sock_path(kw["uid"], kw["name"])
-        sock.parent.mkdir(parents=True, exist_ok=True)
-        sock.touch()
+        # A transport-fd lease hands the spawner a control descriptor; the fake
+        # asserts it arrived and binds nothing on disk.
+        assert (kw.get("control_fd") is not None) == (
+            pool_transport == "fd"
+        ), sorted(kw)
+        if pool_transport == "path":
+            sock = rb._registry_sock_path(kw["uid"], kw["name"])
+            sock.parent.mkdir(parents=True, exist_ok=True)
+            sock.touch()
         proc = FakeProcess()
         spawned.append(proc)
         return proc
 
-    def _factory(path, token):
-        ch = FakeChannel(path, token, replies, log)
+    def _factory(handle):
+        ch = FakeChannel(str(handle.sock_path), handle.token, replies, log)
         channels.append(ch)
         return ch
 
@@ -140,6 +147,7 @@ def _pool(tmp_path, *, replies=None, log=None, size=2, uid_start=20000, spawner=
         spawner=spawner or _spawn,
         channel_factory=channel_factory or _factory,
         socket_timeout_s=socket_timeout_s,
+        transport=transport,
     )
     return pool, spawned, log, channels
 
@@ -249,13 +257,130 @@ async def test_acquire_leases_the_requested_uid_and_lease_documents(tmp_path):
     assert handle.name == "rb-sbx_a"
     assert handle.process is spawned[0]
     assert handle.instance_pid == 7
-    assert handle.token == channels[0].token
+    # transport 1: the credential is the descriptor, so nothing carries a
+    # token and no registry path exists.
+    assert handle.token is None
+    assert handle.sock_path is None
+    assert handle.control_socket is not None
+    assert handle.verb_timeout_s == 15.0
     assert json.loads(handle.policy_path.read_text()) == {"uid": 20001}
     assert json.loads(handle.program_path.read_text()) == PARKING_PROGRAM
-    assert handle.sock_path.exists()
+    assert handle.policy_path.parent.exists()
+    assert handle.control_socket.fileno() != -1
     assert [(verb, args) for verb, args, _ in log] == [("stats", None)]
     assert pool.acquired_uid("sbx_a") == 20001
     assert [slot.uid for slot in pool.live_slots] == [20001]
+
+
+def test_the_pool_hands_the_spawner_a_usable_control_descriptor(tmp_path):
+    """Transport 1 is only as good as the descriptor it hands over: the pool
+    must give the spawner a live `AF_UNIX` `SOCK_STREAM` end, keep its own end
+    usable afterwards, and leave no path or token on the handle."""
+    import socket
+
+    seen: dict = {}
+
+    def _spawn(**kw):
+        seen["control_fd"] = kw["control_fd"]
+        proc = FakeProcess()
+        spawned.append(proc)
+        return proc
+
+    pool, spawned, log, channels = _pool(tmp_path, spawner=_spawn)
+    handle = pool.acquire_sync("sbx_fd", {}, uid=20000)
+    assert seen["control_fd"] is not None and seen["control_fd"] >= 0
+    assert handle.control_socket.type == socket.SOCK_STREAM
+    assert handle.control_socket.family == socket.AF_UNIX
+    assert handle.sock_path is None and handle.token is None
+    # The verbs go through the descriptor: the factory sees no path at all.
+    assert channels[0].path == "None"
+    assert handle.verb_timeout_s == 15.0
+    worker_fd = handle.control_socket.fileno()
+    pool.retire(handle)
+    assert spawned[0].returncode == 0
+    # retire closes the worker end, so a slot that outlived us sees EOF on its
+    # control stream and tears its own generation down instead of serving a
+    # worker that is already gone.
+    assert handle.control_socket is None
+    with pytest.raises(OSError):
+        os.fstat(worker_fd)
+
+
+def test_slot_pools_are_cached_per_transport(tmp_path, monkeypatch):
+    """A registered fleet and an fd-handoff fleet must never share a ledger."""
+    from envd_service.route_b import RouteBConfig, reset_slot_pools, slot_pool_for
+
+    monkeypatch.setattr(
+        rb, "default_supervise_bin", lambda: tmp_path / "sandlock-supervise"
+    )
+    reset_slot_pools()
+    base = dict(uid_start=20000, uid_size=2, tmp_root=tmp_path / "reg")
+    fd_pool = slot_pool_for(RouteBConfig(**base, transport="fd"))
+    path_pool = slot_pool_for(RouteBConfig(**base, transport="path"))
+    assert fd_pool is not path_pool
+    assert fd_pool.transport == "fd" and path_pool.transport == "path"
+    assert (
+        slot_pool_for(RouteBConfig(**base, transport="fd")) is fd_pool
+    ), "an identical config must reuse the cached fleet"
+    reset_slot_pools()
+
+
+def test_default_channel_factory_follows_the_handle_transport(tmp_path, monkeypatch):
+    """The fleet's default client must not smuggle a token back into the picture
+    on transport 1 (that token would only exist to be read out of argv)."""
+    import socket as _socket
+    import sys
+    import types
+
+    seen: dict = {}
+
+    class _StubChannel:
+        def __init__(self, path=None, token="", *, fd=None, timeout_ms=None):
+            seen.update(path=path, token=token, fd=fd, timeout_ms=timeout_ms)
+
+        def request(self, verb, args=None, fds=()):
+            return {}
+
+        def close(self):
+            pass
+
+    package = types.ModuleType("sandlock")
+    module = types.ModuleType("sandlock.supervise")
+    module.SuperviseChannel = _StubChannel
+    monkeypatch.setitem(sys.modules, "sandlock", package)
+    monkeypatch.setitem(sys.modules, "sandlock.supervise", module)
+
+    worker, server = _socket.socketpair()
+    try:
+        fd_handle = rb.SlotHandle(
+            sandbox_id="sbx_a",
+            uid=20000,
+            name="sbx_a",
+            control_socket=worker,
+            verb_timeout_s=7.5,
+        )
+        rb.default_channel_factory(fd_handle)
+        assert seen == {
+            "path": None,
+            "token": "",
+            "fd": worker.fileno(),
+            "timeout_ms": 7500,
+        }
+
+        path_handle = rb.SlotHandle(
+            sandbox_id="sbx_b",
+            uid=20000,
+            name="sbx_b",
+            token="registered-token",
+            sock_path=tmp_path / "control.sock",
+        )
+        seen.clear()
+        rb.default_channel_factory(path_handle)
+        assert seen["path"] == str(tmp_path / "control.sock")
+        assert seen["token"] == "registered-token" and seen["fd"] is None
+    finally:
+        worker.close()
+        server.close()
 
 
 async def test_acquire_without_uid_takes_the_least_recently_freed(tmp_path):
@@ -301,8 +426,10 @@ async def test_acquire_waits_for_the_slot_to_report_a_launched_instance(tmp_path
     pool, spawned, log, channels = _pool(tmp_path, replies={"stats": {"launched": False}})
     flipped = {"launched": False}
 
-    def _factory(path, token):
-        return FakeChannel(path, token, {"stats": dict(flipped)}, log)
+    def _factory(handle):
+        return FakeChannel(
+            str(handle.sock_path), handle.token, {"stats": dict(flipped)}, log
+        )
 
     pool.channel_factory = _factory
 
@@ -322,10 +449,11 @@ async def test_acquire_waits_for_the_slot_to_report_a_launched_instance(tmp_path
 
 
 async def test_stale_socket_is_removed_before_the_spawn(tmp_path, caplog):
+    """Registered transport only -- the fd handoff never touches the fs."""
     sock = rb._registry_sock_path(20000, "rb-sbx_stale")
     sock.parent.mkdir(parents=True, exist_ok=True)
     sock.touch()
-    pool, spawned, log, channels = _pool(tmp_path)
+    pool, spawned, log, channels = _pool(tmp_path, transport="path")
     with caplog.at_level("WARNING", logger="envd_service.route_b"):
         handle = await pool.acquire("sbx_stale", {}, uid=20000)
     assert handle.uid == 20000
@@ -340,7 +468,7 @@ async def test_a_slot_that_dies_on_the_way_up_is_a_dead_error(tmp_path):
     treats it like a dead in-process instance, and the uid goes back."""
     dead = FakeProcess(returncode=1)
     pool, spawned, log, channels = _pool(tmp_path, spawner=lambda **kw: dead)
-    with pytest.raises(SlotDeadError, match=r"exited before binding"):
+    with pytest.raises(SlotDeadError, match=r"exited before answering on"):
         await pool.acquire("sbx_dead", {}, uid=20000)
     assert pool.live_slots == []
     # The uid went back: the next lease (a W1 restart) can use it again.
@@ -369,6 +497,9 @@ async def test_release_falls_back_to_kill_when_shutdown_is_refused(tmp_path, cap
             self._log.append((verb, args, tuple(fds)))
             raise rb.SandlockError("connection refused")
 
+    def _refusing(handle):
+        return _Refusing(str(handle.sock_path), handle.token, {}, log)
+
     class _Stubborn(FakeProcess):
         """Ignores the shutdown verb *and* the reap, like a wedged slot."""
 
@@ -381,11 +512,7 @@ async def test_release_falls_back_to_kill_when_shutdown_is_refused(tmp_path, cap
     stubborn = _Stubborn()
     handle = await pool.acquire("sbx_a", {}, uid=20000)
     handle.process = stubborn
-
-    def _factory(path, token):
-        return _Refusing(path, token, {}, log)
-
-    pool.channel_factory = _factory
+    pool.channel_factory = _refusing
     with caplog.at_level("WARNING", logger="envd_service.route_b"):
         await pool.release("sbx_a")
     assert stubborn.killed == 1
@@ -412,8 +539,8 @@ def _instance(tmp_path, replies=None, log=None):
         process=FakeProcess(),
     )
 
-    def _factory(path, token):
-        return FakeChannel(path, token, replies, log)
+    def _factory(handle):
+        return FakeChannel(str(handle.sock_path), handle.token, replies, log)
 
     pool = W1SlotPool(
         uid_start=20000,
@@ -640,8 +767,8 @@ def test_a_client_side_channel_failure_is_not_a_policy_refusal(tmp_path):
     """
 
     class _BrokenChannel:
-        def __init__(self, path, token):
-            pass
+        def __init__(self, handle):
+            self.handle = handle
 
         def request(self, verb, args=None, fds=()):
             raise AttributeError(
