@@ -121,16 +121,21 @@ ACR 镜像推送照常，git 远程推送暂缓。
    Task 11 已落地 ERROR 日志（sandbox_id/port/stderr/exit text，
    `envd_service/runtime/context.py` watcher），SDK 仍按契约先收 exit-0；SDK 可见的
    错误上抛是未来产品决策，未定。
-5. **FUP T5 xfail 摘除 + reason 清理**: ⬜ open（**非纯部署项**：前置含 fork 侧 F16）——
+5. **FUP T5 xfail 摘除 + reason 清理**: ⬜ open（envd 接线中，2026-09-09 进度：fork F16
+   ✅、**W1 槽位管理器 ✅（`envd_service/route_b.py` + 契约
+   `tests/contract/test_route_b_slot_pool.py`：两个不同 uid 槽位经 SuperviseChannel
+   exec，X 建文件属主 X + 自 chmod、Y rm/chmod EPERM —— envd 侧 T5 证据已立）**；剩余
+   = executor 全面接线（设计见 `docs/superpowers/plans/2026-09-09-envd-route-b-wiring.md`
+   「后续接线 Task」））——
    fork 侧前置 **F16 已完成（2026-09-08）**：`sandlock_supervise_connect/request/free`
    C ABI + Python `SuperviseChannel`（含 exec 的 SCM_RIGHTS stdio 交接；fork `1159525`/
-   `6571c36`、主仓 `f8c4020`，见 #24）。剩余 = envd 接线与 route-B supervise 部署
-   （supervise 进程 euid == 沙箱 host uid，须先选 **W1/W2 槽位模型**；注意 `sun_path`
-   108 字节与「一 uid = 一代沙箱，复用需重启」两条约束），最后摘除
+   `6571c36`、主仓 `f8c4020`，见 #24）。路线：envd 接线与 route-B supervise 部署
+   （supervise 进程 euid == 沙箱 host uid，**W1 已按 2026-09-04 决策采用**；注意
+   `sun_path` 108 字节与「一 uid = 一代沙箱，复用需重启」两条约束），最后摘除
    `tests/contract/test_uid_permissions.py:99` 的 strict xfail 并回归 T5；
    `mediation_run_as='supervisor'` 降级档（`envd_service/executors/sandlock.py:755-761`）
-   与 WARN/`mediation_downgrades` 计数随之移除。**W1/W2 选择属部署/设计决策，等用户定
-   （fork 侧已就绪，不阻塞代码面）。**
+   与 WARN/`mediation_downgrades` 计数随之移除。W1 已定（2026-09-04 决策；窗口 =
+   同时在世槽数 N），W2（换 uid 重启、窗口 = 段大小）为可选升级，不阻塞。
 6. **FUP pure-shape workspace 属主对齐**（Task 11 gate B 首跑暴露，确未修）: ✅ 已关闭
    （G2，2026-09-06）：无 base image
    的 pure-sandlock 沙箱（root worker + 共享 uid）无法 shell 写入 workspace 根目录

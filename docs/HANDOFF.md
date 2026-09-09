@@ -99,6 +99,24 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   #5 剩余（envd route-B 接线 = 先选 W1/W2 槽位模型）、T1/O1–O3（真实 XFS/部署窗口）、
   fork Task 10/11（推送/PR/ACR 需授权）。
 
+## ⚡ envd route-B 接线起步（2026-09-09）：W1 槽位管理器 + envd 侧 T5 证据
+
+- **W1 已定**（沿用 2026-09-04 决策；窗口 = 同时在世槽数 N；W2 为可选升级）。
+- `envd_service/route_b.py`：`W1SlotPool` —— 固定不重叠 uid 段；`acquire` 挑空闲
+  uid 并 spawn `sandlock-supervise --serve-path --token --peer-uid <worker> --program`
+  （setpriv 包装，同 fork root 档形态；registry 按 uid 隔离），等 socket 出现；
+  `release` 发 shutdown + 等退出 → uid 回池（W1 原地重启）；可注入 spawner 供生产
+  launcher。
+- 契约 `tests/contract/test_route_b_slot_pool.py`（root + Linux 门控）**2 passed**
+  （容器实跑）：两个不同 uid 槽位经 `SuperviseChannel` exec —— X 建文件宿主属主 X、
+  自 chmod 生效；Y 对该文件 rm/chmod 均 EPERM（1777+sticky 真语义）；W1 uid 复用/
+  耗尽语义。这是 T5 在 envd 侧的硬证据（fork `mediation_2uid` B档 的 Python 复刻）。
+- 剩余 = executor 全面接线（设计 + 分步清单见
+  `docs/superpowers/plans/2026-09-09-envd-route-b-wiring.md`「后续接线 Task」）：
+  policy→supervise JSON、M0 停车程序、exec/PTY/update_network/pause/收口 verb 面迁移、
+  摘 xfail、删 supervisor 降级档。等用户决策/资源的主要是生产 spawner 形态与完整
+  executor 迁移的验收窗口。
+
 ## ⚡ 修复回合 2（2026-09-08）：FUP-23 根因闭环 + 修复，FUP-14 重新上线（终态 fork `e045881` / 代码 `880a1ec` / wheel `d5cab47` 产物）
 
 上一块的「回退 FUP-14 缓解」已被**真修复**取代。成对探针加上六个快照点
