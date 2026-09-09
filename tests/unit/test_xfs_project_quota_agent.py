@@ -11,10 +11,23 @@ import pytest
 
 import envd_service.agent as agent
 import envd_service.xfs_quota as xfs_quota
+from envd_service import app as app_module
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
 from envd_service.xfs_quota import ProjectQuotaError
+
+
+def _uid_disclosure() -> list[str]:
+    """The E3.2 startup disclosure, present only on a non-root worker.
+
+    Per-sandbox uids are the default; an unprivileged worker says so once at
+    startup, a root worker builds the uid pool and stays quiet -- so the exact
+    expected startup list depends on who runs the suite.
+    """
+    import os
+
+    return [] if os.geteuid() == 0 else [app_module.PER_UID_NONROOT_WARNING]
 
 
 def _make_app(workspace: Path, **settings_overrides):
@@ -113,6 +126,7 @@ async def test_create_quota_failure_degrades_with_warning(workspace, monkeypatch
     assert record is not None
     assert record.project_id is None
     assert [r.message for r in caplog.records] == [
+        *_uid_disclosure(),
         "XFS project quota setup failed for sbx_quota_fail: "
         "xfs_quota 'limit -p bhard=1024M 42' failed: boom",
     ]
@@ -144,6 +158,7 @@ async def test_create_unsupported_skips_quota_with_warning(workspace, monkeypatc
     assert record is not None
     assert record.project_id is None
     assert [r.message for r in caplog.records] == [
+        *_uid_disclosure(),
         f"XFS project quota unavailable for {workspace}: filesystem is ext4, not xfs",
     ]
 
@@ -243,6 +258,7 @@ async def test_create_reprovision_failure_persists_none_after_cleanup(
         ],
     ]
     assert [r.message for r in caplog.records] == [
+        *_uid_disclosure(),
         "XFS project quota setup failed for sbx_reprov_fail: "
         "quota limit setup failed for sbx_reprov_fail: xfs_quota "
         "'limit -p bhard=1024M 777' failed: limit boom",
@@ -352,6 +368,7 @@ async def test_delete_cleanup_failure_degrades_with_warning(workspace, monkeypat
     assert response.status_code == 204
     assert not (workspace / "sbx_cleanup_fail").exists()
     assert [r.message for r in caplog.records] == [
+        *_uid_disclosure(),
         "XFS project quota cleanup failed for sbx_cleanup_fail: "
         "xfs_quota 'project -C -p /srv/sandboxes/sbx_cleanup_fail 42' failed: boom",
     ]

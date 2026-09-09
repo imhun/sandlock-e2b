@@ -298,3 +298,74 @@ def test_legacy_run_as_falls_back_to_worker_identity_when_non_root(
     monkeypatch.setattr(os, "geteuid", lambda: 12345)
     monkeypatch.setattr(os, "getegid", lambda: 12345)
     assert _legacy_executor(tmp_path)._run_as_identity() == (12345, 12345)
+
+
+# ---------------------------------------------------------------- the default
+
+def test_per_sandbox_uid_is_the_deployment_default(monkeypatch) -> None:
+    """E3.2 identity is the base the rest of the isolation model sits on
+    (shared-volume sticky protection, and route B's per-uid supervise slot),
+    so it ships on; the env var stays as the explicit opt-out."""
+    from envd_service.config import Settings
+
+    monkeypatch.delenv("E2B_PER_SANDBOX_UID", raising=False)
+    assert Settings().per_sandbox_uid is True
+    monkeypatch.setenv("E2B_PER_SANDBOX_UID", "false")
+    assert Settings().per_sandbox_uid is False
+
+
+def test_non_root_worker_keeps_the_fixed_identity_model(tmp_path, caplog) -> None:
+    """Flipping the default must not crash-loop an unprivileged worker.
+
+    A non-root worker cannot map host uids (S1.2) or chown, so the pool is
+    never constructed and the reason is said out loud once.
+    """
+    import os
+
+    from envd_service.app import create_app as create_envd_app
+    from envd_service.config import Settings as EnvdSettings
+    from envd_service.runtime.registry import RuntimeRegistry
+
+    if os.geteuid() == 0:  # the degrade path is what is under test
+        pytest.skip("the non-root worker shape cannot be asserted as root")
+
+    registry = RuntimeRegistry(tmp_path)
+    settings = EnvdSettings(
+        executor="local", workspace_base=tmp_path, base_image=None
+    )
+    with caplog.at_level("WARNING", logger="envd_service.app"):
+        app = create_envd_app(
+            settings=settings,
+            runtime_registry=registry,
+            workspace_base=tmp_path,
+        )
+    assert app is not None
+    assert registry.uid_pool is None
+    assert any(
+        "E2B_PER_SANDBOX_UID is enabled but the worker is not running as root"
+        in record.message
+        for record in caplog.records
+    ), [r.message for r in caplog.records]
+
+
+def test_root_worker_gets_the_pool_by_default(tmp_path, monkeypatch) -> None:
+    """The other half of the default: a privileged worker really does allocate
+    -- `host_uid` only exists when both conditions hold."""
+    import os
+
+    from envd_service.app import create_app as create_envd_app
+    from envd_service.config import Settings as EnvdSettings
+    from envd_service.runtime.registry import RuntimeRegistry
+
+    if os.geteuid() != 0:
+        pytest.skip("the root worker shape needs privilege")
+
+    registry = RuntimeRegistry(tmp_path)
+    app = create_envd_app(
+        settings=EnvdSettings(executor="local", workspace_base=tmp_path),
+        runtime_registry=registry,
+        workspace_base=tmp_path,
+    )
+    assert app is not None
+    assert registry.uid_pool is not None
+    assert registry.uid_pool.start == EnvdSettings().uid_pool_start

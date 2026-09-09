@@ -87,6 +87,15 @@ services:
     # E5.1: non-root supervisor (uid 65534). The image pre-creates
     # /var/lib/e2b-sandboxes owned by 65534; upgrade.sh migrates an
     # existing root-owned volume once.
+    #
+    # E3.2 per-sandbox host uids are on by default (E2B_PER_SANDBOX_UID, plus
+    # route B's per-uid supervise slot), but a worker running as 65534 cannot
+    # map uids or chown, so it auto-disables them with one startup WARNING and
+    # keeps the fixed-identity + Landlock model -- i.e. this shape behaves
+    # exactly as before this default flipped. To get per-tenant host uids (and
+    # thus real 1777+sticky volume isolation): run the worker privileged enough
+    # to setuid+chown (root, or CAP_SETUID/CAP_SETGID/CAP_CHOWN) and set
+    # E2B_UID_POOL_START/E2B_UID_POOL_SIZE for the concurrent-sandbox budget.
     user: "65534:65534"
     depends_on:
       - control-plane

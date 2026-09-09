@@ -34,6 +34,15 @@ from envd_service.xfs_quota import (
 
 logger = logging.getLogger(__name__)
 
+#: E3.2 is on by default, and a non-root worker cannot honour it (no uid map,
+#: no chown). Said out loud on purpose: the thing being lost is per-tenant
+#: host-uid isolation, which shared volumes and route B both depend on.
+PER_UID_NONROOT_WARNING = (
+    "E2B_PER_SANDBOX_UID is enabled but the worker is not running "
+    "as root; per-sandbox host uids are disabled (non-root workers "
+    "use the fixed identity + Landlock model, E5.1)"
+)
+
 
 async def _warm_base_image(settings: Settings) -> None:
     """Pre-extract the configured base image + template images at startup."""
@@ -150,11 +159,7 @@ def create_app(
             runtime_registry.uid_pool.release
         )
     elif settings.per_sandbox_uid:
-        logger.warning(
-            "E2B_PER_SANDBOX_UID is enabled but the worker is not running "
-            "as root; per-sandbox host uids are disabled (non-root workers "
-            "use the fixed identity + Landlock model, E5.1)"
-        )
+        logger.warning(PER_UID_NONROOT_WARNING)
     _disclose_nonroot_direct_quota(settings)
     quota_monitor = QuotaMonitor(
         workspace_base=settings.workspace_base,

@@ -31,8 +31,8 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_pty_echo_resize_exit_on_sandlock_instance(multinode_two_workers) -> None:
-    """A pty session on a real sandlock worker echoes input, survives a
-    mid-session resize, and exits cleanly."""
+    """A pty session on a real sandlock worker echoes input, a mid-session
+    resize reaches the child, and it exits cleanly."""
     from e2b import Sandbox
 
     harness = multinode_two_workers
@@ -45,27 +45,45 @@ def test_pty_echo_resize_exit_on_sandlock_instance(multinode_two_workers) -> Non
         pty = sandbox.pty.create(PtySize(rows=24, cols=80))
         try:
             assert pty.pid > 0
-            sandbox.pty.send_stdin(pty.pid, b"PS1=\necho pty-ok\n")
+            sandbox.pty.send_stdin(pty.pid, b"PS1=\n")
+            # Resize *before* asking the child about the window, so the answer
+            # is deterministic: 40x120 can only come from a resize that
+            # arrived. (Route B owns the master in the worker process, so this
+            # is the pty path's resize contract.)
             sandbox.pty.resize(pty.pid, PtySize(rows=40, cols=120))
+            sandbox.pty.send_stdin(pty.pid, b"stty size; echo pty-ok\n")
             sandbox.pty.send_stdin(pty.pid, b"exit\n")
             chunks = []
             result = pty.wait(on_pty=lambda data: chunks.append(data))
             assert result.exit_code == 0
             output = b"".join(chunks)
-            # PS1= empties every prompt after the first line is parsed, but
-            # the shell's first prompt (default `# ` root / `$ ` non-root) is
-            # printed before it can parse PS1= and may land before or after
-            # the echoed input chunk depending on scheduling. The transcript
-            # therefore ends in one of the four exact tails (echoed input +
-            # marker output + echoed exit), never a partial match.
             normalized = output.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-            transcript_tails = (
-                b"PS1=\necho pty-ok\n# pty-ok\nexit\n",
-                b"PS1=\necho pty-ok\n$ pty-ok\nexit\n",
-                b"# PS1=\necho pty-ok\npty-ok\nexit\n",
-                b"$ PS1=\necho pty-ok\npty-ok\nexit\n",
+            # The transcript merges four independent writers on the master --
+            # the input echo, the shell's "no controlling terminal" banner,
+            # its first prompt, and the command output -- and their relative
+            # order is scheduling, not semantics (the banner/prompt position
+            # differs between the in-process instance and a supervise slot).
+            # Assert every piece exactly once instead of pinning one merge
+            # order; a lost echo, a lost output line or a doubled prompt all
+            # still fail here.
+            banner = b"/bin/sh: 0: can't access tty; job control turned off\n"
+            assert normalized.count(b"PS1=\n") == 1, normalized
+            assert normalized.count(b"stty size; echo pty-ok\n") == 1, normalized
+            assert normalized.count(b"exit\n") == 1, normalized
+            assert normalized.count(banner) == 1, normalized
+            assert normalized.count(b"pty-ok\n") == 2, normalized  # echo + output
+            assert normalized.count(b"40 120\n") == 1, normalized
+            assert (
+                normalized.count(b"# ") + normalized.count(b"$ ")
+            ) == 1, (
+                "exactly one shell prompt is expected before PS1= is parsed; "
+                f"got {normalized!r}"
             )
-            assert normalized.endswith(transcript_tails)
+            # The window size the worker set is what the child reported, and
+            # the marker came from the command, not the echo.
+            assert normalized.index(b"stty size; echo pty-ok\n") < normalized.rindex(
+                b"pty-ok\n"
+            )
         finally:
             pty.kill()
     finally:

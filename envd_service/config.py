@@ -155,13 +155,22 @@ class Settings:
     max_file_write_mb: int = field(
         default_factory=lambda: _env_int("E2B_MAX_FILE_WRITE_MB", 512)
     )
-    # Per-sandbox host uid isolation (E3.2): when enabled (and the worker
-    # runs as root / CAP_SETUID), every sandbox gets a distinct host uid
-    # from the pool and its workspace is chowned to that uid with 0700.
-    # Non-root workers cannot map arbitrary host uids (S1.2 fail-closed), so
-    # they degrade to the fixed worker identity + Landlock.
+    # Per-sandbox host uid isolation (E3.2) -- **on by default**: every
+    # sandbox gets a distinct host uid from the pool and its workspace is
+    # chowned to that uid with 0700. That identity is what makes the rest of
+    # the isolation story work: shared volumes protect each other with real
+    # 1777+sticky DAC, and (route B) the sandbox's `sandlock-supervise` slot
+    # runs as *that* uid, so path mediation lands writes on the sandbox
+    # instead of the worker (T5).
+    #
+    # It is a *preference*, not a promise: a non-root worker cannot map
+    # arbitrary host uids (S1.2 fail-closed) and cannot chown, so it
+    # auto-disables the pool and keeps the fixed-identity + Landlock model
+    # (E5.1) with one startup WARNING -- flipping this default therefore does
+    # not change what the unprivileged deployment shapes actually do.
+    # Set it false explicitly to get the legacy shared-uid shape back.
     per_sandbox_uid: bool = field(
-        default_factory=lambda: _env_bool("E2B_PER_SANDBOX_UID", False)
+        default_factory=lambda: _env_bool("E2B_PER_SANDBOX_UID", True)
     )
     # Host uid pool range (10000+i by default, away from image uids like
     # 1000). Workers sharing one workspace must use disjoint ranges.

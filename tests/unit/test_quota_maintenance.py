@@ -739,6 +739,7 @@ def test_create_app_nonroot_discloses_direct_quota_downgrade(
         runtime_registry=RuntimeRegistry(tmp_path),
     )
     assert [r.message for r in caplog.records if r.name == "envd_service.app"] == [
+        app_module.PER_UID_NONROOT_WARNING,
         f"{xfs_quota.NONROOT_DIRECT_QUOTA_REASON} (direct xfs_quota requires "
         "root/CAP_SYS_ADMIN; per-sandbox disk hard limits are disabled while "
         "E2B_QUOTA_VIA_AGENT=false; set E2B_QUOTA_VIA_AGENT=true and deploy "

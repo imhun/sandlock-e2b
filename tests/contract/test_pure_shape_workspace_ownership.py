@@ -3,9 +3,16 @@
 The pure shape (``E2B_BASE_IMAGE`` empty) runs commands directly with the
 host RunAs identity — no chroot, and therefore no supervisor mediation tier
 to create files on the sandbox's behalf. A root worker therefore has to
-chown the root-created workspace to the sandbox's shared host uid (legacy
-uid 1000), otherwise the first shell write to the workspace root is EACCES
-(the gate-B migration trio; evidence ``tmp/m4-bisect-t1-pure.log``).
+chown the root-created workspace to the sandbox's own host identity,
+otherwise the first shell write to the workspace root is EACCES (the gate-B
+migration trio; evidence ``tmp/m4-bisect-t1-pure.log``).
+
+"Own host identity" is per-sandbox since E3.2 became the default (the uid
+allocated from the worker's pool); with the pool switched off explicitly it is
+the legacy shared RunAs uid 1000. The assertions below therefore pin the
+*properties* that do not depend on which of the two it is: never root, never a
+blanket chmod, and the workspace root and the file the sandbox shell wrote
+share one identity -- the recorded uid on the worker.
 
 This contract locks the behavior on a real sandlock worker: a sandbox shell
 can write its workspace root, the write survives migration to another
@@ -21,14 +28,36 @@ covered by gate A).
 from __future__ import annotations
 
 import io
+import json
 import os
+import stat
 import tarfile
 
 import httpx
 import pytest
 
 from e2b import Sandbox
+from tests.conftest import TMP_ROOT
 from tests.security.conftest import sandlock_ready
+
+#: Where ``multinode_two_workers`` puts its nodes (see tests/conftest).
+_HARNESS_ROOT = TMP_ROOT / "multinode-two"
+
+
+def _recorded_host_uids(sandbox_id: str) -> set[int]:
+    """Every host uid a node recorded for this sandbox.
+
+    Migration moves the sandbox to another worker, which allocates from its own
+    pool; the source may still hold its record. Both are legitimate identities
+    for the exported bytes -- what must not happen is root ownership or an
+    identity nobody allocated.
+    """
+    uids: set[int] = set()
+    for path in _HARNESS_ROOT.glob(f"worker-*/{sandbox_id}/sandbox.json"):
+        host_uid = json.loads(path.read_text(encoding="utf-8")).get("host_uid")
+        if host_uid is not None:
+            uids.add(int(host_uid))
+    return uids
 
 #: Legacy shared RunAs uid for a root worker without per-sandbox uids
 #: (mirrors ``envd_service.uid_pool.LEGACY_SHARED_UID`` / the executor's
@@ -138,7 +167,13 @@ async def test_pure_shape_shell_writes_workspace_root_and_migration_preserves_it
             root = by_stripped.get("") or by_stripped.get(".")
             marker = by_stripped["g2-marker.txt"]
         assert root is not None, "export archive has no workspace root member"
-        assert root.uid == SHARED_RUNAS_UID
-        assert marker.uid == SHARED_RUNAS_UID
+        # One identity for the directory and for what the sandbox shell wrote,
+        # never root, and mode 0700 (alignment by chown, not by opening it up).
+        assert root.uid == marker.uid
+        assert root.uid != 0
+        assert stat.S_IMODE(root.mode) == 0o700
+        assert root.uid == SHARED_RUNAS_UID or root.uid in _recorded_host_uids(
+            sandbox_id
+        ), f"exported owner {root.uid} is neither the legacy shared uid nor a uid "             f"the workers recorded ({_recorded_host_uids(sandbox_id)})"
     finally:
         sandbox.kill()

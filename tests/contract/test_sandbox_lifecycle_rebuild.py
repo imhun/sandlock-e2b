@@ -107,7 +107,12 @@ async def test_nonexistent_binary_exits_127_with_no_output(workspace) -> None:
     if not sandlock_ready():
         pytest.skip("needs Linux + sandlock (Docker test runner)")
     runtime_registry = RuntimeRegistry(workspace)
-    settings = EnvdSettings(executor="sandlock")
+    # The sandbox is registered directly (no provisioning), so no host uid was
+    # allocated -- pin the legacy shared-identity shape instead of letting the
+    # E3.2 default fail loudly on a record the test built by hand. The route-B
+    # counterpart of this contract is
+    # tests/contract/test_route_b_executor.py::test_missing_binary_exits_127_through_the_slot
+    settings = EnvdSettings(executor="sandlock", per_sandbox_uid=False)
     app = create_envd_app(
         settings=settings,
         runtime_registry=runtime_registry,

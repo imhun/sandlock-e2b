@@ -311,6 +311,20 @@ async def test_close_leaves_no_slot_and_the_uid_is_reusable(workspace) -> None:
         second.close()
 
 
+async def test_missing_binary_exits_127_through_the_slot(workspace) -> None:
+    """A missing in-sandbox executable is the child's exit status (127, no
+    output), not an exception -- the same fork execvp semantics the in-process
+    instance has (``test_sandbox_lifecycle_rebuild``), now pinned across the
+    channel because route B is the chroot shape's default backend."""
+    ex = _executor(workspace, "sbx_rbe_127")
+    try:
+        running = await ex.start(_config(["/nonexistent-e2b-bin"], str(workspace)))
+        code, out, err = await _collect(running)
+        assert (code, out, err) == (127, b"", b"")
+    finally:
+        ex.close()
+
+
 async def test_concurrent_commands_share_one_slot_without_stalling(workspace) -> None:
     """A slot answers one verb at a time -- that must not turn into one command
     at a time.
