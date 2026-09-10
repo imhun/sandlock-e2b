@@ -72,6 +72,17 @@ workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，�
   而 `E2B_TEST_STRICT_SKIPS=1` 仍开，漏列就变 error 而不是静默少跑。
   `NET_ADMIN` 是给**夹具**用的（往 lo 上放 198.18.0.99 作为可 allow/deny 的真实源地址），
   worker 自身不需要。
+- **phase 2：`--user 65534:65534` 的无特权 worker 跑法**（`UNPRIVILEGED_PHASE=0` 可跳）：
+  上面那条「生产形」lane 仍是 **root**（只是把 cap 削到部署等价集），而
+  `docker-compose.prod.yml` 真正写的是 `user: "65534:65534"` —— 那是**第三种形态**：
+  没有 `CAP_SETUID` ⇒ uid 池自动关、租不到 route-B 槽位、沙箱就用 worker 自己的 euid
+  （E5.1），路径中介留在进程内。删掉 `mediation_run_as` 降级档之后，这一形态
+  必须自己站出来跑一遍：`tests/security/test_template_isolation.py` +
+  `tests/security/test_sandlock_isolation.py` + 两份 route-B/policy 单测，
+  实测 `47 passed / 1 skipped / 0 failed`（唯一的 skip 是那条「euid 0 才谈得上被拒」
+  的钉桩）。phase 2 用 `python:3.11-slim` 作基镜像（`PHASE2_BASE_IMAGE` 可改）：
+  本地构建的 `python-mcp:3.14` 镜像在 registry 镜像站的白名单外，且它的 rootfs
+  缓存落在 phase 1 那套 harness 目录里，65534 写不进去。
 - **原有特权跑法**：继续承担 XFS 配额全量与 loop 相关用例。
   两条 lane 的差集只应当是「配额/loop」这一类，任何别处的差集都是生产可用性缺陷。
 

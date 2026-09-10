@@ -167,7 +167,7 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   上面那条 disclosure；已登记 `docs/sandlock-upstream-issues.md` SL-12（建议 fork 用
   supervise 侧已有的 `err_msg` out 参把 create/launch 的失败原因带出来）。
 - **容器实测（首次有测试在真槽位上跑完整 chroot + `fs_denied` 链）**：
-  `tests/security/test_template_isolation.py` 三条全部重写为走生产路径
+  `tests/security/test_template_isolation.py` 三条 chroot 用例全部重写为走生产路径
   （pooled host uid + `E2B_ROUTE_B=auto` + `await executor.start()`）：
   ① `test_image_rootfs_execution` 往 rootfs 里放一个只有该镜像才有的标记文件，
   沙箱内 `cat /template-marker.txt` 精确读回 `IN_IMAGE_ROOTFS`（runner 本身也是 Debian 系，
@@ -181,24 +181,39 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
 - 连带清理：`route_b.supervise_policy_document()` 仍丢 `mediation_run_as`，注释改成
   「守卫（执行器已不再下发）」；两处 `fs_denied` 的旧注释（「文件属主变成 supervisor」）
   改为按后端说明归属（槽位=沙箱 host uid；进程内特权中介=被拒）。
-  另外 `tests/security/conftest.py` 长出三个共用件（`route_b_sandbox` /
-  `run_sh` / `require_route_b_slot` / `resolve_test_rootfs`）——**mediated chroot
+  另外 `tests/security/conftest.py` 长出四个共用件（`route_b_sandbox` /
+  `run_sh` / `require_mediation_capable` / `resolve_test_rootfs`）——**mediated chroot
   形态从此在测试里也只有一条正确搭法**，别再手搓一个进程内实例去「测」它。
 
-**终态门禁（提交 `37fa9af` 的字节上复跑；容器一律 `--privileged --network host`）**：
-gate A（chroot，`base=python-mcp:3.14`、concurrency=2、strict skips、netns 开）
-`1069 passed / 3 skipped / 0 failed`（`tmp/rb-f21-gate-a-body.log`，基线 1061/3/0，
-+8 = disclosure 参数化 6 + 一次性 builder 的档位断言 1 + 容器侧拒绝钉桩 1）；
-gate B（pure）`1068 passed / 4 skipped / 0 failed`
-（`tmp/rb-f21-gate-b-body.log`，基线 1060/4/0）；
-非特权生产形 lane `966 passed / 2 skipped / 0 failed`
-（`tmp/rb-f23-prod.log`，基线 958/2/0，仍只差 XFS prjquota 那 7 个文件）；
-mediated-chroot 专题切片（上面 6 个容器文件 28 条 + 三份 route-B/policy 单测 70 条）
-`98 passed / 0 failed`（`tmp/rb-f21-focused.log`）；
-macOS 全量 `989 passed / 83 skipped / 0 failed`（`tmp/rb-f23-macos.log`）、
-`tests/unit` `736 passed / 10 skipped`（`tmp/…` 同上，取末行）。
-skip 逐条核过：全是「Linux / root / docker / --perf / 设备能力」这类既有形状原因，
-没有一条来自 `require_route_b_slot`（容器两侧 strict skips 都开着）。
+- **删档动到了第三种形态没有？没有，但以前没人测过它**：`test-prod-shaped.sh` 那条
+  「生产形」lane 削的是 cap，进程**仍是 root**；而 compose/k8s 清单写的是
+  `user: "65534:65534"` —— 无 `CAP_SETUID` ⇒ uid 池自动关、租不到槽位、中介就是
+  worker 自己的 euid（E5.1）。这一形态恰好是「fork 只在中介能映射到**别的**非 0 uid
+  时才拒绝」的那一侧，删档不该动它。现在 lane 有 phase 2（`UNPRIVILEGED_PHASE=0` 可跳）
+  真按 `--user 65534:65534 --cap-drop ALL` 跑，并加
+  `test_unprivileged_worker_still_mediates_the_chroot` 钉住「chroot 仍限制路径空间 +
+  `_in_process_mediation_is_refused()` 为假」。
+  配套两件事：`route_b_sandbox` 的默认 `host_uid` 跟随 worker 特权（与 `app.py` 关池
+  的行为一致 —— 第一次跑就撞出「非 root 传 pool uid ⇒ fork 拒 `RunAs`」这条真约束）；
+  `require_route_b_slot` 改名 `require_mediation_capable`，判据从「租不到槽位就跳」
+  改成「两个后端都建不了才跳」，否则无特权那一相会把自己的用例跳没。
+
+**终态门禁（同一棵终态树，`tmp/final-verify.sh` 一相一容器顺序跑，绝不并发）**：
+
+| 相 | 形态 | 结果 | 日志 |
+|---|---|---|---|
+| gate A | chroot（`base=python-mcp:3.14`、concurrency=2、strict skips、netns 开、`--privileged --network host`） | `1069 passed / 4 skipped / 0 failed`（基线 1061/3/0） | `tmp/f30-gate-a.log` |
+| gate B | pure（`E2B_BASE_IMAGE=`）其余同上 | `1068 passed / 5 skipped / 0 failed`（基线 1060/4/0） | `tmp/f30-gate-b.log` |
+| focused | mediated-chroot 专题 10 个文件（含 `test_worker_nonroot`） | `100 passed / 1 skipped / 0 failed` | `tmp/f30-focused.log` |
+| prod phase 1 | root + 部署等价 capset（`--cap-drop ALL`，无 `--privileged`） | `966 passed / 3 skipped / 0 failed`（基线 958/2/0；多出的那条 skip 就是新加的无特权钉桩） | `tmp/f30-prod1.log` |
+| prod phase 2 | **`--user 65534:65534 --cap-drop ALL`**：无 uid 池、无槽位、中介留在进程内 | `47 passed / 1 skipped / 0 failed` | `tmp/f30-prod2.log` |
+| macOS | 全量（含 sdk） | `989 passed / 84 skipped / 0 failed`（基线 982/78/0） | `tmp/f30-macos.log` |
+
+skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」这类既有形状原因，
+没有一条来自 `require_mediation_capable`（容器两侧 strict skips 都开着，漏列会变 error）。
+⚠️ 门禁容器**必须 `--network host`**：漏掉它 5 条 `tests/sdk/python/test_templates.py`
+会以 `buildkit build exited with code 1` 假红（`buildctl` 在 bridge 网络里连不上
+宿主随机端口上的 buildkitd），本轮第一次跑就踩了，与代码无关。
 ⚠️ 门禁容器**必须 `--network host`**：漏掉它 5 条 `tests/sdk/python/test_templates.py`
 会以 `buildkit build exited with code 1` 假红（`buildctl` 在 bridge 网络里连不上
 `127.0.0.1:<随机端口>` 的 buildkitd），本轮第一次跑就踩了，与代码无关。

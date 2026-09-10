@@ -84,12 +84,15 @@ acquire 重新生成；socket =
    原因与修法；非 root worker（中介即沙箱自己的 euid）不构成拒绝，故不打。
    容器实测：`tests/security/test_template_isolation.py` 三条（两条走真槽位、
    一条钉住拒绝 + 对照组）。
-   删档后终态门禁（提交 `37fa9af` 字节复跑）：gate A `1069/3/0`、gate B `1068/4/0`、
-   非特权生产形 lane `966/2/0`、mediated-chroot 切片 `98/0`、macOS `989/83/0`、
-   `tests/unit` `736/10`；日志 `tmp/rb-f21-gate-a-body.log` /
-   `tmp/rb-f21-gate-b-body.log` / `tmp/rb-f21-focused.log` / `tmp/rb-f23-prod.log` /
-   `tmp/rb-f23-macos.log`（门禁容器要带 `--network host`，否则 5 条 sdk 模板构建
-   用例会因为 buildctl 连不上宿主随机端口而假红 —— 与代码无关，别当成回归）。
+   删档后终态门禁（`tmp/final-verify.sh` 顺序单容器逐相跑，互不并发）：
+   gate A `1069/4/0`、gate B `1068/5/0`、mediated-chroot 切片 `100/1/0`、
+   生产形 lane phase 1（root + 部署 capset）`966/3/0`、**phase 2
+   （`--user 65534:65534`，无池无槽位）`47/1/0`**、macOS 全量 `989/84/0`；
+   日志 `tmp/f30-gate-a.log` / `tmp/f30-gate-b.log` / `tmp/f30-focused.log` /
+   `tmp/f30-prod1.log` / `tmp/f30-prod2.log` / `tmp/f30-macos.log`。
+   两个坑记录在案：① 门禁容器必须 `--network host`，否则 5 条 sdk 模板构建用例
+   会因为 buildctl 连不上宿主随机端口而假红（与代码无关）；② 生产形 lane 从「只削
+   cap 但仍是 root」变成两相，phase 2 才是 compose 清单真正跑的形态。
 5. ✅ **门禁（终态树复跑，含 transport 1 之后）**：gate A（chroot）`1054 passed / 2 skipped / 0 failed`、
    gate B（pure）`1046 passed / 3 skipped / 0 failed`、route-B 专题切片容器
    `64 passed`；日志 `tmp/rb-gate-a2.log` / `tmp/rb-gate-b.log` /
@@ -100,6 +103,11 @@ acquire 重新生成；socket =
 6. ⬜ **生产 spawner 形态**（launcher / 外部槽位池）仍未接：现网 compose（worker
    `user: 65534`）与 k8s（无 CAP_SETUID）两套部署都不满足特权前置 ⇒ auto 档在现网
    仍走进程内后端。这一步是部署决策，不是代码缺口。
+   > 补（2026-09-10，删档后）：该形态现在**有测试了** —— `test-prod-shaped.sh` 的
+   > phase 2 就按 `--user 65534:65534 --cap-drop ALL` 跑 mediated-chroot，实测
+   > `47 passed / 1 skipped / 0 failed`（`tests/security/test_template_isolation.py::
+   > test_unprivileged_worker_still_mediates_the_chroot` 钉住「进程内中介就是自己的
+   > euid ⇒ fork 不拒绝、chroot 仍然限制路径空间」）。删档没有动到现网形态。
 
 ## 部署检查表（route-B 上线前逐条确认）
 
