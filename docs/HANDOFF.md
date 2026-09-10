@@ -202,15 +202,21 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
 
 | 相 | 形态 | 结果 | 日志 |
 |---|---|---|---|
-| gate A | chroot（`base=python-mcp:3.14`、concurrency=2、strict skips、netns 开、`--privileged --network host`） | `1069 passed / 4 skipped / 0 failed`（基线 1061/3/0） | `tmp/f30-gate-a.log` |
-| gate B | pure（`E2B_BASE_IMAGE=`）其余同上 | `1068 passed / 5 skipped / 0 failed`（基线 1060/4/0） | `tmp/f30-gate-b.log` |
-| focused | mediated-chroot 专题 10 个文件（含 `test_worker_nonroot`） | `100 passed / 1 skipped / 0 failed` | `tmp/f30-focused.log` |
-| prod phase 1 | root + 部署等价 capset（`--cap-drop ALL`，无 `--privileged`） | `966 passed / 3 skipped / 0 failed`（基线 958/2/0；多出的那条 skip 就是新加的无特权钉桩） | `tmp/f30-prod1.log` |
-| prod phase 2 | **`--user 65534:65534 --cap-drop ALL`**：无 uid 池、无槽位、中介留在进程内 | `47 passed / 1 skipped / 0 failed` | `tmp/f30-prod2.log` |
-| macOS | 全量（含 sdk） | `989 passed / 84 skipped / 0 failed`（基线 982/78/0） | `tmp/f30-macos.log` |
+| gate A | chroot（`base=python-mcp:3.14`、concurrency=2、strict skips、netns 开、`--privileged --network host`） | `1069 passed / 4 skipped / 0 failed`（基线 1061/3/0） | `tmp/f31-gate-a.log` |
+| gate B | pure（`E2B_BASE_IMAGE=`）其余同上 | `1068 passed / 5 skipped / 0 failed`（基线 1060/4/0） | `tmp/f31-gate-b.log` |
+| focused | mediated-chroot 专题 10 个文件（含 `test_worker_nonroot`） | `100 passed / 1 skipped / 0 failed` | `tmp/f31-focused.log` |
+| prod phase 1 | root + 部署等价 capset（`--cap-drop ALL`，无 `--privileged`） | `966 passed / 3 skipped / 0 failed`（基线 958/2/0；多出的那条 skip 就是新加的无特权钉桩） | `tmp/f31-prod1.log` |
+| prod phase 2 | **`--user 65534:65534 --cap-drop ALL`**：无 uid 池、无槽位、中介留在进程内 | `47 passed / 1 skipped / 0 failed` | `tmp/f31-prod2.log` |
+| macOS | 全量（含 sdk） | `989 passed / 84 skipped / 0 failed`（基线 982/78/0） | `tmp/f31-macos.log` |
 
 skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」这类既有形状原因，
 没有一条来自 `require_mediation_capable`（容器两侧 strict skips 都开着，漏列会变 error）。
+两相各跑过**两遍**（`f30-*` 在临时文件清理前、`f31-*` 在清理后），六相数字逐条相同
+⇒ 清掉的确实只是可再生产物（`tmp/` 79 GB → 6 GB，回收 75.8 GB）。清理脚本
+`tmp/cleanup_scratch.py` 默认 dry-run，且**按文档引用名保号**：凡 docs/README/spec 里
+点过名的 `tmp/*` 一律不删；`_images` 里 base 镜像的 rootfs 与 `.link` 也留着
+（`python-mcp:3.14` 已经不在 registry 镜像站白名单里，删了就重建不出来，gate A 会挂）。
+
 ⚠️ 门禁容器**必须 `--network host`**：漏掉它 5 条 `tests/sdk/python/test_templates.py`
 会以 `buildkit build exited with code 1` 假红（`buildctl` 在 bridge 网络里连不上
 宿主随机端口上的 buildkitd），本轮第一次跑就踩了，与代码无关。

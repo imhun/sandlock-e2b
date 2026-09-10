@@ -84,12 +84,13 @@ acquire 重新生成；socket =
    原因与修法；非 root worker（中介即沙箱自己的 euid）不构成拒绝，故不打。
    容器实测：`tests/security/test_template_isolation.py` 三条（两条走真槽位、
    一条钉住拒绝 + 对照组）。
-   删档后终态门禁（`tmp/final-verify.sh` 顺序单容器逐相跑，互不并发）：
+   删档后终态门禁（`tmp/final-verify.sh` / `tmp/run-f31.sh` 顺序单容器逐相跑，
+   互不并发；清理前后各一遍，六相数字逐条相同）：
    gate A `1069/4/0`、gate B `1068/5/0`、mediated-chroot 切片 `100/1/0`、
    生产形 lane phase 1（root + 部署 capset）`966/3/0`、**phase 2
    （`--user 65534:65534`，无池无槽位）`47/1/0`**、macOS 全量 `989/84/0`；
-   日志 `tmp/f30-gate-a.log` / `tmp/f30-gate-b.log` / `tmp/f30-focused.log` /
-   `tmp/f30-prod1.log` / `tmp/f30-prod2.log` / `tmp/f30-macos.log`。
+   日志 `tmp/f31-gate-a.log` / `tmp/f31-gate-b.log` / `tmp/f31-focused.log` /
+   `tmp/f31-prod1.log` / `tmp/f31-prod2.log` / `tmp/f31-macos.log`。
    两个坑记录在案：① 门禁容器必须 `--network host`，否则 5 条 sdk 模板构建用例
    会因为 buildctl 连不上宿主随机端口而假红（与代码无关）；② 生产形 lane 从「只削
    cap 但仍是 root」变成两相，phase 2 才是 compose 清单真正跑的形态。
