@@ -32,6 +32,18 @@ E2B（FastAPI envd + pytest 契约/单测）、Docker 门禁（`sandlock-dev:lat
   **`SYS_ADMIN` 与 `SYS_PTRACE` 都不是 route-B/chroot 形态的前置**
   （`docs/production-deployment-requirements.md` §2.4.1）。
 
+## 已确认的决定（2026-09-10 用户拍板，执行时按此，不再询问）
+
+| # | 决定 | 落到哪个 Task |
+|---|---|---|
+| 1 | 规范别名取 **`/home/user/<rel>`**；`_view_cwd` 返回 `/home/user`，`pwd` 与现状保持一致 | A4 Step 3 |
+| 2 | chdir 记录**请求的虚拟路径**（逻辑路径语义，接受 `..` 按逻辑解析） | A2 Step 1（原样执行） |
+| 3 | `xfs_quota` 走 **quota-agent**（不放弃配额能力） | A6 Step 2 |
+| 4 | SDK **要能看到**网关启动失败 ⇒ 落地错误上抛 | D1 |
+| 5 | **线上暂不升级**：等所有问题闭环 + 本地模拟测试全绿后再上 | C1–C3 挂起，见其入口条件 |
+| 7 | OCI 限流按**最快且测试正常**的口径：多源回落 + 测试用本地 registry 预置镜像为默认，digest 侧车仅在实测仍抖动时再加 | D2 |
+| 6 | SL-1 收口口径 —— **待你拍板**，全文见文末「附录：SL-1 现状与三种口径」 | B3 |
+
 ## 设计与证据（先读这段再动代码）
 
 探针 `tmp/vol_fs_mount_probe.py`（无 SYS_ADMIN 容器 + 真 fork wheel + route-B 槽位）实测：
@@ -442,7 +454,7 @@ Expected: verify 全绿（FFI 符号双向相等、RECORD 精确、supervise 三
 - Modify: `envd_service/runtime/context.py`（删 `_bind_mount` / `_unmount` /
   `_materialize_chroot_volume_mounts` / `_volume_bind_mounts` 及其 shutdown 段；
   `fs_mounts` 改双别名）
-- Modify: `envd_service/executors/sandlock.py`（确认点 #1 选 `/home/user` 时改 `_view_cwd`）
+- Modify: `envd_service/executors/sandlock.py`（`_view_cwd` 返回 `/home/user`——决定 ①）
 - Delete: `tests/unit/test_runtime_context_volumes.py`
 - Modify: `tests/unit/test_executor_policy.py`、`tests/unit/test_policy_mapping.py`
 - Create: `tests/contract/test_shared_volume_relative_cwd.py`
@@ -553,6 +565,22 @@ Expected: FAIL（`cat mnt/data/a.txt` Permission denied）。
 `self._volume_bind_mounts` 初始化与 `shutdown()` 中的 unmount 循环（以及
 `__init__` 里 `if record.volume_mounts: self._materialize_chroot_volume_mounts()`）。
 
+- [ ] **Step 3b: `_view_cwd` 改为 `/home/user`（决定 ①）**
+
+`envd_service/executors/sandlock.py::_view_cwd`：chroot 模式下把宿主 workspace cwd（或空
+默认值）映射为 **`/home/user`**，并把同文件两处 `mount_map` 的字面量顺序改为
+`"/home/user"` 在前、`"/workspace"` 在后（与 A2 Step 3 的"声明顺序决定平局"一致，
+让 `getcwd`/`pwd` 稳定报告 `/home/user`）：
+
+```python
+            mount_map = {
+                "/home/user": self._workspace_dir,
+                "/workspace": self._workspace_dir,
+            }
+```
+
+同步更新 `tests/unit/test_executor_policy.py` 里对 `sb.cwd` / `sb.fs_mount` 键的断言。
+
 - [ ] **Step 4: 跑契约 + 单测，确认绿**
 
 ```bash
@@ -656,11 +684,17 @@ Expected: 全绿；把祖先改回 0700 的那条变体必须红（证明断言�
 （Docker `--sysctl` / k8s `securityContext.sysctls`），验证 MCP 端口（50005+）与既有
 端口映射行为不变。
 
-- [ ] **Step 2: xfs_quota 走 agent 或接受降级**
+- [ ] **Step 2: xfs_quota 全量走 quota-agent（决定 ③）**
 
-按确认点 #3 二选一：(a) 配 `E2B_QUOTA_AGENT_URL` 走 agent（推荐）；(b) 明确接受配额降级
-（线上当前就是 `noquota` + 镜像内无 `xfs_quota`），并把"无 SYS_ADMIN ⇒ 无直接 xfs_quota"
-写进文档，配额用例按既有 `ProjectQuotaError` 降级路径断言。
+确保三条路径都经 agent 而不是 worker 侧 exec `xfs_quota`：`E2B_QUOTA_AGENT_URL` 配置项
+（存在时 `via_agent=True`）、`envd_service/xfs_quota.py` 的 `provision_project` /
+`release_project` / 扫描入口、以及 `deploy/stack` 的 agent 服务定义。
+`docs/production-deployment-requirements.md` §2.4.1 的 `SYS_ADMIN` 行删掉
+"直接执行 `xfs_quota -x`"这一条，并注明"配额能力由 quota-agent 提供，
+**不再需要 worker 持 `SYS_ADMIN`**"。
+
+降级路径保留但不再依赖 SYS_ADMIN：agent 不可达时仍按既有 `ProjectQuotaError` 降级
+（挂卷成功、无 per-sandbox 限额）并打 WARNING。
 
 - [ ] **Step 3: 验证**
 
@@ -738,15 +772,28 @@ Expected: 与上一基线逐项一致（±本次新增用例数）。
   子进程看不到主管控制端（护栏，非 bug 复现；实测当前无泄漏）。
 - [ ] **Step 3: `sh scripts/test-all.sh --supervise-root` 全绿；提交。**
 
-### Task B3：SL-1 / e2b-integration §3.1 口径收口（半天，纯文档）
+### Task B3：SL-1 / e2b-integration §3.1 口径收口（半天；按附录口径 A，
+### 若确认点 #6 选 B 则扩为「fork 修复 + wheel + 两轮全门禁」，约 3–5 天）
 
-**Files:** `third_party/sandlock/docs/e2b-integration.md` §3.1、`docs/sandlock-upstream-issues.md`
+**Files:** `third_party/sandlock/docs/e2b-integration.md` §3.1、`docs/sandlock-upstream-issues.md`、
+`tests/security/test_template_isolation.py`（补 fail-closed 断言）
 
 - [ ] **Step 1: 按现状重写 §3.1**：route-B 槽位的路径中介 euid == 沙箱 host uid（属主不再
   是 root）；进程内 + chroot + 非 0 uid 组合在 E2B 已被 fork 拒绝建箱（不再是可达面）。
 - [ ] **Step 2: 在 `docs/sandlock-upstream-issues.md` 标注 SL-1"E2B 可达面已关闭、fork 内部
   语义保留"，避免两处口径漂移。**
-- [ ] **Step 3: 按确认点 #6 拍板后，若决定关票则同步 `CHANGELOG.md`。**
+- [ ] **Step 3: 钉住 fail-closed**：新增断言——显式带 `mediation_run_as=supervisor`
+  的 chroot + 非 0 host uid 请求**必须被 fork 拒绝**（不是"允许但降级"），
+  即 E2B 侧不存在任何把它重新打开的路。
+- [ ] **Step 4: 只读核验"降级档已无下发路径"**：
+
+```bash
+rg -n "mediation_run_as" envd_service/ tests/ | rg -v "supervise_policy_document|drop|测试"
+```
+
+Expected: 只命中注释/单测；产出代码里没有任何一处设置该字段。
+
+- [ ] **Step 5: 同步 `CHANGELOG.md`；提交。**
 
 ### Task B4：fork 本地提交推送 + PR 回复（30 分钟，**需授权**）
 
@@ -766,7 +813,12 @@ Expected: 6 个既有提交（F17 `e290059`/`f20d034`/`c0f7bf5`、F18 `03cd36b`/
 
 ---
 
-## Track C — 上线与运维（**需窗口与授权，按顺序执行**）
+## Track C — 上线与运维（**当前挂起：线上暂不升级**）
+
+> **入口条件（决定 ⑤）**：Track A、Track B、Track D 全部闭环，且
+> `PROD_DROP_CAPS=SYS_ADMIN ./deploy/scripts/test-prod-shaped.sh` 与
+> `bash tmp/run-f31.sh` 六相门禁在本地**连续两轮全绿**，才开始 C1。
+> 在此之前 C1–C3 只做**离线准备**（构建产物、清单、脚本、演练 runbook），不推 ACR、不动线上。
 
 ### Task C1：镜像重建 + ACR 推送
 
@@ -813,17 +865,36 @@ Expected: 6 个既有提交（F17 `e290059`/`f20d034`/`c0f7bf5`、F18 `03cd36b`/
 
 ## Track D — 产品决策与清理
 
-### Task D1：FUP #4 —— 网关启动失败对 SDK 的可见性
+### Task D1：FUP #4 —— 网关启动失败必须对 SDK 可见（决定 ④）
 
-- [ ] **Step 1: 决策**（确认点 #4）：维持"先收 exit-0"契约，还是让 SDK 上抛错误。
-- [ ] **Step 2: 若上抛**：改 `envd_service/runtime/context.py` 的 watcher + SDK 契约，
-  新增契约测试断言错误文本逐字匹配；否则把 backlog #4 标记为"维持现状"并关闭。
+**Files:** `envd_service/runtime/context.py`（watcher）、
+`tests/contract/test_mcp_netns.py` 或新增 `tests/contract/test_mcp_gateway_failure.py`
+
+- [ ] **Step 1: 定义可见面**：网关在 `start_mcp_gateway` 后早期退出（watchdog 已捕获
+  `sandbox_id/port/stderr/exit code`）时，不能只打 ERROR——SDK 侧要能拿到失败。
+  选定的口径：**首次 `commands.run`（或 MCP 调用）返回非 0 退出码 + stderr 里带
+  `mcp gateway failed to start` 原文**，而不是先回 exit-0 让用户看到空结果。
+- [ ] **Step 2: 写失败用例**：用一个必然启动失败的 MCP 配置（例如把 gateway 入口指向
+  不存在的模块）建箱 → 调用 → 断言 `exit_code != 0` 且 stderr **逐字包含** watcher 记下的
+  失败原因文本。先跑成红（当前是 exit 0）。
+- [ ] **Step 3: 实现**：watcher 把失败原因记到 sandbox 运行时状态；命令路径在首次 exec
+  前检查该状态并直接失败（或把原因挂到该次命令的 stderr 尾部）。
+- [ ] **Step 4: 验证**：新用例绿 + `tests/contract/test_mcp_netns.py` 全绿 +
+  `tests/security/test_template_isolation.py`（MCP 基镜像形态）无漂移。
+- [ ] **Step 5: backlog #4 关闭并写证据日志名。**
 
 ### Task D2：OCI 限流回落策略
 
-- [ ] **Step 1: 决策**（确认点 #5）：给可认证 registry（ACR，现成路径），还是加
-  `<image>.digest` 侧车回落（限流期感知不到 tag 更新）。
-- [ ] **Step 2: 落地后**把 `E2B_REGISTRY_MIRRORS` 的默认形态写进部署文档，复跑 OCI 形态门禁。
+- [ ] **Step 1: 固化"最快且测试正常"的默认形态（决定 ⑦）**：把 `E2B_REGISTRY_MIRRORS`
+  的多源回落（`|` 分隔、按顺序尝试）作为默认路径写进
+  `docs/production-deployment-requirements.md`，与 `tests/conftest.py` 里 buildkitd
+  mirror 的取值方式对齐（同一 env，不再硬编码单源）。
+- [ ] **Step 2: 测试侧用本地 registry 预置镜像**（`registry:2` + `127.0.0.1:5080`，
+  镜像全集必须齐，404 按既有语义不重试），把这条写进测试文档。
+- [ ] **Step 3: 只有当 Step 1+2 落地后实测仍抖动**，才加 `<image>.digest` 侧车回落；
+  本轮不做。
+- [ ] **Step 4: 验证**：`lane pytest tests -q --perf`（OCI 形态 `E2B_BASE_IMAGE=python:3.11-slim`）
+  无 registry 相关失败；日志落 `tmp/d2-oci.log`。
 
 ### Task D3：清理授权
 
@@ -846,28 +917,80 @@ Expected: 6 个既有提交（F17 `e290059`/`f20d034`/`c0f7bf5`、F18 `03cd36b`/
 
 ---
 
-## 需要你确认的地方（阻塞项）
+## 确认状态
 
-1. **规范别名（canonical alias）选哪个？** 影响 `cwd`/`pwd`/卷挂载点：
-   - **(a) `/home/user/<rel>`（推荐）** —— 与 `spec.md:170`（"挂载到 rootfs 内
-     `/home/user/<path>`"）和官方 API 示例 `"cwd": "/home/user"` 一致；需要把
-     `_view_cwd` 改为返回 `/home/user`，沙箱内 `pwd` 相对**现状**保持不变。
-   - **(b) `/workspace/<rel>`** —— 与 E2B 现有 `_view_cwd` 注释一致，但 `pwd` 会从
-     `/home/user` 变成 `/workspace`（可见行为变更，需过一遍 SDK 兼容性）。
-   - 无论选哪个，A4 都会**两个别名都注册**；差别只在谁是"请求来源"。
-2. **A2 的语义变更是否接受**：chdir 改为记录"请求的虚拟路径"后，`cd <符号链接>` 之后的
-   `..` 按逻辑路径解析（更接近 shell 的 logical 模式），与内核"物理父目录"语义不同。
-   若要求保持物理语义，则只做 A2 Step 3（反查确定性化），并把 A1 第二条用例的期望值
-   改成 `/workspace`。
-3. **无 SYS_ADMIN 后 `xfs_quota` 怎么办**：走 quota-agent（推荐，需要 agent 常驻与
-   `E2B_QUOTA_AGENT_URL` 配置），还是接受配额降级（线上当前已是 `noquota`）。
-4. **FUP #4 的产品口径**：SDK 是否需要看见网关启动失败（现在只有 worker ERROR 日志，
-   SDK 先收 exit-0）。
-5. **B4 与 C1–C3 的授权**：是否允许推 fork 提交 / 回 PR #34#35 / 推 ACR / 拆 uid 段并
-   升级线上（现网空载，是升级窗口）。
-6. **B3 收口口径**：SL-1 按"E2B 可达面已关闭、fork 内部语义保留"办理，还是要求 fork 侧
-   把 `fs_denied` 中介身份彻底改掉（会牵动 `mediation_run_as` 语义）。
-7. **D2 的 OCI 策略**：可认证 registry，还是 digest 侧车回落。
+已拍板（2026-09-10，见文首「已确认的决定」）：#1 规范别名 `/home/user`；#2 逻辑路径
+语义；#3 quota-agent；#4 SDK 要看到网关启动失败；#5 线上暂不升级（C1–C3 挂入口条件）；
+#7 OCI 走最快口径。
+
+**仍待确认：**
+
+- **#6 SL-1 收口口径**（唯一未决项）：三种口径与代价见下方附录。默认按「口径 A
+  （E2B 可达面已关闭 + 文档收口）」执行；如果你要 fork 侧根治，则改按口径 B，
+B3 会从半天文档任务扩成「fork 修复 + wheel + 全门禁」。
+- **授权类（不是设计问题，随时可给）**：C1–C3 上线窗口、B4 的 fork push 与 PR 回复、
+D3 的删除授权。在给出之前这些 Task 保持未开始。
+
+---
+
+## 附录：SL-1 现状与三种口径（待确认 #6）
+
+### SL-1 到底是什么
+
+chroot（镜像 rootfs）形态下，沙箱的路径操作**不是**由内核直接完成，而是由监督进程
+（mediator）代执行：它在 seccomp USER_NOTIF 里解析虚拟路径 → 打开真正的宿主路径 →
+用 `SECCOMP_IOCTL_NOTIF_ADDFD` 把 fd 塞回子进程（`open_in_namespace`，
+`chroot/dispatch.rs`）。写家族（`unlinkat` / `mkdirat` / `renameat2` / `symlinkat` /
+`linkat` / `fchmodat` / `fchownat` / `truncate`，共 8 组）同样走代执行。
+
+因此**文件属主 = 代执行进程的身份**。如果 mediator 是 root、而沙箱 host uid 是 X：
+
+| 症状 | 后果 |
+|---|---|
+| 沙箱新建的文件属主是 root 而不是 X | 沙箱自己 `chmod` 该文件 EPERM；后续迁移/删除要 root |
+| `unlinkat`/`renameat2` 以 root 执行 | 1777+sticky 的"只能删自己文件"保护失效 ⇒ **跨 uid 删除** |
+| `fchmodat`/`fchownat` 以 root 执行 | 沙箱能改动本不属于它的 inode |
+
+（fork 的 `mediation_2uid` root 档用例就是这套降级的验收证据：root 属主文件 +
+跨 uid 删除确实发生过，不是纸面担忧。）
+
+### 为什么在 E2B 上已经不可达
+
+1. **route-B 把 mediator 变成沙箱自己**：槽位进程 `euid == 沙箱 host uid`（`setpriv`
+   降 uid、`CapEff=0`），代执行的属主天然正确 —— 这就是 T5 的关闭方式，且自 2026-09-09
+   起 chroot 形态默认走这条路。
+2. **fork 的 fail-closed 挡住了错配组合**：`mediation_run_as=caller`（默认）要求
+   mediator euid == 沙箱 host uid，否则**建箱前拒绝**。E2B 曾下发的
+   `mediation_run_as='supervisor'` 降级档已于 2026-09-10 从 envd 删除，
+   `route_b.supervise_policy_document()` 还会主动丢弃该字段（防止它被重新带回来）。
+3. **触发面本身被缩小**：`minimal_dev()`（P5）让 chroot 形态不再整树挂 `/dev`，
+   `/dev/shm`、`/dev/mqueue` 不再需要 `fs_denied` carve-out；E2B 现在只对
+   `/proc/kcore`、`/sys` 下发 denial，而这两个是**只读**路径 —— 只读代执行不产生
+   属主问题。
+
+结论：**E2B 的部署形态里 SL-1 的属主/删除两条后果都不可达**。剩下的只有：
+
+### 三种口径
+
+| 口径 | 动作 | 代价 | 适用前提 |
+|---|---|---|---|
+| **A（默认，推荐给 E2B 现状）** | 文档收口：按现状重写 `e2b-integration.md` §3.1 + 在上游问题索引标注"E2B 可达面已关闭、fork 内部语义保留"；并加一条契约测试钉住"错配组合必须被拒"（已有 `test_in_process_chroot_is_refused_without_a_slot`，补一条 `mediation_run_as=supervisor` 被 fork 拒绝的断言） | 0.5 天，纯 fork 文档 + 1 条测试 | 只看 E2B 自己的部署安全 |
+| **B（fork 侧根治）** | 让代执行改为**以沙箱身份**执行：`open`/`openat`/`openat2` 与 8 组写家族代执行时用 `setfsuid/setfsgid(沙箱 uid)` 包住（或至少 `O_CREAT` 后 `fchown` 回沙箱 uid + 写家族按调用方复现 DAC 判定）。fork 文件：`chroot/dispatch.rs`（9 处代执行点 + 3 个 `openat2_in_root` 调用点）、`seccomp/notif.rs`、`sandbox.rs`（身份字段传递） | **3–5 天**（fork 改 + RED + `mediation_2uid` 改判 + wheel + 两轮全门禁）；且 `mediation_run_as=supervisor` 从"降级档"变成"安全档"，P2 的语义要重写 | 把 fork 当**通用库/上游**发布；或将来出现"特权 mediator + 非特权沙箱"的第三方用法 |
+| **C（删档）** | 直接删掉 `mediation_run_as=supervisor` 这个 tier，只保留 `caller` + fail-closed | 2 天；**破坏性**：已有依赖该逃生门的调用方（P2 的迁移承诺）会断 | 确认没有任何外部使用者（上游未发布过则可行） |
+
+### 我的判断
+
+E2B 自己的部署不需要口径 B/C —— 上线用的是 route-B，二者都不会踩到 SL-1。真正值得做
+的是两件不同的事：
+
+1. **必须做（口径 A）**：把"为什么现在安全"写进 fork 文档，并加一条测试钉住
+   fail-closed 与降级档的现状，避免将来有人重新打开 `supervisor` 档而没人发现。
+2. **建议做（口径 B 的"最小版"）**：只修**属主那半**（`O_CREAT` 代执行后把属主改成
+   沙箱 uid），不改写家族的 DAC 复现。理由：属主错误会让用户**看得见**的功能受损
+   （chmod 失败、迁移要 root），而跨 uid 删除只在"denied 路径下有可写对象"时才可能，
+   当前 E2B 形态里没有这种对象。最小版约 1 天，且能让 `supervisor` 档不再是
+   "文件属主错位"的陷阱。是否做取决于你是否打算把 fork 交给上游（M7）——
+   如果 M7 会推进，建议做；只自用则 A 足够。
 
 ## Self-Review
 
