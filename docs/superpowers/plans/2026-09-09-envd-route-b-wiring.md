@@ -101,9 +101,13 @@ acquire 重新生成；socket =
    `tmp/rb-focused.log`。
    性能：租槽位只落在每沙箱**第一条命令**（in-process 10.63 ms → route-B 57.11 ms，
    +46 ms），稳态 exec 无差异（warm p50 4.29 → 4.35 ms）——`tmp/perf/route-b-first-exec.txt`。
-6. ⬜ **生产 spawner 形态**（launcher / 外部槽位池）仍未接：现网 compose（worker
-   `user: 65534`）与 k8s（无 CAP_SETUID）两套部署都不满足特权前置 ⇒ auto 档在现网
-   仍走进程内后端。这一步是部署决策，不是代码缺口。
+6. ⬜ **生产 spawner 形态**（launcher / 外部槽位池）仍未接 —— 但**它的定位要改**：
+   审计（2026-09-10）发现现网 worker 实际是 root + Docker 默认 cap 集（含
+   `SETUID`/`SETGID`/`CHOWN`）+ `SYS_ADMIN`，**特权前置已经满足**；`k8s/worker.yaml` 的
+   `capabilities.add` 也是"在默认集上追加"，不是"只给这两条"。所以挡住 auto 档落地的
+   不是特权，而是**镜像里的 wheel 没有 route-B 语言面**与**两个 worker 的 uid 段没拆开**。
+   launcher / 外部槽位池这条路，因此从"上线前置"降级为"当部署必须非 root 时才需要"。
+   见 `docs/production-deployment-requirements.md` §2.4 线上审计块与 HANDOFF 同名块。
    > **审计更正（2026-09-10）**：这句的前提按**仓库清单**成立、按**线上实态**不成立 ——
    > 线上 worker 实际是 root（远端清单无 `user:` 行、旧镜像无 `USER`）。所以现网 auto 档
    > 并不是"因为没特权而缩退"，而是"因为 **wheel 不带 route-B 语言面**而缩退"
