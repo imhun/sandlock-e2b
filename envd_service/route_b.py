@@ -815,11 +815,12 @@ def supervise_policy_document(ceiling: dict) -> dict:
     Same fields, wire spellings only: ``fs_mount`` becomes the spec list, the
     ``None`` values the Python builder treats as "unset" are dropped (an
     explicit ``null`` is an unknown *value* on the wire, not an omission), and
-    ``mediation_run_as`` is dropped because a route-B slot never uses the
-    supervisor downgrade tier -- its mediator is this uid, which is the whole
-    point of the route. Anything the wire does not know is refused by name
-    before the slot is spawned, rather than by a fork that fails closed
-    later.
+    ``mediation_run_as`` is dropped as a guard: the executor stopped sending it
+    in 2026-09-10 when E2B removed the supervisor downgrade tier, and a slot
+    must never carry it even if some future ceiling does -- its mediator already
+    *is* this uid, which is the whole point of the route. Anything the wire does
+    not know is refused by name before the slot is spawned, rather than by a
+    fork that fails closed later.
     """
     doc: dict = {}
     for key, value in ceiling.items():

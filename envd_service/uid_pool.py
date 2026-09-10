@@ -69,6 +69,12 @@ LEGACY_SHARED_UID = 1000
 #: Kernel capability numbers (capabilities(7)) that the sandbox identity path
 #: depends on but that a hardened container may have dropped.
 CAP_SYS_PTRACE = 19
+#: The pair that lets a *non-root* worker remap a sandbox to another host uid
+#: (the file-cap launcher shape). The fork treats a mediator holding them as
+#: privileged for exactly this reason, so E2B has to ask the same question
+#: before it claims an in-process create will be refused.
+CAP_SETGID = 6
+CAP_SETUID = 7
 
 
 def _cap_eff() -> int | None:

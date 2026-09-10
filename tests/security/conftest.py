@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 import sys
 import tempfile
@@ -175,4 +176,111 @@ def require_sandlock():
             f"sandlock cannot execute commands in this environment "
             f"(smoke test exit_code={smoke.exit_code}, error={smoke.error!r}); "
             "run the test runner with seccomp unconfined / privileged"
+        )
+
+
+# --------------------------------------------------------------------------
+# Chroot (image-rootfs) sandboxes on the production path
+# --------------------------------------------------------------------------
+#
+# The chroot shape is the only one where E2B asks the fork for path mediation
+# (`fs_denied` + chroot), and mediation now runs in the sandbox's own host uid
+# -- inside a route-B `sandlock-supervise` slot. E2B no longer sets the fork's
+# `mediation_run_as=supervisor` downgrade tier, so an in-process mediated
+# create on a privileged worker is *refused* rather than silently producing
+# supervisor-owned files (T5). Tests of this shape therefore have to build the
+# sandbox the way the worker does, which is what these helpers do.
+
+_slot_serial = itertools.count()
+
+
+def resolve_test_rootfs(image: str = "python:3.11-slim") -> Path:
+    """The image rootfs, extracted into a cache directory this test owns.
+
+    Pulled through the registry client (no Docker daemon needed), so the same
+    helper serves the Docker-less production-shape lane.
+    """
+    from envd_service.runtime.image_resolver import resolve_image_rootfs
+
+    return resolve_image_rootfs(image, str(sandbox_tmpdir(suffix="-cache")))
+
+
+def route_b_sandbox(
+    image: str | None,
+    rootfs: Path | None,
+    *,
+    with_route_b: bool = True,
+) -> tuple["object", Path]:
+    """A sandbox built the way the worker builds one, as (executor, workspace).
+
+    ``image`` + ``rootfs`` are the chroot (mediated) shape; both ``None`` give
+    the pure shape, which asks the fork for no mediation at all -- the control
+    that tells a mediation refusal apart from a runner that cannot create any
+    sandbox.
+
+    ``with_route_b`` mirrors the production default (``E2B_ROUTE_B=auto``): the
+    mediated shape is exactly the one auto engages a slot for. ``False`` stands
+    for an operator who set ``E2B_ROUTE_B=off``.
+    """
+    from envd_service.executors.sandlock import SandlockExecutor
+    from envd_service.route_b import RouteBConfig
+
+    workspace = sandbox_tmpdir(suffix="-ws")
+    executor = SandlockExecutor(
+        workspace_dir=str(workspace),
+        base_image=image,
+        image_rootfs=rootfs,
+        host_uid=SANDBOX_UID,
+        per_sandbox_uid=True,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=False,
+        sandbox_id=f"sbx_slot_{next(_slot_serial)}",
+        route_b=RouteBConfig(
+            mode="auto" if with_route_b else "off",
+            uid_start=SANDBOX_UID,
+            uid_size=2,
+            tmp_root=sandbox_tmpdir(suffix="-route-b"),
+        ),
+    )
+    return executor, workspace
+
+
+async def run_sh(executor, cwd: str | Path, sh: str) -> tuple[int, bytes, bytes]:
+    """``start()`` + drain: how the process manager runs one command."""
+    from envd_service.executors.base import ExecConfig
+
+    running = await executor.start(
+        ExecConfig(
+            cmd=["/bin/sh", "-c", sh],
+            env={},
+            cwd=str(cwd),
+            stdin_enabled=False,
+        )
+    )
+    out: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    async for kind, chunk in running.output():
+        if kind in out:
+            out[kind].append(chunk)
+    code = await running.exit_code()
+    return code, b"".join(out["stdout"]), b"".join(out["stderr"])
+
+
+def require_route_b_slot(executor) -> None:
+    """Skip when this runner cannot mediate the shape at all.
+
+    A slot needs a starter able to drop to the sandbox uid (root/CAP_SETUID)
+    and the wheel's ``sandlock-supervise``. Without both there is no way to run
+    a mediated chroot sandbox -- which is the point -- and asserting anyway
+    would let an ``exit_code != 0`` check pass vacuously.
+    """
+    if not executor._route_b_active:
+        pytest.skip(
+            "the mediated chroot shape only runs on a route-B slot, and this "
+            f"worker declined one ({executor._route_b_decline}); needs a root "
+            "worker plus the wheel's sandlock-supervise binary"
         )

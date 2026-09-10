@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 
+import envd_service.executors.sandlock as sl
+from envd_service.executors.base import ExecConfig
 from envd_service.executors.sandlock import SandlockExecutor
 
 
@@ -79,12 +81,16 @@ def test_image_rootfs_shape_keeps_only_defensive_denials(tmp_path) -> None:
     assert "/dev/mqueue" not in sandbox.fs_denied
 
 
-def test_root_image_rootfs_policy_carries_supervisor_mediation(
-    monkeypatch, tmp_path
-) -> None:
-    """Root worker + image-rootfs shape opts into the supervisor mediation tier
-    (pre-M4 baseline: explicit downgrade tier restoring F9-era semantics; to be
-    removed once route-B per-sandbox supervision lands)."""
+def test_chroot_policy_sends_no_mediation_tier(monkeypatch, tmp_path) -> None:
+    """The supervisor downgrade tier is gone (2026-09-10).
+
+    E2B used to send `mediation_run_as='supervisor'` for a root worker with the
+    image-rootfs shape -- which is precisely what made mediated writes belong to
+    the worker instead of the sandbox (T5). Chroot sandboxes now run on a
+    supervise slot whose euid *is* the sandbox's host uid, so no tier is sent at
+    all and the fork keeps its fail-closed `caller` default: an in-process
+    chroot create is refused rather than silently degrading ownership.
+    """
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     rootfs = tmp_path / "rootfs"
     rootfs.mkdir()
@@ -100,17 +106,32 @@ def test_root_image_rootfs_policy_carries_supervisor_mediation(
         allow_internet_access=False,
         enable_network=False,
     )
-    sandbox = _policy(executor)
-    assert sandbox.mediation_run_as == "supervisor"
+    ceiling = executor._policy_ceiling()
+    assert "mediation_run_as" not in ceiling
+    # Mediation really is in play in this shape -- which is why the fork's
+    # default would refuse it in-process, and why route B exists.
+    assert ceiling["fs_denied"] == ["/proc/kcore", "/sys"]
+    assert ceiling["chroot"] == str(rootfs)
+    assert executor._route_b_active is False, (
+        "no route-B config was passed here, so this is the disclosed shape"
+    )
 
 
-def test_nonroot_policy_keeps_caller_mediation(monkeypatch) -> None:
-    """Non-root worker keeps the fork's default caller mediation tier."""
-    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+def test_one_shot_builder_sends_no_mediation_tier(monkeypatch, tmp_path) -> None:
+    """The one-shot builder is the second place the tier used to be set.
+
+    Off Linux ``_build_sandbox`` hands back the kwargs mirror, where absence is
+    directly visible; on Linux the SDK object always carries the field, so the
+    assertion becomes "it is the fork's fail-closed default", which is the same
+    fact from the other side.
+    """
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
     executor = SandlockExecutor(
-        workspace_dir="/tmp/ws",
-        base_image=None,
-        image_rootfs=None,
+        workspace_dir=str(tmp_path / "ws"),
+        base_image="python:3.11-slim",
+        image_rootfs=rootfs,
         memory_mb=512,
         cpu_percent=100,
         disk_mb=1024,
@@ -119,8 +140,15 @@ def test_nonroot_policy_keeps_caller_mediation(monkeypatch) -> None:
         allow_internet_access=False,
         enable_network=False,
     )
-    sandbox = _policy(executor)
-    assert sandbox.mediation_run_as == "caller"
+    one_shot = executor._build_sandbox(
+        ExecConfig(
+            cmd=["/bin/true"], env={}, cwd=str(tmp_path / "ws"), stdin_enabled=False
+        )
+    )
+    if sl.sandlock is None:
+        assert "mediation_run_as" not in vars(one_shot)
+    else:
+        assert one_shot.mediation_run_as == "caller"
 
 
 def test_network_enabled_maps_to_allowlist():

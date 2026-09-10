@@ -27,6 +27,12 @@ from pathlib import Path
 from gateway_common.errors import ConnectError, unimplemented
 from gateway_common.network import NetworkUpdateConflictError
 from envd_service.executors.base import ExecConfig, Executor, RunningProcess
+from envd_service.uid_pool import (
+    CAP_SETGID,
+    CAP_SETUID,
+    LEGACY_SHARED_UID,
+    has_effective_cap,
+)
 from envd_service.route_b import (
     RouteBConfig,
     RouteBInstance,
@@ -277,7 +283,7 @@ class SandlockExecutor(Executor):
     instance stays ``None`` (D11).
 
     The instance has two interchangeable backends, chosen once per sandbox by
-    :meth:`_route_b_selected`: the **in-process** ``sandlock.SandboxInstance``
+    :meth:`_route_b_decline_reason`: the **in-process** ``sandlock.SandboxInstance``
     (the mediator is the worker process), or a **route-B** ``sandlock-supervise``
     slot leased from :mod:`envd_service.route_b` (the mediator is a process
     whose euid *is* this sandbox's host uid, so mediated path operations land
@@ -288,8 +294,6 @@ class SandlockExecutor(Executor):
     """
 
     _non_root_fallback_warned = False
-    _route_b_no_starter_warned = False
-    _route_b_no_fd_client_warned = False
 
     def __init__(
         self,
@@ -364,7 +368,9 @@ class SandlockExecutor(Executor):
         # instance; the decision itself is made once here because every input
         # (shape, uid, platform, starter privilege) is fixed at construction.
         self._route_b = route_b
-        self._route_b_active = self._route_b_selected()
+        self._route_b_decline = self._route_b_decline_reason()
+        self._route_b_active = self._route_b_decline is None
+        self._disclose_mediation_shape()
         self._instance = None
         self._instance_name: str | None = None
         # Set by ``close()`` (the single shutdown point). Guards the
@@ -590,97 +596,175 @@ class SandlockExecutor(Executor):
 
         return "sbx_" + hashlib.sha256(sid.encode()).hexdigest()[:16]
 
-    def _route_b_selected(self) -> bool:
-        """Decide once whether this sandbox's commands run on a supervise slot.
+    # Warn-once switches for the shapes that decline a slot. The reason itself
+    # comes from `_route_b_decline_reason` -- one decision, quoted verbatim by
+    # the disclosure below, so the message can never disagree with the rule.
+    _route_b_no_starter_warned = False
+    _route_b_no_fd_client_warned = False
+    _mediation_shape_disclosed = False
 
-        Route B needs a *per-sandbox host uid*: the slot process **is** that
-        uid (``docs/supervise-identity-handoff.md`` §5), and W1 forbids two
-        live generations on one uid, so a shared-uid sandbox cannot have a
-        slot. It also needs the native library, the ``sandlock-supervise``
-        binary the wheel ships, and a starter that can drop privileges.
+    def _route_b_decline_reason(self) -> str | None:
+        """Why this sandbox does not run on a supervise slot, or None if it does.
 
-        ``auto`` applies it where it matters: the chroot (image-rootfs) shape
-        is the only one where ``fs_denied`` mediation runs, and mediating as
-        the sandbox's own uid is exactly what fixes the supervisor-owned
-        writes behind T5. ``E2B_ROUTE_B_SLOTS>0`` or ``E2B_ROUTE_B=on`` asks
-        for the slot in every shape instead. An operator who explicitly asked
-        for route B and cannot get it fails loudly -- route A vs route B is a
+        Route B needs a *per-sandbox host uid*: the slot process **is** that uid
+        (``docs/supervise-identity-handoff.md`` §5), and W1 forbids two live
+        generations on one uid, so a shared-uid sandbox cannot have a slot. It
+        also needs the native library, the ``sandlock-supervise`` binary the
+        wheel ships, and a starter that can drop privileges.
+
+        ``auto`` engages where it matters: the chroot (image-rootfs) shape is
+        the only one where ``fs_denied``/chroot path mediation runs, and
+        mediating as the sandbox's own uid is what makes mediated writes belong
+        to the sandbox (T5). ``E2B_ROUTE_B_SLOTS>0`` or ``E2B_ROUTE_B=on`` asks
+        for a slot in every shape instead. An operator who explicitly asked for
+        route B and cannot get it fails loudly -- route A vs route B is a
         deployment decision, never a silent downgrade (§8).
         """
         cfg = self._route_b
-        if cfg is None or cfg.mode == "off" or sandlock is None:
-            return False
+        if cfg is None:
+            return "the worker passed no route-B config (E2B_ROUTE_B_* unset)"
+        if cfg.mode == "off":
+            return "E2B_ROUTE_B=off"
+        if sandlock is None:
+            return "the native sandlock module is unavailable"
         forced = cfg.mode == "on" or cfg.slots > 0
         mediation_shape = bool(self._base_image and self._image_rootfs is not None)
         if not (forced or mediation_shape):
-            return False
+            return "auto keeps the pure (no-chroot) shape in-process: it mediates nothing"
         if not self._per_sandbox_uid or self._host_uid is None:
+            reason = (
+                "no per-sandbox host uid (E2B_PER_SANDBOX_UID off, or the uid "
+                "pool allocated nothing): a slot runs as the sandbox's own uid"
+            )
             if forced:
                 raise RuntimeError(
                     "route B was requested (E2B_ROUTE_B=on / E2B_ROUTE_B_SLOTS>0) "
-                    "but this sandbox has no per-sandbox host uid: a "
-                    "sandlock-supervise slot runs as the sandbox's own uid, so "
-                    "E2B_PER_SANDBOX_UID and an allocated host_uid are required"
+                    "but " + reason
                 )
-            return False
+            return reason
         if not cfg.privileged_starter:
+            reason = (
+                f"this worker cannot start a slot as uid {self._host_uid} "
+                "(needs root / CAP_SETUID or an injected launcher spawner)"
+            )
             if forced:
-                raise RuntimeError(
-                    "route B was requested but this worker cannot start a slot "
-                    f"as uid {self._host_uid} (needs root / CAP_SETUID or an "
-                    "injected launcher spawner)"
-                )
+                raise RuntimeError("route B was requested but " + reason)
             if not type(self)._route_b_no_starter_warned:
                 type(self)._route_b_no_starter_warned = True
                 logger.warning(
-                    "route B unavailable for sandbox_id=%s: a slot must be "
-                    "started as the sandbox host uid and this worker is not "
-                    "privileged; mediation stays on the in-process "
-                    "supervisor tier (T5 owner semantics apply)",
+                    "route B unavailable for sandbox_id=%s: %s; mediation stays "
+                    "in-process, which for the chroot shape now fails closed "
+                    "(T5 is not traded back)",
                     self._sandbox_id or "-",
+                    reason,
                 )
-            return False
-        from envd_service.route_b import (
-            default_supervise_bin,
-            fd_client_available,
-        )
+            return reason
+        from envd_service.route_b import default_supervise_bin, fd_client_available
 
         if cfg.transport == "fd" and not fd_client_available():
-            # The wheel predates fork F17: it can *serve* an fd handoff but the
+            # The wheel predates fork F17: it can serve an fd handoff but the
             # worker cannot drive one. Falling back to `path` would put a
             # channel token into the slot's argv, so that is an operator
             # decision, not something to do quietly.
+            reason = (
+                "the installed sandlock wheel has no sandlock_supervise_connect_fd "
+                "(needs fork F17 or newer)"
+            )
             if forced:
                 raise RuntimeError(
-                    "route B was requested with transport=fd, but the installed"
-                    " sandlock wheel has no sandlock_supervise_connect_fd "
-                    "(needs fork F17 or newer): rebuild wheels/fork/ or set "
-                    "E2B_ROUTE_B_TRANSPORT=path"
+                    "route B was requested with transport=fd, but " + reason
+                    + ": rebuild wheels/fork/ or set E2B_ROUTE_B_TRANSPORT=path"
                 )
             if not type(self)._route_b_no_fd_client_warned:
                 type(self)._route_b_no_fd_client_warned = True
                 logger.warning(
-                    "route B unavailable for sandbox_id=%s: the wheel's FFI has "
-                    "no fd-handoff client (fork F17+); running the in-process "
-                    "instance instead of putting a channel token in argv "
-                    "(rebuild wheels/fork/ or set E2B_ROUTE_B_TRANSPORT=path)",
+                    "route B unavailable for sandbox_id=%s: %s; not falling back to "
+                    "the registered transport, whose token would sit in the slot's "
+                    "world-readable argv (rebuild wheels/fork/ or set "
+                    "E2B_ROUTE_B_TRANSPORT=path deliberately)",
                     self._sandbox_id or "-",
+                    reason,
                 )
-            return False
-
+            return reason
         if not default_supervise_bin().exists():
-            if forced:
-                raise RuntimeError(
-                    f"route B was requested but {default_supervise_bin()} is "
-                    "missing (the sandlock wheel ships the supervise binary)"
-                )
-            logger.warning(
-                "route B unavailable: %s missing from the sandlock wheel; "
-                "running the in-process instance",
-                default_supervise_bin(),
+            reason = (
+                f"{default_supervise_bin()} is missing (the sandlock wheel ships "
+                "the supervise binary)"
             )
+            if forced:
+                raise RuntimeError("route B was requested but " + reason)
+            logger.warning(
+                "route B unavailable for sandbox_id=%s: %s; running the in-process "
+                "instance",
+                self._sandbox_id or "-",
+                reason,
+            )
+            return reason
+        return None
+
+    def _disclose_mediation_shape(self) -> None:
+        """Say up front what an in-process chroot sandbox now means.
+
+        E2B no longer sets the fork's ``mediation_run_as=supervisor`` tier, so
+        the combination the tier used to paper over -- privileged in-process
+        mediator + path mediation + a non-zero sandbox host uid -- is refused by
+        the fork instead of silently producing supervisor-owned files (SL-1/T5).
+        None of that reaches the operator through the library, though: the FFI
+        create/launch entry points return a null handle and the SDK turns it into
+        ``sandlock_instance_launch failed`` (SL-12), so this is the only place
+        that says which rule fired and *why no slot was available* -- with the
+        reason quoted from the very function that decided it.
+        """
+        if self._route_b_active or type(self)._mediation_shape_disclosed:
+            return
+        if sandlock is None or not self._in_process_mediation_is_refused():
+            return
+        type(self)._mediation_shape_disclosed = True
+        logger.error(
+            "chroot (image-rootfs) sandbox_id=%s runs in-process, not on a "
+            "supervise slot (%s): path mediation would then execute as the "
+            "mediator, so the fork refuses the create instead of leaving "
+            "supervisor-owned files behind (T5, no downgrade tier is set any "
+            "more). Fix: keep E2B_PER_SANDBOX_UID on and let route B lease a "
+            "slot (E2B_ROUTE_B=auto/on), or run a privileged launcher or an "
+            "external slot fleet.",
+            self._sandbox_id or "-",
+            self._route_b_decline or "reason unavailable",
+        )
+
+    def _in_process_mediation_is_refused(self) -> bool:
+        """Would the fork refuse *this* sandbox's in-process path mediation?
+
+        Mirrors the fork's C-tier check (``mediation_remap_is_refused``: F6.1
+        fail-closed, F14 privilege rule). Mediated path operations run in the
+        mediator, so a mediator that can remap the sandbox to a *different*
+        non-zero host uid attributes the sandbox's own files to itself (T5) and
+        the create is refused now that nothing asks for the ``supervisor`` tier.
+
+        The distinction matters because this predicate gates a loud ERROR: a
+        non-root worker (E5.1) mediates as its own euid, which *is* the
+        sandbox's host uid, so nothing is refused there and disclosing it on
+        every unprivileged run would be a false alarm.
+        """
+        if not (self._base_image and self._image_rootfs is not None):
             return False
-        return True
+        if self._per_sandbox_uid:
+            if self._host_uid is None:
+                # A root worker fails the create on the missing allocation
+                # itself (`_run_as_identity` raises); this is not that error.
+                return False
+            host_uid = self._host_uid
+        else:
+            host_uid = LEGACY_SHARED_UID if os.geteuid() == 0 else os.geteuid()
+        mediator_euid = os.geteuid()
+        if mediator_euid == 0:
+            return host_uid != 0
+        return (
+            host_uid != 0
+            and host_uid != mediator_euid
+            and has_effective_cap(CAP_SETUID)
+            and has_effective_cap(CAP_SETGID)
+        )
 
     def _slot_key(self) -> str:
         """The pool key for this sandbox (slots are leased per sandbox)."""
@@ -815,7 +899,7 @@ class SandlockExecutor(Executor):
         """Creation core; caller must hold ``_lifecycle_lock``.
 
         A route-B instance needs the supervise binary and the native channel
-        client (checked by :meth:`_route_b_selected`), not the in-process
+        client (checked by :meth:`_route_b_decline_reason`), not the in-process
         ``SandboxInstance`` class, so the availability guard only applies to
         the in-process backend.
         """
@@ -1034,22 +1118,6 @@ class SandlockExecutor(Executor):
             return 1000, 1000
         return os.geteuid(), os.getegid()
 
-    def _mediation_run_as(self) -> str:
-        """F6.1 C 档 fail-closed 与现网形态的桥（仅进程内后端用到）。
-        root worker + RunAs(非 0) + chroot 路径中介 ⇒ 默认 caller 会在建箱前被拒，
-        显式降级档恢复 F9 前语义（fork 每次 launch WARN + stats.mediation_downgrades
-        计数）；非 root 无降级。代价就是 T5：代打开的文件属主是 worker（root），
-        per-uid 卷保护回不来。
-
-        route-B 选中时这个键根本不下发（``supervise_policy_document`` 丢弃
-        ``mediation_run_as``）——slot 的中介就是沙箱自己的 host uid，不需要降级。
-        因此本档只服务「route-B 不可用」的形态（非 root worker、无 per-sandbox uid、
-        显式 ``E2B_ROUTE_B=off``），随 route-B 成为该形态默认档后可整体移除
-        （docs/task-backlog.md #5 剩余项）。
-        """
-        if os.geteuid() == 0 and self._base_image and self._image_rootfs is not None:
-            return "supervisor"
-        return "caller"
 
     def _mint_iam_jwt(self, audience: str) -> str:
         """Mint a JWT-SVID for a registered workload identity.
@@ -1161,11 +1229,12 @@ class SandlockExecutor(Executor):
         # Denials are only issued where the sandbox can actually see the
         # path: without a chroot, Landlock is an allow-list and shared paths
         # like /dev/shm are already unreachable (not in fs_readable), so
-        # rules would add nothing -- and issuing them would cost the sandbox
-        # its own file ownership: sandlock enforces denials through its
-        # on-behalf open path, so every file the sandbox creates is then
-        # attributed to the supervisor (host uid 0) instead of the sandbox
-        # host uid.
+        # rules would add nothing -- and they would cost something: a denial is
+        # enforced by an on-behalf open the *mediator* performs, so mediated
+        # writes belong to whoever mediates. On a route-B slot that is this
+        # sandbox's host uid (T5's fix); on a privileged in-process mediator it
+        # would be host uid 0, which the fork refuses outright now that E2B no
+        # longer asks for the supervisor tier (SL-1).
         fs_denied: list[str] = []
         if self._base_image and self._image_rootfs is not None:
             # Image rootfs mode: "/" resolves inside the chroot (the image
@@ -1229,7 +1298,6 @@ class SandlockExecutor(Executor):
             "notify_rate_limit": self._notify_rate_limit or None,
             "uid": sandbox_uid,
             "gid": sandbox_gid,
-            "mediation_run_as": self._mediation_run_as(),
         }
         if self._mcp_bind_port is not None:
             # The SDK starts the MCP gateway inside the sandbox; the whole
@@ -1423,7 +1491,6 @@ class SandlockExecutor(Executor):
             "cwd": config.cwd,
             "uid": sandbox_uid,
             "gid": sandbox_gid,
-            "mediation_run_as": self._mediation_run_as(),
         }
         if "mcp-gateway" in " ".join(config.cmd):
             # The SDK starts the MCP gateway inside the sandbox; it must be

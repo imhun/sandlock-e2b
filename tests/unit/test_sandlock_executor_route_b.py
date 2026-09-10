@@ -299,15 +299,15 @@ def test_route_b_selection_matrix(monkeypatch, case) -> None:
     assert ex._route_b_active is case["want"]
 
 
-def test_non_root_auto_keeps_the_in_process_supervisor_tier(monkeypatch) -> None:
-    """A worker that cannot start a slot stays on route A -- and keeps the
-    documented T5 owner semantics (``mediation_run_as=supervisor``)."""
+def test_non_root_auto_keeps_the_in_process_model_and_says_why(monkeypatch) -> None:
+    """A worker that cannot start a slot stays in-process -- with the reason on
+    record, not silently. It no longer opts into a mediation tier either."""
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    sl.SandlockExecutor._mediation_shape_disclosed = False
     ex = _executor(monkeypatch, route_b=_config(mode="auto"))
     assert ex._route_b_active is False
-    # A non-root worker mediates as the sandbox's own uid already, so it never
-    # needed the downgrade tier; only a root worker on the chroot shape does.
-    assert ex._policy_ceiling()["mediation_run_as"] == "caller"
+    assert "cannot start a slot as uid" in ex._route_b_decline
+    assert "mediation_run_as" not in ex._policy_ceiling()
 
 
 def test_forced_route_b_without_a_privileged_starter_fails_loudly(monkeypatch) -> None:
@@ -326,7 +326,7 @@ def test_forced_route_b_without_a_host_uid_fails_loudly(monkeypatch) -> None:
     with pytest.raises(
         RuntimeError,
         match=r"^route B was requested \(E2B_ROUTE_B=on / E2B_ROUTE_B_SLOTS>0\) "
-        r"but this sandbox has no per-sandbox host uid",
+        r"but no per-sandbox host uid",
     ):
         _executor(monkeypatch, route_b=_config(mode="on"), host_uid=None)
 
@@ -361,15 +361,18 @@ def test_missing_supervise_binary_keeps_the_in_process_backend(
     assert ex._route_b_active is False
 
 
-def test_route_b_drops_the_supervisor_downgrade_tier(monkeypatch) -> None:
-    """The downgrade is an in-process-only escape hatch: the document that
-    reaches the slot carries no ``mediation_run_as`` at all."""
+def test_the_ceiling_carries_no_mediation_tier_for_the_slot(monkeypatch) -> None:
+    """Two layers of the same guarantee: the ceiling never sets the tier, and
+    `supervise_policy_document` would drop it anyway -- a slot must never be
+    told to mediate as a supervisor, since its mediator already *is* the
+    sandbox uid (that is the point of the route)."""
     ex = _executor(monkeypatch, route_b=_config(mode="auto"))
     ceiling = ex._policy_ceiling()
-    assert ceiling["mediation_run_as"] == "supervisor"
-    document = rb.supervise_policy_document(ceiling)
-    assert "mediation_run_as" not in document
-    assert document["uid"] == HOST_UID == document["gid"]
+    assert "mediation_run_as" not in ceiling
+    assert ceiling["uid"] == HOST_UID == ceiling["gid"]
+    assert "mediation_run_as" not in rb.supervise_policy_document(
+        dict(ceiling, mediation_run_as="supervisor")
+    )
 
 
 # ------------------------------------------------------------------ lease
@@ -571,3 +574,88 @@ async def test_network_update_goes_to_the_slot_and_logs_staleness(
         ex.update_network({"allowOut": []})
     assert pool.log[-1] == ("update_network", {"ips": []}, ())
     assert "stale_child_count=1" in caplog.text
+
+
+def test_in_process_chroot_shape_is_disclosed(monkeypatch, caplog) -> None:
+    """Losing the tier must not turn into a cryptic create failure.
+
+    A privileged worker with the chroot shape and no slot is exactly the case
+    the fork now refuses. The refusal reason never reaches us through the FFI
+    (SL-12: a null handle becomes `sandlock_instance_launch failed`), so the
+    executor says it once, up front, naming why no slot was available.
+    """
+    import logging
+
+    sl.SandlockExecutor._mediation_shape_disclosed = False
+    with caplog.at_level(logging.ERROR, logger="envd_service.executors.sandlock"):
+        ex = _executor(monkeypatch, route_b=None)
+    assert ex._route_b_active is False
+    messages = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(messages) == 1, messages
+    assert "runs in-process, not on a supervise slot" in messages[0]
+    assert "the worker passed no route-B config" in messages[0]
+    assert "E2B_PER_SANDBOX_UID" in messages[0]
+
+    # Disclosed once per process, and not at all when a slot is in use.
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="envd_service.executors.sandlock"):
+        _executor(monkeypatch, route_b=None)
+        _executor(monkeypatch, route_b=_config(mode="auto"))
+    assert [r.message for r in caplog.records if r.levelno == logging.ERROR] == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        # The fork's rule is about *remap privilege*, not about euid 0 alone
+        # (F14): a file-cap launcher mediator is refused the same way.
+        pytest.param(
+            {"euid": 0, "host_uid": HOST_UID, "caps": False, "want": True},
+            id="root-worker-refuses",
+        ),
+        pytest.param(
+            {"euid": 65534, "host_uid": HOST_UID, "caps": True, "want": True},
+            id="file-cap-launcher-refuses",
+        ),
+        # ... and the same launcher mediating as its own uid is the shape the
+        # unprivileged production lane actually runs: no refusal, so the
+        # tier-removal ERROR must stay quiet there instead of crying wolf.
+        pytest.param(
+            {"euid": 65534, "host_uid": 65534, "caps": True, "want": False},
+            id="same-uid-mediator-accepted",
+        ),
+        pytest.param(
+            {"euid": 65534, "host_uid": HOST_UID, "caps": False, "want": False},
+            id="plain-nonroot-worker-accepted",
+        ),
+        pytest.param(
+            {"euid": 0, "host_uid": 0, "caps": False, "want": False},
+            id="root-sandbox-accepted",
+        ),
+        # No chroot means no path mediation means nothing to refuse, whatever
+        # the identity looks like.
+        pytest.param(
+            {"euid": 0, "host_uid": HOST_UID, "caps": False, "want": False,
+             "image_rootfs": None},
+            id="pure-shape-accepted",
+        ),
+    ],
+)
+def test_the_refusal_predicate_tracks_the_forks_privilege_rule(
+    monkeypatch, case
+) -> None:
+    """`_in_process_mediation_is_refused` mirrors `mediation_remap_is_refused`.
+
+    The gate has to agree with the fork or the ERROR below either cries wolf
+    (unprivileged lane) or stays silent exactly when a create is about to be
+    refused (privileged worker, no slot).
+    """
+    want = case.pop("want")
+    euid = case.pop("euid")
+    caps = case.pop("caps")
+    monkeypatch.setattr(os, "geteuid", lambda: euid)
+    monkeypatch.setattr(
+        sl, "has_effective_cap", lambda bit: caps if bit in (6, 7) else False
+    )
+    ex = _executor(monkeypatch, route_b=None, **case)
+    assert ex._in_process_mediation_is_refused() is want
