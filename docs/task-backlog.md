@@ -174,6 +174,18 @@ ACR 镜像推送照常，git 远程推送暂缓。
    每沙箱多一棵不计入内存上限的 supervise 树）+ compose 注释。
    ⚠️ 实测暴露**第 7 条语义差异待决策**：route-B 沙箱**内**不再是 root（in-process 是
    ns 内 root，宿主侧同为一个 X）；要保持就得让 fork 侧槽位自 `unshare` + 写 `0 X 1`。
+   ✅ **guest root 对齐（fork F18）+ 非特权测试 lane（2026-09-10）**：route-B 槽位现在自映射
+   `0 -> euid`，客体内恢复 uid 0（与进程内后端一致；探不到非特权 userns 就不建 ns，权限只少
+   不多，形态经 `stats.guest_uid` 回报），in-ns `CAP_MKNOD` 换来的设备节点由 seccomp 按
+   `S_IFBLK`/`S_IFCHR` 类型位拒（`mkfifo` 仍可用）。
+   ⚠️ 顺带挖出一条被 `--privileged` 掩盖的生产要求：**进程内 `RunAs` 需要 `CAP_SYS_PTRACE`**
+   （写别人进程的 `uid_map` 除 `CAP_SETUID` 外还要 ptrace 访问权；实测只补该 cap 即通），
+   而 **route B 一条 cap 都不需要** —— 这是选它的第二个理由。worker 启动会探测并 WARNING
+   （`PER_UID_NO_PTRACE_WARNING`）；k8s/compose 若要 root + E3.2 + 非 chroot 形态必须声明它。
+   新增 `deploy/scripts/test-prod-shaped.sh`：`--cap-drop ALL` + 部署等价 capset、无
+   `--privileged`，**958 passed / 2 skipped / 0 failed**（只有 XFS prjquota 的 7 个文件因容器内
+   造不出 loop 而显式 ignore，strict skips 仍开）。终态门禁：gate A 1061/3/0、gate B 1060/4/0、
+   macOS 982/78/0，fork 11 档全 matches baseline（python 455→461、core_lib 841→842）。
    ⬜ 仍开一项：**删 `mediation_run_as='supervisor'` 降级档** —— 它现在是「route-B 不可用」
    （现网默认 `E2B_PER_SANDBOX_UID=false` ⇒ 无独立 host uid）时 chroot 形态唯一
    逃生门，删档要先让 per-sandbox uid 成为部署默认，属独立决策。

@@ -58,6 +58,21 @@ workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，�
 | 回收 | route-B 代次的结束由 envd 生命周期（TTL/idle eviction/删除 → `executor.close()`）决定，不再依赖 core 的 15 min idle；槽位进程退出前该 uid 不会被再次租出（W1）。 |
 | 文件系统 | uid 只对**支持属主的存储**有意义：repo 的 virtiofs bind 挂载上 chown 是 no-op，生产请用容器原生 / XFS（本项目门禁把 workspace 放 `/var/lib/e2b-sandboxes` 的 XFS+prjquota 上）。 |
 | 关掉它 | 显式 `E2B_PER_SANDBOX_UID=false` 回到旧的共享 uid（1000）形态；此时 chroot 形态会走 `mediation_run_as='supervisor'` 降级档（代打开文件属主变 worker，即 T5 症状）。 |
+| **CAP_SYS_PTRACE**（进程内 RunAs 才有） | 内核要求「给子进程写 `uid_map`」除 `CAP_SETUID` 外还要对该子进程的 **ptrace 访问权**。实测 `--cap-drop ALL`：只补 `SYS_ADMIN` ⇒ 每个建箱都挂在 `sandlock_create failed`；只再补 `SYS_PTRACE` 即通。**route B 不需要它**（槽位自己就是那个 uid，自映射 `0 -> euid` 无需特权）。root worker + 非 chroot 形态开 E3.2 时，worker 启动会打 WARNING（`PER_UID_NO_PTRACE_WARNING`）说明缺哪条 cap、怎么修。 |
+
+## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
+
+- **`deploy/scripts/test-prod-shaped.sh`（生产形，默认推荐）**：容器不带 `--privileged`，
+  `--cap-drop ALL` 后只给部署清单声明的那组 cap（Docker 默认集 + `SYS_ADMIN`
+  `SYS_PTRACE` `NET_ADMIN`，`seccomp=unconfined`）。实测（2026-09-10）Landlock（ABI 8）
+  与非特权 userns 都不需要任何特权；**唯一造不出来的是 XFS prjquota 暂存盘**
+  （容器内 loop 设备不可用，即使 `--cap-add SYS_ADMIN` + `--device /dev/loop-control`
+  也 `failed to setup loop device`）⇒ 7 个配额文件显式 `--ignore`，
+  而 `E2B_TEST_STRICT_SKIPS=1` 仍开，漏列就变 error 而不是静默少跑。
+  `NET_ADMIN` 是给**夹具**用的（往 lo 上放 198.18.0.99 作为可 allow/deny 的真实源地址），
+  worker 自身不需要。
+- **原有特权跑法**：继续承担 XFS 配额全量与 loop 相关用例。
+  两条 lane 的差集只应当是「配额/loop」这一类，任何别处的差集都是生产可用性缺陷。
 
 ## 3. 运维要求
 

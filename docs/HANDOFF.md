@@ -140,6 +140,54 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   （`tmp/e32-default-gate-b.log`）、macOS `979 / 77 / 0`（`tmp/rb-e32-macos.log`）。
   中途 r3/r4 的红（7 条、1 条）就是上面 1–3 与 PTY 那条，全部按上述方式收口。
 
+## ⚡ guest root 复原 + 设备节点收紧 + 非特权测试 lane（2026-09-10，fork F18）
+
+上一块留下的「route-B 沙箱内不再是 root」按**对齐**处理；顺手把对齐换来的能力收住；
+并按要求把容器测试从 `--privileged` 换成贴近生产权限的一 lane —— 结果挖出一条被
+`--privileged` 藏了很久的生产要求。
+
+- **fork F18（`03cd36b` + `9995e28` + `fb2e106`，未推送）：槽位自映射，客体内恢复 uid 0**。
+  `SandboxBuilder::userns_self_map` 只在 Rust 侧（不上 policy wire、不进 CLI）。槽位在
+  `euid != 0 && user.is_some()` 时先 `probe_userns_self_map()` 真探一次（fork 一次性子进程
+  做 `unshare(CLONE_NEWUSER)` + 写 `0 euid 1`，因为 Ubuntu 24.04 的
+  `apparmor_restrict_unprivileged_userns=1` 是「unshare 成功、map 失败」的半可用），可用才让
+  子进程自映射 ⇒ 客体内 `id -u`=0、宿主侧仍是该 host uid（内核比 kuid，跨租户 DAC 不变），
+  与进程内后端一致。**探不通就不建 ns**（客体内保持 host uid：权限只少不多，不因此失败）。
+  实际形态经 `stats.guest_uid`（`uid-0-in-userns` / `host-uid`）回报，envd 写进 ready 日志；
+  干净启动不写 stderr（fork 有测试钉这条，我第一版 `eprintln!` 当场被它判红）。
+- **配套收紧：设备节点按文件类型拒**。自映射带来 in-ns `CAP_MKNOD`，沙箱便能在可写目录造
+  块/字符设备节点再 open（现实上只有 runtime 的 device cgroup 会挡，裸进程没有）。故
+  `mknod`/`mknodat` 用 `AND S_IFMT` 后比 `S_IFBLK`/`S_IFCHR` 过滤，**不整号屏蔽** ——
+  `mkfifo()` 正是同一 syscall 的 `S_IFIFO`，真实负载要用（fork 单测
+  `test_arg_filters_block_device_nodes_but_not_fifos` 钉两端）。
+- **新发现：进程内 `RunAs` 需要 `CAP_SYS_PTRACE`**（此前所有门禁跑在 `--privileged` 下所以
+  没人看见）。内核对「写别人进程的 `uid_map`」除了 `CAP_SETUID` 还要求对该进程的 ptrace
+  访问权。实测矩阵（`--cap-drop ALL` + Docker 默认集）：只加 `SYS_ADMIN` ⇒ 每个建箱挂在泛化的
+  `sandlock_create failed`；**只**再加 `SYS_PTRACE` ⇒ 全通；加 `MKNOD` 而不加 ptrace ⇒ 仍挂。
+  反过来 **route B 一条 cap 都不需要**（槽位自映射）：同 lane 下 route-B 槽位池 + executor
+  契约 + T5 uid 契约 `35 passed`。E2B 侧因此加启动探测 + WARNING
+  （`uid_pool.has_effective_cap(CAP_SYS_PTRACE)` → `PER_UID_NO_PTRACE_WARNING`），fork 侧
+  把两条路径的权限差写进 `docs/supervise-identity-handoff.md` §7b。
+- **非特权「生产形」测试 lane**：新脚本 `deploy/scripts/test-prod-shaped.sh` ——
+  `--cap-drop ALL` + 部署清单等价 cap（Docker 默认集 + `SYS_ADMIN` `SYS_PTRACE`
+  `NET_ADMIN`）+ `seccomp=unconfined`，root 跑（否则 E3.2/route B 根本不在场上）。
+  实测：Landlock（ABI 8）与非特权 userns 都不需要特权 ✅；**唯一造不出来的是 XFS prjquota
+  暂存盘**（容器内 loop 不可用，`--cap-add SYS_ADMIN` + `--device /dev/loop-control` 也
+  `failed to setup loop device`）⇒ 7 个配额文件显式 `--ignore`（`E2B_TEST_STRICT_SKIPS=1`
+  仍开，漏列就成 error 而非静默少跑）；`NET_ADMIN` 是给**夹具**放 198.18.0.99 伪源地址用的，
+  worker 自身不需要。首跑 r1 的 21 ERROR/2 FAIL 全部归因到「缺 ptrace + 缺 ignore」，
+  修正后 **r3：958 passed / 2 skipped / 0 failed**（`tmp/prod-lane-r3.log`；r1 留档
+  `tmp/prod-lane-r1.log`、r2 `tmp/prod-lane-r2.log`）。
+- **门禁（终态）**：fork 非 root core_lib 842 / core_integ 534 / ffi 101 / cli 100 /
+  supervise 42 / supervise_cost 3 / cli_build 0 / python 461，root oci 150 /
+  supervise_root 4 / mediation_2uid 10（全 matches baseline）；E2B 特权 lane
+  gate A `1061 passed / 3 skipped / 0 failed`、gate B `1060 / 4 / 0`（wheel/supervise 由 fork
+  `9995e28` 构建，之后的 `fb2e106` 只是文档提交，不动产物，`tmp/rb-f17r5-gate-{a,b}-body.log`）；非特权 lane 958/2/0；
+  macOS `982 passed / 78 skipped / 0 failed`（`tmp/f18-macos.log`）。新增/改强契约：`test_slot_restores_in_guest_root_without_device_nodes`
+  （客体内 `id -u`/`id -g`=0 + `mkfifo` 可用 + `mknod b` 拒且节点不存在）、
+  `test_executor_command_runs_in_the_leased_generation`（**同时**钉客体内 0 与宿主侧属主 = 租到的
+  uid —— 只钉一头另一头就能悄悄退化）、`_uid_disclosure()` 让 root/非 root 两种 runner 都保持精确断言。
+
 ## ⚡ route-B transport 1：token 从 argv 消失（2026-09-09，SL-10 闭口 / fork F17）
 
 上一块留的「要彻底闭口需 fork 提供 token-by-fd/env」按**给语言面补 transport 1（fd
