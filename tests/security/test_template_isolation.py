@@ -26,7 +26,7 @@ import pytest
 from envd_service.executors.sandlock import SandlockExecutor
 from tests.security.conftest import (
     SANDBOX_UID,
-    require_route_b_slot,
+    require_mediation_capable,
     resolve_test_rootfs,
     route_b_sandbox,
     run_sh,
@@ -55,7 +55,7 @@ async def test_image_rootfs_execution():
 
     executor, workspace = route_b_sandbox(image, rootfs)
     try:
-        require_route_b_slot(executor)
+        require_mediation_capable(executor)
         code, out, err = await run_sh(
             executor, str(workspace), "cat /template-marker.txt"
         )
@@ -86,7 +86,7 @@ async def test_image_rootfs_cannot_reach_host_filesystem():
         f"if [ -e {host_marker} ]; then echo HOST_VISIBLE; else echo HOST_HIDDEN; fi"
     )
     try:
-        require_route_b_slot(executor)
+        require_mediation_capable(executor)
         code, out, err = await run_sh(executor, str(workspace), probe)
         # The host-only random path is not visible inside the chroot: the host
         # filesystem is unreachable even though Landlock "/" covers the image
@@ -157,3 +157,37 @@ async def test_in_process_chroot_is_refused_without_a_slot(caplog):
         assert (plain_ws / "probe.txt").stat().st_uid == SANDBOX_UID
     finally:
         plain.close()
+
+
+@pytest.mark.usefixtures("require_sandlock")
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="the unprivileged worker shape both production manifests ship",
+)
+async def test_unprivileged_worker_still_mediates_the_chroot():
+    """Uid 65534 with no CAP_SETUID: no slot can be leased *and* no pooled uid
+    exists, so the sandbox runs as the worker's own identity (E5.1).
+
+    That is the shape `docker-compose.prod.yml` and `deploy/k8s/worker.yaml`
+    actually run today, and deleting the supervisor tier must not touch it: the
+    fork refuses in-process mediation only when the mediator could remap to a
+    *different* non-zero uid. If this starts failing with
+    ``sandlock_instance_launch failed``, the tier removal broke the deployment
+    rather than a test -- and the disclosure ERROR should not appear either,
+    because there is nothing refused to explain.
+    """
+    rootfs = resolve_test_rootfs()
+    marker = rootfs / "template-marker.txt"
+    marker.write_text("IN_IMAGE_ROOTFS")
+    os.chmod(marker, 0o644)
+
+    executor, workspace = route_b_sandbox(IMAGE, rootfs, host_uid=None)
+    try:
+        assert executor._route_b_active is False
+        assert executor._in_process_mediation_is_refused() is False
+        code, out, err = await run_sh(
+            executor, str(workspace), "id -u; cat /template-marker.txt"
+        )
+        assert (code, out, err) == (0, f"{os.geteuid()}\nIN_IMAGE_ROOTFS".encode(), b"")
+    finally:
+        executor.close()

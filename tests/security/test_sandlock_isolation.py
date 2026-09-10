@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tests.security.conftest import (
-    require_route_b_slot,
+    require_mediation_capable,
     resolve_test_rootfs,
     route_b_sandbox,
     run_sh,
@@ -227,7 +227,7 @@ async def test_dev_shm_absent_but_dev_null_writable():
         "else echo DEV_NULL_BLOCKED; fi"
     )
     try:
-        require_route_b_slot(executor)
+        require_mediation_capable(executor)
         code, out, err = await run_sh(executor, workspace, probe)
         assert (code, out.strip(), err) == (0, b"SHM_ABSENT\nDEV_NULL_WRITABLE", b"")
     finally:

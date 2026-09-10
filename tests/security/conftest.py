@@ -210,6 +210,8 @@ def route_b_sandbox(
     rootfs: Path | None,
     *,
     with_route_b: bool = True,
+    host_uid: int | None = SANDBOX_UID if os.geteuid() == 0 else None,
+    per_sandbox_uid: bool = True,
 ) -> tuple["object", Path]:
     """A sandbox built the way the worker builds one, as (executor, workspace).
 
@@ -221,6 +223,14 @@ def route_b_sandbox(
     ``with_route_b`` mirrors the production default (``E2B_ROUTE_B=auto``): the
     mediated shape is exactly the one auto engages a slot for. ``False`` stands
     for an operator who set ``E2B_ROUTE_B=off``.
+
+    The default ``host_uid`` follows the worker's privilege, exactly like
+    ``envd_service/app.py`` does: a root worker gets a pooled uid (and can map
+    it), an unprivileged one gets ``None`` -- the pool is switched off there
+    because a single-entry userns can only cover the caller's own euid, so the
+    sandbox runs as the worker's identity (E5.1). Passing an explicit uid on a
+    non-root worker is a real configuration error (the fork refuses the
+    ``RunAs``), which is worth testing but not by default.
     """
     from envd_service.executors.sandlock import SandlockExecutor
     from envd_service.route_b import RouteBConfig
@@ -230,8 +240,8 @@ def route_b_sandbox(
         workspace_dir=str(workspace),
         base_image=image,
         image_rootfs=rootfs,
-        host_uid=SANDBOX_UID,
-        per_sandbox_uid=True,
+        host_uid=host_uid,
+        per_sandbox_uid=per_sandbox_uid,
         memory_mb=512,
         cpu_percent=100,
         disk_mb=1024,
@@ -242,7 +252,7 @@ def route_b_sandbox(
         sandbox_id=f"sbx_slot_{next(_slot_serial)}",
         route_b=RouteBConfig(
             mode="auto" if with_route_b else "off",
-            uid_start=SANDBOX_UID,
+            uid_start=host_uid if host_uid is not None else SANDBOX_UID,
             uid_size=2,
             tmp_root=sandbox_tmpdir(suffix="-route-b"),
         ),
@@ -270,17 +280,22 @@ async def run_sh(executor, cwd: str | Path, sh: str) -> tuple[int, bytes, bytes]
     return code, b"".join(out["stdout"]), b"".join(out["stderr"])
 
 
-def require_route_b_slot(executor) -> None:
-    """Skip when this runner cannot mediate the shape at all.
+def require_mediation_capable(executor) -> None:
+    """Skip only when *neither* backend can create this sandbox.
 
-    A slot needs a starter able to drop to the sandbox uid (root/CAP_SETUID)
-    and the wheel's ``sandlock-supervise``. Without both there is no way to run
-    a mediated chroot sandbox -- which is the point -- and asserting anyway
-    would let an ``exit_code != 0`` check pass vacuously.
+    A slot needs a starter able to drop to the sandbox uid (root/CAP_SETUID) and
+    the wheel's ``sandlock-supervise``. Without a slot the mediated create goes
+    in-process, and the fork refuses that only when the mediator could remap the
+    sandbox to a *different* non-zero uid
+    (`SandlockExecutor._in_process_mediation_is_refused`). The unprivileged
+    worker both production manifests ship mediates as the sandbox's own identity
+    and is not refused -- so its chroot tests must keep running rather than
+    skip: that shape *is* the deployment. Asserting anyway where a create cannot
+    happen would let an ``exit_code != 0`` check pass vacuously.
     """
-    if not executor._route_b_active:
+    if not executor._route_b_active and executor._in_process_mediation_is_refused():
         pytest.skip(
-            "the mediated chroot shape only runs on a route-B slot, and this "
-            f"worker declined one ({executor._route_b_decline}); needs a root "
-            "worker plus the wheel's sandlock-supervise binary"
+            "this worker can neither lease a route-B slot nor be accepted by the "
+            f"fork's in-process mediation ({executor._route_b_decline}); needs a "
+            "root worker plus the wheel's sandlock-supervise binary"
         )

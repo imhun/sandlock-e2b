@@ -21,6 +21,18 @@
 #
 # Usage:  ./deploy/scripts/test-prod-shaped.sh [pytest args...]
 #         IMAGE=... PROBE_EXTRA=... ./deploy/scripts/test-prod-shaped.sh
+#         UNPRIVILEGED_PHASE=0 ...      skip the uid-65534 worker phase
+#
+# Two phases, because the deployment has two shapes:
+#   1. root worker with the manifests' capability set -- E3.2 per-sandbox uids
+#      and route-B supervise slots are in play, which is where mediated
+#      (chroot) sandboxes get their own mediator.
+#   2. the *unprivileged* worker `docker-compose.prod.yml` runs today
+#      (`user: "65534:65534"`, no CAP_SETUID): no uid pool, no slots, so the
+#      sandbox is the worker's own identity and mediation runs in-process as
+#      that uid. Phase 2 exists because deleting the `mediation_run_as`
+#      downgrade tier could plausibly have broken exactly this shape, and a
+#      suite that only ever runs as root would never notice.
 set -eu
 cd "$(dirname "$0")/../.."
 
@@ -65,3 +77,25 @@ docker run --rm --init --network host \
     -v "$(pwd):/workspace" -w /workspace \
     "$IMAGE" \
     pytest tests --perf -q -p no:cacheprovider $XFS_DESELECTS "$@"
+
+if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
+    echo "==> phase 2: unprivileged worker (uid 65534, no CAP_SETUID, no slots)"
+    # shellcheck disable=SC2086
+    docker run --rm --init --network host --user 65534:65534 \
+        --cap-drop ALL --security-opt seccomp=unconfined \
+        --security-opt apparmor=unconfined \
+        -e HOME=/tmp -e TMPDIR=/tmp \
+        -e E2B_HOST_PROJECT="$(pwd)" \
+        -e E2B_TEST_STRICT_SKIPS=1 \
+        -e E2B_BASE_IMAGE="${PHASE2_BASE_IMAGE:-python:3.11-slim}" \
+        -v "$(pwd):/workspace" -w /workspace \
+        "$IMAGE" \
+        pytest tests/security/test_template_isolation.py \
+            tests/security/test_sandlock_isolation.py \
+            tests/unit/test_sandlock_executor_route_b.py \
+            tests/unit/test_policy_mapping.py -q -p no:cacheprovider "$@"
+        # ^ E2B_BASE_IMAGE is deliberately not inherited: `python-mcp:3.14` is a
+        # locally built image that the registry mirrors refuse (403 not in the
+        # allowlist), and phase 1 only resolves it because its rootfs is already
+        # in the harness cache that uid 65534 cannot write.
+fi
