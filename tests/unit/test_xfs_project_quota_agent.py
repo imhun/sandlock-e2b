@@ -30,6 +30,29 @@ def _uid_disclosure() -> list[str]:
     return [] if os.geteuid() == 0 else [app_module.PER_UID_NONROOT_WARNING]
 
 
+def _warnings(caplog) -> list[str]:
+    """Warnings from the two loggers these contracts are about.
+
+    ``caplog.records`` is whatever the whole process emitted, and a worker has
+    background loggers that are not part of any of these assertions -- the
+    quota-maintenance disk watermark is the one that bites: on a workspace volume
+    past its threshold it lands a WARNING in the middle of an exact-list check
+    (measured: 98% used turned one of the tests below red with nothing but a
+    quota-log line added at index 0). The message lists below stay exact for the
+    loggers under test.
+    """
+    return [
+        record.message
+        for record in caplog.records
+        if record.name
+        in {
+            "envd_service.agent",
+            "envd_service.app",
+            "envd_service.xfs_quota",  # "quota unavailable: filesystem is X"
+        }
+    ]
+
+
 def _make_app(workspace: Path, **settings_overrides):
     overrides = dict(executor="local", workspace_base=workspace)
     overrides.update(settings_overrides)
@@ -125,7 +148,7 @@ async def test_create_quota_failure_degrades_with_warning(workspace, monkeypatch
     record = app.state.runtime_registry.get("sbx_quota_fail")
     assert record is not None
     assert record.project_id is None
-    assert [r.message for r in caplog.records] == [
+    assert _warnings(caplog) == [
         *_uid_disclosure(),
         "XFS project quota setup failed for sbx_quota_fail: "
         "xfs_quota 'limit -p bhard=1024M 42' failed: boom",
@@ -157,7 +180,7 @@ async def test_create_unsupported_skips_quota_with_warning(workspace, monkeypatc
     record = app.state.runtime_registry.get("sbx_noquota")
     assert record is not None
     assert record.project_id is None
-    assert [r.message for r in caplog.records] == [
+    assert _warnings(caplog) == [
         *_uid_disclosure(),
         f"XFS project quota unavailable for {workspace}: filesystem is ext4, not xfs",
     ]
@@ -257,7 +280,7 @@ async def test_create_reprovision_failure_persists_none_after_cleanup(
             str(workspace),
         ],
     ]
-    assert [r.message for r in caplog.records] == [
+    assert _warnings(caplog) == [
         *_uid_disclosure(),
         "XFS project quota setup failed for sbx_reprov_fail: "
         "quota limit setup failed for sbx_reprov_fail: xfs_quota "
@@ -367,7 +390,7 @@ async def test_delete_cleanup_failure_degrades_with_warning(workspace, monkeypat
     response = await _delete_sandbox(app, "sbx_cleanup_fail")
     assert response.status_code == 204
     assert not (workspace / "sbx_cleanup_fail").exists()
-    assert [r.message for r in caplog.records] == [
+    assert _warnings(caplog) == [
         *_uid_disclosure(),
         "XFS project quota cleanup failed for sbx_cleanup_fail: "
         "xfs_quota 'project -C -p /srv/sandboxes/sbx_cleanup_fail 42' failed: boom",
