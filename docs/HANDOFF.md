@@ -224,6 +224,88 @@ skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」�
 会以 `buildkit build exited with code 1` 假红（`buildctl` 在 bridge 网络里连不上
 `127.0.0.1:<随机端口>` 的 buildkitd），本轮第一次跑就踩了，与代码无关。
 
+## ⚡ 特权最小集实测 + 线上就绪审计（2026-09-10，会话收尾）
+
+这一段的结论已经把 §2.4 的权限口径改掉了（老口径把 `SYS_ADMIN` 写成 E3.2/route-B 前置，
+实测不成立）。**新会话要动特权或上线，先读这里。**
+
+### 1. route-B 真正需要的 cap（非特权容器 + 真 fork wheel + 真槽位实测）
+
+| cap | 谁用 | 摘掉的实测后果 |
+|---|---|---|
+| `SETUID`+`SETGID` | worker 把槽位起在沙箱 host uid 上（`setpriv --reuid X --regid X --clear-groups`） | 租不到槽位 ⇒ chroot 形态被 fork 拒绝建箱 |
+| `CHOWN` | workspace chown 0700 给该 uid、回收时 chown 回来 | E3.2 属主前提不成立 |
+| `DAC_OVERRIDE` | **管理面**穿租户 0700 目录树：孤儿对账 `os.walk`、删除 `rmtree`、配额扫描 | `PermissionError: …/sbx_a/workspace`；对账 + 卷持久化 4 failed / 4 error |
+| `SYS_ADMIN` | ① 共享卷 `mount --bind` ② 直接 `xfs_quota -x` ③ 写 namespaced sysctl | **只掉 4 条共享卷用例**（`cannot bind volume … failed mount system call.; keeping the workspace symlink`）；沙箱侧 confine / 中介 / 设备节点围栏**全部照常** |
+| `SYS_PTRACE` | 只服务**进程内** `RunAs` | 进程内 per-uid 沙箱挂在 `sandlock_create failed`；route B 不需要 |
+
+三条对照数据（原始输出，别只信表格）：
+
+- `--cap-drop ALL` + `CHOWN,DAC_OVERRIDE,FOWNER,KILL,SETGID,SETUID,SETPCAP,SYS_CHROOT,MKNOD`
+  （**没有** `SYS_ADMIN`、**没有** `SYS_PTRACE`）跑 route-B + chroot 沙箱：
+  `{"created": true, "guest_uid": "0", "mknod_rc": "mknod-rc=1", "blk_node_left": false,
+  "file_owner": 21710}` —— 建箱成功、客体内 root、块设备节点造不出也不残留、属主正确。
+- worker 持 `SYS_ADMIN` 时读槽位 `/proc/<pid>/status`：`{"uid": 21710, "eff": []}`
+  —— 中介进程**零 cap**：`setpriv` 降 uid 会清空 effective/permitted 集，E2B 也不用
+  `--ambient-caps` 往下传 ⇒ worker 的 `SYS_ADMIN` 不会顺着中介进入租户路径，它的作用域是
+  **worker→宿主**（这才是它的风险面：mount/loop/setns/pivot_root/bpf/sysctl 写…一个 bit 里
+  几十个入口，等于「半个 privileged」）。
+- 全量套件用生产形 capset 减掉 `SYS_ADMIN`：`4 failed, 962 passed, 3 skipped`
+  （基线 966/3/0），掉的 4 条全是共享卷（migration / uid_permissions / sdk 两条）。
+- ⚠️ **未解决缺口（backlog #25）**：无 `SYS_ADMIN` 时共享卷退化成 workspace 符号链接，
+  而它对跨 uid 读写**不成立**（EACCES）⇒ 摘 `SYS_ADMIN` 目前只适用于不用 `volumeMounts`
+  的部署。要么重新设计卷根属主/权限、要么让 bind 由容器运行时做、要么保留它。需要设计决策。
+
+### 2. 线上审计（172.18.80.140，只读；跳板通道 `deploy/scripts/lib/helpers.sh::run_target`）
+
+**仓库清单 ≠ 已部署状态**：远端 compose 没有 `user:` 行、镜像
+`e2b-sandlock-worker:0.1.0-20260830-191728` 也没有 `USER` ⇒ **线上 worker 是 root**，
+`CapEff=0xa82425fb`（默认集 + `SYS_ADMIN`，无 `SYS_PTRACE`）。逐项：
+
+- 沙箱侧最小集（SETUID/SETGID/CHOWN/DAC_OVERRIDE）——**满足**（默认集里都有）。
+- wheel 的 route-B 语言面——**不满足**：`sandlock_supervise_connect_fd` = False、
+  `sandlock/bin/sandlock-supervise` 不存在（`setpriv` 在、Landlock ABI 6）。
+- uid 段不重叠——**不满足**：`worker-1`/`worker-2` 共用 `sandbox-shared` 卷，两边都没设
+  `E2B_UID_POOL_START` ⇒ 都会从 10000 起。
+- 存储：卷是 xfs ✓，但挂载选项 `noquota`、镜像内没有 `xfs_quota` ⇒ 配额仍处降级态。
+- 非特权 userns（F18 自映射前置）✓（kernel 6.12，`max_user_namespaces=30519`）。
+- 在线沙箱：worker 容器内只有 2 个进程（python + sh），12 个 `sbx_*` 目录多为无记录残留
+  （属主 `0:0 755`）⇒ **当前空载，是升级窗口**。
+
+⚠️ 现网 = root worker + 已配 `E2B_BASE_IMAGE`（chroot 形态在用）+ 拿不到槽位 ⇒ 正好落在
+「删档的后果」那一格：**必须先用带新 wheel 的镜像 `build-and-push`，再升代码**，顺序反了
+「镜像 rootfs 沙箱全部建不出来」；同一次变更里把两个 worker 的 uid 段拆开。
+升级后自检：`./deploy/scripts/smoke-prod-worker.sh` + worker 日志里应出现
+`route-B instance ready … guest-uid=uid-0-in-userns|host-uid=<该沙箱 uid>`。
+
+### 3. 本会话完成清单（提交已在 `main`，fork 子模块未动）
+
+`37fa9af` 删档 → `f7aeb94` 配额用例 caplog 按 logger 收窄 → `7b4fba5` 无特权部署形态
+进测试（lane phase 2）→ `e6415dc`/`569a70a`/`c2b7f92` 文档与终态门禁表 →
+本轮 `docs: 修正特权口径 + 记录线上审计`（§2.4 / 新增 §2.4.1 / 线上审计块、检查表第 10 条、
+backlog #25）。终态门禁（`tmp/run-f31.sh`，一相一容器顺序跑）：gate A `1069/4/0`、
+gate B `1068/5/0`、mediated-chroot 切片 `100/1/0`、生产形 phase 1 `966/3/0`、
+phase 2 `47/1/0`、macOS `989/84/0`、`tests/unit` `736/10`。临时文件清理回收 75.8 GB
+（`tmp/` 79G→6G），清理前后六相数字逐条相同。
+
+### 4. 下个会话的入口（都需要你点头，我没有擅自做）
+
+1. **fork 6 个提交仍未 push**（`upstream-pr/netns-free-clean`：F17 `e290059`/`f20d034`/
+   `c0f7bf5`、F18 `03cd36b`/`9995e28`/`fb2e106`），PR #34 / #35 的回复也还没发
+   （SL-10 闭口 + 客体内 root 的安全论证 + mknod 围栏 + ptrace 前置）。
+2. **SL-12**（create/launch 的 FFI 不带拒绝原因）只登记在
+   `docs/sandlock-upstream-issues.md`，还没作为 issue/PR 报给上游。
+3. **线上升级**：按 §2 的顺序做（先新 wheel 镜像，再拆 uid 段，再升代码）。
+4. **backlog #25 的设计缺口**：共享卷在没有 `SYS_ADMIN` 时的退化路径不成立。
+5. 待授权清理项：`tmp/stale-20260902`（4.9G，G2 取证目录，文档写明"确认无用后可单独删"）、
+   docker 侧 images 18G / volumes 39.7G / build cache 8.7G（卷里混着**别的项目**的数据，
+   我没有 `prune`）。
+6. 复现脚本（都在 gitignored 的 `tmp/`，只读，可按名重跑）：`tmp/run-f31.sh`（六相门禁）、
+   `tmp/cleanup_scratch.py`（回收，默认 dry-run）、`tmp/routeb_cap_probe.py`（capset × 形态
+   矩阵）、`tmp/slot_cap_probe.py`（槽位 CapEff 取证）、`tmp/prod-audit{,2,3}.sh` +
+   `tmp/prod-run.sh`（线上只读审计，走 `deploy/scripts/lib/helpers.sh` 的跳板通道）。
+   若要把后两组固化成 `deploy/scripts/audit-*.sh`（进仓库、可长期重跑），说一声即可。
+
 ## ⚡ guest root 复原 + 设备节点收紧 + 非特权测试 lane（2026-09-10，fork F18）
 
 上一块留下的「route-B 沙箱内不再是 root」按**对齐**处理；顺手把对齐换来的能力收住；

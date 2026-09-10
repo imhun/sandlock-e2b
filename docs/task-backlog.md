@@ -499,6 +499,27 @@ ACR 镜像推送照常，git 远程推送暂缓。
     （同 uid exec-with-fds 往返）、ffi 100→101（C smoke 编译+链接+失败路径契约）。
     fork 11 档门禁全绿 + wheel 双架构 verify 全绿（159=159）+ E2B 三档无漂移
     （gate A 982/2/1xfail(T5)/0、gate B 982/3/0、macOS 916/65/0）。**剩余 = E2B
-    envd 接线 + route-B supervise 部署（W1/W2 槽位模型；`sun_path` 108 与
-    「一 uid = 一代沙箱」两条约束）+ 摘 T5 xfail + 删 `mediation_run_as='supervisor'`
-    降级档**（main backlog #5）。
+    route-B supervise **部署**（W1/W2 槽位模型；`sun_path` 108 与「一 uid = 一代沙箱」
+    两条约束）**。其余三项（envd 接线、摘 T5 xfail、删 `mediation_run_as='supervisor'`
+    降级档）已于 2026-09-10 全部完成 ⇒ 见 #5 与 #25：部署侧还差 wheel 与 uid 段两件事，
+    线上已实测核过。
+
+25. **route-B 特权最小集 + 共享卷 bind 的退化缺口（2026-09-10 实测）**:
+   ✅ 最小集已实测并写进 `docs/production-deployment-requirements.md` §2.4.1 与计划
+   `2026-09-09-envd-route-b-wiring.md` 检查表第 10 条：沙箱侧
+   `SETUID`+`SETGID`+`CHOWN`；`DAC_OVERRIDE` 属管理面（对账 `os.walk`、删除 `rmtree`、
+   配额扫描要穿租户 0700 目录，摘掉即 `EACCES`）；**`SYS_ADMIN` 不是 route-B 前置**
+   （只服务共享卷 `mount --bind` 与直接 `xfs_quota`）；`SYS_PTRACE` 只服务进程内
+   `RunAs`。对照实验与「槽位进程 `CapEff=0` ⇒ worker 的 cap 不会顺着中介漏进租户路径」
+   的取证在 HANDOFF 同名块。
+   ⬜ **未解决（需要设计决策，未排期）**：没有 `SYS_ADMIN` 时共享卷退化成「workspace
+   符号链接」，而这条路径对**跨 uid 读写共享卷不成立**（实测 EACCES，日志
+   `cannot bind volume … failed mount system call.; keeping the workspace symlink`）
+   ⇒ 「摘掉 SYS_ADMIN」目前只对不用 `volumeMounts` 的部署可行。三条候选：按 uid 重新
+   设计卷根属主/权限；让 bind 由容器运行时完成；或接受保留 `SYS_ADMIN`。
+   ⬜ **线上部署前置（审计结论，非代码缺口）**：现网 worker 实际是 root（远端清单没有
+   `user:` 行、旧镜像也没有 `USER`），但**镜像里的 wheel 没有 route-B 语言面**
+   （`sandlock_supervise_connect_fd` = False、缺 `sandlock-supervise`），且两个 worker
+   共用同一 `sandbox-shared` 卷却**都没设不重叠的 uid 段** ⇒ 升级前必须先用新 wheel
+   `build-and-push`，并配 `E2B_UID_POOL_START/SIZE`。逐条数据见 HANDOFF
+   「特权最小集实测 + 线上就绪审计」。

@@ -52,7 +52,7 @@ workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，�
 
 | 项 | 说明 |
 |---|---|
-| 权限 | 只有 root（或 `CAP_SETUID`+`CAP_SETGID`+`CAP_CHOWN`+`CAP_SYS_ADMIN`）worker 能用。非 root worker 自动关闭 uid 池并保持「固定身份 + Landlock」（E5.1），启动时打一条 WARNING —— 也就是说现网 `user: "65534:65534"` 的 compose/k8s worker 行为与翻默认前**完全一致**。 |
+| 权限 | 分三层，**照抄会多给特权**（2026-09-10 实测，逐项见 §2.4.1）：**沙箱侧最小集 = `CAP_SETUID`+`CAP_SETGID`+`CAP_CHOWN`**；`CAP_DAC_OVERRIDE` 是**管理面**需要（对账 `os.walk`、删除 `rmtree`、配额扫描都要穿租户 0700 目录）；`CAP_SYS_ADMIN` 只服务**共享卷 bind mount** 与直接 `xfs_quota`，**不是 E3.2 / route B 的前置**；`CAP_SYS_PTRACE` 只在走进程内 `RunAs` 时才需要。非 root worker 自动关闭 uid 池并保持「固定身份 + Landlock」（E5.1），启动时打一条 WARNING —— 按清单 `user: "65534:65534"` 部署时行为与翻默认前**完全一致**（但线上实际是 root，见下面审计）。 |
 | 容量 | 并发沙箱数受 `E2B_UID_POOL_SIZE` 约束（默认 1000，起始 `E2B_UID_POOL_START=10000`）；池满即建箱失败。多 worker 共用同一 workspace 时必须配**互不重叠**的段。 |
 | 进程/内存 | chroot 形态每沙箱多一棵 supervise 进程树（supervise + sandlock-init + 停车 M0）。它在沙箱 cgroup **之外**，不计入 `max_memory`/`max_disk`，并在 `max_processes` 里占 1；容量表按「N 沙箱 = N 额外进程」重算。 |
 | 回收 | route-B 代次的结束由 envd 生命周期（TTL/idle eviction/删除 → `executor.close()`）决定，不再依赖 core 的 15 min idle；槽位进程退出前该 uid 不会被再次租出（W1）。 |
@@ -60,6 +60,53 @@ workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，�
 | 关掉它 | 显式 `E2B_PER_SANDBOX_UID=false` 回到旧的共享 uid（1000）形态：**pure（无 base image）形态照常跑**；**chroot 形态在 root worker 上会被 fork 直接拒绝建箱**（沙箱 host uid 1000 ≠ 中介 euid 0 ⇒ `mediation_run_as=caller refused`，见下条）。非 root worker 不受影响（沙箱就用 worker 自己的 euid，中介身份与沙箱身份同一个）。E2B 曾下发的 `mediation_run_as='supervisor'` 降级档（代打开文件属主变 worker = T5）已于 2026-09-10 删除，不再有静默逃生门。 |
 | 删档的后果（2026-09-10） | 「特权进程内中介 + 路径中介 + 非 0 host uid」这一组合现在只有 route B 一条路：root worker + chroot 形态若拿不到槽位（`E2B_ROUTE_B=off`、wheel 不带 supervise、或 `E2B_PER_SANDBOX_UID=false`）就**建箱失败**，并打一条 ERROR 说明为什么没有槽位、怎么修（容器实测钉在 `tests/security/test_template_isolation.py::test_in_process_chroot_is_refused_without_a_slot`）。非 root worker（E5.1，中介就是它自己的 euid）**不受影响** —— 那条组合不构成拒绝，所以也不会打这条 ERROR。 |
 | **CAP_SYS_PTRACE**（进程内 RunAs 才有） | 内核要求「给子进程写 `uid_map`」除 `CAP_SETUID` 外还要对该子进程的 **ptrace 访问权**。实测 `--cap-drop ALL`：只补 `SYS_ADMIN` ⇒ 每个建箱都挂在 `sandlock_create failed`；只再补 `SYS_PTRACE` 即通。**route B 不需要它**（槽位自己就是那个 uid，自映射 `0 -> euid` 无需特权）。root worker + 非 chroot 形态开 E3.2 时，worker 启动会打 WARNING（`PER_UID_NO_PTRACE_WARNING`）说明缺哪条 cap、怎么修。 |
+
+### 2.4.1 特权最小集（2026-09-10 实测：非特权容器 + 真 fork wheel + 真槽位）
+
+| capability | 作用在哪 | 摘掉的实测后果 |
+|---|---|---|
+| `SETUID` + `SETGID` | 把 route-B 槽位起在该沙箱的 host uid 上（`setpriv --reuid X --regid X --clear-groups`） | 租不到槽位 ⇒ chroot 形态被 fork 拒绝建箱（见上「删档的后果」行） |
+| `CHOWN` | workspace chown 给该 uid（0700）；uid 回收时再 chown 回来 | E3.2 的属主前提不成立 |
+| `DAC_OVERRIDE` | **管理面**遍历租户 0700 目录树：孤儿对账的 `os.walk`、删除的 `rmtree`、配额扫描 | `PermissionError: …/sbx_a/workspace`；对账与共享卷持久化用例 4 failed / 4 error |
+| `SYS_ADMIN` | ① 共享卷 `mount --bind` 进 workspace；② 直接执行 `xfs_quota -x`；③ 写 namespaced sysctl（清单里的 `ip_unprivileged_port_start`） | **只有 4 条共享卷用例掉**（日志 `cannot bind volume … failed mount system call.; keeping the workspace symlink`）；沙箱侧 confine、路径中介、设备节点围栏全部照常 |
+| `SYS_PTRACE` | 只服务**进程内 RunAs**（父进程给子进程写 `uid_map` 需要对该子进程的 ptrace 访问权） | 非 route-B 的 per-uid 沙箱每个建箱挂在 `sandlock_create failed`；route B 完全不需要 |
+
+三条实测口径（`e2b-sandlock-test` 容器，`--cap-drop ALL` + 指定 capset）：
+
+- 无 `SYS_ADMIN`、无 `SYS_PTRACE` 下跑 route-B + chroot 沙箱：
+  `created=true, guest_uid="0", mknod_rc="mknod-rc=1", blk_node_left=false, file_owner=21710`
+  —— 建箱成功、客体内仍是 uid 0、**造不出也不会残留块设备节点**、写出文件属主就是该沙箱 host uid。
+- worker 持 `SYS_ADMIN` 时读 route-B 槽位的 `/proc/<pid>/status`：`uid 21710, CapEff=0`
+  —— **一个 cap 都没有**：`setpriv` 降 uid 会清空 effective/permitted 集，E2B 也不用
+  `--ambient-caps` 往下传。所以「worker 有 SYS_ADMIN」不会顺着中介进程进入租户路径；
+  它的作用域是 worker→宿主，不是沙箱→宿主。
+- 同一探针里进程内后端（`E2B_ROUTE_B=off` 的 chroot、以及 pure 形态的 per-uid 沙箱）在无
+  `SYS_PTRACE` 时挂在 `sandlock_instance_launch failed`，补上 ptrace 即通 —— 与 F18 的
+  `PER_UID_NO_PTRACE_WARNING` 同源。
+
+> ⚠️ **一个没解决的缺口（登记 main backlog #25）**：共享卷在没有 `SYS_ADMIN` 时会退化成
+> 「workspace 符号链接」，而这条退化路径对**跨 uid 读写共享卷并不成立**（实测 EACCES）。
+> 所以「摘掉 `SYS_ADMIN`」目前只对不用 `volumeMounts` 的部署可行；要用共享卷就得保留它，
+> 或者把卷根属主/权限按 uid 重新设计、或让 bind mount 由容器运行时而不是 worker 进程完成。
+
+**线上审计（2026-09-10，只读探测：跳板→目标机，无写入 / 不重启 / 无副作用 exec）**：仓库清单写的
+`user: "65534:65534"` **不等于已部署状态** —— 远端 `/opt/sandlock/docker-compose.prod.yml`
+没有 `user:` 行、worker 镜像 `0.1.0-20260830-191728` 也没有 `USER` 声明 ⇒ **线上 worker 实际
+以 root 跑**，`CapEff=0xa82425fb`（Docker 默认集 + `SYS_ADMIN`，**无 `SYS_PTRACE`**）。逐项：
+
+| 检查项 | 实测 | 判定 |
+|---|---|---|
+| §2.4.1 的沙箱侧最小集 | root，`SETUID`/`SETGID`/`CHOWN`/`DAC_OVERRIDE` 都在默认集里 | 满足 |
+| wheel 具备 route-B 语言面 | `sandlock_supervise_connect_fd` = **False**、`sandlock/bin/sandlock-supervise` **不存在**（`setpriv` 在、Landlock ABI 6） | **不满足** |
+| 多 worker uid 段不重叠 | `worker-1`/`worker-2` 共用同一 `sandbox-shared` 卷，两边都没设 `E2B_UID_POOL_START` ⇒ 都从 10000 起 | **不满足** |
+| 存储支持属主 / 配额 | 卷是 xfs ✓，但挂载选项是 `noquota`，且镜像内 `xfs_quota: not found` | 部分（配额仍降级） |
+| 非特权 userns（F18 自映射前置） | kernel 6.12，`user.max_user_namespaces=30519` | 满足 |
+| 在线沙箱 | worker 内只有 2 个进程（python + sh）；`sbx_*` 目录多为无记录残留（属主 `0:0 755`） | 空载，适合升级窗口 |
+
+⚠️ 现网既是 **root worker** 又配了 `E2B_BASE_IMAGE`（chroot 形态在用）还**拿不到槽位**，
+正好落在上面「删档的后果」那一格里 ⇒ **先用带新 wheel 的镜像 `build-and-push`，再升代码**，
+顺序反了就会出现「镜像 rootfs 沙箱全部建不出来」；uid 段也要在同一次变更里拆开。
+升级顺序、待授权事项与取证脚本见 `docs/HANDOFF.md`「特权最小集实测 + 线上就绪审计」。
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 

@@ -104,6 +104,13 @@ acquire 重新生成；socket =
 6. ⬜ **生产 spawner 形态**（launcher / 外部槽位池）仍未接：现网 compose（worker
    `user: 65534`）与 k8s（无 CAP_SETUID）两套部署都不满足特权前置 ⇒ auto 档在现网
    仍走进程内后端。这一步是部署决策，不是代码缺口。
+   > **审计更正（2026-09-10）**：这句的前提按**仓库清单**成立、按**线上实态**不成立 ——
+   > 线上 worker 实际是 root（远端清单无 `user:` 行、旧镜像无 `USER`）。所以现网 auto 档
+   > 并不是"因为没特权而缩退"，而是"因为 **wheel 不带 route-B 语言面**而缩退"
+   > （`sandlock_supervise_connect_fd` = False、缺 `sandlock-supervise`）⇒ 先重建镜像就能让
+   > route B 生效，launcher 那条路只在"worker 必须非 root"的部署里才是硬前置。
+   > 同时必须拆开两个 worker 共用的 uid 段（现在都为空 ⇒ 都从 10000 起）。逐条见
+   > `docs/production-deployment-requirements.md` §2.4 线上审计块与 HANDOFF 同名块。
    > 补（2026-09-10，删档后）：该形态现在**有测试了** —— `test-prod-shaped.sh` 的
    > phase 2 就按 `--user 65534:65534 --cap-drop ALL` 跑 mediated-chroot，实测
    > `47 passed / 1 skipped / 0 failed`（`tests/security/test_template_isolation.py::
@@ -128,6 +135,15 @@ acquire 重新生成；socket =
    进程内后端。要在生产开 route-B：worker 改 root（+ `CAP_SETUID`/`CAP_SETGID`
    在Capability里显式列出），或按 fork §2/§8 的边界由**外部 launcher/槽位池**起
    槽位（`W1SlotPool(spawner=...)` 注入），worker 自己永不装特权。
+   > **审计更正（2026-09-10，实测线上 172.18.80.140）**：这句话描述的是**仓库清单**，
+   > 不是**已部署状态**。远端 `/opt/sandlock/docker-compose.prod.yml` 里根本没有 `user:`
+   > 行（那行是 09 月才加进仓库的），worker 镜像 `0.1.0-20260830-191728` 也没 `USER`
+   > 声明 ⇒ **线上 worker 实际是 root**，`CapEff=0xa82425fb`（默认集 + `SYS_ADMIN`，
+   > **无 `SYS_PTRACE`**）。所以"现网不满足特权前置"这个结论对线上不成立；线上真正缺的是
+   > **wheel 的 route-B 语言面**（`sandlock_supervise_connect_fd` = False、
+   > `sandlock/bin/sandlock-supervise` 不存在）与**不重叠的 uid 段**（两个 worker 共用
+   > 同一 `sandbox-shared` 卷却都没设 `E2B_UID_POOL_START` ⇒ 都会从 10000 起）。
+   > 逐条数据见 HANDOFF「特权最小集实测 + 线上就绪审计」。
 2. **`E2B_PER_SANDBOX_UID=true`（2026-09-09 起为代码默认）**：槽位按沙箱自己的 host uid 定向租用；共享 uid
    形态租不到槽位（route-B 的整个身份论证依赖「一个 uid 一代沙箱」）。
 3. **wheel 带 supervise**：`<site-packages>/sandlock/bin/sandlock-supervise`
@@ -172,6 +188,12 @@ acquire 重新生成；socket =
    另加一条护栏：wheel 的 FFI 若没有 `sandlock_supervise_connect_fd`（fork F17 之前），
    `auto` 档宁可退回进程内后端也不静默改用「token 进 argv」的 registered 形态；
    强开则报错点名要重建 wheel（`fd_client_available()`）。
+10. **cap 的最小集（2026-09-10 实测，别照抄 §2.4 老口径）**：沙箱侧只要
+   `SETUID`+`SETGID`+`CHOWN`；`DAC_OVERRIDE` 是**管理面**（对账/删除/配额扫描要穿租户
+   0700 目录）需要；`SYS_ADMIN` 只服务共享卷 bind mount 与直接 `xfs_quota`，
+   **不是 route-B 前置**；`SYS_PTRACE` 只在走进程内 `RunAs` 时才需要。
+   细节与实测三对照见 `docs/production-deployment-requirements.md` §2.4.1。
+
 
 ## 实现期的修正（原设计没预见的约束）
 
