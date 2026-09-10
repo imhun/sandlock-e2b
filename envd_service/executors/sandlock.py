@@ -725,7 +725,7 @@ class SandlockExecutor(Executor):
             handle = _start()
         logger.info(
             "route-B instance ready sandbox_id=%s instance_name=%s uid=%s "
-            "slot=%s channel=%s",
+            "slot=%s channel=%s guest-uid=%s",
             self._sandbox_id or "-",
             self.instance_name,
             uid,
@@ -737,6 +737,11 @@ class SandlockExecutor(Executor):
                 if handle.sock_path is None
                 else handle.sock_path
             ),
+            # The slot's own answer, not an assumption: a self-mapped namespace
+            # makes the workload uid 0 inside (parity with the in-process
+            # mediator), and an unavailable unprivileged userns leaves it at the
+            # host uid. `unknown` means the wheel predates fork F18.
+            handle.guest_uid or "unknown",
         )
         return RouteBInstance(pool=pool, handle=handle, name=self.instance_name)
 

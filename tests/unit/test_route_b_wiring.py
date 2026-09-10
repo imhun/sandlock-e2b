@@ -249,6 +249,23 @@ def test_parking_program_stops_instead_of_spinning():
 # ------------------------------------------------------------------ slots
 
 
+def test_readiness_probe_records_the_guest_identity(tmp_path):
+    """The slot's `stats` answer is the only truth about which identity the guest
+    got (fork F18 self-map vs. no usable unprivileged namespace), so the lease
+    must carry it out for the worker to log."""
+    pool, spawned, log, channels = _pool(
+        tmp_path, replies={"stats": {"launched": True, "pid": 7,
+                                     "guest_uid": "uid-0-in-userns"}}
+    )
+    handle = pool.acquire_sync("sbx_g", {}, uid=20000)
+    assert handle.instance_pid == 7
+    assert handle.guest_uid == "uid-0-in-userns"
+
+    pool2, *_ = _pool(tmp_path)  # a wheel without the field
+    handle2 = pool2.acquire_sync("sbx_g2", {}, uid=20000)
+    assert handle2.guest_uid is None
+
+
 async def test_acquire_leases_the_requested_uid_and_lease_documents(tmp_path):
     pool, spawned, log, channels = _pool(tmp_path)
     handle = await pool.acquire("sbx_a", {"uid": 20001}, uid=20001)

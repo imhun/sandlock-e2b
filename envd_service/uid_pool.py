@@ -66,6 +66,37 @@ _RESERVATION_DIR = ".uid_reservations"
 LEGACY_SHARED_UID = 1000
 
 
+#: Kernel capability numbers (capabilities(7)) that the sandbox identity path
+#: depends on but that a hardened container may have dropped.
+CAP_SYS_PTRACE = 19
+
+
+def _cap_eff() -> int | None:
+    """This process's effective capability mask, or None if unreadable."""
+    try:
+        status = Path("/proc/self/status").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in status.splitlines():
+        if line.startswith("CapEff:"):
+            try:
+                return int(line.split()[1], 16)
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def has_effective_cap(bit: int) -> bool:
+    """Whether capability ``bit`` is *effective* here.
+
+    Not the same question as ``geteuid() == 0``: a container can run as root
+    with a dropped bounding/effective set (so the uid map path fails), or as a
+    non-root user holding one added capability.
+    """
+    cap_eff = _cap_eff()
+    return cap_eff is not None and (cap_eff >> bit) & 1 == 1
+
+
 class UidPoolError(RuntimeError):
     """Raised when the pool cannot satisfy an allocation."""
 

@@ -186,6 +186,9 @@ class SlotHandle:
     control_socket: object | None = None
     #: Response deadline for a single verb on this slot's channel.
     verb_timeout_s: float = 15.0
+    #: What the slot reports for the identity the guest really gets
+    #: (`uid-0-in-userns` / `host-uid`, fork F18); ``None`` with an older wheel.
+    guest_uid: str | None = None
     #: The generation's launched instance pid (from the slot's first
     #: ``stats`` reply); ``None`` only when the fleet was built by a caller
     #: that does not probe readiness.
@@ -599,6 +602,7 @@ class W1SlotPool:
                 continue
             if isinstance(stats, dict) and stats.get("launched"):
                 handle.instance_pid = stats.get("pid")
+                handle.guest_uid = stats.get("guest_uid")
                 return handle
             time.sleep(0.05)
         process.kill()

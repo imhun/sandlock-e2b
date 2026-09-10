@@ -147,20 +147,41 @@ def _config(cmd: list[str], cwd: str, **over) -> ExecConfig:
     return ExecConfig(**cfg)
 
 
-async def test_executor_command_runs_as_the_leased_host_uid(workspace) -> None:
+async def test_executor_command_runs_in_the_leased_generation(workspace) -> None:
+    """The command runs in the slot leased for this sandbox, carrying both of
+    the identities it is supposed to carry.
+
+    Inside its namespace the workload is uid 0 (fork F18's self-map: the same
+    in-guest identity a privileged supervisor produces by writing `0 -> host_uid`
+    for the child), while on the host everything it writes belongs to the
+    sandbox's own uid -- the fact route B exists to establish. Asserting only
+    one of the two would let the other regress unnoticed: no self-map and the
+    guest sees its host uid; a map without the dropped privilege and the writes
+    come back owned by root.
+    """
     ex = _executor(workspace, "sbx_rbe_id")
     try:
         assert ex._route_b_active is True
         running = await ex.start(
             _config(
-                ["/bin/sh", "-c", "id -u; id -g; echo done"],
+                [
+                    "/bin/sh",
+                    "-c",
+                    "id -u; id -g; echo done > from-command.txt",
+                ],
                 str(workspace),
             )
         )
         code, out, err = await _collect(running)
-        assert (code, out, err) == (0, b"%d\n%d\ndone\n" % (UID, UID), b"")
-        # The mediator identity is visible from the worker side too: the slot
-        # process itself runs as the leased uid, not as root.
+        assert (code, out, err) == (0, b"0\n0\n", b"")
+        made = (workspace / "from-command.txt").stat()
+        assert (made.st_uid, made.st_gid) == (UID, UID), (
+            f"the write landed as {made.st_uid}:{made.st_gid}, not the leased "
+            f"{UID}:{UID}: the namespace map is not carrying the host identity"
+        )
+        # The mediator itself: the slot process runs as the leased uid, not as
+        # root -- what makes the ownership above a DAC fact instead of a
+        # mediation artifact.
         slot = slot_pool_for(ex._route_b).slot("sbx_rbe_id")
         assert slot is not None
         status = Path(f"/proc/{slot.process.pid}/status").read_text()
@@ -437,5 +458,51 @@ def test_worker_death_ends_the_generation(workspace) -> None:
             assert _proc_state(pid) != "running", (
                 f"process {pid} of the generation survived its slot"
             )
+    finally:
+        ex.close()
+
+
+GUEST_IDENTITY_CODE = (
+    "id -u; id -g; "
+    "mkfifo mk.fifo && echo fifo-ok; "
+    "mknod blk b 8 0; echo mknod-rc=$?; "
+    "echo end"
+)
+
+
+async def test_slot_restores_in_guest_root_without_device_nodes(workspace) -> None:
+    """Parity for the guest identity, and the one thing it buys back is fenced.
+
+    A route-B slot mediator *is* the sandbox uid, so nobody can write maps for
+    it the way a privileged supervisor writes them for its child; without help
+    the guest would see its own host uid instead of uid 0 (fork F18 self-maps
+    `0 -> euid` inside the sandbox's namespace, matching the in-process shape).
+    That namespace then carries CAP_MKNOD, so the seccomp filter that denies
+    **device** nodes -- while keeping `mkfifo`, the same syscall with S_IFIFO --
+    is what stops the guest from minting a raw-disk handle and opening it.
+    """
+    ex = _executor(workspace, "sbx_rbe_guest_identity")
+    try:
+        code, out, err = await _collect(
+            await ex.start(
+                _config(["/bin/sh", "-c", GUEST_IDENTITY_CODE], str(workspace))
+            )
+        )
+        assert code == 0, (code, out, err)
+        lines = out.decode().splitlines()
+        # Inside the namespace the workload is uid/gid 0; host-side ownership is
+        # unchanged by the map (the kernel compares the kuid), which the
+        # ownership contracts above assert independently.
+        assert lines[:2] == ["0", "0"], out
+        assert lines[-1] == "end", out
+        assert "fifo-ok" in lines, out        # mkfifo must keep working
+        assert "mknod-rc=1" in lines, out  # device nodes must not be creatable
+        assert not (workspace / "blk").exists(), out
+        assert (workspace / "mk.fifo").is_fifo(), out
+        # The failing tool's own diagnostic (message wording varies by coreutils
+        # version, so only the program name is pinned here); *why* it is denied
+        # by file type -- and why S_IFIFO is not -- is pinned at the mechanism
+        # level in the fork's `test_arg_filters_block_device_nodes_but_not_fifos`.
+        assert err.startswith(b"mknod:"), err
     finally:
         ex.close()

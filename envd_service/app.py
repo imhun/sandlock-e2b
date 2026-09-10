@@ -24,7 +24,7 @@ from envd_service.quota_maintenance import QuotaMonitor
 from envd_service.rpc import register_rpc
 from envd_service.runtime.context import SandboxRuntimeContext
 from envd_service.runtime.registry import RuntimeRegistry
-from envd_service.uid_pool import UidPool
+from envd_service.uid_pool import CAP_SYS_PTRACE, UidPool, has_effective_cap
 from envd_service.xfs_quota import (
     NONROOT_DIRECT_QUOTA_REASON,
     ProjectQuotaError,
@@ -41,6 +41,16 @@ PER_UID_NONROOT_WARNING = (
     "E2B_PER_SANDBOX_UID is enabled but the worker is not running "
     "as root; per-sandbox host uids are disabled (non-root workers "
     "use the fixed identity + Landlock model, E5.1)"
+)
+
+#: The other half of the same story: a root worker that dropped CAP_SYS_PTRACE
+#: can allocate host uids but cannot map them for the in-process mediator.
+PER_UID_NO_PTRACE_WARNING = (
+    "E2B_PER_SANDBOX_UID is enabled on a root worker without CAP_SYS_PTRACE: "
+    "the in-process RunAs path cannot write the sandbox's uid_map, so "
+    "sandboxes that are not routed through a supervise slot will fail to "
+    "start (add CAP_SYS_PTRACE, or keep chroot sandboxes on route B -- "
+    "E2B_ROUTE_B=auto/on -- whose slot self-maps and needs no ptrace)"
 )
 
 
@@ -150,6 +160,14 @@ def create_app(
     # and the worker keeps the fixed-identity + Landlock model instead of
     # crash-looping on EPERM.
     if settings.per_sandbox_uid and os.geteuid() == 0:
+        if not has_effective_cap(CAP_SYS_PTRACE):
+            # Writing a *child's* uid_map needs CAP_SETUID **and** ptrace access
+            # to that child, so a root worker with a hardened capability set
+            # cannot remap sandboxes in-process -- measured: every create fails
+            # with the fork's generic `sandlock_create failed`. Route B is not
+            # affected (its slot already *is* the sandbox uid and self-maps), so
+            # this is a disclosure with a remedy, not a new failure mode.
+            logger.warning(PER_UID_NO_PTRACE_WARNING)
         runtime_registry.uid_pool = UidPool(
             start=settings.uid_pool_start,
             size=settings.uid_pool_size,

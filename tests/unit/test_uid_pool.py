@@ -369,3 +369,48 @@ def test_root_worker_gets_the_pool_by_default(tmp_path, monkeypatch) -> None:
     assert app is not None
     assert registry.uid_pool is not None
     assert registry.uid_pool.start == EnvdSettings().uid_pool_start
+
+
+# ------------------------------------------------------- capability gating
+
+def test_has_effective_cap_reads_the_mask_bits(monkeypatch) -> None:
+    """The probe is about the effective mask, not euid: the same root worker can
+    be hardened (bit dropped) or not."""
+    import envd_service.uid_pool as uid_pool
+
+    monkeypatch.setattr(uid_pool, "_cap_eff", lambda: 0x00000000A80425FB)
+    assert uid_pool.has_effective_cap(uid_pool.CAP_SYS_PTRACE) is False
+    assert uid_pool.has_effective_cap(uid_pool.CAP_SYS_PTRACE - 1) is True  # SYS_PTRACE neighbour
+    monkeypatch.setattr(uid_pool, "_cap_eff", lambda: 0x0000003FFFFFFF)
+    assert uid_pool.has_effective_cap(uid_pool.CAP_SYS_PTRACE) is True
+    monkeypatch.setattr(uid_pool, "_cap_eff", lambda: None)  # no /proc (macOS dev)
+    assert uid_pool.has_effective_cap(uid_pool.CAP_SYS_PTRACE) is False
+
+
+def test_root_worker_without_sys_ptrace_says_so(tmp_path, monkeypatch, caplog) -> None:
+    """A root worker with a hardened cap set can allocate host uids but cannot
+    map them in-process; that must be reported with the remedy, not discovered
+    as a wall of `sandlock_create failed`."""
+    import logging
+    import os
+
+    import envd_service.app as app_module
+    import envd_service.uid_pool as uid_pool
+    from envd_service.config import Settings as EnvdSettings
+    from envd_service.runtime.registry import RuntimeRegistry
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(uid_pool, "_cap_eff", lambda: 0x00000000A80425FB)
+    with caplog.at_level(logging.WARNING, logger="envd_service.app"):
+        app = app_module.create_app(
+            settings=EnvdSettings(executor="local", workspace_base=tmp_path),
+            runtime_registry=RuntimeRegistry(tmp_path),
+            workspace_base=tmp_path,
+        )
+    assert app is not None
+    assert any(
+        r.message == app_module.PER_UID_NO_PTRACE_WARNING for r in caplog.records
+    ), [r.message for r in caplog.records]
+    # The pool itself is still built: the disclosure is about what the
+    # in-process mediator can no longer do, not about allocation.
+    assert app.state.runtime_registry is not None
