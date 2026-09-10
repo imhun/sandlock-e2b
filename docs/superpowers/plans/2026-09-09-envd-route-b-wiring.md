@@ -76,10 +76,20 @@ acquire 重新生成；socket =
    带信号号 ⇒ route-B 子进程 `supports_signal_pause=True`（进程内后端仍 False）。
 4. ✅ **摘 xfail**：`tests/contract/test_uid_permissions.py` 的 strict xfail 已删，
    chroot 形态容器实跑 4 passed，日志里两个沙箱分别租到 uid 20000/20001 的槽位。
-   ⬜ **删 `mediation_run_as='supervisor'` 降级档** 还没做：它是「route-B 不可用」时
-   chroot 形态唯一的逃生门（现网默认 `E2B_PER_SANDBOX_UID=false` ⇒ 没有独立 host uid
-   ⇒ 租不到槽位 ⇒ 直接下发 caller 会被 fork F6.1 C 档在建箱前拒绝）。删档的前置是
-   per-sandbox uid 成为部署默认（或让共享 uid 也能槽位化），属独立决策。
+   ✅ **删 `mediation_run_as='supervisor'` 降级档（2026-09-10）**：前置已满足
+   （`E2B_PER_SANDBOX_UID` 已成部署默认）。`_mediation_run_as()` 与两处 ceiling 里的
+   该键一并删除，`_route_b_selected()` 改成 `_route_b_decline_reason()`（一个决策点，
+   disclosure 原文引用它）。删档后 chroot 形态在「拿不到槽位」时被 fork 拒绝建箱
+   （不再静默产出 supervisor 属主的文件 = T5），executor 在建箱前打一条 ERROR 说明
+   原因与修法；非 root worker（中介即沙箱自己的 euid）不构成拒绝，故不打。
+   容器实测：`tests/security/test_template_isolation.py` 三条（两条走真槽位、
+   一条钉住拒绝 + 对照组）。
+   删档后终态门禁（提交 `37fa9af` 字节复跑）：gate A `1069/3/0`、gate B `1068/4/0`、
+   非特权生产形 lane `966/2/0`、mediated-chroot 切片 `98/0`、macOS `989/83/0`、
+   `tests/unit` `736/10`；日志 `tmp/rb-f21-gate-a-body.log` /
+   `tmp/rb-f21-gate-b-body.log` / `tmp/rb-f21-focused.log` / `tmp/rb-f23-prod.log` /
+   `tmp/rb-f23-macos.log`（门禁容器要带 `--network host`，否则 5 条 sdk 模板构建
+   用例会因为 buildctl 连不上宿主随机端口而假红 —— 与代码无关，别当成回归）。
 5. ✅ **门禁（终态树复跑，含 transport 1 之后）**：gate A（chroot）`1054 passed / 2 skipped / 0 failed`、
    gate B（pure）`1046 passed / 3 skipped / 0 failed`、route-B 专题切片容器
    `64 passed`；日志 `tmp/rb-gate-a2.log` / `tmp/rb-gate-b.log` /
@@ -97,8 +107,12 @@ acquire 重新生成；socket =
    > 在「worker 有特权」时自动满足；非 root worker 仍旧自动缩退（E5.1）+ 一条 WARNING。
 1. **worker 特权**：默认 spawner 用 util-linux `setpriv` 把槽位起在沙箱 host uid 上
    ⇒ worker 必须 root（或注入 launcher `spawner=`）。非 root + `E2B_ROUTE_B=on` ⇒
-   建箱即报错（不静默退 route-A）；非 root + `auto` ⇒ 走进程内后端并保留
-   `mediation_run_as='supervisor'` 语义（T5 症状仍在）。
+   建箱即报错（不静默退 route-A）；非 root + `auto` ⇒ 走进程内后端。
+   **删档后（2026-09-10）这句话只对外半句成立**：降级档已删，但非 root worker 的进程内
+   中介就是 worker 自己的 euid、也正是沙箱的 host uid ⇒ fork 不拒绝，没有 T5 症状
+   （跨租户隔离仍弱，是 E5.1 的既有取舍）。会被拒的是另一半形态 ——
+   **root worker + chroot + 拿不到槽位**（`E2B_ROUTE_B=off` / wheel 不带 supervise /
+   `E2B_PER_SANDBOX_UID=false`）⇒ 建箱失败 + 一条 ERROR 说明为什么没有槽位、怎么修。
    **现网两套部署都不满足**：`docker-compose.prod.yml` 的 worker 是
    `user: "65534:65534"`，`deploy/k8s/worker.yaml` 只加
    `SYS_ADMIN`/`NET_BIND_SERVICE`（镜像默认 USER 也非 root）⇒ 两处 auto 档都保持

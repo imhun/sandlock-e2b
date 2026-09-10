@@ -50,7 +50,8 @@ fail-closed；`run_init` 读循环用纯函数 `take_frame_fds` 按「帧自己�
   **不写代码**。
 
 - **不做（属 E2B/运维侧）**：route-B supervise 的**部署与 envd 接线**、T5 strict xfail 摘除与
-  `mediation_run_as='supervisor'` 降级档清理（main backlog #5）、T1 真实 XFS 复测、O1/O2/O3、
+  `mediation_run_as='supervisor'` 降级档清理（main backlog #5；两项均已 2026-09-10 完成）、
+  T1 真实 XFS 复测、O1/O2/O3、
   E1.2/E8.1 目标机部署。其中**「fork 侧要能提供 Python 可达的接入面」这一部分已挪进本计划
   = Task 9（F16）**，剩下的才是纯 E2B/运维动作。
 

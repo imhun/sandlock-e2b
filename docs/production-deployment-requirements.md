@@ -57,7 +57,8 @@ workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，�
 | 进程/内存 | chroot 形态每沙箱多一棵 supervise 进程树（supervise + sandlock-init + 停车 M0）。它在沙箱 cgroup **之外**，不计入 `max_memory`/`max_disk`，并在 `max_processes` 里占 1；容量表按「N 沙箱 = N 额外进程」重算。 |
 | 回收 | route-B 代次的结束由 envd 生命周期（TTL/idle eviction/删除 → `executor.close()`）决定，不再依赖 core 的 15 min idle；槽位进程退出前该 uid 不会被再次租出（W1）。 |
 | 文件系统 | uid 只对**支持属主的存储**有意义：repo 的 virtiofs bind 挂载上 chown 是 no-op，生产请用容器原生 / XFS（本项目门禁把 workspace 放 `/var/lib/e2b-sandboxes` 的 XFS+prjquota 上）。 |
-| 关掉它 | 显式 `E2B_PER_SANDBOX_UID=false` 回到旧的共享 uid（1000）形态；此时 chroot 形态会走 `mediation_run_as='supervisor'` 降级档（代打开文件属主变 worker，即 T5 症状）。 |
+| 关掉它 | 显式 `E2B_PER_SANDBOX_UID=false` 回到旧的共享 uid（1000）形态：**pure（无 base image）形态照常跑**；**chroot 形态在 root worker 上会被 fork 直接拒绝建箱**（沙箱 host uid 1000 ≠ 中介 euid 0 ⇒ `mediation_run_as=caller refused`，见下条）。非 root worker 不受影响（沙箱就用 worker 自己的 euid，中介身份与沙箱身份同一个）。E2B 曾下发的 `mediation_run_as='supervisor'` 降级档（代打开文件属主变 worker = T5）已于 2026-09-10 删除，不再有静默逃生门。 |
+| 删档的后果（2026-09-10） | 「特权进程内中介 + 路径中介 + 非 0 host uid」这一组合现在只有 route B 一条路：root worker + chroot 形态若拿不到槽位（`E2B_ROUTE_B=off`、wheel 不带 supervise、或 `E2B_PER_SANDBOX_UID=false`）就**建箱失败**，并打一条 ERROR 说明为什么没有槽位、怎么修（容器实测钉在 `tests/security/test_template_isolation.py::test_in_process_chroot_is_refused_without_a_slot`）。非 root worker（E5.1，中介就是它自己的 euid）**不受影响** —— 那条组合不构成拒绝，所以也不会打这条 ERROR。 |
 | **CAP_SYS_PTRACE**（进程内 RunAs 才有） | 内核要求「给子进程写 `uid_map`」除 `CAP_SETUID` 外还要对该子进程的 **ptrace 访问权**。实测 `--cap-drop ALL`：只补 `SYS_ADMIN` ⇒ 每个建箱都挂在 `sandlock_create failed`；只再补 `SYS_PTRACE` 即通。**route B 不需要它**（槽位自己就是那个 uid，自映射 `0 -> euid` 无需特权）。root worker + 非 chroot 形态开 E3.2 时，worker 启动会打 WARNING（`PER_UID_NO_PTRACE_WARNING`）说明缺哪条 cap、怎么修。 |
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）

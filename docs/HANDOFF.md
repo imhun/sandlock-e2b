@@ -140,6 +140,69 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   （`tmp/e32-default-gate-b.log`）、macOS `979 / 77 / 0`（`tmp/rb-e32-macos.log`）。
   中途 r3/r4 的红（7 条、1 条）就是上面 1–3 与 PTY 那条，全部按上述方式收口。
 
+## ⚡ 删掉 supervisor 降级档（2026-09-10，backlog #5 ② 闭口）
+
+`envd_service/executors/sandlock.py::_mediation_run_as()` 与两处 ceiling 里的
+`mediation_run_as` 键一并删除：E2B 不再请求 fork 的 `supervisor` 降级档，
+「特权进程内中介 + 路径中介 + 非 0 host uid」这一组合从此**只剩 fork 的 fail-closed
+拒绝**（`mediation_run_as=caller refused: ... Run sandlock-supervise as uid X (route B)`），
+不再静默留下 supervisor 属主的沙箱文件（T5/SL-1）。
+
+- **一个决策点**：`_route_b_selected() -> bool` 改成 `_route_b_decline_reason() -> str | None`。
+  原先各条静默缩退分支（无 host uid / 起不了槽位 / 老 wheel 无 fd 客户端 / 缺 supervise
+  二进制）现在返回**同一句话**，强开（`on`/`SLOTS>0`）时仍然 `raise RuntimeError`
+  （route A/B 是部署决策，绝不静默降级），日志与 disclosure 只是把它原文引用。
+- **新形态 disclosure**：`_disclose_mediation_shape()` 在建箱前打**一条**（每进程一次）
+  ERROR，说明「chroot 沙箱跑在进程内而不是槽位上（原因…）、fork 会拒绝建箱、怎么修
+  （保持 `E2B_PER_SANDBOX_UID` + `E2B_ROUTE_B=auto/on`，或 launcher / 外部槽位池）」。
+  它先问 `_in_process_mediation_is_refused()`（对齐 fork 的 `mediation_remap_is_refused`：
+  F6.1 C 档 + F14「非 root 但持 `CAP_SETUID`/`CAP_SETGID` 的文件能力 launcher 同样算特权
+  中介」）——**非 root worker 的中介就是沙箱自己的 euid，那条组合不构成拒绝**，照打会在
+  生产非特权 lane 每次建箱都哭狼（参数化单测
+  `test_the_refusal_predicate_tracks_the_forks_privilege_rule` 六种身份钉死这条对齐）。
+- **为什么 FFI 侧看不到原因（SL-12）**：`sandlock_create` / `sandlock_instance_launch`
+  只返回空句柄，SDK 一律译成 `sandlock_instance_launch failed`，Rust 里那条写得很细的
+  拒绝文本在 FFI 边界被丢掉（实测：容器内 root worker 建 chroot 沙箱 ⇒
+  `RuntimeError("sandlock_instance_launch failed")`，stderr 无声）。于是 E2B 自建缓解 =
+  上面那条 disclosure；已登记 `docs/sandlock-upstream-issues.md` SL-12（建议 fork 用
+  supervise 侧已有的 `err_msg` out 参把 create/launch 的失败原因带出来）。
+- **容器实测（首次有测试在真槽位上跑完整 chroot + `fs_denied` 链）**：
+  `tests/security/test_template_isolation.py` 三条全部重写为走生产路径
+  （pooled host uid + `E2B_ROUTE_B=auto` + `await executor.start()`）：
+  ① `test_image_rootfs_execution` 往 rootfs 里放一个只有该镜像才有的标记文件，
+  沙箱内 `cat /template-marker.txt` 精确读回 `IN_IMAGE_ROOTFS`（runner 本身也是 Debian 系，
+  os-release 分不出「读的是镜像还是宿主」，标记文件可以）；
+  ② `test_..._cannot_reach_host_filesystem` 用**真的**在宿主上 `mkdtemp` 出来的目录做探针
+  ⇒ `HOST_HIDDEN`；③ `test_in_process_chroot_is_refused_without_a_slot`：
+  `E2B_ROUTE_B=off` 的 root worker 建箱被拒 + disclosure 那条 ERROR 必须出现 +
+  **对照组**（同 worker、同 host uid、同镜像，只去掉 chroot）正常起箱
+  （客体内 `id -u`=0、宿主属主=沙箱 uid）⇒ 证据落在中介规则上，而不是
+  「这台 runner 什么都建不出来」。
+- 连带清理：`route_b.supervise_policy_document()` 仍丢 `mediation_run_as`，注释改成
+  「守卫（执行器已不再下发）」；两处 `fs_denied` 的旧注释（「文件属主变成 supervisor」）
+  改为按后端说明归属（槽位=沙箱 host uid；进程内特权中介=被拒）。
+  另外 `tests/security/conftest.py` 长出三个共用件（`route_b_sandbox` /
+  `run_sh` / `require_route_b_slot` / `resolve_test_rootfs`）——**mediated chroot
+  形态从此在测试里也只有一条正确搭法**，别再手搓一个进程内实例去「测」它。
+
+**终态门禁（提交 `37fa9af` 的字节上复跑；容器一律 `--privileged --network host`）**：
+gate A（chroot，`base=python-mcp:3.14`、concurrency=2、strict skips、netns 开）
+`1069 passed / 3 skipped / 0 failed`（`tmp/rb-f21-gate-a-body.log`，基线 1061/3/0，
++8 = disclosure 参数化 6 + 一次性 builder 的档位断言 1 + 容器侧拒绝钉桩 1）；
+gate B（pure）`1068 passed / 4 skipped / 0 failed`
+（`tmp/rb-f21-gate-b-body.log`，基线 1060/4/0）；
+非特权生产形 lane `966 passed / 2 skipped / 0 failed`
+（`tmp/rb-f23-prod.log`，基线 958/2/0，仍只差 XFS prjquota 那 7 个文件）；
+mediated-chroot 专题切片（上面 6 个容器文件 28 条 + 三份 route-B/policy 单测 70 条）
+`98 passed / 0 failed`（`tmp/rb-f21-focused.log`）；
+macOS 全量 `989 passed / 83 skipped / 0 failed`（`tmp/rb-f23-macos.log`）、
+`tests/unit` `736 passed / 10 skipped`（`tmp/…` 同上，取末行）。
+skip 逐条核过：全是「Linux / root / docker / --perf / 设备能力」这类既有形状原因，
+没有一条来自 `require_route_b_slot`（容器两侧 strict skips 都开着）。
+⚠️ 门禁容器**必须 `--network host`**：漏掉它 5 条 `tests/sdk/python/test_templates.py`
+会以 `buildkit build exited with code 1` 假红（`buildctl` 在 bridge 网络里连不上
+`127.0.0.1:<随机端口>` 的 buildkitd），本轮第一次跑就踩了，与代码无关。
+
 ## ⚡ guest root 复原 + 设备节点收紧 + 非特权测试 lane（2026-09-10，fork F18）
 
 上一块留下的「route-B 沙箱内不再是 root」按**对齐**处理；顺手把对齐换来的能力收住；
@@ -293,10 +356,9 @@ chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-s
   一并归类成 `SlotDeadError`（只放行服务端 `SandboxError`），单测
   `test_a_client_side_channel_failure_is_not_a_policy_refusal` 钉住。
   fork 侧修法（≈10 行 + 1 条回归用例）与影响见 `docs/sandlock-upstream-issues.md` SL-9。
-- **仍未删**：`mediation_run_as='supervisor'` 降级档 —— 它现在是「route-B 不可用」
-  （现网默认无 per-sandbox uid；prod compose worker `user: 65534`、k8s worker 无
-  CAP_SETUID）时 chroot 形态唯一逃生门；删档要先让 per-sandbox uid 成为部署默认，
-  属独立决策（backlog #5 已记）。
+- ~~**仍未删**：`mediation_run_as='supervisor'` 降级档~~ ⇒ **已删（2026-09-10）**，
+  前置（per-sandbox uid 成部署默认）在 09-09 晚已满足；后果与实测见下面「删档」块
+  （`## ⚡ 删掉 supervisor 降级档（2026-09-10）`）。
 - **新增测试**：单测 `tests/unit/test_route_b_wiring.py`（28）+
   `tests/unit/test_sandlock_executor_route_b.py`（23，FakePool/FakeChannel 注入，
   macOS 可跑）；契约 `tests/contract/test_route_b_executor.py`（7，root+Linux 实跑：

@@ -68,7 +68,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | E8.4 | 公共镜像不直连 Docker Hub：`E2B_REGISTRY_MIRRORS` + 凭据按 host 作用域 + harness 存储改容器原生盘 + 清掉一条假 skip | ✅ 完成（默认形态 851 passed / 18 skipped；image-rootfs 形态 73 failed+28 errors → 853 passed / 16 skipped；两形态 0 failed。18 条 skip 的分组与跑法见 HANDOFF「容器全量剩下的 skip」） | `a6f74e4` `3d7cc79` `08a21dc` |
 | E8.5 | 把"能跑却在跳"的用例真正跑起来：镜像自带 XFS prjquota/npm/netns/双形态 + `E2B_TEST_STRICT_SKIPS` 能力型 skip 直接判失败 | ✅ 完成（全开跑见下；顺带修掉 fs_denied 废掉 per-uid 隔离、lsattr 缺失导致孤儿只报不清） | 本次提交 |
 | T4 | net_isolation + 镜像 rootfs(chroot) 形态下 MCP 入站端口映射起不来（纯 sandlock 形态 3/3 通过） | ✅ 已关闭（Task 10，FUP-E1）：根因 = envd 侧 base-image 组成（slim rootfs 无 mcp-gateway，ENOENT exit 2），非 fork；改用 MCP-capable 基镜像 `python-mcp:3.14`（deploy/docker/Dockerfile.mcp-base）后 chroot+netns MCP 契约两形态 3/3 绿；xfail 已摘 | `883d38d` `f67a6b9` |
-| T5 | chroot 形态共享卷写入经 supervisor 归属（fs_denied 代打开路径），per-uid 卷保护无法还原 | ⬜ 仍 strict xfail（`tests/contract/test_uid_permissions.py:99`）。**fork 侧语义已闭环**（§3.1 标「已修（构造消除 + fail-closed）」，B 档 `test_two_supervisors_distinct_uids_isolate_files` 已是跨 uid 硬证据）⇒ 剩余三步：① **fork F16**（route-B worker 侧客户端的 FFI/Python 接入面，今天 `connect_and_request` 只有 Rust，FFI 无导出 ⇒ envd 当不了 route-B worker）；② E2B 侧 envd 接线 + 部署 route-B（选 W1/W2 槽位模型）；③ 摘 xfail + 删 `mediation_run_as='supervisor'` 降级档。F16 计划见 `docs/superpowers/plans/2026-09-08-sandlock-fork-remaining.md` Task 9 | — |
+| T5 | chroot 形态共享卷写入经 supervisor 归属（fs_denied 代打开路径），per-uid 卷保护无法还原 | ✅ 关闭（2026-09-10）：三步全落。① fork F16/F17（worker 侧 C ABI + Python `SuperviseChannel`，含 fd 交接）；② E2B envd 全面接线 route B（W1 槽位模型，chroot 形态默认档）；③ strict xfail 已摘 + **`mediation_run_as='supervisor'` 降级档已删**（那条组合现在由 fork 拒绝建箱，E2B 不再请求）。证据：契约 `test_uid_permissions`（两 uid 槽位 20000/20001 各自属主/自 chmod/跨 uid EPERM）、`test_route_b_slot_pool` 的 token 非暴露面证明、`test_template_isolation` 两条真槽位 chroot + 一条钉住拒绝。fork §3.1 的「fail-closed 现状」段仍待重写（#25 ②），与本项无关 | — |
 | T1 | 真实 XFS/ext4 目标机上复测沙箱文件属主：① 沙箱能否 `chmod` 自己写的文件（本机 EPERM）；② 共享卷 1777+sticky 的跨 uid 保护是否真生效（本机 A 写的文件宿主属主是 uid 0，而沙箱 host_uid 是 20000） | ⬜ 待环境（两条用例已改为带证据跳过，不再靠巧合通过） | — |
 | T6 | 内存/CPU/进程配额按实例而非按沙箱 ⇒ 超卖（默认 K=2 实测 1.76x），放大为节点超卖 | ✅ 已定方案：改为**每沙箱一个 sandlock 实例**（fork 文档 §8，取代 P10 共享资源组） | — |
 | T2 | `third_party/sandlock`：`_HANDLED_FIELDS` 登记 `notify_rate_limit`，消掉假告警 | ✅ 完成（fork P3：`17ee48d` fix + `fad056a` doc，子模块 b955ae9 内） | `17ee48d` |
@@ -186,9 +186,13 @@ ACR 镜像推送照常，git 远程推送暂缓。
    `--privileged`，**958 passed / 2 skipped / 0 failed**（只有 XFS prjquota 的 7 个文件因容器内
    造不出 loop 而显式 ignore，strict skips 仍开）。终态门禁：gate A 1061/3/0、gate B 1060/4/0、
    macOS 982/78/0，fork 11 档全 matches baseline（python 455→461、core_lib 841→842）。
-   ⬜ 仍开一项：**删 `mediation_run_as='supervisor'` 降级档** —— 它现在是「route-B 不可用」
-   （现网默认 `E2B_PER_SANDBOX_UID=false` ⇒ 无独立 host uid）时 chroot 形态唯一
-   逃生门，删档要先让 per-sandbox uid 成为部署默认，属独立决策。
+   ✅ **删 `mediation_run_as='supervisor'` 降级档（2026-09-10）**：前置（per-sandbox uid
+   成部署默认）已满足，`_mediation_run_as()` 与两处 ceiling 里的该键删除，
+   `_route_b_selected()` ⇒ `_route_b_decline_reason()`（单一决策点，日志原文引用）。
+   后果：root worker + chroot 形态拿不到槽位 ⇒ fork 拒绝建箱（不再静默留 T5），
+   executor 在建箱前打一条 ERROR 说清原因与修法；非 root worker 的中介即沙箱自己的
+   euid，不构成拒绝（也不会误报）。容器实测
+   `tests/security/test_template_isolation.py`（两条真槽位 + 一条钉住拒绝与对照组）。
    进度留痕（2026-09-09 早）：fork F16
    ✅、**W1 槽位管理器 ✅（`envd_service/route_b.py` + 契约
    `tests/contract/test_route_b_slot_pool.py`：两个不同 uid 槽位经 SuperviseChannel
@@ -200,9 +204,9 @@ ACR 镜像推送照常，git 远程推送暂缓。
    `6571c36`、主仓 `f8c4020`，见 #24）。路线：envd 接线与 route-B supervise 部署
    （supervise 进程 euid == 沙箱 host uid，**W1 已按 2026-09-04 决策采用**；注意
    `sun_path` 108 字节与「一 uid = 一代沙箱，复用需重启」两条约束），最后摘除
-   `tests/contract/test_uid_permissions.py:99` 的 strict xfail 并回归 T5；
-   `mediation_run_as='supervisor'` 降级档（`envd_service/executors/sandlock.py:755-761`）
-   与 WARN/`mediation_downgrades` 计数随之移除。W1 已定（2026-09-04 决策；窗口 =
+   `tests/contract/test_uid_permissions.py` 的 strict xfail 并回归 T5；
+   `mediation_run_as='supervisor'` 降级档与 WARN/`mediation_downgrades` 计数随之移除
+   （两者均已于 2026-09-10 完成，见本条开头与 #5 ②）。W1 已定（2026-09-04 决策；窗口 =
    同时在世槽数 N），W2（换 uid 重启、窗口 = 段大小）为可选升级，不阻塞。
 6. **FUP pure-shape workspace 属主对齐**（Task 11 gate B 首跑暴露，确未修）: ✅ 已关闭
    （G2，2026-09-06）：无 base image
