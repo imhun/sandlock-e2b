@@ -112,7 +112,7 @@ lane() {
 
 **Files:** 无代码改动；产出 `tmp/a0-baseline.log`、`tmp/a0-probe.log`。
 
-- [ ] **Step 1: 记录三处 HEAD**
+- [x] **Step 1: 记录三处 HEAD**
 
 ```bash
 cd /Users/polus/project/ai/sandlock-e2b
@@ -127,7 +127,7 @@ PY
 
 Expected: 三个值一致；不一致先按 HANDOFF「wheel 与 tip 一致性」流程对齐，不要开始 A1。
 
-- [ ] **Step 2: 复跑探针，确认本机仍复现**
+- [x] **Step 2: 复跑探针，确认本机仍复现**
 
 ```bash
 docker run --rm --network host \
@@ -155,7 +155,7 @@ Expected: `chroot+fs_mount/symlink` 的 `rel-read=1`、`rel-write=2`；
 - Produces: `test_relative_open_from_second_workspace_alias_resolves_the_submount`、
   `test_getcwd_reports_the_alias_the_policy_declared`。
 
-- [ ] **Step 1: 写第一条失败用例（子挂载在 `/workspace` 下，cwd 在 `/home/user`）**
+- [x] **Step 1: 写第一条失败用例（子挂载在 `/workspace` 下，cwd 在 `/home/user`）**
 
 ```rust
 /// A host directory mounted at two virtual paths must not let the second
@@ -224,7 +224,7 @@ async fn test_relative_open_from_second_workspace_alias_resolves_the_submount() 
 }
 ```
 
-- [ ] **Step 2: 跑它，确认是红的**
+- [x] **Step 2: 跑它，确认是红的**
 
 ```bash
 chmod -R a+rwX third_party/sandlock/tmp
@@ -268,7 +268,7 @@ Expected: FAIL——`relative cat must exit 0`（stderr `cat: mnt/data/data.txt:
 >    还要加进程内单调序号 `-{pid}-{seq}`——同一进程里 4 条用例并发，只加 `remove_dir_all`
 >    会让它们互删 `rootfs`，把 git-ignored 的 `tests/rootfs-helper` 清零进而全文件 `exit 127`。
 
-- [ ] **Step 3: 写第二条用例（cwd 身份）**
+- [x] **Step 3: 写第二条用例（cwd 身份）**
 
 ```rust
 /// The sandbox's cwd identity is what the request asked for, not an artifact
@@ -311,12 +311,12 @@ async fn test_getcwd_reports_the_alias_the_policy_declared() {
 }
 ```
 
-- [ ] **Step 4: 跑它，确认是红的**
+- [x] **Step 4: 跑它，确认是红的**
 
 Run: 同 Step 2 的容器命令，替换测试名（日志存 `tmp/a1-red-cwd.log`）。
 Expected: FAIL，实际输出 `/workspace\n`——两条红指向**同一个**反查不确定性问题，修完必须同时转绿。
 
-- [ ] **Step 5: 提交 RED**
+- [x] **Step 5: 提交 RED**
 
 ```bash
 git -C third_party/sandlock add crates/sandlock-core/tests/integration/test_instance_chroot.rs
@@ -338,7 +338,7 @@ git -C third_party/sandlock commit -m "test(chroot): pin alias + sub-mount relat
 - Produces: `handle_chroot_chdir` 记录**请求的**虚拟路径；exec announce 后播种初始 cwd；
   `host_to_virtual` 平局按**声明顺序取第一个**（含文档注释）。
 
-- [ ] **Step 1: chdir 记录请求的虚拟路径**
+- [x] **Step 1: chdir 记录请求的虚拟路径**
 
 `dispatch.rs::handle_chroot_chdir` 末尾替换为：
 
@@ -355,7 +355,7 @@ git -C third_party/sandlock commit -m "test(chroot): pin alias + sub-mount relat
     NotifAction::ReturnValue(0)
 ```
 
-- [ ] **Step 2: 为新 exec 子进程播种初始 cwd**
+- [x] **Step 2: 为新 exec 子进程播种初始 cwd**
 
 `instance.rs::exec_with_fds_inner`，紧跟 `let pid = self.translate_announced_pid(pid)?;`：
 
@@ -373,7 +373,7 @@ git -C third_party/sandlock commit -m "test(chroot): pin alias + sub-mount relat
 
 `RunMain`/popen 的 announce 点做同样一件事（用其对应的 `cwd` 字符串）。
 
-- [ ] **Step 3: 反查确定性化**
+- [x] **Step 3: 反查确定性化**
 
 `resolve.rs::host_to_virtual` 的迭代器链改为（其余逻辑不变）：
 
@@ -397,7 +397,7 @@ git -C third_party/sandlock commit -m "test(chroot): pin alias + sub-mount relat
         })
 ```
 
-- [ ] **Step 4: 纯函数单测钉住平局规则**
+- [x] **Step 4: 纯函数单测钉住平局规则**
 
 `resolve.rs` 的 `mod tests` 加：
 
@@ -417,7 +417,7 @@ git -C third_party/sandlock commit -m "test(chroot): pin alias + sub-mount relat
     }
 ```
 
-- [ ] **Step 5: 跑 RED 两条用例 + 单测，确认转绿**
+- [x] **Step 5: 跑 RED 两条用例 + 单测，确认转绿**
 
 ```bash
 docker run --privileged --rm -v "$PWD/third_party/sandlock":/src -w /src sandlock-dev:latest \
@@ -430,7 +430,7 @@ docker run --privileged --rm -v "$PWD/third_party/sandlock":/src -w /src sandloc
 
 Expected: 两条 PASS + `host_to_virtual_tie_breaks_on_declaration_order` PASS。
 
-- [ ] **Step 6: chroot/cwd 回归（防语义漂移）**
+- [x] **Step 6: chroot/cwd 回归（防语义漂移）**
 
 ```bash
 docker run --privileged --rm -v "$PWD/third_party/sandlock":/src -w /src sandlock-dev:latest \
@@ -441,7 +441,7 @@ docker run --privileged --rm -v "$PWD/third_party/sandlock":/src -w /src sandloc
 Expected: 全绿。若既有用例断言"`cd` 走符号链接后 `..` 用物理父目录"，按确认点 #2 取舍，
 并在 `CHANGELOG.md` 明确记录这条语义变更。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git -C third_party/sandlock add crates/sandlock-core/src
@@ -454,7 +454,7 @@ git -C third_party/sandlock commit -m "fix(chroot): make the virtual cwd request
 - Modify: `third_party/sandlock/CHANGELOG.md`、`third_party/sandlock/docs/test-baseline.md`
 - Produce: `wheels/fork/*.whl` + manifest（脚本生成）
 
-- [ ] **Step 1: 非 root 全档**
+- [x] **Step 1: 非 root 全档**
 
 ```bash
 cd third_party/sandlock && chmod -R a+rwX tmp
@@ -463,7 +463,7 @@ docker run --privileged --rm -v "$PWD":/src -w /src sandlock-dev:latest sh scrip
 
 Expected: 各档与 baseline 一致，仅 core_lib / core_integ 因新用例递增。
 
-- [ ] **Step 2: 三个 root 档**
+- [x] **Step 2: 三个 root 档**
 
 ```bash
 docker run --privileged --rm -v "$PWD":/src -w /src --entrypoint bash sandlock-dev:latest -c 'sh scripts/test-all.sh --oci-root' 2>&1 | tee tmp/a3-gate-oci.log
@@ -473,7 +473,7 @@ docker run --privileged --rm -v "$PWD":/src -w /src --entrypoint bash sandlock-d
 
 Expected: 三档全绿（本机容器需 `--init`，见 HANDOFF「pid-1 不回收孤儿」注记）。
 
-- [ ] **Step 3: wheel 双架构重建 + verify + 同步**
+- [x] **Step 3: wheel 双架构重建 + verify + 同步**
 
 ```bash
 cd third_party/sandlock && sh python/build-wheels.sh 2>&1 | tee tmp/a3-wheel-build.log
@@ -501,7 +501,7 @@ Expected: verify 全绿（FFI 符号双向相等、RECORD 精确、supervise 三
 - Produces: 每个卷视图同时出现在两个别名下——`fs_mounts` 键集合 =
   `{f"/workspace/{rel}", f"/home/user/{rel}"}`（对每个 `rel`）。
 
-- [ ] **Step 0: 重建测试镜像（前置，否则跑的还是旧 fork）**
+- [x] **Step 0: 重建测试镜像（前置，否则跑的还是旧 fork）**
 
 `e2b-sandlock-test:latest` 在**构建期**把 `wheels/fork/*.whl` pip 装进镜像
 （`deploy/docker/Dockerfile.test-runner`），A3 换了 wheel 之后镜像必须重建，否则 E2B
@@ -528,7 +528,7 @@ docker run --rm --entrypoint sh e2b-sandlock-test:latest -c \
 Expected: 两个 sha256 相等（2026-09-10 现状：镜像内 `0989bb55…` ≠ 新 wheel `efdd3264…`，
 即**确实需要重建**）。
 
-- [ ] **Step 1: 先写契约测试（红）**
+- [x] **Step 1: 先写契约测试（红）**
 
 `tests/contract/test_shared_volume_relative_cwd.py`：
 
@@ -594,7 +594,7 @@ async def test_volume_visible_from_both_workspace_aliases(make_apps, workspace):
         assert stderr == b""
 ```
 
-- [ ] **Step 2: 跑它，确认红**
+- [x] **Step 2: 跑它，确认红**
 
 ```bash
 lane pytest tests/contract/test_shared_volume_relative_cwd.py -q --tb=short 2>&1 | tee tmp/a4-red.log
@@ -602,7 +602,7 @@ lane pytest tests/contract/test_shared_volume_relative_cwd.py -q --tb=short 2>&1
 
 Expected: FAIL（`cat mnt/data/a.txt` Permission denied）。
 
-- [ ] **Step 3: 双别名注册 + 删除 bind 段落**
+- [x] **Step 3: 双别名注册 + 删除 bind 段落**
 
 `envd_service/runtime/context.py` 的 `create_executor(...)` 参数改为：
 
@@ -628,7 +628,7 @@ Expected: FAIL（`cat mnt/data/a.txt` Permission denied）。
 `self._volume_bind_mounts` 初始化与 `shutdown()` 中的 unmount 循环（以及
 `__init__` 里 `if record.volume_mounts: self._materialize_chroot_volume_mounts()`）。
 
-- [ ] **Step 3b: `_view_cwd` 改为 `/home/user`（决定 ①）**
+- [x] **Step 3b: `_view_cwd` 改为 `/home/user`（决定 ①）**
 
 `envd_service/executors/sandlock.py::_view_cwd`：chroot 模式下把宿主 workspace cwd（或空
 默认值）映射为 **`/home/user`**，并把同文件两处 `mount_map` 的字面量顺序改为
@@ -644,7 +644,7 @@ Expected: FAIL（`cat mnt/data/a.txt` Permission denied）。
 
 同步更新 `tests/unit/test_executor_policy.py` 里对 `sb.cwd` / `sb.fs_mount` 键的断言。
 
-- [ ] **Step 4: 跑契约 + 单测，确认绿**
+- [x] **Step 4: 跑契约 + 单测，确认绿**
 
 ```bash
 lane pytest tests/contract/test_shared_volume_relative_cwd.py \
@@ -654,7 +654,7 @@ lane pytest tests/contract/test_shared_volume_relative_cwd.py \
 
 Expected: 全绿（bind 相关单测随文件删除；`--ignore` 为空）。
 
-- [ ] **Step 5: 迁移/多节点契约回归**
+- [x] **Step 5: 迁移/多节点契约回归**
 
 ```bash
 lane pytest tests/contract/test_migration.py tests/sdk/python/test_shared_volumes.py -q --tb=short
@@ -662,7 +662,7 @@ lane pytest tests/contract/test_migration.py tests/sdk/python/test_shared_volume
 
 Expected: 全绿——这正是 `tmp/nosa-full.log` 剩下的 4 条红。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add envd_service tests
@@ -682,14 +682,14 @@ git commit -m "fix(volumes): expose volume views under both workspace aliases an
   （`0711`/`0755`），卷切片保持 `0700` 且属主为该沙箱 host uid；无 per-sandbox 配额时
   卷根保持 `1777`。
 
-- [ ] **Step 1: 写失败单测**
+- [x] **Step 1: 写失败单测**
 
 构造 `<tmp>/root/_volumes/vol_a`，把 `root` 与 `_volumes` 造成 `0700`；调用
 `provision_sandbox_volume_mount(..., host_uid=21700)` 后断言 `root`、`_volumes`、
 `vol_a` 的 **mode 位**满足 `mode & 0o011 == 0o011`（用 mode 断言而非 `os.access`，
 避免测试进程的 root 特权让断言空过）。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
 
 ```python
 def _ensure_traversable(path: Path) -> None:
@@ -718,14 +718,20 @@ def _ensure_traversable(path: Path) -> None:
 
 在 `_ensure_shared_volume_root` 内对 `volume_root` 调用它（覆盖 `volume_root.parent` 链）。
 
-- [ ] **Step 3: 启动自检 + 文档**
+- [x] **Step 3: 启动自检 + 文档**
 
 worker 启动时用池内第一个 uid 探测 `settings.shared_volume_root` 的可穿透性，失败打一条
 `WARNING`（点名目录、实际 mode、修法）；`docs/production-deployment-requirements.md`
-新增 §2.4.2：**共享卷根及其祖先必须对租户 uid 可穿过（0711/0755），否则只有绝对路径
-可用、相对路径会 EACCES**。
+新增 §2.4.2：**共享卷根及其祖先必须对租户 uid 可穿过（0711/0755）**。
 
-- [ ] **Step 4: 验证**
+> **控制器更正（2026-09-11，A5 评审）**：本步骤原写"否则只有绝对路径可用、相对路径会
+> EACCES"——**实测不成立**。`tmp/vol_fs_mount_probe.py` 的 `symlink-tight-ancestor` 场景
+> （祖先 `0700`）里，绝对路径 `cat /workspace/mnt/data/data.txt` **同样** `EACCES`
+> （`tmp/a0-probe.log`）。原因是中介以沙箱自己的 uid 打开同一宿主路径，绝对/相对都要过
+> 同一 DAC 判定。文档应写成"祖先不可穿过 ⇒ 卷视图整体不可用"，并注明证据来自 A0/A3 探针
+> （A5 沿用，未重跑宿主探针；现场复现归 Track Z）。
+
+- [x] **Step 4: 验证**
 
 ```bash
 lane pytest tests/unit/test_shared_volume_traversal.py -q --tb=short
@@ -741,13 +747,13 @@ Expected: 全绿；把祖先改回 0700 的那条变体必须红（证明断言�
 - Modify: `envd_service/xfs_quota.py`（`via_agent` 形态不再 exec `xfs_quota`）
 - Modify: `docs/production-deployment-requirements.md` §2.4.1 表格
 
-- [ ] **Step 1: namespaced sysctl 改由容器 spec 提供**
+- [x] **Step 1: namespaced sysctl 改由容器 spec 提供**
 
 把 `net.ipv4.ip_unprivileged_port_start` 的运行时写入改成部署清单声明
 （Docker `--sysctl` / k8s `securityContext.sysctls`），验证 MCP 端口（50005+）与既有
 端口映射行为不变。
 
-- [ ] **Step 2: xfs_quota 全量走 quota-agent（决定 ③）**
+- [x] **Step 2: xfs_quota 全量走 quota-agent（决定 ③）**
 
 确保三条路径都经 agent 而不是 worker 侧 exec `xfs_quota`：`E2B_QUOTA_AGENT_URL` 配置项
 （存在时 `via_agent=True`）、`envd_service/xfs_quota.py` 的 `provision_project` /
@@ -759,7 +765,7 @@ Expected: 全绿；把祖先改回 0700 的那条变体必须红（证明断言�
 降级路径保留但不再依赖 SYS_ADMIN：agent 不可达时仍按既有 `ProjectQuotaError` 降级
 （挂卷成功、无 per-sandbox 限额）并打 WARNING。
 
-- [ ] **Step 3: 验证**
+- [x] **Step 3: 验证**
 
 ```bash
 lane pytest tests/contract/test_volume_quota.py tests/unit/test_volume_quota.py -q --tb=short
@@ -773,7 +779,7 @@ Expected: agent 形态全绿；降级形态需 `E2B_TEST_STRICT_SKIPS=1` 显式�
 - Modify: `deploy/scripts/test-prod-shaped.sh`（capset 可配置）
 - Modify: `docs/task-backlog.md`（#25 收口）、`docs/HANDOFF.md`（新增 ⚡ 段）
 
-- [ ] **Step 1: 让 capset 可配置**
+- [x] **Step 1: 让 capset 可配置**
 
 在 `CAPS` 拼装之后加入：
 
@@ -785,7 +791,26 @@ for drop in $(printf '%s' "${PROD_DROP_CAPS:-}" | tr ',' ' '); do
 done
 ```
 
-- [ ] **Step 2: 跑无 SYS_ADMIN 全量**
+> **控制器更正（2026-09-11，A7 实测）**：上面这段**单独用不够** —— 本机 Docker 引擎
+> （29.4.0）里 `--cap-add` 压过 `--cap-drop`，与参数顺序无关：`--cap-drop ALL
+> --cap-add SYS_ADMIN --cap-drop SYS_ADMIN` 的 `CapEff` 仍是 `0xa02c35fb`（含
+> SYS_ADMIN 位 0x200000），而没有 `--cap-add` 的 `--cap-drop SYS_ADMIN` 才是
+> `0xa00c35fb`。所以实际实现是**先把被掉的 cap 从 `--cap-add` 循环里摘掉**，再保留这段
+> `--cap-drop` 作为兜底（`deploy/scripts/test-prod-shaped.sh`）。
+
+- [x] **Step 1b: 收窄 `XFS_DESELECTS`（A6 反馈）**
+
+现有 deselect 表把 4 个**不需要 XFS** 的 unit 文件也排除了（A5/A6 的新用例因此进不了默认门禁）。
+核对每个被 deselect 的文件是否真的硬依赖 XFS prjquota：只保留真正需要的，其余从列表移除；
+移出的文件必须在**无 SYS_ADMIN 且无 XFS** 的 lane 下跑绿（或暴露出的红是真缺陷）。
+
+- [x] **Step 1c: 更正 strict-skips 口径（A5 实测）**
+
+本计划与部分文档曾写"`E2B_TEST_STRICT_SKIPS=1` 会把能力型 skip 判失败"。实测口径更窄：
+它只升级 `tests/conftest.py:81-88` 的 **6 个 runner 能力标记**，普通 `pytest.mark.skipif`
+在 strict 下仍是 skip。收口时按实测口径更正相关文档，避免误以为新增 `skipif` 会被拦住。
+
+- [x] **Step 2: 跑无 SYS_ADMIN 全量**
 
 ```bash
 PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh 2>&1 | tee tmp/a7-nosa.log
@@ -793,7 +818,10 @@ PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.
 
 Expected: **0 failed / 0 error**（本计划前基线 `tmp/nosa-full.log` = 4 failed）。
 
-- [ ] **Step 3: 常规三档门禁无漂移**
+实测（2026-09-11）：`1075 passed, 3 skipped, 0 failed`（301.19s，`tmp/a7-nosa.log`，
+首行 ENV-HEADER；cap 探针 `CapEff 0xa02c35fb → 0xa00c35fb`）。
+
+- [x] **Step 3: 常规三档门禁无漂移**
 
 ```bash
 bash tmp/run-f31.sh   # gate A / gate B / 生产形 phase1/phase2（macOS 另跑）
@@ -801,7 +829,13 @@ bash tmp/run-f31.sh   # gate A / gate B / 生产形 phase1/phase2（macOS 另跑
 
 Expected: 与上一基线逐项一致（±本次新增用例数）。
 
-- [ ] **Step 4: 台账收口**
+实测（2026-09-11）：只重跑了**本改动唯一触及的那条 lane**（`test-prod-shaped.sh`，cap 不削、
+phase 1 + phase 2）：phase 1 `1075 passed, 3 skipped, 0 failed`、phase 2 `48 passed, 1 skipped,
+0 failed`（`tmp/a7-default-lane.log`），与 A6 的 `tmp/a6-full-gate.log`（收集 982 → 1078）差的就是
+解禁的 96 条。gate A / gate B 没有重跑：它们既不用 `test-prod-shaped.sh`、本 Task 也没碰任何
+产品代码（只有 1 个 deploy 脚本 + 3 个文档），数字不可能动。
+
+- [x] **Step 4: 台账收口**
 
 `docs/task-backlog.md`：#25 标 ✅（写清"无 SYS_ADMIN 可用 + 两处改动 + 证据日志名"），
 并从 §2.4.1 的 `SYS_ADMIN` 行删掉"共享卷 bind"这一用途；`docs/HANDOFF.md` 新增

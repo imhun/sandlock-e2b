@@ -5,6 +5,95 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
+## ⚡ 共享卷去 SYS_ADMIN（2026-09-11，A4–A7 收口 / backlog #25）
+
+**一句话**：worker 侧不再需要 `SYS_ADMIN` ——「共享卷 `mount --bind`」「本地 `xfs_quota -x`」
+「写 namespaced sysctl」三处用途分别由 A4/A5/A6 迁出，A7 把这个形态固化成门禁并跑出
+**0 failed / 0 error**。`SYS_ADMIN` 现在全库只剩一处用途，且**不在 worker 上**：
+`deploy/stack/docker-compose.prod.yml` 的 `quota-agent`（`profiles: ["quota"]`）。
+
+### 1. 探针（本机；镜像 `e2b-sandlock-test:latest` = `sha256:2b796e1c11222c0e845f2d498ea9d4be0632babd4249b212ad209768bd11f42c`）
+
+| 形态 | `CapEff`（`/proc/self/status`） | 结论 |
+|---|---|---|
+| 默认 lane（清单超集，含 `SYS_ADMIN`） | `00000000a02c35fb` | SYS_ADMIN 位 `0x200000` **在** |
+| `PROD_DROP_CAPS=SYS_ADMIN` | `00000000a00c35fb` | 该位**已清**，差值正好 `0x200000` |
+
+⚠️ 踩坑（A7 实测，先记住这条）：**本机 Docker 引擎（29.4.0）里 `--cap-add` 压过
+`--cap-drop`，与参数顺序无关** —— `--cap-drop ALL --cap-add SYS_ADMIN --cap-drop SYS_ADMIN`
+的 `CapEff` 仍是 `0xa02c35fb`（SYS_ADMIN 在），而 `--cap-drop SYS_ADMIN`（无对应
+`--cap-add`）才是 `0xa00c35fb`。所以 `PROD_DROP_CAPS` 的实现是**把 cap 从 `--cap-add`
+循环里摘掉**，`--cap-drop` 只作兜底（`deploy/scripts/test-prod-shaped.sh`）。只按计划原文
+追加 `--cap-drop` 会得到「看起来在跑无 `SYS_ADMIN` 形态、其实还带着它」的假证据。
+
+### 2. 三处改动 + commit（主仓库 `main`；fork 子模块只读、本轮未改动，指针仍 `71e9deb`）
+
+| # | 原用途 | 终态 | commit |
+|---|---|---|---|
+| ① | 共享卷 `mount --bind` 进 workspace | A4 删掉 bind（卷视图 = 请求路径决定的符号链接，双别名 `/workspace/<rel>` + `/home/user/<rel>`）；A5 补齐卷根及祖先对租户 uid 的 `o+x` 穿透位 | `d3c390e`(A4)、`e18120d`(A5) |
+| ② | worker 本地直连 `xfs_quota -x` | A6 改由 **quota-agent** 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关；`SYS_ADMIN` 只留在 `profiles: ["quota"]` 的 agent 上） | `f2af31e`(A6) |
+| ③ | 写 namespaced sysctl（`ip_unprivileged_port_start`） | A6 改由**容器 spec 声明**（compose `sysctls:`；k8s 形态 root + `NET_BIND_SERVICE`） | `f2af31e`(A6) |
+
+fork 侧支撑这次改动的三个 commit（同一轮 A1–A3，**未推送**）：`aadb5ad`（A1 RED：子挂载 +
+别名下的相对路径）、`c6cbe03`（A2 修复：虚拟 cwd 由请求决定、host→virtual 平局规则确定化）、
+`71e9deb`（A3：`docs/test-baseline.md`/`CHANGELOG` + wheel 在该 tip 重建，manifest HEAD == tip；
+A4 起用这枚 wheel 重建测试镜像）。A5/A6 是纯 E2B 侧改动，**不需要 fork 变更**。
+
+主仓库这一串的提交顺序：`58f0ff4`（A0–A3 控制器更正 + fork 指针提到 A3 wheel tip）→
+`d3c390e`(A4) → `e18120d`(A5) → `f2af31e`(A6) → **A7 = 本块所在提交**
+（`test(deploy): pin the no-SYS_ADMIN worker shape and narrow the XFS deselects (A7)`；
+它的 hash 不能用 `--amend` 固定，`git log -1 --format=%h` 取当前值即可）。
+
+### 3. wheel 指纹
+
+- `wheels/fork/sandlock-0.9.0b0-cp314-cp314-manylinux_2_34_x86_64.whl`
+  `sha256=6924059195be6fa8768b1994b111ba305a5016d2bd57f2327a64e276416d0ab6`
+- `wheels/fork/sandlock-0.9.0b0-cp314-cp314-manylinux_2_34_aarch64.whl`
+  `sha256=6d20336c969a9936577c7f3903d05880cd92df0305d9e5d852cf58104c86d4b5`
+- `wheels/fork/SHA256SUMS.supervise`（HEAD `71e9debaef00f61237185c309640d58e46b1e017`）：
+  `supervise/x86_64/sandlock-supervise` = `b3220e063d4c44d334347a74b04167862553348459d5f0a973c6c73c2b8d958e`、
+  `supervise/aarch64/sandlock-supervise` = `e47e62eb6d10a009a5d54eb067db14b8f33e90d392a1e154e4da3cc49a9cee24`
+- 镜像内 `.so` 与 wheel 内 `.so` 同源（都是
+  `efdd3264bc51b939cfa5956dedaaadc5428de666b8d1bbc2634a91242fda1c9b`，A4 复验见
+  `tmp/a4-final-image-so.log`）
+
+### 4. 门禁数字（A7）
+
+| 口径 | 命令 | 结果 | 日志 |
+|---|---|---|---|
+| **GREEN** 无 `SYS_ADMIN` 全量 | `PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` | `1075 passed, 3 skipped, 0 failed`（301.19s；`CapEff 0xa02c35fb → 0xa00c35fb`） | `tmp/a7-nosa.log` |
+| **RED** 改造前基线（对照） | 同 lane、deselect 表仍含 7 条 | `4 failed, 962 passed, 3 skipped` | `tmp/nosa-full.log` |
+| 生产形默认 lane 无漂移 | `./deploy/scripts/test-prod-shaped.sh`（cap 不削、phase 1 + phase 2） | phase 1 `1075 passed, 3 skipped, 0 failed`（309.73s）、phase 2 `48 passed, 1 skipped, 0 failed`（31.30s）；与 A6 的 `tmp/a6-full-gate.log`（phase 1 `979 passed, 3 skipped`、phase 2 `48 passed, 1 skipped`）相比只有解禁的 +96 | `tmp/a7-default-lane.log` |
+
+`tmp/nosa-full.log` 的那 4 条 failed（`test_migration.py::test_migrate_with_shared_volume`、
+`test_uid_permissions.py::test_volume_shared_rw_across_distinct_uids`、
+`test_shared_volumes.py` 两条）正是 A4/A5 修掉的共享卷用例 —— 也就是这次「去 `SYS_ADMIN`」
+的 RED 证据。
+
+**deselect 收窄（A7 Step 1b）**：`XFS_DESELECTS` 从 **7** 个路径收到 **2** 个
+（`tests/contract/test_volume_quota.py`、`tests/contract/test_xfs_project_quota.py` —— 只有这两个
+文件真去建/报告 XFS prjquota 暂存盘）。移出的 5 条：4 个配额单测
+（`test_volume_quota` / `test_xfs_project_quota_agent` / `test_quota_agent_client` /
+`test_quota_maintenance`，全部靠 monkeypatch 文件系统探测与 `xfs_quota` 子进程，不碰真
+文件系统）+ 1 个**早已不存在**的 `tests/security/test_quota_enforcement.py`。效果：默认门禁多跑
+**96** 条用例（A6 期 `979 passed, 3 skipped` / 收集 982 → 现在 `1075 passed, 3 skipped` /
+收集 1078；`--collect-only` 实测这 4 个文件正好 96 条），**A5/A6 的新用例因此回到默认门禁**，
+不再只能靠手工 lane 覆盖。（相对 A4 之前的基线 `tmp/nosa-full.log`（962 passed + 4 failed /
+收集 969）共 +109 条，其中 13 条是 A4–A6 自己新增、96 条是这次解禁的。）
+
+**strict-skips 口径更正（A5 实测、A7 记录）**：`E2B_TEST_STRICT_SKIPS=1` **只**升级
+`tests/conftest.py::_STRICT_SKIP_FORBIDDEN` 的 6 个 runner 能力标记，普通
+`pytest.mark.skipif` 在 strict 下**仍是 skip**；上面两个契约文件恰好用第一条标记
+（"XFS quota integration requires"），所以漏列会变 error 而不是静默少跑。
+
+### 5. 遗留（都不是本次要解决的）
+
+- **线上升级未做**：现网 worker 仍是旧 wheel（无 route-B 语言面）+ 两个 worker 的 uid 段
+  重叠 ⇒ 升级顺序「先前面的镜像、后代码」与自检见下面「特权最小集实测 + 线上就绪审计」块。
+- **fork 的 3 个 commit 仍未 push**（连同 F17/F18 的 6 个）。
+- `tests/contract/test_volume_quota.py` 里那条**降级路径**用例在无 XFS 的 lane 进不来
+  （整个文件被 deselect），仍需特权 lane 覆盖。
+
 ## ⚡ F15（2026-09-08）：控制帧按声明归属描述符（`FRAME_VERSION` 1 → 2，终态 fork `3020ea0` / wheel `3020ea0` 产物）
 
 init 控制通道是 `SOCK_STREAM`：一次 `recvmsg` 可并入多帧，而内核交回的 SCM_RIGHTS
@@ -252,9 +341,12 @@ skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」�
   几十个入口，等于「半个 privileged」）。
 - 全量套件用生产形 capset 减掉 `SYS_ADMIN`：`4 failed, 962 passed, 3 skipped`
   （基线 966/3/0），掉的 4 条全是共享卷（migration / uid_permissions / sdk 两条）。
-- ⚠️ **未解决缺口（backlog #25）**：无 `SYS_ADMIN` 时共享卷退化成 workspace 符号链接，
-  而它对跨 uid 读写**不成立**（EACCES）⇒ 摘 `SYS_ADMIN` 目前只适用于不用 `volumeMounts`
-  的部署。要么重新设计卷根属主/权限、要么让 bind 由容器运行时做、要么保留它。需要设计决策。
+- ✅ **该缺口已闭（2026-09-11 A4–A7）**：当时记的「无 `SYS_ADMIN` 时共享卷退化成 workspace
+  符号链接、跨 uid 读写 EACCES」是 **bind 还在**时的现象。A4 删掉 `mount --bind`（卷视图由
+  请求路径决定）+ A5 补卷根祖先穿透位之后，无 `SYS_ADMIN` 的共享卷在绝对/相对两个方向都成立；
+  A6 再把配额与低端口 sysctl 迁出，A7 用 `PROD_DROP_CAPS=SYS_ADMIN` 固化并跑出
+  `1075 passed, 3 skipped, 0 failed`。终态口径见本文件顶部
+  「⚡ 共享卷去 SYS_ADMIN（2026-09-11）」块与 `docs/task-backlog.md` #25。
 
 ### 2. 线上审计（172.18.80.140，只读；跳板通道 `deploy/scripts/lib/helpers.sh::run_target`）
 
@@ -296,7 +388,8 @@ phase 2 `47/1/0`、macOS `989/84/0`、`tests/unit` `736/10`。临时文件清理
 2. **SL-12**（create/launch 的 FFI 不带拒绝原因）只登记在
    `docs/sandlock-upstream-issues.md`，还没作为 issue/PR 报给上游。
 3. **线上升级**：按 §2 的顺序做（先新 wheel 镜像，再拆 uid 段，再升代码）。
-4. **backlog #25 的设计缺口**：共享卷在没有 `SYS_ADMIN` 时的退化路径不成立。
+4. ~~**backlog #25 的设计缺口**：共享卷在没有 `SYS_ADMIN` 时的退化路径不成立。~~
+   **已闭（2026-09-11 A4–A7）**：见本文件顶部「⚡ 共享卷去 SYS_ADMIN（2026-09-11）」块。
 5. 待授权清理项：`tmp/stale-20260902`（4.9G，G2 取证目录，文档写明"确认无用后可单独删"）、
    docker 侧 images 18G / volumes 39.7G / build cache 8.7G（卷里混着**别的项目**的数据，
    我没有 `prune`）。
@@ -341,6 +434,8 @@ phase 2 `47/1/0`、macOS `989/84/0`、`tests/unit` `736/10`。临时文件清理
   暂存盘**（容器内 loop 不可用，`--cap-add SYS_ADMIN` + `--device /dev/loop-control` 也
   `failed to setup loop device`）⇒ 7 个配额文件显式 `--ignore`（`E2B_TEST_STRICT_SKIPS=1`
   仍开，漏列就成 error 而非静默少跑）；`NET_ADMIN` 是给**夹具**放 198.18.0.99 伪源地址用的，
+  **（2026-09-11 A7 更正：只有 2 个契约文件真需要 XFS，名单已收窄，见顶部 ⚡ 段；
+  `E2B_TEST_STRICT_SKIPS=1` 也只升级 conftest 的 6 个 runner 能力标记。）**
   worker 自身不需要。首跑 r1 的 21 ERROR/2 FAIL 全部归因到「缺 ptrace + 缺 ignore」，
   修正后 **r3：958 passed / 2 skipped / 0 failed**（`tmp/prod-lane-r3.log`；r1 留档
   `tmp/prod-lane-r1.log`、r2 `tmp/prod-lane-r2.log`）。

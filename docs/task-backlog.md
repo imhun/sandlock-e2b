@@ -504,19 +504,28 @@ ACR 镜像推送照常，git 远程推送暂缓。
     降级档）已于 2026-09-10 全部完成 ⇒ 见 #5 与 #25：部署侧还差 wheel 与 uid 段两件事，
     线上已实测核过。
 
-25. **route-B 特权最小集 + 共享卷 bind 的退化缺口（2026-09-10 实测）**:
-   ✅ 最小集已实测并写进 `docs/production-deployment-requirements.md` §2.4.1 与计划
+25. **route-B 特权最小集 + 共享卷 bind 的退化缺口（2026-09-10 实测；2026-09-11 A7 收口）**:
+   ✅ **已收口：无 `SYS_ADMIN` 可用** —— worker 侧不再需要它，共享卷也不再是保留它的理由。
+   特权最小集实测并写进 `docs/production-deployment-requirements.md` §2.4.1 与计划
    `2026-09-09-envd-route-b-wiring.md` 检查表第 10 条：沙箱侧
    `SETUID`+`SETGID`+`CHOWN`；`DAC_OVERRIDE` 属管理面（对账 `os.walk`、删除 `rmtree`、
-   配额扫描要穿租户 0700 目录，摘掉即 `EACCES`）；**`SYS_ADMIN` 不是 route-B 前置**
-   （只服务共享卷 `mount --bind` 与直接 `xfs_quota`）；`SYS_PTRACE` 只服务进程内
-   `RunAs`。对照实验与「槽位进程 `CapEff=0` ⇒ worker 的 cap 不会顺着中介漏进租户路径」
-   的取证在 HANDOFF 同名块。
-   ⬜ **未解决（需要设计决策，未排期）**：没有 `SYS_ADMIN` 时共享卷退化成「workspace
-   符号链接」，而这条路径对**跨 uid 读写共享卷不成立**（实测 EACCES，日志
-   `cannot bind volume … failed mount system call.; keeping the workspace symlink`）
-   ⇒ 「摘掉 SYS_ADMIN」目前只对不用 `volumeMounts` 的部署可行。三条候选：按 uid 重新
-   设计卷根属主/权限；让 bind 由容器运行时完成；或接受保留 `SYS_ADMIN`。
+   配额扫描要穿租户 0700 目录，摘掉即 `EACCES`）；**`SYS_ADMIN` 不是 route-B 前置**，
+   worker 侧三处用途已全部迁出（见下）；`SYS_PTRACE` 只服务进程内 `RunAs`。对照实验与
+   「槽位进程 `CapEff=0` ⇒ worker 的 cap 不会顺着中介漏进租户路径」的取证在 HANDOFF 同名块。
+   ✅ **三处改动（A4 / A5 / A6）**：① 共享卷 `mount --bind` 进 workspace：**A4** 删掉 bind
+   （卷视图 = 请求路径决定的符号链接，双别名 `/workspace/<rel>` + `/home/user/<rel>`），
+   **A5** 补齐卷根及祖先对租户 uid 的 `o+x` 穿透位（§2.4.2）⇒ 原来「无 `SYS_ADMIN` 就
+   EACCES」的跨 uid 读写缺口不再成立；② 直接执行 `xfs_quota -x`：**A6** 改由服务端
+   **quota-agent** 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关，`SYS_ADMIN` 只留在
+   `profiles: ["quota"]` 的 agent 服务上）；③ 写 namespaced sysctl
+   （`ip_unprivileged_port_start`）：**A6** 改由容器 spec 声明（compose `sysctls:`）。
+   ✅ **证据日志**：`tmp/a4-final-step4-run{1,2,3}.log`（A4/A5 契约 36 条 ×3，**无
+   `SYS_ADMIN`** 三连绿）、`tmp/a6-agent.log`（agent 形态 `107 passed`）、
+   `tmp/a6-full-gate.log`、以及 A7 的**无 `SYS_ADMIN` 全量门禁**
+   `tmp/a7-nosa.log` = `1075 passed, 3 skipped, 0 failed`（对照改造前基线
+   `tmp/nosa-full.log` = `4 failed, 962 passed, 3 skipped`；那 4 条正是 A4/A5 修掉的共享卷
+   用例）。门禁固化入口：`PROD_DROP_CAPS=SYS_ADMIN ./deploy/scripts/test-prod-shaped.sh`
+   （cap 探针 `CapEff 0xa02c35fb → 0xa00c35fb`，SYS_ADMIN 位已清）。
    ⬜ **线上部署前置（审计结论，非代码缺口）**：现网 worker 实际是 root（远端清单没有
    `user:` 行、旧镜像也没有 `USER`），但**镜像里的 wheel 没有 route-B 语言面**
    （`sandlock_supervise_connect_fd` = False、缺 `sandlock-supervise`），且两个 worker
