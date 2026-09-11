@@ -38,6 +38,14 @@ fi
 export BASTION_HOST BASTION_USER TARGET_HOST TARGET_SSH_USER DEPLOY_USER \
     SSH_KEY SSH_PASSPHRASE TASK_TIMEOUT REMOTE_DIR
 
+#: Remote secrets upgrade.sh carries over when the local .env still has a blank
+#: or placeholder value (--force-env skips the carry-over). E2B_QUOTA_AGENT_TOKEN
+#: is on the list because a blank local token would otherwise clobber the
+#: deployed one and make the quota-agent refuse to start without auth.
+PRESERVED_REMOTE_SECRET_KEYS="E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_INTERNAL_API_KEYS \
+E2B_IMAGE_REGISTRY_PASSWORD E2B_REDIS_PASSWORD E2B_SECRET_MASTER_KEY \
+E2B_SECRET_MASTER_KEYS E2B_QUOTA_AGENT_TOKEN"
+
 say() { printf '\n==> %s\n' "$*"; }
 
 require_expect() {
@@ -101,6 +109,11 @@ set_env_file_value() {
 
 # --- quota-agent (A6) ------------------------------------------------------
 
+#: In-stack agent endpoint written by enable_quota_agent_profile. disable_
+#: quota_agent_profile clears exactly this value (a deployment that points at
+#: an external/NFS-side agent keeps it: that agent is the operator's).
+QUOTA_AGENT_STACK_URL="http://quota-agent:49984"
+
 # quota_agent_profile_args <env_file> — "--profile quota" when the .env enables
 # the stack-local quota-agent (QUOTA_AGENT_PROFILE=1), else nothing. Fails
 # closed when the profile is on without E2B_QUOTA_AGENT_TOKEN: the agent refuses
@@ -129,8 +142,42 @@ enable_quota_agent_profile() {
     local env_file="$1"
     set_env_file_value "$env_file" QUOTA_AGENT_PROFILE 1
     if [ -z "$(env_file_value "$env_file" E2B_QUOTA_AGENT_URL)" ]; then
-        set_env_file_value "$env_file" E2B_QUOTA_AGENT_URL "http://quota-agent:49984"
+        set_env_file_value "$env_file" E2B_QUOTA_AGENT_URL "$QUOTA_AGENT_STACK_URL"
     fi
+}
+
+# disable_quota_agent_profile <env_file> — turn the stack-local agent off and
+# stop the worker from reaching a leftover one. Compose does *not* stop a
+# container whose service left the active profile set (`up -d
+# --remove-orphans` without the profile keeps it running, measured with
+# compose 5.1.2), so upgrade.sh removes it explicitly; this side of the fix
+# clears the in-stack URL (otherwise the worker would keep provisioning quota
+# through a privileged container the operator believes is gone). An
+# operator-supplied external URL is left alone.
+disable_quota_agent_profile() {
+    local env_file="$1"
+    set_env_file_value "$env_file" QUOTA_AGENT_PROFILE 0
+    if [ "$(env_file_value "$env_file" E2B_QUOTA_AGENT_URL)" = "$QUOTA_AGENT_STACK_URL" ]; then
+        set_env_file_value "$env_file" E2B_QUOTA_AGENT_URL ""
+    fi
+}
+
+# require_pinned_quota_agent_image <env_file> — fail closed when the
+# stack-local agent would run from the unpinned `<name>:latest` fallback, which
+# the target cannot pull. --keep-image-tags skips the pinning step, so that
+# combination is the realistic way to get here.
+require_pinned_quota_agent_image() {
+    local env_file="$1" image
+    image="$(env_file_value "$env_file" QUOTA_AGENT_IMAGE)"
+    if [ -n "$image" ]; then
+        return 0
+    fi
+    echo "quota-agent 形态已启用，但 $env_file 的 QUOTA_AGENT_IMAGE 为空：" \
+        "compose 会回落到 e2b-sandlock-quota-agent:latest，目标机拉不到。" \
+        "--keep-image-tags 会跳过镜像 tag 固定（就是这个组合）；" \
+        "请显式写 QUOTA_AGENT_IMAGE=<registry>/<ns>/e2b-sandlock-quota-agent:<VERSION>，" \
+        "或去掉 --keep-image-tags 让 upgrade.sh 自动固定。" >&2
+    return 1
 }
 
 # --- E6.2 image digest pinning ---------------------------------------------

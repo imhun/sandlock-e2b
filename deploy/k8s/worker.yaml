@@ -17,10 +17,11 @@ spec:
       # worker's own network namespace (shared-netns form, the default one).
       # The worker image builds with `USER 65534:65534`
       # (deploy/docker/Dockerfile.envd) and this pod does NOT override it, so
-      # `capabilities.add: NET_BIND_SERVICE` is *not* enough: containerd clears
-      # the effective set for a non-root process (measured: CapEff=0, no ambient
-      # caps) and with the kernel-default `ip_unprivileged_port_start=1024` the
-      # bind fails with EACCES. Measured in this repo's test image:
+      # `capabilities.add: NET_BIND_SERVICE` is *not* enough: a non-root process
+      # gets no effective capabilities (Kubernetes has no ambient-capability
+      # semantics) and with the kernel-default `ip_unprivileged_port_start=1024`
+      # the bind fails with EACCES. Measured on the Docker engine in this repo's
+      # test image (tmp/a6fix1-cap-probe.log):
       #   uid 65534 + NET_BIND_SERVICE + sysctl=1024 -> CapEff=0, bind :53 EACCES
       #   uid 65534 + NET_BIND_SERVICE + sysctl=0    -> bind :53 OK
       #   uid 0     + NET_BIND_SERVICE + sysctl=1024 -> CapEff=0x400, bind :53 OK

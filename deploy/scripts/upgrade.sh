@@ -97,7 +97,8 @@ fi
 
 # --- 保留远端密钥（默认）---
 if [ -n "$ENV_FILE" ] && [ "$FORCE_ENV" != "1" ]; then
-    for key in E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_INTERNAL_API_KEYS E2B_IMAGE_REGISTRY_PASSWORD E2B_REDIS_PASSWORD E2B_SECRET_MASTER_KEY E2B_SECRET_MASTER_KEYS; do
+    # shellcheck disable=SC2086  # PRESERVED_REMOTE_SECRET_KEYS is a key list
+    for key in $PRESERVED_REMOTE_SECRET_KEYS; do
         if grep -qE "^$key=(__.*__)?$" "$ENV_FILE"; then
             remote_val="$(remote_env_value "$key" || true)"
             if [ -n "$remote_val" ]; then
@@ -234,11 +235,14 @@ fi
 # --- quota-agent（A6）：栈内 agent 形态 -------------------------------------
 # --with-quota-agent 把 QUOTA_AGENT_PROFILE=1 写进 .env（粘性：之后的普通
 # upgrade 也带 --profile quota 起本地 agent），并在 worker 还没配 URL 时指向
-# 栈内服务；--without-quota-agent 只是把开关写回 0（配额随即降级 + WARNING）。
+# 栈内服务。--without-quota-agent 反之：写回 0、清掉栈内 URL，并在目标机
+# **显式**停止/移除 agent 容器（compose 不会因为服务离开 active profile 就停它，
+# 实测 compose 5.1.2：不带 profile 的 `up -d --remove-orphans` 仍让 agent 运行）。
 if [ "$WITH_QUOTA_AGENT" = "1" ] && [ "$WITHOUT_QUOTA_AGENT" = "1" ]; then
     echo "--with-quota-agent 与 --without-quota-agent 互斥" >&2
     exit 1
 fi
+QUOTA_AGENT_STOP=0
 if [ "$WITH_QUOTA_AGENT" = "1" ] || [ "$WITHOUT_QUOTA_AGENT" = "1" ]; then
     [ -n "$ENV_FILE" ] || { echo "quota-agent 开关需要 .env（--env-file 或 deploy/stack/.env）" >&2; exit 1; }
     if [ "$WITH_QUOTA_AGENT" = "1" ]; then
@@ -246,13 +250,24 @@ if [ "$WITH_QUOTA_AGENT" = "1" ] || [ "$WITHOUT_QUOTA_AGENT" = "1" ]; then
         say "quota-agent 形态已开启（QUOTA_AGENT_PROFILE=1，URL=$(env_file_value "$ENV_FILE" E2B_QUOTA_AGENT_URL)）"
         say "记住：agent 需要 E2B_QUOTA_AGENT_TOKEN（与 worker 同值），否则本次部署会 fail fast"
     else
-        set_env_file_value "$ENV_FILE" QUOTA_AGENT_PROFILE 0
-        say "quota-agent 形态已关闭（QUOTA_AGENT_PROFILE=0）；worker 仍指向 agent 时配额会降级 + WARNING"
+        disable_quota_agent_profile "$ENV_FILE"
+        QUOTA_AGENT_STOP=1
+        if [ -n "$(env_file_value "$ENV_FILE" E2B_QUOTA_AGENT_URL)" ]; then
+            say "栈内 quota-agent 已关闭（QUOTA_AGENT_PROFILE=0），容器会被显式停止/移除；" \
+                "E2B_QUOTA_AGENT_URL=$(env_file_value "$ENV_FILE" E2B_QUOTA_AGENT_URL) 是你指定的外置 agent，" \
+                "保留 ⇒ 配额仍由它提供（特权在它那边）"
+        else
+            say "quota-agent 形态已关闭（QUOTA_AGENT_PROFILE=0，栈内 URL 已清空）⇒ worker 转本地直连，" \
+                "非 root worker 会降级（无 per-sandbox 硬限 + WARNING）；容器会被显式停止/移除"
+        fi
     fi
 fi
 QUOTA_PROFILE_ARGS="$(quota_agent_profile_args "${ENV_FILE:-}")" || exit 1
 if [ -n "$QUOTA_PROFILE_ARGS" ]; then
     say "本次 upgrade 带 --profile quota（栈内 quota-agent）"
+    # --keep-image-tags skips the pinning loop above, which would leave
+    # QUOTA_AGENT_IMAGE empty and fall back to `<name>:latest` on the target.
+    require_pinned_quota_agent_image "${ENV_FILE:-}" || exit 1
 fi
 
 say "上传部署文件到 $REMOTE_DIR"
@@ -263,6 +278,14 @@ if [ -n "$ENV_FILE" ]; then
 fi
 
 say "拉取镜像（deploy 用户）"
+if [ "$QUOTA_AGENT_STOP" = "1" ]; then
+    # Explicit, not --remove-orphans: compose keeps a container whose service
+    # left the active profile set running (measured with 5.1.2), and leaving a
+    # root + SYS_ADMIN container behind while telling the operator quota is off
+    # would be a false security statement. Idempotent when it was never created.
+    say "停止并移除栈内 quota-agent 容器（--without-quota-agent）"
+    run_as_deploy "cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml --profile quota rm -sf quota-agent"
+fi
 run_as_deploy "cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml $QUOTA_PROFILE_ARGS pull --quiet"
 
 # E5.1: one-time shared-volume ownership migration for the non-root worker.

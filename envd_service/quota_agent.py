@@ -248,8 +248,10 @@ def configure_quota_agent_client(
     Returns the configured client (for app lifecycle cleanup) or ``None``.
     With ``url`` unset the hooks are reset to ``None`` and a warning is
     logged: the worker degrades (skips quota with a warning) exactly like an
-    unreachable agent, so enabling ``E2B_QUOTA_VIA_AGENT`` without an agent
-    URL never blocks sandboxes.
+    unreachable agent. That is the only case left in which the flag matters --
+    a non-blank ``E2B_QUOTA_AGENT_URL`` selects the agent form on its own
+    (``Settings.quota_via_agent`` derives from it), and setting
+    ``E2B_QUOTA_VIA_AGENT=true`` without a URL never blocks sandboxes.
     """
     if not url:
         configure_agent_query(None)

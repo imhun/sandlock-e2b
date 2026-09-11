@@ -42,7 +42,7 @@ cp deploy/scripts/acr.env.example   deploy/scripts/acr.env         # 填 ACR_USE
 | 脚本 | 参数 / 环境变量 |
 |---|---|
 | build-and-push.sh | `VERSION`、`PLATFORMS`（默认 amd64+arm64）、`BASE_IMAGE`、`MIRROR_BASE_IMAGE=0` 跳过基础镜像 |
-| upgrade.sh | `--build` 先构建；`--version <v>` 固定镜像版本（默认 git describe）；`--env-file <path>` 指定 env；`--force-env` 不保留远端密钥；`--keep-image-tags` 不重写镜像 tag；`--skip-smoke`；`--with-quota-agent` / `--without-quota-agent` 开/关栈内 quota-agent（写 `QUOTA_AGENT_PROFILE`，带 `--profile quota`，缺 `E2B_QUOTA_AGENT_TOKEN` 时 fail fast） |
+| upgrade.sh | `--build` 先构建；`--version <v>` 固定镜像版本（默认 git describe）；`--env-file <path>` 指定 env；`--force-env` 不保留远端密钥；`--keep-image-tags` 不重写镜像 tag（**不能**与 `--with-quota-agent` 合用：会留下空的 `QUOTA_AGENT_IMAGE` ⇒ 回落 `:latest`，脚本 fail fast 并点名该组合）；`--skip-smoke`；`--with-quota-agent` 开栈内 agent（写 `QUOTA_AGENT_PROFILE=1`、固定 `QUOTA_AGENT_IMAGE`、带上 `--profile quota`，缺 `E2B_QUOTA_AGENT_TOKEN` 时 fail fast）；`--without-quota-agent` 关：写回 `QUOTA_AGENT_PROFILE=0`、清掉栈内 `E2B_QUOTA_AGENT_URL`，并在目标机**显式** `docker compose --profile quota rm -sf quota-agent`（不依赖 `--remove-orphans`；外置 agent 的 URL 保留） |
 | smoke.sh | 无 |
 | 全局 | `BASTION_HOST`、`TARGET_HOST`、`DEPLOY_USER`、`SSH_KEY`、`SSH_PASSPHRASE`、`TASK_TIMEOUT` 可覆盖 |
 
@@ -55,7 +55,10 @@ cp deploy/scripts/acr.env.example   deploy/scripts/acr.env         # 填 ACR_USE
   `QUOTA_AGENT_IMAGE` 固定成 `<registry>/<ns>/e2b-sandlock-quota-agent:<VERSION>`
   （`build-images.sh`/`build-and-push.sh` 会构建并推送它，与 worker 同一个流程），
   写 `QUOTA_AGENT_PROFILE=1` 并让 worker 指向栈内 agent；后续升级自动带
-  `--profile quota`。外置/NFS 服务器形态的 agent 不要开这个开关。
+  `--profile quota`。`--without-quota-agent` 是它的逆操作：写回 0、清掉栈内 URL，
+  **并显式 `rm -sf` 掉那个容器**（compose 不会因为服务离开 active profile 就停它，
+  实测 compose 5.1.2）；外置/NFS 服务器形态的 agent 不要开这个开关（开着 off 也无妨，
+  外置 URL 不会被清）。
 - **开发构建默认带时间戳**：`build-and-push.sh` 未指定 `VERSION` 时使用
   `<git describe>-<时间戳>`（如 `0.1.0-20260830-153045`），每次构建都是新
   tag，不覆盖旧镜像；本次构建版本记录在 `deploy/stack/.version`。

@@ -354,9 +354,11 @@ env:
 - 低端口：**必须声明 `net.ipv4.ip_unprivileged_port_start=0`**（pod 级
   `spec.template.spec.securityContext.sysctls`，`deploy/k8s/worker.yaml` 已声明）——
   wildcard allowOut 的 DNS 网关绑 `:53`，而 worker 镜像 `USER 65534` ⇒ 非 root 的
-  `CapEff=0`（containerd 不发放 ambient caps），`NET_BIND_SERVICE` **不够**，内核默认
-  1024 下 bind `:53` = EACCES（实测见 `deploy/k8s/worker.yaml` 的注释）；cap 只对
-  root override（`runAsUser: 0`）有意义。该 sysctl 自 K8s 1.22 起是 **safe sysctl**，
+  cap 没有 effective 语义（Kubernetes 无 ambient capabilities），`NET_BIND_SERVICE`
+  **不够**，内核默认 1024 下 bind `:53` = EACCES。实测来自 **Docker 引擎**
+  （`tmp/a6fix1-cap-probe.log`：uid 65534 + cap ⇒ `CapEff=0`；同一 uid 声明 sysctl=0 ⇒ OK；
+  root + cap ⇒ OK），k8s 侧的依据是**该 sysctl 自 1.22 起属 safe sysctl**（可声明、
+  无需 kubelet 放行）；cap 只对 root override（`runAsUser: 0`）有意义。该 sysctl
   **不需要** kubelet `--allowed-unsafe-sysctls`（`hostNetwork: true` 下 `net.*` 会被拒）；
 - 无 docker socket：不挂 `/var/run/docker.sock`，rootfs 提取走第 4.2 节
   的 registry 直拉。

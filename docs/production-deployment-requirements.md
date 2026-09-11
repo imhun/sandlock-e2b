@@ -168,6 +168,14 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
   `<registry>/<ns>/e2b-sandlock-quota-agent:<VERSION>`。该镜像与 worker 走同一个发布流程：
   `deploy/scripts/build-images.sh`（`build-and-push.sh` 调用）多平台构建并推送它。手动形态：
   自己设 `E2B_QUOTA_AGENT_URL/TOKEN` + `docker compose --profile quota up -d`。
+  关闭用 `--without-quota-agent`：写回 `QUOTA_AGENT_PROFILE=0`、清掉栈内
+  `E2B_QUOTA_AGENT_URL`（worker 转本地直连 ⇒ 非 root 降级 + WARNING），并在目标机
+  **显式** `docker compose --profile quota rm -sf quota-agent` —— compose **不会**因为服务
+  离开 active profile 就停掉容器（实测 compose 5.1.2：不带 profile 的
+  `up -d --remove-orphans` 仍让 agent 运行），所以这里不依赖 `--remove-orphans`；外置 agent
+  的 URL 会保留（配额仍由它提供，特权在它那边）。注意 `--keep-image-tags` 与
+  `--with-quota-agent` **不能**合用：前者跳过 tag 固定 ⇒ `QUOTA_AGENT_IMAGE` 为空 ⇒ 目标机
+  回落到拉不到的 `e2b-sandlock-quota-agent:latest`，脚本会 fail fast 并点名该组合。
   NFS 服务器形态见 `deploy/compose/docker-compose.quota-agent.yml` +
   `E2B_QUOTA_AGENT_PATH_MAP`（外置 agent 时不要开 `QUOTA_AGENT_PROFILE`）。
   `deploy/k8s/worker.yaml` 已不再声明 `SYS_ADMIN`（把 `E2B_QUOTA_AGENT_URL` 指向集群内或

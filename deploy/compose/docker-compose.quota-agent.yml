@@ -16,8 +16,9 @@
 #     E2B_QUOTA_AGENT_PATH_MAP=/mnt/sandboxes=/var/lib/e2b-sandboxes
 #   When both sides use the same path layout (common same-path export),
 #   leave it empty.
-# - Workers enable the agent path:
-#     E2B_QUOTA_VIA_AGENT=true
+# - Workers enable the agent path by setting the URL (A6: a non-blank
+#   E2B_QUOTA_AGENT_URL *is* the switch; E2B_QUOTA_VIA_AGENT is only a
+#   fallback flag for when no URL is set):
 #     E2B_QUOTA_AGENT_URL=http://quota-agent:49984
 #     E2B_QUOTA_AGENT_TOKEN=<same token as below>
 # - The agent port must never be exposed publicly; bind it to the internal
