@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import stat
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -108,6 +110,66 @@ async def _startup_uid_reconcile(pool: UidPool) -> None:
     )
 
 
+def _shared_volume_traversal_gaps(root: Path, uid: int) -> list[tuple[Path, int]]:
+    """Directories between ``/`` and ``root`` that ``uid`` cannot traverse.
+
+    Mode bits, not ``os.access``: the worker (and the gate) runs as root, and
+    root walks a 0700 directory finer than the sandbox uid ever could, so an
+    access(2) probe would report the tenant's view as fine.
+    """
+    gaps: list[tuple[Path, int]] = []
+    for candidate in [root, *root.resolve().parents]:
+        if candidate == Path("/"):
+            break
+        try:
+            st = candidate.stat()
+        except OSError:
+            # A path that does not exist yet cannot block the sandbox either;
+            # it is created (with traversal) when the volume is provisioned.
+            continue
+        mode = stat.S_IMODE(st.st_mode)
+        executable = mode & 0o100 if st.st_uid == uid else mode & 0o001
+        if not executable:
+            gaps.append((candidate, mode))
+    return gaps
+
+
+def _disclose_shared_volume_traversal(
+    settings: Settings, runtime_registry: RuntimeRegistry
+) -> None:
+    """Startup self-check (A5): can the first pool uid walk to the volume root?
+
+    The mediator opens the volume host path as the mounting sandbox's own uid,
+    so every level from ``/`` down to the volume view needs o+x. Without it the
+    volume is unreachable by *any* path -- absolute ones included -- and the
+    failure surfaces as an unexplained EACCES inside the sandbox. Say so once,
+    naming the offending directory, its actual mode, and the fix.
+    """
+    if not settings.per_sandbox_uid or not settings.shared_volume_root:
+        return
+    pool = runtime_registry.uid_pool
+    if pool is None:
+        # Non-root worker: no uid pool, sandboxes keep the worker's own
+        # identity, so the traversal requirement does not apply (E5.1).
+        return
+    root = Path(settings.shared_volume_root)
+    gaps = _shared_volume_traversal_gaps(root, pool.start)
+    if not gaps:
+        return
+    logger.warning(
+        "shared volume root %s is not traversable for tenant uids (first pool "
+        "uid %s): %s. The mediator opens volume host paths as the sandbox's "
+        "own uid, so every level from / down to the volume view needs o+x; "
+        "without it volume mounts fail with EACCES even on an absolute path. "
+        "Fix: chmod 0711 (or 0755 where listing is acceptable) on each of "
+        "those directories -- %s and its ancestors.",
+        root,
+        pool.start,
+        "; ".join(f"{path} is mode {mode:04o}" for path, mode in gaps),
+        root,
+    )
+
+
 def _disclose_nonroot_direct_quota(settings: Settings) -> None:
     """Startup disclosure (E5.1 review): a non-root worker without effective
     CAP_SYS_ADMIN cannot run ``xfs_quota -x`` directly (every call fails
@@ -202,6 +264,9 @@ def create_app(
             from envd_service.netns import ensure_worker_netns_plumbing
 
             ensure_worker_netns_plumbing()
+        # A5: volumes are opened by the mediator as the sandbox's own uid, so
+        # an untraversable ancestor chain silently breaks every volume mount.
+        _disclose_shared_volume_traversal(settings, runtime_registry)
         app.state.quota_monitor = quota_monitor
         quota_monitor.start()
         reconcile_task: asyncio.Task | None = None

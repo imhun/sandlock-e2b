@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,45 @@ def _volume_fs_mount(path: Path, fallback: str | Path) -> Path:
     return Path(mount) if mount else Path(fallback)
 
 
+def _ensure_traversable(path: Path) -> None:
+    """Give tenant uids a way *through* every ancestor of a volume view.
+
+    The mediator opens the volume host path as the sandbox's own uid (route-B
+    slot / RunAs), so DAC needs o+x on each ancestor. Traverse-only (0111)
+    where the tenant must not list, otherwise keep what is there.
+
+    Best-effort: a path that cannot be canonicalized (a symlink loop, an
+    unreadable component) falls back to its literal parent chain and only
+    warns -- provisioning must not fail over a permission *widening* step.
+    """
+    try:
+        chain = [path, *path.resolve().parents]
+    except OSError as exc:
+        logger.warning(
+            "cannot resolve %s to widen its ancestors for tenant uids: %s",
+            path,
+            exc,
+        )
+        chain = [path, *path.parents]
+    for candidate in chain:
+        if candidate == Path("/"):
+            break
+        try:
+            mode = stat.S_IMODE(candidate.stat().st_mode)
+        except OSError:
+            continue
+        wanted = mode | 0o011
+        if wanted != mode:
+            try:
+                os.chmod(candidate, wanted)
+            except OSError as exc:
+                logger.warning(
+                    "cannot make %s traversable for tenant uids: %s",
+                    candidate,
+                    exc,
+                )
+
+
 def _ensure_shared_volume_root(volume_root: Path, host_uid: int) -> None:
     """Apply the E3.2 shared-volume permission model to the volume root.
 
@@ -82,6 +122,11 @@ def _ensure_shared_volume_root(volume_root: Path, host_uid: int) -> None:
     non-root identity — that owner is never stolen. Best-effort: a volume on
     a filesystem that refuses the change degrades to whatever the platform
     allows, with a warning.
+
+    The root is reachable only if every directory above it is too: the
+    mediator opens this path as the mounting sandbox's uid, so a 0700 ancestor
+    turns an absolute volume path into EACCES (A5). ``_ensure_traversable``
+    widens that chain to o+x, leaving the per-sandbox slices at 0700.
     """
     try:
         st = volume_root.stat()
@@ -90,6 +135,7 @@ def _ensure_shared_volume_root(volume_root: Path, host_uid: int) -> None:
             "cannot stat volume root %s for shared perms: %s", volume_root, exc
         )
         return
+    _ensure_traversable(volume_root)
     try:
         if st.st_uid == 0:
             os.chown(volume_root, host_uid, host_uid)

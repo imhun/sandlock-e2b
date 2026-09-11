@@ -108,6 +108,47 @@ workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，�
 顺序反了就会出现「镜像 rootfs 沙箱全部建不出来」；uid 段也要在同一次变更里拆开。
 升级顺序、待授权事项与取证脚本见 `docs/HANDOFF.md`「特权最小集实测 + 线上就绪审计」。
 
+### 2.4.2 共享卷路径的可穿越性（证据来自 A0/A3 探针实测，A5 沿用）
+
+沙箱的路径中介以**沙箱自己的 host uid** 打开卷的宿主路径（route-B 槽位 / RunAs），
+所以从 `/` 到卷视图的**每一级目录**都必须对该 uid 有 **o+x（可穿过）**；卷根自己的
+`1777` 不够。**祖先不可穿过 ⇒ 卷视图整体不可用（绝对与相对同命）**：中介把
+`/workspace/<rel>` 解析回宿主卷路径后逐级打开，缺哪级就死在哪级，沙箱里只看到一句
+没有上下文的 `Permission denied`。
+
+下表来自探针 `tmp/vol_fs_mount_probe.py` 的场景 `symlink-tight-ancestor`
+（**A0/A3 轮次实测，日志 `tmp/a0-probe.log`**；A5 本轮沿用该结论，**未重跑**宿主探针，
+现场复现归 Track Z 的本地部署测试）：
+
+| 宿主卷路径祖先链 | 绝对路径 `cat /workspace/mnt/data/x` | 相对 `cat mnt/data/x` |
+|---|---|---|
+| 逐级 `0711`/`0755` | ✅ exit 0 | ✅ exit 0 |
+| 某一级 `0700` | ❌ EACCES | ❌ EACCES |
+
+（探针原始字段：`perms="0700"`、`abs-read=1`、`rel-read=1`；控制组 `perms="0755"` 时
+`abs-read=0`、`rel-read=0`。绝对路径同命的原因是两条路径最终都由中介以同一个 uid
+打开同一个宿主对象，DAC 判定完全相同。）
+
+要求与实现：
+
+- **卷根** `1777`（sticky，跨 uid 共享）+ 属主 = 第一个挂载该卷的沙箱 host uid；
+  **每沙箱切片** `0700` + 属主 = 该沙箱 host uid（语义不变，穿透补位**不**下放到切片）；
+  **卷根及其全部祖先**补到 `0711` —— 原本就是 `0755`/`1777` 的更宽目录保持原样，
+  只补缺的 x 位。
+- E2B 行为：`provision_sandbox_volume_mount(..., host_uid=...)` 在应用卷根权限时调用
+  `_ensure_traversable()` 沿 `resolve()` 祖先链补 o+x（`resolve()` 抛 `OSError`
+  ——符号链接环等——时退回字面父链并只打一条 WARNING；`envd_service/volumes.py`）；
+  worker 启动时用 uid 池的第一个 uid 做一次可穿透性自检，失败打一条 WARNING
+  （点名目录、实际 mode、修法）。
+- **部署要求**：`E2B_SHARED_VOLUME_ROOT` 的每一级祖先（例如 `/var/lib/e2b-volumes`、
+  `/var/lib`）都要 `0711`/`0755`；只把卷根设成 `1777`，在缺祖先 x 位时整卷不可达。
+
+> 历史成因：删掉 `mount --bind` 材料化之前，bind 把卷内容物理复制进 workspace
+> 子路径，缺 o+x 的祖先链被绕过，症状因此被 backlog #25 **记成**「只有相对路径
+> EACCES」——探针（上表）表明缺祖先 x 位时绝对路径同样不可用。A4 删 bind（虚拟路径
+> 由请求决定）、A5 补穿透位之后，无 `CAP_SYS_ADMIN` 的共享卷形态才在「绝对 + 相对」
+> 两个方向上都完整。
+
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
 - **`deploy/scripts/test-prod-shaped.sh`（生产形，默认推荐）**：容器不带 `--privileged`，
