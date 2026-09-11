@@ -1273,6 +1273,70 @@ docker compose -f deploy/stack/docker-compose.prod.yml down 2>&1 | tee -a tmp/z1
 ## 确认状态
 
 已拍板（2026-09-10，见文首「已确认的决定」）：#1 规范别名 `/home/user`；#2 逻辑路径
+
+---
+
+## Track F — F1：非 root worker 下让 route B 可用（2026-09-11 用户拍板路线 3）
+
+> 决策：**worker 长期目标是非 root（uid 65534）**，但 route-B 必须仍然可用（它需要
+> "以任意池内 uid 起槽位"）。探针结论（`.superpowers/sdd/task-f1probe-report.md`、
+> `tmp/f1probe-*.log`）：
+> - **file capabilities 路线可行且已实测**：非 root 容器里带 `setcap` 的 helper 真拿到 cap；
+>   同一进程自己 `setgroups([])→setgid→setuid→exec` 成功切到 10001；`chown` 到别的 uid 成功；
+>   它 exec 无 caps 的二进制后 `CapEff` 自动归零（槽位仍是零 cap）。
+> - **userns 路线不可行**：零 cap 只能自映射（=现状，无 per-sandbox uid）；映射到别的 host uid
+>   需要父 userns 的 `CAP_SETUID` 或 `newuidmap`+subuid（镜像里没有 `uidmap`），探针里只有给
+>   `CAP_SYS_ADMIN` 才跑通，且会被 fork 的 `--uid` 自检拒（`crates/sandlock-supervise/src/main.rs:153-161`）。
+> - 形态选择：**2 个专用 broker + 一份共享校验模块**（用户 2026-09-11 拍板），不用 4 个 stock 副本。
+
+### Task F1：两个 file-cap broker + envd 接线（2 天，分两阶段提交）
+
+**Files（E2B 主仓库；fork 只读、不改）:**
+- Create: `deploy/priv/priv_common.h`、`deploy/priv/priv_common.c`（共享校验：uid 池范围、
+  根路径白名单 + `realpath` 逃逸防护、argv 形状）
+- Create: `deploy/priv/slot_spawn.c`（`cap_setuid,cap_setgid+ep`）
+- Create: `deploy/priv/maint.c`（`cap_chown,cap_dac_override+ep`）
+- Modify: `deploy/docker/Dockerfile.envd`（多阶段：编译 → **最终阶段** `setcap`）
+- Modify: `envd_service/route_b.py`（spawner 指向 `e2b-slot-spawn`）
+- Modify: `envd_service/volumes.py`、`envd_service/app.py`、`envd_service/agent.py`（chown / walk / rmtree 改走 `e2b-maint`）
+- Modify: `envd_service/config.py`（`E2B_PRIV_HELPERS=auto|off` + 自检）
+- Modify: `deploy/stack/docker-compose.prod.yml`、`deploy/k8s/worker.yaml`（BND 补四条）
+- Modify: `deploy/scripts/test-prod-shaped.sh`（unprivileged phase 的 cap 集）
+- Create: `tests/unit/test_priv_helpers.py`（校验规则）、`tests/contract/test_nonroot_route_b.py`（端到端）
+- Modify: `docs/production-deployment-requirements.md` §2.4/§2.4.1、`README.md`
+
+**硬约束（都来自实测，违反即失败）**
+1. helper 必须是**编译型二进制**（file caps 对 `#!` 脚本不生效）。
+2. **`setcap` 必须在最终镜像阶段执行**——`COPY --from` 不保留 xattr，在构建阶段打过的 caps 会丢；
+   构建期需要 `SETFCAP`（`libcap2-bin`），运行期不需要。
+3. 运行期 **BND 必须含** `SETUID/SETGID/CHOWN/DAC_OVERRIDE`（`capabilities.add` 对非 root 不产生
+   `CapEff`，只撑 BND）；**绝不设 no-new-privs**（实测 NNP=1 ⇒ file caps 全废）。
+4. helper 落点必须**沙箱不可达**：放 `/var/lib/e2b-priv/`（root 所有、mode 0700），
+   **不要**放 `/usr/local` 或 `/opt`（纯形态 Landlock 覆盖这两个前缀）。
+5. `spawn` 的 `argv[0]` 必须**钉死**为 `sandlock-supervise` 的绝对路径，且 uid ∈ 池；
+   `maint` 的 path 必须落在 `<workspace_base>/` 或 `<shared_volume_root>/` 之下（`realpath` 后判定）。
+6. 槽位仍须是零 cap（exec 时自动丢）——不得为了省事把 caps 留在槽位上。
+
+- [ ] **Step 1: RED（先写校验用例）**：`uid 不在池内`、`路径越出根`、`..`/符号链接逃逸、
+  `argv[0]` 非 supervise 绝对路径、缺 helper、helper 无 cap —— 每条都要有精确断言且先跑成红。
+- [ ] **Step 2: 阶段一提交**（broker + 镜像构建 + 校验单测）：镜像里 `getcap` 能看到两个二进制的 cap；
+  非 root 容器内 `e2b-slot-spawn spawn --uid 10001 -- /…/sandlock-supervise …` 能起来且槽位 `CapEff=0`；
+  `e2b-maint chown/rm/walk` 在白名单内可用、越界被拒。
+- [ ] **Step 3: 阶段二（envd 接线 + 端到端）**：非 root worker 形态下建 chroot 沙箱 ⇒
+  ① worker 日志出现 `route-B instance ready … host-uid=<池内 uid>`（F4 修好后该行可见）；
+  ② 槽位进程 `sandlock-supervise --uid <该沙箱 uid>`；③ 两个沙箱的 workspace 属主是**两个不同** uid；
+  ④ 跨 uid 写/删被拒（1777+sticky 真语义）；⑤ `pwd == /home/user`。
+- [ ] **Step 4: 同步 `test-prod-shaped.sh` 的 unprivileged phase** 的 cap 集（否则该 lane 会证明
+  file caps 不可用，门禁自相矛盾）。
+- [ ] **Step 5: 文档**：§2.4 改成"非 root worker 是目标形态 + file caps 机制"；§2.4.1 的 cap 表补
+  BND 四条与"构建期 SETFCAP / 运行期不需要"；README 与 `.env.example` 写明 `E2B_PRIV_HELPERS`
+  与"不要加 no-new-privileges"；威胁模型写明"能 exec helper 即得该 cap（helper 在沙箱不可达路径）"。
+- [ ] **Step 6: 重跑 Track Z**（非 root 形态）：Z1 起栈 + `smoke-prod-worker.sh` + Z2 两条冒烟 +
+  SDK 手工复核，全绿；并把 F1 在 `docs/task-backlog.md` 标为已关闭。
+
+**非目标（本轮不做）**：userns 路线（登记 follow-up，三触发条件见 `task-f1probe-report.md`）；
+`E2B_EXECUTOR=local` 形态；fork 任何改动。
+
 语义；#3 quota-agent；#4 SDK 要看到网关启动失败；#5 线上暂不升级（C1–C3 挂入口条件）；
 #6 SL-1 走 **C-硬删**（降级档直接删除，不留逃生门）；#8 **不推上游**（B4 取消）；
 #9 全部完成后跑 **Track Z 本地部署测试**。
