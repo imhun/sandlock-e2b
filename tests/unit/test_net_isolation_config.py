@@ -35,6 +35,10 @@ def test_create_executor_passes_net_isolation_flags(monkeypatch) -> None:
     construction."""
     import envd_service.executors.factory as factory_mod
 
+    # Stub the environment probes this case is not about: the point here is the
+    # flag passthrough (B1 fix round 3 probes the real import, so a dev host
+    # without sandlock would otherwise fail the explicit-sandlock branch).
+    monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: None)
     monkeypatch.setattr(factory_mod, "_sandlock_available", lambda: True)
     monkeypatch.setattr(factory_mod, "_landlock_ok", lambda: True)
     settings = SimpleNamespace(

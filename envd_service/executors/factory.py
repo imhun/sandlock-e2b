@@ -39,17 +39,25 @@ def _sandlock_available() -> bool:
     return _import_sandlock() is None
 
 
-def _broken_sandlock_detail() -> str | None:
-    """Why the installed sandlock package is unusable, or None when it is fine.
+def sandlock_not_installed(failure: BaseException | None) -> bool:
+    """Whether `failure` means "the sandlock package is absent".
 
-    A *missing* package is not a broken one: it returns None so the documented
-    auto-mode fallback still applies.
+    Only a ``ModuleNotFoundError`` about the **top-level** package qualifies
+    (``.name`` is ``"sandlock"``, or ``None`` for a re-raised bare message).
+    A half-upgraded tree -- the package directory present while one of its
+    modules is gone, so ``.name`` is e.g. ``"sandlock.exceptions"`` -- is an
+    *installed but broken* package: the auto-mode fallback would run the
+    sandbox with no confinement at all, so it must fail closed like every other
+    broken install (B1 fix round 3).
     """
-    if sys.platform != "linux":
-        return None
-    failure = _import_sandlock()
-    if failure is None or isinstance(failure, ModuleNotFoundError):
-        return None
+    return isinstance(failure, ModuleNotFoundError) and failure.name in (
+        None,
+        "sandlock",
+    )
+
+
+def sandlock_failure_detail(failure: BaseException) -> str:
+    """``"<Type>: <message>"`` -- the reason half of the fail-closed errors."""
     return f"{type(failure).__name__}: {failure}"
 
 
@@ -65,6 +73,22 @@ def sandlock_unusable_error(mode: str, detail: str) -> RuntimeError:
         f"unusable ({detail}); refusing to fall back to the LOCAL executor, "
         "which applies no sandbox confinement. Reinstall the matching sandlock "
         "wheel (or rebuild libsandlock_ffi.so) and restage the worker image."
+    )
+
+
+def sandlock_missing_error(mode: str, detail: str) -> RuntimeError:
+    """The fail-closed error for a sandlock package that is not installed.
+
+    Same family as :func:`sandlock_unusable_error`, but it names the real
+    problem: an explicit `E2B_EXECUTOR=sandlock` used to surface a missing
+    package later as "requires Landlock ABI >= 6", which points the operator at
+    the wrong thing entirely (B1 fix round 3).
+    """
+    return RuntimeError(
+        f"E2B_EXECUTOR={mode} cannot run: the sandlock package is not installed "
+        f"({detail}); install the matching sandlock wheel and restage the "
+        "worker image, or set E2B_EXECUTOR=local to run without sandbox "
+        "confinement."
     )
 
 
@@ -101,17 +125,23 @@ def create_executor(
     mode = settings.executor
     image_rootfs: Path | None = None
 
-    # B1 review fix round 2 (security): "sandlock is installed but broken" must
-    # never be mistaken for "sandlock is unavailable" -- the fallback below is
-    # LocalExecutor, which applies NO sandbox confinement. Only a *missing*
-    # package (ModuleNotFoundError) may fall back in auto mode; an unusable one
-    # fails the sandbox creation with the reason, for `auto` and `sandlock`
-    # alike. `local` is the operator's explicit choice and is left untouched
-    # (everything below is skipped, exactly as before B1).
+    # B1 review fix rounds 2-3 (security): "sandlock is installed but broken"
+    # must never be mistaken for "sandlock is unavailable" -- the fallback below
+    # is LocalExecutor, which applies NO sandbox confinement. Only a genuinely
+    # *absent top-level package* may fall back (and only in auto mode); an
+    # unusable package -- including a half-upgraded tree whose `sandlock.*`
+    # submodule is missing -- fails the sandbox creation with the reason, for
+    # `auto` and `sandlock` alike. `local` is the operator's explicit choice and
+    # is left untouched (everything below is skipped, exactly as before B1).
     if mode != "local":
-        broken = _broken_sandlock_detail()
-        if broken is not None:
-            raise sandlock_unusable_error(mode, broken)
+        failure = _import_sandlock()
+        if failure is not None:
+            detail = sandlock_failure_detail(failure)
+            if not sandlock_not_installed(failure):
+                raise sandlock_unusable_error(mode, detail)
+            if mode == "sandlock":
+                raise sandlock_missing_error(mode, detail)
+            # auto + genuinely absent: the documented fallback below.
 
     if mode == "sandlock" or (mode == "auto" and _sandlock_available()):
         if not _landlock_ok():

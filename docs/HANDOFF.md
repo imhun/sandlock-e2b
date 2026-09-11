@@ -316,7 +316,8 @@ cbindgen 头 / CLI `--mediation-run-as` / Python 取值校验 / `stats()` 的
    要改（`route_b`/executor 的 disclosure 与 E2B 用例已同步）。
 2. **ABI 破坏**：导出符号 164→163，`.so`/wheel 必须同批更新（`wheels/fork/` 已换成
    B3 构建，`SHA256SUMS.supervise` 与 supervise 二进制三方指纹一致，
-   HEAD `27c7b5d`）。
+   HEAD `4b4012b`——即 `wheels/fork/SHA256SUMS.supervise` 里写的
+   `# HEAD=4b4012bc85a8ec…`，与 fork 侧 `wheels/SHA256SUMS.supervise` 一致）。
 3. **`route_b.supervise_policy_document()` 的 drop-guard 删除**：该键已不在
    `SUPERVISE_POLICY_FIELDS`（与 fork `policy.rs::POLICY_FIELDS` 逐名相等，53→52），
    所以 ceiling 若还带它会被**按名拒绝**（fail-closed），而不是被静默丢掉。
@@ -354,6 +355,11 @@ cbindgen 头 / CLI `--mediation-run-as` / Python 取值校验 / `stats()` 的
   被吞成「sandlock 不可用」而静默去掉约束）；**fix round 2**：`auto` 与 `sandlock` 遇上
   「装了但坏」一律 fail closed（抛带原因的 `RuntimeError`，建箱失败），只有「包不存在」
   才允许 `auto` 回落 LocalExecutor，`local` 是使用者的显式选择、照旧不探测不报错。
+  **fix round 3**：「包不存在」收窄为**顶层包**不存在（`ModuleNotFoundError.name in
+  (None, "sandlock")`）——「包目录在、`sandlock.exceptions` 之类子模块缺失」这种半升级
+  树按「装了但坏」fail closed；三处探测（factory / worker agent / 控制面）同判据，
+  且 `E2B_EXECUTOR=sandlock` + 包缺失现在点名"包不存在"（原先错报成
+  "requires Landlock ABI >= 6"）。
   上面那条 disclosure 保留作第二道说明。
 - **容器实测（首次有测试在真槽位上跑完整 chroot + `fs_denied` 链）**：
   `tests/security/test_template_isolation.py` 三条 chroot 用例全部重写为走生产路径

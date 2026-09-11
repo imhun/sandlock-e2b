@@ -49,9 +49,17 @@ def _expected_unusable(detail: str) -> str:
     )
 
 
-def test_absent_package_is_false(probe, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ModuleNotFoundError("No module named 'sandlock'"),
+        ModuleNotFoundError("No module named 'sandlock'", name="sandlock"),
+    ],
+    ids=["bare-name-none", "name-sandlock"],
+)
+def test_absent_package_is_false(probe, monkeypatch, failure) -> None:
     """Not installed is the documented auto-mode fallback (no images needed)."""
-    _fail_sandlock_import(monkeypatch, ModuleNotFoundError("No module named 'sandlock'"))
+    _fail_sandlock_import(monkeypatch, failure)
     assert probe("auto") is False
 
 
@@ -87,10 +95,30 @@ def test_missing_reason_export_runtime_error_also_fails_closed(
         probe("auto")
 
     assert type(info.value) is RuntimeError
-    message = str(info.value)
-    assert message.startswith("E2B_EXECUTOR=auto cannot run: ")
-    assert "sandlock_create_with_err is missing from the loaded sandlock library" in message
-    assert "applies no sandbox confinement" in message
+    # Whole-string equality like the other cases: the wrapper format is pinned
+    # exactly, and the SDK's own text rides through verbatim.
+    assert str(info.value) == _expected_unusable(f"RuntimeError: {sdk_error}")
+
+
+def test_half_upgraded_tree_is_broken_not_missing(probe, monkeypatch) -> None:
+    """A missing ``sandlock.*`` submodule must not read as "no images needed".
+
+    The factory fails closed on that shape (B1 fix round 3), so answering False
+    here would hide the reason behind a missing rootfs -- and in auto mode it
+    would have been a path to an unconfined sandbox.
+    """
+    half_upgraded = ModuleNotFoundError(
+        "No module named 'sandlock.exceptions'", name="sandlock.exceptions"
+    )
+    _fail_sandlock_import(monkeypatch, half_upgraded)
+
+    with pytest.raises(RuntimeError) as info:
+        probe("auto")
+
+    assert type(info.value) is RuntimeError
+    assert str(info.value) == _expected_unusable(
+        "ModuleNotFoundError: No module named 'sandlock.exceptions'"
+    )
 
 
 def test_abi_probe_failure_also_raises(probe, monkeypatch) -> None:

@@ -18,7 +18,11 @@ from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from envd_service.config import Settings
-from envd_service.executors.factory import sandlock_unusable_error
+from envd_service.executors.factory import (
+    sandlock_failure_detail,
+    sandlock_not_installed,
+    sandlock_unusable_error,
+)
 from envd_service.runtime.image_resolver import (
     peek_image_warm,
     resolve_image_rootfs,
@@ -689,12 +693,17 @@ def _executor_needs_images(mode: str) -> bool:
         import sandlock  # noqa: F401
 
         return sandlock.landlock_abi_version() >= 6
-    except ModuleNotFoundError:
-        return False
-    except Exception as exc:  # noqa: BLE001 - classified right here
+    except ModuleNotFoundError as exc:
+        # Only a missing *top-level* package is the fallback case: a
+        # half-upgraded tree ("No module named 'sandlock.exceptions'") is
+        # installed-but-broken and must fail closed (B1 fix round 3).
+        if sandlock_not_installed(exc):
+            return False
         raise sandlock_unusable_error(
-            "auto", f"{type(exc).__name__}: {exc}"
+            "auto", sandlock_failure_detail(exc)
         ) from exc
+    except Exception as exc:  # noqa: BLE001 - classified right here
+        raise sandlock_unusable_error("auto", sandlock_failure_detail(exc)) from exc
 
 
 @router.post("/agent/sandboxes/{sandbox_id}/network", status_code=204)

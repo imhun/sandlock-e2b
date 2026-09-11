@@ -66,6 +66,16 @@ def _expected_unusable(mode: str, detail: str) -> str:
     )
 
 
+def _expected_missing(mode: str, detail: str) -> str:
+    """The exact not-installed text, written out rather than imported."""
+    return (
+        f"E2B_EXECUTOR={mode} cannot run: the sandlock package is not installed "
+        f"({detail}); install the matching sandlock wheel and restage the "
+        "worker image, or set E2B_EXECUTOR=local to run without sandbox "
+        "confinement."
+    )
+
+
 @pytest.mark.parametrize("mode", ["sandlock", "auto"])
 def test_broken_package_refuses_for_every_sandlock_capable_mode(
     monkeypatch, mode
@@ -93,9 +103,42 @@ def test_broken_package_refuses_for_every_sandlock_capable_mode(
     )
 
 
-def test_missing_package_keeps_the_quiet_fallback(monkeypatch, caplog) -> None:
+@pytest.mark.parametrize("mode", ["auto", "sandlock"])
+def test_half_upgraded_tree_is_broken_not_missing(monkeypatch, mode) -> None:
+    """A missing ``sandlock.*`` submodule is an unusable package, not "absent".
+
+    "The package directory is there but one of its modules is gone" is exactly
+    what a partial upgrade / half-synced image looks like. Reading it as
+    "sandlock is not installed" would let auto run the sandbox with NO
+    confinement (B1 fix round 3, the reviewer's Important).
+    """
+    half_upgraded = ModuleNotFoundError(
+        "No module named 'sandlock.exceptions'", name="sandlock.exceptions"
+    )
+    # The dev host is macOS; the probe is Linux-only, so pin it here.
+    monkeypatch.setattr(factory_mod.sys, "platform", "linux")
+    monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: half_upgraded)
+
+    with pytest.raises(RuntimeError) as info:
+        _create(_settings(mode))
+
+    assert type(info.value) is RuntimeError
+    assert str(info.value) == _expected_unusable(
+        mode,
+        "ModuleNotFoundError: No module named 'sandlock.exceptions'",
+    )
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        ModuleNotFoundError("No module named 'sandlock'"),
+        ModuleNotFoundError("No module named 'sandlock'", name="sandlock"),
+    ],
+    ids=["bare-name-none", "name-sandlock"],
+)
+def test_missing_package_keeps_the_quiet_fallback(monkeypatch, caplog, missing) -> None:
     """A package that is simply absent is the documented auto-mode fallback."""
-    missing = ModuleNotFoundError("No module named 'sandlock'")
     # The dev host is macOS; the probe is Linux-only, so pin it here.
     monkeypatch.setattr(factory_mod.sys, "platform", "linux")
     monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: missing)
@@ -106,6 +149,28 @@ def test_missing_package_keeps_the_quiet_fallback(monkeypatch, caplog) -> None:
 
     assert isinstance(executor, LocalExecutor)
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_explicit_sandlock_mode_names_a_missing_package(monkeypatch) -> None:
+    """Missing package + explicit sandlock: say *that*, not "needs Landlock".
+
+    Before B1 fix round 3 the absent package surfaced later as
+    "requires Landlock ABI >= 6", which points the operator at the wrong
+    cause entirely.
+    """
+    missing = ModuleNotFoundError("No module named 'sandlock'", name="sandlock")
+    # The dev host is macOS; the probe is Linux-only, so pin it here.
+    monkeypatch.setattr(factory_mod.sys, "platform", "linux")
+    monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: missing)
+
+    with pytest.raises(RuntimeError) as info:
+        _create(_settings("sandlock"))
+
+    assert type(info.value) is RuntimeError
+    assert str(info.value) == _expected_missing(
+        "sandlock", "ModuleNotFoundError: No module named 'sandlock'"
+    )
+    assert "Landlock" not in str(info.value)
 
 
 def test_explicit_local_mode_never_probes_the_package(monkeypatch, caplog) -> None:
