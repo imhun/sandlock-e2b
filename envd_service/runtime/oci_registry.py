@@ -29,6 +29,18 @@ logger = logging.getLogger(__name__)
 DOCKER_HUB_HOST = "registry-1.docker.io"
 DOCKER_HUB_LIBRARY = "library"
 
+# The built-in default for ``E2B_REGISTRY_MIRRORS``. A node that never set the
+# variable still gets a mirror *chain* instead of a single origin: Docker Hub
+# answers anonymous pulls with 429 well before a node's worth of creates, and
+# the mirrors degrade independently. This is the same value
+# ``deploy/compose/.env.example`` and the test-runner image ship, so ``docker.io``
+# resolves identically in every shape.
+#
+# An *explicitly empty* variable (``E2B_REGISTRY_MIRRORS=``) still means "pull
+# from the origin directly" -- that escape hatch is documented in
+# ``deploy/compose/.env.example``.
+DEFAULT_REGISTRY_MIRRORS = "registry-1.docker.io=docker.m.daocloud.io|docker.1ms.run"
+
 _MANIFEST_ACCEPT = ", ".join(
     [
         "application/vnd.docker.distribution.manifest.list.v2+json",
@@ -96,8 +108,13 @@ def registry_mirrors() -> dict[str, list[str]]:
     ``429 TOOMANYREQUESTS`` well before a node's worth of creates), so the
     lookup can be pointed at mirrors instead of at the origin. Alternatives are
     tried in order and the origin host is always appended as the last endpoint.
+
+    Unset means "use :data:`DEFAULT_REGISTRY_MIRRORS`" (the multi-source chain
+    above); set-but-empty means "no mirrors, pull the origin directly".
     """
-    raw = os.environ.get("E2B_REGISTRY_MIRRORS", "")
+    raw = os.environ.get("E2B_REGISTRY_MIRRORS")
+    if raw is None:
+        raw = DEFAULT_REGISTRY_MIRRORS
     mapping: dict[str, list[str]] = {}
     for pair in raw.split(","):
         if "=" not in pair:

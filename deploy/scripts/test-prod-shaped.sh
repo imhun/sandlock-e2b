@@ -102,6 +102,19 @@ XFS_DESELECTS="--ignore=tests/contract/test_volume_quota.py
 # pass here while the sandbox-side network enforcement stays under test.
 EXTRA_CAPS="--cap-add NET_ADMIN"
 
+# The image bakes in the multi-source default for E2B_REGISTRY_MIRRORS, but a
+# run may want a *different* source -- typically the local registry:2 on
+# 127.0.0.1:5080 with the images preloaded, which takes the public mirror chain
+# out of the picture entirely (see docs/production-deployment-requirements.md,
+# "公共镜像源"). Forward the host value only when it is set, so the baked-in
+# default (and its "explicitly empty = pull directly" form) still applies
+# otherwise. tests/conftest.py reads the same variable for buildkitd's mirror,
+# so resolver and template builds never end up on different sources.
+MIRRORS_ENV=""
+if [ -n "${E2B_REGISTRY_MIRRORS:-}" ]; then
+    MIRRORS_ENV="-e E2B_REGISTRY_MIRRORS=${E2B_REGISTRY_MIRRORS}"
+fi
+
 # shellcheck disable=SC2086
 docker run --rm --init --network host \
     $CAPS $EXTRA_CAPS --security-opt seccomp=unconfined \
@@ -110,6 +123,7 @@ docker run --rm --init --network host \
     -e E2B_TEST_STRICT_SKIPS=1 \
     -e E2B_BASE_IMAGE="${E2B_BASE_IMAGE:-python-mcp:3.14}" \
     -e E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2 \
+    $MIRRORS_ENV \
     -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
     -v "$(pwd):/workspace" -w /workspace \
     "$IMAGE" \

@@ -21,6 +21,7 @@ from control_plane.registry.nodes import NodeRegistry
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.gateway import create_gateway
+from envd_service.runtime.oci_registry import registry_mirrors
 from envd_service.runtime.registry import RuntimeRegistry
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -166,6 +167,37 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _buildkit_mirror_urls() -> list[str]:
+    """The docker.io mirrors buildkitd should be configured with.
+
+    Parsed by the resolver's own ``registry_mirrors`` so the daemon and
+    ``envd_service.runtime.oci_registry`` can never end up on different
+    sources: a mirror that refuses buildkit pulls while the resolver is fine
+    (or the reverse) is exactly the same-source flake this fixture used to
+    cause by hardcoding one mirror. No env at all -> the resolver's default
+    chain; explicitly empty -> no mirrors (pull the origin directly).
+    Mirror hosts get the resolver's own scheme rule: https://, except loopback
+    (plain HTTP, the local test registry). An explicit ``http://`` on a
+    non-loopback host is normalized away by the same rule, exactly as the
+    resolver does it -- the two must agree or the fixture reintroduces drift.
+    """
+    buckets = registry_mirrors()
+    mirrors: list[str] = []
+    for alias in ("registry-1.docker.io", "docker.io", "index.docker.io"):
+        if buckets.get(alias):
+            mirrors = list(buckets[alias])
+            break
+    urls: list[str] = []
+    for mirror in mirrors:
+        if mirror.startswith(("http://", "https://")):
+            urls.append(mirror)
+            continue
+        host = mirror.split(":")[0]
+        scheme = "http" if host in ("127.0.0.1", "localhost") else "https"
+        urls.append(f"{scheme}://{mirror}")
+    return urls
+
+
 @pytest.fixture(scope="session")
 def buildkitd():
     """Rootless buildkit daemon (TCP) for local template builds."""
@@ -188,27 +220,10 @@ def buildkitd():
     cfg = cfg_dir / "buildkitd.toml"
     mount_src = host_root / "tmp" / cfg_name / "buildkitd.toml"
 
-    # Public-image pulls go through mirrors the same way the envd resolver
-    # does (E2B_REGISTRY_MIRRORS, docker.io bucket); the daocloud default is
-    # only a fallback for environments that did not configure one. Mirror
-    # hosts without a scheme get https://, except loopback (plain HTTP).
-    docker_mirrors = []
-    for pair in os.environ.get("E2B_REGISTRY_MIRRORS", "").split(","):
-        source, _, targets = pair.partition("=")
-        if source.strip().lower() in ("docker.io", "registry-1.docker.io", "index.docker.io"):
-            docker_mirrors = [t.strip() for t in targets.split("|") if t.strip()]
-            break
-    if not docker_mirrors:
-        docker_mirrors = ["https://docker.m.daocloud.io"]
-
-    def _mirror_url(mirror: str) -> str:
-        if mirror.startswith(("http://", "https://")):
-            return mirror
-        host = mirror.split(":")[0]
-        scheme = "http" if host in ("127.0.0.1", "localhost") else "https"
-        return f"{scheme}://{mirror}"
-
-    mirror_entries = ", ".join(f'"{_mirror_url(m)}"' for m in docker_mirrors)
+    # Public-image pulls go through the same bucket the envd resolver uses
+    # (``E2B_REGISTRY_MIRRORS``); one parsing function, so a hardcoded single
+    # source cannot drift back in (see ``_buildkit_mirror_urls``).
+    mirror_entries = ", ".join(f'"{m}"' for m in _buildkit_mirror_urls())
     cfg.write_text(
         f'[grpc]\n  address = ["tcp://0.0.0.0:{port}"]\n\n'
         "[worker.oci]\n  noProcessSandbox = true\n\n"

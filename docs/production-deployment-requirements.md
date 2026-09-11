@@ -238,6 +238,67 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 - **原有特权跑法**：继续承担 XFS 配额全量与 loop 相关用例。
   两条 lane 的差集只应当是「配额/loop」这一类，任何别处的差集都是生产可用性缺陷。
 
+## 2.6 公共镜像源与 OCI 限流回落（D2 口径，2026-09-11）
+
+公共 registry 对匿名拉取限流（Docker Hub 会在一个节点的建箱量之前就回 `429
+TOOMANYREQUESTS`），而各镜像站的抖动互相独立 ⇒ 默认形态是**多源回落**，不是单源，也不是直连：
+
+- `E2B_REGISTRY_MIRRORS=host=mirrorA|mirrorB,...`：`|` 分隔的候选源按**顺序尝试**，
+  每个源的 token challenge 独立重跑；origin host（如 `registry-1.docker.io`）**始终追加为最后
+  一个端点**，全部失败才报错（`envd_service/runtime/oci_registry.py`）。
+- **未设置**该变量 ⇒ 用内置默认链
+  `registry-1.docker.io=docker.m.daocloud.io|docker.1ms.run`
+  （`DEFAULT_REGISTRY_MIRRORS`，与 `deploy/compose/.env.example`、
+  `deploy/docker/Dockerfile.test-runner` 同值）——出厂不配置也有多源，不是单源兜底。
+- **显式置空**（`E2B_REGISTRY_MIRRORS=`，如 `.env.example` 的「Leave empty to pull directly」）
+  ⇒ 有意直连 origin，不插任何源；这是保留的逃生门，语义与未设置不同。
+- **404 语义**：404 是「镜像不存在」的答案，不是端点故障 ⇒ **不重试、不换下一个源**
+  （`RegistryError.retryable` 仅对 408/429/5xx/连接错误/层 digest 不匹配为真）。推论：
+  任何被用作源的本地/私有 registry **必须镜像全集**，缺一个 tag 就是硬失败。
+- 限流兜底还有两层：`E2B_IMAGE_MANIFEST_TTL_S`（默认 60s，按镜像+凭据缓存 manifest digest）
+  与 blob 独立超时（600s），慢源不占用交互请求预算。
+- **buildkitd（模板构建）与 resolver 读同一个 `E2B_REGISTRY_MIRRORS`**：测试容器的
+  `buildkitd.toml` 由 `tests/conftest.py` 调 resolver 自己的解析函数生成，
+  `deploy/stack/buildkitd.toml` / `deploy/scripts/lib/buildkitd.toml` 内置同一多源链，
+  避免「resolver 换了源、构建还钉在单源」的同源抖动。
+
+### 2.6.1 测试侧：本地 registry 预置镜像（默认跑法）
+
+测试不依赖公共源：`registry:2` 起在 `127.0.0.1:5080`，预置**全集**镜像，再把同一个 env 指到它
+（同一做法已登记在 `docs/task-backlog.md` #20 的规避记录里，此处固化为默认跑法）：
+
+```bash
+docker run -d --rm -p 127.0.0.1:5080:5000 registry:2
+# 预置（amd64）全集：缺任何一个 tag 都会因「404 不重试」硬失败，不会回落公共源
+for t in 3.11-slim 3.12-slim 3.14-slim; do
+  docker pull --platform linux/amd64 python:$t
+  docker tag python:$t 127.0.0.1:5080/library/python:$t
+  docker push 127.0.0.1:5080/library/python:$t
+done
+docker pull --platform linux/amd64 node:22-slim   # 需要 JS/模板用例时
+docker tag node:22-slim 127.0.0.1:5080/library/node:22-slim
+docker push 127.0.0.1:5080/library/node:22-slim
+
+E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
+E2B_BASE_IMAGE=python:3.11-slim \
+  ./deploy/scripts/test-prod-shaped.sh            # OCI 形态
+```
+
+- loopback 源自动走 `http://`（resolver 与 buildkitd 同一条规则），`registry:2` 无需 TLS；
+  `tests/conftest.py` 同时给 buildkitd 写 `[registry."127.0.0.1"] http = true`。注意该规则是
+  **loopback 之外一律 https**：写 `http://mirror.internal` 会被规范化成 `https://`（resolver 与
+  buildkitd 一致，避免同源漂移），纯 HTTP 的远端镜像源需要 TLS 或走 loopback；
+- 本地源**只对测试**成立（它没有上游回源能力），所以「镜像全集」是硬要求：缺
+  `python:3.12-slim` 时 `test_create_with_template_image` 直接 503。
+- 本轮 `127.0.0.1:5080` 的实际内容（`GET /v2/_catalog` + tags）：`library/python` =
+  3.11-slim / 3.12-slim / 3.14-slim，`library/node` = 22-slim。
+
+### 2.6.2 已知退路：`<image>.digest` 侧车（本轮不做）
+
+若「多源回落 + 本地源预置」落地后**实测仍抖动**（例如候选源同时 429/超时），再加
+`<image>.digest` 侧车：解析失败时回落「上次成功的 digest」，代价是限流期间感知不到 tag 更新
+（HANDOFF「OCI 形态」一节的出路 (b)）。本轮按用户拍板（决定 ⑦：最快且测试正常）不做。
+
 ## 3. 运维要求
 
 ### 3.1 quota 管理（E2B worker 自动执行）

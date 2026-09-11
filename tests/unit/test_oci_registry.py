@@ -479,6 +479,53 @@ def test_registry_mirrors_parsing(monkeypatch):
     assert oci_registry.registry_mirrors_for("quay.io") == []
 
 
+def test_mirrors_default_to_the_multi_source_chain_when_unset(monkeypatch):
+    """Unset = the built-in chain; explicitly empty still means "pull direct"."""
+    from envd_service.runtime import oci_registry
+
+    monkeypatch.delenv("E2B_REGISTRY_MIRRORS", raising=False)
+    assert oci_registry.registry_mirrors() == {
+        "registry-1.docker.io": ["docker.m.daocloud.io", "docker.1ms.run"],
+    }
+    # The lookup normalizes the source the same way parse_image_ref does, so
+    # the default bucket is hit by a plain host name too.
+    assert oci_registry.registry_mirrors_for("https://registry-1.docker.io/") == [
+        "docker.m.daocloud.io",
+        "docker.1ms.run",
+    ]
+
+    monkeypatch.setenv("E2B_REGISTRY_MIRRORS", "")
+    assert oci_registry.registry_mirrors() == {}
+    assert oci_registry.registry_mirrors_for("registry-1.docker.io") == []
+
+
+def test_unset_env_still_prefers_the_default_mirror_chain(monkeypatch):
+    """The default path is multi-source: two mirrors, origin last."""
+    import httpx
+
+    from envd_service.runtime import oci_registry
+
+    monkeypatch.delenv("E2B_REGISTRY_MIRRORS", raising=False)
+    fake, calls = _recorder(
+        [
+            _RecordingResponse(429, b'{"errors":[{"code":"TOOMANYREQUESTS"}]}'),
+            _RecordingResponse(429, b'{"errors":[{"code":"TOOMANYREQUESTS"}]}'),
+            _RecordingResponse(body=json.dumps({"layers": []}).encode()),
+        ]
+    )
+    monkeypatch.setattr(httpx, "request", fake)
+
+    client = oci_registry.RegistryClient(
+        parse_image_ref("python:3.11-slim"), timeout=5
+    )
+    assert client.manifest()[0] == {"layers": []}
+    assert [url.split("//", 1)[1].split("/")[0] for url, _ in calls] == [
+        "docker.m.daocloud.io",
+        "docker.1ms.run",
+        "registry-1.docker.io",
+    ]
+
+
 def test_pull_prefers_the_mirror(monkeypatch):
     import httpx
 

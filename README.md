@@ -65,6 +65,16 @@ sandbox.kill()
 本地直连远程部署实例跑 SDK 测试（无需起本地服务）：见
 [docs/remote-testing.md](docs/remote-testing.md)。
 
+**公共镜像源（OCI 形态）**：默认走**多源回落**（`E2B_REGISTRY_MIRRORS`，`|` 分隔按顺序尝试、
+origin 最后兜底；未设置时用内置默认链 `registry-1.docker.io=docker.m.daocloud.io|docker.1ms.run`，
+与 `deploy/compose/.env.example` 同值；显式置空才是直连）。镜像站抖动时改用**本地源**：
+`registry:2` 起在 `127.0.0.1:5080` 并预置**全集**镜像（`library/python` 3.11/3.12/3.14-slim +
+`library/node:22-slim`），再
+`E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 E2B_BASE_IMAGE=python:3.11-slim ./deploy/scripts/test-prod-shaped.sh`。
+**本地源必须镜像全集**：404 按既有语义不重试（是「镜像不存在」的答案），缺 tag 直接失败、
+不会回落公共源。做法与退路（`<image>.digest` 侧车）见
+[docs/production-deployment-requirements.md §2.6](docs/production-deployment-requirements.md#26-公共镜像源与-oci-限流回落d2-口径2026-09-11)。
+
 Linux test runner：
 
 ```bash

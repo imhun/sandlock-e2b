@@ -1,5 +1,9 @@
-# Rootless buildkitd config: route docker.io base-image pulls through a
-# reachable mirror (Docker Hub is blocked from the target host).
+# Rootless buildkitd config: route docker.io base-image pulls through
+# reachable mirrors (Docker Hub is blocked from the target host). The mirrors
+# are the same ordered chain the resolver defaults to
+# (E2B_REGISTRY_MIRRORS in deploy/compose/.env.example): buildkit tries
+# them in order and falls back to the origin, so one bad mirror does not turn
+# into a failed template build.
 [grpc]
   # Rootless buildkitd (uid 1000) cannot create sockets under a root-owned
   # mount; the socket lives inside its own data volume, which the control
@@ -12,7 +16,7 @@
   noProcessSandbox = true
 
 [registry."docker.io"]
-  mirrors = ["https://docker.m.daocloud.io"]
+  mirrors = ["https://docker.m.daocloud.io", "https://docker.1ms.run"]
 
 [registry."docker.m.daocloud.io"]
   http = false
