@@ -15,15 +15,42 @@ from envd_service.runtime.image_resolver import resolve_image_rootfs
 logger = logging.getLogger(__name__)
 
 
-def _sandlock_available() -> bool:
-    if sys.platform != "linux":
-        return False
+def _import_sandlock() -> BaseException | None:
+    """Import the sandlock package, returning the failure instead of raising.
+
+    ``ModuleNotFoundError`` means "not installed at all" -- the documented
+    auto-mode fallback to :class:`LocalExecutor` is fine there.  **Every other
+    failure means the package is installed but broken** (a wheel built against
+    a different ``libsandlock_ffi.so``, a partially upgraded image, a missing
+    export): treating that as "sandlock is unavailable" would silently run the
+    sandbox with no confinement at all.  Callers must be loud about it.
+    """
     try:
         import sandlock  # noqa: F401
 
-        return True
-    except Exception:
+        return None
+    except Exception as exc:  # noqa: BLE001 - classified by the callers
+        return exc
+
+
+def _sandlock_available() -> bool:
+    if sys.platform != "linux":
         return False
+    return _import_sandlock() is None
+
+
+def _broken_sandlock_detail() -> str | None:
+    """Why the installed sandlock package is unusable, or None when it is fine.
+
+    A *missing* package is not a broken one: it returns None so the documented
+    auto-mode fallback still applies.
+    """
+    if sys.platform != "linux":
+        return None
+    failure = _import_sandlock()
+    if failure is None or isinstance(failure, ModuleNotFoundError):
+        return None
+    return f"{type(failure).__name__}: {failure}"
 
 
 def _landlock_ok(min_abi: int = 6) -> bool:
@@ -58,6 +85,29 @@ def create_executor(
     """Pick the executor honoring ``E2B_EXECUTOR`` (``auto``|``local``|``sandlock``)."""
     mode = settings.executor
     image_rootfs: Path | None = None
+
+    # B1 review (security): "sandlock is installed but broken" must never be
+    # mistaken for "sandlock is unavailable" -- the fallback below is
+    # LocalExecutor, which applies NO sandbox confinement. A missing package
+    # keeps the documented auto-mode fallback; a broken one is loud, and fatal
+    # when the operator asked for sandlock explicitly.
+    broken = _broken_sandlock_detail()
+    if broken is not None:
+        if mode == "sandlock":
+            raise RuntimeError(
+                "E2B_EXECUTOR=sandlock is set but the sandlock package is "
+                f"unusable ({broken}); refusing to fall back to the LOCAL "
+                "executor, which applies no sandbox confinement. Reinstall "
+                "the matching sandlock wheel (or rebuild libsandlock_ffi.so) "
+                "and restage the worker image."
+            )
+        logger.error(
+            "sandlock is installed but unusable (%s): falling back to the "
+            "LOCAL executor, which applies NO sandbox confinement. Fix the "
+            "wheel/libsandlock_ffi.so mismatch, or set E2B_EXECUTOR=sandlock "
+            "to make this fatal",
+            broken,
+        )
 
     if mode == "sandlock" or (mode == "auto" and _sandlock_available()):
         if not _landlock_ok():

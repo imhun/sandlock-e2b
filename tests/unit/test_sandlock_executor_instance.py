@@ -34,6 +34,30 @@ class _FakeInstance:
         self.closed = True
 
 
+class _FakeClosedError(RuntimeError):
+    """Stand-in for ``sandlock.InstanceClosedError``.
+
+    The real classes ship with the Linux wheel; the rebuild-once decision is a
+    *type* check against the map the executor builds from them (B1 review,
+    minor-3), so the suite substitutes its own types instead of matching text.
+    """
+
+
+class _FakeDeadError(RuntimeError):
+    """Stand-in for ``sandlock.InstanceDeadError``."""
+
+
+@pytest.fixture
+def typed_instance_gone(monkeypatch):
+    """Classify the stand-in types as session-gone for this test."""
+    monkeypatch.setattr(
+        sl,
+        "_INSTANCE_GONE_REASONS",
+        {_FakeClosedError: "closed", _FakeDeadError: "dead"},
+    )
+    return _FakeClosedError, _FakeDeadError
+
+
 def _executor(monkeypatch, sandbox_id="sbx_abc", workspace_dir="/tmp/ws"):
     monkeypatch.setattr(sl, "SandboxInstance", _FakeInstance)
     return SandlockExecutor(
@@ -140,19 +164,19 @@ def test_ensure_instance_returns_none_without_sandlock(monkeypatch) -> None:
     assert ex.instance_handle is None
 
 
-@pytest.mark.parametrize(
-    "message", ["sandlock instance is closed", "sandlock instance is dead"]
-)
+@pytest.mark.parametrize("kind", ["closed", "dead"])
 def test_ensure_instance_rebuilds_once_after_closed_or_dead_launch(
-    monkeypatch, message, caplog
+    monkeypatch, kind, caplog, typed_instance_gone
 ) -> None:
+    closed_error, dead_error = typed_instance_gone
+    error_type = closed_error if kind == "closed" else dead_error
     attempts = [0]
 
     class _ClosedOnce(_FakeInstance):
         def __init__(self, policy, name=None):
             attempts[0] += 1
             if attempts[0] == 1:
-                raise RuntimeError(message)
+                raise error_type(f"sandlock instance is {kind}")
             super().__init__(policy, name=name)
 
     ex = _executor(monkeypatch)
@@ -163,29 +187,66 @@ def test_ensure_instance_rebuilds_once_after_closed_or_dead_launch(
         inst = ex._ensure_instance()
     assert attempts[0] == 2
     assert inst.name == "sbx_abc"
-    reason = "closed" if "closed" in message else "dead"
     assert [r.message for r in caplog.records] == [
         "sandlock instance relaunching after "
-        f"{reason} sandbox_id=sbx_abc instance_name=sbx_abc",
+        f"{kind} sandbox_id=sbx_abc instance_name=sbx_abc",
         "sandlock instance created sandbox_id=sbx_abc instance_name=sbx_abc "
         "max_memory=512M max_processes=256 chroot=no",
     ]
 
 
-def test_second_closed_launch_failure_bubbles(monkeypatch) -> None:
+def test_second_closed_launch_failure_bubbles(monkeypatch, typed_instance_gone) -> None:
+    closed_error, _ = typed_instance_gone
     attempts = [0]
 
     class _AlwaysClosed(_FakeInstance):
         def __init__(self, policy, name=None):
             attempts[0] += 1
-            raise RuntimeError("sandlock instance is closed")
+            raise closed_error("sandlock instance is closed")
 
     ex = _executor(monkeypatch)
     monkeypatch.setattr(sl, "SandboxInstance", _AlwaysClosed)
-    with pytest.raises(RuntimeError, match=r"^sandlock instance is closed$"):
+    # The typed error survives the retry: a host still sees *why* the second
+    # attempt failed (nothing is re-wrapped into a bare RuntimeError).
+    with pytest.raises(closed_error, match=r"^sandlock instance is closed$"):
         ex._ensure_instance()
     assert attempts[0] == 2
     assert ex.instance_handle is None
+
+
+def test_message_text_never_decides_the_rebuild(monkeypatch, caplog) -> None:
+    """B1 minor-3 regression pin.
+
+    Since fork SL-12 a launch failure carries the core's own prose; a message
+    that merely *mentions* closed/dead (a refusal naming the mediation shape,
+    a confinement error quoting a closed fd) must not be mistaken for a
+    session-gone failure: no rebuild, and the error propagates unchanged.
+    """
+    attempts = [0]
+    prose = (
+        "sandlock_instance_launch failed: process error: child process error: "
+        "the init channel closed after the main-exit container end / dead "
+        "listener: see route B for the remedy"
+    )
+
+    class _ProseLaunchFailure(_FakeInstance):
+        def __init__(self, policy, name=None):
+            attempts[0] += 1
+            raise RuntimeError(prose)
+
+    ex = _executor(monkeypatch)
+    monkeypatch.setattr(sl, "SandboxInstance", _ProseLaunchFailure)
+    with caplog.at_level(
+        logging.WARNING, logger="envd_service.executors.sandlock"
+    ):
+        with pytest.raises(RuntimeError, match="route B for the remedy") as info:
+            ex._ensure_instance()
+    assert not isinstance(info.value, (_FakeClosedError, _FakeDeadError))
+    assert attempts[0] == 1, "a text match must not trigger a rebuild"
+    assert [r.message for r in caplog.records] == [
+        "sandlock instance launch failed sandbox_id=sbx_abc "
+        f"instance_name=sbx_abc error={prose}"
+    ]
 
 
 def test_unrelated_runtime_error_does_not_retry(monkeypatch, caplog) -> None:
@@ -402,11 +463,12 @@ async def test_start_raises_unimplemented_without_native_sandlock(
 
 
 async def test_start_rebuilds_once_after_closed_exec_and_retries(
-    monkeypatch,
+    monkeypatch, typed_instance_gone
 ) -> None:
     """I1: idle/24h expiry surfaces as a closed RuntimeError from
     ``inst.exec``; start() rebuilds the instance exactly once and retries the
     exec. The reaped child is also dropped from the staleness registry."""
+    closed_error, _ = typed_instance_gone
     attempts = [0]
     instances: list = []
 
@@ -418,7 +480,7 @@ async def test_start_rebuilds_once_after_closed_exec_and_retries(
         def exec(self, cmd, stdio=..., **kwargs):  # noqa: ANN001
             attempts[0] += 1
             if attempts[0] == 1:
-                raise RuntimeError("sandlock instance is closed")
+                raise closed_error("sandlock instance is closed")
             return super().exec(cmd, stdio=stdio, **kwargs)
 
     ex = _exec_ready_executor(monkeypatch)
@@ -442,9 +504,12 @@ async def test_start_rebuilds_once_after_closed_exec_and_retries(
     assert ex._child_registry == {}
 
 
-async def test_start_second_closed_exec_failure_propagates(monkeypatch) -> None:
+async def test_start_second_closed_exec_failure_propagates(
+    monkeypatch, typed_instance_gone
+) -> None:
     """I1: if the rebuilt instance's exec also raises closed/dead, the
     second failure propagates unchanged (no endless rebuild loop)."""
+    closed_error, _ = typed_instance_gone
     created = [0]
 
     class _AlwaysClosedExec(_ExecRecordingInstance):
@@ -453,7 +518,7 @@ async def test_start_second_closed_exec_failure_propagates(monkeypatch) -> None:
             created[0] += 1
 
         def exec(self, cmd, stdio=..., **kwargs):  # noqa: ANN001
-            raise RuntimeError("sandlock instance is closed")
+            raise closed_error("sandlock instance is closed")
 
     ex = _exec_ready_executor(monkeypatch)
     monkeypatch.setattr(sl, "SandboxInstance", _AlwaysClosedExec)
@@ -463,7 +528,7 @@ async def test_start_second_closed_exec_failure_propagates(monkeypatch) -> None:
         cwd="/tmp/ws",
         stdin_enabled=False,
     )
-    with pytest.raises(RuntimeError, match=r"^sandlock instance is closed$"):
+    with pytest.raises(closed_error, match=r"^sandlock instance is closed$"):
         await ex.start(cfg)
     assert created[0] == 2
 

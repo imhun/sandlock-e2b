@@ -43,6 +43,19 @@ from envd_service.route_b import (
 
 logger = logging.getLogger(__name__)
 
+# "The session is gone, rebuild once" is decided by **type**, never by
+# substring-matching the message: since fork SL-12 a create/launch failure
+# carries the core's own prose (a refusal's remedy, a confinement errno), so
+# any text could contain "closed"/"dead" by accident (B1 review, minor-3).
+#
+# The map is module data so tests can substitute their own stand-in types.
+_INSTANCE_GONE_REASONS: dict[type[BaseException], str] = {
+    # Route B's slot-gone error is typed and needs no native package, so it is
+    # registered regardless of whether `sandlock` imports (idle/restart of a
+    # leased slot surfaces at exec time exactly like a dead instance).
+    SlotDeadError: "dead",
+}
+
 try:  # sandlock is Linux-only; keep the import optional for macOS dev.
     import sandlock
     from sandlock import (
@@ -50,11 +63,35 @@ try:  # sandlock is Linux-only; keep the import optional for macOS dev.
         Sandbox as SandlockSandbox,
         SandboxInstance,
     )
-except Exception:  # pragma: no cover - macOS / missing package
+    from sandlock.exceptions import InstanceClosedError, InstanceDeadError
+except ModuleNotFoundError:  # not installed: the documented dev fallback
     sandlock = None  # type: ignore[assignment]
     ExecStdio = None  # type: ignore[assignment]
     SandboxInstance = None  # type: ignore[assignment]
     SandlockSandbox = None  # type: ignore[assignment]
+except Exception as exc:  # installed but broken (B1 review): never silent
+    raise RuntimeError(
+        "the sandlock package is installed but unusable "
+        f"({type(exc).__name__}: {exc}); refusing to run the sandlock executor "
+        "without it. Reinstall the matching sandlock wheel (or rebuild "
+        "libsandlock_ffi.so) and restage the worker image."
+    ) from exc
+else:
+    # Typed session-gone failures from the native SDK (SL-12 fix round 1).
+    _INSTANCE_GONE_REASONS[InstanceClosedError] = "closed"
+    _INSTANCE_GONE_REASONS[InstanceDeadError] = "dead"
+
+
+def _instance_gone_reason(exc: BaseException) -> str | None:
+    """``"closed"`` / ``"dead"`` when ``exc`` is a typed session-gone error.
+
+    ``None`` for every other failure, so the caller can log/propagate it
+    unchanged instead of guessing from the message text.
+    """
+    for exc_type, reason in _INSTANCE_GONE_REASONS.items():
+        if isinstance(exc, exc_type):
+            return reason
+    return None
 
 
 # The six single-node /dev mounts of the fork ``sandlock.minimal_dev()``
@@ -473,19 +510,20 @@ class SandlockExecutor(Executor):
         try:
             stale_child_ids = self._instance.update_network(ip_set)
         except RuntimeError as exc:
-            message = str(exc)
-            if "closed" not in message and "dead" not in message:
+            # Typed classification only: the message now carries arbitrary core
+            # text (SL-12), so it must never decide the rebuild (B1 minor-3).
+            reason = _instance_gone_reason(exc)
+            if reason is None:
                 raise
             if self._closed:
                 logger.warning(
                     "not rebuilding %s instance after executor shutdown "
                     "during network update sandbox_id=%s instance_name=%s",
-                    "closed" if "closed" in message else "dead",
+                    reason,
                     self._sandbox_id or "-",
                     self.instance_name,
                 )
                 raise
-            reason = "closed" if "closed" in message else "dead"
             if self._route_b_active:
                 # Rebuilding here would spawn a supervise process on the event
                 # loop (this method is synchronous). Refuse instead: the
@@ -920,20 +958,21 @@ class SandlockExecutor(Executor):
                         policy, name=self._instance_name
                     )
                 except RuntimeError as exc:
-                    message = str(exc)
-                    if "closed" not in message and "dead" not in message:
+                    # Typed classification only (B1 minor-3): the launch reason
+                    # is the core's own text and may contain anything.
+                    reason = _instance_gone_reason(exc)
+                    if reason is None:
                         logger.warning(
                             "sandlock instance launch failed sandbox_id=%s "
                             "instance_name=%s error=%s",
                             self._sandbox_id or "-",
                             self._instance_name,
-                            message,
+                            exc,
                         )
                         raise
                     # The prior session was closed (shutdown/idle reclaim) or died
                     # (machinery failure): rebuild exactly once, and let a second
                     # failure bubble up unchanged.
-                    reason = "closed" if "closed" in message else "dead"
                     logger.info(
                         "sandlock instance relaunching after %s sandbox_id=%s "
                         "instance_name=%s",
@@ -1646,8 +1685,11 @@ class SandlockExecutor(Executor):
         try:
             proc = await _exec_once(inst)
         except RuntimeError as exc:
-            message = str(exc)
-            if "closed" not in message and "dead" not in message:
+            # Typed classification only (B1 minor-3): a command that failed for
+            # any other reason propagates, whatever words its message happens to
+            # contain.
+            reason = _instance_gone_reason(exc)
+            if reason is None:
                 logger.warning(
                     "sandlock exec failed sandbox_id=%s instance_name=%s "
                     "argv=%s error_type=%s error=%s",
@@ -1661,7 +1703,6 @@ class SandlockExecutor(Executor):
             # Idle/24h expiry or machinery death surfaced at exec time:
             # rebuild exactly once and retry. Never after an explicit close()
             # (a concurrent shutdown must not leak a fresh instance).
-            reason = "closed" if "closed" in message else "dead"
             logger.info(
                 "sandlock instance %s during exec; rebuilding once "
                 "sandbox_id=%s instance_name=%s argv=%s",

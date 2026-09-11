@@ -601,12 +601,29 @@ def test_update_network_holds_lifecycle_lock_across_apply(monkeypatch) -> None:
     ex.close()
 
 
+class _FakeClosedError(RuntimeError):
+    """Stand-in for ``sandlock.InstanceClosedError`` (see
+    tests/unit/test_sandlock_executor_instance.py: the rebuild-once decision is
+    a type check against the map built from the real SDK classes)."""
+
+
+@pytest.fixture
+def typed_instance_gone(monkeypatch):
+    import envd_service.executors.sandlock as sl
+
+    monkeypatch.setattr(
+        sl, "_INSTANCE_GONE_REASONS", {_FakeClosedError: "closed"}
+    )
+    return _FakeClosedError
+
+
 def test_update_network_rebuilds_once_after_closed_instance(
-    monkeypatch,
+    monkeypatch, typed_instance_gone
 ) -> None:
     """I1: a closed/dead RuntimeError from ``instance.update_network`` (idle/
     24h expiry surfaced at apply time) rebuilds the instance exactly once and
     retries the apply on the fresh instance."""
+    closed_error = typed_instance_gone
     created = [0]
     raise_once = [True]
     instances: list = []
@@ -621,7 +638,7 @@ def test_update_network_rebuilds_once_after_closed_instance(
             self.update_calls.append(list(ips))
             if raise_once[0]:
                 raise_once[0] = False
-                raise RuntimeError("sandlock instance is closed")
+                raise closed_error("sandlock instance is closed")
             return list(self.stale_child_ids)
 
     ex = _executor(

@@ -325,8 +325,13 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   只返回空句柄，SDK 一律译成 `sandlock_instance_launch failed`，Rust 里那条写得很细的
   拒绝文本在 FFI 边界被丢掉（实测：容器内 root worker 建 chroot 沙箱 ⇒
   `RuntimeError("sandlock_instance_launch failed")`，stderr 无声）。于是 E2B 自建缓解 =
-  上面那条 disclosure；已登记 `docs/sandlock-upstream-issues.md` SL-12（建议 fork 用
-  supervise 侧已有的 `err_msg` out 参把 create/launch 的失败原因带出来）。
+  上面那条 disclosure。**已修（fork B1 `656bb31` + fix round 1 `f5e1edd`）**：两个入口
+  按 supervise 侧已有的 `err_msg` out 参把失败原因带出来（`sandlock_create_with_err` /
+  `sandlock_instance_launch_with_err`），Python 面抛
+  `RuntimeError("sandlock_create failed: <core 文本>")`，点名 `route B` 与 host uid；
+  评审补的两条与运维相关：新 SDK 配旧 `.so` 会**点名报错**（不再是 `AttributeError`
+  被吞成「sandlock 不可用」而静默去掉约束），`E2B_EXECUTOR=sandlock` 遇上「装了但坏」
+  直接 raise、auto 档打 ERROR 后再回落。上面那条 disclosure 保留作第二道说明。
 - **容器实测（首次有测试在真槽位上跑完整 chroot + `fs_denied` 链）**：
   `tests/security/test_template_isolation.py` 三条 chroot 用例全部重写为走生产路径
   （pooled host uid + `E2B_ROUTE_B=auto` + `await executor.start()`）：
@@ -457,8 +462,10 @@ phase 2 `47/1/0`、macOS `989/84/0`、`tests/unit` `736/10`。临时文件清理
 1. **fork 6 个提交仍未 push**（`upstream-pr/netns-free-clean`：F17 `e290059`/`f20d034`/
    `c0f7bf5`、F18 `03cd36b`/`9995e28`/`fb2e106`），PR #34 / #35 的回复也还没发
    （SL-10 闭口 + 客体内 root 的安全论证 + mknod 围栏 + ptrace 前置）。
-2. **SL-12**（create/launch 的 FFI 不带拒绝原因）只登记在
-   `docs/sandlock-upstream-issues.md`，还没作为 issue/PR 报给上游。
+2. ~~**SL-12**（create/launch 的 FFI 不带拒绝原因）只登记在
+   `docs/sandlock-upstream-issues.md`，还没作为 issue/PR 报给上游。~~
+   **已闭（2026-09-11 B1 `656bb31` + fix round 1 `f5e1edd`）**：语言面带原因 + 缺符号
+   点名拒绝（不再静默降级出约束）；尚未作为 issue/PR 报给上游。
 3. **线上升级**：按 §2 的顺序做（先新 wheel 镜像，再拆 uid 段，再升代码）。
 4. ~~**backlog #25 的设计缺口**：共享卷在没有 `SYS_ADMIN` 时的退化路径不成立。~~
    **已闭（2026-09-11 A4–A7）**：见本文件顶部「⚡ 共享卷去 SYS_ADMIN（2026-09-11）」块。
