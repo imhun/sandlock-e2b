@@ -781,15 +781,12 @@ Expected: agent 形态全绿；降级形态需 `E2B_TEST_STRICT_SKIPS=1` 显式�
 
 - [x] **Step 1: 让 capset 可配置**
 
-在 `CAPS` 拼装之后加入：
+在 `CAPS` 拼装之后加入 `PROD_DROP_CAPS`（逗号分隔）支持。
 
-```sh
-# Drop additional caps without editing the list above, e.g.
-#   PROD_DROP_CAPS=SYS_ADMIN,SYS_PTRACE ./deploy/scripts/test-prod-shaped.sh
-for drop in $(printf '%s' "${PROD_DROP_CAPS:-}" | tr ',' ' '); do
-    CAPS="$CAPS --cap-drop $drop"
-done
-```
+> **控制器更正（2026-09-11，A7 实测）**：**不能**用"事后追加 `--cap-drop`"来实现——本机引擎
+> `--cap-add` 压过 `--cap-drop`（与两者顺序无关，A7 两种顺序都实测过），于是会产出
+> "自称无 SYS_ADMIN、实际仍带着它"的**假证据**。正确做法是**在 `--cap-add` 循环里按
+> `PROD_DROP_CAPS` 跳过要摘的 cap**，`--cap-drop` 只作兜底。
 
 > **控制器更正（2026-09-11，A7 实测）**：上面这段**单独用不够** —— 本机 Docker 引擎
 > （29.4.0）里 `--cap-add` 压过 `--cap-drop`，与参数顺序无关：`--cap-drop ALL
