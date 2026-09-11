@@ -842,8 +842,25 @@ gate A 的 `+35` 全是新增用例（`git diff --numstat 569a70a HEAD -- tests/
 A4 契约用例 `test_shared_volume_relative_cwd.py::test_volume_visible_from_both_workspace_aliases`
 （pure 形态没有 `/home/user`、macOS 没有 Landlock ⇒ 这两相永远不可能通过），**不是 A4/A5 的
 产品回归**（pure 形态自己的工作区相对路径契约仍成立，探针 `tmp/fix1-alias-probe.log`）。
-按评审要求未改测试/未加 skip，转 NEEDS_CONTEXT；候选修法与逐条账见
-`docs/HANDOFF.md` §4b 与 `.superpowers/sdd/task-A7-report.md` §F1.3。
+
+**fix round 2（控制器裁定方案 ①：形状限定）**：该用例按 chroot 形态门控 —— 在
+`tests/contract/test_shared_volume_relative_cwd.py` 加 `_IMAGE_ROOTFS_ONLY =
+pytest.mark.skipif(not os.environ.get("E2B_BASE_IMAGE"), …)` 并装饰它，逐字对标同目录
+`tests/contract/test_pure_shape_workspace_ownership.py:75-80` 的 `_NO_BASE_IMAGE`（方向相反）；
+断言一字未动、无 `--ignore`。重跑：
+
+| 相 | fix round 2 | fix round 1 | 基线 `569a70a` |
+|---|---|---|---|
+| gate A（chroot） | `1104 / 4 skip / 0 failed`（`EXIT=0`，该用例真跑） | `1104 / 4 / 0` | `1069 / 4 / 0` |
+| gate B（pure） | `1102 / **6** skip / 0 failed`（`EXIT=0`） | `1102 / 5 / 1 failed` | `1068 / 5 / 0` |
+| macOS | `1023 / **81** skip / 0 failed`（`EXIT=0`） | `1023 / 80 / 1 failed` | `989 / 84 / 0` |
+
+skip 增量逐条核对：gate B `+1`、macOS `+1`，都只有这一条（`…:44 image-rootfs contract
+requires a non-empty E2B_BASE_IMAGE (chroot shape)…`）。形状无关的那半仍由
+`tests/unit/test_policy_mapping.py::test_volume_views_map_under_both_workspace_aliases`（精确
+键集合断言）与同文件内的 `test_runtime_context_registers_both_volume_aliases` 守着，macOS 上
+`2 passed`。日志 `tmp/fix2-{gate-a,gate-b,macos}.log`；逐条账见 `docs/HANDOFF.md` §4b 与
+`.superpowers/sdd/task-A7-report.md` §F2。
 
 - [x] **Step 4: 台账收口**
 

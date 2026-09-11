@@ -91,37 +91,61 @@ A4 起用这枚 wheel 重建测试镜像）。A5/A6 是纯 E2B 侧改动，**不
 `pytest.mark.skipif` 在 strict 下**仍是 skip**；上面两个契约文件恰好用第一条标记
 （"XFS quota integration requires"），所以漏列会变 error 而不是静默少跑。
 
-### 4b. 广度回归（A7 fix round 1）：gate A / gate B / macOS
+### 4b. 广度回归（A7 fix round 1–2）：gate A / gate B / macOS
 
 A4 动了 `_view_cwd`、两处 `mount_map` 顺序与 `fs_mounts` 键集之后，A4–A7 只跑过
 contract/unit 子集与生产形 lane ⇒ 评审要求补跑 gate A（chroot）/ gate B（pure）/ macOS。
 运行器 `tmp/a7-fix1-run.sh`（一相一容器、严格顺序；每份日志首行 ENV-HEADER、末行 `EXIT=`）。
 
-| 相 | 本次（HEAD 侧） | 最近全绿基线（commit `569a70a`，2026-09-10，**早于 A4**） | 日志 |
+**fix round 2（形状门控后重跑，三相连绿）**：
+
+| 相 | fix round 2（最终） | fix round 1（门控前） | 最近全绿基线（commit `569a70a`，早于 A4） | 日志 |
+|---|---|---|---|---|
+| gate A（chroot） | `1104 passed, 4 skipped, 0 failed`（`EXIT=0`） | `1104 / 4 / 0` | `1069 / 4 / 0` | `tmp/fix2-gate-a.log` |
+| gate B（pure） | `1102 passed, 6 skipped, 0 failed`（`EXIT=0`） | `1102 / 5 / 1 failed` | `1068 / 5 / 0` | `tmp/fix2-gate-b.log` |
+| macOS | `1023 passed, 81 skipped, 0 failed`（`EXIT=0`） | `1023 / 80 / 1 failed` | `989 / 84 / 0` | `tmp/fix2-macos.log` |
+
+fix round 1 的原始记录（保留，供对照）：
+
+| 相 | fix round 1 结果 | 基线 | 日志 |
 |---|---|---|---|
-| gate A（chroot） | `1104 passed, 4 skipped, 0 failed`（`EXIT=0`） | `1069 / 4 / 0`（`tmp/f31-gate-a.log`） | `tmp/fix1-gate-a.log` |
-| gate B（pure） | ⚠️ `1 failed, 1102 passed, 5 skipped`（`EXIT=1`） | `1068 / 5 / 0`（`tmp/f31-gate-b.log`） | `tmp/fix1-gate-b.log` |
-| macOS（宿主 venv，无 `--perf`） | ⚠️ `1 failed, 1023 passed, 80 skipped`（`EXIT=1`） | `989 / 84 / 0`（`tmp/f31-macos.log`） | `tmp/fix1-macos.log` |
+| gate A（chroot） | `1104 / 4 / 0` | `1069 / 4 / 0`（`tmp/f31-gate-a.log`） | `tmp/fix1-gate-a.log` |
+| gate B（pure） | ⚠️ `1102 / 5 / 1 failed` | `1068 / 5 / 0`（`tmp/f31-gate-b.log`） | `tmp/fix1-gate-b.log` |
+| macOS | ⚠️ `1023 / 80 / 1 failed` | `989 / 84 / 0`（`tmp/f31-macos.log`） | `tmp/fix1-macos.log` |
 
 - **gate A 的 `+35 passed` 全部是新增用例**：`git diff --numstat 569a70a HEAD -- tests/` 的净
   新增 = 38 个 `def test_` − 3 个删除 = 35（A4 的 `test_shared_volume_relative_cwd`、A5 的 13 条
   穿透单测、A6 的配额/清单/升级用例；A4 删掉 `test_runtime_context_volumes.py` 的 116 行）。
   既有断言的改动只有 `/workspace` → `/home/user` 与「双别名 `fs_mounts`」这一批（`cwd` 断言、
   `fs_mounts` 期望、`fs_mount` 声明顺序），没有别的语义改写。skip 与基线逐条相同。
-- **两条红是同一条用例**：`tests/contract/test_shared_volume_relative_cwd.py::test_volume_visible_from_both_workspace_aliases`
-  （A4 新增的「双别名」契约）。
-  - gate B：**pure 形态的形状口径**，不是 A4/A5 的产品回归。`tmp/a7-fix1-alias-shape-pair.log`
-    实测 pure 形态 `1 failed`（连跑两次都一样）/ chroot 形态 `2 passed`；逐步探针
-    `tmp/fix1-alias-probe.log`（`tmp/a7-fix1-alias-probe.py`）显示 pure 形态里 cwd 是**宿主**
-    workspace 路径、`/home/user` 不存在、`/workspace/<rel>` 也不是沙箱路径，而 pure 形态自己的
-    契约（工作区相对路径读写）仍然成立。原因是 `fs_mounts` 的两个别名只在 chroot 形态下是
-    沙箱内的虚拟路径（`_view_cwd` 仅在带 base image 时把 cwd 映射成 `/home/user`）。
-  - macOS：同一条用例 + macOS 没有 Landlock（`E2B_EXECUTOR=sandlock requires Landlock ABI >= 6`），
-    在该平台永远跑不了；它没进 macOS 那套 80 条能力型 skip 的口径，于是 `0 failed → 1 failed`。
-    同相的 `+34 passed` 与 gate A 同源（新增用例数），不是回归。
-  - **处置（评审：真缺陷停下报 NEEDS_CONTEXT，别改断言）**：没有改测试、没有加 skip/ignore、
-    没动产品代码。三条候选修法（限定 chroot 形态 / 让 pure 形态也暴露 `/home/user` /
-    把「双别名」文档口径按形状限定）逐条写在 `.superpowers/sdd/task-A7-report.md` §F1.3，等拍板。
+- **第一遍的两条红（fix round 1）已在 fix round 2 定性并修掉**：都是同一条用例
+  `tests/contract/test_shared_volume_relative_cwd.py::test_volume_visible_from_both_workspace_aliases`
+  （A4 新增的「双别名」契约），**形状写宽了**：那两个别名只是 chroot 形态的沙箱虚拟路径
+  （`_view_cwd` 仅在带 base image 时把 cwd 映射成 `/home/user`；pure 形态 cwd 就是宿主
+  workspace 目录、`fs_mounts` 不参与），macOS 还叠加了「没有 Landlock 起不了沙箱」。
+  证据：`tmp/a7-fix1-alias-shape-pair.log`（pure `1 failed` 连跑两次 / chroot `2 passed`）、
+  逐步探针 `tmp/fix1-alias-probe.log`。**不是** A4/A5 的产品回归。
+- **修法（控制器裁定方案 ①：形状限定，抄既有惯用法）**：在
+  `tests/contract/test_shared_volume_relative_cwd.py` 加 `_IMAGE_ROOTFS_ONLY =
+  pytest.mark.skipif(not os.environ.get("E2B_BASE_IMAGE"), reason=...)` 并装饰该用例 ——
+  逐字对标同目录 `tests/contract/test_pure_shape_workspace_ownership.py:75-80` 的
+  `_NO_BASE_IMAGE`（marker 对象 + 装饰器，`:113` 的用法），只是方向相反（要 base image）。
+  断言本身**一个字没动**（仍是 `code/stdout/stderr` 的精确比对），也没有用 `--ignore`。
+- **skip 逐条对齐**：gate B 的 skip 从基线/ fix1 的 5 条变成 **6** 条，新增的唯一一条就是
+  `tests/contract/test_shared_volume_relative_cwd.py:44: image-rootfs contract requires a
+  non-empty E2B_BASE_IMAGE (chroot shape)…`，其余 5 条（`test_volume_quota.py:274` XFS 降级、
+  `test_fork_network_features.py:281`、`test_template_isolation.py:44`、
+  `test_template_isolation.py:162`、`test_uid_pool.py:330`）与基线逐字相同；macOS 的 skip
+  从 80 变成 **81**，增量同样只有这一条（同平台能力型 skip 那批不变），passed 不变
+  （1023），failed 归零。gate A 仍是 `1104 / 4 / 0`，skip 表里没有这条用例
+  ⇒ 在 chroot 形态**真的执行**（`tmp/fix2-alias-shape-pair.log` 的 chroot 相 `2 passed`）。
+- **双别名契约的形状无关那半仍在、且在任何平台都跑**：
+  `tests/unit/test_policy_mapping.py::test_volume_views_map_under_both_workspace_aliases`
+  （精确断言 `fs_mount["/workspace/mnt/data"] == volume` 与
+  `fs_mount["/home/user/mnt/data"] == volume`，见该文件 :116-117）以及同一契约文件里的
+  `test_runtime_context_registers_both_volume_aliases`（`captured["fs_mounts"] == {两个别名}`，
+  `:124-140` 附近）。两条在 macOS 宿主 venv 上实测 `2 passed`
+  （`tmp/fix2-shape-independent-alias-assertions.log`，`EXIT=0`）。
 - **多节点 flake（非 A7 引入）**：fix round 的第一遍全量在生产形 lane 红了一条
   `tests/sdk/python/test_multinode.py::test_create_routes_to_remote_worker`
   （`instance is closed`，该遍耗时 647.98s、宿主负载 8.6→13.4；安静时同 lane 301–361s，
@@ -136,9 +160,11 @@ contract/unit 子集与生产形 lane ⇒ 评审要求补跑 gate A（chroot）/
 - **fork 的 3 个 commit 仍未 push**（连同 F17/F18 的 6 个）。
 - `tests/contract/test_volume_quota.py` 里那条**降级路径**用例在无 XFS 的 lane 进不来
   （整个文件被 deselect），仍需特权 lane 覆盖。
-- ⚠️ **A4 的「双别名」契约用例没有按形状/平台收口**（gate B 与 macOS 各红一条）：pure 形态
-  没有 `/home/user`、macOS 没有 Landlock ⇒ 该用例在这两相永远不可能通过。未改测试；
-  候选修法见 `.superpowers/sdd/task-A7-report.md` §F1.3，需决策。
+- ✅ 上一条已闭（2026-09-11 fix round 2，控制器裁定方案 ①）：A4 的「双别名」端到端用例已按
+  **chroot 形态**门控（抄 `test_pure_shape_workspace_ownership.py` 的 `_NO_BASE_IMAGE` 惯用法，
+  方向相反），gate B `1102/6/0`、macOS `1023/81/0` 转绿，gate A 仍 `1104/4/0` 且该用例真的跑。
+  形状无关的那半（`fs_mounts` 键集合）由 `tests/unit/test_policy_mapping.py` 与同文件内的
+  非沙箱单测守着，macOS 也跑。证据与逐条 skip 账见 §4b。
 
 ## ⚡ F15（2026-09-08）：控制帧按声明归属描述符（`FRAME_VERSION` 1 → 2，终态 fork `3020ea0` / wheel `3020ea0` 产物）
 

@@ -3,9 +3,20 @@
 Regression for backlog #25: a cwd-derived relative open (`cat mnt/data/x`)
 bypassed the /workspace/<rel> sub-mount, so chroot sandboxes saw EACCES (or
 ENOENT) for every relative volume path once the bind workaround was removed.
+
+Shape scope: both aliases are *chroot* virtual paths -- ``_view_cwd`` maps a
+host workspace cwd to ``/home/user`` only when a base image is in play, and the
+pure shape's cwd is the host workspace directory with ``fs_mounts`` ignored
+(``envd_service/executors/sandlock.py``). The end-to-end test below is
+therefore gated on the image-rootfs shape, the mirror image of
+``tests/contract/test_pure_shape_workspace_ownership.py``'s ``_NO_BASE_IMAGE``;
+the alias key set itself is asserted shape-independently by
+``test_runtime_context_registers_both_volume_aliases`` here and by
+``tests/unit/test_policy_mapping.py::test_volume_views_map_under_both_workspace_aliases``.
 """
 from __future__ import annotations
 
+import os
 import uuid
 
 import httpx
@@ -17,8 +28,21 @@ from tests.contract.test_uid_permissions import (
     _run_cmd,
 )
 
+# Mirrors tests/contract/test_pure_shape_workspace_ownership.py::_NO_BASE_IMAGE
+# (marker object + decorator), inverted: this contract needs the image-rootfs
+# (chroot) shape, which is what makes the two aliases sandbox-visible paths.
+_IMAGE_ROOTFS_ONLY = pytest.mark.skipif(
+    not os.environ.get("E2B_BASE_IMAGE"),
+    reason=(
+        "image-rootfs contract requires a non-empty E2B_BASE_IMAGE "
+        "(chroot shape); the pure shape runs with the host workspace cwd "
+        "and has no /home/user alias"
+    ),
+)
+
 
 @pytest.mark.asyncio
+@_IMAGE_ROOTFS_ONLY
 async def test_volume_visible_from_both_workspace_aliases(make_apps, workspace):
     control, envd = make_apps(envd_settings=_envd_settings(workspace))
     async with httpx.AsyncClient(
