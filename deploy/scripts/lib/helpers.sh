@@ -83,6 +83,56 @@ remote_env_value() {
         | tr -d '\r' | grep -vE '^[[:space:]]*$' | tail -1
 }
 
+# env_file_value <env_file> <key> — value of one KEY=value line (last one wins)
+env_file_value() {
+    sed -n "s/^$2=//p" "$1" | tail -1 | tr -d '\r' | tr -d '\n'
+}
+
+# set_env_file_value <env_file> <key> <value> — replace KEY=value in place, or
+# append the key when it is not in the file yet.
+set_env_file_value() {
+    local file="$1" key="$2" value="$3"
+    if grep -qE "^$key=" "$file"; then
+        sed "s|^$key=.*|$key=$value|" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$file"
+    fi
+}
+
+# --- quota-agent (A6) ------------------------------------------------------
+
+# quota_agent_profile_args <env_file> — "--profile quota" when the .env enables
+# the stack-local quota-agent (QUOTA_AGENT_PROFILE=1), else nothing. Fails
+# closed when the profile is on without E2B_QUOTA_AGENT_TOKEN: the agent refuses
+# to start without auth, so a silent no-token start would crash-loop.
+quota_agent_profile_args() {
+    local env_file="${1:-}"
+    if [ -z "$env_file" ] || [ ! -f "$env_file" ]; then
+        return 0
+    fi
+    if [ "$(env_file_value "$env_file" QUOTA_AGENT_PROFILE)" != "1" ]; then
+        return 0
+    fi
+    if [ -z "$(env_file_value "$env_file" E2B_QUOTA_AGENT_TOKEN)" ]; then
+        echo "QUOTA_AGENT_PROFILE=1 但 $env_file 缺 E2B_QUOTA_AGENT_TOKEN：" \
+            "quota-agent 拒绝无 auth 启动（deploy/quota_agent/__main__.py）" >&2
+        return 1
+    fi
+    printf '%s' "--profile quota"
+}
+
+# enable_quota_agent_profile <env_file> — sticky switch for the stack-local
+# agent: write QUOTA_AGENT_PROFILE=1 and, when the worker has no agent URL yet,
+# point it at the in-stack service (an operator who already points somewhere
+# else keeps that value).
+enable_quota_agent_profile() {
+    local env_file="$1"
+    set_env_file_value "$env_file" QUOTA_AGENT_PROFILE 1
+    if [ -z "$(env_file_value "$env_file" E2B_QUOTA_AGENT_URL)" ]; then
+        set_env_file_value "$env_file" E2B_QUOTA_AGENT_URL "http://quota-agent:49984"
+    fi
+}
+
 # --- E6.2 image digest pinning ---------------------------------------------
 
 # parse_image_ref <ref> — split an image reference into "repo|tag|digest".

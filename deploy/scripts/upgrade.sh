@@ -10,6 +10,7 @@
 #   * run smoke tests (skip with --skip-smoke)
 #
 # Usage: ./deploy/scripts/upgrade.sh [--build] [--version <v>] [--env-file <path>] [--skip-smoke] [--force-env] [--keep-image-tags] [--allow-tag-base-image]
+#                                     [--with-quota-agent] [--without-quota-agent]
 #                                     [--rotate-internal-key] [--finalize-internal-key-rotation <old-key>]
 #                                     [--rotate-secret-master-key] [--finalize-secret-master-key-rotation <old-key>]
 
@@ -25,6 +26,8 @@ ROTATE_INTERNAL=0
 FINALIZE_INTERNAL=""
 ROTATE_SECRET_MASTER=0
 FINALIZE_SECRET_MASTER=""
+WITH_QUOTA_AGENT=0
+WITHOUT_QUOTA_AGENT=0
 ENV_FILE=""
 VERSION_ARG=""
 while [ $# -gt 0 ]; do
@@ -36,6 +39,8 @@ while [ $# -gt 0 ]; do
         --force-env) FORCE_ENV=1 ;;
         --keep-image-tags) KEEP_IMAGE_TAGS=1 ;;
         --allow-tag-base-image) ALLOW_TAG_BASE_IMAGE=1 ;;
+        --with-quota-agent) WITH_QUOTA_AGENT=1 ;;
+        --without-quota-agent) WITHOUT_QUOTA_AGENT=1 ;;
         --rotate-internal-key) ROTATE_INTERNAL=1 ;;
         --finalize-internal-key-rotation) FINALIZE_INTERNAL="${2:-}"; shift ;;
         --rotate-secret-master-key) ROTATE_SECRET_MASTER=1 ;;
@@ -216,13 +221,38 @@ fi
 # --- 镜像 tag 固定为当前版本（除非 --keep-image-tags）---
 if [ "$KEEP_IMAGE_TAGS" != "1" ] && [ -n "$ENV_FILE" ]; then
     REGISTRY_URL="$ACR_REGISTRY/$ACR_NAMESPACE"
-    for entry in "CONTROL_PLANE_IMAGE:e2b-sandlock-control-plane-gateway" "WORKER_IMAGE:e2b-sandlock-worker"; do
+    # A6: QUOTA_AGENT_IMAGE is pinned too (and added when the .env predates it)
+    # so the quota-agent image the worker points at is pullable on the target.
+    for entry in "CONTROL_PLANE_IMAGE:e2b-sandlock-control-plane-gateway" "WORKER_IMAGE:e2b-sandlock-worker" "QUOTA_AGENT_IMAGE:e2b-sandlock-quota-agent"; do
         key="${entry%%:*}"
         suffix="${entry#*:}"
-        sed "s|^$key=.*|$key=$REGISTRY_URL/$suffix:$VERSION|" \
-            "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
+        set_env_file_value "$ENV_FILE" "$key" "$REGISTRY_URL/$suffix:$VERSION"
     done
     say "镜像 tag 固定为版本 $VERSION"
+fi
+
+# --- quota-agent（A6）：栈内 agent 形态 -------------------------------------
+# --with-quota-agent 把 QUOTA_AGENT_PROFILE=1 写进 .env（粘性：之后的普通
+# upgrade 也带 --profile quota 起本地 agent），并在 worker 还没配 URL 时指向
+# 栈内服务；--without-quota-agent 只是把开关写回 0（配额随即降级 + WARNING）。
+if [ "$WITH_QUOTA_AGENT" = "1" ] && [ "$WITHOUT_QUOTA_AGENT" = "1" ]; then
+    echo "--with-quota-agent 与 --without-quota-agent 互斥" >&2
+    exit 1
+fi
+if [ "$WITH_QUOTA_AGENT" = "1" ] || [ "$WITHOUT_QUOTA_AGENT" = "1" ]; then
+    [ -n "$ENV_FILE" ] || { echo "quota-agent 开关需要 .env（--env-file 或 deploy/stack/.env）" >&2; exit 1; }
+    if [ "$WITH_QUOTA_AGENT" = "1" ]; then
+        enable_quota_agent_profile "$ENV_FILE"
+        say "quota-agent 形态已开启（QUOTA_AGENT_PROFILE=1，URL=$(env_file_value "$ENV_FILE" E2B_QUOTA_AGENT_URL)）"
+        say "记住：agent 需要 E2B_QUOTA_AGENT_TOKEN（与 worker 同值），否则本次部署会 fail fast"
+    else
+        set_env_file_value "$ENV_FILE" QUOTA_AGENT_PROFILE 0
+        say "quota-agent 形态已关闭（QUOTA_AGENT_PROFILE=0）；worker 仍指向 agent 时配额会降级 + WARNING"
+    fi
+fi
+QUOTA_PROFILE_ARGS="$(quota_agent_profile_args "${ENV_FILE:-}")" || exit 1
+if [ -n "$QUOTA_PROFILE_ARGS" ]; then
+    say "本次 upgrade 带 --profile quota（栈内 quota-agent）"
 fi
 
 say "上传部署文件到 $REMOTE_DIR"
@@ -233,7 +263,7 @@ if [ -n "$ENV_FILE" ]; then
 fi
 
 say "拉取镜像（deploy 用户）"
-run_as_deploy "cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml pull --quiet"
+run_as_deploy "cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml $QUOTA_PROFILE_ARGS pull --quiet"
 
 # E5.1: one-time shared-volume ownership migration for the non-root worker.
 # The worker image now runs as uid 65534, but a volume created by an older
@@ -243,13 +273,13 @@ run_as_deploy "cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml pul
 run_as_deploy "cd '$REMOTE_DIR' && WORKER_UID=\$(docker compose -f docker-compose.prod.yml run --rm -T --no-deps --entrypoint id worker-1 -u 2>/dev/null || echo 0) && if [ \"\$WORKER_UID\" != 0 ]; then OWNER=\$(docker compose -f docker-compose.prod.yml run --rm -T --no-deps --user root --entrypoint python worker-1 -c 'import os;print(os.stat(\"/var/lib/e2b-sandboxes\").st_uid)' 2>/dev/null || echo 0); if [ \"\$OWNER\" != \"\$WORKER_UID\" ]; then echo \"migrating shared volume ownership to uid \$WORKER_UID\"; docker compose -f docker-compose.prod.yml run --rm -T --no-deps --user root worker-1 chown -R \"\$WORKER_UID\":\"\$WORKER_UID\" /var/lib/e2b-sandboxes; fi; fi"
 
 say "重建容器（deploy 用户）"
-run_as_deploy "cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml up -d --no-build --remove-orphans"
+run_as_deploy "cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml $QUOTA_PROFILE_ARGS up -d --no-build --remove-orphans"
 
 say "等待就绪并检查容器"
-run_as_deploy "sleep 8 && cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml ps --format 'table {{.Name}}\t{{.Status}}'"
+run_as_deploy "sleep 8 && cd '$REMOTE_DIR' && docker compose -f docker-compose.prod.yml $QUOTA_PROFILE_ARGS ps --format 'table {{.Name}}\t{{.Status}}'"
 
 say "校验 control-plane 网络挂载（异常时重跑 up 自愈）"
-run_as_deploy "cd '$REMOTE_DIR' && docker inspect sandlock-control-plane-1 --format '{{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}} {{end}}' | grep -q 'sandlock_default' || docker compose -f docker-compose.prod.yml up -d --no-build --remove-orphans"
+run_as_deploy "cd '$REMOTE_DIR' && docker inspect sandlock-control-plane-1 --format '{{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}} {{end}}' | grep -q 'sandlock_default' || docker compose -f docker-compose.prod.yml $QUOTA_PROFILE_ARGS up -d --no-build --remove-orphans"
 
 say "检查 worker 注册"
 INTERNAL_KEY="$(remote_env_value E2B_INTERNAL_API_KEY)"

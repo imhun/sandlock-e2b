@@ -149,7 +149,10 @@ PUSH=1 ./deploy/scripts/build-images.sh
 产出镜像，**名称区分服务、tag 区分版本**：
 `<registry>/e2b-sandlock-control-plane-gateway:<version>`（合并服务，见
 `deploy/scripts/build-and-push.sh`）、`<registry>/e2b-sandlock-worker:<version>`、
-`<registry>/e2b-sandlock-autoscaler:<version>`。
+`<registry>/e2b-sandlock-autoscaler:<version>`、
+`<registry>/e2b-sandlock-quota-agent:<version>`（每沙箱磁盘配额的服务端 agent，
+`profiles: ["quota"]`；`./deploy/scripts/upgrade.sh --with-quota-agent` 会一并固定镜像
+与 `--profile quota`）。
 
 **生产部署示例**（合并控制面/gateway + 多 worker + Redis 共享状态 + 可选本地
 镜像仓库）：

@@ -345,16 +345,19 @@ env:
 - 权限：`securityContext.capabilities.add: [NET_BIND_SERVICE]`、
   `securityContext.seccompProfile.type: Unconfined`（K8s 1.19+）。
   **A6 之后不再需要 `SYS_ADMIN`**（共享卷 bind 已删、配额由 quota-agent 提供，
-  见 `docs/production-deployment-requirements.md` §2.4.3）；
+  见 `docs/production-deployment-requirements.md` §2.4.3）；低端口 `:53` 另需 pod 级
+  sysctl（见下条），cap 对非 root pod 无效；
 - 非 root（E5.1）：worker 镜像以 uid 65534 运行，Pod 同步声明
   `securityContext.runAsNonRoot: true`、`runAsUser: 65534`、
   `runAsGroup: 65534`（镜像已预建 `/var/lib/e2b-sandboxes` 且属主 65534；
   既有 RWX PVC 需一次性 chown 到 65534，或由 initContainer 完成）；
-- 低端口：root pod 用 `NET_BIND_SERVICE` 就够（`deploy/k8s/worker.yaml` 的
-  形态）。只有把 pod 改成非 root 才需要
-  `net.ipv4.ip_unprivileged_port_start=0`；它自 K8s 1.22 起是 **safe sysctl**，
-  声明在 **pod 级** `spec.template.spec.securityContext.sysctls` 即可，**不需要**
-  kubelet `--allowed-unsafe-sysctls`（`hostNetwork: true` 下 `net.*` 会被拒）；
+- 低端口：**必须声明 `net.ipv4.ip_unprivileged_port_start=0`**（pod 级
+  `spec.template.spec.securityContext.sysctls`，`deploy/k8s/worker.yaml` 已声明）——
+  wildcard allowOut 的 DNS 网关绑 `:53`，而 worker 镜像 `USER 65534` ⇒ 非 root 的
+  `CapEff=0`（containerd 不发放 ambient caps），`NET_BIND_SERVICE` **不够**，内核默认
+  1024 下 bind `:53` = EACCES（实测见 `deploy/k8s/worker.yaml` 的注释）；cap 只对
+  root override（`runAsUser: 0`）有意义。该 sysctl 自 K8s 1.22 起是 **safe sysctl**，
+  **不需要** kubelet `--allowed-unsafe-sysctls`（`hostNetwork: true` 下 `net.*` 会被拒）；
 - 无 docker socket：不挂 `/var/run/docker.sock`，rootfs 提取走第 4.2 节
   的 registry 直拉。
 

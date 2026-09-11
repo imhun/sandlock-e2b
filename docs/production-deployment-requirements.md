@@ -52,7 +52,7 @@ workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，�
 
 | 项 | 说明 |
 |---|---|
-| 权限 | 分三层，**照抄会多给特权**（2026-09-10 实测，逐项见 §2.4.1）：**沙箱侧最小集 = `CAP_SETUID`+`CAP_SETGID`+`CAP_CHOWN`**；`CAP_DAC_OVERRIDE` 是**管理面**需要（对账 `os.walk`、删除 `rmtree`、配额扫描都要穿租户 0700 目录）；`CAP_SYS_ADMIN` **在 A6 之后 worker 已不需要**（共享卷 bind 由 A4 删除、配额改由 quota-agent 提供、低端口 sysctl 由容器 spec 声明），也**不是 E3.2 / route B 的前置**；`CAP_SYS_PTRACE` 只在走进程内 `RunAs` 时才需要。非 root worker 自动关闭 uid 池并保持「固定身份 + Landlock」（E5.1），启动时打一条 WARNING —— 按清单 `user: "65534:65534"` 部署时行为与翻默认前**完全一致**（但线上实际是 root，见下面审计）。 |
+| 权限 | 分三层，**照抄会多给特权**（2026-09-10 实测，逐项见 §2.4.1）：**沙箱侧最小集 = `CAP_SETUID`+`CAP_SETGID`+`CAP_CHOWN`**；`CAP_DAC_OVERRIDE` 是**管理面**需要（对账 `os.walk`、删除 `rmtree`、配额扫描都要穿租户 0700 目录）；`CAP_SYS_ADMIN` **在出厂镜像与清单形态下 worker 已不需要**（共享卷 bind 由 A4 删除、配额改由 quota-agent 提供、低端口 sysctl 由容器 spec 声明；代码里仍有两条非部署默认的路径需要它，见 §2.4.1 的限定），也**不是 E3.2 / route B 的前置**；`CAP_SYS_PTRACE` 只在走进程内 `RunAs` 时才需要。非 root worker 自动关闭 uid 池并保持「固定身份 + Landlock」（E5.1），启动时打一条 WARNING —— 按清单 `user: "65534:65534"` 部署时行为与翻默认前**完全一致**（但线上实际是 root，见下面审计）。 |
 | 容量 | 并发沙箱数受 `E2B_UID_POOL_SIZE` 约束（默认 1000，起始 `E2B_UID_POOL_START=10000`）；池满即建箱失败。多 worker 共用同一 workspace 时必须配**互不重叠**的段。 |
 | 进程/内存 | chroot 形态每沙箱多一棵 supervise 进程树（supervise + sandlock-init + 停车 M0）。它在沙箱 cgroup **之外**，不计入 `max_memory`/`max_disk`，并在 `max_processes` 里占 1；容量表按「N 沙箱 = N 额外进程」重算。 |
 | 回收 | route-B 代次的结束由 envd 生命周期（TTL/idle eviction/删除 → `executor.close()`）决定，不再依赖 core 的 15 min idle；槽位进程退出前该 uid 不会被再次租出（W1）。 |
@@ -68,7 +68,7 @@ workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，�
 | `SETUID` + `SETGID` | 把 route-B 槽位起在该沙箱的 host uid 上（`setpriv --reuid X --regid X --clear-groups`） | 租不到槽位 ⇒ chroot 形态被 fork 拒绝建箱（见上「删档的后果」行） |
 | `CHOWN` | workspace chown 给该 uid（0700）；uid 回收时再 chown 回来 | E3.2 的属主前提不成立 |
 | `DAC_OVERRIDE` | **管理面**遍历租户 0700 目录树：孤儿对账的 `os.walk`、删除的 `rmtree`、配额扫描 | `PermissionError: …/sbx_a/workspace`；对账与共享卷持久化用例 4 failed / 4 error |
-| `SYS_ADMIN` | **worker 侧不需要它（A6 迁出，A7 固化）。全库只剩一处用途，且不在 worker 上**：`deploy/stack/docker-compose.prod.yml` 的 **quota-agent** 服务（`profiles: ["quota"]`）执行 `xfs_quota -x` —— 内核按 effective `CAP_SYS_ADMIN` 门控（§2.4.3）。worker 侧原来那三处：① 共享卷 `mount --bind` 进 workspace —— **A4 删 bind**（卷视图 = 请求路径决定的符号链接）+ **A5 补祖先穿透位**；② 直接执行 `xfs_quota -x` —— **A6** 改由 quota-agent 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关）；③ 写 namespaced sysctl（`ip_unprivileged_port_start`）—— **A6** 改由容器 spec 声明（compose `sysctls:` / `docker --sysctl`；k8s 形态是 root pod，由 `NET_BIND_SERVICE` 覆盖）。两个显式例外都不是部署默认：不配 `E2B_QUOTA_AGENT_URL` 时的本地直连配额（dev/legacy，需 root）与 `E2B_ENABLE_NETNS=true` 的 legacy netns 形态 | 摘掉它的后果**只剩配额降级**：quota-agent 未配置/不可达 ⇒ 建箱与挂卷照常、无 per-sandbox 磁盘硬限 + 一条 WARNING。共享卷不再是理由 —— A4/A5 的契约（`tests/contract/test_shared_volume_relative_cwd.py` 等 36 条）+ 13 条穿透单测在**无 `SYS_ADMIN`** lane 三连绿（`tmp/a4-final-step4-run{1,2,3}.log`）；A7 起整份套件也在**无 `SYS_ADMIN`** 下全绿：`PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` = `1075 passed, 3 skipped, 0 failed`（`tmp/a7-nosa.log`，cap 探针 `CapEff 0xa02c35fb → 0xa00c35fb`）。A6 的配额 lane（同形状，无 `SYS_ADMIN`）：agent 形态 `tmp/a6-agent.log` = `107 passed`；降级形态 `tmp/a6-degrade.log` = `29 passed, 5 errors`（5 个 error 是 XFS prjquota 门用例被 `E2B_TEST_STRICT_SKIPS=1` 显式暴露；A7 起 `tests/unit/test_xfs_project_quota_agent.py` 不再被 deselect，见 §2.5） |
+| `SYS_ADMIN` | **出厂镜像与清单形态下，worker 侧不需要它**（A6 迁出，A7 固化）。全库只剩一处用途，且不在 worker 上：`deploy/stack/docker-compose.prod.yml` 的 **quota-agent** 服务（`profiles: ["quota"]`）执行 `xfs_quota -x` —— 内核按 effective `CAP_SYS_ADMIN` 门控（§2.4.3）。worker 侧原来那三处：① 共享卷 `mount --bind` 进 workspace —— **A4 删 bind**（卷视图 = 请求路径决定的符号链接）+ **A5 补祖先穿透位**；② 直接执行 `xfs_quota -x` —— **A6** 改由 quota-agent 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关）；③ 写 namespaced sysctl（`ip_unprivileged_port_start`）—— **A6** 改由容器 spec 声明（compose `sysctls:` / `docker --sysctl`；k8s 是 **pod 级** `spec.template.spec.securityContext.sysctls`；`NET_BIND_SERVICE` 对非 root pod **不足以**覆盖 `:53`，实测见 §2.4.3）。⚠️ **限定**：代码里仍有两条非部署默认的路径需要它 —— 合体节点（`E2B_ENABLE_LOCAL_NODE` 默认 **true**，`control_plane/api/sandboxes.py` 硬编码 `via_agent=False` ⇒ 配额在控制面进程里本地直连）与 legacy `E2B_ENABLE_NETNS=true`（运行时写 `net.ipv4.ip_forward` + iptables）；这两条在**出厂镜像**里也跑不起来（无 `xfs_quota`/`sysctl`/`iptables`，实测镜像 `command -v` 全 MISSING），所以「不需要」只在镜像 + 清单形态下成立 | 摘掉它的后果**只剩配额降级**：quota-agent 未配置/不可达 ⇒ 建箱与挂卷照常、无 per-sandbox 磁盘硬限 + 一条 WARNING。共享卷不再是理由 —— A4/A5 的契约（`tests/contract/test_shared_volume_relative_cwd.py` 等 36 条）+ 13 条穿透单测在**无 `SYS_ADMIN`** lane 三连绿（`tmp/a4-final-step4-run{1,2,3}.log`）；A7 起整份套件也在**无 `SYS_ADMIN`** 下全绿：`PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` = `1075 passed, 3 skipped, 0 failed`（`tmp/a7-nosa.log`，cap 探针 `CapEff 0xa02c35fb → 0xa00c35fb`）。A6 的配额 lane（同形状，无 `SYS_ADMIN`）：agent 形态 `tmp/a6-agent.log` = `107 passed`；降级形态 `tmp/a6-degrade.log` = `29 passed, 5 errors`（5 个 error 是 XFS prjquota 门用例被 `E2B_TEST_STRICT_SKIPS=1` 显式暴露；A7 起 `tests/unit/test_xfs_project_quota_agent.py` 不再被 deselect，见 §2.5） |
 | `SYS_PTRACE` | 只服务**进程内 RunAs**（父进程给子进程写 `uid_map` 需要对该子进程的 ptrace 访问权） | 非 route-B 的 per-uid 沙箱每个建箱挂在 `sandlock_create failed`；route B 完全不需要 |
 
 三条实测口径（`e2b-sandlock-test` 容器，`--cap-drop ALL` + 指定 capset）：
@@ -160,23 +160,35 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 - **开关是 URL**：`E2B_QUOTA_AGENT_URL` 存在即启用 agent 形态（优先于 `E2B_QUOTA_VIA_AGENT`，
   后者默认 false）。同时配 `E2B_QUOTA_AGENT_TOKEN`（与 agent 同值，`X-Internal-Key`）。
   `E2B_QUOTA_VIA_AGENT=true` 而 URL 为空仍是受支持的误配：启动打一条 WARNING、配额降级。
-- **清单**：`deploy/stack/docker-compose.prod.yml` 的 `quota-agent` 服务
-  （`profiles: ["quota"]`、`cap_add: SYS_ADMIN`、与 worker 挂同一份 `sandbox-shared`）——
-  `docker compose --profile quota up -d` + 上面两个 env 即开启；NFS 服务器形态见
-  `deploy/compose/docker-compose.quota-agent.yml` + `E2B_QUOTA_AGENT_PATH_MAP`。
+- **清单 + 发布流程（A6 fix-1）**：`deploy/stack/docker-compose.prod.yml` 的 `quota-agent`
+  服务（`profiles: ["quota"]`、`cap_add: SYS_ADMIN`、与 worker 挂同一份 `sandbox-shared`）。
+  一条命令开启：`./deploy/scripts/upgrade.sh --with-quota-agent` —— 它把
+  `QUOTA_AGENT_PROFILE=1` 写进 `.env`（粘性，后续 upgrade 自动带 `--profile quota`）、
+  worker 没配 URL 时指向 `http://quota-agent:49984`、并把 `QUOTA_AGENT_IMAGE` 固定成
+  `<registry>/<ns>/e2b-sandlock-quota-agent:<VERSION>`。该镜像与 worker 走同一个发布流程：
+  `deploy/scripts/build-images.sh`（`build-and-push.sh` 调用）多平台构建并推送它。手动形态：
+  自己设 `E2B_QUOTA_AGENT_URL/TOKEN` + `docker compose --profile quota up -d`。
+  NFS 服务器形态见 `deploy/compose/docker-compose.quota-agent.yml` +
+  `E2B_QUOTA_AGENT_PATH_MAP`（外置 agent 时不要开 `QUOTA_AGENT_PROFILE`）。
   `deploy/k8s/worker.yaml` 已不再声明 `SYS_ADMIN`（把 `E2B_QUOTA_AGENT_URL` 指向集群内或
   外部的 agent；k8s 的共享卷是 RWX PVC，走 NFS 时本地直连本来就不可能）。
 - **降级语义（不变）**：agent 不可达/401/协议错误 ⇒ `ProjectQuotaError` ⇒ **建箱与挂卷成功、
   无 per-sandbox 限额 + WARNING**。agent 形态不会在 worker 上执行任何本地配额命令，回归钉在
   `tests/unit/test_xfs_project_quota_agent.py::test_agent_form_never_shells_out_to_a_local_quota_tool`。
 - **低端口 sysctl（第 ③ 处用途）**：wildcard allowOut 的 DNS 网关绑 `<127.0.1.x>:53`
-  （`resolv.conf` 带不了端口）。Docker 形态由容器 spec 声明
+  （`resolv.conf` 带不了端口，且**默认的共享 netns 形态就是由 worker 父进程绑它**）。两个
+  部署形态都由容器 spec 声明
   `sysctls: net.ipv4.ip_unprivileged_port_start=0` —— 运行时应用，worker 不写 sysctl、不持
-  `SYS_ADMIN`；k8s 形态的 worker 是 **root**，`NET_BIND_SERVICE` 已覆盖，**不需要**这条
-  sysctl。该 sysctl 自 k8s 1.22 起属 **safe sysctl**（无需 kubelet
-  `--allowed-unsafe-sysctls`），只有把 pod 改成非 root 时才需要按 **pod 级**
-  `spec.template.spec.securityContext.sysctls` 声明；`hostNetwork: true` 下 `net.*` 会被拒。
-  MCP 入站端口是 50005+，从来不需要低端口窗口。
+  `SYS_ADMIN`：compose 的 `sysctls:`，k8s 的**pod 级**
+  `spec.template.spec.securityContext.sysctls`（`deploy/k8s/worker.yaml`）。
+  ⚠️ **不能用 `NET_BIND_SERVICE` 代替**：worker 镜像（`deploy/docker/Dockerfile.envd`）
+  以 `USER 65534:65534` 构建、pod 也没有 `runAsUser: 0` ⇒ containerd 对非 root 清空
+  effective 集（实测 `CapEff=0`，没有 ambient caps），内核默认
+  `ip_unprivileged_port_start=1024` 下 bind `:53` = **EACCES**（本仓实测：同一 uid 把该值
+  声明为 0 即 OK；root + `NET_BIND_SERVICE` 才在 1024 下也 OK —— 早期推送的镜像仍是 root，
+  但清单以 Dockerfile 的 `USER` 为准，声明这条 sysctl 对两种形态都安全）。该 sysctl 自 k8s 1.22 起属
+  **safe sysctl**（无需 kubelet `--allowed-unsafe-sysctls`）；`hostNetwork: true` 下 `net.*`
+  会被拒。MCP 入站端口是 50005+，从来不需要低端口窗口。
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 

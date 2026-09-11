@@ -1,14 +1,23 @@
-"""Quota-agent HTTP client + deployment wiring (E2.6).
+"""Quota-agent HTTP client + deployment wiring (E2.6; agent form promoted in A6).
 
-The worker normally runs ``xfs_quota`` directly against its own XFS mount
-(``E2B_QUOTA_VIA_AGENT`` unset/``false``, the default). In the NFS form the
-worker only sees an NFS client mount, so the real filesystem lives on the
-server; this module talks to the server-side quota-agent
-(``deploy/quota_agent``) which executes ``xfs_quota`` locally.
+**The agent form is the deployment's quota source, and
+``E2B_QUOTA_AGENT_URL`` (non-blank) is what selects it** -- the worker's
+``quota_via_agent`` setting derives from that URL, and the flag
+``E2B_QUOTA_VIA_AGENT`` only matters when no URL is configured (failing with a
+warning when it is set without one). Leaving the URL unset keeps the dev/legacy
+direct path, where the worker runs ``xfs_quota`` against its own XFS mount and
+therefore needs root/effective CAP_SYS_ADMIN.
+
+The historical reason for this module is the NFS form: the worker only sees an
+NFS client mount, so the real filesystem lives on the server; this module talks
+to the server-side quota-agent (``deploy/quota_agent``), which executes
+``xfs_quota`` locally and owns the privilege.
 
 Wire the module hooks (``xfs_quota.agent_query`` + ``xfs_quota.agent_ops``)
 with :func:`configure_quota_agent_client`; :func:`envd_service.app.create_app`
-does that automatically whenever ``E2B_QUOTA_VIA_AGENT`` is enabled.
+does that automatically whenever the agent form is on -- i.e. whenever
+``E2B_QUOTA_AGENT_URL`` is set (or ``E2B_QUOTA_VIA_AGENT=true`` without one,
+which wires nothing and degrades with a warning).
 
 HTTP contract with the agent (every response is a JSON object):
 

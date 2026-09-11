@@ -1,11 +1,11 @@
 #!/bin/sh
-# Build the worker / autoscaler images (the control plane + gateway run as
-# the merged e2b-sandlock-control-plane-gateway image, see
+# Build the worker / autoscaler / quota-agent images (the control plane +
+# gateway run as the merged e2b-sandlock-control-plane-gateway image, see
 # deploy/docker/Dockerfile.control-plane-gateway / deploy/scripts/build-and-push.sh).
 #
 # Naming convention: the image NAME distinguishes the service and the TAG
 # distinguishes the version:
-#   $REGISTRY/e2b-sandlock-{worker,autoscaler}:$VERSION
+#   $REGISTRY/e2b-sandlock-{worker,autoscaler,quota-agent}:$VERSION
 #
 # Usage:
 #   REGISTRY=myrepo/e2b VERSION=1.0 PLATFORMS=linux/amd64 ./deploy/scripts/build-images.sh
@@ -48,6 +48,19 @@ docker buildx build "$OUT_FLAG" \
     -t "$REGISTRY/e2b-sandlock-autoscaler:$VERSION" \
     "$SCRIPT_DIR/../.."
 
+# A6: the quota-agent is the deployment's quota source (it is where
+# CAP_SYS_ADMIN lives, see docs/production-deployment-requirements.md §2.4.3),
+# so it ships through the same release flow as the worker. No sandlock wheels
+# needed -- it only runs xfs_quota/lsattr server-side.
+echo "==> building $REGISTRY/e2b-sandlock-quota-agent:$VERSION ($PLATFORMS)"
+docker buildx build "$OUT_FLAG" \
+    --platform "$PLATFORMS" \
+    -f "$SCRIPT_DIR/../docker/Dockerfile.quota-agent" \
+    -t "$REGISTRY/e2b-sandlock-quota-agent:$VERSION" \
+    "$SCRIPT_DIR/../.."
+
 echo "done:"
 echo "  worker:        $REGISTRY/e2b-sandlock-worker:$VERSION"
 echo "  autoscaler:    $REGISTRY/e2b-sandlock-autoscaler:$VERSION"
+echo "  quota-agent:   $REGISTRY/e2b-sandlock-quota-agent:$VERSION"
+echo "  (control-plane-gateway is built by build-and-push.sh)"

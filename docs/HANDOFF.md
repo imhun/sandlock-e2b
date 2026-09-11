@@ -7,10 +7,15 @@
 
 ## ⚡ 共享卷去 SYS_ADMIN（2026-09-11，A4–A7 收口 / backlog #25）
 
-**一句话**：worker 侧不再需要 `SYS_ADMIN` ——「共享卷 `mount --bind`」「本地 `xfs_quota -x`」
-「写 namespaced sysctl」三处用途分别由 A4/A5/A6 迁出，A7 把这个形态固化成门禁并跑出
-**0 failed / 0 error**。`SYS_ADMIN` 现在全库只剩一处用途，且**不在 worker 上**：
+**一句话**：**出厂镜像与清单形态下** worker 侧不再需要 `SYS_ADMIN` ——「共享卷 `mount --bind`」
+「本地 `xfs_quota -x`」「写 namespaced sysctl」三处用途分别由 A4/A5/A6 迁出，A7 把这个形态
+固化成门禁并跑出 **0 failed / 0 error**。`SYS_ADMIN` 现在全库只剩一处用途，且**不在 worker 上**：
 `deploy/stack/docker-compose.prod.yml` 的 `quota-agent`（`profiles: ["quota"]`）。
+⚠️ **限定**：代码里仍保留两条**非部署默认**的路径需要它 —— 合体节点
+（`E2B_ENABLE_LOCAL_NODE` 默认 true，`control_plane/api/sandboxes.py` 硬编码 `via_agent=False`）
+与 legacy `E2B_ENABLE_NETNS=true`（运行时写 `ip_forward` + iptables）；出厂 worker 镜像里
+`xfs_quota`/`sysctl`/`iptables` 都不存在（实测 `command -v` 全 MISSING），所以这两条在默认
+形态下本来也跑不起来。
 
 ### 1. 探针（本机；镜像 `e2b-sandlock-test:latest` = `sha256:2b796e1c11222c0e845f2d498ea9d4be0632babd4249b212ad209768bd11f42c`）
 
@@ -32,7 +37,7 @@
 |---|---|---|---|
 | ① | 共享卷 `mount --bind` 进 workspace | A4 删掉 bind（卷视图 = 请求路径决定的符号链接，双别名 `/workspace/<rel>` + `/home/user/<rel>`）；A5 补齐卷根及祖先对租户 uid 的 `o+x` 穿透位 | `d3c390e`(A4)、`e18120d`(A5) |
 | ② | worker 本地直连 `xfs_quota -x` | A6 改由 **quota-agent** 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关；`SYS_ADMIN` 只留在 `profiles: ["quota"]` 的 agent 上） | `f2af31e`(A6) |
-| ③ | 写 namespaced sysctl（`ip_unprivileged_port_start`） | A6 改由**容器 spec 声明**（compose `sysctls:`；k8s 形态 root + `NET_BIND_SERVICE`） | `f2af31e`(A6) |
+| ③ | 写 namespaced sysctl（`ip_unprivileged_port_start`） | A6 改由**容器 spec 声明**（compose `sysctls:`；k8s 见本文件顶部 ⚡ 块 fix-1：**pod 级** `securityContext.sysctls`，非 root pod 靠 `NET_BIND_SERVICE` 不够） | `f2af31e`(A6) |
 
 fork 侧支撑这次改动的三个 commit（同一轮 A1–A3，**未推送**）：`aadb5ad`（A1 RED：子挂载 +
 别名下的相对路径）、`c6cbe03`（A2 修复：虚拟 cwd 由请求决定、host→virtual 平局规则确定化）、
@@ -325,7 +330,7 @@ skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」�
 | `SETUID`+`SETGID` | worker 把槽位起在沙箱 host uid 上（`setpriv --reuid X --regid X --clear-groups`） | 租不到槽位 ⇒ chroot 形态被 fork 拒绝建箱 |
 | `CHOWN` | workspace chown 0700 给该 uid、回收时 chown 回来 | E3.2 属主前提不成立 |
 | `DAC_OVERRIDE` | **管理面**穿租户 0700 目录树：孤儿对账 `os.walk`、删除 `rmtree`、配额扫描 | `PermissionError: …/sbx_a/workspace`；对账 + 卷持久化 4 failed / 4 error |
-| `SYS_ADMIN` | ~~① 共享卷 `mount --bind`~~（A4 删 bind、A5 补穿透位）~~② 直接 `xfs_quota -x`~~（A6：改由 quota-agent 提供）~~③ 写 namespaced sysctl~~（A6：改由容器 spec 声明，k8s 由 `NET_BIND_SERVICE` 覆盖） | **A6 之后 worker 不再需要它，没有任何一处仍需要**。摘掉它现在的后果只剩「配额降级」（agent 未配置/不可达 ⇒ 无 per-sandbox 硬限 + WARNING，建箱/挂卷照常）；沙箱侧 confine / 中介 / 设备节点围栏照常。删 bind 之前的实测是「只掉 4 条共享卷用例」（`cannot bind volume … failed mount system call.; keeping the workspace symlink`）。终态口径见 `docs/production-deployment-requirements.md` §2.4.1/§2.4.3（A6 证据 `tmp/a6-agent.log`、`tmp/a6-degrade.log`、`tmp/a6-full-gate.log`） |
+| `SYS_ADMIN` | ~~① 共享卷 `mount --bind`~~（A4 删 bind、A5 补穿透位）~~② 直接 `xfs_quota -x`~~（A6：改由 quota-agent 提供）~~③ 写 namespaced sysctl~~（A6：改由容器 spec 声明 —— compose `sysctls:`、k8s **pod 级** `securityContext.sysctls`；`NET_BIND_SERVICE` 对非 root pod 不足以覆盖 `:53`，见 `deploy/k8s/worker.yaml` 实测注释） | **出厂镜像与清单形态下 worker 不再需要它**（A6/A7 收口；限定见本文件顶部 ⚡ 块与 §2.4.1：合体节点 / legacy netns 两条非默认路径仍需）。摘掉它现在的后果只剩「配额降级」（agent 未配置/不可达 ⇒ 无 per-sandbox 硬限 + WARNING，建箱/挂卷照常）；沙箱侧 confine / 中介 / 设备节点围栏照常。删 bind 之前的实测是「只掉 4 条共享卷用例」（`cannot bind volume … failed mount system call.; keeping the workspace symlink`）。终态口径见 `docs/production-deployment-requirements.md` §2.4.1/§2.4.3（A6 证据 `tmp/a6-agent.log`、`tmp/a6-degrade.log`、`tmp/a6-full-gate.log`） |
 | `SYS_PTRACE` | 只服务**进程内** `RunAs` | 进程内 per-uid 沙箱挂在 `sandlock_create failed`；route B 不需要 |
 
 三条对照数据（原始输出，别只信表格）：

@@ -42,15 +42,20 @@ cp deploy/scripts/acr.env.example   deploy/scripts/acr.env         # 填 ACR_USE
 | 脚本 | 参数 / 环境变量 |
 |---|---|
 | build-and-push.sh | `VERSION`、`PLATFORMS`（默认 amd64+arm64）、`BASE_IMAGE`、`MIRROR_BASE_IMAGE=0` 跳过基础镜像 |
-| upgrade.sh | `--build` 先构建；`--version <v>` 固定镜像版本（默认 git describe）；`--env-file <path>` 指定 env；`--force-env` 不保留远端密钥；`--keep-image-tags` 不重写镜像 tag；`--skip-smoke` |
+| upgrade.sh | `--build` 先构建；`--version <v>` 固定镜像版本（默认 git describe）；`--env-file <path>` 指定 env；`--force-env` 不保留远端密钥；`--keep-image-tags` 不重写镜像 tag；`--skip-smoke`；`--with-quota-agent` / `--without-quota-agent` 开/关栈内 quota-agent（写 `QUOTA_AGENT_PROFILE`，带 `--profile quota`，缺 `E2B_QUOTA_AGENT_TOKEN` 时 fail fast） |
 | smoke.sh | 无 |
 | 全局 | `BASTION_HOST`、`TARGET_HOST`、`DEPLOY_USER`、`SSH_KEY`、`SSH_PASSPHRASE`、`TASK_TIMEOUT` 可覆盖 |
 
 ## 版本与回滚
 
 - 镜像命名：**名称区分服务、tag 区分版本**：
-  `e2b-sandlock-{control-plane-gateway,worker,autoscaler}:<VERSION>`
+  `e2b-sandlock-{control-plane-gateway,worker,autoscaler,quota-agent}:<VERSION>`
   （redis 用 `redis:8-alpine`、基础镜像用 `python:3.14-slim`，本身即版本号）。
+- **每沙箱磁盘配额（可选）**：`upgrade.sh --with-quota-agent` 把
+  `QUOTA_AGENT_IMAGE` 固定成 `<registry>/<ns>/e2b-sandlock-quota-agent:<VERSION>`
+  （`build-images.sh`/`build-and-push.sh` 会构建并推送它，与 worker 同一个流程），
+  写 `QUOTA_AGENT_PROFILE=1` 并让 worker 指向栈内 agent；后续升级自动带
+  `--profile quota`。外置/NFS 服务器形态的 agent 不要开这个开关。
 - **开发构建默认带时间戳**：`build-and-push.sh` 未指定 `VERSION` 时使用
   `<git describe>-<时间戳>`（如 `0.1.0-20260830-153045`），每次构建都是新
   tag，不覆盖旧镜像；本次构建版本记录在 `deploy/stack/.version`。
