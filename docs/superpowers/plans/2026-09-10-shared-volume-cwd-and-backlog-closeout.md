@@ -826,11 +826,24 @@ bash tmp/run-f31.sh   # gate A / gate B / 生产形 phase1/phase2（macOS 另跑
 
 Expected: 与上一基线逐项一致（±本次新增用例数）。
 
-实测（2026-09-11）：只重跑了**本改动唯一触及的那条 lane**（`test-prod-shaped.sh`，cap 不削、
-phase 1 + phase 2）：phase 1 `1075 passed, 3 skipped, 0 failed`、phase 2 `48 passed, 1 skipped,
-0 failed`（`tmp/a7-default-lane.log`），与 A6 的 `tmp/a6-full-gate.log`（收集 982 → 1078）差的就是
-解禁的 96 条。gate A / gate B 没有重跑：它们既不用 `test-prod-shaped.sh`、本 Task 也没碰任何
-产品代码（只有 1 个 deploy 脚本 + 3 个文档），数字不可能动。
+实测（2026-09-11，A7 本体）：生产形默认 lane（cap 不削）phase 1 `1075 passed, 3 skipped,
+0 failed`、phase 2 `48 passed, 1 skipped, 0 failed`（`tmp/a7-default-lane.log`）。
+
+实测（2026-09-11，**fix round 1 补跑全三档**；运行器 `tmp/a7-fix1-run.sh`）：
+
+| 相 | 本次 | 基线（`569a70a`，早于 A4） | 日志 |
+|---|---|---|---|
+| gate A（chroot） | `1104 / 4 skip / 0 failed`（`EXIT=0`） | `1069 / 4 / 0` | `tmp/fix1-gate-a.log` |
+| gate B（pure） | ⚠️ `1102 / 5 skip / **1 failed**`（`EXIT=1`） | `1068 / 5 / 0` | `tmp/fix1-gate-b.log` |
+| macOS | ⚠️ `1023 / 80 skip / **1 failed**`（`EXIT=1`） | `989 / 84 / 0` | `tmp/fix1-macos.log` |
+
+gate A 的 `+35` 全是新增用例（`git diff --numstat 569a70a HEAD -- tests/`：38 个新 `def test_`
+− 3 个删除），既有断言只改了 `/workspace` → `/home/user` 与双别名 `fs_mounts`。两条红是**同一条**
+A4 契约用例 `test_shared_volume_relative_cwd.py::test_volume_visible_from_both_workspace_aliases`
+（pure 形态没有 `/home/user`、macOS 没有 Landlock ⇒ 这两相永远不可能通过），**不是 A4/A5 的
+产品回归**（pure 形态自己的工作区相对路径契约仍成立，探针 `tmp/fix1-alias-probe.log`）。
+按评审要求未改测试/未加 skip，转 NEEDS_CONTEXT；候选修法与逐条账见
+`docs/HANDOFF.md` §4b 与 `.superpowers/sdd/task-A7-report.md` §F1.3。
 
 - [x] **Step 4: 台账收口**
 

@@ -66,7 +66,7 @@ A4 起用这枚 wheel 重建测试镜像）。A5/A6 是纯 E2B 侧改动，**不
 
 | 口径 | 命令 | 结果 | 日志 |
 |---|---|---|---|
-| **GREEN** 无 `SYS_ADMIN` 全量 | `PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` | `1075 passed, 3 skipped, 0 failed`（301.19s；`CapEff 0xa02c35fb → 0xa00c35fb`） | `tmp/a7-nosa.log` |
+| **GREEN** 无 `SYS_ADMIN` 全量 | `PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` | `1094 passed, 3 skipped, 0 failed`（361.69s，日志尾部 `EXIT=0`；`CapEff 0xa02c35fb → 0xa00c35fb`）。首轮 `1075/3/0` 在 A7 时点的树上；A6 fix-1/fix-2 又加了用例 ⇒ 现树 1094 | `tmp/a7-nosa.log` |
 | **RED** 改造前基线（对照） | 同 lane、deselect 表仍含 7 条 | `4 failed, 962 passed, 3 skipped` | `tmp/nosa-full.log` |
 | 生产形默认 lane 无漂移 | `./deploy/scripts/test-prod-shaped.sh`（cap 不削、phase 1 + phase 2） | phase 1 `1075 passed, 3 skipped, 0 failed`（309.73s）、phase 2 `48 passed, 1 skipped, 0 failed`（31.30s）；与 A6 的 `tmp/a6-full-gate.log`（phase 1 `979 passed, 3 skipped`、phase 2 `48 passed, 1 skipped`）相比只有解禁的 +96 | `tmp/a7-default-lane.log` |
 
@@ -91,6 +91,44 @@ A4 起用这枚 wheel 重建测试镜像）。A5/A6 是纯 E2B 侧改动，**不
 `pytest.mark.skipif` 在 strict 下**仍是 skip**；上面两个契约文件恰好用第一条标记
 （"XFS quota integration requires"），所以漏列会变 error 而不是静默少跑。
 
+### 4b. 广度回归（A7 fix round 1）：gate A / gate B / macOS
+
+A4 动了 `_view_cwd`、两处 `mount_map` 顺序与 `fs_mounts` 键集之后，A4–A7 只跑过
+contract/unit 子集与生产形 lane ⇒ 评审要求补跑 gate A（chroot）/ gate B（pure）/ macOS。
+运行器 `tmp/a7-fix1-run.sh`（一相一容器、严格顺序；每份日志首行 ENV-HEADER、末行 `EXIT=`）。
+
+| 相 | 本次（HEAD 侧） | 最近全绿基线（commit `569a70a`，2026-09-10，**早于 A4**） | 日志 |
+|---|---|---|---|
+| gate A（chroot） | `1104 passed, 4 skipped, 0 failed`（`EXIT=0`） | `1069 / 4 / 0`（`tmp/f31-gate-a.log`） | `tmp/fix1-gate-a.log` |
+| gate B（pure） | ⚠️ `1 failed, 1102 passed, 5 skipped`（`EXIT=1`） | `1068 / 5 / 0`（`tmp/f31-gate-b.log`） | `tmp/fix1-gate-b.log` |
+| macOS（宿主 venv，无 `--perf`） | ⚠️ `1 failed, 1023 passed, 80 skipped`（`EXIT=1`） | `989 / 84 / 0`（`tmp/f31-macos.log`） | `tmp/fix1-macos.log` |
+
+- **gate A 的 `+35 passed` 全部是新增用例**：`git diff --numstat 569a70a HEAD -- tests/` 的净
+  新增 = 38 个 `def test_` − 3 个删除 = 35（A4 的 `test_shared_volume_relative_cwd`、A5 的 13 条
+  穿透单测、A6 的配额/清单/升级用例；A4 删掉 `test_runtime_context_volumes.py` 的 116 行）。
+  既有断言的改动只有 `/workspace` → `/home/user` 与「双别名 `fs_mounts`」这一批（`cwd` 断言、
+  `fs_mounts` 期望、`fs_mount` 声明顺序），没有别的语义改写。skip 与基线逐条相同。
+- **两条红是同一条用例**：`tests/contract/test_shared_volume_relative_cwd.py::test_volume_visible_from_both_workspace_aliases`
+  （A4 新增的「双别名」契约）。
+  - gate B：**pure 形态的形状口径**，不是 A4/A5 的产品回归。`tmp/a7-fix1-alias-shape-pair.log`
+    实测 pure 形态 `1 failed`（连跑两次都一样）/ chroot 形态 `2 passed`；逐步探针
+    `tmp/fix1-alias-probe.log`（`tmp/a7-fix1-alias-probe.py`）显示 pure 形态里 cwd 是**宿主**
+    workspace 路径、`/home/user` 不存在、`/workspace/<rel>` 也不是沙箱路径，而 pure 形态自己的
+    契约（工作区相对路径读写）仍然成立。原因是 `fs_mounts` 的两个别名只在 chroot 形态下是
+    沙箱内的虚拟路径（`_view_cwd` 仅在带 base image 时把 cwd 映射成 `/home/user`）。
+  - macOS：同一条用例 + macOS 没有 Landlock（`E2B_EXECUTOR=sandlock requires Landlock ABI >= 6`），
+    在该平台永远跑不了；它没进 macOS 那套 80 条能力型 skip 的口径，于是 `0 failed → 1 failed`。
+    同相的 `+34 passed` 与 gate A 同源（新增用例数），不是回归。
+  - **处置（评审：真缺陷停下报 NEEDS_CONTEXT，别改断言）**：没有改测试、没有加 skip/ignore、
+    没动产品代码。三条候选修法（限定 chroot 形态 / 让 pure 形态也暴露 `/home/user` /
+    把「双别名」文档口径按形状限定）逐条写在 `.superpowers/sdd/task-A7-report.md` §F1.3，等拍板。
+- **多节点 flake（非 A7 引入）**：fix round 的第一遍全量在生产形 lane 红了一条
+  `tests/sdk/python/test_multinode.py::test_create_routes_to_remote_worker`
+  （`instance is closed`，该遍耗时 647.98s、宿主负载 8.6→13.4；安静时同 lane 301–361s，
+  2936b20 自带证据 `tmp/a6fix1-nosa-gate.log` 是 `1088/3/0`）。单文件重复 3 次全绿
+  （`6 passed` ×3，`tmp/a7-multinode-repeat.log`），重跑全量 `1094/3/0`（`EXIT=0`）
+  ⇒ 负载型 flake，留档 `tmp/a7-nosa-flake-multinode.log`。
+
 ### 5. 遗留（都不是本次要解决的）
 
 - **线上升级未做**：现网 worker 仍是旧 wheel（无 route-B 语言面）+ 两个 worker 的 uid 段
@@ -98,6 +136,9 @@ A4 起用这枚 wheel 重建测试镜像）。A5/A6 是纯 E2B 侧改动，**不
 - **fork 的 3 个 commit 仍未 push**（连同 F17/F18 的 6 个）。
 - `tests/contract/test_volume_quota.py` 里那条**降级路径**用例在无 XFS 的 lane 进不来
   （整个文件被 deselect），仍需特权 lane 覆盖。
+- ⚠️ **A4 的「双别名」契约用例没有按形状/平台收口**（gate B 与 macOS 各红一条）：pure 形态
+  没有 `/home/user`、macOS 没有 Landlock ⇒ 该用例在这两相永远不可能通过。未改测试；
+  候选修法见 `.superpowers/sdd/task-A7-report.md` §F1.3，需决策。
 
 ## ⚡ F15（2026-09-08）：控制帧按声明归属描述符（`FRAME_VERSION` 1 → 2，终态 fork `3020ea0` / wheel `3020ea0` 产物）
 
