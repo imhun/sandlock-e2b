@@ -42,7 +42,9 @@ E2B（FastAPI envd + pytest 契约/单测）、Docker 门禁（`sandlock-dev:lat
 | 4 | SDK **要能看到**网关启动失败 ⇒ 落地错误上抛 | D1 |
 | 5 | **线上暂不升级**：等所有问题闭环 + 本地模拟测试全绿后再上 | C1–C3 挂起，见其入口条件 |
 | 7 | OCI 限流按**最快且测试正常**的口径：多源回落 + 测试用本地 registry 预置镜像为默认，digest 侧车仅在实测仍抖动时再加 | D2 |
-| 6 | SL-1 收口口径 —— **待你拍板**，全文见文末「附录：SL-1 现状与三种口径」 | B3 |
+| 6 | SL-1 走 **C-硬删**：删掉 `mediation_run_as=supervisor` 档，"中介必须是沙箱身份"成为唯一形态；不考虑推上游，安全性优先 | B3（已改写为硬删任务） |
+| 8 | 不做上游 PR：B4（fork push + PR 回复）取消 | — |
+| 9 | 全部计划执行完后跑**本地部署测试** | 新增 Track Z |
 
 ## 设计与证据（先读这段再动代码）
 
@@ -235,6 +237,37 @@ docker run --privileged --rm -v "$PWD/third_party/sandlock":/src -w /src \
 Expected: FAIL——`relative cat must exit 0`（stderr `cat: mnt/data/data.txt: Permission denied`）。
 输出存 `tmp/a1-red.log`。若它直接通过，说明 fork 已在别处修过——立刻停下同步，不要继续 A2。
 
+> **控制器更正（2026-09-10，A1 实测，已批准）**
+>
+> 1. **门禁命令必须带 `-e CARGO_HOME=/src/tmp/cargo-home`**（镜像默认 `/opt/cargo` 不可写，
+>    否则 `cargo test` 直接 `EXIT=101`）。本计划所有 `sandlock-dev:latest` 的
+>    `cargo test` 命令都按这条补。`scripts/test-all.sh` 自带该设置，不受影响。
+> 2. **Step 3/4 的形状达不到挂载平局**：`SandboxInstance::exec()` 传
+>    `ExecParams::default()`（`cwd: None`），子进程继承的是启动 cwd，而启动 cwd 由
+>    `context.rs` 的真实 `chdir` 落到 `<rootfs>/<cwd>`（chroot 根规则管辖，与挂载无关）
+>    ⇒ 该形状恒绿，**不能当 RED**。它保留为"修复后语义不回退"的守护用例。
+> 3. **真正的 cwd RED** 必须经过 `handle_chroot_chdir`，用 helper 的 `chdir` 子命令：
+>
+>    ```rust
+>    // 策略：/workspace 与 /home/user 同指一个宿主 workspace，两个都 fs_write
+>    let h = inst
+>        .exec(&["rootfs-helper", "chdir", "/workspace"], ExecStdio::Piped)
+>        .await
+>        .expect("chdir exec");
+>    let status = inst.wait_child(h.child_id).await.expect("wait");
+>    let stdout = h.stdout.expect("piped stdout");
+>    let mut out = Vec::new();
+>    std::fs::File::from(stdout).read_to_end(&mut out).expect("read");
+>    assert_eq!(status, ExitStatus::Code(0));
+>    assert_eq!(String::from_utf8_lossy(&out), "OK /workspace\n", "exact chdir report");
+>    ```
+>
+>    修复前实测 `OK /home/user\n`（`handle_chroot_chdir` 的反查平局取最后一个），修复后应为
+>    `OK /workspace\n`。
+> 4. **夹具加固（`test_instance_chroot.rs` 的 `temp_dir()`）**：除 `remove_dir_all` 外，目录名
+>    还要加进程内单调序号 `-{pid}-{seq}`——同一进程里 4 条用例并发，只加 `remove_dir_all`
+>    会让它们互删 `rootfs`，把 git-ignored 的 `tests/rootfs-helper` 清零进而全文件 `exit 127`。
+
 - [ ] **Step 3: 写第二条用例（cwd 身份）**
 
 ```rust
@@ -388,8 +421,10 @@ git -C third_party/sandlock commit -m "test(chroot): pin alias + sub-mount relat
 
 ```bash
 docker run --privileged --rm -v "$PWD/third_party/sandlock":/src -w /src sandlock-dev:latest \
+  -e CARGO_HOME=/src/tmp/cargo-home \
   sh -c 'cargo test -p sandlock-core --test integration test_relative_open_from_second_workspace_alias_resolves_the_submount -- --nocapture && \
          cargo test -p sandlock-core --test integration test_getcwd_reports_the_alias_the_policy_declared -- --nocapture && \
+         cargo test -p sandlock-core --test integration test_getcwd_reports_the_requested_alias_not_the_best_match -- --nocapture && \
          cargo test -p sandlock-core --lib chroot::resolve'
 ```
 
@@ -399,6 +434,7 @@ Expected: 两条 PASS + `host_to_virtual_tie_breaks_on_declaration_order` PASS�
 
 ```bash
 docker run --privileged --rm -v "$PWD/third_party/sandlock":/src -w /src sandlock-dev:latest \
+  -e CARGO_HOME=/src/tmp/cargo-home \
   sh -c 'cargo test -p sandlock-core --test integration chroot -- --nocapture'
 ```
 
@@ -464,6 +500,33 @@ Expected: verify 全绿（FFI 符号双向相等、RECORD 精确、supervise 三
   `SandboxExecutor(fs_mounts: dict[str, str])`。
 - Produces: 每个卷视图同时出现在两个别名下——`fs_mounts` 键集合 =
   `{f"/workspace/{rel}", f"/home/user/{rel}"}`（对每个 `rel`）。
+
+- [ ] **Step 0: 重建测试镜像（前置，否则跑的还是旧 fork）**
+
+`e2b-sandlock-test:latest` 在**构建期**把 `wheels/fork/*.whl` pip 装进镜像
+（`deploy/docker/Dockerfile.test-runner`），A3 换了 wheel 之后镜像必须重建，否则 E2B
+门禁跑的是 A2 之前的代码。
+
+```bash
+docker build -f deploy/docker/Dockerfile.test-runner -t e2b-sandlock-test:latest . 2>&1 | tee tmp/a4-image-build.log
+```
+
+重建后**必须核对镜像内的 `.so` 与 wheel 内的 `.so` 同源**（sha256 相等），并把两个值写进证据：
+
+```bash
+python3 - <<'PY'
+import hashlib, zipfile, pathlib
+whl = next(pathlib.Path("wheels/fork").glob("*x86_64*.whl"))
+with zipfile.ZipFile(whl) as z:
+    n = next(n for n in z.namelist() if n.endswith(".so"))
+    print("wheel", whl.name, hashlib.sha256(z.read(n)).hexdigest())
+PY
+docker run --rm --entrypoint sh e2b-sandlock-test:latest -c \
+  'sha256sum /usr/local/lib/python3.14/site-packages/sandlock/libsandlock_ffi*.so'
+```
+
+Expected: 两个 sha256 相等（2026-09-10 现状：镜像内 `0989bb55…` ≠ 新 wheel `efdd3264…`，
+即**确实需要重建**）。
 
 - [ ] **Step 1: 先写契约测试（红）**
 
@@ -772,44 +835,179 @@ Expected: 与上一基线逐项一致（±本次新增用例数）。
   子进程看不到主管控制端（护栏，非 bug 复现；实测当前无泄漏）。
 - [ ] **Step 3: `sh scripts/test-all.sh --supervise-root` 全绿；提交。**
 
-### Task B3：SL-1 / e2b-integration §3.1 口径收口（半天；按附录口径 A，
-### 若确认点 #6 选 B 则扩为「fork 修复 + wheel + 两轮全门禁」，约 3–5 天）
+### Task B3：SL-1 硬删 —— 取消 `mediation_run_as` 降级档（2–3 天）
 
-**Files:** `third_party/sandlock/docs/e2b-integration.md` §3.1、`docs/sandlock-upstream-issues.md`、
-`tests/security/test_template_isolation.py`（补 fail-closed 断言）
+**目标（决定 ⑥，用户拍板 2026-09-10）**：删掉 `MediationRunAs::Supervisor` 这一档，
+让"**需要路径中介时，中介身份必须就是沙箱身份**"成为唯一形态；不再保留任何降级逃生门，
+安全优先。不做墓碑档。
 
-- [ ] **Step 1: 按现状重写 §3.1**：route-B 槽位的路径中介 euid == 沙箱 host uid（属主不再
-  是 root）；进程内 + chroot + 非 0 uid 组合在 E2B 已被 fork 拒绝建箱（不再是可达面）。
-- [ ] **Step 2: 在 `docs/sandlock-upstream-issues.md` 标注 SL-1"E2B 可达面已关闭、fork 内部
-  语义保留"，避免两处口径漂移。**
-- [ ] **Step 3: 钉住 fail-closed**：新增断言——显式带 `mediation_run_as=supervisor`
-  的 chroot + 非 0 host uid 请求**必须被 fork 拒绝**（不是"允许但降级"），
-  即 E2B 侧不存在任何把它重新打开的路。
-- [ ] **Step 4: 只读核验"降级档已无下发路径"**：
+**Files（fork 侧）:**
+- Modify: `crates/sandlock-core/src/sandbox.rs`（删 enum 变体与文档；拒绝分支去 `match`）
+- Modify: `crates/sandlock-core/src/sandbox/builder.rs`（删 builder 方法）
+- Modify: `crates/sandlock-core/src/sandbox/tests.rs`（删/改档位断言）
+- Modify: `crates/sandlock-core/src/profile.rs`（删 TOML 键的解析/回写与 3 条用例）
+- Modify: `crates/sandlock-core/src/instance.rs`（`mediation_run_as` 的消费点）
+- Modify: `crates/sandlock-ffi/src/lib.rs`（删导出函数）+ `include/sandlock.h`（cbindgen 头）
+- Delete: `crates/sandlock-ffi/tests/mediation_run_as.rs`（改为"该符号不存在"的断言或整删）
+- Modify: `crates/sandlock-cli/src/main.rs`（删 `--mediation-run-as`）+ `cli_test.rs` / `profile_integration.rs`
+- Modify: `crates/sandlock-supervise/src/policy.rs`（wire 字段表去掉该字段）
+- Modify: `crates/sandlock-supervise/tests/mediation_2uid.rs`（C 档验收 **反转**：从"断言降级发生"改为"断言必须被拒"）
+- Modify: `crates/sandlock-core/tests/integration/test_mediation_identity.rs`、`test_instance_chroot.rs`
+- Modify: `python/src/sandlock/_sdk.py`、`python/src/sandlock/sandbox.py`、`python/tests/test_sandbox_config.py`
+- Modify: `docs/e2b-integration.md` §3.1/§2(P1/P2)、`docs/CHANGELOG.md`、`docs/test-baseline.md`、
+  `docs/fork-plan-followups.md`、`docs/supervise-identity-handoff.md`、`docs/upstream-pr-netns-free.md`
 
-```bash
-rg -n "mediation_run_as" envd_service/ tests/ | rg -v "supervise_policy_document|drop|测试"
+**Files（E2B 侧）:**
+- Modify: `envd_service/route_b.py`（`supervise_policy_document` 的 drop-guard 保留或简化为"该字段已不存在"）
+- Modify: `envd_service/executors/sandlock.py:708` 附近注释
+- Modify: `tests/unit/test_route_b_wiring.py`、`tests/unit/test_sandlock_executor_route_b.py`
+- Modify: `docs/production-deployment-requirements.md` §2.4（"删档的后果"段）、§2.4.1
+
+**Interfaces:**
+- Consumes: `mediation_remap_is_refused(mediator_euid, host_uid, mediation_active, privileged_remap_caps)`（保留不动）
+- Produces: `mediation_run_as` 字段在 builder/Policy/profile/FFI/CLI/Python/supervise wire 全线消失；
+  拒绝路径只剩一条（无 `match`），错误文本里不再出现 `supervisor` 这个出路。
+
+- [ ] **Step 1: RED —— 钉住"必须被拒"（先把两条测试写出来，确认红）**
+
+(a) `crates/sandlock-core/tests/integration/test_mediation_identity.rs`：
+
+```rust
+/// The privileged-mediator downgrade no longer exists. A root process that
+/// would mediate on behalf of a different host uid must be refused before
+/// fork, with the route-B remedy in the message and no `supervisor` escape.
+#[test]
+fn privileged_in_process_mediation_is_refused_with_route_b_remedy() {
+    let err = Sandbox::builder()
+        .chroot("/tmp")
+        .fs_read("/")
+        .user(21700, 21700)
+        .build()
+        .expect_err("root mediator + host uid 21700 + path mediation must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Run sandlock-supervise as uid 21700 (route B)"),
+        "refusal must name the route-B remedy verbatim, got: {msg}"
+    );
+    assert!(
+        !msg.contains("mediation_run_as=supervisor"),
+        "the removed downgrade tier must not be offered as a remedy, got: {msg}"
+    );
+}
 ```
 
-Expected: 只命中注释/单测；产出代码里没有任何一处设置该字段。
+(b) `crates/sandlock-core/tests/integration/test_instance_chroot.rs`：反向用例，
+**证明没有误伤**（`mediation_active` 前置条件必须保留）：
 
-- [ ] **Step 5: 同步 `CHANGELOG.md`；提交。**
-
-### Task B4：fork 本地提交推送 + PR 回复（30 分钟，**需授权**）
-
-- [ ] **Step 1: 待授权后推 `upstream-pr/netns-free-clean`**
-
-```bash
-git -C third_party/sandlock log --oneline origin/upstream-pr/netns-free-clean..HEAD
-git -C third_party/sandlock push origin upstream-pr/netns-free-clean
+```rust
+/// Once the identity rule is enforced, a *non-mediated* per-uid shape must
+/// still build: `mediation_active` is what gates the refusal, not RunAs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pure_per_uid_run_as_is_still_accepted() {
+    let base = temp_dir("pure-per-uid");
+    let ws = base.join("workspace");
+    std::fs::create_dir_all(&ws).expect("create workspace");
+    let policy = Sandbox::builder()
+        .fs_write(&ws)
+        .user(21700, 21700)
+        .build()
+        .expect("no chroot/COW/policy-fn => no mediation => RunAs stays legal");
+    let mut inst = SandboxInstance::launch_exec_only(policy)
+        .await
+        .expect("pure per-uid instance must still launch");
+    inst.shutdown().await.expect("shutdown");
+    cleanup(&base);
+}
 ```
 
-Expected: 6 个既有提交（F17 `e290059`/`f20d034`/`c0f7bf5`、F18 `03cd36b`/`9995e28`/`fb2e106`）
-+ 本计划新增提交全部推上。
+- [ ] **Step 2: 删档（fork 代码面）**
 
-- [ ] **Step 2: 回复 PR #34 / #35**（SL-10 闭口 + 客体内 root 的安全论证 + mknod 围栏 +
-  ptrace 前置）。
-- [ ] **Step 3: 更新 `docs/sandlock-upstream-issues.md` 的推送状态列。**
+1. `sandbox.rs`：`enum MediationRunAs` 整体删除（连同 `Display`/`FromStr`/serde），
+   `Sandbox.mediation_run_as` 字段、builder 字段、`mediation_run_as()` 方法与
+   `mediation_remap_is_refused` 分支里的 `match` 一并删除——保留 `Caller` 那一支的逻辑
+   （即"需要中介且身份不匹配 ⇒ 拒绝"），错误文本删掉
+   `or pass mediation_run_as=supervisor to explicitly accept the downgrade` 这半句。
+2. `builder.rs`/`instance.rs`/`profile.rs`：删字段与其序列化（`profile.rs:560` 那行三元判断整删）。
+3. `sandlock-ffi`：删 `sandlock_sandbox_builder_mediation_run_as` 导出函数；重跑 cbindgen 更新
+   `include/sandlock.h`；`ffi/tests/mediation_run_as.rs` 整文件删除并在 wheel verify 的符号基线里
+   登记 -1。
+4. `sandlock-cli`：删 `--mediation-run-as` 与其用例。
+5. `sandlock-supervise/src/policy.rs`：去掉该字段（wire 不再接受它；旧客户端发来会按
+   "unknown field refused by name" 拒绝）。
+6. Python：`_sdk.py` 拆掉 `_b_mediation_run_as` 绑定与 policy 字段、`sandbox.py` 删
+   `mediation_run_as: str = "caller"` 与其取值校验。
+
+- [ ] **Step 3: 反转 C 档验收（supervise 侧）**
+
+`crates/sandlock-supervise/tests/mediation_2uid.rs`：删掉"root 特权中介 + 显式 supervisor 档
+可用（属主错位、跨 uid 删除）"那组用例，替换为"**特权中介 + 需要中介 ⇒ 建箱前拒绝**"，
+断言逐字包含 route-B 修法且不含 `supervisor`。**保留 B 档**（两个不同 uid 的真槽位，
+内核级隔离证据）不动。
+
+- [ ] **Step 4: 全文面清场核验**
+
+```bash
+cd third_party/sandlock
+grep -rn 'mediation_run_as\|MediationRunAs\|mediation-run-as' crates/ python/ --include='*.rs' --include='*.py' --include='*.h' | grep -v '^target'
+```
+
+Expected: **无输出**（`tmp/`、`docs/`、`.superpowers/` 下的历史记录不算）。
+
+- [ ] **Step 5: 跑红/绿与全档**
+
+```bash
+chmod -R a+rwX third_party/sandlock/tmp
+docker run --privileged --rm -v "$PWD/third_party/sandlock":/src -w /src sandlock-dev:latest \
+  sh -c 'cargo test -p sandlock-core --test integration mediation_identity pure_per_uid -- --nocapture'
+docker run --privileged --rm -v "$PWD/third_party/sandlock":/src -w /src sandlock-dev:latest sh scripts/test-all.sh
+docker run --privileged --rm -v "$PWD/third_party/sandlock":/src -w /src --entrypoint bash sandlock-dev:latest -c 'sh scripts/test-all.sh --mediation-2uid'
+docker run --privileged --rm -v "$PWD/third_party/sandlock":/src -w /src --entrypoint bash sandlock-dev:latest -c 'sh scripts/test-all.sh --oci-root'
+docker run --privileged --rm -v "$PWD/third_party/sandlock":/src -w /src --entrypoint bash sandlock-dev:latest -c 'sh scripts/test-all.sh --supervise-root'
+```
+
+Expected: 全绿；`docs/test-baseline.md` 计数按删除的用例数下调并登记。
+
+- [ ] **Step 6: wheel 重建 + verify（ABI 变更）**
+
+```bash
+cd third_party/sandlock && sh python/build-wheels.sh && sh python/verify-wheel.sh
+cp wheels/*.whl /Users/polus/project/ai/sandlock-e2b/wheels/fork/
+```
+
+Expected: verify 全绿，且**导出符号计数比上一基线少 1**（`sandlock_sandbox_builder_mediation_run_as`）；
+manifest HEAD == fork HEAD。
+
+- [ ] **Step 7: E2B 侧清理与文档**
+
+- `envd_service/route_b.py`：`supervise_policy_document` 里对 `mediation_run_as` 的 drop
+  分支简化为注释说明"该字段已从 fork 删除；保留这一行是为了让旧 ceiling 不会把它带进 wire"，
+  或直接删除并同步两条单测。
+- `tests/unit/test_route_b_wiring.py` / `test_sandlock_executor_route_b.py`：把"字段被丢弃"
+  的断言改成"字段在 fork/ceiling 中都不存在"。
+- `docs/production-deployment-requirements.md` §2.4「删档的后果」段改写为终态：
+  **root worker + chroot ⇒ route B 是唯一路径**，并列出四条硬前置（wheel 带 supervise、
+  `E2B_ROUTE_B≠off`、`E2B_PER_SANDBOX_UID=true`、uid 段不重叠）。
+- `docs/sandlock-upstream-issues.md`：SL-1 标注为"**已由硬删关闭**（降级档不存在，
+  特权中介形态被 fail-closed 拒绝）"。
+
+- [ ] **Step 8: E2B 侧回归**
+
+```bash
+lane pytest tests/security/test_template_isolation.py tests/contract/test_route_b_executor.py \
+  tests/contract/test_route_b_slot_pool.py tests/unit/test_route_b_wiring.py \
+  tests/unit/test_sandlock_executor_route_b.py -q --tb=short
+```
+
+Expected: 全绿（含 `test_in_process_chroot_is_refused_without_a_slot`）。
+
+- [ ] **Step 9: 提交（fork + main 各一条）**
+
+```bash
+git -C third_party/sandlock add -A crates python docs
+git -C third_party/sandlock commit -m "feat(breaking)!: remove the privileged-mediator downgrade tier (SL-1)"
+git add third_party/sandlock envd_service tests docs
+git commit -m "chore(sandlock): bump to the no-downgrade wheel and drop the supervisor tier references"
+```
 
 ---
 
@@ -917,19 +1115,89 @@ Expected: 6 个既有提交（F17 `e290059`/`f20d034`/`c0f7bf5`、F18 `03cd36b`/
 
 ---
 
+## Track Z — 本地部署测试（全部计划完成后执行，决定 ⑨）
+
+> 入口条件：Track A / B / D 全部闭环，且 Track A 的无 SYS_ADMIN 门禁与常规三档已绿。
+> 目标是用**部署形态**（而非测试形态）验证结局：本地 compose 起控制面 + 网关 + worker，
+> 跑一遍真实 SDK 流程。
+
+### Task Z1：本地 compose 起栈（E1.2 的本地形态）
+
+**Files:** 无代码改动；产出 `tmp/z1-compose.log`、`tmp/z1-smoke.log`。
+
+- [ ] **Step 1: 构建镜像（本地 tag，不推 ACR）**
+
+```bash
+cd /Users/polus/project/ai/sandlock-e2b
+./deploy/scripts/build-images.sh 2>&1 | tee tmp/z1-build.log
+```
+
+- [ ] **Step 2: 起本地栈**
+
+```bash
+docker compose -f deploy/stack/docker-compose.prod.yml up -d 2>&1 | tee tmp/z1-compose.log
+docker compose -f deploy/stack/docker-compose.prod.yml ps
+```
+
+Expected: control-plane / gateway / worker 三个服务 healthy；worker 日志出现
+`route-B instance ready … host-uid=`，且**没有** `SYS_ADMIN` 相关 WARNING。
+
+- [ ] **Step 3: worker 自检**
+
+```bash
+./deploy/scripts/smoke-prod-worker.sh 2>&1 | tee tmp/z1-worker-smoke.log
+```
+
+### Task Z2：本地部署冒烟（SDK 端到端）
+
+- [ ] **Step 1: 跑部署冒烟脚本**
+
+```bash
+python deploy/scripts/deployment_smoke.py 2>&1 | tee tmp/z2-deploy-smoke.log
+python deploy/scripts/multinode_smoke.py 2>&1 | tee tmp/z2-multinode-smoke.log
+```
+
+Expected: 全绿。两条脚本使用真实 HTTP + 真实镜像 rootfs + 真实 route-B 槽位。
+
+- [ ] **Step 2: 关键路径手工复核（无 SYS_ADMIN 域）**
+
+用官方 SDK 跑一遍本地栈，逐项记录：
+
+```bash
+python - <<'PY' | tee tmp/z2-sdk-manual.log
+import os
+from e2b import Sandbox
+sbx = Sandbox.create(api_key="local-key", api_url=os.environ["E2B_API_URL"],
+                     template="base", timeout=300)
+print("cwd:", sbx.commands.run("pwd").stdout.strip())           # 期望 /home/user
+print("abs:", sbx.commands.run("echo hi > /home/user/a.txt && cat /home/user/a.txt").stdout.strip())
+vol = sbx.volumes.create("z2vol") if hasattr(sbx, "volumes") else None   # 无 API 时跳过
+sbx.kill()
+PY
+```
+
+Expected: `pwd` 输出 `/home/user`；写读回显 `hi`。
+
+- [ ] **Step 3: 收栈与清理**
+
+```bash
+docker compose -f deploy/stack/docker-compose.prod.yml down 2>&1 | tee -a tmp/z1-compose.log
+```
+
+---
+
 ## 确认状态
 
 已拍板（2026-09-10，见文首「已确认的决定」）：#1 规范别名 `/home/user`；#2 逻辑路径
 语义；#3 quota-agent；#4 SDK 要看到网关启动失败；#5 线上暂不升级（C1–C3 挂入口条件）；
-#7 OCI 走最快口径。
+#6 SL-1 走 **C-硬删**（降级档直接删除，不留逃生门）；#8 **不推上游**（B4 取消）；
+#9 全部完成后跑 **Track Z 本地部署测试**。
 
-**仍待确认：**
+**仍待确认（授权类，不是设计问题）：** C1–C3 上线窗口（决定 ⑤ 已明确"本地全绿后再谈"）、
+D3 的删除授权（`tmp/stale-20260902` + docker 侧回收）。在给出之前这些 Task 保持未开始。
 
-- **#6 SL-1 收口口径**（唯一未决项）：三种口径与代价见下方附录。默认按「口径 A
-  （E2B 可达面已关闭 + 文档收口）」执行；如果你要 fork 侧根治，则改按口径 B，
-B3 会从半天文档任务扩成「fork 修复 + wheel + 全门禁」。
-- **授权类（不是设计问题，随时可给）**：C1–C3 上线窗口、B4 的 fork push 与 PR 回复、
-D3 的删除授权。在给出之前这些 Task 保持未开始。
+> 附录「SL-1 现状与三种口径」保留作为背景资料；其结论已被决定 #6（C-硬删）取代，
+> 实现以 Task B3 为准。
 
 ---
 
