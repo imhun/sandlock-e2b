@@ -95,4 +95,28 @@ ENV E2B_TEST_STRICT_SKIPS=1
 COPY deploy/docker/entrypoint.test-runner.sh /usr/local/bin/entrypoint.test-runner.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.test-runner.sh"]
 
+# Track F (Task F1): the same two file-capability brokers the worker image
+# ships (see Dockerfile.envd for why they are compiled, why `setcap` has to run
+# in this stage, and why the directory is root-owned group 65534 mode 0710).
+# They are here so the unprivileged phase of deploy/scripts/test-prod-shaped.sh
+# -- uid 65534 with the four declared caps -- exercises the real non-root
+# shape instead of proving that file capabilities are unusable.
+COPY deploy/priv/ /tmp/priv/
+RUN cc -O2 -Wall -Wextra -o /tmp/priv/e2b-slot-spawn \
+        /tmp/priv/slot_spawn.c /tmp/priv/priv_common.c \
+    && cc -O2 -Wall -Wextra -o /tmp/priv/e2b-maint \
+        /tmp/priv/maint.c /tmp/priv/priv_common.c \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends libcap2-bin \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/e2b-priv \
+    && chown root:65534 /var/lib/e2b-priv \
+    && chmod 0710 /var/lib/e2b-priv \
+    && install -m 0750 -o root -g 65534 \
+        /tmp/priv/e2b-slot-spawn /tmp/priv/e2b-maint /var/lib/e2b-priv/ \
+    && setcap cap_setuid,cap_setgid+ep /var/lib/e2b-priv/e2b-slot-spawn \
+    && setcap cap_chown,cap_dac_override+ep /var/lib/e2b-priv/e2b-maint \
+    && rm -rf /tmp/priv \
+    && getcap /var/lib/e2b-priv/e2b-slot-spawn /var/lib/e2b-priv/e2b-maint
+
 CMD ["pytest", "tests/unit", "tests/contract"]

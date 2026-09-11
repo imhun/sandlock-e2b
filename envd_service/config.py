@@ -190,6 +190,18 @@ class Settings:
     per_sandbox_uid: bool = field(
         default_factory=lambda: _env_bool("E2B_PER_SANDBOX_UID", True)
     )
+    # Track F / Task F1: the two file-capability brokers
+    # (``/var/lib/e2b-priv/e2b-slot-spawn`` / ``e2b-maint``) let a worker that
+    # is *not* root perform the two privileged steps route B and E3.2 need --
+    # starting a slot at a pooled host uid and owning a tenant's 0700 tree.
+    # ``auto`` (default): use them when the worker is non-root and both are
+    # installed; a *half-installed* broker pair fails the worker's startup by
+    # name (a privileged broker must never be guessed at), while a worker with
+    # no brokers keeps the in-process E5.1 shape and says so once. ``off``:
+    # never use them (today's behaviour). A root worker ignores both.
+    priv_helpers: str = field(
+        default_factory=lambda: os.getenv("E2B_PRIV_HELPERS", "auto").lower()
+    )
     # Host uid pool range (10000+i by default, away from image uids like
     # 1000). Workers sharing one workspace must use disjoint ranges.
     uid_pool_start: int = field(

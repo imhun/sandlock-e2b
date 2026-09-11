@@ -1,0 +1,835 @@
+"""File-capability brokers for a **non-root** worker (Track F / Task F1).
+
+Why brokers at all: route B needs one ``sandlock-supervise`` per sandbox
+running *as that sandbox's own host uid*, and the management plane (workspace
+chown, orphan reconcile, deletes) needs to walk a tenant's ``0700`` tree. A
+worker that is uid 65534 can do neither -- ``CapEff`` is empty, so
+``setuid(X)`` is EPERM (``docs/superpowers/plans/...`` / the F1 probe report).
+User namespaces are not an option on the target hosts (the probe measured
+``newuidmap`` refusing every non-``SYS_ADMIN`` shape).
+
+So two **compiled** binaries carry the capability as a *file capability*
+(``setcap`` xattr, applied in the final image stage -- ``COPY --from`` does
+not preserve xattrs), live in ``/var/lib/e2b-priv`` (root-owned, mode 0700,
+outside every sandbox mount view) and do the privileged step themselves:
+
+* ``e2b-slot-spawn`` (``cap_setuid,cap_setgid+ep``) --
+  ``spawn --uid X --gid X -- <sandlock-supervise abs path> <args...>``:
+  ``setgroups([])`` → ``setgid(X)`` → ``setuid(X)`` → ``execve``. The program
+  is **pinned**: the broker only ever launches the wheel's ``sandlock-supervise``
+  absolute path with a uid from the configured pool, so it is not a general
+  "run this as uid X" primitive. The slot starts with ``CapEff=0`` because a
+  capability-carrying process loses permitted/effective on ``setuid`` and the
+  exec'd binary has no file capabilities of its own.
+* ``e2b-maint`` (``cap_chown,cap_dac_override+ep``) --
+  ``chown --uid X [--recursive] --path P`` / ``rm --path P`` /
+  ``walk --path P`` for paths that resolve under ``<workspace_base>/`` or
+  ``<shared_volume_root>/`` only (``realpath``, so ``..`` and symlinks cannot
+  escape).
+
+Both link one shared validator (``deploy/priv/priv_common.c``) so the pool
+range / root whitelist / argument shapes cannot drift apart.
+
+``E2B_PRIV_HELPERS``:
+
+* ``auto`` (default): a non-root worker that ships *both* brokers uses them --
+  which is what turns per-sandbox host uids and route-B slots on for the
+  production non-root shape. A broker pair that is present but incomplete
+  (one binary missing, capability stripped, reachable by a sandbox, or a
+  route-B scratch root the maintenance broker cannot reach) **fails closed**:
+  a half-installed privileged broker must be named, never guessed at. A
+  worker with no brokers at all keeps today's in-process (E5.1) shape and
+  says so once at startup.
+* ``off``: never use the brokers (today's behaviour everywhere). The escape
+  hatch for environments that cannot carry file capabilities.
+
+A root worker is untouched: root already has the capabilities, and route B
+keeps using its own privileged starter.
+"""
+
+from __future__ import annotations
+
+import os
+import stat
+import struct
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+
+#: Where the image installs the brokers. Deliberately **not** ``/usr/local``
+#: or ``/opt``: the pure shape's Landlock rules cover those prefixes, so a
+#: broker there would be reachable from a sandbox (which is exactly the
+#: threat model line "whoever can exec the broker gets its capability").
+#:
+#: The directory is root-owned with the **worker's gid** and mode 0710 (the
+#: binaries 0750): the worker (uid 65534, gid 65534) can traverse and exec
+#: them, while a sandbox uid (a pool uid, never 65534) cannot -- DAC, not
+#: Landlock, is what makes it unreachable, so the guarantee holds in every
+#: sandbox shape. A plain 0700 root-owned directory cannot be used here: it is
+#: also unexecutable by the non-root worker itself (measured in
+#: ``tmp/f1/f1-stage1.log``), which would make the whole broker route dead.
+DEFAULT_HELPER_DIR = Path("/var/lib/e2b-priv")
+SLOT_SPAWN_NAME = "e2b-slot-spawn"
+MAINT_NAME = "e2b-maint"
+HELPER_DIR_MODE = 0o710
+HELPER_FILE_MODE = 0o750
+
+# capability(7) numbers, as bit positions in a capability mask.
+CAP_CHOWN = 0
+CAP_DAC_OVERRIDE = 1
+CAP_SETGID = 6
+CAP_SETUID = 7
+
+_CAP_NAMES = {
+    CAP_CHOWN: "CAP_CHOWN",
+    CAP_DAC_OVERRIDE: "CAP_DAC_OVERRIDE",
+    2: "CAP_DAC_READ_SEARCH",
+    3: "CAP_FOWNER",
+    4: "CAP_FSETID",
+    5: "CAP_KILL",
+    CAP_SETGID: "CAP_SETGID",
+    CAP_SETUID: "CAP_SETUID",
+    8: "CAP_SETPCAP",
+    9: "CAP_LINUX_IMMUTABLE",
+    10: "CAP_NET_BIND_SERVICE",
+    11: "CAP_NET_BROADCAST",
+    12: "CAP_NET_ADMIN",
+    13: "CAP_NET_RAW",
+    14: "CAP_IPC_LOCK",
+    15: "CAP_IPC_OWNER",
+    16: "CAP_SYS_MODULE",
+    17: "CAP_SYS_RAWIO",
+    18: "CAP_SYS_CHROOT",
+    19: "CAP_SYS_PTRACE",
+    20: "CAP_SYS_PACCT",
+    21: "CAP_SYS_ADMIN",
+    22: "CAP_SYS_BOOT",
+    23: "CAP_SYS_NICE",
+    24: "CAP_SYS_RESOURCE",
+    25: "CAP_SYS_TIME",
+    26: "CAP_SYS_TTY_CONFIG",
+    27: "CAP_MKNOD",
+    28: "CAP_LEASE",
+    29: "CAP_AUDIT_WRITE",
+    30: "CAP_AUDIT_CONTROL",
+    31: "CAP_SETFCAP",
+    32: "CAP_MAC_OVERRIDE",
+    33: "CAP_MAC_ADMIN",
+    34: "CAP_SYSLOG",
+    35: "CAP_WAKE_ALARM",
+    36: "CAP_BLOCK_SUSPEND",
+    37: "CAP_AUDIT_READ",
+    38: "CAP_PERFMON",
+    39: "CAP_BPF",
+    40: "CAP_CHECKPOINT_RESTORE",
+}
+
+CAP_SETUID_MASK = 1 << CAP_SETUID
+CAP_SETGID_MASK = 1 << CAP_SETGID
+CAP_CHOWN_MASK = 1 << CAP_CHOWN
+CAP_DAC_OVERRIDE_MASK = 1 << CAP_DAC_OVERRIDE
+
+SLOT_SPAWN_CAPS = frozenset({"CAP_SETUID", "CAP_SETGID"})
+MAINT_CAPS = frozenset({"CAP_CHOWN", "CAP_DAC_OVERRIDE"})
+
+#: ``setcap`` hint per broker, quoted in the self-check failure.
+_SETCAP_HINT = {
+    SLOT_SPAWN_NAME: "cap_setuid,cap_setgid+ep",
+    MAINT_NAME: "cap_chown,cap_dac_override+ep",
+}
+
+#: xattr revision 2 (``VFS_CAP_REVISION_2``) with the all-or-nothing
+#: effective flag (``VFS_CAP_FLAGS_EFFECTIVE``).
+_VFS_CAP_REVISION_1 = 0x01000000
+_VFS_CAP_REVISION_2 = 0x02000000
+_VFS_CAP_REVISION_3 = 0x03000000
+_VFS_CAP_FLAGS_EFFECTIVE = 0x000001
+_VFS_CAP_REVISION_MASK = 0xFF000000
+_VFS_CAP_FLAGS_MASK = ~_VFS_CAP_REVISION_MASK & 0xFFFFFFFF
+
+
+class PrivHelperError(RuntimeError):
+    """A broker request (or the broker self-check) the worker must refuse."""
+
+
+@dataclass(frozen=True)
+class WalkEntry:
+    """One line of ``e2b-maint walk`` output."""
+
+    kind: str
+    uid: int
+    gid: int
+    mode: int
+    size: int
+    path: str
+
+    @classmethod
+    def parse(cls, line: str) -> "WalkEntry":
+        kind, uid, gid, mode, size, path = line.split(" ", 5)
+        return cls(
+            kind=kind,
+            uid=int(uid),
+            gid=int(gid),
+            mode=int(mode, 8),
+            size=int(size),
+            path=path,
+        )
+
+
+@dataclass(frozen=True)
+class FileCapabilities:
+    """The ``security.capability`` xattr, decoded.
+
+    ``effective`` is the *effective mask* (``permitted`` when the on-exec
+    effective flag is set, else 0) -- not the flag itself.
+    """
+
+    permitted: int
+    inheritable: int = 0
+    effective: int = 0
+
+
+def decode_file_capabilities(raw: bytes) -> FileCapabilities:
+    """Decode a raw ``security.capability`` value (rev 1/2/3)."""
+    if len(raw) < 4:
+        raise PrivHelperError(f"security.capability xattr is truncated: {raw!r}")
+    (magic_etc,) = struct.unpack_from("<I", raw, 0)
+    revision = magic_etc & _VFS_CAP_REVISION_MASK
+    flags = magic_etc & _VFS_CAP_FLAGS_MASK
+    if revision == _VFS_CAP_REVISION_1:
+        words = 1
+    elif revision in (_VFS_CAP_REVISION_2, _VFS_CAP_REVISION_3):
+        words = 2
+    else:
+        raise PrivHelperError(
+            f"unsupported security.capability revision 0x{revision:08x}"
+        )
+    expected = 4 + 8 * words + (4 if revision == _VFS_CAP_REVISION_3 else 0)
+    if len(raw) != expected:
+        raise PrivHelperError(
+            f"security.capability xattr has {len(raw)} bytes, expected {expected}"
+        )
+    permitted = 0
+    inheritable = 0
+    for index in range(words):
+        per, inh = struct.unpack_from("<II", raw, 4 + index * 8)
+        permitted |= per << (32 * index)
+        inheritable |= inh << (32 * index)
+    effective = permitted if flags & _VFS_CAP_FLAGS_EFFECTIVE else 0
+    return FileCapabilities(
+        permitted=permitted, inheritable=inheritable, effective=effective
+    )
+
+
+def encode_file_capabilities(
+    *, permitted: int, effective: int = 0, inheritable: int = 0
+) -> bytes:
+    """Build a rev-2 ``security.capability`` value (tests + image tooling).
+
+    The kernel's effective set is all-or-nothing, so ``effective`` only
+    decides the flag; ``effective`` bits outside ``permitted`` are ignored
+    the same way the kernel ignores them.
+    """
+    flags = _VFS_CAP_FLAGS_EFFECTIVE if effective else 0
+    out = struct.pack("<I", _VFS_CAP_REVISION_2 | flags)
+    for index in range(2):
+        out += struct.pack(
+            "<II",
+            (permitted >> (32 * index)) & 0xFFFFFFFF,
+            (inheritable >> (32 * index)) & 0xFFFFFFFF,
+        )
+    return out
+
+
+def capability_names(mask: int) -> frozenset[str]:
+    """The ``CAP_*`` names present in a capability mask."""
+    return frozenset(
+        name for bit, name in _CAP_NAMES.items() if mask >> bit & 1
+    )
+
+
+def read_file_capabilities(path: Path) -> FileCapabilities:
+    """Read the file-capability xattr of ``path``.
+
+    Raises :class:`PrivHelperError` when there is none -- an unmarked broker
+    is exactly the "the image build lost the xattr" defect the self-check
+    exists for.
+    """
+    try:
+        raw = os.getxattr(path, "security.capability")
+    except OSError as exc:
+        raise PrivHelperError(
+            f"{path} has no security.capability xattr ({exc.strerror})"
+        ) from exc
+    return decode_file_capabilities(raw)
+
+
+@dataclass
+class PrivHelpers:
+    """The two brokers plus everything the worker validates against."""
+
+    slot_spawn: Path
+    maint: Path
+    supervise_bin: Path
+    uid_pool_start: int
+    uid_pool_size: int
+    workspace_base: Path
+    shared_volume_root: Path | None = None
+
+    def __post_init__(self) -> None:
+        self.slot_spawn = Path(self.slot_spawn)
+        self.maint = Path(self.maint)
+        self.supervise_bin = Path(self.supervise_bin)
+        self.workspace_base = Path(self.workspace_base)
+        if self.shared_volume_root is not None:
+            self.shared_volume_root = Path(self.shared_volume_root)
+        if not self.supervise_bin.is_absolute():
+            raise PrivHelperError(
+                "the route-B supervise binary must be an absolute path "
+                f"(got {str(self.supervise_bin)!r})"
+            )
+        if self.uid_pool_size < 1:
+            raise PrivHelperError(
+                f"the privileged helper uid pool needs a positive size "
+                f"(got {self.uid_pool_size})"
+            )
+
+    # ------------------------------------------------------------- ranges
+
+    @property
+    def uid_end(self) -> int:
+        return self.uid_pool_start + self.uid_pool_size - 1
+
+    def validate_uid(self, uid: int) -> int:
+        """The broker's uid-pool gate (mirrored by ``priv_common.c``)."""
+        if not isinstance(uid, int) or isinstance(uid, bool):
+            raise PrivHelperError(f"uid {uid!r} is not an integer")
+        if uid < self.uid_pool_start or uid > self.uid_end:
+            raise PrivHelperError(
+                f"uid {uid} is outside the privileged helper uid pool "
+                f"{self.uid_pool_start}..{self.uid_end}"
+            )
+        return uid
+
+    # -------------------------------------------------------------- paths
+
+    def _root_paths(self) -> tuple[Path, ...]:
+        roots = [self.workspace_base]
+        if self.shared_volume_root is not None:
+            roots.append(self.shared_volume_root)
+        return tuple(roots)
+
+    @property
+    def roots_text(self) -> str:
+        return ", ".join(str(p) for p in self._root_paths())
+
+    def resolve_path(self, path: str | Path, *, strict: bool = False) -> Path:
+        """``realpath`` + containment, exactly what ``priv_common.c`` does.
+
+        The *raw* path is what the error names (it is what the caller asked
+        for); the *resolved* path is what is returned. ``strict`` additionally
+        refuses the roots themselves -- delete/chown must never target a whole
+        managed root.
+        """
+        resolved = Path(os.path.realpath(Path(path)))
+        for root in self._root_paths():
+            root_resolved = Path(os.path.realpath(root))
+            if resolved == root_resolved and not strict:
+                return resolved
+            if root_resolved in resolved.parents:
+                return resolved
+        raise PrivHelperError(
+            f"path {path} is outside the privileged helper roots "
+            f"({self.roots_text})"
+        )
+
+    # ------------------------------------------------------------ argv[0]
+
+    def validate_spawn_program(self, program: str | Path) -> str:
+        """``spawn`` launches the pinned supervise binary and nothing else."""
+        if str(program) != str(self.supervise_bin):
+            raise PrivHelperError(
+                "the spawned program must be the absolute path "
+                f"{self.supervise_bin} (got {str(program)!r}): "
+                "e2b-slot-spawn is not a general run-as-uid-X launcher"
+            )
+        return str(self.supervise_bin)
+
+    # -------------------------------------------------------------- argv
+
+    def subprocess_env(self) -> dict[str, str]:
+        """Environment the brokers read their policy from.
+
+        Passed explicitly (not inherited) so the broker's pool range and root
+        whitelist are the worker's own values by construction.
+        """
+        env = {
+            "E2B_UID_POOL_START": str(self.uid_pool_start),
+            "E2B_UID_POOL_SIZE": str(self.uid_pool_size),
+            "E2B_WORKSPACE_BASE": str(self.workspace_base),
+            "E2B_SUPERVISE_BIN": str(self.supervise_bin),
+            "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        }
+        if self.shared_volume_root is not None:
+            env["E2B_SHARED_VOLUME_ROOT"] = str(self.shared_volume_root)
+        return env
+
+    def spawn_argv(
+        self,
+        *,
+        uid: int,
+        gid: int | None = None,
+        supervise_args: Sequence[str] = (),
+    ) -> list[str]:
+        self.validate_uid(uid)
+        gid = uid if gid is None else gid
+        if gid != uid:
+            raise PrivHelperError(
+                f"e2b-slot-spawn starts one host identity: uid {uid} and "
+                f"gid {gid} must match"
+            )
+        self.validate_spawn_program(self.supervise_bin)
+        return [
+            str(self.slot_spawn),
+            "spawn",
+            "--uid",
+            str(uid),
+            "--gid",
+            str(gid),
+            "--",
+            str(self.supervise_bin),
+            *[str(a) for a in supervise_args],
+        ]
+
+    def chown_argv(
+        self, *, uid: int, path: str | Path, recursive: bool = False
+    ) -> list[str]:
+        self.validate_uid(uid)
+        self.resolve_path(path, strict=True)
+        argv = [
+            str(self.maint),
+            "chown",
+            "--uid",
+            str(uid),
+            "--gid",
+            str(uid),
+        ]
+        if recursive:
+            argv.append("--recursive")
+        argv += ["--path", str(path)]
+        return argv
+
+    def chown_worker_argv(
+        self,
+        *,
+        path: str | Path,
+        recursive: bool = False,
+        gid: int | None = None,
+    ) -> list[str]:
+        """Hand a reclaimed orphan back to the worker's own identity.
+
+        ``--worker`` (not ``--uid <worker uid>``): the broker chowns to *its
+        own* uid/gid, so the request can never name root and needs no
+        knowledge of the deployment's uid. An explicit ``gid`` scopes the
+        *group* to a pooled uid instead (the slot documents are
+        "worker-writable, readable by that one slot"); it gets the same pool
+        gate a ``--uid`` would.
+        """
+        self.resolve_path(path, strict=True)
+        argv = [str(self.maint), "chown", "--worker"]
+        if gid is not None:
+            self.validate_uid(gid)
+            argv += ["--gid", str(gid)]
+        if recursive:
+            argv.append("--recursive")
+        argv += ["--path", str(path)]
+        return argv
+
+    def rm_argv(self, *, path: str | Path) -> list[str]:
+        self.resolve_path(path, strict=True)
+        return [str(self.maint), "rm", "--path", str(path)]
+
+    def walk_argv(self, *, path: str | Path) -> list[str]:
+        self.resolve_path(path)
+        return [str(self.maint), "walk", "--path", str(path)]
+
+    # --------------------------------------------------------- operations
+
+    def _run(self, argv: list[str], *, what: str) -> str:
+        proc = subprocess.run(
+            argv,
+            env=self.subprocess_env(),
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            raise PrivHelperError(
+                f"{what} refused by {Path(argv[0]).name} "
+                f"(exit {proc.returncode}): {detail}"
+            )
+        return proc.stdout or ""
+
+    def chown(self, *, uid: int, path: str | Path, recursive: bool = False) -> None:
+        self._run(
+            self.chown_argv(uid=uid, path=path, recursive=recursive),
+            what=f"chown {path} to uid {uid}",
+        )
+
+    def chown_worker(
+        self,
+        *,
+        path: str | Path,
+        recursive: bool = False,
+        gid: int | None = None,
+    ) -> None:
+        self._run(
+            self.chown_worker_argv(path=path, recursive=recursive, gid=gid),
+            what=f"reclaim {path} to the worker identity",
+        )
+
+    def remove(self, path: str | Path) -> None:
+        self._run(self.rm_argv(path=path), what=f"remove {path}")
+
+    def walk(self, path: str | Path) -> list["WalkEntry"]:
+        """Every entry under ``path`` (size/owner metadata included)."""
+        out = self._run(self.walk_argv(path=path), what=f"walk {path}")
+        entries: list[WalkEntry] = []
+        for line in out.splitlines():
+            if not line:
+                continue
+            entries.append(WalkEntry.parse(line))
+        return entries
+
+    def dir_size(self, path: str | Path) -> int:
+        """Regular-file bytes under ``path`` (the ``/metrics`` disk number)."""
+        return sum(
+            entry.size for entry in self.walk(path) if entry.kind == "f"
+        )
+
+    def slot_spawner(
+        self,
+        *,
+        uid: int,
+        policy_path: Path,
+        program_path: Path,
+        name: str,
+        token: str,
+        worker_uid: int,
+        control_fd: int | None = None,
+    ) -> subprocess.Popen:
+        """The ``W1SlotPool`` spawner: a slot started through the broker.
+
+        Same shape as :func:`envd_service.route_b._spawn_slot` (the root
+        worker's ``setpriv`` form) -- the two differ only in *who* performs
+        ``setuid``: here it is the broker, because this worker is not root.
+        """
+        env = self.subprocess_env()
+        supervise_args = ["--policy", str(policy_path), "--uid", str(uid)]
+        if control_fd is not None:
+            supervise_args += [
+                "--control-fd",
+                str(control_fd),
+                "--serve",
+                "--program",
+                str(program_path),
+            ]
+            argv = self.spawn_argv(uid=uid, supervise_args=supervise_args)
+            return subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=env,
+                pass_fds=(control_fd,),
+            )
+        supervise_args += [
+            "--serve-path",
+            name,
+            "--token",
+            token,
+            "--peer-uid",
+            str(worker_uid),
+            "--program",
+            str(program_path),
+        ]
+        argv = self.spawn_argv(uid=uid, supervise_args=supervise_args)
+        return subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+
+
+# --------------------------------------------------------------- self-check
+
+
+def _active() -> PrivHelpers | None:
+    return _ACTIVE[0]
+
+
+_ACTIVE: list[PrivHelpers | None] = [None]
+
+
+def configure_priv_helpers(settings) -> PrivHelpers | None:
+    """Resolve + install the singleton the worker wires itself to."""
+    helpers = resolve_priv_helpers(settings)
+    _ACTIVE[0] = helpers
+    return helpers
+
+
+def active_helpers() -> PrivHelpers | None:
+    """The brokers this worker resolved at startup (``None`` = in-process)."""
+    return _active()
+
+
+def _require_active(what: str) -> PrivHelpers:
+    helpers = _active()
+    if helpers is None:
+        raise PrivHelperError(
+            f"{what} needs the file-capability brokers, but this worker "
+            "resolved none (E2B_PRIV_HELPERS=off, a root worker, or no "
+            "brokers installed)"
+        )
+    return helpers
+
+
+def broker_chown(uid: int, path: str | Path, *, recursive: bool = True) -> None:
+    """Chown a managed tree to a pooled uid (raises when no brokers)."""
+    _require_active(f"chown {path} to uid {uid}").chown(
+        uid=uid, path=path, recursive=recursive
+    )
+
+
+def broker_reclaim(
+    path: str | Path, *, recursive: bool = True, gid: int | None = None
+) -> None:
+    """Hand a reclaimed orphan back to the worker's own identity."""
+    _require_active(f"reclaim {path}").chown_worker(
+        path=path, recursive=recursive, gid=gid
+    )
+
+
+def broker_remove(path: str | Path) -> None:
+    _require_active(f"remove {path}").remove(path)
+
+
+def broker_dir_size(path: str | Path) -> int:
+    return _require_active(f"walk {path}").dir_size(path)
+
+
+def helpers_cover(path: str | Path) -> bool:
+    """Whether the active brokers' whitelist contains ``path``."""
+    helpers = _active()
+    if helpers is None:
+        return False
+    try:
+        helpers.resolve_path(path)
+    except PrivHelperError:
+        return False
+    return True
+
+
+def remove_tree(path: str | Path, *, on_error: str = "ignore") -> None:
+    """``shutil.rmtree`` for managed trees, through the broker when possible.
+
+    A path outside the broker whitelist (``_snapshots``/``_migrate`` scratch
+    roots) falls back to ``shutil.rmtree``: those trees are the worker's own,
+    so the worker identity can already delete them.
+    """
+    import shutil
+
+    if helpers_cover(path):
+        broker_remove(path)
+        return
+    shutil.rmtree(path, ignore_errors=on_error == "ignore")
+
+
+def dir_size(path: str | Path) -> int | None:
+    """File bytes under ``path`` for ``/metrics``; ``None`` means "no broker".
+
+    The walk descends into a tenant's ``0700`` workspace, which only
+    ``CAP_DAC_OVERRIDE`` opens -- an in-process walk would silently report 0.
+    """
+    if not helpers_cover(path):
+        return None
+    return broker_dir_size(path)
+
+
+def helpers_unavailable_reason(settings) -> str | None:
+    """Why a non-root worker is *not* using the broker shape, or ``None``.
+
+    Only the "no brokers at all" case: a *partial* install is a deployment
+    defect and fails closed in :func:`resolve_priv_helpers` instead.
+    """
+    mode = str(getattr(settings, "priv_helpers", "auto") or "auto").lower()
+    if mode == "off" or os.geteuid() == 0:
+        return None
+    slot = DEFAULT_HELPER_DIR / SLOT_SPAWN_NAME
+    maint = DEFAULT_HELPER_DIR / MAINT_NAME
+    if slot.exists() or maint.exists():
+        return None
+    return (
+        f"E2B_PRIV_HELPERS=auto on a non-root worker, but {slot} is missing: "
+        "this worker keeps the in-process (E5.1) shape; ship the "
+        "file-capability brokers to get per-sandbox host uids and route-B slots"
+    )
+
+
+def resolve_priv_helpers(settings) -> PrivHelpers | None:
+    """The startup self-check (fail closed on a half-installed broker pair).
+
+    ``None`` means "use the in-process shape": the mode is ``off``, the worker
+    is root, or no brokers are installed at all (named by
+    :func:`helpers_unavailable_reason`).
+    """
+    mode = str(getattr(settings, "priv_helpers", "auto") or "auto").lower()
+    if mode not in ("auto", "off"):
+        raise PrivHelperError(
+            f"E2B_PRIV_HELPERS must be 'auto' or 'off' (got {mode!r})"
+        )
+    if mode == "off" or os.geteuid() == 0:
+        return None
+    slot = DEFAULT_HELPER_DIR / SLOT_SPAWN_NAME
+    maint = DEFAULT_HELPER_DIR / MAINT_NAME
+    slot_present = slot.exists()
+    maint_present = maint.exists()
+    if not slot_present and not maint_present:
+        return None
+    if slot_present != maint_present:
+        present = slot if slot_present else maint
+        missing = maint if slot_present else slot
+        raise PrivHelperError(
+            f"{missing} is missing while {present} is present: a partial "
+            "broker install must not be guessed at"
+        )
+    _require_unreachable(slot, maint)
+    _require_caps(slot, SLOT_SPAWN_CAPS)
+    _require_caps(maint, MAINT_CAPS)
+    _require_consistent_shape(settings)
+    helpers = PrivHelpers(
+        slot_spawn=slot,
+        maint=maint,
+        supervise_bin=_supervise_bin(),
+        uid_pool_start=int(getattr(settings, "uid_pool_start", 10000)),
+        uid_pool_size=int(getattr(settings, "uid_pool_size", 1000)),
+        workspace_base=Path(getattr(settings, "workspace_base")),
+        shared_volume_root=(
+            Path(settings.shared_volume_root)
+            if getattr(settings, "shared_volume_root", None)
+            else None
+        ),
+    )
+    _require_route_b_scratch_root(helpers, settings)
+    return helpers
+
+
+def _require_consistent_shape(settings) -> None:
+    """The broker shape only works as per-sandbox uids **plus** route B.
+
+    Two mechanical reasons, both measured:
+
+    * without a pooled uid the sandbox would run as the worker's own identity
+      -- the same gid that may exec ``e2b-slot-spawn`` (whoever can exec it
+      holds ``cap_setuid``), so the broker would hand a sandbox the ability to
+      become any other tenant;
+    * without route B the sandbox would have to be remapped in-process, which
+      is precisely what a non-root worker cannot do (the single-entry userns
+      maps only its own euid, S1.2) -- the create would fail at
+      ``sandlock_create`` instead of at startup with a reason.
+    """
+    if not bool(getattr(settings, "per_sandbox_uid", True)):
+        raise PrivHelperError(
+            "E2B_PRIV_HELPERS needs E2B_PER_SANDBOX_UID: without a pooled "
+            "sandbox uid the sandbox would run as the worker's own identity, "
+            "which is exactly the gid that can exec the brokers (whoever can "
+            "exec e2b-slot-spawn holds cap_setuid)"
+        )
+    if str(getattr(settings, "route_b", "auto")).lower() == "off":
+        raise PrivHelperError(
+            "E2B_PRIV_HELPERS needs E2B_ROUTE_B != off: a non-root worker "
+            "cannot remap a sandbox in-process (S1.2), so the broker-started "
+            "slot is the only way to run as the pooled host uid"
+        )
+
+
+def _supervise_bin() -> Path:
+    from envd_service.route_b import default_supervise_bin
+
+    return default_supervise_bin()
+
+
+def _require_unreachable(slot: Path, maint: Path) -> None:
+    """Root-owned + worker-group: the worker can exec, no sandbox uid can.
+
+    ``mode 0710 / owner root / group <worker gid>``: a sandbox uid is a pool
+    uid (10000+), never a member of the worker's gid, so it cannot traverse
+    the directory or exec the binaries -- in every sandbox shape, unlike a
+    Landlock-prefix argument (a pure-shape sandbox reads most of the
+    filesystem outside the denied carve-outs).
+
+    The check is on the *bits* (owner root, no access for "other") plus an
+    access probe, not on "group == this process's gid": the worker may hold
+    the gid as a supplementary group, and a unit test that simulates a
+    non-root worker must not have to fake its gid too.
+    """
+    for path in (slot.parent, slot, maint):
+        expected_mode = HELPER_DIR_MODE if path.is_dir() else HELPER_FILE_MODE
+        try:
+            st = path.stat()
+        except OSError as exc:
+            raise PrivHelperError(f"cannot stat the broker path {path}: {exc}") from exc
+        mode = stat.S_IMODE(st.st_mode)
+        if st.st_uid != 0 or mode != expected_mode:
+            raise PrivHelperError(
+                f"{path} must be root-owned mode {expected_mode:04o} so the "
+                "worker can exec the brokers while no sandbox uid can: got "
+                f"owner {st.st_uid}, group {st.st_gid}, mode {mode:04o}"
+            )
+    if not os.access(slot.parent, os.X_OK) or not os.access(slot, os.X_OK):
+        raise PrivHelperError(
+            f"{slot.parent} / {slot.name} are not executable by this worker: "
+            "the brokers must be reachable by the worker's own group at mode "
+            f"{HELPER_DIR_MODE:04o}/{HELPER_FILE_MODE:04o} (a plain 0700 "
+            "root-owned directory is unexecutable for uid 65534)"
+        )
+
+
+def _require_caps(path: Path, required: Iterable[str]) -> None:
+    caps = read_file_capabilities(path)
+    found = capability_names(caps.permitted)
+    missing = sorted(set(required) - found)
+    if missing:
+        raise PrivHelperError(
+            f"{path} is missing the file capabilities {missing} "
+            f"(found {sorted(found)}): run "
+            f"`setcap {_SETCAP_HINT.get(path.name, '')}` in the final image "
+            "stage (`COPY --from` does not preserve the xattr)"
+        )
+
+
+def _require_route_b_scratch_root(helpers: PrivHelpers, settings) -> None:
+    """The slot's policy/program documents must be scoped through the broker.
+
+    ``W1SlotPool`` writes the slot's ``policy.json``/``program.json`` under
+    ``E2B_ROUTE_B_TMP_ROOT`` and scopes them to the slot's gid (``0440
+    root:<uid>``). A non-root worker can only do that through ``e2b-maint``,
+    and the broker touches whitelisted roots only -- elsewhere the policy
+    (which carries egress-proxy credentials) would fall back to world-readable
+    ``0444``. Refuse the shape by name instead of shipping that leak.
+    """
+    if str(getattr(settings, "route_b", "auto")).lower() == "off":
+        return
+    tmp_root = Path(getattr(settings, "route_b_tmp_root", "/tmp/sandlock-route-b"))
+    try:
+        helpers.resolve_path(tmp_root)
+    except PrivHelperError:
+        raise PrivHelperError(
+            f"route-B scratch root {tmp_root} is outside the privileged "
+            f"helper roots ({helpers.roots_text}): the slot documents are "
+            "group-scoped to the slot uid through e2b-maint, so point "
+            "E2B_ROUTE_B_TMP_ROOT at the workspace base"
+        ) from None
