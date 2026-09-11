@@ -206,7 +206,7 @@ rootfs chroot / SOCKS5 出口，与 compose 部署一致）：
 | `E2B_WORKSPACE_BASE` | `tmp/sandboxes` | 沙箱工作目录 |
 | `E2B_BASE_IMAGE` | 未配置 | `base` 模板基础镜像；配置后启用镜像 rootfs |
 | `E2B_TEMPLATE_IMAGES` | `{}` | 模板 ID → 基础镜像 JSON 映射 |
-| `E2B_EXECUTOR` | `auto` | `auto`/`local`/`sandlock` |
+| `E2B_EXECUTOR` | `auto` | `auto`/`local`/`sandlock`；`auto` 只对**不存在**的 sandlock 包回落 `local`，包在但坏（版本不匹配/缺符号）一律 fail closed（B1 fix round 2） |
 | `E2B_MAX_TOTAL_*` | 见 spec | 宿主总资源上限，`0` 表示关闭该维度 |
 
 ## 与 spec 的两处事实性偏差

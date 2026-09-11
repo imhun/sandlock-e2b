@@ -330,8 +330,10 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   `sandlock_instance_launch_with_err`），Python 面抛
   `RuntimeError("sandlock_create failed: <core 文本>")`，点名 `route B` 与 host uid；
   评审补的两条与运维相关：新 SDK 配旧 `.so` 会**点名报错**（不再是 `AttributeError`
-  被吞成「sandlock 不可用」而静默去掉约束），`E2B_EXECUTOR=sandlock` 遇上「装了但坏」
-  直接 raise、auto 档打 ERROR 后再回落。上面那条 disclosure 保留作第二道说明。
+  被吞成「sandlock 不可用」而静默去掉约束）；**fix round 2**：`auto` 与 `sandlock` 遇上
+  「装了但坏」一律 fail closed（抛带原因的 `RuntimeError`，建箱失败），只有「包不存在」
+  才允许 `auto` 回落 LocalExecutor，`local` 是使用者的显式选择、照旧不探测不报错。
+  上面那条 disclosure 保留作第二道说明。
 - **容器实测（首次有测试在真槽位上跑完整 chroot + `fs_denied` 链）**：
   `tests/security/test_template_isolation.py` 三条 chroot 用例全部重写为走生产路径
   （pooled host uid + `E2B_ROUTE_B=auto` + `await executor.start()`）：

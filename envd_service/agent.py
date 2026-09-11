@@ -18,6 +18,7 @@ from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from envd_service.config import Settings
+from envd_service.executors.factory import sandlock_unusable_error
 from envd_service.runtime.image_resolver import (
     peek_image_warm,
     resolve_image_rootfs,
@@ -679,14 +680,21 @@ def _executor_needs_images(mode: str) -> bool:
         return False
     if mode == "sandlock":
         return True
+    # auto: images only when the sandlock executor will actually run (the
+    # factory falls back to local for a *missing* package and for Landlock
+    # ABI < 6). An installed-but-unusable package is NOT one of those fallback
+    # cases -- the factory fails closed on it -- so answering "no images"
+    # here would hide the reason behind a missing rootfs (B1 fix round 2).
     try:
         import sandlock  # noqa: F401
 
-        # auto: images only when the sandlock executor will actually run
-        # (factory falls back to local when Landlock ABI < 6).
         return sandlock.landlock_abi_version() >= 6
-    except Exception:
+    except ModuleNotFoundError:
         return False
+    except Exception as exc:  # noqa: BLE001 - classified right here
+        raise sandlock_unusable_error(
+            "auto", f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 @router.post("/agent/sandboxes/{sandbox_id}/network", status_code=204)

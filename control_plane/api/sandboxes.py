@@ -37,6 +37,7 @@ from control_plane.registry.manager import (
 from control_plane.registry.secrets import SecretTenantMismatchError
 from control_plane.registry.snapshots import UnknownSnapshotError
 from control_plane.registry.templates import UnknownTemplateBuildError
+from envd_service.executors.factory import sandlock_unusable_error
 from gateway_common.network import (
     NetworkUpdateConflictError,
     NetworkConfigError,
@@ -89,12 +90,20 @@ def _executor_needs_images(mode: str) -> bool:
         return False
     if mode == "sandlock":
         return True
+    # auto: same judgment as the worker's probe (envd_service/agent.py): a
+    # *missing* package falls back to the local executor, an unusable one does
+    # not (the factory fails closed on it), so it must not read as "no images
+    # needed" here either (B1 fix round 2, shared wording).
     try:
         import sandlock  # noqa: F401
 
         return sandlock.landlock_abi_version() >= 6
-    except Exception:
+    except ModuleNotFoundError:
         return False
+    except Exception as exc:  # noqa: BLE001 - classified right here
+        raise sandlock_unusable_error(
+            "auto", f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _check_metadata_envvars_size(settings, metadata: dict, env_vars: dict) -> None:

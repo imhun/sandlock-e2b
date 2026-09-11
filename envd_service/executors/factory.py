@@ -53,6 +53,21 @@ def _broken_sandlock_detail() -> str | None:
     return f"{type(failure).__name__}: {failure}"
 
 
+def sandlock_unusable_error(mode: str, detail: str) -> RuntimeError:
+    """The fail-closed error for an installed-but-unusable sandlock package.
+
+    Shared by the executor factory (`sandlock` and `auto`) and the image
+    probes in `envd_service.agent` / `control_plane.api.sandboxes` so the
+    judgment and the words cannot drift (B1 fix round 2).
+    """
+    return RuntimeError(
+        f"E2B_EXECUTOR={mode} cannot run: the sandlock package is installed but "
+        f"unusable ({detail}); refusing to fall back to the LOCAL executor, "
+        "which applies no sandbox confinement. Reinstall the matching sandlock "
+        "wheel (or rebuild libsandlock_ffi.so) and restage the worker image."
+    )
+
+
 def _landlock_ok(min_abi: int = 6) -> bool:
     try:
         import sandlock
@@ -86,28 +101,17 @@ def create_executor(
     mode = settings.executor
     image_rootfs: Path | None = None
 
-    # B1 review (security): "sandlock is installed but broken" must never be
-    # mistaken for "sandlock is unavailable" -- the fallback below is
-    # LocalExecutor, which applies NO sandbox confinement. A missing package
-    # keeps the documented auto-mode fallback; a broken one is loud, and fatal
-    # when the operator asked for sandlock explicitly.
-    broken = _broken_sandlock_detail()
-    if broken is not None:
-        if mode == "sandlock":
-            raise RuntimeError(
-                "E2B_EXECUTOR=sandlock is set but the sandlock package is "
-                f"unusable ({broken}); refusing to fall back to the LOCAL "
-                "executor, which applies no sandbox confinement. Reinstall "
-                "the matching sandlock wheel (or rebuild libsandlock_ffi.so) "
-                "and restage the worker image."
-            )
-        logger.error(
-            "sandlock is installed but unusable (%s): falling back to the "
-            "LOCAL executor, which applies NO sandbox confinement. Fix the "
-            "wheel/libsandlock_ffi.so mismatch, or set E2B_EXECUTOR=sandlock "
-            "to make this fatal",
-            broken,
-        )
+    # B1 review fix round 2 (security): "sandlock is installed but broken" must
+    # never be mistaken for "sandlock is unavailable" -- the fallback below is
+    # LocalExecutor, which applies NO sandbox confinement. Only a *missing*
+    # package (ModuleNotFoundError) may fall back in auto mode; an unusable one
+    # fails the sandbox creation with the reason, for `auto` and `sandlock`
+    # alike. `local` is the operator's explicit choice and is left untouched
+    # (everything below is skipped, exactly as before B1).
+    if mode != "local":
+        broken = _broken_sandlock_detail()
+        if broken is not None:
+            raise sandlock_unusable_error(mode, broken)
 
     if mode == "sandlock" or (mode == "auto" and _sandlock_available()):
         if not _landlock_ok():

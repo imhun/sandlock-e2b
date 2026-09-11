@@ -3,9 +3,14 @@
 ``_sandlock_available()`` used to answer ``False`` for every failure, so a
 wheel built against a different ``libsandlock_ffi.so`` (or a partially
 upgraded image) degraded to :class:`LocalExecutor` -- a sandbox with **no
-confinement** -- behind a single INFO line. These tests pin the split:
-``ModuleNotFoundError`` keeps the documented fallback, everything else is
-loud, and fatal when the operator asked for sandlock explicitly.
+confinement**. These tests pin the split:
+
+* ``ModuleNotFoundError`` (not installed) keeps the documented fallback to
+  :class:`LocalExecutor`; and
+* an installed-but-unusable package fails the sandbox creation for **both**
+  ``sandlock`` and ``auto`` (B1 fix round 2: auto is not allowed to run
+  unconfined either), while ``local`` -- the operator's explicit choice -- is
+  left untouched and never even probes.
 """
 
 from __future__ import annotations
@@ -51,8 +56,25 @@ def _create(settings) -> object:
     )
 
 
-def test_explicit_sandlock_mode_refuses_a_broken_package(monkeypatch) -> None:
-    """``E2B_EXECUTOR=sandlock`` + broken install == hard failure, never local."""
+def _expected_unusable(mode: str, detail: str) -> str:
+    """The exact fail-closed text, written out rather than imported."""
+    return (
+        f"E2B_EXECUTOR={mode} cannot run: the sandlock package is installed but "
+        f"unusable ({detail}); refusing to fall back to the LOCAL executor, "
+        "which applies no sandbox confinement. Reinstall the matching sandlock "
+        "wheel (or rebuild libsandlock_ffi.so) and restage the worker image."
+    )
+
+
+@pytest.mark.parametrize("mode", ["sandlock", "auto"])
+def test_broken_package_refuses_for_every_sandlock_capable_mode(
+    monkeypatch, mode
+) -> None:
+    """``sandlock`` **and** ``auto`` fail closed on an unusable install.
+
+    ``auto`` may fall back only when the package is *absent*: the fallback is
+    LocalExecutor, which applies no confinement at all (B1 fix round 2).
+    """
     broken = ImportError(
         "sandlock_create_with_err is missing from the loaded sandlock library"
     )
@@ -61,45 +83,66 @@ def test_explicit_sandlock_mode_refuses_a_broken_package(monkeypatch) -> None:
     monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: broken)
 
     with pytest.raises(RuntimeError) as info:
-        _create(_settings("sandlock"))
+        _create(_settings(mode))
 
-    assert "unusable" in str(info.value)
-    assert "sandlock_create_with_err is missing" in str(info.value)
-    assert "no sandbox confinement" in str(info.value)
-
-
-def test_auto_mode_logs_an_error_before_falling_back(monkeypatch, caplog) -> None:
-    """Auto mode may still use the local executor, but never quietly."""
-    broken = ImportError("cannot import name 'InstanceClosedError'")
-    # The dev host is macOS; the probe is Linux-only, so pin it here.
-    monkeypatch.setattr(factory_mod.sys, "platform", "linux")
-    monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: broken)
-
-    with caplog.at_level(logging.INFO, logger="envd_service.executors.factory"):
-        executor = _create(_settings("auto"))
-
-    assert isinstance(executor, LocalExecutor)
-    records = [r for r in caplog.records if r.levelno >= logging.ERROR]
-    assert len(records) == 1
-    assert "installed but unusable" in records[0].message
-    assert "NO sandbox confinement" in records[0].message
-    assert "InstanceClosedError" in records[0].message
-    # The fallback is still announced, and the loud line is not the only one.
-    assert any(r.levelno == logging.INFO for r in caplog.records)
+    assert type(info.value) is RuntimeError
+    assert str(info.value) == _expected_unusable(
+        mode,
+        "ImportError: sandlock_create_with_err is missing from the loaded "
+        "sandlock library",
+    )
 
 
 def test_missing_package_keeps_the_quiet_fallback(monkeypatch, caplog) -> None:
-    """A package that is simply absent is the documented auto-mode case."""
+    """A package that is simply absent is the documented auto-mode fallback."""
     missing = ModuleNotFoundError("No module named 'sandlock'")
     # The dev host is macOS; the probe is Linux-only, so pin it here.
     monkeypatch.setattr(factory_mod.sys, "platform", "linux")
     monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: missing)
+    monkeypatch.setattr(factory_mod, "_landlock_ok", lambda: True)
 
     with caplog.at_level(logging.INFO, logger="envd_service.executors.factory"):
         executor = _create(_settings("auto"))
 
     assert isinstance(executor, LocalExecutor)
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_explicit_local_mode_never_probes_the_package(monkeypatch, caplog) -> None:
+    """``E2B_EXECUTOR=local`` is the operator's choice: no probe, no error.
+
+    A broken install must not make the explicitly-selected local executor
+    noisy or fatal -- but it must not be *chosen* by auto either, which the
+    case above pins.
+    """
+    probes: list[int] = []
+
+    def _probe():  # noqa: ANN202 - records the call
+        probes.append(1)
+        return ImportError("broken")
+
+    monkeypatch.setattr(factory_mod.sys, "platform", "linux")
+    monkeypatch.setattr(factory_mod, "_import_sandlock", _probe)
+
+    with caplog.at_level(logging.INFO, logger="envd_service.executors.factory"):
+        executor = _create(_settings("local"))
+
+    assert isinstance(executor, LocalExecutor)
+    assert probes == []
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_auto_mode_still_selects_sandlock_with_a_healthy_package(
+    monkeypatch,
+) -> None:
+    """Guard the guard: a healthy install keeps the auto-mode fast path."""
+    monkeypatch.setattr(factory_mod.sys, "platform", "linux")
+    monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: None)
+    monkeypatch.setattr(factory_mod, "_landlock_ok", lambda: True)
+
+    executor = _create(_settings("auto"))
+
+    assert type(executor).__name__ == "SandlockExecutor"
 
 
 def test_explicit_sandlock_mode_still_works_with_a_healthy_package(
