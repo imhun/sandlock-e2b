@@ -1186,14 +1186,24 @@ git commit -m "chore(sandlock): bump to the no-downgrade wheel and drop the supe
 
 **Files:** 无代码改动；产出 `tmp/z1-compose.log`、`tmp/z1-smoke.log`。
 
-- [ ] **Step 1: 构建镜像（本地 tag，不推 ACR）**
+> **执行结果（2026-09-11）：见 `.superpowers/sdd/task-Z-report.md`。** Z1/Z2 全绿，但有三处
+> 偏离需要记录：① 出厂清单 worker 是 `user: "65534:65534"`，envd 因此自动关闭 per-sandbox
+> uid ⇒ **route-B 默认不成立**（与 §2.4 及线上 root worker 冲突，报告 F1，待拍板）；本轮
+> 因此跑了两种形态——出厂形态 + root worker（不加任何 cap）形态，两形态冒烟均 `EXIT=0`，
+> route-B 证据取自槽位进程表（`route-B instance ready` 行在部署日志里被 root logger=WARNING
+> 吞掉，报告 F4）。② 冷启动有两个部署缺口（共享卷属主、worker 缺 `E2B_IMAGE_REGISTRY`），
+> 已修并提交（`2cb85fb` + 口径更正 `5df7367`）。③ `smoke-prod-worker.sh` 的容器形态早于
+> E5.1/A7，出厂形态 3 errors、部署身份下 1 条用例断言旧共享 uid 语义（报告 F9，未改）。
+> 另注：本机 `python` 不在 PATH，冒烟用项目内临时 venv（`tmp/z-venv/bin/python`）。
+
+- [x] **Step 1: 构建镜像（本地 tag，不推 ACR）**
 
 ```bash
 cd /Users/polus/project/ai/sandlock-e2b
 ./deploy/scripts/build-images.sh 2>&1 | tee tmp/z1-build.log
 ```
 
-- [ ] **Step 2: 起本地栈**
+- [x] **Step 2: 起本地栈**
 
 ```bash
 docker compose -f deploy/stack/docker-compose.prod.yml up -d 2>&1 | tee tmp/z1-compose.log
@@ -1203,7 +1213,7 @@ docker compose -f deploy/stack/docker-compose.prod.yml ps
 Expected: control-plane / gateway / worker 三个服务 healthy；worker 日志出现
 `route-B instance ready … host-uid=`，且**没有** `SYS_ADMIN` 相关 WARNING。
 
-- [ ] **Step 3: worker 自检**
+- [x] **Step 3: worker 自检**（脚本形态过时 ⇒ 记录 F9；worker 侧改用运行栈 + route-B 进程证据）
 
 ```bash
 ./deploy/scripts/smoke-prod-worker.sh 2>&1 | tee tmp/z1-worker-smoke.log
@@ -1211,7 +1221,7 @@ Expected: control-plane / gateway / worker 三个服务 healthy；worker 日志�
 
 ### Task Z2：本地部署冒烟（SDK 端到端）
 
-- [ ] **Step 1: 跑部署冒烟脚本**
+- [x] **Step 1: 跑部署冒烟脚本**
 
 ```bash
 python deploy/scripts/deployment_smoke.py 2>&1 | tee tmp/z2-deploy-smoke.log
@@ -1219,8 +1229,9 @@ python deploy/scripts/multinode_smoke.py 2>&1 | tee tmp/z2-multinode-smoke.log
 ```
 
 Expected: 全绿。两条脚本使用真实 HTTP + 真实镜像 rootfs + 真实 route-B 槽位。
+实际：出厂形态与 root（无 cap）形态各一遍全绿（root 形态首跑撞 ACR token 偶发 TLS EOF，重试绿）。
 
-- [ ] **Step 2: 关键路径手工复核（无 SYS_ADMIN 域）**
+- [x] **Step 2: 关键路径手工复核（无 SYS_ADMIN 域）**
 
 用官方 SDK 跑一遍本地栈，逐项记录：
 
@@ -1238,8 +1249,9 @@ PY
 ```
 
 Expected: `pwd` 输出 `/home/user`；写读回显 `hi`。
+实际：两形态均满足（出厂形态沙箱内 `uid=65534`，route-B 形态 `uid=0` 自映射）。
 
-- [ ] **Step 3: 收栈与清理**
+- [x] **Step 3: 收栈与清理**
 
 ```bash
 docker compose -f deploy/stack/docker-compose.prod.yml down 2>&1 | tee -a tmp/z1-compose.log
