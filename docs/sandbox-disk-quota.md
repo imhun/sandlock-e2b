@@ -108,21 +108,27 @@ NFS 部署下 worker 只能看到 NFS 客户端挂载，真正的 XFS 文件系�
   `POST /reconcile`（`{workspace_base, mount}`）；
 - 鉴权：`X-Internal-Key` 携带 `E2B_QUOTA_AGENT_TOKEN`（与 worker 的
   internal key 风格一致），token 未配置时服务拒绝启动/应答；
-- worker 侧：`E2B_QUOTA_VIA_AGENT=true` + `E2B_QUOTA_AGENT_URL/TOKEN` 时
+- worker 侧：**`E2B_QUOTA_AGENT_URL` 存在即 agent 形态**（A6：它是唯一开关，
+  优先于默认 false 的 `E2B_QUOTA_VIA_AGENT`；`E2B_QUOTA_AGENT_TOKEN` 同值），
   `envd_service.app.create_app` 自动 wire `xfs_quota.agent_query/agent_ops`
-  HTTP 客户端；默认不设置即本地直连（零回归）。agent 不可达/401/协议错误
-  一律抛 `ProjectQuotaError`，由既有调用方降级跳过 + 警告，不阻塞沙箱；
+  HTTP 客户端；不设 URL 才是本地直连（dev/legacy 形态）。agent 不可达/401/
+  协议错误一律抛 `ProjectQuotaError`，由既有调用方降级跳过 + 警告，不阻塞
+  沙箱；agent 形态下 worker 不执行任何本地配额命令；
 - 部署：`deploy/docker/Dockerfile.quota-agent` +
   `deploy/compose/docker-compose.quota-agent.yml`（NFS 服务器形态说明、
-  `E2B_QUOTA_AGENT_PATH_MAP` 客户端→服务器路径映射）。
+  `E2B_QUOTA_AGENT_PATH_MAP` 客户端→服务器路径映射）；生产栈里是
+  `deploy/stack/docker-compose.prod.yml` 的 `quota-agent` 服务
+  （`profiles: ["quota"]`，`cap_add: SYS_ADMIN` —— **特权只留在 agent 上**）。
 - 非 root worker（E5.1，uid 65534）：`xfs_quota -x` 按 effective
   CAP_SYS_ADMIN 门控而非 euid。Docker/compose 形态对非 root 清零 CapEff，
-  本地直连（`E2B_QUOTA_VIA_AGENT` 未开启）必然 EPERM，每沙箱磁盘硬限会
+  本地直连（未配 `E2B_QUOTA_AGENT_URL`）必然 EPERM，每沙箱磁盘硬限会
   静默失效——worker 启动时检测有效能力集并明确告警「磁盘配额不可用：非
-  root 需配置 E2B_QUOTA_VIA_AGENT + quota-agent」；生产非 root 部署必须
-  启用 `E2B_QUOTA_VIA_AGENT=true` + 部署 quota-agent，或 worker 以 root
-  运行（不推荐）。k8s 形态（`runAsUser: 65534` + `capabilities.add
-  [SYS_ADMIN]`）保留 effective CAP_SYS_ADMIN，直接配额可用、不触发告警。
+  root 需启用 agent 形态（`E2B_QUOTA_AGENT_URL` 指向 quota-agent）」；
+  生产非 root 部署必须部署 quota-agent，或 worker 以 root 运行（不推荐）。
+  保留 effective CAP_SYS_ADMIN 的 worker（root，或 `capabilities.add
+  [SYS_ADMIN]`）仍走本地直连、不触发告警 —— 但 **A6 之后部署清单不再声明
+  `SYS_ADMIN`**：`deploy/stack` 与 `deploy/k8s/worker.yaml` 都改用 agent 形态，
+  本地直连只剩显式自建的 dev/root 形态。
   非 XFS 宿主（如 macOS 本地开发）按真实原因披露（filesystem is
   apfs/..., not xfs），不误报非 root 指引。
 

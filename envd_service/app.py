@@ -173,12 +173,12 @@ def _disclose_shared_volume_traversal(
 def _disclose_nonroot_direct_quota(settings: Settings) -> None:
     """Startup disclosure (E5.1 review): a non-root worker without effective
     CAP_SYS_ADMIN cannot run ``xfs_quota -x`` directly (every call fails
-    with EPERM), so with ``E2B_QUOTA_VIA_AGENT=false`` the per-sandbox disk
-    hard limit silently degrades. Surface the required configuration once
-    at startup. The effective-capability check (not euid alone) keeps the
-    k8s form (runAsUser 65534 + SYS_ADMIN) working without a spurious
+    with EPERM), so with the agent form off (no ``E2B_QUOTA_AGENT_URL``) the
+    per-sandbox disk hard limit silently degrades. Surface the required
+    configuration once at startup. The effective-capability check (not euid
+    alone) keeps a worker that holds CAP_SYS_ADMIN working without a spurious
     warning, and non-XFS hosts keep their real detection reason
-    (Important-2 / Minor-13).
+    (Important-2 / Minor-13; A6 rewrote the remedy to the agent form).
     """
     if settings.quota_via_agent:
         return
@@ -186,9 +186,8 @@ def _disclose_nonroot_direct_quota(settings: Settings) -> None:
         return
     logger.warning(
         "%s (direct xfs_quota requires root/CAP_SYS_ADMIN; per-sandbox "
-        "disk hard limits are disabled while E2B_QUOTA_VIA_AGENT=false; "
-        "set E2B_QUOTA_VIA_AGENT=true and deploy quota-agent, or run the "
-        "worker as root)",
+        "disk hard limits are disabled while the agent form is off; set "
+        "E2B_QUOTA_AGENT_URL to the quota-agent, or run the worker as root)",
         NONROOT_DIRECT_QUOTA_REASON,
     )
 

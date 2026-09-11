@@ -50,9 +50,27 @@ spec:
             limits:
               memory: 2Gi
               cpu: "2"
+          # A6: no SYS_ADMIN. ① the shared-volume ``mount --bind`` was deleted
+          # in A4 (virtual paths + A5 traversal bits); ② XFS project quota is
+          # served by the server-side quota-agent (E2.6) -- point
+          # E2B_QUOTA_AGENT_URL at its endpoint, whereas the worker's local
+          # direct ``xfs_quota -x`` path needs SYS_ADMIN and is not the
+          # deployment form; ③ the wildcard DNS gateway's :53 is covered by
+          # NET_BIND_SERVICE because this pod runs as root.
+          #
+          # Only a non-root pod needs the low-port window declared, and it is
+          # *pod*-level (spec.template.spec.securityContext, not the container
+          # one):
+          #   securityContext:
+          #     sysctls:
+          #       - name: net.ipv4.ip_unprivileged_port_start
+          #         value: "0"
+          # That sysctl is safe since k8s 1.22 (no kubelet
+          # --allowed-unsafe-sysctls), but net.* sysctls are refused with
+          # hostNetwork: true. MCP inbound ports are 50005+ and need neither.
           securityContext:
             capabilities:
-              add: ["SYS_ADMIN", "NET_BIND_SERVICE"]
+              add: ["NET_BIND_SERVICE"]
             seccompProfile:
               type: Unconfined
           volumeMounts:

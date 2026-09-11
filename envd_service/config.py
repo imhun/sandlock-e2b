@@ -38,6 +38,20 @@ def _network_deny_cidrs() -> tuple[str, ...]:
     return tuple(p.strip() for p in value.split(",") if p.strip())
 
 
+def _quota_via_agent_from_env() -> bool:
+    """Whether the worker must route quota operations through quota-agent.
+
+    ``E2B_QUOTA_AGENT_URL`` is the switch (E2.6 + A6): a deployment that
+    configures an agent address runs the agent form, which is what lets the
+    worker drop ``CAP_SYS_ADMIN`` (``xfs_quota -x`` runs on the agent side).
+    ``E2B_QUOTA_VIA_AGENT=true`` without a URL stays a supported
+    misconfiguration: it wires no hooks and degrades with a warning.
+    """
+    if os.getenv("E2B_QUOTA_AGENT_URL", "").strip():
+        return True
+    return _env_bool("E2B_QUOTA_VIA_AGENT", False)
+
+
 @dataclass
 class Settings:
     envd_port: int = field(default_factory=lambda: _env_int("E2B_ENVD_PORT", 49983))
@@ -101,14 +115,18 @@ class Settings:
     default_disk_mb: int = field(
         default_factory=lambda: _env_int("E2B_DEFAULT_DISK_MB", 1024)
     )
-    quota_via_agent: bool = field(
-        default_factory=lambda: _env_bool("E2B_QUOTA_VIA_AGENT", False)
-    )
-    # NFS form (E2.6): server-side quota-agent URL/token. Wired by
-    # envd_service.quota_agent.configure_quota_agent_client when
-    # quota_via_agent is enabled; missing values degrade quota with warnings.
+    # Agent form (E2.6 + A6): the deployment's quota capability comes from the
+    # server-side quota-agent, so *setting E2B_QUOTA_AGENT_URL is the switch*
+    # (it outranks E2B_QUOTA_VIA_AGENT, whose default is false). That is what
+    # frees the worker from CAP_SYS_ADMIN: ``xfs_quota -x`` runs agent-side.
+    quota_via_agent: bool = field(default_factory=_quota_via_agent_from_env)
+    # Server-side quota-agent URL/token. Wired by
+    # envd_service.quota_agent.configure_quota_agent_client whenever the agent
+    # form is on; a missing URL or an unreachable/rejecting agent degrades
+    # quota with warnings (sandboxes and volume mounts keep working).
     quota_agent_url: str | None = field(
-        default_factory=lambda: os.getenv("E2B_QUOTA_AGENT_URL") or None
+        default_factory=lambda: (os.getenv("E2B_QUOTA_AGENT_URL") or "").strip()
+        or None
     )
     quota_agent_token: str | None = field(
         default_factory=lambda: os.getenv("E2B_QUOTA_AGENT_TOKEN") or None

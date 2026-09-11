@@ -77,8 +77,10 @@ class DockerPoolBackend:
                 self._network,
                 "-v",
                 f"{self._volume}:/var/lib/e2b-sandboxes",
-                "--cap-add",
-                "SYS_ADMIN",
+                # A6: no --cap-add SYS_ADMIN. The shared-volume bind was
+                # deleted in A4 and quota goes through quota-agent
+                # (E2B_QUOTA_AGENT_URL); the low-port window below is a
+                # container-spec declaration, not a runtime sysctl write.
                 "--security-opt",
                 "seccomp=unconfined",
                 "--sysctl",

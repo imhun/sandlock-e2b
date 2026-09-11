@@ -57,8 +57,9 @@ services:
       E2B_NODE_PROCESSES: 256
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
-    cap_add:
-      - SYS_ADMIN
+    # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
+    # E2B_QUOTA_AGENT_URL + quota-agent; low-port :53 only matters for
+    # wildcard rules, declare net.ipv4.ip_unprivileged_port_start=0).
     security_opt:
       - seccomp=unconfined
 
@@ -80,8 +81,9 @@ services:
       E2B_NODE_PROCESSES: 256
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
-    cap_add:
-      - SYS_ADMIN
+    # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
+    # E2B_QUOTA_AGENT_URL + quota-agent; low-port :53 only matters for
+    # wildcard rules, declare net.ipv4.ip_unprivileged_port_start=0).
     security_opt:
       - seccomp=unconfined
 
@@ -103,8 +105,9 @@ services:
       E2B_NODE_PROCESSES: 256
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
-    cap_add:
-      - SYS_ADMIN
+    # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
+    # E2B_QUOTA_AGENT_URL + quota-agent; low-port :53 only matters for
+    # wildcard rules, declare net.ipv4.ip_unprivileged_port_start=0).
     security_opt:
       - seccomp=unconfined
 

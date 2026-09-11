@@ -423,3 +423,98 @@ async def test_create_via_agent_flag_forwards_to_agent_ops(workspace, monkeypatc
     response = await _post_sandbox(app, "sbx_agent")
     assert response.status_code == 201
     assert calls["via_agent"] is True
+
+
+def test_agent_form_never_shells_out_to_a_local_quota_tool(monkeypatch):
+    """A6: the agent form is the worker's only quota implementation.
+
+    The deployed worker no longer holds CAP_SYS_ADMIN, so every agent-form
+    entry point must dispatch over the agent hooks and never spawn a local
+    quota command (``xfs_quota``/``xfs_info``/``lsattr``). ``subprocess.run``
+    is replaced with a landmine so any local exec fails loudly.
+    """
+    calls: list[tuple[str, dict]] = []
+
+    def hook(name: str):
+        def call(**kwargs):
+            calls.append((name, kwargs))
+            if name == "provision":
+                return 7
+            return {"projects": {}} if name == "report" else {}
+
+        return call
+
+    monkeypatch.setattr(
+        xfs_quota,
+        "agent_ops",
+        {
+            "provision": hook("provision"),
+            "release": hook("release"),
+            "report": hook("report"),
+            "reconcile": hook("reconcile"),
+        },
+    )
+    monkeypatch.setattr(
+        xfs_quota,
+        "agent_query",
+        lambda _mount: {
+            "fs_type": "xfs",
+            "projid32bit": True,
+            "prjquota": True,
+            "xfs_quota": True,
+        },
+    )
+
+    def landmine(*args, **kwargs):
+        raise AssertionError(f"a local quota tool was executed: {args!r}")
+
+    monkeypatch.setattr(xfs_quota.subprocess, "run", landmine)
+
+    assert xfs_quota.xfs_project_supported("/mnt/nfs", via_agent=True) == (True, "")
+    assert xfs_quota.project_quota_table("/mnt/nfs", via_agent=True) == {}
+    assert (
+        xfs_quota.provision_project(
+            sandbox_id="sbx_agent_only",
+            project_dir="/mnt/nfs/sbx_agent_only",
+            mount_point="/mnt/nfs",
+            disk_mb=512,
+            via_agent=True,
+        )
+        == 7
+    )
+    assert (
+        xfs_quota.release_project(
+            project_dir="/mnt/nfs/sbx_agent_only",
+            mount_point="/mnt/nfs",
+            projid=7,
+            via_agent=True,
+        )
+        is None
+    )
+    assert (
+        xfs_quota.reconcile_orphan_projects(
+            workspace_base="/mnt/nfs",
+            mount_point="/mnt/nfs",
+            via_agent=True,
+        )
+        == {}
+    )
+    assert calls == [
+        ("report", {"mount_point": "/mnt/nfs"}),
+        ("provision", {
+            "sandbox_id": "sbx_agent_only",
+            "project_dir": "/mnt/nfs/sbx_agent_only",
+            "mount_point": "/mnt/nfs",
+            "disk_mb": 512,
+            "project_id": None,
+        }),
+        ("release", {
+            "project_dir": "/mnt/nfs/sbx_agent_only",
+            "mount_point": "/mnt/nfs",
+            "projid": 7,
+        }),
+        ("reconcile", {
+            "workspace_base": "/mnt/nfs",
+            "mount_point": "/mnt/nfs",
+        }),
+    ]

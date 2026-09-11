@@ -722,9 +722,10 @@ def test_create_app_nonroot_discloses_direct_quota_downgrade(
     tmp_path, monkeypatch, caplog
 ):
     """E5.1 review (Important-1/2): a non-root worker without effective
-    CAP_SYS_ADMIN on an XFS workspace with the direct local quota path
-    (E2B_QUOTA_VIA_AGENT=false) must get a startup warning with the required
-    configuration instead of silently losing disk hard limits."""
+    CAP_SYS_ADMIN on an XFS workspace with the direct local quota path (no
+    E2B_QUOTA_AGENT_URL, the A6 agent-form switch) must get a startup warning
+    with the required configuration instead of silently losing disk hard
+    limits."""
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     monkeypatch.setattr(xfs_quota, "_has_effective_cap_sys_admin", lambda: False)
     mount_path = str(Path(tmp_path).resolve())
@@ -742,8 +743,8 @@ def test_create_app_nonroot_discloses_direct_quota_downgrade(
         app_module.PER_UID_NONROOT_WARNING,
         f"{xfs_quota.NONROOT_DIRECT_QUOTA_REASON} (direct xfs_quota requires "
         "root/CAP_SYS_ADMIN; per-sandbox disk hard limits are disabled while "
-        "E2B_QUOTA_VIA_AGENT=false; set E2B_QUOTA_VIA_AGENT=true and deploy "
-        "quota-agent, or run the worker as root)",
+        "the agent form is off; set E2B_QUOTA_AGENT_URL to the quota-agent, "
+        "or run the worker as root)",
     ]
 
 

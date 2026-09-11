@@ -111,19 +111,31 @@ services:
       E2B_NODE_CPU_PERCENT: ${E2B_NODE_CPU_PERCENT:-200}
       E2B_NODE_DISK_MB: ${E2B_NODE_DISK_MB:-4096}
       E2B_NODE_PROCESSES: ${E2B_NODE_PROCESSES:-256}
-      # NFS form (E2.6): route quota operations to the server-side
-      # quota-agent (deploy/compose/docker-compose.quota-agent.yml).
-      # Default false = local direct XFS; unreachable/rejecting agent
-      # degrades with warnings.
+      # Agent form (E2.6, promoted to the production form in A6): the quota
+      # capability comes from the server-side quota-agent service below, so
+      # *setting E2B_QUOTA_AGENT_URL is the switch* (it outranks
+      # E2B_QUOTA_VIA_AGENT, whose default is false). The worker's local
+      # direct ``xfs_quota -x`` path needs root/CAP_SYS_ADMIN, which is
+      # exactly why the worker no longer declares SYS_ADMIN. Unreachable or
+      # rejecting agent => quota degrades with warnings, sandboxes and
+      # volume mounts keep working.
       E2B_QUOTA_VIA_AGENT: ${E2B_QUOTA_VIA_AGENT:-false}
       E2B_QUOTA_AGENT_URL: ${E2B_QUOTA_AGENT_URL:-}
       E2B_QUOTA_AGENT_TOKEN: ${E2B_QUOTA_AGENT_TOKEN:-}
       E2B_QUOTA_AGENT_TIMEOUT_S: ${E2B_QUOTA_AGENT_TIMEOUT_S:-5}
     volumes: &worker-volumes
       - sandbox-shared:/var/lib/e2b-sandboxes
-    cap_add:
-      - SYS_ADMIN
+    # A6: the worker needs no SYS_ADMIN. The three former uses are gone --
+    # ① the shared-volume ``mount --bind`` was deleted in A4 (virtual paths +
+    # A5 traversal bits); ② quota runs on the quota-agent service below;
+    # ③ the low-port window is declared here instead of written at runtime.
     sysctls:
+      # Wildcard allowOut serves <127.0.1.x>:53 from the worker's own network
+      # namespace. resolv.conf cannot carry a port, so the gateway needs the
+      # low-port window -- declared in the container spec, which the runtime
+      # applies: no SYS_ADMIN and no in-container ``sysctl -w``. MCP inbound
+      # ports are 50005+ and never needed it. Only wildcard-domain rules use
+      # this; a root worker would be covered by NET_BIND_SERVICE instead.
       - net.ipv4.ip_unprivileged_port_start=0
     security_opt:
       - seccomp=unconfined
@@ -135,6 +147,33 @@ services:
       <<: *worker-env
       E2B_NODE_ADDRESS: http://worker-2:49983
       E2B_NODE_ID: worker-2
+
+  # Server-side XFS project quota manager (E2.6, A6). It owns the privilege the
+  # worker no longer has: ``xfs_quota -x`` is gated on CAP_SYS_ADMIN, so the
+  # capability lives here and the worker talks HTTP. Opt-in, because the agent
+  # refuses to start without E2B_QUOTA_AGENT_TOKEN:
+  #   .env:  E2B_QUOTA_AGENT_URL=http://quota-agent:49984
+  #          E2B_QUOTA_AGENT_TOKEN=<same token as below>
+  #   up:    docker compose --profile quota up -d
+  # Without it the worker's quota degrades with warnings (no per-sandbox disk
+  # hard limit) and everything else works unchanged. The agent mounts the same
+  # shared volume at the same path, so no E2B_QUOTA_AGENT_PATH_MAP is needed;
+  # for the NFS-server form see deploy/compose/docker-compose.quota-agent.yml.
+  quota-agent:
+    profiles: ["quota"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.quota-agent
+    image: ${QUOTA_AGENT_IMAGE:-e2b-sandlock-quota-agent:latest}
+    environment:
+      E2B_QUOTA_AGENT_TOKEN: ${E2B_QUOTA_AGENT_TOKEN:-}
+      E2B_QUOTA_AGENT_PATH_MAP: ${E2B_QUOTA_AGENT_PATH_MAP:-}
+    # xfs_quota -x needs CAP_SYS_ADMIN; this service is where it lives now.
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - sandbox-shared:/var/lib/e2b-sandboxes
+    restart: unless-stopped
 
 volumes:
   redis-data:

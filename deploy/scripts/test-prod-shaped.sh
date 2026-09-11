@@ -7,10 +7,12 @@
 # loading, ptrace of anything, mount, and every capability. That is not what a
 # worker gets, so a suite that passes there can still be proving less than it
 # looks like -- and anything the code quietly needs beyond the deployed
-# permission set never shows up. This lane drops the privilege and keeps the
-# capabilities the production manifests declare (deploy/k8s/worker.yaml:
-# SYS_ADMIN + NET_BIND_SERVICE, seccomp unconfined, running as root so E3.2
-# per-sandbox host uids and route B are actually in play).
+# permission set never shows up. This lane drops the privilege and starts from
+# the historical deployed capset (deploy/k8s/worker.yaml before A6: SYS_ADMIN +
+# NET_BIND_SERVICE, seccomp unconfined, running as root so E3.2 per-sandbox host
+# uids and route B are actually in play). A6 removed SYS_ADMIN from the
+# manifests and A7 pins the no-SYS_ADMIN shape via PROD_DROP_CAPS, so the cap
+# list below is deliberately a superset today.
 #
 # Measured cost of dropping --privileged (2026-09-10, this host):
 #   - Landlock ABI 8 and unprivileged user namespaces: fine.

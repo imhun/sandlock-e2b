@@ -52,7 +52,7 @@ workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，�
 
 | 项 | 说明 |
 |---|---|
-| 权限 | 分三层，**照抄会多给特权**（2026-09-10 实测，逐项见 §2.4.1）：**沙箱侧最小集 = `CAP_SETUID`+`CAP_SETGID`+`CAP_CHOWN`**；`CAP_DAC_OVERRIDE` 是**管理面**需要（对账 `os.walk`、删除 `rmtree`、配额扫描都要穿租户 0700 目录）；`CAP_SYS_ADMIN` 只服务**共享卷 bind mount** 与直接 `xfs_quota`，**不是 E3.2 / route B 的前置**；`CAP_SYS_PTRACE` 只在走进程内 `RunAs` 时才需要。非 root worker 自动关闭 uid 池并保持「固定身份 + Landlock」（E5.1），启动时打一条 WARNING —— 按清单 `user: "65534:65534"` 部署时行为与翻默认前**完全一致**（但线上实际是 root，见下面审计）。 |
+| 权限 | 分三层，**照抄会多给特权**（2026-09-10 实测，逐项见 §2.4.1）：**沙箱侧最小集 = `CAP_SETUID`+`CAP_SETGID`+`CAP_CHOWN`**；`CAP_DAC_OVERRIDE` 是**管理面**需要（对账 `os.walk`、删除 `rmtree`、配额扫描都要穿租户 0700 目录）；`CAP_SYS_ADMIN` **在 A6 之后 worker 已不需要**（共享卷 bind 由 A4 删除、配额改由 quota-agent 提供、低端口 sysctl 由容器 spec 声明），也**不是 E3.2 / route B 的前置**；`CAP_SYS_PTRACE` 只在走进程内 `RunAs` 时才需要。非 root worker 自动关闭 uid 池并保持「固定身份 + Landlock」（E5.1），启动时打一条 WARNING —— 按清单 `user: "65534:65534"` 部署时行为与翻默认前**完全一致**（但线上实际是 root，见下面审计）。 |
 | 容量 | 并发沙箱数受 `E2B_UID_POOL_SIZE` 约束（默认 1000，起始 `E2B_UID_POOL_START=10000`）；池满即建箱失败。多 worker 共用同一 workspace 时必须配**互不重叠**的段。 |
 | 进程/内存 | chroot 形态每沙箱多一棵 supervise 进程树（supervise + sandlock-init + 停车 M0）。它在沙箱 cgroup **之外**，不计入 `max_memory`/`max_disk`，并在 `max_processes` 里占 1；容量表按「N 沙箱 = N 额外进程」重算。 |
 | 回收 | route-B 代次的结束由 envd 生命周期（TTL/idle eviction/删除 → `executor.close()`）决定，不再依赖 core 的 15 min idle；槽位进程退出前该 uid 不会被再次租出（W1）。 |
@@ -61,14 +61,14 @@ workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，�
 | 删档的后果（2026-09-10） | 「特权进程内中介 + 路径中介 + 非 0 host uid」这一组合现在只有 route B 一条路：root worker + chroot 形态若拿不到槽位（`E2B_ROUTE_B=off`、wheel 不带 supervise、或 `E2B_PER_SANDBOX_UID=false`）就**建箱失败**，并打一条 ERROR 说明为什么没有槽位、怎么修（容器实测钉在 `tests/security/test_template_isolation.py::test_in_process_chroot_is_refused_without_a_slot`）。非 root worker（E5.1，中介就是它自己的 euid）**不受影响** —— 那条组合不构成拒绝，所以也不会打这条 ERROR。 |
 | **CAP_SYS_PTRACE**（进程内 RunAs 才有） | 内核要求「给子进程写 `uid_map`」除 `CAP_SETUID` 外还要对该子进程的 **ptrace 访问权**。实测 `--cap-drop ALL`：只补 `SYS_ADMIN` ⇒ 每个建箱都挂在 `sandlock_create failed`；只再补 `SYS_PTRACE` 即通。**route B 不需要它**（槽位自己就是那个 uid，自映射 `0 -> euid` 无需特权）。root worker + 非 chroot 形态开 E3.2 时，worker 启动会打 WARNING（`PER_UID_NO_PTRACE_WARNING`）说明缺哪条 cap、怎么修。 |
 
-### 2.4.1 特权最小集（2026-09-10 实测：非特权容器 + 真 fork wheel + 真槽位）
+### 2.4.1 特权最小集（2026-09-10 实测：非特权容器 + 真 fork wheel + 真槽位；`SYS_ADMIN` 行的终态见下，2026-09-11 A6）
 
 | capability | 作用在哪 | 摘掉的实测后果 |
 |---|---|---|
 | `SETUID` + `SETGID` | 把 route-B 槽位起在该沙箱的 host uid 上（`setpriv --reuid X --regid X --clear-groups`） | 租不到槽位 ⇒ chroot 形态被 fork 拒绝建箱（见上「删档的后果」行） |
 | `CHOWN` | workspace chown 给该 uid（0700）；uid 回收时再 chown 回来 | E3.2 的属主前提不成立 |
 | `DAC_OVERRIDE` | **管理面**遍历租户 0700 目录树：孤儿对账的 `os.walk`、删除的 `rmtree`、配额扫描 | `PermissionError: …/sbx_a/workspace`；对账与共享卷持久化用例 4 failed / 4 error |
-| `SYS_ADMIN` | ① 共享卷 `mount --bind` 进 workspace；② 直接执行 `xfs_quota -x`；③ 写 namespaced sysctl（清单里的 `ip_unprivileged_port_start`） | **只有 4 条共享卷用例掉**（日志 `cannot bind volume … failed mount system call.; keeping the workspace symlink`）；沙箱侧 confine、路径中介、设备节点围栏全部照常 |
+| `SYS_ADMIN` | **A6 之后 worker 不再需要它 —— 三处用途全部迁出**：① 共享卷 `mount --bind` 进 workspace：**A4 删掉 bind**（卷视图 = 请求路径决定的符号链接）+ **A5 补祖先穿透位**，不再需要挂载权限；② 直接执行 `xfs_quota -x`：改由服务端 **quota-agent** 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关，见 §2.4.3）；③ 写 namespaced sysctl（`ip_unprivileged_port_start`）：改由**容器 spec 声明**（compose `sysctls:` / `docker --sysctl`，由容器运行时应用，worker 进程不写；k8s 形态是 root pod，由 `NET_BIND_SERVICE` 覆盖）。**没有任何一处仍需要 worker 持 `SYS_ADMIN`** | 摘掉它的后果今天**只剩配额降级**：quota-agent 未配置/不可达 ⇒ 建箱与挂卷照常、无 per-sandbox 磁盘硬限 + 一条 WARNING。共享卷不再是理由 —— A4/A5 的契约（`tests/contract/test_shared_volume_relative_cwd.py` 等 36 条）+ 13 条穿透单测在**无 `SYS_ADMIN`** lane 三连绿（`tmp/a4-final-step4-run{1,2,3}.log`）。A6 的配额 lane（同形状，无 `SYS_ADMIN`）：agent 形态 `tmp/a6-agent.log` = `107 passed`；降级形态 `tmp/a6-degrade.log` = `29 passed, 5 errors`（5 个 error 全是 XFS prjquota 门用例被 `E2B_TEST_STRICT_SKIPS=1` 显式暴露，与 `test-prod-shaped.sh` 的既有 deselect 同口径；对照跑 `tmp/a6-control-degrade.log` 逐字相同） |
 | `SYS_PTRACE` | 只服务**进程内 RunAs**（父进程给子进程写 `uid_map` 需要对该子进程的 ptrace 访问权） | 非 route-B 的 per-uid 沙箱每个建箱挂在 `sandlock_create failed`；route B 完全不需要 |
 
 三条实测口径（`e2b-sandlock-test` 容器，`--cap-drop ALL` + 指定 capset）：
@@ -84,10 +84,11 @@ workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，�
   `SYS_PTRACE` 时挂在 `sandlock_instance_launch failed`，补上 ptrace 即通 —— 与 F18 的
   `PER_UID_NO_PTRACE_WARNING` 同源。
 
-> ⚠️ **一个没解决的缺口（登记 main backlog #25）**：共享卷在没有 `SYS_ADMIN` 时会退化成
-> 「workspace 符号链接」，而这条退化路径对**跨 uid 读写共享卷并不成立**（实测 EACCES）。
-> 所以「摘掉 `SYS_ADMIN`」目前只对不用 `volumeMounts` 的部署可行；要用共享卷就得保留它，
-> 或者把卷根属主/权限按 uid 重新设计、或让 bind mount 由容器运行时而不是 worker 进程完成。
+> ✅ **backlog #25 已收口（A4/A5/A6）**：上面那条「没有 `SYS_ADMIN` ⇒ 共享卷退化成不可用的
+> 符号链接」的缺口不再成立 —— A4 删掉 `mount --bind`（卷视图由请求路径决定）、A5 补齐卷根
+> 及祖先对租户 uid 的穿透位（§2.4.2）、A6 把配额与低端口 sysctl 也迁出 worker。现在
+> **无 `SYS_ADMIN` 的部署要用共享卷不需要任何保留条件**；唯一代价是配额需要 quota-agent
+> （§2.4.3），否则降级为「无 per-sandbox 硬限 + WARNING」。
 
 **线上审计（2026-09-10，只读探测：跳板→目标机，无写入 / 不重启 / 无副作用 exec）**：仓库清单写的
 `user: "65534:65534"` **不等于已部署状态** —— 远端 `/opt/sandlock/docker-compose.prod.yml`
@@ -149,11 +150,41 @@ workspace 按该 uid chown 0700。这不是可选项式的「加强安全」，�
 > 由请求决定）、A5 补穿透位之后，无 `CAP_SYS_ADMIN` 的共享卷形态才在「绝对 + 相对」
 > 两个方向上都完整。
 
+### 2.4.3 配额能力的来源：quota-agent（A6）
+
+worker 的**本地直连** `xfs_quota -x` 需要 effective `CAP_SYS_ADMIN`（内核按 cap 门控，不看
+euid），而部署形态的 worker 是 uid 65534（Docker 对非 root 清零 CapEff），本地直连在
+生产里本来就不可用。A6 把链路定成**一条**：配额由服务端 **quota-agent** 提供，worker 只发
+HTTP，`SYS_ADMIN` 只留在 agent 上。
+
+- **开关是 URL**：`E2B_QUOTA_AGENT_URL` 存在即启用 agent 形态（优先于 `E2B_QUOTA_VIA_AGENT`，
+  后者默认 false）。同时配 `E2B_QUOTA_AGENT_TOKEN`（与 agent 同值，`X-Internal-Key`）。
+  `E2B_QUOTA_VIA_AGENT=true` 而 URL 为空仍是受支持的误配：启动打一条 WARNING、配额降级。
+- **清单**：`deploy/stack/docker-compose.prod.yml` 的 `quota-agent` 服务
+  （`profiles: ["quota"]`、`cap_add: SYS_ADMIN`、与 worker 挂同一份 `sandbox-shared`）——
+  `docker compose --profile quota up -d` + 上面两个 env 即开启；NFS 服务器形态见
+  `deploy/compose/docker-compose.quota-agent.yml` + `E2B_QUOTA_AGENT_PATH_MAP`。
+  `deploy/k8s/worker.yaml` 已不再声明 `SYS_ADMIN`（把 `E2B_QUOTA_AGENT_URL` 指向集群内或
+  外部的 agent；k8s 的共享卷是 RWX PVC，走 NFS 时本地直连本来就不可能）。
+- **降级语义（不变）**：agent 不可达/401/协议错误 ⇒ `ProjectQuotaError` ⇒ **建箱与挂卷成功、
+  无 per-sandbox 限额 + WARNING**。agent 形态不会在 worker 上执行任何本地配额命令，回归钉在
+  `tests/unit/test_xfs_project_quota_agent.py::test_agent_form_never_shells_out_to_a_local_quota_tool`。
+- **低端口 sysctl（第 ③ 处用途）**：wildcard allowOut 的 DNS 网关绑 `<127.0.1.x>:53`
+  （`resolv.conf` 带不了端口）。Docker 形态由容器 spec 声明
+  `sysctls: net.ipv4.ip_unprivileged_port_start=0` —— 运行时应用，worker 不写 sysctl、不持
+  `SYS_ADMIN`；k8s 形态的 worker 是 **root**，`NET_BIND_SERVICE` 已覆盖，**不需要**这条
+  sysctl。该 sysctl 自 k8s 1.22 起属 **safe sysctl**（无需 kubelet
+  `--allowed-unsafe-sysctls`），只有把 pod 改成非 root 时才需要按 **pod 级**
+  `spec.template.spec.securityContext.sysctls` 声明；`hostNetwork: true` 下 `net.*` 会被拒。
+  MCP 入站端口是 50005+，从来不需要低端口窗口。
+
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
 - **`deploy/scripts/test-prod-shaped.sh`（生产形，默认推荐）**：容器不带 `--privileged`，
-  `--cap-drop ALL` 后只给部署清单声明的那组 cap（Docker 默认集 + `SYS_ADMIN`
-  `SYS_PTRACE` `NET_ADMIN`，`seccomp=unconfined`）。实测（2026-09-10）Landlock（ABI 8）
+  `--cap-drop ALL` 后给一组部署等价 cap（Docker 默认集 + `SYS_PTRACE` `NET_ADMIN`，
+  `seccomp=unconfined`）。⚠️ A6 之后清单**已不再声明 `SYS_ADMIN`**，而脚本目前仍加着它
+  ⇒ 本条 lane 的 capset 现在是清单的**超集**（A7 用 `PROD_DROP_CAPS=SYS_ADMIN` 固化无
+  `SYS_ADMIN` 形态）。实测（2026-09-10）Landlock（ABI 8）
   与非特权 userns 都不需要任何特权；**唯一造不出来的是 XFS prjquota 暂存盘**
   （容器内 loop 设备不可用，即使 `--cap-add SYS_ADMIN` + `--device /dev/loop-control`
   也 `failed to setup loop device`）⇒ 7 个配额文件显式 `--ignore`，

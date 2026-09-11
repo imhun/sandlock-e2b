@@ -702,8 +702,8 @@ services:
       - "49983:49983"
     volumes:
       - sandbox-data:/var/lib/e2b-sandboxes
-    cap_add:
-      - SYS_ADMIN
+    # A6: no SYS_ADMIN (shared-volume bind deleted in A4; per-sandbox quota
+    # comes from the server-side quota-agent via E2B_QUOTA_AGENT_URL).
     privileged: false
 
 volumes:

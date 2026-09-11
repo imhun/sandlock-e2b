@@ -134,12 +134,15 @@ services:
       E2B_QUOTA_AGENT_TIMEOUT_S: ${E2B_QUOTA_AGENT_TIMEOUT_S:-5}
     volumes: &worker-volumes
       - sandbox-shared:/var/lib/e2b-sandboxes
-    cap_add:
-      - SYS_ADMIN
+    # A6: the worker needs no SYS_ADMIN (shared-volume bind deleted in A4,
+    # quota served by the quota-agent, low-port window declared below). Enabling
+    # the agent form is setting E2B_QUOTA_AGENT_URL; without it quota degrades
+    # with warnings and the sandbox/volume paths keep working.
     sysctls:
       # The wildcard DNS gateway binds 127.0.1.x:53; resolv.conf cannot carry
       # a port, so allow unprivileged low-port binding (namespaced per
-      # container). This is the one deployment knob the sandlock fork needs.
+      # container, applied by the runtime from this spec -- no SYS_ADMIN, no
+      # in-container sysctl write). MCP inbound ports are 50005+.
       - net.ipv4.ip_unprivileged_port_start=0
     security_opt:
       - seccomp=unconfined

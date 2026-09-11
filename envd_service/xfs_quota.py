@@ -3,10 +3,19 @@
 Two quota domains:
 
 - local (``via_agent=False``): inspect the worker's own mount of
-  ``mount_point``, and run ``xfs_quota`` directly on the worker.
-- NFS server side (``via_agent=True``): the worker only sees an NFS mount,
-  so the real filesystem lives on the server. Ask quota-agent (E2.6) for
-  the server-side facts and let it execute the project operations.
+  ``mount_point``, and run ``xfs_quota`` directly on the worker. This is the
+  dev/legacy form: ``xfs_quota -x`` is gated on effective CAP_SYS_ADMIN, so
+  it only works for a root worker (or a worker that keeps SYS_ADMIN) on a
+  local XFS mount with prjquota.
+- quota-agent (``via_agent=True``): the deployment's supported quota source
+  (E2.6, promoted to the production form in A6). The worker asks
+  quota-agent for the server-side facts and for every project operation, so
+  *no path on the agent form ever executes ``xfs_quota`` (or any other local
+  quota tool) on the worker* -- the agent owns the privilege. The worker
+  only needs ``E2B_QUOTA_AGENT_URL`` (see :class:`envd_service.config.Settings`);
+  an unreachable or rejecting agent raises :class:`ProjectQuotaError` and the
+  callers degrade (sandbox/volume mount succeeds, no per-sandbox limit, one
+  WARNING).
 
 Detection (E2.1) is strictly read-only: it never mounts, never enables
 quotas and never writes files. Any unsupported result is logged as a warning
@@ -32,8 +41,9 @@ Project management (E2.2):
 - monitoring (E2.4): ``project_quota_table`` returns used/soft/hard blocks per
   project so callers can detect over-limit and near-limit sandboxes.
 
-The agent branch is reserved for E2.6: ``agent_ops`` maps op names to
-callables — ``provision(sandbox_id, project_dir, disk_mb, mount_point,
+The agent branch (E2.6) is the deployment's supported source: ``agent_ops``
+maps op names to callables — ``provision(sandbox_id, project_dir, disk_mb,
+mount_point,
 project_id=None) -> int``, ``release(project_dir, projid, mount_point)
 -> None``, ``report(mount_point) -> {"projects": {...}}`` and
 ``reconcile(workspace_base, mount_point) -> {"cleaned": [...], "skipped":
@@ -69,7 +79,8 @@ logger = logging.getLogger(__name__)
 #: and non-root with effective SYS_ADMIN (k8s runAsUser + SYS_ADMIN) keeps
 #: the direct path (E5.1 review Important-2).
 NONROOT_DIRECT_QUOTA_REASON = (
-    "磁盘配额不可用：非 root 需配置 E2B_QUOTA_VIA_AGENT + quota-agent"
+    "磁盘配额不可用：非 root 需启用 agent 形态"
+    "（E2B_QUOTA_AGENT_URL 指向 quota-agent）"
 )
 
 #: E2.6 wires the quota-agent client here. Contract:

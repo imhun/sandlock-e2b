@@ -489,3 +489,61 @@ async def test_create_app_via_agent_without_url_degrades(
         "warnings",
         *_uid_disclosure(),
     ]
+
+
+def test_agent_url_alone_selects_the_agent_form(monkeypatch):
+    """A6: setting E2B_QUOTA_AGENT_URL is the switch.
+
+    The deployment configures the agent endpoint, not a second boolean, and
+    the worker then runs the agent form -- the form that let the manifests
+    drop CAP_SYS_ADMIN. An explicit E2B_QUOTA_VIA_AGENT=true without a URL
+    stays a supported misconfiguration (hooks unconfigured, quota degrades).
+    """
+    monkeypatch.delenv("E2B_QUOTA_VIA_AGENT", raising=False)
+    monkeypatch.setenv("E2B_QUOTA_AGENT_URL", AGENT_URL)
+    assert EnvdSettings(executor="local").quota_via_agent is True
+
+    monkeypatch.setenv("E2B_QUOTA_VIA_AGENT", "false")
+    assert EnvdSettings(executor="local").quota_via_agent is True
+
+    monkeypatch.delenv("E2B_QUOTA_AGENT_URL")
+    assert EnvdSettings(executor="local").quota_via_agent is False
+
+    monkeypatch.setenv("E2B_QUOTA_VIA_AGENT", "true")
+    assert EnvdSettings(executor="local").quota_via_agent is True
+
+
+async def test_create_app_with_agent_url_alone_wires_hooks(
+    workspace, monkeypatch, caplog
+):
+    """A6: nothing but the URL is needed for the deployed agent form.
+
+    Same wiring as ``quota_via_agent=True`` (hooks installed, client kept for
+    lifecycle cleanup) and the non-root-downgrade disclosure stays silent,
+    because quota is not being degraded.
+    """
+    monkeypatch.setattr(xfs_quota, "agent_query", None)
+    monkeypatch.setattr(xfs_quota, "agent_ops", None)
+    monkeypatch.delenv("E2B_QUOTA_VIA_AGENT", raising=False)
+    monkeypatch.setenv("E2B_QUOTA_AGENT_URL", AGENT_URL)
+    monkeypatch.setenv("E2B_QUOTA_AGENT_TOKEN", TOKEN)
+    caplog.set_level(logging.WARNING)
+    app = create_envd_app(
+        settings=EnvdSettings(executor="local", workspace_base=workspace),
+        runtime_registry=RuntimeRegistry(workspace),
+    )
+    client = app.state.quota_agent_client
+    try:
+        assert client is not None
+        assert xfs_quota.agent_query == client.detect
+        assert set(xfs_quota.agent_ops) == {
+            "provision",
+            "release",
+            "report",
+            "reconcile",
+        }
+        assert [r for r in caplog.records if "磁盘配额不可用" in r.message] == []
+    finally:
+        configure_quota_agent_client(url=None)
+        if client is not None:
+            client.close()

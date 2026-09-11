@@ -300,8 +300,10 @@ compose scale 的副本共享同一份 env，`E2B_NODE_ADDRESS` 无法按副本�
 - 扩容：`docker run -d --name e2b-worker-<n> --network <共享网络> ...`，
   注入唯一 `E2B_NODE_ID` / `E2B_NODE_ADDRESS=http://e2b-worker-<n>:49983`
   （Docker 网络内容器名可解析，gateway 同网络可达）；
-- 运行参数与现状一致：`SYS_ADMIN`、`seccomp=unconfined`、
-  `--sysctl net.ipv4.ip_unprivileged_port_start=0`、共享 workspace 卷挂载；
+- 运行参数与现状一致：`seccomp=unconfined`、
+  `--sysctl net.ipv4.ip_unprivileged_port_start=0`（容器 spec 声明，A6 之后
+  不再需要 `--cap-add SYS_ADMIN`：共享卷 bind 已删、配额走 quota-agent）、
+  共享 workspace 卷挂载；
 - 缩容：先调控制面 drain（第 9 节），活跃沙箱归零后 `docker rm -f`；
 - 启动时对已有容器做对账（孤儿回收 / 缺失补齐），幂等可重启。
 
@@ -340,15 +342,19 @@ env:
 - 资源：`resources.limits` 必须显式设置，且 `E2B_NODE_MEMORY_MB` /
   `E2B_NODE_CPU_PERCENT` / `E2B_NODE_DISK_MB` / `E2B_NODE_PROCESSES`
   必须等于 limits（容器内探测会看到宿主机全部资源，不显式覆盖会严重超卖）；
-- 权限：`securityContext.capabilities.add: [SYS_ADMIN]`、
-  `securityContext.seccompProfile.type: Unconfined`（K8s 1.19+）；
+- 权限：`securityContext.capabilities.add: [NET_BIND_SERVICE]`、
+  `securityContext.seccompProfile.type: Unconfined`（K8s 1.19+）。
+  **A6 之后不再需要 `SYS_ADMIN`**（共享卷 bind 已删、配额由 quota-agent 提供，
+  见 `docs/production-deployment-requirements.md` §2.4.3）；
 - 非 root（E5.1）：worker 镜像以 uid 65534 运行，Pod 同步声明
   `securityContext.runAsNonRoot: true`、`runAsUser: 65534`、
   `runAsGroup: 65534`（镜像已预建 `/var/lib/e2b-sandboxes` 且属主 65534；
   既有 RWX PVC 需一次性 chown 到 65534，或由 initContainer 完成）；
-- 低端口：优先给 `NET_BIND_SERVICE` capability（替代
-  `net.ipv4.ip_unprivileged_port_start=0` 这个 unsafe sysctl）；若仍走
-  sysctl 方案，需 kubelet `--allowed-unsafe-sysctls` 放行；
+- 低端口：root pod 用 `NET_BIND_SERVICE` 就够（`deploy/k8s/worker.yaml` 的
+  形态）。只有把 pod 改成非 root 才需要
+  `net.ipv4.ip_unprivileged_port_start=0`；它自 K8s 1.22 起是 **safe sysctl**，
+  声明在 **pod 级** `spec.template.spec.securityContext.sysctls` 即可，**不需要**
+  kubelet `--allowed-unsafe-sysctls`（`hostNetwork: true` 下 `net.*` 会被拒）；
 - 无 docker socket：不挂 `/var/run/docker.sock`，rootfs 提取走第 4.2 节
   的 registry 直拉。
 

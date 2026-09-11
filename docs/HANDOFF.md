@@ -236,7 +236,7 @@ skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」�
 | `SETUID`+`SETGID` | worker 把槽位起在沙箱 host uid 上（`setpriv --reuid X --regid X --clear-groups`） | 租不到槽位 ⇒ chroot 形态被 fork 拒绝建箱 |
 | `CHOWN` | workspace chown 0700 给该 uid、回收时 chown 回来 | E3.2 属主前提不成立 |
 | `DAC_OVERRIDE` | **管理面**穿租户 0700 目录树：孤儿对账 `os.walk`、删除 `rmtree`、配额扫描 | `PermissionError: …/sbx_a/workspace`；对账 + 卷持久化 4 failed / 4 error |
-| `SYS_ADMIN` | ① 共享卷 `mount --bind` ② 直接 `xfs_quota -x` ③ 写 namespaced sysctl | **只掉 4 条共享卷用例**（`cannot bind volume … failed mount system call.; keeping the workspace symlink`）；沙箱侧 confine / 中介 / 设备节点围栏**全部照常** |
+| `SYS_ADMIN` | ~~① 共享卷 `mount --bind`~~（A4 删 bind、A5 补穿透位）~~② 直接 `xfs_quota -x`~~（A6：改由 quota-agent 提供）~~③ 写 namespaced sysctl~~（A6：改由容器 spec 声明，k8s 由 `NET_BIND_SERVICE` 覆盖） | **A6 之后 worker 不再需要它，没有任何一处仍需要**。摘掉它现在的后果只剩「配额降级」（agent 未配置/不可达 ⇒ 无 per-sandbox 硬限 + WARNING，建箱/挂卷照常）；沙箱侧 confine / 中介 / 设备节点围栏照常。删 bind 之前的实测是「只掉 4 条共享卷用例」（`cannot bind volume … failed mount system call.; keeping the workspace symlink`）。终态口径见 `docs/production-deployment-requirements.md` §2.4.1/§2.4.3（A6 证据 `tmp/a6-agent.log`、`tmp/a6-degrade.log`、`tmp/a6-full-gate.log`） |
 | `SYS_PTRACE` | 只服务**进程内** `RunAs` | 进程内 per-uid 沙箱挂在 `sandlock_create failed`；route B 不需要 |
 
 三条对照数据（原始输出，别只信表格）：
