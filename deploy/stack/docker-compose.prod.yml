@@ -105,11 +105,13 @@ services:
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE}
       E2B_TEMPLATE_IMAGES: ${E2B_TEMPLATE_IMAGES:-}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
-      # The registry host the pull credentials below belong to: without it the
-      # resolver refuses to attribute the credential to this host (see
-      # registry_credential_host() in envd_service/runtime/oci_registry.py) and
-      # pulls the private base image anonymously -- ACR answers 401 and every
-      # create fails on the warm step (428 warm_required). Measured in Track Z.
+      # The registry host the pull credentials below belong to. Without it
+      # registry_credential_host() returns None and the resolver stops scoping
+      # the credential to its own registry: the ACR username/password are then
+      # offered to *every* host the worker resolves (measured: attached=True
+      # for registry-1.docker.io), which is exactly the leak the resolver's
+      # docstring warns about. With it, the credential goes to that host only
+      # (measured: attached=False for registry-1.docker.io). Track Z.
       E2B_IMAGE_REGISTRY: ${E2B_IMAGE_REGISTRY:-}
       E2B_IMAGE_REGISTRY_USERNAME: ${E2B_IMAGE_REGISTRY_USERNAME:-}
       E2B_IMAGE_REGISTRY_PASSWORD: ${E2B_IMAGE_REGISTRY_PASSWORD:-}
