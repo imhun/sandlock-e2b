@@ -505,7 +505,8 @@ ACR 镜像推送照常，git 远程推送暂缓。
     线上已实测核过。**2026-09-11 B3（SL-1 硬删）**：fork 侧把该档连字段一并删除
     （含 FFI 导出与 `stats()` 计数，导出符号 164→163），拒绝文本变为
     `in-process path mediation refused: … Run sandlock-supervise as uid <N> (route B)`；
-    `wheels/fork/` 已换成 B3 构建（三方 supervise 指纹一致，HEAD `27c7b5d`），
+    `wheels/fork/` 已换成 B3 构建（三方 supervise 指纹一致，HEAD `4b4012b`＝
+    `SHA256SUMS.supervise` 的 `# HEAD=4b4012bc85a8ec…`），
     四条硬前置见 `docs/production-deployment-requirements.md` §2.4。
 
 25. **route-B 特权最小集 + 共享卷 bind 的退化缺口（2026-09-10 实测；2026-09-11 A7 收口）**:

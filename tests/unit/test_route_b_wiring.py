@@ -206,13 +206,18 @@ def test_policy_document_refuses_the_deleted_mediation_tier_by_name():
     key and now the wire does not know it at all: a document that still sends
     one is refused by name (fail-closed) instead of having it dropped on the
     floor, which is what an old ceiling accidentally carrying it would get.
+
+    This is the by-name proof for the removed key: the fork cannot carry one
+    (its own sweep grep is empty), so the only place the string can be pinned
+    is here, on the E2B side of the wire.
     """
-    with pytest.raises(
-        ValueError,
-        match=r"route-B policy ceiling carries field\(s\) the supervise wire "
-        r"does not accept: mediation_run_as",
-    ):
+    with pytest.raises(ValueError) as excinfo:
         supervise_policy_document({"uid": 1, "mediation_run_as": "supervisor"})
+    message = str(excinfo.value)
+    assert message == (
+        "route-B policy ceiling carries field(s) the supervise wire does not "
+        "accept: mediation_run_as"
+    ), message
 
 
 def test_policy_document_refuses_a_field_the_wire_does_not_know():
