@@ -38,6 +38,13 @@ async def mcp_proxy(request: Request, path: str = "") -> Response:
     x_token = request.headers.get("x-mcp-access-token")
     if not (auth == f"Bearer {token}" or x_token == token):
         raise HttpAuthError(401, "Invalid MCP access token")
+    # FUP #4 (Task D1): a gateway the watcher already saw die is not reachable,
+    # so an MCP client gets the recorded reason (exit code + the gateway's own
+    # stderr tail) instead of a bare connection error through the proxy. The
+    # text is the same string the command path returns verbatim.
+    failure = getattr(context, "mcp_gateway_failure", None)
+    if failure is not None:
+        raise HttpAuthError(503, failure.text)
     # E9.1: this route authenticates inline (it targets the per-sandbox
     # mcp-gateway port, not a runtime), so it must mark activity itself --
     # otherwise an MCP-only sandbox would keep looking idle and could be

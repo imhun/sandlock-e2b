@@ -7,7 +7,9 @@ import json
 import logging
 import os
 import threading
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from envd_service.config import Settings
 from envd_service.executors.factory import create_executor
@@ -21,10 +23,32 @@ logger = logging.getLogger(__name__)
 
 _MCP_PORT_BASE = 51000
 _GATEWAY_STDERR_TAIL_BYTES = 4096
+#: Pinned prefix of the SDK-visible text for a gateway that never served
+#: (FUP #4 / Task D1): a contract test asserts this string verbatim.
+MCP_GATEWAY_FAILURE_PREFIX = "mcp gateway failed to start"
+
+
+@dataclass(frozen=True)
+class McpGatewayFailure:
+    """A gateway process that died before the SDK could use it (FUP #4).
+
+    ``text`` is the exact string the SDK sees as the whole stderr of the next
+    command (the watcher's summary of the death: sandbox identity, exit code
+    and the gateway's own stderr tail); ``exit_code`` is that process's own
+    non-zero code and is replayed as the command's exit code, so a caller that
+    only inspects the exit code still fails closed.
+    """
+
+    text: str
+    exit_code: int
 
 
 async def _watch_mcp_gateway_exit(
-    proc, *, sandbox_id: str, port: int
+    proc,
+    *,
+    sandbox_id: str,
+    port: int,
+    on_failure: Callable[[McpGatewayFailure], None] | None = None,
 ) -> None:
     """Log a gateway process that terminates with its stderr/exit text.
 
@@ -33,7 +57,12 @@ async def _watch_mcp_gateway_exit(
     running, and nothing consumes its streams, so an early non-zero exit (e.g.
     a missing interpreter or a bad config) vanished. This watcher drains the
     gateway output (bounded stderr tail) and logs the exit code plus stderr
-    text when the process ends. Logging only -- the SDK contract is unchanged.
+    text when the process ends.
+
+    FUP #4 (Task D1): a non-zero exit is also handed to ``on_failure`` as a
+    typed :class:`McpGatewayFailure`, which is what makes the death visible to
+    the SDK -- the sandbox's command path replays that record instead of
+    reporting success. A clean exit-0 teardown is not a failure.
     The task is cancelled by ``shutdown()`` before the gateway is killed, so a
     normal teardown SIGKILL is not reported as a failure.
     """
@@ -66,12 +95,23 @@ async def _watch_mcp_gateway_exit(
             port,
         )
         return
+    stderr_text = stderr_tail.decode("utf-8", "replace")
+    if on_failure is not None:
+        on_failure(
+            McpGatewayFailure(
+                text=(
+                    f"{MCP_GATEWAY_FAILURE_PREFIX} sandbox_id={sandbox_id} "
+                    f"port={port} exit_code={code} stderr={stderr_text!r}"
+                ),
+                exit_code=code,
+            )
+        )
     logger.error(
         "MCP gateway exited sandbox_id=%s port=%s exit_code=%d stderr=%r",
         sandbox_id,
         port,
         code,
-        stderr_tail.decode("utf-8", "replace"),
+        stderr_text,
     )
 
 
@@ -180,6 +220,7 @@ class SandboxRuntimeContext:
         self.watch_stream = WatchDirStream(self.files)
         self._mcp_gateway = None
         self._mcp_gateway_watch: asyncio.Task | None = None
+        self._mcp_gateway_failure: McpGatewayFailure | None = None
         self._mcp_port: int | None = None
         self._mcp_token: str | None = None
         self._network = dict(record.network) if record.network else None
@@ -200,6 +241,25 @@ class SandboxRuntimeContext:
     @property
     def mcp_token(self) -> str | None:
         return self._mcp_token
+
+    @property
+    def mcp_gateway_failure(self) -> McpGatewayFailure | None:
+        """FUP #4: the gateway death this sandbox must surface, if any.
+
+        Steady state is ``None``. Once the gateway watcher sees a non-zero
+        exit the record is kept for the sandbox's whole life: the command path
+        reads it to fail closed with the recorded reason, and (like the port)
+        it survives a failed start so a retry cannot clear the diagnosis.
+        """
+        return self._mcp_gateway_failure
+
+    def _record_mcp_gateway_failure(self, failure: McpGatewayFailure) -> None:
+        # The watcher is an asyncio task on the app's event loop, exactly like
+        # every RPC handler that reads this, so the assignment needs no lock.
+        # First failure wins: a later death (or a retry) must not rewrite the
+        # reason the SDK was already told about.
+        if self._mcp_gateway_failure is None:
+            self._mcp_gateway_failure = failure
 
     def update_network(self, network: dict | None) -> None:
         """Apply an updated network config; the next command uses it.
@@ -348,6 +408,7 @@ class SandboxRuntimeContext:
                     proc,
                     sandbox_id=self.record.sandbox_id,
                     port=port,
+                    on_failure=self._record_mcp_gateway_failure,
                 )
             )
         return proc

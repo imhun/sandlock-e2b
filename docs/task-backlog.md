@@ -117,10 +117,19 @@ ACR 镜像推送照常，git 远程推送暂缓。
    命令 exit 0（stdout `post-gateway-ok\n`）、第二 450M 命令精确拒绝（exit 137 /
    stdout `''` / stderr ∈ {"", "Killed\n"} / error None）、450+50 控制命令 exit 0 且网关
    持续服务、record `memoryMB == 1024`。thread-tid-keying 残余登记随 row 2。
-4. **FUP 网关启动失败 SDK 可见性**（Task 10/11）: ⬜ open（产品决策，未定）——
-   Task 11 已落地 ERROR 日志（sandbox_id/port/stderr/exit text，
-   `envd_service/runtime/context.py` watcher），SDK 仍按契约先收 exit-0；SDK 可见的
-   错误上抛是未来产品决策，未定。
+4. **FUP 网关启动失败 SDK 可见性**（Task 10/11 → Task D1）: ✅ 已关闭（2026-09-11，
+   决定 ④"SDK 要能看到"）—— watcher 把早期非 0 退出记成 typed `McpGatewayFailure`
+   （文本 `mcp gateway failed to start sandbox_id=… port=… exit_code=… stderr=…` 逐字，
+   `envd_service/runtime/context.py`），命令路径在首次 exec **之前** replay 该记录：
+   `commands.run` 的整串 stderr = 记录原文、退出码 = 网关自己的非 0 码；`/mcp` 以同一
+   文本 503（`envd_service/http/mcp.py`）。判定只认这个 typed 记录，不做子串/宽 except
+   分类。契约 `tests/contract/test_mcp_gateway_failure.py`（建箱 → 调用 → exit_code != 0
+   + stderr 与记录逐字相等 + MCP 503 同文），单测 `tests/unit/test_mcp_gateway.py`
+   两条（watcher 记录、命令路径 replay）。证据：`tmp/d1-red-contract.log`（RED，SDK 侧
+   `exit_code=0 stderr=''`）、`tmp/d1-green-mcp.log`（41 passed，含 netns 契约）、
+   `tmp/d1-green-netns.log`、`tmp/d1-template-isolation.log`、
+   `tmp/d1-prod-shaped-full.log`（`PROD_DROP_CAPS=SYS_ADMIN` 全量 1124 passed / 3 known
+   skips / 0 failed）。
 5. **FUP T5 xfail 摘除 + reason 清理**: 🟡 executor 接线完成、T5 已摘（2026-09-09：
    **executor 已全面走
    supervise** ⇒ `tests/contract/test_uid_permissions.py` 的 strict xfail **已摘**，

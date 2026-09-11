@@ -184,6 +184,26 @@ def build_process_handlers() -> tuple[dict[str, Any], dict[str, Any]]:
 
                 return mcp_gen()
 
+        # FUP #4 (Task D1): a gateway that died at startup must be visible to
+        # the SDK instead of every later command looking healthy. The watcher
+        # records the death as a typed ``McpGatewayFailure`` on the runtime
+        # context; this branch replays it *before exec* -- the whole stderr is
+        # the recorded text verbatim and the exit code is the gateway's own.
+        # The record's presence is the entire test: no substring matching and
+        # no broad ``except`` classification.
+        failure = getattr(ctx, "mcp_gateway_failure", None)
+        if failure is not None:
+            failed = FailedRunningProcess(f"{failure.text}\n")
+
+            async def failed_gen() -> AsyncIterator[dict[str, Any]]:
+                yield start_event(failed.pid)
+                async for kind, chunk in failed.output():
+                    if kind in ("stdout", "stderr"):
+                        yield data_event(kind, chunk)
+                yield end_event(failure.exit_code, "exited")
+
+            return failed_gen()
+
         proc = await ctx.processes.start(
             cmd=[cmd, *args],
             env=merged_env,

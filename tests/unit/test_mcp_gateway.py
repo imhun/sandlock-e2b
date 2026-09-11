@@ -416,6 +416,127 @@ async def test_mcp_gateway_early_exit_logs_error_with_stderr_text(
     ]
 
 
+class _EarlyExitGateway:
+    """Gateway process stub that drains to a non-zero exit with stderr."""
+
+    async def output(self):
+        yield ("stdout", b"ignored")
+        yield ("stderr", b"gateway boom\n")
+
+    async def exit_code(self) -> int:
+        return 2
+
+
+@pytest.mark.asyncio
+async def test_gateway_early_exit_is_recorded_for_the_command_path(caplog) -> None:
+    """FUP #4/Task D1: the watcher hands the death to its recorder as one
+    typed record whose text is exactly what it logs, so the command path can
+    replay it verbatim (logging alone was the pre-FUP#4 behaviour)."""
+    from envd_service.runtime.context import McpGatewayFailure
+
+    recorded: list = []
+    with caplog.at_level(logging.ERROR, logger="envd_service.runtime.context"):
+        await _watch_mcp_gateway_exit(
+            _EarlyExitGateway(),
+            sandbox_id="sbx_gw",
+            port=51001,
+            on_failure=recorded.append,
+        )
+    assert recorded == [
+        McpGatewayFailure(
+            text=(
+                "mcp gateway failed to start sandbox_id=sbx_gw port=51001 "
+                "exit_code=2 stderr='gateway boom\\n'"
+            ),
+            exit_code=2,
+        )
+    ]
+    # ...and the pre-existing ERROR log line is unchanged.
+    assert [r.message for r in caplog.records] == [
+        "MCP gateway exited sandbox_id=sbx_gw port=51001 exit_code=2 "
+        "stderr='gateway boom\\n'"
+    ]
+
+
+class _FailedGatewayCtx:
+    """Runtime context whose gateway died; touching ``processes`` fails.
+
+    The whole point of the FUP #4 surface is that the command fails *before*
+    it execs anything, so this stub turns any exec attempt into an error
+    instead of a silently-skipped collaborator.
+    """
+
+    _network = None
+
+    def __init__(self, failure) -> None:  # noqa: ANN001
+        self.mcp_gateway_failure = failure
+
+    @property
+    def processes(self):  # noqa: ANN201
+        raise AssertionError("a command must not exec after a gateway failure")
+
+
+@pytest.mark.asyncio
+async def test_command_after_gateway_failure_returns_the_recorded_reason() -> None:
+    """FUP #4/Task D1: the next command's whole stderr is the recorded text
+    verbatim and its exit code is the gateway's own non-zero code."""
+    import base64
+
+    import envd_service.rpc as rpc
+    from envd_service.runtime.context import McpGatewayFailure
+
+    failure = McpGatewayFailure(
+        text=(
+            "mcp gateway failed to start sandbox_id=sbx_gw port=51001 "
+            "exit_code=2 stderr='gateway boom\\n'"
+        ),
+        exit_code=2,
+    )
+    sandbox_id = "sbx_gw"
+    ctx = _FailedGatewayCtx(failure)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                runtimes={sandbox_id: ctx},
+                context_factory=None,
+            )
+        )
+    )
+    runtime = SimpleNamespace(
+        sandbox_id=sandbox_id,
+        network=None,
+        workspace_dir="/tmp/sbx_gw_workspace",
+        env_vars={},
+    )
+    _unary, stream = rpc.build_process_handlers()
+    generator = await stream["process.Process/Start"](
+        request, {"process": {"cmd": "echo", "args": ["hi"]}}, runtime
+    )
+    events = [event async for event in generator]
+    start_pid = events[0]["event"]["start"]["pid"]
+    assert events == [
+        {"event": {"start": {"pid": start_pid}}},
+        {
+            "event": {
+                "data": {
+                    "stderr": base64.b64encode(
+                        (failure.text + "\n").encode("utf-8")
+                    ).decode("ascii")
+                }
+            }
+        },
+        {
+            "event": {
+                "end": {
+                    "exitCode": 2,
+                    "exited": True,
+                    "status": "exited",
+                    "error": None,
+                }
+            }
+        },
+    ]
+
 @pytest.mark.asyncio
 async def test_gateway_late_start_with_existing_instance_fails_loudly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

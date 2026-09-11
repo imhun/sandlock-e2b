@@ -608,6 +608,10 @@ def _start_multinode(
         "api_url": f"http://127.0.0.1:{control_port}",
         "sandbox_url": f"http://127.0.0.1:{gateway_port}",
         "worker_urls": [f"http://127.0.0.1:{p}" for p in worker_ports],
+        # The envd apps themselves: contracts that must compare the SDK-visible
+        # result with worker-side runtime state (e.g. the FUP #4 gateway
+        # failure record) read it off ``app.state.runtimes``.
+        "worker_apps": worker_apps,
         "nodes": nodes,
         "control_app": control_app,
         "_stop": lambda: (
