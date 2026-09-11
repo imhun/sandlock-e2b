@@ -215,13 +215,24 @@ def create_app(
     runtime_registry = runtime_registry or RuntimeRegistry(
         workspace_base or settings.workspace_base
     )
-    # E5.1: per-sandbox host uids need a privileged supervisor (root /
-    # CAP_SETUID + chown). A non-root worker (uid 65534) cannot map
-    # arbitrary host uids (S1.2 fail-closed), so the switch is auto-disabled
-    # and the worker keeps the fixed-identity + Landlock model instead of
-    # crash-looping on EPERM.
-    if settings.per_sandbox_uid and os.geteuid() == 0:
-        if not has_effective_cap(CAP_SYS_PTRACE):
+    # Track F (Task F1): resolve the file-capability brokers once, before the
+    # uid pool / route-B decisions below depend on them. A half-installed
+    # broker pair raises here (named) instead of the worker quietly keeping a
+    # weaker shape; "no brokers at all" keeps today's model with one warning.
+    from envd_service import priv_helpers
+
+    priv_helpers.configure_priv_helpers(settings)
+    brokers = priv_helpers.active_helpers()
+    unavailable = priv_helpers.helpers_unavailable_reason(settings)
+    if unavailable is not None:
+        logger.warning("%s", unavailable)
+    # E5.1: per-sandbox host uids need a privileged supervisor -- root /
+    # CAP_SETUID + chown, or (Track F) the two file-capability brokers, which
+    # are exactly how a non-root worker (uid 65534) gets those steps. Without
+    # either, the switch is auto-disabled and the worker keeps the
+    # fixed-identity + Landlock model instead of crash-looping on EPERM.
+    if settings.per_sandbox_uid and (os.geteuid() == 0 or brokers is not None):
+        if os.geteuid() == 0 and not has_effective_cap(CAP_SYS_PTRACE):
             # Writing a *child's* uid_map needs CAP_SETUID **and** ptrace access
             # to that child, so a root worker with a hardened capability set
             # cannot remap sandboxes in-process -- measured: every create fails
@@ -276,7 +287,7 @@ def create_app(
         if (
             settings.per_sandbox_uid
             and settings.uid_reconcile_on_startup
-            and os.geteuid() == 0
+            and (os.geteuid() == 0 or priv_helpers.active_helpers() is not None)
             and runtime_registry.uid_pool is not None
         ):
             uid_reconcile_task = asyncio.create_task(

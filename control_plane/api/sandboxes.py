@@ -1182,11 +1182,17 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
     existing = request.app.state.runtime_registry.get(record.sandbox_id)
     # E3.2: allocate the sandbox's host uid through the shared worker uid
     # pool before materializing volumes so per-sandbox volume slices are
-    # chowned to it. Only a root worker maps arbitrary host uids (S1.2);
-    # otherwise the fixed-uid + Landlock model applies.
+    # chowned to it. Only a root worker -- or a non-root worker that resolved
+    # the Track F file-capability brokers, which perform the chown there --
+    # can put a sandbox under its own host uid; otherwise the fixed-uid +
+    # Landlock model applies.
     host_uid = None
     pool = getattr(request.app.state.runtime_registry, "uid_pool", None)
-    if pool is not None and os.geteuid() == 0:
+    from envd_service import priv_helpers
+
+    if pool is not None and (
+        os.geteuid() == 0 or priv_helpers.active_helpers() is not None
+    ):
         host_uid = pool.acquire(
             record.sandbox_id,
             preferred=existing.host_uid if existing is not None else None,

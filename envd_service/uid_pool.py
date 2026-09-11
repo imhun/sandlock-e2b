@@ -160,7 +160,23 @@ def _read_uid_marker(marker: Path) -> int | None:
 
 
 def _chown_tree(path: Path, uid: int, gid: int) -> None:
-    """Recursively chown ``path`` (symlinks themselves, never their targets)."""
+    """Recursively chown ``path`` (symlinks themselves, never their targets).
+
+    On a non-root worker the recursion happens **inside** ``e2b-maint``: the
+    worker cannot descend a tenant's ``0700`` tree, and that capability is the
+    whole reason the maintenance broker exists. Handing a reclaimed orphan
+    back to the worker identity (``uid == os.geteuid()``) uses the broker's
+    ``--worker`` form, so the request can never name root.
+    """
+    from envd_service import priv_helpers
+
+    helpers = priv_helpers.active_helpers()
+    if helpers is not None and priv_helpers.helpers_cover(path):
+        if uid == os.geteuid() and gid == os.getegid():
+            helpers.chown_worker(path=path, recursive=True)
+        else:
+            helpers.chown(uid=uid, path=path, recursive=True)
+        return
     os.lchown(path, uid, gid)
     if not path.is_symlink() and path.is_dir():
         for root, dirs, files in os.walk(path, topdown=False):
@@ -180,6 +196,20 @@ def apply_sandbox_ownership(workspace_dir: str | Path, host_uid: int) -> None:
     kernel DAC check is the isolation backstop behind Landlock.
     """
     path = Path(workspace_dir)
+    from envd_service import priv_helpers
+
+    helpers = priv_helpers.active_helpers()
+    if helpers is not None and priv_helpers.helpers_cover(path):
+        # Tighten *before* handing the tree over: chmod needs ownership (or
+        # CAP_FOWNER, which the maintenance broker deliberately does not
+        # carry), and the worker owns the tree it just created.
+        try:
+            if path.stat().st_uid == os.geteuid():
+                os.chmod(path, 0o700)
+        except OSError as exc:
+            logger.warning("cannot tighten %s to 0700: %s", path, exc)
+        helpers.chown(uid=host_uid, path=path, recursive=True)
+        return
     _chown_tree(path, host_uid, host_uid)
     os.chmod(path, 0o700)
 

@@ -52,6 +52,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from envd_service.priv_helpers import PrivHelperError
+
 logger = logging.getLogger(__name__)
 
 
@@ -555,8 +557,8 @@ class W1SlotPool:
             with open(path, "w", encoding="utf-8") as document:
                 document.write(payload)
             try:
-                os.chown(path, -1, uid)
-            except PermissionError:
+                self._scope_slot_document(path, uid)
+            except (PermissionError, PrivHelperError):
                 # A worker that cannot chown (an unprivileged pool attached to
                 # an externally started fleet) has no way to scope the group;
                 # say so instead of shipping a silently world-readable policy.
@@ -572,6 +574,24 @@ class W1SlotPool:
                 os.chmod(path, 0o444)
             else:
                 os.chmod(path, 0o440)
+
+    @staticmethod
+    def _scope_slot_document(path: Path, uid: int) -> None:
+        """Make a slot document readable by exactly one uid.
+
+        Root worker: ``chown -1:<uid>`` (owner stays root, group is the slot).
+        Non-root worker: the maintenance broker cannot chown to ``-1``, so the
+        owner stays the **worker** (it has to be able to rewrite the lease on a
+        W1 restart) and only the group becomes the slot uid ``uid`` -- the same
+        0440 "readable by the slot, closed to every other tenant" property,
+        with the worker as owner instead of root.
+        """
+        from envd_service import priv_helpers
+
+        if priv_helpers.helpers_cover(path):
+            priv_helpers.broker_reclaim(path, recursive=False, gid=uid)
+            return
+        os.chown(path, -1, uid)
 
     def _wait_until_launched(self, handle: SlotHandle) -> SlotHandle:
         """Block until the slot answers ``stats`` with a launched instance.
@@ -1277,7 +1297,16 @@ class RouteBConfig:
         partial settings object (the factory's unit stubs) simply gets the
         documented default -- route B off unless its own switches say
         otherwise.
+
+        Track F (Task F1): when this worker resolved the file-capability
+        brokers at startup (``envd_service.priv_helpers``), the slot spawner
+        *is* the broker (``e2b-slot-spawn``), which is what lets a non-root
+        worker start a slot at another uid. A root worker gets no spawner here
+        and keeps the ``setpriv`` form in :func:`_spawn_slot`.
         """
+        from envd_service import priv_helpers
+
+        helpers = priv_helpers.active_helpers()
         return cls(
             mode=str(getattr(settings, "route_b", "auto")).lower(),
             slots=int(getattr(settings, "route_b_slots", 0) or 0),
@@ -1286,6 +1315,7 @@ class RouteBConfig:
             tmp_root=Path(
                 getattr(settings, "route_b_tmp_root", "/tmp/sandlock-route-b")
             ),
+            spawner=helpers.slot_spawner if helpers is not None else None,
             transport=str(getattr(settings, "route_b_transport", "fd")).lower(),
             verb_timeout_s=float(
                 getattr(settings, "route_b_verb_timeout_s", 15.0)

@@ -113,6 +113,14 @@ def _build_worker_image(build_ctx: Path) -> None:
         src = PROJECT_ROOT / name
         dst = build_ctx / name
         shutil.copytree(src, dst, symlinks=True)
+    # Track F (F1): the worker Dockerfile also compiles the two
+    # file-capability brokers from deploy/priv/, so the minimal context has to
+    # carry that directory too (a missing input fails the COPY, not the
+    # build's ability to run the image).
+    shutil.copytree(
+        PROJECT_ROOT / "deploy" / "priv", build_ctx / "deploy" / "priv",
+        symlinks=True,
+    )
     arch = platform.machine()
     if arch == "x86_64":
         target_arch = "amd64"

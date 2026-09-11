@@ -736,7 +736,13 @@ def test_create_app_nonroot_discloses_direct_quota_downgrade(
     )
     caplog.set_level(logging.WARNING)
     create_envd_app(
-        settings=EnvdSettings(executor="local", workspace_base=tmp_path),
+        # E2B_PRIV_HELPERS=off pins the *non-root in-process* shape this test
+        # is about: with the Track F brokers installed, a non-root worker
+        # keeps per-sandbox uids and the E3.2 disclosure no longer applies
+        # (tests/unit/test_priv_helpers.py covers that shape).
+        settings=EnvdSettings(
+            executor="local", workspace_base=tmp_path, priv_helpers="off"
+        ),
         runtime_registry=RuntimeRegistry(tmp_path),
     )
     assert [r.message for r in caplog.records if r.name == "envd_service.app"] == [
@@ -762,7 +768,13 @@ def test_create_app_nonroot_with_sys_admin_cap_no_disclosure(
     )
     caplog.set_level(logging.WARNING)
     create_envd_app(
-        settings=EnvdSettings(executor="local", workspace_base=tmp_path),
+        # The Track F brokers live in /var/lib/e2b-priv, outside this test's
+        # tmp_path workspace, so a simulated non-root worker would (correctly)
+        # refuse the broker shape here. These tests pin the non-root
+        # *in-process* disclosure, so they ask for it explicitly.
+        settings=EnvdSettings(
+            executor="local", workspace_base=tmp_path, priv_helpers="off"
+        ),
         runtime_registry=RuntimeRegistry(tmp_path),
     )
     assert [r for r in caplog.records if "磁盘配额不可用" in r.message] == []
@@ -784,7 +796,9 @@ def test_create_app_nonroot_non_xfs_host_no_disclosure(
     )
     caplog.set_level(logging.WARNING)
     create_envd_app(
-        settings=EnvdSettings(executor="local", workspace_base=tmp_path),
+        settings=EnvdSettings(
+            executor="local", workspace_base=tmp_path, priv_helpers="off"
+        ),
         runtime_registry=RuntimeRegistry(tmp_path),
     )
     assert [r for r in caplog.records if "磁盘配额不可用" in r.message] == []
@@ -811,6 +825,7 @@ def test_create_app_nonroot_via_agent_no_disclosure(tmp_path, monkeypatch, caplo
             executor="local",
             workspace_base=tmp_path,
             quota_via_agent=True,
+            priv_helpers="off",
         ),
         runtime_registry=RuntimeRegistry(tmp_path),
     )

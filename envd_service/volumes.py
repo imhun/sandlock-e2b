@@ -138,7 +138,7 @@ def _ensure_shared_volume_root(volume_root: Path, host_uid: int) -> None:
     _ensure_traversable(volume_root)
     try:
         if st.st_uid == 0:
-            os.chown(volume_root, host_uid, host_uid)
+            _chown_path(volume_root, host_uid)
         os.chmod(volume_root, 0o1777)
     except OSError as exc:
         logger.warning(
@@ -146,6 +146,28 @@ def _ensure_shared_volume_root(volume_root: Path, host_uid: int) -> None:
             volume_root,
             exc,
         )
+
+
+def _chown_path(path: Path, host_uid: int) -> None:
+    """chown one directory to a sandbox uid (broker-first on non-root workers).
+
+    A non-root worker has no CAP_CHOWN of its own; the maintenance broker is
+    what makes the E3.2 ownership model hold there. Outside the broker's
+    whitelist (or with no brokers) this falls back to the in-process call.
+    """
+    from envd_service import priv_helpers
+
+    if priv_helpers.helpers_cover(path):
+        priv_helpers.broker_chown(host_uid, path, recursive=False)
+        return
+    os.chown(path, host_uid, host_uid)
+
+
+def _can_manage_sandbox_uid() -> bool:
+    """Whether this worker can put a path under a sandbox's own host uid."""
+    from envd_service import priv_helpers
+
+    return os.geteuid() == 0 or priv_helpers.active_helpers() is not None
 
 
 def provision_sandbox_volume_mount(
@@ -175,7 +197,7 @@ def provision_sandbox_volume_mount(
     single-uid ownership model (worker identity).
     """
     volume_root = Path(volume_path)
-    if host_uid is not None and os.geteuid() == 0:
+    if host_uid is not None and _can_manage_sandbox_uid():
         _ensure_shared_volume_root(volume_root, host_uid)
     if per_sandbox_quota_mb <= 0:
         return volume_root, None
@@ -186,9 +208,24 @@ def provision_sandbox_volume_mount(
     sandbox_dir = volume_root / sandbox_id
     try:
         sandbox_dir.mkdir(parents=True, exist_ok=True)
-        if host_uid is not None and os.geteuid() == 0:
-            os.chown(sandbox_dir, host_uid, host_uid)
-            os.chmod(sandbox_dir, 0o700)
+        if host_uid is not None and _can_manage_sandbox_uid():
+            from envd_service import priv_helpers
+
+            if priv_helpers.helpers_cover(sandbox_dir):
+                # Tighten while the worker still owns the fresh slice, then
+                # hand it to the sandbox uid (chmod needs ownership).
+                try:
+                    os.chmod(sandbox_dir, 0o700)
+                except OSError as exc:
+                    logger.debug(
+                        "cannot tighten volume slice %s before chown: %s",
+                        sandbox_dir,
+                        exc,
+                    )
+                priv_helpers.broker_chown(host_uid, sandbox_dir, recursive=True)
+            else:
+                os.chown(sandbox_dir, host_uid, host_uid)
+                os.chmod(sandbox_dir, 0o700)
         projid = provision_project(
             sandbox_id=volume_projid_key(sandbox_id, volume_id, mount_path),
             project_dir=sandbox_dir,
@@ -366,4 +403,8 @@ def cleanup_volume_projects(
                     projid,
                     exc,
                 )
-        shutil.rmtree(sandbox_dir, ignore_errors=True)
+        # Broker-first: the slice is owned by the sandbox's host uid at 0700,
+        # so a non-root worker can only remove it through e2b-maint.
+        from envd_service import priv_helpers
+
+        priv_helpers.remove_tree(sandbox_dir)

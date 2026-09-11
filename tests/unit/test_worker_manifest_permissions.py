@@ -8,6 +8,14 @@ and the manifest does not override it, so ``NET_BIND_SERVICE`` is inert
 gateway's ``:53`` bind would fail with the kernel-default
 ``ip_unprivileged_port_start=1024``.
 
+Track F (Task F1) adds the other half: a non-root worker gets per-sandbox host
+uids and route-B slots from the two file-capability brokers, and the kernel
+refuses to exec them unless their capabilities are inside the container's
+*bounding* set. So the manifests now declare exactly those four caps (SETUID,
+SETGID, CHOWN, DAC_OVERRIDE) -- ``capabilities.add`` grants a non-root process
+nothing effective, so this is a BND declaration, not a privilege grant, and it
+must never be paired with ``no-new-privileges`` (NNP=1 disables file caps).
+
 Text assertions rather than a YAML parse: the repo does not depend on PyYAML.
 """
 
@@ -33,7 +41,23 @@ def test_stack_worker_has_no_cap_add_and_declares_the_low_port_window() -> None:
     worker = STACK_COMPOSE.split("\n  worker-1: &worker", 1)[1].split(
         "\n  worker-2:", 1
     )[0]
-    assert "cap_add:" not in worker
+    # No SYS_ADMIN (A6), and only the four file-capability-broker caps (Track
+    # F): the BND has to contain them for the brokers' file xattrs to survive
+    # exec, while a non-root worker's own CapEff stays 0.
+    assert "\n      - SYS_ADMIN\n" not in worker
+    assert (
+        "\n    cap_drop:\n"
+        "      - ALL\n"
+        "    cap_add:\n"
+        "      - SETUID      # e2b-slot-spawn: setuid(X) on the pooled host uid\n"
+        "      - SETGID      # e2b-slot-spawn: setgroups([]) + setgid(X)\n"
+        "      - CHOWN       # e2b-maint: workspace/slice ownership + slot documents\n"
+        "      - DAC_OVERRIDE  # e2b-maint: tenant 0700 trees (walk/rm/chown)\n"
+        in worker
+    )
+    # Negative form: no NNP directive can be added to the security_opt list.
+    assert "\n      - no-new-privileges" not in worker
+    assert "\n      - seccomp=unconfined\n" in worker
     assert "\n    sysctls:\n" in worker
     assert "\n      - net.ipv4.ip_unprivileged_port_start=0\n" in worker
 
@@ -45,9 +69,22 @@ def test_stack_quota_agent_owns_the_capability_behind_a_profile() -> None:
     assert "    image: ${QUOTA_AGENT_IMAGE:-e2b-sandlock-quota-agent:latest}\n" in agent
 
 
-def test_k8s_worker_drops_sys_admin_and_keeps_net_bind_service() -> None:
+def test_k8s_worker_drops_sys_admin_and_declares_the_broker_caps() -> None:
     assert 'add: ["SYS_ADMIN"' not in K8S_WORKER
-    assert 'add: ["NET_BIND_SERVICE"]\n' in K8S_WORKER
+    assert "\n                - SYS_ADMIN\n" not in K8S_WORKER
+    assert (
+        "              add:\n"
+        "                - NET_BIND_SERVICE\n"
+        "                - SETUID\n"
+        "                - SETGID\n"
+        "                - CHOWN\n"
+        "                - DAC_OVERRIDE\n"
+        in K8S_WORKER
+    )
+    # NNP=1 (either spelling) makes the kernel ignore file capabilities, which
+    # would silently turn the brokers back into unprivileged binaries.
+    assert "allowPrivilegeEscalation: false" not in K8S_WORKER
+    assert "no-new-privileges" not in K8S_WORKER
 
 
 def test_k8s_low_port_window_is_pod_level_not_container_level() -> None:

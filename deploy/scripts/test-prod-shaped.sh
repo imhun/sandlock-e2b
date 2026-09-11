@@ -130,10 +130,22 @@ docker run --rm --init --network host \
     pytest tests --perf -q -p no:cacheprovider $XFS_DESELECTS "$@"
 
 if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
-    echo "==> phase 2: unprivileged worker (uid 65534, no CAP_SETUID, no slots)"
+    echo "==> phase 2: unprivileged worker (uid 65534 + the file-capability brokers)"
+    # Track F (Task F1): the deployed non-root worker gets per-sandbox host uids
+    # and route-B slots from the two file-capability brokers
+    # (/var/lib/e2b-priv/e2b-slot-spawn, e2b-maint). File capabilities are a
+    # *subset* of the container's bounding set or the exec is refused with
+    # EPERM (measured), so this phase has to declare the same four caps the
+    # manifests do -- with `--cap-drop ALL` alone the lane would "prove" that
+    # the mechanism is unusable while the same image's brokers work in a real
+    # deployment. The worker's own CapEff stays 0 (no ambient caps for a
+    # non-root process); the capabilities only ever arrive via the broker
+    # binaries.
     # shellcheck disable=SC2086
     docker run --rm --init --network host --user 65534:65534 \
-        --cap-drop ALL --security-opt seccomp=unconfined \
+        --cap-drop ALL \
+        --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE \
+        --security-opt seccomp=unconfined \
         --security-opt apparmor=unconfined \
         -e HOME=/tmp -e TMPDIR=/tmp \
         -e E2B_HOST_PROJECT="$(pwd)" \
@@ -144,7 +156,8 @@ if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
         pytest tests/security/test_template_isolation.py \
             tests/security/test_sandlock_isolation.py \
             tests/unit/test_sandlock_executor_route_b.py \
-            tests/unit/test_policy_mapping.py -q -p no:cacheprovider "$@"
+            tests/unit/test_policy_mapping.py \
+            tests/contract/test_nonroot_route_b.py -q -p no:cacheprovider "$@"
         # ^ E2B_BASE_IMAGE is deliberately not inherited: `python-mcp:3.14` is a
         # locally built image that the registry mirrors refuse (403 not in the
         # allowlist), and phase 1 only resolves it because its rootfs is already

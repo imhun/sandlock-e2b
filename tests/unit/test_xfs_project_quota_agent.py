@@ -24,10 +24,17 @@ def _uid_disclosure() -> list[str]:
     Per-sandbox uids are the default; an unprivileged worker says so once at
     startup, a root worker builds the uid pool and stays quiet -- so the exact
     expected startup list depends on who runs the suite.
+
+    Track F: a non-root worker that resolved the file-capability brokers also
+    builds the uid pool, so the disclosure is conditional on their absence.
     """
     import os
 
-    return [] if os.geteuid() == 0 else [app_module.PER_UID_NONROOT_WARNING]
+    from envd_service import priv_helpers
+
+    if os.geteuid() == 0 or priv_helpers.active_helpers() is not None:
+        return []
+    return [app_module.PER_UID_NONROOT_WARNING]
 
 
 def _warnings(caplog) -> list[str]:

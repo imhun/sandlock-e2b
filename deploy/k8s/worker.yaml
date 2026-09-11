@@ -60,6 +60,19 @@ spec:
               value: "internal-key"
             - name: E2B_WORKSPACE_BASE
               value: /var/lib/e2b-sandboxes
+            # Track F (F1): the non-root worker scopes each slot's
+            # policy/program documents to that slot's uid (0440) through
+            # e2b-maint, and the broker only touches paths under
+            # <workspace_base>/ or <shared_volume_root>/. Anywhere else the
+            # helpers self-check refuses the shape at startup by name (the
+            # alternative is a world-readable 0444 policy document carrying
+            # the egress-proxy credentials).
+            - name: E2B_ROUTE_B_TMP_ROOT
+              value: /var/lib/e2b-sandboxes/.route-b
+            # Track F (F1): `auto` uses the image's file-capability brokers on
+            # this non-root pod; `off` keeps the in-process E5.1 shape.
+            - name: E2B_PRIV_HELPERS
+              value: "auto"
             - name: E2B_BASE_IMAGE
               value: python:3.14-slim
             - name: E2B_NODE_MEMORY_MB
@@ -84,9 +97,23 @@ spec:
           # this non-root pod -- see the comment there).
           securityContext:
             capabilities:
-              # Kept for a root override (runAsUser: 0); inert for the default
-              # non-root pod, which relies on the sysctl above.
-              add: ["NET_BIND_SERVICE"]
+              # Track F (F1): the non-root worker's two file-capability brokers
+              # (/var/lib/e2b-priv/e2b-slot-spawn cap_setuid,cap_setgid+ep and
+              # e2b-maint cap_chown,cap_dac_override+ep) take their capability
+              # from the file xattr, but the exec is refused with EPERM unless
+              # those caps are in the container's *bounding* set (measured).
+              # `add` grants a non-root process nothing effective -- the worker
+              # still runs with CapEff=0 -- so the four are declared and
+              # nothing else. Never set an escalation-blocking field here:
+              # NNP=1 makes the kernel ignore file capabilities outright.
+              # NET_BIND_SERVICE stays for a root override (runAsUser: 0); it is
+              # inert for the default non-root pod, which uses the sysctl above.
+              add:
+                - NET_BIND_SERVICE
+                - SETUID
+                - SETGID
+                - CHOWN
+                - DAC_OVERRIDE
             seccompProfile:
               type: Unconfined
           volumeMounts:

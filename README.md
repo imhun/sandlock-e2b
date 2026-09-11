@@ -226,6 +226,7 @@ rootfs chroot / SOCKS5 出口，与 compose 部署一致）：
 | `E2B_BASE_IMAGE` | 未配置 | `base` 模板基础镜像；配置后启用镜像 rootfs |
 | `E2B_TEMPLATE_IMAGES` | `{}` | 模板 ID → 基础镜像 JSON 映射 |
 | `E2B_EXECUTOR` | `auto` | `auto`/`local`/`sandlock`；`auto` 只对**顶层包不存在**（`ModuleNotFoundError: No module named 'sandlock'`）回落 `local`，包在但坏（版本不匹配/缺符号/半升级树少 `sandlock.*` 子模块）一律 fail closed（B1 fix round 2/3） |
+| `E2B_PRIV_HELPERS` | `auto` | 非 root worker 的 file-capability broker 开关（F1）。`auto`：uid 65534 worker 用镜像里 `/var/lib/e2b-priv/` 的两个**编译型** broker（`e2b-slot-spawn`=`cap_setuid,cap_setgid+ep`、`e2b-maint`=`cap_chown,cap_dac_override+ep`）完成两步特权动作 —— 以池内任意 uid 起 route-B 槽位、chown/删除/遍历租户 0700 目录 —— 于是非 root worker 同样有 per-sandbox host uid + route-B（`spawn` 只能起 `sandlock-supervise` 绝对路径、uid 必须在池内；`maint` 的路径必须经 `realpath` 落在 `<workspace_base>/` 或 `<shared_volume_root>/` 之下）。`off`：回到进程内 E5.1 形态。**半安装**的 broker 对会让 worker 启动失败并点名；完全没有 broker 时打一条 WARNING 后保持进程内。清单已把这四条 cap 补进容器 **BND**（非 root 进程自身 `CapEff` 仍为 0），**绝不要加 no-new-privileges**（NNP=1 会让 file caps 全废） |
 | `E2B_MAX_TOTAL_*` | 见 spec | 宿主总资源上限，`0` 表示关闭该维度 |
 
 ## 与 spec 的两处事实性偏差

@@ -105,6 +105,13 @@ services:
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE}
       E2B_TEMPLATE_IMAGES: ${E2B_TEMPLATE_IMAGES:-}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # Track F (F1): a non-root worker scopes each slot's policy/program
+      # documents to that slot's uid (0440) through e2b-maint, and the broker
+      # only touches paths under <workspace_base>/ or <shared_volume_root>/.
+      # Anywhere else the helpers self-check refuses the shape at startup by
+      # name -- the alternative is a world-readable 0444 policy document
+      # (it carries the egress-proxy credentials).
+      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       # The registry host the pull credentials below belong to. Without it
       # registry_credential_host() returns None and the resolver stops scoping
       # the credential to its own registry: the ACR username/password are then
@@ -131,8 +138,30 @@ services:
       E2B_QUOTA_AGENT_URL: ${E2B_QUOTA_AGENT_URL:-}
       E2B_QUOTA_AGENT_TOKEN: ${E2B_QUOTA_AGENT_TOKEN:-}
       E2B_QUOTA_AGENT_TIMEOUT_S: ${E2B_QUOTA_AGENT_TIMEOUT_S:-5}
+      # Track F (F1): `auto` (default) uses the image's file-capability brokers
+      # (/var/lib/e2b-priv/e2b-slot-spawn, e2b-maint) on this non-root worker;
+      # `off` keeps the in-process E5.1 shape. See the cap_drop/cap_add block
+      # below -- the four caps must be in the bounding set or the broker exec
+      # is refused, and no-new-privileges must never be added.
+      E2B_PRIV_HELPERS: ${E2B_PRIV_HELPERS:-auto}
     volumes: &worker-volumes
       - sandbox-shared:/var/lib/e2b-sandboxes
+    # Track F / Task F1: the non-root worker's two file-capability brokers
+    # (/var/lib/e2b-priv/e2b-slot-spawn, e2b-maint) get their capability from
+    # the file xattr, but the kernel refuses the exec unless those caps are in
+    # the container's *bounding* set (measured: "file caps must be a subset of
+    # BND, otherwise even exec is EPERM"). `cap_add` alone grants a non-root
+    # process nothing effective -- the worker's own CapEff stays 0 -- so this is
+    # exactly the four caps the brokers use and nothing else. Never add a
+    # no-new-privileges security_opt: NNP=1 makes the kernel ignore file
+    # capabilities, so the brokers would stop working.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID      # e2b-slot-spawn: setuid(X) on the pooled host uid
+      - SETGID      # e2b-slot-spawn: setgroups([]) + setgid(X)
+      - CHOWN       # e2b-maint: workspace/slice ownership + slot documents
+      - DAC_OVERRIDE  # e2b-maint: tenant 0700 trees (walk/rm/chown)
     # A6: the worker needs no SYS_ADMIN. The three former uses are gone --
     # ① the shared-volume ``mount --bind`` was deleted in A4 (virtual paths +
     # A5 traversal bits); ② quota runs on the quota-agent service below;

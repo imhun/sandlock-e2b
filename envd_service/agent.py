@@ -217,7 +217,11 @@ def _delete_sandbox_runtime(
             fallback_mount_point=settings.workspace_base,
             via_agent=settings.quota_via_agent,
         )
-    shutil.rmtree(workspace_dir, ignore_errors=True)
+    # Broker-first (Track F): a sandbox workspace is owned by its own host uid
+    # at 0700, so a non-root worker can only remove it through e2b-maint.
+    from envd_service import priv_helpers
+
+    priv_helpers.remove_tree(workspace_dir)
 
 
 class NodeAgent:
@@ -417,12 +421,20 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
     volume_mounts = payload.get("volumeMounts") or []
     existing = runtime_registry.get(sandbox_id)
     # E3.2: allocate the sandbox's host uid before materializing volumes so
-    # per-sandbox volume slices can be chowned to it. Only a root worker can
-    # map arbitrary host uids (S1.2); non-root workers keep the fixed-uid +
-    # Landlock model and never allocate.
+    # per-sandbox volume slices can be chowned to it. Only a root worker -- or
+    # a non-root worker that resolved the file-capability brokers (Track F),
+    # which is what makes the chown possible there -- can put a sandbox under
+    # its own host uid; everything else keeps the fixed-uid + Landlock model
+    # and never allocates.
     host_uid = None
     pool = getattr(runtime_registry, "uid_pool", None)
-    if settings.per_sandbox_uid and os.geteuid() == 0 and pool is not None:
+    from envd_service import priv_helpers
+
+    if (
+        settings.per_sandbox_uid
+        and (os.geteuid() == 0 or priv_helpers.active_helpers() is not None)
+        and pool is not None
+    ):
         host_uid = pool.acquire(
             sandbox_id,
             preferred=existing.host_uid if existing is not None else None,
@@ -833,7 +845,9 @@ async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
     if workspace.exists():
         # Retry-friendly: a previous failed migration may have left partial
         # files; the incoming archive is the full source of truth.
-        shutil.rmtree(workspace, ignore_errors=True)
+        from envd_service import priv_helpers
+
+        priv_helpers.remove_tree(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
     migrate_dir = settings.workspace_base / "_migrate"
     migrate_dir.mkdir(parents=True, exist_ok=True)
