@@ -29,7 +29,17 @@ COPY gateway_common/ gateway_common/
 COPY control_plane/ control_plane/
 COPY envd_service/ envd_service/
 
+# E5.1: the shared workspace volume is mounted here and the *workers* run as
+# uid 65534. This image is the first to mount that volume (workers declare
+# ``depends_on: control-plane``), so Docker initializes a fresh named volume
+# from *this* image -- with no directory in the image the volume root comes out
+# root:root and every worker provision then fails with EACCES on
+# ``<workspace>/<sandbox-id>`` (measured; ``upgrade.sh`` can only repair it on
+# an existing host). Pre-creating the directory owned by 65534 makes a fresh
+# ``docker compose up`` work; the control plane itself runs as root and is
+# unaffected by the ownership.
 ENV E2B_WORKSPACE_BASE=/var/lib/e2b-sandboxes
+RUN mkdir -p /var/lib/e2b-sandboxes && chown 65534:65534 /var/lib/e2b-sandboxes
 EXPOSE 3000
 
 CMD ["python", "-m", "control_plane.combined_main"]
