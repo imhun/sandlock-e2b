@@ -530,12 +530,25 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
 @router.post("/agent/sandboxes", status_code=201)
 async def agent_create_sandbox(request: Request) -> Response:
     settings = request.app.state.settings
+    # F6: auth gets its own try. It used to share one ``except PermissionError``
+    # with provisioning, so an EPERM/EACCES *during* provisioning (e.g. a
+    # root-owned cold shared volume) came back as 401 with an empty body and
+    # the control plane could only report a bare "failed to provision: ".
     try:
         _require_internal_key(request, settings)
+    except PermissionError:
+        # Deliberately body-less: same answer for a missing and a wrong key,
+        # and never any hint about the expected value.
+        return Response(status_code=401)
+    try:
         payload = await request.json()
         _agent_create_sandbox(request, settings, payload)
-    except PermissionError:
-        return Response(status_code=401)
+    except PermissionError as e:
+        # A worker-side permission fault while provisioning, not an auth
+        # failure: 500 with the reason so the control plane's
+        # "failed to provision: <body>" names the real cause.
+        logger.exception("agent create sandbox failed (permission)")
+        return Response(status_code=500, content=str(e)[:500])
     except (ValueError, json.JSONDecodeError) as e:
         return Response(status_code=400, content=str(e))
     except Exception:
@@ -888,8 +901,13 @@ async def agent_health(request: Request) -> dict[str, Any]:
 @router.post("/agent/snapshots", status_code=201)
 async def agent_create_snapshot(request: Request) -> Response:
     settings = request.app.state.settings
+    # Same F6 shape as the create-sandbox route: a PermissionError from
+    # ``copytree`` below is a worker-side EPERM/EACCES, not a bad key.
     try:
         _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    try:
         body = await request.json()
         snapshot_id = body.get("snapshotID")
         sandbox_id = body.get("sandboxID")
@@ -902,8 +920,9 @@ async def agent_create_snapshot(request: Request) -> Response:
         if dst.exists():
             return Response(status_code=409, content="snapshot already exists")
         shutil.copytree(src, dst, symlinks=True)
-    except PermissionError:
-        return Response(status_code=401)
+    except PermissionError as e:
+        logger.exception("agent create snapshot failed (permission)")
+        return Response(status_code=500, content=str(e)[:500])
     except Exception:
         logger.exception("agent create snapshot failed")
         return Response(status_code=500)

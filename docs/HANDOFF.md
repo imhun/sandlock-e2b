@@ -31,7 +31,7 @@
 循环里摘掉**，`--cap-drop` 只作兜底（`deploy/scripts/test-prod-shaped.sh`）。只按计划原文
 追加 `--cap-drop` 会得到「看起来在跑无 `SYS_ADMIN` 形态、其实还带着它」的假证据。
 
-### 2. 三处改动 + commit（主仓库 `main`；fork 子模块只读、本轮未改动，指针仍 `71e9deb`）
+### 2. 三处改动 + commit（主仓库 `main`；fork 子模块只读、本轮未改动 —— 当时的指针是 `71e9deb`，终态收口 `b51fd0d` 已把它重钉到 `a063daf`，见 §3）
 
 | # | 原用途 | 终态 | commit |
 |---|---|---|---|
@@ -41,8 +41,9 @@
 
 fork 侧支撑这次改动的三个 commit（同一轮 A1–A3，**未推送**）：`aadb5ad`（A1 RED：子挂载 +
 别名下的相对路径）、`c6cbe03`（A2 修复：虚拟 cwd 由请求决定、host→virtual 平局规则确定化）、
-`71e9deb`（A3：`docs/test-baseline.md`/`CHANGELOG` + wheel 在该 tip 重建，manifest HEAD == tip；
-A4 起用这枚 wheel 重建测试镜像）。A5/A6 是纯 E2B 侧改动，**不需要 fork 变更**。
+`71e9deb`（**A3 期的 tip，已不是当前指针**：`docs/test-baseline.md`/`CHANGELOG` + wheel 在该 tip
+重建，manifest HEAD == tip；A4–A7 用这枚 wheel 重建测试镜像；2026-09-11 终态收口 `b51fd0d` 把
+子模块重钉到 `a063daf` 并同批换成新 wheel，指纹见 §3）。A5/A6 是纯 E2B 侧改动，**不需要 fork 变更**。
 
 主仓库这一串的提交顺序：`58f0ff4`（A0–A3 控制器更正 + fork 指针提到 A3 wheel tip）→
 `d3c390e`(A4) → `e18120d`(A5) → `f2af31e`(A6) → **A7 = 本块所在提交**
@@ -51,16 +52,27 @@ A4 起用这枚 wheel 重建测试镜像）。A5/A6 是纯 E2B 侧改动，**不
 
 ### 3. wheel 指纹
 
+**当前产物（2026-09-11 终态收口 `b51fd0d`；fork tip `a063daf`）**：
+
 - `wheels/fork/sandlock-0.9.0b0-cp314-cp314-manylinux_2_34_x86_64.whl`
-  `sha256=6924059195be6fa8768b1994b111ba305a5016d2bd57f2327a64e276416d0ab6`
+  `sha256=7c17fa1fc9a68f45713a5f92aa525e69e8679c356b5add9585010b1080caf3e1`
 - `wheels/fork/sandlock-0.9.0b0-cp314-cp314-manylinux_2_34_aarch64.whl`
-  `sha256=6d20336c969a9936577c7f3903d05880cd92df0305d9e5d852cf58104c86d4b5`
-- `wheels/fork/SHA256SUMS.supervise`（HEAD `71e9debaef00f61237185c309640d58e46b1e017`）：
-  `supervise/x86_64/sandlock-supervise` = `b3220e063d4c44d334347a74b04167862553348459d5f0a973c6c73c2b8d958e`、
-  `supervise/aarch64/sandlock-supervise` = `e47e62eb6d10a009a5d54eb067db14b8f33e90d392a1e154e4da3cc49a9cee24`
-- 镜像内 `.so` 与 wheel 内 `.so` 同源（都是
-  `efdd3264bc51b939cfa5956dedaaadc5428de666b8d1bbc2634a91242fda1c9b`，A4 复验见
-  `tmp/a4-final-image-so.log`）
+  `sha256=cdd66bbbddbfa98baa7f8c2a0d772b1ba3941dabb61bdc12e239d5e4a9087388`
+- `wheels/fork/SHA256SUMS.supervise`（HEAD `a063dafe6835d4cf3cfdd259d4c1b1156f54df30`）：
+  `supervise/x86_64/sandlock-supervise` = `a2e469ff1853944bf1a370e213a1fd02e0ebbad53e0885e82175401959712d7c`、
+  `supervise/aarch64/sandlock-supervise` = `19451a41859c667edc75bc9d6b612ad16db5fa06c27e7be0150d2158dcbbdf59`
+- 镜像内 `.so` 与 wheel 内 `.so` 同源（x86_64 都是
+  `013bf12fa5d6ded524d41b20e8a6c8bf5302c0d29d5ace2da1c3a9939b56fb34`；
+  verify 日志 `tmp/sdd/final-repin-wheel-verify.log`，汇总见
+  `.superpowers/sdd/task-final-repin-report.md`）
+
+**A3 期（历史，仅存档；已被上表取代）**：wheel `6924059195be6fa8768b1994b111ba305a5016d2bd57f2327a64e276416d0ab6`
+（x86_64）/ `6d20336c969a9936577c7f3903d05880cd92df0305d9e5d852cf58104c86d4b5`（aarch64）；
+`SHA256SUMS.supervise` HEAD `71e9debaef00f61237185c309640d58e46b1e017`，supervise
+`b3220e063d4c44d334347a74b04167862553348459d5f0a973c6c73c2b8d958e`（x86_64）/
+`e47e62eb6d10a009a5d54eb067db14b8f33e90d392a1e154e4da3cc49a9cee24`（aarch64）；
+该期镜像内 `.so` = `efdd3264bc51b939cfa5956dedaaadc5428de666b8d1bbc2634a91242fda1c9b`
+（A4 复验见 `tmp/a4-final-image-so.log`）。
 
 ### 4. 门禁数字（A7）
 
@@ -314,10 +326,12 @@ cbindgen 头 / CLI `--mediation-run-as` / Python 取值校验 / `stats()` 的
    sandbox's host uid is <N>; … Run sandlock-supervise as uid <N> (route B)`。
    末尾那句「or pass mediation_run_as=supervisor …」不存在了；按文本匹配的调用方
    要改（`route_b`/executor 的 disclosure 与 E2B 用例已同步）。
-2. **ABI 破坏**：导出符号 164→163，`.so`/wheel 必须同批更新（`wheels/fork/` 已换成
-   B3 构建，`SHA256SUMS.supervise` 与 supervise 二进制三方指纹一致，
-   HEAD `4b4012b`——即 `wheels/fork/SHA256SUMS.supervise` 里写的
-   `# HEAD=4b4012bc85a8ec…`，与 fork 侧 `wheels/SHA256SUMS.supervise` 一致）。
+2. **ABI 破坏**：导出符号 164→163，`.so`/wheel 必须同批更新（`wheels/fork/` 当时换成
+   B3 构建，HEAD `4b4012b`——已不是当前产物；2026-09-11 终态收口 `b51fd0d` 把 wheel 重钉到
+   fork tip `a063daf`，当前 `wheels/fork/SHA256SUMS.supervise` 写的是
+   `# HEAD=a063dafe6835d4cf3cfdd259d4c1b1156f54df30`，与 fork 侧
+   `third_party/sandlock/wheels/SHA256SUMS.supervise` 一致，
+   `SHA256SUMS.supervise` 与 supervise 二进制三方指纹见 §3）。
 3. **`route_b.supervise_policy_document()` 的 drop-guard 删除**：该键已不在
    `SUPERVISE_POLICY_FIELDS`（与 fork `policy.rs::POLICY_FIELDS` 逐名相等，53→52），
    所以 ceiling 若还带它会被**按名拒绝**（fail-closed），而不是被静默丢掉。

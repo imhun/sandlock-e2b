@@ -185,6 +185,15 @@ E2B_API_KEY=local-key \
 python deploy/scripts/deployment_smoke.py
 ```
 
+> **跑冒烟前先调容量（F8）**：`.env.example` 的出厂 `E2B_NODE_PROCESSES=256` 与单沙箱默认
+> `E2B_DEFAULT_MAX_PROCESSES=256` 相等，而 `can_fit` 按**整箱**预留 ⇒ 每个 worker 只能放
+> **1** 个沙箱，上面两个冒烟脚本会报 `503 No resources available`
+> （`multinode_smoke.py` 要 4 个沙箱并断言跨两节点分布、`deployment_smoke.py`
+> 同时最多 4 个：3 个 + network 用例）。
+> 跑之前把每 worker 容量抬到例如 `E2B_NODE_MEMORY_MB=4096`、`E2B_NODE_CPU_PERCENT=400`、
+> `E2B_NODE_DISK_MB=8192`、`E2B_NODE_PROCESSES=1024`（单沙箱上限不变；这是文档口径，
+> 产品默认值未改）。
+
 生产形态容器冒烟（非 privileged + `seccomp=unconfined`，验证沙箱创建 /
 rootfs chroot / SOCKS5 出口，与 compose 部署一致）：
 

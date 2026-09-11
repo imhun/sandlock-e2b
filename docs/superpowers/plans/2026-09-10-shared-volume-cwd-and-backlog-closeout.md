@@ -1196,6 +1196,17 @@ git commit -m "chore(sandlock): bump to the no-downgrade wheel and drop the supe
 > E5.1/A7，出厂形态 3 errors、部署身份下 1 条用例断言旧共享 uid 语义（报告 F9，未改）。
 > 另注：本机 `python` 不在 PATH，冒烟用项目内临时 venv（`tmp/z-venv/bin/python`）。
 
+> **F4 收口修复（2026-09-11，本行以上保留为当轮记录）**：`envd_service/__main__.py` 现在在
+> `uvicorn.run` 之前配置日志（root level = `E2B_LOG_LEVEL`，默认 INFO），因此上面那条验收
+> 口径（Step 2「worker 日志出现 `route-B instance ready …`」）重新可用。实跑：用本轮工作树
+> 重建的 worker 镜像 + 同一套 stack compose（root-worker override）跑
+> `deploy/scripts/multinode_smoke.py`（`EXIT=0`，2+2 分布），`worker-1/worker-2` 容器日志里
+> 有 **4 条** `route-B instance ready sandbox_id=… uid=<host uid> … guest-uid=uid-0-in-userns`
+> 与 `worker image warmed: …`（默认 `E2B_LOG_LEVEL=INFO`，无需 DEBUG）。证据：
+> `tmp/f4-real-stack.log`、`tmp/f4-real-stack-worker-logs.log`、`tmp/f4-logging-probe.log`。
+> 注意：该行仍只在 **root worker**（route B 成立）形态出现，出厂 `user: "65534"` 形态取决于
+> F1 的口径（未改）。
+
 - [x] **Step 1: 构建镜像（本地 tag，不推 ACR）**
 
 ```bash
