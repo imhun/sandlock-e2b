@@ -6,8 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
-import sys
 import threading
 from pathlib import Path
 
@@ -23,36 +21,6 @@ logger = logging.getLogger(__name__)
 
 _MCP_PORT_BASE = 51000
 _GATEWAY_STDERR_TAIL_BYTES = 4096
-
-
-def _bind_mount(source: str, target: str) -> None:
-    """Bind ``source`` onto ``target`` (Linux root workers only).
-
-    CPython 3.14 removed ``os.mount``, so the mount(2) is driven through the
-    ``mount`` utility (present in the worker images); failures surface as
-    OSError and the caller falls back to the workspace symlink.
-    """
-    result = subprocess.run(
-        ["mount", "--bind", source, target],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise OSError(
-            result.returncode,
-            f"mount --bind {source} {target}: {result.stderr.strip()}",
-        )
-
-
-def _unmount(target: str) -> None:
-    result = subprocess.run(
-        ["umount", target], capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise OSError(
-            result.returncode,
-            f"umount {target}: {result.stderr.strip()}",
-        )
 
 
 async def _watch_mcp_gateway_exit(
@@ -177,11 +145,19 @@ class SandboxRuntimeContext:
             egress_lib_dir=settings.image_cache_dir / "egress",
             extra_fs_writable=[m["hostPath"] for m in record.volume_mounts],
             fs_mounts={
-                # Inside the image-rootfs chroot the sandbox directory is
-                # /workspace (official SDK default cwd), so mount paths map
-                # under it.
-                f"/workspace/{m['path']}": m["hostPath"]
-                for m in record.volume_mounts
+                # Every volume view must be registered under BOTH workspace
+                # aliases (they are the same host directory). A cwd-derived
+                # relative open resolves against whichever alias the sandbox
+                # sits in, and only that alias's sub-mount can serve it --
+                # evidence: tmp/vol_fs_mount_probe.py.
+                **{
+                    alias: m["hostPath"]
+                    for m in record.volume_mounts
+                    for alias in (
+                        f"/workspace/{m['path']}",
+                        f"/home/user/{m['path']}",
+                    )
+                },
             },
         )
         self.command_logs = CommandLogWriter(record.workspace_dir)
@@ -207,18 +183,6 @@ class SandboxRuntimeContext:
         self._mcp_port: int | None = None
         self._mcp_token: str | None = None
         self._network = dict(record.network) if record.network else None
-        # Root-worker chroot sandboxes: replace the provisioning symlink with
-        # a real bind mount so *relative* volume paths (``cat mnt/data/...``
-        # from the workspace cwd) resolve. Sandlock's instance exec applies
-        # Landlock to relative opens against the host workspace directory, so
-        # a symlink whose target lives outside the chroot is denied, while
-        # pathname opens from "/" go through the fs_mount overlay and work --
-        # the SDK uses both forms. Pre-M4 per-command sandboxes exposed the
-        # volume this way too; non-root workers cannot mount and keep the
-        # symlink (existing behaviour, tracked as a follow-up).
-        self._volume_bind_mounts: list[tuple[Path, str]] = []
-        if record.volume_mounts:
-            self._materialize_chroot_volume_mounts()
         if record.mcp:
             # M4 D3: pre-allocate the MCP gateway port at context creation so
             # the executor's instance ceiling (``net_allow_bind``) is fixed
@@ -264,68 +228,6 @@ class SandboxRuntimeContext:
         elif event == "end":
             writer.end(proc.pid, payload)
 
-    def _materialize_chroot_volume_mounts(self) -> None:
-        """Bind the sandbox's volume views into the workspace (chroot shape).
-
-        Only root workers on Linux can bind; anything else keeps the symlink
-        the volume provisioner created (pure-sandlock shape relies on it).
-        Failures fall back to the symlink with a warning instead of breaking
-        sandbox creation.
-        """
-        if sys.platform != "linux" or os.geteuid() != 0:
-            logger.debug(
-                "skipping chroot volume bind materialization for sandbox %s "
-                "(requires a Linux root worker; current platform=%s euid=%s) "
-                "-- keeping the workspace symlink",
-                self.record.sandbox_id,
-                sys.platform,
-                os.geteuid(),
-            )
-            return
-        if getattr(self.executor, "_image_rootfs", None) is None:
-            logger.debug(
-                "skipping chroot volume bind materialization for sandbox %s "
-                "(executor has no image rootfs; pure-sandlock/local shape "
-                "relies on the workspace symlink)",
-                self.record.sandbox_id,
-            )
-            return
-        for mount in self.record.volume_mounts:
-            rel = str(mount.get("path", "")).lstrip("/")
-            source = mount.get("hostPath")
-            if not rel or not source:
-                continue
-            target = Path(self.record.workspace_dir) / rel
-            try:
-                if target.is_symlink():
-                    target.unlink()
-                elif target.exists():
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.mkdir(parents=True, exist_ok=True)
-                _bind_mount(str(source), str(target))
-            except OSError as exc:
-                # Restore the provisioned symlink so the sandbox keeps the
-                # volume view it would otherwise have had.
-                logger.warning(
-                    "cannot bind volume %s into %s (sandbox_id=%s): %s; "
-                    "keeping the workspace symlink",
-                    source,
-                    target,
-                    self.record.sandbox_id,
-                    exc,
-                )
-                try:
-                    target.rmdir()
-                except OSError:
-                    pass
-                try:
-                    target.symlink_to(source, target_is_directory=True)
-                except OSError:
-                    pass
-                continue
-            self._volume_bind_mounts.append((target, str(source)))
-
     def shutdown(self) -> None:
         self.processes.kill_all()
         self.processes.remove_sandbox()
@@ -347,30 +249,6 @@ class SandboxRuntimeContext:
         closer = getattr(self.executor, "close", None)
         if closer is not None:
             closer()
-        for target, source in reversed(self._volume_bind_mounts):
-            try:
-                _unmount(str(target))
-            except OSError as exc:
-                logger.warning(
-                    "cannot unmount volume view %s (sandbox_id=%s): %s",
-                    target,
-                    self.record.sandbox_id,
-                    exc,
-                )
-                continue
-            # Restore the provisioned symlink: exports/migrations copy the
-            # sandbox directory and the volume provisioning step unlinks an
-            # existing symlink (but rejects a real directory at the mount
-            # path).
-            try:
-                target.rmdir()
-            except OSError:
-                pass
-            try:
-                target.symlink_to(source, target_is_directory=True)
-            except OSError:
-                pass
-        self._volume_bind_mounts.clear()
 
     def pause(self) -> None:
         self.processes.pause_all()

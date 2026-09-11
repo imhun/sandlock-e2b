@@ -616,9 +616,14 @@ def test_runtime_context_exposes_volume_subdir_view_to_executor(
         record, EnvdSettings(executor="sandlock", workspace_base=tmp_path)
     )
     # Landlock second-layer fallback: only the sandbox's own slice is
-    # writable, and the chroot mount view points at that slice.
+    # writable, and the chroot mount view points at that slice under BOTH
+    # workspace aliases (a relative open resolves against whichever alias
+    # the sandbox's cwd names).
     assert captured["extra_fs_writable"] == [str(subdir)]
-    assert captured["fs_mounts"] == {"/workspace/mnt/data": str(subdir)}
+    assert captured["fs_mounts"] == {
+        "/workspace/mnt/data": str(subdir),
+        "/home/user/mnt/data": str(subdir),
+    }
 
 
 def test_sandlock_policy_only_writes_the_volume_subdir(tmp_path):

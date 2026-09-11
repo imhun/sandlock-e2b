@@ -447,7 +447,8 @@ async def test_mcp_gateway_exec_is_the_only_one_allowed_to_bind(monkeypatch) -> 
 
 async def test_exec_params_travel_as_verb_args(monkeypatch) -> None:
     """Per-exec cwd/env/clean_env keep their in-process meaning: cwd maps into
-    the chroot view (``/workspace``) and bash falls back to sh."""
+    the chroot view (``/home/user``, the canonical alias) and bash falls back
+    to sh."""
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool()
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
@@ -457,7 +458,7 @@ async def test_exec_params_travel_as_verb_args(monkeypatch) -> None:
     )
     assert pool.log[0][1] == {
         "argv": ["/bin/sh", "-lc", "pwd"],
-        "cwd": "/workspace",
+        "cwd": "/home/user",
         "env": {"FOO": "bar"},
         "clean_env": True,
     }

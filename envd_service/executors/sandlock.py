@@ -1179,16 +1179,18 @@ class SandlockExecutor(Executor):
     def _view_cwd(self, config: ExecConfig) -> str | None:
         """Map a host-side command cwd into the sandbox's view for exec.
 
-        In chroot mode the workspace is mounted at /workspace, so a host
-        workspace cwd (or an empty default) maps there; other paths pass
-        through unchanged (S9: the chroot shape's fs_readable covers /).
-        Without a chroot the host path is used as-is (the workspace sits in
-        fs_writable).
+        In chroot mode the workspace is mounted at both /home/user (the
+        canonical alias: the fork's ``host_to_virtual`` breaks host-source
+        ties by declaration order and ``mount_map`` declares /home/user
+        first) and /workspace, so a host workspace cwd (or an empty default)
+        maps to /home/user; other paths pass through unchanged (S9: the
+        chroot shape's fs_readable covers /). Without a chroot the host path
+        is used as-is (the workspace sits in fs_writable).
         """
         cwd = (config.cwd or "").strip()
         if self._base_image and self._image_rootfs is not None:
             if not cwd or cwd.startswith(str(self._workspace_dir)):
-                return "/workspace"
+                return "/home/user"
         return cwd or None
 
     def _exec_params(self, config: ExecConfig, *, bind_ports=None) -> dict:
@@ -1329,10 +1331,11 @@ class SandlockExecutor(Executor):
             kwargs["fd_inject_connect"] = True
         if self._base_image and self._image_rootfs is not None:
             # Image rootfs mode: chroot into the extracted image and expose
-            # the sandbox directory as /workspace (official SDK default cwd)
-            # and /home/user (legacy home) inside it. fs_mount only takes
-            # effect at runtime, so the mount points must already exist
-            # inside the rootfs for chdir() to work.
+            # the sandbox directory as /home/user (canonical alias: declared
+            # first, and the fork breaks host-source ties by declaration
+            # order) and /workspace (official SDK spelling) inside it.
+            # fs_mount only takes effect at runtime, so the mount points must
+            # already exist inside the rootfs for chdir() to work.
             # The rootfs must carry the standard /dev parent dir for
             # traversal and listings (minimal_dev provides the node names);
             # slim base images extract without one, so pre-create it like the
@@ -1348,8 +1351,8 @@ class SandlockExecutor(Executor):
                 ).mkdir(parents=True, exist_ok=True)
             kwargs["chroot"] = str(self._image_rootfs)
             mount_map = {
-                "/workspace": self._workspace_dir,
                 "/home/user": self._workspace_dir,
+                "/workspace": self._workspace_dir,
             }
             mount_map.update(self._fs_mounts)
             # minimal_dev replaces the whole-tree host /dev mount: only the
@@ -1522,10 +1525,11 @@ class SandlockExecutor(Executor):
             kwargs["fd_inject_connect"] = True
         if self._base_image and self._image_rootfs is not None:
             # Image rootfs mode: chroot into the extracted image and expose
-            # the sandbox directory as /workspace (official SDK default cwd)
-            # and /home/user (legacy home) inside it. fs_mount only takes
-            # effect at runtime, so the mount points must already exist
-            # inside the rootfs for chdir() to work.
+            # the sandbox directory as /home/user (canonical alias: declared
+            # first, and the fork breaks host-source ties by declaration
+            # order) and /workspace (official SDK spelling) inside it.
+            # fs_mount only takes effect at runtime, so the mount points must
+            # already exist inside the rootfs for chdir() to work.
             # The rootfs must carry the standard /dev parent dir for
             # traversal and listings (minimal_dev provides the node names);
             # slim base images extract without one, so pre-create it like the
@@ -1541,8 +1545,8 @@ class SandlockExecutor(Executor):
                 ).mkdir(parents=True, exist_ok=True)
             kwargs["chroot"] = str(self._image_rootfs)
             mount_map = {
-                "/workspace": self._workspace_dir,
                 "/home/user": self._workspace_dir,
+                "/workspace": self._workspace_dir,
             }
             mount_map.update(self._fs_mounts)
             # minimal_dev replaces the whole-tree host /dev mount: only the
@@ -1555,7 +1559,7 @@ class SandlockExecutor(Executor):
             kwargs["fs_mount"] = mount_map
             cwd = (config.cwd or "").strip()
             if not cwd or cwd.startswith(str(self._workspace_dir)):
-                kwargs["cwd"] = "/workspace"
+                kwargs["cwd"] = "/home/user"
             else:
                 kwargs["cwd"] = cwd
         elif self._fs_mounts:

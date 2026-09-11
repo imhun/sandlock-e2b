@@ -81,6 +81,45 @@ def test_image_rootfs_shape_keeps_only_defensive_denials(tmp_path) -> None:
     assert "/dev/mqueue" not in sandbox.fs_denied
 
 
+def test_volume_views_map_under_both_workspace_aliases(tmp_path) -> None:
+    """A4: the runtime context registers every volume view under both
+    workspace aliases (``/workspace/<rel>`` and ``/home/user/<rel>``); the
+    chroot policy must carry both spellings, and the shared workspace
+    directory must stay declared first so the fork's declaration-order tie
+    break keeps ``/home/user`` canonical.
+    """
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    volume = str(tmp_path / "vol")
+    executor = SandlockExecutor(
+        workspace_dir=str(ws),
+        base_image="python:3.11-slim",
+        image_rootfs=rootfs,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=False,
+        fs_mounts={
+            "/workspace/mnt/data": volume,
+            "/home/user/mnt/data": volume,
+        },
+    )
+    sandbox = _policy(executor)
+    assert sandbox.fs_mount["/home/user"] == str(ws)
+    assert sandbox.fs_mount["/workspace"] == str(ws)
+    assert list(sandbox.fs_mount)[:2] == ["/home/user", "/workspace"]
+    assert sandbox.fs_mount["/workspace/mnt/data"] == volume
+    assert sandbox.fs_mount["/home/user/mnt/data"] == volume
+    # The rootfs carries the mount-point parents the chroot needs for chdir.
+    assert (rootfs / "workspace/mnt/data").is_dir()
+    assert (rootfs / "home/user/mnt/data").is_dir()
+
+
 def test_chroot_policy_sends_no_mediation_tier(monkeypatch, tmp_path) -> None:
     """The supervisor downgrade tier is gone (2026-09-10).
 

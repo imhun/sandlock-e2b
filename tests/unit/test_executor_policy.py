@@ -79,8 +79,12 @@ def test_image_rootfs_mounts_workspace_minimal_dev_and_maps_cwd(
     sb = _policy(executor)
 
     assert sb.chroot == str(rootfs)
-    assert sb.fs_mount["/workspace"] == str(ws)
+    # Declaration order is load-bearing (fork A2: `host_to_virtual` breaks
+    # host-source ties by declaration order), so the shared workspace
+    # directory's canonical alias is the first one declared: /home/user.
     assert sb.fs_mount["/home/user"] == str(ws)
+    assert sb.fs_mount["/workspace"] == str(ws)
+    assert list(sb.fs_mount)[:2] == ["/home/user", "/workspace"]
     # minimal_dev replaces the whole-tree host /dev mount: only the six
     # single-node mounts (ptmx, pts, null, urandom, zero, tty) are visible
     # under the chroot's /dev, so /dev/shm and /dev/mqueue cannot leak in.
@@ -100,9 +104,11 @@ def test_image_rootfs_mounts_workspace_minimal_dev_and_maps_cwd(
     # cwd is a per-exec parameter now, never part of the ceiling.
     assert getattr(sb, "cwd", None) is None
     assert getattr(sb, "env", None) in (None, {})
-    # A host workspace cwd maps to /workspace inside the chroot.
+    # A host workspace cwd (and an empty default) maps to the canonical
+    # /home/user alias inside the chroot.
     params = _params(executor, cmd=["/bin/sh"], cwd=str(ws))
-    assert params["cwd"] == "/workspace"
+    assert params["cwd"] == "/home/user"
+    assert _params(executor, cmd=["/bin/sh"], cwd="")["cwd"] == "/home/user"
 
 
 def test_image_rootfs_keeps_explicit_chroot_cwd(tmp_path: Path) -> None:
@@ -112,7 +118,10 @@ def test_image_rootfs_keeps_explicit_chroot_cwd(tmp_path: Path) -> None:
     ws.mkdir()
     executor = _executor(rootfs, ws)
 
+    # Explicit in-sandbox paths pass through unchanged (the alias is only the
+    # *default* spelling, not a rewrite of what the caller asked for).
     assert _params(executor, cmd=["/bin/sh"], cwd="/workspace")["cwd"] == "/workspace"
+    assert _params(executor, cmd=["/bin/sh"], cwd="/home/user")["cwd"] == "/home/user"
     assert _params(executor, cmd=["/bin/sh"], cwd="/tmp")["cwd"] == "/tmp"
 
 
@@ -223,7 +232,7 @@ def test_exec_params_mapping_pty_and_clean_env(tmp_path: Path) -> None:
     params = executor._exec_params(cfg)
     assert params["clean_env"] is True
     assert params["env"] == {"A": "b"}
-    assert params["cwd"] == "/workspace"
+    assert params["cwd"] == "/home/user"
     assert "bind_ports" not in params
 
 
