@@ -1072,12 +1072,40 @@ git commit -m "chore(sandlock): bump to the no-downgrade wheel and drop the supe
 
 ---
 
-## Track C — 上线与运维（**当前挂起：线上暂不升级**）
+## Track C — 上线（**2026-09-11 用户解禁：按非 root 形态上线，并要求线上测试全绿**）
 
-> **入口条件（决定 ⑤）**：Track A、Track B、Track D 全部闭环，且
-> `PROD_DROP_CAPS=SYS_ADMIN ./deploy/scripts/test-prod-shaped.sh` 与
-> `bash tmp/run-f31.sh` 六相门禁在本地**连续两轮全绿**，才开始 C1。
-> 在此之前 C1–C3 只做**离线准备**（构建产物、清单、脚本、演练 runbook），不推 ACR、不动线上。
+> **新目标（用户 2026-09-11）**：所有任务完成后，**按非 root worker 形态**部署线上环境，
+> 并确保线上测试全部通过。原"决定 ⑤ 暂不升级"作废。**Track F（F1 非 root + file caps）
+> 是本次上线的硬前置**。
+>
+> **入口条件（全部满足才动线上）**：
+> 1. Track F / Task F1 闭环：两个 broker 在非 root 形态下端到端五条断言全绿 + Track Z 非 root 复跑全绿；
+> 2. `PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` 与
+>    `bash tmp/run-f31.sh` 六相在本地**连续两轮全绿**；
+> 3. 线上**回滚点已记录**（现网镜像 tag/digest、`docker-compose.prod.yml`、远端 `.env` 三份快照落 `tmp/rollback-<ts>/`）；
+> 4. 用户确认维护窗口（现网审计为空载，适合窗口）。
+>
+> **顺序（不可颠倒）**：① 镜像（worker/control-plane/gateway/quota-agent）构建并推 ACR →
+> ② 远端 `.env` 与 compose 同步（含 uid 段拆分、`E2B_PRIV_HELPERS=auto`、配额 agent URL）→
+> ③ 起/重建容器 → ④ 等 warm 完成（F5/F7 窗口 20–120s）→ ⑤ 跑线上测试。
+> **B3 是 breaking**：wheel/`.so`/worker 镜像必须同批；旧 `--mediation-run-as` CLI/profile 会按名拒绝。
+
+### Task C0：线上回滚点与前置核对（新增）
+
+- [ ] 记录现网三份快照（镜像 tag/digest、compose、远端 `.env`）到 `tmp/rollback-<ts>/`
+- [ ] 核对两颗 worker 的 uid 段：现网审计发现两边都从 10000 起 ⇒ **必须拆成互不重叠**
+      （建议 worker-1 `10000..10999`、worker-2 `11000..11999`，可按你的偏好改）
+- [ ] 核对 quota-agent：摘 `SYS_ADMIN` 前必须先把 `E2B_QUOTA_AGENT_URL` 配好并有 agent 在跑
+
+### Task C0.5：线上测试清单（新增，C3 之后执行）
+
+- [ ] `deploy/scripts/smoke-prod-worker.sh`（worker 自检：非 root 身份、route-B 槽位、uid 隔离）
+- [ ] `deploy/scripts/deployment_smoke.py` 与 `deploy/scripts/multinode_smoke.py`（跨真实两节点）
+- [ ] 官方 SDK 手工复核：`pwd == /home/user`、写读回显、**两个沙箱 workspace 属主是两个不同 uid**、
+      跨 uid 访问被拒（1777+sticky）
+- [ ] 线上日志核对：worker 出现 `route-B instance ready … host-uid=<池内 uid>`，
+      无 `PER_UID_NONROOT_WARNING`，**无**缺 `SYS_ADMIN` 类告警
+- [ ] 结果落 `tmp/prod-verify-<ts>/*.log`，首行 ENV-HEADER；任一红即按回滚点回退并报告
 
 ### Task C1：镜像重建 + ACR 推送
 
