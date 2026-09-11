@@ -772,7 +772,6 @@ SUPERVISE_POLICY_FIELDS: frozenset[str] = frozenset(
         "max_memory",
         "max_open_files",
         "max_processes",
-        "mediation_run_as",
         "net_allow",
         "net_allow_bind",
         "net_deny",
@@ -814,19 +813,17 @@ def supervise_policy_document(ceiling: dict) -> dict:
 
     Same fields, wire spellings only: ``fs_mount`` becomes the spec list, the
     ``None`` values the Python builder treats as "unset" are dropped (an
-    explicit ``null`` is an unknown *value* on the wire, not an omission), and
-    ``mediation_run_as`` is dropped as a guard: the executor stopped sending it
-    in 2026-09-10 when E2B removed the supervisor downgrade tier, and a slot
-    must never carry it even if some future ceiling does -- its mediator already
-    *is* this uid, which is the whole point of the route. Anything the wire does
-    not know is refused by name before the slot is spawned, rather than by a
-    fork that fails closed later.
+    explicit ``null`` is an unknown *value* on the wire, not an omission).
+    Anything the wire does not know is refused by name before the slot is
+    spawned, rather than by a fork that fails closed later -- which is also
+    what happens to the fork's former ``mediation_run_as`` tier: fork B3
+    (2026-09-11) deleted the field outright, so a slot must never carry it (its
+    mediator already *is* this uid, the whole point of the route) and a ceiling
+    that did would fail here by name instead of being silently dropped.
     """
     doc: dict = {}
     for key, value in ceiling.items():
         if value is None:
-            continue
-        if key == "mediation_run_as":
             continue
         if key == "fs_mount":
             doc[key] = _mount_specs(value)

@@ -303,6 +303,27 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
 
 ## ⚡ 删掉 supervisor 降级档（2026-09-10，backlog #5 ② 闭口）
 
+**B3 更新（2026-09-11）：该字段已从 fork 删除。** E2B 侧 09-10 只是不再**下发**，
+fork B3 把 `mediation_run_as` 档位整体删净（枚举 / `Sandbox` 字段 / builder /
+profile `[config]` 键 / FFI 导出 `sandlock_sandbox_builder_mediation_run_as` /
+cbindgen 头 / CLI `--mediation-run-as` / Python 取值校验 / `stats()` 的
+`mediation_downgrades` / supervise `--policy` wire 键），所以：
+
+1. **拒绝文本变了**：`mediation_run_as=caller refused: …`（旧）⇒
+   `in-process path mediation refused: mediation would run as euid 0 while the
+   sandbox's host uid is <N>; … Run sandlock-supervise as uid <N> (route B)`。
+   末尾那句「or pass mediation_run_as=supervisor …」不存在了；按文本匹配的调用方
+   要改（`route_b`/executor 的 disclosure 与 E2B 用例已同步）。
+2. **ABI 破坏**：导出符号 164→163，`.so`/wheel 必须同批更新（`wheels/fork/` 已换成
+   B3 构建，`SHA256SUMS.supervise` 与 supervise 二进制三方指纹一致，
+   HEAD `27c7b5d`）。
+3. **`route_b.supervise_policy_document()` 的 drop-guard 删除**：该键已不在
+   `SUPERVISE_POLICY_FIELDS`（与 fork `policy.rs::POLICY_FIELDS` 逐名相等，53→52），
+   所以 ceiling 若还带它会被**按名拒绝**（fail-closed），而不是被静默丢掉。
+4. root worker + chroot 形态的四条硬前置（wheel 带 supervise、`E2B_ROUTE_B≠off`、
+   `E2B_PER_SANDBOX_UID=true`、uid 段不重叠）见
+   `docs/production-deployment-requirements.md` §2.4「删档的后果（终态）」。
+
 `envd_service/executors/sandlock.py::_mediation_run_as()` 与两处 ceiling 里的
 `mediation_run_as` 键一并删除：E2B 不再请求 fork 的 `supervisor` 降级档，
 「特权进程内中介 + 路径中介 + 非 0 host uid」这一组合从此**只剩 fork 的 fail-closed
@@ -348,7 +369,9 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   「这台 runner 什么都建不出来」。
 - 连带清理：`route_b.supervise_policy_document()` 仍丢 `mediation_run_as`，注释改成
   「守卫（执行器已不再下发）」；两处 `fs_denied` 的旧注释（「文件属主变成 supervisor」）
-  改为按后端说明归属（槽位=沙箱 host uid；进程内特权中介=被拒）。
+ 改为按后端说明归属（槽位=沙箱 host uid；进程内特权中介=被拒）。
+  **（B3 2026-09-11 更新）**：守卫已按上文第 3 点删除——该键连 fork 的 wire 表一起
+  没了，带它的 ceiling 现在按名拒绝，不需要也不再留一行专门丢它。
   另外 `tests/security/conftest.py` 长出四个共用件（`route_b_sandbox` /
   `run_sh` / `require_mediation_capable` / `resolve_test_rootfs`）——**mediated chroot
   形态从此在测试里也只有一条正确搭法**，别再手搓一个进程内实例去「测」它。

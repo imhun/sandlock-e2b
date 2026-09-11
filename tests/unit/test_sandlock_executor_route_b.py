@@ -301,7 +301,8 @@ def test_route_b_selection_matrix(monkeypatch, case) -> None:
 
 def test_non_root_auto_keeps_the_in_process_model_and_says_why(monkeypatch) -> None:
     """A worker that cannot start a slot stays in-process -- with the reason on
-    record, not silently. It no longer opts into a mediation tier either."""
+    record, not silently. It cannot opt into a mediation tier either: the fork
+    deleted that field (B3, 2026-09-11), so there is nothing to opt into."""
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     sl.SandlockExecutor._mediation_shape_disclosed = False
     ex = _executor(monkeypatch, route_b=_config(mode="auto"))
@@ -362,17 +363,17 @@ def test_missing_supervise_binary_keeps_the_in_process_backend(
 
 
 def test_the_ceiling_carries_no_mediation_tier_for_the_slot(monkeypatch) -> None:
-    """Two layers of the same guarantee: the ceiling never sets the tier, and
-    `supervise_policy_document` would drop it anyway -- a slot must never be
-    told to mediate as a supervisor, since its mediator already *is* the
-    sandbox uid (that is the point of the route)."""
+    """Two layers of the same guarantee, both against the fork's current wire:
+    the ceiling never sets the tier, and the wire no longer knows the field at
+    all (fork B3 deleted it), so a ceiling that carried it is refused by name
+    rather than silently dropped -- a slot must never be told to mediate as
+    anyone but itself, since its mediator already *is* the sandbox uid."""
     ex = _executor(monkeypatch, route_b=_config(mode="auto"))
     ceiling = ex._policy_ceiling()
     assert "mediation_run_as" not in ceiling
     assert ceiling["uid"] == HOST_UID == ceiling["gid"]
-    assert "mediation_run_as" not in rb.supervise_policy_document(
-        dict(ceiling, mediation_run_as="supervisor")
-    )
+    with pytest.raises(ValueError, match="mediation_run_as"):
+        rb.supervise_policy_document(dict(ceiling, mediation_run_as="supervisor"))
 
 
 # ------------------------------------------------------------------ lease

@@ -9,7 +9,7 @@
 
 | 编号 | 主题 | 严重度 | 去处 |
 |---|---|---|---|
-| SL-1 | 路径中介（`fs_denied` / chroot / COW 触发的 USER_NOTIF）以 **supervisor 身份**代执行 `openat/unlinkat/renameat2/fchmodat/fchownat/…` ⇒ 沙箱写的文件属主变 root、`chmod` 失效、共享目录 1777+sticky 的 per-uid 保护不成立（**非** Landlock 逃逸） | High | `e2b-integration.md` §3.1，修法 P1/P2/P5 |
+| SL-1 | 路径中介（`fs_denied` / chroot / COW 触发的 USER_NOTIF）以 **supervisor 身份**代执行 `openat/unlinkat/renameat2/fchmodat/fchownat/…` ⇒ 沙箱写的文件属主变 root、`chmod` 失效、共享目录 1777+sticky 的 per-uid 保护不成立（**非** Landlock 逃逸）。**已由硬删关闭（B3，2026-09-11）**：P2 的 `mediation_run_as` 降级档被整体删除（枚举/字段/builder/FFI 导出/CLI flag/`--policy` wire 键/Python 取值/`stats` 计数），特权中介 + 路径中介形态一律在建箱前 fail-closed 拒绝且只给 route B 一条修法；身份由构造保证（route-B 槽位 euid == 沙箱 host uid，A/B 档硬证据保留） | High（**已闭**） | `e2b-integration.md` §3.1，修法 P1/P5；B3 见 fork `docs/CHANGELOG.md` 顶部与 `docs/production-deployment-requirements.md` §2.4「删档的后果」 |
 | SL-2 | `notify_rate_limit` 假告警：字段已生效（`_sdk.py:1217`），但 `_HANDLED_FIELDS`（`_sdk.py:1138` 起）漏登记 | Low | §3.2，修法 P3（一行） |
 | **SL-4** | `extra_fds` 落位用 `dup2` ⇒ 清掉 `FD_CLOEXEC`，宿主↔in-sandbox init 的控制 socket（fd 3）被**每一个用户进程继承** ⇒ 沙箱内代码**已实测证实**：伪造 `Exited` ⇒ 宿主 `exec` 返回 0 而目标进程仍在跑；假 `Exited{未知 pid}` ⇒ `early_exits` 无上限（60k 帧 +5.3 MB RSS）。~~发 `Shutdown` 打死整箱~~ 已否证、抢读宿主请求未复现 | High | `e2b-integration.md` §3.9，详见 `sandbox-exec-security.md` §4.1；**exec 接线前必修** |
 | **SL-5** | `sandlock-init` 在解析失败/EOF/`RunMain` 分支不关闭收到的 fd，且不校验请求来源、帧边界按字节流猜 | Medium | 同上 §3.9 / §4.2 |

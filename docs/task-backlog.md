@@ -502,7 +502,11 @@ ACR 镜像推送照常，git 远程推送暂缓。
     route-B supervise **部署**（W1/W2 槽位模型；`sun_path` 108 与「一 uid = 一代沙箱」
     两条约束）**。其余三项（envd 接线、摘 T5 xfail、删 `mediation_run_as='supervisor'`
     降级档）已于 2026-09-10 全部完成 ⇒ 见 #5 与 #25：部署侧还差 wheel 与 uid 段两件事，
-    线上已实测核过。
+    线上已实测核过。**2026-09-11 B3（SL-1 硬删）**：fork 侧把该档连字段一并删除
+    （含 FFI 导出与 `stats()` 计数，导出符号 164→163），拒绝文本变为
+    `in-process path mediation refused: … Run sandlock-supervise as uid <N> (route B)`；
+    `wheels/fork/` 已换成 B3 构建（三方 supervise 指纹一致，HEAD `27c7b5d`），
+    四条硬前置见 `docs/production-deployment-requirements.md` §2.4。
 
 25. **route-B 特权最小集 + 共享卷 bind 的退化缺口（2026-09-10 实测；2026-09-11 A7 收口）**:
    ✅ **已收口：无 `SYS_ADMIN` 可用** —— worker 侧不再需要它，共享卷也不再是保留它的理由。

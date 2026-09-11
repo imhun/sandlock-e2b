@@ -177,7 +177,6 @@ def test_policy_document_uses_wire_spellings_and_drops_unsupplied_fields():
         "max_memory": "1024M",
         "uid": 20000,
         "gid": 20000,
-        "mediation_run_as": "supervisor",
         "net_allow_bind": [50006],
         "net_isolation": True,
         "port_mappings": {50006: 8080},
@@ -200,13 +199,20 @@ def test_policy_document_uses_wire_spellings_and_drops_unsupplied_fields():
     }
 
 
-def test_policy_document_drops_mediation_tier_by_name_not_by_value():
-    """``mediation_run_as`` is the *in-process* downgrade tier: a slot's
-    mediator already is this uid, so the key must never reach the wire -- not
-    even when the ceiling carries the safe value."""
-    for tier in ("supervisor", "caller"):
-        doc = supervise_policy_document({"uid": 1, "mediation_run_as": tier})
-        assert doc == {"uid": 1}
+def test_policy_document_refuses_the_deleted_mediation_tier_by_name():
+    """The fork deleted the in-process mediation tier (B3, 2026-09-11).
+
+    A slot's mediator already *is* this uid, so the ceiling never carried the
+    key and now the wire does not know it at all: a document that still sends
+    one is refused by name (fail-closed) instead of having it dropped on the
+    floor, which is what an old ceiling accidentally carrying it would get.
+    """
+    with pytest.raises(
+        ValueError,
+        match=r"route-B policy ceiling carries field\(s\) the supervise wire "
+        r"does not accept: mediation_run_as",
+    ):
+        supervise_policy_document({"uid": 1, "mediation_run_as": "supervisor"})
 
 
 def test_policy_document_refuses_a_field_the_wire_does_not_know():

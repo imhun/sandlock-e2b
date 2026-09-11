@@ -743,10 +743,11 @@ class SandlockExecutor(Executor):
     def _disclose_mediation_shape(self) -> None:
         """Say up front what an in-process chroot sandbox now means.
 
-        E2B no longer sets the fork's ``mediation_run_as=supervisor`` tier, so
-        the combination the tier used to paper over -- privileged in-process
-        mediator + path mediation + a non-zero sandbox host uid -- is refused by
-        the fork instead of silently producing supervisor-owned files (SL-1/T5).
+        E2B no longer asks for a mediation tier, and fork B3 (2026-09-11)
+        deleted that field outright, so the combination it used to paper over
+        -- privileged in-process mediator + path mediation + a non-zero sandbox
+        host uid -- is refused by the fork (route B is the only remedy it
+        names) instead of silently producing supervisor-owned files (SL-1/T5).
         None of that reaches the operator through the library, though: the FFI
         create/launch entry points return a null handle and the SDK turns it into
         ``sandlock_instance_launch failed`` (SL-12), so this is the only place
@@ -777,7 +778,8 @@ class SandlockExecutor(Executor):
         fail-closed, F14 privilege rule). Mediated path operations run in the
         mediator, so a mediator that can remap the sandbox to a *different*
         non-zero host uid attributes the sandbox's own files to itself (T5) and
-        the create is refused now that nothing asks for the ``supervisor`` tier.
+        the create is refused -- the fork's only remedy is route B, since the
+        downgrade tier that used to accept this shape no longer exists (B3).
 
         The distinction matters because this predicate gates a loud ERROR: a
         non-root worker (E5.1) mediates as its own euid, which *is* the
@@ -1275,7 +1277,8 @@ class SandlockExecutor(Executor):
         # writes belong to whoever mediates. On a route-B slot that is this
         # sandbox's host uid (T5's fix); on a privileged in-process mediator it
         # would be host uid 0, which the fork refuses outright now that E2B no
-        # longer asks for the supervisor tier (SL-1).
+        # longer asks for a mediation tier -- and fork B3 deleted the field
+        # itself, so there is nothing left to ask for (SL-1).
         fs_denied: list[str] = []
         if self._base_image and self._image_rootfs is not None:
             # Image rootfs mode: "/" resolves inside the chroot (the image

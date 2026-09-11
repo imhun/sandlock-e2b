@@ -3,9 +3,10 @@
 The chroot (image-rootfs) shape is the only shape where E2B asks the fork for
 path mediation -- ``fs_denied`` + chroot -- and mediation now has exactly one
 identity: the sandbox's own host uid, which a route-B supervise slot provides.
-E2B stopped setting the fork's ``mediation_run_as=supervisor`` downgrade tier on
-2026-09-10, so a privileged worker mediating in-process no longer gets a
-silent, supervisor-owned sandbox (T5): the fork refuses the create.
+E2B stopped asking for the fork's supervisor downgrade tier on 2026-09-10 and
+fork B3 deleted that field outright (2026-09-11), so a privileged worker
+mediating in-process no longer gets a silent, supervisor-owned sandbox (T5):
+the fork refuses the create.
 
 That makes *how* these tests build the sandbox part of what is under test --
 they drive the production path (pooled per-sandbox uid + ``E2B_ROUTE_B=auto`` +
@@ -106,10 +107,11 @@ async def test_in_process_chroot_is_refused_without_a_slot(caplog):
 
     With ``E2B_ROUTE_B=off`` a root worker would mediate in-process while the
     sandbox runs as uid 1000 -- exactly the T5 shape. Before 2026-09-10 E2B
-    asked the fork to accept it (``mediation_run_as=supervisor``, which is loud
-    but still leaves supervisor-owned files); now nothing is asked, so the
-    fork's fail-closed default refuses the create. Re-adding the tier -- or
-    quietly dropping ``fs_denied`` to dodge the refusal -- fails here.
+    asked the fork to accept it through an explicit downgrade tier (loud, but
+    it still leaves supervisor-owned files); now nothing is asked, and fork B3
+    deleted the tier entirely, so the create is refused fail-closed.
+    Re-introducing such a tier -- or quietly dropping ``fs_denied`` to dodge
+    the refusal -- fails here.
 
     The refusal is pinned from two sides because the fork's FFI cannot carry a
     reason (``sandlock_instance_launch`` returns a null handle, and the SDK
@@ -137,7 +139,7 @@ async def test_in_process_chroot_is_refused_without_a_slot(caplog):
         ), disclosed[0]
         with pytest.raises(
             RuntimeError,
-            match="sandlock_instance_launch failed|mediation_run_as=caller refused",
+            match="sandlock_instance_launch failed|in-process path mediation refused",
         ):
             await run_sh(executor, str(workspace), "true")
     finally:

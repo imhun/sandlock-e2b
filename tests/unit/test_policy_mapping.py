@@ -121,14 +121,16 @@ def test_volume_views_map_under_both_workspace_aliases(tmp_path) -> None:
 
 
 def test_chroot_policy_sends_no_mediation_tier(monkeypatch, tmp_path) -> None:
-    """The supervisor downgrade tier is gone (2026-09-10).
+    """The supervisor downgrade tier is gone (E2B 2026-09-10, fork field
+    deleted 2026-09-11 by B3).
 
     E2B used to send `mediation_run_as='supervisor'` for a root worker with the
     image-rootfs shape -- which is precisely what made mediated writes belong to
     the worker instead of the sandbox (T5). Chroot sandboxes now run on a
     supervise slot whose euid *is* the sandbox's host uid, so no tier is sent at
-    all and the fork keeps its fail-closed `caller` default: an in-process
-    chroot create is refused rather than silently degrading ownership.
+    all -- and there is nothing left to send: fork B3 removed the field, so an
+    in-process chroot create is refused (fail-closed) rather than silently
+    degrading ownership.
     """
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     rootfs = tmp_path / "rootfs"
@@ -160,9 +162,9 @@ def test_one_shot_builder_sends_no_mediation_tier(monkeypatch, tmp_path) -> None
     """The one-shot builder is the second place the tier used to be set.
 
     Off Linux ``_build_sandbox`` hands back the kwargs mirror, where absence is
-    directly visible; on Linux the SDK object always carries the field, so the
-    assertion becomes "it is the fork's fail-closed default", which is the same
-    fact from the other side.
+    directly visible; on Linux the SDK object is the fork's ``Sandbox``, which
+    no longer *has* the attribute at all (B3 deleted it), so absence is visible
+    on both sides.
     """
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     rootfs = tmp_path / "rootfs"
@@ -187,7 +189,7 @@ def test_one_shot_builder_sends_no_mediation_tier(monkeypatch, tmp_path) -> None
     if sl.sandlock is None:
         assert "mediation_run_as" not in vars(one_shot)
     else:
-        assert one_shot.mediation_run_as == "caller"
+        assert not hasattr(one_shot, "mediation_run_as")
 
 
 def test_network_enabled_maps_to_allowlist():

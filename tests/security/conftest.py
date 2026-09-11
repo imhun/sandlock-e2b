@@ -185,11 +185,12 @@ def require_sandlock():
 #
 # The chroot shape is the only one where E2B asks the fork for path mediation
 # (`fs_denied` + chroot), and mediation now runs in the sandbox's own host uid
-# -- inside a route-B `sandlock-supervise` slot. E2B no longer sets the fork's
-# `mediation_run_as=supervisor` downgrade tier, so an in-process mediated
-# create on a privileged worker is *refused* rather than silently producing
-# supervisor-owned files (T5). Tests of this shape therefore have to build the
-# sandbox the way the worker does, which is what these helpers do.
+# -- inside a route-B `sandlock-supervise` slot. There is no mediation tier to
+# set any more (E2B stopped sending it 2026-09-10; fork B3 deleted the field
+# 2026-09-11), so an in-process mediated create on a privileged worker is
+# *refused* rather than silently producing supervisor-owned files (T5). Tests
+# of this shape therefore have to build the sandbox the way the worker does,
+# which is what these helpers do.
 
 _slot_serial = itertools.count()
 
