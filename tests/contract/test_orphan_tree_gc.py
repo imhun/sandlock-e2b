@@ -659,6 +659,89 @@ async def test_gc_protects_paused_migrating_and_reserved_entries(
 
 
 @pytest.mark.asyncio
+async def test_snapshot_store_trees_are_never_gc_candidates(
+    workspace, monkeypatch, caplog
+):
+    """follow-up 2: the snapshot store is a top-level ``snap_*`` namespace.
+
+    ``SnapshotRegistry``'s base *is* the workspace base
+    (``control_plane/app.py``), so a snapshot is a top-level
+    ``snap_<hex>`` directory sitting next to the ``sbx_*`` trees. ``snap_``
+    passes ``validate_sandbox_id`` (``_`` is a legal id character and the
+    prefix is not reserved there), so on today's shape the store only escapes
+    the GC because no snapshot carries a *top-level* ``sandbox.json`` — luck,
+    not design. The predicate has to say so instead:
+
+    * the snapshot tree never enters the scan, even when it is shaped exactly
+      like a sandbox tree — a top-level ``sandbox.json`` whose record claims
+      ``<base>/<id>``, which is the shape the teardown's own ``<base>/<id>``
+      guard accepts, i.e. the shape that would be *deleted*;
+    * a real ``sbx_*`` tree of the same round is still scanned, torn down and
+      has its quota row reclaimed (the tightening must not go too far).
+    """
+    _nodes, _registry, control_app = _stack(workspace)
+
+    # The dangerous snapshot shape: the record a whole-tree snapshot would
+    # carry, plus the snapshot's own marker file.
+    snap_id = "snap_0040ce7e44f6365f"
+    snap_dir = _tree(workspace, snap_id, project_id=STRANDED_PROJID)
+    snapshot_marker = snap_dir / "snapshot.json"
+    snapshot_marker.write_text(
+        json.dumps({"snapshot_id": snap_id}), encoding="utf-8"
+    )
+
+    # A real orphan tree of the same round.
+    orphan_id = "sbx_stranded"
+    orphan_dir = _tree(workspace, orphan_id, project_id=STRANDED_VOLUME_PROJID)
+    quota = _QuotaFake({STRANDED_PROJID: 8, STRANDED_VOLUME_PROJID: 8})
+    quota.install(monkeypatch)
+    _install_disk_projids(monkeypatch, {orphan_dir: STRANDED_VOLUME_PROJID})
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+
+    # The scan behind both the GC and the quota reclaim: the snapshot tree is
+    # not a workspace runtime, materialised or unmaterialised.
+    records, unmaterialised = agent_mod._scan_workspace_runtimes(
+        _envd_settings(workspace), RuntimeRegistry(workspace)
+    )
+    assert sorted(records) == [orphan_id]
+    assert unmaterialised == []
+
+    agent = _agent(workspace)
+    async with _client(control_app) as raw:
+        summary = await agent._reconcile_with_control_plane(raw, _headers())
+
+    assert summary == {
+        "deleted": [orphan_id],
+        "delete_failures": [],
+        "unmaterialised": [],
+        "protected_elsewhere": [],
+        "disk_sweep_skipped": [],
+        "untrusted_records": [],
+        "concurrent_creates": [],
+        "quota_cleaned": [STRANDED_VOLUME_PROJID],
+        "quota_unreclaimed": [],
+    }
+    # The snapshot tree is untouched — marker, record and files all still
+    # there — and the round never released the projid its record claims.
+    assert snapshot_marker.read_text(encoding="utf-8") == json.dumps(
+        {"snapshot_id": snap_id}
+    )
+    assert (snap_dir / "sandbox.json").is_file()
+    assert (snap_dir / "workspace").is_dir()
+    assert quota.released == [(str(orphan_dir), STRANDED_VOLUME_PROJID)]
+    # ``_recorded_projids`` is *record*-driven (it reads ``sandbox.json``
+    # directly, not the directory predicate), so the snapshot's claim still
+    # counts there. That asymmetry is the deliberate, fail-safe direction:
+    # the tightened predicate may only ever make a scan see *fewer* trees,
+    # never strip a live tree's recorded project id.
+    assert quota.rows == {STRANDED_PROJID: 8}
+    assert [record.message for record in caplog.records] == [
+        f"reconcile: removing orphan runtime {orphan_id} (not in control plane)",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_trees_without_a_readable_record_are_reported_never_deleted(
     workspace, monkeypatch, caplog
 ):

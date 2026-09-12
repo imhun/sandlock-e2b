@@ -205,6 +205,41 @@ def test_scan_project_dirs_keeps_sandbox_trees_only(tmp_path, monkeypatch):
     assert calls == [["lsattr", "-p", "-d", str(keep)]]
 
 
+def test_scan_project_dirs_excludes_the_snapshot_store(tmp_path, monkeypatch):
+    """follow-up 2: a top-level ``snap_*`` store is not a sandbox tree.
+
+    ``SnapshotRegistry``'s base is the workspace base, so snapshots live at
+    the top level next to the ``sbx_*`` trees and pass
+    ``validate_sandbox_id`` (``_`` is a legal id character). The quota scan
+    must not count one as a recorded project directory even when it carries a
+    top-level ``sandbox.json`` (the whole-tree snapshot shape): its record is
+    not a sandbox record, so its projid must never enter the mapping the
+    orphan reconcile walks.
+
+    Note the split the assertion below pins: ``_recorded_projids`` is
+    *record*-driven (it reads ``sandbox.json`` directly) while
+    ``_scan_project_dirs`` is the predicate consumer. Tightening the shared
+    predicate may only ever make the scan see *fewer* trees, so a live tree
+    can never lose its recorded row to this change.
+    """
+    keep = tmp_path / "sbx_keep"
+    keep.mkdir()
+    snap = tmp_path / "snap_0040ce7e44f6365f"
+    snap.mkdir()
+    (snap / "snapshot.json").write_text("{}", encoding="utf-8")
+    (snap / "sandbox.json").write_text(
+        json.dumps({"sandbox_id": snap.name, "project_id": 701}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(xfs_quota, "_use_quotactl", lambda mount_point: False)
+    calls = _fake_subprocess(
+        monkeypatch, {}, lsattr_stdout=f"     700 ---------------- {keep}\n"
+    )
+    assert xfs_quota._scan_project_dirs(tmp_path) == {700: keep}
+    # The snapshot directory never even reaches the disk read.
+    assert calls == [["lsattr", "-p", "-d", str(keep)]]
+
+
 def test_reconcile_cleans_orphan_with_leftover_dir_but_keeps_dir(
     tmp_path, monkeypatch, caplog
 ):
