@@ -29,6 +29,14 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    # C4: rebuild on boot like every other service. Without this the daemon
+    # leaves redis stopped after a host reboot (measured 2026-09-12:
+    # RestartPolicy=no), so control-plane and the workers -- which depend on
+    # `redis: service_healthy` -- could not come back without a manual
+    # `docker compose up -d`, turning a 20-60s maintenance window into an
+    # open-ended outage. Every service in this file must carry one; if a
+    # service is ever meant to stay down across a reboot, say so here.
+    restart: unless-stopped
 
   control-plane:
     image: ${CONTROL_PLANE_IMAGE}
