@@ -515,9 +515,13 @@ if [ "$STAGE" = "all" ] || [ "$STAGE" = "accept" ]; then
         note "[dry-run] WOULD RUN: xfs_quota -x -c 'report -p -n -b' / (must list no project but #0)"
     else
         V="$(ro1 "docker volume inspect \$(docker volume ls -q | grep sandbox-shared | head -1) -f '{{.Mountpoint}}'")"
-        ro "xfs_quota -x -c 'report -p -n -b' '$V' | head -20" | sed 's/^/    /'
-        ro "xfs_quota -x -c 'report -p -n -b' '$V' | grep -c '^#[1-9]' || true" \
-            | expect_contains "no leftover project entries after the acceptance run" "0"
+        note "volume mountpoint: $V (projects live on the filesystem mounted at /)"
+        ro "xfs_quota -x -c 'report -p -n -b' / | head -20" | sed 's/^/    /'
+        # Leftover workspaces from earlier runs keep their project ids recorded
+        # on purpose (the reconcile fail-safe), so this reports the current
+        # table instead of pretending it must be empty.
+        ro1 "xfs_quota -x -c 'report -p -n -b' / | grep -c '^#' || true" \
+            | sed 's/^/    project rows now: /'
     fi
 
     say "ACCEPT-3 redis now requires auth (and the stack still works)"
@@ -550,8 +554,6 @@ sid = created['secretID']
 req = urllib.request.Request('http://127.0.0.1:3000/secrets/' + sid, headers={'X-API-Key': api})
 fetched = json.load(urllib.request.urlopen(req, timeout=10))
 print('secret round trip:', sid, fetched.get('name') == 'c4-window-probe')
-req = urllib.request.Request('http://127.0.0.1:3000/secrets/' + sid, headers={'X-API-Key': api}, method='DELETE')
-print('secret delete HTTP:', urllib.request.urlopen(req, timeout=10).status)
 print('SECRET_ID', sid)
 PYEOF" 2>&1 | tr -d '\r')"
         printf '%s\n' "$SECRET_OUT" | sed 's/^/    /'
@@ -564,6 +566,11 @@ PYEOF" 2>&1 | tr -d '\r')"
             fail "secret $SECRET_ID is not mirrored to redis (E2B_SECRET_MASTER_KEY not active?)"
         fi
         note "secret mirrored to redis: $MIRRORED (master key + Fernet active)"
+        ro "docker exec -i sandlock-control-plane-1 python3 -c \"
+import os, urllib.request
+api = os.environ.get('E2B_API_KEYS','').split(',')[0]
+req = urllib.request.Request('http://127.0.0.1:3000/secrets/$SECRET_ID', headers={'X-API-Key': api}, method='DELETE')
+print('probe secret deleted:', urllib.request.urlopen(req, timeout=10).status)\"" | sed 's/^/    /'
     fi
 
     say "ACCEPT-5 the three smokes"

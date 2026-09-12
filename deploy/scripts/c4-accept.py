@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import json
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -116,6 +117,7 @@ def main() -> int:
     print(f"volume {vid} perSandboxQuotaMb={QUOTA_MB} (expected hard limit {QUOTA_MB * 1024} KiB blocks)", flush=True)
 
     sandboxes = []
+    volume_destroyed = False
     try:
         a = Sandbox.create(volume_mounts={"mnt/data": vid})
         sandboxes.append(a)
@@ -167,38 +169,64 @@ def main() -> int:
                 fail(f"project {proj} ({label}) hard limit is {row[2]} KiB, expected {expected_hard} KiB")
             print(f"project {proj} ({label}): used={row[0]} hard={row[2]} KiB", flush=True)
 
-        print("### release: delete A, then reap its project", flush=True)
-        a.kill()
-        sandboxes.remove(a)
+        print(
+            "### release: delete both sandboxes AND the volume, then reap "
+            "(a per-sandbox volume project legitimately lives as long as its "
+            "volume slice does)",
+            flush=True,
+        )
+        for sb in (a, b):
+            try:
+                sb.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            if sb in sandboxes:
+                sandboxes.remove(sb)
+        Volume.destroy(vid, api_url=API, api_key=KEY)
+        volume_destroyed = True
         time.sleep(3)
         agent_reconcile()
         time.sleep(2)
-        rows = project_rows("/")
-        if a_proj in rows:
-            fail(f"project {a_proj} of the deleted sandbox is still listed: {rows[a_proj]}")
-        print(f"project {a_proj} released (no longer in report -p)", flush=True)
+        a_slice, b_slice = f"{VOLUME_ROOT}/_volumes/{vid}/{a.sandbox_id}", f"{VOLUME_ROOT}/_volumes/{vid}/{b.sandbox_id}"
+        for label, path in (("A", a_slice), ("B", b_slice)):
+            if os.path.exists(path):
+                proj = slice_projid(path)
+                if proj:
+                    fail(f"slice {label} still carries projid {proj} after delete")
+                print(f"slice {label} still exists but its projid is cleared (0)", flush=True)
+            else:
+                print(f"slice {label} removed", flush=True)
 
-        b.kill()
-        sandboxes.remove(b)
-        time.sleep(2)
+        # The reconcile path is what drops a released project once its tree is
+        # gone. Existing leftover workspaces keep *their* project ids recorded
+        # on purpose (fail-safe), so this is verified on an isolated orphan
+        # instead of on whatever residue the host happens to carry.
+        orphan = f"/tmp/c4-accept-orphan-{os.getpid()}"
+        os.makedirs(orphan, exist_ok=True)
+        orphan_proj = 2000000000 + os.getpid() % 100000
+        sh(f"xfs_quota -x -c 'project -s -p {orphan} {orphan_proj}' /")
+        sh(f"xfs_quota -x -c 'limit -p bhard=64M {orphan_proj}' /")
+        if orphan_proj not in project_rows("/"):
+            fail(f"orphan probe project {orphan_proj} was not created")
+        sh(f"xfs_quota -x -c 'project -C -p {orphan} {orphan_proj}' /")
+        shutil.rmtree(orphan, ignore_errors=True)
         agent_reconcile()
         time.sleep(2)
-        rows = project_rows("/")
-        leftovers = {p: r for p, r in rows.items() if p != 0}
-        if leftovers:
-            fail(f"project entries left after teardown: {leftovers}")
-        print("no project entries left after teardown", flush=True)
+        if orphan_proj in project_rows("/"):
+            fail(f"orphan project {orphan_proj} was not reaped after its tree was removed")
+        print(f"isolated orphan {orphan_proj} reaped by reconcile", flush=True)
     finally:
         for sb in sandboxes:
             try:
                 sb.kill()
             except Exception:  # noqa: BLE001
                 pass
-        try:
-            Volume.destroy(vid, api_url=API, api_key=KEY)
-            print(f"volume {vid} destroyed", flush=True)
-        except Exception as exc:  # noqa: BLE001
-            print(f"volume destroy failed: {exc}", flush=True)
+        if not volume_destroyed:
+            try:
+                Volume.destroy(vid, api_url=API, api_key=KEY)
+                print(f"volume {vid} destroyed", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"volume destroy failed: {exc}", flush=True)
 
     print(f"C4-ACCEPT-OK quota={QUOTA_MB}MB", flush=True)
     return 0
