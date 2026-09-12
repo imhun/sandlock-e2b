@@ -61,13 +61,60 @@ import re
 import shlex
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from envd_service import xfs_quotactl
 from gateway_common.paths import validate_sandbox_id
 
 logger = logging.getLogger(__name__)
+
+#: Backend selector: ``auto`` (fd backend when the xfs_quota tool cannot reach
+#: the filesystem, e.g. a quota-agent container that only bind-mounts it),
+#: ``subprocess`` (always ``xfs_quota -x``) or ``quotactl`` (always the
+#: device-free fd backend).
+XFS_QUOTA_BACKEND_ENV = "E2B_XFS_QUOTA_BACKEND"
+_BACKEND_CACHE: dict[str, str] = {}
+_BACKEND_LOCK = threading.Lock()
+
+
+def _configured_backend() -> str:
+    value = (os.getenv(XFS_QUOTA_BACKEND_ENV) or "auto").strip().lower()
+    return value if value in ("auto", "subprocess", "quotactl") else "auto"
+
+
+def _use_quotactl(mount_point: str | Path) -> bool:
+    """Whether this mount's quota operations go through the fd backend.
+
+    ``auto`` prefers the fd backend whenever the kernel allows it on this
+    mount: that is the shape where ``xfs_quota -x`` cannot reach the
+    filesystem at all (a container that only bind-mounts it), and where the
+    capability is available it is equivalent for our operations. A host/root
+    shape whose kernel says no keeps the historical subprocess path, so no
+    existing command sequence changes.
+    """
+    mode = _configured_backend()
+    if mode == "quotactl":
+        return True
+    if mode == "subprocess":
+        return False
+    key = str(mount_point)
+    with _BACKEND_LOCK:
+        cached = _BACKEND_CACHE.get(key)
+    if cached is not None:
+        return cached == "quotactl"
+    choice = "quotactl" if xfs_quotactl.available(mount_point) else "subprocess"
+    if choice == "quotactl":
+        logger.info(
+            "using the device-free quotactl_fd backend for %s (xfs_quota "
+            "cannot administer this mount without its device)",
+            mount_point,
+        )
+    with _BACKEND_LOCK:
+        _BACKEND_CACHE[key] = choice
+    return choice == "quotactl"
 
 #: Non-root workers (E5.1) without effective CAP_SYS_ADMIN cannot run
 #: ``xfs_quota -x`` directly: the kernel gates quota administration on
@@ -182,6 +229,8 @@ def _local_run_xfs_quota(mount_point: str | Path, command: str) -> str:
 
 def _local_in_use_projids(mount_point: str | Path) -> set[int]:
     """Return the project ids currently defined in the XFS project table."""
+    if _use_quotactl(mount_point):
+        return set(xfs_quotactl.project_table(mount_point))
     output = _local_run_xfs_quota(mount_point, "report -p")
     return _parse_project_report(output)
 
@@ -229,6 +278,18 @@ def project_quota_table(
             raise ProjectQuotaError(
                 f"quota-agent report returned invalid rows: {exc}"
             ) from exc
+    if _use_quotactl(mount_point):
+        return {
+            projid: ProjectQuotaUsage(
+                projid=projid,
+                used_blocks=used,
+                soft_blocks=soft,
+                hard_blocks=hard,
+            )
+            for projid, (used, soft, hard) in xfs_quotactl.project_table(
+                mount_point
+            ).items()
+        }
     output = _local_run_xfs_quota(mount_point, "report -p")
     return _parse_project_usage(output)
 
@@ -290,6 +351,31 @@ def provision_project(
         if project_id is not None
         else allocate_project_id(sandbox_id, mount_point)
     )
+    if _use_quotactl(mount_point):
+        # Device-free backend: tag the directory (children inherit through
+        # XFS_XFLAG_PROJINHERIT) and set the block limit through quotactl_fd.
+        try:
+            xfs_quotactl.assign_projid(project_dir, projid)
+        except xfs_quotactl.QuotactlError as exc:
+            raise ProjectQuotaError(
+                f"project setup failed for {sandbox_id}: {exc}"
+            ) from exc
+        try:
+            xfs_quotactl.set_limit(mount_point, projid, disk_mb)
+        except xfs_quotactl.QuotactlError as exc:
+            try:
+                xfs_quotactl.clear_projid(project_dir)
+            except xfs_quotactl.QuotactlError as cleanup_exc:
+                logger.warning(
+                    "project cleanup failed for %s (projid %s): %s",
+                    sandbox_id,
+                    projid,
+                    cleanup_exc,
+                )
+            raise ProjectQuotaError(
+                f"quota limit setup failed for {sandbox_id}: {exc}"
+            ) from exc
+        return projid
     quoted_dir = shlex.quote(str(project_dir))
     setup = f"project -s -p {quoted_dir} {projid}"
     try:
@@ -337,6 +423,14 @@ def release_project(
             mount_point=str(mount_point),
             projid=projid,
         )
+        return
+    if _use_quotactl(mount_point):
+        try:
+            xfs_quotactl.clear_projid(project_dir)
+        except xfs_quotactl.QuotactlError as exc:
+            raise ProjectQuotaError(
+                f"project release failed for {project_dir}: {exc}"
+            ) from exc
         return
     command = f"project -C -p {shlex.quote(str(project_dir))} {projid}"
     _local_run_xfs_quota(mount_point, command)
@@ -406,6 +500,16 @@ def _scan_project_dirs(workspace_base: str | Path) -> dict[int, Path]:
         return mapping
     if not candidates:
         return mapping
+    if _use_quotactl(base):
+        for candidate in sorted(candidates):
+            try:
+                projid = xfs_quotactl.projid_of(candidate)
+            except xfs_quotactl.QuotactlError as exc:
+                logger.warning("cannot read project id of %s: %s", candidate, exc)
+                continue
+            if projid:
+                mapping[projid] = candidate
+        return mapping
     argv = ["lsattr", "-p", "-d", *(str(c) for c in sorted(candidates))]
     try:
         proc = subprocess.run(
@@ -453,8 +557,20 @@ def cleanup_orphan_project(
     files stay untouched for a later record-driven decision.
     """
     if project_dir is not None:
+        if _use_quotactl(mount_point):
+            try:
+                xfs_quotactl.clear_projid(project_dir)
+            except xfs_quotactl.QuotactlError as exc:
+                raise ProjectQuotaError(
+                    f"project cleanup failed for {project_dir}: {exc}"
+                ) from exc
+            xfs_quotactl.clear_limit(mount_point, projid)
+            return
         command = f"project -C -p {shlex.quote(str(project_dir))} {projid}"
         _local_run_xfs_quota(mount_point, command)
+    if _use_quotactl(mount_point):
+        xfs_quotactl.clear_limit(mount_point, projid)
+        return
     _local_run_xfs_quota(mount_point, f"limit -p bsoft=0 bhard=0 {projid}")
 
 
@@ -662,6 +778,23 @@ def _local_facts(mount_point: str | Path) -> dict[str, Any]:
     }
     if fs_type != "xfs":
         facts["projid32bit"] = False
+        return facts
+    if _use_quotactl(mount_point):
+        # Device-free path: the geometry ioctl is ENOTTY in a container that
+        # only bind-mounts the filesystem, so projid32bit is established
+        # functionally (write a project id above 0xFFFF, read it back).
+        supported, reason = xfs_quotactl.projid32bit(mount_point)
+        if supported is None:
+            logger.warning(
+                "cannot determine projid32bit on %s: %s", mount_point, reason
+            )
+            return {"error": f"cannot determine projid32bit: {reason}"}
+        facts["projid32bit"] = supported
+        facts["projid32bit_source"] = reason
+        # The tool may exist without being usable here; what this fact reports
+        # is whether quota administration is available at all.
+        facts["xfs_quota"] = True
+        facts["backend"] = "quotactl"
         return facts
     info = _run_xfs_info(mount_point)
     if info is None:
