@@ -37,6 +37,47 @@ cp deploy/scripts/acr.env.example   deploy/scripts/acr.env         # 填 ACR_USE
 ./deploy/scripts/smoke.sh
 ```
 
+> 从 fix round 1 之前的版本升级到 c1 权限模型时，先按下一节把既有工作区切一次
+> （本轮从未发布过 ⇒ 只有开发/测试环境需要）。
+
+## 一次性迁移：把既有沙箱工作区切到 c1 权限模型（`0770 <沙箱 uid>:<worker gid>`）
+
+F1/fix round 1（裁定 c1）之后，worker 通过**属组**访问沙箱工作区
+（`0770 owner=<沙箱 uid> group=<worker effective gid>`，见
+`docs/production-deployment-requirements.md` §2.4）。**本轮从未发布过**，所以只有
+开发/测试环境里存在 fix round 1 之前/之中建出的 `0700 owner=X` 工作区；滚动升级到 c1
+镜像前把它们切一次即可（worker 自己改不动别人的模式：broker 刻意不带 `CAP_FOWNER`）。
+
+```bash
+COMPOSE="docker compose -f deploy/stack/docker-compose.prod.yml"
+
+# 0) 先看清 worker 的 uid/gid 与现状（只读）
+$COMPOSE exec -T worker-1 id -u; $COMPOSE exec -T worker-1 id -g
+$COMPOSE exec -T worker-1 sh -c 'ls -ln /var/lib/e2b-sandboxes | head'
+
+# 1) 每个 worker 各跑一次：只碰 <workspace_base> 下的 sbx_* 顶层目录
+for svc in worker-1 worker-2; do
+  WGID="$($COMPOSE exec -T "$svc" id -g | tr -d '\r')"
+  $COMPOSE exec -T -u 0 "$svc" sh -c "
+    for d in /var/lib/e2b-sandboxes/sbx_*; do
+      [ -d \"\$d\" ] || continue
+      chgrp -R $WGID \"\$d\"
+      find \"\$d\" -type d -exec chmod 0770 {} +
+    done
+    ls -ln /var/lib/e2b-sandboxes | head"
+done
+```
+
+要点：
+
+* **取 worker gid 要用容器里的 `id -g`**（compose 是 `user: "65534:65534"`；k8s 若设了
+  `runAsGroup` 就以 pod 的值为准）——不要硬编码 65534。
+* `chgrp -R` 只改属组（文件模式不动，沙箱还是自己文件的属主）；目录统一 `0770`。
+* 只迁移 `sbx_*` 顶层目录：卷根保持 `1777`，`_volumes`/`_snapshots`/`_migrate`
+  不动（它们本来就归 worker）。
+* 迁移后 worker 侧数据面（files API / watcher / 命令日志 / 快照）才可用；不迁移时
+  这些路径会 EACCES，route-B 槽位与命令执行不受影响。
+
 ## 常用参数
 
 | 脚本 | 参数 / 环境变量 |

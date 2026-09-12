@@ -99,6 +99,20 @@ root worker 同样检查）。
 **顺序**：`chmod` 必须**先于** `chown`（chown 之后 worker 不再属主，再 chmod 会 EPERM；
 broker 刻意不带 `CAP_FOWNER`，root 形态看不出这个顺序，非 root 必踩）。
 
+**接受的边界（fix round 2 判定，2026-09-12）**：worker 是用**属组权限**访问托管目录的，
+所以**沙箱自己把条目收紧到 `0600`/`0700`** 时，platforms 侧读不到它
+（`sbx.files.read` 会 EACCES；root 形态没有这个限制——它靠 `DAC_OVERRIDE`）。
+实测（非 root 栈，`tmp/f1/f1-c1-locked-file-probe.log`）：沙箱内
+`chmod 600 /home/user/locked.txt` 后，沙箱自己 `cat` 得到内容、`sbx.files.list` 正常、
+`/metrics` 目录扫描正常、`sbx.files.remove` 成功（删除只需要目录写权限），
+只有 worker 侧**读文件**被拒。判定依据：仓库里**没有任何用例**依赖"worker 读沙箱自建的
+更严格权限文件"这条路径（`tests/sdk/python/*`、`tests/contract/test_filesystem_rpc.py`、
+`tests/security/*` 全量 grep `chmod|0600|permission` 只有"沙箱给自己文件加可执行位"
+与宿主侧 marker 两类）⇒ **接受该边界**，不为此给 broker 加通用 `read/write` 动词。
+删/扫由 worker 自己（属组）或 `e2b-maint rm/walk` 兜底。
+follow-up（一句）：若将来出现"worker 必须读沙箱自建 `0600` 文件"的需求，走**该沙箱自己的
+route-B 槽位**读回（槽位就是 uid X、本来就能读自己的文件），槽位不可用时明确返回"不可读"。
+
 要求与影响（逐条对照）：
 
 | 项 | 说明 |

@@ -28,6 +28,11 @@ from tests.security.conftest import sandbox_tmpdir
 from envd_service.executors.base import ExecConfig
 from envd_service.executors.sandlock import SandlockExecutor
 
+#: The pooled host uid this file's identity contract runs the sandbox at. The
+#: value is arbitrary (any uid outside the runner's own), it only has to be the
+#: uid the route-B slot and the workspace ownership agree on.
+POOLED_UID = 10000
+
 
 class RecordingOrigin:
     """Minimal origin server recording raw request bytes, replying 200."""
@@ -72,6 +77,62 @@ def _executor(
         enable_network=True,
         network=network,
         secrets_dir=secrets_dir,
+    )
+
+
+def _route_b_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExecutor:
+    """The deployed identity shape for route B (§2.4.1, 决定 #1).
+
+    **Host-side the sandbox runs at the pooled uid; inside its namespace it is
+    uid 0** (the fork's F18 self-map of the single-entry userns). A non-root
+    runner reaches that shape through the image's file-capability brokers --
+    the same wiring ``RouteBConfig.from_settings`` does in the worker -- while
+    a root runner uses the default ``setpriv`` starter.
+    """
+    from envd_service import priv_helpers
+    from envd_service.config import Settings as EnvdSettings
+    from envd_service.route_b import RouteBConfig
+    from envd_service.uid_pool import apply_sandbox_ownership
+
+    base = Path(workspace).parent
+    scratch = base / "route-b"
+    scratch.mkdir(parents=True, exist_ok=True)
+    settings = EnvdSettings(
+        priv_helpers="auto",
+        per_sandbox_uid=True,
+        workspace_base=base,
+        route_b="on",
+        uid_pool_start=pooled_uid,
+        uid_pool_size=1,
+        route_b_tmp_root=scratch,
+    )
+    # Resolve + install the singleton exactly like the worker start-up does, so
+    # the slot documents are group-scoped through the broker on a non-root
+    # runner (a warning-free, production-shaped lease).
+    helpers = priv_helpers.configure_priv_helpers(settings)
+    apply_sandbox_ownership(workspace, pooled_uid)
+    return SandlockExecutor(
+        workspace_dir=str(workspace),
+        base_image=None,
+        image_rootfs=None,
+        host_uid=pooled_uid,
+        per_sandbox_uid=True,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=True,
+        network=None,
+        sandbox_id="sbx_identity_probe",
+        route_b=RouteBConfig(
+            mode="on",
+            uid_start=pooled_uid,
+            uid_size=1,
+            tmp_root=scratch,
+            spawner=helpers.slot_spawner if helpers is not None else None,
+        ),
     )
 
 
@@ -253,23 +314,50 @@ async def test_header_inject_and_host_mask_on_the_wire(tmp_path, monkeypatch):
 
 @pytest.mark.usefixtures("require_sandlock")
 async def test_sandbox_child_runs_unprivileged():
-    """S1.2 user-namespace semantics: the single entry maps the host uid
-    1000 into the sandbox as uid 0, so the child sees ``0 0`` — but it holds
-    no root privileges (Landlock keeps every host path outside the workspace
-    unwritable, so a uid-0 child still cannot touch host root paths)."""
-    ws = str(sandbox_tmpdir())
-    executor = _executor(ws, None)
-    exit_code, out, err = await _run(
-        executor, ws, "import os; print(os.getuid(), os.getgid())"
-    )
-    assert exit_code == 0, err.decode()
-    assert out.decode().strip() == "0 0"
+    """S1.2 identity semantics **in the deployed shape** (§2.4.1, 决定 #1).
 
-    # uid 0 inside the namespace must not grant root capabilities: writing
-    # to a host system path is denied by the sandbox policy.
-    denied_code = "open('/bin/root-cap-probe', 'w').write('x')"
-    exit_code, out, err = await _run(executor, ws, denied_code)
-    assert exit_code != 0, "uid 0 child must not write host system paths"
+    ``E2B_PER_SANDBOX_UID`` + route B: the sandbox's *host* uid is the pooled
+    uid and its single-entry namespace maps that uid to 0 (fork F18 self-map),
+    so the child sees ``0 0`` while everything it writes on the host belongs
+    to the pooled uid. Both halves are asserted below — the in-namespace
+    answer and the host-side owner of a file the child created.
+
+    The child still holds no root privileges: Landlock keeps every host path
+    outside the workspace unwritable, so a uid-0 child cannot touch host root
+    paths.
+    """
+    from envd_service.config import Settings as EnvdSettings
+    from envd_service import priv_helpers
+
+    ws = str(sandbox_tmpdir(suffix="-identity", uid=POOLED_UID))
+    executor = _route_b_identity_executor(Path(ws), POOLED_UID)
+    try:
+        exit_code, out, err = await _run(
+            executor, ws, "import os; print(os.getuid(), os.getgid())"
+        )
+        assert exit_code == 0, err.decode()
+        assert out.decode().strip() == "0 0"
+        # The identity came from a route-B slot leased at the pooled uid (not
+        # from an in-process fallback that would leave the worker's identity).
+        assert executor._route_b_active is True
+        assert executor._instance._handle.uid == POOLED_UID
+
+        # Host-side half of the identity: written in the sandbox, owned by the
+        # pooled uid (not by the worker, and not by root).
+        exit_code, out, err = await _run(
+            executor, ws, "open('host-side.txt', 'w').write('x')"
+        )
+        assert exit_code == 0, err.decode()
+        assert (Path(ws) / "host-side.txt").stat().st_uid == POOLED_UID
+
+        # uid 0 inside the namespace must not grant root capabilities: writing
+        # to a host system path is denied by the sandbox policy.
+        denied_code = "open('/bin/root-cap-probe', 'w').write('x')"
+        exit_code, out, err = await _run(executor, ws, denied_code)
+        assert exit_code != 0, "uid 0 child must not write host system paths"
+    finally:
+        executor.close()
+        priv_helpers.configure_priv_helpers(EnvdSettings(priv_helpers="off"))
 
 
 @pytest.mark.usefixtures("require_sandlock")
