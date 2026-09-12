@@ -319,7 +319,7 @@ if [ "$SKIP_PRE" = "0" ] && { [ "$STAGE" = "all" ] || [ "$STAGE" = "pre" ]; }; t
         note "fstab already carries prjquota"
     else
         FSTAB_CMD="python3 - <<'PYEOF'
-import re, shutil, subprocess, sys
+import os, shutil, subprocess, sys
 UUID = '$EXPECT_ROOT_UUID'
 src = '/etc/fstab'
 cand = '/etc/fstab.c4-candidate'
@@ -329,11 +329,12 @@ for line in lines:
     if line.lstrip().startswith('#'):
         out.append(line); continue
     parts = line.split()
-    if len(parts) >= 4 and parts[0] == 'UUID=' + UUID and parts[1] == '/' and parts[3] == '$EXPECT_ROOT_FSTYPE':
-        opts = parts[3] + ',prjquota'
-        parts[3] = opts
-        if parts[3].count('prjquota') > 1:
-            parts[3] = parts[3].replace('prjquota,prjquota', 'prjquota')
+    # fstab fields: <spec> <mountpoint> <fstype> <options> <dump> <pass>
+    if len(parts) >= 4 and parts[0] == 'UUID=' + UUID and parts[1] == '/' and parts[2] == '$EXPECT_ROOT_FSTYPE':
+        opts = parts[3].split(',')
+        if 'prjquota' not in opts:
+            opts.append('prjquota')
+        parts[3] = ','.join(opts)
         hit += 1
         out.append('\t'.join(parts[:3]) + '\t' + parts[3] + '\t' + '\t'.join(parts[4:]) + '\n')
     else:
@@ -348,6 +349,7 @@ print(rc.stdout.strip()); print(rc.stderr.strip())
 if rc.returncode != 0 and 'ignored' not in (rc.stdout + rc.stderr):
     print('FAIL: mount -a --fake rejected the candidate'); sys.exit(1)
 shutil.copy2(cand, '/etc/fstab')
+os.unlink(cand)
 print('installed: /etc/fstab now has prjquota on /')
 PYEOF
 sha256sum /etc/fstab"
@@ -379,8 +381,14 @@ sha256sum /etc/fstab"
     esac
     if [ "$DRY_RUN" = "0" ]; then ROLLBACK_MODE="boot"; fi
     if [ "$DRY_RUN" = "0" ]; then
-        ro "grubby --info=ALL 2>/dev/null | grep -c 'rootflags=[^ ]*prjquota' || true" \
-            | expect_contains "rootflags=prjquota is in the boot entries" "1"
+        # --update-kernel=ALL adds the arg to every kernel entry (this host has
+        # several), so assert on the entry that will actually boot, and record
+        # the total for the log.
+        ro "grubby --info=DEFAULT 2>/dev/null | grep -c 'rootflags=[^ ]*prjquota' || true" \
+            | expect_contains "rootflags=prjquota on the default boot entry" "1"
+        ALL_ENTRIES="$(ro1 "grubby --info=ALL 2>/dev/null | grep -c 'rootflags=[^ ]*prjquota' || true")"
+        note "kernel entries carrying rootflags=prjquota: $ALL_ENTRIES"
+        [ "${ALL_ENTRIES:-0}" -ge 1 ] || fail "no boot entry carries rootflags=prjquota"
         ro "grubby --info=DEFAULT 2>/dev/null | sed -n 's/^args=\"\\(.*\\)\"$/    args: \\1/p'" | head -3
     fi
 
