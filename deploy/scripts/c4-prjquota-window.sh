@@ -477,7 +477,14 @@ r = httpx.get(\"http://quota-agent:49984/detect\", params={\"mount\": \"/var/lib
 print(r.status_code, r.text)"'
     mut "$AGENT_CMD" | sed 's/^/    /'
     if [ "$DRY_RUN" = "0" ]; then
-        ro "$AGENT_CMD" | expect_contains "agent /detect" '"prjquota": true'
+        AGENT_OUT="$(ro "$AGENT_CMD")"
+        printf '%s\n' "$AGENT_OUT" | sed 's/^/    /'
+        # JSON may be compact ("prjquota":true) or spaced; match both.
+        printf '%s' "$AGENT_OUT" | grep -Eq '"prjquota"[[:space:]]*:[[:space:]]*true' \
+            || fail "agent /detect does not report prjquota true"
+        printf '%s' "$AGENT_OUT" | grep -Eq '"projid32bit"[[:space:]]*:[[:space:]]*true' \
+            || fail "agent /detect does not report projid32bit true"
+        note "agent /detect: prjquota + projid32bit true"
     fi
 fi
 

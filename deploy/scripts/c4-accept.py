@@ -22,6 +22,8 @@ prints ``C4-ACCEPT-OK`` plus the measured numbers.
 from __future__ import annotations
 
 import os
+import json
+import shlex
 import subprocess
 import sys
 import time
@@ -81,14 +83,17 @@ def run_cmd(sb, cmd: str) -> tuple[int, str, str]:
 
 def agent_reconcile() -> None:
     """Ask the quota-agent to reap projects nothing references any more."""
-    body = '{"workspace_base": "/var/lib/e2b-sandboxes", "mount": "/var/lib/e2b-sandboxes"}'
-    cmd = (
-        "docker exec sandlock-worker-1-1 python3 -c "
-        '"import os,httpx;r=httpx.post(\'http://quota-agent:49984/reconcile\','
-        'json=' + body + ','
-        'headers={\'X-Internal-Key\': os.environ.get(\'E2B_QUOTA_AGENT_TOKEN\',\'\')},timeout=30);'
-        'print(r.status_code, r.text)"'
+    payload = json.dumps(
+        {"workspace_base": "/var/lib/e2b-sandboxes", "mount": "/var/lib/e2b-sandboxes"}
     )
+    inner = (
+        "import os, httpx;"
+        f"r = httpx.post('http://quota-agent:49984/reconcile', content={payload!r},"
+        " headers={'X-Internal-Key': os.environ.get('E2B_QUOTA_AGENT_TOKEN', ''),"
+        " 'Content-Type': 'application/json'}, timeout=30);"
+        "print(r.status_code, r.text)"
+    )
+    cmd = "docker exec sandlock-worker-1-1 python3 -c " + shlex.quote(inner)
     out = sh(cmd)
     print("agent /reconcile:", out.stdout.strip() or out.stderr.strip(), flush=True)
 
@@ -119,13 +124,16 @@ def main() -> int:
         print(f"sandbox A={a.sandbox_id} B={b.sandbox_id}", flush=True)
 
         overshoot_mb = QUOTA_MB + 96
+        # No shell pipeline here: the sandbox shell is /bin/sh (no PIPESTATUS),
+        # and dd's ENOSPC line must reach us intact (a `tail -2` hid it once).
         code, out, err = run_cmd(
             a,
-            "dd if=/dev/zero of=mnt/data/big bs=1M count=%d 2>&1 | tail -2; "
-            "echo dd_rc=${PIPESTATUS[0]}; stat -c %%s mnt/data/big" % overshoot_mb,
+            "dd if=/dev/zero of=mnt/data/big bs=1M count=%d; "
+            "echo dd_rc=$?; stat -c %%s mnt/data/big" % overshoot_mb,
         )
-        print("A overshoot:", out.strip().replace("\n", " | "), flush=True)
-        if "No space left" not in out:
+        combined = f"{out}\n{err}"
+        print("A overshoot:", combined.strip().replace("\n", " | "), flush=True)
+        if "No space left" not in combined:
             fail(f"overshoot did not hit ENOSPC (exit={code} out={out[:200]!r} err={err[:200]!r})")
         size_line = [ln for ln in out.splitlines() if ln.strip().isdigit()]
         written = int(size_line[-1]) if size_line else 0

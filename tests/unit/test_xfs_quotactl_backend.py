@@ -114,14 +114,15 @@ def test_project_table_filters_ghost_dquots(fake):
     fake.entries = [
         (10001, 8192, 8192, 4096),   # live: 4 MiB limit, 2 MiB used
         (10002, 0, 0, 0),            # ghost left behind by a release
-        (10003, 0, 0, 2048),         # usage but no limit: still a project
+        (10003, 0, 0, 2048),         # no limits, stale usage: also a ghost
     ]
 
     table = q.project_table("/mnt/vol")
 
-    assert set(table) == {10001, 10003}
+    # Mirrors the operator view (`xfs_quota report -p`), which only lists
+    # projects that actually carry a limit.
+    assert set(table) == {10001}
     assert table[10001] == (2048, 4096, 4096)  # used, soft, hard in 1 KiB blocks
-    assert table[10003] == (1024, 0, 0)
 
 
 def test_usage_reports_none_for_an_unknown_project(fake):

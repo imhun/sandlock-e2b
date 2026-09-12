@@ -244,10 +244,13 @@ def usage(mount_point: str | Path, projid: int) -> tuple[int, int, int] | None:
 def project_table(mount_point: str | Path) -> dict[int, tuple[int, int, int]]:
     """projid -> (used, soft, hard) in 1 KiB blocks.
 
-    ``Q_XGETNEXTQUOTA`` also reports entries whose limits and usage are all
-    zero (ghost dquots left behind by a release). They carry no quota, so they
-    are filtered here: a phantom row would otherwise show up as a project in
-    the reconciliation/limit checks.
+    ``Q_XGETNEXTQUOTA`` reports dquots that carry **no limits** too: both the
+    all-zero ghosts a release leaves behind and entries whose usage counter is
+    still draining. The operator view (``xfs_quota report -p``) hides exactly
+    those, so they are filtered here as well -- a phantom row would otherwise
+    show up as a live project in the reconciliation/limit checks (measured on
+    the target: an entry with hard=soft=0 and a stale ``used`` outlived the
+    deleted slice while the host view showed only project 0).
     """
     fd = _MOUNT_FDS.get(mount_point)
     table: dict[int, tuple[int, int, int]] = {}
@@ -271,7 +274,7 @@ def project_table(mount_point: str | Path) -> dict[int, tuple[int, int, int]]:
         hard = struct.unpack_from("<Q", buf.raw, 8)[0]
         soft = struct.unpack_from("<Q", buf.raw, 16)[0]
         used = struct.unpack_from("<Q", buf.raw, 40)[0]
-        if projid and (hard or soft or used):
+        if projid and (hard or soft):
             table[projid] = (
                 basic_blocks_to_kib(used),
                 basic_blocks_to_kib(soft),
