@@ -128,6 +128,15 @@ def _ensure_shared_volume_root(volume_root: Path, host_uid: int) -> None:
     turns an absolute volume path into EACCES (A5). ``_ensure_traversable``
     widens that chain to o+x, leaving the per-sandbox slices at ``0770``
     (fix round 1 / c1: sandbox uid owns, worker gid is the group).
+
+    Order matters on a non-root worker: the handover below is done through the
+    ``e2b-maint`` broker, and once it has run the worker is neither the owner
+    nor in possession of ``CAP_FOWNER``, so a *trailing* chmod is EPERM — the
+    deployed stack logged exactly that warning once per volume per mount
+    (measured 2026-09-12; the c1 workspace fix has the same rule). The chmod
+    therefore comes first, is skipped when the mode is already what we want
+    (the control-plane API creates every volume root as ``0o1777``), and only
+    a wrong *end* state is worth a warning.
     """
     try:
         st = volume_root.stat()
@@ -137,15 +146,36 @@ def _ensure_shared_volume_root(volume_root: Path, host_uid: int) -> None:
         )
         return
     _ensure_traversable(volume_root)
+    wanted = 0o1777
+    try:
+        if stat.S_IMODE(st.st_mode) != wanted:
+            os.chmod(volume_root, wanted)
+    except OSError as exc:
+        # Best effort; the end-state check below decides whether to warn.
+        logger.debug(
+            "cannot chmod volume root %s to %o: %s", volume_root, wanted, exc
+        )
     try:
         if st.st_uid == 0:
             _chown_path(volume_root, host_uid)
-        os.chmod(volume_root, 0o1777)
     except OSError as exc:
         logger.warning(
-            "cannot apply shared perms to volume root %s: %s",
+            "cannot hand volume root %s to uid %s: %s",
             volume_root,
+            host_uid,
             exc,
+        )
+    try:
+        end_mode = stat.S_IMODE(volume_root.stat().st_mode)
+    except OSError:
+        return
+    if end_mode != wanted:
+        logger.warning(
+            "volume root %s is mode %o, expected %o: mounting sandboxes may "
+            "not be able to share it",
+            volume_root,
+            end_mode,
+            wanted,
         )
 
 

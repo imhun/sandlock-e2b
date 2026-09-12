@@ -96,6 +96,94 @@ def _provision(volume: Path, *, quota_mb: int = 0) -> tuple[Path, int | None]:
     )
 
 
+# ------------------------------------------- shared volume root (non-root worker)
+
+#: The exact warning the deployed non-root worker logged once per volume per
+#: mount: on a uid-65534 worker a chmod that runs *after* the chown has no
+#: owner and no CAP_FOWNER, so the kernel refuses it.
+SHARED_PERMS_WARNING = "cannot apply shared perms to volume root"
+
+
+def _emulate_deployed_worker(monkeypatch, volume_root: Path) -> dict:
+    """Make ``volume_root`` behave the way it does on the target.
+
+    ``_chown_path`` hands the tree to the sandbox uid (on the target the
+    ``e2b-maint`` broker does it), after which the worker is neither the owner
+    nor in possession of ``CAP_FOWNER`` -- so a later ``chmod`` is EPERM.
+    Real ``chmod`` is kept for every other path so the surrounding
+    ``_ensure_traversable`` work still runs.
+    """
+    state = {"owner": volume_root.stat().st_uid, "events": []}
+    real_chmod = os.chmod
+
+    def chmod(path, mode, *args, **kwargs):
+        if Path(path) == volume_root:
+            state["events"].append(("chmod", state["owner"]))
+            if state["owner"] != os.geteuid():
+                raise PermissionError(1, "Operation not permitted", str(path))
+        return real_chmod(path, mode, *args, **kwargs)
+
+    def chown(path, uid, **kwargs):
+        if Path(path) == volume_root:
+            state["events"].append(("chown", uid))
+            state["owner"] = uid
+
+    monkeypatch.setattr(volumes.os, "chmod", chmod)
+    monkeypatch.setattr(volumes, "_chown_path", chown)
+    return state
+
+
+def test_shared_volume_root_fixes_the_mode_before_handing_the_tree_over(
+    tmp_path, monkeypatch, caplog
+):
+    """chmod must happen while the worker still owns the root (F1/c1 order).
+
+    The deployed shape is a volume root created by the control plane (root),
+    which the worker then hands to the first mounting sandbox. Doing the chmod
+    *after* that handover is exactly the EPERM the target logged.
+    """
+    volume_root = tmp_path / "vol"
+    volume_root.mkdir()
+    os.chmod(volume_root, 0o755)  # not shared-writable yet
+    needs_handover = os.geteuid() == 0
+    if needs_handover:
+        os.chown(volume_root, 0, 0)  # what the control plane created
+    state = _emulate_deployed_worker(monkeypatch, volume_root)
+
+    with caplog.at_level(logging.WARNING, logger="envd_service.volumes"):
+        _ensure_shared_volume_root(volume_root, HOST_UID)
+
+    assert _mode(volume_root) == 0o1777
+    assert SHARED_PERMS_WARNING not in caplog.text
+    if needs_handover:
+        assert [event for event, _ in state["events"]] == ["chmod", "chown"]
+        assert state["owner"] == HOST_UID
+
+
+def test_shared_volume_root_already_shared_stays_quiet(
+    tmp_path, monkeypatch, caplog
+):
+    """A root that is already 1777 needs no chmod -- and must not cry wolf.
+
+    The control-plane API creates every volume root as root with ``0o1777``
+    (``registry/volumes.py``), which is also why the deployed stack kept
+    working while logging the warning.
+    """
+    volume_root = tmp_path / "vol"
+    volume_root.mkdir()
+    os.chmod(volume_root, 0o1777)
+    if os.geteuid() == 0:
+        # A foreign owner is what the root has after the first mount.
+        os.chown(volume_root, HOST_UID, HOST_UID)
+    _emulate_deployed_worker(monkeypatch, volume_root)
+
+    with caplog.at_level(logging.WARNING, logger="envd_service.volumes"):
+        _ensure_shared_volume_root(volume_root, HOST_UID)
+
+    assert _mode(volume_root) == 0o1777
+    assert SHARED_PERMS_WARNING not in caplog.text
+
+
 # ------------------------------------------------------- the traversal gate
 
 
