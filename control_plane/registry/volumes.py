@@ -15,6 +15,15 @@ from gateway_common.paths import validate_sandbox_id
 from gateway_common.timeutil import to_iso_z, utcnow
 
 
+#: Type tag written into every volume record. Volume and sandbox records share
+#: the ``e2b:record:<id>`` key space (both registries are constructed with the
+#: same namespace), so records are self-describing: the sandbox read paths use
+#: it to skip foreign payloads instead of trying to parse them
+#: (``control_plane.registry.manager._is_sandbox_record_payload``). Legacy
+#: records have no tag and are told apart by ``volume_id``/``sandbox_id``.
+RECORD_KIND_VOLUME = "volume"
+
+
 class UnknownVolumeError(KeyError):
     pass
 
@@ -63,6 +72,8 @@ class VolumeRecord:
 
     def to_storage_dict(self) -> dict[str, Any]:
         return {
+            # Shared-store type tag (see RECORD_KIND_VOLUME).
+            "kind": RECORD_KIND_VOLUME,
             "volume_id": self.volume_id,
             "name": self.name,
             "token": self.token,

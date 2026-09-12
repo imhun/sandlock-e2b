@@ -31,6 +31,31 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+#: Type tag written into every sandbox record. The shared
+#: ``e2b:record:<id>`` store also holds volume records (both registries are
+#: built with the same namespace), so the read paths have to tell them apart.
+#: Legacy records predate the tag, which is why ``_is_sandbox_record_payload``
+#: only uses it to *confirm* the shape, never to reject a record outright.
+RECORD_KIND_SANDBOX = "sandbox"
+
+
+def _is_sandbox_record_payload(payload: Any) -> bool:
+    """Whether a stored payload is a sandbox record (and not a volume's).
+
+    A volume record carries ``volume_id`` and no ``template_id``; parsing one
+    as a sandbox record raised ``KeyError`` out of every enumeration path
+    (``list`` / ``tenant_usage`` / ``remove_expired``), which made
+    ``GET /sandboxes`` answer 500 and stopped the TTL sweep for as long as any
+    volume existed (measured on the deployed stack, 2026-09-12).
+    """
+    if not isinstance(payload, dict):
+        return False
+    kind = payload.get("kind")
+    if kind is not None:
+        return kind == RECORD_KIND_SANDBOX
+    return "sandbox_id" in payload and "volume_id" not in payload
+
+
 class UnknownSandboxError(KeyError):
     """Raised when a sandbox ID is not in the registry."""
 
@@ -248,6 +273,8 @@ class SandboxRecord:
 
     def to_storage_dict(self) -> dict[str, Any]:
         return {
+            # Shared-store type tag (see ``_is_sandbox_record_payload``).
+            "kind": RECORD_KIND_SANDBOX,
             "template_id": self.template_id,
             "sandbox_id": self.sandbox_id,
             "client_id": self.client_id,
@@ -1200,7 +1227,22 @@ class SandboxRegistry:
             payload = self._record_store.get(sandbox_id)
             if payload is None:
                 raise UnknownSandboxError(sandbox_id)
-            record = SandboxRecord.from_storage_dict(payload)
+            if not _is_sandbox_record_payload(payload):
+                # The store is shared with the volume registry: a volume id
+                # (or any other foreign record) reads as "no such sandbox"
+                # instead of breaking the caller.
+                logger.debug(
+                    "record %s in the shared store is not a sandbox record",
+                    sandbox_id,
+                )
+                raise UnknownSandboxError(sandbox_id)
+            try:
+                record = SandboxRecord.from_storage_dict(payload)
+            except (KeyError, TypeError, ValueError) as exc:
+                # An upgrade must never require a Redis flush: a record whose
+                # shape we cannot read is skipped (and named), not raised.
+                logger.warning("unreadable sandbox record %s: %s", sandbox_id, exc)
+                raise UnknownSandboxError(sandbox_id) from exc
             with self._lock:
                 self._sandboxes[sandbox_id] = record
             return record
@@ -1400,12 +1442,7 @@ class SandboxRegistry:
         tenant_id: str | None = None,
     ) -> list[SandboxRecord]:
         if self._record_store is not None:
-            records = []
-            for sandbox_id in self._record_store.keys():
-                try:
-                    records.append(self.get(sandbox_id))
-                except UnknownSandboxError:
-                    continue
+            records = list(self._iter_stored_records())
         else:
             records = list(self._sandboxes.values())
         if tenant_id is not None:
@@ -1430,17 +1467,37 @@ class SandboxRegistry:
     def count(self) -> int:
         return len(self._sandboxes)
 
+    def _iter_stored_records(self):
+        """Yield the sandbox records held in the shared record store.
+
+        The store keeps *both* registries under ``e2b:record:<id>``, so this
+        skips anything that is not a sandbox record (volume records; a
+        tombstone already comes back as ``None`` from the store) and any record
+        whose shape cannot be read. One foreign record must never take out
+        listing, tenant usage or the TTL sweep.
+        """
+        for record_id in self._record_store.keys():
+            payload = self._record_store.get(record_id)
+            if payload is None:
+                continue
+            if not _is_sandbox_record_payload(payload):
+                logger.debug(
+                    "skipping non-sandbox record %s in the shared store",
+                    record_id,
+                )
+                continue
+            try:
+                yield self.get(record_id)
+            except UnknownSandboxError:
+                continue
+
     def tenant_usage(self) -> dict[str, dict[str, int]]:
         """Per-tenant usage from live records (independent of reservation
         ledger, so unconfigured tenants and admin-created records are also
         counted)."""
         usage: dict[str, dict[str, int]] = {}
         if self._record_store is not None:
-            for sandbox_id in self._record_store.keys():
-                try:
-                    record = self.get(sandbox_id)
-                except UnknownSandboxError:
-                    continue
+            for record in self._iter_stored_records():
                 self._accumulate_usage(usage, record)
         else:
             for record in self._sandboxes.values():
@@ -1466,11 +1523,7 @@ class SandboxRegistry:
         """Reap sandboxes whose TTL elapsed and release their reservations."""
         if self._record_store is not None:
             expired = []
-            for sandbox_id in self._record_store.keys():
-                try:
-                    record = self.get(sandbox_id)
-                except UnknownSandboxError:
-                    continue
+            for record in self._iter_stored_records():
                 if self._ttl_reapable(record, now):
                     expired.append(record)
                     self._release(record)
