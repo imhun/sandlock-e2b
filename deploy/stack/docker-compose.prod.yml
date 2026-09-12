@@ -105,6 +105,15 @@ services:
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE}
       E2B_TEMPLATE_IMAGES: ${E2B_TEMPLATE_IMAGES:-}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # E3.2 per-sandbox host uids (and route B's per-uid supervise slot).
+      # Workers that share one workspace volume MUST use disjoint ranges, and
+      # the pool must avoid the worker's own uid/gid (65534 here) --
+      # priv_helpers.check_worker_identity_outside_pool fails the worker's
+      # startup by name otherwise. This service takes the base range;
+      # worker-2 overrides with its own slice below.
+      E2B_PER_SANDBOX_UID: ${E2B_PER_SANDBOX_UID:-true}
+      E2B_UID_POOL_START: ${E2B_UID_POOL_START:-10000}
+      E2B_UID_POOL_SIZE: ${E2B_UID_POOL_SIZE:-1000}
       # Track F (F1): a non-root worker scopes each slot's policy/program
       # documents to that slot's uid (0440) through e2b-maint, and the broker
       # only touches paths under <workspace_base>/ or <shared_volume_root>/.
@@ -186,6 +195,10 @@ services:
       <<: *worker-env
       E2B_NODE_ADDRESS: http://worker-2:49983
       E2B_NODE_ID: worker-2
+      # Disjoint slice of the shared workspace's per-sandbox uid pool;
+      # worker-1 keeps the base E2B_UID_POOL_START/SIZE above.
+      E2B_UID_POOL_START: ${E2B_UID_POOL_START_WORKER2:-11000}
+      E2B_UID_POOL_SIZE: ${E2B_UID_POOL_SIZE_WORKER2:-1000}
 
   # Server-side XFS project quota manager (E2.6, A6). It owns the privilege the
   # worker no longer has: ``xfs_quota -x`` is gated on CAP_SYS_ADMIN, so the
