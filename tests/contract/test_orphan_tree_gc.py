@@ -1488,3 +1488,107 @@ async def test_teardown_without_a_readable_project_id_still_reclaims_the_tree(
         "reclaiming it without releasing its quota row",
         f"reconcile: removing orphan runtime {sandbox_id} (not in control plane)",
     ]
+
+
+@pytest.mark.asyncio
+async def test_in_memory_record_cached_from_a_rewritten_json_is_refused(
+    workspace, monkeypatch, caplog
+):
+    """M4: an in-memory record is only as trustworthy as where it came from.
+
+    Any request that calls ``RuntimeRegistry.get()`` caches the record it
+    reads out of the sandbox-writable ``sandbox.json``. The reconcile window
+    (the control plane deleted this sandbox while the worker was unreachable)
+    then makes that cached record an "orphan this process owns" -- the same
+    cross-tenant reach as the disk path, so the same verified targets apply.
+    The rewritten record keeps its own id (that is the shape the fleet guard
+    cannot filter on: the id really is unowned) and moves ``workspace_dir``
+    and ``project_id`` onto a live tenant's tree instead -- the victim's tree
+    and its quota row stay whole, and the rewritten tree is reported rather
+    than acted on.
+    """
+    _nodes, registry, control_app = _stack(workspace, nodes=("node_a", "node_b"))
+    victim_id = "sbx_cached_victim"
+    _control_record(registry, "node_b", victim_id)
+    victim_dir = _tree(workspace, victim_id, project_id=VICTIM_PROJID)
+    tamper_id = "sbx_cached_rewrite"
+    tamper_dir = workspace / tamper_id
+    (tamper_dir / "workspace").mkdir(parents=True)
+    (tamper_dir / "sandbox.json").write_text(
+        json.dumps(
+            {
+                "sandbox_id": tamper_id,
+                "access_token": "tok",
+                "workspace_dir": str(victim_dir),
+                "created_at": 1_600_000_000.0,
+                "project_id": VICTIM_PROJID,
+            }
+        ),
+        encoding="utf-8",
+    )
+    quota = _QuotaFake({VICTIM_PROJID: 8})
+    quota.install(monkeypatch)
+    _install_disk_projids(monkeypatch, {victim_dir: VICTIM_PROJID})
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+
+    agent = _agent(workspace)
+    # A request for the rewritten sandbox caches its record, exactly like the
+    # proxied command/file paths do.
+    cached = agent._runtime_registry.get(tamper_id)
+    assert cached.sandbox_id == tamper_id
+    assert cached.workspace_dir == str(victim_dir)
+    assert [record.sandbox_id for record in agent._runtime_registry.list()] == [
+        tamper_id
+    ]
+    async with _client(control_app) as raw:
+        summary = await agent._reconcile_with_control_plane(raw, _headers())
+
+    assert victim_dir.exists()
+    assert (victim_dir / "sandbox.json").is_file()
+    assert registry.get(victim_id).state == "running"
+    assert quota.rows == {VICTIM_PROJID: 8}
+    assert quota.released == []
+    assert tamper_dir.exists()
+    assert summary["deleted"] == []
+    assert summary["untrusted_records"] == [tamper_id]
+    assert [record.message for record in caplog.records] == [
+        f"reconcile: leaving {tamper_id} on disk: its sandbox.json points at "
+        f"{victim_dir}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_in_memory_orphan_is_torn_down_from_the_verified_target(
+    workspace, monkeypatch
+):
+    """The E6.1 in-memory semantics survive the M4 hardening.
+
+    A runtime this worker registered itself and the control plane no longer
+    knows is still torn down -- but from ``<workspace_base>/<id>`` and the
+    project id the disk reports, which for an honest record is exactly what
+    the record said.
+    """
+    _nodes, _registry, control_app = _stack(workspace)
+    sandbox_id = "sbx_in_memory_orphan"
+    sandbox_dir = _tree(workspace, sandbox_id, project_id=8101)
+    quota = _QuotaFake({8101: 8})
+    quota.install(monkeypatch)
+    _install_disk_projids(monkeypatch, {sandbox_dir: 8101})
+
+    agent = _agent(workspace)
+    agent._runtime_registry.register(
+        sandbox_id=sandbox_id,
+        access_token="tok",
+        workspace_dir=str(sandbox_dir),
+        project_id=8101,
+    )
+    async with _client(control_app) as raw:
+        summary = await agent._reconcile_with_control_plane(raw, _headers())
+
+    assert sandbox_dir.exists() is False
+    assert quota.released == [(str(sandbox_dir), 8101)]
+    assert quota.rows == {}
+    assert summary["deleted"] == [sandbox_id]
+    assert summary["untrusted_records"] == []
+    assert summary["quota_cleaned"] == [8101]

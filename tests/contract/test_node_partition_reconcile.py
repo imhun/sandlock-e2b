@@ -349,7 +349,11 @@ async def test_worker_reconcile_tears_down_orphan_runtime(workspace):
     )
 
     runtime_registry = RuntimeRegistry(workspace)
-    envd_settings = EnvdSettings(executor="local")
+    # The worker's settings must agree with the registry's base: the record
+    # this test registers lives at ``<workspace_base>/<id>``, and the
+    # orphan-tree GC anchors its teardown targets there (M4) instead of
+    # trusting the record's own ``workspace_dir``.
+    envd_settings = EnvdSettings(workspace_base=workspace, executor="local")
     envd_app = create_envd_app(
         settings=envd_settings,
         runtime_registry=runtime_registry,

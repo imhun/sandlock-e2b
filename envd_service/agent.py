@@ -36,7 +36,6 @@ from envd_service.uid_pool import (
 from envd_service.xfs_quota import (
     ProjectQuotaError,
     directory_project_id,
-    projids_in_record,
     provision_project,
     reconcile_orphan_projects,
     release_project,
@@ -696,11 +695,6 @@ class NodeAgent:
             sandbox_id for sandbox_id in in_memory if sandbox_id not in known
         } - concurrent_creates
         disk_candidates = set(scanned) - known - concurrent_creates
-        #: Trees the scan found on disk and this process never registered:
-        #: their only record lives inside the tree itself, i.e. it is
-        #: sandbox-writable input (M4), so they are torn down from verified
-        #: disk targets rather than from the record.
-        disk_only = set(scanned) - set(in_memory)
         candidates = orphaned | disk_candidates
         deletable = orphaned
         protected_elsewhere: list[str] = []
@@ -730,43 +724,39 @@ class NodeAgent:
         untrusted_records: list[str] = []
         reclaimable_projids: set[int] = set()
         for sandbox_id in sorted(deletable):
-            plan: _TeardownPlan | None = None
-            if sandbox_id in disk_only:
-                try:
-                    plan, reason = _gc_teardown_plan(
-                        self._settings, sandbox_id, local.get(sandbox_id)
-                    )
-                except Exception:
-                    # Verifying the targets must not cost the worker the rest
-                    # of the round (nor its heartbeat): an unverifiable tree
-                    # is left alone and reported like a mismatched record.
-                    logger.warning(
-                        "reconcile: cannot verify the teardown targets of %s; "
-                        "leaving it on disk",
-                        sandbox_id,
-                        exc_info=True,
-                    )
-                    untrusted_records.append(sandbox_id)
-                    continue
-                if plan is None:
-                    # A record that does not describe the tree it was found
-                    # in is not evidence of anything: leave the tree alone
-                    # (it is this sandbox's own directory) and say so.
-                    logger.warning(
-                        "reconcile: leaving %s on disk: %s",
-                        sandbox_id,
-                        reason,
-                    )
-                    untrusted_records.append(sandbox_id)
-                    continue
-                projids = set(plan.expected_projids)
-            else:
-                record = local.get(sandbox_id)
-                projids = (
-                    projids_in_record(record.to_dict())
-                    if record is not None
-                    else set()
+            # Every candidate is torn down from verified targets, in-memory
+            # ones included: a record this process "owns" can have been
+            # cached straight out of the sandbox-writable ``sandbox.json`` by
+            # any request that called ``RuntimeRegistry.get()``, so it is no
+            # more trustworthy than the disk copy (M4).
+            try:
+                plan, reason = _gc_teardown_plan(
+                    self._settings, sandbox_id, local.get(sandbox_id)
                 )
+            except Exception:
+                # Verifying the targets must not cost the worker the rest of
+                # the round (nor its heartbeat): an unverifiable tree is left
+                # alone and reported like a mismatched record.
+                logger.warning(
+                    "reconcile: cannot verify the teardown targets of %s; "
+                    "leaving it alone",
+                    sandbox_id,
+                    exc_info=True,
+                )
+                untrusted_records.append(sandbox_id)
+                continue
+            if plan is None:
+                # A record that does not describe the tree it was found in is
+                # not evidence of anything: leave the tree alone (it is this
+                # sandbox's own directory) and say so.
+                logger.warning(
+                    "reconcile: leaving %s on disk: %s",
+                    sandbox_id,
+                    reason,
+                )
+                untrusted_records.append(sandbox_id)
+                continue
+            projids = set(plan.expected_projids)
             logger.warning(
                 "reconcile: removing orphan runtime %s (not in control plane)",
                 sandbox_id,
