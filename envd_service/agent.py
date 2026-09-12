@@ -10,6 +10,7 @@ import secrets
 import shutil
 import tarfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
@@ -34,6 +35,7 @@ from envd_service.uid_pool import (
 )
 from envd_service.xfs_quota import (
     ProjectQuotaError,
+    directory_project_id,
     projids_in_record,
     provision_project,
     reconcile_orphan_projects,
@@ -53,6 +55,14 @@ router = APIRouter()
 #: a bounded number of times instead of leaving the entry to manual review.
 _QUOTA_RECLAIM_ATTEMPTS = 3
 _QUOTA_RECLAIM_DELAY_S = 0.5
+
+#: A disk sweep that had to be deferred because the fleet's records could not
+#: all be enumerated is retried on later heartbeats: doubling, capped, so a
+#: persistent shortfall (a record whose node never comes back) cannot hide the
+#: sweep forever -- review round 1, M1. The unit is the agent's 5s heartbeat
+#: interval, so the first retry lands on the next heartbeat and the cap is
+#: reached at 60s.
+_RECONCILE_RETRY_MAX_INTERVALS = 12
 
 
 def _extract_sandbox_archive(archive_path: Path, dest: Path) -> None:
@@ -176,6 +186,159 @@ def _heartbeat_usage_payload(
     return payload
 
 
+@dataclass(frozen=True)
+class _TeardownPlan:
+    """Verified teardown targets for one orphan tree (review round 1, M4).
+
+    ``sandbox.json`` is written at the root of the tree the sandbox itself
+    owns (``0770``, owner = the sandbox's host uid), so the sandbox can
+    replace it with a record that points anywhere. Everything destructive is
+    therefore taken from the *disk* — the directory the scan found and the
+    project id the filesystem reports — never from the record's own fields.
+    """
+
+    workspace_dir: Path
+    #: Project state to release; ``None`` means "nothing to release" (the
+    #: disk reports no project id, or the disk cannot be asked at all).
+    project_id: int | None
+    volume_projects: tuple[dict[str, Any], ...]
+    #: The project ids this teardown is expected to make reclaimable, for the
+    #: bounded quota reclaim retry. Unverified entries contribute the record's
+    #: claim so a row that never settles is still reported instead of silent.
+    expected_projids: frozenset[int]
+
+
+def _verified_project_id(
+    path: Path, claimed: Any, expected: set[int]
+) -> tuple[int | None, str | None]:
+    """Project id to release for ``path``, read from the disk (M4).
+
+    Returns ``(project_id, reason)``: ``reason`` is set when the record's
+    claim contradicts the disk, in which case the caller must refuse the tree
+    (a mismatched claim is exactly what a rewritten ``sandbox.json`` looks
+    like). A disk that cannot be asked yields ``(None, None)``: the tree is
+    still reclaimed, but its project state is left alone and the fail-safe
+    quota reconcile drops the row once the tree is gone.
+    """
+    try:
+        disk_projid = directory_project_id(path)
+    except ProjectQuotaError as exc:
+        logger.warning(
+            "reconcile: cannot read the project id of %s from the disk (%s); "
+            "reclaiming it without releasing its quota row",
+            path,
+            exc,
+        )
+        if isinstance(claimed, int) and claimed > 0:
+            expected.add(claimed)
+        return None, None
+    if disk_projid is None:
+        # The directory carries no project id: there is no row to release, so
+        # whatever the record claims cannot be acted on (a release needs a
+        # matching (directory, projid) pair). This is also the shape a
+        # half-finished earlier teardown leaves behind.
+        return None, None
+    if isinstance(claimed, int) and claimed > 0 and claimed != disk_projid:
+        return None, (
+            f"its sandbox.json claims project id {claimed} but the disk "
+            f"says {disk_projid}"
+        )
+    expected.add(disk_projid)
+    return disk_projid, None
+
+
+def _gc_teardown_plan(
+    settings: Settings, sandbox_id: str, record
+) -> tuple[_TeardownPlan | None, str | None]:
+    """Verified teardown targets for a tree found on disk (M4).
+
+    The orphan-tree GC acts on trees whose record only ever existed inside
+    the tree, i.e. on input the sandbox could rewrite. Three rules keep a
+    rewritten record from aiming the sweep at another tenant's data:
+
+    * the tree is always ``<workspace_base>/<sandbox_id>``, never the
+      ``workspace_dir`` the record claims (``sandbox_id`` is the directory
+      name the scan read off the filesystem);
+    * a record whose ``sandbox_id``/``workspace_dir`` disagree with the
+      directory it was found in is refused outright;
+    * a volume slice is only honoured when it is named after this sandbox and
+      lives under the worker's configured ``shared_volume_root``.
+
+    The project ids come from the disk, not from the record: a
+    contradiction refuses the tree, a silent disk drops the release and
+    leaves the row to the fail-safe quota reconcile.
+    """
+    workspace_dir = Path(settings.workspace_base) / sandbox_id
+    if record is not None:
+        recorded_id = getattr(record, "sandbox_id", None)
+        if recorded_id != sandbox_id:
+            return None, f"its sandbox.json names sandbox {recorded_id!r}"
+        recorded_dir = getattr(record, "workspace_dir", None)
+        if recorded_dir is not None and Path(recorded_dir) != workspace_dir:
+            return None, f"its sandbox.json points at {recorded_dir}"
+    expected: set[int] = set()
+    project_id, reason = _verified_project_id(
+        workspace_dir, getattr(record, "project_id", None), expected
+    )
+    if reason is not None:
+        return None, reason
+    shared_root = (
+        Path(settings.shared_volume_root).resolve()
+        if settings.shared_volume_root
+        else None
+    )
+    volume_entries: list[dict[str, Any]] = []
+    for entry in getattr(record, "volume_projects", None) or []:
+        if not isinstance(entry, dict):
+            continue
+        sandbox_dir = entry.get("sandbox_dir")
+        slice_dir = Path(sandbox_dir) if isinstance(sandbox_dir, (str, Path)) else None
+        if (
+            slice_dir is None
+            or entry.get("sandbox_id") != sandbox_id
+            or slice_dir.name != sandbox_id
+        ):
+            logger.warning(
+                "reconcile: refusing a volume entry of %s: %s is not a slice "
+                "of this sandbox",
+                sandbox_id,
+                sandbox_dir,
+            )
+            continue
+        if shared_root is not None and not slice_dir.resolve().is_relative_to(
+            shared_root
+        ):
+            logger.warning(
+                "reconcile: refusing the volume slice %s of %s: it is outside "
+                "the shared volume root %s",
+                slice_dir,
+                sandbox_id,
+                shared_root,
+            )
+            continue
+        slice_projid, slice_reason = _verified_project_id(
+            slice_dir, entry.get("projid"), expected
+        )
+        if slice_reason is not None:
+            logger.warning(
+                "reconcile: refusing the volume slice %s of %s: %s",
+                slice_dir,
+                sandbox_id,
+                slice_reason,
+            )
+            continue
+        volume_entries.append({**entry, "projid": slice_projid})
+    return (
+        _TeardownPlan(
+            workspace_dir=workspace_dir,
+            project_id=project_id,
+            volume_projects=tuple(volume_entries),
+            expected_projids=frozenset(expected),
+        ),
+        None,
+    )
+
+
 def _delete_sandbox_runtime(
     settings: Settings,
     runtime_registry,
@@ -183,20 +346,32 @@ def _delete_sandbox_runtime(
     *,
     keep_files: bool = False,
     keep_volume_slices: bool = False,
+    plan: _TeardownPlan | None = None,
 ) -> None:
     """Full local teardown for one sandbox runtime (shared by the delete
-    endpoint and E6.1 orphan reconciliation)."""
-    record = runtime_registry.get(sandbox_id)
-    project_id = record.project_id if record is not None else None
-    volume_projects = record.volume_projects if record is not None else []
-    # Derive the project dir from the record so release and rmtree always
-    # target the directory the sandbox was registered with; fall back to
-    # the workspace_base/id convention for unregistered sandboxes.
-    workspace_dir = (
-        Path(record.workspace_dir)
-        if record is not None
-        else settings.workspace_base / sandbox_id
-    )
+    endpoint and E6.1 orphan reconciliation).
+
+    ``plan`` is the orphan-tree GC's verified target set (review round 1,
+    M4): the GC scans records that live inside sandbox-owned trees, so it
+    passes targets read from the disk instead of the record. The explicit
+    delete path passes nothing and keeps resolving them from the record.
+    """
+    if plan is not None:
+        workspace_dir = plan.workspace_dir
+        project_id = plan.project_id
+        volume_projects = list(plan.volume_projects)
+    else:
+        record = runtime_registry.get(sandbox_id)
+        project_id = record.project_id if record is not None else None
+        volume_projects = list(record.volume_projects) if record is not None else []
+        # Derive the project dir from the record so release and rmtree always
+        # target the directory the sandbox was registered with; fall back to
+        # the workspace_base/id convention for unregistered sandboxes.
+        workspace_dir = (
+            Path(record.workspace_dir)
+            if record is not None
+            else settings.workspace_base / sandbox_id
+        )
     runtime_registry.unregister(sandbox_id)
     # Shared-workspace deployments keep the directory (keep_files=true): the
     # same storage hosts the sandbox on every node, so removing it would
@@ -323,6 +498,12 @@ class NodeAgent:
         # start, heartbeat failures). The next successful heartbeat after a
         # registration runs a local-runtime reconciliation.
         self._reconcile_pending = True
+        #: M1: heartbeat intervals still to wait before retrying a disk sweep
+        #: that had to be deferred because the fleet's records could not all
+        #: be enumerated (``None`` = no retry scheduled). ``_reconcile_retry_attempts``
+        #: drives the capped doubling and is reported in the WARNING.
+        self._reconcile_retry_in: int | None = None
+        self._reconcile_retry_attempts = 0
 
     def start(self) -> None:
         if not self._control_url or not self._node_address:
@@ -362,12 +543,13 @@ class NodeAgent:
                             # The control plane lost us (e.g. it restarted);
                             # re-register on the next cycle.
                             self._node_id = None
-                        elif self._reconcile_pending:
-                            # A previous heartbeat/registration failed (e.g.
-                            # a network partition): the control plane may
-                            # have orphaned our sandboxes, so reconcile now
-                            # that we can reach it again.
-                            self._reconcile_pending = False
+                        elif self._reconcile_due():
+                            # Either a previous heartbeat/registration failed
+                            # (e.g. a network partition: the control plane may
+                            # have orphaned our sandboxes) or a disk sweep had
+                            # to be deferred because the fleet's records could
+                            # not all be enumerated (M1). Reconcile now that we
+                            # can reach the control plane again.
                             await self._reconcile_with_control_plane(client, headers)
             except asyncio.CancelledError:
                 raise
@@ -375,6 +557,53 @@ class NodeAgent:
                 self._reconcile_pending = True
                 logger.warning("node agent heartbeat failed", exc_info=True)
             await asyncio.sleep(5)
+
+    def _reconcile_due(self) -> bool:
+        """Whether this heartbeat should run the reconcile round.
+
+        Two independent triggers: the pending flag (first start, or a failed
+        heartbeat — the control plane may have orphaned our sandboxes), and
+        the backoff scheduled by a round whose disk sweep the fleet
+        enumeration blocked (M1: without it one non-enumerable record would
+        silence the sweep until the process restarted).
+        """
+        if self._reconcile_pending:
+            self._reconcile_pending = False
+            return True
+        if self._reconcile_retry_in is None:
+            return False
+        self._reconcile_retry_in -= 1
+        if self._reconcile_retry_in > 0:
+            return False
+        self._reconcile_retry_in = None
+        return True
+
+    def _defer_sweep(self) -> None:
+        """Schedule a retry for a disk sweep the enumeration blocked (M1).
+
+        The retry backs off (doubling, capped at
+        ``_RECONCILE_RETRY_MAX_INTERVALS`` heartbeats) so a persistent
+        shortfall -- a record whose node never re-registers -- keeps being
+        retried at a decaying rate instead of polling the whole fleet every
+        heartbeat, and never goes silent.
+        """
+        self._reconcile_retry_attempts += 1
+        delay = min(
+            2 ** (self._reconcile_retry_attempts - 1),
+            _RECONCILE_RETRY_MAX_INTERVALS,
+        )
+        self._reconcile_retry_in = delay
+        logger.warning(
+            "reconcile: disk sweep deferred by an incomplete fleet "
+            "enumeration; retrying in %d heartbeat interval(s) (attempt %d)",
+            delay,
+            self._reconcile_retry_attempts,
+        )
+
+    def _sweep_completed(self) -> None:
+        """Clear the deferred-sweep backoff after a round that did not skip."""
+        self._reconcile_retry_in = None
+        self._reconcile_retry_attempts = 0
 
     async def _reconcile_with_control_plane(self, client, headers) -> dict[str, Any]:
         """Reconcile this worker's local runtimes against the control plane
@@ -402,6 +631,23 @@ class NodeAgent:
           still has, removes records for sandboxes we no longer run (only
           ones that were in the snapshot), and leaves records created after
           the snapshot untouched.
+
+        Three properties the round has to keep (review round 1):
+
+        * a record without ``created_at`` -- the shape written before
+          2026-09-02 -- takes its timestamp from the ``sandbox.json`` mtime
+          instead of the moment it is read, otherwise every legacy tree looks
+          like a create racing this round and is pinned forever (M2);
+        * a disk sweep that cannot be fenced by a complete fleet enumeration
+          is skipped, reported (``disk_sweep_skipped`` plus a WARNING) *and*
+          retried on a backing-off schedule, so one non-enumerable record can
+          neither hide the sweep forever nor turn it into a per-heartbeat
+          poll (M1);
+        * the sweep only tears down trees whose targets are read back from
+          the disk, because ``sandbox.json`` is sandbox-writable input
+          (M4): the directory is ``<workspace_base>/<id>``, the project id
+          is the one the filesystem reports, and a record that disagrees with
+          either is refused and reported (``untrusted_records``).
 
         Returns a summary of what the round did (see the ``summary`` dict at
         the end); callers may ignore it, tests and operators use it to tell a
@@ -450,41 +696,93 @@ class NodeAgent:
             sandbox_id for sandbox_id in in_memory if sandbox_id not in known
         } - concurrent_creates
         disk_candidates = set(scanned) - known - concurrent_creates
+        #: Trees the scan found on disk and this process never registered:
+        #: their only record lives inside the tree itself, i.e. it is
+        #: sandbox-writable input (M4), so they are torn down from verified
+        #: disk targets rather than from the record.
+        disk_only = set(scanned) - set(in_memory)
         candidates = orphaned | disk_candidates
         deletable = orphaned
         protected_elsewhere: list[str] = []
+        disk_sweep_skipped: list[str] = []
         if candidates:
             fleet_owned = await self._fleet_sandbox_ids(client, headers)
             if fleet_owned is None:
                 # Fleet-wide ownership cannot be established: fall back to
                 # the node-local semantics for runtimes this process owns and
-                # leave the disk-only trees for the next round.
+                # leave the disk-only trees for a later round. The skip is
+                # reported in the summary and the retry is scheduled with a
+                # capped backoff (M1) so this state can never be permanent
+                # and silent.
+                disk_sweep_skipped = sorted(disk_candidates)
                 logger.warning(
                     "reconcile: leaving %d orphan tree(s) on disk alone this "
                     "round (fleet record enumeration unavailable): %s",
                     len(disk_candidates),
                     ",".join(sorted(disk_candidates)),
                 )
+                self._defer_sweep()
             else:
                 deletable = candidates - fleet_owned
                 protected_elsewhere = sorted(candidates & fleet_owned)
         deleted: list[str] = []
         delete_failures: list[str] = []
-        released_projids: set[int] = set()
+        untrusted_records: list[str] = []
+        reclaimable_projids: set[int] = set()
         for sandbox_id in sorted(deletable):
+            plan: _TeardownPlan | None = None
+            if sandbox_id in disk_only:
+                try:
+                    plan, reason = _gc_teardown_plan(
+                        self._settings, sandbox_id, local.get(sandbox_id)
+                    )
+                except Exception:
+                    # Verifying the targets must not cost the worker the rest
+                    # of the round (nor its heartbeat): an unverifiable tree
+                    # is left alone and reported like a mismatched record.
+                    logger.warning(
+                        "reconcile: cannot verify the teardown targets of %s; "
+                        "leaving it on disk",
+                        sandbox_id,
+                        exc_info=True,
+                    )
+                    untrusted_records.append(sandbox_id)
+                    continue
+                if plan is None:
+                    # A record that does not describe the tree it was found
+                    # in is not evidence of anything: leave the tree alone
+                    # (it is this sandbox's own directory) and say so.
+                    logger.warning(
+                        "reconcile: leaving %s on disk: %s",
+                        sandbox_id,
+                        reason,
+                    )
+                    untrusted_records.append(sandbox_id)
+                    continue
+                projids = set(plan.expected_projids)
+            else:
+                record = local.get(sandbox_id)
+                projids = (
+                    projids_in_record(record.to_dict())
+                    if record is not None
+                    else set()
+                )
             logger.warning(
                 "reconcile: removing orphan runtime %s (not in control plane)",
                 sandbox_id,
             )
-            record = local.get(sandbox_id)
-            projids = (
-                projids_in_record(record.to_dict())
-                if record is not None
-                else set()
-            )
             try:
-                _delete_sandbox_runtime(
-                    self._settings, self._runtime_registry, sandbox_id
+                # Per-tree teardown is a synchronous heavy step (an XFS
+                # release over the quota agent, an rmtree of a whole
+                # workspace), and a shared workspace can hold dozens of
+                # trees: run it off the event loop so the heartbeat and the
+                # worker's own API never stall behind the sweep (M3).
+                await asyncio.to_thread(
+                    _delete_sandbox_runtime,
+                    self._settings,
+                    self._runtime_registry,
+                    sandbox_id,
+                    plan=plan,
                 )
             except Exception:
                 # One unrecoverable tree (a permission wall, a broken mount)
@@ -499,7 +797,7 @@ class NodeAgent:
                 delete_failures.append(sandbox_id)
                 continue
             deleted.append(sandbox_id)
-            released_projids |= projids
+            reclaimable_projids |= projids
         if unmaterialised:
             logger.warning(
                 "reconcile: %d sandbox tree(s) on disk have no readable "
@@ -550,20 +848,30 @@ class NodeAgent:
                 "reconcile: control-plane record update failed",
                 exc_info=True,
             )
-        if released_projids:
+        if reclaimable_projids or deleted:
             # The startup quota reconcile is scheduled before this worker has
             # even registered, so it usually ran while these trees were still
             # present (their sandbox.json kept the rows "recorded") and XFS
             # may not have dropped the released accounting yet. Reclaim the
             # rows of the trees this round removed, with a bounded retry.
+            # ``reclaimable_projids`` can be empty (a tree with no project id
+            # the worker can read back, or none at all): the pass still runs
+            # once so those rows are reclaimed by the fail-safe reconcile as
+            # soon as their tree is gone.
             quota_cleaned, quota_unreclaimed = await self._reclaim_quota_rows(
-                released_projids
+                reclaimable_projids
             )
+        if not disk_sweep_skipped:
+            # A round that reached the fleet's full record set clears the
+            # deferred-sweep backoff; a deferred one keeps its schedule.
+            self._sweep_completed()
         summary = {
             "deleted": sorted(deleted),
             "delete_failures": sorted(delete_failures),
             "unmaterialised": sorted(unmaterialised),
             "protected_elsewhere": protected_elsewhere,
+            "disk_sweep_skipped": disk_sweep_skipped,
+            "untrusted_records": sorted(untrusted_records),
             "concurrent_creates": sorted(concurrent_creates),
             "quota_cleaned": quota_cleaned,
             "quota_unreclaimed": quota_unreclaimed,

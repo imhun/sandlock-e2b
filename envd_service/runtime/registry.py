@@ -236,14 +236,27 @@ class RuntimeRegistry:
 
     def _load_from_disk(self, sandbox_id: str) -> RuntimeSandbox | None:
         """Parse ``<base>/<id>/sandbox.json``; ``None`` when unusable."""
+        path = self._record_path(sandbox_id)
         try:
-            path = self._record_path(sandbox_id)
             if not path.is_file():
                 return None
             payload = json.loads(path.read_text(encoding="utf-8"))
-            return RuntimeSandbox.from_dict(payload)
+            record = RuntimeSandbox.from_dict(payload)
         except (OSError, ValueError, json.JSONDecodeError):
             return None
+        if isinstance(payload, dict) and "created_at" not in payload:
+            # Records written before the field existed (2026-09-02) would
+            # otherwise parse with the dataclass default, i.e. the time we
+            # happened to read them -- every one of them looks like a create
+            # that raced the reconcile window and is pinned forever (review
+            # round 1, M2). The file's mtime is the creation time the disk
+            # actually has; a genuine concurrent create always carries the
+            # key, because ``register()`` writes ``asdict()``.
+            try:
+                record.created_at = path.stat().st_mtime
+            except OSError:  # pragma: no cover - defensive
+                pass
+        return record
 
     def unregister(self, sandbox_id: str) -> None:
         if not validate_sandbox_id(sandbox_id):

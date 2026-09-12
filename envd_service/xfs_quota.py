@@ -553,6 +553,60 @@ def _scan_project_dirs(workspace_base: str | Path) -> dict[int, Path]:
     return mapping
 
 
+def directory_project_id(project_dir: str | Path) -> int | None:
+    """The project id the *disk* reports for one directory (``None`` = none).
+
+    The worker's own view of its project ids lives in ``sandbox.json``, which
+    sits inside the sandbox-owned tree and can be replaced by the sandbox, so
+    the destructive paths must read the truth from the filesystem instead:
+    the same ``lsattr -p -d`` / fd-backend read :func:`_scan_project_dirs`
+    uses for the orphan quota scan.
+
+    Raises :class:`ProjectQuotaError` when the disk cannot be asked at all
+    (no ``lsattr``, no fd backend -- e.g. an NFS-mounted workspace whose
+    quota lives on the storage server): the caller must then leave the
+    project state alone rather than trust the record's claim.
+    """
+    directory = Path(project_dir)
+    try:
+        # The backend probe itself must never take the caller down: on hosts
+        # where the fd backend cannot even be loaded (no libc.so.6) the read
+        # below degrades to ``lsattr``, and a failure there is reported as a
+        # ProjectQuotaError like any other "cannot ask the disk".
+        use_quotactl = _use_quotactl(directory)
+    except Exception:  # pragma: no cover - defensive
+        use_quotactl = False
+    if use_quotactl:
+        try:
+            return xfs_quotactl.projid_of(directory) or None
+        except xfs_quotactl.QuotactlError as exc:
+            raise ProjectQuotaError(
+                f"cannot read the project id of {directory}: {exc}"
+            ) from exc
+    argv = ["lsattr", "-p", "-d", str(directory)]
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_XFS_QUOTA_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ProjectQuotaError(
+            f"cannot read the project id of {directory} with lsattr: {exc}"
+        ) from exc
+    if proc.returncode != 0:
+        raise ProjectQuotaError(
+            f"lsattr failed for {directory}: {proc.stderr.strip()}"
+        )
+    for line in proc.stdout.splitlines():
+        match = _LSATTR_PROJID_LINE.match(line)
+        if match is None:
+            continue
+        return int(match.group(1)) or None
+    return None
+
+
 def cleanup_orphan_project(
     *,
     projid: int,
