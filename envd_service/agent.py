@@ -527,7 +527,11 @@ class NodeAgent:
                             logger.info(
                                 "registered node %s at %s", self._node_id, self._node_address
                             )
-                            await self._reconcile_with_control_plane(client, headers)
+                            self._report_reconcile_summary(
+                                await self._reconcile_with_control_plane(
+                                    client, headers
+                                )
+                            )
                     else:
                         resp = await client.post(
                             f"{self._control_url}/internal/nodes/{self._node_id}/heartbeat",
@@ -549,13 +553,41 @@ class NodeAgent:
                             # to be deferred because the fleet's records could
                             # not all be enumerated (M1). Reconcile now that we
                             # can reach the control plane again.
-                            await self._reconcile_with_control_plane(client, headers)
+                            self._report_reconcile_summary(
+                                await self._reconcile_with_control_plane(
+                                    client, headers
+                                )
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self._reconcile_pending = True
                 logger.warning("node agent heartbeat failed", exc_info=True)
             await asyncio.sleep(5)
+
+    def _report_reconcile_summary(self, summary: dict[str, Any]) -> None:
+        """Make the reconcile summary visible to operators (L1).
+
+        ``_loop`` used to drop the return value, so the fields that exist only
+        in the summary -- ``disk_sweep_skipped`` and ``untrusted_records`` in
+        particular -- were observable as WARNING text alone. Per-tree detail
+        stays at WARNING; this is the positive, greppable record of a round
+        that ran and what it decided.
+        """
+        logger.info(
+            "reconcile summary: deleted=%d delete_failures=%d unmaterialised=%d "
+            "protected_elsewhere=%d concurrent_creates=%d quota_cleaned=%d "
+            "quota_unreclaimed=%d disk_sweep_skipped=[%s] untrusted_records=[%s]",
+            len(summary["deleted"]),
+            len(summary["delete_failures"]),
+            len(summary["unmaterialised"]),
+            len(summary["protected_elsewhere"]),
+            len(summary["concurrent_creates"]),
+            len(summary["quota_cleaned"]),
+            len(summary["quota_unreclaimed"]),
+            ",".join(summary["disk_sweep_skipped"]),
+            ",".join(summary["untrusted_records"]),
+        )
 
     def _reconcile_due(self) -> bool:
         """Whether this heartbeat should run the reconcile round.

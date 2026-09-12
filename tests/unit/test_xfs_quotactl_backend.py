@@ -31,6 +31,25 @@ def _fill_disk_quota(buf, projid: int, hard: int, soft: int, used: int) -> None:
     struct.pack_into("<Q", buf, 40, used)
 
 
+#: How many bytes this kernel copies for each command -- the whole structure,
+#: not the prefix the caller happens to allocate. Measured on Linux 7.0.x
+#: twice, independently: a guard page right behind the buffer (the smallest
+#: allocation the syscall completes with) and a 0xAA-prefilled buffer (the
+#: last byte the kernel touches). Logs: tmp/quotaleakA-fix2-01-buffer-sizes-
+#: redtree.log (unfixed tree) and tmp/quotaleakA-fix2-05-buffer-sizes-green.log.
+#:
+#: A caller buffer smaller than this is an out-of-bounds access: on the heap it
+#: silently corrupts whatever follows, behind a guard page it fails EFAULT.
+KERNEL_COPY_BYTES = {
+    q._Q_XGETQSTATV: 160,     # fs_quota_statv
+    q._Q_XGETQUOTA: 112,      # fs_disk_quota
+    q._Q_XGETNEXTQUOTA: 112,  # fs_disk_quota
+    q._Q_XSETQLIM: 112,       # fs_disk_quota (copied *in*)
+}
+#: ``FS_IOC_FSGETXATTR`` copies ``struct fsxattr`` out (same measurement).
+KERNEL_COPY_BYTES_IOCTL = 28
+
+
 class FakeKernel:
     """Scripted stand-in for ``quotactl_fd`` (the only kernel seam)."""
 
@@ -40,9 +59,17 @@ class FakeKernel:
         self.flags = flags
         self.setqlim: list[tuple[int, int, int]] = []
         self.calls: list[int] = []
+        self.buffer_bytes: dict[int, int] = {}
 
     def __call__(self, fd, cmd, qid, buf):
         self.calls.append(cmd)
+        self.buffer_bytes[cmd] = len(buf)
+        # The kernel copies the whole struct in/out with copy_from_user/
+        # copy_to_user. Emulate that, and the guard page's verdict on a buffer
+        # too small for it, so a stale caller-side constant cannot hide behind
+        # a roomy heap (C1: 104 bytes handed to a kernel that copies 160).
+        if len(buf) < KERNEL_COPY_BYTES[cmd]:
+            return -1, errno.EFAULT
         if cmd == q._Q_XGETQSTATV:
             struct.pack_into("<b", buf, 0, q._FS_QSTATV_VERSION1)
             struct.pack_into("<H", buf, 2, self.flags)
@@ -127,6 +154,89 @@ def test_project_table_filters_ghost_dquots(fake):
 
 def test_usage_reports_none_for_an_unknown_project(fake):
     assert q.usage("/mnt/vol", 99999) is None
+
+
+# --- 2b. the kernel's structures fit the caller's buffers (C1) ---------------
+
+
+def test_statv_state_gives_the_kernel_the_whole_struct(fake):
+    """``Q_XGETQSTATV`` copies 160 bytes; the buffer must cover all of them."""
+    assert q.state("/mnt/vol") == {"accounting": True, "enforcement": True}
+    assert fake.buffer_bytes[q._Q_XGETQSTATV] >= KERNEL_COPY_BYTES[q._Q_XGETQSTATV]
+
+
+def test_every_kernel_buffer_covers_the_struct_the_kernel_copies(fake):
+    fake.entries = [(10001, 8192, 8192, 4096)]
+    fake.quota[10001] = (8192, 8192, 4096)
+
+    q.state("/mnt/vol")
+    q.set_limit("/mnt/vol", 10001, 4)
+    q.usage("/mnt/vol", 10001)
+    q.project_table("/mnt/vol")
+
+    assert fake.buffer_bytes == {
+        q._Q_XGETQSTATV: q._STATV_BUFFER_BYTES,
+        q._Q_XSETQLIM: q._FS_DISK_QUOTA_SIZE,
+        q._Q_XGETQUOTA: q._FS_DISK_QUOTA_SIZE,
+        q._Q_XGETNEXTQUOTA: q._FS_DISK_QUOTA_SIZE,
+    }
+    assert {
+        cmd: size >= KERNEL_COPY_BYTES[cmd]
+        for cmd, size in fake.buffer_bytes.items()
+    } == {
+        q._Q_XGETQSTATV: True,
+        q._Q_XSETQLIM: True,
+        q._Q_XGETQUOTA: True,
+        q._Q_XGETNEXTQUOTA: True,
+    }
+
+
+def test_fsxattr_buffer_covers_the_struct_the_kernel_copies(monkeypatch, tmp_path):
+    seen: dict[str, int] = {}
+
+    class FakeLibc:
+        def ioctl(self, fd, request, buf):
+            seen["request"] = request.value
+            seen["size"] = len(buf)
+            if len(buf) < KERNEL_COPY_BYTES_IOCTL:
+                ctypes.set_errno(errno.EFAULT)
+                return -1
+            ctypes.memmove(buf, struct.pack("<7I", 0x80000000, 0, 0, 8301, 0, 0, 0), 28)
+            return 0
+
+    monkeypatch.setattr(q, "_libc", lambda: FakeLibc())
+
+    assert q.projid_of(tmp_path) == 8301
+    assert seen == {"request": q._FS_IOC_FSGETXATTR, "size": KERNEL_COPY_BYTES_IOCTL}
+
+
+def test_declared_layouts_match_the_kernel_structs_and_the_parsed_offsets():
+    """The layouts are the single source of the sizes and field offsets."""
+    assert q._FS_QUOTA_STATV_LAYOUT.size == KERNEL_COPY_BYTES[q._Q_XGETQSTATV] == 160
+    assert q._FS_QUOTA_STATV_KERNEL_BYTES == 160
+    assert q._FS_DISK_QUOTA_LAYOUT.size == KERNEL_COPY_BYTES[q._Q_XGETQUOTA] == 112
+    assert q._FSXATTR_LAYOUT.size == KERNEL_COPY_BYTES_IOCTL == 28
+
+    statv = q._FS_QUOTA_STATV_LAYOUT.pack(
+        q._FS_QSTATV_VERSION1, 0, 0x0030, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    )
+    assert struct.unpack_from("<b", statv, 0)[0] == q._FS_QSTATV_VERSION1
+    assert struct.unpack_from("<H", statv, 2)[0] == 0x0030
+
+    disk = q._FS_DISK_QUOTA_LAYOUT.pack(
+        q._FS_DQUOT_VERSION, 0, 0x0003, 8301,
+        8192, 8192, 0, 0, 4096, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, b"\x00" * 8,
+    )
+    assert struct.unpack_from("<b", disk, 0)[0] == q._FS_DQUOT_VERSION
+    assert struct.unpack_from("<h", disk, 2)[0] == 0x0003
+    assert struct.unpack_from("<I", disk, 4)[0] == 8301
+    assert struct.unpack_from("<Q", disk, 8)[0] == 8192
+    assert struct.unpack_from("<Q", disk, 16)[0] == 8192
+    assert struct.unpack_from("<Q", disk, 40)[0] == 4096
 
 
 # --- 3. errno classification --------------------------------------------------

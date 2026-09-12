@@ -23,6 +23,12 @@ Everything here is fail-closed: an unsupported kernel interface, a struct that
 does not read back, or an unexpected errno raises ``QuotactlError``/returns an
 explicit "unknown" -- callers degrade with a named warning instead of
 pretending quota works.
+
+Buffer sizes are the *kernel's* struct sizes, never a hand-copied constant:
+``Q_XGETQSTATV`` copies the whole ``struct fs_quota_statv`` in and back out
+(160 bytes on a current kernel), so it gets a page -- the 104-byte constant
+this module used to ship wrote 56 bytes past the buffer on every call (C1,
+measured 2026-09-12).
 """
 
 from __future__ import annotations
@@ -56,9 +62,42 @@ _FS_DQ_BHARD = 1 << 3
 _XFS_QUOTA_PDQ_ACCT = 0x0010
 _XFS_QUOTA_PDQ_ENFD = 0x0020
 
-_FSXATTR_SIZE = 28
-_FS_DISK_QUOTA_SIZE = 112
-_FS_QUOTA_STATV_SIZE = 104
+#: Kernel ABI layouts of the fixed-size structures handed to ``quotactl_fd``
+#: and ``FS_IOC_*``. The kernel copies the *whole* structure across the user
+#: boundary regardless of any version field, so the caller's buffer has to
+#: cover ``sizeof(struct ...)`` of the running kernel -- a caller-side constant
+#: is only ever a copy of that, and it drifts:
+#:
+#: * ``struct fs_quota_statv`` (include/uapi/linux/dqblk_xfs.h): 160 bytes.
+#:   This module used to allocate 104 (``_FS_QUOTA_STATV_SIZE``), so every
+#:   ``state()`` call wrote 56 bytes past its buffer on such a kernel (C1,
+#:   measured 2026-09-12);
+#: * ``struct fs_disk_quota`` (same header): 112 bytes;
+#: * ``struct fsxattr`` (include/uapi/linux/fs.h): 28 bytes.
+#:
+#: Declaring the layouts keeps the sizes *and* the parsed field offsets in one
+#: place, and both were measured against a running kernel (guard page: the
+#: smallest allocation the copy completes with; plus a 0xAA-prefilled buffer:
+#: the last byte the kernel touches) -- tmp/quotaleakA-fix2-01-buffer-sizes-
+#: redtree.log (unfixed) and tmp/quotaleakA-fix2-05-buffer-sizes-green.log.
+_FS_QUOTA_STATV_LAYOUT = struct.Struct(
+    "<" "bbHI" "QQII" "QQII" "QQII" "III" "HH" "8Q"
+)
+_FS_DISK_QUOTA_LAYOUT = struct.Struct(
+    "<" "bbHI" "QQQQQQ" "ii" "HH" "i" "QQQ" "iHh" "8s"
+)
+_FSXATTR_LAYOUT = struct.Struct("<" "IIIII" "8s")
+
+_FSXATTR_SIZE = _FSXATTR_LAYOUT.size                  # 28
+_FS_DISK_QUOTA_SIZE = _FS_DISK_QUOTA_LAYOUT.size      # 112
+_FS_QUOTA_STATV_KERNEL_BYTES = _FS_QUOTA_STATV_LAYOUT.size   # 160
+
+#: Buffer for ``Q_XGETQSTATV``: one page. The kernel copies its own
+#: ``struct fs_quota_statv``, which has reserved room (``qs_pad2[8]``) and has
+#: already grown once, so no fixed constant is a safe upper bound. The fields
+#: this module reads live in the stable prefix (``qs_version`` at 0,
+#: ``qs_flags`` at 2).
+_STATV_BUFFER_BYTES = 4096
 _FS_QSTATV_VERSION1 = 1
 _FS_DQUOT_VERSION = 1
 
@@ -154,7 +193,10 @@ def _errno_name(err: int) -> str:
 def state(mount_point: str | Path) -> dict[str, bool]:
     """Project-quota accounting/enforcement state for ``mount_point``."""
     fd = _MOUNT_FDS.get(mount_point)
-    buf = ctypes.create_string_buffer(_FS_QUOTA_STATV_SIZE)
+    # One page, not the caller-side struct size: the kernel copies its own
+    # ``fs_quota_statv`` (160 bytes on a current kernel) in and back out, and
+    # a short buffer corrupts the heap instead of failing (C1).
+    buf = ctypes.create_string_buffer(_STATV_BUFFER_BYTES)
     struct.pack_into("<b", buf, 0, _FS_QSTATV_VERSION1)
     rc, err = _quotactl_fd(fd, _Q_XGETQSTATV, 0, buf)
     if rc != 0:

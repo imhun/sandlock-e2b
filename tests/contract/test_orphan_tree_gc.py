@@ -974,7 +974,7 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
     orphan_dir = _tree(workspace, orphan_id, project_id=4101)
     quota = _QuotaFake({4101: 8})
     quota.install(monkeypatch)
-    caplog.set_level(logging.WARNING)
+    caplog.set_level(logging.INFO)
     caplog.clear()
 
     agent = _agent(workspace)
@@ -1027,6 +1027,25 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
         "retrying in 1 heartbeat interval(s) (attempt 1)",
         "reconcile: disk sweep deferred by an incomplete fleet enumeration; "
         "retrying in 2 heartbeat interval(s) (attempt 2)",
+    ]
+    # L1: every round publishes its summary at INFO, so the fields that only
+    # exist in the summary are a positive signal and not just WARNING text.
+    assert [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("reconcile summary")
+    ] == [
+        "reconcile summary: deleted=0 delete_failures=0 unmaterialised=0 "
+        "protected_elsewhere=0 concurrent_creates=0 quota_cleaned=0 "
+        "quota_unreclaimed=0 disk_sweep_skipped=[sbx_unowned_retry] "
+        "untrusted_records=[]",
+        "reconcile summary: deleted=0 delete_failures=0 unmaterialised=0 "
+        "protected_elsewhere=0 concurrent_creates=0 quota_cleaned=0 "
+        "quota_unreclaimed=0 disk_sweep_skipped=[sbx_unowned_retry] "
+        "untrusted_records=[]",
+        "reconcile summary: deleted=1 delete_failures=0 unmaterialised=0 "
+        "protected_elsewhere=0 concurrent_creates=0 quota_cleaned=1 "
+        "quota_unreclaimed=0 disk_sweep_skipped=[] untrusted_records=[]",
     ]
     # The round that finally swept cleared the backoff again.
     assert agent._reconcile_retry_in is None
