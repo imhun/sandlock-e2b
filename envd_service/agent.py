@@ -12,6 +12,7 @@ import tarfile
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Query, Request, Response
@@ -33,15 +34,25 @@ from envd_service.uid_pool import (
 )
 from envd_service.xfs_quota import (
     ProjectQuotaError,
+    projids_in_record,
     provision_project,
+    reconcile_orphan_projects,
     release_project,
     xfs_project_supported,
 )
 from envd_service.volumes import build_volume_mounts, cleanup_volume_projects
+from gateway_common.paths import is_sandbox_workspace_dir
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+#: XFS drops a released project's quota record only once its inode accounting
+#: settles, so the reconcile running right after an ``rmtree`` can legitimately
+#: skip the row ("used blocks but no project directory"). Retry the quota pass
+#: a bounded number of times instead of leaving the entry to manual review.
+_QUOTA_RECLAIM_ATTEMPTS = 3
+_QUOTA_RECLAIM_DELAY_S = 0.5
 
 
 def _extract_sandbox_archive(archive_path: Path, dest: Path) -> None:
@@ -227,6 +238,63 @@ def _delete_sandbox_runtime(
     priv_helpers.remove_tree(workspace_dir)
 
 
+def _scan_workspace_runtimes(
+    settings: Settings, runtime_registry
+) -> tuple[dict[str, Any], list[str]]:
+    """Materialise runtime records for the sandbox trees still on disk.
+
+    ``RuntimeRegistry`` starts empty in a fresh process (it does not scan the
+    workspace at startup), while the workspace keeps every tree the worker was
+    running — ``sandbox.json`` included. ``RuntimeRegistry`` already knows how
+    to read that file back (``peek``, the non-caching form used here so a
+    foreign node's record never enters this process), so the reconciler only
+    needs to know *which ids to ask about*: every top-level sandbox workspace
+    directory, filtered by the same predicate the quota orphan scan uses.
+
+    Returns ``(records, unmaterialised)``: the records read back successfully,
+    and the ids of sandbox-shaped trees whose record could not be read
+    (missing, corrupt, non-JSON or non-record ``sandbox.json``). The latter
+    are reported but never torn down from here: with no record there is no
+    project id to release, so deleting the tree would be all risk and no
+    reclaim.
+    """
+    records: dict[str, Any] = {}
+    unmaterialised: list[str] = []
+    base = settings.workspace_base
+    try:
+        entries = sorted(base.iterdir())
+    except FileNotFoundError:
+        return records, unmaterialised
+    except OSError as exc:
+        logger.warning(
+            "reconcile: cannot scan %s for sandbox trees: %s",
+            base,
+            exc,
+            exc_info=True,
+        )
+        return records, unmaterialised
+    for entry in entries:
+        if not is_sandbox_workspace_dir(entry):
+            continue
+        try:
+            record = runtime_registry.peek(entry.name)
+        except Exception:
+            # ``peek`` reads and parses the file: a tree whose sandbox.json is
+            # JSON but not a usable record (e.g. ``{}``) must degrade to
+            # "unreadable", never take the whole reconcile round down.
+            logger.warning(
+                "reconcile: cannot read the sandbox record of %s",
+                entry,
+                exc_info=True,
+            )
+            record = None
+        if record is None:
+            unmaterialised.append(entry.name)
+        else:
+            records[entry.name] = record
+    return records, unmaterialised
+
+
 class NodeAgent:
     """Periodically registers with the control plane and sends heartbeats."""
 
@@ -308,7 +376,7 @@ class NodeAgent:
                 logger.warning("node agent heartbeat failed", exc_info=True)
             await asyncio.sleep(5)
 
-    async def _reconcile_with_control_plane(self, client, headers) -> None:
+    async def _reconcile_with_control_plane(self, client, headers) -> dict[str, Any]:
         """Reconcile this worker's local runtimes against the control plane
         after (re)registration (E6.1 recovery path).
 
@@ -322,14 +390,25 @@ class NodeAgent:
           was requested. A runtime registered *during* the reconcile window
           is a concurrent create that raced the snapshot; it is kept and
           reported back so the control plane never deletes its record;
+        * "local runtimes" means the in-memory registry *plus* every
+          ``sbx_*`` tree still on disk, re-materialised from its
+          ``sandbox.json``. Without the disk side a worker restart made the
+          control plane delete live records (the worker reported nothing) and
+          left the trees, the ``sandbox.json`` files and their XFS quota rows
+          behind forever — the fail-safe quota reconcile only ever reclaims
+          rows whose tree is gone;
         * the remaining local ids are reported back together with the
           snapshot ids, so the control plane un-orphans the records it
           still has, removes records for sandboxes we no longer run (only
           ones that were in the snapshot), and leaves records created after
           the snapshot untouched.
+
+        Returns a summary of what the round did (see the ``summary`` dict at
+        the end); callers may ignore it, tests and operators use it to tell a
+        quiet round from a round that skipped work.
         """
         if not self._control_url or not self._node_id:
-            return
+            return {}
         # Wall-clock boundary captured *before* the snapshot request. Any
         # local runtime registered after this point cannot have been in the
         # control-plane snapshot, so it must be a concurrent create.
@@ -346,21 +425,98 @@ class NodeAgent:
                 "reconcile: cannot fetch control-plane sandbox list",
                 exc_info=True,
             )
-            return
-        local = {r.sandbox_id: r for r in self._runtime_registry.list()}
+            return {}
+        in_memory = {r.sandbox_id: r for r in self._runtime_registry.list()}
+        local = dict(in_memory)
+        scanned, unmaterialised = _scan_workspace_runtimes(
+            self._settings, self._runtime_registry
+        )
+        for sandbox_id, record in scanned.items():
+            local.setdefault(sandbox_id, record)
         concurrent_creates = {
             sandbox_id
             for sandbox_id, record in local.items()
             if record.created_at > reconcile_started_at
         }
-        orphaned = set(local) - known - concurrent_creates
-        for sandbox_id in sorted(orphaned):
+        # A runtime this process registered itself is this worker's own
+        # sandbox, so a node-local snapshot that no longer lists it means the
+        # record was deleted while we were unreachable (E6.1 semantics).
+        # Trees found only on disk are weaker evidence: every worker of the
+        # production stack mounts the same workspace volume
+        # (deploy/stack/docker-compose.prod.yml), so this worker sees the
+        # other nodes' live sandboxes too and the node-local snapshot cannot
+        # tell them apart from a true orphan.
+        orphaned = {
+            sandbox_id for sandbox_id in in_memory if sandbox_id not in known
+        } - concurrent_creates
+        disk_candidates = set(scanned) - known - concurrent_creates
+        candidates = orphaned | disk_candidates
+        deletable = orphaned
+        protected_elsewhere: list[str] = []
+        if candidates:
+            fleet_owned = await self._fleet_sandbox_ids(client, headers)
+            if fleet_owned is None:
+                # Fleet-wide ownership cannot be established: fall back to
+                # the node-local semantics for runtimes this process owns and
+                # leave the disk-only trees for the next round.
+                logger.warning(
+                    "reconcile: leaving %d orphan tree(s) on disk alone this "
+                    "round (fleet record enumeration unavailable): %s",
+                    len(disk_candidates),
+                    ",".join(sorted(disk_candidates)),
+                )
+            else:
+                deletable = candidates - fleet_owned
+                protected_elsewhere = sorted(candidates & fleet_owned)
+        deleted: list[str] = []
+        delete_failures: list[str] = []
+        released_projids: set[int] = set()
+        for sandbox_id in sorted(deletable):
             logger.warning(
                 "reconcile: removing orphan runtime %s (not in control plane)",
                 sandbox_id,
             )
-            _delete_sandbox_runtime(self._settings, self._runtime_registry, sandbox_id)
+            record = local.get(sandbox_id)
+            projids = (
+                projids_in_record(record.to_dict())
+                if record is not None
+                else set()
+            )
+            try:
+                _delete_sandbox_runtime(
+                    self._settings, self._runtime_registry, sandbox_id
+                )
+            except Exception:
+                # One unrecoverable tree (a permission wall, a broken mount)
+                # must not cost the worker the rest of the round: keep going
+                # and still report the surviving runtimes to the control
+                # plane below.
+                logger.warning(
+                    "reconcile: orphan runtime %s teardown failed; continuing",
+                    sandbox_id,
+                    exc_info=True,
+                )
+                delete_failures.append(sandbox_id)
+                continue
+            deleted.append(sandbox_id)
+            released_projids |= projids
+        if unmaterialised:
+            logger.warning(
+                "reconcile: %d sandbox tree(s) on disk have no readable "
+                "sandbox.json and were left alone: %s",
+                len(unmaterialised),
+                ",".join(sorted(unmaterialised)),
+            )
+        if protected_elsewhere:
+            logger.info(
+                "reconcile: %d tree(s) on disk belong to another control-plane "
+                "record; left alone: %s",
+                len(protected_elsewhere),
+                ",".join(protected_elsewhere),
+            )
         remaining = (set(local) & known) | concurrent_creates
+        quota_cleaned: list[int] = []
+        quota_unreclaimed: list[int] = []
         try:
             resp = await client.post(
                 f"{self._control_url}/internal/nodes/{self._node_id}/reconcile",
@@ -394,6 +550,128 @@ class NodeAgent:
                 "reconcile: control-plane record update failed",
                 exc_info=True,
             )
+        if released_projids:
+            # The startup quota reconcile is scheduled before this worker has
+            # even registered, so it usually ran while these trees were still
+            # present (their sandbox.json kept the rows "recorded") and XFS
+            # may not have dropped the released accounting yet. Reclaim the
+            # rows of the trees this round removed, with a bounded retry.
+            quota_cleaned, quota_unreclaimed = await self._reclaim_quota_rows(
+                released_projids
+            )
+        summary = {
+            "deleted": sorted(deleted),
+            "delete_failures": sorted(delete_failures),
+            "unmaterialised": sorted(unmaterialised),
+            "protected_elsewhere": protected_elsewhere,
+            "concurrent_creates": sorted(concurrent_creates),
+            "quota_cleaned": quota_cleaned,
+            "quota_unreclaimed": quota_unreclaimed,
+        }
+        return summary
+
+    async def _fleet_sandbox_ids(self, client, headers) -> set[str] | None:
+        """Every sandbox id the control plane records, or ``None`` when that
+        answer cannot be trusted.
+
+        Used to fence the disk-side sweep: a tree is only reclaimable when no
+        record anywhere in the fleet references it. The enumeration is only
+        trusted when it accounts for *every* record — ``/internal/fleet/metrics``
+        reports the fleet-wide record count, so a shortfall (a node missing
+        from the node registry, e.g. right after a control-plane restart while
+        the other workers have not re-registered yet) makes the caller skip
+        the sweep instead of deleting someone else's live tree.
+        """
+        try:
+            resp = await client.get(
+                f"{self._control_url}/internal/nodes", headers=headers
+            )
+            resp.raise_for_status()
+            node_list = resp.json()
+            if not isinstance(node_list, list):
+                raise ValueError("node list is not an array")
+            node_ids = [
+                str(node["nodeID"])
+                for node in node_list
+                if isinstance(node, dict) and node.get("nodeID")
+            ]
+            owned: set[str] = set()
+            for node_id in node_ids:
+                node_url = (
+                    f"{self._control_url}/internal/nodes/"
+                    f"{quote(node_id, safe='')}/sandboxes"
+                )
+                listed = await client.get(node_url, headers=headers)
+                listed.raise_for_status()
+                payload = listed.json()
+                if not isinstance(payload, dict):
+                    raise ValueError(
+                        f"sandbox list for {node_id} is not an object"
+                    )
+                owned.update(payload.get("sandboxIDs") or [])
+            metrics = await client.get(
+                f"{self._control_url}/internal/fleet/metrics", headers=headers
+            )
+            metrics.raise_for_status()
+            fleet_metrics = metrics.json()
+            if not isinstance(fleet_metrics, dict):
+                raise ValueError("fleet metrics is not an object")
+            fleet_count = int(fleet_metrics.get("activeSandboxes") or 0)
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
+            logger.warning(
+                "reconcile: cannot enumerate the fleet's sandbox records",
+                exc_info=True,
+            )
+            return None
+        if len(owned) != fleet_count:
+            logger.warning(
+                "reconcile: fleet sandbox enumeration is incomplete "
+                "(%d of %d records accounted for)",
+                len(owned),
+                fleet_count,
+            )
+            return None
+        return owned
+
+    async def _reclaim_quota_rows(
+        self, projids: set[int]
+    ) -> tuple[list[int], list[int]]:
+        """Reclaim the XFS quota rows of the trees this round removed.
+
+        Returns ``(cleaned, unreclaimed)``. The quota pass is best-effort: a
+        failure here is reported, never raised, because the caller is in the
+        middle of a recovery round that must still reach the control plane.
+        """
+        outstanding = set(projids)
+        cleaned: set[int] = set()
+        for attempt in range(1, _QUOTA_RECLAIM_ATTEMPTS + 1):
+            try:
+                result = await asyncio.to_thread(
+                    reconcile_orphan_projects,
+                    workspace_base=self._settings.workspace_base,
+                    mount_point=self._settings.workspace_base,
+                    via_agent=self._settings.quota_via_agent,
+                )
+            except Exception:
+                logger.warning(
+                    "reconcile: quota reconciliation failed",
+                    exc_info=True,
+                )
+                break
+            cleaned |= {int(projid) for projid in result.get("cleaned") or []}
+            outstanding -= cleaned
+            if not outstanding:
+                break
+            if attempt < _QUOTA_RECLAIM_ATTEMPTS:
+                await asyncio.sleep(_QUOTA_RECLAIM_DELAY_S)
+        if outstanding:
+            logger.warning(
+                "reconcile: %d quota row(s) not reclaimed after %d attempt(s): %s",
+                len(outstanding),
+                _QUOTA_RECLAIM_ATTEMPTS,
+                sorted(outstanding),
+            )
+        return sorted(cleaned), sorted(outstanding)
 
     async def stop(self) -> None:
         if self._task is not None:

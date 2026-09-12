@@ -210,15 +210,38 @@ class RuntimeRegistry:
             if record is not None:
                 return record
         # Filesystem-backed lookup (separate-process deployment).
+        record = self._load_from_disk(sandbox_id)
+        if record is None:
+            return None
+        with self._lock:
+            self._records[sandbox_id] = record
+        return record
+
+    def peek(self, sandbox_id: str) -> RuntimeSandbox | None:
+        """Read a record without caching it in this process.
+
+        The orphan-tree scan uses this instead of :meth:`get`: in a
+        shared-workspace deployment the scan sees every node's trees, and a
+        foreign record must not enter this process's registry (every
+        in-memory record is treated as one this worker owns and may tear
+        down).
+        """
+        if not validate_sandbox_id(sandbox_id):
+            return None
+        with self._lock:
+            record = self._records.get(sandbox_id)
+        if record is not None:
+            return record
+        return self._load_from_disk(sandbox_id)
+
+    def _load_from_disk(self, sandbox_id: str) -> RuntimeSandbox | None:
+        """Parse ``<base>/<id>/sandbox.json``; ``None`` when unusable."""
         try:
             path = self._record_path(sandbox_id)
             if not path.is_file():
                 return None
             payload = json.loads(path.read_text(encoding="utf-8"))
-            record = RuntimeSandbox.from_dict(payload)
-            with self._lock:
-                self._records[sandbox_id] = record
-            return record
+            return RuntimeSandbox.from_dict(payload)
         except (OSError, ValueError, json.JSONDecodeError):
             return None
 

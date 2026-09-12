@@ -67,7 +67,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from envd_service import xfs_quotactl
-from gateway_common.paths import validate_sandbox_id
+from gateway_common.paths import is_sandbox_workspace_dir
 
 logger = logging.getLogger(__name__)
 
@@ -466,35 +466,47 @@ def _recorded_projids(workspace_base: str | Path) -> set[int]:
             continue
         if not isinstance(payload, dict):
             continue
-        projid = payload.get("project_id")
-        if isinstance(projid, int) and projid > 0:
-            recorded.add(projid)
-        for item in payload.get("volume_projects", []):
+        recorded |= projids_in_record(payload)
+    return recorded
+
+
+def projids_in_record(payload: dict[str, Any]) -> set[int]:
+    """Project ids one persisted sandbox record references.
+
+    The workspace project (``project_id``) plus every per-sandbox volume
+    project (``volume_projects[].projid``, E2.5). One rule, shared by the
+    quota-side scan over ``sandbox.json`` and the worker-side teardown that
+    has to know which rows its orphan-tree GC makes reclaimable.
+    """
+    projids: set[int] = set()
+    projid = payload.get("project_id")
+    if isinstance(projid, int) and projid > 0:
+        projids.add(projid)
+    volume_projects = payload.get("volume_projects")
+    if isinstance(volume_projects, list):
+        for item in volume_projects:
             if not isinstance(item, dict):
                 continue
             projid = item.get("projid")
             if isinstance(projid, int) and projid > 0:
-                recorded.add(projid)
-    return recorded
+                projids.add(projid)
+    return projids
 
 
 def _scan_project_dirs(workspace_base: str | Path) -> dict[int, Path]:
     """Map projid -> sandbox directory via ``lsattr -p -d``.
 
-    Only top-level directories with a valid sandbox id are considered, so
-    ``_snapshots`` / ``_migrate`` / ``_cow`` and foreign trees are never
-    touched. Returns {} on any failure; callers skip rather than risk
-    mis-identifying a directory.
+    Only top-level sandbox workspace directories are considered (the shared
+    :func:`gateway_common.paths.is_sandbox_workspace_dir` predicate), so
+    ``_snapshots`` / ``_migrate`` / ``_cow`` / ``_volumes`` / ``_templates``
+    and foreign trees are never touched. Returns {} on any failure; callers
+    skip rather than risk mis-identifying a directory.
     """
     base = Path(workspace_base)
     mapping: dict[int, Path] = {}
     try:
         candidates = [
-            entry
-            for entry in base.iterdir()
-            if entry.is_dir()
-            and not entry.is_symlink()
-            and validate_sandbox_id(entry.name)
+            entry for entry in base.iterdir() if is_sandbox_workspace_dir(entry)
         ]
     except OSError:
         return mapping

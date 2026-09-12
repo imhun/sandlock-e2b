@@ -182,6 +182,29 @@ def test_reconcile_cleans_zero_usage_orphan_and_keeps_recorded(tmp_path, monkeyp
     ]
 
 
+def test_scan_project_dirs_keeps_sandbox_trees_only(tmp_path, monkeypatch):
+    """The shared workspace filter: reserved roots, symlinks and plain files
+    are never candidates of the quota orphan scan.
+
+    ``_`` is a legal sandbox-id character, so ``validate_sandbox_id`` alone
+    would hand the snapshot / migration / volume / template / secrets stores
+    to the scan. The backend selector is pinned to the subprocess form so the
+    assertion is the same on every host (the fd backend probe is Linux-only).
+    """
+    keep = tmp_path / "sbx_keep"
+    keep.mkdir()
+    for name in ("_snapshots", "_migrate", "_cow", "_volumes", "_templates", "_secrets"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "sbx_symlinked").symlink_to(tmp_path / "_snapshots")
+    (tmp_path / "sbx_file").write_text("not a tree", encoding="utf-8")
+    monkeypatch.setattr(xfs_quota, "_use_quotactl", lambda mount_point: False)
+    calls = _fake_subprocess(
+        monkeypatch, {}, lsattr_stdout=f"     700 ---------------- {keep}\n"
+    )
+    assert xfs_quota._scan_project_dirs(tmp_path) == {700: keep}
+    assert calls == [["lsattr", "-p", "-d", str(keep)]]
+
+
 def test_reconcile_cleans_orphan_with_leftover_dir_but_keeps_dir(
     tmp_path, monkeypatch, caplog
 ):

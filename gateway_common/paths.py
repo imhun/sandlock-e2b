@@ -57,6 +57,28 @@ def validate_sandbox_id(sandbox_id: str) -> bool:
     return bool(sandbox_id) and bool(_SANDBOX_ID_RE.match(sandbox_id))
 
 
+def is_sandbox_workspace_dir(entry: Path) -> bool:
+    """Whether ``entry`` is a top-level sandbox workspace directory.
+
+    The single filter every workspace scan shares (quota orphan
+    reconciliation and the worker's orphan-tree GC): a real directory — never
+    a symlink — whose name is a valid sandbox id.
+
+    The workspace root's underscore namespace is infrastructure, not
+    sandboxes: ``_snapshots`` / ``_migrate`` / ``_cow`` / ``_volumes`` /
+    ``_templates`` / ``_secrets`` are spelled like legal sandbox ids (``_``
+    is an id character), so ``validate_sandbox_id`` alone does not separate
+    them from ``sbx_*`` trees and they must never be read, quota-scanned or
+    deleted as one.
+    """
+    return (
+        entry.is_dir()
+        and not entry.is_symlink()
+        and not entry.name.startswith("_")
+        and validate_sandbox_id(entry.name)
+    )
+
+
 def safe_join(root: str | Path, *parts: str) -> Path:
     """Join parts under root and return the resolved path."""
     path = Path(root).resolve()
