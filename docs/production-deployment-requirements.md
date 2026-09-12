@@ -53,10 +53,19 @@ workspace 的属主 = 该沙箱 uid、**属组 = worker 的 effective gid**、�
 **2026-09-11（Track F / Task F1）：非 root worker 是目标形态。** 出厂清单的
 `user: "65534:65534"`（compose）与镜像自带的 `USER 65534`（k8s pod 不覆盖
 `runAsUser`）现在同样能拿到 per-sandbox host uid 与 route-B 槽位。机制不再是
-worker 自己 `setuid`——uid 65534 的进程 `CapEff=0`，`setuid(X)` 必 EPERM，userns
-路线实测也不可用（`newuidmap` 在本机非 root 下任何「不加 SYS_ADMIN」的形态都失败，
-见 `.superpowers/sdd/task-f1probe-report.md`）——而是 exec 镜像里两个带 **file
-capabilities** 的**编译型** broker（file caps 对 `#!` 脚本不生效）：
+worker 自己 `setuid`——uid 65534 的进程 `CapEff=0`，`setuid(X)` 必 EPERM——而是 exec
+镜像里两个带 **file capabilities** 的**编译型** broker（file caps 对 `#!` 脚本不生效）：
+
+> **userns 路线的事实更正（2026-09-12，`.superpowers/sdd/task-usernsprobe-report.md`）**：
+F1 探针当时判"userns 需要 `CAP_SYS_ADMIN`"，那是在**本机 OrbStack 内核**上测的——该环境
+对 `uid_map` 写入一律 EPERM，**与 BND 无关**，属环境假象而非机制限制。在目标机同款内核
+（aarch64 / 6.12）上、用**线上同款 BND `0xc3`**，发行版 `newuidmap`/`newgidmap` 成功写入
+`0 100000 1`；把 BND 清空后同一 helper **连 exec 都被拒**（rc=126）。⇒ 映射非自身 uid 的
+充分条件是 **BND ⊇ SETUID（`newgidmap` 还需 SETGID）+ 发行版 helper + `/etc/subuid` 委托段**，
+**与 `CAP_SYS_ADMIN` 无关，也不需要 euid 0**。**不选 userns 是语义代价，不是机制不可用**：
+它要改 fork 的 `--uid` 身份自检并新增一套启动路径，而 file caps 是"identity by construction"。
+触发条件与前置清单见 `docs/superpowers/plans/2026-09-10-shared-volume-cwd-and-backlog-closeout.md`
+「Track U」。
 
 | broker（`/var/lib/e2b-priv/`） | file caps | 调用形态 |
 |---|---|---|

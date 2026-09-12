@@ -28,7 +28,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | S0.1 | 基线回归（lib / integration / python 三套） | ✅ 完成（lib 771 / integration 432 / python 430） |
 | S0.2 | wheel 重建 + `notify_rate_limit` SDK 冒烟 | ✅ 完成 |
 | S1.1 | PID namespace（`CLONE_NEWPID`、procfs 视图、跨沙箱 PID 探测） | ✅ 完成（lib 773 / integration 441；遗留：CLI `--pid-ns` 未接线到运行时 builder，已随 S3 收尾处理） |
-| S1.2 | 独立 uid 的 userns 单 entry 约束验证 | ✅ 完成（结论：非 root supervisor 无法映射任意 host uid，每沙箱独立 uid 需 root/CAP_SETUID → E3.2/E5.1 输入） |
+| S1.2 | 独立 uid 的 userns 单 entry 约束验证 | ✅ 完成（结论：非 root supervisor 无法映射任意 host uid，每沙箱独立 uid 需 root/CAP_SETUID → E3.2/E5.1 输入）。**2026-09-12 更正**：无 helper/subuid 时如上；给定发行版 `uidmap` + 覆盖池的委托段时**不需要 root、也不需要 `CAP_SYS_ADMIN`**，只要 BND ⊇ SETUID/SETGID（`task-usernsprobe-report.md`、计划「Track U」） |
 | S1.3 | 无特权运行固化（uid 65534 全绿） | ✅ 完成（基线写入 HANDOFF） |
 | S2.1 | connect handler 宿主建连 + ADDFD 注入 | ✅ 完成（已知限制：getsockname/getpeername 显示宿主地址、非阻塞 connect 无 EINPROGRESS） |
 | S2.2 | spawn 路径 `CLONE_NEWNET` + `lo up` | ✅ 完成（netns 沙箱 netlink 为合成 loopback-only 视图） |

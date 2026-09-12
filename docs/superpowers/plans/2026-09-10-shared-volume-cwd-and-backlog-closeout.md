@@ -1312,9 +1312,10 @@ docker compose -f deploy/stack/docker-compose.prod.yml down 2>&1 | tee -a tmp/z1
 > - **file capabilities 路线可行且已实测**：非 root 容器里带 `setcap` 的 helper 真拿到 cap；
 >   同一进程自己 `setgroups([])→setgid→setuid→exec` 成功切到 10001；`chown` 到别的 uid 成功；
 >   它 exec 无 caps 的二进制后 `CapEff` 自动归零（槽位仍是零 cap）。
-> - **userns 路线不可行**：零 cap 只能自映射（=现状，无 per-sandbox uid）；映射到别的 host uid
->   需要父 userns 的 `CAP_SETUID` 或 `newuidmap`+subuid（镜像里没有 `uidmap`），探针里只有给
->   `CAP_SYS_ADMIN` 才跑通，且会被 fork 的 `--uid` 自检拒（`crates/sandlock-supervise/src/main.rs:153-161`）。
+> - **userns 路线：机制可用，语义不可取（2026-09-12 更正）**。F1 探针那条"需要 `CAP_SYS_ADMIN`"
+>   是**本机 OrbStack 内核假象**（该内核上任何 BND 写 `uid_map` 都 EPERM）；目标机同款内核 +
+>   线上同款 BND `0xc3` 实测**不需要 SYS_ADMIN**，详见「Track U」。本轮仍选 file caps，是因为
+>   userns 要改 fork 的身份不变量与启动路径，而 file caps 两者都不碰——**不是机制不可用**。
 > - 形态选择：**2 个专用 broker + 一份共享校验模块**（用户 2026-09-11 拍板），不用 4 个 stock 副本。
 
 ### Task F1：两个 file-cap broker + envd 接线（2 天，分两阶段提交）
@@ -1362,7 +1363,7 @@ docker compose -f deploy/stack/docker-compose.prod.yml down 2>&1 | tee -a tmp/z1
 - [ ] **Step 6: 重跑 Track Z**（非 root 形态）：Z1 起栈 + `smoke-prod-worker.sh` + Z2 两条冒烟 +
   SDK 手工复核，全绿；并把 F1 在 `docs/task-backlog.md` 标为已关闭。
 
-**非目标（本轮不做）**：userns 路线（登记 follow-up，三触发条件见 `task-f1probe-report.md`）；
+**非目标（本轮不做）**：userns 路线（登记为触发式 follow-up，触发条件/前置/证据见「Track U」）；
 `E2B_EXECUTOR=local` 形态；fork 任何改动。
 
 语义；#3 quota-agent；#4 SDK 要看到网关启动失败；#5 线上暂不升级（C1–C3 挂入口条件）；
@@ -1435,6 +1436,65 @@ E2B 自己的部署不需要口径 B/C —— 上线用的是 route-B，二者�
    当前 E2B 形态里没有这种对象。最小版约 1 天，且能让 `supervisor` 档不再是
    "文件属主错位"的陷阱。是否做取决于你是否打算把 fork 交给上游（M7）——
    如果 M7 会推进，建议做；只自用则 A 足够。
+
+## Track U — userns 路线（触发式；2026-09-12 机制探针更正）
+
+> 探针报告：`.superpowers/sdd/task-usernsprobe-report.md`；日志 `tmp/usernsprobe-local.log`
+> （OrbStack/amd64 负对照）、`tmp/usernsprobe-target.log`（目标机/aarch64 决定性档）。
+> **本 Track 不在当前计划内实施**，只登记事实更正、触发条件与前置。
+
+### U.1 事实更正：映射非自身 uid **不需要** `CAP_SYS_ADMIN`
+
+F1 探针（`task-f1probe-report.md` B5-1）"非 root 映射非自身 uid 需要 SYS_ADMIN"的结论**不成立**：
+那是**本机 OrbStack 内核的假象**（该内核上任何 BND——含 `--cap-add ALL`——写 `uid_map` 都 EPERM）。
+目标机（aarch64 / kernel 6.12，线上同款）改用**发行版** `newuidmap`/`newgidmap` 的逐档实测：
+
+| BND 档 | `newuidmap` / `newgidmap` | 宿主视图 `uid_map` |
+|---|---|---|
+| **线上同款 `0xc3`**（SETUID\|SETGID\|CHOWN\|DAC_OVERRIDE） | **rc=0 / rc=0** | `0 100000 1` ✅ |
+| `--cap-drop ALL`（BND=0） | rc=126 `Operation not permitted` | 空 ❌（helper **连 exec 都被拒**） |
+| Docker 默认（`0xa80425fb`） | rc=0 / rc=0 | `0 100000 1` ✅ |
+
+⇒ 充分条件是 **BND ⊇ `SETUID`（`newgidmap` 还需 `SETGID`）+ 发行版 helper + `/etc/subuid`
+委托段**，**与 SYS_ADMIN 无关，也不需要 euid 0**——线上 worker 自身 `CapEff=0`、BND 仍是 `0xc3`，
+即"能映射到池内 uid"的地基**当前形态就已具备**。
+"userns 也要 `setcap`"是把 **file caps** 与 userns 混为一谈：userns 走的是发行版 helper 的
+setuid 位（RHEL 系实现为 file caps），容器侧只需 BND 里那几条，而 `0xc3` 本就含。
+
+### U.2 触发条件（修正后）
+
+| # | 触发条件 | 说明 |
+|---|---|---|
+| **U1** | 沙箱**内**需要多于一个身份（多 uid/gid、supplementary groups） | file caps 的 `e2b-slot-spawn` 每槽位只给**一个** host uid，结构上做不到多身份 |
+| **U2** | 明确要求"镜像里不装带 file caps 的二进制"，**且**能提供 `uidmap` + 覆盖 uid 池的 `/etc/subuid`·`subgid` 委托段 | 两条路线都需要把 BND 撑开：file caps 需 4 条，userns 只需 SETUID/SETGID；helpers 需求不同 |
+
+> **原 U2 写法作废**："xattr 被禁且 setuid 渠道可用"——① xattr 是否被禁已被实测排除
+> （overlay2/btrfs 与目标机均支持 `security.capability`，`task-f1probe-report.md` A1-1）；
+> ② "setuid 渠道可用"含糊，真实条件是上表的 **BND ⊇ SETUID/SETGID**。
+
+### U.3 前置清单（若哪天做）
+
+1. 镜像内装 `uidmap`；发行版实现不同但等价（Debian 系 `4755 root:root`、RHEL 系
+   `0755 + cap_setuid=ep`），文档要写清是哪一种；
+2. `/etc/subuid`、`/etc/subgid` 按**调用者用户名**配段（容器内 65534 = `nobody`，**不是**
+   `worker`/`sandbox`——按后者配会被 `uid range … not allowed` 拒，实测坑），且委托范围
+   **必须覆盖 uid 池**（10000..11999）；
+3. helper 所在挂载**不能是 `nosuid`**（线上 `/` 挂载选项无 `nosuid`，已核）；
+4. **必须改 fork**：`crates/sandlock-supervise/src/main.rs:153-161` 的 `geteuid() == cli.uid`
+   自检在 ns 内视角下看到的是 `0`，两种形态都被逐字拒绝（宿主 userns `euid 65534`、
+   `unshare -U -r` 内 `euid 0`）⇒ 要改成"**验证映射**"（接受 `--uid` 等于 ns 根 uid 的宿主映射）。
+   这正是 `crates/sandlock-supervise/src/lib.rs:12-25` 声明的身份不变量，**改动须按 route-B
+   硬不变量重新评审**；
+5. 启动器必须在 `uid_map` 写好后 exec 落地。本轮只证到"映射写入成功"；"子进程真正以宿主 uid X
+   运行"仍属标准 rootless 模型的**推断**，T2 真要落地时用真实启动器补证。
+
+### U.4 为什么现在仍走 file caps
+
+不是机制不可用，而是**语义代价**：userns 要动 fork 的身份不变量（U.3 第 4 条）并新增一套启动
+路径与失败模式；file caps 保持"identity by construction"——`--uid X` 自检天然成立、**零 fork 改动**，
+且能力面更窄（4 条 cap 各自只授一个专用二进制）。U1 一旦成真，再按 U.3 立项。
+
+---
 
 ## Self-Review
 
