@@ -103,7 +103,9 @@
 
 每沙箱分配 host uid（如 10000+i）。收益：
 
-- Landlock 失效时的内核权限兜底（0700 + 独立 uid = 真隔离）；
+- Landlock 失效时的内核权限兜底（**`0770` owner=沙箱 uid、group=worker gid** + 独立 uid = 真隔离：
+  沙箱 `setgroups([])` 且 gid=自己，不在 worker 组，所以 other 位为 0 的 `0770` 对它等价于 `0700`；
+  worker 作为数据面所有者走属组读写，详见 `production-deployment-requirements.md` §2.4 的 c1 段）；
 - unix socket / IPC 随 uid 隔离（额外收获）；
 - 与 usrquota 路线兼容（如需 per-uid 配额）。
 

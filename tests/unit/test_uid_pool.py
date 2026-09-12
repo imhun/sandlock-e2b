@@ -176,7 +176,8 @@ def test_apply_sandbox_ownership_chowns_tree_and_tightens_dir(tmp_path):
     (ws / "sub" / "f.txt").write_text("x", encoding="utf-8")
     apply_sandbox_ownership(ws, POOL_START)
     assert ws.stat().st_uid == POOL_START
-    assert stat.S_IMODE(ws.stat().st_mode) == 0o700
+    assert stat.S_IMODE(ws.stat().st_mode) == 0o770
+    assert ws.stat().st_gid == os.getegid()
     assert (ws / "sub").stat().st_uid == POOL_START
     assert (ws / "sub" / "f.txt").stat().st_uid == POOL_START
 

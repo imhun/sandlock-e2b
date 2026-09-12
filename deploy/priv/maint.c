@@ -238,7 +238,7 @@ int main(int argc, char **argv) {
             uid = (long)getuid();
             if (gid < 0) {
                 gid = (long)getgid();
-            } else if (priv_validate_uid(gid, err, sizeof(err)) != 0) {
+            } else if (priv_gid_allowed(gid, err, sizeof(err)) != 0) {
                 priv_fail("%s", err);
             }
         } else {
@@ -251,10 +251,16 @@ int main(int argc, char **argv) {
             if (gid < 0) {
                 gid = uid;
             }
-            if (gid != uid) {
-                priv_fail(
-                    "chown starts one host identity: uid %ld and gid %ld must match",
-                    uid, gid);
+            /*
+             * Fix round 1 (裁定 c1): the group of a sandbox tree is the
+             * *worker's* gid ("0770 owner=<sandbox uid> group=<worker gid>"),
+             * so --gid may be the broker's own gid as well as a pooled uid.
+             * Naming the broker's own gid is not a widening -- a process may
+             * always chgrp a file it owns to its own gid -- and the uid above
+             * still has to be a pooled one (never 0).
+             */
+            if (priv_gid_allowed(gid, err, sizeof(err)) != 0) {
+                priv_fail("%s", err);
             }
         }
         if (recursive) {

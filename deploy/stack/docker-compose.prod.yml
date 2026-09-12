@@ -161,7 +161,7 @@ services:
       - SETUID      # e2b-slot-spawn: setuid(X) on the pooled host uid
       - SETGID      # e2b-slot-spawn: setgroups([]) + setgid(X)
       - CHOWN       # e2b-maint: workspace/slice ownership + slot documents
-      - DAC_OVERRIDE  # e2b-maint: tenant 0700 trees (walk/rm/chown)
+      - DAC_OVERRIDE  # e2b-maint: rm/walk fallback for trees group access misses
     # A6: the worker needs no SYS_ADMIN. The three former uses are gone --
     # ① the shared-volume ``mount --bind`` was deleted in A4 (virtual paths +
     # A5 traversal bits); ② quota runs on the quota-agent service below;

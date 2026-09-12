@@ -4,7 +4,9 @@ Each sandbox runs inside its own user namespace with the *host* identity set
 by ``RunAs`` (S1.2): inside the namespace the process is uid 0 (fake root),
 while the host sees the allocated uid. Distinct host uids give kernel-enforced
 file / unix-socket isolation even if Landlock were bypassed, which is the
-point of ``0700`` + independent uid workspaces.
+point of ``0770 owner=<sandbox uid> group=<worker gid>`` + independent uid
+workspaces (a sandbox gid is never the worker's gid, so the group bit is the
+worker's own data-plane access and nothing else's).
 
 The pool hands out uids from ``[start, start + size)`` (``10000+i`` by
 default, far away from image-internal uids such as 1000). The allocated uid
@@ -49,6 +51,7 @@ from typing import Any
 
 import fcntl
 
+from envd_service import priv_helpers
 from gateway_common.paths import validate_sandbox_id
 
 logger = logging.getLogger(__name__)
@@ -58,6 +61,12 @@ logger = logging.getLogger(__name__)
 #: ``release``. A marker file is named after the sandbox id and contains the
 #: reserved uid as decimal text.
 _RESERVATION_DIR = ".uid_reservations"
+
+#: Mode of a sandbox-owned directory (workspace root / volume slice):
+#: ``0770 owner=<sandbox uid> group=<worker gid>`` (fix round 1 / c1; the
+#: long-form rationale lives on :func:`apply_sandbox_ownership`). Re-exported
+#: from :mod:`envd_service.priv_helpers` so the shape has one definition.
+WORKSPACE_MODE = priv_helpers.WORKSPACE_MODE
 
 #: Legacy shared-uid RunAs identity (S1.2): with ``E2B_PER_SANDBOX_UID`` off
 #: a root worker maps every sandbox to host uid/gid 1000 (the same constant
@@ -163,8 +172,9 @@ def _chown_tree(path: Path, uid: int, gid: int) -> None:
     """Recursively chown ``path`` (symlinks themselves, never their targets).
 
     On a non-root worker the recursion happens **inside** ``e2b-maint``: the
-    worker cannot descend a tenant's ``0700`` tree, and that capability is the
-    whole reason the maintenance broker exists. Handing a reclaimed orphan
+    worker cannot descend a tenant's tree (``0770`` gives it group access, but
+    it is not the owner, so it cannot change ownership back), and that is why
+    the maintenance broker keeps the chown verb. Handing a reclaimed orphan
     back to the worker identity (``uid == os.geteuid()``) uses the broker's
     ``--worker`` form, so the request can never name root.
     """
@@ -187,31 +197,92 @@ def _chown_tree(path: Path, uid: int, gid: int) -> None:
 
 
 def apply_sandbox_ownership(workspace_dir: str | Path, host_uid: int) -> None:
-    """Chown a sandbox workspace to its host uid and tighten it to 0700.
+    """Chown a sandbox workspace to ``<sandbox uid>:<worker gid>`` at ``0770``.
 
-    The sandbox's mount view (``/workspace`` in image-rootfs mode, or the
-    workspace directory itself) is owned by the host uid, so inside the
-    sandbox (uid 0) writes land with the sandbox's host identity, and other
-    sandboxes (different host uids) cannot even enter the directory — the
-    kernel DAC check is the isolation backstop behind Landlock.
+    Fix round 1 (裁定 c1): the sandbox owns the tree, and the **worker's
+    effective gid** -- ``os.getegid()``, never a hardcoded 65534, because a
+    k8s pod may set ``runAsGroup`` -- is the group. The worker is the
+    data-plane owner of every workspace (files API, watcher, command logs,
+    snapshots, lifecycle -- all of which must work while a sandbox is paused,
+    frozen or gone), so its access is expressed as a *permission* rather than
+    as a per-syscall capability.
+
+    Cross-sandbox isolation is unchanged: a sandbox runs as ``uid X, gid X``
+    with ``setgroups([])`` (the slot broker clears the groups; the userns path
+    has ``setgroups=deny``), so it is never in the worker's group and the
+    ``other`` bits are 0 -- the kernel DAC check is still the isolation
+    backstop behind Landlock.
+
+    Every *directory* in the tree gets the same mode (files keep theirs): the
+    files API uploads into ``<workspace>/workspace/``, a directory the worker
+    itself created as ``0755``, so "``0770`` on the sandbox root" alone would
+    leave the worker without write access one level down.
+
+    Order matters: ``chmod`` **before** ``chown``. After the chown the worker
+    is no longer the owner and ``chmod`` would fail with EPERM (the broker
+    deliberately does not carry ``CAP_FOWNER``); the root shape hides this
+    because root ignores ownership, the non-root shape does not.
     """
     path = Path(workspace_dir)
     from envd_service import priv_helpers
 
+    group = os.getegid()
+    mode = priv_helpers.WORKSPACE_MODE
+    # The mode pass must happen while the worker still owns the tree (chmod
+    # after the chown is EPERM). On a re-create of an existing sandbox the
+    # tree is already the sandbox's, i.e. already in this shape -- skipping is
+    # correct and keeps the log quiet.
+    try:
+        ours = path.is_dir() and not path.is_symlink() and (
+            path.stat().st_uid == os.geteuid()
+        )
+    except OSError:
+        ours = False
+    if ours:
+        _prepare_directory_modes(path, mode)
+    else:
+        logger.debug(
+            "%s is not owned by this worker; keeping its existing modes", path
+        )
     helpers = priv_helpers.active_helpers()
     if helpers is not None and priv_helpers.helpers_cover(path):
-        # Tighten *before* handing the tree over: chmod needs ownership (or
-        # CAP_FOWNER, which the maintenance broker deliberately does not
-        # carry), and the worker owns the tree it just created.
-        try:
-            if path.stat().st_uid == os.geteuid():
-                os.chmod(path, 0o700)
-        except OSError as exc:
-            logger.warning("cannot tighten %s to 0700: %s", path, exc)
-        helpers.chown(uid=host_uid, path=path, recursive=True)
+        helpers.chown(uid=host_uid, path=path, recursive=True, gid=group)
         return
-    _chown_tree(path, host_uid, host_uid)
-    os.chmod(path, 0o700)
+    _chown_tree(path, host_uid, group)
+
+
+def _prepare_directory_modes(path: Path, mode: int) -> None:
+    """Give every directory in a freshly created tree the c1 mode.
+
+    The worker must be able to *write* inside the tree it manages, not only
+    read it: the files API uploads into ``<workspace>/workspace/`` (a
+    directory the worker itself created, which ``mkdir`` left at 0755), and
+    ``0770`` on the sandbox root alone would leave the worker with r-x there.
+    So every directory gets ``0770`` -- the group is the worker's gid and the
+    sandbox is not in it, so cross-sandbox isolation is unchanged -- while
+    **files keep their own modes** (a sandbox-created 0644 file is group/other
+    readable, which is what the files API and snapshots need; an overwrite goes
+    through the temp-file + rename path, which needs directory write).
+
+    Must run **before** the chown: afterwards the worker is no longer the owner
+    and ``chmod`` is EPERM (the broker carries no ``CAP_FOWNER``). Symlinks are
+    never touched (``chmod`` on a symlink would follow it on Linux).
+    """
+    try:
+        os.chmod(path, mode)
+    except OSError as exc:
+        logger.warning("cannot set %s to %04o: %s", path, mode, exc)
+    if path.is_symlink() or not path.is_dir():
+        return
+    for root, dirs, _files in os.walk(path):
+        for name in dirs:
+            child = Path(root) / name
+            if child.is_symlink():
+                continue
+            try:
+                os.chmod(child, mode)
+            except OSError as exc:
+                logger.warning("cannot set %s to %04o: %s", child, mode, exc)
 
 
 def _alignment_target_uid(*, worker_euid: int, owner_uid: int) -> int | None:

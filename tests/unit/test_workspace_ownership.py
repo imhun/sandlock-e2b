@@ -80,7 +80,8 @@ def test_align_shared_uid_workspace_chowns_root_owned_tree(tmp_path):
 
     align_shared_uid_workspace(ws)
     assert ws.stat().st_uid == LEGACY_SHARED_UID
-    assert stat.S_IMODE(ws.stat().st_mode) == 0o700
+    assert stat.S_IMODE(ws.stat().st_mode) == 0o770
+    assert ws.stat().st_gid == os.getegid()
     assert (ws / "sub").stat().st_uid == LEGACY_SHARED_UID
     assert (ws / "sub" / "f.txt").stat().st_uid == LEGACY_SHARED_UID
 

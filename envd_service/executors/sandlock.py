@@ -670,7 +670,7 @@ class SandlockExecutor(Executor):
         # Track F: a broker-started slot is the *only* way a non-root worker
         # can run as the sandbox's own host uid (the in-process RunAs cannot
         # map another uid there, S1.2), so the broker shape takes route B in
-        # every shape -- per-sandbox uids and their 0700 workspaces depend on
+        # every shape -- per-sandbox uids and their 0770 workspaces depend on
         # it even where no path mediation happens.
         if not (forced or mediation_shape or cfg.spawner is not None):
             return "auto keeps the pure (no-chroot) shape in-process: it mediates nothing"

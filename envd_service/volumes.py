@@ -126,7 +126,8 @@ def _ensure_shared_volume_root(volume_root: Path, host_uid: int) -> None:
     The root is reachable only if every directory above it is too: the
     mediator opens this path as the mounting sandbox's uid, so a 0700 ancestor
     turns an absolute volume path into EACCES (A5). ``_ensure_traversable``
-    widens that chain to o+x, leaving the per-sandbox slices at 0700.
+    widens that chain to o+x, leaving the per-sandbox slices at ``0770``
+    (fix round 1 / c1: sandbox uid owns, worker gid is the group).
     """
     try:
         st = volume_root.stat()
@@ -154,13 +155,18 @@ def _chown_path(path: Path, host_uid: int) -> None:
     A non-root worker has no CAP_CHOWN of its own; the maintenance broker is
     what makes the E3.2 ownership model hold there. Outside the broker's
     whitelist (or with no brokers) this falls back to the in-process call.
+
+    The group is the worker's effective gid (fix round 1 / c1): the worker is
+    the data-plane owner of the tree it manages.
     """
     from envd_service import priv_helpers
 
     if priv_helpers.helpers_cover(path):
-        priv_helpers.broker_chown(host_uid, path, recursive=False)
+        priv_helpers.broker_chown(
+            host_uid, path, recursive=False, gid=os.getegid()
+        )
         return
-    os.chown(path, host_uid, host_uid)
+    os.chown(path, host_uid, os.getegid())
 
 
 def _can_manage_sandbox_uid() -> bool:
@@ -192,8 +198,9 @@ def provision_sandbox_volume_mount(
 
     ``host_uid`` (the sandbox's allocated host uid, E3.2): the volume root is
     made ``1777`` for cross-sandbox sharing and, when a per-sandbox slice
-    exists, the slice is chowned to ``host_uid`` with ``0700`` so the slice
-    is kernel-isolated from other sandboxes. ``None`` keeps the legacy
+    exists, the slice is ``0770 <host_uid>:<worker gid>`` (fix round 1 / c1)
+    so the slice is kernel-isolated from other sandboxes while the worker --
+    the data-plane owner -- can still reach it. ``None`` keeps the legacy
     single-uid ownership model (worker identity).
     """
     volume_root = Path(volume_path)
@@ -211,21 +218,36 @@ def provision_sandbox_volume_mount(
         if host_uid is not None and _can_manage_sandbox_uid():
             from envd_service import priv_helpers
 
+            mode = priv_helpers.WORKSPACE_MODE
+            group = os.getegid()
             if priv_helpers.helpers_cover(sandbox_dir):
-                # Tighten while the worker still owns the fresh slice, then
-                # hand it to the sandbox uid (chmod needs ownership).
+                # chmod *before* chown: after the chown the worker is no longer
+                # the owner and chmod would be EPERM (the broker carries no
+                # CAP_FOWNER); the root shape hides the ordering, the non-root
+                # one does not.
                 try:
-                    os.chmod(sandbox_dir, 0o700)
+                    os.chmod(sandbox_dir, mode)
                 except OSError as exc:
                     logger.debug(
-                        "cannot tighten volume slice %s before chown: %s",
+                        "cannot set volume slice %s to %04o before chown: %s",
                         sandbox_dir,
+                        mode,
                         exc,
                     )
-                priv_helpers.broker_chown(host_uid, sandbox_dir, recursive=True)
+                priv_helpers.broker_chown(
+                    host_uid, sandbox_dir, recursive=True, gid=group
+                )
             else:
-                os.chown(sandbox_dir, host_uid, host_uid)
-                os.chmod(sandbox_dir, 0o700)
+                try:
+                    os.chmod(sandbox_dir, mode)
+                except OSError as exc:
+                    logger.debug(
+                        "cannot set volume slice %s to %04o before chown: %s",
+                        sandbox_dir,
+                        mode,
+                        exc,
+                    )
+                os.chown(sandbox_dir, host_uid, group)
         projid = provision_project(
             sandbox_id=volume_projid_key(sandbox_id, volume_id, mount_path),
             project_dir=sandbox_dir,
@@ -403,8 +425,9 @@ def cleanup_volume_projects(
                     projid,
                     exc,
                 )
-        # Broker-first: the slice is owned by the sandbox's host uid at 0700,
-        # so a non-root worker can only remove it through e2b-maint.
+        # Fix round 1 / c1: the slice is `0770 <sandbox uid>:<worker gid>`, so
+        # the worker's own group access can remove it in-process; e2b-maint is
+        # the fallback for trees that access cannot reach.
         from envd_service import priv_helpers
 
         priv_helpers.remove_tree(sandbox_dir)

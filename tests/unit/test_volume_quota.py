@@ -221,10 +221,11 @@ def test_provision_with_host_uid_sets_root_1777_and_slice_owner(
     root_st = volume_path.stat()
     assert stat.S_IMODE(root_st.st_mode) == 0o1777
     assert root_st.st_uid == 10000
-    # Slice: owned by the mounting sandbox uid, tightened to 0700.
+    # Slice: owned by the mounting sandbox uid, group = the worker's gid,
+    # `0770` (fix round 1 / c1).
     slice_st = view.stat()
     assert slice_st.st_uid == 10000
-    assert stat.S_IMODE(slice_st.st_mode) == 0o700
+    assert stat.S_IMODE(slice_st.st_mode) == 0o770
 
 
 def test_provision_quota_zero_with_host_uid_makes_root_1777(
@@ -301,7 +302,7 @@ def test_build_volume_mounts_passes_host_uid_to_slice(
         {"path": "mnt/data", "hostPath": str(slice_dir)}
     ]
     assert slice_dir.stat().st_uid == 10000
-    assert stat.S_IMODE(slice_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(slice_dir.stat().st_mode) == 0o770
     assert volume_path.stat().st_uid == 10000
     assert stat.S_IMODE(volume_path.stat().st_mode) == 0o1777
 

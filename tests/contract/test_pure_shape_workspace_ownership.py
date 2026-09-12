@@ -168,10 +168,13 @@ async def test_pure_shape_shell_writes_workspace_root_and_migration_preserves_it
             marker = by_stripped["g2-marker.txt"]
         assert root is not None, "export archive has no workspace root member"
         # One identity for the directory and for what the sandbox shell wrote,
-        # never root, and mode 0700 (alignment by chown, not by opening it up).
+        # never root, and `0770` with the worker's gid as the group (fix round
+        # 1 / c1: the worker is the data-plane owner and reaches the tree
+        # through its group, never by being root or by opening it to "other").
         assert root.uid == marker.uid
         assert root.uid != 0
-        assert stat.S_IMODE(root.mode) == 0o700
+        assert stat.S_IMODE(root.mode) == 0o770
+        assert root.gid == marker.gid
         assert root.uid == SHARED_RUNAS_UID or root.uid in _recorded_host_uids(
             sandbox_id
         ), f"exported owner {root.uid} is neither the legacy shared uid nor a uid "             f"the workers recorded ({_recorded_host_uids(sandbox_id)})"

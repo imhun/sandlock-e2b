@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static const char *g_progname = "e2b-priv";
 
@@ -100,6 +101,22 @@ int priv_validate_uid(long uid, char *err, size_t errlen) {
         return -1;
     }
     return 0;
+}
+
+int priv_gid_allowed(long gid, char *err, size_t errlen) {
+    long start, size;
+    if (gid == (long)getgid()) {
+        return 0;
+    }
+    priv_uid_pool(&start, &size);
+    if (gid >= start && gid <= start + size - 1) {
+        return 0;
+    }
+    snprintf(err, errlen,
+             "gid %ld is neither the worker's own gid (%ld) nor a member of "
+             "the privileged helper uid pool %ld..%ld",
+             gid, (long)getgid(), start, start + size - 1);
+    return -1;
 }
 
 static const char *priv_workspace_base(void) {

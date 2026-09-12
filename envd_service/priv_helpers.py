@@ -1,12 +1,21 @@
 """File-capability brokers for a **non-root** worker (Track F / Task F1).
 
 Why brokers at all: route B needs one ``sandlock-supervise`` per sandbox
-running *as that sandbox's own host uid*, and the management plane (workspace
-chown, orphan reconcile, deletes) needs to walk a tenant's ``0700`` tree. A
-worker that is uid 65534 can do neither -- ``CapEff`` is empty, so
-``setuid(X)`` is EPERM (``docs/superpowers/plans/...`` / the F1 probe report).
-User namespaces are not an option on the target hosts (the probe measured
-``newuidmap`` refusing every non-``SYS_ADMIN`` shape).
+running *as that sandbox's own host uid*, and that is the one step a uid-65534
+worker cannot perform -- its ``CapEff`` is empty, so ``setuid(X)`` is EPERM
+(the F1 probe report; user namespaces are not an option on the target hosts --
+``newuidmap`` refuses every non-``SYS_ADMIN`` shape there).
+
+Everything else is deliberately *not* delegated any more (fix round 1,
+裁定 c1): the worker is the data-plane owner of every sandbox tree (files API,
+watcher, command logs, snapshots, lifecycle -- all of which must work while a
+sandbox is paused, frozen or gone), so its access is expressed as a
+**permission**: ``0770 owner=<sandbox uid> group=<worker gid>``. The broker
+keeps ``chown`` (the worker is in the group, not the owner, so it cannot hand
+a tree to a pooled uid or reclaim an orphan by itself) and ``rm``/``walk``
+only as the fallback for trees group access cannot reach: a sandbox-made
+``0700`` subdirectory, a ``1777`` volume root, or a root-owned leftover from
+before the cut-over.
 
 So two **compiled** binaries carry the capability as a *file capability*
 (``setcap`` xattr, applied in the final image stage -- ``COPY --from`` does
@@ -147,6 +156,20 @@ _VFS_CAP_REVISION_3 = 0x03000000
 _VFS_CAP_FLAGS_EFFECTIVE = 0x000001
 _VFS_CAP_REVISION_MASK = 0xFF000000
 _VFS_CAP_FLAGS_MASK = ~_VFS_CAP_REVISION_MASK & 0xFFFFFFFF
+
+#: Mode of a sandbox-owned directory (workspace root / volume slice).
+#:
+#: ``0770 owner=<sandbox uid> group=<worker gid>`` -- fix round 1 (裁定 c1).
+#: The worker is the **data-plane owner** of every workspace: the files API,
+#: the watcher, the command-log writer, snapshots and the whole lifecycle run
+#: in the worker process and must keep working while a sandbox is paused,
+#: frozen or gone. Its access requirement is therefore not a capability it
+#: borrows for one syscall, it is a *permission* on the tree. Membership in the
+#: group grants it; a sandbox (uid Y, gid Y, ``setgroups([])`` -- the slot
+#: broker and the userns path both clear supplementary groups) is never in
+#: that group and the ``other`` bits are 0, so cross-sandbox isolation is still
+#: a plain kernel DAC check.
+WORKSPACE_MODE = 0o770
 
 
 class PrivHelperError(RuntimeError):
@@ -312,6 +335,27 @@ class PrivHelpers:
             )
         return uid
 
+    def validate_chown_gid(self, gid: int) -> int:
+        """The group a broker ``chown`` may name.
+
+        Either a pooled sandbox uid (the legacy/root shape: ``X:X``) or the
+        broker's **own** gid. The latter is the c1 model -- the workspace is
+        ``0770`` owned by the sandbox with the worker's group -- and is not a
+        widening: a process may always chgrp a file it owns to its own gid.
+        """
+        if not isinstance(gid, int) or isinstance(gid, bool):
+            raise PrivHelperError(f"gid {gid!r} is not an integer")
+        if gid == os.getegid():
+            return gid
+        try:
+            return self.validate_uid(gid)
+        except PrivHelperError:
+            raise PrivHelperError(
+                f"gid {gid} is neither the worker's own gid ({os.getegid()}) "
+                f"nor a member of the privileged helper uid pool "
+                f"{self.uid_pool_start}..{self.uid_end}"
+            ) from None
+
     # -------------------------------------------------------------- paths
 
     def _root_paths(self) -> tuple[Path, ...]:
@@ -403,9 +447,15 @@ class PrivHelpers:
         ]
 
     def chown_argv(
-        self, *, uid: int, path: str | Path, recursive: bool = False
+        self,
+        *,
+        uid: int,
+        path: str | Path,
+        recursive: bool = False,
+        gid: int | None = None,
     ) -> list[str]:
         self.validate_uid(uid)
+        gid = uid if gid is None else self.validate_chown_gid(gid)
         self.resolve_path(path, strict=True)
         argv = [
             str(self.maint),
@@ -413,7 +463,7 @@ class PrivHelpers:
             "--uid",
             str(uid),
             "--gid",
-            str(uid),
+            str(gid),
         ]
         if recursive:
             argv.append("--recursive")
@@ -471,10 +521,17 @@ class PrivHelpers:
             )
         return proc.stdout or ""
 
-    def chown(self, *, uid: int, path: str | Path, recursive: bool = False) -> None:
+    def chown(
+        self,
+        *,
+        uid: int,
+        path: str | Path,
+        recursive: bool = False,
+        gid: int | None = None,
+    ) -> None:
         self._run(
-            self.chown_argv(uid=uid, path=path, recursive=recursive),
-            what=f"chown {path} to uid {uid}",
+            self.chown_argv(uid=uid, path=path, recursive=recursive, gid=gid),
+            what=f"chown {path} to uid {uid}:gid {gid if gid is not None else uid}",
         )
 
     def chown_worker(
@@ -597,10 +654,16 @@ def _require_active(what: str) -> PrivHelpers:
     return helpers
 
 
-def broker_chown(uid: int, path: str | Path, *, recursive: bool = True) -> None:
+def broker_chown(
+    uid: int,
+    path: str | Path,
+    *,
+    recursive: bool = True,
+    gid: int | None = None,
+) -> None:
     """Chown a managed tree to a pooled uid (raises when no brokers)."""
     _require_active(f"chown {path} to uid {uid}").chown(
-        uid=uid, path=path, recursive=recursive
+        uid=uid, path=path, recursive=recursive, gid=gid
     )
 
 
@@ -614,10 +677,20 @@ def broker_reclaim(
 
 
 def broker_remove(path: str | Path) -> None:
+    """Delete a tree the worker's own DAC access cannot reach.
+
+    Fix round 1 (c1): the worker is a member of every *tenant* tree's group,
+    so ordinary teardown is an in-process ``rmtree`` again (see
+    :func:`remove_tree`). The broker stays as the fallback for the cases group
+    access does not cover: a sandbox-managed ``0700`` subdirectory, a
+    ``1777`` volume root, or a leftover tree still owned by root from before
+    the cut-over.
+    """
     _require_active(f"remove {path}").remove(path)
 
 
 def broker_dir_size(path: str | Path) -> int:
+    """Size scan for trees the worker cannot walk itself (same c1 fallback)."""
     return _require_active(f"walk {path}").dir_size(path)
 
 
@@ -634,26 +707,55 @@ def helpers_cover(path: str | Path) -> bool:
 
 
 def remove_tree(path: str | Path, *, on_error: str = "ignore") -> None:
-    """``shutil.rmtree`` for managed trees, through the broker when possible.
+    """Delete a managed tree, in-process first and through the broker on EACCES.
 
-    A path outside the broker whitelist (``_snapshots``/``_migrate`` scratch
-    roots) falls back to ``shutil.rmtree``: those trees are the worker's own,
-    so the worker identity can already delete them.
+    ``0770 owner=<sandbox uid> group=<worker gid>`` gives the worker group
+    write on the tree, so teardown no longer needs the broker. A *nested*
+    directory the sandbox itself made ``0700`` (or a pre-cut-over root-owned
+    leftover) is still unreachable for the worker's own group access, and that
+    is what ``e2b-maint rm`` remains for.
     """
     import shutil
 
-    if helpers_cover(path):
-        broker_remove(path)
+    try:
+        shutil.rmtree(path, ignore_errors=False)
         return
-    shutil.rmtree(path, ignore_errors=on_error == "ignore")
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        if not helpers_cover(path):
+            if on_error != "ignore":
+                raise
+            logger.debug("cannot remove %s in-process: %s", path, exc)
+            return
+        logger.info(
+            "removing %s through e2b-maint (worker DAC could not: %s)", path, exc
+        )
+        broker_remove(path)
 
 
 def dir_size(path: str | Path) -> int | None:
-    """File bytes under ``path`` for ``/metrics``; ``None`` means "no broker".
+    """File bytes under ``path`` for ``/metrics``; ``None`` means "unknown".
 
-    The walk descends into a tenant's ``0700`` workspace, which only
-    ``CAP_DAC_OVERRIDE`` opens -- an in-process walk would silently report 0.
+    In-process first (the worker's group access reaches a ``0770`` tenant
+    workspace), broker on EACCES (a ``0700`` subdirectory the sandbox made, or
+    a ``1777`` volume root full of foreign-owned files).
     """
+    total = 0
+
+    def _raise(exc: OSError) -> None:
+        raise exc
+
+    try:
+        for root, _dirs, files in os.walk(path, onerror=_raise):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    continue
+        return total
+    except OSError:
+        pass
     if not helpers_cover(path):
         return None
     return broker_dir_size(path)
@@ -710,6 +812,12 @@ def resolve_priv_helpers(settings) -> PrivHelpers | None:
     _require_caps(slot, SLOT_SPAWN_CAPS)
     _require_caps(maint, MAINT_CAPS)
     _require_consistent_shape(settings)
+    check_worker_identity_outside_pool(
+        uid=os.geteuid(),
+        gid=os.getegid(),
+        start=int(getattr(settings, "uid_pool_start", 10000)),
+        size=int(getattr(settings, "uid_pool_size", 1000)),
+    )
     helpers = PrivHelpers(
         slot_spawn=slot,
         maint=maint,
@@ -754,6 +862,31 @@ def _require_consistent_shape(settings) -> None:
             "cannot remap a sandbox in-process (S1.2), so the broker-started "
             "slot is the only way to run as the pooled host uid"
         )
+
+
+def check_worker_identity_outside_pool(
+    *, uid: int, gid: int, start: int, size: int
+) -> None:
+    """The pool must never hand a sandbox the worker's own uid or gid (c1).
+
+    Fix round 1 makes the worker a *member* of every sandbox tree's group
+    (``0770 owner=<sandbox uid> group=<worker gid>``). If a sandbox were
+    allocated that same uid or gid it would be inside the worker's trust
+    boundary -- it could read and write other sandboxes' workspaces -- so the
+    configuration is refused by name at startup rather than shipping a silent
+    hole. Checked for every worker shape (a root worker included): the group
+    model -- and therefore the guard -- is what makes the shared tree safe.
+    """
+    end = start + size - 1
+    for kind, value in (("uid", uid), ("gid", gid)):
+        if start <= value <= end:
+            raise PrivHelperError(
+                f"the sandbox {kind} pool {start}..{end} contains the worker's "
+                f"own {kind} ({value}): a sandbox would share the worker's "
+                "identity and could read every other sandbox's 0770 workspace "
+                "(the group model relies on the sandbox gid differing from the "
+                f"worker's); move E2B_UID_POOL_START/SIZE off {value}"
+            )
 
 
 def _supervise_bin() -> Path:

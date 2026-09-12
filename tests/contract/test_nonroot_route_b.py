@@ -2,7 +2,7 @@
 
 The deployed worker runs as uid 65534 with no effective capabilities. Route B
 still has to start one ``sandlock-supervise`` per sandbox *as that sandbox's
-own host uid*, and E3.2 still has to own the sandbox's ``0700`` workspace --
+own host uid*, and E3.2 still has to own the sandbox's ``0770`` workspace --
 which a non-root worker can only do through the two file-capability brokers
 (``envd_service/priv_helpers.py``, ``deploy/priv/``). This contract drives the
 real worker path (control plane create -> agent create -> first exec) and
@@ -27,6 +27,7 @@ privileged step delegated).
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 import stat
@@ -41,7 +42,7 @@ from control_plane.config import Settings as ControlSettings
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
-from tests.contract.test_uid_permissions import _result, _run_cmd
+from tests.contract.test_uid_permissions import _headers, _result, _run_cmd
 from tests.security.conftest import sandlock_ready
 
 POOL_START = 21000
@@ -186,8 +187,14 @@ async def test_nonroot_worker_runs_route_b_with_pooled_uids(
         POOL_START,
         POOL_START + 1,
     )
-    assert stat.S_IMODE(workspace_a.stat().st_mode) == 0o700
-    assert stat.S_IMODE(workspace_b.stat().st_mode) == 0o700
+    assert stat.S_IMODE(workspace_a.stat().st_mode) == 0o770
+    assert stat.S_IMODE(workspace_b.stat().st_mode) == 0o770
+    # Fix round 1 (c1): the group is the worker's own gid -- that is the
+    # worker's data-plane access to the tree, not a sandbox's.
+    assert (workspace_a.stat().st_gid, workspace_b.stat().st_gid) == (
+        os.getegid(),
+        os.getegid(),
+    )
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=envd), base_url="http://test"
@@ -224,6 +231,59 @@ async def test_nonroot_worker_runs_route_b_with_pooled_uids(
             b"touch: cannot touch 'mnt/data/a.txt': Permission denied\n"
         )
         assert (vol_path / "a.txt").read_text(encoding="utf-8") == "owned-by-a\n"
+
+        # Fix round 1 (c1, 裁定 c1): the workspace is `0770 <sandbox uid>:<worker
+        # gid>`, so the worker's own data plane -- the files API, the command-log
+        # writer and snapshot copies, all of which run *in the worker process*
+        # and must work while a sandbox is paused/frozen/gone -- reaches the
+        # tree again. These are exactly the paths that a 0700 workspace broke.
+        uploaded = await client.post(
+            "/files?path=worker-wrote.txt",
+            headers={
+                **_headers(a_payload),
+                "Content-Type": "application/octet-stream",
+            },
+            content=b"from-worker",
+        )
+        assert uploaded.status_code == 200
+        downloaded = await client.get(
+            "/files?path=worker-wrote.txt", headers=_headers(a_payload)
+        )
+        assert (downloaded.status_code, downloaded.content) == (200, b"from-worker")
+        listed = await client.post(
+            "/filesystem.Filesystem/ListDir",
+            headers={**_headers(a_payload), "Content-Type": "application/json"},
+            content=json.dumps({"path": ".", "depth": 0}).encode(),
+        )
+        assert listed.status_code == 200
+        assert "worker-wrote.txt" in {
+            entry["path"] for entry in listed.json()["entries"]
+        }
+
+        logged = await client.get(
+            f"/agent/sandboxes/{a_payload['sandboxID']}/logs",
+            headers={"X-Internal-Key": "internal-key"},
+        )
+        assert logged.status_code == 200
+        assert any(
+            "owned-by-a" in row.get("line", "") for row in logged.json()
+        ), logged.json()
+
+        snapshot_id = f"snap_c1_{a_payload['sandboxID']}"
+        snapshot = await client.post(
+            "/agent/snapshots",
+            headers={"X-Internal-Key": "internal-key"},
+            json={
+                "sandboxID": a_payload["sandboxID"],
+                "snapshotID": snapshot_id,
+            },
+        )
+        assert snapshot.status_code == 201
+        dropped = await client.delete(
+            f"/agent/snapshots/{snapshot_id}",
+            headers={"X-Internal-Key": "internal-key"},
+        )
+        assert dropped.status_code == 204
 
     # ① the worker's own ready line, with the pooled host uid.
     ready = [

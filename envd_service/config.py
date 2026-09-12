@@ -175,7 +175,7 @@ class Settings:
     )
     # Per-sandbox host uid isolation (E3.2) -- **on by default**: every
     # sandbox gets a distinct host uid from the pool and its workspace is
-    # chowned to that uid with 0700. That identity is what makes the rest of
+    # `0770 <uid>:<worker gid>` (fix round 1 / c1). That identity is what makes the rest of
     # the isolation story work: shared volumes protect each other with real
     # 1777+sticky DAC, and (route B) the sandbox's `sandlock-supervise` slot
     # runs as *that* uid, so path mediation lands writes on the sandbox
@@ -193,7 +193,9 @@ class Settings:
     # Track F / Task F1: the two file-capability brokers
     # (``/var/lib/e2b-priv/e2b-slot-spawn`` / ``e2b-maint``) let a worker that
     # is *not* root perform the two privileged steps route B and E3.2 need --
-    # starting a slot at a pooled host uid and owning a tenant's 0700 tree.
+    # starting a slot at a pooled host uid and reaching a tenant's tree (the
+    # worker is a member of its group: `0770 owner=<sandbox uid> group=<worker gid>`,
+    # fix round 1 / c1).
     # ``auto`` (default): use them when the worker is non-root and both are
     # installed; a *half-installed* broker pair fails the worker's startup by
     # name (a privileged broker must never be guessed at), while a worker with

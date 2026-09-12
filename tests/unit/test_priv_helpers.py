@@ -278,6 +278,32 @@ def test_chown_rm_and_walk_argv_shape(tmp_path: Path) -> None:
     ]
 
 
+def test_chown_argv_carries_the_workers_group_for_the_c1_model(tmp_path: Path) -> None:
+    """Fix round 1 (c1): `0770 owner=<sandbox uid> group=<worker gid>`."""
+    helpers = _helpers(tmp_path)
+    target = helpers.workspace_base / "sbx_a"
+    assert helpers.chown_argv(uid=10003, gid=os.getegid(), path=target) == [
+        str(helpers.maint),
+        "chown",
+        "--uid",
+        "10003",
+        "--gid",
+        str(os.getegid()),
+        "--path",
+        str(target),
+    ]
+    # A pooled gid is still allowed (the root/legacy `X:X` shape).
+    assert helpers.validate_chown_gid(10003) == 10003
+    assert helpers.validate_chown_gid(os.getegid()) == os.getegid()
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        helpers.validate_chown_gid(4242)
+    assert str(excinfo.value) == (
+        "gid 4242 is neither the worker's own gid "
+        f"({os.getegid()}) nor a member of the privileged helper uid pool "
+        "10000..10999"
+    )
+
+
 def test_chown_refuses_a_uid_outside_the_pool(tmp_path: Path) -> None:
     helpers = _helpers(tmp_path)
     with pytest.raises(ph.PrivHelperError) as excinfo:
@@ -424,6 +450,119 @@ def test_off_keeps_todays_in_process_behavior(tmp_path: Path, monkeypatch) -> No
     _install(tmp_path, monkeypatch)
     settings = _settings(tmp_path, priv_helpers="off")
     assert ph.resolve_priv_helpers(settings) is None
+
+
+def test_the_workspace_mode_is_the_c1_shape() -> None:
+    assert ph.WORKSPACE_MODE == 0o770
+
+
+@pytest.mark.parametrize(
+    "uid, gid, expected",
+    [
+        pytest.param(65534, 65534, None, id="outside-pool"),
+        pytest.param(9999, 65534, None, id="just-below-the-pool"),
+        pytest.param(11000, 65534, None, id="just-above-the-pool"),
+        pytest.param(
+            10000,
+            65534,
+            "the sandbox uid pool 10000..10999 contains the worker's own uid "
+            "(10000): a sandbox would share the worker's identity and could "
+            "read every other sandbox's 0770 workspace (the group model relies "
+            "on the sandbox gid differing from the worker's); move "
+            "E2B_UID_POOL_START/SIZE off 10000",
+            id="worker-uid-in-pool",
+        ),
+        pytest.param(
+            65534,
+            10999,
+            "the sandbox gid pool 10000..10999 contains the worker's own gid "
+            "(10999): a sandbox would share the worker's identity and could "
+            "read every other sandbox's 0770 workspace (the group model relies "
+            "on the sandbox gid differing from the worker's); move "
+            "E2B_UID_POOL_START/SIZE off 10999",
+            id="worker-gid-in-pool",
+        ),
+    ],
+)
+def test_the_worker_identity_must_stay_outside_the_pool(
+    uid: int, gid: int, expected: str | None
+) -> None:
+    """Fix round 1 (c1) guard: a pooled worker identity would defeat `0770`.
+
+    A sandbox allocated the worker's own uid/gid would be inside the worker's
+    trust boundary and could read every other sandbox's workspace, so the
+    worker refuses to start unless it is named out of the pool.
+    """
+    if expected is None:
+        ph.check_worker_identity_outside_pool(
+            uid=uid, gid=gid, start=10000, size=1000
+        )
+        return
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        ph.check_worker_identity_outside_pool(
+            uid=uid, gid=gid, start=10000, size=1000
+        )
+    assert str(excinfo.value) == expected
+
+
+def test_the_resolver_applies_the_worker_identity_guard(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(os, "geteuid", lambda: 10005)
+    monkeypatch.setattr(os, "getegid", lambda: 10005)
+    _install(tmp_path, monkeypatch)
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        ph.resolve_priv_helpers(_settings(tmp_path))
+    assert str(excinfo.value) == (
+        "the sandbox uid pool 10000..10999 contains the worker's own uid "
+        "(10005): a sandbox would share the worker's identity and could read "
+        "every other sandbox's 0770 workspace (the group model relies on the "
+        "sandbox gid differing from the worker's); move "
+        "E2B_UID_POOL_START/SIZE off 10005"
+    )
+
+
+def test_remove_and_modes_are_in_process_first(tmp_path: Path, monkeypatch) -> None:
+    """c1 shrinks the broker's verb surface: the worker's own group access
+    handles ordinary trees, so no broker is needed (and none is configured
+    here)."""
+    tree = tmp_path / "sandboxes" / "sbx_a"
+    (tree / "workspace").mkdir(parents=True)
+    (tree / "workspace" / "a.txt").write_bytes(b"0123456789")
+    assert ph.dir_size(tree) == 10
+    ph.remove_tree(tree)
+    assert not tree.exists()
+
+
+def test_create_app_refuses_a_pool_that_contains_the_worker_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The guard is wired into startup for **every** worker shape (a root
+    worker's group model is just as load-bearing), so a bad pool fails the
+    worker with the reason instead of quietly shipping the hole."""
+    from envd_service.app import create_app
+    from envd_service.runtime.registry import RuntimeRegistry
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "getegid", lambda: 10050)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    settings = _settings(
+        tmp_path,
+        priv_helpers="off",
+        workspace_base=workspace,
+        uid_pool_start=10000,
+        uid_pool_size=1000,
+    )
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        create_app(settings=settings, runtime_registry=RuntimeRegistry(workspace))
+    assert str(excinfo.value) == (
+        "the sandbox gid pool 10000..10999 contains the worker's own gid "
+        "(10050): a sandbox would share the worker's identity and could read "
+        "every other sandbox's 0770 workspace (the group model relies on the "
+        "sandbox gid differing from the worker's); move "
+        "E2B_UID_POOL_START/SIZE off 10050"
+    )
 
 
 def test_the_broker_shape_requires_pooled_uids(tmp_path: Path, monkeypatch) -> None:

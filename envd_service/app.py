@@ -114,7 +114,7 @@ def _shared_volume_traversal_gaps(root: Path, uid: int) -> list[tuple[Path, int]
     """Directories between ``/`` and ``root`` that ``uid`` cannot traverse.
 
     Mode bits, not ``os.access``: the worker (and the gate) runs as root, and
-    root walks a 0700 directory finer than the sandbox uid ever could, so an
+    root walks a 0700/0770 directory finer than the sandbox uid ever could, so an
     access(2) probe would report the tenant's view as fine.
     """
     gaps: list[tuple[Path, int]] = []
@@ -232,6 +232,19 @@ def create_app(
     # either, the switch is auto-disabled and the worker keeps the
     # fixed-identity + Landlock model instead of crash-looping on EPERM.
     if settings.per_sandbox_uid and (os.geteuid() == 0 or brokers is not None):
+        # Fix round 1 (c1) hard guard: a sandbox tree is
+        # `0770 owner=<sandbox uid> group=<worker gid>` and the worker is a
+        # member of that group, so a sandbox allocated the worker's own uid or
+        # gid would be inside the worker's trust boundary (it could read every
+        # other sandbox's workspace). Refuse the configuration by name instead
+        # of shipping the hole -- for a root worker too, since the group model
+        # is what makes the shared tree safe.
+        priv_helpers.check_worker_identity_outside_pool(
+            uid=os.geteuid(),
+            gid=os.getegid(),
+            start=settings.uid_pool_start,
+            size=settings.uid_pool_size,
+        )
         if os.geteuid() == 0 and not has_effective_cap(CAP_SYS_PTRACE):
             # Writing a *child's* uid_map needs CAP_SETUID **and** ptrace access
             # to that child, so a root worker with a hardened capability set

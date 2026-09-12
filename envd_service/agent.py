@@ -217,8 +217,11 @@ def _delete_sandbox_runtime(
             fallback_mount_point=settings.workspace_base,
             via_agent=settings.quota_via_agent,
         )
-    # Broker-first (Track F): a sandbox workspace is owned by its own host uid
-    # at 0700, so a non-root worker can only remove it through e2b-maint.
+    # Broker-first (Track F): a sandbox workspace is `0770` owned by its own
+    # host uid with the worker's gid (fix round 1 / c1), so the worker's own
+    # group access normally deletes it in-process; e2b-maint is the fallback
+    # for trees that access cannot reach (sandbox-made 0700 subdirs, root-owned
+    # leftovers from before the cut-over).
     from envd_service import priv_helpers
 
     priv_helpers.remove_tree(workspace_dir)

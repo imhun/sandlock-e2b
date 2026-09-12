@@ -48,6 +48,11 @@ void priv_uid_pool(long *start, long *size);
 /* The uid-pool gate shared by every verb: pool membership, never uid 0. */
 int priv_validate_uid(long uid, char *err, size_t errlen);
 
+/* The chown group gate (fix round 1 / c1): a pooled uid, or the broker's own
+ * gid -- a sandbox tree is `0770 owner=<sandbox uid> group=<worker gid>`, and
+ * chgrp-to-own-gid is never a privilege widening. */
+int priv_gid_allowed(long gid, char *err, size_t errlen);
+
 /* realpath() + containment in <workspace_base>/ or <shared_volume_root>/.
  * `strict` additionally refuses the roots themselves (delete/chown must never
  * target a whole managed root). Returns 0 on success and writes the resolved

@@ -30,9 +30,10 @@ async def envs(request: Request) -> dict[str, str]:
 
 
 def _dir_size(path: Path) -> int:
-    # Track F: on a non-root worker the workspace belongs to the sandbox's own
-    # host uid at 0700, so the walk has to happen inside e2b-maint
-    # (CAP_DAC_OVERRIDE). Without it this silently reported 0 bytes.
+    # Track F / fix round 1 (c1): the workspace is `0770` owned by the
+    # sandbox uid with the worker's gid, so the worker's group access walks it
+    # in-process; priv_helpers falls back to e2b-maint for the trees that
+    # access cannot reach. Either way this no longer silently reports 0.
     from envd_service import priv_helpers
 
     brokered = priv_helpers.dir_size(path)

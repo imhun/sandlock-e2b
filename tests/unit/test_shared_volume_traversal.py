@@ -145,7 +145,7 @@ def test_ensure_shared_volume_root_applies_1777_and_covers_the_chain(tmp_path):
 
 
 def test_traversal_fixup_never_widens_the_sandbox_slice(tmp_path):
-    """It walks *upward* only: the per-sandbox slice stays 0700."""
+    """It walks *upward* only: the per-sandbox slice keeps its own bits."""
     volume = tmp_path / "vol_a"
     slice_dir = volume / "sbx_a"
     slice_dir.mkdir(parents=True)

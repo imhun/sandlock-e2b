@@ -52,7 +52,7 @@ def test_stack_worker_has_no_cap_add_and_declares_the_low_port_window() -> None:
         "      - SETUID      # e2b-slot-spawn: setuid(X) on the pooled host uid\n"
         "      - SETGID      # e2b-slot-spawn: setgroups([]) + setgid(X)\n"
         "      - CHOWN       # e2b-maint: workspace/slice ownership + slot documents\n"
-        "      - DAC_OVERRIDE  # e2b-maint: tenant 0700 trees (walk/rm/chown)\n"
+        "      - DAC_OVERRIDE  # e2b-maint: rm/walk fallback for trees group access misses\n"
         in worker
     )
     # Negative form: no NNP directive can be added to the security_opt list.

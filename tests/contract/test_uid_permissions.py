@@ -198,16 +198,21 @@ async def test_volume_shared_rw_across_distinct_uids(make_apps, workspace):
         )
         assert (vol_path / "a.txt").is_file()
 
-    # Host side: workspaces are owned by their distinct allocated uids with
-    # 0700 (kernel isolation), and the shared volume root keeps 1777.
+    # Host side: workspaces are `0770` owned by their distinct allocated uids
+    # with the worker's gid as the group (fix round 1 / c1: the worker is the
+    # data-plane owner), and the shared volume root keeps 1777.
     assert (vol_path).stat().st_uid == ra.host_uid
     assert stat.S_IMODE((vol_path).stat().st_mode) == 0o1777
     ws_a = Path(ra.workspace_dir)
     ws_b = Path(rb.workspace_dir)
     assert ws_a.stat().st_uid == ra.host_uid
     assert ws_b.stat().st_uid == rb.host_uid
-    assert stat.S_IMODE(ws_a.stat().st_mode) == 0o700
-    assert stat.S_IMODE(ws_b.stat().st_mode) == 0o700
+    assert stat.S_IMODE(ws_a.stat().st_mode) == 0o770
+    assert stat.S_IMODE(ws_b.stat().st_mode) == 0o770
+    assert (ws_a.stat().st_gid, ws_b.stat().st_gid) == (
+        os.getegid(),
+        os.getegid(),
+    )
 
 
 async def test_agent_uid_lifecycle_and_orphan_reconcile(make_apps, workspace):
@@ -231,7 +236,8 @@ async def test_agent_uid_lifecycle_and_orphan_reconcile(make_apps, workspace):
         assert record.host_uid == POOL_START
         ws = Path(record.workspace_dir)
         assert ws.stat().st_uid == POOL_START
-        assert stat.S_IMODE(ws.stat().st_mode) == 0o700
+        assert ws.stat().st_gid == os.getegid()
+        assert stat.S_IMODE(ws.stat().st_mode) == 0o770
         persisted = json.loads((ws / "sandbox.json").read_text(encoding="utf-8"))
         assert persisted["host_uid"] == POOL_START
 
