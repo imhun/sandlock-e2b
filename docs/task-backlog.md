@@ -1,9 +1,10 @@
 # 任务总清单（路线图）
 
-汇总 2026-08-31 ~ 09-02 分析产生的待办。**状态最后更新：2026-09-11（Track F / Task F1
-收口：非 root worker 用两个 file-capability broker 拿到 per-sandbox host uid + route-B；
-此前 2026-09-08 F15 收口、FUP-01/07/09/10/15/17 台账关闭，见 fork
-`docs/fork-plan-followups.md`）**
+汇总 2026-08-31 ~ 09-02 分析产生的待办。**状态最后更新：2026-09-12（线上 Track C
+上线：非 root worker 形态 + uid 段拆分已在目标机生效，四条线上测试全绿；同轮修复并
+上线两条产品缺陷 —— 卷/沙箱记录共用 `e2b:record:` 命名空间（见 #26）与非 root 卷根
+chmod 顺序（见 #27）。此前 2026-09-11 Track F / F1 收口、2026-09-08 F15 收口、
+FUP-01/07/09/10/15/17 台账关闭，见 fork `docs/fork-plan-followups.md`）**
 （细粒度执行记录见 `.superpowers/sdd/progress.md`，两阶段总路线见
 `docs/superpowers/plans/2026-09-01-sandlock-e2b-completion-roadmap.md`）。
 
@@ -551,3 +552,49 @@ ACR 镜像推送照常，git 远程推送暂缓。
    共用同一 `sandbox-shared` 卷却**都没设不重叠的 uid 段** ⇒ 升级前必须先用新 wheel
    `build-and-push`，并配 `E2B_UID_POOL_START/SIZE`。逐条数据见 HANDOFF
    「特权最小集实测 + 线上就绪审计」。
+
+26. **卷记录与沙箱记录共用 `e2b:record:` 命名空间（2026-09-12 线上实测；当日修复上线）**:
+   ✅ **已修复**（commit `1b990f5`；修复镜像 tag `0.1.0-230-g8b01839-20260912-153947`）。
+   **根因**：`RedisRecordStore` 把记录写成 `e2b:record:<id>`，而沙箱注册表
+   （`registry/manager.py`）与卷注册表（`registry/volumes.py`）**用同一个 namespace**
+   （都是 `"e2b"`）。沙箱侧的 `list()` / `tenant_usage()` / `remove_expired()` 都遍历
+   `_record_store.keys()` 并把每个 payload 当沙箱记录解析，卷记录没有 `template_id`
+   ⇒ `SandboxRecord.from_storage_dict` 抛 `KeyError`，只捕 `UnknownSandboxError` 的
+   调用方全部穿透。
+   **影响面（线上实测，非纸面）**：只要线上存在**任意一个卷**（非 tombstone），
+   ① `GET /sandboxes`、`GET /v2/sandboxes`、`GET /internal/tenants` 返回 **500**；
+   ② TTL 回收线程（`registry/ttl.py`，1s 间隔）每次扫描都抛
+   `KeyError: 'template_id'` ⇒ **过期沙箱永不被自动回收**（容量/配额静默泄漏），
+   显式 kill 不受影响。旧镜像（`0.1.0-20260830-191728`）里是同一段代码
+   （已直读旧镜像文件确认）⇒ 不是本次升级引入，只是旧部署没有卷记录所以从未触发；
+   回滚并不能修复它。
+   **修法**：**保留 key 形态、读取侧按类型过滤 + 容忍缺字段**（不需要清空 Redis、
+   不需要迁移）。沙箱/卷记录各自写 `kind` 标签；`manager._is_sandbox_record_payload`
+   对**没有标签的旧记录**退回用 `sandbox_id`/`volume_id` 形状判定，
+   `get()`/枚举路径对不可解析的记录记名跳过而不是抛出。
+   **证据日志**：缺陷复现 `tmp/c2c3-33-defect1-repro.log`、因果实验（建卷→500+计数增长、
+   销毁→200+冻结）`tmp/c2c3-35-defect1-verify.log`、本地 RED→GREEN
+   `tests/unit/test_record_namespace_isolation.py`（列表/租户用量/TTL 三条路径 ×
+   只有卷/只有沙箱/两者都有/旧格式 四种组合 + 两个列表端点 + sweeper），
+   线上复验 `tmp/c2c3-46-c21-regress.log`（有卷时三端点 200、短 TTL 沙箱
+   ~6s 被回收、sweeper 0 失败 / 0 KeyError）。
+
+27. **非 root worker 上卷根 `chmod 1777` 必 EPERM（2026-09-12 线上实测；当日修复上线）**:
+   ✅ **已修复**（commit `8b01839`；同一 tag `0.1.0-230-g8b01839-20260912-153947`）。
+   **根因**：`envd_service/volumes.py::_ensure_shared_volume_root` 先
+   `_chown_path`（经 `e2b-maint` broker 把卷根交给首个挂载沙箱的 uid）**再**
+   `os.chmod(root, 0o1777)`；chown 之后 worker 既不是属主也没有 `CAP_FOWNER`，
+   chmod 必然 EPERM——与 c1 工作区修复里「chmod 必须先于 chown」是同一条纪律。
+   **影响面**：每个卷 × 每个 worker 一条
+   `cannot apply shared perms to volume root …: [Errno 1] Operation not permitted`
+   WARNING（日志噪声）；**实测无功能影响**——卷根由控制面以 root 创建时就已经是
+   `1777`（`registry/volumes.py:191`），两个不同 uid 的沙箱仍都能写入同一卷。
+   **修法**：chmod 提到 chown 之前、且仅在 mode ≠ 1777 时才尝试；失败降级为 DEBUG，
+   只有**最终** mode 仍不对才 WARNING（best-effort 语义不变，噪声消失、
+   真故障仍会点名）。
+   **证据日志**：线上 WARNING 取证 `tmp/c2c3-36-defect2-verify.log`、
+   权限结果实测（两个 uid 都能写、卷根 1777）`tmp/c2c3-37-defect2-uid.log`、
+   本地 RED→GREEN `tests/unit/test_shared_volume_traversal.py`
+   （模拟非 root worker：chown 之后的 chmod 是 EPERM，钉住顺序与"已 1777 不吭声"），
+   上线后复验 `tmp/c2c3-53-volume-perms-online.log` + `tmp/c2c3-54-volume-warn-recheck.log`
+   （挂载后 WARNING 计数 0）。
