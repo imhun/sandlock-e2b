@@ -22,6 +22,7 @@ from envd_service.http.auth import HttpAuthError, http_error_response
 from envd_service.http.files import router as files_router
 from envd_service.http.health import router as health_router
 from envd_service.http.mcp import router as mcp_router
+from envd_service.quota_agent import wait_for_startup_readiness
 from envd_service.quota_maintenance import QuotaMonitor
 from envd_service.rpc import register_rpc
 from envd_service.runtime.context import SandboxRuntimeContext
@@ -81,12 +82,7 @@ async def _warm_base_image(settings: Settings) -> None:
 async def _startup_reconcile(settings: Settings) -> None:
     """Reconcile quota table vs sandbox.json records once at worker startup."""
     try:
-        result = await asyncio.to_thread(
-            reconcile_orphan_projects,
-            workspace_base=settings.workspace_base,
-            mount_point=settings.workspace_base,
-            via_agent=settings.quota_via_agent,
-        )
+        result = await asyncio.to_thread(_startup_reconcile_once, settings)
     except ProjectQuotaError as exc:
         logger.warning("startup quota reconciliation skipped: %s", exc)
         return
@@ -94,6 +90,22 @@ async def _startup_reconcile(settings: Settings) -> None:
         "startup quota reconciliation: cleaned=%s skipped=%s",
         result.get("cleaned"),
         result.get("skipped"),
+    )
+
+
+def _startup_reconcile_once(settings: Settings) -> dict:
+    """One blocking startup reconcile pass (the thread target).
+
+    W6: the bounded quota-agent readiness wait runs first and on the same
+    worker thread, so a worker that started before the agent did does not
+    record the race as a degraded reconciliation — and the wait can never
+    block the event loop or the heartbeat loop.
+    """
+    wait_for_startup_readiness(settings.workspace_base)
+    return reconcile_orphan_projects(
+        workspace_base=settings.workspace_base,
+        mount_point=settings.workspace_base,
+        via_agent=settings.quota_via_agent,
     )
 
 

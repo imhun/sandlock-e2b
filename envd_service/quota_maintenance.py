@@ -20,6 +20,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from envd_service.quota_agent import wait_for_startup_readiness
 from envd_service.xfs_quota import ProjectQuotaError, project_quota_table, xfs_project_supported
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,16 @@ class QuotaMonitor:
             "disk_used_ratio": None,
         }
         if self._quota_supported is None:
+            # W6: this is a *startup* probe, so a worker that came up before
+            # quota-agent did waits here (bounded) instead of recording the
+            # race as a degrade. The verdict used to be cached as "quota is
+            # unavailable" for the whole process lifetime, which silently
+            # turned the race into permanently missing quota monitoring; with
+            # the wait, ``xfs_project_supported`` sees a ready agent and still
+            # reports (and logs) a genuine unsupported/degraded filesystem.
+            # The wait is a no-op for the direct form (no hook wired) and runs
+            # on this scan's worker thread, never on the event loop.
+            wait_for_startup_readiness(self._mount_point)
             self._quota_supported = xfs_project_supported(
                 self._mount_point, via_agent=self._via_agent
             )[0]

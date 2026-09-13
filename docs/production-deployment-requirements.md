@@ -108,9 +108,9 @@ root worker 同样检查）。
 **顺序**：`chmod` 必须**先于** `chown`（chown 之后 worker 不再属主，再 chmod 会 EPERM；
 broker 刻意不带 `CAP_FOWNER`，root 形态看不出这个顺序，非 root 必踩）。
 
-**接受的边界（fix round 2 判定，2026-09-12）**：worker 是用**属组权限**访问托管目录的，
-所以**沙箱自己把条目收紧到 `0600`/`0700`** 时，platforms 侧读不到它
-（`sbx.files.read` 会 EACCES；root 形态没有这个限制——它靠 `DAC_OVERRIDE`）。
+**接受的边界（fix round 2 判定，2026-09-12；W6 定读数语义，2026-09-13）**：worker 是用
+**属组权限**访问托管目录的，所以**沙箱自己把条目收紧到 `0600`/`0700`** 时，platforms 侧
+读不到它（`sbx.files.read` 会 EACCES；root 形态没有这个限制——它靠 `DAC_OVERRIDE`）。
 实测（非 root 栈，`tmp/f1/f1-c1-locked-file-probe.log`）：沙箱内
 `chmod 600 /home/user/locked.txt` 后，沙箱自己 `cat` 得到内容、`sbx.files.list` 正常、
 `/metrics` 目录扫描正常、`sbx.files.remove` 成功（删除只需要目录写权限），
@@ -119,8 +119,28 @@ broker 刻意不带 `CAP_FOWNER`，root 形态看不出这个顺序，非 root �
 `tests/security/*` 全量 grep `chmod|0600|permission` 只有"沙箱给自己文件加可执行位"
 与宿主侧 marker 两类）⇒ **接受该边界**，不为此给 broker 加通用 `read/write` 动词。
 删/扫由 worker 自己（属组）或 `e2b-maint rm/walk` 兜底。
-follow-up（一句）：若将来出现"worker 必须读沙箱自建 `0600` 文件"的需求，走**该沙箱自己的
-route-B 槽位**读回（槽位就是 uid X、本来就能读自己的文件），槽位不可用时明确返回"不可读"。
+
+**W6 读数语义（不是"塌成空体"，也不是 500）**：该边界是**部署形态的永久属性**（非 root
+worker 永远拿不到别人的 `0600`），所以它必须作为**明确的客户端可见错误**表达，而不是伪装成
+平台故障。实现（`envd_service/http/files.py`）：
+
+| 形状 | W6 之前（实测，非 root 栈） | W6 之后 |
+|---|---|---|
+| `0600` 文件（worker 读被拒） | `500` + 裸 errno：SDK 抛 `SandboxException("500: [Errno 13] Permission denied: '/var/lib/…/locked.txt'")` —— 看起来像平台坏了，调用方无从下手 | `403`，`message = "Path <p> is not readable: <原因> ([Errno 13] …)"` |
+| 文件在沙箱自建的 `0700` 父目录下（`stat` 被拒） | 同上（`500` + 裸 errno；`pathlib` 只吞 `ENOENT/ENOTDIR/ELOOP`，`EACCES` 照抛） | 同上 `403` |
+| 路径确实不存在 | `404 {"message": "Path <p> not found"}`（不变） | 不变 |
+| 路径存在但不是普通文件（目录等） | `404`（不变） | 不变（仍 `404`；读目录不在本项范围内） |
+
+原因文案点名**沙箱自建的私有权限**（`0600`/`0700` / `0700` 父目录）、说明 worker 用属组身份
+读，并给出两条出路：**在沙箱内部读**（`cat` 等），或**放宽该条目权限**。`403` 是 Connect
+协议里 `permission_denied` 的 HTTP 映射（`gateway_common/errors.py`），SDK 侧表现为
+`SandboxException("403: <message>")`：状态与文案都指向"条目权限"，不再指向"平台 500"。
+回归钉在 `tests/contract/test_files_private_entries.py`（RED：HEAD 两形状都是 `500 ≠ 403`；
+GREEN：两者都是 `403` + 逐字文案）。
+
+follow-up（一句，仍未做）：若将来出现"worker 必须**读成功**沙箱自建 `0600` 文件"的需求，走
+**该沙箱自己的 route-B 槽位**读回（槽位就是 uid X、本来就能读自己的文件），槽位不可用时仍
+按上表返回明确的"不可读"（`403`），不得退化成空体或 500。
 
 要求与影响（逐条对照）：
 
@@ -294,6 +314,16 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
   `E2B_QUOTA_AGENT_PATH_MAP`（外置 agent 时不要开 `QUOTA_AGENT_PROFILE`）。
   `deploy/k8s/worker.yaml` 已不再声明 `SYS_ADMIN`（把 `E2B_QUOTA_AGENT_URL` 指向集群内或
   外部的 agent；k8s 的共享卷是 RWX PVC，走 NFS 时本地直连本来就不可能）。
+- **启动竞态（W6）**：worker 与 quota-agent 同一次 rollout，但**不同容器**，worker 完全可能
+  先起。启动探针（`QuotaMonitor` 的首次扫描 + 启动期 orphan 对账）现在先做一次**有界**
+  就绪等待（`quota_agent.wait_for_startup_readiness`：8 次 × 2.5s ≈ 最多 17.5s，两处共用一个
+  判定），三种结论**分开表达**：URL 为空 ⇒ 不等待、保留原来的显式 WARNING
+  （`quota-agent not configured`）；只是还没起来 ⇒ 重试，成功后在 **INFO** 里说明最终结果
+  （`quota-agent answered on startup attempt N/8`）；窗口耗尽仍不可达 ⇒ INFO 记最终结果 +
+  调用点照常打原来的 WARNING ⇒ **真降级不会被掩盖**。等待跑在 worker 线程上（监控扫描线程 /
+  启动对账线程），**不阻塞事件循环与心跳循环**；建箱路径的探针**不做**这种等待（它不能为了
+  等 agent 而拖住请求，单个沙箱拿不到限额本身就是要暴露的真降级）。回归钉在
+  `tests/unit/test_quota_agent_startup_race.py`。
 - **降级语义（不变）**：agent 不可达/401/协议错误 ⇒ `ProjectQuotaError` ⇒ **建箱与挂卷成功、
   无 per-sandbox 限额 + WARNING**。agent 形态不会在 worker 上执行任何本地配额命令，回归钉在
   `tests/unit/test_xfs_project_quota_agent.py::test_agent_form_never_shells_out_to_a_local_quota_tool`。

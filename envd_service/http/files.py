@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import stat
 import uuid
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,42 @@ from gateway_common.upload import (
 )
 
 router = APIRouter()
+
+#: W6: the deployed worker is not root, so it reaches managed entries through
+#: its **group** identity. An entry the sandbox itself restricted to
+#: ``0600``/``0700`` (or a ``0700`` parent directory) is therefore out of the
+#: worker's reach, and that is a permanent property of the deployment shape,
+#: not a transient worker fault — so the read answers ``403`` with this
+#: reason instead of a ``500`` carrying the raw errno text (which the SDK
+#: reports as ``SandboxException("500: [Errno 13] Permission denied: ...")``
+#: — the shape the F1 probe measured on the non-root stack, i.e. a platform
+#: fault to the caller's eyes, with nothing to act on). Root workers are
+#: unaffected (``CAP_DAC_OVERRIDE``); the remedy is to read the entry from
+#: inside the sandbox or to relax that entry's mode.
+SANDBOX_PRIVATE_ENTRY_REASON = (
+    "the sandbox made this entry private (0600/0700, or a 0700 parent "
+    "directory): the worker reads sandbox files with its group identity, so "
+    "the entry is out of its reach; read it from inside the sandbox or relax "
+    "that entry's mode"
+)
+
+
+def _read_error(path: str, exc: OSError) -> HttpAuthError:
+    """Map a failed read/stat onto the answer the client can act on (W6).
+
+    ``ENOENT``/``ENOTDIR`` stay ``404`` (the path is not there), a permission
+    failure becomes ``403`` naming the sandbox-private cause, and everything
+    else remains a worker-side ``500``.
+    """
+    if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+        return HttpAuthError(404, f"Path {path} not found")
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        return HttpAuthError(
+            403,
+            f"Path {path} is not readable: {SANDBOX_PRIVATE_ENTRY_REASON} "
+            f"({exc})",
+        )
+    return HttpAuthError(500, str(exc))
 
 
 def _resolve_or_error(ops: FilesystemOps, path: str) -> Path:
@@ -88,9 +126,21 @@ async def download_file(
     ops = FilesystemOps(runtime.workspace_dir)
     try:
         target = _resolve_or_error(ops, path)
-        if not target.is_file():
+        try:
+            # ``stat`` first so the mapping can tell "not there" (404) from
+            # "there but out of the worker's reach" (403): ``is_file()``
+            # re-raises EACCES (pathlib only ignores ENOENT/ENOTDIR/E*LOOP),
+            # so an unsearchable 0700 parent used to surface as a bare 500
+            # just like the read denial did.
+            entry = target.stat()
+        except OSError as exc:
+            raise _read_error(path, exc) from exc
+        if not stat.S_ISREG(entry.st_mode):
             raise HttpAuthError(404, f"Path {path} not found")
-        data = target.read_bytes()
+        try:
+            data = target.read_bytes()
+        except OSError as exc:
+            raise _read_error(path, exc) from exc
     except HttpAuthError as e:
         return http_error_response(request, e)
     except OSError as e:

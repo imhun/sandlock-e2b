@@ -41,15 +41,29 @@ non-dict payload or missing fields — raises :class:`ProjectQuotaError`. The
 existing quota call sites already catch that and degrade with a warning, so
 an unreachable or rejecting agent never blocks sandbox create/delete or
 volume mounts.
+
+W6 adds a **bounded startup readiness wait** around the first quota probes
+(:func:`wait_for_startup_readiness`): the worker and quota-agent are separate
+containers in one rollout, so the worker's startup probes can run before the
+agent serves. That ordering used to be recorded as a degrade — and the
+``QuotaMonitor`` caches the failed verdict for the process lifetime — so the
+wait tells "not up yet" (retried, reported at INFO) apart from "not
+configured" (``E2B_QUOTA_AGENT_URL`` empty, which keeps its explicit
+WARNING). An agent that is still absent when the window runs out keeps the
+ordinary WARNING too: a real degrade is never hidden.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from pathlib import Path
 from typing import Any, Callable
 
 import httpx
 
+from envd_service import xfs_quota
 from envd_service.xfs_quota import (
     ProjectQuotaError,
     _probe_free_projid,
@@ -61,6 +75,23 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_S = 5.0
 _INTERNAL_KEY_HEADER = "X-Internal-Key"
+
+#: W6: size of the bounded startup readiness window — ``attempts`` probes
+#: spaced ``delay_s`` apart (8 x 2.5s = at most 17.5s of waiting).
+STARTUP_READY_ATTEMPTS = 8
+STARTUP_READY_DELAY_S = 2.5
+
+#: Test seam for the retry's sleep: the window can be made instant without
+#: touching the policy under test.
+_sleep = time.sleep
+
+#: Verdict cache keyed on the *wired hook object* (``xfs_quota.agent_query``).
+#: The two startup probes of one worker (the quota monitor's first scan and
+#: the startup reconcile) therefore share one bounded wait instead of each
+#: burning its own, while a freshly configured client — a new app in tests, a
+#: restarted worker in production — re-arms the window.
+_startup_gate_lock = threading.Lock()
+_startup_gate: tuple[object, tuple[str, str | None]] | None = None
 
 
 def _response_error(response: httpx.Response) -> str:
@@ -277,3 +308,76 @@ def configure_quota_agent_client(
     configure_agent_ops(client.agent_ops())
     logger.info("quota-agent configured at %s", client._base_url)
     return client
+
+
+def wait_for_startup_readiness(
+    mount_point: str | Path,
+    *,
+    attempts: int = STARTUP_READY_ATTEMPTS,
+    delay_s: float = STARTUP_READY_DELAY_S,
+) -> tuple[str, str | None]:
+    """Wait (bounded) for quota-agent before a startup quota probe runs.
+
+    Three conclusions, told apart on purpose so a startup race cannot be
+    mistaken for a missing deployment (W6):
+
+    * ``("unconfigured", None)`` — ``E2B_QUOTA_AGENT_URL`` is empty, so no
+      hook is wired. Nothing to wait for, and the unconfigured form keeps its
+      existing explicit WARNING ("quota-agent not configured").
+    * ``("ready", None)`` — the agent answered (logged at INFO when it took
+      more than one attempt, i.e. when a race was actually absorbed).
+    * ``("unreachable", reason)`` — still nothing after the whole window. The
+      outcome is reported at INFO with the reason and the caller's own probe
+      then logs the ordinary WARNING, so a real degrade stays visible.
+
+    Bounded by construction — at most ``attempts`` probes spaced ``delay_s``
+    apart — and never raises; callers run it on a worker thread so it cannot
+    block the event loop or the heartbeat loop.
+    """
+    hook = xfs_quota.agent_query
+    if hook is None:
+        return ("unconfigured", None)
+    attempts = max(1, int(attempts))
+    global _startup_gate
+    with _startup_gate_lock:
+        if _startup_gate is not None and _startup_gate[0] is hook:
+            return _startup_gate[1]
+        verdict = _run_startup_window(
+            hook, mount_point, attempts=attempts, delay_s=delay_s
+        )
+        _startup_gate = (hook, verdict)
+        return verdict
+
+
+def _run_startup_window(
+    hook: Callable[[str], dict[str, Any]],
+    mount_point: str | Path,
+    *,
+    attempts: int,
+    delay_s: float,
+) -> tuple[str, str | None]:
+    reason = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            hook(str(mount_point))
+        except Exception as exc:
+            reason = str(exc) or exc.__class__.__name__
+            if attempt < attempts:
+                _sleep(delay_s)
+        else:
+            if attempt > 1:
+                logger.info(
+                    "quota-agent answered on startup attempt %d/%d: the "
+                    "startup probe is no longer racing the agent",
+                    attempt,
+                    attempts,
+                )
+            return ("ready", None)
+    logger.info(
+        "quota-agent unreachable after %d startup attempt(s) over %.1fs: %s; "
+        "the startup probe now records its own WARNING",
+        attempts,
+        (attempts - 1) * delay_s,
+        reason,
+    )
+    return ("unreachable", reason)
