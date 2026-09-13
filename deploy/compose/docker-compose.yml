@@ -1,8 +1,10 @@
 services:
   # Z-F7 C1: control plane (root) and worker (65534) share this cache, so it is
   # created once with the worker's ownership -- never world-writable (a
-  # writable rootfs cache lets a sandbox poison another sandbox's image). See
-  # docs/production-deployment-requirements.md §2.7.1.
+  # writable rootfs cache lets a sandbox poison another sandbox's image) -- and
+  # the ownership is *verified*, so an init that cannot chown (NFS root_squash)
+  # fails loudly instead of leaving a root-owned cache that makes every image
+  # resolve fail later. See docs/production-deployment-requirements.md §2.7.1.
   image-cache-init:
     build:
       context: ../..
@@ -10,10 +12,23 @@ services:
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - >-
-        mkdir -p /var/lib/e2b-sandboxes/_images/_oci &&
-        chown -R 65534:65534 /var/lib/e2b-sandboxes/_images &&
-        chmod 0755 /var/lib/e2b-sandboxes/_images /var/lib/e2b-sandboxes/_images/_oci
+      - |-
+        set -e
+        for dir in $$CACHE_DIRS; do
+          mkdir -p "$$dir/_oci"
+          chmod 0755 "$$dir" "$$dir/_oci" 2>/dev/null || true
+          chown -R 65534:65534 "$$dir" 2>/dev/null ||
+          echo "image-cache-init: chown refused ($$dir, NFS root_squash?) -- verifying the owner instead"
+          owner="$$(stat -c %u "$$dir")"
+          if [ "$$owner" != "65534" ]; then
+            echo "image-cache-init: FATAL: $$dir is owned by uid $$owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown -R 65534:65534 $$dir" >&2
+            exit 1
+          fi
+          echo "image-cache-init: $$dir is owned by uid 65534"
+        done
+    environment:
+      CACHE_DIRS: /var/lib/e2b-sandboxes/_images
     volumes:
       - sandbox-data:/var/lib/e2b-sandboxes
     restart: "no"

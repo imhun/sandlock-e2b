@@ -17,7 +17,14 @@ volume), so two things hold beyond the in-process lock:
 * the cache is bounded: completed entries beyond
   ``E2B_IMAGE_CACHE_MAX_BYTES`` are evicted oldest-first by
   :func:`prune_image_cache`, which is also what keeps an unlimited-project
-  shared directory from quietly filling the volume.
+  shared directory from quietly filling the volume. That bound only has
+  something to reclaim while the reference pins are *provably* complete: a
+  workspace base that cannot be listed, or a ``sandbox.json`` that cannot be
+  read, refuses the eviction pass instead of guessing (Z-F7 follow-up F2/F3).
+  The locally built ``_oci/*.oci.tar`` layouts -- the only copy of a
+  no-registry template -- are counted towards the bound but are never evicted
+  by it; they have their own opt-in bound,
+  ``E2B_IMAGE_CACHE_OCI_MAX_BYTES`` + ``E2B_IMAGE_CACHE_OCI_STALE_S``.
 
 The directory is *shared by processes running as different uids* in the shipped
 manifests (the control plane runs as root, the workers as 65534), so everything
@@ -46,6 +53,7 @@ from pathlib import Path
 
 import tarfile
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Iterator
 
 from envd_service.runtime.oci_registry import (
@@ -197,6 +205,22 @@ def _cache_owner_ids(path: Path) -> tuple[int, int] | None:
     return None
 
 
+def _cache_repair_command(path: Path) -> str:
+    """The one-time repair an operator runs when the cache owner is wrong.
+
+    The shared cache belongs to the worker uid, and the worker cannot fix a
+    directory that another uid owns (no ``CAP_CHOWN`` in either shipped shape).
+    Every failure that shape produces therefore quotes the *same* command, with
+    the uid spelled out when it can be determined and a placeholder when it
+    cannot (a volume whose root is root-owned too, i.e. nothing to infer from).
+    """
+    owner = _cache_owner_ids(path)
+    descriptor = (
+        f"{owner[0]}:{owner[1]}" if owner is not None else "<worker-uid>:<worker-gid>"
+    )
+    return f"chown -R {descriptor} {path}"
+
+
 def _ensure_shared_dir(path: Path) -> None:
     """``mkdir -p`` a cache directory the shared-cache contract allows.
 
@@ -205,20 +229,22 @@ def _ensure_shared_dir(path: Path) -> None:
     when this process runs as root the directory is handed to the cache owner;
     the mode is re-asserted every time, which also tightens a directory a
     previous deployment left at 0777.
+
+    This does not -- and cannot cheaply -- *verify* writability:
+    ``mkdir(exist_ok=True)`` succeeds on an existing directory whatever its
+    owner, and only a real write can tell. That is why every write the resolver
+    performs reports its own failure with the repair command (the lock file,
+    the staging tree, the sidecar): a root-owned ``_images`` therefore ends in
+    an actionable error instead of a bare ``PermissionError`` (Z-F7 follow-up,
+    the NFS ``root_squash`` shape).
     """
     try:
         path.mkdir(mode=_SHARED_DIR_MODE, parents=True, exist_ok=True)
     except OSError as e:
-        owner = _cache_owner_ids(path)
-        hint = (
-            f"chown -R {owner[0]}:{owner[1]} {path}"
-            if owner is not None
-            else f"chown -R <worker-uid>:<worker-gid> {path}"
-        )
         raise ImageResolutionError(
             f"shared image cache directory {path} is not usable by uid "
             f"{os.geteuid()}: {e} (it belongs to the worker uid that owns the "
-            f"volume; fix it once with `{hint}` as root)"
+            f"volume; fix it once with `{_cache_repair_command(path)}` as root)"
         ) from e
     if os.geteuid() == 0:
         owner = _cache_owner_ids(path)
@@ -282,21 +308,18 @@ def _open_lock_file(lock_path: Path) -> int:
         if not lock_path.exists():
             raise ImageResolutionError(
                 f"shared image cache directory {lock_path.parent} is not "
-                f"writable by uid {os.geteuid()}: {e}"
+                f"writable by uid {os.geteuid()}: {e} (the cache must belong to "
+                f"the worker uid; fix it once with "
+                f"`{_cache_repair_command(lock_path.parent)}` as root)"
             ) from e
         try:
             fd = os.open(lock_path, os.O_RDONLY | os.O_CLOEXEC)
         except OSError as read_only_error:
-            descriptor = (
-                f"{owner[0]}:{owner[1]}"
-                if owner is not None
-                else "<worker-uid>:<worker-gid>"
-            )
             raise ImageResolutionError(
                 f"cannot open the image cache lock {lock_path}: "
                 f"{read_only_error} (uid {os.geteuid()} can neither write nor "
-                f"read it; fix it once with `chown -R {descriptor} "
-                f"{lock_path.parent}` as root)"
+                f"read it; fix it once with "
+                f"`{_cache_repair_command(lock_path.parent)}` as root)"
             ) from read_only_error
     except OSError as e:
         raise ImageResolutionError(
@@ -378,10 +401,24 @@ def _stage_entry(cache_dir: Path, entry_name: str) -> Path:
     The name carries this process's pid, so a tree left behind by a ``SIGKILL``
     can be attributed to its creator: only a tree carrying *our* pid -- or one
     that is older than the staleness threshold -- is ever reclaimed.
+
+    ``mkdtemp`` is also the first *write* the resolver performs inside the
+    cache, so a failure here means the cache is not writable by this uid: the
+    error says so and quotes the repair command instead of leaking a bare
+    ``PermissionError`` (the shape a root-owned ``_images`` produced when the
+    control plane created it first -- Z-F7 C1 / follow-up).
     """
-    staging = Path(
-        tempfile.mkdtemp(prefix=f".{entry_name}.tmp-{os.getpid()}-", dir=cache_dir)
-    )
+    try:
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{entry_name}.tmp-{os.getpid()}-", dir=cache_dir)
+        )
+    except OSError as e:
+        raise ImageResolutionError(
+            f"shared image cache directory {cache_dir} is not writable by uid "
+            f"{os.geteuid()}: {e} (a staging tree for {entry_name} cannot be "
+            f"created there; fix the ownership once with "
+            f"`{_cache_repair_command(Path(cache_dir))}` as root)"
+        ) from e
     _ensure_shared_dir(staging)
     _register_staging(staging)
     return staging
@@ -654,6 +691,21 @@ _MIN_EVICT_MIN_AGE_S = 60.0
 #: ``0`` disables age-based reclamation (only this process's own leftovers go).
 _CACHE_STAGING_STALE_ENV = "E2B_IMAGE_CACHE_STAGING_STALE_S"
 _DEFAULT_STAGING_STALE_S = 3600.0
+#: ``E2B_IMAGE_CACHE_OCI_MAX_BYTES``: a bound for the locally built OCI layout
+#: tars (``_oci/*.oci.tar``), which the entry bound above deliberately never
+#: evicts. With no registry configured a tar is the *only* copy of that image
+#: on this node, so the default is 0 = keep every tar and size the volume for
+#: the templates the node builds. Setting a bound opts in to reclaiming the
+#: tars that are provably safe to drop: older than
+#: ``E2B_IMAGE_CACHE_OCI_STALE_S`` (so a build in flight is never touched) and
+#: not named by any ``sandbox.json`` on the volume. Reclaiming one costs a
+#: template re-export (``Template.build`` writes the tar again) before the next
+#: cold create of that image on this node, which is why it is never the default
+#: and why every reclamation is logged at WARNING with the tar's path and age.
+_CACHE_OCI_MAX_BYTES_ENV = "E2B_IMAGE_CACHE_OCI_MAX_BYTES"
+_DEFAULT_OCI_MAX_BYTES = 0
+_CACHE_OCI_STALE_ENV = "E2B_IMAGE_CACHE_OCI_STALE_S"
+_DEFAULT_OCI_STALE_S = 86400.0
 #: The cap only matters on the scale of minutes, and the walk is O(cache): do
 #: it at most this often per process.
 _PRUNE_INTERVAL_S = 60.0
@@ -721,6 +773,38 @@ def _staging_stale_s() -> float:
             raw,
         )
         return _DEFAULT_STAGING_STALE_S
+
+
+def _oci_max_bytes() -> int:
+    """``E2B_IMAGE_CACHE_OCI_MAX_BYTES``; ``0`` (the default) keeps every tar."""
+    raw = os.environ.get(_CACHE_OCI_MAX_BYTES_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_OCI_MAX_BYTES
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "ignoring invalid %s=%r (expected bytes, 0 = keep every OCI layout tar)",
+            _CACHE_OCI_MAX_BYTES_ENV,
+            raw,
+        )
+        return _DEFAULT_OCI_MAX_BYTES
+
+
+def _oci_stale_s() -> float:
+    """``E2B_IMAGE_CACHE_OCI_STALE_S``; ``0`` disables the ``_oci`` pass."""
+    raw = os.environ.get(_CACHE_OCI_STALE_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_OCI_STALE_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "ignoring invalid %s=%r (expected seconds, 0 = never reclaim)",
+            _CACHE_OCI_STALE_ENV,
+            raw,
+        )
+        return _DEFAULT_OCI_STALE_S
 
 
 def _cache_lock_timeout_s() -> float:
@@ -794,8 +878,43 @@ def _workspace_bases(cache_dir: Path) -> list[Path]:
     return bases
 
 
-def _referenced_entry_pins(cache_dir: Path) -> tuple[set[str], set[str], int]:
-    """``(pinned entry names, pinned image slugs, records read)``.
+@dataclass(frozen=True)
+class _ReferenceScan:
+    """What the volume's ``sandbox.json`` records pin, and what could not be read.
+
+    ``entries`` / ``slugs`` are the *pins*: cache entries a live sandbox
+    chroots into and that eviction must never touch. ``image_slugs`` is every
+    image some record names, digest recorded or not, which is what the
+    separately bounded ``_oci`` layout tars are keyed by.
+
+    ``blockers`` is the fail-closed half (Z-F7 follow-up F2/F3). ``None`` of
+    the three "I could not look" shapes -- a workspace base that cannot be
+    listed, a record that cannot be read or decoded, a record that names no
+    image -- is evidence that nothing is referenced; each one means the pin set
+    is *incomplete*, and an incomplete pin set must not license eviction. The
+    old code treated all three as "no reference" and evicted silently, which is
+    how a 0711 workspace base turned "a live entry is never evicted" off
+    without a word.
+    """
+
+    entries: frozenset[str]
+    slugs: frozenset[str]
+    image_slugs: frozenset[str]
+    records: int
+    blockers: tuple[str, ...]
+
+    @property
+    def trustworthy(self) -> bool:
+        return not self.blockers
+
+
+def _read_record_text(path: Path) -> str:
+    """Read one ``sandbox.json`` (a seam: a test can make this fail)."""
+    return path.read_text(encoding="utf-8")
+
+
+def _scan_reference_pins(cache_dir: Path) -> _ReferenceScan:
+    """Enumerate every pinned entry and every reason the enumeration is partial.
 
     Every ``sandbox.json`` under a workspace base is this node's own record of
     a sandbox that exists on the volume (the record survives unregister until
@@ -807,28 +926,65 @@ def _referenced_entry_pins(cache_dir: Path) -> tuple[set[str], set[str], int]:
     A record may also carry the resolved digest (``base_image_digest`` /
     ``image_digest``); then exactly that entry is pinned instead of every entry
     of the same image, so a tag that moved on can still be reclaimed.
+
+    The listing is ``os.scandir`` (not ``glob``) on purpose: a base this uid
+    may traverse but not list has to be *reported*, and ``glob`` answers
+    "nothing matched" for both "empty" and "unreadable".
     """
-    pinned_entries: set[str] = set()
-    pinned_slugs: set[str] = set()
+    entries: set[str] = set()
+    slugs: set[str] = set()
+    image_slugs: set[str] = set()
     records = 0
-    for base in _workspace_bases(cache_dir):
-        for record in base.glob("*/sandbox.json"):
+    blockers: list[str] = []
+    bases = _workspace_bases(cache_dir)
+    if not bases:
+        blockers.append(
+            "no workspace base was found to enumerate the sandboxes using the "
+            "cache, so the set of referenced images is unknown"
+        )
+    for base in bases:
+        try:
+            with os.scandir(base) as listing:
+                names = sorted(entry.name for entry in listing)
+        except OSError as e:
+            blockers.append(f"workspace base {base} cannot be listed ({e})")
+            continue
+        for name in names:
+            record = base / name / "sandbox.json"
             try:
-                payload = json.loads(record.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+                raw = _read_record_text(record)
+            except (FileNotFoundError, NotADirectoryError):
+                # Not a sandbox tree (a loose file, or a tree with no record).
+                continue
+            except OSError as e:
+                blockers.append(f"sandbox record {record} is unreadable ({e})")
+                continue
+            try:
+                payload = json.loads(raw)
+            except ValueError as e:
+                blockers.append(f"sandbox record {record} is not valid JSON ({e})")
                 continue
             if not isinstance(payload, dict):
+                blockers.append(f"sandbox record {record} is not a JSON object")
                 continue
             image = payload.get("base_image")
             if not isinstance(image, str) or not image:
+                blockers.append(f"sandbox record {record} names no base_image")
                 continue
             records += 1
+            image_slugs.add(_image_cache_name(image))
             digest = payload.get("base_image_digest") or payload.get("image_digest")
             if isinstance(digest, str) and ":" in digest:
-                pinned_entries.add(_entry_name(image, digest))
+                entries.add(_entry_name(image, digest))
             else:
-                pinned_slugs.add(_image_cache_name(image))
-    return pinned_entries, pinned_slugs, records
+                slugs.add(_image_cache_name(image))
+    return _ReferenceScan(
+        frozenset(entries),
+        frozenset(slugs),
+        frozenset(image_slugs),
+        records,
+        tuple(blockers),
+    )
 
 
 def _cache_usage(cache: Path) -> dict[str, Any]:
@@ -895,6 +1051,8 @@ def prune_image_cache(
     *,
     max_bytes: int | None = None,
     min_age_s: float | None = None,
+    oci_max_bytes: int | None = None,
+    oci_stale_s: float | None = None,
     now: float | None = None,
     protect: Iterable[str] = (),
 ) -> dict[str, int]:
@@ -916,25 +1074,38 @@ def prune_image_cache(
       floored at ``_MIN_EVICT_MIN_AGE_S``), which keeps the newest results --
       and whatever a create may be about to use -- out of reach.
 
+    The pin set is only usable while it is *complete*: when a workspace base
+    cannot be listed, or a ``sandbox.json`` cannot be read/decoded or names no
+    image, there is no way to know which entries are referenced, so the
+    eviction pass is refused (with a WARNING) instead of run on partial
+    evidence. Reclaiming leftovers is unaffected -- a dot-prefixed staging tree
+    cannot be the rootfs a sandbox chroots into.
+
     Leftovers are reclaimed first, and only when they are provably junk: a
     staging tree carrying this process's pid, or one older than
     ``E2B_IMAGE_CACHE_STAGING_STALE_S``. Everything (staging trees, incomplete
     entries, ``_oci`` tars, lock files) is counted, so ``total_bytes`` is the
-    cache's real ``du`` (``st_blocks * 512``) and can be checked against the
-    disk after a prune.
+    cache's real allocated size (``st_blocks * 512``) and can be checked with
+    ``du -s --block-size=1 <cache>`` after a prune (``du -sb`` is the
+    *apparent* size and does not match, see §2.7.3 of the deployment docs).
 
     The ``_oci`` layout tars are counted -- they live on the same volume -- but
-    never evicted: with no registry configured a tar is the only copy of a
-    locally built image, so dropping it would break that template instead of
-    merely forcing a re-pull.
+    the entry bound never evicts them: with no registry configured a tar is the
+    only copy of a locally built image, so dropping it would break that
+    template instead of merely forcing a re-pull. They have a separate,
+    opt-in bound (``oci_max_bytes`` / ``E2B_IMAGE_CACHE_OCI_MAX_BYTES``, 0 =
+    keep every tar) which only reclaims a tar that is both older than
+    ``E2B_IMAGE_CACHE_OCI_STALE_S`` and named by no ``sandbox.json`` record on
+    the volume, and only while the pin set is complete.
     """
     cache = Path(cache_dir)
     cap = _cache_max_bytes() if max_bytes is None else int(max_bytes)
     min_age = _cache_evict_min_age_s() if min_age_s is None else max(0.0, float(min_age_s))
     stale_after = _staging_stale_s()
+    oci_cap = _oci_max_bytes() if oci_max_bytes is None else int(oci_max_bytes)
+    oci_stale = _oci_stale_s() if oci_stale_s is None else max(0.0, float(oci_stale_s))
     reference = time.time() if now is None else float(now)
-    bases = _workspace_bases(cache)
-    pinned_entries, pinned_slugs, pinned_records = _referenced_entry_pins(cache)
+    pins = _scan_reference_pins(cache)
     protected = set(protect)
 
     usage = _cache_usage(cache)
@@ -957,21 +1128,75 @@ def prune_image_cache(
         stale_freed += size
         stale_removed += 1
 
+    # 2) Reclaim `_oci` layout tars when the operator bounded them -- the entry
+    #    bound above cannot (see the docstring). A tar is dropped only when it
+    #    is provably not in use on this node: older than the staleness window,
+    #    named by no sandbox record, and the record scan itself is complete.
+    oci_reclaimed = 0
+    oci_freed = 0
+    oci_bytes = int(usage["oci"])
+    if oci_cap > 0 and oci_bytes > oci_cap and oci_stale > 0 and pins.trustworthy:
+        tars: list[tuple[float, str, Path, int]] = []
+        for tar_path in (cache / LOCAL_OCI_DIRNAME).glob("*.oci.tar"):
+            size = _own_bytes(tar_path)
+            tars.append((_mtime(tar_path), tar_path.name, tar_path, size))
+        for mtime, name, tar_path, size in sorted(tars):
+            if oci_bytes <= oci_cap:
+                break
+            slug = name[: -len(".oci.tar")]
+            if slug in pins.image_slugs:
+                continue
+            age = reference - mtime
+            if age <= oci_stale:
+                continue
+            logger.warning(
+                "image cache %s: reclaiming the OCI layout tar %s (%d bytes, "
+                "%.0fs old) because _oci holds %d bytes over its %d byte bound "
+                "and no sandbox record on this volume names image %s. That tar "
+                "is the only copy of a locally built image on this node (no "
+                "registry configured): re-export the template before its next "
+                "cold create here, or set %s=0 to keep the tars.",
+                cache,
+                tar_path,
+                size,
+                age,
+                oci_bytes,
+                oci_cap,
+                slug,
+                _CACHE_OCI_MAX_BYTES_ENV,
+            )
+            _remove_path(tar_path)
+            oci_bytes -= size
+            total -= size
+            oci_freed += size
+            oci_reclaimed += 1
+
     evicted = 0
     freed = 0
     skipped_fresh = 0
     skipped_pinned = 0
-    if cap > 0 and bases:
+    refusal = "; ".join(pins.blockers)
+    if pins.blockers:
+        logger.warning(
+            "image cache %s: refusing to evict completed entries because the "
+            "reference pins cannot be enumerated exhaustively: %s. An entry "
+            "this scan cannot see may be the rootfs a live sandbox chroots "
+            "into, so the cache stays over its bound until every workspace "
+            "base is listable and every sandbox record readable",
+            cache,
+            refusal,
+        )
+    if cap > 0 and not pins.blockers:
         candidates = sorted(
             usage["complete"].items(), key=lambda item: item[1][1]
         )
         for name, (size, mtime) in candidates:
             if total <= cap:
                 break
-            if name in protected or name in pinned_entries:
+            if name in protected or name in pins.entries:
                 skipped_pinned += 1
                 continue
-            if any(name.startswith(f"{slug}-") for slug in pinned_slugs):
+            if any(name.startswith(f"{slug}-") for slug in pins.slugs):
                 skipped_pinned += 1
                 continue
             if min_age > 0 and reference - mtime < min_age:
@@ -981,13 +1206,6 @@ def prune_image_cache(
             total -= size
             freed += size
             evicted += 1
-    elif cap > 0 and not bases:
-        logger.warning(
-            "image cache %s is over its %d byte cap but no workspace base was "
-            "found to enumerate the sandboxes using it; refusing to evict",
-            cache,
-            cap,
-        )
 
     after = _cache_usage(cache)
     kept_bytes = sum(
@@ -1011,6 +1229,12 @@ def prune_image_cache(
         "stale_freed_bytes": stale_freed,
         "skipped_fresh": skipped_fresh,
         "skipped_pinned": skipped_pinned,
+        "reference_records": pins.records,
+        "reference_blockers": len(pins.blockers),
+        "eviction_refused": refusal,
+        "oci_reclaimed": oci_reclaimed,
+        "oci_freed_bytes": oci_freed,
+        "oci_max_bytes": oci_cap,
         "max_bytes": cap,
     }
 
@@ -1029,18 +1253,22 @@ def _maybe_prune_cache(cache_dir: Path, *, protect: Iterable[str] = ()) -> None:
         return
     _last_prune_monotonic = now
     stats = prune_image_cache(cache_dir, max_bytes=cap, protect=protect)
-    if stats["evicted"] or stats["stale_removed"]:
+    if stats["evicted"] or stats["stale_removed"] or stats["oci_reclaimed"]:
         logger.warning(
             "image cache %s (cap %d bytes): evicted %d completed entries, freed "
             "%d bytes; reclaimed %d leftover staging trees, freed %d bytes; "
+            "reclaimed %d OCI layout tars, freed %d bytes; "
             "%d bytes used (%d kept, %d oci, %d staging, %d incomplete, %d loose), "
-            "%d entries pinned by workspace records",
+            "%d entries left alone because they are pinned (a workspace record "
+            "names them, or this call just published them), %d reference records read",
             cache_dir,
             cap,
             stats["evicted"],
             stats["freed_bytes"],
             stats["stale_removed"],
             stats["stale_freed_bytes"],
+            stats["oci_reclaimed"],
+            stats["oci_freed_bytes"],
             stats["total_bytes"],
             stats["kept_bytes"],
             stats["oci_bytes"],
@@ -1048,17 +1276,33 @@ def _maybe_prune_cache(cache_dir: Path, *, protect: Iterable[str] = ()) -> None:
             stats["incomplete_bytes"],
             stats["loose_bytes"],
             stats["skipped_pinned"],
+            stats["reference_records"],
+        )
+    elif stats["eviction_refused"]:
+        logger.warning(
+            "image cache %s is over its %d byte cap but eviction is refused: %s "
+            "(%d bytes used: %d kept, %d oci, %d staging, %d incomplete, %d loose)",
+            cache_dir,
+            cap,
+            stats["eviction_refused"],
+            stats["total_bytes"],
+            stats["kept_bytes"],
+            stats["oci_bytes"],
+            stats["staging_bytes"],
+            stats["incomplete_bytes"],
+            stats["loose_bytes"],
         )
     elif cap > 0 and stats["total_bytes"] > cap:
         logger.warning(
-            "image cache %s still over %d bytes after eviction (kept=%d oci=%d; "
-            "staging=%d incomplete=%d loose=%d; %d entries are pinned by "
-            "workspace records, the freshness floor is %ss and the OCI layout "
-            "tars are never evicted)",
+            "image cache %s still over %d bytes after eviction (kept=%d oci=%d "
+            "/%d oci-bound; staging=%d incomplete=%d loose=%d; %d entries are "
+            "pinned or freshly published, the freshness floor is %ss and the "
+            "OCI layout tars are only reclaimed by their own bound)",
             cache_dir,
             cap,
             stats["kept_bytes"],
             stats["oci_bytes"],
+            stats["oci_max_bytes"],
             stats["staging_bytes"],
             stats["incomplete_bytes"],
             stats["loose_bytes"],
@@ -1179,7 +1423,15 @@ def _write_shared_file(path: Path, text: str) -> None:
     tmp = path.parent / f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
     _register_staging(tmp)
     try:
-        tmp.write_text(text, encoding="utf-8")
+        try:
+            tmp.write_text(text, encoding="utf-8")
+        except OSError as e:
+            raise ImageResolutionError(
+                f"shared image cache directory {path.parent} is not writable by "
+                f"uid {os.geteuid()}: {e} (the sidecar {path.name} cannot be "
+                f"written next to the OCI layout tar; fix the ownership once "
+                f"with `{_cache_repair_command(Path(path.parent))}` as root)"
+            ) from e
         with suppress(OSError):
             os.chmod(tmp, _SHARED_FILE_MODE)
         if os.geteuid() == 0:

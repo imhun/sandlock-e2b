@@ -1,8 +1,53 @@
 services:
+  # Z-F7 C1/tail: this shape has *two* volumes -- the control plane's
+  # (`control-data`, where the root-run control plane exports template layout
+  # tars into `_images/_oci/`) and the workers' (`worker-data`, where the 65534
+  # workers extract rootfs entries) -- and each needs the same cache with the
+  # worker's ownership. It used to have no init at all, so a volume an older
+  # deployment left root-owned made every resolve fail with an error about the
+  # cache directory; the same script every other shape runs now covers both,
+  # and the ownership is verified (a refused chown on NFS root_squash fails
+  # here, loudly, instead of silently later). Idempotent: every `up -d` runs it
+  # once, and it is also the one-time `chown` an existing volume needs.
+  # See docs/production-deployment-requirements.md §2.7.1.
+  #
+  # CACHE_DIRS paths differ from the service-side paths on purpose: what
+  # matters is the ownership of the directory *inode*, which is the same
+  # whatever path the same volume is mounted at in this container.
+  image-cache-init:
+    image: ${WORKER_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0}
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |-
+        set -e
+        for dir in $$CACHE_DIRS; do
+          mkdir -p "$$dir/_oci"
+          chmod 0755 "$$dir" "$$dir/_oci" 2>/dev/null || true
+          chown -R 65534:65534 "$$dir" 2>/dev/null ||
+          echo "image-cache-init: chown refused ($$dir, NFS root_squash?) -- verifying the owner instead"
+          owner="$$(stat -c %u "$$dir")"
+          if [ "$$owner" != "65534" ]; then
+            echo "image-cache-init: FATAL: $$dir is owned by uid $$owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown -R 65534:65534 $$dir" >&2
+            exit 1
+          fi
+          echo "image-cache-init: $$dir is owned by uid 65534"
+        done
+    environment:
+      CACHE_DIRS: /cache/control/_images /cache/worker/_images
+    volumes:
+      - control-data:/cache/control
+      - worker-data:/cache/worker
+    restart: "no"
+
   control-plane:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.control-plane-gateway
+    depends_on:
+      image-cache-init:
+        condition: service_completed_successfully
     environment:
       E2B_API_KEYS: local-key
       E2B_INTERNAL_API_KEY: internal-key
@@ -50,6 +95,9 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.envd
+    depends_on:
+      image-cache-init:
+        condition: service_completed_successfully
     # E5.1: non-root supervisor (uid 65534); upgrade.sh migrates existing
     # root-owned worker-data volumes once.
     user: "65534:65534"
@@ -80,6 +128,9 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.envd
+    depends_on:
+      image-cache-init:
+        condition: service_completed_successfully
     user: "65534:65534"
     environment:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
@@ -108,6 +159,9 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.envd
+    depends_on:
+      image-cache-init:
+        condition: service_completed_successfully
     user: "65534:65534"
     environment:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000

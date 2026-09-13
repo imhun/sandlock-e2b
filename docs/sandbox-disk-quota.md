@@ -78,11 +78,21 @@ route-B 给了"每沙箱一个常驻 supervise 实例"之后，"`max_disk` 是�
 `E2B_IMAGE_CACHE_DIR` 显式指到共享卷 `/var/lib/e2b-sandboxes/_images`（compose 的
 worker-1/worker-2/control-plane 与 k8s 的 worker/control-plane 同源，且
 `E2B_IMAGE_CACHE_OWNER_UID=65534` 把缓存交给 worker uid，使 root 控制面与 65534 worker
-都能写、沙箱 uid 只能读）；因为 `_images` 属于 **project 0（无限额）**，容量上界由解析器
-自己的按量 GC 承担（`E2B_IMAGE_CACHE_MAX_BYTES`，**默认不限、生产清单显式设 4 GiB**；
-`_oci/` 布局 tar 只计不删；`total_bytes` 就是 `du` 口径的真实占用，含暂存残留与未完成
-条目）——**没有**给 `_images` 单独建 project。逐出**跳过**任何被 `sandbox.json`
+都能写、沙箱 uid 只能读；清单里的 `image-cache-init` 还会**校验**目录确实归 65534，不合格
+就失败并打印 `chown -R 65534:65534` 那条一次性修复）；因为 `_images` 属于
+**project 0（无限额）**，容量上界由解析器自己的按量 GC 承担（`E2B_IMAGE_CACHE_MAX_BYTES`，
+**默认不限、生产清单显式设 4 GiB**）——**没有**给 `_images` 单独建 project。
+注意这个上界的**准确口径**：它判的是总占用（`total_bytes` = 已分配字节，
+`du -s --block-size=1` 口径，含暂存残留、未完成条目、`_oci` 与锁文件），但**能回收的只有
+rootfs 条目**；`_oci/*.oci.tar`（无 registry 形态下本地构建镜像的唯一副本）默认
+**只计不删**，要约束它得显式设 `E2B_IMAGE_CACHE_OCI_MAX_BYTES` +
+`E2B_IMAGE_CACHE_OCI_STALE_S`（按龄、且无 `sandbox.json` 引用才回收，回收前打 WARNING；
+口径见 §2.7.3）。所以"无 registry 形态下 cap 兜住共享卷"这句**不成立**：容量要按
+Σ(本地模板 tar) + rootfs 上界一起规划，崩溃循环的暂存峰值（≈1.7 GB 量级、1h 窗口内
+不可回收）也要算进去。逐出**跳过**任何被 `sandbox.json`
 （`base_image`，或记录里的 digest）引用的条目与本次刚发布的条目，`MIN_AGE` 有 60s 硬下限。
+引用集合**枚举不完整时（base 列不出来 / 记录读不出来 / 记录里没有可用 `base_image`）
+拒绝逐出并告警**（fail-closed；正常可列/可读路径行为不变）。
 跨进程安全：extraction 全程持 `<cache>/<image-slug>.lock` 的 `flock`（有超时，
 `E2B_IMAGE_CACHE_LOCK_TIMEOUT_S`），并以「同文件系统暂存树 + 原子 rename」发布；
 "清垃圾"先把残留原子抢到私有隔离名并复核，所以不可能删掉别人刚发布的条目；失败只清自己

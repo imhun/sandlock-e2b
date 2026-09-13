@@ -12,16 +12,31 @@ services:
   # ``sandbox-shared`` volume this root-run control plane writes template tars
   # into, so create the cache with the worker's ownership before either side
   # writes (never 0777 -- a writable rootfs cache lets a sandbox poison another
-  # sandbox's image). See docs/production-deployment-requirements.md §2.7.1.
+  # sandbox's image) and verify it, so a refused chown (NFS root_squash) fails
+  # here instead of silently breaking every image resolve later. See
+  # docs/production-deployment-requirements.md §2.7.1.
   image-cache-init:
     image: ${WORKER_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0}
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - >-
-        mkdir -p /var/lib/e2b-sandboxes/_images/_oci &&
-        chown -R 65534:65534 /var/lib/e2b-sandboxes/_images &&
-        chmod 0755 /var/lib/e2b-sandboxes/_images /var/lib/e2b-sandboxes/_images/_oci
+      - |-
+        set -e
+        for dir in $$CACHE_DIRS; do
+          mkdir -p "$$dir/_oci"
+          chmod 0755 "$$dir" "$$dir/_oci" 2>/dev/null || true
+          chown -R 65534:65534 "$$dir" 2>/dev/null ||
+          echo "image-cache-init: chown refused ($$dir, NFS root_squash?) -- verifying the owner instead"
+          owner="$$(stat -c %u "$$dir")"
+          if [ "$$owner" != "65534" ]; then
+            echo "image-cache-init: FATAL: $$dir is owned by uid $$owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown -R 65534:65534 $$dir" >&2
+            exit 1
+          fi
+          echo "image-cache-init: $$dir is owned by uid 65534"
+        done
+    environment:
+      CACHE_DIRS: /var/lib/e2b-sandboxes/_images
     volumes:
       - sandbox-shared:/var/lib/e2b-sandboxes
     restart: "no"
@@ -38,8 +53,12 @@ services:
       dockerfile: deploy/docker/Dockerfile.control-plane-gateway
     image: ${CONTROL_PLANE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-control-plane-gateway:0.1.0}
     depends_on:
-      - image-cache-init
-      - redis
+      # The root-run control plane exports template tars into `_images/_oci/`
+      # and must not create the directory root-owned before the init chowns it.
+      image-cache-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     environment:
       E2B_API_KEYS: ${E2B_API_KEYS:-local-key}
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}

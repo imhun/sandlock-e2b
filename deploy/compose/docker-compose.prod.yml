@@ -17,17 +17,33 @@ services:
   # Z-F7 C1: one shared cache, two uids (root control plane, 65534 workers).
   # Create it with the worker's ownership before either side writes, so nobody
   # has to widen it to 0777 (a writable rootfs cache lets a sandbox poison
-  # another sandbox's image). Idempotent; see §2.7.1 of
+  # another sandbox's image), and *verify* the ownership: on NFS with
+  # root_squash the chown can be refused, and an init that reports success
+  # while leaving the cache root-owned is how every resolve on that host ends
+  # up failing. Idempotent; see §2.7.1 of
   # docs/production-deployment-requirements.md.
   image-cache-init:
     image: ${WORKER_IMAGE}
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - >-
-        mkdir -p /var/lib/e2b-sandboxes/_images/_oci &&
-        chown -R 65534:65534 /var/lib/e2b-sandboxes/_images &&
-        chmod 0755 /var/lib/e2b-sandboxes/_images /var/lib/e2b-sandboxes/_images/_oci
+      - |-
+        set -e
+        for dir in $$CACHE_DIRS; do
+          mkdir -p "$$dir/_oci"
+          chmod 0755 "$$dir" "$$dir/_oci" 2>/dev/null || true
+          chown -R 65534:65534 "$$dir" 2>/dev/null ||
+          echo "image-cache-init: chown refused ($$dir, NFS root_squash?) -- verifying the owner instead"
+          owner="$$(stat -c %u "$$dir")"
+          if [ "$$owner" != "65534" ]; then
+            echo "image-cache-init: FATAL: $$dir is owned by uid $$owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown -R 65534:65534 $$dir" >&2
+            exit 1
+          fi
+          echo "image-cache-init: $$dir is owned by uid 65534"
+        done
+    environment:
+      CACHE_DIRS: /var/lib/e2b-sandboxes/_images
     volumes:
       - sandbox-shared:/var/lib/e2b-sandboxes
     restart: "no"
@@ -130,8 +146,12 @@ services:
     # E2B_UID_POOL_START/E2B_UID_POOL_SIZE for the concurrent-sandbox budget.
     user: "65534:65534"
     depends_on:
-      - control-plane
-      - image-cache-init
+      control-plane:
+        condition: service_started
+      # Start-order only is not enough here: the worker must not resolve its
+      # first image before the cache exists with its ownership.
+      image-cache-init:
+        condition: service_completed_successfully
     environment: &worker-env
       E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}
       E2B_NODE_ADDRESS: http://worker-1:49983

@@ -12,17 +12,37 @@ services:
   # extract rootfs entries into it). Owning the directory is what lets both
   # write it; 0777 is not an option -- a writable rootfs cache lets a sandbox
   # poison another sandbox's image. Create it once, with the worker's
-  # ownership, before either side touches it. Idempotent, runs on every
-  # `up -d`; docs/production-deployment-requirements.md §2.7.1.
+  # ownership, before either side touches it, and *verify* the ownership: on
+  # NFS with root_squash the chown can be refused, and an init that reports
+  # success while leaving the directory root-owned is exactly how every image
+  # resolve on that host ends up failing (measured: the worker cannot even
+  # create its lock file). Idempotent, runs on every `up -d`, and the same
+  # script is used by every compose/k8s shape; see
+  # docs/production-deployment-requirements.md §2.7.1.
+  #
+  # CACHE_DIRS must match the E2B_IMAGE_CACHE_DIR of the services below.
   image-cache-init:
     image: ${WORKER_IMAGE}
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - >-
-        mkdir -p /var/lib/e2b-sandboxes/_images/_oci &&
-        chown -R 65534:65534 /var/lib/e2b-sandboxes/_images &&
-        chmod 0755 /var/lib/e2b-sandboxes/_images /var/lib/e2b-sandboxes/_images/_oci
+      - |-
+        set -e
+        for dir in $$CACHE_DIRS; do
+          mkdir -p "$$dir/_oci"
+          chmod 0755 "$$dir" "$$dir/_oci" 2>/dev/null || true
+          chown -R 65534:65534 "$$dir" 2>/dev/null ||
+          echo "image-cache-init: chown refused ($$dir, NFS root_squash?) -- verifying the owner instead"
+          owner="$$(stat -c %u "$$dir")"
+          if [ "$$owner" != "65534" ]; then
+            echo "image-cache-init: FATAL: $$dir is owned by uid $$owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown -R 65534:65534 $$dir" >&2
+            exit 1
+          fi
+          echo "image-cache-init: $$dir is owned by uid 65534"
+        done
+    environment:
+      CACHE_DIRS: /var/lib/e2b-sandboxes/_images
     volumes:
       - sandbox-shared:/var/lib/e2b-sandboxes
     restart: "no"
@@ -145,8 +165,14 @@ services:
     # existing root-owned volume once.
     user: "65534:65534"
     depends_on:
-      - control-plane
-      - image-cache-init
+      control-plane:
+        condition: service_started
+      # The cache has to exist *with the worker's ownership* before this
+      # process resolves its first image: plain start-order `depends_on` lets
+      # the worker race the init and hit the root-owned directory the init has
+      # not chowned yet.
+      image-cache-init:
+        condition: service_completed_successfully
     environment: &worker-env
       E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}
       E2B_NODE_ADDRESS: http://worker-1:49983

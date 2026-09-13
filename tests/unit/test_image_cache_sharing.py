@@ -20,6 +20,7 @@ other's entry on failure.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import subprocess
@@ -30,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from envd_service.runtime import image_resolver
+from envd_service.runtime.image_resolver import ImageResolutionError
 from envd_service.runtime.image_resolver import resolve_image_rootfs
 from tests.unit.test_local_oci_images import (
     _layer,
@@ -1276,3 +1278,383 @@ def test_the_default_cache_path_is_not_created_by_settings(
 
     assert settings.image_cache_dir == (tmp_path / "tmp" / "sandboxes" / "_images").resolve()
     assert not (tmp_path / "tmp").exists()
+
+
+# --- Z-F7 tail: the re-review's four non-blocking findings -------------------
+#
+# Follow-ups F1..F6 of `.superpowers/sdd/task-zf7fix-review.md` §8, in the
+# order the four items were taken:
+#
+# * F2/F3 -- "an entry a live sandbox uses is never evicted" must not depend on
+#   being *able to look*: a workspace base this uid cannot list, or a record it
+#   cannot read, refuses the eviction pass instead of evicting on partial
+#   evidence (the old code treated both as "no references" and said nothing);
+# * F1/F6 -- `_oci/*.oci.tar` is the only copy of a locally built image with no
+#   registry configured, so the entry bound never touches it; its own bound is
+#   opt-in, age-gated and refused while the pin scan is partial;
+# * F4 -- every write that fails because the cache belongs to another uid
+#   reports the one-time `chown -R` repair, never a bare PermissionError.
+
+
+def _entry(cache: Path, name: str, mib: int, mtime: float) -> Path:
+    """A published (``.complete``) cache entry of ``mib`` MiB."""
+    rootfs = cache / name / "rootfs"
+    rootfs.mkdir(parents=True)
+    (rootfs / "big").write_bytes(b"x" * (mib * _MIB))
+    (rootfs / ".complete").write_text("ok", encoding="utf-8")
+    os.utime(cache / name, (mtime, mtime))
+    return cache / name
+
+
+def _warning_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "envd_service.runtime.image_resolver"
+        and record.levelno == logging.WARNING
+    ]
+
+
+def test_eviction_is_refused_when_a_workspace_base_cannot_be_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F2 (fail-closed): a base this uid may traverse but not list used to be
+    read as "no sandbox references anything" and the eviction ran anyway. The
+    pin set is *unknown* there, not empty, so the pass must be refused with a
+    warning -- an entry the scan cannot see may be a live sandbox's rootfs."""
+    base = tmp_path / "e2b-sandboxes"
+    cache = base / "_images"
+    cache.mkdir(parents=True)
+    kept = _entry(cache, "python_3.11-slim-aaaa", 1, 1000.0)
+    _entry(cache, "node_22-slim-bbbb", 3, 2000.0)
+    blocked = base
+    real_scandir = os.scandir
+
+    def fake_scandir(path: object = ".", *args: object, **kwargs: object):  # noqa: ANN202
+        if os.fspath(path) == str(blocked):  # type: ignore[arg-type]
+            raise PermissionError(13, "Permission denied", str(blocked))
+        return real_scandir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+    with caplog.at_level(logging.WARNING, logger="envd_service.runtime.image_resolver"):
+        stats = image_resolver.prune_image_cache(cache, max_bytes=1, min_age_s=0.0)
+
+    reason = f"workspace base {base} cannot be listed ([Errno 13] Permission denied: '{base}')"
+    assert stats["evicted"] == 0
+    assert stats["reference_blockers"] == 1
+    assert stats["eviction_refused"] == reason
+    assert stats["total_bytes"] > stats["max_bytes"]
+    assert (kept / "rootfs" / ".complete").is_file()
+    assert sorted(p.name for p in cache.iterdir()) == [
+        "node_22-slim-bbbb",
+        "python_3.11-slim-aaaa",
+    ]
+    assert _warning_messages(caplog) == [
+        f"image cache {cache}: refusing to evict completed entries because the "
+        f"reference pins cannot be enumerated exhaustively: {reason}. An entry "
+        f"this scan cannot see may be the rootfs a live sandbox chroots into, "
+        f"so the cache stays over its bound until every workspace base is "
+        f"listable and every sandbox record readable"
+    ]
+
+
+def test_eviction_is_refused_when_a_sandbox_record_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F3 (fail-closed): a record the worker cannot read (the measured shape is
+    a tenant turning its ``0644`` record into ``0600``) used to drop the pin
+    silently and the entry was evicted with no warning at all. Unreadable means
+    "cannot rule it out", so nothing may be evicted."""
+    base = tmp_path / "e2b-sandboxes"
+    cache = base / "_images"
+    cache.mkdir(parents=True)
+    kept = _entry(cache, "python_3.11-slim-aaaa", 1, 1000.0)
+    _entry(cache, "node_22-slim-bbbb", 3, 2000.0)
+    record = base / "sbx_locked" / "sandbox.json"
+    record.parent.mkdir()
+    record.write_text("{}", encoding="utf-8")
+    real_read = image_resolver._read_record_text
+
+    def fake_read(path: Path) -> str:
+        if path == record:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_read(path)
+
+    monkeypatch.setattr(image_resolver, "_read_record_text", fake_read)
+    with caplog.at_level(logging.WARNING, logger="envd_service.runtime.image_resolver"):
+        stats = image_resolver.prune_image_cache(cache, max_bytes=1, min_age_s=0.0)
+
+    reason = f"sandbox record {record} is unreadable ([Errno 13] Permission denied: '{record}')"
+    assert stats["evicted"] == 0
+    assert stats["reference_blockers"] == 1
+    assert stats["eviction_refused"] == reason
+    assert (kept / "rootfs" / ".complete").is_file()
+    assert sorted(p.name for p in cache.iterdir()) == [
+        "node_22-slim-bbbb",
+        "python_3.11-slim-aaaa",
+    ]
+    assert _warning_messages(caplog) == [
+        f"image cache {cache}: refusing to evict completed entries because the "
+        f"reference pins cannot be enumerated exhaustively: {reason}. An entry "
+        f"this scan cannot see may be the rootfs a live sandbox chroots into, "
+        f"so the cache stays over its bound until every workspace base is "
+        f"listable and every sandbox record readable"
+    ]
+
+
+def test_a_record_that_names_no_image_also_refuses_the_eviction(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F3: the *other* two "cannot tell what it uses" shapes are just as
+    undecidable as an unreadable record -- a record that is not valid JSON, and
+    a record with no ``base_image`` -- so both refuse the pass and say which
+    path is at fault."""
+    base = tmp_path / "e2b-sandboxes"
+    cache = base / "_images"
+    cache.mkdir(parents=True)
+    _entry(cache, "node_22-slim-bbbb", 3, 2000.0)
+    broken = base / "sbx_broken" / "sandbox.json"
+    nameless = base / "sbx_nameless" / "sandbox.json"
+    for record, text in ((broken, "{not json"), (nameless, '{"sandbox_id": "x"}')):
+        record.parent.mkdir()
+        record.write_text(text, encoding="utf-8")
+    try:
+        json.loads("{not json")
+    except ValueError as e:  # the decoder's own wording, whatever the runtime
+        decode_error = e
+
+    with caplog.at_level(logging.WARNING, logger="envd_service.runtime.image_resolver"):
+        stats = image_resolver.prune_image_cache(cache, max_bytes=1, min_age_s=0.0)
+
+    assert stats["evicted"] == 0
+    assert stats["reference_blockers"] == 2
+    assert stats["eviction_refused"] == (
+        f"sandbox record {broken} is not valid JSON ({decode_error}); "
+        f"sandbox record {nameless} names no base_image"
+    )
+    assert len(_warning_messages(caplog)) == 1
+
+
+def test_a_complete_reference_scan_still_evicts(tmp_path: Path) -> None:
+    """The anti-regression pin for F2/F3: with a listable base and readable
+    records nothing is refused -- the referenced entry survives, the
+    unreferenced one is still evicted, and the refusal field stays empty."""
+    base = tmp_path / "e2b-sandboxes"
+    cache = base / "_images"
+    cache.mkdir(parents=True)
+    _write_sandbox_record(base, "sbx_live", "python/3.11-slim")
+    pinned = _entry(
+        cache, f"{image_resolver._image_cache_name('python/3.11-slim')}-a1b2", 1, 1000.0
+    )
+    spare = _entry(cache, "node_22-slim-bbbb", 3, 2000.0)
+
+    stats = image_resolver.prune_image_cache(cache, max_bytes=1, min_age_s=0.0)
+
+    assert stats["eviction_refused"] == ""
+    assert stats["reference_blockers"] == 0
+    assert stats["reference_records"] == 1
+    assert stats["evicted"] == 1
+    assert stats["skipped_pinned"] == 1
+    assert (pinned / "rootfs" / ".complete").is_file()
+    assert not spare.exists()
+
+
+def _allocated(path: Path) -> int:
+    """Allocated bytes of one path, computed here (not via the module helper)."""
+    info = os.lstat(path)
+    return info.st_blocks * 512 if info.st_blocks else info.st_size
+
+
+def _oci_tar(cache: Path, image: str, mib: int, mtime: float) -> Path:
+    """A fake locally built layout tar of ``mib`` MiB with an exact mtime."""
+    tar_path, _link = image_resolver.local_oci_paths(cache, image)
+    tar_path.parent.mkdir(parents=True, exist_ok=True)
+    tar_path.write_bytes(b"t" * (mib * _MIB))
+    os.utime(tar_path, (mtime, mtime))
+    return tar_path
+
+
+def test_oci_tars_are_kept_until_their_own_bound_is_set(tmp_path: Path) -> None:
+    """F1/F6: the entry bound counts the tars (they live on the same volume)
+    but never evicts them -- with no registry the tar is the only copy of that
+    image, and the default must therefore be "keep every tar"."""
+    base = tmp_path / "e2b-sandboxes"
+    cache = base / "_images"
+    cache.mkdir(parents=True)
+    tar = _oci_tar(cache, "e2b-local/tpl_a", 2, mtime=1_000_000.0)
+
+    stats = image_resolver.prune_image_cache(
+        cache, max_bytes=1, min_age_s=0.0, now=2_000_000.0
+    )
+
+    assert stats["oci_max_bytes"] == 0
+    assert stats["oci_reclaimed"] == 0
+    assert stats["oci_freed_bytes"] == 0
+    assert stats["oci_bytes"] == image_resolver._tree_bytes(cache / "_oci")
+    assert tar.is_file()
+
+
+def test_the_oci_bound_reclaims_only_stale_unreferenced_tars(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F6: with an explicit ``_oci`` bound, exactly the tars that are both
+    older than the staleness window and named by no record are reclaimed, each
+    one with a WARNING that says what it costs (a template re-export)."""
+    base = tmp_path / "e2b-sandboxes"
+    cache = base / "_images"
+    cache.mkdir(parents=True)
+    referenced = _oci_tar(cache, "e2b-local/tpl_used", 2, mtime=1_000_000.0)
+    stale = _oci_tar(cache, "e2b-local/tpl_stale", 2, mtime=1_000_000.0)
+    fresh = _oci_tar(cache, "e2b-local/tpl_fresh", 2, mtime=1_999_000.0)
+    _write_sandbox_record(base, "sbx_live", "e2b-local/tpl_used")
+    oci_dir = cache / "_oci"
+    stale_bytes = _allocated(stale)
+    oci_before = _allocated(oci_dir) + sum(
+        _allocated(path) for path in (referenced, stale, fresh)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="envd_service.runtime.image_resolver"):
+        stats = image_resolver.prune_image_cache(
+            cache,
+            max_bytes=0,
+            min_age_s=0.0,
+            oci_max_bytes=1,
+            oci_stale_s=3600.0,
+            now=2_000_000.0,
+        )
+
+    assert stats["oci_reclaimed"] == 1
+    assert stats["oci_freed_bytes"] == stale_bytes
+    assert stats["oci_max_bytes"] == 1
+    assert not stale.exists()
+    assert referenced.is_file()
+    assert fresh.is_file()
+    assert _warning_messages(caplog) == [
+        f"image cache {cache}: reclaiming the OCI layout tar {stale} "
+        f"({stale_bytes} bytes, 1000000s old) because _oci holds "
+        f"{oci_before} bytes over its 1 byte bound and no sandbox record on "
+        f"this volume names image e2b-local_tpl_stale. That tar is the only "
+        f"copy of a locally built image on this node (no registry configured): "
+        f"re-export the template before its next cold create here, or set "
+        f"E2B_IMAGE_CACHE_OCI_MAX_BYTES=0 to keep the tars."
+    ]
+
+
+def test_the_oci_bound_is_refused_while_the_reference_scan_is_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F6 safety: the tar bound is gated on the *same* complete pin scan -- an
+    unlistable base means the "no record names it" test cannot be trusted, so
+    nothing is reclaimed either."""
+    base = tmp_path / "e2b-sandboxes"
+    cache = base / "_images"
+    cache.mkdir(parents=True)
+    tar = _oci_tar(cache, "e2b-local/tpl_stale", 2, mtime=1_000_000.0)
+    real_scandir = os.scandir
+
+    def fake_scandir(path: object = ".", *args: object, **kwargs: object):  # noqa: ANN202
+        if os.fspath(path) == str(base):  # type: ignore[arg-type]
+            raise PermissionError(13, "Permission denied", str(base))
+        return real_scandir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+    stats = image_resolver.prune_image_cache(
+        cache,
+        max_bytes=0,
+        min_age_s=0.0,
+        oci_max_bytes=1,
+        oci_stale_s=3600.0,
+        now=2_000_000.0,
+    )
+
+    assert stats["oci_reclaimed"] == 0
+    assert stats["reference_blockers"] == 1
+    assert tar.is_file()
+
+
+def test_the_lock_file_error_carries_the_repair_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4: a worker that finds the cache owned by another uid cannot even open
+    its lock file. That error used to name the directory and no fix at all; it
+    now quotes the exact one-time chown, with the uid spelled out."""
+    cache = tmp_path / "e2b-sandboxes" / "_images"
+    cache.mkdir(parents=True)
+    lock = cache / "python_3.11-slim.lock"
+    monkeypatch.setenv("E2B_IMAGE_CACHE_OWNER_UID", "65534")
+    real_open = os.open
+
+    def fake_open(path: object, *args: object, **kwargs: object) -> int:
+        if os.fspath(path) == str(lock):  # type: ignore[arg-type]
+            raise PermissionError(13, "Permission denied", str(lock))
+        return real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", fake_open)
+    with pytest.raises(ImageResolutionError) as excinfo:
+        image_resolver._open_lock_file(lock)
+
+    assert str(excinfo.value) == (
+        f"shared image cache directory {cache} is not writable by uid "
+        f"{os.geteuid()}: [Errno 13] Permission denied: '{lock}' (the cache must "
+        f"belong to the worker uid; fix it once with `chown -R 65534:65534 "
+        f"{cache}` as root)"
+    )
+
+
+def test_the_staging_tree_error_carries_the_repair_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4: the cache's first real write is the staging tree; ``mkdtemp`` fails
+    with EACCES on a root-owned ``_images``. That is reported as the cache's
+    ownership problem, with the fix."""
+    cache = tmp_path / "e2b-sandboxes" / "_images"
+    cache.mkdir(parents=True)
+    monkeypatch.setenv("E2B_IMAGE_CACHE_OWNER_UID", "65534")
+
+    def fake_mkdtemp(*args: object, **kwargs: object) -> str:
+        raise PermissionError(13, "Permission denied", str(cache))
+
+    monkeypatch.setattr("tempfile.mkdtemp", fake_mkdtemp)
+    with pytest.raises(ImageResolutionError) as excinfo:
+        image_resolver._stage_entry(cache, "python_3.11-slim-aaaa")
+
+    assert str(excinfo.value) == (
+        f"shared image cache directory {cache} is not writable by uid "
+        f"{os.geteuid()}: [Errno 13] Permission denied: '{cache}' (a staging "
+        f"tree for python_3.11-slim-aaaa cannot be created there; fix the "
+        f"ownership once with `chown -R 65534:65534 {cache}` as root)"
+    )
+
+
+def test_the_sidecar_error_carries_the_repair_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4: the locally built path writes a ``.link`` sidecar into ``_oci/``;
+    when only that directory belongs to root the write raised a bare
+    ``PermissionError``. It now quotes the repair for the offending path."""
+    cache = tmp_path / "e2b-sandboxes" / "_images"
+    (cache / "_oci").mkdir(parents=True)
+    link = cache / "_oci" / "e2b-local_tpl.link"
+    monkeypatch.setenv("E2B_IMAGE_CACHE_OWNER_UID", "65534")
+    # The sidecar is written aside and renamed; pin the random suffix so the
+    # reported path (and therefore the whole message) is exact.
+    monkeypatch.setattr(image_resolver.secrets, "token_hex", lambda _n: "c0ffee")
+    real_write_text = Path.write_text
+
+    def fake_write_text(self: Path, *args: object, **kwargs: object) -> int:
+        if ".link.tmp-" in self.name:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_write_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", fake_write_text)
+    with pytest.raises(ImageResolutionError) as excinfo:
+        image_resolver._write_shared_file(link, "sha256:aaaa\n/path")
+
+    assert str(excinfo.value) == (
+        f"shared image cache directory {cache / '_oci'} is not writable by uid "
+        f"{os.geteuid()}: [Errno 13] Permission denied: "
+        f"'{cache / '_oci'}/.e2b-local_tpl.link.tmp-{os.getpid()}-c0ffee' "
+        f"(the sidecar e2b-local_tpl.link cannot be written next to the OCI "
+        f"layout tar; fix the ownership once with `chown -R 65534:65534 "
+        f"{cache / '_oci'}` as root)"
+    )
