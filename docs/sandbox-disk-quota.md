@@ -37,6 +37,35 @@
 > ⚠️ **不要**把这两件事混起来解释（本文档早期一版对比表就把它写成了"img 全算"，是错的）。
 > 真正要防"沙箱写爆共享盘"时选**存量口径**（现在的实现）；只有做"事务预算/回滚"时才需要**增量口径**。
 
+#### 1.1.1 探针实测（2026-09-13，`.superpowers/sdd/task-cowprobe-report.md`）：**今天根本用不了**
+
+route-B 给了"每沙箱一个常驻 supervise 实例"之后，"`max_disk` 是不是终于可用了"值得实测一次。结论是**不能用**，
+而且不是口径问题，是**能不能激活 + 强制点在哪**：
+
+1. **在 E2B 形态下压根不激活。** `max_disk` 确实落到了 builder，serve 路径也确实走建分支的代码，
+   但门槛是 `!no_supervisor && self.workdir.is_some()`（fork `sandbox.rs:2024`），而 COW 开关本身是
+   `cow: sandbox.workdir.is_some()`；E2B 的 ceiling 从不设 `workdir`/`fs_storage`
+   ⇒ 生产 worker 形态（uid 65534、CapEff=0、BND `0xc3`）下 `max_disk=8M`，**单次 open 写 256 MiB 成功**，
+   `/tmp/sandlock-cow-<uid>` 从未被创建。只补 `workdir` 后同一条路径立刻建分支并把 64 MiB 打成 ENOSPC。
+2. **即使激活，强制点在"写 open"，不在写入字节。** 实测 `write`(64 MiB) / `O_APPEND` / `ftruncate` /
+   `pwrite` / `mmap` 写回 / `fallocate` / `O_DIRECT` / 稀疏文件 / `sh -c 'cat > f'` / 静态 C / 静态 Go
+   **全部先写成功**，只有**下一个 open** 才 ENOSPC；单次 open 256 MiB 照过。真正被拦的只有写 open、
+   路径 `truncate`、`mkdir`（第 2049 个目录）。⇒ 它是"每文件/每 open"的粗粒度闸，不是字节级配额。
+   > 本文档早前把 COW 描述成"每写一次即 ENOSPC"是**不准确**的，以本节实测为准。
+3. **共享卷完全不进账**：挂进来的卷写穿 64 MiB，闸门仍开（与 COW 文档 §7"卷独立配额"一致，
+   但意味着卷的配额只能靠本方案）。
+4. **storage 落点不适合生产**：默认 `/tmp/sandlock-cow-<uid>`（槽位 `XDG_RUNTIME_DIR`/`TMPDIR` 未设）、
+   0700、**节点本地**、与共享卷不同设备；worker 自身 EACCES、broker 白名单拒绝 ⇒ 控制面看不见；
+   A 节点写完后节点猝死，B 节点看不到那份数据（跨节点迁移不成立）。
+5. **成本**：写本身不慢，但 `close()` 的 merge 要 2 ms/文件（3000 个小文件 = 6.0 s）；copy-up 改 1 页要整份复制
+   （64 MiB → 53.6 ms，期间占用 2.00×）；每次写 open 随 upper 条目线性变慢（5200 条 → 8.0 ms/open）。
+6. **重启/崩溃**：计数只在内存、按代次从 0 起 ⇒ `max_disk=8M` 而 workdir 已有 10 MiB 时，新一代再写 10 MiB
+   仍成功（合计 20 MiB）；崩溃后旧分支留在盘上却不带 `PRESERVED` marker，既不合并也不清理。
+
+**因此**：要用 COW 当配额，等于**重做一遍配额机制**（接线 `workdir`/`fs_storage` + 强制点下沉到字节级 +
+卷纳入 + storage 落共享卷 + 记账持久化），而不是打开一个开关。它今天真正可用的价值面只剩"事务/回滚"，
+且受 merge 成本与节点本地 storage 限制。
+
 **平台预置内容的约束（新增）**：沙箱需要预置基线内容（数据集、预装目录等）时，
 **必须放进共享目录 + 只读绑定**，**不得复制进沙箱树**——复制会变成"每沙箱一份 = 计入沙箱配额 + 存储放大"，
 破坏"配额 = 用户增量"这个语义。今天的镜像 rootfs 正是按这个约束做的。
