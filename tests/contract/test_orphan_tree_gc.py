@@ -34,6 +34,7 @@ import httpx
 import pytest
 
 import envd_service.agent as agent_mod
+import envd_service.priv_helpers as priv_helpers
 import envd_service.xfs_quota as xfs_quota
 from envd_service import xfs_quotactl
 from control_plane.app import create_app as create_control_app
@@ -118,6 +119,11 @@ class _QuotaFake:
         #: contract (M3): the quota agent is a synchronous HTTP call with a
         #: multi-second timeout in production.
         self.release_delay_s = 0.0
+        #: The thread each release ran on. A release is a synchronous call,
+        #: so "the teardown is off the event loop" is exactly "no entry in
+        #: here is the loop's thread" -- a thread identity, not a wall-clock
+        #: gap (W8).
+        self.release_threads: list[int] = []
         self.reconcile_calls: list[dict] = []
         self.released: list[tuple[str, int]] = []
 
@@ -152,6 +158,7 @@ class _QuotaFake:
         return result
 
     def release(self, *, project_dir, mount_point, projid) -> None:
+        self.release_threads.append(threading.get_ident())
         if self.release_delay_s:
             time.sleep(self.release_delay_s)
         self.released.append((str(project_dir), int(projid)))
@@ -1725,13 +1732,22 @@ async def test_legacy_shaped_record_with_a_fresh_tree_is_still_a_concurrent_crea
 
 @pytest.mark.asyncio
 async def test_tree_teardown_does_not_block_the_event_loop(workspace, monkeypatch):
-    """M3: the per-tree teardown runs off the event loop.
+    """M3: the per-tree teardown runs off the event loop -- structurally.
 
     Every tree's teardown releases its project state through the
     (synchronous) quota agent and then removes the tree. Measured in the
     loop, six trees with a 250ms release stall the whole worker for 1.5s --
     long enough for the control plane's 15s heartbeat timeout to orphan a
     node's live sandboxes once a shared workspace holds dozens of trees.
+
+    The contract is therefore *where the work runs*, not how quickly the
+    loop comes back (W8). A wall-clock bound measures the host: the same
+    correct code produced 0.10-0.22s loop gaps on a loaded machine against a
+    0.1s threshold, i.e. it reported "this box is busy", never "the teardown
+    is in the loop" -- while a thread identity is precisely what a
+    regression changes. Both halves of the heavy step (the quota release and
+    the removal of the tree) record the thread they ran on, and neither may
+    be the thread that runs this loop's callbacks.
     """
     _nodes, _registry, control_app = _stack(workspace)
     ids = [f"sbx_slow_release_{index}" for index in range(6)]
@@ -1745,42 +1761,46 @@ async def test_tree_teardown_does_not_block_the_event_loop(workspace, monkeypatc
 
     agent = _agent(workspace)
     loop = asyncio.get_running_loop()
-    gaps: list[float] = []
+    # The thread that runs this loop's callbacks, recorded by one of its own
+    # callbacks: the contract is about *this* loop's thread, not a hard-coded
+    # thread name and not "whichever thread the test body happens to be on".
+    loop_threads: list[int] = []
+    loop.call_soon(lambda: loop_threads.append(threading.get_ident()))
+    await asyncio.sleep(0)
+    assert len(loop_threads) == 1
+    loop_thread_id = loop_threads[0]
 
-    async def ticker():
-        last = loop.time()
-        while True:
-            try:
-                await asyncio.sleep(0.01)
-            finally:
-                # The final gap is the one in progress when the round ended,
-                # which is exactly the number that matters here.
-                now = loop.time()
-                gaps.append(now - last)
-                last = now
+    # The teardown's other half: the tree itself. ``remove_tree`` is the
+    # module-level entry the product calls, so wrapping it observes the
+    # thread the removal ran on without touching the product.
+    real_remove_tree = priv_helpers.remove_tree
+    remove_threads: list[int] = []
 
-    tick = asyncio.create_task(ticker())
-    # Let the ticker establish its baseline before the round starts: the
-    # measurement is "how long the loop cannot come back", not "when the
-    # blocked coroutine finally gets scheduled again".
-    await asyncio.sleep(0.05)
-    gaps.clear()
-    try:
-        started = loop.time()
-        async with _client(control_app) as raw:
-            summary = await agent._reconcile_with_control_plane(raw, _headers())
-        elapsed = loop.time() - started
-    finally:
-        tick.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await tick
+    def _recording_remove_tree(path, **kwargs):
+        remove_threads.append(threading.get_ident())
+        return real_remove_tree(path, **kwargs)
+
+    monkeypatch.setattr(priv_helpers, "remove_tree", _recording_remove_tree)
+
+    started = loop.time()
+    async with _client(control_app) as raw:
+        summary = await agent._reconcile_with_control_plane(raw, _headers())
+    elapsed = loop.time() - started
 
     assert summary["deleted"] == sorted(ids)
+    # The work really happened: six releases (1.5s of stalls in production)
+    # and six removals, none of them left out by this round.
     assert len(quota.released) == len(ids)
-    # The work really happened (1.5s of release stalls) ...
+    assert len(quota.release_threads) == len(ids)
+    assert len(remove_threads) == len(ids)
     assert elapsed >= 1.0
-    # ... without the event loop losing control for a whole release.
-    assert max(gaps) < 0.1
+    # And it happened off the loop: a teardown put back into the loop is the
+    # only thing that makes either list non-empty, whatever the host is doing
+    # at the time.
+    assert [
+        thread for thread in quota.release_threads if thread == loop_thread_id
+    ] == []
+    assert [thread for thread in remove_threads if thread == loop_thread_id] == []
 
 
 @pytest.mark.asyncio
