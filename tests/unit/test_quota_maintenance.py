@@ -438,6 +438,136 @@ def test_a_directory_the_worker_may_not_read_keeps_its_own_diagnosis(
     )
 
 
+# ------------------------------------ follow-up 2: cache lifetime + mount key
+#
+# The FU-1 read gate is keyed on the mount, and both backend verdicts were
+# cached for the life of the process. Two shapes followed from that:
+#
+# * a *transient* probe failure -- a mount the container has not finished
+#   setting up, a mount point this process cannot open at that instant -- was
+#   remembered as "this mount has no fd backend", which pinned every later
+#   read on it to ``lsattr`` (absent from the production image, so every read
+#   degraded to "cannot ask the disk") until the process restarted;
+# * a mount point this worker may not open condemned the directories under it
+#   even when those directories are perfectly readable, because the probe
+#   opened the mount root while the read opens the directory.
+#
+# Only the positive verdict is remembered now, and the directory being read
+# gets the last word when the mount cannot answer.
+
+
+def test_a_transient_read_probe_failure_is_not_remembered(tmp_path, monkeypatch):
+    """follow-up 2: a probe that failed once is asked again on the next read.
+
+    The mount is unreadable at the first read (the container-start race) and
+    readable at the second one, in the same process. Remembering the first
+    answer would keep the fd backend -- the only one production has, since the
+    image ships no ``lsattr`` -- out of reach until a restart; the second read
+    must therefore go back to it.
+    """
+    tree = tmp_path / "sbx_tree"
+    tree.mkdir()
+    readable = {"mount": False}
+    probed: list[str] = []
+    monkeypatch.setattr(
+        xfs_quota, "containing_mount_point", lambda path: str(tmp_path)
+    )
+
+    def can_read_projid(path):
+        probed.append(str(path))
+        return readable["mount"] if str(path) == str(tmp_path) else False
+
+    monkeypatch.setattr(xfs_quotactl, "can_read_projid", can_read_projid)
+    monkeypatch.setattr(xfs_quotactl, "projid_of", lambda path: 4242)
+    lsattr_calls = _explode_lsattr(monkeypatch)
+    xfs_quota._PROJID_READ_CACHE.clear()
+
+    # The mount cannot answer yet: the mount is asked, then the directory,
+    # and the read degrades to the fallback the same way it always did.
+    with pytest.raises(ProjectQuotaError) as excinfo:
+        xfs_quota.directory_project_id(tree)
+    assert str(excinfo.value) == (
+        f"cannot ask the disk for the project id of {tree} "
+        f"(lsattr could not run for {tree}: [Errno 2] No such file or "
+        f"directory: 'lsattr')"
+    )
+
+    # The very next read, once the mount answers, uses the fd backend: the
+    # failure was not remembered and ``lsattr`` is not consulted again.
+    readable["mount"] = True
+    assert xfs_quota.directory_project_id(tree) == 4242
+
+    assert probed == [str(tmp_path), str(tree), str(tmp_path)]
+    assert lsattr_calls == [["lsattr", "-p", "-d", str(tree)]]
+    assert xfs_quota._PROJID_READ_CACHE == {str(tmp_path): "quotactl"}
+
+
+def test_a_transient_administration_probe_failure_is_not_remembered(
+    tmp_path, monkeypatch
+):
+    """follow-up 2: the same rule for the management backend verdict.
+
+    ``set_limit``/``release``/the orphan scan pick their backend through
+    ``_use_quotactl``, whose verdict was cached the same way. A mount that
+    could not be asked at startup must not keep the subprocess path forever.
+    A verdict of "yes", on the other hand, is a property of the mounted
+    filesystem and is still remembered: the fd backend is not re-detected on
+    every management call.
+    """
+    mount = tmp_path / "mnt"
+    answers = iter([False, True, True])
+    probed: list[str] = []
+
+    def available(mount_point):
+        probed.append(str(mount_point))
+        return next(answers)
+
+    monkeypatch.delenv(xfs_quota.XFS_QUOTA_BACKEND_ENV, raising=False)
+    monkeypatch.setattr(xfs_quotactl, "available", available)
+    xfs_quota._BACKEND_CACHE.clear()
+
+    assert xfs_quota._use_quotactl(mount) is False
+    assert xfs_quota._use_quotactl(mount) is True     # re-probed, not pinned
+    assert xfs_quota._use_quotactl(mount) is True     # the yes is remembered
+    assert probed == [str(mount), str(mount)]
+
+
+def test_an_unreadable_mount_root_does_not_condemn_a_readable_directory(
+    tmp_path, monkeypatch
+):
+    """follow-up 2: the mount answers first, the directory has the last word.
+
+    ``/var/lib`` at ``0711`` (owner root, others may traverse but not open)
+    with a readable workspace base inside it is the shape: the mount-level
+    probe opens ``/var/lib`` and fails, while the directory the read actually
+    opens is readable and carries its project id. Reading the mount's answer
+    as final turned that into "cannot ask the disk" for every tree under it.
+    """
+    mount_root = tmp_path / "var-lib"
+    tree = mount_root / "e2b-sandboxes" / "sbx_tree"
+    tree.mkdir(parents=True)
+    probed: list[str] = []
+    monkeypatch.setattr(
+        xfs_quota, "containing_mount_point", lambda path: str(mount_root)
+    )
+
+    def can_read_projid(path):
+        probed.append(str(path))
+        return Path(path) == tree
+
+    monkeypatch.setattr(xfs_quotactl, "can_read_projid", can_read_projid)
+    monkeypatch.setattr(xfs_quotactl, "projid_of", lambda path: 4242)
+    lsattr_calls = _explode_lsattr(monkeypatch)
+    xfs_quota._PROJID_READ_CACHE.clear()
+
+    # The mount root alone answers "no" -- the shape that read as "cannot ask
+    # the disk" before the directory was given the last word.
+    assert xfs_quota._use_quotactl_read(mount_root) is False
+    assert xfs_quota.directory_project_id(tree) == 4242
+    assert probed == [str(mount_root), str(mount_root), str(tree)]
+    assert lsattr_calls == []
+
+
 def test_reconcile_cleans_orphan_with_leftover_dir_but_keeps_dir(
     tmp_path, monkeypatch, caplog
 ):

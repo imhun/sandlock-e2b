@@ -77,13 +77,24 @@ logger = logging.getLogger(__name__)
 #: ``subprocess`` (always ``xfs_quota -x``) or ``quotactl`` (always the
 #: device-free fd backend).
 XFS_QUOTA_BACKEND_ENV = "E2B_XFS_QUOTA_BACKEND"
+#: Backend verdicts, keyed by mount. Only ``quotactl`` -- "this mount can be
+#: asked through the fd backend" -- is ever remembered, because that is a
+#: property of the mounted filesystem and holds for the life of the process.
+#: A *failed* probe is deliberately not cached: its causes are transient (a
+#: mount the container has not finished setting up, a mount point this
+#: process cannot open at that instant) and a remembered "no" pins the whole
+#: mount to the subprocess/lsattr fallback until the process restarts. The
+#: probe costs one ``open`` plus one ioctl, so re-asking is cheap and the
+#: recovery is bounded by the next call (follow-up 2).
 _BACKEND_CACHE: dict[str, str] = {}
 _BACKEND_LOCK = threading.Lock()
 
 #: Read-backend cache, deliberately separate from ``_BACKEND_CACHE``: "can
 #: this mount *administer* project quotas" and "can this mount be asked what
 #: project id a directory carries" are different questions with different
-#: answers (follow-up 1).
+#: answers (follow-up 1). Same caching rule as ``_BACKEND_CACHE``: only the
+#: positive verdict is remembered, so a transient probe failure cannot pin a
+#: mount to ``lsattr`` for the life of the process (follow-up 2).
 _PROJID_READ_CACHE: dict[str, str] = {}
 
 
@@ -119,8 +130,8 @@ def _use_quotactl(mount_point: str | Path) -> bool:
             "cannot administer this mount without its device)",
             mount_point,
         )
-    with _BACKEND_LOCK:
-        _BACKEND_CACHE[key] = choice
+        with _BACKEND_LOCK:
+            _BACKEND_CACHE[key] = choice
     return choice == "quotactl"
 
 
@@ -134,10 +145,12 @@ def _use_quotactl_read(mount_point: str | Path) -> bool:
     * the question here is only whether ``FS_IOC_FSGETXATTR`` works, so a
       mount without ``prjquota`` still reads its directories' project ids
       instead of degrading to ``lsattr`` (follow-up 1, RED-2);
-    * the caller passes the *mount point*, never the directory being read.
-      The probe opens what it is given, and asking it about a slice the
-      control plane already deleted turns "this slice is gone" into "this
-      backend does not work" -- the shape behind the 12 production WARNINGs.
+    * the argument is the *mount point*, never the directory being read. The
+      probe opens what it is given, and asking it about a slice the control
+      plane already deleted turns "this slice is gone" into "this backend
+      does not work" -- the shape behind the 12 production WARNINGs. Callers
+      go through :func:`_use_quotactl_for_read`, which adds the directory
+      back as the fallback question and never caches a failure.
     """
     mode = _configured_backend()
     if mode == "quotactl":
@@ -150,8 +163,9 @@ def _use_quotactl_read(mount_point: str | Path) -> bool:
     if cached is not None:
         return cached == "quotactl"
     choice = "quotactl" if xfs_quotactl.can_read_projid(key) else "subprocess"
-    with _BACKEND_LOCK:
-        _PROJID_READ_CACHE[key] = choice
+    if choice == "quotactl":
+        with _BACKEND_LOCK:
+            _PROJID_READ_CACHE[key] = choice
     return choice == "quotactl"
 
 
@@ -168,6 +182,34 @@ def _projid_read_mount(directory: Path) -> Path:
     except OSError:  # pragma: no cover - defensive: unresolvable path
         mount = None
     return Path(mount) if mount else directory
+
+
+def _use_quotactl_for_read(directory: Path) -> bool:
+    """Whether *this directory's* project id is read through the fd backend.
+
+    The containing mount answers first and that answer is cached per mount:
+    it is the cheap representative of the capability the read needs, and
+    keying it on the mount is what keeps one probe from being spent per tree.
+
+    A mount that cannot answer must not condemn the read. The fd read opens
+    *the directory* (``FS_IOC_FSGETXATTR`` on its own fd) and the mount probe
+    opens the mount point, so a workspace base that sits under a mount root
+    this worker may not open -- ``/var/lib`` at ``0711`` with
+    ``/var/lib/e2b-sandboxes`` readable inside it -- has a readable directory
+    that the mount-level question would have called unreadable. When the
+    mount says no, the directory gets the last word.
+
+    The directory-level verdict is never cached: it says nothing about the
+    next directory, and remembering a "no" here is the same stickiness this
+    follow-up removes from the mount-level cache.
+    """
+    mount = _projid_read_mount(directory)
+    if _use_quotactl_read(mount):
+        return True
+    if mount == directory:
+        return False
+    return xfs_quotactl.can_read_projid(directory)
+
 
 #: Non-root workers (E5.1) without effective CAP_SYS_ADMIN cannot run
 #: ``xfs_quota -x`` directly: the kernel gates quota administration on
@@ -681,7 +723,11 @@ def directory_project_id(project_dir: str | Path) -> int | None:
 
     The read is gated on the containing *mount* (``FS_IOC_FSGETXATTR``
     availability, not quota administration) and its failures are classified,
-    because the three shapes need three different answers:
+    because the three shapes need three different answers. The mount answers
+    as the mount's representative directory, and a mount-level "no" is not
+    final: the directory being read gets the last word, and no failure is
+    cached, so a mount that is not ready yet is picked up on a later read
+    instead of degrading every read until the process restarts:
 
     * :class:`ProjectDirectoryGone` -- the directory is not there any more
       (``ENOENT``). Expected when a volume deletion removed the slice first;
@@ -701,8 +747,10 @@ def directory_project_id(project_dir: str | Path) -> int | None:
     try:
         # The backend probe itself must never take the caller down: it only
         # decides between the fd read and ``lsattr``, and both report their
-        # own failure below.
-        use_quotactl = _use_quotactl_read(_projid_read_mount(directory))
+        # own failure below. A failed probe is not remembered, so a read that
+        # lands while the mount is still coming up is retried by the next
+        # caller instead of pinning this mount to the fallback.
+        use_quotactl = _use_quotactl_for_read(directory)
     except Exception:  # pragma: no cover - defensive
         use_quotactl = False
     if use_quotactl:

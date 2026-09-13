@@ -17,6 +17,7 @@ import ctypes
 import errno
 import struct
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -237,6 +238,51 @@ def test_declared_layouts_match_the_kernel_structs_and_the_parsed_offsets():
     assert struct.unpack_from("<Q", disk, 8)[0] == 8192
     assert struct.unpack_from("<Q", disk, 16)[0] == 8192
     assert struct.unpack_from("<Q", disk, 40)[0] == 4096
+
+
+# --- 2c. the project-id read answers its own question (F3) --------------------
+
+
+def test_can_read_projid_is_answered_by_the_ioctl_not_by_quota_administration(
+    tmp_path,
+):
+    """F3: ``can_read_projid`` issues its own syscall, quotas or no quotas.
+
+    Both calls are real syscalls on the filesystem that owns ``tmp_path`` --
+    nothing is faked -- because the point is that they are *different*
+    syscalls: ``available()`` asks ``Q_XGETQSTATV`` whether this mount can
+    **administer** project quotas, while the read only needs
+    ``FS_IOC_FSGETXATTR`` on the directory. Measured on the production shape
+    (a loop XFS mount without ``prjquota``, uid 65534) the two answers come
+    out opposite: ``state()`` fails ENOSYS, ``available() is False``, and a
+    directory tagged with project id 4242 still reads back
+    ``can_read_projid() is True`` / ``projid_of() == 4242`` -- the container
+    probe in tmp/w2-06-linux-probe.log is that measurement.
+    """
+    directory = tmp_path / "sbx_tree"
+    directory.mkdir()
+
+    reads_project_ids = q.can_read_projid(directory)
+    try:
+        administers = q.available(directory)
+    except OSError:
+        # No ``libc.so.6`` to load (a macOS dev box): the fd backend cannot be
+        # used at all. The read probe must report that instead of raising, and
+        # the administration probe cannot answer either.
+        assert reads_project_ids is False
+        with pytest.raises(OSError):
+            q.state(directory)
+        return
+
+    # The ioctl needs nothing but a readable directory: an untagged directory
+    # answers "project id 0" (``directory_project_id`` folds that to None),
+    # not an error.
+    assert reads_project_ids is True
+    assert q.projid_of(directory) == 0
+    # ... while quota administration on the mounts these tests run on is not
+    # available (no prjquota, or not privileged): the two answers diverge,
+    # which is exactly what gating the read on ``available()`` used to hide.
+    assert administers is False
 
 
 # --- 3. errno classification --------------------------------------------------

@@ -295,6 +295,12 @@ def _install_disk_projids(
     monkeypatch.setattr(
         xfs_quota, "_use_quotactl_read", lambda mount_point: False
     )
+    # The read asks the mount first and the directory itself second
+    # (follow-up 2); both seams are pinned so these contracts answer from the
+    # explicit table on every host, never from the real fd backend.
+    monkeypatch.setattr(
+        xfs_quotactl, "can_read_projid", lambda path: False
+    )
 
     def fake_run(argv, *args, **kwargs):
         if isinstance(argv, (list, tuple)) and argv and argv[0] == "lsattr":
