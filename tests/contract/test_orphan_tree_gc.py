@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ import pytest
 
 import envd_service.agent as agent_mod
 import envd_service.xfs_quota as xfs_quota
+from envd_service import xfs_quotactl
 from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings as ControlSettings
 from control_plane.registry.manager import SandboxRegistry
@@ -289,6 +291,9 @@ def _install_disk_projids(
     calls: list[list[str]] = []
     real_run = subprocess.run
     monkeypatch.setattr(xfs_quota, "_use_quotactl", lambda mount_point: False)
+    monkeypatch.setattr(
+        xfs_quota, "_use_quotactl_read", lambda mount_point: False
+    )
 
     def fake_run(argv, *args, **kwargs):
         if isinstance(argv, (list, tuple)) and argv and argv[0] == "lsattr":
@@ -421,16 +426,22 @@ async def test_restart_reclaims_an_unowned_tree_and_its_quota_row(
         {STRANDED_PROJID: 8, STRANDED_VOLUME_PROJID: 4}, defer_rounds=1
     )
     quota.install(monkeypatch)
+    # follow-up 1: the project-id read asks the path itself what state it is
+    # in before it trusts any backend, so the slice this record points at has
+    # to be materialised the way a live sandbox's volume leaves it. The
+    # "volume deleted before the sweep" shape has its own contract next to
+    # this one.
+    slice_dir = (
+        sandbox_dir / "volumes" / f"vol_id_{STRANDED_VOLUME_PROJID}" / sandbox_id
+    )
+    slice_dir.mkdir(parents=True)
     # The target machine reports the project ids from the disk; the record's
     # own claim is sandbox-writable, so the teardown has to match this.
     disk_calls = _install_disk_projids(
         monkeypatch,
         {
             sandbox_dir: STRANDED_PROJID,
-            sandbox_dir
-            / "volumes"
-            / f"vol_id_{STRANDED_VOLUME_PROJID}"
-            / sandbox_id: STRANDED_VOLUME_PROJID,
+            slice_dir: STRANDED_VOLUME_PROJID,
         },
     )
     caplog.set_level(logging.WARNING)
@@ -1585,7 +1596,7 @@ async def test_teardown_without_a_readable_project_id_still_reclaims_the_tree(
     assert summary["quota_cleaned"] == [8301]
     assert summary["quota_unreclaimed"] == []
     assert [record.message for record in caplog.records] == [
-        f"reconcile: cannot read the project id of {sandbox_dir} from the disk "
+        f"reconcile: cannot ask the disk for the project id of {sandbox_dir} "
         f"(lsattr failed for {sandbox_dir}: simulated lsattr failure); "
         "reclaiming it without releasing its quota row",
         f"reconcile: removing orphan runtime {sandbox_id} (not in control plane)",
@@ -1694,3 +1705,166 @@ async def test_in_memory_orphan_is_torn_down_from_the_verified_target(
     assert summary["deleted"] == [sandbox_id]
     assert summary["untrusted_records"] == []
     assert summary["quota_cleaned"] == [8101]
+
+
+def _gone_reason(path: Path) -> str:
+    """The exact reason ``os.open`` gives for a path that is not there."""
+    try:
+        os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError as probe:
+        return str(probe)
+    raise AssertionError(f"{path} must not exist")  # pragma: no cover
+
+
+def _agent_lines(caplog) -> list[tuple[str, str]]:
+    """The agent's own lines: ``caplog`` also records ``httpx`` at INFO."""
+    return [
+        (record.levelname, record.message)
+        for record in caplog.records
+        if record.name == "envd_service.agent"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_slice_deleted_before_the_sweep_is_info_not_a_warning(
+    workspace, monkeypatch, caplog
+):
+    """follow-up 1: the 2026-09-12 production shape, end to end.
+
+    ``DELETE /volumes/<id>`` rmtree'd the volume root -- and the slices inside
+    it -- 5h40m before worker-1 started, so the teardown asked the disk about
+    six slice directories that no longer existed. The read failed with
+    ENOENT, the old gate reported that as "this backend does not work", the
+    ``lsattr`` fallback failed because the image has no e2fsprogs, and the
+    box logged 12 WARNINGs that read like a permission problem.
+
+    The corrected contract: the line is INFO and says the path is gone,
+    ``lsattr`` is never consulted, the tree is still reclaimed, no release is
+    made for the unverifiable slice (fail-safe), and the row the record
+    claimed is reclaimed by the fail-safe quota pass once the tree -- and with
+    it the record -- is gone.
+    """
+    _nodes, _registry, control_app = _stack(workspace)
+    sandbox_id = "sbx_slice_gone"
+    sandbox_dir = _tree(
+        workspace, sandbox_id, project_id=8401, volume_projids=(8402,)
+    )
+    slice_dir = sandbox_dir / "volumes" / "vol_id_8402" / sandbox_id
+    assert slice_dir.exists() is False          # the production shape
+    quota = _QuotaFake({8401: 8, 8402: 4})
+    quota.install(monkeypatch)
+    disk_calls = _install_disk_projids(monkeypatch, {sandbox_dir: 8401})
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+
+    agent = _agent(workspace, shared_volume_root=str(sandbox_dir / "volumes"))
+    async with _client(control_app) as raw:
+        summary = await agent._reconcile_with_control_plane(raw, _headers())
+
+    assert sandbox_dir.exists() is False
+    # Only the tree's own, verified project was released: the slice had no
+    # verified (directory, projid) pair to release.
+    assert quota.released == [(str(sandbox_dir), 8401)]
+    assert quota.rows == {}
+    assert summary == {
+        "deleted": [sandbox_id],
+        "delete_failures": [],
+        "unmaterialised": [],
+        "protected_elsewhere": [],
+        "disk_sweep_skipped": [],
+        "untrusted_records": [],
+        "concurrent_creates": [],
+        "quota_cleaned": [8401, 8402],
+        "quota_unreclaimed": [],
+    }
+    assert _agent_lines(caplog) == [
+        (
+            "INFO",
+            f"reconcile: {slice_dir} is gone from the disk "
+            f"({_gone_reason(slice_dir)}); nothing to verify, its quota row is "
+            "left to the fail-safe reconcile",
+        ),
+        (
+            "WARNING",
+            f"reconcile: removing orphan runtime {sandbox_id} (not in control plane)",
+        ),
+    ]
+    # The production line came from the ``lsattr`` fallback: a path that is
+    # not there must never reach it (the tree's own, readable path legitimately
+    # does, and it is the only one that does).
+    assert [call[-1] for call in disk_calls] == [str(sandbox_dir)]
+
+
+@pytest.mark.asyncio
+async def test_a_slice_this_worker_may_not_read_keeps_its_own_warning(
+    workspace, monkeypatch, caplog
+):
+    """follow-up 1: EACCES stays a WARNING and the caller semantics stay put.
+
+    A slice that exists but cannot be read is a real anomaly (a tenant
+    chmod'ing its own slice 0700, a 0710 directory): the line stays a WARNING
+    and names the reason, so it is never confused with a deleted slice or
+    with a host that cannot ask the disk. The fail-safe semantics are
+    unchanged: no release without a verified (directory, projid) pair, the
+    tree is still reclaimed, and the unverifiable claim is still reported.
+    """
+    _nodes, _registry, control_app = _stack(workspace)
+    sandbox_id = "sbx_slice_unreadable"
+    sandbox_dir = _tree(
+        workspace, sandbox_id, project_id=8501, volume_projids=(8502,)
+    )
+    slice_dir = sandbox_dir / "volumes" / "vol_id_8502" / sandbox_id
+    slice_dir.mkdir(parents=True)
+    denial = PermissionError(
+        errno.EACCES, os.strerror(errno.EACCES), str(slice_dir)
+    )
+    quota = _QuotaFake({8501: 8, 8502: 4})
+    quota.install(monkeypatch)
+    monkeypatch.setattr(xfs_quota, "_use_quotactl_read", lambda mount: True)
+    monkeypatch.setattr(
+        xfs_quota,
+        "_directory_read_error",
+        lambda directory: denial if Path(directory) == slice_dir else None,
+    )
+
+    def read_back(path):
+        path = Path(path)
+        if path == slice_dir:
+            raise xfs_quotactl.QuotactlError(f"cannot open {path}: {denial}")
+        return 8501
+
+    monkeypatch.setattr(xfs_quotactl, "projid_of", read_back)
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+
+    agent = _agent(workspace, shared_volume_root=str(sandbox_dir / "volumes"))
+    async with _client(control_app) as raw:
+        summary = await agent._reconcile_with_control_plane(raw, _headers())
+
+    assert sandbox_dir.exists() is False
+    # No release for the slice, the tree's own verified project released, and
+    # the row reclaims through the fail-safe pass.
+    assert quota.released == [(str(sandbox_dir), 8501)]
+    assert quota.rows == {}
+    assert summary == {
+        "deleted": [sandbox_id],
+        "delete_failures": [],
+        "unmaterialised": [],
+        "protected_elsewhere": [],
+        "disk_sweep_skipped": [],
+        "untrusted_records": [],
+        "concurrent_creates": [],
+        "quota_cleaned": [8501, 8502],
+        "quota_unreclaimed": [],
+    }
+    assert _agent_lines(caplog) == [
+        (
+            "WARNING",
+            f"reconcile: {slice_dir} exists but this worker cannot read it "
+            f"({denial}); reclaiming it without releasing its quota row",
+        ),
+        (
+            "WARNING",
+            f"reconcile: removing orphan runtime {sandbox_id} (not in control plane)",
+        ),
+    ]

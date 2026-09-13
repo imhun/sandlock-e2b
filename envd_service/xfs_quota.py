@@ -53,6 +53,7 @@ raise :class:`ProjectQuotaError` so callers degrade.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -78,6 +79,12 @@ logger = logging.getLogger(__name__)
 XFS_QUOTA_BACKEND_ENV = "E2B_XFS_QUOTA_BACKEND"
 _BACKEND_CACHE: dict[str, str] = {}
 _BACKEND_LOCK = threading.Lock()
+
+#: Read-backend cache, deliberately separate from ``_BACKEND_CACHE``: "can
+#: this mount *administer* project quotas" and "can this mount be asked what
+#: project id a directory carries" are different questions with different
+#: answers (follow-up 1).
+_PROJID_READ_CACHE: dict[str, str] = {}
 
 
 def _configured_backend() -> str:
@@ -115,6 +122,52 @@ def _use_quotactl(mount_point: str | Path) -> bool:
     with _BACKEND_LOCK:
         _BACKEND_CACHE[key] = choice
     return choice == "quotactl"
+
+
+def _use_quotactl_read(mount_point: str | Path) -> bool:
+    """Whether a project id is read through the fd backend on this mount.
+
+    Two deliberate differences from :func:`_use_quotactl`, which answers
+    whether project quotas can be *administered* and stays the gate for the
+    operations that need it (``set_limit``, ``release``, the orphan scan):
+
+    * the question here is only whether ``FS_IOC_FSGETXATTR`` works, so a
+      mount without ``prjquota`` still reads its directories' project ids
+      instead of degrading to ``lsattr`` (follow-up 1, RED-2);
+    * the caller passes the *mount point*, never the directory being read.
+      The probe opens what it is given, and asking it about a slice the
+      control plane already deleted turns "this slice is gone" into "this
+      backend does not work" -- the shape behind the 12 production WARNINGs.
+    """
+    mode = _configured_backend()
+    if mode == "quotactl":
+        return True
+    if mode == "subprocess":
+        return False
+    key = str(mount_point)
+    with _BACKEND_LOCK:
+        cached = _PROJID_READ_CACHE.get(key)
+    if cached is not None:
+        return cached == "quotactl"
+    choice = "quotactl" if xfs_quotactl.can_read_projid(key) else "subprocess"
+    with _BACKEND_LOCK:
+        _PROJID_READ_CACHE[key] = choice
+    return choice == "quotactl"
+
+
+def _projid_read_mount(directory: Path) -> Path:
+    """The mount a project-id read is gated on -- never ``directory`` itself.
+
+    ``containing_mount_point`` answers from ``/proc/mounts``, so it still
+    resolves for a directory that no longer exists; a host without
+    ``/proc/mounts`` (a macOS dev box) has no fd backend to key either, so
+    the directory itself is the harmless last resort.
+    """
+    try:
+        mount = containing_mount_point(directory)
+    except OSError:  # pragma: no cover - defensive: unresolvable path
+        mount = None
+    return Path(mount) if mount else directory
 
 #: Non-root workers (E5.1) without effective CAP_SYS_ADMIN cannot run
 #: ``xfs_quota -x`` directly: the kernel gates quota administration on
@@ -163,6 +216,23 @@ _PROJID_MAX = 1 << 31
 
 class ProjectQuotaError(RuntimeError):
     """A quota management operation failed; callers degrade with a warning."""
+
+
+class ProjectDirectoryGone(ProjectQuotaError):
+    """The directory is not on disk any more, so there is nothing to verify.
+
+    The expected shape after the control plane deleted a volume:
+    ``DELETE /volumes/<id>`` removes the volume root and the per-sandbox
+    slices inside it, so a teardown that runs afterwards has no object to
+    read and no project state it may release. Callers keep the fail-safe
+    semantics (no release without a verified ``(directory, projid)`` pair)
+    and leave the row to the reconcile, but must not report this as an
+    anomaly -- it is what the ordering is supposed to look like from here.
+    """
+
+
+class ProjectDirectoryUnreadable(ProjectQuotaError):
+    """The directory exists but this process may not read it (EACCES/EPERM)."""
 
 
 @dataclass(frozen=True)
@@ -553,6 +623,53 @@ def _scan_project_dirs(workspace_base: str | Path) -> dict[int, Path]:
     return mapping
 
 
+def _directory_read_error(directory: Path) -> OSError | None:
+    """The error that stops this process from reading ``directory``, or None.
+
+    Asked of the path itself, because neither backend reports the two shapes
+    apart: the fd backend folds them into ``open``, and ``lsattr`` answers
+    "cannot stat" for both a deleted directory and one it may not read.
+    """
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        return exc
+    os.close(fd)
+    return None
+
+
+def _path_state_error(directory: Path) -> ProjectQuotaError | None:
+    """``directory`` is gone or unreadable: which class, or None if readable."""
+    error = _directory_read_error(directory)
+    if error is None:
+        return None
+    if error.errno in (errno.ENOENT, errno.ENOTDIR):
+        return ProjectDirectoryGone(
+            f"{directory} is gone from the disk ({error})"
+        )
+    if error.errno in (errno.EACCES, errno.EPERM):
+        return ProjectDirectoryUnreadable(
+            f"{directory} exists but this worker cannot read it ({error})"
+        )
+    return None
+
+
+def _read_failure_class(directory: Path, reason: str) -> ProjectQuotaError:
+    """Which of the three shapes a failed project-id read is (follow-up 1).
+
+    ``reason`` is the mechanism's own explanation (the fd backend's error, or
+    what ``lsattr`` did), used only for the "this host cannot ask the disk"
+    case: the path's own state decides whether there was anything to ask
+    about in the first place.
+    """
+    state_error = _path_state_error(directory)
+    if state_error is not None:
+        return state_error
+    return ProjectQuotaError(
+        f"cannot ask the disk for the project id of {directory} ({reason})"
+    )
+
+
 def directory_project_id(project_dir: str | Path) -> int | None:
     """The project id the *disk* reports for one directory (``None`` = none).
 
@@ -562,27 +679,46 @@ def directory_project_id(project_dir: str | Path) -> int | None:
     the same ``lsattr -p -d`` / fd-backend read :func:`_scan_project_dirs`
     uses for the orphan quota scan.
 
-    Raises :class:`ProjectQuotaError` when the disk cannot be asked at all
-    (no ``lsattr``, no fd backend -- e.g. an NFS-mounted workspace whose
-    quota lives on the storage server): the caller must then leave the
-    project state alone rather than trust the record's claim.
+    The read is gated on the containing *mount* (``FS_IOC_FSGETXATTR``
+    availability, not quota administration) and its failures are classified,
+    because the three shapes need three different answers:
+
+    * :class:`ProjectDirectoryGone` -- the directory is not there any more
+      (``ENOENT``). Expected when a volume deletion removed the slice first;
+      the caller has nothing to verify and nothing to release.
+    * :class:`ProjectDirectoryUnreadable` -- the directory is there and this
+      process may not read it (``EACCES``/``EPERM``): a real anomaly.
+    * :class:`ProjectQuotaError` -- the host cannot ask the disk at all (no
+      fd backend and no ``lsattr``, e.g. an NFS-mounted workspace whose quota
+      lives on the storage server): the caller must then leave the project
+      state alone rather than trust the record's claim.
+
+    Only the last shape may reach the ``lsattr`` fallback: asking it about a
+    path that is not there reports "cannot stat" exactly like a permission
+    problem, which is what made the 12 production WARNINGs unreadable.
     """
     directory = Path(project_dir)
     try:
-        # The backend probe itself must never take the caller down: on hosts
-        # where the fd backend cannot even be loaded (no libc.so.6) the read
-        # below degrades to ``lsattr``, and a failure there is reported as a
-        # ProjectQuotaError like any other "cannot ask the disk".
-        use_quotactl = _use_quotactl(directory)
+        # The backend probe itself must never take the caller down: it only
+        # decides between the fd read and ``lsattr``, and both report their
+        # own failure below.
+        use_quotactl = _use_quotactl_read(_projid_read_mount(directory))
     except Exception:  # pragma: no cover - defensive
         use_quotactl = False
     if use_quotactl:
         try:
             return xfs_quotactl.projid_of(directory) or None
         except xfs_quotactl.QuotactlError as exc:
-            raise ProjectQuotaError(
-                f"cannot read the project id of {directory}: {exc}"
+            raise _read_failure_class(
+                directory, f"the fd backend failed on {directory}: {exc}"
             ) from exc
+    # Never hand a path that is not there (or that this process may not read)
+    # to the fallback: ``lsattr`` reports both as "cannot stat", which is the
+    # same line a genuine backend failure produces, and it would spend a
+    # subprocess on an answer already known.
+    unreachable = _path_state_error(directory)
+    if unreachable is not None:
+        raise unreachable
     argv = ["lsattr", "-p", "-d", str(directory)]
     try:
         proc = subprocess.run(
@@ -592,12 +728,12 @@ def directory_project_id(project_dir: str | Path) -> int | None:
             timeout=_XFS_QUOTA_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise ProjectQuotaError(
-            f"cannot read the project id of {directory} with lsattr: {exc}"
+        raise _read_failure_class(
+            directory, f"lsattr could not run for {directory}: {exc}"
         ) from exc
     if proc.returncode != 0:
-        raise ProjectQuotaError(
-            f"lsattr failed for {directory}: {proc.stderr.strip()}"
+        raise _read_failure_class(
+            directory, f"lsattr failed for {directory}: {proc.stderr.strip()}"
         )
     for line in proc.stdout.splitlines():
         match = _LSATTR_PROJID_LINE.match(line)

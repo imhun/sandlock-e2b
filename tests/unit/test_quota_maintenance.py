@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ import envd_service.agent as agent
 import envd_service.app as app_module
 import envd_service.quota_maintenance as quota_maintenance
 import envd_service.xfs_quota as xfs_quota
+from envd_service import xfs_quotactl
 from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings as ControlSettings
 from control_plane.registry.nodes import NodeRegistry
@@ -22,6 +24,8 @@ from envd_service.config import Settings as EnvdSettings
 from envd_service.quota_maintenance import QuotaMonitor
 from envd_service.runtime.registry import RuntimeRegistry
 from envd_service.xfs_quota import (
+    ProjectDirectoryGone,
+    ProjectDirectoryUnreadable,
     ProjectQuotaError,
     ProjectQuotaUsage,
     _parse_project_usage,
@@ -238,6 +242,183 @@ def test_scan_project_dirs_excludes_the_snapshot_store(tmp_path, monkeypatch):
     assert xfs_quota._scan_project_dirs(tmp_path) == {700: keep}
     # The snapshot directory never even reaches the disk read.
     assert calls == [["lsattr", "-p", "-d", str(keep)]]
+
+
+# ------------------------------------ reading one directory's project id (FU-1)
+#
+# The 12 production WARNINGs of 2026-09-12: ``DELETE /volumes/<id>`` rmtree'd
+# six volume roots (and their slices) 5h40m before worker-1 started, so every
+# slice the teardown asked about was already gone. On that line of code one
+# probe answered three different questions -- "can this mount administer
+# quotas", "is this directory reachable", "may this process read it" -- and
+# the only visible outcome was the same WARNING a real permission problem
+# produces, wrapped around a missing ``lsattr`` (the production image has no
+# e2fsprogs). The read must answer them separately: the fd read needs
+# ``FS_IOC_FSGETXATTR`` only, the backend decision is keyed on the mount, and
+# the failure is classified as gone / unreadable / cannot-ask.
+
+
+def _explode_lsattr(monkeypatch) -> list[list[str]]:
+    """Reproduce the production image: every ``lsattr`` run fails to exec."""
+    calls: list[list[str]] = []
+
+    def missing_binary(argv, *args, **kwargs):
+        calls.append(list(argv))
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), "lsattr")
+
+    monkeypatch.setattr(xfs_quota.subprocess, "run", missing_binary)
+    return calls
+
+
+def test_a_deleted_slice_is_gone_rather_than_a_warning(tmp_path, monkeypatch, caplog):
+    """FU-1 / RED-1: a slice the control plane already deleted is not an anomaly.
+
+    The volume deletion removes the slice with the volume root, so the read
+    fails with ENOENT before any project state can be involved. The caller
+    semantics must not change (no release: there is no verified
+    ``(directory, projid)`` pair; the tree is still reclaimed, and the record's
+    claim stays in ``expected`` so an unreclaimed row is still reported), but
+    the line is INFO -- "nothing to verify" -- and ``lsattr`` is never
+    consulted, on this shape, by any backend.
+    """
+    slice_dir = tmp_path / "_volumes" / "vol_cdbb" / "sbx_slice"
+    claimed = 152695729
+    lsattr_calls = _explode_lsattr(monkeypatch)
+    try:
+        os.open(slice_dir, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError as probe:
+        gone_reason = str(probe)
+    else:  # pragma: no cover - the fixture never creates the slice
+        raise AssertionError("the slice directory must not exist")
+
+    expected: set[int] = set()
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+
+    assert agent._verified_project_id(slice_dir, claimed, expected) == (None, None)
+
+    assert [(record.levelname, record.message) for record in caplog.records] == [
+        (
+            "INFO",
+            f"reconcile: {slice_dir} is gone from the disk ({gone_reason}); "
+            "nothing to verify, its quota row is left to the fail-safe reconcile",
+        ),
+    ]
+    # Fail-safe bookkeeping is unchanged: the row the record claims is reported
+    # even though nothing could be released for it.
+    assert expected == {claimed}
+    assert lsattr_calls == []
+
+
+@pytest.mark.parametrize("fd_backend", [True, False])
+def test_a_missing_directory_is_gone_on_both_backends(
+    tmp_path, monkeypatch, fd_backend
+):
+    """FU-1: the class must not depend on which read backend ran.
+
+    ``lsattr`` reports "no such file" and "permission denied" as the same kind
+    of tool failure and the fd backend folds both into ``open``, so a
+    path-state read -- not the backend's message -- decides the class. The
+    read must not even try ``lsattr`` for a path that is not there.
+    """
+    missing = tmp_path / "sbx_gone"
+    lsattr_calls = _explode_lsattr(monkeypatch)
+    monkeypatch.setattr(
+        xfs_quota, "containing_mount_point", lambda path: str(tmp_path)
+    )
+    monkeypatch.setattr(xfs_quotactl, "can_read_projid", lambda mount: fd_backend)
+
+    def failing_projid_of(path):
+        raise xfs_quotactl.QuotactlError(
+            f"cannot open {path}: [Errno 2] No such file or directory: '{path}'"
+        )
+
+    monkeypatch.setattr(xfs_quotactl, "projid_of", failing_projid_of)
+    try:
+        os.open(missing, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError as probe:
+        gone_reason = str(probe)
+    else:  # pragma: no cover - the fixture never creates the slice
+        raise AssertionError("the slice directory must not exist")
+
+    with pytest.raises(ProjectDirectoryGone) as excinfo:
+        xfs_quota.directory_project_id(missing)
+
+    assert str(excinfo.value) == (
+        f"{missing} is gone from the disk ({gone_reason})"
+    )
+    assert lsattr_calls == []
+
+
+def test_a_projid_read_is_gated_on_the_mount_not_on_quota_administration(
+    tmp_path, monkeypatch
+):
+    """FU-1 / RED-2: the read needs the ioctl, not quota administration.
+
+    Measured on a real XFS mount without ``prjquota``: ``state()`` fails
+    ENOSYS and ``available()`` is False while ``projid_of(dir)`` still reads
+    the stored id (tmp/fu1-06-gate-vs-read.log). The backend decision must
+    therefore be keyed on the *mount* -- the fd backend probe opens whatever
+    it is given, so asking it about the directory being read is what turned
+    "this slice is gone" into "this backend does not work".
+    """
+    tree = tmp_path / "sbx_tree"
+    tree.mkdir()
+    probed: list[str] = []
+    lsattr_calls = _explode_lsattr(monkeypatch)
+    monkeypatch.setattr(
+        xfs_quota, "containing_mount_point", lambda path: str(tmp_path)
+    )
+    monkeypatch.setattr(
+        xfs_quotactl,
+        "can_read_projid",
+        lambda mount: probed.append(str(mount)) or True,
+    )
+    monkeypatch.setattr(xfs_quotactl, "available", lambda mount: False)
+    monkeypatch.setattr(xfs_quotactl, "projid_of", lambda path: 4242)
+
+    assert xfs_quota.directory_project_id(tree) == 4242
+    # The mount answered the backend question, the directory never did.
+    assert probed == [str(tmp_path)]
+    assert lsattr_calls == []
+    # ... and this is a mount whose quotas this worker cannot administer.
+    assert xfs_quota._use_quotactl(tmp_path) is False
+
+
+def test_a_directory_the_worker_may_not_read_keeps_its_own_diagnosis(
+    tmp_path, monkeypatch
+):
+    """FU-1 / RED-3: EACCES is neither "gone" nor "cannot ask the disk".
+
+    A slice that exists but cannot be read (a tenant chmod'ing its own slice
+    0700, or a 0710 directory) is a real anomaly and stays a WARNING with its
+    own reason, so an operator does not have to stat the path by hand to find
+    out which of the three shapes they are looking at.
+    """
+    tree = tmp_path / "sbx_private"
+    tree.mkdir()
+    denial = PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(tree))
+    monkeypatch.setattr(
+        xfs_quota, "_directory_read_error", lambda directory: denial
+    )
+    monkeypatch.setattr(
+        xfs_quota, "containing_mount_point", lambda path: str(tmp_path)
+    )
+    monkeypatch.setattr(xfs_quotactl, "can_read_projid", lambda mount: True)
+
+    def denied(path):
+        raise xfs_quotactl.QuotactlError(
+            f"cannot open {path}: {denial}"
+        )
+
+    monkeypatch.setattr(xfs_quotactl, "projid_of", denied)
+
+    with pytest.raises(ProjectDirectoryUnreadable) as excinfo:
+        xfs_quota.directory_project_id(tree)
+
+    assert str(excinfo.value) == (
+        f"{tree} exists but this worker cannot read it ({denial})"
+    )
 
 
 def test_reconcile_cleans_orphan_with_leftover_dir_but_keeps_dir(

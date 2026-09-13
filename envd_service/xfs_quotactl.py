@@ -224,6 +224,37 @@ def available(mount_point: str | Path) -> bool:
     return True
 
 
+def can_read_projid(mount_point: str | Path) -> bool:
+    """Whether this mount's directories can be asked for their project id.
+
+    A different question from :func:`available`, which asks whether project
+    quotas can be *administered* here. Reading a directory's project id needs
+    ``FS_IOC_FSGETXATTR`` and nothing else: measured on a real XFS mount
+    without ``prjquota``, ``state()`` fails ENOSYS and ``available()`` is
+    False while the stored projid of a tagged directory still reads back
+    correctly (uid 0 and uid 65534 alike; tmp/fu1-06-gate-vs-read.log).
+    Gating the read on ``available()`` is what made "this mount does not
+    administer quotas" mean "this directory's project id cannot be read".
+
+    ``mount_point`` must be the mount itself, not a directory inside it:
+    the probe opens what it is given, so asking it about a directory that is
+    gone (or unreadable) would report a missing *path* as a missing
+    *capability*. Returns False when the ioctl cannot be called at all (a
+    non-XFS filesystem, a host without ``libc.so.6``).
+    """
+    try:
+        fd = os.open(str(mount_point), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return False
+    try:
+        _fsxattr(fd)
+        return True
+    except (QuotactlError, OSError):
+        return False
+    finally:
+        os.close(fd)
+
+
 def set_limit(mount_point: str | Path, projid: int, disk_mb: int) -> None:
     """Set the project's block hard/soft limit (MiB) via Q_XSETQLIM."""
     fd = _MOUNT_FDS.get(mount_point)

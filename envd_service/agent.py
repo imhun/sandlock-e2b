@@ -34,6 +34,7 @@ from envd_service.uid_pool import (
     apply_sandbox_ownership,
 )
 from envd_service.xfs_quota import (
+    ProjectDirectoryGone,
     ProjectQuotaError,
     directory_project_id,
     provision_project,
@@ -222,12 +223,26 @@ def _verified_project_id(
     try:
         disk_projid = directory_project_id(path)
     except ProjectQuotaError as exc:
-        logger.warning(
-            "reconcile: cannot read the project id of %s from the disk (%s); "
-            "reclaiming it without releasing its quota row",
-            path,
-            exc,
-        )
+        # Three shapes, three lines an operator can tell apart without
+        # stat'ing the path by hand (follow-up 1). The message text carries
+        # the class; the level carries the expectation:
+        #
+        # * gone (ENOENT) -- the control plane deleted the volume, and this
+        #   slice went with it: nothing to verify, and the row is left to the
+        #   fail-safe reconcile, so this is INFO and not an anomaly;
+        # * exists but unreadable (EACCES) -- a real anomaly, WARNING;
+        # * this host cannot ask the disk at all -- WARNING.
+        if isinstance(exc, ProjectDirectoryGone):
+            logger.info(
+                "reconcile: %s; nothing to verify, its quota row is left to "
+                "the fail-safe reconcile",
+                exc,
+            )
+        else:
+            logger.warning(
+                "reconcile: %s; reclaiming it without releasing its quota row",
+                exc,
+            )
         if isinstance(claimed, int) and claimed > 0:
             expected.add(claimed)
         return None, None
