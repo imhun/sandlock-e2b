@@ -94,6 +94,27 @@ def _instance_gone_reason(exc: BaseException) -> str | None:
     return None
 
 
+#: Slot states (`sandlock-supervise` ``stats`` -> the fork's ``InstancePhase``)
+#: in which the generation can no longer take work, mapped to the same
+#: ``"closed"``/``"dead"`` vocabulary the typed in-process errors use.
+#:
+#: A generation is a *container*: when its M0 main child exits, `sandlock-init`
+#: collapses every group, closes the control channel and the phase reads
+#: ``Exited`` -- every later verb, `exec` included, is refused with the fork's
+#: unified closed-instance code (``sandlock-core/src/error.rs``,
+#: ``instance.rs``). ``ShutDown``/``Draining`` are a completed or starting
+#: teardown, ``Dead`` is a machinery failure (listener/reaper/channel). Only
+#: ``Live`` means "the session answered and refused this verb for its own
+#: reason" (a ceiling conflict, an unknown child) -- that refusal must reach
+#: the caller unchanged.
+_GENERATION_GONE_STATES: dict[str, str] = {
+    "Exited": "closed",
+    "ShutDown": "closed",
+    "Draining": "closed",
+    "Dead": "dead",
+}
+
+
 # The six single-node /dev mounts of the fork ``sandlock.minimal_dev()``
 # (third_party/sandlock/python/src/sandlock/sandbox.py, importable only on
 # Linux). The mirror keeps the chroot policy shape unit-testable off-Linux,
@@ -614,6 +635,89 @@ class SandlockExecutor(Executor):
         fixed at instance creation; ``None`` clears the allowance.
         """
         self._mcp_bind_port = int(port) if port is not None else None
+
+    async def _generation_gone_reason(self, inst) -> str | None:
+        """``"closed"``/``"dead"`` when the *slot's* generation is over.
+
+        The in-process backend raises the typed ``InstanceClosedError`` /
+        ``InstanceDeadError`` for this, and :func:`_instance_gone_reason` maps
+        them. A route-B slot is a separate process, so its refusal crosses the
+        channel as a plain ``SandboxError`` string and the type is gone -- the
+        executor therefore asks the *slot* what state its generation is in
+        instead of reading its prose: ``stats`` answers with the fork's own
+        ``InstancePhase``.
+
+        An unreadable reply means the slot itself stopped answering (what
+        ``SlotDeadError`` covers on the verb path) and ``launched: false``
+        means the slot never brought a session up; both are "build a new one"
+        exactly like the typed dead class. Everything else -- a ``Live``
+        session that refused the verb for its own reason -- returns ``None``,
+        so that refusal propagates unchanged.
+
+        Runs off the loop: a slot serves one verb at a time, so this probe
+        must never block the event loop.
+        """
+        try:
+            stats = await asyncio.to_thread(inst.stats)
+        except Exception as exc:  # noqa: BLE001 - an unanswerable slot is gone
+            logger.info(
+                "sandlock route-B stats probe failed sandbox_id=%s error=%r",
+                self._sandbox_id or "-",
+                exc,
+            )
+            return "dead"
+        if not isinstance(stats, dict) or stats.get("launched") is False:
+            return "dead"
+        return _GENERATION_GONE_STATES.get(str(stats.get("instance_state")))
+
+    def _log_exec_failure_context(
+        self, config: ExecConfig, resolved: list[str]
+    ) -> None:
+        """Record what the sandbox's view should look like when an exec fails.
+
+        A failing first command has two very different shapes, and telling
+        them apart needs different evidence: a *gone session* (logged by the
+        caller) versus a command that ran against a broken image view -- e.g.
+        ``cat: not found`` in a sandbox whose rootfs is intact on the host,
+        which is only diagnosable together with the chroot path, the per-exec
+        env and whether the image's own tools are still on disk. Three stats,
+        on the failure path only.
+        """
+        root = self._image_rootfs
+        try:
+            env = self._exec_params(
+                config, bind_ports=self._bind_ports_for(config)
+            ).get("env")
+            logger.warning(
+                "sandlock exec failure context sandbox_id=%s argv=%s cwd=%s "
+                "env=%s chroot=%s rootfs_tools=%s ca_bundle=%s",
+                self._sandbox_id or "-",
+                resolved,
+                self._view_cwd(config),
+                env,
+                root,
+                (
+                    {
+                        name: (root / relative).exists()
+                        for name, relative in (
+                            ("sh", "bin/sh"),
+                            ("cat", "usr/bin/cat"),
+                            ("run-parts", "usr/bin/run-parts"),
+                            ("profile", "etc/profile"),
+                        )
+                    }
+                    if root is not None
+                    else None
+                ),
+                (Path(self._workspace_dir) / ".e2b-ca/ca-certificates.crt").exists(),
+            )
+        except Exception as exc:  # noqa: BLE001 - forensics never mask the cause
+            logger.warning(
+                "sandlock exec failure context unavailable sandbox_id=%s "
+                "error=%r",
+                self._sandbox_id or "-",
+                exc,
+            )
 
     @property
     def instance_name(self) -> str:
@@ -1692,11 +1796,18 @@ class SandlockExecutor(Executor):
 
         try:
             proc = await _exec_once(inst)
-        except RuntimeError as exc:
-            # Typed classification only (B1 minor-3): a command that failed for
-            # any other reason propagates, whatever words its message happens to
-            # contain.
+        except Exception as exc:  # noqa: BLE001 - classified below, re-raised whole
+            # Two independent ways a session can be gone, and both rebuild
+            # exactly once: the in-process FFI reports it as a *typed* error,
+            # while a route-B slot answers a *served* refusal whose type the
+            # channel erases (``route_b.py``). The second shape is classified
+            # from the slot's own state machine, never from its prose -- the
+            # same rule the typed path follows (B1 minor-3: a message that
+            # merely mentions closed/dead must not decide a rebuild; the pin
+            # lives in ``tests/unit/test_sandlock_executor_instance.py``).
             reason = _instance_gone_reason(exc)
+            if reason is None and self._route_b_active:
+                reason = await self._generation_gone_reason(inst)
             if reason is None:
                 logger.warning(
                     "sandlock exec failed sandbox_id=%s instance_name=%s "
@@ -1707,10 +1818,12 @@ class SandlockExecutor(Executor):
                     type(exc).__name__,
                     exc,
                 )
+                self._log_exec_failure_context(config, resolved)
                 raise
-            # Idle/24h expiry or machinery death surfaced at exec time:
-            # rebuild exactly once and retry. Never after an explicit close()
-            # (a concurrent shutdown must not leak a fresh instance).
+            # Idle/24h expiry, machinery death or a collapsed route-B
+            # generation surfaced at exec time: rebuild exactly once and
+            # retry. Never after an explicit close() (a concurrent shutdown
+            # must not leak a fresh instance).
             logger.info(
                 "sandlock instance %s during exec; rebuilding once "
                 "sandbox_id=%s instance_name=%s argv=%s",
@@ -1724,17 +1837,6 @@ class SandlockExecutor(Executor):
                 raise unimplemented("Sandlock is not available on this platform")
             # Exactly one retry; a second closed/dead failure propagates.
             proc = await _exec_once(inst)
-        except Exception as exc:
-            logger.warning(
-                "sandlock exec failed sandbox_id=%s instance_name=%s argv=%s "
-                "error_type=%s error=%s",
-                self._sandbox_id or "-",
-                self.instance_name,
-                resolved,
-                type(exc).__name__,
-                exc,
-            )
-            raise
         # F4.3/S2 staleness mapping: register the fork child (id -> pid +
         # resolved argv) before the running process is returned so a later
         # ``update_network`` can log which children keep their old policy.

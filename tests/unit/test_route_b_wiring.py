@@ -19,6 +19,7 @@ import pytest
 import envd_service.route_b as rb
 from envd_service.route_b import (
     PARKING_PROGRAM,
+    PARKING_SCRIPT,
     RouteBInstance,
     SlotDeadError,
     W1SlotPool,
@@ -250,9 +251,21 @@ def test_parking_program_stops_instead_of_spinning():
     """M0 must never exit (main exit collapses the generation) and must never
     cost anything. ``read x < /dev/zero`` -- the obvious pick -- burns a core
     forever, because an exec session's main stdio is /dev/null and ``read``
-    never sees a line terminator; self-stop is the zero-cost park."""
+    never sees a line terminator; self-stop is the zero-cost park.
+
+    The ``trap ''`` prologue is part of "must never exit": a stopped process
+    delivers a *catchable* signal on the next SIGCONT, so a bare self-stop park
+    dies the instant anything resumes it after a stray TERM/HUP/INT/QUIT/USR1/
+    USR2/PIPE (measured in the frozen image: exit 143 on SIGCONT after SIGTERM).
+    The signal-immunity and re-stop behaviour is asserted against a live shell
+    in ``tests/contract/test_route_b_executor.py``; this pin keeps the exact
+    argv from drifting."""
+    assert PARKING_SCRIPT == (
+        "trap '' TERM HUP INT QUIT USR1 USR2 PIPE; "
+        "while :; do kill -STOP $$; done"
+    )
     assert PARKING_PROGRAM == {
-        "argv": ["/bin/sh", "-c", "while :; do kill -STOP $$; done"]
+        "argv": ["/bin/sh", "-c", PARKING_SCRIPT]
     }
     assert "/dev/zero" not in PARKING_PROGRAM["argv"][2]
 

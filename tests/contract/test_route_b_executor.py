@@ -23,9 +23,12 @@ and the supervise binary from the wheel.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import signal
 import stat
+import subprocess
 import time
 from pathlib import Path
 
@@ -33,7 +36,12 @@ import pytest
 
 from envd_service.executors.base import ExecConfig
 from envd_service.executors.sandlock import SandlockExecutor
-from envd_service.route_b import RouteBConfig, reset_slot_pools, slot_pool_for
+from envd_service.route_b import (
+    PARKING_SCRIPT,
+    RouteBConfig,
+    reset_slot_pools,
+    slot_pool_for,
+)
 from tests.security.conftest import sandlock_ready
 
 UID = 21200
@@ -234,6 +242,192 @@ async def test_parked_main_program_costs_nothing(workspace) -> None:
             f"the parked generation burned {after - before} clock ticks in "
             "1 s of wall time; route-B slots must park at zero cost"
         )
+    finally:
+        ex.close()
+
+
+#: The fork's unified closed-instance refusal, byte for byte
+#: (``sandlock-core/src/error.rs``), as it reaches the worker: the slot formats
+#: a served failure as ``instance exec failed: {e}`` and the core renders the
+#: runtime error as ``process error: {…}``. Pinned exactly on purpose -- the
+#: executor must classify this *without* reading the sentence (it asks the
+#: slot's state machine instead), so this string is here to document the shape
+#: the channel erases, not to license a text match.
+INSTANCE_CLOSED_REFUSAL = (
+    "instance exec failed: process error: instance is closed (shut down, or "
+    "the init channel closed after the main-exit container end); no new work "
+    "is accepted"
+)
+
+
+def _raw_state(pid: int) -> str:
+    """The bare ``/proc`` state char (``S``/``T``/``Z``/…), unlike
+    :func:`_proc_state` which folds "stopped" into "running"."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return "gone"
+
+
+def test_parked_main_survives_stray_catchable_signals() -> None:
+    """The park must not be killable by a *catchable* signal.
+
+    A stopped process keeps a catchable signal pending and delivers it on the
+    next SIGCONT, so a park without the ``trap ''`` prologue dies the moment
+    anything resumes it. Measured in the frozen image: the unprefixed script
+    exits 143 (SIGTERM) on SIGCONT after SIGTERM-while-stopped; the shipped one
+    is still parked and still costs zero clock ticks.
+
+    That distinction is the whole ballgame for a route-B sandbox: the M0 main
+    exiting is a *container end* (``ChildKind::Main``), after which every verb
+    on that generation -- every later command of that sandbox -- is refused
+    with the unified closed-instance code.
+    """
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", PARKING_SCRIPT], start_new_session=True
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and _raw_state(proc.pid) != "T":
+            time.sleep(0.02)
+        assert _raw_state(proc.pid) == "T", (
+            "the park must stop itself (the zero-CPU property depends on it)"
+        )
+        before = _clock_ticks(proc.pid)
+        for signum in (
+            signal.SIGTERM,
+            signal.SIGHUP,
+            signal.SIGINT,
+            signal.SIGQUIT,
+            signal.SIGUSR1,
+            signal.SIGUSR2,
+        ):
+            os.kill(proc.pid, signum)
+        os.kill(proc.pid, signal.SIGCONT)
+        time.sleep(0.5)
+        assert proc.poll() is None, (
+            f"the parked main exited from a catchable signal "
+            f"(returncode={proc.returncode})"
+        )
+        assert _raw_state(proc.pid) == "T", "the park must re-stop after SIGCONT"
+        after = _clock_ticks(proc.pid)
+        assert after - before <= 2, (
+            f"the park burned {after - before} clock ticks while idle"
+        )
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+async def test_collapsed_generation_is_rebuilt_once_not_permanent(
+    workspace, caplog
+) -> None:
+    """A collapsed generation must cost one rebuild, not the sandbox's life.
+
+    The generation is a container: when its M0 main exits, init collapses
+    every group and the *slot process keeps serving* -- answering every verb
+    with the unified closed-instance refusal. That refusal crosses the route-B
+    channel as a plain string, so the executor's typed session-gone mapping
+    never saw it and the sandbox stayed dead for good (production symptom:
+    ``error_type=SandboxError`` on a sandbox's *first* command, every later one
+    the same). Here the main is killed the way any stray SIGKILL to it would
+    (the container end is the same either way), and the *next* command must
+    run -- on a generation the executor rebuilt.
+    """
+    sandbox_id = "sbx_rbe_collapse"
+    ex = _executor(workspace, sandbox_id)
+    pool = slot_pool_for(ex._route_b)
+    try:
+        running = await ex.start(_config(["/bin/true"], str(workspace)))
+        assert (await _collect(running))[0] == 0
+        first_slot = pool.slot(sandbox_id)
+        assert first_slot is not None
+        main_pid = first_slot.instance_pid
+        assert isinstance(main_pid, int) and main_pid > 0
+
+        # End the container: the M0 main dies, init collapses and exits. The
+        # slot process is untouched -- that is precisely the shape that made
+        # this permanent.
+        os.kill(main_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 30.0
+        stats: dict = {}
+        while time.monotonic() < deadline:
+            stats = await asyncio.to_thread(ex._instance.stats)
+            if stats.get("instance_state") == "Exited":
+                break
+            time.sleep(0.05)
+        assert stats.get("instance_state") == "Exited", (
+            f"the generation never read Exited after its main was killed: {stats}"
+        )
+
+        # The refused verb, exactly as the worker used to receive it.
+        with pytest.raises(Exception) as refusal:
+            await asyncio.to_thread(ex._instance.exec, ["/bin/true"])
+        assert str(refusal.value) == INSTANCE_CLOSED_REFUSAL
+
+        # ...and the executor turns that into a rebuild plus one retry.
+        with caplog.at_level(
+            "INFO", logger="envd_service.executors.sandlock"
+        ):
+            second = await ex.start(_config(["/bin/true"], str(workspace)))
+        assert (await _collect(second))[0] == 0
+        assert [
+            record.message
+            for record in caplog.records
+            if record.message.startswith("sandlock instance closed during exec")
+        ] == [
+            "sandlock instance closed during exec; rebuilding once "
+            f"sandbox_id={sandbox_id} instance_name={sandbox_id} "
+            "argv=['/bin/true']"
+        ]
+        rebuilt = pool.slot(sandbox_id)
+        assert rebuilt is not None and rebuilt is not first_slot
+        assert rebuilt.instance_pid != main_pid, (
+            "the retry must run on a fresh generation, not the collapsed one"
+        )
+    finally:
+        ex.close()
+
+
+async def test_live_generation_refusal_is_not_rebuilt(
+    workspace, monkeypatch, caplog
+) -> None:
+    """The complement of the pin above: a *Live* session's refusal stands.
+
+    A per-exec parameter wider than the instance ceiling is a policy refusal,
+    not a gone session (``sandlock-supervise`` answers ``exec params exceed the
+    instance policy ceiling: bind_ports 65000 is outside the allowed set
+    (EPERM)``). Rebuilding on it would silently retry a command the deployment
+    refused, so the classification must return ``None`` for ``Live`` and the
+    error must reach the caller unchanged.
+    """
+    sandbox_id = "sbx_rbe_refusal"
+    ex = _executor(workspace, sandbox_id)
+    pool = slot_pool_for(ex._route_b)
+    try:
+        running = await ex.start(_config(["/bin/true"], str(workspace)))
+        assert (await _collect(running))[0] == 0
+        before_slot = pool.slot(sandbox_id)
+        assert before_slot is not None
+        monkeypatch.setattr(
+            type(ex), "_bind_ports_for", lambda self, config: [65000]
+        )
+        with caplog.at_level("INFO", logger="envd_service.executors.sandlock"):
+            with pytest.raises(Exception) as refusal:
+                await ex.start(_config(["/bin/true"], str(workspace)))
+        assert str(refusal.value) == (
+            "instance exec failed: process error: exec params exceed the "
+            "instance policy ceiling: bind_ports 65000 is outside the allowed "
+            "set (EPERM)"
+        )
+        assert [
+            record.message
+            for record in caplog.records
+            if record.message.startswith("sandlock instance ")
+            and "rebuilding once" in record.message
+        ] == []
+        assert pool.slot(sandbox_id) is before_slot
+        assert _proc_state(before_slot.process.pid) == "running"
     finally:
         ex.close()
 

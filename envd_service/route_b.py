@@ -240,7 +240,25 @@ CHILD_POLL_CAP_S = 300.0
 #: is the only input, and ``read`` never sees a newline -- both dash (one
 #: ``read(2)`` per byte) and bash (NULs discarded, line never terminated) spin
 #: on it at 100 % CPU for the life of the sandbox.
-PARKING_SCRIPT = "while :; do kill -STOP $$; done"
+#:
+#: The ``trap ''`` prologue is load-bearing, not decoration. A stopped process
+#: keeps a *catchable* signal pending and delivers it on the next SIGCONT, so
+#: without it a single stray SIGTERM/SIGHUP/SIGINT/SIGQUIT/SIGUSR1/SIGUSR2/
+#: SIGPIPE to the stopped main kills it the moment anything resumes it --
+#: verified in the frozen image: ``sh -c 'while :; do kill -STOP $$; done'``
+#: receives SIGTERM while stopped and exits 143 (SIGTERM) on SIGCONT. A main
+#: that exits collapses the container (`ChildKind::Main`, init's deliberate
+#: main-exit teardown), and every later command on that sandbox fails with the
+#: unified closed-instance code -- so one stray signal used to cost the
+#: sandbox its whole life.
+#:
+#: Ignoring them costs the teardown nothing: init collapses the main with
+#: SIGKILL (`signal_all_children(..., SIGKILL)`, init/mod.rs), which no
+#: disposition can defer, and the 5 s SIGTERM grace in the shutdown ladder
+#: targets *init's* process group (`killpg(group, SIGTERM)`,
+#: instance.rs::shutdown_child_after_grace) -- groups are per-child, so the
+#: parked main is never in the group that grace applies to.
+PARKING_SCRIPT = "trap '' TERM HUP INT QUIT USR1 USR2 PIPE; while :; do kill -STOP $$; done"
 
 PARKING_PROGRAM: dict[str, list[str]] = {
     "argv": ["/bin/sh", "-c", PARKING_SCRIPT]
