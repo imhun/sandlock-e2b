@@ -8,6 +8,24 @@
 #   cp deploy/compose/.env.example deploy/compose/.env
 #   docker compose -f deploy/compose/docker-compose.autoscale.yml up -d --build
 services:
+  # Z-F7 C1: the autoscaler spawns 65534 workers onto the same
+  # ``sandbox-shared`` volume this root-run control plane writes template tars
+  # into, so create the cache with the worker's ownership before either side
+  # writes (never 0777 -- a writable rootfs cache lets a sandbox poison another
+  # sandbox's image). See docs/production-deployment-requirements.md §2.7.1.
+  image-cache-init:
+    image: ${WORKER_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0}
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mkdir -p /var/lib/e2b-sandboxes/_images/_oci &&
+        chown -R 65534:65534 /var/lib/e2b-sandboxes/_images &&
+        chmod 0755 /var/lib/e2b-sandboxes/_images /var/lib/e2b-sandboxes/_images/_oci
+    volumes:
+      - sandbox-shared:/var/lib/e2b-sandboxes
+    restart: "no"
+
   redis:
     image: redis:8-alpine
     command: ["redis-server", "--appendonly", "yes"]
@@ -20,6 +38,7 @@ services:
       dockerfile: deploy/docker/Dockerfile.control-plane-gateway
     image: ${CONTROL_PLANE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-control-plane-gateway:0.1.0}
     depends_on:
+      - image-cache-init
       - redis
     environment:
       E2B_API_KEYS: ${E2B_API_KEYS:-local-key}
@@ -35,6 +54,14 @@ services:
       E2B_SHARED_WORKSPACE_ROOT: /var/lib/e2b-sandboxes
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
+      # Bounded by the resolver itself (`_images` sits in the volume's
+      # unlimited project) and owned by the worker uid, so both the root-run
+      # control plane and the spawned 65534 workers can write it without a
+      # world-writable cache. See
+      # docs/production-deployment-requirements.md §2.7.
+      E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
+      E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
+      E2B_IMAGE_CACHE_OWNER_UID: ${E2B_IMAGE_CACHE_OWNER_UID:-65534}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
       E2B_MAX_SANDBOXES: ${E2B_MAX_SANDBOXES:-1000}
       # Dynamic pools: the autoscaler governs fleet capacity, so the
@@ -67,7 +94,7 @@ services:
       # Spawned workers get their env only from this JSON: without the cache
       # dir they would fall back to a container-local relative path and lose
       # the rootfs on every scale-in/out.
-      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-python:3.14-slim}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-local}", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
+      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-python:3.14-slim}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-local}", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
       E2B_AS_POLL_S: ${E2B_AS_POLL_S:-5}
       E2B_AS_UTIL_THRESHOLD: ${E2B_AS_UTIL_THRESHOLD:-0.70}
       E2B_AS_SCALE_UP_COOLDOWN_S: ${E2B_AS_SCALE_UP_COOLDOWN_S:-60}

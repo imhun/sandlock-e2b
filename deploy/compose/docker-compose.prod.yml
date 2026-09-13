@@ -14,6 +14,24 @@
 # registry (no Docker daemon); the egress-proxy library ships prebuilt in the
 # image per platform.
 services:
+  # Z-F7 C1: one shared cache, two uids (root control plane, 65534 workers).
+  # Create it with the worker's ownership before either side writes, so nobody
+  # has to widen it to 0777 (a writable rootfs cache lets a sandbox poison
+  # another sandbox's image). Idempotent; see §2.7.1 of
+  # docs/production-deployment-requirements.md.
+  image-cache-init:
+    image: ${WORKER_IMAGE}
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mkdir -p /var/lib/e2b-sandboxes/_images/_oci &&
+        chown -R 65534:65534 /var/lib/e2b-sandboxes/_images &&
+        chmod 0755 /var/lib/e2b-sandboxes/_images /var/lib/e2b-sandboxes/_images/_oci
+    volumes:
+      - sandbox-shared:/var/lib/e2b-sandboxes
+    restart: "no"
+
   redis:
     image: redis:8-alpine
     command: ["redis-server", "--appendonly", "yes", "--requirepass", "${E2B_REDIS_PASSWORD:-local-redis-password}"]
@@ -31,6 +49,8 @@ services:
       dockerfile: deploy/docker/Dockerfile.control-plane-gateway
     image: ${CONTROL_PLANE_IMAGE:-e2b-sandlock-control-plane-gateway:0.1.0}
     depends_on:
+      image-cache-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     environment:
@@ -63,6 +83,13 @@ services:
       # each container on every recreate (workspace base holds user files,
       # `_images` holds the extracted rootfs and is project 0 / no quota).
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
+      # Bounded by the resolver itself (`_images` is project 0, no quota) and
+      # owned by the worker uid, so this root-run control plane and the 65534
+      # workers can both write it without a world-writable cache. See
+      # docs/production-deployment-requirements.md §2.7.
+      E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
+      E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
+      E2B_IMAGE_CACHE_OWNER_UID: ${E2B_IMAGE_CACHE_OWNER_UID:-65534}
       # Template images are pushed here after build; workers pull on demand.
       # Leave empty to keep single-host behavior (image stays local).
       E2B_IMAGE_REGISTRY: ${E2B_IMAGE_REGISTRY:-}
@@ -104,6 +131,7 @@ services:
     user: "65534:65534"
     depends_on:
       - control-plane
+      - image-cache-init
     environment: &worker-env
       E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}
       E2B_NODE_ADDRESS: http://worker-1:49983
@@ -120,6 +148,9 @@ services:
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
+      E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
+      E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
+      E2B_IMAGE_CACHE_OWNER_UID: ${E2B_IMAGE_CACHE_OWNER_UID:-65534}
       # The registry host belongs to the pull credentials above: the worker
       # only sends them when the image it resolves lives on that host, so a
       # public base image is pulled anonymously instead of leaking the

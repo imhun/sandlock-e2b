@@ -7,6 +7,26 @@
 # Images and the sandbox base image come from ACR (Docker Hub is unreachable
 # from the target; the daemon uses registry mirrors for redis only).
 services:
+  # Z-F7 C1: the shared cache is written by root (this control plane exports
+  # template layout tars into ``_images/_oci/``) *and* by 65534 (the workers
+  # extract rootfs entries into it). Owning the directory is what lets both
+  # write it; 0777 is not an option -- a writable rootfs cache lets a sandbox
+  # poison another sandbox's image. Create it once, with the worker's
+  # ownership, before either side touches it. Idempotent, runs on every
+  # `up -d`; docs/production-deployment-requirements.md §2.7.1.
+  image-cache-init:
+    image: ${WORKER_IMAGE}
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mkdir -p /var/lib/e2b-sandboxes/_images/_oci &&
+        chown -R 65534:65534 /var/lib/e2b-sandboxes/_images &&
+        chmod 0755 /var/lib/e2b-sandboxes/_images /var/lib/e2b-sandboxes/_images/_oci
+    volumes:
+      - sandbox-shared:/var/lib/e2b-sandboxes
+    restart: "no"
+
   # Daemonless build engine for Template.build (rootless; the control plane
   # talks to it over the shared socket, no Docker socket anywhere).
   buildkit:
@@ -41,6 +61,8 @@ services:
   control-plane:
     image: ${CONTROL_PLANE_IMAGE}
     depends_on:
+      image-cache-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     environment:
@@ -89,6 +111,13 @@ services:
       # See docs/production-deployment-requirements.md §2.7.
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
+      # The cache is written by two different uids (this container runs as
+      # root, the workers run as 65534), so the resolver hands every directory
+      # and file it creates to the worker uid: the worker writes as the owner,
+      # root writes through CAP_DAC_OVERRIDE, and a sandbox uid (10000+) gets
+      # read/traverse bits only. Never 0777: a writable rootfs cache is a
+      # cross-tenant poisoning vector. §2.7.1.
+      E2B_IMAGE_CACHE_OWNER_UID: ${E2B_IMAGE_CACHE_OWNER_UID:-65534}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE}
       E2B_TEMPLATE_IMAGES: ${E2B_TEMPLATE_IMAGES:-}
       E2B_MAX_SANDBOXES: ${E2B_MAX_SANDBOXES:-100}
@@ -117,6 +146,7 @@ services:
     user: "65534:65534"
     depends_on:
       - control-plane
+      - image-cache-init
     environment: &worker-env
       E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}
       E2B_NODE_ADDRESS: http://worker-1:49983
@@ -164,6 +194,7 @@ services:
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
+      E2B_IMAGE_CACHE_OWNER_UID: ${E2B_IMAGE_CACHE_OWNER_UID:-65534}
       E2B_NODE_MEMORY_MB: ${E2B_NODE_MEMORY_MB:-2048}
       E2B_NODE_CPU_PERCENT: ${E2B_NODE_CPU_PERCENT:-200}
       E2B_NODE_DISK_MB: ${E2B_NODE_DISK_MB:-4096}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,6 +15,35 @@ from gateway_common.env import (
     _env_json_dict,
     _env_list,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _image_cache_dir() -> Path:
+    """``E2B_IMAGE_CACHE_DIR`` (or the legacy relative default).
+
+    When the operator *configures* the shared cache, prepare it here -- before
+    any process writes into it, and with the worker's ownership -- because the
+    control plane (root) exports template layout tars into ``_images/_oci/``
+    without going through the resolver. A root-owned ``_images`` left behind by
+    that write is exactly what locks the 65534 workers out of the whole cache
+    (no lock file, no staging tree, every resolve fails), and it is also what
+    heals a directory an older deployment left ``root:root``. Left unset,
+    nothing is created or changed: local development stays all-one-uid.
+    See docs/production-deployment-requirements.md §2.7.1.
+    """
+    raw = os.getenv("E2B_IMAGE_CACHE_DIR")
+    path = Path(raw if raw else "tmp/sandboxes/_images")
+    if raw:
+        try:
+            from envd_service.runtime.image_resolver import ensure_shared_cache_dir
+
+            ensure_shared_cache_dir(path)
+        except Exception as e:  # noqa: BLE001 - never block startup on this
+            logger.warning(
+                "could not prepare the shared image cache %s: %s", path, e
+            )
+    return path.resolve()
 
 # Default private-egress denylist applied to the implicit full-egress branch
 # (no explicit allowOut/denyOut + internet allowed). Covers RFC1918, loopback,
@@ -309,9 +339,7 @@ class Settings:
         default_factory=lambda: os.getenv("E2B_SHARED_VOLUME_ROOT")
     )
     image_cache_dir: Path = field(
-        default_factory=lambda: Path(
-            os.getenv("E2B_IMAGE_CACHE_DIR", "tmp/sandboxes/_images")
-        ).resolve()
+        default_factory=_image_cache_dir
     )
 
     @property

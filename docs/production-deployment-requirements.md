@@ -481,6 +481,7 @@ E2B_BASE_IMAGE=python:3.11-slim \
 E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images            # compose: worker-1/worker-2 + control-plane
 E2B_IMAGE_CACHE_MAX_BYTES: "4294967296"                        # 4 GiB；0 = 不限
 E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: "300"                         # 逐出新鲜度下限（秒）
+E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worker uid（见下）
 ```
 
 - **compose（`deploy/stack/docker-compose.prod.yml`）**：`worker-1`/`worker-2`（同一
@@ -501,6 +502,44 @@ E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: "300"                         # 逐出新鲜度
   放进 workspace base **不会**被当成沙箱树（不会被 GC 扫成孤儿、不会进配额扫描）。
   解析器自己写的东西（`<image-slug>.lock`、`.…tmp-*` 暂存树）都落在 `_images/` **里面**，
   workspace base 顶层不新增任何名字（有单测钉住，见 2.7.5）。
+- **两个 uid 共享同一个 `_images`（必须设 `E2B_IMAGE_CACHE_OWNER_UID`）**：两套清单里
+  **控制面跑 root、worker 跑 65534**（k8s 的 worker pod 继承镜像的 `USER 65534:65534`，
+  控制面 pod 覆盖镜像的 root），而两者指向同一个目录。第一版就死在这里：root 先跑
+  （不配 registry 时控制面导出模板 tar，**必然** root 先建 `_images`）⇒ `_images` 是
+  `root:root 0755`，worker 连 `<image>.lock` 与暂存树都建不出来（`PermissionError` ⇒
+  该镜像解析全量失败）；反向同理（哪一方先建了 `0600` 的锁文件，另一方**永远**打不开，
+  而锁文件按设计从不删除）。
+  规则是**所有权**，不是把目录放宽：
+
+  | 目录/文件 | owner | mode | 谁能写 |
+  |---|---|---|---|
+  | `_images` / `_images/_oci` / `<entry>` / `<entry>/rootfs` | 缓存 owner（= worker uid，生产 65534） | `0755` | owner（worker）+ root（`CAP_DAC_OVERRIDE`） |
+  | `<image-slug>.lock` / `.link` 侧车 | 同上 | `0644` | 同上（`flock` 只需要可读 fd，读不到才报错） |
+  | 沙箱 uid（池内 10000+） | — | 只有 `r-x` | **一个字节都写不了** |
+
+  解析器每次创建目录/文件都执行这条契约：`_ensure_shared_dir()` 建目录后强制 `0755`，
+  并以 root 身份把它 `chown` 给**缓存 owner**（也就是 worker uid，和
+  `deploy/scripts/upgrade.sh` 对卷根做的那次 `chown -R 65534` 同一个身份；
+  `E2B_IMAGE_CACHE_OWNER_UID` 未设时取最近的**非 root 祖先**的 owner，即卷根
+  `/var/lib/e2b-sandboxes`）。root 进程发布条目时，整棵 rootfs 也会被交给该 uid
+  （`lchown`，不跟随镜像里的符号链接）——否则 worker 之后写不进
+  `<rootfs>/workspace` 与 MITM CA 文件（`sandlock.py` 的既有路径），那也是一种"被锁死"。
+  另外，**谁先碰到缓存**这件事不能靠运气：控制面导出模板 tar 的那段代码
+  （`control_plane/api/templates.py`）不经过解析器，所以两套清单都加了一个一次性的
+  `image-cache-init`（compose 是独立 service + `service_completed_successfully` 依赖；
+  k8s 是 worker/control-plane 两个 Deployment 各一个 `initContainer`）：以 root 建
+  `_images`（含 `_oci`）并 `chown 65534`，`up -d` / Pod 重建时都跑一次、幂等。
+  解析器侧也保留了同样的准备逻辑（`Settings.image_cache_dir` 在
+  `E2B_IMAGE_CACHE_DIR` 被显式设置时调用 `ensure_shared_cache_dir()`），所以即便
+  init 被跳过或 NFS `root_squash` 拒绝了 `chown`（k8s 的 init 会告警但不阻塞），
+  root 侧下一次构造 Settings / 解析都会把它自己建的东西自愈过来；worker 侧遇到
+  修不了的历史残留时抛的是**带修复命令**的明确错误，而不是裸 `PermissionError`。
+  **明确不做的事**：不把 `_images` 改成 `0777`。共享卷上跑着租户进程，rootfs 缓存可写 =
+  任一沙箱可以改写别的沙箱将要 chroot 进去的镜像 = 跨租户投毒；解析器反过来还会把
+  遗留的 `0777` 收紧成 `0755`。升级说明：本次修复之前从未上线，`_images` 是新建的；
+  若曾在某台机器上手工跑过旧版并在卷上留下 `root:root` 的 `_images`/`0600` 锁文件，
+  一次 `chown -R 65534:65534 /var/lib/e2b-sandboxes/_images` 即可（root 侧会在下一次
+  解析时自愈它自己建的东西）。
 
 ### 2.7.2 跨进程安全（为什么"同目录"以前是坏的）
 
@@ -510,17 +549,31 @@ E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: "300"                         # 逐出新鲜度
 刚完成的条目整条删掉**。现在（`envd_service/runtime/image_resolver.py`）：
 
 1. **跨进程互斥**：`flock(2)` 独占锁包住「检查 `.complete` → 拉层 → 解压 → 发布」整段，
-   锁文件是 `<cache>/<image-slug>.lock`（`0600`，**从不 unlink**：删了会让两个进程锁到同名
-   的不同 inode 上，等于没锁）。进程内 `threading.Lock` 保留在 `flock` 外层：同一进程的第二个
-   `open` 会在自己的文件描述上阻塞，线程走廉价的进程内锁排队更合适，两者一起覆盖两种形状。
-2. **原子落盘**：解压写进**同文件系统的私有暂存树** `_images/.<entry>.tmp-<rand>/`，
-   `.complete` **先写在暂存树里**，最后 `os.replace(暂存, 最终)` 一步发布 ⇒ 读者看到这个路径时
-   它已经是完整的；即使锁完全没生效（见下条），也**不可能**看到半成品。
-3. **失败只清自己**：`except` 只 `rmtree` 本次创建的暂存树；最终目录只有在**不完整**
-   （历史遗留垃圾、或崩溃的旧版 worker 留下）时才会被清掉，已完成的条目**永远优先**——
-   并发发布者发现"别人已经完成了"就丢弃自己的暂存树，而不会替换/删除那条已完成条目。
-4. **本地构建（OCI tar）路径同一套**：`_resolve_local_oci()` 也走 `_materialize_entry()`，
-   同锁、同暂存、同发布语义。
+   锁文件是 `<cache>/<image-slug>.lock`（`0644`、owner = 缓存 owner，所以两个 uid 都打得开；
+   **从不 unlink**：删了会让两个进程锁到同名的不同 inode 上，等于没锁）。进程内
+   `threading.Lock` 保留在 `flock` 外层：同一进程的第二个 `open` 会在自己的文件描述上阻塞，
+   线程走廉价的进程内锁排队更合适，两者一起覆盖两种形状。
+2. **原子落盘**：解压写进**同文件系统的私有暂存树** `_images/.<entry>.tmp-<pid>-<rand>/`，
+   `.complete` **先写在暂存树里**，最后 `rename(暂存, 最终)` 一步发布 ⇒ 读者看到这个路径时
+   它已经是完整的；即使锁完全没生效（见下条），也**不可能**看到半成品。发布用的是
+   `os.rename`（非空目标会失败）而不是覆盖式 `os.replace`：既有名字**永不**被静默顶掉。
+3. **失败只清自己**：`except` 只 `rmtree` 本次创建的暂存树。
+4. **"清垃圾"不再能误伤已发布条目**：最终目录若被**不完整**的残留占着（旧版 worker 崩溃
+   留下的形状），先 `rename` **原子地把它抢到**本进程的私有隔离名
+   `_images/.<entry>.garbage-<pid>-<rand>`，再核对抢到的是不是刚才检查的那一个 inode、
+   并且**仍然没有 `.complete`**；两项都对才 `rmtree`。中途被别人发布的条目会被原样放回，
+   发布者则退避重试直到看见那条完成条目。旧代码的窗口（检查 `.complete` → 未再确认就
+   `rmtree(最终目录)`）在锁不被跨客户端遵守时会把**刚发布的完整条目**整棵删掉
+   （评审 C4 实测 `was_complete=True`，两个调用者拿到不同 inode），现在这条路径上根本
+   不存在"删除最终条目路径"这个动作。
+5. **锁有超时**：`E2B_IMAGE_CACHE_LOCK_TIMEOUT_S`（默认 300s，`0` = 永远等）同时约束
+   进程内锁与 `flock`。超时后：若条目已经被发布就用它（`_materialize_entry` 会重查
+   `.complete`），否则抛 `CacheLockTimeout`（`ImageResolutionError` 的子类，报文里带
+   锁路径与超时值）。没有超时的话，一个卡在解压里的 worker 会**无限期**阻塞其它 worker
+   解析同一镜像（评审 C5 实测 waiter 20s 仍阻塞）。
+6. **本地构建（OCI tar）路径同一套**：`_resolve_local_oci()` 也走 `_materialize_entry()`，
+   同锁、同暂存、同发布语义；`.link` 侧车用"写临时文件 + rename"的方式更新，所以另一
+   uid 写的旧侧车不会挡住自己。
 
 **存储不支持跨客户端锁时的口径**（NFS 形态务必知道）：§5.1 允许 NFSv3 `nolock` 挂载，
 那 `flock` 退化为客户端本地锁 ⇒ **跨客户端不再互斥**，两个节点会各解压一份。此时正确性由
@@ -538,47 +591,84 @@ E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: "300"                         # 逐出新鲜度
   **每个进程最多每 60s 走一次目录**（`_PRUNE_INTERVAL_S`），不需要运维加 cron，也不给
   热路径（`.complete` 命中，直接 return）增加任何开销。外部想主动跑一次也可以直接调
   `prune_image_cache(cache_dir)`。
-- **候选**：只有带 `rootfs/.complete` 的**已完成条目**。暂存树（`.` 前缀）和未完成目录
-  **永不**是候选 ⇒ 不会踩到别人正在解压的条目。
-- **逐出序**：按 `.complete` 的 mtime **最旧优先**，直到总占用 ≤ 上限；`oci_bytes` 计入总量
-  但**不逐出** `_oci/*.oci.tar` —— 不配 registry 时那份 tar 是本地构建镜像的**唯一副本**，
-  删了是"模板直接不可用"，而不是"重新拉一次"，所以宁可告警也不删（这是有意的口径）。
-- **新鲜度下限**：`E2B_IMAGE_CACHE_EVICT_MIN_AGE_S`（默认 300s）内的条目跳过逐出：既避免
-  逐出刚发布的那一条，也避免正在起沙箱的调用刚好被抽掉地板。
-- **上限不达标时**：`0` = 不限（逃生门）；若受新鲜度下限/`_oci` 制约仍超上限，打一条
-  WARNING 并把 `kept/oci/下限` 三个数字写进日志（见 2.7.4），不静默。
-- **观测**：每次真的逐出，worker/控制面日志出现一条
-  `WARNING envd_service.runtime.image_resolver: image cache <dir> over <cap> bytes: evicted <n> completed entries, freed <m> bytes`；
-  手工核对：`du -sh /var/lib/e2b-sandboxes/_images`（逐出阈值按 `du` 口径对齐：
-  `st_blocks * 512`）。
-- **残留风险（明说）**：逐出只保证"总量有界"，不保证"正在用的 rootfs 不被删"——一个沙箱的
-  rootfs 若比下限更旧、又恰好排在逐出序前面，理论上可能在沙箱存活期间被删（运行中的进程
-  握着 inode 不受影响，新起的命令会失败）。要收紧就把 `E2B_IMAGE_CACHE_EVICT_MIN_AGE_S`
-  调大（代价：上限更难达成），或把上限调到"正常镜像数量 × 单镜像占用"之上（默认 4 GiB ≈
-  10~25 个 python-slim 级 rootfs）。
+**默认不限（`E2B_IMAGE_CACHE_MAX_BYTES` 未设 = `0` = 不逐出）**，因为逐出的失败模式是
+"静默打断活沙箱"：上界是**显式**的运维动作（两套清单都设 4 GiB），不是默认打开的行为。
+`E2B_IMAGE_CACHE_MAX_BYTES=0` 下仍会回收残留（下一条），所以"不限"不等于"可以无界增长"。
+
+- **候选**：只有带 `rootfs/.complete` 的**已完成条目**。暂存树（`.` 前缀）与未完成目录
+  **永不**是逐出候选 ⇒ 不会踩到别人正在解压的条目。
+- **正在被引用的条目永远不逐出（评审 C2 的钉子）**：`sandbox.json` 是节点自己对"这台机器上
+  存在哪些沙箱"的记录（teardown 之前一直在），解析器对每个 workspace base 下的
+  `*/sandbox.json` 取 `base_image`（记了 `base_image_digest`/`image_digest` 就**只**钉住
+  那一个条目），**这些镜像的条目一律跳过逐出**，无论它们多老、上限差多少。同时
+  `_materialize_entry()` 把"刚发布的这一条"作为 `protect` 传给 GC，所以同一次调用绝不会
+  逐掉自己刚发布的 rootfs（旧版 `MIN_AGE=0` 时会，`resolve` 返回一个不存在的路径）。
+  取不到任何 workspace base（缓存不在 `<workspace-base>/_images` 且没设
+  `E2B_WORKSPACE_BASE`/`E2B_SHARED_WORKSPACE_ROOT`）时**拒绝逐出**并告警：拿不准就不删。
+- **逐出序**：其余候选按 `.complete` 的 mtime **最旧优先**，直到真实占用 ≤ 上限；
+  `_oci/*.oci.tar` 计入总量但**不逐出** —— 不配 registry 时那份 tar 是本地构建镜像的
+  **唯一副本**，删了是"模板直接不可用"，而不是"重新拉一次"，所以宁可告警也不删。
+- **新鲜度下限**：`E2B_IMAGE_CACHE_EVICT_MIN_AGE_S`（默认 300s）内的条目跳过逐出；这个值
+  有 **60s 的硬下限**（配 `0` 也会被抬到 60s 并告警），因为逐出恰好发生在一次发布之后。
+- **口径覆盖真实占用（评审 C3）**：`prune_image_cache()` 先把缓存**完整**量一遍——已完成
+  条目、**有名字但没有 `.complete` 的残留**、**暂存/quarantine 树**（含被 `SIGKILL` 留下的）、
+  `_oci/*.oci.tar`、锁文件——`total_bytes` 就是 `du` 口径（`st_blocks * 512`）的总和，
+  prune 结束后可以直接拿 `du -sb` 对账（数字对不上就是 bug，不再出现"磁盘 31.5 MiB、
+  账面 15.8 MiB"）。
+- **残留回收（只清可证明是垃圾的）**：`.{entry}.tmp-<pid>-*` 这类名带 pid；本进程**正在写**
+  的暂存树记在进程内的活动集合里，GC 跳过；带**本进程 pid** 且不在活动集合里的、或者
+  mtime 超过 `E2B_IMAGE_CACHE_STAGING_STALE_S`（默认 3600s）的，才删。别人的新鲜暂存树
+  一律不动（可能是另一台 worker 正在解压）。**已知边界**：一次解压若超过 staleness 窗口，
+  别的进程可能把它当残留删掉，那次解压会失败并被重试（默认 1h，远超正常解压耗时）。
+- **上限不达标时**：若受引用钉子/新鲜度下限/`_oci` 制约仍超上限，打一条 WARNING 并把
+  `kept/oci/staging/incomplete/loose/钉子数/下限` 写进日志（见 2.7.4），不静默。
+- **观测**：每次真的逐出或回收，worker/控制面日志出现一条
+  `WARNING envd_service.runtime.image_resolver: image cache <dir> (cap <n> bytes): evicted …; reclaimed …; <total> bytes used (…)`；
+  手工核对：`du -sb /var/lib/e2b-sandboxes/_images` 与 `_maybe_prune_cache` 报的
+  `total_bytes` 相等（探针 `tmp/zf7fix-prune.log` 给的就是这两个数字）。
+- **仍然存在的边界（明说）**：引用钉子基于 `sandbox.json`。`sandbox.json` 是沙箱可写的输入，
+  一个能改写自己记录的沙箱理论上能丢掉自己的钉子（记了 digest 的记录不受影响）；另外
+  `sandbox.json` 缺失但沙箱树还在的中间态不会被识别成引用。两者都需要宿主机侧的写权限，
+  不属于"解析器自动逐出"能单方面造成的事故。
 
 ### 2.7.4 环境矩阵与开关
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `E2B_IMAGE_CACHE_DIR` | `tmp/sandboxes/_images`（相对 CWD） | rootfs 解包缓存位置；生产设为 `/var/lib/e2b-sandboxes/_images` |
-| `E2B_IMAGE_CACHE_MAX_BYTES` | `8589934592`（8 GiB，未设 env 时） | 缓存上限；compose/k8s 显式设 4 GiB；`0` = 不限 |
-| `E2B_IMAGE_CACHE_EVICT_MIN_AGE_S` | `300` | 逐出新鲜度下限（秒） |
+| `E2B_IMAGE_CACHE_MAX_BYTES` | `0`（**不限 = 不逐出**） | 缓存上限；compose/k8s 显式设 4 GiB；`0`/负数 = 不限（仍回收残留） |
+| `E2B_IMAGE_CACHE_EVICT_MIN_AGE_S` | `300` | 逐出新鲜度下限（秒）；**硬下限 60s**，配更低会被告警并抬到 60 |
+| `E2B_IMAGE_CACHE_OWNER_UID` / `_GID` | 未设 = 取最近的**非 root 祖先**的 owner（生产 = 卷根 owner = 65534） | 解析器创建的目录/文件归谁；两套清单显式设 `65534` |
+| `E2B_IMAGE_CACHE_LOCK_TIMEOUT_S` | `300` | 等待同镜像的跨进程锁的上限（秒）；`0` = 永远等 |
+| `E2B_IMAGE_CACHE_STAGING_STALE_S` | `3600` | 超过这个年龄的暂存/quarantine 树才允许按"超龄"回收；`0` = 只清本进程 pid 的 |
 
-生产形态（compose/k8s）与本地开发形态的差别只是"设不设 env"：不设时行为与修复前完全一致
-（相对路径、8 GiB 上限），本地 `pytest` / 单机开发不需要任何额外配置。
+生产形态（compose/k8s）与本地开发形态的差别只是"设不设 env"：不设时**落点**与修复前逐字
+相同（相对路径），但**行为**有两处刻意的差别 —— 默认上限是"不限"（旧版没有逐出，所以默认
+行为与修复前一致；上限是生产清单里的显式 4 GiB），以及 `MIN_AGE` 有 60s 硬下限。
+本地 `pytest` / 单机开发不需要任何额外配置。
 
 ### 2.7.5 验收清单（本项）
 
 1. 容器内 `docker compose -f deploy/stack/docker-compose.prod.yml config | grep E2B_IMAGE_CACHE_DIR`
-   ⇒ 三个服务（control-plane / worker-1 / worker-2）**同值** `/var/lib/e2b-sandboxes/_images`；
+   ⇒ 三个服务（control-plane / worker-1 / worker-2）`E2B_IMAGE_CACHE_DIR` /
+   `E2B_IMAGE_CACHE_MAX_BYTES` / `E2B_IMAGE_CACHE_EVICT_MIN_AGE_S` /
+   `E2B_IMAGE_CACHE_OWNER_UID` **逐字同值**；
 2. 宿主上 `ls /var/lib/e2b-sandboxes/_images` 有 `_oci/` 与 `<image>-<digest>/rootfs/.complete`，
    且 `up -d` 重建后**不重新解压**（`grep "resolved base image" tmp/*.log` 不再出现同一条）；
-3. `du -sh /var/lib/e2b-sandboxes/_images` ≤ `E2B_IMAGE_CACHE_MAX_BYTES`（或日志里有逐出 WARNING）；
-4. 两个 worker 与 control-plane 的工作目录/镜像缓存**互不冲突**：并发建箱同一模板不再出现
-   `cannot resolve image` / 残缺 rootfs；
-5. 单测门禁：`tests/unit/test_image_cache_sharing.py`（跨进程竞争、失败不误伤、重启复用、
-   `_images` 不是沙箱树、上限逐出、`nolock` 形态）全绿。
+3. **两个 uid 各跑一次解析都成功**：控制面（root）先跑一次、worker（`docker exec -u
+   65534:65534`）再跑一次同一镜像，两边都拿到 `rootfs/.complete`，且 worker 能在该条目里
+   写（`mkdir <entry>/rootfs/workspace`）；反向顺序同样成立（探针
+   `tmp/zf7fix-uid.log`）；
+4. **沙箱 uid 写不进缓存**：以池内 uid（如 10001）尝试在 `_images`、`_oci`、条目 rootfs
+   里建/改文件必须 `Permission denied`（探针 `tmp/zf7fix-uid.log`）；
+5. `du -sb /var/lib/e2b-sandboxes/_images` 与 GC 报的 `total_bytes` 相等，且 ≤
+   `E2B_IMAGE_CACHE_MAX_BYTES`（或日志里有"仍超上限"WARNING，并列出钉子数）；
+6. 两个 worker 与 control-plane 的工作目录/镜像缓存**互不冲突**：并发建箱同一模板不再出现
+   `cannot resolve image` / 残缺 rootfs；被 `sandbox.json` 引用的条目在逐出后仍在
+   （探针 `tmp/zf7fix-prune.log`）；
+7. 单测门禁：`tests/unit/test_image_cache_sharing.py`（跨进程竞争、失败不误伤、重启复用、
+   `_images` 不是沙箱树、上限逐出、`nolock` 形态、两个 uid、引用钉子、真实占用口径、
+   `nolock`+残留不删已发布条目、锁超时）全绿。
 
 ## 3. 运维要求
 
@@ -618,7 +708,9 @@ rm -rf /var/lib/e2b-sandboxes/<id>
 
 镜像 rootfs 缓存（`_images`）**不在任何沙箱 projid 内**：生产形态靠
 `E2B_IMAGE_CACHE_DIR` 把它放到共享卷、`E2B_IMAGE_CACHE_MAX_BYTES` 给它自己的上界
-（§2.7）；开发形态保持相对路径默认，不受影响。
+（§2.7；两种形态在这点上**是同一个事实**——compose 的 quota-agent 是 opt-in
+`profiles: ["quota"]`，且 `_images` 本来就是保留命名空间、永远不进配额扫描）；
+开发形态保持相对路径默认，不受影响。
 
 ## 4. 验收清单（部署后）
 
@@ -630,7 +722,8 @@ rm -rf /var/lib/e2b-sandboxes/<id>
 6. 迁移沙箱（worker 间）→ 配额保留；
 7. 非 XFS 环境创建沙箱 → 正常创建 + 日志警告"project quota unavailable"。
 8. 镜像缓存（§2.7）：`E2B_IMAGE_CACHE_DIR` 三个服务同值且落在共享卷上，重建容器后
-   `_images/**/rootfs/.complete` 仍在、不再重新解压，且 `du -sh` 不超上限。
+   `_images/**/rootfs/.complete` 仍在、不再重新解压；root（控制面）与 65534（worker）
+   都能解析并写入同一条目；`du -sb` 不超（显式设置的）上限且与 GC 报的 `total_bytes` 相等。
 
 ## 5. NFS 共享存储形态（E6.4 实测结论与部署要求）
 

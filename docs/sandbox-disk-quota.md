@@ -76,13 +76,18 @@ route-B 给了"每沙箱一个常驻 supervise 实例"之后，"`max_disk` 是�
 
 处置结果（口径见 `docs/production-deployment-requirements.md` §2.7）：生产形态把
 `E2B_IMAGE_CACHE_DIR` 显式指到共享卷 `/var/lib/e2b-sandboxes/_images`（compose 的
-worker-1/worker-2/control-plane 与 k8s 的 worker/control-plane 同源）；因为 `_images` 属于
-**project 0（无限额）**，容量上界由解析器自己的按量 GC 承担
-（`E2B_IMAGE_CACHE_MAX_BYTES`，默认 8 GiB、生产设 4 GiB，最旧已完成条目优先逐出，
-`_oci/` 布局 tar 只计不删）——**没有**给 `_images` 单独建 project。同时补上跨进程安全：
-extraction 全程持 `<cache>/<image-slug>.lock` 的 `flock`，并以「同文件系统暂存树 +
-`os.replace`」原子发布，失败只清自己创建的暂存物（原实现只有进程内锁，两个 worker 共享目录
-时会互相踩）。默认（不设 env 的本地开发形态）行为不变：仍是相对路径。
+worker-1/worker-2/control-plane 与 k8s 的 worker/control-plane 同源，且
+`E2B_IMAGE_CACHE_OWNER_UID=65534` 把缓存交给 worker uid，使 root 控制面与 65534 worker
+都能写、沙箱 uid 只能读）；因为 `_images` 属于 **project 0（无限额）**，容量上界由解析器
+自己的按量 GC 承担（`E2B_IMAGE_CACHE_MAX_BYTES`，**默认不限、生产清单显式设 4 GiB**；
+`_oci/` 布局 tar 只计不删；`total_bytes` 就是 `du` 口径的真实占用，含暂存残留与未完成
+条目）——**没有**给 `_images` 单独建 project。逐出**跳过**任何被 `sandbox.json`
+（`base_image`，或记录里的 digest）引用的条目与本次刚发布的条目，`MIN_AGE` 有 60s 硬下限。
+跨进程安全：extraction 全程持 `<cache>/<image-slug>.lock` 的 `flock`（有超时，
+`E2B_IMAGE_CACHE_LOCK_TIMEOUT_S`），并以「同文件系统暂存树 + 原子 rename」发布；
+"清垃圾"先把残留原子抢到私有隔离名并复核，所以不可能删掉别人刚发布的条目；失败只清自己
+创建的暂存物（原实现只有进程内锁，两个 worker 共享目录时会互相踩）。默认（不设 env 的
+本地开发形态）落点不变：仍是相对路径。
 
 ## 2. 架构
 

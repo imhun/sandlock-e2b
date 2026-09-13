@@ -1,8 +1,30 @@
 services:
+  # Z-F7 C1: control plane (root) and worker (65534) share this cache, so it is
+  # created once with the worker's ownership -- never world-writable (a
+  # writable rootfs cache lets a sandbox poison another sandbox's image). See
+  # docs/production-deployment-requirements.md §2.7.1.
+  image-cache-init:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.envd
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mkdir -p /var/lib/e2b-sandboxes/_images/_oci &&
+        chown -R 65534:65534 /var/lib/e2b-sandboxes/_images &&
+        chmod 0755 /var/lib/e2b-sandboxes/_images /var/lib/e2b-sandboxes/_images/_oci
+    volumes:
+      - sandbox-data:/var/lib/e2b-sandboxes
+    restart: "no"
+
   control-plane:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.control-plane
+    depends_on:
+      image-cache-init:
+        condition: service_completed_successfully
     environment:
       E2B_API_KEYS: local-key
       E2B_ENABLE_LOCAL_NODE: "false"
@@ -13,6 +35,14 @@ services:
       # Extracted rootfs cache lives on the workspace volume so it survives
       # `up -d` and is shared instead of re-pulled per recreate.
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
+      # Bounded by the resolver itself (`_images` is in the volume's unlimited
+      # project) and owned by the worker uid, which is the only way both the
+      # root-run control plane and the 65534 worker can write it without making
+      # the cache world-writable. See
+      # docs/production-deployment-requirements.md §2.7.
+      E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
+      E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
+      E2B_IMAGE_CACHE_OWNER_UID: ${E2B_IMAGE_CACHE_OWNER_UID:-65534}
       E2B_MAX_SANDBOXES: 100
       E2B_BASE_IMAGE: python:3.14-slim
       E2B_TEMPLATE_IMAGES: '{"python3.14": "python:3.14-slim", "node22": "node:22-slim"}'
@@ -38,6 +68,9 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.envd
+    depends_on:
+      image-cache-init:
+        condition: service_completed_successfully
     # E5.1: worker/supervisor runs as uid 65534 (sandlock non-root shape);
     # the image pre-creates /var/lib/e2b-sandboxes owned by 65534 and the
     # named volume inherits that ownership on first creation.
@@ -45,6 +78,9 @@ services:
     environment:
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
+      E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
+      E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
+      E2B_IMAGE_CACHE_OWNER_UID: ${E2B_IMAGE_CACHE_OWNER_UID:-65534}
     ports:
       - "49983:49983"
     volumes:

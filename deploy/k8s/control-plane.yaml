@@ -13,6 +13,30 @@ spec:
       labels:
         app: control-plane
     spec:
+      # Z-F7 C1: this pod runs as root and exports template layout tars into
+      # ``_images/_oci/`` on the shared PVC; the worker pods (65534) extract the
+      # rootfs entries. Create the cache once with the worker's ownership before
+      # either side writes -- never 0777, since a writable rootfs cache lets a
+      # sandbox poison another sandbox's image. Best-effort: on NFS with
+      # root_squash the chown may be refused and the resolver then reports what
+      # to run. docs/production-deployment-requirements.md §2.7.1.
+      initContainers:
+        - name: image-cache-init
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
+          securityContext:
+            runAsUser: 0
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              mkdir -p /var/lib/e2b-sandboxes/_images/_oci &&
+              (chown -R 65534:65534 /var/lib/e2b-sandboxes/_images ||
+              echo "image-cache-init: chown refused (NFS root_squash?)") &&
+              (chmod 0755 /var/lib/e2b-sandboxes/_images
+              /var/lib/e2b-sandboxes/_images/_oci || true)
+          volumeMounts:
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
       containers:
         - name: control-plane
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-control-plane-gateway:0.1.0
@@ -55,6 +79,14 @@ spec:
               value: "4294967296"
             - name: E2B_IMAGE_CACHE_EVICT_MIN_AGE_S
               value: "300"
+            # This pod runs as root and the workers as 65534, so the resolver
+            # hands every directory and file it creates to the worker uid: the
+            # worker writes as the owner, root writes through CAP_DAC_OVERRIDE,
+            # and a sandbox uid (10000+) gets read/traverse bits only -- never
+            # 0777, since a writable rootfs cache is a cross-tenant poisoning
+            # vector. docs/production-deployment-requirements.md §2.7.1.
+            - name: E2B_IMAGE_CACHE_OWNER_UID
+              value: "65534"
             - name: E2B_BASE_IMAGE
               value: python:3.14-slim
             - name: E2B_MAX_SANDBOXES
