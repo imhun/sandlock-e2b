@@ -598,3 +598,28 @@ ACR 镜像推送照常，git 远程推送暂缓。
    （模拟非 root worker：chown 之后的 chmod 是 EPERM，钉住顺序与"已 1777 不吭声"），
    上线后复验 `tmp/c2c3-53-volume-perms-online.log` + `tmp/c2c3-54-volume-warn-recheck.log`
    （挂载后 WARNING 计数 0）。
+
+28. **控制面/清单侧三条 Minor 收口（W4，2026-09-13）**:
+   ✅ 三条都已落地（本地提交，未推送；判定与证据见
+   `.superpowers/sdd/task-w4-controlplane-report.md`）：
+   ① **合体节点配额硬编码 `via_agent=False`** ⇒ **判定为缺陷**：`control_plane/api/sandboxes.py`
+   两处（provision + destroy/GC release）改为跟随 envd 的开关 —— `E2B_QUOTA_AGENT_URL` 存在即
+   agent 形态，否则 `E2B_QUOTA_VIA_AGENT`（默认 false）；开关本身直接问
+   `envd_service.config.Settings.quota_via_agent`（`control_plane.config.local_node_quota_via_agent()`），
+   不复制规则。合并镜像不跑 `envd_service.app.create_app`，所以合成节点在启动时
+   （`E2B_ENABLE_LOCAL_NODE` 且开关开）用 `configure_quota_agent_client` 把 hooks 接上 ——
+   否则「配好了 agent」的合体节点仍会被报成 quota-agent not configured 并静默降级。
+   ② **控制面卷根缺祖先穿透位** ⇒ 新增
+   `control_plane/registry/volumes.py::_widen_ancestors_for_tenant_uids`，复用 A5 的
+   `envd_service.volumes._ensure_traversable`（同一份实现、不复制），在 `VolumeRegistry.create`
+   建卷根、`chmod 1777` **之前**跑一次：合体节点自己建卷根、不走 worker 的挂载半边，
+   0700 祖先会让租户 uid 连绝对卷路径都 EACCES（§2.4.2）。
+   ③ **k8s 无 quota-agent 清单** ⇒ **判定为口径（降级），不新增清单**：k8s 形态默认无
+   per-sandbox 硬限 + 一条 WARNING（建箱/挂卷照常），需要硬限时把 `E2B_QUOTA_AGENT_URL`
+   指向集群内/外的自备 agent；后果清单与「为什么不随清单发特权 agent（未验证的新部署面）」
+   写进 `docs/production-deployment-requirements.md` §2.4.4，`deploy/k8s/worker.yaml` 的 A6
+   注释块指向该节。
+   **证据**：RED `tmp/w4-red.log`（10 failed）、GREEN `tmp/w4-green.log`（13 passed）、
+   `tests/unit` 失败集合逐条 diff 为空（`tmp/w4-unit-baseline-wip.log` vs
+   `tmp/w4-unit-final.log`）、`tests/contract` 31 failed / 187 passed / 41 skipped 且集合一致
+   （`tmp/w4-contract-baseline-r2.log`、`tmp/w4-contract-final.log`）。

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI
 
@@ -17,7 +19,7 @@ from control_plane.api.secrets import router as secrets_router
 from control_plane.api.snapshots import router as snapshots_router
 from control_plane.api.templates import router as templates_router
 from control_plane.api.volumes import router as volumes_router
-from control_plane.config import Settings
+from control_plane.config import Settings, local_node_quota_via_agent
 from control_plane.metrics import SlidingWindowCounter
 from control_plane.queue import CreateQueue
 from control_plane.registry.manager import SandboxRegistry
@@ -28,6 +30,9 @@ from control_plane.registry.templates import TemplateRegistry
 from control_plane.ratelimit import SlidingWindowRateLimiter
 from control_plane.registry.ttl import TTLSweeper
 from control_plane.registry.volumes import VolumeRegistry
+
+if TYPE_CHECKING:  # pragma: no cover - typing only (envd may be absent)
+    from envd_service.quota_agent import QuotaAgentClient
 
 
 class _NoopRuntimeRegistry:
@@ -57,6 +62,50 @@ class _NoopRuntimeRegistry:
         pass
 
 
+def _wire_local_node_quota_agent(
+    settings: Settings,
+) -> "QuotaAgentClient | None":
+    """Wire the quota-agent hooks for a combined ("合体") node.
+
+    ``control_plane.combined_main`` runs the control plane and the envd
+    gateway in one process, but it never builds the envd worker app
+    (``envd_service.app.create_app``) -- which is where the agent hooks
+    (``xfs_quota.agent_query`` / ``agent_ops``) are normally wired. The
+    control plane's own volume quota reads the same switch
+    (:func:`control_plane.config.local_node_quota_via_agent`), so the hooks
+    have to exist here too; without them a deployment that *did* configure
+    ``E2B_QUOTA_AGENT_URL`` would still be told "quota-agent not configured"
+    and silently keep the degraded (no hard limit) shape.
+
+    The three agent coordinates are read with the envd service's own names and
+    defaults (pinned by ``tests/unit/test_controlplane_local_node_quota.py``),
+    *not* by building ``envd_service.config.Settings``: the combined control
+    plane has no business validating the rest of the worker's configuration
+    (port mappings, template images, ...), and a malformed unrelated value
+    must not take it down at startup.
+
+    Returns the client to close on shutdown, or ``None`` when the agent form
+    is off. A separated control plane (``E2B_ENABLE_LOCAL_NODE=false``)
+    provisions no quota in-process and wires nothing, exactly like it does not
+    need the envd runtime registry.
+    """
+    if not settings.enable_local_node:
+        return None
+    try:
+        from envd_service.quota_agent import configure_quota_agent_client
+    except ImportError:  # pragma: no cover - separated control-plane image
+        return None
+    if not local_node_quota_via_agent():
+        return None
+    from gateway_common.env import env_float
+
+    return configure_quota_agent_client(
+        url=(os.getenv("E2B_QUOTA_AGENT_URL") or "").strip() or None,
+        token=os.getenv("E2B_QUOTA_AGENT_TOKEN") or None,
+        timeout_s=env_float("E2B_QUOTA_AGENT_TIMEOUT_S", 5.0),
+    )
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -71,6 +120,7 @@ def create_app(
 ) -> FastAPI:
     settings = settings or Settings()
     redis_client = None
+    quota_agent_client = _wire_local_node_quota_agent(settings)
     if settings.redis_url:
         from control_plane.registry.redis_backend import create_redis_client
 
@@ -162,10 +212,13 @@ def create_app(
             except asyncio.CancelledError:
                 pass
         await sweeper.stop()
+        if quota_agent_client is not None:
+            quota_agent_client.close()
 
     app = FastAPI(title="E2B Sandlock Gateway - Control Plane", lifespan=lifespan)
     app.state.settings = settings
     app.state.redis_client = redis_client
+    app.state.quota_agent_client = quota_agent_client
     app.state.registry = registry
     app.state.create_queue = create_queue
 

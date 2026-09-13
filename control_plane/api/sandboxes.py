@@ -23,6 +23,7 @@ from control_plane.auth import (
     tenant_of,
     tenant_scope,
 )
+from control_plane.config import local_node_quota_via_agent
 from control_plane.queue import QueueOutcome
 from control_plane.registry.manager import (
     PRIORITY_DEFAULT,
@@ -1220,7 +1221,12 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
                 shared_volume_root=settings.shared_volume_root,
                 workspace_dir=workspace_dir,
                 fallback_mount_point=settings.workspace_base,
-                via_agent=False,
+                # The combined node's volume quota follows the same switch as
+                # the envd service it runs in-process (``E2B_QUOTA_AGENT_URL``
+                # / ``E2B_QUOTA_VIA_AGENT``): a non-root merged image has no
+                # ``xfs_quota`` and no ``CAP_SYS_ADMIN``, and an NFS volume
+                # has no local project quota at all.
+                via_agent=local_node_quota_via_agent(),
                 existing_volume_projects=(
                     existing.volume_projects if existing is not None else []
                 ),
@@ -1485,7 +1491,10 @@ def _destroy_local(
                 cleanup_volume_projects(
                     volume_projects=runtime.volume_projects,
                     fallback_mount_point=state.workspace_base,
-                    via_agent=False,
+                    # Release (and the GC fallback behind it) takes the same
+                    # switch as provisioning, or a released project would be
+                    # asked of the wrong side.
+                    via_agent=local_node_quota_via_agent(),
                 )
         shutil.rmtree(
             state.workspace_base / record.sandbox_id, ignore_errors=True

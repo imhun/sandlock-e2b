@@ -143,7 +143,7 @@ route-B 槽位**读回（槽位就是 uid X、本来就能读自己的文件）�
 | `CHOWN` | workspace/slice 交给该沙箱 uid，属组 = worker 的 gid、模式 `0770`（fix round 1 / c1）；uid 回收时再 chown 回来 | E3.2 的属主前提不成立（非 root 形态由 `e2b-maint` 代做） |
 | `DAC_OVERRIDE` | **兜底**：worker 的属组访问够不到的树 —— 沙箱自建 `0700` 子目录、`1777` 卷根、升级前遗留的 root 属主目录（`e2b-maint rm/walk`）。c1 之后 files API / watcher / 命令日志 / 快照 / 删除租户树都走 worker 自己的属组权限，不经 broker | 旧 `0700` 模型下：`PermissionError: …/sbx_a/workspace`、对账与共享卷持久化用例 4 failed / 4 error；新模型下日常路径已不需要它 |
 | `SETUID`+`SETGID`+`CHOWN`+`DAC_OVERRIDE`（**BND**，非 root worker） | 非 root worker 的那四条 cap 只出现在容器 **bounding set** 里，不落到 worker 进程：`capabilities.add` 对非 root 不产生 `CapEff`（实测 `--user 65534 --cap-add SETUID` 仍 `CapEff=0`），它们唯一的作用是给 broker 的 file caps「开闸」——**file caps 必须是 BND 的子集，否则连 exec 都 EPERM**（实测 rc=126）。worker 侧的四步特权动作全部由两个专用 broker 完成（见 §2.4 的 F1 段） | 缺任一条 ⇒ broker exec 被内核拒绝（`Operation not permitted`），`e2b-slot-spawn`/`e2b-maint` 全废：非 root worker 退回进程内 E5.1 形态（无 per-sandbox uid、无槽位；chroot 形态建箱被 fork 拒绝）。`E2B_PRIV_HELPERS` 自检会点名缺哪条并让 worker 拒绝启动。**另：`--cap-drop ALL` 必须跟 `--cap-add`**（单独 drop ALL ⇒ BND=0 ⇒ 同样死），**绝不能加 no-new-privileges**（实测 NNP=1 时 file caps 被忽略：`setgroups/setgid/setuid: Operation not permitted`） |
-| `SYS_ADMIN` | **出厂镜像与清单形态下，worker 侧不需要它**（A6 迁出，A7 固化）。全库只剩一处用途，且不在 worker 上：`deploy/stack/docker-compose.prod.yml` 的 **quota-agent** 服务（`profiles: ["quota"]`）执行 `xfs_quota -x` —— 内核按 effective `CAP_SYS_ADMIN` 门控（§2.4.3）。worker 侧原来那三处：① 共享卷 `mount --bind` 进 workspace —— **A4 删 bind**（卷视图 = 请求路径决定的符号链接）+ **A5 补祖先穿透位**；② 直接执行 `xfs_quota -x` —— **A6** 改由 quota-agent 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关）；③ 写 namespaced sysctl（`ip_unprivileged_port_start`）—— **A6** 改由容器 spec 声明（compose `sysctls:` / `docker --sysctl`；k8s 是 **pod 级** `spec.template.spec.securityContext.sysctls`；`NET_BIND_SERVICE` 对非 root pod **不足以**覆盖 `:53`，实测见 §2.4.3）。⚠️ **限定**：代码里仍有两条非部署默认的路径需要它 —— 合体节点（`E2B_ENABLE_LOCAL_NODE` 默认 **true**，`control_plane/api/sandboxes.py` 硬编码 `via_agent=False` ⇒ 配额在控制面进程里本地直连）与 legacy `E2B_ENABLE_NETNS=true`（运行时写 `net.ipv4.ip_forward` + iptables）；这两条在**出厂镜像**里也跑不起来（无 `xfs_quota`/`sysctl`/`iptables`，实测镜像 `command -v` 全 MISSING），所以「不需要」只在镜像 + 清单形态下成立 | 摘掉它的后果**只剩配额降级**：quota-agent 未配置/不可达 ⇒ 建箱与挂卷照常、无 per-sandbox 磁盘硬限 + 一条 WARNING。共享卷不再是理由 —— A4/A5 的契约（`tests/contract/test_shared_volume_relative_cwd.py` 等 36 条）+ 13 条穿透单测在**无 `SYS_ADMIN`** lane 三连绿（`tmp/a4-final-step4-run{1,2,3}.log`）；A7 起整份套件也在**无 `SYS_ADMIN`** 下全绿：`PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` = `1075 passed, 3 skipped, 0 failed`（`tmp/a7-nosa.log`，cap 探针 `CapEff 0xa02c35fb → 0xa00c35fb`）。A6 的配额 lane（同形状，无 `SYS_ADMIN`）：agent 形态 `tmp/a6-agent.log` = `107 passed`；降级形态 `tmp/a6-degrade.log` = `29 passed, 5 errors`（5 个 error 是 XFS prjquota 门用例被 `E2B_TEST_STRICT_SKIPS=1` 显式暴露；A7 起 `tests/unit/test_xfs_project_quota_agent.py` 不再被 deselect，见 §2.5） |
+| `SYS_ADMIN` | **出厂镜像与清单形态下，worker 侧不需要它**（A6 迁出，A7 固化）。全库只剩一处用途，且不在 worker 上：`deploy/stack/docker-compose.prod.yml` 的 **quota-agent** 服务（`profiles: ["quota"]`）执行 `xfs_quota -x` —— 内核按 effective `CAP_SYS_ADMIN` 门控（§2.4.3）。worker 侧原来那三处：① 共享卷 `mount --bind` 进 workspace —— **A4 删 bind**（卷视图 = 请求路径决定的符号链接）+ **A5 补祖先穿透位**；② 直接执行 `xfs_quota -x` —— **A6** 改由 quota-agent 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关）；③ 写 namespaced sysctl（`ip_unprivileged_port_start`）—— **A6** 改由容器 spec 声明（compose `sysctls:` / `docker --sysctl`；k8s 是 **pod 级** `spec.template.spec.securityContext.sysctls`；`NET_BIND_SERVICE` 对非 root pod **不足以**覆盖 `:53`，实测见 §2.4.3）。⚠️ **限定**：代码里仍有两条非部署默认的路径需要它 —— 合体节点（`E2B_ENABLE_LOCAL_NODE` 默认 **true**：控制面在进程内自建卷配额；W4 起它的 `via_agent` **跟随** envd 的开关 —— `E2B_QUOTA_AGENT_URL` 存在就走 agent（§2.4.3/§2.4.4），所以只有**没配 agent** 的合体节点才在控制面进程里本地直连、才需要它）与 legacy `E2B_ENABLE_NETNS=true`（运行时写 `net.ipv4.ip_forward` + iptables）；这两条在**出厂镜像**里也跑不起来（无 `xfs_quota`/`sysctl`/`iptables`，实测镜像 `command -v` 全 MISSING），所以「不需要」只在镜像 + 清单形态下成立 | 摘掉它的后果**只剩配额降级**：quota-agent 未配置/不可达 ⇒ 建箱与挂卷照常、无 per-sandbox 磁盘硬限 + 一条 WARNING。共享卷不再是理由 —— A4/A5 的契约（`tests/contract/test_shared_volume_relative_cwd.py` 等 36 条）+ 13 条穿透单测在**无 `SYS_ADMIN`** lane 三连绿（`tmp/a4-final-step4-run{1,2,3}.log`）；A7 起整份套件也在**无 `SYS_ADMIN`** 下全绿：`PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` = `1075 passed, 3 skipped, 0 failed`（`tmp/a7-nosa.log`，cap 探针 `CapEff 0xa02c35fb → 0xa00c35fb`）。A6 的配额 lane（同形状，无 `SYS_ADMIN`）：agent 形态 `tmp/a6-agent.log` = `107 passed`；降级形态 `tmp/a6-degrade.log` = `29 passed, 5 errors`（5 个 error 是 XFS prjquota 门用例被 `E2B_TEST_STRICT_SKIPS=1` 显式暴露；A7 起 `tests/unit/test_xfs_project_quota_agent.py` 不再被 deselect，见 §2.5） |
 | `SYS_PTRACE` | 只服务**进程内 RunAs**（父进程给子进程写 `uid_map` 需要对该子进程的 ptrace 访问权） | 非 route-B 的 per-uid 沙箱每个建箱挂在 `sandlock_create failed`；route B 完全不需要 |
 
 **构建期 vs 运行期（F1 实测，都是踩过的坑）**：`setcap` 需要 `libcap2-bin`，而执行
@@ -268,6 +268,12 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 - **开关是 URL**：`E2B_QUOTA_AGENT_URL` 存在即启用 agent 形态（优先于 `E2B_QUOTA_VIA_AGENT`，
   后者默认 false）。同时配 `E2B_QUOTA_AGENT_TOKEN`（与 agent 同值，`X-Internal-Key`）。
   `E2B_QUOTA_VIA_AGENT=true` 而 URL 为空仍是受支持的误配：启动打一条 WARNING、配额降级。
+- **合体节点（W4）**：`E2B_ENABLE_LOCAL_NODE=true` 时控制面在**自己的进程里**建卷配额
+  （`control_plane/api/sandboxes.py`），它的 `via_agent` **跟随同一个开关**（不再硬编码
+  `false`），并且合并镜像不跑 `envd_service.app.create_app` ⇒ agent hooks 由控制面启动时
+  接上。缺了接线这一步，一个**配好了** `E2B_QUOTA_AGENT_URL` 的合体节点仍会被报成
+  「quota-agent not configured」并静默降级。非 root 的合并镜像既没有 `xfs_quota` 也没有
+  `CAP_SYS_ADMIN`，本地直连本来就不可用（§2.4.1 的 `SYS_ADMIN` 行）。
 - **清单 + 发布流程（A6 fix-1）**：`deploy/stack/docker-compose.prod.yml` 的 `quota-agent`
   服务（`profiles: ["quota"]`、`cap_add: SYS_ADMIN`、与 worker 挂同一份 `sandbox-shared`）。
   一条命令开启：`./deploy/scripts/upgrade.sh --with-quota-agent` —— 它把
@@ -305,6 +311,31 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
   但清单以 Dockerfile 的 `USER` 为准，声明这条 sysctl 对两种形态都安全）。该 sysctl 自 k8s 1.22 起属
   **safe sysctl**（无需 kubelet `--allowed-unsafe-sysctls`）；`hostNetwork: true` 下 `net.*`
   会被拒。MCP 入站端口是 50005+，从来不需要低端口窗口。
+
+### 2.4.4 k8s 清单形态的配额口径：降级（2026-09-13 裁定，W4）
+
+`deploy/k8s/` 发布 worker / control-plane / gateway / autoscaler / redis / PVC / namespace
+七份清单，**不含 quota-agent**，所以 k8s 形态的默认口径就是**配额降级**（不是缺陷，是口径）：
+
+- 建箱、挂卷、命令、快照全部照常；**没有** per-sandbox 磁盘硬限 —— `xfs_project_supported`
+  找不到可用配额来源，挂卷回落到卷根，worker 按 §3.1 的既有披露打一条 WARNING。
+- 后果（部署/验收前必须知道）：
+  1. 单沙箱写满共享卷会影响同卷的其他租户（没有 `bhard` 兜底），容量只能靠
+     `E2B_NODE_DISK_MB` 一类的节点级预算和监控；
+  2. 对账链上的 `release_project` / `reconcile_orphan_projects` 也需要一个配额来源；
+     降级形态下**没有**项目行可释放（从来没建过），所以**不要**在降级形态下手动
+     `xfs_quota -x` 建行 —— 那会造出没人回收的孤儿行，正是 §2.5 那批 follow-up 的形状；
+  3. 升级说明与验收结论里不能写「有硬限」。
+- 需要硬限时：把 `E2B_QUOTA_AGENT_URL`/`E2B_QUOTA_AGENT_TOKEN` 指向**自己部署**的 agent
+  （集群内、集群外都行），前提是它对 worker 看到的那份存储执行 `xfs_quota -x`。k8s 的共享卷
+  是 RWX PVC（NFS/CephFS），XFS project quota 只在该 PVC 后端**真的是 XFS**、且 agent 能拿到
+  设备/挂载点时成立；NFS 形态要配 `E2B_QUOTA_AGENT_PATH_MAP`（见
+  `deploy/compose/docker-compose.quota-agent.yml` 与 §5.2）。
+- **为什么不随清单发 agent**：agent 需要 `SYS_ADMIN` + 宿主机上真实的 XFS 设备/挂载点；
+  compose 形态能直接给它 `cap_add: SYS_ADMIN` + 同一份宿主卷，k8s 的等价物是「特权 pod +
+  PVC/PV 后端语义 + `PATH_MAP` + 节点亲和」——**本仓没有验证过的部署面**。与其发一份没人跑通过
+  的清单，不如把口径写死在这里；等有真实 k8s + XFS 环境再补清单，并把本节改成「已提供」。
+  `deploy/k8s/worker.yaml` 的 A6 注释块指向本节。
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 

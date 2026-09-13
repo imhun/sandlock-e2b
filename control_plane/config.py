@@ -343,3 +343,28 @@ def uvicorn_ssl_kwargs(settings: Settings) -> dict[str, str]:
     if cert_file is None:
         return {}
     return {"ssl_certfile": cert_file, "ssl_keyfile": key_file}
+
+
+def local_node_quota_via_agent() -> bool:
+    """Whether a combined ("合体") node must route quota through the agent.
+
+    ``E2B_ENABLE_LOCAL_NODE`` (default true) makes the control plane provision
+    sandboxes in its own process, and its *volume* quota is provisioned here
+    (``control_plane/api/sandboxes.py``) while the workspace/GC half belongs
+    to the envd service. One deployment must answer that switch the same way
+    on both halves -- ``E2B_QUOTA_AGENT_URL`` present, else
+    ``E2B_QUOTA_VIA_AGENT`` (default false) -- so this asks the envd service
+    for the very function its own ``Settings.quota_via_agent`` is built from
+    instead of re-deriving the rule. It matters in this shape: the merged
+    image runs non-root (no ``xfs_quota``, no ``CAP_SYS_ADMIN``) and a volume
+    may live on an NFS mount, where quota is server-side.
+
+    A separated control plane (``E2B_ENABLE_LOCAL_NODE=false``) provisions no
+    quota itself and has no envd service to ask; ``False`` is then the
+    accurate answer for every caller.
+    """
+    try:
+        from envd_service.config import _quota_via_agent_from_env
+    except ImportError:  # pragma: no cover - separated control-plane image
+        return False
+    return _quota_via_agent_from_env()

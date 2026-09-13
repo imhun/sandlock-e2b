@@ -12,7 +12,10 @@
 固化成门禁并跑出 **0 failed / 0 error**。`SYS_ADMIN` 现在全库只剩一处用途，且**不在 worker 上**：
 `deploy/stack/docker-compose.prod.yml` 的 `quota-agent`（`profiles: ["quota"]`）。
 ⚠️ **限定**：代码里仍保留两条**非部署默认**的路径需要它 —— 合体节点
-（`E2B_ENABLE_LOCAL_NODE` 默认 true，`control_plane/api/sandboxes.py` 硬编码 `via_agent=False`）
+（`E2B_ENABLE_LOCAL_NODE` 默认 true；**W4 起** `control_plane/api/sandboxes.py` 的 `via_agent`
+不再硬编码，而是跟随 envd 的开关，`E2B_QUOTA_AGENT_URL` 存在就走 agent 并在控制面进程里接上
+hooks ⇒ 只有**没配 agent** 的合体节点才本地直连，见
+`docs/production-deployment-requirements.md` §2.4.3/§2.4.4）
 与 legacy `E2B_ENABLE_NETNS=true`（运行时写 `ip_forward` + iptables）；出厂 worker 镜像里
 `xfs_quota`/`sysctl`/`iptables` 都不存在（实测 `command -v` 全 MISSING），所以这两条在默认
 形态下本来也跑不起来。

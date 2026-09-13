@@ -92,9 +92,14 @@ spec:
           # served by the server-side quota-agent (E2.6) -- point
           # E2B_QUOTA_AGENT_URL at its endpoint, whereas the worker's local
           # direct ``xfs_quota -x`` path needs SYS_ADMIN and is not the
-          # deployment form; ③ the :53 wildcard-DNS gateway is enabled by the
-          # pod-level sysctl above (NET_BIND_SERVICE alone does not cover it for
-          # this non-root pod -- see the comment there).
+          # deployment form. This manifest set ships NO quota-agent, so the
+          # k8s default is the *degraded* form (no per-sandbox hard limit +
+          # one WARNING) unless an agent is pointed at from outside; the
+          # stance and its consequences are pinned in
+          # docs/production-deployment-requirements.md §2.4.4 (W4); ③ the :53
+          # wildcard-DNS gateway is enabled by the pod-level sysctl above
+          # (NET_BIND_SERVICE alone does not cover it for this non-root pod --
+          # see the comment there).
           securityContext:
             capabilities:
               # Track F (F1): the non-root worker's two file-capability brokers

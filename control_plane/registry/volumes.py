@@ -24,6 +24,31 @@ from gateway_common.timeutil import to_iso_z, utcnow
 RECORD_KIND_VOLUME = "volume"
 
 
+def _widen_ancestors_for_tenant_uids(volume_root: Path) -> None:
+    """Give tenant uids a way *through* every ancestor of a volume root.
+
+    The volume root is created here, in the control-plane process, but the
+    sandbox opens that host path *as its own uid* (E3.2 / route-B slot), so
+    DAC needs ``o+x`` on every level between ``/`` and the volume view -- the
+    ``1777`` on the root alone is not enough (A5,
+    ``docs/production-deployment-requirements.md`` §2.4.2). A stack
+    deployment gets that from the worker's mount path
+    (``envd_service.volumes._ensure_shared_volume_root``); a combined
+    ("合体") node creates the root here and never runs that half for its own
+    volume roots, so creation has to apply the same rule to the same path.
+
+    Reuses the worker's helper rather than a second copy, so the two sides of
+    one deployment cannot drift; it only ever *adds* the x bits (best-effort,
+    never fails provisioning). A separated control plane has no envd service
+    and no tenant uids, and the import failure is then the no-op.
+    """
+    try:
+        from envd_service.volumes import _ensure_traversable
+    except ImportError:  # pragma: no cover - separated control-plane image
+        return
+    _ensure_traversable(volume_root)
+
+
 class UnknownVolumeError(KeyError):
     pass
 
@@ -198,6 +223,10 @@ class VolumeRegistry:
             # rwx (single-entry userns has no supplementary groups) with the
             # sticky bit preventing cross-uid deletion. Best-effort: a
             # filesystem that refuses the chmod keeps the platform default.
+            # The chain above the root needs its own o+x pass (W4): the
+            # sandbox reaches this path as the tenant uid, and a 0700
+            # ancestor turns even an absolute volume path into EACCES.
+            _widen_ancestors_for_tenant_uids(record.path)
             try:
                 os.chmod(record.path, 0o1777)
             except OSError:
