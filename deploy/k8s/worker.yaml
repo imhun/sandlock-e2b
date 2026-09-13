@@ -60,6 +60,22 @@ spec:
               value: "internal-key"
             - name: E2B_WORKSPACE_BASE
               value: /var/lib/e2b-sandboxes
+            # Track Z / Z-F7: the extracted image rootfs cache goes on the same
+            # RWX PVC as the workspaces, not inside the pod. The k8s shape has
+            # the same gap the compose stack had: the default is the *relative*
+            # ``tmp/sandboxes/_images``, so every pod restart (and every
+            # rescheduled replica) threw the whole cache away and each replica
+            # kept a private copy. ``_images`` is a reserved platform namespace
+            # (gateway_common/paths.py), so the sandbox scans and the quota
+            # scan skip it -- and since this manifest set ships no quota-agent
+            # (§2.4.4, W4), the resolver's own cap is the ONLY bound the cache
+            # has here; it must stay set (docs/production-deployment-requirements.md §2.7).
+            - name: E2B_IMAGE_CACHE_DIR
+              value: /var/lib/e2b-sandboxes/_images
+            - name: E2B_IMAGE_CACHE_MAX_BYTES
+              value: "4294967296"
+            - name: E2B_IMAGE_CACHE_EVICT_MIN_AGE_S
+              value: "300"
             # Track F (F1): the non-root worker scopes each slot's
             # policy/program documents to that slot's uid (0440) through
             # e2b-maint, and the broker only touches paths under

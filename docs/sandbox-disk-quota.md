@@ -70,9 +70,19 @@ route-B 给了"每沙箱一个常驻 supervise 实例"之后，"`max_disk` 是�
 **必须放进共享目录 + 只读绑定**，**不得复制进沙箱树**——复制会变成"每沙箱一份 = 计入沙箱配额 + 存储放大"，
 破坏"配额 = 用户增量"这个语义。今天的镜像 rootfs 正是按这个约束做的。
 
-**已登记缺口（Z-F7）**：镜像缓存走 `E2B_IMAGE_CACHE_DIR`，默认值是**相对路径** `tmp/sandboxes/_images`，
-线上 `.env` 未设置 ⇒ 缓存落在 **worker 容器内**、`up -d` 即丢，且**不受任何配额约束**
-（不在沙箱 projid 内，也不在共享卷上）。要治就让它落共享卷 + 单独一个 project（或明确不限），属独立小项。
+**已登记缺口（Z-F7，2026-09-13 闭环）**：镜像缓存走 `E2B_IMAGE_CACHE_DIR`，默认值是**相对路径**
+`tmp/sandboxes/_images`，线上 `.env` 未设置 ⇒ 缓存落在 **worker 容器内**、`up -d` 即丢，
+且**不受任何配额约束**（不在沙箱 projid 内，也不在共享卷上）。
+
+处置结果（口径见 `docs/production-deployment-requirements.md` §2.7）：生产形态把
+`E2B_IMAGE_CACHE_DIR` 显式指到共享卷 `/var/lib/e2b-sandboxes/_images`（compose 的
+worker-1/worker-2/control-plane 与 k8s 的 worker/control-plane 同源）；因为 `_images` 属于
+**project 0（无限额）**，容量上界由解析器自己的按量 GC 承担
+（`E2B_IMAGE_CACHE_MAX_BYTES`，默认 8 GiB、生产设 4 GiB，最旧已完成条目优先逐出，
+`_oci/` 布局 tar 只计不删）——**没有**给 `_images` 单独建 project。同时补上跨进程安全：
+extraction 全程持 `<cache>/<image-slug>.lock` 的 `flock`，并以「同文件系统暂存树 +
+`os.replace`」原子发布，失败只清自己创建的暂存物（原实现只有进程内锁，两个 worker 共享目录
+时会互相踩）。默认（不设 env 的本地开发形态）行为不变：仍是相对路径。
 
 ## 2. 架构
 

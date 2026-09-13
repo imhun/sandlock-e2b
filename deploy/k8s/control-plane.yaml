@@ -39,6 +39,22 @@ spec:
               value: /var/lib/e2b-sandboxes
             - name: E2B_WORKSPACE_BASE
               value: /var/lib/e2b-sandboxes
+            # Track Z / Z-F7: same shared image cache as the workers. This
+            # deployment runs 2 replicas over the same RWX PVC at the same
+            # path, so with no E2B_IMAGE_REGISTRY configured Template.build
+            # exports the OCI layout tar into ``_images/_oci/`` where the
+            # workers (and the other replica) can resolve it; unset, each
+            # replica wrote its own copy inside its container and the workers
+            # could never see it. The per-image flock + atomic publish in
+            # envd_service/runtime/image_resolver.py is what makes the shared
+            # directory safe for two replicas, and E2B_IMAGE_CACHE_MAX_BYTES is
+            # what bounds it (docs/production-deployment-requirements.md §2.7).
+            - name: E2B_IMAGE_CACHE_DIR
+              value: /var/lib/e2b-sandboxes/_images
+            - name: E2B_IMAGE_CACHE_MAX_BYTES
+              value: "4294967296"
+            - name: E2B_IMAGE_CACHE_EVICT_MIN_AGE_S
+              value: "300"
             - name: E2B_BASE_IMAGE
               value: python:3.14-slim
             - name: E2B_MAX_SANDBOXES

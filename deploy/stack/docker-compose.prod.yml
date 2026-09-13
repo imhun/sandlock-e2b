@@ -73,6 +73,22 @@ services:
       E2B_IMAGE_REGISTRY: ${E2B_IMAGE_REGISTRY:-}
       E2B_IMAGE_REGISTRY_USERNAME: ${E2B_IMAGE_REGISTRY_USERNAME:-}
       E2B_IMAGE_REGISTRY_PASSWORD: ${E2B_IMAGE_REGISTRY_PASSWORD:-}
+      # Track Z / Z-F7: the extracted image rootfs cache lives on the shared
+      # volume instead of inside this container. Unset, the default is the
+      # *relative* ``tmp/sandboxes/_images`` (resolved against the container's
+      # CWD), so every `up -d` discarded every rootfs, each worker kept a
+      # private copy, and the cache sat outside both the quota and the
+      # workspace entirely. The control plane needs the same directory: with no
+      # registry configured it exports locally built template images as OCI
+      # layout tars into ``_images/_oci/`` for the workers to resolve.
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
+      # That directory is in the volume's *unlimited* project (``_images`` is a
+      # reserved platform namespace, not a sandbox tree), so the resolver
+      # bounds the cache itself: completed entries beyond this cap are evicted
+      # oldest-first, never within the freshness floor below. 0 = unbounded.
+      # See docs/production-deployment-requirements.md §2.7.
+      E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
+      E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE}
       E2B_TEMPLATE_IMAGES: ${E2B_TEMPLATE_IMAGES:-}
       E2B_MAX_SANDBOXES: ${E2B_MAX_SANDBOXES:-100}
@@ -139,6 +155,15 @@ services:
       E2B_IMAGE_REGISTRY: ${E2B_IMAGE_REGISTRY:-}
       E2B_IMAGE_REGISTRY_USERNAME: ${E2B_IMAGE_REGISTRY_USERNAME:-}
       E2B_IMAGE_REGISTRY_PASSWORD: ${E2B_IMAGE_REGISTRY_PASSWORD:-}
+      # Track Z / Z-F7: both workers AND this node resolve from ONE image cache
+      # on the shared volume. Two workers on the same directory used to be the
+      # Z-F7 hazard (each held only an in-process lock: both could extract the
+      # same entry and one could delete the other's finished rootfs); the
+      # resolver now serializes on ``<cache>/<image>.lock`` and publishes with
+      # ``os.replace``, and bounds the cache (see §2.7).
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
+      E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
+      E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
       E2B_NODE_MEMORY_MB: ${E2B_NODE_MEMORY_MB:-2048}
       E2B_NODE_CPU_PERCENT: ${E2B_NODE_CPU_PERCENT:-200}
       E2B_NODE_DISK_MB: ${E2B_NODE_DISK_MB:-4096}
