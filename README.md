@@ -435,8 +435,10 @@ Redis WATCH 事务（原子，跨进程不超用），TTL 扫描跨副本一致�
 
   `_images` 属于基础设施命名空间：worker 的顶层扫描会排除它（不会当成沙箱树），
   但它**不在任何 project 配额内** ⇒ 缓存自身有**按量 GC**（`prune_image_cache()`，
-  只逐出已完成条目、最旧优先、默认上限 8 GiB / 生产 4 GiB、`0`=不限），
-  口径见 `docs/production-deployment-requirements.md` §2.7。
+  只逐出已完成的 rootfs 条目、最旧优先、且**剔除被任何沙箱记录引用或依赖清单不完整**的条目；
+  `E2B_IMAGE_CACHE_MAX_BYTES` 默认 **`0`=逐出关闭**，判的是总占用而不是逐条上限），
+  完整口径（含 `_oci` 的单独策略与"崩溃循环暂存 ≈1.7 GB"量级）见
+  `docs/production-deployment-requirements.md` §2.7。
 
   缓存目录名包含镜像 digest（`{image}-{sha256 前缀}`），基础镜像 tag 更新
   （如 `python:3.14-slim` 出新版）后自动落到新目录，不会误用旧 rootfs。
