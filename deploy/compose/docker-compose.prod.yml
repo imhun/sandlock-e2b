@@ -58,6 +58,11 @@ services:
       # only switches routes (no archive transfer).
       E2B_SHARED_WORKSPACE_ROOT: /var/lib/e2b-sandboxes
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # Rootfs cache on the shared volume: persists across `up -d` and is
+      # shared by every worker, instead of being re-pulled/re-extracted into
+      # each container on every recreate (workspace base holds user files,
+      # `_images` holds the extracted rootfs and is project 0 / no quota).
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       # Template images are pushed here after build; workers pull on demand.
       # Leave empty to keep single-host behavior (image stays local).
       E2B_IMAGE_REGISTRY: ${E2B_IMAGE_REGISTRY:-}
@@ -114,6 +119,7 @@ services:
       E2B_ENABLE_NETNS: ${E2B_ENABLE_NETNS:-false}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       # The registry host belongs to the pull credentials above: the worker
       # only sends them when the image it resolves lives on that host, so a
       # public base image is pulled anonymously instead of leaking the

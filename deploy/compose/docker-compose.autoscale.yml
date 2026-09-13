@@ -34,6 +34,7 @@ services:
       E2B_GATEWAY_URL: http://control-plane:3000
       E2B_SHARED_WORKSPACE_ROOT: /var/lib/e2b-sandboxes
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
       E2B_MAX_SANDBOXES: ${E2B_MAX_SANDBOXES:-1000}
       # Dynamic pools: the autoscaler governs fleet capacity, so the
@@ -63,7 +64,10 @@ services:
       E2B_AS_DOCKER_IMAGE: ${WORKER_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0}
       E2B_AS_DOCKER_NETWORK: sandlock
       E2B_AS_WORKSPACE_VOLUME: sandbox-shared
-      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-python:3.14-slim}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-local}", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
+      # Spawned workers get their env only from this JSON: without the cache
+      # dir they would fall back to a container-local relative path and lose
+      # the rootfs on every scale-in/out.
+      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-python:3.14-slim}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-local}", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
       E2B_AS_POLL_S: ${E2B_AS_POLL_S:-5}
       E2B_AS_UTIL_THRESHOLD: ${E2B_AS_UTIL_THRESHOLD:-0.70}
       E2B_AS_SCALE_UP_COOLDOWN_S: ${E2B_AS_SCALE_UP_COOLDOWN_S:-60}

@@ -11,6 +11,7 @@ services:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_GATEWAY_URL: http://control-plane:3000
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       # 模板构建完成后推送到镜像仓库，worker 按需从 OCI registry 直拉 rootfs。
       # 自建 HTTP 仓库需在 docker daemon 配置 insecure-registries。
       E2B_IMAGE_REGISTRY: registry.example.com/e2b
@@ -51,6 +52,7 @@ services:
       E2B_BASE_IMAGE: python:3.14-slim
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_NODE_MEMORY_MB: 2048
       E2B_NODE_CPU_PERCENT: 200
       E2B_NODE_DISK_MB: 4096
@@ -75,6 +77,7 @@ services:
       E2B_BASE_IMAGE: python:3.14-slim
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_NODE_MEMORY_MB: 2048
       E2B_NODE_CPU_PERCENT: 200
       E2B_NODE_DISK_MB: 4096
@@ -99,6 +102,7 @@ services:
       E2B_BASE_IMAGE: python:3.14-slim
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_NODE_MEMORY_MB: 2048
       E2B_NODE_CPU_PERCENT: 200
       E2B_NODE_DISK_MB: 4096

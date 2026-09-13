@@ -10,6 +10,9 @@ services:
       E2B_SECRET_MASTER_KEY: ${E2B_SECRET_MASTER_KEY:-}
       E2B_SECRET_MASTER_KEYS: ${E2B_SECRET_MASTER_KEYS:-}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # Extracted rootfs cache lives on the workspace volume so it survives
+      # `up -d` and is shared instead of re-pulled per recreate.
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_MAX_SANDBOXES: 100
       E2B_BASE_IMAGE: python:3.14-slim
       E2B_TEMPLATE_IMAGES: '{"python3.14": "python:3.14-slim", "node22": "node:22-slim"}'
@@ -41,6 +44,7 @@ services:
     user: "65534:65534"
     environment:
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
     ports:
       - "49983:49983"
     volumes:

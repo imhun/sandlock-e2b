@@ -424,10 +424,19 @@ Redis WATCH 事务（原子，跨进程不超用），TTL 扫描跨副本一致�
 - **不配 registry 的单机形态**：没有可 push 的目标，构建改为把
   **OCI layout tar** 导出到 `E2B_IMAGE_CACHE_DIR/_oci/`，本节点的 worker
   从该 tar 解析 rootfs（解析与 `warm` 探测都不需要 registry）。这条路径只
-  覆盖"建镜像的这台节点"——远端 worker 仍然必须有 `E2B_IMAGE_REGISTRY`。`E2B_IMAGE_CACHE_DIR` 控制 rootfs 解包缓存位置，
-  建议指向节点本地盘（默认 `tmp/sandboxes/_images` 为相对 cwd 的本地
-  路径），与共享的 `E2B_WORKSPACE_BASE` 解耦——**workspace 只存用户文件，
-  镜像 rootfs 始终在节点本地存储**。缓存目录名包含镜像 digest
-  （`{image}-{sha256 前缀}`），基础镜像 tag 更新（如 `python:3.14-slim`
-  出新版）后自动落到新目录，不会误用旧 rootfs；旧 digest 目录保留，
-  需要时手动清理 `E2B_IMAGE_CACHE_DIR` 下的历史目录。
+  覆盖"建镜像的这台节点"——远端 worker 仍然必须有 `E2B_IMAGE_REGISTRY`。
+
+  `E2B_IMAGE_CACHE_DIR` 控制 rootfs 解包缓存位置。**生产形态把它放在共享卷上**：
+  `E2B_IMAGE_CACHE_DIR=/var/lib/e2b-sandboxes/_images`（`deploy/stack` 与 `deploy/compose`
+  的 prod/multinode/autoscale 清单都已显式设置；autoscale 还会把它放进 `E2B_AS_WORKER_ENV`，
+  否则孵化出来的 worker 拿不到）。这样缓存**跨 `up -d`、跨 worker 持久且共享**，
+  重建 worker 不再重新拉取/解包整个 rootfs。默认值（未设 env）仍是相对路径
+  `tmp/sandboxes/_images`，只适合本地开发。
+
+  `_images` 属于基础设施命名空间：worker 的顶层扫描会排除它（不会当成沙箱树），
+  但它**不在任何 project 配额内** ⇒ 缓存自身有**按量 GC**（`prune_image_cache()`，
+  只逐出已完成条目、最旧优先、默认上限 8 GiB / 生产 4 GiB、`0`=不限），
+  口径见 `docs/production-deployment-requirements.md` §2.7。
+
+  缓存目录名包含镜像 digest（`{image}-{sha256 前缀}`），基础镜像 tag 更新
+  （如 `python:3.14-slim` 出新版）后自动落到新目录，不会误用旧 rootfs。
