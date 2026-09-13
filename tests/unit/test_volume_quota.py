@@ -33,6 +33,36 @@ def _unsupported(_mount, *, via_agent=False):
     return (False, "not xfs")
 
 
+def _install_disk_projids(monkeypatch, mapping: dict[Path, int]) -> list[list[str]]:
+    """Answer the project-id read from an explicit disk table (review W1).
+
+    The delete endpoint releases the project id the *disk* reports for the
+    tree, never the one the sandbox-writable ``sandbox.json`` claims, so the
+    one read this host cannot do itself is supplied here -- through
+    ``lsattr -p -d``'s stdout, so the real parser still runs.
+    """
+    import subprocess
+
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+    monkeypatch.setattr(xfs_quota, "_use_quotactl_read", lambda mount_point: False)
+
+    def fake_run(argv, *args, **kwargs):
+        if isinstance(argv, (list, tuple)) and argv and argv[0] == "lsattr":
+            calls.append(list(argv))
+            projid = mapping.get(Path(argv[-1]))
+            stdout = (
+                ""
+                if projid is None
+                else f"{projid:>8} ---------------- {argv[-1]}\n"
+            )
+            return subprocess.CompletedProcess(list(argv), 0, stdout, "")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(xfs_quota.subprocess, "run", fake_run)
+    return calls
+
+
 # ------------------------------------------------------------- projid seed
 
 
@@ -749,6 +779,13 @@ async def test_agent_create_persists_volume_projects_and_delete_cleans(
     ]
     assert slice_dir.is_dir()
 
+    # The delete's targets come from the disk (the record is sandbox-writable,
+    # review W1): the workspace tree reports 777, the slice 4242 -- the same
+    # values the create provisioned.
+    _install_disk_projids(
+        monkeypatch, {tmp_path / sandbox_id: 777, slice_dir: 4242}
+    )
+
     import httpx
 
     async with httpx.AsyncClient(
@@ -827,6 +864,9 @@ async def test_agent_delete_keep_volume_slices_removes_workspace_but_keeps_slice
     slice_dir = volume_root / sandbox_id
     (slice_dir / "payload.bin").write_bytes(b"keep-me")
     workspace_dir = tmp_path / sandbox_id
+    # The workspace release is driven by the projid the disk reports for the
+    # tree (review W1); the slice is kept by the flag below.
+    _install_disk_projids(monkeypatch, {workspace_dir: 777})
 
     import httpx
 

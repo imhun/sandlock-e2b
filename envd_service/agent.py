@@ -188,7 +188,7 @@ def _heartbeat_usage_payload(
 
 @dataclass(frozen=True)
 class _TeardownPlan:
-    """Verified teardown targets for one orphan tree (review round 1, M4).
+    """Verified teardown targets for one sandbox tree (review round 1, M4).
 
     ``sandbox.json`` is written at the root of the tree the sandbox itself
     owns (``0770``, owner = the sandbox's host uid), so the sandbox can
@@ -208,8 +208,19 @@ class _TeardownPlan:
     expected_projids: frozenset[int]
 
 
+class SandboxTeardownRefused(Exception):
+    """The record contradicts the disk, so nothing was touched (W1).
+
+    Raised by :func:`_delete_sandbox_runtime` when the record it was asked to
+    act on disagrees with the tree the disk has. The record is input the
+    sandbox can rewrite, so a contradiction is refused rather than resolved:
+    the caller gets the reason (the delete endpoint turns it into a 409) and
+    an operator can look at the tree, which is left exactly as found.
+    """
+
+
 def _verified_project_id(
-    path: Path, claimed: Any, expected: set[int]
+    path: Path, claimed: Any, expected: set[int], *, context: str = "reconcile"
 ) -> tuple[int | None, str | None]:
     """Project id to release for ``path``, read from the disk (M4).
 
@@ -219,6 +230,10 @@ def _verified_project_id(
     like). A disk that cannot be asked yields ``(None, None)``: the tree is
     still reclaimed, but its project state is left alone and the fail-safe
     quota reconcile drops the row once the tree is gone.
+
+    ``context`` is the log prefix ("reconcile" for the orphan-tree sweep,
+    "delete" for the explicit delete endpoint) so an operator can tell which
+    caller is talking about the path.
     """
     try:
         disk_projid = directory_project_id(path)
@@ -234,13 +249,15 @@ def _verified_project_id(
         # * this host cannot ask the disk at all -- WARNING.
         if isinstance(exc, ProjectDirectoryGone):
             logger.info(
-                "reconcile: %s; nothing to verify, its quota row is left to "
+                "%s: %s; nothing to verify, its quota row is left to "
                 "the fail-safe reconcile",
+                context,
                 exc,
             )
         else:
             logger.warning(
-                "reconcile: %s; reclaiming it without releasing its quota row",
+                "%s: %s; reclaiming it without releasing its quota row",
+                context,
                 exc,
             )
         if isinstance(claimed, int) and claimed > 0:
@@ -261,14 +278,23 @@ def _verified_project_id(
     return disk_projid, None
 
 
-def _gc_teardown_plan(
-    settings: Settings, sandbox_id: str, record
+def _verified_teardown_plan(
+    workspace_base: str | Path,
+    sandbox_id: str,
+    record,
+    *,
+    shared_volume_root: str | Path | None = None,
+    verify_quota: bool = True,
+    context: str = "reconcile",
 ) -> tuple[_TeardownPlan | None, str | None]:
-    """Verified teardown targets for a tree found on disk (M4).
+    """Verified teardown targets for one sandbox tree (M4 / W1).
 
-    The orphan-tree GC acts on trees whose record only ever existed inside
-    the tree, i.e. on input the sandbox could rewrite. Three rules keep a
-    rewritten record from aiming the sweep at another tenant's data:
+    Both callers act on trees whose record lives inside the tree itself,
+    i.e. on input the sandbox could rewrite: the orphan-tree GC scans those
+    trees off the disk, and the explicit delete endpoint reads the record
+    back through the registry (which falls back to the same file). Three
+    rules keep a rewritten record from aiming either path at another
+    tenant's data:
 
     * the tree is always ``<workspace_base>/<sandbox_id>``, never the
       ``workspace_dir`` the record claims (``sandbox_id`` is the directory
@@ -281,8 +307,31 @@ def _gc_teardown_plan(
     The project ids come from the disk, not from the record: a
     contradiction refuses the tree, a silent disk drops the release and
     leaves the row to the fail-safe quota reconcile.
+
+    ``record`` is ``None`` for a teardown with nothing to verify (no record
+    anywhere): the convention path is then all that is left, and it carries
+    no project state.
+
+    ``verify_quota=False`` is for a teardown that keeps the files
+    (``keep_files=true``: migration stop, shared-workspace teardown): no
+    project state is released and no slice is removed, so reading the disk's
+    project ids would only produce an anomaly line for something this call is
+    not going to touch. The record still has to describe its own tree.
+
+    ``context`` prefixes the anomaly lines ("reconcile" for the sweep,
+    "delete" for the endpoint).
+
+    ``workspace_base`` is the root the caller scanned or read the record
+    under: the GC passes the worker's configured base, the delete endpoint
+    passes the registry's own base (where the record file it just read
+    lives), so the target is always derived from the caller's evidence and
+    never from the record's ``workspace_dir``.
+
+    ``shared_volume_root`` is the configured volume root a slice has to be
+    inside to be honoured (``None`` = this worker has no shared volume root
+    configured, so only the slice's own name is checked).
     """
-    workspace_dir = Path(settings.workspace_base) / sandbox_id
+    workspace_dir = Path(workspace_base) / sandbox_id
     if record is not None:
         recorded_id = getattr(record, "sandbox_id", None)
         if recorded_id != sandbox_id:
@@ -290,16 +339,27 @@ def _gc_teardown_plan(
         recorded_dir = getattr(record, "workspace_dir", None)
         if recorded_dir is not None and Path(recorded_dir) != workspace_dir:
             return None, f"its sandbox.json points at {recorded_dir}"
+    if not verify_quota:
+        return (
+            _TeardownPlan(
+                workspace_dir=workspace_dir,
+                project_id=None,
+                volume_projects=(),
+                expected_projids=frozenset(),
+            ),
+            None,
+        )
     expected: set[int] = set()
     project_id, reason = _verified_project_id(
-        workspace_dir, getattr(record, "project_id", None), expected
+        workspace_dir,
+        getattr(record, "project_id", None),
+        expected,
+        context=context,
     )
     if reason is not None:
         return None, reason
     shared_root = (
-        Path(settings.shared_volume_root).resolve()
-        if settings.shared_volume_root
-        else None
+        Path(shared_volume_root).resolve() if shared_volume_root else None
     )
     volume_entries: list[dict[str, Any]] = []
     for entry in getattr(record, "volume_projects", None) or []:
@@ -313,8 +373,9 @@ def _gc_teardown_plan(
             or slice_dir.name != sandbox_id
         ):
             logger.warning(
-                "reconcile: refusing a volume entry of %s: %s is not a slice "
+                "%s: refusing a volume entry of %s: %s is not a slice "
                 "of this sandbox",
+                context,
                 sandbox_id,
                 sandbox_dir,
             )
@@ -323,19 +384,21 @@ def _gc_teardown_plan(
             shared_root
         ):
             logger.warning(
-                "reconcile: refusing the volume slice %s of %s: it is outside "
+                "%s: refusing the volume slice %s of %s: it is outside "
                 "the shared volume root %s",
+                context,
                 slice_dir,
                 sandbox_id,
                 shared_root,
             )
             continue
         slice_projid, slice_reason = _verified_project_id(
-            slice_dir, entry.get("projid"), expected
+            slice_dir, entry.get("projid"), expected, context=context
         )
         if slice_reason is not None:
             logger.warning(
-                "reconcile: refusing the volume slice %s of %s: %s",
+                "%s: refusing the volume slice %s of %s: %s",
+                context,
                 slice_dir,
                 sandbox_id,
                 slice_reason,
@@ -353,6 +416,20 @@ def _gc_teardown_plan(
     )
 
 
+def _registry_workspace_base(runtime_registry, settings: Settings) -> Path:
+    """Workspace root the registry reads this sandbox's record under.
+
+    A teardown has to act on the tree its evidence came from, and for the
+    delete endpoint that is the registry's own base: it is where the record
+    file lives, and where ``<base>/<sandbox_id>`` is a real directory of this
+    worker rather than a path some record named. In every deployment shape it
+    is the same value as ``settings.workspace_base``; the registry is used
+    because it is the one holding the file that was read.
+    """
+    base = getattr(runtime_registry, "workspace_base", None)
+    return Path(base) if base is not None else Path(settings.workspace_base)
+
+
 def _delete_sandbox_runtime(
     settings: Settings,
     runtime_registry,
@@ -361,70 +438,106 @@ def _delete_sandbox_runtime(
     keep_files: bool = False,
     keep_volume_slices: bool = False,
     plan: _TeardownPlan | None = None,
+    unregister: bool = True,
 ) -> None:
     """Full local teardown for one sandbox runtime (shared by the delete
     endpoint and E6.1 orphan reconciliation).
 
-    ``plan`` is the orphan-tree GC's verified target set (review round 1,
-    M4): the GC scans records that live inside sandbox-owned trees, so it
-    passes targets read from the disk instead of the record. The explicit
-    delete path passes nothing and keeps resolving them from the record.
+    Every teardown acts on a verified target set (review round 1 M4 / W1).
+    The orphan-tree GC scans records that live inside sandbox-owned trees and
+    passes what it read off the disk; the explicit delete path passes nothing,
+    and the record it reads through the registry is only *checked* against
+    the disk -- a record that contradicts the tree it was found in is refused
+    (:class:`SandboxTeardownRefused`) instead of being acted on.
+
+    ``unregister=False`` is for a caller that already unregistered on the
+    event loop (the reconcile round does: ``unregister``'s callbacks touch
+    loop-owned objects, while this whole function runs on a worker thread).
     """
-    if plan is not None:
-        workspace_dir = plan.workspace_dir
-        project_id = plan.project_id
-        volume_projects = list(plan.volume_projects)
-    else:
+    if plan is None:
         record = runtime_registry.get(sandbox_id)
-        project_id = record.project_id if record is not None else None
-        volume_projects = list(record.volume_projects) if record is not None else []
-        # Derive the project dir from the record so release and rmtree always
-        # target the directory the sandbox was registered with; fall back to
-        # the workspace_base/id convention for unregistered sandboxes.
-        workspace_dir = (
-            Path(record.workspace_dir)
-            if record is not None
-            else settings.workspace_base / sandbox_id
-        )
-    runtime_registry.unregister(sandbox_id)
-    # Shared-workspace deployments keep the directory (keep_files=true): the
-    # same storage hosts the sandbox on every node, so removing it would
-    # destroy the live sandbox's files, and its project id must stay until
-    # the sandbox is really deleted.
-    # keep_volume_slices=true is the migration counterpart: the workspace may
-    # be removed (non-shared workspace export finished), but per-sandbox
-    # volume slices under a shared volume root are still in use by the
-    # target node and must never be deleted by a migration stop/rollback.
-    if keep_files:
-        return
-    if project_id is not None:
-        try:
-            release_project(
-                project_dir=workspace_dir,
-                mount_point=settings.workspace_base,
-                projid=project_id,
+        base = _registry_workspace_base(runtime_registry, settings)
+        if record is None:
+            # No record at all: there is nothing on the disk to check, so the
+            # convention path is the only target and it carries no project
+            # state to release (unchanged behaviour for this shape).
+            plan = _TeardownPlan(
+                workspace_dir=base / sandbox_id,
+                project_id=None,
+                volume_projects=(),
+                expected_projids=frozenset(),
+            )
+        else:
+            plan, reason = _verified_teardown_plan(
+                base,
+                sandbox_id,
+                record,
+                shared_volume_root=settings.shared_volume_root,
+                verify_quota=not keep_files,
+                context="delete",
+            )
+            if plan is None:
+                # The record does not describe the tree it was found in, so it
+                # is not evidence of anything: refusing keeps whatever it
+                # points at (another tenant's tree, another tenant's quota
+                # row) out of this teardown's reach (W1).
+                logger.warning(
+                    "delete: refusing to tear down %s: %s", sandbox_id, reason
+                )
+                raise SandboxTeardownRefused(
+                    f"refusing to tear down {sandbox_id}: {reason}"
+                )
+    workspace_dir = plan.workspace_dir
+    project_id = plan.project_id
+    volume_projects = list(plan.volume_projects)
+    if unregister:
+        runtime_registry.unregister(sandbox_id)
+    try:
+        # Shared-workspace deployments keep the directory (keep_files=true):
+        # the same storage hosts the sandbox on every node, so removing it
+        # would destroy the live sandbox's files, and its project id must stay
+        # until the sandbox is really deleted.
+        # keep_volume_slices=true is the migration counterpart: the workspace
+        # may be removed (non-shared workspace export finished), but
+        # per-sandbox volume slices under a shared volume root are still in
+        # use by the target node and must never be deleted by a migration
+        # stop/rollback.
+        if keep_files:
+            return
+        if project_id is not None:
+            try:
+                release_project(
+                    project_dir=workspace_dir,
+                    mount_point=settings.workspace_base,
+                    projid=project_id,
+                    via_agent=settings.quota_via_agent,
+                )
+            except ProjectQuotaError as exc:
+                logger.warning(
+                    "XFS project quota cleanup failed for %s: %s",
+                    sandbox_id,
+                    exc,
+                )
+        if not keep_volume_slices:
+            cleanup_volume_projects(
+                volume_projects=volume_projects,
+                fallback_mount_point=settings.workspace_base,
                 via_agent=settings.quota_via_agent,
             )
-        except ProjectQuotaError as exc:
-            logger.warning(
-                "XFS project quota cleanup failed for %s: %s",
-                sandbox_id,
-                exc,
-            )
-    if not keep_volume_slices:
-        cleanup_volume_projects(
-            volume_projects=volume_projects,
-            fallback_mount_point=settings.workspace_base,
-            via_agent=settings.quota_via_agent,
-        )
-    # Broker-first (Track F): a sandbox workspace is `0770` owned by its own
-    # host uid with the worker's gid (fix round 1 / c1), so the worker's own
-    # group access normally deletes it in-process; e2b-maint is the fallback
-    # for trees that access cannot reach (sandbox-made 0700 subdirs, root-owned
-    # leftovers from before the cut-over).
-    from envd_service import priv_helpers
+        # Broker-first (Track F): a sandbox workspace is `0770` owned by its
+        # own host uid with the worker's gid (fix round 1 / c1), so the
+        # worker's own group access normally deletes it in-process; e2b-maint
+        # is the fallback for trees that access cannot reach (sandbox-made
+        # 0700 subdirs, root-owned leftovers from before the cut-over).
+        from envd_service import priv_helpers
 
-    priv_helpers.remove_tree(workspace_dir)
+        priv_helpers.remove_tree(workspace_dir)
+    finally:
+        # The just-unregistered marker only has to cover the teardown itself
+        # (race B): once the tree is gone, its disk record cannot come back.
+        release_tombstone = getattr(runtime_registry, "release_tombstone", None)
+        if release_tombstone is not None:
+            release_tombstone(sandbox_id)
 
 
 def _scan_workspace_runtimes(
@@ -777,8 +890,11 @@ class NodeAgent:
             # any request that called ``RuntimeRegistry.get()``, so it is no
             # more trustworthy than the disk copy (M4).
             try:
-                plan, reason = _gc_teardown_plan(
-                    self._settings, sandbox_id, local.get(sandbox_id)
+                plan, reason = _verified_teardown_plan(
+                    self._settings.workspace_base,
+                    sandbox_id,
+                    local.get(sandbox_id),
+                    shared_volume_root=self._settings.shared_volume_root,
                 )
             except Exception:
                 # Verifying the targets must not cost the worker the rest of
@@ -809,6 +925,13 @@ class NodeAgent:
                 sandbox_id,
             )
             try:
+                # Unregistering is the teardown's first step, and its
+                # callbacks are loop-side code: the production callback pops
+                # the sandbox's runtime context and shuts it down, which
+                # cancels the MCP gateway watch -- an ``asyncio.Task`` owned
+                # by this loop (race A, review W1). Do it here, where the loop
+                # is, and leave the heavy half to the worker thread below.
+                self._runtime_registry.unregister(sandbox_id)
                 # Per-tree teardown is a synchronous heavy step (an XFS
                 # release over the quota agent, an rmtree of a whole
                 # workspace), and a shared workspace can hold dozens of
@@ -820,6 +943,7 @@ class NodeAgent:
                     self._runtime_registry,
                     sandbox_id,
                     plan=plan,
+                    unregister=False,
                 )
             except Exception:
                 # One unrecoverable tree (a permission wall, a broken mount)
@@ -1208,13 +1332,19 @@ async def agent_delete_sandbox(
     except PermissionError:
         return Response(status_code=401)
     runtime_registry = request.app.state.runtime_registry
-    _delete_sandbox_runtime(
-        settings,
-        runtime_registry,
-        sandbox_id,
-        keep_files=keepFiles,
-        keep_volume_slices=keepVolumeSlices,
-    )
+    try:
+        _delete_sandbox_runtime(
+            settings,
+            runtime_registry,
+            sandbox_id,
+            keep_files=keepFiles,
+            keep_volume_slices=keepVolumeSlices,
+        )
+    except SandboxTeardownRefused as exc:
+        # The record the sandbox could rewrite disagrees with the disk, so
+        # nothing was torn down: answer with the reason instead of a 204 that
+        # says a teardown happened (and instead of acting on the record).
+        return Response(status_code=409, content=str(exc))
     return Response(status_code=204)
 
 

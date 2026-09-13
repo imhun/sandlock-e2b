@@ -60,6 +60,38 @@ def _warnings(caplog) -> list[str]:
     ]
 
 
+def _install_disk_projids(monkeypatch, mapping: dict[Path, int]) -> list[list[str]]:
+    """Answer the project-id read from an explicit disk table.
+
+    ``_delete_sandbox_runtime`` takes its release target from the *disk*, not
+    from the record: ``sandbox.json`` sits inside the sandbox-owned tree, so
+    the sandbox can replace it (review W1). These contracts therefore have to
+    supply the one read this host cannot do itself; the real parser is still
+    exercised, because what is faked is ``lsattr -p -d``'s stdout. A directory
+    absent from ``mapping`` reports no project id.
+    """
+    import subprocess
+
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+    monkeypatch.setattr(xfs_quota, "_use_quotactl_read", lambda mount_point: False)
+
+    def fake_run(argv, *args, **kwargs):
+        if isinstance(argv, (list, tuple)) and argv and argv[0] == "lsattr":
+            calls.append(list(argv))
+            projid = mapping.get(Path(argv[-1]))
+            stdout = (
+                ""
+                if projid is None
+                else f"{projid:>8} ---------------- {argv[-1]}\n"
+            )
+            return subprocess.CompletedProcess(list(argv), 0, stdout, "")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(xfs_quota.subprocess, "run", fake_run)
+    return calls
+
+
 def _make_app(workspace: Path, **settings_overrides):
     overrides = dict(executor="local", workspace_base=workspace)
     overrides.update(settings_overrides)
@@ -310,6 +342,8 @@ async def test_delete_releases_project_and_removes_dir(workspace, monkeypatch):
         calls.update(kwargs)
 
     monkeypatch.setattr(agent, "release_project", fake_release)
+    # The release target is the disk's answer, not the record's claim.
+    disk_calls = _install_disk_projids(monkeypatch, {workspace / "sbx_del": 42})
 
     response = await _delete_sandbox(app, "sbx_del")
     assert response.status_code == 204
@@ -319,38 +353,57 @@ async def test_delete_releases_project_and_removes_dir(workspace, monkeypatch):
         "projid": 42,
         "via_agent": False,
     }
+    assert disk_calls == [["lsattr", "-p", "-d", str(workspace / "sbx_del")]]
     assert not (workspace / "sbx_del").exists()
 
 
-async def test_delete_release_uses_record_workspace_dir(workspace, monkeypatch):
-    """Delete derives project_dir and removal target from the record, not the
-    workspace_base/id convention (E2.2 review Minor)."""
+async def test_delete_refuses_a_record_pointing_at_another_tree(
+    workspace, monkeypatch, caplog
+):
+    """A rewritten record may not aim the teardown at another tenant (W1).
+
+    ``sandbox.json`` is written inside the directory the sandbox owns, so the
+    sandbox can unlink and recreate it: with ``workspace_dir`` pointing at
+    somebody else's tree, the delete used to release that tenant's project id
+    and rmtree their workspace. The record is now only ever *checked* against
+    the tree the registry read it from, and a contradiction refuses the
+    teardown with a reason instead of acting on it. (The end-to-end shape,
+    victim tree + victim quota row, is pinned by
+    ``tests/contract/test_delete_trusted_targets.py``.)
+    """
     app = _make_app(workspace)
-    recorded_dir = workspace / "custom" / "sbx_relocated"
-    recorded_dir.mkdir(parents=True)
+    victim_dir = workspace / "custom" / "sbx_victim"
+    victim_dir.mkdir(parents=True)
+    (victim_dir / "payload.bin").write_bytes(b"another tenant's data")
     app.state.runtime_registry.register(
         sandbox_id="sbx_relocated",
         access_token="tok",
-        workspace_dir=str(recorded_dir),
+        workspace_dir=str(victim_dir),
         disk_mb=1024,
         project_id=42,
     )
-    calls: dict = {}
-
-    def fake_release(**kwargs):
-        calls.update(kwargs)
-
-    monkeypatch.setattr(agent, "release_project", fake_release)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        agent, "release_project", lambda **kw: calls.append("release")
+    )
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
 
     response = await _delete_sandbox(app, "sbx_relocated")
-    assert response.status_code == 204
-    assert calls == {
-        "project_dir": recorded_dir,
-        "mount_point": workspace,
-        "projid": 42,
-        "via_agent": False,
-    }
-    assert not recorded_dir.exists()
+    assert response.status_code == 409
+    assert response.text == (
+        "refusing to tear down sbx_relocated: its sandbox.json points at "
+        f"{victim_dir}"
+    )
+    assert calls == []
+    # Everything the record tried to aim the teardown at is untouched, and the
+    # sandbox's own tree is left standing too (nothing was torn down at all).
+    assert (victim_dir / "payload.bin").read_bytes() == b"another tenant's data"
+    assert Path(app.state.runtime_registry.workspace_base, "sbx_relocated").is_dir()
+    assert _warnings(caplog) == [
+        "delete: refusing to tear down sbx_relocated: its sandbox.json points "
+        f"at {victim_dir}"
+    ]
 
 
 async def test_delete_keep_files_skips_release_and_keeps_dir(workspace, monkeypatch):
@@ -392,6 +445,9 @@ async def test_delete_cleanup_failure_degrades_with_warning(workspace, monkeypat
         )
 
     monkeypatch.setattr(agent, "release_project", fake_release)
+    _install_disk_projids(
+        monkeypatch, {workspace / "sbx_cleanup_fail": 42}
+    )
     caplog.set_level(logging.WARNING)
 
     response = await _delete_sandbox(app, "sbx_cleanup_fail")

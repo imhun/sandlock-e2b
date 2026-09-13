@@ -74,6 +74,15 @@ class RuntimeRegistry:
     #: proxied request into a callback / heartbeat-payload update. The idle
     #: threshold these feed is minutes wide (default 300s).
     ACTIVITY_COALESCE_S = 10.0
+    #: A record unregistered while its tree is being torn down must not come
+    #: back: ``unregister()`` does not delete ``sandbox.json``, and the heavy
+    #: half of a teardown (quota release, rmtree) runs off the event loop, so
+    #: a request arriving in that window reads the file straight back into
+    #: this process's registry -- which then claims a sandbox whose tree is
+    #: already gone (review W1, race B). The teardown drops the tombstone when
+    #: it finishes; the deadline is the safety net for an unregister that has
+    #: no teardown behind it.
+    UNREGISTER_TOMBSTONE_S = 5.0
 
     def __init__(
         self,
@@ -83,6 +92,9 @@ class RuntimeRegistry:
     ) -> None:
         self._workspace_base = Path(workspace_base)
         self._records: dict[str, RuntimeSandbox] = {}
+        #: ``sandbox_id -> monotonic deadline`` of the just-unregistered
+        #: marker (see ``UNREGISTER_TOMBSTONE_S``).
+        self._tombstones: dict[str, float] = {}
         self._lock = threading.Lock()
         self._unregister_callbacks: list[Callable[[str], None]] = []
         self._state_callbacks: list[Callable[[str, str], None]] = []
@@ -142,6 +154,16 @@ class RuntimeRegistry:
     def _record_path(self, sandbox_id: str) -> Path:
         return self._workspace_base / sandbox_id / "sandbox.json"
 
+    @property
+    def workspace_base(self) -> Path:
+        """The workspace root this registry reads and writes records under.
+
+        The trees it describes live here, one directory per sandbox id, so
+        this -- not any path a record claims -- is the base a teardown derives
+        its target from (W1).
+        """
+        return self._workspace_base
+
     def register(
         self,
         *,
@@ -191,6 +213,7 @@ class RuntimeRegistry:
             iam_tokens=dict(iam_tokens or {}),
         )
         with self._lock:
+            self._tombstones.pop(sandbox_id, None)
             self._records[sandbox_id] = record
             try:
                 path = self._record_path(sandbox_id)
@@ -209,13 +232,42 @@ class RuntimeRegistry:
             record = self._records.get(sandbox_id)
             if record is not None:
                 return record
+            if self._tombstoned(sandbox_id):
+                # Its teardown is in flight (or just finished): the file on
+                # disk is the input the teardown is deleting, not a record to
+                # materialise (race B).
+                return None
         # Filesystem-backed lookup (separate-process deployment).
         record = self._load_from_disk(sandbox_id)
         if record is None:
             return None
         with self._lock:
+            # The teardown can have started while the file was being read.
+            if self._tombstoned(sandbox_id):
+                return None
             self._records[sandbox_id] = record
         return record
+
+    def _tombstoned(self, sandbox_id: str) -> bool:
+        """Whether ``sandbox_id`` was unregistered moments ago (lock held)."""
+        deadline = self._tombstones.get(sandbox_id)
+        if deadline is None:
+            return False
+        if deadline <= time.monotonic():
+            self._tombstones.pop(sandbox_id, None)
+            return False
+        return True
+
+    def release_tombstone(self, sandbox_id: str) -> None:
+        """Drop the just-unregistered marker once its teardown has finished.
+
+        The window the marker closes is the teardown itself; a caller that
+        re-creates the same sandbox id right after the teardown must not be
+        answered from the deleted tree's leftovers (``register()`` clears it
+        as well).
+        """
+        with self._lock:
+            self._tombstones.pop(sandbox_id, None)
 
     def peek(self, sandbox_id: str) -> RuntimeSandbox | None:
         """Read a record without caching it in this process.
@@ -264,6 +316,9 @@ class RuntimeRegistry:
         with self._lock:
             removed = self._records.pop(sandbox_id, None) is not None
             self._activity.pop(sandbox_id, None)
+            self._tombstones[sandbox_id] = (
+                time.monotonic() + self.UNREGISTER_TOMBSTONE_S
+            )
             callbacks = list(self._unregister_callbacks)
         if removed:
             for callback in callbacks:
