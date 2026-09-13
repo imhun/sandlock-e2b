@@ -219,8 +219,50 @@ class SandboxTeardownRefused(Exception):
     """
 
 
+def _recorded_dir_matches(recorded_dir: Any, workspace_dir: Path) -> bool:
+    """Whether a record's ``workspace_dir`` names the tree the caller scans.
+
+    ``sandbox.json`` is input the sandbox can rewrite, so no teardown ever
+    acts on the path a record claims -- every target is ``<base>/<id>``. This
+    check only decides whether the record *contradicts* the disk, and it
+    compares directory identities instead of spellings (review W7 / C1):
+
+    * the same directory reached through a symlinked base, a relative path, a
+      ``..`` segment or a trailing slash is the same tree and must not be
+      refused. Refusing it turned a working delete (``de555f8``: 204, tree and
+      record gone) into a 409 and pinned the tree plus its quota row forever;
+    * a record that aims at *another* existing directory is exactly the shape
+      the refusal exists for, and is still refused;
+    * a recorded path that is not on this disk (an old base, a path that lives
+      on another node) does not identify a second tree this teardown could
+      reach into, so the convention path is the only target and it proceeds.
+
+    ``resolve()`` (spelling) and ``(st_dev, st_ino)`` (identity, which also
+    covers hard links and bind-mount spellings) are both compared.
+    """
+    recorded = Path(recorded_dir)
+    try:
+        if recorded.resolve() == Path(workspace_dir).resolve():
+            return True
+        recorded_stat = recorded.stat()
+        workspace_stat = Path(workspace_dir).stat()
+    except OSError:
+        # Either the recorded path or the tree itself is not on the disk:
+        # nothing here names a second tree that could be torn down instead.
+        return True
+    return (recorded_stat.st_dev, recorded_stat.st_ino) == (
+        workspace_stat.st_dev,
+        workspace_stat.st_ino,
+    )
+
+
 def _verified_project_id(
-    path: Path, claimed: Any, expected: set[int], *, context: str = "reconcile"
+    path: Path,
+    claimed: Any,
+    expected: set[int],
+    *,
+    context: str = "reconcile",
+    force: bool = False,
 ) -> tuple[int | None, str | None]:
     """Project id to release for ``path``, read from the disk (M4).
 
@@ -234,6 +276,12 @@ def _verified_project_id(
     ``context`` is the log prefix ("reconcile" for the orphan-tree sweep,
     "delete" for the explicit delete endpoint) so an operator can tell which
     caller is talking about the path.
+
+    ``force`` is the operator's explicit "tear this tree down from the disk"
+    decision (review W7 / C1-3): a claim that contradicts the disk is then
+    *reported* instead of refused, and the project id the disk reports is the
+    one released. Only the caller's own convention path and its own slice
+    names are ever reached either way.
     """
     try:
         disk_projid = directory_project_id(path)
@@ -270,9 +318,18 @@ def _verified_project_id(
         # half-finished earlier teardown leaves behind.
         return None, None
     if isinstance(claimed, int) and claimed > 0 and claimed != disk_projid:
-        return None, (
-            f"its sandbox.json claims project id {claimed} but the disk "
-            f"says {disk_projid}"
+        if not force:
+            return None, (
+                f"its sandbox.json claims project id {claimed} but the disk "
+                f"says {disk_projid}"
+            )
+        logger.warning(
+            "%s: forcing %s: its sandbox.json claims project id %s but the "
+            "disk says %s; releasing the project id the disk reports",
+            context,
+            path,
+            claimed,
+            disk_projid,
         )
     expected.add(disk_projid)
     return disk_projid, None
@@ -286,6 +343,8 @@ def _verified_teardown_plan(
     shared_volume_root: str | Path | None = None,
     verify_quota: bool = True,
     context: str = "reconcile",
+    force: bool = False,
+    verify_tree_project: bool = True,
 ) -> tuple[_TeardownPlan | None, str | None]:
     """Verified teardown targets for one sandbox tree (M4 / W1).
 
@@ -330,15 +389,51 @@ def _verified_teardown_plan(
     ``shared_volume_root`` is the configured volume root a slice has to be
     inside to be honoured (``None`` = this worker has no shared volume root
     configured, so only the slice's own name is checked).
+
+    ``force`` (review W7 / C1-3) is the operator's explicit "tear this tree
+    down using the disk alone" decision, and it is the bounded exit a refusal
+    needs: the claim checks below stop returning a refusal reason and *report*
+    what they overruled instead, while every target still comes from the
+    caller's own convention path -- the tree is always
+    ``<workspace_base>/<sandbox_id>``, the project ids are always the ones the
+    filesystem reports, and a volume entry still has to be named after this
+    sandbox and live under the configured volume root. No target of another
+    tenant is reachable with ``force`` either.
+
+    ``verify_tree_project=False`` is for a caller that releases no project
+    state for the tree itself -- the combined node's local teardown cleans
+    volume slices and removes the tree, and its workspace project is the envd
+    half's business. Reading the tree's project id would then only produce an
+    anomaly line (on a host that cannot ask the disk at all) for something
+    this call is not going to touch.
     """
     workspace_dir = Path(workspace_base) / sandbox_id
     if record is not None:
         recorded_id = getattr(record, "sandbox_id", None)
         if recorded_id != sandbox_id:
-            return None, f"its sandbox.json names sandbox {recorded_id!r}"
+            if not force:
+                return None, f"its sandbox.json names sandbox {recorded_id!r}"
+            logger.warning(
+                "%s: forcing the teardown of %s: its sandbox.json names "
+                "sandbox %r; using the directory name",
+                context,
+                sandbox_id,
+                recorded_id,
+            )
         recorded_dir = getattr(record, "workspace_dir", None)
-        if recorded_dir is not None and Path(recorded_dir) != workspace_dir:
-            return None, f"its sandbox.json points at {recorded_dir}"
+        if recorded_dir is not None and not _recorded_dir_matches(
+            recorded_dir, workspace_dir
+        ):
+            if not force:
+                return None, f"its sandbox.json points at {recorded_dir}"
+            logger.warning(
+                "%s: forcing the teardown of %s: its sandbox.json points at "
+                "%s; using the convention path %s",
+                context,
+                sandbox_id,
+                recorded_dir,
+                workspace_dir,
+            )
     if not verify_quota:
         return (
             _TeardownPlan(
@@ -350,14 +445,17 @@ def _verified_teardown_plan(
             None,
         )
     expected: set[int] = set()
-    project_id, reason = _verified_project_id(
-        workspace_dir,
-        getattr(record, "project_id", None),
-        expected,
-        context=context,
-    )
-    if reason is not None:
-        return None, reason
+    project_id: int | None = None
+    if verify_tree_project:
+        project_id, reason = _verified_project_id(
+            workspace_dir,
+            getattr(record, "project_id", None),
+            expected,
+            context=context,
+            force=force,
+        )
+        if reason is not None:
+            return None, reason
     shared_root = (
         Path(shared_volume_root).resolve() if shared_volume_root else None
     )
@@ -393,7 +491,11 @@ def _verified_teardown_plan(
             )
             continue
         slice_projid, slice_reason = _verified_project_id(
-            slice_dir, entry.get("projid"), expected, context=context
+            slice_dir,
+            entry.get("projid"),
+            expected,
+            context=context,
+            force=force,
         )
         if slice_reason is not None:
             logger.warning(
@@ -439,6 +541,7 @@ def _delete_sandbox_runtime(
     keep_volume_slices: bool = False,
     plan: _TeardownPlan | None = None,
     unregister: bool = True,
+    force: bool = False,
 ) -> None:
     """Full local teardown for one sandbox runtime (shared by the delete
     endpoint and E6.1 orphan reconciliation).
@@ -453,6 +556,14 @@ def _delete_sandbox_runtime(
     ``unregister=False`` is for a caller that already unregistered on the
     event loop (the reconcile round does: ``unregister``'s callbacks touch
     loop-owned objects, while this whole function runs on a worker thread).
+
+    ``force=True`` (review W7 / C1-3) is the operator's bounded exit from a
+    refusal: :func:`_verified_teardown_plan` reports instead of refusing the
+    claims it overrules, and the teardown still runs on the convention path
+    and the project ids the disk reports. Without it a contradicting record
+    is refused -- but the *process tree* is stopped either way (review W7 /
+    C1-4): a refusal keeps the files, never a running runtime behind a control
+    plane that has already forgotten the sandbox.
     """
     if plan is None:
         record = runtime_registry.get(sandbox_id)
@@ -475,15 +586,22 @@ def _delete_sandbox_runtime(
                 shared_volume_root=settings.shared_volume_root,
                 verify_quota=not keep_files,
                 context="delete",
+                force=force,
             )
             if plan is None:
                 # The record does not describe the tree it was found in, so it
                 # is not evidence of anything: refusing keeps whatever it
                 # points at (another tenant's tree, another tenant's quota
-                # row) out of this teardown's reach (W1).
+                # row) out of this teardown's reach (W1). The runtime is not
+                # part of the record's reach, so it still goes (review W7 /
+                # C1-4): leaving it running is what turned a refused record
+                # into "the control plane forgot it and the process tree is
+                # still up". Files are what the refusal protects.
                 logger.warning(
                     "delete: refusing to tear down %s: %s", sandbox_id, reason
                 )
+                if unregister:
+                    runtime_registry.unregister(sandbox_id)
                 raise SandboxTeardownRefused(
                     f"refusing to tear down {sandbox_id}: {reason}"
                 )
@@ -693,6 +811,27 @@ class NodeAgent:
                 logger.warning("node agent heartbeat failed", exc_info=True)
             await asyncio.sleep(5)
 
+    def _stop_refused_runtime(self, sandbox_id: str) -> None:
+        """Stop the runtime of a tree whose teardown was refused (W7 / C1-4).
+
+        The refusal protects *files* -- the targets a contradicting record
+        could aim at -- and nothing else. Leaving the runtime registered is
+        what made a refused record end in "the control plane has forgotten the
+        sandbox and the process tree is still running": the callbacks
+        ``unregister`` fires are exactly the ones that shut the sandbox's
+        process tree down (``kill_all`` in production). Runs on the event
+        loop, where those callbacks belong.
+        """
+        try:
+            self._runtime_registry.unregister(sandbox_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "reconcile: could not unregister the runtime of %s while "
+                "refusing its tree",
+                sandbox_id,
+                exc_info=True,
+            )
+
     def _report_reconcile_summary(self, summary: dict[str, Any]) -> None:
         """Make the reconcile summary visible to operators (L1).
 
@@ -899,24 +1038,30 @@ class NodeAgent:
             except Exception:
                 # Verifying the targets must not cost the worker the rest of
                 # the round (nor its heartbeat): an unverifiable tree is left
-                # alone and reported like a mismatched record.
+                # alone and reported like a mismatched record. Its runtime
+                # goes with the other refusals (review W7 / C1-4).
                 logger.warning(
                     "reconcile: cannot verify the teardown targets of %s; "
                     "leaving it alone",
                     sandbox_id,
                     exc_info=True,
                 )
+                self._stop_refused_runtime(sandbox_id)
                 untrusted_records.append(sandbox_id)
                 continue
             if plan is None:
                 # A record that does not describe the tree it was found in is
                 # not evidence of anything: leave the tree alone (it is this
-                # sandbox's own directory) and say so.
+                # sandbox's own directory) and say so. The runtime is not part
+                # of the record's reach, so it still goes (review W7 / C1-4):
+                # a refusal keeps files, never a process tree. An operator
+                # reclaims the tree itself with an explicit force teardown.
                 logger.warning(
                     "reconcile: leaving %s on disk: %s",
                     sandbox_id,
                     reason,
                 )
+                self._stop_refused_runtime(sandbox_id)
                 untrusted_records.append(sandbox_id)
                 continue
             projids = set(plan.expected_projids)
@@ -1325,6 +1470,7 @@ async def agent_delete_sandbox(
     request: Request,
     keepFiles: bool = Query(default=False),
     keepVolumeSlices: bool = Query(default=False),
+    force: bool = Query(default=False),
 ) -> Response:
     settings = request.app.state.settings
     try:
@@ -1339,11 +1485,16 @@ async def agent_delete_sandbox(
             sandbox_id,
             keep_files=keepFiles,
             keep_volume_slices=keepVolumeSlices,
+            force=force,
         )
     except SandboxTeardownRefused as exc:
         # The record the sandbox could rewrite disagrees with the disk, so
-        # nothing was torn down: answer with the reason instead of a 204 that
-        # says a teardown happened (and instead of acting on the record).
+        # the record-derived targets were left alone (the runtime itself was
+        # already stopped): answer with the reason instead of a 204 that says
+        # a teardown happened (and instead of acting on the record). An
+        # operator who wants the tree gone anyway sends force=true, which
+        # reclaims it from the disk alone -- the bounded exit of this refusal
+        # (review W7 / C1-3).
         return Response(status_code=409, content=str(exc))
     return Response(status_code=204)
 

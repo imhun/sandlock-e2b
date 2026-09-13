@@ -130,6 +130,10 @@ class _LocalRuntimeStub(_RuntimeStub):
 
     def __init__(self, volume_projects: list) -> None:
         super().__init__(pool=None)
+        # The verified-target check reads the runtime record's own id the way
+        # ``RuntimeSandbox`` carries it (the real registry materialises the
+        # record from ``<base>/<id>/sandbox.json``, so it always matches).
+        self.sandbox_id = _Record.sandbox_id
         self.volume_projects = volume_projects
 
     def get(self, sandbox_id: str):

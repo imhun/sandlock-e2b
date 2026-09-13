@@ -11,11 +11,13 @@ must still preserve the slice.  Only a real sandbox deletion
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+import envd_service.agent as agent_mod
 import control_plane.api.sandboxes as sandboxes
 import envd_service.volumes as volumes
 from control_plane.api.errors import OfficialError
@@ -71,6 +73,15 @@ def test_destroy_local_real_delete_cleans_volume_slices(tmp_path, monkeypatch):
     )
     calls = []
     monkeypatch.setattr(volumes, "release_project", lambda **kw: calls.append(kw))
+    # A slice's project id is read from the disk now (review W7 / C2: the
+    # record inside the sandbox-owned tree is input the sandbox can rewrite).
+    # This host has no XFS to answer it, so the one read is supplied here; the
+    # real parser and the real wiring still run.
+    monkeypatch.setattr(
+        agent_mod,
+        "directory_project_id",
+        lambda path: 4242 if Path(path) == slice_dir else None,
+    )
     sandboxes._destroy_local(state, _record())
     assert len(calls) == 1
     assert calls[0]["projid"] == 4242
@@ -117,6 +128,9 @@ def test_destroy_remote_forwards_keep_volume_slices(tmp_path, monkeypatch):
         async def delete(self, url, headers):
             sent["url"] = url
             sent["headers"] = headers
+            # The real agent answers 204 on an acknowledged teardown; the
+            # caller now reads that answer (review W7 / C1-1).
+            return httpx.Response(204)
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeClient())
     request = SimpleNamespace(

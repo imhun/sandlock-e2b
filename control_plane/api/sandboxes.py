@@ -11,7 +11,7 @@ import tarfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 
@@ -729,6 +729,8 @@ async def create_sandbox(request: Request) -> dict[str, Any]:
             if result.action == "killed":
                 # kill 受害者复用 contract 的销毁路径：记录已删除，这里只
                 # 销毁节点上的运行时（远程 agent DELETE / 本地清理）。
+                # 失败不再是静默的成功：_destroy_evicted 记 WARNING，树留给
+                # orphan-tree GC 回收（控制面记录已无该沙箱）。
                 await _destroy_evicted(request, result.record)
             elif result.action == "paused":
                 await _push_evicted_pause(result.record)
@@ -1415,20 +1417,108 @@ async def get_sandbox_info(sandbox_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.delete("/sandboxes/{sandbox_id}", status_code=204, dependencies=[Depends(require_api_key)])
-async def kill_sandbox(sandbox_id: str, request: Request) -> Response:
+async def kill_sandbox(
+    sandbox_id: str, request: Request, force: bool = Query(default=False)
+) -> Response:
+    """Kill one sandbox, and only report success once the teardown happened.
+
+    The record is deleted *after* the hosting node acknowledges the teardown
+    (review W7 / C1-2). It used to be deleted first and the remote answer was
+    never looked at, so a node that refused the teardown (a rewritten
+    ``sandbox.json`` -> 409) still answered the SDK with 204: the control
+    plane had forgotten the sandbox while its tree, its quota row and its
+    process tree were all still there. A failure now keeps the record (so the
+    sandbox stays visible and retryable) and answers 502.
+
+    A node that cannot be reached at all is the one exception, and it is the
+    documented E6.1 case: nothing can be confirmed, the worker's next
+    reconcile reclaims the tree and its row, and the kill still completes --
+    with a WARNING naming the sandbox, never silently (see
+    :class:`_TeardownOutcome`).
+
+    ``force=true`` is the operator's bounded exit for a record that
+    contradicts the disk: the teardown then runs on the convention path and
+    the project ids the disk reports, never on the record's claims. It is
+    restricted to keys that are not tenant-scoped (admin or single-tenant
+    mode), because it is not something a tenant's SDK call should turn on.
+    """
     registry = _registry(request)
     try:
         record = registry.get(sandbox_id)
         _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
-        registry.delete(sandbox_id)
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+    if force:
+        tenant, is_admin = tenant_of(request)
+        if not (is_admin or tenant is None):
+            raise OfficialError(403, "force teardown requires an admin API key")
     node = request.app.state.nodes.get(record.node_id or "local")
-    if node is not None and node.address != "local://":
-        await _destroy_remote(request, record, node)
+    if node is None and (record.node_id or "local") != "local":
+        # The node this sandbox was scheduled on is gone from the registry:
+        # no address can confirm the teardown, so the record must not be
+        # dropped on the strength of a local no-op.
+        logger.warning(
+            "sandbox %s: node %s is not in the registry; teardown cannot be "
+            "confirmed",
+            sandbox_id,
+            record.node_id,
+        )
+        outcome = _TeardownOutcome(acknowledged=False)
+    elif node is not None and node.address != "local://":
+        outcome = await _destroy_remote(request, record, node, force=force)
     else:
-        _destroy_local(request.app.state, record)
+        outcome = _destroy_local(request.app.state, record, force=force)
+    if not outcome.acknowledged and not outcome.deferred:
+        # Keep the record: the sandbox is still there (its runtime was stopped
+        # where that was possible, its files are kept), so a 204 here would be
+        # the "control plane forgot it" state with the tree still running.
+        record.state = "orphaned"
+        record.append_log(
+            "delete: the node did not confirm the teardown; runtime stopped, "
+            "files kept"
+        )
+        registry.save(record)
+        logger.warning(
+            "sandbox %s: teardown not confirmed; record kept as orphaned",
+            sandbox_id,
+        )
+        raise OfficialError(
+            502,
+            f"Sandbox {sandbox_id} teardown failed on node "
+            f"{record.node_id}; its runtime was stopped and its files are kept",
+        )
+    if outcome.deferred:
+        logger.warning(
+            "sandbox %s: teardown deferred to the worker's next reconcile "
+            "(node %s unreachable); the record is released and the worker "
+            "reclaims the tree and its quota row",
+            sandbox_id,
+            record.node_id,
+        )
+    registry.delete(sandbox_id)
     return Response(status_code=204)
+
+
+class _TeardownOutcome(NamedTuple):
+    """What one teardown attempt achieved (review W7 / C1-1).
+
+    ``acknowledged`` is True only when the sandbox really is gone from its
+    node: the agent answered 204, or the local teardown ran. Everything else
+    is a failure the caller has to handle, and ``deferred`` separates the two
+    kinds of failure, because they have different exits:
+
+    * the node *answered* and refused or failed (a non-2xx, e.g. the agent's
+      409 for a ``sandbox.json`` that contradicts the disk): nothing was torn
+      down and nothing else will reclaim it, so the record has to stay and
+      the caller has to fail;
+    * the node could not be reached at all: the E6.1 reconcile on the worker's
+      next start reclaims the tree and its quota row (a deliberate contract:
+      ``test_kill_while_the_hosting_worker_is_down_is_reclaimed_on_the_next
+      _start``), so the record may still go -- but never silently.
+    """
+
+    acknowledged: bool
+    deferred: bool = False
 
 
 async def _destroy_remote(
@@ -1437,7 +1527,15 @@ async def _destroy_remote(
     node,
     keep_files: bool = False,
     keep_volume_slices: bool = False,
-) -> None:
+    force: bool = False,
+) -> _TeardownOutcome:
+    """Tear a sandbox down through its node's agent, and report the answer.
+
+    The answer is what the agent said (204 = torn down, 409 = refused, ...)
+    and never "we asked and hoped": treating a refusal as success is what let
+    the control plane forget a sandbox whose tree, quota row and process tree
+    were all still there (review W7 / C1-1).
+    """
     import httpx
 
     try:
@@ -1448,21 +1546,46 @@ async def _destroy_remote(
                 params.append("keepFiles=true")
             if keep_volume_slices:
                 params.append("keepVolumeSlices=true")
+            if force:
+                params.append("force=true")
             if params:
                 url += "?" + "&".join(params)
-            await client.delete(
+            resp = await client.delete(
                 url,
                 headers={
                     "X-Internal-Key": request.app.state.settings.internal_api_key
                 },
             )
-    except httpx.HTTPError:
-        pass
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "sandbox %s: node %s did not answer its teardown request: %s; "
+            "the tree and its runtime are left to that worker's next "
+            "reconcile",
+            record.sandbox_id,
+            getattr(node, "node_id", node.address),
+            exc,
+        )
+        return _TeardownOutcome(acknowledged=False, deferred=True)
+    if resp.status_code != 204:
+        logger.warning(
+            "sandbox %s: node %s refused the teardown (HTTP %s): %s; its "
+            "runtime was stopped and its files are kept",
+            record.sandbox_id,
+            getattr(node, "node_id", node.address),
+            resp.status_code,
+            (resp.text or "")[:300],
+        )
+        return _TeardownOutcome(acknowledged=False)
+    return _TeardownOutcome(acknowledged=True)
 
 
 def _destroy_local(
-    state, record, keep_files: bool = False, keep_volume_slices: bool = False
-) -> None:
+    state,
+    record,
+    keep_files: bool = False,
+    keep_volume_slices: bool = False,
+    force: bool = False,
+) -> _TeardownOutcome:
     """Stop and clean a local sandbox runtime, including volume slices.
 
     ``keep_files=True`` keeps the workspace and volume slices (migration
@@ -1470,37 +1593,94 @@ def _destroy_local(
     keeps only the per-sandbox volume slices while still removing the
     workspace — used by migration success and rollback, where the shared
     volume slice is already in use by the target sandbox and must survive.
+
+    The volume entries come from ``sandbox.json`` inside the sandbox's own
+    tree — input the sandbox can rewrite — so they go through the same
+    verified target set the worker's delete endpoint uses (review W7 / C2):
+    a slice has to be named after this sandbox and live under the configured
+    volume root, and the project id released is the one the disk reports,
+    never the record's claim. Reports a refused teardown (and keeps the files)
+    when the record contradicts the tree it was found in; the runtime is
+    stopped in that case too, so a refusal never leaves a process tree behind
+    a sandbox the control plane has already forgotten.
     """
+    sandbox_id = record.sandbox_id
     runtime_registry = getattr(state, "runtime_registry", None)
     runtime = (
-        runtime_registry.get(record.sandbox_id)
+        runtime_registry.get(sandbox_id)
         if runtime_registry is not None
         else None
     )
     if not keep_files:
-        if (
-            not keep_volume_slices
-            and runtime is not None
-            and runtime.volume_projects
-        ):
+        volume_projects, refused = _verified_local_volume_projects(
+            state, sandbox_id, runtime, force=force
+        )
+        if refused is not None:
+            logger.warning(
+                "local delete: refusing to tear down %s: %s",
+                sandbox_id,
+                refused,
+            )
+            if runtime_registry is not None:
+                runtime_registry.unregister(sandbox_id)
+            return _TeardownOutcome(acknowledged=False)
+        if not keep_volume_slices and volume_projects:
             try:
                 from envd_service.volumes import cleanup_volume_projects
             except ImportError:  # pragma: no cover - separated control plane
                 pass
             else:
                 cleanup_volume_projects(
-                    volume_projects=runtime.volume_projects,
+                    volume_projects=volume_projects,
                     fallback_mount_point=state.workspace_base,
                     # Release (and the GC fallback behind it) takes the same
                     # switch as provisioning, or a released project would be
                     # asked of the wrong side.
                     via_agent=local_node_quota_via_agent(),
                 )
-        shutil.rmtree(
-            state.workspace_base / record.sandbox_id, ignore_errors=True
-        )
+        shutil.rmtree(state.workspace_base / sandbox_id, ignore_errors=True)
     if runtime_registry is not None:
-        runtime_registry.unregister(record.sandbox_id)
+        runtime_registry.unregister(sandbox_id)
+    return _TeardownOutcome(acknowledged=True)
+
+
+def _verified_local_volume_projects(
+    state, sandbox_id: str, runtime, *, force: bool
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Verified volume targets for a combined-node teardown (review W7 / C2).
+
+    Returns ``(volume_projects, None)`` when the record describes its own tree
+    (the entries are the ones whose slice name, volume root and disk project id
+    all check out), and ``(<the record's claims untouched>, reason)`` when the
+    record contradicts the disk, which the caller refuses.
+
+    The rule is the worker's rule, not a second implementation of it: the
+    targets come from :func:`envd_service.agent._verified_teardown_plan`, the
+    one place that reads them off the disk.
+    """
+    settings = getattr(state, "settings", None)
+    try:
+        from envd_service.agent import _verified_teardown_plan
+    except ImportError:  # pragma: no cover - separated control plane
+        # No envd service in this image: there is no verified way to pick a
+        # slice, so none is touched (the old record-driven selection would
+        # delete whatever a rewritten ``sandbox.json`` named).
+        return [], None
+    plan, reason = _verified_teardown_plan(
+        state.workspace_base,
+        sandbox_id,
+        runtime,
+        shared_volume_root=getattr(settings, "shared_volume_root", None),
+        context="local delete",
+        force=force,
+        # The tree's own workspace project belongs to the envd half of a
+        # combined node (``_provision_local`` does not create one), so this
+        # teardown releases slices only -- the same accounting it did before.
+        verify_tree_project=False,
+    )
+    if plan is None:
+        return [], reason
+    return list(plan.volume_projects), None
 
 
 async def _destroy_on_node(
@@ -1509,16 +1689,15 @@ async def _destroy_on_node(
     node,
     keep_files: bool = False,
     keep_volume_slices: bool = False,
-) -> None:
+) -> _TeardownOutcome:
     if node.address == "local://":
-        _destroy_local(
+        return _destroy_local(
             request.app.state,
             record,
             keep_files=keep_files,
             keep_volume_slices=keep_volume_slices,
         )
-        return
-    await _destroy_remote(
+    return await _destroy_remote(
         request,
         record,
         node,
@@ -1527,18 +1706,33 @@ async def _destroy_on_node(
     )
 
 
-async def _destroy_evicted(request, record) -> None:
+async def _destroy_evicted(request, record) -> bool:
     """Tear down the runtime of an eviction-killed sandbox (E9.3).
 
     The registry already removed the record (and released its admission/node
     quota through the normal delete chain); this mirrors ``kill_sandbox``'s
     teardown so the worker actually stops the runtime and drops its files.
+
+    Returns whether the node acknowledged the teardown. There is no record
+    left to keep, so a failure is not a silent 204 either: it is logged (the
+    ``_destroy_*`` helpers name the sandbox and the reason) and the tree is
+    left on the disk as an orphan, which the orphan-tree GC reclaims on its
+    next round — the sandbox is in no control-plane record any more, so the
+    sweep is exactly the retry this shape needs.
     """
     node = request.app.state.nodes.get(record.node_id or "local")
     if node is not None and node.address != "local://":
-        await _destroy_remote(request, record, node)
+        outcome = await _destroy_remote(request, record, node)
     else:
-        _destroy_local(request.app.state, record)
+        outcome = _destroy_local(request.app.state, record)
+    if not outcome.acknowledged:
+        logger.warning(
+            "eviction: the runtime of %s was not torn down (%s); its tree is "
+            "left to the orphan-tree GC",
+            record.sandbox_id,
+            "node unreachable" if outcome.deferred else "node refused",
+        )
+    return outcome.acknowledged
 
 
 async def _stop_source_runtime(request, record, node) -> bool:
@@ -1550,8 +1744,7 @@ async def _stop_source_runtime(request, record, node) -> bool:
     stop, in which case the caller must abort the migration.
     """
     if node.address == "local://":
-        _destroy_local(request.app.state, record, keep_files=True)
-        return True
+        return _destroy_local(request.app.state, record, keep_files=True).acknowledged
     import httpx
 
     try:

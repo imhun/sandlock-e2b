@@ -160,22 +160,53 @@ def create_app(
                 import httpx
 
                 try:
-                    httpx.delete(
+                    resp = httpx.delete(
                         f"{node.address}/agent/sandboxes/{record.sandbox_id}",
                         headers={
                             "X-Internal-Key": settings.internal_api_key
                         },
                         timeout=30,
                     )
-                except httpx.HTTPError:
-                    pass
+                except httpx.HTTPError as exc:
+                    # TTL expiry has no HTTP response to answer with, so the
+                    # only honest signal is this line (review W7 / C1-1): the
+                    # node could not be reached, so the tree stays on the
+                    # worker and its next reconcile reclaims it (no
+                    # control-plane record references it any more).
+                    logging.getLogger(__name__).warning(
+                        "TTL: %s was not torn down on %s: %s; its tree is left "
+                        "to that worker's next reconcile",
+                        record.sandbox_id,
+                        node.node_id,
+                        exc,
+                    )
+                else:
+                    if resp.status_code != 204:
+                        # The node answered and refused (a rewritten
+                        # ``sandbox.json`` is the shape): nothing was torn
+                        # down, and the tree is an orphan now that the record
+                        # is gone, so the orphan-tree GC is the retry.
+                        logging.getLogger(__name__).warning(
+                            "TTL: %s was refused by %s (HTTP %s): %s; its tree "
+                            "is left to the orphan-tree GC",
+                            record.sandbox_id,
+                            node.node_id,
+                            resp.status_code,
+                            (resp.text or "")[:300],
+                        )
                 app.state.runtime_registry.unregister(record.sandbox_id)
             else:
                 # Local runtime: full teardown (unregister + workspace and
                 # per-sandbox volume slice cleanup, E2.5).
                 from control_plane.api.sandboxes import _destroy_local
 
-                _destroy_local(app.state, record)
+                if not _destroy_local(app.state, record).acknowledged:
+                    logging.getLogger(__name__).warning(
+                        "TTL: the local teardown of %s was refused; its "
+                        "runtime was stopped and its tree is left to the "
+                        "orphan-tree GC",
+                        record.sandbox_id,
+                    )
 
         sweeper = TTLSweeper(on_expired=_on_sandbox_removed)
         app.state.sweeper = sweeper
