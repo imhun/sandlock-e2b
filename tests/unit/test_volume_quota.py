@@ -19,6 +19,7 @@ from envd_service.volumes import (
     provision_sandbox_volume_mount,
     volume_projid_key,
 )
+from tests._disk_projids import install_disk_projids as _install_disk_projids
 
 
 def _sandbox_dir(volume_path: Path, sandbox_id: str) -> Path:
@@ -31,36 +32,6 @@ def _supported(_mount, *, via_agent=False):
 
 def _unsupported(_mount, *, via_agent=False):
     return (False, "not xfs")
-
-
-def _install_disk_projids(monkeypatch, mapping: dict[Path, int]) -> list[list[str]]:
-    """Answer the project-id read from an explicit disk table (review W1).
-
-    The delete endpoint releases the project id the *disk* reports for the
-    tree, never the one the sandbox-writable ``sandbox.json`` claims, so the
-    one read this host cannot do itself is supplied here -- through
-    ``lsattr -p -d``'s stdout, so the real parser still runs.
-    """
-    import subprocess
-
-    calls: list[list[str]] = []
-    real_run = subprocess.run
-    monkeypatch.setattr(xfs_quota, "_use_quotactl_read", lambda mount_point: False)
-
-    def fake_run(argv, *args, **kwargs):
-        if isinstance(argv, (list, tuple)) and argv and argv[0] == "lsattr":
-            calls.append(list(argv))
-            projid = mapping.get(Path(argv[-1]))
-            stdout = (
-                ""
-                if projid is None
-                else f"{projid:>8} ---------------- {argv[-1]}\n"
-            )
-            return subprocess.CompletedProcess(list(argv), 0, stdout, "")
-        return real_run(argv, *args, **kwargs)
-
-    monkeypatch.setattr(xfs_quota.subprocess, "run", fake_run)
-    return calls
 
 
 # ------------------------------------------------------------- projid seed
@@ -743,7 +714,7 @@ async def _agent_post(app, sandbox_id, volume_mounts):
 
 
 async def test_agent_create_persists_volume_projects_and_delete_cleans(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, disk_read_backend
 ):
     cleanup_calls = []
     app = _agent_app(tmp_path, monkeypatch, cleanup_calls)
@@ -783,7 +754,9 @@ async def test_agent_create_persists_volume_projects_and_delete_cleans(
     # review W1): the workspace tree reports 777, the slice 4242 -- the same
     # values the create provisioned.
     _install_disk_projids(
-        monkeypatch, {tmp_path / sandbox_id: 777, slice_dir: 4242}
+        monkeypatch,
+        {tmp_path / sandbox_id: 777, slice_dir: 4242},
+        backend=disk_read_backend,
     )
 
     import httpx
@@ -840,7 +813,7 @@ async def test_agent_delete_keepfiles_skips_volume_cleanup(tmp_path, monkeypatch
 
 
 async def test_agent_delete_keep_volume_slices_removes_workspace_but_keeps_slices(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, disk_read_backend
 ):
     """C1: migration cleanup removes the workspace, never the shared slice."""
     cleanup_calls = []
@@ -866,7 +839,9 @@ async def test_agent_delete_keep_volume_slices_removes_workspace_but_keeps_slice
     workspace_dir = tmp_path / sandbox_id
     # The workspace release is driven by the projid the disk reports for the
     # tree (review W1); the slice is kept by the flag below.
-    _install_disk_projids(monkeypatch, {workspace_dir: 777})
+    _install_disk_projids(
+        monkeypatch, {workspace_dir: 777}, backend=disk_read_backend
+    )
 
     import httpx
 

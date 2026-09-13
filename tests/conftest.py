@@ -19,10 +19,12 @@ from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings as ControlSettings
 from control_plane.registry.nodes import NodeRegistry
 from envd_service.app import create_app as create_envd_app
+from envd_service.app import PER_UID_NONROOT_WARNING
 from envd_service.config import Settings as EnvdSettings
 from envd_service.gateway import create_gateway
 from envd_service.runtime.oci_registry import registry_mirrors
 from envd_service.runtime.registry import RuntimeRegistry
+from tests._disk_projids import DISK_READ_BACKENDS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Ownership-sensitive tests (E3.2 per-sandbox uids) need a filesystem where
@@ -121,6 +123,50 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if item.get_closest_marker("perf"):
                 item.add_marker(skip_perf)
+
+
+@pytest.fixture(params=DISK_READ_BACKENDS)
+def disk_read_backend(request) -> str:
+    """Which read backend the contract's project-id table answers through.
+
+    ``directory_project_id`` has two of them (the fd backend and the
+    ``lsattr`` fallback, in that order of preference) and W2 added the second
+    stage that made a mount-only fake stop deciding anything on Linux, so the
+    contracts that answer the read from an explicit table run once per form.
+    See ``tests/_disk_projids.py`` for what the fakes do and why.
+    """
+    return request.param
+
+
+def uid_startup_disclosure() -> list[str]:
+    """The startup lines *this host's* worker emits before a create/delete.
+
+    ``create_envd_app`` logs two independent decisions, in this order, and a
+    contract that compares whole warning lists has to expect exactly the ones
+    that fired here:
+
+    * Track F's broker resolution: a non-root worker with
+      ``E2B_PRIV_HELPERS=auto`` and no brokers installed says so once
+      (``priv_helpers.helpers_unavailable_reason``); a root worker, ``off``,
+      or an installed broker pair stays quiet;
+    * E5.1's per-sandbox uids: without root and without the brokers the switch
+      is auto-disabled with its own line; a root worker (or one that resolved
+      the brokers) builds the uid pool and stays quiet.
+
+    The suite runs in two shapes -- the root gate container (both silent) and
+    an unprivileged dev box (the first line, then the second) -- so a helper
+    that models only the second decision turns every exact-list assertion red
+    on the dev box while the container stays green.
+    """
+    from envd_service import priv_helpers
+
+    if os.geteuid() == 0 or priv_helpers.active_helpers() is not None:
+        return []
+    unavailable = priv_helpers.helpers_unavailable_reason(EnvdSettings())
+    return [
+        *([] if unavailable is None else [unavailable]),
+        PER_UID_NONROOT_WARNING,
+    ]
 
 
 def _fresh_dir(path: Path) -> Path:

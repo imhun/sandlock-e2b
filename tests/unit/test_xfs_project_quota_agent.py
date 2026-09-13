@@ -11,30 +11,13 @@ import pytest
 
 import envd_service.agent as agent
 import envd_service.xfs_quota as xfs_quota
-from envd_service import app as app_module
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
 from envd_service.xfs_quota import ProjectQuotaError
-
-
-def _uid_disclosure() -> list[str]:
-    """The E3.2 startup disclosure, present only on a non-root worker.
-
-    Per-sandbox uids are the default; an unprivileged worker says so once at
-    startup, a root worker builds the uid pool and stays quiet -- so the exact
-    expected startup list depends on who runs the suite.
-
-    Track F: a non-root worker that resolved the file-capability brokers also
-    builds the uid pool, so the disclosure is conditional on their absence.
-    """
-    import os
-
-    from envd_service import priv_helpers
-
-    if os.geteuid() == 0 or priv_helpers.active_helpers() is not None:
-        return []
-    return [app_module.PER_UID_NONROOT_WARNING]
+from tests._disk_projids import install_disk_projids as _install_disk_projids
+from tests._disk_projids import read_calls
+from tests.conftest import uid_startup_disclosure
 
 
 def _warnings(caplog) -> list[str]:
@@ -58,38 +41,6 @@ def _warnings(caplog) -> list[str]:
             "envd_service.xfs_quota",  # "quota unavailable: filesystem is X"
         }
     ]
-
-
-def _install_disk_projids(monkeypatch, mapping: dict[Path, int]) -> list[list[str]]:
-    """Answer the project-id read from an explicit disk table.
-
-    ``_delete_sandbox_runtime`` takes its release target from the *disk*, not
-    from the record: ``sandbox.json`` sits inside the sandbox-owned tree, so
-    the sandbox can replace it (review W1). These contracts therefore have to
-    supply the one read this host cannot do itself; the real parser is still
-    exercised, because what is faked is ``lsattr -p -d``'s stdout. A directory
-    absent from ``mapping`` reports no project id.
-    """
-    import subprocess
-
-    calls: list[list[str]] = []
-    real_run = subprocess.run
-    monkeypatch.setattr(xfs_quota, "_use_quotactl_read", lambda mount_point: False)
-
-    def fake_run(argv, *args, **kwargs):
-        if isinstance(argv, (list, tuple)) and argv and argv[0] == "lsattr":
-            calls.append(list(argv))
-            projid = mapping.get(Path(argv[-1]))
-            stdout = (
-                ""
-                if projid is None
-                else f"{projid:>8} ---------------- {argv[-1]}\n"
-            )
-            return subprocess.CompletedProcess(list(argv), 0, stdout, "")
-        return real_run(argv, *args, **kwargs)
-
-    monkeypatch.setattr(xfs_quota.subprocess, "run", fake_run)
-    return calls
 
 
 def _make_app(workspace: Path, **settings_overrides):
@@ -188,7 +139,7 @@ async def test_create_quota_failure_degrades_with_warning(workspace, monkeypatch
     assert record is not None
     assert record.project_id is None
     assert _warnings(caplog) == [
-        *_uid_disclosure(),
+        *uid_startup_disclosure(),
         "XFS project quota setup failed for sbx_quota_fail: "
         "xfs_quota 'limit -p bhard=1024M 42' failed: boom",
     ]
@@ -220,7 +171,7 @@ async def test_create_unsupported_skips_quota_with_warning(workspace, monkeypatc
     assert record is not None
     assert record.project_id is None
     assert _warnings(caplog) == [
-        *_uid_disclosure(),
+        *uid_startup_disclosure(),
         f"XFS project quota unavailable for {workspace}: filesystem is ext4, not xfs",
     ]
 
@@ -320,14 +271,16 @@ async def test_create_reprovision_failure_persists_none_after_cleanup(
         ],
     ]
     assert _warnings(caplog) == [
-        *_uid_disclosure(),
+        *uid_startup_disclosure(),
         "XFS project quota setup failed for sbx_reprov_fail: "
         "quota limit setup failed for sbx_reprov_fail: xfs_quota "
         "'limit -p bhard=1024M 777' failed: limit boom",
     ]
 
 
-async def test_delete_releases_project_and_removes_dir(workspace, monkeypatch):
+async def test_delete_releases_project_and_removes_dir(
+    workspace, monkeypatch, disk_read_backend
+):
     app = _make_app(workspace)
     app.state.runtime_registry.register(
         sandbox_id="sbx_del",
@@ -343,7 +296,11 @@ async def test_delete_releases_project_and_removes_dir(workspace, monkeypatch):
 
     monkeypatch.setattr(agent, "release_project", fake_release)
     # The release target is the disk's answer, not the record's claim.
-    disk_calls = _install_disk_projids(monkeypatch, {workspace / "sbx_del": 42})
+    disk = _install_disk_projids(
+        monkeypatch,
+        {workspace / "sbx_del": 42},
+        backend=disk_read_backend,
+    )
 
     response = await _delete_sandbox(app, "sbx_del")
     assert response.status_code == 204
@@ -353,7 +310,7 @@ async def test_delete_releases_project_and_removes_dir(workspace, monkeypatch):
         "projid": 42,
         "via_agent": False,
     }
-    assert disk_calls == [["lsattr", "-p", "-d", str(workspace / "sbx_del")]]
+    assert disk.calls == read_calls(disk_read_backend, workspace / "sbx_del")
     assert not (workspace / "sbx_del").exists()
 
 
@@ -429,7 +386,9 @@ async def test_delete_keep_files_skips_release_and_keeps_dir(workspace, monkeypa
     assert (workspace / "sbx_keep" / "sandbox.json").is_file()
 
 
-async def test_delete_cleanup_failure_degrades_with_warning(workspace, monkeypatch, caplog):
+async def test_delete_cleanup_failure_degrades_with_warning(
+    workspace, monkeypatch, caplog, disk_read_backend
+):
     app = _make_app(workspace)
     app.state.runtime_registry.register(
         sandbox_id="sbx_cleanup_fail",
@@ -446,7 +405,9 @@ async def test_delete_cleanup_failure_degrades_with_warning(workspace, monkeypat
 
     monkeypatch.setattr(agent, "release_project", fake_release)
     _install_disk_projids(
-        monkeypatch, {workspace / "sbx_cleanup_fail": 42}
+        monkeypatch,
+        {workspace / "sbx_cleanup_fail": 42},
+        backend=disk_read_backend,
     )
     caplog.set_level(logging.WARNING)
 
@@ -454,7 +415,7 @@ async def test_delete_cleanup_failure_degrades_with_warning(workspace, monkeypat
     assert response.status_code == 204
     assert not (workspace / "sbx_cleanup_fail").exists()
     assert _warnings(caplog) == [
-        *_uid_disclosure(),
+        *uid_startup_disclosure(),
         "XFS project quota cleanup failed for sbx_cleanup_fail: "
         "xfs_quota 'project -C -p /srv/sandboxes/sbx_cleanup_fail 42' failed: boom",
     ]

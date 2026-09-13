@@ -51,6 +51,7 @@ from control_plane.registry.nodes import NodeRegistry
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
+from tests._disk_projids import install_disk_projids as _install_disk_projids
 
 INTERNAL_KEY = "internal-key"
 API_KEY = "local-key"
@@ -433,21 +434,6 @@ class _QuotaFake:
         raise AssertionError("provisioning must not run in these contracts")
 
 
-def _install_disk_projids(monkeypatch, mapping: dict[Path, int]) -> None:
-    """Answer the project-id read from an explicit disk table.
-
-    ``_verified_teardown_plan`` reads the truth from the filesystem, because
-    the record inside the sandbox-owned tree is input the sandbox can
-    rewrite. This host has no XFS to answer it, so the read is supplied here;
-    the real wiring (including the mismatch refusal) still runs.
-    """
-    monkeypatch.setattr(
-        agent_mod,
-        "directory_project_id",
-        lambda path: mapping.get(Path(path)),
-    )
-
-
 def _worker_app(workspace: Path, **settings_overrides):
     return create_envd_app(
         settings=_envd_settings(workspace, **settings_overrides),
@@ -474,7 +460,7 @@ def _agent_lines(caplog) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_a_symlinked_base_spelling_is_the_same_tree(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """C1-5 / M1: the shape ``de555f8`` deleted correctly must delete again.
 
@@ -499,7 +485,9 @@ async def test_a_symlinked_base_spelling_is_the_same_tree(
     # The app's own startup is what installs the degraded quota hooks when no
     # agent URL is configured, so the fake goes on top of it.
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {tree: LIAR_PROJID})
+    _install_disk_projids(
+        monkeypatch, {tree: LIAR_PROJID}, backend=disk_read_backend
+    )
     fired: list[str] = []
     app.state.runtime_registry.add_unregister_callback(fired.append)
     caplog.set_level(logging.WARNING)
@@ -519,7 +507,7 @@ async def test_a_symlinked_base_spelling_is_the_same_tree(
 
 @pytest.mark.asyncio
 async def test_a_stale_recorded_base_is_reclaimed_and_stops_pinning_its_row(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """C1-3: the legitimate "old base" shape is reclaimed, row included.
 
@@ -538,7 +526,9 @@ async def test_a_stale_recorded_base_is_reclaimed_and_stops_pinning_its_row(
     quota = _QuotaFake({LIAR_PROJID: 8})
     app = _worker_app(workspace)
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {tree: LIAR_PROJID})
+    _install_disk_projids(
+        monkeypatch, {tree: LIAR_PROJID}, backend=disk_read_backend
+    )
     caplog.set_level(logging.WARNING)
     caplog.clear()
     # The pin, before: the readable record is what keeps the row out of the
@@ -579,7 +569,7 @@ def _reconcile_rows(monkeypatch, workspace: Path, rows: dict[int, int]) -> dict:
 
 @pytest.mark.asyncio
 async def test_a_record_aiming_at_another_tree_still_refuses_but_stops_the_runtime(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """C1-5 + C1-4: the attack shape is refused, and its runtime still goes.
 
@@ -600,7 +590,11 @@ async def test_a_record_aiming_at_another_tree_still_refuses_but_stops_the_runti
     quota = _QuotaFake({VICTIM_PROJID: 8, LIAR_PROJID: 8})
     app = _worker_app(workspace)
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {liar: LIAR_PROJID, victim: VICTIM_PROJID})
+    _install_disk_projids(
+        monkeypatch,
+        {liar: LIAR_PROJID, victim: VICTIM_PROJID},
+        backend=disk_read_backend,
+    )
     fired: list[str] = []
     app.state.runtime_registry.add_unregister_callback(fired.append)
     caplog.set_level(logging.WARNING)
@@ -627,7 +621,7 @@ async def test_a_record_aiming_at_another_tree_still_refuses_but_stops_the_runti
 
 @pytest.mark.asyncio
 async def test_force_reclaims_the_refused_tree_from_the_disk_alone(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """C1-3: the bounded exit of a refusal, with the victim still untouched.
 
@@ -646,7 +640,11 @@ async def test_force_reclaims_the_refused_tree_from_the_disk_alone(
     quota = _QuotaFake({VICTIM_PROJID: 8, LIAR_PROJID: 8})
     app = _worker_app(workspace)
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {liar: LIAR_PROJID, victim: VICTIM_PROJID})
+    _install_disk_projids(
+        monkeypatch,
+        {liar: LIAR_PROJID, victim: VICTIM_PROJID},
+        backend=disk_read_backend,
+    )
     caplog.set_level(logging.WARNING)
     caplog.clear()
 
@@ -712,7 +710,7 @@ def _record_releases(monkeypatch) -> list[tuple[str, int]]:
 
 @pytest.mark.asyncio
 async def test_the_combined_node_never_reaches_another_tenants_slice(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """C2: a rewritten ``volume_projects`` may not aim the local teardown.
 
@@ -755,6 +753,7 @@ async def test_the_combined_node_never_reaches_another_tenants_slice(
     _install_disk_projids(
         monkeypatch,
         {tree: LIAR_PROJID, victim_slice: VICTIM_PROJID, outside_slice: LIAR_PROJID},
+        backend=disk_read_backend,
     )
     _control_record(registry, "local", "sbx_local_liar")
     caplog.set_level(logging.WARNING)
@@ -778,7 +777,7 @@ async def test_the_combined_node_never_reaches_another_tenants_slice(
 
 @pytest.mark.asyncio
 async def test_the_combined_node_still_cleans_its_own_slice(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """The verified target set must not turn the normal delete into a no-op.
 
@@ -806,7 +805,11 @@ async def test_the_combined_node_still_cleans_its_own_slice(
     )
     registry, app, runtime_registry = _local_control_stack(workspace, volume_root)
     released = _record_releases(monkeypatch)
-    _install_disk_projids(monkeypatch, {tree: LIAR_PROJID, slice_dir: 7200})
+    _install_disk_projids(
+        monkeypatch,
+        {tree: LIAR_PROJID, slice_dir: 7200},
+        backend=disk_read_backend,
+    )
     _control_record(registry, "local", "sbx_local_own")
     caplog.set_level(logging.WARNING)
     caplog.clear()
@@ -857,7 +860,7 @@ def _record_agent_releases(monkeypatch) -> list[tuple[str, int]]:
 
 @pytest.mark.asyncio
 async def test_a_refusal_is_not_blinded_by_its_own_marker(
-    workspace, monkeypatch
+    workspace, monkeypatch, disk_read_backend
 ):
     """W7-1: the refusal used to arm the very marker that hid its record.
 
@@ -878,7 +881,9 @@ async def test_a_refusal_is_not_blinded_by_its_own_marker(
         project_id=VICTIM_PROJID,
     )
     _install_disk_projids(
-        monkeypatch, {victim: VICTIM_PROJID, liar: LIAR_PROJID}
+        monkeypatch,
+        {victim: VICTIM_PROJID, liar: LIAR_PROJID},
+        backend=disk_read_backend,
     )
     app = _worker_app(workspace)
     registry = app.state.runtime_registry
@@ -905,7 +910,9 @@ async def test_a_refusal_is_not_blinded_by_its_own_marker(
 
 
 @pytest.mark.asyncio
-async def test_the_local_refusal_survives_the_next_delete(workspace, monkeypatch):
+async def test_the_local_refusal_survives_the_next_delete(
+    workspace, monkeypatch, disk_read_backend
+):
     """W7-1 on the combined node: two 502s, and the tree is still there."""
     volume_root = workspace / "_volumes"
     victim = _write_tree(workspace, "sbx_victim", project_id=VICTIM_PROJID)
@@ -918,7 +925,9 @@ async def test_the_local_refusal_survives_the_next_delete(workspace, monkeypatch
     registry, app, runtime_registry = _local_control_stack(workspace, volume_root)
     released = _record_releases(monkeypatch)
     _install_disk_projids(
-        monkeypatch, {victim: VICTIM_PROJID, liar: LIAR_PROJID}
+        monkeypatch,
+        {victim: VICTIM_PROJID, liar: LIAR_PROJID},
+        backend=disk_read_backend,
     )
     _control_record(registry, "local", "sbx_liar")
 
@@ -940,7 +949,7 @@ async def test_the_local_refusal_survives_the_next_delete(workspace, monkeypatch
 
 @pytest.mark.asyncio
 async def test_the_local_teardown_confirms_the_tree_is_gone(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """W7-2: a tree that survives its removal is a failed teardown.
 
@@ -955,7 +964,9 @@ async def test_the_local_teardown_confirms_the_tree_is_gone(
     tree = _write_tree(workspace, "sbx_sealed", project_id=LIAR_PROJID)
     registry, app, runtime_registry = _local_control_stack(workspace, volume_root)
     _record_releases(monkeypatch)
-    _install_disk_projids(monkeypatch, {tree: LIAR_PROJID})
+    _install_disk_projids(
+        monkeypatch, {tree: LIAR_PROJID}, backend=disk_read_backend
+    )
     _control_record(registry, "local", "sbx_sealed")
     calls: list[str] = []
 
@@ -986,7 +997,7 @@ async def test_the_local_teardown_confirms_the_tree_is_gone(
 
 @pytest.mark.asyncio
 async def test_the_local_teardown_passes_when_the_helper_removes_the_tree(
-    workspace, monkeypatch
+    workspace, monkeypatch, disk_read_backend
 ):
     """The other half of W7-2: a removal that worked is still a clean 204."""
     import shutil
@@ -995,7 +1006,9 @@ async def test_the_local_teardown_passes_when_the_helper_removes_the_tree(
     tree = _write_tree(workspace, "sbx_ok", project_id=LIAR_PROJID)
     registry, app, runtime_registry = _local_control_stack(workspace, volume_root)
     _record_releases(monkeypatch)
-    _install_disk_projids(monkeypatch, {tree: LIAR_PROJID})
+    _install_disk_projids(
+        monkeypatch, {tree: LIAR_PROJID}, backend=disk_read_backend
+    )
     _control_record(registry, "local", "sbx_ok")
     calls: list[str] = []
 
@@ -1017,7 +1030,7 @@ async def test_the_local_teardown_passes_when_the_helper_removes_the_tree(
 
 @pytest.mark.asyncio
 async def test_a_refused_tree_is_parked_and_the_row_it_pinned_is_released(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """W7-3: the GC's refusal has a bounded, non-destructive exit.
 
@@ -1037,7 +1050,9 @@ async def test_a_refused_tree_is_parked_and_the_row_it_pinned_is_released(
         project_id=LIAR_PROJID,
     )
     _install_disk_projids(
-        monkeypatch, {victim: VICTIM_PROJID, liar: LIAR_PROJID}
+        monkeypatch,
+        {victim: VICTIM_PROJID, liar: LIAR_PROJID},
+        backend=disk_read_backend,
     )
     released = _record_agent_releases(monkeypatch)
     app = _worker_app(workspace)
@@ -1135,7 +1150,7 @@ async def test_the_untrusted_view_and_the_park_action_need_the_internal_key(
 
 @pytest.mark.asyncio
 async def test_a_tree_without_a_readable_record_is_listed_and_parkable(
-    workspace, monkeypatch
+    workspace, monkeypatch, disk_read_backend
 ):
     """The other leftover shape: no readable ``sandbox.json`` at all.
 
@@ -1149,7 +1164,9 @@ async def test_a_tree_without_a_readable_record_is_listed_and_parkable(
     leftover = workspace / "sbx_no_record"
     (leftover / "workspace").mkdir(parents=True)
     (leftover / "payload.bin").write_bytes(b"payload-of-sbx_no_record")
-    _install_disk_projids(monkeypatch, {leftover: 7100})
+    _install_disk_projids(
+        monkeypatch, {leftover: 7100}, backend=disk_read_backend
+    )
     released = _record_agent_releases(monkeypatch)
     app = _worker_app(workspace)
     parked_dir = workspace / "_untrusted.trees" / "sbx_no_record"
@@ -1388,7 +1405,7 @@ async def test_a_platform_namespace_is_never_listed_even_when_it_reports_an_id(
 
 @pytest.mark.asyncio
 async def test_parking_a_refused_tree_releases_the_slices_it_claims(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """R2: park releases the sandbox's validated volume rows too.
 
@@ -1452,6 +1469,7 @@ async def test_parking_a_refused_tree_releases_the_slices_it_claims(
             victim_slice: VICTIM_SLICE_PROJID,
             outside_slice: 8400,
         },
+        backend=disk_read_backend,
     )
     released = _record_agent_releases(monkeypatch)
     app = _worker_app(workspace, shared_volume_root=str(volume_root))

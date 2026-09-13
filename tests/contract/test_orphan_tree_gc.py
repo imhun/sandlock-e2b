@@ -25,7 +25,6 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -45,6 +44,8 @@ from envd_service.agent import NodeAgent
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
+from tests._disk_projids import install_disk_projids as _install_disk_projids
+from tests._disk_projids import read_calls
 
 INTERNAL_KEY = "internal-key"
 API_KEY = "local-key"
@@ -387,52 +388,6 @@ def _client(app) -> httpx.AsyncClient:
     )
 
 
-def _install_disk_projids(
-    monkeypatch, mapping: dict[Path, int], *, failure: str | None = None
-) -> list[list[str]]:
-    """Answer ``lsattr -p -d`` from an explicit project table.
-
-    ``directory_project_id`` reads the project id *from the filesystem* (the
-    only source the GC may trust — ``sandbox.json`` itself is sandbox-writable,
-    review M4). The quota tools are faked separately by ``_QuotaFake``; this
-    fake supplies the one read the destructive path does locally, so the
-    contracts exercise the real parser and the real wiring. A directory that
-    is absent from ``mapping`` reports no project id, and a host without
-    ``lsattr`` at all keeps the "cannot ask the disk" shape (no fake
-    installed), which the contracts cover as well.
-    """
-    calls: list[list[str]] = []
-    real_run = subprocess.run
-    monkeypatch.setattr(xfs_quota, "_use_quotactl", lambda mount_point: False)
-    monkeypatch.setattr(
-        xfs_quota, "_use_quotactl_read", lambda mount_point: False
-    )
-    # The read asks the mount first and the directory itself second
-    # (follow-up 2); both seams are pinned so these contracts answer from the
-    # explicit table on every host, never from the real fd backend.
-    monkeypatch.setattr(
-        xfs_quotactl, "can_read_projid", lambda path: False
-    )
-
-    def fake_run(argv, *args, **kwargs):
-        if isinstance(argv, (list, tuple)) and argv and argv[0] == "lsattr":
-            calls.append(list(argv))
-            if failure is not None:
-                return subprocess.CompletedProcess(list(argv), 1, "", failure)
-            project_dir = Path(argv[-1])
-            projid = mapping.get(project_dir)
-            stdout = (
-                ""
-                if projid is None
-                else f"{projid:>8} ---------------- {project_dir}\n"
-            )
-            return subprocess.CompletedProcess(list(argv), 0, stdout, "")
-        return real_run(argv, *args, **kwargs)
-
-    monkeypatch.setattr(xfs_quota.subprocess, "run", fake_run)
-    return calls
-
-
 def _is_driven(driven) -> bool:
     """Whether the caller is the loop under test (``driven``'s task)."""
     try:
@@ -551,7 +506,7 @@ async def test_restart_reports_the_live_tree_instead_of_stranding_it(
 
 @pytest.mark.asyncio
 async def test_restart_reclaims_an_unowned_tree_and_its_quota_row(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """The trees behind the target machine's 12 pinned quota rows.
 
@@ -585,12 +540,13 @@ async def test_restart_reclaims_an_unowned_tree_and_its_quota_row(
     slice_dir.mkdir(parents=True)
     # The target machine reports the project ids from the disk; the record's
     # own claim is sandbox-writable, so the teardown has to match this.
-    disk_calls = _install_disk_projids(
+    disk = _install_disk_projids(
         monkeypatch,
         {
             sandbox_dir: STRANDED_PROJID,
             slice_dir: STRANDED_VOLUME_PROJID,
         },
+        backend=disk_read_backend,
     )
     caplog.set_level(logging.WARNING)
     caplog.clear()
@@ -636,10 +592,9 @@ async def test_restart_reclaims_an_unowned_tree_and_its_quota_row(
         (str(sandbox_dir), STRANDED_PROJID),
         (str(volume_slice / sandbox_id), STRANDED_VOLUME_PROJID),
     ]
-    assert disk_calls == [
-        ["lsattr", "-p", "-d", str(sandbox_dir)],
-        ["lsattr", "-p", "-d", str(volume_slice / sandbox_id)],
-    ]
+    assert disk.calls == read_calls(
+        disk_read_backend, sandbox_dir, volume_slice / sandbox_id
+    )
     assert _agent_messages(caplog) == [
         f"reconcile: removing orphan runtime {sandbox_id} (not in control plane)",
     ]
@@ -647,19 +602,29 @@ async def test_restart_reclaims_an_unowned_tree_and_its_quota_row(
 
 @pytest.mark.asyncio
 async def test_quota_reclaim_is_bounded_and_reported_when_accounting_never_settles(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """A row that never settles is reported, not retried forever.
 
     The tree removal is already correct in this case; the round must stay
     quiet about it apart from a precise warning, and a later reconcile (the
     next startup) still reclaims the row.
+
+    The tree is torn down *from the project id the disk reports*, so the disk
+    has to answer it here: left to the host, a machine whose fd backend works
+    reads the untagged tree's real project id (0), the round has no row to
+    reclaim, and the assertions below never see a reclaim attempt at all.
     """
     _nodes, _registry, control_app = _stack(workspace)
     sandbox_id = "sbx_never_settles"
     sandbox_dir = _tree(workspace, sandbox_id, project_id=STRANDED_PROJID)
     quota = _QuotaFake({STRANDED_PROJID: 8}, defer_rounds=99)
     quota.install(monkeypatch)
+    _install_disk_projids(
+        monkeypatch,
+        {sandbox_dir: STRANDED_PROJID},
+        backend=disk_read_backend,
+    )
     caplog.set_level(logging.WARNING)
     caplog.clear()
 
@@ -819,7 +784,7 @@ async def test_gc_protects_paused_migrating_and_reserved_entries(
 
 @pytest.mark.asyncio
 async def test_snapshot_store_directory_is_spared_by_its_shape(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """M1 rework, RED-B: the store's own shape is still never a candidate.
 
@@ -861,8 +826,10 @@ async def test_snapshot_store_directory_is_spared_by_its_shape(
     orphan_dir = _tree(workspace, orphan_id, project_id=STRANDED_VOLUME_PROJID)
     quota = _QuotaFake({STRANDED_VOLUME_PROJID: 8})
     quota.install(monkeypatch)
-    disk_calls = _install_disk_projids(
-        monkeypatch, {orphan_dir: STRANDED_VOLUME_PROJID}
+    disk = _install_disk_projids(
+        monkeypatch,
+        {orphan_dir: STRANDED_VOLUME_PROJID},
+        backend=disk_read_backend,
     )
     caplog.set_level(logging.WARNING)
     caplog.clear()
@@ -899,9 +866,7 @@ async def test_snapshot_store_directory_is_spared_by_its_shape(
     assert nested_record.is_file()
     assert quota.released == [(str(orphan_dir), STRANDED_VOLUME_PROJID)]
     assert quota.rows == {}
-    assert disk_calls == [
-        ["lsattr", "-p", "-d", str(orphan_dir)],
-    ]
+    assert disk.calls == read_calls(disk_read_backend, orphan_dir)
     assert _agent_messages(caplog) == [
         f"reconcile: removing orphan runtime {orphan_id} (not in control plane)",
     ]
@@ -910,7 +875,7 @@ async def test_snapshot_store_directory_is_spared_by_its_shape(
 @pytest.mark.parametrize("chosen_id", ["snap_client1", "_client1"])
 @pytest.mark.asyncio
 async def test_a_client_chosen_prefixed_id_is_reclaimed_not_stranded(
-    workspace, monkeypatch, caplog, chosen_id
+    workspace, monkeypatch, caplog, chosen_id, disk_read_backend
 ):
     """M1 rework, RED-A: the leak the unconditional prefix exclusion caused.
 
@@ -939,12 +904,13 @@ async def test_a_client_chosen_prefixed_id_is_reclaimed_not_stranded(
 
     quota = _QuotaFake({STRANDED_PROJID: 8, STRANDED_VOLUME_PROJID: 8})
     quota.install(monkeypatch)
-    disk_calls = _install_disk_projids(
+    disk = _install_disk_projids(
         monkeypatch,
         {
             chosen_dir: STRANDED_PROJID,
             orphan_dir: STRANDED_VOLUME_PROJID,
         },
+        backend=disk_read_backend,
     )
     caplog.set_level(logging.WARNING)
     caplog.clear()
@@ -989,14 +955,14 @@ async def test_a_client_chosen_prefixed_id_is_reclaimed_not_stranded(
     ]
     # Every prefixed tree that carries its own record reaches the disk read;
     # none is filtered out by its name.
-    assert sorted(str(call[-1]) for call in disk_calls) == sorted(
+    assert sorted(str(call[-1]) for call in disk.calls) == sorted(
         [str(chosen_dir), str(orphan_dir)]
     )
 
 
 @pytest.mark.asyncio
 async def test_a_whole_tree_copy_under_a_snapshot_id_is_refused(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """M1 rework, RED-C: the dangerous shape is refused, not deleted.
 
@@ -1031,7 +997,9 @@ async def test_a_whole_tree_copy_under_a_snapshot_id_is_refused(
     # The disk can answer for the copy (its directory carries the project
     # state), so the refusal has to come from the record/directory mismatch,
     # not from a silent disk.
-    _install_disk_projids(monkeypatch, {copied_dir: VICTIM_PROJID})
+    _install_disk_projids(
+        monkeypatch, {copied_dir: VICTIM_PROJID}, backend=disk_read_backend
+    )
     caplog.set_level(logging.WARNING)
     caplog.clear()
 
@@ -1062,7 +1030,7 @@ async def test_a_whole_tree_copy_under_a_snapshot_id_is_refused(
 
 @pytest.mark.asyncio
 async def test_infrastructure_namespaces_are_still_excluded(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """M1 rework, RED-D: the reserved ``_`` namespaces keep their exclusion.
 
@@ -1083,8 +1051,10 @@ async def test_infrastructure_namespaces_are_still_excluded(
     orphan_dir = _tree(workspace, orphan_id, project_id=STRANDED_VOLUME_PROJID)
     quota = _QuotaFake({STRANDED_VOLUME_PROJID: 8})
     quota.install(monkeypatch)
-    calls = _install_disk_projids(
-        monkeypatch, {orphan_dir: STRANDED_VOLUME_PROJID}
+    disk = _install_disk_projids(
+        monkeypatch,
+        {orphan_dir: STRANDED_VOLUME_PROJID},
+        backend=disk_read_backend,
     )
     caplog.set_level(logging.WARNING)
     caplog.clear()
@@ -1100,7 +1070,13 @@ async def test_infrastructure_namespaces_are_still_excluded(
     assert xfs_quota._scan_project_dirs(workspace) == {
         STRANDED_VOLUME_PROJID: orphan_dir
     }
-    assert calls == [["lsattr", "-p", "-d", str(orphan_dir)]]
+    # This half of the read sits behind the *administration* gate, which these
+    # contracts pin to the subprocess form on every host (the pin, and the
+    # reason, are in ``tests/_disk_projids.py``), so the scan asks ``lsattr``
+    # in both forms. The teardown's own read -- the two-stage one W2 added --
+    # is what ``disk_read_backend`` parameterizes, and the assertions around
+    # this one carry both forms.
+    assert disk.calls == [["lsattr", "-p", "-d", str(orphan_dir)]]
 
     agent = _agent(workspace)
     async with _client(control_app) as raw:
@@ -1172,7 +1148,7 @@ async def test_trees_without_a_readable_record_are_reported_never_deleted(
 
 @pytest.mark.asyncio
 async def test_one_failing_tree_does_not_abort_the_round(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """A single unrecoverable tree keeps the round alive (requirement 5).
 
@@ -1187,7 +1163,11 @@ async def test_one_failing_tree_does_not_abort_the_round(
     surviving_dir = _tree(workspace, surviving_id, project_id=2002)
     quota = _QuotaFake({2001: 8, 2002: 8})
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {failing_dir: 2001, surviving_dir: 2002})
+    _install_disk_projids(
+        monkeypatch,
+        {failing_dir: 2001, surviving_dir: 2002},
+        backend=disk_read_backend,
+    )
 
     from envd_service import priv_helpers
 
@@ -1731,7 +1711,9 @@ async def test_legacy_shaped_record_with_a_fresh_tree_is_still_a_concurrent_crea
 
 
 @pytest.mark.asyncio
-async def test_tree_teardown_does_not_block_the_event_loop(workspace, monkeypatch):
+async def test_tree_teardown_does_not_block_the_event_loop(
+    workspace, monkeypatch, disk_read_backend
+):
     """M3: the per-tree teardown runs off the event loop -- structurally.
 
     Every tree's teardown releases its project state through the
@@ -1757,7 +1739,7 @@ async def test_tree_teardown_does_not_block_the_event_loop(workspace, monkeypatc
     quota = _QuotaFake({9000 + index: 8 for index in range(len(ids))})
     quota.release_delay_s = 0.25
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, mapping)
+    _install_disk_projids(monkeypatch, mapping, backend=disk_read_backend)
 
     agent = _agent(workspace)
     loop = asyncio.get_running_loop()
@@ -1805,7 +1787,7 @@ async def test_tree_teardown_does_not_block_the_event_loop(workspace, monkeypatc
 
 @pytest.mark.asyncio
 async def test_record_pointing_at_another_tree_is_refused(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """M4: a rewritten ``sandbox.json`` cannot aim the sweep at another tree.
 
@@ -1852,7 +1834,9 @@ async def test_record_pointing_at_another_tree_is_refused(
     )
     quota = _QuotaFake({VICTIM_PROJID: 8, VICTIM_VOLUME_PROJID: 4})
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {victim_dir: VICTIM_PROJID})
+    _install_disk_projids(
+        monkeypatch, {victim_dir: VICTIM_PROJID}, backend=disk_read_backend
+    )
     caplog.set_level(logging.WARNING)
     caplog.clear()
 
@@ -1878,7 +1862,7 @@ async def test_record_pointing_at_another_tree_is_refused(
 
 @pytest.mark.asyncio
 async def test_record_whose_project_id_contradicts_the_disk_is_refused(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """M4: the project id is read from the disk, not from the record.
 
@@ -1907,7 +1891,11 @@ async def test_record_whose_project_id_contradicts_the_disk_is_refused(
     )
     quota = _QuotaFake({7001: 8, VICTIM_PROJID: 8})
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {liar_dir: 7001, victim_dir: VICTIM_PROJID})
+    _install_disk_projids(
+        monkeypatch,
+        {liar_dir: 7001, victim_dir: VICTIM_PROJID},
+        backend=disk_read_backend,
+    )
     caplog.set_level(logging.WARNING)
     caplog.clear()
 
@@ -1929,7 +1917,7 @@ async def test_record_whose_project_id_contradicts_the_disk_is_refused(
 
 @pytest.mark.asyncio
 async def test_volume_entry_naming_another_sandbox_slice_is_refused(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """M4: volume slices are anchored to this sandbox and the volume root.
 
@@ -1993,7 +1981,9 @@ async def test_volume_entry_naming_another_sandbox_slice_is_refused(
     )
     quota.install(monkeypatch)
     _install_disk_projids(
-        monkeypatch, {liar_dir: 7002, victim_slice: VICTIM_VOLUME_PROJID}
+        monkeypatch,
+        {liar_dir: 7002, victim_slice: VICTIM_VOLUME_PROJID},
+        backend=disk_read_backend,
     )
     caplog.set_level(logging.WARNING)
     caplog.clear()
@@ -2024,7 +2014,7 @@ async def test_volume_entry_naming_another_sandbox_slice_is_refused(
 
 @pytest.mark.asyncio
 async def test_teardown_without_a_readable_project_id_still_reclaims_the_tree(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """M4 / production shape: a disk the worker cannot ask degrades safely.
 
@@ -2033,13 +2023,25 @@ async def test_teardown_without_a_readable_project_id_still_reclaims_the_tree(
     The tree is still reclaimed and its row is dropped by the fail-safe quota
     reconcile once the tree is gone: reclaimed, just not by a release the
     worker cannot verify.
+
+    "The worker cannot ask the disk" has one shape per backend, so the line
+    the operator sees names whichever mechanism this run is on: ``lsattr``
+    failing, or the fd backend's own failure. Both are
+    :class:`ProjectQuotaError` -- "cannot ask the disk", not "there is no
+    project id" -- which is what keeps the claim out of the release set.
     """
     _nodes, _registry, control_app = _stack(workspace)
     sandbox_id = "sbx_unreadable_projid"
     sandbox_dir = _tree(workspace, sandbox_id, project_id=8301)
     quota = _QuotaFake({8301: 8})
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {}, failure="simulated lsattr failure")
+    read_failure = "simulated read failure"
+    _install_disk_projids(
+        monkeypatch,
+        {},
+        backend=disk_read_backend,
+        failure=read_failure,
+    )
     caplog.set_level(logging.WARNING)
     caplog.clear()
 
@@ -2053,9 +2055,13 @@ async def test_teardown_without_a_readable_project_id_still_reclaims_the_tree(
     assert summary["deleted"] == [sandbox_id]
     assert summary["quota_cleaned"] == [8301]
     assert summary["quota_unreclaimed"] == []
+    mechanism = {
+        "lsattr": f"lsattr failed for {sandbox_dir}",
+        "quotactl": f"the fd backend failed on {sandbox_dir}",
+    }[disk_read_backend]
     assert _agent_messages(caplog) == [
         f"reconcile: cannot ask the disk for the project id of {sandbox_dir} "
-        f"(lsattr failed for {sandbox_dir}: simulated lsattr failure); "
+        f"({mechanism}: {read_failure}); "
         "reclaiming it without releasing its quota row",
         f"reconcile: removing orphan runtime {sandbox_id} (not in control plane)",
     ]
@@ -2063,7 +2069,7 @@ async def test_teardown_without_a_readable_project_id_still_reclaims_the_tree(
 
 @pytest.mark.asyncio
 async def test_in_memory_record_cached_from_a_rewritten_json_is_refused(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """M4: an in-memory record is only as trustworthy as where it came from.
 
@@ -2099,7 +2105,9 @@ async def test_in_memory_record_cached_from_a_rewritten_json_is_refused(
     )
     quota = _QuotaFake({VICTIM_PROJID: 8})
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {victim_dir: VICTIM_PROJID})
+    _install_disk_projids(
+        monkeypatch, {victim_dir: VICTIM_PROJID}, backend=disk_read_backend
+    )
     caplog.set_level(logging.WARNING)
     caplog.clear()
 
@@ -2131,7 +2139,7 @@ async def test_in_memory_record_cached_from_a_rewritten_json_is_refused(
 
 @pytest.mark.asyncio
 async def test_in_memory_orphan_is_torn_down_from_the_verified_target(
-    workspace, monkeypatch
+    workspace, monkeypatch, disk_read_backend
 ):
     """The E6.1 in-memory semantics survive the M4 hardening.
 
@@ -2145,7 +2153,9 @@ async def test_in_memory_orphan_is_torn_down_from_the_verified_target(
     sandbox_dir = _tree(workspace, sandbox_id, project_id=8101)
     quota = _QuotaFake({8101: 8})
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {sandbox_dir: 8101})
+    _install_disk_projids(
+        monkeypatch, {sandbox_dir: 8101}, backend=disk_read_backend
+    )
 
     agent = _agent(workspace)
     agent._runtime_registry.register(
@@ -2198,7 +2208,7 @@ def _agent_messages(caplog) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_a_slice_deleted_before_the_sweep_is_info_not_a_warning(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """follow-up 1: the 2026-09-12 production shape, end to end.
 
@@ -2224,7 +2234,9 @@ async def test_a_slice_deleted_before_the_sweep_is_info_not_a_warning(
     assert slice_dir.exists() is False          # the production shape
     quota = _QuotaFake({8401: 8, 8402: 4})
     quota.install(monkeypatch)
-    disk_calls = _install_disk_projids(monkeypatch, {sandbox_dir: 8401})
+    disk = _install_disk_projids(
+        monkeypatch, {sandbox_dir: 8401}, backend=disk_read_backend
+    )
     caplog.set_level(logging.INFO)
     caplog.clear()
 
@@ -2260,10 +2272,17 @@ async def test_a_slice_deleted_before_the_sweep_is_info_not_a_warning(
             f"reconcile: removing orphan runtime {sandbox_id} (not in control plane)",
         ),
     ]
-    # The production line came from the ``lsattr`` fallback: a path that is
-    # not there must never reach it (the tree's own, readable path legitimately
-    # does, and it is the only one that does).
-    assert [call[-1] for call in disk_calls] == [str(sandbox_dir)]
+    # The production line came from the fallback: a path that is not there
+    # must never reach it. The tree's own, readable path legitimately does,
+    # and it is the only path ``lsattr`` is asked about -- the fd form asks
+    # the gone slice too and fails on its ``open``, which is the same ENOENT
+    # the path-state check answers with on this side (see
+    # ``DiskProjids._install_quotactl``).
+    reads = [sandbox_dir] if disk_read_backend == "lsattr" else [
+        sandbox_dir,
+        slice_dir,
+    ]
+    assert disk.calls == read_calls(disk_read_backend, *reads)
 
 
 @pytest.mark.asyncio

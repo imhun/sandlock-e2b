@@ -8,24 +8,13 @@ import httpx
 import pytest
 
 import envd_service.xfs_quota as xfs_quota
-from envd_service import app as app_module
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.quota_agent import QuotaAgentClient, configure_quota_agent_client
 from envd_service.runtime.registry import RuntimeRegistry
 from envd_service.xfs_quota import ProjectQuotaError
+from tests.conftest import uid_startup_disclosure
 
-
-def _uid_disclosure() -> list[str]:
-    """The E3.2 startup disclosure, present only on a non-root worker.
-
-    Per-sandbox uids are the default, and a worker without privilege (or
-    without CAP_SETUID+chown) says so once at startup; a root worker has a
-    live uid pool and stays quiet, so the expected log list is euid-dependent.
-    """
-    import os
-
-    return [] if os.geteuid() == 0 else [app_module.PER_UID_NONROOT_WARNING]
 
 AGENT_URL = "http://quota-agent:49984"
 TOKEN = "agent-token"
@@ -487,7 +476,7 @@ async def test_create_app_via_agent_without_url_degrades(
         "E2B_QUOTA_VIA_AGENT is enabled but E2B_QUOTA_AGENT_URL is not set; "
         "quota-agent hooks unconfigured, quota operations will degrade with "
         "warnings",
-        *_uid_disclosure(),
+        *uid_startup_disclosure(),
     ]
 
 

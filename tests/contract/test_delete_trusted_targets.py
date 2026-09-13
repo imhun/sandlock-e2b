@@ -29,7 +29,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import subprocess
 import threading
 from pathlib import Path
 
@@ -46,6 +45,8 @@ from envd_service.agent import NodeAgent
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
+from tests._disk_projids import install_disk_projids as _install_disk_projids
+from tests._disk_projids import read_calls
 
 INTERNAL_KEY = "internal-key"
 API_KEY = "local-key"
@@ -96,37 +97,6 @@ class _QuotaFake:
 
     def provision(self, **kwargs):  # pragma: no cover - never used here
         raise AssertionError("provisioning must not run in these contracts")
-
-
-def _install_disk_projids(
-    monkeypatch, mapping: dict[Path, int]
-) -> list[list[str]]:
-    """Answer the project-id read from an explicit disk table.
-
-    ``_verified_project_id`` reads the truth from the filesystem (the record
-    inside the sandbox-owned tree is input the sandbox can rewrite), so these
-    contracts supply the one read this host cannot do itself. What is faked is
-    ``lsattr -p -d``'s stdout: the real parser and the real wiring still run.
-    A directory absent from ``mapping`` reports no project id.
-    """
-    calls: list[list[str]] = []
-    real_run = subprocess.run
-    monkeypatch.setattr(xfs_quota, "_use_quotactl_read", lambda mount_point: False)
-
-    def fake_run(argv, *args, **kwargs):
-        if isinstance(argv, (list, tuple)) and argv and argv[0] == "lsattr":
-            calls.append(list(argv))
-            projid = mapping.get(Path(argv[-1]))
-            stdout = (
-                ""
-                if projid is None
-                else f"{projid:>8} ---------------- {argv[-1]}\n"
-            )
-            return subprocess.CompletedProcess(list(argv), 0, stdout, "")
-        return real_run(argv, *args, **kwargs)
-
-    monkeypatch.setattr(xfs_quota.subprocess, "run", fake_run)
-    return calls
 
 
 def _write_record(base: Path, sandbox_id: str, **payload) -> Path:
@@ -222,7 +192,7 @@ async def test_a_record_pointing_at_another_tree_is_refused(
 
 @pytest.mark.asyncio
 async def test_a_project_id_that_contradicts_the_disk_is_refused(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """A cached record is checked against the disk as well.
 
@@ -237,7 +207,9 @@ async def test_a_project_id_that_contradicts_the_disk_is_refused(
     quota = _QuotaFake({VICTIM_PROJID: 8, LIAR_PROJID: 8})
     app = _worker_app(workspace)
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {liar_dir: LIAR_PROJID})
+    _install_disk_projids(
+        monkeypatch, {liar_dir: LIAR_PROJID}, backend=disk_read_backend
+    )
     # The sandbox-writable record reaches the registry the way it would in a
     # live worker: read back through ``get()``.
     assert app.state.runtime_registry.get("sbx_liar").project_id == VICTIM_PROJID
@@ -262,7 +234,7 @@ async def test_a_project_id_that_contradicts_the_disk_is_refused(
 
 @pytest.mark.asyncio
 async def test_a_volume_entry_naming_another_slice_is_refused(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """Only a slice named after this sandbox, inside the volume root, is acted on.
 
@@ -302,7 +274,9 @@ async def test_a_volume_entry_naming_another_slice_is_refused(
     quota = _QuotaFake({VICTIM_VOLUME_PROJID: 8, LIAR_VOLUME_PROJID: 8})
     app = _worker_app(workspace, shared_volume_root=str(volume_root))
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {liar_dir: LIAR_PROJID})
+    _install_disk_projids(
+        monkeypatch, {liar_dir: LIAR_PROJID}, backend=disk_read_backend
+    )
     caplog.set_level(logging.WARNING)
     caplog.clear()
 
@@ -332,7 +306,7 @@ async def test_a_volume_entry_naming_another_slice_is_refused(
 
 @pytest.mark.asyncio
 async def test_a_clean_delete_releases_the_disks_project_ids(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """An honest record deletes exactly what it did before."""
     volume_root = workspace / "_volumes"
@@ -356,8 +330,10 @@ async def test_a_clean_delete_releases_the_disks_project_ids(
     quota = _QuotaFake({7001: 8, 7002: 8})
     app = _worker_app(workspace, shared_volume_root=str(volume_root))
     quota.install(monkeypatch)
-    disk_calls = _install_disk_projids(
-        monkeypatch, {tree: 7001, slice_dir: 7002}
+    disk = _install_disk_projids(
+        monkeypatch,
+        {tree: 7001, slice_dir: 7002},
+        backend=disk_read_backend,
     )
     caplog.set_level(logging.WARNING)
     caplog.clear()
@@ -370,10 +346,7 @@ async def test_a_clean_delete_releases_the_disks_project_ids(
         (str(slice_dir), 7002),
         (str(tree), 7001),
     ]
-    assert disk_calls == [
-        ["lsattr", "-p", "-d", str(tree)],
-        ["lsattr", "-p", "-d", str(slice_dir)],
-    ]
+    assert disk.calls == read_calls(disk_read_backend, tree, slice_dir)
     assert tree.exists() is False
     assert slice_dir.exists() is False
     assert app.state.runtime_registry.get("sbx_clean") is None
@@ -382,7 +355,7 @@ async def test_a_clean_delete_releases_the_disks_project_ids(
 
 @pytest.mark.asyncio
 async def test_keep_files_still_keeps_the_tree_and_releases_nothing(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """Migration stop: the runtime goes, the files and the rows stay."""
     volume_root = workspace / "_volumes"
@@ -406,7 +379,7 @@ async def test_keep_files_still_keeps_the_tree_and_releases_nothing(
     quota = _QuotaFake({7001: 8, 7002: 8})
     app = _worker_app(workspace, shared_volume_root=str(volume_root))
     quota.install(monkeypatch)
-    disk_calls = _install_disk_projids(monkeypatch, {})
+    disk = _install_disk_projids(monkeypatch, {}, backend=disk_read_backend)
     caplog.set_level(logging.WARNING)
     caplog.clear()
 
@@ -417,7 +390,7 @@ async def test_keep_files_still_keeps_the_tree_and_releases_nothing(
     # Nothing is released and nothing is read: the files are staying, so there
     # is no project state this call could act on.
     assert quota.released == []
-    assert disk_calls == []
+    assert disk.calls == []
     assert tree.is_dir()
     assert (slice_dir / "data.bin").read_bytes() == b"keep-me"
     # The record file stays with the tree, so a later request reads it back
@@ -427,7 +400,7 @@ async def test_keep_files_still_keeps_the_tree_and_releases_nothing(
 
 @pytest.mark.asyncio
 async def test_keep_volume_slices_still_removes_only_the_workspace(
-    workspace, monkeypatch, caplog
+    workspace, monkeypatch, caplog, disk_read_backend
 ):
     """Migration cleanup: the workspace goes, the shared slice stays."""
     volume_root = workspace / "_volumes"
@@ -451,7 +424,9 @@ async def test_keep_volume_slices_still_removes_only_the_workspace(
     quota = _QuotaFake({7001: 8, 7002: 8})
     app = _worker_app(workspace, shared_volume_root=str(volume_root))
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {tree: 7001, slice_dir: 7002})
+    _install_disk_projids(
+        monkeypatch, {tree: 7001, slice_dir: 7002}, backend=disk_read_backend
+    )
     caplog.set_level(logging.WARNING)
     caplog.clear()
 
@@ -532,7 +507,9 @@ def _headers() -> dict[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_the_teardown_unregisters_on_the_event_loop(workspace, monkeypatch):
+async def test_the_teardown_unregisters_on_the_event_loop(
+    workspace, monkeypatch, disk_read_backend
+):
     """Race A: the unregister callback is loop-side code (F2).
 
     The production callback pops the sandbox's runtime context and shuts it
@@ -547,7 +524,9 @@ async def test_the_teardown_unregisters_on_the_event_loop(workspace, monkeypatch
     orphan_dir = _write_record(workspace, orphan_id, project_id=8001)
     quota = _QuotaFake({8001: 8})
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {orphan_dir: 8001})
+    _install_disk_projids(
+        monkeypatch, {orphan_dir: 8001}, backend=disk_read_backend
+    )
 
     agent = _worker_agent(workspace)
     seen: dict[str, str] = {}
@@ -594,6 +573,9 @@ async def test_the_teardown_unregisters_on_the_event_loop(workspace, monkeypatch
 
     assert summary["deleted"] == [orphan_id]
     assert orphan_dir.exists() is False
+    # The release the disk's answer drives really happened: without it the
+    # table would be answering a read nothing acts on.
+    assert quota.released == [(str(orphan_dir), 8001)]
     assert seen == {
         "callback_thread": "MainThread",
         "callback_id": orphan_id,
@@ -604,7 +586,7 @@ async def test_the_teardown_unregisters_on_the_event_loop(workspace, monkeypatch
 
 @pytest.mark.asyncio
 async def test_a_get_inside_the_teardown_window_does_not_resurrect_the_record(
-    workspace, monkeypatch
+    workspace, monkeypatch, disk_read_backend
 ):
     """Race B: the teardown's heavy half runs off the loop (F3).
 
@@ -620,7 +602,7 @@ async def test_a_get_inside_the_teardown_window_does_not_resurrect_the_record(
     tree = _write_record(workspace, sandbox_id, project_id=8101)
     quota = _QuotaFake({8101: 8})
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {tree: 8101})
+    _install_disk_projids(monkeypatch, {tree: 8101}, backend=disk_read_backend)
 
     agent = _worker_agent(workspace)
     registry_ = agent._runtime_registry
