@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from envd_service import uid_pool
 from envd_service.executors.sandlock import SandlockExecutor
 from envd_service.runtime.registry import RuntimeRegistry
 from envd_service.uid_pool import (
@@ -34,6 +35,47 @@ def _write_record(workspace: Path, sandbox_id: str, host_uid: int | None) -> Non
         json.dumps({"sandbox_id": sandbox_id, "host_uid": host_uid}),
         encoding="utf-8",
     )
+
+
+def _snapshot_store(base: Path, name: str) -> Path:
+    """The shape ``SnapshotRegistry`` writes: ``snapshot.json`` + ``fs/``.
+
+    The store's base *is* the workspace base (``control_plane/app.py``), so a
+    store sits at the top level next to the sandbox trees and its name passes
+    ``validate_sandbox_id``. The record it carries is the *copied sandbox's*,
+    at ``fs/sandbox.json`` -- never at the top level -- and it claims a uid of
+    its own, so reading it would pin that uid for the wrong reason.
+    """
+    store = base / name
+    (store / "fs").mkdir(parents=True)
+    (store / "snapshot.json").write_text("{}", encoding="utf-8")
+    (store / "fs" / "sandbox.json").write_text(
+        json.dumps({"sandbox_id": "sbx_snapshotted", "host_uid": POOL_START}),
+        encoding="utf-8",
+    )
+    return store
+
+
+def _pretend_owned(monkeypatch, owners: dict[Path, int]) -> None:
+    """Report the given directories as owned by a pool uid.
+
+    The reclaim branch only fires for a directory whose *owner* is a
+    pool-range uid, and a non-root test process cannot create one (``chown``
+    is root-only), so that single syscall is faked rather than skipping the
+    case off root.
+    """
+    real_stat = Path.stat
+
+    def fake_stat(self, *args, **kwargs):
+        result = real_stat(self, *args, **kwargs)
+        uid = owners.get(self)
+        if uid is None:
+            return result
+        fields = list(result)
+        fields[4] = uid
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
 
 
 def test_acquire_allocates_sequential_and_exhausts(tmp_path):
@@ -253,6 +295,98 @@ def test_reconcile_ignores_dirs_owned_outside_pool(tmp_path):
     result = pool.reconcile()
     assert result["reclaimed"] == []
     assert stale.stat().st_uid == 1234
+
+
+def test_reconcile_spares_the_store_the_copy_and_the_infrastructure_namespace(
+    tmp_path, monkeypatch
+):
+    """Only a directory the shared shape predicate calls a sandbox tree can be
+    an orphan-uid reclaim target.
+
+    ``snap_*`` and ``_*`` names pass ``validate_sandbox_id`` (``_`` is a legal
+    id character), and the snapshot store's base *is* the workspace base, so
+    the store lands in this scan next to the real trees. Reclaiming the uid a
+    pool-owned *non-tree* happens to carry also **recursively chowns** that
+    tree to the worker -- handing a foreign tree's ownership to the next
+    allocation -- so both prefixed shapes stay out while the real ``sbx_*``
+    orphan is still reclaimed and handed back to the worker (uid accounting
+    and chown targets both unchanged for it).
+    """
+    stranded = tmp_path / "sbx_stranded"
+    stranded.mkdir()
+    leftover = stranded / "leftover.txt"
+    leftover.write_text("x", encoding="utf-8")
+    store = _snapshot_store(tmp_path, "snap_0040ce7e44f6365f")
+    # A whole-tree copy under a snapshot id: the copied top-level record names
+    # the source sandbox, so this shape is the store *and* a foreign record.
+    copy = tmp_path / "snap_copy0000000000000"
+    copy.mkdir()
+    (copy / "sandbox.json").write_text(
+        json.dumps({"sandbox_id": "sbx_src", "host_uid": POOL_START + 2}),
+        encoding="utf-8",
+    )
+    volumes = tmp_path / "_volumes"
+    volumes.mkdir()
+    _pretend_owned(
+        monkeypatch,
+        {
+            stranded: POOL_START,
+            store: POOL_START + 1,
+            copy: POOL_START + 2,
+            volumes: POOL_START + 3,
+        },
+    )
+    chowned: list[Path] = []
+    monkeypatch.setattr(
+        uid_pool, "_chown_tree", lambda path, uid, gid: chowned.append(path)
+    )
+    pool = _pool(tmp_path)
+    result = pool.reconcile()
+    # The copy's own top-level record is the only recorded uid; the store's
+    # nested record (claiming POOL_START) is not read.
+    assert result["referenced"] == [POOL_START + 2]
+    assert result["reclaimed"] == [POOL_START]
+    assert result["cleaned"] == [{"uid": POOL_START, "path": str(stranded)}]
+    assert result["skipped"] == []
+    assert chowned == [stranded]
+    assert (store / "snapshot.json").read_text(encoding="utf-8") == "{}"
+    assert (store / "fs" / "sandbox.json").is_file()
+    assert (copy / "sandbox.json").is_file()
+    # Neither the store's uid nor the namespace's uid is reclaimable here.
+    assert POOL_START + 1 not in result["reclaimed"]
+    assert POOL_START + 3 not in result["reclaimed"]
+    # Unchanged ``sbx_*`` behavior: the reclaimed uid is allocatable again.
+    assert pool.acquire("sbx_new") == POOL_START
+
+
+def test_uid_accounting_reads_records_regardless_of_prefix(tmp_path):
+    """The two record-driven scans only decide *which records get read*.
+
+    A store carries no top-level record, so it contributes nothing: the
+    record inside its ``fs/`` copy belongs to the copied sandbox and must not
+    pin its uid. A prefixed directory that *does* carry one is, by shape, a
+    sandbox tree (a client-chosen id, or a whole-tree copy), and its uid stays
+    referenced -- the accounting side keeps its fail-safe "any record owns its
+    uid" rule, unchanged by this filter, so a stray copy can still only
+    over-protect a uid, never free one.
+    """
+    store = _snapshot_store(tmp_path, "snap_0040ce7e44f6365f")
+    copy = tmp_path / "snap_copy0000000000000"
+    copy.mkdir()
+    (copy / "sandbox.json").write_text(
+        json.dumps({"sandbox_id": "sbx_src", "host_uid": POOL_START + 1}),
+        encoding="utf-8",
+    )
+    pool = _pool(tmp_path)
+    result = pool.reconcile()
+    assert result["referenced"] == [POOL_START + 1]
+    assert result["reclaimed"] == []
+    # The nested record is really there -- it just is not the store's own.
+    assert (store / "fs" / "sandbox.json").is_file()
+    # POOL_START is what the record inside the store's ``fs/`` copy claims; it
+    # pins nothing, so the lowest uid is handed out.
+    assert pool.acquire("sbx_a") == POOL_START
+    assert pool.acquire("sbx_b") == POOL_START + 2
 
 
 def test_reconcile_missing_base_is_empty(tmp_path):

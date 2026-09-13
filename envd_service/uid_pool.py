@@ -52,7 +52,7 @@ from typing import Any
 import fcntl
 
 from envd_service import priv_helpers
-from gateway_common.paths import validate_sandbox_id
+from gateway_common.paths import is_sandbox_workspace_dir, validate_sandbox_id
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,12 @@ def _recorded_uids(
     except OSError:
         return used
     for entry in entries:
-        if not entry.is_dir() or not validate_sandbox_id(entry.name):
+        # The same shape predicate every other top-level workspace scan uses
+        # (quota orphan scan, worker GC): the ``_``/``snap_`` namespaces are
+        # separated by content, so a prefixed directory counts as a sandbox
+        # tree only when it carries its own record -- which is the only way
+        # this loop can contribute a uid at all.
+        if not is_sandbox_workspace_dir(entry):
             continue
         uid = _recorded_uid(base, entry.name)
         if uid is not None and start <= uid < start + size:
@@ -486,7 +491,10 @@ class UidPool:
         except OSError:
             return referenced, by_sandbox
         for entry in entries:
-            if not entry.is_dir() or not validate_sandbox_id(entry.name):
+            # Same filter as ``_recorded_uids``, and for the same reason: the
+            # reverse map is built from records, so only a directory that the
+            # shared predicate accepts can appear in it.
+            if not is_sandbox_workspace_dir(entry):
                 continue
             uid = _recorded_uid(base, entry.name)
             if (
@@ -646,7 +654,17 @@ class UidPool:
                 "skipped": [{"reason": f"scan failed: {exc}"}],
             }
         for entry in entries:
-            if not entry.is_dir() or not validate_sandbox_id(entry.name):
+            # This is the one scan where the criterion decides a side effect,
+            # so it is the shared predicate *and* the two conditions below:
+            # a prefixed (``_``/``snap_``) real directory without a top-level
+            # record is an infrastructure namespace or a snapshot store, not
+            # an orphan sandbox tree, and reclaiming the uid it happens to
+            # carry -- then recursively chowning the tree to the worker --
+            # would hand a foreign tree's ownership to the next allocation.
+            # The record check stays load-bearing for every other name: a
+            # recorded tree is allocated (or a crashed create), never an
+            # orphan.
+            if not is_sandbox_workspace_dir(entry):
                 continue
             if (entry / "sandbox.json").is_file():
                 continue
