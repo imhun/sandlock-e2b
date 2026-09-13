@@ -36,6 +36,7 @@ from envd_service.uid_pool import (
 from envd_service.xfs_quota import (
     ProjectDirectoryGone,
     ProjectQuotaError,
+    containing_mount_point,
     directory_project_id,
     projids_in_record,
     provision_project,
@@ -44,7 +45,12 @@ from envd_service.xfs_quota import (
     xfs_project_supported,
 )
 from envd_service.volumes import build_volume_mounts, cleanup_volume_projects
-from gateway_common.paths import is_sandbox_workspace_dir
+from gateway_common.paths import (
+    UNTRUSTED_TREE_DIR,
+    is_reserved_platform_namespace,
+    is_sandbox_workspace_dir,
+    validate_sandbox_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +58,8 @@ router = APIRouter()
 
 #: XFS drops a released project's quota record only once its inode accounting
 #: settles, so the reconcile running right after an ``rmtree`` can legitimately
-#: skip the row ("used blocks but no project directory"). Retry the quota pass
-#: a bounded number of times instead of leaving the entry to manual review.
+#: report the row as still there. Retry the quota pass a bounded number of
+#: times instead of leaving the entry to manual review.
 _QUOTA_RECLAIM_ATTEMPTS = 3
 _QUOTA_RECLAIM_DELAY_S = 0.5
 
@@ -65,20 +71,11 @@ _QUOTA_RECLAIM_DELAY_S = 0.5
 #: reached at 60s.
 _RECONCILE_RETRY_MAX_INTERVALS = 12
 
-#: Where a tree the GC refuses to act on is parked (review W7 / W7-3): such a
-#: tree is never *deleted* (its record may be describing a bind-mounted other
-#: tenant's tree) and never acted on from the record's claims either. But
-#: leaving it in place was not an exit: its own ``sandbox.json`` keeps the
-#: project ids it claims in the fail-safe scan's "live" set
-#: (``xfs_quota._recorded_projids``), so its quota row -- and the row it
-#: borrowed from a victim -- stayed pinned forever once the control-plane
-#: record was released (eviction, TTL), where ``force`` can only answer 404.
-#: Parking it under a name that cannot be a sandbox id (a dot is not in
-#: ``gateway_common.paths._SANDBOX_ID_RE``) moves those claims out of the
-#: top-level scan, keeps the payload for an operator to look at, and can never
-#: land inside a live sandbox's workspace; the disk's own project id is
-#: released with it, so no row survives the refusal.
-UNTRUSTED_TREE_DIR = "_untrusted.trees"
+# ``UNTRUSTED_TREE_DIR`` (where a refused tree is parked, review W7 / W7-3) is
+# defined in ``gateway_common.paths`` because the fail-safe quota scan has to
+# know the namespace too: a parked tree keeps the project id of the tree it
+# was renamed from, so a release that failed at park time still has a
+# directory the reconcile can find (review R2).
 
 
 def _extract_sandbox_archive(archive_path: Path, dest: Path) -> None:
@@ -541,6 +538,55 @@ def _verified_teardown_plan(
         )
         if reason is not None:
             return None, reason
+    volume_entries = _verified_volume_slices(
+        record,
+        sandbox_id,
+        shared_volume_root,
+        expected=expected,
+        context=context,
+        force=force,
+    )
+    return (
+        _TeardownPlan(
+            workspace_dir=workspace_dir,
+            project_id=project_id,
+            volume_projects=tuple(volume_entries),
+            expected_projids=frozenset(expected),
+        ),
+        None,
+    )
+
+
+def _verified_volume_slices(
+    record,
+    sandbox_id: str,
+    shared_volume_root: str | Path | None,
+    *,
+    expected: set[int],
+    context: str,
+    force: bool = False,
+) -> list[dict[str, Any]]:
+    """The volume slices of ``record`` this worker may act on, with disk projids.
+
+    Every entry a rewritten ``volume_projects`` list can point somewhere else
+    is dropped, and the project id of the ones that survive is the id the
+    *disk* reports for the slice (never the record's claim):
+
+    * the slice has to be named after this sandbox and to declare this
+      sandbox as its owner;
+    * when the worker has a configured ``shared_volume_root``, the slice has
+      to live under it;
+    * the entry has to *be* the directory it spells (``lstat``/``stat``
+      identity, review W7 / W7-5), so a link inside the volume root that is
+      named after this sandbox cannot smuggle another tenant's slice in;
+    * a claim that contradicts the disk refuses the entry (``force=True``
+      reports it and releases the disk's id instead).
+
+    ``expected`` accumulates every project id the caller may have to reclaim
+    (it is the plan's ``expected_projids``). Shared by the teardown plan and by
+    :func:`_park_refused_tree`, which releases the same slices after a refusal
+    the plan itself never got far enough to describe (review R2).
+    """
     shared_root = (
         Path(shared_volume_root).resolve() if shared_volume_root else None
     )
@@ -602,15 +648,7 @@ def _verified_teardown_plan(
             )
             continue
         volume_entries.append({**entry, "projid": slice_projid})
-    return (
-        _TeardownPlan(
-            workspace_dir=workspace_dir,
-            project_id=project_id,
-            volume_projects=tuple(volume_entries),
-            expected_projids=frozenset(expected),
-        ),
-        None,
-    )
+    return volume_entries
 
 
 def _untrusted_entry_for(
@@ -633,10 +671,37 @@ def _untrusted_entry_for(
     it is reported instead of torn down). A missing or *healthy* tree is
     returned as ``(None, reason)``: parking it would be acting on a tree the
     product still owns.
+
+    Review R1 added a third shape, and it is the one the shape rule cannot
+    see at all: a top-level directory whose name is one of the infrastructure
+    namespaces (``snap_`` / ``_``) and whose ``sandbox.json`` is gone. Both
+    prefixes are *legal sandbox ids* (``X-Sandbox-Id`` is checked with
+    ``validate_sandbox_id`` alone and a snapshot id may be chosen by the
+    caller), so such a directory can be the leftover of a real sandbox tree,
+    and the disk -- not the name, not the missing record -- is what says so:
+    if the directory really carries a project id, it is this worker's quota
+    asset and has to be visible to the operator's exit. Without this, its
+    tree and its quota row pinned each other permanently and no entry existed
+    anywhere.
     """
     base = Path(settings.workspace_base)
     entry = base / sandbox_id
     if not is_sandbox_workspace_dir(entry):
+        leftover_projid = _leftover_quota_projid(entry)
+        if leftover_projid is not None:
+            return (
+                {
+                    "sandbox_id": sandbox_id,
+                    "reason": (
+                        "it has no readable sandbox.json and its name is "
+                        "outside the sandbox shapes this worker acts on; the "
+                        f"disk reports project id {leftover_projid} for it"
+                    ),
+                    "disk_project_id": leftover_projid,
+                    "claimed_project_ids": [],
+                },
+                None,
+            )
         return None, (
             f"{entry} is not a sandbox workspace tree on this worker"
         )
@@ -688,12 +753,58 @@ def _disk_project_id_or_none(path: Path) -> int | None:
         return None
 
 
+def _leftover_quota_projid(entry: Path) -> int | None:
+    """The project id the disk reports for a directory the shape rule rejects.
+
+    ``is_sandbox_workspace_dir`` separates sandbox trees from infrastructure
+    by *shape* (a real directory whose name is a legal id and which is either
+    outside the infrastructure namespaces or carries its own top-level
+    ``sandbox.json``). The shapes it leaves out are not automatically "not
+    ours": a client may choose an id that starts with ``snap_`` or ``_``, so a
+    leftover of such a tree loses every name-based signal the moment its
+    record is gone.
+
+    What does not lie is the disk. A directory that carries a project id is a
+    quota asset this worker has a row for, so it is exactly what the operator's
+    park exit and the fail-safe reconcile's second stage have to cover; a
+    directory that carries none -- the snapshot store (top-level
+    ``snapshot.json`` + ``fs/``), ``_volumes``, every other platform namespace
+    -- is left completely alone. The platform's own namespaces are excluded by
+    name as well, because nothing ever assigns a project id to them (a base
+    carrying ``PROJINHERIT`` would be the one way for them to report one) and
+    parking one would move a whole namespace off the workspace.
+
+    The name still has to be one a sandbox *could* have
+    (:func:`gateway_common.paths.validate_sandbox_id`): this exit offers a
+    directory to an operator to move, and a name that can never be a sandbox
+    id (``_untrusted.trees`` itself, the route-B scratch root, anything with a
+    dot or a space) is platform or foreign storage rather than the leftover of
+    a sandbox tree. Its *row* is not forfeited by that -- the fail-safe
+    reconcile's carrier search has no name rule and releases those rows -- only
+    this exit's "park it" offer is.
+    """
+    if entry.is_symlink() or not entry.is_dir():
+        return None
+    if not validate_sandbox_id(entry.name):
+        return None
+    if is_reserved_platform_namespace(entry.name):
+        return None
+    return _disk_project_id_or_none(entry)
+
+
 def _untrusted_workspace_trees(settings: Settings, runtime_registry) -> list[dict]:
     """Every tree on this worker that a teardown would refuse (W7-3).
 
     The listing ``GET /agent/untrusted`` serves: the operator's positive,
     greppable view of what the refusal branch (``reconcile: leaving %s on
     disk``) reported in the log, and the input an informed ``park`` needs.
+    Its candidate set is the union of the two shapes R1/R2 make visible: the
+    shape rule's own trees, and the top-level directories the shape rule
+    leaves out *that the disk reports a project id for* (a handful of
+    directories at most, so the extra read per candidate is bounded; see
+    :func:`_leftover_quota_projid`). :func:`_untrusted_entry_for` is the single
+    decision point for both, so a candidate is never read twice and a
+    directory that is neither is answered without a disk read.
     """
     base = Path(settings.workspace_base)
     entries: list[dict] = []
@@ -702,8 +813,6 @@ def _untrusted_workspace_trees(settings: Settings, runtime_registry) -> list[dic
     except OSError:  # pragma: no cover - defensive
         return entries
     for candidate in candidates:
-        if not is_sandbox_workspace_dir(candidate):
-            continue
         entry, _reason = _untrusted_entry_for(
             settings, runtime_registry, candidate.name
         )
@@ -713,7 +822,7 @@ def _untrusted_workspace_trees(settings: Settings, runtime_registry) -> list[dic
 
 
 def _park_refused_tree(
-    settings: Settings, sandbox_id: str, reason: str
+    settings: Settings, runtime_registry, sandbox_id: str, reason: str
 ) -> tuple[int | None, str | None]:
     """Park a tree this worker refuses to act on, and free the row it pinned.
 
@@ -736,6 +845,13 @@ def _park_refused_tree(
     * the project id released is the one the *disk* reports for the tree
       (read before the move; a rename keeps the inode's project id), never one
       the record claims -- the same rule every other teardown follows;
+    * the same holds for the sandbox's per-volume slices (review R2): a
+      refused record can *claim* volume projects too, and those claims kept
+      their rows "recorded" for exactly as long as the tree stayed in the
+      workspace scan -- after which no scan could find them, so they were
+      orphaned forever. Only slices that pass the teardown's own guards are
+      considered, and the id released is the one the disk reports for the
+      slice (a contradicting claim is named in the log, not acted on);
     * nothing is deleted: if the path is a mount point (``EBUSY``) or the
       move fails for any other reason, the tree stays exactly where it was
       and the caller gets the failure.
@@ -749,6 +865,9 @@ def _park_refused_tree(
     try:
         if not source.is_dir() or source.is_symlink():
             return None, f"{source} is not a directory"
+        # Read the record while it is still where ``peek`` looks for it: the
+        # move takes the tree -- ``sandbox.json`` included -- with it.
+        slices = _parkable_volume_slices(settings, runtime_registry, sandbox_id)
         try:
             # Disk truth, read while the tree is still where the records put
             # it (the probes' fake table, like ``lsattr``, is path-keyed).
@@ -797,6 +916,34 @@ def _park_refused_tree(
                 projid,
                 exc,
             )
+    for slice_dir, slice_projid in slices:
+        try:
+            release_project(
+                project_dir=slice_dir,
+                mount_point=(
+                    containing_mount_point(slice_dir) or settings.workspace_base
+                ),
+                projid=slice_projid,
+                via_agent=settings.quota_via_agent,
+            )
+        except ProjectQuotaError as exc:
+            logger.warning(
+                "park: %s: the volume slice %s could not be released (%s); "
+                "the fail-safe reconcile takes its row, including from the "
+                "parked tree when the release that failed is the slice's own "
+                "project state",
+                sandbox_id,
+                slice_dir,
+                exc,
+            )
+            continue
+        logger.warning(
+            "park: %s: released the project id %s its volume slice %s "
+            "carries on the disk",
+            sandbox_id,
+            slice_projid,
+            slice_dir,
+        )
     logger.warning(
         "park: moved the refused tree %s to %s (payload kept, project %s "
         "released)",
@@ -805,6 +952,46 @@ def _park_refused_tree(
         projid,
     )
     return projid, None
+
+
+def _parkable_volume_slices(
+    settings: Settings, runtime_registry, sandbox_id: str
+) -> list[tuple[Path, int]]:
+    """The ``(slice, projid)`` volume pairs a park of ``sandbox_id`` releases.
+
+    Review R2: parking a refused tree moved the record (and with it every
+    project id it *claims* out of ``xfs_quota._recorded_projids``) while only
+    the tree's own disk row was released, so a claimed volume project stayed
+    orphaned where nothing could reach it.
+
+    The claims are never the evidence. The slice list comes from
+    :func:`_verified_volume_slices` -- the same guards the teardown plan uses,
+    so the entry has to be named after this sandbox under the configured
+    volume root and has to *be* the directory it spells -- and the project id
+    is the one the disk reports for that directory. ``force=True`` is the
+    operator's park decision applied to the slice's own claim: a record that
+    names a different project id than the disk does is reported and the disk's
+    id is the one released, exactly like ``DELETE ...?force=true``.
+    """
+    try:
+        record = runtime_registry.peek(sandbox_id)
+    except Exception:  # pragma: no cover - defensive
+        record = None
+    if record is None:
+        return []
+    entries = _verified_volume_slices(
+        record,
+        sandbox_id,
+        settings.shared_volume_root,
+        expected=set(),
+        context="park",
+        force=True,
+    )
+    return [
+        (Path(entry["sandbox_dir"]), entry["projid"])
+        for entry in entries
+        if isinstance(entry.get("projid"), int) and entry["projid"] > 0
+    ]
 
 
 def _registry_workspace_base(runtime_registry, settings: Settings) -> Path:
@@ -1888,7 +2075,9 @@ async def agent_park_untrusted(sandbox_id: str, request: Request) -> Response:
     )
     if entry is None:
         return Response(status_code=404, content=reason)
-    projid, error = _park_refused_tree(settings, sandbox_id, entry["reason"])
+    projid, error = _park_refused_tree(
+        settings, request.app.state.runtime_registry, sandbox_id, entry["reason"]
+    )
     if error is not None:
         return Response(
             status_code=409,

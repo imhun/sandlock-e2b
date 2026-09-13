@@ -104,6 +104,54 @@ _INFRASTRUCTURE_PREFIXES = ("_", "snap_")
 #: shape signal that separates a sandbox tree from an infrastructure namespace.
 _SANDBOX_RECORD_NAME = "sandbox.json"
 
+#: Where a worker parks a tree it refuses to act on (review W7 / W7-3): such a
+#: tree is never *deleted* (its record may be describing a bind-mounted other
+#: tenant's tree) and is never acted on from the record's claims either, but
+#: leaving it among the sandbox namespaces leaves its quota row pinned. The
+#: name carries a dot on purpose: ``_SANDBOX_ID_RE`` rejects it, so the
+#: quarantine can never be read as a sandbox tree nor be created inside a live
+#: sandbox's workspace.
+UNTRUSTED_TREE_DIR = "_untrusted.trees"
+
+#: Top-level names the platform itself owns under the workspace base, listed
+#: explicitly. Unlike :data:`_INFRASTRUCTURE_PREFIXES` these are the
+#: platform's *own* storage (the R1/R2 review's "infrastructure directories"),
+#: not a name-based statement about sandbox ids: a directory spelled like one
+#: of them is still a sandbox tree when it carries its own top-level
+#: ``sandbox.json`` (the shape rule above decides that, unchanged).
+#:
+#: They are never the target of the disk-truth rules (the worker's park
+#: surface and the fail-safe quota scan's second stage), for two reasons:
+#:
+#: * nothing ever assigns a project id to them -- ``provision_project`` is
+#:   called on sandbox trees (``agent.create_sandbox_runtime``) and on volume
+#:   slices (``volumes.provision_sandbox_volume_mount``), never on the base, so
+#:   the only way one of these could report a project id is the base itself
+#:   carrying ``PROJINHERIT``;
+#: * they are not parkable: moving ``_volumes`` or ``_snapshots`` into the
+#:   quarantine would take a whole namespace (and the live tenants' data in
+#:   it) off the workspace.
+RESERVED_PLATFORM_NAMESPACES = frozenset(
+    {
+        "_builds",
+        "_cow",
+        "_images",
+        "_migrate",
+        "_secrets",
+        "_snapshots",
+        "_templates",
+        "_volumes",
+        #: The quarantine itself is never an asset; the trees parked inside it
+        #: are covered one level down (the fail-safe scan's second stage).
+        UNTRUSTED_TREE_DIR,
+    }
+)
+
+
+def is_reserved_platform_namespace(name: str) -> bool:
+    """Whether ``name`` is one of the platform's own top-level namespaces."""
+    return name in RESERVED_PLATFORM_NAMESPACES
+
 
 def is_sandbox_workspace_dir(entry: Path) -> bool:
     """Whether ``entry`` is a top-level sandbox workspace directory.

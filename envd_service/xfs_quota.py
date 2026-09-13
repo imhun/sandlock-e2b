@@ -36,8 +36,14 @@ Project management (E2.2):
 - orphan reconciliation (E2.4): compare the project table (``report -p``)
   against the ``project_id`` persisted in every ``sandbox.json``; project ids
   no record references are orphaned and removed — directory project state is
-  cleared when the directory still exists (files are never deleted) and the
-  block limits are reset to 0, which makes XFS drop the zero-usage record.
+  cleared when the directory carrying the id can be found (files are never
+  deleted) and the block limits are reset to 0, which makes XFS drop the
+  record as the accounting settles. The carrier search runs in two stages
+  (review R1/R2): the shape rule's own trees, then the top-level directories
+  the shape rule leaves out plus the parked ones — a *disk fact*, so a
+  leftover whose name or lost record hides it from the first stage is still
+  released, and a row no directory carries at all is reset instead of being
+  skipped forever.
 - monitoring (E2.4): ``project_quota_table`` returns used/soft/hard blocks per
   project so callers can detect over-limit and near-limit sandboxes.
 
@@ -68,7 +74,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from envd_service import xfs_quotactl
-from gateway_common.paths import is_sandbox_workspace_dir
+from gateway_common.paths import (
+    UNTRUSTED_TREE_DIR,
+    is_reserved_platform_namespace,
+    is_sandbox_workspace_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -605,35 +615,37 @@ def projids_in_record(payload: dict[str, Any]) -> set[int]:
     return projids
 
 
-def _scan_project_dirs(workspace_base: str | Path) -> dict[int, Path]:
-    """Map projid -> sandbox directory via ``lsattr -p -d``.
+def _read_top_level_project_ids(
+    base: Path, candidates: list[Path]
+) -> tuple[dict[int, Path], bool]:
+    """Ask the disk which of ``candidates`` carry a project id.
 
-    Only top-level sandbox workspace directories are considered (the shared
-    :func:`gateway_common.paths.is_sandbox_workspace_dir` predicate), so
-    ``_snapshots`` / ``_migrate`` / ``_cow`` / ``_volumes`` / ``_templates``
-    and foreign trees are never touched. Returns {} on any failure; callers
-    skip rather than risk mis-identifying a directory.
+    Returns ``(projid -> directory, asked)``. ``asked`` says whether the disk
+    answered for *all* of them: a host with neither the fd backend nor
+    ``lsattr``, an ``lsattr`` run that failed, and a single directory whose
+    project id could not be read all leave it False.
+
+    The distinction is what the fail-safe reconcile hangs its "no directory
+    carries this row" conclusion on, so a read that could not happen must
+    never look like the answer "no directory here carries a project id"
+    (review R1/R2). It is also why a partial read is reported as unasked
+    rather than trusted: the directory that failed could be the carrier.
     """
-    base = Path(workspace_base)
     mapping: dict[int, Path] = {}
-    try:
-        candidates = [
-            entry for entry in base.iterdir() if is_sandbox_workspace_dir(entry)
-        ]
-    except OSError:
-        return mapping
     if not candidates:
-        return mapping
+        return mapping, True
     if _use_quotactl(base):
+        asked = True
         for candidate in sorted(candidates):
             try:
                 projid = xfs_quotactl.projid_of(candidate)
             except xfs_quotactl.QuotactlError as exc:
                 logger.warning("cannot read project id of %s: %s", candidate, exc)
+                asked = False
                 continue
             if projid:
                 mapping[projid] = candidate
-        return mapping
+        return mapping, asked
     argv = ["lsattr", "-p", "-d", *(str(c) for c in sorted(candidates))]
     try:
         proc = subprocess.run(
@@ -651,18 +663,113 @@ def _scan_project_dirs(workspace_base: str | Path) -> dict[int, Path]:
             "will report non-empty projects instead of cleaning them",
             exc,
         )
-        return mapping
+        return mapping, False
     if proc.returncode != 0:
         logger.warning(
             "lsattr project scan failed for %s: %s", base, proc.stderr.strip()
         )
-        return mapping
+        return mapping, False
     for line in proc.stdout.splitlines():
         match = _LSATTR_PROJID_LINE.match(line)
         if match is None:
             continue
         mapping[int(match.group(1))] = Path(match.group(3))
-    return mapping
+    return mapping, True
+
+
+def _candidate_sandbox_trees(workspace_base: Path) -> list[Path]:
+    """Top-level directories the shape rule calls sandbox work trees."""
+    try:
+        return [
+            entry
+            for entry in workspace_base.iterdir()
+            if is_sandbox_workspace_dir(entry)
+        ]
+    except OSError:
+        return []
+
+
+def _scan_project_dirs_with_status(
+    workspace_base: str | Path,
+) -> tuple[dict[int, Path], bool]:
+    """:func:`_scan_project_dirs` plus whether the disk answered at all."""
+    base = Path(workspace_base)
+    return _read_top_level_project_ids(base, _candidate_sandbox_trees(base))
+
+
+def _scan_project_dirs(workspace_base: str | Path) -> dict[int, Path]:
+    """Map projid -> sandbox directory via ``lsattr -p -d``.
+
+    Only top-level sandbox workspace directories are considered (the shared
+    :func:`gateway_common.paths.is_sandbox_workspace_dir` predicate), so
+    ``_snapshots`` / ``_migrate`` / ``_cow`` / ``_volumes`` / ``_templates``
+    and foreign trees are never touched. Returns {} on any failure; callers
+    skip rather than risk mis-identifying a directory.
+
+    This is the shape stage of the fail-safe reconcile's carrier search. It is
+    deliberately still driven by the predicate (its candidate set is pinned by
+    the orphan-tree GC contracts) and is *not* the whole story: the directory
+    that carries an orphan row need not be a sandbox-shaped tree, which is what
+    :func:`_scan_leftover_project_dirs` answers for.
+    """
+    return _scan_project_dirs_with_status(workspace_base)[0]
+
+
+def _scan_leftover_project_dirs(
+    workspace_base: str | Path,
+) -> tuple[dict[int, Path], bool]:
+    """Map projid -> directory for the shapes the predicate leaves out.
+
+    The second stage of the fail-safe reconcile's carrier search, and the
+    reason a used orphan row can still be released: "this worker manages this
+    directory" is a *disk fact* -- the directory really carries a project id --
+    not a statement about its name or about the ``sandbox.json`` it may have
+    lost (review R1/R2). Two families of candidates, and only these:
+
+    * top-level directories the shape rule rejects (an infrastructure-prefixed
+      name with no top-level record, a name that is not a sandbox id at all,
+      ``_untrusted.trees`` itself) minus
+      :data:`gateway_common.paths.RESERVED_PLATFORM_NAMESPACES`, which nothing
+      ever assigns a project id to and which must never be an asset;
+    * the quarantine's own children: a parked tree was a top-level tree of this
+      worker until it was renamed, and a rename keeps its project id, so a row
+      a failed release left behind is still this worker's row.
+
+    The snapshot store (top-level ``snapshot.json`` + ``fs/``, no project id:
+    ``SnapshotRegistry.create_from_sandbox`` copies the contents into a fresh
+    directory) and the other platform namespaces therefore map to nothing here
+    and are never released against. Returns ``(mapping, asked)`` like
+    :func:`_read_top_level_project_ids`: an unreadable listing is reported as
+    unasked, never as "nothing carries a project id".
+    """
+    base = Path(workspace_base)
+    candidates: list[Path] = []
+    try:
+        entries = sorted(base.iterdir())
+    except OSError:
+        return {}, False
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        if is_sandbox_workspace_dir(entry):
+            # Already covered by the shape stage; asking twice would double
+            # the disk reads of a round for the common case.
+            continue
+        if is_reserved_platform_namespace(entry.name):
+            continue
+        candidates.append(entry)
+    quarantine = base / UNTRUSTED_TREE_DIR
+    try:
+        parked = sorted(quarantine.iterdir())
+    except FileNotFoundError:
+        parked = []
+    except OSError:
+        return {}, False
+    for child in parked:
+        if child.is_symlink() or not child.is_dir():
+            continue
+        candidates.append(child)
+    return _read_top_level_project_ids(base, candidates)
 
 
 def _directory_read_error(directory: Path) -> OSError | None:
@@ -828,7 +935,26 @@ def _local_reconcile(
     workspace_base: str | Path, mount_point: str | Path
 ) -> dict[str, Any]:
     """Local reconciliation: quota table entries no record references are
-    orphaned and cleaned; recorded projids and project 0 are never touched."""
+    orphaned and cleaned; recorded projids and project 0 are never touched.
+
+    The directory an orphan row is released against comes from the disk, in
+    two stages: the shape rule's own trees (:func:`_scan_project_dirs`) and,
+    when that answers nothing for a used row, the top-level directories the
+    shape rule leaves out plus the parked trees
+    (:func:`_scan_leftover_project_dirs`). Both are disk reads, so an
+    infrastructure-prefixed leftover whose record is gone -- a legal sandbox
+    id, invisible to every shape-based scan -- is still found and released
+    (review R1), while the snapshot store and the platform's other namespaces
+    carry no project id and are never candidates.
+
+    A used row that *no* directory carries and that no record references is
+    not pinned by anything this worker can see: the cleanup runs without a
+    directory (limits reset, no directory project state touched) and the row
+    drops as the deferred accounting settles. That is the bounded end of the
+    shape review R2 measured as "skipped forever", and it is only taken when
+    the carrier search *answered*: a disk this host cannot ask leaves the row
+    reported, never guessed at.
+    """
     table = project_quota_table(mount_point)
     recorded = _recorded_projids(workspace_base)
     orphans = sorted(
@@ -837,20 +963,39 @@ def _local_reconcile(
     cleaned: list[int] = []
     skipped: list[dict[str, Any]] = []
     dir_by_projid: dict[int, Path] | None = None
+    leftover_by_projid: dict[int, Path] | None = None
+    disk_answered = True
     for projid in orphans:
         usage = table[projid]
         project_dir: Path | None = None
         if usage.used_blocks > 0:
             if dir_by_projid is None:
-                dir_by_projid = _scan_project_dirs(workspace_base)
+                dir_by_projid, asked = _scan_project_dirs_with_status(
+                    workspace_base
+                )
+                disk_answered = disk_answered and asked
             project_dir = dir_by_projid.get(projid)
             if project_dir is None:
+                # The shape rule's own trees do not carry this row: it may
+                # still be carried by a directory the shapes leave out (a
+                # prefixed leftover, a parked tree), which is a disk question.
+                if leftover_by_projid is None:
+                    leftover_by_projid, asked = _scan_leftover_project_dirs(
+                        workspace_base
+                    )
+                    disk_answered = disk_answered and asked
+                project_dir = leftover_by_projid.get(projid)
+            if project_dir is None and not disk_answered:
+                # Not a fact: this host could not ask the disk which directory
+                # carries the row, so it is reported rather than guessed at
+                # (the same degradation ``_scan_project_dirs`` documents).
                 skipped.append(
                     {
                         "projid": projid,
                         "reason": (
-                            f"{usage.used_blocks} used blocks but no project "
-                            "directory; entry left for manual review"
+                            f"{usage.used_blocks} used blocks and this host "
+                            "cannot ask the disk which directory carries them; "
+                            "entry left for manual review"
                         ),
                     }
                 )
@@ -866,7 +1011,18 @@ def _local_reconcile(
             logger.warning("orphan project %s cleanup failed: %s", projid, exc)
             continue
         cleaned.append(projid)
-        logger.info("cleaned orphan project %s", projid)
+        if project_dir is None and usage.used_blocks > 0:
+            # No record references this row and no directory on this worker
+            # carries it: the block limits are what pinned it, so they are
+            # reset and the entry goes with the accounting.
+            logger.warning(
+                "orphan project %s: %d used blocks and no directory on this "
+                "worker carries it; reset its limits",
+                projid,
+                usage.used_blocks,
+            )
+        else:
+            logger.info("cleaned orphan project %s", projid)
     return {"cleaned": cleaned, "skipped": skipped}
 
 

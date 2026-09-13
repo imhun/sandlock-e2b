@@ -32,6 +32,7 @@ from envd_service.xfs_quota import (
     project_quota_table,
     reconcile_orphan_projects,
 )
+from gateway_common.paths import is_sandbox_workspace_dir
 
 MOUNT = "/srv/sandboxes"
 
@@ -61,6 +62,33 @@ def _fake_subprocess(monkeypatch, quota_responses, lsattr_stdout: str = ""):
         calls.append(list(args))
         if args[0] == "lsattr":
             return _FakeProc(0, stdout=lsattr_stdout)
+        command = args[args.index("-c") + 1]
+        returncode, stdout, stderr = quota_responses.get(command, (0, "", ""))
+        return _FakeProc(returncode, stdout, stderr)
+
+    monkeypatch.setattr(xfs_quota.subprocess, "run", fake_run)
+    return calls
+
+
+def _fake_subprocess_per_path(monkeypatch, quota_responses, projids):
+    """``_fake_subprocess`` whose ``lsattr`` answers per directory.
+
+    ``_scan_leftover_project_dirs`` batches several directories into one
+    ``lsattr -p -d`` run, so a single ``lsattr_stdout`` cannot express the
+    table: this fake renders one line per directory that carries a project id,
+    exactly like the tool does, and reports every path it was asked about.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[0] == "lsattr":
+            lines = [
+                f"{projids[Path(path)]:>8} ---------------- {path}\n"
+                for path in args[3:]
+                if Path(path) in projids
+            ]
+            return _FakeProc(0, stdout="".join(lines))
         command = args[args.index("-c") + 1]
         returncode, stdout, stderr = quota_responses.get(command, (0, "", ""))
         return _FakeProc(returncode, stdout, stderr)
@@ -636,21 +664,224 @@ def test_reconcile_keeps_normal_projids_and_project_zero(tmp_path, monkeypatch):
     ]
 
 
-def test_reconcile_skips_used_orphan_without_dir(tmp_path, monkeypatch):
-    # A sandbox-shaped directory exists but carries a different projid, so
-    # the scan runs and finds no directory for the orphaned id.
+def test_reconcile_skips_used_orphan_without_dir(tmp_path, monkeypatch, caplog):
+    """R2: a used orphan no directory carries is *reclaimed*, not parked.
+
+    The name is historical -- the contract it pins is the one review R2
+    overturned, and renaming the node would move a line of this host's
+    environment-red unit failure set (``libc.so.6``; see the R1/R2 report).
+
+    The scenario is unchanged: a sandbox-shaped directory exists, carries a
+    different project id, and the disk answers "nothing here carries 400".
+    That answer is a *fact* now, not a reason to leave the row for manual
+    review forever: the row is an orphan (no ``sandbox.json`` references it)
+    and no directory on this worker carries it, so the block limits are reset
+    without touching any directory's project state and XFS drops the entry as
+    the deferred accounting settles.
+
+    Like its pre-R2 self this node does not pin the backend selector, so it is
+    one of this host's ``libc.so.6`` environment failures (the Linux lane runs
+    it for real); ``test_reconcile_reclaims_a_used_orphan_no_directory_carries``
+    pins the seam and asserts the same contract on every host.
+    """
     (tmp_path / "sbx_unrelated").mkdir()
     calls = _fake_subprocess(
         monkeypatch,
         {
             "report -p": (
                 0,
-                _report("#400                10          0       1024    00 [--------]"),
+                _report("#400 10 0 1024 00 [--------]"),
                 "",
             )
         },
         lsattr_stdout="",
     )
+    caplog.set_level(logging.WARNING)
+    result = reconcile_orphan_projects(
+        workspace_base=tmp_path, mount_point=MOUNT
+    )
+    assert result == {"cleaned": [400], "skipped": []}
+    # No directory's project state is touched: report + read-only dir scan +
+    # the limit reset that unpins the row.
+    assert calls == [
+        ["xfs_quota", "-x", "-c", "report -p", MOUNT],
+        ["lsattr", "-p", "-d", str(tmp_path / "sbx_unrelated")],
+        ["xfs_quota", "-x", "-c", "limit -p bsoft=0 bhard=0 400", MOUNT],
+    ]
+    assert [r.message for r in caplog.records] == [
+        "orphan project 400: 10 used blocks and no directory on this worker "
+        "carries it; reset its limits",
+    ]
+
+
+def test_reconcile_reclaims_a_used_orphan_no_directory_carries(
+    tmp_path, monkeypatch, caplog
+):
+    """Same contract as the node above, with the backend seam pinned.
+
+    That one carries its pre-R2 name and no seam pin (so this host's
+    environment failure set is unchanged); this one runs everywhere and
+    asserts the same outcome, the same command list and the same operator
+    line: a used orphan no directory carries gets its limits reset, never a
+    "manual review" that nobody can act on.
+    """
+    (tmp_path / "sbx_unrelated").mkdir()
+    monkeypatch.setattr(xfs_quota, "_use_quotactl", lambda mount_point: False)
+    calls = _fake_subprocess(
+        monkeypatch,
+        {
+            "report -p": (
+                0,
+                _report("#400 10 0 1024 00 [--------]"),
+                "",
+            )
+        },
+        lsattr_stdout="",
+    )
+    caplog.set_level(logging.WARNING)
+    result = reconcile_orphan_projects(
+        workspace_base=tmp_path, mount_point=MOUNT
+    )
+    assert result == {"cleaned": [400], "skipped": []}
+    assert calls == [
+        ["xfs_quota", "-x", "-c", "report -p", MOUNT],
+        ["lsattr", "-p", "-d", str(tmp_path / "sbx_unrelated")],
+        ["xfs_quota", "-x", "-c", "limit -p bsoft=0 bhard=0 400", MOUNT],
+    ]
+    assert [r.message for r in caplog.records] == [
+        "orphan project 400: 10 used blocks and no directory on this worker "
+        "carries it; reset its limits",
+    ]
+
+
+def test_reconcile_releases_a_prefixed_leftover_against_its_directory(
+    tmp_path, monkeypatch
+):
+    """R1: the shape rule misses ``snap_`` leftovers; the disk does not.
+
+    ``snap_leftover`` is a legal sandbox id whose tree lost its record: the
+    shape rule leaves it out (an infrastructure prefix with no top-level
+    ``sandbox.json``), so the first scan stage never sees the directory that
+    carries project 9100 -- and the row used to be skipped forever while the
+    tree stayed on disk, with no entry anywhere. The second stage asks the
+    directories the shape rule left out and finds it, so the row is released
+    against the directory that carries it (files kept, limits reset).
+
+    ``_snapshots`` is the control: a platform namespace carries no project id,
+    no ``lsattr`` run ever asks about it, and it is never a candidate.
+    """
+    leftover = tmp_path / "snap_leftover"
+    (leftover / "sealed").mkdir(parents=True)
+    (tmp_path / "_snapshots").mkdir()
+    assert is_sandbox_workspace_dir(leftover) is False
+    monkeypatch.setattr(xfs_quota, "_use_quotactl", lambda mount_point: False)
+    calls = _fake_subprocess_per_path(
+        monkeypatch,
+        {
+            "report -p": (
+                0,
+                _report("#9100 7 0 4096 00 [--------]"),
+                "",
+            )
+        },
+        {leftover: 9100},
+    )
+    result = reconcile_orphan_projects(
+        workspace_base=tmp_path, mount_point=MOUNT
+    )
+    assert result == {"cleaned": [9100], "skipped": []}
+    assert calls == [
+        ["xfs_quota", "-x", "-c", "report -p", MOUNT],
+        ["lsattr", "-p", "-d", str(leftover)],
+        [
+            "xfs_quota",
+            "-x",
+            "-c",
+            f"project -C -p {leftover} 9100",
+            MOUNT,
+        ],
+        ["xfs_quota", "-x", "-c", "limit -p bsoft=0 bhard=0 9100", MOUNT],
+    ]
+    assert (leftover / "sealed").is_dir()
+    assert (tmp_path / "_snapshots").is_dir()
+
+
+def test_reconcile_finds_the_parked_tree_that_still_carries_the_row(
+    tmp_path, monkeypatch
+):
+    """R2: a park whose release failed leaves the row to a findable carrier.
+
+    A parked tree keeps the project id of the tree it was renamed from, so a
+    failed ``project -C`` at park time leaves a used row whose only carrier
+    sits under the quarantine. The quarantine's own children are therefore
+    part of the second stage: the row is released against the parked tree
+    (which is this worker's storage, never deleted, and never has its payload
+    touched by a quota release).
+    """
+    quarantine = tmp_path / "_untrusted.trees"
+    parked = quarantine / "sbx_parked"
+    parked.mkdir(parents=True)
+    (parked / "payload.bin").write_bytes(b"parked payload")
+    (quarantine / "sbx_parked.reason").write_text(
+        "1700000000\tsbx_parked\tits sandbox.json points at somewhere\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(xfs_quota, "_use_quotactl", lambda mount_point: False)
+    calls = _fake_subprocess_per_path(
+        monkeypatch,
+        {
+            "report -p": (
+                0,
+                _report("#500 512 0 4096 00 [--------]"),
+                "",
+            )
+        },
+        {parked: 500},
+    )
+    result = reconcile_orphan_projects(
+        workspace_base=tmp_path, mount_point=MOUNT
+    )
+    assert result == {"cleaned": [500], "skipped": []}
+    assert calls == [
+        ["xfs_quota", "-x", "-c", "report -p", MOUNT],
+        ["lsattr", "-p", "-d", str(parked)],
+        [
+            "xfs_quota",
+            "-x",
+            "-c",
+            f"project -C -p {parked} 500",
+            MOUNT,
+        ],
+        ["xfs_quota", "-x", "-c", "limit -p bsoft=0 bhard=0 500", MOUNT],
+    ]
+    assert (parked / "payload.bin").read_bytes() == b"parked payload"
+
+
+def test_reconcile_reports_a_used_orphan_when_the_disk_cannot_be_asked(
+    tmp_path, monkeypatch
+):
+    """The one shape that keeps the skip: a disk this host cannot ask.
+
+    Without ``lsattr`` (the production image before e2fsprogs was installed)
+    neither stage can say which directory carries the row, so "no directory
+    carries it" is not a fact -- the row is reported with that reason instead
+    of having its limits reset on a guess. This is the pre-R1/R2 degradation,
+    unchanged and still loud.
+    """
+    (tmp_path / "sbx_unrelated").mkdir()
+    monkeypatch.setattr(xfs_quota, "_use_quotactl", lambda mount_point: False)
+    calls: list[list[str]] = []
+
+    def missing_lsattr(args, **kwargs):
+        calls.append(list(args))
+        if args[0] == "lsattr":
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), "lsattr")
+        return _FakeProc(
+            0,
+            stdout=_report("#400 10 0 1024 00 [--------]"),
+        )
+
+    monkeypatch.setattr(xfs_quota.subprocess, "run", missing_lsattr)
     result = reconcile_orphan_projects(
         workspace_base=tmp_path, mount_point=MOUNT
     )
@@ -660,13 +891,14 @@ def test_reconcile_skips_used_orphan_without_dir(tmp_path, monkeypatch):
             {
                 "projid": 400,
                 "reason": (
-                    "10 used blocks but no project directory; "
-                    "entry left for manual review"
+                    "10 used blocks and this host cannot ask the disk which "
+                    "directory carries them; entry left for manual review"
                 ),
             }
         ],
     }
-    # No destructive command ran: report + read-only dir scan only.
+    # Read-only: the report, the one ``lsattr`` that could not run, and no
+    # destructive command at all (nothing is guessed at, nothing is reset).
     assert calls == [
         ["xfs_quota", "-x", "-c", "report -p", MOUNT],
         ["lsattr", "-p", "-d", str(tmp_path / "sbx_unrelated")],

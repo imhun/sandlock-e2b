@@ -1246,3 +1246,247 @@ async def test_a_slice_that_is_a_link_to_another_tenants_slice_is_refused(
     assert link.is_symlink()
     assert tree.exists() is False
     assert runtime_registry.list() == []
+
+
+# ---------------------------------------------------------------------------
+# R1/R2 (final review of W9, `.superpowers/sdd/task-w9-review.md` §4.2/§9):
+# the two "permanent leftover" shapes.
+# ---------------------------------------------------------------------------
+
+#: The project id the *victim's* volume slice carries on the disk.
+VICTIM_SLICE_PROJID = 1876543211
+
+
+@pytest.mark.asyncio
+async def test_a_prefixed_leftover_that_carries_a_project_id_is_visible_and_parkable(
+    workspace, monkeypatch
+):
+    """R1: the name is not the evidence -- the disk is.
+
+    ``snap_leftover`` is a legal sandbox id (``X-Sandbox-Id`` goes through
+    ``validate_sandbox_id`` alone, and ``_``/``snap_`` are legal id
+    characters) whose tree lost its record. The shape rule leaves it out
+    (infrastructure prefix, no top-level ``sandbox.json``), so before this
+    round *every* worker-side surface missed it: not in the audit listing, not
+    parkable, not in ``unmaterialised`` -- while the project id the disk
+    reports for it kept its quota row unscannable forever. Its tree and its
+    row pinned each other with no entry anywhere.
+
+    The disk decides instead. A directory that really carries a project id is
+    this worker's quota asset, whatever it is called; the snapshot store (a
+    top-level ``snapshot.json`` + ``fs/`` with no project id of its own) and
+    the platform namespaces carry none and stay exactly where they are.
+    """
+    leftover = workspace / "snap_leftover"
+    (leftover / "sealed").mkdir(parents=True)
+    (leftover / "payload.bin").write_bytes(b"leftover payload")
+    (workspace / "_snapshots").mkdir()
+    store = workspace / "snap_0040ce7e44f6365f"
+    (store / "fs").mkdir(parents=True)
+    (store / "snapshot.json").write_text("{}", encoding="utf-8")
+    reads: list[str] = []
+
+    def fake_read(path):
+        reads.append(str(path))
+        return 9100 if Path(path) == leftover else None
+
+    monkeypatch.setattr(agent_mod, "directory_project_id", fake_read)
+    released = _record_agent_releases(monkeypatch)
+    app = _worker_app(workspace)
+    parked_dir = workspace / "_untrusted.trees" / "snap_leftover"
+    reason = (
+        "it has no readable sandbox.json and its name is outside the sandbox "
+        "shapes this worker acts on; the disk reports project id 9100 for it"
+    )
+
+    listed = await _worker_get(app, "/agent/untrusted")
+
+    assert listed.status_code == 200
+    assert listed.json() == {
+        "untrusted": [
+            {
+                "sandbox_id": "snap_leftover",
+                "reason": reason,
+                "disk_project_id": 9100,
+                "claimed_project_ids": [],
+            }
+        ]
+    }
+
+    parked = await _worker_post(app, "/agent/untrusted/snap_leftover/park")
+
+    assert parked.status_code == 200
+    assert parked.json() == {
+        "sandbox_id": "snap_leftover",
+        "reason": reason,
+        "parked_at": "_untrusted.trees/snap_leftover",
+        "released_project_id": 9100,
+    }
+    assert leftover.exists() is False
+    assert (parked_dir / "payload.bin").read_bytes() == b"leftover payload"
+    assert (parked_dir / "sealed").is_dir()
+    assert released == [(str(parked_dir), 9100)]
+    assert (store / "snapshot.json").read_text(encoding="utf-8") == "{}"
+    assert (store / "fs").is_dir()
+    assert (workspace / "_snapshots").is_dir()
+    # One read on the store -- the same asset check asks about it and its
+    # answer, "no project id", is what keeps it out -- and three on the
+    # leftover (the listing's check, the park route's re-check, and the
+    # project id park releases). The platform namespace is never read at all:
+    # the reservation short-circuits it before the disk is consulted.
+    assert reads == [
+        str(store),
+        str(leftover),
+        str(leftover),
+        str(leftover),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_platform_namespace_is_never_listed_even_when_it_reports_an_id(
+    workspace, monkeypatch, caplog
+):
+    """The guard on the disk-truth rule: namespaces are not parkable assets.
+
+    Nothing assigns a project id to ``_volumes`` / ``_snapshots`` (only
+    sandbox trees and volume slices are provisioned), so in a healthy
+    deployment the disk read already separates them. A base that carried
+    ``PROJINHERIT`` would be the one way for them to report one -- and parking
+    a namespace would move every tenant's data in it off the workspace. The
+    reservation is therefore explicit; it never widens, because a *sandbox
+    tree* whose client-chosen id is spelled like a namespace still carries its
+    own record and is still a sandbox tree.
+    """
+    (workspace / "_volumes").mkdir()
+    _write_tree(workspace, "_snapshots", project_id=7300)
+    reads: list[str] = []
+
+    def fake_read(path):
+        reads.append(str(path))
+        return 7300
+
+    monkeypatch.setattr(agent_mod, "directory_project_id", fake_read)
+    app = _worker_app(workspace)
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+
+    listed = await _worker_get(app, "/agent/untrusted")
+
+    assert listed.status_code == 200
+    assert listed.json() == {"untrusted": []}
+    # ``_snapshots`` carries its own record, so it is a (healthy) sandbox tree
+    # and its own plan check reads it once; ``_volumes`` is never read, which
+    # is what the reservation buys -- the fake would report 7300 for it.
+    assert reads == [str(workspace / "_snapshots")]
+    assert (
+        await _worker_post(app, "/agent/untrusted/_volumes/park")
+    ).status_code == 404
+    assert (workspace / "_volumes").is_dir()
+    assert (workspace / "_snapshots" / "sandbox.json").is_file()
+    assert _agent_lines(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_parking_a_refused_tree_releases_the_slices_it_claims(
+    workspace, monkeypatch, caplog
+):
+    """R2: park releases the sandbox's validated volume rows too.
+
+    A refused record can *claim* per-volume projects as well, and those claims
+    kept their rows "recorded" for exactly as long as the tree stayed in the
+    workspace scan -- after which the tree is parked, the record sits inside
+    the parked tree, and no scan could reach those rows again. Park therefore
+    releases them, and it does so the only way this codebase releases
+    anything: the slice has to pass the teardown's own guards (named after
+    this sandbox, inside the configured volume root, and *being* the directory
+    it spells), and the project id released is the one the disk reports for
+    that slice. Two entries are refused outright and one claim is overruled;
+    the row the victim's slice carries is never touched.
+    """
+    volume_root = workspace / "_volumes"
+    victim_tree = _write_tree(workspace, "sbx_victim", project_id=VICTIM_PROJID)
+    own_slice = volume_root / "vol_1" / "sbx_liar"
+    own_slice.mkdir(parents=True)
+    (own_slice / "data.bin").write_bytes(b"this sandbox's own slice")
+    victim_slice = volume_root / "vol_1" / "sbx_victim"
+    victim_slice.mkdir(parents=True)
+    (victim_slice / "victim.bin").write_bytes(b"another tenant's volume")
+    outside_slice = workspace / "elsewhere" / "sbx_liar"
+    outside_slice.mkdir(parents=True)
+    liar = _write_tree(
+        workspace,
+        "sbx_liar",
+        workspace_dir=str(victim_tree),
+        project_id=LIAR_PROJID,
+        volume_projects=(
+            {
+                "volume_id": "vol_1",
+                "sandbox_id": "sbx_liar",
+                "mount_path": "mnt/data",
+                "sandbox_dir": str(own_slice),
+                # The record *claims* 8200; the disk reports 8300.
+                "projid": 8200,
+            },
+            {
+                "volume_id": "vol_1",
+                "sandbox_id": "sbx_victim",
+                "mount_path": "mnt/victim",
+                "sandbox_dir": str(victim_slice),
+                "projid": VICTIM_SLICE_PROJID,
+            },
+            {
+                "volume_id": "vol_2",
+                "sandbox_id": "sbx_liar",
+                "mount_path": "mnt/other",
+                "sandbox_dir": str(outside_slice),
+                "projid": 8400,
+            },
+        ),
+    )
+    _install_disk_projids(
+        monkeypatch,
+        {
+            victim_tree: VICTIM_PROJID,
+            liar: LIAR_PROJID,
+            own_slice: 8300,
+            victim_slice: VICTIM_SLICE_PROJID,
+            outside_slice: 8400,
+        },
+    )
+    released = _record_agent_releases(monkeypatch)
+    app = _worker_app(workspace, shared_volume_root=str(volume_root))
+    parked_dir = workspace / "_untrusted.trees" / "sbx_liar"
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+
+    parked = await _worker_post(app, "/agent/untrusted/sbx_liar/park")
+
+    assert parked.status_code == 200
+    assert parked.json() == {
+        "sandbox_id": "sbx_liar",
+        "reason": f"its sandbox.json points at {victim_tree}",
+        "parked_at": "_untrusted.trees/sbx_liar",
+        "released_project_id": LIAR_PROJID,
+    }
+    # The parked tree's own row, then the slice's *disk* id -- never the
+    # claimed 8200, never the victim's row, never the out-of-root row.
+    assert released == [
+        (str(parked_dir), LIAR_PROJID),
+        (str(own_slice), 8300),
+    ]
+    assert _agent_lines(caplog) == [
+        f"park: forcing {own_slice}: its sandbox.json claims project id 8200 "
+        "but the disk says 8300; releasing the project id the disk reports",
+        f"park: refusing a volume entry of sbx_liar: {victim_slice} is not a "
+        "slice of this sandbox",
+        f"park: refusing the volume slice {outside_slice} of sbx_liar: it is "
+        f"outside the shared volume root {volume_root}",
+        f"park: sbx_liar: released the project id 8300 its volume slice "
+        f"{own_slice} carries on the disk",
+        "park: moved the refused tree sbx_liar to _untrusted.trees (payload "
+        f"kept, project {LIAR_PROJID} released)",
+    ]
+    assert (own_slice / "data.bin").read_bytes() == b"this sandbox's own slice"
+    assert victim_slice.is_dir()
+    assert (victim_slice / "victim.bin").read_bytes() == b"another tenant's volume"
+    assert outside_slice.is_dir()
