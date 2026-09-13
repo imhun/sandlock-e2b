@@ -24,6 +24,7 @@ import errno
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -670,48 +671,57 @@ async def test_gc_protects_paused_migrating_and_reserved_entries(
 
 
 @pytest.mark.asyncio
-async def test_snapshot_store_trees_are_never_gc_candidates(
+async def test_snapshot_store_directory_is_spared_by_its_shape(
     workspace, monkeypatch, caplog
 ):
-    """follow-up 2: the snapshot store is a top-level ``snap_*`` namespace.
+    """M1 rework, RED-B: the store's own shape is still never a candidate.
 
     ``SnapshotRegistry``'s base *is* the workspace base
-    (``control_plane/app.py``), so a snapshot is a top-level
-    ``snap_<hex>`` directory sitting next to the ``sbx_*`` trees. ``snap_``
-    passes ``validate_sandbox_id`` (``_`` is a legal id character and the
-    prefix is not reserved there), so on today's shape the store only escapes
-    the GC because no snapshot carries a *top-level* ``sandbox.json`` — luck,
-    not design. The predicate has to say so instead:
+    (``control_plane/app.py``), so a snapshot is a top-level ``snap_<hex>``
+    directory next to the ``sbx_*`` trees, and ``snap_`` passes
+    ``validate_sandbox_id`` (``_`` is a legal id character). The predicate
+    separates it from a sandbox tree by shape, not by name: the store holds
+    ``snapshot.json`` and the copied filesystem under ``fs/`` (the sandbox
+    record of that copy lives at ``snap_X/fs/sandbox.json``), so it carries no
+    *top-level* ``sandbox.json`` and stays out of both scans.
 
-    * the snapshot tree never enters the scan, even when it is shaped exactly
-      like a sandbox tree — a top-level ``sandbox.json`` whose record claims
-      ``<base>/<id>``, which is the shape the teardown's own ``<base>/<id>``
-      guard accepts, i.e. the shape that would be *deleted*;
-    * a real ``sbx_*`` tree of the same round is still scanned, torn down and
-      has its quota row reclaimed (the tightening must not go too far).
+    ``tmp/fu-m1-02-verify-prior.log`` pins that shape against the real
+    ``SnapshotRegistry`` and the real snapshot API (top level is exactly
+    ``['fs', 'snapshot.json']``; a client-supplied ``snapshotID`` in the body
+    is ignored).
     """
     _nodes, _registry, control_app = _stack(workspace)
 
-    # The dangerous snapshot shape: the record a whole-tree snapshot would
-    # carry, plus the snapshot's own marker file.
     snap_id = "snap_0040ce7e44f6365f"
-    snap_dir = _tree(workspace, snap_id, project_id=STRANDED_PROJID)
+    snap_dir = workspace / snap_id
+    (snap_dir / "fs").mkdir(parents=True)
     snapshot_marker = snap_dir / "snapshot.json"
     snapshot_marker.write_text(
         json.dumps({"snapshot_id": snap_id}), encoding="utf-8"
     )
+    fs_payload = snap_dir / "fs" / "marker.txt"
+    fs_payload.write_text("snapshot payload", encoding="utf-8")
+    nested_record = snap_dir / "fs" / "sandbox.json"
+    nested_record.write_text(
+        json.dumps(
+            {"sandbox_id": "sbx_snapshotted", "workspace_dir": "/elsewhere"}
+        ),
+        encoding="utf-8",
+    )
 
-    # A real orphan tree of the same round.
+    # A real orphan tree of the same round, so the tightening is observable.
     orphan_id = "sbx_stranded"
     orphan_dir = _tree(workspace, orphan_id, project_id=STRANDED_VOLUME_PROJID)
-    quota = _QuotaFake({STRANDED_PROJID: 8, STRANDED_VOLUME_PROJID: 8})
+    quota = _QuotaFake({STRANDED_VOLUME_PROJID: 8})
     quota.install(monkeypatch)
-    _install_disk_projids(monkeypatch, {orphan_dir: STRANDED_VOLUME_PROJID})
+    disk_calls = _install_disk_projids(
+        monkeypatch, {orphan_dir: STRANDED_VOLUME_PROJID}
+    )
     caplog.set_level(logging.WARNING)
     caplog.clear()
 
-    # The scan behind both the GC and the quota reclaim: the snapshot tree is
-    # not a workspace runtime, materialised or unmaterialised.
+    # The scan behind both the GC and the quota reclaim: the store is neither a
+    # materialised nor an unmaterialised workspace runtime.
     records, unmaterialised = agent_mod._scan_workspace_runtimes(
         _envd_settings(workspace), RuntimeRegistry(workspace)
     )
@@ -733,23 +743,235 @@ async def test_snapshot_store_trees_are_never_gc_candidates(
         "quota_cleaned": [STRANDED_VOLUME_PROJID],
         "quota_unreclaimed": [],
     }
-    # The snapshot tree is untouched — marker, record and files all still
-    # there — and the round never released the projid its record claims.
+    # The store is untouched — marker, copied filesystem and the nested record
+    # all still there — and the round never reached the disk for it.
     assert snapshot_marker.read_text(encoding="utf-8") == json.dumps(
         {"snapshot_id": snap_id}
     )
-    assert (snap_dir / "sandbox.json").is_file()
-    assert (snap_dir / "workspace").is_dir()
+    assert fs_payload.read_text(encoding="utf-8") == "snapshot payload"
+    assert nested_record.is_file()
     assert quota.released == [(str(orphan_dir), STRANDED_VOLUME_PROJID)]
-    # ``_recorded_projids`` is *record*-driven (it reads ``sandbox.json``
-    # directly, not the directory predicate), so the snapshot's claim still
-    # counts there. That asymmetry is the deliberate, fail-safe direction:
-    # the tightened predicate may only ever make a scan see *fewer* trees,
-    # never strip a live tree's recorded project id.
-    assert quota.rows == {STRANDED_PROJID: 8}
+    assert quota.rows == {}
+    assert disk_calls == [
+        ["lsattr", "-p", "-d", str(orphan_dir)],
+    ]
     assert [record.message for record in caplog.records] == [
         f"reconcile: removing orphan runtime {orphan_id} (not in control plane)",
     ]
+
+
+@pytest.mark.parametrize("chosen_id", ["snap_client1", "_client1"])
+@pytest.mark.asyncio
+async def test_a_client_chosen_prefixed_id_is_reclaimed_not_stranded(
+    workspace, monkeypatch, caplog, chosen_id
+):
+    """M1 rework, RED-A: the leak the unconditional prefix exclusion caused.
+
+    ``X-Sandbox-Id`` is validated with ``validate_sandbox_id`` alone
+    (``control_plane/api/sandboxes.py``), so ``snap_client1`` and ``_client1``
+    are legal sandbox ids and their trees land at ``<base>/<id>`` — the real
+    API accepts both with ``201`` (``tmp/fu-m1-03-create-prefixed-id.log``).
+    Such a tree carries its own top-level ``sandbox.json``, so it *is* a
+    sandbox tree, whatever its name starts with: its orphan tree must be
+    reclaimed and its quota row freed like any other.
+
+    Before the fix the name alone excluded it from the GC candidate set, while
+    ``_recorded_projids`` — which reads ``sandbox.json`` directly and never
+    consults the predicate — kept pinning its row through the surviving file:
+    the tree and the row pinned each other forever, silently.
+    """
+    _nodes, _registry, control_app = _stack(workspace)
+
+    chosen_dir = _tree(workspace, chosen_id, project_id=STRANDED_PROJID)
+    orphan_id = "sbx_stranded"
+    orphan_dir = _tree(workspace, orphan_id, project_id=STRANDED_VOLUME_PROJID)
+    # The real API's record for such an id, as the review logged it.
+    record = json.loads((chosen_dir / "sandbox.json").read_text(encoding="utf-8"))
+    assert record["sandbox_id"] == chosen_id
+    assert record["workspace_dir"] == str(chosen_dir)
+
+    quota = _QuotaFake({STRANDED_PROJID: 8, STRANDED_VOLUME_PROJID: 8})
+    quota.install(monkeypatch)
+    disk_calls = _install_disk_projids(
+        monkeypatch,
+        {
+            chosen_dir: STRANDED_PROJID,
+            orphan_dir: STRANDED_VOLUME_PROJID,
+        },
+    )
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+
+    records, unmaterialised = agent_mod._scan_workspace_runtimes(
+        _envd_settings(workspace), RuntimeRegistry(workspace)
+    )
+    assert sorted(records) == sorted([chosen_id, orphan_id])
+    assert unmaterialised == []
+
+    agent = _agent(workspace)
+    async with _client(control_app) as raw:
+        summary = await agent._reconcile_with_control_plane(raw, _headers())
+
+    assert chosen_dir.exists() is False
+    assert orphan_dir.exists() is False
+    assert summary == {
+        "deleted": sorted([chosen_id, orphan_id]),
+        "delete_failures": [],
+        "unmaterialised": [],
+        "protected_elsewhere": [],
+        "disk_sweep_skipped": [],
+        "untrusted_records": [],
+        "concurrent_creates": [],
+        "quota_cleaned": sorted([STRANDED_PROJID, STRANDED_VOLUME_PROJID]),
+        "quota_unreclaimed": [],
+    }
+    assert quota.rows == {}
+    # The round walks its targets in id order.
+    by_id = {
+        chosen_id: (chosen_dir, STRANDED_PROJID),
+        orphan_id: (orphan_dir, STRANDED_VOLUME_PROJID),
+    }
+    assert quota.released == [
+        (str(by_id[sandbox_id][0]), by_id[sandbox_id][1])
+        for sandbox_id in sorted([chosen_id, orphan_id])
+    ]
+    assert [record.message for record in caplog.records] == [
+        f"reconcile: removing orphan runtime {sandbox_id} "
+        f"(not in control plane)"
+        for sandbox_id in sorted([chosen_id, orphan_id])
+    ]
+    # Every prefixed tree that carries its own record reaches the disk read;
+    # none is filtered out by its name.
+    assert sorted(str(call[-1]) for call in disk_calls) == sorted(
+        [str(chosen_dir), str(orphan_dir)]
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_whole_tree_copy_under_a_snapshot_id_is_refused(
+    workspace, monkeypatch, caplog
+):
+    """M1 rework, RED-C: the dangerous shape is refused, not deleted.
+
+    A whole-tree copy of a sandbox landing at ``<base>/snap_<hex>`` carries the
+    copied ``sandbox.json``, whose record still names the *original* sandbox
+    and its directory — that is what ``cp -r <base>/sbx_src <base>/snap_X``
+    produces, and the only shape of it the product can produce (the store's own
+    copies put the record under ``fs/``). It now enters the candidate set (it
+    looks like a sandbox tree), and the M4 guards then refuse it: the teardown
+    is aimed by the directory name, so a record that disagrees with it is not
+    evidence of anything. The tree is left alone and reported as
+    ``untrusted_records`` — the direction that must never relax.
+    """
+    _nodes, registry, control_app = _stack(workspace)
+
+    # The source is a live sandbox of this node (its record is in the control
+    # plane), so the round's only candidate is the copy.
+    source_id = "sbx_src"
+    _control_record(registry, "node_a", source_id)
+    source_dir = _tree(workspace, source_id, project_id=VICTIM_PROJID)
+    snap_id = "snap_0040ce7e44f6365f"
+    copied_dir = workspace / snap_id
+    shutil.copytree(source_dir, copied_dir, symlinks=True)
+    copied_record = json.loads(
+        (copied_dir / "sandbox.json").read_text(encoding="utf-8")
+    )
+    assert copied_record["sandbox_id"] == source_id
+    assert copied_record["workspace_dir"] == str(source_dir)
+
+    quota = _QuotaFake({VICTIM_PROJID: 8})
+    quota.install(monkeypatch)
+    # The disk can answer for the copy (its directory carries the project
+    # state), so the refusal has to come from the record/directory mismatch,
+    # not from a silent disk.
+    _install_disk_projids(monkeypatch, {copied_dir: VICTIM_PROJID})
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+
+    agent = _agent(workspace)
+    async with _client(control_app) as raw:
+        summary = await agent._reconcile_with_control_plane(raw, _headers())
+
+    assert copied_dir.exists()
+    assert (copied_dir / "sandbox.json").is_file()
+    assert quota.rows == {VICTIM_PROJID: 8}
+    assert quota.released == []
+    assert summary == {
+        "deleted": [],
+        "delete_failures": [],
+        "unmaterialised": [],
+        "protected_elsewhere": [],
+        "disk_sweep_skipped": [],
+        "untrusted_records": [snap_id],
+        "concurrent_creates": [],
+        "quota_cleaned": [],
+        "quota_unreclaimed": [],
+    }
+    assert [record.message for record in caplog.records] == [
+        f"reconcile: leaving {snap_id} on disk: its sandbox.json names "
+        f"sandbox {source_id!r}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_infrastructure_namespaces_are_still_excluded(
+    workspace, monkeypatch, caplog
+):
+    """M1 rework, RED-D: the reserved ``_`` namespaces keep their exclusion.
+
+    ``_volumes`` / ``_snapshots`` / ``_templates`` / ``_secrets`` carry no
+    top-level ``sandbox.json``, so the shape rule leaves them where they were:
+    out of the GC candidate set, out of ``unmaterialised``, out of the quota
+    scan's projid map. A real orphan of the same round is still reclaimed.
+    """
+    _nodes, _registry, control_app = _stack(workspace)
+    for name in ("_volumes", "_snapshots", "_templates", "_secrets"):
+        (workspace / name).mkdir(exist_ok=True)
+    (workspace / "_snapshots" / "snap_a").mkdir(exist_ok=True)
+    (workspace / "_snapshots" / "snap_a" / "snapshot.json").write_text(
+        "{}", encoding="utf-8"
+    )
+
+    orphan_id = "sbx_stranded"
+    orphan_dir = _tree(workspace, orphan_id, project_id=STRANDED_VOLUME_PROJID)
+    quota = _QuotaFake({STRANDED_VOLUME_PROJID: 8})
+    quota.install(monkeypatch)
+    calls = _install_disk_projids(
+        monkeypatch, {orphan_dir: STRANDED_VOLUME_PROJID}
+    )
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+
+    records, unmaterialised = agent_mod._scan_workspace_runtimes(
+        _envd_settings(workspace), RuntimeRegistry(workspace)
+    )
+    assert sorted(records) == [orphan_id]
+    assert unmaterialised == []
+
+    # The quota-side consumer of the same predicate (``xfs_quota.py``): the
+    # infrastructure namespaces never reach the disk read either.
+    assert xfs_quota._scan_project_dirs(workspace) == {
+        STRANDED_VOLUME_PROJID: orphan_dir
+    }
+    assert calls == [["lsattr", "-p", "-d", str(orphan_dir)]]
+
+    agent = _agent(workspace)
+    async with _client(control_app) as raw:
+        summary = await agent._reconcile_with_control_plane(raw, _headers())
+
+    assert summary == {
+        "deleted": [orphan_id],
+        "delete_failures": [],
+        "unmaterialised": [],
+        "protected_elsewhere": [],
+        "disk_sweep_skipped": [],
+        "untrusted_records": [],
+        "concurrent_creates": [],
+        "quota_cleaned": [STRANDED_VOLUME_PROJID],
+        "quota_unreclaimed": [],
+    }
+    for name in ("_volumes", "_snapshots", "_templates", "_secrets"):
+        assert (workspace / name).is_dir()
 
 
 @pytest.mark.asyncio

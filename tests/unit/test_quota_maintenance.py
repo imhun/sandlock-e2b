@@ -209,39 +209,56 @@ def test_scan_project_dirs_keeps_sandbox_trees_only(tmp_path, monkeypatch):
     assert calls == [["lsattr", "-p", "-d", str(keep)]]
 
 
-def test_scan_project_dirs_excludes_the_snapshot_store(tmp_path, monkeypatch):
-    """follow-up 2: a top-level ``snap_*`` store is not a sandbox tree.
+def test_scan_project_dirs_separates_the_store_from_a_prefixed_tree(
+    tmp_path, monkeypatch
+):
+    """M1 rework: ``snap_`` is separated by shape, not by name.
 
-    ``SnapshotRegistry``'s base is the workspace base, so snapshots live at
-    the top level next to the ``sbx_*`` trees and pass
-    ``validate_sandbox_id`` (``_`` is a legal id character). The quota scan
-    must not count one as a recorded project directory even when it carries a
-    top-level ``sandbox.json`` (the whole-tree snapshot shape): its record is
-    not a sandbox record, so its projid must never enter the mapping the
-    orphan reconcile walks.
+    ``SnapshotRegistry``'s base is the workspace base, so a snapshot store sits
+    at the top level next to the ``sbx_*`` trees and passes
+    ``validate_sandbox_id`` (``_`` is a legal id character). But the prefix is
+    not reserved on the create side — ``X-Sandbox-Id`` goes through
+    ``validate_sandbox_id`` alone — so ``snap_client1`` is a legal *sandbox* id
+    whose tree carries its own top-level ``sandbox.json``. Under the old
+    name-only exclusion that tree never entered this mapping, while
+    ``_recorded_projids`` (record-driven, it reads ``sandbox.json`` directly)
+    kept pinning its row: the row could never be reclaimed (review M1).
 
-    Note the split the assertion below pins: ``_recorded_projids`` is
-    *record*-driven (it reads ``sandbox.json`` directly) while
-    ``_scan_project_dirs`` is the predicate consumer. Tightening the shared
-    predicate may only ever make the scan see *fewer* trees, so a live tree
-    can never lose its recorded row to this change.
+    The consumer pin here is the direction the quota scan must keep:
+
+    * the store — ``snapshot.json`` plus the copied filesystem, with the
+      sandbox record of that copy at ``fs/sandbox.json`` — carries no
+      *top-level* ``sandbox.json`` and stays out of the mapping and off the
+      disk read;
+    * a prefixed directory that *does* carry one is a sandbox tree and enters
+      the mapping, so an orphan's row can be released against its directory.
     """
     keep = tmp_path / "sbx_keep"
     keep.mkdir()
-    snap = tmp_path / "snap_0040ce7e44f6365f"
-    snap.mkdir()
-    (snap / "snapshot.json").write_text("{}", encoding="utf-8")
-    (snap / "sandbox.json").write_text(
-        json.dumps({"sandbox_id": snap.name, "project_id": 701}),
+    store = tmp_path / "snap_0040ce7e44f6365f"
+    (store / "fs").mkdir(parents=True)
+    (store / "snapshot.json").write_text("{}", encoding="utf-8")
+    (store / "fs" / "sandbox.json").write_text(
+        json.dumps({"sandbox_id": "sbx_snapshotted", "project_id": 702}),
+        encoding="utf-8",
+    )
+    chosen = tmp_path / "snap_client1"
+    chosen.mkdir()
+    (chosen / "sandbox.json").write_text(
+        json.dumps({"sandbox_id": chosen.name, "project_id": 701}),
         encoding="utf-8",
     )
     monkeypatch.setattr(xfs_quota, "_use_quotactl", lambda mount_point: False)
     calls = _fake_subprocess(
-        monkeypatch, {}, lsattr_stdout=f"     700 ---------------- {keep}\n"
+        monkeypatch,
+        {},
+        lsattr_stdout=f"     700 ---------------- {keep}\n"
+        f"     701 ---------------- {chosen}\n",
     )
-    assert xfs_quota._scan_project_dirs(tmp_path) == {700: keep}
-    # The snapshot directory never even reaches the disk read.
-    assert calls == [["lsattr", "-p", "-d", str(keep)]]
+    assert xfs_quota._scan_project_dirs(tmp_path) == {700: keep, 701: chosen}
+    # The store never reaches the disk read; the prefixed tree does, because it
+    # is a sandbox tree.
+    assert calls == [["lsattr", "-p", "-d", str(keep), str(chosen)]]
 
 
 # ------------------------------------ reading one directory's project id (FU-1)

@@ -58,10 +58,9 @@ def validate_sandbox_id(sandbox_id: str) -> bool:
 
 
 #: Top-level namespaces under the workspace base that hold infrastructure, not
-#: sandboxes. Their names are spelled like legal sandbox ids (``_`` is an id
-#: character), so :func:`validate_sandbox_id` alone does not separate them from
-#: the ``sbx_*`` trees and they must never be read, quota-scanned or deleted as
-#: one:
+#: sandboxes. Their names are spelled like legal sandbox ids (``_`` and
+#: ``snap_`` are both id characters), so :func:`validate_sandbox_id` alone does
+#: not separate them from the ``sbx_*`` trees:
 #:
 #: * ``_`` — the reserved root namespace: ``_snapshots`` / ``_migrate`` /
 #:   ``_cow`` / ``_volumes`` / ``_templates`` / ``_secrets`` / ``_builds`` /
@@ -69,22 +68,41 @@ def validate_sandbox_id(sandbox_id: str) -> bool:
 #: * ``snap_`` — the snapshot store's own trees. ``SnapshotRegistry``'s base
 #:   *is* the workspace base (``control_plane/app.py``), so a snapshot is a
 #:   top-level ``snap_<hex>`` directory sitting right next to the sandbox trees
-#:   (``control_plane/registry/snapshots.py``). On today's shape it holds only
-#:   ``snapshot.json``, so the caller's "no readable record" fail-safe happens
-#:   to spare it — but a snapshot carrying a top-level ``sandbox.json`` (the
-#:   whole-tree copy shape) must never be folded into the GC's candidate set.
+#:   (``control_plane/registry/snapshots.py``): it holds ``snapshot.json`` and
+#:   the copied filesystem under ``fs/``, and the sandbox record that copy
+#:   carries sits at ``snap_X/fs/sandbox.json``, never at the top level.
 #:
-#: This is an *exclusion* list rather than an ``sbx_`` allow-list on purpose.
-#: A workspace tree is ``<base>/<sandbox_id>``, and a client may hand the
-#: control plane its own ``sandbox_id`` through ``X-Sandbox-Id``, which is
-#: validated with :func:`validate_sandbox_id` alone
-#: (``control_plane/api/sandboxes.py``) — the ``sbx_`` prefix is a documented
-#: client contract (``docs/SCALING.md``), not an enforced server invariant.
-#: An allow-list would therefore drop a live tree with a client-chosen
-#: non-``sbx_`` id out of the worker's GC candidate set and out of the quota
-#: scan's projid map; excluding only the namespaces that are infrastructure by
-#: construction keeps the change to names that are provably not sandboxes.
+#: Neither prefix is reserved on the create side — ``X-Sandbox-Id`` is checked
+#: with :func:`validate_sandbox_id` alone (``control_plane/api/sandboxes.py``)
+#: and the snapshot id is generated server-side — so the prefix *cannot* decide
+#: anything on its own. ``snap_client1`` is a legal sandbox id whose tree lands
+#: at ``<base>/snap_client1``; excluding prefixed names unconditionally stranded
+#: such a tree outside the GC candidate set *and* outside the quota scan's
+#: projid map while ``_recorded_projids`` kept pinning its row through the
+#: surviving ``sandbox.json``: a silent, permanent leak (review M1).
+#:
+#: The separator is the content shape, not the name: infrastructure namespaces
+#: carry no top-level ``sandbox.json``, every sandbox tree has one. A prefixed
+#: directory that carries its own record is therefore the sandbox tree it looks
+#: like, and only a prefixed directory without one stays excluded.
+#:
+#: This is an *exclusion* list rather than an ``sbx_`` allow-list on purpose:
+#: the ``sbx_`` prefix is a documented client contract (``docs/SCALING.md``),
+#: not an enforced server invariant, so an allow-list would drop every live tree
+#: with a client-chosen non-``sbx_`` id out of the same two scans.
+#:
+#: Residual shape (accepted): a whole-tree copy of a sandbox landing at
+#: ``<base>/snap_X`` *and* carrying a record rewritten to name ``snap_X`` itself
+#: is indistinguishable from a real tree with that id and is treated as one. The
+#: shape a plain copy produces — the record still naming the original sandbox —
+#: is refused by the teardown guards (``agent._gc_teardown_plan``) and reported
+#: as ``untrusted_records``.
 _INFRASTRUCTURE_PREFIXES = ("_", "snap_")
+
+#: The record every sandbox workspace tree keeps at its root
+#: (``envd_service/runtime/registry.py``). Its presence at the top level is the
+#: shape signal that separates a sandbox tree from an infrastructure namespace.
+_SANDBOX_RECORD_NAME = "sandbox.json"
 
 
 def is_sandbox_workspace_dir(entry: Path) -> bool:
@@ -92,15 +110,23 @@ def is_sandbox_workspace_dir(entry: Path) -> bool:
 
     The single filter every workspace scan shares (quota orphan
     reconciliation and the worker's orphan-tree GC): a real directory — never
-    a symlink — whose name is a valid sandbox id and is not one of the
-    infrastructure namespaces (:data:`_INFRASTRUCTURE_PREFIXES`).
+    a symlink — whose name is a valid sandbox id and which either lies outside
+    the infrastructure namespaces (:data:`_INFRASTRUCTURE_PREFIXES`) or carries
+    its own top-level ``sandbox.json`` into the bargain.
+
+    Existence of that record, not readability, is the shape signal on purpose:
+    a tree whose record exists but cannot be read has to stay visible to the
+    scans — the worker reports it as ``unmaterialised`` and never tears it down
+    — instead of slipping back into the silent-orphan state this predicate
+    exists to prevent.
     """
-    return (
-        entry.is_dir()
-        and not entry.is_symlink()
-        and not entry.name.startswith(_INFRASTRUCTURE_PREFIXES)
-        and validate_sandbox_id(entry.name)
-    )
+    if not entry.is_dir() or entry.is_symlink():
+        return False
+    if not validate_sandbox_id(entry.name):
+        return False
+    if not entry.name.startswith(_INFRASTRUCTURE_PREFIXES):
+        return True
+    return (entry / _SANDBOX_RECORD_NAME).is_file()
 
 
 def safe_join(root: str | Path, *parts: str) -> Path:
