@@ -534,6 +534,70 @@ def test_remove_and_modes_are_in_process_first(tmp_path: Path, monkeypatch) -> N
     assert not tree.exists()
 
 
+def test_the_maint_fallback_runs_for_a_tree_the_worker_cannot_remove(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """W7-4: the fallback branch of ``remove_tree`` used to die on its first log
+    line.
+
+    ``remove_tree`` hands a tree the worker's own DAC cannot remove to
+    ``e2b-maint`` -- the whole reason the maintenance broker exists (a
+    sandbox-made ``0700`` subdirectory, a sealed ``0555`` one, a root-owned
+    leftover). This module had no ``logger`` at all, so the ``logger.info``
+    that announces the hand-off raised ``NameError`` *before* ``broker_remove``
+    ran: the broker was never executed, and every teardown path (the delete
+    endpoint, the orphan-tree GC, the volume-slice cleanup) turned the shape
+    into a 500 that kept the tree. The assertion is the broker *call*, not the
+    return value.
+    """
+    import shutil
+
+    tree = tmp_path / "sandboxes" / "sbx_sealed"
+    (tree / "workspace").mkdir(parents=True)
+
+    def deny(*args, **kwargs) -> None:
+        raise PermissionError(13, "Permission denied", str(tree))
+
+    monkeypatch.setattr(shutil, "rmtree", deny)
+    helpers = _helpers(tmp_path)
+    monkeypatch.setattr(ph, "_ACTIVE", [helpers])
+    removed: list[str] = []
+    monkeypatch.setattr(
+        ph.PrivHelpers, "remove", lambda self, path: removed.append(str(path))
+    )
+
+    ph.remove_tree(tree)
+
+    assert removed == [str(tree)]
+
+
+def test_remove_tree_raises_when_neither_side_can_remove_the_tree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """W7-2's confirmation needs the failure to reach the caller.
+
+    ``on_error="raise"`` is what the teardown paths use: no broker (or a
+    broker that refuses) must surface as a failure instead of a silent partial
+    delete that leaves a tree with no readable record behind.
+    """
+    import shutil
+
+    tree = tmp_path / "sandboxes" / "sbx_sealed"
+    (tree / "workspace").mkdir(parents=True)
+
+    def deny(*args, **kwargs) -> None:
+        raise PermissionError(13, "Permission denied", str(tree))
+
+    monkeypatch.setattr(shutil, "rmtree", deny)
+    monkeypatch.setattr(ph, "_ACTIVE", [None])
+
+    with pytest.raises(PermissionError) as excinfo:
+        ph.remove_tree(tree, on_error="raise")
+
+    assert str(excinfo.value) == f"[Errno 13] Permission denied: '{tree}'"
+    assert tree.is_dir()
+
+
 def test_create_app_refuses_a_pool_that_contains_the_worker_identity(
     tmp_path: Path, monkeypatch
 ) -> None:

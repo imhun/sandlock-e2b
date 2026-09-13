@@ -1603,6 +1603,13 @@ def _destroy_local(
     when the record contradicts the tree it was found in; the runtime is
     stopped in that case too, so a refusal never leaves a process tree behind
     a sandbox the control plane has already forgotten.
+
+    A successful answer means the tree is *gone* from the disk (review W7 /
+    W7-2): the removal runs through the worker's helper — in-process first,
+    then the ``e2b-maint`` broker — and is confirmed by looking at the disk. A
+    tree that survives it, a refused record, or a refusal that armed the
+    just-unregistered marker (review W7 / W7-1) all report
+    ``acknowledged=False`` so the caller keeps the record and answers 502.
     """
     sandbox_id = record.sandbox_id
     runtime_registry = getattr(state, "runtime_registry", None)
@@ -1623,6 +1630,15 @@ def _destroy_local(
             )
             if runtime_registry is not None:
                 runtime_registry.unregister(sandbox_id)
+                # The just-unregistered marker covers a teardown (race B);
+                # this was a refusal, and the record file stays on disk on
+                # purpose. Left armed it blinds the *next* delete's record
+                # read for UNREGISTER_TOMBSTONE_S seconds, and "no record" is
+                # read as "nothing to verify", which deleted the files the
+                # refusal promised to keep (review W7 / W7-1).
+                release = getattr(runtime_registry, "release_tombstone", None)
+                if release is not None:
+                    release(sandbox_id)
             return _TeardownOutcome(acknowledged=False)
         if not keep_volume_slices and volume_projects:
             try:
@@ -1638,10 +1654,66 @@ def _destroy_local(
                     # asked of the wrong side.
                     via_agent=local_node_quota_via_agent(),
                 )
-        shutil.rmtree(state.workspace_base / sandbox_id, ignore_errors=True)
+        if not _remove_local_tree_confirming(state, sandbox_id):
+            # The tree survived (a sealed directory the worker cannot remove,
+            # the worker's own DAC, a mount it may not walk): that is a failed
+            # teardown, not a successful one. Reporting success here is what
+            # left "record gone, tree still on disk" on the combined node --
+            # and the leftovers carry no readable record, so the orphan-tree
+            # GC can never reclaim them (review W7 / W7-2). The caller keeps
+            # the record (orphaned) and the SDK sees 502.
+            if runtime_registry is not None:
+                runtime_registry.unregister(sandbox_id)
+                release = getattr(runtime_registry, "release_tombstone", None)
+                if release is not None:
+                    release(sandbox_id)
+            return _TeardownOutcome(acknowledged=False)
     if runtime_registry is not None:
         runtime_registry.unregister(sandbox_id)
     return _TeardownOutcome(acknowledged=True)
+
+
+def _remove_local_tree_confirming(state, sandbox_id: str) -> bool:
+    """Remove ``<base>/<id>`` and confirm it is really gone (review W7 / W7-2).
+
+    The removal goes through the worker's own helper (in-process first, then
+    the ``e2b-maint`` broker) instead of ``shutil.rmtree(ignore_errors=True)``,
+    whose silent partial failure was indistinguishable from success. The
+    answer is the disk's: the tree has to be gone when this returns.
+
+    ``False`` means the tree is still there and the caller must report a
+    failure (the record stays, the SDK sees 502).
+    """
+    tree = state.workspace_base / sandbox_id
+    try:
+        from envd_service import priv_helpers
+    except ImportError:  # pragma: no cover - separated control plane
+        priv_helpers = None
+    try:
+        if priv_helpers is not None:
+            # ``on_error="raise"``: no broker (or a broker that refuses) has
+            # to surface as a failure, not as a silent partial delete.
+            priv_helpers.remove_tree(tree, on_error="raise")
+        else:
+            shutil.rmtree(tree)
+    except FileNotFoundError:
+        return True
+    except Exception as exc:
+        logger.warning(
+            "local delete: %s could not be removed in-process or through the "
+            "broker: %s",
+            sandbox_id,
+            exc,
+        )
+        return False
+    if tree.exists() or tree.is_symlink():
+        logger.warning(
+            "local delete: %s survived its removal; the teardown did not "
+            "happen",
+            sandbox_id,
+        )
+        return False
+    return True
 
 
 def _verified_local_volume_projects(

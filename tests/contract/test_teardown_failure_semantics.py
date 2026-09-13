@@ -39,12 +39,14 @@ from starlette.requests import Request
 
 import control_plane.api.sandboxes as sandboxes
 import envd_service.agent as agent_mod
+import envd_service.priv_helpers as priv_helpers
 import envd_service.volumes as volumes
 import envd_service.xfs_quota as xfs_quota
 from control_plane.api.sandboxes import _destroy_evicted
 from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings as ControlSettings
 from control_plane.registry.manager import SandboxRegistry
+from control_plane.registry.manager import UnknownSandboxError
 from control_plane.registry.nodes import NodeRegistry
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
@@ -815,5 +817,432 @@ async def test_the_combined_node_still_cleans_its_own_slice(
     assert _agent_lines(caplog) == []
     assert released == [(str(slice_dir), 7200)]
     assert slice_dir.exists() is False
+    assert tree.exists() is False
+    assert runtime_registry.list() == []
+
+
+# ---------------------------------------------------------------------------
+# W9: the branches the C1/C2 review found still open, closed.
+# ---------------------------------------------------------------------------
+
+
+async def _worker_get(app, path: str, *, key: str | None = INTERNAL_KEY):
+    headers = {} if key is None else {"X-Internal-Key": key}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://worker"
+    ) as client:
+        return await client.get(path, headers=headers)
+
+
+async def _worker_post(app, path: str, *, key: str | None = INTERNAL_KEY):
+    headers = {} if key is None else {"X-Internal-Key": key}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://worker"
+    ) as client:
+        return await client.post(path, headers=headers)
+
+
+def _record_agent_releases(monkeypatch) -> list[tuple[str, int]]:
+    """Record every project release the worker's teardown makes."""
+    released: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        agent_mod,
+        "release_project",
+        lambda *, project_dir, mount_point, projid, via_agent: released.append(
+            (str(project_dir), int(projid))
+        ),
+    )
+    return released
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_is_not_blinded_by_its_own_marker(
+    workspace, monkeypatch
+):
+    """W7-1: the refusal used to arm the very marker that hid its record.
+
+    ``_delete_sandbox_runtime`` unregisters the refused sandbox (the process
+    tree must stop -- a refusal protects *files*), and ``unregister`` arms the
+    race-B marker for ``UNREGISTER_TOMBSTONE_S`` seconds. The refusal raised
+    before the teardown's ``finally: release_tombstone``, so the marker stayed:
+    ``RuntimeRegistry.get()`` answered ``None``, "no record" was read as
+    "nothing to verify", and the *second* DELETE of the same id answered 204
+    while deleting the files the refusal had promised to keep. Now the marker
+    is released with the refusal, so the second attempt is refused again.
+    """
+    victim = _write_tree(workspace, "sbx_victim", project_id=VICTIM_PROJID)
+    liar = _write_tree(
+        workspace,
+        "sbx_liar",
+        workspace_dir=str(victim),
+        project_id=VICTIM_PROJID,
+    )
+    _install_disk_projids(
+        monkeypatch, {victim: VICTIM_PROJID, liar: LIAR_PROJID}
+    )
+    app = _worker_app(workspace)
+    registry = app.state.runtime_registry
+
+    first = await _worker_delete(app, "sbx_liar")
+
+    assert first.status_code == 409
+    assert first.text == (
+        f"refusing to tear down sbx_liar: its sandbox.json points at {victim}"
+    )
+    # the record is visible again: the marker did not outlive the refusal
+    assert registry.peek("sbx_liar") is not None
+    assert registry.get("sbx_liar") is not None
+    assert registry._tombstoned("sbx_liar") is False
+
+    second = await _worker_delete(app, "sbx_liar")
+
+    assert second.status_code == 409
+    assert second.text == first.text
+    assert (liar / "payload.bin").read_bytes() == b"payload-of-sbx_liar"
+    assert (liar / "sandbox.json").is_file()
+    assert (victim / "payload.bin").read_bytes() == b"payload-of-sbx_victim"
+    assert (victim / "sandbox.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_the_local_refusal_survives_the_next_delete(workspace, monkeypatch):
+    """W7-1 on the combined node: two 502s, and the tree is still there."""
+    volume_root = workspace / "_volumes"
+    victim = _write_tree(workspace, "sbx_victim", project_id=VICTIM_PROJID)
+    liar = _write_tree(
+        workspace,
+        "sbx_liar",
+        workspace_dir=str(victim),
+        project_id=VICTIM_PROJID,
+    )
+    registry, app, runtime_registry = _local_control_stack(workspace, volume_root)
+    released = _record_releases(monkeypatch)
+    _install_disk_projids(
+        monkeypatch, {victim: VICTIM_PROJID, liar: LIAR_PROJID}
+    )
+    _control_record(registry, "local", "sbx_liar")
+
+    first = await _delete_sandbox(app, "sbx_liar")
+    assert first.status_code == 502
+    assert registry.get("sbx_liar").state == "orphaned"
+    # the marker the refusal armed is gone, so the record is readable again
+    assert runtime_registry._tombstoned("sbx_liar") is False
+
+    second = await _delete_sandbox(app, "sbx_liar")
+
+    assert second.status_code == 502
+    assert registry.get("sbx_liar").state == "orphaned"
+    assert liar.is_dir()
+    assert (liar / "payload.bin").read_bytes() == b"payload-of-sbx_liar"
+    assert (victim / "payload.bin").read_bytes() == b"payload-of-sbx_victim"
+    assert released == []
+
+
+@pytest.mark.asyncio
+async def test_the_local_teardown_confirms_the_tree_is_gone(
+    workspace, monkeypatch, caplog
+):
+    """W7-2: a tree that survives its removal is a failed teardown.
+
+    ``_destroy_local`` used to call ``shutil.rmtree(..., ignore_errors=True)``
+    and return ``acknowledged=True`` unconditionally, so the combined node
+    answered 204, the control plane dropped the record, and the leftovers -- a
+    tree with no readable record -- were left for a GC that can never reclaim
+    them. The removal now goes through the worker's helper (the ``e2b-maint``
+    fallback included) and the answer is the disk's.
+    """
+    volume_root = workspace / "_volumes"
+    tree = _write_tree(workspace, "sbx_sealed", project_id=LIAR_PROJID)
+    registry, app, runtime_registry = _local_control_stack(workspace, volume_root)
+    _record_releases(monkeypatch)
+    _install_disk_projids(monkeypatch, {tree: LIAR_PROJID})
+    _control_record(registry, "local", "sbx_sealed")
+    calls: list[str] = []
+
+    def deny(path, *, on_error="ignore") -> None:
+        calls.append(str(path))
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(priv_helpers, "remove_tree", deny)
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+
+    response = await _delete_sandbox(app, "sbx_sealed")
+
+    assert response.status_code == 502
+    # the helper is what runs -- not a bare ``shutil.rmtree``
+    assert calls == [str(tree)]
+    assert _sandbox_lines(caplog) == [
+        "local delete: sbx_sealed could not be removed in-process or through "
+        f"the broker: [Errno 13] Permission denied: '{tree}'",
+        "sandbox sbx_sealed: teardown not confirmed; record kept as orphaned",
+    ]
+    assert tree.is_dir()
+    assert (tree / "payload.bin").read_bytes() == b"payload-of-sbx_sealed"
+    # the record survives: the sandbox is still there, so 204 would be a lie
+    assert registry.get("sbx_sealed").state == "orphaned"
+    assert runtime_registry._tombstoned("sbx_sealed") is False
+
+
+@pytest.mark.asyncio
+async def test_the_local_teardown_passes_when_the_helper_removes_the_tree(
+    workspace, monkeypatch
+):
+    """The other half of W7-2: a removal that worked is still a clean 204."""
+    import shutil
+
+    volume_root = workspace / "_volumes"
+    tree = _write_tree(workspace, "sbx_ok", project_id=LIAR_PROJID)
+    registry, app, runtime_registry = _local_control_stack(workspace, volume_root)
+    _record_releases(monkeypatch)
+    _install_disk_projids(monkeypatch, {tree: LIAR_PROJID})
+    _control_record(registry, "local", "sbx_ok")
+    calls: list[str] = []
+
+    def remove(path, *, on_error="ignore") -> None:
+        calls.append(str(path))
+        shutil.rmtree(path)
+
+    monkeypatch.setattr(priv_helpers, "remove_tree", remove)
+
+    response = await _delete_sandbox(app, "sbx_ok")
+
+    assert response.status_code == 204
+    assert calls == [str(tree)]
+    assert tree.exists() is False
+    assert runtime_registry.list() == []
+    with pytest.raises(UnknownSandboxError):
+        registry.get("sbx_ok")
+
+
+@pytest.mark.asyncio
+async def test_a_refused_tree_is_parked_and_the_row_it_pinned_is_released(
+    workspace, monkeypatch, caplog
+):
+    """W7-3: the GC's refusal has a bounded, non-destructive exit.
+
+    Once the control plane has released the record (eviction, TTL, a kill
+    while the worker was unreachable) the API's ``force`` can only answer 404
+    -- the record is what named the node. Left in place, the tree's own
+    ``sandbox.json`` keeps the project ids it claims in the fail-safe scan
+    ("still live"), so the row never leaves the table: a permanent pin. The
+    exit moves the tree out of the sandbox namespace (never deletes it) and
+    releases the project id the disk reports.
+    """
+    victim = _write_tree(workspace, "sbx_victim", project_id=VICTIM_PROJID)
+    liar = _write_tree(
+        workspace,
+        "sbx_liar",
+        workspace_dir=str(victim),
+        project_id=LIAR_PROJID,
+    )
+    _install_disk_projids(
+        monkeypatch, {victim: VICTIM_PROJID, liar: LIAR_PROJID}
+    )
+    released = _record_agent_releases(monkeypatch)
+    app = _worker_app(workspace)
+    parked_dir = workspace / "_untrusted.trees" / "sbx_liar"
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+
+    # 1. the worker refuses to tear the tree down from its record ...
+    refused = await _worker_delete(app, "sbx_liar")
+    assert refused.status_code == 409
+    assert _agent_lines(caplog) == [
+        f"delete: refusing to tear down sbx_liar: its sandbox.json points at "
+        f"{victim}",
+    ]
+
+    # 2. ... the audit view names it, with the reason and the ids involved ...
+    caplog.clear()
+    listed = await _worker_get(app, "/agent/untrusted")
+    assert listed.status_code == 200
+    assert listed.json() == {
+        "untrusted": [
+            {
+                "sandbox_id": "sbx_liar",
+                "reason": f"its sandbox.json points at {victim}",
+                "disk_project_id": LIAR_PROJID,
+                "claimed_project_ids": [
+                    LIAR_PROJID,
+                ],
+            }
+        ]
+    }
+
+    # 3. ... and the bounded exit parks the tree (moved, never deleted)
+    monkeypatch.setattr(
+        agent_mod, "time", SimpleNamespace(time=lambda: 1_700_000_000.0)
+    )
+    parked = await _worker_post(app, "/agent/untrusted/sbx_liar/park")
+    assert parked.status_code == 200
+    assert parked.json() == {
+        "sandbox_id": "sbx_liar",
+        "reason": f"its sandbox.json points at {victim}",
+        "parked_at": "_untrusted.trees/sbx_liar",
+        "released_project_id": LIAR_PROJID,
+    }
+    assert _agent_lines(caplog) == [
+        "park: moved the refused tree sbx_liar to _untrusted.trees (payload "
+        f"kept, project {LIAR_PROJID} released)",
+    ]
+    assert liar.exists() is False
+    assert parked_dir.is_dir()
+    assert (parked_dir / "payload.bin").read_bytes() == b"payload-of-sbx_liar"
+    assert (parked_dir / "sandbox.json").is_file()
+    assert (workspace / "_untrusted.trees" / "sbx_liar.reason").read_text(
+        encoding="utf-8"
+    ) == (
+        "1700000000\tsbx_liar\t"
+        f"its sandbox.json points at {victim}\n"
+    )
+    assert released == [(str(parked_dir), LIAR_PROJID)]
+    # the victim is untouched, and the row the liar's record pinned is no
+    # longer in the fail-safe scan (its own row, and the victim's, stay live)
+    assert (victim / "payload.bin").read_bytes() == b"payload-of-sbx_victim"
+    assert xfs_quota._recorded_projids(workspace) == {VICTIM_PROJID}
+
+    # 4. nothing is parked twice, and a *healthy* tree is never parked
+    caplog.clear()
+    again = await _worker_post(app, "/agent/untrusted/sbx_liar/park")
+    assert again.status_code == 404
+    healthy = _write_tree(workspace, "sbx_healthy", project_id=7200)
+    _install_disk_projids(
+        monkeypatch,
+        {victim: VICTIM_PROJID, liar: LIAR_PROJID, healthy: 7200},
+    )
+    healthy_park = await _worker_post(app, "/agent/untrusted/sbx_healthy/park")
+    assert healthy_park.status_code == 404
+    assert healthy.is_dir()
+    assert _agent_lines(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_the_untrusted_view_and_the_park_action_need_the_internal_key(
+    workspace, monkeypatch
+):
+    """Both surfaces are operator-only, like every other agent route."""
+    _write_tree(
+        workspace, "sbx_liar", workspace_dir=str(workspace / "sbx_victim")
+    )
+    app = _worker_app(workspace)
+
+    assert (await _worker_get(app, "/agent/untrusted", key=None)).status_code == 401
+    assert (
+        await _worker_post(app, "/agent/untrusted/sbx_liar/park", key=None)
+    ).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_a_tree_without_a_readable_record_is_listed_and_parkable(
+    workspace, monkeypatch
+):
+    """The other leftover shape: no readable ``sandbox.json`` at all.
+
+    The GC reports those as ``unmaterialised`` and never tears them down (with
+    no record there is no project id to read, so deleting would be all risk and
+    no reclaim) -- which also meant they had no reclaim path of their own. The
+    audit view names them and the same bounded exit moves them out of the
+    sandbox namespace, keeping the payload and releasing the project id the
+    disk reports for the directory itself.
+    """
+    leftover = workspace / "sbx_no_record"
+    (leftover / "workspace").mkdir(parents=True)
+    (leftover / "payload.bin").write_bytes(b"payload-of-sbx_no_record")
+    _install_disk_projids(monkeypatch, {leftover: 7100})
+    released = _record_agent_releases(monkeypatch)
+    app = _worker_app(workspace)
+    parked_dir = workspace / "_untrusted.trees" / "sbx_no_record"
+
+    listed = await _worker_get(app, "/agent/untrusted")
+
+    assert listed.status_code == 200
+    assert listed.json() == {
+        "untrusted": [
+            {
+                "sandbox_id": "sbx_no_record",
+                "reason": "it has no readable sandbox.json",
+                "disk_project_id": 7100,
+                "claimed_project_ids": [],
+            }
+        ]
+    }
+
+    parked = await _worker_post(app, "/agent/untrusted/sbx_no_record/park")
+
+    assert parked.status_code == 200
+    assert parked.json() == {
+        "sandbox_id": "sbx_no_record",
+        "reason": "it has no readable sandbox.json",
+        "parked_at": "_untrusted.trees/sbx_no_record",
+        "released_project_id": 7100,
+    }
+    assert leftover.exists() is False
+    assert (parked_dir / "payload.bin").read_bytes() == b"payload-of-sbx_no_record"
+    assert released == [(str(parked_dir), 7100)]
+
+
+@pytest.mark.asyncio
+async def test_a_slice_that_is_a_link_to_another_tenants_slice_is_refused(
+    workspace, monkeypatch, caplog
+):
+    """W7-5: the slice check is an identity check, not a spelling check.
+
+    A link *inside* the shared volume root, spelled after this sandbox, points
+    at another tenant's slice: the name check passes, the containment check
+    resolves the link to a path that is still inside the root, and the project
+    id read through it is the victim's -- so the pre-fix code adopted the
+    entry and released the victim's row (and, with a broker, ``e2b-maint``
+    would have deleted the victim's slice). ``lstat`` describes the entry and
+    ``stat`` the directory a destructive call would open; they disagree for a
+    link, so the entry is refused.
+    """
+    volume_root = workspace / "_volumes"
+    victim_slice = volume_root / "vol_1" / "sbx_victim"
+    victim_slice.mkdir(parents=True)
+    (victim_slice / "victim.bin").write_bytes(b"another tenant's volume")
+    link = volume_root / "vol_1" / "sbx_linked"
+    link.symlink_to(victim_slice)
+    tree = _write_tree(
+        workspace,
+        "sbx_linked",
+        project_id=LIAR_PROJID,
+        volume_projects=(
+            {
+                "volume_id": "vol_1",
+                "sandbox_id": "sbx_linked",
+                "mount_path": "mnt/data",
+                "sandbox_dir": str(link),
+            },
+        ),
+    )
+    registry, app, runtime_registry = _local_control_stack(workspace, volume_root)
+    released = _record_releases(monkeypatch)
+    # The kernel's project-id read follows the link, so the pre-fix code read
+    # (and released) the *victim's* row through it; that is what this test's
+    # `released == []` pins.
+    monkeypatch.setattr(
+        agent_mod,
+        "directory_project_id",
+        lambda path: {
+            str(victim_slice): VICTIM_PROJID,
+            str(tree): LIAR_PROJID,
+        }.get(str(Path(path).resolve())),
+    )
+    _control_record(registry, "local", "sbx_linked")
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+
+    response = await _delete_sandbox(app, "sbx_linked")
+
+    assert response.status_code == 204
+    assert _agent_lines(caplog) == [
+        f"local delete: refusing the volume slice {link} of sbx_linked: the "
+        "entry is not the directory it spells (a link or a non-directory), "
+        "so it could name another tenant's slice",
+    ]
+    assert released == []
+    assert (victim_slice / "victim.bin").read_bytes() == b"another tenant's volume"
+    assert link.is_symlink()
     assert tree.exists() is False
     assert runtime_registry.list() == []

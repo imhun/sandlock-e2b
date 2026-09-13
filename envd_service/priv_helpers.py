@@ -58,6 +58,7 @@ keeps using its own privileged starter.
 
 from __future__ import annotations
 
+import logging
 import os
 import stat
 import struct
@@ -65,6 +66,15 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
+
+#: The fallback branches of :func:`remove_tree` / :func:`dir_size` log why the
+#: in-process attempt failed and that the broker is taking over. This module had
+#: no logger at all (review W7 / W7-4), so the ``e2b-maint rm`` fallback raised
+#: ``NameError`` *before* the broker call: every tree the worker's own DAC could
+#: not reach (a sandbox-made ``0700`` subdirectory, a sealed ``0555`` directory,
+#: a root-owned leftover) made the teardown fail instead of delegating it, and
+#: the broker that exists for exactly that shape was never executed.
+logger = logging.getLogger(__name__)
 
 #: Where the image installs the brokers. Deliberately **not** ``/usr/local``
 #: or ``/opt``: the pure shape's Landlock rules cover those prefixes, so a

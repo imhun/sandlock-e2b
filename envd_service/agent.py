@@ -37,6 +37,7 @@ from envd_service.xfs_quota import (
     ProjectDirectoryGone,
     ProjectQuotaError,
     directory_project_id,
+    projids_in_record,
     provision_project,
     reconcile_orphan_projects,
     release_project,
@@ -63,6 +64,21 @@ _QUOTA_RECLAIM_DELAY_S = 0.5
 #: interval, so the first retry lands on the next heartbeat and the cap is
 #: reached at 60s.
 _RECONCILE_RETRY_MAX_INTERVALS = 12
+
+#: Where a tree the GC refuses to act on is parked (review W7 / W7-3): such a
+#: tree is never *deleted* (its record may be describing a bind-mounted other
+#: tenant's tree) and never acted on from the record's claims either. But
+#: leaving it in place was not an exit: its own ``sandbox.json`` keeps the
+#: project ids it claims in the fail-safe scan's "live" set
+#: (``xfs_quota._recorded_projids``), so its quota row -- and the row it
+#: borrowed from a victim -- stayed pinned forever once the control-plane
+#: record was released (eviction, TTL), where ``force`` can only answer 404.
+#: Parking it under a name that cannot be a sandbox id (a dot is not in
+#: ``gateway_common.paths._SANDBOX_ID_RE``) moves those claims out of the
+#: top-level scan, keeps the payload for an operator to look at, and can never
+#: land inside a live sandbox's workspace; the disk's own project id is
+#: released with it, so no row survives the refusal.
+UNTRUSTED_TREE_DIR = "_untrusted.trees"
 
 
 def _extract_sandbox_archive(archive_path: Path, dest: Path) -> None:
@@ -219,6 +235,32 @@ class SandboxTeardownRefused(Exception):
     """
 
 
+class SandboxTreeNotRemoved(RuntimeError):
+    """The tree survived its own teardown, so the teardown did not happen.
+
+    Raised by :func:`_delete_sandbox_runtime` when the in-process removal and
+    the ``e2b-maint`` fallback could not take the workspace off the disk (a
+    sealed directory on a worker with no brokers, a mount the process may not
+    walk). Reporting success here is what let a control plane forget a sandbox
+    whose tree -- and whose unreadable leftovers -- stayed behind forever
+    (review W7 / W7-2).
+    """
+
+
+def _release_teardown_tombstone(runtime_registry, sandbox_id: str) -> None:
+    """Disarm the just-unregistered marker after a teardown that did not run.
+
+    ``unregister`` arms the marker so a concurrent ``get()`` cannot
+    materialise the record of a tree that is being deleted (race B). A refusal
+    keeps the files, so the marker must not outlive it: for the next
+    ``UNREGISTER_TOMBSTONE_S`` seconds ``get()`` would answer ``None``, and
+    "no record" is read as "nothing to verify" (review W7 / W7-1).
+    """
+    release = getattr(runtime_registry, "release_tombstone", None)
+    if release is not None:
+        release(sandbox_id)
+
+
 def _recorded_dir_matches(recorded_dir: Any, workspace_dir: Path) -> bool:
     """Whether a record's ``workspace_dir`` names the tree the caller scans.
 
@@ -254,6 +296,45 @@ def _recorded_dir_matches(recorded_dir: Any, workspace_dir: Path) -> bool:
         workspace_stat.st_dev,
         workspace_stat.st_ino,
     )
+
+
+def _is_the_directory_it_spells(path: Path) -> bool:
+    """Whether ``path`` *is* the directory it names, not a link to another.
+
+    The volume slice check used to compare the entry's *name* (is it spelled
+    after this sandbox?) and the *resolved* path (is it inside the shared
+    volume root?), and both pass for a link that lives inside the volume root,
+    is named after this sandbox, and points at another tenant's slice: the
+    containment test resolves the link to a path that is still inside the
+    root, and the project id is then read (and released) through it, i.e. off
+    the victim's slice (review W7 / W7-5). The path a slice is *declared* at
+    and the directory a destructive call would open have to be the same
+    object, which is an identity question, not a spelling one:
+    ``lstat`` describes the entry itself and ``stat`` the directory a
+    ``rmtree``/``chown`` would reach, so a symlink (and anything that is not a
+    directory at all) fails while hard links, bind mounts and equivalent
+    spellings of the same directory pass.
+
+    A path that is not on the disk (or cannot be stat'ed) is not refused here:
+    there is no second directory it could point at, and the disk read in
+    :func:`_verified_project_id` already reports that shape (its row is left
+    to the fail-safe reconcile).
+    """
+    if os.path.islink(path):
+        # The entry itself is a link -- including a broken one, whose target
+        # ``stat`` cannot reach: either way the destructive call would open
+        # something other than the slice this sandbox owns.
+        return False
+    try:
+        declared = os.lstat(path)
+        opened = os.stat(path)
+    except OSError:
+        return True
+    if not path.is_dir():
+        # A file/FIFO/socket named after the sandbox is not a slice: a
+        # project id can live on any inode, and a release would act on it.
+        return False
+    return (declared.st_dev, declared.st_ino) == (opened.st_dev, opened.st_ino)
 
 
 def _verified_project_id(
@@ -361,7 +442,11 @@ def _verified_teardown_plan(
     * a record whose ``sandbox_id``/``workspace_dir`` disagree with the
       directory it was found in is refused outright;
     * a volume slice is only honoured when it is named after this sandbox and
-      lives under the worker's configured ``shared_volume_root``.
+      lives under the worker's configured ``shared_volume_root``, and when the
+      entry *is* the directory it spells -- ``lstat``/``stat`` identity, so a
+      link inside the volume root that is named after this sandbox but points
+      at another tenant's slice cannot smuggle that slice into the target set
+      (review W7 / W7-5).
 
     The project ids come from the disk, not from the record: a
     contradiction refuses the tree, a silent disk drops the release and
@@ -490,6 +575,16 @@ def _verified_teardown_plan(
                 shared_root,
             )
             continue
+        if not _is_the_directory_it_spells(slice_dir):
+            logger.warning(
+                "%s: refusing the volume slice %s of %s: the entry is not "
+                "the directory it spells (a link or a non-directory), so it "
+                "could name another tenant's slice",
+                context,
+                slice_dir,
+                sandbox_id,
+            )
+            continue
         slice_projid, slice_reason = _verified_project_id(
             slice_dir,
             entry.get("projid"),
@@ -516,6 +611,200 @@ def _verified_teardown_plan(
         ),
         None,
     )
+
+
+def _untrusted_entry_for(
+    settings: Settings, runtime_registry, sandbox_id: str
+) -> tuple[dict | None, str | None]:
+    """One audit entry for a refused tree, or why ``sandbox_id`` is not one.
+
+    Review W7 / W7-3: the refusal used to be visible in the worker's log only
+    (``_report_reconcile_summary``) and had no exit an operator could reach
+    once the control plane had released the record -- ``force`` on the API
+    then answers 404, because the node hosting the tree is exactly what the
+    released record no longer says. The entry carries the reason a teardown
+    refuses the tree and the project ids involved, so parking it is an
+    informed, bounded action rather than a guess.
+
+    Two shapes count as "refused": a tree whose own ``sandbox.json``
+    contradicts the directory it lives in, and a sandbox-shaped tree with no
+    readable record at all (the leftover an interrupted teardown leaves --
+    with no record there is no project id the GC could release, which is why
+    it is reported instead of torn down). A missing or *healthy* tree is
+    returned as ``(None, reason)``: parking it would be acting on a tree the
+    product still owns.
+    """
+    base = Path(settings.workspace_base)
+    entry = base / sandbox_id
+    if not is_sandbox_workspace_dir(entry):
+        return None, (
+            f"{entry} is not a sandbox workspace tree on this worker"
+        )
+    try:
+        record = runtime_registry.peek(sandbox_id)
+    except Exception:  # pragma: no cover - defensive
+        record = None
+    if record is None:
+        return (
+            {
+                "sandbox_id": sandbox_id,
+                "reason": "it has no readable sandbox.json",
+                "disk_project_id": _disk_project_id_or_none(entry),
+                "claimed_project_ids": [],
+            },
+            None,
+        )
+    try:
+        plan, reason = _verified_teardown_plan(
+            base,
+            sandbox_id,
+            record,
+            shared_volume_root=settings.shared_volume_root,
+            context="untrusted",
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        plan, reason = None, f"its targets cannot be verified: {exc}"
+    if plan is not None:
+        return None, (
+            "its sandbox.json describes the tree it lives in: it is a healthy "
+            "tree this worker would tear down itself, not a refused one"
+        )
+    return (
+        {
+            "sandbox_id": sandbox_id,
+            "reason": reason,
+            "disk_project_id": _disk_project_id_or_none(entry),
+            "claimed_project_ids": sorted(projids_in_record(record.to_dict())),
+        },
+        None,
+    )
+
+
+def _disk_project_id_or_none(path: Path) -> int | None:
+    """The project id the disk reports, or ``None`` when it cannot be asked."""
+    try:
+        return directory_project_id(path)
+    except ProjectQuotaError:
+        return None
+
+
+def _untrusted_workspace_trees(settings: Settings, runtime_registry) -> list[dict]:
+    """Every tree on this worker that a teardown would refuse (W7-3).
+
+    The listing ``GET /agent/untrusted`` serves: the operator's positive,
+    greppable view of what the refusal branch (``reconcile: leaving %s on
+    disk``) reported in the log, and the input an informed ``park`` needs.
+    """
+    base = Path(settings.workspace_base)
+    entries: list[dict] = []
+    try:
+        candidates = sorted(base.iterdir())
+    except OSError:  # pragma: no cover - defensive
+        return entries
+    for candidate in candidates:
+        if not is_sandbox_workspace_dir(candidate):
+            continue
+        entry, _reason = _untrusted_entry_for(
+            settings, runtime_registry, candidate.name
+        )
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def _park_refused_tree(
+    settings: Settings, sandbox_id: str, reason: str
+) -> tuple[int | None, str | None]:
+    """Park a tree this worker refuses to act on, and free the row it pinned.
+
+    Review W7 / W7-3's bounded exit. A record that contradicts the disk must
+    not be acted on (it may be describing a bind-mounted other tenant's tree,
+    which is what the refusal protects), and once the control plane has
+    released the record (eviction, TTL, a worker that was unreachable) there
+    is no API ``force`` left to reach it with. Left where they are, those
+    trees are a permanent pin: their own ``sandbox.json`` keeps the project
+    ids they claim in ``xfs_quota._recorded_projids`` ("still live"), so the
+    fail-safe reconcile never drops the row.
+
+    The exit is a *move*, never a delete:
+
+    * the tree goes to ``<base>/_untrusted.trees/<id>`` -- out of the
+      top-level scan (the name cannot be a sandbox id, so the quarantine can
+      never land inside a live sandbox's workspace), payload intact, with a
+      ``.reason`` marker next to it, so an operator can see what was refused
+      and why;
+    * the project id released is the one the *disk* reports for the tree
+      (read before the move; a rename keeps the inode's project id), never one
+      the record claims -- the same rule every other teardown follows;
+    * nothing is deleted: if the path is a mount point (``EBUSY``) or the
+      move fails for any other reason, the tree stays exactly where it was
+      and the caller gets the failure.
+
+    Returns ``(released_projid, error)``: ``error`` is set when the tree could
+    not be parked, in which case nothing was touched.
+    """
+    base = Path(settings.workspace_base)
+    source = base / sandbox_id
+    quarantine = base / UNTRUSTED_TREE_DIR
+    try:
+        if not source.is_dir() or source.is_symlink():
+            return None, f"{source} is not a directory"
+        try:
+            # Disk truth, read while the tree is still where the records put
+            # it (the probes' fake table, like ``lsattr``, is path-keyed).
+            projid = directory_project_id(source)
+        except ProjectQuotaError as exc:
+            logger.warning(
+                "park: %s: cannot read its project id from the disk (%s); "
+                "parking it without a release",
+                sandbox_id,
+                exc,
+            )
+            projid = None
+        quarantine.mkdir(parents=True, exist_ok=True)
+        dest = quarantine / sandbox_id
+        if dest.exists() or dest.is_symlink():
+            # A previous attack already parked one under this id: keep both
+            # trees, and keep the audit trail readable.
+            dest = quarantine / f"{sandbox_id}.{time.time_ns()}"
+        os.replace(source, dest)  # same filesystem: a rename, never a copy
+        try:
+            (quarantine / f"{dest.name}.reason").write_text(
+                f"{time.time():.0f}\t{sandbox_id}\t{reason}\n", encoding="utf-8"
+            )
+        except OSError:
+            logger.warning(
+                "park: %s: could not write its reason marker",
+                sandbox_id,
+                exc_info=True,
+            )
+    except OSError as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    if projid is not None:
+        try:
+            release_project(
+                project_dir=dest,
+                mount_point=settings.workspace_base,
+                projid=projid,
+                via_agent=settings.quota_via_agent,
+            )
+        except ProjectQuotaError as exc:
+            logger.warning(
+                "park: %s: its project %s could not be released (%s); the "
+                "fail-safe reconcile takes the row now that the tree is out "
+                "of the workspace scan",
+                sandbox_id,
+                projid,
+                exc,
+            )
+    logger.warning(
+        "park: moved the refused tree %s to %s (payload kept, project %s "
+        "released)",
+        sandbox_id,
+        UNTRUSTED_TREE_DIR,
+        projid,
+    )
+    return projid, None
 
 
 def _registry_workspace_base(runtime_registry, settings: Settings) -> Path:
@@ -602,6 +891,17 @@ def _delete_sandbox_runtime(
                 )
                 if unregister:
                     runtime_registry.unregister(sandbox_id)
+                    # The just-unregistered marker covers the teardown itself
+                    # (race B): nothing is being torn down here, and the record
+                    # file stays on disk on purpose, so the marker has to go
+                    # with the refusal. Leaving it armed made
+                    # ``RuntimeRegistry.get()`` answer ``None`` for this id for
+                    # the next ``UNREGISTER_TOMBSTONE_S`` seconds, and the next
+                    # delete then read "no record" as "nothing to verify" and
+                    # deleted the very files the refusal promised to keep
+                    # (review W7 / W7-1). Release it before the raise: an
+                    # exception is not a teardown.
+                    _release_teardown_tombstone(runtime_registry, sandbox_id)
                 raise SandboxTeardownRefused(
                     f"refusing to tear down {sandbox_id}: {reason}"
                 )
@@ -649,7 +949,31 @@ def _delete_sandbox_runtime(
         # 0700 subdirs, root-owned leftovers from before the cut-over).
         from envd_service import priv_helpers
 
-        priv_helpers.remove_tree(workspace_dir)
+        # ``on_error="raise"`` (review W7 / W7-2): a silent failure here used to
+        # be indistinguishable from success, so a tree the worker could not
+        # remove still ended in "the record is gone and the tree is not". The
+        # broker is the fallback; when even it cannot remove the tree, the
+        # caller has to see a failure rather than a 204.
+        try:
+            priv_helpers.remove_tree(workspace_dir, on_error="raise")
+        except Exception as exc:
+            # The in-process ``rmtree`` failed *and* the brokers were absent,
+            # refused, or failed too (W7-4 is what makes the broker branch
+            # reachable at all). Name it, so the endpoint answers 500 with the
+            # reason instead of an unhandled traceback.
+            raise SandboxTreeNotRemoved(
+                f"the workspace of {sandbox_id} could not be removed "
+                f"({workspace_dir}): {type(exc).__name__}: {exc}"
+            ) from exc
+        if workspace_dir.exists():  # pragma: no branch - defensive re-check
+            # A broker that reported success while the tree survived is a
+            # failure too: "recorded as removed" with the tree still on disk is
+            # the exact shape the GC can never reclaim (it has no record to
+            # read), so it must not be reported as a teardown.
+            raise SandboxTreeNotRemoved(
+                f"the workspace of {sandbox_id} survived its teardown: "
+                f"{workspace_dir} is still on disk"
+            )
     finally:
         # The just-unregistered marker only has to cover the teardown itself
         # (race B): once the tree is gone, its disk record cannot come back.
@@ -1054,8 +1378,10 @@ class NodeAgent:
                 # not evidence of anything: leave the tree alone (it is this
                 # sandbox's own directory) and say so. The runtime is not part
                 # of the record's reach, so it still goes (review W7 / C1-4):
-                # a refusal keeps files, never a process tree. An operator
-                # reclaims the tree itself with an explicit force teardown.
+                # a refusal keeps files, never a process tree. The refusal is
+                # not the end of the story -- see ``GET /agent/untrusted`` and
+                # ``POST /agent/untrusted/{id}/park`` for the operator's
+                # bounded, non-destructive exit (review W7 / W7-3).
                 logger.warning(
                     "reconcile: leaving %s on disk: %s",
                     sandbox_id,
@@ -1496,7 +1822,86 @@ async def agent_delete_sandbox(
         # reclaims it from the disk alone -- the bounded exit of this refusal
         # (review W7 / C1-3).
         return Response(status_code=409, content=str(exc))
+    except SandboxTreeNotRemoved as exc:
+        # The tree survived the in-process removal *and* the e2b-maint
+        # fallback (review W7 / W7-4): the teardown did not happen, so it must
+        # not be answered with a 204 that makes the control plane drop the
+        # record of a tree that is still on the disk. 500 with the reason.
+        logger.warning("agent delete %s failed: %s", sandbox_id, exc)
+        return Response(status_code=500, content=str(exc))
     return Response(status_code=204)
+
+
+@router.get("/agent/untrusted")
+async def agent_list_untrusted(request: Request) -> Response:
+    """The trees this worker refuses to tear down, with the reason (W7-3).
+
+    The refusal branch of the orphan-tree GC keeps a contradicting tree's
+    files and only *reports* it (``reconcile: leaving <id> on disk: <reason>``,
+    the ``untrusted_records`` field of the reconcile summary). Once the control
+    plane has released the sandbox record -- an eviction, a TTL, a kill while
+    this worker was unreachable -- there is no API ``force`` left to reclaim
+    it with, because the record is what named the node. This listing is the
+    positive answer: an operator (or the control plane) can ask a worker what
+    it is holding back, and ``POST /agent/untrusted/{id}/park`` is the bounded
+    exit. Internal key only, like every other agent route.
+    """
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    entries = _untrusted_workspace_trees(
+        settings, request.app.state.runtime_registry
+    )
+    return JSONResponse({"untrusted": entries})
+
+
+@router.post("/agent/untrusted/{sandbox_id}/park")
+async def agent_park_untrusted(sandbox_id: str, request: Request) -> Response:
+    """Move a refused tree out of the sandbox namespace; never delete it.
+
+    The bounded exit of review W7 / W7-3. ``<base>/<id>`` is renamed to
+    ``<base>/_untrusted.trees/<id>`` (a name that cannot be a sandbox id, so
+    it is out of every workspace scan and can never be created inside a live
+    sandbox's workspace), a ``.reason`` marker is written next to it, and the
+    project id *the disk reports* is released -- so the quota row the tree's
+    own record pinned becomes reclaimable by the fail-safe reconcile. The
+    payload is kept: this action exists because the tree may be holding
+    another tenant's data behind a rewritten record, and destroying it is
+    exactly what the refusal is for.
+
+    * ``404``: ``sandbox_id`` is not a tree this worker refuses (see
+      ``GET /agent/untrusted``) -- including a healthy tree, which is never
+      parked.
+    * ``409``: the tree could not be moved (a mount point, a filesystem
+      error); nothing was touched.
+    * ``200``: the tree is parked; the body names the project id released.
+    """
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    entry, reason = _untrusted_entry_for(
+        settings, request.app.state.runtime_registry, sandbox_id
+    )
+    if entry is None:
+        return Response(status_code=404, content=reason)
+    projid, error = _park_refused_tree(settings, sandbox_id, entry["reason"])
+    if error is not None:
+        return Response(
+            status_code=409,
+            content=f"cannot park {sandbox_id}: {error}",
+        )
+    return JSONResponse(
+        {
+            "sandbox_id": sandbox_id,
+            "reason": entry["reason"],
+            "parked_at": f"{UNTRUSTED_TREE_DIR}/{sandbox_id}",
+            "released_project_id": projid,
+        }
+    )
 
 
 def _agent_set_paused(
