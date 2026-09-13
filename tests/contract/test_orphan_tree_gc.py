@@ -26,6 +26,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -73,6 +74,30 @@ def _envd_settings(workspace: Path, **overrides) -> EnvdSettings:
         quota_via_agent=True,
         **overrides,
     )
+
+
+class _OnlyThisThread(logging.Filter):
+    """Keep the log records this test's own thread emitted.
+
+    ``caplog`` is a handler on the root logger, so it records *every* thread's
+    output. A full-directory run has the session-scoped harness workers next
+    door (``multinode_servers``, started by ``test_command_logs.py``)
+    heartbeating and reconciling in uvicorn's threads for the rest of the
+    session, and their ``envd_service.agent`` lines used to land in this
+    file's exact log assertions -- ``Left contains 2 more items`` with two
+    ``reconcile summary`` lines nobody in this test asked for. The worker
+    under test runs on this test's own event loop, i.e. in this thread.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.thread == threading.get_ident()
+
+
+@pytest.fixture(autouse=True)
+def _owned_log_capture(caplog):
+    """Scope ``caplog`` to this test's thread (see ``_OnlyThisThread``)."""
+    caplog.handler.addFilter(_OnlyThisThread())
+    yield caplog
 
 
 class _QuotaFake:
@@ -257,16 +282,96 @@ def _stack(workspace: Path, *, nodes: tuple[str, ...] = ("node_a",)):
     return control_nodes, registry, control_app
 
 
-def _agent(workspace: Path, **settings_overrides) -> NodeAgent:
+def _agent(
+    workspace: Path, *, metrics_provider=None, **settings_overrides
+) -> NodeAgent:
     """A freshly started worker (empty in-memory registry) on ``workspace``."""
     agent = NodeAgent(
         settings=_envd_settings(workspace, **settings_overrides),
         runtime_registry=RuntimeRegistry(workspace),
         control_plane_url="http://control",
         node_address="http://127.0.0.1:1",
+        metrics_provider=metrics_provider,
     )
     agent._node_id = "node_a"
     return agent
+
+
+def _foreign_agent(workspace: Path, metrics_provider=None) -> NodeAgent:
+    """A second worker whose heartbeats never reach this test's control plane.
+
+    Its address is unreachable, so it stays on the failed-heartbeat path: one
+    heartbeat round per wait, no reconcile, nothing of this test's touched.
+    """
+    agent = NodeAgent(
+        settings=_envd_settings(workspace),
+        runtime_registry=RuntimeRegistry(workspace),
+        control_plane_url="http://127.0.0.1:1",
+        node_address="http://127.0.0.1:1",
+        metrics_provider=metrics_provider,
+    )
+    agent._node_id = "node_foreign"
+    return agent
+
+
+def _tick(rounds: list[int]) -> dict:
+    """A ``metrics_provider`` that records one entry per heartbeat round."""
+
+    def metrics() -> dict:
+        rounds.append(len(rounds) + 1)
+        return {}
+
+    return metrics
+
+
+class _ForeignHeartbeat:
+    """A ``NodeAgent`` heartbeat loop running in its own thread and loop.
+
+    This is the shape a full-directory run has anyway: the session-scoped
+    ``multinode_servers`` harness (started by
+    ``tests/contract/test_command_logs.py``) boots real worker agents in
+    uvicorn's threads and leaves them heartbeating for the rest of the
+    session, long after their own tests are done.
+    """
+
+    def __init__(self, workspace: Path) -> None:
+        self.rounds = 0
+        self.first_round = threading.Event()
+        self._workspace = Path(workspace)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _tick(self) -> dict:
+        self.rounds += 1
+        self.first_round.set()
+        return {}
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        foreign = _foreign_agent(self._workspace, self._tick)
+        self._task = loop.create_task(foreign._loop())
+        try:
+            loop.run_until_complete(self._task)
+        except asyncio.CancelledError:  # the only way this loop ends
+            pass
+        finally:
+            loop.close()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    async def wait_for_first_round(self) -> None:
+        loop = asyncio.get_running_loop()
+        if not await loop.run_in_executor(None, self.first_round.wait, 30.0):
+            raise AssertionError("the foreign heartbeat loop never ran a round")
+
+    def stop(self) -> None:
+        if self._loop is not None and self._task is not None:
+            self._loop.call_soon_threadsafe(self._task.cancel)
+        self._thread.join(timeout=10)
 
 
 def _client(app) -> httpx.AsyncClient:
@@ -321,11 +426,29 @@ def _install_disk_projids(
     return calls
 
 
-def _patch_loop_transport(monkeypatch, control_app) -> None:
-    """Point ``NodeAgent._loop``'s own ``httpx.AsyncClient`` at the app."""
+def _is_driven(driven) -> bool:
+    """Whether the caller is the loop under test (``driven``'s task)."""
+    try:
+        return asyncio.current_task() is driven
+    except RuntimeError:  # no running loop: the caller is sync code
+        return False
+
+
+def _patch_loop_transport(monkeypatch, control_app, *, driven) -> None:
+    """Point the loop under test's own ``httpx.AsyncClient`` at the app.
+
+    ``httpx`` is patched on the module the agent imports it from, which is
+    process-wide, so the redirection is scoped to ``driven``: a full-directory
+    run has session-scoped harness workers (``multinode_servers``, started by
+    ``test_command_logs.py``) heartbeating in uvicorn's threads for the rest
+    of the session, and an unscoped patch re-pointed *their* clients at this
+    test's control plane.
+    """
     real_client = httpx.AsyncClient
 
     def factory(*args, **kwargs):
+        if not _is_driven(driven):
+            return real_client(*args, **kwargs)
         kwargs.pop("timeout", None)
         return real_client(
             transport=httpx.ASGITransport(app=control_app),
@@ -336,20 +459,31 @@ def _patch_loop_transport(monkeypatch, control_app) -> None:
     monkeypatch.setattr(httpx, "AsyncClient", factory)
 
 
-def _patch_loop_sleep(monkeypatch, hook) -> None:
+def _patch_loop_sleep(monkeypatch, hook, *, driven) -> None:
     """Drive ``NodeAgent._loop``'s 5s heartbeat sleep from the test.
 
     Only ``asyncio``'s attribute inside ``envd_service.agent`` is replaced
     (by a proxy that forwards everything else), so the loop's own waits are
     what the test controls: ``hook(interval)`` runs once per heartbeat
-    interval, and the sub-second waits of the quota reclaim stay instant.
+    interval of the loop under test, and its sub-second waits (the quota
+    reclaim's) stay instant.
+
+    The hook is scoped to ``driven`` because ``envd_service.agent.asyncio``
+    is a *module* attribute: it reaches every ``NodeAgent`` loop in the
+    process, and the harness workers above heartbeat in the very rounds this
+    contract counts (their traffic shows up as ``rounds=[1, 2, 6, 14]`` and
+    the shape goes red only when the whole directory runs). Every other loop
+    keeps its real 5s cadence and its real client.
     """
     real_sleep = asyncio.sleep
 
     async def fake_sleep(delay, *args, **kwargs):
-        if delay >= 1.0:
-            await hook(delay)
-        await real_sleep(0)
+        if _is_driven(driven):
+            if delay >= 1.0:
+                await hook(delay)
+            await real_sleep(0)
+            return
+        await real_sleep(delay)
 
     class _AsyncioProxy:
         def __getattr__(self, name):
@@ -499,7 +633,7 @@ async def test_restart_reclaims_an_unowned_tree_and_its_quota_row(
         ["lsattr", "-p", "-d", str(sandbox_dir)],
         ["lsattr", "-p", "-d", str(volume_slice / sandbox_id)],
     ]
-    assert [record.message for record in caplog.records] == [
+    assert _agent_messages(caplog) == [
         f"reconcile: removing orphan runtime {sandbox_id} (not in control plane)",
     ]
 
@@ -534,7 +668,7 @@ async def test_quota_reclaim_is_bounded_and_reported_when_accounting_never_settl
     assert (
         f"reconcile: 1 quota row(s) not reclaimed after "
         f"{agent_mod._QUOTA_RECLAIM_ATTEMPTS} attempt(s): [{STRANDED_PROJID}]"
-    ) in [record.message for record in caplog.records]
+    ) in _agent_messages(caplog)
 
     quota.defer_rounds = 0
     async with _client(control_app) as raw:
@@ -673,7 +807,7 @@ async def test_gc_protects_paused_migrating_and_reserved_entries(
         "quota_cleaned": [],
         "quota_unreclaimed": [],
     }
-    assert [record.message for record in caplog.records] == []
+    assert _agent_messages(caplog) == []
 
 
 @pytest.mark.asyncio
@@ -761,7 +895,7 @@ async def test_snapshot_store_directory_is_spared_by_its_shape(
     assert disk_calls == [
         ["lsattr", "-p", "-d", str(orphan_dir)],
     ]
-    assert [record.message for record in caplog.records] == [
+    assert _agent_messages(caplog) == [
         f"reconcile: removing orphan runtime {orphan_id} (not in control plane)",
     ]
 
@@ -841,7 +975,7 @@ async def test_a_client_chosen_prefixed_id_is_reclaimed_not_stranded(
         (str(by_id[sandbox_id][0]), by_id[sandbox_id][1])
         for sandbox_id in sorted([chosen_id, orphan_id])
     ]
-    assert [record.message for record in caplog.records] == [
+    assert _agent_messages(caplog) == [
         f"reconcile: removing orphan runtime {sandbox_id} "
         f"(not in control plane)"
         for sandbox_id in sorted([chosen_id, orphan_id])
@@ -913,7 +1047,7 @@ async def test_a_whole_tree_copy_under_a_snapshot_id_is_refused(
         "quota_cleaned": [],
         "quota_unreclaimed": [],
     }
-    assert [record.message for record in caplog.records] == [
+    assert _agent_messages(caplog) == [
         f"reconcile: leaving {snap_id} on disk: its sandbox.json names "
         f"sandbox {source_id!r}",
     ]
@@ -1022,7 +1156,7 @@ async def test_trees_without_a_readable_record_are_reported_never_deleted(
         "quota_cleaned": [],
         "quota_unreclaimed": [],
     }
-    assert [record.message for record in caplog.records] == [
+    assert _agent_messages(caplog) == [
         f"reconcile: cannot read the sandbox record of {empty}",
         "reconcile: 3 sandbox tree(s) on disk have no readable sandbox.json "
         "and were left alone: sbx_corrupt_record,sbx_empty_record,sbx_no_record",
@@ -1087,7 +1221,7 @@ async def test_one_failing_tree_does_not_abort_the_round(
         "quota_unreclaimed": [],
     }
     assert client.posts == [{"sandboxIDs": [], "snapshotIDs": []}]
-    assert [record.message for record in caplog.records] == [
+    assert _agent_messages(caplog) == [
         f"reconcile: removing orphan runtime {failing_id} (not in control plane)",
         f"reconcile: orphan runtime {failing_id} teardown failed; continuing",
         f"reconcile: removing orphan runtime {surviving_id} (not in control plane)",
@@ -1228,7 +1362,7 @@ async def test_incomplete_fleet_enumeration_aborts_the_disk_sweep(
     # until the process restarts (M1).
     assert agent._reconcile_retry_in == 1
     assert agent._reconcile_retry_attempts == 1
-    assert [record.message for record in caplog.records] == [
+    assert _agent_messages(caplog) == [
         "reconcile: fleet sandbox enumeration is incomplete "
         "(0 of 1 records accounted for)",
         "reconcile: leaving 1 orphan tree(s) on disk alone this round "
@@ -1301,7 +1435,6 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
 
     agent = _agent(workspace)
     agent._node_id = None  # the loop registers before its first round
-    _patch_loop_transport(monkeypatch, control_app)
     rounds = 0
     skipped_rounds: list[int] = []
     sweep_round: int | None = None
@@ -1311,9 +1444,9 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
         nonlocal rounds, sweep_round
         rounds += 1
         deferred = [
-            record.message
-            for record in caplog.records
-            if record.message.startswith("reconcile: disk sweep deferred")
+            message
+            for message in _agent_messages(caplog)
+            if message.startswith("reconcile: disk sweep deferred")
         ]
         if len(deferred) > len(skipped_rounds):
             skipped_rounds.append(rounds)
@@ -1327,8 +1460,9 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
             parked.set()
             await asyncio.sleep(3600)
 
-    _patch_loop_sleep(monkeypatch, hook)
     task = asyncio.create_task(agent._loop())
+    _patch_loop_transport(monkeypatch, control_app, driven=task)
+    _patch_loop_sleep(monkeypatch, hook, driven=task)
     try:
         await asyncio.wait_for(parked.wait(), timeout=30)
     finally:
@@ -1341,9 +1475,9 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
     assert orphan_dir.exists() is False
     assert quota.rows == {}
     assert [
-        record.message
-        for record in caplog.records
-        if record.message.startswith("reconcile: disk sweep deferred")
+        message
+        for message in _agent_messages(caplog)
+        if message.startswith("reconcile: disk sweep deferred")
     ] == [
         "reconcile: disk sweep deferred by an incomplete fleet enumeration; "
         "retrying in 1 heartbeat interval(s) (attempt 1)",
@@ -1353,9 +1487,9 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
     # L1: every round publishes its summary at INFO, so the fields that only
     # exist in the summary are a positive signal and not just WARNING text.
     assert [
-        record.message
-        for record in caplog.records
-        if record.message.startswith("reconcile summary")
+        message
+        for message in _agent_messages(caplog)
+        if message.startswith("reconcile summary")
     ] == [
         "reconcile summary: deleted=0 delete_failures=0 unmaterialised=0 "
         "protected_elsewhere=0 concurrent_creates=0 quota_cleaned=0 "
@@ -1396,7 +1530,6 @@ async def test_deferred_disk_sweep_backs_off_instead_of_polling_every_heartbeat(
 
     agent = _agent(workspace)
     agent._node_id = None
-    _patch_loop_transport(monkeypatch, control_app)
     rounds = 0
     attempt_rounds: list[int] = []
     parked = asyncio.Event()
@@ -1405,9 +1538,9 @@ async def test_deferred_disk_sweep_backs_off_instead_of_polling_every_heartbeat(
         nonlocal rounds
         rounds += 1
         deferred = [
-            record.message
-            for record in caplog.records
-            if record.message.startswith("reconcile: disk sweep deferred")
+            message
+            for message in _agent_messages(caplog)
+            if message.startswith("reconcile: disk sweep deferred")
         ]
         if len(deferred) > len(attempt_rounds):
             attempt_rounds.append(rounds)
@@ -1415,8 +1548,9 @@ async def test_deferred_disk_sweep_backs_off_instead_of_polling_every_heartbeat(
             parked.set()
             await asyncio.sleep(3600)
 
-    _patch_loop_sleep(monkeypatch, hook)
     task = asyncio.create_task(agent._loop())
+    _patch_loop_transport(monkeypatch, control_app, driven=task)
+    _patch_loop_sleep(monkeypatch, hook, driven=task)
     try:
         await asyncio.wait_for(parked.wait(), timeout=30)
     finally:
@@ -1426,9 +1560,9 @@ async def test_deferred_disk_sweep_backs_off_instead_of_polling_every_heartbeat(
 
     assert attempt_rounds == [1, 2, 4, 8]
     assert [
-        record.message
-        for record in caplog.records
-        if record.message.startswith("reconcile: disk sweep deferred")
+        message
+        for message in _agent_messages(caplog)
+        if message.startswith("reconcile: disk sweep deferred")
     ] == [
         "reconcile: disk sweep deferred by an incomplete fleet enumeration; "
         f"retrying in {delay} heartbeat interval(s) (attempt {attempt})"
@@ -1438,6 +1572,82 @@ async def test_deferred_disk_sweep_backs_off_instead_of_polling_every_heartbeat(
     assert orphan_dir.exists()
     assert quota.rows == {4201: 8}
     assert quota.reconcile_calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_heartbeat_hook_counts_only_the_loop_under_test(
+    workspace, monkeypatch
+):
+    """W5: the driven loop's rounds are its own, whatever else heartbeats.
+
+    ``envd_service.agent.asyncio`` is a *module* attribute, so the seam the
+    two contracts above install reaches every ``NodeAgent`` loop in the
+    process. A full directory has a second agent heartbeating next door: the
+    session-scoped ``multinode_servers`` harness (booted by
+    ``test_command_logs.py``) leaves real worker agents in uvicorn's threads
+    for the rest of the session, and while their waits counted as rounds the
+    M1 contracts went red only when the whole directory ran
+    (``attempt_rounds=[4, 10]`` instead of ``[1, 2, 4, 8]``, with another
+    node id's heartbeat traffic in the same log).
+
+    Three loops are alive here -- the one under test, a second ``NodeAgent``
+    in this event loop, and a third in its own thread -- and the hook sees
+    exactly the driven loop's four heartbeats.
+    """
+    nodes, _registry, control_app = _stack(workspace)
+    driven_rounds: list[int] = []
+    driven = _agent(workspace, metrics_provider=_tick(driven_rounds))
+    driven._reconcile_pending = False  # this contract counts heartbeats only
+    in_loop_rounds: list[int] = []
+    first_in_loop_round = asyncio.Event()
+
+    def in_loop_metrics() -> dict:
+        in_loop_rounds.append(len(in_loop_rounds) + 1)
+        first_in_loop_round.set()
+        return {}
+
+    foreign_in_loop = asyncio.create_task(
+        _foreign_agent(workspace, in_loop_metrics)._loop()
+    )
+    await asyncio.wait_for(first_in_loop_round.wait(), timeout=30)
+    foreign_thread = _ForeignHeartbeat(workspace)
+    foreign_thread.start()
+    await foreign_thread.wait_for_first_round()
+
+    rounds = 0
+    counted_from: set[object] = set()
+    parked = asyncio.Event()
+
+    async def hook(interval):
+        nonlocal rounds
+        rounds += 1
+        counted_from.add(asyncio.current_task())
+        if rounds >= 4:
+            parked.set()
+            await asyncio.sleep(3600)
+
+    task = asyncio.create_task(driven._loop())
+    _patch_loop_transport(monkeypatch, control_app, driven=task)
+    _patch_loop_sleep(monkeypatch, hook, driven=task)
+    try:
+        await asyncio.wait_for(parked.wait(), timeout=30)
+    finally:
+        for pending in (task, foreign_in_loop):
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending
+        foreign_thread.stop()
+
+    # The hook fired once per heartbeat of the loop under test...
+    assert rounds == 4
+    assert counted_from == {task}
+    assert driven_rounds == [1, 2, 3, 4]
+    # ...while both foreign loops really were heartbeating in this process,
+    # each on its own wait, and neither was re-pointed at this test's control
+    # plane.
+    assert len(in_loop_rounds) >= 1
+    assert foreign_thread.rounds >= 1
+    assert sorted(node.node_id for node in nodes.list()) == ["node_a"]
 
 
 @pytest.mark.asyncio
@@ -1640,7 +1850,7 @@ async def test_record_pointing_at_another_tree_is_refused(
     assert summary["deleted"] == []
     assert summary["untrusted_records"] == [tamper_id]
     assert summary["disk_sweep_skipped"] == []
-    assert [record.message for record in caplog.records] == [
+    assert _agent_messages(caplog) == [
         f"reconcile: leaving {tamper_id} on disk: its sandbox.json names "
         f"sandbox {victim_id!r}",
     ]
@@ -1691,7 +1901,7 @@ async def test_record_whose_project_id_contradicts_the_disk_is_refused(
     assert victim_dir.exists()
     assert summary["deleted"] == []
     assert summary["untrusted_records"] == [liar_id]
-    assert [record.message for record in caplog.records] == [
+    assert _agent_messages(caplog) == [
         f"reconcile: leaving {liar_id} on disk: its sandbox.json claims "
         f"project id {VICTIM_PROJID} but the disk says 7001",
     ]
@@ -1783,7 +1993,7 @@ async def test_volume_entry_naming_another_sandbox_slice_is_refused(
     assert liar_dir.exists() is False
     assert summary["deleted"] == [liar_id]
     assert summary["untrusted_records"] == []
-    assert [record.message for record in caplog.records] == [
+    assert _agent_messages(caplog) == [
         f"reconcile: refusing a volume entry of {liar_id}: {victim_slice} is "
         "not a slice of this sandbox",
         f"reconcile: refusing the volume slice {outside_slice} of {liar_id}: "
@@ -1823,7 +2033,7 @@ async def test_teardown_without_a_readable_project_id_still_reclaims_the_tree(
     assert summary["deleted"] == [sandbox_id]
     assert summary["quota_cleaned"] == [8301]
     assert summary["quota_unreclaimed"] == []
-    assert [record.message for record in caplog.records] == [
+    assert _agent_messages(caplog) == [
         f"reconcile: cannot ask the disk for the project id of {sandbox_dir} "
         f"(lsattr failed for {sandbox_dir}: simulated lsattr failure); "
         "reclaiming it without releasing its quota row",
@@ -1893,7 +2103,7 @@ async def test_in_memory_record_cached_from_a_rewritten_json_is_refused(
     assert tamper_dir.exists()
     assert summary["deleted"] == []
     assert summary["untrusted_records"] == [tamper_id]
-    assert [record.message for record in caplog.records] == [
+    assert _agent_messages(caplog) == [
         f"reconcile: leaving {tamper_id} on disk: its sandbox.json points at "
         f"{victim_dir}",
     ]
@@ -1945,12 +2155,25 @@ def _gone_reason(path: Path) -> str:
 
 
 def _agent_lines(caplog) -> list[tuple[str, str]]:
-    """The agent's own lines: ``caplog`` also records ``httpx`` at INFO."""
+    """The agent's own lines, in order.
+
+    ``caplog`` is a handler on the root logger: besides this worker's lines it
+    also records ``httpx`` at INFO, other ``envd_service`` loggers (the disk
+    watermark warning fires on a nearly full host disk) and -- in a
+    full-directory run -- the session-scoped harness workers next door. Only
+    the ``envd_service.agent`` records of *this* thread are this worker's
+    (``_OnlyThisThread`` scopes the capture).
+    """
     return [
         (record.levelname, record.message)
         for record in caplog.records
         if record.name == "envd_service.agent"
     ]
+
+
+def _agent_messages(caplog) -> list[str]:
+    """``_agent_lines`` without the level, for the exact-list contracts."""
+    return [message for _level, message in _agent_lines(caplog)]
 
 
 @pytest.mark.asyncio
