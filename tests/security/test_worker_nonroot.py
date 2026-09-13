@@ -209,13 +209,25 @@ def test_worker_nonroot_sandbox_network_rootfs_all_green(worker_image) -> None:
         _chown_all(rootfs, WORKER_UID, WORKER_UID)
         _chown_all(probe_ws, WORKER_UID, WORKER_UID)
         probe_src = bind_root / probe_ws.relative_to(PROJECT_ROOT)
-        rootfs_src = bind_root / rootfs.relative_to(PROJECT_ROOT)
         repo_src = bind_root
 
-        result = _run(
+        # The exported rootfs is handed over *through the daemon* (``docker
+        # cp`` into the container's own writable layer), not as a bind mount of
+        # a just-written host-shared tree. The bind shape made the probe's view
+        # of its own rootfs a host-file-server read of a tree that had just
+        # been materialized, which is the one link in this probe that can be
+        # observed before every entry is visible there -- surfacing as the
+        # cryptic ``execvp '/bin/echo': No such file or directory`` inside the
+        # sandbox while the tree was complete on the host (docs/HANDOFF.md's
+        # ``worker_nonroot`` / ``docker export`` flake family). ``docker cp``
+        # finishes inside the daemon before it returns, and the container then
+        # drops to the worker uid itself, so both the ownership and the
+        # completeness of the probe's view are set by construction; the probe
+        # additionally re-verifies that view from its own process before it
+        # chroots.
+        created = _run(
             "docker",
-            "run",
-            "--rm",
+            "create",
             "--privileged",
             "--security-opt",
             "seccomp=unconfined",
@@ -223,25 +235,43 @@ def test_worker_nonroot_sandbox_network_rootfs_all_green(worker_image) -> None:
             "NET_ADMIN",
             "--network",
             "host",
+            # Root for the handoff (chown of the copied tree), then setpriv
+            # down to the worker uid for the probe itself -- the image's
+            # default USER would otherwise decide the order for us.
             "--user",
-            f"{WORKER_UID}:{WORKER_UID}",
+            "0:0",
             "-v",
             f"{repo_src}:/workspace:ro",
             "-v",
             f"{probe_src}:/probe",
-            "-v",
-            f"{rootfs_src}:/rootfs",
             "-w",
             "/workspace",
             "-e",
             "PYTHONPATH=/workspace",
             worker_image,
-            "python",
-            "/workspace/tests/security/worker_nonroot_probe.py",
-            str(WORKER_UID),
-            "/probe",
-            "/rootfs",
+            "sh",
+            "-c",
+            (
+                f"chown -R {WORKER_UID}:{WORKER_UID} /rootfs && "
+                f"exec setpriv --reuid {WORKER_UID} --regid {WORKER_UID} "
+                "--clear-groups python "
+                "/workspace/tests/security/worker_nonroot_probe.py "
+                f"{WORKER_UID} /probe /rootfs"
+            ),
         )
+        assert created.returncode == 0, created.stderr
+        container_id = created.stdout.strip()
+        assert container_id, created.stdout
+        try:
+            # ``/.`` copies the *contents* of the tree into /rootfs, matching
+            # the bind mount the probe used to receive.
+            copied = _run(
+                "docker", "cp", f"{rootfs}/.", f"{container_id}:/rootfs"
+            )
+            assert copied.returncode == 0, copied.stderr
+            result = _run("docker", "start", "-a", container_id)
+        finally:
+            _run("docker", "rm", "-f", container_id)
         assert result.returncode == 0, (
             f"non-root worker probe failed (exit {result.returncode}):\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"

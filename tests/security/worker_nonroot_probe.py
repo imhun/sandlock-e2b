@@ -17,6 +17,7 @@ reported with exact evidence on stderr.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -111,6 +112,39 @@ def main() -> int:
 
     rootfs_ws = base / "rootfs"
     rootfs_ws.mkdir(exist_ok=True)
+    # Precondition, not a retry: prove *this process's* view of the handed-over
+    # rootfs carries the binary the probe is about to exec, loader included.
+    # Executing it here is the strongest available check -- the kernel resolves
+    # both the ELF and its interpreter -- and it turns a materialization or
+    # visibility fault into the named condition instead of an exit=127 inside
+    # the sandbox ("sandlock child: execvp '/bin/echo': No such file or
+    # directory"), which is indistinguishable from a real chroot regression.
+    echo_in_rootfs = ROOTFS / "bin" / "echo"
+    if not echo_in_rootfs.exists():
+        echo_in_rootfs = ROOTFS / "usr" / "bin" / "echo"
+    _check(
+        "rootfs view complete",
+        echo_in_rootfs.exists(),
+        f"{ROOTFS}/bin/echo and {ROOTFS}/usr/bin/echo are both missing",
+    )
+    try:
+        precheck = subprocess.run(
+            [str(echo_in_rootfs), "view-ok"], capture_output=True, timeout=30
+        )
+    except OSError as exc:
+        _check(
+            "rootfs view complete",
+            False,
+            f"{echo_in_rootfs} cannot be executed from this process's view: "
+            f"{type(exc).__name__}: {exc} (its ELF interpreter may be missing)",
+        )
+        raise
+    _check(
+        "rootfs view complete",
+        precheck.returncode == 0 and precheck.stdout == b"view-ok\n",
+        f"{echo_in_rootfs} rc={precheck.returncode} "
+        f"stdout={precheck.stdout!r} stderr={precheck.stderr!r}",
+    )
     result = _run(
         _executor(
             str(rootfs_ws),
