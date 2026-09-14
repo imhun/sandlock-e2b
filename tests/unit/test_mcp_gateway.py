@@ -21,6 +21,8 @@ from envd_service.http.auth import HttpAuthError, http_error_response
 from envd_service.http.mcp import router as mcp_router
 from envd_service.runtime.context import (
     SandboxRuntimeContext,
+    _MCP_PORT_BASE,
+    _MCP_PORT_MAX,
     _watch_mcp_gateway_exit,
 )
 from envd_service.runtime.registry import RuntimeSandbox
@@ -145,7 +147,10 @@ async def test_start_mcp_gateway_allocates_port_writes_token(
     # present) and pushed into the executor as the instance bind ceiling;
     # start_mcp_gateway consumes it instead of allocating again.
     port_at_create = ctx.mcp_port
-    assert port_at_create is not None and port_at_create >= 51000
+    assert port_at_create is not None
+    # The pool's band is outside the kernel's ephemeral range and the harness
+    # pool (tests/unit/test_mcp_port_pool.py pins the band itself).
+    assert _MCP_PORT_BASE < port_at_create <= _MCP_PORT_MAX
 
     await ctx.start_mcp_gateway({"name": "echo", "command": "python3"}, "tok-123")
 
@@ -381,10 +386,11 @@ async def test_gateway_start_failure_logs_error_with_port_and_text(
     ):
         with pytest.raises(RuntimeError, match="gateway start failed"):
             await ctx.start_mcp_gateway({"name": "echo"}, "tok")
-    assert ctx.mcp_port == 51001  # port stays pinned to the sandbox
+    # Port stays pinned to the sandbox (first port of the pool's band).
+    assert ctx.mcp_port == _MCP_PORT_BASE + 1
     assert [r.message for r in caplog.records] == [
         "MCP gateway start failed sandbox_id=sbx_mcp_fail "
-        "port=51001 error_type=RuntimeError error=gateway start failed"
+        f"port={_MCP_PORT_BASE + 1} error_type=RuntimeError error=gateway start failed"
     ]
 
 

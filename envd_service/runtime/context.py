@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,29 @@ from envd_service.runtime.registry import RuntimeSandbox
 
 logger = logging.getLogger(__name__)
 
-_MCP_PORT_BASE = 51000
+#: First port the per-sandbox MCP gateway pool hands out, and the last one.
+#:
+#: The band is squeezed between two constraints, and only one window satisfies
+#: both:
+#:
+#: * **at least 50005** -- under net_isolation the supervisor serves the
+#:   sandbox's ``accept()`` from a host-loopback listener on the same number,
+#:   and sandlock refuses a ``net_bind_map`` host port below 50005
+#:   (``net_bind_map: host port ... is below the reserved inbound mapping range
+#:   (50005+)``, ``sandlock-core/src/sandbox/builder.rs``);
+#: * **outside the kernel's ephemeral range** -- ``ip_local_port_range`` is
+#:   measured as ``32768-60999`` inside the containers, and every outgoing
+#:   connection draws its *source* port from there without asking anyone.
+#:
+#: So the band has to start *above* the ephemeral top: ``61000-65535`` is the
+#: whole window that is both >= 50005 and clear of the range the kernel hands
+#: out on its own. The base was ``51000`` -- inside the ephemeral range, where
+#: the suite's own loopback traffic is given the same numbers, and the gateway
+#: only finds out when it binds, deep inside the sandbox (flake #2's class).
+#: The band is bounded so the pool can never drift back down into that range: a
+#: worker that runs out fails loudly instead of borrowing a shared port.
+_MCP_PORT_BASE = 61000
+_MCP_PORT_MAX = 65535
 _GATEWAY_STDERR_TAIL_BYTES = 4096
 #: Pinned prefix of the SDK-visible text for a gateway that never served
 #: (FUP #4 / Task D1): a contract test asserts this string verbatim.
@@ -115,6 +138,26 @@ async def _watch_mcp_gateway_exit(
     )
 
 
+def _port_bindable(port: int) -> bool:
+    """Whether ``port`` can be bound *right now* in this network namespace.
+
+    The gateway binds ``0.0.0.0:<port>`` inside the sandbox (and under
+    net_isolation the supervisor maps the same number on the worker's
+    loopback, which is what the ``/mcp`` proxy dials), so the probe binds the
+    same wildcard address -- a specific bind would miss a wildcard listener.
+    ``SO_REUSEADDR`` mirrors what asyncio/uvicorn set, so a port a dead
+    gateway left in ``TIME_WAIT`` still counts as free while a live listener
+    never does.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("0.0.0.0", port))
+        except OSError:
+            return False
+    return True
+
+
 class McpPortPool:
     """Allocates per-sandbox MCP gateway ports and reuses freed ones (E6.3).
 
@@ -125,20 +168,50 @@ class McpPortPool:
     pool and the next ``allocate`` reuses it. Allocation and release are
     serialized under a lock, so concurrent sandbox create/delete cannot hand
     out the same port twice.
+
+    Every candidate is *verified* bindable before it is handed out (see
+    :func:`_port_bindable`): a number that another listener already holds --
+    the pool only knows about ports it handed out itself -- must be skipped
+    here, not inside the sandbox where the gateway's bind fails.
     """
 
-    def __init__(self, base: int = _MCP_PORT_BASE) -> None:
+    def __init__(
+        self, base: int = _MCP_PORT_BASE, max_port: int = _MCP_PORT_MAX
+    ) -> None:
         self._base = base
+        self._max = max_port
         self._counter = 0
         self._free: set[int] = set()
         self._lock = threading.Lock()
 
     def allocate(self) -> int:
         with self._lock:
-            if self._free:
-                return self._free.pop()
-            self._counter += 1
-            return self._base + self._counter
+            while True:
+                candidate = self._next_candidate()
+                if _port_bindable(candidate):
+                    return candidate
+                logger.warning(
+                    "MCP gateway port %d is already held; skipping it", candidate
+                )
+
+    def _next_candidate(self) -> int:
+        """The next port to try: a recycled one, else the next unused one.
+
+        Caller holds the lock. A recycled port that turns out to be taken is
+        dropped, not put back: the pool must not remember a number that is no
+        longer its to give.
+        """
+        if self._free:
+            return self._free.pop()
+        if self._base + self._counter >= self._max:
+            raise RuntimeError(
+                f"the MCP gateway port band {self._base + 1}-{self._max} is "
+                f"exhausted ({self._counter} ports held); refusing to allocate "
+                "outside the band, where the kernel's ephemeral range hands out "
+                "the same numbers to outgoing connections"
+            )
+        self._counter += 1
+        return self._base + self._counter
 
     def release(self, port: int | None) -> None:
         """Return ``port`` to the free set, ignoring out-of-range values

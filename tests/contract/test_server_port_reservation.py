@@ -4,9 +4,11 @@ The harness used to probe a free port with ``bind(("127.0.0.1", 0))``, close
 it, and let uvicorn bind that number later. Between the two binds the port is
 free -- and it comes from the kernel's ephemeral range, the same range every
 loopback connection in the suite draws its *source* port from (thousands per
-lane), which is also where the worker's MCP-gateway port pool starts
-(51000). Observed as ``_ServerThread.start`` -> ``RuntimeError: server failed to
-start`` / ``[Errno 98] address already in use`` on a loaded whole-lane round.
+lane), which is also where the worker's MCP-gateway port pool used to start
+(51000; it now sits above the ephemeral top -- see
+``tests/unit/test_mcp_port_pool.py``). Observed as ``_ServerThread.start`` ->
+``RuntimeError: server failed to start`` / ``[Errno 98] address already in
+use`` on a loaded whole-lane round.
 
 The fix hands the *bound listening socket* to uvicorn (``sock=``), which
 removes the window instead of narrowing it, and the pool it draws from sits
@@ -65,10 +67,10 @@ def test_the_harness_port_pool_stays_out_of_the_shared_ranges() -> None:
     """The pool sits below the local ephemeral floor and the MCP pool base.
 
     Both ranges are handed out without a bind of their own -- the kernel for
-    connection source ports, ``McpPortPool`` (base 51000) for sandbox gateways
-    -- so a harness port chosen inside them can be claimed by a *non-listener*
-    at any moment. Any value in the pool above either floor reintroduces the
-    class of collision this flake was.
+    connection source ports, ``McpPortPool`` for sandbox gateways -- so a
+    harness port chosen inside them can be claimed by a *non-listener* at any
+    moment. Any value in the pool above either floor reintroduces the class of
+    collision this flake was.
     """
     ephemeral_floor = 49152  # macOS default; Linux reports its own below
     try:

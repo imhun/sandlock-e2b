@@ -10,3 +10,13 @@ RUN pip install --no-cache-dir \
 COPY envd_service/mcp/gateway.py /usr/bin/mcp-gateway
 RUN chmod +x /usr/bin/mcp-gateway \
     && ln -sf /usr/bin/mcp-gateway /usr/local/bin/mcp-gateway
+
+# The gateway is standalone inside the sandbox (it cannot import
+# gateway_common.keepalive), so its idle keep-alive -- which must stay above
+# the client's pooled idle window, or an idle pool connection is closed by the
+# server first and the next non-replayable bidi request dies with
+# "Connection reset by peer" -- is inlined in the script. Fail the build if the
+# copy ever loses that pin, and remember: this image has to be rebuilt whenever
+# envd_service/mcp/gateway.py changes, or the sandboxes keep running the old
+# bytes (tests/contract/test_mcp_gateway_keepalive.py fails until it is).
+RUN grep -q 'timeout_keep_alive' /usr/bin/mcp-gateway

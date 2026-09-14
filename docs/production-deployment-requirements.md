@@ -799,6 +799,77 @@ E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worke
     设了上界也只回收"超龄 + 无记录引用"的那些，每次回收都能在日志里看到 tar 路径、龄期与
     代价说明（探针 `tmp/zf7tail-oci.log`）。
 
+## 2.8 空闲 HTTP 连接的关闭方向：服务端 keep-alive 必须大于客户端连接池窗口（2026-09-14）
+
+**不变量**：每一条服务端 uvicorn 入口的空闲 keep-alive 必须**严格大于**它的 HTTP
+客户端连接池空闲窗口 ⇒ 空闲连接由**客户端**先关。`>=` 不行（两个定时器会互相
+竞争），反过来（服务端更短）正是本仓踩过的那一侧。
+
+**本仓取值**（服务端两端都定义在 `gateway_common/keepalive.py`，改一端必须改另一端）：
+
+| 端 | 常量 | 值 | 落在哪 |
+|---|---|---|---|
+| 服务端 | `SERVER_KEEP_ALIVE_S` | **120s** | 四个宿主入口（`control_plane/__main__.py`、`control_plane/combined_main.py`、`envd_service/__main__.py`、`envd_service/gateway_main.py`）都展开 `**uvicorn_keep_alive_kwargs()`；测试脚手架的 `_ServerThread` 同值 |
+| 服务端（沙箱内） | `envd_service/mcp/gateway.py::SERVER_KEEP_ALIVE_S` | **120s** | `mcp-gateway` 是**拷进基础镜像**的独立脚本，镜像里没有 `gateway_common`，该值是内联的（见下） |
+| 客户端 | `CLIENT_POOL_IDLE_TIMEOUT_S` | **90s** | 官方 SDK 的 pyqwest `pool_idle_timeout` 默认值，SDK 不覆盖 |
+
+**违反后的症状**：SDK 的 `commands.run` 是 bidi 流（`process.Process/Start`），请求体是
+流、**不可重放**（pyqwest 的 `ConnectionRetryTransport` 也重试不了它）。客户端在池里停
+90s 后复用它，而服务端若在 uvicorn 默认的 5s 就关，这次 RPC 直接以
+`pyqwest.WriteError: ... Connection reset by peer (os error 104)` 结束 —— 这正是整档第 9
+轮 SDK 连接重置的签名（`http://127.0.0.1:38735/process.Process/Start`），同轮 MCP 网关上
+还有 9 次来自 `envd_service/http/mcp.py` 的 `httpx.ConnectError`（网关起得慢、轮询把它拖
+过了窗口）。
+
+**沙箱内那一跳**：`deploy/docker/Dockerfile.mcp-base` 把 `envd_service/mcp/gateway.py`
+`COPY` 成 `/usr/bin/mcp-gateway`，它在沙箱里独立运行，**只能内联**这个常量。因此
+**改 `envd_service/mcp/gateway.py` 必须重建基础镜像**
+（`docker build -f deploy/docker/Dockerfile.mcp-base -t python-mcp:3.14 .`，并按 §2.6.1
+把它推回本地源），否则沙箱里跑的还是旧字节。验证手段：
+
+- `tests/contract/test_mcp_gateway_keepalive.py`：源码里的 `timeout_keep_alive` 必须等于
+  `gateway_common.keepalive.SERVER_KEEP_ALIVE_S`；**镜像里的 `/usr/bin/mcp-gateway` 必须与
+  本树逐字节相同**（没重建就是红，不是静默漂移）；并真起一个镜像里的网关，证明同一条 TCP
+  连接空闲 12s（**>** 旧的 5s）后仍能应答 —— 即"客户端先关"在**沙箱内**也成立；
+- `Dockerfile.mcp-base` 有一条构建期断言 `grep -q 'timeout_keep_alive' /usr/bin/mcp-gateway`：
+  拷贝丢掉这条 pin 时**构建就失败**，不会悄悄发出去；
+- 宿主侧 `tests/contract/test_server_keepalive.py` 把两端常量与**安装版** pyqwest 默认值钉
+  在一起，并在真 uvicorn 上复跑同一条"空闲后复用"断言。
+
+**反例（不要这么做）**：把客户端窗口调大解决不了 —— 服务端仍是先关的那一侧；让 SDK 重试也
+不行（bidi 不可重放）。唯一正解是把服务端的空闲窗口抬到客户端窗口之上（同 nginx
+`keepalive_timeout 75s` > 浏览器 60s 的常规配比），代价只是空闲连接最多多留 115s。
+
+## 2.9 worker 上的 MCP 网关端口带：61001–65535（2026-09-14）
+
+每个带 MCP 的沙箱在 worker 网络命名空间里占一个宿主端口（`MCP_PORT`，由
+`envd_service/runtime/context.py::McpPortPool` 发放）。该池的端口带是
+**`_MCP_PORT_BASE = 61000`（发放 61001 起）到 `_MCP_PORT_MAX = 65535`**。这个区间是被
+两条约束挤出来的，只有它能同时满足：
+
+- **下界 50005（net_isolation 的硬约束）**：`net_isolation` 形态下，沙箱在自己的 loopback
+  netns 里 `listen()`，由 supervisor 在**宿主 loopback 的同一个端口号**上起监听来服务它的
+  `accept()`（S2.5 入站映射）。sandlock 对 `net_bind_map` 的校验要求
+  `host_port >= 50005`，否则直接拒绝（`net_bind_map: host port ... is below the reserved
+  inbound mapping range (50005+)`，`sandlock-core/src/sandbox/builder.rs`）—— 所以端口带
+  **不能**像测试脚手架端口池那样挪到低区间；
+- **上界在 `ephemeral` 区间之外**：容器内实测 `net.ipv4.ip_local_port_range = 32768-60999`，
+  出向连接**不申请**就从那里取**源端口**；池的基址曾是 `51000`（正在区间内），发出去的
+  端口可能已被别人的连接占着，而网关要到沙箱里 bind 才发现。于是 `61000-65535` 是这个
+  窗口的**唯一**取值（≥50005 且 > 60999）；
+- **与测试脚手架端口池（20000–28000）不相交**；
+- **有界**：发满 4535 个即**拒绝分配**（`RuntimeError`）而不是越界借一个共享端口。
+
+`McpPortPool.allocate()` 另外对每个候选**实际做一次 bind 校验**（`0.0.0.0` +
+`SO_REUSEADDR`，与网关自己的 bind 同形）：被别的 listener 占着的号直接跳过，不发给网关。
+
+**运维含义**：worker 主机（或 k8s 节点）上 **61001–65535 必须留给 MCP 网关**，不要被别的
+服务、端口转发或防火墙预留占用；该区间的监听者会让对应端口被池跳过（日志
+`MCP gateway port <n> is already held; skipping it`），占满则建箱在分配端口处失败。
+另外**不要**把宿主/worker 的 `net.ipv4.ip_local_port_range` 上界调高到 61000 以上（例如
+`1024 65535`）——那会把整个端口带重新拖回出向连接的源端口池里；本仓按默认
+`32768-60999` 设计。
+
 ## 3. 运维要求
 
 ### 3.1 quota 管理（E2B worker 自动执行）

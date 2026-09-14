@@ -78,7 +78,12 @@ def pytest_addoption(parser):
 # Every gate below is something the Docker test runner can genuinely satisfy
 # (it ships xfsprogs + node/npm, loop-mounts XFS with prjquota at startup, and
 # selects the image-rootfs / net-isolation shapes), so a skip that matches one
-# of these reasons means coverage quietly disappeared. With
+# of these reasons means coverage quietly disappeared. The docker daemon is in
+# that set too: every lane mounts the socket in, so a fixture that skips
+# because it cannot find `docker` is a mis-provisioned runner, not a narrower
+# matrix -- that is the difference between "this environment cannot run
+# containers at all" (an honest capability skip) and "the registry/buildkit
+# container did not come up" (now a failure that quotes its log). With
 # E2B_TEST_STRICT_SKIPS=1 (set in the test-runner image) such a skip is
 # reported as a failure instead.
 # Only *runner* capabilities are forbidden here -- XFS prjquota, node/npm,
@@ -94,6 +99,9 @@ _STRICT_SKIP_FORBIDDEN = (
     "needs NET_ADMIN",
     "sandbox writes land owned by",
     "worker storage does not give the sandbox ownership",
+    "docker is required for template build tests",
+    "docker is required for the image registry tests",
+    "docker is required for the authenticated registry tests",
 )
 
 
@@ -949,9 +957,32 @@ def multinode_shared_workspace(buildkitd):
     harness["_stop"]()
 
 
+def _registry_failure(container: str, detail: str) -> str:
+    """Failure text for a registry fixture: what we expected + its own log.
+
+    Same rule as ``_buildkitd_failure``: a registry that does not come up is a
+    *regression* of the fixture (or of the docker it runs on), not a reason to
+    drop the registry-backed coverage silently. The container is still there
+    while the fixture waits -- ``--rm`` only removes it after it exits -- so
+    ``docker logs`` can quote the registry's own output here.
+    """
+    logs = subprocess.run(["docker", "logs", container], capture_output=True, text=True)
+    tail = f"{logs.stdout}{logs.stderr}".strip()[-2000:]
+    return f"registry {detail}\n--- registry log tail ---\n{tail}"
+
+
 @pytest.fixture(scope="session")
 def image_registry_url():
-    """A disposable Docker registry (``registry:2``) on a docker-assigned port."""
+    """A disposable Docker registry (``registry:2``) on a docker-assigned port.
+
+    Every step after the docker-capability check *fails* -- it never skips.
+    A registry that cannot be started, published or reached means the
+    template-push contracts lost their subject; skipping there is exactly the
+    silent-coverage-loss this fixture used to do (the same shape the buildkitd
+    fixture had). The one skip left is ``docker`` itself being absent from the
+    machine, which ``_STRICT_SKIP_FORBIDDEN`` also turns into a failure inside
+    the gate (every lane runs with the daemon socket mounted).
+    """
     if shutil.which("docker") is None:
         pytest.skip("docker is required for the image registry tests")
     start = subprocess.run(
@@ -972,13 +1003,16 @@ def image_registry_url():
         text=True,
     )
     if start.returncode != 0:
-        pytest.skip(f"cannot start registry container: {start.stderr.strip()}")
+        pytest.fail(
+            f"cannot start registry container: {start.stderr.strip()}",
+            pytrace=False,
+        )
     container_id = start.stdout.strip()
     try:
         port = _published_port(container_id, 5000)
     except RuntimeError as exc:
         subprocess.run(["docker", "rm", "-f", container_id], capture_output=True)
-        pytest.skip(f"cannot read the registry's published port: {exc}")
+        pytest.fail(f"cannot read the registry's published port: {exc}", pytrace=False)
     deadline = time.time() + 120
     ready = False
     while time.time() < deadline:
@@ -990,15 +1024,23 @@ def image_registry_url():
         except httpx.HTTPError:
             time.sleep(0.5)
     if not ready:
+        failure = _registry_failure(
+            container_id, f"did not answer 200 on 127.0.0.1:{port}/v2/ within 120s"
+        )
         subprocess.run(["docker", "rm", "-f", container_id], capture_output=True)
-        pytest.skip("registry container did not become ready in time")
+        pytest.fail(failure, pytrace=False)
     yield f"127.0.0.1:{port}"
     subprocess.run(["docker", "rm", "-f", container_id], capture_output=True)
 
 
 @pytest.fixture(scope="session")
 def authenticated_registry():
-    """A Docker registry requiring basic auth (bcrypt htpasswd)."""
+    """A Docker registry requiring basic auth (bcrypt htpasswd).
+
+    Same rule as ``image_registry_url``: after the docker-capability check
+    every failure fails the run with the container's own log instead of
+    skipping.
+    """
     if shutil.which("docker") is None:
         pytest.skip("docker is required for the authenticated registry tests")
     username, password = "testuser", "testpass"
@@ -1017,7 +1059,7 @@ def authenticated_registry():
         text=True,
     )
     if ht.returncode != 0:
-        pytest.skip(f"cannot generate htpasswd: {ht.stderr.strip()}")
+        pytest.fail(f"cannot generate htpasswd: {ht.stderr.strip()}", pytrace=False)
     # The registry reads htpasswd at startup, so the file is injected into the
     # created-but-not-started container with ``docker cp`` (same rule as
     # buildkitd's config): a bind mount is resolved by the daemon on the HOST,
@@ -1047,12 +1089,12 @@ def authenticated_registry():
                 files={"/auth/htpasswd": htpasswd_path},
             )
     except RuntimeError as exc:
-        pytest.skip(f"cannot start authenticated registry: {exc}")
+        pytest.fail(f"cannot start authenticated registry: {exc}", pytrace=False)
     try:
         port = _published_port(container_id, 5000)
     except RuntimeError as exc:
         subprocess.run(["docker", "rm", "-f", container_id], capture_output=True)
-        pytest.skip(f"cannot read the registry's published port: {exc}")
+        pytest.fail(f"cannot read the registry's published port: {exc}", pytrace=False)
     deadline = time.time() + 120
     ready = False
     while time.time() < deadline:
@@ -1064,8 +1106,12 @@ def authenticated_registry():
         except httpx.HTTPError:
             time.sleep(0.5)
     if not ready:
+        failure = _registry_failure(
+            container_id,
+            f"did not answer 200/401 on 127.0.0.1:{port}/v2/ within 120s",
+        )
         subprocess.run(["docker", "rm", "-f", container_id], capture_output=True)
-        pytest.skip("authenticated registry did not become ready in time")
+        pytest.fail(failure, pytrace=False)
     yield {
         "url": f"127.0.0.1:{port}",
         "username": username,

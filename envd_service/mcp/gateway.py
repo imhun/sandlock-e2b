@@ -26,6 +26,27 @@ from mcp.server.lowlevel import Server
 
 PORT = int(os.environ.get("MCP_PORT", "50005"))
 
+#: Idle keep-alive of this gateway's uvicorn server, in seconds.
+#:
+#: The rule (both ends are pinned for the host-side entry points in
+#: ``gateway_common/keepalive.py``): the server's idle keep-alive must be
+#: *strictly greater* than the client's connection-pool idle window, so the
+#: **client** is the side that closes an idle connection. A pooled client
+#: parks a connection for its ``pool_idle_timeout`` (pyqwest: 90s, not
+#: overridden by the SDK) and then reuses it for a non-replayable bidi
+#: ``process.Process/Start``; a server that closes first costs that whole RPC
+#: as ``Connection reset by peer``. uvicorn's default (5s) is that failing
+#: ordering.
+#:
+#: This file is *copied into the MCP base image* as ``/usr/bin/mcp-gateway``
+#: (``deploy/docker/Dockerfile.mcp-base``) and runs inside the sandbox
+#: standalone, so it cannot import ``gateway_common``: the value is inlined
+#: here and ``tests/contract/test_mcp_gateway_keepalive.py`` pins it to
+#: ``gateway_common.keepalive.SERVER_KEEP_ALIVE_S`` *and* to the bytes the
+#: image actually ships, so neither an edit without a rebuild nor a drift
+#: between the two copies can go unnoticed.
+SERVER_KEEP_ALIVE_S = 120.0
+
 
 def _authorized(scope: dict, token: str) -> bool:
     if not token:
@@ -83,7 +104,11 @@ async def _serve(config: dict[str, Any], token: str) -> None:
             # its own lifespan (session manager), so it must stay the root app.
             app = AuthMiddleware(server.streamable_http_app(), token)
             config_uv = uvicorn.Config(
-                app, host="0.0.0.0", port=PORT, log_level="warning"
+                app,
+                host="0.0.0.0",
+                port=PORT,
+                log_level="warning",
+                timeout_keep_alive=SERVER_KEEP_ALIVE_S,
             )
             await uvicorn.Server(config_uv).serve()
 
