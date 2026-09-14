@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import socket
 import subprocess
 import time
 
@@ -22,17 +21,16 @@ redis = pytest.importorskip("redis")
 from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings
 from envd_service.runtime.registry import RuntimeRegistry
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+from tests.conftest import _free_container_port
 
 
 @pytest.fixture(scope="module")
 def redis_server():
-    port = _free_port()
+    # ``redis-server`` binds its own port (the harness cannot hand it a
+    # socket), so this stays the probe/close shape -- but in the harness port
+    # pool's low range (below the ephemeral range every loopback connection in
+    # the suite draws its source port from) instead of ``bind(port=0)``.
+    port = _free_container_port()
     client = redis.Redis(host="127.0.0.1", port=port, socket_connect_timeout=2)
     proc = None
     cleanup = None

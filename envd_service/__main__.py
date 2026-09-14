@@ -8,6 +8,7 @@ import uvicorn
 
 from envd_service.app import create_app
 from envd_service.config import Settings
+from gateway_common.keepalive import uvicorn_keep_alive_kwargs
 
 
 def _configure_logging(settings: Settings) -> int:
@@ -45,9 +46,9 @@ def main() -> None:
         host="0.0.0.0",
         port=settings.envd_port,
         log_level=settings.log_level.lower(),
+        **uvicorn_keep_alive_kwargs(),
     )
 
 
 if __name__ == "__main__":
     main()
-

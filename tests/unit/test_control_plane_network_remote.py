@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from control_plane.config import Settings as ControlSettings
-from tests.conftest import _ServerThread, _free_port
+from tests.conftest import _ServerThread, _bind_low_port
 
 API = {"X-API-Key": "local-key"}
 
@@ -90,8 +90,8 @@ def make_remote_harness(make_apps):
     def _make(**overrides) -> dict:
         control, _envd = make_apps(control_settings=_settings(**overrides))
         stub = _StubWorker()
-        port = _free_port()
-        server = _ServerThread(stub.app, port)
+        port, sock = _bind_low_port()
+        server = _ServerThread(stub.app, port, sock=sock)
         server.start()
         try:
             control.state.nodes.register(

@@ -6,6 +6,7 @@ import uvicorn
 
 from control_plane.app import create_app
 from control_plane.config import Settings, uvicorn_ssl_kwargs
+from gateway_common.keepalive import uvicorn_keep_alive_kwargs
 
 
 def main() -> None:
@@ -16,6 +17,7 @@ def main() -> None:
         host="0.0.0.0",
         port=settings.control_plane_port,
         log_level=settings.log_level.lower(),
+        **uvicorn_keep_alive_kwargs(),
         **uvicorn_ssl_kwargs(settings),
     )
 

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import errno
+import io
 import os
+import random
 import shutil
 import socket
 import subprocess
+import tarfile
+import tempfile
 import threading
 import time
 import uuid
@@ -24,6 +29,7 @@ from envd_service.config import Settings as EnvdSettings
 from envd_service.gateway import create_gateway
 from envd_service.runtime.oci_registry import registry_mirrors
 from envd_service.runtime.registry import RuntimeRegistry
+from gateway_common.keepalive import uvicorn_keep_alive_kwargs
 from tests._disk_projids import DISK_READ_BACKENDS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -207,10 +213,148 @@ def _warm_local_template_images(settings: ControlSettings) -> None:
         )
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+# --- port handoff -----------------------------------------------------------
+#: Ports the harness hands out come from *below* the kernel's ephemeral range
+#: (Linux: 32768-60999) and below the worker's MCP-gateway port pool base
+#: (51000, ``envd_service/runtime/context.py``). Probing with
+#: ``bind(("127.0.0.1", 0))`` instead draws from the ephemeral range -- the same
+#: range every loopback connection in the suite takes its *source* port from,
+#: with thousands of them per lane -- so a port a probe just found free can be
+#: claimed by an outgoing connection (or by the MCP pool handing the same
+#: number to a sandbox gateway) before the server binds it. Observed as
+#: ``_ServerThread.start`` -> ``[Errno 98] address already in use``.
+_PORT_POOL_MIN = 20000
+_PORT_POOL_MAX = 28000
+_PORT_PICK_ATTEMPTS = 64
+
+
+def _bind_low_port() -> tuple[int, socket.socket]:
+    """Bind *and* listen on a free harness port, and keep the socket.
+
+    The returned socket is the one a server must serve on
+    (``_ServerThread(..., sock=sock)``): the port stays bound from the moment
+    it is chosen, so nothing can take it between "found free" and "server
+    bound it". That window is exactly what the old probe/close/rebind shape
+    left open, and closing it is the fix -- narrowing it with a retry would
+    keep the race, only rarer.
+    """
+    for _ in range(_PORT_PICK_ATTEMPTS):
+        candidate = random.randrange(_PORT_POOL_MIN, _PORT_POOL_MAX)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", candidate))
+        except OSError as exc:
+            sock.close()
+            if exc.errno == errno.EADDRINUSE:
+                continue
+            raise
+        sock.listen(128)
+        return candidate, sock
+    raise RuntimeError(
+        f"no free port in the harness pool ({_PORT_POOL_MIN}-{_PORT_POOL_MAX})"
+    )
+
+
+def _free_container_port() -> int:
+    """A harness-pool port for a *container* to bind itself (buildkitd).
+
+    A container binds its port itself, so the port cannot be handed over as a
+    socket; this is the one place the probe/close shape survives. The pool
+    range is what keeps it safe: a collision now needs another *listener* on
+    that port, never an outgoing connection's ephemeral source port, and the
+    callers that use it verify the container actually listens (loudly) instead
+    of trusting the probe.
+    """
+    port, sock = _bind_low_port()
+    sock.close()
+    return port
+
+
+def _port_accepting(port: int) -> bool:
+    """True when something is listening on ``127.0.0.1:port`` right now."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.5)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _docker_container(
+    name: str,
+    args: list[str],
+    *,
+    files: dict[str, Path] | None = None,
+) -> str:
+    """Create a container, inject ``files`` (container path -> local file), then
+    start it; returns the container id.
+
+    ``docker cp`` moves the bytes through the daemon API while the container is
+    stopped, so a file a process needs at startup never depends on the daemon
+    resolving a *host* path. The bind-mount shape this replaces is resolved by
+    the daemon, which turns a source it cannot see into an empty directory
+    (see ``_start_buildkitd``). The payload travels as a tar stream
+    (``docker cp - CONTAINER:/``) because plain ``docker cp src ctr:/a/b/c``
+    refuses a missing parent directory -- the tar creates the whole path, so a
+    file can land at the process's own default location.
+    """
+    created = subprocess.run(
+        ["docker", "create", "--name", name, *args],
+        capture_output=True,
+        text=True,
+    )
+    if created.returncode != 0:
+        raise RuntimeError(created.stderr.strip() or "docker create failed")
+    container = created.stdout.strip()
+    try:
+        if files:
+            payload = io.BytesIO()
+            with tarfile.open(fileobj=payload, mode="w") as tar:
+                for dest, src in files.items():
+                    data = src.read_bytes()
+                    entry = tarfile.TarInfo(name=dest.lstrip("/"))
+                    entry.size = len(data)
+                    entry.mode = 0o644
+                    tar.addfile(entry, io.BytesIO(data))
+            payload.seek(0)
+            copied = subprocess.run(
+                ["docker", "cp", "-", f"{container}:/"],
+                input=payload.read(),
+                capture_output=True,
+            )
+            if copied.returncode != 0:
+                raise RuntimeError(
+                    "docker cp - -> / failed: "
+                    f"{copied.stderr.decode(errors='replace').strip()}"
+                )
+        started = subprocess.run(
+            ["docker", "start", container], capture_output=True, text=True
+        )
+        if started.returncode != 0:
+            raise RuntimeError(f"docker start failed: {started.stderr.strip()}")
+    except BaseException:
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+        raise
+    return container
+
+
+def _published_port(container: str, container_port: int) -> int:
+    """Host port docker assigned for ``-p 127.0.0.1::<container_port>``.
+
+    Docker picks the host port at bind time and the harness reads it back, so
+    the registry fixtures never probe a port and re-bind it later: the
+    ephemeral-range race cannot happen at all (the "let the binder pick port 0
+    and read it back" shape).
+    """
+    published = subprocess.run(
+        ["docker", "port", container, str(container_port)],
+        capture_output=True,
+        text=True,
+    )
+    stdout = published.stdout.strip()
+    if published.returncode != 0 or not stdout:
+        raise RuntimeError(
+            f"container published no port {container_port}: {published.stderr.strip()}"
+        )
+    return int(stdout.rsplit(":", 1)[1])
 
 
 def _buildkit_mirror_urls() -> list[str]:
@@ -244,95 +388,140 @@ def _buildkit_mirror_urls() -> list[str]:
     return urls
 
 
-@pytest.fixture(scope="session")
-def buildkitd():
-    """Rootless buildkit daemon (TCP) for local template builds."""
-    if shutil.which("docker") is None:
-        pytest.skip("docker is required for template build tests")
-    port = _free_port()
-    # The config is bind-mounted into a container that the HOST daemon
-    # creates: ``-v`` sources resolve on the host, so writing it to a
-    # container-native path (tempfile.mkdtemp) leaves the daemon with a
-    # missing source it fills in with an empty directory, and buildkitd dies
-    # on ``read .../buildkitd.toml: is a directory``. Write it through the
-    # project's host-visible tree instead (same rule as authenticated_registry).
-    host_root = Path(os.environ.get("E2B_HOST_PROJECT") or str(PROJECT_ROOT))
-    write_root = (
-        Path("/workspace") if os.environ.get("E2B_HOST_PROJECT") else PROJECT_ROOT
-    )
-    cfg_name = f"buildkit-test-{uuid.uuid4().hex[:8]}"
-    cfg_dir = write_root / "tmp" / cfg_name
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    cfg = cfg_dir / "buildkitd.toml"
-    mount_src = host_root / "tmp" / cfg_name / "buildkitd.toml"
+#: Where buildkitd looks for its config inside the rootless image (the image's
+#: own user's default XDG path). The file is injected with ``docker cp`` -- see
+#: ``_start_buildkitd`` for why it is not a bind mount.
+_BUILDKIT_CONFIG_PATH = "/home/user/.config/buildkit/buildkitd.toml"
 
-    # Public-image pulls go through the same bucket the envd resolver uses
-    # (``E2B_REGISTRY_MIRRORS``); one parsing function, so a hardcoded single
-    # source cannot drift back in (see ``_buildkit_mirror_urls``).
+
+def _buildkit_config_text(port: int | str) -> str:
+    """buildkitd config: TCP listener + the resolver's docker.io mirrors.
+
+    Public-image pulls go through the same bucket the envd resolver uses
+    (``E2B_REGISTRY_MIRRORS``); one parsing function, so a hardcoded single
+    source cannot drift back in (see ``_buildkit_mirror_urls``).
+    """
     mirror_entries = ", ".join(f'"{m}"' for m in _buildkit_mirror_urls())
-    cfg.write_text(
+    return (
         f'[grpc]\n  address = ["tcp://0.0.0.0:{port}"]\n\n'
         "[worker.oci]\n  noProcessSandbox = true\n\n"
         f'[registry."docker.io"]\n  mirrors = [{mirror_entries}]\n\n'
         # Local test registry is plain HTTP on 127.0.0.1 (any port).
-        '[registry."127.0.0.1"]\n  http = true\n',
-        encoding="utf-8",
+        '[registry."127.0.0.1"]\n  http = true\n'
     )
+
+
+def _buildkitd_failure(container: str, detail: str) -> str:
+    """Failure text for the buildkit fixture: what we expected + its own log."""
+    logs = subprocess.run(["docker", "logs", container], capture_output=True, text=True)
+    tail = f"{logs.stdout}{logs.stderr}".strip()[-2000:]
+    return f"buildkitd {detail}\n--- buildkitd log tail ---\n{tail}"
+
+
+def _stop_buildkitd(container: str, cfg_dir: Path) -> None:
+    subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+    shutil.rmtree(cfg_dir, ignore_errors=True)
+
+
+def _start_buildkitd() -> tuple[str, str, Path]:
+    """Start the rootless buildkit daemon; ``(tcp address, container, cfg_dir)``.
+
+    The config is *injected* into the created-but-not-started container with
+    ``docker cp`` instead of being bind-mounted. A bind mount is resolved by
+    the HOST daemon, so a file the test container just wrote (through its
+    ``/workspace`` view of the tree) -- or any run whose tree path differs from
+    ``E2B_HOST_PROJECT``, e.g. the ``git archive`` snapshots the lanes are
+    reproduced on -- is a source the daemon cannot see: it creates an empty
+    *directory* in its place and buildkitd dies on
+    ``read .../buildkitd.toml: is a directory`` (observed twice: a 24-test skip
+    in ``tests/contract`` and 9 failures in ``tests/sdk``). ``docker cp``
+    carries the bytes through the daemon API, so no host path is resolved at
+    all, and the two checks below turn any recurrence into a loud failure that
+    quotes buildkitd's own log (never a silent skip that drops coverage).
+    """
+    if shutil.which("docker") is None:
+        pytest.skip("docker is required for template build tests")
+    port = _free_container_port()
+    config_text = _buildkit_config_text(port)
+    TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    cfg_dir = Path(tempfile.mkdtemp(prefix="buildkit-cfg-", dir=TMP_ROOT))
+    cfg = cfg_dir / "buildkitd.toml"
+    cfg.write_text(config_text, encoding="utf-8")
     name = f"buildkit-test-{uuid.uuid4().hex[:8]}"
     volume = f"buildkit-test-vol-{uuid.uuid4().hex[:8]}"
-    start = subprocess.run(
-        [
-            "docker",
-            "run",
-            "-d",
-            # No --rm: the teardown below removes the container, and keeping it
-            # alive in `docker ps -a` is what makes the "did not become ready"
-            # report able to quote buildkitd's own log.
-            "--name",
-            name,
-            "--security-opt",
-            "seccomp=unconfined",
-            "--security-opt",
-            "label=disable",
-            "--network",
-            "host",
-            "-v",
-            f"{mount_src}:/home/user/.config/buildkit/buildkitd.toml:ro",
-            "-v",
-            f"{volume}:/home/user/.local/share/buildkit",
-            "moby/buildkit:rootless",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if start.returncode != 0:
-        pytest.skip(f"cannot start buildkit container: {start.stderr.strip()}")
-    container = start.stdout.strip()
+    container = ""
     try:
+        try:
+            container = _docker_container(
+                name,
+                [
+                    # No --rm: the teardown removes the container, and keeping
+                    # it in `docker ps -a` is what makes the failure report
+                    # able to quote buildkitd's own log.
+                    "--security-opt",
+                    "seccomp=unconfined",
+                    "--security-opt",
+                    "label=disable",
+                    "--network",
+                    "host",
+                    "-v",
+                    f"{volume}:/home/user/.local/share/buildkit",
+                    "moby/buildkit:rootless",
+                ],
+                files={_BUILDKIT_CONFIG_PATH: cfg},
+            )
+        except RuntimeError as exc:
+            # Docker itself is unusable (no daemon/permission): the same class
+            # as "docker is required" above.
+            pytest.skip(f"cannot start buildkit container: {exc}")
+
+        # Readiness is "listening on the address this config asked for", which
+        # only happens if the daemon parsed *this* file -- not "the container
+        # process is still alive" (a daemon that dies on a bad config, or one
+        # running with defaults after a failed config load, is not serving).
         deadline = time.time() + 90
-        ready = False
-        while time.time() < deadline:
-            state = subprocess.run(
-                ["docker", "inspect", "-f", "{{.State.Running}}", container],
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            if state == "true":
-                ready = True
-                break
-            time.sleep(0.5)
-        if not ready:
-            logs = subprocess.run(
-                ["docker", "logs", container], capture_output=True, text=True
+        while time.time() < deadline and not _port_accepting(port):
+            time.sleep(0.25)
+        if not _port_accepting(port):
+            pytest.fail(
+                _buildkitd_failure(
+                    container,
+                    f"did not listen on 127.0.0.1:{port} within 90s",
+                ),
+                pytrace=False,
             )
-            pytest.skip(
-                "buildkit did not become ready: "
-                f"{(logs.stderr or logs.stdout).strip()[-300:]}"
+        read_back = subprocess.run(
+            ["docker", "exec", container, "cat", _BUILDKIT_CONFIG_PATH],
+            capture_output=True,
+            text=True,
+        )
+        if read_back.returncode != 0 or read_back.stdout != config_text:
+            pytest.fail(
+                _buildkitd_failure(
+                    container,
+                    f"{_BUILDKIT_CONFIG_PATH} is not the config file we copied "
+                    f"(exit={read_back.returncode}, stderr="
+                    f"{read_back.stderr.strip()!r}, bytes={len(read_back.stdout)})",
+                ),
+                pytrace=False,
             )
-        yield f"tcp://127.0.0.1:{port}"
+    except BaseException:
+        if container:
+            _stop_buildkitd(container, cfg_dir)
+        else:
+            shutil.rmtree(cfg_dir, ignore_errors=True)
+        raise
+    return f"tcp://127.0.0.1:{port}", container, cfg_dir
+
+
+@pytest.fixture(scope="session")
+def buildkitd():
+    """Rootless buildkit daemon (TCP) for local template builds."""
+    address, container, cfg_dir = _start_buildkitd()
+    try:
+        yield address
     finally:
-        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
-        shutil.rmtree(cfg_dir, ignore_errors=True)
+        _stop_buildkitd(container, cfg_dir)
 
 
 @pytest.fixture()
@@ -417,6 +606,7 @@ class _ServerThread:
         app,
         port: int,
         *,
+        sock: socket.socket | None = None,
         ssl_certfile: str | None = None,
         ssl_keyfile: str | None = None,
     ) -> None:
@@ -428,9 +618,22 @@ class _ServerThread:
             lifespan="on",
             ssl_certfile=ssl_certfile,
             ssl_keyfile=ssl_keyfile,
+            # Keep an idle connection open past the SDK's own pool idle window
+            # (``gateway_common.keepalive``): the client reuses a pooled
+            # connection for a bidi ``process.Process/Start`` whose body it
+            # cannot replay, so a server that closes an idle connection first
+            # costs that RPC a reset. Same knobs as every service entry point.
+            **uvicorn_keep_alive_kwargs(),
         )
         self.server = uvicorn.Server(config)
-        self.thread = threading.Thread(target=self.server.run, daemon=True)
+        # Serve the caller's *reserved* socket (``_bind_low_port``) when there
+        # is one: uvicorn then adopts the already-bound port instead of binding
+        # it a second time, which is what removes the free-port race window
+        # rather than narrowing it.
+        self.sockets = [sock] if sock is not None else None
+        self.thread = threading.Thread(
+            target=lambda: self.server.run(self.sockets), daemon=True
+        )
 
     def start(self) -> None:
         self.thread.start()
@@ -443,6 +646,11 @@ class _ServerThread:
     def stop(self) -> None:
         self.server.should_exit = True
         self.thread.join(timeout=10)
+        for sock in self.sockets or []:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 @pytest.fixture(scope="session")
@@ -461,8 +669,8 @@ def live_servers(buildkitd):
         return
     sdk_workspace = _fresh_dir(TMP_ROOT / "sdk-workspace")
     runtime_registry = RuntimeRegistry(sdk_workspace)
-    control_port = _free_port()
-    envd_port = _free_port()
+    control_port, control_sock = _bind_low_port()
+    envd_port, envd_sock = _bind_low_port()
     control_app = create_control_app(
         settings=ControlSettings(
             api_keys=("local-key",),
@@ -492,8 +700,8 @@ def live_servers(buildkitd):
         workspace_base=sdk_workspace,
     )
     _warm_local_template_images(control_app.state.settings)
-    control = _ServerThread(control_app, control_port)
-    envd = _ServerThread(envd_app, envd_port)
+    control = _ServerThread(control_app, control_port, sock=control_sock)
+    envd = _ServerThread(envd_app, envd_port, sock=envd_sock)
     control.start()
     envd.start()
 
@@ -561,9 +769,10 @@ def _start_multinode(
     if shared_workspace:
         shared_workspace_dir.mkdir(parents=True, exist_ok=True)
 
-    control_port = _free_port()
-    gateway_port = _free_port()
-    worker_ports = [_free_port() for _ in range(worker_count)]
+    control_port, control_sock = _bind_low_port()
+    gateway_port, gateway_sock = _bind_low_port()
+    worker_sockets = [_bind_low_port() for _ in range(worker_count)]
+    worker_ports = [port for port, _sock in worker_sockets]
 
     nodes = NodeRegistry(heartbeat_timeout=12)
     control_app = create_control_app(
@@ -635,9 +844,12 @@ def _start_multinode(
         internal_api_key="internal-key",
     )
 
-    control = _ServerThread(control_app, control_port)
-    workers = [_ServerThread(app, port) for app, port in zip(worker_apps, worker_ports)]
-    gateway = _ServerThread(gateway_app, gateway_port)
+    control = _ServerThread(control_app, control_port, sock=control_sock)
+    workers = [
+        _ServerThread(app, port, sock=sock)
+        for app, (port, sock) in zip(worker_apps, worker_sockets)
+    ]
+    gateway = _ServerThread(gateway_app, gateway_port, sock=gateway_sock)
     control.start()
     for worker in workers:
         worker.start()
@@ -739,18 +951,21 @@ def multinode_shared_workspace(buildkitd):
 
 @pytest.fixture(scope="session")
 def image_registry_url():
-    """A disposable Docker registry (``registry:2``) on a random port."""
+    """A disposable Docker registry (``registry:2``) on a docker-assigned port."""
     if shutil.which("docker") is None:
         pytest.skip("docker is required for the image registry tests")
-    port = _free_port()
     start = subprocess.run(
         [
             "docker",
             "run",
             "-d",
             "--rm",
+            # ``-p 127.0.0.1::5000`` lets docker pick the host port when it
+            # binds and the harness read it back (``_published_port``): no
+            # port is probed and then rebound later, so nothing can take it in
+            # between.
             "-p",
-            f"127.0.0.1:{port}:5000",
+            "127.0.0.1::5000",
             "registry:2",
         ],
         capture_output=True,
@@ -759,6 +974,11 @@ def image_registry_url():
     if start.returncode != 0:
         pytest.skip(f"cannot start registry container: {start.stderr.strip()}")
     container_id = start.stdout.strip()
+    try:
+        port = _published_port(container_id, 5000)
+    except RuntimeError as exc:
+        subprocess.run(["docker", "rm", "-f", container_id], capture_output=True)
+        pytest.skip(f"cannot read the registry's published port: {exc}")
     deadline = time.time() + 120
     ready = False
     while time.time() < deadline:
@@ -798,51 +1018,41 @@ def authenticated_registry():
     )
     if ht.returncode != 0:
         pytest.skip(f"cannot generate htpasswd: {ht.stderr.strip()}")
-    # The htpasswd file is bind-mounted by a docker CLI running inside the
-    # test container. The daemon resolves the -v source path on the HOST, so
-    # the file must physically exist at host_root — which, when running
-    # inside the container, means writing through the /workspace mount (the
-    # container view of the same host tree), not the host-absolute path
-    # (that would land in the container's own filesystem and the daemon
-    # would create a directory at the missing host path).
-    host_root = Path(os.environ.get("E2B_HOST_PROJECT") or str(PROJECT_ROOT))
-    write_root = Path("/workspace") if os.environ.get("E2B_HOST_PROJECT") else PROJECT_ROOT
-    htpasswd_dir = write_root / "tmp" / "registry-auth"
-    htpasswd_dir.mkdir(parents=True, exist_ok=True)
-    htpasswd_path = htpasswd_dir / "htpasswd"
-    # Self-heal: if a previous run left a directory here (docker creates
-    # missing bind sources as dirs), the registry would mount a directory as
-    # the htpasswd file and return 400 on login.
-    if htpasswd_path.is_dir():
-        shutil.rmtree(htpasswd_path)
-    htpasswd_path.write_text(ht.stdout, encoding="utf-8")
-    mount_src = host_root / "tmp" / "registry-auth" / "htpasswd"
-
-    port = _free_port()
-    start = subprocess.run(
-        [
-            "docker",
-            "run",
-            "-d",
-            "--rm",
-            "-p",
-            f"127.0.0.1:{port}:5000",
-            "-e",
-            "REGISTRY_AUTH=htpasswd",
-            "-e",
-            "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd",
-            "-e",
-            "REGISTRY_AUTH_HTPASSWD_REALM=Registry",
-            "-v",
-            f"{mount_src}:/auth/htpasswd",
-            "registry:2",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if start.returncode != 0:
-        pytest.skip(f"cannot start authenticated registry: {start.stderr.strip()}")
-    container_id = start.stdout.strip()
+    # The registry reads htpasswd at startup, so the file is injected into the
+    # created-but-not-started container with ``docker cp`` (same rule as
+    # buildkitd's config): a bind mount is resolved by the daemon on the HOST,
+    # and a source it cannot see becomes an empty *directory* -- the registry
+    # then mounts a directory as its htpasswd file and answers 400 on login.
+    # ``docker cp`` resolves no host path at all, so there is nothing to race.
+    TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="registry-auth-", dir=TMP_ROOT
+        ) as tmp:
+            htpasswd_path = Path(tmp) / "htpasswd"
+            htpasswd_path.write_text(ht.stdout, encoding="utf-8")
+            container_id = _docker_container(
+                f"registry-auth-{uuid.uuid4().hex[:8]}",
+                [
+                    "-p",
+                    "127.0.0.1::5000",
+                    "-e",
+                    "REGISTRY_AUTH=htpasswd",
+                    "-e",
+                    "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd",
+                    "-e",
+                    "REGISTRY_AUTH_HTPASSWD_REALM=Registry",
+                    "registry:2",
+                ],
+                files={"/auth/htpasswd": htpasswd_path},
+            )
+    except RuntimeError as exc:
+        pytest.skip(f"cannot start authenticated registry: {exc}")
+    try:
+        port = _published_port(container_id, 5000)
+    except RuntimeError as exc:
+        subprocess.run(["docker", "rm", "-f", container_id], capture_output=True)
+        pytest.skip(f"cannot read the registry's published port: {exc}")
     deadline = time.time() + 120
     ready = False
     while time.time() < deadline:
@@ -875,8 +1085,8 @@ def _start_live_servers(
     """Real control plane + envd servers for registry template builds."""
     workspace = _fresh_dir(TMP_ROOT / name)
     runtime_registry = RuntimeRegistry(workspace)
-    control_port = _free_port()
-    envd_port = _free_port()
+    control_port, control_sock = _bind_low_port()
+    envd_port, envd_sock = _bind_low_port()
     control_app = create_control_app(
         settings=ControlSettings(
             api_keys=("local-key",),
@@ -908,8 +1118,8 @@ def _start_live_servers(
         workspace_base=workspace,
     )
     _warm_local_template_images(control_app.state.settings)
-    control = _ServerThread(control_app, control_port)
-    envd = _ServerThread(envd_app, envd_port)
+    control = _ServerThread(control_app, control_port, sock=control_sock)
+    envd = _ServerThread(envd_app, envd_port, sock=envd_sock)
     control.start()
     envd.start()
     return {

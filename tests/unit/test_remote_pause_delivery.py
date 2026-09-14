@@ -25,7 +25,7 @@ from fastapi import FastAPI, Request, Response
 
 from control_plane.config import Settings as ControlSettings
 from control_plane.registry.manager import UnknownSandboxError
-from tests.conftest import _ServerThread, _free_port
+from tests.conftest import _ServerThread, _bind_low_port
 
 API = {"X-API-Key": "local-key"}
 
@@ -107,8 +107,8 @@ def make_remote_harness(make_apps):
             control_settings=control_settings or _settings(**overrides)
         )
         stub = _StubWorker()
-        port = _free_port()
-        server = _ServerThread(stub.app, port)
+        port, sock = _bind_low_port()
+        server = _ServerThread(stub.app, port, sock=sock)
         server.start()
         try:
             control.state.nodes.register(
@@ -149,12 +149,12 @@ def live_remote_harness(make_apps):
 
     def _make(**overrides) -> dict:
         control, _envd = make_apps(control_settings=_settings(**overrides))
-        control_port = _free_port()
-        control_server = _ServerThread(control, control_port)
+        control_port, control_sock = _bind_low_port()
+        control_server = _ServerThread(control, control_port, sock=control_sock)
         control_server.start()
         stub = _StubWorker()
-        stub_port = _free_port()
-        stub_server = _ServerThread(stub.app, stub_port)
+        stub_port, stub_sock = _bind_low_port()
+        stub_server = _ServerThread(stub.app, stub_port, sock=stub_sock)
         stub_server.start()
         try:
             control.state.nodes.register(

@@ -11,7 +11,6 @@ server stays plain HTTP (zero-regression guard).
 from __future__ import annotations
 
 import shutil
-import socket
 import subprocess
 from pathlib import Path
 
@@ -20,12 +19,6 @@ import pytest
 
 from control_plane.app import create_app
 from control_plane.config import Settings, uvicorn_ssl_kwargs
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _gen_self_signed_cert(tmp_path: Path) -> tuple[str, str]:
@@ -66,13 +59,13 @@ def _gen_self_signed_cert(tmp_path: Path) -> tuple[str, str]:
 @pytest.fixture()
 def tls_server(tmp_path):
     """Real uvicorn HTTPS control plane (self-signed cert, ephemeral port)."""
-    from tests.conftest import _ServerThread
+    from tests.conftest import _ServerThread, _bind_low_port
 
     cert, key = _gen_self_signed_cert(tmp_path)
-    port = _free_port()
+    port, sock = _bind_low_port()
     app = create_app(settings=Settings(api_keys=("local-key",)))
     server = _ServerThread(
-        app, port, ssl_certfile=cert, ssl_keyfile=key
+        app, port, sock=sock, ssl_certfile=cert, ssl_keyfile=key
     )
     server.start()
     yield port
@@ -82,11 +75,11 @@ def tls_server(tmp_path):
 @pytest.fixture()
 def http_server(tmp_path):
     """Plain-HTTP control plane (E1.4 zero-regression guard)."""
-    from tests.conftest import _ServerThread
+    from tests.conftest import _ServerThread, _bind_low_port
 
-    port = _free_port()
+    port, sock = _bind_low_port()
     app = create_app(settings=Settings(api_keys=("local-key",)))
-    server = _ServerThread(app, port)
+    server = _ServerThread(app, port, sock=sock)
     server.start()
     yield port
     server.stop()

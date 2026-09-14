@@ -16,7 +16,7 @@ from envd_service.gateway import (
     create_gateway,
 )
 from gateway_common import GATEWAY_ROUTE_INVALIDATE_CHANNEL
-from tests.conftest import _ServerThread, _free_port
+from tests.conftest import _ServerThread, _bind_low_port, _free_container_port
 
 
 def _make_node(statuses: list[int], body: bytes = b"ok") -> tuple[FastAPI, list[str]]:
@@ -53,8 +53,8 @@ class _ControlPlane:
             return {"address": addrs[0]}
 
     def start(self) -> tuple[_ServerThread, int]:
-        port = _free_port()
-        server = _ServerThread(self.app, port)
+        port, sock = _bind_low_port()
+        server = _ServerThread(self.app, port, sock=sock)
         server.start()
         return server, port
 
@@ -64,8 +64,8 @@ async def _start_gateway(cp_url: str) -> tuple[_ServerThread, int]:
         control_plane_url=cp_url,
         internal_api_key="internal-key",
     )
-    port = _free_port()
-    server = _ServerThread(app, port)
+    port, sock = _bind_low_port()
+    server = _ServerThread(app, port, sock=sock)
     server.start()
     return server, port
 
@@ -104,8 +104,10 @@ async def test_retry_replays_after_node_moved_502() -> None:
     """First node answers 502, control plane route moved; retry succeeds."""
     node1, calls1 = _make_node([502])
     node2, calls2 = _make_node([200], body=b"migrated-ok")
-    s1 = _ServerThread(node1, _free_port())
-    s2 = _ServerThread(node2, _free_port())
+    s1_port, s1_sock = _bind_low_port()
+    s2_port, s2_sock = _bind_low_port()
+    s1 = _ServerThread(node1, s1_port, sock=s1_sock)
+    s2 = _ServerThread(node2, s2_port, sock=s2_sock)
     s1.start()
     s2.start()
     cp = _ControlPlane()
@@ -130,9 +132,10 @@ async def test_retry_replays_after_node_moved_502() -> None:
 @pytest.mark.asyncio
 async def test_retry_replays_after_connection_failure() -> None:
     """First node is unreachable (connection refused); retry hits the new node."""
-    dead_port = _free_port()  # nothing listens here
+    dead_port = _free_container_port()  # nothing listens here
     node2, calls2 = _make_node([200], body=b"recovered")
-    s2 = _ServerThread(node2, _free_port())
+    s2_port, s2_sock = _bind_low_port()
+    s2 = _ServerThread(node2, s2_port, sock=s2_sock)
     s2.start()
     cp = _ControlPlane()
     cp.routes["sbx_1"] = [
@@ -156,7 +159,8 @@ async def test_retry_replays_after_connection_failure() -> None:
 async def test_no_retry_loop_when_both_attempts_fail() -> None:
     """Stale route that never moves: exactly two attempts, then 502."""
     node1, calls1 = _make_node([502])
-    s1 = _ServerThread(node1, _free_port())
+    s1_port, s1_sock = _bind_low_port()
+    s1 = _ServerThread(node1, s1_port, sock=s1_sock)
     s1.start()
     cp = _ControlPlane()
     cp.routes["sbx_1"] = [f"http://127.0.0.1:{s1.server.config.port}"]
@@ -175,7 +179,8 @@ async def test_no_retry_loop_when_both_attempts_fail() -> None:
 @pytest.mark.asyncio
 async def test_happy_path_streams_without_retry() -> None:
     node, calls = _make_node([200], body=b"ok")
-    s = _ServerThread(node, _free_port())
+    s_port, s_sock = _bind_low_port()
+    s = _ServerThread(node, s_port, sock=s_sock)
     s.start()
     cp = _ControlPlane()
     cp.routes["sbx_1"] = [f"http://127.0.0.1:{s.server.config.port}"]
@@ -204,7 +209,8 @@ async def test_mcp_session_id_header_forwarded() -> None:
         seen["mcp-session-id"] = request.headers.get("mcp-session-id", "")
         return Response(status_code=200, content=b"ok")
 
-    s = _ServerThread(node_app, _free_port())
+    s_port, s_sock = _bind_low_port()
+    s = _ServerThread(node_app, s_port, sock=s_sock)
     s.start()
     cp = _ControlPlane()
     cp.routes["sbx_1"] = [f"http://127.0.0.1:{s.server.config.port}"]
@@ -230,7 +236,8 @@ async def test_mcp_session_id_header_forwarded() -> None:
 @pytest.mark.asyncio
 async def test_invalidation_endpoint_drops_cache() -> None:
     node, _ = _make_node([200])
-    s = _ServerThread(node, _free_port())
+    s_port, s_sock = _bind_low_port()
+    s = _ServerThread(node, s_port, sock=s_sock)
     s.start()
     cp = _ControlPlane()
     cp.routes["sbx_1"] = [f"http://127.0.0.1:{s.server.config.port}"]

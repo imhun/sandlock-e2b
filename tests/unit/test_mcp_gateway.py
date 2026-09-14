@@ -24,7 +24,7 @@ from envd_service.runtime.context import (
     _watch_mcp_gateway_exit,
 )
 from envd_service.runtime.registry import RuntimeSandbox
-from tests.conftest import _ServerThread, _free_port
+from tests.conftest import _ServerThread, _bind_low_port
 
 
 def test_gateway_port_default() -> None:
@@ -646,7 +646,8 @@ async def test_mcp_proxy_routes_to_sandbox_gateway() -> None:
     async def up(request: Request) -> JSONResponse:
         return JSONResponse({"ok": True, "method": request.method})
 
-    server = _ServerThread(upstream, _free_port())
+    port, sock = _bind_low_port()
+    server = _ServerThread(upstream, port, sock=sock)
     server.start()
     app = _proxy_app(
         {"sbx_1": SimpleNamespace(mcp_port=server.server.config.port, mcp_token="tok")}
@@ -728,7 +729,8 @@ async def test_mcp_proxy_post_body_path_query_and_delete() -> None:
             }
         )
 
-    server = _ServerThread(upstream, _free_port())
+    port, sock = _bind_low_port()
+    server = _ServerThread(upstream, port, sock=sock)
     server.start()
     app = _proxy_app(
         {"sbx_1": SimpleNamespace(mcp_port=server.server.config.port, mcp_token="tok")}
@@ -771,7 +773,8 @@ async def test_mcp_proxy_accepts_x_mcp_access_token() -> None:
     async def up() -> JSONResponse:
         return JSONResponse({"ok": True})
 
-    server = _ServerThread(upstream, _free_port())
+    port, sock = _bind_low_port()
+    server = _ServerThread(upstream, port, sock=sock)
     server.start()
     app = _proxy_app(
         {"sbx_1": SimpleNamespace(mcp_port=server.server.config.port, mcp_token="tok")}
@@ -804,7 +807,8 @@ async def test_mcp_proxy_strips_transfer_headers() -> None:
             },
         )
 
-    server = _ServerThread(upstream, _free_port())
+    port, sock = _bind_low_port()
+    server = _ServerThread(upstream, port, sock=sock)
     server.start()
     app = _proxy_app(
         {"sbx_1": SimpleNamespace(mcp_port=server.server.config.port, mcp_token="tok")}

@@ -32,7 +32,7 @@ from e2b import Sandbox
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
-from tests.conftest import TMP_ROOT, _ServerThread, _free_port, _fresh_dir
+from tests.conftest import TMP_ROOT, _ServerThread, _bind_low_port, _fresh_dir
 from tests.security.conftest import sandlock_ready
 
 pytestmark = pytest.mark.skipif(
@@ -62,8 +62,8 @@ def sandlock_combined_harness() -> dict[str, str]:
     """
     workspace = _fresh_dir(TMP_ROOT / "pause-resume-sandlock")
     runtime_registry = RuntimeRegistry(workspace)
-    control_port = _free_port()
-    envd_port = _free_port()
+    control_port, control_sock = _bind_low_port()
+    envd_port, envd_sock = _bind_low_port()
     control_app = create_control_app(
         settings=ControlSettings(
             api_keys=("local-key",),
@@ -90,8 +90,8 @@ def sandlock_combined_harness() -> dict[str, str]:
         runtime_registry=runtime_registry,
         workspace_base=workspace,
     )
-    control = _ServerThread(control_app, control_port)
-    envd = _ServerThread(envd_app, envd_port)
+    control = _ServerThread(control_app, control_port, sock=control_sock)
+    envd = _ServerThread(envd_app, envd_port, sock=envd_sock)
     control.start()
     envd.start()
     try:

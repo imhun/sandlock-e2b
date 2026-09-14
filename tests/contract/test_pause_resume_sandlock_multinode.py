@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import os
 import queue
+import signal
+import subprocess
 import threading
 import time
 
@@ -80,18 +82,9 @@ def _proc_state(pid: int) -> str:
     return data[data.rindex(b")") + 2 :].split()[0].decode()
 
 
-def _stopped_group(pid: int) -> bool:
-    """Whether every live member of ``pid``'s process group is SIGSTOPped.
-
-    The agent pause route freezes the child's whole *process group* (one
-    group per exec child, fork F1.7), so that is what a "frozen" sandbox
-    command means: the kernel reports ``T`` for the child and for every
-    descendant that inherited its group.
-    """
-    try:
-        pgid = os.getpgid(pid)
-    except (ProcessLookupError, PermissionError):
-        return False
+def _group_states(pgid: int) -> dict[int, str]:
+    """``/proc`` state letter of every process in process group ``pgid``."""
+    states: dict[int, str] = {}
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
@@ -102,7 +95,35 @@ def _stopped_group(pid: int) -> bool:
             continue
         if int(fields[2]) != pgid:
             continue
-        if fields[0] != b"T":
+        states[int(entry)] = fields[0].decode()
+    return states
+
+
+def _stopped_group(pid: int) -> bool:
+    """Whether no member of ``pid``'s process group is still running.
+
+    The agent pause route freezes the child's whole *process group* (one
+    group per exec child, fork F1.7), so that is what a "frozen" sandbox
+    command means: the kernel reports ``T`` for the child and for every
+    descendant that inherited its group. A member that already exited while
+    the group is stopped is a **zombie** (``Z``): its parent is frozen and
+    cannot reap it, so it stays in the group, in state ``Z``, for as long as
+    the sandbox is paused. It runs no user code, so it does not un-freeze the
+    group -- requiring literally every member to be ``T`` (the pre-fix rule)
+    failed this check while the child the caller cares about was demonstrably
+    frozen (observed: ``worker-side (pid, /proc state) pairs: [(893, 'T')]``,
+    i.e. a ``T`` exec child plus an unreaped member, on ~1/4 of loaded
+    whole-lane rounds).
+    """
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, PermissionError):
+        return False
+    for state in _group_states(pgid).values():
+        # ``T`` = stopped, ``Z``/``X`` = dead (unreapable while the group is
+        # stopped): neither is executing user code. Anything else (``R``,
+        # ``S``, ``D``, ...) means the group is not frozen.
+        if state not in ("T", "Z", "X"):
             return False
     return True
 
@@ -306,3 +327,55 @@ def test_paused_sandbox_survives_a_stalled_worker_heartbeat(
             waiter.join(timeout=5)
         sandbox.kill()
         bystander.kill()
+
+
+def test_stopped_group_counts_a_member_that_died_inside_it() -> None:
+    """A member that dies while the group is stopped must not un-freeze it.
+
+    Deterministic shape of the observed whole-lane failure: SIGSTOP the group,
+    then kill one member from outside the group. Its parent -- the frozen group
+    leader -- can no longer reap it, so the group holds a ``Z`` member for as
+    long as it stays stopped. The child under test is ``T`` throughout; the
+    pre-fix rule (every member literally ``T``) called that "not frozen" and
+    failed ``_wait_for_frozen`` with ``[(<pid>, 'T')]``.
+
+    No harness needed: it is the freeze *check* that is under test, and the
+    kernel states are read exactly as ``_wait_for_frozen`` reads them.
+    """
+    process = subprocess.Popen(
+        ["sh", "-c", "sleep 300 & sleep 300"],
+        start_new_session=True,
+    )
+    pgid = os.getpgid(process.pid)
+    try:
+        deadline = time.monotonic() + 5.0
+        while len(_group_states(pgid)) < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        members = _group_states(pgid)
+        assert process.pid in members, members
+        assert len(members) >= 2, members
+
+        os.killpg(pgid, signal.SIGSTOP)
+        victim = max(pid for pid in members if pid != process.pid)
+        os.kill(victim, signal.SIGKILL)
+
+        states: dict[int, str] = {}
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            states = _group_states(pgid)
+            if states.get(victim) == "Z" and states.get(process.pid) == "T":
+                break
+            time.sleep(0.02)
+        assert states.get(process.pid) == "T", states
+        assert states.get(victim) == "Z", states
+        assert _stopped_group(process.pid) is True
+    finally:
+        try:
+            os.killpg(pgid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=5)
