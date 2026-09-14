@@ -641,6 +641,19 @@ E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worke
   **每个进程最多每 60s 走一次目录**（`_PRUNE_INTERVAL_S`），不需要运维加 cron，也不给
   热路径（`.complete` 命中，直接 return）增加任何开销。外部想主动跑一次也可以直接调
   `prune_image_cache(cache_dir)`。
+- **这一趟跑在自己的线程上，不在发布者的线程上（2026-09-14，sdk lane flake）**：发布路径
+  就是**沙箱的第一条命令**——worker 在第一个 RPC 上才建运行时上下文（`SandboxRuntimeContext`
+  → `create_executor()` → `resolve_image_rootfs()`），而 SDK 对这条请求的预算是
+  `request_timeout`/`timeout`（默认 60s）。实测（`tmp/sdkflake-diag2.log`、`-diag3.log`、
+  `tmp/sdkflake-cacheprobe.py`）：在 13.98 GiB / 383k 文件的暖缓存上，**一次 GC 里的量取
+  走一遍就要 24.3s（空载）、43.3s（6 核压载），而 `prune_image_cache()` 走两遍**（先判再报），
+  整趟 97.9s ⇒ 一次冷创建的"首条命令"≈105s，SDK 到点把请求杀掉，测试看到的是
+  `process.Process/Start` 客户端超时。因此 `_materialize_entry()` 现在只**排队**
+  （`_schedule_cache_prune()`：进程内单飞 + 沿用 60s 节流），GC 在 `image-cache-maintenance`
+  守护线程上跑。发布本身仍是原子 `os.replace`，调用方要的是路径而不是 GC 的数字，且新鲜度
+  下限（≥60s）本来就把"刚发布的条目"挡在逐出集合之外（`protect` 继续原样传递）。GC 失败只
+  打 ERROR（缓存维持现状到下一趟），不再让一条**已经落盘**的发布失败。
+  要观测一趟是否跑过，单元测试用 `wait_for_image_cache_maintenance()` 等它结束。
 **默认不限（`E2B_IMAGE_CACHE_MAX_BYTES` 未设 = `0` = 不逐出）**，因为逐出的失败模式是
 "静默打断活沙箱"：上界是**显式**的运维动作（两套清单都设 4 GiB），不是默认打开的行为。
 `E2B_IMAGE_CACHE_MAX_BYTES=0` 下仍会回收残留（下一条），但**上界本身只约束 rootfs 条目**

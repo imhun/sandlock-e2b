@@ -25,6 +25,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -187,6 +188,19 @@ def _extraction_pids(record: Path) -> list[int]:
 
 def _entry_names(cache: Path) -> list[str]:
     return sorted(p.name for p in cache.iterdir())
+
+
+def _settle_cache_maintenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start each test from a process with no cache pass in flight.
+
+    The pass a publish schedules runs on one thread per process (see
+    ``_schedule_cache_prune``), so a pass left over from an earlier test would
+    make this test's publish coalesce into it instead of scheduling its own.
+    Waiting it out and clearing the slot keeps that state per test, which is
+    also what lets the tests below count how many passes ran.
+    """
+    assert image_resolver.wait_for_image_cache_maintenance(timeout=30)
+    monkeypatch.setattr(image_resolver, "_MAINTENANCE_THREAD", None)
 
 
 def _write_entry(cache: Path, name: str, payload: bytes, mtime: float) -> Path:
@@ -505,6 +519,7 @@ def test_a_cold_resolve_enforces_the_cache_cap(
     monkeypatch.setenv("E2B_IMAGE_CACHE_MAX_BYTES", str(2 * 1024 * 1024))
     monkeypatch.setenv("E2B_IMAGE_CACHE_EVICT_MIN_AGE_S", "0")
     monkeypatch.setattr(image_resolver, "_last_prune_monotonic", 0.0)
+    _settle_cache_maintenance(monkeypatch)
 
     rootfs = resolve_image_rootfs(image, cache)
 
@@ -512,6 +527,9 @@ def test_a_cold_resolve_enforces_the_cache_cap(
     assert rootfs == cache / entry / "rootfs"
     assert (rootfs / ".complete").is_file()
     assert (rootfs / "etc" / "zf7").read_bytes() == b"capped\n"
+    # The bound is enforced by the pass the resolve schedules; wait for it so
+    # the assertion below is about the finished pass, not about a race with it.
+    assert image_resolver.wait_for_image_cache_maintenance(timeout=30)
     assert _entry_names(cache) == sorted(
         ["_oci", "e2b-local_zf7_capped.lock", entry]
     )
@@ -531,11 +549,13 @@ def test_cap_of_zero_keeps_the_shared_cache_unbounded(
     _write_local_oci(cache, image, payload)
     monkeypatch.setenv("E2B_IMAGE_CACHE_MAX_BYTES", "0")
     monkeypatch.setattr(image_resolver, "_last_prune_monotonic", 0.0)
+    _settle_cache_maintenance(monkeypatch)
 
     rootfs = resolve_image_rootfs(image, cache)
 
     assert (old_rootfs / ".complete").is_file()
     entry = f"e2b-local_zf7_unbounded-{digest[7:47]}"
+    assert image_resolver.wait_for_image_cache_maintenance(timeout=30)
     assert _entry_names(cache) == sorted(
         ["_oci", "e2b-local_zf7_unbounded.lock", "old-1111", entry]
     )
@@ -760,6 +780,7 @@ def test_a_cold_resolve_keeps_the_entry_it_published(
     monkeypatch.setenv("E2B_IMAGE_CACHE_MAX_BYTES", "1")
     monkeypatch.setenv("E2B_IMAGE_CACHE_EVICT_MIN_AGE_S", "0")
     monkeypatch.setattr(image_resolver, "_last_prune_monotonic", 0.0)
+    _settle_cache_maintenance(monkeypatch)
 
     rootfs = resolve_image_rootfs(image, cache)
 
@@ -769,6 +790,11 @@ def test_a_cold_resolve_keeps_the_entry_it_published(
     assert rootfs.exists()
     # A second call is a cache hit: nothing was evicted and re-extracted.
     assert resolve_image_rootfs(image, cache) == rootfs
+    # ``protect`` and the freshness floor are what keep the published entry
+    # alive; assert that against the *finished* pass, not against a race with
+    # a pass that may not have run yet.
+    assert image_resolver.wait_for_image_cache_maintenance(timeout=30)
+    assert rootfs.exists()
     assert sorted(p.name for p in cache.iterdir() if not p.name.startswith(".")) == sorted(
         ["_oci", "e2b-local_zf7_keep.lock", entry.name]
     )
@@ -783,6 +809,161 @@ def test_the_freshness_floor_has_a_positive_lower_bound(
     assert image_resolver._cache_evict_min_age_s() == 60.0
     monkeypatch.setenv("E2B_IMAGE_CACHE_EVICT_MIN_AGE_S", "300")
     assert image_resolver._cache_evict_min_age_s() == 300.0
+
+
+# --- the cache pass is maintenance, not part of the publish ------------------
+#
+# The pass a publish triggers used to run inline, at the end of
+# ``_materialize_entry``. That call site is the sandbox's *first command*: the
+# worker builds the runtime context lazily on the first RPC, the context builds
+# the executor, and the executor resolves the image. The pass is O(cache) --
+# on the deployment's warm cache (13.98 GiB, 383k files) the walk alone took
+# 24 s idle and 43 s under load, twice per pass -- which is what turned a cache
+# miss into a 100 s first command that the SDK killed at its 60 s
+# ``request_timeout`` (the sdk lane's ``test_template_copy_file_visible_in_
+# rootfs`` flake). The tests below pin the fix: the publisher never waits for
+# the pass, the pass still runs (and still enforces the bound), one process
+# keeps at most one pass in flight, and a pass that cannot finish never fails
+# the publish it was scheduled by.
+
+
+def test_a_publish_never_waits_for_the_cache_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caller returns while the pass is still running, on its own thread."""
+    cache = tmp_path / "shared" / "_images"
+    cache.mkdir(parents=True)
+    _write_entry(cache, "old-1111", b"o" * (3 * 1024 * 1024), 1000.0)
+    image = "e2b-local/zf7_async"
+    payload, digest = _oci_layout_tar(
+        [_layer({"bin/sh": b"#!/bin/sh\n", "etc/zf7": b"async\n"})]
+    )
+    _write_local_oci(cache, image, payload)
+    monkeypatch.setenv("E2B_IMAGE_CACHE_MAX_BYTES", str(2 * 1024 * 1024))
+    monkeypatch.setenv("E2B_IMAGE_CACHE_EVICT_MIN_AGE_S", "0")
+    monkeypatch.setattr(image_resolver, "_last_prune_monotonic", 0.0)
+    _settle_cache_maintenance(monkeypatch)
+
+    real_prune = image_resolver.prune_image_cache
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    seen: dict[str, object] = {}
+
+    def _blocking_prune(cache_dir: object, **kwargs: object) -> dict[str, int]:
+        seen["thread"] = threading.current_thread().name
+        entered.set()
+        # Bounded so a synchronous call site fails the assertion below instead
+        # of hanging the suite.
+        release.wait(30)
+        try:
+            return real_prune(cache_dir, **kwargs)  # type: ignore[arg-type]
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(image_resolver, "prune_image_cache", _blocking_prune)
+
+    rootfs = resolve_image_rootfs(image, cache)
+
+    entry = f"e2b-local_zf7_async-{digest[7:47]}"
+    assert rootfs == cache / entry / "rootfs"
+    assert (rootfs / ".complete").is_file()
+    # The pass started (it is not skipped) and was still running when the
+    # publisher returned: a synchronous pass would have had to finish first.
+    assert entered.wait(30)
+    assert not finished.is_set()
+    assert seen["thread"] == "image-cache-maintenance"
+
+    release.set()
+    assert image_resolver.wait_for_image_cache_maintenance(timeout=30)
+    assert finished.is_set()
+    # Off the caller's thread, but the bound it exists to enforce still lands.
+    assert _entry_names(cache) == sorted(
+        ["_oci", "e2b-local_zf7_async.lock", entry]
+    )
+
+
+def test_only_one_cache_pass_runs_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two publishes while a pass is in flight share that one pass.
+
+    Stacking a second O(cache) walk on the same volume for every concurrent
+    create is what the single-flight slot exists to prevent; the second publish
+    is still safe to defer because its entry is complete and fresh.
+    """
+    cache = tmp_path / "shared" / "_images"
+    cache.mkdir(parents=True)
+    monkeypatch.setenv("E2B_IMAGE_CACHE_MAX_BYTES", "0")
+    monkeypatch.setattr(image_resolver, "_last_prune_monotonic", 0.0)
+    _settle_cache_maintenance(monkeypatch)
+
+    real_prune = image_resolver.prune_image_cache
+    entered = threading.Event()
+    release = threading.Event()
+    passes: list[str] = []
+
+    def _blocking_prune(cache_dir: object, **kwargs: object) -> dict[str, int]:
+        passes.append(threading.current_thread().name)
+        entered.set()
+        release.wait(30)
+        return real_prune(cache_dir, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(image_resolver, "prune_image_cache", _blocking_prune)
+
+    for name in ("zf7_coalesce_a", "zf7_coalesce_b"):
+        image = f"e2b-local/{name}"
+        payload, _digest = _oci_layout_tar(
+            [_layer({"bin/sh": b"#!/bin/sh\n", f"etc/{name}": b"c\n"})]
+        )
+        _write_local_oci(cache, image, payload)
+        resolve_image_rootfs(image, cache)
+
+    assert entered.wait(30)
+    assert passes == ["image-cache-maintenance"]
+
+    release.set()
+    assert image_resolver.wait_for_image_cache_maintenance(timeout=30)
+    assert passes == ["image-cache-maintenance"]
+
+
+def test_a_failing_cache_pass_does_not_fail_the_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Maintenance is best effort: the entry is already on disk."""
+    cache = tmp_path / "shared" / "_images"
+    cache.mkdir(parents=True)
+    image = "e2b-local/zf7_broken_pass"
+    payload, digest = _oci_layout_tar(
+        [_layer({"bin/sh": b"#!/bin/sh\n", "etc/zf7": b"pass\n"})]
+    )
+    _write_local_oci(cache, image, payload)
+    monkeypatch.setattr(image_resolver, "_last_prune_monotonic", 0.0)
+    _settle_cache_maintenance(monkeypatch)
+
+    def _exploding_prune(cache_dir: object, **kwargs: object) -> dict[str, int]:
+        raise OSError(28, "No space left on device", str(cache_dir))
+
+    monkeypatch.setattr(image_resolver, "prune_image_cache", _exploding_prune)
+    caplog.set_level(logging.ERROR, logger="envd_service.runtime.image_resolver")
+
+    rootfs = resolve_image_rootfs(image, cache)
+
+    entry = f"e2b-local_zf7_broken_pass-{digest[7:47]}"
+    assert rootfs == cache / entry / "rootfs"
+    assert (rootfs / "etc" / "zf7").read_bytes() == b"pass\n"
+    assert image_resolver.wait_for_image_cache_maintenance(timeout=30)
+    assert [
+        (record.levelname, record.getMessage())
+        for record in caplog.records
+        if record.name == "envd_service.runtime.image_resolver"
+    ] == [
+        (
+            "ERROR",
+            f"image cache maintenance pass failed for {cache} (the cache keeps "
+            "its current size until the next pass)",
+        )
+    ]
 
 
 def test_prune_accounts_for_every_byte_and_reclaims_stale_leftovers(

@@ -558,6 +558,10 @@ def _materialize_entry(
     the bound this call enforces can never evict the very rootfs it is about to
     hand back (with ``E2B_IMAGE_CACHE_EVICT_MIN_AGE_S=0`` the old code deleted
     it and returned a path that no longer existed).
+
+    That GC pass is *scheduled*, not run here: this function is on the first
+    command's critical path and the pass is O(cache) (:func:`_schedule_cache_prune`
+    has the measurements and the safety argument).
     """
     cache_dir = Path(cache_dir)
     entry = cache_dir / entry_name
@@ -587,7 +591,7 @@ def _materialize_entry(
         if marker.is_file():
             return rootfs
         raise
-    _maybe_prune_cache(cache_dir, protect=(entry_name,))
+    _schedule_cache_prune(cache_dir, protect=(entry_name,))
     return rootfs
 
 
@@ -1242,6 +1246,11 @@ def prune_image_cache(
 def _maybe_prune_cache(cache_dir: Path, *, protect: Iterable[str] = ()) -> None:
     """Enforce the cache bound after a cold resolve (throttled per process).
 
+    Called by the cache's own maintenance thread (:func:`_schedule_cache_prune`),
+    never by the request that published an entry: the walk below is O(cache),
+    and the publish path is the first command of a sandbox, which the SDK bounds
+    at ``request_timeout``/``timeout`` (60 s by default).
+
     Runs even when the cap is ``0``: an unbounded cache still reclaims its own
     and over-age leftovers, which is the only thing that stops a crash loop
     from growing the shared volume without bound.
@@ -1309,6 +1318,83 @@ def _maybe_prune_cache(cache_dir: Path, *, protect: Iterable[str] = ()) -> None:
             stats["skipped_pinned"],
             _cache_evict_min_age_s(),
         )
+
+
+#: The one maintenance pass a process may have in flight. The pass is O(cache)
+#: -- ``prune_image_cache`` walks every entry twice (once to decide, once to
+#: report) and reads every ``sandbox.json`` on the volume -- so a *later*
+#: publish that finds a pass already running coalesces into it instead of
+#: stacking a second walk on the same volume (see :func:`_schedule_cache_prune`
+#: for why it must not run on the publisher's thread at all). Single-flight per
+#: *process* narrows nothing: the 60s throttle it wraps (``_PRUNE_INTERVAL_S``
+#: / ``_last_prune_monotonic``) was already per process.
+_MAINTENANCE_LOCK = threading.Lock()
+_MAINTENANCE_THREAD: threading.Thread | None = None
+
+
+def _schedule_cache_prune(cache_dir: Path, *, protect: Iterable[str] = ()) -> None:
+    """Run the post-publish cache maintenance off the publisher's thread.
+
+    The pass below used to run inline at the end of :func:`_materialize_entry`,
+    i.e. *inside the request* that first resolves an image. That request is the
+    sandbox's first command (``SandboxRuntimeContext.__init__`` builds the
+    executor, and the context is created lazily by the first RPC), which the
+    official SDK bounds with ``request_timeout``/``timeout`` (60 s by default).
+    On the deployment's warm cache the walk alone measured 24 s idle and 43 s
+    under load (13.98 GiB, 383k files), so a cache miss turned a ~1 s command
+    into a 100 s one and the SDK killed it: a *client-visible* failure caused
+    purely by maintenance the caller never asked for.
+
+    The work is safe to defer: the entry was already published atomically
+    (``os.replace`` of a complete staging tree), the caller uses the returned
+    path and never the GC's numbers, and the freshness floor
+    (``E2B_IMAGE_CACHE_EVICT_MIN_AGE_S``, floored at
+    ``_MIN_EVICT_MIN_AGE_S``) keeps an entry published just now out of the
+    eviction set even when the pass runs later with a different ``protect``.
+    Failures are logged, not raised: the cache bound is a maintenance property,
+    and a publisher whose entry is already on disk must not fail because the
+    sweep over the *rest* of the cache could not finish.
+    """
+    global _MAINTENANCE_THREAD
+    with _MAINTENANCE_LOCK:
+        if _MAINTENANCE_THREAD is not None and _MAINTENANCE_THREAD.is_alive():
+            return
+        thread = threading.Thread(
+            target=_run_cache_prune,
+            args=(cache_dir, tuple(protect)),
+            name="image-cache-maintenance",
+            daemon=True,
+        )
+        _MAINTENANCE_THREAD = thread
+        thread.start()
+
+
+def _run_cache_prune(cache_dir: Path, protect: tuple[str, ...]) -> None:
+    """Body of the maintenance thread: one pass, throttled, never fatal."""
+    try:
+        _maybe_prune_cache(cache_dir, protect=protect)
+    except Exception:  # noqa: BLE001 - maintenance must not fail a publish
+        logger.exception(
+            "image cache maintenance pass failed for %s (the cache keeps its "
+            "current size until the next pass)",
+            cache_dir,
+        )
+
+
+def wait_for_image_cache_maintenance(timeout: float | None = None) -> bool:
+    """Block until the scheduled maintenance pass has finished.
+
+    The pass is deliberately off the publisher's thread, so anything that needs
+    to observe its *effect* (the unit tests pinning the bound, leftovers and
+    reporting) waits here instead of racing it. Returns ``True`` when the pass
+    that was in flight at call time has finished, ``False`` on timeout.
+    """
+    with _MAINTENANCE_LOCK:
+        thread = _MAINTENANCE_THREAD
+    if thread is None:
+        return True
+    thread.join(timeout)
+    return not thread.is_alive()
 
 
 def _shared_cache_dir() -> Path | None:

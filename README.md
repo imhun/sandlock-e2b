@@ -437,6 +437,8 @@ Redis WATCH 事务（原子，跨进程不超用），TTL 扫描跨副本一致�
   但它**不在任何 project 配额内** ⇒ 缓存自身有**按量 GC**（`prune_image_cache()`，
   只逐出已完成的 rootfs 条目、最旧优先、且**剔除被任何沙箱记录引用或依赖清单不完整**的条目；
   `E2B_IMAGE_CACHE_MAX_BYTES` 默认 **`0`=逐出关闭**，判的是总占用而不是逐条上限），
+  发布后这一趟跑在**独立维护线程**上（缓存大时它是 O(缓存) 的走查，不能占用沙箱首条命令的
+  60s 预算），
   完整口径（含 `_oci` 的单独策略与"崩溃循环暂存 ≈1.7 GB"量级）见
   `docs/production-deployment-requirements.md` §2.7。
 
