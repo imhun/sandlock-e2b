@@ -250,9 +250,10 @@ async def test_parked_main_program_costs_nothing(workspace) -> None:
 #: (``sandlock-core/src/error.rs``), as it reaches the worker: the slot formats
 #: a served failure as ``instance exec failed: {e}`` and the core renders the
 #: runtime error as ``process error: {…}``. Pinned exactly on purpose -- the
-#: executor must classify this *without* reading the sentence (it asks the
-#: slot's state machine instead), so this string is here to document the shape
-#: the channel erases, not to license a text match.
+#: executor must classify this *without* reading the sentence (it branches on
+#: the refusal's stable ``code`` instead), so this string is here to document
+#: what the channel now carries *next to* the code, not to license a text
+#: match.
 INSTANCE_CLOSED_REFUSAL = (
     "instance exec failed: process error: instance is closed (shut down, or "
     "the init channel closed after the main-exit container end); no new work "
@@ -327,13 +328,16 @@ async def test_collapsed_generation_is_rebuilt_once_not_permanent(
     The generation is a container: when its M0 main exits, init collapses
     every group and the *slot process keeps serving* -- answering every verb
     with the unified closed-instance refusal. That refusal crosses the route-B
-    channel as a plain string, so the executor's typed session-gone mapping
-    never saw it and the sandbox stayed dead for good (production symptom:
+    channel as ``err`` prose plus a stable ``code`` (fork F19/SL-13); before
+    the code it was prose only, the executor's typed session-gone mapping
+    never saw it, and the sandbox stayed dead for good (production symptom:
     ``error_type=SandboxError`` on a sandbox's *first* command, every later one
     the same). Here the main is killed the way any stray SIGKILL to it would
     (the container end is the same either way), and the *next* command must
     run -- on a generation the executor rebuilt.
     """
+    from sandlock.exceptions import SlotRefusal
+
     sandbox_id = "sbx_rbe_collapse"
     ex = _executor(workspace, sandbox_id)
     pool = slot_pool_for(ex._route_b)
@@ -360,10 +364,12 @@ async def test_collapsed_generation_is_rebuilt_once_not_permanent(
             f"the generation never read Exited after its main was killed: {stats}"
         )
 
-        # The refused verb, exactly as the worker used to receive it.
-        with pytest.raises(Exception) as refusal:
+        # The refused verb: the same prose the worker always received, plus
+        # the code that says *why* -- there is no `stats` round trip here.
+        with pytest.raises(SlotRefusal) as refusal:
             await asyncio.to_thread(ex._instance.exec, ["/bin/true"])
         assert str(refusal.value) == INSTANCE_CLOSED_REFUSAL
+        assert refusal.value.code == "generation_closed", refusal.value.code
 
         # ...and the executor turns that into a rebuild plus one retry.
         with caplog.at_level(
@@ -397,10 +403,13 @@ async def test_live_generation_refusal_is_not_rebuilt(
     A per-exec parameter wider than the instance ceiling is a policy refusal,
     not a gone session (``sandlock-supervise`` answers ``exec params exceed the
     instance policy ceiling: bind_ports 65000 is outside the allowed set
-    (EPERM)``). Rebuilding on it would silently retry a command the deployment
-    refused, so the classification must return ``None`` for ``Live`` and the
-    error must reach the caller unchanged.
+    (EPERM)``, with the stable code ``policy_denied``). Rebuilding on it would
+    silently retry a command the deployment refused, so the code must not be
+    one of the two session-gone values and the error must reach the caller
+    unchanged.
     """
+    from sandlock.exceptions import SlotRefusal
+
     sandbox_id = "sbx_rbe_refusal"
     ex = _executor(workspace, sandbox_id)
     pool = slot_pool_for(ex._route_b)
@@ -413,13 +422,14 @@ async def test_live_generation_refusal_is_not_rebuilt(
             type(ex), "_bind_ports_for", lambda self, config: [65000]
         )
         with caplog.at_level("INFO", logger="envd_service.executors.sandlock"):
-            with pytest.raises(Exception) as refusal:
+            with pytest.raises(SlotRefusal) as refusal:
                 await ex.start(_config(["/bin/true"], str(workspace)))
         assert str(refusal.value) == (
             "instance exec failed: process error: exec params exceed the "
             "instance policy ceiling: bind_ports 65000 is outside the allowed "
             "set (EPERM)"
         )
+        assert refusal.value.code == "policy_denied", refusal.value.code
         assert [
             record.message
             for record in caplog.records
@@ -428,6 +438,96 @@ async def test_live_generation_refusal_is_not_rebuilt(
         ] == []
         assert pool.slot(sandbox_id) is before_slot
         assert _proc_state(before_slot.process.pid) == "running"
+    finally:
+        ex.close()
+
+
+def _generation_init_pid(slot_pid: int, main_pid: int) -> int:
+    """The ``sandlock-init`` of the generation running under ``slot_pid``.
+
+    The tree is ``slot -> sandlock-init -> M0 main``: init is the slot's
+    direct child that is not the main. Killing init is the *machinery*
+    failure (its control link dies with no main-exit frame), i.e. the shape
+    that must read ``Dead`` -- as opposed to killing the main, which is a
+    clean container end and reads ``Exited``.
+    """
+    children = Path(f"/proc/{slot_pid}/task/{slot_pid}/children").read_text().split()
+    for child in children:
+        if int(child) != main_pid:
+            return int(child)
+    raise AssertionError(
+        f"slot {slot_pid} has no init child besides the main {main_pid}: "
+        f"{children}"
+    )
+
+
+async def test_dead_generation_refusal_is_coded_and_rebuilt_once(
+    workspace, caplog
+) -> None:
+    """A *dead* generation's refusal is coded ``generation_dead`` and rebuilt.
+
+    The machinery form, next to the clean ``Exited`` one above: killing
+    ``sandlock-init`` ends the generation's control link with no main-exit
+    frame, so the session reads ``Dead`` and every later verb is refused with
+    the dead-instance code (``sandlock-core/src/error.rs``,
+    ``SandboxRuntimeError::InstanceDead``). The slot keeps serving, so the
+    refusal arrives as prose + code -- and the executor's recovery is the
+    same rebuild-once it applies to a *typed* dead session, exactly as it was
+    when the classification had to ask for ``stats`` first.
+    """
+    from sandlock.exceptions import SlotRefusal
+
+    sandbox_id = "sbx_rbe_dead"
+    ex = _executor(workspace, sandbox_id)
+    pool = slot_pool_for(ex._route_b)
+    try:
+        running = await ex.start(_config(["/bin/true"], str(workspace)))
+        assert (await _collect(running))[0] == 0
+        first_slot = pool.slot(sandbox_id)
+        assert first_slot is not None
+        main_pid = first_slot.instance_pid
+        assert isinstance(main_pid, int) and main_pid > 0
+        init_pid = _generation_init_pid(first_slot.process.pid, main_pid)
+
+        os.kill(init_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 30.0
+        stats: dict = {}
+        while time.monotonic() < deadline:
+            stats = await asyncio.to_thread(ex._instance.stats)
+            if stats.get("instance_state") == "Dead":
+                break
+            time.sleep(0.05)
+        assert stats.get("instance_state") == "Dead", (
+            f"the generation never read Dead after its init was killed: {stats}"
+        )
+
+        with pytest.raises(SlotRefusal) as refusal:
+            await asyncio.to_thread(ex._instance.exec, ["/bin/true"])
+        assert refusal.value.code == "generation_dead", refusal.value.code
+        assert str(refusal.value) == (
+            "instance exec failed: process error: instance is dead "
+            "(listener/reaper/control-channel failure); every verb returns "
+            "this code and the instance is never silently relaunched"
+        )
+
+        with caplog.at_level("INFO", logger="envd_service.executors.sandlock"):
+            second = await ex.start(_config(["/bin/true"], str(workspace)))
+        assert (await _collect(second))[0] == 0
+        assert [
+            record.message
+            for record in caplog.records
+            if record.message.startswith("sandlock instance ")
+            and "rebuilding once" in record.message
+        ] == [
+            "sandlock instance dead during exec; rebuilding once "
+            f"sandbox_id={sandbox_id} instance_name={sandbox_id} "
+            "argv=['/bin/true']"
+        ]
+        rebuilt = pool.slot(sandbox_id)
+        assert rebuilt is not None and rebuilt is not first_slot
+        assert rebuilt.instance_pid != main_pid, (
+            "the retry must run on a fresh generation, not the dead one"
+        )
     finally:
         ex.close()
 

@@ -596,3 +596,222 @@ async def test_consume_filters_internal_eof_markers() -> None:
         queue.put_nowait(item)
     events = [item async for item in running.output()]
     assert events == [("stderr", b"x"), ("stdout", b"y")]
+
+
+# --------------------------------------------------------------------------
+# Route-B refusals: classified by the fork's stable refusal *code*
+# --------------------------------------------------------------------------
+#
+# A ``sandlock-supervise`` slot is a separate process, so its refusal cannot
+# be a typed native error: the frame carries the prose plus a stable code,
+# and the wheel surfaces the pair as ``sandlock.exceptions.SlotRefusal``
+# (``third_party/sandlock/crates/sandlock-core/src/error.rs``,
+# ``RefusalCode``). These cases pin the three-way decision the executor makes
+# on that code alone -- and that it never reads the prose.
+
+
+#: The fork's unified closed-instance prose, verbatim (``error.rs``). Used
+#: *against* the code below on purpose: a refusal whose sentence says "closed"
+#: but whose code does not must not be rebuilt (and vice versa), which is what
+#: "the text never decides" means.
+CLOSED_REFUSAL_TEXT = (
+    "instance exec failed: process error: instance is closed (shut down, or "
+    "the init channel closed after the main-exit container end); no new work "
+    "is accepted"
+)
+
+
+class _CodedRefusal(Exception):
+    """Stand-in for ``sandlock.exceptions.SlotRefusal`` (a ``SandboxError``).
+
+    Only ``.code`` is read by the executor; the class deliberately does *not*
+    subclass the real ``SandboxError`` so this suite keeps running on macOS
+    (where the wheel is absent), exactly like the ``typed_instance_gone``
+    stand-ins above.
+    """
+
+    def __init__(self, message: str, code: str | None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _refusing_executor(monkeypatch, refusal, times: int, sandbox_id="sbx_coded"):
+    """An exec-ready executor whose first ``times`` execs raise ``refusal``."""
+    attempts = [0]
+    instances: list = []
+    error = refusal
+
+    class _RefusingExec(_ExecRecordingInstance):
+        def __init__(self, policy, name=None):
+            super().__init__(policy, name=name)
+            instances.append(self)
+
+        def exec(self, cmd, stdio=..., **kwargs):  # noqa: ANN001
+            attempts[0] += 1
+            if attempts[0] <= times:
+                raise error
+            return super().exec(cmd, stdio=stdio, **kwargs)
+
+    ex = _exec_ready_executor(monkeypatch, sandbox_id)
+    monkeypatch.setattr(sl, "SandboxInstance", _RefusingExec)
+    return ex, attempts, instances
+
+
+@pytest.mark.parametrize("code", ["generation_closed", "generation_dead"])
+async def test_coded_session_gone_refusal_rebuilds_once_and_succeeds(
+    monkeypatch, code, caplog
+) -> None:
+    """``generation_closed`` / ``generation_dead`` ⇒ rebuild once, then run.
+
+    These are the two codes that mean "the generation can no longer take
+    work" (``_REFUSAL_GONE_REASONS``); both go through the *existing*
+    rebuild-once path shared with the typed in-process errors -- the fork's
+    refusal code replaced the ``stats``/``InstancePhase`` reverse-inference,
+    it did not change what the executor does with it.
+    """
+    refusal = _CodedRefusal(f"instance exec failed: refused ({code})", code)
+    ex, attempts, instances = _refusing_executor(monkeypatch, refusal, times=1)
+    cfg = ExecConfig(
+        cmd=["/bin/sh", "-c", "echo retried"],
+        env={},
+        cwd="/tmp/ws",
+        stdin_enabled=False,
+    )
+    with caplog.at_level("INFO", logger="envd_service.executors.sandlock"):
+        running = await ex.start(cfg)
+
+    assert attempts[0] == 2, "exactly one rebuild-and-retry"
+    assert len(instances) == 2, "the retry runs on a freshly built instance"
+    assert ex.instance_handle is instances[1]
+    expected = code.removeprefix("generation_")
+    assert [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("sandlock instance ")
+        and "rebuilding once" in record.message
+    ] == [
+        f"sandlock instance {expected} during exec; rebuilding once "
+        f"sandbox_id=sbx_coded instance_name=sbx_coded argv=['/bin/sh', '-c', "
+        "'echo retried']"
+    ]
+    assert ex._child_registry == {7: (4242, ["/bin/sh", "-c", "echo retried"])}
+    assert await running.exit_code() == 0
+
+
+async def test_coded_live_refusal_propagates_without_rebuilding(
+    monkeypatch, caplog
+) -> None:
+    """``policy_denied`` ⇒ the refusal reaches the caller unchanged.
+
+    A Live session refusing a wider-than-ceiling request is *not* a gone
+    session; rebuilding would silently retry a command the deployment
+    refused. The same object must surface, and no instance may be created.
+    """
+    refusal = _CodedRefusal(
+        "instance exec failed: process error: exec params exceed the "
+        "instance policy ceiling: bind_ports 65000 is outside the allowed "
+        "set (EPERM)",
+        "policy_denied",
+    )
+    ex, attempts, instances = _refusing_executor(monkeypatch, refusal, times=99)
+    cfg = ExecConfig(
+        cmd=["/bin/true"],
+        env={},
+        cwd="/tmp/ws",
+        stdin_enabled=False,
+    )
+    with caplog.at_level("INFO", logger="envd_service.executors.sandlock"):
+        with pytest.raises(_CodedRefusal) as raised:
+            await ex.start(cfg)
+    assert raised.value is refusal, "the refusal must surface unchanged"
+    assert attempts[0] == 1, "no retry"
+    assert len(instances) == 1, "no rebuild"
+    assert [
+        record.message
+        for record in caplog.records
+        if "rebuilding once" in record.message
+    ] == []
+
+
+async def test_the_refusal_text_never_decides_the_rebuild(monkeypatch) -> None:
+    """The reverse-inference pin, in code: the *code* decides, never prose.
+
+    Two refusals with the fork's verbatim closed-instance sentence: the one
+    whose code says ``policy_denied`` must not be rebuilt (a Live refusal),
+    and the one whose code says ``generation_closed`` must be -- even though
+    their sentences are identical. This is the pin the SL-12 worker could not
+    have (it had no code, so it had to ask the slot for ``stats``).
+    """
+    live = _CodedRefusal(CLOSED_REFUSAL_TEXT, "policy_denied")
+    ex, attempts, instances = _refusing_executor(
+        monkeypatch, live, times=99, sandbox_id="sbx_text_live"
+    )
+    cfg = ExecConfig(
+        cmd=["/bin/true"], env={}, cwd="/tmp/ws", stdin_enabled=False
+    )
+    with pytest.raises(_CodedRefusal):
+        await ex.start(cfg)
+    assert (attempts[0], len(instances)) == (1, 1)
+
+    gone = _CodedRefusal(CLOSED_REFUSAL_TEXT, "generation_closed")
+    ex2, attempts2, instances2 = _refusing_executor(
+        monkeypatch, gone, times=1, sandbox_id="sbx_text_gone"
+    )
+    running = await ex2.start(cfg)
+    assert (attempts2[0], len(instances2)) == (2, 2)
+    assert await running.exit_code() == 0
+
+
+async def test_an_uncoded_refusal_is_not_guessed_from_its_text(
+    monkeypatch, caplog
+) -> None:
+    """A wheel older than the code field ⇒ no rebuild, failure visible.
+
+    The fork's ``code`` rides ``ControlResponse``; a wheel built before it
+    answers with prose alone, which is exactly the shape that used to force
+    the ``stats`` reverse-inference. The executor refuses to guess: the
+    sentence below is the closed-instance one verbatim, and an uncoded
+    refusal carrying it must still propagate (fail visible) rather than
+    silently rebuild on a matched substring. envd and ``sandlock-supervise``
+    ship in the same wheel, so this shape only appears mid-upgrade -- and its
+    symptom is a *visible* failure, never a wrong rebuild.
+    """
+    uncoded = _CodedRefusal(CLOSED_REFUSAL_TEXT, None)
+    ex, attempts, instances = _refusing_executor(monkeypatch, uncoded, times=99)
+    cfg = ExecConfig(
+        cmd=["/bin/true"], env={}, cwd="/tmp/ws", stdin_enabled=False
+    )
+    with caplog.at_level("INFO", logger="envd_service.executors.sandlock"):
+        with pytest.raises(_CodedRefusal) as raised:
+            await ex.start(cfg)
+    assert raised.value is uncoded
+    assert (attempts[0], len(instances)) == (1, 1)
+    assert [
+        record.message for record in caplog.records if "rebuilding" in record.message
+    ] == []
+
+
+async def test_a_refusal_is_classified_without_ever_stringifying_it(
+    monkeypatch,
+) -> None:
+    """A refusal whose ``__str__`` explodes must still be classified.
+
+    The strongest form of "the executor never reads the refusal's text": this
+    stand-in raises from ``__str__``, so any code path that formats it --
+    the old substring match, a "reason = str(exc)" shortcut, an eager log
+    line -- turns into a loud failure here instead of a silent misdecision.
+    """
+
+    class _PoisonText(_CodedRefusal):
+        def __str__(self) -> str:
+            raise AssertionError("the refusal's text must never be read")
+
+    refusal = _PoisonText("unused", "generation_closed")
+    ex, attempts, instances = _refusing_executor(monkeypatch, refusal, times=1)
+    cfg = ExecConfig(
+        cmd=["/bin/sh", "-c", "true"], env={}, cwd="/tmp/ws", stdin_enabled=False
+    )
+    running = await ex.start(cfg)
+    assert attempts[0] == 2
+    assert len(instances) == 2
+    assert await running.exit_code() == 0

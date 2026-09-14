@@ -49,6 +49,11 @@ logger = logging.getLogger(__name__)
 # any text could contain "closed"/"dead" by accident (B1 review, minor-3).
 #
 # The map is module data so tests can substitute their own stand-in types.
+# It holds only *typed* session-gone failures -- a served route-B refusal is
+# never in here: it arrives as a coded exception
+# (:func:`_refusal_reason`), because the same exception class also covers
+# refusals that are emphatically *not* a gone session (a policy ceiling
+# conflict).
 _INSTANCE_GONE_REASONS: dict[type[BaseException], str] = {
     # Route B's slot-gone error is typed and needs no native package, so it is
     # registered regardless of whether `sandlock` imports (idle/restart of a
@@ -94,25 +99,49 @@ def _instance_gone_reason(exc: BaseException) -> str | None:
     return None
 
 
-#: Slot states (`sandlock-supervise` ``stats`` -> the fork's ``InstancePhase``)
-#: in which the generation can no longer take work, mapped to the same
+#: The fork's stable refusal codes (``sandlock-core/src/error.rs``,
+#: ``RefusalCode``; carried as ``code`` on a served ``ok:false`` answer and
+#: surfaced by the wheel as ``sandlock.exceptions.SlotRefusal.code``) that
+#: mean the generation can no longer take work, mapped to the same
 #: ``"closed"``/``"dead"`` vocabulary the typed in-process errors use.
 #:
 #: A generation is a *container*: when its M0 main child exits, `sandlock-init`
-#: collapses every group, closes the control channel and the phase reads
-#: ``Exited`` -- every later verb, `exec` included, is refused with the fork's
-#: unified closed-instance code (``sandlock-core/src/error.rs``,
-#: ``instance.rs``). ``ShutDown``/``Draining`` are a completed or starting
-#: teardown, ``Dead`` is a machinery failure (listener/reaper/channel). Only
-#: ``Live`` means "the session answered and refused this verb for its own
-#: reason" (a ceiling conflict, an unknown child) -- that refusal must reach
-#: the caller unchanged.
-_GENERATION_GONE_STATES: dict[str, str] = {
-    "Exited": "closed",
-    "ShutDown": "closed",
-    "Draining": "closed",
-    "Dead": "dead",
+#: collapses every group, closes the control channel and every later verb,
+#: `exec` included, is refused with the unified closed-instance code
+#: (``generation_closed``). ``generation_dead`` is a machinery failure
+#: (listener/reaper/channel). The other two codes -- ``policy_denied`` and
+#: ``verb_refused`` -- are a *Live* session refusing the verb for its own
+#: reason (a ceiling conflict, an unknown child, a malformed payload): that
+#: refusal is the caller's business and is never rebuilt.
+#:
+#: The missing-code shape (a wheel older than the field) is deliberately
+#: **not** in here: an uncoded answer is treated exactly like an unknown code
+#: -- propagate, no rebuild -- because guessing it from the prose is the
+#: unsound reverse-inference this table replaced. In practice envd and
+#: ``sandlock-supervise`` ship in the same wheel and cannot drift; the
+#: upgrade rule is written down in ``third_party/sandlock/docs/CHANGELOG.md``.
+_REFUSAL_GONE_REASONS: dict[str, str] = {
+    "generation_closed": "closed",
+    "generation_dead": "dead",
 }
+
+
+def _refusal_reason(exc: BaseException) -> str | None:
+    """``"closed"`` / ``"dead"`` when ``exc`` is a *coded* route-B refusal.
+
+    Route B's slot is a separate process, so its refusal cannot be a typed
+    native error: the channel carries the anchor's prose plus the fork's
+    stable ``code``, and the wheel exposes the pair as
+    ``sandlock.exceptions.SlotRefusal``. This reads that code -- and **only**
+    that code. ``None`` for a Live refusal (``policy_denied`` /
+    ``verb_refused``), for an uncoded answer from an older wheel, and for
+    every exception that carries no code at all; all of those propagate
+    unchanged.
+    """
+    code = getattr(exc, "code", None)
+    if not isinstance(code, str):
+        return None
+    return _REFUSAL_GONE_REASONS.get(code)
 
 
 # The six single-node /dev mounts of the fork ``sandlock.minimal_dev()``
@@ -635,40 +664,6 @@ class SandlockExecutor(Executor):
         fixed at instance creation; ``None`` clears the allowance.
         """
         self._mcp_bind_port = int(port) if port is not None else None
-
-    async def _generation_gone_reason(self, inst) -> str | None:
-        """``"closed"``/``"dead"`` when the *slot's* generation is over.
-
-        The in-process backend raises the typed ``InstanceClosedError`` /
-        ``InstanceDeadError`` for this, and :func:`_instance_gone_reason` maps
-        them. A route-B slot is a separate process, so its refusal crosses the
-        channel as a plain ``SandboxError`` string and the type is gone -- the
-        executor therefore asks the *slot* what state its generation is in
-        instead of reading its prose: ``stats`` answers with the fork's own
-        ``InstancePhase``.
-
-        An unreadable reply means the slot itself stopped answering (what
-        ``SlotDeadError`` covers on the verb path) and ``launched: false``
-        means the slot never brought a session up; both are "build a new one"
-        exactly like the typed dead class. Everything else -- a ``Live``
-        session that refused the verb for its own reason -- returns ``None``,
-        so that refusal propagates unchanged.
-
-        Runs off the loop: a slot serves one verb at a time, so this probe
-        must never block the event loop.
-        """
-        try:
-            stats = await asyncio.to_thread(inst.stats)
-        except Exception as exc:  # noqa: BLE001 - an unanswerable slot is gone
-            logger.info(
-                "sandlock route-B stats probe failed sandbox_id=%s error=%r",
-                self._sandbox_id or "-",
-                exc,
-            )
-            return "dead"
-        if not isinstance(stats, dict) or stats.get("launched") is False:
-            return "dead"
-        return _GENERATION_GONE_STATES.get(str(stats.get("instance_state")))
 
     def _log_exec_failure_context(
         self, config: ExecConfig, resolved: list[str]
@@ -1761,10 +1756,12 @@ class SandlockExecutor(Executor):
         resized through ``ExecProcess.resize``) instead of the removed
         in-sandbox bridge; everything else uses ``ExecStdio.PIPED``. Per-exec
         cwd/env/clean_env/bind_ports come from ``_exec_params``. A
-        closed/dead ``RuntimeError`` from ``inst.exec`` (idle-15min/24h
-        instance expiry surfaces at exec time, not construction) rebuilds the
-        instance exactly once under the lifecycle lock and retries the exec;
-        after an explicit ``close()``/shutdown the executor fails loudly
+        closed/dead failure from ``inst.exec`` -- the in-process FFI's typed
+        ``InstanceClosedError``/``InstanceDeadError``, or a route-B slot's
+        coded refusal (idle-15min/24h instance expiry surfaces at exec time,
+        not construction) -- rebuilds the instance exactly once under the
+        lifecycle lock and retries the exec; after an explicit
+        ``close()``/shutdown the executor fails loudly
         instead of rebuilding.
         """
         if sandlock is None:
@@ -1800,14 +1797,14 @@ class SandlockExecutor(Executor):
             # Two independent ways a session can be gone, and both rebuild
             # exactly once: the in-process FFI reports it as a *typed* error,
             # while a route-B slot answers a *served* refusal whose type the
-            # channel erases (``route_b.py``). The second shape is classified
-            # from the slot's own state machine, never from its prose -- the
-            # same rule the typed path follows (B1 minor-3: a message that
-            # merely mentions closed/dead must not decide a rebuild; the pin
-            # lives in ``tests/unit/test_sandlock_executor_instance.py``).
+            # channel cannot carry -- but which arrives with the fork's stable
+            # refusal *code* attached (``_refusal_reason``). Neither shape is
+            # ever classified from prose (B1 minor-3: a message that merely
+            # mentions closed/dead must not decide a rebuild; the pin lives in
+            # ``tests/unit/test_sandlock_executor_instance.py``).
             reason = _instance_gone_reason(exc)
-            if reason is None and self._route_b_active:
-                reason = await self._generation_gone_reason(inst)
+            if reason is None:
+                reason = _refusal_reason(exc)
             if reason is None:
                 logger.warning(
                     "sandlock exec failed sandbox_id=%s instance_name=%s "
