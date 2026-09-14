@@ -229,6 +229,15 @@ sandlock 官方支持非 root 运行（uid 65534 全绿）——worker 应以非
   通过 `POST /internal/nodes/{id}/reconcile` 双向对账——本地不再运行的
   记录删除、仍在运行的记录恢复 `running`、控制面已删除记录的本地运行时
   由 worker 侧清理。
+  **2026-09-14 补正：**该扫描**不得触碰 `paused`**。暂停时 worker 用
+  `killpg(SIGSTOP)` 冻结整棵进程组，而 SDK 唯一的解冻入口（`Sandbox.connect`
+  的自动解冻）只在 `state == "paused"` 时投递 resume；一旦被抹成 `orphaned`，
+  connect 连 resume 都不发 ⇒ **进程组永久停在 `T` 态，控制面却回 200 connected**，
+  且日志对调用方完全静默（`recover_node` 只 `append_log`）。`paused` 在暂停时
+  已归还配额、TTL 本就跳过，是唯一能推出解冻的状态，因此必须保态。
+  修法见 `control_plane/registry/manager.py::mark_orphaned` 的
+  `state != "paused"` 守卫；回归用例 `test_connect_auto_resume_survives_a_node_health_sweep`、
+  `test_partition_leaves_a_paused_sandbox_paused`、`test_paused_sandbox_survives_a_stalled_worker_heartbeat`。
 - **镜像 tag 非 digest**（低-中，供应链）：`E2B_BASE_IMAGE` 用 tag，
   tag 可被替换。已修复（E6.2）：`.env.example` 改 `@sha256:` 形式；
   `upgrade.sh` 校验 digest 格式（`--allow-tag-base-image` 显式放行 tag），
