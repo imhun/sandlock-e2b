@@ -95,6 +95,43 @@ def test_partition_orphans_sandboxes_and_ttl_skips(workspace):
     assert registry.get("sbx_part_a1").state == "orphaned"
 
 
+def test_partition_leaves_a_paused_sandbox_paused(workspace):
+    """A paused sandbox keeps its state through the node-health sweep.
+
+    Orphaning it would protect nothing -- a paused record already gave its
+    node/global/tenant reservations back and TTL expiry already skips it --
+    while destroying the one fact the resume path needs: ``paused`` is what
+    makes ``Sandbox.connect``'s auto-resume (the SDK's only public resume
+    surface) push the thaw to the worker that holds the frozen child. Left
+    ``paused`` (or flipped to ``running`` by ``recover_node``) the worker's
+    SIGSTOPped process tree can never be thawed again.
+    """
+    nodes, registry, _app = _make_control(workspace)
+    _register_node(nodes, "node_a", "http://127.0.0.1:11111")
+    paused = _sandbox_on(registry, "node_a", "sbx_part_paused")
+    running = _sandbox_on(registry, "node_a", "sbx_part_running")
+    registry.pause(paused)
+
+    nodes.get("node_a").heartbeat_at = time.time() - 10
+    assert nodes.reap_unhealthy(registry) == ["node_a"]
+    assert registry.get("sbx_part_paused").state == "paused"
+    assert registry.get("sbx_part_running").state == "orphaned"
+
+    # TTL already skips both states; recovery reconciliation must not turn the
+    # paused sandbox into a ``running`` one whose worker was never thawed.
+    for record in (paused, running):
+        record.end_at = utcnow() - timedelta(seconds=10)
+    assert registry.remove_expired() == []
+    recovered = registry.recover_node(
+        "node_a",
+        {"sbx_part_paused", "sbx_part_running"},
+        {"sbx_part_paused", "sbx_part_running"},
+    )
+    assert recovered["recovered"] == ["sbx_part_running"]
+    assert registry.get("sbx_part_paused").state == "paused"
+    assert registry.get("sbx_part_running").state == "running"
+
+
 @pytest.mark.asyncio
 async def test_recovery_reconcile_endpoints(workspace):
     """The worker's recovery report restores records it still runs and

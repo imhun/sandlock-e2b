@@ -1275,9 +1275,29 @@ class SandboxRegistry:
         its running processes (which would keep the deleted inode open).
         Recovery reconciliation (``recover_node``) flips them back to
         ``running`` when the worker reconnects and reports them.
+
+        A **``paused``** record is left exactly as it is. Orphaning it would
+        protect nothing -- it already released its node/global/tenant
+        reservations when it paused, and TTL expiry already skips it
+        (:meth:`SandboxRegistry.remove_expired`) -- while destroying the one
+        fact the resume path is built on: *paused* is what tells the control
+        plane that the hosting worker may still hold a SIGSTOPped process
+        tree whose thaw has to be pushed to that worker. Only
+        ``connect_sandbox``'s auto-resume (the SDK's only public resume
+        surface) gates on it, so a paused record the sweep flipped to
+        ``orphaned`` -- and that ``recover_node`` later restored to
+        ``running`` when the worker reported it -- comes back as a sandbox
+        that the SDK can talk to while every command on it stays frozen
+        forever. A node that loses its heartbeat while a sandbox is paused
+        therefore keeps that sandbox ``paused``; the SDK's next
+        ``Sandbox.connect`` re-books capacity, pushes the thaw, and (when the
+        node really is gone) reads the documented best-effort transport
+        caveat, exactly like every other resume.
         """
         marked: list[SandboxRecord] = []
         for record in self.list_by_node(node_id):
+            if record.state == "paused":
+                continue
             if record.state != "orphaned":
                 record.state = "orphaned"
                 record.append_log("node unreachable; sandbox orphaned")

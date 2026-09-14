@@ -16,6 +16,7 @@ a real uvicorn stub worker:
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -374,6 +375,42 @@ async def test_connect_auto_resume_pushes_resume_to_remote_worker(remote_harness
     assert connected.status_code == 200
     assert stub.resume_calls == ["sbx_remote_connect"]
     assert _ledgers(control, "sbx_remote_connect") == (512, 512, "running")
+
+
+async def test_connect_auto_resume_survives_a_node_health_sweep(remote_harness):
+    """A paused sandbox on a node that lost its heartbeat still thaws.
+
+    E6.1's health sweep orphans the sandboxes of a remote node once its
+    heartbeat goes stale, so TTL cannot delete them under a live worker. A
+    *paused* record must keep its state through that sweep: ``paused`` is what
+    makes ``Sandbox.connect`` -- the SDK's only public resume surface --
+    re-book capacity and push the thaw to the hosting worker. Orphaning it
+    (and the ``recover_node`` that later restores such a record to
+    ``running`` when the worker reports it) leaves the worker's SIGSTOPped
+    process tree with no resume path left: the SDK gets a connected sandbox
+    whose every command stays frozen.
+    """
+    control = remote_harness["control"]
+    stub = remote_harness["stub"]
+    await _create(control, "sbx_sweep_paused")
+    assert (await _call(control, "sbx_sweep_paused", "pause")).status_code == 204
+    assert stub.pause_calls == ["sbx_sweep_paused"]
+
+    # The worker's heartbeat goes stale. This is the exact call the control
+    # plane's 1s node-health loop makes, against the same registry.
+    control.state.nodes.get("worker-1").heartbeat_at = time.time() - 3600.0
+    assert control.state.nodes.reap_unhealthy(control.state.registry) == []
+    assert control.state.registry.get("sbx_sweep_paused").state == "paused"
+    # ...and the worker's next heartbeat (5s cadence in production) puts the
+    # node back on the healthy list, which is what lets the resume re-book
+    # capacity on it. Only the record's own state survived the gap.
+    control.state.nodes.heartbeat("worker-1")
+
+    connected = await _connect(control, "sbx_sweep_paused")
+
+    assert connected.status_code == 200
+    assert stub.resume_calls == ["sbx_sweep_paused"]
+    assert _ledgers(control, "sbx_sweep_paused") == (512, 512, "running")
 
 
 async def test_connect_auto_resume_explicit_error_rolls_back_and_raises_502(
