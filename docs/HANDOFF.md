@@ -1264,8 +1264,11 @@ ImageResolutionError: failed to resolve image registry…/python-mcp:3.14@sha256
 `--allow-tag-base-image`，同轮 upgrade 的多节点 + 部署级冒烟随即全绿（⇒ 与同一轮发布的 seccomp
 收敛无关，见 §2.4.5）。**代码已修**（`envd_service/runtime/oci_registry.py`：
 只在最后一个路径段剥 tag），回归 `tests/unit/test_oci_registry.py` 两条（解析层 + 用假 registry
-端到端解析 digest 固定引用，修复前一红一 error）；**线上仍是修复前的镜像** ⇒ 要真上 E6.2 还需
-重建 worker 镜像并升级，见 §2.6.2。
+端到端解析 digest 固定引用，修复前一红一 error）。**同日已落地**：`build-and-push.sh` 出
+`0.1.0-281-gbd88421-20260915-185036`，`.env` 的 `E2B_BASE_IMAGE` 钉成
+`registry…/python-mcp:3.14@sha256:3675662d…`，升级后 worker 日志实测
+`resolved base image …@sha256:3675662d… to rootfs` 与 `worker image warmed: …@sha256:…`，
+多节点 + 部署级冒烟全绿（换 digest 后第一次建箱要等预热，见 §2.6.2）。
 
 **iam（SDK 工作负载身份）已实现**：控制面 create 接受 `iam.tokens`
 （兼容 wire 的 camelCase `tokenType` 与 snake_case），存到沙箱记录并透传

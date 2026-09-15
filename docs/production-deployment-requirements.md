@@ -549,10 +549,17 @@ ImageResolutionError: failed to resolve image registry…/python-mcp:3.14@sha256
 （解析层）与 `::test_resolve_rootfs_from_a_digest_pinned_ref`（用假 registry 端到端解析一个
 digest 固定的引用；修复前这两条一红一 error）。
 
-⚠️ **线上尚未生效**：目标机跑的仍是修复前的 worker 镜像，所以线上 `E2B_BASE_IMAGE` 现在还是
-tag + `--allow-tag-base-image`。要真正落地 E6.2 需要：① `build-and-push.sh` 重建 worker 镜像
-并升级；② 把 `.env` 的 `E2B_BASE_IMAGE` 改成 `tag@digest`（digest 要在**目标机**上解析，
-不要用本机 OrbStack 的结果）。
+✅ **已落地（2026-09-15 同日）**：`build-and-push.sh` 出新版本
+`0.1.0-281-gbd88421-20260915-185036`（重建后 `python-mcp:3.14` 的 manifest list digest 仍是
+`sha256:3675662d…`，base 内容未变），`.env` 把 `E2B_BASE_IMAGE` 改成 `tag@digest` 后
+`upgrade.sh` 升级完成。线上实测：worker 日志
+`resolved base image …@sha256:3675662d… to rootfs …` 与 `worker image warmed: …@sha256:3675662d…`，
+多节点 + 部署级冒烟全绿（`tmp/build-push-resolver-fix.log`、`tmp/upgrade-resolver-fix.log`）。
+
+两条运维注意：① **换 digest 就是换缓存条目** —— 升级后第一次建箱要等预热，抢在预热完成前创建
+会拿到 428 `warm_required`（`upgrade.sh` 内置的那次冒烟就撞上过，补跑 `smoke.sh` 即绿）；
+② 重建 base 镜像（`build-and-push.sh` 的 `MIRROR_BASE_IMAGE=1`）会换 digest，必须同步更新
+`.env` 的钉值 —— tag 变更不更新 digest 会被 `upgrade.sh` 按 E6.2 拒绝，这正是它的意图。
 
 ### 2.6.3 已知退路：`<image>.digest` 侧车（本轮不做）
 
