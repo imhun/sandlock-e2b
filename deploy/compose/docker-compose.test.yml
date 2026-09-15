@@ -5,10 +5,13 @@ services:
       dockerfile: deploy/docker/Dockerfile.test-runner
     image: e2b-sandlock-test:latest
     working_dir: /workspace
-    # Non-privileged production shape: seccomp must be unconfined (sandlock
-    # needs a user namespace; Docker's default profile would EPERM it),
-    # NET_ADMIN for the wildcard local-origin fixture, host network for
-    # registry/Redis localhost ports.
+    # Non-privileged production shape. seccomp stays unconfined *here* because
+    # this image runs the whole suite, including the loop/XFS and mount
+    # dependent gates -- the deployed worker itself uses
+    # deploy/seccomp/sandlock-worker.json (Docker's default profile plus
+    # `pidfd_getfd` and `unshare`; see deploy/seccomp/README.md). NET_ADMIN is
+    # for the wildcard local-origin fixture, host network for registry/Redis
+    # localhost ports.
     security_opt:
       - seccomp=unconfined
     cap_add:

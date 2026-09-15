@@ -25,6 +25,10 @@ set -eu
 
 IMAGE="${1:-e2b-sandlock-test:latest}"
 BASE_IMAGE="${E2B_BASE_IMAGE:-python:3.14-slim}"
+# The shipped worker syscall filter (deploy/seccomp/README.md). This smoke is
+# meant to be the deployment shape, so it uses the profile the manifests do
+# rather than `seccomp=unconfined`.
+SECCOMP_PROFILE="${SECCOMP_PROFILE:-$(pwd)/deploy/seccomp/sandlock-worker.json}"
 # Scratch that uid 65534 can actually write (the image's own
 # /var/lib/e2b-test-runtime is root-owned); container-native, so ownership and
 # 0770 workspaces still behave like the deployment.
@@ -35,7 +39,7 @@ docker run --rm \
     --user 65534:65534 \
     --cap-drop ALL \
     --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE \
-    --security-opt seccomp=unconfined \
+    --security-opt seccomp="$SECCOMP_PROFILE" \
     -e HOME=/tmp -e TMPDIR=/tmp \
     -e E2B_TEST_TMP_ROOT="$TEST_TMP_ROOT" \
     -e E2B_BASE_IMAGE="$BASE_IMAGE" \

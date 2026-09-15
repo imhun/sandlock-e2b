@@ -367,11 +367,64 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
   的清单，不如把口径写死在这里；等有真实 k8s + XFS 环境再补清单，并把本节改成「已提供」。
   `deploy/k8s/worker.yaml` 的 A6 注释块指向本节。
 
+### 2.4.5 worker seccomp 面：从 `unconfined` 收敛到「默认档 + 2 条」（2026-09-15）
+
+**结论**：worker 容器不再用 `seccomp=unconfined`，改用
+`deploy/seccomp/sandlock-worker.json` —— **Docker 默认 profile 加恰好两条 syscall**
+（`pidfd_getfd`、`unshare`；做法是把这两个名字从各自的 capability 门控组移到无条件白名单，
+其余条目一律不动）。理由、证据与重新生成方式见 `deploy/seccomp/README.md`。
+
+**为什么是这两条**（2026-09-15 实测，x86_64 容器 `CapEff=0xa80425fb`，无
+`SYS_ADMIN`／`SYS_PTRACE`；同容器只换 seccomp 档，按 errno 判定）：
+
+| syscall | 默认档 | unconfined | 判定 |
+|---|---|---|---|
+| `pidfd_getfd` | `EPERM` | `EBADF` | **profile 拦**：sandlock 用它取子进程的 seccomp-notif fd（`sandbox.rs::dup_child_fd`），缺它沙箱建不起来 |
+| `unshare(CLONE_NEWUSER)` | `EPERM` | `ok` | **profile 拦**：per-sandbox host uid（E3.2）、route-B F18 自映射、`net_isolation`、`pid_ns` 都靠它 |
+| `unshare(NEWNET/NEWPID/NEWNS)` | `EPERM` | `EPERM` | **内核 capability 拒的，不是 seccomp**（容器无 `SYS_ADMIN`） |
+| `pidfd_open`、`process_vm_readv/writev`、`seccomp(SET_MODE_FILTER)`、`setgroups`、`ptrace` | 放行 | 放行 | 默认档本来就够，无需补白 |
+| `mount`、`keyctl`、`bpf`、`clone3` | `EPERM`/`EPERM`/`EPERM`/`ENOSYS` | `ENOENT`/`EINVAL`/`EINVAL`/`EINVAL` | 保持拒绝不动（不需要） |
+
+端到端（真实建箱 + 执行命令）：默认档 ❌ 建箱失败；默认档 + **仅** `pidfd_getfd` ✅；
+默认档 + **仅** `unshare` ❌；两条齐（或 unconfined）✅。⇒ `pidfd_getfd` 是基线必需，
+`unshare` 是命名空间类路径必需；当前 `E2B_PER_SANDBOX_UID` 默认开且 route-B 槽位在用，
+**所以两条都要**。
+
+**安全边界（该收敛的关键前提）**：沙箱**不继承**这份放宽 —— 沙箱内
+`unshare(CLONE_NEWUSER)` 在本 profile 与 unconfined 下**都是 `EPERM`**（sandlock 自己的
+过滤器挡的，实测）。放宽面只到 worker/supervisor。
+
+**落地要求**：
+
+- **compose**（`deploy/compose/docker-compose.prod.yml`、`deploy/stack/docker-compose.prod.yml`）：
+  `seccomp=../seccomp/sandlock-worker.json`。Compose 读取该文件并随请求下发，相对路径按
+  compose 文件所在目录解析（已实测：Compose 渲染出的容器里 `unshare(NEWUSER)` 成功）。
+  ⚠️ **只拷单个 compose 文件的部署（线上 `/opt/sandlock/` 那种）没有 `../seccomp/`**
+  ⇒ 必须把 profile 一起放上去并用 `E2B_SECCOMP_PROFILE=<绝对路径>` 指过去；用
+  `docker compose config` 检查渲染值，别等到 `up` 才失败。
+- **k8s**（`deploy/k8s/worker.yaml`）：`seccompProfile: {type: Localhost,
+  localhostProfile: sandlock-worker.json}`。Localhost profile 是**节点本地状态** ——
+  **上线前必须把 `deploy/seccomp/sandlock-worker.json` 装到每个节点的
+  `/var/lib/kubelet/seccomp/`**（kubelet 的 seccomp 根目录），否则 pod 起不来。
+  顺带：`Localhost` 是 Pod Security `baseline` 的允许值，而 `Unconfined` 不是。
+- **生产形 lane**：`deploy/scripts/test-prod-shaped.sh` 与
+  `deploy/scripts/smoke-prod-worker.sh` 改用同一文件（`SECCOMP_PROFILE=` 可覆盖）
+  ⇒ 门禁跑的就是上线形态，而不是比它更宽的形态。
+
+**仍然 `unconfined` 的两处（有意保留）**：`docker-compose.prod.yml`/`docker-compose.stack` 里的
+`moby/buildkit:rootless`（构建器需要完整 syscall 面，与沙箱能力无关）；
+`docker-compose.test.yml` 的测试镜像（要跑 loop/XFS/mount 依赖的那批门禁）。
+
+**尚未取证的最后一环**：本机内核（OrbStack）写 `uid_map` 一律 EPERM，所以
+`net_isolation`/`pid_ns` 的端到端只能在目标机验证；本次改动的"profile 可用"证据全部来自
+syscall 级实测 + 真实建箱（见上表），**上游门禁（`test-prod-shaped.sh` 全量）需在 Linux 目标形态复跑**。
+
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
 - **`deploy/scripts/test-prod-shaped.sh`（生产形，默认推荐）**：容器不带 `--privileged`，
   `--cap-drop ALL` 后给一组部署等价 cap（Docker 默认集 + `SYS_PTRACE` `NET_ADMIN`，
-  `seccomp=unconfined`）。⚠️ A6 之后清单**已不再声明 `SYS_ADMIN`**，而脚本默认仍加着它
+  `seccomp=<deploy/seccomp/sandlock-worker.json>`，2026-09-15 起与上线清单同一份 profile，
+  `SECCOMP_PROFILE=` 可覆盖）。⚠️ A6 之后清单**已不再声明 `SYS_ADMIN`**，而脚本默认仍加着它
   ⇒ 不带参数的 lane 是清单的**超集**；**无 `SYS_ADMIN` 的形态由 A7 的参数固化**：
   `PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh`
   （实测 `1075 passed, 3 skipped, 0 failed`，`tmp/a7-nosa.log`）。

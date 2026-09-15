@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Deploy / upgrade the stack on the target server (runs as the deploy user).
 #   * upload deploy/stack/docker-compose.prod.yml
+#   * upload deploy/seccomp/sandlock-worker.json (the worker's syscall filter)
+#     and point E2B_SECCOMP_PROFILE at its absolute path on the target -- the
+#     compose file's `../seccomp/...` default only resolves from a checkout
 #   * upload .env (local deploy/stack/.env or --env-file; first deploy generates one)
 #     - existing remote secrets are preserved unless --force-env
 #     - image tags are pinned to VERSION (default: git describe; override
@@ -270,9 +273,25 @@ if [ -n "$QUOTA_PROFILE_ARGS" ]; then
     require_pinned_quota_agent_image "${ENV_FILE:-}" || exit 1
 fi
 
+# --- worker seccomp profile (2026-09-15) ------------------------------------
+# The profile is a *file the compose client reads* (see deploy/seccomp/README.md),
+# so it does not travel with docker-compose.prod.yml: a host that only has that
+# file would fail to start the worker. Upload it next to the compose file and
+# fill E2B_SECCOMP_PROFILE in with the absolute remote path (the compose
+# default `../seccomp/sandlock-worker.json` is relative to the checkout layout).
+SECCOMP_PROFILE_LOCAL="$REPO_DIR/deploy/seccomp/sandlock-worker.json"
+SECCOMP_PROFILE_REMOTE="$REMOTE_DIR/seccomp/sandlock-worker.json"
+[ -f "$SECCOMP_PROFILE_LOCAL" ] || { echo "缺少 $SECCOMP_PROFILE_LOCAL" >&2; exit 1; }
+if [ -n "$ENV_FILE" ] && [ -z "$(env_file_value "$ENV_FILE" E2B_SECCOMP_PROFILE)" ]; then
+    set_env_file_value "$ENV_FILE" E2B_SECCOMP_PROFILE "$SECCOMP_PROFILE_REMOTE"
+    say "已设置 E2B_SECCOMP_PROFILE=$SECCOMP_PROFILE_REMOTE"
+fi
+
 say "上传部署文件到 $REMOTE_DIR"
 upload_file "$COMPOSE" "$REMOTE_DIR/docker-compose.prod.yml" "$DEPLOY_USER"
 upload_file "$STACK_DIR/buildkitd.toml" "$REMOTE_DIR/buildkitd.toml" "$DEPLOY_USER"
+run_as_deploy "mkdir -p '$REMOTE_DIR/seccomp'"
+upload_file "$SECCOMP_PROFILE_LOCAL" "$SECCOMP_PROFILE_REMOTE" "$DEPLOY_USER"
 if [ -n "$ENV_FILE" ]; then
     upload_file "$ENV_FILE" "$REMOTE_DIR/.env" "$DEPLOY_USER"
 fi

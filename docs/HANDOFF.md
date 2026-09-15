@@ -1242,6 +1242,14 @@ htpasswd 路径 bug：容器内写文件必须走 `/workspace` 挂载视图（da
 宿主解析 `-v` 源路径，写宿主绝对路径会落进容器自身文件系统、daemon 在
 宿主建目录导致 registry 登录 400）。
 
+> **更正（2026-09-15）**：上面「worker 容器必须 `seccomp=unconfined`」不再成立。实测该默认档
+> 只拦 sandlock 需要的两条 syscall —— `pidfd_getfd`（取子进程 notif fd）与
+> `unshare(CLONE_NEWUSER)`（userns）；`unshare(NEWNET/NEWPID/NEWNS)` 那条被算进 seccomp，
+> 实际是**缺 `CAP_SYS_ADMIN` 的内核拒绝**。现在改用
+> `deploy/seccomp/sandlock-worker.json`（默认档 + 这 2 条，从各自的 cap 门控组移到无条件白名单），
+> compose/k8s 清单与两条生产形 lane 都已切换；k8s 走 `Localhost` profile，节点需预装文件。
+> 口径与证据见 `docs/production-deployment-requirements.md` §2.4.5 与 `deploy/seccomp/README.md`。
+
 **iam（SDK 工作负载身份）已实现**：控制面 create 接受 `iam.tokens`
 （兼容 wire 的 camelCase `tokenType` 与 snake_case），存到沙箱记录并透传
 worker；executor 在注入时把 `${e2b.identity.tokens.<name>}` 占位符（含

@@ -44,6 +44,12 @@ set -eu
 cd "$(dirname "$0")/../.."
 
 IMAGE="${IMAGE:-e2b-sandlock-test:latest}"
+# The shipped worker syscall filter (deploy/seccomp/README.md): the Docker
+# default profile plus the two syscalls the sandbox-create path needs. This
+# lane exists to reproduce the deployed shape, so it must run the profile that
+# deploys -- `seccomp=unconfined` proved the code works under a filter the
+# worker does not have. Override SECCOMP_PROFILE to widen it deliberately.
+SECCOMP_PROFILE="${SECCOMP_PROFILE:-$(pwd)/deploy/seccomp/sandlock-worker.json}"
 CAPS="--cap-drop ALL"
 # PROD_DROP_CAPS=SYS_ADMIN,SYS_PTRACE (or any cap in the list below) narrows
 # the lane to the pinned production shape. It has to *remove the cap from the
@@ -122,7 +128,7 @@ fi
 
 # shellcheck disable=SC2086
 docker run --rm --init --network host \
-    $CAPS $EXTRA_CAPS --security-opt seccomp=unconfined \
+    $CAPS $EXTRA_CAPS --security-opt seccomp="$SECCOMP_PROFILE" \
     --security-opt apparmor=unconfined \
     -e E2B_HOST_PROJECT="$(pwd)" \
     -e E2B_TEST_STRICT_SKIPS=1 \
@@ -150,7 +156,7 @@ if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
     docker run --rm --init --network host --user 65534:65534 \
         --cap-drop ALL \
         --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE \
-        --security-opt seccomp=unconfined \
+        --security-opt seccomp="$SECCOMP_PROFILE" \
         --security-opt apparmor=unconfined \
         -e HOME=/tmp -e TMPDIR=/tmp \
         -e E2B_HOST_PROJECT="$(pwd)" \

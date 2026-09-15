@@ -52,6 +52,10 @@ services:
   buildkit:
     image: moby/buildkit:rootless
     security_opt:
+      # buildkit is a builder, not a sandlock worker: it legitimately needs the
+      # whole syscall surface, so it stays unconfined (it is also irrelevant to
+      # what the sandbox can do). The worker below is the one that must run the
+      # narrowed profile.
       - seccomp=unconfined
       - label=disable
     volumes:
@@ -276,7 +280,13 @@ services:
       # the cap -- and the declaration is harmless in that case too).
       - net.ipv4.ip_unprivileged_port_start=0
     security_opt:
-      - seccomp=unconfined
+      # Docker's default syscall filter plus the two syscalls the sandbox-create
+      # path needs (`pidfd_getfd` for the seccomp-notification fd, `unshare` for
+      # the user namespace). `seccomp=unconfined` used to stand here; the
+      # profile is strictly narrower and is what the deployment is verified
+      # against -- see deploy/seccomp/README.md. Override the path with
+      # E2B_SECCOMP_PROFILE when the profile does not sit next to this file.
+      - seccomp=${E2B_SECCOMP_PROFILE:-../seccomp/sandlock-worker.json}
     restart: unless-stopped
 
   worker-2:

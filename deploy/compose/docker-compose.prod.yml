@@ -202,7 +202,19 @@ services:
       # in-container sysctl write). MCP inbound ports are 50005+.
       - net.ipv4.ip_unprivileged_port_start=0
     security_opt:
-      - seccomp=unconfined
+      # The worker is the process that builds every sandbox, so it is the one
+      # that needs a user namespace and the seccomp-notification fd from the
+      # child. `deploy/seccomp/sandlock-worker.json` is the Docker default
+      # syscall filter plus exactly those two syscalls (`pidfd_getfd`,
+      # `unshare`); see that directory's README for the measurements. Never go
+      # back to `seccomp=unconfined`: it drops the whole default filter from the
+      # container, and this profile is what the deployment is verified against.
+      #
+      # The default path is relative to this file, which is what a checkout
+      # gets. A host that keeps only the compose file (the /opt/sandlock
+      # single-file layout) must point E2B_SECCOMP_PROFILE at wherever it put
+      # the profile -- an absolute path is the safe form there.
+      - seccomp=${E2B_SECCOMP_PROFILE:-../seccomp/sandlock-worker.json}
     restart: unless-stopped
 
   worker-2:
