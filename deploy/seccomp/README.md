@@ -24,6 +24,35 @@ kept verbatim, so a deployment that does carry a capability (e.g. the
 quota-agent's `SYS_ADMIN`, or the test runner's) keeps exactly the access the
 kernel would have granted it anyway.
 
+### Which rows are deltas, and which are just the default
+
+Only **`pidfd_getfd` and `unshare` are changes**: the default profile gates them
+(behind `CAP_SYS_PTRACE` / `CAP_SYS_ADMIN`) and neither worker shape carries
+those capabilities. The other three are here because this file was generated
+from an older revision of the default profile that still gated them; current
+daemons allow all three unconditionally, and the supervisor does use them, so
+leaving them gated would make this profile *stricter than the default* and break
+the sandbox-create path:
+
+| syscall | supervisor use |
+|---|---|
+| `ptrace` | fork tracking for process accounting / per-child handling (`PTRACE_SEIZE` + `PTRACE_O_TRACEFORK/VFORK/CLONE`, `resource.rs`), checkpoint capture (`checkpoint/capture.rs`) |
+| `process_vm_readv` | seccomp-notif argument reads (`read_child_mem`), netlink struct reads (`netlink/handlers.rs`), checkpoint memory capture |
+| `process_vm_writev` | checkpoint restore (`checkpoint/restore_blob.rs`) — the only one not on a hot path |
+
+None of this reaches sandbox code: sandlock's own `DEFAULT_BLOCKLIST_SYSCALLS`
+lists `ptrace`, `process_vm_readv`, `process_vm_writev`, `unshare`, `setns`,
+`mount` and `bpf`, and a probe run **inside** a sandbox under this profile gets
+`EPERM` for every one of them (measured 2026-09-15,
+`tmp/seccomp-probe/sandbox_syscalls.py`). The container-level allowances are for
+the worker/supervisor only.
+
+`process_vm_writev` is the single candidate for going *below* the default
+(checkpoint restore is not part of what E2B exposes); that would be a deliberate
+deviation to argue for on its own merits, not something this file does silently.
+`ptrace` and `process_vm_readv` cannot be re-gated without breaking fork
+tracking and the notification path.
+
 ## Evidence (measured 2026-09-15, Docker on x86_64)
 
 `errno` of the same probe under the default profile vs `seccomp=unconfined` in
