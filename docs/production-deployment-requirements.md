@@ -67,6 +67,24 @@ F1 探针当时判"userns 需要 `CAP_SYS_ADMIN`"，那是在**本机 OrbStack �
 触发条件与前置清单见 `docs/superpowers/plans/2026-09-10-shared-volume-cwd-and-backlog-closeout.md`
 「Track U」。
 
+> **二次更正（2026-09-15，本机实测，撤回上面的"本机环境假象"归因）**：那批探针把失败归给
+> "本机 OrbStack 内核对 `uid_map` 写入一律 EPERM" **不成立**。同一台机器上，只要容器的
+> seccomp 档放行 `unshare`（`unconfined`，或现在上线的
+> `deploy/seccomp/sandlock-worker.json`）：
+> - 能力矩阵四档全部通过：`root + 默认 caps`、`root + 仅 SYS_ADMIN`、
+>   `root + 仅 SETUID,SETGID`、`uid 65534 + SETUID,SETGID` ——
+>   `unshare(CLONE_NEWUSER)` 成功且 `uid_map`/`gid_map` 写入成功；
+> - 本地 lane 跑 `tests/contract/test_route_b_executor.py` = `14 passed`，槽位日志
+>   `guest-uid=uid-0-in-userns`（含 SYS_ADMIN 与 `PROD_DROP_CAPS=SYS_ADMIN` 两种形态一致）。
+>
+> 真正的门槛在**容器运行时**：Docker 默认 seccomp 档把 `unshare` 放在
+> `includes.caps: [CAP_SYS_ADMIN]` 组里（实测默认档 `unshare(NEWUSER)`=EPERM、`unconfined`=ok），
+> 所以当初"某档 BND 失败、加 `SYS_ADMIN` 就成功"的整张矩阵，是 **seccomp 的能力门控**，
+> 与内核无关；`newuidmap`+subuid 那条路另有自己的前提（helper 特权、`/etc/subuid` 按
+> **调用者用户名**配段、挂载非 `nosuid`、无 NNP）。
+> ⇒ **本地完全能做 userns（以及 `net_isolation`）的验证**；"只能上目标机验"的说法撤回，
+> `.superpowers/sdd/task-usernsprobe-report.md` §6 的那条建议随之失效。
+
 | broker（`/var/lib/e2b-priv/`） | file caps | 调用形态 |
 |---|---|---|
 | `e2b-slot-spawn` | `cap_setuid,cap_setgid+ep` | `spawn --uid X --gid X -- <sandlock-supervise 绝对路径> <args…>`；内部 `setgroups([])`→`setgid(X)`→`setuid(X)`→`execve`。`argv[0]` 钉死为 supervise 绝对路径、X 必须在已配 uid 池内，所以它不是「以任意 uid 跑任意程序」的通用工具；**不 shell、也不转手 exec 别的 setuid 工具**（实测那样 caps 会在 exec 时丢失：`setresuid failed: EPERM`）。槽位 exec 后自动零 cap（uid 变更清空 permitted/effective，supervise 自身无 file caps）。 |
@@ -415,9 +433,14 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 `moby/buildkit:rootless`（构建器需要完整 syscall 面，与沙箱能力无关）；
 `docker-compose.test.yml` 的测试镜像（要跑 loop/XFS/mount 依赖的那批门禁）。
 
-**尚未取证的最后一环**：本机内核（OrbStack）写 `uid_map` 一律 EPERM，所以
-`net_isolation`/`pid_ns` 的端到端只能在目标机验证；本次改动的"profile 可用"证据全部来自
-syscall 级实测 + 真实建箱（见上表），**上游门禁（`test-prod-shaped.sh` 全量）需在 Linux 目标形态复跑**。
+**本地可验证（2026-09-15 更正）**：先前记的"本机内核（OrbStack）写 `uid_map` 一律 EPERM"
+**是错的**。本地 lane 用上线同款形态跑 `tests/contract/test_route_b_executor.py` 实测
+`14 passed`，槽位日志报 `guest-uid=uid-0-in-userns`（含 `SYS_ADMIN` 与
+`PROD_DROP_CAPS=SYS_ADMIN` 两种形态都一样）⇒ **本机就能建 userns 并完成 F18 自映射**。
+卡住早期探针的是**容器的 seccomp 档**（Docker 默认档把 `unshare` 挂在 `CAP_SYS_ADMIN`
+门控组上），不是内核；机制细节见 §2.4 的"二次更正"。
+推论：`net_isolation` 的端到端**本机就能验**；`pid_ns` 缺的是 envd 开关与中间进程的自映射兼容
+（代码问题），与环境无关。`test-prod-shaped.sh` 全量的 1439 passed 也正是在本机取到的。
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
