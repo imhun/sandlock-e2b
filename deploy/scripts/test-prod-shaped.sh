@@ -87,11 +87,16 @@ XFS_DESELECTS="--ignore=tests/contract/test_volume_quota.py
 --ignore=tests/contract/test_xfs_project_quota.py"
 
 # Scope of E2B_TEST_STRICT_SKIPS=1 (measured by A5, corrected by A7): it only
-# upgrades the six *runner capability* markers listed in
-# tests/conftest.py::_STRICT_SKIP_FORBIDDEN ("XFS quota integration requires",
-# "does not support XFS project quota", "npm is not installed",
-# "needs NET_ADMIN", "sandbox writes land owned by", "worker storage does not
-# give the sandbox ownership"). An ordinary `pytest.mark.skipif` stays a skip.
+# upgrades the *runner capability* markers listed in
+# tests/conftest.py::_STRICT_SKIP_FORBIDDEN -- the live list is the source of
+# truth; do not spell a count here (it grew when the buildkit/registry
+# fixtures stopped skipping silently, and a number in a comment drifts).
+# Today it covers the XFS-quota markers ("XFS quota integration requires",
+# "does not support XFS project quota"), "npm is not installed",
+# "needs NET_ADMIN", the workspace-ownership pair ("sandbox writes land owned
+# by", "worker storage does not give the sandbox ownership") and the three
+# "docker is required for ..." markers. An ordinary `pytest.mark.skipif`
+# stays a skip.
 # Both files above skip with the first marker, so dropping one from this list
 # while the scratch filesystem is missing turns into an error, not a quiet
 # smaller run.
