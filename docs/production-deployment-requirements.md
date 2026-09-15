@@ -435,13 +435,16 @@ syscall 级实测 + 真实建箱（见上表），**上游门禁（`test-prod-sh
   ⚠️ **必须带 `E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080`**（§2.6.1 的本地
   预置源）：不带就退回公共镜像链，而本地构建的 `python-mcp:3.14` 不在那些镜像站的白名单里，
   实测 **205 条失败/错误**（`this image is not in the allowlist` 与它引发的 428
-  `warm_required` 级联）；带上之后同一棵树是 **6 failed / 1431 passed / 3 skipped**
-  （那 6 条全是磁盘水位引起的缓存维护时序 flaky，见下段）。脚本在未设置时会打一条显式
-  告警，不再静默跑出一片红。
+  `warm_required` 级联）；带上之后同一棵树是 **1437 passed / 3 skipped / 0 failed**
+  （2026-09-15，`tmp/prod-shaped-seccomp-final2.log`，用的就是上线那份
+  `deploy/seccomp/sandlock-worker.json`）。脚本在未设置时会打一条显式告警，不再静默跑出
+  一片红。
   **磁盘水位也是这条 lane 的前置**：宿主 `/System/Volumes/Data` 用到 97%（873G/932G）时，
   `tests/unit/test_image_cache_sharing.py` 的 `wait_for_image_cache_maintenance(timeout=30)`
   会等不到收敛而超时（测试日志里有 `workspace disk watermark warning: 96.9% used`）；
-  该文件单独跑（两种 seccomp 档都试过）是 `41 passed`。清盘后复跑即可。
+  该文件单独跑（两种 seccomp 档都试过）是 `41 passed`。清出 75G（873G→798G）后复跑即全绿；
+  另注意**清盘会把镜像缓存变成冷源**，紧接着的一次全量会出现 `428 warm_required` 竞态
+  （实测 20 条），热一轮即消失，不是回归。
   实测（2026-09-10）Landlock（ABI 8）与非特权 userns 都不需要任何特权；**唯一造不出来的是
   XFS prjquota 暂存盘**（容器内 loop 设备不可用，即使 `--cap-add SYS_ADMIN` +
   `--device /dev/loop-control` 也 `failed to setup loop device`）⇒ 只有**真挂 XFS prjquota**
