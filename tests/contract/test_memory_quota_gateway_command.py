@@ -176,10 +176,17 @@ def gateway_quota_servers():
             "gateway boxed-memory contract needs Linux + sandlock "
             "(run inside the Docker test runner)"
         )
-    from tests.conftest import PROJECT_ROOT, _start_multinode
+    from tests.conftest import TMP_ROOT, _start_multinode
 
+    # ``TMP_ROOT`` (``E2B_TEST_TMP_ROOT``) is container-native in the runner;
+    # a ``PROJECT_ROOT/tmp`` root is the bind-mounted repo, i.e. one directory
+    # shared by every concurrent container of this suite, and
+    # ``_start_multinode``'s ``_fresh_dir`` wipes it at setup. A lane starting
+    # beside this one deleted live sandboxes' workspace trees here, which
+    # surfaced as ``sandlock-init: chdir to "/home/user" failed (errno 2)``
+    # (exit 125) on the command right after the gateway.
     harness = _start_multinode(
-        PROJECT_ROOT / "tmp" / "multinode-gw-quota",
+        TMP_ROOT / "multinode-gw-quota",
         1,
         buildkit_addr=None,
     )

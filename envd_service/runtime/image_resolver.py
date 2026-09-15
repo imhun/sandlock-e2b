@@ -543,6 +543,127 @@ def _extract_layers(image: str, rootfs: Path, blobs: Iterable[bytes]) -> None:
     rootfs.joinpath(".complete").write_text("ok", encoding="utf-8")
 
 
+#: Rootfs trees this process has already normalized (see
+#: :func:`_prepared_rootfs`). The walk is O(rootfs), so it happens once per
+#: process per entry rather than on every resolve.
+_PREPARED_ROOTFS: set[str] = set()
+_PREPARED_GUARD = threading.Lock()
+
+
+def _prepared_rootfs(image: str, rootfs: Path) -> Path:
+    """The rootfs, with the ``..``-relative symlink rewrite applied once.
+
+    Entries extracted by an older resolver (or by the warm cache the gate
+    ships) are repaired in place the first time this process hands them out;
+    the rewrite is atomic per link and leaves the resolved target unchanged,
+    so a sandbox already running on that entry is unaffected.
+    """
+    key = str(rootfs)
+    with _PREPARED_GUARD:
+        seen = key in _PREPARED_ROOTFS
+        if not seen:
+            _PREPARED_ROOTFS.add(key)
+    if not seen:
+        _root_absolute_links(image, rootfs)
+    return rootfs
+
+
+def _root_absolute_links(image: str, rootfs: Path) -> None:
+    """Rewrite ``..``-relative symlinks into the equivalent rooted absolute ones.
+
+    The sandbox's chroot is emulated by ``openat2(RESOLVE_IN_ROOT)`` (the fork's
+    ``sys/fs.rs``), which the kernel may refuse with the *documented, retryable*
+    ``EAGAIN`` when a ``..`` component has to be clamped: "the kernel could not
+    ensure that a ".." component didn't escape (due to a race condition or
+    potential attack). The caller may choose to retry the openat2() call"
+    (openat2(2)). Every dynamically linked exec resolves its ``PT_INTERP``
+    through exactly such a link -- Debian/Ubuntu ship
+    ``/lib64/ld-linux-x86-64.so.2 -> ../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2``
+    -- and the fork's chroot executor turns *any* lookup failure into an
+    immediate ``Errno(ENOENT)``, i.e. the workload never starts and the command
+    reports "exit 127" with empty stderr.
+
+    Rewriting the link's *text* to its root-absolute form is semantics-preserving
+    inside the chroot: ``RESOLVE_IN_ROOT`` clamps ``..`` at the sandbox root, and
+    ``/x/y`` under that root resolves to the same inode as ``../y`` after
+    clamping (``resolve::confine`` implements the same rule). It removes the
+    ``..`` walk from every mediated lookup, which is what makes the openat2
+    fast path unconditional. The change is deliberately limited to symlink
+    targets: no file content, mode, owner or inode changes.
+
+    A link that cannot be rewritten is left as it was and reported: the image
+    still works, it merely keeps the ``..`` route (and with it the exposure).
+    """
+    rewritten = 0
+    for base, dirs, files in os.walk(rootfs, followlinks=False):
+        for name in list(dirs) + files:
+            path = Path(base) / name
+            try:
+                if not path.is_symlink():
+                    continue
+                target = os.readlink(path)
+            except OSError as e:
+                logger.warning(
+                    "image %s: cannot inspect the symlink %s (%s)", image, path, e
+                )
+                continue
+            if os.path.isabs(target):
+                continue
+            parts = target.split("/")
+            if ".." not in parts:
+                continue
+            relative = path.relative_to(rootfs).parent
+            absolute = _confine_at_root(f"/{relative}/{target}")
+            try:
+                temporary = path.with_name(f".{name}.link-tmp-{os.getpid()}")
+                with suppress(OSError):
+                    temporary.unlink()
+                os.symlink(absolute, temporary)
+                os.replace(temporary, path)
+            except OSError as e:
+                with suppress(OSError):
+                    temporary.unlink()
+                logger.warning(
+                    "image %s: cannot rewrite the relative symlink %s -> %s into "
+                    "%s (%s); leaving it alone (a mediated lookup through it can "
+                    "still be refused with the retryable EAGAIN)",
+                    image,
+                    path,
+                    target,
+                    absolute,
+                    e,
+                )
+                continue
+            rewritten += 1
+    if rewritten:
+        logger.info(
+            "image %s: rewrote %d relative symlink(s) with a '..' component into "
+            "their root-absolute equivalent",
+            image,
+            rewritten,
+        )
+
+
+def _confine_at_root(path: str) -> str:
+    """Collapse ``.``/``..`` components, clamping at ``/`` (RESOLVE_IN_ROOT).
+
+    The kernel's ``RESOLVE_IN_ROOT`` never lets a ``..`` component climb above
+    the sandbox root, so a link target that would escape resolves back at
+    ``/``; rewriting the link has to use exactly that rule or it would resolve
+    a different inode.
+    """
+    components: list[str] = []
+    for part in path.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if components:
+                components.pop()
+            continue
+        components.append(part)
+    return "/" + "/".join(components)
+
+
 def _materialize_entry(
     cache_dir: Path,
     image: str,
@@ -1646,12 +1767,14 @@ def resolve_image_rootfs(
     tar_path, link = local_oci_paths(cache, image)
     cached_local = _rootfs_from_local_link(link)
     if cached_local is not None:
-        return cached_local
+        return _prepared_rootfs(image, cached_local)
     if tar_path.is_file():
-        return _resolve_local_oci(image, cache, tar_path, link)
+        return _prepared_rootfs(
+            image, _resolve_local_oci(image, cache, tar_path, link)
+        )
     shared_rootfs = _shared_cache_rootfs(image, cache)
     if shared_rootfs is not None:
-        return shared_rootfs
+        return _prepared_rootfs(image, shared_rootfs)
     _ref, client = _client_for(
         image,
         registry_username=registry_username,
@@ -1667,7 +1790,7 @@ def resolve_image_rootfs(
     rootfs = _cache_rootfs(cache, image, digest)
     marker = rootfs / ".complete"
     if marker.is_file():
-        return rootfs
+        return _prepared_rootfs(image, rootfs)
 
     def layer_blobs() -> Iterable[bytes]:
         for layer in manifest.get("layers", []):
@@ -1687,4 +1810,4 @@ def resolve_image_rootfs(
     except Exception as e:
         raise ImageResolutionError(f"failed to extract image {image}: {e}") from e
     logger.info("resolved base image %s to rootfs %s", image, rootfs)
-    return rootfs
+    return _prepared_rootfs(image, rootfs)

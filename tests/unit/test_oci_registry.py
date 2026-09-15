@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import posixpath
 import tarfile
 import threading
@@ -249,12 +250,26 @@ def test_resolve_applies_whiteouts(registry, tmp_path):
     assert (rootfs / "sub" / "y.txt").read_text() == "y"
 
 
-def test_resolve_preserves_absolute_symlinks_as_relative(registry, tmp_path):
+def test_resolve_keeps_symlink_targets_resolving_inside_the_chroot(
+    registry, tmp_path
+):
     """Image-rootfs fidelity: absolute symlink targets (e.g. ``/usr/lib/
     ssl/cert.pem -> /etc/ssl/certs/ca-certificates.crt``) must survive
-    extraction as chroot-safe relative links. tarfile's ``data`` filter
-    drops raw absolute links, which would break Python's default CA path
-    resolution inside the chroot (``ssl.get_default_verify_paths()``)."""
+    extraction and keep resolving to the *rootfs* copy in the sandbox's view.
+    tarfile's ``data`` filter drops raw absolute links, which would break
+    Python's default CA path resolution inside the chroot
+    (``ssl.get_default_verify_paths()``).
+
+    The extracted tree is handed to the sandbox as a chroot root, and every
+    path lookup inside it is ``openat2(RESOLVE_IN_ROOT)``: an absolute target
+    resolves at the sandbox root, exactly like the relative link the extractor
+    writes to get past the ``data`` filter. What must *never* remain is a
+    ``..``-relative target, because the kernel may refuse that walk with the
+    documented *retryable* ``EAGAIN`` -- and the fork's executor turns any
+    lookup failure into a silent "exit 127, empty stderr" (see
+    ``tests/unit/test_image_rootfs_links.py`` for the rewrite and its
+    inode-for-inode equivalence).
+    """
     config_digest = _sha256(b"{}")
     l1 = registry.add_layer(
         {
@@ -282,17 +297,36 @@ def test_resolve_preserves_absolute_symlinks_as_relative(registry, tmp_path):
     cert_link = rootfs / "usr/lib/ssl/cert.pem"
     assert cert_link.is_symlink()
     target = cert_link.readlink()
-    assert not posixpath.isabs(target)
-    assert (cert_link.parent / target).resolve() == (
+    assert ".." not in target.parts
+    # Resolve the target the way the sandbox does: an absolute target is
+    # anchored at the chroot root, a relative one at the link's own directory.
+    if target.is_absolute():
+        resolved = rootfs / target.relative_to("/")
+    else:
+        resolved = cert_link.parent / target
+    assert resolved.resolve() == (
         rootfs / "etc/ssl/certs/ca-certificates.crt"
     ).resolve()
-    assert (cert_link.parent / target).read_text() == "CA\n"
+    assert resolved.read_text() == "CA\n"
 
     certs_link = rootfs / "usr/lib/ssl/certs"
     assert certs_link.is_symlink()
-    assert (certs_link.parent / certs_link.readlink()).resolve() == (
-        rootfs / "etc/ssl/certs"
-    ).resolve()
+    certs_target = certs_link.readlink()
+    assert ".." not in certs_target.parts
+    if certs_target.is_absolute():
+        resolved_certs = rootfs / certs_target.relative_to("/")
+    else:
+        resolved_certs = certs_link.parent / certs_target
+    assert resolved_certs.resolve() == (rootfs / "etc/ssl/certs").resolve()
+
+    # The whole extracted tree is ``..``-free, which is what keeps every
+    # mediated lookup on the openat2 fast path.
+    offenders = [
+        path
+        for path in rootfs.rglob("*")
+        if path.is_symlink() and ".." in Path(os.readlink(path)).parts
+    ]
+    assert offenders == []
 
 
 def test_resolve_with_bearer_auth_and_redirect(registry, tmp_path):

@@ -22,6 +22,7 @@ import os
 import shutil
 import threading
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from pathlib import Path
 
 from gateway_common.errors import ConnectError, unimplemented
@@ -157,6 +158,19 @@ _MINIMAL_DEV_MOUNTS = {
     "/dev/tty": "/dev/tty",
 }
 
+#: Exit codes ``sandlock-init`` reserves for a *setup* failure, i.e. the
+#: workload never ran (``sandlock-core/src/init/mod.rs``): 125 is a failed
+#: ``chdir`` or a refused stdio wiring, 126 a failed ``setpgid``, 127 a failed
+#: ``execvp`` -- which is also what a mediated lookup the supervisor performs
+#: turns into (a path it could not open, including the documented *retryable*
+#: ``EAGAIN`` that ``openat2(RESOLVE_IN_ROOT)`` may return for a ``..``
+#: symlink, e.g. the image's ``/lib64/ld-linux-x86-64.so.2``).
+#:
+#: A command that exits with one of these produced no output of its own, so
+#: without a record on the failure path the only thing an operator sees is
+#: "exit 127, empty stderr" -- the shape that made this family unreadable.
+_EXEC_SETUP_FAILURE_CODES = (125, 126, 127)
+
 
 def _minimal_dev_mounts() -> dict[str, str]:
     """The chroot shape's ``fs_mount`` /dev set (minimal_dev, six nodes).
@@ -199,6 +213,7 @@ class SandlockRunningProcess(RunningProcess):
         stdin_queue: asyncio.Queue,
         pty_mode: bool = False,
         on_exit=None,
+        on_setup_failure=None,
         signal_pause_supported: bool | None = None,
     ) -> None:
         self._proc = proc
@@ -208,6 +223,7 @@ class SandlockRunningProcess(RunningProcess):
         self._pty_mode = pty_mode
         self._pid = proc.pid if proc.pid is not None else -1
         self._on_exit = on_exit
+        self._on_setup_failure = on_setup_failure
         self._reaped = False
         self._writer_thread: threading.Thread | None = None
         self._closed = False
@@ -355,6 +371,14 @@ class SandlockRunningProcess(RunningProcess):
         if self._on_exit is not None and not self._reaped:
             self._reaped = True
             self._on_exit(self._proc.child_id, self._pid)
+        # A reserved setup/exec code means the workload never ran, and the
+        # child's own output is empty by construction: record the sandbox view
+        # here, or the command is indistinguishable from a silent crash.
+        if (
+            self._on_setup_failure is not None
+            and result.exit_code in _EXEC_SETUP_FAILURE_CODES
+        ):
+            self._on_setup_failure(result.exit_code)
         return result.exit_code
 
 
@@ -666,7 +690,11 @@ class SandlockExecutor(Executor):
         self._mcp_bind_port = int(port) if port is not None else None
 
     def _log_exec_failure_context(
-        self, config: ExecConfig, resolved: list[str]
+        self,
+        config: ExecConfig,
+        resolved: list[str],
+        *,
+        exit_code: int | None = None,
     ) -> None:
         """Record what the sandbox's view should look like when an exec fails.
 
@@ -677,16 +705,37 @@ class SandlockExecutor(Executor):
         which is only diagnosable together with the chroot path, the per-exec
         env and whether the image's own tools are still on disk. Three stats,
         on the failure path only.
+
+        ``exit_code`` is set when the *child* exited with one of the fork's
+        reserved setup/exec codes (125/126/127): then no exception was raised
+        and nothing was logged anywhere else, and the exit code is the whole
+        diagnosis -- 127 means ``execvp`` failed (a mediated lookup the
+        supervisor performs could not be opened, e.g. the ``EAGAIN`` a
+        ``..``-symlink lookup under ``RESOLVE_IN_ROOT`` may return), 125 a
+        failed ``chdir`` (usually a missing mount point), 126 a failed
+        ``setpgid``. The dynamic-linker row is there because that symlink's
+        relative target is what such a lookup most often trips on.
         """
         root = self._image_rootfs
         try:
             env = self._exec_params(
                 config, bind_ports=self._bind_ports_for(config)
             ).get("env")
+            interpreter = None
+            if root is not None:
+                linker = root / "lib64" / "ld-linux-x86-64.so.2"
+                with suppress(OSError):
+                    interpreter = {
+                        "path": str(linker),
+                        "exists": linker.exists(),
+                        "target": os.readlink(linker),
+                    }
             logger.warning(
-                "sandlock exec failure context sandbox_id=%s argv=%s cwd=%s "
-                "env=%s chroot=%s rootfs_tools=%s ca_bundle=%s",
+                "sandlock exec failure context sandbox_id=%s exit_code=%s "
+                "argv=%s cwd=%s env=%s chroot=%s rootfs_tools=%s "
+                "dynamic_linker=%s ca_bundle=%s",
                 self._sandbox_id or "-",
+                exit_code,
                 resolved,
                 self._view_cwd(config),
                 env,
@@ -704,6 +753,7 @@ class SandlockExecutor(Executor):
                     if root is not None
                     else None
                 ),
+                interpreter,
                 (Path(self._workspace_dir) / ".e2b-ca/ca-certificates.crt").exists(),
             )
         except Exception as exc:  # noqa: BLE001 - forensics never mask the cause
@@ -1848,6 +1898,9 @@ class SandlockExecutor(Executor):
             stdin_queue=stdin_queue,
             pty_mode=config.pty,
             on_exit=self._child_exited,
+            on_setup_failure=lambda code: self._log_exec_failure_context(
+                config, resolved, exit_code=code
+            ),
             # ``kill(sig)`` on an in-process child is always SIGKILL (see
             # ``SandlockRunningProcess.kill``); a slot child takes the signal
             # number through ``kill_child``, so the pause/resume fallback may

@@ -356,6 +356,20 @@ def test_stopped_group_counts_a_member_that_died_inside_it() -> None:
         assert len(members) >= 2, members
 
         os.killpg(pgid, signal.SIGSTOP)
+        # The test is about a member that dies *while* the group is stopped,
+        # so the stop has to have landed before the kill: SIGSTOP delivery is
+        # asynchronous, and a still-running leader reaps the killed child
+        # immediately -- the zombie this asserts on never appears (observed
+        # under load as ``{pid: 'T', pid: 'T'}`` and ``None == 'Z'``). The wait
+        # is bounded and asserted, so a genuine failure stays loud.
+        stop_deadline = time.monotonic() + 5.0
+        while time.monotonic() < stop_deadline:
+            if all(state == "T" for state in _group_states(pgid).values()):
+                break
+            time.sleep(0.02)
+        assert all(state == "T" for state in _group_states(pgid).values()), (
+            _group_states(pgid)
+        )
         victim = max(pid for pid in members if pid != process.pid)
         os.kill(victim, signal.SIGKILL)
 

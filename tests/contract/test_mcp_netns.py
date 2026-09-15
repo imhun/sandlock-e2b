@@ -49,10 +49,20 @@ def _linux_sandlock_ready() -> bool:
 
 
 def _netns_servers(buildkit_addr):
-    from tests.conftest import PROJECT_ROOT, _start_multinode
+    from tests.conftest import TMP_ROOT, _start_multinode
 
+    # The harness root goes under ``TMP_ROOT`` (``E2B_TEST_TMP_ROOT``), never
+    # ``PROJECT_ROOT/tmp``: the runner bind-mounts the repo into the container,
+    # so a repo-relative root is the *same* directory for every concurrent
+    # container of this suite and ``_start_multinode``'s ``_fresh_dir`` wipes
+    # it. A second lane starting while this one runs therefore deleted live
+    # sandboxes' workspace trees (the ``/home/user`` chdir of a command then
+    # failed with ENOENT, and the in-sandbox MCP gateway's stdio server died --
+    # the "exit 125/127 out of nowhere" family). ``TMP_ROOT`` is
+    # container-native in the runner, which is also why every other harness
+    # already lives there.
     harness = _start_multinode(
-        PROJECT_ROOT / "tmp" / "multinode-netns",
+        TMP_ROOT / "multinode-netns",
         1,
         buildkit_addr=buildkit_addr,
         envd_settings_extra={
