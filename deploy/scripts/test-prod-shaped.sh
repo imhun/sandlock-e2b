@@ -124,6 +124,20 @@ EXTRA_CAPS="--cap-add NET_ADMIN"
 MIRRORS_ENV=""
 if [ -n "${E2B_REGISTRY_MIRRORS:-}" ]; then
     MIRRORS_ENV="-e E2B_REGISTRY_MIRRORS=${E2B_REGISTRY_MIRRORS}"
+else
+    # Loud on purpose: without the local source the lane resolves the base
+    # image through the public mirror chain, and the locally built
+    # `python-mcp:3.14` is not in those mirrors' allowlists (measured
+    # 2026-09-15: 205 failures/errors out of 1436, all of them
+    # "this image is not in the allowlist" and the 428 warm_required cascade
+    # behind it). The fix is the preloaded registry documented in
+    # docs/production-deployment-requirements.md §2.6.1, i.e.
+    #   E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
+    #     ./deploy/scripts/test-prod-shaped.sh
+    echo "!! E2B_REGISTRY_MIRRORS is unset: this run resolves base images through" >&2
+    echo "!! the public mirror chain. Locally built python-mcp:3.14 is NOT in" >&2
+    echo "!! those allowlists -- expect ~200 failures unless the local registry" >&2
+    echo "!! on 127.0.0.1:5080 is preloaded and passed here (§2.6.1)." >&2
 fi
 
 # shellcheck disable=SC2086

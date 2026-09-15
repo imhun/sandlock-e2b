@@ -21,6 +21,7 @@ Text assertions rather than a YAML parse: the repo does not depend on PyYAML.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent
@@ -28,6 +29,9 @@ STACK_COMPOSE = (REPO / "deploy" / "stack" / "docker-compose.prod.yml").read_tex
     encoding="utf-8"
 )
 K8S_WORKER = (REPO / "deploy" / "k8s" / "worker.yaml").read_text(encoding="utf-8")
+WORKER_SECCOMP = json.loads(
+    (REPO / "deploy" / "seccomp" / "sandlock-worker.json").read_text(encoding="utf-8")
+)
 
 POD_SYSCTL = (
     "      securityContext:\n"
@@ -57,9 +61,58 @@ def test_stack_worker_has_no_cap_add_and_declares_the_low_port_window() -> None:
     )
     # Negative form: no NNP directive can be added to the security_opt list.
     assert "\n      - no-new-privileges" not in worker
-    assert "\n      - seccomp=unconfined\n" in worker
+    # The worker's syscall filter is the shipped profile, not `unconfined`
+    # (2026-09-15): it is Docker's default profile plus exactly the two syscalls
+    # the sandbox-create path needs. The path is env-overridable because a host
+    # that keeps only this compose file has no `../seccomp/`.
+    assert "\n      - seccomp=${E2B_SECCOMP_PROFILE:-../seccomp/sandlock-worker.json}\n" in worker
+    # The directive, not the prose: the comment above the line names the old
+    # value on purpose.
+    assert "\n      - seccomp=unconfined\n" not in worker
     assert "\n    sysctls:\n" in worker
     assert "\n      - net.ipv4.ip_unprivileged_port_start=0\n" in worker
+
+
+def _unconditional_allowlist() -> set[str]:
+    entries = [
+        entry
+        for entry in WORKER_SECCOMP["syscalls"]
+        if entry["action"] == "SCMP_ACT_ALLOW"
+        and not entry.get("includes")
+        and not entry.get("args")
+    ]
+    assert len(entries) == 1, "expected one unconditional allowlist entry"
+    return set(entries[0]["names"])
+
+
+def test_worker_seccomp_profile_is_the_default_plus_two_syscalls() -> None:
+    """The profile may only relax `pidfd_getfd` and `unshare` off the default.
+
+    Anything else here is a syscall surface the worker did not have before
+    2026-09-15, so it must be a conscious edit to this test as well.
+    """
+    assert WORKER_SECCOMP["defaultAction"] == "SCMP_ACT_ERRNO"
+    allowed = _unconditional_allowlist()
+    assert {"pidfd_getfd", "unshare"} <= allowed
+    # Everything that was capability-gated in the upstream default profile must
+    # stay gated: a deployment that *does* carry the capability keeps the access
+    # the kernel would grant it, and one that does not stays denied.
+    gated = {
+        name
+        for entry in WORKER_SECCOMP["syscalls"]
+        if entry.get("includes", {}).get("caps")
+        for name in entry["names"]
+    }
+    assert not ({"pidfd_getfd", "unshare"} & gated)
+    for still_gated in ("mount", "setns", "bpf", "open_tree", "perf_event_open"):
+        assert still_gated in gated
+
+
+def test_k8s_worker_uses_a_localhost_seccomp_profile() -> None:
+    """`Unconfined` violates Pod Security baseline; `Localhost` does not."""
+    assert "            seccompProfile:\n              type: Localhost\n" in K8S_WORKER
+    assert "localhostProfile: sandlock-worker.json\n" in K8S_WORKER
+    assert "type: Unconfined" not in K8S_WORKER
 
 
 def test_stack_quota_agent_owns_the_capability_behind_a_profile() -> None:
