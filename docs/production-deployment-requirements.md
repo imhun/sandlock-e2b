@@ -528,7 +528,33 @@ E2B_BASE_IMAGE=python:3.11-slim \
 - 本轮 `127.0.0.1:5080` 的实际内容（`GET /v2/_catalog` + tags）：`library/python` =
   3.11-slim / 3.12-slim / 3.14-slim，`library/node` = 22-slim。
 
-### 2.6.2 已知退路：`<image>.digest` 侧车（本轮不做）
+### 2.6.2 digest 固定的 `tag@sha256:...`：resolver 曾把 tag 留在路径里（2026-09-15 修）
+
+E6.2 要求生产把 `E2B_BASE_IMAGE` 钉成 `<repo>:<tag>@sha256:<digest>`（`upgrade.sh` 拒绝
+tag-only，除非显式 `--allow-tag-base-image`）。这个形态**当时跑不通**，实测（目标机
+Rocky/aarch64，2026-09-15，`docs/HANDOFF.md` 同名块）：
+
+```
+GET /v2/byteplan/python-mcp:3.14/manifests/sha256:3675662d…  ->  404
+ImageResolutionError: failed to resolve image registry…/python-mcp:3.14@sha256:3675662d…
+→ 建箱 428 warm_required（该节点上所有建箱都失败）
+```
+
+根因：`parse_image_ref`（`envd_service/runtime/oci_registry.py`）在参考串含 `@` 时把 `@`
+之前**整段**当成 repository，于是 tag 留在路径里；而 registry API 要的是
+`/v2/<repo>/manifests/<digest>`。修法：只在**最后一个路径段**上剥 tag（带端口的 registry
+主机名 `localhost:5000/ns/img:1` 因此不受影响），`reference` 仍是 digest。
+
+回归：`tests/unit/test_oci_registry.py::test_parse_image_ref_tag_plus_digest_keeps_the_repository_clean`
+（解析层）与 `::test_resolve_rootfs_from_a_digest_pinned_ref`（用假 registry 端到端解析一个
+digest 固定的引用；修复前这两条一红一 error）。
+
+⚠️ **线上尚未生效**：目标机跑的仍是修复前的 worker 镜像，所以线上 `E2B_BASE_IMAGE` 现在还是
+tag + `--allow-tag-base-image`。要真正落地 E6.2 需要：① `build-and-push.sh` 重建 worker 镜像
+并升级；② 把 `.env` 的 `E2B_BASE_IMAGE` 改成 `tag@digest`（digest 要在**目标机**上解析，
+不要用本机 OrbStack 的结果）。
+
+### 2.6.3 已知退路：`<image>.digest` 侧车（本轮不做）
 
 若「多源回落 + 本地源预置」落地后**实测仍抖动**（例如候选源同时 429/超时），再加
 `<image>.digest` 侧车：解析失败时回落「上次成功的 digest」，代价是限流期间感知不到 tag 更新

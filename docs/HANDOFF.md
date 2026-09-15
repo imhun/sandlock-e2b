@@ -1250,6 +1250,23 @@ htpasswd 路径 bug：容器内写文件必须走 `/workspace` 挂载视图（da
 > compose/k8s 清单与两条生产形 lane 都已切换；k8s 走 `Localhost` profile，节点需预装文件。
 > 口径与证据见 `docs/production-deployment-requirements.md` §2.4.5 与 `deploy/seccomp/README.md`。
 
+**digest 固定的 base image 在 resolver 上是 404（2026-09-15，升级当场发现并回退）**：按 E6.2
+把 `E2B_BASE_IMAGE` 钉成 `registry…/python-mcp:3.14@sha256:3675662d…` 部署后，worker 预热失败，
+建箱全部 `428 warm_required`：
+
+```
+GET /v2/byteplan/python-mcp:3.14/manifests/sha256:3675662d… -> 404
+ImageResolutionError: failed to resolve image registry…/python-mcp:3.14@sha256:3675662d…
+```
+
+根因是 `parse_image_ref` 把 `@` 之前整段当 repository，tag 留在路径里；
+`/v2/<repo>/manifests/<digest>` 才是 registry 要的形状。当场回退到 tag +
+`--allow-tag-base-image`，同轮 upgrade 的多节点 + 部署级冒烟随即全绿（⇒ 与同一轮发布的 seccomp
+收敛无关，见 §2.4.5）。**代码已修**（`envd_service/runtime/oci_registry.py`：
+只在最后一个路径段剥 tag），回归 `tests/unit/test_oci_registry.py` 两条（解析层 + 用假 registry
+端到端解析 digest 固定引用，修复前一红一 error）；**线上仍是修复前的镜像** ⇒ 要真上 E6.2 还需
+重建 worker 镜像并升级，见 §2.6.2。
+
 **iam（SDK 工作负载身份）已实现**：控制面 create 接受 `iam.tokens`
 （兼容 wire 的 camelCase `tokenType` 与 snake_case），存到沙箱记录并透传
 worker；executor 在注入时把 `${e2b.identity.tokens.<name>}` 占位符（含

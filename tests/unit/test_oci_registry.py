@@ -213,6 +213,43 @@ def test_parse_image_ref_variants():
     assert parse_image_ref("x@sha256:abc").reference == "sha256:abc"
 
 
+def test_parse_image_ref_tag_plus_digest_keeps_the_repository_clean():
+    """``repo:tag@sha256:...`` is the E6.2 production form (upgrade.sh refuses a
+    tag-only base image). The tag is a human hint: the registry is asked for the
+    digest, so it must not survive into the repository path -- that produced
+    ``/v2/<repo>:<tag>/manifests/sha256:...`` and a 404 (measured against ACR on
+    2026-09-15, which made every sandbox create fail on the deployed worker)."""
+    digest = "sha256:" + "a" * 64
+    ref = parse_image_ref(
+        f"registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@{digest}"
+    )
+    assert ref.host == "registry.cn-shanghai.aliyuncs.com"
+    assert ref.repository == "byteplan/python-mcp"
+    assert ref.reference == digest
+    assert ref.is_digest
+    # A registry host that carries a port must keep it: the tag stripper works
+    # on the last path segment only.
+    ref = parse_image_ref(f"localhost:5000/ns/img:1@{digest}")
+    assert ref.host == "localhost:5000"
+    assert ref.repository == "ns/img"
+    # Docker Hub short form, and a digest without any tag.
+    assert parse_image_ref(f"python:3.14-slim@{digest}").repository == "library/python"
+    assert parse_image_ref(f"python@{digest}").repository == "library/python"
+
+
+def test_resolve_rootfs_from_a_digest_pinned_ref(registry, tmp_path):
+    """End to end: a digest-pinned reference resolves through the same code path
+    the worker uses (this is the shape E6.2 requires in production)."""
+    from envd_service.runtime.oci_registry import RegistryClient
+
+    image = _base_registry(registry, tmp_path)
+    repo, tag = image.rsplit(":", 1)
+    _, digest = RegistryClient(parse_image_ref(image), scheme="http").manifest()
+    assert digest.startswith("sha256:")
+    rootfs = resolve_image_rootfs(f"{repo}:{tag}@{digest}", tmp_path)
+    assert (rootfs / "bin" / "sh").is_file()
+
+
 def test_resolve_extracts_rootfs_and_caches(registry, tmp_path):
     image = _base_registry(registry, tmp_path)
     rootfs = resolve_image_rootfs(image, tmp_path)

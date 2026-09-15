@@ -158,6 +158,17 @@ def parse_image_ref(image: str) -> ImageRef:
     """
     if "@" in image:
         repo, reference = image.rsplit("@", 1)
+        # `repo:tag@sha256:...` is legal, and it is the form the production
+        # manifests pin (E6.2). The tag is only a human hint here: the registry
+        # is asked for the digest, so it must not survive into the repository
+        # path -- `GET /v2/<repo>:<tag>/manifests/<digest>` is a 404, which is
+        # exactly what made every sandbox create fail on the deployed worker
+        # (measured 2026-09-15). Strip the tag from the last path segment only,
+        # so a host that carries a port (`localhost:5000/ns/img:1`) keeps it.
+        head, sep, last = repo.rpartition("/")
+        head_of_tag, _, maybe_tag = last.rpartition(":")
+        if head_of_tag and _looks_like_tag(maybe_tag):
+            repo = f"{head}{sep}{head_of_tag}"
     else:
         repo, _, tag = image.rpartition(":")
         reference = tag if _looks_like_tag(tag) else "latest"
