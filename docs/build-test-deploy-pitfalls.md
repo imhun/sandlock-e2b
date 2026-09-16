@@ -36,6 +36,18 @@ python `_sdk.py`（`_b_*` + `_HANDLED_FIELDS` + 应用点）、E2B `route_b.py::
 做法：照 `MIRRORS_ENV` / `MEMORY_ENV` / `PIDNS_ENV` 的写法加一段，并且**未设时必须保持未设**
 （否则门禁跑的是代码默认形态，而不是线上形态）。
 
+**A6. fork 新增字段后 lane 全绿，但 fork 自己的门禁编译不过。**
+症状：`cargo test -p sandlock-core --lib` 报 `error[E0063]: missing field X in initializer of …`
+（2026-09-16 实测：`net_bind_inject` 加了字段、改了生产侧初始化，漏了 `seccomp/dispatch.rs` 与
+`resource.rs` 里两个 `#[cfg(test)]` 的 `NotifPolicy` 字面量）。
+原因：E2B lane 与 fork 门禁**编译的目标不一样** —— lane 走 `--test integration` + wheel 里的
+`sandlock-supervise`，`--lib` 的测试字面量它根本不碰；`fe492be` 的 bind-injection 证据正是来自
+这两条路径，所以断在 tip 上没人看见。
+做法：fork 改动按完整门禁验（`docker run --privileged -v "$PWD/third_party/sandlock":/src -w /src
+sandlock-dev:latest sh scripts/test-all.sh`；该镜像 entrypoint 自动降到 uid 65534，根相位另跑
+`--oci-root` / `--supervise-root` / `--mediation-2uid`）。新增字段时把测试字面量一起搜：
+`rg -n "NotifPolicy \{" crates/`。
+
 ---
 
 ## B. 跑测试 / lane
@@ -74,6 +86,18 @@ python `_sdk.py`（`_b_*` + `_HANDLED_FIELDS` + 应用点）、E2B `route_b.py::
 
 **B9. 验证"线上形态"必须带形态开关**：`E2B_DEFAULT_MEMORY_MB=512`、`E2B_TEST_NET_ISOLATION=1`、
 `E2B_PID_NS=1`（视所要验证的形态），并配合 `PROD_DROP_CAPS=SYS_ADMIN`。
+
+**B10. lane 里建箱 503 `this image is not in the allowlist`。**
+原因：没设 `E2B_REGISTRY_MIRRORS`，于是基础镜像走公共镜像源链，而本地构建的 `python-mcp:3.14`
+不在任何公共源的白名单里（2026-09-16 实测：单条 contract 直接 503）。
+做法：带本地预载 registry（§2.6.1）：
+`E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 ./deploy/scripts/test-prod-shaped.sh …`
+（脚本自己会大声警告，别把警告当噪音跳过。）
+
+**B11. "箱内 `id -u` = 0"不能单独当形态证据。**
+原因：pid_ns 关着时这条同样成立（route-B 自映射本来就把客人做成 root），所以拿它当 pid_ns 的
+验收时会得到假绿。做法：配对一条只有该形态才成立的观测 —— 例如 `kill(<宿主 pid>, 0)`：
+自有 pid ns 里是 `ESRCH`，共享宿主 pid ns 里是 `EPERM`（探针 `tmp/pidns-shape-probe.py`）。
 
 ---
 

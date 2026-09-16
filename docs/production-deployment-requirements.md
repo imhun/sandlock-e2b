@@ -808,35 +808,72 @@ E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
 | `cargo test -p sandlock-core --test integration test_pid_ns::` | **9 passed / 0 failed**（默认档下 0/9，全部 `unshare(CLONE_NEWUSER): EPERM` —— 那正是 profile 放行的 syscall） |
 | `test_uid_isolation::`（含 `test_run_as_arbitrary_uid_with_pid_ns`） | **4 passed**（需要 `--cap-add SYS_PTRACE`；缺它时 `pidfd_getfd: EPERM`） |
 
-**阻断项：route-B 的"自映射"没在 pid-ns 中间进程里实现。** 部署形态（非 root worker +
-池化 uid）靠 `userns_self_map` 让客人体内 uid 0、宿主侧仍是槽位 uid（fork F18：
-`crates/sandlock-core/src/context.rs` 里 `self_map = userns_self_map && !remap &&
+#### 2.4.10.1 阻断项已修：中间进程也认"自映射"（fork `5b16855`，2026-09-16）
+
+部署形态（非 root worker + 池化 uid）靠 `userns_self_map` 让客人体内 uid 0、宿主侧仍是槽位
+uid（fork F18：`crates/sandlock-core/src/context.rs` 里 `self_map = userns_self_map && !remap &&
 user.is_some() && real_uid != 0` ⇒ `write_id_maps(real_uid, real_gid, 0, 0)`）。开了 pid_ns
-之后 userns 由**中间进程**在最终 fork 之前创建，`confine_child` 的 userns 整块被 `if !pid_ns`
-跳过，而中间进程只认两种映射（特权 remap ⇒ `0 -> RunAs`；其余 ⇒ `real_uid -> real_uid`），
-**没有第三种自映射分支**（`crates/sandlock-core/src/sandbox.rs` 的 pid-ns 中间进程段）。
+之后 userns 由**中间进程**在最终 fork 之前创建（非特权 `CLONE_NEWPID` 必须先有自己的 userns），
+`confine_child` 的 userns 整块被 `if !pid_ns` 跳过 —— 而中间进程原来只认两种映射（特权 remap ⇒
+`0 -> RunAs`，由父进程经握手管道写；其余 ⇒ `real_uid -> real_uid`），**没有第三种自映射分支**
+（`crates/sandlock-core/src/sandbox.rs` 的 pid-ns 中间进程段）。所以 route-B 箱在 pid_ns 下起来
+就是宿主槽位 uid：`E2B_PID_NS=1` 实测 `id -u` = `21000`（契约测试
+`tests/contract/test_nonroot_route_b.py::test_route_b_restores_guest_root_with_and_without_pid_ns`
+钉的就是这条，此前它按设计是红的）。
 
-实测（同一 lane、同一形态，只差 `E2B_PID_NS`）：route-B 箱内 `id -u` ——
+修法（fork `5b16855`）：中间进程按 `confine_child` 的同一套三选一挑映射 —— `userns_self_map`
+且请求身份就是自己且非 root ⇒ `0 -> euid`，特权 remap ⇒ `RunAs` 对，其余 ⇒ 自身身份。两份
+uid/gid map 的写者从此不会再漂移。fork 侧新增回归用例
+`test_pid_ns::pid_ns_self_map_restores_guest_root`（非 root 相位 = uid 65534，正好是 route-B
+槽位形态）：修前 RED（`id -u` = 65534），修后 GREEN；且断言宿主侧落盘文件仍属槽位 uid。
+fork 全门禁在该 tip 复跑全绿（core_lib 848 / core_integ 543(+1) / ffi 104 / cli 97 /
+supervise 43 / supervise_cost 3 / python 465 + 根相位 oci 157 / supervise_root 4 /
+mediation_2uid 9），wheel 按同 tip 重建（manifest `5b16855`）。
 
-| 配置 | 结果 |
-|---|---|
-| `E2B_PID_NS` 未设（对照） | `0` ✅ |
-| `E2B_PID_NS=1` | **`21000`**（宿主槽位 uid）❌ |
+**E2B 侧验收（部署形态，`E2B_PID_NS=1 PROD_DROP_CAPS=SYS_ADMIN` + 本地 registry 镜像源）**：
 
-新契约测试 `tests/contract/test_nonroot_route_b.py::test_route_b_restores_guest_root_with_and_without_pid_ns`
-把这条钉住（route-B 箱内 `id -u` 必须 0、宿主侧文件属主必须是池内 uid）；**在
-`E2B_PID_NS=1` 下它现在就是红的，这是有意的**：它描述的就是阻断项，修好即转绿。
+| 观测 | `E2B_PID_NS` 未设 | `E2B_PID_NS=1`（修前） | `E2B_PID_NS=1`（修后） |
+|---|---|---|---|
+| route-B 箱内 `id -u` | `0` ✅ | `21000` ❌ | **`0` ✅** |
+| 宿主侧文件属主 | 槽位 uid ✅ | 槽位 uid | **槽位 uid ✅** |
+| ready 行 `guest-uid` | `uid-0-in-userns` | （箱起不来语义） | **`uid-0-in-userns`** |
+| 箱内 `kill(<worker pid>, 0)` | `EPERM`（共享 pid ns） | — | **`ESRCH`（自有 pid ns，真开了）** |
 
-**代价（尚未实测，按 netns 的教训必须先量）**：pid_ns 打开后 fork 会拦截
-`newfstatat`/`statx`/`faccessat`/`faccessat2`/`readlinkat`（+ 旧 ABI 的 `stat`/`lstat`/`access`/
-`readlink`，见 `seccomp_plan.rs::pid_ns_procfs_stat_syscalls`）——**全是热 syscall**，且 seccomp
-无法按字符串过滤路径，所以即使最终 `Continue` 也要每次进一次 supervisor（读子进程内存里的路径
-再判断）。这与 netns 的 readiness 拦截同类：**先在 lane 里量"stat 密集命令"的开销，再决定是否
-开启**（对照命令例如 `python3 -c "import os;[os.stat('/etc/hostname') for _ in range(2000)]"`，
-pid_ns 开/关各跑一次）。
+最后一行是**形态证据**：`id -u` = 0 在 pid_ns 关着时同样成立，所以只凭它无法排除"开关没生效"
+的假绿；`kill()` 探针（探针文件 `tmp/pidns-shape-probe.py`，日志 `tmp/pidns-shape-{on,off}.log`）
+把两种形态区分开，确认这一轮的绿是真开了 pid_ns 的绿。
 
-**修复计划**：① fork：中间进程复刻 `confine_child` 的第三种分支（`self_map` ⇒ `0 -> euid`），
-并加覆盖该组合的测试；② 量上面的 syscall 代价；③ 两项都过了再谈灰度（先一个 worker）与默认值。
+#### 2.4.10.2 代价：部署形态下测不到增量，裸形态 +85 µs/次（2026-09-16）
+
+pid_ns 打开后 fork 要拦 `newfstatat`/`statx`/`faccessat`/`faccessat2`/`readlinkat`（+ 旧 ABI 的
+`stat`/`lstat`/`access`/`readlink`，见 `seccomp_plan.rs::pid_ns_procfs_stat_syscalls`），
+seccomp 无法按路径过滤 ⇒ 每次调用进 supervisor。量法：5000 次 × 4 轮，取中位数，同一镜像同一
+lane，只差 `E2B_PID_NS`（探针 `tmp/pidns-cost-probe.py`）。
+
+| 形态 / 负载（ms / 5000 次，表内为 c 次跑） | `open`（对照，未拦） | `stat` | `access` | `readlink` |
+|---|---|---|---|---|
+| route-B 部署形，pid_ns 关 | 2003 | 992 | 1002 | 1032 |
+| route-B 部署形，pid_ns 开 | 2004 | 992 | 1002 | 999 |
+| 裸形（CLI，无 chroot 中介），pid_ns 关 | 1229 | **5.9** | **2.9** | **3.8** |
+| 裸形（CLI，无 chroot 中介），pid_ns 开 | 1253 | **445** | **395** | **427** |
+
+结论（三次重复，前两行对应本轮 a/b/c 三次跑，日志 `tmp/pidns-cost-{0,1}-{a,b,c}.log`）：
+
+1. **部署形态里测不到 pid_ns 的增量**：中位数差值与对照组 `open` 的抖动同号同量级（±1%，
+   ≤2 µs/次），三个热 syscall 逐次跑有正有负。机理不是"拦得便宜"，而是**这些 syscall 在
+   route-B 里本来就已经进 supervisor**：route-B 始终带 chroot 路径中介，`chroot_path_syscalls()`
+   里就有同样这五个（`seccomp_plan.rs`），pid_ns 只是往已经在的拦截点里多加一个 handler。
+2. 部署形态里这些调用**本来就贵**：约 200 µs/次，是 chroot 中介的既有成本（与 pid_ns 无关；
+   同一张表里 `open`+`close` 一对约 400 µs/次，同为中介成本）；pid_ns 不改变这个量级。
+3. 最坏形态（无任何路径中介的裸沙箱）才看得见真实单价：`stat` 1.2 → 89 µs/次、`access`
+   0.6 → 79、`readlink` 0.8 → 85，即 **+80~90 µs/次**。E2B 的部署形态（模板 rootfs + 中介）
+   不属于这一类。
+4. netns 那次的教训（390 ms/请求）**不适用**：那是入站代理 readiness 合成的每请求开销，不是
+   每 syscall 的 trap 成本。
+
+**剩余决策（N3）**：形态正确性（2.4.10.1）与代价（2.4.10.2）都已就绪，`E2B_PID_NS` 仍是
+**默认关闭**；灰度形态（先一个 worker，`E2B_PID_NS` 是进程级开关、按 worker 分容器 env）与
+默认值待择期执行。
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
