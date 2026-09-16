@@ -33,6 +33,7 @@ def _settings(executor: str) -> SimpleNamespace:
         enable_netns=False,
         enable_net_isolation=False,
         fd_inject_connect=False,
+        pid_ns=False,
         net_bind_inject=False,
         port_mappings={},
         network_deny_cidrs=(),

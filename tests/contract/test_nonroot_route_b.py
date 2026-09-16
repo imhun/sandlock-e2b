@@ -354,3 +354,49 @@ async def test_the_broker_step_is_real_when_this_worker_is_not_root(
         assert "CapEff:\t0000000000000000" in status
     finally:
         pool.release_sync("sbx_broker_probe")
+
+
+async def test_route_b_restores_guest_root_with_and_without_pid_ns(
+    route_b_workspace,
+) -> None:
+    """Guest uid stays 0 (host side stays the pooled slot uid) under pid_ns.
+
+    Route B's whole point is "the sandbox looks like a privileged-supervisor
+    sandbox": the child self-maps ``0 -> euid`` in its user namespace, so the
+    guest is root while every host-side file it touches stays owned by its
+    pooled slot uid (fork F18, asserted for the *in-process* shape in
+    tests/security/test_template_isolation.py — this is the supervised route-B
+    shape, which no test covered until now).
+
+    With ``E2B_PID_NS=1`` the user namespace is created by the fork's
+    intermediate process *before* the final fork, and ``confine_child`` then
+    skips its own unshare — so the same identity decision has to happen there
+    (crates/sandlock-core/src/sandbox.rs, the pid-ns intermediate). This test is
+    the observable that says whether it does: without it the guest sees the
+    *host* slot uid (e.g. 10000) instead of 0, and every "am I root?" behaviour
+    changes (apt-get, chown, ports below 1024).
+    """
+    workspace = route_b_workspace
+    control, envd = _make_apps(workspace)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/sandboxes",
+            # A cold lane has no warmed base image; the idempotent-create path
+            # (X-Sandbox-Id) is what turns the 428 into "warm, then complete"
+            # instead of a flake.
+            headers={"X-API-Key": "local-key", "X-Sandbox-Id": "sbx_pidns_probe"},
+            json={"templateID": "base", "timeout": 300},
+        )
+        assert created.status_code == 201, created.text
+        payload = created.json()
+    # The command RPC is envd's; the control plane only creates the sandbox.
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=envd), base_url="http://test"
+    ) as envd_client:
+        messages = await _run_cmd(envd_client, payload, "id -u; printf x > pidns-probe.txt")
+    code, out, err = _result(messages)
+    assert (code, out, err) == (0, b"0\n", b"")
+    owner = (workspace / payload["sandboxID"] / "pidns-probe.txt").stat().st_uid
+    assert owner != 0, "the guest must not have written the file as host root"

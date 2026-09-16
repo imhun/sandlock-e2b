@@ -794,6 +794,50 @@ E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
 这条链上，不进用户命令的默认环境，因为多线程分配密集的负载会吃到 arena 竞争。
 
 
+### 2.4.10 pid_ns 现状与阻断项（2026-09-16 评估）
+
+**E2B 侧已接上开关但默认关闭**：`E2B_PID_NS`（`envd_service/config.py`，默认 `false`）→
+`factory.py` → `SandlockExecutor(pid_ns=...)` → 策略里的 `pid_ns`（`route_b.py` 的 wire 字段表
+本来就有）。lane 也透传该变量（`E2B_PID_NS=1 ./deploy/scripts/test-prod-shaped.sh ...`），
+所以两种形态都能跑门禁。
+
+**fork 侧机制本身是健康的**（在部署 profile 下实测，`seccomp=$PWD/deploy/seccomp/sandlock-worker.json`）：
+
+| 覆盖 | 结果 |
+|---|---|
+| `cargo test -p sandlock-core --test integration test_pid_ns::` | **9 passed / 0 failed**（默认档下 0/9，全部 `unshare(CLONE_NEWUSER): EPERM` —— 那正是 profile 放行的 syscall） |
+| `test_uid_isolation::`（含 `test_run_as_arbitrary_uid_with_pid_ns`） | **4 passed**（需要 `--cap-add SYS_PTRACE`；缺它时 `pidfd_getfd: EPERM`） |
+
+**阻断项：route-B 的"自映射"没在 pid-ns 中间进程里实现。** 部署形态（非 root worker +
+池化 uid）靠 `userns_self_map` 让客人体内 uid 0、宿主侧仍是槽位 uid（fork F18：
+`crates/sandlock-core/src/context.rs` 里 `self_map = userns_self_map && !remap &&
+user.is_some() && real_uid != 0` ⇒ `write_id_maps(real_uid, real_gid, 0, 0)`）。开了 pid_ns
+之后 userns 由**中间进程**在最终 fork 之前创建，`confine_child` 的 userns 整块被 `if !pid_ns`
+跳过，而中间进程只认两种映射（特权 remap ⇒ `0 -> RunAs`；其余 ⇒ `real_uid -> real_uid`），
+**没有第三种自映射分支**（`crates/sandlock-core/src/sandbox.rs` 的 pid-ns 中间进程段）。
+
+实测（同一 lane、同一形态，只差 `E2B_PID_NS`）：route-B 箱内 `id -u` ——
+
+| 配置 | 结果 |
+|---|---|
+| `E2B_PID_NS` 未设（对照） | `0` ✅ |
+| `E2B_PID_NS=1` | **`21000`**（宿主槽位 uid）❌ |
+
+新契约测试 `tests/contract/test_nonroot_route_b.py::test_route_b_restores_guest_root_with_and_without_pid_ns`
+把这条钉住（route-B 箱内 `id -u` 必须 0、宿主侧文件属主必须是池内 uid）；**在
+`E2B_PID_NS=1` 下它现在就是红的，这是有意的**：它描述的就是阻断项，修好即转绿。
+
+**代价（尚未实测，按 netns 的教训必须先量）**：pid_ns 打开后 fork 会拦截
+`newfstatat`/`statx`/`faccessat`/`faccessat2`/`readlinkat`（+ 旧 ABI 的 `stat`/`lstat`/`access`/
+`readlink`，见 `seccomp_plan.rs::pid_ns_procfs_stat_syscalls`）——**全是热 syscall**，且 seccomp
+无法按字符串过滤路径，所以即使最终 `Continue` 也要每次进一次 supervisor（读子进程内存里的路径
+再判断）。这与 netns 的 readiness 拦截同类：**先在 lane 里量"stat 密集命令"的开销，再决定是否
+开启**（对照命令例如 `python3 -c "import os;[os.stat('/etc/hostname') for _ in range(2000)]"`，
+pid_ns 开/关各跑一次）。
+
+**修复计划**：① fork：中间进程复刻 `confine_child` 的第三种分支（`self_map` ⇒ `0 -> euid`），
+并加覆盖该组合的测试；② 量上面的 syscall 代价；③ 两项都过了再谈灰度（先一个 worker）与默认值。
+
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
 - **`deploy/scripts/test-prod-shaped.sh`（生产形，默认推荐）**：容器不带 `--privileged`，

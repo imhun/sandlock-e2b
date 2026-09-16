@@ -152,6 +152,14 @@ if [ -n "${E2B_DEFAULT_MEMORY_MB:-}" ]; then
     MEMORY_ENV="-e E2B_DEFAULT_MEMORY_MB=${E2B_DEFAULT_MEMORY_MB}"
 fi
 
+# The per-sandbox PID namespace is opt-in per deployment (E2B_PID_NS, default
+# false in envd_service/config.py), and the lane exists to reproduce the
+# deployed shape -- so let a run pick the shape explicitly. Unset stays unset.
+PIDNS_ENV=""
+if [ -n "${E2B_PID_NS:-}" ]; then
+    PIDNS_ENV="-e E2B_PID_NS=${E2B_PID_NS}"
+fi
+
 # shellcheck disable=SC2086
 docker run --rm --init --network host \
     $CAPS $EXTRA_CAPS --security-opt seccomp="$SECCOMP_PROFILE" \
@@ -162,6 +170,7 @@ docker run --rm --init --network host \
     -e E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2 \
     $MIRRORS_ENV \
     $MEMORY_ENV \
+    $PIDNS_ENV \
     -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
     -v "$(pwd):/workspace" -w /workspace \
     "$IMAGE" \
@@ -190,6 +199,7 @@ if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
         -e E2B_TEST_STRICT_SKIPS=1 \
         -e E2B_BASE_IMAGE="${PHASE2_BASE_IMAGE:-python:3.11-slim}" \
         $MEMORY_ENV \
+        $PIDNS_ENV \
         -v "$(pwd):/workspace" -w /workspace \
         "$IMAGE" \
         pytest tests/security/test_template_isolation.py \

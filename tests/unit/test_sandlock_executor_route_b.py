@@ -421,6 +421,7 @@ async def test_shape_knobs_reach_the_slot_document(monkeypatch) -> None:
         route_b=_config(mode="auto"),
         enable_net_isolation=True,
         fd_inject_connect=True,
+        pid_ns=False,
         bind_inject=True,
         port_mappings={50006: 8080},
         extra_fs_writable=["/var/lib/e2b-volumes/vol_1"],

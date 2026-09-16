@@ -425,6 +425,7 @@ class SandlockExecutor(Executor):
         enable_net_isolation: bool = False,
         fd_inject_connect: bool = False,
         bind_inject: bool = False,
+        pid_ns: bool = False,
         port_mappings: dict | None = None,
         network: dict | None = None,
         network_deny_cidrs: tuple[str, ...] = (),
@@ -452,6 +453,7 @@ class SandlockExecutor(Executor):
         self._enable_net_isolation = enable_net_isolation
         self._fd_inject_connect = fd_inject_connect
         self._bind_inject = bool(bind_inject)
+        self._pid_ns = bool(pid_ns)
         self._port_mappings = {
             int(host): int(sandbox) for host, sandbox in (port_mappings or {}).items()
         }
@@ -1513,6 +1515,11 @@ class SandlockExecutor(Executor):
                 self._port_mappings.setdefault(
                     self._mcp_bind_port, self._mcp_bind_port
                 )
+        if self._pid_ns:
+            # S2.2 sibling: own PID namespace. The fork needs a user namespace
+            # first (unprivileged CLONE_NEWPID) and does that in an intermediate
+            # process, so this is independent of net_isolation.
+            kwargs["pid_ns"] = True
         if self._enable_net_isolation:
             kwargs["net_isolation"] = True
             if self._port_mappings:
@@ -1718,6 +1725,11 @@ class SandlockExecutor(Executor):
                 # which is what the /mcp proxy dials (127.0.0.1:<port>).
                 port = int(mcp_port)
                 self._port_mappings.setdefault(port, port)
+        if self._pid_ns:
+            # S2.2 sibling: own PID namespace. The fork needs a user namespace
+            # first (unprivileged CLONE_NEWPID) and does that in an intermediate
+            # process, so this is independent of net_isolation.
+            kwargs["pid_ns"] = True
         if self._enable_net_isolation:
             kwargs["net_isolation"] = True
             if self._port_mappings:

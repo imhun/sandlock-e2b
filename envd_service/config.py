@@ -143,6 +143,14 @@ class Settings:
     require_seccomp_filter: bool = field(
         default_factory=lambda: _env_bool("E2B_REQUIRE_SECCOMP_FILTER", True)
     )
+    # Per-sandbox PID namespace (fork `pid_ns`, S2.2's sibling): the sandbox is
+    # the first process of its own PID namespace, so host/other-sandbox pids are
+    # invisible from inside and the sandbox gets a real pid-1 reaper. Off by
+    # default: the fork's self-map shape (route-B: guest uid 0 while the host uid
+    # stays the slot uid) is not implemented on the pid-ns path yet, so turning
+    # this on today costs the guest its root identity -- see
+    # docs/production-deployment-requirements.md §2.4.10.
+    pid_ns: bool = field(default_factory=lambda: _env_bool("E2B_PID_NS", False))
     # E7.2: the pairing guard's escape hatch. `net_isolation` without
     # `fd_inject_connect` yields a loopback-only sandbox: every external
     # connect fails at the kernel (no route), which in production looks like

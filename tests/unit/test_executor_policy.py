@@ -256,6 +256,7 @@ def test_net_isolation_fd_inject_and_port_mappings_passthrough(tmp_path: Path) -
         enable_network=False,
         enable_net_isolation=True,
         fd_inject_connect=True,
+        pid_ns=False,
         bind_inject=True,
         port_mappings={"50006": "8080"},
     )
@@ -287,6 +288,7 @@ def test_fd_inject_without_net_isolation_passthrough(tmp_path: Path) -> None:
         allow_internet_access=False,
         enable_network=False,
         fd_inject_connect=True,
+        pid_ns=False,
         bind_inject=False,
     )
     sb = _policy(executor)
@@ -337,6 +339,7 @@ def test_mcp_gateway_netns_identity_mapping(tmp_path: Path) -> None:
         enable_network=False,
         enable_net_isolation=True,
         fd_inject_connect=True,
+        pid_ns=False,
         bind_inject=False,
     )
     executor.set_mcp_bind_port(51234)
