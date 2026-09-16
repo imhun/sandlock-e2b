@@ -1,5 +1,9 @@
 # E2B-Sandlock 部署 / 升级脚本
 
+> **k8s 形态不在本文范围内**：`deploy/k8s/` 那套清单的部署顺序、与 compose 的差异表和开关
+> 切换方法见 [`docs/k8s-deployment.md`](../../docs/k8s-deployment.md)。本文只管目标机
+> compose 这条线（堡垒机 → 目标机 → 应用用户 `deploy`）。
+
 连接拓扑：本机 → 堡垒机 `root@172.18.74.236`（key `~/.ssh/id_pub` + 口令）→
 目标机 `root@172.18.80.140`（堡垒机免密）→ 应用用户 `deploy`（docker 组）。
 

@@ -65,6 +65,10 @@ sandbox.kill()
 本地直连远程部署实例跑 SDK 测试（无需起本地服务）：见
 [docs/remote-testing.md](docs/remote-testing.md)。
 
+部署：目标机 compose 走 [deploy/scripts/README.md](deploy/scripts/README.md)；
+k8s 清单（`deploy/k8s/`）的部署顺序、与 compose 的差异表、开关切换与验证清单见
+[docs/k8s-deployment.md](docs/k8s-deployment.md)。
+
 跑 lane / 构建 wheel / 部署前先过一遍
 [docs/build-test-deploy-pitfalls.md](docs/build-test-deploy-pitfalls.md)：
 里面记的是"看起来像代码坏了、其实是环境/流程"的那些坑（镜像不重建、默认 seccomp 档拦

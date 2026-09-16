@@ -366,6 +366,9 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 
 ### 2.4.4 k8s 清单形态的配额口径：降级（2026-09-13 裁定，W4）
 
+> k8s 这套清单的**部署步骤、与 compose 的差异表、开关切换与验证清单**统一写在
+> [`docs/k8s-deployment.md`](k8s-deployment.md)；本节只记配额口径这个决策本身。
+
 `deploy/k8s/` 发布 worker / control-plane / gateway / autoscaler / redis / PVC / namespace
 七份清单，**不含 quota-agent**，所以 k8s 形态的默认口径就是**配额降级**（不是缺陷，是口径）：
 

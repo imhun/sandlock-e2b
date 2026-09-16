@@ -38,6 +38,12 @@ spec:
       # the sysctl is *safe* since k8s 1.22 (no kubelet
       # --allowed-unsafe-sysctls needed), but `net.*` sysctls are refused with
       # hostNetwork: true. MCP inbound ports are 50005+ and never needed it.
+      # The compose stack dropped its copy on 2026-09-16, but only because both
+      # its workers moved to per-sandbox netns; this manifest still shares the
+      # pod netns, so the window stays. Switching k8s to netns means adding the
+      # paired E2B_ENABLE_NET_ISOLATION/E2B_FD_INJECT_CONNECT *and* deleting this
+      # block -- the walk-through, the pid_ns switch (N10) and the multi-replica
+      # uid-pool gap (N13) live in docs/k8s-deployment.md §5.
       securityContext:
         sysctls:
           - name: net.ipv4.ip_unprivileged_port_start
@@ -146,6 +152,17 @@ spec:
             # this non-root pod; `off` keeps the in-process E5.1 shape.
             - name: E2B_PRIV_HELPERS
               value: "auto"
+            # Two shape switches that the compose stack has ON and this manifest
+            # deliberately leaves OFF (see docs/k8s-deployment.md §3/§5):
+            #   E2B_PID_NS=1                -- per-sandbox pid namespace (N10)
+            #   E2B_ENABLE_NET_ISOLATION=1  -- per-sandbox netns (paired with
+            #                                  E2B_FD_INJECT_CONNECT) (N5)
+            # Not set here on purpose: switching them changes what a workload
+            # can see (pids, interfaces) and needs the §6 verification pass.
+            # Also *not* set: E2B_UID_POOL_START/SIZE -- replicas default to
+            # 10000/1000, and this manifest can scale past one replica over a
+            # single RWX PVC, so the ranges would overlap. Fix before raising
+            # replicas: N13 in docs/task-backlog.md.
             - name: E2B_BASE_IMAGE
               value: python:3.14-slim
             - name: E2B_NODE_MEMORY_MB
