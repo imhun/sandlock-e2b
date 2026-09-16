@@ -7,6 +7,7 @@ import importlib
 import json
 import logging
 import os
+import socket
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -775,6 +776,76 @@ async def test_mcp_proxy_sandbox_without_mcp_returns_404() -> None:
             headers={"E2b-Sandbox-Id": "sbx_2", "Authorization": "Bearer tok"},
         )
         assert resp.status_code == 404
+
+
+def _closed_port() -> int:
+    """A port nothing is listening on (bound then closed, so it is free)."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = int(sock.getsockname()[1])
+    sock.close()
+    return port
+
+
+@pytest.mark.asyncio
+async def test_mcp_proxy_gateway_not_listening_yet_is_a_retryable_503() -> None:
+    """A gateway that has not bound its port yet must be 503, never 500.
+
+    ``/mcp`` dials ``127.0.0.1:<mcp_port>``. Between the create response and
+    the gateway's first ``listen()`` nothing is there, so the connect is
+    refused -- the *normal* state for a client that calls ``/mcp`` right after
+    create, and exactly what the deployed worker showed (``GET /mcp -> 500``
+    with an ``httpx.ConnectError`` traceback, backlog N6). A 500 tells the
+    client the worker is broken; the honest answer is "not ready, retry", i.e.
+    503 plus a ``Retry-After`` hint. ``raise_app_exceptions=False`` is what
+    makes the unhandled exception visible as the status a real client got.
+    """
+    port = _closed_port()
+    app = _proxy_app({"sbx_1": SimpleNamespace(mcp_port=port, mcp_token="tok")})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as c:
+        resp = await c.get(
+            "/mcp",
+            headers={"E2b-Sandbox-Id": "sbx_1", "Authorization": "Bearer tok"},
+        )
+    assert resp.status_code == 503
+    assert resp.headers["retry-after"] == "1"
+    assert resp.json() == {
+        "message": f"MCP gateway for sandbox sbx_1 is not listening on port {port} yet"
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_proxy_recorded_gateway_death_is_not_retryable() -> None:
+    """The Task D1 503 (gateway died at startup) stays without ``Retry-After``.
+
+    It means the gateway is dead until the sandbox is recreated, so telling a
+    client to retry would be a lie. Pinning both 503s keeps the transient one
+    (not listening yet) distinguishable from the permanent one.
+    """
+    failure = SimpleNamespace(
+        text=(
+            "mcp gateway failed to start sandbox_id=sbx_1 port=1 exit_code=2 "
+            "stderr=boom"
+        )
+    )
+    app = _proxy_app(
+        {
+            "sbx_1": SimpleNamespace(
+                mcp_port=1, mcp_token="tok", mcp_gateway_failure=failure
+            )
+        }
+    )
+    async with _client(app) as c:
+        resp = await c.get(
+            "/mcp",
+            headers={"E2b-Sandbox-Id": "sbx_1", "Authorization": "Bearer tok"},
+        )
+    assert resp.status_code == 503
+    assert "retry-after" not in resp.headers
+    assert resp.json() == {"message": failure.text}
 
 
 @pytest.mark.asyncio

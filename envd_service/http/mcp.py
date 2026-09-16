@@ -63,12 +63,29 @@ async def mcp_proxy(request: Request, path: str = "") -> Response:
         not in ("host", "content-length", "connection", "e2b-sandbox-id")
     }
     client = httpx.AsyncClient(timeout=None)
-    upstream = await client.request(
-        request.method,
-        url,
-        headers=headers,
-        content=await request.body(),
-    )
+    try:
+        upstream = await client.request(
+            request.method,
+            url,
+            headers=headers,
+            content=await request.body(),
+        )
+    except httpx.ConnectError as exc:
+        # N6: nothing is listening on the sandbox's gateway port *yet*. That is
+        # the normal state between the create response and the gateway's first
+        # `listen()`, and a client is entitled to call `/mcp` immediately --
+        # the same request succeeds a moment later, so the honest answer is
+        # "retry", not a 500 that reads as "the worker is broken" (measured in
+        # production: `GET /mcp -> 500` + a ConnectError traceback per call).
+        # The recorded-death 503 above is the opposite case -- permanent until
+        # the sandbox is recreated -- and deliberately carries no Retry-After.
+        await client.aclose()
+        raise HttpAuthError(
+            503,
+            f"MCP gateway for sandbox {sandbox_id} is not listening on port "
+            f"{port} yet",
+            headers={"Retry-After": "1"},
+        ) from exc
 
     async def _body():
         try:

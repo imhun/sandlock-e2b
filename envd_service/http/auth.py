@@ -9,16 +9,26 @@ from fastapi.responses import JSONResponse
 
 
 class HttpAuthError(Exception):
-    def __init__(self, status_code: int, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
+        #: Extra response headers, e.g. ``Retry-After`` on a *transient* 503
+        #: (the caller can succeed by retrying) as opposed to a permanent one
+        #: (retrying would be a lie).
+        self.headers = dict(headers or {})
 
 
 def http_error_response(request: Request, exc: HttpAuthError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content={"message": exc.message},
+        headers=exc.headers or None,
     )
 
 
