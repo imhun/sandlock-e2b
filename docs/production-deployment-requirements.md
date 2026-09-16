@@ -921,6 +921,13 @@ quota-agent `worker-2` 0 条 traceback/ERROR；`worker-1` 20 条全部是 `GET /
 （`httpx.ConnectError`），来源是 MCP 探针扫端口时打到还没起来的箱内网关 —— 这正是已登记的
 backlog N6（网关未就绪应回 502/503 而不是 500），**与 pid_ns 无关**（worker-2 同一轮 0 条）。
 
+**本机全量门禁（canary 形态）**：`E2B_PID_NS=1 E2B_DEFAULT_MEMORY_MB=512
+PROD_DROP_CAPS=SYS_ADMIN` 跑整条 lane（`tmp/pidns-e2b-full-1.log`）—— 相位 1
+**1470 passed / 3 skipped / 0 failed**（7 分 24 秒）、相位 2 **51 passed / 1 skipped /
+0 failed**。跳过的 4 项都是相位形态类（pure-shape 契约要求 `E2B_BASE_IMAGE` 为空、非 root
+worker 形态不能在 root 相位断言），与开不开 pid_ns 无关；也就是说形如 worker-2 的部署形态在
+本机没有暴露额外失败。
+
 **观察清单（灰度期）**：
 
 1. 按节点的建箱失败率。pid_ns 的特有失败模式是 fail-closed：中间进程 `unshare(CLONE_NEWUSER)`
