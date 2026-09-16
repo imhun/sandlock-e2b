@@ -351,6 +351,10 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
   `sysctls: net.ipv4.ip_unprivileged_port_start=0` —— 运行时应用，worker 不写 sysctl、不持
   `SYS_ADMIN`：compose 的 `sysctls:`，k8s 的**pod 级**
   `spec.template.spec.securityContext.sysctls`（`deploy/k8s/worker.yaml`）。
+  **2026-09-16 起：compose 侧不再声明这条 sysctl**——两个 worker 都跑 per-sandbox netns，
+  wildcard-DNS 的 `:53` bind 落在沙箱自己的 netns 内，沙箱在自身 userns 里是 root
+  （`CAP_NET_BIND_SERVICE` 覆盖 53），host 侧 sysctl 无关（fork: `context.rs`）。k8s 清单仍是
+  共享 netns 形态，继续保留 pod 级声明。
   ⚠️ **不能用 `NET_BIND_SERVICE` 代替**：worker 镜像（`deploy/docker/Dockerfile.envd`）
   以 `USER 65534:65534` 构建、pod 也没有 `runAsUser: 0` ⇒ containerd 对非 root 清空
   effective 集（实测 `CapEff=0`，没有 ambient caps），内核默认
@@ -476,9 +480,18 @@ E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true` 跑全量 =
 ② 连接建立速率（~8.5×）是唯一的量化代价，短连接密集的负载需按此评估。
 未测项剩下 UDP/ICMP 边缘（无 connect 的 datagram、组播/广播）与真实 SDK 负载下的行为。
 
-### 2.4.7 netns 单节点灰度（2026-09-16 起）
+### 2.4.7 netns 全量（2026-09-16：灰度 → 全量）
 
-**形态**：`deploy/stack/docker-compose.prod.yml` 里**只有 worker-2** 带
+**结果**：灰度期间量到 MCP 入站路径每请求 +390 ms（§2.4.7 下方实测 + 根因 + fork 侧
+`net_bind_inject` 修复），修复上线后 worker-2 的 `/mcp` p50 回到 29.1–29.7 ms、与共享形态持平
+⇒ **2026-09-16 全量**：两个 worker 都在 `&worker-env` 上带
+`E2B_ENABLE_NET_ISOLATION=${E2B_ENABLE_NET_ISOLATION:-true}` +
+`E2B_FD_INJECT_CONNECT=${E2B_FD_INJECT_CONNECT:-true}`（worker-2 保留自己的
+`*_WORKER2` 覆盖以便单节点回滚），**容器级 `ip_unprivileged_port_start=0` 已从 compose 撤掉**
+（它的唯一用户是 wildcard-DNS 的 `:53`，netns 形态下该 bind 发生在沙箱自己的 netns，
+root-in-userns 自带 `CAP_NET_BIND_SERVICE`；k8s 清单仍是共享 netns，继续保留 pod 级那份）。
+
+以下为灰度期的记录，保留作追溯：**形态**：`deploy/stack/docker-compose.prod.yml` 里**只有 worker-2** 带
 `E2B_ENABLE_NET_ISOLATION=true` + `E2B_FD_INJECT_CONNECT=true`（默认即 true，可用
 `E2B_ENABLE_NET_ISOLATION_WORKER2`/`E2B_FD_INJECT_CONNECT_WORKER2` 覆盖），worker-1 保持共享
 netns ⇒ 一套栈上两种形态并存，用真实流量判断。
@@ -503,8 +516,10 @@ netns ⇒ 一套栈上两种形态并存，用真实流量判断。
 6. **内核资源**：`user.max_user_namespaces` 水位（每沙箱 +1 个 netns；目标机实测 30519）、
    `ip netns list | wc -l` 应 ≈ 该节点并发沙箱数。
 
-**退出到全量的判据**：24h 内 1–4 无回归、无客户可感知差异（尤其是"沙箱里起服务/开端口"这类
-报错），再把 worker-1 切过去并撤掉容器级 `ip_unprivileged_port_start=0`（§2.4.6 的那条净收益）。
+**退出到全量的判据（已按实测判据执行，未等 24h）**：原判据是 24h 内 1–4 无回归、无客户可感知
+差异；但车队没有真实流量，"24h" 事实上不会产生证据，所以改用**按节点分组的定向实测**替代：
+命令 RTT、wildcard DNS、MCP `/mcp` p50/p95 两种形态逐项对齐（见下方修复后表格），再切 worker-1
+并撤掉容器级 `ip_unprivileged_port_start=0`。
 
 **2026-09-16 灰度实测：暂缓全量。** 按节点分组的合成负载（官方 MCP 客户端、每请求新建连接，
 即 envd 代理的真实行为）量到一条 §2.4.6 没覆盖的回归：

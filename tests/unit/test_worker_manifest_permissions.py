@@ -1,8 +1,10 @@
 """A6/fix-1: the manifests must not ask the worker for SYS_ADMIN.
 
 The privilege moved to the ``quota-agent`` service (it runs ``xfs_quota -x``
-server-side) and the low-port window is declared in the container spec. For the
-k8s pod the sysctl has to be **pod-level**: the worker image is ``USER 65534``
+server-side). The compose stack no longer declares the low-port window at all
+(both workers run per-sandbox netns, where the wildcard-DNS `:53` bind is
+covered by the sandbox's own userns); for the k8s pod, which is still
+shared-netns, the sysctl has to be **pod-level**: the worker image is ``USER 65534``
 and the manifest does not override it, so ``NET_BIND_SERVICE`` is inert
 (containerd grants no ambient caps to a non-root process) and the wildcard-DNS
 gateway's ``:53`` bind would fail with the kernel-default
@@ -66,11 +68,23 @@ def test_stack_worker_has_no_cap_add_and_declares_the_low_port_window() -> None:
     # the sandbox-create path needs. The path is env-overridable because a host
     # that keeps only this compose file has no `../seccomp/`.
     assert "\n      - seccomp=${E2B_SECCOMP_PROFILE:-../seccomp/sandlock-worker.json}\n" in worker
+    # Netns shape: the anchor every worker inherits, and worker-2's own
+    # override (kept so a single node can still be reverted). The pairing guard
+    # in create_app refuses one switch without the other, so both lines or
+    # neither.
+    assert "\n      E2B_ENABLE_NET_ISOLATION: ${E2B_ENABLE_NET_ISOLATION:-true}\n" in worker
+    assert "\n      E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT:-true}\n" in worker
     # The directive, not the prose: the comment above the line names the old
     # value on purpose.
     assert "\n      - seccomp=unconfined\n" not in worker
-    assert "\n    sysctls:\n" in worker
-    assert "\n      - net.ipv4.ip_unprivileged_port_start=0\n" in worker
+    # Since both workers run per-sandbox netns (2026-09-16) the container-level
+    # low-port window is gone: the wildcard-DNS `:53` bind happens inside the
+    # sandbox's own netns, where root-in-userns covers port 53 (fork:
+    # crates/sandlock-core/src/context.rs). The k8s manifest keeps its pod-level
+    # copy -- that shape is still shared-netns -- and is asserted below.
+    assert "\n    sysctls:\n" not in worker
+    # The directive, not the prose: the comment above explains why it is gone.
+    assert "\n      - net.ipv4.ip_unprivileged_port_start=0\n" not in worker
 
 
 def _unconditional_allowlist() -> set[str]:

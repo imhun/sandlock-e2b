@@ -14,7 +14,12 @@ spec:
         app: e2b-worker
     spec:
       # A6/fix-1: the wildcard-allowOut DNS gateway binds <127.0.1.x>:53 from the
-      # worker's own network namespace (shared-netns form, the default one).
+      # worker's own network namespace. This manifest does NOT enable
+      # per-sandbox netns (no E2B_ENABLE_NET_ISOLATION below), so the DNS bind
+      # still happens in the *pod's* netns and the pod-level low-port window is
+      # still required -- the compose stack dropped its copy on 2026-09-16
+      # after both its workers moved to netns, where the sandbox's own
+      # root-in-userns covers port 53.
       # The worker image builds with `USER 65534:65534`
       # (deploy/docker/Dockerfile.envd) and this pod does NOT override it, so
       # `capabilities.add: NET_BIND_SERVICE` is *not* enough: a non-root process

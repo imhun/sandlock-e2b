@@ -196,6 +196,18 @@ services:
       E2B_ENABLE_NETWORK: "true"
       E2B_NETWORK_DENY_CIDRS: ${E2B_NETWORK_DENY_CIDRS:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,169.254.0.0/16,fd00::/8}
       E2B_ENABLE_NETNS: "false"
+      # S2.2/S2.5 (2026-09-16): every worker runs sandboxes in their own
+      # loopback-only netns. Worker-2 carried this as the canary while the
+      # MCP path was ~19x slower under netns (375.9 ms vs 19.3 ms per /mcp
+      # request, the readiness synthesis in the fork's inbound mapping); bind
+      # injection (fork `net_bind_inject`, E2B_NET_BIND_INJECT) removed that
+      # cost -- measured 29.1-29.7 ms after -- so both workers run the same
+      # shape now. BOTH switches are required: `create_app` refuses the
+      # unpaired combination by name (it would leave every sandbox
+      # loopback-only, i.e. "the network is down" with no error), so a typo
+      # here crash-loops the worker instead of silently breaking sandboxes.
+      E2B_ENABLE_NET_ISOLATION: ${E2B_ENABLE_NET_ISOLATION:-true}
+      E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT:-true}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE}
       E2B_TEMPLATE_IMAGES: ${E2B_TEMPLATE_IMAGES:-}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
@@ -281,20 +293,19 @@ services:
       - SETGID      # e2b-slot-spawn: setgroups([]) + setgid(X)
       - CHOWN       # e2b-maint: workspace/slice ownership + slot documents
       - DAC_OVERRIDE  # e2b-maint: rm/walk fallback for trees group access misses
-    # A6: the worker needs no SYS_ADMIN. The three former uses are gone --
-    # ① the shared-volume ``mount --bind`` was deleted in A4 (virtual paths +
-    # A5 traversal bits); ② quota runs on the quota-agent service below;
-    # ③ the low-port window is declared here instead of written at runtime.
-    sysctls:
-      # Wildcard allowOut serves <127.0.1.x>:53 from the worker's own network
-      # namespace. resolv.conf cannot carry a port, so the gateway needs the
-      # low-port window -- declared in the container spec, which the runtime
-      # applies: no SYS_ADMIN and no in-container ``sysctl -w``. MCP inbound
-      # ports are 50005+ and never needed it. Only wildcard-domain rules use
-      # this. It is the only thing that works here: the worker is uid 65534, so
-      # NET_BIND_SERVICE would be inert (only a root worker would be covered by
-      # the cap -- and the declaration is harmless in that case too).
-      - net.ipv4.ip_unprivileged_port_start=0
+    # A6: the worker needs no SYS_ADMIN, and since both workers run
+    # per-sandbox netns the container-level low-port sysctl is gone too. Its
+    # only user was the wildcard-allowOut DNS gateway binding <127.0.1.x>:53:
+    # in the old shared-netns shape that bind happened in the worker's netns as
+    # uid 65534, which needs `net.ipv4.ip_unprivileged_port_start=0` in the
+    # container spec (no SYS_ADMIN, and NET_BIND_SERVICE is inert for a
+    # non-root worker). With `net_isolation` the same bind runs inside the
+    # sandbox's own netns, where the sandbox is root-in-userns and its
+    # CAP_NET_BIND_SERVICE covers port 53 -- the host sysctl is irrelevant
+    # there (fork: `crates/sandlock-core/src/context.rs`, "we are root inside
+    # our user namespace, so CAP_NET_BIND_SERVICE covers port 53 and the host
+    # `ip_unprivileged_port_start` sysctl is irrelevant"). The k8s manifest
+    # keeps its pod-level copy because that shape is still shared-netns.
     security_opt:
       # Docker's default syscall filter plus the two syscalls the sandbox-create
       # path needs (`pidfd_getfd` for the seccomp-notification fd, `unshare` for
