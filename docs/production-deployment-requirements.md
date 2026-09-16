@@ -506,6 +506,35 @@ netns ⇒ 一套栈上两种形态并存，用真实流量判断。
 **退出到全量的判据**：24h 内 1–4 无回归、无客户可感知差异（尤其是"沙箱里起服务/开端口"这类
 报错），再把 worker-1 切过去并撤掉容器级 `ip_unprivileged_port_start=0`（§2.4.6 的那条净收益）。
 
+**2026-09-16 灰度实测：暂缓全量。** 按节点分组的合成负载（官方 MCP 客户端、每请求新建连接，
+即 envd 代理的真实行为）量到一条 §2.4.6 没覆盖的回归：
+
+| 指标 | worker-1（共享 netns） | worker-2（netns） |
+|---|---|---|
+| MCP `/mcp` p50 | **19.3 ms**（18.7–42.9） | **375.9 ms**（375.1–398.9） |
+| 同连接复用（官方客户端 pooled） | 6.9–9.9 ms | 394–498 ms |
+| 命令 RTT p50 | 34.3 ms | 33.9 ms |
+| wildcard DNS | ok（10.250.0.2） | ok（10.250.0.2） |
+
+三段拆分（`tmp/mcp-3way.py`：测试自己的 MCP server 在工具处理里打时间戳，客户端在 worker 侧
+打时间戳，同一宿主墙钟）定位到**传输路径**而不是网关逻辑：
+
+| 阶段 | worker-1 | worker-2 |
+|---|---|---|
+| 去程（client 发出 → server 收到） | 5.3 ms | **170–183 ms** |
+| server 自身处理 | 0.2 ms | 0.2 ms |
+| 回程（server 回复 → client 收到） | 2.3 ms | **226 ms** |
+
+排除项：裸 TCP `connect()` 两种形态都是 0.1–0.2 ms（不是建连）；池化连接同样付费（不是每连接）；
+`/mcp` 的 401（网关鉴权中间件产生的一行响应）在 netns 侧也要 ~75 ms（不是 MCP 协议层）；
+netns 箱内 DNS 是"快速失败"（0.4 ms，不是解析）。⇒ 每请求 ~390 ms 落在 netns 独有的
+**入站映射 + fd 注入 socket 的数据面**（`network/inbound.rs`：host listener → eager-accept
+队列 → seccomp 注入的 `accept()`），fork 侧路径。
+
+**因此：worker-1 保持共享 netns，`ip_unprivileged_port_start=0` 不撤**，等 fork 侧把这条
+每请求代价定位并修掉后再走全量。复测脚本：`tmp/netns-node-compare.py`（按节点）、
+`tmp/mcp-3way.py`（三段拆分）。
+
 ### 2.4.8 并发容量口径（2026-09-16 调整）
 
 `E2B_MAX_TOTAL_*` 是**车队级**预算，`E2B_NODE_*` 是**每节点**容量，两者都以「每沙箱预留」
