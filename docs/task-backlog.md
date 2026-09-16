@@ -41,10 +41,10 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | S2.6 | 全特性矩阵回归 + wheel 重建 | ✅ 完成（lib 788 / integration 465 / python 430） |
 | S3.1 | cp314 双架构 wheel + 冒烟 | ✅ 完成（cp310-313 扩列本期不做） |
 | S3.2 | 私有源/镜像安装切换 | ✅ 完成（Dockerfile 按 ABI+ARCH 从 `wheels/fork` 安装） |
-| S3.3 | 上游 PR 分支整理 | ✅ 完成（推送按约束暂缓） |
+| S3.3 | 上游 PR 分支整理 | 🟡 分支已整理，**推送未做**：fork 分支领先 origin 166 个提交（含本轮 pid_ns 两个提交与 `fe492be`/`752b5db`），远程约束已解禁 → 见 N11 |
 
 | E10 | 每沙箱一实例（fork §8，M0–M4）：三层拆分 + E2B 接线。含 Q10 风险：`max_processes` 从『每命令 64』变『整箱 64』，落地时必须同步上调默认值并写变更说明；另含 Q6 网络策略语义、Q7 控制目录身份、Q8 泄漏回收。**安全前置（fork §7 M0′）未清零前不得在 envd 开 `exec`**；M4 第一步只做「网关+命令」半合并 | ✅ 完成（fork 侧 M0–M4/F0–F10 在子模块 b955ae9；E2B 接线 5d38537（Task 0.5 supervisor 档）→ 4f34e55/e0f5507/6de41db/05f349f/cb36b7a/f64d7ab/19dc1f5/f337724/4149a1f/4d617b9/3bf5d0e/883d38d/f67a6b9 → Task 11 收口；全量门禁见 HANDOFF。剩余 follow-ups 见下方「M4 收口后的 open follow-ups」） | `5d38537`…`f67a6b9`（+Task 11） |
-| SL-1 | 路径中介（USER_NOTIF）以 supervisor 身份执行 `openat/unlinkat/fchmodat/...`：沙箱文件属主变 root、`chmod` 失效、共享目录 per-uid 保护不成立 | ⬜ 待修（正文+复现+修法在 `third_party/sandlock/docs/e2b-integration.md` §3.1/§2 P1；`gh` 不可用 + token 只读，暂无法直接开上游 issue） |：`wheels/fork` 需按 E7 最终 sandlock tip 重建（`scripts/build-sandlock-wheels.sh`），
+| SL-1 | 路径中介（USER_NOTIF）以 supervisor 身份执行 `openat/unlinkat/fchmodat/...`：沙箱文件属主变 root、`chmod` 失效、共享目录 per-uid 保护不成立 | ✅ **已关闭（构造消除 + fail-closed）**：route B（supervise 进程 euid == 沙箱 host uid）使原修法不再需要，特权进程内中介 + 路径中介建箱前拒绝且**没有降级档**（B3 硬删 `mediation_run_as`）；E2B 侧见 T5 收口（`596f843`…）。**残余**：fork `docs/e2b-integration.md` §3.1 的"fail-closed 现状"段待重写（#25 ②）+ 上游 issue 未开（`gh` 不可用，见 N11） | `b62e201` `dd5a7e8` `7f81314` `75bbe0b`
 镜像内 wheel 与 fork 提交一致后才能推 ACR。
 
 ## E2B 服务端侧任务（阶段二）
@@ -52,7 +52,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | # | 任务 | 状态 | 关键提交 |
 |---|---|---|---|
 | E1.1 | 构建 + 推送 ACR 双架构镜像 | ✅ 完成 | `0.1.0-9-g9ed0f00-20260902-013319` |
-| E1.2 | 部署验证 | ⏸ 改为本地 compose 冒烟（远程部署按约束暂缓） | `917395b` `3b8f8af` |
+| E1.2 | 部署验证 | ✅ 完成（2026-09-16：远程部署解禁后真做了目标机验证 —— 两轮 `upgrade.sh`（净 netns 全量 + pid_ns 灰度/全量）每次自带多节点冒烟与部署级冒烟全过，另有按节点的契约探针；日志 `tmp/upgrade-*.log` / `tmp/pidns-*.log`） | `917395b` `3b8f8af` |
 | E1.3 | 内网隔离复测 | ✅ 完成（tests/security 26/0/1skip；顺带修 rootfs 绝对符号链接） | `b8cb817` |
 | E1.4 | 控制面 TLS | ✅ 完成 | `8b63da9` `9395c88` `01b6723` |
 | E2.1–E2.6 | XFS project quota（检测/管理/串行锁/孤儿清理/volume 配额/quota-agent） | ✅ 完成 | `a819426`…`e985efc` |
@@ -68,7 +68,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | E9.2 | pause 释放配额 / resume 重新准入 | ✅ 完成 | `8448d64` |
 | E9.3 | 驱逐选择器 + kill/pause + 通知（默认开启） | ✅ 完成 | `bcee688` |
 | E9.4 | 创建排队 / 超时 / 队列上限 | ✅ 完成 | `59c64d9` |
-| E8.1 | 部署后远程 smoke 回归 | ⏸ 受"不做远程部署"约束暂缓 | — |
+| E8.1 | 部署后远程 smoke 回归 | ✅ 完成（2026-09-16：解禁后每轮部署都跑 —— `multinode_smoke.py`（命令/文件/健康经网关、stdin、kill 后预留归零）+ `deployment_smoke.py`（迁移保留文件、网络配置、卷挂载、模板构建→ACR→worker 拉取、箱内 MCP 经代理），见 `tmp/upgrade-pidns.log` / `tmp/upgrade-pidns-full.log`） | — |
 | E8.2 | 本地测试基线确认 + HANDOFF/backlog 更新 | ✅ 完成（Linux 容器全量 28 failed / 804 passed / 17 skipped / 6 errors，219.63s；macOS unit+contract 11 failed / 689 passed / 23 skipped / 33 errors，36.91s；详见 HANDOFF「验证命令与基线」） | — |
 | E8.3 | 测试环境失败清零（把 E8.2 的"环境类失败"逐条定根因） | ✅ 完成（Linux 容器全量 **0 failed / 0 error**，843 passed / 18 skipped；macOS 全量（含 sdk python/js + security）**0 failed**，804 passed / 53 skipped；顺带修掉 2 个产品缺陷（模板镜像切换未落盘、无 registry 构建产物无法解析） | `ac59152` `d8b7f41` `87874a0` `0a235b4` `22e5acc` |
 | E8.4 | 公共镜像不直连 Docker Hub：`E2B_REGISTRY_MIRRORS` + 凭据按 host 作用域 + harness 存储改容器原生盘 + 清掉一条假 skip | ✅ 完成（默认形态 851 passed / 18 skipped；image-rootfs 形态 73 failed+28 errors → 853 passed / 16 skipped；两形态 0 failed。18 条 skip 的分组与跑法见 HANDOFF「容器全量剩下的 skip」） | `a6f74e4` `3d7cc79` `08a21dc` |
@@ -106,6 +106,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | N7 | 测试 | **`test_nonroot_route_b.py::test_nonroot_worker_runs_route_b_with_pooled_uids` 冷 lane 抖动**：没带 `X-Sandbox-Id`，冷缓存下直接 428 | 未开始。照同文件新用例的写法补 `X-Sandbox-Id`（幂等建箱） |
 | N8 | 运维 | **netns 观察清单剩余项**（§2.4.7）：按节点分组的超时率与 MCP 端口带水位 | 未开始。现在两节点同形态，只需一条全局水位即可；做法见 §2.9 端口池 |
 | N9 | 仓库卫生 | 未跟踪产物：`.graphifyignore`、`graphify-out/`、`target` | 待决：入库（`.graphifyignore` 值得）还是加进 `.gitignore` |
+| N11 | 仓库/上游 | **fork 分支推送 + SL-1 上游 issue**：分支领先 `origin` 166 个提交（含本轮 `5b16855`/`752b5db`）；SL-1 的 issue 一直没开（`gh` 不可用 + token 只读） | 待你决定：① `git -C third_party/sandlock push origin <branch>`（需网络+权限）；② 是否要开上游 issue（要一个可写的 token/凭据） |
 
 **本轮已完成（2026-09-16，供追溯）**：seccomp 收敛到"默认档 + 2 条补白"并上线；并发容量
 512MB/8 并发（`366e5dc`）；契约按 `E2B_DEFAULT_MEMORY_MB` 取值 + lane 透传（`d6b7270`）；
@@ -117,11 +118,12 @@ netns 灰度暴露 MCP 入站每请求 +390 ms，根因是 readiness 合成，fo
 
 ## 剩余工作
 
-1. 上线前：`wheels/fork` 重建（E7 最终 tip）+ 镜像重建推 ACR —— ✅ 代码/产物侧已完成
-   （F15 终态 fork `3020ea0` / wheel `3020ea0` 产物，见 #23）；**仍剩 ACR 推送**（受
-   "不推送远程"约束暂缓，Task 11）；
-2. 用户解除"不做远程部署"约束后：O1（prjquota）、E1.2/E8.1 目标机部署与远程复测、O2/O3；
-   T1（真实 XFS/ext4 上复测沙箱文件属主，去掉那条带证据的 skip）随 O1 一起做；
+1. 上线前：`wheels/fork` 重建 + 镜像重建推 ACR —— ✅ **全部完成**（2026-09-16：wheel 按
+   fork `5b16855` 重建、镜像推 ACR 两轮 —— netns 全量 + pid_ns 灰度/全量，见
+   `tmp/build-push-pidns.log`）
+2. 远程约束**已解禁并已用起来**（2026-09-16）：E1.2/E8.1 目标机部署与远程复测 ✅ 完成；
+   仍剩需要维护/部署窗口的 O1（prjquota）、O2（TLS 代理层）、O3（凭据管理），以及随 O1
+   一起做的 T1（真实 XFS/ext4 上复测沙箱文件属主，去掉那条带证据的 skip）；
 3. 不需要环境就能做的：~~T3（快照展开自嵌套守卫）~~ ✅ 已完成（G2，2026-09-06，见上表行）；
    T2 已随 fork P3 完成；~~#22 候选补丁（协议缺陷）~~ ✅ 已完成（F15，见 #23）。
 
