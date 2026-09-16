@@ -462,6 +462,9 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
   - 逃生口：`E2B_REQUIRE_SECCOMP_FILTER=0` 把两层都降为 WARNING —— 测试 runner
     （`deploy/compose/docker-compose.test.yml` 故意 `seccomp=unconfined`）与 autoscaler 的
     local backend（`autoscaler/backends/local.py` 拉起 worker 时同样 unconfined）已各自声明。
+  - 上线验证（随 `0.1.0-302-gf559014` 发布）：worker-1 与 worker-2 启动日志各出现一条
+    `seccomp self-check: filter mode active, user namespaces allowed` ⇒ 两个 worker 都在
+    shipped profile 下、探针通过，建箱冒烟照常全绿。
   - 真实容器三态验证（2026-09-16，本机 Docker）：`seccomp=unconfined` ⇒ 抛
     `SECCOMP_FILTER_MISSING`（`Seccomp: 0`）；`seccomp=deploy/seccomp/sandlock-worker.json`
     ⇒ 返回 `2` 不抛；**不加任何 `--security-opt`**（Docker 默认档，即 k8s 静默跳过的退化态）
