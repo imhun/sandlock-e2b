@@ -617,6 +617,20 @@ EXIT=0、0 failed（`tmp/gate-inject-full2.log`）；`mediation_2uid` 的 6 个�
 同样存在（环境所致，与本次改动无关）。升级后两个冒烟（多节点 + 部署级，含 MCP 网关过代理）
 全部通过。
 
+**全量上线后的实测（`0.1.0-299-g97ad404`，两个 worker 同形态）**：
+
+| 检查 | worker-1 | worker-2 |
+|---|---|---|
+| 容器开关 | `NET_ISOLATION=true` + `FD_INJECT_CONNECT=true` | 同 |
+| 容器 `sysctls` | **`null`**（低端口窗口已撤） | **`null`** |
+| 沙箱内接口 | `IFACES=lo`（自有 netns） | `IFACES=lo` |
+| MCP `/mcp` p50 | 29.7–39.0 ms | 29.4 ms |
+| 命令 RTT p50 | 33.1 ms | 32.9 ms |
+| wildcard DNS | ok（10.250.0.2） | ok（10.250.0.2） |
+
+wildcard DNS 在**没有容器级低端口 sysctl** 的情况下仍然可用，正是"`:53` 现在绑在沙箱自己的
+netns、由 userns root 覆盖"的直接证据；`IFACES=lo` 则确认车队里不再存在共享 netns 的沙箱。
+
 **因此：worker-1 保持共享 netns，`ip_unprivileged_port_start=0` 不撤**，等 fork 侧把这条
 每请求代价定位并修掉后再走全量。复测脚本：`tmp/netns-node-compare.py`（按节点）、
 `tmp/mcp-3way.py`（三段拆分）。
