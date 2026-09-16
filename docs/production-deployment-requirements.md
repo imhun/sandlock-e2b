@@ -531,6 +531,31 @@ netns 箱内 DNS 是"快速失败"（0.4 ms，不是解析）。⇒ 每请求 ~3
 **入站映射 + fd 注入 socket 的数据面**（`network/inbound.rs`：host listener → eager-accept
 队列 → seccomp 注入的 `accept()`），fork 侧路径。
 
+**机制（代码级定位，2026-09-16）**：`network/readiness.rs` 为"事件循环型服务器"合成就绪
+——host 侧排队的连接不会让沙箱自己的 listener 变可读，所以 fork 拦截
+`ppoll`/`epoll_pwait`（`seccomp_plan.rs::INBOUND_MAPPING_SYSCALLS`，**仅在
+`features.inbound_port_map` 打开时**注册），supervisor 复制被监视的 fd、按
+`POLL_SLICE_MS = 20` 切片轮询，再把组合好的 events 写回子进程。关键触发条件在
+`handle_poll_impl`：**被 poll 的 fd 集合里只要有"被映射的 listener"，整次调用就走合成路径**
+（`any_mapped` 为真即 `Defer`，否则 `Continue` 交还内核）。MCP 网关进程的 epoll 集合里永远
+有它自己的 listener（否则它没法 accept），而箱内 uvicorn 跑在 uvloop 上（`uvloop True`，
+纯 epoll 驱动）⇒ **该进程每一次事件循环等待都要过一次 supervisor**，一个请求在去程/回程各
+经历若干次事件循环迭代，累计成测到的 170 / 226 ms。
+
+这也解释了为什么只有 MCP 路径慢：命令 RTT（34 ms，两形态一致）与 stdio server 自身
+（0.2 ms）都不带被映射的 listener，不触发拦截；401 只走少数几次迭代（~75 ms）。
+
+修复方向（fork 侧，任选其一或组合）：
+① 快路径先行——进入切片循环前先以 timeout=0 试探一次复制 fd 与 `pending`，就绪即立刻返回，
+不再 `Defer`；
+② 去掉每次调用的 `dup_fd_from_pid` + `socket_ino` + 网络锁（epoll 路径已有 `epoll_ctl`
+注册表可缓存 inode；`ppoll` 可按 (pid, fd) 做小缓存）；
+③ 从设计上消掉这条映射——让网关改用 supervisor 交付的 socketpair 而不是在沙箱 netns 里
+bind+listen，则 `inbound_port_map` 关掉、拦截整体消失（改动最大，收益也最彻底）。
+
+修完要重跑同一条 A/B（`tmp/netns-node-compare.py`）确认收敛，才谈 worker-1 全量与撤
+`ip_unprivileged_port_start`。
+
 **因此：worker-1 保持共享 netns，`ip_unprivileged_port_start=0` 不撤**，等 fork 侧把这条
 每请求代价定位并修掉后再走全量。复测脚本：`tmp/netns-node-compare.py`（按节点）、
 `tmp/mcp-3way.py`（三段拆分）。
