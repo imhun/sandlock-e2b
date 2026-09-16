@@ -162,12 +162,16 @@ async def test_nonroot_worker_runs_route_b_with_pooled_uids(
         mount = [{"name": vid, "path": "mnt/data"}]
         a = await client.post(
             "/sandboxes",
-            headers={"X-API-Key": "local-key"},
+            # N7: a cold lane has no warmed base image, and an official create
+            # without X-Sandbox-Id fails fast with 428 instead of warming.
+            # Distinct ids per sandbox keep the two creates independent while
+            # making a rerun of this test idempotent (the id is the sandbox id).
+            headers={"X-API-Key": "local-key", "X-Sandbox-Id": "sbx_route_b_pool_a"},
             json={"templateID": "base", "timeout": 300, "volumeMounts": mount},
         )
         b = await client.post(
             "/sandboxes",
-            headers={"X-API-Key": "local-key"},
+            headers={"X-API-Key": "local-key", "X-Sandbox-Id": "sbx_route_b_pool_b"},
             json={"templateID": "base", "timeout": 300, "volumeMounts": mount},
         )
         assert (a.status_code, b.status_code) == (201, 201)

@@ -160,6 +160,17 @@ if [ -n "${E2B_PID_NS:-}" ]; then
     PIDNS_ENV="-e E2B_PID_NS=${E2B_PID_NS}"
 fi
 
+# Image-cache location. Unset the lane uses config.py's default, a *relative*
+# path under the CWD -- which on this lane is the repo bind mount, so the cache
+# survives between runs and every create finds a warm image. Pointing it at a
+# fresh (usually /tmp) path is the only way to reproduce the cold-lane shape
+# (B6/N7: an official create without X-Sandbox-Id answers 428 warm_required),
+# so forward it when the caller sets it; unset stays unset.
+CACHE_ENV=""
+if [ -n "${E2B_IMAGE_CACHE_DIR:-}" ]; then
+    CACHE_ENV="-e E2B_IMAGE_CACHE_DIR=${E2B_IMAGE_CACHE_DIR}"
+fi
+
 # shellcheck disable=SC2086
 docker run --rm --init --network host \
     $CAPS $EXTRA_CAPS --security-opt seccomp="$SECCOMP_PROFILE" \
@@ -171,6 +182,7 @@ docker run --rm --init --network host \
     $MIRRORS_ENV \
     $MEMORY_ENV \
     $PIDNS_ENV \
+    $CACHE_ENV \
     -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
     -v "$(pwd):/workspace" -w /workspace \
     "$IMAGE" \
@@ -198,8 +210,10 @@ if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
         -e E2B_HOST_PROJECT="$(pwd)" \
         -e E2B_TEST_STRICT_SKIPS=1 \
         -e E2B_BASE_IMAGE="${PHASE2_BASE_IMAGE:-python:3.11-slim}" \
+        $MIRRORS_ENV \
         $MEMORY_ENV \
         $PIDNS_ENV \
+        $CACHE_ENV \
         -v "$(pwd):/workspace" -w /workspace \
         "$IMAGE" \
         pytest tests/security/test_template_isolation.py \
