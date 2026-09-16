@@ -1555,6 +1555,13 @@ for n in json.load(sys.stdin):
 正常水位是"该节点并发 MCP 沙箱数 / 4535"；`highest` 只说明池用得多深（单调不降），
 不降下来不代表泄漏，`in_use` 才是被占用的数。
 
+**上线实测（2026-09-16，`0.1.0-316-g10bedf6-20260916-175558`）**：
+`before {worker-1: 0/4535, worker-2: 0/4535}` → 建 3 个 MCP 沙箱 →
+`{worker-1: 1/4535, worker-2: 2/4535}`（控制面按节点调度） → kill 后一个心跳周期回到
+`{0/4535, 0/4535}`（`tmp/n8-verify.log`）。同一版本还带上了 N6 的修复：create 之后立刻
+打 `/mcp` 的竞态窗口现在回 **503 + `Retry-After: 1`**（现场探针 `{503: 26, 200: 1}`，
+worker-2 日志 30×503 / 0×500 / 0 traceback，`tmp/n6-live-race.log`）。
+
 ## 3. 运维要求
 
 ### 3.1 quota 管理（E2B worker 自动执行）
