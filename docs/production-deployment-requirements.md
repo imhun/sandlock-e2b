@@ -579,6 +579,29 @@ E2B 侧开关：`E2B_NET_BIND_INJECT`（默认 `true`，`envd_service/config.py`
 `route_b.py` 的 wire 字段白名单同步加了这个键）。回滚只需把该变量设为 `false` 并重建 worker
 镜像/重启，策略立刻回到主机监听器映射。
 
+**上线实测（2026-09-16，随 `0.1.0-297-g15d4726` 发布，worker-2 仍是唯一 netns 节点）**：
+同一条按节点 A/B（`tmp/netns-node-compare.py`）在修复前后对比：
+
+| 指标 | worker-1（共享） | worker-2 修复前 | worker-2 修复后 |
+|---|---|---|---|
+| MCP `/mcp` p50 | 19–34 ms | **375.9 ms** | **29.1–29.7 ms** |
+| MCP p95 | 49–62 ms | ~399 ms | 37.8–48.7 ms |
+| 命令 RTT p50 | 33.7 ms | 33.9 ms | 33.2 ms |
+| wildcard DNS | ok | ok | ok |
+
+三段拆分（`tmp/mcp-3way.py`）同步收敛：worker-2 的去程 170–183 ms → **5.3 ms**、回程
+226 ms → **2.5 ms**（服务端自身仍是 0.2 ms），与 worker-1 的 5.3/2.3 ms 持平。
+
+形状不变量（worker 容器内 `/proc/net/tcp`，决定性证据）：共享形态的监听是
+`00000000:61001`（沙箱自己在 worker netns 里绑 0.0.0.0），注入形态是 `0100007F:61001`
+——即 supervisor 建的 **127.0.0.1** host-loopback socket 被注入了沙箱 fd，与「只绑 loopback」
+的设计一致。
+
+门禁：fork `sandlock-supervise` 库测试 20/20；E2B prod-shaped lane 在 netns 形态整轮
+EXIT=0、0 failed（`tmp/gate-inject-full2.log`）；`mediation_2uid` 的 6 个失败在干净 HEAD 上
+同样存在（环境所致，与本次改动无关）。升级后两个冒烟（多节点 + 部署级，含 MCP 网关过代理）
+全部通过。
+
 **因此：worker-1 保持共享 netns，`ip_unprivileged_port_start=0` 不撤**，等 fork 侧把这条
 每请求代价定位并修掉后再走全量。复测脚本：`tmp/netns-node-compare.py`（按节点）、
 `tmp/mcp-3way.py`（三段拆分）。
