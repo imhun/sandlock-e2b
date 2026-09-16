@@ -119,6 +119,16 @@ class Settings:
     fd_inject_connect: bool = field(
         default_factory=lambda: _env_bool("E2B_FD_INJECT_CONNECT", False)
     )
+    # E7.2: the pairing guard's escape hatch. `net_isolation` without
+    # `fd_inject_connect` yields a loopback-only sandbox: every external
+    # connect fails at the kernel (no route), which in production looks like
+    # "the network is down" with no error anywhere. That combination is
+    # refused at startup unless the operator says here that they mean it.
+    allow_loopback_only: bool = field(
+        default_factory=lambda: _env_bool(
+            "E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY", False
+        )
+    )
     # E7.2: inbound port mappings {host_port: sandbox_port} (S2.5), JSON.
     # Host ports live in the reserved 50005+ range. The MCP gateway path adds
     # its per-sandbox port automatically when net_isolation is enabled.
@@ -349,3 +359,39 @@ class Settings:
         if self.internal_api_key:
             keys.append(self.internal_api_key)
         return tuple(dict.fromkeys(keys))
+
+
+#: Raised (and never swallowed) when the net-isolation switches contradict each
+#: other. Named so a crash-looping worker says exactly which pair is wrong.
+NET_ISOLATION_PAIRING_ERROR = (
+    "E2B_ENABLE_NET_ISOLATION=true without E2B_FD_INJECT_CONNECT=true: every "
+    "sandbox would get a loopback-only network namespace, so each outbound "
+    "connect fails inside the kernel (no route) and user code only sees "
+    "timeouts -- nothing in the worker logs an error. Set "
+    "E2B_FD_INJECT_CONNECT=true to mediate egress through the supervisor, or "
+    "set E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY=1 if a sandbox that cannot "
+    "egress at all is what you want."
+)
+
+
+def check_net_isolation_pairing(settings: Settings) -> None:
+    """Refuse the net-isolation shape that fails silently (measured 2026-09-16).
+
+    ``net_isolation`` alone is a loopback-only sandbox: the supervisor still
+    mediates, but a trapped ``connect()`` has no route to fall back on and the
+    failure surfaces as a timeout in user code, not as an error in the worker.
+    The shape stays reachable on purpose (a sandbox that must not egress, with
+    inbound served through ``port_mappings``); an operator asks for it by
+    setting ``E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY=1``.
+
+    See docs/production-deployment-requirements.md §2.4.6 for the measurement.
+    """
+    # getattr with the conservative defaults: a settings double that predates
+    # these fields keeps its old behaviour instead of crashing the startup path.
+    if not getattr(settings, "enable_net_isolation", False) or getattr(
+        settings, "fd_inject_connect", False
+    ):
+        return
+    if getattr(settings, "allow_loopback_only", False):
+        return
+    raise RuntimeError(NET_ISOLATION_PAIRING_ERROR)

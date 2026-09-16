@@ -12,7 +12,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from envd_service.config import Settings
+from envd_service.config import Settings, check_net_isolation_pairing
 from envd_service.agent import (
     NodeAgent,
     _executor_needs_images,
@@ -213,6 +213,19 @@ def create_app(
     node_address: str | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
+    # E7.2 pairing guard (2026-09-16): refuse the shape whose only symptom is a
+    # timeout in user code -- `net_isolation` without `fd_inject_connect` makes
+    # every sandbox loopback-only. Fail here, by name, instead of shipping a
+    # worker whose network looks "down" with nothing in its logs. The
+    # intentional no-egress shape sets E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY=1.
+    check_net_isolation_pairing(settings)
+    if getattr(settings, "allow_loopback_only", False) and getattr(
+        settings, "enable_net_isolation", False
+    ):
+        logger.warning(
+            "E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY=1: sandboxes will have no "
+            "external egress at all (loopback-only, inbound via port_mappings)"
+        )
     control_plane_url = control_plane_url or os.getenv("E2B_CONTROL_PLANE_URL")
     node_address = node_address or os.getenv("E2B_NODE_ADDRESS")
     quota_agent_client = None

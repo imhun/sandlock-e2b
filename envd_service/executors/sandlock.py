@@ -1521,7 +1521,10 @@ class SandlockExecutor(Executor):
                 type(self)._netns_no_inject_warned = True
                 logger.warning(
                     "net_isolation enabled without fd_inject_connect: "
-                    "sandboxes are loopback-only (all external egress fails)"
+                    "sandboxes are loopback-only (all external egress fails). "
+                    "create_app refuses this shape unless "
+                    "E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY=1 -- reaching this "
+                    "line means the executor was built outside that guard."
                 )
         elif self._fd_inject_connect:
             kwargs["fd_inject_connect"] = True

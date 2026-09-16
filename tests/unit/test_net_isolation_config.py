@@ -6,6 +6,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from pathlib import Path
 
+import pytest
+
 from envd_service.config import Settings
 from envd_service.executors.factory import create_executor
 
@@ -28,6 +30,57 @@ def test_net_isolation_settings_from_env(monkeypatch) -> None:
     assert settings.enable_net_isolation is True
     assert settings.fd_inject_connect is True
     assert settings.port_mappings == {"50006": "8080"}
+
+
+def test_net_isolation_pairing_guard(monkeypatch) -> None:
+    """`net_isolation` without `fd_inject_connect` refuses to start (2026-09-16).
+
+    That shape gives every sandbox a loopback-only netns: outbound connects
+    fail inside the kernel and user code only sees timeouts, with nothing in
+    the worker log. The guard names both switches; the intentional no-egress
+    shape has to say so with the ack variable.
+    """
+    from envd_service.config import (
+        NET_ISOLATION_PAIRING_ERROR,
+        check_net_isolation_pairing,
+    )
+
+    def _settings(netns, inject, ack):
+        return SimpleNamespace(
+            enable_net_isolation=netns, fd_inject_connect=inject, allow_loopback_only=ack
+        )
+
+    # The refused shape, and its exact message.
+    with pytest.raises(RuntimeError) as excinfo:
+        check_net_isolation_pairing(_settings(True, False, False))
+    assert str(excinfo.value) == NET_ISOLATION_PAIRING_ERROR
+
+    # Every other combination is fine: off, paired, or explicitly acknowledged.
+    assert check_net_isolation_pairing(_settings(False, False, False)) is None
+    assert check_net_isolation_pairing(_settings(False, True, False)) is None
+    assert check_net_isolation_pairing(_settings(True, True, False)) is None
+    assert check_net_isolation_pairing(_settings(True, False, True)) is None
+
+    monkeypatch.delenv("E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY", raising=False)
+    assert Settings(executor="local").allow_loopback_only is False
+    monkeypatch.setenv("E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY", "1")
+    assert Settings(executor="local").allow_loopback_only is True
+
+
+def test_create_app_refuses_the_unpaired_switch() -> None:
+    """The guard runs before anything else in create_app, so a misconfigured
+    worker crash-loops with the reason instead of serving sandboxes whose
+    network is silently dead."""
+    from envd_service.app import create_app
+    from envd_service.config import NET_ISOLATION_PAIRING_ERROR
+
+    settings = SimpleNamespace(
+        enable_net_isolation=True, fd_inject_connect=False, allow_loopback_only=False
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings=settings)
+    assert str(excinfo.value) == NET_ISOLATION_PAIRING_ERROR
+
 
 
 def test_create_executor_passes_net_isolation_flags(monkeypatch) -> None:
