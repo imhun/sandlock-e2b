@@ -299,6 +299,18 @@ services:
       # worker-1 keeps the base E2B_UID_POOL_START/SIZE above.
       E2B_UID_POOL_START: ${E2B_UID_POOL_START_WORKER2:-11000}
       E2B_UID_POOL_SIZE: ${E2B_UID_POOL_SIZE_WORKER2:-1000}
+      # netns canary (2026-09-16): worker-2 builds a per-sandbox network
+      # namespace, worker-1 keeps the shared netns, so both shapes run side by
+      # side on one stack and a rollout can be judged on real traffic. BOTH
+      # switches are required -- `create_app` now refuses the unpaired shape by
+      # name (it would leave every sandbox loopback-only, i.e. "the network is
+      # down" with no error), so a typo here crash-loops this worker instead of
+      # silently breaking sandboxes. Rollback: set both to false (or drop these
+      # two lines) and `upgrade.sh` again; the containers are recreated with the
+      # shared netns and nothing else changes. Measurements and the observation
+      # checklist live in docs/production-deployment-requirements.md §2.4.6/§2.4.7.
+      E2B_ENABLE_NET_ISOLATION: ${E2B_ENABLE_NET_ISOLATION_WORKER2:-true}
+      E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT_WORKER2:-true}
 
   # Server-side XFS project quota manager (E2.6, A6). It owns the privilege the
   # worker no longer has: ``xfs_quota -x`` is gated on CAP_SYS_ADMIN, so the

@@ -467,10 +467,44 @@ E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true` 跑全量 =
 
 **结论：没有发现阻塞项。** 需要管理的只有两件：
 ① 两个开关必须同时开 —— 只开 `enable_net_isolation` 而不开 `fd_inject_connect` 时，
-代码只打一条 WARNING（`sandlock.py`）然后沙箱变 loopback-only，"网络全断"表现为超时而非报错
-⇒ **建议改成启动时 fail-fast**（现为 warn-once）；
+沙箱会变 loopback-only 且"网络全断"表现为超时而非报错。**已改为启动自检 fail-fast
+（2026-09-16）**：`create_app` 第一步调用 `config.check_net_isolation_pairing`，命中即抛
+`NET_ISOLATION_PAIRING_ERROR`（点名两个变量 + 症状 + 两条出路），worker 拒绝启动而不是带着
+一张"网是坏的"的沙箱跑起来。确实想要"不能出网"的沙箱时显式声明
+`E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY=1`（启动时另打一条 WARNING）。
+回归：`tests/unit/test_net_isolation_config.py`（配对的四种组合 + `create_app` 拒绝 + 开关解析）；
 ② 连接建立速率（~8.5×）是唯一的量化代价，短连接密集的负载需按此评估。
 未测项剩下 UDP/ICMP 边缘（无 connect 的 datagram、组播/广播）与真实 SDK 负载下的行为。
+
+### 2.4.7 netns 单节点灰度（2026-09-16 起）
+
+**形态**：`deploy/stack/docker-compose.prod.yml` 里**只有 worker-2** 带
+`E2B_ENABLE_NET_ISOLATION=true` + `E2B_FD_INJECT_CONNECT=true`（默认即 true，可用
+`E2B_ENABLE_NET_ISOLATION_WORKER2`/`E2B_FD_INJECT_CONNECT_WORKER2` 覆盖），worker-1 保持共享
+netns ⇒ 一套栈上两种形态并存，用真实流量判断。
+
+**为什么可以并存**：沙箱的节点归属在创建时就定死（由控制面调度），单个沙箱不会在两种形态间迁移；
+按 §2.4.6 的实测，两端对外只有"连接建立 ~8.5×"与"非阻塞 connect 立即成功"两处差异。
+
+**回滚（一条命令）**：把 `E2B_ENABLE_NET_ISOLATION_WORKER2` / `E2B_FD_INJECT_CONNECT_WORKER2`
+设为 `false`（或删掉那两行）再跑 `upgrade.sh` —— 容器重建回共享 netns，不涉及镜像与数据回滚。
+若只开了一个开关，worker-2 会**拒绝启动并打印原因**（上面的配对守卫），这是预期行为。
+
+**观察清单（开灰度后 24h）**：
+
+1. **连接建立延迟**：worker-2 的首命令/建连指标 vs worker-1（预期 +0.3 ms 量级，只影响建连，
+   稳态数据面不变）。
+2. **超时率**：SDK 侧 `timeout` / 连接失败类错误**按节点分组**对比 —— netns 下的失败会表现为
+   超时而不是"connection refused"。
+3. **MCP 网关**：netns 沙箱的 `/mcp` 代理可用性 + 端口带水位（`61000–65535`，§2.9）。
+4. **DNS / 通配域名**：解析是否与共享形态一致（沙箱内 `ip addr` 只见 `lo` 是预期）。
+5. **worker 日志**：不应出现 `net_isolation enabled without fd_inject_connect`（配对守卫会先拒绝
+   启动）；容器非 0 退出 = 配置被拒，读错误原文即可定位。
+6. **内核资源**：`user.max_user_namespaces` 水位（每沙箱 +1 个 netns；目标机实测 30519）、
+   `ip netns list | wc -l` 应 ≈ 该节点并发沙箱数。
+
+**退出到全量的判据**：24h 内 1–4 无回归、无客户可感知差异（尤其是"沙箱里起服务/开端口"这类
+报错），再把 worker-1 切过去并撤掉容器级 `ip_unprivileged_port_start=0`（§2.4.6 的那条净收益）。
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
