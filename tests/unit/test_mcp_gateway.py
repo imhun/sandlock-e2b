@@ -215,7 +215,14 @@ async def test_start_mcp_gateway_primary_bin_and_full_config(
     assert cfg.cmd[1] == "/usr/bin/mcp-gateway"
     assert cfg.cmd[2:] == [
         "--config",
-        json.dumps({"name": "echo", "args": ["-c", "x"]}, separators=(",", ":")),
+        json.dumps(
+            {
+                "name": "echo",
+                "args": ["-c", "x"],
+                "envs": {"MALLOC_ARENA_MAX": "1"},
+            },
+            separators=(",", ":"),
+        ),
         "--foreground",
     ]
     assert cfg.cwd == str(tmp_path)
@@ -223,6 +230,60 @@ async def test_start_mcp_gateway_primary_bin_and_full_config(
     assert cfg.env["GATEWAY_ACCESS_TOKEN"] == "tok"
     assert cfg.env["MCP_PORT"] == str(ctx.mcp_port)
     assert cfg.env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+
+
+@pytest.mark.asyncio
+async def test_start_mcp_gateway_pins_malloc_arena_max(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gateway starts with one malloc arena, so neither it nor the stdio
+    server it spawns reserves 64 MiB of address space per thread.
+
+    sandlock is cgroup-less and charges anonymous *reservations* against the
+    sandbox budget (``sandlock-core/src/resource.rs::handle_memory``), so a
+    per-thread glibc arena costs a real 64 MiB: measured on the target
+    2026-09-16, one extra thread charged +72 MiB in a 512MB box. That is what
+    capped an MCP stdio server at ~110 MiB of payload; with this variable set
+    the same server held 300 MiB. The stdio server inherits the gateway's env,
+    so pinning it here covers both processes.
+    """
+    record = RuntimeSandbox(
+        sandbox_id="sbx_mcp_arena",
+        access_token="at",
+        workspace_dir=str(tmp_path),
+        base_image="python-mcp:3.14",
+        mcp={"name": "echo", "command": "python3"},
+    )
+    ctx = SandboxRuntimeContext(record, Settings())
+    fake = _FakeExecutor()
+    monkeypatch.setattr(ctx, "executor", fake)
+    await ctx.start_mcp_gateway({"name": "echo"}, "tok")
+    assert fake.started[0].env["MALLOC_ARENA_MAX"] == "1"
+    # ...and the stdio server, which cannot inherit it (the SDK forwards only
+    # DEFAULT_INHERITED_ENV_VARS), gets it through the config's envs.
+    config_json = fake.started[0].cmd[3]
+    assert json.loads(config_json)["envs"] == {"MALLOC_ARENA_MAX": "1"}
+
+
+@pytest.mark.asyncio
+async def test_start_mcp_gateway_keeps_a_caller_supplied_arena_max(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller that pinned its own arena count keeps it."""
+    record = RuntimeSandbox(
+        sandbox_id="sbx_mcp_arena_user",
+        access_token="at",
+        workspace_dir=str(tmp_path),
+        base_image="python-mcp:3.14",
+        mcp={"name": "echo", "command": "python3"},
+    )
+    ctx = SandboxRuntimeContext(record, Settings())
+    fake = _FakeExecutor()
+    monkeypatch.setattr(ctx, "executor", fake)
+    await ctx.start_mcp_gateway(
+        {"name": "echo", "envs": {"MALLOC_ARENA_MAX": "4"}}, "tok"
+    )
+    assert json.loads(fake.started[0].cmd[3])["envs"] == {"MALLOC_ARENA_MAX": "4"}
 
 
 def test_mcp_port_pool_reuses_freed_ports() -> None:

@@ -45,6 +45,23 @@ logger = logging.getLogger(__name__)
 #: worker that runs out fails loudly instead of borrowing a shared port.
 _MCP_PORT_BASE = 61000
 _MCP_PORT_MAX = 65535
+
+#: glibc hands every new thread its own malloc arena, and a fresh arena
+#: reserves 64 MiB of anonymous address space up front. sandlock charges
+#: anonymous *reservations*, not touched pages (it is cgroup-less and runs the
+#: limit from seccomp notifications on mmap/brk:
+#: ``sandlock-core/src/resource.rs::handle_memory``), so those reservations come
+#: straight out of the sandbox's memory budget: measured on the target
+#: 2026-09-16 in a 512MB box, one extra thread cost +72 MiB (64 arena + 8 stack)
+#: and three cost +216 MiB, while the same three with this variable set cost
+#: +24 MiB. It is what made an MCP stdio server top out near 110 MiB of payload;
+#: with it the same server held 300 MiB (340 MiB was killed). The server is
+#: spawned by the gateway, so it inherits this -- and the gateway itself, being
+#: an I/O-bound proxy, is the one process the trade-off (all threads sharing one
+#: arena) is safe for. Keep it here, not in the sandbox's general env: a
+#: user workload that allocates from many threads would pay the contention.
+_MCP_GATEWAY_MALLOC_ARENA_MAX = "1"
+
 _GATEWAY_STDERR_TAIL_BYTES = 4096
 #: Pinned prefix of the SDK-visible text for a gateway that never served
 #: (FUP #4 / Task D1): a contract test asserts this string verbatim.
@@ -403,6 +420,14 @@ class SandboxRuntimeContext:
         gateway_bin = "/usr/bin/mcp-gateway"
         if not os.path.exists(gateway_bin):
             gateway_bin = "/usr/local/bin/mcp-gateway"
+        # The stdio server needs the same pin, and it cannot inherit it: the
+        # SDK's stdio client forwards only its DEFAULT_INHERITED_ENV_VARS
+        # (HOME/LOGNAME/PATH/SHELL/TERM/USER) and merges the configured
+        # ``envs`` on top, so an explicit entry is the only way through. A
+        # value the caller set keeps precedence.
+        mcp_envs = dict(config.get("envs") or {})
+        mcp_envs.setdefault("MALLOC_ARENA_MAX", _MCP_GATEWAY_MALLOC_ARENA_MAX)
+        config = {**config, "envs": mcp_envs}
         config_json = json.dumps(config, separators=(",", ":"))
         port = self._mcp_port
         if port is None:
@@ -451,6 +476,10 @@ class SandboxRuntimeContext:
                         # configured MCP server by command name (e.g.
                         # python3) via stdio.
                         "PATH": "/usr/local/bin:/usr/bin:/bin",
+                        # See _MCP_GATEWAY_MALLOC_ARENA_MAX: this is what keeps
+                        # the gateway's and the stdio server's thread counts out
+                        # of the sandbox's (reservation-based) memory budget.
+                        "MALLOC_ARENA_MAX": _MCP_GATEWAY_MALLOC_ARENA_MAX,
                     },
                     cwd=self.record.workspace_dir,
                     stdin_enabled=False,
