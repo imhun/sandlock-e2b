@@ -74,12 +74,12 @@ def test_stack_worker_has_no_cap_add_and_declares_the_low_port_window() -> None:
     # neither.
     assert "\n      E2B_ENABLE_NET_ISOLATION: ${E2B_ENABLE_NET_ISOLATION:-true}\n" in worker
     assert "\n      E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT:-true}\n" in worker
-    # pid_ns shape (2026-09-16): off in the anchor every worker inherits, so
-    # worker-1 keeps the shared host pid ns. The canary itself -- worker-2's
-    # override -- is pinned by its own test below, because this slice stops at
-    # the `worker-2:` key. Unlike the netns pair there is no pairing guard to
-    # keep honest: pid_ns cannot put a sandbox offline.
-    assert "\n      E2B_PID_NS: ${E2B_PID_NS:-false}\n" in worker
+    # pid_ns shape (2026-09-16): on in the anchor every worker inherits (the
+    # worker-2 canary graduated to the fleet). The per-node lever lives in
+    # worker-2's block and is pinned by its own test below, because this slice
+    # stops at the `worker-2:` key. Unlike the netns pair there is no pairing
+    # guard to keep honest: pid_ns cannot put a sandbox offline.
+    assert "\n      E2B_PID_NS: ${E2B_PID_NS:-true}\n" in worker
     # The directive, not the prose: the comment above the line names the old
     # value on purpose.
     assert "\n      - seccomp=unconfined\n" not in worker
@@ -94,21 +94,22 @@ def test_stack_worker_has_no_cap_add_and_declares_the_low_port_window() -> None:
 
 
 def test_stack_worker2_carries_the_pid_ns_canary() -> None:
-    """worker-2 is the pid_ns canary; worker-1 must keep the shared host pid ns.
+    """Worker-2 keeps a per-node pid_ns lever after the fleet-wide rollout.
 
     The switch is process-level per worker (`E2B_PID_NS` -> `Settings.pid_ns`),
-    so the only way to run both shapes at once is a per-service override -- the
-    same shape the netns canary used. Pinning both halves keeps a future edit
-    from silently turning the canary on for the whole fleet (or off for the
-    node that is supposed to carry it), which is exactly what the rollout is
-    judged on.
+    so a per-service override is the only way to take one node back to the
+    shared pid namespace without touching the fleet -- the same shape the netns
+    canary used, now kept as the rollback lever (the canary ran on this node
+    first: docs §2.4.10.3). Pinning it keeps a future edit from silently
+    dropping the lever, and pins that no `*_WORKER1` variant exists: worker-1
+    can only follow the shared anchor.
     """
     worker2 = STACK_COMPOSE.split("\n  worker-2:", 1)[1]
     assert "\n      E2B_PID_NS: ${E2B_PID_NS_WORKER2:-true}\n" in worker2
-    # The override belongs to worker-2 alone: no `*_WORKER1` variant exists, so
-    # worker-1 can only get the switch through the shared anchor (asserted off
-    # by the test above).
     assert "E2B_PID_NS_WORKER1" not in STACK_COMPOSE
+    # The anchor is the fleet-wide writer, and it is on (asserted by the test
+    # above); this lever only ever subtracts.
+    assert "\n      E2B_PID_NS: ${E2B_PID_NS:-true}\n" in STACK_COMPOSE
 
 
 def _unconditional_allowlist() -> set[str]:

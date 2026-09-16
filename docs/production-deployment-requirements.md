@@ -946,6 +946,42 @@ worker 形态不能在 root 相位断言），与开不开 pid_ns 无关；也�
 `${E2B_PID_NS_WORKER2:-false}`（或整行删掉）再 `upgrade.sh`，容器重建后回到共享 pid ns，
 其余不变。
 
+#### 2.4.10.4 全量：两个 worker 都开（2026-09-16，canary 毕业）
+
+**灰度期在 canary 上跑的契约**（`tmp/pidns-canary-contracts.sh`，黑盒打真实 API，就是部署产物
+本身；worker-1 当对照，`tmp/pidns-canary-contracts3.log`）—— 每节点两箱，逐条断言：
+
+| 检查 | worker-1（对照，pid_ns 关） | worker-2（canary，pid_ns 开） |
+|---|---|---|
+| C1 箱内 `id -u` | `0` ✅ | `0` ✅ |
+| C2 两箱宿主槽位 uid 互不相同且在节点池内 | `10000`/`10001` ✅ | `11000`/`11001` ✅ |
+| C3 `kill(1,0)` / `kill(<容器内外来 pid>,0)` | `EPERM` / `EPERM`（都可见、都非本进程） ✅ | **`ok` / `ESRCH`**（pid 1 是自己、外来 pid 不可见） ✅ |
+| C4 多线程负载 | —（对照） | `threads=ok` ✅ |
+| C5 后台子进程 + `wait` + 第二次 exec | — | `wait_rc=0`、`again` ✅ |
+| C6 files API 往返 | — | 往返一致 ✅ |
+
+外来 pid 是探针在 worker 容器里起的一个 `sleep 300`（容器里除了 worker 自己几乎没别的进程，
+早先那版取到 pid 1 等于在测 leader，是探针 bug 不是形态）。C3 两列**互为反例**：同一条
+`kill(foreign, 0)` 在对照上是 `EPERM`、在 canary 上是 `ESRCH`，这是 pid ns 唯一无法伪装的观测量。
+
+**切全量**：共享锚点改成 `E2B_PID_NS: ${E2B_PID_NS:-true}`（worker-2 保留自己的
+`E2B_PID_NS_WORKER2` 覆盖行，作为单节点回滚杆；没有 `*_WORKER1` 变体，worker-1 只能跟锚点）。
+`.env.example`、清单测试（现在钉住锚点 = true + worker-2 的杆 + 无 worker-1 变体）同步更新，
+`upgrade.sh` 重放（`tmp/upgrade-pidns-full.log`）—— 这一轮没改代码，只改清单，所以复用同一镜像版本
+`0.1.0-307-g7009a6d-20260916-165154`。升级自带的多节点冒烟与部署级冒烟全过。
+
+**全量后复核**（`tmp/pidns-full-contracts2.log` / `tmp/pidns-full-mcp.log`）：
+
+* 同一套契约两个节点**都是** `id -u`=0、池内 uid 各异、`kill(1,0)=ok`、外来 pid `ESRCH`、
+  线程/子进程/files API 正常（探针的期望值现在按节点**实际的** `E2B_PID_NS` 推导，所以同一支
+  探针在灰度前、灰度中、全量后、单节点回滚四种状态下都能用）；
+* `/mcp` 稳态每请求 `worker-1 = 8.1/7.8/7.9 ms`、`worker-2 = 8.4/7.9/7.7 ms`，仍持平；
+* 健康扫描：6 个服务全 Up，两个 worker `RestartCount=0`；日志里仅剩的 `GET /mcp -> 500`
+  （worker-1 4 条）是 MCP 探针扫端口打到未就绪网关照成的，即已登记的 N6。
+
+**范围说明**：这一轮只覆盖 compose 形态（线上目标机）。k8s 清单仍是共享 pid ns —— 与 N5
+（k8s 是否切 per-sandbox netns）同一类决定，另立条目跟踪，不在本轮范围内。
+
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
 - **`deploy/scripts/test-prod-shaped.sh`（生产形，默认推荐）**：容器不带 `--privileged`，
