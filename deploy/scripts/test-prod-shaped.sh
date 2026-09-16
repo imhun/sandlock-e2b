@@ -140,6 +140,18 @@ else
     echo "!! on 127.0.0.1:5080 is preloaded and passed here (§2.6.1)." >&2
 fi
 
+# The per-sandbox memory ceiling is a *deployment* value: the shipped stack
+# runs 512MB (deploy/stack/.env, docs §2.4.8) while the code default is
+# 1024MB. Both the control plane and the workers read it, and the boxed-quota
+# contracts derive their allocation sizes from it, so a lane that means to
+# reproduce the deployed shape has to forward it -- otherwise it silently
+# proves the code default instead. Unset stays unset: the code default applies
+# and the lane runs the 1 GiB shape the pre-2.4.8 contracts were written for.
+MEMORY_ENV=""
+if [ -n "${E2B_DEFAULT_MEMORY_MB:-}" ]; then
+    MEMORY_ENV="-e E2B_DEFAULT_MEMORY_MB=${E2B_DEFAULT_MEMORY_MB}"
+fi
+
 # shellcheck disable=SC2086
 docker run --rm --init --network host \
     $CAPS $EXTRA_CAPS --security-opt seccomp="$SECCOMP_PROFILE" \
@@ -149,6 +161,7 @@ docker run --rm --init --network host \
     -e E2B_BASE_IMAGE="${E2B_BASE_IMAGE:-python-mcp:3.14}" \
     -e E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2 \
     $MIRRORS_ENV \
+    $MEMORY_ENV \
     -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
     -v "$(pwd):/workspace" -w /workspace \
     "$IMAGE" \
@@ -176,6 +189,7 @@ if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
         -e E2B_HOST_PROJECT="$(pwd)" \
         -e E2B_TEST_STRICT_SKIPS=1 \
         -e E2B_BASE_IMAGE="${PHASE2_BASE_IMAGE:-python:3.11-slim}" \
+        $MEMORY_ENV \
         -v "$(pwd):/workspace" -w /workspace \
         "$IMAGE" \
         pytest tests/security/test_template_isolation.py \

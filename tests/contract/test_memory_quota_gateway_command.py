@@ -1,26 +1,41 @@
-"""FUP-E3/F11 contract: gateway + command share the boxed 1 GiB quota.
+"""FUP-E3/F11 contract: gateway + command share the boxed quota.
 
 The Task-8 (FUP-E3) gateway+command pairing was not expressible on the
 pre-F11 fork wheel: once the multithreaded MCP gateway ran, every later exec
 was denied by the argv-safety freeze EPERM (exit 127), and on the old 512 MiB
-box the gateway ledger left no headroom for a 450 MiB MCP server child.
-Both blockers are closed: fork F11 normalizes ProcessIndex keys to unique
-TGIDs before the exec freeze (``edd8c76``/``927d015``), and the E2B default
-per-sandbox memory is 1 GiB (``E2B_DEFAULT_MEMORY_MB``). This contract proves
-the original scenario on the F11 wheel:
+box the gateway ledger left no headroom for a 450 MiB MCP server child -- and
+that half is still true at 512MB: the ledger eats ~400 MiB of the box, so the
+largest server that initializes there is ~110 MiB (measured on the target
+2026-09-16). Fork F11 is closed: it normalizes ProcessIndex keys to unique
+TGIDs before the exec freeze (``edd8c76``/``927d015``). This contract proves
+the same-instance scenario on the F11 wheel, at whatever ceiling the lane
+runs:
 
-* an MCP gateway whose stdio echo server allocates and touches 450 MiB at
-  import is reachable (``list_tools`` returns exactly ``["echo"]``);
+* an MCP gateway whose stdio echo server allocates and touches
+  ``SERVER_HOLD_MB`` (an eighth of the ceiling, inside the headroom the box
+  was measured to have) at import is reachable (``list_tools`` returns
+  exactly ``["echo"]``);
 * a trivial command after the gateway runs with exit 0 (the F11 regression
   guard: pre-F11 every later exec died exit 127);
-* a second concurrent 450 MiB command is denied with the exact SDK signature
-  recorded by the F11 probe (``tmp/perf/f11-gateway-probe-450-450-50*.log`` and
+* a second concurrent command that asks for the whole ceiling on its own
+  (``DENIED_MB``) is denied with the exact SDK signature recorded by the F11
+  probe (``tmp/perf/f11-gateway-probe-450-450-50*.log`` and
   ``tmp/perf/f11-gateway-sdk-signature-variants.txt``): exit code 137, empty
   stdout, ``error is None``, stderr exactly one of the recorded set -- never
   a substring match and never an unobserved value;
-* a 50 MiB control command succeeds exactly while the server still holds its
-  450 MiB, and the gateway keeps serving ``["echo"]`` throughout;
-* the public sandbox record reports the default ``memoryMB == 1024``.
+* a ``CONTROL_MB`` (a twentieth of the ceiling) control command succeeds
+  exactly while the server still holds its allocation, and the gateway keeps
+  serving ``["echo"]`` throughout;
+* the public sandbox record reports the configured ceiling.
+
+All three sizes are derived from ``E2B_DEFAULT_MEMORY_MB`` (the lane forwards
+it; control plane and workers both read it) by ``tests/_memory_budget.py``, so
+this file describes the deployment's 512MB shape as well as the 1 GiB code
+default the hardcoded 450/450/50 was written against. The denial is expressed
+against the *box* rather than against the gateway's footprint on purpose: the
+gateway's own accounting differs between the target (where it leaves ~110 MiB
+of a 512MB box) and the in-lane harness (where it leaves far more), and only
+the box is the same on both.
 
 Run requirements: pure-sandlock container shape with ``E2B_BASE_IMAGE=``
 empty; the image-rootfs gate A shape with ``E2B_BASE_IMAGE=python-mcp:3.14``
@@ -41,6 +56,7 @@ import pytest
 
 from e2b import Sandbox
 from e2b.sandbox.commands.command_handle import CommandExitException
+from tests._memory_budget import gateway_sizes, per_sandbox_memory_mb
 from tests.security.conftest import sandlock_ready
 
 pytestmark = pytest.mark.skipif(
@@ -51,15 +67,12 @@ pytestmark = pytest.mark.skipif(
     ),
 )
 
-#: Default per-sandbox memory ceiling asserted through the public record.
-DEFAULT_MEMORY_MB = 1024
-
-#: The MCP stdio echo server holds this much memory (touched pages) inside
-#: the box for the whole test, so a sibling 450 MiB command overcommits
-#: (gateway ledger + 450 + 450 > 1024) while a 50 MiB one still fits.
-SERVER_HOLD_MB = 450
-DENIED_MB = 450
-CONTROL_MB = 50
+#: Per-sandbox memory ceiling asserted through the public record.
+DEFAULT_MEMORY_MB = per_sandbox_memory_mb()
+#: (See ``tests/_memory_budget.py`` for the fractions and the measured
+#: 512MB headroom they are checked against: 512MB -> 64/512/25 MiB,
+#: 1024MB -> 128/1024/51.)
+SERVER_HOLD_MB, DENIED_MB, CONTROL_MB = gateway_sizes(DEFAULT_MEMORY_MB)
 
 TRIVIAL_MARKER = "post-gateway-ok"
 
@@ -145,7 +158,7 @@ def _list_tools(sandbox, harness) -> list[str]:
 
 
 def _wait_gateway_serving_echo(sandbox, harness, deadline_s: float = 60.0) -> None:
-    """Wait until list_tools returns exactly ``["echo"]`` (the 450 MiB server
+    """Wait until list_tools returns exactly ``["echo"]`` (the held server
     child is alive and initialized); loud on timeout so a broken gateway or a
     killed server cannot make later assertions vacuously pass."""
     deadline = time.time() + deadline_s
@@ -162,7 +175,7 @@ def _wait_gateway_serving_echo(sandbox, harness, deadline_s: float = 60.0) -> No
         last = tools
         time.sleep(0.5)
     raise AssertionError(
-        "MCP gateway/450 MiB server never served ['echo'] "
+        f"MCP gateway/{SERVER_HOLD_MB} MiB server never served ['echo'] "
         f"(last observation: {last!r})"
     )
 
@@ -195,8 +208,8 @@ def gateway_quota_servers():
 
 
 def test_gateway_and_command_share_boxed_quota(gateway_quota_servers) -> None:
-    """MCP gateway (450 MiB server holder) + post-gateway exec + over-budget
-    sibling denial + in-budget control on the shared 1 GiB box."""
+    """MCP gateway (held server) + post-gateway exec + over-budget sibling
+    denial + in-budget control on the shared box."""
     harness = gateway_quota_servers
     sandbox = Sandbox.create(
         mcp={
@@ -208,7 +221,7 @@ def test_gateway_and_command_share_boxed_quota(gateway_quota_servers) -> None:
     )
     try:
         # The sandbox is created with the default per-sandbox memory: the
-        # public record must say exactly 1024 MiB.
+        # public record must say exactly the configured ceiling.
         detail = httpx.get(
             f"{harness['api_url'].rstrip('/')}/sandboxes/{sandbox.sandbox_id}",
             headers={"X-API-Key": "local-key"},
@@ -217,7 +230,7 @@ def test_gateway_and_command_share_boxed_quota(gateway_quota_servers) -> None:
         assert detail.status_code == 200
         assert detail.json()["memoryMB"] == DEFAULT_MEMORY_MB
 
-        # Outcome 1: the gateway plus its 450 MiB stdio server is reachable
+        # Outcome 1: the gateway plus its held stdio server is reachable
         # (list_tools works and reports exactly the echo tool).
         _wait_gateway_serving_echo(sandbox, harness)
 
@@ -231,9 +244,9 @@ def test_gateway_and_command_share_boxed_quota(gateway_quota_servers) -> None:
         assert trivial.stdout == f"{TRIVIAL_MARKER}\n"
         assert trivial.stderr == ""
 
-        # Outcome 3: a second concurrent 450 MiB command against the same box
-        # (gateway ledger + 450 MiB server holder + 450 MiB sibling) is denied
-        # with the exact recorded SDK signature.
+        # Outcome 3: a second concurrent command that wants the whole
+        # headroom against the same box (gateway reserve + server holder +
+        # sibling) is denied with the exact recorded SDK signature.
         with pytest.raises(CommandExitException) as excinfo:
             sandbox.commands.run(
                 py_cmd(alloc_script(DENIED_MB, hold=2.0)),
@@ -245,12 +258,12 @@ def test_gateway_and_command_share_boxed_quota(gateway_quota_servers) -> None:
         assert excinfo.value.error is None
 
         # The denial killed the over-budget task only: the gateway is still
-        # alive and still serving the 450 MiB holder's echo tool.
+        # alive and still serving the held server's echo tool.
         assert _list_tools(sandbox, harness) == ["echo"]
 
-        # Outcome 4: with the server still holding its 450 MiB, a 50 MiB
-        # control command stays under the 1 GiB box quota and succeeds
-        # exactly; the gateway keeps serving afterwards.
+        # Outcome 4: with the server still holding its memory, a control
+        # command stays under the box quota and succeeds exactly; the gateway
+        # keeps serving afterwards.
         control = sandbox.commands.run(
             py_cmd(alloc_script(CONTROL_MB, hold=2.0)),
             timeout=60,

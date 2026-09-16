@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests._memory_budget import per_sandbox_memory_mb
+
 
 async def _create(control_client):
     response = await control_client.post(
@@ -81,7 +83,8 @@ async def test_metrics_shape(control_client):
         "diskUsed",
         "timestamp",
     }
-    assert metric["memTotal"] == 1024 * 1024 * 1024
+    # The per-sandbox ceiling the run is configured for, not a fixed 1 GiB.
+    assert metric["memTotal"] == per_sandbox_memory_mb() * 1024 * 1024
 
 
 async def test_logs_shape(control_client):

@@ -1,4 +1,4 @@
-"""FUP-E3 contract: one sandbox instance's boxed 1 GiB quota denies overcommit.
+"""FUP-E3 contract: one sandbox instance's boxed quota denies overcommit.
 
 The original plan paired the over-budget command with a live MCP gateway
 (gateway holds 450M, command 450M denied, command 50M accepted). That pairing
@@ -6,21 +6,29 @@ is not expressible on the current sandlock fork wheel: a multithreaded
 gateway process poisons later exec creations (argv-safety freeze EPERM, exit
 127; gateway-shape blocker evidence: ``tmp/perf/task8-fup3-evidence-100-450-50.txt``),
 and the gateway's own ledger left <200M headroom inside the old 512M box, so
-a 450M MCP server child could not start there. That ledger-headroom half of
-the blocker is now closed E2B-side (FUP #3) by raising the per-sandbox default
-memory ceiling from 512 MiB to 1 GiB; fork F11 remains open. The D8-allowed
-pure-sandlock sibling variant below formalizes the exact same-instance
-accounting through the SDK:
+a 450M MCP server child could not start there. FUP #3 closed that half by
+raising the per-sandbox default to 1 GiB, but the deployment is back at 512MB
+(docs/production-deployment-requirements.md 2.4.8 measures the consequence:
+an MCP server tops out near 110 MiB there), so the gateway pairing is again
+only exercised by ``test_memory_quota_gateway_command.py`` within its own
+reserve-aware sizes. This D8-allowed pure-sandlock sibling variant needs no
+gateway at all: it formalizes the same-instance accounting through the SDK.
 
-* one background command child holds 800 MiB (touched pages) on the sandbox's
-  single long-lived instance;
-* a second concurrent 400 MiB command must be denied with the exact SDK
+* one background command child holds 70% of the ceiling (touched pages) on the
+  sandbox's single long-lived instance;
+* a second concurrent 40%-of-ceiling command must be denied with the exact SDK
   signature recorded in ``tmp/perf/task8-fup3-sdk-signature-variants.txt``
   (host-present evidence; ``CommandExitException`` exit_code 137, empty
   stdout, error None, stderr one of the recorded exact set
   ``{"", "Killed\\n"}``);
-* with the same 800 MiB holder, a concurrent 50 MiB command succeeds exactly
-  (exit 0, stdout ``got 50\n``) and the holder later finishes cleanly.
+* with the same holder, a concurrent 5%-of-ceiling command succeeds exactly
+  (exit 0, stdout ``got <MiB>\n``) and the holder later finishes cleanly.
+
+The three sizes are derived from ``E2B_DEFAULT_MEMORY_MB`` (the lane forwards
+it; controls and workers both read it), so this file proves the same
+accounting at the deployment's 512MB and at the 1 GiB code default. The
+1 GiB numbers this file used to hardcode (800/400/50) are exactly the 1024
+instances of the same fractions.
 
 Skipped outside the Linux sandlock runner (macOS host runs cover the executor
 mapping unit-level instead; run inside the Docker test runner with
@@ -39,6 +47,7 @@ import threading
 
 from e2b import Sandbox
 from e2b.sandbox.commands.command_handle import CommandExitException
+from tests._memory_budget import boxed_sizes, per_sandbox_memory_mb
 from tests.security.conftest import sandlock_ready
 
 pytestmark = pytest.mark.skipif(
@@ -49,12 +58,19 @@ pytestmark = pytest.mark.skipif(
     ),
 )
 
-#: Default per-sandbox memory ceiling asserted through the public record.
-DEFAULT_MEMORY_MB = 1024
-
-HOLDER_MB = 800
-OVER_BUDGET_SIBLING_MB = 400
-CONTROL_SIBLING_MB = 50
+#: Per-sandbox memory ceiling asserted through the public record, and the
+#: allocation sizes derived from it. The sizes are fractions of the ceiling
+#: so the same contract proves the boxed accounting at whatever
+#: ``E2B_DEFAULT_MEMORY_MB`` the lane runs -- 512MB (the deployment, sizes
+#: 358/204/25) and the 1 GiB code default (716/409/51) both hold the three
+#: properties below: the holder fits, holder + over-budget sibling does not,
+#: holder + control does.
+DEFAULT_MEMORY_MB = per_sandbox_memory_mb()
+(
+    HOLDER_MB,
+    OVER_BUDGET_SIBLING_MB,
+    CONTROL_SIBLING_MB,
+) = boxed_sizes(DEFAULT_MEMORY_MB)
 
 #: Exact SDK-visible denial signature recorded by the Step-1 probe
 #: (tmp/perf/task8-fup3-sdk-signature-variants.txt): the sandlock supervisor SIGKILLs
@@ -166,7 +182,7 @@ def wait_for_holder_allocation(ready, done, deadline_s: float = 30.0) -> None:
 def test_boxed_memory_quota_denies_sibling_overcommit(
     multinode_two_workers,
 ) -> None:
-    """Two concurrent SDK commands on one instance share the 1 GiB box quota."""
+    """Two concurrent SDK commands on one instance share the box quota."""
     harness = multinode_two_workers
     sandbox = Sandbox.create(**sandbox_opts(harness))
     holder = None
@@ -175,7 +191,7 @@ def test_boxed_memory_quota_denies_sibling_overcommit(
     holder_done = None
     try:
         # The sandbox is created with the default per-sandbox memory: the
-        # public record must say exactly 1024 MiB.
+        # public record must say exactly the configured ceiling.
         detail = httpx.get(
             f"{harness['api_url'].rstrip('/')}/sandboxes/{sandbox.sandbox_id}",
             headers={"X-API-Key": "local-key"},
@@ -184,7 +200,8 @@ def test_boxed_memory_quota_denies_sibling_overcommit(
         assert detail.status_code == 200
         assert detail.json()["memoryMB"] == DEFAULT_MEMORY_MB
 
-        # Holder: 800 MiB background command, alive until its sleep ends.
+        # Holder: 70% of the ceiling as a background command, alive until its
+        # sleep ends.
         holder = sandbox.commands.run(
             py_cmd(alloc_script(HOLDER_MB, hold=30.0)),
             background=True,
@@ -193,10 +210,10 @@ def test_boxed_memory_quota_denies_sibling_overcommit(
         holder_ready, holder_done, holder_thread = start_holder_waiter(holder)
         wait_for_holder_allocation(holder_ready, holder_done)
 
-        # Over-budget sibling: 800 + 400 = 1200 > 1024 MiB (plus interpreter
-        # overhead), so the new task is killed by the boxed memory supervisor;
-        # the SDK sees the exact recorded rejection (bash reports the
-        # SIGKILLed python as 128+9).
+        # Over-budget sibling: holder + 40% of the ceiling = 110% > 100%, so
+        # the new task is killed by the boxed memory supervisor; the SDK sees
+        # the exact recorded rejection (bash reports the SIGKILLed python as
+        # 128+9).
         with pytest.raises(CommandExitException) as excinfo:
             sandbox.commands.run(
                 py_cmd(alloc_script(OVER_BUDGET_SIBLING_MB, hold=2.0)),
@@ -207,15 +224,15 @@ def test_boxed_memory_quota_denies_sibling_overcommit(
         assert excinfo.value.stderr in DENIED_STDERR_SET
         assert excinfo.value.error is None
 
-        # Control sibling: 800 + 50 plus interpreter overhead stays below
-        # 1024 MiB while the holder still owns its allocation, so the command
-        # must succeed exactly.
+        # Control sibling: holder + 5% of the ceiling plus interpreter
+        # overhead stays below the ceiling while the holder still owns its
+        # allocation, so the command must succeed exactly.
         control = sandbox.commands.run(
             py_cmd(alloc_script(CONTROL_SIBLING_MB, hold=2.0)),
             timeout=60,
         )
         assert control.exit_code == 0
-        assert control.stdout == "got 50\n"
+        assert control.stdout == f"got {CONTROL_SIBLING_MB}\n"
         assert control.stderr == ""
 
         # The holder survived both siblings and exits cleanly on its own.

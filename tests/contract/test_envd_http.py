@@ -8,6 +8,7 @@ import httpx
 import starlette.requests
 
 from envd_service.config import Settings as EnvdSettings
+from tests._memory_budget import per_sandbox_memory_mb
 
 
 async def _create_sandbox(control_client) -> dict:
@@ -59,7 +60,9 @@ async def test_metrics(control_client, envd_client):
     assert response.status_code == 200
     payload = response.json()
     assert set(payload) == {"cpu", "memory", "disk"}
-    assert payload["memory"]["totalBytes"] == 1024 * 1024 * 1024
+    # The box reports the ceiling it was created with, which is whatever
+    # E2B_DEFAULT_MEMORY_MB the lane runs (512MB in the deployed shape).
+    assert payload["memory"]["totalBytes"] == per_sandbox_memory_mb() * 1024 * 1024
 
 
 async def test_file_download_exact(control_client, envd_client):

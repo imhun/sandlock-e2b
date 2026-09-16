@@ -551,11 +551,31 @@ control-plane 与 worker（此前只在代码里有默认值 1024MB/100%/1024MB/
   （不是 503）。用 MCP 的客户端要把"刚 create 就连"当作可重试窗口，与
   `tests/contract/test_mcp_netns.py` 里那段等 20s 的逻辑同源。
 
-门禁口径提醒：`tests/contract/test_memory_quota_{boxed,gateway_command}.py` 把上限写成常量
-1024（分配量 800/400/50 也按 1 GiB 箱折算），`deploy/scripts/test-prod-shaped.sh` 又没把
-`E2B_DEFAULT_MEMORY_MB` 透传进去 —— 所以门禁跑的是**代码默认 1024 形态**，不是线上 512
-形态。要让它跟线上对齐，得把这两个契约改成按 settings 取上限（分配量按比例折算）并在 lane
-里透传该变量。
+门禁口径（2026-09-16 修正）：此前这两个契约把上限写成常量 1024（分配量 800/400/50 也按
+1 GiB 箱折算），而 lane 不把 `E2B_DEFAULT_MEMORY_MB` 透传进去 —— 门禁跑的是**代码默认
+1024 形态**，不是线上 512 形态。现在：
+
+- `deploy/scripts/test-prod-shaped.sh` 会透传宿主的 `E2B_DEFAULT_MEMORY_MB`（未设则保持
+  不设，退回代码默认），两个阶段都带上；
+- `tests/_memory_budget.py` 是尺寸口径的唯一来源：`boxed_sizes()` 按上限取比例
+  （512 → 358/204/25），`gateway_sizes()` 的 `denied` 直接要整箱（与网关自身占用无关，
+  这样在生产与 lane 两种网关记账下都成立），`server_hold`/`control` 之和压在**实测**的
+  512 箱余量 110 MiB 之内；
+- `tests/unit/test_memory_quota_contract_sizes.py` 把这三条性质钉住，将来改比例不会静默
+  让断言变空转；
+- 同一批被 512 形态暴露出来的写死值（`/metrics` 的 `memTotal`、`/internal/tenants` 的
+  usage/unowned、migration 的 target 预留）一并改成按同一常量取。
+
+跑线上形态的门禁：
+
+```sh
+E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
+  PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 E2B_DEFAULT_MEMORY_MB=512 \
+  ./deploy/scripts/test-prod-shaped.sh
+```
+
+2026-09-16 两种形态各跑一次：`502`/`1024` 下改动涉及的 22 条全绿，512 形态整轮 100%
+无 F/E。
 
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）

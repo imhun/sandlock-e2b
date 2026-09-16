@@ -7,6 +7,7 @@ import time
 import pytest
 
 from e2b import Sandbox, Secret, Volume
+from tests._memory_budget import per_sandbox_memory_mb
 
 
 def test_volume_roundtrip_and_mount(live_servers):
@@ -113,7 +114,8 @@ def test_metrics(live_servers):
         metrics = sandbox.get_metrics()
         assert len(metrics) >= 1
         assert metrics[0].cpu_count == 1
-        assert metrics[0].mem_total == 1024 * 1024 * 1024
+        # Whatever ceiling this run is configured for (512MB deployed).
+        assert metrics[0].mem_total == per_sandbox_memory_mb() * 1024 * 1024
         assert metrics[0].disk_total > 0
         assert metrics[0].timestamp is not None
     finally:
