@@ -551,7 +551,13 @@ netns ⇒ 一套栈上两种形态并存，用真实流量判断。
    稳态数据面不变）。
 2. **超时率**：SDK 侧 `timeout` / 连接失败类错误**按节点分组**对比 —— netns 下的失败会表现为
    超时而不是"connection refused"。
-3. **MCP 网关**：netns 沙箱的 `/mcp` 代理可用性 + 端口带水位（`61000–65535`，§2.9）。
+3. **MCP 网关**：`/mcp` 代理可用性 + **一条全局端口带水位**。N8 起不再按节点分形态比较
+   （两节点已是同一形态）：读控制面 `GET /nodes`（API key）里每个节点的
+   `mcpPortsInUse` / `mcpPortsCapacity` —— worker 心跳带上来的（§2.9），
+   `in_use = 已发出 − 已回收`、`capacity = 4535`。判据：任一节点
+   `in_use / capacity` 接近 1，或出现 §2.9 那句
+   `the MCP gateway port band ... is exhausted` 的建箱失败，才需要动作；全局水位就是
+   **各节点里的最大值**，不需要再分别看两种形态。
 4. **DNS / 通配域名**：解析是否与共享形态一致（沙箱内 `ip addr` 只见 `lo` 是预期）。
 5. **worker 日志**：不应出现 `net_isolation enabled without fd_inject_connect`（配对守卫会先拒绝
    启动）；容器非 0 退出 = 配置被拒，读错误原文即可定位。
@@ -1531,6 +1537,23 @@ E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worke
 另外**不要**把宿主/worker 的 `net.ipv4.ip_local_port_range` 上界调高到 61000 以上（例如
 `1024 65535`）——那会把整个端口带重新拖回出向连接的源端口池里；本仓按默认
 `32768-60999` 设计。
+
+**水位怎么读（N8，2026-09-16）**：`McpPortPool.stats()` 给出
+`{capacity, in_use, highest, free}`，worker 每次心跳把它带上控制面
+（`mcpPortsInUse` / `mcpPortsCapacity`），因此**一条全局水位**就能从
+`GET /nodes` 读出来（API key 鉴权）：
+
+```bash
+curl -s -H "X-API-Key: $KEY" http://<control-plane>:3000/nodes \
+  | python3 -c 'import json,sys
+for n in json.load(sys.stdin):
+    u, c = n["mcpPortsInUse"], n["mcpPortsCapacity"]
+    print(f"{n[\"nodeID\"]}: {u}/{c} ({100*u/c:.1f}%)" if c else n["nodeID"])'
+```
+
+判据：任节点接近 100%（或已出现上面的 exhausted 建箱失败）才需要动作 —— 带宽 4535 个端口，
+正常水位是"该节点并发 MCP 沙箱数 / 4535"；`highest` 只说明池用得多深（单调不降），
+不降下来不代表泄漏，`in_use` 才是被占用的数。
 
 ## 3. 运维要求
 

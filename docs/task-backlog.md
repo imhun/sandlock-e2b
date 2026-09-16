@@ -102,9 +102,9 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | N10 | E2B/k8s | **k8s 形态是否也开 pid_ns**：compose 已全量，k8s 清单仍是共享 pid ns | 待定（与 N5 同形：若要切，清单加 `E2B_PID_NS=true` + 复跑 k8s 形态的契约） |
 | N4 | 运维/k8s | **目标集群安装 seccomp profile**：`deploy/k8s/seccomp-installer.yaml`（ConfigMap + DaemonSet）已就位但**尚未在真实集群验证** | 未开始。顺序：`kubectl apply -f deploy/k8s/seccomp-installer.yaml` → 等 DaemonSet 每节点 Ready → 再滚 worker Deployment；缺文件的节点一定起不来（fail closed） |
 | N5 | E2B/k8s | **k8s 形态是否也切 per-sandbox netns**：目前 k8s 清单仍共享 netns，因此保留 pod 级 `ip_unprivileged_port_start=0`（compose 已撤） | 待定。若切：清单加 `E2B_ENABLE_NET_ISOLATION/E2B_FD_INJECT_CONNECT` + 撤 pod sysctl + 复跑两条 lane |
-| N6 | E2B | **MCP 网关未就绪时的状态码**：`/mcp` 代理对 `httpx.ConnectError` 未捕获，客户端看到 500（应为 502/503） | 未开始。位置 `envd_service/http/mcp.py`（代理上游调用）；契约：create 后立即请求应得 503 + 可重试语义 |
-| N7 | 测试 | **`test_nonroot_route_b.py::test_nonroot_worker_runs_route_b_with_pooled_uids` 冷 lane 抖动**：没带 `X-Sandbox-Id`，冷缓存下直接 428 | 未开始。照同文件新用例的写法补 `X-Sandbox-Id`（幂等建箱） |
-| N8 | 运维 | **netns 观察清单剩余项**（§2.4.7）：按节点分组的超时率与 MCP 端口带水位 | 未开始。现在两节点同形态，只需一条全局水位即可；做法见 §2.9 端口池 |
+| N6 | E2B | **MCP 网关未就绪时的状态码**：`/mcp` 代理对 `httpx.ConnectError` 未捕获，客户端看到 500（应为 502/503） | ✅ **完成（2026-09-16）**：`httpx.ConnectError` ⇒ **503 + `Retry-After: 1`**（"还没 listen"是可重试状态）；D1 那条"网关已死"的 503 保持**无** `Retry-After`（重试是假话），两种 503 因此在测试里被区分钉住。`HttpAuthError` 新增可选 `headers`。RED（修前）`assert 500 == 503`（`tmp/n6-red.log`）→ GREEN（`tmp/n6-green.log`/`n6-green2.log`，含 D1 契约 61 passed）。注：端到端"未就绪窗口"无法确定性构造（窗口在网关 bind 之前），所以入库的是单测层契约 + 生产日志证据 |
+| N7 | 测试 | **`test_nonroot_route_b.py::test_nonroot_worker_runs_route_b_with_pooled_uids` 冷 lane 抖动**：没带 `X-Sandbox-Id`，冷缓存下直接 428 | ✅ **完成（2026-09-16）**：两次 create 各带独立 `X-Sandbox-Id`（它就是沙箱 id，幂等短路）。为了真验冷形态，lane 新增 `E2B_IMAGE_CACHE_DIR` 透传（否则缓存落在仓库 `tmp/sandboxes/_images` 永远是暖的）：冷跑 GREEN（`tmp/n7-cold-green.log`，8.18s），去掉 header 的冷跑 RED = `assert (428, 428) == (201, 201)`（`tmp/n7-cold-red.log`），两相位常规跑也绿（`tmp/n7-green.log`） |
+| N8 | 运维 | **netns 观察清单剩余项**（§2.4.7）：按节点分组的超时率与 MCP 端口带水位 | ✅ **完成（2026-09-16）**：端口带水位变成可读的**一条全局值** —— `McpPortPool.stats()`（`capacity/in_use/highest/free`）→ worker 心跳带 `mcpPortsInUse`/`mcpPortsCapacity` → 节点视图 `GET /nodes` 可见（读法与判据写进 §2.9，观察清单条目已改成单节点全局水位）；单测覆盖池子算术、心跳 payload（含 provider 崩掉不牵连）、节点记录与端点往返。超时率那一半本就是客户端侧观测，形态统一后不再需要分节点对比 |
 | N9 | 仓库卫生 | 未跟踪产物：`.graphifyignore`、`graphify-out/`、`target` | 待决：入库（`.graphifyignore` 值得）还是加进 `.gitignore` |
 | N11 | 仓库/上游 | **fork 分支推送 + SL-1 上游 issue**：分支领先 `origin` 166 个提交（含本轮 `5b16855`/`752b5db`）；SL-1 的 issue 一直没开（`gh` 不可用 + token 只读） | 待你决定：① `git -C third_party/sandlock push origin <branch>`（需网络+权限）；② 是否要开上游 issue（要一个可写的 token/凭据） |
 
@@ -442,8 +442,8 @@ netns 灰度暴露 MCP 入站每请求 +390 ms，根因是 readiness 合成，fo
     `library/python` 3.11/3.12/3.14-slim + `library/node:22-slim`）后三档全绿；
     注：404 按既有语义不重试，故本地源必须**镜像全集**（缺 `python:3.12-slim`
     时 `test_create_with_template_image` 直接 503）。
-21. **`tmp/f11_fup3_probe.py` 独立脚本形态不可复现（2026-09-07）**: ⬜ open
-    （**已定性，见 #22**；本条保留现象与已排除项）。同一镜像、同一 pure 形态下，
+21. **`tmp/f11_fup3_probe.py` 独立脚本形态不可复现（2026-09-07）**: ✅ **已结案
+    （2026-09-08，根因与修复见 #22；本条保留现象与已排除项作追溯）**。同一镜像、同一 pure 形态下，
     该脚本自建的 harness 里
     **任何写 stdout 的命令**都拿 `exit=120`/`stdout=''`（`/bin/echo x` → 1、
     `echo hi > /tmp/o.txt` → 2、沙箱内文件写不出来），而入库契约
