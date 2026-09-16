@@ -11,6 +11,9 @@ FUP-01/07/09/10/15/17 台账关闭，见 fork `docs/fork-plan-followups.md`）**
 约束提醒：本期"不推送远程" = 不做目标机远程部署（`upgrade.sh` / 远程复测暂缓），
 ACR 镜像推送照常，git 远程推送暂缓。
 
+构建/测试/部署前先看 [docs/build-test-deploy-pitfalls.md](build-test-deploy-pitfalls.md)
+（已踩过的坑 + 对应做法，防复发）。
+
 ## 归属方说明
 
 | 归属 | 代码库 | 改动/验证方式 |
@@ -86,6 +89,30 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | O1 | 目标机启用 XFS `prjquota`（fstab + 在线 remount，维护窗口） | 未开始（E2 生产验证前置；本地已用 losetup/XFS 实测） |
 | O2 | TLS 证书/代理层配置（代码侧 E1.4 已完成） | 未开始（需部署窗口） |
 | O3 | 凭据管理（ACR/API key/redis/SSH 上密钥管理） | 未开始（E5.4 已提供 master key 轮换能力） |
+
+## 待办登记（2026-09-16：netns 全量 / bind 注入 / seccomp 自检 / pid_ns 评估）
+
+按归属方整理；每条都写明"下一步动作"与"验收判据"，避免下次重新推导。
+
+| # | 归属 | 任务 | 状态 / 下一步 |
+|---|---|---|---|
+| N1 | fork | **pid_ns 自映射修复**：pid-ns 中间进程复刻 `confine_child` 的第三分支（`userns_self_map && !remap && user.is_some() && real_uid != 0` ⇒ `write_id_maps(real_uid, real_gid, 0, 0)`）。现在中间进程只有"特权 remap"和"real_uid→real_uid"两种 | 未开始。验收：`E2B_PID_NS=1` 下 `tests/contract/test_nonroot_route_b.py::test_route_b_restores_guest_root_with_and_without_pid_ns` 转绿（当前实测 `id -u` = 21000，应为 0） |
+| N2 | 测量 | **pid_ns 的 syscall 代价**：pid_ns 会拦 `newfstatat/statx/faccessat/faccessat2/readlinkat`（+旧 ABI 四条），全是热路径，且 seccomp 无法按路径过滤 ⇒ 每次调用都进 supervisor | 未开始。做法：lane 里 stat 密集命令（`[os.stat('/etc/hostname') for _ in range(2000)]`）在 `E2B_PID_NS=0/1` 各跑一次对比；判据：增量可接受（参考 netns 的教训：390 ms/请求不可接受） |
+| N3 | E2B/运维 | **pid_ns 灰度与默认值**：N1+N2 通过后才能谈 | 阻塞于 N1/N2。形态：先一个 worker（`E2B_PID_NS` 是进程级开关，需要按 worker 分容器 env） |
+| N4 | 运维/k8s | **目标集群安装 seccomp profile**：`deploy/k8s/seccomp-installer.yaml`（ConfigMap + DaemonSet）已就位但**尚未在真实集群验证** | 未开始。顺序：`kubectl apply -f deploy/k8s/seccomp-installer.yaml` → 等 DaemonSet 每节点 Ready → 再滚 worker Deployment；缺文件的节点一定起不来（fail closed） |
+| N5 | E2B/k8s | **k8s 形态是否也切 per-sandbox netns**：目前 k8s 清单仍共享 netns，因此保留 pod 级 `ip_unprivileged_port_start=0`（compose 已撤） | 待定。若切：清单加 `E2B_ENABLE_NET_ISOLATION/E2B_FD_INJECT_CONNECT` + 撤 pod sysctl + 复跑两条 lane |
+| N6 | E2B | **MCP 网关未就绪时的状态码**：`/mcp` 代理对 `httpx.ConnectError` 未捕获，客户端看到 500（应为 502/503） | 未开始。位置 `envd_service/http/mcp.py`（代理上游调用）；契约：create 后立即请求应得 503 + 可重试语义 |
+| N7 | 测试 | **`test_nonroot_route_b.py::test_nonroot_worker_runs_route_b_with_pooled_uids` 冷 lane 抖动**：没带 `X-Sandbox-Id`，冷缓存下直接 428 | 未开始。照同文件新用例的写法补 `X-Sandbox-Id`（幂等建箱） |
+| N8 | 运维 | **netns 观察清单剩余项**（§2.4.7）：按节点分组的超时率与 MCP 端口带水位 | 未开始。现在两节点同形态，只需一条全局水位即可；做法见 §2.9 端口池 |
+| N9 | 仓库卫生 | 未跟踪产物：`.graphifyignore`、`graphify-out/`、`target` | 待决：入库（`.graphifyignore` 值得）还是加进 `.gitignore` |
+
+**本轮已完成（2026-09-16，供追溯）**：seccomp 收敛到"默认档 + 2 条补白"并上线；并发容量
+512MB/8 并发（`366e5dc`）；契约按 `E2B_DEFAULT_MEMORY_MB` 取值 + lane 透传（`d6b7270`）；
+MCP 网关 `MALLOC_ARENA_MAX=1`（`d5114a2`，箱内 MCP server 上限 110 → 300 MiB）；
+netns 灰度暴露 MCP 入站每请求 +390 ms，根因是 readiness 合成，fork 侧 `net_bind_inject`
+（`fe492be`）+ E2B 接线（`15d4726`）修掉，实测 375.9 → 29.1 ms；netns 全量 + 撤 compose
+低端口 sysctl（`97ad404`）；k8s seccomp 安装器（`d818896`）；worker seccomp 启动自检
+（`f559014`）；pid_ns 评估与开关（`3461e36`）。
 
 ## 剩余工作
 

@@ -65,6 +65,11 @@ sandbox.kill()
 本地直连远程部署实例跑 SDK 测试（无需起本地服务）：见
 [docs/remote-testing.md](docs/remote-testing.md)。
 
+跑 lane / 构建 wheel / 部署前先过一遍
+[docs/build-test-deploy-pitfalls.md](docs/build-test-deploy-pitfalls.md)：
+里面记的是"看起来像代码坏了、其实是环境/流程"的那些坑（镜像不重建、默认 seccomp 档拦
+`unshare`、缺 `CAP_SYS_PTRACE`、冷缓存 428、引号地狱、`rg -r` 等）。
+
 **公共镜像源（OCI 形态）**：默认走**多源回落**（`E2B_REGISTRY_MIRRORS`，`|` 分隔按顺序尝试、
 origin 最后兜底；未设置时用内置默认链 `registry-1.docker.io=docker.m.daocloud.io|docker.1ms.run`，
 与 `deploy/compose/.env.example` 同值；显式置空才是直连）。镜像站抖动时改用**本地源**：
