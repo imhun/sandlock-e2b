@@ -534,6 +534,29 @@ control-plane 与 worker（此前只在代码里有默认值 1024MB/100%/1024MB/
 ② 之前"最多 4 个并发、第 5 个起 `503 No resources available`"的根因就是这张表：
 `E2B_MAX_TOTAL_CPU_PERCENT=400` 与 `E2B_MAX_TOTAL_PROCESSES=1024` 各折算 4 个。
 
+线上实测（2026-09-16，`tmp/mem512-limit.py` / `tmp/mcp-512-size.py`）：
+
+- **上限是真硬约束**：箱内 `MemTotal=524288 kB`；同箱内 400 MiB 分配 exit 0，700 MiB 分配
+  被 SIGKILL（SDK 侧 exit 137 / stderr `Killed`）。
+- **箱内 MCP 网关的 stdio server 上限 ≈110 MiB**（这是 512MB 口径下比"用户负载减半"更容易
+  被忽略的一条）：server 在 import 期持有 110 MiB 时 `tools/list` 与 `tools/call` 都正常；
+  120 MiB 起 server 起不来，网关 `session.initialize()` 拿到 `MCPError: Connection closed`
+  后 exit 1（worker 日志 `MCP gateway exited ... exit_code=1`），`/mcp` 按 FUP #4 以 503 带
+  记录原文作答。FUP #3 当年把 per-sandbox 默认从 512 抬到 1024 正是为了 450 MiB 的 MCP
+  server 目标 —— **改回 512 就等于把那个目标降到 ~110 MiB**，跑大 MCP server 的部署要么把
+  `E2B_DEFAULT_MEMORY_MB` 设回 1024，要么接受这个上限。
+- **`Sandbox.create(mcp=...)` 返回 ≠ 网关已就绪**（与本次容量调整无关的既有语义）：envd 拦截
+  SDK 的 `mcp-gateway --config` 命令后立刻回 exit 0，网关真正 bind 要 2–5s（并发创建更多箱
+  时更久），这期间 `/mcp` 从 worker 代理出去是 `httpx.ConnectError` → 客户端看到 **500**
+  （不是 503）。用 MCP 的客户端要把"刚 create 就连"当作可重试窗口，与
+  `tests/contract/test_mcp_netns.py` 里那段等 20s 的逻辑同源。
+
+门禁口径提醒：`tests/contract/test_memory_quota_{boxed,gateway_command}.py` 把上限写成常量
+1024（分配量 800/400/50 也按 1 GiB 箱折算），`deploy/scripts/test-prod-shaped.sh` 又没把
+`E2B_DEFAULT_MEMORY_MB` 透传进去 —— 所以门禁跑的是**代码默认 1024 形态**，不是线上 512
+形态。要让它跟线上对齐，得把这两个契约改成按 settings 取上限（分配量按比例折算）并在 lane
+里透传该变量。
+
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
