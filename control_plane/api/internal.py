@@ -98,6 +98,8 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
         quota_near_limit_count=body.get("quotaNearLimitCount"),
         disk_warn_count=body.get("diskWarnCount"),
         disk_error_count=body.get("diskErrorCount"),
+        mcp_ports_in_use=body.get("mcpPortsInUse"),
+        mcp_ports_capacity=body.get("mcpPortsCapacity"),
     )
     activity = body.get("sandboxActivity")
     if activity is not None and not isinstance(activity, dict):

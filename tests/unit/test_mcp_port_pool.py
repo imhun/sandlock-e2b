@@ -114,3 +114,35 @@ def test_an_exhausted_band_fails_instead_of_borrowing_a_port() -> None:
     assert _port_bindable(_MCP_PORT_BASE + width + 1)
     with pytest.raises(RuntimeError):
         pool.allocate()
+
+
+def test_stats_expose_the_band_watermark_by_whole_worker() -> None:
+    """N8: ``stats()`` is the number an operator watches, per worker.
+
+    ``in_use`` counts what live sandboxes hold against the band (handed out
+    minus released), ``capacity`` is the hard ceiling ``allocate`` refuses
+    past, and ``highest`` is the monotonic counter -- so "nearly exhausted" and
+    "recycled a lot" stay distinguishable. A fresh pool must read all zeros
+    except the capacity, i.e. the watermark cannot look busy before any
+    gateway exists.
+    """
+    width = 8
+    pool = McpPortPool(base=_MCP_PORT_BASE, max_port=_MCP_PORT_BASE + width)
+    assert pool.stats() == {"capacity": width, "in_use": 0, "highest": 0, "free": 0}
+
+    held = [pool.allocate() for _ in range(3)]
+    assert pool.stats() == {"capacity": width, "in_use": 3, "highest": 3, "free": 0}
+
+    # Releasing one returns it to the free set: in_use drops, highest does not
+    # (the pool must never hand out a number it no longer owns).
+    pool.release(held[1])
+    assert pool.stats() == {"capacity": width, "in_use": 2, "highest": 3, "free": 1}
+
+    # The recycled number is handed out again, not a new one.
+    assert pool.allocate() == held[1]
+    assert pool.stats() == {"capacity": width, "in_use": 3, "highest": 3, "free": 0}
+
+    # Out-of-band releases (never-allocated ports) change nothing.
+    pool.release(_MCP_PORT_BASE + width + 5)
+    pool.release(None)
+    assert pool.stats() == {"capacity": width, "in_use": 3, "highest": 3, "free": 0}

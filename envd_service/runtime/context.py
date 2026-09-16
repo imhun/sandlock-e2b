@@ -240,12 +240,35 @@ class McpPortPool:
                 return
             self._free.add(port)
 
+    def stats(self) -> dict[str, int]:
+        """Snapshot of the band, for the node's watermark (N8).
+
+        ``in_use`` is the number an operator watches: every port ever handed
+        out minus the ones released back, i.e. what live sandboxes hold
+        against the band. ``highest`` is the monotonic counter (it never
+        decreases), so "nearly exhausted" is distinguishable from "recycled a
+        lot"; ``capacity`` is the band's size (the hard ceiling
+        ``allocate`` refuses past).
+        """
+        with self._lock:
+            return {
+                "capacity": self._max - self._base,
+                "in_use": self._counter - len(self._free),
+                "highest": self._counter,
+                "free": len(self._free),
+            }
+
 
 _mcp_port_pool = McpPortPool()
 
 
 def _next_mcp_port() -> int:
     return _mcp_port_pool.allocate()
+
+
+def mcp_port_stats() -> dict[str, int]:
+    """The worker's MCP port-band snapshot (see :meth:`McpPortPool.stats`)."""
+    return _mcp_port_pool.stats()
 
 
 def _release_mcp_port(port: int | None) -> None:

@@ -1225,6 +1225,55 @@ def test_heartbeat_usage_payload_survives_broken_provider(monkeypatch, tmp_path)
     assert payload == {"diskUsedMB": 0, "diskTotalMB": 0}
 
 
+def test_heartbeat_usage_payload_carries_the_mcp_port_watermark(
+    monkeypatch, tmp_path
+) -> None:
+    """N8: the heartbeat is how the worker's port band reaches the control plane.
+
+    The band (61001-65535) is a per-worker resource with a hard ceiling, and
+    both workers now run the same shape -- so the *single* global watermark an
+    operator reads is ``mcpPortsInUse / mcpPortsCapacity`` on the node view,
+    not a per-shape comparison. The provider is reported even when the quota
+    metrics provider is broken (it runs before it), because the two failures
+    are unrelated.
+    """
+    monkeypatch.setattr(
+        agent.shutil,
+        "disk_usage",
+        lambda _path: _DiskUsage(used=1, total=1000),
+    )
+    payload = agent._heartbeat_usage_payload(
+        EnvdSettings(workspace_base=tmp_path),
+        lambda: (_ for _ in ()).throw(RuntimeError("quota boom")),
+        None,
+        lambda: {"capacity": 4535, "in_use": 7, "highest": 900, "free": 893},
+    )
+    assert payload == {
+        "diskUsedMB": 0,
+        "diskTotalMB": 0,
+        "mcpPortsInUse": 7,
+        "mcpPortsCapacity": 4535,
+    }
+
+
+def test_heartbeat_usage_payload_survives_a_broken_port_provider(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        agent.shutil,
+        "disk_usage",
+        lambda _path: _DiskUsage(used=1, total=1000),
+    )
+
+    def broken():
+        raise RuntimeError("pool boom")
+
+    payload = agent._heartbeat_usage_payload(
+        EnvdSettings(workspace_base=tmp_path), None, None, broken
+    )
+    assert payload == {"diskUsedMB": 0, "diskTotalMB": 0}
+
+
 def test_node_record_update_usage_exposed_in_to_dict():
     registry = NodeRegistry()
     record = registry.register(
@@ -1244,6 +1293,8 @@ def test_node_record_update_usage_exposed_in_to_dict():
         quota_near_limit_count=2,
         disk_warn_count=1,
         disk_error_count=3,
+        mcp_ports_in_use=7,
+        mcp_ports_capacity=4535,
     )
     data = record.to_dict()
     assert data["usedDiskMB"] == 1234
@@ -1254,6 +1305,10 @@ def test_node_record_update_usage_exposed_in_to_dict():
     assert data["quotaNearLimitCount"] == 2
     assert data["diskWarnCount"] == 1
     assert data["diskErrorCount"] == 3
+    # N8: the MCP port watermark rides the same snapshot, so the node view is
+    # where the fleet-wide (per-node) watermark is read from.
+    assert data["mcpPortsInUse"] == 7
+    assert data["mcpPortsCapacity"] == 4535
 
 
 async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
@@ -1290,6 +1345,8 @@ async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
                 "quotaNearLimitCount": 0,
                 "diskWarnCount": 1,
                 "diskErrorCount": 2,
+                "mcpPortsInUse": 7,
+                "mcpPortsCapacity": 4535,
             },
         )
         assert response.status_code == 204
@@ -1302,6 +1359,10 @@ async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
         assert record.quota_near_limit_count == 0
         assert record.disk_warn_count == 1
         assert record.disk_error_count == 2
+        assert record.mcp_ports_in_use == 7
+        assert record.mcp_ports_capacity == 4535
+        # ...and the node view the operator reads carries the watermark.
+        assert control.state.nodes.get(node_id).to_dict()["mcpPortsInUse"] == 7
 
 
 # ------------------------------------------------------------- app lifespan

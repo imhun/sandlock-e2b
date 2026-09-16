@@ -27,6 +27,11 @@ class NodeRecord:
     disk_total_mb: int = 0
     disk_warn_count: int = 0
     disk_error_count: int = 0
+    #: N8: the worker's MCP gateway port band (61001-65535) usage, shipped by
+    #: the heartbeat. ``capacity`` is the band's hard ceiling, so the watermark
+    #: an operator watches is ``mcp_ports_in_use / mcp_ports_capacity``.
+    mcp_ports_in_use: int = 0
+    mcp_ports_capacity: int = 0
     reserved_memory_mb: int = 0
     reserved_cpu_percent: int = 0
     reserved_disk_mb: int = 0
@@ -72,6 +77,8 @@ class NodeRecord:
         quota_near_limit_count: int | None = None,
         disk_warn_count: int | None = None,
         disk_error_count: int | None = None,
+        mcp_ports_in_use: int | None = None,
+        mcp_ports_capacity: int | None = None,
     ) -> None:
         """Store the worker heartbeat's disk/quota usage snapshot."""
         if used_disk_mb is not None:
@@ -90,6 +97,10 @@ class NodeRecord:
             self.disk_warn_count = int(disk_warn_count)
         if disk_error_count is not None:
             self.disk_error_count = int(disk_error_count)
+        if mcp_ports_in_use is not None:
+            self.mcp_ports_in_use = int(mcp_ports_in_use)
+        if mcp_ports_capacity is not None:
+            self.mcp_ports_capacity = int(mcp_ports_capacity)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -112,6 +123,8 @@ class NodeRecord:
             "quotaNearLimit": self.quota_near_limit,
             "quotaOverLimitCount": self.quota_over_limit_count,
             "quotaNearLimitCount": self.quota_near_limit_count,
+            "mcpPortsInUse": self.mcp_ports_in_use,
+            "mcpPortsCapacity": self.mcp_ports_capacity,
             "totalProcesses": self.total_processes,
             "reservedProcesses": self.reserved_processes,
             "draining": self.draining,

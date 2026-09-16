@@ -29,6 +29,7 @@ from envd_service.runtime.image_resolver import (
     peek_image_warm,
     resolve_image_rootfs,
 )
+from envd_service.runtime.context import mcp_port_stats as _mcp_port_stats
 from envd_service.uid_pool import (
     align_shared_uid_workspace,
     apply_sandbox_ownership,
@@ -160,8 +161,9 @@ def _heartbeat_usage_payload(
     settings: Settings,
     metrics_provider: Callable[[], dict[str, Any]] | None = None,
     activity_provider: Callable[[], dict[str, float]] | None = None,
+    port_provider: Callable[[], dict[str, int]] | None = None,
 ) -> dict[str, Any]:
-    """Disk usage + quota alert snapshot carried by each worker heartbeat."""
+    """Disk usage + quota alerts + MCP port band carried by each heartbeat."""
     payload: dict[str, Any] = {}
     try:
         usage = shutil.disk_usage(settings.workspace_base)
@@ -179,6 +181,25 @@ def _heartbeat_usage_payload(
             activity = None
         if isinstance(activity, dict) and activity:
             payload["sandboxActivity"] = activity
+    if port_provider is not None:
+        # N8: the MCP gateway port band (61001-65535, §2.9) is a per-worker
+        # resource with a hard ceiling, and both workers now run the same
+        # shape -- so one global watermark per node (readable from the control
+        # plane's node view) replaces the old per-shape comparison. Reported
+        # before the quota metrics below on purpose: a broken quota provider
+        # returns early and must not take the watermark with it.
+        try:
+            ports = port_provider()
+        except Exception:
+            logger.warning("MCP port pool provider failed", exc_info=True)
+            ports = None
+        if isinstance(ports, dict):
+            for key, wire in (
+                ("in_use", "mcpPortsInUse"),
+                ("capacity", "mcpPortsCapacity"),
+            ):
+                if key in ports:
+                    payload[wire] = ports[key]
     if metrics_provider is not None:
         try:
             metrics = metrics_provider()
@@ -1237,12 +1258,17 @@ class NodeAgent:
         control_plane_url: str | None,
         node_address: str | None,
         metrics_provider: Callable[[], dict[str, Any]] | None = None,
+        port_provider: Callable[[], dict[str, int]] | None = None,
     ) -> None:
         self._settings = settings
         self._runtime_registry = runtime_registry
         self._control_url = (control_plane_url or "").rstrip("/")
         self._node_address = node_address or ""
         self._metrics_provider = metrics_provider
+        #: N8: the MCP gateway port band's watermark, shipped with every
+        #: heartbeat so the control plane's node view is the single place to
+        #: read it (defaults to the process-wide pool when not injected).
+        self._port_provider = port_provider or _mcp_port_stats
         #: E9.1: per-sandbox activity to ship with each heartbeat (registries
         #: without activity tracking simply report nothing).
         self._activity_provider = getattr(
@@ -1296,6 +1322,7 @@ class NodeAgent:
                                 self._settings,
                                 self._metrics_provider,
                                 self._activity_provider,
+                                self._port_provider,
                             ),
                             headers=headers,
                         )
