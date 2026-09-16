@@ -609,12 +609,20 @@ E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
 的 payload。同一只箱里一条**普通命令**仍能分配 160 MiB（账本 507.6 MiB）——箱没满，
 是 server 自己先付了 import/线程的钱。
 
-**可用的杠杆（已实测，尚未落地）**：给 stdio server 加 `MALLOC_ARENA_MAX=1`（经由
-`mcp={"envs": ...}`），server 的上限从 110 MiB 抬到 **300 MiB 可用 / 340 MiB 被杀**
-（`tmp/mcp-arena-max.py`）——省下的正是每个非主线程 64 MiB 的 arena 预留。要同时省网关那侧，
-得在 envd `start_mcp_gateway` 的 env 里带上同一个变量（server 从网关继承），那属于改代码 +
-重建发布。代价是对**多线程用户负载**可能变慢（所有线程抢同一 arena），所以只该加在
-网关/server 这条链上，不要无脑塞进用户命令的默认环境。
+**已落地的杠杆（2026-09-16，`d5114a2`，随 `0.1.0-293-gd5114a2` 上线）**：
+`MALLOC_ARENA_MAX=1` 钉在 envd 起的 MCP 网关上
+（`envd_service/runtime/context.py::_MCP_GATEWAY_MALLOC_ARENA_MAX`）。
+两个进程都要覆盖，而只有一个能靠继承：
+
+- 网关自己拿 env（`ExecConfig.env`）；
+- **stdio server 继承不到** —— SDK 的 stdio client 只转发
+  `DEFAULT_INHERITED_ENV_VARS`（HOME/LOGNAME/PATH/SHELL/TERM/USER），所以 envd 把它注入
+  mcp config 的 `envs`（调用方自带的值优先）。
+
+线上复测（同一只 512MB 箱，`tmp/verify-arena-live.py`）：server 持 **110 / 200 / 300 MiB
+都能 serve**（`tools/list` + `echo` 往返），340 MiB 仍失败；server 侧 `echo` 回读环境变量确认
+拿到 `MALLOC_ARENA_MAX=1`。普通箱 400 MiB 分配不受影响——这个变量**只**加在网关/server
+这条链上，不进用户命令的默认环境，因为多线程分配密集的负载会吃到 arena 竞争。
 
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
