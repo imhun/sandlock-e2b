@@ -883,6 +883,62 @@ lane，只差 `E2B_PID_NS`（探针 `tmp/pidns-cost-probe.py`）。
 **默认关闭**；灰度形态（先一个 worker，`E2B_PID_NS` 是进程级开关、按 worker 分容器 env）与
 默认值待择期执行。
 
+#### 2.4.10.3 灰度已上线：worker-2 开、worker-1 对照（2026-09-16）
+
+**形态**（`deploy/stack/docker-compose.prod.yml`）：共享锚点 `worker-env` 里
+`E2B_PID_NS: ${E2B_PID_NS:-false}`（worker-1 走这条），`worker-2` 服务块自己覆盖
+`E2B_PID_NS: ${E2B_PID_NS_WORKER2:-true}`。`E2B_PID_NS` 是进程级开关（`Settings.pid_ns`），
+所以同一个栈上两个 worker 会同时跑两种形态 —— 这正是灰度要的对照组。与 netns 那对开关不同，
+这里**没有配对守卫**：pid_ns 不会把沙箱弄成离线状态，所以单开一项是安全形态。
+
+**上线**：`build-and-push.sh`（版本 `0.1.0-307-g7009a6d-20260916-165154`，wheel 侧 fork tip
+`5b16855`）→ `upgrade.sh`（`tmp/upgrade-pidns.log`）。升级自带的两项冒烟全过：
+多节点冒烟（4 箱落在两个 worker 上，命令/文件/健康经网关全通）与部署级冒烟（含
+`worker-1 -> worker-2` 迁移后文件保留、模板构建→ACR→worker 拉取、箱内 MCP 网关经代理）。
+
+**形态验证**（`tmp/pidns-canary.sh` → `tmp/pidns-canary4.log`；同一次探测同一栈上各一箱）：
+
+| 观测 | worker-1（对照） | worker-2（canary） |
+|---|---|---|
+| worker 进程内 `E2B_PID_NS` | `false` | `true` |
+| ready 行 | `uid=10000 … guest-uid=uid-0-in-userns` | `uid=11000 … guest-uid=uid-0-in-userns` |
+| 箱内 `id -u` | `0` | `0` |
+| 箱内 `kill(1, 0)` | `EPERM`（pid 1 = 容器 init，共享 pid ns） | **`ok`（pid 1 就是沙箱自己的 leader ⇒ 自有 pid ns）** |
+| 箱内 `$$` | `332`（容器 pid 空间） | **`9`（命名空间内 pid）** |
+| `sleep & wait` 退码 / 自信号 | `wait_rc=0` / `self_rc=0` | `wait_rc=0` / `self_rc=0` |
+| 客人写的文件宿主侧属主 | `10000`（池内槽位 uid） | `11000`（worker-2 池内槽位 uid） |
+
+`id -u` 两列都是 0（route-B 自映射本来就把客人做成 root），所以**判形态的是最后三列**：
+自有 pid ns 才可能让 pid 1 属于自己、让 `$$` 落在个位数。
+
+**性能**：`tmp/mcp-3way.py`（netns 那次用的同一支探针，`tmp/pidns-canary-mcp.log`）稳态每请求
+`worker-1 = 7.7/8.0/8.0 ms`、`worker-2 = 8.2/8.0/9.3 ms`（首请求各 ~127 ms 为连接建立）。
+两节点持平，没有 netns 那类每请求 +390 ms 的回退，与 §2.4.10.2 的"部署形态里 stat 族本来就已经
+被 chroot 中介拦着、pid_ns 增量测不到"一致。
+
+**健康扫描**（`tmp/pidns-canary-health.sh`）：6 个服务全 Up，control-plane/gateway/redis/
+quota-agent `worker-2` 0 条 traceback/ERROR；`worker-1` 20 条全部是 `GET /mcp -> 500`
+（`httpx.ConnectError`），来源是 MCP 探针扫端口时打到还没起来的箱内网关 —— 这正是已登记的
+backlog N6（网关未就绪应回 502/503 而不是 500），**与 pid_ns 无关**（worker-2 同一轮 0 条）。
+
+**观察清单（灰度期）**：
+
+1. 按节点的建箱失败率。pid_ns 的特有失败模式是 fail-closed：中间进程 `unshare(CLONE_NEWUSER)`
+   被拒（内核/LSM）时直接 `_exit(127)`，建箱报错而不是静默退回共享 pid ns —— 所以看到
+   worker-2 建箱失败要先查 userns 是否可用，不要当成普通容量问题。
+2. `/mcp` 每请求 p50 的节点间差值（本轮基线 ~8 ms 持平）。
+3. 箱内进程可见性变化的用户侧反馈（`ps`、`kill` 到宿主 pid、`/proc` 视图）——这是 pid_ns
+   唯一对外可见的语义变化。
+4. 本机门禁的 pid_ns 覆盖保持绿：fork `test_pid_ns::`（9 个）+ E2B `-k 'route_b or pid_ns'`
+   （相位 1 86 / 相位 2 34）。
+
+**退出判据**：本 fleet 不带真实流量（同 §2.4.7 的说明），所以"跑 24h 无回归"取不到证据；改用
+上面的形态 + 性能 + 冒烟 + 错误计数四项同时成立即可全量（或按观察结果回滚）。
+
+**回滚**：`deploy/stack/docker-compose.prod.yml` 里把 worker-2 的那行 `E2B_PID_NS` 改成
+`${E2B_PID_NS_WORKER2:-false}`（或整行删掉）再 `upgrade.sh`，容器重建后回到共享 pid ns，
+其余不变。
+
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
 - **`deploy/scripts/test-prod-shaped.sh`（生产形，默认推荐）**：容器不带 `--privileged`，

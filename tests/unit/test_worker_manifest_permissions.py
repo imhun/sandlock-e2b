@@ -74,6 +74,12 @@ def test_stack_worker_has_no_cap_add_and_declares_the_low_port_window() -> None:
     # neither.
     assert "\n      E2B_ENABLE_NET_ISOLATION: ${E2B_ENABLE_NET_ISOLATION:-true}\n" in worker
     assert "\n      E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT:-true}\n" in worker
+    # pid_ns shape (2026-09-16): off in the anchor every worker inherits, so
+    # worker-1 keeps the shared host pid ns. The canary itself -- worker-2's
+    # override -- is pinned by its own test below, because this slice stops at
+    # the `worker-2:` key. Unlike the netns pair there is no pairing guard to
+    # keep honest: pid_ns cannot put a sandbox offline.
+    assert "\n      E2B_PID_NS: ${E2B_PID_NS:-false}\n" in worker
     # The directive, not the prose: the comment above the line names the old
     # value on purpose.
     assert "\n      - seccomp=unconfined\n" not in worker
@@ -85,6 +91,24 @@ def test_stack_worker_has_no_cap_add_and_declares_the_low_port_window() -> None:
     assert "\n    sysctls:\n" not in worker
     # The directive, not the prose: the comment above explains why it is gone.
     assert "\n      - net.ipv4.ip_unprivileged_port_start=0\n" not in worker
+
+
+def test_stack_worker2_carries_the_pid_ns_canary() -> None:
+    """worker-2 is the pid_ns canary; worker-1 must keep the shared host pid ns.
+
+    The switch is process-level per worker (`E2B_PID_NS` -> `Settings.pid_ns`),
+    so the only way to run both shapes at once is a per-service override -- the
+    same shape the netns canary used. Pinning both halves keeps a future edit
+    from silently turning the canary on for the whole fleet (or off for the
+    node that is supposed to carry it), which is exactly what the rollout is
+    judged on.
+    """
+    worker2 = STACK_COMPOSE.split("\n  worker-2:", 1)[1]
+    assert "\n      E2B_PID_NS: ${E2B_PID_NS_WORKER2:-true}\n" in worker2
+    # The override belongs to worker-2 alone: no `*_WORKER1` variant exists, so
+    # worker-1 can only get the switch through the shared anchor (asserted off
+    # by the test above).
+    assert "E2B_PID_NS_WORKER1" not in STACK_COMPOSE
 
 
 def _unconditional_allowlist() -> set[str]:

@@ -208,6 +208,15 @@ services:
       # here crash-loops the worker instead of silently breaking sandboxes.
       E2B_ENABLE_NET_ISOLATION: ${E2B_ENABLE_NET_ISOLATION:-true}
       E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT:-true}
+      # Per-sandbox PID namespace (fork `pid_ns`, default off). The sandbox
+      # gets its own pid ns: host and other-sandbox pids are invisible
+      # (`kill(pid, 0)` -> ESRCH), and the fork's /proc view is renumbered to
+      # the sandbox's own processes. Off in the anchor, on for the worker-2
+      # canary below -- the switch is process-level per worker, so a mixed
+      # stack is exactly the canary shape. Cost check (2026-09-16): in this
+      # shape the stat family is already mediated by the chroot translator, so
+      # pid_ns adds no measurable per-call cost (docs §2.4.10.2).
+      E2B_PID_NS: ${E2B_PID_NS:-false}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE}
       E2B_TEMPLATE_IMAGES: ${E2B_TEMPLATE_IMAGES:-}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
@@ -338,6 +347,15 @@ services:
       # checklist live in docs/production-deployment-requirements.md §2.4.6/§2.4.7.
       E2B_ENABLE_NET_ISOLATION: ${E2B_ENABLE_NET_ISOLATION_WORKER2:-true}
       E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT_WORKER2:-true}
+      # pid_ns canary (2026-09-16): worker-2 runs every sandbox in its own PID
+      # namespace, worker-1 keeps the shared host pid ns, so both shapes run
+      # side by side on one stack and the rollout can be judged on the same
+      # traffic. Rollback: set this to false (or drop the line) and
+      # `upgrade.sh` again -- the containers are recreated with the shared pid
+      # ns and nothing else changes. Shape evidence, cost measurements and the
+      # observation checklist live in docs/production-deployment-requirements.md
+      # §2.4.10.1-§2.4.10.3.
+      E2B_PID_NS: ${E2B_PID_NS_WORKER2:-true}
 
   # Server-side XFS project quota manager (E2.6, A6). It owns the privilege the
   # worker no longer has: ``xfs_quota -x`` is gated on CAP_SYS_ADMIN, so the
