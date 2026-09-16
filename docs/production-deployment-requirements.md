@@ -446,9 +446,31 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true` 跑全量 =
 `1439 passed / 3 skipped / 0 failed`（`tmp/prod-shaped-netns-on.log`），与共享 netns 那次
 逐项相同；netns 契约三条（MCP 全链路经代理、CPython `connect()` 走 fd 注入、通配域名）本地
-`3 passed`。⇒ **"能不能跑"这一层已经没有悬念**；开与不开的取舍落在语义与容量上
-（`getsockname` 返回宿主侧地址、入站必须显式映射、映射端口带 61000–65535 的容量、
-DNS/通配/HTTP MITM 的回归面、以及连接建立速率的未测项）。
+`3 passed`。⇒ **"能不能跑"这一层已经没有悬念**；开与不开的取舍落在语义与容量上。
+
+### 2.4.6 netns 的代价：逐条实测（2026-09-16，本机）
+
+开了 `net_isolation` 与没开，**在同一条 lane、同一份 profile 下**各跑一遍同类探针
+（`127.0.0.1` 与**非 loopback** 目标各一次；`connect` / 非阻塞 `connect` / `bind+listen`
+三种 socket 用法），逐项对比：
+
+| 观测项 | 共享 netns（线上现状） | netns（fd 注入） | 判定 |
+|---|---|---|---|
+| `getsockname()`（loopback 目标） | `127.0.0.1:<源端口>` | `127.0.0.1:<源端口>` | **无差异** |
+| `getsockname()`（**非 loopback** 目标） | `192.168.139.2:<源端口>`（**worker 的地址**） | `192.168.139.2:<源端口>` | **无差异** ⇒ 文档里"显示宿主地址"那条**不是 netns 引入的**，共享 netns 已如此（沙箱本来就在 worker 的网络命名空间里） |
+| `getpeername()` | 真实目标 | 真实目标 | 无差异 |
+| `bind()+listen()` 后 `getsockname()` | 正确 | 正确（`inbound.rs` 就在自己 netns 内 bind） | 无差异 |
+| **非阻塞 `connect_ex()`** | `115 EINPROGRESS`，此时 `getpeername()` 不可用 | **`0 OK`**，`getpeername()` 可用 | **唯一实证的语义差异**（方向还是"更友好"），但依赖 EINPROGRESS + 可写事件等待的代码路径会走不同分支 |
+| 连接建立 p50 / p95（200 次短连接） | **0.034 / 0.082 ms** | **0.291 / 0.560 ms** | **~8.5×**；绝对值 0.3 ms/连接（≈3400 conn/s 单线程），长连接/连接池无感 |
+| 入站可达性 | 同 netns ⇒ 外部可直连沙箱端口 | 必须有 `net_bind_map` | **差异，但不构成功能缺口**：全库没有 `get_host`/端口暴露语义（`rg get_host` 无命中），唯一入站消费者是内部 MCP 网关，它由 §2.9 的端口池自动映射 |
+| 端口带容量 | n/a | `61000–65535` = 4536 个 | **不是瓶颈**：节点上限 ≤100 沙箱（`E2B_MAX_SANDBOXES` 默认 100）⇒ 45× 余量 |
+
+**结论：没有发现阻塞项。** 需要管理的只有两件：
+① 两个开关必须同时开 —— 只开 `enable_net_isolation` 而不开 `fd_inject_connect` 时，
+代码只打一条 WARNING（`sandlock.py`）然后沙箱变 loopback-only，"网络全断"表现为超时而非报错
+⇒ **建议改成启动时 fail-fast**（现为 warn-once）；
+② 连接建立速率（~8.5×）是唯一的量化代价，短连接密集的负载需按此评估。
+未测项剩下 UDP/ICMP 边缘（无 connect 的 datagram、组播/广播）与真实 SDK 负载下的行为。
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
