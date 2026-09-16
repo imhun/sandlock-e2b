@@ -85,6 +85,10 @@ class DockerPoolBackend:
                 "seccomp=unconfined",
                 "--sysctl",
                 "net.ipv4.ip_unprivileged_port_start=0",
+                # The local backend keeps `seccomp=unconfined` (above): the
+                # worker's startup self-check must not refuse that shape.
+                "-e",
+                "E2B_REQUIRE_SECCOMP_FILTER=0",
                 "-e",
                 f"E2B_NODE_ID={name}",
                 "-e",

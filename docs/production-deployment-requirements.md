@@ -446,6 +446,26 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
   - 若集群改过 kubelet 的 `--seccomp-default-root`，hostPath 要指向同一个目录；手工拷文件仍
     可作单节点应急，但可复现路径是 DaemonSet。
   顺带：`Localhost` 是 Pod Security `baseline` 的允许值，而 `Unconfined` 不是。
+- **启动自检（2026-09-16，A7 follow-up）**：worker 起服务前会验证自己**确实**跑在
+  profile 下（`envd_service/config.py::check_seccomp_filter`，在 `create_app` 第一步调用，与
+  net-isolation 配对守卫并排）。两层，各自抓一种**静默**失效：
+  1. `/proc/self/status` 的 `Seccomp:` 必须为 `2`；`0` = 完全没过滤（profile 被丢、写成
+     `seccomp=unconfined`、或运行时忽略了未知 profile）⇒ 抛 `SECCOMP_FILTER_MISSING`。
+     这才是 A7 要消除的形态：沙箱会继承 worker 的整个系统调用面，而日志里什么都没有。
+  2. `Seccomp: 2` 之后再做一次**主动探针**：子进程里 `unshare(CLONE_NEWUSER)`。shipped
+     profile 无条件放行这条；而**运行时默认档**把它按 `CAP_SYS_ADMIN` 门控（worker 没有该
+     cap）⇒ 探针 EPERM 即抛 `SECCOMP_PROFILE_NOT_APPLIED`。这正是 **k8s 节点缺 Localhost
+     profile 文件时的退化形态**：kubelet 会静默跳过缺失文件、pod 照起（kubernetes#124944，
+     1.28/1.29），只有建箱时才失败。探针结果按进程缓存，不会每次建 app 都起子进程。
+     若 EPERM 其实来自宿主限制（`kernel.apparmor_restrict_unprivileged_userns=1` 或
+     `user.max_user_namespaces=0`），自检**点名宿主原因**并降级为 WARNING，而不是归咎 profile。
+  - 逃生口：`E2B_REQUIRE_SECCOMP_FILTER=0` 把两层都降为 WARNING —— 测试 runner
+    （`deploy/compose/docker-compose.test.yml` 故意 `seccomp=unconfined`）与 autoscaler 的
+    local backend（`autoscaler/backends/local.py` 拉起 worker 时同样 unconfined）已各自声明。
+  - 真实容器三态验证（2026-09-16，本机 Docker）：`seccomp=unconfined` ⇒ 抛
+    `SECCOMP_FILTER_MISSING`（`Seccomp: 0`）；`seccomp=deploy/seccomp/sandlock-worker.json`
+    ⇒ 返回 `2` 不抛；**不加任何 `--security-opt`**（Docker 默认档，即 k8s 静默跳过的退化态）
+    ⇒ 抛 `SECCOMP_PROFILE_NOT_APPLIED`。回归：`tests/unit/test_seccomp_selfcheck.py`（11 条）。
 - **生产形 lane**：`deploy/scripts/test-prod-shaped.sh` 与
   `deploy/scripts/smoke-prod-worker.sh` 改用同一文件（`SECCOMP_PROFILE=` 可覆盖）
   ⇒ 门禁跑的就是上线形态，而不是比它更宽的形态。

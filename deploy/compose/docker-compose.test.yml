@@ -18,6 +18,9 @@ services:
       - NET_ADMIN
     network_mode: host
     environment:
+      # This runner is unfiltered on purpose (`seccomp=unconfined` above); the
+      # worker's own startup self-check would otherwise refuse to serve.
+      E2B_REQUIRE_SECCOMP_FILTER: "0"
       E2B_API_KEY: local-key
       E2B_API_URL: http://127.0.0.1:3000
       E2B_SANDBOX_URL: http://127.0.0.1:49983

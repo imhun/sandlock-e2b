@@ -12,7 +12,11 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from envd_service.config import Settings, check_net_isolation_pairing
+from envd_service.config import (
+    Settings,
+    check_net_isolation_pairing,
+    check_seccomp_filter,
+)
 from envd_service.agent import (
     NodeAgent,
     _executor_needs_images,
@@ -219,6 +223,15 @@ def create_app(
     # worker whose network looks "down" with nothing in its logs. The
     # intentional no-egress shape sets E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY=1.
     check_net_isolation_pairing(settings)
+    # A7 follow-up (2026-09-16): the worker must actually run under the shipped
+    # seccomp profile. A missing one is silent in two different ways -- no filter
+    # at all (`Seccomp: 0`: the sandboxes inherit the worker's syscall surface),
+    # or the runtime default instead of ours (a k8s node whose Localhost profile
+    # file is missing: the kubelet skips it and the pod still comes up,
+    # kubernetes#124944). Both would only surface as failing sandbox creates, so
+    # they fail here by name. See envd_service/config.py for the two layers and
+    # E2B_REQUIRE_SECCOMP_FILTER for the deliberate opt-out.
+    check_seccomp_filter(settings)
     if getattr(settings, "allow_loopback_only", False) and getattr(
         settings, "enable_net_isolation", False
     ):

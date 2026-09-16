@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
+from functools import lru_cache
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -130,6 +132,16 @@ class Settings:
     # refused by the fork's own validation (fail closed).
     net_bind_inject: bool = field(
         default_factory=lambda: _env_bool("E2B_NET_BIND_INJECT", True)
+    )
+    # A7 follow-up (2026-09-16): the worker must actually run under the shipped
+    # seccomp profile. `Seccomp: 0` in /proc/self/status means the container is
+    # unfiltered (the profile was dropped or overridden with `unconfined`), and
+    # the sandboxes then inherit the worker's whole syscall surface -- the exact
+    # regression A7 removed, and one that otherwise shows up nowhere. Test
+    # runners and the autoscaler's local backend run unfiltered on purpose and
+    # set this to 0.
+    require_seccomp_filter: bool = field(
+        default_factory=lambda: _env_bool("E2B_REQUIRE_SECCOMP_FILTER", True)
     )
     # E7.2: the pairing guard's escape hatch. `net_isolation` without
     # `fd_inject_connect` yields a loopback-only sandbox: every external
@@ -384,6 +396,190 @@ NET_ISOLATION_PAIRING_ERROR = (
     "set E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY=1 if a sandbox that cannot "
     "egress at all is what you want."
 )
+
+
+#: Raised when the worker is not running under the shipped seccomp profile.
+#: Named so a crash-looping pod says which knob to turn.
+SECCOMP_FILTER_MISSING_ERROR = (
+    "SECCOMP_FILTER_MISSING: this worker is not running under a seccomp filter "
+    "(/proc/self/status reports Seccomp: {mode}, {meaning}). The worker is the "
+    "process that runs untrusted workloads, so an unfiltered worker hands every "
+    "sandbox the worker's whole syscall surface -- and nothing logs it. The "
+    "deployment profile is deploy/seccomp/sandlock-worker.json (Docker's default "
+    "plus `pidfd_getfd` and `unshare`); install it per deploy/seccomp/README.md "
+    "(compose `seccomp=` line, or deploy/k8s/seccomp-installer.yaml on k8s) and "
+    "restart. To run unfiltered on purpose (test runner, autoscaler local "
+    "backend), set E2B_REQUIRE_SECCOMP_FILTER=0."
+)
+
+SECCOMP_PROFILE_NOT_APPLIED_ERROR = (
+    "SECCOMP_PROFILE_NOT_APPLIED: a seccomp filter is loaded, but it is not the "
+    "shipped one -- `unshare(CLONE_NEWUSER)` is still gated (the child died with "
+    "{detail}) while the worker carries no capability that would satisfy the "
+    "gate. That is what the container runtime's default profile looks like, and "
+    "it is how a k8s node with a missing Localhost profile can present itself: "
+    "the kubelet silently skips the missing file and the pod comes up anyway "
+    "(kubernetes#124944, 1.28/1.29), so every sandbox create would fail later "
+    "instead of here. Install the profile (deploy/k8s/seccomp-installer.yaml, or "
+    "the compose `seccomp=` line) and restart; set "
+    "E2B_REQUIRE_SECCOMP_FILTER=0 to accept an unprofiled worker on purpose."
+)
+
+#: `/proc/self/status` `Seccomp:` values (linux/seccomp.h).
+_SECCOMP_MODE_MEANING = {
+    0: "filtering disabled",
+    1: "strict mode, not a filter",
+    2: "filter mode",
+}
+
+
+def parse_seccomp_mode(status_text: str) -> int | None:
+    """The `Seccomp:` field of a /proc/<pid>/status dump, or None when absent."""
+    for line in status_text.splitlines():
+        if line.startswith("Seccomp:"):
+            value = line.split(":", 1)[1].strip()
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def read_seccomp_mode(path: str = "/proc/self/status") -> int | None:
+    """Read the worker's own seccomp mode; None when /proc is unavailable."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return parse_seccomp_mode(handle.read())
+    except OSError:
+        return None
+
+
+@lru_cache(maxsize=1)
+def _userns_probe() -> tuple[bool, str]:
+    """Can this process still create a user namespace without capabilities?
+
+    The shipped profile allows `unshare` unconditionally; the runtime default
+    gates it on CAP_SYS_ADMIN, which the non-root worker does not have. So the
+    probe separates "our profile" from "some other filter" -- the case the
+    `Seccomp:` field alone cannot see. A subprocess rather than a fork: envd is
+    multi-threaded and the child only has to run one syscall.
+    """
+    import subprocess
+    import sys
+
+    code = "import os; os.unshare(os.CLONE_NEWUSER)"
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if result.returncode == 0:
+        return True, ""
+    detail = (result.stderr or "").strip().splitlines()
+    return False, (detail[-1] if detail else f"exit {result.returncode}")
+
+
+def _userns_limited_by_host() -> str | None:
+    """Why an EPERM probe may be the host's doing, not the profile's.
+
+    Unprivileged user namespaces can be switched off globally, or restricted to
+    AppArmor-profiled binaries (Ubuntu 24.04's default). Naming that here keeps
+    the failure honest: the operator gets the real cause instead of "your
+    seccomp profile is wrong".
+    """
+    import os
+
+    for path, value, reason in (
+        (
+            "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+            "1",
+            "the host restricts unprivileged user namespaces to AppArmor-profiled "
+            "binaries (kernel.apparmor_restrict_unprivileged_userns=1)",
+        ),
+        (
+            "/proc/sys/user/max_user_namespaces",
+            "0",
+            "the host has unprivileged user namespaces disabled "
+            "(user.max_user_namespaces=0)",
+        ),
+    ):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                if handle.read().strip() == value:
+                    return reason
+        except OSError:
+            continue
+    return None
+
+
+def check_seccomp_filter(
+    settings: Settings,
+    *,
+    status_text: str | None = None,
+    probe_runner: Callable[[], tuple[bool, str]] | None = None,
+) -> int | None:
+    """Refuse to serve sandboxes from a worker that is not filtered as shipped.
+
+    Two layers, because they catch different mistakes (both silent otherwise):
+
+    * `Seccomp:` in /proc/self/status -- ``0`` means no filter at all. This is
+      what a dropped profile, a stray `seccomp=unconfined`, or a runtime that
+      ignores an unknown profile looks like. Fatal by default: it is the exact
+      regression A7 removed.
+    * an active `unshare(CLONE_NEWUSER)` probe -- a filter is present, but the
+      default one still gates that syscall, which is how a k8s node whose
+      Localhost profile file is missing presents itself (kubelet skips it
+      silently on 1.28/1.29, kubernetes#124944). Also fatal by default, unless
+      the host itself disables/restricts user namespaces, which is reported as
+      the cause instead.
+
+    ``E2B_REQUIRE_SECCOMP_FILTER=0`` turns both into warnings, for the shapes
+    that are unfiltered on purpose (test runners, the autoscaler's local
+    backend). Returns the observed mode (None off-Linux).
+    """
+    mode = (
+        parse_seccomp_mode(status_text)
+        if status_text is not None
+        else read_seccomp_mode()
+    )
+    if mode is None:
+        # No /proc (macOS dev hosts): nothing to assert.
+        logger.debug("seccomp self-check skipped: no /proc/self/status")
+        return None
+
+    required = bool(getattr(settings, "require_seccomp_filter", True))
+    if mode != 2:
+        message = SECCOMP_FILTER_MISSING_ERROR.format(
+            mode=mode, meaning=_SECCOMP_MODE_MEANING.get(mode, "unknown mode")
+        )
+        if required:
+            raise RuntimeError(message)
+        logger.warning("%s (E2B_REQUIRE_SECCOMP_FILTER=0: continuing)", message)
+        return mode
+
+    probe = probe_runner or _userns_probe
+    ok, detail = probe()
+    if ok:
+        logger.info("seccomp self-check: filter mode active, user namespaces allowed")
+        return mode
+
+    host_reason = _userns_limited_by_host()
+    if host_reason is not None:
+        logger.warning(
+            "seccomp self-check: unshare(CLONE_NEWUSER) failed (%s) but %s -- "
+            "sandbox creation will fail until that is lifted",
+            detail,
+            host_reason,
+        )
+        return mode
+
+    message = SECCOMP_PROFILE_NOT_APPLIED_ERROR.format(detail=detail)
+    if required:
+        raise RuntimeError(message)
+    logger.warning("%s (E2B_REQUIRE_SECCOMP_FILTER=0: continuing)", message)
+    return mode
 
 
 def check_net_isolation_pairing(settings: Settings) -> None:

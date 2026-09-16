@@ -21,6 +21,28 @@ nothing else is relaxed. Everything the sandbox itself needs (`seccomp` with
 `NEW_LISTENER`, `setgroups`, `pidfd_open`, `landlock_*`, `fork`/`clone`,
 `ioctl`, …) is already in the default allowlist.
 
+## The worker checks that it is actually running under this profile
+
+`envd_service/config.py::check_seccomp_filter` runs as the first step of
+`create_app` (next to the net-isolation pairing guard) and refuses to serve when
+the profile is not in effect — both failures below are otherwise silent:
+
+* `Seccomp: 0` in `/proc/self/status` (no filter at all: profile dropped,
+  `seccomp=unconfined`, or a runtime that ignored an unknown profile) →
+  `SECCOMP_FILTER_MISSING`.
+* a filter is loaded but `unshare(CLONE_NEWUSER)` is still gated (an active
+  probe in a child process) → `SECCOMP_PROFILE_NOT_APPLIED`. That is the runtime
+  default profile, and it is how a k8s node with a *missing* Localhost profile
+  presents itself: the kubelet silently skips the missing file and the pod comes
+  up anyway (kubernetes#124944, 1.28/1.29), so every sandbox create would fail
+  later instead of at startup. A host-level restriction
+  (`apparmor_restrict_unprivileged_userns=1`, `max_user_namespaces=0`) is
+  reported as the cause instead of blaming the profile.
+
+`E2B_REQUIRE_SECCOMP_FILTER=0` downgrades both to warnings for the shapes that
+are unfiltered on purpose (the test runner compose, the autoscaler's local
+backend).
+
 ## What it changes vs the Docker default
 
 | syscall | upstream default | here | why |
