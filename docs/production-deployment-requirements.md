@@ -556,6 +556,29 @@ bind+listen，则 `inbound_port_map` 关掉、拦截整体消失（改动最大�
 修完要重跑同一条 A/B（`tmp/netns-node-compare.py`）确认收敛，才谈 worker-1 全量与撤
 `ip_unprivileged_port_start`。
 
+**修复已实现（方案 ③ 的落地形态，fork `fe492be`）**：`net_bind_inject` —— 映射端口的
+`bind()` 不再让沙箱在自己 netns 里绑，而是由 supervisor 在 **worker netns 的
+127.0.0.1:<host_port>** 建好 socket，再用 `SECCOMP_ADDFD_FLAG_SETFD` **替换沙箱的 socket fd**
+（`fd_inject_connect` 已在用的机制）。此后沙箱的 `listen()`/`accept()` 全是内核在
+宿主 netns socket 上的普通调用：listen 处理器与就绪合成都走 `Continue`（该 listener 不在
+`NetworkState::inbound` 里），**supervisor 彻底离开数据面与就绪面**，主机监听器 / eager-accept
+队列 / `poll`·`epoll_wait` 拦截全部不再参与。
+
+边界与保证（同一次改动里写死）：
+
+- **只对已映射的 TCP 端口生效**：其它 family / 临时端口 / 未映射端口一律 `Continue`，原有
+  netlink cookie、`port_remap`、bind denylist 链路不变；
+- **只绑 loopback**（127.0.0.1/::1，绝不 0.0.0.0），所以沙箱内 `getsockname()` 报的是
+  loopback 地址而不是它请求的 `0.0.0.0`——与主机监听器方案对外暴露的地址一致；
+- **fail closed**：宿主 socket 建不出来或绑不上（端口被占、无 loopback）就让沙箱的 `bind()`
+  带着该 errno 失败，而不是退回"在自己 netns 里绑上了但外面够不着"；
+- 构建期校验：`net_bind_inject` 必须同时有 `net_isolation` 与 `net_port_map`（否则报错拒跑）。
+
+E2B 侧开关：`E2B_NET_BIND_INJECT`（默认 `true`，`envd_service/config.py`），经
+`factory.py` → `SandlockExecutor(bind_inject=...)` → 策略里出现 `net_bind_inject`（
+`route_b.py` 的 wire 字段白名单同步加了这个键）。回滚只需把该变量设为 `false` 并重建 worker
+镜像/重启，策略立刻回到主机监听器映射。
+
 **因此：worker-1 保持共享 netns，`ip_unprivileged_port_start=0` 不撤**，等 fork 侧把这条
 每请求代价定位并修掉后再走全量。复测脚本：`tmp/netns-node-compare.py`（按节点）、
 `tmp/mcp-3way.py`（三段拆分）。

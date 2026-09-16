@@ -424,6 +424,7 @@ class SandlockExecutor(Executor):
         enable_netns: bool = False,
         enable_net_isolation: bool = False,
         fd_inject_connect: bool = False,
+        bind_inject: bool = False,
         port_mappings: dict | None = None,
         network: dict | None = None,
         network_deny_cidrs: tuple[str, ...] = (),
@@ -450,6 +451,7 @@ class SandlockExecutor(Executor):
         self._enable_network = enable_network
         self._enable_net_isolation = enable_net_isolation
         self._fd_inject_connect = fd_inject_connect
+        self._bind_inject = bool(bind_inject)
         self._port_mappings = {
             int(host): int(sandbox) for host, sandbox in (port_mappings or {}).items()
         }
@@ -1515,6 +1517,14 @@ class SandlockExecutor(Executor):
             kwargs["net_isolation"] = True
             if self._port_mappings:
                 kwargs["port_mappings"] = dict(self._port_mappings)
+                if self._bind_inject:
+                    # S2.5 bind injection: the mapped port becomes a socket the
+                    # sandbox itself listens on (created in the worker netns and
+                    # injected at bind() time), so the supervisor leaves the
+                    # accept/readiness path -- no host listener, no eager-accept
+                    # worker, no poll/epoll_wait interception. Measured cost of
+                    # the mapping path it replaces: ~390 ms per MCP request.
+                    kwargs["net_bind_inject"] = True
             if self._fd_inject_connect:
                 kwargs["fd_inject_connect"] = True
             elif not getattr(type(self), "_netns_no_inject_warned", False):
@@ -1712,6 +1722,14 @@ class SandlockExecutor(Executor):
             kwargs["net_isolation"] = True
             if self._port_mappings:
                 kwargs["port_mappings"] = dict(self._port_mappings)
+                if self._bind_inject:
+                    # S2.5 bind injection: the mapped port becomes a socket the
+                    # sandbox itself listens on (created in the worker netns and
+                    # injected at bind() time), so the supervisor leaves the
+                    # accept/readiness path -- no host listener, no eager-accept
+                    # worker, no poll/epoll_wait interception. Measured cost of
+                    # the mapping path it replaces: ~390 ms per MCP request.
+                    kwargs["net_bind_inject"] = True
             if self._fd_inject_connect:
                 kwargs["fd_inject_connect"] = True
             elif not getattr(type(self), "_netns_no_inject_warned", False):

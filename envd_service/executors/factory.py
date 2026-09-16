@@ -179,6 +179,7 @@ def create_executor(
                 enable_net_isolation=settings.enable_net_isolation,
                 fd_inject_connect=settings.fd_inject_connect,
                 port_mappings=settings.port_mappings,
+                bind_inject=settings.net_bind_inject,
                 network=network,
                 network_deny_cidrs=settings.network_deny_cidrs,
                 notify_rate_limit=settings.sandbox_notify_rate_limit,

@@ -812,6 +812,7 @@ SUPERVISE_POLICY_FIELDS: frozenset[str] = frozenset(
         "max_processes",
         "net_allow",
         "net_allow_bind",
+        "net_bind_inject",
         "net_deny",
         "net_deny_bind",
         "net_isolation",

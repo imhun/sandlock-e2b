@@ -256,11 +256,16 @@ def test_net_isolation_fd_inject_and_port_mappings_passthrough(tmp_path: Path) -
         enable_network=False,
         enable_net_isolation=True,
         fd_inject_connect=True,
+        bind_inject=True,
         port_mappings={"50006": "8080"},
     )
     sb = _policy(executor)
     assert sb.net_isolation is True
     assert sb.fd_inject_connect is True
+    # S2.5 bind injection rides with the mappings: the mapped port becomes a
+    # socket the sandbox itself listens on, so the supervisor leaves the
+    # accept/readiness path.
+    assert sb.net_bind_inject is True
     assert sb.port_mappings == {50006: 8080}
 
 
@@ -282,6 +287,7 @@ def test_fd_inject_without_net_isolation_passthrough(tmp_path: Path) -> None:
         allow_internet_access=False,
         enable_network=False,
         fd_inject_connect=True,
+        bind_inject=False,
     )
     sb = _policy(executor)
     assert getattr(sb, "net_isolation", False) is False
@@ -331,6 +337,7 @@ def test_mcp_gateway_netns_identity_mapping(tmp_path: Path) -> None:
         enable_network=False,
         enable_net_isolation=True,
         fd_inject_connect=True,
+        bind_inject=False,
     )
     executor.set_mcp_bind_port(51234)
     sb = _policy(executor)

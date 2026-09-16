@@ -421,6 +421,7 @@ async def test_shape_knobs_reach_the_slot_document(monkeypatch) -> None:
         route_b=_config(mode="auto"),
         enable_net_isolation=True,
         fd_inject_connect=True,
+        bind_inject=True,
         port_mappings={50006: 8080},
         extra_fs_writable=["/var/lib/e2b-volumes/vol_1"],
     )
@@ -430,6 +431,9 @@ async def test_shape_knobs_reach_the_slot_document(monkeypatch) -> None:
     assert policy["net_allow_bind"] == [50006]
     assert policy["net_isolation"] is True
     assert policy["fd_inject_connect"] is True
+    # The wire field the supervisor's policy parser expects (its manifest keeps
+    # the name; see crates/sandlock-supervise/src/policy.rs).
+    assert policy["net_bind_inject"] is True
     assert policy["port_mappings"] == {50006: 8080}
     assert policy["fs_writable"] == [WORKSPACE, "/var/lib/e2b-volumes/vol_1"]
 

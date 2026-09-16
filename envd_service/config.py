@@ -119,6 +119,18 @@ class Settings:
     fd_inject_connect: bool = field(
         default_factory=lambda: _env_bool("E2B_FD_INJECT_CONNECT", False)
     )
+    # S2.5 bind injection (fork `net_bind_inject`): the mapped inbound port is
+    # answered by replacing the sandbox's socket with a supervisor-created
+    # host-loopback one at `bind()` time, so the sandbox `listen()`s/`accept()`s
+    # on a real host-netns socket and the supervisor never traps
+    # `poll`/`ppoll`/`epoll_wait` for readiness synthesis. Measured on the
+    # deployment (2026-09-16): an MCP request cost ~390 ms per request with the
+    # host-listener mapping and ~8 ms with injection. Requires
+    # `port_mappings` + `net_isolation`; setting it without the mapping is
+    # refused by the fork's own validation (fail closed).
+    net_bind_inject: bool = field(
+        default_factory=lambda: _env_bool("E2B_NET_BIND_INJECT", True)
+    )
     # E7.2: the pairing guard's escape hatch. `net_isolation` without
     # `fd_inject_connect` yields a loopback-only sandbox: every external
     # connect fails at the kernel (no route), which in production looks like

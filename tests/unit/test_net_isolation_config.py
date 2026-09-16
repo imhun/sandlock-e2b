@@ -100,6 +100,7 @@ def test_create_executor_passes_net_isolation_flags(monkeypatch) -> None:
         enable_netns=False,
         enable_net_isolation=True,
         fd_inject_connect=True,
+        net_bind_inject=True,
         port_mappings={"50006": "8080"},
         network_deny_cidrs=(),
         sandbox_notify_rate_limit=0,
@@ -120,4 +121,62 @@ def test_create_executor_passes_net_isolation_flags(monkeypatch) -> None:
     )
     assert executor._enable_net_isolation is True
     assert executor._fd_inject_connect is True
+    # S2.5 bind injection: the mapped port is served by a socket the sandbox
+    # itself listens on, so the supervisor never traps the event loop's
+    # readiness syscalls (see docs/production-deployment-requirements.md).
+    assert executor._bind_inject is True
     assert executor._port_mappings == {50006: 8080}
+
+
+def test_policy_ceiling_requests_bind_injection(monkeypatch) -> None:
+    """S2.5 bind injection is requested exactly when mappings + switch agree.
+
+    The flag is what moves the MCP port out of the host-listener mapping path
+    (and therefore out of the event loop's readiness interception): the
+    supervisor replaces the sandbox's socket with a host-loopback one at
+    ``bind()`` time instead. Setting it without ``port_mappings`` is refused by
+    the fork's own validation, so the two must travel together.
+    """
+    import envd_service.executors.factory as factory_mod
+
+    monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: None)
+    monkeypatch.setattr(factory_mod, "_sandlock_available", lambda: True)
+    monkeypatch.setattr(factory_mod, "_landlock_ok", lambda: True)
+
+    def build(*, bind_inject: bool, port_mappings):
+        settings = SimpleNamespace(
+            executor="sandlock",
+            enable_network=True,
+            enable_netns=False,
+            enable_net_isolation=True,
+            fd_inject_connect=True,
+            net_bind_inject=bind_inject,
+            port_mappings=port_mappings,
+            network_deny_cidrs=(),
+            sandbox_notify_rate_limit=0,
+            iam_signing_key="k",
+            image_cache_dir=Path("tmp/cache"),
+        )
+        executor = create_executor(
+            settings,
+            workspace_dir="/tmp/ws",
+            base_image=None,
+            memory_mb=512,
+            cpu_percent=100,
+            disk_mb=1024,
+            max_processes=64,
+            max_open_files=4096,
+            allow_internet_access=False,
+            network=None,
+        )
+        executor.set_mcp_bind_port(61001)
+        return executor._build_instance_policy()
+
+    injected = build(bind_inject=True, port_mappings={"61001": "61001"})
+    assert getattr(injected, "net_bind_inject", False) is True
+    assert injected.port_mappings == {61001: 61001}
+    assert injected.net_isolation is True
+
+    off = build(bind_inject=False, port_mappings={"61001": "61001"})
+    assert getattr(off, "net_bind_inject", False) is False
+    assert off.port_mappings == {61001: 61001}
