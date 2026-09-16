@@ -442,6 +442,14 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 推论：`net_isolation` 的端到端**本机就能验**；`pid_ns` 缺的是 envd 开关与中间进程的自映射兼容
 （代码问题），与环境无关。`test-prod-shaped.sh` 全量的 1439 passed 也正是在本机取到的。
 
+**netns 形态本机也验过了（2026-09-16）**：`E2B_TEST_NET_ISOLATION=1
+E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true` 跑全量 =
+`1439 passed / 3 skipped / 0 failed`（`tmp/prod-shaped-netns-on.log`），与共享 netns 那次
+逐项相同；netns 契约三条（MCP 全链路经代理、CPython `connect()` 走 fd 注入、通配域名）本地
+`3 passed`。⇒ **"能不能跑"这一层已经没有悬念**；开与不开的取舍落在语义与容量上
+（`getsockname` 返回宿主侧地址、入站必须显式映射、映射端口带 61000–65535 的容量、
+DNS/通配/HTTP MITM 的回归面、以及连接建立速率的未测项）。
+
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
 - **`deploy/scripts/test-prod-shaped.sh`（生产形，默认推荐）**：容器不带 `--privileged`，
