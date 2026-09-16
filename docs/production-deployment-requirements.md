@@ -1580,6 +1580,22 @@ rm -rf /var/lib/e2b-sandboxes/<id>
 - 孤儿清理：worker 启动时对账 `sandbox.json` 与 quota 表，删除无主 project；
 - 监控：`xfs_quota -x -c "report -p" /` 定期巡检，超限沙箱告警。
 
+**上线实测（2026-09-16，目标机 `prjquota` 开启后；`tmp/quota-t1-probe4.log`）**：
+worker 走的是 **agent 形态**（`E2B_QUOTA_AGENT_URL` 是开关，`.env` 里那条
+`E2B_QUOTA_VIA_AGENT=false` 是惰性的：URL 优先，见 `config.py::_quota_via_agent_from_env`）。
+实测：
+
+- `GET /detect` → `{"fs_type":"xfs","prjquota":true,"xfs_quota":true,"backend":"quotactl"}`；
+- 建箱后 `GET /report` 立刻多一行，`hard_blocks=1048576`（= 默认 1 GiB 盘上限）；写入 24 MiB 后
+  `used_blocks=24584`（≈24 MiB，1 KiB 块）→ **记账真实**；
+- 把该项目的限额改成 16 MiB 后再写 48 MiB → `dd: failed to open 'over.bin': No space left on
+  device` → **强制真实**（ENOSPC）；
+- **删除沙箱不会立刻让这一行消失**：`project -C` 只清目录态、限额留着，行（0 用量 + 非零
+  `hard_blocks`）要等 reconcile 复位限额才被 XFS 丢掉。一次创建/删除潮后 40 行，
+  `POST /reconcile` → `cleaned` 36 个 → 剩 4 行（那 4 行是 worker 按设计留的 unmaterialised
+  树的载体）。**长期 uptime + 高 churn 需要周期性 reconcile**（当前只有 worker 启动时跑一次）
+  —— 已登记 backlog **N12**。
+
 ### 3.2 兼容性注意
 
 - **EDQUOT 而非 ENOSPC**：超限写返回 `EDQUOT`，需确认沙箱内工具能正确处理

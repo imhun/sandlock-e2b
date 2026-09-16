@@ -75,7 +75,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | E8.5 | 把"能跑却在跳"的用例真正跑起来：镜像自带 XFS prjquota/npm/netns/双形态 + `E2B_TEST_STRICT_SKIPS` 能力型 skip 直接判失败 | ✅ 完成（全开跑见下；顺带修掉 fs_denied 废掉 per-uid 隔离、lsattr 缺失导致孤儿只报不清） | 本次提交 |
 | T4 | net_isolation + 镜像 rootfs(chroot) 形态下 MCP 入站端口映射起不来（纯 sandlock 形态 3/3 通过） | ✅ 已关闭（Task 10，FUP-E1）：根因 = envd 侧 base-image 组成（slim rootfs 无 mcp-gateway，ENOENT exit 2），非 fork；改用 MCP-capable 基镜像 `python-mcp:3.14`（deploy/docker/Dockerfile.mcp-base）后 chroot+netns MCP 契约两形态 3/3 绿；xfail 已摘 | `883d38d` `f67a6b9` |
 | T5 | chroot 形态共享卷写入经 supervisor 归属（fs_denied 代打开路径），per-uid 卷保护无法还原 | ✅ 关闭（2026-09-10）：三步全落。① fork F16/F17（worker 侧 C ABI + Python `SuperviseChannel`，含 fd 交接）；② E2B envd 全面接线 route B（W1 槽位模型，chroot 形态默认档）；③ strict xfail 已摘 + **`mediation_run_as='supervisor'` 降级档已删**（那条组合现在由 fork 拒绝建箱，E2B 不再请求）。证据：契约 `test_uid_permissions`（两 uid 槽位 20000/20001 各自属主/自 chmod/跨 uid EPERM）、`test_route_b_slot_pool` 的 token 非暴露面证明、`test_template_isolation` 两条真槽位 chroot + 一条钉住拒绝。fork §3.1 的「fail-closed 现状」段仍待重写（#25 ②），与本项无关 | — |
-| T1 | 真实 XFS/ext4 目标机上复测沙箱文件属主：① 沙箱能否 `chmod` 自己写的文件（本机 EPERM）；② 共享卷 1777+sticky 的跨 uid 保护是否真生效（本机 A 写的文件宿主属主是 uid 0，而沙箱 host_uid 是 20000） | ⬜ 待环境（两条用例已改为带证据跳过，不再靠巧合通过） | — |
+| T1 | 真实 XFS/ext4 目标机上复测沙箱文件属主：① 沙箱能否 `chmod` 自己写的文件（本机 EPERM）；② 共享卷 1777+sticky 的跨 uid 保护是否真生效（本机 A 写的文件宿主属主是 uid 0，而沙箱 host_uid 是 20000） | ✅ **完成（2026-09-16，随 O1，目标机实测 `tmp/quota-t1-probe4.log`）**：① 箱内 `touch+chmod 600` 成功、宿主属主 = 池内槽位 uid（`600 11002`）——本机那条 EPERM 是 overlayfs 产物；② 卷目录宿主模式 **`1777`**（owner=池内 uid, group=worker gid），A（worker-2, 11002）写 0600 后，B（worker-1, 另一槽位 uid）读 `EACCES`、`rm` **`EPERM`**（sticky）、`chmod` **`EPERM`**，A 的文件事后仍是 `600 11002` | — |
 | T6 | 内存/CPU/进程配额按实例而非按沙箱 ⇒ 超卖（默认 K=2 实测 1.76x），放大为节点超卖 | ✅ 已定方案：改为**每沙箱一个 sandlock 实例**（fork 文档 §8，取代 P10 共享资源组） | — |
 | T2 | `third_party/sandlock`：`_HANDLED_FIELDS` 登记 `notify_rate_limit`，消掉假告警 | ✅ 完成（fork P3：`17ee48d` fix + `fad056a` doc，子模块 b955ae9 内） | `17ee48d` |
 | T3 | 复现并修 `SnapshotRegistry.expand_to` 快照自嵌套（`snap_X/fs/snap_X/fs/...`） | ✅ 已落地（G2，2026-09-06）：`create_from_sandbox`/`expand_to` 复制前拒绝"目标落在源之内"（`ValueError`），并用 ignore 回调剪掉工作区里嵌入的快照存储根（只剪最外层，普通同名目录保留）；用例 `tests/unit/test_snapshot_registry.py` 3 条 + snapshot 契约回归全绿；设计见 `docs/superpowers/plans/2026-09-04-sandlock-remaining-goals.md` Task 0.2 | 见 git log（fix(snapshots) commit） |
@@ -86,7 +86,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 
 | # | 任务 | 状态 |
 |---|---|---|
-| O1 | 目标机启用 XFS `prjquota`（fstab + 在线 remount，维护窗口） | 未开始（E2 生产验证前置；本地已用 losetup/XFS 实测） |
+| O1 | 目标机启用 XFS `prjquota`（fstab + 在线 remount，维护窗口） | ✅ **完成（2026-09-16，用户侧开启并已复验）**：根盘 `/dev/nvme0n1p2` 以 `prjquota` 挂载、`/etc/fstab` 同项；部署侧配额链路随即转活 —— agent `/detect` = `{"fs_type":"xfs","prjquota":true,"backend":"quotactl"}`，`/report` 每个沙箱项目都有 `hard_blocks=1048576`（= 默认 1 GiB 盘上限），实测记账与强制见 N12 同段证据（`tmp/quota-t1-probe4.log`） |
 | O2 | TLS 证书/代理层配置（代码侧 E1.4 已完成） | 未开始（需部署窗口） |
 | O3 | 凭据管理（ACR/API key/redis/SSH 上密钥管理） | 未开始（E5.4 已提供 master key 轮换能力） |
 
@@ -107,6 +107,7 @@ ACR 镜像推送照常，git 远程推送暂缓。
 | N8 | 运维 | **netns 观察清单剩余项**（§2.4.7）：按节点分组的超时率与 MCP 端口带水位 | ✅ **完成并已上线（2026-09-16，同 N6 版本）**：端口带水位变成可读的**一条全局值** —— `McpPortPool.stats()`（`capacity/in_use/highest/free`）→ worker 心跳带 `mcpPortsInUse`/`mcpPortsCapacity` → 节点视图 `GET /nodes` 可见（读法与判据写进 §2.9）。单测覆盖池子算术、心跳 payload（含 provider 崩掉不牵连）、节点记录与端点往返。**目标机实测**：`before {worker-1:(0,4535), worker-2:(0,4535)}` → 建 3 个 MCP 沙箱 `{worker-1:(1,4535), worker-2:(2,4535)}` → kill 后 `{0,0}`（`tmp/n8-verify.log`）。超时率那一半本就是客户端侧观测，形态统一后不再需要分节点对比 |
 | N9 | 仓库卫生 | 未跟踪产物：`.graphifyignore`、`graphify-out/`、`target` | 待决：入库（`.graphifyignore` 值得）还是加进 `.gitignore` |
 | N11 | 仓库/上游 | **fork 分支推送 + SL-1 上游 issue**：分支领先 `origin` 166 个提交（含本轮 `5b16855`/`752b5db`）；SL-1 的 issue 一直没开（`gh` 不可用 + token 只读） | 待你决定：① `git -C third_party/sandlock push origin <branch>`（需网络+权限）；② 是否要开上游 issue（要一个可写的 token/凭据） |
+| N12 | E2B/运维 | **沙箱删除后 project 行不立即消失**：`project -C` 只清目录态、限额留着，行（0 用量 + 非零 `hard_blocks`）要等 reconcile 把限额复位才被 XFS 丢掉 | 观察项（2026-09-16 实测）：一次创建/删除潮后 **40 行**，`POST /reconcile` → `cleaned` 36 个 → **剩 4 行**（那 4 行是 worker 按设计留的 unmaterialised 树的载体）。所以**不是 bug，但长期 uptime + 高 churn 需要周期性 reconcile**（现在只有 worker 启动时做一次）。待决：① 删除路径顺带把限额复位到 0（agent 侧一行 + 契约）；② 或加周期性 reconcile。证据 `tmp/quota-t1-probe4.log` / `tmp/quota-reconcile-probe.sh` |
 
 **本轮已完成（2026-09-16，供追溯）**：seccomp 收敛到"默认档 + 2 条补白"并上线；并发容量
 512MB/8 并发（`366e5dc`）；契约按 `E2B_DEFAULT_MEMORY_MB` 取值 + lane 透传（`d6b7270`）；
