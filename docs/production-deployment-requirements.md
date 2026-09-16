@@ -577,6 +577,45 @@ E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
 2026-09-16 两种形态各跑一次：`502`/`1024` 下改动涉及的 22 条全绿，512 形态整轮 100%
 无 F/E。
 
+### 2.4.9 为什么 MCP 箱里"只剩 110 MiB"：记账按预留，不按实际触碰
+
+上面的 110 MiB 不是"箱子被谁占了 400 MiB"，而是**两个 Python 进程的地址空间预留**在这套
+记账下被全额计入。机制先说清：
+
+- sandlock 是**无 cgroup** 运行时（`crates/sandlock-oci/README.md`：no namespaces / no
+  cgroups），内存上限由 supervisor 在 seccomp 通知里执行
+  （`crates/sandlock-core/src/resource.rs::handle_memory`，拦 `mmap/brk/mremap/munmap`）；
+- 账本记的是**匿名映射的请求大小**，不是驻留也不是触碰量 —— 预留 64 MiB、只用 1 MiB
+  也按 64 MiB 计；
+- 箱内 `/proc/meminfo` 就是这本账：`MemFree = max_memory − mem_used`
+  （`crates/sandlock-core/src/procfs.rs::generate_meminfo`），所以可以直接在箱内读数。
+
+2026-09-16 在线上 512MB 箱里逐项量的**单位成本**（每次都是独立前台进程，读同一个账本；
+`tmp/ledger-thread-cost.py`、`tmp/ledger-arena-test.py`）：
+
+| 项 | 记账 | 说明 |
+|---|---|---|
+| 空箱基线 | ~28 MiB | 无 MCP、无命令时的箱底 |
+| 触碰 50 MiB | **+50 MiB** | 真实数据 1:1 |
+| 多 1 个线程 | **+72 MiB** | glibc per-thread malloc arena（64 MiB 预留）+ 8 MiB 栈 |
+| 3 个线程 | +216 MiB | 线性叠加（3×72） |
+| `import mcp` | **+73 MiB** | mcp 依赖树的映射 |
+| `import uvicorn` | +25 MiB | |
+| 3 线程 + `MALLOC_ARENA_MAX=1` | **+24 MiB** | arena 预留消失，只剩栈 |
+
+⇒ MCP 箱的账：网关进程（python + mcp + uvicorn + 自己的线程/arena）+ stdio server
+（python + `import mcp` + 它的线程/arena）在 server **还没分配任何业务内存**之前就吃掉
+约 320 MiB（实测：MCP 箱 347.7 MiB vs 同形空箱 27.7 MiB），剩下约 110 MiB 才是 server 自己
+的 payload。同一只箱里一条**普通命令**仍能分配 160 MiB（账本 507.6 MiB）——箱没满，
+是 server 自己先付了 import/线程的钱。
+
+**可用的杠杆（已实测，尚未落地）**：给 stdio server 加 `MALLOC_ARENA_MAX=1`（经由
+`mcp={"envs": ...}`），server 的上限从 110 MiB 抬到 **300 MiB 可用 / 340 MiB 被杀**
+（`tmp/mcp-arena-max.py`）——省下的正是每个非主线程 64 MiB 的 arena 预留。要同时省网关那侧，
+得在 envd `start_mcp_gateway` 的 env 里带上同一个变量（server 从网关继承），那属于改代码 +
+重建发布。代价是对**多线程用户负载**可能变慢（所有线程抢同一 arena），所以只该加在
+网关/server 这条链上，不要无脑塞进用户命令的默认环境。
+
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
