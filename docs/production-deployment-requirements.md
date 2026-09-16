@@ -483,8 +483,10 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 `PROD_DROP_CAPS=SYS_ADMIN` 两种形态都一样）⇒ **本机就能建 userns 并完成 F18 自映射**。
 卡住早期探针的是**容器的 seccomp 档**（Docker 默认档把 `unshare` 挂在 `CAP_SYS_ADMIN`
 门控组上），不是内核；机制细节见 §2.4 的"二次更正"。
-推论：`net_isolation` 的端到端**本机就能验**；`pid_ns` 缺的是 envd 开关与中间进程的自映射兼容
-（代码问题），与环境无关。`test-prod-shaped.sh` 全量的 1439 passed 也正是在本机取到的。
+推论：`net_isolation` 的端到端**本机就能验**；`pid_ns` 当初缺的是 envd 开关与中间进程的自映射
+兼容（代码问题），与环境无关 —— **2026-09-16 两者都已解决**（开关 `E2B_PID_NS`、中间进程
+自映射 fork `5b16855`，验收与代价见 §2.4.10）。`test-prod-shaped.sh` 全量的 1439 passed 也正是
+在本机取到的。
 
 **netns 形态本机也验过了（2026-09-16）**：`E2B_TEST_NET_ISOLATION=1
 E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true` 跑全量 =
@@ -794,12 +796,13 @@ E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
 这条链上，不进用户命令的默认环境，因为多线程分配密集的负载会吃到 arena 竞争。
 
 
-### 2.4.10 pid_ns 现状与阻断项（2026-09-16 评估）
+### 2.4.10 pid_ns：开关、形态与代价（2026-09-16）
 
 **E2B 侧已接上开关但默认关闭**：`E2B_PID_NS`（`envd_service/config.py`，默认 `false`）→
 `factory.py` → `SandlockExecutor(pid_ns=...)` → 策略里的 `pid_ns`（`route_b.py` 的 wire 字段表
 本来就有）。lane 也透传该变量（`E2B_PID_NS=1 ./deploy/scripts/test-prod-shaped.sh ...`），
-所以两种形态都能跑门禁。
+所以两种形态都能跑门禁。**阻断项（route-B 自映射）与代价（stat 族拦截）本轮都已闭环**，
+剩下的是灰度/默认值这个部署决策（N3）：形态正确性见 2.4.10.1，代价见 2.4.10.2。
 
 **fork 侧机制本身是健康的**（在部署 profile 下实测，`seccomp=$PWD/deploy/seccomp/sandlock-worker.json`）：
 
@@ -842,6 +845,11 @@ mediation_2uid 9），wheel 按同 tip 重建（manifest `5b16855`）。
 最后一行是**形态证据**：`id -u` = 0 在 pid_ns 关着时同样成立，所以只凭它无法排除"开关没生效"
 的假绿；`kill()` 探针（探针文件 `tmp/pidns-shape-probe.py`，日志 `tmp/pidns-shape-{on,off}.log`）
 把两种形态区分开，确认这一轮的绿是真开了 pid_ns 的绿。
+
+**邻接契约与两相位**：`E2B_PID_NS=1` 下按 `-k 'route_b or pid_ns'` 跑完 lane 的两个相位
+（`tmp/pidns-e2b-both-phases.log`）——相位 1（root worker + 槽位池）**86 passed / 0 failed**、
+相位 2（uid 65534 worker + file-cap brokers）**34 passed / 0 failed**，说明开启 pid_ns 不会碰坏
+route B 的邻接面（槽位池、跨 uid 拒绝、池化 uid 建箱、非 root worker 的 in-process 中介）。
 
 #### 2.4.10.2 代价：部署形态下测不到增量，裸形态 +85 µs/次（2026-09-16）
 
