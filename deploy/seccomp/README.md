@@ -5,6 +5,17 @@ under. It replaces `seccomp=unconfined`, which every production manifest used
 until this change: unconfined drops the entire default filter from the
 container, and the worker is the process that runs untrusted workloads.
 
+## How it reaches the runtime
+
+- **compose**: `seccomp=../seccomp/sandlock-worker.json` in the service spec (or
+  `E2B_SECCOMP_PROFILE=<absolute path>` when only the compose file is shipped).
+- **k8s**: `seccompProfile: {type: Localhost, localhostProfile:
+  sandlock-worker.json}`. The kubelet resolves that name on the *node*, so the
+  file has to be installed there: `deploy/k8s/seccomp-installer.yaml` (ConfigMap
+  + DaemonSet) writes this exact file into `/var/lib/kubelet/seccomp/` on every
+  node. Apply the installer and wait for it to be ready *before* rolling the
+  worker Deployment.
+
 The profile is **the Docker default profile plus exactly two syscalls** —
 nothing else is relaxed. Everything the sandbox itself needs (`seccomp` with
 `NEW_LISTENER`, `setgroups`, `pidfd_open`, `landlock_*`, `fork`/`clone`,

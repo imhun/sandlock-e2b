@@ -192,14 +192,17 @@ spec:
                 - SETGID
                 - CHOWN
                 - DAC_OVERRIDE
-            # Install-time state on the node: copy
-            # deploy/seccomp/sandlock-worker.json to
-            # /var/lib/kubelet/seccomp/sandlock-worker.json (the kubelet's
-            # seccomp root) before rolling this Deployment. The profile is the
-            # runtime default plus the two syscalls the sandbox-create path
-            # needs (`pidfd_getfd`, `unshare`) -- see deploy/seccomp/README.md.
-            # `Localhost` (not `Unconfined`) also keeps this pod on the allowed
-            # side of the Pod Security "baseline" seccomp rule.
+            # Node-local state: the kubelet resolves a Localhost profile on the
+            # host filesystem, so deploy/k8s/seccomp-installer.yaml (ConfigMap +
+            # DaemonSet) installs deploy/seccomp/sandlock-worker.json into the
+            # kubelet's seccomp root on every node. Apply it *first* and wait for
+            # the DaemonSet to be ready; a node without the file cannot start
+            # this pod at all. Copying the file by hand still works for a
+            # one-off node, but the DaemonSet is the reproducible path.
+            # The profile is the runtime default plus the two syscalls the
+            # sandbox-create path needs (`pidfd_getfd`, `unshare`) -- see
+            # deploy/seccomp/README.md. `Localhost` (not `Unconfined`) also keeps
+            # this pod on the allowed side of the Pod Security "baseline" rule.
             seccompProfile:
               type: Localhost
               localhostProfile: sandlock-worker.json

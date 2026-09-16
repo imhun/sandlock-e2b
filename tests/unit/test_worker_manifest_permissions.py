@@ -159,3 +159,96 @@ def test_k8s_low_port_window_is_pod_level_not_container_level() -> None:
     pod_part, containers_part = pod_spec.split("\n      containers:\n", 1)
     assert POD_SYSCTL in pod_part
     assert "sysctls:" not in containers_part
+
+
+# ----------------------------------------------------------------------------
+# seccomp profile installation (deploy/k8s/seccomp-installer.yaml)
+# ----------------------------------------------------------------------------
+
+SECCOMP_INSTALLER = (REPO / "deploy" / "k8s" / "seccomp-installer.yaml").read_text(
+    encoding="utf-8"
+)
+WORKER_SECCOMP_TEXT = (REPO / "deploy" / "seccomp" / "sandlock-worker.json").read_text(
+    encoding="utf-8"
+)
+
+
+def _installer_configmap_payload() -> str:
+    """The profile exactly as the ConfigMap carries it (block scalar dedented)."""
+    marker = "  sandlock-worker.json: |-\n"
+    assert marker in SECCOMP_INSTALLER, "ConfigMap must carry the profile as a block scalar"
+    body = SECCOMP_INSTALLER.split(marker, 1)[1].split("\n---\napiVersion: apps/v1", 1)[0]
+    lines = []
+    for line in body.split("\n"):
+        if line.startswith("    "):
+            lines.append(line[4:])
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def test_seccomp_installer_ships_the_exact_shipped_profile() -> None:
+    """The ConfigMap payload is the file the deployment verifies against.
+
+    Byte-exact, not "parses to the same JSON": the node's file is what the
+    runtime applies, and a silent reformat would make the two drift apart from
+    the artifact the tests and the docs describe.
+    """
+    payload = _installer_configmap_payload()
+    assert payload == WORKER_SECCOMP_TEXT
+    assert json.loads(payload) == json.loads(WORKER_SECCOMP_TEXT)
+
+
+def test_seccomp_installer_rolls_when_the_profile_changes() -> None:
+    """`checksum/profile` is the sha256 of the payload.
+
+    The annotation sits on the pod template, so a profile edit that updates it
+    rolls the DaemonSet immediately; the test fails until the two agree, which
+    makes "I edited the profile but forgot the annotation" a build error rather
+    than a node that keeps the old filter.
+    """
+    import hashlib
+
+    digest = hashlib.sha256(WORKER_SECCOMP_TEXT.encode()).hexdigest()
+    assert f'        checksum/profile: "{digest}"\n' in SECCOMP_INSTALLER
+
+
+def test_seccomp_installer_writes_the_kubelet_seccomp_root() -> None:
+    """It targets the kubelet's own seccomp root, atomically."""
+    assert "            path: /var/lib/kubelet/seccomp\n" in SECCOMP_INSTALLER
+    assert "            type: DirectoryOrCreate\n" in SECCOMP_INSTALLER
+    # Atomic replace: write a temp file in the same directory, then rename.
+    assert 'tmp="$root/.sandlock-worker.json.$$"' in SECCOMP_INSTALLER
+    assert 'mv "$tmp" "$dst"' in SECCOMP_INSTALLER
+    # The ConfigMap is mounted read-only and never written back to.
+    assert "              mountPath: /config\n              readOnly: true\n" in SECCOMP_INSTALLER
+    # kubelet reads the file per container creation, so no restart is involved;
+    # the 5-minute re-check is the backstop for a missed rollout.
+    assert "sleep 300" in SECCOMP_INSTALLER
+
+
+def test_seccomp_installer_asks_for_the_minimum() -> None:
+    """root to write the node path, and nothing else."""
+    assert "privileged: true" not in SECCOMP_INSTALLER
+    assert "hostNetwork: true" not in SECCOMP_INSTALLER
+    assert "hostPID: true" not in SECCOMP_INSTALLER
+    assert (
+        "            runAsUser: 0\n"
+        "            runAsGroup: 0\n"
+        "            allowPrivilegeEscalation: false\n"
+        "            readOnlyRootFilesystem: true\n"
+        "            capabilities:\n"
+        "              drop:\n"
+        "                - ALL\n"
+        in SECCOMP_INSTALLER
+    )
+    # Every node, tainted control-plane nodes included -- a node without the
+    # profile cannot run the worker pod at all.
+    assert "      tolerations:\n        - operator: Exists\n" in SECCOMP_INSTALLER
+
+
+def test_worker_manifest_points_at_the_installer() -> None:
+    """The Deployment keeps Localhost and names the component that installs it."""
+    assert "            seccompProfile:\n              type: Localhost\n" in K8S_WORKER
+    assert "              localhostProfile: sandlock-worker.json\n" in K8S_WORKER
+    assert "seccomp-installer.yaml" in K8S_WORKER

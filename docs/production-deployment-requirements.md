@@ -425,9 +425,26 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
   ⇒ 必须把 profile 一起放上去并用 `E2B_SECCOMP_PROFILE=<绝对路径>` 指过去；用
   `docker compose config` 检查渲染值，别等到 `up` 才失败。
 - **k8s**（`deploy/k8s/worker.yaml`）：`seccompProfile: {type: Localhost,
-  localhostProfile: sandlock-worker.json}`。Localhost profile 是**节点本地状态** ——
-  **上线前必须把 `deploy/seccomp/sandlock-worker.json` 装到每个节点的
-  `/var/lib/kubelet/seccomp/`**（kubelet 的 seccomp 根目录），否则 pod 起不来。
+  localhostProfile: sandlock-worker.json}`。Localhost profile 是**节点本地状态**：kubelet
+  在节点的文件系统上按 seccomp 根目录（默认 `/var/lib/kubelet/seccomp`）解析它 —— 所以
+  **ConfigMap 挂在 worker pod 里是没用的**，内容必须落到节点上。
+  `deploy/k8s/seccomp-installer.yaml`（ConfigMap + DaemonSet，2026-09-16 起）就是这个落地
+  组件：ConfigMap 逐字携带 `deploy/seccomp/sandlock-worker.json`，DaemonSet 每节点把它原子
+  写入 `/var/lib/kubelet/seccomp/sandlock-worker.json`（`DirectoryOrCreate`，覆盖含 tainted
+  control-plane 在内的所有节点）。
+  - **顺序**：先 `kubectl apply -f deploy/k8s/seccomp-installer.yaml`，等 DaemonSet 在每个
+    节点 Ready，再滚 worker Deployment —— 缺文件的节点会直接起不来（fail closed，符合预期）。
+  - **改 profile**：改 `deploy/seccomp/sandlock-worker.json` → 跑
+    `tests/unit/test_worker_manifest_permissions.py`（它逐字比对嵌入副本、并用 sha256 钉住
+    `checksum/profile` 注解）→ `kubectl apply`。注解在 pod template 上，内容一变就触发
+    DaemonSet 滚动；容器另有 5 分钟兜底重查，漏滚也会收敛（kubelet 每次建容器读文件，不需要
+    重启 kubelet）。
+  - **权限**：DaemonSet 只需要 `runAsUser: 0` 写那一个目录，`capabilities.drop: [ALL]`、
+    `allowPrivilegeEscalation: false`、`readOnlyRootFilesystem: true`，无 `privileged`/
+    `hostNetwork`/`hostPID`；SELinux enforcing 的节点若报 `Permission denied`，按清单注释加
+    `seLinuxOptions: {type: spc_t}`。
+  - 若集群改过 kubelet 的 `--seccomp-default-root`，hostPath 要指向同一个目录；手工拷文件仍
+    可作单节点应急，但可复现路径是 DaemonSet。
   顺带：`Localhost` 是 Pod Security `baseline` 的允许值，而 `Unconfined` 不是。
 - **生产形 lane**：`deploy/scripts/test-prod-shaped.sh` 与
   `deploy/scripts/smoke-prod-worker.sh` 改用同一文件（`SECCOMP_PROFILE=` 可覆盖）
