@@ -67,7 +67,16 @@ ENV E2B_REGISTRY_MIRRORS="registry-1.docker.io=docker.m.daocloud.io|docker.1ms.r
 # chown is a no-op, so the per-sandbox uid tests would assert against a
 # filesystem that cannot express ownership at all.
 ENV E2B_TEST_TMP_ROOT=/var/lib/e2b-test-runtime
-RUN mkdir -p /var/lib/e2b-test-runtime
+# The scratch root is created as root (0755) but the *unprivileged* lane
+# (`test-prod-shaped.sh` phase 2) runs the whole suite as uid 65534 and cannot
+# create anything under it, so every fixture that needs a workspace errored out
+# at setup: `PermissionError: /var/lib/e2b-test-runtime/<id>` (measured
+# 2026-09-17: 503 setup errors, 24 failures, and the same on the unmodified
+# image, i.e. phase 2 was unrunnable, not merely red). Hand the directory to
+# the same uid the phase-2 container runs as -- the worker image does the same
+# for /var/lib/e2b-sandboxes.
+RUN mkdir -p /var/lib/e2b-test-runtime \
+    && chown 65534:65534 /var/lib/e2b-test-runtime
 
 WORKDIR /workspace
 
