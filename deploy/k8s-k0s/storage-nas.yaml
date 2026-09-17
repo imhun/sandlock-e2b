@@ -1,0 +1,39 @@
+# 共享存储：阿里云 NAS 的静态 NFS PV。
+#
+# 为什么是静态 PV 而不是阿里云 CSI 插件：
+#   * 内置的 `nfs` 卷插件就是执行 mount -t nfs，不需要 OpenAPI 凭据、不需要
+#     csi-plugin/csi-provisioner。这台 ECS 没有挂 RAM 角色，走 CSI 得手工配 AK。
+#   * CSI 的增量是「动态供给 + 自动建 NAS 子目录」，本形态只要一个长期不变的
+#     共享卷，用不上。
+#
+# ⚠ 必须用 NFSv4.0，不要用 `.140` 上那份 v3+nolock 的参数。2026-09-17 实测：
+#   * NFSv3 + 服务端锁：flock/fcntl 全部 ESTALE（NAS 的 NLM 在这个客户端上不可用）
+#   * NFSv3 + nolock：锁正常，但**只在单机内有效**
+#   * NFSv4.0：锁正常，且跨节点互斥成立（.94 持锁时 .140 抢锁被挡）
+#   E2B 的 uid 池分配器用 `flock(<base>/.uid_pool.lock)` 在多个 worker 副本之间
+#   排他，v3+nolock 会让这个前提静默失效 —— 多副本（N13）必须走 NFSv4。
+#   另外 NAS 只支持 v4.0：vers=4.1/4.2 客户端直接 EPROTONOSUPPORT。
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: sandlock-shared-nas
+spec:
+  capacity:
+    storage: 50Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  # 显式空串：不要被任何默认 StorageClass 接管，只做静态绑定（PVC 同样不带 class）。
+  storageClassName: ""
+  mountOptions:
+    - vers=4.0
+    - proto=tcp
+    - hard
+    - timeo=600
+    - retrans=2
+    - noresvport
+    - rsize=1048576
+    - wsize=1048576
+  nfs:
+    server: 347d748090-ihu74.cn-shanghai.nas.aliyuncs.com
+    path: /sandlock

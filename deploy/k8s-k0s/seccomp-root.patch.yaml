@@ -1,0 +1,20 @@
+# 把 seccomp 安装器的三处路径一起挪到 k0s 的 kubelet 根。
+#
+# 三处必须同时改（安装器脚本写哪、pod 挂哪、宿主机哪个目录被挂进来）；只改一处
+# 会让 worker pod 起不来，而且失败信息只在 pod 事件里（2026-09-17 实测：错路径下
+# 报 `cannot load seccomp profile "/var/lib/k0s/kubelet/seccomp/..."`）。
+#
+# 下标含义钉在 tests/unit/test_worker_manifest_permissions.py 的渲染用例里：
+#   containers[0]   = installer（唯一容器）
+#   env[0]          = E2B_SECCOMP_ROOT（基线里该容器只有这一个 env）
+#   volumeMounts[1] = kubelet-seccomp-root（[0] 是只读的 /config）
+#   volumes[1]      = kubelet-seccomp-root（[0] 是 ConfigMap）
+- op: replace
+  path: /spec/template/spec/containers/0/env/0/value
+  value: /var/lib/k0s/kubelet/seccomp
+- op: replace
+  path: /spec/template/spec/containers/0/volumeMounts/1/mountPath
+  value: /var/lib/k0s/kubelet/seccomp
+- op: replace
+  path: /spec/template/spec/volumes/1/hostPath/path
+  value: /var/lib/k0s/kubelet/seccomp

@@ -1,0 +1,42 @@
+# 按集群节点的真实规格声明 worker 容量，并把 pod 的 requests/limits 与它对齐。
+#
+# 基线 worker 用的是「保守默认」：E2B_NODE_* = 2048MB / 200% / 4096MB盘 / 256进程，
+# 而 compose 生产用的正是同一组默认值 —— 但生产 `.env` 把它覆盖成
+# 4096 / 400 / 8192 / 1024（deploy/stack/.env.example）。这里对齐生产口径，因为
+# 这台节点就是 4 核 / 7GB。
+#
+# 为什么必须同时改 pod 的 requests/limits：基线把 limits 写成 `cpu: 2 / memory: 2Gi`
+# 且没有 requests，Kubernetes 于是把 requests 也当成 2 CPU / 2Gi。后果有两个，都在
+# 2026-09-17 实测到：
+#   ① 声明 200% CPU 的节点放不下第 3 个沙箱（每箱默认 100%），冒烟报
+#      `503: No resources available`；
+#   ② requests=2 CPU 让滚动更新无处安放第二个 pod，rollout 停在
+#      `0/2 nodes are available: 1 Insufficient cpu`（基线因此另加了 maxSurge: 0）。
+# 显式给小 requests、大 limits 才是这里的正确形状：调度器只预留一点，容量声明
+# 交给 E2B 自己的记账（E2B_NODE_*）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: e2b-worker
+  namespace: sandlock
+spec:
+  template:
+    spec:
+      containers:
+        - name: worker
+          env:
+            - name: E2B_NODE_MEMORY_MB
+              value: "4096"
+            - name: E2B_NODE_CPU_PERCENT
+              value: "400"
+            - name: E2B_NODE_DISK_MB
+              value: "8192"
+            - name: E2B_NODE_PROCESSES
+              value: "1024"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "4"
+              memory: 4Gi

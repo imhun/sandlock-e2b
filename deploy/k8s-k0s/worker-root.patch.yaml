@@ -1,0 +1,32 @@
+# 让 worker 以 root 运行（只在这套「共享卷 = 网络文件系统」的集群里需要）。
+#
+# 为什么非 root 不行：route B/c1 要在建箱时把沙箱树的属主改成池里的 uid
+# （`0770 owner=<沙箱 uid> group=<worker gid>`），这一步由镜像里的 file-capability
+# broker（`e2b-maint`，带 cap_chown）执行。CAP_CHOWN 是**本地**特权，而 NFS 走
+# AUTH_SYS：服务端只看见凭据里的 uid，不看客户端的能力，而「把文件让给别的 uid」
+# 只有 root 能做。2026-09-17 在这台阿里云 NAS 上实测：
+#   * worker（uid 65534，broker 带 cap_chown）chown 到 10000:65534 -> EPERM
+#     （连自己拥有的文件也让不出去；broker 报的 "failed: Success" 是它的
+#      strerror(errno) 诊断 bug，errno 已被后续调用清零）
+#   * 同一挂载上以 root 执行同样的 chown -> 成功
+# 后果：worker 以 65534 跑时每一个 `Sandbox.create()` 都会失败，
+# `failed to provision` 且原因字段为空。
+#
+# ⚠ 这不是 k0s 特有的：基线的「非 root worker + RWX PVC」组合在任何网络文件系统
+# （NFS/CephFS/…）上都不成立，只在本地盘（compose 的命名卷）上成立。这里先作为
+# overlay 差异落地，通用的处置见 docs/k8s-deployment.md 与 task-backlog。
+#
+# 安全代价与前提：worker 变成可信中介（沙箱仍然跑在自己的池 uid 下，隔离模型不变），
+# 且导出必须允许 root 访问（本 NAS 已允许）。
+# euid 0 + 保留 worker 的组：两个约束同时存在，缺一不可。
+#   * euid 0 —— NFS 只认凭据里的 uid，chown 到池 uid 必须由 root 发起（上面实测）。
+#   * fsgid 65534 —— c1 模型的沙箱树是 `0770 owner=<沙箱 uid> group=<worker gid>`，
+#     worker 靠**属组**进出这些树。若让 pod 以 gid 0 跑，它就既不在属组里、又没有
+#     DAC 覆盖（这台 NAS 实测同样不给 uid 0 越权读别人的 0600 文件：一个由 65534
+#     建的 `.uid_pool.lock` 0600，root 打开报 EACCES），于是连自己管的沙箱树都写不进去。
+- op: add
+  path: /spec/template/spec/containers/0/securityContext/runAsUser
+  value: 0
+- op: add
+  path: /spec/template/spec/containers/0/securityContext/runAsGroup
+  value: 65534

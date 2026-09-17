@@ -936,7 +936,14 @@ spec:
             - |-
               set -eu
               src=/config/sandlock-worker.json
-              root=/var/lib/kubelet/seccomp
+              # The kubelet's seccomp root is *derived from its --root-dir*, not a
+              # fixed path: kubeadm points --root-dir at /var/lib/kubelet, k0s at
+              # /var/lib/k0s/kubelet (measured 2026-09-17: a pod with
+              # localhostProfile: x.json failed with
+              # `cannot load seccomp profile "/var/lib/k0s/kubelet/seccomp/x.json"`).
+              # E2B_SECCOMP_ROOT is set to the kubelet's own directory; the
+              # hostPath below must point at the same directory.
+              root="${E2B_SECCOMP_ROOT:-/var/lib/kubelet/seccomp}"
               dst="$root/sandlock-worker.json"
               echo "installer up: $src -> $dst"
               while true; do
@@ -951,6 +958,13 @@ spec:
                 fi
                 sleep 300
               done
+          env:
+            # Must equal the hostPath below. The default matches a kubelet whose
+            # --root-dir is /var/lib/kubelet (kubeadm, most managed clusters);
+            # k0s uses /var/lib/k0s/kubelet -- deploy/k8s/selfhosted/ patches
+            # both this value and the hostPath together.
+            - name: E2B_SECCOMP_ROOT
+              value: /var/lib/kubelet/seccomp
           securityContext:
             # root only to write inside the node's kubelet root; nothing else
             # is granted (no privileged, no caps, read-only rootfs).
@@ -980,7 +994,9 @@ spec:
             name: sandlock-worker-seccomp
         - name: kubelet-seccomp-root
           hostPath:
-            # The kubelet's seccomp root. If the cluster sets
-            # --seccomp-default-root, point this at the same directory.
+            # The kubelet's seccomp root (= <kubelet --root-dir>/seccomp, which the
+            # kubelet resolves Localhost profiles against). Keep in step with
+            # E2B_SECCOMP_ROOT above and the mountPath; the selfhosted overlay
+            # rewrites all three for k0s.
             path: /var/lib/kubelet/seccomp
             type: DirectoryOrCreate

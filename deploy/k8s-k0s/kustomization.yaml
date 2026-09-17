@@ -1,0 +1,42 @@
+# k0s（自建集群）上的差异层。
+#
+# 与 deploy/k8s/ 的基线相比只有两类差异，都是「发行版/环境事实」而不是策略差异：
+#   1. seccomp 安装器写哪个目录 —— kubelet 把 Localhost profile 解析到
+#      <它的 --root-dir>/seccomp；kubeadm/托管集群是 /var/lib/kubelet，k0s 是
+#      /var/lib/k0s/kubelet。基线用的是前者。
+#   2. 共享存储 —— 基线只声明一个 RWX PVC，不自带 PV（生产是 NFS/CephFS 由运营提供）；
+#      这里用阿里云 NAS 的静态 NFS PV 落实它。
+#
+# 用法（先 kubectl -n sandlock create secret，见 README）：
+#   kubectl kustomize deploy/k8s/selfhosted | kubectl apply -f -
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: sandlock
+
+resources:
+  - ../k8s        # 基线清单目录（deploy/k8s/，没有 kustomization.yaml ⇒ 裸清单集）
+  - storage-nas.yaml
+
+patches:
+  - target:
+      group: apps
+      version: v1
+      kind: DaemonSet
+      name: seccomp-installer
+      namespace: sandlock
+    path: seccomp-root.patch.yaml
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: e2b-worker
+      namespace: sandlock
+    path: worker-root.patch.yaml
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: e2b-worker
+      namespace: sandlock
+    path: worker-capacity.patch.yaml

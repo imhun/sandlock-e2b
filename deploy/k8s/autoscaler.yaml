@@ -54,7 +54,10 @@ spec:
             - name: E2B_AS_CONTROL_PLANE_URL
               value: http://control-plane:3000
             - name: E2B_AS_INTERNAL_API_KEY
-              value: "internal-key"
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_INTERNAL_API_KEY
             - name: E2B_AS_BACKEND
               value: k8s
             - name: E2B_AS_K8S_NAMESPACE

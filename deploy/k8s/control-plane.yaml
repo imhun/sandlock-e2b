@@ -60,17 +60,32 @@ spec:
             - containerPort: 3000
           env:
             - name: E2B_API_KEYS
-              value: "local-key"
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_API_KEYS
             - name: E2B_INTERNAL_API_KEY
-              value: "internal-key"
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_INTERNAL_API_KEY
             - name: E2B_ENABLE_LOCAL_NODE
               value: "false"
+            # SECURITY: credentials come from the `e2b-secrets` Secret that the
+            # deploy creates *before* applying this manifest set (the placeholders
+            # that used to sit here are gone: a missing Secret now leaves the pod
+            # in CreateContainerConfigError instead of silently arming the stack
+            # with `local-key`). $(E2B_REDIS_PASSWORD) is expanded by the kubelet
+            # from the variable above; redis.yaml puts the same value behind
+            # --requirepass. Without auth a full-egress sandbox can read/write the
+            # shared ledger.
+            - name: E2B_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_REDIS_PASSWORD
             - name: E2B_REDIS_URL
-              value: redis://redis:6379/0
-              # SECURITY: once redis auth is enabled (see redis.yaml), this
-              # must become redis://:<password>@redis:6379/0 via secretKeyRef.
-              # Also mirror E2B_NETWORK_DENY_CIDRS + E2B_CREATE_RATE_LIMIT_PER_MIN
-              # from the compose stack.
+              value: redis://:$(E2B_REDIS_PASSWORD)@redis:6379/0
             - name: E2B_CONTROL_PLANE_URL
               value: http://control-plane:3000
             - name: E2B_GATEWAY_URL
@@ -104,7 +119,13 @@ spec:
             - name: E2B_IMAGE_CACHE_OWNER_UID
               value: "65534"
             - name: E2B_BASE_IMAGE
-              value: python:3.14-slim
+              # Same registry + digest pinning as the compose stack (E6.2: a
+              # base image must be digest-pinned), and the same reason the redis
+              # image is an ACR mirror -- Docker Hub is unreachable from the
+              # deployment hosts. Digest verified against ACR 2026-09-17.
+              value: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
+            - name: E2B_TEMPLATE_IMAGES
+              value: '{"py311": "registry.cn-shanghai.aliyuncs.com/byteplan/python:3.11-slim"}'
             - name: E2B_MAX_SANDBOXES
               value: "1000"
           volumeMounts:

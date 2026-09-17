@@ -5,6 +5,19 @@ metadata:
   namespace: sandlock
 spec:
   replicas: 1
+  # Never brief the unverified two-replica shape into existence (docs/task-backlog.md
+  # N13). A default rolling update surges a second pod before deleting the old one,
+  # so for the length of every upgrade two workers reconcile and GC one shared
+  # workspace base -- exactly what `replicas: 1` + the autoscaler's MAX=1 are there
+  # to prevent. On a 4-core node the surge also cannot even schedule: the worker
+  # requests 2 CPU, so the rollout stalled with
+  # `0/2 nodes are available: 1 Insufficient cpu` (measured 2026-09-17 on k0s).
+  # maxSurge 0 deletes first, creates second: one worker at a time, always.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: e2b-worker
@@ -74,6 +87,50 @@ spec:
           volumeMounts:
             - name: shared
               mountPath: /var/lib/e2b-sandboxes
+        # The worker (uid 65534) creates each sandbox's top-level tree *directly*
+        # under the volume root, so that root must be writable by it -- the compose
+        # convention is mode 1777 (deploy/scripts/README.md, "一次性迁移": 卷根保持
+        # 1777). A freshly provisioned RWX volume is usually neither: on Aliyun NAS
+        # the export arrived as root:root 0755 (2026-09-17) and the very first
+        # Sandbox.create() died with
+        # `[Errno 13] Permission denied: '/var/lib/e2b-sandboxes/sbx_<id>'`.
+        # Repair once, then *verify* -- on a root_squashed NFS the chmod is refused,
+        # and the pod stops here with the exact fix instead of failing every create.
+        # Only the root's own mode is touched: the sandbox trees below it belong to
+        # their sandbox uids (client-side `chgrp`/`chmod -R` must never walk them).
+        - name: workspace-root-init
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
+          securityContext:
+            runAsUser: 0
+          command:
+            - /bin/sh
+            - -c
+            - |-
+              set -e
+              base="$WORKSPACE_BASE"
+              owner="$(stat -c %u "$base")"
+              mode="$(stat -c %a "$base")"
+              echo "workspace-root-init: $base owner=$owner mode=$mode"
+              if [ "$owner" != "65534" ]; then
+                chmod 1777 "$base" 2>/dev/null ||
+                  echo "workspace-root-init: chmod refused (NFS root_squash?)"
+                owner="$(stat -c %u "$base")"
+                mode="$(stat -c %a "$base")"
+              fi
+              world_writable=0
+              case "$mode" in *2|*3|*6|*7) world_writable=1 ;; esac
+              if [ "$owner" != "65534" ] && [ "$world_writable" != "1" ]; then
+                echo "workspace-root-init: FATAL: $base is mode $mode, owned by uid $owner -- the worker (uid 65534) cannot create sandbox trees there, so every Sandbox.create() would fail with EACCES" >&2
+                echo "workspace-root-init: fix it once (on the node, or on the storage server): chmod 1777 $base  (or chown 65534:65534 $base)" >&2
+                exit 1
+              fi
+              echo "workspace-root-init: $base is writable by uid 65534 (owner=$owner mode=$mode)"
+          env:
+            - name: WORKSPACE_BASE
+              value: /var/lib/e2b-sandboxes
+          volumeMounts:
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
       containers:
         - name: worker
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
@@ -88,12 +145,31 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            # The address the control-plane dials back on. This must NOT be
+            # `http://$(POD_NAME).worker-headless.<ns>.svc.cluster.local:49983`
+            # (what docs/SCALING.md §8.1 proposed, carried over from the compose
+            # shape where `http://worker-1:49983` works because Docker's embedded
+            # DNS resolves container names): a per-pod name under a headless
+            # Service only exists when the endpoint carries a hostname, and that
+            # comes from `pod.spec.hostname` -- which a Deployment never sets.
+            # Measured 2026-09-17 on k0s 1.36: the EndpointSlice endpoint had no
+            # hostname, the FQDN did not resolve, and every `Sandbox.create()`
+            # failed with `502: Node ... unavailable: [Errno -2] Name or service
+            # not known`. The pod IP is the address that always exists; the pod
+            # re-registers on restart, which updates it.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: E2B_NODE_ADDRESS
-              value: http://$(POD_NAME).worker-headless.sandlock.svc.cluster.local:49983
+              value: http://$(POD_IP):49983
             - name: E2B_CONTROL_PLANE_URL
               value: http://control-plane:3000
             - name: E2B_INTERNAL_API_KEY
-              value: "internal-key"
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_INTERNAL_API_KEY
             - name: E2B_WORKSPACE_BASE
               value: /var/lib/e2b-sandboxes
             # Track Z / Z-F7: the extracted image rootfs cache goes on the same
@@ -164,7 +240,11 @@ spec:
             # the autoscaler is capped at 1 until N13 is closed on a real
             # cluster. See docs/task-backlog.md N13.
             - name: E2B_BASE_IMAGE
-              value: python:3.14-slim
+              # Keep in step with control-plane.yaml (same digest-pinned ACR
+              # mirror; Docker Hub is unreachable from the deployment hosts).
+              value: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
+            - name: E2B_TEMPLATE_IMAGES
+              value: '{"py311": "registry.cn-shanghai.aliyuncs.com/byteplan/python:3.11-slim"}'
             - name: E2B_NODE_MEMORY_MB
               value: "2048"
             - name: E2B_NODE_CPU_PERCENT

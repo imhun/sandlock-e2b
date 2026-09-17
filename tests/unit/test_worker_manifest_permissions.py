@@ -24,7 +24,11 @@ Text assertions rather than a YAML parse: the repo does not depend on PyYAML.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parent.parent.parent
 STACK_COMPOSE = (REPO / "deploy" / "stack" / "docker-compose.prod.yml").read_text(
@@ -233,6 +237,20 @@ def test_k8s_stays_single_replica_until_n13_is_closed() -> None:
     assert "\n  replicas: 1\n" in K8S_WORKER
 
 
+def test_k8s_worker_never_surges_a_second_replica() -> None:
+    """`replicas: 1` alone is not enough: a rolling update would surge a second pod.
+
+    Two workers over one shared workspace base is the unverified N13 shape, and
+    the repo locks it off by pinning the worker to one replica and the autoscaler
+    to MAX=1 -- but the default rolling-update strategy creates a replacement pod
+    *before* deleting the old one, so every upgrade would briefly run the exact
+    shape those two pins exist to prevent. It also cannot schedule on a 4-core
+    node (the worker requests 2 CPU): measured 2026-09-17 on k0s, the rollout
+    stalled with `0/2 nodes are available: 1 Insufficient cpu`.
+    """
+    assert "  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 0\n" in K8S_WORKER
+
+
 # ----------------------------------------------------------------------------
 # seccomp profile installation (deploy/k8s/seccomp-installer.yaml)
 # ----------------------------------------------------------------------------
@@ -289,6 +307,11 @@ def test_seccomp_installer_writes_the_kubelet_seccomp_root() -> None:
     """It targets the kubelet's own seccomp root, atomically."""
     assert "            path: /var/lib/kubelet/seccomp\n" in SECCOMP_INSTALLER
     assert "            type: DirectoryOrCreate\n" in SECCOMP_INSTALLER
+    # The kubelet resolves a Localhost profile against <its --root-dir>/seccomp,
+    # so the write target is a variable: the default is the kubeadm/managed-cluster
+    # layout, and deploy/k8s/selfhosted/ patches it (k0s: /var/lib/k0s/kubelet).
+    assert '              root="${E2B_SECCOMP_ROOT:-/var/lib/kubelet/seccomp}"\n' in SECCOMP_INSTALLER
+    assert "            - name: E2B_SECCOMP_ROOT\n              value: /var/lib/kubelet/seccomp\n" in SECCOMP_INSTALLER
     # Atomic replace: write a temp file in the same directory, then rename.
     assert 'tmp="$root/.sandlock-worker.json.$$"' in SECCOMP_INSTALLER
     assert 'mv "$tmp" "$dst"' in SECCOMP_INSTALLER
@@ -297,6 +320,76 @@ def test_seccomp_installer_writes_the_kubelet_seccomp_root() -> None:
     # kubelet reads the file per container creation, so no restart is involved;
     # the 5-minute re-check is the backstop for a missed rollout.
     assert "sleep 300" in SECCOMP_INSTALLER
+
+
+def _installer_seccomp_root(text: str) -> str:
+    """The directory the installer targets, read out of its E2B_SECCOMP_ROOT."""
+    # Indentation differs between the baseline file and a rendered overlay, so
+    # match on the item and then read the first following "value:" line.
+    marker = "- name: E2B_SECCOMP_ROOT\n"
+    assert marker in text, "installer must declare E2B_SECCOMP_ROOT"
+    for line in text.split(marker, 1)[1].split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        assert stripped.startswith("value: "), stripped
+        root = stripped[len("value: ") :]
+        assert root.startswith("/"), root
+        return root
+    raise AssertionError("no value line follows E2B_SECCOMP_ROOT")
+
+
+def test_seccomp_installer_root_is_the_same_in_all_three_places() -> None:
+    """E2B_SECCOMP_ROOT, the mountPath and the hostPath must name one directory.
+
+    They are three independent literals in the manifest, and the installer is
+    useless (silently, on every node) if they drift: the script would write to a
+    directory the pod never mounted, or mount a directory the kubelet never reads.
+    Measured on k0s 2026-09-17: with the paths pointed at the wrong root the
+    worker pod simply never starts, because its Localhost profile cannot load.
+    """
+    root = _installer_seccomp_root(SECCOMP_INSTALLER)
+    # The kubeadm/managed-cluster layout is the baseline default.
+    assert root == "/var/lib/kubelet/seccomp"
+    assert f"mountPath: {root}" in SECCOMP_INSTALLER
+    assert f"path: {root}" in SECCOMP_INSTALLER
+
+
+KUBECTL = shutil.which("kubectl")
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_k0s_overlay_moves_the_seccomp_root_to_the_k0s_kubelet_dir() -> None:
+    """The k0s overlay must retarget all three places, not just the script.
+
+    The overlay exists because the kubelet's seccomp root is derived from its
+    ``--root-dir``: kubeadm uses ``/var/lib/kubelet``, k0s uses
+    ``/var/lib/k0s/kubelet``. Rendering it here (rather than asserting on the
+    patch file by hand) is what keeps the index-based JSON patch honest -- if the
+    baseline's container/volume order changes, this fails instead of silently
+    mounting the wrong directory on a live cluster.
+    """
+    rendered = subprocess.run(
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s-k0s")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    out = rendered.stdout
+    assert _installer_seccomp_root(out) == "/var/lib/k0s/kubelet/seccomp"
+    assert "mountPath: /var/lib/k0s/kubelet/seccomp" in out
+    assert "path: /var/lib/k0s/kubelet/seccomp" in out
+    # No leftovers pointed at the kubeadm root: a second mount of the same volume
+    # at the old path is exactly the half-switch this test exists to catch.
+    assert "mountPath: /var/lib/kubelet/seccomp" not in out
+    assert "path: /var/lib/kubelet/seccomp" not in out
+    # The shared-storage PV rides along with the overlay.
+    assert "name: sandlock-shared-nas" in out
+    # The overlay also makes the worker root: a network filesystem authorizes a
+    # chown by the AUTH_SYS uid, not by the client's capabilities, so the non-root
+    # file-capability broker cannot hand a sandbox tree to its pooled uid there.
+    assert "runAsUser: 0" in out
 
 
 def test_seccomp_installer_asks_for_the_minimum() -> None:

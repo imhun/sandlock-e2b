@@ -15,13 +15,26 @@ spec:
     spec:
       containers:
         - name: redis
-          image: redis:7-alpine
-          command: ["redis-server", "--appendonly", "yes"]
-          # SECURITY: production must enable authentication. Mirror the
-          # compose stack: add "--requirepass", "$(REDIS_PASSWORD)" and feed
-          # REDIS_PASSWORD from a Secret, then point control-plane's
-          # E2B_REDIS_URL at redis://:<password>@redis:6379/0. Without this,
-          # a full-egress sandbox can read/write the shared ledger.
+          # Was `redis:7-alpine` (Docker Hub). Two reasons this is now the ACR
+          # mirror: ① every deployment host measured on 2026-09-17 has
+          # registry-1.docker.io/auth.docker.io closed while ACR is open (this is
+          # the same convention README already records for the base images);
+          # ② the compose stack already runs redis 8, so the k8s shape was a
+          # version behind it. Mirrored multi-arch (linux/arm64 + linux/amd64)
+          # from docker.io/library/redis:8-alpine, redis 8.10.1.
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/redis:8-alpine
+          # SECURITY: authentication mirrors the compose stack. The password comes
+          # from the same `e2b-secrets` Secret the control-plane reads, and
+          # $(REDIS_PASSWORD) is expanded by the kubelet, so the password never
+          # appears in this manifest. Without auth, a full-egress sandbox can read
+          # and write the shared ledger.
+          command: ["redis-server", "--appendonly", "yes", "--requirepass", "$(REDIS_PASSWORD)"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_REDIS_PASSWORD
           ports:
             - containerPort: 6379
 ---
