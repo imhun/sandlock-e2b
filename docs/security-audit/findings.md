@@ -255,6 +255,26 @@ chroot/route-B 形态多出 fd 3/4/6/7，实测都是**普通 ELF 文件**（不
   `move_mount`/`fsopen`/`fsmount`/`mount_setattr`/`fspick`/`fanotify_mark`
   （CAP 拦截，实测 EPERM）；`uselib`/`mq_open`/`mq_unlink`（ENOSYS / mqueue 未挂载）。
 
+  > **2026-09-17 更正（重要，影响两处归因）**
+  >
+  > ① **"审计内核上 ENOSYS"是错的说法。** 内核**实现了**这些 syscall（452、463–466、
+  > 457–458、468–469）；返回 ENOSYS 的是**部署用的 worker seccomp profile** —— 它的默认
+  > 动作拒掉 allow 列表之外的一切。同一台机同一个调用实测：
+  > `deploy/seccomp/sandlock-worker.json` 下 **ENOSYS(38)**，`seccomp=unconfined` 下
+  > **EINVAL(22)**（真的到达内核）。**seccomp 过滤器是叠加的，沙箱继承外层**，所以这 9 条
+  > 在**部署形态下根本不可达**，只有在"worker 跑更宽 profile"的宿主上才可达。结论方向不变
+  > （要**中介**而非拒绝 —— glibc 已在用 `fchmodat2`，拒绝会表现为"工作负载坏了"而不是
+  > "攻击被挡"），但**暴露面比我先前写的窄**。
+  >
+  > ② **`open_tree` 那条是在比生产更宽的测量环境里测到的。** 探针 runner 复刻的是 lane 的
+  > **能力超集**（带 `SYS_ADMIN`），而生产 A6 之后没有 SYS_ADMIN —— profile 里 `open_tree`
+  > 恰属"仅当容器带 CAP_SYS_ADMIN 才 allow"那一组。实测到的是**更宽**的形态，所以结论偏保守
+  > （测到的是最坏情况），但"部署形态下可达"对 `open_tree` 并不成立。
+  >
+  > 已按"新 mount API 与 `mount` 同类、Landlock 覆盖不到"把 `open_tree`/`open_tree_attr`
+  > 加进沙箱默认拒绝集（fork `2666ce5`）作为外层 profile 缺失时的兜底；其余 9 条保留 `Open`
+  > 并改写理由为上述真实机制。
+
 ### 路径面账本（fork 侧已落地，把"清单完整"变成不变量）
 
 - **OBS-7 pure（无 chroot）形态的缺口是"一类"而不是一条（中，已定性，未修）**
