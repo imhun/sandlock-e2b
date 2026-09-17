@@ -319,6 +319,27 @@ def test_seccomp_installer_asks_for_the_minimum() -> None:
     assert "      tolerations:\n        - operator: Exists\n" in SECCOMP_INSTALLER
 
 
+def test_seccomp_installer_stays_off_virtual_nodes() -> None:
+    """The installer tolerates every taint (it must reach control-plane nodes),
+    which is exactly what made it schedule onto ACK's virtual-kubelet nodes and
+    sit in `NotSupport` forever -- 5/7 ready, measured 2026-09-17 -- so a
+    DaemonSet rollout never converged and §2's "wait for every node" hung.
+    """
+    assert "operator: Exists" in SECCOMP_INSTALLER  # still reaches every real node
+    assert "nodeAffinity:" in SECCOMP_INSTALLER
+    assert "key: type" in SECCOMP_INSTALLER
+    assert "operator: NotIn" in SECCOMP_INSTALLER
+    assert "virtual-kubelet" in SECCOMP_INSTALLER
+    # The workload manifests already stay off them: they declare no tolerations,
+    # so the virtual nodes' taints keep them out. Pin that, because adding a
+    # blanket toleration there would put a sandbox worker on a node that cannot
+    # run one.
+    assert "tolerations:" not in K8S_WORKER
+    assert "tolerations:" not in (REPO / "deploy" / "k8s" / "control-plane.yaml").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_worker_manifest_points_at_the_installer() -> None:
     """The Deployment keeps Localhost and names the component that installs it."""
     assert "            seccompProfile:\n              type: Localhost\n" in K8S_WORKER

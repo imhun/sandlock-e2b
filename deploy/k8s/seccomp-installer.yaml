@@ -901,6 +901,23 @@ spec:
       # profile cannot run the worker pod at all.
       tolerations:
         - operator: Exists
+      # ...but not onto *virtual* nodes (ACK's ECI / any virtual-kubelet).
+      # The blanket toleration above is what puts it there, and the pod then
+      # never runs: measured on the main cluster (2026-09-17) the DaemonSet was
+      # 5/7 with two pods stuck in `NotSupport` on the virtual-kubelet nodes, so
+      # a DaemonSet rollout *never converges* -- which makes §2's "wait for the
+      # DaemonSet to be Ready on every node" hang forever for an operator.
+      # `NotIn` also matches nodes that carry no `type` label at all, so this is
+      # a no-op on clusters without virtual nodes.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: type
+                    operator: NotIn
+                    values:
+                      - virtual-kubelet
       # No priorityClassName: `system-node-critical` only exists on clusters
       # that created it (kubeadm does, vanilla does not), and a missing class
       # rejects the pod outright. Clusters that have it can add it here.
