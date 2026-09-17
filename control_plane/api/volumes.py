@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from control_plane.api.errors import OfficialError
 from control_plane.auth import _require_owned, require_api_key, tenant_of, tenant_scope
+from control_plane.ratelimit import enforce_resource_limit
 from control_plane.registry.volumes import UnknownVolumeError
 from gateway_common.paths import PathTraversalError, resolve_under_root
 from gateway_common.upload import (
@@ -80,6 +81,14 @@ def _iso(mtime: float) -> str:
 
 @router.post("/volumes", status_code=201, dependencies=[Depends(require_api_key)])
 async def create_volume(request: Request) -> dict[str, Any]:
+    # Volume create allocates a quota slice and a directory tree under the
+    # workspace base: admitted like the other resource-creating endpoints.
+    enforce_resource_limit(
+        request,
+        limiter=request.app.state.volume_limiter,
+        tenant_limiter=request.app.state.tenant_volume_limiter,
+        message="Volume create rate limit exceeded",
+    )
     try:
         body = await request.json()
     except json.JSONDecodeError:

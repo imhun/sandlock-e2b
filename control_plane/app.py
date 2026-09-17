@@ -331,6 +331,20 @@ def create_app(
     app.state.tenant_create_limiter = SlidingWindowRateLimiter(
         settings.create_rate_limit_per_min
     )
+    # Same admission shape for the other resource-creating endpoints. Per
+    # endpoint, so a snapshot burst cannot spend the sandbox-create budget.
+    app.state.snapshot_limiter = SlidingWindowRateLimiter(
+        settings.snapshot_rate_limit_per_min
+    )
+    app.state.volume_limiter = SlidingWindowRateLimiter(
+        settings.volume_rate_limit_per_min
+    )
+    app.state.tenant_snapshot_limiter = SlidingWindowRateLimiter(
+        settings.snapshot_rate_limit_per_min
+    )
+    app.state.tenant_volume_limiter = SlidingWindowRateLimiter(
+        settings.volume_rate_limit_per_min
+    )
     app.state.tenant_limiters = {
         tenant_id: SlidingWindowRateLimiter(limit)
         for tenant_id, limit in settings.tenant_rate_limits.items()

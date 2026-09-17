@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 
 from control_plane.api.errors import OfficialError
 from control_plane.auth import _require_owned, require_api_key, tenant_of, tenant_scope
+from control_plane.ratelimit import enforce_resource_limit
 from control_plane.api.sandboxes import _provision_local, _provision_remote
 from control_plane.registry.manager import (
     ResourceUnavailableError,
@@ -112,6 +113,15 @@ def _capture_snapshot(request: Request, sandbox_id: str, name: str | None):
 async def create_snapshot(
     sandbox_id: str, request: Request
 ) -> dict[str, Any]:
+    # A snapshot copies the sandbox filesystem: the heaviest resource-creating
+    # endpoint there is, so it is admitted like sandbox create rather than left
+    # unbounded.
+    enforce_resource_limit(
+        request,
+        limiter=request.app.state.snapshot_limiter,
+        tenant_limiter=request.app.state.tenant_snapshot_limiter,
+        message="Snapshot create rate limit exceeded",
+    )
     try:
         body = await read_json_body(
             request, request.app.state.settings.max_json_body_bytes

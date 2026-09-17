@@ -694,6 +694,11 @@ def live_servers(buildkitd):
             # production budget allows (120/min by default), which shows up
             # as 429 in SDK fixtures; the limiter itself has its own tests.
             create_rate_limit_per_min=0,
+            # The resource-creating endpoints share that reasoning: the
+            # suite creates far more volumes/snapshots per minute than a
+            # production budget allows.
+            snapshot_rate_limit_per_min=0,
+            volume_rate_limit_per_min=0,
             buildkit_addr=buildkitd,
         ),
         runtime_registry=runtime_registry,
@@ -796,6 +801,11 @@ def _start_multinode(
             # production budget allows (120/min by default), which shows up
             # as 429 in SDK fixtures; the limiter itself has its own tests.
             create_rate_limit_per_min=0,
+            # The resource-creating endpoints share that reasoning: the
+            # suite creates far more volumes/snapshots per minute than a
+            # production budget allows.
+            snapshot_rate_limit_per_min=0,
+            volume_rate_limit_per_min=0,
             workspace_base=shared_workspace_dir,
             shared_workspace_root=(
                 str(shared_workspace_dir) if shared_workspace else None
@@ -1151,6 +1161,11 @@ def _start_live_servers(
             # production budget allows (120/min by default), which shows up
             # as 429 in SDK fixtures; the limiter itself has its own tests.
             create_rate_limit_per_min=0,
+            # The resource-creating endpoints share that reasoning: the
+            # suite creates far more volumes/snapshots per minute than a
+            # production budget allows.
+            snapshot_rate_limit_per_min=0,
+            volume_rate_limit_per_min=0,
         ),
         runtime_registry=runtime_registry,
         workspace_base=workspace,

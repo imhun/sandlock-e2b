@@ -45,3 +45,40 @@ class SlidingWindowRateLimiter:
             while dq and now - dq[0] > self._window:
                 dq.popleft()
             return max(0, self._limit - len(dq))
+
+
+def enforce_resource_limit(
+    request,
+    *,
+    limiter: SlidingWindowRateLimiter,
+    tenant_limiter: SlidingWindowRateLimiter,
+    message: str,
+) -> None:
+    """Admission for a *resource-creating* endpoint: per key, then per tenant.
+
+    The same shape sandbox create uses (E3.5/E9.3): the caller's key spends one
+    slot first, then the tenant's when tenant isolation is configured. Admin
+    keys and single-tenant compatible mode skip the tenant half.
+
+    Every endpoint that allocates durable platform state calls this -- sandbox
+    create, snapshot create and volume create. Leaving any of them out made an
+    authenticated key able to loop that one for free while the others were
+    throttled; the limiters are per endpoint so a burst on one cannot spend
+    another's budget.
+
+    Raises ``OfficialError(429)`` on refusal. Imported lazily because
+    ``control_plane.api.errors`` and ``control_plane.auth`` import this module's
+    siblings's dependents; a module-level import would close the cycle.
+    """
+    from control_plane.api.errors import OfficialError
+    from control_plane.auth import tenant_of
+
+    key = request.headers.get("X-API-Key") or request.headers.get("X-API-KEY", "")
+    if not limiter.allow(key):
+        raise OfficialError(429, message)
+    settings = request.app.state.settings
+    if not settings.tenants_enabled:
+        return
+    tenant, is_admin = tenant_of(request)
+    if tenant is not None and not is_admin and not tenant_limiter.allow(tenant):
+        raise OfficialError(429, message)

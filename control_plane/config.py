@@ -16,6 +16,13 @@ from gateway_common.env import (
     _env_list,
 )
 
+#: Default per-key budget for the *resource-creating* control-plane endpoints
+#: (sandbox create, snapshot create, volume create). One constant so the three
+#: cannot drift apart; each endpoint keeps its own env override and, per repo
+#: convention, ``0`` disables its limiter.
+DEFAULT_CREATE_RATE_LIMIT_PER_MIN = 120
+
+
 @dataclass
 class Settings:
     """All tunables of the control plane.
@@ -86,7 +93,25 @@ class Settings:
         default_factory=lambda: _env_int("E2B_MAX_TOTAL_PROCESSES", 2048)
     )
     create_rate_limit_per_min: int = field(
-        default_factory=lambda: _env_int("E2B_CREATE_RATE_LIMIT_PER_MIN", 120)
+        default_factory=lambda: _env_int(
+            "E2B_CREATE_RATE_LIMIT_PER_MIN", DEFAULT_CREATE_RATE_LIMIT_PER_MIN
+        )
+    )
+    # Per-key budgets for the other *resource-creating* endpoints. They share
+    # the create budget's default on purpose: each one allocates durable
+    # platform state (a snapshot copies a sandbox filesystem, a volume takes a
+    # quota slice), so leaving them unlimited made an authenticated key able to
+    # loop them for free while sandbox create was already throttled. Each has
+    # its own override and, per repo convention, 0 disables it.
+    snapshot_rate_limit_per_min: int = field(
+        default_factory=lambda: _env_int(
+            "E2B_SNAPSHOT_RATE_LIMIT_PER_MIN", DEFAULT_CREATE_RATE_LIMIT_PER_MIN
+        )
+    )
+    volume_rate_limit_per_min: int = field(
+        default_factory=lambda: _env_int(
+            "E2B_VOLUME_RATE_LIMIT_PER_MIN", DEFAULT_CREATE_RATE_LIMIT_PER_MIN
+        )
     )
     # E9.1: idle detection (resource-contention.md §3.1). A running sandbox
     # whose last observed activity is older than this becomes an eviction
