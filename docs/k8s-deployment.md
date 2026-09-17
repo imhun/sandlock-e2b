@@ -391,8 +391,8 @@ pod 停在 `CreateContainerConfigError` 而不是静默用一个公共 key。
 |---|---|---|
 | §6 A 起没起来 | ✅ | worker 自检 `seccomp self-check: filter mode active, user namespaces allowed`；pod 内 `/proc/1/status` `Seccomp: 2`、`Seccomp_filters: 1`；安装器在 `.94` 写入 `/var/lib/k0s/kubelet/seccomp/sandlock-worker.json (13147 bytes)`；PVC `Bound`（50Gi RWX，静态绑定 NAS PV）；seccomp DaemonSet 2/2 |
 | §6 C 形态证据 | ✅（单节点） | 箱内 `id -u`=0；`socket.if_nameindex()` 只有 `lo`（N5 per-sandbox netns）；`kill(1,0)`=ok（N10 per-sandbox pid ns）；宿主侧落盘 `drwxrwx--- 10000:nogroup`（owner=池 uid 10000、group=worker gid 65534、0770，即 c1 模型） |
-| §6 B 应用冒烟 | ⛔ **被 F3 挡** | `deployment_smoke.py` 断言 `len(nodes) >= 2`、`multinode_smoke.py` 要 4 个沙箱跨两节点分布；在跨节点网络修好之前，把 worker 钉在一个节点上时这两条断言必然失败（单/多节点建箱、执行命令、kill 都已单独跑通） |
-| 多副本 N13 | ⛔ 未开始 | 前置同上：先修 F3，再撤 `.140` 上的临时 taint、把 worker 拉到 2 副本 |
+| §6 B 应用冒烟 | ✅ **2026-09-17 全绿** | `deployment_smoke.py`：跨节点分布、经 gateway 的命令与文件、**跨节点迁移且共享 workspace 文件保留**、网络配置回显与原子更新、远端卷挂载与兄弟卷隔离、**模板构建 → worker 拉取 → 镜像 rootfs**、**箱内 MCP 经代理**、kill 后预留归零 —— 整轮 **20.6 秒**。`multinode_smoke.py`（4 个沙箱 2+2 跨两节点）**8.7 秒** 通过。两条冒烟都要求在途 ≥2 个健康 worker |
+| 多副本 N13 | 🟡 **首次跑起来了，但未收口** | 两个 worker 副本同时跑在一份共享 base 上（`replicas: 2`，autoscaler 停在 0 以免它按 `E2B_AS_MAX_REPLICAS=1` 缩回去）。观察到的都是好信号：两条冒烟全绿、跨节点迁移保留文件、两个 worker 的 `reconcile summary` 都是 `deleted=0 delete_failures=0 protected_elsewhere=0 untrusted_records=[]`（**没有互相动对方的活树**）、kill 后两边预留都归零。**但这还不算证明**：清单仍按 N13 的约定把 `replicas: 1` + autoscaler MAX=1 钉死（`tests/unit/test_worker_manifest_permissions.py`），要放开得先做 per-pod 子卷/段划分与一轮专门的交叉干扰用例 |
 
 ### 10.5 下一步
 
@@ -481,3 +481,61 @@ kill 后预留归零）。剩下的第 5/6 阶段：模板构建现在能跑通�
 （模板 rootfs/chroot 形态的命令路径；worker 同时会打
 `E2B_PER_SANDBOX_UID is enabled on a root worker without CAP_SYS_PTRACE` 的告警，
 root worker 形态可能需要补 `CAP_SYS_PTRACE`）。
+
+---
+
+## 12. 收口 N18：(c) 解到节点本地 + (a) 不在事件循环上解（2026-09-17）
+
+§11.4 之后 N18 剩三层（慢 240 倍 / 跑在事件循环上 / 预热协议对 SDK 不通）。这轮做了前两层，
+第三条按设计保留（它对 SDK 调用方本就不通，见 §12.3）。
+
+### 12.1 (c) OCI tar 留在共享卷，**解出来的 rootfs 放到节点本地**
+
+新设置 `E2B_IMAGE_OCI_DIR`（未设 = 与 `E2B_IMAGE_CACHE_DIR` 同一个目录，即拆分前的行为）：
+
+* **控制面**：`Template.build` 仍然把 OCI layout tar 导出到共享卷
+  （`<E2B_IMAGE_OCI_DIR or E2B_IMAGE_CACHE_DIR>/_oci/<slug>.oci.tar`），因为它要发给每个节点；
+* **worker**：`E2B_IMAGE_CACHE_DIR=/var/lib/e2b-images`（`hostPath`，节点本地、跨 pod 重建保留），
+  `E2B_IMAGE_OCI_DIR=/var/lib/e2b-sandboxes/_images`（共享 PVC）。解析时先看自己缓存里的 link，
+  再看自己缓存里的 tar，**再看生产方目录里的 tar** —— 命中就从共享卷读 tar、解到本地缓存并在
+  本地写 link；缓存里没有 `_oci` 的 tar 时，prune 会额外扫一遍生产方目录，分享出来的 tar 不会无界增长。
+
+效果（同一台 worker、同一份 python-slim rootfs、2111 个文件）：
+
+| | 拆分前（解到共享 NAS） | 拆分后（解到节点本地） |
+|---|---|---|
+| 层 blob → rootfs | 61.4 s | **0.26 s** |
+| `deployment_smoke.py` 整轮 | 分钟级并在模板阶段超时 | **20.6 s 全绿** |
+
+### 12.2 (a) 把 context（含镜像解析）的构建搬出事件循环
+
+`SandboxRuntimeContext`（以及它内部的 `create_executor` → `resolve_image_rootfs`）原本由沙箱的
+**首个 RPC** 惰性创建（`envd_service/rpc.py::_context`）——那正是 SDK 用 60 秒默认超时包住的
+请求，而且跑在事件循环上，所以解析多慢，worker 就多久发不出心跳。现在 `POST /agent/sandboxes`
+在**建箱成功之后**用 `asyncio.to_thread` 预建 context（`_prime_runtime_context`）：首个命令因此
+直接命中，而且构建过程不再占用事件循环。预建失败**不影响建箱契约**——记一条 warning，首个命令像
+以前一样报它自己的错（这也是 §10.3 F7 那条 `E2B_PER_SANDBOX_UID … without CAP_SYS_PTRACE` 告警
+不再致命的原因）。
+
+兜底仍在：`E2B_NODE_HEARTBEAT_TIMEOUT`（`1a17059`，默认 15 秒不变；k0s overlay 设 300 秒）。
+有了 (a) 它是**安全网**而不是必需——心跳不再会被解析拖住。
+
+### 12.3 保留、没有改的那条
+
+控制面「冷镜像必须先预热」需要客户端带 `X-Sandbox-Id`（否则 `428 warm_required`），而
+**e2b SDK 2.46.0 不发这个头也不处理 428**。模板创建之所以能工作，是因为
+`Settings.resolve_template_image()` 对本地构建的模板返回 `None` ⇒ 预热被跳过 ⇒ 代价落在首个
+命令上。曾经试着把模板的 image 补进去，冒烟立刻变成 428，所以撤回（`721dead` 记录了这段）。
+现在 (c) 把那份代价从 61 秒压到 0.26 秒，**这条协议不一致就不再是拦路虎**；要不要让冷镜像预热
+对不带头的客户端透明，仍是一个需要单独设计确认的问题（`docs/task-backlog.md` N18 的三条修法里
+的 (b)）。
+
+**2026-09-17 收口（c + a，见 §12）**：上面那条模板超时已解决，两条冒烟在真集群上全绿：
+
+```
+deployment_smoke.py  20.6 s  OK: 跨节点分布 / 命令+文件 / 迁移保留文件 / 网络配置 /
+                               远端卷隔离 / 模板构建→worker 拉取→镜像 rootfs /
+                               箱内 MCP 经代理 / kill 后预留归零
+multinode_smoke.py    8.7 s  4 个沙箱 2+2 跨两节点，命令+文件+健康+stdin 全通过
+DEPLOYMENT SMOKE OK / MULTI-NODE SMOKE OK
+```

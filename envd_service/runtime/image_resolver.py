@@ -1566,6 +1566,39 @@ def local_oci_paths(cache_dir: str | Path, image: str) -> tuple[Path, Path]:
     return root / f"{slug}.oci.tar", root / f"{slug}{_OCI_LINK_SUFFIX}"
 
 
+def _producer_oci_dir() -> Path | None:
+    """Where the OCI layout tars for locally built images live (``E2B_IMAGE_OCI_DIR``).
+
+    Split out of ``E2B_IMAGE_CACHE_DIR`` so the *extracted* rootfs can sit on a
+    node's local disk while the tars stay on the shared volume the control plane
+    exports them to. The reason is the unpack: the same 2111-file python-slim
+    rootfs takes **61.4s** onto the shared Aliyun NAS versus **0.26s** onto the
+    pod's local overlay (measured 2026-09-17), and that unpack happens on the
+    worker's event loop while the sandbox's first command waits for it -- minutes
+    of a node that cannot heartbeat (docs/task-backlog.md N18).
+
+    Unset means "the caller's own cache also holds the tars", i.e. exactly the
+    behavior before the split.
+    """
+    raw = os.environ.get("E2B_IMAGE_OCI_DIR")
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def _local_oci_tar(cache: Path, image: str) -> Path | None:
+    """``image``'s OCI layout tar: this cache first, then the producer directory."""
+    tar_path = local_oci_paths(cache, image)[0]
+    if tar_path.is_file():
+        return tar_path
+    producer = _producer_oci_dir()
+    if producer is not None:
+        producer_tar, _ = local_oci_paths(producer, image)
+        if producer_tar.is_file():
+            return producer_tar
+    return None
+
+
 def ensure_shared_cache_dir(cache_dir: str | Path) -> Path:
     """Prepare a *configured* shared cache for both production identities.
 
@@ -1709,6 +1742,14 @@ def _resolve_local_oci(image: str, cache: Path, tar_path: Path, link: Path) -> P
     rootfs, digest = _extract_local_oci(image, cache, tar_path)
     _write_shared_file(link, f"{digest}\n{rootfs}")
     logger.info("resolved locally built image %s to rootfs %s", image, rootfs)
+    # The tar may have come from the producer directory (the shared volume the
+    # control plane writes to). That directory is not the caller's cache, so the
+    # prune that `_materialize_entry` schedules for the caller does not bound it;
+    # schedule one for the tars explicitly, or a long-lived deployment grows the
+    # shared `_oci/` directory without limit.
+    producer = _producer_oci_dir()
+    if producer is not None and producer.resolve() != Path(cache).resolve():
+        _schedule_cache_prune(producer)
     return rootfs
 
 
@@ -1732,8 +1773,9 @@ def peek_image_warm(
     rootfs = _rootfs_from_local_link(local_oci_paths(Path(cache_dir), image)[1])
     if rootfs is not None:
         return {"cached": True, "digest": _link_digest(local_oci_paths(Path(cache_dir), image)[1])}
-    if local_oci_paths(Path(cache_dir), image)[0].is_file():
-        # Built on this node but not extracted yet: a create that may warm it.
+    if _local_oci_tar(Path(cache_dir), image) is not None:
+        # The tar is reachable (this cache, or the shared producer directory) but
+        # has not been extracted into this cache yet: a create that may warm it.
         return {"cached": False, "digest": None}
     try:
         digest = _platform_digest(
@@ -1764,11 +1806,15 @@ def resolve_image_rootfs(
         raise ImageResolutionError("no base image configured")
 
     cache = Path(cache_dir)
-    tar_path, link = local_oci_paths(cache, image)
+    link = local_oci_paths(cache, image)[1]
     cached_local = _rootfs_from_local_link(link)
     if cached_local is not None:
         return _prepared_rootfs(image, cached_local)
-    if tar_path.is_file():
+    tar_path = _local_oci_tar(cache, image)
+    if tar_path is not None:
+        # Extracted into *this* cache (the worker's node-local one when the tar
+        # lives on the shared volume), so the sidecar next to it records a path
+        # the next resolve on this node finds.
         return _prepared_rootfs(
             image, _resolve_local_oci(image, cache, tar_path, link)
         )

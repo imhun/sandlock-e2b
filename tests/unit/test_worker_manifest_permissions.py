@@ -316,6 +316,40 @@ def test_k8s_control_plane_is_paired_with_the_buildkit_sidecar() -> None:
     assert "seccompProfile:\n              type: Unconfined\n" in K8S_CONTROL_PLANE
 
 
+def test_worker_keeps_the_extracted_rootfs_off_the_shared_volume() -> None:
+    """The tars stay shared; the unpack stays on the node's own disk.
+
+    Unpacking a rootfs onto the shared volume costs 240x what it costs locally
+    (measured 2026-09-17 on Aliyun NAS: 61.4s versus 0.26s for the same 2111-file
+    python-slim rootfs), and that unpack happens while the sandbox's first command
+    waits -- which on a real cluster produced minutes-long node silences and let
+    E6.1 reap live sandboxes (docs/task-backlog.md N18). With the split, the smoke
+    that used to hang now completes end to end in ~20s.
+    """
+    assert "            - name: E2B_IMAGE_CACHE_DIR\n              value: /var/lib/e2b-images\n" in K8S_WORKER
+    assert (
+        "            - name: E2B_IMAGE_OCI_DIR\n"
+        "              value: /var/lib/e2b-sandboxes/_images\n" in K8S_WORKER
+    )
+    # The control plane still exports its tars into the shared cache, so the
+    # worker's producer directory has to be that same path.
+    assert "E2B_IMAGE_CACHE_DIR\n              value: /var/lib/e2b-sandboxes/_images" not in K8S_WORKER
+    # Node-local, and NOT the RWX claim: an unpack into the shared PVC is the
+    # thing this test exists to prevent.
+    assert "        - name: image-cache\n          hostPath:\n            path: /var/lib/e2b-images\n" in K8S_WORKER
+    assert (
+        "        - name: image-cache\n"
+        "          hostPath:\n"
+        "            path: /var/lib/e2b-images\n"
+        "            type: DirectoryOrCreate\n" in K8S_WORKER
+    )
+    # ...while the workspaces keep arriving through the RWX claim.
+    assert "          persistentVolumeClaim:\n            claimName: sandbox-shared\n" in K8S_WORKER
+    # Both caches are prepared (created + handed to the worker uid) by the init
+    # container, in the order the resolver uses them.
+    assert "value: /var/lib/e2b-images /var/lib/e2b-sandboxes/_images\n" in K8S_WORKER
+
+
 # ----------------------------------------------------------------------------
 # seccomp profile installation (deploy/k8s/seccomp-installer.yaml)
 # ----------------------------------------------------------------------------

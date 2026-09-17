@@ -18,6 +18,15 @@ DRY_RUN=1 KUBECONFIG=... deploy/k8s-k0s/apply.sh   # 只渲染
 | `worker-root.patch.yaml` | worker `runAsUser: 0` + `runAsGroup: 65534` | 网络文件系统按 AUTH_SYS 凭据授权，CAP_CHOWN 不过网 —— 非 root worker 的 file-capability broker 无法把沙箱树让给池 uid。保留 fsgid 65534 是因为沙箱树是 `0770 group=<worker gid>` |
 | `worker-capacity.patch.yaml` | `E2B_NODE_*` → 4096/400/8192/1024；pod requests 500m/512Mi、limits 4/4Gi | 基线默认 2048/200 只放得下 1 个沙箱（README 的 F8 就是这条）；且基线 `limits` 无 `requests` 会被当成 requests=2 CPU，滚动更新无处安放 |
 
+另外基线自己已经按「节点本地」分开了两类镜像缓存（`deploy/k8s/worker.yaml`）：
+
+* `E2B_IMAGE_CACHE_DIR=/var/lib/e2b-images` —— **解出来的 rootfs**，`hostPath` 节点本地。解到共享卷上
+  要 61.4 秒、解到本地盘 0.26 秒（同一份 python-slim rootfs，2111 个文件，2026-09-17 实测）。
+* `E2B_IMAGE_OCI_DIR=/var/lib/e2b-sandboxes/_images` —— **OCI layout tar**，仍在共享卷上，因为那是
+  控制面 `Template.build` 导出的、每个节点都要读的东西。
+
+两者的区别就是 N18 那 240 倍；拆开之后 `deployment_smoke.py` 从「分钟级挂在模板阶段」变成 **20.6 秒全绿**。
+
 ## CNI 必须建集群时定：这套集群用 Calico VXLAN
 
 这套 VPC 会丢弃**源或目的不是本实例 IP** 的报文（ENI 的「源/目的地址检查」），而安全组

@@ -83,10 +83,15 @@ spec:
               done
           env:
             - name: CACHE_DIRS
-              value: /var/lib/e2b-sandboxes/_images
+              # Both caches, in the order they are created: the node-local one
+              # this pod unpacks into, and the shared one whose ``_oci/`` the
+              # control plane writes tars into.
+              value: /var/lib/e2b-images /var/lib/e2b-sandboxes/_images
           volumeMounts:
             - name: shared
               mountPath: /var/lib/e2b-sandboxes
+            - name: image-cache
+              mountPath: /var/lib/e2b-images
         # The worker (uid 65534) creates each sandbox's top-level tree *directly*
         # under the volume root, so that root must be writable by it -- the compose
         # convention is mode 1777 (deploy/scripts/README.md, "一次性迁移": 卷根保持
@@ -183,6 +188,16 @@ spec:
             # (§2.4.4, W4), the resolver's own cap is the ONLY bound the cache
             # has here; it must stay set (docs/production-deployment-requirements.md §2.7).
             - name: E2B_IMAGE_CACHE_DIR
+              value: /var/lib/e2b-images
+            # ...and the OCI layout tars stay on the *shared* volume, because the
+            # control plane is what exports them (``Template.build`` writes
+            # ``<dir>/_oci/<slug>.oci.tar``) and every worker has to be able to
+            # read one built on another node. Splitting the two directories is
+            # what keeps the unpack local: the same 2111-file python-slim rootfs
+            # takes 61.4s onto the shared Aliyun NAS and 0.26s onto a node's own
+            # disk (measured 2026-09-17), and the unpack runs while the sandbox's
+            # first command waits. See docs/task-backlog.md N18.
+            - name: E2B_IMAGE_OCI_DIR
               value: /var/lib/e2b-sandboxes/_images
             - name: E2B_IMAGE_CACHE_MAX_BYTES
               value: "4294967296"
@@ -306,10 +321,22 @@ spec:
           volumeMounts:
             - name: shared
               mountPath: /var/lib/e2b-sandboxes
+            - name: image-cache
+              mountPath: /var/lib/e2b-images
       volumes:
         - name: shared
           persistentVolumeClaim:
             claimName: sandbox-shared
+        # Node-local, and deliberately NOT the shared PVC: this is the extracted
+        # image rootfs cache, and unpacking one onto the shared volume costs 240x
+        # what it costs here (61.4s vs 0.26s for the same rootfs; N18). It is a
+        # hostPath rather than an emptyDir because it must survive pod restarts --
+        # the compose stack's equivalent is a named volume on the host's disk --
+        # and "node-local" is exactly its scope.
+        - name: image-cache
+          hostPath:
+            path: /var/lib/e2b-images
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service

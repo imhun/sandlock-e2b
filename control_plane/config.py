@@ -57,6 +57,18 @@ class Settings:
     node_heartbeat_timeout_s: float = field(
         default_factory=lambda: _env_float("E2B_NODE_HEARTBEAT_TIMEOUT", 15.0)
     )
+    #: Directory the control plane exports a locally built template's OCI layout
+    #: tar into (``<dir>/_oci/<slug>.oci.tar``). Empty means "same as
+    #: ``image_cache_dir``". Set it when the extracted rootfs is node-local: the
+    #: tar has to stay on the shared volume every worker can read, while a worker
+    #: unpacks it into its own cache (``E2B_IMAGE_OCI_DIR`` on the worker side).
+    image_oci_dir: Path | None = field(
+        default_factory=lambda: (
+            Path(os.environ["E2B_IMAGE_OCI_DIR"]).resolve()
+            if os.getenv("E2B_IMAGE_OCI_DIR")
+            else None
+        )
+    )
     executor: str = field(
         default_factory=lambda: os.getenv("E2B_EXECUTOR", "auto").lower()
     )

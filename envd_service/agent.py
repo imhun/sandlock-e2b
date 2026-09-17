@@ -1974,6 +1974,50 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
         pool.commit(sandbox_id)
 
 
+async def _prime_runtime_context(request: Request, sandbox_id: str | None) -> None:
+    """Build the sandbox's runtime context -- off the event loop.
+
+    The context (and with it ``create_executor`` -> the image rootfs resolution)
+    is otherwise created lazily by the sandbox's *first RPC*
+    (``envd_service/rpc.py::_context``), i.e. inside the very request the official
+    SDK bounds with its 60s ``request_timeout`` -- and on the event loop, so a slow
+    resolve also stopped this worker's heartbeats for its duration. On a
+    network-backed image cache that resolve is minutes (measured on Aliyun NAS
+    2026-09-17: 61s to unpack a python-slim rootfs versus 0.26s onto local disk),
+    which made a healthy node look dead and let E6.1 reap the sandbox mid-create
+    (docs/task-backlog.md N18).
+
+    Failure is not fatal here on purpose: this is an optimisation of the *first
+    command*, and the create contract is unchanged -- if the image cannot be
+    resolved now, the first RPC reports exactly what it reports today.
+    """
+    if not sandbox_id:
+        return
+    runtimes = request.app.state.runtimes
+    if runtimes.get(sandbox_id) is not None:
+        return
+    registry = request.app.state.runtime_registry
+    try:
+        record = registry.get(sandbox_id)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("could not read the runtime record for %s", sandbox_id)
+        return
+    if record is None:
+        return
+    factory = request.app.state.context_factory
+    try:
+        ctx = await asyncio.to_thread(factory, record)
+    except Exception:
+        logger.warning(
+            "could not prime the runtime context for %s: the first command will "
+            "build it (and report its error) instead",
+            sandbox_id,
+            exc_info=True,
+        )
+        return
+    runtimes[sandbox_id] = ctx
+
+
 @router.post("/agent/sandboxes", status_code=201)
 async def agent_create_sandbox(request: Request) -> Response:
     settings = request.app.state.settings
@@ -1990,6 +2034,7 @@ async def agent_create_sandbox(request: Request) -> Response:
     try:
         payload = await request.json()
         _agent_create_sandbox(request, settings, payload)
+        await _prime_runtime_context(request, payload.get("sandboxID"))
     except PermissionError as e:
         # A worker-side permission fault while provisioning, not an auth
         # failure: 500 with the reason so the control plane's

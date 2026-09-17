@@ -195,7 +195,12 @@ async def _run_build(
         # envd_service for exactly this (build + resolution) code path.
         from envd_service.runtime.image_resolver import local_oci_paths
 
-        oci_tar, oci_link = local_oci_paths(settings.image_cache_dir, template.image)
+        # ``image_oci_dir`` is where the tars belong when it is set: the workers
+        # unpack into their *own* cache (``E2B_IMAGE_OCI_DIR``), so the tars must
+        # live on the volume they share with this pod, not in the pod's cache.
+        oci_tar, oci_link = local_oci_paths(
+            settings.image_oci_dir or settings.image_cache_dir, template.image
+        )
         oci_tar.parent.mkdir(parents=True, exist_ok=True)
         # A rebuilt template must not reuse the previous layout tar -- nor the
         # sidecar that points at the rootfs extracted from it, which would
