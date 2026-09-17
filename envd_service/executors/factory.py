@@ -101,6 +101,36 @@ def _landlock_ok(min_abi: int = 6) -> bool:
         return False
 
 
+def sandlock_unconfined_kernel_error(mode: str) -> RuntimeError:
+    """The fail-closed error for a kernel that cannot confine anything.
+
+    Same family as the unusable-package errors above, and for the same reason:
+    the fallback is :class:`LocalExecutor`, which applies **no** sandbox
+    confinement. A kernel without Landlock (ABI < 6, i.e. < 5.13) cannot run
+    sandlock at all, so `auto` refusing here is the only way an operator finds
+    out before untrusted code runs -- measured 2026-09-17 on a real cluster
+    whose nodes are Alibaba Cloud Linux 3 / 5.10: `E2B_EXECUTOR=auto` logged one
+    warning and handed back a LocalExecutor, i.e. sandboxes with no confinement
+    whatsoever, while `E2B_EXECUTOR=sandlock` refused correctly.
+
+    ``local`` stays the deliberate way to run without confinement -- that is
+    the operator's explicit choice and is left untouched.
+    """
+    try:
+        import sandlock
+
+        abi: object = sandlock.landlock_abi_version()
+    except Exception as exc:  # pragma: no cover - defensive
+        abi = f"unavailable ({type(exc).__name__})"
+    return RuntimeError(
+        f"E2B_EXECUTOR={mode} cannot run: this kernel has no usable Landlock "
+        f"(ABI {abi}, needs >= 6), so sandlock cannot confine a sandbox. "
+        "Refusing to fall back to the LOCAL executor, which applies no sandbox "
+        "confinement. Run the worker on a kernel with Landlock (>= 5.13, ABI >= 6), "
+        "or set E2B_EXECUTOR=local to run without confinement deliberately."
+    )
+
+
 def create_executor(
     settings: Settings,
     *,
@@ -145,11 +175,10 @@ def create_executor(
 
     if mode == "sandlock" or (mode == "auto" and _sandlock_available()):
         if not _landlock_ok():
-            if mode == "sandlock":
-                raise RuntimeError(
-                    "E2B_EXECUTOR=sandlock requires Landlock ABI >= 6"
-                )
-            logger.warning("Landlock ABI < 6 on Linux; falling back to local executor")
+            # Both modes refuse: the alternative is LocalExecutor, which runs
+            # untrusted code with no confinement at all. `local` is the
+            # operator's explicit opt-in for exactly that and never gets here.
+            raise sandlock_unconfined_kernel_error(mode)
         else:
             from envd_service.executors.sandlock import SandlockExecutor
             from envd_service.route_b import RouteBConfig

@@ -153,6 +153,32 @@ def test_missing_package_keeps_the_quiet_fallback(monkeypatch, caplog, missing) 
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
 
 
+def test_auto_refuses_when_the_kernel_cannot_confine(monkeypatch) -> None:
+    """`auto` must not degrade to the unconfined executor.
+
+    Measured on a real cluster (Alibaba Cloud Linux 3, kernel 5.10, Landlock
+    ABI -1): `auto` logged one warning and returned a LocalExecutor -- i.e.
+    sandboxes with no confinement at all. The package was importable, so the
+    installed-but-broken guard above did not fire, and only an explicit
+    `E2B_EXECUTOR=sandlock` refused. A kernel that cannot confine is the same
+    hazard as a package that cannot run, and now takes the same path.
+    """
+    monkeypatch.setattr(factory_mod.sys, "platform", "linux")
+    monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: None)
+    monkeypatch.setattr(factory_mod, "_sandlock_available", lambda: True)
+    monkeypatch.setattr(factory_mod, "_landlock_ok", lambda: False)
+
+    with pytest.raises(RuntimeError) as info:
+        _create(_settings("auto"))
+
+    assert type(info.value) is RuntimeError
+    assert "no usable Landlock" in str(info.value)
+    assert "Refusing to fall back to the LOCAL executor" in str(info.value)
+
+    # `local` stays the deliberate opt-in for running without confinement.
+    assert isinstance(_create(_settings("local")), LocalExecutor)
+
+
 def test_explicit_sandlock_mode_names_a_missing_package(monkeypatch) -> None:
     """Missing package + explicit sandlock: say *that*, not "needs Landlock".
 
