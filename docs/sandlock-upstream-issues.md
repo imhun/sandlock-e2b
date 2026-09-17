@@ -7,6 +7,26 @@
 那份文档同时覆盖：已落地方案（R*/S*/E*/M*）、待实施修改方案（P1–P8）、未解决问题
 （SL-1 等）、E2B 侧现有缓解、验证矩阵与同步约定。本文只保留编号映射，避免两处描述漂移。
 
+> **2026-09-17 状态更正（E2B 侧复验）**：下表把 **SL-4 / SL-5 / SL-7** 记为"未修、
+> `exec` 接线前必修"，**已过时** —— fork 侧 M0′ 已修（`docs/CHANGELOG.md`「安全修复
+> （M0′：SL-4/5/6/7/8 + 进程组/上限/deadline）」：F1.1 `3d804b1` 控制 fd 泄漏、F1.2
+> `c5a0fe7` early_exits 上限、F1.3 `95608be`/`ceaa069` + F2b.2 控制面鉴权与目录身份、
+> F1.6 `0f51fce` fd 关闭与显式分帧），而 `exec` verb 也已在用（`envd_service/route_b.py`）。
+> 本次在 `sandlock-dev` 容器里跑它们点名的回归用例，**全部通过**：
+>
+> ```
+> test_control::test_peer_uid_mismatch_closes                        ok   (SL-7)
+> test_control::test_sibling_sandbox_cannot_read_other_policy        ok   (SL-7 实测项)
+> test_control::test_sandbox_cannot_reach_sibling_channel            ok
+> test_control::test_path_mode_peer_uid_mismatch_closes              ok
+> test_control::test_fd_handoff_channel_rejects_third_party          ok
+> test_fd_inherit::test_control_socket_not_inherited_by_user_process ok   (SL-4)
+> test_fd_inherit::test_extra_fds_are_cloexec                        ok   (SL-4)
+> ```
+>
+> 即"沙箱内伪造 `Exited` 控箱"与"沙箱能 config 别人槽位"两条都已有回归覆盖且转绿。
+> 下面表格保留原编号映射，读到时以本节为准。
+
 | 编号 | 主题 | 严重度 | 去处 |
 |---|---|---|---|
 | SL-1 | 路径中介（`fs_denied` / chroot / COW 触发的 USER_NOTIF）以 **supervisor 身份**代执行 `openat/unlinkat/renameat2/fchmodat/fchownat/…` ⇒ 沙箱写的文件属主变 root、`chmod` 失效、共享目录 1777+sticky 的 per-uid 保护不成立（**非** Landlock 逃逸）。**已由硬删关闭（B3，2026-09-11）**：P2 的 `mediation_run_as` 降级档被整体删除（枚举/字段/builder/FFI 导出/CLI flag/`--policy` wire 键/Python 取值/`stats` 计数），特权中介 + 路径中介形态一律在建箱前 fail-closed 拒绝且只给 route B 一条修法；身份由构造保证（route-B 槽位 euid == 沙箱 host uid，A/B 档硬证据保留） | High（**已闭**） | `e2b-integration.md` §3.1，修法 P1/P5；B3 见 fork `docs/CHANGELOG.md` 顶部与 `docs/production-deployment-requirements.md` §2.4「删档的后果」 |

@@ -24,8 +24,13 @@
 - **显式 `allowOut` 不受影响**：用户明确放行内网 IP/CIDR 时照常工作，
   不做私网过滤。
 - worker 配置 `E2B_NETWORK_DENY_CIDRS`（默认 RFC1918 + loopback +
-  link-local + ULA）。需要放行内网服务时从该列表裁剪对应段；
-  置空则完全关闭保护。
+  link-local + ULA + CGNAT + 组播/保留段，两个地址族都列）。
+  需要放行内网服务时从该列表裁剪对应段；置空则完全关闭保护。
+  **2026-09-16 补正（SEC-001）**：初版清单漏了 `0.0.0.0/8` 与 `::1/128`，
+  实测沙箱可用 `connect(0.0.0.0)` / `connect(::1)` 直达 worker 回环上的
+  envd 内部 API（`fd_inject_connect` 使 netns 不构成缓解）。清单已扩到 15 条，
+  详见 [security-audit/findings.md](security-audit/findings.md#sec-001p0已修复默认私网拒绝清单漏-000008-与-1128--沙箱直达-worker-回环服务)。
+  已部署实例的 `.env` 若显式写了旧清单，升级时需一并替换。
 
 ### P0-2 redis 认证
 
@@ -151,11 +156,23 @@
 internal key、沙箱数据**明文**经公网代理传输。修复依赖代理层 TLS 或控制面
 HTTPS。
 
-## 3. 无租户隔离（架构级，高）
+## 3. 租户隔离：能力已落地，但默认关闭（高，2026-09-17 更正）
 
-所有 API key 权限相同：持有任一 key 可列/删所有沙箱与 volume、读快照/模板、
-挂载任意 volume 读内容。多租户场景需 per-key 资源归属/授权模型（与独立 uid
-的"资源归属"一起设计）。
+> 原文写于 2026-09-01（"架构级缺失"），**已过时**。E3.1 之后租户模型完整存在：
+> `control_plane/auth.py` 的 `tenant_of` / `_require_owned` / `_require_related`、
+> `E2B_TENANTS` + `E2B_ADMIN_API_KEYS`、资源的 `tenant_id` 归属、按租户限流/配额、
+> `deploy/scripts/migrate-tenants.py` 存量迁移，以及
+> `tests/contract/test_tenant_isolation.py` 的用例矩阵。口径见
+> [tenant-isolation.md](tenant-isolation.md)。
+>
+> **真正的缺口是默认值**：`E2B_TENANTS` 未配置即"单租户兼容模式"，出厂 env 示例里
+> 没有这个变量 ⇒ 任一 API key 可列/读/删/驱动全部沙箱与卷（实测两 key 矩阵见
+> [security-audit/findings.md](security-audit/findings.md#sec-001p0已修复默认私网拒绝清单漏-000008-与-1128--沙箱直达-worker-回环服务) 的 OBS-6）。
+> 修法是**部署配置**（设 `E2B_TENANTS` + `E2B_ADMIN_API_KEYS`，存量跑一次
+> `migrate-tenants.py`），不是改代码。
+>
+> 附带一条纵深防御项：envd 数据面只校验 `E2b-Sandbox-Id` + `X-Access-Token`，
+> 不参与租户校验。
 
 ## 4. token 无过期/失效（中）
 
