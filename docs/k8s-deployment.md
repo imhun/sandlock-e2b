@@ -96,14 +96,14 @@ kubectl -n $NS set image ds/seccomp-installer installer=<REGISTRY>/byteplan/e2b-
 
 ---
 
-## 3. compose ↔ k8s 差异表（2026-09-16）
+## 3. compose ↔ k8s 差异表（2026-09-17 更新）
 
 | 面 | compose（线上） | k8s（本清单） | 影响 |
 |---|---|---|---|
-| per-sandbox netns | **开**（两 worker，`E2B_ENABLE_NET_ISOLATION` + `E2B_FD_INJECT_CONNECT` = true） | **关**（共享 pod netns） | k8s 沙箱能看见 pod 网络；`no_egress` 类语义仍由沙箱自己的策略保证，但"沙箱只能看见 lo"这条不成立 |
-| 低端口 sysctl | 已撤（沙箱在自有 netns 里 root-in-userns 覆盖 :53） | **pod 级 `net.ipv4.ip_unprivileged_port_start=0`**（共享 netns 时 wildcard-DNS `:53` 需要它；`NET_BIND_SERVICE` 对非 root pod 无效） | 保留即可，别删 |
-| pid_ns | **开**（`E2B_PID_NS=true`，2026-09-16 全量） | **关**（共享 pod pid ns） | k8s 沙箱能看到同 pod 的其它进程；开法见 §5 |
-| 沙箱身份 | 每沙箱独立 host uid（槽位 uid 池，两 worker 用**不重叠**段 10000/11000） | 每沙箱独立 host uid（默认 10000 起 1000 个）——**但多副本共享同一份 RWX PVC，段会重叠**（见 N13） | 兄弟沙箱的跨 uid 保护会退化成"同 uid"，**多副本前必须解决** |
+| per-sandbox netns | **开** | **开**（2026-09-17 对齐，N5 关闭） | 一致：沙箱自有 netns，只见 `lo` |
+| 低端口 sysctl | 已撤 | **已撤**（2026-09-17，N5 的配套） | 两边都没有了；顺带关掉了「pod 内任何进程都能绑低端口」这个与沙箱无关的口子 |
+| pid_ns | **开**（2026-09-16 全量） | **开**（2026-09-17 对齐，N10 关闭） | 一致：`kill(pid,0)` 不再是同 pod 进程的存在性探针 |
+| 沙箱身份 | 每沙箱独立 host uid（两 worker 用不重叠段 10000/11000） | 每沙箱独立 host uid（段默认相同，但**共用一个 base ⇒ 共用一个分配器**：`uid_pool.acquire` 先 flock `<base>/.uid_pool.lock`，再按全部 `sandbox.json` + 预约标记重算空闲集 ⇒ 副本之间**不会**发同一个 uid） | 见 §8 的 N13 更正：分配器本身是跨进程安全的；**未验证的是同一 base 上多副本各自的 reconcile/GC 权限**，因此 autoscaler 上限先锁 1 |
 | route B（槽位） | 每沙箱一个 `sandlock-supervise --uid <槽位>` | 同（`E2B_PRIV_HELPERS=auto`，非 root pod 用镜像里的 file-cap broker） | 一致；broker 依赖上面那 4 个 cap 在**bounding set** 里 |
 | 配额 | stack 内 quota-agent（`E2B_QUOTA_AGENT_URL`），XFS prjquota 已开 | **无 agent 清单 → 降级**（无 per-sandbox 磁盘硬限，一条 WARNING） | 口径写在 §2.4.4；要真配额就把 agent 指到集群内/外（k8s 共享卷是 RWX/NFS，本地直连不可能） |
 | seccomp | 容器 `seccomp=<deploy/seccomp/sandlock-worker.json>`（compose 直接引用文件） | `Localhost` profile + DaemonSet 安装器 | 语义相同；k8s 多了"每节点装文件"这一步（§2） |
@@ -131,9 +131,13 @@ worker 侧关键 env（语义见 `deploy/stack/.env.example` 的同名键）：
 
 ---
 
-## 5. 把 k8s 切到与 compose 相同的形态（待决策：N5 / N10）
+## 5. 把 k8s 切到与 compose 相同的形态（✅ 2026-09-17 已落地：N5 / N10）
 
-**netns（N5）**——在 `worker.yaml` 的 worker 容器 env 里加两条（**必须成对**，`create_app`
+**本节已按下列步骤落地（`deploy/k8s/worker.yaml`，2026-09-17）**，但**尚未在真实集群复跑 §6** ——
+本地无法验证 k8s 层（无集群）。落地内容与理由：两条开关都加进 worker env，pod 级 sysctl 块删除，
+`tests/unit/test_worker_manifest_permissions.py` 改为钉住新形态（窗口消失 + 两条开关成对 + pid_ns 在）。
+
+**netns（N5）**——worker 容器 env 里两条（**必须成对**，`create_app`
 会拒绝单开：单开会把每个沙箱变成"只有 lo"，即静默断网）：
 
 ```yaml
@@ -155,7 +159,7 @@ wildcard-DNS 的 `:53`，而切了 netns 之后那个 bind 发生在沙箱自己
               value: "true"
 ```
 
-两条都要按 §6 复跑验证；pid_ns 的 k8s 特有失败模式是 **fail closed**：节点不允许非特权 userns
+两条都已加进清单，**仍需按 §6 在真实集群复跑**；pid_ns 的 k8s 特有失败模式是 **fail closed**：节点不允许非特权 userns
 （内核开关 / LSM）时，中间进程 `unshare(CLONE_NEWUSER)` 失败 ⇒ **建箱报错**，而不是静默退回
 共享 pid ns。
 
@@ -215,7 +219,7 @@ python3 deploy/scripts/multinode_smoke.py
 | # | 缺口 | 下一步 |
 |---|---|---|
 | N4 | seccomp 安装器**未在真实集群验证** | `kubectl apply` → 等 DS 每节点 Ready → 滚 worker；缺文件节点 fail closed |
-| N5 | k8s 是否切 per-sandbox netns（现在共享） | 按 §5 改动 + 复跑 §6 |
-| N10 | k8s 是否开 pid_ns（现在共享） | 同上；另注意节点需允许非特权 userns |
-| N13 | **多副本共享一份 RWX PVC 时 uid 池重叠**（默认都是 10000–10999，autoscaler 最多 16 副本） | 设计：StatefulSet 序号/每 pod 固定段，或每 pod 独立 workspace 子卷；在把 replicas 提到 1 以上之前解决 |
+| ~~N5~~ | ~~k8s 是否切 per-sandbox netns~~ | ✅ 2026-09-17 已切（§5），**待真实集群按 §6 复验** |
+| ~~N10~~ | ~~k8s 是否开 pid_ns~~ | ✅ 2026-09-17 已切（§5），同上待复验；节点仍需允许非特权 userns（这依赖本来就存在） |
+| N13 | **多副本形态整体未验证**。~~uid 池重叠~~ 已更正：两个 pod 共用同一 base 时**共用同一个分配器**（`uid_pool.acquire` flock + 按全部 `sandbox.json`/预约标记重算），不会发同一个 uid。真正的未知是**同一 base 上各副本的 reconcile/GC 权限** —— 一个 worker 会不会动到另一个 worker 的活树 | 已先**把上限锁住**：worker `replicas: 1` + autoscaler `E2B_AS_MAX_REPLICAS=1`，并有清单用例钉住；打开前需在真实集群验证（per-pod 子卷 + 段划分一起做） |
 | — | k8s 无 quota-agent 清单（口径=降级，§2.4.4） | 有真实 k8s + XFS/NFS 环境时补清单（agent 形态对 NFS 才是唯一可行路径） |

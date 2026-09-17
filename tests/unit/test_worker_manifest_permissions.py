@@ -1,14 +1,14 @@
 """A6/fix-1: the manifests must not ask the worker for SYS_ADMIN.
 
 The privilege moved to the ``quota-agent`` service (it runs ``xfs_quota -x``
-server-side). The compose stack no longer declares the low-port window at all
-(both workers run per-sandbox netns, where the wildcard-DNS `:53` bind is
-covered by the sandbox's own userns); for the k8s pod, which is still
-shared-netns, the sysctl has to be **pod-level**: the worker image is ``USER 65534``
-and the manifest does not override it, so ``NET_BIND_SERVICE`` is inert
-(containerd grants no ambient caps to a non-root process) and the wildcard-DNS
-gateway's ``:53`` bind would fail with the kernel-default
-``ip_unprivileged_port_start=1024``.
+server-side). Neither stack declares the low-port window any more: both run
+per-sandbox netns, where the wildcard-DNS ``:53`` bind happens inside the
+sandbox's own netns and is covered by the guest's root-in-userns
+(``CAP_NET_BIND_SERVICE``). The k8s manifest was the last holder of a pod-level
+``net.ipv4.ip_unprivileged_port_start=0`` window, which was needed only while it
+shared the pod netns -- and it was a hole unrelated to sandboxes (every process
+in the pod could bind low ports). N5/N10 closed on 2026-09-17; the tests below
+pin the new shape so neither the window nor a half-switch can come back.
 
 Track F (Task F1) adds the other half: a non-root worker gets per-sandbox host
 uids and route-B slots from the two file-capability brokers, and the kernel
@@ -179,11 +179,58 @@ def test_k8s_worker_drops_sys_admin_and_declares_the_broker_caps() -> None:
     assert "no-new-privileges" not in K8S_WORKER
 
 
-def test_k8s_low_port_window_is_pod_level_not_container_level() -> None:
-    pod_spec = K8S_WORKER.split("\n    spec:\n", 1)[1]
-    pod_part, containers_part = pod_spec.split("\n      containers:\n", 1)
-    assert POD_SYSCTL in pod_part
-    assert "sysctls:" not in containers_part
+def test_no_low_port_window_survives_anywhere() -> None:
+    """N5: with per-sandbox netns the window has no user left, in either manifest.
+
+    The compose stack dropped its copy on 2026-09-16; the k8s pod held one until
+    2026-09-17. A half-revert (sysctl back without the netns pair, or the pair
+    without removing the window) is exactly what these two assertions catch.
+    """
+    # Structural, not textual: both files still *mention* the sysctl in the
+    # comments that explain why it is gone, and those comments are the point.
+    assert POD_SYSCTL not in K8S_WORKER
+    assert "\n        sysctls:\n" not in K8S_WORKER  # pod-level PodSecurityContext
+    assert "\n    sysctls:\n" not in STACK_COMPOSE  # compose service-level
+
+
+def test_k8s_runs_the_same_namespace_shape_as_the_stack() -> None:
+    """N5/N10: the two shipped shapes must not drift apart.
+
+    A per-sandbox netns is only meaningful with the paired fd injection
+    (`create_app` refuses `net_isolation` without it, because the single-switch
+    shape is a sandbox with no network at all), and a shared pid namespace
+    leaves `kill(pid, 0)` as a liveness oracle for the pod's other processes.
+    """
+    assert 'name: E2B_ENABLE_NET_ISOLATION' in K8S_WORKER
+    assert 'name: E2B_FD_INJECT_CONNECT' in K8S_WORKER
+    assert 'name: E2B_PID_NS' in K8S_WORKER
+    # ...and the stack still runs it, so the assertion above is about parity
+    # rather than about k8s alone.
+    assert 'E2B_ENABLE_NET_ISOLATION' in STACK_COMPOSE
+    assert 'E2B_PID_NS' in STACK_COMPOSE
+
+
+def test_k8s_stays_single_replica_until_n13_is_closed() -> None:
+    """N13: the multi-replica shape is unverified, so nothing may reach it.
+
+    The uid allocator itself is cross-process safe on a shared base
+    (`uid_pool.acquire` flocks `<base>/.uid_pool.lock` and recomputes the free
+    set from every `sandbox.json` plus the reservation markers), but every
+    worker on one shared base also reconciles and GCs a tree set it does not
+    own, and that is not established. Until it is, the autoscaler may not raise
+    the replica count -- which is what this pins.
+    """
+    autoscaler = (REPO / "deploy" / "k8s" / "autoscaler.yaml").read_text(
+        encoding="utf-8"
+    )
+    marker = "name: E2B_AS_MAX_REPLICAS"
+    assert marker in autoscaler
+    # The value sits a few comment lines below the name, so read forward rather
+    # than requiring the two to be adjacent.
+    following = autoscaler[autoscaler.index(marker):][:600]
+    assert 'value: "1"' in following
+    assert 'value: "16"' not in following
+    assert "\n  replicas: 1\n" in K8S_WORKER
 
 
 # ----------------------------------------------------------------------------

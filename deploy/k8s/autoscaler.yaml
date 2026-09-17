@@ -64,4 +64,11 @@ spec:
             - name: E2B_AS_MIN_REPLICAS
               value: "1"
             - name: E2B_AS_MAX_REPLICAS
-              value: "16"
+              # N13: the multi-replica shape has never been verified -- one
+              # shared RWX base means every worker reconciles and GCs a tree set
+              # it does not own (the uid allocator itself is cross-process safe,
+              # but per-pod reconcile authority over that base is not
+              # established). Raise this only after N13 is closed on a real
+              # cluster, and with the per-pod workspace layout that goes with
+              # it. See docs/k8s-deployment.md §5/§8 and docs/task-backlog.md.
+              value: "1"

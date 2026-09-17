@@ -13,41 +13,23 @@ spec:
       labels:
         app: e2b-worker
     spec:
-      # A6/fix-1: the wildcard-allowOut DNS gateway binds <127.0.1.x>:53 from the
-      # worker's own network namespace. This manifest does NOT enable
-      # per-sandbox netns (no E2B_ENABLE_NET_ISOLATION below), so the DNS bind
-      # still happens in the *pod's* netns and the pod-level low-port window is
-      # still required -- the compose stack dropped its copy on 2026-09-16
-      # after both its workers moved to netns, where the sandbox's own
-      # root-in-userns covers port 53.
-      # The worker image builds with `USER 65534:65534`
-      # (deploy/docker/Dockerfile.envd) and this pod does NOT override it, so
-      # `capabilities.add: NET_BIND_SERVICE` is *not* enough: a non-root process
-      # gets no effective capabilities (Kubernetes has no ambient-capability
-      # semantics) and with the kernel-default `ip_unprivileged_port_start=1024`
-      # the bind fails with EACCES. Measured on the Docker engine in this repo's
-      # test image (tmp/a6fix1-cap-probe.log):
-      #   uid 65534 + NET_BIND_SERVICE + sysctl=1024 -> CapEff=0, bind :53 EACCES
-      #   uid 65534 + NET_BIND_SERVICE + sysctl=0    -> bind :53 OK
-      #   uid 0     + NET_BIND_SERVICE + sysctl=1024 -> CapEff=0x400, bind :53 OK
-      # So the low-port window has to be DECLARED, exactly like the compose
-      # deploy does -- it is what covers both shapes (an older pushed image that
-      # still ran as root is satisfied by NET_BIND_SERVICE; the current
-      # Dockerfile's 65534 image is *not*, and the sysctl is harmless for both).
-      # sysctls are pod-level (this is PodSecurityContext, not the container's);
-      # the sysctl is *safe* since k8s 1.22 (no kubelet
-      # --allowed-unsafe-sysctls needed), but `net.*` sysctls are refused with
-      # hostNetwork: true. MCP inbound ports are 50005+ and never needed it.
-      # The compose stack dropped its copy on 2026-09-16, but only because both
-      # its workers moved to per-sandbox netns; this manifest still shares the
-      # pod netns, so the window stays. Switching k8s to netns means adding the
-      # paired E2B_ENABLE_NET_ISOLATION/E2B_FD_INJECT_CONNECT *and* deleting this
-      # block -- the walk-through, the pid_ns switch (N10) and the multi-replica
-      # uid-pool gap (N13) live in docs/k8s-deployment.md §5.
-      securityContext:
-        sysctls:
-          - name: net.ipv4.ip_unprivileged_port_start
-            value: "0"
+      # A6/fix-1: the worker image builds with `USER 65534:65534`
+      # (deploy/docker/Dockerfile.envd) and this pod does NOT override it.
+      # NET_BIND_SERVICE stays declared: a non-root process gets no effective
+      # capabilities (Kubernetes has no ambient-capability semantics), so the
+      # declaration grants the pod nothing by itself -- it is there for a root
+      # override (`runAsUser: 0`), and it keeps the file-capability brokers'
+      # bounding set complete.
+      #
+      # No `securityContext.sysctls` any more (N5, 2026-09-17). The pod-level
+      # `net.ipv4.ip_unprivileged_port_start=0` window existed for exactly one
+      # user: the wildcard-allowOut DNS gateway binding :53, which used to bind
+      # in the shared pod netns as uid 65534 with no effective capability. With
+      # per-sandbox netns the bind happens inside the sandbox's own netns, where
+      # the guest's root-in-userns holds CAP_NET_BIND_SERVICE -- the same reason
+      # the compose stack dropped its copy on 2026-09-16. Deleting the block
+      # also removes a pod-level hole that had nothing to do with sandboxes:
+      # every process in this pod could bind low ports.
       terminationGracePeriodSeconds: 120
       # Z-F7 C1: the cache on the shared PVC is written by root (the
       # control-plane pod exports template layout tars into ``_images/_oci/``)
@@ -152,17 +134,35 @@ spec:
             # this non-root pod; `off` keeps the in-process E5.1 shape.
             - name: E2B_PRIV_HELPERS
               value: "auto"
-            # Two shape switches that the compose stack has ON and this manifest
-            # deliberately leaves OFF (see docs/k8s-deployment.md §3/§5):
-            #   E2B_PID_NS=1                -- per-sandbox pid namespace (N10)
-            #   E2B_ENABLE_NET_ISOLATION=1  -- per-sandbox netns (paired with
-            #                                  E2B_FD_INJECT_CONNECT) (N5)
-            # Not set here on purpose: switching them changes what a workload
-            # can see (pids, interfaces) and needs the §6 verification pass.
-            # Also *not* set: E2B_UID_POOL_START/SIZE -- replicas default to
-            # 10000/1000, and this manifest can scale past one replica over a
-            # single RWX PVC, so the ranges would overlap. Fix before raising
-            # replicas: N13 in docs/task-backlog.md.
+            # N5/N10 closed (2026-09-17): this manifest now runs the same
+            # per-sandbox namespace shape the compose stack has run in
+            # production since 2026-09-16.
+            #   E2B_PID_NS                 -- per-sandbox pid namespace. Without
+            #     it a sandbox sees the pod's pids and `kill(pid, 0)` answers
+            #     EPERM for a live one (existence oracle).
+            #   E2B_ENABLE_NET_ISOLATION + E2B_FD_INJECT_CONNECT -- per-sandbox
+            #     loopback netns; the pair is mandatory (`create_app` refuses
+            #     net_isolation without fd_inject_connect, precisely because the
+            #     single-switch shape is a sandbox with no network at all).
+            # Neither adds a kernel prerequisite this pod did not already have:
+            # per-sandbox host uids (E2B_PER_SANDBOX_UID, on by default) already
+            # create a user namespace per sandbox, which is the same
+            # `unshare(CLONE_NEWUSER)` these two build on.
+            - name: E2B_PID_NS
+              value: "true"
+            - name: E2B_ENABLE_NET_ISOLATION
+              value: "true"
+            - name: E2B_FD_INJECT_CONNECT
+              value: "true"
+            # Still *not* set: E2B_UID_POOL_START/SIZE. The allocator is
+            # cross-process safe on a shared base (`uid_pool.acquire` takes an
+            # flock on `<base>/.uid_pool.lock` and recomputes the free set from
+            # every `sandbox.json` plus the reservation markers, so two pods
+            # sharing this PVC do not hand out the same uid) -- but the
+            # *multi-replica* shape as a whole is unverified (per-pod reconcile
+            # authority and GC over one shared base), so `replicas` stays 1 and
+            # the autoscaler is capped at 1 until N13 is closed on a real
+            # cluster. See docs/task-backlog.md N13.
             - name: E2B_BASE_IMAGE
               value: python:3.14-slim
             - name: E2B_NODE_MEMORY_MB
