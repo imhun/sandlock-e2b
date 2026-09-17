@@ -242,8 +242,92 @@ Landlock 要 5.13+），且 `user.max_user_namespaces = 0` ⇒ `unshare -U` 直�
 
 | # | 缺口 | 下一步 |
 |---|---|---|
-| N4 | seccomp 安装器**未在真实集群验证** | `kubectl apply` → 等 DS 每节点 Ready → 滚 worker；缺文件节点 fail closed |
+| ~~N4~~ | ~~seccomp 安装器未在真实集群验证~~ | ✅ **2026-09-17 已在 main(ACK) 验证**：安装器 5 个真节点全部写入、带 Localhost profile 的 pod 实测 `Seccomp: 2`。两条附带结论：profile 里含该内核没有的 syscall 名**不影响加载**（跨内核可移植）；虚拟节点会 `NotSupport` 导致 DS 永不收敛 —— 已加 `nodeAffinity` 修复（commit `235fc34`） |
 | ~~N5~~ | ~~k8s 是否切 per-sandbox netns~~ | ✅ 2026-09-17 已切（§5），**待真实集群按 §6 复验** |
 | ~~N10~~ | ~~k8s 是否开 pid_ns~~ | ✅ 2026-09-17 已切（§5），同上待复验；节点仍需允许非特权 userns（这依赖本来就存在） |
 | N13 | **多副本形态整体未验证**。~~uid 池重叠~~ 已更正：两个 pod 共用同一 base 时**共用同一个分配器**（`uid_pool.acquire` flock + 按全部 `sandbox.json`/预约标记重算），不会发同一个 uid。真正的未知是**同一 base 上各副本的 reconcile/GC 权限** —— 一个 worker 会不会动到另一个 worker 的活树 | 已先**把上限锁住**：worker `replicas: 1` + autoscaler `E2B_AS_MAX_REPLICAS=1`，并有清单用例钉住；打开前需在真实集群验证（per-pod 子卷 + 段划分一起做） |
 | — | k8s 无 quota-agent 清单（口径=降级，§2.4.4） | 有真实 k8s + XFS/NFS 环境时补清单（agent 形态对 NFS 才是唯一可行路径） |
+
+---
+
+## 9. 自建集群：验证沙箱数据面与多副本（计划登记 2026-09-17）
+
+**为什么**：§7.5 已确认 main 的 ACK 集群（kernel 5.10）既没有 Landlock 也没有非特权 userns，
+沙箱数据面与多副本（N13）在那里**物理上不可验** —— §6 的 B/C 至今没有在真实集群上跑过。
+新增节点 **172.18.80.94** 让一台自建集群成为可能，本节把方案与判据先登记下来。
+
+### 9.1 前置闸门（不合格就不必建）
+
+| 判据 | 通过线 | 为什么是硬闸门 |
+|---|---|---|
+| `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` | **≥ 6** | 权威判据，比看版本号可靠（Landlock 5.13+ 才有，ABI 6 要 6.12+） |
+| `uname -r` | ≥ 6.12（参考） | 同上 |
+| `user.max_user_namespaces` | **≠ 0** | ACK 上是 0：`unshare -U` → ENOSPC，per-sandbox uid / route-B 槽位一起失效 |
+| `kernel.apparmor_restrict_unprivileged_userns` | 不为 `1`（或给 kubelet/containerd 配 AppArmor profile） | Ubuntu 24.04+ 会掐掉 userns；表现是**建箱报错**（`auto` 已 fail closed，不会静默降级） |
+
+> **换发行版不会影响这张表。** ACK 就是对照：同一批镜像在 k3s/k0s/kubeadm 上结果一样。
+
+### 9.2 两个必须先定的问题
+
+1. **"已有的线上节点"指哪台？**
+   - **ACK 的节点**（172.18.93.x / 94.x）：**不可 join**。它们由 ACK 托管，kubelet/containerd 配置属于 ACK，
+     强行 join 会破坏 ACK 的节点生命周期；ACK 集群也不可能被"收编"成自建集群的一部分。
+   - **172.18.80.140**（compose 生产栈所在机，Landlock ABI 8）：可以但风险明确 —— 引入
+     containerd/kubelet/CNI 后，**iptables 规则与 Docker 冲突是这类混合部署的经典故障**，且资源会与新集群互相挤。
+     建议第二个 worker 用**备用机**；非用不可则 taint 隔离 + 端口/网段避开 + 明确接受风险。
+2. **用途定级**：只验"单节点 k8s 形态"（§6 A/B/C）→ 1 台足够（用 k3s 自带 local-path 存储）；
+   要验**多副本 N13** → 必须 ≥2 个可用 worker **且**共享 **RWX**（自建集群得自己起 NFS）。
+
+### 9.3 方案选择
+
+| 方案 | 起量 | 自带 | 结论 |
+|---|---|---|---|
+| **k3s** | 最快，单二进制 | containerd + flannel + Traefik + ServiceLB + local-path | **推荐**；必须 `--disable traefik --disable servicelb`，否则 ServiceLB 的 DaemonSet 会去抢宿主 80/443 |
+| **k0s** | 快，单二进制 | containerd + kube-router，**不带** ingress/LB | **备选**：自带行为最少；`k0sctl` 一份 YAML 管多节点 |
+| kubeadm | 慢 | 几乎不带 | 只在需要完全贴上游时 |
+| kind / k3d | 快 | 容器当节点 | **不用于验隔离**：内核仍是宿主内核，但多了一层 userns/seccomp，会让结论归因不清；只适合验清单/调度 |
+| microk8s | 中 | snap 全家桶 | AL8/非 Ubuntu 上不一定顺，不推荐 |
+
+### 9.4 E2B 侧三个前置（比选发行版更容易踩）
+
+1. **seccomp**：k8s **不会**默认给 pod 加 seccomp profile，而 worker 有启动自检
+   （profile 没生效就 `SECCOMP_PROFILE_NOT_APPLIED` 拒服务）⇒ §2 的 `seccomp-installer` 照样要先跑。
+   已在 ACK 验证可用（含 virtual-kubelet 的 `nodeAffinity` 修复，commit `235fc34`）。
+2. **共享存储**：单节点 → k3s `local-path` 即可；**多副本 → 必须 NFS**。
+   `deploy/k8s/pvc.yaml` 已预留 `# storageClassName: nfs`，仓库里已有 `deploy/scripts/nfs-probe`、
+   `nfs_quota_probe.sh` 与相关文档口径 —— 是先例，不是新坑。
+3. **镜像**：直接用本次发布 `0.1.0-330-g235fc34-20260917-142808`（含 `auto` 在无 Landlock 内核上
+   fail-closed 的修复，已在 ACK 用该 tag 复验）。
+
+### 9.5 最短路径（内核闸门通过后）
+
+```bash
+# 节点 1 = 控制面 + worker
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server \
+  --disable traefik --disable servicelb --write-kubeconfig-mode 644" sh -
+# 节点 2 = worker
+K3S_URL=https://<node1>:6443 \
+K3S_TOKEN=$(cat /var/lib/rancher/k3s/server/node-token) \
+curl -sfL https://get.k3s.io | sh -
+
+# 清单适配（自建集群版）：
+#   pvc.yaml      -> local-path（单节点）或 NFS PV（多副本）
+#   *.yaml 镜像 tag -> 0.1.0-330-g235fc34-20260917-142808
+#   其余照 §2 顺序：ns -> secret -> redis -> control-plane -> seccomp-installer(等 Ready) -> worker
+```
+
+### 9.6 验收与解绑
+
+| 步 | 判据 | 解绑 |
+|---|---|---|
+| 建集群 | 三个闸门判据达标；`kubectl get nodes` 全 Ready | —— |
+| §6 A | worker `seccomp self-check` + `route-B instance ready` 两条日志 | k8s 形态自检 |
+| §6 B | `deployment_smoke.py` / `multinode_smoke.py` 全绿 | 应用层在 k8s 上首次真跑通 |
+| §6 C | 箱内 `id -u`=0 / 宿主落盘属主=池内 uid / 只见 `lo` / `kill(1,0)`=ok | N5/N10 在自建集群上复核（此前只验了清单，没验运行时） |
+| 多副本 | 2 worker + 共享 RWX；观察一个 pod 的 reconcile/GC 是否会动到另一个 pod 的活树 | **N13**（多副本形态首次验证） |
+
+### 9.7 待确认（卡在这三件上，先不动手）
+
+1. **172.18.80.94 的内核**（权限：从开发机直连不通、bastion 拒了本机公钥，需你给输出或访问）。
+2. 第二个 worker 用**哪台**（备用机 or 172.18.80.140）。
+3. 是否需要**多副本**（决定要不要上 NFS）。
