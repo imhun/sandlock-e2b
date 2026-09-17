@@ -72,16 +72,25 @@ kubectl apply -f deploy/k8s/autoscaler.yaml
 ```
 
 **第 5 步不能省、也不能并行**：kubelet 在**节点宿主**上解析 `Localhost` profile，节点上没有那个
-文件时 pod 根本起不来（N4 记录，清单已就位但**尚未在真实集群验证**）。worker 自己还有一条启动
+文件时 pod 根本起不来。**N4 已于 2026-09-17 在 main 集群验证**：安装器在 5 个真节点全部写入成功
+（`installed /var/lib/kubelet/seccomp/sandlock-worker.json (13147 bytes)`），带 `Localhost` profile 的
+pod 实测 `Seccomp: 2 / Seccomp_filters: 1`（即 worker 启动自检所需的谓词为真）。
+附带两条实测结论：① profile 里含**该内核并不存在**的 syscall 名（`landlock_*`、`fchmodat2`、
+`mount_setattr` …）**不影响加载** —— containerd 2.1.6 能解析，profile 跨内核可移植；
+② 安装器原来**容忍全部污点**（为了覆盖控制面节点），因此在 ACK 的 virtual-kubelet(ECI) 节点上
+被判 `NotSupport`、DaemonSet 停在 5/7 **永不收敛**，让本步的“等每个节点 Ready”永远等不到。
+已加 `nodeAffinity: type NotIn [virtual-kubelet]` 修复，复验 `successfully rolled out` / 5-5-5。worker 自己还有一条启动
 自检：profile 没生效就拒绝服务（`SECCOMP_PROFILE_NOT_APPLIED`），所以"pod 起来了但 profile
 没真加载"这条不会静默通过。
 
 ### 镜像与升级
 
-清单里的镜像 tag 目前是占位的 `:0.1.0`。发布流程与 compose 同源（`build-and-push.sh` 会把
-worker / control-plane-gateway / autoscaler / quota-agent 推到 ACR），升级时**把清单里的 tag
-换成当次构建的版本**（compose 侧现在跑的是 `0.1.0-316-g10bedf6-20260916-175558` 这种带
-时间戳的 dev tag），再：
+清单里的镜像 tag 目前是占位的 `:0.1.0`。发布流程与 compose 同源：`build-and-push.sh` 把
+worker / control-plane-gateway / autoscaler / quota-agent 推到 ACR，并**把版本写进
+`deploy/stack/.version`（gitignored）**；compose 侧 `upgrade.sh` 直接读它来 pin tag，
+k8s 侧没有等价的自动机制，所以要显式把 tag 换成当次构建的版本。
+**2026-09-17 的最近一次发布**：`0.1.0-330-g235fc34-20260917-142808`（含 `auto` 在无 Landlock
+内核上 fail-closed 的修复，已在 main 集群用该 tag 复验通过）。升级时：
 
 ```bash
 kubectl -n $NS set image deploy/e2b-worker worker=<REGISTRY>/byteplan/e2b-sandlock-worker:<VERSION>
@@ -211,6 +220,21 @@ python3 deploy/scripts/multinode_smoke.py
 * 版本回滚：`kubectl -n sandlock set image ...:<旧版本>`（旧镜像要在 ACR 里）。
 * seccomp：profile 文件留着不影响任何东西（没有 pod 引用它）；删 pod 不会删节点上的文件，
   卸载要自己 `rm /var/lib/kubelet/seccomp/sandlock-worker.json`（或删 DaemonSet 后再删文件）。
+
+---
+
+## 7.5 main 集群（ACK，kernel 5.10）能验什么
+
+2026-09-17 在这台集群上实测：**沙箱数据面在此不可验证**，两条硬前置都不满足 ——
+`landlock_create_ruleset(VERSION)` 返回 **ENOSYS**（`sandlock.landlock_abi_version()` = -1，
+Landlock 要 5.13+），且 `user.max_user_namespaces = 0` ⇒ `unshare -U` 直接 ENOSPC
+（非特权 userns 被关，per-sandbox uid / route-B 槽位同样不成立）。
+因此 §6 的 B（应用冒烟）、C（形态证据）、逃逸套件、网络清单、配额、N13 的多副本树归属
+**一项都做不了**；沙箱侧验收仍须在有 Landlock 的机器（compose 那台 ABI 8）上进行。
+
+**这台集群适合做的**：部署机制与平台层 —— 清单 apply/调度、RBAC、**多架构镜像**（实测三个
+镜像都是 amd64+arm64，而 5 个真节点里 4 个是 arm64，这条不成立就是部署拦路虎）、seccomp 安装器
+（N4，已验证）、以及“worker 在不能约束的内核上是否正确拒绝”（已用它抓到并复验 `auto` 的静默降级）。
 
 ---
 
