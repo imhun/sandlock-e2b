@@ -18,6 +18,32 @@ DRY_RUN=1 KUBECONFIG=... deploy/k8s-k0s/apply.sh   # 只渲染
 | `worker-root.patch.yaml` | worker `runAsUser: 0` + `runAsGroup: 65534` | 网络文件系统按 AUTH_SYS 凭据授权，CAP_CHOWN 不过网 —— 非 root worker 的 file-capability broker 无法把沙箱树让给池 uid。保留 fsgid 65534 是因为沙箱树是 `0770 group=<worker gid>` |
 | `worker-capacity.patch.yaml` | `E2B_NODE_*` → 4096/400/8192/1024；pod requests 500m/512Mi、limits 4/4Gi | 基线默认 2048/200 只放得下 1 个沙箱（README 的 F8 就是这条）；且基线 `limits` 无 `requests` 会被当成 requests=2 CPU，滚动更新无处安放 |
 
+## CNI 必须建集群时定：这套集群用 Calico VXLAN
+
+这套 VPC 会丢弃**源或目的不是本实例 IP** 的报文（ENI 的「源/目的地址检查」），而安全组
+规则是 `172.16.0.0/12`（不含 pod 网段 `10.244.0.0/16`），所以 kube-router 那种原生路由
+CNI 的跨节点流量会被云网络拦掉。节点链路本身没问题（ping/ssh/kubelet 都通）。
+
+因此这套集群用 **Calico VXLAN**（`deploy/k8s-k0s/k0s-calico.yaml`）：
+
+```yaml
+spec:
+  network:
+    provider: calico
+    calico: {mode: vxlan, overlay: Always, vxlanVNI: 4096, mtu: 1450,
+             ipAutodetectionMethod: kubernetes-internal-ip}
+```
+
+要点：
+
+* **CNI 只能建集群时定**。k0s 会拒绝给已有集群换 provider
+  （`cannot change CNI provider from kuberouter to calico`），改了就得分重装集群。
+* `overlay: Always` 是必须的——这里不是子网问题，是云网络不认识 pod IP。
+* `mtu: 1450`（节点 eth0 是 1500，VXLAN 头 50 字节）。
+* `ipAutodetectionMethod: kubernetes-internal-ip`：`.140` 上还有 docker0 与 br-*，
+  默认的 first-found 可能选错接口。
+* calico 的三个镜像都在 `quay.io/k0sproject`（本环境可拉），**不需要**镜像到 ACR。
+
 ## 集群怎么起的（一次性的）
 
 节点走跳板机，和 compose 那条线同一拓扑：本机 → 跳板机 → 节点。要点：
@@ -28,7 +54,8 @@ DRY_RUN=1 KUBECONFIG=... deploy/k8s-k0s/apply.sh   # 只渲染
 2. **前置**：`modprobe overlay br_netfilter` + `net.ipv4.ip_forward=1`、
    `net.bridge.bridge-nf-call-iptables=1`、`net.ipv6.conf.all.forwarding=1`（写进
    `/etc/modules-load.d/k0s.conf` 与 `/etc/sysctl.d/99-k0s.conf`）；无 swap。
-3. **控制面**：`k0s install controller --enable-worker --no-taints --start`。
+3. **控制面**：先把上面的 `k0s-calico.yaml` 放到 `/etc/k0s/k0s.yaml`，再
+   `k0s install controller --enable-worker --no-taints --start`。
    ⚠ **不要用 `--single`**：它会切到 kine(SQLite) 并且拒绝任何 worker token
    （`refusing to create token: cannot join into a single node cluster`）。要加节点就
    必须不带 `--single` 重装（默认 etcd 存储）。
@@ -39,6 +66,17 @@ DRY_RUN=1 KUBECONFIG=... deploy/k8s-k0s/apply.sh   # 只渲染
    `https://127.0.0.1:16443`）。认证走 SSH ControlMaster，口令只输一次。
 6. **冒烟要打到 gateway**：临时建一个 NodePort Service（不要改基线清单），再从本机
    经跳板机转发过去；`E2B_API_URL` / `E2B_SANDBOX_URL` 指到本机端口。
+
+## 清单侧的三个配套（不是 k0s 特有，但都是真集群跑出来的）
+
+* `control-plane` **只能 1 副本**：节点注册表是进程内的，而心跳被 Service 轮询到某一个
+  副本 ⇒ 另一个副本 15 秒后把健康的节点判成 unhealthy（实测两副本意见相反）。
+* 清单里原本**没有 buildkit**，`Template.build` 无从执行 ⇒ 按 compose 的形态补成
+  control-plane 的 **sidecar**（unix socket 要同 pod 才能共享 emptyDir）；镜像
+  `moby/buildkit:rootless` 在 Docker Hub ⇒ 已镜像到 ACR 的 `byteplan/buildkit:rootless`。
+* worker 以 **root** 跑（网络文件系统的 chown 需要 euid 0），因此会打
+  `E2B_PER_SANDBOX_UID … without CAP_SYS_PTRACE` 的告警；非 route-B 路径的模板沙箱
+  可能因此受影响（见 backlog N18）。
 
 ## 已知未完成项
 

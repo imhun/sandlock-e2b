@@ -408,3 +408,76 @@ pod 停在 `CreateContainerConfigError` 而不是静默用一个公共 key。
 3. 收尾遗留：worker 的稳定 node id（F7）、v3/nolock 与 v4 的锁语义差异要不要写进
    存储选型门槛、以及 F4 那条「非 root worker 与网络文件系统不兼容」是否要升级成
    基线的显式约束。
+
+---
+
+## 11. 换成封装型 CNI（Calico VXLAN），跨节点打通（2026-09-17 执行）
+
+§10.5 的路线 B：不动云配置，把 k0s 的 CNI 从 kube-router（原生路由）换成
+**Calico VXLAN**。节点之间只出现 `172.18.x`（已在安全组 `172.16.0.0/12` 的放行范围内），
+pod 网段不再出现在云网络上。**跨节点 pod 流量已打通**，冒烟的多节点阶段通过。
+
+### 11.1 为什么 B 可行（先验证再动手）
+
+在改 CNI 之前先手工建了两条隧道做判定（`tmp/k0s/overlay-probe.sh`）：
+
+| 隧道 | `.94 → .140` | `.140 → .94` |
+|---|---|---|
+| VXLAN（UDP/4789） | 0% 丢包，0.26 ms | 0% 丢包，0.21 ms |
+| IP-in-IP（proto 4） | 0% 丢包，0.21 ms | 0% 丢包，0.18 ms |
+
+两类封装都能穿过这套 VPC，所以 Calico 的 `vxlan`（或 `ipip`）都能用；选了 VXLAN
+（`spec.network.calico.mode: vxlan` + `overlay: Always` + `mtu: 1450`）。
+
+### 11.2 k0s 不允许给已有集群换 CNI
+
+改 `/etc/k0s/k0s.yaml` 的 `network.provider` 再重启控制面，k0s 会明确拒绝：
+
+```
+level=error msg="Failed to reconcile cluster configuration" component=clusterConfig-reconciler
+  error="cannot change CNI provider from kuberouter to calico"
+```
+
+所以是**按 Calico 重建的集群**（`k0s stop` → `k0s reset` → `k0s install controller …` →
+重新加 worker）。这也意味着：**CNI 是建集群时定下来的量，之后改不了**——新集群要先选好。
+重建清单上没有额外代价（集群里只有验证负载），但要清三样旧 CNI 残留：上一轮的 pod 网段
+路由、`/etc/cni/net.d/10-kuberouter.conflist`、以及 kube-router 的 iptables 链
+（`.140` 上还跑着 compose，所以只删 `KUBE-ROUTER-*`/`KUBE-POD-FW-*`，docker 的
+`DOCKER-*` 规则保持不动——清理后复查过 FORWARD 里的 DOCKER 引用仍在）。
+
+Calico 起来后的事实：`vxlan.calico`（vxlan id 4096，local 172.18.80.94:4789，MTU 1450）、
+到对端 IP 池的封装路由（`10.244.192.192/26 via 10.244.192.192 dev vxlan.calico onlink`）、
+pod 从 Calico IPAM 拿到 `10.244.140.x` / `10.244.192.x`。镜像不需要镜像到 ACR——
+k0s 用的三个 calico 镜像都在 **quay.io/k0sproject**（`calico-node|cni|kube-controllers:v3.32.1-3`），
+quay 在这里是通的（只有 docker.io 不通）。
+
+### 11.3 换 CNI 过程中暴露的四条
+
+| # | 问题 | 证据与处置 |
+|---|---|---|
+| **F11** | **control-plane 不能多副本**：节点注册表是**进程内**的（`NodeRegistry._nodes` 是内存 dict，Redis 只承载配额台账与沙箱记录），而心跳被 Service 轮询到某个副本 | 直接分别问两个副本：副本 A 连续 12 次报 `fxf2j: unhealthy`，副本 B 同时报 `fxf2j: healthy`。后果：过时副本上 `/internal/routes` 返回 `502 Node ... unavailable`，放置只在它认为有容量的节点上发生，`reap_unhealthy`（E6.1）会把「不健康」节点上的活沙箱当孤儿回收——冒烟里那条 `404 Sandbox ... not found` 就是这么来的。**处置**：`control-plane` 回到 **1 副本**（与 compose 生产栈一致），并加用例钉住；要开多副本必须先把节点视图（健康+地址）共享出去 |
+| **F12** | **清单里根本没有 buildkit**，而 `Template.build` 必须有它 | 冒烟模板阶段报 `BuildException: buildkit build exited with code 1`。**处置**：按 compose 的形态补 `buildkit`——但它不能用独立 Deployment，因为 buildkit 是**走 unix socket** 访问的（compose 把同一个 socket 卷只读挂到 control-plane 的 `/run/buildkit`），而 emptyDir 只在**同一个 pod 内**共享 ⇒ 做成 control-plane pod 的 **sidecar**，共享 `buildkit-data` emptyDir，`E2B_BUILDKIT_ADDR=unix:///run/buildkit/buildkitd.sock`，配置用 ConfigMap 承载并有「与 `deploy/stack/buildkitd.toml` 字节一致」的用例（docker.io 镜像加速链就写在里面）。`moby/buildkit:rootless` 在 Docker Hub ⇒ 镜像到 ACR（arm64+amd64）|
+| **F13** | buildkit sidecar 加 `allowPrivilegeEscalation: false` 会让它起不来 | 报 `[rootlesskit:parent] error: failed to setup UID/GID map: newuidmap ... failed: newuidmap: Could not set caps` —— kubelet 因此给进程加了 `no_new_privs`，内核忽略 newuidmap 的 setuid 位（与 worker 清单里 file-capability broker 那条注释同一机制）。compose 的 buildkit 用的是默认值，所以这里也不设 |
+| **F14** | **失败的 `Template.build` 会留下可解析的残骸**：`_templates/<tpl_id>/template.json` + 一个 **0 字节**的 `_images/_oci/e2b-local_<tpl_id>.oci.tar`；之后再构建**同名**模板时名字解析可能取到这条 | 症状是 worker 解 rootfs 报 envd 的 `Code.INTERNAL: file could not be opened successfully: … empty file`。实测：`_images/_oci/` 里同时存在 `tpl_2b89f5…`（0 字节，失败那次）与 `tpl_82d03f…`（49 MB，成功那次），而 `smoke-template` 这个名字在两者上都注册着。**未修**：记录在案，验证时用 `tmp/k0s/reset-smoke-template.sh` 清残骸。正确修法二选一：失败的构建不落可解析记录；或名字解析绑定「最近一次成功构建」 |
+
+### 11.4 现在的验证状态
+
+`deployment_smoke.py` 在多节点 k8s（Calico VXLAN + NAS RWX）上：
+
+```
+NODE DISTRIBUTION: {'http://10.244.140.8:49983', 'http://10.244.192.203:49983'}
+OK: commands + files through gateway
+OK: migrated … -> …, files kept
+OK: network config echo + atomic update
+OK: volume mounted remotely + sibling volume isolated
+after kill reservations: {…: 0, …: 0}
+```
+
+即 §6 B 的**多节点数据面阶段全部通过**（含跨节点分布、经 gateway 的命令与文件、
+**跨节点迁移且共享 workspace 文件保留**、网络配置回显与原子更新、远端卷挂载与兄弟卷隔离、
+kill 后预留归零）。剩下的第 5/6 阶段：模板构建现在能跑通（buildkit 生效、产物 49 MB 落到
+共享 OCI 缓存、模板沙箱建得出来），但**模板沙箱内的 `commands.run` 超时**
+（`connectrpc … Code.DEADLINE_EXCEEDED: Request timed out`）——这是下一轮要查的独立问题
+（模板 rootfs/chroot 形态的命令路径；worker 同时会打
+`E2B_PER_SANDBOX_UID is enabled on a root worker without CAP_SYS_PTRACE` 的告警，
+root worker 形态可能需要补 `CAP_SYS_PTRACE`）。

@@ -1,0 +1,27 @@
+# k0s 集群配置：CNI 从 kube-router（原生路由）切到 Calico VXLAN（封装）。
+#
+# 为什么换：这套 VPC 的 ENI「源/目的地址检查」只放行源与目的都属于本实例的报文，
+# 而安全组规则是 172.16.0.0/12（不含 pod 网段 10.244.0.0/16）；kube-router 走原生
+# 路由，跨节点包携带 10.244.x，于是在云网络里被丢弃（见 docs/k8s-deployment.md
+# §10.3 F3 的实测）。封装之后节点之间只出现 172.18.x，已在放行范围内。
+#
+# overlay: Always —— 必须一直封装，不能只在跨子网时封装（本场景不是子网问题，
+# 而是云网络不认识 pod IP）。
+# mtu: 1450 —— 节点 eth0 是 1500，VXLAN 头 50 字节。
+# ipAutodetectionMethod: kubernetes-internal-ip —— .140 上还有 docker0(172.17)
+# 与 br-*(172.19)，用 first-found 可能选错接口；这里固定用节点的 InternalIP。
+apiVersion: k0s.k0sproject.io/v1beta1
+kind: ClusterConfig
+metadata:
+  name: k0s
+spec:
+  network:
+    provider: calico
+    podCIDR: 10.244.0.0/16
+    serviceCIDR: 10.96.0.0/12
+    calico:
+      mode: vxlan
+      overlay: Always
+      vxlanVNI: 4096
+      mtu: 1450
+      ipAutodetectionMethod: kubernetes-internal-ip

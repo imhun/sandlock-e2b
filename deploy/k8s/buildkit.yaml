@@ -1,0 +1,48 @@
+# Rootless buildkit for ``Template.build`` -- the k8s twin of the compose
+# ``buildkit`` service (deploy/stack/docker-compose.prod.yml).
+#
+# Why the manifest set needs it: the control-plane image ships no docker CLI and
+# every deployment host measured on 2026-09-17 has Docker Hub closed, so without
+# a builder ``Template.build`` has nothing to run against -- measured on k0s,
+# the smoke's template phase ends in
+# ``BuildException: buildkit build exited with code 1``.
+#
+# Why a sidecar and not its own Deployment: buildkit is reached over a *unix
+# socket* (compose mounts the same socket from a shared volume, read-only, at
+# /run/buildkit), and an emptyDir is only shared between containers of one pod.
+# Co-locating them keeps the compose arrangement -- no network hop, no TCP
+# socket to authenticate -- and the pairing is exactly one builder per
+# control-plane replica.
+#
+# The payload below must stay byte-identical to deploy/stack/buildkitd.toml;
+# tests/unit/test_worker_manifest_permissions.py compares the two so the mirror
+# list cannot drift from the compose stack's.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: buildkitd-config
+  namespace: sandlock
+data:
+  buildkitd.toml: |-
+    # Rootless buildkitd config: route docker.io base-image pulls through
+    # reachable mirrors (Docker Hub is blocked from the target host). The mirrors
+    # are the same ordered chain the resolver defaults to
+    # (E2B_REGISTRY_MIRRORS in deploy/compose/.env.example): buildkit tries
+    # them in order and falls back to the origin, so one bad mirror does not turn
+    # into a failed template build.
+    [grpc]
+      # Rootless buildkitd (uid 1000) cannot create sockets under a root-owned
+      # mount; the socket lives inside its own data volume, which the control
+      # plane mounts read-only at /run/buildkit.
+      address = ["unix:///home/user/.local/share/buildkit/buildkitd.sock"]
+
+    # Running rootless buildkitd inside a container: without this, runc cannot
+    # mount /proc in build steps ("operation not permitted").
+    [worker.oci]
+      noProcessSandbox = true
+
+    [registry."docker.io"]
+      mirrors = ["https://docker.m.daocloud.io", "https://docker.1ms.run"]
+
+    [registry."docker.m.daocloud.io"]
+      http = false

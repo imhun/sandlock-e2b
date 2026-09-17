@@ -35,6 +35,11 @@ STACK_COMPOSE = (REPO / "deploy" / "stack" / "docker-compose.prod.yml").read_tex
     encoding="utf-8"
 )
 K8S_WORKER = (REPO / "deploy" / "k8s" / "worker.yaml").read_text(encoding="utf-8")
+K8S_CONTROL_PLANE = (REPO / "deploy" / "k8s" / "control-plane.yaml").read_text(
+    encoding="utf-8"
+)
+BUILDKIT_CONFIG = (REPO / "deploy" / "stack" / "buildkitd.toml").read_text(encoding="utf-8")
+K8S_BUILDKIT = (REPO / "deploy" / "k8s" / "buildkit.yaml").read_text(encoding="utf-8")
 WORKER_SECCOMP = json.loads(
     (REPO / "deploy" / "seccomp" / "sandlock-worker.json").read_text(encoding="utf-8")
 )
@@ -238,6 +243,7 @@ def test_k8s_stays_single_replica_until_n13_is_closed() -> None:
 
 
 def test_k8s_worker_never_surges_a_second_replica() -> None:
+
     """`replicas: 1` alone is not enough: a rolling update would surge a second pod.
 
     Two workers over one shared workspace base is the unverified N13 shape, and
@@ -249,6 +255,65 @@ def test_k8s_worker_never_surges_a_second_replica() -> None:
     stalled with `0/2 nodes are available: 1 Insufficient cpu`.
     """
     assert "  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 0\n" in K8S_WORKER
+
+
+def test_k8s_control_plane_stays_single_replica_until_node_registry_is_shared() -> None:
+    """Two control-plane replicas disagree about which nodes are healthy.
+
+    The node registry is per-process (`NodeRegistry._nodes` is an in-memory dict;
+    Redis carries only the quota ledger and the sandbox records), while a
+    worker's registration and heartbeats stick to whichever replica its HTTP
+    connection reaches. The replica that misses them ages the node past the
+    15-second `heartbeat_timeout` and marks it unhealthy. Measured on k0s on
+    2026-09-17: replica A said `fxf2j: unhealthy` while replica B said
+    `fxf2j: healthy`, for 12 consecutive samples -- which produced `502 Node ...
+    unavailable` route lookups, uneven placement, and `reap_unhealthy` treating
+    live sandboxes as orphans (a `404 Sandbox ... not found` in the smoke).
+    """
+    assert "\n  replicas: 1\n" in K8S_CONTROL_PLANE
+    assert "\n  replicas: 2\n" not in K8S_CONTROL_PLANE
+
+
+def _buildkit_configmap_payload() -> str:
+    """The buildkitd config exactly as the ConfigMap carries it (dedented)."""
+    marker = "  buildkitd.toml: |-\n"
+    assert marker in K8S_BUILDKIT, "buildkit ConfigMap must carry the file as a block scalar"
+    body = K8S_BUILDKIT.split(marker, 1)[1]
+    lines = []
+    for line in body.split("\n"):
+        if line.startswith("    "):
+            lines.append(line[4:])
+        else:
+            lines.append(line)
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def test_k8s_buildkit_config_is_the_compose_stack_config() -> None:
+    """The k8s builder must use the same config as the compose one.
+
+    Byte-exact, because the part that actually matters is the docker.io mirror
+    chain: this deployment host has Docker Hub closed, so a drifted (or missing)
+    mirror list turns every template build into a pull failure. Same pattern as
+    the seccomp profile's ConfigMap copy.
+    """
+    assert _buildkit_configmap_payload() == BUILDKIT_CONFIG
+
+
+def test_k8s_control_plane_is_paired_with_the_buildkit_sidecar() -> None:
+    """`Template.build` has no builder without this pair.
+
+    Measured on k0s 2026-09-17: with no buildkit anywhere in the manifest set,
+    the smoke's template phase ends in
+    `BuildException: buildkit build exited with code 1`. The sidecar shares its
+    socket volume with the control plane (an emptyDir is pod-scoped), which is
+    why the two are containers of one pod rather than two Deployments.
+    """
+    assert "E2B_BUILDKIT_ADDR\n              value: unix:///run/buildkit/buildkitd.sock\n" in K8S_CONTROL_PLANE
+    assert "\n        - name: buildkit\n" in K8S_CONTROL_PLANE
+    assert "      securityContext:\n        fsGroup: 1000\n" in K8S_CONTROL_PLANE
+    # The builder keeps the full syscall surface; the *worker* profile is the one
+    # that must stay narrowed.
+    assert "seccompProfile:\n              type: Unconfined\n" in K8S_CONTROL_PLANE
 
 
 # ----------------------------------------------------------------------------

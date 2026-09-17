@@ -12,6 +12,7 @@ resources:
   - namespace.yaml
   - pvc.yaml
   - redis.yaml
+  - buildkit.yaml
   - control-plane.yaml
   - gateway.yaml
   - seccomp-installer.yaml

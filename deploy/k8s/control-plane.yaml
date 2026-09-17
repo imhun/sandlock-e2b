@@ -4,7 +4,23 @@ metadata:
   name: control-plane
   namespace: sandlock
 spec:
-  replicas: 2
+  # ONE replica, matching the compose stack the rest of this manifest set mirrors.
+  # ⚠ The node registry is **per-process**: `NodeRegistry._nodes` is an in-memory
+  # dict and only the *quota ledger* and the *sandbox records* go through Redis
+  # (`control_plane/registry/nodes.py`, `redis_backend.py`). With two replicas
+  # behind the Service, a worker's registration and its 5-second heartbeats
+  # stick to whichever pod its HTTP connection reaches, so the other replica's
+  # view of that node ages past the 15-second `heartbeat_timeout` and it marks a
+  # perfectly healthy node `unhealthy`. Measured on k0s on 2026-09-17: replica A
+  # reported `fxf2j: unhealthy` while replica B reported `fxf2j: healthy`, for 12
+  # consecutive samples. Consequences seen live: `/internal/routes/<id>` served
+  # by the stale replica answers `502 Node ... unavailable` (one blip in a 30s
+  # window), placement only happens where the replica in question believes there
+  # is capacity, and `reap_unhealthy` (E6.1) treats live sandboxes on the
+  # "unhealthy" node as orphans -- which is what turned `deployment_smoke.py`'s
+  # route lookup into a `404 Sandbox ... not found`. Raise this back to >1 only
+  # after the node registry (health + addresses) is shared, not just its quotas.
+  replicas: 1
   selector:
     matchLabels:
       app: control-plane
@@ -13,6 +29,13 @@ spec:
       labels:
         app: control-plane
     spec:
+      # fsGroup 1000 exists for the buildkit sidecar: the emptyDir k8s creates
+      # for it is root-owned, while rootless buildkitd runs as the image's uid
+      # 1000 and must create its data directory *and* the unix socket inside it.
+      # Group ownership gives it that, and the root control-plane container reads
+      # the socket through the same volume (mounted read-only at /run/buildkit).
+      securityContext:
+        fsGroup: 1000
       # Z-F7 C1: this pod runs as root and exports template layout tars into
       # ``_images/_oci/`` on the shared PVC; the worker pods (65534) extract the
       # rootfs entries. Create the cache once with the worker's ownership before
@@ -128,13 +151,58 @@ spec:
               value: '{"py311": "registry.cn-shanghai.aliyuncs.com/byteplan/python:3.11-slim"}'
             - name: E2B_MAX_SANDBOXES
               value: "1000"
+            # Template.build talks to the buildkit sidecar below over a unix
+            # socket inside the shared `buildkit-data` emptyDir -- the same
+            # arrangement (and the same address) as the compose stack, which
+            # mounts the builder's socket volume read-only at /run/buildkit.
+            # Without it every `Template.build` fails; the k8s manifest set had
+            # no builder at all until 2026-09-17.
+            - name: E2B_BUILDKIT_ADDR
+              value: unix:///run/buildkit/buildkitd.sock
           volumeMounts:
             - name: shared
               mountPath: /var/lib/e2b-sandboxes
+            - name: buildkit-data
+              mountPath: /run/buildkit
+              readOnly: true
+        # The builder. Rootless buildkitd (uid 1000 of the image) keeps its
+        # socket inside its own data directory, which is why the control plane
+        # above mounts that same emptyDir read-only rather than a socket path of
+        # its own.
+        - name: buildkit
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/buildkit:rootless
+          securityContext:
+            # buildkit is a builder, not a sandbox: it legitimately needs the
+            # whole syscall surface (mount, clone, ...). It is also irrelevant to
+            # what a sandbox can do -- the *worker's* profile is the one that must
+            # stay narrowed (deploy/seccomp/sandlock-worker.json).
+            seccompProfile:
+              type: Unconfined
+            # NOT allowPrivilegeEscalation: false, however tempting: setting it
+            # makes the kubelet add no_new_privs, and rootlesskit then dies with
+            # `newuidmap ... failed: newuidmap: Could not set caps` because the
+            # kernel ignores newuidmap's setuid bit. Same mechanism the worker's
+            # manifest calls out for its file-capability brokers. The compose
+            # stack's buildkit container runs with the default (allowed), so this
+            # matches it.
+          volumeMounts:
+            - name: buildkit-data
+              mountPath: /home/user/.local/share/buildkit
+            - name: buildkit-config
+              mountPath: /home/user/.config/buildkit/buildkitd.toml
+              subPath: buildkitd.toml
+              readOnly: true
       volumes:
         - name: shared
           persistentVolumeClaim:
             claimName: sandbox-shared
+        # fsGroup 1000 (pod-level, below) is what lets the rootless builder write
+        # here: the emptyDir arrives root-owned, and the builder runs as uid 1000.
+        - name: buildkit-data
+          emptyDir: {}
+        - name: buildkit-config
+          configMap:
+            name: buildkitd-config
 ---
 apiVersion: v1
 kind: Service
