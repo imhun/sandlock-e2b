@@ -10,6 +10,7 @@ from pathlib import Path
 from gateway_common.env import registry_host
 from gateway_common.env import (
     _env_bool,
+    _env_float,
     _env_int,
     _env_json_dict,
     _env_json,
@@ -41,6 +42,20 @@ class Settings:
     envd_port: int = field(default_factory=lambda: _env_int("E2B_ENVD_PORT", 49983))
     warm_timeout_s: int = field(
         default_factory=lambda: _env_int("E2B_WARM_TIMEOUT_S", 180)
+    )
+    #: How long a worker's heartbeat may be silent before its node is marked
+    #: ``unhealthy`` (and, via E6.1, its sandboxes are treated as orphans).
+    #: 15s matches the historical hard-coded ``NodeRegistry`` default, which is
+    #: fine when every node's image rootfs is on local disk (a 0.3s extraction).
+    #: It is NOT fine when the node's image cache is a network filesystem: the
+    #: first use of a built template unpacks thousands of small files
+    #: (measured on Aliyun NAS 2026-09-17: 61s for a python-slim rootfs, 240x the
+    #: local-overlay 0.26s), and the worker resolves that rootfs *on its event
+    #: loop*, so it cannot heartbeat for minutes -- a healthy node then looks
+    #: dead and its live sandboxes get reaped. Raise this above the slowest
+    #: extraction the storage can produce.
+    node_heartbeat_timeout_s: float = field(
+        default_factory=lambda: _env_float("E2B_NODE_HEARTBEAT_TIMEOUT", 15.0)
     )
     executor: str = field(
         default_factory=lambda: os.getenv("E2B_EXECUTOR", "auto").lower()

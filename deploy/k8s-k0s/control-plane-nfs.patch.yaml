@@ -1,0 +1,27 @@
+# 这套集群的共享卷是网络文件系统，节点活性的 15 秒窗口撑不住。
+#
+# 为什么：worker 解析一个**冷**镜像 rootfs 时是在自己的事件循环上同步做的
+# （`envd_service/executors/sandlock.py::_ensure_instance_async` 只把 route-B 的
+# *实例创建*放进了线程；rootfs 解包发生在它之前）。本地盘上这是 0.3 秒，无感；
+# 阿里云 NAS 上实测同一份 python-slim rootfs（2111 个文件）**61 秒**，是本地
+# overlay 的 240 倍——本地构建的模板更久（实测一次模板沙箱的解析用了 3 分 35 秒）。
+# 这期间 worker 发不出心跳 ⇒ 控制面 15 秒后把健康节点判成 unhealthy ⇒
+# `reap_unhealthy`（E6.1）把**还活着**的沙箱当孤儿回收 ⇒ 该沙箱的 route-B 槽位被
+# 释放、exec 报 `route-B instance … is closed`，客户端看到的是 deadline 超时。
+#
+# 300 秒取自实测：要覆盖一次 3 分 35 秒的 rootfs 解析并留出余量。
+# ⚠ 这是缓解措施，不是根治：真正该修的是 ① 那次 rootfs 解析不要跑在事件循环上
+# （或心跳独立于循环），② 「只是漏心跳」不该回收槽位。见 docs/task-backlog.md N18。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: sandlock
+spec:
+  template:
+    spec:
+      containers:
+        - name: control-plane
+          env:
+            - name: E2B_NODE_HEARTBEAT_TIMEOUT
+              value: "300"

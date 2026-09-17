@@ -311,7 +311,10 @@ def create_app(
     app.state.snapshots = snapshots_registry or SnapshotRegistry(
         (workspace_base or settings.workspace_base)
     )
-    app.state.nodes = nodes_registry or NodeRegistry(redis_client=redis_client)
+    app.state.nodes = nodes_registry or NodeRegistry(
+        redis_client=redis_client,
+        heartbeat_timeout=settings.node_heartbeat_timeout_s,
+    )
     app.state.recent_failures = SlidingWindowCounter()
     app.state.templates = templates_registry or TemplateRegistry(
         (workspace_base or settings.workspace_base) / "_templates"
