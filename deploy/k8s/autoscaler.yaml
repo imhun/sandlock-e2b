@@ -65,13 +65,22 @@ spec:
             - name: E2B_AS_K8S_DEPLOYMENT
               value: e2b-worker
             - name: E2B_AS_MIN_REPLICAS
-              value: "1"
+              # Two, like the compose stack: worker-1 and worker-2 always run. With
+              # MIN=1 the autoscaler drains one of the two worker replicas as soon
+              # as the fleet is idle, which is correct for an autoscaler but not the
+              # shape this manifest set is verified in (and a drained node keeps
+              # `draining: true` until it re-registers, so the next placement round
+              # silently loses half the fleet).
+              value: "2"
             - name: E2B_AS_MAX_REPLICAS
-              # N13: the multi-replica shape has never been verified -- one
-              # shared RWX base means every worker reconciles and GCs a tree set
-              # it does not own (the uid allocator itself is cross-process safe,
-              # but per-pod reconcile authority over that base is not
-              # established). Raise this only after N13 is closed on a real
-              # cluster, and with the per-pod workspace layout that goes with
-              # it. See docs/k8s-deployment.md §5/§8 and docs/task-backlog.md.
-              value: "1"
+              # N13 closed 2026-09-17 (docs/k8s-deployment.md §13): two workers
+              # over one shared base were verified on a real cluster -- the
+              # reconciling worker protected every tree the fleet still owned
+              # (`protected_elsewhere=4`) and deleted none, the replicas were
+              # handed disjoint host uids, and the surviving worker's sandboxes
+              # kept working across a peer restart.
+              # ⚠ Precondition: the shared storage's locks must reach across
+              # nodes (NFSv4; NFSv3 + `nolock` is single-node only). The uid
+              # pool's flock is what makes two replicas safe together, and a
+              # cluster whose locks are local can hand out the same uid twice.
+              value: "16"

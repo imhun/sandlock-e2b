@@ -4,15 +4,24 @@ metadata:
   name: e2b-worker
   namespace: sandlock
 spec:
-  replicas: 1
-  # Never brief the unverified two-replica shape into existence (docs/task-backlog.md
-  # N13). A default rolling update surges a second pod before deleting the old one,
-  # so for the length of every upgrade two workers reconcile and GC one shared
-  # workspace base -- exactly what `replicas: 1` + the autoscaler's MAX=1 are there
-  # to prevent. On a 4-core node the surge also cannot even schedule: the worker
-  # requests 2 CPU, so the rollout stalled with
-  # `0/2 nodes are available: 1 Insufficient cpu` (measured 2026-09-17 on k0s).
-  # maxSurge 0 deletes first, creates second: one worker at a time, always.
+  # Two replicas: the shape the compose stack runs (worker-1 + worker-2) and the
+  # one verified on a real cluster once N13 closed (docs/k8s-deployment.md §13).
+  # More than one worker over one shared workspace base is safe because a
+  # reconciling worker asks the control plane for the *fleet-wide* sandbox set
+  # before it deletes anything: it removes only what nobody owns and leaves the
+  # rest (`protected_elsewhere`), and it defers the whole disk sweep when that
+  # fleet view cannot be established. Measured: a restarted worker saw all four
+  # live trees as unowned, protected all four, and deleted none.
+  # ⚠ The storage must provide locks that reach across nodes -- NFSv4 (or any
+  # server-side locking), NOT NFSv3 with `nolock`, whose locks are single-node
+  # only. The uid pool's flock on `<base>/.uid_pool.lock` is what keeps two
+  # replicas from handing out the same host uid (docs/k8s-deployment.md §10.3 F5).
+  replicas: 2
+  # maxSurge 0 is about capacity, not about hiding the multi-replica shape: this
+  # deployment has no `requests`, so Kubernetes copies the 2-CPU limit into the
+  # request, and a surge pod cannot even schedule on a 4-core node -- measured
+  # 2026-09-17 on k0s, where a rollout stalled with
+  # `0/2 nodes are available: 1 Insufficient cpu`. Delete first, create second.
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -249,11 +258,11 @@ spec:
             # cross-process safe on a shared base (`uid_pool.acquire` takes an
             # flock on `<base>/.uid_pool.lock` and recomputes the free set from
             # every `sandbox.json` plus the reservation markers, so two pods
-            # sharing this PVC do not hand out the same uid) -- but the
-            # *multi-replica* shape as a whole is unverified (per-pod reconcile
-            # authority and GC over one shared base), so `replicas` stays 1 and
-            # the autoscaler is capped at 1 until N13 is closed on a real
-            # cluster. See docs/task-backlog.md N13.
+            # sharing this PVC do not hand out the same uid). The *multi-replica*
+            # shape as a whole is now verified (N13 closed 2026-09-17, see
+            # docs/k8s-deployment.md §13), so no per-pod segments are needed --
+            # but the flock above is only real if the storage's locks cross
+            # nodes (NFSv4; NFSv3 + `nolock` is single-node only).
             - name: E2B_BASE_IMAGE
               # Keep in step with control-plane.yaml (same digest-pinned ACR
               # mirror; Docker Hub is unreachable from the deployment hosts).

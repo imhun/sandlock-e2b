@@ -219,15 +219,16 @@ def test_k8s_runs_the_same_namespace_shape_as_the_stack() -> None:
     assert 'E2B_PID_NS' in STACK_COMPOSE
 
 
-def test_k8s_stays_single_replica_until_n13_is_closed() -> None:
-    """N13: the multi-replica shape is unverified, so nothing may reach it.
+def test_k8s_runs_the_verified_multi_replica_worker_shape() -> None:
+    """N13 closed 2026-09-17: >1 worker on one shared base is the supported shape.
 
-    The uid allocator itself is cross-process safe on a shared base
-    (`uid_pool.acquire` flocks `<base>/.uid_pool.lock` and recomputes the free
-    set from every `sandbox.json` plus the reservation markers), but every
-    worker on one shared base also reconciles and GCs a tree set it does not
-    own, and that is not established. Until it is, the autoscaler may not raise
-    the replica count -- which is what this pins.
+    `deploy/scripts/multiworker_interference.py` is the evidence: two workers, four
+    sandboxes spread across them, disjoint pooled host uids, and then a worker
+    restart, after which all four trees were still on the shared base (none deleted
+    by the reconciling worker), its summaries showed `protected_elsewhere=4`, the
+    surviving worker's sandboxes still ran, and both workers' reservations returned
+    to zero. What this pins is that the manifests actually run that shape and do not
+    creep back to a single replica with an autoscaler that cannot follow.
     """
     autoscaler = (REPO / "deploy" / "k8s" / "autoscaler.yaml").read_text(
         encoding="utf-8"
@@ -236,23 +237,28 @@ def test_k8s_stays_single_replica_until_n13_is_closed() -> None:
     assert marker in autoscaler
     # The value sits a few comment lines below the name, so read forward rather
     # than requiring the two to be adjacent.
-    following = autoscaler[autoscaler.index(marker):][:600]
-    assert 'value: "1"' in following
-    assert 'value: "16"' not in following
-    assert "\n  replicas: 1\n" in K8S_WORKER
+    following = autoscaler[autoscaler.index(marker):][:1200]
+    assert 'value: "16"' in following
+    assert "\n  replicas: 2\n" in K8S_WORKER
+    # ...and the floor matches the compose stack's two always-on workers, so the
+    # autoscaler does not drain half the fleet whenever the queue is empty.
+    assert 'name: E2B_AS_MIN_REPLICAS' in autoscaler
+    min_section = autoscaler[autoscaler.index("name: E2B_AS_MIN_REPLICAS"):][:600]
+    assert 'value: "2"' in min_section
+    # The precondition that makes the shape safe has to stay written down where the
+    # value is: locks that reach across nodes. NFSv3 + `nolock` would let two
+    # replicas hand out the same host uid.
+    assert "nolock" in following
 
 
-def test_k8s_worker_never_surges_a_second_replica() -> None:
+def test_k8s_worker_replaces_rather_than_surges_on_rollout() -> None:
+    """maxSurge 0 is a capacity property of this manifest, not a shape guard.
 
-    """`replicas: 1` alone is not enough: a rolling update would surge a second pod.
-
-    Two workers over one shared workspace base is the unverified N13 shape, and
-    the repo locks it off by pinning the worker to one replica and the autoscaler
-    to MAX=1 -- but the default rolling-update strategy creates a replacement pod
-    *before* deleting the old one, so every upgrade would briefly run the exact
-    shape those two pins exist to prevent. It also cannot schedule on a 4-core
-    node (the worker requests 2 CPU): measured 2026-09-17 on k0s, the rollout
-    stalled with `0/2 nodes are available: 1 Insufficient cpu`.
+    This Deployment has no `requests`, so Kubernetes copies its 2-CPU limit into
+    the request; a surge pod therefore cannot schedule on a 4-core node -- measured
+    2026-09-17 on k0s, where a rollout stalled with
+    `0/2 nodes are available: 1 Insufficient cpu`. Delete-then-create keeps upgrades
+    working on small nodes.
     """
     assert "  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 0\n" in K8S_WORKER
 

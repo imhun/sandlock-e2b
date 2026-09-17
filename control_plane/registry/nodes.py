@@ -131,6 +131,19 @@ class NodeRecord:
         }
 
 
+#: How recently a node must have heartbeated to be *given new work*.
+#:
+#: Deliberately separate from ``heartbeat_timeout``, which decides when a node's
+#: sandboxes are treated as orphaned -- that window is generous on purpose,
+#: because wrongly orphaning a live sandbox takes its slot away (the lesson from
+#: the N18 investigation). Handing new work to a node that is actually gone costs
+#: the caller a 502 instead, so this window is short: the worker heartbeats every
+#: 5s, so 15s is three missed beats. Measured on k0s 2026-09-17 with one shared
+#: threshold (300s): restarting a worker left roughly a minute in which the dead
+#: node was still "healthy" by the orphan definition, so creates were placed on
+#: it and answered ``502 Node <id> unavailable``.
+PLACEMENT_MAX_HEARTBEAT_AGE_S = 15.0
+
 class NodeRegistry:
     def __init__(
         self,
@@ -345,12 +358,19 @@ class NodeRegistry:
         """
         with self._lock:
             self._sweep_health_locked()
+            now = time.time()
             candidates = [
                 n
                 for n in self._nodes.values()
                 if n.status == "healthy"
                 and n.node_id != exclude_node_id
                 and not n.draining
+                # Fresh enough to be given work. The in-process node never
+                # heartbeats itself, so it is exempt like it is in the sweep.
+                and (
+                    n.address == "local://"
+                    or now - n.heartbeat_at <= PLACEMENT_MAX_HEARTBEAT_AGE_S
+                )
                 and n.can_fit(memory_mb, cpu_percent, disk_mb, processes)
             ]
             node = pick_best(

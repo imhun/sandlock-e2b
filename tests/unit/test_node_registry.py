@@ -40,6 +40,63 @@ def test_heartbeat_timeout_marks_unhealthy():
     assert registry.get("node_a").status == "healthy"
 
 
+def _reserve(registry):
+    return registry.select_and_reserve(
+        base_image=None,
+        memory_mb=128,
+        cpu_percent=10,
+        disk_mb=128,
+        processes=8,
+    )
+
+
+def test_a_node_that_missed_recent_heartbeats_is_not_given_new_work():
+    """Placement freshness is a separate, shorter window than the orphan one.
+
+    The orphan window (``heartbeat_timeout``) has to stay generous -- wrongly
+    orphaning a live sandbox takes its slot away (the N18 lesson) -- but a node
+    that has gone quiet must stop receiving *new* sandboxes long before that, or
+    every create placed on it answers `502 Node ... unavailable` until the wide
+    window elapses. Measured on k0s 2026-09-17 with a single 300s threshold:
+    restarting a worker produced about a minute of exactly that.
+    """
+    registry = NodeRegistry(heartbeat_timeout=300.0)  # the wide orphan window
+    record = registry.register(
+        node_id="node_slow",
+        address="http://127.0.0.1:49983",
+        total_memory_mb=1024,
+        total_cpu_percent=200,
+        total_disk_mb=2048,
+        total_processes=128,
+    )
+    assert _reserve(registry) is not None
+
+    # Quiet for a minute: still "healthy" by the orphan definition (so its live
+    # sandboxes are safe), but no longer eligible for new work.
+    record.heartbeat_at = time.time() - 60
+    assert registry.get("node_slow").status == "healthy"
+    assert _reserve(registry) is None
+
+    # One heartbeat and it is eligible again.
+    registry.heartbeat("node_slow")
+    assert _reserve(registry) is not None
+
+
+def test_the_in_process_node_is_exempt_from_the_placement_window():
+    """`local://` never heartbeats itself, so it must not age out of placement."""
+    registry = NodeRegistry(heartbeat_timeout=300.0)
+    record = registry.register(
+        node_id="local",
+        address="local://",
+        total_memory_mb=1024,
+        total_cpu_percent=200,
+        total_disk_mb=2048,
+        total_processes=128,
+    )
+    record.heartbeat_at = time.time() - 3600
+    assert _reserve(registry) is not None
+
+
 def test_reservation_and_release():
     registry, record = _node(total_memory_mb=1024)
     assert record.can_fit(512, 100, 1024, 64)

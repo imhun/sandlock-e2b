@@ -112,7 +112,7 @@ kubectl -n $NS set image ds/seccomp-installer installer=<REGISTRY>/byteplan/e2b-
 | per-sandbox netns | **开** | **开**（2026-09-17 对齐，N5 关闭） | 一致：沙箱自有 netns，只见 `lo` |
 | 低端口 sysctl | 已撤 | **已撤**（2026-09-17，N5 的配套） | 两边都没有了；顺带关掉了「pod 内任何进程都能绑低端口」这个与沙箱无关的口子 |
 | pid_ns | **开**（2026-09-16 全量） | **开**（2026-09-17 对齐，N10 关闭） | 一致：`kill(pid,0)` 不再是同 pod 进程的存在性探针 |
-| 沙箱身份 | 每沙箱独立 host uid（两 worker 用不重叠段 10000/11000） | 每沙箱独立 host uid（段默认相同，但**共用一个 base ⇒ 共用一个分配器**：`uid_pool.acquire` 先 flock `<base>/.uid_pool.lock`，再按全部 `sandbox.json` + 预约标记重算空闲集 ⇒ 副本之间**不会**发同一个 uid） | 见 §8 的 N13 更正：分配器本身是跨进程安全的；**未验证的是同一 base 上多副本各自的 reconcile/GC 权限**，因此 autoscaler 上限先锁 1 |
+| 沙箱身份 | 每沙箱独立 host uid（两 worker 用不重叠段 10000/11000） | 每沙箱独立 host uid（段默认相同，但**共用一个 base ⇒ 共用一个分配器**：`uid_pool.acquire` 先 flock `<base>/.uid_pool.lock`，再按全部 `sandbox.json` + 预约标记重算空闲集 ⇒ 副本之间**不会**发同一个 uid） | 已验（§13）：真集群上 4 个沙箱分布在两个副本、磁盘读出的宿主 uid 互不相同。**前置是锁跨节点**（NAS 上只有 NFSv4.0 成立），autoscaler 上限 2026-09-17 起放开到 16 |
 | route B（槽位） | 每沙箱一个 `sandlock-supervise --uid <槽位>` | 同（`E2B_PRIV_HELPERS=auto`，非 root pod 用镜像里的 file-cap broker） | 一致；broker 依赖上面那 4 个 cap 在**bounding set** 里 |
 | 配额 | stack 内 quota-agent（`E2B_QUOTA_AGENT_URL`），XFS prjquota 已开 | **无 agent 清单 → 降级**（无 per-sandbox 磁盘硬限，一条 WARNING） | 口径写在 §2.4.4；要真配额就把 agent 指到集群内/外（k8s 共享卷是 RWX/NFS，本地直连不可能） |
 | seccomp | 容器 `seccomp=<deploy/seccomp/sandlock-worker.json>`（compose 直接引用文件） | `Localhost` profile + DaemonSet 安装器 | 语义相同；k8s 多了"每节点装文件"这一步（§2） |
@@ -208,8 +208,9 @@ python3 deploy/scripts/multinode_smoke.py
 | 端口带水位 | `GET /nodes`（`X-API-Key`）里 `mcpPortsInUse`/`mcpPortsCapacity` | 随 MCP 沙箱数涨落；接近 4535 才需要动作（§2.9） |
 | 配额 | 有 agent 时：`/detect` 的 `prjquota`；`/report` 每项目 `hard_blocks` | 无 agent（本清单默认）时是**降级**，只有一条启动 WARNING |
 
-**D. 多副本（autoscaler 提到 >1）之前必须做的**：解决 §3 表里那条 uid 池重叠（N13），
-并确认 PDB `minAvailable: 1` 与 `terminationGracePeriodSeconds: 120` 对滚动更新的行为符合预期。
+**D. 多副本（autoscaler 提到 >1）之前必须做的**：~~解决 §3 表里那条 uid 池重叠（N13）~~
+✅ 2026-09-17 已收口（§13）：真集群验证了两副本共用一份 base 不互相破坏，清单上限已放开。
+仍待确认的是 PDB `minAvailable: 1` 与 `terminationGracePeriodSeconds: 120` 对滚动更新的行为。
 
 ---
 
@@ -245,7 +246,7 @@ Landlock 要 5.13+），且 `user.max_user_namespaces = 0` ⇒ `unshare -U` 直�
 | ~~N4~~ | ~~seccomp 安装器未在真实集群验证~~ | ✅ **2026-09-17 已在 main(ACK) 验证**：安装器 5 个真节点全部写入、带 Localhost profile 的 pod 实测 `Seccomp: 2`。两条附带结论：profile 里含该内核没有的 syscall 名**不影响加载**（跨内核可移植）；虚拟节点会 `NotSupport` 导致 DS 永不收敛 —— 已加 `nodeAffinity` 修复（commit `235fc34`） |
 | ~~N5~~ | ~~k8s 是否切 per-sandbox netns~~ | ✅ 2026-09-17 已切（§5），**待真实集群按 §6 复验** |
 | ~~N10~~ | ~~k8s 是否开 pid_ns~~ | ✅ 2026-09-17 已切（§5），同上待复验；节点仍需允许非特权 userns（这依赖本来就存在） |
-| N13 | **多副本形态整体未验证**。~~uid 池重叠~~ 已更正：两个 pod 共用同一 base 时**共用同一个分配器**（`uid_pool.acquire` flock + 按全部 `sandbox.json`/预约标记重算），不会发同一个 uid。真正的未知是**同一 base 上各副本的 reconcile/GC 权限** —— 一个 worker 会不会动到另一个 worker 的活树 | 已先**把上限锁住**：worker `replicas: 1` + autoscaler `E2B_AS_MAX_REPLICAS=1`，并有清单用例钉住；打开前需在真实集群验证（per-pod 子卷 + 段划分一起做） |
+| ~~N13~~ | ~~**多副本形态整体未验证**~~。~~uid 池重叠~~ 已更正：两个 pod 共用同一 base 时**共用同一个分配器**（`uid_pool.acquire` flock + 按全部 `sandbox.json`/预约标记重算），不会发同一个 uid。真正的未知是**同一 base 上各副本的 reconcile/GC 权限** | ✅ **2026-09-17 已收口（§13）**：`deploy/scripts/multiworker_interference.py` 在真集群跑通 —— 重启一个 worker 后它把舰队仍拥有的 4 棵活树全判 `protected_elsewhere=4`、`deleted=0`，4 棵树都在，幸存 worker 的沙箱照常读写。清单从 `replicas: 1`+MAX=1 改为 `replicas: 2`+MIN=2/MAX=16；前置是锁跨节点（NAS 只有 NFSv4.0 成立）。路上另修「死节点仍被派活 ⇒ 502」。衍生缺口见 N20/N21 |
 | — | k8s 无 quota-agent 清单（口径=降级，§2.4.4） | 有真实 k8s + XFS/NFS 环境时补清单（agent 形态对 NFS 才是唯一可行路径） |
 
 ---
@@ -379,9 +380,11 @@ k0s 的 containerd socket（`/run/k0s/containerd.sock`）与 docker 的互不相
 | **F8** | **默认容量只放得下 1 个沙箱**（README 的 F8 早有记载，这里是 k8s 侧的复现）：`E2B_NODE_PROCESSES=256` == 单沙箱默认 256，`can_fit` 按整箱预留 | 第 3 个 `Sandbox.create()` 报 `503: No resources available`。**处置**：overlay 把 `E2B_NODE_*` 抬到 4096/400/8192/1024（与生产 `.env` 同值），并把 pod 的 requests/limits 显式拆开（基线把 `limits` 当 requests=2 CPU，滚动更新因此停在 `0/2 nodes are available: 1 Insufficient cpu`；基线的 `replicas: 1` 也补了 `maxSurge: 0`，见下） |
 | **F9** | 部署主机**不通 Docker Hub**（`registry-1.docker.io` / `auth.docker.io` 全关），而基线 redis 引用的是 `redis:7-alpine` | 清单里的 redis 改成 ACR 镜像（多架构 arm64+amd64，redis 8.10.1，与 compose 用的是同一大版本）；`E2B_BASE_IMAGE` 也从 `python:3.14-slim` 换成生产同款 digest-pinned ACR 镜像。ACR 支持**匿名拉取**（实测 token 流程 200），所以 pod 不需要 imagePullSecret |
 
-顺带修进基线的两条（不在上表）：① `worker.yaml` 的 `replicas: 1` 现在是
-`strategy.maxSurge: 0`——默认滚动更新会先起第二个 pod，那正是 N13 说「未验证」的
-双副本共享 base 形态，而且 4 核节点上根本排不下；② 明文占位密钥（`local-key` /
+顺带修进基线的两条（不在上表）：① `worker.yaml` 当时把 `replicas` 钉在 1 并加
+`strategy.maxSurge: 0`——默认滚动更新会先起第二个 pod，那正是当时「未验证」的
+双副本共享 base 形态，而且 4 核节点上也排不下。**N13 收口（§13）后 `replicas` 已放开到 2，
+`maxSurge: 0` 保留但理由换成容量**（这个 Deployment 没有 `requests`，Kubernetes 会把 2 CPU
+的 limit 复制成 request）；② 明文占位密钥（`local-key` /
 `internal-key` / 无口令 redis）改成 `e2b-secrets` Secret + `--requirepass`，缺 Secret 时
 pod 停在 `CreateContainerConfigError` 而不是静默用一个公共 key。
 
@@ -392,7 +395,7 @@ pod 停在 `CreateContainerConfigError` 而不是静默用一个公共 key。
 | §6 A 起没起来 | ✅ | worker 自检 `seccomp self-check: filter mode active, user namespaces allowed`；pod 内 `/proc/1/status` `Seccomp: 2`、`Seccomp_filters: 1`；安装器在 `.94` 写入 `/var/lib/k0s/kubelet/seccomp/sandlock-worker.json (13147 bytes)`；PVC `Bound`（50Gi RWX，静态绑定 NAS PV）；seccomp DaemonSet 2/2 |
 | §6 C 形态证据 | ✅（单节点） | 箱内 `id -u`=0；`socket.if_nameindex()` 只有 `lo`（N5 per-sandbox netns）；`kill(1,0)`=ok（N10 per-sandbox pid ns）；宿主侧落盘 `drwxrwx--- 10000:nogroup`（owner=池 uid 10000、group=worker gid 65534、0770，即 c1 模型） |
 | §6 B 应用冒烟 | ✅ **2026-09-17 全绿** | `deployment_smoke.py`：跨节点分布、经 gateway 的命令与文件、**跨节点迁移且共享 workspace 文件保留**、网络配置回显与原子更新、远端卷挂载与兄弟卷隔离、**模板构建 → worker 拉取 → 镜像 rootfs**、**箱内 MCP 经代理**、kill 后预留归零 —— 整轮 **20.6 秒**。`multinode_smoke.py`（4 个沙箱 2+2 跨两节点）**8.7 秒** 通过。两条冒烟都要求在途 ≥2 个健康 worker |
-| 多副本 N13 | 🟡 **首次跑起来了，但未收口** | 两个 worker 副本同时跑在一份共享 base 上（`replicas: 2`，autoscaler 停在 0 以免它按 `E2B_AS_MAX_REPLICAS=1` 缩回去）。观察到的都是好信号：两条冒烟全绿、跨节点迁移保留文件、两个 worker 的 `reconcile summary` 都是 `deleted=0 delete_failures=0 protected_elsewhere=0 untrusted_records=[]`（**没有互相动对方的活树**）、kill 后两边预留都归零。**但这还不算证明**：清单仍按 N13 的约定把 `replicas: 1` + autoscaler MAX=1 钉死（`tests/unit/test_worker_manifest_permissions.py`），要放开得先做 per-pod 子卷/段划分与一轮专门的交叉干扰用例 |
+| 多副本 N13 | ✅ **2026-09-17 已收口（见 §13）** | 判据脚本 `deploy/scripts/multiworker_interference.py` 在真集群跑通：4 个沙箱 2+2 跨两个 worker、**磁盘上读出的宿主 uid 互不相同**（`[10000, 10001, 10002, 10006]`）、**重启一个 worker 后 4 棵树全在**（起手 reconcile 把舰队仍拥有的 4 棵全判 `protected_elsewhere=4`、`deleted=0`）、幸存 worker 的沙箱文件读写照旧、两侧预留归零。清单已解除 pin（worker `replicas: 2`、autoscaler MIN=2/MAX=16），前置是共享存储的锁必须跨节点（NAS 上只有 NFSv4.0 成立）。路上另修「控制面把死节点当活节点派活 ⇒ 502」（放置改用 15 秒的独立窗口） |
 
 ### 10.5 下一步
 
@@ -404,7 +407,8 @@ pod 停在 `CreateContainerConfigError` 而不是静默用一个公共 key。
      `calico.mode: vxlan`（或 ipip）。VXLAN 与 IP-in-IP 在这两个节点之间都通
      （手工隧道实测 0% 丢包），且节点间只出现安全组已放行的 `172.18.x`。
      代价：封装开销、MTU 降、Pod 网段重建。
-2. 撤掉临时 taint，把 `e2b-worker` 拉到 2 副本，按 §6 复跑 A/B/C 并开始 **N13**。
+2. ~~撤掉临时 taint，把 `e2b-worker` 拉到 2 副本，按 §6 复跑 A/B/C 并开始 **N13**。~~
+   ✅ 已做（2026-09-17）：Calico 换完（§11）后 A/B/C 全绿，N13 在 §13 收口。
 3. 收尾遗留：worker 的稳定 node id（F7）、v3/nolock 与 v4 的锁语义差异要不要写进
    存储选型门槛、以及 F4 那条「非 root worker 与网络文件系统不兼容」是否要升级成
    基线的显式约束。
@@ -482,6 +486,9 @@ kill 后预留归零）。剩下的第 5/6 阶段：模板构建现在能跑通�
 `E2B_PER_SANDBOX_UID is enabled on a root worker without CAP_SYS_PTRACE` 的告警，
 root worker 形态可能需要补 `CAP_SYS_PTRACE`）。
 
+**后续（2026-09-17）**：上面那条模板超时在 §12 收口；多副本形态（N13）在 §13 收口 ——
+清单已从"钉死单副本"改成 `replicas: 2` + autoscaler MIN=2/MAX=16，并有专门判据脚本。
+
 ---
 
 ## 12. 收口 N18：(c) 解到节点本地 + (a) 不在事件循环上解（2026-09-17）
@@ -539,3 +546,105 @@ deployment_smoke.py  20.6 s  OK: 跨节点分布 / 命令+文件 / 迁移保留�
 multinode_smoke.py    8.7 s  4 个沙箱 2+2 跨两节点，命令+文件+健康+stdin 全通过
 DEPLOYMENT SMOKE OK / MULTI-NODE SMOKE OK
 ```
+
+---
+
+## 13. 收口 N13：多副本 worker 共用一份 base 不互相破坏（2026-09-17）
+
+### 13.1 N13 到底在问什么
+
+`E2B_WORKSPACE_BASE` 是**所有 worker 副本共用**的一份存储，所以每个 pod 的 reconcile 都会
+走到**别人建的树**上。要证明的只有一件事：**一个 worker 的 reconcile/GC 不会动到另一个
+worker 的活树**。判据（不再靠"看起来没出事"）：
+
+1. 至少两个**真有 Running pod 撑着**的 worker；
+2. 建的沙箱要**跨 ≥2 个 worker**分布，否则测的还是一条流水线；
+3. 每个树的宿主 uid 从**磁盘上**读出来，**互不相同**、且都不是 worker 自己的身份；
+4. 重启一个 worker（逼它做一次**起手 reconcile**，而共享 base 上全是别人的活树），
+   事后断言 **4 棵树都还在**、幸存 worker 的沙箱**仍能读写自己的文件**、
+   重启者的 reconcile 摘要 **`deleted=0`**；
+5. 全杀掉后两个 worker 的预留都归零。
+
+### 13.2 判据脚本与证据
+
+新增 `deploy/scripts/multiworker_interference.py`（需要一个集群的 kubectl 来重启 pod 与读日志；
+`--no-restart` 只跑 1/2/5 阶段，不碰集群）。真集群一整轮的输出：
+
+```
+OK: 2 workers healthy and pod-backed
+SANDBOX DISTRIBUTION: {'85-qfmwd': 2, '85-xd4tf': 2}
+OK: 4 sandboxes spread over 2 workers
+OK: distinct pooled host uids, none of them the worker's: [10000, 10001, 10002, 10006]
+== restarting e2b-worker-799b78bc85-qfmwd (forces a startup reconcile)
+OK: both workers healthy and pod-backed again
+OK: all 4 trees still on the shared base (no cross-deletion)
+OK: every sandbox on a surviving worker still runs with its file intact
+NOTE: 2 sandbox(es) lost their route when their worker restarted (N20, not an N13 failure)
+OK: reconcile summaries show deleted=0 (protected_elsewhere=4, unmaterialised=2,
+    disk_sweep_skipped=0 across 1 round(s))
+after kill reservations: {'85-qfmwd': 0, '85-xd4tf': 0, '85-q8p75': 0}
+MULTI-WORKER INTERFERENCE OK        # 3 分 23 秒
+```
+
+读法：重启的那个 worker 换了 node id（= pod 名），于是它**看不到任何一份自己名下的记录**，
+共享 base 上 4 棵活树对它全都"无主"。它的起手 reconcile 把这 4 棵全部判为
+`protected_elsewhere=4`、**一棵没删** —— 这正是 N13 要的结论：护栏认的是**舰队全集**
+（`deletable = candidates - fleet_owned`），不是本 pod 的记忆。
+
+同一轮的两条冒烟（清单已是 `replicas: 2` 的多副本形态）：
+
+```
+deployment_smoke.py  45.9 s  OK: 跨节点分布 / 命令+文件 / 迁移保留文件 / 网络配置 /
+                               远端卷隔离 / 模板构建→worker 拉取→镜像 rootfs /
+                               箱内 MCP 经代理 / kill 后预留归零
+multinode_smoke.py    7.8 s  4 个沙箱 2+2 跨两节点，命令+文件+健康+stdin 全通过
+DEPLOYMENT SMOKE OK / MULTI-NODE SMOKE OK
+```
+
+### 13.3 清单解除 pin
+
+N13 之前基线是钉死单副本的（`deploy/k8s/worker.yaml` `replicas: 1` + autoscaler
+`E2B_AS_MAX_REPLICAS=1`，由单测钉住）。现在改回与 compose 相同的形态：
+
+* `worker.yaml` `replicas: 2`，注释写明前置（跨节点锁）而不是"隐藏多副本"；
+* `autoscaler.yaml` `E2B_AS_MIN_REPLICAS=2` / `E2B_AS_MAX_REPLICAS=16`；
+  MIN 提到 2 是因为 **`draining: true` 是粘性的**（只有该节点重新注册才会清），
+  空闲时缩到 1 会让"下一次扩容"先撞上一个被 drain 掉的节点，等于悄悄丢半个舰队；
+* `strategy.maxSurge: 0` **保留**，但理由换成**容量**：这个 Deployment 没有 `requests`，
+  Kubernetes 会把 2 CPU 的 limit 复制成 request，surge pod 在 4 核节点上根本排不下
+  （实测 `0/2 nodes are available: 1 Insufficient cpu`）；
+* 单测相应改名并改断言：`test_k8s_runs_the_verified_multi_replica_worker_shape`、
+  `test_k8s_worker_replaces_rather_than_surges_on_rollout`（22 passed）。
+
+**前置是存储的锁必须跨节点**：uid 池靠 `<base>/.uid_pool.lock` 的 flock 互斥，
+阿里云 NAS 上只有 **NFSv4.0** 成立（v3+`nolock` 只是**本地**锁，跨节点不互斥 ⇒ 两个副本
+可能发出同一个 uid）。这条已写进清单注释，别在 v3/`nolock` 的存储上照抄这份形态。
+
+⚠ **镜像 tag 的坑（收口这轮实测踩到）**：`deploy/k8s-k0s/apply.sh` 会把**所有**
+`byteplan/e2b-sandlock-*` 的 tag 统一替换成 `deploy/stack/.version` 里的那一个字符串，
+所以本轮为了带上 N18 与放置窗口两处改动，worker 与 control-plane 各自推了**不同**的 tag
+（worker `0.1.0-n18split-20260917-1920`、control-plane `0.1.0-n13-20260917-2010`），
+再用 `kubectl set image` 指过去。**下次直接 `apply.sh` 会把这两个 tag 复位成 `.version`**
+（一个更早的版本），要么先跑 `deploy/scripts/build-and-push.sh` 生成一套一致的 tag 写进
+`.version`，要么 apply 之后再用 `kubectl set image` 指回来。
+
+### 13.4 收口过程中另外修掉/新发现的问题
+
+**修掉（真集群暴露，本轮改）**：控制面把**已经死掉的节点**当健康节点继续派活 ⇒ 建箱返回
+`502 Node <id> unavailable`。根因是**孤儿判定窗口被复用成了放置窗口**：overlay 为了让共享
+存储上的慢心跳不至于误判孤儿，把 `E2B_NODE_HEARTBEAT_TIMEOUT` 设成 300 秒，而这个窗口
+同时决定"还要不要往它上面放"。修法是在 `control_plane/registry/nodes.py` 里**另立**一个短窗口
+`PLACEMENT_MAX_HEARTBEAT_AGE_S = 15.0`（worker 每 5 秒心跳 ⇒ 三次缺席即停派；`local://`
+在进程内节点上豁免，和 sweep 一致），只影响**放置**，不影响孤儿判定（错误孤儿会抢走活沙箱的
+槽位，那是 N18 的教训）。单测见 `tests/unit/test_node_registry.py`。
+
+**新登记（未修，见 `docs/task-backlog.md`）**：
+
+* **N20** —— worker 重启后 **node id 变了**（pod 名），它从共享 base 上认领回来的沙箱记录
+  仍指向旧 id，控制面路由不到（表现 `Node unavailable: All connection attempts failed`），
+  要等 TTL。上面那两条 `NOTE: … lost their route` 就是它。**别**用 worker 上报的本地运行时
+  去推断归属 —— 那个列表里含共享 base 上**所有**树（`_reconcile_with_control_plane` 注释写明），
+  当成归属声明就会**偷走别人的沙箱**。方向：稳定 node id（StatefulSet）或让 worker 给出
+  "本节点真的在跑"的证据。
+* **N21** —— 共享 base 上跑 reconcile 扫描时，worker 会长时间不响应文件 API
+  （代码注释记的 24 秒空闲 / 43 秒负载下），与 N18(a) 同族（重活在事件循环上）。

@@ -87,14 +87,30 @@ spec:
   `E2B_PER_SANDBOX_UID … without CAP_SYS_PTRACE` 的告警；非 route-B 路径的模板沙箱
   可能因此受影响（见 backlog N18）。
 
+## 一组验证脚本（跑在真集群上）
+
+三个都要 `E2B_API_URL` / `E2B_SANDBOX_URL` 指到本机转发的 gateway、`E2B_API_KEY`
+与 `E2B_INTERNAL_API_KEY` 来自 `e2b-secrets`；多副本那个还需要 `KUBECONFIG`（它要重启
+worker、读 pod 日志）。
+
+| 脚本 | 验什么 | 参考耗时 |
+|---|---|---|
+| `deploy/scripts/multinode_smoke.py` | 4 个沙箱 2+2 跨节点，命令 + 文件 + 健康 + stdin | ~8 s |
+| `deploy/scripts/deployment_smoke.py` | 跨 worker 迁移保留文件、网络配置、远端卷隔离、模板构建→worker 拉取→镜像 rootfs、箱内 MCP 经代理 | ~46 s（模板冷启动时更长） |
+| `deploy/scripts/multiworker_interference.py` | **N13**：两副本共用一份 base 不互相破坏（重启一个 worker 后断言树都在、`deleted=0`、幸存者的沙箱照常读写） | ~3.5 min |
+
+跑 N13 那个之前**先把 autoscaler 停掉**（`kubectl -n sandlock scale deploy/autoscaler
+--replicas=0`），它会按需求缩容/扩容，与"重启一个 worker 再看结果"互相干扰。
+
 ## 已知未完成项
 
-* **跨节点 pod 网络不通** —— 阿里云 ECS 的「源/目的地址检查」默认开启，会丢弃目的 IP
-  不是该实例的转发包；kube-router 是原生路由型 CNI（不做封装），跨节点包的目的 IP 是
-  对方的 `10.244.x`。需要关掉两个实例的源/目的地址检查，或改用封装型 CNI
-  （`spec.network.provider: calico` + ipip/vxlan）。**在此之前**：多副本 `worker`
-  Deployment 与冒烟脚本（它们都要求 ≥2 个健康 worker）都跑不了；临时把 worker 钉在
-  一个节点上可以验证单节点形态。详见 `docs/k8s-deployment.md` §10。
+* ~~跨节点 pod 网络不通~~ —— ✅ 2026-09-17 已解（Calico VXLAN，见上一节与
+  `docs/k8s-deployment.md` §11）。
 * **worker 的 node id 是 pod 名**（downward API `metadata.name`），每次重建都是一个新
-  节点；死掉节点的预留不会被回收，fleet 视图会累积僵尸节点。要稳定 id 需要 StatefulSet
-  （autoscaler 现在按 Deployment scale，改起来牵连较大）。
+  节点。两条后果：① 死掉节点的预留不会被回收，fleet 视图会累积僵尸节点；② **重启后它
+  承载的沙箱记录仍指向旧 id，控制面路由不到**，要等 TTL（登记为 backlog **N20**）。
+  要稳定 id 需要 StatefulSet（autoscaler 现在按 Deployment scale，改起来牵连较大）。
+  ⚠ 别拿 worker 上报的本地运行时列表当归属声明 —— 它含共享 base 上**所有**树。
+* **共享 base 上做 reconcile 扫描时文件 API 会变慢**（24 s 空闲 / 43 s 负载下），
+  与 N18(a) 同族：重活在事件循环上（backlog **N21**）。
+* 控制面**仍只能 1 副本**（注册表在进程内，见上一节）。
