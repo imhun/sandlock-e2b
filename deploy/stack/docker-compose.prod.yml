@@ -194,7 +194,7 @@ services:
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY}
       E2B_INTERNAL_API_KEYS: ${E2B_INTERNAL_API_KEYS:-}
       E2B_ENABLE_NETWORK: "true"
-      E2B_NETWORK_DENY_CIDRS: ${E2B_NETWORK_DENY_CIDRS:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,169.254.0.0/16,fd00::/8}
+      E2B_NETWORK_DENY_CIDRS: ${E2B_NETWORK_DENY_CIDRS:-0.0.0.0/8,10.0.0.0/8,100.64.0.0/10,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.168.0.0/16,224.0.0.0/4,240.0.0.0/4,::/128,::1/128,::ffff:0:0/96,fe80::/10,fd00::/8,ff00::/8}
       E2B_ENABLE_NETNS: "false"
       # S2.2/S2.5 (2026-09-16): every worker runs sandboxes in their own
       # loopback-only netns. Worker-2 carried this as the canary while the

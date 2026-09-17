@@ -49,15 +49,43 @@ def _image_cache_dir() -> Path:
 
 # Default private-egress denylist applied to the implicit full-egress branch
 # (no explicit allowOut/denyOut + internet allowed). Covers RFC1918, loopback,
-# link-local / cloud metadata, and ULA. Override with E2B_NETWORK_DENY_CIDRS;
-# an explicit empty value disables the protection.
+# link-local / cloud metadata, CGNAT, multicast/reserved, and ULA. Override
+# with E2B_NETWORK_DENY_CIDRS; an explicit empty value disables the protection.
+#
+# This list is the *only* egress control there is: the fork performs outbound
+# connects on the sandbox's behalf **in the worker's network namespace**
+# (``fd_inject_connect``), so a per-sandbox netns does not constrain a
+# destination -- the rules do. Two families of spelling were missing and each
+# reached worker-local services (SEC-001, 2026-09-16):
+#
+# * ``0.0.0.0/8`` -- ``connect(0.0.0.0)`` is INADDR_ANY, which Linux routes to
+#   the local host, so ``tcp://0.0.0.0:49983`` reached the worker's own envd
+#   even though ``127.0.0.0/8`` was denied. ``0.0.0.1`` behaves the same way.
+# * ``::1/128`` (and ``::/128``) -- IPv6 loopback had no rule at all; the
+#   v4-mapped form is already folded to IPv4 by the fork's
+#   ``to_canonical()``, but the plain v6 spelling is not.
+#
+# ``fe80::/10`` (IPv6 link-local) and the multicast/reserved ranges are listed
+# for the same reason the v4 ones are: metadata services and neighbours live
+# there, and ``IpCidr`` refuses cross-family matches, so each family needs its
+# own entry. ``::ffff:0:0/96`` is belt-and-braces for any future path that
+# skips ``to_canonical()``.
 DEFAULT_NETWORK_DENY_CIDRS = (
+    "0.0.0.0/8",
     "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
+    "100.64.0.0/10",
     "127.0.0.0/8",
     "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    "::/128",
+    "::1/128",
+    "::ffff:0:0/96",
+    "fe80::/10",
     "fd00::/8",
+    "ff00::/8",
 )
 
 
