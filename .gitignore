@@ -17,3 +17,11 @@ tests/sdk/js/package-lock.json
 envd_service/egress/*.so
 .patchloom/backups/
 .superpowers/
+
+# graphify's generated graph (cache + html + report); the *config* that shapes it
+# (`.graphifyignore`) is committed, the 47M of output it produces is not.
+graphify-out/
+# A cargo build directory that only ever means anything inside the dev container:
+# it is a symlink to `/src/target-linux`. Committing it would be committing a
+# dangling link (see docs/build-test-deploy-pitfalls.md A2).
+/target
