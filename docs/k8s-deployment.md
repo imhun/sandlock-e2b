@@ -845,3 +845,13 @@ reconcile summary: deleted=0 delete_failures=0 unmaterialised=3 protected_elsewh
 同一形态下的三条验证全绿：`multinode_smoke.py`（4 箱 2+2）、`deployment_smoke.py`
 （含跨 worker 迁移 `e2b-worker-0 -> e2b-worker-1`、模板构建、箱内 MCP）、
 `multiworker_interference.py`（N13；并且它那条 N20 的 `NOTE` 自己消失了，见 §13.2）。
+
+### 15.5 这条修法覆盖不到的那一半（N22）
+
+稳定 id 让**重启**不再是丢节点，但**真的不再回来**的节点仍在：`mark_orphaned`（E6.1）
+把断开节点的记录标成 `orphaned`，而 `_ttl_reapable` **故意**让它（和 `paused`）跳过 TTL
+过期 —— 因为那个 worker 可能还握着那些 inode，删掉 workspace 会制造"活着的孤儿 inode"。
+代价是：节点行、沙箱记录、共享 base 上对应的树，在 worker 永不返回时**都没有回收路径**
+（autoscaler 缩容掉的副本、下线或换机的节点）。这台集群上就还留着两条旧 Deployment 时代的
+`e2b-worker-555d875875-*`，只有控制面重启才会清。登记为 **N22**：要给它一个远长于心跳窗口的
+宽限（例如可配 `E2B_ORPHAN_RECORD_TTL`，默认关），而那是**有数据损失的取舍**，先定值再动。
