@@ -34,6 +34,7 @@ from control_plane.registry.manager import (
     SandboxStateConflictError,
     SandboxRegistry,
     UnknownSandboxError,
+    workspace_disk_refusal,
 )
 from control_plane.registry.secrets import SecretTenantMismatchError
 from control_plane.registry.snapshots import UnknownSnapshotError
@@ -154,6 +155,28 @@ def _record_quota_dims(record) -> tuple[int, int, int, int]:
     )
 
 
+def _node_refusal_message(request, dims) -> str:
+    """Explain a node-level refusal in the fleet's own terms.
+
+    A full workspace used to be indistinguishable from a full memory pool
+    here, exactly as it was in the fleet ledger. This gate is the one that
+    fires *first* on single-node shapes (and in the test harness, where the
+    in-process node carries the fleet's own budget), so it has to speak the
+    same language as ``SandboxRegistry._quota_denied_message``.
+    """
+    refused = request.app.state.nodes.refusal(
+        memory_mb=dims[0],
+        cpu_percent=dims[1],
+        disk_mb=dims[2],
+        processes=dims[3],
+    )
+    if refused is None or refused["dimension"] != "disk":
+        return "No resources available"
+    return workspace_disk_refusal(
+        int(refused["disk_reserved_mb"]), int(refused["disk_limit_mb"])
+    )
+
+
 def _park_capacity(request, record) -> None:
     """Give back the node reservation of a sandbox that just paused (E9.2).
 
@@ -194,8 +217,17 @@ def _resume_with_capacity(request, registry, record, *, timeout: int | None = No
         )
         if reserved_on is None:
             # Same message as the global pool: callers (and the E9.3/E9.4
-            # retry paths) can treat a full node and a full fleet alike.
-            raise OfficialError(503, "No resources available")
+            # retry paths) can treat a full node and a full fleet alike -- the
+            # workspace budget excepted, which names itself on both gates.
+            # The sandbox is pinned to this node, so the answer is about this
+            # node's slice, not about what the rest of the fleet could take.
+            blocked = node.blocking_dimension(*dims)
+            if blocked != "disk":
+                raise OfficialError(503, "No resources available")
+            raise OfficialError(
+                503,
+                workspace_disk_refusal(node.reserved_disk_mb, node.total_disk_mb),
+            )
     try:
         resumed = registry.resume(record, timeout)
     except ResourceUnavailableError as e:
@@ -1027,7 +1059,7 @@ async def _create_sandbox_attempt(
     )
     if node is None:
         # 节点层无容量：还没有任何状态可回滚，直接交给调度器决定是否驱逐。
-        raise _CapacityExhausted("No resources available")
+        raise _CapacityExhausted(_node_refusal_message(request, dims))
 
     # Adaptive warm: image cached -> fast path (server-side ID, SDK no-op);
     # image cold -> slow path requiring X-Sandbox-Id, warming before any

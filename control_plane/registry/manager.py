@@ -60,6 +60,19 @@ class UnknownSandboxError(KeyError):
     """Raised when a sandbox ID is not in the registry."""
 
 
+def workspace_disk_refusal(reserved_mb: int, limit_mb: int) -> str:
+    """The one wording for "the shared workspace budget is what stopped you".
+
+    Shared by the fleet ledger here and by the per-node check in
+    ``control_plane.api.sandboxes``: both gates guard the same workspace, and a
+    caller that learned to read one sentence should not have to learn a second.
+    """
+    return (
+        f"shared workspace disk budget exhausted: {int(reserved_mb)} MiB "
+        f"reserved of {int(limit_mb)} MiB"
+    )
+
+
 class ResourceUnavailableError(RuntimeError):
     """Raised when total resource admission rejects a sandbox creation."""
 
@@ -637,10 +650,7 @@ class SandboxRegistry:
                 if reserved_disk is not None
                 else int(self.global_reserved().get("disk", 0))
             )
-            return (
-                f"shared workspace disk budget exhausted: {reserved} MiB "
-                f"reserved of {limit} MiB"
-            )
+            return workspace_disk_refusal(reserved, limit)
         return "No resources available"
 
     def global_reserved(self) -> dict[str, int]:
@@ -1234,7 +1244,19 @@ class SandboxRegistry:
         tenant_limits = self._tenant_limits(tenant_id, is_admin)
         if self._quota_store is not None:
             if not self._quota_store.reserve("global", limits, dims):
-                raise ResourceUnavailableError("No resources available")
+                # Same classification as the in-memory branch and as
+                # ``hold_quota``: the store only says "no", so re-read the
+                # ledger once on the refusal to tell the workspace budget
+                # apart from a full memory pool. Without this the shared-store
+                # deployment (the one that actually runs multi-replica) kept
+                # reporting the historical message no matter what the
+                # in-memory path said.
+                blocked = (
+                    "disk"
+                    if self._store_would_refuse("global", limits, dims, "disk")
+                    else None
+                )
+                raise ResourceUnavailableError(self._quota_denied_message(blocked))
             if tenant_limits is not None:
                 tenant_dims = dict(dims)
                 tenant_dims["sandboxes"] = 1

@@ -188,6 +188,52 @@ async def test_redis_multireplica_quota_and_visibility(workspace, redis_url):
         await ca.delete(f"/sandboxes/{second.json()['sandboxID']}")
 
 
+async def test_redis_multireplica_disk_budget_names_itself(workspace, redis_url):
+    """The shared workspace budget explains itself through the shared ledger.
+
+    The k0s deployment runs against this store, so the readable refusal has to
+    survive the store-backed branch: the ledger only answers *whether* the
+    reservation fits, and the store branch used to answer "No resources
+    available" no matter which dimension actually said no. That sends an
+    operator (or an SDK user) looking at memory while the workspace budget is
+    what filled up.
+    """
+    replica = create_control_app(
+        settings=Settings(
+            api_keys=("local-key",),
+            redis_url=redis_url,
+            max_sandboxes=100,
+            default_memory_mb=512,
+            default_cpu_percent=100,
+            default_disk_mb=1024,
+            default_max_processes=64,
+            max_total_memory_mb=1024,
+            max_total_cpu_percent=0,
+            # 1.5 sandboxes' worth of workspace: the first fits, the second
+            # cannot, and memory alone would still allow two.
+            max_total_disk_mb=1536,
+            max_total_processes=0,
+            eviction_enabled=False,
+            create_queue_timeout_s=0,
+        ),
+        runtime_registry=RuntimeRegistry(workspace),
+        workspace_base=workspace,
+    )
+    async with _client(replica) as client:
+        first = await _create(client)
+        assert first.status_code == 201
+
+        refused = await _create(client)
+        assert refused.status_code == 503
+        assert refused.json() == {
+            "code": 503,
+            "message": (
+                "shared workspace disk budget exhausted: "
+                "1024 MiB reserved of 1536 MiB"
+            ),
+        }
+
+
 async def test_redis_multireplica_concurrent_create_never_over_commits(
     workspace, redis_url
 ):

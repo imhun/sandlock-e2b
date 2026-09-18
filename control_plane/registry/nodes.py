@@ -47,15 +47,27 @@ class NodeRecord:
     created_at: float = field(default_factory=time.time)
 
     def can_fit(self, memory_mb: int, cpu: int, disk_mb: int, processes: int) -> bool:
+        return self.blocking_dimension(memory_mb, cpu, disk_mb, processes) is None
+
+    def blocking_dimension(
+        self, memory_mb: int, cpu: int, disk_mb: int, processes: int
+    ) -> str | None:
+        """The dimension that makes this sandbox not fit, or ``None``.
+
+        Same order as :meth:`can_fit` (which is now defined in terms of this),
+        so callers can explain a refusal with the dimension the check actually
+        stopped on instead of guessing afterwards. The name matches the
+        ledger's: ``"memory" | "cpu" | "disk" | "processes"``.
+        """
         if self.total_memory_mb > 0 and self.reserved_memory_mb + memory_mb > self.total_memory_mb:
-            return False
+            return "memory"
         if self.total_cpu_percent > 0 and self.reserved_cpu_percent + cpu > self.total_cpu_percent:
-            return False
+            return "cpu"
         if self.total_disk_mb > 0 and self.reserved_disk_mb + disk_mb > self.total_disk_mb:
-            return False
+            return "disk"
         if self.total_processes > 0 and self.reserved_processes + processes > self.total_processes:
-            return False
-        return True
+            return "processes"
+        return None
 
     def reserve(self, memory_mb: int, cpu: int, disk_mb: int, processes: int) -> None:
         self.reserved_memory_mb += memory_mb
@@ -395,6 +407,74 @@ class NodeRegistry:
             self._nodes[node_id] = record
             return record
 
+    def _placeable_candidates_locked(
+        self, exclude_node_id: str | None
+    ) -> list[NodeRecord]:
+        """Nodes that could be given work at all, before any capacity check.
+
+        Callers must hold ``self._lock``. Both :meth:`select_and_reserve` and
+        :meth:`refusal_dimension` start here so an explanation is always about
+        the same node set the placement actually considered.
+        """
+        self._sweep_health_locked()
+        now = time.time()
+        return [
+            n
+            for n in self._nodes.values()
+            if n.status == "healthy"
+            and n.node_id != exclude_node_id
+            and not n.draining
+            # Fresh enough to be given work. The in-process node never
+            # heartbeats itself, so it is exempt like it is in the sweep.
+            and (
+                n.address == "local://"
+                or now - n.heartbeat_at <= PLACEMENT_MAX_HEARTBEAT_AGE_S
+            )
+        ]
+
+    def refusal(
+        self,
+        *,
+        exclude_node_id: str | None = None,
+        memory_mb: int,
+        cpu_percent: int,
+        disk_mb: int,
+        processes: int,
+    ) -> dict[str, int | str] | None:
+        """Why no placeable node could take the sandbox, when there is one reason.
+
+        Only for explaining a refusal that already happened: every placeable
+        node fails on at least one dimension, and when they all fail on the
+        same one that dimension is the honest answer. A mixed picture (one
+        node short of memory, another short of disk) returns ``None`` so the
+        caller keeps the neutral wording instead of picking a winner. So does
+        an empty fleet -- there is no dimension to blame.
+
+        ``disk_reserved_mb``/``disk_limit_mb`` are summed over exactly those
+        placeable nodes, so an explanation of the workspace gate quotes the
+        aggregate the nodes enforce rather than one arbitrary node's slice.
+        """
+        with self._lock:
+            nodes = self._placeable_candidates_locked(exclude_node_id)
+            blocking = set()
+            disk_reserved = 0
+            disk_limit = 0
+            for node in nodes:
+                dim = node.blocking_dimension(
+                    memory_mb, cpu_percent, disk_mb, processes
+                )
+                if dim is not None:
+                    blocking.add(dim)
+                disk_reserved += node.reserved_disk_mb
+                disk_limit += node.total_disk_mb
+        if len(blocking) != 1:
+            return None
+        return {
+            "dimension": next(iter(blocking)),
+            "disk_reserved_mb": disk_reserved,
+            "disk_limit_mb": disk_limit,
+        }
+
     def select_and_reserve(
         self,
         *,
@@ -413,21 +493,10 @@ class NodeRegistry:
         over-commit a node.
         """
         with self._lock:
-            self._sweep_health_locked()
-            now = time.time()
             candidates = [
                 n
-                for n in self._nodes.values()
-                if n.status == "healthy"
-                and n.node_id != exclude_node_id
-                and not n.draining
-                # Fresh enough to be given work. The in-process node never
-                # heartbeats itself, so it is exempt like it is in the sweep.
-                and (
-                    n.address == "local://"
-                    or now - n.heartbeat_at <= PLACEMENT_MAX_HEARTBEAT_AGE_S
-                )
-                and n.can_fit(memory_mb, cpu_percent, disk_mb, processes)
+                for n in self._placeable_candidates_locked(exclude_node_id)
+                if n.can_fit(memory_mb, cpu_percent, disk_mb, processes)
             ]
             node = pick_best(
                 candidates,

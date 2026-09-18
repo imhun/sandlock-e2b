@@ -209,6 +209,29 @@ pod 里 df /var/lib/e2b-sandboxes : nfs4  10P 总  553G 已用  1%（那是整�
 而它是在**已持有 `self._lock`**（普通 `threading.Lock`，不可重入）的路径里被调用的 ⇒ 死锁，
 整个测试套挂住。现在锁内调用点把已知值直接传进去，锁外（Redis 路径）才去读。
 
+**收口（同日，上线后复验时发现文案没透出）**：闸门确实拦住了，客户端拿到的却是旧的
+`503: No resources available`。`_CapacityExhausted(str(exc))` 这一路是对的，问题都在上游，
+三条：
+
+1. **`SandboxRegistry.create()` 的 Redis 分支是硬编码文案** —— 多副本（= 线上）走的是
+   `self._quota_store` 那一支，它没被上一次改动碰到 ⇒ "内存分支说得清、线上说不清"。
+   现在和 `hold_quota` 一样，**只在拒绝那一次**多读一次台账来分类维度
+   （`_store_would_refuse`），非磁盘维度仍回 "No resources available"；
+2. **节点闸门（`select_and_reserve` 返回 `None`）也只说明"没有资源"**。k0s 上 fleet 限额
+   （10240）先于节点限额（8192×2）触发，所以线上靠第 1 条就够了；但**单节点形态下节点先触发**
+   （compose 时代就是：节点 `E2B_NODE_DISK_MB` 4096 < fleet 10240）；而且测试 harness 里
+   in-process 节点的 `total_disk_mb` **就等于** fleet 限额 ⇒ 只修第 1 条，本地和单节点上
+   这个修复**看不见**。现在 `NodeRecord.blocking_dimension()` 返回**先失败的那个维度**
+   （顺序与 `can_fit` 一致，`can_fit` 改成它的薄封装），`NodeRegistry.refusal()` 只在
+   **所有可放置节点都因同一个维度失败**时给出该维度并附上这些节点的磁盘聚合
+   （混合原因、或集群里一个可放置节点都没有 ⇒ `None` ⇒ 保持中性文案，不挑一个"赢家"）；
+3. 两条闸门的措辞由 `workspace_disk_refusal()` **同一处**产出，避免两句话各自漂移；
+   resume 钉在特定节点上，所以按**该节点**的 slice 报数，而不是"舰队其他节点还能装什么"。
+
+回归保护：`test_the_shared_store_budget_refuses_and_says_so`（Redis 后端单元）、
+`test_redis_multireplica_disk_budget_names_itself`（整流链路的 API 契约，形如线上拓扑）。
+两处都验证过"去掉修复即失败"。
+
 ### L2 —— 每沙箱那一层（L1 之后的下一步）
 
 > ⛔ **L2a（目录配额）已被否决（2026-09-18，运维决定：不想引入云 API 依赖）。**

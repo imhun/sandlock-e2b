@@ -237,6 +237,40 @@ def test_a_non_disk_refusal_keeps_the_historical_message(workspace):
     assert str(exc.value) == "No resources available"
 
 
+def test_the_shared_store_budget_refuses_and_says_so(workspace):
+    """The Redis-backed ledger explains a refusal exactly like the in-memory one.
+
+    Multi-replica deployments keep the fleet ledger in the shared store, so
+    the store's ``reserve`` only ever answers "no". That branch used to raise
+    the historical message unconditionally, which meant the readable reason
+    added for the in-memory path never reached the clients of the deployments
+    that actually run more than one replica.
+    """
+    fakeredis = pytest.importorskip("fakeredis")
+    settings = _settings(max_total_disk_mb=1536, default_disk_mb=1024)
+    registry = SandboxRegistry(
+        settings, redis_client=fakeredis.FakeStrictRedis()
+    )
+    _create(registry)
+    assert registry.global_reserved()["disk"] == 1024
+
+    with pytest.raises(ResourceUnavailableError) as exc:
+        _create(registry)
+    assert str(exc.value) == (
+        "shared workspace disk budget exhausted: 1024 MiB reserved of 1536 MiB"
+    )
+
+    # A non-disk dimension keeps the historical wording through the store too.
+    memory_capped = SandboxRegistry(
+        _settings(max_total_memory_mb=1024, default_memory_mb=1024),
+        redis_client=fakeredis.FakeStrictRedis(),
+    )
+    _create(memory_capped)
+    with pytest.raises(ResourceUnavailableError) as exc:
+        _create(memory_capped)
+    assert str(exc.value) == "No resources available"
+
+
 def test_mark_orphaned_skips_ttl_and_recovers(workspace):
     """E6.1: sandboxes on a lost node are marked orphaned; TTL never reaps
     them while orphaned; recovery flips them back to running."""
