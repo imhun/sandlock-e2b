@@ -117,6 +117,10 @@ class SandboxWriter:
     def __init__(self, context) -> None:
         self._ctx = context
         self._root = Path(context.record.workspace_dir).resolve()
+        #: N28/B: the metadata xattr is best effort *per filesystem*, and this
+        #: fleet's NAS answers ENOTSUP for the ``user.`` namespace -- once. One
+        #: line per sandbox is diagnosis; one per upload would be noise.
+        self._metadata_warned = False
 
     # -- public surface: the four writing RPCs -----------------------------
 
@@ -216,13 +220,21 @@ class SandboxWriter:
                 operation="SetMetadata",
             )
         except Exception:
-            logger.warning(
-                "sandbox %s could not persist upload metadata on %s; the file "
-                "itself was written",
-                self._ctx.record.sandbox_id,
-                path,
-                exc_info=True,
-            )
+            if not self._metadata_warned:
+                self._metadata_warned = True
+                logger.warning(
+                    "sandbox %s could not persist upload metadata on %s (the "
+                    "file itself was written; this filesystem does not have to "
+                    "support the user. namespace -- the fleet's NAS answers "
+                    "ENOTSUP); further failures for this sandbox are debug",
+                    self._ctx.record.sandbox_id,
+                    path,
+                    exc_info=True,
+                )
+            else:
+                logger.debug(
+                    "upload metadata still not persisted on %s", path
+                )
             return False
         return True
 

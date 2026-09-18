@@ -13,6 +13,7 @@ Two layers are pinned here, and the split is the point:
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -357,6 +358,39 @@ async def test_persist_metadata_is_a_no_op_without_metadata(root):
     writer = SandboxWriter(_context(root, executor))
     assert await writer.persist_metadata("f.bin", {}) is True
     assert executor.configs == []
+
+
+async def test_persist_metadata_passes_its_operands_in_the_script_s_order(root):
+    """The one helper that takes *code* as an operand: pin the argv order.
+
+    ``$1`` is the JSON, ``$2`` the path and ``$3`` the program, because the
+    program is the only operand that may contain characters the shell would
+    otherwise act on -- it is read through ``"$3"``, never interpolated.
+    """
+    executor = _RecordingExecutor()
+    writer = SandboxWriter(_context(root, executor))
+    (root / "f.bin").write_bytes(b"x")
+
+    assert await writer.persist_metadata("f.bin", {"owner": "alice"}) is True
+
+    cmd = executor.configs[0].cmd
+    assert cmd[:4] == [SHELL, "-c", 'exec python3 -c "$3" "$1" "$2"\n', ARGV0]
+    assert cmd[4] == '{"owner":"alice"}'
+    assert cmd[5] == "f.bin"
+    assert cmd[6].startswith("import os,sys;")
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "setxattr"),
+    reason="os.setxattr is Linux-only, and so is the worker (E5.1)",
+)
+async def test_persist_metadata_reaches_the_file_through_the_sandbox(root):
+    writer = SandboxWriter(_context(root))
+    (root / "f.bin").write_bytes(b"x")
+
+    assert await writer.persist_metadata("f.bin", {"owner": "alice"}) is True
+
+    assert os.getxattr(root / "f.bin", "user.e2b.owner") == b"alice"
 
 
 # -- the helper runs where the tree lives ----------------------------------

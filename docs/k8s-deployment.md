@@ -1299,6 +1299,11 @@ stdin），然后只做**读**回填响应。路径语义不变（`/foo` 仍然�
   改为中止（用户命令仍然冻结/解冻，它的输出要留着），写者把"被信号杀掉 + 记录不是 running"
   翻成**同一个 409**：`Sandbox is paused[: 原因]; the Upload was interrupted by the pause rather
   than frozen (resume it and retry)`。
+* **上传 metadata 在这套存储上是 no-op（实测，非本次引入）**：E2B 的 `x-metadata-*` 会以
+  `user.e2b.*` xattr 落到文件上，而**阿里云 NAS 对该命名空间返回 `ENOTSUP`**（沙箱内
+  `os.getxattr` → `[Errno 95] Operation not supported`）。所以接口照旧返回调用方给的 metadata
+  （那是回显请求），但**不落盘**；写者只在每个沙箱上告警一次（以前是静默吞掉）。要真正支持得
+  换存储或改存侧记录。
 
 **③ 单文件硬限（C，`RLIMIT_FSIZE`）**：fork 侧新增 `max_file_size`（builder + profile
 `[limits].file_size` + supervise policy + C ABI + Python/Go 绑定），在子进程里同时压低软硬限，
