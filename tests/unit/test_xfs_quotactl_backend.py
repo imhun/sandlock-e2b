@@ -130,12 +130,58 @@ def test_a_4mib_limit_means_4194304_bytes(fake):
     """The probe's 2 GiB mistake: 4 MiB must reach the kernel as 8192 blocks."""
     q.set_limit("/mnt/vol", 10001, 4)
 
-    assert fake.setqlim == [(10001, 8192, 8192)]
+    # ``(projid, hard, soft)``: the hard limit is the one being set, and the soft
+    # limit is zeroed rather than mirrored onto it -- that is the shape the
+    # subprocess backend produces (`limit -p bhard=4M`) and the one the XFS-lane
+    # contracts assert (`4 0 8192` in `report -p`). Mirroring it turned every
+    # fd-provisioned project into "soft == hard" (N23).
+    assert fake.setqlim == [(10001, 8192, 0)]
     hard_bytes = q.mb_to_basic_blocks(4) * q._BASIC_BLOCK_BYTES
     assert hard_bytes == 4 * 1024 * 1024 == 4194304
 
 
 # --- 2. ghost filtering -------------------------------------------------------
+
+
+def test_assign_projid_tree_reaches_entries_that_predate_provisioning(
+    tmp_path, monkeypatch
+):
+    """N24: the fd backend has to cover what ``project -s`` covers.
+
+    A sandbox tree is built *before* it is provisioned, so ``workspace/`` (and
+    anything a snapshot put there) exists by the time the project id is set --
+    and ``XFS_XFLAG_PROJINHERIT`` only affects entries created after that. The
+    tree walk is what closes the gap; without it every file the sandbox writes
+    is accounted to project 0 (measured on the production stack: 50 MiB through
+    the file API moved project 0's usage by 50 MiB while the sandbox's own row
+    went 4 KiB -> 8 KiB, i.e. its hard limit was inert).
+    """
+    root = tmp_path / "sbx_tree"
+    (root / "workspace" / "nested").mkdir(parents=True)
+    (root / "sandbox.json").write_text("{}", encoding="utf-8")
+    (root / "workspace" / "nested" / "data.bin").write_bytes(b"x")
+    (root / "link").symlink_to(root / "workspace")
+
+    assigned_dirs: list[str] = []
+    assigned_files: list[str] = []
+    monkeypatch.setattr(
+        q, "assign_projid", lambda path, projid: assigned_dirs.append(Path(path).name)
+    )
+    monkeypatch.setattr(
+        q,
+        "assign_file_projid",
+        lambda path, projid: assigned_files.append(Path(path).name),
+    )
+
+    q.assign_projid_tree(root, 4242)
+
+    # Every directory that existed before provisioning, not just the root...
+    assert assigned_dirs == ["sbx_tree", "workspace", "nested"]
+    # ...and every file, since a file's own inode is what the quota counts.
+    assert assigned_files == ["sandbox.json", "data.bin"]
+    # A symlink is not this tree's inode: resolving it would pull in whatever it
+    # points at (another project's file, if a sandbox can plant one).
+    assert "link" not in assigned_dirs + assigned_files
 
 
 def test_project_table_filters_ghost_dquots(fake):

@@ -264,7 +264,18 @@ def can_read_projid(mount_point: str | Path) -> bool:
 
 
 def set_limit(mount_point: str | Path, projid: int, disk_mb: int) -> None:
-    """Set the project's block hard/soft limit (MiB) via Q_XSETQLIM."""
+    """Set the project's block *hard* limit (MiB) via Q_XSETQLIM.
+
+    Hard only, and the soft limit is explicitly zeroed. That is what the
+    subprocess backend does (``limit -p bhard=<mb>M`` leaves ``bsoft`` at 0) and
+    what the XFS-lane contracts assert, so both backends report the same table.
+    This one used to write ``blocks`` into *both* fields, so a project
+    provisioned through the fd backend carried a soft limit equal to its hard
+    one -- ``4 1048576 1048576`` in ``report -p``, measured on the production
+    stack (N23): a limit nobody asked for, and no warning band between the two.
+    The field mask keeps ``_FS_DQ_BSOFT`` so the zero is written rather than
+    inherited from a dquot an earlier incarnation left behind.
+    """
     fd = _MOUNT_FDS.get(mount_point)
     blocks = mb_to_basic_blocks(disk_mb)
     buf = ctypes.create_string_buffer(_FS_DISK_QUOTA_SIZE)
@@ -272,7 +283,7 @@ def set_limit(mount_point: str | Path, projid: int, disk_mb: int) -> None:
     struct.pack_into("<h", buf, 2, _FS_DQ_BHARD | _FS_DQ_BSOFT)
     struct.pack_into("<I", buf, 4, projid)
     struct.pack_into("<Q", buf, 8, blocks)   # d_blk_hardlimit
-    struct.pack_into("<Q", buf, 16, blocks)  # d_blk_softlimit
+    struct.pack_into("<Q", buf, 16, 0)       # d_blk_softlimit: none
     rc, err = _quotactl_fd(fd, _Q_XSETQLIM, projid, buf)
     if rc != 0:
         raise QuotactlError(
@@ -439,6 +450,103 @@ def clear_projid(path: str | Path) -> None:
         _set_fsxattr(fd, words)
     finally:
         os.close(fd)
+
+
+def assign_file_projid(path: str | Path, projid: int) -> None:
+    """Set ``projid`` on a non-directory inode.
+
+    ``PROJINHERIT`` means nothing on a regular file, so only the id is written.
+    ``O_NOFOLLOW`` keeps a symlink from being resolved into whatever it points
+    at: a sandbox that could plant a link would otherwise be able to pull
+    another project's file into its own accounting.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise QuotactlError(f"cannot open {path}: {exc}") from exc
+    try:
+        words = _fsxattr(fd)
+        words[0] = words[0] & ~_XFS_XFLAG_HASATTR
+        words[3] = projid
+        _set_fsxattr(fd, words)
+        stored = _fsxattr(fd)[3]
+        if stored != projid:
+            raise QuotactlError(
+                f"project id did not stick on {path}: wrote {projid}, read {stored}"
+            )
+    finally:
+        os.close(fd)
+
+
+def assign_projid_tree(root: str | Path, projid: int) -> int:
+    """Assign ``projid`` to ``root`` **and every entry under it** (N24).
+
+    The subprocess backend runs ``project -s -p <dir> <projid>``, which walks the
+    tree; :func:`assign_projid` only covers the inode it is handed. That
+    difference is what decides whether a quota exists at all, because
+    ``XFS_XFLAG_PROJINHERIT`` only affects entries created *after* it is set and
+    a sandbox tree is built *before* it is provisioned: ``<base>/<id>/workspace``
+    already exists by then, so it (and everything the sandbox writes inside it)
+    stayed at project 0 while the tree's own hard limit accrued nothing.
+
+    Measured on the production stack (2026-09-18): ``<id>`` = projid N with the
+    ``P`` flag, ``<id>/workspace`` = projid 0, and 50 MiB written through the file
+    API moved project 0's usage by 50 MiB while the sandbox's row went 4 KiB ->
+    8 KiB. A hard limit nothing accrues usage against is inert, so every
+    per-sandbox disk limit in that deployment was decorative.
+
+    Symlinks are skipped for both directions (see :func:`assign_file_projid`):
+    the target inode belongs to whoever owns it, not to this tree.
+    """
+    root = Path(root)
+    assign_projid(root, projid)
+    for current, dirs, files in os.walk(root, followlinks=False):
+        for name in sorted(dirs):
+            path = Path(current) / name
+            if path.is_symlink():
+                dirs.remove(name)
+                continue
+            assign_projid(path, projid)
+        for name in sorted(files):
+            path = Path(current) / name
+            if path.is_symlink():
+                continue
+            assign_file_projid(path, projid)
+    return projid
+
+
+def clear_projid_tree(root: str | Path) -> None:
+    """Undo :func:`assign_projid_tree`: drop the project id everywhere under ``root``.
+
+    Used to clean up a provisioning that failed *after* the tree was tagged, so
+    a sandbox that ends up without a quota does not leave its files accounted to
+    a project nobody tracks. A symlinked entry is skipped, like in the assign
+    direction: it is not this tree's inode to change.
+    """
+    root = Path(root)
+    clear_projid(root)
+    for current, dirs, files in os.walk(root, followlinks=False):
+        for name in sorted(dirs):
+            path = Path(current) / name
+            if path.is_symlink():
+                dirs.remove(name)
+                continue
+            clear_projid(path)
+        for name in sorted(files):
+            path = Path(current) / name
+            if path.is_symlink():
+                continue
+            try:
+                fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError as exc:
+                raise QuotactlError(f"cannot open {path}: {exc}") from exc
+            try:
+                words = _fsxattr(fd)
+                words[0] = words[0] & ~_XFS_XFLAG_HASATTR
+                words[3] = 0
+                _set_fsxattr(fd, words)
+            finally:
+                os.close(fd)
 
 
 # --- projid32bit ----------------------------------------------------------

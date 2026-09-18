@@ -1002,3 +1002,87 @@ N12 ON THE TARGET OK
 （1 GiB），而契约要的是「只设 hard」。（此前只在本地 lane 上见过，所以 N23 的证据现在
 从"测试环境"升级成"生产栈"。）另外这次升级本身也顺手清掉了一批旧行：两个 worker 重启时
 的启动 reconcile 把上一版留下的残留行收掉了。
+
+---
+
+## 18. N23 + N24：fd 后端与 `project -s/-C` 的语义对齐（2026-09-18）
+
+### 18.1 一条线索带出的两个问题
+
+§17.4 里那行 `#700308939 4 1048576 1048576` 有两个"不对劲"：soft 不该等于 hard（N23），
+而一个**刚建好的**沙箱就占了 4 KiB —— 于是顺手量了一下"写进去的东西算不算数"：
+
+| | 结果 |
+|---|---|
+| 沙箱项目自己的行 | 写 50 MiB 前后：**4 KiB → 8 KiB** |
+| 默认 project 0 的行 | 同期 **+50 MiB** |
+
+也就是说 **每沙箱磁盘限额在生产上完全没有生效**：限额挂在一个永远不涨用量的项目上，
+而沙箱写的文件全部记在默认项目里。`quota_maintenance` 的 near/over-limit 也永远不会触发。
+
+### 18.2 根因：fd 后端只碰"它拿到的那一个 inode"，而 `project -s/-C` 是递归的
+
+实测（特权容器里，真 XFS）：
+
+```
+$ xfs_quota -x -c 'project -s -p $V/probe 4242' $V
+ 4242 -------------------P-- probe
+ 4242 -------------------P-- probe/sub        ← 设之前就存在的子目录，也被打上
+ 4242 ---------------------- probe/sub/f      ← 之后创建的文件，靠继承
+$ xfs_quota -x -c 'project -C -p $V/probe 4242' $V
+    0 ---------------------- probe / probe/sub / probe/sub/f   ← 三层全清
+```
+
+而 fd 后端（`xfs_quotactl.assign_projid` / `clear_projid`）用的是
+`FS_IOC_FSSETXATTR`，**只作用于传入的那一个目录**，靠 `PROJINHERIT` 让*之后*创建的东西继承。
+建箱顺序恰好踩中这个差别：`<base>/<id>` 先建、`<id>/workspace` 再建、**然后**才 provision ——
+于是 `workspace/` 永远停在 project 0：
+
+```
+<tree>                    projid 1436317985  flags P
+<tree>/workspace          projid 0            ← 先建后设，不继承
+<tree>/workspace/probe.bin projid 0           ← 沙箱写的文件
+```
+
+两边同样偏窄的还有清理方向：`cleanup_orphan_project` 只清目录，而"记录丢了、文件保留"的
+孤儿场景要求把**整棵树**去项目化（否则用量还挂在那个项目上，行永远掉不掉）。
+
+### 18.3 改了什么
+
+* `xfs_quotactl.assign_projid_tree(root, projid)` / `clear_projid_tree(root)`：深度优先走一遍
+  **已存在**的条目 —— 目录用 `assign_projid`（projid + PROJINHERIT），文件用新的
+  `assign_file_projid`（只写 projid，文件上 PROJINHERIT 没有意义）。两者都用
+  `O_NOFOLLOW` 并跳过软链接：链接指向的 inode 属于别人，不能被拉进本项目的计量。
+* `provision_project` 的 fd 分支改用它（等价于 `project -s`），失败清理改 `clear_projid_tree`。
+* `cleanup_orphan_project` 的 fd 分支改 `clear_projid_tree`（等价于 `project -C`）。
+* `release_project` **保持单目录**：它的调用方（删箱、删卷切片）紧接着就删掉整棵树，
+  走一遍纯属浪费 —— 这一点写进了注释，免得以后有人误以为它也是全树语义。
+* `xfs_quotactl.set_limit` 只设 hard、soft 显式写 0（N23）。单测里那条
+  `(projid, hard, soft)` 断言原来是 `(10001, 8192, 8192)`，它的主题本是 hard 的**字节数**，
+  soft 是顺带带上的；现在按契约改成 `0`。
+
+### 18.4 验证
+
+**XFS 契约 lane**（特权容器 + 真 XFS + prjquota）：从"5 failed / 5 passed"变成
+**10 passed / 1 skipped** —— 那 5 条正是被这两个问题挡住的（用量不计入 / 限额不生效 /
+soft≠0）。新增单测 `test_assign_projid_tree_reaches_entries_that_predate_provisioning`
+钉住走树的覆盖面（每个既有目录、每个文件都覆盖，软链接跳过）。
+
+**生产栈（`.140`，升级到 `0.1.0-349-g8b8ae49-20260918-150140` 之后）**：
+
+```
+created: sbx_f9d233e1f10f8e2f -> new rows: [442880324]
+row at create : used=4 KiB soft=0 hard=1048576 KiB     ← N23：soft 是 0
+after 50 MiB  : used=51204 KiB (+50.0 MiB)             ← N24：算在沙箱自己头上
+dd past the limit: ["dd: error writing 'workspace/fill.bin': No space left on device", 'exit=1']
+row after kill: False                                  ← N12 没有回归
+```
+
+即：限额真的开始生效了（`dd` 写到 1 GiB 被 ENOSPC 挡住），而行的生命周期仍然正确。
+
+### 18.5 ⚠ 运维影响（这一条要提前说）
+
+**从这一版起，每沙箱磁盘限额是真的了。** 之前"看起来有配额、实际无限"，
+现在默认 `E2B_DEFAULT_DISK_MB`（这台是 **1 GiB**）会真的把超限写入挡下来。
+如果现有工作负载本来就会写超过 1 GiB，升级后它们会开始报 `No space left on device`
+—— 要按需调 `E2B_DEFAULT_DISK_MB`（或建箱时传 `diskMB`）。

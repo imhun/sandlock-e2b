@@ -499,10 +499,14 @@ def provision_project(
         else allocate_project_id(sandbox_id, mount_point)
     )
     if _use_quotactl(mount_point):
-        # Device-free backend: tag the directory (children inherit through
-        # XFS_XFLAG_PROJINHERIT) and set the block limit through quotactl_fd.
+        # Device-free backend: tag the tree and set the block limit through
+        # quotactl_fd. The *tree* -- not just the directory it is handed -- is
+        # what `project -s` (the other backend) covers, and the difference is
+        # whether the limit ever accrues usage: the sandbox's `workspace/`
+        # subdirectory is created before provisioning, so PROJINHERIT alone
+        # leaves it at project 0 (N24, measured on the production stack).
         try:
-            xfs_quotactl.assign_projid(project_dir, projid)
+            xfs_quotactl.assign_projid_tree(project_dir, projid)
         except xfs_quotactl.QuotactlError as exc:
             raise ProjectQuotaError(
                 f"project setup failed for {sandbox_id}: {exc}"
@@ -511,7 +515,7 @@ def provision_project(
             xfs_quotactl.set_limit(mount_point, projid, disk_mb)
         except xfs_quotactl.QuotactlError as exc:
             try:
-                xfs_quotactl.clear_projid(project_dir)
+                xfs_quotactl.clear_projid_tree(project_dir)
             except xfs_quotactl.QuotactlError as cleanup_exc:
                 logger.warning(
                     "project cleanup failed for %s (projid %s): %s",
@@ -941,7 +945,13 @@ def cleanup_orphan_project(
     if project_dir is not None:
         if _use_quotactl(mount_point):
             try:
-                xfs_quotactl.clear_projid(project_dir)
+                # The *tree*, not just the directory: `project -C` walks (measured
+                # 2026-09-18: a pre-existing `probe/sub` and a file under it both
+                # came back to 0), and the files here stay on disk by design --
+                # with only the directory disowned their usage would keep the
+                # project's row alive and the "cleaned" report would be a lie
+                # (N24's other direction).
+                xfs_quotactl.clear_projid_tree(project_dir)
             except xfs_quotactl.QuotactlError as exc:
                 raise ProjectQuotaError(
                     f"project cleanup failed for {project_dir}: {exc}"
