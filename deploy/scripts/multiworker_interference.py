@@ -371,18 +371,23 @@ def main() -> int:
             assert result.stdout == f"marker-{index}\n", (index, result.stdout)
         print("OK: every sandbox on a surviving worker still runs with its file intact")
 
-        # 4c. Sandboxes that were on the restarted worker are reported, not
-        #     asserted: a restart gives the worker a *new* node id (its pod name),
-        #     and the records of the sandboxes it re-adopts from the shared base
-        #     still name the previous one, so the control plane cannot route to
-        #     them until their TTL. That is a separate defect from N13 (tracked as
-        #     N20 in docs/task-backlog.md); N13 is the claim that the two workers do
-        #     not destroy each other's state, which 4a just checked.
+        # 4c. Sandboxes that were on the restarted worker.
+        #
+        #     They used to be *stranded*: the worker's node id was its pod name, a
+        #     Deployment gave the restart a new name, and the control plane could
+        #     not route to the records the previous incarnation had left behind
+        #     (N20). The worker is a StatefulSet now, so the same node id comes
+        #     back, the recovery round re-reports what the control plane still
+        #     attributes to it, and the records are un-orphaned -- this phase is
+        #     reported rather than asserted for a different reason: a restart also
+        #     kills the sandboxes' *processes*, so what is being checked is that
+        #     their records and trees survive, which 4a does. A route that does go
+        #     missing here means the worker did not come back within the window.
         stranded = [sb.sandbox_id for sb in sandboxes if routes[sb.sandbox_id] not in alive_nodes]
         if stranded:
             print(
-                f"NOTE: {len(stranded)} sandbox(es) lost their route when their worker "
-                f"restarted (N20, not an N13 failure): {stranded}"
+                f"NOTE: {len(stranded)} sandbox(es) are not on a running worker "
+                f"(the restarted one may not have come back): {stranded}"
             )
 
         if not args.no_restart:

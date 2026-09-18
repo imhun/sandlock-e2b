@@ -18,6 +18,7 @@ def _build_backend(settings: Settings):
         return KubernetesBackend(
             namespace=settings.k8s_namespace,
             deployment=settings.k8s_deployment,
+            kind=settings.k8s_kind,
         )
     from autoscaler.backends.local import DockerPoolBackend
 

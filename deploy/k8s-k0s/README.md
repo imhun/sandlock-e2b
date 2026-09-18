@@ -107,11 +107,12 @@ worker、读 pod 日志）。
 
 * ~~跨节点 pod 网络不通~~ —— ✅ 2026-09-17 已解（Calico VXLAN，见上一节与
   `docs/k8s-deployment.md` §11）。
-* **worker 的 node id 是 pod 名**（downward API `metadata.name`），每次重建都是一个新
-  节点。两条后果：① 死掉节点的预留不会被回收，fleet 视图会累积僵尸节点；② **重启后它
-  承载的沙箱记录仍指向旧 id，控制面路由不到**，要等 TTL（登记为 backlog **N20**）。
-  要稳定 id 需要 StatefulSet（autoscaler 现在按 Deployment scale，改起来牵连较大）。
-  ⚠ 别拿 worker 上报的本地运行时列表当归属声明 —— 它含共享 base 上**所有**树。
+* ~~worker 的 node id 是 pod 名，每次重建都是一个新节点~~ —— ✅ 2026-09-18 已修
+  （backlog **N20**）：worker 从 Deployment 换成 **StatefulSet**（`e2b-worker-0/1` 跨重启
+  稳定），autoscaler 用 `E2B_AS_K8S_KIND=statefulset` 扩缩、Role 也已放开
+  `statefulsets{,/scale}`。删 pod 后同名回来，沙箱记录被 E6.1 的恢复轮次认回
+  （实测 126 秒后文件 API 恢复、内容完好、路由未变）。见 `docs/k8s-deployment.md` §15。
+  ⚠ 仍然别拿 worker 上报的本地运行时列表当归属声明 —— 它含共享 base 上**所有**树。
 * ~~reconcile 轮次压在 worker 的事件循环上~~ —— ✅ 2026-09-18 已修（backlog **N21**）：
   轮次独立成单飞 task、扫描与逐树校验挪到线程，心跳不再等任何一轮。base 灌到 3002 棵树
   （一轮 7.8 s）时心跳仍是 5.0 s，窗口因此从 60 s 收到 30 s（见 `docs/k8s-deployment.md` §14）。

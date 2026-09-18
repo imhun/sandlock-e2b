@@ -15,7 +15,7 @@
 # 显式给小 requests、大 limits 才是这里的正确形状：调度器只预留一点，容量声明
 # 交给 E2B 自己的记账（E2B_NODE_*）。
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: e2b-worker
   namespace: sandlock

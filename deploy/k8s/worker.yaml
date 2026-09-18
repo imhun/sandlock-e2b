@@ -1,9 +1,16 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: e2b-worker
   namespace: sandlock
 spec:
+  # The headless Service (bottom of this file) is the StatefulSet's identity anchor:
+  # it is what turns the stable pod names below into per-pod DNS records
+  # (`e2b-worker-0.worker-headless.…`). Nothing *addresses* the workers by DNS -- the
+  # control plane dials their pod IPs -- but the reference is required, and with a
+  # StatefulSet the records are finally per-pod and stable (under a Deployment the
+  # same Service gave no stable name at all, see the E2.4 finding in §10.3).
+  serviceName: worker-headless
   # Two replicas: the shape the compose stack runs (worker-1 + worker-2) and the
   # one verified on a real cluster once N13 closed (docs/k8s-deployment.md §13).
   # More than one worker over one shared workspace base is safe because a
@@ -17,16 +24,27 @@ spec:
   # only. The uid pool's flock on `<base>/.uid_pool.lock` is what keeps two
   # replicas from handing out the same host uid (docs/k8s-deployment.md §10.3 F5).
   replicas: 2
-  # maxSurge 0 is about capacity, not about hiding the multi-replica shape: this
-  # deployment has no `requests`, so Kubernetes copies the 2-CPU limit into the
-  # request, and a surge pod cannot even schedule on a 4-core node -- measured
-  # 2026-09-17 on k0s, where a rollout stalled with
-  # `0/2 nodes are available: 1 Insufficient cpu`. Delete first, create second.
-  strategy:
+  # The StatefulSet (not a Deployment) is the fix for N20: a worker's node id is its
+  # pod name (downward API `metadata.name`), and a Deployment hands every restart a
+  # brand-new name. The control plane then kept the *previous* incarnation's sandbox
+  # records -- unroutable until they aged out (`Node unavailable`) -- and the old
+  # record lingered as a zombie node. Stable ordinals remove the whole class, and they
+  # are what the compose stack has always had (`E2B_NODE_ID: worker-1` / `worker-2`).
+  # A restart with the same id re-registers, the recovery round reports the sandboxes
+  # the control plane still attributes to this worker (`remaining = local & known`, so
+  # it can never claim a peer's), and their records and trees survive.
+  #
+  # `podManagementPolicy: Parallel` because the replicas are interchangeable: the
+  # default OrderedReady would serialize startup and rollouts behind pod 0.
+  podManagementPolicy: Parallel
+  # StatefulSet updates are delete-then-create, one pod at a time (reverse ordinal),
+  # so there is no surge pod to schedule. That is also what the old `maxSurge: 0` was
+  # for: this workload declares no `requests`, so Kubernetes copies the 2-CPU limit
+  # into the request and a second pod cannot fit on a 4-core node -- measured
+  # 2026-09-17 on k0s, where a Deployment rollout stalled with
+  # `0/2 nodes are available: 1 Insufficient cpu`.
+  updateStrategy:
     type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 0
-      maxUnavailable: 1
   selector:
     matchLabels:
       app: e2b-worker

@@ -65,7 +65,7 @@ kubectl -n $NS rollout status ds/seccomp-installer     # 每个节点一个 Read
 
 # 6) worker（缺 profile 的节点会起来失败 —— 这是 fail closed，不是 flake）
 kubectl apply -f deploy/k8s/worker.yaml
-kubectl -n $NS rollout status deploy/e2b-worker
+kubectl -n $NS rollout status sts/e2b-worker
 
 # 7) autoscaler（可选）
 kubectl apply -f deploy/k8s/autoscaler.yaml
@@ -93,10 +93,20 @@ k8s 侧没有等价的自动机制，所以要显式把 tag 换成当次构建�
 内核上 fail-closed 的修复，已在 main 集群用该 tag 复验通过）。升级时：
 
 ```bash
-kubectl -n $NS set image deploy/e2b-worker worker=<REGISTRY>/byteplan/e2b-sandlock-worker:<VERSION>
+kubectl -n $NS set image sts/e2b-worker worker=<REGISTRY>/byteplan/e2b-sandlock-worker:<VERSION>
 kubectl -n $NS set image deploy/control-plane control-plane=<REGISTRY>/byteplan/e2b-sandlock-control-plane-gateway:<VERSION>
 kubectl -n $NS set image deploy/autoscaler autoscaler=<REGISTRY>/byteplan/e2b-sandlock-autoscaler:<VERSION>
 kubectl -n $NS set image ds/seccomp-installer installer=<REGISTRY>/byteplan/e2b-sandlock-worker:<VERSION>
+```
+
+⚠ 老集群（worker 还是 Deployment 的）切到 StatefulSet 要多一步：`worker.yaml` 换了 `kind`，
+`kubectl apply` 只会新建 `e2b-worker` StatefulSet，**旧的 Deployment 还在**（同名不同 kind，
+两者会各自跑副本、各自注册成 worker）。顺序：
+
+```bash
+kubectl -n $NS delete deploy/e2b-worker        # 先停旧的（它的沙箱随之结束）
+kubectl apply -f deploy/k8s/worker.yaml
+kubectl -n $NS rollout status sts/e2b-worker
 ```
 
 `seccomp-installer` 的镜像只用来跑 `cp`（profile 本体在 ConfigMap 里），跟着 worker 版本走是
@@ -180,7 +190,7 @@ wildcard-DNS 的 `:53`，而切了 netns 之后那个 bind 发生在沙箱自己
 
 ```bash
 kubectl -n sandlock get pods -o wide
-kubectl -n sandlock logs deploy/e2b-worker | grep -E "seccomp self-check|route-B instance ready"
+kubectl -n sandlock logs sts/e2b-worker | grep -E "seccomp self-check|route-B instance ready"
 #   seccomp self-check: filter mode active, user namespaces allowed    ← 自检通过
 #   route-B instance ready … uid=<池位> … guest-uid=uid-0-in-userns    ← 槽位起来了
 kubectl -n sandlock get pods -l app=e2b-worker \
@@ -382,9 +392,10 @@ k0s 的 containerd socket（`/run/k0s/containerd.sock`）与 docker 的互不相
 
 顺带修进基线的两条（不在上表）：① `worker.yaml` 当时把 `replicas` 钉在 1 并加
 `strategy.maxSurge: 0`——默认滚动更新会先起第二个 pod，那正是当时「未验证」的
-双副本共享 base 形态，而且 4 核节点上也排不下。**N13 收口（§13）后 `replicas` 已放开到 2，
-`maxSurge: 0` 保留但理由换成容量**（这个 Deployment 没有 `requests`，Kubernetes 会把 2 CPU
-的 limit 复制成 request）；② 明文占位密钥（`local-key` /
+双副本共享 base 形态，而且 4 核节点上也排不下。**N13 收口（§13）后 `replicas` 放开到 2**，
+**N20 收口（§15）后整个对象从 Deployment 换成 StatefulSet**——后者的更新本来就是
+delete-then-create、没有 surge pod，`maxSurge` 那条也就随之消失了（这个 workload 没有
+`requests`，Kubernetes 会把 2 CPU 的 limit 复制成 request）；② 明文占位密钥（`local-key` /
 `internal-key` / 无口令 redis）改成 `e2b-secrets` Secret + `--requirepass`，缺 Secret 时
 pod 停在 `CreateContainerConfigError` 而不是静默用一个公共 key。
 
@@ -592,6 +603,21 @@ MULTI-WORKER INTERFERENCE OK        # 3 分 23 秒
 `protected_elsewhere=4`、**一棵没删** —— 这正是 N13 要的结论：护栏认的是**舰队全集**
 （`deletable = candidates - fleet_owned`），不是本 pod 的记忆。
 
+上面这轮是 2026-09-17 的记录（当时 node id 还会变，所以带那条 `NOTE`）。**N20 修好后
+（§15，worker 换成 StatefulSet）同一脚本的输出里那条 `NOTE` 消失了**，`protected_elsewhere`
+也从 4 降到 2 —— 重启的 worker 现在会用**同一个 node id** 回来，把它名下的记录认回去，
+另外 2 棵（对端的）才需要保护：
+
+```
+SANDBOX DISTRIBUTION: {'worker-0': 2, 'worker-1': 2}
+OK: both workers healthy and pod-backed again
+OK: all 4 trees still on the shared base (no cross-deletion)
+OK: every sandbox on a surviving worker still runs with its file intact
+OK: reconcile summaries show deleted=0 (protected_elsewhere=2, unmaterialised=3,
+    disk_sweep_skipped=0 across 1 round(s))
+MULTI-WORKER INTERFERENCE OK        # 2 分 37 秒
+```
+
 同一轮的两条冒烟（清单已是 `replicas: 2` 的多副本形态）：
 
 ```
@@ -611,11 +637,12 @@ N13 之前基线是钉死单副本的（`deploy/k8s/worker.yaml` `replicas: 1` +
 * `autoscaler.yaml` `E2B_AS_MIN_REPLICAS=2` / `E2B_AS_MAX_REPLICAS=16`；
   MIN 提到 2 是因为 **`draining: true` 是粘性的**（只有该节点重新注册才会清），
   空闲时缩到 1 会让"下一次扩容"先撞上一个被 drain 掉的节点，等于悄悄丢半个舰队；
-* `strategy.maxSurge: 0` **保留**，但理由换成**容量**：这个 Deployment 没有 `requests`，
-  Kubernetes 会把 2 CPU 的 limit 复制成 request，surge pod 在 4 核节点上根本排不下
-  （实测 `0/2 nodes are available: 1 Insufficient cpu`）；
+* `strategy.maxSurge: 0` 当时**保留**，理由换成**容量**（这个 Deployment 没有 `requests`，
+  Kubernetes 会把 2 CPU 的 limit 复制成 request，surge pod 在 4 核节点上根本排不下：
+  实测 `0/2 nodes are available: 1 Insufficient cpu`）。**这一条后来被 §15 取代**：换成
+  StatefulSet 后更新策略本身就是 delete-then-create，没有 surge pod 可排。
 * 单测相应改名并改断言：`test_k8s_runs_the_verified_multi_replica_worker_shape`、
-  `test_k8s_worker_replaces_rather_than_surges_on_rollout`（22 passed）。
+  `test_k8s_worker_is_a_statefulset_so_its_node_ids_survive_a_restart`。
 
 **前置是存储的锁必须跨节点**：uid 池靠 `<base>/.uid_pool.lock` 的 flock 互斥，
 阿里云 NAS 上只有 **NFSv4.0** 成立（v3+`nolock` 只是**本地**锁，跨节点不互斥 ⇒ 两个副本
@@ -642,12 +669,9 @@ N13 之前基线是钉死单副本的（`deploy/k8s/worker.yaml` `replicas: 1` +
 
 **新登记（未修，见 `docs/task-backlog.md`）**：
 
-* **N20** —— worker 重启后 **node id 变了**（pod 名），它从共享 base 上认领回来的沙箱记录
-  仍指向旧 id，控制面路由不到（表现 `Node unavailable: All connection attempts failed`），
-  要等 TTL。上面那两条 `NOTE: … lost their route` 就是它。**别**用 worker 上报的本地运行时
-  去推断归属 —— 那个列表里含共享 base 上**所有**树（`_reconcile_with_control_plane` 注释写明），
-  当成归属声明就会**偷走别人的沙箱**。方向：稳定 node id（StatefulSet）或让 worker 给出
-  "本节点真的在跑"的证据。
+* ~~**N20** —— worker 重启后 node id 变了（pod 名），它承载的沙箱记录仍指向旧 id，
+  控制面路由不到~~ ✅ **2026-09-18 已修（§15）**：worker 换成 StatefulSet，pod 名（= node id）
+  跨重启稳定，E6.1 那条「分区恢复」路径终于能生效。
 * ~~**N21** —— reconcile 轮次压在 worker 的事件循环上~~ ✅ **2026-09-18 已修**（轮次改成
   独立单飞 task，扫描与逐树校验挪到线程）：见 §14.4 与 `docs/task-backlog.md` N21。
 
@@ -747,3 +771,77 @@ worst gap across nodes: 5.15s (of which up to 0.15s is a reconcile round)
 契约测试在 `tests/contract/test_orphan_tree_gc.py::test_heartbeats_keep_their_cadence_while_a_round_scans_the_base`：
 它把扫描**故意卡住**（用事件而不是 sleep，避免时序巧合），然后断言三轮心跳照发 ——
 老形态下这条测试会卡死超时（已实测确认过 RED）。
+
+---
+
+## 15. 收口 N20：worker 换成 StatefulSet，node id 跨重启稳定（2026-09-18）
+
+### 15.1 问题的形态
+
+worker 的 node id 就是它的 pod 名（downward API `metadata.name`）。**Deployment 的 pod 名是随机的**，
+所以每次重启都是一个「新节点」：
+
+* 控制面把沙箱记录挂在**旧 id** 下，路由解析不到 ⇒ 客户端拿到
+  `Node unavailable: All connection attempts failed`；
+* 旧 id 会以僵尸节点的形式留在舰队视图里（死节点的预留也不回收）；
+* 更要命的是，它让 E6.1 那条**本来就设计好的分区恢复**路径失效了 —— 那条路径的前提是
+  「worker 用同一个 id 回来」：控制面把断开期间的记录标成 orphaned（**不删 workspace**），
+  worker 重连后由恢复轮次报告「这些还在我这」，控制面再 un-orphan。随机 pod 名把「分区」
+  变成了「永久丢节点」。
+
+### 15.2 为什么是稳定 id，而不是让控制面做认领
+
+一个诱人的替代方案是：让控制面把旧 id 的记录迁移给新 id。**不能这么做**，因为唯一能拿到的
+「归属证据」是不可信的 —— worker 上报的本地运行时列表含共享 base 上**所有**树（每个 worker
+都看得见别人的活沙箱，`_reconcile_with_control_plane` 的注释写明这个坑），拿它认领就是
+**偷别人的沙箱**。干净的做法是让「这个 worker 是不是同一个 worker」有确定答案，而那正是
+pod 名在表达式里承担的角色：把它变稳定，比事后猜要简单也要安全。
+
+顺带一提，**compose 那边一直就是这样**（`E2B_NODE_ID: worker-1` / `worker-2`，容器名稳定）。
+这次只是把 k8s 侧补齐到同一个语义。
+
+### 15.3 改了什么
+
+* `deploy/k8s/worker.yaml`：`kind: Deployment` → **`StatefulSet`**，pod 名变成
+  `e2b-worker-0` / `e2b-worker-1`（跨重启不变）；`serviceName: worker-headless` 指向文件里
+  本来就有的 headless Service；`podManagementPolicy: Parallel`（两个副本是对等的，不需要
+  OrderedReady 串行启动）。原来的 `strategy.maxSurge: 0` 随之删除 —— StatefulSet 的更新
+  本来就是 delete-then-create，没有 surge pod 可排。
+* `deploy/k8s/autoscaler.yaml`：新增 `E2B_AS_K8S_KIND=statefulset`，Role 补上
+  `statefulsets` / `statefulsets/scale`（缺了是硬 403，**实测踩到过**，不是静默无操作）。
+* `autoscaler/backends/k8s.py`：按 kind 拼 REST 路径（`deployments` / `statefulsets`），
+  未知 kind 在构造时就报错；`has_node`/`remove_node` 按 pod 名工作，两种 kind 通用。
+  单测 `tests/unit/test_autoscaler_k8s_backend.py` 钉住两条路径与拼写错误的拒绝。
+* `deploy/k8s-k0s/kustomization.yaml`：两个 worker patch 的 `target.kind` 跟着改成
+  `StatefulSet`。**这一步漏了会很隐蔽**：patch 不生效，worker 就以镜像里的 uid 65534 跑，
+  于是每个建箱都失败在 `<base>/.uid_pool.lock`（NAS 不让 65534 打开那个 root 建的 0600 文件）。
+  单测因此改成**按对象解析**（`_rendered_workload`），只断言 worker 容器自己的
+  `runAsUser`/`runAsGroup` —— 之前那句 `"runAsUser: 0" in out` 会被 control-plane 与
+  init 容器里的同名键满足（新断言对这个 bug 已实测确认 RED）。
+
+### 15.4 真集群验证
+
+一个沙箱建在 `e2b-worker-0` 上，写一个文件，然后删掉这个 pod：
+
+```
+sandbox sbx_42a05737ec545b7a on e2b-worker-0
+== deleting pod e2b-worker-0: the node id must come back as the same name
+route after:  e2b-worker-0            ← 路由没变，记录没被回收
+recovered in: 125.9s                  ← pod 重启（init + seccomp 检查）后文件 API 恢复
+CP still lists it: 200
+```
+
+worker 日志给出的恢复路径正是 E6.1：
+
+```
+registered node e2b-worker-0 at http://10.244.140.49:49983
+reconcile: restored sandboxes sbx_42a05737ec545b7a
+reconcile summary: deleted=0 delete_failures=0 unmaterialised=3 protected_elsewhere=0 …
+```
+
+即：**同一个 node id 回来 → 恢复轮次把记录认回去 → 文件原样还在**。改之前这条链是断的
+（旧 pod 名的记录谁也认不回，等窗口超时后连同 workspace 一起被回收）。
+
+同一形态下的三条验证全绿：`multinode_smoke.py`（4 箱 2+2）、`deployment_smoke.py`
+（含跨 worker 迁移 `e2b-worker-0 -> e2b-worker-1`、模板构建、箱内 MCP）、
+`multiworker_interference.py`（N13；并且它那条 N20 的 `NOTE` 自己消失了，见 §13.2）。

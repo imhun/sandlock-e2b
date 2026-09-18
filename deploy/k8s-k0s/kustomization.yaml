@@ -29,14 +29,14 @@ patches:
   - target:
       group: apps
       version: v1
-      kind: Deployment
+      kind: StatefulSet
       name: e2b-worker
       namespace: sandlock
     path: worker-root.patch.yaml
   - target:
       group: apps
       version: v1
-      kind: Deployment
+      kind: StatefulSet
       name: e2b-worker
       namespace: sandlock
     path: worker-capacity.patch.yaml

@@ -1,7 +1,15 @@
-"""Kubernetes Deployment backend using the k8s REST API directly (no extra
-dependency). Scales the worker Deployment and retires the drained pod by
-raising its pod-deletion-cost before scaling down, so the controller picks
-the safe pod to terminate."""
+"""Kubernetes workload backend using the k8s REST API directly (no extra
+dependency). Scales the worker Deployment *or* StatefulSet and retires the
+drained pod by raising its pod-deletion-cost before scaling down, so the
+controller picks the safe pod to terminate.
+
+Both kinds are supported because the shape decides whether a worker's identity
+survives a restart: the baseline runs a StatefulSet so the node ids are stable
+(``e2b-worker-0``/``-1``, matching the compose stack's ``E2B_NODE_ID``), while a
+cluster that only has the Deployment form (pre-N20 manifests) must stay
+scalable. ``has_node``/``remove_node`` are kind-agnostic either way: they work on
+pods, and the node id *is* the pod name.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +23,13 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _DELETION_COST = "controller.kubernetes.io/pod-deletion-cost"
+
+#: ``kind`` -> the REST path segment for it. Only these two are meaningful: the
+#: autoscaler scales worker replicas, not arbitrary workloads.
+_RESOURCE_FOR_KIND = {
+    "deployment": "deployments",
+    "statefulset": "statefulsets",
+}
 
 
 def _service_account_token() -> str | None:
@@ -30,11 +45,19 @@ class KubernetesBackend:
         *,
         namespace: str,
         deployment: str,
+        kind: str = "deployment",
         client: httpx.Client | None = None,
         in_cluster: bool = True,
     ) -> None:
         self._namespace = namespace
         self._deployment = deployment
+        self._kind = kind.strip().lower()
+        if self._kind not in _RESOURCE_FOR_KIND:
+            raise ValueError(
+                f"unsupported workload kind {kind!r}: expected one of "
+                f"{sorted(_RESOURCE_FOR_KIND)}"
+            )
+        self._resource = _RESOURCE_FOR_KIND[self._kind]
         if client is not None:
             self._client = client
             return
@@ -54,7 +77,7 @@ class KubernetesBackend:
     def _deploy_url(self) -> str:
         return (
             f"/apis/apps/v1/namespaces/{self._namespace}"
-            f"/deployments/{self._deployment}"
+            f"/{self._resource}/{self._deployment}"
         )
 
     def current(self) -> int:
@@ -74,7 +97,9 @@ class KubernetesBackend:
             json={"spec": {"replicas": int(replicas)}},
         )
         resp.raise_for_status()
-        logger.info("scaled deployment %s to %s", self._deployment, replicas)
+        logger.info(
+            "scaled %s %s to %s", self._kind, self._deployment, replicas
+        )
 
     def remove_node(self, node_id: str) -> None:
         """Retire one specific pod: prefer deleting it on scale-down."""

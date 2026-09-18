@@ -30,6 +30,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO = Path(__file__).resolve().parent.parent.parent
 STACK_COMPOSE = (REPO / "deploy" / "stack" / "docker-compose.prod.yml").read_text(
@@ -252,16 +253,39 @@ def test_k8s_runs_the_verified_multi_replica_worker_shape() -> None:
     assert "nolock" in following
 
 
-def test_k8s_worker_replaces_rather_than_surges_on_rollout() -> None:
-    """maxSurge 0 is a capacity property of this manifest, not a shape guard.
+def test_k8s_worker_is_a_statefulset_so_its_node_ids_survive_a_restart() -> None:
+    """N20: the worker's node id is its pod name, so the pod name has to be stable.
 
-    This Deployment has no `requests`, so Kubernetes copies its 2-CPU limit into
-    the request; a surge pod therefore cannot schedule on a 4-core node -- measured
-    2026-09-17 on k0s, where a rollout stalled with
-    `0/2 nodes are available: 1 Insufficient cpu`. Delete-then-create keeps upgrades
-    working on small nodes.
+    A Deployment gives every restart a brand-new pod name, i.e. a brand-new node id.
+    The control plane keeps the previous incarnation's sandbox records under the old
+    id, cannot route to them until they age out (`Node unavailable: All connection
+    attempts failed`, measured), and the old node lingers as a zombie in the fleet
+    view. A StatefulSet's ordinals remove that class outright -- and they are what
+    the compose stack has always had (`E2B_NODE_ID: worker-1` / `worker-2`), so this
+    is the k8s half of an existing property rather than a new one.
+
+    The service reference and the rollout strategy are pinned with it: `serviceName`
+    is required for the stable per-pod DNS that makes the ordinals real, and
+    StatefulSet updates are already delete-then-create, one pod at a time. That last
+    part is also why there is no `maxSurge: 0` to look for any more -- this workload
+    declares no `requests`, so Kubernetes copies the 2-CPU limit into the request and
+    a surge pod cannot fit a 4-core node (measured 2026-09-17: a Deployment rollout
+    stalled with `0/2 nodes are available: 1 Insufficient cpu`).
     """
-    assert "  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 0\n" in K8S_WORKER
+    assert K8S_WORKER.startswith("apiVersion: apps/v1\nkind: StatefulSet\n")
+    assert "  serviceName: worker-headless\n" in K8S_WORKER
+    assert "  podManagementPolicy: Parallel\n" in K8S_WORKER
+    assert "  updateStrategy:\n    type: RollingUpdate\n" in K8S_WORKER
+    # No Deployment-only leftovers: `strategy.maxSurge` is silently ignored on a
+    # StatefulSet, so leaving it behind would read as a guard that is not there.
+    assert "    rollingUpdate:\n      maxSurge:" not in K8S_WORKER
+    assert "\n  strategy:\n" not in K8S_WORKER
+    # The autoscaler has to scale the same kind, or it would 404 on every tick.
+    autoscaler = (REPO / "deploy" / "k8s" / "autoscaler.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "name: E2B_AS_K8S_KIND\n" in autoscaler
+    assert "value: statefulset\n" in autoscaler
 
 
 def test_k8s_control_plane_stays_single_replica_until_node_registry_is_shared() -> None:
@@ -495,7 +519,37 @@ def test_k0s_overlay_moves_the_seccomp_root_to_the_k0s_kubelet_dir() -> None:
     # The overlay also makes the worker root: a network filesystem authorizes a
     # chown by the AUTH_SYS uid, not by the client's capabilities, so the non-root
     # file-capability broker cannot hand a sandbox tree to its pooled uid there.
-    assert "runAsUser: 0" in out
+    #
+    # Read it off the *worker container*, not the rendered text: `runAsUser: 0`
+    # appears in other objects (control-plane, the seccomp installer) and in the
+    # baseline's init containers, so a substring match passes even when this patch
+    # misses its target entirely. That is not hypothetical -- moving the worker from
+    # Deployment to StatefulSet without updating the patch's `target.kind` left the
+    # container running as the image's 65534, and every create then failed with
+    # `Permission denied: <base>/.uid_pool.lock` (a root-owned 0600 file the NAS
+    # will not let 65534 open).
+    worker = _rendered_workload(out, "StatefulSet", "e2b-worker")
+    security = worker["spec"]["template"]["spec"]["containers"][0]["securityContext"]
+    assert security["runAsUser"] == 0
+    assert security["runAsGroup"] == 65534
+
+
+def _rendered_workload(rendered: str, kind: str, name: str) -> dict:
+    """The one rendered object of ``kind``/``name``.
+
+    Parsing beats grepping for anything about a pod's security context: the same
+    keys appear in every workload, so text assertions cannot tell which object
+    they matched.
+    """
+    matches = [
+        doc
+        for doc in yaml.safe_load_all(rendered)
+        if isinstance(doc, dict)
+        and doc.get("kind") == kind
+        and doc.get("metadata", {}).get("name") == name
+    ]
+    assert len(matches) == 1, f"expected exactly one {kind}/{name}: {len(matches)}"
+    return matches[0]
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")

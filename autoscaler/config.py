@@ -83,6 +83,12 @@ class Settings:
     k8s_deployment: str = field(
         default_factory=lambda: os.getenv("E2B_AS_K8S_DEPLOYMENT", "e2b-worker")
     )
+    #: ``deployment`` or ``statefulset``. The baseline runs the worker as a
+    #: StatefulSet so its node ids are stable across restarts (N20); the name of
+    #: the object still comes from ``E2B_AS_K8S_DEPLOYMENT``.
+    k8s_kind: str = field(
+        default_factory=lambda: os.getenv("E2B_AS_K8S_KIND", "deployment")
+    )
 
 
 def _env_json(name: str, default: dict) -> dict:
