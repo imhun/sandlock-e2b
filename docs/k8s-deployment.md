@@ -89,8 +89,10 @@ pod 实测 `Seccomp: 2 / Seccomp_filters: 1`（即 worker 启动自检所需的�
 worker / control-plane-gateway / autoscaler / quota-agent 推到 ACR，并**把版本写进
 `deploy/stack/.version`（gitignored）**；compose 侧 `upgrade.sh` 直接读它来 pin tag，
 k8s 侧没有等价的自动机制，所以要显式把 tag 换成当次构建的版本。
-**2026-09-17 的最近一次发布**：`0.1.0-330-g235fc34-20260917-142808`（含 `auto` 在无 Landlock
-内核上 fail-closed 的修复，已在 main 集群用该 tag 复验通过）。升级时：
+**2026-09-18 的最近一次发布**：**`0.1.0-348-g837b2ca-20260918-143848`**（N12/N19/N20/N21 与
+`reconcile` 解耦那批都在里面）。**两套栈现在跑同一个 tag**：compose 生产栈（`.140`）与这台
+k0s 集群都指到它，`deploy/stack/.version` 重新成为唯一权威 —— §13.3 里那个"k8s 侧 tag 漂移"
+已经消掉。升级时：
 
 ```bash
 kubectl -n $NS set image sts/e2b-worker worker=<REGISTRY>/byteplan/e2b-sandlock-worker:<VERSION>
@@ -307,8 +309,8 @@ Landlock 要 5.13+），且 `user.max_user_namespaces = 0` ⇒ `unshare -U` 直�
 2. **共享存储**：单节点 → k3s `local-path` 即可；**多副本 → 必须 NFS**。
    `deploy/k8s/pvc.yaml` 已预留 `# storageClassName: nfs`，仓库里已有 `deploy/scripts/nfs-probe`、
    `nfs_quota_probe.sh` 与相关文档口径 —— 是先例，不是新坑。
-3. **镜像**：直接用本次发布 `0.1.0-330-g235fc34-20260917-142808`（含 `auto` 在无 Landlock 内核上
-   fail-closed 的修复，已在 ACK 用该 tag 复验）。
+3. **镜像**：直接用当前发布 `0.1.0-348-g837b2ca-20260918-143848`（值见 `deploy/stack/.version`；
+   含 `auto` 在无 Landlock 内核上 fail-closed 的修复，已在 ACK 复验过）。
 
 ### 9.5 最短路径（内核闸门通过后）
 
@@ -648,13 +650,14 @@ N13 之前基线是钉死单副本的（`deploy/k8s/worker.yaml` `replicas: 1` +
 阿里云 NAS 上只有 **NFSv4.0** 成立（v3+`nolock` 只是**本地**锁，跨节点不互斥 ⇒ 两个副本
 可能发出同一个 uid）。这条已写进清单注释，别在 v3/`nolock` 的存储上照抄这份形态。
 
-⚠ **镜像 tag 的坑（收口这轮实测踩到）**：`deploy/k8s-k0s/apply.sh` 会把**所有**
+⚠ **镜像 tag 的坑（收口那轮踩到，2026-09-18 已消）**：`deploy/k8s-k0s/apply.sh` 会把**所有**
 `byteplan/e2b-sandlock-*` 的 tag 统一替换成 `deploy/stack/.version` 里的那一个字符串，
-所以本轮为了带上 N18 与放置窗口两处改动，worker 与 control-plane 各自推了**不同**的 tag
-（worker `0.1.0-n18split-20260917-1920`、control-plane `0.1.0-n13-20260917-2010`），
-再用 `kubectl set image` 指过去。**下次直接 `apply.sh` 会把这两个 tag 复位成 `.version`**
-（一个更早的版本），要么先跑 `deploy/scripts/build-and-push.sh` 生成一套一致的 tag 写进
-`.version`，要么 apply 之后再用 `kubectl set image` 指回来。
+所以收口 N18/N13 时 worker 与 control-plane 各推了**不同**的临时 tag 再用 `kubectl set image`
+指过去 —— 而任何一次 `apply.sh` 都会把它们复位成 `.version`（当时是个更早的版本）。
+**现在不用再这么做了**：`./deploy/scripts/build-and-push.sh` 会为每个组件推同一个版本号，
+compose 栈与这台 k0s 集群都指到它（当前 `0.1.0-348-g837b2ca-20260918-143848`），
+`apply.sh` 渲染出来的 tag 与线上一致。部署顺序就是「build-and-push → upgrade.sh（compose）
+→ apply.sh 或 set image（k8s）」。
 
 ### 13.4 收口过程中另外修掉/新发现的问题
 
@@ -979,3 +982,23 @@ docker run --rm --privileged --network host -v "$PWD:/workspace" -w /workspace \
 对比过），所以那 5 个不是这次带进去的。它们共用一个签名：`(soft, hard) == (8192, 8192)`
 而测试期望 `(0, 8192)` —— 即 **fd 后端把 soft 也设成了 hard**（`xfs_quotactl.set_limit` 里
 `<Q` 两处都写 `blocks`），而 subprocess 路径只设 hard。两条后端语义不一致，已登记为 **N23**。
+
+### 17.4 生产目标机（`.140` compose 栈）验证
+
+升级到 `0.1.0-348-g837b2ca-20260918-143848` 之后，直接在真机上量了一遍「行跟着沙箱走」：
+
+```
+rows before      : ['#0 19201056 0 0']
+created          : sbx_29c04381dbd87bf5
+rows while alive : ['#0 19201060 0 0', '#700308939 4 1048576 1048576']
+rows after kill  : ['#0 19201064 0 0']
+gone after kill  : ['#700308939 4 1048576 1048576']
+N12 ON THE TARGET OK
+```
+
+即那一行随建箱出现、随删除**立即消失** —— 不再有「0 用量 + 非零 hard_blocks」的残留行。
+
+⚠ 同一份输出也是 **N23 在生产机上的复现**：`#700308939` 的 soft 与 hard 都是 `1048576`
+（1 GiB），而契约要的是「只设 hard」。（此前只在本地 lane 上见过，所以 N23 的证据现在
+从"测试环境"升级成"生产栈"。）另外这次升级本身也顺手清掉了一批旧行：两个 worker 重启时
+的启动 reconcile 把上一版留下的残留行收掉了。
