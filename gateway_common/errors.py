@@ -115,6 +115,10 @@ def resource_exhausted(message: str) -> ConnectError:
     return connect_error(CONNECT_CODE_RESOURCE_EXHAUSTED, message)
 
 
+def failed_precondition(message: str) -> ConnectError:
+    return connect_error(CONNECT_CODE_FAILED_PRECONDITION, message)
+
+
 def unimplemented(message: str) -> ConnectError:
     return connect_error(CONNECT_CODE_UNIMPLEMENTED, message)
 

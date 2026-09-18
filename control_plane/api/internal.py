@@ -137,8 +137,15 @@ async def _enforce_disk_reports(
 
     for record in request.app.state.registry.enforce_disk_budget(reports):
         _park_capacity(request, record)
+        reason = (
+            f"its workspace grew past its budget "
+            f"({(record.workspace_disk_used_bytes or 0) // (1024 * 1024)} MiB "
+            f"used of {record.disk_size_mb} MiB)"
+        )
         try:
-            await _push_pause_state(request, record, paused=True)
+            pushed = await _push_pause_state(
+                request, record, paused=True, reason=reason
+            )
         except Exception:  # pragma: no cover - worker-specific transport
             logger.warning(
                 "could not freeze over-budget sandbox %s on node %s; the "
@@ -146,6 +153,16 @@ async def _enforce_disk_reports(
                 record.sandbox_id,
                 node_id,
                 exc_info=True,
+            )
+            continue
+        if not pushed:
+            # Combined deployment (``local://``): there is no agent to push to,
+            # so the shared runtime registry is what carries the state -- the
+            # same branch ``pause_sandbox`` takes. Without it the record said
+            # "paused" while the worker's runtime (and therefore both write
+            # gates) still said "running".
+            request.app.state.runtime_registry.set_state(
+                record.sandbox_id, "paused", reason
             )
 
 

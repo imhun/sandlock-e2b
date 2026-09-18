@@ -42,6 +42,23 @@ class RunningProcess:
     def send_stdin(self, data: bytes) -> None:
         raise NotImplementedError
 
+    async def feed_stdin(self, data: bytes) -> None:
+        """Feed ``data`` to the child's stdin, waiting for room (N28).
+
+        ``send_stdin`` is the interactive path: it must never block the event
+        loop, so a backend whose input buffer is full *drops* the bytes (the
+        sandlock backend logs the drop). A workspace write cannot drop
+        anything, so the writer uses this variant instead: it returns only
+        once the backend has accepted the bytes, and raises when the child has
+        no stdin at all (a silently-absent stdin would turn a streamed upload
+        into an empty file, which is worse than a refusal).
+
+        The base class derives it from ``send_stdin``: a backend that cannot
+        apply backpressure (or cannot tell) keeps the old behaviour, and the
+        two backends that can -- local and sandlock -- override it.
+        """
+        self.send_stdin(data)
+
     def close_stdin(self) -> None:
         raise NotImplementedError
 

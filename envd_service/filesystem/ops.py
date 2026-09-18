@@ -1,9 +1,17 @@
-"""Filesystem operations over a sandbox workspace root."""
+"""Filesystem operations over a sandbox workspace root.
+
+This module is the **read** side of the filesystem service plus the
+*decisions* every write makes before it touches anything. It deliberately does
+not perform the writes: since N28 the sandbox is the single writer of its own
+tree (``envd_service.filesystem.writer``), and the worker only looks. The
+guards live here rather than inside the writer's shell script because they are
+what the API contract is written in terms of (``already_exists`` /
+``not_found``), and because they need nothing but a read.
+"""
 
 from __future__ import annotations
 
 import os
-import shutil
 import stat as stat_module
 from pathlib import Path
 from typing import Any
@@ -95,35 +103,42 @@ class FilesystemOps:
             raise not_found(f"Path {path} not found")
         return _entry(self.root, target, st)
 
-    def make_dir(self, path: str) -> dict[str, Any]:
+    # -- write guards ------------------------------------------------------
+    #
+    # Each guard answers "may this write happen, and if not, which documented
+    # code does the caller get?" and returns the resolved target(s) the writer
+    # is then told to operate on. The worker is allowed to answer them: it is
+    # a read of the tree it just served the caller's request against.
+
+    def require_creatable(self, path: str) -> Path:
+        """Resolve ``path`` for ``MakeDir``, refusing an existing entry.
+
+        The path arrives *resolved*, so a symlink is judged as its target --
+        that is the semantics the request path has always had
+        (``resolve_under_root``), and the helper then runs against the same
+        resolved name.
+        """
         target = _resolve(self.root, path)
         if target.exists():
             raise already_exists(f"Path {path} already exists")
-        try:
-            target.mkdir(parents=True)
-        except FileExistsError:
-            raise already_exists(f"Path {path} already exists")
-        return _entry(self.root, target)
+        return target
 
-    def move(self, source: str, destination: str) -> dict[str, Any]:
+    def require_movable(self, source: str, destination: str) -> tuple[Path, Path]:
+        """Resolve both ends of ``Move``, refusing a missing/occupied pair."""
         src = _resolve(self.root, source)
         dst = _resolve(self.root, destination)
-        if not src.exists() and not src.is_symlink():
+        if not src.exists():
             raise not_found(f"Path {source} not found")
         if dst.exists():
             raise ConnectError("already_exists", f"Path {destination} already exists", 409)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(src, dst)
-        return _entry(self.root, dst)
+        return src, dst
 
-    def remove(self, path: str) -> None:
+    def require_removable(self, path: str) -> Path:
+        """Resolve ``path`` for ``Remove``, refusing an absent entry."""
         target = _resolve(self.root, path)
-        if not target.exists() and not target.is_symlink():
+        if not target.exists():
             raise not_found(f"Path {path} not found")
-        if target.is_dir() and not target.is_symlink():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
+        return target
 
     def list_dir(self, path: str, depth: int) -> dict[str, Any]:
         target = _resolve(self.root, path)
@@ -150,4 +165,3 @@ class FilesystemOps:
                     and (depth == 0 or current + 1 < depth)
                 ):
                     self._walk(path, current + 1, depth, out)
-

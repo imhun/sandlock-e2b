@@ -300,6 +300,24 @@ class SandlockRunningProcess(RunningProcess):
         except asyncio.QueueFull:
             logger.warning("sandlock stdin queue full; dropping %d bytes", len(data))
 
+    async def feed_stdin(self, data: bytes) -> None:
+        """``send_stdin`` that waits for queue room instead of dropping (N28).
+
+        The interactive path above trades bytes for latency on purpose
+        (a keystroke that cannot be queued is not worth stalling the event
+        loop for). A streamed upload has the opposite requirement: every byte
+        must arrive, and the producer can afford to wait. ``await put`` on the
+        same bounded queue gives exactly that backpressure -- the queue holds
+        at most 256 chunks, so a fast reader of a 512 MiB body never has more
+        than that in flight.
+        """
+        if self._closed or self._stdin_closed:
+            raise RuntimeError("the child's stdin is already closed")
+        if self._input_stream is None:
+            raise RuntimeError("the child has no stdin stream to write to")
+        self._start_stdin_writer()
+        await self._stdin_queue.put(data)
+
     def close_stdin(self) -> None:
         if self._pty_mode:
             # A pty has no independent EOF: closing the master write side
@@ -417,6 +435,7 @@ class SandlockExecutor(Executor):
         memory_mb: int,
         cpu_percent: int,
         disk_mb: int,
+        max_file_size_mb: int | None = None,
         max_processes: int,
         max_open_files: int,
         allow_internet_access: bool,
@@ -446,6 +465,7 @@ class SandlockExecutor(Executor):
         self._memory_mb = memory_mb
         self._cpu_percent = cpu_percent
         self._disk_mb = disk_mb
+        self._max_file_size_mb = max_file_size_mb
         self._max_processes = max_processes
         self._max_open_files = max_open_files
         self._allow_internet_access = allow_internet_access
@@ -1411,6 +1431,27 @@ class SandlockExecutor(Executor):
         }
         return {k: v for k, v in params.items() if v is not None}
 
+    def _max_file_size_bytes(self) -> int | None:
+        """The single-file ceiling (``RLIMIT_FSIZE``) to ask the fork for (N28/C).
+
+        ``None`` = do not ask, i.e. inherit the system limit. The *number* is
+        the caller's own decision (``RuntimeRegistry.max_file_size_mb``, the
+        largest budget the sandbox was sold); this only converts MiB to the
+        bytes the fork's builder takes.
+
+        The limit is what makes the disk story have a *hard* half. Every other
+        disk bound here is either sold up front (the admission ledger) or
+        measured after the fact (the L2b walk); this one is the kernel
+        refusing a write that would cross it, at zero runtime cost to the
+        worker. Because it is per *process*, it necessarily also covers the
+        things a sandbox writes outside its tree (``/tmp`` inside the image
+        rootfs, a volume's mount) -- the budget it is set to is the largest of
+        those, so it can only ever refuse something already over budget.
+        """
+        if self._max_file_size_mb is None or self._max_file_size_mb <= 0:
+            return None
+        return int(self._max_file_size_mb) * 1024 * 1024
+
     def _policy_ceiling(self) -> dict:
         """Command-independent policy ceiling for the long-lived instance, as kwargs.
 
@@ -1497,6 +1538,7 @@ class SandlockExecutor(Executor):
             "max_open_files": self._max_open_files,
             "max_cpu": min(100, max(1, self._cpu_percent)),
             "max_disk": f"{self._disk_mb}M",
+            "max_file_size": self._max_file_size_bytes(),
             "notify_rate_limit": self._notify_rate_limit or None,
             "uid": sandbox_uid,
             "gid": sandbox_gid,
@@ -1704,6 +1746,7 @@ class SandlockExecutor(Executor):
             "max_open_files": self._max_open_files,
             "max_cpu": min(100, max(1, self._cpu_percent)),
             "max_disk": f"{self._disk_mb}M",
+            "max_file_size": self._max_file_size_bytes(),
             "notify_rate_limit": self._notify_rate_limit or None,
             "clean_env": True,
             "env": dict(config.env),

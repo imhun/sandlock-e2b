@@ -7,6 +7,8 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from envd_service.runtime.registry import state_clause
+
 
 class HttpAuthError(Exception):
     def __init__(
@@ -32,11 +34,19 @@ def http_error_response(request: Request, exc: HttpAuthError) -> JSONResponse:
     )
 
 
-def require_http_sandbox(request: Request, health: bool = False) -> Any:
+def require_http_sandbox(
+    request: Request, health: bool = False, mutating: bool = False
+) -> Any:
     """Look up the sandbox runtime for an HTTP request.
 
     ``/health`` reports a missing sandbox as 502 so the SDK's
     ``is_running()`` returns ``False`` after kill; other endpoints use 404.
+
+    ``mutating`` marks an endpoint that changes the workspace. A sandbox that
+    is not running refuses those: a paused sandbox has given its admission
+    reservation back (E9.2), so a write into it would land in a workspace
+    nothing is accounting for -- and the sandbox's own processes could not have
+    made it. Reads stay allowed, so an operator can look before resuming.
     """
     sandbox_id = request.headers.get("E2b-Sandbox-Id")
     if not sandbox_id:
@@ -53,6 +63,13 @@ def require_http_sandbox(request: Request, health: bool = False) -> Any:
         and token != runtime.access_token
     ):
         raise HttpAuthError(401, "Invalid access token")
+    state = getattr(runtime, "state", "running")
+    if mutating and state != "running":
+        raise HttpAuthError(
+            409,
+            f"{state_clause(runtime, state)}; its files can only be modified "
+            "while it is running (resume it first)",
+        )
     # E9.1: an authenticated call is activity; the worker reports it to the
     # control plane on its next heartbeat (idle detection / eviction).
     request.app.state.runtime_registry.mark_active(sandbox_id)

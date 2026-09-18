@@ -59,6 +59,24 @@ class LocalRunningProcess(RunningProcess):
         if self._stdin_writer is not None and not self._stdin_writer.is_closing():
             self._stdin_writer.write(data)
 
+    async def feed_stdin(self, data: bytes) -> None:
+        """``send_stdin`` with backpressure (N28); raises without a stdin.
+
+        ``StreamWriter.write`` only buffers, so a loop that feeds a large
+        body without draining would grow the buffer at memory speed; ``drain``
+        is what makes the producer wait for the child. A child started with
+        ``stdin_enabled=False`` has no writer at all (its stdin is
+        ``/dev/null``), and writing an upload there would silently produce an
+        empty file -- refuse instead.
+        """
+        if self._pty_master is not None:
+            self.send_stdin(data)
+            return
+        if self._stdin_writer is None or self._stdin_writer.is_closing():
+            raise RuntimeError("the child has no stdin stream to write to")
+        self._stdin_writer.write(data)
+        await self._stdin_writer.drain()
+
     def close_stdin(self) -> None:
         if self._pty_master is not None:
             return

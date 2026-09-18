@@ -8,17 +8,22 @@ pause|resume``), and a real sandlock worker must freeze a background command
 until the SDK's ``Sandbox.connect`` auto-resume thaws it.
 
 The freeze is proven, not inferred. The background command waits for a marker
-file and can only print ``done`` once that marker exists, and the tests (a)
-poll the worker's own runtime state for a SIGSTOPped exec child (``/proc/
-<pid>/stat`` shows ``T``) instead of racing a fixed silence window against the
-command's own deadline, and (b) create the marker while the sandbox is paused
--- pause freezes the running command groups, it does not gate new execs
-(parity with the combined deployment) -- so a frozen child that keeps its
-output is direct evidence of the freeze rather than of a command that simply
-had not finished yet. The 2.0s window after the marker exists is the same
-``queue.Empty`` check as the combined contract's, now with its premise
-guaranteed: the child's completion condition is satisfied and it still must
-stay silent while paused.
+file and can only print ``done`` once that marker exists; the tests poll the
+worker's own runtime state for a SIGSTOPped exec child (``/proc/<pid>/stat``
+shows ``T``) instead of racing a fixed silence window against the command's
+own deadline, and then pin the state's *second* half (N28/A): the marker that
+would satisfy the child cannot be created while the sandbox is paused, because
+a paused sandbox refuses new execs and new writes outright. The 2.0s
+``queue.Empty`` window follows that refusal with the child demonstrably
+frozen, and the same write is admitted again once ``Sandbox.connect`` resumes
+-- at which point the thawed child completes.
+
+Refusal shape, measured off the SDK rather than assumed (probe:
+``tmp/k0s/probe_pause_errors.py``, 2026-09-18): the command path answers
+``failed_precondition``, which the vendored SDK renders as
+``SandboxException("Code.FAILED_PRECONDITION: <our message>")`` -- the
+``Code.`` prefix is the SDK's own formatting of an unmapped code, so the
+assertion below spells it out instead of matching a substring.
 
 ``test_paused_sandbox_survives_a_stalled_worker_heartbeat`` runs the same
 delivery while the hosting node *looks* lost (E6.1's node-health sweep
@@ -44,7 +49,7 @@ import time
 
 import pytest
 
-from e2b import Sandbox
+from e2b import Sandbox, SandboxException
 from tests.security.conftest import sandlock_ready
 
 pytestmark = pytest.mark.skipif(
@@ -70,6 +75,22 @@ THAW_BUDGET_S = 15.0
 #: The background command's completion condition: it can only print ``done``
 #: once this file exists, and the tests create it *after* the freeze.
 MARKER = "pafl-go"
+
+#: What the paused sandbox answers a new command with, as the SDK renders it
+#: (see the module docstring: the ``Code.`` prefix comes from the vendored
+#: SDK's own formatting of a Connect code it does not map to a typed
+#: exception).
+PAUSED_COMMAND_REFUSAL = (
+    "Code.FAILED_PRECONDITION: Sandbox is paused; run a command only while "
+    "it is running (resume it first)"
+)
+
+
+def _assert_paused_refuses_commands(sandbox) -> None:
+    """A paused sandbox admits no new exec, so no marker can be created."""
+    with pytest.raises(SandboxException) as refused:
+        sandbox.commands.run(f"touch {MARKER}")
+    assert str(refused.value) == PAUSED_COMMAND_REFUSAL
 
 
 def _proc_state(pid: int) -> str:
@@ -203,10 +224,10 @@ def test_pause_delivery_freezes_remote_child_until_connect_resumes(
         # This is the property the old silence window only inferred, and it no
         # longer races the command's own deadline.
         frozen_pid = _wait_for_frozen(harness, sandbox.sandbox_id, FREEZE_BUDGET_S)
-        # Satisfy the child's completion condition while the sandbox is
-        # paused (pause does not gate new execs). It is now ready to print
-        # ``done`` -- and it must still not, because it is frozen.
-        assert sandbox.commands.run(f"touch {MARKER}").exit_code == 0
+        # The marker cannot be created while the sandbox is paused (N28/A):
+        # new execs are refused, so the child stays *un-satisfied* as well as
+        # frozen.
+        _assert_paused_refuses_commands(sandbox)
         assert _proc_state(frozen_pid) == "T"
         with pytest.raises(queue.Empty):
             ended.get(timeout=PAUSED_SILENCE_WINDOW_S)
@@ -217,6 +238,9 @@ def test_pause_delivery_freezes_remote_child_until_connect_resumes(
             sandbox_url=harness["sandbox_url"],
             api_key="local-key",
         )
+        # Resumed: the same command is admitted, satisfies the child's
+        # completion condition, and the thawed child finishes.
+        assert sandbox.commands.run(f"touch {MARKER}").exit_code == 0
         outcome = ended.get(timeout=THAW_BUDGET_S)
         if isinstance(outcome, BaseException):
             raise outcome
@@ -304,7 +328,8 @@ def test_paused_sandbox_survives_a_stalled_worker_heartbeat(
             time.sleep(0.2)
         assert nodes.get(record.node_id).status == "healthy"
 
-        assert sandbox.commands.run(f"touch {MARKER}").exit_code == 0
+        # Still paused: the node came back, the state did not change.
+        _assert_paused_refuses_commands(sandbox)
         with pytest.raises(queue.Empty):
             ended.get(timeout=PAUSED_SILENCE_WINDOW_S)
 
@@ -314,6 +339,7 @@ def test_paused_sandbox_survives_a_stalled_worker_heartbeat(
             sandbox_url=harness["sandbox_url"],
             api_key="local-key",
         )
+        assert sandbox.commands.run(f"touch {MARKER}").exit_code == 0
         outcome = ended.get(timeout=THAW_BUDGET_S)
         if isinstance(outcome, BaseException):
             raise outcome

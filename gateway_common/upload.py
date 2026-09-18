@@ -90,14 +90,26 @@ async def stream_body_to_file(
     return await _drain(chunks(), Path(path), limit_bytes)
 
 
-async def stream_upload_file_to_file(
-    file_obj,
-    path: str | Path,
-    limit_bytes: int | None,
-    *,
-    chunk_size: int = 64 * 1024,
-) -> int:
-    """Drain a multipart ``UploadFile`` to ``path`` in bounded chunks."""
+def request_chunks(request: Request) -> AsyncIterable[bytes]:
+    """The request body as a chunk stream, without buffering any of it.
+
+    Shared by the worker-side sink (:func:`stream_body_to_file`) and the
+    sandbox-side one (``envd_service.filesystem.writer``), so the two differ
+    only in *where* the bytes land.
+    """
+
+    async def chunks() -> AsyncIterable[bytes]:
+        async for chunk in request.stream():
+            if chunk:
+                yield chunk
+
+    return chunks()
+
+
+def upload_file_chunks(
+    file_obj, *, chunk_size: int = 64 * 1024
+) -> AsyncIterable[bytes]:
+    """A multipart ``UploadFile`` as a chunk stream (see ``request_chunks``)."""
 
     async def chunks() -> AsyncIterable[bytes]:
         while True:
@@ -106,7 +118,20 @@ async def stream_upload_file_to_file(
                 return
             yield chunk
 
-    return await _drain(chunks(), Path(path), limit_bytes)
+    return chunks()
+
+
+async def stream_upload_file_to_file(
+    file_obj,
+    path: str | Path,
+    limit_bytes: int | None,
+    *,
+    chunk_size: int = 64 * 1024,
+) -> int:
+    """Drain a multipart ``UploadFile`` to ``path`` in bounded chunks."""
+    return await _drain(
+        upload_file_chunks(file_obj, chunk_size=chunk_size), Path(path), limit_bytes
+    )
 
 
 async def _drain(

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import errno
-import os
 import stat
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -15,14 +13,15 @@ from starlette.datastructures import UploadFile
 
 from envd_service.filesystem.ops import FilesystemOps, _entry
 from envd_service.http.auth import HttpAuthError, http_error_response, require_http_sandbox
-from gateway_common.errors import invalid_argument, not_found
+from envd_service.runtime.context import runtime_context
+from gateway_common.errors import ConnectError, invalid_argument, not_found
 from gateway_common.paths import PathTraversalError, resolve_under_root
 from gateway_common.upload import (
     UploadTooLargeError,
     check_content_length,
     limit_bytes_from_mb,
-    stream_body_to_file,
-    stream_upload_file_to_file,
+    request_chunks,
+    upload_file_chunks,
 )
 
 router = APIRouter()
@@ -80,31 +79,6 @@ def _metadata_from_headers(request: Request) -> dict[str, str]:
     return metadata
 
 
-def _persist_metadata(path: Path, metadata: dict[str, str]) -> None:
-    for key, value in metadata.items():
-        try:
-            os.setxattr(path, f"user.e2b.{key}", value.encode("utf-8"))
-        except (OSError, AttributeError):
-            pass
-
-
-def _read_metadata(path: Path) -> dict[str, str] | None:
-    metadata: dict[str, str] = {}
-    try:
-        names = os.listxattr(path)
-    except (OSError, AttributeError):
-        return None
-    for name in names:
-        if name.startswith("user.e2b."):
-            try:
-                metadata[name[len("user.e2b.") :]] = os.getxattr(
-                    path, name
-                ).decode("utf-8", "replace")
-            except OSError:
-                pass
-    return metadata or None
-
-
 def _upload_response(ops: FilesystemOps, path: Path, metadata: dict[str, str]) -> dict[str, Any]:
     return {
         "name": path.name,
@@ -112,6 +86,21 @@ def _upload_response(ops: FilesystemOps, path: Path, metadata: dict[str, str]) -
         "path": path.relative_to(ops.root).as_posix(),
         "metadata": metadata or None,
     }
+
+
+def _write_failure(request: Request, exc: Exception) -> Response:
+    """Map a write-path failure onto the HTTP answer the caller can act on.
+
+    The workspace writer reports through the Connect vocabulary (a refused
+    path is ``invalid_argument``, a helper that failed inside the sandbox is
+    ``internal``), so the HTTP surface translates the code rather than
+    re-deriving the cause.
+    """
+    if isinstance(exc, ConnectError):
+        return http_error_response(
+            request, HttpAuthError(exc.http_status or 500, exc.message)
+        )
+    return http_error_response(request, HttpAuthError(500, str(exc)))
 
 
 def _write_limit(request: Request) -> int | None:
@@ -156,7 +145,10 @@ async def upload_file(
     request: Request,
     path: str | None = None,
 ) -> Response:
-    runtime = require_http_sandbox(request)
+    # N28 + the pause gate: this is a *write*, so it is refused outright while
+    # the sandbox is not running, and performed by the sandbox when it is.
+    runtime = require_http_sandbox(request, mutating=True)
+    writer = runtime_context(request, runtime).writer
     ops = FilesystemOps(runtime.workspace_dir)
     metadata = _metadata_from_headers(request)
     content_type = (request.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -165,21 +157,21 @@ async def upload_file(
         if content_type == "application/octet-stream":
             if not path:
                 raise HttpAuthError(400, "path is required for octet-stream uploads")
-            target = _resolve_or_error(ops, path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            # E4.2: stream to a sibling temp file and atomically rename so an
-            # over-limit upload (413) leaves no partial file and the worker
-            # memory does not grow with the body.
             limit = _write_limit(request)
-            tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
             try:
                 check_content_length(request, limit)
-                await stream_body_to_file(request, tmp, limit)
-                os.replace(tmp, target)
             except UploadTooLargeError:
-                tmp.unlink(missing_ok=True)
                 raise HttpAuthError(413, "File exceeds maximum upload size")
-            _persist_metadata(target, metadata)
+            # E4.2: the temp-and-rename that keeps an over-limit upload from
+            # leaving a partial file happens inside the sandbox now, in
+            # ``SandboxWriter.write_stream``.
+            try:
+                target = await writer.write_stream(
+                    path, request_chunks(request), limit_bytes=limit
+                )
+            except UploadTooLargeError:
+                raise HttpAuthError(413, "File exceeds maximum upload size")
+            await writer.persist_metadata(target, metadata)
             return JSONResponse(content=[_upload_response(ops, target, metadata)])
 
         limit = _write_limit(request)
@@ -201,19 +193,16 @@ async def upload_file(
             file_path = path or (file_obj.filename or "")
             if not file_path:
                 raise HttpAuthError(400, "file path is required")
-            target = _resolve_or_error(ops, file_path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
             try:
-                await stream_upload_file_to_file(file_obj, tmp, limit)
-                os.replace(tmp, target)
+                target = await writer.write_stream(
+                    file_path, upload_file_chunks(file_obj), limit_bytes=limit
+                )
             except UploadTooLargeError:
-                tmp.unlink(missing_ok=True)
                 raise HttpAuthError(413, "File exceeds maximum upload size")
-            _persist_metadata(target, metadata)
+            await writer.persist_metadata(target, metadata)
             results.append(_upload_response(ops, target, metadata))
         return JSONResponse(content=results)
     except HttpAuthError as e:
         return http_error_response(request, e)
     except Exception as e:
-        return http_error_response(request, HttpAuthError(500, str(e)))
+        return _write_failure(request, e)

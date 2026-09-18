@@ -302,6 +302,24 @@ spec:
               value: "200"
             - name: E2B_NODE_DISK_MB
               value: "4096"
+            # N25/L2b + N28/D: how often this worker walks each sandbox tree and
+            # reports the measured bytes on its heartbeat. 0 disables the
+            # report entirely -- and with it the only thing that catches a
+            # sandbox writing *past* its sold budget (the admission ledger
+            # bounds what was sold, not what exists), so leave it on.
+            #
+            # The measured number is not only the pause trigger: the control
+            # plane stores it on the sandbox record, where it is what
+            # `GET /sandboxes/{id}/metrics` answers as `diskUsed` and what a
+            # platform-initiated pause quotes back ("its workspace grew past
+            # its budget (1340 MiB used of 1024 MiB)").
+            #
+            # Cost was measured, not assumed (docs/disk-accounting-dirty-dirs.md
+            # §5.2): ~3.5 us/file and ~2.4 ms/directory on this NAS. A round
+            # stops at a 1 s budget and resumes where it left off, so the
+            # interval is not a bound on how long a walk may take.
+            - name: E2B_DISK_ENFORCE_INTERVAL_S
+              value: "30"
             - name: E2B_NODE_PROCESSES
               value: "256"
           resources:

@@ -304,7 +304,25 @@ class ProcessManager:
         stdin_enabled: bool,
         pty_size: tuple[int, int] | None = None,
         tag: str | None = None,
+        internal: bool = False,
     ) -> ManagedProcess:
+        """Start a command; ``internal`` marks worker bookkeeping (N28).
+
+        The workspace writer runs *inside* the sandbox (that is what makes the
+        sandbox the single writer of its tree), so its helper processes go
+        through this same table -- but they are not user commands, and with
+        both of the following differences:
+
+        * they do **not** take the per-sandbox command gate. ``E2B_MAX_
+          CONCURRENT_COMMANDS_PER_SANDBOX`` defaults to 1, so a long-running
+          user command holds the gate for its whole lifetime; a write that
+          queued behind it would time out (30s) and fail with 429 even though
+          nothing is contended. The gate bounds *user* concurrency, and the
+          writer is the platform acting as the sandbox.
+        * they are **not** written to the command log. That log is the
+          sandbox's command history, surfaced to the SDK as ``record.logs``;
+          a ``cat > file`` the caller never ran must not appear there.
+        """
         pty = pty_size is not None
         rows, cols = pty_size or (24, 80)
         config = ExecConfig(
@@ -321,8 +339,9 @@ class ProcessManager:
         # with 429. The gate stays held until the command ends (released by
         # _drive), so with the default limit of 1 commands run strictly
         # serially.
-        gate = self._gate()
-        await gate.acquire()
+        gate = None if internal else self._gate()
+        if gate is not None:
+            await gate.acquire()
         try:
             try:
                 running = await self._executor.start(config)
@@ -339,18 +358,31 @@ class ProcessManager:
                 _running=running,
                 capture_limit=self._capture_limit_bytes,
             )
+            # An internal process still enters the table (shutdown's
+            # ``kill_all`` and the pause/resume walk must see it), but with a
+            # capture limit of 0: nothing replays it, so its output only needs
+            # to be drained, not kept.
+            if internal:
+                proc.capture_limit = 0
+                proc.captured = {}
             self._processes[proc.pid] = proc
-            if self._on_command_log is not None:
+            if self._on_command_log is not None and not internal:
                 self._on_command_log(proc, "start", None)
-            asyncio.create_task(self._drive(proc, running, gate))
+            asyncio.create_task(self._drive(proc, running, gate, internal=internal))
             return proc
         except BaseException:
             # Cancel/error before _drive was scheduled must not leak the slot.
-            gate.release()
+            if gate is not None:
+                gate.release()
             raise
 
     async def _drive(
-        self, proc: ManagedProcess, running: RunningProcess, gate: _CommandGate
+        self,
+        proc: ManagedProcess,
+        running: RunningProcess,
+        gate: _CommandGate | None,
+        *,
+        internal: bool = False,
     ) -> None:
         try:
             timed_out = False
@@ -375,11 +407,12 @@ class ProcessManager:
                     else:
                         truncated_now = False
                     if self._on_command_log is not None:
-                        self._on_command_log(proc, kind, chunk)
+                        if not internal:
+                            self._on_command_log(proc, kind, chunk)
                     self._broadcast(proc, ("data", kind, chunk))
                     if truncated_now:
                         marker = TRUNCATED_MARK
-                        if self._on_command_log is not None:
+                        if self._on_command_log is not None and not internal:
                             self._on_command_log(proc, kind, marker)
                         self._broadcast(proc, ("data", kind, marker))
                 exit_code = await running.exit_code()
@@ -396,12 +429,13 @@ class ProcessManager:
             proc.exit_code = exit_code
             proc.ended = True
             status = "killed" if (timed_out or exit_code < 0) else "exited"
-            if self._on_command_log is not None:
+            if self._on_command_log is not None and not internal:
                 self._on_command_log(proc, "end", exit_code)
             self._broadcast(proc, ("end", exit_code, status))
             self._processes.pop(proc.pid, None)
         finally:
-            gate.release()
+            if gate is not None:
+                gate.release()
 
     @staticmethod
     def _broadcast(proc: ManagedProcess, item: tuple) -> None:
@@ -442,6 +476,13 @@ class ProcessManager:
         proc = self.get(pid)
         if proc._running is not None:
             proc._running.send_stdin(data)
+
+    async def feed_stdin(self, pid: int, data: bytes) -> None:
+        """Feed stdin with backpressure (N28; see ``feed_stdin`` in base.py)."""
+        proc = self.get(pid)
+        if proc._running is None:
+            raise not_found(f"Process {pid} not found")
+        await proc._running.feed_stdin(data)
 
     def close_stdin(self, pid: int) -> None:
         proc = self.get(pid)

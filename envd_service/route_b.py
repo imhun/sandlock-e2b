@@ -808,6 +808,7 @@ SUPERVISE_POLICY_FIELDS: frozenset[str] = frozenset(
         "max_cpu",
         "max_disk",
         "max_memory",
+        "max_file_size",
         "max_open_files",
         "max_processes",
         "net_allow",

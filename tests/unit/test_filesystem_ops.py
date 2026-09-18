@@ -1,4 +1,11 @@
-"""Filesystem ops: stat / list / move / remove / makedir."""
+"""Filesystem ops: the reads, and the decisions every write makes (N28).
+
+The operations themselves moved into the sandbox
+(``tests/unit/test_sandbox_writer.py`` covers them end to end): what stays here
+is the read side and the guards, i.e. the part of a write that decides *which
+documented error the caller gets*. Those are asserted verbatim -- the API
+contract is the code and the message together.
+"""
 
 from __future__ import annotations
 
@@ -31,46 +38,52 @@ def test_stat_missing_is_not_found(ops):
     assert exc.value.code == "not_found"
 
 
-def test_make_dir_recursive(ops):
-    entry = ops.make_dir("a/b/c")
-    assert entry["type"] == "FILE_TYPE_DIRECTORY"
-    assert (ops.root / "a" / "b" / "c").is_dir()
+def test_require_creatable_returns_the_resolved_target(ops):
+    assert ops.require_creatable("a/b/c") == ops.root / "a" / "b" / "c"
 
 
-def test_make_dir_existing_is_already_exists(ops):
-    ops.make_dir("a")
+def test_require_creatable_existing_is_already_exists(ops):
+    (ops.root / "a").mkdir()
     with pytest.raises(ConnectError) as exc:
-        ops.make_dir("a")
+        ops.require_creatable("a")
     assert exc.value.code == "already_exists"
+    assert exc.value.message == "Path a already exists"
 
 
-def test_move_file(ops):
+def test_require_movable_returns_both_resolved_ends(ops):
     (ops.root / "a.txt").write_text("x")
-    entry = ops.move("a.txt", "dir/b.txt")
-    assert entry["path"] == "dir/b.txt"
-    assert (ops.root / "dir" / "b.txt").is_file()
+    assert ops.require_movable("a.txt", "dir/b.txt") == (
+        ops.root / "a.txt",
+        ops.root / "dir" / "b.txt",
+    )
 
 
-def test_move_missing_is_not_found(ops):
+def test_require_movable_missing_is_not_found(ops):
     with pytest.raises(ConnectError) as exc:
-        ops.move("nope.txt", "b.txt")
+        ops.require_movable("nope.txt", "b.txt")
     assert exc.value.code == "not_found"
+    assert exc.value.message == "Path nope.txt not found"
 
 
-def test_remove_file_and_missing(ops):
+def test_require_movable_occupied_destination_is_already_exists(ops):
     (ops.root / "a.txt").write_text("x")
-    ops.remove("a.txt")
-    assert not (ops.root / "a.txt").exists()
+    (ops.root / "b.txt").write_text("y")
     with pytest.raises(ConnectError) as exc:
-        ops.remove("a.txt")
+        ops.require_movable("a.txt", "b.txt")
+    assert exc.value.code == "already_exists"
+    assert exc.value.message == "Path b.txt already exists"
+
+
+def test_require_removable_returns_the_resolved_target(ops):
+    (ops.root / "a.txt").write_text("x")
+    assert ops.require_removable("a.txt") == ops.root / "a.txt"
+
+
+def test_require_removable_missing_is_not_found(ops):
+    with pytest.raises(ConnectError) as exc:
+        ops.require_removable("a.txt")
     assert exc.value.code == "not_found"
-
-
-def test_remove_directory_recursive(ops):
-    (ops.root / "dir" / "sub").mkdir(parents=True)
-    (ops.root / "dir" / "f.txt").write_text("x")
-    ops.remove("dir")
-    assert not (ops.root / "dir").exists()
+    assert exc.value.message == "Path a.txt not found"
 
 
 def test_list_dir_depth(ops):
@@ -93,4 +106,3 @@ def test_traversal_rejected(ops):
     with pytest.raises(ConnectError) as exc:
         ops.stat("../outside")
     assert exc.value.code == "invalid_argument"
-

@@ -16,6 +16,7 @@ from envd_service.connect.router import register_routes
 from envd_service.executors.base import FailedRunningProcess
 from envd_service.process.events import data_event, end_event, start_event
 from envd_service.process.manager import ManagedProcess, parse_signal
+from envd_service.runtime.context import runtime_context
 from gateway_common.errors import (
     ConnectError,
     invalid_argument,
@@ -36,12 +37,8 @@ _drift_warned_at: dict[str, float] = {}
 
 def _context(request: Request, runtime) -> Any:
     """Get or create the per-sandbox runtime context."""
-    runtimes = request.app.state.runtimes
-    ctx = runtimes.get(runtime.sandbox_id)
-    if ctx is None:
-        ctx = request.app.state.context_factory(runtime)
-        runtimes[runtime.sandbox_id] = ctx
-    elif getattr(ctx, "_network", None) != runtime.network:
+    ctx = runtime_context(request, runtime)
+    if getattr(ctx, "_network", None) != runtime.network:
         # The control plane may have pushed a network update into the shared
         # runtime record; apply it to the live context so the next command
         # uses the new policy.
@@ -329,20 +326,22 @@ def build_filesystem_handlers() -> tuple[dict[str, Any], dict[str, Any]]:
 
     async def rpc_make_dir(request: Request, payload: dict, runtime) -> dict[str, Any]:
         ctx = _context(request, runtime)
-        return {"entry": ctx.files.make_dir(_require_str(payload, "path"))}
+        path = _require_str(payload, "path")
+        # N28: the write runs as the sandbox (``ctx.writer``), the read-back
+        # that builds the response entry stays the worker's.
+        await ctx.writer.make_dir(path)
+        return {"entry": ctx.files.stat(path)}
 
     async def rpc_move(request: Request, payload: dict, runtime) -> dict[str, Any]:
         ctx = _context(request, runtime)
-        return {
-            "entry": ctx.files.move(
-                _require_str(payload, "source"),
-                _require_str(payload, "destination"),
-            )
-        }
+        source = _require_str(payload, "source")
+        destination = _require_str(payload, "destination")
+        await ctx.writer.move(source, destination)
+        return {"entry": ctx.files.stat(destination)}
 
     async def rpc_remove(request: Request, payload: dict, runtime) -> dict[str, Any]:
         ctx = _context(request, runtime)
-        ctx.files.remove(_require_str(payload, "path"))
+        await ctx.writer.remove(_require_str(payload, "path"))
         return {}
 
     async def rpc_list_dir(request: Request, payload: dict, runtime) -> dict[str, Any]:

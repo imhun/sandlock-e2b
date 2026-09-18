@@ -17,9 +17,11 @@ from envd_service.connect.codec import (
     encode_end_stream,
     encode_message,
 )
+from envd_service.runtime.registry import state_clause
 from gateway_common.errors import (
     CONNECT_HTTP_STATUS,
     ConnectError,
+    failed_precondition,
     internal,
     unauthenticated,
 )
@@ -80,6 +82,41 @@ async def _read_json_body(request: Request) -> dict[str, Any]:
     return payload
 
 
+# -- pause gating ----------------------------------------------------------
+#
+#: RPCs that make the sandbox do work or change its workspace.
+#:
+#: A paused sandbox has given its admission reservation back (E9.2), so letting
+#: it keep executing lets it consume capacity nobody is counting -- and, for the
+#: file APIs, write into a workspace whose size is no longer being gated. Reads
+#: stay allowed on purpose: they consume nothing and an operator needs them to
+#: look at a paused sandbox before resuming it.
+MUTATING_RPCS = frozenset(
+    {
+        "process.Process/Start",
+        "filesystem.Filesystem/MakeDir",
+        "filesystem.Filesystem/Move",
+        "filesystem.Filesystem/Remove",
+    }
+)
+
+
+def _require_running(sandbox: Any, path: str) -> None:
+    """Refuse a mutating RPC while the sandbox is not running."""
+    if sandbox is None or path not in MUTATING_RPCS:
+        return
+    state = getattr(sandbox, "state", "running")
+    if state == "running":
+        return
+    raise failed_precondition(
+        (
+            f"{state_clause(sandbox, state)}; "
+            f"{'run a command' if path.startswith('process.') else 'modify files'} "
+            "only while it is running (resume it first)"
+        )
+    )
+
+
 async def handle_unary(
     request: Request,
     path: str,
@@ -89,6 +126,7 @@ async def handle_unary(
 ) -> Response:
     try:
         sandbox = _find_sandbox(request) if require_sandbox else None
+        _require_running(sandbox, path)
         payload = await _read_json_body(request)
         result = await handler(request, payload, sandbox)
     except ConnectError as e:
@@ -111,6 +149,7 @@ async def handle_stream(
 ) -> Response:
     try:
         sandbox = _find_sandbox(request) if require_sandbox else None
+        _require_running(sandbox, path)
         raw = await request.body()
         payload = decode_stream_request(raw)
         events = await handler(request, payload, sandbox)

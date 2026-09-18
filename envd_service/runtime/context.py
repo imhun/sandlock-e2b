@@ -16,9 +16,10 @@ from envd_service.config import Settings
 from envd_service.executors.factory import create_executor
 from envd_service.filesystem.ops import FilesystemOps
 from envd_service.filesystem.watch import WatcherRegistry, WatchDirStream
+from envd_service.filesystem.writer import SandboxWriter
 from envd_service.process.logs import CommandLogWriter
 from envd_service.process.manager import ProcessManager
-from envd_service.runtime.registry import RuntimeSandbox
+from envd_service.runtime.registry import RuntimeSandbox, max_file_size_mb
 
 from gateway_common.paths import sandbox_runtime_dir
 
@@ -277,6 +278,22 @@ def _release_mcp_port(port: int | None) -> None:
     _mcp_port_pool.release(port)
 
 
+def runtime_context(request, runtime: SandboxRuntimeContext) -> SandboxRuntimeContext:
+    """The per-sandbox context, created on first use and then cached.
+
+    Shared by the Connect-RPC layer (``envd_service.rpc._context``, which adds
+    the network-drift reconciliation on top) and the HTTP file endpoints, so
+    both reach the *same* context instance: the HTTP upload path has to run its
+    helper through the sandbox's own executor, and the executor is owned here.
+    """
+    runtimes = request.app.state.runtimes
+    ctx = runtimes.get(runtime.sandbox_id)
+    if ctx is None:
+        ctx = request.app.state.context_factory(runtime)
+        runtimes[runtime.sandbox_id] = ctx
+    return ctx
+
+
 class SandboxRuntimeContext:
     """Everything needed to serve RPCs for one sandbox."""
 
@@ -292,6 +309,7 @@ class SandboxRuntimeContext:
             memory_mb=record.memory_mb,
             cpu_percent=record.cpu_percent,
             disk_mb=record.disk_mb,
+            max_file_size_mb=max_file_size_mb(record),
             max_processes=record.max_processes,
             max_open_files=record.max_open_files,
             allow_internet_access=record.allow_internet_access,
@@ -335,6 +353,10 @@ class SandboxRuntimeContext:
             ),
         )
         self.files = FilesystemOps(record.workspace_dir)
+        # N28: the sandbox is the single writer of its own tree, so every
+        # workspace write goes through this -- an in-sandbox command with the
+        # sandbox's own identity -- while ``self.files`` answers the reads.
+        self.writer = SandboxWriter(self)
         self.watchers = WatcherRegistry(self.files)
         self.watch_stream = WatchDirStream(self.files)
         self._mcp_gateway = None

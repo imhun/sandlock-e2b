@@ -57,7 +57,18 @@ class RuntimeSandbox:
     allow_internet_access: bool = False
     max_command_timeout: int = 3600
     state: str = "running"
-    volume_mounts: list[dict[str, str]] = field(default_factory=list)
+    #: Why the platform put this sandbox out of ``running`` (N28/D). Set with
+    #: the state and cleared on resume, so a refusal can say *why* the sandbox
+    #: is paused -- "the platform paused you" and "you paused yourself" are the
+    #: same state but not the same thing to a caller. In-memory only: it is
+    #: pushed with the state and never read from disk, because a stale reason
+    #: outliving the pause that produced it would be worse than none.
+    pause_reason: str | None = None
+    #: One entry per mounted volume: ``{"path", "hostPath",
+    #: "perSandboxQuotaMb"}``. The quota rides along because the single-file
+    #: ceiling (N28/C) has to be at least as large as the biggest budget the
+    #: sandbox was sold, and a volume slice is a budget of its own.
+    volume_mounts: list[dict[str, Any]] = field(default_factory=list)
     #: Per-sandbox volume quota state (E2.5): one entry per quota-limited
     #: mount — ``{"volume_id", "sandbox_id", "mount_path", "sandbox_dir",
     #: "projid"}``. Persisted so deletion and migration re-provision can
@@ -75,6 +86,48 @@ class RuntimeSandbox:
     def from_dict(cls, payload: dict[str, Any]) -> "RuntimeSandbox":
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in payload.items() if k in known})
+
+
+def max_file_size_mb(record: RuntimeSandbox) -> int | None:
+    """The single-file ceiling for ``record`` (``RLIMIT_FSIZE``), or ``None``.
+
+    The ceiling is the *largest* budget the sandbox was sold -- its tree and
+    every mounted volume slice -- because a limit below a legal budget would
+    refuse a write the sandbox is allowed to make, and a hard limit that
+    refuses legal work is worse than no limit at all.
+
+    ``None`` (inherit the system limit) whenever any of those budgets is
+    unbounded: a recorded ``diskMB <= 0`` means no tree budget, and a mount
+    with ``perSandboxQuotaMb == 0`` means that slice is unlimited (see
+    ``build_volume_mounts``). With one unbounded dimension there is no honest
+    number to pick, and guessing one would be the same "refuses legal work"
+    failure with extra steps.
+    """
+    budgets: list[int] = []
+    for value in [record.disk_mb, *(
+        mount.get("perSandboxQuotaMb") for mount in record.volume_mounts
+    )]:
+        if not isinstance(value, int) or isinstance(value, bool):
+            return None
+        if value <= 0:
+            return None
+        budgets.append(value)
+    return max(budgets) if budgets else None
+
+
+def state_clause(record: RuntimeSandbox | None, state: str | None = None) -> str:
+    """``"Sandbox is paused"`` -- plus the platform's reason when it has one.
+
+    Called by both gates (the HTTP file endpoints and the Connect-RPC
+    dispatcher) so the two refusals cannot drift, and so a caller that is
+    being *kept out* learns why in the same message that tells it to resume
+    (N28/D). The reason is only ever set by a platform-initiated pause
+    (``SandboxRegistry.enforce_disk_budget``); a caller's own pause answers
+    with the bare clause.
+    """
+    current = state or getattr(record, "state", "running")
+    reason = getattr(record, "pause_reason", None)
+    return f"Sandbox is {current}: {reason}" if reason else f"Sandbox is {current}"
 
 
 class RuntimeRegistry:
@@ -274,7 +327,7 @@ class RuntimeRegistry:
         max_open_files: int = 4096,
         allow_internet_access: bool = False,
         max_command_timeout: int = 3600,
-        volume_mounts: list[dict[str, str]] | None = None,
+        volume_mounts: list[dict[str, Any]] | None = None,
         volume_projects: list[dict[str, Any]] | None = None,
         mcp: dict | None = None,
         network: dict | None = None,
@@ -479,7 +532,15 @@ class RuntimeRegistry:
         # for the next delete to verify against (review W7). It is removed
         # together with the tree, by whoever removes the tree.
 
-    def set_state(self, sandbox_id: str, state: str) -> None:
+    def set_state(
+        self, sandbox_id: str, state: str, reason: str | None = None
+    ) -> None:
+        """Move ``sandbox_id`` to ``state``; ``reason`` explains a non-running one.
+
+        The reason travels with the state (see ``RuntimeSandbox.pause_reason``)
+        and is dropped on the way back to ``running``: it belongs to the pause
+        it was set by.
+        """
         if not validate_sandbox_id(sandbox_id):
             return
         with self._lock:
@@ -487,6 +548,7 @@ class RuntimeRegistry:
             if record is None:
                 return
             record.state = state
+            record.pause_reason = reason if state != "running" else None
             callbacks = list(self._state_callbacks)
         for callback in callbacks:
             try:

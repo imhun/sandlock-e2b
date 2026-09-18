@@ -144,7 +144,8 @@ def test_the_gate_is_idempotent_across_repeated_reports(workspace):
     The worker's report is cached between scans, so the control plane sees the
     same over-budget number on every pulse for up to the scan interval. A
     second pause would append a second "sandbox paused" log line to a record
-    that is already frozen.
+    that is already frozen. The *measurement* is still recorded every time
+    (N28/D) -- it is the accounting, not the action.
     """
     registry = SandboxRegistry(_settings())
     record = _create(registry, sandbox_id="sbx_twice")
@@ -153,7 +154,11 @@ def test_the_gate_is_idempotent_across_repeated_reports(workspace):
     assert len(registry.enforce_disk_budget({"sbx_twice": over})) == 1
     assert registry.enforce_disk_budget({"sbx_twice": over}) == []
     lines = [entry["line"] for entry in registry.get("sbx_twice").logs]
-    assert lines.count("sandbox paused") == 1
+    assert lines == [
+        "sandbox paused: its workspace grew past its budget "
+        f"({record.disk_size_mb} MiB used of {record.disk_size_mb} MiB)"
+    ]
+    assert registry.get("sbx_twice").workspace_disk_used_bytes == over
 
 
 def test_a_foreign_or_malformed_report_is_ignored(workspace):

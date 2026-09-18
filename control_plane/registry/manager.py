@@ -168,6 +168,18 @@ class SandboxRecord:
     #: orphan grace period reads it; without that setting an orphaned record
     #: stays forever, which is the conservative default.
     orphaned_at: datetime | None = None
+    #: N25/L2b + N28/D: the worker's **measured** size of this sandbox's
+    #: workspace tree, in bytes, as of its last heartbeat report. ``None``
+    #: means "never measured" (a remote sandbox the worker has not walked yet,
+    #: or a record written before this field existed) -- which is
+    #: deliberately distinct from a measured ``0``, because "unknown" must not
+    #: be published as "empty".
+    #:
+    #: This is the *only* source of the number for a remote sandbox: the
+    #: control plane cannot walk a tree on a node it does not host
+    #: (``workspace_dir`` is ``None`` there), which is why ``sample_metric``
+    #: used to answer a flat ``diskUsed: 0``.
+    workspace_disk_used_bytes: int | None = None
 
     def refresh(self, timeout: int) -> None:
         self.end_at = utcnow() + timedelta(seconds=max(1, timeout))
@@ -214,14 +226,22 @@ class SandboxRecord:
             self.logs = self.logs[-limit:]
 
     def sample_metric(self) -> dict[str, Any]:
-        used = 0
-        if self.workspace_dir is not None:
+        # N28/D: prefer the worker's own measurement. It is the size of *this*
+        # sandbox's tree (the walk the L2b enforcer already makes), and it is
+        # the only number that exists for a remote sandbox at all -- there the
+        # record carries no ``workspace_dir``, so the local walk used to
+        # report a flat zero for every sandbox on every other node.
+        used: int | None = self.workspace_disk_used_bytes
+        if used is None and self.workspace_dir is not None:
+            used = 0
             for root, _dirs, files in os.walk(self.workspace_dir):
                 for name in files:
                     try:
                         used += (Path(root) / name).stat().st_size
                     except OSError:
                         pass
+        if used is None:
+            used = 0
         return {
             "timestamp": to_iso_z(utcnow()),
             "timestampUnix": int(time.time()),
@@ -234,11 +254,18 @@ class SandboxRecord:
             "diskTotal": self.disk_size_mb * 1024 * 1024,
         }
 
-    def pause(self) -> None:
+    def pause(self, reason: str | None = None) -> None:
+        """Freeze the record; ``reason`` is what the sandbox log shows.
+
+        The log is the operator- and SDK-visible half of a pause that the
+        platform started on its own (the L2b disk enforcer): "sandbox paused"
+        alone does not say whether the caller asked for it or the platform did
+        it *to* them, nor how far over the line they were.
+        """
         if self.state == "paused":
             raise SandboxStateConflictError("Sandbox is already paused")
         self.state = "paused"
-        self.append_log("sandbox paused")
+        self.append_log(f"sandbox paused: {reason}" if reason else "sandbox paused")
 
     def resume(self, timeout: int | None = None) -> None:
         if self.state == "running":
@@ -334,6 +361,7 @@ class SandboxRecord:
                 str(self.workspace_dir) if self.workspace_dir is not None else None
             ),
             "host_uid": self.host_uid,
+            "workspace_disk_used_bytes": self.workspace_disk_used_bytes,
         }
 
     @classmethod
@@ -384,6 +412,11 @@ class SandboxRecord:
             ),
             host_uid=(
                 int(data["host_uid"]) if data.get("host_uid") is not None else None
+            ),
+            workspace_disk_used_bytes=(
+                int(data["workspace_disk_used_bytes"])
+                if data.get("workspace_disk_used_bytes") is not None
+                else None
             ),
         )
 
@@ -920,15 +953,18 @@ class SandboxRegistry:
         record.quota_released = False
         return True
 
-    def pause(self, record: SandboxRecord) -> SandboxRecord:
+    def pause(
+        self, record: SandboxRecord, reason: str | None = None
+    ) -> SandboxRecord:
         """Pause ``record`` and release its admission reservation (E9.2).
 
         A paused sandbox stops counting against the global, tenant and node
         pools, which is what makes "hibernate the idle ones to make room"
         (E9.3) worth doing: the processes are frozen on the worker and the
-        workspace stays, but the capacity is bookable again.
+        workspace stays, but the capacity is bookable again. ``reason`` is
+        carried into the sandbox's own log (see ``SandboxRecord.pause``).
         """
-        record.pause()
+        record.pause(reason)
         self.release_quota(record)
         self.save(record)
         return record
@@ -1651,6 +1687,11 @@ class SandboxRegistry:
         a runaway sandbox stops competing for capacity instead of being
         killed, and the user can resume it once the tree is back in budget.
 
+        The measurement is recorded on **every** reported record (N28/D), not
+        only on the ones being paused: this is the fleet's accounting, and a
+        per-sandbox disk number that exists only for frozen sandboxes answers
+        no question an operator (or ``GET /sandboxes/{id}/metrics``) has.
+
         Returns the records this call moved to ``paused``. Freezing the
         runtime on the worker is the caller's job and is *deliberately* not
         rolled back on failure: an unfrozen runaway must not keep its
@@ -1666,6 +1707,15 @@ class SandboxRegistry:
                 record = self.get(str(sandbox_id))
             except UnknownSandboxError:
                 continue
+            # N28/D: the measurement is the accounting, so it is recorded for
+            # *every* reported sandbox, not only the ones about to be paused --
+            # otherwise the fleet's only per-sandbox disk number would exist
+            # exactly for the sandboxes that just got frozen. Written back only
+            # when it moved, so a steady tree does not cost a store write per
+            # heartbeat.
+            if record.workspace_disk_used_bytes != used_bytes:
+                record.workspace_disk_used_bytes = used_bytes
+                self.save(record)
             if record.quota_released or record.state != "running":
                 continue
             budget_bytes = int(record.disk_size_mb) * 1024 * 1024
@@ -1678,7 +1728,14 @@ class SandboxRegistry:
                 used_bytes // (1024 * 1024),
                 record.disk_size_mb,
             )
-            self.pause(record)
+            self.pause(
+                record,
+                reason=(
+                    f"its workspace grew past its budget "
+                    f"({used_bytes // (1024 * 1024)} MiB used of "
+                    f"{record.disk_size_mb} MiB)"
+                ),
+            )
             paused.append(record)
         return paused
 

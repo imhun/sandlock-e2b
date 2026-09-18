@@ -244,6 +244,16 @@ fork 已有的 `ResourceState`（`seccomp/state.rs:12`）是**低成本记账的
 * 只能在**沙箱子进程**上设：worker/envd 自身要能写模板 copytree / 快照展开 / 镜像缓存（远超
   `diskMB`），一旦被这个 rlimit 限制会直接坏掉。
 
+> **✅ A 已落地（2026-09-19，N28/C）**，上面四条判断全部按实测照做，`docs/k8s-deployment.md` §22：
+> fork 侧新增 `max_file_size`（core builder + profile `[limits].file_size` + supervise policy +
+> C ABI `sandlock_sandbox_builder_max_file_size` + Python/Go 绑定），实现就在本表指的那处
+> （`context.rs` step 13d，紧邻 `RLIMIT_NOFILE`），**先 `signal(SIGXFSZ, SIG_IGN)` 再 `setrlimit`**
+> ⇒ 越界写返回 `EFBIG` 而不是杀进程（被忽略的处置能穿过 `execve`，命令继承得到）。
+> 取值走"代价 1"的处置：`max_file_size = max(diskMB, 各挂载卷 perSandboxQuotaMb)`，**任何一维
+> 为 0（= 不限）则不设限** —— 编不出一个诚实的数时不猜。**只有沙箱子进程**被设（worker 的模板/
+> 快照路径不受影响），因为它来自 policy，而 policy 只作用于实例内的命令。
+> 契约：`tests/unit/test_file_size_limit.py`（口径 6 条 + 接线 5 条）。
+
 ### 10.3 C：采样"打开的写 fd"（零 fork 改动，直接命中跑飞形态）
 
 跑飞的特征是"**一个打开的写 fd 一直在长**"（实测的 `dd` 正是这样）。而"谁被以写方式打开"这件事
@@ -410,12 +420,21 @@ ENOENT），而是在 pure 形态、或命名空间隔离被绕过时当第二/�
 **前提**：所有进入工作区树的写都经沙箱自身（= sandlock 中介 + 沙箱身份），平台侧不再有"牢外写者"
 （迁移/GC 期的平台写要么在基线之前、要么我们可标脏）。
 
-**先说清楚"暂停"这条**（实测矩阵，线上）：暂停状态下一个沙箱**仍然**可以
-`files.write`（新建/覆盖）、`files.make_dir`、`files.remove`，**连 `commands.run` 都能执行**——
-`pause` 自己的文档就写着 "it does not gate future execs (parity with the combined deployment)"。
-也就是说："暂停"今天 = **释放准入预留给别人，但自己仍可继续干活**。这与 E9.2 的账本语义相互矛盾
-（预留释放了，实际消耗没停）。要落实"暂停就不该能写"，必须**同时**做两件事：**写走沙箱** +
-**暂停真正冻结新工作**（否则沙箱内写者在冻结时能写、解冻后照旧）。
+**先说清楚"暂停"这条**（2026-09-18 **已实现**，N28/A）：改造前实测矩阵是——暂停状态下一个沙箱
+**仍然**可以 `files.write`（新建/覆盖）、`files.make_dir`、`files.remove`，**连 `commands.run`
+都能执行**；`pause` 自己的文档当时写着 "it does not gate future execs (parity with the combined
+deployment)"。也就是说："暂停"曾经 = **释放准入预留给别人，但自己仍可继续干活**，与 E9.2 的账本
+语义相互矛盾（预留释放了，实际消耗没停）。
+
+现在暂停是真的冻结：`state != running` 时 **`process.Process/Start` 与四个写 RPC 全部被拒**
+（`failed_precondition`；HTTP 写端点 409），**读不受影响**（`Stat`/`ListDir`/`GET /files` 照常，
+运营方要能在 resume 前看一眼）。实现落在两处入口且是同一个判断：
+`envd_service/connect/router.py::_require_running`（RPC）与
+`envd_service/http/auth.py::require_http_sandbox(mutating=True)`（HTTP）。契约见
+`tests/contract/test_pause_write_gating.py`（可移植）与
+`tests/contract/test_pause_resume_sandlock_multinode.py`（真 sandlock 交付链路，用"暂停时 marker
+写不进去"证明冻结）。**这条是"写走沙箱"能够成立的前提**：沙箱内写者在冻结期如果还能写，
+"暂停 = 不消耗"就是假的。
 
 **统一写者身份真正解锁的两件事**：
 
@@ -424,6 +443,12 @@ ENOENT），而是在 pure 形态、或命名空间隔离被绕过时当第二/�
    且零运行时成本；
 2. **脏集合完整 + 单一记录者**：不再需要在 N 个平台写点手工标脏，中介就是唯一账本来源
    ⇒ L2c 的实现更简单（少一类"牢外写者"），低频对账只需兜**迁移/GC 期的平台写 + 跨机 root**。
+
+> **✅ B/C 已落地（2026-09-19）**：本文的"统一写者身份"判成 **B** 的实现是
+> `envd_service/filesystem/writer.py` —— worker 把每次写作为**沙箱内命令**跑
+> （`sh -c` + argv 路径 + stdin 字节），只做**读**回填响应；**没有新增 fork 原语**（当时这条写了
+> "要新增 SCM_RIGHTS 注入通道"，是过度设计，见 N28 行内的纠正）。§10.2 的 A（`RLIMIT_FSIZE`）
+> 随之一起落地。所以下面这两条"解锁"现在都是**已实现**的，不是待办。
 
 **它不解锁的**：
 

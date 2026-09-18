@@ -388,7 +388,17 @@ def build_volume_mounts(
                 raise ValueError(f"Mount path {mount['path']} already exists")
             target.unlink()
         target.symlink_to(view, target_is_directory=True)
-        mount_paths.append({"path": rel, "hostPath": str(view)})
+        # ``perSandboxQuotaMb`` rides along so a reader (the single-file
+        # RLIMIT_FSIZE ceiling, N28/C) can see that a mount may legitimately
+        # hold a file larger than the sandbox tree's own budget. 0 = the mount
+        # is unlimited.
+        mount_paths.append(
+            {
+                "path": rel,
+                "hostPath": str(view),
+                "perSandboxQuotaMb": quota_raw,
+            }
+        )
         if projid is not None:
             volume_projects.append(
                 {

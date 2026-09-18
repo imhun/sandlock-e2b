@@ -2379,7 +2379,7 @@ async def agent_park_untrusted(sandbox_id: str, request: Request) -> Response:
     )
 
 
-def _agent_set_paused(
+async def _agent_set_paused(
     request: Request, sandbox_id: str, *, paused: bool
 ) -> Response:
     """Freeze/thaw one sandbox's running exec children on this worker.
@@ -2397,12 +2397,17 @@ def _agent_set_paused(
     * Idempotent: ``ctx.pause()``/``ctx.resume()`` delegate to
       ``ProcessManager.pause_all/resume_all``, which are no-ops with no
       running children, matching the combined (shared-registry) path.
-    * No new-command gating: pause freezes the currently running command
-      groups; it does not gate future execs (parity with the combined
-      deployment).
-
-    Any JSON body is accepted and ignored for symmetry with the other agent
-    routes (none is needed).
+    * **The state is written back** (N28/A). This used to be the one delivery
+      path that moved the sandbox without telling the worker's own runtime
+      record: a remote sandbox was frozen on its node while that node's record
+      still said ``running``. The file and command gates read exactly that
+      record (``require_http_sandbox`` / ``_require_running``), so without
+      this the pause did not gate anything on a remote worker.
+    * The optional JSON body carries ``{"reason": "..."}`` -- the platform's
+      own explanation for a pause it started (the L2b disk enforcer). It is
+      handed to the record so the refusal text (``state_clause``) can say why.
+      An absent body is the ordinary case and means "no reason given", which
+      is what a caller's own ``pause()`` produces.
     """
     settings = request.app.state.settings
     try:
@@ -2412,12 +2417,15 @@ def _agent_set_paused(
     runtime = request.app.state.runtime_registry.get(sandbox_id)
     if runtime is None:
         return Response(status_code=404)
+    reason = await _pause_reason_from_body(request)
+    # The freeze/thaw itself rides the registry's state callback
+    # (``create_app`` wires ``set_state`` -> ``ctx.pause()/resume()`` for a live
+    # context), so the state and the effect cannot diverge -- calling
+    # ``ctx.pause()`` here as well would stop every process group twice.
     ctx = request.app.state.runtimes.get(sandbox_id)
-    if ctx is not None:
-        if paused:
-            ctx.pause()
-        else:
-            ctx.resume()
+    request.app.state.runtime_registry.set_state(
+        sandbox_id, "paused" if paused else "running", reason
+    )
     logger.info(
         "agent %s sandbox %s (%s)",
         "pause" if paused else "resume",
@@ -2427,16 +2435,32 @@ def _agent_set_paused(
     return Response(status_code=204)
 
 
+async def _pause_reason_from_body(request: Request) -> str | None:
+    """The optional ``reason`` of a pause push; ``None`` for no/!JSON body.
+
+    Best effort on purpose: the reason is diagnostic text, and a control
+    plane that sends a malformed body must still get its sandbox frozen.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - an absent or malformed body
+        return None
+    if not isinstance(body, dict):
+        return None
+    reason = body.get("reason")
+    return reason if isinstance(reason, str) and reason else None
+
+
 @router.post("/agent/sandboxes/{sandbox_id}/pause", status_code=204)
 async def agent_pause_sandbox(sandbox_id: str, request: Request) -> Response:
     """Freeze the sandbox's running exec child groups on this worker."""
-    return _agent_set_paused(request, sandbox_id, paused=True)
+    return await _agent_set_paused(request, sandbox_id, paused=True)
 
 
 @router.post("/agent/sandboxes/{sandbox_id}/resume", status_code=204)
 async def agent_resume_sandbox(sandbox_id: str, request: Request) -> Response:
     """Thaw the sandbox's paused exec child groups on this worker."""
-    return _agent_set_paused(request, sandbox_id, paused=False)
+    return await _agent_set_paused(request, sandbox_id, paused=False)
 
 
 @router.get("/agent/images/{image:path}/warm")

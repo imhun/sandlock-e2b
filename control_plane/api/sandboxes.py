@@ -247,7 +247,7 @@ def _resume_with_capacity(request, registry, record, *, timeout: int | None = No
 
 
 async def _push_pause_state(
-    request: Request, record, *, paused: bool
+    request: Request, record, *, paused: bool, reason: str | None = None
 ) -> bool:
     """Push a pause/resume decision to the hosting worker agent (G1a).
 
@@ -298,6 +298,11 @@ async def _push_pause_state(
                 headers={
                     "X-Internal-Key": request.app.state.settings.internal_api_key
                 },
+                # N28/D: only a platform-initiated pause has a reason, and the
+                # worker needs it to answer "why can I not write?" with more
+                # than "you are paused". Omitted entirely otherwise, so an
+                # ordinary pause keeps its old body.
+                json={"reason": reason} if reason else None,
             )
     except httpx.HTTPError as exc:
         logger.warning(

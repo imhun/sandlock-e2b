@@ -1235,12 +1235,78 @@ POST /sandboxes -> 503
 * **成本**：整树 walk 在这台 NAS 上是 **10.9 ms / 2 000 文件、35.7 ms / 10 000 文件**
   （单文件亚线性，贵在目录：≈2.5 ms/目录）。不需要 inotify（实测推翻了"walk 太贵"这个前提），
   见 `docs/disk-quota-options.md` §5.2。扫描另有 1 s/轮预算 + 游标轮转，不会因为一棵巨树饿死其他树。
-* **已知缺口**：`GET /sandboxes/{id}/metrics` 的 `diskUsed` 在 k8s 上仍是 **0**
-  （`sample_metric()` 只在 `workspace_dir` 非空时 walk，而远端记录永远为 `None`）。
-  用量目前只能从上面那行 WARNING 日志看到；把最后实测值落库并暴露是下一步。
+* **用量有第二处落点（N28/D，2026-09-19）**：worker 报的每个实测值都会写进控制面的沙箱记录
+  （`workspace_disk_used_bytes`），于是 `GET /sandboxes/{id}/metrics` 的 `diskUsed` 在 k8s 上
+  **是真实值**了（`sample_metric()` 以前只在 `workspace_dir` 非空时 walk，而远端记录永远为
+  `None` ⇒ 恒为 0）。实测值**每次上报都记**（不是只在要暂停时记），否则舰队的每沙箱磁盘数字
+  只会存在于"刚被冻住的那些"身上。只在数值变化时才回写存储，稳态一棵树不等于每次心跳一次写。
+* **平台主动暂停会说明原因（N28/D）**：日志行是
+  `sandbox paused: its workspace grew past its budget (N MiB used of M MiB)`，并且同一个原因会
+  随暂停推送给 worker，被**拒绝写入/命令时的文案**引用：
+  `Sandbox is paused: its workspace grew past its budget (1340 MiB used of 1024 MiB); ...`。
+  调用方自己 `pause()` 的沙箱不会带这段（没有原因可讲）。
 
 **可伸缩性（已记录，未实施）**：上面这版每轮走整树，成本随"树里目录数 × 沙箱数"线性涨（实测
 venv 形状 ≈1.27 s/棵）。要把它降成"只重扫脏目录"（预期稳态 **2.4 ms/轮**且不随树增长）需要改
 mediator（Rust），方案、盲区与测试计划见
 [`docs/disk-accounting-dirty-dirs.md`](disk-accounting-dirty-dirs.md)；为什么不用 inotify / COW
 见 [`docs/disk-quota-options.md`](disk-quota-options.md) §5.3（实测）。
+
+---
+
+## 22. 统一写者身份 + 暂停真的冻结（N28，2026-09-19）
+
+上一条（L2b）是"**事后**发现超了就把你冻住"，它成立的前提是"暂停 = 不再消耗"。这个前提当时
+**不成立**：实测暂停状态下 `files.write`（新建/覆盖）、`files.make_dir`、`files.remove`
+**全都成功**，连 `commands.run` 都能执行。于是"暂停"只做了一半 —— 释放了准入预留，却没停住
+实际消耗。
+
+这一节落地四件事，缺一不可：
+
+**① 暂停门控（A）**：`state != running` 时，
+
+| 入口 | 结果 |
+|---|---|
+| `POST /files`（SDK `files.write` / 上传） | **409** `Sandbox is <state>; its files can only be modified while it is running (resume it first)` |
+| `MakeDir` / `Move` / `Remove` | **400** `failed_precondition`，同样带原因 |
+| `process.Process/Start`（SDK `commands.run`） | 同上（流式应答以 EndStream error 结束） |
+| `Stat` / `ListDir` / `GET /files` | **照常**：只读不消耗，且运营方要能在 resume 前看一眼 |
+
+判定点是**同一个** `state`，两条入口各读一次：`connect/router.py::_require_running`（RPC）与
+`http/auth.py::require_http_sandbox(mutating=True)`（HTTP）。
+
+⚠ 修这条时发现并补上了一个**真缺口**：`/agent/sandboxes/{id}/pause|resume`（远程交付路径）
+以前只冻结进程组、**从不改 worker 自己的运行时记录**。远端沙箱的 worker 记录永远写着
+`running`，所以门控在分离部署下等于不存在。现在这条路径会 `set_state` 回写（顺便带上原因）。
+契约：`tests/contract/test_pause_write_gating.py`（可移植，含 agent 路径）、
+`tests/contract/test_pause_resume_sandlock_multinode.py`（真 sandlock，用"暂停时 marker 写不进去"
+证明冻结）。
+
+**② 统一写者身份（B）**：工作区树的写**只有沙箱自己**。worker 不再 `open()`/`mkdir()`/`rmtree()`
+沙箱树 —— 它把同一件事作为**沙箱内的命令**跑（`/bin/sh -c`，路径走 argv 不做字符串拼接，字节走
+stdin），然后只做**读**回填响应。路径语义不变（`/foo` 仍然落在 `<树>/foo`）。
+
+* 实现：`envd_service/filesystem/writer.py`（`SandboxWriter`）；
+  `FilesystemOps` 退化成"读 + 写前判断"（`require_creatable/movable/removable`）。
+* 这些内部命令**不占**每沙箱命令闸门（默认并发 1，用户起一个 `sleep` 就会把写卡 30 s 后 429），
+  也**不进**命令日志（`command_logs` 是给 SDK 看的"我跑过什么"）。见 `ProcessManager.start(internal=True)`。
+* 上传仍保留"临时文件 + rename"（E4.2），只是搬进沙箱内做；超限时杀进程并清理临时文件。
+* 前提：镜像里有 `/bin/sh`。本舰队所有镜像（`python-mcp`、`python:3.11-slim`）都有；scratch
+  形态的镜像会**明确报错**而不是偷偷换回 worker 身份写。
+
+**③ 单文件硬限（C，`RLIMIT_FSIZE`）**：fork 侧新增 `max_file_size`（builder + profile
+`[limits].file_size` + supervise policy + C ABI + Python/Go 绑定），在子进程里同时压低软硬限，
+并把 `SIGXFSZ` 设为忽略 —— 这样越界的写返回 **EFBIG**（程序看得懂的"文件太大"），而不是
+默认动作**把进程杀掉**。
+
+取值 = **这个沙箱被卖过的最大额度**（`diskMB` 与各挂载卷 `perSandboxQuotaMb` 取大），
+所以它**永远不会拒绝一个合法大小**；任何一维是"不限"（0）时不设限（编不出一个诚实的数）。
+因为它是 per-process，顺带也管住沙箱往 `/tmp`（镜像 rootfs 内）和卷里写的东西。
+
+**④ 记账收口（D）**：见 §21.1 的两条（`diskUsed` 真实值 + 暂停原因进文案）。部署清单里
+显式写上 `E2B_DISK_ENFORCE_INTERVAL_S=30`（`deploy/k8s/worker.yaml`）。
+
+> 这一组做完，"磁盘"这条线是：**卖多少**（L1 卷级台账）→ **写了多少**（L2b 实测 + 现在有落点）
+> → **暂停真的停住**（A）→ **谁在写只有一个身份**（B）→ **单文件不可能越过被卖的额度**（C）。
+> 仍然没有的是**写到一半的 ENOSPC**（per-write），它需要写路径中介记账，见
+> `docs/disk-accounting-dirty-dirs.md` §13。

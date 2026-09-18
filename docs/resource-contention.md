@@ -100,8 +100,12 @@ E9.2 已完成：`pause` = 释放配额 + 冻结现场（状态保留）；`resu
 重新分配资源（配额不足则失败）。“把空闲沙箱休眠腾资源”因此成立，E9.3 的
 prefer-pause 直接复用它。
 
-冻结只作用于 `ProcessManager` 里各命令子进程组（exec child 自带组，
-F1.7），**MCP 网关不在暂停范围**——paused 态下网关与命令流仍可达（M4 D5）。
+冻结作用于 `ProcessManager` 里各命令子进程组（exec child 自带组，F1.7），
+**MCP 网关进程本身不在暂停范围**（它是长驻进程，冻结它会把 SDK 的 MCP 通路
+一起掐掉）。paused 态下的可达性在 2026-09-18（N28/A）收窄为：**读可达、写与
+新 exec 一律被拒**——`process.Process/Start` 与 `MakeDir`/`Move`/`Remove` 回
+`failed_precondition`，HTTP 写端点回 409，`Stat`/`ListDir`/`GET /files` 正常。
+理由与实现见 `docs/disk-accounting-dirty-dirs.md` §13。
 
 原文（改造前的目标描述）：
 

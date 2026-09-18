@@ -300,7 +300,7 @@ def test_build_volume_mounts_passes_host_uid_to_slice(
     )
     slice_dir = volume_path / "sbx_a"
     assert mount_paths == [
-        {"path": "mnt/data", "hostPath": str(slice_dir)}
+        {"path": "mnt/data", "hostPath": str(slice_dir), "perSandboxQuotaMb": 0}
     ]
     assert slice_dir.stat().st_uid == 10000
     assert stat.S_IMODE(slice_dir.stat().st_mode) == 0o770
@@ -337,7 +337,9 @@ def test_build_volume_mounts_quota_zero_keeps_volume_root_view(
         fallback_mount_point="/srv",
         via_agent=False,
     )
-    assert mount_paths == [{"path": "mnt/data", "hostPath": str(volume_path)}]
+    assert mount_paths == [
+        {"path": "mnt/data", "hostPath": str(volume_path), "perSandboxQuotaMb": 0}
+    ]
     assert volume_projects == []
     assert calls == []
     target = workspace / "mnt" / "data"
@@ -364,7 +366,9 @@ def test_build_volume_mounts_quota_views_subdir_and_records_project(
     )
     view = _sandbox_dir(volume_path, "sbx_a")
     assert view.is_dir()
-    assert mount_paths == [{"path": "mnt/data", "hostPath": str(view)}]
+    assert mount_paths == [
+        {"path": "mnt/data", "hostPath": str(view), "perSandboxQuotaMb": 512}
+    ]
     assert volume_projects == [
         {
             "volume_id": "vol_1",
@@ -737,7 +741,7 @@ async def test_agent_create_persists_volume_projects_and_delete_cleans(
     record = app.state.runtime_registry.get(sandbox_id)
     slice_dir = volume_root / sandbox_id
     assert record.volume_mounts == [
-        {"path": "mnt/data", "hostPath": str(slice_dir)}
+        {"path": "mnt/data", "hostPath": str(slice_dir), "perSandboxQuotaMb": 512}
     ]
     assert record.volume_projects == [
         {
