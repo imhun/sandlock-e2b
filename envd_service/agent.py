@@ -1276,6 +1276,12 @@ class NodeAgent:
         )
         self._node_id: str | None = None
         self._task: asyncio.Task | None = None
+        #: The reconcile round currently running, if any. The round is its own
+        #: task so the heartbeat never waits behind it (see ``_loop``), and it
+        #: is single-flight: a trigger that arrives while one runs stays set
+        #: (``_start_reconcile_if_due``) instead of stacking a second sweep over
+        #: the same trees.
+        self._reconcile_task: asyncio.Task | None = None
         # E6.1: set when the control plane may have missed this worker (first
         # start, heartbeat failures). The next successful heartbeat after a
         # registration runs a local-runtime reconciliation.
@@ -1293,61 +1299,118 @@ class NodeAgent:
         self._task = asyncio.create_task(self._loop())
 
     async def _loop(self) -> None:
-        headers = {"X-Internal-Key": self._settings.internal_api_key}
+        """Heartbeat on its own cadence, with reconcile rounds running *beside*.
+
+        The round used to run inline here, which made every heartbeat gap
+        ``interval + round duration``: a round walks every tree on the shared
+        base (``_scan_workspace_runtimes``), so its length grows with the fleet's
+        history and has no bound. Two things followed from that, and both were
+        real damage: a worker that was merely *busy* could go quiet past
+        ``E2B_NODE_HEARTBEAT_TIMEOUT`` and have its live sandboxes reaped as
+        orphans (E6.1, the N18 failure mode), and the window could not be lowered
+        to the sensor it is meant to be (three missed beats) without risking
+        exactly that -- which kept a *dead* node's capacity reserved for minutes.
+
+        Detaching the round is what makes the window meaningful: the gap is the
+        interval plus the registration round trip again, not the interval plus
+        however long the sweep happens to take. Failures still flow the same way
+        (a failed pulse or round sets ``_reconcile_pending``), and the round keeps
+        its single-flight guard.
+        """
         while True:
             try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    payload = _register_payload(self._settings)
-                    payload["address"] = self._node_address
-                    if self._node_id is None:
-                        resp = await client.post(
-                            f"{self._control_url}/internal/nodes/register",
-                            json=payload,
-                            headers=headers,
-                        )
-                        if resp.status_code == 200:
-                            self._node_id = resp.json().get("nodeID")
-                            logger.info(
-                                "registered node %s at %s", self._node_id, self._node_address
-                            )
-                            self._report_reconcile_summary(
-                                await self._reconcile_with_control_plane(
-                                    client, headers
-                                )
-                            )
-                    else:
-                        resp = await client.post(
-                            f"{self._control_url}/internal/nodes/{self._node_id}/heartbeat",
-                            json=_heartbeat_usage_payload(
-                                self._settings,
-                                self._metrics_provider,
-                                self._activity_provider,
-                                self._port_provider,
-                            ),
-                            headers=headers,
-                        )
-                        if resp.status_code == 404:
-                            # The control plane lost us (e.g. it restarted);
-                            # re-register on the next cycle.
-                            self._node_id = None
-                        elif self._reconcile_due():
-                            # Either a previous heartbeat/registration failed
-                            # (e.g. a network partition: the control plane may
-                            # have orphaned our sandboxes) or a disk sweep had
-                            # to be deferred because the fleet's records could
-                            # not all be enumerated (M1). Reconcile now that we
-                            # can reach the control plane again.
-                            self._report_reconcile_summary(
-                                await self._reconcile_with_control_plane(
-                                    client, headers
-                                )
-                            )
+                await self._pulse()
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # Any failure here may mean the control plane did not hear this
+                # worker, so the next successful heartbeat must reconcile.
                 self._reconcile_pending = True
                 logger.warning("node agent heartbeat failed", exc_info=True)
             await asyncio.sleep(5)
+
+    async def _pulse(self) -> None:
+        """One register-or-heartbeat exchange, then whatever round it triggers."""
+        headers = {"X-Internal-Key": self._settings.internal_api_key}
+        async with httpx.AsyncClient(timeout=10) as client:
+            payload = _register_payload(self._settings)
+            payload["address"] = self._node_address
+            if self._node_id is None:
+                resp = await client.post(
+                    f"{self._control_url}/internal/nodes/register",
+                    json=payload,
+                    headers=headers,
+                )
+                if resp.status_code == 200:
+                    self._node_id = resp.json().get("nodeID")
+                    logger.info(
+                        "registered node %s at %s", self._node_id, self._node_address
+                    )
+                    # A fresh registration is exactly the E6.1 trigger: the
+                    # control plane may have orphaned what this worker still
+                    # runs while it was away.
+                    self._reconcile_pending = True
+            else:
+                resp = await client.post(
+                    f"{self._control_url}/internal/nodes/{self._node_id}/heartbeat",
+                    json=_heartbeat_usage_payload(
+                        self._settings,
+                        self._metrics_provider,
+                        self._activity_provider,
+                        self._port_provider,
+                    ),
+                    headers=headers,
+                )
+                if resp.status_code == 404:
+                    # The control plane lost us (e.g. it restarted);
+                    # re-register on the next cycle.
+                    self._node_id = None
+        # Outside the pulse's client scope on purpose: the round owns its client
+        # (this one is closed when the ``async with`` above exits, and a detached
+        # round outlives it).
+        self._start_reconcile_if_due()
+
+    def _start_reconcile_if_due(self) -> None:
+        """Start one reconcile round as its own task, if one is due.
+
+        The triggers (``_reconcile_pending`` from a failed pulse or a fresh
+        registration, and the deferred-sweep countdown) are only consumed once a
+        round actually starts: while one is in flight this returns *before*
+        asking ``_reconcile_due``, so a trigger that arrives mid-round is retried
+        on a later heartbeat rather than dropped or run concurrently.
+        """
+        if self._node_id is None:
+            # Nothing to reconcile against: a 404 heartbeat clears the id, and
+            # the next registration re-arms ``_reconcile_pending``. Leaving the
+            # trigger unconsumed is what keeps the recovery round from being
+            # skipped.
+            return
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            return
+        if not self._reconcile_due():
+            return
+        self._reconcile_task = asyncio.create_task(self._reconcile_round())
+
+    async def _reconcile_round(self) -> None:
+        """Run one round with its own client, and report its summary.
+
+        The client is per-round because the heartbeat loop closes the one it
+        uses at the end of every pulse; a detached round cannot borrow it.
+        """
+        headers = {"X-Internal-Key": self._settings.internal_api_key}
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                summary = await self._reconcile_with_control_plane(client, headers)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Same contract as a failed pulse: we may have missed the control
+            # plane, so the next successful heartbeat reconciles again.
+            self._reconcile_pending = True
+            logger.warning("reconcile round failed", exc_info=True)
+            return
+        if summary:
+            self._report_reconcile_summary(summary)
 
     def _stop_refused_runtime(self, sandbox_id: str) -> None:
         """Stop the runtime of a tree whose teardown was refused (W7 / C1-4).
@@ -1510,8 +1573,13 @@ class NodeAgent:
             return {}
         in_memory = {r.sandbox_id: r for r in self._runtime_registry.list()}
         local = dict(in_memory)
-        scanned, unmaterialised = _scan_workspace_runtimes(
-            self._settings, self._runtime_registry
+        # The walk is one filesystem round trip per tree on the shared base, so
+        # it belongs off the event loop: run there, it answered nothing -- file
+        # API, commands, and its own heartbeat -- for the length of the scan
+        # (N21). ``peek`` does not touch the in-memory registry, so a thread is
+        # safe against concurrent creates.
+        scanned, unmaterialised = await asyncio.to_thread(
+            _scan_workspace_runtimes, self._settings, self._runtime_registry
         )
         for sandbox_id, record in scanned.items():
             local.setdefault(sandbox_id, record)
@@ -1567,7 +1635,11 @@ class NodeAgent:
             # any request that called ``RuntimeRegistry.get()``, so it is no
             # more trustworthy than the disk copy (M4).
             try:
-                plan, reason = _verified_teardown_plan(
+                # Same reasoning as the scan above: `lstat`/`resolve` per target
+                # is filesystem work, and a round that can tear down many trees
+                # would otherwise hold the loop for the whole verification pass.
+                plan, reason = await asyncio.to_thread(
+                    _verified_teardown_plan,
                     self._settings.workspace_base,
                     sandbox_id,
                     local.get(sandbox_id),
@@ -1828,13 +1900,22 @@ class NodeAgent:
         return sorted(cleaned), sorted(outstanding)
 
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
+        """Stop the heartbeat loop and any round it left running.
+
+        The round is detached, so cancelling the loop alone would leave a sweep
+        running through shutdown (touching the shared base while the process is
+        tearing its state down).
+        """
+        for attribute in ("_task", "_reconcile_task"):
+            task: asyncio.Task | None = getattr(self, attribute)
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._task = None
+            setattr(self, attribute, None)
 
 
 def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -> None:

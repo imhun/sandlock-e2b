@@ -332,6 +332,86 @@ def _tick(rounds: list[int]) -> dict:
     return metrics
 
 
+async def test_heartbeats_keep_their_cadence_while_a_round_scans_the_base(
+    workspace, monkeypatch
+):
+    """N21: a reconcile round must not sit in the heartbeat's way.
+
+    The round used to run inline in the heartbeat coroutine, so the gap between
+    two beats was ``interval + round duration`` -- and a round walks every tree
+    on the shared base, so that duration grows with the fleet's history and has
+    no bound. Both halves of the fix are checked here by making the scan block:
+
+    * the scan runs on a worker thread, so blocking it cannot freeze the event
+      loop (with the old synchronous call the loop below could not pulse at all);
+    * the round is its own task, so the heartbeat does not wait for it even when
+      it is stuck.
+
+    The scan is held open by an event rather than a sleep, so the assertion is
+    "these heartbeats went out *while* the round was inside the scan" and not a
+    timing coincidence.
+    """
+    control_nodes, _registry, control_app = _stack(workspace)
+    sent: list[int] = []
+    agent = _agent(workspace, metrics_provider=_tick(sent))
+    agent._node_id = None  # the loop registers first, like production
+
+    scan_started = threading.Event()
+    scan_release = threading.Event()
+
+    def blocking_scan(_settings, _runtime_registry):
+        scan_started.set()
+        scan_release.wait(timeout=30)
+        return {}, []
+
+    monkeypatch.setattr(agent_mod, "_scan_workspace_runtimes", blocking_scan)
+
+    intervals: list[int] = []
+    parked = asyncio.Event()
+
+    async def hook(_interval):
+        intervals.append(len(intervals) + 1)
+        if len(intervals) >= 3:
+            parked.set()
+            await asyncio.sleep(3600)
+
+    task = asyncio.create_task(agent._loop())
+    # No ``agent=``: this contract wants the harness to stay out of the round's
+    # way (the draining hook would hide exactly what it asserts).
+    _patch_loop_transport(monkeypatch, control_app, driven=task, agent=agent)
+    _patch_loop_sleep(monkeypatch, hook, driven=task)
+    try:
+        await asyncio.wait_for(parked.wait(), timeout=30)
+        # The round is parked inside the scan right now...
+        assert scan_started.is_set()
+        assert agent._reconcile_task is not None
+        assert not agent._reconcile_task.done()
+        # ...and the loop still registered and kept beating: three intervals
+        # elapsed with the scan holding a thread.
+        assert len(intervals) >= 3
+        # The first pulse is the registration (no usage payload); every later
+        # pulse is a heartbeat, and each one got out while the round was parked.
+        assert len(sent) == len(intervals) - 1, (
+            f"{len(sent)} heartbeat(s) over {len(intervals)} interval(s)"
+        )
+        assert len(sent) >= 2
+        # ...and the registration itself landed (the loop generates its own node
+        # id: ``_node_id`` was None on purpose, as it is on a real first start).
+        assert agent._node_id is not None
+        assert agent._node_id in {
+            node.node_id for node in control_nodes.list()
+        }
+    finally:
+        scan_release.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        round_task = agent._reconcile_task
+        if round_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await round_task
+
+
 class _ForeignHeartbeat:
     """A ``NodeAgent`` heartbeat loop running in its own thread and loop.
 
@@ -388,15 +468,42 @@ def _client(app) -> httpx.AsyncClient:
     )
 
 
-def _is_driven(driven) -> bool:
-    """Whether the caller is the loop under test (``driven``'s task)."""
+def _is_driven(driven, agent: NodeAgent | None = None) -> bool:
+    """Whether the caller is the loop under test, or one of its rounds.
+
+    Since N21 the reconcile round is a *separate task* (``NodeAgent`` detaches it
+    so the heartbeat never waits behind a sweep), so the loop's task is no longer
+    the only task this harness has to serve: the round creates its own HTTP client
+    and would otherwise talk to the real ``http://control``.
+    """
     try:
-        return asyncio.current_task() is driven
+        current = asyncio.current_task()
     except RuntimeError:  # no running loop: the caller is sync code
         return False
+    if current is driven:
+        return True
+    return (
+        agent is not None
+        and agent._reconcile_task is not None
+        and current is agent._reconcile_task
+    )
 
 
-def _patch_loop_transport(monkeypatch, control_app, *, driven) -> None:
+async def _drain_reconcile_round(agent: NodeAgent) -> None:
+    """Let the agent's detached reconcile round finish.
+
+    The rounds below are counted per heartbeat interval. While the round ran
+    inline that ordering was implied; now it is a task of its own, so a tick can
+    land in the middle of one. Awaiting it here keeps the assertions about the
+    retry *schedule* from racing the sweep they are describing.
+    """
+    task = agent._reconcile_task
+    if task is not None and not task.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def _patch_loop_transport(monkeypatch, control_app, *, driven, agent=None) -> None:
     """Point the loop under test's own ``httpx.AsyncClient`` at the app.
 
     ``httpx`` is patched on the module the agent imports it from, which is
@@ -409,7 +516,7 @@ def _patch_loop_transport(monkeypatch, control_app, *, driven) -> None:
     real_client = httpx.AsyncClient
 
     def factory(*args, **kwargs):
-        if not _is_driven(driven):
+        if not _is_driven(driven, agent):
             return real_client(*args, **kwargs)
         kwargs.pop("timeout", None)
         return real_client(
@@ -421,7 +528,7 @@ def _patch_loop_transport(monkeypatch, control_app, *, driven) -> None:
     monkeypatch.setattr(httpx, "AsyncClient", factory)
 
 
-def _patch_loop_sleep(monkeypatch, hook, *, driven) -> None:
+def _patch_loop_sleep(monkeypatch, hook, *, driven, agent=None) -> None:
     """Drive ``NodeAgent._loop``'s 5s heartbeat sleep from the test.
 
     Only ``asyncio``'s attribute inside ``envd_service.agent`` is replaced
@@ -440,8 +547,12 @@ def _patch_loop_sleep(monkeypatch, hook, *, driven) -> None:
     real_sleep = asyncio.sleep
 
     async def fake_sleep(delay, *args, **kwargs):
-        if _is_driven(driven):
+        if _is_driven(driven, agent):
             if delay >= 1.0:
+                # Only from the loop's own task: awaiting the round from inside
+                # the round would deadlock on itself.
+                if agent is not None and asyncio.current_task() is driven:
+                    await _drain_reconcile_round(agent)
                 await hook(delay)
             await real_sleep(0)
             return
@@ -1448,8 +1559,8 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
             await asyncio.sleep(3600)
 
     task = asyncio.create_task(agent._loop())
-    _patch_loop_transport(monkeypatch, control_app, driven=task)
-    _patch_loop_sleep(monkeypatch, hook, driven=task)
+    _patch_loop_transport(monkeypatch, control_app, driven=task, agent=agent)
+    _patch_loop_sleep(monkeypatch, hook, driven=task, agent=agent)
     try:
         await asyncio.wait_for(parked.wait(), timeout=30)
     finally:
@@ -1536,8 +1647,8 @@ async def test_deferred_disk_sweep_backs_off_instead_of_polling_every_heartbeat(
             await asyncio.sleep(3600)
 
     task = asyncio.create_task(agent._loop())
-    _patch_loop_transport(monkeypatch, control_app, driven=task)
-    _patch_loop_sleep(monkeypatch, hook, driven=task)
+    _patch_loop_transport(monkeypatch, control_app, driven=task, agent=agent)
+    _patch_loop_sleep(monkeypatch, hook, driven=task, agent=agent)
     try:
         await asyncio.wait_for(parked.wait(), timeout=30)
     finally:
@@ -1614,8 +1725,8 @@ async def test_the_heartbeat_hook_counts_only_the_loop_under_test(
             await asyncio.sleep(3600)
 
     task = asyncio.create_task(driven._loop())
-    _patch_loop_transport(monkeypatch, control_app, driven=task)
-    _patch_loop_sleep(monkeypatch, hook, driven=task)
+    _patch_loop_transport(monkeypatch, control_app, driven=task, agent=driven)
+    _patch_loop_sleep(monkeypatch, hook, driven=task, agent=driven)
     try:
         await asyncio.wait_for(parked.wait(), timeout=30)
     finally:

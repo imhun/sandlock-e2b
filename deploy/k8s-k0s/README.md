@@ -112,8 +112,7 @@ worker、读 pod 日志）。
   承载的沙箱记录仍指向旧 id，控制面路由不到**，要等 TTL（登记为 backlog **N20**）。
   要稳定 id 需要 StatefulSet（autoscaler 现在按 Deployment scale，改起来牵连较大）。
   ⚠ 别拿 worker 上报的本地运行时列表当归属声明 —— 它含共享 base 上**所有**树。
-* **reconcile 轮次仍压在 worker 的事件循环上**（扫描是同步调用，整轮还挂在心跳那个协程里），
-  所以轮次有多长、心跳就断多久（backlog **N21**）。今天 0.19 s/轮、零症状，但它是把
-  `E2B_NODE_HEARTBEAT_TIMEOUT` 降回默认 15 s 的前置（现在是 60 s，见
-  `docs/k8s-deployment.md` §14）。
+* ~~reconcile 轮次压在 worker 的事件循环上~~ —— ✅ 2026-09-18 已修（backlog **N21**）：
+  轮次独立成单飞 task、扫描与逐树校验挪到线程，心跳不再等任何一轮。base 灌到 3002 棵树
+  （一轮 7.8 s）时心跳仍是 5.0 s，窗口因此从 60 s 收到 30 s（见 `docs/k8s-deployment.md` §14）。
 * 控制面**仍只能 1 副本**（注册表在进程内，见上一节）。
