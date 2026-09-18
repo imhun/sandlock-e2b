@@ -76,36 +76,33 @@ spec:
 6. **冒烟要打到 gateway**：用下面那个 NodePort（`gateway-nodeport`，固定 31907）——
    它就在这个 overlay 里，不再是临时对象。
 
-## 从集群外面访问：`gateway-nodeport`（固定 NodePort 31907）
+## 从集群外面访问
 
-这台集群没有 LB，所以「外面怎么进来」由 overlay 里的 `gateway-nodeport` 回答：
-**任意节点的 `:31907`** → control-plane 的 `:3000`（与基线那个 ClusterIP `gateway`
-同一个后端，只是换了个入口类型）。端口写死，因为访问它的东西是跳板机转发、CI 与运维
-脚本，不该跟着 k8s 的随机分配漂。
+三个入口，同一套鉴权（`X-API-Key`，即 `e2b-secrets` 里的 `E2B_API_KEYS`）：
 
-**VPC 内**（跳板机、同 VPC 的 CI、其它 ECS）直接打：
-
-```bash
-curl -s -H "X-API-Key: $KEY" http://172.18.80.94:31907/sandboxes     # 或 :31907
-```
-
-**本机 / 集群外**（本机只能到跳板机）经跳板机转发：
+| 从哪里 | 用什么 | 备注 |
+|---|---|---|
+| **本机 / 任何能到它的机器** | `http://172.18.78.49:3000` | **首选**。这是前置转发（→ `.140:31907`），本机可直达，无需跳板机 |
+| VPC 内（跳板机、同 VPC 的 CI/ECS） | `http://172.18.80.94:31907`（或 `.140`） | 集群自己的 NodePort，两个节点都服务 |
+| 经跳板机的备用路径 | `ssh -L 49983:172.18.80.94:31907 <bastion>` | 只在上面两条都不可用时才需要 |
 
 ```bash
-ssh -f -N -L 49983:172.18.80.94:31907 root@172.18.74.236
-export E2B_API_URL=http://127.0.0.1:49983 E2B_SANDBOX_URL=http://127.0.0.1:49983
+export E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000
 ```
 
-`tmp/k0s/open-tunnels.sh` 就是把上面两条转发（kubectl 的 16443 + gateway 的 49983）一起
-建起来；它也顺带 `kubectl apply` 这个 Service，所以重建集群后跑一次就够。
+`gateway-nodeport`（overlay 里的那个 Service）就是第二行的来源：**任意节点的 `:31907`** →
+control-plane 的 `:3000`，与基线那个 ClusterIP `gateway` 同一个后端，只是换了个入口类型。
+端口写死，因为访问它的东西（本机脚本、CI、前置转发）不该跟着 k8s 的随机分配漂。
+`tmp/k0s/open-tunnels.sh` 会把 kubectl 那条（16443）建起来，并顺带 `kubectl apply`
+这个 Service —— 重建集群后跑一次就够；**gateway 那条转发它不再建**（本机直连 78.49 即可）。
 
-**已经在用的前置转发**：`172.18.78.49:3000` → `.140:31907`（2026-09-18 验过整条链路：
-带 key 的 `/sandboxes` 200、不带/带错 key 401、`/internal/*` 仍需内部 key，延迟与直连
-31907 相当（12 ms vs 11 ms）；`multinode_smoke` 与 `deployment_smoke` 都从这个入口跑通，
-含命令/文件/跨节点迁移/模板构建→worker 拉取/箱内 MCP）。VPC 内可直接用它，本机则
-`ssh -L 49984:172.18.78.49:3000 <bastion>` 再指 `E2B_API_URL=http://127.0.0.1:49984`。
-⚠ 注意它**钉在 `.140` 这一个节点**上：NodePort 本身在每个节点都服务（CP pod 跑到 `.94`
-也照样通），但 `.140` 一旦下线/重启，这条转发就断了 —— 要抗单点就把它改成带后端健康检查的
+**实测（2026-09-18，本机直连，无转发）**：`/sandboxes` 带 key 200、不带/带错 key 401、
+`/internal/*` 仍需内部 key；`multinode_smoke`（4 箱 2+2、命令/文件/stdin）与
+`deployment_smoke`（跨节点迁移保留文件、远端卷隔离、模板构建→worker 拉取、箱内 MCP）
+**从这个地址直接跑全绿**，整轮 9.6 s / 20.4 s。
+
+⚠ **单点**：前置转发钉在 `.140` 这一个节点上。NodePort 本身在每个节点都服务（CP pod 跑到
+`.94` 也照样通），但 `.140` 一旦重启/下线，这条入口就断了 —— 要抗这点就把它改成带健康检查的
 双目标（`.94` + `.140`），或把入口交给真正的 LB。
 
 ⚠ 两点：**明文 HTTP**（认证靠 `X-API-Key`，即 `e2b-secrets` 里的 `E2B_API_KEYS`），
