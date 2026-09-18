@@ -297,6 +297,11 @@ fork 本来就知道，且它**已经有按 child fd 键控的 per-process 状�
 安全侧完整定性见 `docs/security-audit/findings.md` 的 **OBS-9**（并已挂到
 `attack-surface.md` 的 C 层）。这里只记与配额账相关的结论：
 
+> **状态（2026-09-18）**：OBS-9 的建议 ①（uid 权威搬到 `SandboxRecord`/Redis）与 ②（控制面
+> 最小权限挂载）**已落地并在集群验证**，细节见 findings 的 OBS-9。对本文的影响：那两条链
+> （改 `sandbox.json` 拆掉跨 uid 墙、控制面改任意沙箱树）都已关闭；剩下的 ③ uid 审计与
+> ④ NAS 权限组确认仍未做，卷切片归属的权威仍在卷内。
+
 **实测现状**（2026-09-18）：`deploy/k8s-k0s/storage-nas.yaml` 的 `: /sandlock` 被**控制面与两个
 worker 都以 root 挂载**，两节点分别实测 `WRITE OK as 0:0` / `WRITE OK as 0:65534`，卷根是
 `drwxrwxrwt` ⇒ **机器级没有任何边界**，只有进程级（沙箱 host uid + Landlock）。

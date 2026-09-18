@@ -405,6 +405,29 @@ chroot/route-B 形态多出 fd 3/4/6/7，实测都是**普通 ELF 文件**（不
     确认权限组与"是否有别的信任域也挂着同一路径"——这一条决定它是"缺纵深防御"还是
     "对外可写的真漏洞"。
 
+  **① 与 ② 已落地（2026-09-18，`0.1.0-367-gca4a602`），并在集群上验证：**
+
+  * **② 控制面最小权限挂载**：`deploy/k8s/control-plane.yaml` 里 `: /sandlock` 改为
+    `readOnly`，控制面真正要写的六个目录用 **`subPath` 挂回来 RW**：
+    `_builds`（模板构建）、`_images`（OCI 导出）、`_secrets`、`_templates`、`_snapshots`、
+    `_volumes`；这些目录由 worker 的 `workspace-root-init` 预建（subPath 源不存在会让 pod 停在
+    ContainerCreating，kubelet 会重试，所以首次安装会自愈）。
+    实测（控制面 pod 内）：写已存在沙箱树 `sbx_…` 与写根层新名字**都是 EROFS**；
+    六个目录全部可写。顺带修掉一个真回归：**快照记录原本落在根层的 `snap_<id>`**
+    （而 worker 的 `fs/` 在 `_snapshots/<id>/fs`——同一个快照两套路径），现改为记录与 payload
+    同目录 `_snapshots/<id>/`，读取仍兼容旧布局、删除两者都清；快照 create/restore/delete 实测通过。
+  * **① uid 权威搬到卷外**：新增 `RedisUidLedger`（`HSETNX` 逐 uid 认领 + 反向索引，无 Redis 时等价
+    内存实现），`SandboxRegistry.allocate_host_uid()/release_host_uid()`，`host_uid` 成为
+    `SandboxRecord` 的持久字段；建箱前分配并随 `hostUID` 下发给 worker，
+    worker `UidPool.claim()` **按给定值采用**，只有拿不到 uid（旧控制面/旧记录）才回落到它自己的
+    磁盘扫描分配（也正因如此，非 per-uid 部署不会白白耗尽池）；释放挂在 `_release` 上
+    （驱逐、TTL、所有回滚路径都走它）。
+    **集群实测这条链**：A→10000、B→10001；把 A 的 `sandbox.json` 伪造成占用 **10002**（正是
+    OBS-9 的攻击面）→ 新建 C **仍然拿到 10002**（旧扫描式分配器会跳过去给 10003）；
+    kill A/C 后新建 D 拿到 **10000**（释放真的回到池里，不是每个沙箱漏一个 uid）。
+  * 仍未做：**③ uid 审计**与**④ NAS 权限组确认**；另外"**卷切片归属**"这一半的权威仍在卷内
+    （`volume_projects` 由 worker 写在 `sandbox.json`，teardown 侧已有名字/根校验，分配侧还没有）。
+
 ## L4 实测：哪些上限是真的
 
 - **OBS-8 资源创建类端点只有沙箱创建有限流（中，已修）**
