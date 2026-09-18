@@ -154,6 +154,9 @@ class _Record:
     mcp = None
     network: dict = {}
     iam_tokens: dict = {}
+    #: Set by the registry before provisioning (OBS-9); ``None`` here keeps
+    #: this test on the worker-pool fallback path it is about.
+    host_uid: int | None = None
 
 
 def _provision_request(tmp_path, pool):

@@ -127,6 +127,23 @@ class Settings:
     max_total_disk_mb: int = field(
         default_factory=lambda: _env_int("E2B_MAX_TOTAL_DISK_MB", 10240)
     )
+    # Per-sandbox host uid pool (E3.2). Same names as the worker's settings on
+    # purpose: the control plane is now the allocator (OBS-9 -- the pool used
+    # to be derived from files inside the shared volume, which any root on any
+    # mounting node can rewrite), so both sides must agree on the range.
+    uid_pool_start: int = field(
+        default_factory=lambda: _env_int("E2B_UID_POOL_START", 10000)
+    )
+    uid_pool_size: int = field(
+        default_factory=lambda: _env_int("E2B_UID_POOL_SIZE", 1000)
+    )
+    #: Mirrors the worker's switch (same env name, same default): a deployment
+    #: that is not putting sandboxes on per-sandbox uids must not consume the
+    #: pool, or a thousand creates would exhaust it and start refusing work for
+    #: a feature that is switched off.
+    per_sandbox_uid: bool = field(
+        default_factory=lambda: _env_bool("E2B_PER_SANDBOX_UID", True)
+    )
     max_total_processes: int = field(
         default_factory=lambda: _env_int("E2B_MAX_TOTAL_PROCESSES", 2048)
     )

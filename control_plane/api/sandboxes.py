@@ -1171,6 +1171,26 @@ async def _create_sandbox_attempt(
     registry.save(record)
     registry.release_pending(sandbox_id_hdr)
 
+    # OBS-9: the fleet-wide host uid is allocated here, in the registry's
+    # shared store, and travels down with the provision call -- the worker must
+    # not derive it from the sandbox tree, because that tree is writable by any
+    # root on any mounting node. The record carries it, so migration and
+    # re-provisioning reuse the same uid, and record removal (including every
+    # rollback below) returns it to the pool.
+    host_uid = None
+    if settings.per_sandbox_uid:
+        host_uid = registry.allocate_host_uid(record.sandbox_id)
+        if host_uid is None:
+            registry.delete(record.sandbox_id)
+            raise OfficialError(
+                503,
+                "per-sandbox uid pool exhausted: every host uid in "
+                f"[{settings.uid_pool_start}, "
+                f"{settings.uid_pool_start + settings.uid_pool_size}) is taken",
+            )
+        record.host_uid = host_uid
+        registry.save(record)
+
     try:
         if node.address == "local://":
             workspace_dir = _provision_local(
@@ -1228,10 +1248,16 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
     if pool is not None and (
         os.geteuid() == 0 or priv_helpers.active_helpers() is not None
     ):
-        host_uid = pool.acquire(
-            record.sandbox_id,
-            preferred=existing.host_uid if existing is not None else None,
-        )
+        # The registry allocated this uid fleet-wide before we got here
+        # (OBS-9); the pool's own allocator is only the fallback for records
+        # that predate the change.
+        if record.host_uid is not None:
+            host_uid = pool.claim(record.sandbox_id, record.host_uid)
+        else:
+            host_uid = pool.acquire(
+                record.sandbox_id,
+                preferred=existing.host_uid if existing is not None else None,
+            )
     try:
         try:
             from envd_service.volumes import build_volume_mounts
@@ -1330,6 +1356,10 @@ async def _provision_remote(
         "cpuPercent": record.cpu_count * 100,
         "diskMB": record.disk_size_mb,
         "maxProcesses": record.max_processes,
+        # OBS-9: the fleet-wide host uid, allocated by the registry. Absent
+        # only for records older than the change, where the worker falls back
+        # to its own pool.
+        "hostUID": record.host_uid,
         "allowInternetAccess": record.allow_internet_access,
         "allowPublicTraffic": bool(
             (record.network or {}).get("allowPublicTraffic", False)

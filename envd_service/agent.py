@@ -2039,10 +2039,17 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
         and (os.geteuid() == 0 or priv_helpers.active_helpers() is not None)
         and pool is not None
     ):
-        host_uid = pool.acquire(
-            sandbox_id,
-            preferred=existing.host_uid if existing is not None else None,
-        )
+        # OBS-9: the control plane allocates the fleet-wide uid and passes it
+        # down; the worker's own pool is the fallback for payloads without one
+        # (an older control plane, or a deployment that never enabled it).
+        allocated = payload.get("hostUID")
+        if isinstance(allocated, int) and not isinstance(allocated, bool):
+            host_uid = pool.claim(sandbox_id, allocated)
+        else:
+            host_uid = pool.acquire(
+                sandbox_id,
+                preferred=existing.host_uid if existing is not None else None,
+            )
     try:
         mount_paths, volume_projects = build_volume_mounts(
             sandbox_id=sandbox_id,

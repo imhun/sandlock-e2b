@@ -135,6 +135,11 @@ class SandboxRecord:
     allow_internet_access: bool = False
     alias: str = "base"
     workspace_dir: Path | None = None
+    #: Per-sandbox host uid (E3.2), allocated by this registry and persisted
+    #: here rather than derived from the tree: the tree lives on the shared
+    #: volume, where any root on any mounting node can rewrite it (OBS-9), and
+    #: a fleet-level invariant cannot be sourced from there.
+    host_uid: int | None = None
     base_image: str | None = None
     max_processes: int = 256
     secure: bool = True
@@ -328,6 +333,7 @@ class SandboxRecord:
             "workspace_dir": (
                 str(self.workspace_dir) if self.workspace_dir is not None else None
             ),
+            "host_uid": self.host_uid,
         }
 
     @classmethod
@@ -375,6 +381,9 @@ class SandboxRecord:
             ),
             workspace_dir=(
                 Path(data["workspace_dir"]) if data.get("workspace_dir") else None
+            ),
+            host_uid=(
+                int(data["host_uid"]) if data.get("host_uid") is not None else None
             ),
         )
 
@@ -443,16 +452,22 @@ class SandboxRegistry:
         self._redis = None
         self._quota_store = None
         self._record_store = None
+        self._uid_ledger = None
+        #: In-memory fallback for single-process deployments (no Redis): the
+        #: same "allocated" semantics without a shared store.
+        self._uid_allocations: dict[str, int] = {}
         self._ns = namespace
         if redis_client is not None:
             from control_plane.registry.redis_backend import (
                 RedisQuotaStore,
                 RedisRecordStore,
+                RedisUidLedger,
             )
 
             self._redis = redis_client
             self._quota_store = RedisQuotaStore(redis_client, namespace)
             self._record_store = RedisRecordStore(redis_client, namespace)
+            self._uid_ledger = RedisUidLedger(redis_client, namespace)
 
     def add_on_removed(self, callback: Callable[[SandboxRecord], None]) -> None:
         self._on_removed_callbacks.append(callback)
@@ -652,6 +667,46 @@ class SandboxRegistry:
             )
             return workspace_disk_refusal(reserved, limit)
         return "No resources available"
+
+    def allocate_host_uid(self, sandbox_id: str) -> int | None:
+        """Claim a per-sandbox host uid for the whole fleet (E3.2 / OBS-9).
+
+        The allocation lives in the shared store, **not** in the sandbox tree:
+        the tree is on the shared volume, any root on any mounting node can
+        rewrite it, and the old on-disk scan (``envd_service.uid_pool``) read
+        ``host_uid`` from exactly such files. A tampered file could therefore
+        make two sandboxes share a uid -- i.e. remove the cross-uid isolation
+        wall -- without touching anything the platform owns.
+
+        ``None`` means the pool is exhausted; the caller refuses the create
+        with a readable message instead of handing out a uid that is in use.
+        """
+        s = self._settings
+        start = int(getattr(s, "uid_pool_start", 0) or 0)
+        size = int(getattr(s, "uid_pool_size", 0) or 0)
+        if start <= 0 or size <= 0:
+            return None
+        if self._uid_ledger is not None:
+            return self._uid_ledger.allocate(
+                start=start, size=size, sandbox_id=sandbox_id
+            )
+        with self._lock:
+            existing = self._uid_allocations.get(sandbox_id)
+            if existing is not None:
+                return existing
+            used = set(self._uid_allocations.values())
+            for uid in range(start, start + size):
+                if uid not in used:
+                    self._uid_allocations[sandbox_id] = uid
+                    return uid
+        return None
+
+    def release_host_uid(self, sandbox_id: str) -> int | None:
+        """Return ``sandbox_id``'s uid to the pool (called on record removal)."""
+        if self._uid_ledger is not None:
+            return self._uid_ledger.release(sandbox_id)
+        with self._lock:
+            return self._uid_allocations.pop(sandbox_id, None)
 
     def global_reserved(self) -> dict[str, int]:
         """The fleet-wide reservation ledger, whichever backend is holding it.
@@ -1190,6 +1245,10 @@ class SandboxRegistry:
             except Exception:  # pragma: no cover - defensive
                 pass
         self.release_quota(record)
+        # OBS-9: the uid is claimed fleet-wide, so it has to come back whenever
+        # the record goes away -- TTL expiry, eviction and every rollback path
+        # all funnel through here.
+        self.release_host_uid(record.sandbox_id)
 
     # -- lifecycle --------------------------------------------------------
 

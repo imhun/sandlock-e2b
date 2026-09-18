@@ -563,6 +563,34 @@ class UidPool:
             finally:
                 self._close_reservation_lock(fd)
 
+    def claim(self, sandbox_id: str, uid: int) -> int:
+        """Adopt a uid the **control plane** allocated (OBS-9).
+
+        The authority for fleet-wide uid allocation moved out of the shared
+        volume: ``sandbox.json`` inside a sandbox tree is writable by any root
+        on any mounting node, so a uid sourced from there could be forged --
+        and forging one is enough to make two sandboxes share a uid and remove
+        the cross-uid isolation wall. The control plane now allocates in its
+        shared store and passes the uid down with the create; this method just
+        records it locally so the *fallback* allocator
+        (:meth:`acquire`, used when no uid arrives) cannot hand out the same
+        value.
+
+        Raises :class:`UidPoolError` when the uid is outside the pool range --
+        a control plane and a worker that disagree about the range would
+        otherwise silently put two sandboxes on one uid.
+        """
+        if not validate_sandbox_id(sandbox_id):
+            raise UidPoolError(f"invalid sandbox id: {sandbox_id!r}")
+        if not (self._start <= uid < self._start + self._size):
+            raise UidPoolError(
+                f"uid {uid} is outside this worker's pool "
+                f"[{self._start}, {self._start + self._size})"
+            )
+        with self._lock:
+            self._allocated.add(uid)
+        return uid
+
     def commit(self, sandbox_id: str) -> None:
         """Drop the reservation marker once the record is durable.
 
