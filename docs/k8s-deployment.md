@@ -1219,3 +1219,22 @@ POST /sandboxes -> 503
 
 > 跑 smoke 时记得 `E2B_INTERNAL_API_KEY` 也要导出（脚本默认值 `internal-key` 与集群不符，
 > 否则会在 `/internal/routes` 上 401）。
+
+### 21.1 每沙箱超限会被暂停（N25 / L2b，2026-09-18）
+
+卷级闸门管的是**卖出去多少**；这一条管的是**实际写了多少**（前者看不见后者）。
+
+* **谁测**：worker 周期性 walk 每棵沙箱树（它拥有这个挂载；控制面侧
+  `record.workspace_dir` 对远端沙箱**故意为 `None`**，所以它不做这件事）。间隔
+  `E2B_DISK_ENFORCE_INTERVAL_S`（默认 **30 s**，`0` = **关闭这条闸门**）。
+* **怎么判**：实测 > 该沙箱创建时的 `diskMB`（默认 `E2B_DEFAULT_DISK_MB=1024`）。
+* **怎么办**：**暂停**（不是 kill）：状态保留、预留释放（global/tenant/节点 slice 都还回去）、
+  worker 上的进程被冻结。日志：`sandbox <id> over its workspace budget (N MiB used of M MiB): pausing it`。
+* **恢复路径**：删掉超额文件后 `POST /sandboxes/{id}/connect` 恢复。**仍超预算就会在下一个心跳
+  （≤30 s）内被再次暂停** —— 这是"暂停而非 kill"的代价，换来的是现场不丢。
+* **成本**：整树 walk 在这台 NAS 上是 **10.9 ms / 2 000 文件、35.7 ms / 10 000 文件**
+  （单文件亚线性，贵在目录：≈2.5 ms/目录）。不需要 inotify（实测推翻了"walk 太贵"这个前提），
+  见 `docs/disk-quota-options.md` §5.2。扫描另有 1 s/轮预算 + 游标轮转，不会因为一棵巨树饿死其他树。
+* **已知缺口**：`GET /sandboxes/{id}/metrics` 的 `diskUsed` 在 k8s 上仍是 **0**
+  （`sample_metric()` 只在 `workspace_dir` 非空时 walk，而远端记录永远为 `None`）。
+  用量目前只能从上面那行 WARNING 日志看到；把最后实测值落库并暴露是下一步。

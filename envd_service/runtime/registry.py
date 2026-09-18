@@ -109,6 +109,9 @@ class RuntimeRegistry:
         #: sandboxes on this workspace (worker agent + local-node control
         #: plane). ``None`` = independent-uid mode disabled.
         self.uid_pool = uid_pool
+        #: N25/L2b: where the next ``disk_usage_snapshot`` round starts, so a
+        #: scan budget that runs out does not always starve the same trees.
+        self._disk_scan_cursor = 0
 
     def add_unregister_callback(self, callback) -> None:
         """Invoke ``callback(sandbox_id)`` after a sandbox is unregistered."""
@@ -150,6 +153,51 @@ class RuntimeRegistry:
         """Copy of the per-sandbox activity timestamps, for the heartbeat."""
         with self._lock:
             return dict(self._activity)
+
+    def disk_usage_snapshot(self, *, budget_s: float | None = None) -> dict[str, int]:
+        """Measured file bytes per sandbox tree, for the heartbeat (N25/L2b).
+
+        The worker owns the mount, so it is the only party that can measure a
+        tree; the control plane turns a report into a pause (it owns state).
+        This is the *second* disk gate: the per-node and fleet ledgers bound
+        what the sandbox was **sold** (``diskMB`` at create time), and this
+        one catches the sandbox that wrote past it.
+
+        Cost was measured on the real NAS rather than assumed (see
+        ``docs/disk-quota-options.md`` §5.2): ~3.6-5.5 us/file and ~2.5 ms per
+        directory, because NFSv4 readdirplus returns a directory's attributes
+        in one RPC -- 10 000 files in one directory walk in 36 ms, and the
+        same 10 000 spread over 100 directories in 273 ms. That is cheap
+        enough that no change-notification machinery is needed; instead the
+        round stops at ``budget_s`` and resumes at the next sandbox next time,
+        so one enormous tree cannot monopolise the heartbeat thread.
+
+        ``None`` from the size scan (a tree the worker's DAC cannot reach and
+        the broker does not cover) is reported as an absent entry: "unknown"
+        must never be read as "empty".
+        """
+        from envd_service import priv_helpers
+
+        with self._lock:
+            records = list(self._records.values())
+            if not records:
+                return {}
+            start = self._disk_scan_cursor % len(records)
+        deadline = None if budget_s is None else time.monotonic() + budget_s
+        usage: dict[str, int] = {}
+        scanned = 0
+        for index, record in enumerate(records[start:] + records[:start]):
+            # Always scan one: a round that returns nothing at all would leave
+            # the cursor where it was and starve every tree behind it forever.
+            if index and deadline is not None and time.monotonic() >= deadline:
+                break
+            size = priv_helpers.dir_size(record.workspace_dir)
+            if size is not None:
+                usage[record.sandbox_id] = int(size)
+            scanned += 1
+        with self._lock:
+            self._disk_scan_cursor = (start + scanned) % len(records)
+        return usage
 
     def _record_path(self, sandbox_id: str) -> Path:
         return self._workspace_base / sandbox_id / "sandbox.json"

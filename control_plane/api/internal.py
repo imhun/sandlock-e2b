@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter
 from typing import Any
 
@@ -13,6 +14,8 @@ from control_plane.auth import verify_internal_key
 from gateway_common.paths import validate_sandbox_id
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 
 def _require_internal_key(request: Request) -> None:
@@ -108,7 +111,42 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
         # E9.1: the worker is the only observer of in-sandbox traffic, so its
         # report is what makes idle detection (and eviction) possible.
         request.app.state.registry.apply_activity_report(node_id, activity)
+    disk_usage = body.get("sandboxDiskUsage")
+    if disk_usage is not None and not isinstance(disk_usage, dict):
+        raise OfficialError(400, "sandboxDiskUsage must be a JSON object")
+    if isinstance(disk_usage, dict) and disk_usage:
+        await _enforce_disk_reports(request, node_id, disk_usage)
     return Response(status_code=204)
+
+
+async def _enforce_disk_reports(
+    request: Request, node_id: str, reports: dict[str, Any]
+) -> None:
+    """Turn a worker's measured tree sizes into pauses (N25/L2b).
+
+    Same split as the activity report: the worker measures because it owns the
+    mount, the control plane pauses because it owns state. Everything the
+    pause would otherwise do *besides* freezing the runtime -- returning the
+    node slice -- happens here, and the freeze push is best-effort: a push
+    that does not land is retried by the next heartbeat (the record stays
+    ``paused`` and still over budget, and the worker's own reconcile/freeze
+    path is idempotent), while rolling the pause back would hand the
+    reservation back to a sandbox that is still writing.
+    """
+    from control_plane.api.sandboxes import _park_capacity, _push_pause_state
+
+    for record in request.app.state.registry.enforce_disk_budget(reports):
+        _park_capacity(request, record)
+        try:
+            await _push_pause_state(request, record, paused=True)
+        except Exception:  # pragma: no cover - worker-specific transport
+            logger.warning(
+                "could not freeze over-budget sandbox %s on node %s; the "
+                "runtime retries on the next heartbeat",
+                record.sandbox_id,
+                node_id,
+                exc_info=True,
+            )
 
 
 @router.get("/internal/nodes/{node_id}/sandboxes")

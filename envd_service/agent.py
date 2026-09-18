@@ -74,6 +74,13 @@ _QUOTA_RECLAIM_DELAY_S = 0.5
 #: reached at 60s.
 _RECONCILE_RETRY_MAX_INTERVALS = 12
 
+#: N25/L2b: wall-clock ceiling for one round of the per-sandbox disk scan.
+#: The scan walks each tree once against the heartbeat's own thread, so the
+#: budget is what keeps a worker with one enormous tree from stalling the
+#: pulse: the round returns what it finished and the next one resumes at the
+#: sandbox after the last it scanned.
+_DISK_SCAN_BUDGET_S = 1.0
+
 # ``UNTRUSTED_TREE_DIR`` (where a refused tree is parked, review W7 / W7-3) is
 # defined in ``gateway_common.paths`` because the fail-safe quota scan has to
 # know the namespace too: a parked tree keeps the project id of the tree it
@@ -159,11 +166,23 @@ def _register_payload(settings: Settings) -> dict[str, Any]:
     }
 
 
+def _disk_enforce_interval_s() -> float:
+    """How often the worker rewalks sandbox trees for the disk report.
+
+    ``E2B_DISK_ENFORCE_INTERVAL_S`` (default 30 s); ``0`` disables the report
+    entirely, which turns the control plane's measured-disk gate off with it.
+    """
+    from gateway_common.env import env_float
+
+    return env_float("E2B_DISK_ENFORCE_INTERVAL_S", 30.0)
+
+
 def _heartbeat_usage_payload(
     settings: Settings,
     metrics_provider: Callable[[], dict[str, Any]] | None = None,
     activity_provider: Callable[[], dict[str, float]] | None = None,
     port_provider: Callable[[], dict[str, int]] | None = None,
+    disk_report: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Disk usage + quota alerts + MCP port band carried by each heartbeat."""
     payload: dict[str, Any] = {}
@@ -183,6 +202,12 @@ def _heartbeat_usage_payload(
             activity = None
         if isinstance(activity, dict) and activity:
             payload["sandboxActivity"] = activity
+    if disk_report:
+        # N25/L2b: measured tree sizes. The control plane pauses what is over
+        # its declared ``diskMB`` -- the per-node and fleet ledgers only bound
+        # what a sandbox was *sold*, so this is the only signal that sees what
+        # it actually wrote. Absent when the round found nothing to report.
+        payload["sandboxDiskUsage"] = dict(disk_report)
     if port_provider is not None:
         # N8: the MCP gateway port band (61001-65535, §2.9) is a per-worker
         # resource with a hard ceiling, and both workers now run the same
@@ -1293,6 +1318,16 @@ class NodeAgent:
         self._activity_provider = getattr(
             runtime_registry, "activity_snapshot", None
         )
+        #: N25/L2b: measured per-sandbox tree sizes. Scanned on its own,
+        #: slower cadence (``E2B_DISK_ENFORCE_INTERVAL_S``, 0 disables) and
+        #: cached for every heartbeat in between: the walk is a few
+        #: milliseconds per sandbox, but there is no reason to redo it five
+        #: times a minute, and a heartbeat that finds nothing must not erase
+        #: the control plane's view of what it learned a moment ago.
+        self._disk_provider = getattr(runtime_registry, "disk_usage_snapshot", None)
+        self._disk_interval_s = _disk_enforce_interval_s()
+        self._disk_report: dict[str, int] = {}
+        self._disk_report_at = 0.0
         self._node_id: str | None = None
         self._task: asyncio.Task | None = None
         #: The reconcile round currently running, if any. The round is its own
@@ -1377,6 +1412,7 @@ class NodeAgent:
                         self._metrics_provider,
                         self._activity_provider,
                         self._port_provider,
+                        self._disk_report_for_heartbeat(),
                     ),
                     headers=headers,
                 )
@@ -1388,6 +1424,28 @@ class NodeAgent:
         # (this one is closed when the ``async with`` above exits, and a detached
         # round outlives it).
         self._start_reconcile_if_due()
+
+    def _disk_report_for_heartbeat(self) -> dict[str, int]:
+        """The last measured tree sizes, refreshed on its own cadence.
+
+        Runs the (blocking, file-system) scan on the event loop's thread by
+        design: it is a few milliseconds per sandbox with a hard scan budget
+        (``disk_usage_snapshot(budget_s=...)``), and moving it to a thread
+        would buy nothing but a race with the next heartbeat.
+        """
+        if self._disk_provider is None or self._disk_interval_s <= 0:
+            return {}
+        now = time.monotonic()
+        if now - self._disk_report_at < self._disk_interval_s:
+            return self._disk_report
+        try:
+            report = self._disk_provider(budget_s=_DISK_SCAN_BUDGET_S)
+        except Exception:
+            logger.warning("sandbox disk scan failed", exc_info=True)
+            return self._disk_report
+        self._disk_report = dict(report or {})
+        self._disk_report_at = now
+        return self._disk_report
 
     def _start_reconcile_if_due(self) -> None:
         """Start one reconcile round as its own task, if one is due.

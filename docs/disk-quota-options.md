@@ -173,6 +173,39 @@ pod 里 df /var/lib/e2b-sandboxes : nfs4  10P 总  553G 已用  1%（那是整�
 * **迁移**：额度跟着树走（目录配额与路径绑定 ⇒ 目标节点重新 `Set`；只有真删除才 `Cancel`）；
 * 判据脚本：扩展现有冒烟 —— 建一个 `diskMB` 很小的沙箱 + `dd`，并加一条"邻居不受影响"的断言。
 
+### 5.2 每沙箱整树 walk 到底贵不贵（2026-09-18 实测，改掉了 L2b 的设计）
+
+原计划（L2b）打算走 **inotify 增量**（事件 + 只 `stat` 变化的文件），前提是"整树 walk 太贵"。
+**实测把这个前提推翻了**，所以 L2b 现在**没有 inotify**，就是周期性整树 walk。
+
+在**线上共享 NAS** 上量（`kubectl exec` 进控制面 pod，同一个 `/var/lib/e2b-sandboxes` 挂载，
+`os.walk` + `stat` 求和，与 `priv_helpers.dir_size` 同一口径）：
+
+| 形状 | walk p50 | 每次 stat |
+|---|---|---|
+| 2 000 文件 / 1 目录 | **10.9 ms** | 5.5 µs |
+| 10 000 文件 / 1 目录 | **35.7 ms** | 3.6 µs |
+| 10 000 文件 / 100 目录 | **273 ms** | 27.3 µs |
+
+读出来的是两条：
+
+1. **每文件成本是亚线性的**（NFSv4 `readdirplus` 一次 RPC 带回整个目录的属性）——
+   10 000 个文件只要 36 ms；单文件"贵"在**目录**上（≈2.5 ms/目录），不是文件上；
+2. **写文件才是慢的那一头**：同一个卷上创建 2 000 个小文件花了 33 s（16 ms/文件）、
+   10 000 个花 167 s。也就是说"为了省 walk 而引入增量记账"，省下来的远小于它引入的
+   复杂度（递归 watch 管理、NFS 上的事件语义、`mmap` 写不产生事件、跨节点写看不见）。
+
+因此 L2b 定为：**worker 周期性整树 walk + 超限暂停**，并加一个**扫描预算**（`_DISK_SCAN_BUDGET_S`
+= 1 s/轮，超了就下一轮从下一个沙箱接着扫，游标轮转，保证每个树都会被扫到）。
+
+顺带核出两件与它相关的事实（都是**设计使然**，不是 bug，但要知道）：
+
+* `_provision_remote` 结尾**显式** `record.workspace_dir = None` —— 远端沙箱的树归 worker 管，
+  控制面不插手（否则删除路径会有两个主人）。所以**"谁测量"只能是 worker**；
+* 由此，`GET /sandboxes/{id}/metrics` 在 k8s 上 **`diskUsed` 恒为 0**
+  （`SandboxRecord.sample_metric()` 只在 `workspace_dir` 非空时才 walk，而它永远是 `None`）。
+  SDK 的 `get_metrics()` 因此在 k8s 上看不到磁盘占用 —— 这是 N25 的另一半，见 §7 的 L2b 收口。
+
 ## 7. 结论：方案
 
 ### L1 —— 已落地（2026-09-18，`0.1.0-360-…`）
@@ -257,6 +290,28 @@ pod 里 df /var/lib/e2b-sandboxes : nfs4  10P 总  553G 已用  1%（那是整�
 * worker 增量测量（inotify 事件 + 只 `stat` 变化过的文件；长写者用 open-write fd 扫描兜住），
   超过 `diskMB` → **暂停沙箱**（复用现有 pause：保留状态、释放准入），而不是返回 ENOSPC；
 * 语义必须写进 API 文档与错误信息：「配额 = 准入与守护；超限会被暂停」，并给出恢复路径。
+
+**L2b 已落地（2026-09-18，`0.1.0-362-…`）：** 实现与上面的草稿有一处重要差别 ——
+**没有 inotify**，因为 §5.2 的实测推翻了它赖以成立的前提（整树 walk 只要 10.9 ms/2 000 文件）。
+
+* **worker 测**：`RuntimeRegistry.disk_usage_snapshot(budget_s=…)` 周期性 walk 每棵沙箱树
+  （与 `/metrics` 的 `priv_helpers.dir_size` 同一口径，所以"你看到的数" == "判你超限的数"），
+  预算 1 s/轮、游标轮转（保证每棵树都会被扫到，不会永远饿死队尾）；间隔
+  `E2B_DISK_ENFORCE_INTERVAL_S`（默认 30 s，**0 = 关闭**），结果缓存后跟随后续心跳重发；
+* **`None`（DAC 够不到、broker 也不覆盖）→ 不报**：`unknown ≠ 0`，不能把"测不到"读成"没占地方"；
+* **CP 判**：`SandboxRegistry.enforce_disk_budget()` —— 只动
+  **running 且实测 > `disk_size_mb`** 的记录，走**现有 E9.2 pause**（保留状态、释放 global/tenant
+  预留，节点 slice 由心跳处理器 `_park_capacity` 释放）。**已暂停的跳过**，否则每个心跳都会往
+  同一条记录追加一行 "sandbox paused"；
+* **冻结推送失败不回滚**：滚回等于把预留还给一个还在写的沙箱；推送失败只 WARNING，
+  下一个心跳继续推（幂等）。这条与用户主动 pause 的语义**故意不同**（那条要回滚，见 G1a）；
+* resume 仍可发起：树回到预算内就不会再被暂停；**仍在超预算则会在下一个心跳（≤30 s）内被再次暂停**
+  —— "暂停而不是 kill"的代价就是这个来回，换来的是现场不丢；
+* 配套老实说清楚：`GET /sandboxes/{id}/metrics` 的 `diskUsed` 在 k8s 上**仍然是 0**
+  （§5.2 第 2 条，远端记录 `workspace_dir=None` 是设计使然）。**这个数还没接到 API 上**，
+  所以现阶段"看得见用量"的地方只有 worker/CP 的 WARNING 日志与
+  `/internal/fleet/metrics` 的卷级台账 —— **下一步就是把每条记录的最后一次实测值落库并暴露出去**
+  （它同时也是"resume 时直接告诉用户超了多少"的输入）。
 
 ### L3 —— 兜底（仅在 L2 两条都不接受、又必须 ENOSPC 时）
 

@@ -1575,6 +1575,54 @@ class SandboxRegistry:
                 updated += 1
         return updated
 
+    def enforce_disk_budget(
+        self, reports: dict[str, Any] | None
+    ) -> list[SandboxRecord]:
+        """Pause the sandboxes whose *measured* tree outgrew their budget.
+
+        N25/L2b, and the counterpart of :meth:`apply_activity_report`: the
+        worker measures (it owns the mount), the control plane acts (it owns
+        state). ``reports`` maps sandbox id to measured bytes; anything at or
+        below ``disk_size_mb`` is left alone, and so is a sandbox that is
+        already paused -- otherwise every heartbeat would append another
+        "paused" log line to a record that is already frozen.
+
+        The pause is the existing E9.2 one: state preserved, reservations
+        (global, tenant, and -- by the caller -- the node slice) returned, so
+        a runaway sandbox stops competing for capacity instead of being
+        killed, and the user can resume it once the tree is back in budget.
+
+        Returns the records this call moved to ``paused``. Freezing the
+        runtime on the worker is the caller's job and is *deliberately* not
+        rolled back on failure: an unfrozen runaway must not keep its
+        reservation back just because the push did not land.
+        """
+        paused: list[SandboxRecord] = []
+        for sandbox_id, raw in (reports or {}).items():
+            try:
+                used_bytes = int(raw)
+            except (TypeError, ValueError):
+                continue
+            try:
+                record = self.get(str(sandbox_id))
+            except UnknownSandboxError:
+                continue
+            if record.quota_released or record.state != "running":
+                continue
+            budget_bytes = int(record.disk_size_mb) * 1024 * 1024
+            if budget_bytes <= 0 or used_bytes <= budget_bytes:
+                continue
+            logger.warning(
+                "sandbox %s over its workspace budget (%d MiB used of %d MiB): "
+                "pausing it",
+                record.sandbox_id,
+                used_bytes // (1024 * 1024),
+                record.disk_size_mb,
+            )
+            self.pause(record)
+            paused.append(record)
+        return paused
+
     # -- listing ----------------------------------------------------------
 
     def list(
