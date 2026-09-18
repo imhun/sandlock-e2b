@@ -2243,7 +2243,11 @@ async def agent_create_sandbox(request: Request) -> Response:
         return Response(status_code=401)
     try:
         payload = await request.json()
-        _agent_create_sandbox(request, settings, payload)
+        # Provisioning is filesystem work -- mkdir/chown, volume materialisation
+        # and (for a snapshot-based create) a full copytree of the snapshot --
+        # so it runs off the event loop. Inline it stalled heartbeats and every
+        # other request on this worker for the length of the copy.
+        await asyncio.to_thread(_agent_create_sandbox, request, settings, payload)
         await _prime_runtime_context(request, payload.get("sandboxID"))
     except PermissionError as e:
         # A worker-side permission fault while provisioning, not an auth
@@ -2724,7 +2728,25 @@ async def agent_create_snapshot(request: Request) -> Response:
             return Response(status_code=404, content=f"Sandbox {sandbox_id} not found")
         if dst.exists():
             return Response(status_code=409, content="snapshot already exists")
-        shutil.copytree(src, dst, symlinks=True)
+        # Off the event loop: a snapshot is a full copy of the sandbox's tree
+        # and on the shared NAS that is ~16 ms per file (measured: 2 000 small
+        # files take longer than the entry proxy's timeout). Running it inline
+        # stalled every heartbeat and every other request on this worker for
+        # the whole copy -- the loop stopped answering, which is what made a
+        # snapshot look like a worker outage.
+        try:
+            await asyncio.to_thread(shutil.copytree, src, dst, symlinks=True)
+        except BaseException:
+            # A failed or abandoned copy must not leave a half snapshot behind:
+            # the record is written by the control plane only on success, so a
+            # partial payload would be an orphan nothing ever reclaims (and the
+            # next attempt for the same id would answer 409 "already exists").
+            await asyncio.to_thread(
+                shutil.rmtree,
+                settings.workspace_base / "_snapshots" / snapshot_id,
+                True,
+            )
+            raise
     except PermissionError as e:
         logger.exception("agent create snapshot failed (permission)")
         return Response(status_code=500, content=str(e)[:500])
