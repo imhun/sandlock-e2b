@@ -397,7 +397,7 @@ pure 形态要保持不可见，只有两条路，**都属于形态决策而不�
 
 1. **把平台状态整体搬出 `<base>`**（例如 `E2B_*_BASE=/var/lib/e2b-state`，甚至单独一个挂载）：
    沙箱从 `/home/user` 向上只能到 `<base>`，那里就只剩别的沙箱树（那些是 E3.2 的 `0770` + uid
-   隔离问题，与本条无关）；
+   隔离问题，与本条无关）；**已立账：`docs/task-backlog.md` N27（低优先级，切 pure 形态时必做）**；
 2. **每沙箱私有 mount namespace**（把树 bind 到 `/home/user`）——chroot 形态实际上做的就是这个；
    pure 形态要这么做需要 mount 权限，而 A6 当初特意移除了 `SYS_ADMIN`。
 
