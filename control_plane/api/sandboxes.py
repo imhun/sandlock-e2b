@@ -56,6 +56,7 @@ from gateway_common.upload import (
     read_json_body,
 )
 from gateway_common import GATEWAY_ROUTE_INVALIDATE_CHANNEL
+from gateway_common.timeutil import to_iso_z
 from gateway_common.paths import (
     is_reserved_platform_namespace,
     sandbox_command_log_path,
@@ -645,6 +646,27 @@ def _log_ts(log: dict[str, str]) -> int:
         )
     except (ValueError, KeyError):
         return 0
+
+
+def _platform_pause_entry(record) -> dict[str, str] | None:
+    """The platform's own pause, as the log line the SDK and operators read.
+
+    The record's log *history* is in-memory by design (the record store keeps
+    durable state only), so a line appended by ``SandboxRecord.pause`` is gone
+    by the next ``get`` -- and with Redis in front, *every* read is the next
+    get. The reason is durable (``pause_reason``), so this derives the line from
+    it instead, and stays out of the way when the in-memory history already
+    carries one.
+    """
+    if not record.pause_reason:
+        return None
+    line = f"sandbox paused: {record.pause_reason}"
+    if any(entry.get("line") == line for entry in record.logs):
+        return None
+    return {
+        "timestamp": to_iso_z(record.paused_at or record.last_active_at),
+        "line": line,
+    }
 
 
 async def _command_logs(request, record) -> list[dict[str, str]]:
@@ -2718,6 +2740,9 @@ async def get_sandbox_logs(
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
     logs = record.logs + await _command_logs(request, record)
+    platform_pause = _platform_pause_entry(record)
+    if platform_pause is not None:
+        logs.append(platform_pause)
     logs.sort(key=_log_ts)
     if start is not None:
         logs = [log for log in logs if _log_ts(log) >= start]
@@ -2740,5 +2765,8 @@ async def get_sandbox_logs_v2(
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
     logs = record.logs + await _command_logs(request, record)
+    platform_pause = _platform_pause_entry(record)
+    if platform_pause is not None:
+        logs.append(platform_pause)
     logs.sort(key=_log_ts)
     return logs[-limit:]

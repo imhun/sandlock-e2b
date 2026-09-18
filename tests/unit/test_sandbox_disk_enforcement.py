@@ -16,10 +16,12 @@ import pytest
 
 from control_plane.config import Settings
 from control_plane.registry.manager import (
+    SandboxRecord,
     SandboxRegistry,
     UnknownSandboxError,
 )
 from envd_service.runtime.registry import RuntimeRegistry
+from gateway_common.timeutil import to_iso_z
 
 
 def _settings(**overrides) -> Settings:
@@ -159,6 +161,38 @@ def test_the_gate_is_idempotent_across_repeated_reports(workspace):
         f"({record.disk_size_mb} MiB used of {record.disk_size_mb} MiB)"
     ]
     assert registry.get("sbx_twice").workspace_disk_used_bytes == over
+
+
+def test_the_pause_reason_survives_the_shared_store(workspace):
+    """The reason is durable state, not a log line (N28/D).
+
+    ``to_storage_dict`` carries the record's *durable* fields only -- ``logs``
+    is deliberately not among them -- so a reason that lived only in the log
+    was gone by the next ``get()``, which under Redis is every read.
+    """
+    registry = SandboxRegistry(_settings())
+    record = _create(registry, sandbox_id="sbx_round")
+    record.pause("its workspace grew past its budget (1200 MiB used of 1024 MiB)")
+
+    restored = SandboxRecord.from_storage_dict(record.to_storage_dict())
+
+    assert restored.pause_reason == (
+        "its workspace grew past its budget (1200 MiB used of 1024 MiB)"
+    )
+    # The stored form is the contract: ISO-Z, millisecond precision.
+    assert to_iso_z(restored.paused_at) == to_iso_z(record.paused_at)
+    restored.resume()
+    assert restored.pause_reason is None
+    assert restored.paused_at is None
+
+
+def test_a_caller_initiated_pause_carries_no_reason(workspace):
+    registry = SandboxRegistry(_settings())
+    record = _create(registry, sandbox_id="sbx_plain")
+    registry.pause(record)
+    assert record.pause_reason is None
+    assert record.paused_at is None
+    assert [entry["line"] for entry in record.logs] == ["sandbox paused"]
 
 
 def test_a_foreign_or_malformed_report_is_ignored(workspace):

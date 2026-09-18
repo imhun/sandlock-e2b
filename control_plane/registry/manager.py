@@ -180,6 +180,17 @@ class SandboxRecord:
     #: (``workspace_dir`` is ``None`` there), which is why ``sample_metric``
     #: used to answer a flat ``diskUsed: 0``.
     workspace_disk_used_bytes: int | None = None
+    #: N28/D: why the platform moved this record out of ``running``, and when.
+    #:
+    #: Persisted, unlike ``logs``: the record store deliberately keeps only the
+    #: durable state (the log history lives in the replica that wrote it), so a
+    #: reason that lived only in ``logs`` was gone by the next ``get()`` -- and
+    #: with Redis in front, *every* read is the next get. It is a statement
+    #: *about the current state* ("this is why you are paused"), which is
+    #: exactly what the record store is for; the log line derived from it is
+    #: not.
+    pause_reason: str | None = None
+    paused_at: datetime | None = None
 
     def refresh(self, timeout: int) -> None:
         self.end_at = utcnow() + timedelta(seconds=max(1, timeout))
@@ -265,12 +276,16 @@ class SandboxRecord:
         if self.state == "paused":
             raise SandboxStateConflictError("Sandbox is already paused")
         self.state = "paused"
+        self.pause_reason = reason
+        self.paused_at = utcnow() if reason else None
         self.append_log(f"sandbox paused: {reason}" if reason else "sandbox paused")
 
     def resume(self, timeout: int | None = None) -> None:
         if self.state == "running":
             raise SandboxStateConflictError("Sandbox is already running")
         self.state = "running"
+        self.pause_reason = None
+        self.paused_at = None
         if timeout:
             self.refresh(timeout)
         self.append_log("sandbox resumed")
@@ -362,6 +377,10 @@ class SandboxRecord:
             ),
             "host_uid": self.host_uid,
             "workspace_disk_used_bytes": self.workspace_disk_used_bytes,
+            "pause_reason": self.pause_reason,
+            "paused_at": (
+                to_iso_z(self.paused_at) if self.paused_at is not None else None
+            ),
         }
 
     @classmethod
@@ -417,6 +436,10 @@ class SandboxRecord:
                 int(data["workspace_disk_used_bytes"])
                 if data.get("workspace_disk_used_bytes") is not None
                 else None
+            ),
+            pause_reason=data.get("pause_reason"),
+            paused_at=(
+                _parse(data["paused_at"]) if data.get("paused_at") else None
             ),
         )
 

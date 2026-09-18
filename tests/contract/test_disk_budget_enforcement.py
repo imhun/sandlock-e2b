@@ -173,3 +173,14 @@ async def test_moving_to_paused_says_why(apps, control_client):
         f"sandbox paused: its workspace grew past its budget "
         f"({over_mib} MiB used of {record.disk_size_mb} MiB)"
     )
+    # ...and the same reason reaches the log endpoint even when the record's
+    # in-memory history does not survive the read (the shared store keeps
+    # durable state only, so under Redis this is the *only* copy).
+    registry.get(sid).logs.clear()
+    logs = await control_client.get(
+        f"/sandboxes/{sid}/logs", headers={"X-API-Key": "local-key"}
+    )
+    assert [entry["line"] for entry in logs.json() if "paused" in entry["line"]] == [
+        f"sandbox paused: its workspace grew past its budget "
+        f"({over_mib} MiB used of {record.disk_size_mb} MiB)"
+    ]
