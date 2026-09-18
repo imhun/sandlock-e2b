@@ -99,6 +99,15 @@ export E2B_API_URL=http://127.0.0.1:49983 E2B_SANDBOX_URL=http://127.0.0.1:49983
 `tmp/k0s/open-tunnels.sh` 就是把上面两条转发（kubectl 的 16443 + gateway 的 49983）一起
 建起来；它也顺带 `kubectl apply` 这个 Service，所以重建集群后跑一次就够。
 
+**已经在用的前置转发**：`172.18.78.49:3000` → `.140:31907`（2026-09-18 验过整条链路：
+带 key 的 `/sandboxes` 200、不带/带错 key 401、`/internal/*` 仍需内部 key，延迟与直连
+31907 相当（12 ms vs 11 ms）；`multinode_smoke` 与 `deployment_smoke` 都从这个入口跑通，
+含命令/文件/跨节点迁移/模板构建→worker 拉取/箱内 MCP）。VPC 内可直接用它，本机则
+`ssh -L 49984:172.18.78.49:3000 <bastion>` 再指 `E2B_API_URL=http://127.0.0.1:49984`。
+⚠ 注意它**钉在 `.140` 这一个节点**上：NodePort 本身在每个节点都服务（CP pod 跑到 `.94`
+也照样通），但 `.140` 一旦下线/重启，这条转发就断了 —— 要抗单点就把它改成带后端健康检查的
+双目标（`.94` + `.140`），或把入口交给真正的 LB。
+
 ⚠ 两点：**明文 HTTP**（认证靠 `X-API-Key`，即 `e2b-secrets` 里的 `E2B_API_KEYS`），
 **不要**把 31907 直接暴露到公网；要 TLS 就在前面加 ingress/证书。`/internal/*` 需要
 另一个 key（`E2B_INTERNAL_API_KEY`），所以它虽然同端口可达，但没有内部 key 打不进去。
