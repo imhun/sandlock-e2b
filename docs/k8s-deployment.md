@@ -1182,3 +1182,40 @@ cgroup 没有空间配额）；③ 无论走哪条，都要补**卷级水位闸�
 
 在这三条里挑之前，先明确一个口径问题：**k8s 主线上，"每沙箱磁盘配额"是必须的硬需求，
 还是可以接受的降级？**
+
+---
+
+## 21. 卷级磁盘闸门上线并复验（2026-09-18，N25 / L1）
+
+`E2B_MAX_TOTAL_DISK_MB` 现在**显式**写在 `deploy/k8s-k0s/control-plane-nfs.patch.yaml`
+（= 10240，与代码默认值和 compose 时代同口径 ⇒ **不改行为**，只是把它从"藏在默认值里"变成
+"写在清单上、能被 `workspaceDisk` 看到"）。完整取舍见 [`docs/disk-quota-options.md`](disk-quota-options.md) §7。
+
+**给运维的两个查询**（唯一的卷级磁盘信号；节点视图里的 `diskTotalMB` 是整台 NAS，永远不准）：
+
+```
+kubectl -n sandlock get deploy control-plane -o jsonpath=\
+  '{.spec.template.spec.containers[0].env[?(@.name=="E2B_MAX_TOTAL_DISK_MB")].value}{"\n"}'
+curl -s -H "X-Internal-Key: $E2B_INTERNAL_API_KEY" \
+  http://172.18.78.49:3000/internal/fleet/metrics | python3 -m json.tool
+# -> workspaceDisk {reservedMB, limitMB, warn(>=85%), saturated(>=100%)}
+```
+
+**拒绝时会说明白是工作区，而不是"没有资源"**：
+
+```
+POST /sandboxes -> 503
+{"code":503,"message":"shared workspace disk budget exhausted: 1024 MiB reserved of 10240 MiB"}
+```
+
+非磁盘维度（内存/CPU/进程/并发数）**保持** `No resources available` —— E9.3/E9.4 的重试与
+排队路径按那句话写的。**两条闸门都会说这句**（fleet 台账、以及节点
+`E2B_NODE_DISK_MB` 聚合），因为单节点形态下先触发的是节点那条。
+
+**实测（2026-09-18，`0.1.0-362-g6f94522`）**：临时把 fleet 预算设到 1100 MiB，第 1 个沙箱
+201、第 2 个 503 且文案如上（节点侧聚合是 8192×2 = 16384 ⇒ 能报出 1100 的只可能是 fleet
+闸门）；复验后已回滚到 10240，`workspaceDisk.limitMB` 确认 = 10240、`activeSandboxes=0`、
+两个 worker 的预留都回到 0。`deployment_smoke.py` 与 `multinode_smoke.py` 均通过。
+
+> 跑 smoke 时记得 `E2B_INTERNAL_API_KEY` 也要导出（脚本默认值 `internal-key` 与集群不符，
+> 否则会在 `/internal/routes` 上 401）。
