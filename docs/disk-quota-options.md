@@ -353,7 +353,13 @@ pod 里 df /var/lib/e2b-sandboxes : nfs4  10P 总  553G 已用  1%（那是整�
 （正好等于 NFS 的成本单位，2.4 ms/目录）；预期 1.27 s/轮 → 稳态 **2.4 ms/轮**且不随树增长；
 **低频整树对账必须保留**（跨节点写看不见）；开关默认关，能力探测失败即回落今天的 walk。
 两条前置事实：inotify 与它覆盖面相同但更贵（§5.3）；COW 的账本本身就是"每次写 open 整树
-recalc"，比今天更贵（§5.3）。
+recalc"，比今天更贵（§5.3）。**另记两条更便宜的 fork 侧原语**（探索，同一文档 §10）：
+**A. `RLIMIT_FSIZE = diskMB`** —— fork 从来没设过这个 rlimit，而 `max_disk` 在本形态下是死参数
+⇒ 几行代码就能拿到"**单个文件不可能超过整树预算**"的**内核硬边界**（实测那种 `dd bs=1M
+count=1200` 当场 EFBIG），且对树口径永不误伤，代价是 EFBIG/SIGXFSZ 语义 + 它同时管到卷/`tmp`；
+**C. worker 侧纯 `/proc` 采样"打开的写 fd"**（`fdinfo.flags` + `stat`）——**零 fork 改动**，
+实测 **86 µs/次**，天然覆盖 `ftruncate/fallocate/copy_file_range` 的结果，直接命中"一个 fd
+一直在长"的跑飞形态。
 
 ### L3 —— 兜底（仅在 L2 两条都不接受、又必须 ENOSPC 时）
 
