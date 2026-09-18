@@ -206,6 +206,39 @@ pod 里 df /var/lib/e2b-sandboxes : nfs4  10P 总  553G 已用  1%（那是整�
   （`SandboxRecord.sample_metric()` 只在 `workspace_dir` 非空时才 walk，而它永远是 `None`）。
   SDK 的 `get_metrics()` 因此在 k8s 上看不到磁盘占用 —— 这是 N25 的另一半，见 §7 的 L2b 收口。
 
+### 5.3 inotify / COW / mmap 能不能当账源（2026-09-18 实测）
+
+这一节是"要不要用事件/COW 替代 walk"的判据，全部在线上 NAS + 6.12 内核上实测。
+
+**inotify（watcher 在控制面 pod，watcher/写者节点关系已核对）**
+
+| 项 | 结果 |
+|---|---|
+| 同机写（写者与 watcher 同节点） | ✅ `CREATE` + `MODIFY` + `CLOSE_WRITE` 都到 |
+| **跨节点写**（worker-0 在 `.94` 写、watcher 在 `.140`） | ❌ **0 个事件**（文件确实存在：12 B，`ls` 可见） |
+| 一次 256 MiB `dd` | **~155 个 `MODIFY`**（不是 1 个；合并程度取决于读者排空速度）+ 1 `CLOSE_WRITE` |
+| 524 目录（venv 形状）挂 watch | **1215 ms（2315 µs/目录）**，且每新建目录都要补 |
+| 上限 | `max_user_watches=58688`（**per-uid**）、`max_user_instances=128`、`max_queued_events=16384` ⇒ 58688/525 ≈ **111 个该形状沙箱/节点**，且不能"每沙箱一个 fd" |
+
+⇒ inotify 只能当**本机提示**，不能当账本：跨节点写静默少记，队列会丢事件
+（必须把"溢出"翻译成"全量重扫"）。它的唯一优势是**不动 Rust**。
+
+**COW（代码 + 既有 probe 报告 `docs/sandbox-disk-quota.md` §1.1.1）**：不是"记账"，
+而是**把 walk 搬到最热路径**——`cow/seccomp.rs:1085`/`:1161` 在**每次写 open** 都
+`recalc_disk_used()` → `dir_size(&self.upper)`（`:82`，整树递归），注释写明是为了把
+"已注入 fd 写进去的字节"算回来。对照实测（同一份报告）：单次 open 写 256 MiB 通过、
+`ftruncate/pwrite/mmap/fallocate/O_DIRECT/稀疏/子进程/静态二进制` 全不拦，只有**下一个 open**
+才 ENOSPC；且它在 E2B 形态下**根本没激活**（我们发 `max_disk` 但从不发 `workdir`，
+门槛是 `!no_supervisor && workdir.is_some()`，`sandbox.rs:2078`）。
+
+**mmap 扩容**：文件内写 ✅ 正常；**越 EOF 写直接 `SIGBUS`（exit 135）**——这台 NFS 上
+共享映射**长不了文件**（与"稀疏文件不保留"同类）。所以"事件驱动会漏 mmap 增长"这条常见
+反对理由在这里**不成立**；但它是环境事实，换存储要重新验证。
+
+**取舍**：inotify 与 mediator 脏集合**覆盖面完全相同（都只到本机）**，后者免费（`openat`
+本来就在拦）且更准，唯一代价是要动 Rust。因此：**愿意动 Rust 走脏集合，不愿意才用 inotify
+（且只能当提示）**；完整设计见 [`docs/disk-accounting-dirty-dirs.md`](disk-accounting-dirty-dirs.md)。
+
 ## 7. 结论：方案
 
 ### L1 —— 已落地（2026-09-18，`0.1.0-360-…`）
@@ -312,6 +345,15 @@ pod 里 df /var/lib/e2b-sandboxes : nfs4  10P 总  553G 已用  1%（那是整�
   所以现阶段"看得见用量"的地方只有 worker/CP 的 WARNING 日志与
   `/internal/fleet/metrics` 的卷级台账 —— **下一步就是把每条记录的最后一次实测值落库并暴露出去**
   （它同时也是"resume 时直接告诉用户超了多少"的输入）。
+
+**L2c（已记录，待实施）：mediator 脏目录记账 —— 把"每轮整树 walk"降级为"只重扫脏目录"。**
+设计、盲区、接口、测试计划见 [`docs/disk-accounting-dirty-dirs.md`](disk-accounting-dirty-dirs.md)
+（依据是 §5.2 的 walk 成本 + §5.3 的 inotify/COW/mmap 实测）。要点：脏信号取自**已经被拦的**
+路径 syscall（`openat`/`truncate`/`rename`/`unlink`/`mkdir`…），零新增陷阱；粒度取**父目录**
+（正好等于 NFS 的成本单位，2.4 ms/目录）；预期 1.27 s/轮 → 稳态 **2.4 ms/轮**且不随树增长；
+**低频整树对账必须保留**（跨节点写看不见）；开关默认关，能力探测失败即回落今天的 walk。
+两条前置事实：inotify 与它覆盖面相同但更贵（§5.3）；COW 的账本本身就是"每次写 open 整树
+recalc"，比今天更贵（§5.3）。
 
 ### L3 —— 兜底（仅在 L2 两条都不接受、又必须 ENOSPC 时）
 

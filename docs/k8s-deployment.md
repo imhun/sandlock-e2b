@@ -1238,3 +1238,9 @@ POST /sandboxes -> 503
 * **已知缺口**：`GET /sandboxes/{id}/metrics` 的 `diskUsed` 在 k8s 上仍是 **0**
   （`sample_metric()` 只在 `workspace_dir` 非空时 walk，而远端记录永远为 `None`）。
   用量目前只能从上面那行 WARNING 日志看到；把最后实测值落库并暴露是下一步。
+
+**可伸缩性（已记录，未实施）**：上面这版每轮走整树，成本随"树里目录数 × 沙箱数"线性涨（实测
+venv 形状 ≈1.27 s/棵）。要把它降成"只重扫脏目录"（预期稳态 **2.4 ms/轮**且不随树增长）需要改
+mediator（Rust），方案、盲区与测试计划见
+[`docs/disk-accounting-dirty-dirs.md`](disk-accounting-dirty-dirs.md)；为什么不用 inotify / COW
+见 [`docs/disk-quota-options.md`](disk-quota-options.md) §5.3（实测）。
