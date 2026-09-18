@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -81,15 +82,32 @@ def scan_subtree(root: Path, rel: str) -> dict[str, int]:
 class DirLedger:
     """The workspace size, kept as a per-directory breakdown."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        grace_s: float = 120.0,
+        clock=time.monotonic,
+    ) -> None:
         self._root = Path(root)
         self._dirs: dict[str, int] = {}
         self._total = 0
         self._ready = False
-        #: Directories whose subtree grew last time they were checked, so they
-        #: are re-checked next round even without a fresh mark (see the module
-        #: docstring on append-only writers).
-        self._growing: set[str] = set()
+        self._clock = clock
+        #: N25/L2c: directories to re-check until their deadline. A mediator
+        #: mark says "written since the last drain", but a writer that holds a
+        #: descriptor open and comes back later emits no further path syscall
+        #: (measured on the cluster: a file opened, written, slept 12 s, written
+        #: again, and the second write was invisible). Re-checking a directory
+        #: for a while after it was written is what covers that, and it is
+        #: bounded: the set is what was written recently, and each re-check is
+        #: one `scandir` of that directory.
+        self._grace_s = grace_s
+        self._recheck: dict[str, float] = {}
+        #: When the last whole-tree rebuild ran, so the caller can bound how
+        #: long the incremental answer may go without a backstop.
+        self._rebuilt_at = clock()
+        self._full_walks = 0
 
     @property
     def ready(self) -> bool:
@@ -104,32 +122,43 @@ class DirLedger:
     def directory_count(self) -> int:
         return len(self._dirs)
 
+    @property
+    def seconds_since_rebuild(self) -> float:
+        return self._clock() - self._rebuilt_at
+
+    @property
+    def full_walks(self) -> int:
+        return self._full_walks
+
     def invalidate(self) -> None:
         """Forget the baseline: the next update must be a full rebuild."""
         self._ready = False
-        self._growing.clear()
+        self._recheck.clear()
 
     def rebuild(self) -> int:
         """Recompute everything from one whole-tree walk."""
         self._dirs = scan_subtree(self._root, "")
         self._total = sum(self._dirs.values())
-        self._growing.clear()
+        self._recheck.clear()
         self._ready = True
+        self._rebuilt_at = self._clock()
+        self._full_walks += 1
         return self._total
 
     def rescan_next(self, host_dirs: Iterable[str | os.PathLike]) -> None:
-        """Re-check these directories once more on the next update.
+        """Re-check these directories for the grace window.
 
-        For the one window a rebuild cannot cover by itself: a writer whose
-        path syscall landed before the drain and whose bytes landed after the
-        walk had passed that directory. The directories that changed are
-        exactly the ones the drain named, so re-checking them once is both
-        sufficient and cheap.
+        For the windows a rebuild cannot cover by itself: a writer whose path
+        syscall landed before the drain and whose bytes landed after the walk
+        had passed that directory, and a writer that comes back to a file it
+        opened earlier.
         """
-        self._growing |= self._shallow_targets(host_dirs)
+        deadline = self._clock() + self._grace_s
+        for rel in self._shallow_targets(host_dirs):
+            self._recheck[rel] = max(self._recheck.get(rel, 0.0), deadline)
 
     def apply(self, host_dirs: Iterable[str | os.PathLike]) -> int:
-        """Re-scan the subtrees the mediator reported (plus any still growing).
+        """Re-scan the subtrees the mediator reported (plus any still recent).
 
         ``host_dirs`` are absolute host paths, as the mediator records them; a
         path outside this ledger's root is ignored (another sandbox's tree, or
@@ -140,25 +169,38 @@ class DirLedger:
         caller decides what to do about the number, and this ledger is marked
         unusable so it rebuilds next time.
         """
+        now = self._clock()
         targets = self._shallow_targets(host_dirs)
-        targets.update(self._growing)
+        # A directory that was just written is re-checked for the grace window,
+        # whatever the mediator says next round.
+        for rel in targets:
+            self._recheck[rel] = max(self._recheck.get(rel, 0.0), now + self._grace_s)
+        targets |= {rel for rel, until in self._recheck.items() if until > now}
 
         # Rescan first, then swap: a failure part-way must not leave half the
         # tree replaced (the exception propagates before any mutation).
         scanned: list[tuple[str, dict[str, int]]] = []
-        grew: set[str] = set()
         for rel in sorted(targets):
             fresh = scan_subtree(self._root, rel)
             if sum(fresh.values()) > self._subtree_bytes(rel):
-                grew.add(rel)
+                # Still growing: keep watching it past the mark's own window,
+                # so a writer that keeps appending is never caught mid-flight.
+                self._recheck[rel] = now + self._grace_s
             scanned.append((rel, fresh))
 
         for rel, fresh in scanned:
             self._replace(rel, fresh)
-        self._growing = grew
+        self._recheck = {
+            rel: until for rel, until in self._recheck.items() if until > now
+        }
         self._total = sum(self._dirs.values())
         self._ready = True
         return self._total
+
+    @property
+    def recheck_count(self) -> int:
+        """How many directories are being re-checked (for the operator)."""
+        return len(self._recheck)
 
     # -- internals ---------------------------------------------------------
 

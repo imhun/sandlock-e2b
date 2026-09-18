@@ -89,6 +89,13 @@ class RuntimeSandbox:
         return cls(**{k: v for k, v in payload.items() if k in known})
 
 
+def _env_seconds(name: str, default: float) -> float:
+    """A worker-side duration knob in seconds (``<= 0`` disables it)."""
+    from gateway_common.env import env_float
+
+    return env_float(name, default)
+
+
 def max_file_size_mb(record: RuntimeSandbox) -> int | None:
     """The single-file ceiling for ``record`` (``RLIMIT_FSIZE``), or ``None``.
 
@@ -181,6 +188,13 @@ class RuntimeRegistry:
         #: reported (see `_log_dirty_split`).
         self._dirty_stats = {"ledger": 0, "rebuilt": 0, "walk": 0}
         self._dirty_log_at = 0.0
+        #: N25/L2c: how long a written directory keeps being re-checked (see
+        #: `DirLedger`), and how long the incremental answer may go before the
+        #: accounting is rebuilt from a whole-tree walk. Both are worker-side
+        #: knobs read here rather than threaded through `Settings`: they only
+        #: exist while `E2B_DISK_ENFORCE_DIRTY` selects this path.
+        self._dirty_grace_s = _env_seconds("E2B_DISK_DIRTY_GRACE_S", 120.0)
+        self._dirty_reconcile_s = _env_seconds("E2B_DISK_RECONCILE_INTERVAL_S", 900.0)
         #: N25/L2b: where the next ``disk_usage_snapshot`` round starts, so a
         #: scan budget that runs out does not always starve the same trees.
         self._disk_scan_cursor = 0
@@ -318,7 +332,9 @@ class RuntimeRegistry:
         with self._lock:
             ledger = self._ledgers.get(record.sandbox_id)
             if ledger is None:
-                ledger = DirLedger(record.workspace_dir)
+                ledger = DirLedger(
+                    record.workspace_dir, grace_s=self._dirty_grace_s
+                )
                 self._ledgers[record.sandbox_id] = ledger
             return ledger
 
@@ -329,19 +345,38 @@ class RuntimeRegistry:
 
         Every "cannot answer" path degrades to the whole-tree walk that was
         the only implementation before this existed -- a wrong number is the
-        one outcome that must not happen, so an overflow, a lost baseline or an
-        unreadable directory all end in a walk rather than an estimate.
+        one outcome that must not happen, so an overflow, a lost baseline, an
+        unreadable directory, or a baseline older than the reconcile interval
+        all end in a walk rather than an estimate.
         """
         if not dirty:
             return None
         provider = self._dirty_provider
         if provider is None:
             return None
+        ledger = self._ledger_for(record)
+        # The backstop first, because it does not depend on the answer: the
+        # mediator cannot see everything (a descriptor held open past the grace
+        # window, a write from another trust domain), so the accounting is
+        # rebuilt from a real walk on its own schedule no matter how healthy
+        # the incremental path looks.
+        reconcile = self._dirty_reconcile_s
+        if (
+            reconcile > 0
+            and ledger.ready
+            and ledger.seconds_since_rebuild >= reconcile
+        ):
+            drained = provider(record.sandbox_id)
+            dirs = drained[0] if drained is not None else []
+            self._dirty_stats["rebuilt"] += 1
+            total = ledger.rebuild()
+            ledger.rescan_next(dirs)
+            return total
+
         drained = provider(record.sandbox_id)
         if drained is None:
             return None
         dirs, overflow = drained
-        ledger = self._ledger_for(record)
         if overflow or not ledger.ready:
             # Overflow means the mediator stopped recording, so the ledger has
             # to be rebuilt from scratch before it can be trusted again.

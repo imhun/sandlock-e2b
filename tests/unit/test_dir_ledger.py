@@ -128,40 +128,54 @@ def test_marks_outside_the_root_are_ignored(root, tmp_path):
     _assert_matches_walk(root, ledger)
 
 
-def test_a_growing_directory_stays_dirty_until_it_stops(root):
-    """An open descriptor that keeps appending marks nothing after `open`."""
-    ledger = DirLedger(root)
-    ledger.rebuild()
-    log = root / "a" / "log.txt"
-    log.write_bytes(b"l" * 100)
+def test_an_open_writer_that_comes_back_later_is_still_accounted(root):
+    """The cluster failure this grace window exists for, as a unit test.
 
-    # The mediator saw the `open`; the appends that follow are invisible.
-    ledger.apply([root / "a"])
+    Measured on the real fleet: a process opened a file, wrote 1000 bytes,
+    slept 12 s (longer than the 5 s scan cadence), appended 5000 more and
+    closed. The `open` marked the directory once; the later write emits no path
+    syscall at all, and an accounting that stopped re-checking as soon as one
+    round showed no growth missed all 5000 bytes.
+    """
+    now = [1000.0]
+    ledger = DirLedger(root, grace_s=120.0, clock=lambda: now[0])
+    ledger.rebuild()
+
+    log = root / "a" / "log.txt"
+    log.write_bytes(b"l" * 1000)
+    ledger.apply([root / "a"])  # the mediator saw the open
     assert ledger.total_bytes == dir_size(root)
 
+    now[0] += 12.0  # longer than any single scan interval
     with open(log, "ab") as handle:
-        for _ in range(3):
-            handle.write(b"l" * 50)
-            ledger.apply([])  # no new marks at all
-            assert ledger.total_bytes == dir_size(root)
+        handle.write(b"l" * 5000)
+    ledger.apply([])  # no new marks at all
+    assert ledger.total_bytes == dir_size(root)
 
-    # Once it stops growing, the directory stops being re-checked.
+    # ...and the re-checking is bounded: once the window passes, the
+    # directory stops being scanned.
+    now[0] += 121.0
     ledger.apply([])
-    assert ledger._growing == set()
+    assert ledger.recheck_count == 0
 
 
-def test_rescan_next_re_checks_a_directory_once(root):
+def test_rescan_next_re_checks_a_directory_until_the_window_ends(root):
     """The rebuild window: a write between the drain and the walk's passing."""
-    ledger = DirLedger(root)
+    now = [500.0]
+    ledger = DirLedger(root, grace_s=60.0, clock=lambda: now[0])
     ledger.rebuild()
 
     ledger.rescan_next([root / "a"])
-    assert ledger._growing == {"a"}
+    assert ledger.recheck_count == 1
 
-    # One update re-checks it; if nothing grew, it stops being re-checked.
+    now[0] += 30.0
     ledger.apply([])
-    assert ledger._growing == set()
+    assert ledger.recheck_count == 1, "still inside the window"
     assert ledger.total_bytes == dir_size(root)
+
+    now[0] += 31.0
+    ledger.apply([])
+    assert ledger.recheck_count == 0
 
 
 def test_an_unreadable_subtree_raises_and_invalidates(root):

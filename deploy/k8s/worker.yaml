@@ -348,6 +348,23 @@ spec:
             # directory all end in the whole-tree walk.
             - name: E2B_DISK_ENFORCE_DIRTY
               value: "1"
+            # N25/L2c, the two bounds that make the incremental answer safe:
+            #
+            #   GRACE  -- a directory that was written keeps being re-checked
+            #     this long. The mediator marks a write at its *path* syscall,
+            #     so a process that opens a file and appends later (a log) emits
+            #     nothing after the open; measured on this fleet: open, 1000
+            #     bytes, a 12 s sleep, 5000 more bytes -- and the second write
+            #     was invisible until this window existed.
+            #   RECONCILE -- how long the incremental answer may go before the
+            #     accounting is rebuilt from a real walk. This is what catches
+            #     everything the mediator structurally cannot see (a descriptor
+            #     held open longer than the grace window, a write from another
+            #     trust domain). 0 disables the backstop; do not.
+            - name: E2B_DISK_DIRTY_GRACE_S
+              value: "120"
+            - name: E2B_DISK_RECONCILE_INTERVAL_S
+              value: "900"
             - name: E2B_NODE_PROCESSES
               value: "256"
           resources:

@@ -83,6 +83,30 @@ def test_overflow_rebuilds_instead_of_trusting_the_set(tmp_path):
     assert registry.disk_usage_snapshot(dirty=True) == {"sbx_overflow": dir_size(tree)}
 
 
+def test_the_reconcile_backstop_catches_a_write_the_mediator_cannot_see(tmp_path):
+    """The reason a periodic rebuild is not optional.
+
+    The mediator cannot see every write (a descriptor held open past the grace
+    window, a write from another trust domain), so an accounting built only
+    from its marks would be wrong forever with nothing to notice. This is the
+    write the provider never reports.
+    """
+    registry = _registry(tmp_path, "sbx_blind")
+    tree = _tree(tmp_path, "sbx_blind")
+    registry.set_dirty_provider(lambda sandbox_id: ([], False))
+    registry.disk_usage_snapshot(dirty=True)  # baseline + ledger
+
+    (tree / "workspace" / "invisible.bin").write_bytes(b"i" * 4096)
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_blind": 1000}
+
+    # Make the baseline look older than the reconcile interval.
+    registry._dirty_reconcile_s = 900.0
+    ledger = registry._ledger_for(registry.get("sbx_blind"))
+    ledger._rebuilt_at -= 1000.0
+
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_blind": dir_size(tree)}
+
+
 def test_a_worker_written_file_is_marked_at_the_write_point(tmp_path):
     """The MCP token is the one platform write inside the tree (N25/L2c)."""
     registry = _registry(tmp_path, "sbx_token")
