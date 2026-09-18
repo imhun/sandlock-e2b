@@ -12,7 +12,7 @@ L3 越权（沙箱→平台面）、L4 可用性（沙箱→打垮 worker/节点
 |---|---|---|---|---|
 | A | 沙箱 → 内核接口 | `third_party/sandlock/crates/sandlock-core/src/{seccomp,sys,procfs,landlock}/` | 17 类特权 syscall + 4 类 socket + docker sock | ✅ 干净（见 findings） |
 | B | 沙箱 → 宿主文件系统 | chroot 中介、COW、`filesystem/ops.py`、`gateway_common/paths.py` | pure + chroot 两形态的宿主路径/`/proc`/`/sys` 读，`chroot` fallthrough 判定，image 层解压路径过滤 | ❌ **OBS-1（已修）**：`chroot(2)` 未被拦截，实测可 chroot 到宿主独有目录；已加入默认拒绝集 |
-| C | 沙箱 → 其他沙箱 | `uid_pool.py`（0770 owner=sandbox uid/gid=worker）、volumes、PID ns | 双沙箱读写删互攻（10001 vs 10002） | ✅ 干净；k8s 形态见 OBS-4 |
+| C | 沙箱 → 其他沙箱 | `uid_pool.py`（0770 owner=sandbox uid/gid=worker）、volumes、PID ns | 双沙箱读写删互攻（10001 vs 10002） | ✅ 干净；k8s 形态见 OBS-4；**卷的机器级边界见 OBS-9** |
 | D | 沙箱 → 网络 | `gateway_common/network.py`、`network/rules.rs`、`network/connect.rs`、`egress/libegress_proxy.c` | 目的写法矩阵（v4/v6/mapped/link-local/metadata/短写/八进制/十六进制）× 共享 netns 与 per-sandbox netns | ❌ **SEC-001（已修）** |
 | E | 沙箱 → worker 中介 | `route_b.py`、`priv_helpers.py`、seccomp 通知、fd handoff | fd 继承（两形态）、AF_NETLINK、控制通道可达性 | ✅ 干净（SL-4 族不可复现） |
 | F | 沙箱 → 平台 API | `http/auth.py`、`connect/router.py`、`control_plane/api/*` | traversal、恶意 sandbox id、内部 key 空值路径 | ✅ 本轮干净；架构级无租户隔离见 OBS-6 |

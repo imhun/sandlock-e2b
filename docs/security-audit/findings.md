@@ -378,6 +378,33 @@ chroot/route-B 形态多出 fd 3/4/6/7，实测都是**普通 ELF 文件**（不
   —— 因为请求带的是 A 的 access token。控制面列表已被过滤，token 拿不到，
   所以不构成越权；但 envd 侧没有第二道租户校验，属于纵深防御可加固项。
 
+- **OBS-9 共享卷是单一信任域：集群内任意 root 可写任意沙箱树（中，2026-09-18 实测，
+  超出本轮攻击者模型）**
+
+  本轮攻击者模型是"已能在沙箱内执行任意代码"，而**对那个模型这不算洞**（C 层已干净：
+  host uid 独立、Landlock 白名单、`0770` 只给 worker gid）。真正的缺口在**集群内 root**：
+
+  * 实测现状：`deploy/k8s-k0s/storage-nas.yaml` 的 `: /sandlock` 被**控制面与两个 worker
+    都以 root 挂载**，两个节点分别实测 `WRITE OK as 0:0` / `WRITE OK as 0:65534`，
+    且卷根是 `drwxrwxrwt`（1777）⇒ **机器级没有任何边界**，只有进程级；
+  * 因此"跨机写"不是理论：任何能在这台卷上拿到 root 的东西（任一挂载它的 pod、被攻破的
+    worker、误操作）都能改任何沙箱的树；
+  * **有一条具体可利用链**：OBS-4 的修法是让 fleet 级 uid 分配以**卷内文件**
+    `sandbox.json` 的 `host_uid` 为权威（`uid_pool.py:_recorded_uids`，注释明说
+    "on any worker sharing the workspace"），而该文件属主是 `0:65534`（root 可改）
+    ⇒ 改写它可让两个沙箱**共用同一个 host uid**，从而**拆掉第二道墙**（跨 uid 隔离）。
+    同一个文件也是 teardown 侧"沙箱可改写"的输入（那边已按名字/根做校验，分配侧还没有）；
+  * **不能简单开 root squash**：E3.2 的每沙箱 uid 需要 worker 对卷执行 `chown`
+    （`uid_pool.py:apply_sandbox_ownership` → `priv_helpers.chown` / `_chown_tree`），
+    而 squash 是**服务端**行为，客户端再特权也会被映射成 nobody ⇒ 直接 EPERM。
+    "卷上 root squash" 与 "卷上每沙箱 host uid" 目前**互斥**；
+  * **建议**（按性价比）：① 把 fleet 级不变量（`host_uid`、卷切片归属）的权威搬到**卷外**
+    （`SandboxRecord` / Redis），卷内文件降级为缓存并做一致性校验；② 控制面改最小权限挂载
+    （`: /sandlock` 只读 + 仅 `_builds` 可写，worker 保持 RW）；③ 在已有的周期性扫描里加
+    **uid 审计**（树内出现非本沙箱 uid、或非 worker gid 的属主即告警）；④ 在 NAS 控制台
+    确认权限组与"是否有别的信任域也挂着同一路径"——这一条决定它是"缺纵深防御"还是
+    "对外可写的真漏洞"。
+
 ## L4 实测：哪些上限是真的
 
 - **OBS-8 资源创建类端点只有沙箱创建有限流（中，已修）**

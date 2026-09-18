@@ -291,3 +291,31 @@ fork 本来就知道，且它**已经有按 child fd 键控的 per-process 状�
 还有一条由此推出的差别：**A 不受 §3 的任何账本盲区影响**（牢外写者、带外写、基线失效都不影响
 它）—— 它不看账本，内核在任何节点、任何写者上一致地执行；B/C 的盲区代价是"写者/账本重建后开的
 那个窗口"。
+
+## 11. 跨机写不是"罕见场景"，是缺一层边界（安全）
+
+安全侧完整定性见 `docs/security-audit/findings.md` 的 **OBS-9**（并已挂到
+`attack-surface.md` 的 C 层）。这里只记与配额账相关的结论：
+
+**实测现状**（2026-09-18）：`deploy/k8s-k0s/storage-nas.yaml` 的 `: /sandlock` 被**控制面与两个
+worker 都以 root 挂载**，两节点分别实测 `WRITE OK as 0:0` / `WRITE OK as 0:65534`，卷根是
+`drwxrwxrwt` ⇒ **机器级没有任何边界**，只有进程级（沙箱 host uid + Landlock）。
+
+**定性**：
+
+* 对**本轮攻击者模型**（"已能在沙箱内执行任意代码"）**不是洞** —— C 层已干净（host uid 独立、
+  Landlock 白名单、`0770` 只给 worker gid）；
+* 对**集群内 root** 是缺纵深防御，而且有一条具体链：OBS-4 的修法让 fleet 级 uid 分配以
+  **卷内文件** `sandbox.json` 的 `host_uid` 为权威（`uid_pool.py:_recorded_uids`，
+  "on any worker sharing the workspace"），该文件属主 `0:65534`（root 可改）⇒ 可让两个沙箱
+  **共用 host uid**，拆掉第二道墙；
+* **卷上 root squash 与"每沙箱 host uid"目前互斥**：E3.2 需要 worker 对卷 `chown`
+  （`uid_pool.py:apply_sandbox_ownership`），而 squash 是服务端行为，客户端再特权也 EPERM。
+
+**对本文的影响**：
+
+1. 只要不加边界，**低频对账就必须保留**（它不是"兜罕见场景"，而是兜一个确实存在的写者类别）；
+2. 若采纳 OBS-9 的建议 ③（在已有周期扫描里加 **uid 审计**：树内出现非本沙箱 uid / 非 worker gid
+   的属主即告警），这套扫描同时就是**越界写的检测器** —— 成本几乎为零，因为 walk 已经存在；
+3. 若采纳建议 ①（把 `host_uid`/卷切片归属的权威搬到 `SandboxRecord`/Redis），则"脏目录账"
+   依赖的树内元数据也不再是信任来源，两条线（配额与安全）在这里合流。
