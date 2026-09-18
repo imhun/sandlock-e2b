@@ -73,8 +73,35 @@ spec:
 5. **本机 kubectl**：API 证书 SAN 含 `127.0.0.1`，所以用 SSH 本地转发即可
    （`ssh -L 16443:<node>:6443 <bastion>`，`kubeconfig` 的 server 改成
    `https://127.0.0.1:16443`）。认证走 SSH ControlMaster，口令只输一次。
-6. **冒烟要打到 gateway**：临时建一个 NodePort Service（不要改基线清单），再从本机
-   经跳板机转发过去；`E2B_API_URL` / `E2B_SANDBOX_URL` 指到本机端口。
+6. **冒烟要打到 gateway**：用下面那个 NodePort（`gateway-nodeport`，固定 31907）——
+   它就在这个 overlay 里，不再是临时对象。
+
+## 从集群外面访问：`gateway-nodeport`（固定 NodePort 31907）
+
+这台集群没有 LB，所以「外面怎么进来」由 overlay 里的 `gateway-nodeport` 回答：
+**任意节点的 `:31907`** → control-plane 的 `:3000`（与基线那个 ClusterIP `gateway`
+同一个后端，只是换了个入口类型）。端口写死，因为访问它的东西是跳板机转发、CI 与运维
+脚本，不该跟着 k8s 的随机分配漂。
+
+**VPC 内**（跳板机、同 VPC 的 CI、其它 ECS）直接打：
+
+```bash
+curl -s -H "X-API-Key: $KEY" http://172.18.80.94:31907/sandboxes     # 或 :31907
+```
+
+**本机 / 集群外**（本机只能到跳板机）经跳板机转发：
+
+```bash
+ssh -f -N -L 49983:172.18.80.94:31907 root@172.18.74.236
+export E2B_API_URL=http://127.0.0.1:49983 E2B_SANDBOX_URL=http://127.0.0.1:49983
+```
+
+`tmp/k0s/open-tunnels.sh` 就是把上面两条转发（kubectl 的 16443 + gateway 的 49983）一起
+建起来；它也顺带 `kubectl apply` 这个 Service，所以重建集群后跑一次就够。
+
+⚠ 两点：**明文 HTTP**（认证靠 `X-API-Key`，即 `e2b-secrets` 里的 `E2B_API_KEYS`），
+**不要**把 31907 直接暴露到公网；要 TLS 就在前面加 ingress/证书。`/internal/*` 需要
+另一个 key（`E2B_INTERNAL_API_KEY`），所以它虽然同端口可达，但没有内部 key 打不进去。
 
 ## 清单侧的三个配套（不是 k0s 特有，但都是真集群跑出来的）
 

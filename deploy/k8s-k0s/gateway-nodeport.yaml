@@ -1,0 +1,31 @@
+# 给集群外的客户端一个**固定**入口。
+#
+# 为什么放 overlay 而不是基线：NodePort 回答的是「这个环境怎么被外面访问」，
+# 不是应用的形态。托管集群那边同一个角色由 SLB/ingress 承担，没必要让每个集群都
+# 在 30000 段开一个洞；这台自建集群没有 LB，NodePort 就是最省事的等价物。
+#
+# 端口写死（31907）是刻意的：访问它的东西是跳板机转发、CI、运维脚本 —— 让它们跟着
+# k8s 的随机分配走，每次重建集群都要改一圈配置。改这个值 = 改一处 + 通知一次。
+#
+# 语义：`port 49983` 与基线里那个 ClusterIP `gateway` 一致（网关契约端口），
+# targetPort 3000 是合并镜像的实际监听端口。
+#
+# ⚠ 明文 HTTP。认证仍然是 `X-API-Key`（`e2b-secrets` 里的 `E2B_API_KEYS`），
+# 但**不要把 31907 直接暴露到公网**：这台集群的访问路径是 VPC 内（跳板机 172.18.x
+# 已放行）或经跳板机转发。要 TLS 就在前面加 ingress/证书，那是另一个决定。
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-nodeport
+  namespace: sandlock
+  labels:
+    app: control-plane
+spec:
+  type: NodePort
+  selector:
+    app: control-plane
+  ports:
+    - name: http
+      port: 49983
+      targetPort: 3000
+      nodePort: 31907

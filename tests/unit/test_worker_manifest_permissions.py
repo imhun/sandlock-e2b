@@ -516,6 +516,15 @@ def test_k0s_overlay_moves_the_seccomp_root_to_the_k0s_kubelet_dir() -> None:
     assert "path: /var/lib/kubelet/seccomp" not in out
     # The shared-storage PV rides along with the overlay.
     assert "name: sandlock-shared-nas" in out
+    # ...and so does the cluster's own fixed entry point. Pinned because it is
+    # the only stable address remote clients have (there is no LB here), and a
+    # changed or missing nodePort silently breaks every bastion forward, CI job
+    # and operator script that was told to use it.
+    assert "name: gateway-nodeport" in out
+    assert "  type: NodePort\n" in out
+    assert "    nodePort: 31907\n" in out
+    assert "    port: 49983\n" in out
+    assert "    targetPort: 3000\n" in out
     # The overlay also makes the worker root: a network filesystem authorizes a
     # chown by the AUTH_SYS uid, not by the client's capabilities, so the non-root
     # file-capability broker cannot hand a sandbox tree to its pooled uid there.

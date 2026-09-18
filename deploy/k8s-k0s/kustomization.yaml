@@ -17,6 +17,7 @@ namespace: sandlock
 resources:
   - ../k8s        # 基线清单目录（deploy/k8s/，没有 kustomization.yaml ⇒ 裸清单集）
   - storage-nas.yaml
+  - gateway-nodeport.yaml   # 集群外的固定入口（基线由 SLB/ingress 承担，这里没有）
 
 patches:
   - target:
