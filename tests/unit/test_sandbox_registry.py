@@ -114,6 +114,88 @@ def test_delete_releases_entry(workspace):
         registry.delete(record.sandbox_id)
 
 
+def test_an_orphaned_record_is_collected_once_the_opt_in_grace_elapses(workspace):
+    """N22: ``E2B_ORPHAN_RECORD_TTL`` is the only way an orphan ever goes away.
+
+    Orphaned records are protected from expiry because the lost worker may still
+    be running them -- but a worker that never comes back then keeps its
+    records, its quota rows and its trees on the shared base forever. The grace
+    period is opt-in (0 = never, the default) and measured from the record's own
+    transition, so a long outage is what elapses, not a repeated sweep.
+    """
+    from datetime import timedelta
+
+    registry = SandboxRegistry(_settings(orphan_record_ttl_s=60))
+    record = _create(registry)
+    record.node_id = "node_a"
+    registry.save(record)
+    registry.mark_orphaned("node_a")
+    assert registry.get(record.sandbox_id).orphaned_at is not None
+
+    record.end_at = utcnow() - timedelta(seconds=10)
+    assert registry.remove_expired() == []          # orphaned seconds ago
+
+    # The outage is what ages: push the stamp past the grace period.
+    orphaned = registry.get(record.sandbox_id)
+    orphaned.orphaned_at = utcnow() - timedelta(seconds=120)
+    registry.save(orphaned)
+    assert [r.sandbox_id for r in registry.remove_expired()] == [record.sandbox_id]
+    assert registry.list() == []
+
+
+def test_the_default_keeps_the_promise_that_an_orphan_is_never_reaped(workspace):
+    """Without the setting, an orphaned record survives its deadline forever."""
+    from datetime import timedelta
+
+    registry = SandboxRegistry(_settings())
+    record = _create(registry)
+    record.node_id = "node_a"
+    registry.save(record)
+    registry.mark_orphaned("node_a")
+    orphaned = registry.get(record.sandbox_id)
+    orphaned.end_at = utcnow() - timedelta(days=365)
+    orphaned.orphaned_at = utcnow() - timedelta(days=365)
+    registry.save(orphaned)
+
+    assert registry.remove_expired() == []
+    assert registry.get(record.sandbox_id).state == "orphaned"
+
+
+def test_a_recovered_sandbox_loses_its_orphan_stamp(workspace):
+    """Recovery clears the stamp, so the *next* outage gets its own grace.
+
+    Otherwise a sandbox that was orphaned long ago and then recovered would be
+    reaped the moment it is orphaned again -- the deadline has to belong to the
+    outage, not to the sandbox.
+    """
+    from datetime import timedelta
+
+    registry = SandboxRegistry(_settings(orphan_record_ttl_s=60))
+    record = _create(registry)
+    record.node_id = "node_a"
+    registry.save(record)
+    registry.mark_orphaned("node_a")
+    old = registry.get(record.sandbox_id)
+    old.orphaned_at = utcnow() - timedelta(seconds=600)
+    registry.save(old)
+
+    registry.recover_node(
+        "node_a",
+        {record.sandbox_id},
+        snapshot_ids={record.sandbox_id},
+        timeout=60,
+    )
+    recovered = registry.get(record.sandbox_id)
+    assert recovered.state == "running"
+    assert recovered.orphaned_at is None
+
+    registry.mark_orphaned("node_a")  # the node drops out again
+    again = registry.get(record.sandbox_id)
+    again.end_at = utcnow() - timedelta(seconds=10)
+    registry.save(again)
+    assert registry.remove_expired() == []  # the new grace has just started
+
+
 def test_mark_orphaned_skips_ttl_and_recovers(workspace):
     """E6.1: sandboxes on a lost node are marked orphaned; TTL never reaps
     them while orphaned; recovery flips them back to running."""

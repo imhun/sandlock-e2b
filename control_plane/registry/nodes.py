@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -9,6 +10,8 @@ from typing import Any
 
 from control_plane.scheduler import pick_best
 from gateway_common.ids import sandbox_id
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -299,6 +302,14 @@ class NodeRegistry:
         Called periodically from the control-plane lifespan. Local (in-
         process) nodes are never considered. Returns the node ids whose
         sandbox records were marked, for logging/metrics.
+
+        The same pass drops a node row that has become *empty and stale*: an
+        unhealthy node with no reservations and no records left cannot affect
+        placement (it is not healthy), accounting (nothing reserved) or the
+        fleet-wide enumeration the workers use to fence their sweeps (it
+        contributes no ids) -- it is only a row an operator has to read past.
+        Without this, every worker whose node id changed (a Deployment-era pod,
+        before N20) left one behind for the life of the process.
         """
         with self._lock:
             self._sweep_health_locked()
@@ -311,7 +322,52 @@ class NodeRegistry:
         for node_id in node_ids:
             if sandbox_registry.mark_orphaned(node_id):
                 marked_nodes.append(node_id)
+        pruned = self._prune_empty_unhealthy(node_ids, sandbox_registry)
+        if pruned:
+            logger.info(
+                "node health sweep: dropped %d empty node row(s) quiet for "
+                "more than %d heartbeat windows: %s",
+                len(pruned),
+                self._PRUNE_AFTER_WINDOWS,
+                ", ".join(sorted(pruned)),
+            )
         return marked_nodes
+
+    #: How many heartbeat windows a node row stays after it went quiet *and* ran
+    #: out of everything it was holding. Deliberately generous: the row is only
+    #: cosmetic by then, so there is no reason to race an operator who is reading
+    #: the fleet view to see what was lost.
+    _PRUNE_AFTER_WINDOWS = 10
+
+    def _prune_empty_unhealthy(
+        self, node_ids: list[str], sandbox_registry
+    ) -> list[str]:
+        """Drop node rows that hold nothing and have been gone for a long time."""
+        now = time.time()
+        pruned: list[str] = []
+        with self._lock:
+            for node_id in node_ids:
+                record = self._nodes.get(node_id)
+                if record is None or record.status != "unhealthy":
+                    continue
+                if any(
+                    (
+                        record.reserved_memory_mb,
+                        record.reserved_cpu_percent,
+                        record.reserved_disk_mb,
+                        record.reserved_processes,
+                    )
+                ):
+                    continue
+                if now - record.heartbeat_at <= (
+                    self._PRUNE_AFTER_WINDOWS * self._heartbeat_timeout
+                ):
+                    continue
+                if sandbox_registry.list_by_node(node_id):
+                    continue
+                self._nodes.pop(node_id, None)
+                pruned.append(node_id)
+        return pruned
 
     def remove(self, node_id: str) -> None:
         with self._lock:

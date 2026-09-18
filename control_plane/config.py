@@ -57,6 +57,17 @@ class Settings:
     node_heartbeat_timeout_s: float = field(
         default_factory=lambda: _env_float("E2B_NODE_HEARTBEAT_TIMEOUT", 15.0)
     )
+    #: How long an ``orphaned`` sandbox record may sit before the TTL sweep is
+    #: allowed to collect it (seconds; 0 = never). Orphaned records are exempt
+    #: from expiry on purpose -- the lost worker may still be running them, and
+    #: deleting the workspace underneath a live process orphans live inodes --
+    #: but a node that *never* comes back then leaves its records, its rows and
+    #: its trees behind forever (N22). A deployment that retires workers
+    #: (autoscaling down, replacing a machine) can set this to a grace period it
+    #: is comfortable with; the default keeps today's behaviour.
+    orphan_record_ttl_s: float = field(
+        default_factory=lambda: _env_float("E2B_ORPHAN_RECORD_TTL", 0.0)
+    )
     #: Directory the control plane exports a locally built template's OCI layout
     #: tar into (``<dir>/_oci/<slug>.oci.tar``). Empty means "same as
     #: ``image_cache_dir``". Set it when the extracted rootfs is node-local: the

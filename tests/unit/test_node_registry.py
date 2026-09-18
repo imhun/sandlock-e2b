@@ -331,3 +331,52 @@ def test_reap_unhealthy_marks_sandboxes_orphaned():
     registry.heartbeat("node_dead")
     assert registry.get("node_dead").status == "healthy"
     assert sandboxes.get(rec_dead.sandbox_id).state == "orphaned"
+
+
+def test_the_sweep_drops_a_node_row_that_holds_nothing_and_is_long_gone():
+    """N22's second half: an empty stale row is not something to keep.
+
+    It cannot affect placement (it is unhealthy), accounting (nothing is
+    reserved) or the workers' fleet-wide enumeration (it contributes no ids),
+    so leaving it only makes an operator read past rows for nodes that are
+    never coming back -- which is what every pod-name node id left behind
+    before N20.
+    """
+    registry = NodeRegistry(heartbeat_timeout=10.0)
+    sandboxes = SandboxRegistry(Settings(api_keys=("local-key",)))
+    for node_id in ("node_gone", "node_has_work", "node_recent", "node_reserved"):
+        registry.register(
+            node_id=node_id,
+            address=f"http://127.0.0.1/{node_id}",
+            total_memory_mb=1024,
+            total_cpu_percent=200,
+            total_disk_mb=2048,
+            total_processes=128,
+        )
+
+    # A record keeps its node in the view, however long it has been quiet.
+    alive = sandboxes.create(
+        template_id="base",
+        timeout=300,
+        metadata={},
+        env_vars={},
+        secure=True,
+        allow_internet_access=False,
+        base_image=None,
+    )
+    alive.node_id = "node_has_work"
+    sandboxes.save(alive)
+    # A reservation is a reason to keep reading the row.
+    registry.reserve_node("node_reserved", memory_mb=128, cpu_percent=10, disk_mb=128, processes=8)
+    # Quiet, but not for long enough yet.
+    registry.get("node_recent").heartbeat_at = time.time() - 20
+
+    now = time.time()
+    for node_id in ("node_gone", "node_has_work", "node_reserved"):
+        registry.get(node_id).heartbeat_at = now - (registry._PRUNE_AFTER_WINDOWS * 10.0) - 1
+
+    assert registry.reap_unhealthy(sandboxes) == ["node_has_work"]
+    assert [n.node_id for n in registry.list()] == ["node_has_work", "node_recent", "node_reserved"]
+    # The node whose id was dropped is simply gone from the view; its records
+    # were orphaned first, which is what the caller logs.
+    assert sandboxes.get(alive.sandbox_id).state == "orphaned"

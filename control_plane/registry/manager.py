@@ -145,6 +145,11 @@ class SandboxRecord:
     #: the record's own state helpers. Records created before E9.2 read as
     #: ``False``, so an upgrade cannot release a reservation twice.
     quota_released: bool = False
+    #: N22: when this record was last flipped to ``orphaned``. ``None`` means it
+    #: never was (or it was recovered, which clears this). Only the opt-in
+    #: orphan grace period reads it; without that setting an orphaned record
+    #: stays forever, which is the conservative default.
+    orphaned_at: datetime | None = None
 
     def refresh(self, timeout: int) -> None:
         self.end_at = utcnow() + timedelta(seconds=max(1, timeout))
@@ -304,6 +309,9 @@ class SandboxRecord:
             "last_active_at": to_iso_z(self.last_active_at),
             "priority": int(self.priority),
             "quota_released": bool(self.quota_released),
+            "orphaned_at": (
+                to_iso_z(self.orphaned_at) if self.orphaned_at is not None else None
+            ),
             "workspace_dir": (
                 str(self.workspace_dir) if self.workspace_dir is not None else None
             ),
@@ -349,6 +357,9 @@ class SandboxRecord:
             last_active_at=_parse(data.get("last_active_at") or data.get("started_at")),
             priority=_safe_priority(data.get("priority")),
             quota_released=bool(data.get("quota_released", False)),
+            orphaned_at=(
+                _parse(data["orphaned_at"]) if data.get("orphaned_at") else None
+            ),
             workspace_dir=(
                 Path(data["workspace_dir"]) if data.get("workspace_dir") else None
             ),
@@ -1300,6 +1311,10 @@ class SandboxRegistry:
                 continue
             if record.state != "orphaned":
                 record.state = "orphaned"
+                # Stamped once, on the transition: a later sweep must not keep
+                # pushing the deadline out, or the opt-in grace period (N22)
+                # would never elapse for a node that stays down.
+                record.orphaned_at = utcnow()
                 record.append_log("node unreachable; sandbox orphaned")
                 self.save(record)
             marked.append(record)
@@ -1333,6 +1348,9 @@ class SandboxRegistry:
             if record.sandbox_id in sandbox_ids:
                 if record.state == "orphaned":
                     record.state = "running"
+                    # Recovered, so it is not an orphan any more: clearing the
+                    # stamp keeps a *later* outage's grace period honest (N22).
+                    record.orphaned_at = None
                     record.append_log("worker recovered; sandbox restored")
                     recovered.append(record.sandbox_id)
                 else:
@@ -1556,8 +1574,7 @@ class SandboxRegistry:
             self._release(record)
         return expired
 
-    @staticmethod
-    def _ttl_reapable(record: SandboxRecord, now: datetime | None) -> bool:
+    def _ttl_reapable(self, record: SandboxRecord, now: datetime | None) -> bool:
         """Whether the TTL sweep may delete ``record``.
 
         Two states survive their deadline:
@@ -1567,9 +1584,30 @@ class SandboxRegistry:
         * ``paused`` (E9.2) — parking a sandbox is supposed to preserve the
           session, and a parked sandbox holds no admission reservation, so
           reaping it would buy capacity while destroying user state.
+
+        ``orphaned`` has one opt-in exception (N22): when
+        ``E2B_ORPHAN_RECORD_TTL`` is set, a record that has been orphaned for
+        longer than that is collected after all. Without it a worker that never
+        comes back -- a retired replica, a changed machine -- leaves its
+        records, their quota rows and their trees on the shared base forever,
+        because nothing else can decide the node is gone for good. The stamp is
+        taken from the record's own transition (``orphaned_at``), so a record
+        orphaned by an older build (no stamp) is only collected once a later
+        outage stamps it.
         """
-        if record.state in ("orphaned", "paused"):
+        if record.state == "paused":
             return False
+        if record.state == "orphaned":
+            ttl = float(getattr(self._settings, "orphan_record_ttl_s", 0.0) or 0.0)
+            if ttl <= 0 or record.orphaned_at is None:
+                return False
+            moment = now or utcnow()
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            orphaned_at = record.orphaned_at
+            if orphaned_at.tzinfo is None:
+                orphaned_at = orphaned_at.replace(tzinfo=timezone.utc)
+            return (moment - orphaned_at).total_seconds() >= ttl
         return record.is_expired(now)
 
     def cleanup_workspace(self, record: SandboxRecord) -> None:
