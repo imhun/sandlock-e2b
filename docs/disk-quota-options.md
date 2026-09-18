@@ -18,7 +18,7 @@
 
 | 能力 | 现状 |
 |---|---|
-| 准入 | `E2B_NODE_DISK_MB`：**每个 worker 一份声明预算**（这台 2×8192 MB = 16 GiB），与卷真实容量（50 GiB）脱钩；共享卷下多份预算是"预算"不是"容量" |
+| 准入 | **两层**：① 全局 `E2B_MAX_TOTAL_DISK_MB`（**代码默认 10240**，Σ 活沙箱 `disk_mb`）；② 每节点 `E2B_NODE_DISK_MB`（这台 2×8192 MB = 16 GiB）。②在共享卷下是"各记一份的预算"，只有①代表"这片 slice 一共卖出去多少" |
 | 监控 | 心跳带 `diskUsedMB`/`diskTotalMB` —— `shutil.disk_usage(workspace_base)`，即**整卷**（每个 worker 报同一个数）；`quota_maintenance` 按比例算 `diskWarnCount`/`diskErrorCount` |
 | 有没有动作 | **没有**。warn/error 计数只进节点视图，没有任何消费者（`control_plane/api/internal.py:95-100` 只是收下） |
 | 每沙箱用量 | **没有**。XFS project quota 表是唯一来源，NFS 形态不存在；agent 形态要求 agent 跑在存储服务端，托管 NAS 放不了 |
@@ -179,14 +179,20 @@ pod 里 df /var/lib/e2b-sandboxes : nfs4  10P 总  553G 已用  1%（那是整�
 
 **磁盘准入从「每节点预算」变成「卷级台账」，并且拒绝时说得清楚。**
 
-先说一个更正：**台账机制本来就有**（`manager.py::_quota_allows_locked` 的 global `"disk"`
-维度 + `E2B_MAX_TOTAL_DISK_MB`），compose 时代设过（`deploy/stack/.env` = 10240），
-**只是 k8s 清单从来没设** ⇒ 线上 0 = 不限制，等于没有卷级准入。所以 L1 不是"新建机制"，
-而是"把它接上 + 让它可观测 + 让拒绝可解释"：
+先说两个更正，都是这轮核出来的：
 
-* `deploy/k8s-k0s/control-plane-nfs.patch.yaml` 设 `E2B_MAX_TOTAL_DISK_MB=51200`
-  （= PVC/PV 声明的 50 GiB）；基线 `control-plane.yaml` 留注释说明托管集群为何也必须设
-  （那里没有 overlay 兜底）；
+1. **台账机制一直存在**，而且**一直在生效**：`manager.py::_quota_allows_locked` 的 global
+   `"disk"` 维度 + `E2B_MAX_TOTAL_DISK_MB`，其**代码默认值是 10240**。所以线上从来不是
+   "没有卷级准入"（我先前按「清单里没设 + env 里看不到」误判了一次 —— 代码默认值不在 env 里），
+   只是那个数藏在默认值里、没人知道它存在、也看不到它用了多少；
+2. compose 时代另设过同一个值（`deploy/stack/.env` = 10240），与默认值相同 ——
+   即**两个栈一直是同一口径：只卖 PVC 声明（50 GiB）的 1/5**。
+
+所以 L1 不是"新建机制"，而是"**把它显式化 + 可观测 + 拒绝可解释**"：
+
+* `deploy/k8s-k0s/control-plane-nfs.patch.yaml` 把 `E2B_MAX_TOTAL_DISK_MB` **显式写成
+  10240**（= 现状，不改行为），并写清口径与"要放大就改这里"；基线 `control-plane.yaml`
+  留注释说明托管集群也该显式写出来（那里没有 overlay 兜底，值藏在代码默认值里）；
 * 拒绝时给**专门的错误**：`shared workspace disk budget exhausted: <已售> MiB reserved of
   <上限> MiB` —— 以前所有拒绝都说 "No resources available"，会把"工作区塞满了"误导成
   "内存不够"；非磁盘维度的拒绝**保持原文案**（E9.3/E9.4 的重试路径按那句话写的）；
