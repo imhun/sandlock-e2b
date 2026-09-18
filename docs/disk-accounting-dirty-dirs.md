@@ -367,3 +367,40 @@ worker 都以 root 挂载**，两节点分别实测 `WRITE OK as 0:0` / `WRITE O
 **验证**：单测+契约 **1358 passed**（仅 3 个既有 macOS-only 失败）；`deployment_smoke`/`multinode_smoke` 全绿；集群实测权限矩阵如上、`/logs` 仍能读到日志、`_runtime` 随删除清空；版本 `0.1.0-368-g65b1747`。
 
 **仍未做**：卷切片 `projid` 归属的权威仍在卷内（本仓库 §11 末尾那条；等真接上支持 per-sandbox 配额的存储或 quota agent 时再做——届时它落到 `_runtime/` 即天然不可被沙箱改写）。
+
+### 12.1 `_runtime` 对沙箱是否可见（2026-09-18 实测）
+
+**结论：在线上形态下它是真不可见（ENOENT），而不是"看得见但打不开"。**
+
+```
+os.stat('/home/user/../_runtime')                    → ENOENT (No such file or directory)
+os.listdir('/home/user/..')                          → ['user']          (只有它自己)
+os.listdir('/')                                      → bin boot dev etc home lib … (它自己的 image rootfs)
+cat /proc/self/mountinfo | grep e2b-sandboxes        → 0 命中（source 渲染成 "sandlock"）
+```
+
+机制**不是权限而是命名空间**：沙箱的根是它自己的 image rootfs，`/home/user`（工作区）与 `/workspace`
+（树里的 `workspace/`）是 bind-mount 进来的，而整颗 `<base>` —— 含 `_runtime`、`_images`、
+`_snapshots`，以及**其他沙箱的树** —— 都不在它的视图里。`/proc` 的挂载信息也不泄漏宿主路径。
+
+> 更正：我在落地后第一次探针里报过一条 "Permission denied"，那是把两次观测混在一起了；
+> 精确复测（`os.stat` + `errno.errorcode`）是 **ENOENT**。
+
+**但这是形态属性，不是布局属性**：
+
+| 形态 | `/home/user/..` 到哪 | `_runtime` 的表现 |
+|---|---|---|
+| **chroot / image-rootfs（线上）** | 沙箱自己的 `/home`（只有 `user`） | **不可见（ENOENT）** |
+| **pure（无 chroot）** | `<base>`（`/home/user` 就是 `<base>/<id>` 的真实路径） | 看得见、打不开（DAC `0700` / Landlock → EACCES） |
+
+pure 形态要保持不可见，只有两条路，**都属于形态决策而不是布局微调**：
+
+1. **把平台状态整体搬出 `<base>`**（例如 `E2B_*_BASE=/var/lib/e2b-state`，甚至单独一个挂载）：
+   沙箱从 `/home/user` 向上只能到 `<base>`，那里就只剩别的沙箱树（那些是 E3.2 的 `0770` + uid
+   隔离问题，与本条无关）；
+2. **每沙箱私有 mount namespace**（把树 bind 到 `/home/user`）——chroot 形态实际上做的就是这个；
+   pure 形态要这么做需要 mount 权限，而 A6 当初特意移除了 `SYS_ADMIN`。
+
+**所以 `0700` 与 Landlock 仍然要保留**：它们的作用不是"隐藏"（权限层只能给 EACCES，给不了
+ENOENT），而是在 pure 形态、或命名空间隔离被绕过时当第二/第三道墙。分层是：
+**命名空间（不可见）→ Landlock（不可达）→ DAC/0700（不可读写）**。
