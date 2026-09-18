@@ -574,33 +574,104 @@ class SandboxRegistry:
 
     def _quota_allows_locked(
         self, memory_mb: int, cpu: int, disk_mb: int, processes: int
-    ) -> bool:
+    ) -> str | None:
+        """Whether the fleet-wide pool can take one more sandbox.
+
+        Returns the *dimension* that is exhausted, or ``None`` when the
+        reservation fits. Callers only need the name to explain the refusal
+        (see :meth:`_quota_denied_message`); a bare bool used to be enough
+        because every refusal said the same thing -- which is exactly what made
+        a workspace disk budget indistinguishable from a full memory pool.
+        """
         s = self._settings
         # Paused sandboxes hold no reservation (E9.2), so they do not consume
         # a slot of the concurrency cap either.
         if s.max_sandboxes > 0 and self._held_count_locked() >= s.max_sandboxes:
-            return False
+            return "sandboxes"
         if (
             s.max_total_memory_mb > 0
             and self._reserved_memory + memory_mb > s.max_total_memory_mb
         ):
-            return False
+            return "memory"
         if (
             s.max_total_cpu_percent > 0
             and self._reserved_cpu + cpu > s.max_total_cpu_percent
         ):
-            return False
+            return "cpu"
         if (
             s.max_total_disk_mb > 0
             and self._reserved_disk + disk_mb > s.max_total_disk_mb
         ):
-            return False
+            return "disk"
         if (
             s.max_total_processes > 0
             and self._reserved_processes + processes > s.max_total_processes
         ):
+            return "processes"
+        return None
+
+    def _quota_denied_message(
+        self, blocked: str | None, reserved_disk: int | None = None
+    ) -> str:
+        """Explain a refused reservation, in the caller's terms.
+
+        The default stays the historical ``"No resources available"``: the
+        E9.3/E9.4 retry paths, and callers that only care that the fleet is
+        full, treat a full node and a full pool alike.
+
+        The exception is the **shared workspace** budget
+        (``E2B_MAX_TOTAL_DISK_MB``). That ceiling is new on this deployment and
+        is about the volume the sandboxes share, so a caller told "no
+        resources" would go looking at memory instead of at the workspace their
+        own sandboxes filled.
+
+        ``reserved_disk`` exists because :meth:`global_reserved` takes the
+        registry lock, and the in-memory callers are already holding it (it is
+        a plain ``threading.Lock``, so re-entering deadlocks). They pass the
+        number they have; the shared-store path, which holds no lock, reads it.
+        """
+        limit = int(getattr(self._settings, "max_total_disk_mb", 0) or 0)
+        if blocked == "disk" and limit > 0:
+            reserved = (
+                int(reserved_disk)
+                if reserved_disk is not None
+                else int(self.global_reserved().get("disk", 0))
+            )
+            return (
+                f"shared workspace disk budget exhausted: {reserved} MiB "
+                f"reserved of {limit} MiB"
+            )
+        return "No resources available"
+
+    def global_reserved(self) -> dict[str, int]:
+        """The fleet-wide reservation ledger, whichever backend is holding it.
+
+        In-memory deployments keep it on the registry; replica deployments keep
+        it in the shared store, where it is the only copy that is true.
+        """
+        if self._quota_store is not None:
+            return dict(self._quota_store.get("global"))
+        with self._lock:
+            return {
+                "memory": self._reserved_memory,
+                "cpu": self._reserved_cpu,
+                "disk": self._reserved_disk,
+                "processes": self._reserved_processes,
+            }
+
+    def _store_would_refuse(
+        self, name: str, limits: dict[str, int], dims: dict[str, int], dim: str
+    ) -> bool:
+        """Whether ``dim`` alone would make the store's reserve fail.
+
+        Only used to *explain* a failure, so it re-reads the ledger after the
+        fact: the reservation did not happen, so the numbers have not moved.
+        """
+        limit = int(limits.get(dim, 0) or 0)
+        if limit <= 0:
             return False
-        return True
+        used = int(self._quota_store.get(name).get(dim, 0))
+        return used + int(dims.get(dim, 0)) > limit
 
     def _held_count_locked(self) -> int:
         """Records currently holding a reservation (E9.2: not paused).
@@ -736,8 +807,17 @@ class SandboxRegistry:
         dims = self._global_dims(record)
         tenant_limits = self._tenant_limits(record.tenant_id, is_admin=False)
         if self._quota_store is not None:
-            if not self._quota_store.reserve("global", self._global_limits(), dims):
-                raise ResourceUnavailableError("No resources available")
+            limits = self._global_limits()
+            if not self._quota_store.reserve("global", limits, dims):
+                # Classify only on the way out (one store read, on a refusal):
+                # the caller deserves to know whether it hit the workspace
+                # budget or something else.
+                blocked = (
+                    "disk"
+                    if self._store_would_refuse("global", limits, dims, "disk")
+                    else None
+                )
+                raise ResourceUnavailableError(self._quota_denied_message(blocked))
             if tenant_limits is not None and not self._quota_store.reserve(
                 f"tenant:{record.tenant_id}", tenant_limits, self._tenant_dims(record)
             ):
@@ -746,10 +826,13 @@ class SandboxRegistry:
             record.quota_released = False
             return True
         with self._lock:
-            if not self._quota_allows_locked(
+            blocked = self._quota_allows_locked(
                 dims["memory"], dims["cpu"], dims["disk"], dims["processes"]
-            ):
-                raise ResourceUnavailableError("No resources available")
+            )
+            if blocked is not None:
+                raise ResourceUnavailableError(
+                    self._quota_denied_message(blocked, self._reserved_disk)
+                )
             if tenant_limits is not None and not self._tenant_quota_allows_locked(
                 record.tenant_id,
                 tenant_limits,
@@ -1162,8 +1245,13 @@ class SandboxRegistry:
                     raise ResourceUnavailableError("tenant quota exceeded")
         else:
             with self._lock:
-                if not self._quota_allows_locked(memory_mb, cpu, disk_mb, processes):
-                    raise ResourceUnavailableError("No resources available")
+                blocked = self._quota_allows_locked(
+                    memory_mb, cpu, disk_mb, processes
+                )
+                if blocked is not None:
+                    raise ResourceUnavailableError(
+                        self._quota_denied_message(blocked, self._reserved_disk)
+                    )
                 if tenant_limits is not None and not self._tenant_quota_allows_locked(
                     tenant_id, tenant_limits, memory_mb, cpu, disk_mb, processes
                 ):

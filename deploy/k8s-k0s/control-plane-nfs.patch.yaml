@@ -43,3 +43,21 @@ spec:
           env:
             - name: E2B_NODE_HEARTBEAT_TIMEOUT
               value: "30"
+            # 共享工作区的磁盘**预算**（全局准入台账，不是水位采样）。
+            #
+            # 为什么必须有：这份清单的 workspace 是 RWX/PVC，两个 worker 共用同一片存储，
+            # 而每节点的 `E2B_NODE_DISK_MB` 是**各记一份**的预算（2×8192 MB = 16 GiB），
+            # 它与"我们这片 slice 到底多大"无关 —— 加第三个节点就等于再多卖 8 GiB。
+            # `E2B_MAX_TOTAL_DISK_MB` 是控制面唯一的**舰队级**磁盘台账
+            # （`manager.py::_quota_allows_locked` 的 global "disk" 维度），compose 时代设过
+            # （`deploy/stack/.env` = 10240），k8s 侧一直没设 ⇒ 线上**根本没有卷级准入**。
+            #
+            # 取值 = PVC/PV 声明的 50 GiB（`deploy/k8s/pvc.yaml`）。它约束的是"**卖出去**多少"
+            # （Σ 活沙箱 disk_mb），不是"盘上实际多少字节"：
+            #   * paused 沙箱会释放预留（E9.2），所以它们的文件不在这个数里；
+            #   * 实测用量（每个树真实占多少）目前仍没有来源 —— 那是下一步的事，
+            #     见 docs/disk-quota-options.md §7（L2b）。
+            # ⚠ 别用 `usedDiskMB/diskTotalMB` 当水位：那是**整台 NAS 文件系统**
+            # （实测 10 PiB，而我们的 PVC 只有 50 GiB 的标称），比例永远 0.005%，安全灯永远是绿的。
+            - name: E2B_MAX_TOTAL_DISK_MB
+              value: "51200"

@@ -196,6 +196,47 @@ def test_a_recovered_sandbox_loses_its_orphan_stamp(workspace):
     assert registry.remove_expired() == []  # the new grace has just started
 
 
+def test_the_shared_workspace_budget_refuses_and_says_so(workspace):
+    """N25/L1: the fleet-wide disk ledger is a real gate with a real reason.
+
+    Two workers sharing one workspace each carry their own `E2B_NODE_DISK_MB`
+    budget, so only `E2B_MAX_TOTAL_DISK_MB` says how much the *deployment* has
+    sold off that slice. When it is what refuses a create, the caller must not
+    be told "No resources available" -- that sends them looking at memory
+    instead of at the workspace their own sandboxes filled.
+    """
+    registry = SandboxRegistry(
+        # 1.5 sandboxes' worth: the first fits, the second cannot.
+        _settings(max_total_disk_mb=1536, default_disk_mb=1024)
+    )
+    _create(registry)
+    assert registry.global_reserved()["disk"] == 1024
+
+    with pytest.raises(ResourceUnavailableError) as exc:
+        _create(registry)
+    assert str(exc.value) == (
+        "shared workspace disk budget exhausted: 1024 MiB reserved of 1536 MiB"
+    )
+
+    # Without the budget (the historical default) the same create goes through.
+    unbounded = SandboxRegistry(_settings(default_disk_mb=1024))
+    _create(unbounded)
+    _create(unbounded)
+    assert unbounded.global_reserved()["disk"] == 2048
+
+
+def test_a_non_disk_refusal_keeps_the_historical_message(workspace):
+    """The E9.3/E9.4 retry paths still see the message they were written for."""
+    registry = SandboxRegistry(
+        _settings(max_total_memory_mb=1024, default_memory_mb=1024)
+    )
+    _create(registry)
+
+    with pytest.raises(ResourceUnavailableError) as exc:
+        _create(registry)
+    assert str(exc.value) == "No resources available"
+
+
 def test_mark_orphaned_skips_ttl_and_recovers(workspace):
     """E6.1: sandboxes on a lost node are marked orphaned; TTL never reaps
     them while orphaned; recovery flips them back to running."""

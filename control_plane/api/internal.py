@@ -223,7 +223,8 @@ async def fleet_metrics(request: Request) -> dict[str, Any]:
     _require_internal_key(request)
     settings = request.app.state.settings
     nodes = request.app.state.nodes.list()
-    records = request.app.state.registry.list()
+    registry = request.app.state.registry
+    records = registry.list()
     active_by_node: Counter[str] = Counter(r.node_id for r in records)
 
     dims = {
@@ -289,9 +290,27 @@ async def fleet_metrics(request: Request) -> dict[str, Any]:
                 4,
             ),
         }
+    # The *fleet-wide* ledger, next to the per-node budgets above. They answer
+    # different questions: the per-node numbers say how much each worker has
+    # promised, this one says how much the deployment has sold in total -- and
+    # on a **shared** workspace that second number is the one with a real
+    # ceiling (`E2B_MAX_TOTAL_DISK_MB`, the slice's size). It is also the only
+    # honest disk signal here: `usedDiskMB`/`diskTotalMB` in the node view are
+    # the whole NAS filesystem (measured 10 PiB against a 50 GiB claim), so the
+    # percent thresholds derived from them can never fire.
+    global_ledger = registry.global_reserved()
+    disk_limit = int(getattr(settings, "max_total_disk_mb", 0) or 0)
+    disk_reserved = int(global_ledger.get("disk", 0))
+    workspace_disk = {
+        "reservedMB": disk_reserved,
+        "limitMB": disk_limit,
+        "warn": bool(disk_limit and disk_reserved >= 0.85 * disk_limit),
+        "saturated": bool(disk_limit and disk_reserved >= disk_limit),
+    }
     return {
         "nodes": node_metrics,
         "fleet": fleet,
+        "workspaceDisk": workspace_disk,
         "standardSandboxDims": {
             "memory": settings.default_memory_mb,
             "cpu": settings.default_cpu_percent,

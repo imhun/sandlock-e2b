@@ -141,6 +141,14 @@ spec:
             # vector. docs/production-deployment-requirements.md §2.7.1.
             - name: E2B_IMAGE_CACHE_OWNER_UID
               value: "65534"
+            # ⚠ 共享工作区（RWX PVC）必须显式设 `E2B_MAX_TOTAL_DISK_MB`：
+            # 它是控制面唯一的**舰队级**磁盘准入台账（Σ 活沙箱 disk_mb），而每节点的
+            # `E2B_NODE_DISK_MB` 是各记一份的预算 —— 共用一片存储时，只有这个数代表
+            # 「我们这片 slice 卖出去多少」。取值看 PVC 声明多大（基线 `pvc.yaml` 是 50Gi）。
+            # 不设 = 0 = 不限制（历史上就是这样，k0s overlay 之前也没设，等于没有卷级准入）。
+            # 详见 docs/disk-quota-options.md §7 L1。
+            # - name: E2B_MAX_TOTAL_DISK_MB
+            #   value: "51200"   # = 50 GiB，与 pvc.yaml 的声明一致
             - name: E2B_BASE_IMAGE
               # Same registry + digest pinning as the compose stack (E6.2: a
               # base image must be digest-pinned), and the same reason the redis

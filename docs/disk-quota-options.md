@@ -175,24 +175,43 @@ pod 里 df /var/lib/e2b-sandboxes : nfs4  10P 总  553G 已用  1%（那是整�
 
 ## 7. 结论：方案
 
-### L1 —— 现在就能做，不依赖任何未知（纯记账）
+### L1 —— 已落地（2026-09-18，`0.1.0-360-…`）
 
-**把磁盘准入从「每节点预算」改成「卷级台账」，并退役那个永远绿的假信号。**
+**磁盘准入从「每节点预算」变成「卷级台账」，并且拒绝时说得清楚。**
 
-* 新增 `E2B_WORKSPACE_CAPACITY_MB`（默认 = PV 声明的 50 GiB）。CP 侧一份台账
-  （Redis，与沙箱记录同源）：`sold = Σ 活着的沙箱的 disk_mb`；
-* 建箱准入：`sold + disk_mb > capacity × 0.95` → **503 且信息明确**（"shared workspace
-  capacity exhausted"）；`> 0.85` → WARN。实现就是一次算术 + 一次比较，不碰任何 syscall；
-* **同时**处理 `diskWarnCount`/`diskErrorCount`：它们现在按整台 NAS（10 PiB）的比例算，
-  永远不触发（§5.1 实测 0.0053%）—— **一个永远绿的安全灯比没有更糟**，要么退休，
-  要么改成基于这套台账的指标。
+先说一个更正：**台账机制本来就有**（`manager.py::_quota_allows_locked` 的 global `"disk"`
+维度 + `E2B_MAX_TOTAL_DISK_MB`），compose 时代设过（`deploy/stack/.env` = 10240），
+**只是 k8s 清单从来没设** ⇒ 线上 0 = 不限制，等于没有卷级准入。所以 L1 不是"新建机制"，
+而是"把它接上 + 让它可观测 + 让拒绝可解释"：
 
-为什么先做这个：它是**唯一同时修掉"超卖"和"假信号"的点**，成本近零，而且**三条路线都需要它**
-（目录配额也要知道卖了多少才敢 OpenAPI 调用）。
+* `deploy/k8s-k0s/control-plane-nfs.patch.yaml` 设 `E2B_MAX_TOTAL_DISK_MB=51200`
+  （= PVC/PV 声明的 50 GiB）；基线 `control-plane.yaml` 留注释说明托管集群为何也必须设
+  （那里没有 overlay 兜底）；
+* 拒绝时给**专门的错误**：`shared workspace disk budget exhausted: <已售> MiB reserved of
+  <上限> MiB` —— 以前所有拒绝都说 "No resources available"，会把"工作区塞满了"误导成
+  "内存不够"；非磁盘维度的拒绝**保持原文案**（E9.3/E9.4 的重试路径按那句话写的）；
+* `GET /internal/fleet/metrics` 新增 `workspaceDisk {reservedMB, limitMB, warn, saturated}`
+  —— 这是**唯一**反映我们这片 slice 的磁盘信号（节点视图里的 `usedDiskMB/diskTotalMB`
+  是整台 NAS，见 §5.1）；
+* `SandboxRegistry.global_reserved()` 暴露舰队台账（内存与 Redis 两种后端都能读）。
 
-### L2 —— 拿到 NAS 规格后二选一
+**语义边界（写清楚，避免误读）**：这个数约束的是**卖出去多少**（Σ 活沙箱 `disk_mb`），
+不是盘上实际字节 —— paused 沙箱释放预留（E9.2），它们的数据仍在卷上；实测用量的来源
+是 L2b 的事。
 
-**L2a（通用型 NAS）→ 目录配额，硬限 + 服务端计量：**
+⚠ 实现时踩到一个真坑，留个记录：`_quota_denied_message` 最初调 `global_reserved()` 取数字，
+而它是在**已持有 `self._lock`**（普通 `threading.Lock`，不可重入）的路径里被调用的 ⇒ 死锁，
+整个测试套挂住。现在锁内调用点把已知值直接传进去，锁外（Redis 路径）才去读。
+
+### L2 —— 每沙箱那一层（L1 之后的下一步）
+
+> ⛔ **L2a（目录配额）已被否决（2026-09-18，运维决定：不想引入云 API 依赖）。**
+> 记录在此是因为它的结论仍然有效 —— 它本来是**唯一"硬 + 零运行时成本"**的选项
+> （`Enforcement` 服务端执行、还能免费拿到每沙箱用量）。被否决的不是能力，而是代价：
+> CP 要多一条对 NAS OpenAPI 的运行时依赖（凭据、限流、故障面），以及 500 目录/文件系统、
+> `SizeLimit` 是 GiB 整数这两个约束。**下面的 L2b 因此从"备选"变成"下一步"。**
+
+**L2a（~~通用型 NAS → 目录配额~~，已否决）：**
 
 * 建箱：`SetDirQuota(Path=<base>/<sandbox_id>, QuotaType=Enforcement,
   SizeLimit=ceil(disk_mb/1024) GiB [, FileCountLimit=<按需>])`；删箱：`CancelDirQuota`
@@ -204,7 +223,7 @@ pod 里 df /var/lib/e2b-sandboxes : nfs4  10P 总  553G 已用  1%（那是整�
   （`diskMB` 向上取整，粒度写进 API 文档）、需要 **RAM 凭据**（`nas:SetDirQuota`，
   这台 ECS 目前没有实例角色）。
 
-**L2b（非通用型，或不想引入云 API 依赖）→ 测量 + 停箱：**
+**L2b（选定路线）→ 测量 + 停箱：**
 
 * worker 增量测量（inotify 事件 + 只 `stat` 变化过的文件；长写者用 open-write fd 扫描兜住），
   超过 `diskMB` → **暂停沙箱**（复用现有 pause：保留状态、释放准入），而不是返回 ENOSPC；
