@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 import time
 import secrets
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -65,6 +67,11 @@ class TemplateRecord:
     files: dict[str, bool] = field(default_factory=dict)
     upload_tokens: dict[str, str] = field(default_factory=dict)
     tenant_id: str | None = None
+    #: Set by :meth:`TemplateRegistry.discard` for a record whose build never
+    #: produced an image. Never persisted (see ``_write_record``): a discarded
+    #: record stops being resolvable by name and stops being written, but stays
+    #: in memory so ``GET …/builds/{id}/status`` can still explain the failure.
+    discarded: bool = False
 
     def to_storage_dict(self) -> dict[str, Any]:
         return {
@@ -145,9 +152,26 @@ class TemplateRegistry:
             build = BuildRecord(build_id=build_id)
             record.builds[build_id] = build
             self._templates[template_id] = record
-            self._by_name[name] = template_id
+            self._bind_name(record)
             self._write_record(record)
             return record, build
+
+    def _bind_name(self, record: TemplateRecord) -> None:
+        """Point ``record.name`` at the newest record claiming it.
+
+        Names are not unique: build ``foo`` twice and both records stay on disk.
+        Binding whichever one a directory walk happened to reach last made the
+        winner depend on iteration order, which is how a *failed* build's record
+        could take a name back from the build that replaced it (N19 / F14 on the
+        k0s cluster). ``created_at`` is persisted, so "newest wins" is both
+        deterministic and durable.
+        """
+        current_id = self._by_name.get(record.name)
+        if current_id is not None and current_id != record.template_id:
+            current = self._templates.get(current_id)
+            if current is not None and current.created_at >= record.created_at:
+                return
+        self._by_name[record.name] = record.template_id
 
     def _record_path(self, template_id: str) -> Path | None:
         if self._base is None:
@@ -156,7 +180,9 @@ class TemplateRegistry:
 
     def _write_record(self, record: TemplateRecord) -> None:
         path = self._record_path(record.template_id)
-        if path is None:
+        if path is None or record.discarded:
+            # A discarded record must not come back to life: the whole point is
+            # that a name only resolves to a build that produced an image.
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -180,7 +206,7 @@ class TemplateRegistry:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 record = TemplateRecord.from_storage_dict(payload)
                 self._templates[record.template_id] = record
-                self._by_name[record.name] = record.template_id
+                self._bind_name(record)
             except (OSError, ValueError, KeyError):
                 continue
 
@@ -206,8 +232,45 @@ class TemplateRegistry:
         """Persist a mutated record (upload tokens / uploaded state)."""
         with self._lock:
             self._templates[record.template_id] = record
-            self._by_name[record.name] = record.template_id
+            self._bind_name(record)
         self._write_record(record)
+
+    def discard(self, record: TemplateRecord) -> None:
+        """Drop a template whose build produced no image (N19).
+
+        ``create`` publishes the record -- and binds its name -- *before* anything
+        is built, so a failed build used to leave a name that resolves: to an
+        image whose OCI layout tar is a 0-byte file buildkit never finished. The
+        next build of that name could then pick the debris up, and the worker's
+        failure (`Code.INTERNAL: file could not be opened successfully: … empty
+        file`) pointed at the wrong thing entirely.
+
+        Only the name and the on-disk record go. The record stays in memory (and
+        out of :meth:`list`) because ``GET …/builds/{id}/status`` is how the SDK
+        learns *why* its build failed -- answering "template not found" there
+        would trade one confusing error for another.
+
+        The trade that buys: a control-plane restart in the seconds between the
+        failure and the SDK's poll turns that answer into a 404. The alternative
+        (persist the failed record so the poll survives) recreates exactly what
+        this method exists to remove -- a durable record for a template that
+        cannot be built from.
+        """
+        with self._lock:
+            record.discarded = True
+            if self._by_name.get(record.name) == record.template_id:
+                self._by_name.pop(record.name, None)
+            # Another record may still carry the name (a failed rebuild of a
+            # template that built before): let the newest remaining one have it.
+            for candidate in self._templates.values():
+                if candidate is record or candidate.discarded:
+                    continue
+                if candidate.name == record.name:
+                    self._bind_name(candidate)
+            path = self._record_path(record.template_id)
+        if path is not None:
+            with suppress(OSError):
+                shutil.rmtree(path.parent, ignore_errors=True)
 
     def claim_file_upload(self, template_id: str, file_hash: str) -> bool:
         """Atomically mark ``file_hash`` uploaded; False when already done.
@@ -230,7 +293,9 @@ class TemplateRegistry:
     def list(self, *, tenant_id: str | None = None) -> list[TemplateRecord]:
         with self._lock:
             self._scan_disk()
-            records = list(self._templates.values())
+            # A discarded template is not a template this deployment can create
+            # from, so it is not advertised.
+            records = [r for r in self._templates.values() if not r.discarded]
         if tenant_id is not None:
             records = [r for r in records if r.tenant_id == tenant_id]
         return records

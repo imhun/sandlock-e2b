@@ -473,7 +473,7 @@ quay 在这里是通的（只有 docker.io 不通）。
 | **F11** | **control-plane 不能多副本**：节点注册表是**进程内**的（`NodeRegistry._nodes` 是内存 dict，Redis 只承载配额台账与沙箱记录），而心跳被 Service 轮询到某个副本 | 直接分别问两个副本：副本 A 连续 12 次报 `fxf2j: unhealthy`，副本 B 同时报 `fxf2j: healthy`。后果：过时副本上 `/internal/routes` 返回 `502 Node ... unavailable`，放置只在它认为有容量的节点上发生，`reap_unhealthy`（E6.1）会把「不健康」节点上的活沙箱当孤儿回收——冒烟里那条 `404 Sandbox ... not found` 就是这么来的。**处置**：`control-plane` 回到 **1 副本**（与 compose 生产栈一致），并加用例钉住；要开多副本必须先把节点视图（健康+地址）共享出去 |
 | **F12** | **清单里根本没有 buildkit**，而 `Template.build` 必须有它 | 冒烟模板阶段报 `BuildException: buildkit build exited with code 1`。**处置**：按 compose 的形态补 `buildkit`——但它不能用独立 Deployment，因为 buildkit 是**走 unix socket** 访问的（compose 把同一个 socket 卷只读挂到 control-plane 的 `/run/buildkit`），而 emptyDir 只在**同一个 pod 内**共享 ⇒ 做成 control-plane pod 的 **sidecar**，共享 `buildkit-data` emptyDir，`E2B_BUILDKIT_ADDR=unix:///run/buildkit/buildkitd.sock`，配置用 ConfigMap 承载并有「与 `deploy/stack/buildkitd.toml` 字节一致」的用例（docker.io 镜像加速链就写在里面）。`moby/buildkit:rootless` 在 Docker Hub ⇒ 镜像到 ACR（arm64+amd64）|
 | **F13** | buildkit sidecar 加 `allowPrivilegeEscalation: false` 会让它起不来 | 报 `[rootlesskit:parent] error: failed to setup UID/GID map: newuidmap ... failed: newuidmap: Could not set caps` —— kubelet 因此给进程加了 `no_new_privs`，内核忽略 newuidmap 的 setuid 位（与 worker 清单里 file-capability broker 那条注释同一机制）。compose 的 buildkit 用的是默认值，所以这里也不设 |
-| **F14** | **失败的 `Template.build` 会留下可解析的残骸**：`_templates/<tpl_id>/template.json` + 一个 **0 字节**的 `_images/_oci/e2b-local_<tpl_id>.oci.tar`；之后再构建**同名**模板时名字解析可能取到这条 | 症状是 worker 解 rootfs 报 envd 的 `Code.INTERNAL: file could not be opened successfully: … empty file`。实测：`_images/_oci/` 里同时存在 `tpl_2b89f5…`（0 字节，失败那次）与 `tpl_82d03f…`（49 MB，成功那次），而 `smoke-template` 这个名字在两者上都注册着。**未修**：记录在案，验证时用 `tmp/k0s/reset-smoke-template.sh` 清残骸。正确修法二选一：失败的构建不落可解析记录；或名字解析绑定「最近一次成功构建」 |
+| ~~**F14**~~ | ~~失败的 `Template.build` 会留下可解析的残骸~~ | ✅ **2026-09-18 已修（§16）**：失败时删掉 buildctl 半写的 tar/link，并让记录 `discard`（名字不再解析、盘上不留记录、`list` 不再展示；**内存里保留**，因为 SDK 正是靠 `…/builds/{id}/status` 拿到失败原因）。另外名字解析从「目录扫描最后一条」改成 **`created_at` 最新者优先**，这条治的是**存量**残骸（老集群上已经有）。实测：失败构建后共享卷上**零残留**，同名重建 1.3 秒成功并能按名字建箱跑命令；`smoke-template` 7 条同名记录时，重启控制面后按名字解析取到最新那条 |
 
 ### 11.4 现在的验证状态
 
@@ -855,3 +855,69 @@ reconcile summary: deleted=0 delete_failures=0 unmaterialised=3 protected_elsewh
 （autoscaler 缩容掉的副本、下线或换机的节点）。这台集群上就还留着两条旧 Deployment 时代的
 `e2b-worker-555d875875-*`，只有控制面重启才会清。登记为 **N22**：要给它一个远长于心跳窗口的
 宽限（例如可配 `E2B_ORPHAN_RECORD_TTL`，默认关），而那是**有数据损失的取舍**，先定值再动。
+
+---
+
+## 16. 收口 N19：失败的模板构建不再留下可解析的残骸（2026-09-18）
+
+### 16.1 两个独立的小毛病，合起来是一个大坑
+
+`POST /v3/templates` 的 `create()` 会**先把记录写盘并绑定名字**，然后才构建。于是构建失败时：
+
+* `_templates/<tpl_id>/template.json` 留在盘上 ⇒ 这个名字**仍然可解析**；
+* 无 registry 形态下 buildctl 的 `--output type=oci,dest=<tar>` 会**先建出输出文件**，
+  失败时留下一个 **0 字节**的 `_images/_oci/e2b-local_<tpl_id>.oci.tar`；
+* 名字解析是「扫盘时最后走到的那条赢」（`_by_name` 在 `_scan_disk` 里被逐条覆盖），
+  所以一条残骸完全可能在之后**抢回**这个名字。
+
+拼起来就是 F14 那个症状：worker 去解一个空 tar，报
+`Code.INTERNAL: file could not be opened successfully: … empty file` —— 报的是症状，
+和真正的原因（上一次构建失败）没有半点关系。当时的绕法是 `tmp/k0s/reset-smoke-template.sh`
+手工清残骸。
+
+### 16.2 改了什么
+
+`control_plane/registry/templates.py` 新增 `discard(record)`，并在**每一条失败路径**上调用
+（`control_plane/api/templates.py::_discard_failed_build`，覆盖：构建上下文准备失败、
+没有 buildctl、buildctl 退出码非 0、以及 `_run_build_with_slot` 的兜底 except 与
+`_steps_to_dockerfile` 的入参错误）。它做三件事，**顺序和边界都是刻意的**：
+
+1. 删掉 buildctl 半写的 tar 与它的 link（这些文件里没有任何有效数据）；
+2. `record.discarded = True` 并解绑名字 ⇒ **名字不再解析**，盘上的记录目录也删掉，
+   `list()` 不再展示它（`_write_record` 对 discarded 记录直接返回，所以任何后续
+   `save`/上传都不能把它复活）；
+3. **但记录留在内存里**。因为 SDK 正是靠 `GET …/builds/{id}/status` 拿失败原因的：
+   把它一并删掉，用户看到的就从「buildkit build exited with code 1」变成
+   「template not found」—— 一个困惑换成另一个困惑，不算修好。
+
+另外把名字解析从「扫描最后一条」改成 **`created_at` 最新者优先**（`_bind_name`）。
+这一条治的是**存量**：改动之前留下的残骸还躺在老集群的盘上，光靠「以后不再产生」是治不了的，
+而「最新者赢」恰好等价于 backlog 里的第二个方案「名字解析绑定最近一次成功构建」——
+失败的记录被 discard 之后，名字自然回落到上一次成功的那条。
+
+### 16.3 真集群验证
+
+```
+== build 1: must fail (RUN false)
+   failed as expected: BuildException: buildkit build exited with code 1   ← 失败原因照样报出来了
+== 失败之后共享卷上：
+   records: 没有新增（n19-probe 一条都不在）
+   zero-byte tars: 0
+== build 2: same name, must succeed
+   built tpl_2bffa26f9eeed7a2 in 1.3s
+== create from the NAME 并跑命令
+   cat /n19-marker -> 'n19-ok\n'
+N19 PROBE OK
+```
+
+第二条验证针对**存量**那条规则：这台集群上本来就积了 **7 条同名 `smoke-template`**
+（历代冒烟留下的，正是 F14 的原始形态）。用最新那条打一个独占标记
+（`RUN echo newest-wins > /n19-newest`），**重启控制面**（内存注册表清空，只能靠扫盘），
+再按名字建箱：
+
+```
+cat /n19-newest -> 'newest-wins\n'
+NEWEST-WINS OK
+```
+
+即解析取到的是最新那条，而不是「目录里 id 排序最后」的那条。

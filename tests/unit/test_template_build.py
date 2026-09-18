@@ -11,7 +11,11 @@ import pytest
 
 from control_plane.api import templates as tmpl
 from control_plane.config import Settings
-from control_plane.registry.templates import TemplateRecord, TemplateRegistry
+from control_plane.registry.templates import (
+    TemplateRecord,
+    TemplateRegistry,
+    UnknownTemplateBuildError,
+)
 
 
 class _FakeStream:
@@ -36,9 +40,13 @@ class _FakeTemplateRegistry:
 
     def __init__(self) -> None:
         self.saved: list = []
+        self.discarded: list = []
 
     def save(self, record) -> None:  # noqa: ANN001
         self.saved.append(record)
+
+    def discard(self, record) -> None:  # noqa: ANN001
+        self.discarded.append(record)
 
 
 def _app(settings: Settings) -> SimpleNamespace:
@@ -175,6 +183,106 @@ def test_mark_file_uploaded_clears_token_idempotently():
     record.mark_file_uploaded("h1")
     assert record.is_file_uploaded("h1") is True
     assert "h1" not in record.upload_tokens
+
+
+@pytest.mark.asyncio
+async def test_a_failed_build_removes_its_half_written_oci_tar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """N19: buildctl opens ``dest`` before it knows the build will succeed.
+
+    A failure therefore leaves a 0-byte (or truncated) layout tar behind, and
+    that file is not just clutter: it is what a later name resolution can hand a
+    worker, whose error (`Code.INTERNAL: … empty file`) says nothing about the
+    real cause. The record goes with it -- see the registry tests -- because a
+    name must only resolve to a build that produced an image.
+    """
+    settings = Settings(api_keys=("k",), image_registry="", image_oci_dir=tmp_path / "oci")
+    tar = tmp_path / "oci" / "_oci" / "e2b-sandlock-template_tpl_abc.oci.tar"
+
+    async def fake_exec(*args, **kwargs):  # noqa: ANN002, ANN003
+        # What buildctl leaves when the build fails: the output file exists.
+        Path(args[args.index("--output") + 1].removeprefix("type=oci,dest=")).write_bytes(b"")
+        return _FakeProc(code=1)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    build, template, app = _build(), _template(), _app(settings)
+    await tmpl._run_build(app, template, build, "FROM python:3.11-slim\n", tmp_path)
+
+    assert build.status == "error"
+    assert not tar.exists(), "a half-written layout tar must not survive the failure"
+    assert app.state.templates.discarded == [template]
+
+
+def test_discarding_a_failed_build_frees_its_name(workspace: Path) -> None:
+    """A name that resolves has to mean "a build produced an image".
+
+    ``create`` publishes the record and binds the name before anything is built,
+    so a failed build used to leave a name pointing at an image whose OCI tar
+    buildkit never finished. The next build of that name could pick the debris
+    up (F14 on the k0s cluster) and the worker reported `… empty file`.
+
+    Discarding is deliberately *not* "delete everything": the build status stays
+    readable by id, because that is what the SDK polls to learn why its build
+    failed. Only the name and the on-disk record go.
+    """
+    registry = TemplateRegistry(workspace / "templates")
+    record, build = registry.create("smoke-template")
+    build.status = "error"
+    build.error = "buildkit build exited with code 1"
+    registry.discard(record)
+
+    with pytest.raises(UnknownTemplateBuildError):
+        registry.get_by_name("smoke-template")
+    # The status poll addresses the build by id, not by name.
+    assert registry.get(record.template_id).get_build(build.build_id).status == "error"
+    # A template nobody can create from must not be advertised either.
+    assert registry.list() == []
+    # Nothing on disk for a later scan (or a restarted control plane) to find.
+    assert not (workspace / "templates" / record.template_id).exists()
+    restarted = TemplateRegistry(workspace / "templates")
+    assert restarted.list() == []
+    with pytest.raises(UnknownTemplateBuildError):
+        restarted.get_by_name("smoke-template")
+
+
+def test_a_failed_rebuild_leaves_the_previous_successful_build_resolvable(
+    workspace: Path,
+) -> None:
+    """The name falls back to the last build that produced an image."""
+    registry = TemplateRegistry(workspace / "templates")
+    good, _ = registry.create("foo")
+    failed, _ = registry.create("foo")
+    assert registry.get_by_name("foo").template_id == failed.template_id
+
+    registry.discard(failed)
+    assert registry.get_by_name("foo").template_id == good.template_id
+
+
+def test_name_resolution_picks_the_newest_record_not_the_last_one_scanned(
+    workspace: Path,
+) -> None:
+    """Several records can carry one name, so the winner must be deterministic.
+
+    Calling that a "rule" fixes the half of N19 that a fix alone cannot: clusters
+    already carrying such debris keep the records, because they predate it. So
+    the choice has to be *which* record, and ``created_at`` (persisted) is the
+    honest answer -- the alternative was whichever one the directory walk
+    happened to see last, which is how a failed build's record took a name back
+    from the build that had replaced it.
+    """
+    base = workspace / "templates"
+    registry = TemplateRegistry(base)
+    older, _ = registry.create("foo")
+    newer, _ = registry.create("foo")
+    older.created_at = newer.created_at - 60
+    registry.save(older)
+    # Persisting the older record must not steal the binding back...
+    assert registry.get_by_name("foo").template_id == newer.template_id
+
+    # ...and a fresh process (the control plane restarting) only has the disk.
+    restarted = TemplateRegistry(base)
+    assert restarted.get_by_name("foo").template_id == newer.template_id
 
 
 def test_claim_file_upload_is_atomic_and_persists(workspace):

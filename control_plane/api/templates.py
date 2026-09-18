@@ -158,6 +158,28 @@ def _write_docker_config(settings: Any) -> None:
     path.write_text(json.dumps(config), encoding="utf-8")
 
 
+def _discard_failed_build(
+    app: Any, template: TemplateRecord, *artifacts: Path | None
+) -> None:
+    """Forget a template whose build produced no image (N19).
+
+    Two things have to go, and they are different in kind:
+
+    * the **artifacts** buildctl left behind. With no registry the layout tar is
+      opened before the build is known to succeed, so a failure leaves a 0-byte
+      file -- exactly what a worker later reports as `file could not be opened
+      successfully: … empty file`, which names the symptom and hides the cause;
+    * the **record**, via :meth:`TemplateRegistry.discard`: the name must stop
+      resolving, so the next build of it cannot inherit a broken image.
+    """
+    for artifact in artifacts:
+        if artifact is None:
+            continue
+        with suppress(OSError):
+            artifact.unlink(missing_ok=True)
+    app.state.templates.discard(template)
+
+
 async def _run_build(
     app: Any,
     template: TemplateRecord,
@@ -174,6 +196,7 @@ async def _run_build(
         build.status = "error"
         build.error = f"failed to prepare build context: {e}"
         build.append_log(build.error)
+        _discard_failed_build(app, template)
         return
     # buildctl's dockerfile frontend reads the Dockerfile from a file in a
     # --local dockerfile source (unlike docker build's stdin).
@@ -182,6 +205,10 @@ async def _run_build(
     _write_docker_config(settings)
 
     registry = (settings.image_registry or "").rstrip("/")
+    #: ``(tar, link)`` for the no-registry path; both stay ``None`` when the
+    #: build pushes to a registry and there is nothing local to clean up.
+    oci_tar: Path | None = None
+    oci_link: Path | None = None
     if registry:
         remote = f"{registry}/{template.template_id}"
         output = f"type=image,name={remote}:latest,push=true"
@@ -231,6 +258,7 @@ async def _run_build(
         build.status = "error"
         build.error = "buildctl is not available in this image"
         build.append_log(build.error)
+        _discard_failed_build(app, template, oci_tar, oci_link)
         return
     while True:
         line = await proc.stdout.readline()
@@ -257,6 +285,7 @@ async def _run_build(
         build.status = "error"
         build.error = f"buildkit build exited with code {code}"
         build.append_log(build.error)
+        _discard_failed_build(app, template, oci_tar, oci_link)
 
 
 async def _run_build_with_slot(
@@ -274,6 +303,9 @@ async def _run_build_with_slot(
         build.status = "error"
         build.error = f"build failed unexpectedly: {e}"
         build.append_log(build.error)
+        # An unexpected failure is still a build that produced no image, so the
+        # name must not keep pointing at it either (N19).
+        _discard_failed_build(app, template)
     finally:
         release_slot()
 
@@ -459,6 +491,10 @@ async def trigger_template_build(
         release_slot()
         build.status = "error"
         build.error = str(e)
+        # The build never started, so there is no image and no reason for the
+        # name to keep resolving (N19). The status poll still works: it goes by
+        # id, and the record stays in memory.
+        _discard_failed_build(request.app, record)
         return Response(status_code=202)
     app = request.app
     workspace_base = app.state.workspace_base
