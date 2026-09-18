@@ -1293,6 +1293,12 @@ stdin），然后只做**读**回填响应。路径语义不变（`/foo` 仍然�
 * 上传仍保留"临时文件 + rename"（E4.2），只是搬进沙箱内做；超限时杀进程并清理临时文件。
 * 前提：镜像里有 `/bin/sh`。本舰队所有镜像（`python-mcp`、`python:3.11-slim`）都有；scratch
   形态的镜像会**明确报错**而不是偷偷换回 worker 身份写。
+* **写与暂停赛跑（实测发现并已修）**：暂停若落在写已过闸门之后，沙箱内的 helper 会被
+  `SIGSTOP` **冻住** ⇒ 调用方的请求一直挂在里面（实测入口 nginx **60 秒后 504**），临时文件也留在
+  树上；而"暂停了却还有一个写在长"正是暂停要阻止的事。现在 `pause_all` 对**内部写 helper**
+  改为中止（用户命令仍然冻结/解冻，它的输出要留着），写者把"被信号杀掉 + 记录不是 running"
+  翻成**同一个 409**：`Sandbox is paused[: 原因]; the Upload was interrupted by the pause rather
+  than frozen (resume it and retry)`。
 
 **③ 单文件硬限（C，`RLIMIT_FSIZE`）**：fork 侧新增 `max_file_size`（builder + profile
 `[limits].file_size` + supervise policy + C ABI + Python/Go 绑定），在子进程里同时压低软硬限，

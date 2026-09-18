@@ -115,8 +115,20 @@ def resource_exhausted(message: str) -> ConnectError:
     return connect_error(CONNECT_CODE_RESOURCE_EXHAUSTED, message)
 
 
-def failed_precondition(message: str) -> ConnectError:
-    return connect_error(CONNECT_CODE_FAILED_PRECONDITION, message)
+def failed_precondition(
+    message: str, http_status: int | None = None
+) -> ConnectError:
+    """``failed_precondition`` -- the system is not in the state you need.
+
+    ``http_status`` overrides the table's 400 for the transports that answer
+    HTTP directly and have a better word for it: the workspace writer's
+    "your write was interrupted by the pause" is the same conflict the file
+    endpoints already answer with 409, and a caller should not have to read two
+    statuses as one cause.
+    """
+    return connect_error(
+        CONNECT_CODE_FAILED_PRECONDITION, message, http_status=http_status
+    )
 
 
 def unimplemented(message: str) -> ConnectError:

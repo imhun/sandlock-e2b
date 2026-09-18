@@ -62,7 +62,7 @@ class _NoSignalPauseRunning(_FakeRunning):
         self.kill_calls.append(signal.SIGKILL)
 
 
-def _manager_with(running: RunningProcess) -> ProcessManager:
+def _manager_with(running: RunningProcess, *, internal: bool = False) -> ProcessManager:
     manager = ProcessManager(executor=object())  # type: ignore[arg-type]
     proc = ManagedProcess(
         pid=running.pid,
@@ -72,6 +72,7 @@ def _manager_with(running: RunningProcess) -> ProcessManager:
             cwd="/workspace",
             stdin_enabled=False,
         ),
+        internal=internal,
         _running=running,
     )
     manager._processes[proc.pid] = proc
@@ -135,6 +136,38 @@ def test_pause_resume_fallback_sends_signal_when_backend_supports_signal_pause(
     manager.resume_all()
 
     assert running.kill_calls == [signal.SIGSTOP, signal.SIGCONT]
+
+
+def test_a_paused_sandbox_aborts_an_in_flight_write_instead_of_freezing_it(
+    monkeypatch,
+) -> None:
+    """N28/B: a helper is killed, a user command is stopped (they are not alike).
+
+    Freezing a write that is already in flight leaves the caller's request
+    hanging inside the sandbox until it is resumed -- measured on the cluster
+    as an nginx 504 after its 60 s timeout, with the write's temp file behind
+    -- and a paused sandbox that still has a write growing is the exact thing
+    the pause exists to stop. A user command, by contrast, *should* be frozen
+    and resumed with its output intact.
+    """
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(os, "killpg", lambda *a: None)
+    helper = _FakeRunning()
+    command = _FakeRunning(pid=4243)
+    manager = _manager_with(helper, internal=True)
+    manager._processes[command.pid] = ManagedProcess(
+        pid=command.pid,
+        config=ExecConfig(
+            cmd=["sleep", "60"], env={}, cwd="/workspace", stdin_enabled=False
+        ),
+        _running=command,
+    )
+
+    manager.pause_all()
+
+    assert helper.kill_calls == [signal.SIGKILL]
+    assert command.kill_calls == []
+    assert manager.get_or_none(helper.pid) is None
 
 
 def test_running_process_backends_expose_capability_markers() -> None:

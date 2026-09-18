@@ -44,7 +44,8 @@ import uuid
 from collections.abc import AsyncIterable
 from pathlib import Path
 
-from gateway_common.errors import ConnectError, invalid_argument
+from envd_service.runtime.registry import state_clause
+from gateway_common.errors import ConnectError, failed_precondition, invalid_argument
 from gateway_common.paths import PathTraversalError, resolve_under_root
 from gateway_common.upload import UploadTooLargeError
 
@@ -337,6 +338,21 @@ class SandboxWriter:
         detail = stderr.decode("utf-8", "replace").strip()
         if not detail:
             detail = f"the sandbox's {SHELL} exited {code} with no output"
+        state = getattr(self._ctx.record, "state", "running")
+        if code < 0 and state != "running":
+            # Killed by a signal while its sandbox left ``running``: the pause
+            # is the cause, and -- unlike a helper that failed on its own --
+            # it is the caller's to fix (resume and retry). Answering with the
+            # state (and the platform's reason for it) is what keeps a write
+            # that *raced* the pause from surfacing as an unexplained 500.
+            return failed_precondition(
+                (
+                    f"{state_clause(self._ctx.record, state)}; the {operation} "
+                    "was interrupted by the pause rather than frozen "
+                    "(resume it and retry)"
+                ),
+                http_status=409,
+            )
         return SandboxWriteError(
             "internal",
             f"{operation} failed inside the sandbox: {detail}",

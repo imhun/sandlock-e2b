@@ -61,6 +61,10 @@ class ManagedProcess:
     capture_limit: int | None = CAPTURE_LIMIT_DEFAULT
     # Streams that crossed the capture cap (their replay ends with the marker).
     captured_truncated: set[str] = field(default_factory=set)
+    #: Worker bookkeeping (the workspace writer's helpers), not a user command.
+    #: ``pause_all`` cannot freeze one of these the way it freezes user work:
+    #: see the note there.
+    internal: bool = False
     ended: bool = False
     exit_code: int | None = None
     killed: bool = False
@@ -355,6 +359,7 @@ class ProcessManager:
                 pid=running.pid,
                 config=config,
                 tag=tag,
+                internal=internal,
                 _running=running,
                 capture_limit=self._capture_limit_bytes,
             )
@@ -526,6 +531,18 @@ class ProcessManager:
         """
         for proc in list(self._processes.values()):
             if proc._running is None:
+                continue
+            if proc.internal:
+                # A workspace write that is already in flight (N28/B) is not
+                # "frozen work" the way a user command is. Freezing it means
+                # the caller's request hangs inside the sandbox until the
+                # sandbox is resumed -- measured as an nginx 504 after its 60 s
+                # timeout, with the write's own temp file left behind -- and a
+                # paused sandbox that still has a write growing is exactly what
+                # the pause exists to stop. Kill it instead: the writer turns
+                # the signal into the same "paused, resume and retry" refusal
+                # the gate hands out, and takes the temp file with it.
+                self.send_signal(proc.pid, signal.SIGKILL)
                 continue
             try:
                 import os

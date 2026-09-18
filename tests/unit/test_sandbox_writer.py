@@ -13,6 +13,7 @@ Two layers are pinned here, and the split is the point:
 from __future__ import annotations
 
 import asyncio
+import signal
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -254,6 +255,45 @@ async def test_a_failing_helper_reports_the_sandbox_stderr(root):
     assert exc.value.message == (
         "MakeDir failed inside the sandbox: mv: cannot stat 'a'"
     )
+
+
+async def test_a_helper_killed_by_a_pause_reports_the_pause(tmp_path):
+    """N28/B: the write that raced the pause gets the same refusal as the gate.
+
+    A helper that dies by signal while its sandbox is not ``running`` is not a
+    worker fault to report as a 500 -- the caller can resume and retry, and the
+    message says so (with the platform's reason, when it has one).
+    """
+    executor = _RecordingExecutor(exit_code=-signal.SIGKILL)
+    context = _context(root := tmp_path / "sbx_writer", executor)
+    context.record.state = "paused"
+    context.record.pause_reason = (
+        "its workspace grew past its budget (1340 MiB used of 1024 MiB)"
+    )
+    writer = SandboxWriter(context)
+
+    with pytest.raises(ConnectError) as exc:
+        await writer.write_stream("f.bin", _chunks(b"x"), limit_bytes=None)
+
+    assert exc.value.code == "failed_precondition"
+    assert exc.value.http_status == 409
+    assert exc.value.message == (
+        "Sandbox is paused: its workspace grew past its budget "
+        "(1340 MiB used of 1024 MiB); the Upload was interrupted by the pause "
+        "rather than frozen (resume it and retry)"
+    )
+
+
+async def test_a_helper_that_fails_on_its_own_is_still_a_worker_fault(tmp_path):
+    executor = _RecordingExecutor(exit_code=1, stderr=b"mv: cannot stat 'a'\n")
+    context = _context(root := tmp_path / "sbx_writer", executor)
+    writer = SandboxWriter(context)
+
+    with pytest.raises(ConnectError) as exc:
+        await writer.make_dir("a")
+
+    assert exc.value.code == "internal"
+    assert exc.value.http_status == 500
 
 
 # -- internal is internal --------------------------------------------------
