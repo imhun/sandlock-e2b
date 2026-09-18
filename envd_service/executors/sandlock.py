@@ -799,6 +799,29 @@ class SandlockExecutor(Executor):
         """Live ``SandboxInstance``, or ``None`` until ``_ensure_instance()``."""
         return self._instance
 
+    def drain_dirty_dirs(self) -> tuple[list[str], bool] | None:
+        """Take the session's written-directory ledger (N25/L2c).
+
+        ``None`` means this backend cannot answer -- no instance yet (nothing
+        has been launched, so nothing has been written), an older fork wheel
+        without the drain symbol, or the pure shape, where there are no path
+        notifications to mark from. The caller falls back to a whole-tree walk,
+        which is exactly what it did before this existed.
+        """
+        holder = self._instance
+        drain = getattr(holder, "drain_dirty_dirs", None)
+        if drain is None:
+            return None
+        try:
+            return drain()
+        except Exception:  # noqa: BLE001 - a capability answer, never a crash
+            logger.debug(
+                "drain_dirty_dirs unavailable for sandbox %s",
+                self._sandbox_id,
+                exc_info=True,
+            )
+            return None
+
     def _instance_name_for(self) -> str:
         sid = self._sandbox_id or Path(self._workspace_dir).name
         if len(sid.encode()) <= 64:

@@ -25,6 +25,7 @@ from gateway_common.paths import (
     sandbox_runtime_dir,
     validate_sandbox_id,
 )
+from envd_service.runtime.dir_ledger import DirLedger, DirLedgerUnknown
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,14 @@ class RuntimeRegistry:
         #: sandboxes on this workspace (worker agent + local-node control
         #: plane). ``None`` = independent-uid mode disabled.
         self.uid_pool = uid_pool
+        self._dirty_provider: Callable[[str], tuple[list[str], bool] | None] | None = None
+        #: N25/L2c: per-sandbox `DirLedger`, keyed by id, dropped when the
+        #: sandbox is unregistered (its tree is about to go away).
+        self._ledgers: dict[str, DirLedger] = {}
+        #: N25/L2c: how the last rounds were answered, and when that was last
+        #: reported (see `_log_dirty_split`).
+        self._dirty_stats = {"ledger": 0, "rebuilt": 0, "walk": 0}
+        self._dirty_log_at = 0.0
         #: N25/L2b: where the next ``disk_usage_snapshot`` round starts, so a
         #: scan budget that runs out does not always starve the same trees.
         self._disk_scan_cursor = 0
@@ -223,7 +232,9 @@ class RuntimeRegistry:
         with self._lock:
             return dict(self._activity)
 
-    def disk_usage_snapshot(self, *, budget_s: float | None = None) -> dict[str, int]:
+    def disk_usage_snapshot(
+        self, *, budget_s: float | None = None, dirty: bool = False
+    ) -> dict[str, int]:
         """Measured file bytes per sandbox tree, for the heartbeat (N25/L2b).
 
         The worker owns the mount, so it is the only party that can measure a
@@ -260,13 +271,120 @@ class RuntimeRegistry:
             # the cursor where it was and starve every tree behind it forever.
             if index and deadline is not None and time.monotonic() >= deadline:
                 break
-            size = priv_helpers.dir_size(record.workspace_dir)
+            size = self._incremental_dir_size(record, dirty=dirty)
+            if size is None:
+                size = priv_helpers.dir_size(record.workspace_dir)
+                if dirty:
+                    self._dirty_stats["walk"] += 1
             if size is not None:
                 usage[record.sandbox_id] = int(size)
             scanned += 1
+        if dirty:
+            self._log_dirty_split()
         with self._lock:
             self._disk_scan_cursor = (start + scanned) % len(records)
         return usage
+
+    def set_dirty_provider(self, provider) -> None:
+        """Install the per-sandbox dirty-directory source (N25/L2c).
+
+        ``provider(sandbox_id) -> (dirs, overflow) | None``: the directories
+        that sandbox has written since the last call, or ``None`` when there is
+        no ledger to ask (no live session, an older wheel, the pure shape).
+        The registry owns the *sizes*; the provider owns "what changed".
+        """
+        with self._lock:
+            self._dirty_provider = provider
+
+    def note_local_write(self, sandbox_id: str, path: str | Path) -> None:
+        """Record a write the **worker itself** made inside a sandbox tree.
+
+        N25/L2c's dirty set comes from the mediator, which sees every write the
+        sandbox makes -- but not the ones the platform makes on its behalf
+        (the MCP gateway token is the one that lands inside the tree at
+        runtime). Those are our own code, so they are marked at the write
+        point: no inference, no extra walk.
+        """
+        with self._lock:
+            ledger = self._ledgers.get(sandbox_id)
+        if ledger is None or not ledger.ready:
+            return
+        try:
+            ledger.apply([Path(path).parent])
+        except DirLedgerUnknown:
+            ledger.invalidate()
+
+    def _ledger_for(self, record: RuntimeSandbox) -> DirLedger:
+        with self._lock:
+            ledger = self._ledgers.get(record.sandbox_id)
+            if ledger is None:
+                ledger = DirLedger(record.workspace_dir)
+                self._ledgers[record.sandbox_id] = ledger
+            return ledger
+
+    def _incremental_dir_size(
+        self, record: RuntimeSandbox, *, dirty: bool
+    ) -> int | None:
+        """The tree's size from the ledger, or ``None`` to walk it.
+
+        Every "cannot answer" path degrades to the whole-tree walk that was
+        the only implementation before this existed -- a wrong number is the
+        one outcome that must not happen, so an overflow, a lost baseline or an
+        unreadable directory all end in a walk rather than an estimate.
+        """
+        if not dirty:
+            return None
+        provider = self._dirty_provider
+        if provider is None:
+            return None
+        drained = provider(record.sandbox_id)
+        if drained is None:
+            return None
+        dirs, overflow = drained
+        ledger = self._ledger_for(record)
+        if overflow or not ledger.ready:
+            # Overflow means the mediator stopped recording, so the ledger has
+            # to be rebuilt from scratch before it can be trusted again.
+            self._dirty_stats["rebuilt"] += 1
+            total = ledger.rebuild()
+            # A rebuild drains and then walks, and the two are not atomic: a
+            # writer that opened its file *before* the drain and appended
+            # *during* the walk can fall between them, in a directory the walk
+            # had already passed. Re-checking exactly those directories once
+            # more is what closes that window (they are the ones the drain
+            # named), and it costs one scan of the directories that changed.
+            ledger.rescan_next(dirs)
+            return total
+        try:
+            size = ledger.apply(dirs)
+        except DirLedgerUnknown:
+            ledger.invalidate()
+            return None
+        self._dirty_stats["ledger"] += 1
+        return size
+
+    def _log_dirty_split(self) -> None:
+        """Say how the last rounds were answered, at most once a minute.
+
+        The incremental path is allowed to fall back to the walk at any time,
+        which means a *correct* number proves nothing about whether the ledger
+        is doing any work: without this line, "the feature is inert" and "the
+        feature works" look identical from outside.
+        """
+        if not any(self._dirty_stats.values()):
+            return
+        now = time.monotonic()
+        if now - self._dirty_log_at < 60.0:
+            return
+        self._dirty_log_at = now
+        logger.info(
+            "disk accounting: ledger=%d rebuilt=%d walk=%d (since the last "
+            "report)",
+            self._dirty_stats["ledger"],
+            self._dirty_stats["rebuilt"],
+            self._dirty_stats["walk"],
+        )
+        self._dirty_stats = {"ledger": 0, "rebuilt": 0, "walk": 0}
 
     def _record_path(self, sandbox_id: str) -> Path:
         """Where this sandbox's runtime record is written.
@@ -361,6 +479,10 @@ class RuntimeRegistry:
         with self._lock:
             self._tombstones.pop(sandbox_id, None)
             self._records[sandbox_id] = record
+            # A re-created id must not inherit the previous incarnation's
+            # baseline (N25/L2c): its tree may be a fresh template copy, and a
+            # ledger that assumed continuity would report the difference.
+            self._ledgers.pop(sandbox_id, None)
             try:
                 self._ensure_runtime_dir(sandbox_id)
                 path = self._record_path(sandbox_id)
@@ -517,6 +639,7 @@ class RuntimeRegistry:
         with self._lock:
             removed = self._records.pop(sandbox_id, None) is not None
             self._activity.pop(sandbox_id, None)
+            self._ledgers.pop(sandbox_id, None)
             self._tombstones[sandbox_id] = (
                 time.monotonic() + self.UNREGISTER_TOMBSTONE_S
             )

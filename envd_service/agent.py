@@ -193,6 +193,22 @@ def _disk_enforce_interval_s() -> float:
     return env_float("E2B_DISK_ENFORCE_INTERVAL_S", 5.0)
 
 
+def _disk_enforce_dirty_enabled() -> bool:
+    """Whether the report is built incrementally (N25/L2c).
+
+    ``E2B_DISK_ENFORCE_DIRTY`` (default **off**): with it on, the worker asks
+    each sandbox's mediator which directories changed and re-walks only those,
+    instead of walking every tree; with it off, or when a sandbox cannot answer
+    (no live session, an older wheel, the pure shape), it walks the tree
+    exactly as before. Off by default because the two must produce the same
+    number -- the flag is what makes "they do" a measurable claim rather than a
+    promise, and the accounting turns it on only after that measurement.
+    """
+    from gateway_common.env import env_bool
+
+    return env_bool("E2B_DISK_ENFORCE_DIRTY", False)
+
+
 def _heartbeat_usage_payload(
     settings: Settings,
     metrics_provider: Callable[[], dict[str, Any]] | None = None,
@@ -1374,6 +1390,9 @@ class NodeAgent:
         #: the control plane's view of what it learned a moment ago.
         self._disk_provider = getattr(runtime_registry, "disk_usage_snapshot", None)
         self._disk_interval_s = _disk_enforce_interval_s()
+        #: N25/L2c: build the report from the mediator's dirty set instead of
+        #: walking every tree. Off by default -- see `_disk_enforce_dirty_enabled`.
+        self._disk_dirty = _disk_enforce_dirty_enabled()
         self._disk_report: dict[str, int] = {}
         self._disk_report_at = 0.0
         #: The scan round in flight, if any (single-flight, like the reconcile
@@ -1509,7 +1528,9 @@ class NodeAgent:
         self._disk_report_at = time.monotonic()
         try:
             report = await asyncio.to_thread(
-                self._disk_provider, budget_s=_DISK_SCAN_BUDGET_S
+                self._disk_provider,
+                budget_s=_DISK_SCAN_BUDGET_S,
+                dirty=self._disk_dirty,
             )
         except asyncio.CancelledError:
             raise

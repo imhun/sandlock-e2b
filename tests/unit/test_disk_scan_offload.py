@@ -28,9 +28,12 @@ class _BlockingRegistry:
         self.fail = fail
         self.calls = 0
 
-    def disk_usage_snapshot(self, *, budget_s: float | None = None) -> dict[str, int]:
+    def disk_usage_snapshot(
+        self, *, budget_s: float | None = None, dirty: bool = False
+    ) -> dict[str, int]:
         self.calls += 1
         assert budget_s == 1.0
+        assert dirty is False, "this fake does not model the dirty path"
         self.release.wait(5)
         if self.fail:
             raise OSError("the base is unreachable")

@@ -329,6 +329,25 @@ spec:
             # round stops at a 1 s budget and resumes where it left off.
             - name: E2B_DISK_ENFORCE_INTERVAL_S
               value: "5"
+            # N25/L2c: build the report from each sandbox's *mediator* instead
+            # of walking every tree. The mediator sees every write the sandbox
+            # makes (it already resolves every path), so it can say which
+            # directories changed; the worker re-walks only those.
+            #
+            # The two implementations must produce the same number, and that
+            # is measured rather than assumed: `tmp/k0s/probe_dir_ledger.py`
+            # compares the metric against a byte-exact measurement taken
+            # *inside* the sandbox after a mutation sequence, and the worker
+            # logs how each round was answered
+            # (`disk accounting: ledger=… rebuilt=… walk=…`) so an inert
+            # feature cannot look like a working one.
+            #
+            # Falling back is always safe and always allowed: no live session,
+            # an older wheel without the drain verb, the pure shape (no path
+            # notifications), a dirty set that overflowed, or an unreadable
+            # directory all end in the whole-tree walk.
+            - name: E2B_DISK_ENFORCE_DIRTY
+              value: "1"
             - name: E2B_NODE_PROCESSES
               value: "256"
           resources:

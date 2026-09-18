@@ -1097,6 +1097,27 @@ class RouteBInstance:
                 f"{verb!r} lost the slot: {type(exc).__name__}: {exc}"
             ) from exc
 
+    def drain_dirty_dirs(self) -> tuple[list[str], bool] | None:
+        """Take the slot's written-directory ledger (N25/L2c).
+
+        `None` means this slot cannot answer -- an older fork wheel whose
+        supervise binary has no `dirty_dirs` verb -- and the caller must fall
+        back to a whole-tree walk. An *empty* list with `overflow` false is a
+        real answer: nothing was written since the last drain.
+        """
+        try:
+            payload = self.request("dirty_dirs")
+        except SandboxError:
+            # A served refusal: the slot is alive and this verb is unknown to
+            # it. That is a capability answer, not a dead instance.
+            return None
+        if not isinstance(payload, dict):
+            return None
+        dirs = payload.get("dirs")
+        if not isinstance(dirs, list):
+            return None
+        return [str(d) for d in dirs], bool(payload.get("overflow"))
+
     def exec(
         self,
         cmd,

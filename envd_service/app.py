@@ -383,7 +383,21 @@ def create_app(
     app.state.quota_agent_client = quota_agent_client
     app.state.runtime_registry = runtime_registry
     app.state.runtimes: dict[str, SandboxRuntimeContext] = {}
-    app.state.context_factory = lambda record: SandboxRuntimeContext(record, settings)
+    app.state.context_factory = lambda record: SandboxRuntimeContext(
+        record, settings, runtime_registry=runtime_registry
+    )
+    # N25/L2c: the disk accounting asks each sandbox's *mediator* what changed
+    # (the file-level "who wrote what" lives inside its session), while the
+    # registry owns the sizes. A sandbox with no live context has no mediator
+    # to ask -- and nothing written through one either -- so this answers
+    # `None`, which the caller reads as "walk the tree".
+    runtime_registry.set_dirty_provider(
+        lambda sandbox_id: (
+            app.state.runtimes[sandbox_id].drain_dirty_dirs()
+            if sandbox_id in app.state.runtimes
+            else None
+        )
+    )
     runtime_registry.add_unregister_callback(
         lambda sandbox_id: (
             app.state.runtimes.pop(sandbox_id, None).shutdown()

@@ -297,8 +297,19 @@ def runtime_context(request, runtime: SandboxRuntimeContext) -> SandboxRuntimeCo
 class SandboxRuntimeContext:
     """Everything needed to serve RPCs for one sandbox."""
 
-    def __init__(self, record: RuntimeSandbox, settings: Settings) -> None:
+    def __init__(
+        self,
+        record: RuntimeSandbox,
+        settings: Settings,
+        *,
+        runtime_registry=None,
+    ) -> None:
         self.record = record
+        #: N25/L2c: the registry that owns the incremental ledger, so a write
+        #: the platform makes inside the tree can mark itself dirty (see
+        #: ``start_mcp_gateway``). ``None`` in tests and in any embedder that
+        #: does not run the accounting.
+        self.runtime_registry = runtime_registry
         self.executor = create_executor(
             settings,
             workspace_dir=record.workspace_dir,
@@ -454,6 +465,17 @@ class SandboxRuntimeContext:
     def pause(self) -> None:
         self.processes.pause_all()
 
+    def drain_dirty_dirs(self) -> tuple[list[str], bool] | None:
+        """Take this sandbox's written-directory ledger (N25/L2c).
+
+        Delegated to the executor, because the ledger lives with the mediator
+        that sees the writes -- in this sandbox's own slot process. ``None``
+        means "no answer available" (no session yet, an older wheel, the pure
+        shape), which the disk accounting reads as "walk the tree".
+        """
+        drain = getattr(self.executor, "drain_dirty_dirs", None)
+        return drain() if drain is not None else None
+
     def resume(self) -> None:
         self.processes.resume_all()
 
@@ -506,6 +528,14 @@ class SandboxRuntimeContext:
         token_dir = Path(self.record.workspace_dir) / "etc" / "mcp-gateway"
         token_dir.mkdir(parents=True, exist_ok=True)
         (token_dir / ".token").write_text(token, encoding="utf-8")
+        # N25/L2c: this is the one write the *platform* makes inside the tree
+        # at runtime, so the mediator never sees it. Marking it here is exact
+        # (this code is the writer) and keeps the incremental accounting equal
+        # to the whole-tree walk. Provisioning writes need no mark: they happen
+        # before the ledger's baseline.
+        registry = getattr(self, "runtime_registry", None)
+        if registry is not None:
+            registry.note_local_write(self.record.sandbox_id, token_dir)
         try:
             proc = await self.executor.start(
                 ExecConfig(
