@@ -40,6 +40,17 @@ def _seed(path: Path) -> Path:
     return path
 
 
+def _store_dir(reg: SnapshotRegistry, sid: str) -> Path:
+    """The registry's own on-disk directory for one snapshot.
+
+    These tests copy a whole *store directory* into a workspace to reproduce
+    the nesting incident, so they need the real path rather than a hard-coded
+    one -- it moved under ``_snapshots/`` when the control plane started
+    mounting the shared volume read-only (OBS-9).
+    """
+    return reg._snapshot_dir(sid)
+
+
 def test_expand_to_rejects_destination_inside_source(tmp_path):
     reg = _registry(tmp_path / "store")
     src = tmp_path / "sbx_1"
@@ -62,7 +73,9 @@ def test_snapshot_of_workspace_containing_store_prunes_store(tmp_path):
     (ws / "workspace").mkdir(parents=True)
     (ws / "workspace" / "keep.txt").write_text("keep", encoding="utf-8")
     shutil.copytree(
-        store / "snap_victim", ws / "snapshots" / "snap_victim", symlinks=True
+        _store_dir(reg, "snap_victim"),
+        ws / "snapshots" / "snap_victim",
+        symlinks=True,
     )
     (ws / "data").mkdir()  # 普通目录必须原样保留：守卫不得过度剪枝
     (ws / "data" / "keep.bin").write_bytes(b"1")
@@ -114,7 +127,7 @@ def test_nested_store_markers_are_pruned_within_bounded_depth(tmp_path):
     # The container directory is not itself a store; the snapshot root sits
     # two levels below it (mirror/snap_victim/snapshot.json).
     shutil.copytree(
-        store / "snap_victim",
+        _store_dir(reg, "snap_victim"),
         ws / "cache" / "mirror" / "snap_victim",
         symlinks=True,
     )

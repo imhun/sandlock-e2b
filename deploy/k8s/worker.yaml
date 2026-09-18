@@ -140,6 +140,15 @@ spec:
             - |-
               set -e
               base="$WORKSPACE_BASE"
+              # OBS-9: the control plane mounts these back on top of its
+              # read-only view of the shared volume (subPath mounts), and a
+              # subPath whose source does not exist keeps that pod in
+              # ContainerCreating. Creating them here -- the one init container
+              # that already runs as root with the volume mounted RW -- means a
+              # fresh install converges without a separate bootstrap step.
+              for dir in _builds _images _secrets _templates _snapshots _volumes; do
+                mkdir -p "$base/$dir"
+              done
               owner="$(stat -c %u "$base")"
               mode="$(stat -c %a "$base")"
               echo "workspace-root-init: $base owner=$owner mode=$mode"

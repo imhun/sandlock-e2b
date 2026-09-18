@@ -170,8 +170,44 @@ spec:
             - name: E2B_BUILDKIT_ADDR
               value: unix:///run/buildkit/buildkitd.sock
           volumeMounts:
+            # OBS-9: the shared volume is one trust domain -- every pod that
+            # mounts it can write every sandbox tree (all of them run as root,
+            # and this export does not squash root). The control plane is the
+            # most exposed component (it serves the public API and holds the
+            # internal key), so it gets the shared volume **read-only** and gets
+            # its own writable areas mounted back on top as subPaths.
+            #
+            # Everything below is a directory the control plane actually
+            # writes: template builds (`_builds`), the OCI layout tars it
+            # exports for the workers (`_images/_oci`), its registries
+            # (`_secrets`, `_templates`, `_snapshots`) and the volume
+            # directories (`_volumes`). Sandbox trees are deliberately absent:
+            # writing one from here is now EROFS, which is exactly what OBS-9
+            # asked for. The directories are pre-created by the worker's
+            # `workspace-root-init` (a pod that needs a subPath source that does
+            # not exist yet stays in ContainerCreating and the kubelet retries,
+            # so a fresh install converges once a worker has initialised).
             - name: shared
               mountPath: /var/lib/e2b-sandboxes
+              readOnly: true
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes/_builds
+              subPath: _builds
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes/_images
+              subPath: _images
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes/_secrets
+              subPath: _secrets
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes/_templates
+              subPath: _templates
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes/_snapshots
+              subPath: _snapshots
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes/_volumes
+              subPath: _volumes
             - name: buildkit-data
               mountPath: /run/buildkit
               readOnly: true

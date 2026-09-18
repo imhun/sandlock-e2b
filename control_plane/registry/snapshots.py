@@ -151,10 +151,40 @@ class SnapshotRegistry:
         self._base.mkdir(parents=True, exist_ok=True)
 
     def _snapshot_dir(self, snapshot_id: str) -> Path:
-        return self._base / snapshot_id
+        """Where one snapshot's record *and* payload live.
+
+        ``<base>/_snapshots/<id>`` -- deliberately the same directory the
+        worker's ``/agent/snapshots`` copies the filesystem into, so the
+        record and its ``fs/`` are one object in one place. It used to be
+        ``<base>/<id>`` here while the worker wrote ``<base>/_snapshots/<id>``,
+        i.e. two layouts for the same snapshot; that mattered once the control
+        plane started mounting the shared volume read-only (OBS-9), because the
+        root-level form has nowhere to be mounted back read-write.
+        """
+        return self._base / "_snapshots" / snapshot_id
 
     def _fs_path(self, snapshot_id: str) -> Path:
         return self._snapshot_dir(snapshot_id) / "fs"
+
+    def _legacy_snapshot_dir(self, snapshot_id: str) -> Path:
+        """The pre-OBS-9 root-level layout, still read (and removed) if present."""
+        return self._base / snapshot_id
+
+    def _record_path(self, snapshot_id: str) -> tuple[Path, Path]:
+        """``(record_path, fs_path)`` for the layout this snapshot actually uses.
+
+        The two are returned together because a legacy record's payload lives
+        in the legacy directory: ``SnapshotRecord.from_dict`` takes the fs path
+        as an argument rather than from the file, so pairing them here is what
+        keeps snapshots taken before this change readable.
+        """
+        current = self._snapshot_dir(snapshot_id) / "snapshot.json"
+        if current.is_file():
+            return current, self._fs_path(snapshot_id)
+        legacy = self._legacy_snapshot_dir(snapshot_id) / "snapshot.json"
+        if legacy.is_file():
+            return legacy, legacy.parent / "fs"
+        return current, self._fs_path(snapshot_id)
 
     def create_from_sandbox(
         self,
@@ -220,11 +250,11 @@ class SnapshotRegistry:
             record = self._snapshots.get(snapshot_id)
             if record is not None:
                 return record
-        path = self._snapshot_dir(snapshot_id) / "snapshot.json"
+        path, fs_path = self._record_path(snapshot_id)
         if not path.is_file():
             raise UnknownSnapshotError(snapshot_id)
         payload = json.loads(path.read_text(encoding="utf-8"))
-        record = SnapshotRecord.from_dict(payload, self._fs_path(snapshot_id))
+        record = SnapshotRecord.from_dict(payload, fs_path)
         with self._lock:
             self._snapshots[snapshot_id] = record
         return record
@@ -234,6 +264,9 @@ class SnapshotRegistry:
         with self._lock:
             self._snapshots.pop(snapshot_id, None)
         shutil.rmtree(self._snapshot_dir(snapshot_id), ignore_errors=True)
+        # A snapshot written before the layout change still occupies its old
+        # directory; deleting only the new one would leave the copy behind.
+        shutil.rmtree(self._legacy_snapshot_dir(snapshot_id), ignore_errors=True)
         return record
 
     def list(
