@@ -1,17 +1,32 @@
-# 这套集群的共享卷是网络文件系统，节点活性的 15 秒窗口撑不住。
+# 节点活性窗口：从 300 秒降到 60 秒（2026-09-18）。
 #
-# 为什么：worker 解析一个**冷**镜像 rootfs 时是在自己的事件循环上同步做的
-# （`envd_service/executors/sandlock.py::_ensure_instance_async` 只把 route-B 的
-# *实例创建*放进了线程；rootfs 解包发生在它之前）。本地盘上这是 0.3 秒，无感；
-# 阿里云 NAS 上实测同一份 python-slim rootfs（2111 个文件）**61 秒**，是本地
-# overlay 的 240 倍——本地构建的模板更久（实测一次模板沙箱的解析用了 3 分 35 秒）。
-# 这期间 worker 发不出心跳 ⇒ 控制面 15 秒后把健康节点判成 unhealthy ⇒
-# `reap_unhealthy`（E6.1）把**还活着**的沙箱当孤儿回收 ⇒ 该沙箱的 route-B 槽位被
-# 释放、exec 报 `route-B instance … is closed`，客户端看到的是 deadline 超时。
+# 这个窗口决定「多久没心跳就当作节点没了」，而「没了」会让它名下的**活沙箱**被
+# `reap_unhealthy`（E6.1）当孤儿回收、route-B 槽位被释放。所以它既是活性判据，
+# 也是一条**误判就会杀活沙箱**的线，取值必须对着实测的最坏心跳空档来定。
 #
-# 300 秒取自实测：要覆盖一次 3 分 35 秒的 rootfs 解析并留出余量。
-# ⚠ 这是缓解措施，不是根治：真正该修的是 ① 那次 rootfs 解析不要跑在事件循环上
-# （或心跳独立于循环），② 「只是漏心跳」不该回收槽位。见 docs/task-backlog.md N18。
+# 原来设 300 秒是为了扛 N18：worker 当时在**事件循环上**解冷镜像 rootfs，阿里云 NAS
+# 上实测 61 秒（本地盘 0.26 秒），本地模板更长（3 分 35 秒），这期间发不出心跳。
+# 那条已经修掉（N18 (c)+(a)：OCI tar 留在共享卷、解出来的 rootfs 落到节点本地，
+# 且 context 预建走 `asyncio.to_thread`），300 秒的**理由**没有了。
+#
+# 但「心跳已经异步」只覆盖了镜像解析那条路径。worker 的心跳与 reconcile 轮次在
+# **同一个协程**里（`NodeAgent._loop`：心跳 → 可能跑一轮 reconcile → sleep 5），
+# 所以空档 = 5 秒 + 一整轮 reconcile，而轮次时长随共享 base 上的树数增长（扫描仍是
+# 事件循环上的同步调用，见 backlog N21），没有上界。
+#
+# 60 秒的来由（2026-09-18 实测，deploy/scripts/heartbeat_gaps.py 可复现）：
+# 两个 worker、14.7 小时、各约 1.06 万次心跳，控制面侧最大空档 **5.15 秒**
+# （中位 5.01），其中属于 reconcile 的部分最多 **0.15 秒**。
+#   * 15 秒（代码默认，3 次缺席）在今天这个 base 上其实也够，但它只剩 3 倍余量，
+#     而轮次时长是没有上界的 —— 一旦 base 长到几千棵树，一个慢轮次就会把**活着的**
+#     worker 判死，正是 N18 那类伤害；
+#   * 60 秒 = 12 倍实测空档，能容下最长约 55 秒的一轮（按实测每棵树约 15 毫秒算，
+#     ≈ 3000 棵树），同时比 300 秒**快 5 倍**回收掉死节点的预留 —— 那才是宽窗口现在的
+#     代价：死节点的 `reservedMemoryMB` 会挂到超时为止，容量吃紧时直接顶掉建箱。
+#
+# ⚠ 想再往下（回到默认 15 秒）的前提是**把心跳与 reconcile 分开**（心跳单独一个任务，
+# 或轮次不再挂在心跳路径上），那时窗口才能重新等于「3 次缺席」。在此之前，
+# 改这个值之前先跑一遍 deploy/scripts/heartbeat_gaps.py。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -24,4 +39,4 @@ spec:
         - name: control-plane
           env:
             - name: E2B_NODE_HEARTBEAT_TIMEOUT
-              value: "300"
+              value: "60"

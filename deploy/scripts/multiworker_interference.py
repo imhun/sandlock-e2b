@@ -50,10 +50,12 @@ from e2b import Sandbox
 SANDBOX_COUNT = 4
 
 #: Per-call deadline for the sandbox file/command calls. Generous on purpose: a
-#: worker that is running a reconcile pass over the shared base is busy for tens
-#: of seconds (the resolver's own notes measure that walk at 24s idle and 43s
-#: under load), and this test is about interference, not latency. A worker that is
-#: genuinely broken still fails -- just after the longer deadline.
+#: worker's reconcile pass over the shared base runs *synchronously on its event
+#: loop* (``_scan_workspace_runtimes``), so for the length of that pass the worker
+#: answers nothing -- and this codebase already carries measurements of walks on
+#: this storage in the tens of seconds (the image-cache prune: 24 s idle, 43 s
+#: under load, 383k files). This test is about interference, not latency, and a
+#: worker that is genuinely broken still fails, just after the longer deadline.
 REQUEST_TIMEOUT_S = 180.0
 
 

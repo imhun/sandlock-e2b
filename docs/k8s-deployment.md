@@ -524,8 +524,9 @@ root worker 形态可能需要补 `CAP_SYS_PTRACE`）。
 以前一样报它自己的错（这也是 §10.3 F7 那条 `E2B_PER_SANDBOX_UID … without CAP_SYS_PTRACE` 告警
 不再致命的原因）。
 
-兜底仍在：`E2B_NODE_HEARTBEAT_TIMEOUT`（`1a17059`，默认 15 秒不变；k0s overlay 设 300 秒）。
-有了 (a) 它是**安全网**而不是必需——心跳不再会被解析拖住。
+兜底仍在：`E2B_NODE_HEARTBEAT_TIMEOUT`（`1a17059`，默认 15 秒不变；k0s overlay 先设 300 秒，
+2026-09-18 降到 **60 秒**——推导与实测见 §14）。有了 (a) 它是**安全网**而不是必需——
+心跳不再会被解析拖住（§14 里用一次冷解析验证了这一点）。
 
 ### 12.3 保留、没有改的那条
 
@@ -632,8 +633,9 @@ N13 之前基线是钉死单副本的（`deploy/k8s/worker.yaml` `replicas: 1` +
 
 **修掉（真集群暴露，本轮改）**：控制面把**已经死掉的节点**当健康节点继续派活 ⇒ 建箱返回
 `502 Node <id> unavailable`。根因是**孤儿判定窗口被复用成了放置窗口**：overlay 为了让共享
-存储上的慢心跳不至于误判孤儿，把 `E2B_NODE_HEARTBEAT_TIMEOUT` 设成 300 秒，而这个窗口
-同时决定"还要不要往它上面放"。修法是在 `control_plane/registry/nodes.py` 里**另立**一个短窗口
+存储上的慢心跳不至于误判孤儿，把 `E2B_NODE_HEARTBEAT_TIMEOUT` 设得很宽（当时 300 秒，后来
+按 §14 收到 60 秒），而这个窗口同时决定"还要不要往它上面放"。修法是在
+`control_plane/registry/nodes.py` 里**另立**一个短窗口
 `PLACEMENT_MAX_HEARTBEAT_AGE_S = 15.0`（worker 每 5 秒心跳 ⇒ 三次缺席即停派；`local://`
 在进程内节点上豁免，和 sweep 一致），只影响**放置**，不影响孤儿判定（错误孤儿会抢走活沙箱的
 槽位，那是 N18 的教训）。单测见 `tests/unit/test_node_registry.py`。
@@ -646,5 +648,69 @@ N13 之前基线是钉死单副本的（`deploy/k8s/worker.yaml` `replicas: 1` +
   去推断归属 —— 那个列表里含共享 base 上**所有**树（`_reconcile_with_control_plane` 注释写明），
   当成归属声明就会**偷走别人的沙箱**。方向：稳定 node id（StatefulSet）或让 worker 给出
   "本节点真的在跑"的证据。
-* **N21** —— 共享 base 上跑 reconcile 扫描时，worker 会长时间不响应文件 API
-  （代码注释记的 24 秒空闲 / 43 秒负载下），与 N18(a) 同族（重活在事件循环上）。
+* **N21** —— reconcile 轮次仍压在 worker 的事件循环上（`_scan_workspace_runtimes` 是同步
+  调用，而且整轮就挂在心跳那个协程里）。症状与规模见 §14；它也正是把心跳窗口降回默认值的
+  前置。
+
+---
+
+## 14. 心跳窗口：300 秒 → 60 秒（2026-09-18）
+
+### 14.1 这个窗口管什么
+
+`E2B_NODE_HEARTBEAT_TIMEOUT` 决定「多久没心跳就把节点当作没了」，而「没了」会让它名下的
+**活沙箱**被 `reap_unhealthy`（E6.1）当孤儿回收、route-B 槽位被释放。所以它不只是活性判据，
+还是一条**误判就杀活沙箱**的线 —— 这就是当初把它从默认 15 秒抬到 300 秒的原因。
+
+300 秒是为 N18 抬的：worker 当时在**事件循环上**解冷镜像 rootfs，阿里云 NAS 上实测 61 秒
+（本地盘 0.26 秒），本地构建的模板更久（3 分 35 秒），这期间发不出心跳 ⇒ 15 秒判 unhealthy。
+N18 (c)+(a) 之后这条**理由**没有了，但「已经异步了」只覆盖**镜像解析**这一条路径：
+
+* worker 的心跳与 reconcile 轮次在**同一个协程**里
+  （`envd_service/agent.py::NodeAgent._loop`：心跳 → 可能跑一轮 reconcile → `sleep(5)`），
+  所以**空档 = 5 秒 + 一整轮**，而不是 5 秒；
+* 一轮的长度随共享 base 上的树数增长（扫描 `_scan_workspace_runtimes` 仍是事件循环上的
+  同步调用，逐棵树读 `sandbox.json`），**没有上界**（N21）。
+
+### 14.2 实测
+
+新增 `deploy/scripts/heartbeat_gaps.py`：控制面的访问日志里每次心跳一行，用
+`kubectl logs --timestamps` 就能拿到到达时刻，于是心跳空档可以**反复测量**而不必猜。
+
+```
+$ KUBECONFIG=... python deploy/scripts/heartbeat_gaps.py --since 15h
+control plane control-plane-…: 21238 heartbeat(s) over --since=15h
+configured window: 60s
+
+e2b-worker-…-q8p75   beats=10566  median=5.01s  p95=5.01s  p99=5.03s  max=5.07s
+  implied worst reconcile round: 0.07s
+e2b-worker-…-xd4tf   beats=10694  median=5.01s  p95=5.01s  p99=5.03s  max=5.15s
+  implied worst reconcile round: 0.15s
+worst gap across nodes: 5.15s (of which up to 0.15s is a reconcile round)
+```
+
+两个 worker、14.7 小时、各约 1.06 万次心跳，控制面侧**最大空档 5.15 秒**，而且那时的 base
+只有 10 个条目 / 2 棵树。另做了一次「N18 场景」的定向验证 —— 把 worker 节点本地的 rootfs
+缓存挪走制造冷解析：
+
+| 动作 | 客户端看到 | 同期心跳空档 |
+|---|---|---|
+| `POST /agent/images/…/warm`（冷解析：拉取 + 解到本地） | **18.1 s** | 最大 **5.13 s** |
+| 带 `X-Sandbox-Id` 的冷建箱（预热后建箱） | **19.3 s** | 最大 **5.05 s** |
+
+即那两段 18~19 秒的解析**完全没有碰到心跳路径** —— N18 那类伤害现在只可能从 N21 那条
+（reconcile 轮次）来。
+
+### 14.3 取值与后续
+
+`deploy/k8s-k0s/control-plane-nfs.patch.yaml` 设 **60 秒**：
+
+* 15 秒（代码默认，3 次缺席）在今天这个 base 上其实也够，但只剩 3 倍余量，而轮次时长**没有
+  上界** —— base 长到几千棵树时，一个慢轮次就会把活着的 worker 判死；
+* 60 秒 = 12 倍实测空档，能容下最长约 55 秒的一轮（按实测每棵树约 15 毫秒算 ≈ 3000 棵树）；
+* 相比 300 秒**快 5 倍**回收死节点的预留 —— 那正是宽窗口现在的代价：死节点的
+  `reservedMemoryMB` 会一直挂到超时为止，容量吃紧时直接顶掉建箱。
+
+想把窗口降回 15 秒，前置是 **N21**：让心跳不再挂在 reconcile 轮次上（独立任务），或让轮次
+不再占事件循环。在那之前，动这个值之前先跑一遍 `deploy/scripts/heartbeat_gaps.py` —— 它会在
+任何一次空档达到配置窗口时报错退出（那意味着控制面把一个**活着的**节点判成了 unhealthy）。

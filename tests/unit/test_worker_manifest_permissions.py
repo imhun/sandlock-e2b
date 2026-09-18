@@ -24,6 +24,7 @@ Text assertions rather than a YAML parse: the repo does not depend on PyYAML.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -495,6 +496,52 @@ def test_k0s_overlay_moves_the_seccomp_root_to_the_k0s_kubelet_dir() -> None:
     # chown by the AUTH_SYS uid, not by the client's capabilities, so the non-root
     # file-capability broker cannot hand a sandbox tree to its pooled uid there.
     assert "runAsUser: 0" in out
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_k0s_overlay_sets_a_node_liveness_window_wider_than_placement() -> None:
+    """The overlay must widen the orphan window, and only in the safe direction.
+
+    Two windows read the same "how long since this node last spoke" fact and mean
+    opposite things:
+
+    * ``PLACEMENT_MAX_HEARTBEAT_AGE_S`` (15s, in code) stops *new work* going to a
+      node that went quiet. Being wrong here costs the caller a 502.
+    * ``E2B_NODE_HEARTBEAT_TIMEOUT`` declares the node *gone*, and reaping marks
+      its live sandboxes orphaned -- their route-B slots go with them. Being wrong
+      here loses sandboxes that were fine (the N18 failure).
+
+    So the overlay's window has to be the wider one, and it has to stay wide enough
+    for a worker whose heartbeat is late because it is running a reconcile round
+    (heartbeats and the round share one coroutine: gap = 5s + round). The value was
+    300s while the worker unpacked cold images on its event loop; that path is
+    asynchronous now, so 60s was measured in (docs/k8s-deployment.md §14). This
+    asserts the ordering, not the number: a future edit may retune it, but not
+    invert it, and not drop it below a few heartbeat intervals (5s each).
+    """
+    from control_plane.registry.nodes import PLACEMENT_MAX_HEARTBEAT_AGE_S
+
+    rendered = subprocess.run(
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s-k0s")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    matches = re.findall(
+        r"name: E2B_NODE_HEARTBEAT_TIMEOUT\s+value: \"?([0-9.]+)\"?", rendered.stdout
+    )
+    assert matches, "the k0s overlay must set E2B_NODE_HEARTBEAT_TIMEOUT"
+    assert len(set(matches)) == 1, f"the overlay sets two different windows: {matches}"
+    window = float(matches[0])
+
+    intervals = window / 5.0  # the worker heartbeats every 5s
+    assert intervals >= 3, f"a {window:g}s window is fewer than 3 heartbeat intervals"
+    assert window > PLACEMENT_MAX_HEARTBEAT_AGE_S, (
+        f"the orphan window ({window:g}s) must be wider than the placement window "
+        f"({PLACEMENT_MAX_HEARTBEAT_AGE_S:g}s): stop giving work first, declare the "
+        "node gone later"
+    )
 
 
 def test_seccomp_installer_asks_for_the_minimum() -> None:

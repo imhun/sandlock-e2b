@@ -98,6 +98,7 @@ worker、读 pod 日志）。
 | `deploy/scripts/multinode_smoke.py` | 4 个沙箱 2+2 跨节点，命令 + 文件 + 健康 + stdin | ~8 s |
 | `deploy/scripts/deployment_smoke.py` | 跨 worker 迁移保留文件、网络配置、远端卷隔离、模板构建→worker 拉取→镜像 rootfs、箱内 MCP 经代理 | ~46 s（模板冷启动时更长） |
 | `deploy/scripts/multiworker_interference.py` | **N13**：两副本共用一份 base 不互相破坏（重启一个 worker 后断言树都在、`deleted=0`、幸存者的沙箱照常读写） | ~3.5 min |
+| `deploy/scripts/heartbeat_gaps.py` | 心跳空档：从控制面访问日志算每个节点的真实间隔，与配置的 `E2B_NODE_HEARTBEAT_TIMEOUT` 对比（空档打到窗口就说明活节点被判成 unhealthy）。定/改那个窗口前先跑它 | < 5 s |
 
 跑 N13 那个之前**先把 autoscaler 停掉**（`kubectl -n sandlock scale deploy/autoscaler
 --replicas=0`），它会按需求缩容/扩容，与"重启一个 worker 再看结果"互相干扰。
@@ -111,6 +112,8 @@ worker、读 pod 日志）。
   承载的沙箱记录仍指向旧 id，控制面路由不到**，要等 TTL（登记为 backlog **N20**）。
   要稳定 id 需要 StatefulSet（autoscaler 现在按 Deployment scale，改起来牵连较大）。
   ⚠ 别拿 worker 上报的本地运行时列表当归属声明 —— 它含共享 base 上**所有**树。
-* **共享 base 上做 reconcile 扫描时文件 API 会变慢**（24 s 空闲 / 43 s 负载下），
-  与 N18(a) 同族：重活在事件循环上（backlog **N21**）。
+* **reconcile 轮次仍压在 worker 的事件循环上**（扫描是同步调用，整轮还挂在心跳那个协程里），
+  所以轮次有多长、心跳就断多久（backlog **N21**）。今天 0.19 s/轮、零症状，但它是把
+  `E2B_NODE_HEARTBEAT_TIMEOUT` 降回默认 15 s 的前置（现在是 60 s，见
+  `docs/k8s-deployment.md` §14）。
 * 控制面**仍只能 1 副本**（注册表在进程内，见上一节）。
