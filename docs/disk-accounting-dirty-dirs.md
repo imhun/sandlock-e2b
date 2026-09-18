@@ -533,3 +533,53 @@ ENOENT），而是在 pure 形态、或命名空间隔离被绕过时当第二/�
 
 若三条都接受，镜像就是唯一能在这套共享存储上给出**字节级硬限**的选项（NAS 目录配额被否决之后），
 并且必须把**围栏纪律**（源不可达时拒绝 attach；attach 前确保源已 detach；崩溃残留清理）显式实现并测试。
+
+### 13.3 换成"虚拟块设备"（NBD / iSCSI / RBD）行不行？（2026-09-18 实测前提）
+
+**概念上：行，而且严格强于 raw 镜像。** 三个具体增益：
+
+1. **薄**：后端可以是 **qcow2**——它的稀疏是**格式级**的（分配表 + 懒分配），**不依赖文件系统保真稀疏**
+   ⇒ 正好修掉 raw loop 在这台 NAS 上的硬伤（`truncate -s 256M` 后 `du` 直接 256 MiB）；
+2. **排他/围栏由服务端执行**：nbd-server 天然单客户端、RBD 有 `exclusive-lock` ⇒ §13.2 里那条
+   "围栏纪律"从"协议约定"变成"机制"；
+3. **快照/克隆可以是服务端 O(1)**：qcow2 backing chain / RBD clone ⇒ 正好解决我们量到的
+   "快照 = 整树 copytree ≈ 16 ms/文件"。
+
+**但前提是把 worker 重新提权——这一条是硬前提，且有实测：**
+
+```
+worker pod CapEff      = 00000000a80425fb   (Docker 默认集，没有 CAP_SYS_ADMIN)
+pod 内 /dev/loop-control = 不存在
+pod 内 /dev/nbd*         = 不存在（默认设备集不含任何块设备）
+节点 nbd 模块            = /lib/modules/…/block/nbd.ko.xz 在，但**未加载**
+节点 userspace           = nbd-client / qemu-nbd / nbdkit / qemu-img 全部 MISSING（losetup、mkfs.ext4 有）
+```
+
+⇒ 无论 loop 还是 NBD，都要：**① 给 worker 加 `CAP_SYS_ADMIN`（或 privileged）、② 放行块设备（device cgroup +
+设备节点）、③ NBD 还要在节点上加载 `nbd` 模块**。而仓库里现有的 host 级 helper（`seccomp-installer`）
+注释写着 *"no privileged, no caps"* 且 `capabilities: drop: [ALL]` —— 也就是说**新增一个特权组件/
+给 worker 提权，与这套代码库既有的安全姿态方向相反**（这正是 A6 当初移除 `SYS_ADMIN` 的意图）。
+
+**它**不**能免掉的那笔账**（与 §13.2 相同）：一个**守护进程**（每沙箱一个 ⇒ 进程/内存开销与新故障域；
+每节点一个 ⇒ 该节点所有沙箱的 I/O 都要过它）、传输开销（unix socket/TCP vs 本地块设备）、
+`nbd-client`/`qemu-nbd` 要进 worker 镜像，以及**"工作区不再是目录"那套重构**（GC、L2b 扫描、
+快照 payload、模板 `copytree`、CP 直接读树）。
+
+**自建选项排序**（前提：不要云 API）：
+
+| 想拿到的 | 唯一/最优解 | 代价 |
+|---|---|---|
+| **只要"写不进去"（树级硬限）** | **NAS 目录配额** | 云 API 依赖（唯一被否决的点）；不动工作区形态、零运行时成本 |
+| 硬限 **+ 薄 + 快照克隆 + 服务端排他** | **qcow2 + NBD**（**不是 raw loop**——后者在这台 NAS 上不瘦） | 上面三条提权前提 + 守护进程 + "不是目录"重构 |
+| 硬限 + 薄 + 零守护进程，但可放弃共享 | 本地 XFS + prjquota | 破坏"共享卷是硬需求" |
+| 最完整（thin + exclusive-lock + clone + 仲裁） | Ceph RBD | 运维一套分布式存储（≥3 节点；我们只有 2 台）⇒ 现在不现实 |
+
+**建议**：先把那个前提问题定下来——**是否需要树级"写不进去"**。若需要，第一步不是写代码，而是做一次
+**可行性 spike**（在**一台**节点上用临时特权 helper 验通）：`modprobe nbd` → `qemu-nbd` 起 qcow2 →
+`nbd-client -unix` attach → `mkfs.ext4` → bind 进一个沙箱，并量三个数：
+
+1. **薄**：新建 1 GiB qcow2 的 `du`、写入 100 MiB 之后的 `du`；
+2. **吞吐**：对比 NFS 直写与 raw loop（后者已测 **+35%**）；
+3. **生命周期**：attach/detach 延迟、崩溃残留与重启恢复（含 ext4 journal 回放）。
+
+这三个数出来，"镜像/块设备"这条线才有资格进方案比较。
