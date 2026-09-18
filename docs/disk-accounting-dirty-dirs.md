@@ -583,3 +583,55 @@ pod 内 /dev/nbd*         = 不存在（默认设备集不含任何块设备）
 3. **生命周期**：attach/detach 延迟、崩溃残留与重启恢复（含 ext4 journal 回放）。
 
 这三个数出来，"镜像/块设备"这条线才有资格进方案比较。
+
+**✅ Spike 已跑完（2026-09-18，见 §13.4）**，三个数都有了，而且结论比预期清楚：
+
+* 薄 ✅（空 1 GiB qcow2 = **196 KB**；写 100 MiB → 101.6 MiB，无放大）；
+* 吞吐 ✅ **+15–20%**（`--cache=none` 只比 writeback 慢 5%；上一版记的 raw loop +35% 未复现）；
+* 崩溃 ✅ **可恢复**（`kill -9` 服务端后写请求 EIO、`umount`/detach/reattach 正常、ext4 journal 回放成功、
+  未 fsync 的尾部丢失）；
+* ❌ **但配额语义冲突**：这台 NFS **不支持打洞**（`fallocate -p` → "keep size mode is unsupported"），
+  `fstrim` 报了 973 MiB 而 `du` 不降 ⇒ **镜像占用 = 高水位，删除不退还空间**。
+  ⇒ 决定权落在一个语义问题上：`diskMB` 能不能是**峰值口径**。能 ⇒ 镜像（qcow2+NBD）可行；
+  不能 ⇒ 维持 `RLIMIT_FSIZE` + 记账软闸门，或重新评估 NAS 目录配额。
+
+### 13.4 Spike 结果：qcow2-over-NBD 在真 NAS 上的实测（2026-09-18，`0.1.0-369`）
+
+方法：在 `.94` 上起一个**临时特权 pod**（宿主 `/dev`、`/lib/modules`、共享 NAS PVC），
+`modprobe nbd` → `qemu-nbd` 起 qcow2 → `nbd-client -unix` → `mkfs.ext4` → mount → 量数据。
+跑完即删（进程/挂载/设备/pod/`/nas/_spike*` 全清，**宿主 `nbd` 模块已 `rmmod`**）。
+
+| 项 | 实测 |
+|---|---|
+| **空 1 GiB qcow2 占用** | **196 KB**（同尺寸 raw = 1 GiB）⇒ 薄是**格式级**的，不依赖 NFS 稀疏 |
+| 写 100 MiB 之后 | **101.6 MiB**（≈1:1，无放大） |
+| **删除后是否回收** | ❌ **不回收**：`fstrim` 报 trimmed 973 MiB 但 `du` 仍 101 MiB；`fallocate -p` 直接 **"keep size mode is unsupported"** ⇒ **这台 NFS export 不支持打洞**，镜像占用 = **高水位** |
+| 吞吐（128 MiB + fsync） | NFS 直写 392/414/462 ms；qcow2+`writeback` 465/477/493；qcow2+`none` **497**；raw loop 374/379/380 |
+| 生命周期 | qcow2 建 231 ms、attach **113 ms**、mount **12 ms**、detach **3 ms** |
+| 服务端排他 | 第二客户端**拿不到**（挂起在协商，需客户端超时/重试策略） |
+| **崩溃恢复**（`kill -9` 服务端，FS 已挂载） | 后续写 **EIO**（不永久挂死）；`umount -f`/detach/reattach 全部成功；**ext4 remount OK（journal 回放）**；已 fsync 的 32 MiB **完整**，未 fsync 的 8 MiB **丢失** ⇒ **可恢复，损失限于最后未落盘部分** |
+| 前置条件 | privileged pod + 宿主 `/dev` + `/lib/modules` + `modprobe nbd`（worker 容器 CapEff 无 `CAP_SYS_ADMIN`，实测） |
+
+**两个中途被推翻的假设**（写在这里免得后人重走）：
+
+1. 我先看到"`kill -9` 后 remount 失败、can't read superblock"，据此猜是 `--cache=writeback` 的锅——
+   **错**。那是我的 harness 先在未真正杀死服务端的情况下又起了一个 qemu-nbd，**两个服务端同时打开同一
+   个 qcow2**（正是这条路线必须杜绝的事）。v6 修好后，**两种 cache 模式都能恢复**，且 `none` 只比
+   `writeback` 慢 5%（497 vs 472 ms）；
+2. 上一版记的 raw loop **+35%** 吞吐代价在这次同机同负载下**没有复现**（raw loop 374–380 ms，
+   甚至略快于 NFS 直写 392–462 ms）。数字以本节为准，§4.1 的 +35% 只作为当时的单点观测。
+
+**结论（是否值得走这条路）**：
+
+* ✅ **技术上可行且崩溃可恢复**：薄（空 196 KB）、生命周期毫秒级、ext4 journal 能自愈、
+  未 fsync 的尾部丢失是可接受的"最后几秒"语义；
+* ✅ 吞吐代价 **+15–20%**（比我上一轮说的 +35% 好；且 `--cache=none` 的额外成本只有 5%）；
+* ❌ **与本项目的配额语义冲突**：`diskMB` 是**存量**（删文件应当退还额度），而这台 NFS
+  **不回收打洞空间** ⇒ 镜像占用 = 高水位。50 GiB 卷容纳的是"**曾经写过的总量**"（50 个 1 GiB 高水位），
+  不是 50 个"当前各 1 GiB"的沙箱。缓解只有：定期压缩（要停箱 + 整份拷贝）、
+  或**把配额口径改成"峰值"并写进 API 文档**；
+* ❌ 仍需付：特权前提（privileged/SYS_ADMIN + 设备 + 宿主 `modprobe`）与"工作区不再是目录"的整套改造。
+
+⇒ **决定权现在落在一个语义问题上**：`diskMB` 能不能是**峰值口径**（写多少算多少，删了不退）。
+能接受 ⇒ 镜像是共享 NAS 下唯一能给出字节级 ENOSPC 的路（qcow2+NBD，**不是 raw loop**）；
+不能接受 ⇒ 维持 `RLIMIT_FSIZE` + 记账软闸门，或重新评估 NAS 目录配额。
