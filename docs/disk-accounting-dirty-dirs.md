@@ -52,11 +52,13 @@
    不是主风险。真正的缺口是"**谁在写**"而不是"**哪台机器在写**"：worker 会**代沙箱写树**，
    而这些写**根本不经过沙箱的 seccomp 牢**，mediator 看不见：
 
-   | 牢外写者 | 频率 | 依据 |
+   | 牢外写者 | 频率 | 依据（**实测判据**：看宿主 uid —— 沙箱进程写的文件是 `10000:…`，worker 代写的是 `0:65534`） |
    |---|---|---|
-   | **SDK 文件上传**（`sb.files.write(...)`） | 每次上传 | `envd_service/http/files.py:177-182`：worker 自己的进程 `stream_body_to_file` + `os.replace`（不在牢里） |
-   | **命令日志** `command-logs.jsonl` | **每条命令** | `envd_service/process/logs.py:36`，由 worker 的 `runtime/context.py:316` 实例化并 append —— 这是树里的稳定写入者 |
-   | **provision 期物化**：卷挂载点 symlink、快照 `copytree` | 建箱/迁移 | `envd_service/volumes.py:380-386`（`target.symlink_to(...)` 写在树内）、`agent.py:2017-2021` |
+   | **SDK 文件上传**（`sb.files.write(...)`） | 每次上传 | 实测上传落到 `<tree>/home/user/upload.bin` 且属主 `0:65534`（= worker），沙箱内 `echo > cmd.txt` 是 `10000:10000`。代码：`envd_service/http/files.py:177-182`，worker 自己的进程 `stream_body_to_file` + `os.replace`；`files.py:30` 的 W6 注释明说 worker 是"用自己的 group 身份去够这些条目" |
+   | **命令日志** `command-logs.jsonl` | **每条命令** | 实测属主 `0:65534`（worker），而沙箱自己写的文件是 `10000:10000`。代码：`envd_service/process/logs.py:36`，由 worker 的 `runtime/context.py:316` 实例化并 append |
+
+   这两条都在**运行期**，所以必须在写点标脏；它们**不是**"沙箱自己没写"的推论，而是 uid 实测。
+   （`sandbox.json` 同样是 `0:65534`，即 worker 写的。）
 
    处置**便宜且精确**：这些写点**全是我们自己的代码** ⇒ 在写点直接标脏（零成本、无需推断），
    比"靠对账兜"既准又快。**不要**把它们留给对账。
@@ -66,6 +68,9 @@
    分区后在另一节点重 provision：写者换了，**新宿主的 mediator/脏集合没有旧基线**。
    处置是**事件驱动**的：**在 provision 完成时做一次全树 walk 建基线**（窗口 = 0），而不是靠
    低频对账慢慢追。
+   **注意这不是"漏记的写"**：建箱/迁移期的物化（快照 `copytree`、卷挂载点 symlink）发生在
+   provision 之内、在基线之前，所以它不构成盲区——把它列进"牢外写者"是上一版的错误。
+   真正需要记账的是**运行期**的牢外写者（§3 第 1 条那两条）。
 
 3. **带外写**（末位，也是唯一可能真跨机的）—— 运维在别的 pod 里改数据、平台 GC。
    实测：worker-0 在 `.94` 写、watcher 在 `.140` 时 **0 事件**（文件确实存在）。
@@ -115,9 +120,10 @@
 * **基线重建是事件驱动的**（§3 第 2 条）：`provision` 完成时、以及每次接管一棵已有树时
   （迁移冷启动、worker 重启后 reconcile 到本地 runtime）各建一次 —— 这样"换宿主"的窗口是 0，
   不需要靠对账去追；
-* **牢外写者由写点自己标脏**（§3 第 1 条）：SDK 上传（`http/files.py`）、命令日志
-  （`process/logs.py`）、provision 物化（`volumes.py` / `agent.py`）都调同一个
-  `mark_dir_dirty()`；这些是**我们自己的代码**，标脏精确且零成本，别留给对账；
+* **牢外写者由写点自己标脏**（§3 第 1 条）：SDK 上传（`http/files.py`）与命令日志
+  （`process/logs.py`）都调同一个 `mark_dir_dirty()`；这些是**我们自己的代码**，标脏精确且
+  零成本，别留给对账。**provision 期的物化不需要标脏**——它在基线之前，由 §3 第 2 条的重建
+  覆盖；
 * 每轮（沿用 `E2B_DISK_ENFORCE_INTERVAL_S`，默认 30 s）：`drain_dirty_dirs()` → 只重扫脏目录
   （`os.scandir`，一个目录一次 readdirplus ≈ **2.4 ms**）→ 更新 ledger → 交给已上线的
   `enforce_disk_budget()`；
@@ -165,6 +171,11 @@
 * 牢外写者漏标（改成"写点不该标脏"）⇒ 账偏小 ⇒ 该暂停没暂停 ⇒ 靠写点标脏 + 对账纠；
 * 带外增长 ⇒ 账偏小 ⇒ 只有对账能纠 ⇒ 对账间隔要写进用户可见文案（"最迟 N 分钟被暂停"）；
 * 带外删除/缩小 ⇒ 账停在旧值 ⇒ 可能误暂停（对账后自愈，且暂停可恢复、不丢现场）；
+* **顺手记一个与本方案无关、但同一轮测出来的既有行为**：SDK 的绝对路径是**相对树根**解析的
+  （`gateway_common/paths.py:11`"Absolute user paths are treated as relative to the root"），
+  所以 `sb.files.write("/home/user/x")` 落到 `<tree>/home/user/x`（沙箱里看到
+  `/home/user/home/user/x`）。这与上游 E2B 的语义不同，值得单独排查（不影响配额账，但会让人
+  以为"文件没写进去"）；
 * 误标 ⇒ 多算 ⇒ 误暂停 ⇒ 用"只标改变大小的操作"约束，并在属性测试里钉住；
 * 回退：关开关即回到今天已上线的整树 walk，**无数据迁移**。
 
