@@ -1307,7 +1307,8 @@ stdin），然后只做**读**回填响应。路径语义不变（`/foo` 仍然�
 
 取值 = **这个沙箱被卖过的最大额度**（`diskMB` 与各挂载卷 `perSandboxQuotaMb` 取大），
 所以它**永远不会拒绝一个合法大小**；任何一维是"不限"（0）时不设限（编不出一个诚实的数）。
-因为它是 per-process，顺带也管住沙箱往 `/tmp`（镜像 rootfs 内）和卷里写的东西。
+因为它是 per-process，口径上还覆盖"沙箱写的任何文件"；在本形态里可写面就是**工作区树 + 挂载的卷**
+（镜像 rootfs 对沙箱是只读的：实测写 `/tmp` 得到 `Permission denied`）。
 
 **④ 记账收口（D）**：见 §21.1 的两条（`diskUsed` 真实值 + 暂停原因进文案）。部署清单里
 显式写上 `E2B_DISK_ENFORCE_INTERVAL_S=30`（`deploy/k8s/worker.yaml`）。
@@ -1316,3 +1317,21 @@ stdin），然后只做**读**回填响应。路径语义不变（`/foo` 仍然�
 > → **暂停真的停住**（A）→ **谁在写只有一个身份**（B）→ **单文件不可能越过被卖的额度**（C）。
 > 仍然没有的是**写到一半的 ENOSPC**（per-write），它需要写路径中介记账，见
 > `docs/disk-accounting-dirty-dirs.md` §13。
+
+### 22.1 集群验收（2026-09-19，`0.1.0-388-ge76d38e-20260919-010638`）
+
+`tmp/k0s/probe_n28_acceptance.py`（可复跑，逐条打印证据）全绿，实测输出要点：
+
+| 项 | 实测 |
+|---|---|
+| B：上传的身份 = 沙箱自己命令的身份 | `uploaded=10000:10000`、`by_command=10000:10000`（平台建的条目是 `10000:65534`，gid 即"谁创建的"） |
+| B：写不排在用户命令后面 | 一个 `sleep 25` 占着命令闸门时，写 **0.14 s** 完成 |
+| A：上传被拒 | `SandboxException: 409: Sandbox is paused; its files can only be modified while it is running (resume it first)` |
+| A：新命令被拒 | `Code.FAILED_PRECONDITION: …`（SDK 对未映射 code 的渲染，前缀是它的） |
+| A：读不受影响 | `files.read` / `files.list` 照常；`connect` 后同一个写成功 |
+| C：单文件越界 | `dd … count=1200` → `rc=1`、`dd: error writing '…': File too large`、文件停在 **1024.0 MiB**、**沙箱还活着**（`echo alive` OK） |
+| D：实测值进 API | `diskUsed` 从 0 → **169 B**（首次扫描）→ 超限后 **1200.0 MiB** |
+| D：暂停原因 | 拒绝文案带 `its workspace grew past its budget (1200 MiB used of 1024 MiB)`；`GET /sandboxes/{id}/logs` 有同一行 |
+
+另外 `deploy/scripts/deployment_smoke.py` 与 `multinode_smoke.py` 均通过（含命令、文件、迁移、
+网络、卷、模板构建、MCP 网关六条路径 —— 也就是**写路径改走沙箱之后**的全链路）。
