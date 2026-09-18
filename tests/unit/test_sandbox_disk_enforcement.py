@@ -69,13 +69,16 @@ def test_worker_reports_the_bytes_it_wrote(workspace):
         workspace_dir=tree,
     )
 
-    # The tree also holds the runtime's own ``sandbox.json``, so the expected
-    # number is a walk of the same tree rather than the 4096 the test wrote.
+    # The tree holds *only* what the sandbox wrote: the runtime record lives
+    # beside it in ``_runtime/<id>/`` (the platform/workspace split), so the
+    # measured number is exactly the user's data -- platform bookkeeping no
+    # longer counts against the sandbox's disk budget.
     expected = sum(
         path.stat().st_size for path in Path(tree).rglob("*") if path.is_file()
     )
     assert registry.disk_usage_snapshot() == {"sbx_disk_a": expected}
-    assert expected > 4096
+    assert expected == 4096
+    assert not (Path(tree) / "sandbox.json").exists()
 
 
 def test_a_scan_addresses_every_tree_in_turn(workspace):

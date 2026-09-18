@@ -201,10 +201,14 @@ def test_registry_persists_host_uid(tmp_path):
         workspace_dir=str(tmp_path / "sbx_a"),
         host_uid=POOL_START,
     )
-    payload = json.loads(
-        (tmp_path / "sbx_a" / "sandbox.json").read_text(encoding="utf-8")
-    )
+    # The record lives beside the tree (``_runtime/<id>/``) since the split:
+    # inside the tree it was a file the sandbox itself could unlink and
+    # rewrite, and it must not be able to touch the platform's copy.
+    record_path = tmp_path / "_runtime" / "sbx_a" / "sandbox.json"
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
     assert payload["host_uid"] == POOL_START
+    assert not (tmp_path / "sbx_a" / "sandbox.json").exists()
+    assert stat.S_IMODE(record_path.parent.stat().st_mode) == 0o700
     loaded = RuntimeRegistry(tmp_path).get("sbx_a")
     assert loaded is not None
     assert loaded.host_uid == POOL_START

@@ -14,6 +14,8 @@ from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings as ControlSettings
 from envd_service.config import Settings as EnvdSettings
 
+from gateway_common.paths import sandbox_record_path
+
 META_LIMIT = 256
 ENV_LIMIT = 256
 BODY_LIMIT = 1024
@@ -161,7 +163,10 @@ async def test_sandbox_json_stays_bounded(
     )
     assert created.status_code == 201
     sandbox_id = created.json()["sandboxID"]
-    record_path = workspace / sandbox_id / "sandbox.json"
+    # The record is a platform file: it lives beside the tree (``_runtime/``),
+    # not inside it, so the E5.3 bound covers what the worker writes rather
+    # than what the sandbox could rewrite.
+    record_path = sandbox_record_path(workspace, sandbox_id)
     assert record_path.is_file()
     size = record_path.stat().st_size
     # 256B metadata + 256B envVars plus record envelope must stay well under

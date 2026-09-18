@@ -52,7 +52,11 @@ from typing import Any
 import fcntl
 
 from envd_service import priv_helpers
-from gateway_common.paths import is_sandbox_workspace_dir, validate_sandbox_id
+from gateway_common.paths import (
+    is_sandbox_workspace_dir,
+    sandbox_record_path,
+    validate_sandbox_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,10 +125,19 @@ def _pool_range(start: int, size: int) -> set[int]:
 
 
 def _recorded_uid(workspace_base: str | Path, sandbox_id: str) -> int | None:
-    """``host_uid`` persisted for one sandbox, or None."""
-    record_path = Path(workspace_base) / sandbox_id / "sandbox.json"
+    """``host_uid`` persisted for one sandbox, or None.
+
+    Reads the platform's copy (``_runtime/<id>/sandbox.json``), falling back to
+    the pre-split in-tree location. This is the *fallback* allocator's input:
+    the control plane owns the fleet-wide allocation (OBS-9), and the tree copy
+    is the very file a sandbox can rewrite, which is why it is no longer
+    consulted first.
+    """
+    record_path = sandbox_record_path(workspace_base, sandbox_id)
     if not record_path.is_file():
-        return None
+        record_path = sandbox_record_path(workspace_base, sandbox_id, legacy=True)
+        if not record_path.is_file():
+            return None
     try:
         payload = json.loads(record_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

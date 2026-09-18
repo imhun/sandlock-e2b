@@ -9,6 +9,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from gateway_common.paths import sandbox_record_path
+
 import envd_service.agent as agent
 import envd_service.xfs_quota as xfs_quota
 from envd_service.app import create_app as create_envd_app
@@ -116,7 +118,7 @@ async def test_create_provisions_quota_and_persists_project_id(workspace, monkey
     record = app.state.runtime_registry.get("sbx_quota1")
     assert record is not None
     assert record.project_id == 42
-    record_path = workspace / "sbx_quota1" / "sandbox.json"
+    record_path = sandbox_record_path(workspace, "sbx_quota1")
     payload = json.loads(record_path.read_text(encoding="utf-8"))
     assert payload["project_id"] == 42
     assert (workspace / "sbx_quota1" / "workspace").is_dir()
@@ -248,7 +250,7 @@ async def test_create_reprovision_failure_persists_none_after_cleanup(
     assert record is not None
     assert record.project_id is None
     payload = json.loads(
-        (workspace / "sbx_reprov_fail" / "sandbox.json").read_text(
+        sandbox_record_path(workspace, "sbx_reprov_fail").read_text(
             encoding="utf-8"
         )
     )
@@ -282,6 +284,10 @@ async def test_delete_releases_project_and_removes_dir(
     workspace, monkeypatch, disk_read_backend
 ):
     app = _make_app(workspace)
+    # The tree is the worker's own doing (``_agent_create_sandbox`` makes it);
+    # ``register`` writes only the platform's record, which lives beside the
+    # tree since the platform/workspace split.
+    (workspace / "sbx_del").mkdir(parents=True, exist_ok=True)
     app.state.runtime_registry.register(
         sandbox_id="sbx_del",
         access_token="tok",
@@ -332,6 +338,9 @@ async def test_delete_refuses_a_record_pointing_at_another_tree(
     victim_dir = workspace / "custom" / "sbx_victim"
     victim_dir.mkdir(parents=True)
     (victim_dir / "payload.bin").write_bytes(b"another tenant's data")
+    # The liar's own tree exists too (the worker creates it); the refusal is
+    # about the record pointing at the *victim* instead.
+    (workspace / "sbx_relocated").mkdir(parents=True, exist_ok=True)
     app.state.runtime_registry.register(
         sandbox_id="sbx_relocated",
         access_token="tok",
@@ -365,6 +374,7 @@ async def test_delete_refuses_a_record_pointing_at_another_tree(
 
 async def test_delete_keep_files_skips_release_and_keeps_dir(workspace, monkeypatch):
     app = _make_app(workspace)
+    (workspace / "sbx_keep").mkdir(parents=True, exist_ok=True)
     app.state.runtime_registry.register(
         sandbox_id="sbx_keep",
         access_token="tok",
@@ -383,13 +393,14 @@ async def test_delete_keep_files_skips_release_and_keeps_dir(workspace, monkeypa
     assert response.status_code == 204
     assert calls == []
     assert (workspace / "sbx_keep").is_dir()
-    assert (workspace / "sbx_keep" / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, "sbx_keep").is_file()
 
 
 async def test_delete_cleanup_failure_degrades_with_warning(
     workspace, monkeypatch, caplog, disk_read_backend
 ):
     app = _make_app(workspace)
+    (workspace / "sbx_cleanup_fail").mkdir(parents=True, exist_ok=True)
     app.state.runtime_registry.register(
         sandbox_id="sbx_cleanup_fail",
         access_token="tok",

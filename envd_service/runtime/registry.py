@@ -1,14 +1,18 @@
 """Sandbox runtime registry.
 
 The control plane registers each sandbox (workspace directory, access token,
-env vars, image, policy params). Records are persisted as ``sandbox.json``
-inside the sandbox workspace so the envd service can run as a separate
-process sharing the workspace volume.
+env vars, image, policy params). Records are persisted as
+``<base>/_runtime/<id>/sandbox.json`` -- *next to* the sandbox's tree, never
+inside it, so the envd service (a separate process sharing the workspace
+volume) can read them while the sandbox itself cannot: it owns its tree
+directory and could otherwise unlink and rewrite its own record.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -16,7 +20,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from gateway_common.paths import validate_sandbox_id
+from gateway_common.paths import (
+    sandbox_record_path,
+    sandbox_runtime_dir,
+    validate_sandbox_id,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -112,6 +122,12 @@ class RuntimeRegistry:
         #: N25/L2b: where the next ``disk_usage_snapshot`` round starts, so a
         #: scan budget that runs out does not always starve the same trees.
         self._disk_scan_cursor = 0
+        # Best-effort, idempotent migration of records that still live inside
+        # their sandbox tree (pre-split fleets); never fatal at startup.
+        try:
+            self.adopt_legacy_records()
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("legacy record adoption failed", exc_info=True)
 
     def add_unregister_callback(self, callback) -> None:
         """Invoke ``callback(sandbox_id)`` after a sandbox is unregistered."""
@@ -200,7 +216,36 @@ class RuntimeRegistry:
         return usage
 
     def _record_path(self, sandbox_id: str) -> Path:
-        return self._workspace_base / sandbox_id / "sandbox.json"
+        """Where this sandbox's runtime record is written.
+
+        ``_runtime/<id>/sandbox.json`` -- outside the sandbox's own tree. The
+        tree is the sandbox's to own (it must be able to write its workspace),
+        which also means it can unlink anything inside it, so the platform's
+        record cannot live there and stay trustworthy. Readers still fall back
+        to the old in-tree location; :meth:`adopt_legacy_records` moves it.
+        """
+        return sandbox_record_path(self._workspace_base, sandbox_id)
+
+    def _legacy_record_path(self, sandbox_id: str) -> Path:
+        return sandbox_record_path(self._workspace_base, sandbox_id, legacy=True)
+
+    def _ensure_runtime_dir(self, sandbox_id: str) -> Path:
+        """Create ``_runtime/<id>``, owned by the worker and closed to sandboxes.
+
+        ``0700`` on purpose: the per-sandbox host uid is not the owner and is
+        (by the E3.2 model) not in the worker's group either, so the sandbox
+        cannot traverse into it -- not to read the record, and not to delete
+        it. Ownership follows whoever runs the worker (root in the production
+        shape), never the sandbox uid.
+        """
+        path = sandbox_runtime_dir(self._workspace_base, sandbox_id)
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path, 0o700)
+            os.chown(path, os.geteuid(), os.getegid())
+        except OSError:  # pragma: no cover - best effort, like the modes above
+            pass
+        return path
 
     @property
     def workspace_base(self) -> Path:
@@ -264,11 +309,16 @@ class RuntimeRegistry:
             self._tombstones.pop(sandbox_id, None)
             self._records[sandbox_id] = record
             try:
+                self._ensure_runtime_dir(sandbox_id)
                 path = self._record_path(sandbox_id)
-                path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(
                     json.dumps(record.to_dict(), separators=(",", ":")), encoding="utf-8"
                 )
+                # The in-tree copy was the pre-split location and is still
+                # writable by the sandbox itself; once the authoritative copy
+                # exists outside the tree, drop it rather than leave a
+                # forgeable second version behind.
+                self._legacy_record_path(sandbox_id).unlink(missing_ok=True)
             except OSError:
                 pass
         return record
@@ -335,8 +385,17 @@ class RuntimeRegistry:
         return self._load_from_disk(sandbox_id)
 
     def _load_from_disk(self, sandbox_id: str) -> RuntimeSandbox | None:
-        """Parse ``<base>/<id>/sandbox.json``; ``None`` when unusable."""
+        """Parse the runtime record; ``None`` when unusable.
+
+        Prefers ``_runtime/<id>/sandbox.json`` and falls back to the legacy
+        in-tree copy (see :meth:`adopt_legacy_records`), so a worker rolling
+        onto a fleet that still has pre-split trees can still adopt them.
+        """
         path = self._record_path(sandbox_id)
+        if not path.is_file():
+            legacy = self._legacy_record_path(sandbox_id)
+            if legacy.is_file():
+                path = legacy
         try:
             if not path.is_file():
                 return None
@@ -358,6 +417,47 @@ class RuntimeRegistry:
                 pass
         return record
 
+    def adopt_legacy_records(self) -> list[str]:
+        """Move pre-split in-tree records into ``_runtime/``.
+
+        Idempotent, and safe to call at startup: for every sandbox tree that
+        still carries its own ``sandbox.json`` and has no runtime copy yet, the
+        file is moved (not copied) into ``_runtime/<id>/``. After this the
+        platform's record is out of the sandbox's reach, which is the whole
+        point of the split -- a sandbox can delete and rewrite files inside its
+        own tree, so a record left there is a record it can forge.
+
+        The moved file carries whatever the sandbox left behind, so adoption
+        logs it: a forged record is frozen here rather than trusted, and the
+        fleet-level values it might lie about (``host_uid``, volume slices) are
+        owned by the control plane's record store, not by this file.
+        """
+        adopted: list[str] = []
+        try:
+            entries = list(self._workspace_base.iterdir())
+        except OSError:
+            return adopted
+        for entry in entries:
+            if not validate_sandbox_id(entry.name) or not entry.is_dir():
+                continue
+            legacy = self._legacy_record_path(entry.name)
+            if not legacy.is_file() or self._record_path(entry.name).is_file():
+                continue
+            try:
+                self._ensure_runtime_dir(entry.name)
+                os.replace(legacy, self._record_path(entry.name))
+            except OSError:
+                continue
+            logger.warning(
+                "adopted the pre-split record of %s into _runtime/ (its "
+                "contents came from a file the sandbox could rewrite; the "
+                "authoritative host uid and volume slices live in the control "
+                "plane)",
+                entry.name,
+            )
+            adopted.append(entry.name)
+        return adopted
+
     def unregister(self, sandbox_id: str) -> None:
         if not validate_sandbox_id(sandbox_id):
             return
@@ -374,6 +474,10 @@ class RuntimeRegistry:
                     callback(sandbox_id)
                 except Exception:
                     pass
+        # Deliberately *not* removing ``_runtime/<id>`` here: unregister also
+        # runs when a teardown is refused, and the record has to stay on disk
+        # for the next delete to verify against (review W7). It is removed
+        # together with the tree, by whoever removes the tree.
 
     def set_state(self, sandbox_id: str, state: str) -> None:
         if not validate_sandbox_id(sandbox_id):

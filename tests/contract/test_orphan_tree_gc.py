@@ -29,6 +29,8 @@ import threading
 import time
 from pathlib import Path
 
+from gateway_common.paths import sandbox_record_path
+
 import httpx
 import pytest
 
@@ -261,19 +263,26 @@ def _tree(
     created_at: float | None = 1_600_000_000.0,
     mtime: float | None = None,
     record_text: str | None = None,
+    legacy_record: bool = False,
 ) -> Path:
-    """Write a sandbox tree (``<base>/<id>/sandbox.json``) on disk.
+    """Write a sandbox tree and its record on disk.
 
     ``created_at=None`` omits the key entirely, the shape of the trees
     written before the field existed (2026-09-02). ``mtime`` sets the
     ``sandbox.json`` modification time, which is what those legacy records
-    have to fall back to.
+    have to fall back to. The record itself lives in ``_runtime/<id>/`` since
+    the platform/workspace split (inside the tree it was a file the sandbox
+    could rewrite); ``legacy_record=True`` writes it in the old in-tree place
+    instead, which is what the read-fallback has to keep honouring.
     """
     sandbox_dir = workspace / sandbox_id
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     (sandbox_dir / "workspace").mkdir(exist_ok=True)
+    record_path = (
+        sandbox_record_path(workspace, sandbox_id, legacy=legacy_record)
+    )
     if record_text is not None:
-        record_path = sandbox_dir / "sandbox.json"
+        record_path.parent.mkdir(parents=True, exist_ok=True)
         record_path.write_text(record_text, encoding="utf-8")
         if mtime is not None:
             os.utime(record_path, (mtime, mtime))
@@ -302,7 +311,7 @@ def _tree(
         ]
     if created_at is not None:
         payload["created_at"] = created_at
-    record_path = sandbox_dir / "sandbox.json"
+    record_path.parent.mkdir(parents=True, exist_ok=True)
     record_path.write_text(json.dumps(payload), encoding="utf-8")
     if mtime is not None:
         os.utime(record_path, (mtime, mtime))
@@ -633,7 +642,7 @@ async def test_restart_reports_the_live_tree_instead_of_stranding_it(
     # The live sandbox keeps its record, its tree and its quota row.
     assert registry.get(sandbox_id).state == "running"
     assert sandbox_dir.exists()
-    assert (sandbox_dir / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, sandbox_id).is_file()
     assert quota.rows == {STRANDED_PROJID: 8}
     assert quota.reconcile_calls == []
     assert summary == {
@@ -832,7 +841,7 @@ async def test_kill_while_the_hosting_worker_is_down_is_reclaimed_on_the_next_st
         registry.get(sandbox_id)
     # The remote teardown could not reach the worker, so nothing was removed.
     assert sandbox_dir.exists()
-    assert (sandbox_dir / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, sandbox_id).is_file()
     assert quota.rows == {STRANDED_PROJID: 8}
 
     agent = _agent(workspace)
@@ -887,7 +896,7 @@ async def test_gc_protects_paused_migrating_and_reserved_entries(
         )
     assert stopped.status_code == 204
     assert migrating_dir.exists()
-    assert (migrating_dir / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, migrating_id).is_file()
 
     # Reserved infrastructure, a symlink and a plain file are not sandboxes.
     snapshot_marker = workspace / "_snapshots" / "snap_a" / "fs" / "marker.txt"
@@ -910,10 +919,10 @@ async def test_gc_protects_paused_migrating_and_reserved_entries(
         summary = await agent._reconcile_with_control_plane(raw, _headers())
 
     assert paused_dir.exists()
-    assert (paused_dir / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, paused_id).is_file()
     assert registry.get(paused_id).state == "paused"
     assert migrating_dir.exists()
-    assert (migrating_dir / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, migrating_id).is_file()
     assert registry.get(migrating_id).state == "running"
     assert snapshot_marker.read_text(encoding="utf-8") == "snapshot data"
     assert symlink.is_symlink()
@@ -1049,7 +1058,9 @@ async def test_a_client_chosen_prefixed_id_is_reclaimed_not_stranded(
     orphan_id = "sbx_stranded"
     orphan_dir = _tree(workspace, orphan_id, project_id=STRANDED_VOLUME_PROJID)
     # The real API's record for such an id, as the review logged it.
-    record = json.loads((chosen_dir / "sandbox.json").read_text(encoding="utf-8"))
+    record = json.loads(
+        sandbox_record_path(workspace, chosen_id).read_text(encoding="utf-8")
+    )
     assert record["sandbox_id"] == chosen_id
     assert record["workspace_dir"] == str(chosen_dir)
 
@@ -1137,9 +1148,14 @@ async def test_a_whole_tree_copy_under_a_snapshot_id_is_refused(
     snap_id = "snap_0040ce7e44f6365f"
     copied_dir = workspace / snap_id
     shutil.copytree(source_dir, copied_dir, symlinks=True)
-    copied_record = json.loads(
-        (copied_dir / "sandbox.json").read_text(encoding="utf-8")
+    # A *pre-split* whole-tree copy: the record travelled with the tree then.
+    # (Since the platform/workspace split a plain copy carries no record at
+    # all, so this shape only arises from an older worker's tree.)
+    copied_record_path = copied_dir / "sandbox.json"
+    shutil.copy2(
+        sandbox_record_path(workspace, source_id), copied_record_path
     )
+    copied_record = json.loads(copied_record_path.read_text(encoding="utf-8"))
     assert copied_record["sandbox_id"] == source_id
     assert copied_record["workspace_dir"] == str(source_dir)
 
@@ -1159,7 +1175,7 @@ async def test_a_whole_tree_copy_under_a_snapshot_id_is_refused(
         summary = await agent._reconcile_with_control_plane(raw, _headers())
 
     assert copied_dir.exists()
-    assert (copied_dir / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, source_id).is_file()
     assert quota.rows == {VICTIM_PROJID: 8}
     assert quota.released == []
     assert summary == {
@@ -1855,7 +1871,7 @@ async def test_legacy_shaped_record_with_a_fresh_tree_is_still_a_concurrent_crea
         summary = await agent._reconcile_with_control_plane(raw, _headers())
 
     assert sandbox_dir.exists()
-    assert (sandbox_dir / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, sandbox_id).is_file()
     assert quota.rows == {8002: 8}
     assert summary["deleted"] == []
     assert summary["concurrent_creates"] == [sandbox_id]
@@ -1962,7 +1978,9 @@ async def test_record_pointing_at_another_tree_is_refused(
     tamper_dir = workspace / tamper_id
     (tamper_dir / "workspace").mkdir(parents=True)
     victim_slice = victim_dir / "volumes" / f"vol_id_{VICTIM_VOLUME_PROJID}"
-    (tamper_dir / "sandbox.json").write_text(
+    tamper_record = sandbox_record_path(workspace, tamper_id)
+    tamper_record.parent.mkdir(parents=True, exist_ok=True)
+    tamper_record.write_text(
         json.dumps(
             {
                 "sandbox_id": victim_id,
@@ -1996,7 +2014,7 @@ async def test_record_pointing_at_another_tree_is_refused(
         summary = await agent._reconcile_with_control_plane(raw, _headers())
 
     assert victim_dir.exists()
-    assert (victim_dir / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, victim_id).is_file()
     assert registry.get(victim_id).state == "running"
     assert registry.get(victim_id).node_id == "node_b"
     assert quota.rows == {VICTIM_PROJID: 8, VICTIM_VOLUME_PROJID: 4}
@@ -2028,7 +2046,9 @@ async def test_record_whose_project_id_contradicts_the_disk_is_refused(
     liar_id = "sbx_project_row_liar"
     liar_dir = workspace / liar_id
     (liar_dir / "workspace").mkdir(parents=True)
-    (liar_dir / "sandbox.json").write_text(
+    liar_record = sandbox_record_path(workspace, liar_id)
+    liar_record.parent.mkdir(parents=True, exist_ok=True)
+    liar_record.write_text(
         json.dumps(
             {
                 "sandbox_id": liar_id,
@@ -2099,7 +2119,9 @@ async def test_volume_entry_naming_another_sandbox_slice_is_refused(
     (liar_dir / "workspace").mkdir(parents=True)
     outside_slice = outside_root / "vol-2" / liar_id
     outside_slice.mkdir(parents=True)
-    (liar_dir / "sandbox.json").write_text(
+    liar_record = sandbox_record_path(workspace, liar_id)
+    liar_record.parent.mkdir(parents=True, exist_ok=True)
+    liar_record.write_text(
         json.dumps(
             {
                 "sandbox_id": liar_id,
@@ -2242,7 +2264,9 @@ async def test_in_memory_record_cached_from_a_rewritten_json_is_refused(
     tamper_id = "sbx_cached_rewrite"
     tamper_dir = workspace / tamper_id
     (tamper_dir / "workspace").mkdir(parents=True)
-    (tamper_dir / "sandbox.json").write_text(
+    tamper_record = sandbox_record_path(workspace, tamper_id)
+    tamper_record.parent.mkdir(parents=True, exist_ok=True)
+    tamper_record.write_text(
         json.dumps(
             {
                 "sandbox_id": tamper_id,
@@ -2275,7 +2299,7 @@ async def test_in_memory_record_cached_from_a_rewritten_json_is_refused(
         summary = await agent._reconcile_with_control_plane(raw, _headers())
 
     assert victim_dir.exists()
-    assert (victim_dir / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, victim_id).is_file()
     assert registry.get(victim_id).state == "running"
     assert quota.rows == {VICTIM_PROJID: 8}
     assert quota.released == []

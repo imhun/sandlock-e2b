@@ -37,6 +37,8 @@ import httpx
 import pytest
 from starlette.requests import Request
 
+from gateway_common.paths import sandbox_record_path
+
 import control_plane.api.sandboxes as sandboxes
 import envd_service.agent as agent_mod
 import envd_service.priv_helpers as priv_helpers
@@ -388,7 +390,14 @@ def _write_tree(
     project_id: int | None = None,
     volume_projects: tuple = (),
 ) -> Path:
-    """Write ``<base>/<id>/sandbox.json`` plus a payload file."""
+    """Write the sandbox's record plus a payload file.
+
+    The record goes to ``<base>/_runtime/<id>/sandbox.json`` -- beside the tree
+    rather than inside it. Inside the tree it was a file the sandbox itself
+    could delete and rewrite; the W7 verification these tests exercise still
+    runs on the record wherever it lives, but an attacker now needs the worker
+    uid (or root) to rewrite it, not just the sandbox's own tree ownership.
+    """
     tree = base / sandbox_id
     (tree / "workspace").mkdir(parents=True, exist_ok=True)
     (tree / "payload.bin").write_bytes(f"payload-of-{sandbox_id}".encode())
@@ -402,7 +411,9 @@ def _write_tree(
         record["project_id"] = project_id
     if volume_projects:
         record["volume_projects"] = list(volume_projects)
-    (tree / "sandbox.json").write_text(json.dumps(record), encoding="utf-8")
+    record_path = sandbox_record_path(base, sandbox_id)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(record), encoding="utf-8")
     return tree
 
 
@@ -672,7 +683,7 @@ async def test_force_reclaims_the_refused_tree_from_the_disk_alone(
     assert quota.released == [(str(liar), LIAR_PROJID)]
     # ... and nothing of the victim's is (its row is untouched by this call).
     assert (victim / "payload.bin").read_bytes() == b"payload-of-sbx_victim"
-    assert (victim / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, "sbx_victim").is_file()
     assert quota.rows == {VICTIM_PROJID: 8, LIAR_PROJID: 8}
 
 
@@ -913,9 +924,9 @@ async def test_a_refusal_is_not_blinded_by_its_own_marker(
     assert second.status_code == 409
     assert second.text == first.text
     assert (liar / "payload.bin").read_bytes() == b"payload-of-sbx_liar"
-    assert (liar / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, "sbx_liar").is_file()
     assert (victim / "payload.bin").read_bytes() == b"payload-of-sbx_victim"
-    assert (victim / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, "sbx_victim").is_file()
 
 
 @pytest.mark.asyncio
@@ -1408,7 +1419,7 @@ async def test_a_platform_namespace_is_never_listed_even_when_it_reports_an_id(
         await _worker_post(app, "/agent/untrusted/_volumes/park")
     ).status_code == 404
     assert (workspace / "_volumes").is_dir()
-    assert (workspace / "_snapshots" / "sandbox.json").is_file()
+    assert sandbox_record_path(workspace, "_snapshots").is_file()
     assert _agent_lines(caplog) == []
 
 

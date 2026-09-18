@@ -78,6 +78,7 @@ from gateway_common.paths import (
     UNTRUSTED_TREE_DIR,
     is_reserved_platform_namespace,
     is_sandbox_workspace_dir,
+    sandbox_record_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -608,9 +609,14 @@ def _recorded_projids(workspace_base: str | Path) -> set[int]:
             f"{base} ({type(exc).__name__})"
         ) from exc
     for entry in entries:
-        record_path = entry / "sandbox.json"
+        # Platform record: ``_runtime/<id>/sandbox.json``, with the pre-split
+        # in-tree location still read so a rolling upgrade does not treat live
+        # project ids as orphans.
+        record_path = sandbox_record_path(base, entry.name)
         if not record_path.is_file():
-            continue
+            record_path = sandbox_record_path(base, entry.name, legacy=True)
+            if not record_path.is_file():
+                continue
         try:
             payload = json.loads(record_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):

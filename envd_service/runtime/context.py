@@ -20,6 +20,8 @@ from envd_service.process.logs import CommandLogWriter
 from envd_service.process.manager import ProcessManager
 from envd_service.runtime.registry import RuntimeSandbox
 
+from gateway_common.paths import sandbox_runtime_dir
+
 logger = logging.getLogger(__name__)
 
 #: First port the per-sandbox MCP gateway pool hands out, and the last one.
@@ -313,7 +315,11 @@ class SandboxRuntimeContext:
                 },
             },
         )
-        self.command_logs = CommandLogWriter(record.workspace_dir)
+        # Platform file: written beside the sandbox's tree, not inside it (the
+        # sandbox owns its tree and could delete or rewrite anything there).
+        self.command_logs = CommandLogWriter(
+            sandbox_runtime_dir(Path(record.workspace_dir).parent, record.sandbox_id)
+        )
         self.processes = ProcessManager(
             self.executor,
             max_command_timeout=record.max_command_timeout,

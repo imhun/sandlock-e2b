@@ -52,6 +52,8 @@ from gateway_common.paths import (
     UNTRUSTED_TREE_DIR,
     is_reserved_platform_namespace,
     is_sandbox_workspace_dir,
+    sandbox_command_log_path,
+    sandbox_runtime_dir,
     validate_sandbox_id,
 )
 
@@ -907,7 +909,7 @@ def _park_refused_tree(
     Returns ``(released_projid, error)``: ``error`` is set when the tree could
     not be parked, in which case nothing was touched.
     """
-    base = Path(settings.workspace_base)
+    base = _registry_workspace_base(runtime_registry, settings)
     source = base / sandbox_id
     quarantine = base / UNTRUSTED_TREE_DIR
     try:
@@ -935,6 +937,27 @@ def _park_refused_tree(
             # trees, and keep the audit trail readable.
             dest = quarantine / f"{sandbox_id}.{time.time_ns()}"
         os.replace(source, dest)  # same filesystem: a rename, never a copy
+        # The platform's files for this sandbox are evidence for whoever has to
+        # review the quarantine, and they describe a tree that is no longer in
+        # the workspace scan. Move them in beside it -- keeping the record and
+        # the payload together, which is what this path (review W7 / W7-3)
+        # always did, just from two places now instead of one.
+        runtime_dir = sandbox_runtime_dir(base, sandbox_id)
+        if runtime_dir.is_dir():
+            for entry in runtime_dir.iterdir():
+                try:
+                    os.replace(entry, dest / entry.name)
+                except OSError:  # pragma: no cover - best effort
+                    logger.warning(
+                        "park: %s: could not move %s into the quarantine",
+                        sandbox_id,
+                        entry,
+                        exc_info=True,
+                    )
+            try:
+                runtime_dir.rmdir()
+            except OSError:  # pragma: no cover - defensive
+                pass
         try:
             (quarantine / f"{dest.name}.reason").write_text(
                 f"{time.time():.0f}\t{sandbox_id}\t{reason}\n", encoding="utf-8"
@@ -1209,6 +1232,17 @@ def _delete_sandbox_runtime(
                 f"the workspace of {sandbox_id} survived its teardown: "
                 f"{workspace_dir} is still on disk"
             )
+        # The platform's files live next to the tree now (``_runtime/<id>/``),
+        # so they are removed with it -- paired收尾, the N12/N24 lesson: the
+        # record is what the *next* delete verifies against, so it must not
+        # outlive the tree it describes (nor be dropped while the tree stands,
+        # which is why ``unregister`` leaves it alone).
+        shutil.rmtree(
+            sandbox_runtime_dir(
+                _registry_workspace_base(runtime_registry, settings), sandbox_id
+            ),
+            ignore_errors=True,
+        )
         if project_id is not None:
             # N12: only now, with the tree gone and its accounting at zero, can
             # the quota row itself be dropped -- XFS keeps a record while its
@@ -2632,7 +2666,15 @@ async def agent_sandbox_logs(sandbox_id: str, request: Request) -> Response:
         _require_internal_key(request, settings)
     except PermissionError:
         return Response(status_code=401)
-    log_path = settings.workspace_base / sandbox_id / "command-logs.jsonl"
+    # The command log is a platform file: it lives in ``_runtime/<id>/`` beside
+    # the tree, not inside it (the sandbox owns the tree and could rewrite or
+    # delete anything in there). The in-tree path is the pre-split location and
+    # is still read so a rolling upgrade does not lose a sandbox's history.
+    log_path = sandbox_command_log_path(settings.workspace_base, sandbox_id)
+    if not log_path.is_file():
+        log_path = sandbox_command_log_path(
+            settings.workspace_base, sandbox_id, legacy=True
+        )
     if not log_path.is_file():
         return JSONResponse(content=[])
     entries: list[dict[str, Any]] = []

@@ -53,7 +53,15 @@ _SANDBOX_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 def validate_sandbox_id(sandbox_id: str) -> bool:
-    """Reject malicious sandbox IDs before they reach path or process lookups."""
+    """Reject malicious sandbox IDs before they reach path or process lookups.
+
+    Shape only, on purpose: interior scans (the orphan GC, the quota scan) run
+    this over *existing* top-level names, and a reserved-looking name that
+    carries a record has to stay visible to them (the M1 leak was exactly a
+    client-chosen ``snap_*`` tree dropped by a name filter). Rejecting the
+    platform's own namespace names belongs on the create path, where an id is
+    first *chosen* -- :func:`is_reserved_platform_namespace` is the check.
+    """
     return bool(sandbox_id) and bool(_SANDBOX_ID_RE.match(sandbox_id))
 
 
@@ -104,6 +112,50 @@ _INFRASTRUCTURE_PREFIXES = ("_", "snap_")
 #: shape signal that separates a sandbox tree from an infrastructure namespace.
 _SANDBOX_RECORD_NAME = "sandbox.json"
 
+#: Top-level namespace holding each sandbox's **platform** files (its runtime
+#: record and its command log) -- deliberately *next to*, never inside, the
+#: sandbox's own tree.
+#:
+#: The sandbox owns its tree directory (``0770 <sandbox uid>:<worker gid>``,
+#: E3.2), and owning a directory means being able to unlink from it: measured
+#: on the live cluster, a sandbox can ``rm sandbox.json`` and write its own
+#: back even though the file itself is read-only to it. Anything the platform
+#: must trust therefore cannot live there -- that is why the fleet-level uid
+#: allocation moved to Redis (OBS-9) and why these files move here, where the
+#: sandbox has no access at all.
+RUNTIME_DIR_NAME = "_runtime"
+
+#: The sandbox's command output log (JSONL), written by the worker.
+COMMAND_LOG_NAME = "command-logs.jsonl"
+
+
+def sandbox_runtime_dir(workspace_base: str | Path, sandbox_id: str) -> Path:
+    """``<base>/_runtime/<id>`` -- the platform's directory for one sandbox."""
+    return Path(workspace_base) / RUNTIME_DIR_NAME / sandbox_id
+
+
+def sandbox_record_path(
+    workspace_base: str | Path, sandbox_id: str, *, legacy: bool = False
+) -> Path:
+    """Where a sandbox's runtime record lives.
+
+    ``legacy=True`` returns the pre-split location inside the sandbox's own
+    tree, which readers still fall back to and writers migrate away from; see
+    ``RuntimeRegistry.adopt_legacy_records``.
+    """
+    if legacy:
+        return Path(workspace_base) / sandbox_id / _SANDBOX_RECORD_NAME
+    return sandbox_runtime_dir(workspace_base, sandbox_id) / _SANDBOX_RECORD_NAME
+
+
+def sandbox_command_log_path(
+    workspace_base: str | Path, sandbox_id: str, *, legacy: bool = False
+) -> Path:
+    """Where a sandbox's command log lives (see :func:`sandbox_record_path`)."""
+    if legacy:
+        return Path(workspace_base) / sandbox_id / COMMAND_LOG_NAME
+    return sandbox_runtime_dir(workspace_base, sandbox_id) / COMMAND_LOG_NAME
+
 #: Where a worker parks a tree it refuses to act on (review W7 / W7-3): such a
 #: tree is never *deleted* (its record may be describing a bind-mounted other
 #: tenant's tree) and is never acted on from the record's claims either, but
@@ -137,6 +189,11 @@ RESERVED_PLATFORM_NAMESPACES = frozenset(
         "_cow",
         "_images",
         "_migrate",
+        #: Per-sandbox *platform* files (runtime record + command log), live
+        #: beside the sandbox's tree: see :data:`RUNTIME_DIR_NAME`. Reserved
+        #: like the rest -- it must never be listed as an untrusted tree, never
+        #: reaped as an orphan and never parked.
+        RUNTIME_DIR_NAME,
         "_secrets",
         "_snapshots",
         "_templates",
@@ -174,7 +231,14 @@ def is_sandbox_workspace_dir(entry: Path) -> bool:
         return False
     if not entry.name.startswith(_INFRASTRUCTURE_PREFIXES):
         return True
-    return (entry / _SANDBOX_RECORD_NAME).is_file()
+    # A prefixed name is a sandbox tree when the *content* says so: its record
+    # exists. The record lives in ``_runtime/<name>/`` since the platform/
+    # workspace split, so that is where to look; the in-tree copy is the
+    # pre-split location and still counts so a rolling upgrade does not strand
+    # an existing client-chosen ``snap_*``/``_*`` tree.
+    if (entry / _SANDBOX_RECORD_NAME).is_file():
+        return True
+    return sandbox_record_path(entry.parent, entry.name).is_file()
 
 
 def safe_join(root: str | Path, *parts: str) -> Path:

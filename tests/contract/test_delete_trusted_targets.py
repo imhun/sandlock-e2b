@@ -35,6 +35,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from gateway_common.paths import sandbox_record_path
+
 import envd_service.agent as agent_mod
 import envd_service.xfs_quota as xfs_quota
 from control_plane.app import create_app as create_control_app
@@ -109,7 +111,11 @@ class _QuotaFake:
 
 
 def _write_record(base: Path, sandbox_id: str, **payload) -> Path:
-    """Write ``<base>/<id>/sandbox.json`` (plus a payload file)."""
+    """Write the sandbox's record (plus a payload file).
+
+    The record goes to ``<base>/_runtime/<id>/`` -- beside the tree, not inside
+    it (the sandbox owns its tree and could unlink anything in there).
+    """
     tree = base / sandbox_id
     tree.mkdir(parents=True, exist_ok=True)
     (tree / "workspace").mkdir(exist_ok=True)
@@ -120,7 +126,9 @@ def _write_record(base: Path, sandbox_id: str, **payload) -> Path:
         "workspace_dir": str(tree),
     }
     record.update(payload)
-    (tree / "sandbox.json").write_text(json.dumps(record), encoding="utf-8")
+    record_path = sandbox_record_path(base, sandbox_id)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(record), encoding="utf-8")
     return tree
 
 
@@ -191,9 +199,8 @@ async def test_a_record_pointing_at_another_tree_is_refused(
     # intact, and the rewritten tree is left standing for an operator to see.
     assert victim_dir.is_dir()
     assert (victim_dir / "payload.bin").read_bytes() == b"payload-of-sbx_victim"
-    assert json.loads((victim_dir / "sandbox.json").read_text())["project_id"] == (
-        VICTIM_PROJID
-    )
+    victim_record = sandbox_record_path(victim_dir.parent, "sbx_victim")
+    assert json.loads(victim_record.read_text())["project_id"] == VICTIM_PROJID
     assert liar_dir.is_dir()
     assert quota.released == []
     assert quota.rows == {VICTIM_PROJID: 8, LIAR_PROJID: 8}
@@ -404,7 +411,7 @@ async def test_keep_files_still_keeps_the_tree_and_releases_nothing(
     assert (slice_dir / "data.bin").read_bytes() == b"keep-me"
     # The record file stays with the tree, so a later request reads it back
     # from the disk -- unchanged: keepFiles is a stop, not a delete.
-    assert (tree / "sandbox.json").is_file()
+    assert sandbox_record_path(tree.parent, tree.name).is_file()
 
 
 @pytest.mark.asyncio
@@ -623,7 +630,9 @@ async def test_a_get_inside_the_teardown_window_does_not_resurrect_the_record(
         # The window: after unregister(), before the rmtree.
         observed["get"] = registry_.get(sandbox_id)
         observed["records"] = [record.sandbox_id for record in registry_.list()]
-        observed["record_file_on_disk"] = (tree / "sandbox.json").is_file()
+        observed["record_file_on_disk"] = sandbox_record_path(
+            tree.parent, tree.name
+        ).is_file()
 
     monkeypatch.setattr(agent_mod, "release_project", release_then_look)
     async with httpx.AsyncClient(

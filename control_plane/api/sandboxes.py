@@ -56,7 +56,12 @@ from gateway_common.upload import (
     read_json_body,
 )
 from gateway_common import GATEWAY_ROUTE_INVALIDATE_CHANNEL
-from gateway_common.paths import validate_sandbox_id
+from gateway_common.paths import (
+    is_reserved_platform_namespace,
+    sandbox_command_log_path,
+    sandbox_runtime_dir,
+    validate_sandbox_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -667,7 +672,13 @@ async def _command_logs(request, record) -> list[dict[str, str]]:
     workspace = record.workspace_dir or (
         request.app.state.workspace_base / record.sandbox_id
     )
-    log_path = Path(workspace) / "command-logs.jsonl"
+    # Platform file, so it lives beside the tree (``_runtime/<id>/``) rather
+    # than inside it; the in-tree path is the pre-split location and stays
+    # readable during a rolling upgrade.
+    base = Path(workspace).parent
+    log_path = sandbox_command_log_path(base, record.sandbox_id)
+    if not log_path.is_file():
+        log_path = sandbox_command_log_path(base, record.sandbox_id, legacy=True)
     entries: list[dict[str, str]] = []
     if log_path.is_file():
         try:
@@ -1004,6 +1015,19 @@ async def _create_sandbox_attempt(
     if sandbox_id_hdr is not None:
         if not validate_sandbox_id(sandbox_id_hdr):
             raise OfficialError(400, "X-Sandbox-Id must be a valid sandbox id")
+        # A sandbox tree lands at ``<base>/<id>``, so an id naming one of the
+        # platform's own top-level namespaces would put a sandbox on top of
+        # platform state -- ``_runtime`` now holds the sandbox's own record, so
+        # this is the difference between a sandbox and the entry that records
+        # it. Client ids are otherwise free-form; the create path is the one
+        # place that can keep the two namespaces apart (interior scans must
+        # keep accepting a reserved-looking name that carries a record: M1).
+        if is_reserved_platform_namespace(sandbox_id_hdr):
+            raise OfficialError(
+                400,
+                f"X-Sandbox-Id {sandbox_id_hdr!r} is a reserved platform "
+                f"namespace",
+            )
         try:
             existing = registry.get(sandbox_id_hdr)
         except UnknownSandboxError:
@@ -1759,6 +1783,10 @@ def _remove_local_tree_confirming(state, sandbox_id: str) -> bool:
         else:
             shutil.rmtree(tree)
     except FileNotFoundError:
+        shutil.rmtree(
+            sandbox_runtime_dir(state.workspace_base, sandbox_id),
+            ignore_errors=True,
+        )
         return True
     except Exception as exc:
         logger.warning(
@@ -1775,6 +1803,12 @@ def _remove_local_tree_confirming(state, sandbox_id: str) -> bool:
             sandbox_id,
         )
         return False
+    # Paired收尾 (N12/N24): the platform's files live beside the tree now, so
+    # they go with it -- and only with it, since the record is what the next
+    # delete verifies against.
+    shutil.rmtree(
+        sandbox_runtime_dir(state.workspace_base, sandbox_id), ignore_errors=True
+    )
     return True
 
 
