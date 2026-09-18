@@ -38,7 +38,9 @@ from envd_service.xfs_quota import (
     ProjectDirectoryGone,
     ProjectQuotaError,
     containing_mount_point,
+    clear_project_limits,
     directory_project_id,
+    project_quota_table,
     projids_in_record,
     provision_project,
     reconcile_orphan_projects,
@@ -1182,6 +1184,23 @@ def _delete_sandbox_runtime(
                 f"the workspace of {sandbox_id} survived its teardown: "
                 f"{workspace_dir} is still on disk"
             )
+        if project_id is not None:
+            # N12: only now, with the tree gone and its accounting at zero, can
+            # the quota row itself be dropped -- XFS keeps a record while its
+            # limits are non-zero, and this is the delete that no longer has to
+            # wait for a reconciliation to say so. It runs after the removal on
+            # purpose: resetting the limits first would leave a *live* sandbox
+            # unbounded if the removal then failed.
+            try:
+                clear_project_limits(
+                    mount_point=settings.workspace_base,
+                    projid=project_id,
+                    via_agent=settings.quota_via_agent,
+                )
+            except ProjectQuotaError as exc:
+                logger.warning(
+                    "XFS project row cleanup failed for %s: %s", sandbox_id, exc
+                )
     finally:
         # The just-unregistered marker only has to cover the teardown itself
         # (race B): once the tree is gone, its disk record cannot come back.
@@ -1878,6 +1897,11 @@ class NodeAgent:
                     mount_point=self._settings.workspace_base,
                     via_agent=self._settings.quota_via_agent,
                 )
+                table = await asyncio.to_thread(
+                    project_quota_table,
+                    self._settings.workspace_base,
+                    via_agent=self._settings.quota_via_agent,
+                )
             except Exception:
                 logger.warning(
                     "reconcile: quota reconciliation failed",
@@ -1885,7 +1909,13 @@ class NodeAgent:
                 )
                 break
             cleaned |= {int(projid) for projid in result.get("cleaned") or []}
-            outstanding -= cleaned
+            # N12: "still in the table" is the question, not "did this pass
+            # report it". The teardown itself now drops the row of every tree
+            # this round removed (limits reset once the tree is gone), so those
+            # projids are settled *without* ever appearing in ``cleaned`` --
+            # judging by the pass's list reported them as unreclaimed and logged
+            # a warning about rows that were already gone.
+            outstanding = {projid for projid in outstanding if projid in table}
             if not outstanding:
                 break
             if attempt < _QUOTA_RECLAIM_ATTEMPTS:

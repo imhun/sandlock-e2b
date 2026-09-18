@@ -310,6 +310,7 @@ def test_configure_wires_agent_query_and_ops(monkeypatch):
         assert set(xfs_quota.agent_ops) == {
             "provision",
             "release",
+            "clear_limits",
             "report",
             "reconcile",
         }
@@ -443,6 +444,7 @@ async def test_create_app_wires_agent_hooks_when_via_agent(workspace, monkeypatc
         assert set(xfs_quota.agent_ops) == {
             "provision",
             "release",
+            "clear_limits",
             "report",
             "reconcile",
         }
@@ -528,6 +530,7 @@ async def test_create_app_with_agent_url_alone_wires_hooks(
         assert set(xfs_quota.agent_ops) == {
             "provision",
             "release",
+            "clear_limits",
             "report",
             "reconcile",
         }

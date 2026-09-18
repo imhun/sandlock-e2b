@@ -14,6 +14,11 @@ Request surface (all responses JSON objects):
   -> ``{"projid": int}``; on failure ``500 {"error": ...}``.
 - ``POST /project_delete`` ``{"projid", "path", "mount"}``
   -> ``{"deleted": int}``.
+- ``POST /project_limits`` ``{"projid", "mount"}`` -> ``{"cleared": int}``:
+  reset the project's block limits to 0 so XFS drops the row. The worker calls
+  this *after* it removed the tree (``release``/``project_delete`` runs before),
+  which is what makes a deleted sandbox leave the quota table at delete time
+  rather than at the next reconciliation (N12).
 - ``GET /report?mount=...`` -> ``{"projects": {projid: {"used_blocks",
   "soft_blocks", "hard_blocks"}}}``.
 - ``POST /reconcile`` ``{"workspace_base", "mount"}`` -> ``{"cleaned":
@@ -50,6 +55,13 @@ class ProjectCreateBody(BaseModel):
 class ProjectDeleteBody(BaseModel):
     projid: int = Field(ge=1, le=_PROJID_MAX)
     path: str = Field(min_length=1)
+    mount: str = Field(min_length=1)
+
+
+class ProjectLimitsBody(BaseModel):
+    """Reset only: no ``path``, because the tree is already gone by then."""
+
+    projid: int = Field(ge=1, le=_PROJID_MAX)
     mount: str = Field(min_length=1)
 
 
@@ -134,6 +146,22 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         except xfs_quota.ProjectQuotaError as exc:
             raise _quota_error(exc) from exc
         return {"deleted": body.projid}
+
+    @app.post("/project_limits")
+    def project_limits(body: ProjectLimitsBody, request: Request) -> dict[str, Any]:
+        """Reset the project's block limits so the row drops (N12).
+
+        Called after the worker has removed the tree: the accounting is already
+        zero, so clearing the limits is the last thing between the row and its
+        removal from ``report -p``.
+        """
+        _require_key(request)
+        mount = _rewrite_path(body.mount, settings)
+        try:
+            xfs_quota.clear_project_limits(mount_point=mount, projid=body.projid)
+        except xfs_quota.ProjectQuotaError as exc:
+            raise _quota_error(exc) from exc
+        return {"cleared": body.projid}
 
     @app.get("/report")
     def report(

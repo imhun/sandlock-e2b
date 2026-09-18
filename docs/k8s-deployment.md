@@ -921,3 +921,61 @@ NEWEST-WINS OK
 ```
 
 即解析取到的是最新那条，而不是「目录里 id 排序最后」的那条。
+
+---
+
+## 17. 收口 N12：删除沙箱时把那行配额也带走（2026-09-18）
+
+### 17.1 症状与机制
+
+删掉一个沙箱后，`xfs_quota -x -c "report -p"` 里那行还在，形如「0 used + 非零
+`hard_blocks`」。原因是删除路径只做了两件事：`release_project`（`project -C`，清掉**目录**上的
+项目态）和删目录（用量随之归零）。XFS 只在**用量与限额同时为 0** 时才丢掉记录，而限额没人复位
+—— 于是行一直挂到下一次孤儿 reconcile。实测一次创建/删除潮留下 **40 行**，`POST /reconcile`
+清掉 36 个（剩下 4 行是 worker 按设计留的 unmaterialised 树的载体）。
+
+### 17.2 改了什么
+
+* `xfs_quota.clear_project_limits(mount_point, projid, via_agent=...)`：把块限额复位
+  （`limit -p bsoft=0 bhard=0` / `xfs_quotactl.clear_limit`），孤儿清理也改用它（去重）。
+* **顺序是刻意的**：`_delete_sandbox_runtime` 在**树确实删掉之后**才调它（`SandboxTreeNotRemoved`
+  的两条检查之后）。先复位限额会留下一个**没有任何磁盘限额的活沙箱**（树还在、行还在），
+  而且删除若随后失败，这个沙箱就再也受不到限额约束。卷切片同理
+  （`volumes.cleanup_volume_projects` 在每个切片删除成功后复位）。
+* NFS/agent 形态补一个 op：`POST /project_limits {projid, mount} -> {cleared}`，客户端
+  `QuotaAgentClient.clear_limits`（配额 agent 的 worker 侧本来就只有 `provision`/`release`/
+  `report`/`reconcile`）。
+* 顺带修一处**误导性记账**：`_reclaim_quota_rows` 原来把「本趟没报 cleaned」当成「没收回来」，
+  而删除路径已经drop 掉的行永远不可能出现在那个列表里 —— 于是每次删除都会多出一条
+  `quota row(s) not reclaimed` 警告。现在它问**配额表**（行还在不在），而不是信任那一趟的清单。
+  这也是为什么那张表还留着：**延迟记账**（XFS 的 dquot 尚未结算，用量还没归零）是它唯一
+  还在服务的场景 —— 那种行删除路径确实掉不了，只能等它结算。
+* 另修一个脆弱点：`xfs_quotactl.available()` 在取不到 `libc.so.6` 的主机（macOS/musl）会抛
+  `OSError`，而 `_use_quotactl` 是**每次配额操作**都会走的**后端选择**步骤 —— 一条带着旧
+  project id 的记录就能让一次普通删除炸成未捕获的 OSError。现在 `_use_quotactl` 把
+  「连问都问不了」归到 `subprocess` 回退（那里会给出更清楚的 `xfs_quota … failed`），
+  `available()` 自身的契约保持不变（能力问题与可诊断性问题不是同一个问题，那条也有测试钉着）。
+
+### 17.3 真 XFS 验证
+
+用文档里的本地 lane（特权容器 + loop 设备，真实 XFS + prjquota）跑 XFS 门控契约：
+
+```bash
+docker run --rm --privileged --network host -v "$PWD:/workspace" -w /workspace \
+  -e TMPDIR=/workspace/tmp_pytest -e E2B_REQUIRE_SECCOMP_FILTER=0 \
+  e2b-sandlock-test:latest bash -c 'pytest tests/contract/test_xfs_project_quota.py tests/contract/test_volume_quota.py -q'
+```
+
+两条 N12 断言在**真 XFS** 上通过：
+
+* `test_agent_delete_clears_project_and_dir`：删除后 `projid not in _report_rows()`；
+* `test_delete_sandbox_cleans_only_its_own_slice`：A 的行没了，B 的行与用量照旧，
+  volume root 不受影响（引用计数）。
+
+`test_reconcile_removes_zero_usage_orphan_entry` 也改写成了它现在真正要覆盖的场景：**绕过删除
+路径**（直接 `rmtree` 那棵树）留下的零用量行，仍然由 reconcile 收掉。
+
+⚠ 这条 lane 在**改动前后一样**是 `5 failed / 5 passed`（用干净 HEAD 的 worktree 跑了同一命令
+对比过），所以那 5 个不是这次带进去的。它们共用一个签名：`(soft, hard) == (8192, 8192)`
+而测试期望 `(0, 8192)` —— 即 **fd 后端把 soft 也设成了 hard**（`xfs_quotactl.set_limit` 里
+`<Q` 两处都写 `blocks`），而 subprocess 路径只设 hard。两条后端语义不一致，已登记为 **N23**。

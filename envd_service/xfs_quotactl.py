@@ -216,7 +216,15 @@ def state(mount_point: str | Path) -> dict[str, bool]:
 
 
 def available(mount_point: str | Path) -> bool:
-    """Whether fd-based project-quota administration works here."""
+    """Whether fd-based project-quota administration works here.
+
+    Raises ``OSError`` when the probe cannot be made at all (a host without
+    ``libc.so.6``) -- deliberately *not* folded into False, so "this mount does
+    not administer quotas" and "this host cannot even ask" stay distinguishable
+    (see ``tests/unit/test_xfs_quotactl_backend.py``). Callers that only need a
+    backend choice should go through ``xfs_quota._use_quotactl``, which resolves
+    that case to the subprocess fallback.
+    """
     try:
         state(mount_point)
     except QuotactlError:

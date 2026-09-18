@@ -127,6 +127,8 @@ class _QuotaFake:
         self.release_threads: list[int] = []
         self.reconcile_calls: list[dict] = []
         self.released: list[tuple[str, int]] = []
+        #: ``(mount_point, projid)`` of every limit reset (N12).
+        self.cleared: list[tuple[str, int]] = []
 
     def install(self, monkeypatch) -> None:
         monkeypatch.setattr(
@@ -135,6 +137,8 @@ class _QuotaFake:
             {
                 "reconcile": self.reconcile,
                 "release": self.release,
+                "clear_limits": self.clear_limits,
+                "report": self.report,
                 "provision": self.provision,
             },
         )
@@ -163,6 +167,39 @@ class _QuotaFake:
         if self.release_delay_s:
             time.sleep(self.release_delay_s)
         self.released.append((str(project_dir), int(projid)))
+
+    def clear_limits(self, *, mount_point, projid) -> None:
+        """Reset the limits, like ``limit -p bsoft=0 bhard=0`` (N12).
+
+        The worker calls this *after* the tree is gone, and with usage at zero
+        that is what removes the record. Deferred accounting is the exception
+        the bounded-retry contract needs: XFS only drops a row whose usage *and*
+        limits are zero, so while ``defer_rounds`` says the usage has not
+        settled the row survives -- and the reconcile rounds it, not the
+        teardown.
+        """
+        self.cleared.append((str(mount_point), int(projid)))
+        if self.defer_rounds <= 0:
+            self.rows.pop(int(projid), None)
+
+    def report(self, mount_point) -> dict:  # noqa: ANN001
+        """The quota table as the worker would read it (E2.4 contract).
+
+        The reclaim pass asks the table whether a row is still there rather than
+        trusting the reconciliation's ``cleaned`` list -- a row the teardown
+        already dropped (N12) is settled and must not be reported as
+        unreclaimed.
+        """
+        return {
+            "projects": {
+                str(projid): {
+                    "used_blocks": used,
+                    "soft_blocks": 0,
+                    "hard_blocks": 0,
+                }
+                for projid, used in self.rows.items()
+            }
+        }
 
     def provision(self, **kwargs):  # pragma: no cover - never used here
         raise AssertionError("provisioning must not run in orphan-tree GC")
@@ -677,6 +714,9 @@ async def test_restart_reclaims_an_unowned_tree_and_its_quota_row(
         "disk_sweep_skipped": [],
         "untrusted_records": [],
         "concurrent_creates": [],
+        # Deferred accounting (`defer_rounds=1`): a limit reset cannot drop a row
+        # whose usage has not settled, so this is the case the bounded reclaim
+        # pass still exists for -- it is what cleans both rows.
         "quota_cleaned": [STRANDED_VOLUME_PROJID, STRANDED_PROJID],
         "quota_unreclaimed": [],
     }
@@ -965,7 +1005,7 @@ async def test_snapshot_store_directory_is_spared_by_its_shape(
         "disk_sweep_skipped": [],
         "untrusted_records": [],
         "concurrent_creates": [],
-        "quota_cleaned": [STRANDED_VOLUME_PROJID],
+        "quota_cleaned": [],
         "quota_unreclaimed": [],
     }
     # The store is untouched — marker, copied filesystem and the nested record
@@ -1046,7 +1086,7 @@ async def test_a_client_chosen_prefixed_id_is_reclaimed_not_stranded(
         "disk_sweep_skipped": [],
         "untrusted_records": [],
         "concurrent_creates": [],
-        "quota_cleaned": sorted([STRANDED_PROJID, STRANDED_VOLUME_PROJID]),
+        "quota_cleaned": [],
         "quota_unreclaimed": [],
     }
     assert quota.rows == {}
@@ -1201,7 +1241,7 @@ async def test_infrastructure_namespaces_are_still_excluded(
         "disk_sweep_skipped": [],
         "untrusted_records": [],
         "concurrent_creates": [],
-        "quota_cleaned": [STRANDED_VOLUME_PROJID],
+        "quota_cleaned": [],
         "quota_unreclaimed": [],
     }
     for name in ("_volumes", "_snapshots", "_templates", "_secrets"):
@@ -1315,7 +1355,7 @@ async def test_one_failing_tree_does_not_abort_the_round(
         "disk_sweep_skipped": [],
         "untrusted_records": [],
         "concurrent_creates": [],
-        "quota_cleaned": [2002],
+        "quota_cleaned": [],
         "quota_unreclaimed": [],
     }
     assert client.posts == [{"sandboxIDs": [], "snapshotIDs": []}]
@@ -2281,9 +2321,13 @@ async def test_in_memory_orphan_is_torn_down_from_the_verified_target(
     assert sandbox_dir.exists() is False
     assert quota.released == [(str(sandbox_dir), 8101)]
     assert quota.rows == {}
+    # N12: the teardown also reset the limits, which is what drops the row when
+    # the usage is already zero -- the reconciliation below therefore has
+    # nothing left to clean (that is what `quota_cleaned == []` says too).
+    assert quota.cleared == [(str(workspace), 8101)]
     assert summary["deleted"] == [sandbox_id]
     assert summary["untrusted_records"] == []
-    assert summary["quota_cleaned"] == [8101]
+    assert summary["quota_cleaned"] == []
 
 
 def _gone_reason(path: Path) -> str:
@@ -2368,7 +2412,7 @@ async def test_a_slice_deleted_before_the_sweep_is_info_not_a_warning(
         "disk_sweep_skipped": [],
         "untrusted_records": [],
         "concurrent_creates": [],
-        "quota_cleaned": [8401, 8402],
+        "quota_cleaned": [8402],
         "quota_unreclaimed": [],
     }
     assert _agent_lines(caplog) == [
@@ -2455,7 +2499,7 @@ async def test_a_slice_this_worker_may_not_read_keeps_its_own_warning(
         "disk_sweep_skipped": [],
         "untrusted_records": [],
         "concurrent_creates": [],
-        "quota_cleaned": [8501, 8502],
+        "quota_cleaned": [8502],
         "quota_unreclaimed": [],
     }
     assert _agent_lines(caplog) == [

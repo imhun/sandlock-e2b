@@ -232,6 +232,32 @@ class QuotaAgentClient:
                 f"{payload!r}"
             )
 
+    def clear_limits(
+        self,
+        *,
+        mount_point: str,
+        projid: int,
+    ) -> None:
+        """Reset the project's block limits so XFS drops the row (N12).
+
+        The delete path's second half: ``release`` clears the directory's project
+        state before the tree is removed, this resets the limits after it. Only
+        both together make the quota row go away at delete time instead of at the
+        next reconciliation.
+        """
+        payload = self._request(
+            "project_limits",
+            "POST",
+            "/project_limits",
+            json={"projid": int(projid), "mount": str(mount_point)},
+        )
+        cleared = payload.get("cleared")
+        if not isinstance(cleared, int):
+            raise ProjectQuotaError(
+                f"quota-agent project_limits response missing int 'cleared': "
+                f"{payload!r}"
+            )
+
     def reconcile(
         self,
         *,
@@ -262,6 +288,7 @@ class QuotaAgentClient:
         return {
             "provision": self.provision,
             "release": self.release,
+            "clear_limits": self.clear_limits,
             "report": self.report,
             "reconcile": self.reconcile,
         }

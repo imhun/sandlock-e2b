@@ -260,7 +260,11 @@ async def test_delete_sandbox_cleans_only_its_own_slice(xfs_envd_app):
         assert not slice_a.exists()
         assert slice_b.is_dir()
         rows = _report_rows()
-        assert rows[projid_a][0] == 0
+        # N12: A's row goes with the slice -- the delete path resets the limits
+        # after removing it, and XFS drops a record whose usage and limits are
+        # both zero. It used to sit at "0 used, hard_blocks=N" until a
+        # reconciliation ran.
+        assert projid_a not in rows
         assert rows[projid_b][0] >= 1024
         assert volume_root.is_dir()
     finally:

@@ -44,6 +44,7 @@ from typing import Any
 
 from envd_service.xfs_quota import (
     ProjectQuotaError,
+    clear_project_limits,
     containing_mount_point,
     provision_project,
     release_project,
@@ -461,3 +462,20 @@ def cleanup_volume_projects(
         from envd_service import priv_helpers
 
         priv_helpers.remove_tree(sandbox_dir)
+        if isinstance(projid, int) and projid > 0 and not sandbox_dir.exists():
+            # N12, same shape as the workspace project: with the slice gone the
+            # accounting is zero, so resetting the limits is what drops the row
+            # now rather than at the next reconciliation. Guarded on the slice
+            # actually being gone -- resetting first would leave a live volume
+            # unbounded.
+            try:
+                clear_project_limits(
+                    mount_point=fs_mount, projid=projid, via_agent=via_agent
+                )
+            except ProjectQuotaError as exc:
+                logger.warning(
+                    "volume project row cleanup failed for %s (projid %s): %s",
+                    sandbox_dir,
+                    projid,
+                    exc,
+                )

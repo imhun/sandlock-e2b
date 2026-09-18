@@ -113,6 +113,29 @@ def _configured_backend() -> str:
     return value if value in ("auto", "subprocess", "quotactl") else "auto"
 
 
+def _quotactl_available(mount_point: str | Path) -> bool:
+    """``xfs_quotactl.available`` with "cannot even ask" resolved to False.
+
+    The probe loads ``libc.so.6``, which does not exist on a non-glibc host
+    (macOS, musl), and that is the same *answer* for this caller as "this mount
+    has no fd backend": fall back to the ``xfs_quota`` subprocess path, which
+    reports its own, clearer failure when that is missing too
+    (``ProjectQuotaError: xfs_quota '…' failed: …``, which every caller of a
+    quota operation already degrades on with a warning). Letting the load error
+    escape instead made a plain sandbox *delete* raise an untyped ``OSError``
+    out of a backend-selection probe -- reachable whenever a record carried a
+    project id on such a host.
+
+    ``xfs_quotactl.available`` keeps raising on purpose (a capability question
+    and a diagnosability question are not the same one); the fold happens here,
+    at the only place that needs a binary choice.
+    """
+    try:
+        return xfs_quotactl.available(mount_point)
+    except OSError:
+        return False
+
+
 def _use_quotactl(mount_point: str | Path) -> bool:
     """Whether this mount's quota operations go through the fd backend.
 
@@ -133,7 +156,9 @@ def _use_quotactl(mount_point: str | Path) -> bool:
         cached = _BACKEND_CACHE.get(key)
     if cached is not None:
         return cached == "quotactl"
-    choice = "quotactl" if xfs_quotactl.available(mount_point) else "subprocess"
+    choice = (
+        "quotactl" if _quotactl_available(mount_point) else "subprocess"
+    )
     if choice == "quotactl":
         logger.info(
             "using the device-free quotactl_fd backend for %s (xfs_quota "
@@ -921,10 +946,40 @@ def cleanup_orphan_project(
                 raise ProjectQuotaError(
                     f"project cleanup failed for {project_dir}: {exc}"
                 ) from exc
-            xfs_quotactl.clear_limit(mount_point, projid)
+            clear_project_limits(mount_point=mount_point, projid=projid)
             return
         command = f"project -C -p {shlex.quote(str(project_dir))} {projid}"
         _local_run_xfs_quota(mount_point, command)
+    clear_project_limits(mount_point=mount_point, projid=projid)
+
+
+def clear_project_limits(
+    *,
+    mount_point: str | Path,
+    projid: int,
+    via_agent: bool = False,
+) -> None:
+    """Reset a released project's block limits so XFS drops its row (N12).
+
+    ``release_project`` clears the *directory's* project state (``project -C``);
+    the accounting then follows the tree the caller removes. The **row** does not
+    go with it: XFS keeps a project record while its limits are non-zero, so a
+    deleted sandbox stayed visible in ``report -p`` as "0 used, hard_blocks=N"
+    until something reset the limits -- and on a running worker the only thing
+    that did was the startup orphan reconciliation. Measured: one create/delete
+    burst left 40 rows, of which a `POST /reconcile` cleaned 36.
+
+    Order matters and is the caller's: run this **after** the tree is gone. With
+    the tree still on disk the row stays anyway (usage > 0) and a teardown that
+    then fails would leave a live sandbox with no disk limit at all.
+    """
+    if via_agent:
+        _agent_call(
+            "clear_limits",
+            mount_point=str(mount_point),
+            projid=int(projid),
+        )
+        return
     if _use_quotactl(mount_point):
         xfs_quotactl.clear_limit(mount_point, projid)
         return

@@ -17,6 +17,7 @@ import errno
 import json
 import os
 import re
+import shutil
 import uuid
 from pathlib import Path
 
@@ -156,20 +157,30 @@ async def test_agent_delete_clears_project_and_dir(xfs_app):
     projid = record.project_id
     assert projid in _report_rows()
     await _delete_sandbox(xfs_app, sandbox_id)
-    # project -C clears the directory's project state and deleting the
-    # directory releases the quota accounting (usage drops to 0). The quota
-    # table entry itself stays as a zero-usage orphan until the E2.x orphan
-    # cleanup milestone (design doc §3.3).
-    assert _report_rows()[projid][0] == 0
+    # N12: the delete finishes its own row. `project -C` clears the directory's
+    # project state, removing the tree zeroes the usage, and the worker then
+    # resets the limits -- XFS drops a record whose usage *and* limits are zero,
+    # so there is nothing left for the next reconciliation (before this, the row
+    # sat at "0 used, hard_blocks=N" until one ran; a create/delete burst left
+    # 40 of them).
+    assert projid not in _report_rows()
     assert not (XFS_MOUNT / sandbox_id).exists()
 
 
 async def test_reconcile_removes_zero_usage_orphan_entry(xfs_app):
-    """Reconciliation drops the zero-usage quota entry E2.2 deletion leaves."""
+    """Reconciliation drops a zero-usage entry nothing else removed.
+
+    This is the case the pass still exists for: N12 made the *delete path*
+    finish its own row, so an entry like this now only appears when the tree
+    disappears without that path running -- a crash between the two, or a tree
+    removed by hand. Planted that way here (the directory goes behind the
+    worker's back), the row is left at zero usage with non-zero limits, which is
+    exactly what the reconciliation resets.
+    """
     sandbox_id, record = await _create_sandbox(xfs_app, disk_mb=8)
     projid = record.project_id
     assert projid in _report_rows()
-    await _delete_sandbox(xfs_app, sandbox_id)
+    shutil.rmtree(XFS_MOUNT / sandbox_id)
     assert _report_rows()[projid][0] == 0
     result = reconcile_orphan_projects(
         workspace_base=XFS_MOUNT,

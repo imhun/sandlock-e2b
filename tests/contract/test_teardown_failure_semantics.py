@@ -412,6 +412,8 @@ class _QuotaFake:
     def __init__(self, rows: dict[int, int] | None = None) -> None:
         self.rows = dict(rows or {})
         self.released: list[tuple[str, int]] = []
+        #: ``(mount_point, projid)`` of every limit reset (N12).
+        self.cleared: list[tuple[str, int]] = []
 
     def install(self, monkeypatch) -> None:
         monkeypatch.setattr(
@@ -420,6 +422,7 @@ class _QuotaFake:
             {
                 "reconcile": self.reconcile,
                 "release": self.release,
+                "clear_limits": self.clear_limits,
                 "provision": self.provision,
             },
         )
@@ -429,6 +432,12 @@ class _QuotaFake:
 
     def release(self, *, project_dir, mount_point, projid) -> None:
         self.released.append((str(project_dir), int(projid)))
+
+    def clear_limits(self, *, mount_point, projid) -> None:
+        # Production's delete path resets the limits *after* removing the tree,
+        # which is what makes XFS drop the quota row (N12). The fake has to model
+        # it, or the warning it logs would be an artefact of the fake.
+        self.cleared.append((str(mount_point), int(projid)))
 
     def provision(self, **kwargs):  # pragma: no cover - never used here
         raise AssertionError("provisioning must not run in these contracts")

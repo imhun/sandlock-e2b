@@ -403,7 +403,17 @@ async def test_delete_cleanup_failure_degrades_with_warning(
             "xfs_quota 'project -C -p /srv/sandboxes/sbx_cleanup_fail 42' failed: boom"
         )
 
+    def fake_clear_limits(**kwargs):
+        # N12 added a second best-effort step to the delete path (reset the
+        # limits once the tree is gone). Both degrades are faked here so the
+        # expectation stays deterministic: going through the real function would
+        # assert on this platform's xfs_quota error text.
+        raise ProjectQuotaError(
+            "xfs_quota 'limit -p bsoft=0 bhard=0 42' failed: boom"
+        )
+
     monkeypatch.setattr(agent, "release_project", fake_release)
+    monkeypatch.setattr(agent, "clear_project_limits", fake_clear_limits)
     _install_disk_projids(
         monkeypatch,
         {workspace / "sbx_cleanup_fail": 42},
@@ -418,6 +428,10 @@ async def test_delete_cleanup_failure_degrades_with_warning(
         *uid_startup_disclosure(),
         "XFS project quota cleanup failed for sbx_cleanup_fail: "
         "xfs_quota 'project -C -p /srv/sandboxes/sbx_cleanup_fail 42' failed: boom",
+        # The second step fails independently and is reported the same way: the
+        # delete is not blocked by either, and the row is left to the reconcile.
+        "XFS project row cleanup failed for sbx_cleanup_fail: "
+        "xfs_quota 'limit -p bsoft=0 bhard=0 42' failed: boom",
     ]
 
 
