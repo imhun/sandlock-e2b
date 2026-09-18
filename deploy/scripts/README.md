@@ -1,5 +1,15 @@
 # E2B-Sandlock 部署 / 升级脚本
 
+> ⛔ **这条线已经停用（2026-09-18）**：目标机 `.140` 上的 compose 栈已经
+> `docker compose down`（**卷保留**：`sandlock_sandbox-shared` 等 4 个），
+> 后续**以 k8s 为主**（自建 k0s 集群，见 [`deploy/k8s-k0s/README.md`](../k8s-k0s/README.md)
+> 与 [`docs/k8s-deployment.md`](../../docs/k8s-deployment.md)）。除非明确必要，
+> **不要**再跑下面的 `bootstrap-target.sh` / `upgrade.sh`。
+>
+> 还在这条线里用到的只有 `build-and-push.sh`：它给**所有**组件打同一个版本号并写
+> `deploy/stack/.version`，而 k8s 的 `deploy/k8s-k0s/apply.sh` 正是按那个版本号 pin 镜像。
+> （`upgrade.sh`、`smoke.sh`、`bootstrap-target.sh` 保留作参考与应急，不再作为常态流程。）
+
 > **k8s 形态不在本文范围内**：`deploy/k8s/` 那套清单的部署顺序、与 compose 的差异表和开关
 > 切换方法见 [`docs/k8s-deployment.md`](../../docs/k8s-deployment.md)。本文只管目标机
 > compose 这条线（堡垒机 → 目标机 → 应用用户 `deploy`）。

@@ -126,7 +126,7 @@ kubectl -n $NS rollout status sts/e2b-worker
 | pid_ns | **开**（2026-09-16 全量） | **开**（2026-09-17 对齐，N10 关闭） | 一致：`kill(pid,0)` 不再是同 pod 进程的存在性探针 |
 | 沙箱身份 | 每沙箱独立 host uid（两 worker 用不重叠段 10000/11000） | 每沙箱独立 host uid（段默认相同，但**共用一个 base ⇒ 共用一个分配器**：`uid_pool.acquire` 先 flock `<base>/.uid_pool.lock`，再按全部 `sandbox.json` + 预约标记重算空闲集 ⇒ 副本之间**不会**发同一个 uid） | 已验（§13）：真集群上 4 个沙箱分布在两个副本、磁盘读出的宿主 uid 互不相同。**前置是锁跨节点**（NAS 上只有 NFSv4.0 成立），autoscaler 上限 2026-09-17 起放开到 16 |
 | route B（槽位） | 每沙箱一个 `sandlock-supervise --uid <槽位>` | 同（`E2B_PRIV_HELPERS=auto`，非 root pod 用镜像里的 file-cap broker） | 一致；broker 依赖上面那 4 个 cap 在**bounding set** 里 |
-| 配额 | stack 内 quota-agent（`E2B_QUOTA_AGENT_URL`），XFS prjquota 已开 | **无 agent 清单 → 降级**（无 per-sandbox 磁盘硬限，一条 WARNING） | 口径写在 §2.4.4；要真配额就把 agent 指到集群内/外（k8s 共享卷是 RWX/NFS，本地直连不可能） |
+| 配额 | stack 内 quota-agent（`E2B_QUOTA_AGENT_URL`），XFS prjquota 已开 | **无 agent → 降级**（无 per-sandbox 磁盘硬限，一条 WARNING）。⚠ **compose 停用后（2026-09-18）这是 k8s 主线上唯一缺的实能力**，见 §20 | 口径写在 §2.4.4；这台集群的共享卷是**托管 NAS**，agent 必须跑在 NFS 服务端 ⇒ 落不下来；真要硬限得换方案（§20） |
 | seccomp | 容器 `seccomp=<deploy/seccomp/sandlock-worker.json>`（compose 直接引用文件） | `Localhost` profile + DaemonSet 安装器 | 语义相同；k8s 多了"每节点装文件"这一步（§2） |
 | 卷 | 命名卷 `sandbox-shared`（宿主 XFS，支持 prjquota） | RWX PVC（NFS/CephFS） | XFS 项目配额只在 XFS 上；NFS 走 agent 那套 |
 | 镜像缓存 | 卷内 `_images`，属主 65534 | 同（initContainer 建/验） | 一致 |
@@ -1133,3 +1133,44 @@ pod-名时代残留的那种行收掉。
 这一批（`0.1.0-350-g212850d-20260918-152008`）已推到两套栈：compose 栈两条冒烟全绿，
 k0s 集群两条冒烟全绿、舰队视图回到 2 个健康节点。那两条旧 id 的行是随控制面重启消失的；
 **清理逻辑本身针对的是"以后不会重启控制面"的场景**，所以它由单测覆盖，而不是靠现场观察。
+
+---
+
+## 20. compose 线停用（2026-09-18）：k8s 成为唯一部署形态
+
+目标机 `.140` 上的 compose 栈已 `docker compose down --remove-orphans`（**卷保留**：
+`sandlock_sandbox-shared` 2.7 G、`sandlock_redis-data`、`sandlock_buildkit-{data,sock}`），
+本机到它的那条 13000 转发也已关闭。之后的常态流程只有一条：
+
+```
+./deploy/scripts/build-and-push.sh     # 所有组件同一个版本号，写 deploy/stack/.version
+deploy/k8s-k0s/apply.sh                # 或 kubectl set image，两者都用那个版本号
+```
+
+`deploy/scripts/` 里其余的（`bootstrap-target.sh` / `upgrade.sh` / `smoke.sh`）保留作参考与
+应急，不再作为常态流程 —— 见 `deploy/scripts/README.md` 顶部的告示。
+
+### 20.1 这次切换带来的一个能力缺口（要记账）
+
+**k8s 形态没有每沙箱磁盘硬限。** compose 那套之所以有，是因为它的工作区在宿主 **XFS** 上，
+而且配额 agent 可以跟栈一起跑；k8s 这边的共享卷是**阿里云托管 NAS（NFS）**，而 NFS 上的
+每沙箱配额只能由**NFS 服务端**执行 —— agent 得跑在那台我们碰不到的存储服务器上。所以：
+
+* 这条不是"忘了写清单"：`deploy/k8s/` 本来就没有 quota-agent 清单是有原因的，
+  现在 compose 停用后它变成**主线唯一的实能力缺口**；
+* 现在 k8s 侧还剩的**软**信号：worker 心跳带 `usedDiskMB`、控制面的 disk-warn/error 计数
+  （`§2.4.4` 的口径）、以及节点层的容量记账（`E2B_NODE_DISK_MB`，避免把节点塞满）；
+* 一个跑飞的沙箱**可以**把 50 GiB 的共享卷写满，进而影响同一 base 上的所有 worker ——
+  这是这条缺口的实际风险面。
+
+三条可选路线（登记在 backlog，未选型）：
+
+1. **换共享存储**：自建 XFS + NFS 服务端（或 CephFS），在服务端跑 agent —— 能力对齐 compose，
+   代价是运维一台存储；
+2. **worker 侧软执行**：定期按 `usedDiskMB` 检查每棵树，超 `diskMB` 就 kill/pause 沙箱 ——
+   不需要 XFS，但语义从"写不进去"变成"超了就被处理"，且需要定阈值与宽限；
+3. **工作区改节点本地 XFS**：硬限天然成立，但丢掉共享 base 的多副本/迁移语义（N13 那套），
+   等于换架构。
+
+在这三条里挑之前，先明确一个口径问题：**k8s 主线上，"每沙箱磁盘配额"是必须的硬需求，
+还是可以接受的降级？**

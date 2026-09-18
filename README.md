@@ -65,9 +65,13 @@ sandbox.kill()
 本地直连远程部署实例跑 SDK 测试（无需起本地服务）：见
 [docs/remote-testing.md](docs/remote-testing.md)。
 
-部署：目标机 compose 走 [deploy/scripts/README.md](deploy/scripts/README.md)；
+部署：**以 k8s 为主**（2026-09-18 起；目标机 `.140` 上的 compose 栈已停用，卷保留）。
 k8s 清单（`deploy/k8s/`）的部署顺序、与 compose 的差异表、开关切换与验证清单见
-[docs/k8s-deployment.md](docs/k8s-deployment.md)。
+[docs/k8s-deployment.md](docs/k8s-deployment.md)，自建 k0s 集群的落法见
+[deploy/k8s-k0s/README.md](deploy/k8s-k0s/README.md)。
+compose 那条线（[deploy/scripts/README.md](deploy/scripts/README.md)）保留作参考与应急，
+除非必要不再运行；其中 `build-and-push.sh` 仍是镜像构建入口（k8s 按它写下的
+`deploy/stack/.version` pin tag）。
 
 跑 lane / 构建 wheel / 部署前先过一遍
 [docs/build-test-deploy-pitfalls.md](docs/build-test-deploy-pitfalls.md)：
