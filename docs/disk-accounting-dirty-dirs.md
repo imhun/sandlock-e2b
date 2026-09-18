@@ -324,3 +324,46 @@ worker 都以 root 挂载**，两节点分别实测 `WRITE OK as 0:0` / `WRITE O
    的属主即告警），这套扫描同时就是**越界写的检测器** —— 成本几乎为零，因为 walk 已经存在；
 3. 若采纳建议 ①（把 `host_uid`/卷切片归属的权威搬到 `SandboxRecord`/Redis），则"脏目录账"
    依赖的树内元数据也不再是信任来源，两条线（配额与安全）在这里合流。
+
+## 12. 平台文件与用户 workspace 分离（A，2026-09-18 落地并验证）
+
+**起因**（实测，不是推理）：沙箱**拥有自己树的目录**（`0770 <sandbox uid>:<worker gid>`），而拥有目录就等于**能 unlink**——`rm sandbox.json` 成功、再写一份自己的也成功（0644 只挡住"原地改"）。平台把一个舰队级不变量（`host_uid`、卷切片）的来源放在这种文件里，才有后面一连串防御（`_verified_*` 的 W7/C2 校验、uid 池的磁盘扫描、`_prune_store`、teardown 的名字校验）。
+
+**新布局**：
+
+```
+<base>/
+├── <sandbox_id>/            ← 用户树（沙箱的 /home/user，0770 sandbox uid）
+└── _runtime/<sandbox_id>/   ← 平台文件：sandbox.json + command-logs.jsonl
+                               （0700，属主 = worker，绝不给 sandbox uid）
+```
+
+**读写权限也分离了**（这是 A 的第二个收益，实测确认）：
+
+| 动作（沙箱内） | 结果 |
+|---|---|
+| 写自己的 workspace | ✅ 正常 |
+| `ls /home/user/../_runtime` | ❌ No such file or directory |
+| `cat /home/user/../_runtime/<id>/sandbox.json` | ❌ **Permission denied** |
+| `touch /home/user/../_runtime/<id>/pwned` | ❌ **Permission denied** |
+
+两层都在起作用：Landlock 的 `fs_writable` 只含用户树，DAC 的 `0700`+worker 属主是第二道。
+
+**顺带解决/收窄的**：
+
+* **配额口径变纯**：`priv_helpers.dir_size` 与 L2b 的实测值现在只统计用户数据——此前 `sandbox.json`（649 B）+ `command-logs.jsonl`（随命令数增长）都算进用户的 `diskMB`；
+* **快照 payload 变纯**：`fs/` 只拷用户数据（此前会把 record 与日志一起拷进快照）；
+* **"牢外写者"少一个**：命令日志不再写进用户树，L2b 的 `mark_dir_dirty` 清单里少一项（SDK 上传仍在树里，但那是用户数据，本就该计入）。
+
+**实现与兼容**（`gateway_common/paths.py` 是唯一定义处）：
+
+* `sandbox_runtime_dir()` / `sandbox_record_path()` / `sandbox_command_log_path()`，都支持 `legacy=True` 指回旧位置；
+* 读取一律"新路径优先、旧路径回退"；**写入即迁移**（写完新记录顺手删掉树里的旧副本）；启动时 `RuntimeRegistry.adopt_legacy_records()` 把残留的旧记录搬进 `_runtime/`（逐条 WARNING：其内容来自沙箱可改写的文件，而舰队级值以控制面为准）；
+* **谓词**：`is_sandbox_workspace_dir` 对 `_`/`snap_` 前缀的目录改为"**旧位置有 record，或 `_runtime/<name>/` 有 record**"——否则客户端自选 id（如 `snap_client1`）的树会被误判出候选集（M1 那条泄漏）；
+* **建箱侧拒绝保留名**：`X-Sandbox-Id` 命中 `RESERVED_PLATFORM_NAMESPACES`（含新增的 `_runtime`）直接 400 —— 否则一个叫 `_runtime` 的沙箱会坐在自己的记录上；
+* **成对收尾**：删除时 `_runtime/<id>` 与树一起删（且**不**在 `unregister` 里删：被拒绝的拆除要把记录留在盘上，供下一次删除校验，W7）；`park` 把平台文件一起搬进隔离区（保留"证据成对"的语义）；
+* 收尾用的是 `_registry_workspace_base(runtime_registry, settings)` 而不是 `settings.workspace_base`——两者可以不同，而记录是从 registry 的 base 读出来的。
+
+**验证**：单测+契约 **1358 passed**（仅 3 个既有 macOS-only 失败）；`deployment_smoke`/`multinode_smoke` 全绿；集群实测权限矩阵如上、`/logs` 仍能读到日志、`_runtime` 随删除清空；版本 `0.1.0-368-g65b1747`。
+
+**仍未做**：卷切片 `projid` 归属的权威仍在卷内（本仓库 §11 末尾那条；等真接上支持 per-sandbox 配额的存储或 quota agent 时再做——届时它落到 `_runtime/` 即天然不可被沙箱改写）。
