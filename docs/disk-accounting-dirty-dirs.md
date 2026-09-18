@@ -143,6 +143,18 @@
 
 ## 5. 预期收益（基于 §5.2 实测的 venv 形状：524 目录 / 3 446 文件）
 
+> **✅ 已实现并在集群实测（2026-09-19，`0.1.0-394-g0f2ae02`，`docs/k8s-deployment.md` §22.2）**。
+> 实测：**400 目录 / 2000 文件**的树，整树 walk **1043.9 ms** → 只重扫 1 个脏目录 **2.34 ms（446x）**；
+> 验收探针在沙箱内独立量出的字节数与平台上报**逐字节相等**（变异序列 6144=6144、追加写 12144=12144）。
+> **两处设计修正**：① 打点必须在 `chroot/dispatch.rs` 的**两个写 handler 内部**（`handle_chroot_open`
+> 的写意图分支 + `handle_chroot_write`），不能像 §4.1 写的那样"在 handler 链上新增 builtin"——
+> chroot 的写 handler 以 `ReturnValue` 短路，链后面的 handler 看不到；② **pure 形态没有 openat
+> 通知**（`chroot_path_syscalls()` 只在 chroot 形态进计划表），所以该形态永久回落整树 walk。
+> **另外补了两条边界**（§4.2 只写了"对账"，第一轮实测证明不够）：**grace**
+> （`E2B_DISK_DIRTY_GRACE_S=120 s`，被写过的目录持续复检）与 **reconcile**
+> （`E2B_DISK_RECONCILE_INTERVAL_S=900 s`，定期真实 walk 重建）。原因是一次实测：写 1000 B →
+> 睡 12 s → 再写 5000 B（`open` 之后没有任何路径 syscall），平台只报 7144/12144。
+
 | 场景 | 今天（整树 walk） | 脏目录方案 |
 |---|---|---|
 | 稳态（这一轮改了几个文件） | 1.27 s / 轮 | **2.4 ms / 轮** |

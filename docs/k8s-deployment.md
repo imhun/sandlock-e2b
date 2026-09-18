@@ -1326,6 +1326,44 @@ stdin），然后只做**读**回填响应。路径语义不变（`/foo` 仍然�
 > 仍然没有的是**写到一半的 ENOSPC**（per-write），它需要写路径中介记账，见
 > `docs/disk-accounting-dirty-dirs.md` §13。
 
+### 22.2 记账改成增量（N25/L2c，2026-09-19）
+
+上面 §21.1 那一版每轮走**整棵树**。这台 NAS 上实测（`e2b-worker-0` 里直接跑）：
+
+```
+400 目录 / 2000 文件的一棵树：
+  整树 walk（被替换的做法）:  1043.9 ms
+  只重扫 1 个被报脏的目录:       2.34 ms      ⇒ 446x
+```
+
+于是把"哪些目录变了"交给**中介**：它本来就解析每一次写的路径（它就是执行策略的那个组件），
+所以能说出"这些目录自上次问你之后被写过"。worker 只重扫这些目录。
+
+| 层 | 落点 |
+|---|---|
+| fork | `crates/sandlock-core/src/dirty.rs`：写意图路径的**父目录**集合，上限 4096，超了置 `overflow`（上层改走整树 walk）；打点在 `handle_chroot_open` 的写意图分支与 `handle_chroot_write` 里 —— **不是** handler 链上的新 builtin（chroot 的写 handler 以 `ReturnValue` 短路，链后面的 handler 根本看不到） |
+| 导出 | in-process 走 FFI `sandlock_instance_drain_dirty_dirs`；route-B（生产形态）走 slot 的 `dirty_dirs` verb。两者都是**新增**符号/动词，调用方能力探测 |
+| worker | `DirLedger`：每目录 own bytes + 总量，只替换被报脏的子树；`E2B_DISK_ENFORCE_DIRTY`（默认关，清单里开） |
+
+**两条边界（缺一不可，第二条是第一轮实测抓出来的）**：
+
+* **grace**（`E2B_DISK_DIRTY_GRACE_S=120`）：被写过的目录在这段时间内持续复检。中介只在**路径**
+  syscall 上打点，所以"开一个文件、过一会儿再追加"（日志）在 `open` 之后不再产生任何路径 syscall
+  —— 实测：写 1000 B → 睡 12 s（超过 5 s 扫描间隔）→ 再写 5000 B，平台只报 7144/12144。
+  加上 grace 后同一条用例逐字节相等。
+* **reconcile**（`E2B_DISK_RECONCILE_INTERVAL_S=900`）：无论增量路径看起来多健康，账本每 15 分钟
+  从一次**真实整树 walk** 重建。中介**结构上**看不见的东西（描述符开着超过 grace、别的信任域写的）
+  只有这条兜得住 —— 换成增量之前，"永远错"不是可能，是没有东西会去发现。
+
+**验收**：`tmp/k0s/probe_dir_ledger.py` —— 在**沙箱内**独立量出树大小（`os.walk`+`getsize`，与
+`priv_helpers.dir_size` 同口径），与平台上报的 `diskUsed` **逐字节相等**：变异序列
+（多层新文件 / 新目录 / rename / 整枝删除）**6144 = 6144**，追加写场景 **12144 = 12144**。
+worker 同时打印每轮用了哪条路，避免"功能其实是空转"看不出来：
+`disk accounting: ledger=13 rebuilt=0 walk=0`（连续 13 轮全部来自账本）。
+
+**为什么这条是 ③ 的前提**：`max_file_size` 要取"剩余额度"，剩余就必须够新；整树 walk 的陈旧度是
+`间隔 × ⌈树数 ÷ 每轮扫到的树数⌉`，增量之后第一项（5 s）才占主导。
+
 ### 22.1 集群验收（2026-09-19，`0.1.0-388-ge76d38e-20260919-010638`）
 
 `tmp/k0s/probe_n28_acceptance.py`（可复跑，逐条打印证据）全绿，实测输出要点：
