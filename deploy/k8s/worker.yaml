@@ -302,11 +302,21 @@ spec:
               value: "200"
             - name: E2B_NODE_DISK_MB
               value: "4096"
-            # N25/L2b + N28/D: how often this worker walks each sandbox tree and
-            # reports the measured bytes on its heartbeat. 0 disables the
+            # N25/L2b + N28/D: how often this worker rewalks each sandbox tree
+            # and reports the measured bytes on its heartbeat. 0 disables the
             # report entirely -- and with it the only thing that catches a
             # sandbox writing *past* its sold budget (the admission ledger
             # bounds what was sold, not what exists), so leave it on.
+            #
+            # 5 s = the heartbeat's own cadence, which is the floor for *this*
+            # path: a report is acted on at the next pulse, so a faster walk
+            # would only make the number fresher than the moment it is read.
+            # The walk itself runs on a worker thread, so a short interval
+            # cannot stall the heartbeat or the file API -- it costs NAS reads
+            # (measured: ~2.4 ms per directory, ~3.5 us per file) and, while
+            # the walk is still whole-tree, staleness is
+            # `interval x ceil(trees / trees-per-round)` because one round gets
+            # a 1 s budget.
             #
             # The measured number is not only the pause trigger: the control
             # plane stores it on the sandbox record, where it is what
@@ -315,11 +325,10 @@ spec:
             # its budget (1340 MiB used of 1024 MiB)").
             #
             # Cost was measured, not assumed (docs/disk-accounting-dirty-dirs.md
-            # §5.2): ~3.5 us/file and ~2.4 ms/directory on this NAS. A round
-            # stops at a 1 s budget and resumes where it left off, so the
-            # interval is not a bound on how long a walk may take.
+            # §5.2): ~3.5 us/file and ~2.4 ms/directory on this NAS, and a
+            # round stops at a 1 s budget and resumes where it left off.
             - name: E2B_DISK_ENFORCE_INTERVAL_S
-              value: "30"
+              value: "5"
             - name: E2B_NODE_PROCESSES
               value: "256"
           resources:

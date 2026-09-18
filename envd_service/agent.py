@@ -171,12 +171,26 @@ def _register_payload(settings: Settings) -> dict[str, Any]:
 def _disk_enforce_interval_s() -> float:
     """How often the worker rewalks sandbox trees for the disk report.
 
-    ``E2B_DISK_ENFORCE_INTERVAL_S`` (default 30 s); ``0`` disables the report
+    ``E2B_DISK_ENFORCE_INTERVAL_S`` (default 5 s); ``0`` disables the report
     entirely, which turns the control plane's measured-disk gate off with it.
+
+    The default is the heartbeat's own cadence, and that is the honest floor
+    for *this* path: the report rides a heartbeat, so a round finished 1 ms
+    after the last pulse still waits up to 5 s to be acted on. Below the
+    cadence buys nothing here and costs NAS reads.
+
+    What the interval does *not* bound is how long the worker is held: the walk
+    runs on a thread (``_scan_disk_round``), so a short interval cannot stall
+    the heartbeat or a request. What it bounds is staleness of the number --
+    and with a whole-tree walk that staleness is really
+    ``interval x ceil(trees / trees-per-round)``, because each round only gets
+    ``_DISK_SCAN_BUDGET_S``. Dirty-directory accounting
+    (``docs/disk-accounting-dirty-dirs.md`` §4) is what makes a round cheap
+    enough that the first term dominates.
     """
     from gateway_common.env import env_float
 
-    return env_float("E2B_DISK_ENFORCE_INTERVAL_S", 30.0)
+    return env_float("E2B_DISK_ENFORCE_INTERVAL_S", 5.0)
 
 
 def _heartbeat_usage_payload(
@@ -1362,6 +1376,10 @@ class NodeAgent:
         self._disk_interval_s = _disk_enforce_interval_s()
         self._disk_report: dict[str, int] = {}
         self._disk_report_at = 0.0
+        #: The scan round in flight, if any (single-flight, like the reconcile
+        #: round): the heartbeat reads the last completed report and never
+        #: waits for a walk.
+        self._disk_scan_task: asyncio.Task | None = None
         self._node_id: str | None = None
         self._task: asyncio.Task | None = None
         #: The reconcile round currently running, if any. The round is its own
@@ -1460,26 +1478,45 @@ class NodeAgent:
         self._start_reconcile_if_due()
 
     def _disk_report_for_heartbeat(self) -> dict[str, int]:
-        """The last measured tree sizes, refreshed on its own cadence.
+        """The last measured tree sizes; a fresh scan is started, never awaited.
 
-        Runs the (blocking, file-system) scan on the event loop's thread by
-        design: it is a few milliseconds per sandbox with a hard scan budget
-        (``disk_usage_snapshot(budget_s=...)``), and moving it to a thread
-        would buy nothing but a race with the next heartbeat.
+        The scan is a blocking file-system walk, so it runs on a worker thread
+        with a single-flight guard (the same shape N21 gave the reconcile
+        round) and this returns whatever the last completed round produced.
+        Awaiting it here would put the whole NAS walk back on the event loop --
+        which is what capped the cadence: with the walk inline, a round could
+        hold the loop for its whole 1 s budget, so ``E2B_DISK_ENFORCE_INTERVAL_S``
+        had to be minutes wide to keep the duty cycle harmless.
+
+        Now the interval only decides *when the next round starts*, never how
+        long the loop is held, and a round that outruns its interval simply
+        means the next one starts late. The floor that remains is the heartbeat
+        it rides (5 s): a report is only acted on at the next pulse.
         """
         if self._disk_provider is None or self._disk_interval_s <= 0:
             return {}
         now = time.monotonic()
-        if now - self._disk_report_at < self._disk_interval_s:
-            return self._disk_report
+        in_flight = self._disk_scan_task is not None and not self._disk_scan_task.done()
+        if not in_flight and now - self._disk_report_at >= self._disk_interval_s:
+            self._disk_scan_task = asyncio.create_task(self._scan_disk_round())
+        return self._disk_report
+
+    async def _scan_disk_round(self) -> None:
+        """Run one scan round off the loop and publish what it found."""
+        # The cadence is claimed *before* the walk, so a failing or slow round
+        # cannot turn the heartbeat into a scan storm: the next one waits for
+        # the interval either way.
+        self._disk_report_at = time.monotonic()
         try:
-            report = self._disk_provider(budget_s=_DISK_SCAN_BUDGET_S)
+            report = await asyncio.to_thread(
+                self._disk_provider, budget_s=_DISK_SCAN_BUDGET_S
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.warning("sandbox disk scan failed", exc_info=True)
-            return self._disk_report
+            return
         self._disk_report = dict(report or {})
-        self._disk_report_at = now
-        return self._disk_report
 
     def _start_reconcile_if_due(self) -> None:
         """Start one reconcile round as its own task, if one is due.
@@ -2028,7 +2065,7 @@ class NodeAgent:
         running through shutdown (touching the shared base while the process is
         tearing its state down).
         """
-        for attribute in ("_task", "_reconcile_task"):
+        for attribute in ("_task", "_reconcile_task", "_disk_scan_task"):
             task: asyncio.Task | None = getattr(self, attribute)
             if task is None:
                 continue
