@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Request, Response
 
 from envd_service.http.auth import HttpAuthError, require_http_sandbox
+from envd_service.runtime import brief_stat
 
 router = APIRouter()
 
@@ -44,7 +45,7 @@ def _dir_size(path: Path) -> int:
         for root, dirs, files in os.walk(path):
             for name in files:
                 try:
-                    total += os.path.getsize(os.path.join(root, name))
+                    total += brief_stat.entry_size(os.path.join(root, name))
                 except OSError:
                     pass
     except OSError:

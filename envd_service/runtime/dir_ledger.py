@@ -7,11 +7,20 @@ enough to run for a large one -- so this ledger keeps the answer *and* the
 per-directory breakdown, and updates only what the mediator saw change.
 
 The two numbers must agree exactly. `DirLedger.total_bytes` is the same
-quantity as `priv_helpers.dir_size` -- the sum of `os.path.getsize` over every
+quantity as `priv_helpers.dir_size` -- the sum of the size of every
 non-directory entry `os.walk` yields -- and the contract is byte equality, not
 approximation: an accounting that drifts is worse than a slow one, because
 nothing notices. `tests/unit/test_dir_ledger.py` pins that equality against the
 full walk over random mutation sequences.
+
+That size comes from :func:`envd_service.runtime.brief_stat.entry_size`, not
+from `os.path.getsize`, and the difference is the whole point of this file's
+cost model: on NFS, `stat` of a file whose dirty pages are still in this
+client's page cache flushes them to the server first (`nfs_getattr`) and waits
+-- measured at 1405 ms for a file being written at speed, against 0.01 ms for
+the same number asked with `statx(STATX_SIZE)`. A ledger that wants to answer
+"what has this workspace grown to" every second cannot afford to ask in the
+form that also says "and please finish writing it".
 
 Two properties of the split matter to the reader:
 
@@ -34,6 +43,8 @@ import time
 from collections.abc import Iterable
 from pathlib import Path
 
+from envd_service.runtime.brief_stat import entry_size
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,8 +63,9 @@ def scan_subtree(root: Path, rel: str) -> dict[str, int]:
     ``rel`` itself is always present (possibly with 0 bytes), so a caller
     replacing a subtree has something to subtract even for a directory that
     became empty. Symlinks are counted by their target's size and never
-    followed as directories -- exactly what ``os.walk`` + ``getsize`` does in
-    ``priv_helpers.dir_size``, which is the number this must match.
+    followed as directories -- exactly what ``os.walk`` plus the same size
+    probe does in ``priv_helpers.dir_size``, which is the number this must
+    match.
     """
 
     start = root / rel if rel else root
@@ -70,7 +82,7 @@ def scan_subtree(root: Path, rel: str) -> dict[str, int]:
             owned = 0
             for name in files:
                 try:
-                    owned += os.path.getsize(os.path.join(dirpath, name))
+                    owned += entry_size(os.path.join(dirpath, name))
                 except OSError:
                     continue
             found[rel_dir] = owned
