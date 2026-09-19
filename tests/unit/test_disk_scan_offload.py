@@ -43,6 +43,26 @@ class _BlockingRegistry:
         return {}
 
 
+class _RecordingRegistry(_BlockingRegistry):
+    """A registry that crosses a budget once, then stays over it."""
+
+    def __init__(self, *, release: threading.Event) -> None:
+        super().__init__(release=release)
+        self._over = False
+
+    def disk_usage_snapshot(
+        self, *, budget_s: float | None = None, dirty: bool = False
+    ) -> dict[str, int]:
+        self.calls += 1
+        return {"sbx_cross": 2048}
+
+    def take_budget_crossings(self) -> dict[str, int]:
+        if self._over:
+            return {}
+        self._over = True
+        return {"sbx_cross": 2048}
+
+
 def _agent(registry, workspace, *, interval: float = 0.001) -> NodeAgent:
     settings = Settings(workspace_base=str(workspace))
     settings.disk_enforce_interval_s = interval  # type: ignore[attr-defined]
@@ -138,3 +158,34 @@ async def test_a_disabled_interval_never_scans(tmp_path, release):
     assert agent._disk_report_for_heartbeat() == {}
     assert agent._disk_scan_task is None
     assert registry.calls == 0
+
+
+async def test_a_crossing_is_pushed_without_waiting_for_the_pulse(tmp_path, release):
+    """N25: a sandbox that just went over its budget is reported at once.
+
+    Everything else can ride the pulse (it is the metric, and drift); a sandbox
+    that has *crossed* its budget is the one case where each second of delay is
+    another second of writing, because the control plane's answer is to freeze
+    it.
+    """
+    release.set()
+    registry = _RecordingRegistry(release=release)
+    agent = _agent(registry, tmp_path)
+    pushed: list[dict[str, int]] = []
+
+    async def _record_push(usage) -> None:
+        pushed.append(dict(usage))
+
+    agent._push_disk_report = _record_push  # type: ignore[assignment]
+    agent._disk_report_for_heartbeat()
+    await agent._disk_scan_task
+    await asyncio.sleep(0)
+
+    assert pushed == [{"sbx_cross": 2048}]
+    assert agent._push_task is not None
+
+    # ...and a sandbox that *stays* over budget is not news: no second push.
+    agent._disk_report_for_heartbeat()
+    await agent._disk_scan_task
+    await asyncio.sleep(0)
+    assert pushed == [{"sbx_cross": 2048}]

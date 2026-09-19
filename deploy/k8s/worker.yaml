@@ -328,7 +328,7 @@ spec:
             # §5.2): ~3.5 us/file and ~2.4 ms/directory on this NAS, and a
             # round stops at a 1 s budget and resumes where it left off.
             - name: E2B_DISK_ENFORCE_INTERVAL_S
-              value: "5"
+              value: "1"
             # N25/L2c: build the report from each sandbox's *mediator* instead
             # of walking every tree. The mediator sees every write the sandbox
             # makes (it already resolves every path), so it can say which

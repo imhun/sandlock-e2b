@@ -171,26 +171,21 @@ def _register_payload(settings: Settings) -> dict[str, Any]:
 def _disk_enforce_interval_s() -> float:
     """How often the worker rewalks sandbox trees for the disk report.
 
-    ``E2B_DISK_ENFORCE_INTERVAL_S`` (default 5 s); ``0`` disables the report
+    ``E2B_DISK_ENFORCE_INTERVAL_S`` (default 1 s); ``0`` disables the report
     entirely, which turns the control plane's measured-disk gate off with it.
 
-    The default is the heartbeat's own cadence, and that is the honest floor
-    for *this* path: the report rides a heartbeat, so a round finished 1 ms
-    after the last pulse still waits up to 5 s to be acted on. Below the
-    cadence buys nothing here and costs NAS reads.
-
-    What the interval does *not* bound is how long the worker is held: the walk
-    runs on a thread (``_scan_disk_round``), so a short interval cannot stall
-    the heartbeat or a request. What it bounds is staleness of the number --
-    and with a whole-tree walk that staleness is really
-    ``interval x ceil(trees / trees-per-round)``, because each round only gets
-    ``_DISK_SCAN_BUDGET_S``. Dirty-directory accounting
-    (``docs/disk-accounting-dirty-dirs.md`` §4) is what makes a round cheap
-    enough that the first term dominates.
+    The interval is when the next *drain* starts, and with dirty-directory
+    accounting a round costs what changed rather than what exists (measured:
+    2.34 ms to re-check one reported directory, against 1043.9 ms for a
+    whole-tree walk of 400 directories). It is no longer the bound on how
+    *fast* an over-budget sandbox is acted on: a sandbox that crosses its
+    budget is reported out of band the moment the round sees it
+    (``_report_budget_crossings``), and the periodic report is for everything
+    else -- the metric, and drift.
     """
     from gateway_common.env import env_float
 
-    return env_float("E2B_DISK_ENFORCE_INTERVAL_S", 5.0)
+    return env_float("E2B_DISK_ENFORCE_INTERVAL_S", 1.0)
 
 
 def _disk_enforce_dirty_enabled() -> bool:
@@ -1399,6 +1394,9 @@ class NodeAgent:
         #: round): the heartbeat reads the last completed report and never
         #: waits for a walk.
         self._disk_scan_task: asyncio.Task | None = None
+        #: N25: the out-of-band report for a sandbox that just crossed its
+        #: budget (see `_report_budget_crossings`).
+        self._push_task: asyncio.Task | None = None
         self._node_id: str | None = None
         self._task: asyncio.Task | None = None
         #: The reconcile round currently running, if any. The round is its own
@@ -1538,6 +1536,64 @@ class NodeAgent:
             logger.warning("sandbox disk scan failed", exc_info=True)
             return
         self._disk_report = dict(report or {})
+        self._report_budget_crossings()
+
+    def _report_budget_crossings(self) -> None:
+        """Push a sandbox that just crossed its budget, without waiting (N25).
+
+        The report normally rides the heartbeat, which means a sandbox can keep
+        writing for up to a full pulse after it is known to be over. A
+        *crossing* is the one moment worth a report of its own: the control
+        plane's answer is to freeze the sandbox, so every second of delay is a
+        second of writing.
+        """
+        taker = getattr(self._disk_provider, "__self__", None)
+        take = getattr(taker, "take_budget_crossings", None)
+        if take is None:
+            return
+        crossings = take()
+        if not crossings:
+            return
+        logger.info(
+            "sandbox disk budget crossed for %s; reporting immediately",
+            ",".join(sorted(crossings)),
+        )
+        self._push_task = asyncio.create_task(self._push_disk_report(crossings))
+
+    async def _push_disk_report(self, usage: dict[str, int]) -> None:
+        """Send one out-of-band usage report (N25).
+
+        Same endpoint and credentials as the pulse -- it *is* a heartbeat, with
+        only the disk field in it -- because the control plane's disk gate hangs
+        off that route and the node's liveness is refreshed by the same call. A
+        failure is logged and dropped: the next pulse carries the same numbers
+        anyway, so a missed push costs latency, never correctness.
+        """
+        if self._node_id is None:
+            return
+        import httpx
+
+        # Only the disk report: this is not a replacement pulse, and sending
+        # the full usage twice per interval would double every other report.
+        payload = {"sandboxDiskUsage": dict(usage)}
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{self._control_url}/internal/nodes/{self._node_id}/heartbeat",
+                    json=payload,
+                    headers={"X-Internal-Key": self._settings.internal_api_key},
+                )
+            if resp.status_code == 404:
+                self._node_id = None
+            elif resp.status_code != 204:
+                logger.warning(
+                    "out-of-band disk report rejected by %s: %s %s",
+                    self._control_url,
+                    resp.status_code,
+                    resp.text[:200],
+                )
+        except Exception:
+            logger.warning("out-of-band disk report failed", exc_info=True)
 
     def _start_reconcile_if_due(self) -> None:
         """Start one reconcile round as its own task, if one is due.
@@ -2086,7 +2142,7 @@ class NodeAgent:
         running through shutdown (touching the shared base while the process is
         tearing its state down).
         """
-        for attribute in ("_task", "_reconcile_task", "_disk_scan_task"):
+        for attribute in ("_task", "_reconcile_task", "_disk_scan_task", "_push_task"):
             task: asyncio.Task | None = getattr(self, attribute)
             if task is None:
                 continue

@@ -195,6 +195,10 @@ class RuntimeRegistry:
         #: exist while `E2B_DISK_ENFORCE_DIRTY` selects this path.
         self._dirty_grace_s = _env_seconds("E2B_DISK_DIRTY_GRACE_S", 120.0)
         self._dirty_reconcile_s = _env_seconds("E2B_DISK_RECONCILE_INTERVAL_S", 900.0)
+        #: N25: sandboxes that are over budget now, and the ones that *just*
+        #: crossed (the latter is the event worth reporting immediately).
+        self._disk_over: set[str] = set()
+        self._disk_crossings: dict[str, int] = {}
         #: N25/L2b: where the next ``disk_usage_snapshot`` round starts, so a
         #: scan budget that runs out does not always starve the same trees.
         self._disk_scan_cursor = 0
@@ -292,6 +296,7 @@ class RuntimeRegistry:
                     self._dirty_stats["walk"] += 1
             if size is not None:
                 usage[record.sandbox_id] = int(size)
+                self._note_budget_crossing(record, int(size))
             scanned += 1
         if dirty:
             self._log_dirty_split()
@@ -327,6 +332,33 @@ class RuntimeRegistry:
             ledger.apply([Path(path).parent])
         except DirLedgerUnknown:
             ledger.invalidate()
+
+    def _note_budget_crossing(self, record: RuntimeSandbox, size: int) -> None:
+        """Note a sandbox that has just gone over its budget (N25).
+
+        The report rides the heartbeat, which is up to a full interval late; a
+        sandbox that has *crossed* its budget is the one case worth pushing
+        immediately (see `take_budget_crossings`), because the control plane's
+        answer is to freeze it -- and until it does, it keeps writing. Only the
+        crossing is an event: a sandbox that stays over budget is not news, and
+        re-pushing it every round would be a second heartbeat.
+        """
+        budget = int(record.disk_mb) * 1024 * 1024
+        with self._lock:
+            over = budget > 0 and size > budget
+            if not over:
+                self._disk_over.discard(record.sandbox_id)
+                return
+            if record.sandbox_id not in self._disk_over:
+                self._disk_over.add(record.sandbox_id)
+                self._disk_crossings[record.sandbox_id] = size
+
+    def take_budget_crossings(self) -> dict[str, int]:
+        """Sandboxes that crossed their budget since the last call (N25)."""
+        with self._lock:
+            crossings = self._disk_crossings
+            self._disk_crossings = {}
+            return crossings
 
     def refresh_disk_usage(self, sandbox_id: str) -> int | None:
         """The tree's size *now*, from the ledger (N25/L2c), or ``None``.
