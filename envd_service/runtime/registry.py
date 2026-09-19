@@ -189,6 +189,9 @@ class RuntimeRegistry:
         #: N25: the last number reported per sandbox. Pushed appends are
         #: increments on *this*, not on the walk (see `_reported_usage`).
         self._reported: dict[str, int] = {}
+        #: N25: the cumulative bytes the mediator has watched since the last
+        #: round with nothing to push (see `_reported_usage`).
+        self._pushed_total: dict[str, int] = {}
         #: N25: the live tightener (`f(sandbox_id, bytes) -> applied | None`),
         #: installed by the app. Absent means "no live tightening": the
         #: per-exec ceiling and the pause gate still hold.
@@ -475,14 +478,38 @@ class RuntimeRegistry:
     def _reported_usage(self, sandbox_id: str, walk: int, pushed: int) -> int:
         """What to report for one sandbox this round (N25).
 
-        ``max(walk, previous + pushed)``: the pushed bytes are relative to the
-        last report, the walk is a floor, and the larger of the two wins. See
-        the call site for why a sum is wrong -- it double counts every byte the
-        push reported and the walk later committed.
+        The push and the walk measure the *same* bytes from two sides -- the
+        sandbox's own descriptors, and what the server has committed -- and
+        neither knows which bytes the other has already seen. They are
+        therefore combined as two estimates of the same quantity, never added:
+
+            reported = max(walk, bytes the mediator has watched since the
+                                 last round that had nothing to push)
+
+        The push side is *cumulative*, not a per-round increment: that is what
+        makes a late sample harmless (the walk it duplicates is already
+        covered by the max) and what makes an early one visible. A round with
+        nothing pushed re-bases it on the walk, which is when the filesystem is
+        authoritative -- and it is what lets a *deletion* come back down.
+
+        Measured on the cluster, the naive `walk + pushed` reported 287 MiB for
+        a 287 MiB file (the commit landed between two rounds) and 647 MiB for
+        the same file a round later (§22.5.8), which cut a legal 900 MiB file
+        with EFBIG at 696 MiB. Measured with the *previous* fix -- `max(walk,
+        previous + pushed)` -- a 700 MiB fill was reported as 777 MiB, because
+        the mediator's samples of it arrived after the walk had banked the same
+        bytes; the 77 MiB of phantom usage left a new file only 247 MiB of a
+        324 MiB budget. Anchoring removes both: a byte the walk already counted
+        is inside the anchor, not on top of it.
+
+        A round with nothing pushed re-anchors on the walk: that is when the
+        filesystem is authoritative, and it is what lets a *deletion* come
+        back down.
         """
         with self._lock:
-            previous = self._reported.get(sandbox_id, 0)
-            reported = max(walk, previous + pushed) if pushed > 0 else walk
+            total = 0 if pushed <= 0 else self._pushed_total.get(sandbox_id, 0) + pushed
+            self._pushed_total[sandbox_id] = total
+            reported = max(walk, total)
             self._reported[sandbox_id] = reported
             return reported
 
@@ -493,9 +520,11 @@ class RuntimeRegistry:
         appends *and* must not take them from the round that reports them.
         """
         with self._lock:
-            previous = self._reported.get(sandbox_id, 0)
             pushed = self._appended.get(sandbox_id, 0)
-            return max(walk, previous + pushed) if pushed > 0 else walk
+            if pushed <= 0:
+                return walk
+            total = self._pushed_total.get(sandbox_id, 0) + pushed
+            return max(walk, total)
 
     def note_local_write(self, sandbox_id: str, path: str | Path) -> None:
         """Record a write the **worker itself** made inside a sandbox tree.
@@ -850,6 +879,7 @@ class RuntimeRegistry:
             self._ledgers.pop(sandbox_id, None)
             self._appended.pop(sandbox_id, None)
             self._reported.pop(sandbox_id, None)
+            self._pushed_total.pop(sandbox_id, None)
             self._tightened.pop(sandbox_id, None)
             self._tightened_at.pop(sandbox_id, None)
             try:
@@ -1011,6 +1041,7 @@ class RuntimeRegistry:
             self._ledgers.pop(sandbox_id, None)
             self._appended.pop(sandbox_id, None)
             self._reported.pop(sandbox_id, None)
+            self._pushed_total.pop(sandbox_id, None)
             self._tightened.pop(sandbox_id, None)
             self._tightened_at.pop(sandbox_id, None)
             self._tombstones[sandbox_id] = (

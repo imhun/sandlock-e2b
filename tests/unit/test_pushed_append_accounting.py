@@ -68,6 +68,26 @@ def test_a_round_does_not_count_a_byte_twice_when_the_walk_catches_up(tmp_path):
     assert registry.disk_usage_snapshot(dirty=True) == {"sbx_once": 5120}
 
 
+def test_a_late_sample_of_bytes_the_walk_already_banked_is_not_added_twice(tmp_path):
+    """The cluster's 700 -> 777 MiB phantom, pinned.
+
+    A 700 MiB fill was reported as 777 MiB because the mediator's samples of it
+    arrived *after* the walk had already banked the same bytes, and the old
+    identity added them to the previous report. That 77 MiB of phantom usage
+    left a new file 247 MiB of a 324 MiB budget. Both sides are estimates of the
+    same quantity, so the combination has to be a max.
+    """
+    registry = _registry(tmp_path, "sbx_late")
+    # The walk banks 4000 bytes with nothing pushed: this is the round that
+    # re-bases the push side.
+    (tmp_path / "sbx_late" / "workspace" / "a.bin").write_bytes(b"a" * 4000)
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_late": 4000}
+
+    # Then the mediator's samples of those same bytes arrive late.
+    registry.note_appended("sbx_late", 3000)
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_late": 4000}
+
+
 def test_the_walk_governs_once_the_pushes_stop(tmp_path):
     """A sandbox that deletes its files is not held at the high-water mark."""
     registry = _registry(tmp_path, "sbx_delete")

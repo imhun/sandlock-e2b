@@ -423,6 +423,25 @@ spec:
               value: "1"
             - name: E2B_DISK_APPEND_MIN_INTERVAL_S
               value: "0.05"
+            # N25/A': how often the mediator samples a watched descriptor.
+            #
+            # 20 ms, not 100 ms, and cheap enough to be worth it because the
+            # sampler no longer has to find the sandbox's copy of the
+            # descriptor: the injection dups the mediator's own fd into the
+            # sandbox, so the mediator reads the offset from its own
+            # `/proc/self/fdinfo` -- no pid translation, no permission on
+            # another process, and nothing a redirection can move. That copy
+            # is the second choice; the sandbox's own descriptor is still read
+            # first, and a path scan is the last resort.
+            #
+            # This is the *sampling* half of the residual in §22.5.8: a file
+            # that opens, fills and closes inside one interval is only counted
+            # when some interval catches it, and these writers fill 124 MiB in
+            # ~250 ms. The round cadence (`..._MIN_INTERVAL_S` above) is left
+            # alone on purpose -- rounds cost a ledger scan, samples cost a
+            # read.
+            - name: SANLOCK_APPEND_INTERVAL_MS
+              value: "20"
             - name: E2B_NODE_PROCESSES
               value: "256"
           resources:
