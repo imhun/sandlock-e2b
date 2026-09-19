@@ -1433,6 +1433,26 @@ class NodeAgent:
         self._disk_loop_task: asyncio.Task | None = None
         if self._disk_provider is not None and self._disk_interval_s > 0:
             self._disk_loop_task = asyncio.create_task(self._disk_loop())
+            # N25: the pushed-append path runs a round *now* when a sandbox has
+            # written enough for the cached number to be stale. The event pump
+            # lives on the slot's own thread, so the callback crosses back to
+            # this loop; `call_soon_threadsafe` is what makes that safe, and
+            # the registry rate-limits how often it is even asked.
+            registry = getattr(self._disk_provider, "__self__", None)
+            install = getattr(registry, "set_disk_wakeup", None)
+            logger.info(
+                "disk wakeup wiring: provider=%s registry=%s installable=%s",
+                type(self._disk_provider).__name__,
+                type(registry).__name__,
+                install is not None,
+            )
+            if install is not None:
+                loop = asyncio.get_running_loop()
+                install(
+                    lambda sandbox_id: loop.call_soon_threadsafe(
+                        lambda: self._maybe_scan_disk(force=True)
+                    )
+                )
 
     async def _loop(self) -> None:
         """Heartbeat on its own cadence, with reconcile rounds running *beside*.
@@ -1507,7 +1527,7 @@ class NodeAgent:
         # round outlives it).
         self._start_reconcile_if_due()
 
-    def _maybe_scan_disk(self) -> dict[str, int]:
+    def _maybe_scan_disk(self, *, force: bool = False) -> dict[str, int]:
         """Start a scan round if one is due (single-flight); return the last.
 
         Called from the heartbeat *and* from `_disk_loop`. The loop is what
@@ -1515,12 +1535,20 @@ class NodeAgent:
         started from there would give the interval an effective floor of one
         pulse -- measured as a 4.7 s freeze latency with the interval set to
         1 s, because the crossing was only noticed on a pulse.
+
+        ``force`` is the pushed-append path (N25): the mediator has seen the
+        sandbox write enough that the cached number is out of date by more
+        than the trigger threshold, so the round runs now rather than at the
+        next tick. The interval still governs *unforced* rounds, and the
+        single-flight guard is what keeps a burst of triggers from becoming a
+        burst of walks.
         """
         if self._disk_provider is None or self._disk_interval_s <= 0:
             return {}
         now = time.monotonic()
         in_flight = self._disk_scan_task is not None and not self._disk_scan_task.done()
-        if not in_flight and now - self._disk_report_at >= self._disk_interval_s:
+        due = force or now - self._disk_report_at >= self._disk_interval_s
+        if not in_flight and due:
             self._disk_scan_task = asyncio.create_task(self._scan_disk_round())
         return self._disk_report
 

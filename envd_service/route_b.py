@@ -45,6 +45,7 @@ import os
 import secrets
 import shutil
 import socket
+import fcntl
 import subprocess
 import threading
 import time
@@ -1111,6 +1112,8 @@ class RouteBInstance:
             return False
 
         def pump() -> None:
+            seen = 0
+            last_tick = 0.0
             try:
                 for line in reader:
                     line = line.strip()
@@ -1129,6 +1132,21 @@ class RouteBInstance:
                         continue
                     if not isinstance(event, dict):
                         continue
+                    if event.get("event") == "tick":
+                        # Diagnostic telemetry (the slot only sends it with
+                        # SANLOCK_EVENT_TRACE=1): what the watch can see.
+                        now = time.monotonic()
+                        if now - last_tick >= 1.0:
+                            last_tick = now
+                            logger.info(
+                                "route-B slot %s: watch state %r", self.name, event
+                            )
+                        continue
+                    seen += 1
+                    if seen == 1:
+                        logger.info(
+                            "route-B slot %s: first pushed event %r", self.name, line[:160]
+                        )
                     try:
                         on_event(event)
                     except Exception:  # noqa: BLE001 - the pump outlives callers
@@ -1137,14 +1155,57 @@ class RouteBInstance:
                             self.name,
                             exc_info=True,
                         )
-            except OSError:
-                pass
+            except OSError as exc:
+                context = self._slot_stderr_now()
+                logger.warning(
+                    "route-B slot %s: events pump ended (%d events): %s%s",
+                    self.name,
+                    seen,
+                    exc,
+                    f"; slot stderr: {context}" if context else "",
+                )
+            else:
+                context = self._slot_stderr_now()
+                logger.warning(
+                    "route-B slot %s: events pump ended after %d events (the slot "
+                    "closed its events descriptor)%s",
+                    self.name,
+                    seen,
+                    f"; slot stderr: {context}" if context else "",
+                )
 
         self._events_thread = threading.Thread(
             target=pump, name=f"sandlock-events-{self.name}", daemon=True
         )
         self._events_thread.start()
         return True
+
+    def _slot_stderr_now(self, limit: int = 2000) -> str:
+        """Whatever the slot has written to stderr so far, without blocking.
+
+        The slot's stderr is a pipe nobody reads until something goes wrong,
+        so a diagnostic the slot prints (a refusal, a panic, a channel that
+        could not be wired) would otherwise sit unseen in the buffer. Reading
+        is non-blocking on purpose: the slot is still alive, so a blocking
+        read would wait for a process that is not going to exit.
+        """
+        stream = getattr(self._handle.process, "stderr", None)
+        if stream is None:
+            return ""
+        fd = stream.fileno()
+        try:
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            try:
+                data = os.read(fd, limit)
+            except BlockingIOError:
+                return ""
+        except OSError:
+            return ""
+        if not data:
+            return ""
+        text = data.decode("utf-8", "replace").strip()
+        return text[-limit:] if text else ""
 
     def set_file_size_limit(self, bytes_: int) -> dict | None:
         """Tighten the live processes' ``RLIMIT_FSIZE`` to at most ``bytes_`` (N25).

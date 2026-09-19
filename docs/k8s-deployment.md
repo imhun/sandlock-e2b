@@ -1426,12 +1426,154 @@ worker 侧三条克制：只在**实质下降**时下发（默认 4 MiB 步长�
 | 变量 | 侧 | 默认 | 作用 |
 |---|---|---|---|
 | `SANLOCK_APPEND_INTERVAL_MS` | fork（slot 进程继承 worker 环境） | 100 | 采样 open write fd 的间隔；就是"平台多久能看见新增写"的上界 |
-| `E2B_DISK_TIGHTEN_STEP_MB` | worker | 4 | 剩余额度**至少**降这么多才值得发一次 verb |
-| `E2B_DISK_TIGHTEN_INTERVAL_S` | worker | 0.5 | 两次收紧之间的最短间隔 |
+| `E2B_DISK_APPEND_TRIGGER_MB` | worker | 8 | 自上一轮以来追加超过这么多，就**立刻叫起一轮**（不等节拍） |
+| `E2B_DISK_APPEND_MIN_INTERVAL_S` | worker | 0.2 | 两次"叫起"之间的最短间隔（轮次是贵的那一半） |
+| `E2B_DISK_TIGHTEN_STEP_MB` | worker | 1 | 剩余额度**至少**降这么多才值得发一次 verb |
+| `E2B_DISK_TIGHTEN_INTERVAL_S` | worker | 0.1 | 两次收紧之间的最短间隔；**就是"新 fork 出来的进程继承到的那份剩余额度有多旧"**（§22.5.7） |
 
-三者都为"少说话"服务：push 只在**有增长**时发帧（空闲沙箱一个字节都不发），收紧只在**实质下降**时发。
+几个都为"少说话"服务：push 只在**有增长**时发帧（空闲沙箱一个字节都不发），收紧只在**实质下降**时发。
+但 `E2B_DISK_APPEND_TRIGGER_MB` 是反方向的：它让**字节数**而不是时钟决定什么时候重新测量 ——
+这一条是集群实测补上的，见 §22.5.5。
+
+#### 22.5.6 超支为什么不是零：轮次间隔就是超支
+
+第一版 push 上线后，集群仍测到 1~124 MiB 的超支（冻结在 1148 MiB / 1024 预算）。日志把原因指得很清楚：
+
+```
+13:58:45.032  tightening … (used 1073741824 of 1073741824)   ← 正好等于预算，不算"超过"
+13:58:45.959  budget crossed → pause                          ← 927 ms 之后才看到 >1024
+```
+
+也就是说：**数字是实时的（push 做到了），但 worker 只在 `E2B_DISK_ENFORCE_INTERVAL_S=1 s` 的节拍里去看它**。
+写者 ~130 MB/s，927 ms ≈ 124 MiB —— 超支 = `轮次间隔 × 写速`，与"看得见看不见"无关。
+
+改法就是让**字节数**触发那一轮：追加超过 `E2B_DISK_APPEND_TRIGGER_MB`（默认 8 MiB）就叫起一轮，
+最快每 `E2B_DISK_APPEND_MIN_INTERVAL_S`（默认 0.2 s）一次。于是超支变成
+`触发阈值 + 一轮 + 上报 ≈ 8 MiB + 几十 ms`，而空闲沙箱仍然一个字节都不发、`ENFORCE_INTERVAL_S`
+仍然是"没人写时的兜底节拍"。
 另外 `update_file_size_limit` 的下限与 per-exec 上限共用 `E2B_DISK_EXEC_LIMIT_FLOOR_MB`（默认 1 MiB）——
 一个文件总得能装下一点东西。
+
+#### 22.5.7 那 124 MiB 真正的来源：额度是按"每个文件"发出去的（N25，2026-09-19）
+
+§22.5.6 把超支解释成"轮次间隔 × 写速"，能解释一部分，但不是**这次**测到的那个数。
+同一 shape 连跑两次，日志给出的数字完全一致：
+
+```
+16:59:00.988  disk tightening: sbx_e3a9… limited to 130023424 bytes (used 943718400 of 1073741824)
+16:59:02.009  disk tightening: sbx_e3a9… limited to 1048576  bytes (used 1203765248 of 1073741824)
+16:59:02.030  agent pause sandbox sbx_e3a9…            ← 冻结在 1148 MiB
+```
+
+`900 MiB 已写 → 剩余 124 MiB`，冻结时是 **1148 = 900 + 124 + 124**。命令是
+`for i in 1 2 3; do dd of=part$i.bin count=900; done`：`part1.bin` 写完之后，
+**剩下的两个文件各自被允许再写满这 124 MiB**。
+
+原因是 `RLIMIT_FSIZE` 按**进程**生效、并且被继承：收紧把 124 MiB 写进 shell 的 limit，
+之后每 fork 一个 `dd` 都**各自继承一份完整的 124 MiB**。所以"剩余额度"被当成每文件一份发出去，
+总超支 ≈ `剩余的额度 × 之后新开的文件数`。
+
+同一个 bug 还有一个更危险的方向。为了让"合法的大文件不被自己的尾巴切掉"，
+收紧原本会把该进程组已增长的量加回额度（`allowance = 剩余 + group_grown`）。
+但那一步在这套部署里**从来没生效过**：watch 的 key 是通知里的 pid，而收紧遍历的是宿主 pid，
+两者在 `pid_ns` 下永远不相等（见下），于是 `group_grown` 恒为 0。
+如果它"修好了"却仍按进程组发放，shell 会拿到 `124 + 900 = 1024 MiB`，
+后面每个文件都能写到 1 GiB —— 超支反而会从 124 MiB 变成约 900 MiB。
+
+**根因：通知里的 pid 是沙箱自己命名空间的 pid。**
+
+`SeccompNotif.pid` 由内核按**触发线程自己所在**的命名空间给出，不是按 listener 的。
+集群实测：writer 的 `NSpid: 121 7`，mediator 收到的是 `7`，于是
+
+```
+sandlock-supervise: fdinfo read failed: /proc/35/fdinfo/5: No such file or directory
+route-B slot …: watch state {'bytes': 0, 'dropped': 0, 'watching': 0}   ← 每一个 tick 都是 0
+```
+
+两个 worker 累计 **1515 个 tick 全是 `watching: 0`** —— 也就是说这条 push 通道
+**从上线起就没工作过一次**，数字一直只靠 walk，收紧只能落在轮次上。
+
+顺带纠正一个曾经写进代码注释、但**实测不成立**的假设：不能靠
+`/proc/<沙箱宿主 pid>/root/proc/<ns pid>/…` 换个 `/proc` 看。沙箱里的 `/proc` 就是
+**pod 的 procfs**（实测 `/proc/<pid>/root/proc/self` 解析到 pod 级 pid，
+而 `/proc/<pid>/root/proc/<ns pid>` 根本不存在），所以只能**翻译** pid。
+
+改法是复用仓库里已有的翻译表 `procfs::PidNsMap`（`/proc` 视图与 teardown 扫描用的同一张，
+按 pid namespace inode 区分沙箱），`handle_chroot_open` 在登记 write fd 之前先把
+通知 pid 翻成宿主 pid。这样三件事同时对：
+
+1. watch 读得到 `/proc/<宿主 pid>/fdinfo/<fd>`；
+2. 收紧遍历的宿主 pid 能和 watch 的 key 对上，"大文件不被自己的尾巴切掉"才真的生效；
+3. 额度按**进程**归属而不是进程组最大值发放 —— 一个不写文件的 shell 只拿到"真正剩下的"，
+   它后来 fork 的每个文件都从同一个数开始，而那个数会随着 push 立刻变小。
+
+回归测试就落在 shape 上：`crates/sandlock-supervise/tests/supervise.rs` 的
+`instance_policy_chrooted_pid_ns`（`pid_ns: true`）用在
+`test_events_fd_reports_a_running_writers_growth` 上，断言**推送字节数精确等于写入字节数**。
+修之前这个用例必然失败（`watching: 0` → 推送 0 字节），修之前的那版 fixture 没有 pid ns，
+所以整个单测套件全绿而生产是死的。
+
+超支的**残余**就是"上一次收紧时的剩余额度"，由 `E2B_DISK_TIGHTEN_INTERVAL_S`
+决定它有多旧：0.1 s × 实测写速 ~250 MB/s ≈ 25 MiB，而不是 124 MiB。
+
+#### 22.5.8 通道接上之后剩的三件事（N25，2026-09-19 晚）
+
+§22.5.7 改完，集群上 `watch state` 第一次出现 `watching: 1`、worker 打出
+`disk append +1048576 bytes (pending …, wakeup=True)` —— 通道真的通了。但同一版立刻暴露两个新问题，
+而且**都不是 push 本身**：
+
+**① 同一个字节被算了两次。** 一轮的上报原本是 `walk + pushed`。walk 是"已提交"，
+push 是"沙箱自己看见的增量"，一旦回写落地，同一批字节**同时**出现在两者里。
+实测：文件真实 287 MiB 时 worker 报 **647 MiB**，于是"剩余"被算成 377 MiB，
+而收紧把"剩余 + 自身已写"发下去 = 664 MiB < 文件继续长到的 **696 MiB** —— 一个**合法的 900 MiB 文件被 EFBIG 切断**。
+
+改成增量恒等式：
+
+```
+reported = max(walk, 上一次上报 + 本次 push)      # push 为空时就是 walk
+```
+
+一个字节无论被 push 看见、被 walk 看见、还是两者都看见，都只算一次。
+每一次收紧的 `增长` 诊断把这条链路摊开了（`SANLOCK_EVENT_TRACE=1`）：
+
+```
+tighten targets=[25, 34, 40] grown={40: 300941312, ...} bytes=395313152 watch_entries=1
+```
+
+**② 沙箱会把注入的 fd 挪走。** `exec 9>>file` 把注入的描述符 dup 到 9 并**关掉原来那个**，
+于是 watch 记录的 `(pid, fd)` 在几毫秒内就指向一个已关闭的描述符，每个条目在第一个 tick 就被丢弃
+（这正是"刚修好 pid 翻译、`watching` 又是 0"的原因）。现在读不到精确 fd 时，按**路径**在该进程的
+fd 表里回退查找（`/proc/<pid>/fd/<n>` 的解析目标 == mediator 打开的宿主路径，允许内核的 `" (deleted)"` 后缀）。
+
+**③ PID 命名空间表可能是空的。** `PidNsMap::new` 在 leader **正在进入自己的用户命名空间**时读
+`/proc/<leader>/ns/pid`，那一刻进程不再 dumpable，非特权读者会被拒；`.ok()` 把这个失败吞掉，
+留下**一张空表**——沙箱自己 `ls /proc` 一个数字都看不到（`/proc/self` 都不存在），
+watch 也翻不出任何 pid。现在：inode 读不到会在下次 refresh 重试，仍读不到时按**进程树**判定归属
+（只需 world-readable 的 `/proc/<pid>/stat`），并且表为空时必然打一行 stderr，带上 leader pid 与 inode 状态。
+
+**集群最终实测**（`0.1.0-405-g8ca0551-20260919-192955`，`tmp/k0s/probe_push_and_tighten.py`，三次）：
+
+| 指标 | 值 |
+|---|---|
+| A. 1024 MiB 预算冻结时的超支 | 124 / 246 / 124 MiB（验收线 1/4 预算 = 256 MiB）→ **PASS** |
+| B. 单命令内失控写者 | 内核 EFBIG 拦住、命令自己退出、沙箱仍在运行 → **PASS** |
+| 合法的 900 MiB 单文件 | rc=0、`ls -l` = 943718400 → 不再被切断 |
+| per-exec 上限 / ledger / smoke | 324+1+1 MiB、6144=6144、12144=12144、单机与多机 smoke OK |
+
+**残余超支是采样粒度，不是记账：** 这类写者 ~250 ms 就写满一个 124 MiB 文件，而 mediator 每
+`SANLOCK_APPEND_INTERVAL_MS`（100 ms）采一次描述符，所以整文件可能落在**一个采样内**；
+两个这样的文件可以在两轮之间开完，各自继承"上一次收紧时的剩余"。实测阶梯：
+
+```
+52.837  used 900 MiB → limit 124 MiB
+53.716  used 1148 MiB → floor → 冻结     # 中间两个文件各写了 124 MiB
+```
+
+要再压这一截，只有两条路：把 `SANLOCK_APPEND_INTERVAL_MS` 调到 10 ms 量级（采样更细，
+代价是 slot 侧 syscall 变多），或者把"剩余额度"在 **open 时**按当前在写的描述符共享分配
+（现在它是**每进程继承**的，而额度是"剩余"——这就是每个新文件各拿一份的来源）。
+本轮把唤醒节拍调到 `E2B_DISK_APPEND_TRIGGER_MB=1` / `E2B_DISK_APPEND_MIN_INTERVAL_S=0.05`
+（超支从 124–339 MiB 收敛到 124–246 MiB），并把这条残量写进清单注释。
 
 ### 22.4 冻结延迟的 3.7 秒花在哪：NFS 的 `stat` 会先等自己的回写（N25，2026-09-19）
 

@@ -4,9 +4,11 @@ The mediator watches the sandbox's own open write descriptors and pushes what
 they grew by (`docs/k8s-deployment.md` §22.5). The worker's contract with that
 number is narrow on purpose:
 
-* the round reports ``walked + appended`` and *consumes* the appended bytes,
-  because the walked number already contains everything committed up to that
-  moment;
+* the round reports ``max(walked, last_report + appended)`` and *consumes* the
+  appended bytes. Adding them to the walk instead double counts every byte the
+  push saw and the filesystem later committed -- measured on the cluster as
+  "287 MiB written, 647 MiB reported", which is what cut a legal 900 MiB file
+  with EFBIG at 696 MiB (`docs/k8s-deployment.md` §22.5.8);
 * the per-exec ceiling *peeks* instead, so the same bytes are still there for
   the round;
 * nothing here may ever make the number smaller than the walk said.
@@ -39,17 +41,47 @@ def _registry(base: Path, sandbox_id: str, *, disk_mb: int = 1024) -> RuntimeReg
     return registry
 
 
-def test_a_round_reports_the_walk_plus_what_was_appended(tmp_path):
+def test_a_round_reports_what_was_appended_on_top_of_its_last_report(tmp_path):
     registry = _registry(tmp_path, "sbx_pushed")
     registry.note_appended("sbx_pushed", 4096)
 
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_pushed": 1000 + 4096}
+    # Nothing was reported yet, so the walk (1 kB) is below
+    # "previous report (0) + pushed (4 kB)" and the push wins.
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_pushed": 4096}
+
+
+def test_a_round_does_not_count_a_byte_twice_when_the_walk_catches_up(tmp_path):
+    """The production bug, pinned.
+
+    The push reports 4 kB while the file is uncommitted; the next round's walk
+    *also* sees those 4 kB (the writeback landed) and the sandbox has pushed
+    another 1 kB. A sum would report 1000 + 5000 + 1024; the identity reports
+    the last report plus what is new.
+    """
+    registry = _registry(tmp_path, "sbx_once")
+    registry.note_appended("sbx_once", 4096)
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_once": 4096}
+
+    # The commit lands: the tree is now 1000 + 4096, and the push adds 1024.
+    (tmp_path / "sbx_once" / "workspace" / "a.bin").write_bytes(b"a" * 5096)
+    registry.note_appended("sbx_once", 1024)
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_once": 5120}
+
+
+def test_the_walk_governs_once_the_pushes_stop(tmp_path):
+    """A sandbox that deletes its files is not held at the high-water mark."""
+    registry = _registry(tmp_path, "sbx_delete")
+    registry.note_appended("sbx_delete", 10 * 1024 * 1024)
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_delete": 10 * 1024 * 1024}
+
+    (tmp_path / "sbx_delete" / "workspace" / "a.bin").unlink()
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_delete": 0}
 
 
 def test_the_appended_bytes_are_consumed_by_the_round_that_reported_them(tmp_path):
     registry = _registry(tmp_path, "sbx_consumed")
     registry.note_appended("sbx_consumed", 4096)
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_consumed": 5096}
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_consumed": 4096}
 
     # Second round: the same bytes must not be added twice (the walk now sees
     # whatever committed, and the accumulator is empty).
@@ -60,9 +92,10 @@ def test_the_ceiling_refresh_peeks_so_the_round_can_still_take_them(tmp_path):
     registry = _registry(tmp_path, "sbx_peek")
     registry.note_appended("sbx_peek", 2048)
 
-    assert registry.refresh_disk_usage("sbx_peek") == 1000 + 2048
-    # Peeking does not consume: the round still adds them.
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_peek": 3048}
+    # Peek: the walk is 1 kB, "previous report + pending" is 2 kB, so the
+    # pending bytes win -- and they are still pending afterwards.
+    assert registry.refresh_disk_usage("sbx_peek") == 2048
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_peek": 2048}
 
 
 def test_appends_for_an_unknown_sandbox_are_ignored_by_the_round(tmp_path):
@@ -86,7 +119,9 @@ def test_appends_accumulate_until_a_round_takes_them(tmp_path):
     registry.note_appended("sbx_sum", 2)
     registry.note_appended("sbx_sum", 3)
 
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_sum": 1006}
+    # 6 bytes of appends is far below what the walk already sees, and the walk
+    # is the floor: the number may never be smaller than it.
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_sum": 1000}
 
 
 def test_unregistering_drops_the_accumulator(tmp_path):
@@ -115,7 +150,71 @@ def test_a_crossing_seen_only_through_pushed_bytes_is_still_a_crossing(tmp_path)
     registry = _registry(tmp_path, "sbx_crossed", disk_mb=2)
     registry.note_appended("sbx_crossed", 3 * 1024 * 1024)
 
-    assert registry.disk_usage_snapshot(dirty=True) == {
-        "sbx_crossed": 1000 + 3 * 1024 * 1024
-    }
-    assert registry.take_budget_crossings() == {"sbx_crossed": 1000 + 3 * 1024 * 1024}
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_crossed": 3 * 1024 * 1024}
+    assert registry.take_budget_crossings() == {"sbx_crossed": 3 * 1024 * 1024}
+
+
+# ---------------------------------------------------------------------------
+# N25: the push also *wakes* the round. Waiting for the cadence is what the
+# cluster measured as the remaining overshoot: a writer at ~130 MB/s put
+# 124 MiB into the tree in the 927 ms between the round that saw exactly
+# 1024 MiB and the next one. So the bytes decide when the round runs.
+# ---------------------------------------------------------------------------
+
+
+def _waking_registry(base: Path, sandbox_id: str) -> tuple[RuntimeRegistry, list[str]]:
+    registry = _registry(base, sandbox_id)
+    woken: list[str] = []
+    registry.set_disk_wakeup(woken.append)
+    return registry, woken
+
+
+def test_appends_below_the_trigger_do_not_wake_the_round(tmp_path):
+    registry, woken = _waking_registry(tmp_path, "sbx_quiet")
+    registry._append_trigger_bytes = 1024 * 1024
+
+    registry.note_appended("sbx_quiet", 1024)
+
+    assert woken == []
+
+
+def test_enough_appended_bytes_wake_the_round(tmp_path):
+    registry, woken = _waking_registry(tmp_path, "sbx_loud")
+    registry._append_trigger_bytes = 1024 * 1024
+
+    registry.note_appended("sbx_loud", 1024 * 1024)
+
+    assert woken == ["sbx_loud"]
+
+
+def test_the_wakeup_is_rate_limited(tmp_path):
+    """A 130 MB/s writer crosses the trigger every few ms.
+
+    Waking on every crossing would run the round continuously; the point is to
+    run it *as well as* the cadence, not instead of having a cadence.
+    """
+    registry, woken = _waking_registry(tmp_path, "sbx_burst")
+    registry._append_trigger_bytes = 1024
+    registry._append_min_interval_s = 3600.0
+
+    for _ in range(100):
+        registry.note_appended("sbx_burst", 1024)
+
+    assert woken == ["sbx_burst"]
+
+
+def test_a_round_that_catches_up_stops_the_waking(tmp_path):
+    registry, woken = _waking_registry(tmp_path, "sbx_catchup")
+    registry._append_trigger_bytes = 4096
+    registry._append_min_interval_s = 0.0
+
+    registry.note_appended("sbx_catchup", 8192)
+    assert woken == ["sbx_catchup"]
+
+    # The round consumes the accumulator, so the next few bytes are below the
+    # trigger again -- the waking follows the accounting, not the clock.
+    registry.disk_usage_snapshot(dirty=True)
+    registry._disk_wakeup_at = 0.0
+    registry.note_appended("sbx_catchup", 1024)
+
+    assert woken == ["sbx_catchup"], "nothing new has accumulated"

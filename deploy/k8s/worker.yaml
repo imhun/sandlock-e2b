@@ -378,8 +378,15 @@ spec:
             #
             # What it does not buy: a *single* command that loops and writes
             # files (`for i in 1 2 3; do dd ...; done`) is one process with one
-            # ceiling, so each file is only bounded by that same number. That
-            # case is bounded by the 5 s pause gate, not by this.
+            # ceiling, so each file is only bounded by that same number, and
+            # the remaining budget is therefore handed out once per file.
+            # Measured on the cluster: after `part1.bin` used 900 MiB of a
+            # 1024 MiB budget, `part2.bin` and `part3.bin` were each allowed
+            # the same 124 MiB that was left, and the sandbox was frozen at
+            # 1148 MiB. What bounds it is the *freshness* of that remaining
+            # number -- the push below wakes a round as the bytes arrive, and a
+            # tightening may land `E2B_DISK_TIGHTEN_INTERVAL_S` after the round
+            # that computed it.
             #
             # The floor (1 MiB) is what keeps an over-budget sandbox usable: it
             # must still be able to run commands that write a small file, and
@@ -388,6 +395,34 @@ spec:
               value: "1"
             - name: E2B_DISK_EXEC_LIMIT_FLOOR_MB
               value: "1"
+            # N25: the live per-file ceiling. `STEP_MB` is the smallest drop
+            # worth a verb to the slot; `INTERVAL_S` is how stale the number a
+            # *newly forked* process inherits can be, which is what a command
+            # that writes several files one after another spends -- 0.1 s is
+            # ~25 MiB at the writer speed measured on this NAS (~250 MiB/s).
+            - name: E2B_DISK_TIGHTEN_STEP_MB
+              value: "1"
+            - name: E2B_DISK_TIGHTEN_INTERVAL_S
+              value: "0.05"
+            # N25: pushed appends wake a scan round instead of waiting for the
+            # 1 s cadence, so the remaining budget (and with it the per-file
+            # ceiling) follows a fast writer. The trigger is a floor on "worth
+            # a round"; the interval is the ceiling on how often one runs.
+            #
+            # Measured (2026-09-19, three runs): with 8 MiB / 0.2 s the
+            # overshoot past a 1024 MiB budget was 124–339 MiB, because a
+            # command that writes several files hands each new one the
+            # remaining budget as of the *last* tightening, and two 124 MiB
+            # files can start and finish between two rounds. At 1 MiB / 0.05 s
+            # the three runs were 124 / 246 / 124 MiB (acceptance is a quarter
+            # of the budget). The rest of that gap is sampling granularity: the
+            # mediator samples a descriptor every 100 ms
+            # (`SANLOCK_APPEND_INTERVAL_MS`), and these writers fill 124 MiB in
+            # ~250 ms, so a whole file can land inside one sample.
+            - name: E2B_DISK_APPEND_TRIGGER_MB
+              value: "1"
+            - name: E2B_DISK_APPEND_MIN_INTERVAL_S
+              value: "0.05"
             - name: E2B_NODE_PROCESSES
               value: "256"
           resources:

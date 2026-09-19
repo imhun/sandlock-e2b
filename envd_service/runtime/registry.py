@@ -186,6 +186,9 @@ class RuntimeRegistry:
         #: being polled for. A round consumes them, because the round's number
         #: already contains everything committed up to that moment.
         self._appended: dict[str, int] = {}
+        #: N25: the last number reported per sandbox. Pushed appends are
+        #: increments on *this*, not on the walk (see `_reported_usage`).
+        self._reported: dict[str, int] = {}
         #: N25: the live tightener (`f(sandbox_id, bytes) -> applied | None`),
         #: installed by the app. Absent means "no live tightening": the
         #: per-exec ceiling and the pause gate still hold.
@@ -199,12 +202,36 @@ class RuntimeRegistry:
         #: *something*, so the ceiling never goes to zero), and how often a
         #: tightening may be sent at most.
         self._tighten_step_bytes = int(
-            _env_seconds("E2B_DISK_TIGHTEN_STEP_MB", 4.0) * 1024 * 1024
+            _env_seconds("E2B_DISK_TIGHTEN_STEP_MB", 1.0) * 1024 * 1024
         )
         self._tighten_floor_bytes = max(
             1, int(_env_seconds("E2B_DISK_EXEC_LIMIT_FLOOR_MB", 1.0) * 1024 * 1024)
         )
-        self._tighten_interval_s = _env_seconds("E2B_DISK_TIGHTEN_INTERVAL_S", 0.5)
+        #: 0.1 s, not 0.5 s: the number a *new* file inherits is whatever the
+        #: last tightening left, so this interval is how stale that number can
+        #: be. Measured on the cluster, a 900 MiB command whose remaining
+        #: budget was 124 MiB handed each of its two remaining files the full
+        #: 124 MiB and ended at 1148 MiB of a 1024 MiB budget.
+        self._tighten_interval_s = _env_seconds("E2B_DISK_TIGHTEN_INTERVAL_S", 0.1)
+        #: N25: the push wakes a scan round instead of waiting for the cadence.
+        #: Past `E2B_DISK_APPEND_TRIGGER_MB` since the last round, ask for one
+        #: now (never more often than `E2B_DISK_APPEND_MIN_INTERVAL_S`, because
+        #: the round is the expensive half).
+        #:
+        #: What the wake is *for*, measured on the cluster: a
+        #: `for i in 1 2 3; do dd of=part$i.bin count=900; done` in a 1024 MiB
+        #: sandbox was tightened to 124 MiB of remaining budget once part1 was
+        #: written, and ended frozen at 1148 MiB -- 900 + 124 + 124, because
+        #: each of the two remaining files was allowed the whole remaining
+        #: budget. The per-file ceiling can only be as fresh as the number it
+        #: was computed from, so the appends have to move that number while the
+        #: command runs, not on the next 1 s cadence.
+        self._append_trigger_bytes = max(
+            1, int(_env_seconds("E2B_DISK_APPEND_TRIGGER_MB", 8.0) * 1024 * 1024)
+        )
+        self._append_min_interval_s = _env_seconds("E2B_DISK_APPEND_MIN_INTERVAL_S", 0.2)
+        self._disk_wakeup: Callable[[str], None] | None = None
+        self._disk_wakeup_at = 0.0
         #: N25/L2c: per-sandbox `DirLedger`, keyed by id, dropped when the
         #: sandbox is unregistered (its tree is about to go away).
         self._ledgers: dict[str, DirLedger] = {}
@@ -334,7 +361,27 @@ class RuntimeRegistry:
                 # which on this storage can be seconds of writing the
                 # filesystem cannot see yet (§22.5). Their sum is a lower
                 # bound on the truth, so reporting it is early-or-exact.
-                reported = int(size) + self._take_appended(record.sandbox_id)
+                # The walk answers what has *committed*; the pushed appends
+                # answer what the sandbox wrote since that answer. They must
+                # not be added together: once the writeback lands, the same
+                # bytes are in the walk *and* on the push, and a sum reports
+                # twice the truth. Measured on the cluster that is what it did
+                # -- a 287 MiB file was reported as 647 MiB used, so the
+                # remaining budget was 377 MiB and the live tightening cut the
+                # file with EFBIG at 696 MiB (`docs/k8s-deployment.md` §22.5.8).
+                #
+                # So the push is an *increment on the last report*, and the
+                # walk is a floor:
+                #
+                #   reported = max(walk, previous_reported + pushed_since)
+                #
+                # which counts a byte once whether the push saw it, the walk
+                # saw it, or both. With nothing pushed the walk governs, so a
+                # sandbox that deletes files is not held at a stale high-water
+                # mark for longer than the round after its last write.
+                reported = self._reported_usage(
+                    record.sandbox_id, int(size), self._take_appended(record.sandbox_id)
+                )
                 usage[record.sandbox_id] = reported
                 self._note_budget_crossing(record, reported)
                 self._maybe_tighten(record, reported)
@@ -367,6 +414,18 @@ class RuntimeRegistry:
         with self._lock:
             self._tightener = tightener
 
+    def set_disk_wakeup(self, wakeup) -> None:
+        """Install the "run a round now" callback (N25).
+
+        ``wakeup(sandbox_id)`` is called from a slot's event thread when a
+        sandbox has appended enough for the current number to be worth
+        re-measuring, so it must be safe to call from another thread -- the
+        agent's implementation is `loop.call_soon_threadsafe`. ``None`` (the
+        default) keeps the plain cadence.
+        """
+        with self._lock:
+            self._disk_wakeup = wakeup
+
     def note_appended(self, sandbox_id: str, bytes_: int) -> None:
         """Record bytes a mediator watched the sandbox append (N25).
 
@@ -379,8 +438,31 @@ class RuntimeRegistry:
         """
         if bytes_ <= 0:
             return
+        wakeup = None
         with self._lock:
             self._appended[sandbox_id] = self._appended.get(sandbox_id, 0) + int(bytes_)
+            if self._trace:
+                logger.info(
+                    "disk append: %s +%d bytes (pending %d, wakeup=%s)",
+                    sandbox_id,
+                    int(bytes_),
+                    self._appended[sandbox_id],
+                    self._disk_wakeup is not None,
+                )
+            wakeup = self._disk_wakeup
+            now = time.monotonic()
+            worth_a_round = self._appended[sandbox_id] >= self._append_trigger_bytes
+            allowed = now - self._disk_wakeup_at >= self._append_min_interval_s
+            if wakeup is not None and worth_a_round and allowed:
+                self._disk_wakeup_at = now
+            else:
+                wakeup = None
+        if wakeup is not None:
+            if self._trace:
+                logger.info("disk wakeup: %s has appended enough for a round", sandbox_id)
+            # Outside the lock: the callback schedules work on the event loop,
+            # and a slow or misbehaving one must not stall the event pumps.
+            wakeup(sandbox_id)
 
     def _peek_appended(self, sandbox_id: str) -> int:
         with self._lock:
@@ -389,6 +471,31 @@ class RuntimeRegistry:
     def _take_appended(self, sandbox_id: str) -> int:
         with self._lock:
             return self._appended.pop(sandbox_id, 0)
+
+    def _reported_usage(self, sandbox_id: str, walk: int, pushed: int) -> int:
+        """What to report for one sandbox this round (N25).
+
+        ``max(walk, previous + pushed)``: the pushed bytes are relative to the
+        last report, the walk is a floor, and the larger of the two wins. See
+        the call site for why a sum is wrong -- it double counts every byte the
+        push reported and the walk later committed.
+        """
+        with self._lock:
+            previous = self._reported.get(sandbox_id, 0)
+            reported = max(walk, previous + pushed) if pushed > 0 else walk
+            self._reported[sandbox_id] = reported
+            return reported
+
+    def _peek_usage(self, sandbox_id: str, walk: int) -> int:
+        """The same identity as [`Self::_reported_usage`], without consuming.
+
+        The ceiling asks this between rounds, so it must see the pending
+        appends *and* must not take them from the round that reports them.
+        """
+        with self._lock:
+            previous = self._reported.get(sandbox_id, 0)
+            pushed = self._appended.get(sandbox_id, 0)
+            return max(walk, previous + pushed) if pushed > 0 else walk
 
     def note_local_write(self, sandbox_id: str, path: str | Path) -> None:
         """Record a write the **worker itself** made inside a sandbox tree.
@@ -515,10 +622,13 @@ class RuntimeRegistry:
         size = self._incremental_dir_size(record, dirty=True)
         if size is None:
             return None
-        # N25: peek, do not take. The per-exec ceiling asks this between
-        # rounds, and the same appended bytes must still be there for the next
-        # round to add to its own (committed) number.
-        return int(size) + self._peek_appended(sandbox_id)
+        # N25: peek, do not take. The per-exec ceiling asks this between rounds,
+        # and the same appended bytes must still be there for the next round to
+        # account for. The identity is the round's (`_reported_usage`), because
+        # the per-exec ceiling is what a *fresh* command starts with: summing
+        # the walk and the push here would hand the command a ceiling computed
+        # from a number up to twice the truth.
+        return self._peek_usage(sandbox_id, int(size))
 
     def _ledger_for(self, record: RuntimeSandbox) -> DirLedger:
         with self._lock:
@@ -739,6 +849,7 @@ class RuntimeRegistry:
             # ledger that assumed continuity would report the difference.
             self._ledgers.pop(sandbox_id, None)
             self._appended.pop(sandbox_id, None)
+            self._reported.pop(sandbox_id, None)
             self._tightened.pop(sandbox_id, None)
             self._tightened_at.pop(sandbox_id, None)
             try:
@@ -899,6 +1010,7 @@ class RuntimeRegistry:
             self._activity.pop(sandbox_id, None)
             self._ledgers.pop(sandbox_id, None)
             self._appended.pop(sandbox_id, None)
+            self._reported.pop(sandbox_id, None)
             self._tightened.pop(sandbox_id, None)
             self._tightened_at.pop(sandbox_id, None)
             self._tombstones[sandbox_id] = (

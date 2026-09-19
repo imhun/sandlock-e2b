@@ -857,6 +857,22 @@ class SandlockExecutor(Executor):
 
     def _on_slot_event(self, event: dict) -> None:
         """Handle one pushed slot event (N25)."""
+        if event.get("event") == "hello":
+            # The slot's proof that the channel is wired: without it, "no
+            # events" and "a dead channel" look identical from here.
+            logger.info(
+                "sandbox_id=%s pushed-append channel is live (slot fd %s)",
+                self._sandbox_id or "-",
+                event.get("fd"),
+            )
+            return
+        if not getattr(self, "_append_event_seen", False):
+            self._append_event_seen = True
+            logger.info(
+                "sandbox_id=%s received its first pushed event: %r",
+                self._sandbox_id or "-",
+                event,
+            )
         if event.get("event") != "append":
             return
         sink = getattr(self, "_append_sink", None)
@@ -1129,8 +1145,20 @@ class SandlockExecutor(Executor):
         # slot has no events channel (an older wheel, or the registered-path
         # transport), which costs acceleration only -- the accounting still
         # answers from the filesystem, and the ceiling from the ledger.
-        if getattr(self, "_append_sink", None) is not None:
+        sink = getattr(self, "_append_sink", None)
+        logger.info(
+            "sandbox_id=%s pushed-append wiring: sink=%s slot_events=%s",
+            self._sandbox_id or "-",
+            sink is not None,
+            handle.events_socket is not None,
+        )
+        if sink is not None:
             started = instance.start_event_pump(self._on_slot_event)
+            logger.info(
+                "sandbox_id=%s pushed-append pump started=%s",
+                self._sandbox_id or "-",
+                started,
+            )
             if not started:
                 logger.info(
                     "sandbox_id=%s has no pushed-append channel (slot %s): "
