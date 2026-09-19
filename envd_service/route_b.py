@@ -1128,6 +1128,7 @@ class RouteBInstance:
         clean_env: bool = False,
         extra_writable=None,
         bind_ports=None,
+        max_file_size: int | None = None,
     ) -> RouteBExecProcess:
         """Exec ``cmd`` on the slot with worker-side stdio (PIPED or PTY).
 
@@ -1150,6 +1151,10 @@ class RouteBInstance:
             args["extra_writable"] = [str(p) for p in extra_writable]
         if bind_ports:
             args["bind_ports"] = [int(p) for p in bind_ports]
+        if max_file_size is not None:
+            # N25/C: the slot validates this against the instance ceiling and
+            # applies it in the forked child, before execve.
+            args["max_file_size"] = int(max_file_size)
 
         pty_mode = _stdio_is_pty(stdio)
         master = stdout_reader = stderr_reader = stdin_writer = None

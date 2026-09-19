@@ -1451,6 +1451,10 @@ class SandlockExecutor(Executor):
             "env": env,
             "clean_env": True,
             "bind_ports": bind_ports or None,
+            # N25/C: a per-exec RLIMIT_FSIZE, if the caller has a fresh
+            # measurement of what is left. The fork refuses anything above the
+            # instance ceiling, so this can only ever tighten.
+            "max_file_size": config.max_file_size,
         }
         return {k: v for k, v in params.items() if v is not None}
 

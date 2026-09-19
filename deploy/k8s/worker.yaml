@@ -365,6 +365,29 @@ spec:
               value: "120"
             - name: E2B_DISK_RECONCILE_INTERVAL_S
               value: "900"
+            # N25/C: hand every command a per-exec `RLIMIT_FSIZE` equal to what
+            # is **left** of its workspace budget, refreshed at each exec (the
+            # dirty-directory ledger makes that refresh milliseconds, so it is
+            # not a stale number from the last scan round).
+            #
+            # What it buys: a sandbox at 700 of 1024 MiB can no longer write
+            # another 1024 MiB file -- the write stops at 324. Consecutive
+            # writes that are each their own exec (every SDK `files.write`, and
+            # every upload helper) therefore converge on the budget instead of
+            # each re-reading the full one.
+            #
+            # What it does not buy: a *single* command that loops and writes
+            # files (`for i in 1 2 3; do dd ...; done`) is one process with one
+            # ceiling, so each file is only bounded by that same number. That
+            # case is bounded by the 5 s pause gate, not by this.
+            #
+            # The floor (1 MiB) is what keeps an over-budget sandbox usable: it
+            # must still be able to run commands that write a small file, and
+            # above all to *delete* what it needs to delete.
+            - name: E2B_DISK_EXEC_LIMIT
+              value: "1"
+            - name: E2B_DISK_EXEC_LIMIT_FLOOR_MB
+              value: "1"
             - name: E2B_NODE_PROCESSES
               value: "256"
           resources:

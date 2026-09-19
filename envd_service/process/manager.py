@@ -309,6 +309,7 @@ class ProcessManager:
         pty_size: tuple[int, int] | None = None,
         tag: str | None = None,
         internal: bool = False,
+        max_file_size: int | None = None,
     ) -> ManagedProcess:
         """Start a command; ``internal`` marks worker bookkeeping (N28).
 
@@ -337,6 +338,7 @@ class ProcessManager:
             pty=pty,
             rows=rows,
             cols=cols,
+            max_file_size=max_file_size,
         )
         # Per-sandbox gate: commands to the same sandbox serialize on write
         # access. Concurrent commands queue; a full wait queue fails fast

@@ -17,6 +17,15 @@ class ExecConfig:
     pty: bool = False
     rows: int = 24
     cols: int = 80
+    #: N25/C: tighten this command's ``RLIMIT_FSIZE`` to this many bytes.
+    #:
+    #: Only the sandlock backend consumes it (a per-exec ceiling inside the
+    #: instance's own), and only ever as a *tightening*: the caller passes how
+    #: much of a budget is left, and a write past it fails with ``EFBIG``
+    #: instead of being noticed afterwards. ``None`` keeps the instance
+    #: ceiling -- which is what every non-sandlock backend and every caller
+    #: without a fresh measurement does.
+    max_file_size: int | None = None
 
 
 class RunningProcess:

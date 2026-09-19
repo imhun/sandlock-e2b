@@ -328,6 +328,25 @@ class RuntimeRegistry:
         except DirLedgerUnknown:
             ledger.invalidate()
 
+    def refresh_disk_usage(self, sandbox_id: str) -> int | None:
+        """The tree's size *now*, from the ledger (N25/L2c), or ``None``.
+
+        The per-exec ceiling (N25/C) asks this before each command, so the
+        ceiling is "what is left" rather than "what was left up to one scan
+        interval ago". With dirty-directory accounting that refresh is the work
+        one scan round does for one sandbox -- milliseconds -- instead of the
+        whole-tree walk it replaced (measured: 1044 ms for 400 directories).
+
+        ``None`` means "cannot answer" (no provider, no ledger yet, an
+        unreadable directory, the pure shape), and the caller must fall back to
+        the instance ceiling rather than invent a number.
+        """
+        try:
+            record = self.get(sandbox_id)
+        except UnknownSandboxError:
+            return None
+        return self._incremental_dir_size(record, dirty=True)
+
     def _ledger_for(self, record: RuntimeSandbox) -> DirLedger:
         with self._lock:
             ledger = self._ledgers.get(record.sandbox_id)

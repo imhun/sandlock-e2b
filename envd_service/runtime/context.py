@@ -307,9 +307,11 @@ class SandboxRuntimeContext:
         self.record = record
         #: N25/L2c: the registry that owns the incremental ledger, so a write
         #: the platform makes inside the tree can mark itself dirty (see
-        #: ``start_mcp_gateway``). ``None`` in tests and in any embedder that
+        #: ``start_mcp_gateway``) and so the per-exec ceiling (N25/C) can read
+        #: a *fresh* usage number. ``None`` in tests and in any embedder that
         #: does not run the accounting.
         self.runtime_registry = runtime_registry
+        self.settings = settings
         self.executor = create_executor(
             settings,
             workspace_dir=record.workspace_dir,
@@ -475,6 +477,53 @@ class SandboxRuntimeContext:
         """
         drain = getattr(self.executor, "drain_dirty_dirs", None)
         return drain() if drain is not None else None
+
+    def max_file_size_for_exec(self) -> int | None:
+        """The per-exec file ceiling for the next command (N25/C), or ``None``.
+
+        ``None`` means "no per-exec change": the instance ceiling applies, which
+        is what every command got before this existed and what a caller with no
+        fresh measurement still gets.
+
+        The number is what is **left** of the workspace budget, computed with
+        the accounting refreshed *right now* rather than at the last scan
+        round. That refresh is the whole point: with a stale value, consecutive
+        writes would each read the same "1024 MiB left" and each be allowed to
+        write it. Dirty-directory accounting is what makes refreshing per exec
+        affordable (milliseconds, against a whole-tree walk measured at
+        ~1 s for 400 directories).
+
+        Two floors keep it from refusing legal work:
+
+        * the configured floor (1 MiB), so a sandbox at or over its budget can
+          still run commands that write small files -- and, above all, can
+          still *delete* what it must to get back inside;
+        * every mounted volume slice's own quota, because a slice is a separate
+          budget whose usage this ledger does not track. A per-exec ceiling
+          below it would refuse a write the volume was sold.
+        """
+        settings = self.settings
+        if not getattr(settings, "disk_exec_limit", False):
+            return None
+        registry = self.runtime_registry
+        if registry is None:
+            return None
+        budget = int(self.record.disk_mb) * 1024 * 1024
+        if budget <= 0:
+            return None
+        used = registry.refresh_disk_usage(self.record.sandbox_id)
+        if used is None:
+            # No fresh measurement: the instance ceiling (which never refuses a
+            # legal write) stays in force. Guessing here would be the one
+            # failure mode this feature must not have.
+            return None
+        floor = max(0, int(getattr(settings, "disk_exec_limit_floor_mb", 1))) * 1024 * 1024
+        limit = max(budget - used, floor)
+        for mount in self.record.volume_mounts:
+            quota = mount.get("perSandboxQuotaMb")
+            if isinstance(quota, int) and not isinstance(quota, bool) and quota > 0:
+                limit = max(limit, quota * 1024 * 1024)
+        return limit
 
     def resume(self) -> None:
         self.processes.resume_all()

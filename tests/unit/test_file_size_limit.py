@@ -108,6 +108,88 @@ def test_a_non_positive_setting_is_treated_as_unset(value):
     assert _executor(max_file_size_mb=value)._max_file_size_bytes() is None
 
 
+# -- the per-exec ceiling (N25/C) -------------------------------------------
+
+
+class _FakeRegistry:
+    """Stands in for the worker registry the context asks for a fresh number."""
+
+    def __init__(self, used: int | None) -> None:
+        self.used = used
+        self.calls = 0
+
+    def refresh_disk_usage(self, sandbox_id: str) -> int | None:
+        self.calls += 1
+        return self.used
+
+
+def _settings(**overrides):
+    from types import SimpleNamespace
+
+    base = {
+        "disk_exec_limit": True,
+        "disk_exec_limit_floor_mb": 1,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _context(*, used: int | None, disk_mb: int = 1024, volumes=None, settings=None, registry=True):
+    from envd_service.runtime.context import SandboxRuntimeContext
+
+    record = _record(disk_mb=disk_mb, volumes=volumes)
+    context = SandboxRuntimeContext.__new__(SandboxRuntimeContext)
+    context.record = record
+    context.settings = settings or _settings()
+    context.runtime_registry = _FakeRegistry(used) if registry else None
+    return context
+
+
+def test_the_exec_ceiling_is_what_is_left():
+    assert _context(used=700 * MIB).max_file_size_for_exec() == 324 * MIB
+
+
+def test_the_exec_ceiling_refreshes_before_each_command():
+    """The point of the whole feature: never use a value from the last scan."""
+    registry = _FakeRegistry(700 * MIB)
+    context = _context(used=700 * MIB)
+    context.runtime_registry = registry
+    context.max_file_size_for_exec()
+    context.max_file_size_for_exec()
+    assert registry.calls == 2
+
+
+def test_the_floor_keeps_an_over_budget_sandbox_usable():
+    """It must still be able to run a command that deletes something."""
+    assert _context(used=2000 * MIB).max_file_size_for_exec() == 1 * MIB
+
+
+def test_a_volume_slice_only_ever_widens_the_ceiling():
+    """A slice is a budget of its own, and its usage is not in this ledger."""
+    assert (
+        _context(used=1000 * MIB, volumes=[_mount(4096)]).max_file_size_for_exec()
+        == 4096 * MIB
+    )
+
+
+def test_without_a_fresh_number_there_is_no_per_exec_change():
+    """`None` means the instance ceiling applies -- never a guess."""
+    assert _context(used=None).max_file_size_for_exec() is None
+    assert _context(used=0, registry=False).max_file_size_for_exec() is None
+
+
+def test_the_feature_is_off_unless_it_is_switched_on():
+    assert (
+        _context(used=0, settings=_settings(disk_exec_limit=False))
+        .max_file_size_for_exec()
+        is None
+    )
+
+
+def test_an_unbudgeted_tree_has_no_exec_ceiling():
+    assert _context(used=1, disk_mb=0).max_file_size_for_exec() is None
+
+
 # -- the refusal text -------------------------------------------------------
 
 

@@ -88,6 +88,10 @@ class _Context:
         self.files = FilesystemOps(root)
         self.processes = processes
 
+    def max_file_size_for_exec(self) -> int | None:
+        """No per-exec ceiling unless a test asks for one (N25/C)."""
+        return None
+
 
 def _context(root: Path, executor: Executor | None = None, **manager_kwargs):
     manager = ProcessManager(
@@ -295,6 +299,18 @@ async def test_a_helper_that_fails_on_its_own_is_still_a_worker_fault(tmp_path):
 
     assert exc.value.code == "internal"
     assert exc.value.http_status == 500
+
+
+async def test_the_helper_carries_the_per_exec_ceiling(root):
+    """N25/C: an upload is bounded by what is left, like any other command."""
+    executor = _RecordingExecutor()
+    context = _context(root, executor)
+    context.max_file_size_for_exec = lambda: 42 * 1024 * 1024
+    writer = SandboxWriter(context)
+
+    await writer.make_dir("a")
+
+    assert executor.configs[0].max_file_size == 42 * 1024 * 1024
 
 
 # -- internal is internal --------------------------------------------------

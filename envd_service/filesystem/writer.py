@@ -266,6 +266,11 @@ class SandboxWriter:
                 cwd=ctx.record.workspace_dir,
                 stdin_enabled=stdin,
                 internal=True,
+                # N25/C: the upload itself runs inside the sandbox, so it is
+                # subject to the same "what is left" ceiling as any other
+                # command -- otherwise the one write the platform performs on
+                # the caller's behalf would be the one that ignores the budget.
+                max_file_size=ctx.max_file_size_for_exec(),
             )
         except Exception as exc:  # noqa: BLE001 - reported as a write failure
             raise SandboxWriteError(

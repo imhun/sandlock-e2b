@@ -208,6 +208,10 @@ def build_process_handlers() -> tuple[dict[str, Any], dict[str, Any]]:
             stdin_enabled=bool(stdin),
             pty_size=pty_size,
             tag=tag if isinstance(tag, str) else None,
+            # N25/C: what is left of this sandbox's workspace budget, refreshed
+            # now (see `max_file_size_for_exec`), so a single file cannot grow
+            # past the remaining budget. `None` keeps the instance ceiling.
+            max_file_size=ctx.max_file_size_for_exec(),
         )
         queue = proc.subscribe(replay=False)
 

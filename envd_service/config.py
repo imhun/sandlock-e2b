@@ -273,6 +273,22 @@ class Settings:
     max_file_write_mb: int = field(
         default_factory=lambda: _env_int("E2B_MAX_FILE_WRITE_MB", 512)
     )
+    # N25/C: hand every command a per-exec `RLIMIT_FSIZE` equal to what is left
+    # of its workspace budget, so a single file cannot grow past the *remaining*
+    # budget rather than past the whole one. **Off by default**: it changes what
+    # a command can write, so it is enabled where it has been measured (the
+    # accounting is refreshed at each exec, which is what makes consecutive
+    # writes converge instead of each re-reading a stale value).
+    disk_exec_limit: bool = field(
+        default_factory=lambda: _env_bool("E2B_DISK_EXEC_LIMIT", False)
+    )
+    # ...and the floor it is never lowered below. A sandbox at or over its
+    # budget must still be able to run a command that writes a small file (a
+    # shell's temp file), and above all to *delete* what it needs to delete to
+    # get back inside it -- a ceiling of zero would refuse both.
+    disk_exec_limit_floor_mb: int = field(
+        default_factory=lambda: _env_int("E2B_DISK_EXEC_LIMIT_FLOOR_MB", 1)
+    )
     # Per-sandbox host uid isolation (E3.2) -- **on by default**: every
     # sandbox gets a distinct host uid from the pool and its workspace is
     # `0770 <uid>:<worker gid>` (fix round 1 / c1). That identity is what makes the rest of
