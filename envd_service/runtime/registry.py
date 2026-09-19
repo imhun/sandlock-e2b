@@ -199,6 +199,16 @@ class RuntimeRegistry:
         #: crossed (the latter is the event worth reporting immediately).
         self._disk_over: set[str] = set()
         self._disk_crossings: dict[str, int] = {}
+        #: N25: per-call timing of the two halves of a dirty round (the drain
+        #: into the mediator and the re-walk of what it reported), so a round
+        #: that takes longer than the walk can be told apart from one that is
+        #: waiting on something else. Off unless E2B_DISK_TRACE is set.
+        self._trace = str(os.getenv("E2B_DISK_TRACE", "") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         #: N25/L2b: where the next ``disk_usage_snapshot`` round starts, so a
         #: scan budget that runs out does not always starve the same trees.
         self._disk_scan_cursor = 0
@@ -424,15 +434,19 @@ class RuntimeRegistry:
             ledger.rescan_next(dirs)
             return total
 
+        drained_at = time.monotonic()
         drained = provider(record.sandbox_id)
+        drain_s = time.monotonic() - drained_at
         if drained is None:
+            self._trace_call(record.sandbox_id, drain_s, 0.0, "walk")
             return None
         dirs, overflow = drained
         if overflow or not ledger.ready:
-            # Overflow means the mediator stopped recording, so the ledger has
-            # to be rebuilt from scratch before it can be trusted again.
             self._dirty_stats["rebuilt"] += 1
             total = ledger.rebuild()
+            self._trace_call(
+                record.sandbox_id, drain_s, time.monotonic() - drained_at, "rebuilt"
+            )
             # A rebuild drains and then walks, and the two are not atomic: a
             # writer that opened its file *before* the drain and appended
             # *during* the walk can fall between them, in a directory the walk
@@ -447,7 +461,31 @@ class RuntimeRegistry:
             ledger.invalidate()
             return None
         self._dirty_stats["ledger"] += 1
+        self._trace_call(
+            record.sandbox_id, drain_s, time.monotonic() - drained_at, "ledger"
+        )
         return size
+
+    def _trace_call(
+        self, sandbox_id: str, drain_s: float, total_s: float, path: str
+    ) -> None:
+        """Log one round's timing split when ``E2B_DISK_TRACE`` is set (N25).
+
+        The two halves are the question: a round that is slow because it
+        *wrote* a lot is doing its job, and a round that is slow because it is
+        *waiting* (on the slot's channel, or on a thread) is not -- and from the
+        outside they look identical.
+        """
+        if not self._trace:
+            return
+        logger.info(
+            "disk trace: call sid=%s path=%s drain=%.3fs total=%.3fs apply=%.3fs",
+            sandbox_id,
+            path,
+            drain_s,
+            total_s,
+            max(0.0, total_s - drain_s),
+        )
 
     def _log_dirty_split(self) -> None:
         """Say how the last rounds were answered, at most once a minute.

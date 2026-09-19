@@ -1566,8 +1566,10 @@ class NodeAgent:
         self._disk_report = dict(report or {})
         if self._disk_trace:
             logger.info(
-                "disk trace: round=%s got=%s",
-                time.strftime("%H:%M:%S", time.localtime()) + f".{int(time.time() * 1000) % 1000:03d}",
+                "disk trace: round=%s took=%.3fs got=%s",
+                time.strftime("%H:%M:%S", time.localtime())
+                + f".{int(time.time() * 1000) % 1000:03d}",
+                time.monotonic() - self._disk_report_at,
                 dict(report or {}),
             )
         self._report_budget_crossings()
