@@ -1420,6 +1420,13 @@ class NodeAgent:
         if not self._control_url or not self._node_address:
             return
         self._task = asyncio.create_task(self._loop())
+        # N25: the scan cadence gets its own task, because the heartbeat only
+        # runs every 5 s -- a round started from there would inherit that as
+        # its floor no matter what the interval says (measured: a 4.7 s freeze
+        # latency with the interval set to 1 s).
+        self._disk_loop_task: asyncio.Task | None = None
+        if self._disk_provider is not None and self._disk_interval_s > 0:
+            self._disk_loop_task = asyncio.create_task(self._disk_loop())
 
     async def _loop(self) -> None:
         """Heartbeat on its own cadence, with reconcile rounds running *beside*.
@@ -1494,21 +1501,14 @@ class NodeAgent:
         # round outlives it).
         self._start_reconcile_if_due()
 
-    def _disk_report_for_heartbeat(self) -> dict[str, int]:
-        """The last measured tree sizes; a fresh scan is started, never awaited.
+    def _maybe_scan_disk(self) -> dict[str, int]:
+        """Start a scan round if one is due (single-flight); return the last.
 
-        The scan is a blocking file-system walk, so it runs on a worker thread
-        with a single-flight guard (the same shape N21 gave the reconcile
-        round) and this returns whatever the last completed round produced.
-        Awaiting it here would put the whole NAS walk back on the event loop --
-        which is what capped the cadence: with the walk inline, a round could
-        hold the loop for its whole 1 s budget, so ``E2B_DISK_ENFORCE_INTERVAL_S``
-        had to be minutes wide to keep the duty cycle harmless.
-
-        Now the interval only decides *when the next round starts*, never how
-        long the loop is held, and a round that outruns its interval simply
-        means the next one starts late. The floor that remains is the heartbeat
-        it rides (5 s): a report is only acted on at the next pulse.
+        Called from the heartbeat *and* from `_disk_loop`. The loop is what
+        makes the interval real: the heartbeat only runs every 5 s, so a round
+        started from there would give the interval an effective floor of one
+        pulse -- measured as a 4.7 s freeze latency with the interval set to
+        1 s, because the crossing was only noticed on a pulse.
         """
         if self._disk_provider is None or self._disk_interval_s <= 0:
             return {}
@@ -1517,6 +1517,28 @@ class NodeAgent:
         if not in_flight and now - self._disk_report_at >= self._disk_interval_s:
             self._disk_scan_task = asyncio.create_task(self._scan_disk_round())
         return self._disk_report
+
+    async def _disk_loop(self) -> None:
+        """Drive the scan cadence independently of the pulse (N25)."""
+        tick = max(0.1, min(self._disk_interval_s, 1.0))
+        while True:
+            await asyncio.sleep(tick)
+            try:
+                self._maybe_scan_disk()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("disk loop tick failed", exc_info=True)
+
+    def _disk_report_for_heartbeat(self) -> dict[str, int]:
+        """The last measured tree sizes; a fresh scan is started, never awaited.
+
+        The heartbeat carries whatever the last completed round produced. The
+        round itself is a worker-thread task behind a single-flight guard (the
+        shape N21 gave the reconcile round), so a slow or failing scan can never
+        stall a pulse or a request -- it only means the next round starts late.
+        """
+        return self._maybe_scan_disk()
 
     async def _scan_disk_round(self) -> None:
         """Run one scan round off the loop and publish what it found."""
@@ -2142,8 +2164,14 @@ class NodeAgent:
         running through shutdown (touching the shared base while the process is
         tearing its state down).
         """
-        for attribute in ("_task", "_reconcile_task", "_disk_scan_task", "_push_task"):
-            task: asyncio.Task | None = getattr(self, attribute)
+        for attribute in (
+            "_task",
+            "_reconcile_task",
+            "_disk_scan_task",
+            "_disk_loop_task",
+            "_push_task",
+        ):
+            task: asyncio.Task | None = getattr(self, attribute, None)
             if task is None:
                 continue
             task.cancel()
