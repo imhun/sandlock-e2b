@@ -1326,6 +1326,89 @@ stdin），然后只做**读**回填响应。路径语义不变（`/foo` 仍然�
 > 仍然没有的是**写到一半的 ENOSPC**（per-write），它需要写路径中介记账，见
 > `docs/disk-accounting-dirty-dirs.md` §13。
 
+### 22.4 冻结延迟的 3.7 秒花在哪：NFS 的 `stat` 会先等自己的回写（N25，2026-09-19）
+
+**现象**：写 3×900 MiB（预算 1024 MiB），从"开始写"到"控制面记录变成 paused"是 **3.7~4.0 s**，
+而把扫描间隔从 1 s 调到 0.25 s 或拉长到 3 s，结果**一模一样**。间隔不是杠杆，这本身就是线索：
+延迟里有一段与间隔无关的时间。
+
+**先排除的两段**（实测，不是推断）：上报链路只占 **20 ms**（worker 日志 `crossing 09:22:59.837`
+→ 控制面 `…843` → agent 冻结 `…857`）；控制面到 worker 的 `stat` 可见性也没问题（慢速写时
+worker 侧跟着线性涨）。所以这段时间在**扫描这一轮本身**：worker 自己的 trace 记着
+`path=rebuilt total=1.800s apply=1.799s`、`path=ledger total=1.006s apply=1.006s`。
+
+**找它的过程**（每一步都用一个反例把上一步的假设打掉）：
+
+| 假设 | 怎么测的 | 结果 |
+|---|---|---|
+| 树太大/walk 本来就这么贵 | 同一个 NFS 路径，从**另一台** worker 上走同一棵树 | **4.6 ms**（树是 2 目录 3 文件）⇒ 不是 NAS 慢 |
+| CPU 被限流或抢不到 | 线程内同时记 wall 与 `thread_time()`，并读 cgroup `cpu.stat` | wall **1722 ms** / CPU **2.2 ms**，`nr_throttled=0`、`throttled_usec=0` ⇒ 是**阻塞**，不是 CPU |
+| 写入节点的所有元数据操作都慢 | 先 `find` 出沙箱真正落在宿主上的路径，再逐个计时 | `scandir(父目录)` **2.3 ms**、`stat(父目录)` **0.03 ms**，只有 **`stat(正在写的那个文件)` 1389 ms**（另一台 worker 同一次测量 **0.03 ms**） |
+| 是 RPC 排队/协议层 | 看阻塞线程的内核状态 | 线程状态 `D`、`wchan=rpc_wait_bit_killable` 与 `folio_wait_bit_common`、当前 syscall = `newfstatat`(79) ⇒ 卡在**回写等待**上 |
+
+内核源码把这条钉死（`fs/nfs/inode.c::nfs_getattr`）：
+
+```c
+/* Flush out writes to the server in order to update c/mtime/version.  */
+if ((request_mask & (STATX_CTIME | STATX_MTIME | STATX_CHANGE_COOKIE)) &&
+    S_ISREG(inode->i_mode)) {
+        if (nfs_have_delegated_mtime(inode))
+                filemap_fdatawrite(inode->i_mapping);
+        else
+                filemap_write_and_wait(inode->i_mapping);
+}
+```
+
+也就是说：**在 NFS 上 `stat()` 一个"自己还有脏页"的文件，会先把脏页全部写出去再回答**。而
+`os.stat`（`fstatat`）的请求掩码里**永远带着 ctime/mtime**，所以记账每问一次"这个文件多大"，
+就等于顺手要求"顺便把它写完" —— 在写入节点上，这个等待正好等于那一轮写的时长。
+
+**改法**：只在 **`statx` 里请求 `STATX_SIZE`**（不含时间字段），内核就不会安排那次 flush，而
+size 缓存过期时它照样会去 revalidate。集群上同一时刻、同一个文件的对照测量：
+
+| 问法 | 写入节点 | 另一台 |
+|---|---|---|
+| `os.stat()` | **1405 ms** | 0.04 ms |
+| `statx(mask=STATX_SIZE)` | **0.01 ms** | 0.01 ms |
+| `statx(AT_STATX_DONT_SYNC)` | 0.06 ms | 0.03 ms |
+
+三者返回的**同一个数**（838860800）。Python 的 `os.stat` 没有 flags 参数，所以这个探针用
+ctypes 直接调 libc 的 `statx`（`struct statx.stx_size` 在 256 字节记录的第 40 字节，且该结构
+按设计是架构无关的；`os.stat` 保留为没有 `statx` 的平台的回退）。实现落在
+`envd_service/runtime/brief_stat.py::entry_size`，被**两条**记账 walk 使用：
+`dir_ledger.scan_subtree`（增量账本）与 `priv_helpers.dir_size`（整树回退，也是 `/metrics` 那个
+数）。两条用同一个探针，所以"账本 == 整树 walk"的逐字节契约不变。
+
+**为什么不是别的改法**：
+
+* 调间隔没用：一轮里有一段与间隔无关的阻塞，间隔再短也得等它（本轮实测 0.25/1/3 s 三档一致，
+  就是这个原因）。
+* 事件上报（跨阈值立即报）只省掉"轮询发现"的那一段，它**仍然要先有一个数**，而那个数当时
+  正卡在上面这 1.4 s 里。
+* 换掉整树 walk 也不够：增量账本已经只重扫脏目录了，脏目录里的**那个文件**照样要问大小。
+
+**上线实测**（`0.1.0-400-g37e8da3-20260919-103017`，`tmp/k0s/probe_brief_stat_live.py` /
+`probe_freeze_latency_cp.py` 可复跑）：
+
+| 项 | 改前 | 改后 |
+|---|---|---|
+| 写入节点 `stat` 正在写的文件 | 1395 ms（p50） | **0.08 ms**（`entry_size`） |
+| 该节点整树 `dir_size` walk | 1.4 s 量级 | **4.9 ms**（p50） |
+| worker 一轮（trace `round took`） | **1.0 / 1.6 / 1.8 s** | **0.010 / 0.011 s** |
+| 冻结延迟（3×900 MiB 对 1024 预算） | 3.7 / 3.8 / 3.9 / 4.0 s | **1.9 / 3.1 / 3.2 / 3.2 / 3.4 / 3.4 / 3.7 s** |
+| 三处返回值 | — | `os.stat` / `entry_size` / `dir_size` **逐字节相同** |
+
+**剩下的 3 秒不是这条链路**。它现在分解成：一轮 10 ms + 上报 20 ms + **"沙箱写下去的字节什么时候对平台可见"**。
+后者是存储侧的可见性，不是扫描频率：对**快速写**，不带 flush 的 `stat` 看到的是**已提交**状态，
+所以观测序列是台阶（`0 → 900 MiB → 1800 MiB`，偶尔能抓到中间值 `1151 MiB`，那一次延迟就是 **1.9 s**）；
+带 flush 的 `stat` 能拿到真实大小，但代价是等到这次写结束 —— 也就是改前那 1.4 s 在做的事。
+两侧都一样：**沙箱自己的** `os.stat` 同样会 flush、同样被卡住（实测：探针从 0.01 s 的"不存在"直接跳到
+0.85 s 的 900 MiB）。
+
+> 所以再往下压延迟，要压的不是"扫描多快"，而是"**数从哪来**"：只有当数字来自"沙箱自己写了多少字节"
+> （中介侧记账 / 事件上报）时，才不依赖存储的提交可见性。这件事与 §22.2 的脏目录记账是两条不同的
+> 线：脏目录回答"哪个目录变了"，字节账回答"变了多少"，而后者正是现在唯一还没被消掉的那一段。
+
 ### 22.3 单文件硬限改成"剩余额度"（N25/C，2026-09-19）
 
 C 原来的口径是"任何单个文件不得超过**整棵树**的预算"（免费、永不误伤，但也管不住"树已经用了 700、
