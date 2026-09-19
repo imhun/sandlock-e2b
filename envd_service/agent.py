@@ -1388,6 +1388,12 @@ class NodeAgent:
         #: N25/L2c: build the report from the mediator's dirty set instead of
         #: walking every tree. Off by default -- see `_disk_enforce_dirty_enabled`.
         self._disk_dirty = _disk_enforce_dirty_enabled()
+        #: N25: a per-round trace of what the scan actually saw, for the
+        #: question "why did it take this long to notice" -- the interval and
+        #: the push are both visible, but what a round *observed* is not.
+        self._disk_trace = str(
+            os.getenv("E2B_DISK_TRACE", "") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self._disk_report: dict[str, int] = {}
         self._disk_report_at = 0.0
         #: The scan round in flight, if any (single-flight, like the reconcile
@@ -1558,6 +1564,12 @@ class NodeAgent:
             logger.warning("sandbox disk scan failed", exc_info=True)
             return
         self._disk_report = dict(report or {})
+        if self._disk_trace:
+            logger.info(
+                "disk trace: round=%s got=%s",
+                time.strftime("%H:%M:%S", time.localtime()) + f".{int(time.time() * 1000) % 1000:03d}",
+                dict(report or {}),
+            )
         self._report_budget_crossings()
 
     def _report_budget_crossings(self) -> None:
