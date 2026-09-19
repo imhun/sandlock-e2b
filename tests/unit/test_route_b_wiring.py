@@ -323,6 +323,7 @@ def test_the_pool_hands_the_spawner_a_usable_control_descriptor(tmp_path):
 
     def _spawn(**kw):
         seen["control_fd"] = kw["control_fd"]
+        seen["events_fd"] = kw.get("events_fd")
         proc = FakeProcess()
         spawned.append(proc)
         return proc
@@ -330,6 +331,13 @@ def test_the_pool_hands_the_spawner_a_usable_control_descriptor(tmp_path):
     pool, spawned, log, channels = _pool(tmp_path, spawner=_spawn)
     handle = pool.acquire_sync("sbx_fd", {}, uid=20000)
     assert seen["control_fd"] is not None and seen["control_fd"] >= 0
+    # N25: the same lease carries the one-way events descriptor, and the
+    # worker keeps a live end of it for the sandbox's whole life.
+    assert seen["events_fd"] is not None and seen["events_fd"] >= 0
+    assert seen["events_fd"] != seen["control_fd"]
+    assert handle.events_socket is not None
+    assert handle.events_socket.type == socket.SOCK_STREAM
+    assert handle.events_socket.family == socket.AF_UNIX
     assert handle.control_socket.type == socket.SOCK_STREAM
     assert handle.control_socket.family == socket.AF_UNIX
     assert handle.sock_path is None and handle.token is None
@@ -337,14 +345,20 @@ def test_the_pool_hands_the_spawner_a_usable_control_descriptor(tmp_path):
     assert channels[0].path == "None"
     assert handle.verb_timeout_s == 15.0
     worker_fd = handle.control_socket.fileno()
+    events_fd = handle.events_socket.fileno()
     pool.retire(handle)
     assert spawned[0].returncode == 0
     # retire closes the worker end, so a slot that outlived us sees EOF on its
     # control stream and tears its own generation down instead of serving a
     # worker that is already gone.
     assert handle.control_socket is None
+    assert handle.events_socket is None
     with pytest.raises(OSError):
         os.fstat(worker_fd)
+    # …and the events channel goes with it, so no dead generation's pipe is
+    # left behind keeping a reader thread alive.
+    with pytest.raises(OSError):
+        os.fstat(events_fd)
 
 
 def test_slot_pools_are_cached_per_transport(tmp_path, monkeypatch):

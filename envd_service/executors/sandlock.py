@@ -505,6 +505,10 @@ class SandlockExecutor(Executor):
         self._route_b = route_b
         self._route_b_decline = self._route_b_decline_reason()
         self._route_b_active = self._route_b_decline is None
+        # N25: consumer of the slot's pushed append events, installed by the
+        # runtime context (`SandboxRuntimeContext`) right after construction.
+        # ``None`` means the numbers keep coming from the filesystem alone.
+        self._append_sink = None
         self._disclose_mediation_shape()
         self._instance = None
         self._instance_name: str | None = None
@@ -822,6 +826,58 @@ class SandlockExecutor(Executor):
             )
             return None
 
+    def set_append_sink(self, sink) -> None:
+        """Install the consumer of pushed append events (N25).
+
+        ``sink(bytes_)`` is called from the slot's event-pump thread whenever
+        the mediator reports that the sandbox appended bytes. The sink is the
+        registry's `note_appended`, so nothing here interprets the number.
+        """
+        self._append_sink = sink
+
+    def set_file_size_limit(self, bytes_: int) -> dict | None:
+        """Ask the live slot to tighten the running processes' file limit (N25).
+
+        ``None`` means no live instance or a slot that does not know the verb;
+        the caller treats that exactly like "no tightening available".
+        """
+        instance = self._instance
+        setter = getattr(instance, "set_file_size_limit", None)
+        if setter is None:
+            return None
+        try:
+            return setter(int(bytes_))
+        except Exception:  # noqa: BLE001 - a capability answer, never a crash
+            logger.warning(
+                "update_file_size_limit refused for sandbox %s",
+                self._sandbox_id or "-",
+                exc_info=True,
+            )
+            return None
+
+    def _on_slot_event(self, event: dict) -> None:
+        """Handle one pushed slot event (N25)."""
+        if event.get("event") != "append":
+            return
+        sink = getattr(self, "_append_sink", None)
+        if sink is None:
+            return
+        try:
+            bytes_ = int(event.get("bytes") or 0)
+        except (TypeError, ValueError):
+            return
+        if bytes_ > 0:
+            sink(bytes_)
+        try:
+            return drain()
+        except Exception:  # noqa: BLE001 - a capability answer, never a crash
+            logger.debug(
+                "drain_dirty_dirs unavailable for sandbox %s",
+                self._sandbox_id,
+                exc_info=True,
+            )
+            return None
+
     def _instance_name_for(self) -> str:
         sid = self._sandbox_id or Path(self._workspace_dir).name
         if len(sid.encode()) <= 64:
@@ -1068,7 +1124,21 @@ class SandlockExecutor(Executor):
             # host uid. `unknown` means the wheel predates fork F18.
             handle.guest_uid or "unknown",
         )
-        return RouteBInstance(pool=pool, handle=handle, name=self.instance_name)
+        instance = RouteBInstance(pool=pool, handle=handle, name=self.instance_name)
+        # N25: start consuming the slot's pushed events. `False` means this
+        # slot has no events channel (an older wheel, or the registered-path
+        # transport), which costs acceleration only -- the accounting still
+        # answers from the filesystem, and the ceiling from the ledger.
+        if getattr(self, "_append_sink", None) is not None:
+            started = instance.start_event_pump(self._on_slot_event)
+            if not started:
+                logger.info(
+                    "sandbox_id=%s has no pushed-append channel (slot %s): "
+                    "disk accounting keeps its polling path",
+                    self._sandbox_id or "-",
+                    self.instance_name,
+                )
+        return instance
 
     async def _ensure_instance_async(self):
         """:meth:`_ensure_instance` without ever blocking the event loop.

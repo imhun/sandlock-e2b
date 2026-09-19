@@ -372,6 +372,16 @@ class SandboxRuntimeContext:
         self.writer = SandboxWriter(self)
         self.watchers = WatcherRegistry(self.files)
         self.watch_stream = WatchDirStream(self.files)
+        # N25: the pushed-append sink. The slot watches the sandbox's own open
+        # write descriptors and reports what they grew by; this hands that
+        # number to the registry, which is the component that knows what a
+        # size means. Wiring it here (rather than in the executor) keeps the
+        # executor ignorant of the accounting, exactly like `drain_dirty_dirs`.
+        if self.runtime_registry is not None:
+            setter = getattr(self.executor, "set_append_sink", None)
+            if setter is not None:
+                sandbox_id = record.sandbox_id
+                setter(lambda bytes_: runtime_registry.note_appended(sandbox_id, bytes_))
         self._mcp_gateway = None
         self._mcp_gateway_watch: asyncio.Task | None = None
         self._mcp_gateway_failure: McpGatewayFailure | None = None
@@ -391,6 +401,19 @@ class SandboxRuntimeContext:
     @property
     def mcp_port(self) -> int | None:
         return self._mcp_port
+
+    def set_file_size_limit(self, bytes_: int) -> dict | None:
+        """Tighten the live sandbox's per-file ceiling (N25).
+
+        Called by the registry between scan rounds: the sandbox is nearly out
+        of budget and the process that is writing must feel it now, not when
+        the pause gate lands. ``None`` means there is nothing live to tighten
+        (no exec running, or a slot without the verb).
+        """
+        setter = getattr(self.executor, "set_file_size_limit", None)
+        if setter is None:
+            return None
+        return setter(bytes_)
 
     @property
     def mcp_token(self) -> str | None:

@@ -398,6 +398,18 @@ def create_app(
             else None
         )
     )
+    # N25: the other half of the same split. The registry decides *when* a
+    # sandbox's remaining budget is small enough to be worth acting on (it is
+    # the only component that knows what is left); the sandbox's context
+    # applies it to the live process. A sandbox with no live context has
+    # nothing running to tighten, so it answers `None`.
+    runtime_registry.set_disk_tightener(
+        lambda sandbox_id, bytes_: (
+            app.state.runtimes[sandbox_id].set_file_size_limit(bytes_)
+            if sandbox_id in app.state.runtimes
+            else None
+        )
+    )
     runtime_registry.add_unregister_callback(
         lambda sandbox_id: (
             app.state.runtimes.pop(sandbox_id, None).shutdown()

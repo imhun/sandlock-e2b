@@ -95,6 +95,7 @@ def _spawn_slot(
     stdout,
     stderr,
     control_fd: int | None = None,
+    events_fd: int | None = None,
 ) -> subprocess.Popen:
     if os.geteuid() != 0:
         raise PermissionError(
@@ -130,6 +131,16 @@ def _spawn_slot(
         argv += [
             "--control-fd",
             str(control_fd),
+        ]
+        fd_list = [control_fd]
+        if events_fd is not None:
+            # N25: a second, one-way descriptor for pushed events. It is
+            # deliberately not multiplexed onto the control channel: that
+            # channel is request/response, and every reader (including older
+            # wheels) treats its next frame as the answer to its own request.
+            argv += ["--events-fd", str(events_fd)]
+            fd_list.append(events_fd)
+        argv += [
             "--serve",
             "--program",
             str(program_path),
@@ -142,7 +153,7 @@ def _spawn_slot(
             env=env,
             # pass_fds clears CLOEXEC on exactly this descriptor and keeps the
             # same number in the child, which is what --control-fd names.
-            pass_fds=(control_fd,),
+            pass_fds=tuple(fd_list),
         )
     # transport 2: for a slot this pool did not start (an external W1 fleet
     # reached through an injected spawner + channel factory).
@@ -186,6 +197,13 @@ class SlotHandle:
     process: subprocess.Popen | None = None
     #: Transport 1 only: the worker end of the handoff socketpair.
     control_socket: object | None = None
+    #: Transport 1 only (N25): the worker end of the one-way events channel.
+    #: ``None`` on the registered-path transport (an external slot fleet has
+    #: no handoff to carry it), which simply means the accounting keeps its
+    #: polling path. The wheel's ``sandlock-supervise`` and this worker ship
+    #: in the same image, so a slot that does not understand ``--events-fd``
+    #: cannot be paired with this code in the first place.
+    events_socket: object | None = None
     #: Response deadline for a single verb on this slot's channel.
     verb_timeout_s: float = 15.0
     #: What the slot reports for the identity the guest really gets
@@ -453,12 +471,20 @@ class W1SlotPool:
             handoff = None
             server = None
             control_fd: int | None = None
+            events_reader = None
+            events_writer = None
+            events_fd: int | None = None
             if not registered:
                 # Transport 1: one end goes to the slot as ``--control-fd``
                 # (inherited, same number), the other stays here as the client.
                 # No filesystem path, no sun_path budget, no argv secret.
                 handoff, server = socket.socketpair()
                 control_fd = server.fileno()
+                # N25: the one-way events channel. Created with the control
+                # socketpair so both are inherited the same way, and kept on
+                # the handle for the sandbox's lifetime.
+                events_reader, events_writer = socket.socketpair()
+                events_fd = events_writer.fileno()
             elif sock_path.exists():
                 # A socket nobody listens on (a slot this pool had to kill, or
                 # a crashed generation) would make the readiness wait below
@@ -488,9 +514,10 @@ class W1SlotPool:
                     token=token,
                     worker_uid=self._worker_uid,
                     control_fd=control_fd,
+                    events_fd=events_fd,
                 )
             except BaseException:
-                for end in (handoff, server):
+                for end in (handoff, server, events_reader, events_writer):
                     if end is not None:
                         end.close()
                 raise
@@ -498,6 +525,10 @@ class W1SlotPool:
                 # The slot's exec kept its own dup; holding our end would keep
                 # the generation alive-looking after this worker goes away.
                 server.close()
+            if events_writer is not None:
+                # Same reasoning as the control end: the slot holds its dup,
+                # and ours would only keep the pipe from reporting EOF.
+                events_writer.close()
             handle = SlotHandle(
                 sandbox_id=sandbox_id,
                 uid=uid,
@@ -508,6 +539,7 @@ class W1SlotPool:
                 program_path=program_path,
                 process=process,
                 control_socket=handoff,
+                events_socket=events_reader,
                 verb_timeout_s=self.verb_timeout_s,
             )
             # The slot binds/accepts *before* it launches the instance, so a
@@ -739,6 +771,15 @@ class W1SlotPool:
             except OSError:
                 pass
             handle.control_socket = None
+        # N25: the events channel goes with the control channel -- an events
+        # socket left open would keep a dead generation's pipe alive and hold
+        # the pump thread instead of letting it see EOF.
+        if handle.events_socket is not None:
+            try:
+                handle.events_socket.close()
+            except OSError:
+                pass
+            handle.events_socket = None
         self._return_uid_locked(handle.uid)
         logger.info("route-B slot %s released uid %d", handle.name, handle.uid)
 
@@ -1044,6 +1085,81 @@ class RouteBInstance:
         self.policy = None
         self._channel = None
         self._closed = False
+        #: N25: the events pump thread, when one was started.
+        self._events_thread: threading.Thread | None = None
+
+    def start_event_pump(self, on_event: Callable[[dict], None]) -> bool:
+        """Consume pushed events, calling ``on_event`` per event (N25).
+
+        ``False`` means this slot has no events channel to read -- an older
+        wheel, a registered-path transport, or an external fleet -- and the
+        caller must keep whatever polling path it has. That is a capability
+        answer, not an error: the events are an *acceleration*, and the
+        accounting is correct without them.
+
+        The reader is a daemon thread on purpose. It blocks on a socket the
+        slot writes to when the sandbox writes, so it cannot be driven from
+        the event loop; and it must never hold up shutdown, which is why the
+        executor only has to close the socket (EOF ends the loop).
+        """
+        stream = self._handle.events_socket
+        if stream is None or self._events_thread is not None:
+            return False
+        try:
+            reader = stream.makefile("r", encoding="utf-8", newline="\n")
+        except OSError:
+            return False
+
+        def pump() -> None:
+            try:
+                for line in reader:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        # A truncated or foreign line is not worth losing the
+                        # stream over; the next one is still framed by \n.
+                        logger.debug(
+                            "route-B slot %s: unparsable event line %r",
+                            self.name,
+                            line[:120],
+                        )
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    try:
+                        on_event(event)
+                    except Exception:  # noqa: BLE001 - the pump outlives callers
+                        logger.warning(
+                            "route-B slot %s: event consumer raised",
+                            self.name,
+                            exc_info=True,
+                        )
+            except OSError:
+                pass
+
+        self._events_thread = threading.Thread(
+            target=pump, name=f"sandlock-events-{self.name}", daemon=True
+        )
+        self._events_thread.start()
+        return True
+
+    def set_file_size_limit(self, bytes_: int) -> dict | None:
+        """Tighten the live processes' ``RLIMIT_FSIZE`` to at most ``bytes_`` (N25).
+
+        ``None`` means the slot does not know this verb (an older binary), and
+        the caller keeps relying on the per-exec ceiling plus the pause gate.
+        A refused value raises, exactly like every other verb: the slot's
+        reasons ("wider than the ceiling", "no ceiling at all") are the
+        caller's to see.
+        """
+        try:
+            payload = self.request("update_file_size_limit", {"bytes": int(bytes_)})
+        except SandboxError:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     @property
     def pid(self) -> int | None:
@@ -1241,6 +1357,15 @@ class RouteBInstance:
         try:
             self._pool.retire(self._handle)
         finally:
+            # N25: closing the worker's end of the events channel is what ends
+            # the pump thread (the reader sees EOF); it is a daemon, so this
+            # is about promptness, not about correctness at exit.
+            if self._handle.events_socket is not None:
+                try:
+                    self._handle.events_socket.close()
+                except OSError:
+                    pass
+                self._handle.events_socket = None
             if self._channel is not None:
                 try:
                     self._channel.close()

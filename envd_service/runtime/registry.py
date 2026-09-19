@@ -181,6 +181,30 @@ class RuntimeRegistry:
         #: plane). ``None`` = independent-uid mode disabled.
         self.uid_pool = uid_pool
         self._dirty_provider: Callable[[str], tuple[list[str], bool] | None] | None = None
+        #: N25: bytes each sandbox has *appended* since its last exact
+        #: measurement, pushed by its mediator (`note_appended`) instead of
+        #: being polled for. A round consumes them, because the round's number
+        #: already contains everything committed up to that moment.
+        self._appended: dict[str, int] = {}
+        #: N25: the live tightener (`f(sandbox_id, bytes) -> applied | None`),
+        #: installed by the app. Absent means "no live tightening": the
+        #: per-exec ceiling and the pause gate still hold.
+        self._tightener: Callable[[str, int], dict | None] | None = None
+        #: Last limit sent per sandbox and when, so a round that changes
+        #: nothing costs nothing and a shrinking budget is sent in steps.
+        self._tightened: dict[str, int] = {}
+        self._tightened_at: dict[str, float] = {}
+        #: N25: how much the limit must drop before it is worth a verb to the
+        #: slot, the smallest limit ever sent (a file must be able to hold
+        #: *something*, so the ceiling never goes to zero), and how often a
+        #: tightening may be sent at most.
+        self._tighten_step_bytes = int(
+            _env_seconds("E2B_DISK_TIGHTEN_STEP_MB", 4.0) * 1024 * 1024
+        )
+        self._tighten_floor_bytes = max(
+            1, int(_env_seconds("E2B_DISK_EXEC_LIMIT_FLOOR_MB", 1.0) * 1024 * 1024)
+        )
+        self._tighten_interval_s = _env_seconds("E2B_DISK_TIGHTEN_INTERVAL_S", 0.5)
         #: N25/L2c: per-sandbox `DirLedger`, keyed by id, dropped when the
         #: sandbox is unregistered (its tree is about to go away).
         self._ledgers: dict[str, DirLedger] = {}
@@ -305,8 +329,15 @@ class RuntimeRegistry:
                 if dirty:
                     self._dirty_stats["walk"] += 1
             if size is not None:
-                usage[record.sandbox_id] = int(size)
-                self._note_budget_crossing(record, int(size))
+                # N25: the walk answers what has *committed*; the pushed
+                # appends answer what the sandbox wrote since that answer,
+                # which on this storage can be seconds of writing the
+                # filesystem cannot see yet (§22.5). Their sum is a lower
+                # bound on the truth, so reporting it is early-or-exact.
+                reported = int(size) + self._take_appended(record.sandbox_id)
+                usage[record.sandbox_id] = reported
+                self._note_budget_crossing(record, reported)
+                self._maybe_tighten(record, reported)
             scanned += 1
         if dirty:
             self._log_dirty_split()
@@ -325,6 +356,40 @@ class RuntimeRegistry:
         with self._lock:
             self._dirty_provider = provider
 
+    def set_disk_tightener(self, tightener) -> None:
+        """Install the live file-size tightener (N25).
+
+        ``tightener(sandbox_id, bytes) -> dict | None`` lowers the running
+        sandbox's ``RLIMIT_FSIZE`` to at most ``bytes`` *now* and reports what
+        the slot applied. The registry owns *when* -- it is the only component
+        that knows what is left -- and the tightener owns *how*.
+        """
+        with self._lock:
+            self._tightener = tightener
+
+    def note_appended(self, sandbox_id: str, bytes_: int) -> None:
+        """Record bytes a mediator watched the sandbox append (N25).
+
+        Called from each slot's event pump, on that slot's own thread, so it
+        takes this lock and does nothing else. The number is a *lower bound* on
+        how much the workspace grew (see `docs/k8s-deployment.md` §22.5), which
+        is the direction a quota wants: `last_exact + appended` can be early,
+        never late, and never larger than the truth unless the sandbox deleted
+        as much as it wrote in the same window.
+        """
+        if bytes_ <= 0:
+            return
+        with self._lock:
+            self._appended[sandbox_id] = self._appended.get(sandbox_id, 0) + int(bytes_)
+
+    def _peek_appended(self, sandbox_id: str) -> int:
+        with self._lock:
+            return self._appended.get(sandbox_id, 0)
+
+    def _take_appended(self, sandbox_id: str) -> int:
+        with self._lock:
+            return self._appended.pop(sandbox_id, 0)
+
     def note_local_write(self, sandbox_id: str, path: str | Path) -> None:
         """Record a write the **worker itself** made inside a sandbox tree.
 
@@ -342,6 +407,66 @@ class RuntimeRegistry:
             ledger.apply([Path(path).parent])
         except DirLedgerUnknown:
             ledger.invalidate()
+
+    def _maybe_tighten(self, record: RuntimeSandbox, size: int) -> None:
+        """Lower the running sandbox's file-size limit to what is left (N25).
+
+        The pause gate is the platform's backstop, and it is a *slow* one by
+        construction: the control plane only learns a sandbox is over budget
+        from a report, and the sandbox keeps writing until the freeze lands.
+        Tightening is the fast half -- the kernel refuses the next write past
+        what is left, in the process that is writing, with no round trip to
+        anyone -- and it is what makes a loop inside one command (a shape the
+        per-exec ceiling cannot stop, because that ceiling was fixed when the
+        command started) stop at the budget instead of at the freeze.
+
+        Three deliberate restraints, so this stays a quota and not a second
+        event stream:
+
+        * only ever **lower** -- a sandbox whose number goes up (files
+          deleted, or a fresh round) is not sent anything;
+        * only on a **material** drop, so a round that moves the number by a
+          few kilobytes does not talk to the slot;
+        * at most once per ``E2B_DISK_TIGHTEN_INTERVAL_S``.
+        """
+        tightener = self._tightener
+        if tightener is None:
+            return
+        budget = int(record.disk_mb) * 1024 * 1024
+        if budget <= 0:
+            return
+        remaining = max(budget - int(size), self._tighten_floor_bytes)
+        now = time.monotonic()
+        # The bookkeeping is taken under the lock (registration and
+        # unregistration touch the same three fields); the verb itself is
+        # *not* -- it crosses a channel, and holding a lock the event pumps
+        # also need while doing I/O is how a slow slot becomes a stalled
+        # accounting round.
+        with self._lock:
+            previous = self._tightened.get(record.sandbox_id)
+            if previous is not None and remaining >= previous:
+                return
+            if previous is not None and remaining > previous - self._tighten_step_bytes:
+                return
+            if now - self._tightened_at.get(record.sandbox_id, 0.0) < self._tighten_interval_s:
+                return
+            self._tightened[record.sandbox_id] = remaining
+            self._tightened_at[record.sandbox_id] = now
+        try:
+            applied = tightener(record.sandbox_id, remaining)
+        except Exception:  # noqa: BLE001 - never break a scan round over this
+            logger.warning(
+                "disk tightening failed for %s", record.sandbox_id, exc_info=True
+            )
+            return
+        if applied:
+            logger.info(
+                "disk tightening: %s limited to %s bytes (used %s of %s)",
+                record.sandbox_id,
+                remaining,
+                size,
+                budget,
+            )
 
     def _note_budget_crossing(self, record: RuntimeSandbox, size: int) -> None:
         """Note a sandbox that has just gone over its budget (N25).
@@ -387,7 +512,13 @@ class RuntimeRegistry:
             record = self.get(sandbox_id)
         except UnknownSandboxError:
             return None
-        return self._incremental_dir_size(record, dirty=True)
+        size = self._incremental_dir_size(record, dirty=True)
+        if size is None:
+            return None
+        # N25: peek, do not take. The per-exec ceiling asks this between
+        # rounds, and the same appended bytes must still be there for the next
+        # round to add to its own (committed) number.
+        return int(size) + self._peek_appended(sandbox_id)
 
     def _ledger_for(self, record: RuntimeSandbox) -> DirLedger:
         with self._lock:
@@ -607,6 +738,9 @@ class RuntimeRegistry:
             # baseline (N25/L2c): its tree may be a fresh template copy, and a
             # ledger that assumed continuity would report the difference.
             self._ledgers.pop(sandbox_id, None)
+            self._appended.pop(sandbox_id, None)
+            self._tightened.pop(sandbox_id, None)
+            self._tightened_at.pop(sandbox_id, None)
             try:
                 self._ensure_runtime_dir(sandbox_id)
                 path = self._record_path(sandbox_id)
@@ -764,6 +898,9 @@ class RuntimeRegistry:
             removed = self._records.pop(sandbox_id, None) is not None
             self._activity.pop(sandbox_id, None)
             self._ledgers.pop(sandbox_id, None)
+            self._appended.pop(sandbox_id, None)
+            self._tightened.pop(sandbox_id, None)
+            self._tightened_at.pop(sandbox_id, None)
             self._tombstones[sandbox_id] = (
                 time.monotonic() + self.UNREGISTER_TOMBSTONE_S
             )

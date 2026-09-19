@@ -1,0 +1,165 @@
+"""N25: the registry's live tightening, and its three restraints.
+
+The pause gate is the slow half of enforcement (the control plane only knows
+what a heartbeat told it). Tightening the *running* process's file-size limit
+is the fast half: the kernel refuses the next write past what is left, in the
+process that is writing. What these tests pin is that the fast half can never
+make things worse than the slow half would have:
+
+* it is only ever asked to *lower* a limit;
+* it is not asked on every round (a byte of movement is not news);
+* it is not asked at all without a tightener or a budget.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from envd_service.runtime.registry import RuntimeRegistry
+
+
+def _registry(base: Path, sandbox_id: str, *, disk_mb: int = 100) -> RuntimeRegistry:
+    registry = RuntimeRegistry(base)
+    registry.register(
+        sandbox_id=sandbox_id,
+        access_token="t",
+        workspace_dir=str(base / sandbox_id),
+        disk_mb=disk_mb,
+    )
+    tree = base / sandbox_id
+    (tree / "workspace").mkdir(parents=True)
+    (tree / "workspace" / "a.bin").write_bytes(b"a" * 1000)
+    registry.set_dirty_provider(lambda sandbox_id: ([str(tree / "workspace")], False))
+    # No sleeping in tests: the interval is exercised by its own test below.
+    registry._tighten_interval_s = 0.0
+    return registry
+
+
+def _recorder():
+    calls: list[tuple[str, int]] = []
+
+    def tightener(sandbox_id: str, bytes_: int):
+        calls.append((sandbox_id, bytes_))
+        return {"applied_bytes": bytes_}
+
+    return calls, tightener
+
+
+def test_a_round_that_drops_the_remaining_budget_tightens(tmp_path):
+    registry = _registry(tmp_path, "sbx_tighten", disk_mb=100)
+    calls, tightener = _recorder()
+    registry.set_disk_tightener(tightener)
+    # 100 MiB budget, 1 kB used: the remaining budget is sent as the ceiling.
+    registry.disk_usage_snapshot(dirty=True)
+
+    assert calls == [("sbx_tighten", 100 * 1024 * 1024 - 1000)]
+
+
+def test_nothing_is_sent_twice_for_the_same_remaining(tmp_path):
+    registry = _registry(tmp_path, "sbx_same", disk_mb=1)
+    calls, tightener = _recorder()
+    registry.set_disk_tightener(tightener)
+
+    registry.disk_usage_snapshot(dirty=True)
+    registry.disk_usage_snapshot(dirty=True)
+    registry.disk_usage_snapshot(dirty=True)
+
+    assert len(calls) == 1
+
+
+def test_a_small_drop_is_not_worth_a_verb(tmp_path):
+    registry = _registry(tmp_path, "sbx_small", disk_mb=100)
+    calls, tightener = _recorder()
+    registry.set_disk_tightener(tightener)
+    registry.disk_usage_snapshot(dirty=True)
+
+    # 1 kB more used: far below the material step, so nothing is sent.
+    (tmp_path / "sbx_small" / "workspace" / "b.bin").write_bytes(b"b" * 1000)
+    registry.disk_usage_snapshot(dirty=True)
+
+    assert len(calls) == 1
+
+
+def test_a_material_drop_is_sent(tmp_path):
+    registry = _registry(tmp_path, "sbx_material", disk_mb=100)
+    registry._tighten_step_bytes = 4096
+    calls, tightener = _recorder()
+    registry.set_disk_tightener(tightener)
+    registry.disk_usage_snapshot(dirty=True)
+
+    (tmp_path / "sbx_material" / "workspace" / "big.bin").write_bytes(b"b" * 65536)
+    registry.disk_usage_snapshot(dirty=True)
+
+    assert [c[1] for c in calls] == [
+        100 * 1024 * 1024 - 1000,
+        100 * 1024 * 1024 - 66536,
+    ]
+    assert calls[1][1] < calls[0][1]
+
+
+def test_the_interval_gates_a_second_tightening(tmp_path):
+    registry = _registry(tmp_path, "sbx_interval", disk_mb=100)
+    registry._tighten_step_bytes = 1
+    registry._tighten_interval_s = 3600.0  # never elapses inside the test
+    calls, tightener = _recorder()
+    registry.set_disk_tightener(tightener)
+
+    registry.disk_usage_snapshot(dirty=True)
+    (tmp_path / "sbx_interval" / "workspace" / "b.bin").write_bytes(b"b" * 65536)
+    registry.disk_usage_snapshot(dirty=True)
+
+    assert len(calls) == 1
+
+
+def test_a_sandbox_that_shrank_is_never_widened(tmp_path):
+    """Deleting files raises the remaining budget; that is not a grant."""
+    registry = _registry(tmp_path, "sbx_shrank", disk_mb=100)
+    calls, tightener = _recorder()
+    registry.set_disk_tightener(tightener)
+    (tmp_path / "sbx_shrank" / "workspace" / "big.bin").write_bytes(b"b" * 1_000_000)
+    registry.disk_usage_snapshot(dirty=True)
+    first = calls[-1][1]
+
+    (tmp_path / "sbx_shrank" / "workspace" / "big.bin").unlink()
+    registry.disk_usage_snapshot(dirty=True)
+
+    assert calls[-1][1] == first, "the limit must not be raised back"
+
+
+def test_the_ceiling_never_goes_below_the_floor(tmp_path):
+    registry = _registry(tmp_path, "sbx_over", disk_mb=1)
+    registry._tighten_floor_bytes = 65536
+    calls, tightener = _recorder()
+    registry.set_disk_tightener(tightener)
+    # Already far over budget: the remaining budget is negative.
+    (tmp_path / "sbx_over" / "workspace" / "huge.bin").write_bytes(b"b" * (2 * 1024 * 1024))
+    registry.disk_usage_snapshot(dirty=True)
+
+    assert calls == [("sbx_over", 65536)], "a file must still be able to hold something"
+
+
+def test_without_a_tightener_nothing_is_asked(tmp_path):
+    registry = _registry(tmp_path, "sbx_none", disk_mb=1)
+    # No `set_disk_tightener` call at all: the round must still work.
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_none": 1000}
+
+
+def test_a_sandbox_with_no_budget_is_not_tightened(tmp_path):
+    registry = _registry(tmp_path, "sbx_unbounded", disk_mb=0)
+    calls, tightener = _recorder()
+    registry.set_disk_tightener(tightener)
+
+    registry.disk_usage_snapshot(dirty=True)
+
+    assert calls == [], "0 means 'no budget', not 'a budget of nothing'"
+
+
+def test_a_tightener_that_raises_does_not_break_the_round(tmp_path):
+    registry = _registry(tmp_path, "sbx_boom", disk_mb=1)
+
+    def explode(sandbox_id: str, bytes_: int):
+        raise RuntimeError("slot gone")
+
+    registry.set_disk_tightener(explode)
+
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_boom": 1000}
