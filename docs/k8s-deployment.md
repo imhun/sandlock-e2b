@@ -1749,7 +1749,29 @@ description），所以"现在多大"只差一次 `fdinfo` 读——现在 `is_e
 文件大小、也不占字节账。唯一要标注的是 `copy_file_range` 那次停在 62.2 MiB：那是"worker 的样本 +
 中介的增量"两个估计之间的保守差（与 §22.5.10 那个 48 MiB 同一来源、方向相反），**少给而不是多给**。
 
-复现：`tmp/k0s/probe_write_paths.py`、`tmp/k0s/probe_mmap_growth.py`、`tmp/k0s/probe_kernel_copy.py`。
+**更严的一半：天花板恰好为 0（树正好压在预算上）。** 上面每条都是在"还剩 ~124 MiB"时测的；这一轮把
+沙箱填到 1024 MiB 整（`cur=0`、`hard=1073741824` —— 顺带直接印证了 §22.5.10 的分工：硬限仍是实例上限，
+动的是软限），并且**所有目标文件都在填满之前就建好**，这样"建条目被拒"就不会替别的路径背锅：
+
+| 尝试（已存在的文件上） | 结果 | 文件大小 |
+|---|---|---|
+| 新建文件（`O_CREAT`） | **ENOSPC** | — |
+| `write` 300 MiB | **EFBIG** | 4096 → 4096 |
+| `ftruncate` 300 MiB | **EFBIG** | 4096 → 4096 |
+| `fallocate` 300 MiB | **EFBIG** | 4096 → 4096 |
+| `copy_file_range` 1 MiB × N | **返回 4096**（被钳到"当前大小"），不报错 | 4096 → 4096 |
+| `sendfile` 300 MiB | **EFBIG**（4096 之后） | 4096 → 4096 |
+| mmap `MAP_SHARED` 越 EOF（页对齐 EOF → 下一页） | **SIGBUS** | 4096 → 4096 |
+| mmap `MAP_SHARED` 文件内 | store ok | 4096 → 4096 |
+| 平台记账 before → after | **1024.0 MiB → 1024.0 MiB** | — |
+
+两个注意点：① `copy_file_range` 在 `cur=0` 时不报错而是**每次返回 4096**（它只允许改已有字节、不允许
+增长）——我第一版探针把返回值累加成了"搬了 300 MiB"，那是探针的 bug，不是绕过；② 沙箱里 `df` 报的是
+**10 PB / 已用 557 G / 1%**（整个 NAS 文件系统），所以"看 statfs 判断还有没有空间"在沙箱内毫无意义——
+这正是这条闸门必须建立在**我们自己的台账**上的原因。
+
+复现：`tmp/k0s/probe_write_paths.py`、`tmp/k0s/probe_mmap_growth.py`、`tmp/k0s/probe_kernel_copy.py`、
+`tmp/k0s/probe_ceiling_completeness.py`、`tmp/k0s/probe_copy_range_zero.py`。
 
 ### 22.4 冻结延迟的 3.7 秒花在哪：NFS 的 `stat` 会先等自己的回写（N25，2026-09-19）
 
