@@ -1783,6 +1783,30 @@ description），所以"现在多大"只差一次 `fdinfo` 读——现在 `is_e
 
 三个探针坑，记下来免得下次重踩：① `O_DIRECT` 短写是常态，判停条件不能写成"第一次短写"（否则会把 84.9 MiB 误读成被拦）；② socket→pipe 的 `splice` 每次只搬 socket 缓冲区那点（~64 KiB），迭代次数上限会先于天花板触顶（我第一版用 `4×目标MiB` 次迭代，把 70 MiB 误读成被拦）；③ `files.write("/home/user/x")` 会落到 `/home/user/home/user/x`——SDK 的绝对路径按**树根**解析（N28 记录过的未修语义），要传相对路径。
 
+**"换存储要不要重验"这件事本身也验了（2026-09-20）。** 之前这条写的是"这是**这台 NFS**上的事实、换存储要重新验证"——量过之后那句话**不准确**：同一份探针（`tmp/k0s/mmap-probe.py`，越 EOF 三页内/4 MiB 外、末页内、文件内对照各一次）在两个内核、六种存储/协议上**结果逐字一致**：
+
+| 存储 | 内核 | 越 EOF 存储 | 末页内越 EOF |
+|---|---|---|---|
+| XFS（节点本地 nvme，`.94`） | 6.12.0-211 aarch64 | SIGBUS，不增长 | store ok，**不落盘** |
+| tmpfs（`/dev/shm`） | 同上 | SIGBUS，不增长 | store ok，不落盘 |
+| **ext4 on loop**（256 MiB 镜像，N30 那条路线） | 同上 | SIGBUS，不增长 | store ok，不落盘 |
+| NFS **4.0**（沙箱真正用的那个 PV） | 同上 | SIGBUS，不增长 | store ok，不落盘 |
+| NFS **3**（同一条 NAS，`.140:/mnt/sandlock`） | 同上 | SIGBUS，不增长 | store ok，不落盘 |
+| XFS（本地，`.140`） | 同上 | SIGBUS，不增长 | store ok，不落盘 |
+| overlayfs（Docker VM） | **7.0.14-orbstack x86_64** | SIGBUS，不增长 | store ok，不落盘 |
+
+所以这是**内核的通用行为**（`filemap_fault` 里 `offset >= max_idx` → SIGBUS，末页那一段按 `mmap(2)` 的"partial page 不写回"处理），不是 NFS、也不是这台 NAS 的怪癖；顺带把 N30 的镜像路线也验了：**ext4-on-loop 上同样长不了文件**，换过去不会凭空多一个 mmap 洞。
+
+**但仍然要按存储/内核重验的不是 mmap，而是这五项**（都是这次侦察里冒出来的）：
+
+1. **NFS 协议版本**——现在挂的是 **vers=4.0**（`.94`/`.140` 的 PV 都是；`/mnt/sandlock` 那条是 v3）。服务端拷贝（NFS `COPY`）要 **4.2** 才有 ⇒ `copy_file_range` 现在**不可能**被服务端代理，所以它老老实实受 `RLIMIT_FSIZE`（这正是上面 EFBIG 的由来）。换到 4.2 或别的产品，**这一条必须重验**：服务端拷贝是唯一能绕过进程侧限额的形态。
+2. `statx(STATX_SIZE)` 是否仍然避免回写（§22.4 的 1405 ms → 0.01 ms 完全依赖它）。
+3. 稀疏/打洞支持（这台 NAS `fallocate -p` 不支持 ⇒ N30 的"峰值口径"问题）。
+4. 目录配额 / `FileCountLimit` 是否存在（N31 第三条修法）。
+5. 属性缓存与 `.nfsXXXX` 行为（§22.5.9 那条修法依赖"最后一个持有者放手后 NFS 才回收"）。
+
+**验不了的**：另一个**内核版本**（生产目标是 ACK 5.10，我们手上只有 6.12 与 7.0.14），以及另一个 **NAS 产品**——分别需要一台 5.10 的机器（或 ACK 集群）和目标产品的 export。复现手段：`tmp/k0s/node-mmap-storage.sh` + `tmp/k0s/mmap-probe.py`，经 `tmp/k0s/tools.sh node-run <host>` 打到节点上（节点是 root，可 `losetup`/`mkfs.ext4`）。
+
 ### 22.4 冻结延迟的 3.7 秒花在哪：NFS 的 `stat` 会先等自己的回写（N25，2026-09-19）
 
 **现象**：写 3×900 MiB（预算 1024 MiB），从"开始写"到"控制面记录变成 paused"是 **3.7~4.0 s**，

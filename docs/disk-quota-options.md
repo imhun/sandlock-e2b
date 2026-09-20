@@ -233,9 +233,13 @@ SDK 上传、命令日志、provision 物化）它**看得见**，而 mediator �
 才 ENOSPC；且它在 E2B 形态下**根本没激活**（我们发 `max_disk` 但从不发 `workdir`，
 门槛是 `!no_supervisor && workdir.is_some()`，`sandbox.rs:2078`）。
 
-**mmap 扩容**：文件内写 ✅ 正常；**越 EOF 写直接 `SIGBUS`（exit 135）**——这台 NFS 上
-共享映射**长不了文件**（与"稀疏文件不保留"同类）。所以"事件驱动会漏 mmap 增长"这条常见
-反对理由在这里**不成立**；但它是环境事实，换存储要重新验证。
+**mmap 扩容**：文件内写 ✅ 正常；**越 EOF 写直接 `SIGBUS`（exit 135）**——共享映射**长不了文件**
+（与"稀疏文件不保留"同类）。所以"事件驱动会漏 mmap 增长"这条常见反对理由**不成立**。
+**2026-09-20 复验并纠正归属**：原先写成"这台 NFS 上"是**不准确的**——同一份探针在 **2 个内核 × 6 种存储/协议**
+（XFS / tmpfs / **ext4-on-loop** / NFS 4.0 / NFS 3 / overlayfs）上结果逐字一致，所以它是**内核通用行为**
+（`filemap_fault` 里 `offset >= max_idx` → SIGBUS），不是 NFS 或这台 NAS 的特性；换 **内核** 才需要重验，
+矩阵与"换存储真正要重验的五项（NFS 版本 / statx 回写 / 打洞 / 目录配额 / 属性缓存）"见
+[`docs/k8s-deployment.md`](k8s-deployment.md) §22.5.11。
 
 **取舍**：inotify 与 mediator 脏集合**覆盖面完全相同（都只到本机）**，后者免费（`openat`
 本来就在拦）且更准，唯一代价是要动 Rust。因此：**愿意动 Rust 走脏集合，不愿意才用 inotify
