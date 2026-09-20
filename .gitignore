@@ -25,3 +25,7 @@ graphify-out/
 # it is a symlink to `/src/target-linux`. Committing it would be committing a
 # dangling link (see docs/build-test-deploy-pitfalls.md A2).
 /target
+# The same build directory under the name the fork's `target` symlink uses
+# (`third_party/sandlock/target -> /src/target-linux`), i.e. the dev container's
+# cargo output. 5.8 GB after a test run, and never source.
+/target-linux/

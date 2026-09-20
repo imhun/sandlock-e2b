@@ -1647,6 +1647,77 @@ NFS 会把"已被 unlink 但仍被打开"的文件改名为 `.nfsXXXX` 并保留
 | 腾出空间后再写 | — | **可以** |
 | 沙箱是否被冻结 | 是 | **否** |
 
+#### 22.5.10 天花板归平台、软限可回升、unlink 立刻归还（N25，2026-09-20）
+
+**起于一个问题**：删除文件后空间立刻释放，走的是"实例级的限制"，那为什么 workload 还能自己调限制？
+
+**先纠正前提：内核里没有"实例级文件空间限制"。** `RLIMIT_FSIZE` 是**进程级**的，而且只管**单个文件的大小**，
+不是"这个沙箱总共能写多少"。这个部署里的"实例上限"一直是两样东西拼出来的：**硬限**（launch 时的 ceiling）
++ **中介侧的池**（预算 − 已用 + 已释放）。内核的 setrlimit 规则是：任何进程都能**下调**自己的 limit，
+也能把 `rlim_cur` 抬到 `rlim_max`（不需要特权）；只有 `rlim_max` 抬不上去——沙箱里实测
+`setrlimit((1<<40,1<<40))` → `ValueError: not allowed to raise maximum limit`。
+
+**"workload 能自己调限制"的来源**就是这里：可动的那一半原本放在**硬限**上（收紧时下压 `rlim_max`，
+单向、不可回升），而 workload 只要把自己的 `cur` 抬到 `max`，就拿到中介没打算发的那份额度。
+
+**现在的分工**：
+
+| 值 | 谁动 | 能不能回升 |
+|---|---|---|
+| `rlim_max`（硬限） | 只在 launch 时设定 = 实例上限 | 平台不动；guest 动不了（EPERM） |
+| `rlim_cur`（软限） | per-exec 额度、open 授予、实时收紧、unlink 后归还 | 可以，且只有平台能抬 |
+
+闸门：`setrlimit`/`prlimit64` 落在 `RLIMIT_FSIZE` 上、且**抬高** `cur` 或 `max` → `EPERM`；**下调放行**；
+其他资源一概不碰；沙箱自己的 init 路径（supervise 自身，镜像里够不着）例外。沙箱内用 ctypes 直打 syscall
+（绕开 CPython `resource` 自己的用户态检查，否则会误判成"闸门生效"）：
+
+| 调用（树 1000/1024 MiB，`cur`=24 MiB，`hard`=1024 MiB） | 结果 |
+|---|---|
+| `setrlimit(soft=hard)` | `-1 EPERM` |
+| `prlimit64(0, RLIMIT_FSIZE, soft=hard)` | `-1 EPERM` |
+| `setrlimit(max=1 TiB)` | `-1 EPERM` |
+| `setrlimit(soft=cur+64K)` | `-1 EPERM` |
+| `setrlimit(soft=cur/2)`（下调） | `0` |
+| 之后正常 `dd` | 正常（没有误伤） |
+
+**"同一条命令里删了再写"可用**：`unlink`/`rmdir` 成功时中介按**删除前**的 `symlink_metadata` 把字节记进
+`freed`（目录记 0），并**当场**把这份额度通过 `prlimit` 交还调用者（软限 = 剩余 + 该进程已写量），
+不等下一轮记账。实测 `probe_delete_then_write.py`：填满 1024 MiB → 一条命令 `rm -f fill.bin; dd of=after.bin 1MiB`
+→ `rc=0`、`after.bin=1048576`；下一条命令照样能写。
+
+**代价**：单个文件的上限仍然等于实例上限（`RLIMIT_FSIZE` 分不开同一进程的两个文件），"总量"约束靠
+**中介的发放入口 + 池**，而不是内核的总量限制——内核本来也没有。
+
+**同一轮的最后一个坑：决策点用的账必须是当下的（`ec2921e`）。** 硬限不再下压之后，`probe_exec_limit.py`
+立刻抓到一个此前被那条"棘轮"掩盖的漏洞：700 MiB 已用 + 一个 324 MiB 文件写完，**紧接着**第二个文件，
+第二个文件落了 **48 MiB**。根因不是某一侧算错，而是**两侧都在滞后**：watch 按自己的 tick 采样，
+worker 的账本由 dirty 事件驱动重扫，决策落在两次采样之间时，中介的 `remaining()` 只补偿"到达之后"的增长，
+worker 的样本又比真实小 48 MiB。中介本来就为每个它中介过的文件**自持一份 fd**（内核 dup，同一 open file
+description），所以"现在多大"只差一次 `fdinfo` 读——现在 `is_exhausted`（"这个 open 能建文件吗 /
+这个 `mkdir` 能跑吗"）、open 发放、unlink 后的归还三处都先 `WriteFds::flush_held()` 再算。实测同一形状
+**0/8** 越界（此前一次运行放过 48 MiB），`probe_exec_limit.py` 回到 324.0 / 0，串行 324.0 / 0，
+树收敛 **1024 MiB 整**。
+
+**集群验收（`0.1.0-414-g68b9196-20260920-154249`）**：
+
+| 探针 | 结果 |
+|---|---|
+| `probe_push_and_tighten.py` A（3×900 MiB / 1024 预算） | **0 MiB** 超支（三次 run 全部 1024 整）PASS |
+| 同 B（一条命令里的失控写者） | 拦住写 + 删除可用 + 腾空间后可写，且**不冻结** PASS |
+| `probe_exec_limit.py` | 单文件 **324.0 MiB**；第二个文件 **0 MiB**；串行 324.0 / 0，树 1024 MiB |
+| `probe_second_file_race.py`（同一形状 ×8，两命令之间不停顿） | **0/8** 越界 |
+| `probe_delete_then_write.py` | 同命令删后写 `rc=0`，`after.bin=1048576` |
+| `probe_guest_raise_ctypes.py` | 抬高全 `EPERM`、下调 `0`、之后正常写 |
+| `probe_dir_ledger.py` | 6144=6144、12144=12144，逐字节相等 |
+| `deployment_smoke.py` / `multinode_smoke.py` | 全绿；kill 后预留归零 |
+| fork 测试 | core lib **887** 通过；supervise 28 通过 / 1 预存在失败（`test_supervise_path_serve_launches_instance_and_serves_verbs_until_shutdown`，未改动的树上同样失败） |
+| 主仓单测 | 1190 通过 / 13 既有失败（macOS 上的 `test_priv_helpers` 11 + `test_xfs_quotactl_backend` 2） |
+
+**顺带记一条运维事实**：每次 worker 滚动重启都可能把 base image 预热打断，缓存目录里只剩
+`…sha256_….lock`（没有实体目录），此时 `Sandbox.create()` 会回 `428 warm_required`，多机 smoke 因此失败。
+预热端点是 **POST**（GET 只是查询）：`POST /agent/images/<urlencoded-ref>/warm`，带 `X-Internal-Key`
+打在该 worker 的 `127.0.0.1:49983` 上。
+
 ### 22.4 冻结延迟的 3.7 秒花在哪：NFS 的 `stat` 会先等自己的回写（N25，2026-09-19）
 
 **现象**：写 3×900 MiB（预算 1024 MiB），从"开始写"到"控制面记录变成 paused"是 **3.7~4.0 s**，
