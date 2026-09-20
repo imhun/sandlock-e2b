@@ -440,7 +440,8 @@ spec:
             # needs. `deny` additionally pins the gate shut for
             # `E2B_DISK_OVERRUN_DENY_S` so a stale estimate cannot re-open it.
             # The fleet view reports both via
-            # `/internal/fleet/metrics` -> `workspaceDisk.overrunSandboxes`.
+            # `/internal/fleet/metrics` -> `workspaceDisk.sandboxes` (how many
+            # are over) and `workspaceDisk.overMB` (how far over in total).
             - name: E2B_DISK_OVERRUN_ACTION
               value: "log"
             - name: E2B_DISK_OVERRUN_DENY_S

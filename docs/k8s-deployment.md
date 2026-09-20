@@ -1807,6 +1807,37 @@ description），所以"现在多大"只差一次 `fdinfo` 读——现在 `is_e
 
 **验不了的**：另一个**内核版本**（生产目标是 ACK 5.10，我们手上只有 6.12 与 7.0.14），以及另一个 **NAS 产品**——分别需要一台 5.10 的机器（或 ACK 集群）和目标产品的 export。复现手段：`tmp/k0s/node-mmap-storage.sh` + `tmp/k0s/mmap-probe.py`，经 `tmp/k0s/tools.sh node-run <host>` 打到节点上（节点是 root，可 `losetup`/`mkfs.ext4`）。
 
+#### 22.5.12 三件未决的事：条目配额、样本自证时间、超支可见（N25/N31，2026-09-20）
+
+**① 条目/inode 没有配额（N31）。** 字节账本看不见"按名字增长"的树：实测 2000 个空文件让平台数字**全程停在 0 字节**，
+而目录自身在 NFS 上是 16384 字节也**不计**（`dir_size`/`dir_ledger` 只累加非目录条目）。唯一挡"建条目"的闸门是
+"字节池**恰好**为 0"，而空条目永远不花字节 ⇒ 数量无上限。现在：worker 的账本在走字节的同时**数名字**
+（文件 + 目录，目录本来就是账本的键），每轮把计数和上限下发给中介（verb `update_entry_limit`），中介对四个
+"造名字"的 syscall —— `openat(O_CREAT|O_TMPFILE)`、`mkdirat`、`symlinkat`、`linkat` —— 在计数到顶时返回
+**ENOSPC**，并按自己看到的创建/删除累加（`unlink`/`rmdir` 记负），所以一条命令里的 `rm -rf cache && mkdir cache`
+照常。knob：`E2B_DISK_MAX_ENTRIES`（代码默认 0 = 关；k8s overlay 取 **500000** 作失控兜底）。
+
+集群实测（把 knob 临时调到 200）：建 **198** 个文件后第 199 个条目被 **ENOSPC** 拒绝、总数 199 ≤ 200；
+`rm` 掉 20 个再建 20 个**全部成功**。**第一版让 213 个名字通过了**——锚点和字节是同一个毛病（worker 的计数是一次
+walk，可能比消息更旧），用同一套 stamping 修掉后复测即 198/199。
+
+**② worker 的样本现在会自证时间。** 中介原来把 spend 计数锚在**消息到达**那一刻，只减"到达之后"的增长，
+于是 worker 账本在到达前漏掉的那一段被当成可用空间发出去 —— 实测就是 700 MiB 已用 + 324 MiB 文件之后，
+第二个文件写了 **48 MiB 超支**。现在 worker 先调 `read_write_counters` 取中介的 `(spent, freed, created, removed)`，
+**再去走账**，把这四个数随 `update_file_size_limit` / `update_entry_limit` 一起送回来，锚点变成"这个数是**什么时候**
+为真的"。误差方向只剩"少给"，且上界是一次走账期间的写入量。集群实测：第二文件竞态 **0/8**、**0/6**、**0/3**
+（三次会话），同时 `probe_exec_limit.py` 仍是 **324.0 / 0**、串行 324.0/0、树 1024 MiB 整 —— 没有引入少给。
+
+**③ 超支可见，并且可以选一种最后动作。** 以前"谁超了、超多少"只有一行日志。现在
+`/internal/fleet/metrics` 的 `workspaceDisk` 里多两个数：`sandboxes`（当前超预算的沙箱数）与 `overMB`（合计超多少），
+**每轮重建**，所以被杀掉的沙箱不会留下幽灵。另加 `E2B_DISK_OVERRUN_ACTION`（默认 `log`）：`deny` 会在一次
+crossing 之后把写闸门**钉住** `E2B_DISK_OVERRUN_DENY_S`（默认 60 s），只有测量回到 `budget × E2B_DISK_OVERRUN_EXIT_RATIO`
+（默认 0.98）以下才放开 —— 这样"估算抖动把写重新打开"这条缝就没有了，同时"删回预算内"仍然能很快解锁。
+
+**诚实边界**：因为闸门是有效的，集群上**造不出**真正的 over-budget（这正是它存在的意义），所以那两个数字在集群上
+实测是 `0 / 0`（字段可见、形状正确）；计数语义与 `deny` 的钉住行为由单测固定
+（`tests/unit/test_disk_overrun_visibility.py`）。
+
 ### 22.4 冻结延迟的 3.7 秒花在哪：NFS 的 `stat` 会先等自己的回写（N25，2026-09-19）
 
 **现象**：写 3×900 MiB（预算 1024 MiB），从"开始写"到"控制面记录变成 paused"是 **3.7~4.0 s**，
