@@ -1773,6 +1773,16 @@ description），所以"现在多大"只差一次 `fdinfo` 读——现在 `is_e
 复现：`tmp/k0s/probe_write_paths.py`、`tmp/k0s/probe_mmap_growth.py`、`tmp/k0s/probe_kernel_copy.py`、
 `tmp/k0s/probe_ceiling_completeness.py`、`tmp/k0s/probe_copy_range_zero.py`。
 
+**剩下三种形状也补了（同一形状：900/1024 已用、天花板 ~124 MiB、目标 300 MiB）：**
+
+| 形状 | 结果 |
+|---|---|
+| `O_DIRECT`（对齐缓冲 + `pwrite`） | **EFBIG**，停在 **116.0 MiB**（≤ 天花板） |
+| `io_uring`（`IORING_OP_WRITEV`） | **`io_uring_setup` → EPERM**：sandlock 自己的 `DEFAULT_BLOCKLIST_SYSCALLS`（`crates/sandlock-core/src/sys/structs.rs`）就禁了 `io_uring_setup/enter/register`，注释写明理由——"io_uring bypasses seccomp for I/O operations" ⇒ **这条路在这个部署里不存在**。把 syscall 放开后本地实测（dev 容器 `seccomp=unconfined`）：写得进去，且限额 1 MiB 时**第二块 1 MiB 立刻 EFBIG** ⇒ 万一谁把黑名单删了，天花板仍然管得住 |
+| socket → pipe → file（`splice`，字节来自 socket） | **EFBIG**，停在 **124.0 MiB**（正好天花板），平台记账 1024.0 MiB |
+
+三个探针坑，记下来免得下次重踩：① `O_DIRECT` 短写是常态，判停条件不能写成"第一次短写"（否则会把 84.9 MiB 误读成被拦）；② socket→pipe 的 `splice` 每次只搬 socket 缓冲区那点（~64 KiB），迭代次数上限会先于天花板触顶（我第一版用 `4×目标MiB` 次迭代，把 70 MiB 误读成被拦）；③ `files.write("/home/user/x")` 会落到 `/home/user/home/user/x`——SDK 的绝对路径按**树根**解析（N28 记录过的未修语义），要传相对路径。
+
 ### 22.4 冻结延迟的 3.7 秒花在哪：NFS 的 `stat` 会先等自己的回写（N25，2026-09-19）
 
 **现象**：写 3×900 MiB（预算 1024 MiB），从"开始写"到"控制面记录变成 paused"是 **3.7~4.0 s**，
