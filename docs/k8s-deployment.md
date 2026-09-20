@@ -1725,6 +1725,32 @@ description），所以"现在多大"只差一次 `fdinfo` 读——现在 `is_e
 预热端点是 **POST**（GET 只是查询）：`POST /agent/images/<urlencoded-ref>/warm`，带 `X-Internal-Key`
 打在该 worker 的 `127.0.0.1:49983` 上。
 
+#### 22.5.11 单文件天花板到底盖住了哪些写路径（N25，2026-09-20）
+
+`RLIMIT_FSIZE` 只在 `generic_write_checks`（write/pwrite）、`inode_newsize_ok`（truncate/ftruncate）、
+`vfs_fallocate` 里检查，**page fault 路径不查**——所以"mmap 越界扩容"一直被当成这套方案的已知裂缝。
+在集群上逐个量过之后，结论是**它在这台存储上不是裂缝**（`docs/disk-quota-options.md` §6 已记过一半：
+越 EOF 直接 SIGBUS，并注明"换存储要重新验证"；这一轮把它量全了）：
+
+设置：预算 1024 MiB，先填 900 MiB（天花板只剩 ~124 MiB），再尝试落一个 300 MiB 的文件或扩展。
+
+| 路径 | 结果 |
+|---|---|
+| `dd`（write） | EFBIG，**正好停在 124 MiB**（130023424 B） |
+| `ftruncate`（300 MiB） | `Errno 27 File too large`，文件 0 字节 |
+| `fallocate`（300 MiB） | `Errno 27 File too large`，文件 0 字节 |
+| `copy_file_range`（逐 MiB） | EFBIG，停在 **62.2 MiB**（低于天花板，原因见下） |
+| `sendfile`（逐 MiB） | EFBIG，停在 **123.1 MiB** |
+| `splice`（经 pipe，逐 MiB） | EFBIG，停在 **124.0 MiB**（正好天花板） |
+| mmap `MAP_SHARED`，在**最后一页内**越过 EOF 存储 | 子进程 exit 0、**文件大小不变**（`mmap(2)`："partial page 的修改不写回文件"） |
+| mmap `MAP_SHARED`，存储落在**下一页**（含页对齐的 EOF） | **SIGBUS（exit -7）**、文件不增长 |
+
+也就是："能让文件变大的字节"这条路全被天花板盖住；mmap 能做的只是**改已有区域内**的字节，既不改变
+文件大小、也不占字节账。唯一要标注的是 `copy_file_range` 那次停在 62.2 MiB：那是"worker 的样本 +
+中介的增量"两个估计之间的保守差（与 §22.5.10 那个 48 MiB 同一来源、方向相反），**少给而不是多给**。
+
+复现：`tmp/k0s/probe_write_paths.py`、`tmp/k0s/probe_mmap_growth.py`、`tmp/k0s/probe_kernel_copy.py`。
+
 ### 22.4 冻结延迟的 3.7 秒花在哪：NFS 的 `stat` 会先等自己的回写（N25，2026-09-19）
 
 **现象**：写 3×900 MiB（预算 1024 MiB），从"开始写"到"控制面记录变成 paused"是 **3.7~4.0 s**，
