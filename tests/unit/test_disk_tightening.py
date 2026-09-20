@@ -37,12 +37,48 @@ def _registry(base: Path, sandbox_id: str, *, disk_mb: int = 100) -> RuntimeRegi
 
 def _recorder():
     calls: list[tuple[str, int]] = []
+    stamps_seen: list[tuple[int, int] | None] = []
 
-    def tightener(sandbox_id: str, bytes_: int):
+    def tightener(sandbox_id: str, bytes_: int, stamps=None):
+        # N25: the third argument is the walk's own date (the mediator's
+        # `(spent, freed)` counters, read before the walk). Kept out of `calls`
+        # so every existing assertion stays about the number.
         calls.append((sandbox_id, bytes_))
+        stamps_seen.append(stamps)
         return {"applied_bytes": bytes_}
 
+    # Attached rather than returned, so the dozen call sites that unpack two
+    # values keep working and every existing assertion stays about the number.
+    tightener.stamps_seen = stamps_seen
     return calls, tightener
+
+
+def test_a_round_dates_its_walk_with_the_counter_provider(tmp_path):
+    # N25: the number the round sends has to say *when* it was true. The
+    # provider is asked before the walk, and what it answers travels with the
+    # budget, so the mediator can subtract everything since -- without it, the
+    # gap between the walk and its arrival was handed out as free space
+    # (measured: 48 MiB past the budget).
+    registry = _registry(tmp_path, "sbx_dated")
+    calls, tightener = _recorder()
+    registry.set_disk_tightener(tightener)
+    registry.set_counter_provider(lambda sandbox_id: (11, 22))
+
+    registry.disk_usage_snapshot(dirty=True)
+
+    assert calls, "the round must have tightened"
+    assert tightener.stamps_seen == [(11, 22)] * len(calls)
+
+
+def test_a_round_without_a_counter_provider_sends_no_date(tmp_path):
+    registry = _registry(tmp_path, "sbx_undated")
+    calls, tightener = _recorder()
+    registry.set_disk_tightener(tightener)
+
+    registry.disk_usage_snapshot(dirty=True)
+
+    assert calls, "the round must have tightened"
+    assert tightener.stamps_seen == [None] * len(calls)
 
 
 def test_a_round_that_drops_the_remaining_budget_tightens(tmp_path):

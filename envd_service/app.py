@@ -404,8 +404,28 @@ def create_app(
     # applies it to the live process. A sandbox with no live context has
     # nothing running to tighten, so it answers `None`.
     runtime_registry.set_disk_tightener(
-        lambda sandbox_id, bytes_: (
-            app.state.runtimes[sandbox_id].set_file_size_limit(bytes_)
+        lambda sandbox_id, bytes_, stamps: (
+            app.state.runtimes[sandbox_id].set_file_size_limit(bytes_, stamps)
+            if sandbox_id in app.state.runtimes
+            else None
+        )
+    )
+    # N25: the counters that let a walk date itself. Read before the walk, sent
+    # with the budget, so the mediator can subtract what happened in between.
+    runtime_registry.set_counter_provider(
+        lambda sandbox_id: (
+            app.state.runtimes[sandbox_id].read_write_counters()
+            if sandbox_id in app.state.runtimes
+            else None
+        )
+    )
+    # N31: the same split for the *entry* count. A byte budget cannot see a
+    # tree that grows by names (an empty file costs zero), so the count the
+    # ledger walks is sent on the same round and the mediator refuses the four
+    # syscalls that create one.
+    runtime_registry.set_entry_tightener(
+        lambda sandbox_id, entries, limit: (
+            app.state.runtimes[sandbox_id].set_entry_limit(entries, limit)
             if sandbox_id in app.state.runtimes
             else None
         )

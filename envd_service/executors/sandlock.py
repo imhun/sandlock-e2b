@@ -835,7 +835,9 @@ class SandlockExecutor(Executor):
         """
         self._append_sink = sink
 
-    def set_file_size_limit(self, bytes_: int) -> dict | None:
+    def set_file_size_limit(
+        self, bytes_: int, stamps: tuple[int, int] | None = None
+    ) -> dict | None:
         """Ask the live slot to tighten the running processes' file limit (N25).
 
         ``None`` means no live instance or a slot that does not know the verb;
@@ -846,10 +848,49 @@ class SandlockExecutor(Executor):
         if setter is None:
             return None
         try:
-            return setter(int(bytes_))
+            if stamps is None:
+                return setter(int(bytes_))
+            try:
+                return setter(int(bytes_), stamps)
+            except TypeError:
+                # An instance that does not take stamps (not route B): the
+                # number still lands, just anchored at arrival.
+                return setter(int(bytes_))
         except Exception:  # noqa: BLE001 - a capability answer, never a crash
             logger.warning(
                 "update_file_size_limit refused for sandbox %s",
+                self._sandbox_id or "-",
+                exc_info=True,
+            )
+            return None
+
+    def read_write_counters(self) -> tuple[int, int] | None:
+        """The live slot's write counters, for dating a walk (N25)."""
+        instance = self._instance
+        reader = getattr(instance, "read_write_counters", None)
+        if reader is None:
+            return None
+        try:
+            return reader()
+        except Exception:  # noqa: BLE001 - a capability answer, never a crash
+            logger.debug("read_write_counters unavailable", exc_info=True)
+            return None
+
+    def set_entry_limit(self, entries: int, limit: int) -> dict | None:
+        """Ask the live slot to cap how many names the tree may hold (N31).
+
+        ``None`` means no live instance or a slot that does not know the verb,
+        which the caller reads as "this deployment has no entry gate".
+        """
+        instance = self._instance
+        setter = getattr(instance, "set_entry_limit", None)
+        if setter is None:
+            return None
+        try:
+            return setter(int(entries), int(limit))
+        except Exception:  # noqa: BLE001 - a capability answer, never a crash
+            logger.warning(
+                "update_entry_limit refused for sandbox %s",
                 self._sandbox_id or "-",
                 exc_info=True,
             )

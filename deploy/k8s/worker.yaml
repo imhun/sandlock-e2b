@@ -402,6 +402,17 @@ spec:
               value: "1"
             - name: E2B_DISK_TIGHTEN_INTERVAL_S
               value: "0.05"
+            # N31: the *entry* cap. The byte budget cannot see a tree that
+            # grows by names -- measured on the cluster, 2000 empty files left
+            # the reported usage at 0 bytes, so a sandbox could spend the
+            # volume's inodes without ever touching its budget. 500k is a
+            # runaway backstop, not a policy: a heavy legitimate install is
+            # tens of thousands of files, and creating 500k through the
+            # mediator would take hours anyway (~21 ms per name measured), so
+            # what this defends is the *volume* (inodes and walk cost shared
+            # with every other sandbox), not the speed of the writer.
+            - name: E2B_DISK_MAX_ENTRIES
+              value: "500000"
             # N25: pushed appends wake a scan round instead of waiting for the
             # 1 s cadence, so the remaining budget (and with it the per-file
             # ceiling) follows a fast writer. The trigger is a floor on "worth
@@ -421,6 +432,19 @@ spec:
               value: "1"
             - name: E2B_DISK_APPEND_MIN_INTERVAL_S
               value: "0.05"
+            # N25: what happens when a round *measures* a sandbox over its
+            # budget. `log` (here, and the product semantic) keeps the existing
+            # behaviour: the write gate is already shut by the zero ceiling and
+            # the `ENOSPC` for new names, the control plane records it, and
+            # nothing is frozen -- the sandbox keeps the reads and deletes it
+            # needs. `deny` additionally pins the gate shut for
+            # `E2B_DISK_OVERRUN_DENY_S` so a stale estimate cannot re-open it.
+            # The fleet view reports both via
+            # `/internal/fleet/metrics` -> `workspaceDisk.overrunSandboxes`.
+            - name: E2B_DISK_OVERRUN_ACTION
+              value: "log"
+            - name: E2B_DISK_OVERRUN_DENY_S
+              value: "60"
             # N25/A': how often the mediator samples a watched descriptor.
             #
             # 20 ms, not 100 ms, and cheap enough to be worth it because the

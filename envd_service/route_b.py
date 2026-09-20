@@ -1207,7 +1207,9 @@ class RouteBInstance:
         text = data.decode("utf-8", "replace").strip()
         return text[-limit:] if text else ""
 
-    def set_file_size_limit(self, bytes_: int) -> dict | None:
+    def set_file_size_limit(
+        self, bytes_: int, stamps: tuple[int, int] | None = None
+    ) -> dict | None:
         """Tighten the live processes' ``RLIMIT_FSIZE`` to at most ``bytes_`` (N25).
 
         ``None`` means the slot does not know this verb (an older binary), and
@@ -1215,9 +1217,56 @@ class RouteBInstance:
         A refused value raises, exactly like every other verb: the slot's
         reasons ("wider than the ceiling", "no ceiling at all") are the
         caller's to see.
+
+        ``stamps`` are the mediator's ``(spent, freed)`` counters *at the
+        instant the walk that produced this number was taken*, from
+        :meth:`read_write_counters`. They let the slot subtract what happened
+        between the walk and its arrival -- without them the anchor is arrival,
+        and the gap is handed out as if it were free (measured: a second file
+        wrote 48 MiB past the budget).
+        """
+        args: dict[str, int] = {"bytes": int(bytes_)}
+        if stamps is not None:
+            args["spent"] = int(stamps[0])
+            args["freed"] = int(stamps[1])
+        try:
+            payload = self.request("update_file_size_limit", args)
+        except SandboxError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def read_write_counters(self) -> tuple[int, int] | None:
+        """The slot's ``(spent, freed)`` write counters, or ``None`` (N25).
+
+        Read *before* walking the tree, then handed back with the budget, so
+        the number the worker sends stays honest about when it was true. An
+        older binary does not know the verb, and the caller then sends no
+        stamps at all -- the old, arrival-anchored behaviour.
         """
         try:
-            payload = self.request("update_file_size_limit", {"bytes": int(bytes_)})
+            payload = self.request("read_write_counters", {})
+        except SandboxError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        spent = payload.get("spent")
+        freed = payload.get("freed")
+        if not isinstance(spent, int) or not isinstance(freed, int):
+            return None
+        return spent, freed
+
+    def set_entry_limit(self, entries: int, limit: int) -> dict | None:
+        """Tell the slot how many names the tree holds, and its cap (N31).
+
+        ``limit == 0`` turns the gate off. ``None`` means the slot does not
+        know the verb (an older binary), which the caller treats as "no entry
+        gate available" -- the byte ceiling still holds.
+        """
+        try:
+            payload = self.request(
+                "update_entry_limit",
+                {"entries": int(entries), "limit": int(limit)},
+            )
         except SandboxError:
             return None
         return payload if isinstance(payload, dict) else None

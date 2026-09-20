@@ -505,6 +505,12 @@ class SandboxRegistry:
             Callable[[SandboxRecord], None]
         ] = []
         self._lock = threading.Lock()
+        #: N25: sandboxes the last accounting round measured *over* their
+        #: budget, with `(used, budget)`. Kept so the fleet view can say how
+        #: much over, instead of the crossing log line being the only trace.
+        #: Pruned to what the current report actually named, so a deleted
+        #: sandbox cannot linger here.
+        self._disk_overruns: dict[str, tuple[int, int]] = {}
         self._redis = None
         self._quota_store = None
         self._record_store = None
@@ -1721,6 +1727,7 @@ class SandboxRegistry:
         report the crossing. Nothing about their state changes here.
         """
         over_budget: list[SandboxRecord] = []
+        overruns: dict[str, tuple[int, int]] = {}
         for sandbox_id, raw in (reports or {}).items():
             try:
                 used_bytes = int(raw)
@@ -1756,8 +1763,30 @@ class SandboxRegistry:
                 used_bytes // (1024 * 1024),
                 record.disk_size_mb,
             )
+            overruns[record.sandbox_id] = (used_bytes, budget_bytes)
             over_budget.append(record)
+        # N25: the record of *who* is over and by how much, for the fleet view.
+        # Rebuilt from this round alone, so a sandbox that came back inside --
+        # or stopped being reported at all -- drops out rather than lingering
+        # as a phantom.
+        with self._lock:
+            self._disk_overruns = overruns
         return over_budget
+
+    def disk_overrun_stats(self) -> dict[str, int]:
+        """How many sandboxes are over budget, and by how much (N25).
+
+        The write side is enforced where the writes are (a zero ceiling plus
+        `ENOSPC` for new names), so this is the *visibility* half: a fleet view
+        that says "two sandboxes, 340 MiB over in total" is what an alert can
+        be built on, where a log line per crossing is not.
+        """
+        with self._lock:
+            overruns = dict(self._disk_overruns)
+        over_mb = sum(
+            max(0, used - budget) for used, budget in overruns.values()
+        ) // (1024 * 1024)
+        return {"sandboxes": len(overruns), "overMB": int(over_mb)}
 
     # -- listing ----------------------------------------------------------
 

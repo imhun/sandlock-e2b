@@ -341,6 +341,11 @@ async def fleet_metrics(request: Request) -> dict[str, Any]:
         "warn": bool(disk_limit and disk_reserved >= 0.85 * disk_limit),
         "saturated": bool(disk_limit and disk_reserved >= disk_limit),
     }
+    # N25: who is *over* their own budget right now, and by how much. The write
+    # side is enforced inside the sandbox (zero ceiling + `ENOSPC` for new
+    # names) and deliberately does not freeze anyone, so this is the number an
+    # operator or an alert watches instead of a log line.
+    workspace_disk.update(registry.disk_overrun_stats())
     return {
         "nodes": node_metrics,
         "fleet": fleet,

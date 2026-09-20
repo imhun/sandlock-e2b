@@ -45,12 +45,38 @@ def root(tmp_path: Path) -> Path:
 
 def test_scan_subtree_reports_every_directory_once(root):
     found = scan_subtree(root, "")
-    assert found == {"": 5, "a": 10, "a/deep": 200}
+    assert found.bytes_by_dir == {"": 5, "a": 10, "a/deep": 200}
     assert found == scan_subtree(root, "")
 
 
 def test_scan_subtree_of_a_leaf(root):
-    assert scan_subtree(root, "a/deep") == {"a/deep": 200}
+    scanned = scan_subtree(root, "a/deep")
+    assert scanned.bytes_by_dir == {"a/deep": 200}
+    assert scanned.bytes == 200
+    # N31: the same walk answers "how many names", which the byte ledger
+    # cannot see on its own.
+    assert scanned.files == 1
+
+
+def test_entries_are_files_plus_directories(root):
+    ledger = DirLedger(root)
+    ledger.rebuild()
+    # `_tree` builds: <root>/a.bin, <root>/a/b.bin, <root>/a/deep/c.bin, plus
+    # the three directories themselves.
+    assert ledger.total_entries == 6
+    assert ledger.directory_count == 3
+
+
+def test_an_empty_file_moves_entries_and_not_bytes(root):
+    # The whole reason the entry cap exists: zero bytes, one name.
+    ledger = DirLedger(root)
+    ledger.rebuild()
+    before_bytes = ledger.total_bytes
+    before_entries = ledger.total_entries
+    (root / "empty.bin").write_bytes(b"")
+    ledger.apply([root])
+    assert ledger.total_bytes == before_bytes
+    assert ledger.total_entries == before_entries + 1
 
 
 def test_rebuild_matches_the_walk(root):

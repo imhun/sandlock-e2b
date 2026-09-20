@@ -200,6 +200,53 @@ class RuntimeRegistry:
         #: nothing costs nothing and a shrinking budget is sent in steps.
         self._tightened: dict[str, int] = {}
         self._tightened_at: dict[str, float] = {}
+        #: N31: the same shape for the *entry* cap -- how many names the tree
+        #: holds, against a limit. Separate state because the two move
+        #: independently: opening an empty file moves this one and not the
+        #: bytes, writing a big file moves the bytes and not this one.
+        self._entry_tightener: Callable[[str, int, int], dict | None] | None = None
+        #: N25: `provider(sandbox_id) -> (spent, freed) | None`, read *before*
+        #: the walk so the tightened number can be dated. Absent means the
+        #: anchor stays at delivery, which is what it used to be.
+        self._counter_provider: Callable[[str], tuple[int, int] | None] | None = None
+        self._entry_tightened: dict[str, int] = {}
+        self._entry_tightened_at: dict[str, float] = {}
+        #: `E2B_DISK_MAX_ENTRIES` (0 = off). The knob is a *runaway backstop*,
+        #: not a policy: a legitimate build (`npm install` on a large tree, a
+        #: Python venv with thousands of files) must not hit it, while a
+        #: sandbox creating names in a loop must. Measured cost of the shape
+        #: it defends against: 200 empty files take ~4.2 s through the
+        #: mediator (≈21 ms each), so a million of them is hours of work --
+        #: the limit exists because the *volume's* inodes and the walk cost are
+        #: shared with everyone else on the NAS, not because it is fast.
+        self._max_entries = int(_env_seconds("E2B_DISK_MAX_ENTRIES", 0.0))
+        #: How much the count must move before it is worth a verb, and how
+        #: often one may be sent. A crossing of the limit is always sent (see
+        #: `_maybe_tighten_entries`), because that is the moment the gate
+        #: changes state.
+        self._entry_step = int(_env_seconds("E2B_DISK_ENTRY_STEP", 256.0))
+        self._entry_interval_s = _env_seconds("E2B_DISK_ENTRY_INTERVAL_S", 1.0)
+        #: N25: what to do when a sandbox is *measured* over its budget. The
+        #: default, `log`, is the product semantic: the gate that already
+        #: exists (zero ceiling + `ENOSPC` for new names) keeps writes out, the
+        #: control plane records and alerts, and nothing is frozen -- the
+        #: sandbox keeps the reads and the deletes that bring it back inside.
+        #:
+        #: `deny` pins the write gate shut for `E2B_DISK_OVERRUN_DENY_S` after
+        #: a crossing, whatever the next round's estimate says. That closes the
+        #: one hole `log` leaves open: the number the gate is computed from is
+        #: an estimate, and an estimate that dips back under the budget on a
+        #: stale walk would re-open writes while the tree is still over. It is
+        #: opt-in because it also delays a sandbox that legitimately deleted its
+        #: way back inside (until the hysteresis below is cleared).
+        self._overrun_action = (
+            os.environ.get("E2B_DISK_OVERRUN_ACTION", "log") or "log"
+        ).strip().lower()
+        self._overrun_deny_s = _env_seconds("E2B_DISK_OVERRUN_DENY_S", 60.0)
+        self._denied_until: dict[str, float] = {}
+        #: The measurement has to fall this far below the budget before `deny`
+        #: lets go, so a value that wobbles around the line keeps the gate shut.
+        self._overrun_exit_ratio = _env_seconds("E2B_DISK_OVERRUN_EXIT_RATIO", 0.98)
         #: N25: how much the limit must drop before it is worth a verb to the
         #: slot, the smallest limit ever sent (a file must be able to hold
         #: *something*, so the ceiling never goes to zero), and how often a
@@ -350,11 +397,19 @@ class RuntimeRegistry:
             # the cursor where it was and starve every tree behind it forever.
             if index and deadline is not None and time.monotonic() >= deadline:
                 break
-            size = self._incremental_dir_size(record, dirty=dirty)
-            if size is None:
+            # N25: date the walk *before* taking it. The worker's number is a
+            # maintained ledger and can be older than its message; the two
+            # counters are the instant it was true, and the mediator subtracts
+            # everything that happened since.
+            stamps = self._counter_provider(record.sandbox_id) if self._counter_provider else None
+            scanned_usage = self._incremental_dir_usage(record, dirty=dirty)
+            entries: int | None = None
+            if scanned_usage is None:
                 size = priv_helpers.dir_size(record.workspace_dir)
                 if dirty:
                     self._dirty_stats["walk"] += 1
+            else:
+                size, entries = scanned_usage
             if size is not None:
                 # N25: the walk answers what has *committed*; the pushed
                 # appends answer what the sandbox wrote since that answer,
@@ -384,7 +439,9 @@ class RuntimeRegistry:
                 )
                 usage[record.sandbox_id] = reported
                 self._note_budget_crossing(record, reported)
-                self._maybe_tighten(record, reported)
+                self._maybe_tighten(record, reported, stamps)
+                if entries is not None:
+                    self._maybe_tighten_entries(record, entries)
             scanned += 1
         if dirty:
             self._log_dirty_split()
@@ -413,6 +470,31 @@ class RuntimeRegistry:
         """
         with self._lock:
             self._tightener = tightener
+
+    def set_entry_tightener(self, tightener) -> None:
+        """Install the entry-count tightener (N31).
+
+        ``tightener(sandbox_id, entries, limit) -> dict | None`` tells the
+        running sandbox how many names its tree holds and how many it may
+        hold, so the mediator can refuse the four syscalls that create one.
+        The registry owns the *count* (it is the component that walks the
+        tree); the tightener owns the channel.
+        """
+        with self._lock:
+            self._entry_tightener = tightener
+
+    def set_counter_provider(self, provider) -> None:
+        """Install the write-counter source used to *date* a walk (N25).
+
+        ``provider(sandbox_id) -> (spent, freed) | None`` is called at the
+        start of an accounting round, before the tree is measured, and the
+        numbers travel with the budget the round sends. They are the
+        difference between "subtract what happened after this message
+        arrived" (which handed a second file 48 MiB past the budget) and
+        "subtract what happened after this number was *measured*".
+        """
+        with self._lock:
+            self._counter_provider = provider
 
     def set_disk_wakeup(self, wakeup) -> None:
         """Install the "run a round now" callback (N25).
@@ -541,7 +623,12 @@ class RuntimeRegistry:
         except DirLedgerUnknown:
             ledger.invalidate()
 
-    def _maybe_tighten(self, record: RuntimeSandbox, size: int) -> None:
+    def _maybe_tighten(
+        self,
+        record: RuntimeSandbox,
+        size: int,
+        stamps: tuple[int, int] | None = None,
+    ) -> None:
         """Lower the running sandbox's file-size limit to what is left (N25).
 
         The pause gate is the platform's backstop, and it is a *slow* one by
@@ -580,6 +667,14 @@ class RuntimeRegistry:
         # refuses the entries a zero ceiling cannot reach (`ENOSPC`).
         remaining = max(budget - int(size), 0)
         now = time.monotonic()
+        # N25: with `E2B_DISK_OVERRUN_ACTION=deny`, a crossing pins the gate
+        # shut for a while even if the next estimate dips back under the
+        # budget. The estimate is a walk that can be seconds behind; the pin is
+        # what keeps a stale one from re-opening writes to a tree that is
+        # still over.
+        pinned = self._denied_until.get(record.sandbox_id, 0.0) > now
+        if pinned:
+            remaining = 0
         # The bookkeeping is taken under the lock (registration and
         # unregistration touch the same three fields); the verb itself is
         # *not* -- it crosses a channel, and holding a lock the event pumps
@@ -605,7 +700,7 @@ class RuntimeRegistry:
             self._tightened[record.sandbox_id] = remaining
             self._tightened_at[record.sandbox_id] = now
         try:
-            applied = tightener(record.sandbox_id, remaining)
+            applied = tightener(record.sandbox_id, remaining, stamps)
         except Exception:  # noqa: BLE001 - never break a scan round over this
             logger.warning(
                 "disk tightening failed for %s", record.sandbox_id, exc_info=True
@@ -618,6 +713,62 @@ class RuntimeRegistry:
                 remaining,
                 size,
                 budget,
+            )
+
+    def _maybe_tighten_entries(self, record: RuntimeSandbox, entries: int) -> None:
+        """Tell the sandbox how many names its tree holds, and the cap (N31).
+
+        Why this axis exists: the byte budget cannot see a tree that grows by
+        *names*. Measured on the cluster, 2000 empty files left the platform's
+        reported usage at **0 bytes**, while the directory itself was 16384
+        bytes on NFS and is not counted either -- so a sandbox could spend the
+        volume's inodes without ever touching its budget, and the only gate
+        that covered entry creation fired when the byte pool was *exactly*
+        zero, which empty entries never reach.
+
+        The count comes from the ledger (a whole-tree walk has no count to
+        give without a second pass, so a deployment that runs without the
+        incremental ledger simply does not have this gate -- the knob is a
+        backstop, not a policy). Two restraints, the same as the byte half:
+        the verb is only worth sending when the number moved materially or the
+        *crossing* happened, and at most once per interval.
+
+        ``E2B_DISK_MAX_ENTRIES = 0`` (the default) turns all of this off.
+        """
+        limit = self._max_entries
+        if limit <= 0:
+            return
+        tightener = self._entry_tightener
+        if tightener is None:
+            return
+        now = time.monotonic()
+        with self._lock:
+            previous = self._entry_tightened.get(record.sandbox_id)
+            over = entries >= limit
+            crossing = previous is not None and over != (previous >= limit)
+            if (
+                previous is not None
+                and abs(entries - previous) < self._entry_step
+                and not crossing
+            ):
+                return
+            if now - self._entry_tightened_at.get(record.sandbox_id, 0.0) < self._entry_interval_s:
+                return
+            self._entry_tightened[record.sandbox_id] = entries
+            self._entry_tightened_at[record.sandbox_id] = now
+        try:
+            applied = tightener(record.sandbox_id, entries, limit)
+        except Exception:  # noqa: BLE001 - never break a scan round over this
+            logger.warning(
+                "entry tightening failed for %s", record.sandbox_id, exc_info=True
+            )
+            return
+        if applied and crossing:
+            logger.info(
+                "entry cap: %s at %s entries of %s (crossing)",
+                record.sandbox_id,
+                entries,
+                limit,
             )
 
     def _note_budget_crossing(self, record: RuntimeSandbox, size: int) -> None:
@@ -635,10 +786,19 @@ class RuntimeRegistry:
             over = budget > 0 and size > budget
             if not over:
                 self._disk_over.discard(record.sandbox_id)
+                # N25: `deny` lets go once the measurement is clearly back
+                # inside -- not the moment it touches the line, or a value that
+                # wobbles around the budget would flap the gate.
+                if budget > 0 and size <= budget * self._overrun_exit_ratio:
+                    self._denied_until.pop(record.sandbox_id, None)
                 return
             if record.sandbox_id not in self._disk_over:
                 self._disk_over.add(record.sandbox_id)
                 self._disk_crossings[record.sandbox_id] = size
+            if self._overrun_action == "deny" and self._overrun_deny_s > 0:
+                self._denied_until[record.sandbox_id] = (
+                    time.monotonic() + self._overrun_deny_s
+                )
 
     def take_budget_crossings(self) -> dict[str, int]:
         """Sandboxes that crossed their budget since the last call (N25)."""
@@ -685,10 +845,10 @@ class RuntimeRegistry:
                 self._ledgers[record.sandbox_id] = ledger
             return ledger
 
-    def _incremental_dir_size(
+    def _incremental_dir_usage(
         self, record: RuntimeSandbox, *, dirty: bool
-    ) -> int | None:
-        """The tree's size from the ledger, or ``None`` to walk it.
+    ) -> tuple[int, int] | None:
+        """``(bytes, entries)`` from the ledger, or ``None`` to walk it.
 
         Every "cannot answer" path degrades to the whole-tree walk that was
         the only implementation before this existed -- a wrong number is the
@@ -718,7 +878,7 @@ class RuntimeRegistry:
             self._dirty_stats["rebuilt"] += 1
             total = ledger.rebuild()
             ledger.rescan_next(dirs)
-            return total
+            return total, ledger.total_entries
 
         drained_at = time.monotonic()
         drained = provider(record.sandbox_id)
@@ -740,7 +900,7 @@ class RuntimeRegistry:
             # more is what closes that window (they are the ones the drain
             # named), and it costs one scan of the directories that changed.
             ledger.rescan_next(dirs)
-            return total
+            return total, ledger.total_entries
         try:
             size = ledger.apply(dirs)
         except DirLedgerUnknown:
@@ -750,7 +910,16 @@ class RuntimeRegistry:
         self._trace_call(
             record.sandbox_id, drain_s, time.monotonic() - drained_at, "ledger"
         )
-        return size
+        # N31: the same walk that answers "how many bytes" answers "how many
+        # names" -- files plus directories, the number the entry cap is about.
+        return size, ledger.total_entries
+
+    def _incremental_dir_size(
+        self, record: RuntimeSandbox, *, dirty: bool
+    ) -> int | None:
+        """The bytes half of :meth:`_incremental_dir_usage`."""
+        usage = self._incremental_dir_usage(record, dirty=dirty)
+        return None if usage is None else usage[0]
 
     def _trace_call(
         self, sandbox_id: str, drain_s: float, total_s: float, path: str

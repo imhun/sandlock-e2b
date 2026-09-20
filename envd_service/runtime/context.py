@@ -402,7 +402,9 @@ class SandboxRuntimeContext:
     def mcp_port(self) -> int | None:
         return self._mcp_port
 
-    def set_file_size_limit(self, bytes_: int) -> dict | None:
+    def set_file_size_limit(
+        self, bytes_: int, stamps: tuple[int, int] | None = None
+    ) -> dict | None:
         """Tighten the live sandbox's per-file ceiling (N25).
 
         Called by the registry between scan rounds: the sandbox is nearly out
@@ -413,7 +415,31 @@ class SandboxRuntimeContext:
         setter = getattr(self.executor, "set_file_size_limit", None)
         if setter is None:
             return None
-        return setter(bytes_)
+        if stamps is None:
+            return setter(bytes_)
+        try:
+            return setter(bytes_, stamps)
+        except TypeError:
+            return setter(bytes_)
+
+    def read_write_counters(self) -> tuple[int, int] | None:
+        """The live sandbox's write counters, read before a walk (N25)."""
+        reader = getattr(self.executor, "read_write_counters", None)
+        if reader is None:
+            return None
+        return reader()
+
+    def set_entry_limit(self, entries: int, limit: int) -> dict | None:
+        """Cap how many names the live sandbox's tree may hold (N31).
+
+        Called by the registry on the accounting round, with the count its
+        walk produced. ``None`` means nothing live to tell (no exec running, or
+        a slot without the verb).
+        """
+        setter = getattr(self.executor, "set_entry_limit", None)
+        if setter is None:
+            return None
+        return setter(entries, limit)
 
     @property
     def mcp_token(self) -> str | None:

@@ -42,6 +42,7 @@ import os
 import time
 from collections.abc import Iterable
 from pathlib import Path
+from typing import NamedTuple
 
 from envd_service.runtime.brief_stat import entry_size
 
@@ -57,7 +58,30 @@ class DirLedgerUnknown(Exception):
     """
 
 
-def scan_subtree(root: Path, rel: str) -> dict[str, int]:
+class SubtreeScan(NamedTuple):
+    """One subtree walk: the bytes per directory, and the files per directory.
+
+    The second number exists because the first one cannot see a tree that
+    grows by *names*: an empty file contributes zero bytes, and directories
+    contribute nothing at all, so a sandbox can spend the volume's inodes
+    without moving the byte ledger (N31 -- measured on the cluster: 2000 empty
+    files, platform number unchanged at 0 bytes, while the directory itself
+    was 16384 bytes on NFS and is not counted either).
+    """
+
+    bytes_by_dir: dict[str, int]
+    files_by_dir: dict[str, int]
+
+    @property
+    def bytes(self) -> int:
+        return sum(self.bytes_by_dir.values())
+
+    @property
+    def files(self) -> int:
+        return sum(self.files_by_dir.values())
+
+
+def scan_subtree(root: Path, rel: str) -> SubtreeScan:
     """``{relative directory: own non-directory bytes}`` under ``root/rel``.
 
     ``rel`` itself is always present (possibly with 0 bytes), so a caller
@@ -70,6 +94,7 @@ def scan_subtree(root: Path, rel: str) -> dict[str, int]:
 
     start = root / rel if rel else root
     found: dict[str, int] = {rel: 0}
+    counts: dict[str, int] = {rel: 0}
 
     def _raise(exc: OSError) -> None:
         raise exc
@@ -80,6 +105,7 @@ def scan_subtree(root: Path, rel: str) -> dict[str, int]:
             if rel_dir == ".":
                 rel_dir = ""
             owned = 0
+            counts[rel_dir] = len(files)
             for name in files:
                 try:
                     owned += entry_size(os.path.join(dirpath, name))
@@ -88,7 +114,7 @@ def scan_subtree(root: Path, rel: str) -> dict[str, int]:
             found[rel_dir] = owned
     except OSError as exc:
         raise DirLedgerUnknown(f"cannot walk {start}: {exc}") from exc
-    return found
+    return SubtreeScan(found, counts)
 
 
 class DirLedger:
@@ -104,6 +130,10 @@ class DirLedger:
         self._root = Path(root)
         self._dirs: dict[str, int] = {}
         self._total = 0
+        #: Files per directory, the parallel to `_dirs`: `len(_dirs)` counts
+        #: the directories themselves, so entries = files + directories.
+        self._files: dict[str, int] = {}
+        self._entries = 0
         self._ready = False
         self._clock = clock
         #: N25/L2c: directories to re-check until their deadline. A mediator
@@ -131,6 +161,15 @@ class DirLedger:
         return self._total
 
     @property
+    def total_entries(self) -> int:
+        """Files plus directories: what a `stat` would call a name.
+
+        The number the entry cap is about -- not the bytes, which stay at zero
+        for empty files and never see directories at all (N31).
+        """
+        return self._entries if self._ready else 0
+
+    @property
     def directory_count(self) -> int:
         return len(self._dirs)
 
@@ -149,8 +188,11 @@ class DirLedger:
 
     def rebuild(self) -> int:
         """Recompute everything from one whole-tree walk."""
-        self._dirs = scan_subtree(self._root, "")
+        scan = scan_subtree(self._root, "")
+        self._dirs = scan.bytes_by_dir
+        self._files = scan.files_by_dir
         self._total = sum(self._dirs.values())
+        self._entries = sum(self._files.values()) + len(self._dirs)
         self._recheck.clear()
         self._ready = True
         self._rebuilt_at = self._clock()
@@ -191,10 +233,10 @@ class DirLedger:
 
         # Rescan first, then swap: a failure part-way must not leave half the
         # tree replaced (the exception propagates before any mutation).
-        scanned: list[tuple[str, dict[str, int]]] = []
+        scanned: list[tuple[str, SubtreeScan]] = []
         for rel in sorted(targets):
             fresh = scan_subtree(self._root, rel)
-            if sum(fresh.values()) > self._subtree_bytes(rel):
+            if fresh.bytes > self._subtree_bytes(rel):
                 # Still growing: keep watching it past the mark's own window,
                 # so a writer that keeps appending is never caught mid-flight.
                 self._recheck[rel] = now + self._grace_s
@@ -206,6 +248,7 @@ class DirLedger:
             rel: until for rel, until in self._recheck.items() if until > now
         }
         self._total = sum(self._dirs.values())
+        self._entries = sum(self._files.values()) + len(self._dirs)
         self._ready = True
         return self._total
 
@@ -266,10 +309,11 @@ class DirLedger:
             if key == rel or key.startswith(prefix)
         )
 
-    def _replace(self, rel: str, fresh: dict[str, int]) -> None:
+    def _replace(self, rel: str, fresh: SubtreeScan) -> None:
         """Swap one subtree's entries for the freshly scanned ones."""
         if rel == "":
-            self._dirs = dict(fresh)
+            self._dirs = dict(fresh.bytes_by_dir)
+            self._files = dict(fresh.files_by_dir)
             return
         prefix = rel + "/"
         for key in [
@@ -278,4 +322,6 @@ class DirLedger:
             if key == rel or key.startswith(prefix)
         ]:
             del self._dirs[key]
-        self._dirs.update(fresh)
+            self._files.pop(key, None)
+        self._dirs.update(fresh.bytes_by_dir)
+        self._files.update(fresh.files_by_dir)
