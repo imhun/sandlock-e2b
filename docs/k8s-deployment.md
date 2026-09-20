@@ -1713,6 +1713,13 @@ description），所以"现在多大"只差一次 `fdinfo` 读——现在 `is_e
 | fork 测试 | core lib **887** 通过；supervise 28 通过 / 1 预存在失败（`test_supervise_path_serve_launches_instance_and_serves_verbs_until_shutdown`，未改动的树上同样失败） |
 | 主仓单测 | 1190 通过 / 13 既有失败（macOS 上的 `test_priv_helpers` 11 + `test_xfs_quotactl_backend` 2） |
 
+**还没解决的（这一轮量到了，记在 backlog N31）**：账本是**字节**账本，所以它看不见"条目"——
+沙箱里建 2000 个空文件，平台 `diskUsed` 全程 **0 字节**，连 NFS 上每个目录至少 **16 KiB** 的目录块也不计
+（`dir_size`/`dir_ledger` 只累加非目录条目）。唯一挡"建条目"的闸门是"池**恰好**为 0"，而空条目不消耗字节
+⇒ **数量无上限**，真实风险是 inode/元数据耗尽（整卷故障）与整树 walk/GC/快照的成本随条目数线性上升，
+不是容量。顺带量到建条目本身很贵：**200 个空文件 ≈ 4.2 s（≈21 ms/个）**，且这个速率在 200→2000 之间
+不随目录变大而改善；`rm -rf` 2000 个文件 20.8 s；一条命令里建 20000 个文件会把命令的响应流打断。
+
 **顺带记一条运维事实**：每次 worker 滚动重启都可能把 base image 预热打断，缓存目录里只剩
 `…sha256_….lock`（没有实体目录），此时 `Sandbox.create()` 会回 `428 warm_required`，多机 smoke 因此失败。
 预热端点是 **POST**（GET 只是查询）：`POST /agent/images/<urlencoded-ref>/warm`，带 `X-Internal-Key`
