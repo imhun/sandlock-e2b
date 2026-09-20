@@ -111,19 +111,54 @@ def test_the_interval_gates_a_second_tightening(tmp_path):
     assert len(calls) == 1
 
 
-def test_a_sandbox_that_shrank_is_never_widened(tmp_path):
-    """Deleting files raises the remaining budget; that is not a grant."""
+def test_a_budget_rise_below_the_step_is_not_sent(tmp_path):
+    """A move that changes no decision is not worth a verb.
+
+    The step exists so a round that moved the number by a few kilobytes does
+    not talk to the slot. 1 MB of room in a 100 MiB budget changes no grant.
+    """
     registry = _registry(tmp_path, "sbx_shrank", disk_mb=100)
     calls, tightener = _recorder()
     registry.set_disk_tightener(tightener)
     (tmp_path / "sbx_shrank" / "workspace" / "big.bin").write_bytes(b"b" * 1_000_000)
     registry.disk_usage_snapshot(dirty=True)
-    first = calls[-1][1]
+    # The fixture's own 1000-byte file is in the tree too.
+    assert calls[-1][1] == 100 * 1024 * 1024 - (1_000_000 + 1000)
 
     (tmp_path / "sbx_shrank" / "workspace" / "big.bin").unlink()
     registry.disk_usage_snapshot(dirty=True)
 
-    assert calls[-1][1] == first, "the limit must not be raised back"
+    assert calls[-1][1] == 100 * 1024 * 1024 - (1_000_000 + 1000), (
+        "a sub-step rise changes no decision"
+    )
+
+
+def test_leaving_the_exhausted_state_is_always_sent(tmp_path):
+    """The one rise that matters, however small.
+
+    A sandbox that deleted its way back inside has to be able to write again,
+    and *that* decision lives in the mediator: the budget it holds is what its
+    `open` grants and its "may the tree grow?" refusals are computed from. So
+    a crossing of zero is exempt from the step.
+    """
+    registry = _registry(tmp_path, "sbx_full", disk_mb=1)
+    calls, tightener = _recorder()
+    registry.set_disk_tightener(tightener)
+    # The verb is rate-limited, and this test does not wait a scan interval.
+    registry._tighten_interval_s = 0.0
+    # The fixture's own 1000-byte file is in the tree too, so this is 2000
+    # bytes *past* the 1 MiB budget: the pool is exhausted.
+    (tmp_path / "sbx_full" / "workspace" / "huge.bin").write_bytes(b"b" * (1024 * 1024 + 1000))
+    registry.disk_usage_snapshot(dirty=True)
+    assert calls[-1][1] == 0
+
+    # Now 100 bytes *inside* the budget: a rise of 100 bytes, far below the
+    # step, but it is the difference between "may not create anything" and
+    # "may".
+    (tmp_path / "sbx_full" / "workspace" / "huge.bin").write_bytes(b"b" * (1024 * 1024 - 1100))
+    registry.disk_usage_snapshot(dirty=True)
+
+    assert calls[-1][1] == 100, "leaving the exhausted state is always sent"
 
 
 def test_the_ceiling_reaches_zero_when_the_budget_is_gone(tmp_path):

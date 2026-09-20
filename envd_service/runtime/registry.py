@@ -556,10 +556,12 @@ class RuntimeRegistry:
         Three deliberate restraints, so this stays a quota and not a second
         event stream:
 
-        * only ever **lower** -- a sandbox whose number goes up (files
-          deleted, or a fresh round) is not sent anything;
-        * only on a **material** drop, so a round that moves the number by a
-          few kilobytes does not talk to the slot;
+        * **material** moves only, in either direction: the number is the budget
+          the fork's `open` grants and its "may the tree grow?" refusals are
+          computed from, so a sandbox that deletes its way back inside has to
+          be able to write again -- while the `RLIMIT_FSIZE` sweep that same
+          verb performs stays one-way (a limit a stale reading could widen is
+          not a limit);
         * at most once per ``E2B_DISK_TIGHTEN_INTERVAL_S``.
         """
         tightener = self._tightener
@@ -585,9 +587,18 @@ class RuntimeRegistry:
         # accounting round.
         with self._lock:
             previous = self._tightened.get(record.sandbox_id)
-            if previous is not None and remaining >= previous:
-                return
-            if previous is not None and remaining > previous - self._tighten_step_bytes:
+            # A crossing of zero is always worth a verb, however small the
+            # move: leaving "exhausted" is what unblocks a sandbox that made
+            # room for itself, and entering it is what stops the writes.
+            crossing = previous is not None and ((remaining == 0) != (previous == 0))
+            if (
+                previous is not None
+                and abs(remaining - previous) < self._tighten_step_bytes
+                and not crossing
+            ):
+                # Not material in either direction: the verb carries the budget
+                # the mediator's `open` grants are computed from, and a value
+                # that only moved by a few kilobytes changes no decision.
                 return
             if now - self._tightened_at.get(record.sandbox_id, 0.0) < self._tighten_interval_s:
                 return
