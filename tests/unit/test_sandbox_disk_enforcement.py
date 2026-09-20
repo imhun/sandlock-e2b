@@ -1,11 +1,13 @@
-"""N25/L2b: the measured-disk gate (worker measures, control plane pauses).
+"""N25/L2b: the measured-disk gate (worker measures, both sides act).
 
 The per-node and fleet ledgers bound what a sandbox was **sold** (its
 ``diskMB`` at create time); nothing bounded what it actually wrote. These
-tests pin both halves of the answer -- the worker's measurement (including
-the scan budget that keeps it off the heartbeat's critical path) and the
-control plane's pause -- plus the heartbeat contract that carries one to the
-other.
+tests pin both halves of the answer -- the worker's measurement (including the
+scan budget that keeps it off the heartbeat's critical path) and the control
+plane's reaction, which is to *record*, not to freeze: over budget means the
+writes stop (the worker's zero file-size ceiling, plus the mediator's `ENOSPC`
+for the entry-creating calls a ceiling cannot reach) while the sandbox keeps
+running, so its owner can still delete its way back inside.
 """
 
 from __future__ import annotations
@@ -117,18 +119,28 @@ def test_no_runtime_means_nothing_to_report(workspace):
 # -- the control plane's pause --------------------------------------------
 
 
-def test_a_tree_over_budget_is_paused_and_releases_its_slice(workspace):
+def test_a_tree_over_budget_is_reported_but_never_frozen(workspace):
+    """The product semantic: over the limit, writes stop; the sandbox does not.
+
+    Freezing it took away the reads, the exec and -- the one that matters --
+    the deletes its owner needs to get back inside. The enforcement lives where
+    the writes are (the worker's data plane), so all this path does is record
+    the number and name the crossing.
+    """
     registry = SandboxRegistry(_settings())
     record = _create(registry, sandbox_id="sbx_over")
-    assert registry.global_reserved()["disk"] == record.disk_size_mb
 
     over = record.disk_size_mb * 1024 * 1024 + 1
-    paused = registry.enforce_disk_budget({"sbx_over": over})
+    reported = registry.enforce_disk_budget({"sbx_over": over})
 
-    assert [r.sandbox_id for r in paused] == ["sbx_over"]
-    assert registry.get("sbx_over").state == "paused"
-    # E9.2 semantics: a paused sandbox holds no reservation.
-    assert registry.global_reserved()["disk"] == 0
+    assert [r.sandbox_id for r in reported] == ["sbx_over"]
+    assert registry.get("sbx_over").state == "running"
+    # The measurement is the accounting, and it lands on the record whether or
+    # not the sandbox is over (N28/D).
+    assert registry.get("sbx_over").workspace_disk_used_bytes == over
+    # Nothing was parked: a running sandbox keeps its reservation, so it keeps
+    # its place while it deletes its way back inside.
+    assert registry.global_reserved()["disk"] == record.disk_size_mb
 
 
 def test_a_tree_within_budget_is_left_alone(workspace):
@@ -140,27 +152,22 @@ def test_a_tree_within_budget_is_left_alone(workspace):
     assert registry.global_reserved()["disk"] == record.disk_size_mb
 
 
-def test_the_gate_is_idempotent_across_repeated_reports(workspace):
-    """Every heartbeat re-sends the last scan; the pause must land once.
+def test_a_repeated_report_records_once_and_never_pauses(workspace):
+    """Every heartbeat re-sends the last scan, and the heartbeat is 5 s.
 
-    The worker's report is cached between scans, so the control plane sees the
-    same over-budget number on every pulse for up to the scan interval. A
-    second pause would append a second "sandbox paused" log line to a record
-    that is already frozen. The *measurement* is still recorded every time
-    (N28/D) -- it is the accounting, not the action.
+    The record has to keep the number without accumulating anything: no second
+    "paused" log line (there is no pause at all any more), and one stored
+    measurement, not one per pulse.
     """
     registry = SandboxRegistry(_settings())
     record = _create(registry, sandbox_id="sbx_twice")
     over = record.disk_size_mb * 1024 * 1024 + 1
 
     assert len(registry.enforce_disk_budget({"sbx_twice": over})) == 1
-    assert registry.enforce_disk_budget({"sbx_twice": over}) == []
-    lines = [entry["line"] for entry in registry.get("sbx_twice").logs]
-    assert lines == [
-        "sandbox paused: its workspace grew past its budget "
-        f"({record.disk_size_mb} MiB used of {record.disk_size_mb} MiB)"
-    ]
+    assert len(registry.enforce_disk_budget({"sbx_twice": over})) == 1
+    assert registry.get("sbx_twice").state == "running"
     assert registry.get("sbx_twice").workspace_disk_used_bytes == over
+    assert [entry["line"] for entry in registry.get("sbx_twice").logs] == []
 
 
 def test_the_pause_reason_survives_the_shared_store(workspace):

@@ -126,16 +126,32 @@ def test_a_sandbox_that_shrank_is_never_widened(tmp_path):
     assert calls[-1][1] == first, "the limit must not be raised back"
 
 
-def test_the_ceiling_never_goes_below_the_floor(tmp_path):
+def test_the_ceiling_reaches_zero_when_the_budget_is_gone(tmp_path):
+    """Over budget the answer is *no growth*, not "one more tiny file".
+
+    The floor that used to sit here was the one MiB that put a full sandbox
+    past its budget -- where the platform then froze it, taking away the
+    deletes it needed to get back inside. Zero is a real value: every write
+    fails with EFBIG, and deleting still works, which is the product semantic.
+    """
     registry = _registry(tmp_path, "sbx_over", disk_mb=1)
-    registry._tighten_floor_bytes = 65536
     calls, tightener = _recorder()
     registry.set_disk_tightener(tightener)
     # Already far over budget: the remaining budget is negative.
     (tmp_path / "sbx_over" / "workspace" / "huge.bin").write_bytes(b"b" * (2 * 1024 * 1024))
     registry.disk_usage_snapshot(dirty=True)
 
-    assert calls == [("sbx_over", 65536)], "a file must still be able to hold something"
+    assert calls == [("sbx_over", 0)], "no growth: the ceiling is zero"
+
+
+def test_a_sandbox_inside_its_budget_keeps_what_is_left(tmp_path):
+    registry = _registry(tmp_path, "sbx_inside", disk_mb=1)
+    calls, tightener = _recorder()
+    registry.set_disk_tightener(tightener)
+    # 1000 bytes of a 1 MiB budget: the ceiling is the remaining budget.
+    registry.disk_usage_snapshot(dirty=True)
+
+    assert calls == [("sbx_inside", 1024 * 1024 - 1000)]
 
 
 def test_without_a_tightener_nothing_is_asked(tmp_path):

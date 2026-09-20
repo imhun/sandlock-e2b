@@ -376,24 +376,22 @@ spec:
             # every upload helper) therefore converge on the budget instead of
             # each re-reading the full one.
             #
-            # What it does not buy: a *single* command that loops and writes
-            # files (`for i in 1 2 3; do dd ...; done`) is one process with one
-            # ceiling, so each file is only bounded by that same number, and
-            # the remaining budget is therefore handed out once per file.
-            # Measured on the cluster: after `part1.bin` used 900 MiB of a
-            # 1024 MiB budget, `part2.bin` and `part3.bin` were each allowed
-            # the same 124 MiB that was left, and the sandbox was frozen at
-            # 1148 MiB. What bounds it is the *freshness* of that remaining
-            # number -- the push below wakes a round as the bytes arrive, and a
-            # tightening may land `E2B_DISK_TIGHTEN_INTERVAL_S` after the round
-            # that computed it.
+            # What it does not buy on its own: a *single* command that loops and
+            # writes files (`for i in 1 2 3; do dd ...; done`) is one process
+            # with one ceiling per file. That gap is closed in the fork: the
+            # mediator hands each `open` `baseline + what is left` from its own
+            # spend counter (§22.5.9), so a second file sees what the first one
+            # used, however fast the files come.
             #
-            # The floor (1 MiB) is what keeps an over-budget sandbox usable: it
-            # must still be able to run commands that write a small file, and
-            # above all to *delete* what it needs to delete.
+            # Over budget the ceiling is **zero**, and that is the product
+            # semantic rather than a freeze: the sandbox may not write (every
+            # write fails with EFBIG) and may not create new entries (the
+            # mediator refuses `O_CREAT`/`mkdir`/`symlink`/`link` with ENOSPC),
+            # while reads, exec and -- above all -- the deletes that bring it
+            # back inside keep working. There is deliberately no floor: a floor
+            # is the one MiB that steps a full sandbox past its budget, and the
+            # control plane used to freeze it for exactly that.
             - name: E2B_DISK_EXEC_LIMIT
-              value: "1"
-            - name: E2B_DISK_EXEC_LIMIT_FLOOR_MB
               value: "1"
             # N25: the live per-file ceiling. `STEP_MB` is the smallest drop
             # worth a verb to the slot; `INTERVAL_S` is how stale the number a

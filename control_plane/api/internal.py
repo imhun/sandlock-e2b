@@ -122,48 +122,27 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
 async def _enforce_disk_reports(
     request: Request, node_id: str, reports: dict[str, Any]
 ) -> None:
-    """Turn a worker's measured tree sizes into pauses (N25/L2b).
+    """Turn a worker's measured tree sizes into accounting (N25/L2b).
 
-    Same split as the activity report: the worker measures because it owns the
-    mount, the control plane pauses because it owns state. Everything the
-    pause would otherwise do *besides* freezing the runtime -- returning the
-    node slice -- happens here, and the freeze push is best-effort: a push
-    that does not land is retried by the next heartbeat (the record stays
-    ``paused`` and still over budget, and the worker's own reconcile/freeze
-    path is idempotent), while rolling the pause back would hand the
-    reservation back to a sandbox that is still writing.
+    The worker measures because it owns the mount; the control plane records
+    because it owns state. Being over budget is **not** a freeze: the worker
+    already blocks writes (a zero file-size ceiling, plus `ENOSPC` for the
+    operations a ceiling cannot reach), and the owner keeps the reads, the exec
+    and -- above all -- the deletes that bring the sandbox back inside. So this
+    reports the crossing and nothing else: no pause, no reservation change.
     """
-    from control_plane.api.sandboxes import _park_capacity, _push_pause_state
-
     for record in request.app.state.registry.enforce_disk_budget(reports):
-        _park_capacity(request, record)
-        reason = (
-            f"its workspace grew past its budget "
-            f"({(record.workspace_disk_used_bytes or 0) // (1024 * 1024)} MiB "
-            f"used of {record.disk_size_mb} MiB)"
+        # `record.workspace_disk_used_bytes` is already stored by the registry;
+        # this is the operator-facing half (one line per crossing report).
+        logger.warning(
+            "sandbox %s on node %s is over its workspace budget "
+            "(%d MiB used of %d MiB): writes are blocked until it is back inside",
+            record.sandbox_id,
+            node_id,
+            (record.workspace_disk_used_bytes or 0) // (1024 * 1024),
+            record.disk_size_mb,
         )
-        try:
-            pushed = await _push_pause_state(
-                request, record, paused=True, reason=reason
-            )
-        except Exception:  # pragma: no cover - worker-specific transport
-            logger.warning(
-                "could not freeze over-budget sandbox %s on node %s; the "
-                "runtime retries on the next heartbeat",
-                record.sandbox_id,
-                node_id,
-                exc_info=True,
-            )
-            continue
-        if not pushed:
-            # Combined deployment (``local://``): there is no agent to push to,
-            # so the shared runtime registry is what carries the state -- the
-            # same branch ``pause_sandbox`` takes. Without it the record said
-            # "paused" while the worker's runtime (and therefore both write
-            # gates) still said "running".
-            request.app.state.runtime_registry.set_state(
-                record.sandbox_id, "paused", reason
-            )
+
 
 
 @router.get("/internal/nodes/{node_id}/sandboxes")

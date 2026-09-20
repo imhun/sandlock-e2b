@@ -1696,31 +1696,31 @@ class SandboxRegistry:
     def enforce_disk_budget(
         self, reports: dict[str, Any] | None
     ) -> list[SandboxRecord]:
-        """Pause the sandboxes whose *measured* tree outgrew their budget.
+        """Record the *measured* tree size, and note who is over budget.
 
         N25/L2b, and the counterpart of :meth:`apply_activity_report`: the
-        worker measures (it owns the mount), the control plane acts (it owns
-        state). ``reports`` maps sandbox id to measured bytes; anything at or
-        below ``disk_size_mb`` is left alone, and so is a sandbox that is
-        already paused -- otherwise every heartbeat would append another
-        "paused" log line to a record that is already frozen.
+        worker measures (it owns the mount), the control plane records (it owns
+        state). ``reports`` maps sandbox id to measured bytes.
 
-        The pause is the existing E9.2 one: state preserved, reservations
-        (global, tenant, and -- by the caller -- the node slice) returned, so
-        a runaway sandbox stops competing for capacity instead of being
-        killed, and the user can resume it once the tree is back in budget.
+        **Over budget is not a pause.** The product semantic is that a sandbox
+        which has used its disk is *not allowed to write* and everything else
+        keeps working -- reads, exec, and above all the deletes that would bring
+        it back inside. Freezing it took exactly those away. The write side is
+        enforced where the writes are: the worker turns the measured number into
+        a zero `RLIMIT_FSIZE` (so every write fails with `EFBIG`) and the
+        mediator refuses the entries a ceiling cannot reach (`O_CREAT`,
+        `mkdir`, `symlink`, `link` with `ENOSPC`, §22.5.9). This method
+        therefore only *records*: the number lands on the record for
+        ``GET /sandboxes/{id}/metrics`` and for the size probe, and the caller
+        logs a crossing once.
 
         The measurement is recorded on **every** reported record (N28/D), not
-        only on the ones being paused: this is the fleet's accounting, and a
-        per-sandbox disk number that exists only for frozen sandboxes answers
-        no question an operator (or ``GET /sandboxes/{id}/metrics``) has.
+        only on the ones over budget: this is the fleet's accounting.
 
-        Returns the records this call moved to ``paused``. Freezing the
-        runtime on the worker is the caller's job and is *deliberately* not
-        rolled back on failure: an unfrozen runaway must not keep its
-        reservation back just because the push did not land.
+        Returns the records that are over their budget now, so the caller can
+        report the crossing. Nothing about their state changes here.
         """
-        paused: list[SandboxRecord] = []
+        over_budget: list[SandboxRecord] = []
         for sandbox_id, raw in (reports or {}).items():
             try:
                 used_bytes = int(raw)
@@ -1739,28 +1739,25 @@ class SandboxRegistry:
             if record.workspace_disk_used_bytes != used_bytes:
                 record.workspace_disk_used_bytes = used_bytes
                 self.save(record)
-            if record.quota_released or record.state != "running":
+            if record.quota_released:
                 continue
             budget_bytes = int(record.disk_size_mb) * 1024 * 1024
             if budget_bytes <= 0 or used_bytes <= budget_bytes:
                 continue
+            # Over budget: the worker has already made every write fail (a zero
+            # file-size ceiling, plus `ENOSPC` for the entry-creating operations
+            # a ceiling cannot reach), so there is nothing to enforce here --
+            # and freezing would take away the deletes the owner needs to get
+            # back inside. Reported, not acted on.
             logger.warning(
                 "sandbox %s over its workspace budget (%d MiB used of %d MiB): "
-                "pausing it",
+                "writes are blocked until it is back inside",
                 record.sandbox_id,
                 used_bytes // (1024 * 1024),
                 record.disk_size_mb,
             )
-            self.pause(
-                record,
-                reason=(
-                    f"its workspace grew past its budget "
-                    f"({used_bytes // (1024 * 1024)} MiB used of "
-                    f"{record.disk_size_mb} MiB)"
-                ),
-            )
-            paused.append(record)
-        return paused
+            over_budget.append(record)
+        return over_budget
 
     # -- listing ----------------------------------------------------------
 

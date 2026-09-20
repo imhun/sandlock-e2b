@@ -540,8 +540,13 @@ class SandboxRuntimeContext:
             # legal write) stays in force. Guessing here would be the one
             # failure mode this feature must not have.
             return None
-        floor = max(0, int(getattr(settings, "disk_exec_limit_floor_mb", 1))) * 1024 * 1024
-        limit = max(budget - used, floor)
+        # Over budget the ceiling is zero: no write may grow a file, while
+        # reads, exec and -- above all -- deletes keep working. That is the
+        # product semantic for "over the limit": the sandbox is not frozen, it
+        # just cannot write. There is deliberately no floor here: a floor is
+        # the one MiB by which a full sandbox would step past its budget, and
+        # the platform used to freeze it for exactly that.
+        limit = max(budget - used, 0)
         for mount in self.record.volume_mounts:
             quota = mount.get("perSandboxQuotaMb")
             if isinstance(quota, int) and not isinstance(quota, bool) and quota > 0:

@@ -282,13 +282,12 @@ class Settings:
     disk_exec_limit: bool = field(
         default_factory=lambda: _env_bool("E2B_DISK_EXEC_LIMIT", False)
     )
-    # ...and the floor it is never lowered below. A sandbox at or over its
-    # budget must still be able to run a command that writes a small file (a
-    # shell's temp file), and above all to *delete* what it needs to delete to
-    # get back inside it -- a ceiling of zero would refuse both.
-    disk_exec_limit_floor_mb: int = field(
-        default_factory=lambda: _env_int("E2B_DISK_EXEC_LIMIT_FLOOR_MB", 1)
-    )
+    # N25: there is deliberately no floor under that ceiling. Over budget the
+    # ceiling is zero -- no write, and no new entry (the mediator refuses the
+    # operations a ceiling cannot reach with ENOSPC) -- while reads, exec and
+    # the deletes that bring the sandbox back inside keep working. A floor used
+    # to keep "one more small file" possible, and that is exactly the MiB that
+    # stepped a full sandbox past its budget, where the platform froze it.
     # Per-sandbox host uid isolation (E3.2) -- **on by default**: every
     # sandbox gets a distinct host uid from the pool and its workspace is
     # `0770 <uid>:<worker gid>` (fix round 1 / c1). That identity is what makes the rest of

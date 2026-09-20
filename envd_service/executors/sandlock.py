@@ -1573,7 +1573,11 @@ class SandlockExecutor(Executor):
         rootfs, a volume's mount) -- the budget it is set to is the largest of
         those, so it can only ever refuse something already over budget.
         """
-        if self._max_file_size_mb is None or self._max_file_size_mb <= 0:
+        # N25: zero is a ceiling, not "unset" -- over its disk budget a sandbox
+        # may not grow a file at all, and this is the value that says so. Only
+        # ``None`` means "this policy carries no file-size ceiling", and only a
+        # negative number is nonsense.
+        if self._max_file_size_mb is None or self._max_file_size_mb < 0:
             return None
         return int(self._max_file_size_mb) * 1024 * 1024
 

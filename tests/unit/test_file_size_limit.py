@@ -98,13 +98,23 @@ def test_the_ceiling_reaches_the_instance_policy_as_bytes():
 
 
 def test_no_ceiling_means_no_field_rather_than_zero():
-    """A zero RLIMIT_FSIZE refuses every write, including a shell's temp file."""
+    """Unset is ``None``; zero is a *ceiling* and means no growth at all."""
     assert _executor()._policy_ceiling()["max_file_size"] is None
     assert _executor()._max_file_size_bytes() is None
 
 
-@pytest.mark.parametrize("value", [0, -1])
-def test_a_non_positive_setting_is_treated_as_unset(value):
+def test_zero_is_a_ceiling_not_an_absence():
+    """N25: over its disk budget a sandbox may not write, so the worker asks
+    for a zero ceiling on purpose -- and the fork installs it rather than
+    treating it as "unset". Everything else (reads, exec, deletes) keeps
+    working; that is why this is a ceiling and not a freeze."""
+    assert _executor(max_file_size_mb=0)._policy_ceiling()["max_file_size"] == 0
+    assert _executor(max_file_size_mb=0)._max_file_size_bytes() == 0
+
+
+@pytest.mark.parametrize("value", [-1, -1024])
+def test_a_negative_setting_is_not_a_ceiling(value):
+    """Negative is nonsense, not "no growth": it must not reach the fork."""
     assert _executor(max_file_size_mb=value)._max_file_size_bytes() is None
 
 
@@ -159,9 +169,14 @@ def test_the_exec_ceiling_refreshes_before_each_command():
     assert registry.calls == 2
 
 
-def test_the_floor_keeps_an_over_budget_sandbox_usable():
-    """It must still be able to run a command that deletes something."""
-    assert _context(used=2000 * MIB).max_file_size_for_exec() == 1 * MIB
+def test_an_over_budget_sandbox_gets_a_zero_ceiling():
+    """The product semantic, at the per-exec layer: over budget means the
+    command runs (a delete must be possible) but no write can grow a file.
+
+    Freezing used to be the answer here, and it took the delete away with
+    everything else.
+    """
+    assert _context(used=2000 * MIB).max_file_size_for_exec() == 0
 
 
 def test_a_volume_slice_only_ever_widens_the_ceiling():

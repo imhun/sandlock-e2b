@@ -207,14 +207,11 @@ class RuntimeRegistry:
         self._tighten_step_bytes = int(
             _env_seconds("E2B_DISK_TIGHTEN_STEP_MB", 1.0) * 1024 * 1024
         )
-        self._tighten_floor_bytes = max(
-            1, int(_env_seconds("E2B_DISK_EXEC_LIMIT_FLOOR_MB", 1.0) * 1024 * 1024)
-        )
         #: 0.1 s, not 0.5 s: the number a *new* file inherits is whatever the
         #: last tightening left, so this interval is how stale that number can
-        #: be. Measured on the cluster, a 900 MiB command whose remaining
-        #: budget was 124 MiB handed each of its two remaining files the full
-        #: 124 MiB and ended at 1148 MiB of a 1024 MiB budget.
+        #: be. Measured on the cluster, a 900 MiB command whose remaining budget
+        #: was 124 MiB handed each of its two remaining files the full 124 MiB
+        #: and ended at 1148 MiB of a 1024 MiB budget.
         self._tighten_interval_s = _env_seconds("E2B_DISK_TIGHTEN_INTERVAL_S", 0.1)
         #: N25: the push wakes a scan round instead of waiting for the cadence.
         #: Past `E2B_DISK_APPEND_TRIGGER_MB` since the last round, ask for one
@@ -571,7 +568,15 @@ class RuntimeRegistry:
         budget = int(record.disk_mb) * 1024 * 1024
         if budget <= 0:
             return
-        remaining = max(budget - int(size), self._tighten_floor_bytes)
+        # Over budget the answer is no growth, not a value that keeps the tree
+        # creeping: `E2B_DISK_EXEC_LIMIT_FLOOR_MB` used to guarantee "something
+        # can still be written", and on the cluster that is exactly the MiB
+        # that puts a full sandbox past its budget -- where the platform then
+        # froze it, taking away the deletes it needed to get back inside. The
+        # product semantic is the other way round: over the limit, writes stop
+        # and everything else keeps working, so zero is sent and the mediator
+        # refuses the entries a zero ceiling cannot reach (`ENOSPC`).
+        remaining = max(budget - int(size), 0)
         now = time.monotonic()
         # The bookkeeping is taken under the lock (registration and
         # unregistration touch the same three fields); the verb itself is
