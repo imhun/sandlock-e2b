@@ -424,8 +424,8 @@ def create_app(
     # ledger walks is sent on the same round and the mediator refuses the four
     # syscalls that create one.
     runtime_registry.set_entry_tightener(
-        lambda sandbox_id, entries, limit: (
-            app.state.runtimes[sandbox_id].set_entry_limit(entries, limit)
+        lambda sandbox_id, entries, limit, stamps: (
+            app.state.runtimes[sandbox_id].set_entry_limit(entries, limit, stamps)
             if sandbox_id in app.state.runtimes
             else None
         )

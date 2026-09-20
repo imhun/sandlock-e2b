@@ -429,7 +429,9 @@ class SandboxRuntimeContext:
             return None
         return reader()
 
-    def set_entry_limit(self, entries: int, limit: int) -> dict | None:
+    def set_entry_limit(
+        self, entries: int, limit: int, stamps: tuple[int, int] | None = None
+    ) -> dict | None:
         """Cap how many names the live sandbox's tree may hold (N31).
 
         Called by the registry on the accounting round, with the count its
@@ -439,7 +441,12 @@ class SandboxRuntimeContext:
         setter = getattr(self.executor, "set_entry_limit", None)
         if setter is None:
             return None
-        return setter(entries, limit)
+        if stamps is None:
+            return setter(entries, limit)
+        try:
+            return setter(entries, limit, stamps)
+        except TypeError:
+            return setter(entries, limit)
 
     @property
     def mcp_token(self) -> str | None:

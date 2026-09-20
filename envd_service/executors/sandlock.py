@@ -876,7 +876,9 @@ class SandlockExecutor(Executor):
             logger.debug("read_write_counters unavailable", exc_info=True)
             return None
 
-    def set_entry_limit(self, entries: int, limit: int) -> dict | None:
+    def set_entry_limit(
+        self, entries: int, limit: int, stamps: tuple[int, int] | None = None
+    ) -> dict | None:
         """Ask the live slot to cap how many names the tree may hold (N31).
 
         ``None`` means no live instance or a slot that does not know the verb,
@@ -887,7 +889,12 @@ class SandlockExecutor(Executor):
         if setter is None:
             return None
         try:
-            return setter(int(entries), int(limit))
+            if stamps is None:
+                return setter(int(entries), int(limit))
+            try:
+                return setter(int(entries), int(limit), stamps)
+            except TypeError:
+                return setter(int(entries), int(limit))
         except Exception:  # noqa: BLE001 - a capability answer, never a crash
             logger.warning(
                 "update_entry_limit refused for sandbox %s",

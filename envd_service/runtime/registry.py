@@ -441,7 +441,8 @@ class RuntimeRegistry:
                 self._note_budget_crossing(record, reported)
                 self._maybe_tighten(record, reported, stamps)
                 if entries is not None:
-                    self._maybe_tighten_entries(record, entries)
+                    entry_stamps = None if stamps is None else (stamps[2], stamps[3])
+                    self._maybe_tighten_entries(record, entries, entry_stamps)
             scanned += 1
         if dirty:
             self._log_dirty_split()
@@ -715,7 +716,12 @@ class RuntimeRegistry:
                 budget,
             )
 
-    def _maybe_tighten_entries(self, record: RuntimeSandbox, entries: int) -> None:
+    def _maybe_tighten_entries(
+        self,
+        record: RuntimeSandbox,
+        entries: int,
+        stamps: tuple[int, int] | None = None,
+    ) -> None:
         """Tell the sandbox how many names its tree holds, and the cap (N31).
 
         Why this axis exists: the byte budget cannot see a tree that grows by
@@ -757,7 +763,7 @@ class RuntimeRegistry:
             self._entry_tightened[record.sandbox_id] = entries
             self._entry_tightened_at[record.sandbox_id] = now
         try:
-            applied = tightener(record.sandbox_id, entries, limit)
+            applied = tightener(record.sandbox_id, entries, limit, stamps)
         except Exception:  # noqa: BLE001 - never break a scan round over this
             logger.warning(
                 "entry tightening failed for %s", record.sandbox_id, exc_info=True

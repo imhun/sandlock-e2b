@@ -1235,8 +1235,11 @@ class RouteBInstance:
             return None
         return payload if isinstance(payload, dict) else None
 
-    def read_write_counters(self) -> tuple[int, int] | None:
-        """The slot's ``(spent, freed)`` write counters, or ``None`` (N25).
+    def read_write_counters(self) -> tuple[int, int, int, int] | None:
+        """The slot's counters, or ``None`` (N25/N31).
+
+        ``(spent, freed, entries_created, entries_removed)``: the first two
+        date a *byte* walk, the last two an *entry* walk.
 
         Read *before* walking the tree, then handed back with the budget, so
         the number the worker sends stays honest about when it was true. An
@@ -1253,20 +1256,32 @@ class RouteBInstance:
         freed = payload.get("freed")
         if not isinstance(spent, int) or not isinstance(freed, int):
             return None
-        return spent, freed
+        created = payload.get("created")
+        removed = payload.get("removed")
+        if not isinstance(created, int) or not isinstance(removed, int):
+            # An older binary: bytes can be dated, entries cannot.
+            created = removed = 0
+        return spent, freed, created, removed
 
-    def set_entry_limit(self, entries: int, limit: int) -> dict | None:
+    def set_entry_limit(
+        self, entries: int, limit: int, stamps: tuple[int, int] | None = None
+    ) -> dict | None:
         """Tell the slot how many names the tree holds, and its cap (N31).
 
         ``limit == 0`` turns the gate off. ``None`` means the slot does not
         know the verb (an older binary), which the caller treats as "no entry
         gate available" -- the byte ceiling still holds.
+
+        ``stamps`` is ``(created, removed)`` from :meth:`read_write_counters`,
+        read before the walk: without them the anchor is the moment the count
+        arrived, and a 200-entry cap let **213** names through on the cluster.
         """
+        args: dict[str, int] = {"entries": int(entries), "limit": int(limit)}
+        if stamps is not None:
+            args["created"] = int(stamps[0])
+            args["removed"] = int(stamps[1])
         try:
-            payload = self.request(
-                "update_entry_limit",
-                {"entries": int(entries), "limit": int(limit)},
-            )
+            payload = self.request("update_entry_limit", args)
         except SandboxError:
             return None
         return payload if isinstance(payload, dict) else None

@@ -34,7 +34,9 @@ def test_the_entry_cap_is_off_by_default(tmp_path):
     registry = _registry(tmp_path, "sbx_off")
     _tree(tmp_path, "sbx_off")
     sent: list[tuple[str, int, int]] = []
-    registry.set_entry_tightener(lambda sid, entries, limit: sent.append((sid, entries, limit)))
+    registry.set_entry_tightener(
+        lambda sid, entries, limit, stamps=None: sent.append((sid, entries, limit))
+    )
     record = registry.get("sbx_off")
     registry._maybe_tighten_entries(record, 10_000_000)
     assert sent == []
@@ -46,7 +48,9 @@ def test_the_entry_cap_sends_the_count_and_the_limit(tmp_path):
     registry._max_entries = 100
     registry._entry_interval_s = 0.0
     sent: list[tuple[str, int, int]] = []
-    registry.set_entry_tightener(lambda sid, entries, limit: sent.append((sid, entries, limit)))
+    registry.set_entry_tightener(
+        lambda sid, entries, limit, stamps=None: sent.append((sid, entries, limit))
+    )
     record = registry.get("sbx_cap")
 
     registry._maybe_tighten_entries(record, 10)

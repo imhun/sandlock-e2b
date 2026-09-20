@@ -62,12 +62,14 @@ def test_a_round_dates_its_walk_with_the_counter_provider(tmp_path):
     registry = _registry(tmp_path, "sbx_dated")
     calls, tightener = _recorder()
     registry.set_disk_tightener(tightener)
-    registry.set_counter_provider(lambda sandbox_id: (11, 22))
+    # The provider answers all four counters: two for the bytes, two for the
+    # entries (N31). The byte round only reads the first pair.
+    registry.set_counter_provider(lambda sandbox_id: (11, 22, 33, 44))
 
     registry.disk_usage_snapshot(dirty=True)
 
     assert calls, "the round must have tightened"
-    assert tightener.stamps_seen == [(11, 22)] * len(calls)
+    assert tightener.stamps_seen == [(11, 22, 33, 44)] * len(calls)
 
 
 def test_a_round_without_a_counter_provider_sends_no_date(tmp_path):
