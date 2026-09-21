@@ -1757,8 +1757,19 @@ platform vs du -s -B1: 33792 vs 33792 (diff 0)
 中介本来就按这条打点（`dirty.rs::mark` 取父目录，`mkdirat`/`unlinkat`/`renameat`/`symlinkat`/
 `linkat` 全部覆盖），随机的"记账 == 整树 walk"测试现在把这条写进了夹具的注释。
 
-单测与契约测试的对照跑法：干净树 88 失败（既有）+ 123 失败（既有，contract 通道），
-改动后**集合完全一致**（`comm` 双向为空）。
+**单测与契约测试怎么跑才算数（2026-09-21 修正一次口径）**：第一遍我用的是
+`docker run --privileged … pytest tests/unit`，得到 88 个失败，我把它当成"既有失败"——
+**那是错的**：`Settings` 现在会 fail closed（`E2B_REQUIRE_SECCOMP_FILTER`，`config.py:609`），
+而 `--privileged` 起的容器 `/proc/self/status` 是 `Seccomp: 0` ⇒ 所有构造 worker 配置的用例直接抛
+`SECCOMP_FILTER_MISSING`（那一批占了 88 里的大头）。**按 lane 的形状跑**（`--security-opt
+seccomp=deploy/seccomp/sandlock-worker.json`、`E2B_HOST_PROJECT`、`E2B_TEST_STRICT_SKIPS=1`、
+`E2B_BASE_IMAGE=python-mcp:3.14`）：`tests/unit` = **43 failed / 1177 passed**，其中
+`test_xfs_project_quota_agent`/`test_volume_quota` 这 20 个是这条 lane **明确 deselect** 的
+XFS prjquota 用例（`XFS_DESELECTS`，它们由特权 lane 覆盖）——项目记的"13 个既有失败"就是
+deselect 之后的口径。**对本次改动真正相关的证据**：规范 lane 下这 43 个失败里
+**没有任何一个**来自我改过的模块（`test_dir_ledger` / `test_brief_stat` / `test_priv_helpers` /
+`test_disk_tightening` / `test_registry_dirty_snapshot` / `test_pushed_append_accounting` /
+`test_sandbox_disk_enforcement`），而"改动前 vs 改动后"在同一 lane 下的失败集合逐条相同。
 
 #### 22.5.13 rollout 之后自动预热 base image（N25 的运维收口，2026-09-21）
 
