@@ -529,7 +529,14 @@ def test_remove_and_modes_are_in_process_first(tmp_path: Path, monkeypatch) -> N
     tree = tmp_path / "sandboxes" / "sbx_a"
     (tree / "workspace").mkdir(parents=True)
     (tree / "workspace" / "a.txt").write_bytes(b"0123456789")
-    assert ph.dir_size(tree) == 10
+    # N31 fix 2: the 10 file bytes plus each directory's own `st_size` (on this
+    # NFS a directory is 16 KiB of real space), asserted against an `os.stat`
+    # oracle rather than the implementation's own probe.
+    assert ph.dir_size(tree) == (
+        10
+        + os.stat(tree).st_blocks * 512
+        + os.stat(tree / "workspace").st_blocks * 512
+    )
     ph.remove_tree(tree)
     assert not tree.exists()
 

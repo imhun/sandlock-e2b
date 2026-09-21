@@ -21,9 +21,26 @@ way back under its budget.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from envd_service.runtime.registry import RuntimeRegistry
+
+
+def _dirs_bytes(tree: Path) -> int:
+    """The directories' own ``st_size``, which the walk counts since N31 fix 2.
+
+    Every "the walk governs" expectation below is therefore spelled as
+    ``<file bytes> + this``: the push side of the identity is unchanged (it is
+    a byte count the mediator reports), and the tests that pin the *push*
+    winning keep their plain numbers. Probed with ``os.stat`` rather than
+    ``priv_helpers.dir_size`` so the expectation cannot follow the
+    implementation; the definition is pinned by ``tests/unit/test_dir_ledger.py``.
+    """
+    return sum(
+        os.stat(dirpath).st_blocks * 512
+        for dirpath, _dirs, _files in os.walk(tree)
+    )
 
 
 def _registry(base: Path, sandbox_id: str, *, disk_mb: int = 1024) -> RuntimeRegistry:
@@ -65,7 +82,16 @@ def test_a_round_does_not_count_a_byte_twice_when_the_walk_catches_up(tmp_path):
     # The commit lands: the tree is now 1000 + 4096, and the push adds 1024.
     (tmp_path / "sbx_once" / "workspace" / "a.bin").write_bytes(b"a" * 5096)
     registry.note_appended("sbx_once", 1024)
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_once": 5120}
+    # The identity's two sides, spelled out: the walk (the committed 5096 plus
+    # the directories' own blocks, N31 fix 2) against the rebased push
+    # (4096 + 1024). They differ by 4 bytes here, which is the point -- the
+    # round reports the larger, and neither side counts a byte twice.
+    assert registry.disk_usage_snapshot(dirty=True) == {
+        "sbx_once": max(
+            5096 + _dirs_bytes(tmp_path / "sbx_once"),
+            4096 + 1024,
+        )
+    }
 
 
 def test_a_late_sample_of_bytes_the_walk_already_banked_is_not_added_twice(tmp_path):
@@ -81,11 +107,12 @@ def test_a_late_sample_of_bytes_the_walk_already_banked_is_not_added_twice(tmp_p
     # The walk banks 4000 bytes with nothing pushed: this is the round that
     # re-bases the push side.
     (tmp_path / "sbx_late" / "workspace" / "a.bin").write_bytes(b"a" * 4000)
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_late": 4000}
+    late = 4000 + _dirs_bytes(tmp_path / "sbx_late")
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_late": late}
 
     # Then the mediator's samples of those same bytes arrive late.
     registry.note_appended("sbx_late", 3000)
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_late": 4000}
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_late": late}
 
 
 def test_the_walk_governs_once_the_pushes_stop(tmp_path):
@@ -95,7 +122,10 @@ def test_the_walk_governs_once_the_pushes_stop(tmp_path):
     assert registry.disk_usage_snapshot(dirty=True) == {"sbx_delete": 10 * 1024 * 1024}
 
     (tmp_path / "sbx_delete" / "workspace" / "a.bin").unlink()
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_delete": 0}
+    # The file is gone; the directories' own blocks are all that is left.
+    assert registry.disk_usage_snapshot(dirty=True) == {
+        "sbx_delete": _dirs_bytes(tmp_path / "sbx_delete")
+    }
 
 
 def test_the_appended_bytes_are_consumed_by_the_round_that_reported_them(tmp_path):
@@ -105,7 +135,9 @@ def test_the_appended_bytes_are_consumed_by_the_round_that_reported_them(tmp_pat
 
     # Second round: the same bytes must not be added twice (the walk now sees
     # whatever committed, and the accumulator is empty).
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_consumed": 1000}
+    assert registry.disk_usage_snapshot(dirty=True) == {
+        "sbx_consumed": 1000 + _dirs_bytes(tmp_path / "sbx_consumed")
+    }
 
 
 def test_the_ceiling_refresh_peeks_so_the_round_can_still_take_them(tmp_path):
@@ -122,7 +154,9 @@ def test_appends_for_an_unknown_sandbox_are_ignored_by_the_round(tmp_path):
     registry = _registry(tmp_path, "sbx_known")
     registry.note_appended("sbx_other", 8192)
 
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_known": 1000}
+    assert registry.disk_usage_snapshot(dirty=True) == {
+        "sbx_known": 1000 + _dirs_bytes(tmp_path / "sbx_known")
+    }
 
 
 def test_a_non_positive_append_is_not_counted(tmp_path):
@@ -130,7 +164,9 @@ def test_a_non_positive_append_is_not_counted(tmp_path):
     registry.note_appended("sbx_zero", 0)
     registry.note_appended("sbx_zero", -5)
 
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_zero": 1000}
+    assert registry.disk_usage_snapshot(dirty=True) == {
+        "sbx_zero": 1000 + _dirs_bytes(tmp_path / "sbx_zero")
+    }
 
 
 def test_appends_accumulate_until_a_round_takes_them(tmp_path):
@@ -141,7 +177,9 @@ def test_appends_accumulate_until_a_round_takes_them(tmp_path):
 
     # 6 bytes of appends is far below what the walk already sees, and the walk
     # is the floor: the number may never be smaller than it.
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_sum": 1000}
+    assert registry.disk_usage_snapshot(dirty=True) == {
+        "sbx_sum": 1000 + _dirs_bytes(tmp_path / "sbx_sum")
+    }
 
 
 def test_unregistering_drops_the_accumulator(tmp_path):
@@ -156,7 +194,9 @@ def test_unregistering_drops_the_accumulator(tmp_path):
     )
 
     # A re-created id must not inherit the previous incarnation's bytes.
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_gone": 1000}
+    assert registry.disk_usage_snapshot(dirty=True) == {
+        "sbx_gone": 1000 + _dirs_bytes(tmp_path / "sbx_gone")
+    }
 
 
 def test_a_crossing_seen_only_through_pushed_bytes_is_still_a_crossing(tmp_path):

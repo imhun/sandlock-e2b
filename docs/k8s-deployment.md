@@ -1720,10 +1720,68 @@ description），所以"现在多大"只差一次 `fdinfo` 读——现在 `is_e
 不是容量。顺带量到建条目本身很贵：**200 个空文件 ≈ 4.2 s（≈21 ms/个）**，且这个速率在 200→2000 之间
 不随目录变大而改善；`rm -rf` 2000 个文件 20.8 s；一条命令里建 20000 个文件会把命令的响应流打断。
 
-**顺带记一条运维事实**：每次 worker 滚动重启都可能把 base image 预热打断，缓存目录里只剩
-`…sha256_….lock`（没有实体目录），此时 `Sandbox.create()` 会回 `428 warm_required`，多机 smoke 因此失败。
-预热端点是 **POST**（GET 只是查询）：`POST /agent/images/<urlencoded-ref>/warm`，带 `X-Internal-Key`
-打在该 worker 的 `127.0.0.1:49983` 上。
+**已收口（2026-09-21，`0.1.0-425-…-20260921-172405`）：目录按「实际分配」计费，不是 `st_size`。**
+先说清被实测推翻的前提：N31 记的是「NFS 每目录至少 16 KiB 的目录块」，但在这台 NAS 上
+**目录的 `st_size` 不是它占的空间**——空目录 `st_size=4096`、2000 个条目时 `st_size=16384`，
+而 `st_blocks×512` 与 `du -s` **全程都是 512**（`tmp/k0s/probe_dir_cost.py`，0/10/200/1000/2000
+五档，逐档打印）。所以修法② 落成 **`st_blocks × 512`**（`brief_stat.directory_cost`），文件侧维持
+原来的 `entry_size` 口径不变；若按 `st_size` 计费，平台数会比沙箱自己的 `du` **更远**，正好与验收
+判据相反。
+
+改动面（三处求和 + 一个输出 + 契约测试）：
+
+| 落点 | 变化 |
+|---|---|
+| `deploy/priv/maint.c` | `walk` 对目录输出 `st_blocks×512`；**每个条目只输出一次**（`FTS_D` 与 `FTS_DP` 曾让每个目录打印两行，`walk` 实测确认过；Python 侧一旦开始累加目录，这就会双计） |
+| `envd_service/runtime/dir_ledger.py` | `scan_subtree` 的每目录项 = `directory_cost(dir)` + 该目录下的文件 |
+| `envd_service/priv_helpers.py` | 模块级 `dir_size`（in-process）与 `PrivHelpers.dir_size`（broker，累加 `f`/`d`）同一口径 |
+| `envd_service/http/health.py` | `/metrics` 的兜底分支同口径（它只在前两条都读不到时才走到，但不能第三套定义） |
+| `tests/unit/test_dir_ledger.py` 等 6 个测试文件 | 期望值改成 `<文件字节> + 目录 `st_blocks×512`（用 `os.stat` 独立探测，不调用被测代码），并新增「只含空目录的树」一条契约测试 |
+
+**集群实测（`tmp/k0s/probe_dir_stsize.py`，两类独立测量）**：沙箱内建 40 个目录 + 1 个 4096 B 文件
+（外加一棵只有目录的树）：
+
+```
+inside the sandbox: files+dir-blocks=33792 file-only=4096 du=33792
+  directory allocation the old definition missed: 29696 bytes
+reported by the platform: 33792
+platform == sandbox measurement, byte for byte (33792)
+platform vs du -s -B1: 33792 vs 33792 (diff 0)
+```
+
+即：平台数与沙箱内独立测量**逐字节相等**，并且与 `du -s` **完全相同**（做之前这一格是 4096 vs 33792）。
+一处副产品：`note_local_write`（MCP token 那个平台写）原来只标"被写路径的父目录"，而
+`mkdir(parents=True)` 会给**每一层**一个新名字 ⇒ 上层的自身尺寸变化没人重扫（实测在
+`test_a_dirty_report_matches_the_walk` 里表现为少报 6 字节）；现在它从写入点一路标到账本根。
+`E2B_DISK_ENFORCE_DIRTY` 的增量路径因此多一条纪律：**结构变化必须标记"容纳该名字的目录"**，
+中介本来就按这条打点（`dirty.rs::mark` 取父目录，`mkdirat`/`unlinkat`/`renameat`/`symlinkat`/
+`linkat` 全部覆盖），随机的"记账 == 整树 walk"测试现在把这条写进了夹具的注释。
+
+单测与契约测试的对照跑法：干净树 88 失败（既有）+ 123 失败（既有，contract 通道），
+改动后**集合完全一致**（`comm` 双向为空）。
+
+#### 22.5.13 rollout 之后自动预热 base image（N25 的运维收口，2026-09-21）
+
+一次滚动重启可以打断 base image 的解包，缓存里只剩 `…sha256_….lock`，之后该节点的
+`Sandbox.create()` 回 **428 warm_required**（e2b SDK 不发 `X-Sandbox-Id`，也不认识 428）。
+现在两条部署路径都在 rollout 之后自动预热，共用一份 HTTP 契约
+（`deploy/scripts/warm_base_image.py`：先 GET 查询、再按需 POST、末尾一行 `RESULT … cached=…`，
+不热就非零退出），并且都**在 worker 容器里执行**（agent 监听容器自己的 `0.0.0.0:49983`）：
+
+| 路径 | 做法 | 关闭开关 |
+|---|---|---|
+| `deploy/k8s-k0s/apply.sh` | `rollout status` 之后对每个 `app=e2b-worker` pod：`kubectl exec -i … python3 - … < warm_base_image.py` | `SKIP_WARM=1` |
+| `deploy/scripts/upgrade.sh` | 同一份脚本 base64 进远端命令，`docker compose … exec -T worker-N python3 -` | `--skip-warm` |
+
+**集群实测（2026-09-21）**：
+
+* 热节点（正常 rollout 后）：两个 worker 都是 `peek {"cached": true}` ⇒ `RESULT … warmed=skipped`，
+  不需要任何手动 POST；
+* **冷节点**（把解出来的 rootfs 挪走、只留 `.lock`，正是运维事实描述的那个形状）：
+  `peek {"cached": false}` → POST → `RESULT … cached=true warmed=yes`，整轮 **18.8 s**
+  （与 §14.2 量的 18.1 s 冷解析一致）；
+* 失败语义：预热失败的节点会被点名，`apply.sh`/`upgrade.sh` 非零退出，不再让后面的 smoke
+  去替它暴露 428。
 
 #### 22.5.11 单文件天花板到底盖住了哪些写路径（N25，2026-09-20）
 

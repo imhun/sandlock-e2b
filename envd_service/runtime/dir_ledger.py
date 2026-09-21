@@ -44,7 +44,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
 
-from envd_service.runtime.brief_stat import entry_size
+from envd_service.runtime.brief_stat import directory_cost, entry_size
 
 logger = logging.getLogger(__name__)
 
@@ -82,14 +82,25 @@ class SubtreeScan(NamedTuple):
 
 
 def scan_subtree(root: Path, rel: str) -> SubtreeScan:
-    """``{relative directory: own non-directory bytes}`` under ``root/rel``.
+    """``{relative directory: the bytes it owns}`` under ``root/rel``.
 
     ``rel`` itself is always present (possibly with 0 bytes), so a caller
     replacing a subtree has something to subtract even for a directory that
-    became empty. Symlinks are counted by their target's size and never
-    followed as directories -- exactly what ``os.walk`` plus the same size
-    probe does in ``priv_helpers.dir_size``, which is the number this must
-    match.
+    became empty.
+
+    A directory's entry is its **allocated size** plus the sizes of the files
+    it contains: N31's fix 2.  The file-only number could not see a tree that
+    grows by names -- 2000 empty entries moved it by 0 -- and the platform
+    number is what the quota is decided on, so the directories count now.
+    The term is ``st_blocks x 512`` rather than ``st_size``: measured on the
+    cluster's NAS (2026-09-21) a directory's ``st_size`` was 4096 empty and
+    16384 at 2000 entries while its allocation and ``du -s`` stayed at **512**
+    the whole way, so `st_size` would have moved the platform's number away
+    from the sandbox's own ``du`` (`brief_stat.directory_cost` carries the
+    numbers). Symlinks are counted by their target's size and never followed
+    as directories -- exactly what ``os.walk`` plus the same probes do in
+    ``priv_helpers.dir_size``, which is the number this must match byte for
+    byte.
     """
 
     start = root / rel if rel else root
@@ -104,7 +115,11 @@ def scan_subtree(root: Path, rel: str) -> SubtreeScan:
             rel_dir = os.path.relpath(dirpath, root)
             if rel_dir == ".":
                 rel_dir = ""
-            owned = 0
+            # The directory's own allocation first (N31 fix 2), then its files.
+            try:
+                owned = directory_cost(dirpath)
+            except OSError:
+                owned = 0
             counts[rel_dir] = len(files)
             for name in files:
                 try:
@@ -155,6 +170,11 @@ class DirLedger:
     def ready(self) -> bool:
         """Whether a baseline exists (a ledger that is not ready has no total)."""
         return self._ready
+
+    @property
+    def root(self) -> Path:
+        """The tree this ledger accounts for (marks are relative to it)."""
+        return self._root
 
     @property
     def total_bytes(self) -> int:

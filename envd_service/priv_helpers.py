@@ -570,9 +570,31 @@ class PrivHelpers:
         return entries
 
     def dir_size(self, path: str | Path) -> int:
-        """Regular-file bytes under ``path`` (the ``/metrics`` disk number)."""
+        """Bytes under ``path``: regular files plus every directory's own cost.
+
+        The directory term is N31's fix 2.  A tree costs space for its *names*
+        as well as its data: a sandbox that creates 2000 empty entries spends
+        real space (measured on the cluster's NAS: 512 bytes of directory
+        blocks per directory) without moving the old, file-only number at all
+        (that run reported the platform number unchanged at 0).  ``walk``
+        reports each directory once and carries its **allocated** size
+        (``st_blocks x 512``; see
+        :func:`envd_service.runtime.brief_stat.directory_cost` -- on this NAS a
+        directory's ``st_size`` is 8-32x that and `du` agrees with the blocks),
+        so the sum here is the same quantity :func:`dir_size` computes below
+        and :func:`envd_service.runtime.dir_ledger.scan_subtree` maintains
+        incrementally -- byte equality between them is the contract.
+
+        Symlinks are the one place the two sides of this module still differ,
+        and it is pre-existing: the in-process walk follows one (``entry_size``
+        answers like ``os.path.getsize``) while this broker walk is
+        ``FTS_PHYSICAL`` and never follows, so an ``l`` entry contributes
+        nothing here.  N31's fix 2 does not change that either way; a tree
+        without symlinks -- every tree measured for the quota work so far --
+        sees the two agree exactly.
+        """
         return sum(
-            entry.size for entry in self.walk(path) if entry.kind == "f"
+            entry.size for entry in self.walk(path) if entry.kind in ("f", "d")
         )
 
     def slot_spawner(
@@ -745,11 +767,20 @@ def remove_tree(path: str | Path, *, on_error: str = "ignore") -> None:
 
 
 def dir_size(path: str | Path) -> int | None:
-    """File bytes under ``path`` for ``/metrics``; ``None`` means "unknown".
+    """Bytes under ``path`` for ``/metrics``; ``None`` means "unknown".
 
     In-process first (the worker's group access reaches a ``0770`` tenant
     workspace), broker on EACCES (a ``0700`` subdirectory the sandbox made, or
     a ``1777`` volume root full of foreign-owned files).
+
+    The quantity is *files plus directories*: each directory the walk visits
+    contributes its allocated size (``st_blocks x 512``), which the file-only
+    number never saw (N31: 2000 empty entries moved the platform number by 0
+    bytes; measured 2026-09-21, that space is 512 bytes per directory on this
+    NAS even at 2000 entries, while the directory's ``st_size`` -- 4096 to
+    16384 -- is not what `du` reports). `DirLedger` maintains the same number
+    incrementally and the byte equality between the two is a pinned contract
+    (`tests/unit/test_dir_ledger.py`).
 
     The size comes from :func:`envd_service.runtime.brief_stat.entry_size`
     rather than ``os.path.getsize``: on NFS the latter flushes a file's dirty
@@ -760,13 +791,17 @@ def dir_size(path: str | Path) -> int | None:
     """
     total = 0
 
-    from envd_service.runtime.brief_stat import entry_size
+    from envd_service.runtime.brief_stat import directory_cost, entry_size
 
     def _raise(exc: OSError) -> None:
         raise exc
 
     try:
         for root, _dirs, files in os.walk(path, onerror=_raise):
+            try:
+                total += directory_cost(root)
+            except OSError:
+                pass
             for name in files:
                 try:
                     total += entry_size(os.path.join(root, name))

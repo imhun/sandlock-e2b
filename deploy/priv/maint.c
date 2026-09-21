@@ -11,6 +11,15 @@
  *   rm     --path P                          sandbox teardown
  *   walk   --path P                          size/owner scans (metrics, reconcile)
  *
+ * `walk` prints one line per entry -- "<kind> <uid> <gid> <mode-octal> <size>
+ * <path>", kind `d` for a directory, `f` for a regular file, `l` for a
+ * symlink -- and never the same entry twice, because the byte accounting that
+ * consumes it sums the directories too.  For a directory the size is its
+ * **allocated** bytes (`st_blocks x 512`), not `st_size`: measured on the
+ * cluster's NAS (2026-09-21) `st_size` was 4096 for an empty directory and
+ * 16384 at 2000 entries while `st_blocks` and `du -s` stayed at 512 the whole
+ * way, and the consumer's contract is to be the number `du` reports.
+ *
  * Every path is `realpath`-resolved and must land under `<workspace_base>/` or
  * `<shared_volume_root>/`; symlinks are never followed while recursing
  * (`FTS_PHYSICAL` + `lchown`/`unlinkat` semantics), so a tenant cannot plant a
@@ -125,7 +134,6 @@ static int remove_tree(const char *root) {
 static char walk_kind(const FTSENT *entry) {
     switch (entry->fts_info) {
     case FTS_D:
-    case FTS_DP:
     case FTS_DC:
         return 'd';
     case FTS_F:
@@ -146,15 +154,31 @@ static int walk_tree(const char *root) {
         return -1;
     }
     while ((entry = fts_read(tree)) != NULL) {
+        /* Each entry exactly once.  FTS visits a directory twice -- FTS_D
+         * before its contents and FTS_DP after -- and the caller sums the
+         * directories' own st_size as well as the files' (N31 fix 2: on NFS a
+         * directory costs 16 KiB of real space that the byte ledger used to
+         * ignore entirely), so emitting the post-order visit too would count
+         * every directory's blocks twice.  The pre-order visit is the one
+         * that matches os.walk's `dirpath`, which is the number this must
+         * agree with byte for byte. */
+        if (entry->fts_info == FTS_DP) {
+            continue;
+        }
         char kind = walk_kind(entry);
         const struct stat *st = entry->fts_statp;
         if (st == NULL) {
             continue;
         }
+        /* A directory is charged its allocation, not its st_size (see the
+         * header): the block count is in 512-byte units by definition. */
+        long long size = (kind == 'd')
+                             ? (long long)st->st_blocks * 512
+                             : (long long)st->st_size;
         /* "<kind> <uid> <gid> <mode-octal> <size> <path>" */
         if (printf("%c %lu %lu %o %lld %s\n", kind, (unsigned long)st->st_uid,
                    (unsigned long)st->st_gid, (unsigned int)(st->st_mode & 07777),
-                   (long long)st->st_size, entry->fts_accpath) < 0) {
+                   size, entry->fts_accpath) < 0) {
             fts_close(tree);
             return -1;
         }

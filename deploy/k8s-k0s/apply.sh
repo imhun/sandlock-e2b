@@ -9,10 +9,17 @@
 #   KUBECONFIG=... deploy/k8s-k0s/apply.sh            # 版本取自 deploy/stack/.version
 #   VERSION=1.2.3 KUBECONFIG=... deploy/k8s-k0s/apply.sh
 #   DRY_RUN=1 ... deploy/k8s-k0s/apply.sh             # 只渲染不 apply
+#   SKIP_WARM=1 ... deploy/k8s-k0s/apply.sh           # 不预热 base image
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+NAMESPACE="${NAMESPACE:-sandlock}"
+
+#: The in-container warmer (`deploy/scripts/warm_base_image.py`): the agent
+#: listens on the container's own 0.0.0.0:49983, so the script travels to the
+#: pod over stdin instead of being dialled from here.
+WARM_HELPER="$REPO_ROOT/deploy/scripts/warm_base_image.py"
 
 VERSION="${VERSION:-$(cat "$REPO_ROOT/deploy/stack/.version" 2>/dev/null || true)}"
 if [ -z "$VERSION" ]; then
@@ -35,3 +42,49 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
 fi
 
 printf '%s\n' "$rendered" | kubectl apply -f -
+
+# --- rollout 之后预热 base image（N25 / §22.5.10 那条运维事实）---------------
+# 一次滚动重启可以打断正在进行的解包，缓存目录里只剩 `…sha256_….lock`（没有实体
+# 目录）；此时该节点的 `Sandbox.create()` 回 **428 warm_required** —— 而 e2b SDK
+# 既不发 `X-Sandbox-Id` 也不认识 428，于是"节点冷"表现成一次与沙箱无关的冒烟失败。
+# 在这里补一个预热步骤把窗口关掉：GET 只查询（不落地），**POST 才真的解包**，两者
+# 都幂等。打在每个 pod 自己的 agent 上，所以 `kubectl exec` 进容器跑。
+if [ "${SKIP_WARM:-0}" = "1" ]; then
+    echo "跳过 base image 预热（SKIP_WARM=1）"
+    exit 0
+fi
+
+[ -f "$WARM_HELPER" ] || { echo "缺少 $WARM_HELPER" >&2; exit 1; }
+
+echo "等待 worker 滚动完成"
+kubectl -n "$NAMESPACE" rollout status statefulset/e2b-worker --timeout=300s
+
+image="$(kubectl -n "$NAMESPACE" get statefulset e2b-worker \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="E2B_BASE_IMAGE")].value}')"
+if [ -z "$image" ]; then
+    echo "无法从 statefulset/e2b-worker 读到 E2B_BASE_IMAGE" >&2
+    exit 1
+fi
+key="$(kubectl -n "$NAMESPACE" get secret e2b-secrets \
+    -o jsonpath='{.data.E2B_INTERNAL_API_KEY}' | base64 -d)"
+if [ -z "$key" ]; then
+    echo "无法从 secret/e2b-secrets 读到 E2B_INTERNAL_API_KEY" >&2
+    exit 1
+fi
+
+warm_failures=0
+while read -r pod; do
+    [ -n "$pod" ] || continue
+    echo "预热 $pod：$image"
+    if ! kubectl -n "$NAMESPACE" exec -i "$pod" -- \
+        python3 - --image "$image" --key "$key" < "$WARM_HELPER"; then
+        warm_failures=$((warm_failures + 1))
+    fi
+done < <(kubectl -n "$NAMESPACE" get pods -l app=e2b-worker \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+
+if [ "$warm_failures" != 0 ]; then
+    echo "有 $warm_failures 个 worker 预热失败：这些节点的首个 create 会回 428 warm_required" >&2
+    exit 1
+fi
+echo "base image 已在每个 worker 就绪（peek cached=true）"

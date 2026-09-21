@@ -614,13 +614,31 @@ class RuntimeRegistry:
         (the MCP gateway token is the one that lands inside the tree at
         runtime). Those are our own code, so they are marked at the write
         point: no inference, no extra walk.
+
+        The mark is the written path's directory **and every directory above it
+        up to the tree root**: since N31 fix 2 a directory's own ``st_size`` is
+        part of the number, and the ``mkdir(parents=True)`` that precedes this
+        write gives a *new name* to each level -- the token the caller names is
+        two levels down, but the tree root is the directory that received
+        ``etc``, so a mark set of ``{<tree>/etc}`` left the root's own entry
+        stale (measured: the ledger under-reported by exactly the 6 bytes the
+        root grew, ``tests/unit/test_registry_dirty_snapshot.py``). Marking an
+        ancestor of a deeper mark costs that ancestor's subtree, because the
+        mark set is reduced to its shallowest member; the only caller runs
+        once per sandbox (``start_mcp_gateway`` caches), where one walk is
+        cheap next to being wrong.
         """
         with self._lock:
             ledger = self._ledgers.get(sandbox_id)
         if ledger is None or not ledger.ready:
             return
+        marks: list[Path] = []
+        for directory in (Path(path).parent, *Path(path).parent.parents):
+            marks.append(directory)
+            if directory == ledger.root:
+                break
         try:
-            ledger.apply([Path(path).parent])
+            ledger.apply(marks)
         except DirLedgerUnknown:
             ledger.invalidate()
 

@@ -10,10 +10,26 @@ walk it replaces, not against itself.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from envd_service.priv_helpers import dir_size
 from envd_service.runtime.registry import RuntimeRegistry
+
+
+def _dirs_bytes(tree: Path) -> int:
+    """The directories' own ``st_size``, which the number includes since N31 fix 2.
+
+    Probed with ``os.stat`` rather than ``priv_helpers.dir_size`` so an
+    expectation here cannot follow the implementation; the definition itself is
+    pinned by ``tests/unit/test_dir_ledger.py``. The totals below stay spelled
+    as ``<file bytes> + this`` so the assertion still says what the *file* part
+    is (the number the old, file-only accounting produced).
+    """
+    return sum(
+        os.stat(dirpath).st_blocks * 512
+        for dirpath, _dirs, _files in os.walk(tree)
+    )
 
 
 def _tree(base: Path, sandbox_id: str) -> Path:
@@ -54,10 +70,14 @@ def test_a_dirty_report_matches_the_walk(tmp_path):
         else None
     )
 
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_dirty": 1000}
+    assert registry.disk_usage_snapshot(dirty=True) == {
+        "sbx_dirty": 1000 + _dirs_bytes(tree)
+    }
 
     (tree / "workspace" / "deep" / "c.txt").write_bytes(b"c" * 7)
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_dirty": 1007}
+    assert registry.disk_usage_snapshot(dirty=True) == {
+        "sbx_dirty": 1007 + _dirs_bytes(tree)
+    }
     assert registry.disk_usage_snapshot(dirty=True)["sbx_dirty"] == dir_size(tree)
 
 
@@ -94,10 +114,15 @@ def test_the_reconcile_backstop_catches_a_write_the_mediator_cannot_see(tmp_path
     registry = _registry(tmp_path, "sbx_blind")
     tree = _tree(tmp_path, "sbx_blind")
     registry.set_dirty_provider(lambda sandbox_id: ([], False))
-    registry.disk_usage_snapshot(dirty=True)  # baseline + ledger
+    # Baseline + ledger. The number is captured rather than re-derived: the
+    # point of the assertion below is that it *does not move*, and the write it
+    # cannot see also grows `workspace`'s own entry (the file is a new name in
+    # it), so a fresh `dir_size` would not be the baseline either.
+    baseline = registry.disk_usage_snapshot(dirty=True)["sbx_blind"]
+    assert baseline == 1000 + _dirs_bytes(tree)
 
     (tree / "workspace" / "invisible.bin").write_bytes(b"i" * 4096)
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_blind": 1000}
+    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_blind": baseline}
 
     # Make the baseline look older than the reconcile interval.
     registry._dirty_reconcile_s = 900.0

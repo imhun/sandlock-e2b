@@ -10,9 +10,13 @@
 #       with --version or VERSION=) unless --keep-image-tags
 #   * docker compose pull + up -d --no-build on the target
 #   * wait, then verify containers and worker registration
+#   * warm each worker's base image (POST /agent/images/<ref>/warm inside the
+#     container): a rollout can interrupt an extraction and leave a cold node
+#     that answers 428 warm_required on the next create (skip with --skip-warm)
 #   * run smoke tests (skip with --skip-smoke)
 #
 # Usage: ./deploy/scripts/upgrade.sh [--build] [--version <v>] [--env-file <path>] [--skip-smoke] [--force-env] [--keep-image-tags] [--allow-tag-base-image]
+#                                     [--skip-warm]
 #                                     [--with-quota-agent] [--without-quota-agent]
 #                                     [--rotate-internal-key] [--finalize-internal-key-rotation <old-key>]
 #                                     [--rotate-secret-master-key] [--finalize-secret-master-key-rotation <old-key>]
@@ -22,6 +26,7 @@ set -euo pipefail
 
 BUILD=0
 SKIP_SMOKE=0
+SKIP_WARM="${SKIP_WARM:-0}"
 FORCE_ENV=0
 KEEP_IMAGE_TAGS=0
 ALLOW_TAG_BASE_IMAGE=0
@@ -39,6 +44,7 @@ while [ $# -gt 0 ]; do
         --version) VERSION_ARG="$2"; shift ;;
         --env-file) ENV_FILE="$2"; shift ;;
         --skip-smoke) SKIP_SMOKE=1 ;;
+        --skip-warm) SKIP_WARM=1 ;;
         --force-env) FORCE_ENV=1 ;;
         --keep-image-tags) KEEP_IMAGE_TAGS=1 ;;
         --allow-tag-base-image) ALLOW_TAG_BASE_IMAGE=1 ;;
@@ -326,6 +332,39 @@ run_as_deploy "cd '$REMOTE_DIR' && docker inspect sandlock-control-plane-1 --for
 say "检查 worker 注册"
 INTERNAL_KEY="$(remote_env_value E2B_INTERNAL_API_KEY)"
 run_target "set -o pipefail; for i in 1 2 3 4 5 6; do OUT=\$(curl -s -m 5 -H 'X-Internal-Key: $INTERNAL_KEY' http://127.0.0.1:3000/internal/nodes) && [ -n \"\$OUT\" ] && break; sleep 5; done; printf '%s' \"\$OUT\" | python3 -c 'import sys,json; d=json.load(sys.stdin); [print(\"{:12} {:8} mem={}/{}\".format(n[\"nodeID\"], n[\"status\"], n[\"reservedMemoryMB\"], n[\"totalMemoryMB\"])) for n in d]'"
+
+# --- rollout 之后预热 base image（N25 / §22.5.10 那条运维事实）---------------
+# 一次滚动重启可以打断正在进行的解包，缓存目录里只剩 `…sha256_….lock`（没有实体
+# 目录）；此时该节点的 `Sandbox.create()` 回 **428 warm_required** —— 而 e2b SDK
+# 既不发 `X-Sandbox-Id` 也不认识 428，于是"节点冷"表现成一次与沙箱无关的冒烟失败。
+# 这里把窗口关掉：GET 只查询（不落地），**POST 才真的解包**，两者都幂等；脚本送进
+# 容器执行（agent 监听的是容器里的 0.0.0.0:49983，compose 并未把它发布到宿主机）。
+if [ "$SKIP_WARM" = "1" ]; then
+    say "跳过 base image 预热（--skip-warm）"
+else
+    BASE_IMAGE="$(env_file_value "${ENV_FILE:-/dev/null}" E2B_BASE_IMAGE)"
+    if [ -z "$BASE_IMAGE" ]; then
+        say "警告：.env 里读不到 E2B_BASE_IMAGE，跳过预热（节点可能回 428）"
+    else
+        say "预热 base image（每个 worker 各一次）：$BASE_IMAGE"
+        # The helper is shipped as base64 inside the (already base64-transported)
+        # remote command: nothing has to be installed on the target, and the
+        # container needs no copy of the checkout.
+        WARM_B64="$(base64 < "$SCRIPT_DIR/warm_base_image.py" | tr -d '\n')"
+        WARM_FAILURES=0
+        for svc in worker-1 worker-2; do
+            say "预热 $svc"
+            if ! run_as_deploy "cd '$REMOTE_DIR' && printf '%s' '$WARM_B64' | base64 -d | docker compose -f docker-compose.prod.yml $QUOTA_PROFILE_ARGS exec -T $svc python3 - --image '$BASE_IMAGE' --key '$INTERNAL_KEY'"; then
+                WARM_FAILURES=$((WARM_FAILURES + 1))
+            fi
+        done
+        if [ "$WARM_FAILURES" != 0 ]; then
+            echo "有 $WARM_FAILURES 个 worker 预热失败：这些节点的首个 create 会回 428 warm_required" >&2
+            exit 1
+        fi
+        say "base image 已在每个 worker 就绪（peek cached=true）"
+    fi
+fi
 
 if [ "$SKIP_SMOKE" != "1" ]; then
     say "运行冒烟验证"

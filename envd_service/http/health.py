@@ -40,9 +40,19 @@ def _dir_size(path: Path) -> int:
     brokered = priv_helpers.dir_size(path)
     if brokered is not None:
         return brokered
+    # Same quantity as `priv_helpers.dir_size` (N31 fix 2): the files
+    # (`entry_size`) plus each directory's allocated size (`directory_cost` --
+    # `st_blocks x 512`, which is what `du` reports; `st_size` is 8-32x that on
+    # this NAS). This branch only runs when neither the worker's own DAC nor
+    # the broker can read the tree, so it is the last resort -- but it must not
+    # answer a different definition than the path that normally does.
     total = 0
     try:
         for root, dirs, files in os.walk(path):
+            try:
+                total += brief_stat.directory_cost(root)
+            except OSError:
+                pass
             for name in files:
                 try:
                     total += brief_stat.entry_size(os.path.join(root, name))

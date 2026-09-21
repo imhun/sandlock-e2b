@@ -63,17 +63,27 @@ def test_str_and_path_are_both_accepted(tmp_path: Path) -> None:
 
 
 def test_dir_size_sums_the_brief_probe(tmp_path: Path) -> None:
-    """`priv_helpers.dir_size` is the number the ledger is pinned to."""
+    """`priv_helpers.dir_size` is the number the ledger is pinned to.
+
+    The quantity is files **plus each directory's own `st_size`** (N31 fix 2),
+    so the expected total is spelled as the file bytes the old definition
+    produced plus the two directories the fixture has.
+    """
     (tmp_path / "a").mkdir()
     (tmp_path / "a" / "f1").write_bytes(b"1" * 10)
     (tmp_path / "a" / "f2").write_bytes(b"2" * 300)
     (tmp_path / "top").write_bytes(b"3" * 5)
     naive = 0
     for root, _dirs, files in os.walk(tmp_path):
+        naive += os.stat(root).st_blocks * 512
         for name in files:
             naive += os.path.getsize(os.path.join(root, name))
     assert dir_size(tmp_path) == naive
-    assert dir_size(tmp_path) == 315
+    assert dir_size(tmp_path) == (
+        315
+        + os.stat(tmp_path).st_blocks * 512
+        + os.stat(tmp_path / "a").st_blocks * 512
+    )
 
 
 def test_statx_presence_is_reported_consistently() -> None:

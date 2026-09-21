@@ -48,8 +48,11 @@ from typing import Any
 #: 256-byte, architecture-independent `struct statx`.
 _AT_FDCWD = -100
 _STATX_SIZE = 0x0200
+_STATX_BLOCKS = 0x0400
 _STATX_STRUCT_SIZE = 256
 _STATX_SIZE_OFFSET = 40
+#: `stx_blocks` follows `stx_size` in `struct statx`, still in 512-byte units.
+_STATX_BLOCKS_OFFSET = 48
 
 #: `statx` that cannot work at all (no syscall, no libc export) must not cost a
 #: failed call per file, so it is retired on the first such answer.
@@ -116,6 +119,25 @@ def _brief_size(path: str | bytes) -> int:
     )
 
 
+def _brief_blocks(path: str | bytes) -> int:
+    """`stx_blocks x 512` from one `statx(STATX_BLOCKS)`, following symlinks."""
+    statx = _statx
+    raw = os.fsencode(path)
+    buf = getattr(_local, "buf", None)
+    if buf is None:
+        buf = _local.buf = ctypes.create_string_buffer(_STATX_STRUCT_SIZE)
+    if statx(_AT_FDCWD, raw, 0, _STATX_BLOCKS, buf) != 0:
+        err = ctypes.get_errno()
+        if err in _UNAVAILABLE:
+            _retire_statx()
+            raise NotImplementedError("statx is not usable here")
+        raise OSError(err, os.strerror(err), raw)
+    blocks = int.from_bytes(
+        buf[_STATX_BLOCKS_OFFSET : _STATX_BLOCKS_OFFSET + 8], sys.byteorder
+    )
+    return blocks * 512
+
+
 def entry_size(path: str | os.PathLike[str]) -> int:
     """Bytes in ``path``, as `os.path.getsize` reports them, without the flush.
 
@@ -133,4 +155,28 @@ def entry_size(path: str | os.PathLike[str]) -> int:
         return os.stat(path).st_size
 
 
-__all__ = ["entry_size", "statx_available"]
+def directory_cost(path: str | os.PathLike[str]) -> int:
+    """Bytes a **directory** is charged for the accounting walk: its allocation.
+
+    Not `st_size`.  Measured on the cluster's NAS (2026-09-21), a directory's
+    `st_size` is not the space it occupies: an empty directory reported 4096
+    and a 2000-entry one reported 16384, while `st_blocks x 512` and `du -s`
+    both stayed at **512** the whole way.  Charging `st_size` would therefore
+    have moved the platform's number *away* from what the sandbox's own `du`
+    reports (and from what the storage bills) -- the opposite of what the
+    accounting is for -- so the directory term is the allocated size, and the
+    files keep the pre-existing `entry_size` convention.
+
+    Asking for `STATX_BLOCKS` alone is still cheap on NFS: the writeback flush
+    is gated on the *time* fields (see the module docstring), and this request
+    carries none of them.
+    """
+    if not statx_available():
+        return os.stat(path).st_blocks * 512
+    try:
+        return _brief_blocks(path)
+    except NotImplementedError:
+        return os.stat(path).st_blocks * 512
+
+
+__all__ = ["directory_cost", "entry_size", "statx_available"]

@@ -7,7 +7,15 @@
 KUBECONFIG=... deploy/k8s-k0s/apply.sh          # 版本取自 deploy/stack/.version
 VERSION=1.2.3 KUBECONFIG=... deploy/k8s-k0s/apply.sh
 DRY_RUN=1 KUBECONFIG=... deploy/k8s-k0s/apply.sh   # 只渲染
+SKIP_WARM=1 KUBECONFIG=... deploy/k8s-k0s/apply.sh # 不预热 base image
 ```
+
+`apply.sh` 在 `kubectl apply` 之后会等 `rollout status`，再对每个 worker pod 预热 base image
+（`deploy/scripts/warm_base_image.py`，经 `kubectl exec -i … python3 -` 送进容器：agent 监听的是
+容器自己的 `0.0.0.0:49983`，宿主机上没有这个端口）。一次滚动重启可以打断正在进行的解包，缓存里只留
+`…sha256_….lock`，之后该节点的 `Sandbox.create()` 会回 **428 warm_required**（e2b SDK 不发
+`X-Sandbox-Id`、也不认识 428）。预热失败时 `apply.sh` 非零退出并点名还剩几个节点是冷的；
+`docs/k8s-deployment.md` §22.5.10 末尾记了这条事实与两处部署脚本的分工。
 
 ## overlay 改了什么，以及为什么
 

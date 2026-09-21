@@ -76,12 +76,22 @@ def test_worker_reports_the_bytes_it_wrote(workspace):
     # The tree holds *only* what the sandbox wrote: the runtime record lives
     # beside it in ``_runtime/<id>/`` (the platform/workspace split), so the
     # measured number is exactly the user's data -- platform bookkeeping no
-    # longer counts against the sandbox's disk budget.
-    expected = sum(
-        path.stat().st_size for path in Path(tree).rglob("*") if path.is_file()
+    # longer counts against the sandbox's disk budget. Since N31 fix 2 the
+    # number is the files **plus each directory's own `st_size`**, so the two
+    # parts are asserted separately rather than hidden in one sum.
+    entries = list(Path(tree).rglob("*"))
+    files = [path for path in entries if path.is_file()]
+    dirs = [path for path in entries if path.is_dir()]
+    # `rglob("*")` lists what is *under* the tree, so the tree's own entry is
+    # added by hand -- it is the root of the walk and costs its own block too.
+    root_bytes = Path(tree).stat().st_blocks * 512
+    dirs_bytes = sum(path.stat().st_blocks * 512 for path in dirs)
+    expected = root_bytes + dirs_bytes + sum(
+        path.stat().st_size for path in files
     )
     assert registry.disk_usage_snapshot() == {"sbx_disk_a": expected}
-    assert expected == 4096
+    assert sum(path.stat().st_size for path in files) == 4096
+    assert expected == 4096 + root_bytes + dirs_bytes
     assert not (Path(tree) / "sandbox.json").exists()
 
 

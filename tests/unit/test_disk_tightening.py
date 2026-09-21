@@ -13,9 +13,32 @@ make things worse than the slow half would have:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from envd_service.runtime.registry import RuntimeRegistry
+
+
+def _dirs_bytes(tree: Path) -> int:
+    """The directories' own ``st_size``, which the round counts since N31 fix 2.
+
+    Spelled with ``os.stat`` instead of ``priv_helpers.dir_size`` so an
+    expectation here cannot simply follow the implementation; the definition
+    itself is pinned by ``tests/unit/test_dir_ledger.py``.
+    """
+    return sum(
+        os.stat(dirpath).st_blocks * 512
+        for dirpath, _dirs, _files in os.walk(tree)
+    )
+
+
+def _tree_bytes(tree: Path) -> int:
+    """What a round measures: the files plus every directory's own ``st_size``."""
+    total = _dirs_bytes(tree)
+    for dirpath, _dirs, files in os.walk(tree):
+        for name in files:
+            total += os.stat(os.path.join(dirpath, name)).st_size
+    return total
 
 
 def _registry(base: Path, sandbox_id: str, *, disk_mb: int = 100) -> RuntimeRegistry:
@@ -87,10 +110,13 @@ def test_a_round_that_drops_the_remaining_budget_tightens(tmp_path):
     registry = _registry(tmp_path, "sbx_tighten", disk_mb=100)
     calls, tightener = _recorder()
     registry.set_disk_tightener(tightener)
-    # 100 MiB budget, 1 kB used: the remaining budget is sent as the ceiling.
+    # 100 MiB budget, a 1 kB file plus the fixture's directories used: the
+    # remaining budget is sent as the ceiling.
     registry.disk_usage_snapshot(dirty=True)
 
-    assert calls == [("sbx_tighten", 100 * 1024 * 1024 - 1000)]
+    assert calls == [
+        ("sbx_tighten", 100 * 1024 * 1024 - _tree_bytes(tmp_path / "sbx_tighten"))
+    ]
 
 
 def test_nothing_is_sent_twice_for_the_same_remaining(tmp_path):
@@ -123,14 +149,16 @@ def test_a_material_drop_is_sent(tmp_path):
     registry._tighten_step_bytes = 4096
     calls, tightener = _recorder()
     registry.set_disk_tightener(tightener)
+    tree = tmp_path / "sbx_material"
+    before = _tree_bytes(tree)
     registry.disk_usage_snapshot(dirty=True)
 
     (tmp_path / "sbx_material" / "workspace" / "big.bin").write_bytes(b"b" * 65536)
     registry.disk_usage_snapshot(dirty=True)
 
     assert [c[1] for c in calls] == [
-        100 * 1024 * 1024 - 1000,
-        100 * 1024 * 1024 - 66536,
+        100 * 1024 * 1024 - before,
+        100 * 1024 * 1024 - _tree_bytes(tree),
     ]
     assert calls[1][1] < calls[0][1]
 
@@ -158,17 +186,17 @@ def test_a_budget_rise_below_the_step_is_not_sent(tmp_path):
     registry = _registry(tmp_path, "sbx_shrank", disk_mb=100)
     calls, tightener = _recorder()
     registry.set_disk_tightener(tightener)
-    (tmp_path / "sbx_shrank" / "workspace" / "big.bin").write_bytes(b"b" * 1_000_000)
+    tree = tmp_path / "sbx_shrank"
+    (tree / "workspace" / "big.bin").write_bytes(b"b" * 1_000_000)
     registry.disk_usage_snapshot(dirty=True)
-    # The fixture's own 1000-byte file is in the tree too.
-    assert calls[-1][1] == 100 * 1024 * 1024 - (1_000_000 + 1000)
+    # The fixture's own 1000-byte file and its directories are in the tree too.
+    over = 100 * 1024 * 1024 - _tree_bytes(tree)
+    assert calls[-1][1] == over
 
-    (tmp_path / "sbx_shrank" / "workspace" / "big.bin").unlink()
+    (tree / "workspace" / "big.bin").unlink()
     registry.disk_usage_snapshot(dirty=True)
 
-    assert calls[-1][1] == 100 * 1024 * 1024 - (1_000_000 + 1000), (
-        "a sub-step rise changes no decision"
-    )
+    assert calls[-1][1] == over, "a sub-step rise changes no decision"
 
 
 def test_leaving_the_exhausted_state_is_always_sent(tmp_path):
@@ -186,14 +214,18 @@ def test_leaving_the_exhausted_state_is_always_sent(tmp_path):
     registry._tighten_interval_s = 0.0
     # The fixture's own 1000-byte file is in the tree too, so this is 2000
     # bytes *past* the 1 MiB budget: the pool is exhausted.
-    (tmp_path / "sbx_full" / "workspace" / "huge.bin").write_bytes(b"b" * (1024 * 1024 + 1000))
+    tree = tmp_path / "sbx_full"
+    huge = tree / "workspace" / "huge.bin"
+    huge.write_bytes(b"b" * (1024 * 1024 + 1000))
     registry.disk_usage_snapshot(dirty=True)
     assert calls[-1][1] == 0
 
-    # Now 100 bytes *inside* the budget: a rise of 100 bytes, far below the
-    # step, but it is the difference between "may not create anything" and
-    # "may".
-    (tmp_path / "sbx_full" / "workspace" / "huge.bin").write_bytes(b"b" * (1024 * 1024 - 1100))
+    # Now exactly 100 bytes *inside* the budget -- the file's size is chosen
+    # against the directories' own `st_size`, which the round counts since N31
+    # fix 2 -- so the rise is 100 bytes, far below the step, but it is the
+    # difference between "may not create anything" and "may".
+    inside = 1024 * 1024 - _dirs_bytes(tree) - 1000 - 100
+    huge.write_bytes(b"b" * inside)
     registry.disk_usage_snapshot(dirty=True)
 
     assert calls[-1][1] == 100, "leaving the exhausted state is always sent"
@@ -221,16 +253,21 @@ def test_a_sandbox_inside_its_budget_keeps_what_is_left(tmp_path):
     registry = _registry(tmp_path, "sbx_inside", disk_mb=1)
     calls, tightener = _recorder()
     registry.set_disk_tightener(tightener)
-    # 1000 bytes of a 1 MiB budget: the ceiling is the remaining budget.
+    # A 1000-byte file (plus the fixture's directories) of a 1 MiB budget: the
+    # ceiling is the remaining budget.
     registry.disk_usage_snapshot(dirty=True)
 
-    assert calls == [("sbx_inside", 1024 * 1024 - 1000)]
+    assert calls == [
+        ("sbx_inside", 1024 * 1024 - _tree_bytes(tmp_path / "sbx_inside"))
+    ]
 
 
 def test_without_a_tightener_nothing_is_asked(tmp_path):
     registry = _registry(tmp_path, "sbx_none", disk_mb=1)
     # No `set_disk_tightener` call at all: the round must still work.
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_none": 1000}
+    assert registry.disk_usage_snapshot(dirty=True) == {
+        "sbx_none": _tree_bytes(tmp_path / "sbx_none")
+    }
 
 
 def test_a_sandbox_with_no_budget_is_not_tightened(tmp_path):
@@ -251,4 +288,6 @@ def test_a_tightener_that_raises_does_not_break_the_round(tmp_path):
 
     registry.set_disk_tightener(explode)
 
-    assert registry.disk_usage_snapshot(dirty=True) == {"sbx_boom": 1000}
+    assert registry.disk_usage_snapshot(dirty=True) == {
+        "sbx_boom": _tree_bytes(tmp_path / "sbx_boom")
+    }
