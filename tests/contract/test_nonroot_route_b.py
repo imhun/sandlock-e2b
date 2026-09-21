@@ -94,7 +94,17 @@ def _make_apps(workspace: Path):
     """Control plane + envd sharing one registry, like ``make_apps`` does."""
     registry = RuntimeRegistry(workspace)
     control = create_control_app(
-        settings=ControlSettings(api_keys=("local-key",), create_queue_timeout_s=0),
+        # The control plane is the uid authority (OBS-9): it must hand out the
+        # same range this fixture's worker will accept, or every create in
+        # this contract fails with "uid N is outside this worker's pool". This
+        # file's pool is its own (21000), so it is set here rather than taken
+        # from the shared helper's default.
+        settings=ControlSettings(
+            api_keys=("local-key",),
+            create_queue_timeout_s=0,
+            uid_pool_start=POOL_START,
+            uid_pool_size=POOL_SIZE,
+        ),
         runtime_registry=registry,
         workspace_base=workspace,
     )

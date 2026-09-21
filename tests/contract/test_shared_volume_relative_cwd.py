@@ -23,6 +23,7 @@ import httpx
 import pytest
 
 from tests.contract.test_uid_permissions import (
+    _control_settings,
     _envd_settings,
     _result,
     _run_cmd,
@@ -40,11 +41,32 @@ _IMAGE_ROOTFS_ONLY = pytest.mark.skipif(
     ),
 )
 
+#: This file's own uid range, so its sandboxes can never collide with the
+#: ownership contracts' 20000/21000 slots in a shared container.
+ALIAS_POOL_START = 22000
+#: Same size as the other contract files' pools (16): the control plane hands
+#: the uid out and the worker checks it against this same range.
+ALIAS_POOL_SIZE = 16
+
 
 @pytest.mark.asyncio
 @_IMAGE_ROOTFS_ONLY
 async def test_volume_visible_from_both_workspace_aliases(make_apps, workspace):
-    control, envd = make_apps(envd_settings=_envd_settings(workspace))
+    # This file gets its **own** uid pool. Route-B leases one live slot per
+    # uid, and the suite's other ownership contracts run on 20000/21000: a
+    # second sandbox on a uid whose sandbox from another file is still alive
+    # cannot lease a slot at all, and the create then fails inside the
+    # sandbox with exit 127 and this only visible on stderr --
+    # "route-B uid 20000 already has a live slot (sandbox …); W1 recycles a
+    # uid only by restarting its process, never by sharing it"
+    # (measured 2026-09-21). Per-file ranges are the suite's existing
+    # convention for exactly this reason.
+    control, envd = make_apps(
+        control_settings=_control_settings(
+            uid_pool_start=ALIAS_POOL_START, uid_pool_size=ALIAS_POOL_SIZE
+        ),
+        envd_settings=_envd_settings(workspace, uid_pool_start=ALIAS_POOL_START),
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=control), base_url="http://test"
     ) as client:

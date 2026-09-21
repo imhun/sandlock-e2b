@@ -726,3 +726,89 @@ def test_capability_names_covers_the_broker_sets() -> None:
         {"CAP_DAC_OVERRIDE"}
     )
     assert ph.capability_names(0) == frozenset()
+
+
+def test_the_broker_spawner_hands_over_the_events_descriptor(tmp_path, monkeypatch):
+    """N25's pushed-events fd must reach the slot through the broker too.
+
+    ``W1SlotPool`` passes ``events_fd`` unconditionally
+    (``envd_service/route_b.py``), and a **non-root** worker -- the production
+    compose shape -- reaches route B through ``PrivHelpers.slot_spawner``
+    instead of the root ``setpriv`` form. When this signature lacked the
+    parameter, every slot start on such a worker raised
+
+        TypeError: PrivHelpers.slot_spawner() got an unexpected keyword
+        argument 'events_fd'
+
+    the sandbox's command then exited 127, and nothing in the fast lane
+    noticed: it took the unprivileged phase of ``test-prod-shaped.sh``
+    (measured 2026-09-21). The descriptor handoff is pinned here so the next
+    refactor of either spawner cannot drop it silently.
+    """
+    helpers = ph.PrivHelpers(
+        slot_spawn=tmp_path / "e2b-slot-spawn",
+        maint=tmp_path / "e2b-maint",
+        supervise_bin=tmp_path / "sandlock-supervise",
+        uid_pool_start=10000,
+        uid_pool_size=10,
+        workspace_base=tmp_path,
+    )
+    captured: dict = {}
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            captured["pass_fds"] = kwargs.get("pass_fds")
+
+    monkeypatch.setattr(ph.subprocess, "Popen", FakePopen)
+    helpers.slot_spawner(
+        uid=10000,
+        policy_path=tmp_path / "policy.json",
+        program_path=tmp_path / "program.json",
+        name="slot",
+        token="t",
+        worker_uid=65534,
+        control_fd=7,
+        events_fd=8,
+    )
+
+    argv = captured["argv"]
+    assert argv[argv.index("--control-fd") + 1] == "7"
+    assert argv[argv.index("--events-fd") + 1] == "8"
+    # Both must survive the broker's execve: the slot reads the *numbers* it
+    # was handed, so a descriptor left out of `pass_fds` closes at exec.
+    assert captured["pass_fds"] == (7, 8)
+
+
+def test_the_broker_spawner_without_events_hands_over_control_only(
+    tmp_path, monkeypatch
+):
+    """The older shape (no events channel) still starts a slot."""
+    helpers = ph.PrivHelpers(
+        slot_spawn=tmp_path / "e2b-slot-spawn",
+        maint=tmp_path / "e2b-maint",
+        supervise_bin=tmp_path / "sandlock-supervise",
+        uid_pool_start=10000,
+        uid_pool_size=10,
+        workspace_base=tmp_path,
+    )
+    captured: dict = {}
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            captured["pass_fds"] = kwargs.get("pass_fds")
+
+    monkeypatch.setattr(ph.subprocess, "Popen", FakePopen)
+    helpers.slot_spawner(
+        uid=10000,
+        policy_path=tmp_path / "policy.json",
+        program_path=tmp_path / "program.json",
+        name="slot",
+        token="t",
+        worker_uid=65534,
+        control_fd=7,
+    )
+
+    assert "--events-fd" not in captured["argv"]
+    assert captured["pass_fds"] == (7,)

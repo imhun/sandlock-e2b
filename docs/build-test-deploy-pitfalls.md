@@ -69,6 +69,42 @@ sandlock-dev:latest sh scripts/test-all.sh`；该镜像 entrypoint 自动降到 
 **B4. 给 lane 传测试文件路径并不会缩小范围。**
 原因：脚本内部是 `pytest tests … "$@"`，文件路径只是追加。用 `-k` 过滤。
 
+**B5. 自己拼 `docker run --privileged … pytest tests/unit` 会造出一堆"既有失败"。**
+2026-09-21 实测：这样跑出 88 个失败，其中一大半是 `SECCOMP_FILTER_MISSING`
+（`envd_service/config.py` 的 `E2B_REQUIRE_SECCOMP_FILTER` 自检：`/proc/self/status` 是
+`Seccomp: 0` 就 fail closed，因为 worker 正是跑不可信负载的那个进程）。**正确做法是别自己拼**：
+`UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh`（它自带 capset + 线上 seccomp 档 +
+`E2B_HOST_PROJECT` + `E2B_TEST_STRICT_SKIPS=1`）。缺 capset 还会多出一条启动披露告警，把
+`test_xfs_project_quota_agent` / `test_quota_agent_client` 那类"逐条比对 caplog"的断言整批打红。
+
+**B6. base image 在 lane 里解析不到 ⇒ 建箱回 428，然后一串测试红。**
+`python-mcp:3.14` 是我们本地构建的镜像，公共 mirror 链（daocloud 等）**不在白名单**（403）。
+做法：`E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 ./deploy/scripts/test-prod-shaped.sh`
+（本机 `sandlock-local-registry` 预置了全集镜像；脚本开头也会打这条提示）。少这一条时
+`test_control_plane_network_local` / `test_migration_volume_quota` 全是 `assert 428 == 201`。
+
+**B7. 测试镜像比 fork wheel 旧 ⇒ 一批 `TypeError: … unexpected keyword argument`。**
+`e2b-sandlock-test:latest` 不会自动跟着 `wheels/fork/*.whl` 重建。2026-09-21 实测：镜像是 09-16 的、
+wheel 是 09-20 的（含 N25 的 `max_file_size`），`tests/unit` 因此红 31 个
+（`Sandbox.__init__() got an unexpected keyword argument 'max_file_size'`）。改完 fork 要重建：
+`docker build -f deploy/docker/Dockerfile.test-runner -t e2b-sandlock-test:latest .`
+
+**B8. 两个测试文件共用同一段 uid 池 ⇒ 后一个文件里只看得见 `exit 127`。**
+route-B 每个 uid 只租**一个活槽位**（"W1 recycles a uid only by restarting its process,
+never by sharing it"）；若两个文件用同一段，第二个文件建箱时槽位还被前一个文件的沙箱占着，
+命令回 127、**原因只在 stderr**（`route-B uid N already has a live slot`）。
+做法：每个测试文件用自己的 uid 段（`test_shared_volume_relative_cwd` 现在用 22000），
+且控制面与 worker 必须配**同一段**——OBS-9 之后 uid 由控制面分配、worker 只做范围校验，
+只配 worker 会得到 `500 uid 10000 is outside this worker's pool`。
+
+**B9. 平台状态搬家后，测试里写死的路径会过期。**
+`sandbox.json` 已从沙箱树内搬到 `<base>/_runtime/<id>/`（§12 的平台/workspace 分离）。
+`test_agent_uid_lifecycle_and_orphan_reconcile` 原先读 `<workspace>/sandbox.json`，现在读不到
+（`FileNotFoundError`）——用 `gateway_common.paths.sandbox_record_path(base, id)`，
+读者仍保留 legacy 回落。同类还有 `perSandboxQuotaMb` 的期望值：N28/C（`78285fa`）之后
+volume mount 会**原样透传**这个数（`single_file_ceiling_bytes` 靠它知道该挂载点可以放大文件），
+测试里再写 `0` 就是把"无限制"当成默认了。
+
 **B5. phase 1 红了，phase 2（非 root 形态）根本没跑。**
 原因：脚本 `set -e`，phase 1 非零直接退出。看输出里有没有 `==> phase 2 …` 再下结论。
 

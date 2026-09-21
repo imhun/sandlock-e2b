@@ -607,12 +607,21 @@ class PrivHelpers:
         token: str,
         worker_uid: int,
         control_fd: int | None = None,
+        events_fd: int | None = None,
     ) -> subprocess.Popen:
         """The ``W1SlotPool`` spawner: a slot started through the broker.
 
         Same shape as :func:`envd_service.route_b._spawn_slot` (the root
         worker's ``setpriv`` form) -- the two differ only in *who* performs
         ``setuid``: here it is the broker, because this worker is not root.
+
+        ``events_fd`` is N25's one-way pushed-events descriptor. It has to be
+        on this signature, not only on the root form: the pool passes it
+        unconditionally, and a non-root worker (the production compose shape)
+        reaches route B *through this method* -- without the parameter every
+        slot start raised ``TypeError: slot_spawner() got an unexpected
+        keyword argument 'events_fd'`` and the sandbox create failed with
+        exit 127 (measured in the unprivileged lane, 2026-09-21).
         """
         env = self.subprocess_env()
         supervise_args = ["--policy", str(policy_path), "--uid", str(uid)]
@@ -620,6 +629,15 @@ class PrivHelpers:
             supervise_args += [
                 "--control-fd",
                 str(control_fd),
+            ]
+            fd_list = [control_fd]
+            if events_fd is not None:
+                # Same handoff as the root form: a second descriptor, kept
+                # open across the broker's execve, so the slot sees the same
+                # number the worker wrote into its own fdinfo.
+                supervise_args += ["--events-fd", str(events_fd)]
+                fd_list.append(events_fd)
+            supervise_args += [
                 "--serve",
                 "--program",
                 str(program_path),
@@ -631,7 +649,7 @@ class PrivHelpers:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 env=env,
-                pass_fds=(control_fd,),
+                pass_fds=tuple(fd_list),
             )
         supervise_args += [
             "--serve-path",

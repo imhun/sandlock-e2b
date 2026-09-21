@@ -299,8 +299,14 @@ def test_build_volume_mounts_passes_host_uid_to_slice(
         host_uid=10000,
     )
     slice_dir = volume_path / "sbx_a"
+    # ``perSandboxQuotaMb`` rides through unchanged (N28/C, commit 78285fa):
+    # it is what `single_file_ceiling_bytes` reads to see that this mount may
+    # legitimately hold a file larger than the sandbox tree's own budget, and
+    # its sender has to report the *real* number -- 0 means "unlimited", so a
+    # consumed project quota must not be reported as 0 or the file ceiling
+    # would silently become "no limit" for that mount.
     assert mount_paths == [
-        {"path": "mnt/data", "hostPath": str(slice_dir), "perSandboxQuotaMb": 0}
+        {"path": "mnt/data", "hostPath": str(slice_dir), "perSandboxQuotaMb": 512}
     ]
     assert slice_dir.stat().st_uid == 10000
     assert stat.S_IMODE(slice_dir.stat().st_mode) == 0o770

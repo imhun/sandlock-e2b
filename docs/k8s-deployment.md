@@ -1763,13 +1763,25 @@ platform vs du -s -B1: 33792 vs 33792 (diff 0)
 而 `--privileged` 起的容器 `/proc/self/status` 是 `Seccomp: 0` ⇒ 所有构造 worker 配置的用例直接抛
 `SECCOMP_FILTER_MISSING`（那一批占了 88 里的大头）。**按 lane 的形状跑**（`--security-opt
 seccomp=deploy/seccomp/sandlock-worker.json`、`E2B_HOST_PROJECT`、`E2B_TEST_STRICT_SKIPS=1`、
-`E2B_BASE_IMAGE=python-mcp:3.14`）：`tests/unit` = **43 failed / 1177 passed**，其中
-`test_xfs_project_quota_agent`/`test_volume_quota` 这 20 个是这条 lane **明确 deselect** 的
-XFS prjquota 用例（`XFS_DESELECTS`，它们由特权 lane 覆盖）——项目记的"13 个既有失败"就是
-deselect 之后的口径。**对本次改动真正相关的证据**：规范 lane 下这 43 个失败里
-**没有任何一个**来自我改过的模块（`test_dir_ledger` / `test_brief_stat` / `test_priv_helpers` /
-`test_disk_tightening` / `test_registry_dirty_snapshot` / `test_pushed_append_accounting` /
-`test_sandbox_disk_enforcement`），而"改动前 vs 改动后"在同一 lane 下的失败集合逐条相同。
+`E2B_BASE_IMAGE=python-mcp:3.14`、**`E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080`**，
+且 `e2b-sandlock-test:latest` 必须是用当前 `wheels/fork/*.whl` 重建过的）：**两阶段全绿** ——
+phase 1 `1683 passed, 6 skipped, 1 xfailed`，phase 2（uid 65534 + broker）`51 passed, 1 skipped`。
+
+这一轮把当时剩下的 10 个失败全部修掉（`docs/build-test-deploy-pitfalls.md` §B5–B9 记了坑）：
+
+| 失败 | 真因 | 修法 |
+|---|---|---|
+| `test_disk_budget_enforcement` ×2 | 断言的是**旧语义**（超预算 ⇒ 暂停 + 退回预留），而 N25 已改成"阻止写入、不暂停" | 改成钉住当前语义：`running` 不变、预留不变、无暂停日志；另一条改钉"越界上报 + 回落即消失"（`disk_overrun_stats`） |
+| `test_uid_permissions` / `test_nonroot_route_b` / `test_shared_volume_relative_cwd` ×5 | OBS-9 之后 uid 由**控制面**分配，而夹具只给 worker 配了池 ⇒ `500 uid 10000 is outside this worker's pool`；两个文件共用一段 uid 时还会撞"一个 uid 一个活槽位"（表现为 `exit 127`） | 控制面与 worker 配同一段；`test_shared_volume_relative_cwd` 单独用 22000；记录路径改用 `sandbox_record_path`（`_runtime/<id>/`） |
+| `test_volume_quota` ×1 | 断言 `perSandboxQuotaMb == 0`，而 N28/C（`78285fa`）之后该值**原样透传**（`single_file_ceiling_bytes` 要用它，0 = 无限制） | 期望改成 `512` 并写明理由 |
+| `test_quota_agent_client` ×1 / `test_migration_volume_quota` ×2 | 是上面两条的**连带**（428/500 改变了全局状态与告警顺序），修完自动转绿 | — |
+
+**顺带抓到一个真 bug（非 root 生产形态）**：`PrivHelpers.slot_spawner()` 没有接 N25 新增的
+`events_fd` ⇒ 非 root worker（compose 的生产形态，`user: 65534`）起 route-B 槽位时
+`TypeError: … unexpected keyword argument 'events_fd'`，沙箱命令回 127。根路径
+（`route_b._spawn_slot`）有参数、broker 路径没有，快步单测也覆盖不到 —— 是**两阶段 lane 的
+phase 2** 抓出来的。现在两条路径同形（`--events-fd` + `pass_fds` 一并传递），并补了两条
+快步单测（有/无 events 两种 argv 形状）钉住它。
 
 #### 22.5.13 rollout 之后自动预热 base image（N25 的运维收口，2026-09-21）
 

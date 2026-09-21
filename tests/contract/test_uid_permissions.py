@@ -30,12 +30,37 @@ from pathlib import Path
 import httpx
 import pytest
 
+from control_plane.config import Settings as ControlSettings
 from envd_service.config import Settings as EnvdSettings
 from envd_service.connect.codec import decode_envelopes, encode_message
+from gateway_common.paths import sandbox_record_path
 from tests.security.conftest import sandlock_ready
 
 POOL_START = 20000
 POOL_SIZE = 16
+
+
+def _control_settings(**overrides) -> ControlSettings:
+    """Control-plane settings whose uid pool is the *same* range as the worker's.
+
+    Since OBS-9 the fleet's per-sandbox host uid is allocated by the **control
+    plane** (`SandboxRegistry.allocate_host_uid`, backed by the Redis ledger)
+    and travels to the worker with the create; the worker then checks it
+    against *its* pool and refuses anything outside it --
+    ``500 Failed to provision sandbox runtime: uid 10000 is outside this
+    worker's pool [20000, 20016)``. A fixture that configured only the
+    worker's pool therefore handed out the control plane's default 10000 and
+    every create in these contracts failed, which is exactly what these tests
+    were measuring. Both sides get the range here.
+    """
+    kwargs: dict = {
+        "api_keys": ("local-key",),
+        "create_queue_timeout_s": 0,
+        "uid_pool_start": POOL_START,
+        "uid_pool_size": POOL_SIZE,
+    }
+    kwargs.update(overrides)
+    return ControlSettings(**kwargs)
 
 
 pytestmark = pytest.mark.skipif(
@@ -47,12 +72,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _envd_settings(workspace: Path) -> EnvdSettings:
+def _envd_settings(
+    workspace: Path,
+    *,
+    uid_pool_start: int = POOL_START,
+    uid_pool_size: int = POOL_SIZE,
+) -> EnvdSettings:
+    """Worker settings on ``uid_pool_start`` (default: this file's POOL_START).
+
+    The pool is a parameter because route-B leases **one live slot per uid**:
+    a file that runs its own sandboxes needs its own range, or a create on a
+    uid whose sandbox from another file is still alive fails inside the
+    sandbox (exit 127, ``route-B uid N already has a live slot``).
+    """
     return EnvdSettings(
         executor="sandlock",
         per_sandbox_uid=True,
-        uid_pool_start=POOL_START,
-        uid_pool_size=POOL_SIZE,
+        uid_pool_start=uid_pool_start,
+        uid_pool_size=uid_pool_size,
         workspace_base=workspace,
     )
 
@@ -103,7 +140,10 @@ def _result(messages) -> tuple[int, bytes, bytes]:
 
 
 async def test_volume_shared_rw_across_distinct_uids(make_apps, workspace):
-    control, envd = make_apps(envd_settings=_envd_settings(workspace))
+    control, envd = make_apps(
+        control_settings=_control_settings(),
+        envd_settings=_envd_settings(workspace),
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=control), base_url="http://test"
     ) as client:
@@ -216,7 +256,10 @@ async def test_volume_shared_rw_across_distinct_uids(make_apps, workspace):
 
 
 async def test_agent_uid_lifecycle_and_orphan_reconcile(make_apps, workspace):
-    control, envd = make_apps(envd_settings=_envd_settings(workspace))
+    control, envd = make_apps(
+        control_settings=_control_settings(),
+        envd_settings=_envd_settings(workspace),
+    )
     registry = envd.state.runtime_registry
     pool = registry.uid_pool
     assert pool is not None
@@ -238,7 +281,9 @@ async def test_agent_uid_lifecycle_and_orphan_reconcile(make_apps, workspace):
         assert ws.stat().st_uid == POOL_START
         assert ws.stat().st_gid == os.getegid()
         assert stat.S_IMODE(ws.stat().st_mode) == 0o770
-        persisted = json.loads((ws / "sandbox.json").read_text(encoding="utf-8"))
+        persisted = json.loads(
+            sandbox_record_path(workspace, sbx_id).read_text(encoding="utf-8")
+        )
         assert persisted["host_uid"] == POOL_START
 
         deleted = await client.delete(
@@ -278,7 +323,10 @@ async def test_agent_create_failure_releases_uid(make_apps, workspace):
     """I3 (agent path): a create that fails between acquire and register
     (invalid volumeMounts -> 400) must return the reserved uid to the pool
     instead of leaking a slot on every bad request."""
-    control, envd = make_apps(envd_settings=_envd_settings(workspace))
+    control, envd = make_apps(
+        control_settings=_control_settings(),
+        envd_settings=_envd_settings(workspace),
+    )
     registry = envd.state.runtime_registry
     pool = registry.uid_pool
     assert pool is not None
@@ -318,7 +366,10 @@ async def test_local_create_failure_releases_uid(make_apps, workspace):
     """I3 (local control-plane path): a provisioning failure after acquire
     (mount path already exists -> 400) returns the reserved uid to the pool
     instead of leaking a slot."""
-    control, envd = make_apps(envd_settings=_envd_settings(workspace))
+    control, envd = make_apps(
+        control_settings=_control_settings(),
+        envd_settings=_envd_settings(workspace),
+    )
     pool = envd.state.runtime_registry.uid_pool
     assert pool is not None
 

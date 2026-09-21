@@ -48,7 +48,19 @@ def _own_by(registry, nodes, sandbox_id: str):
     return record
 
 
-async def test_over_budget_report_pauses_the_sandbox(apps, control_client):
+async def test_over_budget_report_blocks_writes_and_never_pauses(apps, control_client):
+    """N25 (2026-09-20): over budget is *no writes*, not a freeze.
+
+    This test used to pin the opposite -- a paused record with its reservation
+    handed back -- and that semantic was deliberately removed: freezing a
+    sandbox over its disk took away the deletes that would bring it back
+    inside, which is why the write side is enforced where the writes are (the
+    worker turns the measured number into a zero `RLIMIT_FSIZE` plus `ENOSPC`
+    for the entry-creating operations, §22.5.9). The control plane's half is
+    the accounting and the warning, and *nothing else*:
+    ``SandboxRegistry.enforce_disk_budget`` records and returns the crossing
+    without touching the state.
+    """
     control_app, _ = apps
     registry = control_app.state.registry
     nodes = control_app.state.nodes
@@ -63,14 +75,17 @@ async def test_over_budget_report_pauses_the_sandbox(apps, control_client):
         json={"sandboxDiskUsage": {sid: over}},
     )
 
-    # The freeze push cannot land (no agent at :39999) and that is *not* a
-    # heartbeat failure: the record is paused and the retry rides the next
-    # pulse, because rolling back would hand the reservation back to a
-    # sandbox that is still writing.
     assert response.status_code == 204
-    assert registry.get(sid).state == "paused"
-    assert nodes.get("node_disk").reserved_disk_mb == 0
-    assert registry.global_reserved()["disk"] == 0
+    after = registry.get(sid)
+    assert after.state == "running", "a crossing must not pause the sandbox"
+    assert after.workspace_disk_used_bytes == over
+    # The reservation is untouched too: the sandbox is still here and still
+    # holding its capacity, so handing it back would be the same mistake in a
+    # different register.
+    assert nodes.get("node_disk").reserved_disk_mb == record.disk_size_mb
+    assert registry.global_reserved()["disk"] == record.disk_size_mb
+    # ...and no pause reason was written (the line the old semantic produced).
+    assert [entry for entry in after.logs if "paused" in entry["line"]] == []
 
 
 async def test_a_tree_within_budget_leaves_the_sandbox_running(apps, control_client):
@@ -150,8 +165,18 @@ async def test_the_measurement_lands_on_the_record(apps, control_client):
     assert metrics.json()[-1]["diskUsed"] == measured
 
 
-async def test_moving_to_paused_says_why(apps, control_client):
-    """The pause a platform starts is distinguishable from the caller's own."""
+async def test_the_crossing_is_reported_and_clears_when_the_tree_comes_back(
+    apps, control_client, caplog
+):
+    """The operator-facing half of the same rule (N25).
+
+    Over budget is not silent and not a pause: the crossing is named once in
+    the control plane's log, the fleet counter carries it, and the counter is
+    rebuilt from the *current* report rather than accumulated -- so a sandbox
+    that comes back inside (by deleting, which is exactly the operation a
+    freeze would have taken away) stops being counted instead of lingering as
+    a phantom overrun.
+    """
     control_app, _ = apps
     registry = control_app.state.registry
     nodes = control_app.state.nodes
@@ -166,21 +191,19 @@ async def test_moving_to_paused_says_why(apps, control_client):
         json={"sandboxDiskUsage": {sid: over_mib * 1024 * 1024}},
     )
 
-    paused = registry.get(sid)
-    assert paused.state == "paused"
-    assert paused.workspace_disk_used_bytes == over_mib * 1024 * 1024
-    assert paused.logs[-1]["line"] == (
-        f"sandbox paused: its workspace grew past its budget "
-        f"({over_mib} MiB used of {record.disk_size_mb} MiB)"
+    reported = registry.get(sid)
+    assert reported.state == "running"
+    assert reported.workspace_disk_used_bytes == over_mib * 1024 * 1024
+    assert registry.disk_overrun_stats() == {"sandboxes": 1, "overMB": 316}
+    assert "over its workspace budget" in caplog.text
+    assert "writes are blocked until it is back inside" in caplog.text
+
+    # Back inside: the counter drops it, and the number on the record follows
+    # the report (it is the accounting, not a high-water mark).
+    await control_client.post(
+        "/internal/nodes/node_disk/heartbeat",
+        headers=headers,
+        json={"sandboxDiskUsage": {sid: record.disk_size_mb * 1024 * 1024}},
     )
-    # ...and the same reason reaches the log endpoint even when the record's
-    # in-memory history does not survive the read (the shared store keeps
-    # durable state only, so under Redis this is the *only* copy).
-    registry.get(sid).logs.clear()
-    logs = await control_client.get(
-        f"/sandboxes/{sid}/logs", headers={"X-API-Key": "local-key"}
-    )
-    assert [entry["line"] for entry in logs.json() if "paused" in entry["line"]] == [
-        f"sandbox paused: its workspace grew past its budget "
-        f"({over_mib} MiB used of {record.disk_size_mb} MiB)"
-    ]
+    assert registry.disk_overrun_stats() == {"sandboxes": 0, "overMB": 0}
+    assert registry.get(sid).workspace_disk_used_bytes == record.disk_size_mb * 1024 * 1024
