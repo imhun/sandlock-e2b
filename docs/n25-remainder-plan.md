@@ -72,7 +72,6 @@
 
 
 ## 收口记录（2026-09-22，`0.1.0-429-g2abaf33-20260922-094142`）
-
 `deploy/scripts/build-and-push.sh` 重建并推送，`deploy/k8s-k0s/apply.sh` 滚动两个 worker +
 控制面，全部换成该版本（pod 的 `.status.containerStatuses[0].image` 逐条核对）。这一次的镜像
 **带上了「修复那 10 个失败」那一轮的代码改动**，其中唯一影响运行时的是一条真 bug 修复：
@@ -88,3 +87,40 @@
 | 非 root 形态 | 由 lane 的 phase 2 覆盖（`UNPRIVILEGED_PHASE` 默认跑）：51 passed；集群这份清单是 **root worker**（`worker-root.patch.yaml` 的 `runAsUser: 0`），走的是 `route_b._spawn_slot`，不受那条修复影响 |
 
 即：A/F 已在集群复验，B 仍未做（见上），C/D 是书面结论。
+
+## B 收口（2026-09-22，`0.1.0-431-gf821435-20260922-101447`）
+
+**做了什么**（对应 backlog 的 ②③④，① 异步仍留后续）：
+
+* **幂等键**：`POST /sandboxes/{id}/snapshots` 认 `Idempotency-Key` 头或 body 里的 `snapshotID`。
+  同键 = 同一份快照：记录在 ⇒ **200 + `{"status":"completed","alreadyExists":true}`**（不再拷）；
+  拷贝还在跑 ⇒ 这次请求**等它跑完**再回同一份记录（控制面按 id 加锁，单副本即可，多副本要换共享锁）。
+* **worker 侧 `.complete` 标记**：`POST /agent/snapshots` 对已完成载荷回 **200 `alreadyExists`**（不再是 409），
+  只有"目录在、标记不在"（崩在半路）才是 409 —— 并发保护不变、重试不再付第二次整树拷贝；控制面把
+  worker 的 409 如实翻成 409（不再伪装成 502）。
+* **本地形态**同理：载荷已在盘上就 `copy_fs=False` 只写记录。
+* **文档**：明确"客户端超时 ≠ 失败"；没带键的重试（e2b SDK 只发 `name`）会**再建一个新快照**——
+  要可重试语义就得带键，或先 `GET /snapshots`。入口侧要配的值与理由见 §22.5.14（`proxy_read_timeout`
+  ≥ 合法拷贝时间；复核 `non_idempotent`/`max_fails`/`fail_timeout`）。
+
+**验收（集群，直连控制面 `kubectl port-forward`，2000 文件的树）**：
+
+| 现象 | 数字 |
+|---|---|
+| 第一次 POST（带键，客户端超时 600 s） | **201**，**76 s**，id == 键 |
+| **同键重试** | **200 + `alreadyExists:true`**，**0.12 s**（同一 id，列表只有一条） |
+| 同键并发两条（"重试赶在拷贝进行中"这一形态） | **200 + 201，同一个 id**，列表只有一条 —— 第二次等了第一次的拷贝，没有再拷 |
+| 换一个键 | **201**，另一份快照（键才是判别式，不是"每沙箱一份"） |
+| 清理 | `DELETE /templates/{id}` → 204 ✓ |
+
+**为什么走直连**：经入口时每次 2000 文件快照都在 **60.1 s 拿到 504**，随后入口**摘 upstream 约 30 s**
+（`/sandboxes` 连续 502，实测两次），重试根本到不了控制面 —— 那半是**部署项**（入口超时与摘除参数），
+本仓库改不动，已按 §22.5.14 给出要配的值。
+
+**顺带抓到一个新问题（与本改动无关，已记 N32）**：这轮反复做大快照期间，worker 心跳出现
+**76–83 s 断档**（`deploy/scripts/heartbeat_gaps.py --since 40m`，四个窗口分别 82.72 / 82.15 / 78.43 /
+77.07 s），而 k8s overlay 的节点健康窗口是 **30 s** ⇒ 控制面把节点判为 unhealthy、`node health sweep`
+把沙箱标成 **orphaned**，于是**紧接着的下一次快照回 409「Sandbox … is not running」**
+（直连探针 2026-09-22 实测，`tmp/k0s/n29-idem-direct2.log`；当时共享 base 上只有 8 棵树、2.6 GB，
+所以不是"树太多把轮次拖长"）。断档的量级与拷贝耗时几乎相同，但是拷贝的 NAS 负载、reconcile 的磁盘
+轮次还是别的阻塞路径，需要一次定向测量才能定论。

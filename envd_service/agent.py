@@ -2931,10 +2931,29 @@ async def agent_create_snapshot(request: Request) -> Response:
         if not snapshot_id or not sandbox_id:
             return Response(status_code=400, content="snapshotID and sandboxID required")
         src = settings.workspace_base / sandbox_id
-        dst = settings.workspace_base / "_snapshots" / snapshot_id / "fs"
+        snapshot_dir = settings.workspace_base / "_snapshots" / snapshot_id
+        dst = snapshot_dir / "fs"
+        marker = snapshot_dir / ".complete"
         if not src.is_dir():
             return Response(status_code=404, content=f"Sandbox {sandbox_id} not found")
         if dst.exists():
+            # N29: idempotent **for a finished copy**. The control plane retries
+            # the same id when its own client timed out, and paying a second
+            # full copy of a large tree is exactly what that retry must not do.
+            # The marker is what makes "the directory exists" mean "complete":
+            # without it this is a crashed attempt, and 409 keeps the rule that
+            # one id has one live copy (a concurrent duplicate is refused
+            # rather than interleaved).
+            if marker.is_file():
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "snapshotID": snapshot_id,
+                        "sandboxID": sandbox_id,
+                        "status": "completed",
+                        "alreadyExists": True,
+                    },
+                )
             return Response(status_code=409, content="snapshot already exists")
         # Off the event loop: a snapshot is a full copy of the sandbox's tree
         # and on the shared NAS that is ~16 ms per file (measured: 2 000 small
@@ -2944,6 +2963,9 @@ async def agent_create_snapshot(request: Request) -> Response:
         # snapshot look like a worker outage.
         try:
             await asyncio.to_thread(shutil.copytree, src, dst, symlinks=True)
+            # Written last, and that is the whole point: until this line lands,
+            # the payload is not a snapshot (see the 409 above).
+            await asyncio.to_thread(marker.write_text, "complete\n", encoding="utf-8")
         except BaseException:
             # A failed or abandoned copy must not leave a half snapshot behind:
             # the record is written by the control plane only on success, so a
@@ -2951,7 +2973,7 @@ async def agent_create_snapshot(request: Request) -> Response:
             # next attempt for the same id would answer 409 "already exists").
             await asyncio.to_thread(
                 shutil.rmtree,
-                settings.workspace_base / "_snapshots" / snapshot_id,
+                snapshot_dir,
                 True,
             )
             raise

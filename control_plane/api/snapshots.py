@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi.responses import JSONResponse
 
 from control_plane.api.errors import OfficialError
 from control_plane.auth import _require_owned, require_api_key, tenant_of, tenant_scope
@@ -19,11 +21,38 @@ from control_plane.registry.manager import (
 )
 from control_plane.registry.snapshots import UnknownSnapshotError
 from gateway_common.ids import sandbox_id as new_sandbox_id
+from gateway_common.paths import validate_sandbox_id
 from gateway_common.upload import UploadTooLargeError, read_json_body
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+#: One lock per snapshot id, in this process (N29).
+#:
+#: The copy is synchronous, so the entry proxy can time out on a large tree
+#: while the control plane keeps working -- which is exactly when the client's
+#: retry arrives, *during* the first copy. Serializing on the id makes that
+#: retry wait for the first attempt and then answer with its record, instead of
+#: starting a second full copy. A second control-plane replica would need this
+#: in the shared store; the deployment runs one (`deploy/k8s/control-plane.yaml`),
+#: and the docstring of `create_snapshot` says so.
+_SNAPSHOT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for(snapshot_id: str) -> asyncio.Lock:
+    lock = _SNAPSHOT_LOCKS.get(snapshot_id)
+    if lock is None:
+        lock = _SNAPSHOT_LOCKS[snapshot_id] = asyncio.Lock()
+    return lock
+
+
+def _existing_snapshot(request: Request, snapshot_id: str):
+    """The record for ``snapshot_id``, or ``None`` when there is none."""
+    try:
+        return _snapshots(request).get(snapshot_id)
+    except UnknownSnapshotError:
+        return None
 
 
 def _registry(request: Request):
@@ -43,8 +72,20 @@ def _check_name_size(settings, name: str) -> None:
         raise OfficialError(400, f"name exceeds {settings.max_name_bytes}-byte limit")
 
 
-def _capture_snapshot(request: Request, sandbox_id: str, name: str | None):
-    """Freeze the sandbox, copy its filesystem, thaw it."""
+def _capture_snapshot(
+    request: Request,
+    sandbox_id: str,
+    name: str | None,
+    *,
+    snapshot_id: str | None = None,
+):
+    """Freeze the sandbox, copy its filesystem, thaw it.
+
+    ``snapshot_id`` is the caller's idempotency key (N29): when the request
+    carries one, the copy lands under exactly that id, so a retry either finds
+    the finished payload (the worker answers "completed") or waits for the
+    attempt already in flight -- never a second copy of the same tree.
+    """
     registry = _registry(request)
     record = registry.get(sandbox_id)
     _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
@@ -55,8 +96,12 @@ def _capture_snapshot(request: Request, sandbox_id: str, name: str | None):
         raise OfficialError(502, f"Node {record.node_id} not found")
     request.app.state.runtime_registry.freeze(sandbox_id)
     try:
-        snapshot_id = new_sandbox_id().replace("sbx_", "snap_")
+        snapshot_id = snapshot_id or new_sandbox_id().replace("sbx_", "snap_")
         if node.address == "local://":
+            # A retried id whose payload is already on disk must not copy
+            # again -- the local shape has no worker route to answer
+            # "completed", so the filesystem is the answer (N29).
+            payload_there = _snapshots(request).payload_path(snapshot_id).exists()
             return _snapshots(request).create_from_sandbox(
                 workspace_dir=record.workspace_dir,
                 template_id=record.template_id,
@@ -70,6 +115,8 @@ def _capture_snapshot(request: Request, sandbox_id: str, name: str | None):
                 allow_internet_access=record.allow_internet_access,
                 node_id=node.node_id,
                 name=name,
+                snapshot_id=snapshot_id,
+                copy_fs=not payload_there,
                 tenant_id=record.tenant_id,
             )
         # Remote snapshot: ask the worker to copy the sandbox directory into
@@ -82,7 +129,15 @@ def _capture_snapshot(request: Request, sandbox_id: str, name: str | None):
             headers={"X-Internal-Key": request.app.state.settings.internal_api_key},
             timeout=120,
         )
-        if resp.status_code != 201:
+        if resp.status_code == 409:
+            # The id exists but its payload is not a finished snapshot: say so
+            # instead of dressing it up as "the node failed" (N29).
+            raise OfficialError(
+                409,
+                f"Snapshot {snapshot_id} already exists on node "
+                f"{node.node_id} but is not complete",
+            )
+        if resp.status_code not in (200, 201):
             raise OfficialError(502, f"Node {node.node_id} failed to snapshot")
         return _snapshots(request).create_from_sandbox(
             workspace_dir=None,
@@ -113,6 +168,23 @@ def _capture_snapshot(request: Request, sandbox_id: str, name: str | None):
 async def create_snapshot(
     sandbox_id: str, request: Request
 ) -> dict[str, Any]:
+    """Snapshot a sandbox, idempotently when the caller names the request.
+
+    N29: this copy is synchronous and can outlive the entry proxy's read
+    timeout on a large tree. The client's retry then arrives while the first
+    attempt is still running, and the two things it must never do are start a
+    second copy and come back as "failed" for work that succeeded. So:
+
+    * ``Idempotency-Key`` (or ``snapshotID`` in the body) names the request.
+      The same key means the same snapshot -- if its record exists, it is
+      returned with ``200`` and ``alreadyExists: true`` and nothing is copied;
+      if a copy for it is in flight, this request waits for that one and
+      answers with its record.
+    * without a key the behaviour is unchanged (a fresh id per request), which
+      is what the e2b SDK does: it sends only ``name``, so a retry from it is a
+      *new* snapshot. Callers that retry should either send a key or list
+      snapshots first; ``docs/k8s-deployment.md`` §22.5.14 says so.
+    """
     # A snapshot copies the sandbox filesystem: the heaviest resource-creating
     # endpoint there is, so it is admitted like sandbox create rather than left
     # unbounded.
@@ -135,14 +207,46 @@ async def create_snapshot(
         raise OfficialError(400, "name must be a string")
     if name is not None:
         _check_name_size(request.app.state.settings, name)
-    try:
-        record = _capture_snapshot(request, sandbox_id, name)
-    except UnknownSandboxError:
-        raise OfficialError(404, f"Sandbox {sandbox_id} not found")
-    except SandboxStateConflictError:
-        raise OfficialError(409, f"Sandbox {sandbox_id} is not running")
+
+    requested_id = request.headers.get("Idempotency-Key") or (
+        body.get("snapshotID") if isinstance(body, dict) else None
+    )
+    if requested_id is not None:
+        if not isinstance(requested_id, str) or not validate_sandbox_id(requested_id):
+            raise OfficialError(400, "snapshotID/Idempotency-Key is not a valid id")
+        existing = _existing_snapshot(request, requested_id)
+        if existing is not None:
+            return _already_exists(existing)
+
+    async with _lock_for(requested_id or sandbox_id):
+        # Re-checked inside the lock: the attempt we waited behind may just
+        # have written its record.
+        if requested_id is not None:
+            existing = _existing_snapshot(request, requested_id)
+            if existing is not None:
+                return _already_exists(existing)
+        try:
+            record = _capture_snapshot(
+                request, sandbox_id, name, snapshot_id=requested_id
+            )
+        except UnknownSandboxError:
+            raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+        except SandboxStateConflictError:
+            raise OfficialError(409, f"Sandbox {sandbox_id} is not running")
     logger.info("snapshot %s captured from sandbox %s", record.snapshot_id, sandbox_id)
     return record.as_snapshot_info()
+
+
+def _already_exists(record) -> JSONResponse:
+    """The answer to a retried snapshot request: the one it already made."""
+    return JSONResponse(
+        status_code=200,
+        content={
+            **record.as_snapshot_info(),
+            "status": "completed",
+            "alreadyExists": True,
+        },
+    )
 
 
 @router.get("/snapshots", dependencies=[Depends(require_api_key)])

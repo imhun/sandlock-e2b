@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import shutil
+import uuid
+
 
 async def _create(control_client, **overrides):
     body = {"templateID": "base", "timeout": 300, "envVars": {"K": "v"}}
@@ -160,3 +163,159 @@ async def test_snapshot_missing_sandbox_404(control_client):
         json={},
     )
     assert response.status_code == 404
+
+
+async def test_a_snapshot_retry_with_the_same_key_answers_the_first_one(
+    control_client, envd_client
+):
+    """N29: the endpoint the client retries must not do the work twice.
+
+    Measured on the cluster (2026-09-21): a 2000-file tree outlives the entry
+    proxy's 60 s, so the client's retry arrives while the first copy is still
+    running -- and without a key the control plane minted a *new* snapshot id
+    and copied the tree again. With `Idempotency-Key` the retry names the same
+    request: the second call answers 200 with the same snapshot, the list still
+    has one entry, and its payload is the one the first call made.
+    """
+    sandbox = await _create(control_client)
+    sid = sandbox["sandboxID"]
+    upload = await envd_client.post(
+        "/files",
+        headers={
+            "E2b-Sandbox-Id": sid,
+            "X-Access-Token": sandbox["envdAccessToken"],
+            "Content-Type": "application/octet-stream",
+        },
+        params={"path": "workspace/retry.txt"},
+        content=b"retry-content",
+    )
+    assert upload.status_code in (200, 201)
+
+    key = "snap-idem-0123456789abcdef"
+    first = await control_client.post(
+        f"/sandboxes/{sid}/snapshots",
+        headers={"X-API-Key": "local-key", "Idempotency-Key": key},
+        json={"name": "retry-once"},
+    )
+    assert first.status_code == 201
+    created = first.json()
+    assert created["snapshotID"] == key
+
+    second = await control_client.post(
+        f"/sandboxes/{sid}/snapshots",
+        headers={"X-API-Key": "local-key", "Idempotency-Key": key},
+        json={"name": "retry-once"},
+    )
+    assert second.status_code == 200
+    assert second.json() == {
+        "snapshotID": key,
+        "names": ["retry-once"],
+        "status": "completed",
+        "alreadyExists": True,
+    }
+
+    listed = await control_client.get(
+        "/snapshots", headers={"X-API-Key": "local-key"}
+    )
+    assert [s["snapshotID"] for s in listed.json()] == [key]
+
+
+async def test_a_snapshot_retry_without_a_key_is_a_new_snapshot(
+    control_client, envd_client
+):
+    """The SDK sends only `name`, so a retry from it is a *second* snapshot.
+
+    Pinned rather than wished away: it is why the docs tell a retrying caller
+    to send `Idempotency-Key` (or to list snapshots first), and it is the
+    behaviour a caller who genuinely wants two snapshots with the same name
+    still gets.
+    """
+    sandbox = await _create(control_client)
+    sid = sandbox["sandboxID"]
+
+    first = await control_client.post(
+        f"/sandboxes/{sid}/snapshots",
+        headers={"X-API-Key": "local-key"},
+        json={"name": "same-name"},
+    )
+    second = await control_client.post(
+        f"/sandboxes/{sid}/snapshots",
+        headers={"X-API-Key": "local-key"},
+        json={"name": "same-name"},
+    )
+    assert first.status_code == 201 and second.status_code == 201
+    assert first.json()["snapshotID"] != second.json()["snapshotID"]
+
+    listed = await control_client.get(
+        "/snapshots", headers={"X-API-Key": "local-key"}
+    )
+    assert len([s for s in listed.json() if s["names"] == ["same-name"]]) == 2
+
+
+async def test_the_worker_answers_a_finished_payload_as_completed(apps, envd_client):
+    """The worker half of the same rule: 200 for "done", 409 for "half done".
+
+    The control plane's retry has to know whether a payload for that id is
+    *finished*. The `.complete` marker is what separates the two cases: a
+    directory without it is a crashed attempt (a concurrent duplicate is still
+    refused rather than interleaved), so a retry costs nothing only when the
+    copy really finished.
+
+    The tree is built under the *worker's* base on purpose: this route reads
+    `settings.workspace_base`, which in this fixture is not the control
+    plane's `workspace` -- the existing tests all went through the control
+    plane's in-process copy and never touched this route.
+    """
+    from pathlib import Path
+
+    _, envd_app = apps
+    base = Path(envd_app.state.settings.workspace_base)
+    # Unique per run: the worker's base is the *repository's* `tmp/sandboxes`
+    # on this lane, so a fixed id would make the test depend on what a previous
+    # run left behind (measured: the second run of this file answered 409 for
+    # its own leftover payload).
+    suffix = uuid.uuid4().hex[:12]
+    sandbox_id = f"sbx_worker_{suffix}"
+    (base / sandbox_id / "workspace").mkdir(parents=True, exist_ok=True)
+    (base / sandbox_id / "workspace" / "f.txt").write_text("x", encoding="utf-8")
+
+    headers = {"X-Internal-Key": "internal-key"}
+    snapshot_id = f"snap_worker_{suffix}"
+    half = f"snap_worker_half_{suffix}"
+    try:
+        first = await envd_client.post(
+            "/agent/snapshots",
+            headers=headers,
+            json={"snapshotID": snapshot_id, "sandboxID": sandbox_id},
+        )
+        assert first.status_code == 201
+
+        payload = base / "_snapshots" / snapshot_id
+        assert (payload / ".complete").is_file()
+
+        again = await envd_client.post(
+            "/agent/snapshots",
+            headers=headers,
+            json={"snapshotID": snapshot_id, "sandboxID": sandbox_id},
+        )
+        assert again.status_code == 200
+        assert again.json() == {
+            "snapshotID": snapshot_id,
+            "sandboxID": sandbox_id,
+            "status": "completed",
+            "alreadyExists": True,
+        }
+
+        # A half payload (no marker) is *not* "completed": the same id stays
+        # refused instead of being reported as a snapshot nobody finished.
+        (base / "_snapshots" / half / "fs").mkdir(parents=True)
+        refused = await envd_client.post(
+            "/agent/snapshots",
+            headers=headers,
+            json={"snapshotID": half, "sandboxID": sandbox_id},
+        )
+        assert refused.status_code == 409
+    finally:
+        shutil.rmtree(base / "_snapshots" / snapshot_id, ignore_errors=True)
+        shutil.rmtree(base / "_snapshots" / half, ignore_errors=True)
+        shutil.rmtree(base / sandbox_id, ignore_errors=True)

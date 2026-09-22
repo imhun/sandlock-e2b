@@ -166,6 +166,16 @@ class SnapshotRegistry:
     def _fs_path(self, snapshot_id: str) -> Path:
         return self._snapshot_dir(snapshot_id) / "fs"
 
+    def payload_path(self, snapshot_id: str) -> Path:
+        """Where this snapshot's filesystem lives (N29 idempotency checks).
+
+        Public because the create endpoint has to ask "is the payload already
+        there?" for a retried idempotency key without reaching for the private
+        name: the local shape copies in-process, so the filesystem -- not a
+        worker route -- is what answers that question.
+        """
+        return self._fs_path(snapshot_id)
+
     def _legacy_snapshot_dir(self, snapshot_id: str) -> Path:
         """The pre-OBS-9 root-level layout, still read (and removed) if present."""
         return self._base / snapshot_id
