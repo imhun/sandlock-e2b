@@ -145,8 +145,15 @@ netns 灰度暴露 MCP 入站每请求 +390 ms，根因是 readiness 合成，fo
    fork `5b16855` 重建、镜像推 ACR 两轮 —— netns 全量 + pid_ns 灰度/全量，见
    `tmp/build-push-pidns.log`）
 2. 远程约束**已解禁并已用起来**（2026-09-16）：E1.2/E8.1 目标机部署与远程复测 ✅ 完成；
-   仍剩需要维护/部署窗口的 O1（prjquota）、O2（TLS 代理层）、O3（凭据管理），以及随 O1
-   一起做的 T1（真实 XFS/ext4 上复测沙箱文件属主，去掉那条带证据的 skip）；
+   仍剩需要维护/部署窗口的 O1（prjquota）、O2（TLS 代理层）、O3（凭据管理）。**T1 ✅ 已关闭
+   （2026-09-22 复核）**：`tests/security/test_sandlock_isolation.py::test_user_cli_install_within_workspace_persists`
+   在 lane 里**不再 skip**（现行 6 条 skip 的清单见最近一次 lane 输出，都是形态/工具缺失），
+   即"沙箱 chmod 自己写的文件"在现在的形态下已成立。**FUP-28（撤 `..` 软链改写）**：
+   前提② 2026-09-22 在两个部署宿主上实测成立（`.94` 8107/40000、`.140` 6855/40000 次
+   EAGAIN，探针 `tmp/k0s/probe_openat2_eagain.py`）、前提① 也成立（集群 wheel manifest
+   HEAD=`7b60349c` 含 FUP-26）；**缺的是前提③的产品路径 soak**（要在部署宿主上跑，
+   需要 arm64 的 soak 二进制或节点上起 dev 镜像），所以本轮**保留**改写 —— 明细在
+   fork `docs/fork-plan-followups.md` 的 FUP-28。
 3. 不需要环境就能做的：~~T3（快照展开自嵌套守卫）~~ ✅ 已完成（G2，2026-09-06，见上表行）；
    T2 已随 fork P3 完成；~~#22 候选补丁（协议缺陷）~~ ✅ 已完成（F15，见 #23）。
 

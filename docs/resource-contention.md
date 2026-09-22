@@ -206,6 +206,53 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after�
 5. **pause 语义**：pause 释放配额后现场保留的实现（进程冻结 vs 停止+
    恢复），与 sandlock 能力相关。
 
+---
+
+## 6. 2026-09-22 复核：空闲判定的边界、现在的旋钮、以及要不要补采样
+
+上面 §3.1 那条"剩余边界"在实现落地之后（E9.1–E9.4）仍然成立，这里是复核过的现状与账。
+
+**活动信号今天有两个来源**（都在代码里可查）：
+
+* **控制面侧**：只有生命周期/变更类端点会 `_mark_active`（connect、timeout、pause、resume、
+  改网络），**只读轮询（info/metrics/logs）与内部端点（reconcile、列沙箱）刻意不算** ——
+  否则"有人在看"就等于"有人在用"（`control_plane/api/sandboxes.py::_mark_active` 的注释），
+  一个被监控轮询的空沙箱将永远踢不掉；
+* **worker 侧**：每个沙箱**经过 envd 鉴权层**的请求计数，随心跳的 `sandboxActivity` 上报
+  （`envd_service/agent.py` 的 `_activity_provider` → `internal.py` 的
+  `apply_activity_report`）。
+
+**因此这三类仍然会被判成空闲**（会走驱逐：pause + 释放预留）：
+
+1. 沙箱内部进程**自己的出站流量**（egress on-behalf：supervisor 代发，从不经过 envd）；
+2. **纯 CPU/内存型长任务**（没有请求，也没有 egress）；
+3. **沙箱之间的互访**（不经过 envd）。
+
+**现有旋钮与它们的真实强度**（别把它们当"免疫"）：
+
+| 旋钮 | 真实语义 |
+|---|---|
+| `E2B_SANDBOX_IDLE_THRESHOLD_S`（默认 300） | 大于多少秒没活动就算空闲；**设 0 等于关掉整条判定** |
+| `E2B_EVICTION_ENABLED` | 总开关（关掉 = 容量不足直接 503/排队，不驱逐） |
+| `priority` | 只决定**顺序**（低优先先被踢）——它不是豁免：候选不够时高优先也会被踢 |
+| 租户维度 | 默认只踢请求者**自己租户**的空闲沙箱（`eviction_cross_tenant` 才跨租户，防止"建箱即踢别人"的 DoS） |
+
+**要不要补采样（这是需要定的那条）**：
+
+* **选项 i（便宜）**：worker 已经在跑周期任务（disk scan / reconcile），顺手采**每沙箱的 CPU
+  时间增量**（cgroup v2 `cpu.stat` 的 `usage_usec` 差，或该沙箱进程组的 `/proc/<pid>/stat`
+  utime+stime 差），把"这段时间确实在烧 CPU"并进 `sandboxActivity` 上报。
+  覆盖盲点 2；代价小，不需要新通道。
+* **选项 ii（完整）**：再加上**每沙箱的网络计数**（route-B 槽位的 netns 里
+  `/sys/class/net/*/statistics`，或按 pid 聚合），覆盖盲点 1 与 3。代价是要给每个沙箱定位网络命名
+  空间（route-B 槽位天然有；route-A/in-process 形态没有独立 netns，只能按 pid 聚合，精度差）。
+* **选项 iii（不补）**：接受现状，把上面这张表写进对外文档（"空闲 = 没有经过平台的请求"），
+  并建议长任务型沙箱调高阈值或提高 priority。
+
+**建议**：先做 **i**（改一处采样 + 一个上报字段 + 一条契约测试即可，且它挡住的正是最常见的那类
+——"没有请求但一直在算"），**ii 留到有人真的用沙箱间/纯 egress 型长任务时再做**；**iii 作为
+兜底**，不论选哪条都应该写进对外文档，因为这是使用方必须知道的语义。
+
 **E9.3 已实现机制对应的已知限制（与代码注释口径一致）：**
 
 - **驱逐节流是进程内状态**：`E2B_EVICTION_MIN_INTERVAL_S` 在每个控制面副本
