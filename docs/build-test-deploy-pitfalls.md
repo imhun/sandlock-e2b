@@ -48,6 +48,14 @@ sandlock-dev:latest sh scripts/test-all.sh`；该镜像 entrypoint 自动降到 
 `--oci-root` / `--supervise-root` / `--mediation-2uid`）。新增字段时把测试字面量一起搜：
 `rg -n "NotifPolicy \{" crates/`。
 
+**又一个形状（2026-09-22，N25/C 的 `max_file_size`）**：同一个错误可以躲过 `--lib`、只被
+**release 构建门 + oci 相位**抓住。症状不是 `--lib` 红，而是 `cli_build: suite FAILED`，日志里是
+`error[E0063]: missing field 'max_file_size' in initializer of sandlock_core::init::Req`
+（`--oci-root` 相位另报同族的 5 处测试字面量）。原因：`Req::RunExec` 的构造点分布在
+`sandlock-oci`（1 处生产 + 4 处 `#[cfg(test)]`），而默认相位的 `--lib`/`--test integration` 都不
+编译那个 crate。做法：**新增字段时按"谁构造这个结构体"全局搜**（`rg -n "Req::RunExec \{" crates/`），
+而不是只搜 fork 自己那两棵 crate —— 上一条做法里那句 `rg` 要按字段所在的结构体改，不是照抄。
+
 ---
 
 ## B. 跑测试 / lane
