@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Callable
 
@@ -35,7 +36,14 @@ class TTLSweeper:
                     logger.info("TTL expired sandbox %s", record.sandbox_id)
                     if self._on_expired is not None:
                         try:
-                            self._on_expired(record)
+                            # A callback may be async: the node teardown has to
+                            # `await` its HTTP call, or the only way to reach the
+                            # worker would be a blocking call on this loop --
+                            # which is what N32 measured as a 76 s stall that
+                            # looked like two dead nodes.
+                            result = self._on_expired(record)
+                            if inspect.isawaitable(result):
+                                await result
                         except Exception:  # pragma: no cover - defensive
                             logger.exception("TTL cleanup failed for %s", record.sandbox_id)
                     registry.cleanup_workspace(record)
@@ -53,4 +61,3 @@ class TTLSweeper:
             except asyncio.CancelledError:
                 pass
             self._task = None
-

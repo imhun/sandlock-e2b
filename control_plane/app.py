@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
@@ -106,6 +107,61 @@ def _wire_local_node_quota_agent(
     )
 
 
+async def _node_health_loop(
+    app: FastAPI,
+    registry,
+    *,
+    window_s: float,
+    interval_s: float = 1.0,
+    clock=time.monotonic,
+) -> None:
+    """Mark sandboxes on lost remote nodes orphaned (E6.1).
+
+    The evidence is "this node's last heartbeat is older than the window", and
+    that evidence is only valid while *this loop* is running on schedule. After
+    a control-plane stall -- a blocking call in a handler, a long pause -- the
+    heartbeats that arrived during the stall have not been handled yet, so
+    their timestamps are still the old ones and *every* node looks lost at
+    once. The verdict is destructive (live sandboxes are torn down as orphans
+    and every later request for them answers 409), so a round that finds
+    itself ``window_s`` behind skips it and lets the next one decide: by then
+    the queued heartbeats have been handled and a node that really is gone is
+    still stale. Measured before this guard (2026-09-22, k0s cluster): one
+    2000-file snapshot blocked the loop for 76.1 s behind a synchronous
+    ``httpx.post``, the two workers' heartbeats gapped 77.2 s / 78.3 s in the
+    access log, and the first sweep after the loop resumed answered
+    ``node health sweep: orphaned sandboxes on e2b-worker-1``.
+    """
+    log = logging.getLogger(__name__)
+    previous = clock()
+    while True:
+        now = clock()
+        behind = now - previous
+        previous = now
+        if behind > window_s:
+            log.warning(
+                "node health sweep: skipping this round -- the control plane "
+                "itself was %.1fs behind (>= the %.0fs heartbeat window), so a "
+                "stale heartbeat is not yet evidence that a node is gone",
+                behind,
+                window_s,
+            )
+            await asyncio.sleep(interval_s)
+            continue
+        try:
+            marked = await asyncio.to_thread(app.state.nodes.reap_unhealthy, registry)
+            if marked:
+                log.warning(
+                    "node health sweep: orphaned sandboxes on %s",
+                    ", ".join(marked),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - defensive
+            log.exception("node health sweep failed")
+        await asyncio.sleep(interval_s)
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -154,19 +210,23 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        def _on_sandbox_removed(record):
+        async def _on_sandbox_removed(record):
             node = app.state.nodes.get(record.node_id or "local")
             if node is not None and node.address != "local://":
                 import httpx
 
                 try:
-                    resp = httpx.delete(
-                        f"{node.address}/agent/sandboxes/{record.sandbox_id}",
-                        headers={
-                            "X-Internal-Key": settings.internal_api_key
-                        },
-                        timeout=30,
-                    )
+                    # Async, and awaited by the TTL sweeper: a synchronous call
+                    # here blocked the event loop for up to its 30 s timeout --
+                    # the same class of stall the node-health sweep now refuses
+                    # to read as a dead node (N32).
+                    async with httpx.AsyncClient(timeout=30) as client:
+                        resp = await client.delete(
+                            f"{node.address}/agent/sandboxes/{record.sandbox_id}",
+                            headers={
+                                "X-Internal-Key": settings.internal_api_key
+                            },
+                        )
                 except httpx.HTTPError as exc:
                     # TTL expiry has no HTTP response to answer with, so the
                     # only honest signal is this line (review W7 / C1-1): the
@@ -212,27 +272,11 @@ def create_app(
         app.state.sweeper = sweeper
         sweeper.start(registry)
 
-        async def _node_health_loop() -> None:
-            """Mark sandboxes on lost remote nodes orphaned (E6.1)."""
-            while True:
-                try:
-                    marked = await asyncio.to_thread(
-                        app.state.nodes.reap_unhealthy, registry
-                    )
-                    if marked:
-                        logging.getLogger(__name__).warning(
-                            "node health sweep: orphaned sandboxes on %s",
-                            ", ".join(marked),
-                        )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # pragma: no cover - defensive
-                    logging.getLogger(__name__).exception(
-                        "node health sweep failed"
-                    )
-                await asyncio.sleep(1)
-
-        health_task = asyncio.create_task(_node_health_loop())
+        health_task = asyncio.create_task(
+            _node_health_loop(
+                app, registry, window_s=settings.node_heartbeat_timeout_s
+            )
+        )
         app.state.node_health_task = health_task
         try:
             yield

@@ -70,3 +70,34 @@ async def test_ttl_sweeper_reaps():
         await sweeper.stop()
     assert [r.sandbox_id for r in reaped] == [record.sandbox_id]
 
+
+async def test_ttl_sweeper_awaits_an_async_callback():
+    """A node-teardown callback must be awaited, not dropped.
+
+    The callback that tears a sandbox down on its worker reaches the node over
+    HTTP. Reaching it with a *blocking* call from this loop is what the N32
+    measurement caught (a 76 s stall that made two live workers look gone), so
+    the callback is async and the sweeper has to await it -- a coroutine that
+    is merely called would never run, and the tree would stay on the worker
+    with nobody noticing.
+    """
+    registry = SandboxRegistry(_settings())
+    record = _create(registry, timeout=300)
+    record.end_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        seconds=1
+    )
+    reaped: list[str] = []
+    finished = asyncio.Event()
+
+    async def _on_expired(r) -> None:
+        await asyncio.sleep(0.01)
+        reaped.append(r.sandbox_id)
+        finished.set()
+
+    sweeper = TTLSweeper(interval_seconds=0.05, on_expired=_on_expired)
+    sweeper.start(registry)
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=5)
+    finally:
+        await sweeper.stop()
+    assert reaped == [record.sandbox_id]

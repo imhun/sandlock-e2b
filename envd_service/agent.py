@@ -2462,7 +2462,16 @@ async def agent_delete_sandbox(
         return Response(status_code=401)
     runtime_registry = request.app.state.runtime_registry
     try:
-        _delete_sandbox_runtime(
+        # Off the loop: this removes a whole sandbox tree, and on this
+        # deployment that tree is on the shared NAS -- measured 17.4 s for a
+        # 2000-file sandbox, during which the worker sent no heartbeats at all
+        # (`DELETE /agent/sandboxes/...` logged its response 17.4 s after the
+        # request, the gap the node-health window is measured against; N32).
+        # `_delete_sandbox_runtime` is written for a worker thread already --
+        # the reconcile round calls it that way (see its own note about
+        # ``unregister=False``).
+        await asyncio.to_thread(
+            _delete_sandbox_runtime,
             settings,
             runtime_registry,
             sandbox_id,
@@ -2993,7 +3002,12 @@ async def agent_delete_snapshot(snapshot_id: str, request: Request) -> Response:
         _require_internal_key(request, settings)
     except PermissionError:
         return Response(status_code=401)
-    shutil.rmtree(
-        settings.workspace_base / "_snapshots" / snapshot_id, ignore_errors=True
+    # The payload is a full tree on the shared NAS; removing it here on the
+    # loop is the same stall the control plane's own delete had (N32), one
+    # level down.
+    await asyncio.to_thread(
+        shutil.rmtree,
+        settings.workspace_base / "_snapshots" / snapshot_id,
+        True,
     )
     return Response(status_code=204)

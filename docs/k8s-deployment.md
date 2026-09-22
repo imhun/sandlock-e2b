@@ -776,6 +776,49 @@ worst gap across nodes: 5.15s (of which up to 0.15s is a reconcile round)
 它把扫描**故意卡住**（用事件而不是 sleep，避免时序巧合），然后断言三轮心跳照发 ——
 老形态下这条测试会卡死超时（已实测确认过 RED）。
 
+### 14.5 N32（2026-09-22）：轮次挪出去了，**处理请求时做 NAS 树操作**照样会堵
+
+§14.2 量的是 warm / create 两条路径，它们都不碰共享 base 上的**大树**。N29 的快照验收
+在大树上量到了另一个来源，而且它比 N21 那条更狠 —— **两边的进程都会堵**：
+
+| 站点 | 在循环上做的事 | 大树上的实测 |
+|---|---|---|
+| 控制面 `POST /sandboxes/{id}/snapshots` | `httpx.post(...)`（**同步**客户端）等 worker 拷完 | **76.1 s** 控制面访问日志整段空白 |
+| 控制面 `DELETE /templates/{id}` | `shutil.rmtree` 共享 `_snapshots` 上的 payload 树 | 每个 DELETE **17.1 s** |
+| worker `DELETE /agent/sandboxes/{id}` | `_delete_sandbox_runtime(...)` 直接调用（同步删树） | 响应 **17.4 s** 后才出现，期间**一条心跳都没有**（21.6 s 空档 = 删除 + 一个间隔） |
+| worker `DELETE /agent/snapshots/{id}` | `shutil.rmtree` | 同上（同一形状） |
+
+为什么它会变成"节点死了"：心跳的**到达时刻**就是控制面判断节点活着的证据，而控制面自己
+被堵住时，这段时间到达的心跳（以及它自己的健康扫描）都还没被处理 —— 循环一恢复，`now −
+最后一次心跳` 就是一个拷贝的时长。**直连控制面的实测**：一次 2000 文件的快照 →
+两个 worker 的心跳空档 **77.2 / 78.3 s** → `node health sweep: orphaned sandboxes on
+e2b-worker-1` → 后续对那个沙箱的请求全是 **409 "Sandbox … is not running"**（这就是 N29
+验收时看到的 409，当时被记成"部署项"）。
+
+修法（两层）：
+
+* **别在循环上做**：控制面的捕获与删除、worker 的删除都改成 `await asyncio.to_thread(...)`
+  （捕获原本就是同步 `httpx.post` + worker 侧同步 copytree；删除是 NAS 上的 `rmtree`）。
+  这与本仓库其它地方已经用惯的形状一致（`sandboxes.py` 的 worker 调用走 `AsyncClient`，
+  扫描/建箱/拷快照早已 `to_thread`）。
+* **别把自己的停顿当成别人的死亡**：健康扫描现在记录自己一轮的起点，若本轮**自己**落后
+  ≥ 心跳窗口（`_node_health_loop` 的 `behind > window_s`），就跳过这一轮的孤儿判决 ——
+  那一刻队列里的心跳还没被处理，判"失联"必然误伤。下一轮（1 秒后）照常判，真死的节点
+  依然是死的。TTL 回调里的节点删除也从同步 `httpx.delete` 改成 `AsyncClient`（同一个
+  30 秒上限的堵法）。
+
+**集群验收**（`0.1.0-437-g2e91607-20260922-171258`，同一条 N29 直连探针：2000 文件树、
+两次同键 + 一个新键、以及三次删除）：
+
+| 指标 | 修前 | 只修捕获后 | 全部修完 |
+|---|---|---|---|
+| 心跳最大空档（worker） | **77.2 / 78.3 s** | 19.6 / 21.6 s（worker 删除仍在堵） | **5.03 / 5.05 s** |
+| 控制面访问日志最大行间隔 | **76.1 s** | 17 s（DELETE 在堵） | **0.94 s**（>5 s 的空档 0 次） |
+| `orphaned` 行 / 沙箱状态 | 1 行 → 后续全 **409** | 0 行 | **0 行**，探针期间 `running` |
+
+`heartbeat_gaps.py` 的判词也从 "headroom is thin"（21.6 s = 窗口的 72%）回到
+**"15s covers this sample with 3x headroom"**。
+
 ---
 
 ## 15. 收口 N20：worker 换成 StatefulSet，node id 跨重启稳定（2026-09-18）

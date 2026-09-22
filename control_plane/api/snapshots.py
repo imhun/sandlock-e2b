@@ -226,8 +226,23 @@ async def create_snapshot(
             if existing is not None:
                 return _already_exists(existing)
         try:
-            record = _capture_snapshot(
-                request, sandbox_id, name, snapshot_id=requested_id
+            # N32: the capture talks to the worker with a *synchronous* HTTP
+            # call (the copy is synchronous there too) and can take as long as
+            # the tree is big -- measured 76 s for 2000 files. Running it on
+            # this thread used to block the whole event loop for exactly that
+            # long: the access log went silent for 76.1 s, so the workers'
+            # *arrival* timestamps for heartbeats were one copy old, and the
+            # node-health sweep then orphaned live nodes ("node health sweep:
+            # orphaned sandboxes on e2b-worker-1", 2026-09-22 on the k0s
+            # cluster). Everything the loop serves -- facts that decide whether
+            # a node is alive -- has to keep flowing while a copy runs, so the
+            # capture goes to a worker thread.
+            record = await asyncio.to_thread(
+                _capture_snapshot,
+                request,
+                sandbox_id,
+                name,
+                snapshot_id=requested_id,
             )
         except UnknownSandboxError:
             raise OfficialError(404, f"Sandbox {sandbox_id} not found")
@@ -283,7 +298,14 @@ async def delete_snapshot(snapshot_id: str, request: Request) -> Response:
     try:
         record = _snapshots(request).get(snapshot_id)
         _require_owned(request, record, resource_id=snapshot_id, label="Snapshot")
-        _snapshots(request).delete(snapshot_id)
+        # The payload lives on the shared NAS tree (the control plane and the
+        # worker mount the same `_snapshots`), so this delete is an `rmtree`
+        # over a whole sandbox tree: measured 17.1 s for 2000 files, and it
+        # used to run here on the event loop -- the access log stopped for
+        # exactly that long, which is the same "the control plane thinks its
+        # own silence is a dead node" shape the capture had (N32). Off the
+        # loop, like the capture.
+        await asyncio.to_thread(_snapshots(request).delete, snapshot_id)
     except UnknownSnapshotError:
         raise OfficialError(404, f"Snapshot {snapshot_id} not found")
     return Response(status_code=204)
@@ -315,7 +337,11 @@ async def fork_sandbox(sandbox_id: str, request: Request) -> list[dict[str, Any]
         raise OfficialError(400, "count must be an integer between 1 and 100")
 
     try:
-        snapshot = _capture_snapshot(request, sandbox_id, name=None)
+        # Same offload as `create_snapshot`: a fork captures first, and that
+        # capture is the long synchronous worker call (N32).
+        snapshot = await asyncio.to_thread(
+            _capture_snapshot, request, sandbox_id, name=None
+        )
     except UnknownSandboxError:
         raise OfficialError(404, f"Sandbox {sandbox_id} not found")
     except SandboxStateConflictError:

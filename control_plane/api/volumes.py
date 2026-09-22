@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -141,7 +142,11 @@ async def delete_volume(volume_id: str, request: Request) -> Response:
     try:
         record = _volumes(request).get(volume_id)
         _require_owned(request, record, resource_id=volume_id, label="Volume")
-        _volumes(request).delete(volume_id)
+        # The volume's payload is a tree on the shared NAS; the registry's
+        # delete is an `rmtree` over it. Not on the event loop (N32: a NAS
+        # `rmtree` in an async handler is a stall, and a stall is what the
+        # node-health sweep reads as a dead node).
+        await asyncio.to_thread(_volumes(request).delete, volume_id)
     except UnknownVolumeError:
         raise OfficialError(404, f"Volume {volume_id} not found")
     return Response(status_code=204)
@@ -252,9 +257,9 @@ async def volume_delete_path(
     if not target.exists() and not target.is_symlink():
         raise OfficialError(404, f"Path {path} not found")
     if target.is_dir() and not target.is_symlink():
-        shutil.rmtree(target)
+        await asyncio.to_thread(shutil.rmtree, target)
     else:
-        target.unlink()
+        await asyncio.to_thread(target.unlink)
     return Response(status_code=204)
 
 
