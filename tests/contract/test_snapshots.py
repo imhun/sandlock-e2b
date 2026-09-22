@@ -330,6 +330,9 @@ class _SlowWorker:
 
     def __init__(self, copy_s: float) -> None:
         self.copy_s = copy_s
+        #: How many copies were actually requested -- the async shape's whole
+        #: point is that a retry does not add a second one.
+        self.copies = 0
         slow = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -345,6 +348,7 @@ class _SlowWorker:
                 length = int(self.headers.get("Content-Length") or 0)
                 self.rfile.read(length)
                 # The copy: long enough that a blocked loop cannot hide it.
+                slow.copies += 1
                 time.sleep(slow.copy_s)
                 body = b'{"status":"completed","alreadyExists":false}'
                 self.send_response(201)
@@ -585,3 +589,187 @@ async def test_a_slow_agent_sandbox_delete_does_not_block_the_worker(
     assert health.status_code == 200
     assert (await deletion).status_code == 204
     assert calls == [sandbox_id]
+
+
+async def _poll_snapshot(control_client, snapshot_id: str, *, timeout=15.0):
+    """Poll one snapshot until it stops being `creating`, and return it."""
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        response = await control_client.get(
+            f"/snapshots/{snapshot_id}", headers={"X-API-Key": "local-key"}
+        )
+        assert response.status_code == 200, response.text
+        last = response.json()
+        if last["status"] != "creating":
+            return last
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"snapshot never settled: {last}")
+
+
+async def test_async_snapshot_answers_immediately_then_completes(
+    apps, control_client
+):
+    """N29 ①: the long copy must not have to fit in one HTTP request.
+
+    The sync shape is what makes a 2000-file tree (measured ~75 s of copying)
+    exceed the entry's 60 s read timeout, leaving the client unable to tell
+    "failed" from "still running" -- and producing a second full copy when it
+    retries. With ``Prefer: respond-async`` the answer comes back in
+    milliseconds with the id, and the record's status is the completion signal.
+    """
+    app, _ = apps
+    copy_s = 1.0
+    slow = _SlowWorker(copy_s)
+    try:
+        sandbox = await _create(control_client)
+        sid = sandbox["sandboxID"]
+        record = app.state.registry.get(sid)
+        node = app.state.nodes.get(record.node_id)
+        node.address = slow.url
+
+        started = time.monotonic()
+        response = await control_client.post(
+            f"/sandboxes/{sid}/snapshots",
+            headers={"X-API-Key": "local-key", "Prefer": "respond-async"},
+            json={"name": "async-one"},
+        )
+        answered = time.monotonic() - started
+        assert response.status_code == 202, response.text
+        body = response.json()
+        assert body["status"] == "creating"
+        assert body["names"] == ["async-one"]
+        assert answered < copy_s / 2, (
+            f"the 202 took {answered:.2f}s of a {copy_s}s copy: the request is "
+            "waiting for the bytes"
+        )
+
+        # Still copying: a poll says so rather than pretending it is usable.
+        during = await control_client.get(
+            f"/snapshots/{body['snapshotID']}",
+            headers={"X-API-Key": "local-key"},
+        )
+        assert during.status_code == 200
+        assert during.json()["status"] == "creating"
+
+        done = await _poll_snapshot(control_client, body["snapshotID"])
+        assert done["status"] == "completed"
+        assert slow.copies == 1
+    finally:
+        slow.stop()
+
+
+async def test_an_async_retry_with_the_same_key_does_not_copy_again(
+    apps, control_client
+):
+    """The idempotency rule has to hold *while* the copy is in flight.
+
+    The client's retry arrives during the copy -- that is the whole reason the
+    key exists -- so the second request must answer with the state of the first
+    one (202 + ``creating``, ``alreadyExists``) and start nothing.
+    """
+    app, _ = apps
+    copy_s = 1.0
+    slow = _SlowWorker(copy_s)
+    try:
+        sandbox = await _create(control_client)
+        sid = sandbox["sandboxID"]
+        node = app.state.nodes.get(app.state.registry.get(sid).node_id)
+        node.address = slow.url
+        key = f"snap_async_{uuid.uuid4().hex[:10]}"
+        headers = {
+            "X-API-Key": "local-key",
+            "Prefer": "respond-async",
+            "Idempotency-Key": key,
+        }
+        first = await control_client.post(
+            f"/sandboxes/{sid}/snapshots", headers=headers, json={"name": "async-key"}
+        )
+        assert first.status_code == 202
+        assert first.json()["snapshotID"] == key
+
+        again = await control_client.post(
+            f"/sandboxes/{sid}/snapshots", headers=headers, json={"name": "async-key"}
+        )
+        assert again.status_code == 202, again.text
+        assert again.json() == {
+            "snapshotID": key,
+            "names": ["async-key"],
+            "status": "creating",
+            "alreadyExists": True,
+        }
+        # The count is asserted once the copy has finished: mid-flight the
+        # first copy may not even have reached the worker yet, and what this
+        # test is about is that the *retry* never becomes a second one.
+        done = await _poll_snapshot(control_client, key)
+        assert done["status"] == "completed"
+        assert slow.copies == 1, "the retry started a second copy"
+        # Once finished, the same key is the plain N29 retry answer.
+        settled = await control_client.post(
+            f"/sandboxes/{sid}/snapshots", headers=headers, json={"name": "async-key"}
+        )
+        assert settled.status_code == 200
+        assert settled.json()["alreadyExists"] is True
+        assert settled.json()["status"] == "completed"
+        assert slow.copies == 1
+    finally:
+        slow.stop()
+
+
+async def test_a_reserved_snapshot_is_settled_at_startup(
+    apps, control_client
+):
+    """A restart must not leave a poller waiting on a copy nobody runs.
+
+    Reserved captures live in an in-process task, so the startup pass resolves
+    every ``creating`` record once: resumed (the worker's copy route is
+    idempotent) when it can be, failed with the reason when it cannot -- never
+    left spinning.
+    """
+    from control_plane.api.snapshots import reconcile_pending_snapshots
+
+    app, _ = apps
+    copy_s = 0.2
+    slow = _SlowWorker(copy_s)
+    try:
+        sandbox = await _create(control_client)
+        sid = sandbox["sandboxID"]
+        record = app.state.registry.get(sid)
+        node = app.state.nodes.get(record.node_id)
+        node.address = slow.url
+
+        # Two reserved records as a crashed process would leave them: one that
+        # can be resumed, one whose source sandbox was never recorded (the
+        # shape a record written by an older/partial run has).
+        resumable = app.state.snapshots.reserve_from_sandbox(
+            template_id=record.template_id,
+            env_vars=record.env_vars,
+            metadata=record.metadata,
+            volume_mounts=[],
+            base_image=record.base_image,
+            allow_internet_access=record.allow_internet_access,
+            source_sandbox_id=sid,
+            node_id=node.node_id,
+            name="interrupted-ok",
+        )
+        assert resumable.status == "creating"
+        hopeless = app.state.snapshots.reserve_from_sandbox(
+            template_id=record.template_id,
+            env_vars=record.env_vars,
+            metadata=record.metadata,
+            volume_mounts=[],
+            base_image=record.base_image,
+            allow_internet_access=record.allow_internet_access,
+            source_sandbox_id=None,
+            node_id=node.node_id,
+            name="interrupted-dead",
+        )
+
+        resolved = await reconcile_pending_snapshots(app)
+        assert resolved == 2
+        assert app.state.snapshots.get(resumable.snapshot_id).status == "completed"
+        dead = app.state.snapshots.get(hopeless.snapshot_id)
+        assert dead.status == "failed"
+        assert "interrupted by a restart" in (dead.error or "")
+    finally:
+        slow.stop()

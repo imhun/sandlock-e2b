@@ -17,7 +17,10 @@ from control_plane.api.internal import router as internal_router
 from control_plane.api.nodes import router as nodes_router
 from control_plane.api.sandboxes import router as sandboxes_router
 from control_plane.api.secrets import router as secrets_router
-from control_plane.api.snapshots import router as snapshots_router
+from control_plane.api.snapshots import (
+    reconcile_pending_snapshots,
+    router as snapshots_router,
+)
 from control_plane.api.templates import router as templates_router
 from control_plane.api.volumes import router as volumes_router
 from control_plane.config import Settings, local_node_quota_via_agent
@@ -277,10 +280,24 @@ def create_app(
                 app, registry, window_s=settings.node_heartbeat_timeout_s
             )
         )
+        # N29 (async shape): a reserved copy is an in-process task, so a
+        # restart leaves its record at `creating` and a poller waiting on a
+        # copy nobody runs. One pass settles them -- resumed from the worker's
+        # idempotent answer when the payload did finish, failed otherwise.
+        startup_snapshot_task = asyncio.create_task(
+            reconcile_pending_snapshots(app)
+        )
         app.state.node_health_task = health_task
         try:
             yield
         finally:
+            # The startup pass is short, but it must not outlive the app: an
+            # interrupted resume would leave a record half-updated.
+            if not startup_snapshot_task.done():
+                try:
+                    await asyncio.wait_for(startup_snapshot_task, timeout=30)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    startup_snapshot_task.cancel()
             health_task.cancel()
             try:
                 await health_task

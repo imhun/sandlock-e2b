@@ -105,12 +105,34 @@ class SnapshotRecord:
     node_id: str = "local"
     fs_path: Path | None = None
     tenant_id: str | None = None
+    #: The sandbox this was captured from. Kept so an interrupted *async*
+    #: capture (N29) can be resumed or failed after a restart without asking
+    #: the caller again.
+    sandbox_id: str | None = None
+    #: ``completed`` | ``creating`` | ``failed``. Records are born completed;
+    #: only the async shape reserves an id before any bytes move.
+    status: str = "completed"
+    #: Why a capture failed (async shape only). Short, user-facing text.
+    error: str | None = None
 
     def as_snapshot_info(self) -> dict[str, Any]:
         return {
             "snapshotID": self.snapshot_id,
             "names": list(self.names),
         }
+
+    def as_snapshot_status(self) -> dict[str, Any]:
+        """`as_snapshot_info` plus where the capture got to (N29 async).
+
+        The sync shape keeps the two-field body it always had; this one is what
+        a 202 answer and the poll endpoint return, so a client can tell
+        "still copying" from "done" without inferring it from a missing field.
+        """
+        info = self.as_snapshot_info()
+        info["status"] = self.status
+        if self.error:
+            info["error"] = self.error
+        return info
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -140,6 +162,9 @@ class SnapshotRecord:
             node_id=payload.get("node_id", "local"),
             fs_path=fs_path,
             tenant_id=payload.get("tenant_id"),
+            sandbox_id=payload.get("sandbox_id"),
+            status=payload.get("status", "completed"),
+            error=payload.get("error"),
         )
 
 
@@ -211,6 +236,7 @@ class SnapshotRegistry:
         snapshot_id: str | None = None,
         copy_fs: bool = True,
         tenant_id: str | None = None,
+        source_sandbox_id: str | None = None,
     ) -> SnapshotRecord:
         snapshot_id = snapshot_id or sandbox_id().replace("sbx_", "snap_")
         fs_path = self._fs_path(snapshot_id)
@@ -240,11 +266,89 @@ class SnapshotRegistry:
             node_id=node_id,
             fs_path=fs_path,
             tenant_id=tenant_id,
+            sandbox_id=source_sandbox_id,
+            status="completed",
         )
         self._write_record(record)
         with self._lock:
             self._snapshots[snapshot_id] = record
         return record
+
+    def reserve_from_sandbox(
+        self,
+        *,
+        template_id: str,
+        env_vars: dict[str, str],
+        metadata: dict[str, str],
+        volume_mounts: list[dict[str, str]],
+        base_image: str | None,
+        allow_internet_access: bool,
+        source_sandbox_id: str | None,
+        node_id: str = "local",
+        name: str | None = None,
+        snapshot_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> SnapshotRecord:
+        """Claim an id for a copy that has not run yet (N29, async shape).
+
+        The record exists from the moment the caller is answered with 202 --
+        that is what makes the id pollable and the retry idempotent -- and the
+        copy later fills ``fs/`` and flips ``status`` through
+        :meth:`mark_completed` / :meth:`mark_failed`. Nothing here touches the
+        workspace, so it is cheap and safe to call inside the request.
+        """
+        snapshot_id = snapshot_id or sandbox_id().replace("sbx_", "snap_")
+        record = SnapshotRecord(
+            snapshot_id=snapshot_id,
+            names=[name] if name else [],
+            template_id=template_id,
+            env_vars=dict(env_vars),
+            metadata=dict(metadata),
+            volume_mounts=[dict(m) for m in volume_mounts],
+            base_image=base_image,
+            allow_internet_access=bool(allow_internet_access),
+            node_id=node_id,
+            fs_path=self._fs_path(snapshot_id),
+            tenant_id=tenant_id,
+            sandbox_id=source_sandbox_id,
+            status="creating",
+        )
+        self._write_record(record)
+        with self._lock:
+            self._snapshots[snapshot_id] = record
+        return record
+
+    def mark_completed(self, snapshot_id: str) -> SnapshotRecord:
+        """The copy for `snapshot_id` finished; publish the record as usable."""
+        record = self.get(snapshot_id)
+        record.status = "completed"
+        record.error = None
+        self._write_record(record)
+        return record
+
+    def mark_failed(self, snapshot_id: str, error: str) -> SnapshotRecord:
+        """The copy for `snapshot_id` did not finish.
+
+        The record stays (the id is claimed, and a retry with the same key has
+        to be able to answer with *why* rather than 404), but it is never
+        handed out as a usable snapshot: every reader checks the status.
+        """
+        record = self.get(snapshot_id)
+        record.status = "failed"
+        record.error = error[:500]
+        self._write_record(record)
+        return record
+
+    def in_progress(self) -> list[SnapshotRecord]:
+        """Every record whose copy has not finished (startup reconciliation)."""
+        for path in sorted((self._base / "_snapshots").glob("*/snapshot.json")):
+            snapshot_id = path.parent.name
+            try:
+                record = self.get(snapshot_id)
+            except UnknownSnapshotError:
+                continue
+            if record.status == "creating":
+                yield record
 
     def _write_record(self, record: SnapshotRecord) -> None:
         path = self._snapshot_dir(record.snapshot_id) / "snapshot.json"

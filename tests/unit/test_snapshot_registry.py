@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from control_plane.registry.snapshots import SnapshotRegistry
+from control_plane.api.snapshots import _copy_local_payload
 
 
 def _registry(base: Path) -> SnapshotRegistry:
@@ -138,3 +140,37 @@ def test_nested_store_markers_are_pruned_within_bounded_depth(tmp_path):
     ) == "keep"
     assert not (out.fs_path / "cache").exists()
     assert list(out.fs_path.rglob("snapshot.json")) == []
+
+
+def test_the_local_async_payload_copy_is_a_no_op_when_it_is_already_there(tmp_path):
+    """The async shape's local branch: copy once, and never into itself.
+
+    The reserved capture copies the payload itself (the registry's
+    `create_from_sandbox` is the sync path), so the two guards that matter are
+    pinned here: a retried id whose payload is already on disk copies nothing,
+    and a payload that would land inside its own source is refused rather than
+    copied into itself (the G2 self-nesting incident).
+    """
+    registry = SnapshotRegistry(tmp_path / "control")
+    state = SimpleNamespace(snapshots=registry)
+    workspace = tmp_path / "sbx_local"
+    (workspace / "workspace").mkdir(parents=True)
+    (workspace / "workspace" / "f.txt").write_text("one", encoding="utf-8")
+
+    _copy_local_payload(state, workspace, "snap_local")
+    payload = registry.payload_path("snap_local")
+    assert (payload / "workspace" / "f.txt").read_text(encoding="utf-8") == "one"
+
+    # A second call (the retry) must not re-copy -- it would also have to
+    # tolerate the existing destination, which the strict copytree does not.
+    (workspace / "workspace" / "f.txt").write_text("two", encoding="utf-8")
+    _copy_local_payload(state, workspace, "snap_local")
+    assert (payload / "workspace" / "f.txt").read_text(encoding="utf-8") == "one"
+
+    # The guard is about the *destination* being under the source: point a
+    # snapshot id at the workspace itself by making the store live there.
+    nested = SnapshotRegistry(workspace)
+    with pytest.raises(ValueError, match="inside its source"):
+        _copy_local_payload(
+            SimpleNamespace(snapshots=nested), workspace, "snap_self"
+        )
