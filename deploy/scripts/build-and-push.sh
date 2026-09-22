@@ -107,4 +107,10 @@ fi
 
 printf '%s\n' "$VERSION" > "$VERSION_FILE"
 say "记录本次构建版本：$VERSION -> $VERSION_FILE"
+# The local test lane bakes the same wheels into its own image, and nothing
+# rebuilds it automatically: a wheel that changed without a rebuild there cost
+# 31 `TypeError: … unexpected keyword argument` failures once
+# (docs/build-test-deploy-pitfalls.md §B7). Say so while the wheels are fresh
+# in the reader's mind.
+say "提示：fork wheel 有变化时，本地测试镜像也要重建 —— ./deploy/scripts/build-test-image.sh"
 say "完成。升级目标机：./deploy/scripts/upgrade.sh"
