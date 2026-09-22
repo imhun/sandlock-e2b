@@ -135,6 +135,21 @@ volume mount 会**原样透传**这个数（`single_file_ceiling_bytes` 靠它�
 验收时会得到假绿。做法：配对一条只有该形态才成立的观测 —— 例如 `kill(<宿主 pid>, 0)`：
 自有 pid ns 里是 `ESRCH`，共享宿主 pid ns 里是 `EPERM`（探针 `tmp/pidns-shape-probe.py`）。
 
+**B12. fork 门禁里 chroot 家族集体红，报 `execvp 'rootfs-helper': Exec format error`（或 exit 127），
+而 `tests/rootfs-helper` 变成 0 字节。**
+原因：夹具根是 `CARGO_TARGET_TMPDIR`，也就是 fork 仓的 `target-linux/tmp` —— 它**挂在 `/src` 里、
+跨容器共享、跨运行存活**，而失败或挂住的用例走不到 `cleanup_rootfs`。残留 rootfs 里的
+`usr/bin/rootfs-helper` 与共享的 `tests/rootfs-helper` **是同一个 inode**（硬链接）；下一次
+`build_test_rootfs` 的 `hard_link` 因目标已存在而失败，回退 `fs::copy`，它的目标正是那个同 inode 的
+路径 ⇒ 打开写入把**源**截断成 0 字节 ⇒ 此后所有 chroot 类用例拿到 ENOEXEC。容器里 pid 复用是常态
+（每个容器里测试二进制都是同一个低 pid），所以"换个容器再跑"救不了这个坑。
+做法：`test_instance_chroot.rs` 早就修过（`temp_dir` 加单调 seq + 先 `remove_dir_all`），
+`test_chroot.rs` 缺这份修复 —— 2026-09-22 补齐；同时 `build.rs::build_static` 改成**先编译到同级
+临时文件再 rename 发布**，这样即使 `cc` 原地写也只换目录项，已存在的硬链接仍指向旧的那份完整 inode
+（证据：`tmp/k0s/core_integ-after-fix.log`、`tmp/k0s/trace-magicfd.log`）。
+排查提示：怀疑 helper 被清零时先看 `ls -l third_party/sandlock/tests/rootfs-helper` 的**大小**——
+0 字节就是这条，不是产品回归。
+
 ---
 
 ## C. 目标机部署 / 远程操作
