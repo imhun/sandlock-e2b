@@ -309,6 +309,59 @@ A（真根：mount ns + pivot_root）是**形态级**改动，安全评估按"�
 显式的放宽**；B 不动部署边界，但把缺口留在了内核侧、并引入一个静默的语义差异。若走 A，
 务必取 §9.1 的 (i) 路线、并把 9.3.1/9.3.4 两条缓解做成硬性前置。
 
+### 9.5 能不能"只让沙箱根 mount、不让沙箱内 mount"？—— 能，而且今天已经是这样
+
+这是 A 最关键的边界问题：**建根阶段必须能挂载，工作负载必须不能**。答案分三层，前两层是
+实测，第三层是本次要补的保险。
+
+**第一层（实测）：今天沙箱里的工作负载已经挂不了任何东西。** 在一个**容器档明确允许
+mount 家族**的 lane 里（默认 lane 带 SYS_ADMIN，所以 cap 门闩的那条规则被 runc 保留），
+让 guest 自己试：
+
+```
+uid=0                                    # userns 里的 root
+mkdir /workspace/mnt -> ok               # 自己的可写树
+mount -t tmpfs none /workspace/mnt   -> permission denied (rc 32)
+mount -t proc  none /workspace/mnt   -> permission denied (rc 32)
+umount /workspace/mnt                -> must be superuser (rc 32)
+unshare -m true                      -> Operation not permitted
+chroot / true                        -> Operation not permitted
+```
+
+同一条 lane 里，**沙箱自身**的 setup 相（userns root + 全部 caps）能 bind mount 成功
+（§5.1 的 `probe_n35_realmount.py`）。**同一个进程、同一套 caps**，唯一的差别就是 fork
+装的那层 seccomp ⇒ 判据是 `DEFAULT_BLOCKLIST_SYSCALLS`（含 `mount`/`umount2`/`pivot_root`/
+`open_tree`/`chroot`/`unshare`），由 `confine_child` 在 **exec 之前**装好，并被工作负载及其
+后代继承。`unshare -m` 与 `chroot /` 的 EPERM 尤其说明问题：这两条在容器档里是**允许**的
+（`unshare` 无条件放行，`chroot` 是本 lane 给了 CAP_SYS_CHROOT 才保留），却仍然被拒。
+
+**第二层（本次要做的）：把挂载序列放进 setup 相。** `confine_child` 的顺序本来就是
+"建 userns → 装 Landlock → 装 seccomp → exec"，挂载序列插在 **userns 建好之后、两道上锁
+之前**（也就是今天那一段空档）：`unshare(CLONE_NEWNS)` → 把 `/` 设 private → 绑 rootfs/
+workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + seccomp → `execve` 工作负载。
+工作负载拿到的是一个**已经封好**的进程：它继承的过滤器里 `mount` 就是 EPERM。
+容器档只需要开 `mount`/`umount2`/`pivot_root`（不带 cap 门闩）；**不需要** `chroot`（走
+`pivot_root`）。
+
+**第三层（建议本次一起补的保险）：setup 完成后 capset 只丢 `CAP_SYS_ADMIN`。**
+今天 fork 里没有任何 capset 代码，沙箱进程在整个生命周期里都握着 userns 里的全部 caps
+（实测 `CapEff=000001ffffffffff`），所以"guest 挂不了"目前**只靠那一层 seccomp**。
+丢 `CAP_SYS_ADMIN`（其余 caps 保留 —— `CHOWN`/`DAC_OVERRIDE`/`FOWNER`/`SETUID`/`SETGID`
+正是"沙箱内 root"这套契约要用的）之后，即使将来容器档被再放宽一次，内核也会拒：
+两道独立机制，任一层失效都不会立刻变成"guest 能挂载"。
+
+**残余放宽（要写进部署文档，别留在纸上）**：容器档放宽之后，容器里**任何**进程都能
+"调用"这几个 syscall；内核仍按"该 userns 里的 CAP_SYS_ADMIN"判。worker 本身没有 caps
+（EPERM），而"先 unshare 一个 userns、再做 userns 允许的挂载"这条路**今天对沙箱就已经开着**
+（沙箱从建箱起就在自己的 userns 里）。也就是说这是"把沙箱已有的姿态复制给 worker 进程"，
+不是新的越权面 —— 但它确实变了，且必须与 fork 改动**同批上线**（容器档单独放宽、fork 还没
+把 guest 封好，等于把没有任何路径中介的 mount 交给沙箱里的进程）。
+
+**验收（应进 lane 的形态用例）**：① 在容器档允许 mount 家族的形状里，guest 的
+`mount`/`unshare`/`chroot` 必须 EPERM，而 setup 相的 bind mount 必须成功（上面那段探针直接
+转成测试）；② 建箱→销毁 N 次后宿主 `mount` 计数回到基线（挂载泄漏）；③ 丢 `CAP_SYS_ADMIN`
+之后，`chown`/`chmod`/低端口这些"沙箱内 root"行为不变（按现有 security 套件回归）。
+
 ## 10. 未结线索（不算结论）
 
 1. **两次 30 s 卡死，未复现**：最初两轮（trace 开、前面已跑十来条腿）里，20 次"写 + 拒绝 exec"
