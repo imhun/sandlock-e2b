@@ -625,6 +625,12 @@ chroot 根（模拟的、真根的）都把 workload 路径解析到 rootfs 内 
    （`resume::StubChannel::extra_fds()` → `rt.extra_fds`，restore 本来就在用它传 blob 通道），
    并把 `fs_readable.push(stub)` 换成"给 **stub 的宿主路径** 授 `EXECUTE|READ`"的规则 ——
    Landlock 规则集在 `pivot_root` **之前**按宿主路径构建，表达这条没有障碍。
+   为什么必须"换成"：`landlock.rs::build_ruleset` 在 chroot 形态把 `fs_readable`/`fs_writable`
+   的每条都当**虚拟路径**处理（`root.join(strip_prefix("/"))`），`!host.exists()` 就 `continue`
+   ——"host paths are NOT added（fail-closed）"。stub 的宿主路径在 rootfs 里当然不存在，
+   于是**今天它一条规则都没拿到**（这解释了为什么"只按 fd 执行"仍然 EACCES）。
+   同一函数下方对 `fs_mount` 的**挂载源**已经在按宿主路径授"挂载点声明的权利"，理由一模一样
+   （内核按文件真实层级判定），stub 要的正是这一条路的形态。
 2. **init / `create_interactive`**：新增"以 fd 执行"的入口（program spec 里带 `exec_fd`），
    child 侧用 `execveat(exec_fd, "", argv, envp, AT_EMPTY_PATH)` 代替 `execvp(path)`。
    `keep_fds`/`extra_fds` 已保证该 fd 到达 child，init 的 exec 分支只需多一个模式。
