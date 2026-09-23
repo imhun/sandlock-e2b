@@ -17,8 +17,12 @@
 4. **B 有一条不可绕过的语义缺口**：seccomp-notify 不能改 syscall 参数，而 argv 数组
    的地址固定且与 envp 数组紧邻 ⇒ **无法构造内核语义的 argv**，只能走"改写 shebang 行"
    的变体，代价是脚本里的 `$0`/`sys.path[0]` 变成 `/proc/self/fd/M`。
+5. **§7 那条已经落地**（2026-09-23，本文档同轮）：workspace 里的**静态 ELF 现在能跑**
+   （改前 EACCES、改后 `tini version 0.19.0`，同一份用例在旧镜像上红、新镜像上绿）。
+   同时它让**被掩盖的一拍窗口显形**：同一条命令里"写静态二进制→立刻执行"现在报
+   **ETXTBSY**，隔一拍（`sleep 1`）就正常——这条以前被 EACCES 挡在前面，看不见。
 
-## 1. 实测（`e2b-sandlock-test:latest`，prod-shaped lane，root worker + route B 槽位）
+## 1. 实测（prod-shaped lane，root worker + route B 槽位；**下表是 §7 修复之前**）
 
 探针 `tmp/k0s/probe_n35_exec_gate.py`（每条腿独立 executor、逐条命令 30 s 超时），
 lane 入口 `tmp/k0s/n35-lane.sh`，日志 `tmp/k0s/n35-chroot{,2..6}.log`、`tmp/k0s/n35-pure.log`。
@@ -43,6 +47,16 @@ lane 入口 `tmp/k0s/n35-lane.sh`，日志 `tmp/k0s/n35-chroot{,2..6}.log`、`tm
 
 判别腿的意思：**内核解析 `#!` 时既不在"宿主文件存在"的语义里，也不在 guest 的路径空间里** ——
 它落在"宿主路径 + 没规则"的交叉点上，所以"文件不存在"和"文件存在"给出同一个 EACCES。
+
+**§7 落地后的复测**（同一探针、同一 lane，镜像换成含修复的 wheel）：
+
+| 腿 | 改前 | 改后 |
+|---|---|---|
+| workspace 里**静态 ELF**（探针进程预先放好） | EACCES 126 | **`tini version 0.19.0`，rc 0** |
+| 同一条命令里"guest 写静态 ELF → 立刻执行" | EACCES 126 | **ETXTBSY 126**；`sleep 1` 后 **rc 0** |
+| 同一条命令里"写**动态** ELF → 立刻执行"×20 | 20/20 OK | 20/20 OK（走 memfd，不碰源 inode） |
+| shebang 脚本（预先存在 / 同拍写入） | EACCES | **EACCES**（解释器）/**ETXTBSY**（同拍） |
+| pure 形态各腿 | — | **不变**（静态 ELF OK、未覆盖目录 EACCES、脚本 OK、20/20） |
 
 ## 2. 机制：三条规则 + 一个内核步骤
 
@@ -176,8 +190,9 @@ defense-in-depth 的一个面（userns 的 mount 仍受内核的 userns 限制�
   当 argv[1] 传下去，而那条路径已被改写成 fd 路径）。`cd "$(dirname "$0")"` 这类写法静默失效；
   Python 脚本的 `sys.path[0]` 变成 `/proc/self/fd` ⇒ 同级模块 `import` 直接报错。
 * **venv 解释器**（`/workspace/.venv/bin/python`，`uv venv` 的标准产物）：
-  - 注入它的 fd ⇒ 那就是"宿主 inode 上的 exec"，**今天的实测结果就是静态 ELF 那条 EACCES**
-    （§1），除非**先修 §7 的规则翻译**；
+  - 注入它的 fd ⇒ 那就是"宿主 inode 上的 exec"；**§7 落地前这条必然 EACCES**
+    （与静态 ELF 同因），**§7 落地后该 inode 已有 EXECUTE/读权限，这条通路就通了**
+    （前置已满足，见 §7）；
   - 或者把它也拷成 memfd ⇒ 能跑，但 python 会从 `/proc/self/exe`/`argv[0]` 判断自己**不是 venv**，
     于是静默用错解释器/site-packages —— 比报错更糟。
 * 仍然漏掉：`binfmt_misc` 之类其它"内核侧解析"（今天同样在宿主空间）。
@@ -188,19 +203,39 @@ defense-in-depth 的一个面（userns 的 mount 仍受内核的 userns 限制�
 一组形态用例），落 B 之前先落 §7。它能让"镜像解释器的脚本"（`pip3`、npm shim、`~/.local/bin`
 里 shebang 指向镜像 python 的那种）今天就跑起来，代价是 §6.3 的第一条。
 
-## 7. 第三条路：`fs_writable` 的 Landlock 翻译是个**应当单独修的 bug**
+## 7. 已落地：`fs_writable` 的 Landlock 翻译（原"应当单独修的 bug"）
 
 `fs_writable` 是宿主拼写，却在 chroot 形态被 `chroot_root.join(...)` 翻译 ⇒ 规则根本没装上
-（§2.2）。修它（例如给"宿主拼写"和"虚拟拼写"分开，或让 fork 对不存在的翻译结果回落到原路径）
-带来的直接收益是：**workspace 里的静态 ELF 立刻能跑**，而且它是 B 的 venv 分支的前置。
-它**不**能单独解决 shebang：解释器 `/bin/sh` 在宿主空间解析，规则若覆盖宿主 `/bin`
-就是把**宿主解释器**放进沙箱（会看到 `py (3, 14)` 这种"宿主版本"），那是 C 路线，与
-`test_image_rootfs_cannot_reach_host_filesystem` 钉住的隔离相冲突 —— 这也是为什么 shebang
-必须由 A 或 B 来解。
+（§2.2）。**2026-09-23 已修**，做法不是"猜拼写"，而是把两件事分开说清楚：
+
+1. **调用方（envd）**在 chroot 形态下把**挂载点**（`/workspace`、`/home/user`、每个卷的
+   虚拟路径）也声明进 `fs_writable` —— 宿主拼写继续保留，因为中介的 on-behalf 闸门
+   （`deny_open_verdict`）是拿**真实宿主路径**去比对的（两侧各司其职，写在
+   `envd_service/executors/sandlock.py` 同一段注释里）。
+2. **fork（`landlock.rs`）**在 chroot 形态下，按挂载点声明的权利给**挂载源**（宿主路径）
+   装规则：声明为可写 ⇒ 写掩码；只在可读集合里 ⇒ `READ_ACCESS`；两者都不沾 ⇒ **不装规则**
+   （fail-closed）。只读挂载永远不拿写掩码。抽成纯函数 `path_rule_rights`，4 条单测钉住。
+
+**为什么不采用"翻译不到就回落到原路径"**：那等于在 chroot 形态下允许策略路径指向宿主
+（`/usr`、`/data` 这类路径在镜像里不存在时会静默变成宿主路径），把"chroot 形态只能命名
+沙箱内的东西"这条不变量打掉；而挂载源只可能来自**已声明的挂载**，边界清楚。
+
+**验证**：`cargo test -p sandlock-core --lib mount_source_rights` 4/4；
+新用例 `tests/security/test_chroot_exec_shebang.py::test_static_binary_in_the_workspace_runs`
+在旧镜像上**红**（EACCES 126）、新镜像上**绿**；`tests/security` 整套 39 passed /
+1 skipped（既有的非 root 形状）/ 2 xfailed（本条脚本 + 既有的 pure inotify），
+`tests/unit/test_policy_mapping.py`、`tests/contract/test_route_b_executor.py` 同绿。
+
+它**不**解决 shebang：解释器 `/bin/sh` 在宿主空间解析，规则若覆盖宿主 `/bin` 就是把
+**宿主解释器**放进沙箱（会看到 `py (3, 14)` 这种"宿主版本"），那是 C 路线，与
+`test_image_rootfs_cannot_reach_host_filesystem` 钉住的隔离相冲突 —— shebang 仍必须由
+A 或 B 来解。
 
 ## 8. 建议与决策点
 
-1. **先落 §7**（独立 bug 修，收益明确、无部署改动、无形态风险）。
+1. ~~先落 §7~~ **已完成（2026-09-23）**：静态 ELF 通了，B 的 venv 前置也满足；
+   同一轮里"同拍写静态二进制→执行"暴露出的 **ETXTBSY** 归 N35①/N15 的写描述符释放策略
+   （改前被 EACCES 挡着看不见），不是本次改动的回退——改前是"永远跑不了"，改后是"晚一拍能跑"。
 2. 然后 **A 还是 B 取决于两个问题**：
    * 产品是否要求"沙箱里的文件系统就是普通文件系统语义"（`$0`、`sys.path[0]`、静态二进制、
      `mountinfo`、任何内核侧解析）？若是 ⇒ **A**，并接受一次 seccomp 档/安全评审的部署改动。
@@ -209,7 +244,70 @@ defense-in-depth 的一个面（userns 的 mount 仍受内核的 userns 限制�
 3. **不建议 C**（放宽规则覆盖宿主解释器目录）：它把宿主二进制当镜像二进制用，是静默的
    语义替换，与隔离目标冲突。
 
-## 9. 未结线索（不算结论）
+## 9. A 方案的安全评估
+
+A（真根：mount ns + pivot_root）是**形态级**改动，安全评估按"它动了哪些边界"逐条给结论，
+依据是本文档 §5 的实测（userns/caps、四条 EPERM、代码面）。
+
+### 9.1 它扩大了什么（唯一的实质面：容器内 mount 能力）
+
+今天生产 worker 容器里 `mount`/`umount2`/`pivot_root`/`chroot` 全是 EPERM（实测），
+而 A 必须让 **sandlock-init 自己能挂载**。两条实现路线：
+
+| 路线 | 放宽的东西 | 风险 |
+|---|---|---|
+| (i) seccomp 档加**不带 cap 门闩**的 `mount/umount2/pivot_root` | 容器里**任何**进程都能调用这几个 syscall | 中：内核的 userns 规则仍然兜底（非 FS_USERNS_MOUNT 的文件系统挂不上、locked mount 不能绑），但"容器内不可 mount"这条 defense-in-depth 消失 |
+| (ii) 把 `CAP_SYS_ADMIN` 还给 worker | 容器拿到全套 mount/新 mount API/setns 等 | **高**：这正是 A6/A7 刻意删掉的形状，等于回退那次收敛，且 cap 是"全有或全无"的粒度 |
+
+建议若走 A，取 (i) 而不是 (ii)：粒度更细、可审计、且不改变 worker 的 cap 集。
+
+### 9.2 它缩小了什么（同一改动带来的正收益）
+
+* **路径策略从"模拟"变"真实"**：内核侧路径解析（shebang 解释器、`binfmt_misc`、
+  将来任何新解析）落到沙箱自己的树里，规则拼写不再需要"猜"——§2 那三条规则里的
+  第二条（宿主 inode 无规则）本来就与"文件系统语义"矛盾，A 把它从根上消掉。
+* **fd 注入改写退场**：`/proc/self/fd/N` 那种"把调用方内存里的路径改掉"的手法不再必要，
+  随之消失的还有它的一串副作用（工具自己再 exec 一次撞 fd 路径 §10.2、`$0` 变异、
+  memfd 拷贝的 `/proc/self/exe` 差异）。
+* **隔离不变量的表达更硬**：`fs_denied`/只读挂载/`/dev` 六节点从"中介逐个 syscall 改写"
+  变成"挂载表 + Landlock 规则"，可被 `mountinfo` 直接观察与审计。
+
+### 9.3 它引入的新风险（按严重度）
+
+1. **挂载/卸载生命周期**：半成品挂载点、umount 失败、propagation（必须把 `/` 设成
+   private，否则宿主会看到沙箱的挂载）、并发建箱时的 mount 计数。缓解：挂载全部在
+   沙箱自己的 mount ns 内完成、失败即 `_exit`、退出路径幂等 umount，并在 lane 里加
+   "建箱→销毁×N 后 `mount` 计数不涨"的回归。
+2. **`/proc` 的去留**：今天 `/proc` 是中介**合成**的（1951 行 `procfs.rs`），含虚拟
+   hostname/uptime/mounts 等。真根之后要么继续合成（那 `/proc/self/root` 之类仍是"假"的，
+   但至少 fs 语义是真的），要么配 PID ns 挂真 procfs（更强，但要重做 PID ns 与
+   `/proc/<pid>` 的可见性策略）。这一条如果不做，A 的收益是"文件系统真、/proc 仍假"。
+3. **与 N15 的路径收敛**：pure 形态要不要一起换真根（`chroot_root="/"` 的 identity 形态）
+   决定是"一套路径设计"还是"两套"。不收敛的话，两套的差异会长期存在（但 pure 本来就没有
+   镜像可 pivot，属于设计选择而非漏洞）。
+4. **越权面**：真根之后沙箱**看得到**的是自己的树，但 cap 面没变（userns 里本来就是全 caps，
+   实测）。风险点是**挂载源的选择**：`fs_mount` 的来源必须只来自 worker 的可信输入
+   （今天已是如此：workspace/卷/dev 节点），否则"给沙箱挂宿主任意目录"就成了新的越权口。
+   缓解：把"哪些路径允许作为挂载源"写成策略侧校验（例如必须位于 workspace/卷 base 之下），
+   而不是靠调用方自觉。
+5. **回滚成本**：形态级改动的回滚要同时回滚 seccomp 档、镜像与部署清单；建议先用
+   `E2B_REAL_ROOT=1`（灰度开关）在 lane + 单节点跑通，再进生产清单一轮。
+
+### 9.4 与 B 的安全对比（同样按边界）
+
+| 维度 | A | B |
+|---|---|---|
+| 容器 capability/seccomp | **需要放宽**（§9.1） | 不动 |
+| 沙箱内新增可达面 | 无（树是自己的，cap 面不变） | 无（多注入一两个 fd；fd 只指向解释器与脚本） |
+| 内核侧解析的正确性 | 完全正确（真 fs 语义） | 只正确到"中介能改写的那些"；`binfmt_misc` 等仍会落到宿主空间 |
+| 语义副作用 | 需要复核 `/proc`、mountinfo、COW、账本（工程量大） | `$0`/`sys.path[0]` 变 fd 路径（**静默**的行为差异） |
+| 可回滚性 | 差（形态级 + 部署） | 好（一个 handler + 一个开关） |
+
+结论（安全角度）：**A 的净收益是"消掉一整类路径语义缺口"，代价是"容器内允许 mount"这一次
+显式的放宽**；B 不动部署边界，但把缺口留在了内核侧、并引入一个静默的语义差异。若走 A，
+务必取 §9.1 的 (i) 路线、并把 9.3.1/9.3.4 两条缓解做成硬性前置。
+
+## 10. 未结线索（不算结论）
 
 1. **两次 30 s 卡死，未复现**：最初两轮（trace 开、前面已跑十来条腿）里，20 次"写 + 拒绝 exec"
    的循环卡在 `access(2)` 通知上（supervisor 侧空闲）；随后同一段命令在独立容器里重跑

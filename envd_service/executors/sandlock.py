@@ -1666,6 +1666,22 @@ class SandlockExecutor(Executor):
             # view and need no carve-out; /proc/kcore and /sys stay denied
             # as defensive entries.
             fs_readable = list(fs_readable) + ["/"]
+            # The sandbox's own workspace (and every volume) is a *mount* in
+            # this mode, and what the sandbox touches behind those mount points
+            # lives on the host side. The fork grants a mount's rights to its
+            # *source*, and it derives them from what the policy declares for
+            # the mount point -- so the mount points have to be declared here,
+            # in the sandbox's own namespace, next to the host spellings above
+            # (which are what the mediator's on-behalf gate compares real paths
+            # against). Without this the source gets no path rule at all, and a
+            # binary the sandbox writes into its own workspace cannot be
+            # exec'd (N35: a static ELF fails with EACCES while the same binary
+            # inside the image rootfs runs).
+            fs_writable = (
+                list(fs_writable)
+                + ["/workspace", "/home/user"]
+                + [str(virtual) for virtual in self._fs_mounts]
+            )
             fs_denied = ["/proc/kcore", "/sys"]
         net_allow: list[str] = []
         net_deny: list[str] = []
@@ -1874,6 +1890,14 @@ class SandlockExecutor(Executor):
             # view and need no carve-out; /proc/kcore and /sys stay denied
             # as defensive entries.
             fs_readable = list(fs_readable) + ["/"]
+            # Same declaration as the instance ceiling above: the mount points
+            # of the sandbox's own tree, in the sandbox's own namespace, so the
+            # fork can grant their host sources the rights the policy declares.
+            fs_writable = (
+                list(fs_writable)
+                + ["/workspace", "/home/user"]
+                + [str(virtual) for virtual in self._fs_mounts]
+            )
             fs_denied = ["/proc/kcore", "/sys"]
         net_allow: list[str] = []
         net_deny: list[str] = []

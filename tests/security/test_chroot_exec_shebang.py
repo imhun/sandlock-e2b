@@ -26,6 +26,9 @@ measured it is ``tmp/k0s/probe_n35_exec_gate.py``.
 
 from __future__ import annotations
 
+import struct
+from pathlib import Path
+
 import pytest
 
 from tests.security.conftest import (
@@ -36,6 +39,41 @@ from tests.security.conftest import (
 )
 
 IMAGE = "python:3.11-slim"
+
+# Static ELFs available in the lane image (tini, shipped as docker-init). A
+# static binary is the shape that proves the *workspace's own inode* is
+# exec-allowed: a dynamic one goes through the mediator's memfd copy instead.
+STATIC_CANDIDATES = ("/usr/sbin/docker-init", "/sbin/tini", "/bin/busybox")
+
+
+def _elf_interpreter(path: Path) -> str | None:
+    """PT_INTERP path, "" for a static ELF, None for a non-ELF."""
+    try:
+        blob = path.read_bytes()
+    except OSError:
+        return None
+    if len(blob) < 64 or not blob.startswith(b"\x7fELF") or blob[4] != 2:
+        return None
+    (e_phoff,) = struct.unpack_from("<Q", blob, 0x20)
+    (e_phentsize,) = struct.unpack_from("<H", blob, 0x36)
+    (e_phnum,) = struct.unpack_from("<H", blob, 0x38)
+    for index in range(e_phnum):
+        off = e_phoff + index * e_phentsize
+        (p_type,) = struct.unpack_from("<I", blob, off)
+        if p_type != 3:  # PT_INTERP
+            continue
+        (p_offset,) = struct.unpack_from("<Q", blob, off + 8)
+        (p_filesz,) = struct.unpack_from("<Q", blob, off + 32)
+        return blob[p_offset : p_offset + p_filesz].rstrip(b"\0").decode(errors="replace")
+    return ""
+
+
+def _static_elf() -> Path | None:
+    for candidate in STATIC_CANDIDATES:
+        path = Path(candidate)
+        if path.exists() and _elf_interpreter(path) == "":
+            return path
+    return None
 
 
 def _chroot_sandbox():
@@ -72,8 +110,10 @@ async def test_elf_binary_copied_into_the_workspace_runs():
     strict=True,
     reason=(
         "N35: the kernel resolves a #! interpreter outside the mediator's "
-        "rewrite, and in the image-rootfs shape that lookup is refused with "
-        "EACCES -- docs/chroot-workspace-exec.md"
+        "rewrite, and in the image-rootfs shape that lookup is refused -- "
+        "EACCES once the file's own inode is exec-allowed and its write "
+        "descriptor has been released, ETXTBSY while the mediator still holds "
+        "that descriptor (same tick) -- docs/chroot-workspace-exec.md"
     ),
 )
 async def test_shebang_script_written_into_the_workspace_runs():
@@ -87,5 +127,32 @@ async def test_shebang_script_written_into_the_workspace_runs():
             "&& chmod +x ./n35_script && ./n35_script",
         )
         assert (code, out.strip(), err) == (0, b"script-hi", b"")
+    finally:
+        executor.close()
+
+
+@pytest.mark.usefixtures("require_sandlock")
+async def test_static_binary_in_the_workspace_runs():
+    """The other half of the gap, and the one a fix could close first.
+
+    A static ELF has no PT_INTERP, so the mediator cannot hand the kernel an
+    anonymous copy: the exec reaches the workspace's own inode. That inode had
+    no path rule until 2026-09-23 (`fs_writable` came in host-spelled and the
+    chroot translation dropped it, so the mount source was never granted), and
+    the refusal was EACCES. It is granted now, which is what this test pins.
+    """
+    source = _static_elf()
+    if source is None:
+        pytest.skip("no static ELF in the lane image to use as the fixture")
+    executor, workspace = _chroot_sandbox()
+    try:
+        (Path(workspace) / "static_bin").write_bytes(source.read_bytes())
+        (Path(workspace) / "static_bin").chmod(0o755)
+        code, out, err = await run_sh(
+            executor, workspace, "/workspace/static_bin --version"
+        )
+        assert code == 0, f"exit={code} stderr={err!r}"
+        assert out.startswith(b"tini version"), out
+        assert err == b""
     finally:
         executor.close()
