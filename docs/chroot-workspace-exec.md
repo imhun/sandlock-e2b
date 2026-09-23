@@ -691,3 +691,30 @@ sandlock 默认黑名单里、seccomp 又是单向的 ⇒ 那会把一个众所�
 
 **对 E2B 的含义**：生产形态是 chroot(+`real_root`) ⇒ 在 11.1 落地前"恢复沙箱"类功能不可用
 （`test_checkpoint_restore_unused.py` 挡住误用）；落地后按 11.1 第 4 条的验收重跑即可。
+
+### 11.3 "先存镜像文件、再从文件恢复" —— 引擎已经支持，且与 11.1 正交（不是它的替代）
+
+fork 里已有目录式镜像：`Checkpoint::save(dir)` / `Checkpoint::load(dir)`
+（`checkpoint/image.rs`，格式 v2、先写 `*.tmp` 再原子 rename），FFI 出
+`sandlock_checkpoint_save` / `sandlock_checkpoint_load`，Python `_sdk` 也绑了；`sandlock-oci`
+就是这条路：`checkpoint <id> --image-path <dir>` → `restore <id> --image-path <dir>`，
+`run_supervisor_restore` 在**另一个进程**里 `Checkpoint::load` 再恢复（OCI 用例甚至恢复到
+第二个容器）。**镜像内容**：`meta.json`（name / cow_snapshot / version）、**`policy.dat`
+（bincode 序列化的 Sandbox 政策）**、可选 `app_state.bin`、`process/{info.json（pid/cwd/exe）、
+fds.json、memory_map.json（**每一条映射**，含文件后备区域，供恢复时按原文件重映射）、
+threads/0.bin（寄存器+FP）、memory/<start_hex>.bin（匿名区被捕获的字节）}`。恢复时用的是
+**镜像里保存的政策**（`cp.policy.clone()`），所以镜像是"自含怎么建这个沙箱"的。
+
+**为什么它不是 11.1 的替代**：文件形态只改变"镜像**从哪来**"（内存 → 磁盘），不改变
+"镜像**怎么进到沙箱进程里**"——恢复流程仍然是"按政策起一个新沙箱 → 在里面 exec stub →
+supervisor 把页写进去"。OCI 那条 bonus 注记（"restore of a chrooted checkpoint is a separate
+limitation"，因为 bundle 形态带 chroot）正好印证：文件形态一样卡在 stub 上。
+
+**要用它做 E2B 的"暂停/恢复"，文件形态另外带来这些前提**（都要单列验收）：
+* 只能**同内核**恢复（引擎自述），且只有 x86_64 / riscv64 引擎；
+* `restore_skipped` 覆盖 socket/pipe/memfd —— **连接类 fd 不会回来**（对沙箱内 MCP gateway
+  这类形状是硬约束）；
+* `memory_map.json` 与 `fds.json` 记的是**宿主路径**，恢复时经 `restore_blob::plan` 按 chroot/
+  挂载翻译 ⇒ 镜像只在"镜像 rootfs 与各卷挂载仍按同样方式解析"时有效；`cow_snapshot` 记的是
+  **路径**，上层目录必须还在（或随镜像一起快照）；
+* 镜像里含政策与进程内存 ⇒ 存储位置、属主/权限、配额与清理要和沙箱数据同级对待。
