@@ -739,3 +739,44 @@ limitation"，因为 bundle 形态带 chroot）正好印证：文件形态一样
 B 是"彻底不要 stub"的路（正中 §11 的病根，但要用一份"无 stray mapping + fd 表干净"的新证明
 换掉 stub 自带的两个免费性质），值得作为备选做一次原型；C/E 都要付"脏地址空间"或大依赖的代价；
 F 只能覆盖"沙箱还活着"的暂停。
+
+### 11.5 B 路线的**正确形态**：不是"就地调用函数"，而是"把 stub 用 mmap 装进来再跳进去"
+
+先说清楚最容易走歪的一点：**"在 supervisor 里调一个 restore 函数"这种进程内写法是不可行的**，
+因为⑤"要执行的代码"恰好就是留在地址空间里的那部分 —— supervisor 是 PIE（随机基址）+ libc +
+tokio + 堆，无法与镜像区域解耦。**可行的形态是**：supervisor 打开 stub、把它的 ELF 段
+`mmap` 到**固定保留窗口**（`STUB_BASE`，stub 本来就是按这个基址链接的）、切到私有栈、跳进它的
+入口 —— 也就是"**把 stub 的投递方式从 `execve` 换成 `fd + mmap`**"。这样：
+
+* **两条 §11 的关一起消失**：不 `execve` ⇒ 没有路径解析、**也不需要给 stub 任何 Landlock 执行
+  授权**（不 exec 就没有可授权的执行；maps 里的代码直接跑）。相比 §11 的"给 stub 宿主路径一条
+  `EXECUTE|READ`"，B 在**规则集面上更干净**（不新增任何权限）。
+* **干净地址空间这条还能保住**：`restore_blob::plan_sweep(current, cp)` 本来就是通用实现 ——
+  它拿"子进程**当前**的 maps"减掉"镜像记录的 maps + `STUB_BASE` 窗口"算出要 unmap 的残留，
+  stub 侧再执行；它不关心载荷是怎么进来的。exec 形态下 `current` 只有 stub 自己几页，
+  mmap 形态下 `current` 是"fork 自 supervisor 的一整套映射"，机制不变、**规模变了**。
+
+**代价与待验（六条，都要单独验收）**：
+
+1. **sweep 规模**：`MAX_SWEEP 256` / `resume::MAX_SWEEP_ENTRIES` 是照 exec 形态定的；fork 形态
+   下 glibc + tokio 的映射可能上百条，要实测并把上限当契约写死（超限必须报错，不能静默漏 unm）。
+2. **多线程 fork**：子进程是 supervisor 的 fork（route B 的 supervisor 带 tokio/事件泵）。fork
+   只保留调用线程，**别的线程持有的锁会冻结在锁住状态** ⇒ 载荷必须"零分配、不取锁"（现在的 stub
+   天生如此；`init/mod.rs::child_fail` 的注释也写着"glibc 的堆在这条单线程回路上是 fork 安全的"）。
+3. **fd 表不再免费清零**：`execve` + `CLOEXEC` 是白送的一步；mmap 路线要自己关掉 supervisor 的
+   **整张**表（控制 socket、notify listener、trace fd…），再按镜像记录的原编号重开。E2B 刚因
+   "trace fd 落进 workload" 修过一次同类问题 ⇒ 验收项应是"恢复后的 fd 表 == 镜像记录，且不含任何
+   平台 fd"。
+4. **文件后备区域自己开**：匿名页以外（text / so / 解释器）走 `RemapFromFile`，要由载荷在
+   **Landlock 域内**按 plan 翻译过的虚拟路径打开（stub 今天也是这么做），保持"超出可读集就按
+   plan 的规则处理"的现状。
+5. **入口要小改**：stub 的 `_start` 依赖内核给的初始栈/auxv（只为 `AT_SYSINFO_EHDR` 取 vDSO 基址）。
+   mmap 装机没有这套 ⇒ 加个 shim 合成最小 auxv，或把 vDSO 基址当参数传进去（镜像里本来就记了
+   vDSO 的落点）。有界改动，约十几行。
+6. **成本对比**：exec 形态付出的是"一次 execve + 一个二进制要可达"；mmap 形态付出的是"fork 一份
+   supervisor 的 COW 地址空间 + 全量 sweep"。两者都要实测（页面数、时间、负载下的稳定性）。
+
+**结论**：B 不是"更省事的 A"，而是把风险从"沙箱内能不能 exec 到 stub（路径 + 一条授权）"换到
+"fork 出来的脏地址空间 + 全量 fd 表能不能清干净"。**规则集面上它更干净**（不加权限），机制上
+`plan_sweep`/`restore_blob`/stub 主体都可复用 —— 所以值得做一个原型：在 `chroot + real_root(true)`
+下用 mmap 装机恢复一次、断言"计数器前进 + 无 stray mapping + fd 表干净"，再把上面六条逐条量出来。
