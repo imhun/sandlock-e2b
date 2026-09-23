@@ -126,9 +126,11 @@ E2B_REAL_ROOT=1 ./deploy/scripts/test-prod-shaped.sh tests/security
    用的是 stale cwd ⇒ 相对路径 exec ENOENT。真根下改为**让内核真正执行 chdir**（先做
    存在性/越界校验与记账，再 `Continue`）。
 
-另外为让"写→立刻执行"这一形状在真根下成立，exec 前会**结清并释放该文件的写 watch**
-（中介持有的 `held` 描述符正是 ETXTBSY 的来源，即 N35① 的窗口）：先按 pump 的做法读一次
-终值记账，再 `forget`，所以账不失真、文件立刻可执行。
+另外为让"写→立刻执行"这一形状在真根下成立，**每次 exec 前都会"结算"一次写 watch**：
+把**所有"沙箱已经关闭、而中介还握着 held 副本"的条目**按 pump 的方式读一次终值（记账不失真）、
+标记脏路径（账本 walk 仍会重读）、再释放掉副本（这正是 ETXTBSY 的来源）。写者仍在运行的条目
+**故意不动**——那时内核拒绝是对的（沙箱自己的描述符还开着）。这条通用规则同时覆盖了 exec 目标、
+脚本的解释器、以及其它"内核自己解析"的路径（早期版本是按路径定点释放，已被它取代）。
 
 ### 5.1 现状盘点（实测）
 
@@ -400,13 +402,12 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 
 ### 9.6 打开真根之后仍存在的缺口（本轮实测）
 
-1. **同拍写入的文件当"别人的解释器"的 ETXTBSY —— 已修（2026-09-23，同一轮）**：exec 前中介除了释放
-   "被 exec 的文件"的写 watch，还会**读一次该文件的 `#!` 行**（与读 ELF `PT_INTERP` 同一手法），
-   把**解释器**的写 watch 也结清释放（嵌套解释器按内核那样最多跟 4 层；释放前的终值读数保证账不失真）。
-   用例：`tests/security/test_chroot_exec_shebang.py::test_script_whose_interpreter_was_written_in_the_same_command_runs`
-   （venv console script 形状），真根开=通过、关=xfail；探针腿 `shebangguest` 同样由 126 变 rc=0。
-   **残留**：仅在"解释器路径与写者不同名（例如经过一层符号链接指向刚写的文件）"这类边角上仍可能撞到，
-   因为 watch 比较用的是解析后的路径（已做 canonicalize 兜底）。
+1. **同拍写入的文件当"别人的解释器"的 ETXTBSY —— 已修（2026-09-23）**：做法已升级为**通用规则**——
+   每次 exec 前结算并释放**所有"沙箱已关闭、而中介还握着 held 副本"的条目**（读终值 → 标脏 → forget），
+   因此 exec 目标、脚本的解释器、以及其它内核侧解析路径一并覆盖，不需要专门解析 `#!`
+   （早期的按路径定点+shebang 解析版本已被删除）。用例：
+   `tests/security/test_chroot_exec_shebang.py::test_script_whose_interpreter_was_written_in_the_same_command_runs`
+   （venv console script 形状），真根开=通过、关=xfail；探针腿 `shebangguest` 由 126 变 rc=0。
 2. **`/proc` 仍是合成的 —— 已定案：本平台无法在沙箱侧挂真 procfs（实测，不是没做）**。
    三条实测：① 在自建 userns 里 `mount("proc", …)` **EPERM**（没有自己的 pid ns 时内核按规则拒）；
    ② 加 `unshare(CLONE_NEWPID)` 并在 fork 之后（pid=1）再挂，**仍然 EPERM**；
@@ -421,8 +422,20 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 3. **部署依赖**：`deploy/seccomp/sandlock-worker.json` 已加无门闩的
    `mount/umount2/pivot_root` 允许项，但**节点必须先应用这份档**（DaemonSet）再打开
    `E2B_REAL_ROOT`，否则建箱全 EPERM。
-4. **已补的验收**：`tests/security/test_real_root_mounts.py` 钉住"建箱→销毁 3 次后 worker
-   自己的挂载表一字不变"（§9.5 的 ②）——两种形状都跑，实现在宿主命名空间里挂载会立刻红。
+4. **已补的验收（§9.5 的 ②）**：`tests/security/test_real_root_mounts.py` 钉住"建箱→销毁 3 次后
+   worker 自己的挂载表一字不变"——两种形状都跑，任何"把挂载做在宿主命名空间里"的实现会立刻红。
+5. **binfmt_misc（及其它内核侧格式解析）—— 已实测并钉住（2026-09-23）**：注册一个自己的
+   magic 处理器（`:n35probe:M::#N35BINFMT::/bin/sh:`，解释器是**镜像内**路径），在 workspace 里
+   放一个以该 magic 开头的可执行文件：
+   * **真根开**：内核在**镜像自己的树**里解析 `/bin/sh` ⇒ payload 真的跑起来（rc=0）；
+   * **模拟形态**：解释器落在**宿主路径空间**，chroot 翻译后的规则集没有覆盖 ⇒ **EACCES 126**
+     （与 shebang 同一机制，之前没人报过是因为没人用 binfmt 形状的镜像）。
+   ⇒ 结论：真根同样修好这一类；前提是**解释器必须存在于镜像里**（注册表属于 worker 的内核，
+   解释器路径由内核在沙箱的根里解析）。用例：
+   `tests/security/test_chroot_exec_shebang.py::test_a_format_handler_resolves_its_interpreter_inside_the_sandbox`
+   （自己挂 `binfmt_misc`、自己注册，真根开=通过 / 关=xfail）。**剩余**：解释器只在宿主存在的
+   处理器仍然不可用（这是"注册表在宿主机、镜像里没有该解释器"的必然结果，不是缺口）。
+
 
 
 ## 10. 未结线索（不算结论）

@@ -26,7 +26,9 @@ measured it is ``tmp/k0s/probe_n35_exec_gate.py``.
 
 from __future__ import annotations
 
+import os
 import struct
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -165,6 +167,70 @@ async def test_script_whose_interpreter_was_written_in_the_same_command_runs():
             )
         assert code == 0, f"exit={code} stderr={err!r}"
         assert b"interp-marker" in out, out
+    finally:
+        executor.close()
+
+
+#: A magic binfmt_misc registration of this test's own, so the case does not
+#: depend on which handlers the host happens to advertise. The magic is a shell
+#: comment on purpose: the interpreter (`/bin/sh`) reads the same file, and the
+#: test wants its output to be the payload only.
+BINFMT_NAME = "n35probe"
+BINFMT_MAGIC = "#N35BINFMT"
+
+
+def _register_binfmt_handler() -> bool:
+    if os.geteuid() != 0:
+        return False
+    register = Path("/proc/sys/fs/binfmt_misc/register")
+    if not register.exists():
+        # The registry is a mount, not a permanent part of /proc: bring it up
+        # when this process may, and skip when it may not.
+        subprocess.run(
+            ["mount", "-t", "binfmt_misc", "binfmt_misc", "/proc/sys/fs/binfmt_misc"],
+            check=False,
+            capture_output=True,
+        )
+    if not register.exists():
+        return False
+    entry = Path("/proc/sys/fs/binfmt_misc") / BINFMT_NAME
+    if entry.exists():
+        return True
+    # `M` = magic at offset 0; the interpreter is an in-image path.
+    register.write_text(f":{BINFMT_NAME}:M::{BINFMT_MAGIC}::/bin/sh:\n")
+    return entry.exists()
+
+
+@pytest.mark.usefixtures("require_sandlock")
+async def test_a_format_handler_resolves_its_interpreter_inside_the_sandbox():
+    """binfmt_misc is the other thing the kernel execs by itself.
+
+    The registration belongs to the worker (it is the host's kernel registry),
+    but the interpreter path it names is resolved *by the kernel*, in whatever
+    root the exec'ing process has. Under a real root that is the image's own
+    `/bin/sh`, so the payload runs; under the emulated root the lookup lands in
+    the host's path space, where the chroot-translated ruleset has no rule, and
+    the exec is refused (measured: EACCES, rc 126 -- the same mechanism as the
+    shebang case).
+    """
+    if not _register_binfmt_handler():
+        pytest.skip("binfmt_misc needs root and a mounted binfmt_misc registry")
+    executor, workspace = _chroot_sandbox()
+    try:
+        payload = Path(workspace) / "n35_binfmt_payload"
+        payload.write_text(f"{BINFMT_MAGIC}\n/bin/echo binfmt-ran\n")
+        payload.chmod(0o755)
+        code, out, err = await run_sh(
+            executor, workspace, "/workspace/n35_binfmt_payload"
+        )
+        if not getattr(executor, "_real_root", False):
+            pytest.xfail(
+                "N35: a format handler's interpreter is resolved in the host's "
+                "path space without a real root -- docs/chroot-workspace-exec.md"
+            )
+        assert code == 0, f"exit={code} stderr={err!r}"
+        assert b"binfmt-ran" in out, out
+        assert err == b"", err
     finally:
         executor.close()
 
