@@ -5,9 +5,13 @@ sandbox runs it"), both on the production path -- pooled per-sandbox host uid
 plus an ``E2B_ROUTE_B=auto`` slot, which is the only identity that mediations
 run as (see ``tests/security/conftest.py::route_b_sandbox``):
 
-* an **ELF binary** copied into the workspace runs. The mediator handles the
-  ``execve``, opens the target itself and rewrites the caller's path to an
-  injected ``/proc/self/fd/N``, so no host path ever has to resolve;
+* a **dynamic ELF binary** copied into the workspace runs. It only runs because
+  the mediator handles the ``execve`` by opening the target itself, copying it
+  into an *anonymous memfd* (patching PT_INTERP) and rewriting the caller's
+  path to that fd -- anonymous inodes are the one exec target no Landlock rule
+  has an opinion about. A *static* ELF in the workspace does NOT run (measured:
+  EACCES, while the same binary inside the image rootfs runs), so this test is
+  deliberately the dynamic case;
 * a **shebang script** does not, with ``EACCES``. The kernel resolves the
   ``#!`` interpreter on its own, inside the same syscall and without a second
   seccomp notification, and that lookup is refused in this shape.
@@ -15,9 +19,9 @@ run as (see ``tests/security/conftest.py::route_b_sandbox``):
 The second case is the *gap*, not the contract: it is pinned as a strict
 ``xfail`` so the suite records today's behavior, and flips to ``XPASS`` (a
 failure, on purpose) the day it is fixed by N14's real root or by a shebang
-branch in the mediator. Reasoning, evidence and the three options are in
-``docs/shebang-exec-in-chroot.md``; the probe that measured it is
-``tmp/k0s/probe_n35_exec_gate.py``.
+branch in the mediator. Reasoning, evidence, the static-ELF half of the gap and
+the A/B account are in ``docs/chroot-workspace-exec.md``; the probe that
+measured it is ``tmp/k0s/probe_n35_exec_gate.py``.
 """
 
 from __future__ import annotations
@@ -43,11 +47,13 @@ def _chroot_sandbox():
 
 @pytest.mark.usefixtures("require_sandlock")
 async def test_elf_binary_copied_into_the_workspace_runs():
-    """The control half: a binary the sandbox just wrote into its own tree runs.
+    """The control half: a *dynamic* binary the sandbox wrote into its own tree.
 
-    It goes through the mediator's fd injection, so this also pins that the
-    workspace is *not* missing an exec grant -- the refusal in the test below
-    is about the interpreter lookup, not about the file's location.
+    This is the shape that works, and it works through the mediator's memfd
+    copy -- not because the workspace's own inode is exec-allowed. The static
+    binary and the script are the halves that do not work; see
+    ``docs/chroot-workspace-exec.md`` §1 for both (and for why this control has
+    to stay dynamic to keep its meaning).
     """
     executor, workspace = _chroot_sandbox()
     try:
@@ -67,7 +73,7 @@ async def test_elf_binary_copied_into_the_workspace_runs():
     reason=(
         "N35: the kernel resolves a #! interpreter outside the mediator's "
         "rewrite, and in the image-rootfs shape that lookup is refused with "
-        "EACCES -- docs/shebang-exec-in-chroot.md"
+        "EACCES -- docs/chroot-workspace-exec.md"
     ),
 )
 async def test_shebang_script_written_into_the_workspace_runs():
