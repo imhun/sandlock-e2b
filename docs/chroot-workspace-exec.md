@@ -534,6 +534,8 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
    **③ 对 E2B 的含义**：E2B 的生产形态就是 chroot 根（`E2B_BASE_IMAGE=python-mcp:3.14` ⇒
    image-rootfs），所以在把 stub 送进根里之前，**"恢复沙箱"这类功能在这条 API 上不可用**——这条
    写成前置条件，真要做时按它开工，而不是"将来若启用需重新验证"这种含糊说法。
+   **④ 可行方案见 §11**（关键未知量——按 fd 执行是否绕过 Landlock——已实测，结论是"不绕过权限、
+   但绕开路径解析"，所以方案是"fd 执行 + 给 stub 宿主路径一条执行授权"）。
 
 
 ## 10. 未结线索（不算结论）
@@ -594,3 +596,61 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 
    形状细节：两条用例都是 **pure 形态**（`base_image=None` / 无 rootfs，现场 `chroot=None`），
    与真根无关；这是"errno 只该读一次"的通用缺陷，任何"诊断自身会失败"的路径都可能踩到。
+
+
+## 11. 真根下 checkpoint/restore 的可行方案（2026-09-23，关键未知量已实测）
+
+**问题（§9.7.9 实测）**：`restore_interactive` 把 restore stub 当**宿主路径** exec；任何
+chroot 根（模拟的、真根的）都把 workload 路径解析到 rootfs 内 ⇒
+`execvp '…/restore-stub': No such file or directory` 后 10 s READY 超时。当前已临时改为
+**立即拒绝**（fork `43cc62a`），方案落地前拒绝对话就是正确行为。
+
+**关键未知量：按 fd 执行（`execveat(fd, "", …, AT_EMPTY_PATH)`）能不能绕过 Landlock？**
+探针 `tmp/k0s/probe_landlock_execveat.py` 自建 Landlock 域（decoy 目录全权、`/` 与 `/tmp`
+只给 search），用**静态**二进制（`tests/rootfs-helper`）当 stub —— 第一版用 `/bin/true`
+时 EACCES 其实来自"动态解释器读不到"，属测量污染，记在这里以免后来人重踩。
+
+| 规则集 | `execve(stub 路径)` | `execveat(stub_fd, "", AT_EMPTY_PATH)` |
+|---|---|---|
+| stub 在授权之外（decoy 之外） | EACCES(13) | **EACCES(13)** |
+| 额外把 stub 的**宿主文件**授 `EXECUTE\|READ` | 跑起来（helper usage，exit 1） | **跑起来** |
+
+结论：**fd 形式不是权限后门**（Landlock 仍按文件真实路径判定），但它**绕开了路径解析** ——
+而这正是 chroot/真根形态下唯一坏掉的那一环。所以方案 = **"fd 执行" + "给 stub 的宿主路径一条
+执行授权"** 两条同时给，缺一条都不成立。
+
+### 11.1 推荐方案（改动都在 fork 内，E2B 侧零改动）
+
+1. **`restore_interactive`**：把 stub 以 `O_PATH|O_CLOEXEC` 打开，fd 走**已有**的注入通道
+   （`resume::StubChannel::extra_fds()` → `rt.extra_fds`，restore 本来就在用它传 blob 通道），
+   并把 `fs_readable.push(stub)` 换成"给 **stub 的宿主路径** 授 `EXECUTE|READ`"的规则 ——
+   Landlock 规则集在 `pivot_root` **之前**按宿主路径构建，表达这条没有障碍。
+2. **init / `create_interactive`**：新增"以 fd 执行"的入口（program spec 里带 `exec_fd`），
+   child 侧用 `execveat(exec_fd, "", argv, envp, AT_EMPTY_PATH)` 代替 `execvp(path)`。
+   `keep_fds`/`extra_fds` 已保证该 fd 到达 child，init 的 exec 分支只需多一个模式。
+3. **中介（supervisor）无需改动**：fd 执行不经过路径翻译；真根形态 mediator 本来就对该 execve
+   答 `Continue`（`child_is_pivoted` 分支），这套改动恰好补上"无法注入 fd 时怎么办"。
+   模拟 chroot 形态同样受益：不再需要把宿主路径翻译进 rootfs。
+4. **验收（RED → GREEN）**：
+   * 把 `test_restore_resumes_inside_a_real_root` 从"两种根形态立即拒绝"翻成"两种根形态都能
+     恢复、计数器继续前进"，chroot-free 的 `test_restore_glibc_vdso_program_resumes` 继续做正向对照；
+   * 再加一条负向用例：**授权缺失时立即拒绝并点名 stub**（防止退化成 10 s 超时）；
+   * E2B 侧：`E2B_REAL_ROOT=1` 跑 `tests/security` + 一条"恢复后计数器前进"的形态用例，并解除
+     `tests/unit/test_checkpoint_restore_unused.py` 的守卫（该用例就是为这一刻留的门）。
+5. **风险与待验**：
+   * 该改动把 stub 放进沙箱的**可执行授权集**（仅这一个文件、只读+执行）。stub 是平台自己的
+     静态二进制、workload 不可写，但按规矩仍要做一次评审确认这不是新的越权面；
+   * 需要 file 级 `EXECUTE` 规则（本机 Landlock ABI **8** ✓；老内核要按 ABI 探测降级）；
+   * 沙箱已设 `no_new_privs`，`execveat` 无额外前提 ✓。
+
+### 11.2 备选（fd 路线若在某个内核/ABI 上不成立）
+
+* **B1 策略挂载把 stub 带进根里**：把持有 stub 的目录（只读）bind 到 rootfs 内**已存在**的目录上。
+  真根形态可行（realroot 就是按策略挂载做 bind）；**模拟 chroot 形态不行**（没有内核挂载，
+  路径必须真实存在于 rootfs）。代价：要在共享镜像树里放挂载点，需 per-sandbox 命名与清理。
+* **B2 E2B 侧 staging**：把 stub 拷进沙箱自己的 workspace（per-sandbox、可写、随沙箱销毁），
+  core 的 restore API 接受"调用方指定的 stub 位置"。代价：恢复语义变成"宿主先给一个可写位置"。
+* **B3 直接往 rootfs 拷 stub**：单租户/独占 rootfs 下最简单，但污染共享镜像，不建议用于 E2B 现形态。
+
+**对 E2B 的含义**：生产形态是 chroot(+`real_root`) ⇒ 在 11.1 落地前"恢复沙箱"类功能不可用
+（`test_checkpoint_restore_unused.py` 挡住误用）；落地后按 11.1 第 4 条的验收重跑即可。
