@@ -128,6 +128,12 @@ async def test_shebang_script_written_into_the_workspace_runs():
             "&& chmod +x ./n35_script && ./n35_script",
         )
         if not getattr(executor, "_real_root", False):
+            # The gap has to be *there* when the shape that closes it is off: if
+            # this ever stops holding, the case moved rather than regressed, and
+            # the suite should say so instead of quietly accepting an xfail.
+            assert (code, out.strip(), err) != (0, b"script-hi", b""), (
+                "the shebang gap closed without a real root"
+            )
             pytest.xfail(
                 "N35: refused without a real root (EACCES/ETXTBSY) -- "
                 "docs/chroot-workspace-exec.md"
@@ -161,6 +167,9 @@ async def test_script_whose_interpreter_was_written_in_the_same_command_runs():
             "&& ./n35_uses_interp interp-marker; echo rc=$?",
         )
         if not getattr(executor, "_real_root", False):
+            assert not (code == 0 and b"interp-marker" in out), (
+                "the workspace-interpreter gap closed without a real root"
+            )
             pytest.xfail(
                 "N35: a workspace-resident interpreter is refused without a "
                 "real root -- docs/chroot-workspace-exec.md"
@@ -224,6 +233,9 @@ async def test_a_format_handler_resolves_its_interpreter_inside_the_sandbox():
             executor, workspace, "/workspace/n35_binfmt_payload"
         )
         if not getattr(executor, "_real_root", False):
+            assert not (code == 0 and b"binfmt-ran" in out), (
+                "binfmt_misc resolution succeeded without a real root"
+            )
             pytest.xfail(
                 "N35: a format handler's interpreter is resolved in the host's "
                 "path space without a real root -- docs/chroot-workspace-exec.md"
