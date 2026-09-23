@@ -516,3 +516,28 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
    本轮加了 `SANLOCK_REALROOT_TRACE=<file>`：把每一步、以及 `fail!`/`child_fail`/exec 的
    失败原文写进同一个**先开好的 fd**（pivot 之后路径已不可解析，必须用 fd）——排查这类
    "instance is closed 但没有原因"的问题就靠它。
+4. **`deploy/scripts/test-prod-shaped.sh` 的 phase 1 目前是红的（2 条，且不是本轮引入）**：
+   `tests/contract/test_route_b_executor.py::test_missing_binary_exits_127_through_the_slot`
+   与 `tests/contract/test_sandbox_lifecycle_rebuild.py::test_nonexistent_binary_exits_127_with_no_output`
+   钉的是"缺失的可执行文件＝退出码 127 且**没有任何输出**"（fork 的 `execvp` 语义）。在 phase-1
+   形状下这两条实测拿到 **`sandlock-init: exec "/nonexistent-e2b-bin" failed (errno 13)`** ——
+   缺路径答的是 **EACCES(13)** 而不是 ENOENT，于是 fork 的 FUP-26 诊断行（`errno != ENOENT` 时
+   打印，`init/mod.rs::exec_fail`）落在 guest 的 stderr 上，契约的 "no output" 破了。
+   **不是本轮引入**：把工作树切到本轮之前的 `0021a9f`（`git worktree add`，同一个容器形状）跑同样
+   两条 → 同样 2 failed；消息文本也来自镜像里的 fork（镜像构建早于本轮三个提交）。**根因留给 fork**，
+   但现象已定位到"缺失路径的 errno 随 `SANLOCK_REALROOT_TRACE` 变"。实测矩阵（同一个 phase-1 形状，
+   只改这一个环境变量，`tmp/k0s/phase1-probe2.sh` 即该实验的脚本）：
+   * `SANLOCK_REALROOT_TRACE` **未设** → `test_route_b_executor.py` **1 failed / 13 passed**；
+   * 设成任意值（`/workspace/tmp/...`、`/tmp/...`，甚至**空字符串**）→ **14 passed**。
+
+   `realroot::trace_enabled()` 就是 `env::var(..).is_ok()`（`realroot.rs:114`），所以"变量在不在"
+   一为真，缺失路径就回到 ENOENT、诊断行不再出现。fork 里唯一按它分叉的地方是 `context.rs:1034`
+   把 trace fd 加进子进程的 keep 列表（紧接着 `close_fds_above(2, &fds_to_keep)`），所以下一步应从
+   "多 keep 一个 fd 为什么会改变 `execvp` 的 errno"查起（怀疑与 exec 的 fd 注入路径或规则集构造的
+   交互有关，**未验证**）。**为什么之前没被发现**：N35 的 lane（`tmp/k0s/n35-lane.sh`）默认就设
+   `SANLOCK_REALROOT_TRACE`，正好把这个差异盖住了。
+
+   形状细节：两条用例都是 **pure 形态**（`base_image=None` / 无 rootfs，现场 `chroot=None`），
+   与真根无关 —— 这是"fork 对缺失路径的 errno 语义 + 诊断行可见性"的问题。**待决**：修 fork
+   （让缺失路径稳定回 ENOENT），还是改契约（接受非 ENOENT 时的一行诊断）；倾向前者，因为契约与
+   fork 的注释本来就是同一立场（ENOENT 静默），只是这条路径的 errno 在两种形态下漂了。
