@@ -402,6 +402,44 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 
 ### 9.6 打开真根之后仍存在的缺口（本轮实测）
 
+### 9.7 真根实现的安全复核（2026-09-23，逐条实测）
+
+结论：**净变化以"收权"为主**，唯一的放宽（容器档允许 mount）已用参数过滤收到"只能 bind/传播"。
+逐条（数字都是本机 lane 实测）：
+
+1. **沙箱能力下降**：工作负载 `CapEff` 由 `000001ffffffffff` → **`000001ffffdfffff`**
+   —— 正好只清掉 bit 21（`CAP_SYS_ADMIN = 0x200000`）；`NNP=1`、`Seccomp=2` 不变。
+   恢复无路：`unshare` 在沙箱自己的黑名单里、`clone` 有 namespace 参数过滤、`NNP=1` 让文件
+   caps 失效、permitted 已清 ⇒ 拿不回来。
+2. **工作负载只继承 stdio**：修复后 `/proc/<pid>/fd` 只有 0/1/2。
+   **本轮复核发现并修掉一个洞**：诊断用的 `SANLOCK_REALROOT_TRACE` 文件描述符原先会被
+   工作负载继承（实测 fd 20 指向宿主上的 trace 文件——等于把宿主文件的写句柄交给沙箱）；
+   现在显式 `FD_CLOEXEC`。exec **失败**时该标志不生效，所以"exec 失败面包屑"仍能用。
+3. **容器级放宽已收窄**：`mount` 只允许 **fstype == NULL**（bind / 传播操作，真根只用到这些），
+   `umount2`/`pivot_root` 不加参数过滤（这两条参数表太短，加索引会读到垃圾寄存器，libseccomp
+   也会直接拒，故拆成两条规则）。实测（**钉死的生产 cap 形状**，容器无 SYS_ADMIN）：
+   **容器里任何 userns-root 进程都挂不了任何文件系统**（tmpfs/procfs 全 EPERM），
+   而真根的 bind + `pivot_root` + `umount2(MNT_DETACH)` 照常工作——真根在该形状下**端到端全通**
+   （脚本/相对路径/venv 解释器/静态二进制/20 次循环），guest 的 mount 仍 EPERM。
+4. **"内核侧解析落到宿主空间"这一类被消除**（而不是被 Landlock 兜住）：真根把旧根 `MNT_DETACH`，
+   `#!`、ELF 的 `PT_INTERP`、binfmt 处理器都在**镜像树内**解析。实测 binfmt：真根=成功，
+   模拟形态=EACCES 126 ⇒ 对比证明是"路径空间"变了。
+5. **沙箱有独立的 mount ns**：实测 `mnt:[4026532705] ≠ 容器 4026532453`；且建箱→销毁 3 次
+   宿主的挂载表一字不变（`tests/security/test_real_root_mounts.py`）。
+6. **共享镜像 rootfs 仍只读**：Landlock 对 rootfs 的规则是 `READ_ACCESS`（§7 的"挂载源写掩码"
+   只作用于 workspace/卷），沙箱写 rootfs 仍走中介的 COW/拒绝；既有
+   `test_write_outside_workspace_denied` 在两种形状下都过。
+7. **本轮复核中的两条"非本次引入"观察（已记档，未改）**：
+   a. 沙箱在 exec 前曾持有 seccomp **notify listener fd**（`context.rs` 的 `keep_fd` +
+      `mem::forget`）。若这一 fd 进入工作负载，理论上它可以**自答自己的通知**（绕过 notify
+      类策略检查；Landlock 仍在，真根下内核侧回退解析也只在沙箱树内）。建议后续在父进程
+      取走 listener（ready 握手）之后、exec 之前显式关掉它，并在两种形状各验一次。
+   b. 本内核不在 `/proc/<pid>/status` 打印 Landlock 字段，所以"沙箱确有 Landlock 域"这一条
+      **没有**被独立验证；安全结论依赖既有 security 套件（两种形状都过），不依赖该字段。
+8. **未复核、值得后续做的**：`fs_denied`/只读挂载在真根下的**内核侧**行为（`/proc/kcore`、
+   `/sys` 现在落在镜像树内的空目录上）；checkpoint/restore 与真根的兼容（恢复路径假设）。
+
+
 1. **同拍写入的文件当"别人的解释器"的 ETXTBSY —— 已修（2026-09-23）**：做法已升级为**通用规则**——
    每次 exec 前结算并释放**所有"沙箱已关闭、而中介还握着 held 副本"的条目**（读终值 → 标脏 → forget），
    因此 exec 目标、脚本的解释器、以及其它内核侧解析路径一并覆盖，不需要专门解析 `#!`
