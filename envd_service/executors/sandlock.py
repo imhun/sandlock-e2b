@@ -16,10 +16,13 @@ where path mediation and DAC ownership are correct by construction
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
 import shutil
+import subprocess
+import sys
 import threading
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -170,6 +173,125 @@ _MINIMAL_DEV_MOUNTS = {
 #: without a record on the failure path the only thing an operator sees is
 #: "exit 127, empty stderr" -- the shape that made this family unreadable.
 _EXEC_SETUP_FAILURE_CODES = (125, 126, 127)
+
+
+#: The capability probe's source, run by a child *process* (never ``os.fork()``:
+#: the worker is multi-threaded -- ``asyncio.to_thread`` -- and a fork in a
+#: threaded process can leave the child holding a lock another thread took, so
+#: the check meant to prevent a wedged worker could itself wedge it; the child
+#: process also gets a deadline for free).
+#:
+#: It walks exactly the steps the fork's real-root phase walks -- user
+#: namespace, mount namespace, private, a recursive bind, then ``pivot_root``
+#: and ``umount2(MNT_DETACH)`` -- so it fails where a sandbox would fail. The
+#: ids are read *before* the unshare: inside a fresh user namespace with no map
+#: yet the process reports the overflow id (65534), and mapping that is EPERM.
+_REAL_ROOT_PROBE = r'''
+import ctypes
+import os
+from pathlib import Path
+
+
+class _Failed(Exception):
+    pass
+
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+real_uid, real_gid = os.getuid(), os.getgid()
+CLONE_NEWUSER, CLONE_NEWNS = 0x10000000, 0x00020000
+MS_BIND, MS_REC, MS_PRIVATE = 4096, 16384, 1 << 18
+
+
+def check(label, call):
+    ctypes.set_errno(0)
+    if call() != 0:
+        raise _Failed(f"{label}: {os.strerror(ctypes.get_errno())}")
+
+
+try:
+    check("unshare(CLONE_NEWUSER)", lambda: libc.unshare(CLONE_NEWUSER))
+    # The maps have to exist before the namespace has capabilities the kernel
+    # will honour on a mount.
+    for path, text in (
+        ("/proc/self/setgroups", "deny"),
+        ("/proc/self/uid_map", f"0 {real_uid} 1\n"),
+        ("/proc/self/gid_map", f"0 {real_gid} 1\n"),
+    ):
+        try:
+            Path(path).write_text(text)
+        except OSError as exc:
+            if "uid_map" in path or "gid_map" in path:
+                raise _Failed(f"write {path}: {exc.strerror}") from exc
+            break
+    check("unshare(CLONE_NEWNS)", lambda: libc.unshare(CLONE_NEWNS))
+    check(
+        "mount(NULL, /, MS_REC|MS_PRIVATE)",
+        lambda: libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None),
+    )
+    scratch = Path("/tmp/.e2b-real-root-probe")
+    scratch.mkdir(exist_ok=True)
+    check(
+        "mount --bind (the sandbox's own mounts need this)",
+        lambda: libc.mount(
+            str(scratch).encode(), str(scratch).encode(), None, MS_BIND | MS_REC, None
+        ),
+    )
+    # The last two steps the fork takes: pivot into the root it just built,
+    # then drop the old one. A profile that admits mount but not pivot_root
+    # (the pre-N35 worker profile is exactly that) fails here, nowhere earlier.
+    check("chdir", lambda: libc.chdir(str(scratch).encode()))
+    check(
+        "pivot_root (the profile must admit it)",
+        lambda: libc.syscall(155, b".", b"."),  # SYS_pivot_root
+    )
+    check("umount2(MNT_DETACH)", lambda: libc.umount2(b".", 2))
+except _Failed as exc:
+    print(exc)
+except Exception as exc:  # a probe that raises is a probe that failed
+    print(f"{type(exc).__name__}: {exc}")
+else:
+    print("ok")
+'''
+
+#: How long the child probe may take. Generous on purpose: this runs once per
+#: process (``lru_cache``), and a cold node can be slow to fork+exec.
+_REAL_ROOT_PROBE_TIMEOUT_S = 30
+
+
+@functools.lru_cache(maxsize=1)
+def _real_root_capability() -> str:
+    """Can this worker build a sandbox root? Cached: it is a deployment property.
+
+    Returns ``""`` when it can, otherwise the reason -- the errno text plus which
+    step failed (:data:`_REAL_ROOT_PROBE`), so the caller can name the fix
+    instead of failing every create with "instance is closed".
+
+    Why this exists: the flag and the worker's seccomp profile have to travel
+    together (the profile has to admit the mount family before `E2B_REAL_ROOT`
+    means anything). Without this check a node that has not been updated fails
+    every sandbox create with "instance is closed" and no reason -- measured
+    cost of finding that out the hard way is a whole debugging session.
+    """
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _REAL_ROOT_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=_REAL_ROOT_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return f"the probe did not finish within {_REAL_ROOT_PROBE_TIMEOUT_S}s"
+    except OSError as exc:
+        return f"could not start the probe ({sys.executable}): {exc}"
+    reason = (completed.stdout or "").strip()
+    if reason == "ok":
+        return ""
+    if reason:
+        return reason[:400]
+    detail = [line for line in (completed.stderr or "").strip().splitlines() if line]
+    if detail:
+        return detail[-1][:400]
+    return f"the probe exited {completed.returncode} without a reason"
 
 
 def _ensure_chroot_mount_points(rootfs: Path, mounts: dict[str, str]) -> None:
@@ -521,6 +643,18 @@ class SandlockExecutor(Executor):
         self._extra_fs_writable = list(extra_fs_writable or [])
         self._fs_mounts = dict(fs_mounts or {})
         self._sandbox_id = sandbox_id
+        if self._real_root and self._base_image and self._image_rootfs is not None:
+            # The flag and the worker's seccomp profile have to travel together;
+            # probe once per process and fail with the operator's next action
+            # instead of failing every create with "instance is closed".
+            reason = _real_root_capability()
+            if reason:
+                raise RuntimeError(
+                    "E2B_REAL_ROOT is on, but this worker cannot build a sandbox "
+                    f"root: {reason}. Apply deploy/seccomp/sandlock-worker.json "
+                    "(it admits the mount-family syscalls the sandbox's own user "
+                    "namespace needs) to every node before enabling the flag."
+                )
         # Route B (one ``sandlock-supervise`` per sandbox, euid == the
         # sandbox's host uid). ``None`` / ``off`` keeps the in-process
         # instance; the decision itself is made once here because every input
