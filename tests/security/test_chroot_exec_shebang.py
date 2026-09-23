@@ -136,6 +136,40 @@ async def test_shebang_script_written_into_the_workspace_runs():
 
 
 @pytest.mark.usefixtures("require_sandlock")
+async def test_script_whose_interpreter_was_written_in_the_same_command_runs():
+    """The venv shape: a tool arrives, and a script is pointed at it.
+
+    `uv venv`/`python -m venv` then install a console script whose `#!` names an
+    interpreter *inside the workspace*, so both the exec target and its
+    interpreter were written in this tick. The kernel resolves that interpreter
+    itself, which means the mediator never sees the open and cannot release the
+    write watch it holds on it -- unless it reads the `#!` line while handling
+    the exec, which is what makes this work.
+    """
+    executor, workspace = _chroot_sandbox()
+    try:
+        # The interpreter has to be an absolute path: the kernel takes the `#!`
+        # line verbatim, so a relative one is a non-starter.
+        code, out, err = await run_sh(
+            executor,
+            workspace,
+            "cp /bin/echo ./n35_interp && chmod +x ./n35_interp "
+            "&& printf '#!%s/n35_interp\\nignored\\n' \"$(pwd)\" > ./n35_uses_interp "
+            "&& chmod +x ./n35_uses_interp "
+            "&& ./n35_uses_interp interp-marker; echo rc=$?",
+        )
+        if not getattr(executor, "_real_root", False):
+            pytest.xfail(
+                "N35: a workspace-resident interpreter is refused without a "
+                "real root -- docs/chroot-workspace-exec.md"
+            )
+        assert code == 0, f"exit={code} stderr={err!r}"
+        assert b"interp-marker" in out, out
+    finally:
+        executor.close()
+
+
+@pytest.mark.usefixtures("require_sandlock")
 async def test_the_workload_cannot_mount():
     """The seal that makes a real root safe to hand to the sandbox.
 

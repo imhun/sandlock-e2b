@@ -400,18 +400,29 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 
 ### 9.6 打开真根之后仍存在的缺口（本轮实测）
 
-1. **同拍写入的文件当"别人的解释器"仍然 ETXTBSY**：`shebangguest` 腿（脚本自己写好，紧接着
-   `#!/workspace/interp_bin` 那条解释器也是刚从宿主拷进来的）仍报 `Text file busy` ——
-   中介能看到"被 exec 的文件"并在 exec 前释放它的写 watch，但**内核自己解析 shebang
-   解释器**这一步中介看不到，解释器仍在 watch 里。用户级安装的常见形状不受影响
-   （`pip install` 与随后运行是两条命令/两个进程，早已过拍），残留的是一个**同一条命令内**
-   的窄情形；根治要动"描述符何时放手"（N35①/N15 的写账本），本轮不动。
-2. **`/proc` 仍是合成的**：真根没有挂真 procfs，所以内核侧对 `/proc` 的解析（少数工具会做，
-   如 `readlink /proc/self/exe` 的某些实现）依旧不成立；沙箱自己读 `/proc` 走中介合成 ✓。
-   要修得配 PID ns 才能挂 procfs（N14 的延伸）。
+1. **同拍写入的文件当"别人的解释器"的 ETXTBSY —— 已修（2026-09-23，同一轮）**：exec 前中介除了释放
+   "被 exec 的文件"的写 watch，还会**读一次该文件的 `#!` 行**（与读 ELF `PT_INTERP` 同一手法），
+   把**解释器**的写 watch 也结清释放（嵌套解释器按内核那样最多跟 4 层；释放前的终值读数保证账不失真）。
+   用例：`tests/security/test_chroot_exec_shebang.py::test_script_whose_interpreter_was_written_in_the_same_command_runs`
+   （venv console script 形状），真根开=通过、关=xfail；探针腿 `shebangguest` 同样由 126 变 rc=0。
+   **残留**：仅在"解释器路径与写者不同名（例如经过一层符号链接指向刚写的文件）"这类边角上仍可能撞到，
+   因为 watch 比较用的是解析后的路径（已做 canonicalize 兜底）。
+2. **`/proc` 仍是合成的 —— 已定案：本平台无法在沙箱侧挂真 procfs（实测，不是没做）**。
+   三条实测：① 在自建 userns 里 `mount("proc", …)` **EPERM**（没有自己的 pid ns 时内核按规则拒）；
+   ② 加 `unshare(CLONE_NEWPID)` 并在 fork 之后（pid=1）再挂，**仍然 EPERM**；
+   ③ 先把目标放在**自己挂的 tmpfs** 上（排除"目标 mount 不属于本 ns"这一条），带与不带 pid ns
+   **都 EPERM**；把探针从头就以 slot uid（1000）运行、make 两份 map 也复现同样结果
+   ⇒ 在这台内核（OrbStack 7.0.14）上，单条目 map 的非特权 userns **挂不了 procfs**，
+   要真 procfs 只能由特权方（runc 式 root setup 或带 cap 的 broker）来挂，那是本轮明确
+   不引入的部署改动。同时中介合成的 `/proc` 本来就是产品侧更想要的那一份（pid 过滤、
+   虚拟 hostname/uptime/meminfo、隐藏宿主路径，`procfs.rs`），所以这条按"设计选择 + 平台限制"
+   收口。**代价**（保留在案）：内核侧对 `/proc` 的解析仍不成立，例如 guest 用
+   `execve("/proc/self/fd/N")` 这种技巧；guest 自己读 `/proc` 走中介合成 ✓ 不受影响。
 3. **部署依赖**：`deploy/seccomp/sandlock-worker.json` 已加无门闩的
    `mount/umount2/pivot_root` 允许项，但**节点必须先应用这份档**（DaemonSet）再打开
    `E2B_REAL_ROOT`，否则建箱全 EPERM。
+4. **已补的验收**：`tests/security/test_real_root_mounts.py` 钉住"建箱→销毁 3 次后 worker
+   自己的挂载表一字不变"（§9.5 的 ②）——两种形状都跑，实现在宿主命名空间里挂载会立刻红。
 
 
 ## 10. 未结线索（不算结论）
