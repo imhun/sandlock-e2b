@@ -99,7 +99,36 @@ seccomp 黑名单里）。
 | workspace 里的**静态**二进制 | 直接 exec 不了 | Go/Rust 工具、musl 构建、静态 busybox |
 | workspace 里的动态 ELF | 可以（memfd 巧合） | — |
 
-## 5. 选项 A：真根（mount ns + pivot_root）
+## 5. 选项 A：真根（mount ns + pivot_root）——**已实现，`E2B_REAL_ROOT=1` 打开**
+
+**2026-09-23 落地**（fork `realroot` 模块 + 中介的 pivoted-aware 分支 + 部署档放宽）。
+打开后：sandbox 自己建 mount ns、把策略里的挂载（workspace/卷/六个 `/dev` 节点）绑进镜像
+rootfs、`pivot_root` 进去，然后**丢掉 `CAP_SYS_ADMIN`** 再启动工作负载。实测效果：
+**绝对与相对路径的脚本、静态/动态 ELF、"写完立刻执行"（同一条命令）全部可跑**，
+而**工作负载仍然不能 mount/unshare/chroot**（下面的 9.5）。默认**关闭**：worker 容器的
+seccomp 档必须先放宽（同批提交里已改），否则每个建箱都会 EPERM。
+
+```sh
+# 单机/lane 打开
+E2B_REAL_ROOT=1 ./deploy/scripts/test-prod-shaped.sh tests/security
+```
+
+### 5.0 实现里被实测纠正的三个假设（留给后来人）
+
+1. **挂载顺序**：必须"先绑策略挂载、再 `MS_BIND|MS_REC` 自绑 rootfs"。反过来的话，
+   后加的挂载挂在**原** rootfs mount 上，而 `pivot_root` 移走的是**自绑**那份 ⇒ 新根里
+   只剩空的挂载点目录（症状：相对路径 exec ENOENT、绝对路径正常，因为中介走的是宿主路径）。
+2. **中介的 fd 路径改写**（`/proc/self/fd/N`）在真根里**必定失败**：新根没有真 procfs
+   （`/proc` 是中介合成的），内核解析不到 ⇒ exec ENOENT。真根下 exec handler 改为
+   **直接 `Continue`**，让内核在沙箱自己的树里解析（也正因此解释器变成镜像自己的那份）。
+3. **chdir 过去"只记账、不动内核 cwd"**（`handle_chroot_chdir` 的老注释：*the child's own
+   cwd never moves*）——模拟根下无所谓，真根下内核自己解析相对路径（`execve("./x")`）
+   用的是 stale cwd ⇒ 相对路径 exec ENOENT。真根下改为**让内核真正执行 chdir**（先做
+   存在性/越界校验与记账，再 `Continue`）。
+
+另外为让"写→立刻执行"这一形状在真根下成立，exec 前会**结清并释放该文件的写 watch**
+（中介持有的 `held` 描述符正是 ETXTBSY 的来源，即 N35① 的窗口）：先按 pump 的做法读一次
+终值记账，再 `forget`，所以账不失真、文件立刻可执行。
 
 ### 5.1 现状盘点（实测）
 
@@ -335,7 +364,7 @@ chroot / true                        -> Operation not permitted
 后代继承。`unshare -m` 与 `chroot /` 的 EPERM 尤其说明问题：这两条在容器档里是**允许**的
 （`unshare` 无条件放行，`chroot` 是本 lane 给了 CAP_SYS_CHROOT 才保留），却仍然被拒。
 
-**第二层（本次要做的）：把挂载序列放进 setup 相。** `confine_child` 的顺序本来就是
+**第二层（本次要做的）：把挂载序列放进 setup 相。** —— **已实现（2026-09-23）**，见 §5 的落地说明与 5.0 的三条实测纠正；顺序是"先绑策略挂载 → 递归自绑 rootfs → chdir → pivot_root → 卸载旧根 → chdir 到 guest cwd"。`confine_child` 的顺序本来就是
 "建 userns → 装 Landlock → 装 seccomp → exec"，挂载序列插在 **userns 建好之后、两道上锁
 之前**（也就是今天那一段空档）：`unshare(CLONE_NEWNS)` → 把 `/` 设 private → 绑 rootfs/
 workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + seccomp → `execve` 工作负载。
@@ -344,6 +373,8 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 `pivot_root`）。
 
 **第三层（建议本次一起补的保险）：setup 完成后 capset 只丢 `CAP_SYS_ADMIN`。**
+ —— **已实现（2026-09-23）**：`realroot::drop_cap_sys_admin` 在 pivot 之后、Landlock/seccomp
+之前清掉 effective/permitted/inheritable 里的 bit 21，其余 caps 保留。
 今天 fork 里没有任何 capset 代码，沙箱进程在整个生命周期里都握着 userns 里的全部 caps
 （实测 `CapEff=000001ffffffffff`），所以"guest 挂不了"目前**只靠那一层 seccomp**。
 丢 `CAP_SYS_ADMIN`（其余 caps 保留 —— `CHOWN`/`DAC_OVERRIDE`/`FOWNER`/`SETUID`/`SETGID`
@@ -358,9 +389,30 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 把 guest 封好，等于把没有任何路径中介的 mount 交给沙箱里的进程）。
 
 **验收（应进 lane 的形态用例）**：① 在容器档允许 mount 家族的形状里，guest 的
-`mount`/`unshare`/`chroot` 必须 EPERM，而 setup 相的 bind mount 必须成功（上面那段探针直接
-转成测试）；② 建箱→销毁 N 次后宿主 `mount` 计数回到基线（挂载泄漏）；③ 丢 `CAP_SYS_ADMIN`
-之后，`chown`/`chmod`/低端口这些"沙箱内 root"行为不变（按现有 security 套件回归）。
+`mount`/`unshare`/`chroot` 必须 EPERM，而 setup 相的 bind mount 必须成功 —— **已落地为
+`tests/security/test_chroot_exec_shebang.py::test_the_workload_cannot_mount`（两种形状都跑）**；
+② 建箱→销毁 N 次后宿主 `mount` 计数回到基线（挂载泄漏）——**待补**（真根用的挂载全在沙箱
+自己的 mount ns 里，`pivot_root` 之后旧根被 `MNT_DETACH`，但"计数不涨"这条还没有用例）；
+③ 丢 `CAP_SYS_ADMIN` 之后，`chown`/`chmod`/低端口这些"沙箱内 root"行为不变
+（按现有 security 套件回归）——**已验**：`tests/security` 在两种形状下分别
+**42 passed / 1 skipped / 1 xfailed（真根开）** 与 **94 passed / 2 skipped / 2 xfailed（默认关，
+含 dir_ledger/policy_mapping/route_b 单测）**。
+
+### 9.6 打开真根之后仍存在的缺口（本轮实测）
+
+1. **同拍写入的文件当"别人的解释器"仍然 ETXTBSY**：`shebangguest` 腿（脚本自己写好，紧接着
+   `#!/workspace/interp_bin` 那条解释器也是刚从宿主拷进来的）仍报 `Text file busy` ——
+   中介能看到"被 exec 的文件"并在 exec 前释放它的写 watch，但**内核自己解析 shebang
+   解释器**这一步中介看不到，解释器仍在 watch 里。用户级安装的常见形状不受影响
+   （`pip install` 与随后运行是两条命令/两个进程，早已过拍），残留的是一个**同一条命令内**
+   的窄情形；根治要动"描述符何时放手"（N35①/N15 的写账本），本轮不动。
+2. **`/proc` 仍是合成的**：真根没有挂真 procfs，所以内核侧对 `/proc` 的解析（少数工具会做，
+   如 `readlink /proc/self/exe` 的某些实现）依旧不成立；沙箱自己读 `/proc` 走中介合成 ✓。
+   要修得配 PID ns 才能挂 procfs（N14 的延伸）。
+3. **部署依赖**：`deploy/seccomp/sandlock-worker.json` 已加无门闩的
+   `mount/umount2/pivot_root` 允许项，但**节点必须先应用这份档**（DaemonSet）再打开
+   `E2B_REAL_ROOT`，否则建箱全 EPERM。
+
 
 ## 10. 未结线索（不算结论）
 
@@ -370,4 +422,8 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 2. **`timeout` 包一层就变味**：`timeout 10 /usr/local/bin/pip --version` 报
    `timeout: failed to run command '/proc/self/fd/5': No such file or directory` —— 中介把
    路径改写成 `/proc/self/fd/N` 之后，**由上层工具自己再 exec 一次**的形状会撞上这个改写。
-   这条在 A 下自然消失，也是 A 的收益之一。
+   真根下这条**自然消失**（pivoted 的子进程不再被改写路径，见 §5.0.2），也就是 A 的收益之一。
+3. **失败可见性**：真根这条路原本是"静默死"（子进程 stderr 在 slot 形状里还没接上）。
+   本轮加了 `SANLOCK_REALROOT_TRACE=<file>`：把每一步、以及 `fail!`/`child_fail`/exec 的
+   失败原文写进同一个**先开好的 fd**（pivot 之后路径已不可解析，必须用 fd）——排查这类
+   "instance is closed 但没有原因"的问题就靠它。

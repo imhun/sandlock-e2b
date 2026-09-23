@@ -212,6 +212,7 @@ def create_executor(
                 port_mappings=settings.port_mappings,
                 bind_inject=settings.net_bind_inject,
                 pid_ns=settings.pid_ns,
+                real_root=settings.real_root,
                 network=network,
                 network_deny_cidrs=settings.network_deny_cidrs,
                 notify_rate_limit=settings.sandbox_notify_rate_limit,

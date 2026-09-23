@@ -833,6 +833,18 @@
 				]
 			},
 			"excludes": {}
+		},
+		{
+			"names": [
+				"mount",
+				"umount2",
+				"pivot_root"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [],
+			"comment": "N35 / real root: the mount-family syscalls a sandbox uses to build its own root (mount namespace, bind the workspace/volumes/dev nodes, pivot_root). Unconditional on purpose: the cap-gated rule above is resolved against the *container's* capability set when the container starts, while the capability that authorises these calls here belongs to the sandbox's own user namespace -- so the gated rule is dropped in exactly the production shape that needs them. The workload never gets to use them: the sandbox's own filter denies mount/umount2/pivot_root, and CAP_SYS_ADMIN is dropped before the workload starts (see docs/chroot-workspace-exec.md sections 7 and 9.5).",
+			"includes": {},
+			"excludes": {}
 		}
 	]
 }

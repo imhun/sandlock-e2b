@@ -179,6 +179,21 @@ class Settings:
     # this on today costs the guest its root identity -- see
     # docs/production-deployment-requirements.md §2.4.10.
     pid_ns: bool = field(default_factory=lambda: _env_bool("E2B_PID_NS", False))
+    # Real root (fork `real_root`, N35): instead of emulating the image root by
+    # rewriting every path the mediator sees, the sandbox builds one -- a mount
+    # namespace it owns, the rootfs as its root, the workspace/volumes/device
+    # nodes bound inside it, `pivot_root` into it -- and then gives up
+    # CAP_SYS_ADMIN before the workload starts. What it buys: `#!` scripts and
+    # static binaries, i.e. everything the *kernel* resolves by itself, which
+    # the emulated root can only refuse (docs/chroot-workspace-exec.md).
+    #
+    # Off by default, and it must not be turned on before the *deployment* is
+    # ready: the worker's seccomp profile has to admit the mount-family
+    # syscalls (deploy/seccomp/sandlock-worker.json carries them; a node still
+    # running the old profile refuses every sandbox create with EPERM). The
+    # workload itself never gains the ability to mount -- the fork's own filter
+    # denies it and the capability is gone.
+    real_root: bool = field(default_factory=lambda: _env_bool("E2B_REAL_ROOT", False))
     # E7.2: the pairing guard's escape hatch. `net_isolation` without
     # `fd_inject_connect` yields a loopback-only sandbox: every external
     # connect fails at the kernel (no route), which in production looks like

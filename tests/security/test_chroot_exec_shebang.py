@@ -106,18 +106,17 @@ async def test_elf_binary_copied_into_the_workspace_runs():
 
 
 @pytest.mark.usefixtures("require_sandlock")
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "N35: the kernel resolves a #! interpreter outside the mediator's "
-        "rewrite, and in the image-rootfs shape that lookup is refused -- "
-        "EACCES once the file's own inode is exec-allowed and its write "
-        "descriptor has been released, ETXTBSY while the mediator still holds "
-        "that descriptor (same tick) -- docs/chroot-workspace-exec.md"
-    ),
-)
 async def test_shebang_script_written_into_the_workspace_runs():
-    """The gap: `pip install --user`-shaped, and refused today."""
+    """The `pip install --user` shape: write a script, then run it.
+
+    Without a real root this is the gap N35 is about -- the kernel resolves the
+    `#!` interpreter outside the mediator's rewrite, and the lookup is refused
+    (EACCES once the file's own inode is exec-allowed and its write descriptor
+    has been released, ETXTBSY while the mediator still holds that descriptor).
+    With `real_root` (the fork's mount namespace + pivot_root, E2B
+    `E2B_REAL_ROOT=1`) the interpreter resolves inside the sandbox's own tree
+    and the script simply runs -- which is what this test then asserts.
+    """
     executor, workspace = _chroot_sandbox()
     try:
         code, out, err = await run_sh(
@@ -126,7 +125,43 @@ async def test_shebang_script_written_into_the_workspace_runs():
             "printf '#!/bin/sh\\necho script-hi\\n' > ./n35_script "
             "&& chmod +x ./n35_script && ./n35_script",
         )
+        if not getattr(executor, "_real_root", False):
+            pytest.xfail(
+                "N35: refused without a real root (EACCES/ETXTBSY) -- "
+                "docs/chroot-workspace-exec.md"
+            )
         assert (code, out.strip(), err) == (0, b"script-hi", b"")
+    finally:
+        executor.close()
+
+
+@pytest.mark.usefixtures("require_sandlock")
+async def test_the_workload_cannot_mount():
+    """The seal that makes a real root safe to hand to the sandbox.
+
+    The sandbox builds its own root (when `real_root` is on) with CAP_SYS_ADMIN
+    *inside its own user namespace*, and gives that capability up before the
+    workload starts. Whatever the container's own profile admits, the workload
+    must not be able to mount, unshare a namespace or chroot -- three
+    independent mechanisms say so: the capability is gone, the sandbox's own
+    seccomp filter refuses those syscalls, and (for the kernel-resolved cases)
+    the mount namespace is the sandbox's own.
+    """
+    executor, workspace = _chroot_sandbox()
+    try:
+        code, out, err = await run_sh(
+            executor,
+            workspace,
+            "mkdir -p ./mnt; "
+            "mount -t tmpfs none ./mnt 2>&1; echo mount_rc=$?; "
+            "unshare -m true 2>&1; echo unshare_rc=$?; "
+            "chroot / true 2>&1; echo chroot_rc=$?",
+        )
+        assert code == 0, f"exit={code} stderr={err!r}"
+        text = out.decode(errors="replace")
+        assert "mount_rc=0" not in text, text
+        assert "unshare_rc=0" not in text, text
+        assert "chroot_rc=0" not in text, text
     finally:
         executor.close()
 

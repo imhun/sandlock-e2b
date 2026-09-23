@@ -870,6 +870,7 @@ SUPERVISE_POLICY_FIELDS: frozenset[str] = frozenset(
         "port_mappings",
         "port_remap",
         "random_seed",
+        "real_root",
         "time_start",
         "uid",
         "workdir",

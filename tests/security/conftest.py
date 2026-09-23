@@ -237,12 +237,17 @@ def route_b_sandbox(
     from envd_service.route_b import RouteBConfig
 
     workspace = sandbox_tmpdir(suffix="-ws")
+    # Mirror `Settings.real_root` (E2B_REAL_ROOT) so the suite can be run in
+    # both shapes: the emulated root (default) and the real one the fork builds
+    # with a mount namespace + pivot_root (see docs/chroot-workspace-exec.md).
+    real_root = os.environ.get("E2B_REAL_ROOT", "0").strip() == "1"
     executor = SandlockExecutor(
         workspace_dir=str(workspace),
         base_image=image,
         image_rootfs=rootfs,
         host_uid=host_uid,
         per_sandbox_uid=per_sandbox_uid,
+        real_root=real_root,
         memory_mb=512,
         cpu_percent=100,
         disk_mb=1024,

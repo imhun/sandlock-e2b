@@ -172,6 +172,27 @@ _MINIMAL_DEV_MOUNTS = {
 _EXEC_SETUP_FAILURE_CODES = (125, 126, 127)
 
 
+def _ensure_chroot_mount_points(rootfs: Path, mounts: dict[str, str]) -> None:
+    """Create every mount *target* inside the rootfs.
+
+    The emulating shape never needed them: the mediator resolved the virtual
+    path to the host source and opened that. A real root (fork ``real_root``)
+    binds each source *onto* its target, so the target has to exist -- including
+    the single-node files of ``minimal_dev``, which slim base images extract
+    without. Directories are created, missing file targets are touched (the bind
+    replaces them with the device node or file the source is); the fork refuses
+    a mount whose target is missing rather than silently leaving a hole.
+    """
+    for virtual, host in mounts.items():
+        target = rootfs / str(virtual).removeprefix("/")
+        if Path(str(host)).is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.touch()
+
+
 def _minimal_dev_mounts() -> dict[str, str]:
     """The chroot shape's ``fs_mount`` /dev set (minimal_dev, six nodes).
 
@@ -445,6 +466,7 @@ class SandlockExecutor(Executor):
         fd_inject_connect: bool = False,
         bind_inject: bool = False,
         pid_ns: bool = False,
+        real_root: bool = False,
         port_mappings: dict | None = None,
         network: dict | None = None,
         network_deny_cidrs: tuple[str, ...] = (),
@@ -474,6 +496,7 @@ class SandlockExecutor(Executor):
         self._fd_inject_connect = fd_inject_connect
         self._bind_inject = bool(bind_inject)
         self._pid_ns = bool(pid_ns)
+        self._real_root = bool(real_root)
         self._port_mappings = {
             int(host): int(sandbox) for host, sandbox in (port_mappings or {}).items()
         }
@@ -1755,6 +1778,21 @@ class SandlockExecutor(Executor):
             # first (unprivileged CLONE_NEWPID) and does that in an intermediate
             # process, so this is independent of net_isolation.
             kwargs["pid_ns"] = True
+        if self._real_root:
+            # N35: build a real root instead of emulating one, so the kernel
+            # resolves paths (a `#!` interpreter, a static binary) inside the
+            # sandbox's own tree. Only meaningful with a chroot root, and the
+            # setting is deployment-wide while the shape is per-sandbox: a
+            # sandbox without a rootfs has nothing to pivot into, so the flag is
+            # a no-op there (loud once per executor) rather than a failed create.
+            if self._base_image and self._image_rootfs is not None:
+                kwargs["real_root"] = True
+            else:
+                logger.warning(
+                    "E2B_REAL_ROOT is set but sandbox %s has no image rootfs "
+                    "(pure shape): real_root has no effect for it",
+                    self._sandbox_id or "<unnamed>",
+                )
         if self._enable_net_isolation:
             kwargs["net_isolation"] = True
             if self._port_mappings:
@@ -1813,6 +1851,7 @@ class SandlockExecutor(Executor):
             # Native ExecStdio.PTY lives host-side, so no devpts node grants
             # are part of the ceiling either.
             mount_map.update(_minimal_dev_mounts())
+            _ensure_chroot_mount_points(Path(self._image_rootfs), mount_map)
             kwargs["fs_mount"] = mount_map
         elif self._fs_mounts:
             # Without a chroot (pure Sandlock), virtual mount paths cannot be
@@ -1974,6 +2013,21 @@ class SandlockExecutor(Executor):
             # first (unprivileged CLONE_NEWPID) and does that in an intermediate
             # process, so this is independent of net_isolation.
             kwargs["pid_ns"] = True
+        if self._real_root:
+            # N35: build a real root instead of emulating one, so the kernel
+            # resolves paths (a `#!` interpreter, a static binary) inside the
+            # sandbox's own tree. Only meaningful with a chroot root, and the
+            # setting is deployment-wide while the shape is per-sandbox: a
+            # sandbox without a rootfs has nothing to pivot into, so the flag is
+            # a no-op there (loud once per executor) rather than a failed create.
+            if self._base_image and self._image_rootfs is not None:
+                kwargs["real_root"] = True
+            else:
+                logger.warning(
+                    "E2B_REAL_ROOT is set but sandbox %s has no image rootfs "
+                    "(pure shape): real_root has no effect for it",
+                    self._sandbox_id or "<unnamed>",
+                )
         if self._enable_net_isolation:
             kwargs["net_isolation"] = True
             if self._port_mappings:
@@ -2029,6 +2083,7 @@ class SandlockExecutor(Executor):
             # Native ExecStdio.PTY lives host-side, so no devpts node grants
             # are part of this shape either.
             mount_map.update(_minimal_dev_mounts())
+            _ensure_chroot_mount_points(Path(self._image_rootfs), mount_map)
             kwargs["fs_mount"] = mount_map
             cwd = (config.cwd or "").strip()
             if not cwd or cwd.startswith(str(self._workspace_dir)):
