@@ -75,9 +75,19 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
 
 ## 5. 于是现在的路线（不再需要你拍这一条）
 
-1. **N15 + OBS-5 作为一个工作包开工**（fork 侧）：先按 33 条清单逐条定语义、补策略面，
-   再补写路径的活账本；验收线照 chroot 形态的现有契约等强 —— 宿主文件的存在性/大小/
-   时间戳/inode/链接目标/xattr/事件都不可见，且 `diskMB` 那层账本在该形态下也有等价物。
+1. **N15 + OBS-5 作为一个工作包开工**，路线已用实验选定：**不给 33 条另写一套代执行，
+   而是把 pure 形态的根设为 `"/"`**（虚拟路径 == 宿主路径，identity 翻译），直接复用
+   现成的 chroot handler 与活账本。实验（2026-09-23，改动已回退以保持树绿）证明这条路
+   的核心验收一次通过：原先 `xfail(strict=True)` 的
+   `tests/security/escape/test_path_surface_inotify.py::test_pure_shape_inotify_still_reaches_the_host_root`
+   变成正向断言通过（宿主目录被拒 + 无事件泄漏，沙箱自己的 workspace 仍可 watch）。
+   代价与前置也随之确定：**pure 形态从此需要 route B 槽位**（否则中介以 euid 0 跑被
+   SL-1 守卫拒 → fail closed，与既有纪律一致），因此**第一步是把 29 条假定"纯形态不中介"
+   的测试迁移过来**（清单与证据见 backlog N15 行：8 个 security 文件里直接构造
+   `SandlockExecutor` 的用例改用 `route_b_sandbox(None, None)`、选择矩阵那条改成"自动上
+   槽位"、另有 4 条形态差异），迁移后跑 **gate B（`E2B_BASE_IMAGE=""`）+ 默认档**双复验。
+   验收线照 chroot 形态的现有契约等强 —— 宿主文件的存在性/大小/时间戳/inode/链接目标/
+   xattr/事件都不可见，且 `diskMB` 那层账本在该形态下也有等价物。
 2. **N27 单独排期**（E2B 侧）：按行内已收口的落点（`gateway_common/paths.py` 三个 helper +
    新 `E2B_STATE_BASE` + 迁移脚本）做，验收是 pure 形态下从沙箱内 `stat(<新 base>)` 为 ENOENT。
 3. **N14 挂在 N15+OBS-5 之后评估**：如果 33 条做完之后仍觉得"拦截清单完整性"这层负担不值，
