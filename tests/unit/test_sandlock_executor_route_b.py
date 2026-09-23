@@ -401,7 +401,11 @@ async def test_first_exec_leases_this_sandbox_uid_with_the_full_ceiling(
     ]
     policy = pool.acquire_calls[0]["policy"]
     assert policy["chroot"] == str(ROOTFS)
-    assert policy["fs_writable"] == [WORKSPACE]
+    # Two spellings, two consumers: the host path is what the mediator's
+    # on-behalf gate compares real paths against, and the mount points are what
+    # the fork's Landlock rules are written in (it grants a mount's *source* the
+    # rights its mount point declares -- see docs/chroot-workspace-exec.md §7).
+    assert policy["fs_writable"] == [WORKSPACE, "/workspace", "/home/user"]
     assert f"/workspace:{WORKSPACE}" in policy["fs_mount"]
     assert policy["max_memory"] == "1024M"
     assert running.pid == 5150
@@ -436,7 +440,12 @@ async def test_shape_knobs_reach_the_slot_document(monkeypatch) -> None:
     # the name; see crates/sandlock-supervise/src/policy.rs).
     assert policy["net_bind_inject"] is True
     assert policy["port_mappings"] == {50006: 8080}
-    assert policy["fs_writable"] == [WORKSPACE, "/var/lib/e2b-volumes/vol_1"]
+    assert policy["fs_writable"] == [
+        WORKSPACE,
+        "/var/lib/e2b-volumes/vol_1",
+        "/workspace",
+        "/home/user",
+    ]
 
 
 async def test_mcp_gateway_exec_is_the_only_one_allowed_to_bind(monkeypatch) -> None:

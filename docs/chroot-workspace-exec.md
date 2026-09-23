@@ -220,11 +220,13 @@ defense-in-depth 的一个面（userns 的 mount 仍受内核的 userns 限制�
 （`/usr`、`/data` 这类路径在镜像里不存在时会静默变成宿主路径），把"chroot 形态只能命名
 沙箱内的东西"这条不变量打掉；而挂载源只可能来自**已声明的挂载**，边界清楚。
 
-**验证**：`cargo test -p sandlock-core --lib mount_source_rights` 4/4；
-新用例 `tests/security/test_chroot_exec_shebang.py::test_static_binary_in_the_workspace_runs`
-在旧镜像上**红**（EACCES 126）、新镜像上**绿**；`tests/security` 整套 39 passed /
-1 skipped（既有的非 root 形状）/ 2 xfailed（本条脚本 + 既有的 pure inotify），
-`tests/unit/test_policy_mapping.py`、`tests/contract/test_route_b_executor.py` 同绿。
+**验证**：`cargo test -p sandlock-core --lib mount_source_rights` 4/4；新用例
+`tests/security/test_chroot_exec_shebang.py::test_static_binary_in_the_workspace_runs`
+在**旧镜像**（`e2b-sandlock-test:pre-n35-fswritable`）上**红**（EACCES 126）、新镜像上**绿** ——
+`tests/security` 整套因此从 `1 failed / 39 passed / 1 skipped / 2 xfailed` 变成
+**`40 passed / 1 skipped / 2 xfailed`**（skip 与 xfail 都未变）；`tests/unit` + `tests/contract`
+里既有的 8 条环境依赖失败（MCP gateway 镜像 / netns / 多节点 pause / boxed memory quota）与
+XFS 报错在同一命令下**逐一在旧镜像复现**，与本改动无关。
 
 它**不**解决 shebang：解释器 `/bin/sh` 在宿主空间解析，规则若覆盖宿主 `/bin` 就是把
 **宿主解释器**放进沙箱（会看到 `py (3, 14)` 这种"宿主版本"），那是 C 路线，与
