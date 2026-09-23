@@ -621,6 +621,37 @@ chroot 根（模拟的、真根的）都把 workload 路径解析到 rootfs 内 
 
 ### 11.1 推荐方案（改动都在 fork 内，E2B 侧零改动）
 
+**先厘清为什么 restore 非要有 stub**（这决定方案只能怎么改）：
+`restore_interactive` 的契约是"把 checkpoint 的进程镜像放回一个**已经在沙箱里**的进程"。
+沙箱的每一次启动都要 exec 一个程序；restore 时 exec 的就是 stub，因为它是唯一满足下面三条的
+东西：
+
+1. **干净地址空间**：`execve` 会把地址空间整体换掉，stub 之后只剩它自己几页（链接在
+   `STUB_BASE`，任何 workload 都用不到的高位窗口）+ 内核给的初始栈/auxv/vDSO，而它随后把
+   这些也搬走/清掉。checkpoint 的区域要按原地址 `MAP_FIXED` 铺回来，先有"没有别的东西"才能
+   保证恢复后的映射集合==镜像记录的集合（`test_restore.rs` 专门断言"没有 stray mapping"）。
+   这正是它取代掉的 ptrace 注入引擎做不到的事：那套在一个 parked libc launcher 上重建镜像，
+   launcher 自己的 text/heap/stack 会留在恢复后的地址空间里且**可达**。
+2. **必须在沙箱内部**：恢复出来的进程要活在同一个 user/mount/net/pid ns、同一个 uid、同一套
+   Landlock 域和 seccomp 过滤里。supervisor 在另一个 uid/名字空间里，它只能做两件事：把内存
+   写进那个进程（`process_vm_writev`）和通过 fd 驱动它——所以沙箱里必须有一个**肯配合**的进程，
+   那就是 stub。
+3. **在任何策略下都能跑**：freestanding、`-static -nostdlib -no-pie`、不调 vDSO、只用极少
+   几个 syscall；控制 blob 读进 `.bss` 而不是映射（避免被 `MAP_FIXED` 覆盖）。
+
+协作协议就是为此设计的：fd 3/4/5 固定（控制 blob / READY eventfd / GO 管道），stub 铺完区域
+先发 READY，supervisor 再 `process_vm_writev` 写入匿名页，stub 收 GO 后 `mprotect` 回checkpoint
+的权限、清掉自己启动残留、按原编号重开 fd 表、恢复 fs/gs base，最后 `rt_sigreturn` **跳进
+checkpoint 的寄存器上下文**——不是让原程序自己跑起来再注入。
+
+**代价正是 §9.7.9 那条**：这个"沙箱里 exec 的程序"目前是按**宿主路径**执行的，于是任何 chroot
+根都解析不到它。注意 stub 的**控制 fd 本来就已经是注入进去的**（`extra_fds`）——只有"二进制
+本身"还走路径。所以 11.1 的两条改动，本质是"把二进制也换成 fd 投递"，与它自己的控制通道保持
+一致。另有一个被否掉的设计可以佐证取舍：最初想用 `userfaultfd` 给 stub 做按需分页，但 uffd 在
+sandlock 默认黑名单里、seccomp 又是单向的 ⇒ 那会把一个众所周知的可利用原语**永久**授给每个
+恢复过的沙箱；改成 supervisor 侧 `process_vm_writev` 不需要任何策略改动（`checkpoint/resume.rs`
+头部记着这段）。
+
 1. **`restore_interactive`**：把 stub 以 `O_PATH|O_CLOEXEC` 打开，fd 走**已有**的注入通道
    （`resume::StubChannel::extra_fds()` → `rt.extra_fds`，restore 本来就在用它传 blob 通道），
    并把 `fs_readable.push(stub)` 换成"给 **stub 的宿主路径** 授 `EXECUTE|READ`"的规则 ——
