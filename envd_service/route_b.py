@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import secrets
+import select
 import shutil
 import socket
 import fcntl
@@ -56,6 +57,74 @@ from typing import Callable
 from envd_service.priv_helpers import PrivHelperError
 
 logger = logging.getLogger(__name__)
+
+
+#: How much of a slot's stderr is kept once it is being drained.
+SLOT_STDERR_TAIL_BYTES = 8192
+
+
+class SlotStderrDrain:
+    """Keep a slot's stderr drained, and its tail for diagnostics.
+
+    The slot's stderr is a pipe this worker owns, and the fork's trace switch
+    (``SANLOCK_EVENT_TRACE=1``) writes one line per mediated syscall into it.
+    A pipe nobody reads fills at 64 KiB and then blocks the *writer* -- the
+    supervisor's own runtime thread, mid-syscall, so the guest's mediated call
+    is never answered and the sandbox wedges. Measured: 85 614 bytes sitting in
+    a 65 536-byte pipe, the guest parked in ``inotify_add_watch`` (syscall
+    262) and the supervisor thread parked in ``anon_pipe_write``; the same run
+    finished as soon as the pipe was drained by hand. That is the shape the
+    N35 lane hit -- the switch exists to *diagnose* a stuck node, so it must
+    not be able to create one.
+
+    A daemon thread on purpose: it blocks on a pipe for the slot's lifetime,
+    so it cannot be driven from the event loop, and it must never hold up
+    shutdown -- the slot dying closes every write end, and the loop then ends
+    on EOF by itself.
+    """
+
+    def __init__(self, process) -> None:
+        self._lock = threading.Lock()
+        self._tail = bytearray()
+        stream = getattr(process, "stderr", None)
+        self._fd = stream.fileno() if stream is not None else None
+        self._thread: threading.Thread | None = None
+        if self._fd is not None:
+            self._thread = threading.Thread(
+                target=self._drain, name="sandlock-slot-stderr", daemon=True
+            )
+            self._thread.start()
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                # ``select`` first: an earlier non-blocking peek may have left
+                # the descriptor non-blocking, and the read below would then
+                # turn into a spin.
+                select.select([self._fd], [], [])
+                chunk = os.read(self._fd, 65536)
+            except InterruptedError:
+                continue
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            with self._lock:
+                self._tail += chunk
+                if len(self._tail) > SLOT_STDERR_TAIL_BYTES:
+                    del self._tail[:-SLOT_STDERR_TAIL_BYTES]
+
+    def join(self, timeout: float | None = None) -> None:
+        """Wait for the drain (only for tests: it ends when the slot does)."""
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+    def text(self, limit: int = 2000) -> str:
+        """The last ``limit`` characters read so far, stripped."""
+        with self._lock:
+            data = bytes(self._tail)
+        text = data.decode("utf-8", "replace").strip()
+        return text[-limit:] if text else ""
 
 
 try:  # the native module is Linux-only; the shim stays importable off-Linux
@@ -214,9 +283,15 @@ class SlotHandle:
     #: ``stats`` reply); ``None`` only when the fleet was built by a caller
     #: that does not probe readiness.
     instance_pid: int | None = None
+    #: Keeps this slot's stderr from blocking its writer, and holds the tail
+    #: for diagnostics (:class:`SlotStderrDrain`). ``None`` only when the
+    #: spawner produced a process without a captured stderr.
+    stderr_drain: SlotStderrDrain | None = None
 
     @property
     def stderr(self) -> str:
+        if self.stderr_drain is not None:
+            return self.stderr_drain.text(limit=SLOT_STDERR_TAIL_BYTES)
         if self.process.stderr is None:
             return ""
         try:
@@ -530,6 +605,10 @@ class W1SlotPool:
                 # Same reasoning as the control end: the slot holds its dup,
                 # and ours would only keep the pipe from reporting EOF.
                 events_writer.close()
+            # Before the readiness wait, not after: the trace switch can fill
+            # the pipe (and wedge the slot) while the generation is still
+            # coming up, which is exactly when this waits.
+            stderr_drain = SlotStderrDrain(process)
             handle = SlotHandle(
                 sandbox_id=sandbox_id,
                 uid=uid,
@@ -542,6 +621,7 @@ class W1SlotPool:
                 control_socket=handoff,
                 events_socket=events_reader,
                 verb_timeout_s=self.verb_timeout_s,
+                stderr_drain=stderr_drain,
             )
             # The slot binds/accepts *before* it launches the instance, so a
             # live channel does not yet mean "exec works": ``stats`` is served
@@ -663,7 +743,7 @@ class W1SlotPool:
             if process.poll() is not None:
                 raise SlotDeadError(
                     f"route-B slot {handle.name} (uid {handle.uid}) exited "
-                    f"before answering on {where}: {_slot_stderr(process)}"
+                    f"before answering on {where}: {_slot_stderr(handle)}"
                 )
             try:
                 stats = self.channel_for(handle).request("stats")
@@ -788,9 +868,16 @@ class W1SlotPool:
         await asyncio.to_thread(self.release_sync, sandbox_id)
 
 
-def _slot_stderr(process) -> str:
+def _slot_stderr(handle: SlotHandle) -> str:
     """Best-effort slot stderr for a startup failure message."""
-    stream = getattr(process, "stderr", None)
+    drain = handle.stderr_drain
+    if drain is not None:
+        # The drain already holds the tail (and read it before ``read()``
+        # below could see an empty pipe, which is why it comes first).
+        text = drain.text(limit=SLOT_STDERR_TAIL_BYTES)
+        if text:
+            return text
+    stream = getattr(handle.process, "stderr", None)
     if stream is None:
         return "<no captured stderr>"
     try:
@@ -1184,12 +1271,15 @@ class RouteBInstance:
     def _slot_stderr_now(self, limit: int = 2000) -> str:
         """Whatever the slot has written to stderr so far, without blocking.
 
-        The slot's stderr is a pipe nobody reads until something goes wrong,
-        so a diagnostic the slot prints (a refusal, a panic, a channel that
-        could not be wired) would otherwise sit unseen in the buffer. Reading
-        is non-blocking on purpose: the slot is still alive, so a blocking
-        read would wait for a process that is not going to exit.
+        The slot's stderr is drained by :class:`SlotStderrDrain` from the
+        moment it is spawned -- the fork's trace switch writes one line per
+        mediated syscall, and a pipe nobody reads wedges the writer. This only
+        reports the tail the drain kept, so a diagnostic the slot prints (a
+        refusal, a panic, a channel that could not be wired) is readable
+        without touching the pipe the slot is still writing to.
         """
+        if self._handle.stderr_drain is not None:
+            return self._handle.stderr_drain.text(limit=limit)
         stream = getattr(self._handle.process, "stderr", None)
         if stream is None:
             return ""

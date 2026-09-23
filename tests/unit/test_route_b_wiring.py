@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from envd_service.route_b import (
     PARKING_SCRIPT,
     RouteBInstance,
     SlotDeadError,
+    SlotHandle,
     W1SlotPool,
     supervise_policy_document,
 )
@@ -359,6 +361,91 @@ def test_the_pool_hands_the_spawner_a_usable_control_descriptor(tmp_path):
     # left behind keeping a reader thread alive.
     with pytest.raises(OSError):
         os.fstat(events_fd)
+
+
+# ----------------------------------------------------------- slot stderr
+
+
+def test_a_talkative_slot_stderr_cannot_wedge_its_writer():
+    """The fork's trace switch writes one line per mediated syscall, and the
+    slot's stderr is a pipe this worker owns. A pipe nobody reads fills at
+    64 KiB and then blocks the *writer* -- the supervisor's runtime thread,
+    mid-syscall, so the guest's mediated call is never answered and the
+    sandbox wedges (N35 lane measurement: 85 614 bytes sitting in a
+    65 536-byte pipe, the guest parked in ``inotify_add_watch`` and the
+    supervisor parked in ``anon_pipe_write``; the same run went through as
+    soon as the pipe was drained by hand).
+
+    The drain is the fix, and this is the shape that proves it: a writer far
+    past the pipe's capacity still finishes.
+    """
+    line = "x" * 255  # 255 + "\n" = 256 bytes, so the 8 KiB tail is 32 lines
+    lines = 400  # 102 400 bytes, well past the 65 536-byte pipe
+    script = (
+        "i=0; while [ $i -lt %d ]; do printf '%%s\\n' %s >&2; i=$((i+1)); done"
+        % (lines, line)
+    )
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    drain = rb.SlotStderrDrain(proc)
+    assert proc.wait(timeout=30) == 0
+    drain.join(10)
+    # Bounded: exactly the last SLOT_STDERR_TAIL_BYTES of the stream survive
+    # the strip (the stream's final newline is what the strip removes).
+    assert drain.text(limit=10**6) == ("x" * 255 + "\n") * 31 + "x" * 255
+    assert drain.text(limit=4) == "xxxx"
+
+
+def test_a_spawned_slot_is_drained_from_the_spawn(tmp_path):
+    """The wiring, not just the class: the drain starts at the spawn, because
+    the pipe fills while the generation is still coming up -- before the
+    readiness wait could report anything."""
+    def _spawn(**kw):
+        proc = FakeProcess()
+        read_fd, write_fd = os.pipe()
+        proc.stderr = os.fdopen(read_fd, "rb", buffering=0)
+        os.write(write_fd, b"sandlock-supervise: coming up\n")
+        os.close(write_fd)
+        spawned.append(proc)
+        return proc
+
+    pool, spawned, log, channels = _pool(tmp_path, spawner=_spawn)
+    handle = pool.acquire_sync("sbx_drain", {}, uid=20000)
+    assert handle.stderr_drain is not None
+    handle.stderr_drain.join(10)
+    assert handle.stderr_drain.text() == "sandlock-supervise: coming up"
+    pool.retire(handle)
+
+
+def test_the_tail_the_drain_kept_is_what_a_dead_slot_reports():
+    """A slot that dies on the way up is diagnosed from the drain's tail. The
+    old reader had to ``read()`` the pipe the drain now empties, and would
+    then call a slot that had plenty to say "empty"."""
+
+    class _Talkative(FakeProcess):
+        def __init__(self):
+            super().__init__(returncode=1)
+            read_fd, write_fd = os.pipe()
+            os.write(write_fd, b"sandlock-supervise: refused to bind\n")
+            os.close(write_fd)
+            self.stderr = os.fdopen(read_fd, "rb", buffering=0)
+
+    proc = _Talkative()
+    handle = SlotHandle(
+        sandbox_id="sbx_tail", uid=20000, name="slot-1", process=proc
+    )
+    handle.stderr_drain = rb.SlotStderrDrain(proc)
+    handle.stderr_drain.join(10)
+    assert rb._slot_stderr(handle) == "sandlock-supervise: refused to bind"
+    assert handle.stderr == "sandlock-supervise: refused to bind"
+    # A slot that really said nothing still says so.
+    quiet = SlotHandle(
+        sandbox_id="sbx_quiet", uid=20001, name="slot-2", process=FakeProcess()
+    )
+    assert rb._slot_stderr(quiet) == "<no captured stderr>"
 
 
 def test_slot_pools_are_cached_per_transport(tmp_path, monkeypatch):
