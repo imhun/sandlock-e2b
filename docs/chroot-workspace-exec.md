@@ -516,28 +516,48 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
    本轮加了 `SANLOCK_REALROOT_TRACE=<file>`：把每一步、以及 `fail!`/`child_fail`/exec 的
    失败原文写进同一个**先开好的 fd**（pivot 之后路径已不可解析，必须用 fd）——排查这类
    "instance is closed 但没有原因"的问题就靠它。
-4. **`deploy/scripts/test-prod-shaped.sh` 的 phase 1 目前是红的（2 条，且不是本轮引入）**：
-   `tests/contract/test_route_b_executor.py::test_missing_binary_exits_127_through_the_slot`
-   与 `tests/contract/test_sandbox_lifecycle_rebuild.py::test_nonexistent_binary_exits_127_with_no_output`
-   钉的是"缺失的可执行文件＝退出码 127 且**没有任何输出**"（fork 的 `execvp` 语义）。在 phase-1
-   形状下这两条实测拿到 **`sandlock-init: exec "/nonexistent-e2b-bin" failed (errno 13)`** ——
-   缺路径答的是 **EACCES(13)** 而不是 ENOENT，于是 fork 的 FUP-26 诊断行（`errno != ENOENT` 时
-   打印，`init/mod.rs::exec_fail`）落在 guest 的 stderr 上，契约的 "no output" 破了。
-   **不是本轮引入**：把工作树切到本轮之前的 `0021a9f`（`git worktree add`，同一个容器形状）跑同样
-   两条 → 同样 2 failed；消息文本也来自镜像里的 fork（镜像构建早于本轮三个提交）。**根因留给 fork**，
-   但现象已定位到"缺失路径的 errno 随 `SANLOCK_REALROOT_TRACE` 变"。实测矩阵（同一个 phase-1 形状，
-   只改这一个环境变量，`tmp/k0s/phase1-probe2.sh` 即该实验的脚本）：
-   * `SANLOCK_REALROOT_TRACE` **未设** → `test_route_b_executor.py` **1 failed / 13 passed**；
+4. **`init` 的 exec 路径读了两遍 errno —— 已定位并已修（2026-09-23，fork `f1fecba`）**。
+
+   **现象**：`deploy/scripts/test-prod-shaped.sh` phase 1 有两条红 ——
+   `test_route_b_executor.py::test_missing_binary_exits_127_through_the_slot` 与
+   `test_sandbox_lifecycle_rebuild.py::test_nonexistent_binary_exits_127_with_no_output`，
+   钉的是"缺失的可执行文件＝退出码 127 且**没有任何输出**"。实测拿到的却是
+   `sandlock-init: exec "/nonexistent-e2b-bin" failed (errno 13)`。
+
+   **根因**：`init/mod.rs::spawn` 的 exec 分支里，`execvp` 返回后先调
+   `realroot::record_failure(...)`（把失败写进 trace 文件），**之后**才读 `errno` 决定要不要
+   打 FUP-26 那一行。而 `record_failure` 会 `open("/tmp/sandlock-real-root-error")`
+   （`SANLOCK_REALROOT_TRACE` 未设时的默认路径）——**沙箱的规则集不给 `/tmp` 写权限**
+   （实测 guest 里 `open /tmp/sandlock-real-root-error` = **EACCES(13)**，见
+   `tmp/k0s/probe_127_errno.py` 的矩阵），于是这次 open 的 EACCES **盖掉了** execvp 真正的
+   ENOENT(2)，`errno != ENOENT` 成立、诊断行被打印，契约随之破掉。
+
+   **为什么"开着 trace 就没事"**：`trace_enabled()` 就是 `env::var(..).is_ok()`
+   （`realroot.rs:114`），而 `note("exec …")` 就在 `execvp` **之前**、且只在 trace 开时调用 ——
+   它先把 trace 文件开了一遍（TRACE 单元被初始化），`record_failure` 于是不再 open、也就不会
+   改 errno。实测矩阵（同一 phase-1 形状，只改这一个环境变量，脚本 `tmp/k0s/phase1-probe2.sh`）：
+   * **未设** → `test_route_b_executor.py` **1 failed / 13 passed**（errno 13）；
    * 设成任意值（`/workspace/tmp/...`、`/tmp/...`，甚至**空字符串**）→ **14 passed**。
 
-   `realroot::trace_enabled()` 就是 `env::var(..).is_ok()`（`realroot.rs:114`），所以"变量在不在"
-   一为真，缺失路径就回到 ENOENT、诊断行不再出现。fork 里唯一按它分叉的地方是 `context.rs:1034`
-   把 trace fd 加进子进程的 keep 列表（紧接着 `close_fds_above(2, &fds_to_keep)`），所以下一步应从
-   "多 keep 一个 fd 为什么会改变 `execvp` 的 errno"查起（怀疑与 exec 的 fd 注入路径或规则集构造的
-   交互有关，**未验证**）。**为什么之前没被发现**：N35 的 lane（`tmp/k0s/n35-lane.sh`）默认就设
-   `SANLOCK_REALROOT_TRACE`，正好把这个差异盖住了。
+   **不是本轮 N35 引入**：把工作树切到本轮之前的 `0021a9f`（`git worktree`，同容器同形状）跑同样
+   两条 → 同样 2 failed；且 fork 自己的
+   `test_exec_failure_names_the_kernel_errno_instead_of_exiting_127_silently`（FUP-26）在
+   **root 形态门禁**（`--privileged`）下也是红的：它用符号链接环钉 ELOOP(40)，实得
+   **errno 13** —— 同一处 errno 覆盖，只是它只在"trace 默认路径不可写"的形状下暴露。
+
+   **修法**（`init/mod.rs`，一处）：`execvp` 返回后**立刻**读一次 errno，面包屑与判定共用这一个
+   值（同文件里 chdir 分支本来就是这么写的，只有 exec 这条把诊断插在了中间）。修完实测：
+   * fork 门禁里那条 FUP-26 用例 **RED(`errno 13` vs 期望 40) → GREEN**；
+   * E2B 侧两条契约在 phase-1 形状、**trace 未设**（= 线上默认）下 **2 failed → 16 passed**
+     （`tests/contract/test_route_b_executor.py` 整个文件）；
+   * phase 1 全档 **1711 passed / 2 failed → 1714 passed / 6 skipped / 4 xfailed / 0 failed**；
+     phase 2 `51 passed / 1 skipped`；`E2B_REAL_ROOT=1` 的 `tests/security` `45 passed / 1 skipped /
+     1 xfailed`（wheel 重建，manifest HEAD=`f1fecba07d93…`）。
+
+   **新钉的用例**：`tests/contract/test_route_b_executor.py::
+   test_the_missing_binary_contract_survives_the_diagnostic_trace` —— 同一形状下**把 trace 开与
+   关各跑一遍**，都要求 `(127, b"", b"")`，这样契约不再依赖跑它的人有没有恰好设这个变量
+   （N35 的 lane 默认就设，正是它把这个差异盖住的原因）。
 
    形状细节：两条用例都是 **pure 形态**（`base_image=None` / 无 rootfs，现场 `chroot=None`），
-   与真根无关 —— 这是"fork 对缺失路径的 errno 语义 + 诊断行可见性"的问题。**待决**：修 fork
-   （让缺失路径稳定回 ENOENT），还是改契约（接受非 ENOENT 时的一行诊断）；倾向前者，因为契约与
-   fork 的注释本来就是同一立场（ENOENT 静默），只是这条路径的 errno 在两种形态下漂了。
+   与真根无关；这是"errno 只该读一次"的通用缺陷，任何"诊断自身会失败"的路径都可能踩到。

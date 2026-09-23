@@ -640,6 +640,45 @@ async def test_missing_binary_exits_127_through_the_slot(workspace) -> None:
         ex.close()
 
 
+async def test_the_missing_binary_contract_survives_the_diagnostic_trace(
+    monkeypatch, workspace
+) -> None:
+    """127 with no output, whether or not the fork's diagnostic trace is on.
+
+    Measured 2026-09-23: the fork's exec-failure path read `errno` twice -- once
+    for the breadcrumb, then again *after* ``realroot::record_failure()`` had
+    tried to open its trace file. When that open is denied (the default path is
+    ``/tmp/sandlock-real-root-error`` and the sandbox's ruleset grants no write
+    to ``/tmp``), the second read returned the *open's* EACCES, so a missing
+    binary reported ``sandlock-init: exec "/nonexistent-e2b-bin" failed
+    (errno 13)`` on the guest's stderr. The trace being *on* hid it (``note()``
+    runs just before ``execvp`` and opens the file first, leaving errno alone
+    afterwards), which is why the N35 lane -- it sets that variable -- never saw
+    this while phase 1 of ``deploy/scripts/test-prod-shaped.sh`` did.
+
+    Both settings are pinned here instead of trusting the environment: the
+    variable reaches the slot because the pool spawns it from this process's
+    environment, and each iteration leases a fresh sandbox id so it gets a
+    freshly spawned slot.
+    """
+    for trace_path in (None, "/tmp/e2b-contract-trace"):
+        if trace_path is None:
+            monkeypatch.delenv("SANLOCK_REALROOT_TRACE", raising=False)
+            sandbox_id = "sbx_rbe_127_trace_off"
+        else:
+            monkeypatch.setenv("SANLOCK_REALROOT_TRACE", trace_path)
+            sandbox_id = "sbx_rbe_127_trace_on"
+        ex = _executor(workspace, sandbox_id)
+        try:
+            running = await ex.start(
+                _config(["/nonexistent-e2b-bin"], str(workspace))
+            )
+            code, out, err = await _collect(running)
+            assert (code, out, err) == (127, b"", b"")
+        finally:
+            ex.close()
+
+
 async def test_concurrent_commands_share_one_slot_without_stalling(workspace) -> None:
     """A slot answers one verb at a time -- that must not turn into one command
     at a time.
