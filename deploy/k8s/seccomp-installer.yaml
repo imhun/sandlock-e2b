@@ -870,9 +870,37 @@ data:
     				]
     			},
     			"excludes": {}
+    		},
+    		{
+    			"names": [
+    				"mount"
+    			],
+    			"action": "SCMP_ACT_ALLOW",
+    			"args": [
+    				{
+    					"index": 2,
+    					"value": 0,
+    					"op": "SCMP_CMP_EQ"
+    				}
+    			],
+    			"comment": "N35 / real root: the sandbox's own setup binds the workspace, volumes and /dev nodes into the root it pivots into. Allowed without the CAP_SYS_ADMIN gate on purpose: that gate is resolved against the *container's* capability set when the container starts, while the capability that authorises the call belongs to the sandbox's own user namespace -- so the gated rule above is dropped in exactly the production shape that needs this. The argument filter is the second half: index 2 is the filesystem type, and the real root only ever binds (NULL fstype), so this rule cannot mount a filesystem -- tmpfs, procfs, overlayfs and the rest stay refused for every process in this container. The workload gets nothing: the sandbox's own filter denies mount, and CAP_SYS_ADMIN is dropped before it starts (docs/chroot-workspace-exec.md sections 7 and 9.5).",
+    			"includes": {},
+    			"excludes": {}
+    		},
+    		{
+    			"names": [
+    				"umount2",
+    				"pivot_root"
+    			],
+    			"action": "SCMP_ACT_ALLOW",
+    			"args": [],
+    			"comment": "N35 / real root, same two calls' companions: `umount2(MNT_DETACH)` to drop the old root and `pivot_root` to make the new one the process root. No argument filter on these: their argument lists are too short for one (an index past the end reads whatever the caller left in the register, and libseccomp rejects the rule), and they need no filter -- both are bounded by the kernel's own rules, which let a process in a user namespace touch only mounts that namespace owns. The workload is refused both by the sandbox's filter and by the dropped capability.",
+    			"includes": {},
+    			"excludes": {}
     		}
     	]
     }
+
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -895,7 +923,7 @@ spec:
         # sha256 of the profile payload. Bump it (with the ConfigMap) when the
         # profile changes: the pod template hash change is what rolls the
         # DaemonSet, and the test above fails until the two agree.
-        checksum/profile: "0e07967a2c577d9fb3646e9735d72589abd5d8195d2a5a15ec27a498f1ee5bdb"
+        checksum/profile: "071486c06782c70d6764184493b104ed4418f77a244cb4198e14db70091ee27c"
     spec:
       # Every node, including tainted control-plane nodes: a node without the
       # profile cannot run the worker pod at all.

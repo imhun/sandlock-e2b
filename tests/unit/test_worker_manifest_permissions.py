@@ -123,7 +123,10 @@ def test_stack_worker2_carries_the_pid_ns_canary() -> None:
     assert "\n      E2B_PID_NS: ${E2B_PID_NS:-true}\n" in STACK_COMPOSE
 
 
-def _unconditional_allowlist() -> set[str]:
+#: The two entries every process in the worker container gets regardless of its
+#: capabilities: the upstream default profile's own allowlist, and the N35
+#: real-root pair (see the test below).
+def _unconditional_allowlists() -> list[set[str]]:
     entries = [
         entry
         for entry in WORKER_SECCOMP["syscalls"]
@@ -131,19 +134,24 @@ def _unconditional_allowlist() -> set[str]:
         and not entry.get("includes")
         and not entry.get("args")
     ]
-    assert len(entries) == 1, "expected one unconditional allowlist entry"
-    return set(entries[0]["names"])
+    assert len(entries) == 2, "expected the default allowlist plus the N35 pair"
+    return [set(entry["names"]) for entry in entries]
 
 
 def test_worker_seccomp_profile_is_the_default_plus_two_syscalls() -> None:
     """The profile may only relax `pidfd_getfd` and `unshare` off the default.
 
     Anything else here is a syscall surface the worker did not have before
-    2026-09-15, so it must be a conscious edit to this test as well.
+    2026-09-15, so it must be a conscious edit to this test as well. (The N35
+    real-root additions are the other unconditional entry and have their own
+    test: `test_worker_seccomp_profile_admits_the_pivot_pair_without_the_cap_gate`.)
     """
     assert WORKER_SECCOMP["defaultAction"] == "SCMP_ACT_ERRNO"
-    allowed = _unconditional_allowlist()
+    lists = _unconditional_allowlists()
+    allowed = max(lists, key=len)
     assert {"pidfd_getfd", "unshare"} <= allowed
+    # ...and the other unconditional entry is exactly the N35 pair, nothing more.
+    assert min(lists, key=len) == {"pivot_root", "umount2"}
     # Everything that was capability-gated in the upstream default profile must
     # stay gated: a deployment that *does* carry the capability keeps the access
     # the kernel would grant it, and one that does not stays denied.
@@ -156,6 +164,55 @@ def test_worker_seccomp_profile_is_the_default_plus_two_syscalls() -> None:
     assert not ({"pidfd_getfd", "unshare"} & gated)
     for still_gated in ("mount", "setns", "bpf", "open_tree", "perf_event_open"):
         assert still_gated in gated
+
+
+def test_worker_seccomp_profile_admits_the_pivot_pair_without_the_cap_gate() -> None:
+    """N35: the sandbox builds its own root, so the profile must let it.
+
+    Both halves of this shape were forced by measurement:
+
+    * No ``CAP_SYS_ADMIN`` gate on either entry. The gate is resolved against
+      the *container's* capability set when the container starts
+      (``includes.caps``), while the capability that authorises the call
+      belongs to the sandbox's own user namespace -- so a gated rule is dropped
+      in exactly the production shape that needs it (``PROD_DROP_CAPS=SYS_ADMIN``
+      is the pinned shape: measured, real-root sandboxes came up with these two
+      entries and nothing else).
+    * ``mount`` carries an argument filter (index 2, the filesystem type, must
+      be NULL) because a bind is all a real root ever does. Without it the rule
+      would hand every process in the container the ability to mount tmpfs,
+      procfs and overlayfs; with it, those stay ``EPERM``. ``umount2`` and
+      ``pivot_root`` have no filter -- their argument lists are too short for
+      one (an index past the end reads whatever the caller left in the
+      register, and libseccomp rejects that rule) and need none: the kernel
+      only lets a process in a user namespace touch mounts that namespace owns.
+
+    The workload is not in this picture: the sandbox's own filter denies the
+    three calls, and ``CAP_SYS_ADMIN`` is dropped before it starts
+    (``docs/chroot-workspace-exec.md`` §7 and §9.5).
+    """
+    gated = {
+        name
+        for entry in WORKER_SECCOMP["syscalls"]
+        if entry.get("includes", {}).get("caps")
+        for name in entry["names"]
+    }
+    # The pre-N35 rule is still there for anyone who does carry the capability.
+    assert {"mount", "umount", "umount2", "open_tree", "move_mount"} <= gated
+
+    ungated = {
+        name: entry
+        for entry in WORKER_SECCOMP["syscalls"]
+        if entry["action"] == "SCMP_ACT_ALLOW"
+        and not entry.get("includes")
+        for name in entry["names"]
+    }
+    assert set(ungated) >= {"mount", "umount2", "pivot_root"}
+    assert ungated["mount"]["args"] == [
+        {"index": 2, "value": 0, "op": "SCMP_CMP_EQ"}
+    ]
+    assert ungated["umount2"]["args"] == []
+    assert ungated["pivot_root"]["args"] == []
 
 
 def test_k8s_worker_uses_a_localhost_seccomp_profile() -> None:

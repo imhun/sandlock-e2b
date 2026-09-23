@@ -40,6 +40,9 @@ def _settings(executor: str) -> SimpleNamespace:
         sandbox_notify_rate_limit=0,
         iam_signing_key="k",
         image_cache_dir=Path("tmp/cache"),
+        # N35: the factory forwards this one too (settings.real_root ->
+        # SandlockExecutor(real_root=...)), so the fake has to carry it.
+        real_root=False,
     )
 
 

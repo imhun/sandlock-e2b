@@ -393,14 +393,69 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 **验收（应进 lane 的形态用例）**：① 在容器档允许 mount 家族的形状里，guest 的
 `mount`/`unshare`/`chroot` 必须 EPERM，而 setup 相的 bind mount 必须成功 —— **已落地为
 `tests/security/test_chroot_exec_shebang.py::test_the_workload_cannot_mount`（两种形状都跑）**；
-② 建箱→销毁 N 次后宿主 `mount` 计数回到基线（挂载泄漏）——**待补**（真根用的挂载全在沙箱
-自己的 mount ns 里，`pivot_root` 之后旧根被 `MNT_DETACH`，但"计数不涨"这条还没有用例）；
+② 建箱→销毁 N 次后宿主 `mount` 计数回到基线（挂载泄漏）——**已补**为
+`tests/security/test_real_root_mounts.py`（§9.6 第 4 条）；
 ③ 丢 `CAP_SYS_ADMIN` 之后，`chown`/`chmod`/低端口这些"沙箱内 root"行为不变
-（按现有 security 套件回归）——**已验**：`tests/security` 在两种形状下分别
-**42 passed / 1 skipped / 1 xfailed（真根开）** 与 **94 passed / 2 skipped / 2 xfailed（默认关，
-含 dir_ledger/policy_mapping/route_b 单测）**。
+（按现有 security 套件回归）——**已验（2026-09-23 复跑，lane `tmp/k0s/n35-lane.sh`）**：
+`tests/security` 两种形状分别 **45 passed / 1 skipped / 1 xfailed（真根开，XFAIL 是 pure 形态
+的既有残余）** 与 **42 passed / 1 skipped / 4 xfailed（默认关，4 条 XFAIL 就是真根能救的那 4 条）**；
+同轮 `tests/unit` 全档 **1236 passed / 4 skipped**（4 条 skip 都是形态要求：XFS、非 root worker、
+`kubectl` 缺失）。
 
 ### 9.6 打开真根之后仍存在的缺口（本轮实测）
+
+1. **同拍写入的文件当"别人的解释器"的 ETXTBSY —— 已修（2026-09-23）**：做法已升级为**通用规则**——
+   每次 exec 前结算并释放**所有"沙箱已关闭、而中介还握着 held 副本"的条目**（读终值 → 标脏 → forget），
+   因此 exec 目标、脚本的解释器、以及其它内核侧解析路径一并覆盖，不需要专门解析 `#!`
+   （早期的按路径定点+shebang 解析版本已被删除）。用例：
+   `tests/security/test_chroot_exec_shebang.py::test_script_whose_interpreter_was_written_in_the_same_command_runs`
+   （venv console script 形状），真根开=通过、关=xfail；探针腿 `shebangguest` 由 126 变 rc=0。
+2. **`/proc` 仍是合成的 —— 已定案：本平台无法在沙箱侧挂真 procfs（实测，不是没做）**。
+   三条实测：① 在自建 userns 里 `mount("proc", …)` **EPERM**（没有自己的 pid ns 时内核按规则拒）；
+   ② 加 `unshare(CLONE_NEWPID)` 并在 fork 之后（pid=1）再挂，**仍然 EPERM**；
+   ③ 先把目标放在**自己挂的 tmpfs** 上（排除"目标 mount 不属于本 ns"这一条），带与不带 pid ns
+   **都 EPERM**；把探针从头就以 slot uid（1000）运行、make 两份 map 也复现同样结果
+   ⇒ 在这台内核（OrbStack 7.0.14）上，单条目 map 的非特权 userns **挂不了 procfs**，
+   要真 procfs 只能由特权方（runc 式 root setup 或带 cap 的 broker）来挂，那是本轮明确
+   不引入的部署改动。同时中介合成的 `/proc` 本来就是产品侧更想要的那一份（pid 过滤、
+   虚拟 hostname/uptime/meminfo、隐藏宿主路径，`procfs.rs`），所以这条按"设计选择 + 平台限制"
+   收口。**代价**（保留在案）：内核侧对 `/proc` 的解析仍不成立，例如 guest 用
+   `execve("/proc/self/fd/N")` 这种技巧；guest 自己读 `/proc` 走中介合成 ✓ 不受影响。
+3. **部署依赖：两份档必须同批到位（2026-09-23 又补了两个机制）**。`deploy/seccomp/
+   sandlock-worker.json` 已加无门闩的 `mount/umount2/pivot_root` 允许项，**节点先应用这份档、
+   再打开 `E2B_REAL_ROOT`**，否则建箱全 EPERM。今天不靠"记得"：
+   * **启动即自检（本轮新增）**：worker 第一次建 `SandlockExecutor`（结果进程内缓存）时用一个
+     **子进程**走一遍真根的关键步骤——userns → mount ns → `MS_REC|MS_PRIVATE` → bind →
+     `pivot_root` → `umount2(MNT_DETACH)`——失败就在构造函数里抛 `RuntimeError`，把**哪一步失败**
+     与**下一步该做什么**（应用 `deploy/seccomp/sandlock-worker.json`）一起写进消息；不再是
+     "每个建箱都 instance is closed、却没有任何原因"（那正是本轮踩过的）。用子进程而不是
+     `os.fork()`：worker 是多线程的（`asyncio.to_thread`），在线程里 fork 出的子进程可能死在
+     别的线程持有的锁上，那会让"防呆"本身变成卡死；子进程还自带 30 s 超时。
+     **实测**：worker 档在位 → 探针返回空串（可以建根）；换成本轮之前那份旧档（无 `pivot_root`）
+     → `pivot_root (the profile must admit it): Operation not permitted`。用例
+     `tests/unit/test_real_root_gate.py`（5 条：拒绝时的消息、开关关闭/无 rootfs 时不探测、
+     探针 stdout 即诊断原文、ok/超时/无理由退出三条边界）。
+   * **DaemonSet 里内嵌的那份档已补同步（本轮修掉的真缺口）**：`deploy/k8s/seccomp-installer.yaml`
+     的 ConfigMap 是 profile 的**内嵌副本**（不是引用文件），而它在本轮之前停在 **`8ea5909`**
+     那份 profile —— 两次 N35 改动都只改了 profile、没同步内嵌副本，所以**只 `kubectl apply`
+     DaemonSet 的节点会拿到旧档**（旧档里连无门闩的 `mount` 都没有）。现已按该文件自己写的
+     流程重嵌，并把 `checksum/profile` 注解更新为 profile 文本的 sha256（`071486c0…`）；
+     `tests/unit/test_worker_manifest_permissions.py` 同时钉住"内嵌副本与 profile 逐字节相等"
+     与"注解 == sha256(profile 文本)"，重嵌工具 `tmp/k0s/sync-seccomp-installer.py`（自检是
+     "把盘上 payload 重新编码必须逐字节复现"，先证明编码器可信再改写）。
+4. **已补的验收（§9.5 的 ②）**：`tests/security/test_real_root_mounts.py` 钉住"建箱→销毁 3 次后
+   worker 自己的挂载表一字不变"——两种形状都跑，任何"把挂载做在宿主命名空间里"的实现会立刻红。
+5. **binfmt_misc（及其它内核侧格式解析）—— 已实测并钉住（2026-09-23）**：注册一个自己的
+   magic 处理器（`:n35probe:M::#N35BINFMT::/bin/sh:`，解释器是**镜像内**路径），在 workspace 里
+   放一个以该 magic 开头的可执行文件：
+   * **真根开**：内核在**镜像自己的树**里解析 `/bin/sh` ⇒ payload 真的跑起来（rc=0）；
+   * **模拟形态**：解释器落在**宿主路径空间**，chroot 翻译后的规则集没有覆盖 ⇒ **EACCES 126**
+     （与 shebang 同一机制，之前没人报过是因为没人用 binfmt 形状的镜像）。
+   ⇒ 结论：真根同样修好这一类；前提是**解释器必须存在于镜像里**（注册表属于 worker 的内核，
+   解释器路径由内核在沙箱的根里解析）。用例：
+   `tests/security/test_chroot_exec_shebang.py::test_a_format_handler_resolves_its_interpreter_inside_the_sandbox`
+   （自己挂 `binfmt_misc`、自己注册，真根开=通过 / 关=xfail）。**剩余**：解释器只在宿主存在的
+   处理器仍然不可用（这是"注册表在宿主机、镜像里没有该解释器"的必然结果，不是缺口）。
 
 ### 9.7 真根实现的安全复核（2026-09-23，逐条实测）
 
@@ -429,51 +484,23 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 6. **共享镜像 rootfs 仍只读**：Landlock 对 rootfs 的规则是 `READ_ACCESS`（§7 的"挂载源写掩码"
    只作用于 workspace/卷），沙箱写 rootfs 仍走中介的 COW/拒绝；既有
    `test_write_outside_workspace_denied` 在两种形状下都过。
-7. **本轮复核中的两条"非本次引入"观察（已记档，未改）**：
-   a. 沙箱在 exec 前曾持有 seccomp **notify listener fd**（`context.rs` 的 `keep_fd` +
-      `mem::forget`）。若这一 fd 进入工作负载，理论上它可以**自答自己的通知**（绕过 notify
-      类策略检查；Landlock 仍在，真根下内核侧回退解析也只在沙箱树内）。建议后续在父进程
-      取走 listener（ready 握手）之后、exec 之前显式关掉它，并在两种形状各验一次。
+7. **本轮复核的两条附注（已实测校正）**：
+   a. **工作负载的 fd 表只有 0/1/2（实测 `/proc/<pid>/fd`）**。seccomp notify listener
+      （`keep_fd`）与诊断用的 trace fd 都留在**沙箱 init** 手里——init 是平台自己的进程，
+      只 fork+exec 工作负载、**从不执行 guest 代码**（`init/mod.rs::spawn` 里对 `CONTROL_FD`
+      设 `FD_CLOEXEC`、stdio 重定位、子进程 exec），所以"沙箱自答自己通知"这条路对 guest
+      **不成立**。保留为**可选加固**（握手后把 init 的表也收干净），不是洞。
+      trace fd 的继承问题确实存在过，但受害者也可能是**工作负载**（早先实测 fd 20 落在它表里），
+      已用 `FD_CLOEXEC` 修掉（fork 提交 `447454d`）。
    b. 本内核不在 `/proc/<pid>/status` 打印 Landlock 字段，所以"沙箱确有 Landlock 域"这一条
       **没有**被独立验证；安全结论依赖既有 security 套件（两种形状都过），不依赖该字段。
-8. **未复核、值得后续做的**：`fs_denied`/只读挂载在真根下的**内核侧**行为（`/proc/kcore`、
-   `/sys` 现在落在镜像树内的空目录上）；checkpoint/restore 与真根的兼容（恢复路径假设）。
-
-
-1. **同拍写入的文件当"别人的解释器"的 ETXTBSY —— 已修（2026-09-23）**：做法已升级为**通用规则**——
-   每次 exec 前结算并释放**所有"沙箱已关闭、而中介还握着 held 副本"的条目**（读终值 → 标脏 → forget），
-   因此 exec 目标、脚本的解释器、以及其它内核侧解析路径一并覆盖，不需要专门解析 `#!`
-   （早期的按路径定点+shebang 解析版本已被删除）。用例：
-   `tests/security/test_chroot_exec_shebang.py::test_script_whose_interpreter_was_written_in_the_same_command_runs`
-   （venv console script 形状），真根开=通过、关=xfail；探针腿 `shebangguest` 由 126 变 rc=0。
-2. **`/proc` 仍是合成的 —— 已定案：本平台无法在沙箱侧挂真 procfs（实测，不是没做）**。
-   三条实测：① 在自建 userns 里 `mount("proc", …)` **EPERM**（没有自己的 pid ns 时内核按规则拒）；
-   ② 加 `unshare(CLONE_NEWPID)` 并在 fork 之后（pid=1）再挂，**仍然 EPERM**；
-   ③ 先把目标放在**自己挂的 tmpfs** 上（排除"目标 mount 不属于本 ns"这一条），带与不带 pid ns
-   **都 EPERM**；把探针从头就以 slot uid（1000）运行、make 两份 map 也复现同样结果
-   ⇒ 在这台内核（OrbStack 7.0.14）上，单条目 map 的非特权 userns **挂不了 procfs**，
-   要真 procfs 只能由特权方（runc 式 root setup 或带 cap 的 broker）来挂，那是本轮明确
-   不引入的部署改动。同时中介合成的 `/proc` 本来就是产品侧更想要的那一份（pid 过滤、
-   虚拟 hostname/uptime/meminfo、隐藏宿主路径，`procfs.rs`），所以这条按"设计选择 + 平台限制"
-   收口。**代价**（保留在案）：内核侧对 `/proc` 的解析仍不成立，例如 guest 用
-   `execve("/proc/self/fd/N")` 这种技巧；guest 自己读 `/proc` 走中介合成 ✓ 不受影响。
-3. **部署依赖**：`deploy/seccomp/sandlock-worker.json` 已加无门闩的
-   `mount/umount2/pivot_root` 允许项，但**节点必须先应用这份档**（DaemonSet）再打开
-   `E2B_REAL_ROOT`，否则建箱全 EPERM。
-4. **已补的验收（§9.5 的 ②）**：`tests/security/test_real_root_mounts.py` 钉住"建箱→销毁 3 次后
-   worker 自己的挂载表一字不变"——两种形状都跑，任何"把挂载做在宿主命名空间里"的实现会立刻红。
-5. **binfmt_misc（及其它内核侧格式解析）—— 已实测并钉住（2026-09-23）**：注册一个自己的
-   magic 处理器（`:n35probe:M::#N35BINFMT::/bin/sh:`，解释器是**镜像内**路径），在 workspace 里
-   放一个以该 magic 开头的可执行文件：
-   * **真根开**：内核在**镜像自己的树**里解析 `/bin/sh` ⇒ payload 真的跑起来（rc=0）；
-   * **模拟形态**：解释器落在**宿主路径空间**，chroot 翻译后的规则集没有覆盖 ⇒ **EACCES 126**
-     （与 shebang 同一机制，之前没人报过是因为没人用 binfmt 形状的镜像）。
-   ⇒ 结论：真根同样修好这一类；前提是**解释器必须存在于镜像里**（注册表属于 worker 的内核，
-   解释器路径由内核在沙箱的根里解析）。用例：
-   `tests/security/test_chroot_exec_shebang.py::test_a_format_handler_resolves_its_interpreter_inside_the_sandbox`
-   （自己挂 `binfmt_misc`、自己注册，真根开=通过 / 关=xfail）。**剩余**：解释器只在宿主存在的
-   处理器仍然不可用（这是"注册表在宿主机、镜像里没有该解释器"的必然结果，不是缺口）。
-
+8. **被策略拒绝的路径在真根下没有变松（实测）**：真根开/关两形状下
+   `ls /sys/kernel` 与 `cat /proc/kcore` 都是 **Permission denied**、`ls /proc` 都是空
+   —— 真根把 `/sys`、`/proc` 变成**镜像树内的空目录**，比"仅由中介拒绝"更紧，没有引入新的可见面。
+9. **checkpoint/restore 与本形态无关（已核实）**：envd **完全没有**使用 fork 的
+   checkpoint/restore（`rg checkpoint envd_service` 无命中；唯一 `restore` 命中是
+   "reconciled/restored sandboxes" 的生命周期措辞）。所以"恢复路径假设"不是本产品的风险面；
+   将来若启用该能力，需按真根重新验证。
 
 
 ## 10. 未结线索（不算结论）
