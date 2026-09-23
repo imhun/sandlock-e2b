@@ -718,3 +718,24 @@ limitation"，因为 bundle 形态带 chroot）正好印证：文件形态一样
   挂载翻译 ⇒ 镜像只在"镜像 rootfs 与各卷挂载仍按同样方式解析"时有效；`cow_snapshot` 记的是
   **路径**，上层目录必须还在（或随镜像一起快照）；
 * 镜像里含政策与进程内存 ⇒ 存储位置、属主/权限、配额与清理要和沙箱数据同级对待。
+
+### 11.4 除 exec stub 之外的可选路线（谁在沙箱里搬内存，以及各自的代价）
+
+恢复要同时满足三件事：① 有一个**在沙箱内部**（同 ns/uid/Landlock/seccomp）的进程；
+② 它的地址空间**干净到能把镜像按原地址铺回去**；③ 有人把内存/寄存器/fd 搬回去。围绕
+"② 与 ③ 由谁提供"，可控的路线只有这些：
+
+| 路线 | 谁做②/③ | 绕过 §11 的两道关？ | 代价（实测/代码事实） |
+|---|---|---|---|
+| **A. execve stub（现状）** | 一个 freestanding 静态二进制：exec 提供干净地址空间，stub 自己铺区域，supervisor `process_vm_writev` 写页 | **否**（要能 exec 到它 + 要一条 Landlock 执行授权） | 需要 stub 可达 + 固定基址 + 按架构维护；这正是 §11 要修的 |
+| **B. 不 exec，进程内恢复载荷** | 复用已有的 `in_child_main: Option<fn()>`（OCI 的沙箱内 init 就走它："run this function in-process instead of `execve`-ing a workload … **nothing is exec'd, so Landlock has no execution to authorize**"） | **是**（无 exec ⇒ 无路径、无执行授权） | 地址空间是"fork 自 supervisor 的脏镜像"（tokio/缓冲/libc 全在），要自己证明能清到与镜像一致（现有的 stray-mapping 断言是为 stub 立的，得另立等价证明）；fd 表也**不再**由 exec+CLOEXEC 自动清零，要显式关干净再按原编号重开 |
+| **C. 旧 ptrace 注入引擎** | 外部 ptrace 附着到沙箱里一个 parked launcher，直接写镜像 | 是（不 exec 额外二进制） | **已明确放弃**：launcher 的 text/heap/stack 会留在恢复后的地址空间里且可达（`test_restore.rs` 的 stray-mapping 断言就是钉这个）；还要处理"何时停住它"的竞态与 route-B 下的 ptrace 权限 |
+| **D. userfaultfd 按需分页**（原设计） | stub 建 uffd，按缺页惰性供给 | 否（仍要 stub） | **被否**：uffd 在默认黑名单、seccomp 单向 ⇒ 等于把众所周知的利用原语永久授给每个恢复过的沙箱；`UFFD_USER_MODE_ONLY` 还服务不了内核态缺页。变体（init 在锁前建 uffd、以 fd 交给 stub、只用 ioctl）能绕开策略问题，但复杂度更高且仍需 stub |
+| **E. CRIU** | 外部工具：注入 parasite 代码 + 写内存 + 跳转（`restore_blob.rs` 的注释直接引了它的 restart 修复做法） | 是（不 exec 我们的 stub） | 大依赖 + 需要特权/ptrace + 要在本架构（per-sandbox userns/Landlock/seccomp）里做一遍适配；好处是 socket/连接类资源和跨版本经验比自研强 |
+| **F. 不重建（冻结/续跑）** | 没有②③：SIGSTOP/cgroup freezer 冻住整棵树，"恢复"= SIGCONT | — | **零成本但沙箱必须还活着**：不能跨机、不能跨 worker 重启、占用内存；这就是 E2B 今天 `paused` 的语义 |
+| **G. 应用级** | 镜像格式里已有的 `app_state`（不透明字节）+ 应用自己 dump/restore；或记录输入/系统调用流做 replay | — | 可移植、不碰内核，但要求应用配合、副作用要处理 |
+
+**对 E2B 的建议**：要在**生产形态（chroot + real_root）**上落地，A+§11 是改动最小的路；
+B 是"彻底不要 stub"的路（正中 §11 的病根，但要用一份"无 stray mapping + fd 表干净"的新证明
+换掉 stub 自带的两个免费性质），值得作为备选做一次原型；C/E 都要付"脏地址空间"或大依赖的代价；
+F 只能覆盖"沙箱还活着"的暂停。
