@@ -494,13 +494,46 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
       已用 `FD_CLOEXEC` 修掉（fork 提交 `447454d`）。
    b. 本内核不在 `/proc/<pid>/status` 打印 Landlock 字段，所以"沙箱确有 Landlock 域"这一条
       **没有**被独立验证；安全结论依赖既有 security 套件（两种形状都过），不依赖该字段。
-8. **被策略拒绝的路径在真根下没有变松（实测）**：真根开/关两形状下
-   `ls /sys/kernel` 与 `cat /proc/kcore` 都是 **Permission denied**、`ls /proc` 都是空
-   —— 真根把 `/sys`、`/proc` 变成**镜像树内的空目录**，比"仅由中介拒绝"更紧，没有引入新的可见面。
-9. **checkpoint/restore 与本形态无关（已核实）**：envd **完全没有**使用 fork 的
-   checkpoint/restore（`rg checkpoint envd_service` 无命中；唯一 `restore` 命中是
-   "reconciled/restored sandboxes" 的生命周期措辞）。所以"恢复路径假设"不是本产品的风险面；
-   将来若启用该能力，需按真根重新验证。
+8. **被策略拒绝的路径在真根下没有变松（实测，两形状逐字节一致 —— 2026-09-23 复核）**：
+   真根开/关两形状下逐条实测，结果**完全相同**（用例 `tests/security/test_real_root_denials.py`
+   按精确三元组钉住，两种形状各跑一遍）：
+
+   | 探针 | (rc, stdout, stderr) |
+   |---|---|
+   | `cat /proc/kcore` | `(1, b"", "cat: /proc/kcore: Permission denied\n")` |
+   | `ls /sys` | `(2, b"", "ls: cannot access '/sys': Permission denied\n")` |
+   | `ls /sys/kernel` | `(2, b"", "ls: cannot access '/sys/kernel': Permission denied\n")` |
+   | `ls /proc` | `(0, b"", "")` |
+   | `echo x > /usr/bin/n35-probe` | `(2, b"", "/bin/sh: 1: cannot create /usr/bin/n35-probe: Permission denied\n")`，且宿主侧镜像树里没有这个文件 |
+
+   **一处早先的解释被实测纠正**：`/sys`、`/sys/kernel` 在真根下**不是**"变成镜像树内的空目录"
+   —— 两形状都是 `EACCES`，也就是说拒绝来自 **Landlock 的 `fs_denied` 规则**（与目标在树里存不存在
+   无关），不是"树里恰好是空的"这种巧合；真正"空"的只有 `/proc`，因为它是中介合成的视图
+   （列出成功、内容为空，没有宿主 pid/宿主树）。结论不变、而且更强：真根没有让任何一条被拒路径变松。
+9. **checkpoint/restore：已从"没人用"升级为"实测不兼容并被显式拒绝"（2026-09-23）**。
+   **① envd 确实没用**：`envd_service/` 全树没有任何 fork C/R 符号（`checkpoint` /
+   `restore_interactive` / `restore_skipped`），现由 `tests/unit/test_checkpoint_restore_unused.py`
+   守住——将来谁要用，这条会先红，提醒先解决下面的兼容问题。
+   **② 兼容性是实测出来的，不是"应该没事"**：`Sandbox::restore_interactive` 把 **restore stub
+   当宿主路径 exec**（`resume::stub_path` 是构建产物）并把它塞进 `fs_readable`，而**任何 chroot
+   根**（模拟的、真根的）都把 workload 的路径解析到 rootfs 里面 —— 于是 stub 在那里根本不存在。
+   在 `chroot + real_root(true)` 政策下实测原文：
+
+   ```
+   sandlock child: execvp '/src/target/debug/build/sandlock-core-*/out/restore-stub':
+   No such file or directory (os error 2)
+   restore stub never signalled READY within 10000ms: exited with restore-stub code 127
+   ```
+
+   **关掉 `real_root`（只用模拟 chroot）同样复现** ⇒ 这条**不是真根独有**，是"带 root 的形态"
+   通病；fork 自己的 OCI 用例里早有一句注记"restore of a chrooted checkpoint is a separate
+   limitation"，与此一致。**已做的处理（fork `43cc62a`）**：在配置了 chroot 根而 stub 不在该根内时
+   **立刻拒绝**并写明 stub、根与两条出路（用策略挂载把 stub 带进根里 / 恢复到无 chroot 的政策），
+   不再让人等 10 s 超时；无 chroot 的恢复**不受影响**（`test_restore_glibc_vdso_program_resumes`
+   仍绿），两种根形态的"立即拒绝"由新用例 `test_restore_resumes_inside_a_real_root` 钉住。
+   **③ 对 E2B 的含义**：E2B 的生产形态就是 chroot 根（`E2B_BASE_IMAGE=python-mcp:3.14` ⇒
+   image-rootfs），所以在把 stub 送进根里之前，**"恢复沙箱"这类功能在这条 API 上不可用**——这条
+   写成前置条件，真要做时按它开工，而不是"将来若启用需重新验证"这种含糊说法。
 
 
 ## 10. 未结线索（不算结论）
