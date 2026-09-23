@@ -780,3 +780,49 @@ tokio + 堆，无法与镜像区域解耦。**可行的形态是**：supervisor 
 "fork 出来的脏地址空间 + 全量 fd 表能不能清干净"。**规则集面上它更干净**（不加权限），机制上
 `plan_sweep`/`restore_blob`/stub 主体都可复用 —— 所以值得做一个原型：在 `chroot + real_root(true)`
 下用 mmap 装机恢复一次、断言"计数器前进 + 无 stray mapping + fd 表干净"，再把上面六条逐条量出来。
+
+### 11.6 A（exec+fd+授权）与 B（mmap 装机）的实测对比（2026-09-23，B 原型已跑通）
+
+原型（fork `d16daae`）按 §11.5 的形态实现并实测：真根下 no-exec 恢复**成功**（计数器继续前进，
+`restore_skipped` 只有三个 stdio，恢复后 maps 通过"无 stray mapping"断言），无 chroot 形态同样成功
+（这条 bisect 证明先前的 SIGSEGV 与"根"无关）。下面按你关心的两个轴给结论，数字都是本轮实测。
+
+**① 功能完整一致性**
+
+| | A：exec + fd 投递 + 一条授权（§11.1） | B：memfd 装机 + 跳入（原型） |
+|---|---|---|
+| 引擎语义 | 与现有 exec 路线**逐字节相同**（同一 blob/协议/sweep/rt_sigreturn） | 同上，**但多了三条必须成立的不变量** |
+| 真根/chroot | 可用（这正是 §11.1 要修的） | 可用（实测：真根 61 maps / 45 sweep，计数器恢复） |
+| 每次恢复的开销 | exec 一次 + 一个两页进程（实测 exec 路线 **17 maps / 1 sweep**） | fork 一份 supervisor 的 COW 地址空间 + 全量 sweep（实测 **61 maps / 45 sweep**，`MAX_SWEEP 256` 余量从 ~255 掉到 ~211） |
+| per-task 内核状态 | exec 全部重置（白送） | **要约自己清**：实测 fork 继承 glibc 的 rseq 注册、而 sweep 把 rseq 区 unmap ⇒ 恢复后进程**第一条指令就 SIGSEGV**；关掉 `glibc.pthread.rseq` 同一轮直接通过 ⇒ 载荷现在显式 `rseq(NULL,0,0)` + 关 altstack（已修） |
+| fd 表 | exec + CLOEXEC 白送干净 | **未修**：实测恢复出的进程表里有 `6->/memfd:sandlock-restore-stub` 与 **`22->anon_inode:seccomp notify`**（stub 镜像 + **supervisor 的 notify listener**），即"平台 fd 落进 guest"这一类 |
+| 对 supervisor 进程状态的依赖 | 无（exec 后一切重置） | **有**：载荷跑在 supervisor 的 fork 上，进程里已有别的线程/测试状态时，实测**在 READY 之前就被 SIGSEGV 杀掉**（两种形态都复现）⇒ 原型用例已用 `SANLOCK_NOEXEC_PROTOTYPE=1` 显式开关，门禁保持绿（`core_integ 548`） |
+| 引擎固有边界（两条路线相同） | 单线程恢复、socket/pipe/memfd 走 `restore_skipped`、同内核、x86_64/riscv64 | 同左 |
+
+**结论（功能）**：A 的行为**与今天已经能跑的 chroot-free 路线完全一致**，只是把投递方式换成 fd
+并补一条授权；B 能在真根下跑通，但要**额外满足三条不变量**，其中两条目前还没达标（fd 表未清、
+进程状态敏感）。也就是说 B 的"功能完整"是**有条件的**，A 的是**无条件的**。
+
+**② 安全风险**
+
+| 风险面 | A：exec + fd + 一条授权 | B：memfd 装机 |
+|---|---|---|
+| 规则集变化 | **+1 条**：stub 的**宿主文件** `EXECUTE\|READ`（§11.1 第 5 条要求评审） | **零变化**（不 exec 就没有执行可授权；memfd 是匿名 inode，没有路径可判） |
+| 新增"平台物"出现在沙箱内 | 只有 stub 自己的 4 个 LOAD 段（exec 后的干净镜像） | 载荷与 stub 都在 supervisor 的 fork 之上；**未清理前，supervisor 的 fd（含 notify listener）会留在恢复出的进程里**（实测） |
+| 恢复后地址空间可审计性 | 白盒：只有镜像 + vdso + stub 窗口（现有 stray-mapping 断言） | 同样可断言（原型已过），但 sweep 规模大 45 倍，错误模式从"漏映射"变成"多 unmap ⇒ 崩" |
+| 失败模式 | 失败=拒绝对话/超时（响亮） | 失败可能是**静默的部分清理**（需要断言兜住）；本轮实测的是响亮崩溃（SIGSEGV） |
+| 对 workload 的额外暴露 | 一条"能执行一个平台二进制"的规则（guest 无法命名该路径，fd 表 stdio-only） | 无新增权限；但 **notify listener 泄漏**若不清，等于把 supervisor 原语交给 guest（严重，必须修） |
+
+**结论（安全）**：**B 在"权限面"更干净（零新增规则），A 在"进程内面"更干净（沙箱里只多一个
+已 exec 的静态 stub，没有任何继承物）**。B 目前那条 fd 泄漏（notify listener）在修好之前是**不可
+接受的**（它正是 E2B 上一轮修过的同一类洞），修好之后 B 的规则集优势才成立。
+
+**③ 建议（按你给的两个轴排序）**
+
+1. **先做 A+§11.1**：功能与今天可跑的路线逐字节一致、无附加不变量，风险集中且可评审（一条
+   `EXECUTE|READ`，对象是平台自己的静态 stub，guest 无法命名它）。满足"功能完整一致性"这一轴。
+2. **把 B 作为并行推进的备选**，但要按顺序补齐三件事才有资格进入选择：① 载荷在跳转前**关掉
+   未记录的 fd**（含 notify listener；验收=恢复后 fd 表 == 镜像记录）；② 解决"fork 自多线程
+   supervisor"的敏感性（例如从**专门的单线程 helper 进程** fork，而不是从 supervisor 本体 fork）；
+   ③ 为 sweep 规模设一个实测契约（当前 45/256，需给出上限与超限行为）。这三条做完再评 B 的
+   规则集优势是否值这个复杂度。
