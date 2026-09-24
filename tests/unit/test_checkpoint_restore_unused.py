@@ -15,6 +15,13 @@ sandbox's connections do not either. Nothing in the worker calls the API today;
 if that changes, this test fails and points at the checklist in
 `docs/chroot-workspace-exec.md` §9.7.9 / §11.6.
 
+**And one architecture precondition**: the restore *engine* supports x86_64 and
+riscv64 only -- `restore_interactive` refuses anything else before it starts, the
+stub has no aarch64 branch, and `build.rs` treats a missing stub as a warning off
+those architectures (so the wheel ships aarch64 happily). The A delivery change is
+arch-neutral, so a deployment on aarch64 needs the engine port first
+(`docs/chroot-workspace-exec.md` §11.7 lists it), not a different delivery route.
+
 Text scan on purpose: it is the call sites, not the behaviour, that must stay
 absent, and a grep-shaped assertion is what makes "we re-checked" durable.
 """

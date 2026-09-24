@@ -893,3 +893,45 @@ stub 这一个文件、`add_path_rule` 对文件自动掩到 `EXECUTE|READ_FILE`
 教训**：投递 fd 必须 `dup3(…, O_CLOEXEC)`——第一版用 `dup2` 时，stub 镜像以
 `6 -> …/restore-stub` 留在了**恢复后的进程**里（通道 fd 3/4/5 相反，必须活到 stub 内部，故仍是
 可继承的 dup2）。③ 与 ⑥ 留作运维/评审项（当前 stub 位于构建目录）。
+
+### 11.7 架构前提：**线上是 aarch64 时，阻塞点在引擎，不在投递**
+
+**结论先说**：A（fd 投递 + 一条宿主授权）**没有任何架构相关代码** —— `execveat`/`AT_EMPTY_PATH`、
+`fs_readable_host`、中介的放行分支都是 arch-neutral 的；而 checkpoint/restore **引擎本身只支持
+x86_64 与 riscv64**。所以在 aarch64 上，"A 还是 B"这个问题还不成立：**两条路都跑不了**，因为
+`restore_interactive` 在第一步就按架构拒绝。
+
+代码事实（本轮核对）：
+* `sandbox.rs::restore_interactive` 开头 `cfg!(not(any(x86_64, riscv64)))` ⇒ 其它架构直接
+  `Err("checkpoint restore is only implemented on x86_64 and riscv64")`；
+* `checkpoint/restore-stub.c` 只写了 `__x86_64__` / `__riscv` 两套 syscall 号与入口，
+  其它架构 `#error "unsupported architecture"`；`build.rs` 的 `is_restore_arch` 同样只含这两个
+  架构，因此**非这两个架构上 stub 构建失败只是 warning**（wheel 照常出 aarch64，`stub_path()`
+  指向一个不存在的文件）；
+* `restore_blob.rs` 的 `STUB_BASE`、FP 帧常量、`rearm_restartable_syscall` 都按 x86_64/riscv64
+  写；`capture.rs` 的寄存器捕获虽然在 `not(any(…, aarch64, …))` 里留了 aarch64 的名字，
+  但一条 aarch64 路径都没被这两个架构之外的测试跑过；
+* 我加的唯一架构代码在 **B 原型**里（`noexec.rs` 的跳转 asm，已按 x86_64/riscv64 隔离，其它架构
+  `_exit(95)`）——而 B 在 aarch64 上本来也无从运行：它要跳进的 stub 在那里根本不存在。
+
+**要在 aarch64 上线 checkpoint/restore，需要一个引擎移植（建议单独立项）**，清单：
+1. `restore-stub.c` 增 aarch64 分支：syscall 号、`_start`（把入口 sp 交给 `_start_c`、切到 `.bss`
+   私有栈）、`rt_sigreturn` 帧布局（arm64 `sigcontext` = `fault_address, regs[31], sp, pc,
+   pstate` + FP/SVE 上下文，与 x86_64 完全不同）；
+2. **线程指针**：arm64 的 TLS 在 `TPIDR_EL0`，**不在 `sigcontext` 里** ⇒ 捕获侧要读
+   `PTRACE_GETREGSET(NT_ARM_TLS)`，恢复侧要在 `rt_sigreturn` 之前用 `msr tpidr_el0, xN` 写回
+   （默认不被 `SCTLR_EL1.TIDCP` 陷入；需在目标内核上实测确认）；
+3. `restore_blob.rs`：给 aarch64 一个 `STUB_BASE`（3 TiB 在 48 位 VA 内可用，需实测）、arm64 的
+   FP 图像帧（`fpsimd_context` magic `0x46508001`、必要时 `sve_context`）、以及 arm64 版本的
+   `rearm_restartable_syscall`（`svc #0` 之后的 pc/返回值语义）；
+4. `sandbox.rs` 的架构门槛加 aarch64；`build.rs` 的 `is_restore_arch` 同步（让缺 stub 在 aarch64
+   上变成**致命**而不是 warning）；
+5. 验收必须在 **aarch64 lane** 上跑（当前 fork 门禁是 x86_64 容器）：至少
+   `test_restore_glibc_vdso_program_resumes` + `test_restore_resumes_inside_a_chroot_root`
+   的两种根形态，以及 `--oci-root` 的 C/R 用例；
+6. 之后 E2B 侧那一半（镜像存储/属主/配额、pause/resume 生命周期、`restore_skipped` 语义）照
+   §11.6 的清单走，与架构无关。
+
+**对当前决策的影响**：既然线上是 aarch64，**"先 A 还是先 B"要排在"要不要移植引擎"之后**。
+如果 aarch64 的 C/R 是目标，先做上面的移植（预计是本项目里独立的一块工作，涉及内核 ABI 细节且
+必须在 arm64 上验收），A 的投递改动届时**无需返工**（它没有架构假设）。
