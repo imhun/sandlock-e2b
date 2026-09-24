@@ -948,9 +948,9 @@ S1–S5 的阶段与每阶段判据、SVE/MTE-PAC 先 fail-closed 的处置、ar
 `regs[8]` 就是 syscall 号、fpsimd 记录 `magic 0x46508001 size 0x210 vregs@+16`、`__reserved@sc+0x120`；
 **手工帧 `rt_sigreturn` 成功**且内核不碰 `TPIDR_EL0`（⇒ stub 必须自己写回）；EL0 能写 `TPIDR_EL0`
 （TIDCP 未陷入），`NT_ARM_TLS` 经 ptrace 往返且子进程会读到新值；VA 上限 48 位、3 TiB 可用。
-两处**要按实测改计划**：SVE 的 fail-closed 判据必须用 `vl>16 || flags & SVE_PT_REGS_SVE`
-（本机普通 glibc 进程的 `NT_ARM_SVE` 本来就有内容，按"有内容就拒"会把一切拒掉）；vdso 搬迁
-必须**同 delta 搬 `[vvar]`+`[vdso]`**（只搬 `[vdso]` 实测 `SEGV_MAPERR @ new_vdso-0x4000`）。
+两处**要按实测改计划**：SVE 的 fail-closed 判据（本机普通 glibc 进程的 `NT_ARM_SVE` 本来就有
+内容，按"有内容就拒"会把一切拒掉；判据最后定成**只看 `SVE_PT_REGS_SVE` 那一位**，见下）；vdso
+搬迁必须**同 delta 搬 `[vvar]`+`[vdso]`**（只搬 `[vdso]` 实测 `SEGV_MAPERR @ new_vdso-0x4000`）。
 **S1 已落地（2026-09-24，fork `40527d8`）**：capture 学会读 aarch64 的线程指针
 （`NT_ARM_TLS`；x86_64/riscv64 返回 `None`），`ProcessState` 增加 `tls`、`IMAGE_VERSION` 2→3、
 镜像新增 `process/threads/tls.bin`（aarch64 缺该字段的 v3 镜像直接拒绝）。方式是**本地 zig 镜像
@@ -958,4 +958,20 @@ S1–S5 的阶段与每阶段判据、SVE/MTE-PAC 先 fail-closed 的处置、ar
 `docs/arm-cr-s0-evidence.md` §7）。证据：aarch64 上 `checkpoint::` 子集 32 passed / 0 failed
 （改前 28），x86_64 同子集 40 passed / 0 failed。
 
-下一步是 S2（`restore_blob` 的 arm64 分支：3 TiB 的 `STUB_BASE`、fpsimd 帧封装、`rearm` 写回）。
+**S2 已落地（2026-09-24，fork `6a6fdf2`）**：`restore_blob` 的 arm64 分支 —— `STUB_BASE` 在
+aarch64 上复用 x86_64 的 3 TiB（S0c 实测可 mmap、48 位 VA）；FP 图像做成 `rt_sigreturn` 要的
+`fpsimd_context` 记录（把 ptrace 的 `user_fpsimd_state` 重排并丢掉两个内核保留字，长度不是 0/528
+就拒）；`rearm_restartable_syscall` 在 arm64 上是**空操作**（外加"`x0` 里还留着重启哨兵就
+fail-closed"）。最后一条是本阶段最有价值的实测：新探针 `spikes/arm-s0/s0e-restart.c` 在目标内核
+上量到，`PTRACE_INTERRUPT` 停点**之前**内核已经把 `pc` 掰回 `svc`、把 `x0` 还原成原参数，`x8`
+里还是原 syscall 号（内核注释原文 *"so that a debugger will see the already changed PC"*）⇒
+x86_64 那套"`pc` 减 4、重载 `orig_rax`"在 arm64 上会执行到 `svc` 的后半条，而 `orig_x0` 又不在
+`user_pt_regs` 里、根本重载不了。capture 侧另加了 SVE 的 fail-closed（读 `NT_ARM_SVE`，只有
+`SVE_PT_REGS_SVE` 位表示向量寄存器真的活着才拒）：**S0 写的 `vl>16` 那半条判据被撤回**，因为
+`vl` 是线程 VL、在有 SVE 的机器上默认等于系统 VL，用长度判会把 Graviton 上每一个普通进程都拒掉。
+证据：aarch64 `checkpoint::` 子集 33 passed / 8 failed（8 条全是**本地 lane 的 qemu-user 不实现
+`ptrace`/`process_vm_writev`**，新增的帧布局/哨兵/FP 长度/SVE 判据全绿），x86_64 同子集
+40 passed / 0 failed。
+
+下一步是 S3：`restore-stub.c` 的 `__aarch64__` 分支（syscall 号、`_start`、`rt_sigreturn` 帧 +
+`msr tpidr_el0` 写回），以及 `build.rs`/`sandbox.rs`/`resume.rs` 的架构门槛。
