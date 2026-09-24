@@ -941,3 +941,14 @@ x86_64 与 riscv64**。所以在 aarch64 上，"A 还是 B"这个问题还不成
 信号帧 `rt_sigreturn`、`TPIDR_EL0` 往返 + `NT_ARM_TLS`、`STUB_BASE`/vDSO 对目标内核）、
 S1–S5 的阶段与每阶段判据、SVE/MTE-PAC 先 fail-closed 的处置、arm64 lane 的搭法与验收命令、
 以及"S0 不成立就停在 S0、改走冻结/replay"的止损点。
+
+**S0 已跑完（2026-09-24）**：fork 提交 `0f1c168`（`docs/arm-cr-s0-evidence.md` +
+`spikes/arm-s0/`）。在线上同族的两个 aarch64 节点（Rocky 10.2 / `6.12.0-211.34.1.el10_2.aarch64`）
+上逐字段实测，两节点一致：帧布局钉死为 `info@0 / uc@0x80 / sigcontext@frame+0x130`、
+`regs[8]` 就是 syscall 号、fpsimd 记录 `magic 0x46508001 size 0x210 vregs@+16`、`__reserved@sc+0x120`；
+**手工帧 `rt_sigreturn` 成功**且内核不碰 `TPIDR_EL0`（⇒ stub 必须自己写回）；EL0 能写 `TPIDR_EL0`
+（TIDCP 未陷入），`NT_ARM_TLS` 经 ptrace 往返且子进程会读到新值；VA 上限 48 位、3 TiB 可用。
+两处**要按实测改计划**：SVE 的 fail-closed 判据必须用 `vl>16 || flags & SVE_PT_REGS_SVE`
+（本机普通 glibc 进程的 `NT_ARM_SVE` 本来就有内容，按"有内容就拒"会把一切拒掉）；vdso 搬迁
+必须**同 delta 搬 `[vvar]`+`[vdso]`**（只搬 `[vdso]` 实测 `SEGV_MAPERR @ new_vdso-0x4000`）。
+下一步是 S1（capture 的 aarch64 分支 + `IMAGE_VERSION` +1 带 `tls` 字段）。
