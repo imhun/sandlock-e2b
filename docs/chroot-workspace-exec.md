@@ -826,3 +826,51 @@ tokio + 堆，无法与镜像区域解耦。**可行的形态是**：supervisor 
    supervisor"的敏感性（例如从**专门的单线程 helper 进程** fork，而不是从 supervisor 本体 fork）；
    ③ 为 sweep 规模设一个实测契约（当前 45/256，需给出上限与超限行为）。这三条做完再评 B 的
    规则集优势是否值这个复杂度。
+
+#### 11.6.1 A 那条授权（stub 宿主路径 `EXECUTE|READ_FILE`）的安全评估
+
+**先摆事实：它不是新增的权限种类。** fork 的 `fs_readable` 一律按 `READ_ACCESS` 安装，而
+`READ_ACCESS = EXECUTE | READ_FILE | READ_DIR`（`landlock.rs:25`），`add_path_rule` 对非目录会把
+目录类权限掩掉（`ACCESS_FILE`，`landlock.rs:32`）⇒ 落到文件上**正好就是 `EXECUTE|READ_FILE`**。
+**纯形态（今天就能跑恢复的形态）其实已经在装这一条**：`restore_interactive` 里那句
+`fs_readable.push(stub)` 在无 chroot 时就是宿主路径。§11.1 的改动只是让 **chroot 形态**把
+**同一条**授权写在宿主路径上（现在它被 chroot 翻译成"rootfs 里不存在的路径"而被静默丢弃）。
+
+**规则的内核语义（决定了风险边界）**：
+
+| 维度 | 实际含义 |
+|---|---|
+| 对象 | **一个文件**（stub 构建产物），不是目录 ⇒ 没有子项，目录类权限被掩掉 |
+| 权利 | 实测**最小集 = `EXECUTE \| READ_FILE`**：只给 `EXECUTE` 会被拒（EACCES）—— 内核把可执行文件
+的段映射进来需要 READ_FILE；`EXECUTE\|READ_FILE` 下两种 exec 形式都通过 |
+| 作用域 | 该沙箱**自己的** Landlock 域（每沙箱各自构建规则集，域随进程树消亡），被恢复出的程序及其
+后代继承 |
+| 祖先目录 | **不需要授**（§11.1 用 fd 投递）：实测只授权文件本身即可跑起来，路径形式在 chroot/
+真根下依旧不可解析 |
+| 不涉及 | 写、创建、删除、目录遍历以外的 REFER、seccomp、uid/caps、chroot/pivot 行为 |
+
+**谁能用它**：生产形态（chroot/`real_root`）下 stub 的宿主路径**不在沙箱路径空间里**（guest 的 `/`
+是 rootfs），workload 无法命名它；workload 的 fd 表只有 stdio（早前实测），stub 的 fd 全是 CLOEXEC
+⇒ **实际只有恢复路径自己用得到这条权利**。纯形态里 guest 理论上能命名宿主路径 —— 但那正是**今天
+已有**的状态，chroot 形态加这条不扩大纯形态之外的暴露。
+
+**残余风险清单（逐条给可达性与影响）**：
+
+1. **workload 若能命名该文件，就能执行它** —— 执行 stub 不构成提权：它跑在**同一个沙箱域**内
+   （Landlock/seccomp/uid 都已就位），没有 blob/计划时只会 `_exit(2)`；即便伪造 blob，它能做的也只是
+   "map 若干区域 + 跳到某地址"，与 guest 自己调 `mmap` 等价。影响：无提权，最多是可用性噪声。
+2. **能读/映射 stub 二进制** —— 内容是平台自己的几 KB 代码，无秘密。影响：无。
+3. **规则锚在"构建产物路径"上** —— 若该文件所在目录**可被宿主侧非特权用户写**，有人可以替换 stub，
+   沙箱会执行被替换的文件。边界很窄：能替换的人已经在宿主上拥有比沙箱更大的权限，且被替换的代码仍在
+   沙箱域内运行（Landlock/seccomp/uid 已装、CAP 已丢）⇒ 不会因此拿到宿主权限。**运维要求**：stub 所在
+   目录不得对非特权宿主用户可写（当前是构建目录；要更严可迁到 worker 的受保护目录）。
+4. **审计面 +1 条规则** —— 收法：用一条用例把它的**形状**钉住（只允许这一个文件、只允许
+   `EXECUTE|READ_FILE`、只在需要它的形态里出现），漂移即红。
+5. **与 B 的相对风险** —— B 不加规则，但原型实测把 **supervisor 的 seccomp notify listener** 留在了
+   恢复进程的 fd 表里（`22->anon_inode:seccomp notify`）：那是**内核原语句柄**层面的暴露，比"一个文件的
+   路径权限"高一个量级，也是"先做 A"的主要理由之一。
+
+**评审清单（可直接对照）**：① 只授文件、不授目录；② 只授 `EXECUTE|READ_FILE`（实测最小集）；
+③ 只在有 chroot 根的形态里加，纯形态沿用现有 `fs_readable`；④ 继续用 fd 投递，不回到路径 exec
+（这样祖先目录一条都不用授）；⑤ 加"授权形状"用例（两种形态各跑一遍）；⑥ 运维确认 stub 目录不可被
+非特权用户写。
