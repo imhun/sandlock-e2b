@@ -345,21 +345,23 @@ env:
 - 权限：`securityContext.capabilities.add: [NET_BIND_SERVICE]`、
   `securityContext.seccompProfile.type: Unconfined`（K8s 1.19+）。
   **A6 之后不再需要 `SYS_ADMIN`**（共享卷 bind 已删、配额由 quota-agent 提供，
-  见 `docs/production-deployment-requirements.md` §2.4.3）；低端口 `:53` 另需 pod 级
-  sysctl（见下条），cap 对非 root pod 无效；
+  见 `docs/production-deployment-requirements.md` §2.4.3）；低端口 `:53` 在 netns
+  形态下不需要任何窗口（见下条），cap 对非 root pod 无效；
 - 非 root（E5.1）：worker 镜像以 uid 65534 运行，Pod 同步声明
   `securityContext.runAsNonRoot: true`、`runAsUser: 65534`、
   `runAsGroup: 65534`（镜像已预建 `/var/lib/e2b-sandboxes` 且属主 65534；
   既有 RWX PVC 需一次性 chown 到 65534，或由 initContainer 完成）；
-- 低端口：**必须声明 `net.ipv4.ip_unprivileged_port_start=0`**（pod 级
-  `spec.template.spec.securityContext.sysctls`，`deploy/k8s/worker.yaml` 已声明）——
-  wildcard allowOut 的 DNS 网关绑 `:53`，而 worker 镜像 `USER 65534` ⇒ 非 root 的
-  cap 没有 effective 语义（Kubernetes 无 ambient capabilities），`NET_BIND_SERVICE`
-  **不够**，内核默认 1024 下 bind `:53` = EACCES。实测来自 **Docker 引擎**
-  （`tmp/a6fix1-cap-probe.log`：uid 65534 + cap ⇒ `CapEff=0`；同一 uid 声明 sysctl=0 ⇒ OK；
-  root + cap ⇒ OK），k8s 侧的依据是**该 sysctl 自 1.22 起属 safe sysctl**（可声明、
-  无需 kubelet 放行）；cap 只对 root override（`runAsUser: 0`）有意义。该 sysctl
-  **不需要** kubelet `--allowed-unsafe-sysctls`（`hostNetwork: true` 下 `net.*` 会被拒）；
+- 低端口：**netns 形态下不需要**。`deploy/k8s/worker.yaml` 自 2026-09-17（N5）起与
+  compose stack 同形态（`E2B_ENABLE_NET_ISOLATION` + `E2B_FD_INJECT_CONNECT` 成对），
+  pod 级 `securityContext.sysctls` 随之删除：wildcard allowOut 的 DNS 网关绑 `:53` 现在
+  发生在**沙箱自己的 netns** 里，root-in-userns 自带 `CAP_NET_BIND_SERVICE`（fork
+  `context.rs`）。只有**共享 netns 形态**才需要低端口窗口，且在那里 worker 镜像
+  `USER 65534` ⇒ 非 root 的 cap 没有 effective 语义（Kubernetes 无 ambient
+  capabilities），`NET_BIND_SERVICE` **不够**，内核默认 1024 下 bind `:53` = EACCES。
+  实测来自 **Docker 引擎**（`tmp/a6fix1-cap-probe.log`：uid 65534 + cap ⇒ `CapEff=0`；
+  同一 uid 声明 sysctl=0 ⇒ OK；root + cap ⇒ OK）；k8s 侧的旧依据是该 sysctl 自 1.22 起
+  属 safe sysctl（可声明、无需 kubelet 放行，`hostNetwork: true` 下 `net.*` 会被拒）；
+  cap 只对 root override（`runAsUser: 0`）有意义；
 - 无 docker socket：不挂 `/var/run/docker.sock`，rootfs 提取走第 4.2 节
   的 registry 直拉。
 

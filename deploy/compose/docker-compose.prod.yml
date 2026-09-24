@@ -200,6 +200,16 @@ services:
       # a port, so allow unprivileged low-port binding (namespaced per
       # container, applied by the runtime from this spec -- no SYS_ADMIN, no
       # in-container sysctl write). MCP inbound ports are 50005+.
+      #
+      # Load-bearing for THIS example, which runs the shared-netns shape: the
+      # gateway binds in the worker's netns as uid 65534, and the kernel
+      # refuses :53 there without the window (measured 2026-09-24 on the
+      # aarch64 lane against the same shape: `bind DNS gateway: Permission
+      # denied (os error 13)` with the stock default). The fleet shape --
+      # `deploy/stack/docker-compose.prod.yml` and the k8s `worker.yaml` --
+      # runs per-sandbox netns (`E2B_ENABLE_NET_ISOLATION` +
+      # `E2B_FD_INJECT_CONNECT`), where the bind happens inside the sandbox's
+      # own netns and neither manifest declares a low-port window.
       - net.ipv4.ip_unprivileged_port_start=0
     security_opt:
       # The worker is the process that builds every sandbox, so it is the one

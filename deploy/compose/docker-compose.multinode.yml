@@ -119,8 +119,12 @@ services:
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
-    # E2B_QUOTA_AGENT_URL + quota-agent; low-port :53 only matters for
-    # wildcard rules, declare net.ipv4.ip_unprivileged_port_start=0).
+    # E2B_QUOTA_AGENT_URL + quota-agent). This example runs the shared-netns
+    # shape, where wildcard allowOut rules additionally need the low-port
+    # window -- `sysctls: [net.ipv4.ip_unprivileged_port_start=0]`, as in
+    # deploy/compose/docker-compose.prod.yml -- which this file does not
+    # declare; the fleet shape is per-sandbox netns
+    # (deploy/stack/docker-compose.prod.yml) and needs no window at all.
     security_opt:
       - seccomp=unconfined
 
@@ -150,8 +154,12 @@ services:
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
-    # E2B_QUOTA_AGENT_URL + quota-agent; low-port :53 only matters for
-    # wildcard rules, declare net.ipv4.ip_unprivileged_port_start=0).
+    # E2B_QUOTA_AGENT_URL + quota-agent). This example runs the shared-netns
+    # shape, where wildcard allowOut rules additionally need the low-port
+    # window -- `sysctls: [net.ipv4.ip_unprivileged_port_start=0]`, as in
+    # deploy/compose/docker-compose.prod.yml -- which this file does not
+    # declare; the fleet shape is per-sandbox netns
+    # (deploy/stack/docker-compose.prod.yml) and needs no window at all.
     security_opt:
       - seccomp=unconfined
 
@@ -181,8 +189,12 @@ services:
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
-    # E2B_QUOTA_AGENT_URL + quota-agent; low-port :53 only matters for
-    # wildcard rules, declare net.ipv4.ip_unprivileged_port_start=0).
+    # E2B_QUOTA_AGENT_URL + quota-agent). This example runs the shared-netns
+    # shape, where wildcard allowOut rules additionally need the low-port
+    # window -- `sysctls: [net.ipv4.ip_unprivileged_port_start=0]`, as in
+    # deploy/compose/docker-compose.prod.yml -- which this file does not
+    # declare; the fleet shape is per-sandbox netns
+    # (deploy/stack/docker-compose.prod.yml) and needs no window at all.
     security_opt:
       - seccomp=unconfined
 

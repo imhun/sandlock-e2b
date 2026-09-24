@@ -97,8 +97,8 @@ def test_stack_worker_has_no_cap_add_and_declares_the_low_port_window() -> None:
     # Since both workers run per-sandbox netns (2026-09-16) the container-level
     # low-port window is gone: the wildcard-DNS `:53` bind happens inside the
     # sandbox's own netns, where root-in-userns covers port 53 (fork:
-    # crates/sandlock-core/src/context.rs). The k8s manifest keeps its pod-level
-    # copy -- that shape is still shared-netns -- and is asserted below.
+    # crates/sandlock-core/src/context.rs). The k8s manifest dropped its
+    # pod-level copy on 2026-09-17 (N5, same reason) and is asserted below.
     assert "\n    sysctls:\n" not in worker
     # The directive, not the prose: the comment above explains why it is gone.
     assert "\n      - net.ipv4.ip_unprivileged_port_start=0\n" not in worker

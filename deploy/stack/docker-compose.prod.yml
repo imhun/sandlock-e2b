@@ -315,7 +315,9 @@ services:
     # there (fork: `crates/sandlock-core/src/context.rs`, "we are root inside
     # our user namespace, so CAP_NET_BIND_SERVICE covers port 53 and the host
     # `ip_unprivileged_port_start` sysctl is irrelevant"). The k8s manifest
-    # keeps its pod-level copy because that shape is still shared-netns.
+    # dropped its pod-level copy on 2026-09-17 (N5) for the same reason -- and
+    # because a pod-level window let every process in the pod bind low ports,
+    # a hole with nothing to do with sandboxes.
     security_opt:
       # Docker's default syscall filter plus the two syscalls the sandbox-create
       # path needs (`pidfd_getfd` for the seccomp-notification fd, `unshare` for

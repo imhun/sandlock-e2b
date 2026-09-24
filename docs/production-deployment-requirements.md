@@ -353,8 +353,9 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
   `spec.template.spec.securityContext.sysctls`（`deploy/k8s/worker.yaml`）。
   **2026-09-16 起：compose 侧不再声明这条 sysctl**——两个 worker 都跑 per-sandbox netns，
   wildcard-DNS 的 `:53` bind 落在沙箱自己的 netns 内，沙箱在自身 userns 里是 root
-  （`CAP_NET_BIND_SERVICE` 覆盖 53），host 侧 sysctl 无关（fork: `context.rs`）。k8s 清单仍是
-  共享 netns 形态，继续保留 pod 级声明。
+  （`CAP_NET_BIND_SERVICE` 覆盖 53），host 侧 sysctl 无关（fork: `context.rs`）。k8s 清单
+  2026-09-17（N5）切 netns 时也撤掉了 pod 级声明，理由同上 —— 并且 pod 级窗口让 pod 里
+  **任何**进程都能绑低端口，与沙箱无关。
   ⚠️ **不能用 `NET_BIND_SERVICE` 代替**：worker 镜像（`deploy/docker/Dockerfile.envd`）
   以 `USER 65534:65534` 构建、pod 也没有 `runAsUser: 0` ⇒ containerd 对非 root 清空
   effective 集（实测 `CapEff=0`，没有 ambient caps），内核默认
@@ -534,7 +535,8 @@ E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true` 跑全量 =
 `E2B_FD_INJECT_CONNECT=${E2B_FD_INJECT_CONNECT:-true}`（worker-2 保留自己的
 `*_WORKER2` 覆盖以便单节点回滚），**容器级 `ip_unprivileged_port_start=0` 已从 compose 撤掉**
 （它的唯一用户是 wildcard-DNS 的 `:53`，netns 形态下该 bind 发生在沙箱自己的 netns，
-root-in-userns 自带 `CAP_NET_BIND_SERVICE`；k8s 清单仍是共享 netns，继续保留 pod 级那份）。
+root-in-userns 自带 `CAP_NET_BIND_SERVICE`；k8s 清单 2026-09-17（N5）切 netns 时把 pod 级
+那份一并撤掉，理由同上 —— 并且 pod 级窗口让 pod 里**任何**进程都能绑低端口）。
 
 以下为灰度期的记录，保留作追溯：**形态**：`deploy/stack/docker-compose.prod.yml` 里**只有 worker-2** 带
 `E2B_ENABLE_NET_ISOLATION=true` + `E2B_FD_INJECT_CONNECT=true`（默认即 true，可用
