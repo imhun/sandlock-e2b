@@ -1026,3 +1026,33 @@ guest 内核 ≥6.10、工作区必须在 guest 本机文件系统、`/tmp` 重�
 剩下的两步（S4 门槛/构建、S5 lane 与验收登记）按 fork 计划继续，验收仍须在 arm64 lane 上做；
 §11.6 里 E2B 侧那一半（镜像存储/属主/配额、pause/resume 生命周期、`restore_skipped` 语义）
 与架构无关，不受影响。
+
+**S3 之后：arm64 lane 首轮全量（2026-09-24，全部本地）**。把 fork 的 `core_lib` 整档搬到 arm64
+真内核上跑，**904 passed / 0 failed**（x86_64 同档 **902/0**；四相位门禁也全绿：非 root 八档
+对基线零漂移、`--oci-root` **157**、`--supervise-root` **4**、`--mediation-2uid` **9**）。首轮是
+**899/4**，四条红**全部**落在"按架构写死的表"上，其中一条是**产品 bug**：
+
+* **`struct epoll_event` 在 aarch64 上是 16 字节、`data` 在偏移 8**（x86_64 才是 packed 的 12/4；
+  两边都用 C 探针量过）。`network/readiness.rs` 把 `12/4` 写死了 ⇒ **入站映射**（拦截
+  `epoll_ctl(ADD|MOD)` 并合成 `epoll_wait` 结果那条路）在 aarch64 上读错半个记录、写回内核不认的
+  记录。真内核上 RED 到位：解析出 `data = 0x0b0a090800000000`，真值是 `0x0f0e0d0c0b0a0908`。
+  **这条与 C/R 无关、但与生产同源** —— 线上 worker 是 aarch64，任何走 epoll 入站映射的负载都会
+  踩到它。已在两架构上 GREEN（fork `5937df0`）。
+* `sys/path_surface.rs` 的三个横切检查按 x86_64 的**名字**比对，而 `chroot_path_syscalls()` 本就是
+  **数字**表（`arch::sys_*()` 在 generic ABI 上返回 `None`）：aarch64 上 `open/stat/...` 根本不存在
+  ⇒ 改成"按数字比对 + 每个 ABI 相关行由 arch helper 双向背书"。产品行为未变（fork `8a7e225`）。
+* `NON_PATH_SYSCALLS` 补上 32 位 time64 组：`syscalls` crate 的 aarch64 表在 403..422 带了这些
+  名字，内核在 64 位 ABI 上并不实现，原先被穷尽性检查当成"新 syscall"。
+* `core_integ` 在 arm64 上**还没绿**：**506/42**，42 条同属 `net_fixture` 家族（http_acl /
+  net_isolate / 网络注入 / named unix socket），缺的是**容器入口的 root prep** —— fixture 自己
+  在报错里点名 "run the test container entrypoint (root prep) so the unprivileged fixtures
+  exist"（那一步负责 seed `/etc/hosts` 与 `198.18.0.0/15` 地址）。已按"未收口"写进 fork 的
+  `docs/test-baseline.md`，**没有**假装成基线。
+* E2B 侧 `tests/security` 的 arm64 两态**尚未跑**，原因如实记下：本地 `e2b-sandlock-test` 镜像是
+  amd64、fork 的 wheel 只出了 cp314、而 guest 是 python 3.12。下一步二选一：给 lane 装 docker 并
+  载入 arm64 镜像（prod worker 镜像本来就是 arm64），或给 wheel 加 cp312 腿。
+
+lane 本身也修了一处**取证陷阱**：Lima 的 9p 挂载在宿主原地重写文件后仍给 guest **旧内容**
+（宿主 6→29 字节，guest 侧内容与 mtime 都不动，12 秒后依旧），rsync 的快速检查因此什么都不复制、
+lane 会拿上一次的二进制跑出"结果"。现在源码走 tar-over-ssh、产物走 `limactl copy`，9p 只做随手看；
+**依然不往线上节点推任何测试二进制**。
