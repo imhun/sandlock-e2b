@@ -935,3 +935,9 @@ x86_64 与 riscv64**。所以在 aarch64 上，"A 还是 B"这个问题还不成
 **对当前决策的影响**：既然线上是 aarch64，**"先 A 还是先 B"要排在"要不要移植引擎"之后**。
 如果 aarch64 的 C/R 是目标，先做上面的移植（预计是本项目里独立的一块工作，涉及内核 ABI 细节且
 必须在 arm64 上验收），A 的投递改动届时**无需返工**（它没有架构假设）。
+
+**移植计划已落**：fork 仓 `docs/fork-plan-2026-09-aarch64-restore.md`（2026-09-24，提交
+`17e4711`）—— 含代码坐标（capture/restore_blob/stub/门槛/构建）、**S0 三条 spike 先行**（手工
+信号帧 `rt_sigreturn`、`TPIDR_EL0` 往返 + `NT_ARM_TLS`、`STUB_BASE`/vDSO 对目标内核）、
+S1–S5 的阶段与每阶段判据、SVE/MTE-PAC 先 fail-closed 的处置、arm64 lane 的搭法与验收命令、
+以及"S0 不成立就停在 S0、改走冻结/replay"的止损点。
