@@ -158,6 +158,23 @@ volume mount 会**原样透传**这个数（`single_file_ceiling_bytes` 靠它�
 排查提示：怀疑 helper 被清零时先看 `ls -l third_party/sandlock/tests/rootfs-helper` 的**大小**——
 0 字节就是这条，不是产品回归。
 
+**B13. `E2B_REAL_ROOT=1` 在 aarch64 上永远打不开，报的却是 seccomp 档的问题。**
+现象（2026-09-24，arm lane 实测）：`E2B_REAL_ROOT=1` 跑 `tests/security`，12 个用例全红在建箱前 ——
+`RuntimeError: E2B_REAL_ROOT is on, but this worker cannot build a sandbox root: pivot_root (the
+profile must admit it): No such process`，指向"去应用 `deploy/seccomp/sandlock-worker.json`"。
+原因：`_REAL_ROOT_PROBE` 里的探针把 `pivot_root(2)` 的号**写死成 x86_64 的 155**
+（`libc.syscall(155, ...)`）。aarch64 用的是 generic syscall 表，`pivot_root` 是 **41**，而 155 在
+那里是 `sched_getattr` —— 传 `b"."` 当 pid 就回 `ESRCH`（"No such process"），于是**探针从来没问过
+内核 pivot_root**，却把别人的 errno 当成了"profile 没放行"。影响面正好是生产架构：线上是 aarch64，
+这个开关在那之前**不可能被打开**，而错误信息会把人送去查 seccomp。
+实测（同一台 guest）：`syscall(155)` → ESRCH，`syscall(41)` → EINVAL（这才是真 `pivot_root` 对
+"路径不是挂载点"的回答）。
+做法：按架构派发（x86_64 = 155，generic 表的 aarch64/riscv64/loongarch64 = 41），**未知架构
+fail closed** 并点出架构名（错的号会伪装成 seccomp 问题，见上）；注意别把这条规则误用到
+`xfs_quotactl.py` 的 `_SYS_QUOTACTL_FD = 443` —— 那个号在两张表里一致，写一个是对的。
+推广：**任何 Python 里的 `__NR_*` 常量都要先确认它在目标架构上是不是同一个号**，跨架构的 lane
+（§7 的 arm64 lane）是唯一能抓到这类 bug 的地方，x86_64 容器门禁全绿也说明不了问题。
+
 ---
 
 ## C. 目标机部署 / 远程操作

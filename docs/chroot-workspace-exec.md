@@ -896,10 +896,39 @@ stub 这一个文件、`add_path_rule` 对文件自动掩到 `EXECUTE|READ_FILE`
 
 ### 11.7 架构前提：**线上是 aarch64 时，阻塞点在引擎，不在投递**
 
-**结论先说**：A（fd 投递 + 一条宿主授权）**没有任何架构相关代码** —— `execveat`/`AT_EMPTY_PATH`、
-`fs_readable_host`、中介的放行分支都是 arch-neutral 的；而 checkpoint/restore **引擎本身只支持
-x86_64 与 riscv64**。所以在 aarch64 上，"A 还是 B"这个问题还不成立：**两条路都跑不了**，因为
-`restore_interactive` 在第一步就按架构拒绝。
+**状态（2026-09-24，S0–S5 全部落地后）**：下面这段是本轮**开始前**的盘点，它当时是对的，
+现在只是历史。引擎移植已经做完（S0 spike → S1 capture → S2 帧/blob → S3 stub → S4 门槛与构建 →
+S5 lane 与验收），**aarch64 上 checkpoint/restore 已经能跑**：本地 Lima qemu VM（真 6.14 内核、
+真 ptrace、真 `rt_sigreturn`，不往任何线上节点推测试二进制）上 `integration::test_restore::`
+4 passed / 0 failed，其中 `test_restore_resumes_inside_a_chroot_root` 两种根形态都过；fork 的五条
+arm64 相位（含 C-ABI）与 x86_64 基线**逐条相同**（157/4/9/104/51，见本节末尾的 S1–S3 段、
+下面的 S4/S5 状态，以及 `third_party/sandlock/docs/test-baseline.md` 的 arm64 段）。于是"投递
+（A）还是装机（B）"现在**是个真问题**了，而 §11.6 的结论不变：投递本身没有架构假设，S3 落地
+**没有让 A 返工**。逐阶段判据与证据在 fork 的 `docs/fork-plan-2026-09-aarch64-restore.md`。
+
+**S5 的 arm64 两态（本节更新的一部分）**：`tests/security` 在 arm64 lane 上两态都绿 ——
+`E2B_REAL_ROOT=0` **35 passed / 9 skipped / 4 xfailed**、`E2B_REAL_ROOT=1` **38 passed /
+9 skipped / 1 xfailed**（同轮 x86_64 生产形态 lane：43/1/4 与 46/1/1；两边的 passed+xfailed
+都是 39/47，差的那 8 条是 arm64 guest 没有 docker 守护进程/socket/CLI 导致的 skip）。
+日志：`tmp/arm-lane/s5-arm-security-realroot{0,1}.log` 与 `s5-x86-security-realroot{0,1}.log`；
+x86 那两条是用 `tmp/arm-lane/x86-security.sh` 取的（`test-prod-shaped.sh` 的 phase 1 跑整个
+`tests` 树，无法只跑一个目录，见 pitfalls B4），镜像、cap 集、seccomp 档、registry mirror 与它
+一致。arm64 的 `E2B_REAL_ROOT=0` 那一条没有重跑探针修复后的代码：探针唯一的调用点在
+`if self._real_root and …` 里面，这个形态根本不会走到它。
+真根形态比模拟根多出的 3 条通过，正是本文 N35 的那三条 shebang/binfmt 用例 —— 它们在没有真根时
+是**运行期** `pytest.xfail()`，真根下走到断言并通过，所以 xfailed 从 4 降到 1。
+
+**这一路在 aarch64 上抓到的最有价值的一条不是 fork 的**：`E2B_REAL_ROOT=1` 在 arm64 上**根本
+打不开** —— worker 的 `_REAL_ROOT_PROBE` 把 `pivot_root(2)` 的号写死成 x86_64 的 155，而 aarch64
+用 generic 表（`pivot_root` = 41，155 = `sched_getattr`），探针**从没问过内核 pivot_root**，
+却把 ESRCH 报成"seccomp 档没放行"，把运维指向 seccomp。线上是 aarch64，所以这个开关在那之前
+不可能被打开。已修（按架构派发 + 未知架构 fail closed），并加了只在 generic 表架构上会红的
+单元钉（拿掉修复即 ESRCH 红，arm lane 实测）。细节见 `docs/build-test-deploy-pitfalls.md` B13。
+
+**结论先说（历史，2026-09-24 之前）**：A（fd 投递 + 一条宿主授权）**没有任何架构相关代码** ——
+`execveat`/`AT_EMPTY_PATH`、`fs_readable_host`、中介的放行分支都是 arch-neutral 的；而
+checkpoint/restore **引擎本身只支持 x86_64 与 riscv64**。所以在 aarch64 上，"A 还是 B"这个问题
+还不成立：**两条路都跑不了**，因为 `restore_interactive` 在第一步就按架构拒绝。
 
 代码事实（本轮核对）：
 * `sandbox.rs::restore_interactive` 开头 `cfg!(not(any(x86_64, riscv64)))` ⇒ 其它架构直接
@@ -932,9 +961,8 @@ x86_64 与 riscv64**。所以在 aarch64 上，"A 还是 B"这个问题还不成
 6. 之后 E2B 侧那一半（镜像存储/属主/配额、pause/resume 生命周期、`restore_skipped` 语义）照
    §11.6 的清单走，与架构无关。
 
-**对当前决策的影响**：既然线上是 aarch64，**"先 A 还是先 B"要排在"要不要移植引擎"之后**。
-如果 aarch64 的 C/R 是目标，先做上面的移植（预计是本项目里独立的一块工作，涉及内核 ABI 细节且
-必须在 arm64 上验收），A 的投递改动届时**无需返工**（它没有架构假设）。
+**对当前决策的影响（2026-09-24 更新）**：移植已经做完，所以这只剩 A/B 本身的选择，§11.6 的
+结论直接生效 —— A 的投递改动全程**一行没动**（S3 改的全在 `#[cfg(target_arch = "aarch64")]` 里）。
 
 **移植计划已落**：fork 仓 `docs/fork-plan-2026-09-aarch64-restore.md`（2026-09-24，提交
 `17e4711`）—— 含代码坐标（capture/restore_blob/stub/门槛/构建）、**S0 三条 spike 先行**（手工
