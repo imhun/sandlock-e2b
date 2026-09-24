@@ -119,9 +119,8 @@ def test_distinct_host_uids_isolate_same_path_files(workspace):
     )
     stat_b = _run(str(ws_b), UID_B, ["/bin/stat", str(ws_a / "workspace")])
     assert stat_b.exit_code != 0
-    assert (
-        stat_b.stderr
-        == f"stat: cannot statx '{ws_a / 'workspace'}': Permission denied\n".encode()
+    assert stat_b.stderr in _diagnostic(
+        "stat", f"cannot statx '{ws_a / 'workspace'}': Permission denied"
     )
 
     # Open path: sandlock's grant check (B is never granted A's workspace)
@@ -130,9 +129,7 @@ def test_distinct_host_uids_isolate_same_path_files(workspace):
         str(ws_b), UID_B, ["/bin/cat", str(secret_a)]
     )
     assert cat_b.exit_code != 0
-    assert (
-        cat_b.stderr == f"cat: {secret_a}: Permission denied\n".encode()
-    )
+    assert cat_b.stderr in _diagnostic("cat", f"{secret_a}: Permission denied")
 
     # A's control read succeeds.
     cat_a = _run(str(ws_a), UID_A, ["/bin/cat", str(secret_a)])
@@ -152,10 +149,28 @@ def test_distinct_host_uids_isolate_same_path_files(workspace):
     ).encode()
     rm_b = _run(str(ws_b), UID_B, ["/bin/rm", str(secret_a)])
     assert rm_b.exit_code != 0
-    assert rm_b.stderr == (
-        f"rm: cannot remove '{secret_a}': Permission denied\n"
-    ).encode()
+    assert rm_b.stderr in _diagnostic(
+        "rm", f"cannot remove '{secret_a}': Permission denied"
+    )
     assert secret_a.read_text(encoding="utf-8") == "A-secret"
+
+
+def _diagnostic(program: str, message: str) -> tuple[bytes, bytes]:
+    """The exact stderr spellings a coreutils diagnostic can take.
+
+    coreutils' ``error()`` prints whatever gnulib's ``set_program_name`` left in
+    ``program_name``: <= 9.4 keeps the path as the caller invoked it
+    (``/bin/ls: cannot access ...``), >= 9.5 strips it to the basename
+    (``ls: cannot access ...``). Which one a lane gets is build trivia -- the
+    container image ships 9.7, Ubuntu 24.04 ships 9.4 -- so pin *both* spellings
+    exactly rather than one build's wording (the same treatment
+    ``test_chroot_hardlink_into_a_branch_is_refused`` got for glibc's EXDEV
+    text). Everything from the ``": "`` on is the contract.
+    """
+    return (
+        f"{program}: {message}\n".encode(),
+        f"/bin/{program}: {message}\n".encode(),
+    )
 
 
 def _as_uid(uid: int, *cmd: str, groups: tuple[int, ...] = ()) -> subprocess.CompletedProcess:
@@ -195,20 +210,20 @@ def test_0770_group_bit_grants_the_worker_and_not_another_sandbox(workspace):
 
     listings = _as_uid(UID_B, "/bin/ls", str(ws_a / "workspace"))
     assert listings.returncode != 0
-    assert listings.stderr == (
-        f"ls: cannot access '{ws_a / 'workspace'}': Permission denied\n"
-    ).encode()
+    assert listings.stderr in _diagnostic(
+        "ls", f"cannot access '{ws_a / 'workspace'}': Permission denied"
+    )
     wrote = _as_uid(UID_B, "/bin/touch", str(ws_a / "workspace" / "b-wrote.txt"))
     assert wrote.returncode != 0
-    assert wrote.stderr == (
-        f"touch: cannot touch '{ws_a / 'workspace' / 'b-wrote.txt'}': "
-        "Permission denied\n"
-    ).encode()
+    assert wrote.stderr in _diagnostic(
+        "touch",
+        f"cannot touch '{ws_a / 'workspace' / 'b-wrote.txt'}': Permission denied",
+    )
     removed = _as_uid(UID_B, "/bin/rm", str(ws_a / "workspace" / "a.txt"))
     assert removed.returncode != 0
-    assert removed.stderr == (
-        f"rm: cannot remove '{ws_a / 'workspace' / 'a.txt'}': Permission denied\n"
-    ).encode()
+    assert removed.stderr in _diagnostic(
+        "rm", f"cannot remove '{ws_a / 'workspace' / 'a.txt'}': Permission denied"
+    )
     assert (ws_a / "workspace" / "a.txt").read_text(encoding="utf-8") == "A-secret"
 
     # Positive control: the same uid B, but carrying the worker's gid (what a

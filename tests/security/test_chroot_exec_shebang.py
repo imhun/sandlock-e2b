@@ -45,7 +45,22 @@ IMAGE = "python:3.11-slim"
 # Static ELFs available in the lane image (tini, shipped as docker-init). A
 # static binary is the shape that proves the *workspace's own inode* is
 # exec-allowed: a dynamic one goes through the mediator's memfd copy instead.
-STATIC_CANDIDATES = ("/usr/sbin/docker-init", "/sbin/tini", "/bin/busybox")
+#
+# Each entry is ``(path, workspace name, argv, banner)``. The extra fields are
+# not decoration: "a static ELF" is one shape, but "what a static ELF prints"
+# is not. The production image ships tini (whose version banner is a
+# compile-time string, so it ignores argv[0]) while a plain guest may only have
+# busybox -- and busybox dispatches on argv[0]: copied in as ``static_bin`` and
+# asked for ``--version`` it answers ``static_bin: applet not found`` (exit
+# 127), because it falls back to treating argv[1] as the applet name
+# (measured on the aarch64 lane 2026-09-24). It has no ``--version`` either;
+# ``--help`` is where its banner lives, on stdout. Giving each candidate the
+# invocation it actually answers keeps this test about the workspace inode.
+STATIC_CANDIDATES = (
+    ("/usr/sbin/docker-init", "docker-init", ("--version",), b"tini version"),
+    ("/sbin/tini", "tini", ("--version",), b"tini version"),
+    ("/bin/busybox", "busybox", ("--help",), b"BusyBox v"),
+)
 
 
 def _elf_interpreter(path: Path) -> str | None:
@@ -70,11 +85,12 @@ def _elf_interpreter(path: Path) -> str | None:
     return ""
 
 
-def _static_elf() -> Path | None:
-    for candidate in STATIC_CANDIDATES:
+def _static_elf() -> tuple[Path, str, tuple[str, ...], bytes] | None:
+    """The first candidate that is a static ELF, with the way to run it."""
+    for candidate, name, argv, banner in STATIC_CANDIDATES:
         path = Path(candidate)
         if path.exists() and _elf_interpreter(path) == "":
-            return path
+            return path, name, argv, banner
     return None
 
 
@@ -288,18 +304,20 @@ async def test_static_binary_in_the_workspace_runs():
     chroot translation dropped it, so the mount source was never granted), and
     the refusal was EACCES. It is granted now, which is what this test pins.
     """
-    source = _static_elf()
-    if source is None:
+    fixture = _static_elf()
+    if fixture is None:
         pytest.skip("no static ELF in the lane image to use as the fixture")
+    source, name, argv, banner = fixture
     executor, workspace = _chroot_sandbox()
     try:
-        (Path(workspace) / "static_bin").write_bytes(source.read_bytes())
-        (Path(workspace) / "static_bin").chmod(0o755)
+        target = Path(workspace) / name
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o755)
         code, out, err = await run_sh(
-            executor, workspace, "/workspace/static_bin --version"
+            executor, workspace, f"/workspace/{name} {' '.join(argv)}"
         )
         assert code == 0, f"exit={code} stderr={err!r}"
-        assert out.startswith(b"tini version"), out
+        assert out.startswith(banner), out
         assert err == b""
     finally:
         executor.close()
