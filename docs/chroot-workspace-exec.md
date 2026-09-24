@@ -973,5 +973,56 @@ x86_64 那套"`pc` 减 4、重载 `orig_rax`"在 arm64 上会执行到 `svc` 的
 `ptrace`/`process_vm_writev`**，新增的帧布局/哨兵/FP 长度/SVE 判据全绿），x86_64 同子集
 40 passed / 0 failed。
 
-下一步是 S3：`restore-stub.c` 的 `__aarch64__` 分支（syscall 号、`_start`、`rt_sigreturn` 帧 +
-`msr tpidr_el0` 写回），以及 `build.rs`/`sandbox.rs`/`resume.rs` 的架构门槛。
+**S3 已落地（2026-09-24，fork 本轮提交）**：`restore-stub.c` 的 `__aarch64__` 分支与
+`build.rs`/`sandbox.rs`/`resume.rs` 的架构门槛都在，并且**第一次在真内核上端到端跑通** ——
+本节开头那句"两条路都跑不了"从此只作历史：aarch64 上引擎已经能恢复进程。
+
+代码面（改动全在 `#[cfg(target_arch = "aarch64")]` 里，x86_64/riscv64 路径未动）：
+* `restore-stub.c` 的 aarch64 分支：通用 64 位 syscall 号（read63/write64/close57/lseek62/
+  mmap222/mprotect226/munmap215/mremap216/dup3 24/exit93/openat56/rt_sigreturn139，**没有
+  `arch_prctl`**、dup 改 `dup3`）；`sc6()` = `x8` + `x0..x5` + `svc #0`；`_start` 把入口 sp（auxv 在
+  其上）交给 `_start_c` 再切到 `.bss` 私有栈；步骤 10 在栈上建 `struct rt_sf`，**一次 `memcpy`**
+  覆盖 `regs[31]/sp/pc/pstate`（ptrace 交回的顺序就是帧顺序），FP 记录整段写 `__reserved`，帧偏移
+  按 S0 表 1 加 `_Static_assert` 钉死；**步骤 9 `msr tpidr_el0`** —— `TPIDR_EL0` 既不在寄存器
+  文件里也不在信号帧里，只能这样写回。
+* `build.rs`：`is_restore_arch` 含 aarch64（那里"缺 stub"从 warning 变**致命**）；链接地址按
+  工具链分派（GCC `-Wl,-Ttext-segment=`、zig/clang `-Wl,--image-base=`，实测 zig 拒绝前者）；
+  `-mcmodel=large` 只有 x86_64 需要。
+* `restore_blob.rs`：`HEADER_LEN` 64→80、`BLOB_VERSION` 2→3，header 末尾带 `tls/has_tls`；
+  aarch64 两条 fail-closed（FP 记录不是 528 字节、`tls` 缺失都直接拒，不是降级）。
+* 门槛：`sandbox.rs` 与 `tests/integration/test_restore.rs` 的架构门加 aarch64，`STUB_BASE` 复用
+  3 TiB（S0c 已实测）。
+
+**lane 变了**：S1/S2 是靠"本地交叉编译 + 推二进制到 aarch64 节点"取证的，S3 起改成本地
+**Lima qemu VM**（Ubuntu 24.04 + 6.14 内核，宿主 amd64 Darwin）—— 真内核、真 ptrace、真
+`rt_sigreturn`，**不再往线上节点推任何测试二进制**。四条搭 lane 的硬约束（不要写 `networks:`、
+guest 内核 ≥6.10、工作区必须在 guest 本机文件系统、`/tmp` 重启即清）写在 fork
+`docs/arm-cr-s0-evidence.md` §7。
+
+**真内核第一次跑就抓到两个 RED**（都是 qemu-user 下测不到的东西）：
+1. **测试自己写错了机器码**：aarch64 合成镜像用例里 `movk x2, #0x4500, lsl #48` 想构造
+   `STACK + 0x800`，而 `STACK = 0x4500_0001_0000` 需要 `lsl #32`；载荷于是落到映射外，
+   `SIGSEGV {si_code=SEGV_MAPERR, si_addr=0x4500000000010800}`。能一眼定位是因为
+   `rt_sigreturn` **本身已经成功**（`rt_sigreturn({mask=[]}) = 0` 之后 pc 已落在 `CODE`）⇒
+   帧、寄存器、`svc` 全对，错的只是载荷常量。
+2. **FPCR 的 bit5 在模拟出的 CPU 上不可写**：原断言 `FPCR = 0x20`（bit5/IDE）实测写进去读回 0，
+   而 `0xc00000`/`0x1000000` 正常往返。断言改用 **RMode = 0b11**（`0x00C0_0000`，用
+   `1.0 + 2⁻⁶⁰` 的舍入行为钉住）：断言一个该实现丢掉的位等于在测 CPU 模型，而 RMode 是每个
+   aarch64 实现都必须实现的字段。
+
+**证据（全部本地，2026-09-24）**：
+* RED：真内核 `checkpoint::` 子集 **45 passed / 1 failed**（上面第 1 条）。
+* GREEN（aarch64 真内核）：`checkpoint::` **46 passed / 0 failed / 0 skipped**。关键一条
+  `restore_stub_reconstructs_a_synthetic_image` 这次真的执行了 stub，payload 从恢复出的帧里读回
+  `TPIDR_EL0 = 0x0000ffff88881000`、`FPSR = 0x10`、`FPCR = 0x00c00000`，逐位相等。
+* GREEN（aarch64 真内核，端到端）：`integration::test_restore::` **4 passed / 0 failed** ——
+  `test_restore_glibc_vdso_program_resumes`（vDSO 搬迁 + 寄存器/FP + fd 重开 + `rt_sigreturn`）
+  与 `test_restore_resumes_inside_a_chroot_root` 的两种根形态都过；两条 noexec 原型按架构自述跳过。
+* GREEN（x86_64 回归）：同子集 **42 passed / 0 failed**。
+
+> "0 skipped" 是刻意查的：`stub_path()` 是编译期烘焙的绝对路径，路径不存在时那三条 stub 用例会
+> **静默 `return`** —— 第一轮真内核的"46/46"就是这么来的假绿，真 SIGSEGV 被它盖住了。
+
+剩下的两步（S4 门槛/构建、S5 lane 与验收登记）按 fork 计划继续，验收仍须在 arm64 lane 上做；
+§11.6 里 E2B 侧那一半（镜像存储/属主/配额、pause/resume 生命周期、`restore_skipped` 语义）
+与架构无关，不受影响。
