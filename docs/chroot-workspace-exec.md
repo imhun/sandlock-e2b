@@ -951,4 +951,11 @@ S1–S5 的阶段与每阶段判据、SVE/MTE-PAC 先 fail-closed 的处置、ar
 两处**要按实测改计划**：SVE 的 fail-closed 判据必须用 `vl>16 || flags & SVE_PT_REGS_SVE`
 （本机普通 glibc 进程的 `NT_ARM_SVE` 本来就有内容，按"有内容就拒"会把一切拒掉）；vdso 搬迁
 必须**同 delta 搬 `[vvar]`+`[vdso]`**（只搬 `[vdso]` 实测 `SEGV_MAPERR @ new_vdso-0x4000`）。
-下一步是 S1（capture 的 aarch64 分支 + `IMAGE_VERSION` +1 带 `tls` 字段）。
+**S1 已落地（2026-09-24，fork `40527d8`）**：capture 学会读 aarch64 的线程指针
+（`NT_ARM_TLS`；x86_64/riscv64 返回 `None`），`ProcessState` 增加 `tls`、`IMAGE_VERSION` 2→3、
+镜像新增 `process/threads/tls.bin`（aarch64 缺该字段的 v3 镜像直接拒绝）。方式是**本地 zig 镜像
+交叉编译 + 推二进制到 aarch64 节点跑**（recipe 与"宿主 linker 要钉回 cc"的坑写在 fork 的
+`docs/arm-cr-s0-evidence.md` §7）。证据：aarch64 上 `checkpoint::` 子集 32 passed / 0 failed
+（改前 28），x86_64 同子集 40 passed / 0 failed。
+
+下一步是 S2（`restore_blob` 的 arm64 分支：3 TiB 的 `STUB_BASE`、fpsimd 帧封装、`rearm` 写回）。
