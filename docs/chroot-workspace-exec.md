@@ -536,6 +536,15 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
    写成前置条件，真要做时按它开工，而不是"将来若启用需重新验证"这种含糊说法。
    **④ 可行方案见 §11**（关键未知量——按 fd 执行是否绕过 Landlock——已实测，结论是"不绕过权限、
    但绕开路径解析"，所以方案是"fd 执行 + 给 stub 宿主路径一条执行授权"）。
+   **⑤ 前置条件已满足（2026-09-24，fork `a6f6b04`）**：§11.1 的 A 方案已实现 —— stub 改由
+   描述符投递（`execveat(fd, "", …, AT_EMPTY_PATH)`，fd 6，与它自己的 CTRL/READY/GO 同一套），
+   规则集按**宿主路径**给这一个文件 `EXECUTE|READ_FILE`（`Sandbox::fs_readable_host`，
+   `serde(skip)` 保证镜像/wire 布局不变），中介对 `AT_EMPTY_PATH` 的空路径直接放行（原先会把
+   dirfd 当目录 fd 去翻译、把整次调用拒成 EACCES）。实测：**模拟 chroot 与真根两种形态都能恢复**
+   （计数器继续前进、`restore_skipped` 只有 stdio、恢复后 fd 表断言"无 restore-stub / notify
+   listener / memfd"）；投递 fd 用 `dup3(O_CLOEXEC)`，否则实测会以 `6 -> …/restore-stub` 漏进
+   恢复后的进程。**剩余的是 E2B 自己那一半**（镜像存储/属主/配额/清理、pause/resume 生命周期、
+   `restore_skipped` 的语义），守卫 `tests/unit/test_checkpoint_restore_unused.py` 仍是入口。
 
 
 ## 10. 未结线索（不算结论）
@@ -620,6 +629,9 @@ chroot 根（模拟的、真根的）都把 workload 路径解析到 rootfs 内 
 执行授权"** 两条同时给，缺一条都不成立。
 
 ### 11.1 推荐方案（改动都在 fork 内，E2B 侧零改动）
+
+> **状态（2026-09-24）：已实现**，fork `a6f6b04`。落地要点与实测见 §9.7.9 ⑤ 与本节末尾；
+> 下面保留原始设计与理由，作为评审记录。
 
 **先厘清为什么 restore 非要有 stub**（这决定方案只能怎么改）：
 `restore_interactive` 的契约是"把 checkpoint 的进程镜像放回一个**已经在沙箱里**的进程"。
@@ -874,3 +886,10 @@ tokio + 堆，无法与镜像区域解耦。**可行的形态是**：supervisor 
 ③ 只在有 chroot 根的形态里加，纯形态沿用现有 `fs_readable`；④ 继续用 fd 投递，不回到路径 exec
 （这样祖先目录一条都不用授）；⑤ 加"授权形状"用例（两种形态各跑一遍）；⑥ 运维确认 stub 目录不可被
 非特权用户写。
+
+**实现后复核（fork `a6f6b04`，2026-09-24）**：清单 ①②④⑤ 都按此落地（`fs_readable_host` 只放
+stub 这一个文件、`add_path_rule` 对文件自动掩到 `EXECUTE|READ_FILE`、投递走 fd 6、用例
+`test_restore_resumes_inside_a_chroot_root` 两种形态各跑一遍并断言 fd 表干净）。**新增一条实测
+教训**：投递 fd 必须 `dup3(…, O_CLOEXEC)`——第一版用 `dup2` 时，stub 镜像以
+`6 -> …/restore-stub` 留在了**恢复后的进程**里（通道 fd 3/4/5 相反，必须活到 stub 内部，故仍是
+可继承的 dup2）。③ 与 ⑥ 留作运维/评审项（当前 stub 位于构建目录）。

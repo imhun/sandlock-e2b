@@ -1,19 +1,19 @@
-"""The worker must not reach for the fork's checkpoint/restore -- yet.
+"""The worker must not reach for the fork's checkpoint/restore on its own.
 
-Measured 2026-09-23 (fork commit `43cc62a`): `Sandbox::restore_interactive`
-execs its restore stub by its *host* path, and any chroot root (emulated or
-real) resolves the workload's paths inside the rootfs, so the stub cannot run
-there. The fork now refuses such a call immediately and says so; its own
-integration test `test_restore_resumes_inside_a_real_root` pins both root shapes
-failing that way, and the fork's OCI test already recorded "restore of a
-chrooted checkpoint" as a separate limitation.
+The engine side is now ready (fork `a6f6b04`, 2026-09-24): the restore stub is
+delivered by descriptor (`execveat(AT_EMPTY_PATH)`) and the ruleset grants that
+one host file `EXECUTE|READ_FILE`, so restore resumes inside an emulated chroot
+*and* inside a real root -- `test_restore_resumes_inside_a_chroot_root` runs both
+and asserts the counter advances with a clean fd table. That replaces the earlier
+state, where a chroot root could not host the stub at all (§9.7.9).
 
-E2B's production shape *is* a chroot root (`E2B_BASE_IMAGE=python-mcp:3.14`
-⇒ image-rootfs ⇒ `chroot`/`real_root`), so a "resume this sandbox" feature built
-on this API would fail on the first real node. Nothing in the worker calls it
-today; this test is the reminder that the gap has to be closed first (carry the
-stub into the root with a policy mount, or restore without a root) -- and that
-`docs/chroot-workspace-exec.md` §9.7.9 is the place to record it.
+What is still missing is E2B's half of the feature, and it is the reason this
+scan stays: image storage and ownership (the image carries the policy and the
+process memory), quota and cleanup, the pause/resume lifecycle, and a decision
+about `restore_skipped` -- sockets, pipes and memfds do not come back, so a
+sandbox's connections do not either. Nothing in the worker calls the API today;
+if that changes, this test fails and points at the checklist in
+`docs/chroot-workspace-exec.md` §9.7.9 / §11.6.
 
 Text scan on purpose: it is the call sites, not the behaviour, that must stay
 absent, and a grep-shaped assertion is what makes "we re-checked" durable.
@@ -39,8 +39,10 @@ def test_no_worker_source_calls_the_fork_checkpoint_restore_api() -> None:
             if needle in text:
                 offenders.append(f"{path.relative_to(REPO)}: {needle}")
     assert offenders == [], (
-        "envd started using the fork's checkpoint/restore; re-verify it against "
-        "the real root first (the restore stub is a host path and any chroot root "
-        "refuses it -- docs/chroot-workspace-exec.md §9.7.9): "
+        "envd started using the fork's checkpoint/restore: the engine works under "
+        "a chroot/real root now, but the E2B half is not designed yet (image "
+        "storage/ownership/quota, pause/resume lifecycle, and what a sandbox does "
+        "when its sockets come back as `restore_skipped`) -- see "
+        "docs/chroot-workspace-exec.md §9.7.9 and §11.6: "
         + ", ".join(offenders)
     )
