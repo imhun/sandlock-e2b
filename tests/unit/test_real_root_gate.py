@@ -14,6 +14,12 @@ the fleet is faked and only the decision is under test.
 
 from __future__ import annotations
 
+import ctypes
+import errno
+import json
+import platform
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -130,3 +136,69 @@ def test_a_probe_that_never_answers_is_a_reason_not_a_wedge(monkeypatch):
     monkeypatch.setattr(sl, "_REAL_ROOT_PROBE", "import time; time.sleep(30)")
     monkeypatch.setattr(sl, "_REAL_ROOT_PROBE_TIMEOUT_S", 0.05)
     assert sl._real_root_capability() == "the probe did not finish within 0.05s"
+
+
+# ------------------------------------------------- the number it asks for
+
+#: Calls the candidate number with arguments no real `pivot_root` can accept,
+#: in a *child* (a number that turned out to be a working `pivot_root` must not
+#: be able to relocate the test runner's root), and prints `rc errno`.
+_ARCH_PROBE = r"""
+import ctypes, json, platform
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+ctypes.set_errno(0)
+rc = libc.syscall(%d, b"/", b"/")
+print(json.dumps({"arch": platform.machine(), "rc": rc, "errno": ctypes.get_errno()}))
+"""
+
+
+def _call_in_child(nr: int) -> dict:
+    completed = subprocess.run(
+        [sys.executable, "-c", _ARCH_PROBE % nr],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout.strip().splitlines()[-1])
+
+
+def test_the_probe_asks_for_the_pivot_root_this_architecture_has():
+    """`pivot_root` is 155 on x86_64 and 41 on the generic-table arches.
+
+    Pinning the bug rather than the constant: the probe used to ask for a
+    hardcoded 155, and on aarch64 that number is `sched_getattr` -- it answered
+    ESRCH ("No such process") and the gate reported it as "the seccomp profile
+    does not admit pivot_root", so `E2B_REAL_ROOT` could never be armed on the
+    architecture production runs (measured 2026-09-24: `syscall(155)` -> ESRCH
+    on aarch64, while the real `pivot_root` at 41 answers EINVAL for these
+    deliberately-unusable paths). Every assertion below fails on that code on
+    an aarch64 machine.
+    """
+    arch = platform.machine()
+    assert arch in sl._PIVOT_ROOT_NR, f"no pivot_root number for {arch}"
+    answer = _call_in_child(sl._PIVOT_ROOT_NR[arch])
+    assert answer["arch"] == arch
+    code = errno.errorcode.get(answer["errno"], str(answer["errno"]))
+    assert answer["rc"] == -1, f"pivot_root({arch}) relocated a child's root"
+    assert code != "ESRCH", (
+        f"{sl._PIVOT_ROOT_NR[arch]} names a different syscall on {arch} (ESRCH)"
+    )
+    assert code != "ENOSYS", (
+        f"{sl._PIVOT_ROOT_NR[arch]} names no syscall at all on {arch} (ENOSYS)"
+    )
+    # The answer a real pivot_root gives for a root that is its own put_old, or
+    # for a caller without the namespace capability.
+    assert code in {"EINVAL", "EBUSY", "EPERM"}, f"unexpected pivot_root answer: {code}"
+
+
+def test_the_probe_carries_the_table_into_the_child():
+    """The number has to survive into the probe text, not just the module.
+
+    The probe is a *string* run by `python -c`, so a mapping that only exists
+    in this process would leave the child with a NameError -- and a child that
+    dies is reported as a reason rather than as a wrong number, which is the
+    same silent-failure shape the pivot_root bug had.
+    """
+    assert "__PIVOT_ROOT_NR__" not in sl._REAL_ROOT_PROBE
+    assert repr(sl._PIVOT_ROOT_NR) in sl._REAL_ROOT_PROBE

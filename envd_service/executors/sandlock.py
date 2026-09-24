@@ -175,6 +175,23 @@ _MINIMAL_DEV_MOUNTS = {
 _EXEC_SETUP_FAILURE_CODES = (125, 126, 127)
 
 
+#: `pivot_root(2)` by architecture. x86_64 kept its own syscall table (155);
+#: every other 64-bit Linux arch this fork targets -- aarch64, riscv64,
+#: loongarch64 -- uses the generic one (41).
+#:
+#: This is not trivia. The probe used to hardcode x86_64's 155, and on aarch64
+#: 155 is `sched_getattr`: the call came back ESRCH ("No such process") and
+#: every aarch64 node was told its seccomp profile did not admit `pivot_root`,
+#: when nothing had ever asked the kernel for it -- so `E2B_REAL_ROOT` could
+#: never be turned on for the architecture production runs. Measured
+#: 2026-09-24 on the aarch64 lane: `syscall(155)` -> ESRCH,
+#: `syscall(41)` -> EINVAL, which is what a real `pivot_root` answers when its
+#: paths are not mount points. It travels into the child as a literal because
+#: the probe is a *string* run by `python -c` (a name that only exists in this
+#: module would be a NameError there, and a dead probe reports as a reason
+#: rather than as a wrong number -- the same silent shape as the bug).
+_PIVOT_ROOT_NR = {"x86_64": 155, "aarch64": 41, "riscv64": 41, "loongarch64": 41}
+
 #: The capability probe's source, run by a child *process* (never ``os.fork()``:
 #: the worker is multi-threaded -- ``asyncio.to_thread`` -- and a fork in a
 #: threaded process can leave the child holding a lock another thread took, so
@@ -189,6 +206,7 @@ _EXEC_SETUP_FAILURE_CODES = (125, 126, 127)
 _REAL_ROOT_PROBE = r'''
 import ctypes
 import os
+import platform
 from pathlib import Path
 
 
@@ -200,6 +218,8 @@ libc = ctypes.CDLL("libc.so.6", use_errno=True)
 real_uid, real_gid = os.getuid(), os.getgid()
 CLONE_NEWUSER, CLONE_NEWNS = 0x10000000, 0x00020000
 MS_BIND, MS_REC, MS_PRIVATE = 4096, 16384, 1 << 18
+
+PIVOT_ROOT_NR = __PIVOT_ROOT_NR__
 
 
 def check(label, call):
@@ -240,9 +260,15 @@ try:
     # then drop the old one. A profile that admits mount but not pivot_root
     # (the pre-N35 worker profile is exactly that) fails here, nowhere earlier.
     check("chdir", lambda: libc.chdir(str(scratch).encode()))
+    arch = platform.machine()
+    nr = PIVOT_ROOT_NR.get(arch)
+    if nr is None:
+        # Fail closed: a wrong number is how this went unnoticed for a whole
+        # architecture, and it reports as a seccomp problem.
+        raise _Failed(f"pivot_root: no syscall number known for {arch}")
     check(
         "pivot_root (the profile must admit it)",
-        lambda: libc.syscall(155, b".", b"."),  # SYS_pivot_root
+        lambda: libc.syscall(nr, b".", b"."),
     )
     check("umount2(MNT_DETACH)", lambda: libc.umount2(b".", 2))
 except _Failed as exc:
@@ -251,7 +277,7 @@ except Exception as exc:  # a probe that raises is a probe that failed
     print(f"{type(exc).__name__}: {exc}")
 else:
     print("ok")
-'''
+'''.replace("__PIVOT_ROOT_NR__", repr(_PIVOT_ROOT_NR))
 
 #: How long the child probe may take. Generous on purpose: this runs once per
 #: process (``lru_cache``), and a cold node can be slow to fork+exec.
