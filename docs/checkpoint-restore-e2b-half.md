@@ -133,12 +133,19 @@ FFI 那条也自己编了一个 `-static -nostdlib -no-pie` 的 counter
 能救活的只有极简进程。所以这条比 D9 更要紧：D9 限制的是"恢复后能不能 exec"，这一条限制的是
 **"恢复后那个进程还能不能活"**。
 
-**归属未定（不要当成已定位的引擎 bug 报出去）**：上面都在 **slot 路径**上量的
-（`instance.checkpoint()` 出的镜像 + 另起一个 slot 恢复）。引擎自己的用例是
-one-shot `spawn_interactive` + 进程内恢复，用静态 helper，因此**两边都没有测过
-"同一个复杂 workload 在引擎原生写法下如何"**。我试着补那个探针时卡在夹具（策略没给
-动态程序的读权限、计数器没写出来），所以**没有**得出结论 —— 下一步应该是那个实验，
-而不是假设。
+**归属：是引擎，不是 slot 路径。** 用**同一个 harness、同一个 policy、同一条代码路径**、
+只换 workload 做了判别实验（引擎原生写法：one-shot `spawn_interactive` + 进程内恢复）：
+
+```
+dyngap static:  advanced=true   state=S   exit_code=0     <- 对照，照常恢复
+dyngap dynamic: advanced=false  state=Z   exit_code=11    <- 动态 libc 程序，僵尸
+```
+
+动态那半是个真正用 libc/stdio/heap 的 C 程序（`cc -O0`，非 `-nostdlib`），
+静态对照就是那个 freestanding helper。**对照先断言、缺失即报**，所以"夹具坏了"不会被读成"发现了问题"。
+这条已钉成引擎自己的用例：`crates/sandlock-core/tests/integration/test_restore.rs::
+test_dynamic_libc_restore_is_a_known_gap`（它**故意断言这个缺口存在**：动态恢复一旦能跑，这条会变红，
+提示删掉它和本文这一节）。
 
 **已排除的解释**（免得后来人重走）：不是子进程/fork（两种写法都崩）、不是 fd 被 skip
 （动态 `sleep` 同样 skip 了 0/1/2 却正常）、不是"恢复本身不工作"（静态与 `sleep` 都工作）。
@@ -158,7 +165,7 @@ one-shot `spawn_interactive` + 进程内恢复，用静态 helper，因此**两�
 | D7 | 跨节点 | 允许（blob 在共享 NFS 上），但**同内核**是硬前提 | 引擎前提，与架构无关 |
 | D8 | 清理 | 随沙箱 teardown 一起删（`_delete_sandbox_runtime` 已经按 verified target set 删 `_runtime`） | 不新增一条回收路径 |
 | D9 | **恢复后 exec 不可用，产品上怎么算** | **二选一，需要拍板**：**(a)** 接受"恢复 = 进程回来、不能再 exec"，把它写进对外语义（长驻服务形状够用）；**(b)** 让恢复出来的会话 exec-capable（引擎侧要新做"把 checkpoint 还原进一个带 init 的会话"），代价明显更大 | §1(d)：引擎自己按名拒绝 `exec is not supported on a restored container`。这不是我们能顺手补的缺口，是"恢复一个进程"与"恢复一个可交互的箱子"的区别 |
-| D10 | **非平凡动态程序恢复即崩**（`/bin/sh`、`python3` 实测 SIGSEGV；静态 helper 与 `/bin/sleep` 正常） | **先做归属实验，再决定**：用引擎原生写法（one-shot `spawn_interactive` + 进程内恢复）跑同一个复杂 workload —— 若同样崩 ⇒ 引擎缺口，作为引擎工作立项；若不崩 ⇒ 是 slot 路径或 instance 捕获的差异，由我们修 | §1(e)。这是**比 D9 更要紧**的一条：它决定"恢复后那个进程还能不能活"，而 E2B 的沙箱里跑的基本都是这类程序。**归属未定，不能当已定位的 bug 报** |
+| D10 | **动态、用 libc 的程序恢复后即崩**（`/bin/sh`、`python3` 实测 SIGSEGV；静态 helper 与 `/bin/sleep` 正常） | **归属已定：引擎**（§1(e) 的判别实验），下一步是**立项修引擎**还是**接受"只有简单进程能恢复"**。修的话入口在引擎的恢复计划：静态 freestanding 能恢复、动态 libc 不能，指向 loader/映射重建那一块，不是调用方 | §1(e)。**比 D9 更要紧**：D9 限制"恢复后能做什么"，这条限制"恢复后那个进程还活不活"——而 E2B 沙箱跑的基本都是这类程序。缺口已钉成用例 `test_dynamic_libc_restore_is_a_known_gap` |
 
 ---
 
