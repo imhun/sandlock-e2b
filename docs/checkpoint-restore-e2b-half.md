@@ -170,8 +170,13 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 
 **下一步（按顺序）**：
 
-* **S1b-spike**：只回答第 2 步的未知量 —— 用最小改动让 init 起一个孩子、slot 侧尝试
-  `process_vm_writev`/`PTRACE_ATTACH` 进去，把能不能做的结论钉成一条用例。
+* **S1b-spike**：✅ **已做（2026-09-25）——答案是"能"**。让会话的 init 起一个孩子
+  （`test_instance_exec` 的 `exec` 路），从会话父进程对这个**孙进程**尝试两条注入路径：
+  `process_vm_writev` **写进了 8 字节（正好是 payload）**、`PTRACE_ATTACH` **返回 0**
+  （随后的 `PTRACE_DETACH` 也成功）。原因就是同 host uid + 同一 userns 映射。
+  已钉成用例 `test_the_session_parent_can_write_into_an_init_spawned_child`
+  （断言而非打印）——**这是 (b) 的地基**：它若被内核/策略改动打破，这里先红，
+  而不是后来在恢复路径里变成一个说不清的现象。
 * **S1b-impl**：spike 通过就按 1+3 落地（新增请求 + 会话记账），验收沿用现有的恢复用例
   （`test_restore_*`）+ 一条"恢复之后还能 exec"的会话用例。
 * 之后才回到 **S2**（worker 侧存储与平台账）——S2 的接线与 (a)/(b) 无关，但 (b) 改的是会话形状，
