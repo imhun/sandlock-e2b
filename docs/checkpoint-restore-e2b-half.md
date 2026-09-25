@@ -108,7 +108,7 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 
 于是 E2B 侧必须先回答一个产品问题（§2 D9），而不是先写代码。
 
-### (e) **根因（已定位）**：加载器写进"只读页"的运行时值，在恢复时丢了
+### (e) **根因（已定位并已修，2026-09-25）**：加载器写进"只读页"的运行时值，在恢复时丢了
 
 一开始的症状是"真实程序恢复不了"（slot 自恢复时 `/bin/sh`、`python3` 立刻 SIGSEGV，
 而静态 helper、`/bin/sleep` 正常）。**前面两版框架都是错的，被实验推翻**：
@@ -138,8 +138,7 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 
 **为什么这一格一直没人踩到**：引擎里每条 restore 用例用的都是静态 freestanding helper
 （core 四处），FFI 那条也自己编了 `-static -nostdlib -no-pie` —— 它们**都不碰 RELRO**。
-缺口与机制钉在同一条用例里：`test_loader_readonly_page_writes_are_lost_on_restore`
-（缺口那两个 case 故意断言失败；修好后会变红并指向本节）。
+**已修（2026-09-25，fork `e9b8b6c`）**：捕获现在把 RELRO 段一并 dump（`checkpoint::capture::is_relro_map`），恢复侧零改动。原来那条"故意断言缺口存在"的用例已按它自己的提示**转成回归用例**`test_libc_workloads_resume_after_restore`（四类形状全部断言能恢复）。
 
 **沿途被排除的解释**（免得后来人重走）：动态链接、fork 子进程、fd 被 skip、
 "恢复本身坏了"、slot 路径、noexec 路线（那条在 supervisor 多线程下本来就已知会崩，**不作为反证**）、
@@ -152,7 +151,7 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 | # | 方案 | 代价 | 判断 |
 |---|---|---|---|
 | **F1** | ✅ **已完成**：根因定位（见 §1(e)） | — | 结论：不是结构性墙，而是"捕获了哪些页"的一个具体漏洞 |
-| **F2a** | **只把 RELRO 段纳入 dump**：按每个已加载对象的 `PT_GNU_RELRO`（从 `/proc/<pid>/maps` 找到 r--p 文件段，或读 ELF program headers）把这些页记成"带字节的匿名区"，恢复侧已具备能力（`SRC_ANON` + 步骤 6 的 `mprotect` 收窄） | 小：每对象几 KB；改动集中在 capture 的 `must_dump` 判据与 plan；两态 security 套件可覆盖 | **推荐先做**：实测已证明它足以让 vDSO 与 stdio 两类恢复 |
+| **F2a** | ✅ **已做**（fork `e9b8b6c`）：**只把 RELRO 段纳入 dump**：按每个已加载对象的 `PT_GNU_RELRO`（从 `/proc/<pid>/maps` 找到 r--p 文件段，或读 ELF program headers）把这些页记成"带字节的匿名区"，恢复侧已具备能力（`SRC_ANON` + 步骤 6 的 `mprotect` 收窄） | 实际改动很小：`capture.rs` 的 `is_relro_map` + `capture_memory` 一处判据，**恢复侧零改动**（这类区域变成"带字节的匿名区"，现有步骤 6 再收窄到记录的权限） | **已完成并验证**：原来失败的四类形状（`malloc`、vDSO `clock_gettime`、`fopen`、静态对照）现在**全部恢复**；`test_restore` 5 passed / 0 failed；`core_lib` 904 passed / 0 failed |
 | **F2b** | **通用的"软脏页"**：`/proc/pid/clear_refs` + pagemap 找出启动后被写过的私有文件页（CRIU 的做法） | 中：更通用（也覆盖"程序自己 mprotect 后写 .text"这类形状），但要处理 pagemap/软脏的权限与可用性 | 若 F2a 之后仍有别的形状崩，再上这条 |
 | **F3** | **接受限制**：只有不碰加载器运行时状态的程序能恢复 | 零 | 今天等于不交付（python/node/sh 全在这条线上），**F2a 出来前不要选它** |
 
@@ -174,7 +173,7 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 | D7 | 跨节点 | 允许（blob 在共享 NFS 上），但**同内核**是硬前提 | 引擎前提，与架构无关 |
 | D8 | 清理 | 随沙箱 teardown 一起删（`_delete_sandbox_runtime` 已经按 verified target set 删 `_runtime`） | 不新增一条回收路径 |
 | D9 | **恢复后 exec 不可用，产品上怎么算** | **二选一，需要拍板**：**(a)** 接受"恢复 = 进程回来、不能再 exec"，把它写进对外语义（长驻服务形状够用）；**(b)** 让恢复出来的会话 exec-capable（引擎侧要新做"把 checkpoint 还原进一个带 init 的会话"），代价明显更大 | §1(d)：引擎自己按名拒绝 `exec is not supported on a restored container`。这不是我们能顺手补的缺口，是"恢复一个进程"与"恢复一个可交互的箱子"的区别 |
-| D10 | **碰加载器只读页的程序恢复后即崩**（`/bin/sh`、`python3`、vDSO 调用、`fopen` 实测 SIGSEGV；静态 helper、`malloc`、裸 syscall 正常） | **根因已定位，修复小且具体**：捕获要把"进程改过的私有只读文件页"（RELRO）一起 dump —— F2a；F2b 是更通用的软脏页路线 | §1(e)/(f)。**不是结构性墙**：把 RELRO 段在捕获前改成可写（于是被 dump），vDSO 与 stdio 两类**都恢复**（实测）。两个错过的框架已纠正：不是"静态 vs 动态"、也不是"分配器" |
+| D10 | **碰加载器只读页的程序恢复后即崩** | ✅ **已修（2026-09-25，fork `e9b8b6c`）**：捕获把 RELRO 段一并 dump；四类形状（`malloc`、vDSO、`fopen`、静态对照）全部恢复，`test_restore` 5/0、`core_lib` 904/0 | §1(e)/(f)。**不再是阻塞项**：这个能力对"真实程序"（python/node/sh）现在成立 |
 
 ---
 
