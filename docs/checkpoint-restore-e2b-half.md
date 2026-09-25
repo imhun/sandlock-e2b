@@ -146,6 +146,37 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 且内核**拒绝**把 break 移到初始断点之下，所以 stub 路线补不了），但把 malloc 完全赶出 brk 的程序**照样崩**，
 所以它是这一片里的另一个已证缺陷，而**不是**这些崩溃的原因。
 
+### (g) (b) 的实施计划：让恢复出来的会话可 exec
+
+**已经确定的机制**（侦察过，不是猜）：
+
+* `SandboxInstance`（可 exec 的会话）= 一个 `sandlock-init` + 子进程表；`exec` 是请 init 去 fork 一个孩子。
+* 恢复（`Sandbox::restore_interactive`）走的是 **`RestoreLaunch::Exec`**：把 **restore stub 当孩子 exec 进去**
+  （stub 由描述符投递，`execveat(AT_EMPTY_PATH)`），supervisor 侧用 `process_vm_writev` 把内存写进去，
+  靠 stub 的 READY/GO 握手。
+* **两者现在接不上**，原因是投递面：`ExecParams` 只带 cwd/env/extra_writable/bind_ports/max_file_size，
+  **没有"额外 fd"这一项**——而 restore 需要把 stub fd 和三个控制 fd（CTRL/READY/GO）交给那个孩子。
+  今天这些 fd 是通过 `Sandbox::extra_fds` 交给"会话自己创建的那个孩子"的，而会话创建的孩子永远是 init。
+
+**因此 (b) 的形状是**：让**init 生出来的孩子**也能带上 restore 的那组 fd。
+
+1. **扩投递面**：给 exec 路加一种新请求（或给 `Req::RunExec` 加一组可选 fd），语义是"用这些 fd + 这个程序
+   起一个孩子"——也就是把 `RestoreLaunch::Exec` 今天做的事挪进会话；
+2. **写入端**：孩子由 init fork，slot 进程是它的**祖父**。supervisor 侧要 `process_vm_writev` 进去，
+   于是第一步要验证的未知量是：**同 uid、同一 userns 映射下，slot 能不能 ptrace 到 init 的孩子**。
+   能（预期），写入端才能照旧；不能，就得让 init 自己写（或换投递形状）。
+3. **会话记账**：这个孩子要跟普通 exec 孩子一样进子进程表（wait/kill/进程组），否则
+   `stats.children_live`、`kill`、`shutdown` 的语义都会漏掉它。
+
+**下一步（按顺序）**：
+
+* **S1b-spike**：只回答第 2 步的未知量 —— 用最小改动让 init 起一个孩子、slot 侧尝试
+  `process_vm_writev`/`PTRACE_ATTACH` 进去，把能不能做的结论钉成一条用例。
+* **S1b-impl**：spike 通过就按 1+3 落地（新增请求 + 会话记账），验收沿用现有的恢复用例
+  （`test_restore_*`）+ 一条"恢复之后还能 exec"的会话用例。
+* 之后才回到 **S2**（worker 侧存储与平台账）——S2 的接线与 (a)/(b) 无关，但 (b) 改的是会话形状，
+  先落地能避免 S2 按旧形状写一遍。
+
 ### (f) 修法：把"进程改过的私有文件页"纳入捕获（F1 已给出落点）
 
 | # | 方案 | 代价 | 判断 |
@@ -172,7 +203,7 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 | D6 | `restore_skipped` 对外 | 恢复结果里带 fd 表；日志 + 文档明说"连接不回来"；**不**假装成功 | §1(c) |
 | D7 | 跨节点 | 允许（blob 在共享 NFS 上），但**同内核**是硬前提 | 引擎前提，与架构无关 |
 | D8 | 清理 | 随沙箱 teardown 一起删（`_delete_sandbox_runtime` 已经按 verified target set 删 `_runtime`） | 不新增一条回收路径 |
-| D9 | **恢复后 exec 不可用，产品上怎么算** | **二选一，需要拍板**：**(a)** 接受"恢复 = 进程回来、不能再 exec"，把它写进对外语义（长驻服务形状够用）；**(b)** 让恢复出来的会话 exec-capable（引擎侧要新做"把 checkpoint 还原进一个带 init 的会话"），代价明显更大 | §1(d)：引擎自己按名拒绝 `exec is not supported on a restored container`。这不是我们能顺手补的缺口，是"恢复一个进程"与"恢复一个可交互的箱子"的区别 |
+| D9 | **恢复后 exec 不可用** | **已定（2026-09-25，用户）：走 (b) —— 要能执行命令**。所以恢复出来的会话必须可 exec；F2a 已把"进程能活"这半解决，剩下的是"会话形状"这半。实施计划见 (g) | 不是取舍问题：E2B 用户日常靠 `commands.run`，一个恢复后拒执行的沙箱不是同一种东西 |
 | D10 | **碰加载器只读页的程序恢复后即崩** | ✅ **已修（2026-09-25，fork `e9b8b6c`）**：捕获把 RELRO 段一并 dump；四类形状（`malloc`、vDSO、`fopen`、静态对照）全部恢复，`test_restore` 5/0、`core_lib` 904/0 | §1(e)/(f)。**不再是阻塞项**：这个能力对"真实程序"（python/node/sh）现在成立 |
 
 ---
