@@ -277,6 +277,15 @@ export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o json
 （脚本最后会把沙箱 `kill` 掉；想留下现场排障就用 `tmp/k0s/probe_restore_state.py`，它不 kill，
 并打印沙箱 id 与宿主 pod。）
 
+> **2026-09-25 夜复核**：部署 `0.1.0-527-g946daa9` 上再跑一遍这条验收，全绿（含"删掉宿主
+> worker pod → 重建 → resume"，日志 `tmp/k0s/restore-recheck3.log`）。对照 §9 上面那两轮，
+> 这次先红了**两次**、两次都不在 restore，而是验收脚本自己的两个毛病，已经修掉并写进
+> `docs/checkpoint-restore-e2b-half.md` §6(j)：① `kubectl` **通道必须活着**（它死了会让
+> `image_on_node` 打出空列表，看起来像"图没写"，而 worker 日志里明明写着写了 —— 脚本现在
+> 开头就 `kubectl get nodes` 前置断言，并把 stderr 带进断言消息）；② 夹具的计时器文件改成
+> **临时文件 + `os.replace`**（原来 `open(w)` 的截断窗口一旦被 `pause()` 冻住，文件在整个冻结期
+> 都是空的，读者拿到的 `""` 被当作"还没写" ⇒ 误报"计数消失"）。
+
 **重建链条（改了 fork 就要从第一步走）**：`deploy/scripts/build-sandlock-wheels.sh`
 （交叉编两个 arch 的 wheel + supervise + restore-stub，约 4 分钟）→ `deploy/scripts/build-and-push.sh`
 （镜像推 ACR，层缓存命中时 1 分钟）→ `KUBECONFIG=... deploy/k8s-k0s/apply.sh`（滚两台 worker +

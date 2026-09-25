@@ -451,3 +451,33 @@ dash 原地 `exec`（所以 `python3 …` 这种形状抓到的就是 python）�
    被引擎按名拒绝（`restore-stub was not built`）。修法见 fork `2d5f2e9`（随 wheel 注入
    `sandlock/bin/restore-stub`，并在 `stub_path()` 里依次认「环境变量 → 构建路径 → 可执行
    文件旁边」），集群上修复后恢复调用链立刻通。
+
+### (j) 复核（2026-09-25 深夜，部署 `0.1.0-527-g946daa9`）
+
+在同一套环境上把这条验收又跑了一遍，**全绿**（脚本 `tmp/k0s/checkpoint_acceptance.py`，
+日志 `tmp/k0s/restore-recheck3.log`）：
+
+* pause 写图 → `latest`（6162 KB，含 `meta.json` / `policy.dat` / `process`，属主是沙箱的
+  uid `10000`）；
+* 平台账按节点各一列（worker-1 `4/8192`、worker-0 `6/8192` MiB）；
+* 解冻：**同一进程继续计数**（3 → 4）、同会话 `exec` 拿到 `THAWED_OK`；
+* 第二段负载 → 再 pause → **删掉宿主 worker 的 pod** → 重建、重新注册 → `resume` →
+  进程继续（3 → 4）、`exec` 拿到 `EXEC_OK`、图被消费（`latest: No such file or directory`）。
+  引擎这次的面包屑：`resumed … into the session (child 1, pid 30); 1 fd(s) could not come
+  back (sockets/pipes/memfds): [{'fd': 0, 'path': 'pipe:[…]'}]`。
+
+**这一轮先红了两次，两次都不在 restore**，而且都属于"验收脚本自己的毛病"这一类
+（与 FUP-29/30 同族）。写下来，免得下次又当成引擎回归：
+
+1. **kubectl 通道死了会伪装成"图没写"**：`image_on_node()` 用 `kubectl exec` 去列节点上的图，
+   而它的报错走 stderr、被 helper 丢掉 ⇒ 断言打出 `no checkpoint image on the hosting node:`
+   后面跟着一片空白。同一时刻 worker 日志里却明明写着
+   `checkpoint image written to … (5 MiB, pid 225, 4 fd(s))`。修法：`image_on_node` 在
+   `kubectl` 非零退出时把 stderr 带进 listing；`main()` 开头先 `kubectl get nodes` 做前置
+   断言（通道要先用 `deploy/scripts/open-cluster-tunnel.sh` 建好，验收脚本依赖它）。
+2. **计时器文件的写法会被 pause 冻在"截断窗口"里**：夹具原本 `open('tick','w')` 再写，而
+   `pause()` 会把进程冻在**任意一条指令**上 —— 冻在 truncate 与 write 之间时，文件在**整个
+   冻结期都是空的**，读者拿到 `""`，而脚本按自己的约定把"空"读作"还没写"（那是给活着的写者
+   留的窗口）⇒ 断言 `the counter vanished at the pause`，看起来像"进程死了"。改成
+   **临时文件 + `os.replace`**（同目录内原子）之后，任何时刻观察到的都是一个完整的值
+   （旧的或新的），这条红消失。两次跑里红绿各一次，正是它随机的直接证据。
