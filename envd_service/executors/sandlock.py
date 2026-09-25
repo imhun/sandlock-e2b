@@ -1177,12 +1177,37 @@ class SandlockExecutor(Executor):
                 self._sandbox_id or "-",
                 exc,
             )
+            self._log_slot_stderr("restore refused")
             return {"restored": False, "reason": str(exc)}
+        # The slot's stderr is where the engine's restore breadcrumbs go with
+        # `SANLOCK_RESTORE_TRACE=1` (`checkpoint::resume::note`): a session points
+        # the *child's* stdio at /dev/null, so without this the only report of a
+        # restore that got as far as announcing a child and nothing further is the
+        # absence of the process. One line here, on the rare path.
+        self._log_slot_stderr("restore")
         outcome: dict = {"restored": True, "reason": ""}
         for key in ("dir", "child_id", "pid", "restore_skipped"):
             if key in reply:
                 outcome[key] = reply[key]
         return outcome
+
+    def _log_slot_stderr(self, what: str) -> None:
+        """Log the slot's stderr tail, if it has anything to say (never raises)."""
+        instance = self._instance
+        reader = getattr(instance, "slot_stderr", None)
+        if reader is None:
+            return
+        try:
+            text = reader()
+        except Exception:  # noqa: BLE001 - diagnostics must not change an outcome
+            return
+        if text:
+            logger.info(
+                "%s: slot stderr for sandbox %s:\n%s",
+                what,
+                self._sandbox_id or "-",
+                text,
+            )
 
     def _on_slot_event(self, event: dict) -> None:
         """Handle one pushed slot event (N25)."""

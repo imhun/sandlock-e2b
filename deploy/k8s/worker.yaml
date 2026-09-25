@@ -341,6 +341,17 @@ spec:
               value: "1"
             - name: E2B_PLATFORM_DISK_MB
               value: "8192"
+            # FUP-30's diagnostic: with this on, the fork prints one line per
+            # restore step to the *slot's* stderr (`checkpoint::resume::note`),
+            # and the worker logs that tail right after a restore
+            # (`envd_service/executors/sandlock.py::_log_slot_stderr`). A
+            # restored child has no stdio of its own -- a session gives it
+            # /dev/null -- so this is the only way "the engine announced a child
+            # and the process is gone a second later" can say *how far it got*.
+            # ~6 lines per restore, i.e. only when a sandbox actually resumes;
+            # leave it on until that incident is closed.
+            - name: SANLOCK_RESTORE_TRACE
+              value: "1"
             # Still *not* set: E2B_UID_POOL_START/SIZE. The allocator is
             # cross-process safe on a shared base (`uid_pool.acquire` takes an
             # flock on `<base>/.uid_pool.lock` and recomputes the free set from

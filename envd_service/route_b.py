@@ -1268,6 +1268,16 @@ class RouteBInstance:
         self._events_thread.start()
         return True
 
+    def slot_stderr(self, limit: int = 2000) -> str:
+        """The slot's stderr tail, for a caller that wants to log it.
+
+        Public twin of :meth:`_slot_stderr_now`. The executor uses it after a
+        restore: a *restored* child's own stdio is gone (a session gives it
+        /dev/null), so the slot's stderr is the only place the engine's restore
+        breadcrumbs (`SANLOCK_RESTORE_TRACE=1`) can land.
+        """
+        return self._slot_stderr_now(limit=limit)
+
     def _slot_stderr_now(self, limit: int = 2000) -> str:
         """Whatever the slot has written to stderr so far, without blocking.
 
