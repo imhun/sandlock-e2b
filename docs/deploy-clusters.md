@@ -203,13 +203,14 @@ Calico VXLAN 只能建集群时定）见 `deploy/k8s-k0s/README.md`；集群层�
 
 ## 9. checkpoint/restore 的上线记录（2026-09-25）
 
-**版本**：`0.1.0-523-g38fbc30-20260925-204255`（= `deploy/stack/.version`）。这一轮改了三样
+**版本**：`0.1.0-525-g65ad183-20260925-212439`（= `deploy/stack/.version`）。这一轮改了三样
 东西，所以 rebuild 链条跑了两遍：E2B 侧代码（主仓 `9ddebc5`）、fork 的 `exclude_main`
 （fork `da0faf5`）、fork 的 restore-stub 随 wheel（fork `2d5f2e9`）。整栈同一版本，
 `kubectl diff` 只剩版本行 + worker 的两个新环境变量。
 
-> 当晚又滚过一次（`0.1.0-523`，fork `685301c` + `6367c26`：冻结释放 fork 通知的修复、
-> 以及测试/文档），链条同上：wheel → 镜像 → `apply.sh`。
+> 当晚又滚过两次（`0.1.0-523` / `0.1.0-525`；fork `685301c` 冻结释放 fork 通知的修复、
+> `89e8ab2` restore 面包屑 + E2B `65ad183` 记录 slot stderr），链条同上：
+> wheel → 镜像 → `apply.sh`。**验收在这两版之后全绿**（见下表）。
 
 **worker 上的两个新开关**（写在 `deploy/k8s/worker.yaml`，不是临时 patch）：
 
@@ -242,14 +243,18 @@ Calico VXLAN 只能建集群时定）见 `deploy/k8s-k0s/README.md`；集群层�
 * ✅ **thaw 路径（不用重启 worker 的那一半）完全正确**：`pause` → `Sandbox.connect` 解冻后
   **同一个进程继续计数**（3 → 4），而且**在同一个会话里 exec 能拿到输出**
   （`echo THAWED_OK` → `THAWED_OK\n`）。FUP-29 追的就是这条形状，线上是好的。
-* ❌ 被恢复的那个 **python 进程几秒后不在 `/proc` 里**（节点上只剩 worker、slot 的 3 个
-  `sandlock-supervise` 与 park），计数器文件停在 pause 时的值。
-  当晚又加了 **boot 标记**再量一次：负载开机第一句就把自己的 pid 写进 `boot2.txt`，并把
-  stdio 重定向到文件（stdio 是 pipe，恢复会 skip，traceback 会丢）。resume 之后
-  **`boot2.txt` 仍是捕获前的 pid、`err2.txt`/`out2.txt` 全空** ⇒ 被恢复的进程
-  **连一行 Python 都没跑到**，死在恢复本身。
-  ⇒ 这是引擎侧的 **FUP-30**（fork `docs/fork-plan-followups.md`），
-  **因此这条能力还没宣布可用**；E2B 侧接线到"恢复调用成功返回"为止全部实测通过。
+* ✅ **被恢复的进程活着，而且还在干活**（`0.1.0-525`）：resume 之后计数器继续前进（4 → 5），
+  同会话 `exec` 拿到 `EXEC_OK`，图被消费，引擎面包屑
+  `child alive 50ms after the handshake: true`。
+* 当晚那几次"恢复了但进程不见"的**真因不在引擎，而在验收脚本的命令串**：脚本写成
+  `sh -c 'exec python3 …'`，而 worker 本来就把命令包成 `/bin/sh -c "<串>"` ⇒ 会话里的活子进程
+  是**第二个 shell**，python 成了孙子；捕获按设计只抓那一个活子进程，于是抓到 shell，
+  恢复出来的 shell 唯一的孩子早没了、`wait4` 拿到 ECHILD 就退出。面包屑把这件事说穿了：
+  那张图是 `maps=19` / 填充 397 KB（dash 的大小），而真 python 是 `maps=32` / 6.3 MB
+  （`/proc` 里也看不到了）。命令串改以 `exec` 开头（worker 的 shell 原地变成 python）后全绿。
+  **相关语义已写进 `docs/checkpoint-restore-e2b-half.md` §6(g)**：pause 抓的是会话里的活子进程，
+  会 fork 出子 shell 的命令形状（`sh -c '…'`、管道、`&&`）抓到的就是那个子 shell。
+  fork 侧登记见 `docs/fork-plan-followups.md` FUP-30（已关，含定位方法与两组数字）。
 * ⚠️ **验收脚本的部署语义**：`max_concurrent_commands_per_sandbox` 默认 **1**，
   所以"后台进程还在跑 + 再 exec 一条命令"会排队 30 s 然后 429；脚本里先 `handle.kill()`
   再 exec（`tmp/k0s/checkpoint_acceptance.py` 已按此写）。

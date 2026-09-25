@@ -262,7 +262,7 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 | **S1a** | ✅ fork：slot 加 `checkpoint` verb（写 blob 到调用方指定的路径）—— fork `e76cb2f`，主仓 pin `82a26df` | fork 的 supervise 相位 **31 passed / 0 failed**，新用例钉住"镜像是引擎格式"与"捕获不是 kill" |
 | **S1b** | ✅ fork：**从镜像起一个 slot**（`Checkpoint::load` → 用镜像里的 policy 起沙箱 → `restore_interactive`），服务 `config`/`stats`/`shutdown`、**按名拒绝 exec**（照 OCI 的既有语义）。不是 verb，是启动模式 | fork `58264eb`，supervise 相位 **32 passed / 0 failed**。用例钉住：恢复出的进程**真的在跑**（计数器继续前进）、`stats.restored` 可辨、`exec` 得到引擎原话、`shutdown` 干净退出、**进程死后报 `Exited` 而不是 `Live`**（僵尸那个 bug 就是这一步量出来的）。**警告**：workload 必须是 §1(e) 那格里"能恢复"的类型 |
 | **S2** | ✅ **已完成**：worker：agent 端点（`/checkpoint`、`/restore`）+ D1/D2/D8 的落地 + **D3 的平台账与拒绝路径**（`runtime/checkpoint_store.py`、`runtime/platform_disk.py`、`route_b.RouteBInstance` 的两个 verb 客户端、`executors/sandlock.py` 的两个能力入口） | 单测：blob 落在 `_runtime`、目录 0700 且属主是 worker、沙箱树一个字节不动、**平台账计入且用户的 `diskMB` 不变**、账满时**先拒**（一条 verb 都不发）、写超了**删掉再拒**、refusal 带原因、teardown 删净 —— `tests/unit/test_checkpoint_store.py`（16 条）+ `tests/unit/test_agent_checkpoint_restore.py`（11 条）+ `tests/unit/test_sandlock_executor_route_b.py` 的 6 条 verb 用例 |
-| **S3** | ✅ **代码已完成**：`pause` 先捕获再冻结、`resume` 先解冻/恢复再改状态，`E2B_PAUSE_CHECKPOINT` 默认关 | 单测把两条顺序钉成事实（事件序列 `["executor.capture_checkpoint", "ctx.pause"]` / `["executor.restore_checkpoint", "ctx.resume"]`，`test_agent_checkpoint_restore.py`）。**集群验收见 §6(g)：一半绿一半红** —— 捕获/存储/平台账/worker 重建/恢复调用链全部实测通过，但恢复出来的**动态**程序随后消失（引擎侧的 FUP-30）。**这条能力因此还不能宣布可用** |
+| **S3** | ✅ **完成**：`pause` 先捕获再冻结、`resume` 先解冻/恢复再改状态，`E2B_PAUSE_CHECKPOINT` 默认关 | 单测把两条顺序钉成事实（事件序列 `["executor.capture_checkpoint", "ctx.pause"]` / `["executor.restore_checkpoint", "ctx.resume"]`，`test_agent_checkpoint_restore.py`）。**集群验收见 §6(g)：全绿** —— 起一个跑着的沙箱 → 重启它的 worker → resume → **进程状态还在、还能 exec**（中途那段"恢复了但进程不见"是验收脚本自己的命令形状，见 §6(g) 第三轮） |
 | **S4** | ✅ **已完成**：`restore_skipped` 的对外语义（D6） | `unrecoveredFds` 随 `/restore` 与 `resume` 的结果返回、逐条进日志（用例断言的是**整句**日志文本，不是子串），文档在这一节与 §6(e) 里明说"恢复的沙箱没有原有的网络连接" |
 
 **S1 之前的任何 E2B 侧改动都没有意义**：没有 verb，worker 拿不到 `Sandbox`。
@@ -366,7 +366,7 @@ worker 上把 per-sandbox 扫描整个关掉（`E2B_DISK_ENFORCE_INTERVAL_S=0`�
 孩子**，所以 `exec` 继续被服务（不是 OCI 那句按名拒绝）。部署记录与实测输出见
 `docs/deploy-clusters.md`。
 
-**2026-09-25 实测：一半绿，一半红，红的那半在引擎里（FUP-30）**。脚本
+**2026-09-25 实测（第一、二轮）：看起来"一半绿、一半红"**。脚本
 `tmp/k0s/checkpoint_acceptance.py`（每步都断言，不是打印）走到：
 
 * ✅ `pause` 写了图，落在**平台的**目录里、**属主是那个沙箱的 uid**（`_runtime/.checkpoints/
@@ -379,10 +379,11 @@ worker 上把 per-sandbox 扫描整个关掉（`E2B_DISK_ENFORCE_INTERVAL_S=0`�
 * ❌ **被恢复的那个 python 进程几秒后不在 `/proc` 里了**（节点上只剩 worker、slot 的 3 个
   `sandlock-supervise` 与 park），计数器文件停在 pause 时的值 —— 也就是"恢复了、但没活下来"。
 
-这不是 E2B 的接线问题（接线到"restore 成功返回"为止全都对），而是引擎在**动态程序 + 恢复进
-会话**这个组合上的一件事，已按 fork 的纪律登记为 **FUP-30**（同形 probe 在本机能跑起来、
-但随后 wedge，见 FUP-29）。**所以这条能力现在还不能宣布可用**：E2B 侧全部就位、集群上
-capture/store/账/重启/恢复调用链全部验证过，缺的是引擎把真实程序稳稳恢复回来。
+当时读成"引擎在动态程序 + 恢复进会话这个组合上出了问题"，于是按 fork 的纪律登记为 **FUP-30**
+（本机同形 probe 也卡住，另外登记为 FUP-29）。**两件的真因后来都查清了、都不是引擎**：
+FUP-29 是 fork 侧测试 runtime 单线程（本机那半），FUP-30 是**上面这条验收脚本自己的命令形状**
+（下面第三轮）。也就是说：E2B 侧接线、引擎的捕获/恢复、存储与平台账**在集群上从一开始就是对的**，
+被误判成引擎缺陷的那张图其实是一个 shell。
 
 **2026-09-25 第二轮（同一晚，集群版本 `0.1.0-523-g38fbc30-20260925-204255`）**：
 
@@ -404,6 +405,39 @@ capture/store/账/重启/恢复调用链全部验证过，缺的是引擎把真�
 * **写验收脚本要注意的部署语义**：worker 的 `max_concurrent_commands_per_sandbox` 默认 **1**，
   所以"后台跑着的进程 + 再 exec 一条命令"会排队 30s 然后 429（`command queue timed out`）。
   这不是 pause 的问题，是部署的并发形状；脚本里要先 `handle.kill()` 再 exec。
+
+**2026-09-25 第三轮（当晚收口）：验收全绿，FUP-30 的真因是验收脚本的命令形状。**
+
+引擎侧加了 restore 面包屑（fork `89e8ab2`：`SANLOCK_RESTORE_TRACE=1` 时逐步打印；
+E2B 侧 `65ad183` 在 restore 之后把 slot 的 stderr 尾巴写进 worker 日志——会话里子进程的
+stdio 是 `/dev/null`，这是唯一能看到引擎自述的通道）。第一张面包屑就露了馅：
+
+| 同一次验收 | 图里的形态 | 握手 | 50 ms 后 |
+|---|---|---|---|
+| 旧命令串 `sh -c 'exec python3 …'` | `maps=19`、填充 **397312** 字节 | 全部走完 | **子进程已死** |
+| 改成 `exec python3 …` | `maps=32`、填充 **6279168** 字节 | 全部走完 | **还活着** |
+
+`19` 个映射、388 KiB 是 **dash** 的大小，不是 python。**根因**：worker 本来就把命令包成
+`/bin/sh -c "<串>"`，而脚本又在串里写了一次 `sh -c '…'` —— 那个 `sh` 会 fork 出第二个 shell，
+于是**会话里的活子进程是第二个 shell**，python 成了它的孙子。捕获按设计只抓"会话里那一个
+活子进程"⇒ 抓到 shell；恢复出来的也是 shell，它唯一的孩子早没了，`wait4` 拿到 ECHILD
+→ 走完脚本 → **立刻退出**（这就是"恢复了但没活下来"）。把 `exec` 放在**命令串的第一个词**
+（让 worker 自己的 shell 原地换成 python）之后，一切正常。
+
+**最终一次验收（集群 `0.1.0-525-g65ad183-20260925-212439`）全绿**：
+
+* `pause` → 图 **6162 KiB**（真 python），平台账 `used=5 MiB / 8192`；
+* `connect`（thaw）→ 同一进程继续计数（3 → 4），同会话 `exec` 拿到 `THAWED_OK`；
+* 第二段 python 负载 → 再 `pause` → **删掉宿主 worker 的 pod** → 重建 → 重新注册 → `resume`；
+* `resume` → **被恢复的进程继续计数（4 → 5）**、`exec` 拿到 `EXEC_OK`、图被消费
+  （worker 日志：`resumed … into the session (child 1, pid 30); 2 fd(s) could not come back`——
+  两个 stdio/pipe），引擎面包屑 `child alive 50ms after the handshake: true`。
+
+**一条必须写给使用者的语义**（本项目就是它的第一个"使用者"）：一次 pause 捕获的是
+**会话里那个活子进程**，也就是 worker 自己 exec 的 `/bin/sh -c <命令串>`。单条简单命令会被
+dash 原地 `exec`（所以 `python3 …` 这种形状抓到的就是 python），但**会 fork 出子 shell 的形状**
+（`sh -c '…'`、管道、`&&` 列表…）抓到的就是那个子 shell——恢复回来的也是一个 shell，
+它的孩子不会回来。要"抓住那个服务进程"，命令串就该以 `exec` 开头（或直接给单条命令）。
 
 ### (i) 集群上现学到的三件事（都是 E2B 侧，2026-09-25）
 
