@@ -451,8 +451,15 @@ WORKER_SECCOMP_TEXT = (REPO / "deploy" / "seccomp" / "sandlock-worker.json").rea
 
 
 def _installer_configmap_payload() -> str:
-    """The profile exactly as the ConfigMap carries it (block scalar dedented)."""
-    marker = "  sandlock-worker.json: |-\n"
+    """The profile exactly as the ConfigMap carries it (block scalar dedented).
+
+    The marker is ``"|"`` (keep) and deliberately not ``"|-"`` (strip): the
+    profile file ends with a newline, so a stripped scalar would hand the node
+    a payload one byte shorter than the file every test here compares against.
+    Matching on ``"|\\n"`` is strict -- the ``|-`` form has ``-`` where this
+    marker wants the newline, so it stops matching rather than matching loosely.
+    """
+    marker = "  sandlock-worker.json: |\n"
     assert marker in SECCOMP_INSTALLER, "ConfigMap must carry the profile as a block scalar"
     body = SECCOMP_INSTALLER.split(marker, 1)[1].split("\n---\napiVersion: apps/v1", 1)[0]
     lines = []
@@ -488,6 +495,47 @@ def test_seccomp_installer_rolls_when_the_profile_changes() -> None:
 
     digest = hashlib.sha256(WORKER_SECCOMP_TEXT.encode()).hexdigest()
     assert f'        checksum/profile: "{digest}"\n' in SECCOMP_INSTALLER
+
+
+def test_seccomp_installer_scalar_keeps_the_trailing_newline() -> None:
+    """`|`, never `|-` -- the applied payload has to be the file, byte for byte.
+
+    `|-` strips the block scalar's final newline, and the profile file has one,
+    so a stripped scalar makes the value the ConfigMap carries (and the node
+    writes) one byte short of the file this suite, the in-file comment and the
+    `checksum/profile` annotation all name. Measured 2026-09-25 against the
+    rendered stack: the applied value hashed to `e79a1c6a…` while the annotation
+    said `071486c0…`. Nothing broke (JSON and the kubelet both tolerate it) --
+    which is exactly why it needs pinning rather than trusting.
+    """
+    assert "  sandlock-worker.json: |\n" in SECCOMP_INSTALLER
+    assert "  sandlock-worker.json: |-\n" not in SECCOMP_INSTALLER
+    payload = _installer_configmap_payload()
+    assert payload.endswith("\n"), (
+        "the profile file ends with a newline; a scalar that strips it silently "
+        "changes what the node is given"
+    )
+
+
+def test_seccomp_installer_comment_names_the_payload_hash() -> None:
+    """The comment above the payload carries that payload's sha256, pinned.
+
+    The comment is documentation, not mechanism -- which is exactly why it
+    drifted: the N35 resync bumped the payload and the `checksum/profile`
+    annotation but left this line on the pre-N35 hash (`0e07967a…`), so the one
+    line a human would read named a profile no manifest shipped. Measured
+    2026-09-25: the deployed ConfigMap carried `0e07967a…` while the repo's
+    payload was `071486c0…`, and the stale comment made the live-vs-repo
+    comparison read as agreement at a glance.
+    """
+    import hashlib
+
+    payload = _installer_configmap_payload()
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    assert (
+        f"# tests/unit/test_worker_manifest_permissions.py); sha256 {digest}\n"
+        in SECCOMP_INSTALLER
+    )
 
 
 def test_seccomp_installer_writes_the_kubelet_seccomp_root() -> None:

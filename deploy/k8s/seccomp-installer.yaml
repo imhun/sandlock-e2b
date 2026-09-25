@@ -33,8 +33,18 @@ metadata:
     app: seccomp-installer
 data:
   # Byte-for-byte the file at deploy/seccomp/sandlock-worker.json (pinned by
-  # tests/unit/test_worker_manifest_permissions.py); sha256 0e07967a2c577d9fb3646e9735d72589abd5d8195d2a5a15ec27a498f1ee5bdb
-  sandlock-worker.json: |-
+  # tests/unit/test_worker_manifest_permissions.py); sha256 071486c06782c70d6764184493b104ed4418f77a244cb4198e14db70091ee27c
+  #
+  # `|` (keep), NOT `|-` (strip). The profile file ends with a newline, so `|-`
+  # hands the node a payload one byte shorter than the very file this comment
+  # and the annotation name. That is not hypothetical: the file had no trailing
+  # newline at 8ea5909 (so `|-` was then exact), a later pass added one, and the
+  # N35 resync copied the text without noticing -- measured 2026-09-25, the
+  # applied value hashed to e79a1c6a while the annotation said 071486c0. A
+  # trailing newline is inert for JSON and for the kubelet, but it makes every
+  # "byte-for-byte" claim on this file quietly false, and the text-style test
+  # could not see it (it dedented the source instead of reading the YAML value).
+  sandlock-worker.json: |
     {
     	"defaultAction": "SCMP_ACT_ERRNO",
     	"archMap": [
