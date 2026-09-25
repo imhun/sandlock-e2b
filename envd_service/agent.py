@@ -35,6 +35,7 @@ from envd_service.runtime.checkpoint_store import (
     restore_checkpoint_image,
     resume_sandbox,
 )
+from envd_service.runtime.cpu_activity import CpuActivityTracker, sample_cpu_ticks
 from envd_service.runtime.context import mcp_port_stats as _mcp_port_stats
 from envd_service.uid_pool import (
     align_shared_uid_workspace,
@@ -210,6 +211,31 @@ def _disk_enforce_dirty_enabled() -> bool:
     from gateway_common.env import env_bool
 
     return env_bool("E2B_DISK_ENFORCE_DIRTY", False)
+
+
+def _cpu_activity_interval_s() -> float:
+    """How often the worker samples per-sandbox CPU (E9.1 blind spot 2).
+
+    ``E2B_CPU_ACTIVITY_INTERVAL_S`` (default 5 s = the heartbeat's own cadence);
+    ``0`` disables the sampling, which puts a CPU-bound sandbox back in the
+    "looks empty" bucket -- see `docs/resource-contention.md` §6 for what that
+    costs.
+    """
+    from gateway_common.env import env_float
+
+    return env_float("E2B_CPU_ACTIVITY_INTERVAL_S", 5.0)
+
+
+def _cpu_activity_percent() -> float:
+    """Percent of one core that counts as "this sandbox is working".
+
+    ``E2B_CPU_ACTIVITY_PERCENT`` (default 5). A delta of *any* size is not
+    activity -- a process that wakes once a minute has one -- and treating it as
+    activity would make every sandbox un-evictable.
+    """
+    from gateway_common.env import env_float
+
+    return env_float("E2B_CPU_ACTIVITY_PERCENT", 5.0)
 
 
 #: MiB, the unit both sides of the platform's checkpoint account are written in.
@@ -1468,6 +1494,22 @@ class NodeAgent:
         #: (``E2B_DISK_ENFORCE_INTERVAL_S=0``), which has no accounting report at
         #: all; the endpoints' own replies still carry the numbers there.
         self._platform_disk_report: dict[str, int] = {}
+        #: E9.1 blind spot 2 (``docs/resource-contention.md`` §6): a sandbox that
+        #: only burns CPU crossed no request, so eviction read it as idle. The
+        #: sampler turns its own ``/proc`` CPU time into activity, on the same
+        #: ``sandboxActivity`` channel a request uses -- no new wire field.
+        self._cpu_interval_s = _cpu_activity_interval_s()
+        self._cpu_tracker = CpuActivityTracker(
+            percent_threshold=_cpu_activity_percent()
+        )
+        self._cpu_sampler = sample_cpu_ticks
+        self._cpu_trace = str(os.getenv("E2B_CPU_TRACE", "") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._cpu_loop_task: asyncio.Task | None = None
         self._disk_report_at = 0.0
         #: The scan round in flight, if any (single-flight, like the reconcile
         #: round): the heartbeat reads the last completed report and never
@@ -1499,6 +1541,11 @@ class NodeAgent:
         if not self._control_url or not self._node_address:
             return
         self._task = asyncio.create_task(self._loop())
+        # E9.1 blind spot 2: CPU sampling runs on its own cadence, for the same
+        # reason the disk round does -- the pulse is every 5 s and a round must
+        # not be given that as its floor.
+        if self._cpu_interval_s > 0:
+            self._cpu_loop_task = asyncio.create_task(self._cpu_activity_loop())
         # N25: the scan cadence gets its own task, because the heartbeat only
         # runs every 5 s -- a round started from there would inherit that as
         # its floor no matter what the interval says (measured: a 4.7 s freeze
@@ -1637,6 +1684,51 @@ class NodeAgent:
                 raise
             except Exception:  # pragma: no cover - defensive
                 logger.warning("disk loop tick failed", exc_info=True)
+
+    async def _cpu_activity_loop(self) -> None:
+        """Mark CPU-burning sandboxes active, on the sampling cadence (E9.1)."""
+        while True:
+            await asyncio.sleep(self._cpu_interval_s)
+            try:
+                await self._cpu_activity_round()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("cpu activity round failed", exc_info=True)
+
+    async def _cpu_activity_round(self) -> dict[str, float]:
+        """One CPU sample: mark the sandboxes that were actually working.
+
+        The sample itself is a `/proc` walk, so it runs on a worker thread. Only
+        the *delta* since the previous sample counts, and only above the
+        configured percentage -- "there was a delta" is not activity (a process
+        that wakes once a minute has one) and would make eviction impossible.
+
+        Returns the marked sandboxes for tests and for the trace log; a sandbox
+        with no pooled uid (the shared-uid shape) is deliberately skipped, since
+        its CPU cannot be told apart from the worker's own.
+        """
+        ticks = await asyncio.to_thread(self._cpu_sampler)
+        percents = self._cpu_tracker.observe(ticks, now=time.time())
+        busy = self._cpu_tracker.busy(percents)
+        marked: dict[str, float] = {}
+        if busy:
+            for record in self._runtime_registry.list():
+                uid = getattr(record, "host_uid", None)
+                if uid is None or getattr(record, "state", "running") != "running":
+                    continue
+                uid = int(uid)
+                if uid in busy:
+                    self._runtime_registry.mark_active(record.sandbox_id)
+                    marked[record.sandbox_id] = percents[uid]
+        if self._cpu_trace:
+            logger.info(
+                "cpu trace: uids=%d busy=%d marked=%s",
+                len(percents),
+                len(busy),
+                {k: round(v, 1) for k, v in marked.items()},
+            )
+        return marked
 
     def _disk_report_for_heartbeat(self) -> dict[str, int]:
         """The last measured tree sizes; a fresh scan is started, never awaited.
@@ -2303,6 +2395,7 @@ class NodeAgent:
             "_reconcile_task",
             "_disk_scan_task",
             "_disk_loop_task",
+            "_cpu_loop_task",
             "_push_task",
         ):
             task: asyncio.Task | None = getattr(self, attribute, None)

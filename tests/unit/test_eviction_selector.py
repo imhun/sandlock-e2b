@@ -8,6 +8,7 @@ are bounded and expire so the notification table cannot grow forever.
 
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 
 import pytest
@@ -54,6 +55,31 @@ def _make_idle(registry, record, *, seconds=1200, stamp=None):
     record.last_active_at = moment
     registry.save(record)
     return moment
+
+
+def test_a_sandbox_the_cpu_sampler_marked_active_is_not_a_candidate():
+    """E9.1 blind spot 2, at the selection the eviction actually makes.
+
+    The worker's CPU sampler calls the *same* `mark_active` a request does
+    (`envd_service/agent.py::_cpu_activity_round`), so its effect here is the
+    acceptance the design asks for: a sandbox that only burns CPU -- no
+    requests, no egress -- is not picked, while one that did nothing still is.
+    """
+    registry = SandboxRegistry(_settings())
+    burning = _create(registry)
+    idle = _create(registry)
+    _make_idle(registry, burning, seconds=1200)
+    _make_idle(registry, idle, seconds=1200)
+
+    # What the heartbeat does with the worker's report -- the path a CPU mark
+    # rides (`apply_activity_report`, node_id None = the in-process shape).
+    updated = registry.apply_activity_report(None, {burning.sandbox_id: time.time()})
+    assert updated == 1
+
+    candidates = registry.eviction_candidates(tenant_id=None)
+    assert [record.sandbox_id for record in candidates] == [idle.sandbox_id], (
+        "a sandbox that is still burning CPU is not idle; the untouched one is"
+    )
 
 
 # -- ordering -------------------------------------------------------------

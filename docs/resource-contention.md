@@ -251,12 +251,34 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after�
 
 **决定（2026-09-23，用户）：要补采样。** 按 **i → ii** 的顺序做，**iii 的文档部分照写**：
 
-1. **先做 i（每沙箱 CPU 时间增量）**：worker 的周期任务里顺手采（cgroup v2 `cpu.stat` 的
+1. ✅ **已做 i（每沙箱 CPU 时间增量，2026-09-25）**：worker 的周期任务里顺手采（cgroup v2 `cpu.stat` 的
    `usage_usec` 差，或该沙箱进程组的 `/proc/<pid>/stat` utime+stime 差），把"这段时间确实在
-   烧 CPU"并进 `sandboxActivity` 上报；控制面把"CPU 增量 > 阈值"也算活动。
-   验收：一个**不发任何请求、只在循环里烧 CPU** 的沙箱在阈值窗口内**不被判空闲**（今天的
+  烧 CPU"并进 `sandboxActivity` 上报；控制面把"CPU 增量 > 阈值"也算活动。
+  验收：一个**不发任何请求、只在循环里烧 CPU** 的沙箱在阈值窗口内**不被判空闲**（今天的
    行为是会被 pause + 释放预留），而一个真正什么都没做的沙箱**仍然**会被判空闲
    （不能把判定变成"永不空闲"）。
+   **实现（2026-09-25）**：`envd_service/runtime/cpu_activity.py` + `agent.py` 的一个独立
+   周期任务（与磁盘轮同形，不挂在心跳上）：
+
+   * **一次 `/proc` 走查**，按进程的**属主 uid** 汇总 `utime+stime`（E3.2 之下 slot 就是沙箱
+     的进程树、跑在它的池 uid 上，所以不需要按沙箱走树）；没有池 uid 的形态
+     （非 root worker / 共享 uid）**故意不采**——那里的 CPU 分不出是沙箱的还是 worker 自己的，
+     猜一个数就等于让驱逐去信一个假信号；
+   * **阈值是"一个核的百分比"**（`E2B_CPU_ACTIVITY_PERCENT`，默认 5，按采样窗口平均；
+     `E2B_CPU_ACTIVITY_INTERVAL_S` 默认 5 s，0 = 关掉）。"有增量就算活动"是错的：一分钟醒一次
+     的进程也有增量，那样**没有沙箱可被驱逐**；
+   * 超过阈值的沙箱调**同一个** `mark_active`（worker 侧 registry），于是走的是**同一条**
+     `sandboxActivity` 心跳与 `apply_activity_report` 合并路径 —— 不加新字段、控制面不加第二个
+     阈值。`E2B_CPU_TRACE=1` 打一行每轮的采样摘要（排障用）。
+
+   验收（单测，`tests/unit/test_cpu_activity.py` + `test_eviction_selector.py`）：
+   `/proc` 汇总按 uid 精确；阈值边界（0.5 s/5 s = 10% 算活动、无增量不算、uid 回绕不算）；
+   烧 CPU 的沙箱被 mark、**闲的 / 没有池 uid 的 / paused 的都不会**；
+   并且把这条 mark 走完 `apply_activity_report` 之后，它**不在** `eviction_candidates` 里，
+   而什么都没做的那个**还在** —— 正是这条决策的验收。
+   **已知缺口（有意）**：这套采样挂在 NodeAgent 的循环上，所以只有"分离形态"（worker 有自己的
+   heartbeat 循环）会采；combined 形态（控制面与 worker 同进程）今天不采 —— 它本来也不是
+   产能形态，且它的空闲判定与驱逐在同一个进程里，等真有人用再补。
 2. **ii（每沙箱网络计数）留到真有人用纯 egress / 沙箱互访型长任务时**：那时才需要给每个
    沙箱定位网络命名空间（route-B 槽位天然有；route-A/in-process 只能按 pid 聚合，精度差）。
 3. **不论做到哪一步，都把语义写进对外文档**：空闲 = "没有经过平台的请求 + 没有在烧 CPU
