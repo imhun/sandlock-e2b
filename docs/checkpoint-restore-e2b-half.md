@@ -44,7 +44,7 @@ worker 早就把"这个 slot 不认识这个 verb"（旧二进制）当成一种
 
 **这不是纯 E2B 改动，和 `update_network` 当年一样是 fork+E2B 一起动。**
 
-### (b) blob 的天然位置**不在**磁盘账本里
+### (b) blob 的天然位置**不在**磁盘账本里，而"计进账"这句话得说清记到谁头上
 
 进程内存的落点不能是 workspace——那是 guest 可读的。天然的、也是唯一干净的位置是
 `gateway_common/paths.py` 的 `sandbox_runtime_dir()`：`<base>/_runtime/<id>`，
@@ -52,9 +52,23 @@ worker 早就把"这个 slot 不认识这个 verb"（旧二进制）当成一种
 
 **但它不在账本里。** 磁盘账本量的是 `record.workspace_dir`（`<base>/<id>`），
 `_runtime/<id>` 是它的**兄弟目录**（`registry.py::disk_usage_snapshot` 逐 `workspace_dir` 走）。
-今天这不要紧（那里只有一个 record 和一个 JSONL 命令日志）；checkpoint blob 是**整个进程的内存**，
-量级完全不同 ⇒ **一个沙箱可以靠反复 checkpoint 无限放大自己的磁盘占用而不被配额看见。**
-这是必须先解决的一件事，不是实现细节。
+今天那里有多大，是量过的（2026-09-25，两台 worker）：**每个沙箱 4096 字节**——正好一个块，
+内容只有 `command-logs.jsonl`（样例 59 字节）。对照 1 GiB 的 `diskMB`，那是 **0.0004%**。
+所以"把现有的 `_runtime` 纳入账本"这件事本身几乎不花钱（见 §2 D3 的实测）。
+
+**真正不一样的只有 blob**：它是**整个进程的内存**，量级差三四个数量级。
+难点不是"要不要算"，而是**记到谁的账上** —— 因为按用户的 `diskMB` 去算会撞上一个很坏的形状：
+
+`pause` 是**释放**资源的动作，而不是消耗资源的动作。如果 pause 写的 checkpoint 记在被暂停的那个
+沙箱自己的配额里，那么"暂停"会把它推过预算，于是它**从此不能写**（worker 侧实测口径：
+超预算 ⇒ `RLIMIT_FSIZE=0` 让每个写失败在 `EFBIG`，`O_CREAT`/`mkdir`/`symlink`/`link` 回 `ENOSPC`，
+见 `control_plane/registry/manager.py::enforce_disk_budget` 的说明），而它的文件**一个字节都没变**。
+用户想腾空间只能删自己的文件，而 blob 不会因此变小。
+
+（一条我先前的猜测在这里被代码否掉了，记下来免得别人重走：磁盘超限**不会**触发 pause ——
+`enforce_disk_budget` 的注释写着 *"Over budget is not a pause"*，这是刻意的产品语义
+（冻结会连"删东西把自己弄回预算内"一起拿走）。所以不存在"pause → 更大 → 更多 pause"的正反馈；
+上面那个陷阱与它无关，它只来自"记到谁头上"。）
 
 ### (c) `restore_skipped` 是一条**语义选择**，不是缺陷
 
@@ -72,7 +86,7 @@ socket / pipe / memfd 恢复不了（引擎固有边界，与架构无关）。�
 |---|---|---|---|
 | D1 | blob 放哪 | `<base>/_runtime/<id>/checkpoint/<gen>.blob` | 沙箱完全无权限；与 record/命令日志同处一个平台目录；跨节点天然可见（共享 NFS） |
 | D2 | 谁拥有 | worker uid（0700 目录），**不是**沙箱的池 uid | blob 是进程内存，可能含凭据；沙箱自己永远不该读到它 |
-| D3 | 配额怎么算 | **必须计入**：给 `_runtime/<id>` 加一条独立的账（node 级 + 沙箱级） | §1(b)；不做的后果是 checkpoint 变成绕过配额的口子 |
+| D3 | 配额怎么算 | **记到平台账上，不记进用户的 `diskMB`**：给 `_runtime` 加一条独立的平台账（节点级 + 舰队级），checkpoint 写入前先看它够不够；不够就**拒绝这次 checkpoint 并退回今天的 SIGSTOP**，而不是悄悄吃掉用户的空间 | §1(b)。两边的理由都硬：不计 = checkpoint 变成绕过配额的口子；按用户配额计 = "暂停"把沙箱推过预算，它从此只能读不能写（`EFBIG`/`ENOSPC`），而用户自己的文件一个字节没变 |
 | D4 | 何时 checkpoint | **`pause` 时**，且可配置（`E2B_PAUSE_CHECKPOINT=1`，默认关） | 复用已有的、用户可见的生命周期动词；默认关 = 不改变今天的行为 |
 | D5 | 何时 restore | `resume` 时，**若进程已不在**（worker 重启过）才走恢复；还在就直接解冻 | 恢复是慢路径、且丢连接，不该在正常路径上付这个代价 |
 | D6 | `restore_skipped` 对外 | 恢复结果里带 fd 表；日志 + 文档明说"连接不回来"；**不**假装成功 | §1(c) |
@@ -87,7 +101,7 @@ socket / pipe / memfd 恢复不了（引擎固有边界，与架构无关）。�
 |---|---|---|
 | **S0** | ✅ 修掉守卫用例里过时的架构说法（它仍写着"引擎只支持 x86_64/riscv64、aarch64 要先移植"，而 aarch64 的 S0–S5 2026-09-24 已落地） | 用例文本与代码一致 |
 | **S1** | fork：slot 加 `checkpoint` verb（写 blob 到调用方指定的路径）与 `restore`（按 policy 起 slot 并恢复） | fork 的 supervise 相位有新用例；旧 client 对未知 verb 的行为不变 |
-| **S2** | worker：agent 端点 + D1/D2/D8 的落地 + **D3 的账** | 单测：blob 落在 `_runtime`、沙箱读不到、账本计入、teardown 删净 |
+| **S2** | worker：agent 端点 + D1/D2/D8 的落地 + **D3 的平台账与拒绝路径** | 单测：blob 落在 `_runtime`、沙箱读不到、**平台账计入且用户的 `diskMB` 不变**、平台账不够时拒绝而不是写入、teardown 删净 |
 | **S3** | 生命周期：`pause` 写、`resume`（进程不在时）恢复，旗标默认关 | 集群验收：**启一个跑着的沙箱 → 重启 worker → resume → 进程状态还在**（正是今天做不到的那一条） |
 | **S4** | `restore_skipped` 的对外语义（D6） | 契约用例 + 文档 |
 
