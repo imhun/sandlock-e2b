@@ -139,6 +139,11 @@ profile 会拦截 sandlock 安装自己的 seccomp 过滤器，`deploy/compose/d
 
 ## 容器镜像与部署
 
+> **目标集群与连接方式见 [docs/deploy-clusters.md](docs/deploy-clusters.md)**：本机
+> `kubectl` 的默认 context 指的**不是**本项目的集群，任何 `kubectl` 都要显式带
+> `KUBECONFIG="$PWD/tmp/k0s/kubeconfig"`（自检：2 节点 / arm64 / `v1.36.4+k0s` /
+> namespace `sandlock`）。
+
 **镜像**：
 - `deploy/docker/Dockerfile.control-plane-gateway` 打包**控制面 + envd gateway 合并镜像**
   （`gateway_common` + `control_plane` + `envd_service`，单服务单端口
