@@ -198,3 +198,63 @@ DRY_RUN=1 deploy/k8s-k0s/apply.sh 2>/dev/null | kubectl apply --dry-run=server -
 overlay 改了什么、为什么（NAS PV 必须 NFSv4.0、worker `runAsUser: 0`、容量与 resources、
 Calico VXLAN 只能建集群时定）见 `deploy/k8s-k0s/README.md`；集群层设计的全貌见
 `docs/k8s-deployment.md`。
+
+---
+
+## 9. checkpoint/restore 的上线记录（2026-09-25）
+
+**版本**：`0.1.0-522-g7248e71-20260925-185237`（= `deploy/stack/.version`）。这一轮改了三样
+东西，所以 rebuild 链条跑了两遍：E2B 侧代码（主仓 `9ddebc5`）、fork 的 `exclude_main`
+（fork `da0faf5`）、fork 的 restore-stub 随 wheel（fork `2d5f2e9`）。整栈同一版本，
+`kubectl diff` 只剩版本行 + worker 的两个新环境变量。
+
+**worker 上的两个新开关**（写在 `deploy/k8s/worker.yaml`，不是临时 patch）：
+
+| 变量 | 值 | 干什么 |
+|---|---|---|
+| `E2B_PAUSE_CHECKPOINT` | `"1"` | `pause` 先写一张 checkpoint 图再冻结；`resume` 时进程不在就恢复它 |
+| `E2B_PLATFORM_DISK_MB` | `"8192"` | 图记**平台**的账（不是用户 `diskMB`）；0 会是不限，所以这里显式给一个上限 |
+
+**这次上线在集群上量出来的三件事**（细节见 `docs/checkpoint-restore-e2b-half.md` §6(i)）：
+
+1. **route-B 的 slot 以沙箱自己的池 uid 运行**（实测 `host_uid=10001`，slot 进程 `uid=10001`，
+   worker 是 root）。所以图的目录必须**交给那个 uid**：`<base>/_runtime/.checkpoints/<id>`
+   （store `0711`、每个 `<id>` 归该沙箱 `0700`）。按原设计写成 `_runtime/<id>/checkpoint`
+   （worker `0700`）时，引擎**捕获成功、保存 EACCES**：
+   `checkpoint save failed: process error: io error: Permission denied`。
+2. **`exclude_main`**：会话的 M0 是 park（`while :; do kill -STOP $$; done`），所以"用户跑过
+   东西的沙箱"永远是 2 个活子进程，引擎（正确地）拒绝盲捕 —— 见 fork `da0faf5`。
+3. **restore stub 必须随 wheel 走**：`build.rs` 把它编译进 build 容器的 `target/`，而
+   `stub_path()` 用的正是那条路径 ⇒ 装到 worker 上的 wheel 里没有它，每次 resume 都被
+   `restore-stub was not built` 拒绝（见 fork `2d5f2e9`，修完立刻通）。
+
+**验收状态**（脚本 `tmp/k0s/checkpoint_acceptance.py`，每步都断言）：
+
+* ✅ `pause` 写图：`_runtime/.checkpoints/<id>/latest`，422 KiB，含 `meta.json` / `policy.dat` /
+  `process`；属主是那个沙箱的 uid；沙箱自己的树一个字节没动。
+* ✅ 平台账随心跳上报：节点视图 `platformDiskUsedMB/platformDiskBudgetMB = 0/8192`。
+* ✅ 删掉宿主 worker 的 pod → 重建 → 重新注册 → `resume` **把镜像恢复进了一个新会话**
+  （worker 日志逐字：`resumed … into the session (child 1, pid 30); 4 fd(s) could not come
+  back (sockets/pipes/memfds): [fd 0 pipe, fd 1 pipe, fd 2 pipe, fd 3 pipe]`）。
+* ❌ 被恢复的那个 **python 进程几秒后不在 `/proc` 里**（节点上只剩 worker、slot 的 3 个
+  `sandlock-supervise` 与 park），计数器文件停在 pause 时的值。
+  ⇒ 这是引擎侧的 **FUP-30**（fork `docs/fork-plan-followups.md`），
+  **因此这条能力还没宣布可用**；E2B 侧接线到"恢复调用成功返回"为止全部实测通过。
+
+**怎么再跑一遍**（密钥从集群里取，不写进仓库）：
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+export E2B_API_URL=http://172.18.78.49:3000
+export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d)
+export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data.E2B_INTERNAL_API_KEY}' | base64 -d)
+.venv/bin/python tmp/k0s/checkpoint_acceptance.py
+```
+
+（脚本最后会把沙箱 `kill` 掉；想留下现场排障就用 `tmp/k0s/probe_restore_state.py`，它不 kill，
+并打印沙箱 id 与宿主 pod。）
+
+**重建链条（改了 fork 就要从第一步走）**：`deploy/scripts/build-sandlock-wheels.sh`
+（交叉编两个 arch 的 wheel + supervise + restore-stub，约 4 分钟）→ `deploy/scripts/build-and-push.sh`
+（镜像推 ACR，层缓存命中时 1 分钟）→ `KUBECONFIG=... deploy/k8s-k0s/apply.sh`（滚两台 worker +
+预热 base image，约 3–5 分钟）。

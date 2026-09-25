@@ -31,6 +31,7 @@ from envd_service.runtime.image_resolver import (
 )
 from envd_service.runtime.checkpoint_store import (
     capture_checkpoint_image,
+    remove_checkpoint_images,
     restore_checkpoint_image,
     resume_sandbox,
 )
@@ -54,9 +55,11 @@ from envd_service.xfs_quota import (
 )
 from envd_service.volumes import build_volume_mounts, cleanup_volume_projects
 from gateway_common.paths import (
+    CHECKPOINT_ROOT_NAME,
     UNTRUSTED_TREE_DIR,
     is_reserved_platform_namespace,
     is_sandbox_workspace_dir,
+    sandbox_checkpoint_dir,
     sandbox_command_log_path,
     sandbox_runtime_dir,
     validate_sandbox_id,
@@ -1021,6 +1024,22 @@ def _park_refused_tree(
                 runtime_dir.rmdir()
             except OSError:  # pragma: no cover - defensive
                 pass
+        # The checkpoint images are evidence of the same kind and live in their
+        # own store (``_runtime/.checkpoints/<id>`` -- the sandbox's slot is what
+        # writes them, so they cannot sit under the worker-owned runtime dir).
+        # They move in beside the record rather than staying in the live store,
+        # where nothing would describe them any more.
+        images = sandbox_checkpoint_dir(base, sandbox_id)
+        if images.is_dir():
+            try:
+                os.replace(images, dest / CHECKPOINT_ROOT_NAME)
+            except OSError:  # pragma: no cover - best effort
+                logger.warning(
+                    "park: %s: could not move its checkpoint images into the "
+                    "quarantine",
+                    sandbox_id,
+                    exc_info=True,
+                )
         try:
             (quarantine / f"{dest.name}.reason").write_text(
                 f"{time.time():.0f}\t{sandbox_id}\t{reason}\n", encoding="utf-8"
@@ -1305,6 +1324,14 @@ def _delete_sandbox_runtime(
                 _registry_workspace_base(runtime_registry, settings), sandbox_id
             ),
             ignore_errors=True,
+        )
+        # ...and the checkpoint images, which live *beside* that runtime dir
+        # (``_runtime/.checkpoints/<id>``, `gateway_common.paths`) because the
+        # sandbox's own slot has to be able to write them. They are the largest
+        # thing the platform holds for a sandbox, so a teardown that forgot them
+        # would leave the platform account behind with no owner.
+        remove_checkpoint_images(
+            _registry_workspace_base(runtime_registry, settings), sandbox_id
         )
         if project_id is not None:
             # N12: only now, with the tree gone and its accounting at zero, can
@@ -2721,12 +2748,16 @@ async def _checkpoint_before_pause(
     heartbeats for that would be exactly the N32 shape.
     """
     ctx = request.app.state.runtimes.get(sandbox_id)
+    # The image has to land where the *slot* can write it, and the slot runs as
+    # the sandbox's pooled uid (route B). ``None`` on a shared-uid worker.
+    runtime = request.app.state.runtime_registry.get(sandbox_id)
     try:
         reply = await asyncio.to_thread(
             capture_checkpoint_image,
             _registry_workspace_base(request.app.state.runtime_registry, settings),
             ctx,
             sandbox_id,
+            owner_uid=getattr(runtime, "host_uid", None),
         )
     except Exception:  # noqa: BLE001 - see the docstring: the pause proceeds
         logger.warning(
@@ -2765,12 +2796,14 @@ async def _resume_process_tree(
     """
     await _prime_runtime_context(request, sandbox_id)
     ctx = request.app.state.runtimes.get(sandbox_id)
+    runtime = request.app.state.runtime_registry.get(sandbox_id)
     try:
         reply = await asyncio.to_thread(
             resume_sandbox,
             _registry_workspace_base(request.app.state.runtime_registry, settings),
             ctx,
             sandbox_id,
+            owner_uid=getattr(runtime, "host_uid", None),
         )
     except Exception:  # noqa: BLE001 - the resume delivery still succeeds
         logger.warning(
@@ -2868,6 +2901,7 @@ async def agent_checkpoint_sandbox(sandbox_id: str, request: Request) -> Respons
             _registry_workspace_base(request.app.state.runtime_registry, settings),
             ctx,
             sandbox_id,
+            owner_uid=getattr(runtime, "host_uid", None),
         )
     except Exception as exc:  # noqa: BLE001 - reported, never a silent 200
         logger.exception("agent checkpoint failed for sandbox %s", sandbox_id)
@@ -2909,6 +2943,7 @@ async def agent_restore_sandbox(sandbox_id: str, request: Request) -> Response:
             _registry_workspace_base(request.app.state.runtime_registry, settings),
             ctx,
             sandbox_id,
+            owner_uid=getattr(runtime, "host_uid", None),
         )
     except Exception as exc:  # noqa: BLE001 - reported, never a silent 200
         logger.exception("agent restore failed for sandbox %s", sandbox_id)

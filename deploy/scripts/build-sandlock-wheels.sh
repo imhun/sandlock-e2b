@@ -42,8 +42,19 @@ CONTEXT_DIR="${CONTEXT_DIR:-$PWD/tmp/wheel-context}" \
 echo "==> E2B wheel inputs refreshed in wheels/fork/:"
 ls -lh wheels/fork/*.whl
 ls -l  wheels/fork/supervise/*/sandlock-supervise
+ls -l  wheels/fork/restore-stub/*/restore-stub
 if [ ! -f wheels/fork/supervise/x86_64/sandlock-supervise ] \
    || [ ! -f wheels/fork/supervise/aarch64/sandlock-supervise ]; then
     echo "build-sandlock-wheels: supervise binaries missing from wheels/fork/" >&2
+    exit 1
+fi
+# F2b.5b: the restore stub has to travel with the wheel too. Without it the
+# engine refuses every restore with "restore-stub was not built" -- measured on
+# the deployment 2026-09-25, where the stub existed only in the build
+# container's target dir. A wheel build that loses it fails here, not three
+# steps later in a resume.
+if [ ! -f wheels/fork/restore-stub/x86_64/restore-stub ] \
+   || [ ! -f wheels/fork/restore-stub/aarch64/restore-stub ]; then
+    echo "build-sandlock-wheels: restore-stub missing from wheels/fork/" >&2
     exit 1
 fi

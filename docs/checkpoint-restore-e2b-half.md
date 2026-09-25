@@ -30,6 +30,10 @@ checkpoint/restore 补的正是这一段：**把一个正在跑的沙箱写进�
 
 > ⚠ 需求本身仍未确认：仓库里没有任何"用户要这个"的记录，`envd` 至今没碰过这套 API。
 > 本设计按"`pause` 存活"这个最有说服力的形状写；如果最后没人要，停在这里的代价也只是这份文档。
+>
+> **实现已完成（2026-09-25，S2/S3/S4 见 §6）**：能力在 `E2B_PAUSE_CHECKPOINT`
+> 后面，**默认关** —— 打开它才改变 `pause` 的成本与 `resume` 的行为，
+> 这也是"需求未确认"这件事在代码里的形状。
 
 ---
 
@@ -48,6 +52,13 @@ worker 早就把"这个 slot 不认识这个 verb"（旧二进制）当成一种
 （`route_b.py` 里那两处 "an older binary" 注释）。
 
 **这不是纯 E2B 改动，和 `update_network` 当年一样是 fork+E2B 一起动。**
+
+**而且 verb 不够**（2026-09-25 集群实测才发现："2 live children"）：`checkpoint()` 要求
+会话里**恰好一个活着的子进程**，而 route-B 的会话**一定**有一个 M0 ——
+`sandlock-init` 只在主子进程活着时服务 `exec`，而 envd 实例在启动时没有自己的负载，
+所以 slot 用 `PARKING_PROGRAM`（一个自我 SIGSTOP 的 shell）当 M0。于是"用户跑过东西的沙箱"
+永远是 **2 个活子进程**（park + 负载），引擎（正确地）拒绝对它捕获。
+解法是让**只有部署能知道的那句话**说出来：`exclude_main`（见 §6(h)）。
 
 ### (b) blob 的天然位置**不在**磁盘账本里，而"计进账"这句话得说清记到谁头上
 
@@ -230,14 +241,14 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 
 | # | 决策 | 建议 | 理由 |
 |---|---|---|---|
-| D1 | blob 放哪 | `<base>/_runtime/<id>/checkpoint/<gen>.blob` | 沙箱完全无权限；与 record/命令日志同处一个平台目录；跨节点天然可见（共享 NFS） |
-| D2 | 谁拥有 | worker uid（0700 目录），**不是**沙箱的池 uid | blob 是进程内存，可能含凭据；沙箱自己永远不该读到它 |
-| D3 | 配额怎么算 | **记到平台账上，不记进用户的 `diskMB`**：给 `_runtime` 加一条独立的平台账（节点级 + 舰队级），checkpoint 写入前先看它够不够；不够就**拒绝这次 checkpoint 并退回今天的 SIGSTOP**，而不是悄悄吃掉用户的空间 | §1(b)。两边的理由都硬：不计 = checkpoint 变成绕过配额的口子；按用户配额计 = "暂停"把沙箱推过预算，它从此只能读不能写（`EFBIG`/`ENOSPC`），而用户自己的文件一个字节没变 |
-| D4 | 何时 checkpoint | **`pause` 时**，且可配置（`E2B_PAUSE_CHECKPOINT=1`，默认关） | 复用已有的、用户可见的生命周期动词；默认关 = 不改变今天的行为 |
-| D5 | 何时 restore | `resume` 时，**若进程已不在**（worker 重启过）才走恢复；还在就直接解冻 | 恢复是慢路径、且丢连接，不该在正常路径上付这个代价 |
-| D6 | `restore_skipped` 对外 | 恢复结果里带 fd 表；日志 + 文档明说"连接不回来"；**不**假装成功 | §1(c) |
+| D1 | blob 放哪 | ✅ **改为** `<base>/_runtime/.checkpoints/<id>/latest`（`gateway_common.paths.sandbox_checkpoint_dir`）：平台状态下，但**与 `_runtime/<id>` 并列**而不是嵌在里面 | 原设计写成 `_runtime/<id>/checkpoint/`，集群实测（§6(i)）撞死：那个目录是 worker 的 `0700`，而**写图的是沙箱自己的 slot**，它连穿过都做不到。并列之后 store 自己 `0711`（可穿不可列），每个 `<id>` 是那个沙箱的 `0700` |
+| D2 | 谁拥有 | ⚠️ **修正**：目录交给**沙箱自己的池 uid**（0700），不是 worker uid | 原因是同一件事：捕获是**沙箱自己的进程树**做的（route B 下 slot 就是那个 uid），所以"worker uid 拥有、沙箱永远读不到"在捕获路径上不可实现。仍然保住的：别的沙箱读不到（不同 uid + 0700）、不在用户的配额树里、平台仍能量能删。**没保住**：沙箱能读/伪造自己的图（边界分析见 `runtime/checkpoint_store.py` 的模块头）；要彻底关掉得让 slot 把 blob 交给 worker（协议改动，未做） |
+| D3 | 配额怎么算 | ✅ **已做**：记到平台账上，不记进用户的 `diskMB`（`E2B_PLATFORM_DISK_MB`，0=不限；`runtime/platform_disk.py`）；不够就**拒绝这次 checkpoint 并退回今天的 SIGSTOP**，而不是悄悄吃掉用户的空间 | §1(b)。两边的理由都硬：不计 = checkpoint 变成绕过配额的口子；按用户配额计 = "暂停"把沙箱推过预算，它从此只能读不能写（`EFBIG`/`ENOSPC`），而用户自己的文件一个字节没变。§6(d) 是两次检查的形状 |
+| D4 | 何时 checkpoint | ✅ **已做**：`pause` 时（`E2B_PAUSE_CHECKPOINT=1`，默认关），且**在冻结之前** | 复用已有的、用户可见的生命周期动词；默认关 = 不改变今天的行为。顺序不是形式：引擎的捕获自己会 SIGSTOP→SIGCONT 目标子进程，先冻再捕获会把 `pause` 撤销（§6(b)） |
+| D5 | 何时 restore | ✅ **已做**：`resume` 时，**若进程已不在**（worker 重启过）才走恢复；还在就直接解冻，并删掉那张已经过时的图 | 恢复是慢路径、且丢连接，不该在正常路径上付这个代价 |
+| D6 | `restore_skipped` 对外 | ✅ **已做**：恢复结果里带 fd 表（`unrecoveredFds` / `unrecoveredFdCount`），日志逐条列出，文档（本节 + §6(e)）明说"连接不回来"；**不**假装成功 | §1(c) |
 | D7 | 跨节点 | 允许（blob 在共享 NFS 上），但**同内核**是硬前提 | 引擎前提，与架构无关 |
-| D8 | 清理 | 随沙箱 teardown 一起删（`_delete_sandbox_runtime` 已经按 verified target set 删 `_runtime`） | 不新增一条回收路径 |
+| D8 | 清理 | ✅ **已做，但是两条调用**：`_delete_sandbox_runtime` 删 `_runtime/<id>`，**再加** `checkpoint_store.remove_checkpoint_images` 删 `.checkpoints/<id>`（D1 改成并列之后，"删 `_runtime/<id>` 就够"不再成立）；隔离区（`_park_refused_tree`）同样把图搬进隔离区 | 图是平台为一个沙箱持有的最大东西，漏掉它就是把账留给一个没有人认领的目录 |
 | D9 | **恢复后 exec 不可用** | ✅ **已做（2026-09-25，fork `1f41f1a`）**：走 (b) —— 恢复**进会话**，会话继续服务 exec/wait/kill/记账。验收用例 `test_a_child_restored_into_a_session_keeps_the_session_executable`（三条断言：进程在跑、**恢复后仍能 exec**、`children_live` 算上它），`core_lib` 911/0、`test_restore::` 5/0、`test_instance*` 50/0 | 见 §(g) |
 | D10 | **碰加载器只读页的程序恢复后即崩** | ✅ **已修（2026-09-25，fork `e9b8b6c`）**：捕获把 RELRO 段一并 dump；四类形状（`malloc`、vDSO、`fopen`、静态对照）全部恢复，`test_restore` 5/0、`core_lib` 904/0 | §1(e)/(f)。**不再是阻塞项**：这个能力对"真实程序"（python/node/sh）现在成立 |
 
@@ -250,9 +261,9 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 | **S0** | ✅ 修掉守卫用例里过时的架构说法（它仍写着"引擎只支持 x86_64/riscv64、aarch64 要先移植"，而 aarch64 的 S0–S5 2026-09-24 已落地） | 用例文本与代码一致 |
 | **S1a** | ✅ fork：slot 加 `checkpoint` verb（写 blob 到调用方指定的路径）—— fork `e76cb2f`，主仓 pin `82a26df` | fork 的 supervise 相位 **31 passed / 0 failed**，新用例钉住"镜像是引擎格式"与"捕获不是 kill" |
 | **S1b** | ✅ fork：**从镜像起一个 slot**（`Checkpoint::load` → 用镜像里的 policy 起沙箱 → `restore_interactive`），服务 `config`/`stats`/`shutdown`、**按名拒绝 exec**（照 OCI 的既有语义）。不是 verb，是启动模式 | fork `58264eb`，supervise 相位 **32 passed / 0 failed**。用例钉住：恢复出的进程**真的在跑**（计数器继续前进）、`stats.restored` 可辨、`exec` 得到引擎原话、`shutdown` 干净退出、**进程死后报 `Exited` 而不是 `Live`**（僵尸那个 bug 就是这一步量出来的）。**警告**：workload 必须是 §1(e) 那格里"能恢复"的类型 |
-| **S2** | worker：agent 端点 + D1/D2/D8 的落地 + **D3 的平台账与拒绝路径** | 单测：blob 落在 `_runtime`、沙箱读不到、**平台账计入且用户的 `diskMB` 不变**、平台账不够时拒绝而不是写入、teardown 删净 |
-| **S3** | 生命周期：`pause` 写、`resume`（进程不在时）恢复，旗标默认关 | 集群验收：**启一个跑着的沙箱 → 重启 worker → resume → 进程状态还在**（正是今天做不到的那一条）。**验收要连 §1(d) 一起写**：恢复后 `exec` 的行为按 D9 的结论定（(a) 则断言那句按名拒绝，(b) 则断言能继续 exec） |
-| **S4** | `restore_skipped` 的对外语义（D6） | 契约用例 + 文档 |
+| **S2** | ✅ **已完成**：worker：agent 端点（`/checkpoint`、`/restore`）+ D1/D2/D8 的落地 + **D3 的平台账与拒绝路径**（`runtime/checkpoint_store.py`、`runtime/platform_disk.py`、`route_b.RouteBInstance` 的两个 verb 客户端、`executors/sandlock.py` 的两个能力入口） | 单测：blob 落在 `_runtime`、目录 0700 且属主是 worker、沙箱树一个字节不动、**平台账计入且用户的 `diskMB` 不变**、账满时**先拒**（一条 verb 都不发）、写超了**删掉再拒**、refusal 带原因、teardown 删净 —— `tests/unit/test_checkpoint_store.py`（16 条）+ `tests/unit/test_agent_checkpoint_restore.py`（11 条）+ `tests/unit/test_sandlock_executor_route_b.py` 的 6 条 verb 用例 |
+| **S3** | ✅ **代码已完成**：`pause` 先捕获再冻结、`resume` 先解冻/恢复再改状态，`E2B_PAUSE_CHECKPOINT` 默认关 | 单测把两条顺序钉成事实（事件序列 `["executor.capture_checkpoint", "ctx.pause"]` / `["executor.restore_checkpoint", "ctx.resume"]`，`test_agent_checkpoint_restore.py`）。**集群验收见 §6(g)：一半绿一半红** —— 捕获/存储/平台账/worker 重建/恢复调用链全部实测通过，但恢复出来的**动态**程序随后消失（引擎侧的 FUP-30）。**这条能力因此还不能宣布可用** |
+| **S4** | ✅ **已完成**：`restore_skipped` 的对外语义（D6） | `unrecoveredFds` 随 `/restore` 与 `resume` 的结果返回、逐条进日志（用例断言的是**整句**日志文本，不是子串），文档在这一节与 §6(e) 里明说"恢复的沙箱没有原有的网络连接" |
 
 **S1 之前的任何 E2B 侧改动都没有意义**：没有 verb，worker 拿不到 `Sandbox`。
 
@@ -274,3 +285,114 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 * slot 协议：`envd_service/route_b.py`、fork `crates/sandlock-supervise/src/serve.rs`
 * 平台状态目录：`gateway_common/paths.py`（`sandbox_runtime_dir`）
 * 账本口径：`envd_service/runtime/registry.py::disk_usage_snapshot`、`envd_service/runtime/dir_ledger.py`
+
+---
+
+## 6. 实施记录（2026-09-25，S2/S3/S4）
+
+主仓提交 `9ddebc5`；引擎侧在此之前已入库并 pin（fork `57f610c` 及以下）。
+
+### (a) 分层：谁决定什么
+
+| 层 | 落点 | 它决定 |
+|---|---|---|
+| 引擎 | fork `sandlock-supervise` 的 `checkpoint`/`restore` verb | 捕获那个进程、把它恢复成会话的孩子 |
+| 传输 | `route_b.RouteBInstance.capture_checkpoint/restore_checkpoint` | verb 的线上形状；**refusal 原样抛**，由上层判断它是"没有这个能力"还是"这次不行" |
+| 能力 | `executors/sandlock.py::capture_checkpoint/restore_checkpoint` | 把三类"做不了"翻译成**带原因的结果**（`{"captured": false, "reason": ...}`）：中介形态、本机没有活会话、slot 拒绝（含旧 wheel 的 `unknown verb`）。**捕获从不租 slot，恢复一定租** —— 后者正是 (b) 的形状 |
+| 存储/账 | `runtime/checkpoint_store.py` + `runtime/platform_disk.py` | 图放哪、谁付钱、什么时候删、平台账满时怎么拒 |
+| 对外 | `agent.py` 的 `/agent/sandboxes/{id}/checkpoint`、`/restore`，以及 `pause`/`resume` 的接线 | 200 + 数字（无活会话/超账/refusal 都是**正常答案**）、401/404 的投递契约 |
+
+这么分是因为三件事的**归属不同**：捕获属于 slot（进程树在那儿），路径与账属于部署，
+而"pause 该不该因此失败"属于产品 —— 后者的答案是**不**，所以 refusal 一路只带原因，不改状态码。
+
+### (b) 两条顺序，都是承重的
+
+1. **捕获在冻结之前**（`pause`）。引擎的 `SandboxInstance::checkpoint` 自己会
+   `SIGSTOP` 目标子进程、捕获、再 `SIGCONT`（`instance.rs`），所以对一个**已经**被
+   `ProcessManager.pause_all` 停住的沙箱做捕获，收尾的 `SIGCONT` 会把暂停**撤销**：
+   那会变成"pause 了但还在跑"，而且没有任何日志说它发生了。
+2. **恢复在发布状态之前**（`resume`）。反过来做的话，记录已经写 `running`、进程还没回来，
+   期间到达的命令会先落进一个**空会话**。两条顺序都被用例钉成事件序列（不是注释）。
+
+### (c) 一张图，活着的时候只有一张，出门即焚
+
+* 名字固定为 `checkpoint/latest`（不带点：引擎的 `Checkpoint::save` 是
+  `<dir>.tmp` + rename，带扩展名会让临时目录变成别的东西的兄弟）；
+* `pause` 覆盖写（rename 是原子的，捕获到一半不会留下半张图）；
+* **两条 resume 路径都删图**：会话还在 ⇒ 图已经过时（删掉，否则下一次 resume 会把
+  沙箱**倒回**一个更早的进程）；会话不在 ⇒ 图被消费掉。
+
+于是"图存在"这句话的准确含义是：**有一个暂停着的沙箱，它的进程不在任何 worker 上**。
+
+### (d) 平台账：两次检查，中间那一下写是必须付的
+
+图的**大小只能靠写出来才知道**，所以拒绝分两道：
+
+1. **写之前**（`checkpoint_no_room_reason`）：平台账已经满 ⇒ 直接拒，一条 verb 都不发
+   —— 捕获是这个 worker 会写出的最大东西，没地方放就不该先花掉它；
+2. **写之后**（`checkpoint_admission`）：按**实际写出的字节**判定；超了就把图**删掉**再拒
+   （否则字节已经花了，只是没人记账）。
+
+两个方向的错都被排除了：既不会"计到用户头上让暂停变成只读"，也不会"不计而成为绕过配额的口子"。
+唯一的代价是第 2 道之下有一次**短暂的**超账（写完到删掉之间），这是"尺寸不可预知"的必然，
+不是选择。
+
+### (e) `restore_skipped`：说清楚，而不是等第一次 read 炸
+
+socket / pipe / memfd 恢复不了，所以恢复出来的进程**没有它原来的连接**。worker 把引擎的
+这张表原样带出来（`unrecoveredFds` + `unrecoveredFdCount`），并逐条写进日志：
+
+```
+sandbox sbx_x: resumed …/checkpoint/latest into the session (child 7, pid 31337);
+2 fd(s) could not come back (sockets/pipes/memfds):
+[{'fd': 5, 'path': 'socket:[12345]'}, {'fd': 6, 'path': 'pipe:[6789]'}]
+```
+
+**对外一句话**：恢复回来的沙箱**没有原有的网络连接**；长期服务要重新连接，靠旧连接的
+协议会话不会接上。空列表也是一个真实答案（这个进程只持有 stdio）。
+
+### (f) 平台账上报
+
+`_runtime` 的字节数随心跳上到节点视图（`platformDiskUsedMB` / `platformDiskBudgetMB`，
+0 = 不限），测量就在**已有的**那次离循环磁盘轮里做（同一块卷、同一节奏、同一个单飞），
+并把平台账**放在 per-sandbox 走树之前**：后者会失败或超预算，而管着图的这条账不该跟着哑掉。
+worker 上把 per-sandbox 扫描整个关掉（`E2B_DISK_ENFORCE_INTERVAL_S=0`）时它没有账可报 ——
+那种形态本来就没有任何磁盘上报，两个端点的**回复**里仍然带着这两个数。
+
+### (g) 集群验收（`E2B_PAUSE_CHECKPOINT=1`）
+
+验收形状只有一条，正是今天做不到的那条：**启一个跑着的沙箱 → 重启它的 worker → resume →
+进程状态还在，且还能 exec**。除了"进程回来"，第二条断言来自 D9/(b)：恢复的是一个**会话的
+孩子**，所以 `exec` 继续被服务（不是 OCI 那句按名拒绝）。部署记录与实测输出见
+`docs/deploy-clusters.md`。
+
+**2026-09-25 实测：一半绿，一半红，红的那半在引擎里（FUP-30）**。脚本
+`tmp/k0s/checkpoint_acceptance.py`（每步都断言，不是打印）走到：
+
+* ✅ `pause` 写了图，落在**平台的**目录里、**属主是那个沙箱的 uid**（`_runtime/.checkpoints/
+  <id>/latest`，`meta.json` + `policy.dat` + `process/`，422 KiB），沙箱自己的树一个字节没动；
+* ✅ 心跳把平台账报到了节点视图（`platformDiskUsedMB` / `platformDiskBudgetMB` = 0/8192）；
+* ✅ 删掉宿主 worker 的 pod、等它重建并重新注册 → `resume` **成功把镜像恢复进一个新会话**：
+  worker 日志逐字 `resumed … into the session (child 1, pid 30); 4 fd(s) could not come back
+  (sockets/pipes/memfds): [fd 0 pipe, fd 1 pipe, fd 2 pipe, fd 3 pipe]`（D6/S4 的对外语义也在这里
+  得到了真实数据：回来的是 stdio + 一个 pipe，其余都在）；
+* ❌ **被恢复的那个 python 进程几秒后不在 `/proc` 里了**（节点上只剩 worker、slot 的 3 个
+  `sandlock-supervise` 与 park），计数器文件停在 pause 时的值 —— 也就是"恢复了、但没活下来"。
+
+这不是 E2B 的接线问题（接线到"restore 成功返回"为止全都对），而是引擎在**动态程序 + 恢复进
+会话**这个组合上的一件事，已按 fork 的纪律登记为 **FUP-30**（同形 probe 在本机能跑起来、
+但随后 wedge，见 FUP-29）。**所以这条能力现在还不能宣布可用**：E2B 侧全部就位、集群上
+capture/store/账/重启/恢复调用链全部验证过，缺的是引擎把真实程序稳稳恢复回来。
+
+### (i) 集群上现学到的三件事（都是 E2B 侧，2026-09-25）
+
+1. **slot 是沙箱的 uid，不是 worker 的** —— 所以图的目录必须交给那个 uid（D1/D2 的修正）。
+   第一版按设计写成"worker uid + 0700"时，引擎**捕获成功、保存失败**：
+   `checkpoint save failed: process error: io error: Permission denied`。
+2. **`exclude_main`** —— route B 的会话一定有 park 当 M0，所以"用户跑过东西的沙箱"永远是
+   2 个活子进程，引擎（正确地）拒绝盲捕；见 §1(a) 与 fork `da0faf5`。
+3. **restore stub 必须随 wheel 走** —— `build.rs` 把它编译进 *build 容器* 的 `target/`，
+   而 `stub_path()` 用的就是那条路径；装到 worker 上的 wheel 里没有它 ⇒ 每次 resume 都
+   被引擎按名拒绝（`restore-stub was not built`）。修法见 fork `2d5f2e9`（随 wheel 注入
+   `sandlock/bin/restore-stub`，并在 `stub_path()` 里依次认「环境变量 → 构建路径 → 可执行
+   文件旁边」），集群上修复后恢复调用链立刻通。

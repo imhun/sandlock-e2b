@@ -141,7 +141,7 @@ def test_a_capture_lands_in_the_platforms_dir_and_is_billed_to_the_platform(
 
 
 def test_the_image_directory_is_closed_to_the_sandbox(tmp_path: Path) -> None:
-    """D2: 0700 for the worker's uid -- the image holds a process's memory."""
+    """D2: 0700, and no other sandbox can reach it -- the image is memory."""
     base = tmp_path / "sandboxes"
     _sandbox_tree(base, "sbx_store")
 
@@ -151,8 +151,71 @@ def test_the_image_directory_is_closed_to_the_sandbox(tmp_path: Path) -> None:
     mode = stat.S_IMODE(parent.stat().st_mode)
     assert mode == 0o700, f"the checkpoint dir must be 0700, got {oct(mode)}"
     assert parent.stat().st_uid == os.geteuid(), (
-        "and owned by the worker, not by the sandbox's pooled uid"
+        "with no pooled uid to hand it to, it stays the worker's"
     )
+    # The store around it is the *only* thing the slot has to reach through:
+    # traverse, no listing, so one sandbox cannot even enumerate the others.
+    root = parent.parent
+    root_mode = stat.S_IMODE(root.stat().st_mode)
+    assert root_mode == 0o711, f"the store must be 0711, got {oct(root_mode)}"
+
+
+def test_the_image_directory_is_handed_to_the_slot_that_will_write_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The capture runs *as the sandbox*: a root-owned dir makes the save EACCES.
+
+    Measured on the cluster (2026-09-25): the slot is started as the sandbox's
+    pooled uid, so the engine captured the workload and then died writing it
+    ("checkpoint save failed: ... Permission denied"). The worker therefore
+    hands the directory over -- directly as root, through ``e2b-maint``
+    otherwise -- and this pins which uid it names.
+    """
+    from envd_service import priv_helpers
+
+    handed: list[tuple[int, str, bool]] = []
+
+    def record(uid, path, *, recursive=True, gid=None):
+        handed.append((uid, str(path), recursive))
+
+    monkeypatch.setattr(priv_helpers, "broker_chown", record)
+    base = tmp_path / "sandboxes"
+    _sandbox_tree(base, "sbx_store")
+    executor = _FakeExecutor()
+
+    reply = capture_checkpoint_image(
+        base, _ctx(executor), "sbx_store", owner_uid=20001
+    )
+
+    image = checkpoint_image_dir(base, "sbx_store")
+    assert handed == [(20001, str(image.parent), False)]
+    assert reply["captured"] is True, f"a hand-off must not block the capture: {reply}"
+
+
+def test_a_directory_that_cannot_be_handed_over_is_not_captured(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No hand-off, no capture: the save would fail inside the slot anyway."""
+    from envd_service import priv_helpers
+
+    def refuse(uid, path, *, recursive=True, gid=None):
+        raise priv_helpers.PrivHelperError("no brokers on this worker")
+
+    monkeypatch.setattr(priv_helpers, "broker_chown", refuse)
+    base = tmp_path / "sandboxes"
+    _sandbox_tree(base, "sbx_store")
+    executor = _FakeExecutor()
+
+    reply = capture_checkpoint_image(
+        base, _ctx(executor), "sbx_store", owner_uid=20001
+    )
+
+    assert reply["captured"] is False
+    assert reply["reason"] == (
+        "the checkpoint directory could not be handed to the sandbox's uid "
+        "20001: PrivHelperError: no brokers on this worker"
+    )
+    assert executor.captures == [], "nothing may be captured into a dir it cannot write"
 
 
 def test_a_full_platform_account_is_refused_before_anything_is_written(

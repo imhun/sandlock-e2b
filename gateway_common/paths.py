@@ -128,8 +128,11 @@ RUNTIME_DIR_NAME = "_runtime"
 #: The sandbox's command output log (JSONL), written by the worker.
 COMMAND_LOG_NAME = "command-logs.jsonl"
 
-#: Where a sandbox's checkpoint images live, inside its runtime dir.
-CHECKPOINT_DIR_NAME = "checkpoint"
+#: The checkpoint store, **beside** the per-sandbox runtime dirs rather than
+#: inside them (see :func:`sandbox_checkpoint_dir` for why the split exists).
+#: The leading dot keeps it out of the sandbox-id namespace, exactly like
+#: :data:`UNTRUSTED_TREE_DIR`.
+CHECKPOINT_ROOT_NAME = ".checkpoints"
 
 
 def sandbox_runtime_dir(workspace_base: str | Path, sandbox_id: str) -> Path:
@@ -161,19 +164,32 @@ def sandbox_command_log_path(
 
 
 def sandbox_checkpoint_dir(workspace_base: str | Path, sandbox_id: str) -> Path:
-    """``<base>/_runtime/<id>/checkpoint`` -- a sandbox's checkpoint images.
+    """``<base>/_runtime/.checkpoints/<id>`` -- a sandbox's checkpoint images.
 
-    Inside the runtime dir on purpose, and for the same reason the record and the
-    command log are: this is platform state that holds the sandbox's **whole
-    process image**, so the sandbox itself must never be able to read it (see
-    :func:`sandbox_runtime_dir`), while the deployment still needs it across nodes
-    (the base is a shared volume).
+    Platform state, held under ``_runtime`` (never inside the tree the sandbox
+    owns, and on the shared volume so another node can resume it), but as a
+    **sibling** of the runtime dir rather than a child of it. That split is what
+    makes the capture possible at all: the image is written *by the sandbox's own
+    slot* -- route B runs it as the sandbox's pooled uid, and that is the only
+    process that owns the address space being captured -- so the directory has to
+    belong to that uid, while ``_runtime/<id>`` itself holds the runtime record
+    and the command log, which are the worker's own files and stay ``0700``
+    worker-owned (a ``0700`` parent cannot be traversed by the slot, so "images
+    inside the record's directory" would only work by opening the record's
+    directory up).
+
+    The store's own gate is :data:`CHECKPOINT_ROOT_NAME` at ``0711``: traverse,
+    no listing. Each ``<id>`` inside it is ``0700`` for that sandbox's uid, so
+    one sandbox can neither enumerate the store nor read another's image; the
+    worker still measures and removes them (as root, or through ``e2b-maint``).
 
     It is also, deliberately, *outside* the tree the per-sandbox quota measures
     (``<base>/<id>``). That is why it has an account of its own -- see
     :mod:`envd_service.runtime.platform_disk`.
     """
-    return sandbox_runtime_dir(workspace_base, sandbox_id) / CHECKPOINT_DIR_NAME
+    return (
+        Path(workspace_base) / RUNTIME_DIR_NAME / CHECKPOINT_ROOT_NAME / sandbox_id
+    )
 
 #: Where a worker parks a tree it refuses to act on (review W7 / W7-3): such a
 #: tree is never *deleted* (its record may be describing a bind-mounted other

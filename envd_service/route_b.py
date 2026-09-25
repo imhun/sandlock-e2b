@@ -1460,6 +1460,15 @@ class RouteBInstance:
         the deployment's business, so the slot is handed the answer, exactly
         like the ``dir`` of the restore below.
 
+        ``exclude_main`` is always on, and this is the only place that knows
+        why: an envd sandbox's session is launched with :data:`PARKING_PROGRAM`
+        (``sandlock-init`` serves ``exec`` only while its main child lives, and
+        an envd instance has no workload of its own at launch), so the sandbox's
+        workload is the single child *beside* that park. Without it the engine
+        would refuse every sandbox a user has run something in -- correctly, as
+        an image is one address space -- and the refusal is reported back with
+        the engine's own words (see ``executors/sandlock.py``).
+
         A served refusal is raised unchanged, and the caller decides what it
         means: an older ``sandlock-supervise`` whose dispatch has no
         ``checkpoint`` arm refuses the verb the same way it refuses
@@ -1467,7 +1476,7 @@ class RouteBInstance:
         one live child refuses for its own reason. Neither may read as a dead
         slot, so this method never classifies them itself.
         """
-        args: dict[str, str] = {"dir": str(dir)}
+        args: dict[str, object] = {"dir": str(dir), "exclude_main": True}
         if name is not None:
             args["name"] = str(name)
         reply = self.request("checkpoint", args)

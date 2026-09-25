@@ -134,21 +134,37 @@ def test_the_image_path_is_platform_state_the_sandbox_tree_never_contains(tmp_pa
     )
 
 
-def test_teardown_takes_the_images_with_the_runtime_dir(tmp_path: Path) -> None:
-    """What ``_delete_sandbox_runtime`` removes is the whole runtime dir.
+def test_teardown_takes_the_images_too_and_they_are_not_under_the_runtime_dir(
+    tmp_path: Path,
+) -> None:
+    """The teardown's two calls, and why it needs two.
 
-    Stated here because the checkpoint images are the largest thing that lives
-    there: if the teardown ever narrowed to "the record and the log", images would
-    silently outlive the sandboxes they belong to, which is exactly the leak shape
-    the platform/workspace split was built to avoid.
+    Stated here because the checkpoint images are the largest thing the platform
+    holds for a sandbox: if the teardown ever narrowed to "the record and the
+    log", images would silently outlive the sandboxes they belong to, which is
+    exactly the leak shape the platform/workspace split was built to avoid.
+
+    They live *beside* ``_runtime/<id>`` rather than inside it (the sandbox's own
+    slot is what writes them, so they cannot sit under a worker-owned ``0700``
+    dir), which is why the teardown has to remove both -- and why this asserts
+    the pair instead of the old "one rmtree is enough" shape.
     """
     import shutil
+
+    from envd_service.runtime.checkpoint_store import remove_checkpoint_images
 
     base = tmp_path / "sandboxes"
     _sandbox_tree(base, "sbx_a")
     _checkpoint_image(base, "sbx_a")
 
-    # The teardown's own call, verbatim (``agent._delete_sandbox_runtime``).
+    # The teardown's first call, verbatim (``agent._delete_sandbox_runtime``).
     shutil.rmtree(sandbox_runtime_dir(base, "sbx_a"), ignore_errors=True)
+    assert sandbox_checkpoint_dir(base, "sbx_a").exists(), (
+        "the images are not under the runtime dir -- if this ever passes without "
+        "the second call below, the two hierarchies have been merged again"
+    )
 
+    # ...and its second.
+    assert remove_checkpoint_images(base, "sbx_a") is True
     assert not sandbox_checkpoint_dir(base, "sbx_a").exists(), "the images must be gone"
+    assert remove_checkpoint_images(base, "sbx_a") is False, "idempotent"

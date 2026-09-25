@@ -213,6 +213,43 @@ fail closed** 并点出架构名（错的号会伪装成 seccomp 问题，见上
 通过/失败是 547/5、551/1、549/3（基线、暂存了改动）、552/0、537/15，**每次红的用例集合都不同**
 （`popen` / `control` / `freeze` 这类进程呈现与线程通知的用例居多，也见过 `test_chroot::` 整族 15 条
 一起红）。而**每一族单跑都是绿的**（实测 `test_chroot::` 单跑 49/0）。
+
+**B15. checkpoint 落盘踩的两个"形态"坑（2026-09-25，都是同一件事的两个面）。**
+两者都是**只在集群上才会出现**的：本机的 fork 套件要么用静态 helper、要么跑在 root 上。
+
+1. **写图的进程是沙箱自己的 uid，不是 worker 的。** route-B 下 slot 以沙箱的池 uid 跑
+   （实测 `host_uid=10001`，slot 进程 `uid=10001`，worker 是 root）。所以图所在的目录必须能
+   被那个 uid 写：我们第一版按设计写成"worker 0700"（`_runtime/<id>/checkpoint`），结果是
+   引擎**捕获成功、保存失败** `checkpoint save failed: … Permission denied`。
+   现在图放在 `<base>/_runtime/.checkpoints/<id>`（store `0711`、每个 `<id>` 归该沙箱 `0700`），
+   与 runtime 目录**并列**而不是嵌在里面 —— `_runtime/<id>` 本身是 worker 的 `0700`，
+   嵌在里面的话 slot 连穿过去都做不到（除非把 record 所在的目录开出来，而那会让沙箱能读
+   record 里的 access token）。
+2. **park 也算一个活子进程。** 会话的 M0 是 park（`while :; do kill -STOP $$; done`），
+   所以"跑过东西的沙箱"恒有 2 个活子进程，引擎的 `checkpoint()`（正确地）拒绝；
+   部署侧用 `exclude_main` 说明"我的 M0 是 park"（fork `da0faf5`）。
+
+**B16. fork 的构建产物不止 `libsandlock_ffi.so` 与 `sandlock-supervise`：还有 restore-stub。**
+`restore-stub.c` 由 `build.rs` 编译，`stub_path()` 用的是 **build 容器里**的
+`target/…/out/restore-stub`，而 wheel 只装 `.so` 与 supervise ⇒ 装到 worker 上的 wheel
+**没有 stub**，每次 resume 都被引擎按名拒绝：`restore-stub was not built …`（集群实测
+2026-09-25）。修法（fork `2d5f2e9`）：wheel builder 分 arch 暂存 stub、`build-wheels.sh` 把它
+注入成 `sandlock/bin/restore-stub`（与 supervise 同样的 0755 + RECORD 重写 + manifest 行）、
+`sandlock/__init__.py` 把 `SANDLOCK_RESTORE_STUB` 指过去、`stub_path()` 依次认
+「环境变量 → 构建路径 → 可执行文件旁边」。**本机套件抓不到这个**：本机跑的就是构建树，
+`RESTORE_STUB_PATH` 存在。
+
+**B17. 写 fork 的"会话"用例时：一个活着的会话子进程会把 libtest 的输出捕获管道留着，
+整个测试二进制在退出时挂住 —— 看起来完全像引擎卡死。**
+现象（2026-09-25，写 park 形态用例时踩到）：用例主体已经跑完（甚至写了"完成"标记），
+但 `cargo test` 永不返回；容器里 `/proc` 看得到测试进程、slot 与 parked 的 M0，测试主线程停在
+`futex`，另有一个线程停在 `anon_pipe_read`（libtest 的捕获读线程）。原因：会话子进程
+**继承了测试进程的 stdout/stderr**（捕获管道），而 park 既 ignore `TERM` 又处于 `SIGSTOP`，
+所以 `shutdown()` 之外还得显式 `kill_child(0, SIGKILL)`；否则管道永不 EOF、libtest 等不到。
+排查手法：**别信"没有输出"** —— 用 `--nocapture` 跑（捕获关掉，失败信息就直接出来了），
+或者往**文件**里写标记（`std::fs::OpenOptions::append` + `sync_all`），后者在两种模式下都可靠。
+本机这个镜像里容器 pid 1 是 cargo、**不 reap 孤儿**，所以源会话的子进程会留在 `Z` 状态，
+不要把它当成"泄漏"。
 所以它只能当「看方向」，不能当判定；要判定请用规范镜像或 lane，或者按 FUP-09 的纪律
 「留住第一次红的日志 + 单跑那一族」。
 

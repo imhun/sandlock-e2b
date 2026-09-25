@@ -619,7 +619,15 @@ async def test_a_checkpoint_goes_to_the_slot_with_the_workers_own_path(
     await ex.start(_exec_cmd())
 
     reply = ex.capture_checkpoint(image, "latest")
-    assert pool.log[-1] == ("checkpoint", {"dir": image, "name": "latest"}, ())
+    # `exclude_main` rides every capture: this deployment's sessions run a park
+    # as their main child (see `RouteBInstance.capture_checkpoint`), so the
+    # workload is the child beside it. Without the flag the engine refuses a
+    # sandbox with anything running in it.
+    assert pool.log[-1] == (
+        "checkpoint",
+        {"dir": image, "name": "latest", "exclude_main": True},
+        (),
+    )
     assert reply == {
         "captured": True,
         "reason": "",
@@ -634,7 +642,10 @@ async def test_a_checkpoint_goes_to_the_slot_with_the_workers_own_path(
     ex.capture_checkpoint("/var/lib/e2b-sandboxes/_runtime/sbx_route_b/checkpoint/other")
     assert pool.log[-1] == (
         "checkpoint",
-        {"dir": "/var/lib/e2b-sandboxes/_runtime/sbx_route_b/checkpoint/other"},
+        {
+            "dir": "/var/lib/e2b-sandboxes/_runtime/sbx_route_b/checkpoint/other",
+            "exclude_main": True,
+        },
         (),
     )
 

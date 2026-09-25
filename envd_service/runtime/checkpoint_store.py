@@ -4,11 +4,28 @@ The engine's half is done -- a slot writes an image and can resume one into its
 own session (``docs/checkpoint-restore-e2b-half.md`` §(g)) -- so what is left is
 the deployment's half, and it is three decisions in one file.
 
-**Storage (D1/D2).** An image goes to ``<base>/_runtime/<id>/checkpoint/latest``:
-a sibling of the tree the per-sandbox quota measures, created ``0700`` for the
-worker's own uid, exactly like the runtime record next to it. The sandbox has no
-access to that directory at all, which is what makes holding a *process's
-memory* there acceptable -- an image can contain credentials.
+**Storage (D1/D2).** An image goes to ``<base>/_runtime/.checkpoints/<id>/latest``
+(`gateway_common.paths.sandbox_checkpoint_dir`): outside the tree the per-sandbox
+quota measures, inside the platform's ``_runtime``, and -- because the capture is
+performed by the sandbox's own slot -- ``0700`` owned by the **sandbox's own
+uid**. No other sandbox can reach it, and the worker keeps measuring and removing
+it (as root, or through the maintenance broker: ``priv_helpers.dir_size`` /
+``remove_tree``).
+
+**Who can read the image, stated honestly (D2 revised 2026-09-25).** The
+capture is performed *by the sandbox's own process tree* -- under route B the
+slot runs as the sandbox's pooled uid, and that is the only process that owns
+the address space being captured -- so the directory has to be writable by that
+uid. The earlier design said "worker uid, the sandbox never reads it"; that is
+not implementable for the capture path, because the writer *is* the sandbox's
+own identity. What is preserved: (a) another sandbox cannot read or write it
+(different uids, ``0700``), (b) it stays outside the tree the user's quota
+measures, (c) the platform can still measure and delete it. What is *not*
+preserved: the sandbox can read (and forge) its own image. That is bounded --
+the image is its own memory, the forged process would run with the identity it
+already has, and the bytes are accounted for either way -- but it is a real
+weakening, and the way to close it is to have the slot hand the blob *to the
+worker* rather than write it where it sits (a protocol change, not done here).
 
 **The account (D3).** Those bytes are billed to the platform
 (:mod:`envd_service.runtime.platform_disk`), never to the sandbox's ``diskMB``,
@@ -31,7 +48,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 from pathlib import Path
 
 from envd_service.runtime.platform_disk import (
@@ -58,22 +74,63 @@ def checkpoint_image_dir(workspace_base, sandbox_id: str) -> Path:
     return sandbox_checkpoint_dir(workspace_base, sandbox_id) / IMAGE_NAME
 
 
-def _prepare_image_parent(workspace_base, sandbox_id: str) -> Path:
-    """The image path, with a ``0700`` worker-owned parent (see the module doc).
+def _prepare_image_parent(
+    workspace_base, sandbox_id: str, *, owner_uid: int | None
+) -> Path:
+    """The image path, with a ``0700`` parent **the slot can write**.
 
-    Mirrors ``RuntimeRegistry._ensure_runtime_dir`` for the record one level up:
-    the sandbox's own host uid is neither the owner nor in the worker's group,
-    so it cannot traverse in -- not to read an image, and not to unlink one.
+    The directory is created by the worker and then handed to the sandbox's own
+    uid, because that is who writes the image: under route B the slot runs as
+    the sandbox's pooled uid and it is the only process that owns the address
+    space being captured. Without the hand-off the capture itself succeeds and
+    the *save* dies with EACCES -- measured on the cluster (2026-09-25), which
+    is why this is not "the worker's own directory" as the first design said.
+
+    ``owner_uid is None`` means the deployment has no pooled uid (the shared-uid
+    shape): the slot already runs as the worker, so nothing has to move.
     """
     image = checkpoint_image_dir(workspace_base, sandbox_id)
+    root = image.parent.parent
     parent = image.parent
-    parent.mkdir(parents=True, exist_ok=True)
+    # The store's own gate: traversable, not listable, owned by the worker. The
+    # slot has to reach *its* directory through it.
+    root.mkdir(parents=True, exist_ok=True)
     try:
-        os.chmod(parent, 0o700)
-        os.chown(parent, os.geteuid(), os.getegid())
+        os.chmod(root, 0o711)
     except OSError:  # pragma: no cover - best effort, like the modes above
         pass
+    parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(parent, 0o700)
+    owner = os.geteuid() if owner_uid is None else int(owner_uid)
+    if owner != os.geteuid():
+        _hand_to_sandbox(parent, owner)
+    else:
+        try:
+            os.chown(parent, owner, owner)
+        except OSError:  # pragma: no cover - best effort for the no-op case
+            pass
     return image
+
+
+def _hand_to_sandbox(path: Path, uid: int, *, recursive: bool = False) -> None:
+    """Give ``path`` to the pooled uid that will write it (raises on failure).
+
+    Root does it directly; a non-root worker goes through ``e2b-maint``
+    (``CAP_CHOWN``), which is the same broker the rest of the platform uses to
+    move a path between the worker's identity and a sandbox's.
+    """
+    if os.geteuid() == 0:
+        if not recursive:
+            os.chown(path, uid, uid)
+            return
+        os.chown(path, uid, uid)
+        for root, dirs, files in os.walk(path):
+            for entry in (*dirs, *files):
+                os.chown(Path(root) / entry, uid, uid)
+        return
+    from envd_service import priv_helpers
+
+    priv_helpers.broker_chown(uid, path, recursive=recursive)
 
 
 def image_bytes(image: Path) -> int:
@@ -107,7 +164,9 @@ def live_session_present(ctx) -> bool:
     return getattr(holder, "instance_handle", None) is not None
 
 
-def capture_checkpoint_image(workspace_base, ctx, sandbox_id: str) -> dict:
+def capture_checkpoint_image(
+    workspace_base, ctx, sandbox_id: str, *, owner_uid: int | None = None
+) -> dict:
     """Take this sandbox's checkpoint, or say why there is none.
 
     Returns the shape the agent endpoint hands back: ``{"captured": bool,
@@ -134,7 +193,22 @@ def capture_checkpoint_image(workspace_base, ctx, sandbox_id: str) -> dict:
             limit=limit,
         )
 
-    image = _prepare_image_parent(workspace_base, sandbox_id)
+    try:
+        image = _prepare_image_parent(
+            workspace_base, sandbox_id, owner_uid=owner_uid
+        )
+    except Exception as exc:  # noqa: BLE001 - reported as "not captured"
+        # The directory has to belong to the sandbox's uid or the *save* fails
+        # inside the slot (EACCES, measured on the cluster). Saying so here is
+        # better than letting that surface as a generic io error.
+        reason = (
+            "the checkpoint directory could not be handed to the sandbox's "
+            f"uid {owner_uid}: {type(exc).__name__}: {exc}"
+        )
+        logger.warning("sandbox %s: %s", sandbox_id, reason)
+        return _capture_reply(
+            sandbox_id, False, reason, used=used_before, limit=limit
+        )
     holder = _executor_of(ctx)
     capture = getattr(holder, "capture_checkpoint", None)
     if capture is None:
@@ -160,7 +234,7 @@ def capture_checkpoint_image(workspace_base, ctx, sandbox_id: str) -> dict:
         # The account is enforced on what was actually written: the size is only
         # knowable by capturing, so the image is removed again and the sandbox is
         # left exactly as it was found.
-        shutil.rmtree(image, ignore_errors=True)
+        _remove_image(image)
         logger.warning(
             "sandbox %s: checkpoint image of %d MiB refused and removed: %s",
             sandbox_id,
@@ -220,7 +294,9 @@ def _capture_reply(
     return reply
 
 
-def restore_checkpoint_image(workspace_base, ctx, sandbox_id: str) -> dict:
+def restore_checkpoint_image(
+    workspace_base, ctx, sandbox_id: str, *, owner_uid: int | None = None
+) -> dict:
     """Resume this sandbox's image into a session on **this** worker.
 
     The image is *consumed* on success (see the module doc). ``restored: False``
@@ -236,6 +312,26 @@ def restore_checkpoint_image(workspace_base, ctx, sandbox_id: str) -> dict:
             "reason": "no checkpoint image for this sandbox",
             "image": None,
         }
+    if owner_uid is not None:
+        # The resuming slot reads the image as its own uid, so it has to own it.
+        # Normally it already does (the capture ran as the same sandbox uid);
+        # this covers the shapes where it does not -- a record whose uid changed,
+        # or a legacy image taken before pooled uids.
+        try:
+            if image.stat().st_uid != int(owner_uid):
+                _hand_to_sandbox(image, int(owner_uid), recursive=True)
+        except Exception as exc:  # noqa: BLE001 - reported as "not restored"
+            reason = (
+                "the checkpoint image could not be handed to the sandbox's uid "
+                f"{owner_uid}: {type(exc).__name__}: {exc}"
+            )
+            logger.warning("sandbox %s: %s", sandbox_id, reason)
+            return {
+                "sandbox_id": sandbox_id,
+                "restored": False,
+                "reason": reason,
+                "image": str(image),
+            }
     if live_session_present(ctx):
         # Never quietly give a sandbox two processes: resuming an image next to a
         # running session is not what "resume" means, and the lifecycle's thaw
@@ -301,7 +397,7 @@ def restore_checkpoint_image(workspace_base, ctx, sandbox_id: str) -> dict:
         len(skipped),
         skipped if skipped else "none",
     )
-    shutil.rmtree(image, ignore_errors=True)
+    _remove_image(image)
     return {
         "sandbox_id": sandbox_id,
         "restored": True,
@@ -317,6 +413,34 @@ def restore_checkpoint_image(workspace_base, ctx, sandbox_id: str) -> dict:
     }
 
 
+def _remove_image(image: Path) -> None:
+    """Delete one image tree, in-process first and through the broker on EACCES.
+
+    The image is ``0700`` and owned by the sandbox's uid (see the module doc), so
+    a *non-root* worker cannot walk into it: ``priv_helpers.remove_tree`` is the
+    platform's own fallback for exactly that (`e2b-maint`, ``CAP_DAC_OVERRIDE``).
+    A root worker removes it directly.
+    """
+    from envd_service import priv_helpers
+
+    priv_helpers.remove_tree(image)
+
+
+def remove_checkpoint_images(workspace_base, sandbox_id: str) -> bool:
+    """Delete a sandbox's whole image directory; ``True`` if one was there.
+
+    The teardown's and the quarantine's hook: images live *beside* the runtime
+    dir (``_runtime/.checkpoints/<id>``), so removing ``_runtime/<id>`` -- which
+    is what the teardown does, and what it has always done -- would leave them
+    behind. Called from both places that make a sandbox's platform state go away.
+    """
+    store = sandbox_checkpoint_dir(workspace_base, sandbox_id)
+    if not store.is_dir():
+        return False
+    _remove_image(store)
+    return True
+
+
 def consume_checkpoint_image(workspace_base, sandbox_id: str) -> bool:
     """Drop the image of a sandbox whose process is back: ``True`` if one went.
 
@@ -328,11 +452,13 @@ def consume_checkpoint_image(workspace_base, sandbox_id: str) -> bool:
     image = checkpoint_image_dir(workspace_base, sandbox_id)
     if not image.is_dir():
         return False
-    shutil.rmtree(image, ignore_errors=True)
+    _remove_image(image)
     return True
 
 
-def resume_sandbox(workspace_base, ctx, sandbox_id: str) -> dict:
+def resume_sandbox(
+    workspace_base, ctx, sandbox_id: str, *, owner_uid: int | None = None
+) -> dict:
     """The resume half of the lifecycle: thaw what is here, resume what is not.
 
     Both paths end with no image left (D5 + the module doc). A worker that holds
@@ -349,5 +475,7 @@ def resume_sandbox(workspace_base, ctx, sandbox_id: str) -> dict:
             "reason": "",
             "staleImageRemoved": dropped,
         }
-    outcome = restore_checkpoint_image(workspace_base, ctx, sandbox_id)
+    outcome = restore_checkpoint_image(
+        workspace_base, ctx, sandbox_id, owner_uid=owner_uid
+    )
     return {"sandbox_id": sandbox_id, "resumed": True, **outcome}
