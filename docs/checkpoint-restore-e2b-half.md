@@ -108,47 +108,52 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 
 于是 E2B 侧必须先回答一个产品问题（§2 D9），而不是先写代码。
 
-### (e) **实测**：非平凡程序恢复后会崩 —— 引擎自己的覆盖里没有这一格
+### (e) **实测与归因**：用 libc 分配器的程序恢复后即崩 —— 而这条钉在一个具体的机制上
 
-S1b 落地时做判别实验（同一个 slot 路径，只换 workload），结果按 workload 分成两半：
+**先纠正一个我自己写错的框架**：最初记的是"静态能、动态不能"，**这是错的**。
+三个 workload 走**同一个 harness**（同一 policy、同一条代码路径、one-shot `spawn_interactive` + 进程内恢复），
+只换程序：
 
-| workload | 恢复之后 |
+| workload | 结果 |
 |---|---|
-| `tests/rootfs-helper`（静态、`-nostdlib`） | **正常**：计数器继续前进（4 → 8 → 12 …），state=S |
-| `/bin/sleep 60`（动态 glibc） | **正常**：state=S、睡在 `hrtimer_nanosleep`、fd 0-2 齐全 |
-| `/bin/sh`（dash，动态） | **SIGSEGV**：`state=Z exit_code=11`，一次都没跑起来 |
-| `python3`（CPython 3.14） | **SIGSEGV**：同上 |
+| 静态 freestanding helper | **恢复**（对照） |
+| **动态链接、但只用裸 syscall**（不碰 libc 分配器） | **恢复** ⇒ **动态链接本身不是问题** |
+| 动态链接 + libc stdio/堆 | **SIGSEGV**（`state=Z exit_code=11`） |
 
-（`/bin/sh` 那种"循环里 fork `sleep`"和"忙循环不 fork"两种写法**都崩**，所以不是子进程的问题；
-崩溃发生在恢复之后立刻，表现为僵尸 + `exit_code=11`。）
+**随附两条实测**（都在活着的对照上量的）：
+
+* checkpoint 记了堆的**区间**，恢复也把它**映射回来了**（对照进程的 maps 里有那段地址）；
+  但**内核的 program break 没被恢复**——活着的恢复进程**没有 `[heap]` 标签**，而内核只把
+  `[heap]` 贴给 break 所在的那段。
+* 而且**这个不能靠 stub 里调 `brk()` 补**：内核只允许 break 往**上**移（实测直查：把 break 设到
+  初始断点之下，内核**拒绝**并返回旧值），而 stub 链在 3 TiB、workload 的堆远在它下面。
+
+**但这条不足以解释全部，写清楚比讲个漂亮故事重要**：把 malloc 完全赶出 `brk`
+（`mallopt(M_MMAP_THRESHOLD, 1)`，它的 checkpoint 里**压根没有 `[heap]`**）**同样会崩**。
+所以"break 没恢复"是这一片里**一个已证的缺陷**，不是全部；**把剩下的定位出来就是下一步实验**，
+而它决定修法的大小。
 
 **为什么这一格一直没人踩到**：引擎里**每一条** restore 用例用的都是那个静态 freestanding helper
-（`crates/sandlock-core/tests/integration/test_restore.rs` 四处的 `rootfs-helper`），
-FFI 那条也自己编了一个 `-static -nostdlib -no-pie` 的 counter
-（`crates/sandlock-ffi/tests/restore.rs`）。也就是说**"动态/复杂程序能不能恢复"从来没被覆盖过**，
-而现在量到的是：**不能，至少 dash 与 CPython 不能**。
+（core 四处），FFI 那条也自己编了 `-static -nostdlib -no-pie`。也就是说
+**"真实程序能不能恢复"从来没被覆盖过**。缺口已钉成用例
+`test_libc_allocator_workload_restore_is_a_known_gap`（故意断言缺口存在；修好会变红并指向本节）。
 
-**这对本功能意味着什么**：E2B 沙箱里跑的基本都是这类程序（`python`、`node`、各种 CLI、
-用户的脚本）。如果它们恢复即崩，那么"`pause` 活过 worker 重启"对**主要用例**是空的 ——
-能救活的只有极简进程。所以这条比 D9 更要紧：D9 限制的是"恢复后能不能 exec"，这一条限制的是
-**"恢复后那个进程还能不能活"**。
+**沿途排除的解释**（免得后来人重走）：不是动态链接、不是 fork 子进程（shell 两种写法都崩）、
+不是 fd 被 skip（动态 `sleep` 同样 skip 0/1/2 却正常）、不是"恢复本身不工作"（静态与 `sleep` 都工作）、
+不是 slot 路径（引擎原生形态同样崩）、不是 noexec 路线能救（那条**也崩**，但按文档它在"supervisor
+多线程"场景本来就会崩，所以**不作为反证**）。
 
-**归属：是引擎，不是 slot 路径。** 用**同一个 harness、同一个 policy、同一条代码路径**、
-只换 workload 做了判别实验（引擎原生写法：one-shot `spawn_interactive` + 进程内恢复）：
+### (f) 修法方案（按代价从小到大）
 
-```
-dyngap static:  advanced=true   state=S   exit_code=0     <- 对照，照常恢复
-dyngap dynamic: advanced=false  state=Z   exit_code=11    <- 动态 libc 程序，僵尸
-```
+| # | 方案 | 代价 | 判断 |
+|---|---|---|---|
+| **F1** | **先定位剩下的机制**：既然是"用分配器就崩"而不是"用 brk 就崩"，就把 `brk` 之外的那部分找出来（候选：glibc 初始化时用 `sbrk(0)`/`brk(0)` 读到的断点被拿去做 arena 起点、`[heap]` 之外由分配器建的 anon 区、以及 loader 相关状态）。一次实验即可 | 小（一轮实验） | **先做这个**：它决定 F2 是"补一个 field"还是"动投递路线" |
+| **F2** | **让恢复进程的断点地板够低**，使 `brk(heap_end)` 能被接受：把 stub 链到低地址（赌它低于 workload 的堆），或走 noexec（fork 一份 supervisor，它的断点地板本来就是自己的低地址） | 中～大：stub 低链会与"恢复回原地址的 workload 映射"争地盘（STUB_BASE 之所以在 3 TiB 就是为避免这个）；noexec 有自己的不变量要补（fd 表、进程状态敏感） | 只在 F1 证明"补断点就够"时才值得 |
+| **F3** | **CRIU 式：先 exec 程序本身再注入内存**（这样 `start_brk` 就是程序自己的，断点可设） | 大：需要 argv/envp（现在没记）、会重跑程序启动、与"沙箱内受限启动"耦合 | 引擎级重构，不轻动 |
+| **F4** | **接受限制**：只有"不碰分配器"的程序能恢复 | 零 | 对 E2B **等于不交付**（python/node/sh 全是这个形状），所以只在 F1 证明无法修时才作为结论 |
 
-动态那半是个真正用 libc/stdio/heap 的 C 程序（`cc -O0`，非 `-nostdlib`），
-静态对照就是那个 freestanding helper。**对照先断言、缺失即报**，所以"夹具坏了"不会被读成"发现了问题"。
-这条已钉成引擎自己的用例：`crates/sandlock-core/tests/integration/test_restore.rs::
-test_dynamic_libc_restore_is_a_known_gap`（它**故意断言这个缺口存在**：动态恢复一旦能跑，这条会变红，
-提示删掉它和本文这一节）。
-
-**已排除的解释**（免得后来人重走）：不是子进程/fork（两种写法都崩）、不是 fd 被 skip
-（动态 `sleep` 同样 skip 了 0/1/2 却正常）、不是"恢复本身不工作"（静态与 `sleep` 都工作）。
+**对计划的影响**：F1 没出结果之前，S2（worker 侧存储/平台账）做完了也交付不了能用的能力 ——
+所以顺序是 **F1 → 决定 F2/F3/F4 → 再回 S2**。
 
 ---
 
@@ -165,7 +170,7 @@ test_dynamic_libc_restore_is_a_known_gap`（它**故意断言这个缺口存在*
 | D7 | 跨节点 | 允许（blob 在共享 NFS 上），但**同内核**是硬前提 | 引擎前提，与架构无关 |
 | D8 | 清理 | 随沙箱 teardown 一起删（`_delete_sandbox_runtime` 已经按 verified target set 删 `_runtime`） | 不新增一条回收路径 |
 | D9 | **恢复后 exec 不可用，产品上怎么算** | **二选一，需要拍板**：**(a)** 接受"恢复 = 进程回来、不能再 exec"，把它写进对外语义（长驻服务形状够用）；**(b)** 让恢复出来的会话 exec-capable（引擎侧要新做"把 checkpoint 还原进一个带 init 的会话"），代价明显更大 | §1(d)：引擎自己按名拒绝 `exec is not supported on a restored container`。这不是我们能顺手补的缺口，是"恢复一个进程"与"恢复一个可交互的箱子"的区别 |
-| D10 | **动态、用 libc 的程序恢复后即崩**（`/bin/sh`、`python3` 实测 SIGSEGV；静态 helper 与 `/bin/sleep` 正常） | **归属已定：引擎**（§1(e) 的判别实验），下一步是**立项修引擎**还是**接受"只有简单进程能恢复"**。修的话入口在引擎的恢复计划：静态 freestanding 能恢复、动态 libc 不能，指向 loader/映射重建那一块，不是调用方 | §1(e)。**比 D9 更要紧**：D9 限制"恢复后能做什么"，这条限制"恢复后那个进程还活不活"——而 E2B 沙箱跑的基本都是这类程序。缺口已钉成用例 `test_dynamic_libc_restore_is_a_known_gap` |
+| D10 | **用 libc 分配器的程序恢复后即崩**（`/bin/sh`、`python3`、stdio 计数器实测 SIGSEGV；静态 helper、裸 syscall 的动态程序、`/bin/sleep` 正常） | **归属已定：引擎**；**先做 F1（定位 break 之外的机制）**，再按结果在 F2（让断点地板够低）/ F3（CRIU 式）/ F4（接受限制=对 E2B 等于不交付）之间选 | §1(e)。**比 D9 更要紧**：D9 限制"恢复后能做什么"，这条限制"恢复后那个进程还活不活"。已纠正的旧框架：不是"静态 vs 动态"，是"用不用 libc 分配器" |
 
 ---
 
