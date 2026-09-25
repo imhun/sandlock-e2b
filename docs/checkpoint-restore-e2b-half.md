@@ -178,7 +178,21 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
   （断言而非打印）——**这是 (b) 的地基**：它若被内核/策略改动打破，这里先红，
   而不是后来在恢复路径里变成一个说不清的现象。
 * **S1b-impl**：spike 通过就按 1+3 落地（新增请求 + 会话记账），验收沿用现有的恢复用例
-  （`test_restore_*`）+ 一条"恢复之后还能 exec"的会话用例。
+  （`test_restore_*`）+ 一条"恢复之后还能 exec"的会话用例。**分成两步走**：
+  * **① ✅ 已完成（2026-09-25，fork `7f94561`）：摆放规划器**。`init::plan_fd_placements` /
+    `wire_fds` 把 `plan_exec_stdio` 那套（FUP-23 的"先挪到保留区、再在子进程 dup 到目标号"）
+    从"固定 3 个 stdio"泛化成"调用方指定的任意号码集合"，并保留它的两条性质：
+    保留区不可用就退回原号（绝不变差）、身份校验覆盖整组后才动任何 fd。
+    拒绝而不是猜的四条：目标号被另一个描述符占着（子进程的 dup2 会clobber，两个顺序都不安全）、
+    目标号重复/落在保留区、两个数组长度不一致、空集合。单测 5 条，`core_lib` 909/0。
+    **故意是纯增量**：stdio 路径一格未动；两套计划用不同保留区（64 / 80），
+    因为普通 exec 可能与恢复请求同时在飞。
+  * **② 待做**：请求臂 + `spawn` 的"按摆设计划摆放 + 按 fd 执行"（stub 只能
+    `execveat(AT_EMPTY_PATH)`，它在镜像里不存在）；孩子要进子进程表。
+  * **③ 待做**：`SandboxInstance::restore_into_session(cp)` —— 把
+    `sandbox.rs::restore_interactive_with` 的 plan → StubChannel → READY/GO → 写内存
+    接到会话的孩子上（写入端 spike 已证可行），验收＝"在会话里恢复一个 child，
+    然后这个会话还能 exec、且 stats 把它算进去"。
 * 之后才回到 **S2**（worker 侧存储与平台账）——S2 的接线与 (a)/(b) 无关，但 (b) 改的是会话形状，
   先落地能避免 S2 按旧形状写一遍。
 
