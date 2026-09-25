@@ -94,6 +94,51 @@ mount ns**。模拟根形态下沙箱与容器共享 mount ns ⇒ 它们枚举�
 （`chroot_root="/"` 的 identity 翻译）。**过渡期两种形态并存 ⇒ 翻译代码在过渡期不能删**——
 否则关了开关的部署会立刻退回"未拦截即在宿主解析"，那才是真正的放大。
 
+### 4.1 另一条路：按形态分路径（只有**模拟根**走翻译）
+
+既然过渡期不能删代码，那有没有比"等 pure 吃完真根再删"更好的做法？
+有：**不删，改为在真根下让 handler 直接 `Continue`，把翻译留给模拟根。**
+
+先把名字摆正，这是最容易搞错的一处：
+
+| 形态 | 路径中介 | 走翻译吗 |
+|---|---|---|
+| **pure**（无 base image / 无 rootfs） | **没有**（`sandlock.py`：*"auto keeps the pure (no-chroot) shape in-process: it mediates nothing"*） | **不走**——它连中介都不起，正是 N15 那 33 条 `PURE_UNGATED` 的来处 |
+| **chroot + 模拟根**（`E2B_REAL_ROOT=0`） | 全量翻译 | **走** |
+| **chroot + 真根**（生产） | 内核解析；中介只做自己的宿主侧工作 | **也在走**（这才是不该的） |
+
+所以"把 pure 和真根分开、只有 pure 走兜底"这个方向是对的，但**兜底服务的不是 pure，是模拟根的
+那个配置**。
+
+**机制已经存在，不用发明**：`exec` 与 `chdir` 早就按 `ctx.child_is_pivoted(pid)` 分路径
+（`dispatch.rs:1649` / `2797`），真根下直接 `Continue` 把 syscall 交回内核；`getdents`
+更是**无条件** `Continue`（它的注释：fd 已由 open 注入成宿主目录，内核直接列即可）。
+所以这条路是"把已有的做法推广到别的 handler"，不是新机制。
+
+**边界由"宿主侧工作"划，而不是由"是不是只读"划。** 逐 handler 过一遍
+（`/proc` 分支 / 账本 `mark_dirty` / COW / fd 注入），不可放行的是那些**翻译之外还做事**的：
+
+| handler | 为什么不能只 `Continue` |
+|---|---|
+| `open` | COW + 写监控 + fd 注入，三者都在这里 |
+| `write` | 追加记账（N25 的 pushed appends）与 COW |
+| `stat` / `statx` | **沙箱写过的东西必须报 COW 副本的元数据**，内核看到的是原件 |
+| `readlink` / `xattr` / `utimensat` | 同上（COW 视图） |
+| `exec` | 已分路径，但真根下仍要记账（`settle_closed_writes`）与写虚拟 exe |
+| 13 个 `legacy_*` | 大多是薄转发，**但它们是否触达账本要读代码定**，不能靠 grep 断言 |
+
+能放行的候选（读到确认的）：`getcwd`（真根下内核给的 cwd 就是对的）、`statfs`、
+`inotify_add_watch`（历史上那条 OBS 泄露正是因为它在宿主路径空间解析，真根下由内核解析）。
+**注意**：`/proc` 那一路不能靠"这个 handler 没有 /proc 分支"来判断——`/proc` 的目录 fd 是
+在 `open` 里合成的，所以 `getdents`/`statfs` 对 `/proc` 的可见性依赖上游。
+
+**这条路买到什么、买不到什么**（说清楚，免得当成安全改进）：
+
+* **买到**：真根下这些 syscall **不再执行翻译代码** ⇒ 翻译里的 bug 到不了生产；内核直接给答案，
+  省一次中介往返；而且**每个 handler 都可分别验收**，因为 security 套件本来就跑两态
+  （arm64 lane 的 `E2B_REAL_ROOT=0/1` 两份日志）。
+* **买不到**：代码不会变少（两个分支都在）；**安全上也不加分**——那是 S1 已经交付的（§5）。
+
 ---
 
 ## 5. S2 的答案：pure 形态**结构上**吃不了真根 —— 于是 S1 已经把收益交付了
@@ -127,7 +172,7 @@ S2 原本问的是"pure 形态能不能也吃真根"。读了代码，答案是*
 |---|---|---|
 | S1 | ✅ **已完成**：真根成为线上形态，并写进清单（**收益已交付**，见 §5） | `kubectl diff` 为空；两形态对照表（`deploy-clusters.md` §7） |
 | S2 | ✅ **已回答**：pure 形态**结构上**吃不了真根（没有 rootfs 可 pivot）⇒ 枢纽从"让 pure 吃真根"变成"**pure 还要不要存在**" | 结论见 §5，依据是 `context.rs` 的前置与两套生产清单都设了 base image |
-| S3 | 若 S2 的答案是"pure 退役"：删 translation-only 的 handler（先列清单，逐个对上"内核产出的答案与之等价"） | 两形态的 security 套件全绿 + 每条删除都有对应实测 |
+| S3 | **优先走 §4.1 的分路径**：真根下的 handler 改成 `Continue`（沿用 `exec`/`chdir` 已有的 `child_is_pivoted` 判据），翻译只留给模拟根。真正删代码要等 S5 | 每个改动过的 handler 在 `E2B_REAL_ROOT=0/1` 两态下 security 套件全绿；不可放行的那批（`open`/`write`/`stat`/`statx`/`readlink`/`xattr`/`utimensat`）**保持不变**，并在提交信息里写明为什么 |
 | S4 | 账本换观察点（或证明周期扫描足够），再退写拦截 | 磁盘门禁的单测与集群验收不变 |
 | S5 | 真根成为**唯一**形态，模拟那套整体退役。**注意这是代码卫生，不是安全改进**（§5） | 没有 `E2B_REAL_ROOT=0` 也能全绿 |
 
