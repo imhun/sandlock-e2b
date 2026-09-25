@@ -108,52 +108,56 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 
 于是 E2B 侧必须先回答一个产品问题（§2 D9），而不是先写代码。
 
-### (e) **实测与归因**：用 libc 分配器的程序恢复后即崩 —— 而这条钉在一个具体的机制上
+### (e) **根因（已定位）**：加载器写进"只读页"的运行时值，在恢复时丢了
 
-**先纠正一个我自己写错的框架**：最初记的是"静态能、动态不能"，**这是错的**。
-三个 workload 走**同一个 harness**（同一 policy、同一条代码路径、one-shot `spawn_interactive` + 进程内恢复），
-只换程序：
+一开始的症状是"真实程序恢复不了"（slot 自恢复时 `/bin/sh`、`python3` 立刻 SIGSEGV，
+而静态 helper、`/bin/sleep` 正常）。**前面两版框架都是错的，被实验推翻**：
 
-| workload | 结果 |
+* ~~"静态能、动态不能"~~ —— 错：动态链接但不用 libc 机制的程序**能**恢复；
+* ~~"libc 分配器是问题"~~ —— 错：`malloc`/`free` **能**恢复。
+
+真正区分开的是：**这个程序有没有碰"动态加载器在启动时写进只读页"的值**。
+捕获只 dump **可写**（或不可重开）的映射，于是 `PT_GNU_RELRO`
+——加载器存放**重定位后的指针**与 **vDSO 函数缓存**的地方——被留作"从文件重读"，
+而文件里那些位置是 **0**。第一个解引用它的 libc 调用就崩：实测
+`segfault at 300 ... in libc.so.6`，加载到的指针是 NULL，位置在 `clock_gettime` 的 vDSO 路径里。
+
+**一个机制解释两个症状，而且是构造出来的证据、不是论证**：把 RELRO 段在捕获前改成可写
+（这样捕获就会 dump 它）之后，**vDSO 程序能恢复、stdio 程序也能恢复**；同样的两个程序不做这个处理就是僵尸。
+其余机制被逐条钉成"正常"：裸 syscall、普通 libc 调用、`malloc`、`open`/`close`。
+
+| 变体（同一个 harness / policy / 代码路径） | 结果 |
 |---|---|
-| 静态 freestanding helper | **恢复**（对照） |
-| **动态链接、但只用裸 syscall**（不碰 libc 分配器） | **恢复** ⇒ **动态链接本身不是问题** |
-| 动态链接 + libc stdio/堆 | **SIGSEGV**（`state=Z exit_code=11`） |
+| 静态 freestanding helper | 恢复（对照） |
+| `malloc`/`free` | 恢复 |
+| `clock_gettime`（**走 vDSO**） | **僵尸** |
+| 同一个调用走**裸 syscall** | 恢复 |
+| `open`/`close`（libc 包装） | 恢复 |
+| `fopen`/`fclose` | **僵尸** |
+| **上面两个 + 捕获前把 RELRO 改成可写** | **都恢复** |
 
-**随附两条实测**（都在活着的对照上量的）：
+**为什么这一格一直没人踩到**：引擎里每条 restore 用例用的都是静态 freestanding helper
+（core 四处），FFI 那条也自己编了 `-static -nostdlib -no-pie` —— 它们**都不碰 RELRO**。
+缺口与机制钉在同一条用例里：`test_loader_readonly_page_writes_are_lost_on_restore`
+（缺口那两个 case 故意断言失败；修好后会变红并指向本节）。
 
-* checkpoint 记了堆的**区间**，恢复也把它**映射回来了**（对照进程的 maps 里有那段地址）；
-  但**内核的 program break 没被恢复**——活着的恢复进程**没有 `[heap]` 标签**，而内核只把
-  `[heap]` 贴给 break 所在的那段。
-* 而且**这个不能靠 stub 里调 `brk()` 补**：内核只允许 break 往**上**移（实测直查：把 break 设到
-  初始断点之下，内核**拒绝**并返回旧值），而 stub 链在 3 TiB、workload 的堆远在它下面。
+**沿途被排除的解释**（免得后来人重走）：动态链接、fork 子进程、fd 被 skip、
+"恢复本身坏了"、slot 路径、noexec 路线（那条在 supervisor 多线程下本来就已知会崩，**不作为反证**）、
+以及**断点（brk）**——它确实没被恢复（实测：活着的恢复进程没有 `[heap]` 标签；内核只把该标签给 break 范围；
+且内核**拒绝**把 break 移到初始断点之下，所以 stub 路线补不了），但把 malloc 完全赶出 brk 的程序**照样崩**，
+所以它是这一片里的另一个已证缺陷，而**不是**这些崩溃的原因。
 
-**但这条不足以解释全部，写清楚比讲个漂亮故事重要**：把 malloc 完全赶出 `brk`
-（`mallopt(M_MMAP_THRESHOLD, 1)`，它的 checkpoint 里**压根没有 `[heap]`**）**同样会崩**。
-所以"break 没恢复"是这一片里**一个已证的缺陷**，不是全部；**把剩下的定位出来就是下一步实验**，
-而它决定修法的大小。
-
-**为什么这一格一直没人踩到**：引擎里**每一条** restore 用例用的都是那个静态 freestanding helper
-（core 四处），FFI 那条也自己编了 `-static -nostdlib -no-pie`。也就是说
-**"真实程序能不能恢复"从来没被覆盖过**。缺口已钉成用例
-`test_libc_allocator_workload_restore_is_a_known_gap`（故意断言缺口存在；修好会变红并指向本节）。
-
-**沿途排除的解释**（免得后来人重走）：不是动态链接、不是 fork 子进程（shell 两种写法都崩）、
-不是 fd 被 skip（动态 `sleep` 同样 skip 0/1/2 却正常）、不是"恢复本身不工作"（静态与 `sleep` 都工作）、
-不是 slot 路径（引擎原生形态同样崩）、不是 noexec 路线能救（那条**也崩**，但按文档它在"supervisor
-多线程"场景本来就会崩，所以**不作为反证**）。
-
-### (f) 修法方案（按代价从小到大）
+### (f) 修法：把"进程改过的私有文件页"纳入捕获（F1 已给出落点）
 
 | # | 方案 | 代价 | 判断 |
 |---|---|---|---|
-| **F1** | **先定位剩下的机制**：既然是"用分配器就崩"而不是"用 brk 就崩"，就把 `brk` 之外的那部分找出来（候选：glibc 初始化时用 `sbrk(0)`/`brk(0)` 读到的断点被拿去做 arena 起点、`[heap]` 之外由分配器建的 anon 区、以及 loader 相关状态）。一次实验即可 | 小（一轮实验） | **先做这个**：它决定 F2 是"补一个 field"还是"动投递路线" |
-| **F2** | **让恢复进程的断点地板够低**，使 `brk(heap_end)` 能被接受：把 stub 链到低地址（赌它低于 workload 的堆），或走 noexec（fork 一份 supervisor，它的断点地板本来就是自己的低地址） | 中～大：stub 低链会与"恢复回原地址的 workload 映射"争地盘（STUB_BASE 之所以在 3 TiB 就是为避免这个）；noexec 有自己的不变量要补（fd 表、进程状态敏感） | 只在 F1 证明"补断点就够"时才值得 |
-| **F3** | **CRIU 式：先 exec 程序本身再注入内存**（这样 `start_brk` 就是程序自己的，断点可设） | 大：需要 argv/envp（现在没记）、会重跑程序启动、与"沙箱内受限启动"耦合 | 引擎级重构，不轻动 |
-| **F4** | **接受限制**：只有"不碰分配器"的程序能恢复 | 零 | 对 E2B **等于不交付**（python/node/sh 全是这个形状），所以只在 F1 证明无法修时才作为结论 |
+| **F1** | ✅ **已完成**：根因定位（见 §1(e)） | — | 结论：不是结构性墙，而是"捕获了哪些页"的一个具体漏洞 |
+| **F2a** | **只把 RELRO 段纳入 dump**：按每个已加载对象的 `PT_GNU_RELRO`（从 `/proc/<pid>/maps` 找到 r--p 文件段，或读 ELF program headers）把这些页记成"带字节的匿名区"，恢复侧已具备能力（`SRC_ANON` + 步骤 6 的 `mprotect` 收窄） | 小：每对象几 KB；改动集中在 capture 的 `must_dump` 判据与 plan；两态 security 套件可覆盖 | **推荐先做**：实测已证明它足以让 vDSO 与 stdio 两类恢复 |
+| **F2b** | **通用的"软脏页"**：`/proc/pid/clear_refs` + pagemap 找出启动后被写过的私有文件页（CRIU 的做法） | 中：更通用（也覆盖"程序自己 mprotect 后写 .text"这类形状），但要处理 pagemap/软脏的权限与可用性 | 若 F2a 之后仍有别的形状崩，再上这条 |
+| **F3** | **接受限制**：只有不碰加载器运行时状态的程序能恢复 | 零 | 今天等于不交付（python/node/sh 全在这条线上），**F2a 出来前不要选它** |
 
-**对计划的影响**：F1 没出结果之前，S2（worker 侧存储/平台账）做完了也交付不了能用的能力 ——
-所以顺序是 **F1 → 决定 F2/F3/F4 → 再回 S2**。
+**对计划的影响**：这个缺口现在是**小而具体**的引擎修复（不是重构），所以顺序是
+**F2a → 复跑本用例（缺口两个 case 应变红）→ 再回 S2（worker 侧存储/平台账）**。
 
 ---
 
@@ -170,7 +174,7 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 | D7 | 跨节点 | 允许（blob 在共享 NFS 上），但**同内核**是硬前提 | 引擎前提，与架构无关 |
 | D8 | 清理 | 随沙箱 teardown 一起删（`_delete_sandbox_runtime` 已经按 verified target set 删 `_runtime`） | 不新增一条回收路径 |
 | D9 | **恢复后 exec 不可用，产品上怎么算** | **二选一，需要拍板**：**(a)** 接受"恢复 = 进程回来、不能再 exec"，把它写进对外语义（长驻服务形状够用）；**(b)** 让恢复出来的会话 exec-capable（引擎侧要新做"把 checkpoint 还原进一个带 init 的会话"），代价明显更大 | §1(d)：引擎自己按名拒绝 `exec is not supported on a restored container`。这不是我们能顺手补的缺口，是"恢复一个进程"与"恢复一个可交互的箱子"的区别 |
-| D10 | **用 libc 分配器的程序恢复后即崩**（`/bin/sh`、`python3`、stdio 计数器实测 SIGSEGV；静态 helper、裸 syscall 的动态程序、`/bin/sleep` 正常） | **归属已定：引擎**；**先做 F1（定位 break 之外的机制）**，再按结果在 F2（让断点地板够低）/ F3（CRIU 式）/ F4（接受限制=对 E2B 等于不交付）之间选 | §1(e)。**比 D9 更要紧**：D9 限制"恢复后能做什么"，这条限制"恢复后那个进程还活不活"。已纠正的旧框架：不是"静态 vs 动态"，是"用不用 libc 分配器" |
+| D10 | **碰加载器只读页的程序恢复后即崩**（`/bin/sh`、`python3`、vDSO 调用、`fopen` 实测 SIGSEGV；静态 helper、`malloc`、裸 syscall 正常） | **根因已定位，修复小且具体**：捕获要把"进程改过的私有只读文件页"（RELRO）一起 dump —— F2a；F2b 是更通用的软脏页路线 | §1(e)/(f)。**不是结构性墙**：把 RELRO 段在捕获前改成可写（于是被 dump），vDSO 与 stdio 两类**都恢复**（实测）。两个错过的框架已纠正：不是"静态 vs 动态"、也不是"分配器" |
 
 ---
 
