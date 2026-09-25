@@ -384,6 +384,27 @@ worker 上把 per-sandbox 扫描整个关掉（`E2B_DISK_ENFORCE_INTERVAL_S=0`�
 但随后 wedge，见 FUP-29）。**所以这条能力现在还不能宣布可用**：E2B 侧全部就位、集群上
 capture/store/账/重启/恢复调用链全部验证过，缺的是引擎把真实程序稳稳恢复回来。
 
+**2026-09-25 第二轮（同一晚，集群版本 `0.1.0-523-g38fbc30-20260925-204255`）**：
+
+* ✅ **thaw 路径（D5 的常规路径）在集群上完全正确**：`pause` 之后 `Sandbox.connect` 解冻，
+  **同一个进程继续计数**（3 → 4），并且**在同一个会话里 exec 一条命令能拿到输出**
+  （`echo THAWED_OK` → `THAWED_OK\n`）。这正是 FUP-29 追的那条产品形状——它在**线上**是好的；
+  夹具里的 1/3 卡死已被证明是 fork 侧测试用单线程 runtime 的自伤（fork `docs/fork-plan-followups.md`
+  FUP-29 已闭，本机那条断言 5/5 绿）。
+* ❌ **restore 路径仍然不活**，但这次拿到了最硬的证据：让第二段负载（python）**开机第一句**
+  就把自己的 pid 写进 `/home/user/boot2.txt`，并把 stdout/stderr 重定向到文件（stdio 是
+  pipe，恢复时会被 skip，traceback 会丢）。resume 之后：`boot2.txt` **仍是捕获前那个 pid**、
+  `err2.txt`/`out2.txt` 都是空的 ⇒ **被恢复的进程连一行 Python 都没跑到**，死在恢复本身，
+  而不是"跑起来之后被拒"。本轮日志里 skip 的 fd 是 5 个（0/1/2 stdio + 两个 pipe）。
+  本机把这些轴一个个复现都过：**动态**（python）、**真根**（`real_root(true)` + `/usr`/`/bin`/`/lib`/`/etc`
+  挂载）、**pid_ns**、**net_isolation + fd_inject_connect** —— 所以剩下的差别在 route-B/部署侧
+  （image rootfs、worker 交给子进程的额外 pipe fd、slot 向 init 孩子写内存那一段在线上 uid/userns
+  下的真实行为）。下一步：给 restore 路径做一条**落盘 trace**（与引擎已有的
+  `SANLOCK_REALROOT_TRACE` 同形），在集群上跑一次就能定位到"没写进去/没跳转/跳转即崩"哪一段。
+* **写验收脚本要注意的部署语义**：worker 的 `max_concurrent_commands_per_sandbox` 默认 **1**，
+  所以"后台跑着的进程 + 再 exec 一条命令"会排队 30s 然后 429（`command queue timed out`）。
+  这不是 pause 的问题，是部署的并发形状；脚本里要先 `handle.kill()` 再 exec。
+
 ### (i) 集群上现学到的三件事（都是 E2B 侧，2026-09-25）
 
 1. **slot 是沙箱的 uid，不是 worker 的** —— 所以图的目录必须交给那个 uid（D1/D2 的修正）。

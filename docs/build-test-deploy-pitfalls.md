@@ -250,6 +250,19 @@ fail closed** 并点出架构名（错的号会伪装成 seccomp 问题，见上
 或者往**文件**里写标记（`std::fs::OpenOptions::append` + `sync_all`），后者在两种模式下都可靠。
 本机这个镜像里容器 pid 1 是 cargo、**不 reap 孤儿**，所以源会话的子进程会留在 `Z` 状态，
 不要把它当成"泄漏"。
+
+**B18. 写 fork 的"会话"用例时第二个夹具陷阱：`#[tokio::test]` 默认单线程 runtime，
+会饿死沙箱的监督循环。**
+现象（2026-09-25）：用例里"捕获后往同一个会话 exec 一条命令、再读它的 stdout"约 1/3 概率
+卡死（测试主线程停在 `futex`），而同一形状单跑有时又全绿——看着像引擎间歇性 bug。
+真因：`#[tokio::test]` 默认是**单线程** runtime，而 `read_exact_bytes` 是**阻塞**读；
+那一次读占住唯一的线程后，沙箱的通知循环（同一 runtime 里的 task）再也跑不了，
+**被 exec 的孩子的第一次 `write` 得不到应答**，读在等一段永远产不出来的输出。
+`sandlock-supervise` 跑的是多线程 runtime，所以夹具也必须：
+`#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`。改完那条断言连跑 5 次全绿。
+同一个坑还有第二个面：**捕获这类会阻塞线程的调用**同理——单线程 runtime 下派发循环在捕获
+期间根本没机会跑，"冻结窗口里挂起的 fork 通知"那类 bug 就永远复现不出来（我们为此写了
+`test_a_capture_does_not_wedge_a_forking_sibling`，它必须多线程 + 长窗口才稳定红）。
 所以它只能当「看方向」，不能当判定；要判定请用规范镜像或 lane，或者按 FUP-09 的纪律
 「留住第一次红的日志 + 单跑那一族」。
 

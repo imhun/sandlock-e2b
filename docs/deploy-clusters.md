@@ -203,10 +203,13 @@ Calico VXLAN 只能建集群时定）见 `deploy/k8s-k0s/README.md`；集群层�
 
 ## 9. checkpoint/restore 的上线记录（2026-09-25）
 
-**版本**：`0.1.0-522-g7248e71-20260925-185237`（= `deploy/stack/.version`）。这一轮改了三样
+**版本**：`0.1.0-523-g38fbc30-20260925-204255`（= `deploy/stack/.version`）。这一轮改了三样
 东西，所以 rebuild 链条跑了两遍：E2B 侧代码（主仓 `9ddebc5`）、fork 的 `exclude_main`
 （fork `da0faf5`）、fork 的 restore-stub 随 wheel（fork `2d5f2e9`）。整栈同一版本，
 `kubectl diff` 只剩版本行 + worker 的两个新环境变量。
+
+> 当晚又滚过一次（`0.1.0-523`，fork `685301c` + `6367c26`：冻结释放 fork 通知的修复、
+> 以及测试/文档），链条同上：wheel → 镜像 → `apply.sh`。
 
 **worker 上的两个新开关**（写在 `deploy/k8s/worker.yaml`，不是临时 patch）：
 
@@ -236,10 +239,20 @@ Calico VXLAN 只能建集群时定）见 `deploy/k8s-k0s/README.md`；集群层�
 * ✅ 删掉宿主 worker 的 pod → 重建 → 重新注册 → `resume` **把镜像恢复进了一个新会话**
   （worker 日志逐字：`resumed … into the session (child 1, pid 30); 4 fd(s) could not come
   back (sockets/pipes/memfds): [fd 0 pipe, fd 1 pipe, fd 2 pipe, fd 3 pipe]`）。
+* ✅ **thaw 路径（不用重启 worker 的那一半）完全正确**：`pause` → `Sandbox.connect` 解冻后
+  **同一个进程继续计数**（3 → 4），而且**在同一个会话里 exec 能拿到输出**
+  （`echo THAWED_OK` → `THAWED_OK\n`）。FUP-29 追的就是这条形状，线上是好的。
 * ❌ 被恢复的那个 **python 进程几秒后不在 `/proc` 里**（节点上只剩 worker、slot 的 3 个
   `sandlock-supervise` 与 park），计数器文件停在 pause 时的值。
+  当晚又加了 **boot 标记**再量一次：负载开机第一句就把自己的 pid 写进 `boot2.txt`，并把
+  stdio 重定向到文件（stdio 是 pipe，恢复会 skip，traceback 会丢）。resume 之后
+  **`boot2.txt` 仍是捕获前的 pid、`err2.txt`/`out2.txt` 全空** ⇒ 被恢复的进程
+  **连一行 Python 都没跑到**，死在恢复本身。
   ⇒ 这是引擎侧的 **FUP-30**（fork `docs/fork-plan-followups.md`），
   **因此这条能力还没宣布可用**；E2B 侧接线到"恢复调用成功返回"为止全部实测通过。
+* ⚠️ **验收脚本的部署语义**：`max_concurrent_commands_per_sandbox` 默认 **1**，
+  所以"后台进程还在跑 + 再 exec 一条命令"会排队 30 s 然后 429；脚本里先 `handle.kill()`
+  再 exec（`tmp/k0s/checkpoint_acceptance.py` 已按此写）。
 
 **怎么再跑一遍**（密钥从集群里取，不写进仓库）：
 
