@@ -29,6 +29,11 @@ from envd_service.runtime.image_resolver import (
     peek_image_warm,
     resolve_image_rootfs,
 )
+from envd_service.runtime.checkpoint_store import (
+    capture_checkpoint_image,
+    restore_checkpoint_image,
+    resume_sandbox,
+)
 from envd_service.runtime.context import mcp_port_stats as _mcp_port_stats
 from envd_service.uid_pool import (
     align_shared_uid_workspace,
@@ -204,12 +209,38 @@ def _disk_enforce_dirty_enabled() -> bool:
     return env_bool("E2B_DISK_ENFORCE_DIRTY", False)
 
 
+#: MiB, the unit both sides of the platform's checkpoint account are written in.
+_MIB = 1024 * 1024
+
+
+def _measure_platform_account(workspace_base) -> dict[str, int]:
+    """The platform's checkpoint account as heartbeat wire values (S2/D3).
+
+    Two numbers, because a budget without its usage says nothing and usage
+    without a budget reads as "unlimited". ``0`` for the budget is the honest
+    encoding of unlimited (``E2B_PLATFORM_DISK_MB`` defaults to it), not a
+    missing value.
+    """
+    from envd_service.runtime.platform_disk import (
+        measure_platform_disk_bytes,
+        platform_budget_bytes,
+    )
+
+    used = measure_platform_disk_bytes(workspace_base)
+    budget = platform_budget_bytes()
+    return {
+        "platformDiskUsedMB": used // _MIB,
+        "platformDiskBudgetMB": budget // _MIB,
+    }
+
+
 def _heartbeat_usage_payload(
     settings: Settings,
     metrics_provider: Callable[[], dict[str, Any]] | None = None,
     activity_provider: Callable[[], dict[str, float]] | None = None,
     port_provider: Callable[[], dict[str, int]] | None = None,
     disk_report: dict[str, int] | None = None,
+    platform_disk: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Disk usage + quota alerts + MCP port band carried by each heartbeat."""
     payload: dict[str, Any] = {}
@@ -235,6 +266,13 @@ def _heartbeat_usage_payload(
         # what a sandbox was *sold*, so this is the only signal that sees what
         # it actually wrote. Absent when the round found nothing to report.
         payload["sandboxDiskUsage"] = dict(disk_report)
+    if platform_disk:
+        # S2/D3: the platform's own checkpoint account (``E2B_PLATFORM_DISK_MB``,
+        # 0 = unlimited). It is deliberately *not* a per-sandbox number: the
+        # images are the deployment's, billed to nobody's ``diskMB``, and this is
+        # what makes them visible to the control plane instead of invisible.
+        # Absent until the first measurement, exactly like the report above.
+        payload.update(platform_disk)
     if port_provider is not None:
         # N8: the MCP gateway port band (61001-65535, §2.9) is a per-worker
         # resource with a hard ceiling, and both workers now run the same
@@ -1395,6 +1433,14 @@ class NodeAgent:
             os.getenv("E2B_DISK_TRACE", "") or ""
         ).strip().lower() in {"1", "true", "yes", "on"}
         self._disk_report: dict[str, int] = {}
+        #: S2/D3: the platform's own account (checkpoint images under
+        #: ``_runtime``), measured in the same round as the per-sandbox report --
+        #: same volume, same cadence, same single-flight -- and carried by every
+        #: heartbeat in between. Empty until the first round completes, and empty
+        #: forever on a worker that turned the per-sandbox scan off
+        #: (``E2B_DISK_ENFORCE_INTERVAL_S=0``), which has no accounting report at
+        #: all; the endpoints' own replies still carry the numbers there.
+        self._platform_disk_report: dict[str, int] = {}
         self._disk_report_at = 0.0
         #: The scan round in flight, if any (single-flight, like the reconcile
         #: round): the heartbeat reads the last completed report and never
@@ -1515,6 +1561,7 @@ class NodeAgent:
                         self._activity_provider,
                         self._port_provider,
                         self._disk_report_for_heartbeat(),
+                        self._platform_disk_report,
                     ),
                     headers=headers,
                 )
@@ -1580,6 +1627,24 @@ class NodeAgent:
         # cannot turn the heartbeat into a scan storm: the next one waits for
         # the interval either way.
         self._disk_report_at = time.monotonic()
+        # S2/D3: the platform's own account, measured in the same off-loop round.
+        # It answers a different question than the report below -- what the
+        # *deployment* stores (checkpoint images), not what a sandbox wrote -- but
+        # it is the same walk of the same volume, so it belongs to the same
+        # cadence rather than to a timer of its own. Measured first on purpose: a
+        # per-sandbox walk can fail or run out of budget, and the account that
+        # bounds the images must not go silent with it.
+        try:
+            self._platform_disk_report = await asyncio.to_thread(
+                _measure_platform_account,
+                _registry_workspace_base(self._runtime_registry, self._settings),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "platform checkpoint account measurement failed", exc_info=True
+            )
         try:
             report = await asyncio.to_thread(
                 self._disk_provider,
@@ -2601,6 +2666,14 @@ async def _agent_set_paused(
       handed to the record so the refusal text (``state_clause``) can say why.
       An absent body is the ordinary case and means "no reason given", which
       is what a caller's own ``pause()`` produces.
+    * **S3**: with ``E2B_PAUSE_CHECKPOINT=1`` a pause first writes a checkpoint
+      image, so the sandbox's process can outlive this worker, and a resume then
+      either thaws the session that is still here or resumes the image that is
+      not (D5). Both halves are best-effort by construction -- neither a
+      checkpoint that cannot be taken nor an image that cannot be resumed may
+      turn the delivery into something other than the 204 the control plane's
+      push expects. The reasons land in the worker's log, and the standalone
+      ``/checkpoint`` and ``/restore`` endpoints below answer them in full.
     """
     settings = request.app.state.settings
     try:
@@ -2611,6 +2684,16 @@ async def _agent_set_paused(
     if runtime is None:
         return Response(status_code=404)
     reason = await _pause_reason_from_body(request)
+    # D4/D5: capture *before* the freeze, resume *before* the thaw is published.
+    # The ordering is not cosmetic: the engine's capture stops the target child
+    # and resumes it when it is done, so capturing a sandbox this worker had
+    # already SIGSTOPped would release it again (a "pause" that quietly keeps
+    # running), and a resume that published "running" before the image was back
+    # would let a command run in an empty session first.
+    if paused and settings.pause_checkpoint:
+        await _checkpoint_before_pause(settings, request, sandbox_id)
+    elif not paused:
+        await _resume_process_tree(settings, request, sandbox_id)
     # The freeze/thaw itself rides the registry's state callback
     # (``create_app`` wires ``set_state`` -> ``ctx.pause()/resume()`` for a live
     # context), so the state and the effect cannot diverge -- calling
@@ -2626,6 +2709,98 @@ async def _agent_set_paused(
         "live context" if ctx is not None else "no live context",
     )
     return Response(status_code=204)
+
+
+async def _checkpoint_before_pause(
+    settings: Settings, request: Request, sandbox_id: str
+) -> None:
+    """Take the image a later resume needs; never fail the pause over it (S3/D4).
+
+    Off the event loop on purpose: a capture is a native call plus the sandbox's
+    whole memory written to a network-backed volume, and stalling this worker's
+    heartbeats for that would be exactly the N32 shape.
+    """
+    ctx = request.app.state.runtimes.get(sandbox_id)
+    try:
+        reply = await asyncio.to_thread(
+            capture_checkpoint_image,
+            _registry_workspace_base(request.app.state.runtime_registry, settings),
+            ctx,
+            sandbox_id,
+        )
+    except Exception:  # noqa: BLE001 - see the docstring: the pause proceeds
+        logger.warning(
+            "pause of sandbox %s could not take a checkpoint; it is frozen in "
+            "place exactly as before",
+            sandbox_id,
+            exc_info=True,
+        )
+        return
+    if reply.get("captured"):
+        logger.info(
+            "pause of sandbox %s wrote checkpoint %s (%s MiB, pid %s)",
+            sandbox_id,
+            reply.get("image"),
+            reply.get("imageMB"),
+            reply.get("pid"),
+        )
+    else:
+        logger.info(
+            "pause of sandbox %s holds no checkpoint: %s",
+            sandbox_id,
+            reply.get("reason"),
+        )
+
+
+async def _resume_process_tree(
+    settings: Settings, request: Request, sandbox_id: str
+) -> None:
+    """Thaw the session that is here, resume the image that is not (S3/D5).
+
+    Priming the runtime context first is what makes a resume after a *worker
+    restart* possible at all: the worker that comes up has no context for a
+    sandbox the control plane paused on the worker that went away. Priming
+    builds no session by itself (the executor's instance is lazy), so this stays
+    cheap for the ordinary thaw of a sandbox that never moved.
+    """
+    await _prime_runtime_context(request, sandbox_id)
+    ctx = request.app.state.runtimes.get(sandbox_id)
+    try:
+        reply = await asyncio.to_thread(
+            resume_sandbox,
+            _registry_workspace_base(request.app.state.runtime_registry, settings),
+            ctx,
+            sandbox_id,
+        )
+    except Exception:  # noqa: BLE001 - the resume delivery still succeeds
+        logger.warning(
+            "resume of sandbox %s could not bring its process back from the "
+            "checkpoint; it is running with an empty process tree",
+            sandbox_id,
+            exc_info=True,
+        )
+        return
+    if reply.get("restored"):
+        logger.info(
+            "resume of sandbox %s resumed image %s into the session (pid %s); "
+            "%s fd(s) could not come back",
+            sandbox_id,
+            reply.get("image"),
+            reply.get("pid"),
+            reply.get("unrecoveredFdCount"),
+        )
+    elif reply.get("staleImageRemoved"):
+        logger.info(
+            "resume of sandbox %s dropped the checkpoint image its live session "
+            "made stale",
+            sandbox_id,
+        )
+    else:
+        logger.info(
+            "resume of sandbox %s had no image to resume (%s)",
+            sandbox_id,
+            reply.get("reason") or "nothing was checkpointed",
+        )
 
 
 async def _pause_reason_from_body(request: Request) -> str | None:
@@ -2654,6 +2829,93 @@ async def agent_pause_sandbox(sandbox_id: str, request: Request) -> Response:
 async def agent_resume_sandbox(sandbox_id: str, request: Request) -> Response:
     """Thaw the sandbox's paused exec child groups on this worker."""
     return await _agent_set_paused(request, sandbox_id, paused=False)
+
+
+@router.post("/agent/sandboxes/{sandbox_id}/checkpoint")
+async def agent_checkpoint_sandbox(sandbox_id: str, request: Request) -> Response:
+    """Write this sandbox's checkpoint image on this worker (S2/D1-D3).
+
+    Where the engine and the deployment meet: the capture itself happens in the
+    sandbox's slot (its process tree belongs there), while the path, the
+    ownership and the account the bytes are billed to are this worker's -- see
+    :mod:`envd_service.runtime.checkpoint_store`.
+
+    Contract, same delivery shape as the pause/resume pushes:
+
+    * 401 without the internal key; 404 when this worker has no record of the
+      sandbox (there is nothing to capture and nothing to bill).
+    * 200 with ``captured: true`` and the image path, pid, fd count and the
+      platform account's numbers, or ``captured: false`` **with a reason**:
+      over the platform's checkpoint account, no live session on this worker,
+      an executor with no checkpoint verb, or a slot that refused (a session
+      with more than one live child, an older ``sandlock-supervise``). A refusal
+      is a normal answer -- the sandbox is left exactly as it was found, which
+      for a pause means frozen in place, today's behaviour.
+    * 500 only for an unexpected failure, with the reason in the body.
+    """
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    runtime = request.app.state.runtime_registry.get(sandbox_id)
+    if runtime is None:
+        return Response(status_code=404)
+    ctx = request.app.state.runtimes.get(sandbox_id)
+    try:
+        reply = await asyncio.to_thread(
+            capture_checkpoint_image,
+            _registry_workspace_base(request.app.state.runtime_registry, settings),
+            ctx,
+            sandbox_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, never a silent 200
+        logger.exception("agent checkpoint failed for sandbox %s", sandbox_id)
+        return Response(
+            status_code=500, content=f"{type(exc).__name__}: {exc}"[:500]
+        )
+    return JSONResponse(reply)
+
+
+@router.post("/agent/sandboxes/{sandbox_id}/restore")
+async def agent_restore_sandbox(sandbox_id: str, request: Request) -> Response:
+    """Resume this sandbox's checkpoint image into a session on this worker (S2/S4).
+
+    The image is consumed on success, and the reply carries the engine's own
+    ``unrecoveredFds`` list: a restored process has no sockets, pipes or memfds
+    left, so "what could not come back" is part of the result rather than
+    something a caller infers from the first failed read (D6).
+
+    A worker that already holds a live session for this sandbox refuses
+    (``restored: false``), because resuming an image next to a running process
+    would quietly give the sandbox two of them; the resume lifecycle thaws in
+    that case instead (see :func:`_resume_process_tree`).
+    """
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    runtime = request.app.state.runtime_registry.get(sandbox_id)
+    if runtime is None:
+        return Response(status_code=404)
+    # A worker that has just come up has no context yet, and the restore is
+    # exactly the case that needs one.
+    await _prime_runtime_context(request, sandbox_id)
+    ctx = request.app.state.runtimes.get(sandbox_id)
+    try:
+        reply = await asyncio.to_thread(
+            restore_checkpoint_image,
+            _registry_workspace_base(request.app.state.runtime_registry, settings),
+            ctx,
+            sandbox_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, never a silent 200
+        logger.exception("agent restore failed for sandbox %s", sandbox_id)
+        return Response(
+            status_code=500, content=f"{type(exc).__name__}: {exc}"[:500]
+        )
+    return JSONResponse(reply)
 
 
 @router.get("/agent/images/{image:path}/warm")

@@ -592,6 +592,161 @@ async def test_network_update_goes_to_the_slot_and_logs_staleness(
     assert "stale_child_count=1" in caplog.text
 
 
+# ------------------------------------------------- checkpoint / restore verbs
+
+
+async def test_a_checkpoint_goes_to_the_slot_with_the_workers_own_path(
+    monkeypatch,
+) -> None:
+    """S1a/S2: the capture happens in the slot, the *path* is the deployment's.
+
+    The image is the sandbox's whole process, so the write has to happen where
+    the process tree lives (the slot); where those bytes land -- and whose
+    account they are billed to -- is the worker's business, so it is handed the
+    answer rather than the policy.
+    """
+    ROOTFS.mkdir(parents=True, exist_ok=True)
+    pool = FakePool()
+    image = "/var/lib/e2b-sandboxes/_runtime/sbx_route_b/checkpoint/latest"
+    pool.replies["checkpoint"] = {
+        "dir": image,
+        "name": "latest",
+        "pid": 5100,
+        "fds": 4,
+    }
+    monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
+    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    await ex.start(_exec_cmd())
+
+    reply = ex.capture_checkpoint(image, "latest")
+    assert pool.log[-1] == ("checkpoint", {"dir": image, "name": "latest"}, ())
+    assert reply == {
+        "captured": True,
+        "reason": "",
+        "dir": image,
+        "name": "latest",
+        "pid": 5100,
+        "fds": 4,
+    }
+
+    # No name means no `name` field at all: the slot's own default is the
+    # image's business, not something this side spells out.
+    ex.capture_checkpoint("/var/lib/e2b-sandboxes/_runtime/sbx_route_b/checkpoint/other")
+    assert pool.log[-1] == (
+        "checkpoint",
+        {"dir": "/var/lib/e2b-sandboxes/_runtime/sbx_route_b/checkpoint/other"},
+        (),
+    )
+
+
+def test_a_capture_without_a_live_session_leases_nothing_to_find_out(
+    monkeypatch,
+) -> None:
+    """A capture is not a reason to start a session -- there is nothing in it."""
+    ROOTFS.mkdir(parents=True, exist_ok=True)
+    pool = FakePool()
+    monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
+    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+
+    reply = ex.capture_checkpoint("/var/lib/e2b-sandboxes/_runtime/x/checkpoint/latest")
+
+    assert reply == {
+        "captured": False,
+        "reason": "no live session on this worker to capture",
+    }
+    assert pool.acquire_calls == []
+    assert pool.log == []
+
+
+async def test_a_refused_capture_carries_the_slots_own_words(monkeypatch) -> None:
+    """A session with several live children refuses, and the reason survives.
+
+    The refusal must not read as a dead slot (the executor rebuilds those), and
+    it must not be swallowed either: the caller keeps pausing the sandbox in
+    place, and the reason is what says why there is no image.
+    """
+    ROOTFS.mkdir(parents=True, exist_ok=True)
+    pool = FakePool()
+    pool.replies["checkpoint"] = rb.SandboxError(
+        "checkpoint requires exactly one live child, found 2"
+    )
+    monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
+    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    await ex.start(_exec_cmd())
+
+    reply = ex.capture_checkpoint("/var/lib/e2b-sandboxes/_runtime/x/checkpoint/latest")
+
+    assert reply == {
+        "captured": False,
+        "reason": "checkpoint requires exactly one live child, found 2",
+    }
+
+
+def test_the_in_process_mediator_cannot_capture_and_says_which_shape_it_is(
+    monkeypatch,
+) -> None:
+    """No slot owns the process tree, so no verb can reach it (T5's shape)."""
+    ROOTFS.mkdir(parents=True, exist_ok=True)
+    ex = _executor(monkeypatch, route_b=None)
+
+    reply = ex.capture_checkpoint("/var/lib/e2b-sandboxes/_runtime/x/checkpoint/latest")
+
+    assert reply == {
+        "captured": False,
+        "reason": (
+            "this worker runs the in-process mediator; the sandbox's process "
+            "tree is not in a slot, so no checkpoint verb can reach it"
+        ),
+    }
+
+
+async def test_a_restore_leases_the_session_and_hands_over_the_image(monkeypatch) -> None:
+    """The pooled shape: lease a slot, *then* tell it what to bring back.
+
+    Creating the session is part of the job -- the image is resumed as a child of
+    it, which is what keeps ``exec`` working afterwards ((b)/D9).
+    """
+    ROOTFS.mkdir(parents=True, exist_ok=True)
+    pool = FakePool()
+    image = "/var/lib/e2b-sandboxes/_runtime/sbx_route_b/checkpoint/latest"
+    pool.replies["restore"] = {
+        "dir": image,
+        "child_id": 5,
+        "pid": 1234,
+        "restore_skipped": [{"fd": 7, "path": "socket:[9]"}],
+    }
+    monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
+    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+
+    reply = ex.restore_checkpoint(image)
+
+    assert [c["sandbox_id"] for c in pool.acquire_calls] == ["sbx_route_b"]
+    assert pool.log[-1] == ("restore", {"dir": image}, ())
+    assert reply == {
+        "restored": True,
+        "reason": "",
+        "dir": image,
+        "child_id": 5,
+        "pid": 1234,
+        "restore_skipped": [{"fd": 7, "path": "socket:[9]"}],
+    }
+
+
+async def test_a_restore_a_slot_does_not_know_is_reported_not_crashed(
+    monkeypatch,
+) -> None:
+    """An older wheel says ``unknown verb``; the caller carries on from it."""
+    ROOTFS.mkdir(parents=True, exist_ok=True)
+    pool = FakePool()
+    pool.replies["restore"] = rb.SandboxError("unknown verb: restore")
+    monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
+    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+
+    reply = ex.restore_checkpoint("/var/lib/e2b-sandboxes/_runtime/x/checkpoint/latest")
+
+    assert reply == {"restored": False, "reason": "unknown verb: restore"}
+
+
 def test_in_process_chroot_shape_is_disclosed(monkeypatch, caplog) -> None:
     """Losing the tier must not turn into a cryptic create failure.
 

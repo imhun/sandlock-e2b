@@ -1450,6 +1450,46 @@ class RouteBInstance:
             return None
         return [str(d) for d in dirs], bool(payload.get("overflow"))
 
+    def capture_checkpoint(self, dir: str, name: str | None = None) -> dict:
+        """Ask the slot to write a checkpoint image of its live session into ``dir``.
+
+        The capture has to happen *there*: the sandbox's process tree belongs
+        to this slot, so no other process can take it (the ``checkpoint`` arm
+        of ``sandlock-supervise``). The **path is the caller's**, not the
+        slot's -- storage, ownership and the account an image is billed to are
+        the deployment's business, so the slot is handed the answer, exactly
+        like the ``dir`` of the restore below.
+
+        A served refusal is raised unchanged, and the caller decides what it
+        means: an older ``sandlock-supervise`` whose dispatch has no
+        ``checkpoint`` arm refuses the verb the same way it refuses
+        ``dirty_dirs`` (a capability answer), while a session with more than
+        one live child refuses for its own reason. Neither may read as a dead
+        slot, so this method never classifies them itself.
+        """
+        args: dict[str, str] = {"dir": str(dir)}
+        if name is not None:
+            args["name"] = str(name)
+        reply = self.request("checkpoint", args)
+        return reply if isinstance(reply, dict) else {}
+
+    def restore_checkpoint(self, dir: str) -> dict:
+        """Ask the slot to resume the image in ``dir`` into its own session.
+
+        This is the pooled shape: the worker leases a slot the usual way and
+        *then* tells it what to bring back, rather than starting a slot per
+        image. It matters because a **session** is what serves ``exec`` -- a
+        resume that produced the supervisor's own child could never be exec'd
+        into again (see ``docs/checkpoint-restore-e2b-half.md`` §(g)).
+
+        The reply carries the engine's own honesty about the image: sockets,
+        pipes and memfds do not come back. A caller that has to tell a user
+        "your connections will not return" reads that list here instead of
+        inferring it.
+        """
+        reply = self.request("restore", {"dir": str(dir)})
+        return reply if isinstance(reply, dict) else {}
+
     def exec(
         self,
         cmd,

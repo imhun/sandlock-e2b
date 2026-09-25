@@ -35,6 +35,13 @@ class NodeRecord:
     #: an operator watches is ``mcp_ports_in_use / mcp_ports_capacity``.
     mcp_ports_in_use: int = 0
     mcp_ports_capacity: int = 0
+    #: S2/D3: the platform's **checkpoint account** as this node sees it --
+    #: everything under the shared ``_runtime`` (checkpoint images), billed to
+    #: nobody's ``diskMB`` and bounded by ``E2B_PLATFORM_DISK_MB`` on the workers.
+    #: ``budget`` of 0 is unlimited, so the pair is read as usage-of-budget the
+    #: same way the MCP band is.
+    platform_disk_used_mb: int = 0
+    platform_disk_budget_mb: int = 0
     reserved_memory_mb: int = 0
     reserved_cpu_percent: int = 0
     reserved_disk_mb: int = 0
@@ -94,6 +101,8 @@ class NodeRecord:
         disk_error_count: int | None = None,
         mcp_ports_in_use: int | None = None,
         mcp_ports_capacity: int | None = None,
+        platform_disk_used_mb: int | None = None,
+        platform_disk_budget_mb: int | None = None,
     ) -> None:
         """Store the worker heartbeat's disk/quota usage snapshot."""
         if used_disk_mb is not None:
@@ -116,6 +125,10 @@ class NodeRecord:
             self.mcp_ports_in_use = int(mcp_ports_in_use)
         if mcp_ports_capacity is not None:
             self.mcp_ports_capacity = int(mcp_ports_capacity)
+        if platform_disk_used_mb is not None:
+            self.platform_disk_used_mb = int(platform_disk_used_mb)
+        if platform_disk_budget_mb is not None:
+            self.platform_disk_budget_mb = int(platform_disk_budget_mb)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -140,6 +153,8 @@ class NodeRecord:
             "quotaNearLimitCount": self.quota_near_limit_count,
             "mcpPortsInUse": self.mcp_ports_in_use,
             "mcpPortsCapacity": self.mcp_ports_capacity,
+            "platformDiskUsedMB": self.platform_disk_used_mb,
+            "platformDiskBudgetMB": self.platform_disk_budget_mb,
             "totalProcesses": self.total_processes,
             "reservedProcesses": self.reserved_processes,
             "draining": self.draining,

@@ -90,3 +90,28 @@ def checkpoint_admission(
         limit=limit_bytes // _MIB,
         used=used // _MIB,
     )
+
+
+def checkpoint_no_room_reason(
+    *, used_bytes: int, limit_bytes: int | None = None
+) -> str | None:
+    """The sentence for "the account is already full", or ``None`` when it is not.
+
+    Separate from :func:`checkpoint_admission` because it is asked *before* a
+    capture can be started: an image's size is only knowable by writing it, so a
+    fleet with no room left at all must refuse on the number it already has
+    rather than spend a whole capture to learn the same thing. ``None`` means
+    "there is room to try" -- the real admission still runs on what was written.
+    """
+    if limit_bytes is None:
+        limit_bytes = platform_budget_bytes()
+    if limit_bytes <= 0:
+        return None
+    used = max(0, int(used_bytes))
+    if used < limit_bytes:
+        return None
+    return (
+        "the platform's checkpoint account is already full: {used} MiB held of "
+        "its {limit} MiB budget, so no image can be taken; the sandbox is left "
+        "paused in place instead of spending the user's disk"
+    ).format(used=used // _MIB, limit=limit_bytes // _MIB)

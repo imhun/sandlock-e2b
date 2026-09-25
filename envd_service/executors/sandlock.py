@@ -40,6 +40,7 @@ from envd_service.uid_pool import (
 from envd_service.route_b import (
     RouteBConfig,
     RouteBInstance,
+    SandboxError,
     SlotDeadError,
     supervise_policy_document,
     slot_pool_for,
@@ -1085,6 +1086,103 @@ class SandlockExecutor(Executor):
                 exc_info=True,
             )
             return None
+
+    def capture_checkpoint(self, dir: str, name: str | None = None) -> dict:
+        """Write a checkpoint image of this sandbox's live session into ``dir``.
+
+        Returns the outcome shape the worker's checkpoint endpoint reports:
+        ``{"captured": bool, "reason": str, ...}``. A ``False`` always carries
+        *why*, because a checkpoint is an **offer**: every caller (a pause, an
+        operator) keeps doing exactly what it did before this feature existed,
+        so "not captured" has to be sayable instead of inferred from silence.
+
+        The three ways to get ``False`` are all capability answers rather than
+        failures:
+
+        * the in-process mediator -- no slot owns the process tree, so there is
+          nothing a verb could reach (the shape T5 exists for);
+        * no live session on this worker: nothing was launched, or the
+          generation went away with the worker it ran on;
+        * the slot refused -- an older ``sandlock-supervise`` with no
+          ``checkpoint`` arm, or a session whose live-child count is not exactly
+          one. The engine's own sentence is carried through verbatim.
+        """
+        if not self._route_b_active:
+            return {
+                "captured": False,
+                "reason": (
+                    "this worker runs the in-process mediator; the sandbox's "
+                    "process tree is not in a slot, so no checkpoint verb can "
+                    "reach it"
+                ),
+            }
+        instance = self._instance
+        if instance is None:
+            return {
+                "captured": False,
+                "reason": "no live session on this worker to capture",
+            }
+        try:
+            reply = instance.capture_checkpoint(dir, name)
+        except (SandboxError, SlotDeadError) as exc:
+            logger.info(
+                "checkpoint refused for sandbox %s: %s",
+                self._sandbox_id or "-",
+                exc,
+            )
+            return {"captured": False, "reason": str(exc)}
+        outcome: dict = {"captured": True, "reason": ""}
+        for key in ("dir", "name", "pid", "fds"):
+            if key in reply:
+                outcome[key] = reply[key]
+        return outcome
+
+    def restore_checkpoint(self, dir: str) -> dict:
+        """Resume the image in ``dir`` into this sandbox's session on this worker.
+
+        The session is **created** here when there is none: the pooled shape is
+        "lease a slot, then tell it what to bring back", and the fork's restore
+        arm attaches the resumed process to a launched session -- which is
+        exactly what keeps ``exec`` working afterwards (D9/(b) in
+        ``docs/checkpoint-restore-e2b-half.md`` §(g)).
+
+        Returns ``{"restored": bool, "reason": str, ...}``; on success the
+        engine's ``restore_skipped`` fd list rides along, because a restored
+        process has **no** sockets, pipes or memfds left and a caller that
+        cannot say so would report a sandbox that looks fine until its first
+        read (D6).
+        """
+        if not self._route_b_active:
+            return {
+                "restored": False,
+                "reason": (
+                    "this worker runs the in-process mediator; there is no slot "
+                    "whose session a checkpoint could be resumed into"
+                ),
+            }
+        try:
+            instance = self._ensure_instance()
+        except Exception as exc:  # noqa: BLE001 - a slot that will not come up
+            logger.warning(
+                "restore: could not launch a session for sandbox %s",
+                self._sandbox_id or "-",
+                exc_info=True,
+            )
+            return {"restored": False, "reason": f"{type(exc).__name__}: {exc}"}
+        try:
+            reply = instance.restore_checkpoint(dir)
+        except (SandboxError, SlotDeadError) as exc:
+            logger.warning(
+                "restore refused for sandbox %s: %s",
+                self._sandbox_id or "-",
+                exc,
+            )
+            return {"restored": False, "reason": str(exc)}
+        outcome: dict = {"restored": True, "reason": ""}
+        for key in ("dir", "child_id", "pid", "restore_skipped"):
+            if key in reply:
+                outcome[key] = reply[key]
+        return outcome
 
     def _on_slot_event(self, event: dict) -> None:
         """Handle one pushed slot event (N25)."""

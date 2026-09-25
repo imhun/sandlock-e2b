@@ -297,6 +297,21 @@ class Settings:
     disk_exec_limit: bool = field(
         default_factory=lambda: _env_bool("E2B_DISK_EXEC_LIMIT", False)
     )
+    # S3/D4 (`docs/checkpoint-restore-e2b-half.md`): a `pause` writes a
+    # checkpoint image, so the sandbox's **process** outlives this worker, and a
+    # `resume` either thaws the session that is still here or resumes the image
+    # that is not. **Off by default**: it changes what a pause costs and what a
+    # resume does, and it only works where the fork's `checkpoint`/`restore`
+    # slot verbs are present (a wheel older than fork `57f610c` answers
+    # "unknown verb", which the worker reports and carries on from).
+    #
+    # The flag gates **writing** an image, not reading one: a resume follows the
+    # artifact, so an image taken while the flag was on is still resumed after
+    # the flag is turned off -- otherwise flipping the knob would strand every
+    # sandbox that is already paused.
+    pause_checkpoint: bool = field(
+        default_factory=lambda: _env_bool("E2B_PAUSE_CHECKPOINT", False)
+    )
     # N25: there is deliberately no floor under that ceiling. Over budget the
     # ceiling is zero -- no write, and no new entry (the mediator refuses the
     # operations a ceiling cannot reach with ENOSPC) -- while reads, exec and

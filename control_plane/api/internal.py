@@ -103,6 +103,8 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
         disk_error_count=body.get("diskErrorCount"),
         mcp_ports_in_use=body.get("mcpPortsInUse"),
         mcp_ports_capacity=body.get("mcpPortsCapacity"),
+        platform_disk_used_mb=body.get("platformDiskUsedMB"),
+        platform_disk_budget_mb=body.get("platformDiskBudgetMB"),
     )
     activity = body.get("sandboxActivity")
     if activity is not None and not isinstance(activity, dict):

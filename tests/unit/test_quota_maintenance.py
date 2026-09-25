@@ -32,7 +32,7 @@ from envd_service.xfs_quota import (
     project_quota_table,
     reconcile_orphan_projects,
 )
-from gateway_common.paths import is_sandbox_workspace_dir
+from gateway_common.paths import is_sandbox_workspace_dir, sandbox_checkpoint_dir
 
 MOUNT = "/srv/sandboxes"
 
@@ -1274,6 +1274,53 @@ def test_heartbeat_usage_payload_survives_a_broken_port_provider(
     assert payload == {"diskUsedMB": 0, "diskTotalMB": 0}
 
 
+def test_heartbeat_usage_payload_carries_the_platform_checkpoint_account(
+    monkeypatch, tmp_path
+) -> None:
+    """S2/D3: the deployment's checkpoint bytes are visible on the node view.
+
+    The images are billed to the platform, not to any sandbox's ``diskMB``, so
+    the node view is the only place they can be read from -- and the pair is
+    what makes the account auditable: usage against its budget, where ``0`` for
+    the budget is the honest encoding of unlimited.
+    """
+    monkeypatch.setattr(
+        agent.shutil,
+        "disk_usage",
+        lambda _path: _DiskUsage(used=1, total=1000),
+    )
+    payload = agent._heartbeat_usage_payload(
+        EnvdSettings(workspace_base=tmp_path),
+        None,
+        None,
+        None,
+        None,
+        {"platformDiskUsedMB": 512, "platformDiskBudgetMB": 4096},
+    )
+    assert payload == {
+        "diskUsedMB": 0,
+        "diskTotalMB": 0,
+        "platformDiskUsedMB": 512,
+        "platformDiskBudgetMB": 4096,
+    }
+
+
+def test_measuring_the_platform_account_walks_the_runtime_dir(
+    tmp_path, monkeypatch
+) -> None:
+    """The number is the account's own arithmetic, in MiB, with its budget."""
+    monkeypatch.setenv("E2B_PLATFORM_DISK_MB", "7")
+    base = tmp_path / "sandboxes"
+    image = sandbox_checkpoint_dir(base, "sbx_platform") / "latest"
+    image.mkdir(parents=True)
+    (image / "memory.bin").write_bytes(b"m" * (2 * 1024 * 1024))
+
+    assert agent._measure_platform_account(base) == {
+        "platformDiskUsedMB": 2,
+        "platformDiskBudgetMB": 7,
+    }
+
+
 def test_node_record_update_usage_exposed_in_to_dict():
     registry = NodeRegistry()
     record = registry.register(
@@ -1295,6 +1342,8 @@ def test_node_record_update_usage_exposed_in_to_dict():
         disk_error_count=3,
         mcp_ports_in_use=7,
         mcp_ports_capacity=4535,
+        platform_disk_used_mb=512,
+        platform_disk_budget_mb=4096,
     )
     data = record.to_dict()
     assert data["usedDiskMB"] == 1234
@@ -1309,6 +1358,9 @@ def test_node_record_update_usage_exposed_in_to_dict():
     # where the fleet-wide (per-node) watermark is read from.
     assert data["mcpPortsInUse"] == 7
     assert data["mcpPortsCapacity"] == 4535
+    # S2/D3: the platform's checkpoint account rides the same snapshot.
+    assert data["platformDiskUsedMB"] == 512
+    assert data["platformDiskBudgetMB"] == 4096
 
 
 async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
@@ -1347,6 +1399,8 @@ async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
                 "diskErrorCount": 2,
                 "mcpPortsInUse": 7,
                 "mcpPortsCapacity": 4535,
+                "platformDiskUsedMB": 512,
+                "platformDiskBudgetMB": 4096,
             },
         )
         assert response.status_code == 204
@@ -1361,8 +1415,13 @@ async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
         assert record.disk_error_count == 2
         assert record.mcp_ports_in_use == 7
         assert record.mcp_ports_capacity == 4535
+        assert record.platform_disk_used_mb == 512
+        assert record.platform_disk_budget_mb == 4096
         # ...and the node view the operator reads carries the watermark.
         assert control.state.nodes.get(node_id).to_dict()["mcpPortsInUse"] == 7
+        assert (
+            control.state.nodes.get(node_id).to_dict()["platformDiskUsedMB"] == 512
+        )
 
 
 # ------------------------------------------------------------- app lifespan

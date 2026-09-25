@@ -25,11 +25,12 @@ all three, `restore-stub.c` has a `__aarch64__` branch, and `build.rs` made a
 missing stub *fatal* on those targets instead of a warning. So the aarch64 fleet
 the product actually runs on can host the feature.
 
-What still blocks it is E2B's half, and the design now exists:
-`docs/checkpoint-restore-e2b-half.md`. It also records the one piece that turns
-out not to be E2B-side -- under route B the `Sandbox` lives inside the slot
-process, so a `checkpoint`/`restore` *verb* has to exist before any worker-side
-code can call anything (the `update_network` verb went the same way).
+E2B's half is built now (S2/S3/S4 in `docs/checkpoint-restore-e2b-half.md`):
+the images live in the platform's own runtime dir and account, `pause` writes
+one and `resume` thaws-or-resumes, and `restore_skipped` is reported rather than
+swallowed. This scan is what keeps the *shape* of that half from drifting back:
+every path goes through the slot's verbs, and the worker never calls the fork's
+bindings in process.
 
 Text scan on purpose: it is the call sites, not the behaviour, that must stay
 absent, and a grep-shaped assertion is what makes "we re-checked" durable.
@@ -41,12 +42,19 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 
-#: Call sites, not vocabulary. `.checkpoint(` is the binding's shape (a call on a
-#: sandbox object); the other two are the engine-side names a caller would have to
-#: touch to do any of this in-process. The bare words "checkpoint" and "restore"
-#: are deliberately absent: the E2B half legitimately talks about images, and the
-#: uid-pool lifecycle legitimately says "restored sandboxes".
-FORBIDDEN = (".checkpoint(", "restore_interactive", "restore_skipped")
+#: Call sites, not vocabulary -- and each needle is the *binding* shape, i.e. an
+#: attribute access on a sandbox/instance object.
+#:
+#: ``.checkpoint(`` and ``.restore_skipped(`` are methods on the wheel's
+#: ``Sandbox``/``SandboxInstance`` (``sandlock-core/src/instance.rs``), and
+#: ``restore_interactive`` is the engine's other restore entry point. The bare
+#: words, spelled without the dot, are deliberately **not** matched: the E2B half
+#: has its own vocabulary now -- ``checkpoint``/``restore`` are the *slot verbs*
+#: it is supposed to call, ``restore_skipped`` is the wire key of the restore
+#: reply it is supposed to read (``route_b.RouteBInstance``), and the uid-pool
+#: lifecycle legitimately says "restored sandboxes". Matching those would make
+#: the guard fire on exactly the shape it exists to require.
+FORBIDDEN = (".checkpoint(", "restore_interactive", ".restore_skipped(")
 
 
 def test_no_worker_source_calls_the_fork_checkpoint_restore_api() -> None:
