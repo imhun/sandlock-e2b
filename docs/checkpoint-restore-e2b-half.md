@@ -1,0 +1,113 @@
+# E2B 侧的 checkpoint/restore：设计
+
+守卫用例（`tests/unit/test_checkpoint_restore_unused.py`）挡着的就是这一份：
+**引擎能用了，但 E2B 这一半没设计。** 本文把它设计出来，并把方案里
+"看起来能做、其实做不了"的三处先钉住（§1）。
+
+---
+
+## 0. 这个能力在产品上是什么
+
+今天 `pause` 的实现是**冻结进程组**（`ProcessManager.pause_all` → SIGSTOP，
+worker 侧 `_agent_set_paused`）。所以：
+
+* 进程活在 **worker 的内存里**，只在它的 worker 还活着时存在；
+* worker 滚动重启 / 节点掉线 ⇒ 沙箱的进程没了（文件还在，`_runtime` 与树都在共享 NFS 上）；
+* `/sandboxes` 里的沙箱能"跨 worker 迁移"（`deployment_smoke` 验的就是这条），
+  但那迁移的是**文件**，不是**正在跑的进程**。
+
+checkpoint/restore 补的正是这一段：**把一个正在跑的沙箱写进磁盘、之后再恢复**——
+包括它的 worker 已经不在了的时候。因为 workspace base 是共享 NFS，
+"之后"可以是同一个 worker、也可以是另一个节点。
+
+**所以这个能力的产品形状是：`pause` 变得能在 worker 重启后存活。**
+（不是新造一个用户可见的动词；E2B SDK 的 `pause()`/`connect()` 已经有位置放它。）
+
+> ⚠ 需求本身仍未确认：仓库里没有任何"用户要这个"的记录，`envd` 至今没碰过这套 API。
+> 本设计按"`pause` 存活"这个最有说服力的形状写；如果最后没人要，停在这里的代价也只是这份文档。
+
+---
+
+## 1. 三个把方案钉死的事实
+
+### (a) `Sandbox` 活在 slot 进程里 ⇒ **必须先加一个 slot verb**
+
+生产是 route B：真正的 `Sandbox` 句柄在 `sandlock-supervise` 那个独立进程里，
+worker 的 python 只是通过 socket 上的 verb 跟它说话
+（`envd_service/route_b.py`，verb 有 `run`/`exec`/`wait_child`/`kill_child`/
+`update_network`/`shutdown`，分发在 fork 的 `crates/sandlock-supervise/src/serve.rs:922`）。
+
+所以"E2B 自己那一半"这个说法**不完整**：`checkpoint()` 是 `Sandbox` 上的方法，
+worker 调不到它，得先有一条 verb。好消息是加 verb 是安全的——未知 verb 会被干净拒绝，
+worker 早就把"这个 slot 不认识这个 verb"（旧二进制）当成一种正常情况处理
+（`route_b.py` 里那两处 "an older binary" 注释）。
+
+**这不是纯 E2B 改动，和 `update_network` 当年一样是 fork+E2B 一起动。**
+
+### (b) blob 的天然位置**不在**磁盘账本里
+
+进程内存的落点不能是 workspace——那是 guest 可读的。天然的、也是唯一干净的位置是
+`gateway_common/paths.py` 的 `sandbox_runtime_dir()`：`<base>/_runtime/<id>`，
+注释写着 *"the sandbox has no access at all"*。
+
+**但它不在账本里。** 磁盘账本量的是 `record.workspace_dir`（`<base>/<id>`），
+`_runtime/<id>` 是它的**兄弟目录**（`registry.py::disk_usage_snapshot` 逐 `workspace_dir` 走）。
+今天这不要紧（那里只有一个 record 和一个 JSONL 命令日志）；checkpoint blob 是**整个进程的内存**，
+量级完全不同 ⇒ **一个沙箱可以靠反复 checkpoint 无限放大自己的磁盘占用而不被配额看见。**
+这是必须先解决的一件事，不是实现细节。
+
+### (c) `restore_skipped` 是一条**语义选择**，不是缺陷
+
+socket / pipe / memfd 恢复不了（引擎固有边界，与架构无关）。恢复出来的进程
+**不会有它原来的连接**。这必须被明确表达给调用方，而不是让沙箱静默地"看起来恢复正常、
+然后第一次 read/write 才炸"。引擎已经把它列出来了（`restore_skipped` 的 fd 表，
+`test_restore.rs` 断言"只有 stdio"），所以 E2B 侧要做的是**把它作为恢复结果的一部分**
+返回/记录，并在文档里说清"恢复的沙箱没有原有的网络连接"。
+
+---
+
+## 2. 决策点与建议
+
+| # | 决策 | 建议 | 理由 |
+|---|---|---|---|
+| D1 | blob 放哪 | `<base>/_runtime/<id>/checkpoint/<gen>.blob` | 沙箱完全无权限；与 record/命令日志同处一个平台目录；跨节点天然可见（共享 NFS） |
+| D2 | 谁拥有 | worker uid（0700 目录），**不是**沙箱的池 uid | blob 是进程内存，可能含凭据；沙箱自己永远不该读到它 |
+| D3 | 配额怎么算 | **必须计入**：给 `_runtime/<id>` 加一条独立的账（node 级 + 沙箱级） | §1(b)；不做的后果是 checkpoint 变成绕过配额的口子 |
+| D4 | 何时 checkpoint | **`pause` 时**，且可配置（`E2B_PAUSE_CHECKPOINT=1`，默认关） | 复用已有的、用户可见的生命周期动词；默认关 = 不改变今天的行为 |
+| D5 | 何时 restore | `resume` 时，**若进程已不在**（worker 重启过）才走恢复；还在就直接解冻 | 恢复是慢路径、且丢连接，不该在正常路径上付这个代价 |
+| D6 | `restore_skipped` 对外 | 恢复结果里带 fd 表；日志 + 文档明说"连接不回来"；**不**假装成功 | §1(c) |
+| D7 | 跨节点 | 允许（blob 在共享 NFS 上），但**同内核**是硬前提 | 引擎前提，与架构无关 |
+| D8 | 清理 | 随沙箱 teardown 一起删（`_delete_sandbox_runtime` 已经按 verified target set 删 `_runtime`） | 不新增一条回收路径 |
+
+---
+
+## 3. 阶段（每阶段独立验收，S0 已完成）
+
+| 阶段 | 做什么 | 验收 |
+|---|---|---|
+| **S0** | ✅ 修掉守卫用例里过时的架构说法（它仍写着"引擎只支持 x86_64/riscv64、aarch64 要先移植"，而 aarch64 的 S0–S5 2026-09-24 已落地） | 用例文本与代码一致 |
+| **S1** | fork：slot 加 `checkpoint` verb（写 blob 到调用方指定的路径）与 `restore`（按 policy 起 slot 并恢复） | fork 的 supervise 相位有新用例；旧 client 对未知 verb 的行为不变 |
+| **S2** | worker：agent 端点 + D1/D2/D8 的落地 + **D3 的账** | 单测：blob 落在 `_runtime`、沙箱读不到、账本计入、teardown 删净 |
+| **S3** | 生命周期：`pause` 写、`resume`（进程不在时）恢复，旗标默认关 | 集群验收：**启一个跑着的沙箱 → 重启 worker → resume → 进程状态还在**（正是今天做不到的那一条） |
+| **S4** | `restore_skipped` 的对外语义（D6） | 契约用例 + 文档 |
+
+**S1 之前的任何 E2B 侧改动都没有意义**：没有 verb，worker 拿不到 `Sandbox`。
+
+---
+
+## 4. 明确不做
+
+* **不做跨内核恢复**：同内核是引擎前提（捕获的是这台内核的地址空间布局）。跨内核要重做引擎，不在这个能力的范围里。
+* **不做"自动迁移正在跑的沙箱"**：blob 在共享 NFS 上让这条路技术上可行，但那是调度器的活，
+  且要先把 §2 全部落地。留给以后按需评估。
+* **不改 `pause` 今天的行为**（旗标默认关）：S3 之前，pause 仍只是 SIGSTOP。
+
+---
+
+## 5. 出处
+
+* 引擎与两种根形态：`docs/chroot-workspace-exec.md` §9.7.9、§11（A 方案 `a6f6b04`）
+* 当前守卫：`tests/unit/test_checkpoint_restore_unused.py`
+* slot 协议：`envd_service/route_b.py`、fork `crates/sandlock-supervise/src/serve.rs`
+* 平台状态目录：`gateway_common/paths.py`（`sandbox_runtime_dir`）
+* 账本口径：`envd_service/runtime/registry.py::disk_usage_snapshot`、`envd_service/runtime/dir_ledger.py`

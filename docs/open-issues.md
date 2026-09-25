@@ -31,6 +31,7 @@
 | N31③ | NAS `FileCountLimit`（条目数硬限） | **不做** | 被"不引云 API"否掉；条目数记账/目录块口径已落地 | backlog N31 行 |
 | N26③④ | uid 审计、NAS 权限组确认、卷切片 projid 归属 | **不做（带触发）** | 触发：③ 出现第二个挂载该卷的信任域；④ 换 NAS/换挂载用户；projid 接上支持 per-sandbox 配额的存储时 | backlog N26 行 |
 | N34 | 直接跑 core_integ 二进制时 stdio 必须是管道（否则 restore 用例红） | **不是缺陷**（排查提醒） | — | backlog N34 行；fork `scripts/test-all.sh` 的 `run()` |
+| checkpoint/restore | **E2B 侧那一半**（引擎已就绪：fork `a6f6b04` 的 fd 投递 + aarch64 移植 S0–S5）——镜像存储/属主/配额/清理、pause/resume 生命周期、`restore_skipped` 语义 | **待做（已设计，2026-09-25）** | 按 `docs/checkpoint-restore-e2b-half.md` 的 S1→S4 走：**S0 已做**（修掉守卫用例里过时的"引擎只支持 x86_64/riscv64"）；S1 = fork 给 slot 加 `checkpoint`/`restore` verb（未知 verb 会被干净拒绝，所以加 verb 向后兼容）；S2 = blob 落 `_runtime/<id>/` + **把 `_runtime` 纳入账本**（否则 checkpoint 是绕过配额的口子）；S3 = `pause` 写、`resume` 恢复（进程已不在时），旗标默认关；S4 = `restore_skipped` 对外语义。**注意**：设计发现这不是纯 E2B 改动——route B 下 `Sandbox` 活在 slot 进程里。**需求仍未确认**（仓库无使用者记录） | `docs/checkpoint-restore-e2b-half.md`；守卫 `tests/unit/test_checkpoint_restore_unused.py` |
 
 ## 二、fork（`third_party/sandlock`）
 

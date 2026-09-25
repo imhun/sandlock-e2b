@@ -15,12 +15,17 @@ sandbox's connections do not either. Nothing in the worker calls the API today;
 if that changes, this test fails and points at the checklist in
 `docs/chroot-workspace-exec.md` §9.7.9 / §11.6.
 
-**And one architecture precondition**: the restore *engine* supports x86_64 and
-riscv64 only -- `restore_interactive` refuses anything else before it starts, the
-stub has no aarch64 branch, and `build.rs` treats a missing stub as a warning off
-those architectures (so the wheel ships aarch64 happily). The A delivery change is
-arch-neutral, so a deployment on aarch64 needs the engine port first
-(`docs/chroot-workspace-exec.md` §11.7 lists it), not a different delivery route.
+**The architecture precondition is met** -- it was not when this scan was written.
+The engine now covers x86_64, aarch64 and riscv64: `restore_interactive` accepts
+all three, `restore-stub.c` has a `__aarch64__` branch, and `build.rs` made a
+missing stub *fatal* on those targets instead of a warning. So the aarch64 fleet
+the product actually runs on can host the feature.
+
+What still blocks it is E2B's half, and the design now exists:
+`docs/checkpoint-restore-e2b-half.md`. It also records the one piece that turns
+out not to be E2B-side -- under route B the `Sandbox` lives inside the slot
+process, so a `checkpoint`/`restore` *verb* has to exist before any worker-side
+code can call anything (the `update_network` verb went the same way).
 
 Text scan on purpose: it is the call sites, not the behaviour, that must stay
 absent, and a grep-shaped assertion is what makes "we re-checked" durable.
@@ -50,6 +55,7 @@ def test_no_worker_source_calls_the_fork_checkpoint_restore_api() -> None:
         "a chroot/real root now, but the E2B half is not designed yet (image "
         "storage/ownership/quota, pause/resume lifecycle, and what a sandbox does "
         "when its sockets come back as `restore_skipped`) -- see "
-        "docs/chroot-workspace-exec.md §9.7.9 and §11.6: "
+        "docs/checkpoint-restore-e2b-half.md (design) and "
+        "docs/chroot-workspace-exec.md §9.7.9 / §11.6 (engine): "
         + ", ".join(offenders)
     )
