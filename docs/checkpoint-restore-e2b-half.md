@@ -187,7 +187,7 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
     目标号重复/落在保留区、两个数组长度不一致、空集合。单测 5 条，`core_lib` 909/0。
     **故意是纯增量**：stdio 路径一格未动；两套计划用不同保留区（64 / 80），
     因为普通 exec 可能与恢复请求同时在飞。
-  * **② 进行中**：两块机制已落地并各有测试 ——
+  * **② ✅ 已完成**：两块机制 + 投递面全部落地 ——
     * ✅ **按 fd 执行**（fork `bf60b5d`）：`init::exec_at_fd` = `execveat(fd, "", argv, envp,
       AT_EMPTY_PATH)`，让会话的孩子能跑一个**只以描述符存在**的程序（stub 是宿主产物、
       不在镜像的路径空间里，所以只能这样投递）。失败纪律照抄 execvp 那条：**errno 只读一次**、
@@ -196,10 +196,19 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
       —— 会变成沙箱内的 abort 而不是错误）。
     * ⏳ **还差**：把"摆放计划"接进 `spawn`（给 `spawn` 一个携带 placements + exec_fd 的规格；
       三个调用点：RunMain / RunExec / launch-first）、加 `Req` 臂，并让孩子进子进程表。
-  * **③ 待做**：`SandboxInstance::restore_into_session(cp)` —— 把
-    `sandbox.rs::restore_interactive_with` 的 plan → StubChannel → READY/GO → 写内存
-    接到会话的孩子上（写入端 spike 已证可行），验收＝"在会话里恢复一个 child，
-    然后这个会话还能 exec、且 stats 把它算进去"。
+    ✅ **已做**：`SpawnSpec`（by_path / placed 两种构造）、`Req::RunPlacedExec`、
+    `spawn` 里按计划摆放 + 按 fd 执行、孩子以 `ChildKind::ExecAttach` 进会话表。
+  * **③ ✅ 已完成**：`SandboxInstance::restore_into_session(cp)` —— 同一套 plan / StubChannel /
+    `finish_restore`，只把孩子交给会话的 init 生（`Req::RunPlacedExec`），再按会话子进程登记。
+    验收＝**在会话里恢复一个 child，然后这个会话还能 exec、且 stats 把它算进去**（用例见 D9 行）。
+    **上线时会撞到的两个点，都写在这里省得重踩**：
+    * **stub 的授权只能在创建时装**：Landlock 域是启动时一次性的，而 `fs_readable_host` 是
+      `serde(skip)`（不能动 wire/镜像布局）⇒ 会话没法在恢复时给自己补授权。现在
+      `launch_exec_inner` **给每个会话都装**那一条（与一次性恢复给自己装的是同一条、同一个
+      平台自带静态 stub、guest 也叫不出它的名字）。代价一条：stub 路径带构建哈希，
+      重建之前创建的会话不能恢复进新 stub。
+    * **目标会话必须有一个长驻的第一个孩子**：M0 退出＝会话结束（文档化语义），
+      用 `true` 之类去起目标会话，它会在恢复之前就自己收摊（这个坑在用例注释里也留了）。
 * 之后才回到 **S2**（worker 侧存储与平台账）——S2 的接线与 (a)/(b) 无关，但 (b) 改的是会话形状，
   先落地能避免 S2 按旧形状写一遍。
 
@@ -229,7 +238,7 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 | D6 | `restore_skipped` 对外 | 恢复结果里带 fd 表；日志 + 文档明说"连接不回来"；**不**假装成功 | §1(c) |
 | D7 | 跨节点 | 允许（blob 在共享 NFS 上），但**同内核**是硬前提 | 引擎前提，与架构无关 |
 | D8 | 清理 | 随沙箱 teardown 一起删（`_delete_sandbox_runtime` 已经按 verified target set 删 `_runtime`） | 不新增一条回收路径 |
-| D9 | **恢复后 exec 不可用** | **已定（2026-09-25，用户）：走 (b) —— 要能执行命令**。所以恢复出来的会话必须可 exec；F2a 已把"进程能活"这半解决，剩下的是"会话形状"这半。实施计划见 (g) | 不是取舍问题：E2B 用户日常靠 `commands.run`，一个恢复后拒执行的沙箱不是同一种东西 |
+| D9 | **恢复后 exec 不可用** | ✅ **已做（2026-09-25，fork `1f41f1a`）**：走 (b) —— 恢复**进会话**，会话继续服务 exec/wait/kill/记账。验收用例 `test_a_child_restored_into_a_session_keeps_the_session_executable`（三条断言：进程在跑、**恢复后仍能 exec**、`children_live` 算上它），`core_lib` 911/0、`test_restore::` 5/0、`test_instance*` 50/0 | 见 §(g) |
 | D10 | **碰加载器只读页的程序恢复后即崩** | ✅ **已修（2026-09-25，fork `e9b8b6c`）**：捕获把 RELRO 段一并 dump；四类形状（`malloc`、vDSO、`fopen`、静态对照）全部恢复，`test_restore` 5/0、`core_lib` 904/0 | §1(e)/(f)。**不再是阻塞项**：这个能力对"真实程序"（python/node/sh）现在成立 |
 
 ---
