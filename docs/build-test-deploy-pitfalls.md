@@ -179,6 +179,43 @@ fail closed** 并点出架构名（错的号会伪装成 seccomp 问题，见上
 推广：**任何 Python 里的 `__NR_*` 常量都要先确认它在目标架构上是不是同一个号**，跨架构的 lane
 （§7 的 arm64 lane）是唯一能抓到这类 bug 的地方，x86_64 容器门禁全绿也说明不了问题。
 
+**B14. fork 门禁在本机跑不起来（三条独立原因叠在一起），以及"基线数字"那条纪律。**
+现象（2026-09-25）：照 fork 文档跑 `sh scripts/test-all.sh` 被门禁自己拒绝 ——
+*"default and --wheels modes are NON-ROOT suites: they must run as uid 65534"*；按它给的
+`setpriv --reuid 65534 … sh scripts/test-all.sh` 改，又变成 `cargo: Permission denied`；
+再把权限放开，就停在 `core_lib: baseline says 902 passed, run produced 904`。
+三条原因（都不是 fork 的问题）：
+1. **本机没有 fork 的规范镜像**。文档里的 `sandlock-dev:latest` 的 entrypoint 会在 root prep 之后
+   降到 nobody；本机装的是 **E2B 的测试镜像 `sandlock-dev-f17`**，entrypoint 是
+   `entrypoint.test-runner.sh`（Cmd 是 pytest），prep 完 `exec "$@"` **仍然是 root**。
+2. **工具链在 65534 够不到的地方**：`cargo` 在 `/root/.cargo/bin`，而 `/root` 是 `0700`
+   （规范镜像里是 `/opt/cargo`，所以那边没这个问题）。
+3. **这个镜像的 prep 不含 fork 的 net fixture 需要的东西**：`/etc/hosts` 的
+   `198.18.0.0/15` 映射与 lo 上的 198.18.0.x 地址。缺了它，core_integ 有 **5 条**红在
+   *"no free 198.18.0.x address … run the test container entrypoint (root prep) so the
+   unprivileged fixtures exist"*（与 arm64 lane 当年那 42 条同因，见 `cross-platform-lanes.md`）。
+做法：**`deploy/scripts/fork-gate.sh`** —— 它在容器里以 root 先跑 lane 的那份 prep
+（`deploy/scripts/arm-lane/guest-prep.sh`，一份定义两处调用）、放开工具链可读/可执行、把 `tmp/` 与
+`HOME` 指到可写处，再用 `setpriv` 降到 65534 跑门禁，最后把各相位的结果打出来。
+两个顺手修掉的 prep 坑（都记在 `guest-prep.sh` 的注释里）：
+* **别在已经有 `/usr/local/bin/python3` 的镜像上建那条软链**：本镜像里
+  `/usr/bin/python3 -> /usr/local/bin/python3`，照 lane 那句 `ln -sfn /usr/bin/python3
+  /usr/local/bin/python3` 会**造出环**，表现为两条毫不相关的 suite 报
+  `Too many levels of symbolic links`。改成"只在 `/usr/local/bin/python3` 不可执行时才建"。
+* 本镜像**没有 `sysctl`**，prep 改成回落到直接写 `/proc/sys/net/ipv4/ip_unprivileged_port_start`。
+**这条纪律也在这里**：门禁把每档的通过数跟 `third_party/sandlock/docs/test-baseline.md` 比对，
+**加了测试就必须同步那份基线**，否则你会看到 `baseline says X passed, run produced Y` ——
+那不是回归，是提醒登记（这轮 core_lib 902→904、core_integ 551→552 就是这么来的）。
+复跑单个家族：**`deploy/scripts/fork-gate.sh --one 'test_chroot::'`**（在同一套 prep/降权环境里
+只跑该过滤集；这是 FUP-09 那条纪律的工具，不是「重试门禁」）。
+
+**一条使用警告**：这台机器上**整档 core_integ 的非 root 跑不稳定** —— 同一套环境跑五次，
+通过/失败是 547/5、551/1、549/3（基线、暂存了改动）、552/0、537/15，**每次红的用例集合都不同**
+（`popen` / `control` / `freeze` 这类进程呈现与线程通知的用例居多，也见过 `test_chroot::` 整族 15 条
+一起红）。而**每一族单跑都是绿的**（实测 `test_chroot::` 单跑 49/0）。
+所以它只能当「看方向」，不能当判定；要判定请用规范镜像或 lane，或者按 FUP-09 的纪律
+「留住第一次红的日志 + 单跑那一族」。
+
 ---
 
 ## C. 目标机部署 / 远程操作
