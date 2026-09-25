@@ -313,6 +313,34 @@ spec:
             # capability (docs/chroot-workspace-exec.md §9).
             - name: E2B_REAL_ROOT
               value: "1"
+            # S3 (`docs/checkpoint-restore-e2b-half.md`): a pause writes a
+            # checkpoint image *before* it freezes, so the sandbox's **process**
+            # outlives this pod, and a resume either thaws the session that is
+            # still here or resumes the image that is not. What it needs is a
+            # wheel whose `sandlock-supervise` knows the `checkpoint`/`restore`
+            # verbs (fork `57f610c`); a worker on an older one is told
+            # `unknown verb`, logs it, and keeps freezing in place as before --
+            # a capture that cannot happen never fails a pause.
+            #
+            # The images are the **deployment's** disk, not the sandbox's: they
+            # live in `<base>/_runtime/<id>/checkpoint/` (0700, worker uid; the
+            # sandbox cannot read them at all) and are billed to
+            # `E2B_PLATFORM_DISK_MB`, never to a sandbox's `diskMB`. Billing a
+            # pause to the paused sandbox would take its writes away with the
+            # very call that was supposed to free the node (the write side of
+            # that budget is `RLIMIT_FSIZE=0` plus `ENOSPC` on creates), while
+            # none of its own files changed.
+            #
+            # 0 would mean unlimited -- the hole this account exists to close --
+            # so the budget is stated here instead of left implicit. An image is
+            # the sandbox's memory, i.e. tens to a few hundred MiB in the 512
+            # MiB production shape, so 8 GiB holds a few dozen paused sandboxes;
+            # a capture that would not fit is refused and removed, and the
+            # sandbox stays paused in place rather than quietly growing.
+            - name: E2B_PAUSE_CHECKPOINT
+              value: "1"
+            - name: E2B_PLATFORM_DISK_MB
+              value: "8192"
             # Still *not* set: E2B_UID_POOL_START/SIZE. The allocator is
             # cross-process safe on a shared base (`uid_pool.acquire` takes an
             # flock on `<base>/.uid_pool.lock` and recomputes the free set from
