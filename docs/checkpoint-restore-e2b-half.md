@@ -108,6 +108,41 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 
 于是 E2B 侧必须先回答一个产品问题（§2 D9），而不是先写代码。
 
+### (e) **实测**：非平凡程序恢复后会崩 —— 引擎自己的覆盖里没有这一格
+
+S1b 落地时做判别实验（同一个 slot 路径，只换 workload），结果按 workload 分成两半：
+
+| workload | 恢复之后 |
+|---|---|
+| `tests/rootfs-helper`（静态、`-nostdlib`） | **正常**：计数器继续前进（4 → 8 → 12 …），state=S |
+| `/bin/sleep 60`（动态 glibc） | **正常**：state=S、睡在 `hrtimer_nanosleep`、fd 0-2 齐全 |
+| `/bin/sh`（dash，动态） | **SIGSEGV**：`state=Z exit_code=11`，一次都没跑起来 |
+| `python3`（CPython 3.14） | **SIGSEGV**：同上 |
+
+（`/bin/sh` 那种"循环里 fork `sleep`"和"忙循环不 fork"两种写法**都崩**，所以不是子进程的问题；
+崩溃发生在恢复之后立刻，表现为僵尸 + `exit_code=11`。）
+
+**为什么这一格一直没人踩到**：引擎里**每一条** restore 用例用的都是那个静态 freestanding helper
+（`crates/sandlock-core/tests/integration/test_restore.rs` 四处的 `rootfs-helper`），
+FFI 那条也自己编了一个 `-static -nostdlib -no-pie` 的 counter
+（`crates/sandlock-ffi/tests/restore.rs`）。也就是说**"动态/复杂程序能不能恢复"从来没被覆盖过**，
+而现在量到的是：**不能，至少 dash 与 CPython 不能**。
+
+**这对本功能意味着什么**：E2B 沙箱里跑的基本都是这类程序（`python`、`node`、各种 CLI、
+用户的脚本）。如果它们恢复即崩，那么"`pause` 活过 worker 重启"对**主要用例**是空的 ——
+能救活的只有极简进程。所以这条比 D9 更要紧：D9 限制的是"恢复后能不能 exec"，这一条限制的是
+**"恢复后那个进程还能不能活"**。
+
+**归属未定（不要当成已定位的引擎 bug 报出去）**：上面都在 **slot 路径**上量的
+（`instance.checkpoint()` 出的镜像 + 另起一个 slot 恢复）。引擎自己的用例是
+one-shot `spawn_interactive` + 进程内恢复，用静态 helper，因此**两边都没有测过
+"同一个复杂 workload 在引擎原生写法下如何"**。我试着补那个探针时卡在夹具（策略没给
+动态程序的读权限、计数器没写出来），所以**没有**得出结论 —— 下一步应该是那个实验，
+而不是假设。
+
+**已排除的解释**（免得后来人重走）：不是子进程/fork（两种写法都崩）、不是 fd 被 skip
+（动态 `sleep` 同样 skip 了 0/1/2 却正常）、不是"恢复本身不工作"（静态与 `sleep` 都工作）。
+
 ---
 
 ## 2. 决策点与建议
@@ -123,6 +158,7 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 | D7 | 跨节点 | 允许（blob 在共享 NFS 上），但**同内核**是硬前提 | 引擎前提，与架构无关 |
 | D8 | 清理 | 随沙箱 teardown 一起删（`_delete_sandbox_runtime` 已经按 verified target set 删 `_runtime`） | 不新增一条回收路径 |
 | D9 | **恢复后 exec 不可用，产品上怎么算** | **二选一，需要拍板**：**(a)** 接受"恢复 = 进程回来、不能再 exec"，把它写进对外语义（长驻服务形状够用）；**(b)** 让恢复出来的会话 exec-capable（引擎侧要新做"把 checkpoint 还原进一个带 init 的会话"），代价明显更大 | §1(d)：引擎自己按名拒绝 `exec is not supported on a restored container`。这不是我们能顺手补的缺口，是"恢复一个进程"与"恢复一个可交互的箱子"的区别 |
+| D10 | **非平凡动态程序恢复即崩**（`/bin/sh`、`python3` 实测 SIGSEGV；静态 helper 与 `/bin/sleep` 正常） | **先做归属实验，再决定**：用引擎原生写法（one-shot `spawn_interactive` + 进程内恢复）跑同一个复杂 workload —— 若同样崩 ⇒ 引擎缺口，作为引擎工作立项；若不崩 ⇒ 是 slot 路径或 instance 捕获的差异，由我们修 | §1(e)。这是**比 D9 更要紧**的一条：它决定"恢复后那个进程还能不能活"，而 E2B 的沙箱里跑的基本都是这类程序。**归属未定，不能当已定位的 bug 报** |
 
 ---
 
@@ -132,7 +168,7 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
 |---|---|---|
 | **S0** | ✅ 修掉守卫用例里过时的架构说法（它仍写着"引擎只支持 x86_64/riscv64、aarch64 要先移植"，而 aarch64 的 S0–S5 2026-09-24 已落地） | 用例文本与代码一致 |
 | **S1a** | ✅ fork：slot 加 `checkpoint` verb（写 blob 到调用方指定的路径）—— fork `e76cb2f`，主仓 pin `82a26df` | fork 的 supervise 相位 **31 passed / 0 failed**，新用例钉住"镜像是引擎格式"与"捕获不是 kill" |
-| **S1b** | fork：`restore` —— 但它不是一条 verb，而是**从镜像起一个 slot**（`Checkpoint::load` → 用镜像里的 policy 起沙箱 → `restore_interactive`），服务 `stats`/`shutdown`、**按名拒绝 exec**（照 OCI 的既有语义） | fork 相位新用例：从镜像起的 slot `stats` 说进程活着、`exec` 得到那句按名拒绝、`shutdown` 干净退出。**先答 D9 再动手**：若选 (b)，S1b 的形状完全不同 |
+| **S1b** | ✅ fork：**从镜像起一个 slot**（`Checkpoint::load` → 用镜像里的 policy 起沙箱 → `restore_interactive`），服务 `config`/`stats`/`shutdown`、**按名拒绝 exec**（照 OCI 的既有语义）。不是 verb，是启动模式 | fork `58264eb`，supervise 相位 **32 passed / 0 failed**。用例钉住：恢复出的进程**真的在跑**（计数器继续前进）、`stats.restored` 可辨、`exec` 得到引擎原话、`shutdown` 干净退出、**进程死后报 `Exited` 而不是 `Live`**（僵尸那个 bug 就是这一步量出来的）。**警告**：workload 必须是 §1(e) 那格里"能恢复"的类型 |
 | **S2** | worker：agent 端点 + D1/D2/D8 的落地 + **D3 的平台账与拒绝路径** | 单测：blob 落在 `_runtime`、沙箱读不到、**平台账计入且用户的 `diskMB` 不变**、平台账不够时拒绝而不是写入、teardown 删净 |
 | **S3** | 生命周期：`pause` 写、`resume`（进程不在时）恢复，旗标默认关 | 集群验收：**启一个跑着的沙箱 → 重启 worker → resume → 进程状态还在**（正是今天做不到的那一条）。**验收要连 §1(d) 一起写**：恢复后 `exec` 的行为按 D9 的结论定（(a) 则断言那句按名拒绝，(b) 则断言能继续 exec） |
 | **S4** | `restore_skipped` 的对外语义（D6） | 契约用例 + 文档 |
