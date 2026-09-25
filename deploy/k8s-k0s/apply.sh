@@ -10,6 +10,12 @@
 #   VERSION=1.2.3 KUBECONFIG=... deploy/k8s-k0s/apply.sh
 #   DRY_RUN=1 ... deploy/k8s-k0s/apply.sh             # 只渲染不 apply
 #   SKIP_WARM=1 ... deploy/k8s-k0s/apply.sh           # 不预热 base image
+#
+# **stdout 只放渲染结果，其余（进度、诊断、错误）一律 stderr。** 这样 DRY_RUN 的
+# 输出是可以直接喂给 kubectl 的数据流：
+#   DRY_RUN=1 deploy/k8s-k0s/apply.sh 2>/dev/null | kubectl apply --dry-run=server -f -
+# 以前的版本把「版本 … 已 pin」打在 stdout，于是上面这条命令的第 1 行不是 YAML，
+# 管道那一侧只会报一个与真正原因无关的解析错误。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,7 +40,7 @@ rendered="$(kubectl kustomize "$HERE" \
     | sed -E "s#(image: registry\.cn-shanghai\.aliyuncs\.com/byteplan/e2b-sandlock-[a-z-]+):[^[:space:]]+#\1:${VERSION}#g")"
 
 count="$(printf '%s\n' "$rendered" | grep -c "byteplan/e2b-sandlock-.*:${VERSION}$" || true)"
-echo "版本 ${VERSION}：${count} 个镜像引用已 pin"
+echo "版本 ${VERSION}：${count} 个镜像引用已 pin" >&2
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
     printf '%s\n' "$rendered"
@@ -50,13 +56,13 @@ printf '%s\n' "$rendered" | kubectl apply -f -
 # 在这里补一个预热步骤把窗口关掉：GET 只查询（不落地），**POST 才真的解包**，两者
 # 都幂等。打在每个 pod 自己的 agent 上，所以 `kubectl exec` 进容器跑。
 if [ "${SKIP_WARM:-0}" = "1" ]; then
-    echo "跳过 base image 预热（SKIP_WARM=1）"
+    echo "跳过 base image 预热（SKIP_WARM=1）" >&2
     exit 0
 fi
 
 [ -f "$WARM_HELPER" ] || { echo "缺少 $WARM_HELPER" >&2; exit 1; }
 
-echo "等待 worker 滚动完成"
+echo "等待 worker 滚动完成" >&2
 kubectl -n "$NAMESPACE" rollout status statefulset/e2b-worker --timeout=300s
 
 image="$(kubectl -n "$NAMESPACE" get statefulset e2b-worker \
@@ -75,7 +81,7 @@ fi
 warm_failures=0
 while read -r pod; do
     [ -n "$pod" ] || continue
-    echo "预热 $pod：$image"
+    echo "预热 $pod：$image" >&2
     if ! kubectl -n "$NAMESPACE" exec -i "$pod" -- \
         python3 - --image "$image" --key "$key" < "$WARM_HELPER"; then
         warm_failures=$((warm_failures + 1))
@@ -87,4 +93,4 @@ if [ "$warm_failures" != 0 ]; then
     echo "有 $warm_failures 个 worker 预热失败：这些节点的首个 create 会回 428 warm_required" >&2
     exit 1
 fi
-echo "base image 已在每个 worker 就绪（peek cached=true）"
+echo "base image 已在每个 worker 就绪（peek cached=true）" >&2
