@@ -1,0 +1,102 @@
+warning: unused import: `crate::seccomp::syscall::syscall_name_to_nr`
+  --> crates/sandlock-core/src/sys/path_surface.rs:46:5
+   |
+46 | use crate::seccomp::syscall::syscall_name_to_nr;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> crates/sandlock-core/src/checkpoint/noexec.rs:230:9
+    |
+136 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+230 |         unsafe {
+    |         ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `Disposition` is never used
+  --> crates/sandlock-core/src/sys/path_surface.rs:50:17
+   |
+50 | pub(crate) enum Disposition {
+   |                 ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MEDIATED_PATH_SYSCALLS` is never used
+  --> crates/sandlock-core/src/sys/path_surface.rs:67:18
+   |
+67 | pub(crate) const MEDIATED_PATH_SYSCALLS: &[&str] = &[
+   |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MEDIATED_PATH_SYSCALLS_PER_ABI` is never used
+   --> crates/sandlock-core/src/sys/path_surface.rs:129:18
+    |
+129 | pub(crate) const MEDIATED_PATH_SYSCALLS_PER_ABI: &[(&str, fn() -> Option<i64>)] = &[
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNMEDIATED_PATH_TAKING` is never used
+   --> crates/sandlock-core/src/sys/path_surface.rs:153:18
+    |
+153 | pub(crate) const UNMEDIATED_PATH_TAKING: &[(&str, Disposition)] = &[
+    |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNMEDIATED_PATH_TAKING_ABI_SPECIFIC` is never used
+   --> crates/sandlock-core/src/sys/path_surface.rs:292:18
+    |
+292 | pub(crate) const UNMEDIATED_PATH_TAKING_ABI_SPECIFIC: &[&str] =
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `PURE_LANDLOCK_GATED` is never used
+   --> crates/sandlock-core/src/sys/path_surface.rs:315:18
+    |
+315 | pub(crate) const PURE_LANDLOCK_GATED: &[&str] = &[
+    |                  ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `PURE_GATED_ELSEWHERE` is never used
+   --> crates/sandlock-core/src/sys/path_surface.rs:333:18
+    |
+333 | pub(crate) const PURE_GATED_ELSEWHERE: &[(&str, &str)] = &[
+    |                  ^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `PURE_UNGATED` is never used
+   --> crates/sandlock-core/src/sys/path_surface.rs:364:18
+    |
+364 | pub(crate) const PURE_UNGATED: &[(&str, &str)] = &[
+    |                  ^^^^^^^^^^^^
+
+warning: constant `NON_PATH_SYSCALLS` is never used
+   --> crates/sandlock-core/src/sys/path_surface.rs:409:18
+    |
+409 | pub(crate) const NON_PATH_SYSCALLS: &[&str] = &[
+    |                  ^^^^^^^^^^^^^^^^^
+
+warning: `sandlock-core` (lib) generated 11 warnings (run `cargo fix --lib -p sandlock-core` to apply 1 suggestion)
+   Compiling sandlock-core v0.9.0-beta (/src/third_party/sandlock/crates/sandlock-core)
+warning: function `net_admin_available` is never used
+   --> crates/sandlock-core/tests/integration/net_fixture.rs:136:8
+    |
+136 | pub fn net_admin_available() -> bool {
+    |        ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sandlock-core` (test "integration") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.09s
+     Running tests/integration.rs (target/debug/deps/integration-38c5e31c88903532)
+
+running 9 tests
+test test_instance_chroot::test_deny_declared_under_one_alias_covers_the_other_alias ... ok
+test test_instance_chroot::test_exec_failure_names_the_kernel_errno_instead_of_exiting_127_silently ... ok
+test test_instance_chroot::test_exec_through_a_dotdot_relative_symlink_resolves ... ok
+test test_instance_chroot::test_getcwd_reports_the_alias_the_policy_declared ... ok
+test test_instance_chroot::test_getcwd_reports_the_requested_alias_not_the_best_match ... ok
+test test_instance_chroot::test_getcwd_under_a_real_root_is_the_kernels_answer ... ok
+test test_instance_chroot::test_instance_exec_only_chroot_same_uid_launch_and_exec ... ok
+test test_instance_chroot::test_read_only_declared_under_one_alias_covers_the_other_alias ... ok
+test test_instance_chroot::test_relative_open_from_second_workspace_alias_resolves_the_submount ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 550 filtered out; finished in 0.32s
+

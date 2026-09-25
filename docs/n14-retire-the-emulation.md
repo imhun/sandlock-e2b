@@ -127,10 +127,33 @@ mount ns**。模拟根形态下沙箱与容器共享 mount ns ⇒ 它们枚举�
 | `exec` | 已分路径，但真根下仍要记账（`settle_closed_writes`）与写虚拟 exe |
 | 13 个 `legacy_*` | 大多是薄转发，**但它们是否触达账本要读代码定**，不能靠 grep 断言 |
 
-能放行的候选（读到确认的）：`getcwd`（真根下内核给的 cwd 就是对的）、`statfs`、
-`inotify_add_watch`（历史上那条 OBS 泄露正是因为它在宿主路径空间解析，真根下由内核解析）。
-**注意**：`/proc` 那一路不能靠"这个 handler 没有 /proc 分支"来判断——`/proc` 的目录 fd 是
-在 `open` 里合成的，所以 `getdents`/`statfs` 对 `/proc` 的可见性依赖上游。
+**S3 第一步已做（2026-09-25，fork）：放行了三个候选里的一个 —— `getcwd`。**
+`ctx.child_is_pivoted(pid)` 为真时直接 `Continue`，翻译只留给模拟根。它是三者中唯一
+**纯翻译**的那个，读代码确认过：
+
+* handler 里没有策略判定，只有"把记录下来的 cwd 写回子进程缓冲区"；
+* 真根下内核给的 cwd 就是沙箱自己的拼法（任务的根就是 rootfs），而且**比记录更准** ——
+  内核会解析符号链接（经由软链进入的 cwd 报规范路径，与容器一致），handler 那道 ERANGE
+  检查（拿"记录下来的拼法"量长度）也随之消失；
+* 代码与验收：fork 的 `handle_chroot_getcwd` + `test_getcwd_under_a_real_root_is_the_kernels_answer`
+  （判别性已证：把判据强制为假 ⇒ 第三段断言红在 `OK /alias`）。
+
+**另外两个候选读完否掉了**（这正是"边界由宿主侧工作划"的意思，两者都不是只做翻译）：
+
+* `inotify_add_watch`：它在翻译之外还做 `can_read(&virtual_path)` 的**策略判定**，而真根下
+  策略只以 `fs_mount` 表 + Landlock 表达（`realroot.rs`：只挂 `fs_mount`）——**嵌套 deny
+  （挂载点内部再 deny，例如 `fs_deny("/workspace/mnt/data")`）挂载集根本表达不了**，全靠
+  逐 syscall 的这一句兜着。放行它等于把那条 deny 从 inotify 这条路上拿掉 = 真实的放大。
+  它的另一半（翻译）确实冗余了，但省下的只有一次 `dup_fd_from_pid` + 注册，不值这条风险。
+* `statfs`：唯一的工作是"虚拟路径 → 宿主路径 → `libc::statfs` → 写回缓冲区"，但
+  `resolve_chroot_path_existing` 会经过 `canon_proc_self`/`canon_proc_cwd`，而 `/proc` 的
+  目录 fd 是在 `open` 里**合成**的（§3 那条）⇒ 对 `/proc/...` 的可见性，真根内核与中介
+  给的答案不同（内核看到的是 rootfs 里那个空目录）。放行不会扩大权限，但会让 `/proc`
+  下的 `statfs` 换一个语义，属于"没验收就先改行为"。
+
+**下一步（S3 余下）**：把上面的判定方法推广到 13 个 `legacy_*` 与 `/proc` 家族 —— 判据是
+"翻译之外还做不做事"，而不是"看起来像不像直通"。每个放行都要在 `E2B_REAL_ROOT=0/1`
+两态下留下 security 套件的结果。
 
 **这条路买到什么、买不到什么**（说清楚，免得当成安全改进）：
 
@@ -211,7 +234,7 @@ N15 选的路是"补一个中介 + identity 翻译，把那 33 条一条条闸�
 |---|---|---|
 | S1 | ✅ **已完成**：真根成为线上形态，并写进清单（**收益已交付**，见 §5） | `kubectl diff` 为空；两形态对照表（`deploy-clusters.md` §7） |
 | S2 | ✅ **已回答**：pure 走真根**可行但要合成 rootfs**，而那份 rootfs 的内容正好是它今天的 Landlock 白名单 ⇒ 这同时是 **N15 的一条替代路线**（一次合成换掉 33 条闸门） | 结论与实测见 §5；三个探针 `tmp/k0s/probe-pure-realroot.py`（A=EBUSY、A2=同树无隔离、B=合成根真隔离） |
-| S3 | **优先走 §4.1 的分路径**：真根下的 handler 改成 `Continue`（沿用 `exec`/`chdir` 已有的 `child_is_pivoted` 判据），翻译只留给模拟根。真正删代码要等 S5 | 每个改动过的 handler 在 `E2B_REAL_ROOT=0/1` 两态下 security 套件全绿；不可放行的那批（`open`/`write`/`stat`/`statx`/`readlink`/`xattr`/`utimensat`）**保持不变**，并在提交信息里写明为什么 |
+| S3 | **进行中（第一步已做，2026-09-25）**：真根下的 handler 改成 `Continue`（沿用 `exec`/`chdir` 已有的 `child_is_pivoted` 判据），翻译只留给模拟根。**已放行：`getcwd`**（理由与另外两个候选被否掉的原因见 §4.1）。余下：13 个 `legacy_*` 与 `/proc` 家族逐个读代码定，真正删代码要等 S5 | **已验收（`getcwd`）**：fork 的 `core_integ` 559（+1 新用例，判别性已证）+ 两态 security 套件 —— `E2B_REAL_ROOT=0` **43 passed / 1 skipped / 4 xfailed**、`=1` **46 passed / 1 skipped / 1 xfailed**，与改动前的基线逐字相同（crate 侧 `test_chroot` 51 / `test_instance_exec` 28 / `test_cow` 26 / `test_restore` 5 全绿）。每个新放行的 handler 都要这样留两态结果；不可放行的那批（`open`/`write`/`stat`/`statx`/`readlink`/`xattr`/`utimensat`）**保持不变**，并在提交信息里写明为什么 |
 | S4 | 账本换观察点（或证明周期扫描足够），再退写拦截 | 磁盘门禁的单测与集群验收不变 |
 | S5 | 真根成为**唯一**形态，模拟那套整体退役。**注意这是代码卫生，不是安全改进**（§5） | 没有 `E2B_REAL_ROOT=0` 也能全绿 |
 
