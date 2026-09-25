@@ -128,36 +128,51 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 
 ## 7. 当前部署状态（2026-09-25 实测，改部署前先复核）
 
-**worker 的环境变量**（`kubectl -n sandlock get sts e2b-worker -o jsonpath=...`）：
-`E2B_PID_NS=true`、`E2B_ENABLE_NET_ISOLATION=true`、`E2B_FD_INJECT_CONNECT=true`、
-`E2B_WORKSPACE_BASE=/var/lib/e2b-sandboxes`、`E2B_BASE_IMAGE=…/python-mcp:3.14@sha256:3675662d…`。
-**没有 `E2B_REAL_ROOT`** ⇒ 真根默认关（`envd_service/config.py` 默认 `False`）。
+**版本**：`0.1.0-495-gcbe55df-20260925-100509`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的）。
 
-**seccomp 档：集群上是 N35 之前那份。** 这是实测的三处一致证据：
+**别把 `python-mcp:3.14` 当稳定引用**：`deploy/docker/Dockerfile.mcp-base` 用的是
+`pip install --no-cache-dir mcp uvicorn`，**没有钉版本**，所以每次重建它都可能产出不同内容 ——
+2026-09-25 这次重建后该 tag 指向 `sha256:e91b0ae2…`，而集群的 `E2B_BASE_IMAGE` 钉的仍是
+`sha256:3675662d…`（**刻意保留**：这一轮只改"真根"一件事，不同时动沙箱基底；旧 digest 依旧
+可解析，push 之后 worker 还成功预热过它）。**换基准镜像时按 digest 换，不要按 tag 换**，
+否则会静默换掉所有沙箱的基底。
 
-| 看哪里 | 值 |
-|---|---|
-| 节点文件 `/var/lib/k0s/kubelet/seccomp/sandlock-worker.json`（.94） | `sha256 = 0e07967a…`，mtime `Sep 17 17:19` |
-| `kubectl -n sandlock get cm sandlock-worker-seccomp -o jsonpath='{.data.sandlock-worker\.json}' \| shasum -a 256` | `0e07967a…` |
-| `kubectl -n sandlock get ds seccomp-installer -o jsonpath='{.spec.template.metadata.annotations.checksum/profile}'` | `0e07967a…` |
+**真根（N35/N14）已上线**（2026-09-25 单节点灰度 → 推广，两台 worker）：
 
-`0e07967a…` 正是 `deploy/seccomp/sandlock-worker.json` 的 `8ea5909`（2026-09-15，N35 之前）那份；
-仓库现在是 `071486c0…`（N35 档，对应 installer 修订 `84f1c11`，2026-09-23）。
-**N35 的那次 `kubectl apply` 从未执行过。**
+* worker 环境里有 `E2B_REAL_ROOT=1`，**写在 `deploy/k8s/worker.yaml`**（不是临时 patch）；
+* `kubectl diff -f <渲染出的 STS>` 为空 ⇒ 线上与仓库规格一致，`apply.sh` 幂等；
+* seccomp 档已是 N35 那份：两台节点上 `/var/lib/k0s/kubelet/seccomp/sandlock-worker.json`
+  都是 14927 字节、`sha256 071486c0…`（与仓库文件逐字节相同），`mount`/`umount2`/`pivot_root`
+  三个都在允许组里。
 
-后果（在节点上直接读那份档确认）：`pivot_root` **根本不在允许组里** ⇒ 被
-`defaultAction: SCMP_ACT_ERRNO` 无条件拒；`mount` / `umount2` 只在
-`includes.caps: [CAP_SYS_ADMIN]` 的组里 ⇒ 而 worker 早就去掉了 SYS_ADMIN，等于同样被拒。
-**所以集群当前形态下真根一行都建不起来**；打开 `E2B_REAL_ROOT` 会立刻撞 worker 的启动自检
-（`envd_service/executors/sandlock.py::_real_root_capability`），报
-`pivot_root (the profile must admit it): Operation not permitted`。
+验收（同一条命令、两台 worker 各跑一次；探针就是 N35 的形状）：
 
-上线顺序是**先应用 seccomp 档、再打开开关**：
+| worker | 根形态 | 对照（动态 ELF） | 判别（shebang 脚本，同一条命令里写→chmod→执行） |
+|---|---|---|---|
+| （灰度后）两台 | 真根 | `exit 0` `ELF_OK` | **`exit 0` `SHEBANG_OK`** |
+| （上线前）旧规格 | 模拟根 | `exit 0` `ELF_OK` | `exit 126` `Permission denied` |
+
+第三行是这次唯一一次能拿到"同一集群上两种形态对照"的机会，所以记在这里：它就是 N35 要消灭的那个形状
+（用户级安装 `pip install --user` 落在 `~/.local/bin` 的 console script 属于同一类）。
+另有 `deploy/scripts/multinode_smoke.py` 与 `deployment_smoke.py` 在其后全绿。
+
+**上线顺序（必须遵守，且已经由 worker 自己兜住）**：**先应用 seccomp 档、再打开 `E2B_REAL_ROOT`**。
+反过来的话每个 `Sandbox.create()` 都会 EPERM。现在不必靠人记得：worker 第一次建 executor 时会用
+子进程把 userns→mount ns→bind→pivot_root→umount2 走一遍，失败即抛
+`RuntimeError`，并写明是哪一步失败、该应用哪个文件
+（`envd_service/executors/sandlock.py::_real_root_capability`，用例 `tests/unit/test_real_root_gate.py`）。
+
+**这次上线前的状态（留档，说明"档没应用"这个坑长什么样）**：线上当时跑的是
+`8ea5909`（2026-09-15）那份 profile —— 三处（节点文件、集群 ConfigMap、DaemonSet 注解）
+一致地写着 `0e07967a…`；那份里 `pivot_root` **根本不在允许组**（`defaultAction: SCMP_ACT_ERRNO`
+无条件拒），`mount`/`umount2` 只在 `includes.caps: [CAP_SYS_ADMIN]` 组里而 worker 早已去掉
+SYS_ADMIN ⇒ 真根一行都建不起来。也就是说 N35 的 `kubectl apply`（installer 修订 `84f1c11`）
+**从未在集群上执行过**，而索引里只写了"上线顺序"、没写"到底应用了没有"。
 
 ```bash
 export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 kubectl apply -f deploy/k8s/seccomp-installer.yaml   # ① 档（先）
-# 等 DaemonSet ready，再动 worker 的 E2B_REAL_ROOT          ② 开关（后）
+# 等 DaemonSet ready，再动 worker 的 E2B_REAL_ROOT    ② 开关（后）
 ```
 
 ## 8. 改部署的入口
