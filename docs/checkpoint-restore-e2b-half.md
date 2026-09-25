@@ -187,8 +187,15 @@ OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_run
     目标号重复/落在保留区、两个数组长度不一致、空集合。单测 5 条，`core_lib` 909/0。
     **故意是纯增量**：stdio 路径一格未动；两套计划用不同保留区（64 / 80），
     因为普通 exec 可能与恢复请求同时在飞。
-  * **② 待做**：请求臂 + `spawn` 的"按摆设计划摆放 + 按 fd 执行"（stub 只能
-    `execveat(AT_EMPTY_PATH)`，它在镜像里不存在）；孩子要进子进程表。
+  * **② 进行中**：两块机制已落地并各有测试 ——
+    * ✅ **按 fd 执行**（fork `bf60b5d`）：`init::exec_at_fd` = `execveat(fd, "", argv, envp,
+      AT_EMPTY_PATH)`，让会话的孩子能跑一个**只以描述符存在**的程序（stub 是宿主产物、
+      不在镜像的路径空间里，所以只能这样投递）。失败纪律照抄 execvp 那条：**errno 只读一次**、
+      只有非 ENOENT 才在 fd 2 上留一行（e2b 契约钉着"缺程序 ⇒ 127 且无输出"）；
+      环境用 `vars_os` 而非 `vars`（非 UTF-8 会让 `vars` panic，而那是在 fork 后的子进程里
+      —— 会变成沙箱内的 abort 而不是错误）。
+    * ⏳ **还差**：把"摆放计划"接进 `spawn`（给 `spawn` 一个携带 placements + exec_fd 的规格；
+      三个调用点：RunMain / RunExec / launch-first）、加 `Req` 臂，并让孩子进子进程表。
   * **③ 待做**：`SandboxInstance::restore_into_session(cp)` —— 把
     `sandbox.rs::restore_interactive_with` 的 plan → StubChannel → READY/GO → 写内存
     接到会话的孩子上（写入端 spike 已证可行），验收＝"在会话里恢复一个 child，
