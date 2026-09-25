@@ -128,6 +128,9 @@ RUNTIME_DIR_NAME = "_runtime"
 #: The sandbox's command output log (JSONL), written by the worker.
 COMMAND_LOG_NAME = "command-logs.jsonl"
 
+#: Where a sandbox's checkpoint images live, inside its runtime dir.
+CHECKPOINT_DIR_NAME = "checkpoint"
+
 
 def sandbox_runtime_dir(workspace_base: str | Path, sandbox_id: str) -> Path:
     """``<base>/_runtime/<id>`` -- the platform's directory for one sandbox."""
@@ -155,6 +158,22 @@ def sandbox_command_log_path(
     if legacy:
         return Path(workspace_base) / sandbox_id / COMMAND_LOG_NAME
     return sandbox_runtime_dir(workspace_base, sandbox_id) / COMMAND_LOG_NAME
+
+
+def sandbox_checkpoint_dir(workspace_base: str | Path, sandbox_id: str) -> Path:
+    """``<base>/_runtime/<id>/checkpoint`` -- a sandbox's checkpoint images.
+
+    Inside the runtime dir on purpose, and for the same reason the record and the
+    command log are: this is platform state that holds the sandbox's **whole
+    process image**, so the sandbox itself must never be able to read it (see
+    :func:`sandbox_runtime_dir`), while the deployment still needs it across nodes
+    (the base is a shared volume).
+
+    It is also, deliberately, *outside* the tree the per-sandbox quota measures
+    (``<base>/<id>``). That is why it has an account of its own -- see
+    :mod:`envd_service.runtime.platform_disk`.
+    """
+    return sandbox_runtime_dir(workspace_base, sandbox_id) / CHECKPOINT_DIR_NAME
 
 #: Where a worker parks a tree it refuses to act on (review W7 / W7-3): such a
 #: tree is never *deleted* (its record may be describing a bind-mounted other
