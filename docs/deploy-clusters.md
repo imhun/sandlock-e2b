@@ -130,6 +130,11 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 
 **版本**：`0.1.0-495-gcbe55df-20260925-100509`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的）。
 
+> 本节其余内容记的是**这一版**（0.1.0-495）的实测状态。之后又上了两版：§9（checkpoint/restore，
+> `0.1.0-525`）、§10（空闲判定 CPU 采样，`0.1.0-527`）。**"现在跑的是哪一版"永远以
+> `deploy/stack/.version` + 集群里 `autoscaler/control-plane/e2b-worker` 三个工作负载的
+> 实际镜像为准**（两边必须一致），别引用本文任何一节里写死的版本号。
+
 **别把 `python-mcp:3.14` 当稳定引用**：`deploy/docker/Dockerfile.mcp-base` 用的是
 `pip install --no-cache-dir mcp uvicorn`，**没有钉版本**，所以每次重建它都可能产出不同内容 ——
 2026-09-25 这次重建后该 tag 指向 `sha256:e91b0ae2…`，而集群的 `E2B_BASE_IMAGE` 钉的仍是
@@ -276,3 +281,39 @@ export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o json
 （交叉编两个 arch 的 wheel + supervise + restore-stub，约 4 分钟）→ `deploy/scripts/build-and-push.sh`
 （镜像推 ACR，层缓存命中时 1 分钟）→ `KUBECONFIG=... deploy/k8s-k0s/apply.sh`（滚两台 worker +
 预热 base image，约 3–5 分钟）。
+
+## 10. 空闲判定补采样（CPU）的上线记录（2026-09-25）
+
+**版本**：`0.1.0-527-g946daa9-20260925-215057`（= `deploy/stack/.version`），整栈同一版本
+（`kubectl diff` 只剩版本行）。这一轮**只改 worker 侧代码**（主仓 `946daa9`：新模块
+`envd_service/runtime/cpu_activity.py` + `agent.py` 里一条独立采样循环），fork 没动 ⇒ 链条
+只有 **镜像 → `apply.sh`** 两跳（`build-sandlock-wheels.sh` 不必跑）。**没有新环境变量**：
+采样默认就开（`E2B_CPU_ACTIVITY_INTERVAL_S` 默认 5 s，0 = 关；`E2B_CPU_ACTIVITY_PERCENT`
+默认 5），`E2B_CPU_TRACE=1` 只是排障用的每轮摘要，线上**没开**。控制面一行没改 —— 这条信号
+走的是既有的 `sandboxActivity` 心跳。
+
+**验收**：`tmp/k0s/cpu_activity_acceptance.py` 全绿（两个沙箱、两段 45 s 静默窗口；
+两组时间戳见 `docs/resource-contention.md` §6 的表）。
+
+**这次量出来的两件事（以后验收任何"活动/空闲"类功能都要记得）**：
+
+1. **`GET /sandboxes` 的 `lastActiveAt` 读的是共享 store（Redis），不是控制面内存**。
+   `Registry.mark_active` 只在内存里前进，最多每 `E2B_ACTIVITY_PERSIST_INTERVAL_S`（默认 **30 s**，
+   本集群**未设** ⇒ 30 s）才 `save()` 穿透一次（`control_plane/registry/manager.py::mark_active`）。
+   ⇒ **验收窗口必须长于这个间隔**：第一版脚本用 20 s 窗口，连"跑一条命令"都没能让
+   `lastActiveAt` 动，差点把一条好功能判死；而且窗口内**首次请求本身也是活动**，所以断言要
+   放在第二段完全静默的窗口里，否则证不出是采样干的。
+   ⚠️ 同一条滞后又回到了驱逐：`eviction_candidates` 也走 `list()`（= store），所以驱逐看到的
+   活动时间最坏同样落后 30 s。默认空闲阈值 300 s 之下占 10%，可接受；**调小空闲阈值时
+   要一并算进去**。
+2. **读列表不算活动**：`GET /sandboxes` 是纯读，轮询它既不制造也不掩盖信号 —— 这让它适合当
+   观测手段，但"窗口里没有别的请求"这件事得由脚本自己保证。
+
+**怎么再跑一遍**（约 100 s）：
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+export E2B_API_URL=http://172.18.78.49:3000
+export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d)
+.venv/bin/python tmp/k0s/cpu_activity_acceptance.py
+```
