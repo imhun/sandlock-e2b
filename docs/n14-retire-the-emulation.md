@@ -141,27 +141,66 @@ mount ns**。模拟根形态下沙箱与容器共享 mount ns ⇒ 它们枚举�
 
 ---
 
-## 5. S2 的答案：pure 形态**结构上**吃不了真根 —— 于是 S1 已经把收益交付了
+## 5. S2 的答案：pure 能不能走真根？——**能，但要给它合成一个 rootfs**
 
-S2 原本问的是"pure 形态能不能也吃真根"。读了代码，答案是**不能，而且是结构性的**：
-`real_root` 的前置就是"必须有一个 chroot root"，没有它直接 `fail!`
-（`crates/sandlock-core/src/context.rs`：
-*"real_root requires a chroot root (the image rootfs)"*）。pure 形态按定义没有 image rootfs，
-没有东西可以 `pivot_root` 进去 —— 给它"真根"就等于给它一个 rootfs，那是另一个功能，不是配置。
+S2 原本问的是"pure 形态能不能也吃真根"。分三层答，每层都有实测。
 
-而**两套生产清单都设了 `E2B_BASE_IMAGE`**（k8s 那份钉着 digest，compose 那份从 env 取），
-所以生产**永远是 image-rootfs 形态**，也就永远是能吃真根的那个形态。pure 是开发/本地形态。
+**① 今天不行，因为 `real_root` 要求有 chroot root。** 没有它直接 `fail!`
+（`context.rs`：*"real_root requires a chroot root (the image rootfs)"*），而 pure 从不设 chroot
+（`sandlock.py:2001` 那句 `kwargs["chroot"] = …` 只在 `base_image and image_rootfs` 分支里）。
 
-**这条推论比 S2 本身重要**：既然生产的路径封闭靠的是**内核根**，那么
+**② "把 chroot 设成 `/` 再开真根"也不行**，两条路都试过（`tmp/k0s/probe-pure-realroot.py`，
+特权容器、照抄 `realroot::build` 的顺序）：
+
+| 做法 | 结果 |
+|---|---|
+| 自绑 `/` 再 `pivot_root(".", ".")` | **EBUSY** —— 不能 pivot 进自己已经在的根 |
+| 把 `/` 绑到**另一个路径**再 pivot | 成功，但 `/src`（宿主独有）**仍然看得见** ⇒ 这不是隔离，只是把同一个树重新挂了一次 |
+
+**③ 但合成一个 rootfs 就可以——而且那就是 pure 被允许看的那些路径。**
+tmpfs + 绑几个系统目录再 pivot：`/src` **看不见了**（新根 ino=1，是 tmpfs）。
+
+### 5.1 这条为什么比"能不能"更重要
+
+pure 今天的 `Landlock` 白名单是 `fs_readable = ["/usr", "/lib", "/bin", "/opt"]` +
+`fs_writable = [workspace]`（`sandlock.py:1830`；`/` 只在 chroot 分支被加进去）。
+也就是说 **pure 沙箱能看到的，正好就是那几个系统目录加自己的 workspace**。
+
+而它剩下的缺口是 `PURE_UNGATED` 那 33 条 —— `stat`/`lstat`/`statx`/`statfs`/`access`/
+`readlink`/`chdir`/`chmod`/xattr/`inotify_add_watch`…… **都是 Landlock 表达不了的路径访问**，
+于是它们对着**宿主根**解析（`test_pure_shape_inotify_still_reaches_the_host_root` 钉着这条残余）。
+
+**给 pure 合成一个 rootfs，内容就是那"几个系统目录 + workspace"，等于把今天的可见集合原样
+搬进一个内核根**：沙箱能看到的**一个都不少、一个都不多**，但那 33 条**从"够得着宿主"变成
+"在沙箱自己的树里解析"** —— 缺口不是被"拦住"，是**不存在了**。
+
+N15 选的路是"补一个中介 + identity 翻译，把那 33 条一条条闸住"，比这重得多，而且只是**闸住**。
+所以这条不只是"S2 的答案"，它是 **N15 的一条替代路线**：用一次 rootfs 合成，换掉 33 条闸门。
+
+**要付的账（都还不知道答案，得实测，不能推演）**：
+
+* **`/proc`**：pure **没有中介**，所以合成根里要么挂真 procfs、要么没有 `/proc`。
+  文档里已有的实测是"自建 userns 挂不了 procfs（三形态全 EPERM）"，但那是**沙箱自己**挂；
+  由 worker（容器内 root）在 pivot 前挂好、再让沙箱继承，是另一条路，**没试过**。
+* **`/dev`**：chroot 形态有 `minimal_dev` 六节点，pure 今天用的是容器自己的 `/dev`。
+* **别的东西**：pure 现在还能走 `/etc`（DNS）等路径吗？白名单说不能 —— 这与"N15 要闸住它"是一致的，
+  但真要合成根时，**每个真实用法都得过一遍**，不能只看白名单。
+
+### 5.2 于是生产那边
+
+**两套生产清单都设了 `E2B_BASE_IMAGE`**（k8s 那份钉着 digest，compose 那份从 env 取），
+所以生产**永远是 image-rootfs 形态**，也就永远是已经吃上真根的那个形态。pure 是开发/本地形态。
+
+**推论**：既然生产的路径封闭靠的是**内核根**，那么
 
 > **S1（真根上线）已经把 N14 的收益交付了。**
 
-`chroot_path_syscalls()` 的完整性在生产里**不再承担安全职责** —— 它现在是为
-`E2B_REAL_ROOT=0` 的部署和 pure 形态兜底（defense in depth），而生产里"漏一条拦截"的后果
-从"在宿主路径空间解析"变成了"在沙箱自己的树里解析"。
+`chroot_path_syscalls()` 的完整性在生产里**不再承担安全职责** —— 它现在为
+`E2B_REAL_ROOT=0` 的部署兜底（defense in depth），而生产里"漏一条拦截"的后果从"在宿主路径空间解析"
+变成了"在沙箱自己的树里解析"。
 
-于是"退役模拟"这件事的性质变了：**它不再是安全改进，而是代码卫生**（并且被 pure 形态挡着——
-只要 pure 还要跑，翻译代码就得留着）。要不要做它，取决于愿不愿意为"少维护一套模拟"付重构代价，
+于是"退役模拟"这件事的性质变了：**它不再是安全改进，而是代码卫生**（并且被
+`E2B_REAL_ROOT=0` 这个配置挡着）。要不要做它，取决于愿不愿意为"少维护一套模拟"付重构代价，
 而**不做不再是欠一道防线**。
 
 ---
@@ -171,7 +210,7 @@ S2 原本问的是"pure 形态能不能也吃真根"。读了代码，答案是*
 | 阶段 | 做什么 | 验收 |
 |---|---|---|
 | S1 | ✅ **已完成**：真根成为线上形态，并写进清单（**收益已交付**，见 §5） | `kubectl diff` 为空；两形态对照表（`deploy-clusters.md` §7） |
-| S2 | ✅ **已回答**：pure 形态**结构上**吃不了真根（没有 rootfs 可 pivot）⇒ 枢纽从"让 pure 吃真根"变成"**pure 还要不要存在**" | 结论见 §5，依据是 `context.rs` 的前置与两套生产清单都设了 base image |
+| S2 | ✅ **已回答**：pure 走真根**可行但要合成 rootfs**，而那份 rootfs 的内容正好是它今天的 Landlock 白名单 ⇒ 这同时是 **N15 的一条替代路线**（一次合成换掉 33 条闸门） | 结论与实测见 §5；三个探针 `tmp/k0s/probe-pure-realroot.py`（A=EBUSY、A2=同树无隔离、B=合成根真隔离） |
 | S3 | **优先走 §4.1 的分路径**：真根下的 handler 改成 `Continue`（沿用 `exec`/`chdir` 已有的 `child_is_pivoted` 判据），翻译只留给模拟根。真正删代码要等 S5 | 每个改动过的 handler 在 `E2B_REAL_ROOT=0/1` 两态下 security 套件全绿；不可放行的那批（`open`/`write`/`stat`/`statx`/`readlink`/`xattr`/`utimensat`）**保持不变**，并在提交信息里写明为什么 |
 | S4 | 账本换观察点（或证明周期扫描足够），再退写拦截 | 磁盘门禁的单测与集群验收不变 |
 | S5 | 真根成为**唯一**形态，模拟那套整体退役。**注意这是代码卫生，不是安全改进**（§5） | 没有 `E2B_REAL_ROOT=0` 也能全绿 |
