@@ -1,0 +1,2 @@
+warning: `sandlock-core` (lib) generated 14 warnings (run `cargo fix --lib -p sandlock-core` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.19s

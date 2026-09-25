@@ -1,0 +1,99 @@
+   Compiling sandlock-core v0.9.0-beta (/src/crates/sandlock-core)
+warning: sandlock-core@0.9.0-beta: failed to compile restore-stub: no working C compiler (install cc/gcc); checkpoint restore is unavailable
+warning: unused import: `crate::seccomp::syscall::syscall_name_to_nr`
+  --> crates/sandlock-core/src/sys/path_surface.rs:46:5
+   |
+46 | use crate::seccomp::syscall::syscall_name_to_nr;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> crates/sandlock-core/src/checkpoint/noexec.rs:230:9
+    |
+136 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+230 |         unsafe {
+    |         ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `entry`
+   --> crates/sandlock-core/src/checkpoint/noexec.rs:142:13
+    |
+142 |         let entry = u64::from_le_bytes(ehdr[24..32].try_into().unwrap());
+    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_entry`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `Disposition` is never used
+  --> crates/sandlock-core/src/sys/path_surface.rs:50:17
+   |
+50 | pub(crate) enum Disposition {
+   |                 ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MEDIATED_PATH_SYSCALLS` is never used
+  --> crates/sandlock-core/src/sys/path_surface.rs:67:18
+   |
+67 | pub(crate) const MEDIATED_PATH_SYSCALLS: &[&str] = &[
+   |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNMEDIATED_PATH_TAKING` is never used
+   --> crates/sandlock-core/src/sys/path_surface.rs:123:18
+    |
+123 | pub(crate) const UNMEDIATED_PATH_TAKING: &[(&str, Disposition)] = &[
+    |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `PURE_LANDLOCK_GATED` is never used
+   --> crates/sandlock-core/src/sys/path_surface.rs:274:18
+    |
+274 | pub(crate) const PURE_LANDLOCK_GATED: &[&str] = &[
+    |                  ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `PURE_GATED_ELSEWHERE` is never used
+   --> crates/sandlock-core/src/sys/path_surface.rs:292:18
+    |
+292 | pub(crate) const PURE_GATED_ELSEWHERE: &[(&str, &str)] = &[
+    |                  ^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `PURE_UNGATED` is never used
+   --> crates/sandlock-core/src/sys/path_surface.rs:323:18
+    |
+323 | pub(crate) const PURE_UNGATED: &[(&str, &str)] = &[
+    |                  ^^^^^^^^^^^^
+
+warning: constant `NON_PATH_SYSCALLS` is never used
+   --> crates/sandlock-core/src/sys/path_surface.rs:368:18
+    |
+368 | pub(crate) const NON_PATH_SYSCALLS: &[&str] = &[
+    |                  ^^^^^^^^^^^^^^^^^
+
+warning: constant `FP_XSTATE_MAGIC1` is never used
+  --> crates/sandlock-core/src/checkpoint/restore_blob.rs:69:7
+   |
+69 | const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+   |       ^^^^^^^^^^^^^^^^
+
+warning: constant `FP_XSTATE_MAGIC2` is never used
+  --> crates/sandlock-core/src/checkpoint/restore_blob.rs:70:7
+   |
+70 | const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
+   |       ^^^^^^^^^^^^^^^^
+
+warning: constant `SW_RESERVED_OFF` is never used
+  --> crates/sandlock-core/src/checkpoint/restore_blob.rs:72:7
+   |
+72 | const SW_RESERVED_OFF: usize = 464;
+   |       ^^^^^^^^^^^^^^^
+
+warning: constant `MIN_XSTATE_SIZE` is never used
+  --> crates/sandlock-core/src/checkpoint/restore_blob.rs:75:7
+   |
+75 | const MIN_XSTATE_SIZE: usize = 512 + 64;
+   |       ^^^^^^^^^^^^^^^
+
+warning: `sandlock-core` (lib) generated 14 warnings (run `cargo fix --lib -p sandlock-core` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.98s

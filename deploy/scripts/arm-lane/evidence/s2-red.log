@@ -1,0 +1,6 @@
+    checkpoint::restore_blob::tests::aarch64_a_fp_capture_of_the_wrong_size_is_refused
+    checkpoint::restore_blob::tests::aarch64_fpstate_image_is_a_fpsimd_record_not_a_kernel_fpsimd_state
+    checkpoint::restore_blob::tests::aarch64_rearm_rejects_a_restart_sentinel_left_in_x0
+
+test result: FAILED. 33 passed; 3 failed; 0 ignored; 0 measured; 857 filtered out; finished in 0.13s
+

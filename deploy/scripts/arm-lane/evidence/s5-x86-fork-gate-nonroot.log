@@ -1,0 +1,28 @@
+==> core_lib
+    previous core_lib log archived as tmp/core_lib-r51.log
+    902 passed -- matches baseline
+==> core_integ
+    previous core_integ log archived as tmp/core_integ-r41.log
+    551 passed -- matches baseline
+==> ffi
+    previous ffi log archived as tmp/ffi-r36.log
+    104 passed -- matches baseline
+==> cli
+    previous cli log archived as tmp/cli-r35.log
+    98 passed -- matches baseline
+==> supervise
+    previous supervise log archived as tmp/supervise-r33.log
+    51 passed -- matches baseline
+==> supervise_cost
+    previous supervise_cost log archived as tmp/supervise_cost-r30.log
+    3 passed -- matches baseline
+==> cli_build
+    previous cli_build log archived as tmp/cli_build-r30.log
+    0 passed -- matches baseline
+==> python
+    previous python log archived as tmp/python-r29.log
+    465 passed -- matches baseline
+oci is root-mode: run `sh scripts/test-all.sh --oci-root` as root to verify the oci baseline;
+supervise_root is root-mode: run `sh scripts/test-all.sh --supervise-root` as root to verify
+the foreign-uid acceptance; mediation_2uid is root-mode: run `sh scripts/test-all.sh
+--mediation-2uid` as root to verify the F6.1 two-uid / C档 acceptance

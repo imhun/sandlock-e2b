@@ -1,0 +1,16 @@
+....x.xxx........sssss..............s..s......ss                         [100%]
+=========================== short test summary info ============================
+SKIPPED [1] tests/security/test_fork_network_features.py:363: docker is required for template build tests
+SKIPPED [1] tests/security/test_fork_network_features.py:398: docker is required for template build tests
+SKIPPED [1] tests/security/test_network_enforcement.py:101: docker is required for template build tests
+SKIPPED [1] tests/security/test_network_enforcement.py:154: docker is required for template build tests
+SKIPPED [1] tests/security/test_network_enforcement.py:208: docker is required for template build tests
+SKIPPED [1] tests/security/test_template_isolation.py:45: no base image configured for template isolation test
+SKIPPED [1] tests/security/test_template_isolation.py:164: the unprivileged worker shape both production manifests ship
+SKIPPED [1] tests/security/test_worker_nonroot.py:160: E5.1 container tests need Linux, a reachable Docker daemon (mount /var/run/docker.sock) and the fork wheels (run ./deploy/scripts/build-sandlock-wheels.sh first)
+SKIPPED [1] tests/security/test_worker_nonroot.py:197: E5.1 container tests need Linux, a reachable Docker daemon (mount /var/run/docker.sock) and the fork wheels (run ./deploy/scripts/build-sandlock-wheels.sh first)
+XFAIL tests/security/escape/test_path_surface_inotify.py::test_pure_shape_inotify_still_reaches_the_host_root - known residual: the pure (no-chroot) shape has no path mediation at all -- Landlock is its only barrier and it has no access right for inotify -- so the watch still resolves against the host root there
+XFAIL tests/security/test_chroot_exec_shebang.py::test_shebang_script_written_into_the_workspace_runs - N35: refused without a real root (EACCES/ETXTBSY) -- docs/chroot-workspace-exec.md
+XFAIL tests/security/test_chroot_exec_shebang.py::test_script_whose_interpreter_was_written_in_the_same_command_runs - N35: a workspace-resident interpreter is refused without a real root -- docs/chroot-workspace-exec.md
+XFAIL tests/security/test_chroot_exec_shebang.py::test_a_format_handler_resolves_its_interpreter_inside_the_sandbox - N35: a format handler's interpreter is resolved in the host's path space without a real root -- docs/chroot-workspace-exec.md
+35 passed, 9 skipped, 4 xfailed in 2116.35s (0:35:16)

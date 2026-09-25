@@ -1,0 +1,42 @@
+# A real-kernel aarch64 lane for the sandlock C/R work.
+#
+# This is the tracked copy of the config the live VM was created from; the
+# commentary is the original. Full usage, constraints and the symptom table are
+# in docs/cross-platform-lanes.md.
+#
+# Two absolute paths below point at this checkout (the base image and the
+# transport mount). If the repo moves, update them -- and note the image is
+# a downloaded Ubuntu cloud image, not something the repo ships.
+#
+# Deliberately no `networks:` section: the `lima: shared` mode needs
+# socket_vmnet installed through sudo, and this lane only needs to reach
+# the guest over Lima's own ssh port forward.
+vmType: qemu
+arch: aarch64
+cpus: 6
+memory: 8GiB
+disk: 30GiB
+
+mountType: 9p
+
+images:
+  # Reused from the hand-rolled qemu lane: same Ubuntu 24.04 arm64 cloud image.
+  # Local so the create step does not depend on a mirror (TUNA 403s the Go client).
+  - location: "file:///Users/polus/project/ai/sandlock-e2b/tmp/arm-vm/noble-arm64.img"
+    arch: aarch64
+
+# Mounted at the identical path inside the guest on purpose: the test
+# binaries bake absolute host paths at compile time (CARGO_MANIFEST_DIR,
+# the restore-stub OUT_DIR, and the integration test's stub lookup).
+# The host tree is exposed as *transport*, not as the run root. Landlock's
+# rules are accepted on a 9p mount but never match, so every sandbox test that
+# confines a workspace path is refused EACCES -- the run root therefore has to
+# be a real filesystem inside the guest (see deploy/scripts/arm-lane/lima-vm.sh).
+mounts:
+  - location: "/Users/polus/project/ai/sandlock-e2b"
+    mountPoint: "/lima-repo"
+    writable: false
+
+containerd:
+  system: false
+  user: false

@@ -1,0 +1,12 @@
+===== --oci-root =====
+==> oci
+    previous oci log archived as tmp/oci-r63.log
+    157 passed -- matches baseline
+===== --supervise-root =====
+==> supervise_root
+    previous supervise_root log archived as tmp/supervise_root-r28.log
+    4 passed -- matches baseline
+===== --mediation-2uid =====
+==> mediation_2uid
+    previous mediation_2uid log archived as tmp/mediation_2uid-r27.log
+    9 passed -- matches baseline

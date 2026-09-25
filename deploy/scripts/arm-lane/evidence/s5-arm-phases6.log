@@ -1,0 +1,31 @@
+==> ffi (uid501, cwd /src/crates/sandlock-ffi)
+    sandlock_ffi-e53d91f8e5844d40
+    c_smoke-68d64d09298c5ba3
+    failure_reason-2cadd0bf24f89f0c
+    fs_mount-a99cad541d76464b
+    handler_smoke-45ceb04789a9ed9b
+    instance_exec-83107e8b360941e4
+    policy_fn-56805b5bc5b66651
+    popen-7147677e03e31448
+    protection-3e5db2c7a061b747
+    restore-a4cc22159fc63a56
+    ffi: 104 passed
+==> supervise (uid501, cwd /src/crates/sandlock-supervise)
+    sandlock_supervise-8538d3bd84aba6c9
+    supervise-72b8fdba414f94f0
+    supervise: 51 passed
+==> oci (root, cwd /src/crates/sandlock-oci)
+    sandlock_oci-0f592da75d820831
+    sandlock_oci-acab050f41acb302
+    integration-1b0feee20ace71f6
+    test_init_reaper-458f9c3ca4b99888
+    test_kill_all_delivery-49c0dd3ee497d8e6
+    test_process_groups-829760fc2be82cac
+    oci: 157 passed
+==> supervise_root (root, cwd /src/crates/sandlock-supervise)
+    supervise_root-3ff1d3f0cb60788b
+    supervise_root: 4 passed
+==> mediation_2uid (root, cwd /src/crates/sandlock-supervise)
+    mediation_2uid-958a2fd47e10cd01
+    mediation_2uid: 9 passed
+all phases ran
