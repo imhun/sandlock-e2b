@@ -23,6 +23,11 @@ checkpoint/restore 补的正是这一段：**把一个正在跑的沙箱写进�
 **所以这个能力的产品形状是：`pause` 变得能在 worker 重启后存活。**
 （不是新造一个用户可见的动词；E2B SDK 的 `pause()`/`connect()` 已经有位置放它。）
 
+**但"存活"有个上限，是引擎给的（§1(d)）**：恢复出来的沙箱里**原有那个进程**回来了，
+而**新的 exec 不被服务**（OCI 的恢复路径按名拒绝，因为 exec 靠 `sandlock-init`，
+恢复出的沙箱没有 init）。所以对"长驻服务要继续服务"够用，对"继续在这个箱子里干活"不够 ——
+这是 §2 的 D9，需要先拍。
+
 > ⚠ 需求本身仍未确认：仓库里没有任何"用户要这个"的记录，`envd` 至今没碰过这套 API。
 > 本设计按"`pause` 存活"这个最有说服力的形状写；如果最后没人要，停在这里的代价也只是这份文档。
 
@@ -78,6 +83,31 @@ socket / pipe / memfd 恢复不了（引擎固有边界，与架构无关）。�
 `test_restore.rs` 断言"只有 stdio"），所以 E2B 侧要做的是**把它作为恢复结果的一部分**
 返回/记录，并在文档里说清"恢复的沙箱没有原有的网络连接"。
 
+### (d) 恢复出来的沙箱**不能 exec** —— 这是引擎的语义，不是缺口
+
+S1 的 `checkpoint` verb 落地后去查 restore 那一半，撞到引擎自己写死的一句话。
+OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_running`）
+对 `Exec` 的回答是：
+
+    exec is not supported on a restored container
+
+旁边的理由是：**exec 靠 `sandlock-init` 转发**，而恢复出来的沙箱里**没有 init** ——
+`restore_interactive` 起的是一个"被还原的进程"，不是 `sandlock-init`
+（对照 create 路径：它 `spawn` 出 init，再由 init 服务 exec）。
+
+**这条改变的是产品含义，不是实现细节**：
+
+| | 今天（SIGSTOP 冻结） | 恢复之后 |
+|---|---|---|
+| 原来那个进程 | 活着 | **活着**（内存状态回来了） |
+| 能不能 exec 新命令 | 能 | **不能**（引擎按名拒绝） |
+
+所以"pause 活过 worker 重启"换来的不是一个**完好如初**的沙箱，而是一个
+**进程还在、但不能再往里敲命令**的沙箱。对"跑着长驻服务、要它继续服务"的形状这够了
+（服务照旧）；对"我要继续在这个箱子里干活"的形状，**不够**。
+
+于是 E2B 侧必须先回答一个产品问题（§2 D9），而不是先写代码。
+
 ---
 
 ## 2. 决策点与建议
@@ -92,17 +122,19 @@ socket / pipe / memfd 恢复不了（引擎固有边界，与架构无关）。�
 | D6 | `restore_skipped` 对外 | 恢复结果里带 fd 表；日志 + 文档明说"连接不回来"；**不**假装成功 | §1(c) |
 | D7 | 跨节点 | 允许（blob 在共享 NFS 上），但**同内核**是硬前提 | 引擎前提，与架构无关 |
 | D8 | 清理 | 随沙箱 teardown 一起删（`_delete_sandbox_runtime` 已经按 verified target set 删 `_runtime`） | 不新增一条回收路径 |
+| D9 | **恢复后 exec 不可用，产品上怎么算** | **二选一，需要拍板**：**(a)** 接受"恢复 = 进程回来、不能再 exec"，把它写进对外语义（长驻服务形状够用）；**(b)** 让恢复出来的会话 exec-capable（引擎侧要新做"把 checkpoint 还原进一个带 init 的会话"），代价明显更大 | §1(d)：引擎自己按名拒绝 `exec is not supported on a restored container`。这不是我们能顺手补的缺口，是"恢复一个进程"与"恢复一个可交互的箱子"的区别 |
 
 ---
 
-## 3. 阶段（每阶段独立验收，S0 已完成）
+## 3. 阶段（每阶段独立验收）
 
 | 阶段 | 做什么 | 验收 |
 |---|---|---|
 | **S0** | ✅ 修掉守卫用例里过时的架构说法（它仍写着"引擎只支持 x86_64/riscv64、aarch64 要先移植"，而 aarch64 的 S0–S5 2026-09-24 已落地） | 用例文本与代码一致 |
-| **S1** | fork：slot 加 `checkpoint` verb（写 blob 到调用方指定的路径）与 `restore`（按 policy 起 slot 并恢复） | fork 的 supervise 相位有新用例；旧 client 对未知 verb 的行为不变 |
+| **S1a** | ✅ fork：slot 加 `checkpoint` verb（写 blob 到调用方指定的路径）—— fork `e76cb2f`，主仓 pin `82a26df` | fork 的 supervise 相位 **31 passed / 0 failed**，新用例钉住"镜像是引擎格式"与"捕获不是 kill" |
+| **S1b** | fork：`restore` —— 但它不是一条 verb，而是**从镜像起一个 slot**（`Checkpoint::load` → 用镜像里的 policy 起沙箱 → `restore_interactive`），服务 `stats`/`shutdown`、**按名拒绝 exec**（照 OCI 的既有语义） | fork 相位新用例：从镜像起的 slot `stats` 说进程活着、`exec` 得到那句按名拒绝、`shutdown` 干净退出。**先答 D9 再动手**：若选 (b)，S1b 的形状完全不同 |
 | **S2** | worker：agent 端点 + D1/D2/D8 的落地 + **D3 的平台账与拒绝路径** | 单测：blob 落在 `_runtime`、沙箱读不到、**平台账计入且用户的 `diskMB` 不变**、平台账不够时拒绝而不是写入、teardown 删净 |
-| **S3** | 生命周期：`pause` 写、`resume`（进程不在时）恢复，旗标默认关 | 集群验收：**启一个跑着的沙箱 → 重启 worker → resume → 进程状态还在**（正是今天做不到的那一条） |
+| **S3** | 生命周期：`pause` 写、`resume`（进程不在时）恢复，旗标默认关 | 集群验收：**启一个跑着的沙箱 → 重启 worker → resume → 进程状态还在**（正是今天做不到的那一条）。**验收要连 §1(d) 一起写**：恢复后 `exec` 的行为按 D9 的结论定（(a) 则断言那句按名拒绝，(b) 则断言能继续 exec） |
 | **S4** | `restore_skipped` 的对外语义（D6） | 契约用例 + 文档 |
 
 **S1 之前的任何 E2B 侧改动都没有意义**：没有 verb，worker 拿不到 `Sandbox`。
