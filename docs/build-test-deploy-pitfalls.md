@@ -60,6 +60,10 @@ sandlock-dev:latest sh scripts/test-all.sh`；该镜像 entrypoint 自动降到 
 
 ## B. 跑测试 / lane
 
+> 这一节是**症状 → 真因**的速查。两套 lane（x86_64 容器 + aarch64 真内核）的完整方案、
+> 脚本清单、VM 定义、重建步骤与基线数字在 **`docs/cross-platform-lanes.md`**；本节只留
+> 踩过的坑，两边互为索引。
+
 **B1. dev 容器里一切 namespace 测试都红：`unshare(CLONE_NEWUSER): Operation not permitted`。**
 原因：`sandlock-dev-*` 用 Docker 默认 seccomp 档，`unshare` 被按 `CAP_SYS_ADMIN` 门控——而那正是
 线上 profile 放行的 syscall。

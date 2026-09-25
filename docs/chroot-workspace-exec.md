@@ -906,12 +906,15 @@ arm64 相位（含 C-ABI）与 x86_64 基线**逐条相同**（157/4/9/104/51，
 （A）还是装机（B）"现在**是个真问题**了，而 §11.6 的结论不变：投递本身没有架构假设，S3 落地
 **没有让 A 返工**。逐阶段判据与证据在 fork 的 `docs/fork-plan-2026-09-aarch64-restore.md`。
 
+（这条 lane 本身怎么搭、怎么跑、踩过哪些坑，见 `docs/cross-platform-lanes.md`；脚本与 VM
+定义在 `deploy/scripts/arm-lane/`。）
+
 **S5 的 arm64 两态（本节更新的一部分）**：`tests/security` 在 arm64 lane 上两态都绿 ——
 `E2B_REAL_ROOT=0` **35 passed / 9 skipped / 4 xfailed**、`E2B_REAL_ROOT=1` **38 passed /
 9 skipped / 1 xfailed**（同轮 x86_64 生产形态 lane：43/1/4 与 46/1/1；两边的 passed+xfailed
 都是 39/47，差的那 8 条是 arm64 guest 没有 docker 守护进程/socket/CLI 导致的 skip）。
-日志：`tmp/arm-lane/s5-arm-security-realroot{0,1}.log` 与 `s5-x86-security-realroot{0,1}.log`；
-x86 那两条是用 `tmp/arm-lane/x86-security.sh` 取的（`test-prod-shaped.sh` 的 phase 1 跑整个
+日志：`deploy/scripts/arm-lane/evidence/s5-arm-security-realroot{0,1}.log` 与 `deploy/scripts/arm-lane/evidence/s5-x86-security-realroot{0,1}.log`；
+x86 那两条是用 `deploy/scripts/arm-lane/x86-security.sh` 取的（`test-prod-shaped.sh` 的 phase 1 跑整个
 `tests` 树，无法只跑一个目录，见 pitfalls B4），镜像、cap 集、seccomp 档、registry mirror 与它
 一致。arm64 的 `E2B_REAL_ROOT=0` 那一条没有重跑探针修复后的代码：探针唯一的调用点在
 `if self._real_root and …` 里面，这个形态根本不会走到它。
