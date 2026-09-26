@@ -2443,3 +2443,107 @@ worker 同时打印每轮用了哪条路，避免"功能其实是空转"看不�
 
 另外 `deploy/scripts/deployment_smoke.py` 与 `multinode_smoke.py` 均通过（含命令、文件、迁移、
 网络、卷、模板构建、MCP 网关六条路径 —— 也就是**写路径改走沙箱之后**的全链路）。
+
+## 23. N27（2026-09-26）：沙箱树根下沉一级，平台状态搬到它的兄弟目录
+
+这一步把共享卷上的**目录布局**改掉（挂载参数一个字没动，见
+`deploy/k8s-k0s/storage-nas.yaml` 的文件头）：
+
+```
+改前： <export>/<id>            <export>/_runtime      <export>/.route-b   …
+改后： <export>/workspaces/<id> <export>/state/_runtime <export>/state/.route-b …
+```
+
+两个理由，缺一不可：
+
+* **平台状态不在沙箱走得出来的那条路上**：真根形态下沙箱从自己的树往上走一步到
+  `<export>/workspaces`；平台的文件（记录、命令日志、checkpoint 镜像、route-B 槽位、
+  uid 池的锁与预约）现在是它的**兄弟**，不在那条路的尽头。
+* **迁移是秒级的**：`rename(2)` 的边界是**挂载点**，`workspaces/` 与 `state/` 与旧位置
+  在同一个挂载里，所以每一棵树都是一次元数据改名（checkpoint 镜像 GiB 级，整树拷贝
+  那条路不可接受）。回退同样是改名。
+
+### 23.1 迁移窗口（用户已接受，2026-09-26 决策 2）
+
+窗口内 **worker 缩到 0**：现有沙箱全部消失（进程没了），**数据保留**（树、记录、
+checkpoint 镜像都还在卷上，迁完可用 `fork`/`--restore-from` 那条恢复路径起来）。
+控制面可以留着 —— 只读的它看不见写，`_migrate` 那份 subPath 要等新清单 apply 之后
+才需要。
+
+### 23.2 执行顺序（**顺序错了就得回退**，见 `deploy/k8s/control-plane.yaml` 的注释）
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+
+# 0) 停写：副本缩到 0 且确认没有 worker pod 还在跑（脚本也会验一遍）
+kubectl -n sandlock scale statefulset/e2b-worker --replicas=0
+kubectl -n sandlock wait --for=delete pod -l app=e2b-worker --timeout=300s
+
+# 1) 先只看不写（默认就是 dry-run）：脚本经控制面 pod 读实物、打印计划
+deploy/scripts/migrate-state-base.sh
+
+# 2) 真迁移：脚本建 configmap + Job（runAsUser 0、PVC 以 RW 挂到 /shared），跑完收日志清理
+deploy/scripts/migrate-state-base.sh --apply
+deploy/scripts/migrate-state-base.sh --apply --delete-after   # 可选：连陈旧锁与空壳一起清掉
+
+# 3) 再上新清单，最后把 worker 起回来
+deploy/k8s-k0s/apply.sh
+kubectl -n sandlock scale statefulset/e2b-worker --replicas=2
+```
+
+脚本的硬性质（`tests/unit/test_migrate_state_base_script.py` 逐条钉住）：默认 dry-run；
+**一切搬迁都是 `rename(2)`**，跨挂载（EXDEV）是**拒绝**而不是退化成拷贝；没有任何递归
+删除（`--delete-after` 只 `unlink` 那个 0 字节的陈旧 `.uid_pool.lock` 与 `rmdir` 那几个
+空壳，`rmdir` 对非空目录必然失败）；worker 不在 0 副本、`.uid_reservations` 非空、或顶层
+出现不认识的条目，一律非零退出。
+
+### 23.3 回退（原路退回 + 撤掉新清单里的 `E2B_STATE_BASE`）
+
+脚本在卷上留了一份 **0600** 的映射表 `state/.state-base-migration.journal`（每搬一项就
+`fsync` 追加一行），回退就是拿它逐条反向改名：
+
+```bash
+kubectl -n sandlock scale statefulset/e2b-worker --replicas=0     # 同样先停写
+deploy/scripts/migrate-state-base.sh --rollback                   # 先看反向计划
+deploy/scripts/migrate-state-base.sh --rollback --apply           # 真的退回（同一个 Job 清单，换 args）
+```
+
+**然后必须手工把清单改回去**（迁移脚本只碰数据，不碰清单）：
+
+1. `deploy/k8s/worker.yaml` 与 `deploy/k8s/control-plane.yaml` 里撤掉 `E2B_STATE_BASE`；
+2. 它们的 `E2B_WORKSPACE_BASE` 回到 `/var/lib/e2b-sandboxes`（树根上浮一级）；
+3. worker 的 `E2B_ROUTE_B_TMP_ROOT` 回到 `/var/lib/e2b-sandboxes/.route-b`；
+4. 撤掉控制面那两个新 subPath（`workspaces/_migrate`、`state`）；
+5. `deploy/k8s-k0s/apply.sh` 再起 worker。
+
+回退跑完后 `<export>/state`、`<export>/workspaces` 会被 `rmdir` 掉，journal 改名成
+`<export>/.state-base-migration.journal.rolled-back`（仍是 0600，留作证据）。
+`--delete-after` 删掉的那个陈旧 `.uid_pool.lock` 不回来 —— 它是锁文件，新位置由
+`uid_pool.acquire` 按需 `O_CREAT`（`envd_service/uid_pool.py`）。
+
+### 23.4 两条与安全有关的运维事实
+
+* **脚本创建的每一个文件都是 0600**（`umask 077` + journal 显式 `chmod`）。原因：
+  `<workspaces>/_migrate` 是 **1777**（worker 与控制面都要往里写），迁移窗口内猜到
+  `<id>.tar.gz` 名字的沙箱理论上能读别人的归档 —— 那是**既有的暴露面**，本脚本不新增
+  一个。迁移动的是目录树（`rename` 不需要读文件内容），日志与 journal 只写在自己的
+  0600 文件里。
+* **0600 挡不住这个 Job，因为它以 root 跑**（`runAsUser: 0`）：文件是它自己建的、
+  属主就是它，读写都不需要 `CAP_DAC_OVERRIDE`；而 `rename(2)` 本来也不需要被搬对象的
+  任何权限，只要两端父目录可写。Job 的清单里那份 `securityContext` 因此不是可选项。
+
+### 23.5 验证（迁完在这个窗口里做，不用等起沙箱）
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+kubectl -n sandlock exec e2b-worker-0 -c worker -- sh -c '
+  ls -a /var/lib/e2b-sandboxes            # 六个平台命名空间 + state + workspaces
+  ls -a /var/lib/e2b-sandboxes/workspaces # 每一棵 <id> 都在，_migrate 也在
+  ls -a /var/lib/e2b-sandboxes/state      # _runtime（含 .checkpoints）、.route-b
+  stat -c "%d %i %n" /var/lib/e2b-sandboxes/state/_runtime/.checkpoints'
+```
+
+迁移脚本自己的输出里有对账表：每一步的 `VERIFY … dev=… ino=… same_inode=yes src_gone=yes`
+（inode 不变即"是改名不是拷贝"）、`_runtime` 与 `.checkpoints` 的前后计数、以及抽样
+8 个小文件的 `SAMPLE … sha_same=yes ino_same=yes`。这些行由 `kubectl logs job/state-base-migrate`
+收到，`--keep-job` 可以让 Job 留着不删。
