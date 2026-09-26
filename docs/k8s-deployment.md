@@ -758,8 +758,9 @@ pod 停在 `CreateContainerConfigError` 而不是静默用一个公共 key。
      代价：封装开销、MTU 降、Pod 网段重建。
 2. ~~撤掉临时 taint，把 `e2b-worker` 拉到 2 副本，按 §6 复跑 A/B/C 并开始 **N13**。~~
    ✅ 已做（2026-09-17）：Calico 换完（§11）后 A/B/C 全绿，N13 在 §13 收口。
-3. 收尾遗留：worker 的稳定 node id（F7）、v3/nolock 与 v4 的锁语义差异要不要写进
-   存储选型门槛、以及 F4 那条「非 root worker 与网络文件系统不兼容」是否要升级成
+3. 收尾遗留：worker 的稳定 node id（F7）、~~v3/`nolock` 与 v4 的锁语义差异要不要写进
+   存储选型门槛~~ ✅ 已写成硬门槛（2026-09-26）：`docs/production-deployment-requirements.md`
+   §5.4(a)、以及 F4 那条「非 root worker 与网络文件系统不兼容」是否要升级成
    基线的显式约束。
 
 ---
@@ -985,6 +986,7 @@ N13 之前基线是钉死单副本的（`deploy/k8s/worker.yaml` `replicas: 1` +
 **前置是存储的锁必须跨节点**：uid 池靠 `<base>/.uid_pool.lock` 的 flock 互斥，
 阿里云 NAS 上只有 **NFSv4.0** 成立（v3+`nolock` 只是**本地**锁，跨节点不互斥 ⇒ 两个副本
 可能发出同一个 uid）。这条已写进清单注释，别在 v3/`nolock` 的存储上照抄这份形态。
+（门槛与复核时机：`docs/production-deployment-requirements.md` §5.4(a)）
 
 ⚠ **镜像 tag 的坑（收口那轮踩到，2026-09-18 已消）**：`deploy/k8s-k0s/apply.sh` 会把**所有**
 `byteplan/e2b-sandlock-*` 的 tag 统一替换成 `deploy/stack/.version` 里的那一个字符串，
