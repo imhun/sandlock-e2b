@@ -55,9 +55,17 @@ class DockerPoolBackend:
             # the supervisor's connect fd injection. BOTH are required --
             # `create_app` refuses the unpaired shape by name
             # (envd_service/config.py:471-479), which crash-loops a worker
-            # rather than silently cutting every sandbox's network. Set here
-            # (not in `cmd`) so E2B_AS_WORKER_ENV can still override the pair
-            # to "false": the dictionary expands first, worker_env last.
+            # rather than silently cutting every sandbox's network.
+            #
+            # Declared, and gated: these two are read by the *sandlock* executor
+            # only, so what turns them on is the pool's own `E2B_EXECUTOR` --
+            # `auto` in the compose default since N38 (2026-09-26). Setting it
+            # back to `local` runs the worker's shared netns with the pair
+            # inert (and then a wildcard `allowOut` needs the low-port window
+            # that this backend no longer declares).
+            #
+            # Kept in the dictionary (the one place the shape is declared, next
+            # to the one seam an operator can override) rather than in `cmd`.
             "E2B_ENABLE_NET_ISOLATION": "true",
             "E2B_FD_INJECT_CONNECT": "true",
             **dict(worker_env or {}),
@@ -90,9 +98,13 @@ class DockerPoolBackend:
                 # A6: no --cap-add SYS_ADMIN. The shared-volume bind was
                 # deleted in A4 and quota goes through quota-agent
                 # (E2B_QUOTA_AGENT_URL); the container-level low-port window is
-                # gone too (2026-09-26) -- the pooled workers run the fleet's
-                # per-sandbox netns below, where the wildcard-DNS `:53` bind
-                # happens inside the sandbox's own netns as root-in-userns.
+                # gone too (2026-09-26). The pooled workers now default to the
+                # fleet's per-sandbox netns (the pair below, gated by
+                # `E2B_EXECUTOR=auto` since N38), where the wildcard-DNS `:53`
+                # bind happens inside the sandbox's own netns as root-in-userns
+                # -- so no window is needed. An operator who sets
+                # `E2B_EXECUTOR=local` gets the shared netns back with the pair
+                # inert, and that shape would need the window again.
                 "--security-opt",
                 "seccomp=unconfined",
                 # The local backend keeps `seccomp=unconfined` (above): the
