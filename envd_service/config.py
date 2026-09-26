@@ -17,6 +17,7 @@ from gateway_common.env import (
     _env_json_dict,
     _env_list,
 )
+from gateway_common.paths import PURE_ROOTFS_DIR_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,22 @@ def _image_cache_dir() -> Path:
                 "could not prepare the shared image cache %s: %s", path, e
             )
     return path.resolve()
+
+
+def _pure_rootfs_dir() -> Path:
+    """``E2B_PURE_ROOTFS_DIR``, else ``<workspace base>/_pure_rootfs``.
+
+    Beside the sandbox trees on purpose -- see
+    :data:`gateway_common.paths.PURE_ROOTFS_DIR_NAME` for why the layers below
+    it are ``0755`` and for why the switch that uses it may only be turned on
+    once the teardown side that removes ``<this>/<id>`` has landed.
+    """
+    raw = os.getenv("E2B_PURE_ROOTFS_DIR")
+    if raw:
+        return Path(raw).resolve()
+    base = Path(os.getenv("E2B_WORKSPACE_BASE", "tmp/sandboxes")).resolve()
+    return base / PURE_ROOTFS_DIR_NAME
+
 
 # Default private-egress denylist applied to the implicit full-egress branch
 # (no explicit allowOut/denyOut + internet allowed). Covers RFC1918, loopback,
@@ -124,6 +141,23 @@ class Settings:
         default_factory=lambda: os.getenv("E2B_EXECUTOR", "auto").lower()
     )
     base_image: str | None = field(default_factory=lambda: os.getenv("E2B_BASE_IMAGE"))
+    #: Shape of the pure (no base image) sandbox's root (N16). ``off`` keeps
+    #: N15's identity translation (the mediator's root is the host's "/");
+    #: ``synth`` materializes a real root per sandbox -- a plain directory the
+    #: sandbox's own mount namespace binds the host system directories, the
+    #: workspace and the volumes into -- so the pure shape can use the fork's
+    #: ``real_root`` as well. ``off`` is the default: this is a shape an
+    #: operator flips, not a silent change to a running fleet. The flip has an
+    #: ordering condition -- see
+    #: :data:`gateway_common.paths.PURE_ROOTFS_DIR_NAME`.
+    pure_rootfs: str = field(
+        default_factory=lambda: os.getenv("E2B_PURE_ROOTFS", "off").strip().lower()
+    )
+    #: Where those roots land: ``E2B_PURE_ROOTFS_DIR``, else beside the sandbox
+    #: trees under the workspace base. Read only when ``pure_rootfs`` is
+    #: ``synth``; the directory itself is created and ``chmod``ed (``0755``) by
+    #: the executor, never here.
+    pure_rootfs_dir: Path = field(default_factory=_pure_rootfs_dir)
     template_images: dict[str, str] = field(
         default_factory=lambda: _env_json_dict("E2B_TEMPLATE_IMAGES")
     )

@@ -109,6 +109,9 @@ def test_create_executor_passes_net_isolation_flags(monkeypatch) -> None:
         image_cache_dir=Path("tmp/cache"),
         # N35 carries the same way as the switches above.
         real_root=True,
+        # N16 too: the factory reads the switch and the directory together.
+        pure_rootfs="off",
+        pure_rootfs_dir=Path("tmp/cache/pure"),
     )
     executor = create_executor(
         settings,
@@ -162,6 +165,8 @@ def test_policy_ceiling_requests_bind_injection(monkeypatch) -> None:
             iam_signing_key="k",
             image_cache_dir=Path("tmp/cache"),
             real_root=False,
+            pure_rootfs="off",
+            pure_rootfs_dir=Path("tmp/cache/pure"),
         )
         executor = create_executor(
             settings,

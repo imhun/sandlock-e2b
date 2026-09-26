@@ -76,7 +76,14 @@ def test_is_sandbox_workspace_dir_separates_by_shape_not_by_name(tmp_path):
     plain_tree = tmp_path / "sbx_with_record"
     plain_tree.mkdir()
     _record(plain_tree)
-    for reserved in ("_volumes", "_snapshots", "_migrate", "_templates", "_secrets"):
+    for reserved in (
+        "_volumes",
+        "_snapshots",
+        "_migrate",
+        "_templates",
+        "_secrets",
+        "_pure_rootfs",
+    ):
         (tmp_path / reserved).mkdir()
     # The snapshot store: its marker and the copied filesystem, whose sandbox
     # record never sits at the store's top level.
@@ -112,6 +119,7 @@ def test_is_sandbox_workspace_dir_separates_by_shape_not_by_name(tmp_path):
         "_migrate",
         "_templates",
         "_secrets",
+        "_pure_rootfs",
         "snap_0040ce7e44f6365f",
         "bad.name",
     ):

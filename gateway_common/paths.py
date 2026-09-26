@@ -125,6 +125,36 @@ _SANDBOX_RECORD_NAME = "sandbox.json"
 #: sandbox has no access at all.
 RUNTIME_DIR_NAME = "_runtime"
 
+#: The per-sandbox root of the pure shape (N16): an empty skeleton for a
+#: sandbox whose shape has no base image. The sandbox's own mount namespace
+#: binds the host's system directories, the workspace and the volumes into
+#: ``<base>/_pure_rootfs/<id>`` (see
+#: ``envd_service.executors.sandlock._synthetic_rootfs_mounts``), so the pure
+#: shape can use the fork's ``real_root`` as well, with
+#: ``E2B_PURE_ROOTFS_DIR`` overriding the base. Never created when the switch
+#: is off: the pure shape then keeps N15's identity translation.
+#:
+#: It has to be traversable by the sandbox's own host uid -- the binds and the
+#: ``chdir`` into the root run inside the sandbox's *user* namespace, as the
+#: sandbox itself -- which rules out both the sandbox's own tree (it owns that
+#: one and could unlink its own root) and ``_runtime/<id>`` (``0700`` and
+#: worker-owned: a ``0700`` parent cannot be traversed by the sandbox).
+#:
+#: That is why the executor's ``mkdir``/``chmod`` of this directory and of
+#: ``<this>/<id>`` is **deliberate**: both layers are created at ``0755``, and
+#: healed back to ``0755`` when an older run or a hostile umask left them
+#: ``0700`` (the heal stops at the anchor, so a misconfigured
+#: ``E2B_PURE_ROOTFS=/`` never ``chmod``s ``/``). An operator seeing this
+#: directory's mode change in a worker log is watching the synthesis work, not
+#: a bug.
+#:
+#: Enabled only *after* the teardown that removes ``<base>/_pure_rootfs/<id>``
+#: has landed -- the two are separate steps of
+#: ``docs/superpowers/plans/2026-09-26-pure-shape-synthetic-rootfs.md``, and
+#: until the cleanup side runs, every destroyed sandbox would leave its root
+#: behind. Reserved like the rest of the platform's namespaces, below.
+PURE_ROOTFS_DIR_NAME = "_pure_rootfs"
+
 #: The sandbox's command output log (JSONL), written by the worker.
 COMMAND_LOG_NAME = "command-logs.jsonl"
 
@@ -229,6 +259,12 @@ RESERVED_PLATFORM_NAMESPACES = frozenset(
         #: like the rest -- it must never be listed as an untrusted tree, never
         #: reaped as an orphan and never parked.
         RUNTIME_DIR_NAME,
+        #: The pure shape's per-sandbox roots, a platform layer rather than a
+        #: tenant tree: see :data:`PURE_ROOTFS_DIR_NAME`. Listed here so the
+        #: walks that consult this list -- the park offer and the fail-safe
+        #: quota scan's second stage -- skip it, and so the create path refuses
+        #: the id.
+        PURE_ROOTFS_DIR_NAME,
         "_secrets",
         "_snapshots",
         "_templates",

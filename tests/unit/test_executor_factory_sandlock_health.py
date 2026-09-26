@@ -43,6 +43,11 @@ def _settings(executor: str) -> SimpleNamespace:
         # N35: the factory forwards this one too (settings.real_root ->
         # SandlockExecutor(real_root=...)), so the fake has to carry it.
         real_root=False,
+        # N16 carries the same way, and its two halves are read together: the
+        # fake spells the switch with its default so the `off` branch is the
+        # one these cases take.
+        pure_rootfs="off",
+        pure_rootfs_dir=Path("tmp/cache/pure"),
     )
 
 

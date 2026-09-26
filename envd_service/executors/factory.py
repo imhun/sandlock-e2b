@@ -196,6 +196,14 @@ def create_executor(
                 workspace_dir=workspace_dir,
                 base_image=base_image,
                 image_rootfs=image_rootfs,
+                # N16: the pure shape gets a synthesized root only when the
+                # operator flipped the switch. `off` (the default) hands over
+                # no directory at all, which is what keeps N15's shape.
+                pure_rootfs_dir=(
+                    settings.pure_rootfs_dir
+                    if settings.pure_rootfs == "synth"
+                    else None
+                ),
                 host_uid=host_uid,
                 per_sandbox_uid=per_sandbox_uid,
                 memory_mb=memory_mb,
