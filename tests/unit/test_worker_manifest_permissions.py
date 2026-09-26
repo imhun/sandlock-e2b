@@ -1263,3 +1263,190 @@ def test_only_the_arm_lane_keeps_a_low_port_window() -> None:
     assert "ip_unprivileged_port_start" not in _without_comment_lines(pool)
     # The k8s pod-level window is gone (N5) and must stay gone.
     assert POD_SYSCTL not in K8S_WORKER
+
+
+# --------------------------------------------------------------------------
+# O3 Task 4 (2026-09-26): the two credentials with NO rotation window --
+# `E2B_REDIS_PASSWORD` and `E2B_QUOTA_AGENT_TOKEN`.
+#
+# The ruling that shapes both pins is in `docs/superpowers/plans/
+# 2026-09-26-decisions.md` #5 plus the same-day O3 second-round addendum:
+# redis keeps ONE `--requirepass` and the 10-30 s interruption is *accepted*
+# (the ACL double-user shape stays an alternative in the runbook, not code),
+# and the api/internal keys are a separate, already-two-windowed matter
+# (Task 3, `8d4c83c`). `deploy/k8s/redis.yaml` therefore does not move -- what
+# moves is that the interruption and the "auth comes from the Secret" shape
+# are written down and pinned, because an edit that inlines a password (or
+# drops the `secretKeyRef`) would make the runbook's rotation steps impossible
+# while every other test in this file stayed green.
+# --------------------------------------------------------------------------
+
+K8S_REDIS = (REPO / "deploy" / "k8s" / "redis.yaml").read_text(encoding="utf-8")
+RUNBOOK = (REPO / "docs" / "k8s-deployment.md").read_text(encoding="utf-8")
+
+#: 表 3's two rows, verbatim from the runbook (single source: the doc is
+#: asserted against these strings rather than against key phrases, so a
+#: rewording cannot silently drop a step or the window).
+REDIS_TABLE_ROW = (
+    "| `E2B_REDIS_PASSWORD` | ① 排维护窗口 ② `deploy/k8s-k0s/secrets.sh --rotate "
+    "E2B_REDIS_PASSWORD` ③ `kubectl -n sandlock rollout restart deploy/redis` "
+    "④ `kubectl -n sandlock rollout restart deploy/control-plane deploy/autoscaler`"
+    "（读 redis 的只有 control-plane；`autoscaler` 是控制面客户端，跟着滚是形状对齐）"
+    "⑤ 从 Secret 里读新口令验收（见下） | **必然有 10–30 s 中断**：redis 带着新口令重启、到 "
+    "control-plane 滚动完拿到新口令之间，共享后端（配额 / 节点视图 / 限流 / 单飞）不可用 ⇒ "
+    "**建箱、路由、sandbox 记录查询全部失败**；沙箱进程本身不经过 redis，**不受影响**；"
+    "`appendonly yes` ⇒ 重启从 AOF 装载，**数据不丢**。**窗口不可逆**：② 之后旧口令只活在仍"
+    "在跑的 redis 进程内存里，要回去只能再轮换一次（表 3 没有 finalize 那种安全位） | "
+    "**ACL 双用户**（2026-09-26 裁定**不采纳**，只作备选）：`ACL SETUSER` 建新用户 → "
+    "control-plane 切到 `redis://<新用户>:<新口令>@...` → 滚动 → 删旧用户 ⇒ "
+    "**零停机**。代价：要改 redis 的启动方式（`--aclfile` 或启动期 `ACL SETUSER`），且"
+    "用户必须持久化，否则重启就丢 |"
+)
+QUOTA_TABLE_ROW = (
+    "| `E2B_QUOTA_AGENT_TOKEN` | 同时更新 worker 与 agent 的 Secret；**先重启 agent、再滚 "
+    "worker**（顺序反了 worker 找不到 agent，但 worker 侧是降级的） | 单 token、启动即 "
+    "fail-fast（`deploy/quota_agent/__main__.py:15-19`），**没有双窗**；worker 重启 = "
+    "**杀沙箱**（同表 2 第 3 步） | ⚠ **k8s 形态今天没有部署 quota-agent**"
+    "（`docs/production-deployment-requirements.md` §2.4.4 W4）⇒ 现在**没有影响面**，本轮只"
+    "记账。将来部署 agent 时必须**同时**设计双 token（列表 + 旧值窗口），别把这条留到上线"
+    "当天 |"
+)
+
+
+def _k8s_redis_container() -> dict:
+    """The redis Deployment's single container, parsed rather than grepped."""
+    documents = [doc for doc in yaml.safe_load_all(K8S_REDIS) if doc]
+    assert [doc["kind"] for doc in documents] == ["Deployment", "Service"]
+    containers = documents[0]["spec"]["template"]["spec"]["containers"]
+    assert len(containers) == 1
+    return containers[0]
+
+
+def _k8s_control_plane_env() -> dict:
+    """`control-plane`'s env by name, from the Deployment document only."""
+    deployments = [
+        doc
+        for doc in yaml.safe_load_all(K8S_CONTROL_PLANE)
+        if doc and doc.get("kind") == "Deployment"
+    ]
+    assert len(deployments) == 1
+    return _env_of(deployments[0])
+
+
+def test_k8s_redis_auth_comes_from_the_secret_not_a_literal() -> None:
+    """O3 Task 4: redis is single-user, and that one user's secret is the Secret.
+
+    The 2026-09-26 ruling accepted a 10-30 s interruption instead of the ACL
+    double-user shape, so `deploy/k8s/redis.yaml` keeps exactly one
+    `--requirepass`. What the rotation depends on is *where that value comes
+    from*: the directive argument is `$(REDIS_PASSWORD)`, which kubelet can
+    only expand from the container's own env, and that env is a
+    `secretKeyRef` into `e2b-secrets/E2B_REDIS_PASSWORD` -- the same Secret
+    object and the same key the control plane interpolates into
+    `E2B_REDIS_URL`. So a rotation is one write to the Secret plus the two
+    rollouts in the runbook's 表 3, and no manifest ever carries a plaintext
+    password (writing one in would defeat both the rotation steps and the
+    repo-wide "no credentials in manifests" rule).
+
+    Adopting the runbook's ACL *alternative* is a re-decision: it changes this
+    startup shape, and the two negative assertions at the end are the
+    tripwire so it cannot arrive silently.
+    """
+    container = _k8s_redis_container()
+    assert container["command"] == [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--requirepass",
+        "$(REDIS_PASSWORD)",
+    ]
+    # One directive, and its argument is a reference rather than a value.
+    assert K8S_REDIS.count("--requirepass") == 1
+    # The name in the command has to be this container's env -- kubelet
+    # expands `$(NAME)` from the container's own environment and leaves an
+    # unknown reference as literal text.
+    assert container["env"] == [
+        {
+            "name": "REDIS_PASSWORD",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": "e2b-secrets",
+                    "key": "E2B_REDIS_PASSWORD",
+                }
+            },
+        }
+    ]
+    # The reader side: one interpolation, from the same Secret key.
+    cp_env = _k8s_control_plane_env()
+    assert cp_env["E2B_REDIS_URL"] == {
+        "name": "E2B_REDIS_URL",
+        "value": "redis://:$(E2B_REDIS_PASSWORD)@redis:6379/0",
+    }
+    assert cp_env["E2B_REDIS_PASSWORD"]["valueFrom"]["secretKeyRef"] == {
+        "name": "e2b-secrets",
+        "key": "E2B_REDIS_PASSWORD",
+    }
+    assert (
+        container["env"][0]["valueFrom"]["secretKeyRef"]
+        == cp_env["E2B_REDIS_PASSWORD"]["valueFrom"]["secretKeyRef"]
+    ), "redis 与 control-plane 必须读同一个 Secret 的同一个键"
+    # No ACL shape has crept in: the ruling keeps this file untouched, and the
+    # alternative lives in the runbook's 备选 column only.
+    assert "--aclfile" not in K8S_REDIS
+    assert "ACL SETUSER" not in K8S_REDIS
+
+
+def test_the_runbook_carries_the_no_double_window_table() -> None:
+    """O3 Task 4's deliverable: 表 3, where an operator reads the rotation.
+
+    Tables 1 and 2 of `docs/k8s-deployment.md` §4.5 rotate in two windows
+    because their consumers read "list ∪ single slot". These two credentials
+    have no such list, so their table has to carry what the other two do not:
+    the *interruption itself* (where it starts, who notices what, and that the
+    window is not reversible), the `appendonly yes` evidence that no data is
+    lost, and the two credentials' different sizes of blast radius -- the
+    quota-agent token has none today because the k8s shape deploys no agent
+    (`docs/production-deployment-requirements.md` §2.4.4 W4).
+    """
+    assert (
+        "### 表 3：无双窗的凭据（`E2B_REDIS_PASSWORD` / `E2B_QUOTA_AGENT_TOKEN`）"
+        in RUNBOOK
+    )
+    assert REDIS_TABLE_ROW in RUNBOOK
+    assert QUOTA_TABLE_ROW in RUNBOOK
+    # Table 3 stays with the other two tables, and the ruling it encodes is
+    # spelled out (the ACL shape is the alternative, not the main path).
+    assert RUNBOOK.index("### 表 1：") < RUNBOOK.index("### 表 2：")
+    assert RUNBOOK.index("### 表 2：") < RUNBOOK.index("### 表 3：")
+    assert RUNBOOK.index("### 表 3：") < RUNBOOK.index("### 4.5.1")
+    assert (
+        "**redis 接受 10–30 s 中断，不做 ACL 双用户**；ACL 版本只作**备选**记在表里，"
+        "`deploy/k8s/redis.yaml` 不动。" in RUNBOOK
+    )
+    # The interruption, step by step: the operator has to know which rollout
+    # must not be left hanging, and that the measured window is exactly this.
+    assert (
+        "- ② 之后、③ 之前：Secret 已是新口令、redis 进程内存里还是旧口令 —— **别在这时滚 "
+        "CP**：新起的 pod 会拿着新口令连不上。②③ 连着做，不要停在中间。" in RUNBOOK
+    )
+    assert (
+        "- ③ 之后、④ 滚完之前：redis 只认新口令，control-plane 内存里还是旧口令 ⇒ 共享后端"
+        "认证失败，**这一段的时长就是那 10–30 s**（redis 重启 + control-plane 滚一轮；"
+        "`autoscaler` 不读 redis，跟滚只是形状对齐）。" in RUNBOOK
+    )
+    assert (
+        "- 这段窗口里谁会看到什么：`POST /sandboxes` 建箱失败、`GET /sandboxes/<id>` 等记录"
+        "查询失败、路由查找失败（节点视图在 redis 里）、创建限流与单飞失效；沙箱**进程**本身"
+        "照旧运行（不经过 redis），但控制面针对它的调用同样要等 redis 回来。" in RUNBOOK
+    )
+    # Acceptance reads the password out of the Secret instead of putting it on
+    # a command line (the repo-wide "no plaintext in logs/reports" rule).
+    assert (
+        "    'redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping; redis-cli ping'"
+        in RUNBOOK
+    )
+    # ...and the auth-from-Secret property is written down next to its pin.
+    assert (
+        "`tests/unit/test_worker_manifest_permissions.py::"
+        "test_k8s_redis_auth_comes_from_the_secret_not_a_literal`" in RUNBOOK
+    )

@@ -175,6 +175,9 @@ autoscaler 只是控制面的客户端（它发 `E2B_AS_INTERNAL_API_KEY` 的单
 rotate 再逐成员打一遍窗口列表 —— finalize 的地址既可以是 key 本身，也可以是**那个指纹**
 （推荐；值从不离开脚本，报错也只打指纹）。
 
+表 1 与表 2 是这两个双窗凭据的 runbook；**没有双窗的** `E2B_REDIS_PASSWORD` 与
+`E2B_QUOTA_AGENT_TOKEN` 见本节末尾的表 3（那一类的轮换必然带一段停机窗口）。
+
 ### 表 1：`E2B_API_KEYS`（外部 API key，客户端持有）
 
 | 步 | 动作 | 影响面 | 不可逆点 |
@@ -201,13 +204,50 @@ rotate 再逐成员打一遍窗口列表 —— finalize 的地址既可以是 k
 回滚：同表 1 —— 第 5 步之前回滚 = 不做（旧 key 仍在列表里生效）；第 5 步之后不可恢复，
 只能再轮换一次。**第 3 步是窗口的代价**：其他步骤都能在工作时间做，只有它会让所有沙箱消失。
 
-对账（两个表都用，不改任何东西、不回显明文）：
+对账（三张表都用，不改任何东西、不回显明文；redis 口令也在 `--fingerprint` 的输出里）：
 
 ```bash
 export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 deploy/k8s-k0s/secrets.sh --fingerprint        # 逐键 sha256(前16)+长度；未轮换的键逐字不变
 kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data}' | wc -c   # 只报大小
 ```
+
+### 表 3：无双窗的凭据（`E2B_REDIS_PASSWORD` / `E2B_QUOTA_AGENT_TOKEN`）
+
+前两个表靠“列表里新旧并存”消掉中断，这两个凭据**没有双窗**：redis 只有一个
+`--requirepass`（换口令就是换那一个值），quota-agent token 是单值、缺了就拒绝启动
+（`deploy/quota_agent/__main__.py:15-19`）—— 所以轮换**必然**经过一段不可用。
+2026-09-26 的用户裁定（`docs/superpowers/plans/2026-09-26-decisions.md` 第 5 条 +
+《追加裁定（O3 第二轮）》）：**redis 接受 10–30 s 中断，不做 ACL 双用户**；ACL 版本只作**备选**记在表里，`deploy/k8s/redis.yaml` 不动。
+
+| 凭据 | 步骤 | 影响面 / 不可逆窗口 | 备选 |
+|---|---|---|---|
+| `E2B_REDIS_PASSWORD` | ① 排维护窗口 ② `deploy/k8s-k0s/secrets.sh --rotate E2B_REDIS_PASSWORD` ③ `kubectl -n sandlock rollout restart deploy/redis` ④ `kubectl -n sandlock rollout restart deploy/control-plane deploy/autoscaler`（读 redis 的只有 control-plane；`autoscaler` 是控制面客户端，跟着滚是形状对齐）⑤ 从 Secret 里读新口令验收（见下） | **必然有 10–30 s 中断**：redis 带着新口令重启、到 control-plane 滚动完拿到新口令之间，共享后端（配额 / 节点视图 / 限流 / 单飞）不可用 ⇒ **建箱、路由、sandbox 记录查询全部失败**；沙箱进程本身不经过 redis，**不受影响**；`appendonly yes` ⇒ 重启从 AOF 装载，**数据不丢**。**窗口不可逆**：② 之后旧口令只活在仍在跑的 redis 进程内存里，要回去只能再轮换一次（表 3 没有 finalize 那种安全位） | **ACL 双用户**（2026-09-26 裁定**不采纳**，只作备选）：`ACL SETUSER` 建新用户 → control-plane 切到 `redis://<新用户>:<新口令>@...` → 滚动 → 删旧用户 ⇒ **零停机**。代价：要改 redis 的启动方式（`--aclfile` 或启动期 `ACL SETUSER`），且用户必须持久化，否则重启就丢 |
+| `E2B_QUOTA_AGENT_TOKEN` | 同时更新 worker 与 agent 的 Secret；**先重启 agent、再滚 worker**（顺序反了 worker 找不到 agent，但 worker 侧是降级的） | 单 token、启动即 fail-fast（`deploy/quota_agent/__main__.py:15-19`），**没有双窗**；worker 重启 = **杀沙箱**（同表 2 第 3 步） | ⚠ **k8s 形态今天没有部署 quota-agent**（`docs/production-deployment-requirements.md` §2.4.4 W4）⇒ 现在**没有影响面**，本轮只记账。将来部署 agent 时必须**同时**设计双 token（列表 + 旧值窗口），别把这条留到上线当天 |
+
+**那 10–30 s 的中断具体在哪、谁会看到什么**（`E2B_REDIS_PASSWORD`）：
+
+- ② 之后、③ 之前：Secret 已是新口令、redis 进程内存里还是旧口令 —— **别在这时滚 CP**：新起的 pod 会拿着新口令连不上。②③ 连着做，不要停在中间。
+- ③ 之后、④ 滚完之前：redis 只认新口令，control-plane 内存里还是旧口令 ⇒ 共享后端认证失败，**这一段的时长就是那 10–30 s**（redis 重启 + control-plane 滚一轮；`autoscaler` 不读 redis，跟滚只是形状对齐）。
+- 这段窗口里谁会看到什么：`POST /sandboxes` 建箱失败、`GET /sandboxes/<id>` 等记录查询失败、路由查找失败（节点视图在 redis 里）、创建限流与单飞失效；沙箱**进程**本身照旧运行（不经过 redis），但控制面针对它的调用同样要等 redis 回来。
+- ④ 滚完之后恢复；⑤ 的 `PONG` 是收尾验收。
+
+验收（**不把口令打上命令行**，从 Secret 里读）：
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+# 带口令 PONG，不带口令 NOAUTH（认证确实生效）
+kubectl -n sandlock exec deploy/redis -- sh -c \
+    'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping; redis-cli ping'
+```
+
+**认证必须来自 Secret（既有性质，不许退化）**：redis 的启动参数只有
+`--requirepass "$(REDIS_PASSWORD)"` —— 那个名字由 kubelet 从**同容器**的 `REDIS_PASSWORD`
+env 展开，env 是 `secretKeyRef` → `e2b-secrets/E2B_REDIS_PASSWORD`；control-plane 侧
+`E2B_REDIS_URL` 用 `redis://:$(E2B_REDIS_PASSWORD)@redis:6379/0`，读的是**同一个 Secret 的
+同一个键**。所以换口令只写 Secret、清单里永远没有字面口令 —— 由
+`tests/unit/test_worker_manifest_permissions.py::test_k8s_redis_auth_comes_from_the_secret_not_a_literal`
+钉住（同一条测试还钉住 redis 仍是单用户：要采纳上面的 ACL 备选，就得先改它）。
 
 ### 4.5.1 一次性清理既有明文 secret（O3 第二轮，2026-09-26 裁定）
 
