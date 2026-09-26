@@ -39,6 +39,9 @@ STACK_COMPOSE = (REPO / "deploy" / "stack" / "docker-compose.prod.yml").read_tex
 COMPOSE_PROD = (
     REPO / "deploy" / "compose" / "docker-compose.prod.yml"
 ).read_text(encoding="utf-8")
+COMPOSE_MULTINODE = (
+    REPO / "deploy" / "compose" / "docker-compose.multinode.yml"
+).read_text(encoding="utf-8")
 K8S_WORKER = (REPO / "deploy" / "k8s" / "worker.yaml").read_text(encoding="utf-8")
 K8S_CONTROL_PLANE = (REPO / "deploy" / "k8s" / "control-plane.yaml").read_text(
     encoding="utf-8"
@@ -877,3 +880,76 @@ def test_compose_prod_worker_env_carries_the_fleets_route_b_root() -> None:
     assert _compose_prod_worker_route_b_root() == {
         "E2B_ROUTE_B_TMP_ROOT": next(iter(fleet.values()))
     }
+
+
+def _multinode_worker_block(name: str) -> str:
+    tail = COMPOSE_MULTINODE.split(f"\n  {name}:", 1)[1]
+    for marker in ("\n  worker-1:", "\n  worker-2:", "\n  worker-3:", "\nvolumes:"):
+        if marker in tail:
+            tail = tail.split(marker, 1)[0]
+    return tail
+
+
+def test_multinode_example_runs_the_fleet_netns_shape() -> None:
+    """N36's fourth site: the file that was broken the other way round.
+
+    `deploy/compose/docker-compose.multinode.yml` ran the shared-netns shape
+    *and* declared no low-port window, so its own comment admitted wildcard
+    `allowOut` rules would fail with `bind DNS gateway: Permission denied
+    (os error 13)` (docs/open-issues.md N36). Aligning it with the fleet both
+    removes the window question and fixes the wildcard path. There is no
+    anchor in this file: each of the three workers repeats its whole env block,
+    so all three are asserted separately.
+
+    Measured 2026-09-26 on this file (uid 65534, OrbStack): the first sentence
+    is N36's claim -- the one this file's own comment repeated -- and it does
+    *not* reproduce. A Docker container's netns already reads
+    `net.ipv4.ip_unprivileged_port_start=0` with no `sysctls:` declared, so the
+    shared-netns shape bound `127.0.1.x:53` fine and resolved wildcards
+    (`tmp/netns-unify-wildcard-before-b2.log`); forcing the window shut is what
+    reproduces N36's `bind DNS gateway: Permission denied (os error 13)`
+    (`tmp/netns-unify-wildcard-forced-window-shut.log`). So these assertions are
+    the *alignment* with the fleet, not the repair of a wildcard bug: what this
+    file is actually missing for wildcard `allowOut` is `E2B_ENABLE_NETWORK`
+    (N42's shape -- no policy reaches the fork, so no gateway is created), and
+    that key is deliberately left out of this task's scope.
+    """
+    assert "\n    sysctls:\n" not in COMPOSE_MULTINODE
+    assert "\n      - net.ipv4.ip_unprivileged_port_start=0\n" not in COMPOSE_MULTINODE
+    for name in ("worker-1", "worker-2", "worker-3"):
+        block = _multinode_worker_block(name)
+        assert '\n      E2B_ENABLE_NET_ISOLATION: "true"\n' in block, name
+        assert '\n      E2B_FD_INJECT_CONNECT: "true"\n' in block, name
+        assert f"\n      E2B_NODE_ID: {name}\n" in block, name
+
+
+def _multinode_worker_route_b_root(name: str) -> str:
+    """`E2B_ROUTE_B_TMP_ROOT` as one worker block spells it, quotes stripped."""
+    block = _multinode_worker_block(name)
+    found = [
+        line.strip().split(":", 1)[1].strip().strip('"')
+        for line in block.splitlines()
+        if line.strip().startswith("E2B_ROUTE_B_TMP_ROOT:")
+    ]
+    assert len(found) == 1, f"expected exactly one E2B_ROUTE_B_TMP_ROOT: {found}"
+    return found[0]
+
+
+def test_multinode_worker_env_carries_the_fleets_route_b_root() -> None:
+    """N39 at site ④: the same wall ① hit, measured on this file 2026-09-26.
+
+    `E2B_ROUTE_B_TMP_ROOT` defaults to `/tmp/sandlock-route-b`, which is outside
+    the roots the `e2b-maint` file-capability broker may touch, so
+    `configure_priv_helpers` refuses the shape by name at startup and every
+    worker crash-loops before it ever listens (measured here: all three
+    `Restarting (1)` with `route-B scratch root /tmp/sandlock-route-b is outside
+    the privileged helper roots (/var/lib/e2b-sandboxes)`; `docs/open-issues.md`
+    N39 is the same wall). The value is taken from the fleet manifests, not
+    written a fourth time -- the same comparison ①'s pin makes, and it is per
+    worker because this file has no anchor.
+    """
+    fleet = _fleet_route_b_roots()
+    assert set(fleet.values()) == {"/var/lib/e2b-sandboxes/.route-b"}, fleet
+    fleet_root = next(iter(fleet.values()))
+    for name in ("worker-1", "worker-2", "worker-3"):
+        assert _multinode_worker_route_b_root(name) == fleet_root, name

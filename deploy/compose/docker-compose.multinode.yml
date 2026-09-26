@@ -108,6 +108,16 @@ services:
       E2B_BASE_IMAGE: python:3.14-slim
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # Route B's scratch root (the per-slot policy/program documents). The
+      # fleet value, copied from deploy/stack/docker-compose.prod.yml:239 --
+      # these workers are uid 65534 like the fleet's, and the `e2b-maint`
+      # broker only touches roots under the workspace base, so the default
+      # (`/tmp/sandlock-route-b`) is refused by name at startup: every worker
+      # in this file crash-loops before it listens (N39, measured here
+      # 2026-09-26: all three `Restarting (1)` with `route-B scratch root
+      # /tmp/sandlock-route-b is outside the privileged helper roots
+      # (/var/lib/e2b-sandboxes)`).
+      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
@@ -116,15 +126,36 @@ services:
       E2B_NODE_CPU_PERCENT: 200
       E2B_NODE_DISK_MB: 4096
       E2B_NODE_PROCESSES: 256
+      # N36 (2026-09-26): the fleet shape, so wildcard allowOut works here.
+      # Each sandbox runs its own loopback-only netns and egress goes through
+      # the supervisor's connect-fd injection; the wildcard-DNS `:53` bind then
+      # happens inside the sandbox's own netns (root-in-userns covers port 53),
+      # which is why this file declares no low-port window. BOTH switches are
+      # required: `create_app` refuses the unpaired shape by name
+      # (envd_service/config.py:471-479).
+      #
+      # Measured 2026-09-26 on this file (uid 65534, OrbStack): the switch is
+      # alignment, not a repair. The shared-netns shape it replaces never hit a
+      # low-port window either -- a Docker container's netns already reads
+      # `net.ipv4.ip_unprivileged_port_start=0` with no `sysctls:` declared, so
+      # the wildcard `:53` bind succeeded (`docker exec <worker> cat
+      # /proc/sys/net/ipv4/ip_unprivileged_port_start` = 0; forcing the window
+      # shut reproduces N36's `bind DNS gateway: Permission denied (os error
+      # 13)`). What wildcard rules really need here is `E2B_ENABLE_NETWORK`,
+      # which this file does not declare: without it the policy never reaches
+      # the fork, no gateway is created and the sandbox resolves against the
+      # image's own resolver (N42's shape). Declaring it is an egress-posture
+      # change, so it is left to its own decision rather than smuggled in here.
+      E2B_ENABLE_NET_ISOLATION: "true"
+      E2B_FD_INJECT_CONNECT: "true"
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
-    # E2B_QUOTA_AGENT_URL + quota-agent). This example runs the shared-netns
-    # shape, where wildcard allowOut rules additionally need the low-port
-    # window -- `sysctls: [net.ipv4.ip_unprivileged_port_start=0]`, as in
-    # deploy/compose/docker-compose.prod.yml -- which this file does not
-    # declare; the fleet shape is per-sandbox netns
-    # (deploy/stack/docker-compose.prod.yml) and needs no window at all.
+    # E2B_QUOTA_AGENT_URL + quota-agent). The file runs the fleet shape:
+    # per-sandbox netns, so wildcard allowOut rules resolve through the
+    # sandbox's own DNS gateway binding 127.0.1.x:53 inside its own netns --
+    # no low-port window is declared, and none is needed (as in
+    # deploy/stack/docker-compose.prod.yml and deploy/compose/docker-compose.prod.yml).
     security_opt:
       - seccomp=unconfined
 
@@ -143,6 +174,16 @@ services:
       E2B_BASE_IMAGE: python:3.14-slim
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # Route B's scratch root (the per-slot policy/program documents). The
+      # fleet value, copied from deploy/stack/docker-compose.prod.yml:239 --
+      # these workers are uid 65534 like the fleet's, and the `e2b-maint`
+      # broker only touches roots under the workspace base, so the default
+      # (`/tmp/sandlock-route-b`) is refused by name at startup: every worker
+      # in this file crash-loops before it listens (N39, measured here
+      # 2026-09-26: all three `Restarting (1)` with `route-B scratch root
+      # /tmp/sandlock-route-b is outside the privileged helper roots
+      # (/var/lib/e2b-sandboxes)`).
+      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
@@ -151,15 +192,36 @@ services:
       E2B_NODE_CPU_PERCENT: 200
       E2B_NODE_DISK_MB: 4096
       E2B_NODE_PROCESSES: 256
+      # N36 (2026-09-26): the fleet shape, so wildcard allowOut works here.
+      # Each sandbox runs its own loopback-only netns and egress goes through
+      # the supervisor's connect-fd injection; the wildcard-DNS `:53` bind then
+      # happens inside the sandbox's own netns (root-in-userns covers port 53),
+      # which is why this file declares no low-port window. BOTH switches are
+      # required: `create_app` refuses the unpaired shape by name
+      # (envd_service/config.py:471-479).
+      #
+      # Measured 2026-09-26 on this file (uid 65534, OrbStack): the switch is
+      # alignment, not a repair. The shared-netns shape it replaces never hit a
+      # low-port window either -- a Docker container's netns already reads
+      # `net.ipv4.ip_unprivileged_port_start=0` with no `sysctls:` declared, so
+      # the wildcard `:53` bind succeeded (`docker exec <worker> cat
+      # /proc/sys/net/ipv4/ip_unprivileged_port_start` = 0; forcing the window
+      # shut reproduces N36's `bind DNS gateway: Permission denied (os error
+      # 13)`). What wildcard rules really need here is `E2B_ENABLE_NETWORK`,
+      # which this file does not declare: without it the policy never reaches
+      # the fork, no gateway is created and the sandbox resolves against the
+      # image's own resolver (N42's shape). Declaring it is an egress-posture
+      # change, so it is left to its own decision rather than smuggled in here.
+      E2B_ENABLE_NET_ISOLATION: "true"
+      E2B_FD_INJECT_CONNECT: "true"
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
-    # E2B_QUOTA_AGENT_URL + quota-agent). This example runs the shared-netns
-    # shape, where wildcard allowOut rules additionally need the low-port
-    # window -- `sysctls: [net.ipv4.ip_unprivileged_port_start=0]`, as in
-    # deploy/compose/docker-compose.prod.yml -- which this file does not
-    # declare; the fleet shape is per-sandbox netns
-    # (deploy/stack/docker-compose.prod.yml) and needs no window at all.
+    # E2B_QUOTA_AGENT_URL + quota-agent). The file runs the fleet shape:
+    # per-sandbox netns, so wildcard allowOut rules resolve through the
+    # sandbox's own DNS gateway binding 127.0.1.x:53 inside its own netns --
+    # no low-port window is declared, and none is needed (as in
+    # deploy/stack/docker-compose.prod.yml and deploy/compose/docker-compose.prod.yml).
     security_opt:
       - seccomp=unconfined
 
@@ -178,6 +240,16 @@ services:
       E2B_BASE_IMAGE: python:3.14-slim
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # Route B's scratch root (the per-slot policy/program documents). The
+      # fleet value, copied from deploy/stack/docker-compose.prod.yml:239 --
+      # these workers are uid 65534 like the fleet's, and the `e2b-maint`
+      # broker only touches roots under the workspace base, so the default
+      # (`/tmp/sandlock-route-b`) is refused by name at startup: every worker
+      # in this file crash-loops before it listens (N39, measured here
+      # 2026-09-26: all three `Restarting (1)` with `route-B scratch root
+      # /tmp/sandlock-route-b is outside the privileged helper roots
+      # (/var/lib/e2b-sandboxes)`).
+      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
@@ -186,15 +258,36 @@ services:
       E2B_NODE_CPU_PERCENT: 200
       E2B_NODE_DISK_MB: 4096
       E2B_NODE_PROCESSES: 256
+      # N36 (2026-09-26): the fleet shape, so wildcard allowOut works here.
+      # Each sandbox runs its own loopback-only netns and egress goes through
+      # the supervisor's connect-fd injection; the wildcard-DNS `:53` bind then
+      # happens inside the sandbox's own netns (root-in-userns covers port 53),
+      # which is why this file declares no low-port window. BOTH switches are
+      # required: `create_app` refuses the unpaired shape by name
+      # (envd_service/config.py:471-479).
+      #
+      # Measured 2026-09-26 on this file (uid 65534, OrbStack): the switch is
+      # alignment, not a repair. The shared-netns shape it replaces never hit a
+      # low-port window either -- a Docker container's netns already reads
+      # `net.ipv4.ip_unprivileged_port_start=0` with no `sysctls:` declared, so
+      # the wildcard `:53` bind succeeded (`docker exec <worker> cat
+      # /proc/sys/net/ipv4/ip_unprivileged_port_start` = 0; forcing the window
+      # shut reproduces N36's `bind DNS gateway: Permission denied (os error
+      # 13)`). What wildcard rules really need here is `E2B_ENABLE_NETWORK`,
+      # which this file does not declare: without it the policy never reaches
+      # the fork, no gateway is created and the sandbox resolves against the
+      # image's own resolver (N42's shape). Declaring it is an egress-posture
+      # change, so it is left to its own decision rather than smuggled in here.
+      E2B_ENABLE_NET_ISOLATION: "true"
+      E2B_FD_INJECT_CONNECT: "true"
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
-    # E2B_QUOTA_AGENT_URL + quota-agent). This example runs the shared-netns
-    # shape, where wildcard allowOut rules additionally need the low-port
-    # window -- `sysctls: [net.ipv4.ip_unprivileged_port_start=0]`, as in
-    # deploy/compose/docker-compose.prod.yml -- which this file does not
-    # declare; the fleet shape is per-sandbox netns
-    # (deploy/stack/docker-compose.prod.yml) and needs no window at all.
+    # E2B_QUOTA_AGENT_URL + quota-agent). The file runs the fleet shape:
+    # per-sandbox netns, so wildcard allowOut rules resolve through the
+    # sandbox's own DNS gateway binding 127.0.1.x:53 inside its own netns --
+    # no low-port window is declared, and none is needed (as in
+    # deploy/stack/docker-compose.prod.yml and deploy/compose/docker-compose.prod.yml).
     security_opt:
       - seccomp=unconfined
 
