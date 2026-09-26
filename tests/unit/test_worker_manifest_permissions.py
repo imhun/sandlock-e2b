@@ -801,3 +801,79 @@ def test_compose_prod_example_runs_the_fleet_netns_shape() -> None:
     assert "\n      E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT:-true}\n" in worker
     # The worker still runs the shipped seccomp profile, not `unconfined`.
     assert "\n      - seccomp=${E2B_SECCOMP_PROFILE:-../seccomp/sandlock-worker.json}\n" in worker
+
+
+def _value_after_key(text: str, key: str, *, indent: str) -> str:
+    """The single ``<indent><key>: <value>`` line's value, whitespace stripped."""
+    marker = f"{indent}{key}:"
+    hits = [line for line in text.splitlines() if line.startswith(marker)]
+    assert len(hits) == 1, f"expected exactly one {key!r} line at that indent: {hits}"
+    return hits[0][len(marker) :].strip().strip('"')
+
+
+def _k8s_env_value(text: str, key: str) -> str:
+    """The ``- name: <key>`` / ``value: <v>`` pair a k8s container env spells."""
+    lines = [line.strip() for line in text.splitlines()]
+    marker = f"- name: {key}"
+    hits = [index for index, line in enumerate(lines) if line == marker]
+    assert len(hits) == 1, f"expected exactly one {key!r} env entry: {hits}"
+    value_line = lines[hits[0] + 1]
+    assert value_line.startswith("value: "), value_line
+    return value_line[len("value: ") :].strip().strip('"')
+
+
+def _fleet_route_b_roots() -> dict[str, str]:
+    """`E2B_ROUTE_B_TMP_ROOT` as each fleet manifest spells it.
+
+    Both manifests are read, not just the compose one: the pool's alignment
+    test learned that reading one leaves the other free to drift
+    (`tests/unit/test_autoscaler_local_backend_shape.py`), and the k8s pod
+    template is the manifest the cluster actually runs.
+    """
+    return {
+        "deploy/stack/docker-compose.prod.yml": _value_after_key(
+            STACK_COMPOSE, "E2B_ROUTE_B_TMP_ROOT", indent="      "
+        ),
+        "deploy/k8s/worker.yaml": _k8s_env_value(
+            K8S_WORKER, "E2B_ROUTE_B_TMP_ROOT"
+        ),
+    }
+
+
+def _compose_prod_worker_route_b_root() -> dict[str, str]:
+    """The same key, read off the prod example's own worker anchor.
+
+    Anchored to the slice every worker inherits (`worker-1: &worker` up to
+    `worker-2:`) rather than to the file: a bare `in` over the whole file would
+    pass even if the key drifted into a service that never reads it.
+    """
+    worker = COMPOSE_PROD.split("\n  worker-1: &worker", 1)[1].split(
+        "\n  worker-2:", 1
+    )[0]
+    found: dict[str, str] = {}
+    for line in worker.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("E2B_ROUTE_B_TMP_ROOT:"):
+            found["E2B_ROUTE_B_TMP_ROOT"] = stripped.split(":", 1)[1].strip().strip('"')
+    return found
+
+
+def test_compose_prod_worker_env_carries_the_fleets_route_b_root() -> None:
+    """N39 at site ①: a from-tree worker refuses to start without this key.
+
+    `E2B_ROUTE_B_TMP_ROOT` defaults to `/tmp/sandlock-route-b`, which is outside
+    the roots the `e2b-maint` file-capability broker may touch, so
+    `configure_priv_helpers` refuses the shape by name at startup -- the worker
+    crash-loops before it ever listens (measured on this file 2026-09-26 with
+    `up -d --build`: all three workers `Restarting (1)`). The pool hit the same
+    wall (N39) and the fleet has always declared the key, so this file takes the
+    fleet's value instead of inventing one: the assertion compares against the
+    fleet manifests themselves, not against a third copy of the literal.
+    """
+    fleet = _fleet_route_b_roots()
+    # One value across the fleet, and it is the path under the workspace base
+    # the comment in `deploy/stack/docker-compose.prod.yml:239` explains.
+    assert set(fleet.values()) == {"/var/lib/e2b-sandboxes/.route-b"}, fleet
+    assert _compose_prod_worker_route_b_root() == {
+        "E2B_ROUTE_B_TMP_ROOT": next(iter(fleet.values()))
+    }

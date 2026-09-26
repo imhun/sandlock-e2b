@@ -183,6 +183,18 @@ services:
       E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT:-true}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # Route B's scratch root (the per-slot policy/program documents). The
+      # fleet value, copied from deploy/stack/docker-compose.prod.yml:239 --
+      # the k8s pod template names the same path. A non-root worker writes
+      # those documents through the `e2b-maint` broker, and the broker only
+      # touches roots under the workspace base, so the default
+      # (`/tmp/sandlock-route-b`) is refused by name at startup:
+      # `configure_priv_helpers` raises before the worker ever listens, i.e.
+      # every worker in this example crash-loops with
+      # `route-B scratch root /tmp/sandlock-route-b is outside the privileged
+      # helper roots (/var/lib/e2b-sandboxes)` (N39, measured on this file
+      # 2026-09-26: all three workers `Restarting (1)`).
+      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
