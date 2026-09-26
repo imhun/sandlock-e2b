@@ -17,6 +17,49 @@ SKIP_WARM=1 KUBECONFIG=... deploy/k8s-k0s/apply.sh # 不预热 base image
 `X-Sandbox-Id`、也不认识 428）。预热失败时 `apply.sh` 非零退出并点名还剩几个节点是冷的；
 `docs/k8s-deployment.md` §22.5.10 末尾记了这条事实与两处部署脚本的分工。
 
+## 部署顺序（k0s）：密钥先于业务清单
+
+```bash
+# 1) 命名空间 + 存储
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl apply -f deploy/k8s/pvc.yaml
+
+# 2) 密钥：脚本幂等 —— Secret 不存在就全新建，存在就只补缺的键（已有的不覆盖）
+KUBECONFIG=... deploy/k8s-k0s/secrets.sh
+
+# 3) 其余清单一次 apply（redis / control-plane + buildkit / seccomp 安装器 / worker /
+#    autoscaler / NodePort 入口），版本仍由 apply.sh 从 deploy/stack/.version 取
+KUBECONFIG=... deploy/k8s-k0s/apply.sh
+```
+
+第 2 步取代了 `docs/k8s-deployment.md` §2 那份手工 `kubectl -n $NS create secret generic`
+命令（这就是它在 k0s 上的版本）。`secrets.sh` 建/补的是清单里 `secretKeyRef` 读的四个键：
+`E2B_API_KEYS`、`E2B_INTERNAL_API_KEY`、`E2B_REDIS_PASSWORD`、`E2B_SECRET_MASTER_KEY`。
+它**只打印 `sha256(前16)` 指纹与长度**，不打印明文，也不开 `set -x`；除这四个键之外的键
+（例如主 key 轮换窗口用的 `E2B_SECRET_MASTER_KEYS`）原样带过去，不会被 apply 抹掉。
+
+`E2B_SECRET_MASTER_KEY` 是 secret-at-rest 加密的开关：没有它 `SecretRegistry` 退回
+"内存 + 明文落盘"（只打一条启动告警），而 `_secrets/**` 就在共享 NAS 卷上、worker pod
+整卷 RW 挂 —— 任何拿到 pod root 的人都能读。`control-plane` 那两个新 `secretKeyRef` 是
+`optional: true`（刻意的过渡态：先 apply 清单还是先跑脚本都不会让 CP 起不来），所以键补上
+之后要 `kubectl -n sandlock rollout restart deploy/control-plane` 才真正读到。
+
+## 凭据轮换（k0s）
+
+`secrets.sh` 是唯一允许改值的入口：不点名 `--rotate <KEY>` 时，已有的键**一律不动**。
+
+| 轮换的键 | 影响面 | 不可逆窗口 / 备注 |
+|---|---|---|
+| `E2B_REDIS_PASSWORD` | **10–30 s 中断**：redis 带着新口令重启、到 control-plane / autoscaler 滚动完拿到新口令之间，共享后端（配额/节点视图/限流/单飞）不可用 ⇒ 建箱与路由失败。沙箱本身不经过 redis，不受影响 | 2026-09-26 裁定**接受**这段中断，不做 ACL 双用户热轮换（`docs/superpowers/plans/2026-09-26-decisions.md` 第 5 条）。redis 是 `appendonly yes` ⇒ 数据不丢。顺序：`secrets.sh --rotate E2B_REDIS_PASSWORD` → `rollout restart deploy/redis` → `rollout restart deploy/control-plane deploy/autoscaler` |
+| `E2B_API_KEYS` / `E2B_INTERNAL_API_KEY` | 单值被换掉的瞬间旧 key 就失效：未切换的客户端 401；`E2B_INTERNAL_API_KEY` 还要 worker / autoscaler 都滚到新值 | 放维护窗口做（滚 worker = 杀掉全部 running 沙箱）。双窗列表与完整 runbook 见 `docs/superpowers/plans/2026-09-26-o3-credential-rotation.md` Task 2–6 |
+| `E2B_SECRET_MASTER_KEY` | 脚本**拒绝**就地轮换：旧 key 必须先留在 `E2B_SECRET_MASTER_KEYS`，否则既有 `_secrets/**` 与 redis `e2b:secret:*` 的密文永远解不开 | 两窗三拍（rotate → 滚 CP → finalize）由 `deploy/k8s-k0s/rotate-secret-master.sh` 承担 |
+
+只读核对（不改任何东西，也不回显明文）：
+
+```bash
+KUBECONFIG=... deploy/k8s-k0s/secrets.sh --fingerprint   # 每个键的 sha256(前16) + 长度
+```
+
 ## overlay 改了什么，以及为什么
 
 | 文件 | 改动 | 为什么 |

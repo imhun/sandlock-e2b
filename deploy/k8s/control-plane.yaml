@@ -179,6 +179,33 @@ spec:
                   key: E2B_REDIS_PASSWORD
             - name: E2B_REDIS_URL
               value: redis://:$(E2B_REDIS_PASSWORD)@redis:6379/0
+            # SECURITY (O3 Task 1): the secret-at-rest master key. Without it
+            # SecretRegistry degrades to "in-memory + plaintext on disk" and
+            # writes every value in clear text under
+            # /var/lib/e2b-sandboxes/_secrets/** -- the *shared* NAS volume the
+            # workers mount read-write in full, so any pod root could read
+            # another tenant's secret. `optional: true` is a deliberate
+            # transitional shape: applying this manifest before
+            # `deploy/k8s-k0s/secrets.sh` has added the keys still starts the
+            # control plane (degraded, with the startup warning) instead of
+            # failing with CreateContainerConfigError, so the two steps are
+            # order-independent. Run `kubectl -n sandlock rollout restart
+            # deploy/control-plane` once the keys are in the Secret.
+            # E2B_SECRET_MASTER_KEYS carries the *previous* keys during a
+            # rotation window (old records stay decryptable until every replica
+            # has re-encrypted them with the primary key).
+            - name: E2B_SECRET_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_SECRET_MASTER_KEY
+                  optional: true
+            - name: E2B_SECRET_MASTER_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_SECRET_MASTER_KEYS
+                  optional: true
             - name: E2B_CONTROL_PLANE_URL
               value: http://control-plane:3000
             - name: E2B_GATEWAY_URL
