@@ -1,15 +1,23 @@
-"""N25/L2b: the worker's measured-disk report pauses a runaway, end to end.
+"""N25/L2b: the worker's measured-disk report is the disk accounting, end to end.
 
 The worker is the only party that can measure (it owns the mount) and the
-control plane is the only party that can pause (it owns state), so the whole
-feature lives or dies on the heartbeat contract between them. This drives the
-real endpoint and then reads the registry back.
+control plane is the only party that owns the fleet's view of it, so the whole
+feature lives or dies on the heartbeat contract between them. What that
+contract carries is the measurement and a crossing notice -- **not** a
+freeze: over budget means the writes are refused where the writes are (the
+worker's zero file-size ceiling, plus ``ENOSPC`` for the entry-creating calls
+the ceiling cannot reach), so the sandbox stays ``running`` and its owner can
+still delete its way back inside. This drives the real endpoint and then reads
+the registry back.
 """
 
 from __future__ import annotations
 
 import httpx
 import pytest
+
+from control_plane.config import Settings as ControlSettings
+from control_plane.registry.manager import SandboxRecord, SandboxRegistry
 
 
 async def _create(control_client) -> dict:
@@ -207,3 +215,107 @@ async def test_the_crossing_is_reported_and_clears_when_the_tree_comes_back(
     )
     assert registry.disk_overrun_stats() == {"sandboxes": 0, "overMB": 0}
     assert registry.get(sid).workspace_disk_used_bytes == record.disk_size_mb * 1024 * 1024
+
+
+# -- N30: the contract itself, pinned where the semantics live ---------------
+
+_BUDGET_MB = 64
+_MIB = 1024 * 1024
+
+
+@pytest.fixture()
+def registry(make_apps) -> SandboxRegistry:
+    """A control-plane registry that sells 64 MiB of workspace disk.
+
+    These three cases drive ``enforce_disk_budget`` directly rather than
+    through the heartbeat endpoint (the endpoint has its own cases above):
+    what they pin is a property of the registry's semantics -- what a crossing
+    must *not* do to the record -- which is exactly what a later change would
+    regress, and it is the level at which the outward behaviour is decided.
+    """
+    control_app, _ = make_apps(
+        control_settings=ControlSettings(
+            api_keys=("local-key",),
+            create_queue_timeout_s=0,
+            default_disk_mb=_BUDGET_MB,
+        )
+    )
+    return control_app.state.registry
+
+
+def _sandbox_with_budget(registry: SandboxRegistry) -> SandboxRecord:
+    """A live record sold exactly ``_BUDGET_MB`` of workspace disk."""
+    return registry.create(
+        template_id="base",
+        timeout=300,
+        metadata={},
+        env_vars={},
+        secure=True,
+        allow_internet_access=False,
+        base_image=None,
+        sandbox_id="sbx_budget_contract",
+    )
+
+
+def test_over_budget_records_the_measurement_and_keeps_the_sandbox_running(registry):
+    """N30: over budget is *writes refused*, not a freeze -- and the number the
+    fleet advertises is the worker's measurement, not a local walk.
+
+    Both halves are the product: the record stays ``running`` so the reads, the
+    exec and above all the deletes that give the space back all keep working,
+    and ``diskUsed`` is exactly what the worker reported. The write side is
+    refused where the writes are (the worker's zero file-size ceiling plus
+    ``ENOSPC`` for the entry-creating calls a ceiling cannot reach), which this
+    method never assumed the job of.
+    """
+    record = _sandbox_with_budget(registry)
+    assert record.disk_size_mb == _BUDGET_MB
+    measured = 128 * _MIB
+
+    over = registry.enforce_disk_budget({record.sandbox_id: measured})
+
+    assert [r.sandbox_id for r in over] == [record.sandbox_id]
+    after = registry.get(record.sandbox_id)
+    assert after.state == "running"
+    assert after.workspace_disk_used_bytes == measured
+    # The outward half: ``GET /sandboxes/{id}/metrics`` reads these two fields.
+    assert after.sample_metric()["diskUsed"] == measured
+    assert after.sample_metric()["diskTotal"] == _BUDGET_MB * _MIB
+
+
+def test_an_in_budget_report_is_recorded_without_being_reported_as_a_crossing(
+    registry,
+):
+    """The recording is the fleet's ledger, not only the reaction to a crossing.
+
+    A number that only existed for the sandboxes that just crossed would leave
+    every other sandbox unaccounted for.
+    """
+    record = _sandbox_with_budget(registry)
+
+    assert registry.enforce_disk_budget({record.sandbox_id: 1_000_000}) == []
+    after = registry.get(record.sandbox_id)
+    assert after.state == "running"
+    assert after.workspace_disk_used_bytes == 1_000_000
+    assert after.sample_metric()["diskUsed"] == 1_000_000
+
+
+def test_enforce_disk_budget_does_not_pause_or_release_anything(registry):
+    """The reverse nail: nothing about the record's *standing* moves either.
+
+    Written against the semantics that were deliberately removed -- freezing a
+    sandbox over its disk also handed its reservation back (E9.2), which is
+    what made the freeze stick. Both halves are pinned here so that neither can
+    come back quietly.
+    """
+    record = _sandbox_with_budget(registry)
+    before = registry.global_reserved()
+    assert before["disk"] == _BUDGET_MB
+
+    registry.enforce_disk_budget({record.sandbox_id: 999 * _MIB})
+
+    assert registry.global_reserved() == before
+    after = registry.get(record.sandbox_id)
+    assert after.state == "running"
+    assert after.quota_released is False
+    assert [entry["line"] for entry in after.logs] == []

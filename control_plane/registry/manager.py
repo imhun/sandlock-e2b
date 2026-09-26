@@ -261,6 +261,13 @@ class SandboxRecord:
             "memUsed": 0,
             "memTotal": self.memory_mb * 1024 * 1024,
             "memCache": 0,
+            # N30: ``diskUsed`` is the *stock* reading of this sandbox's tree --
+            # the bytes it occupies right now, directories counted at their
+            # allocated blocks -- so deleting gives the space back on the next
+            # report rather than after a rebuild. ``diskTotal`` is the
+            # ``diskMB`` ceiling the sandbox was sold. Wording and why the
+            # alternative (peak) reading was rejected: docs/sandbox-disk-quota.md
+            # §1.1.
             "diskUsed": used,
             "diskTotal": self.disk_size_mb * 1024 * 1024,
         }
@@ -269,9 +276,12 @@ class SandboxRecord:
         """Freeze the record; ``reason`` is what the sandbox log shows.
 
         The log is the operator- and SDK-visible half of a pause that the
-        platform started on its own (the L2b disk enforcer): "sandbox paused"
-        alone does not say whether the caller asked for it or the platform did
-        it *to* them, nor how far over the line they were.
+        platform started on its own: "sandbox paused" alone does not say
+        whether the caller asked for it or the platform did it *to* them, nor
+        why. Nothing passes a reason today -- the disk enforcer did, until
+        N25/2026-09-20 turned over-budget into "writes are refused, the sandbox
+        keeps running" (see ``SandboxRegistry.enforce_disk_budget``), so the
+        mechanism outlived its first caller rather than being removed.
         """
         if self.state == "paused":
             raise SandboxStateConflictError("Sandbox is already paused")
@@ -1725,6 +1735,12 @@ class SandboxRegistry:
 
         Returns the records that are over their budget now, so the caller can
         report the crossing. Nothing about their state changes here.
+
+        The stock accounting that ``diskUsed`` carries (and why the peak
+        reading was rejected) is §1.1 of ``docs/sandbox-disk-quota.md``. The
+        invariant is pinned by
+        ``tests/contract/test_disk_budget_enforcement.py::
+        test_over_budget_records_the_measurement_and_keeps_the_sandbox_running``.
         """
         over_budget: list[SandboxRecord] = []
         overruns: dict[str, tuple[int, int]] = {}
@@ -1738,9 +1754,9 @@ class SandboxRegistry:
             except UnknownSandboxError:
                 continue
             # N28/D: the measurement is the accounting, so it is recorded for
-            # *every* reported sandbox, not only the ones about to be paused --
+            # *every* reported sandbox, not only the ones over budget --
             # otherwise the fleet's only per-sandbox disk number would exist
-            # exactly for the sandboxes that just got frozen. Written back only
+            # exactly for the sandboxes that just crossed. Written back only
             # when it moved, so a steady tree does not cost a store write per
             # heartbeat.
             if record.workspace_disk_used_bytes != used_bytes:

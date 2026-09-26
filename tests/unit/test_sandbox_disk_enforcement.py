@@ -148,6 +148,13 @@ def test_a_tree_over_budget_is_reported_but_never_frozen(workspace):
     # The measurement is the accounting, and it lands on the record whether or
     # not the sandbox is over (N28/D).
     assert registry.get("sbx_over").workspace_disk_used_bytes == over
+    # N30: the *outward* number is that same measurement -- ``diskUsed`` is the
+    # stock reading the worker reported (not a walk of a tree this record does
+    # not even carry: a remote sandbox has no ``workspace_dir``), and
+    # ``diskTotal`` is the ceiling it was sold.
+    metrics = registry.get("sbx_over").sample_metric()
+    assert metrics["diskUsed"] == over
+    assert metrics["diskTotal"] == record.disk_size_mb * 1024 * 1024
     # Nothing was parked: a running sandbox keeps its reservation, so it keeps
     # its place while it deletes its way back inside.
     assert registry.global_reserved()["disk"] == record.disk_size_mb
