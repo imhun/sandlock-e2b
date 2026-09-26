@@ -26,7 +26,11 @@ from envd_service.runtime.platform_disk import (
     checkpoint_admission,
     measure_platform_disk_bytes,
 )
-from gateway_common.paths import sandbox_checkpoint_dir, sandbox_runtime_dir
+from gateway_common.paths import (
+    PURE_ROOTFS_DIR_NAME,
+    sandbox_checkpoint_dir,
+    sandbox_runtime_dir,
+)
 
 
 def _sandbox_tree(base: Path, sandbox_id: str) -> None:
@@ -168,3 +172,78 @@ def test_teardown_takes_the_images_too_and_they_are_not_under_the_runtime_dir(
     assert remove_checkpoint_images(base, "sbx_a") is True
     assert not sandbox_checkpoint_dir(base, "sbx_a").exists(), "the images must be gone"
     assert remove_checkpoint_images(base, "sbx_a") is False, "idempotent"
+
+
+def test_teardown_removes_the_synthesized_root_too(tmp_path: Path, monkeypatch) -> None:
+    """A leftover skeleton is a leftover *root*: it goes with the tree.
+
+    The synthesized root (N16) is the third thing the platform holds for a
+    sandbox beside its tree -- ``<base>/_pure_rootfs/<id>``, next to
+    ``_runtime/<id>`` and its checkpoint images -- and it is the one a teardown
+    can forget without anyone noticing: it holds no payload, and it lives in a
+    reserved namespace, so neither the orphan-tree GC nor the fail-safe quota
+    scan ever walks it (``gateway_common.paths.PURE_ROOTFS_DIR_NAME``). That is
+    what the switch's ordering condition is about -- ``E2B_PURE_ROOTFS`` may only
+    be turned on behind the teardown that removes this directory -- so the pair
+    is asserted here in one call: the tree, the record and the root.
+    """
+    from envd_service import agent as agent_mod
+    from envd_service.config import Settings
+    from envd_service.runtime.registry import RuntimeRegistry
+
+    # The deployment shape: both layers default to the workspace base, which is
+    # what makes ``<base>/_pure_rootfs/<id>`` the skeleton's home.
+    monkeypatch.delenv("E2B_PURE_ROOTFS_DIR", raising=False)
+    monkeypatch.setenv("E2B_WORKSPACE_BASE", str(tmp_path / "base"))
+
+    base = tmp_path / "base"
+    sandbox_id = "sbx_synth_teardown"
+    workspace = base / sandbox_id
+    workspace.mkdir(parents=True)
+    (workspace / "keep.txt").write_text("x", encoding="utf-8")
+    skeleton = base / PURE_ROOTFS_DIR_NAME / sandbox_id
+    (skeleton / "proc").mkdir(parents=True)
+
+    agent_mod._delete_sandbox_runtime(
+        Settings(executor="local", workspace_base=base),
+        RuntimeRegistry(base),
+        sandbox_id,
+    )
+
+    assert workspace.exists() is False
+    assert skeleton.exists() is False
+
+
+def test_teardown_takes_the_synthesized_root_from_where_it_was_pinned(
+    tmp_path: Path,
+) -> None:
+    """``E2B_PURE_ROOTFS_DIR`` moves the root, so the teardown has to follow it.
+
+    ``settings.pure_rootfs_dir`` is where the skeleton actually lands: the
+    executor materializes ``<pure_rootfs_dir>/<id>`` and the factory hands it
+    exactly this setting (``envd_service.executors.factory``). A teardown that
+    derived the path from the workspace base instead would look right in the
+    default layout and leak every synthesized root on a worker that pinned the
+    namespace onto a volume of its own -- and nothing would ever collect them,
+    because the namespace is reserved.
+    """
+    from envd_service import agent as agent_mod
+    from envd_service.config import Settings
+    from envd_service.runtime.registry import RuntimeRegistry
+
+    base = tmp_path / "base"
+    pinned = tmp_path / "pinned"
+    sandbox_id = "sbx_synth_pinned"
+    workspace = base / sandbox_id
+    workspace.mkdir(parents=True)
+    skeleton = pinned / sandbox_id
+    (skeleton / "proc").mkdir(parents=True)
+
+    agent_mod._delete_sandbox_runtime(
+        Settings(executor="local", workspace_base=base, pure_rootfs_dir=pinned),
+        RuntimeRegistry(base),
+        sandbox_id,
+    )
+
+    assert workspace.exists() is False
+    assert skeleton.exists() is False

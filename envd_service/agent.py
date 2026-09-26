@@ -1351,6 +1351,27 @@ def _delete_sandbox_runtime(
             ),
             ignore_errors=True,
         )
+        # ...and the pure shape's synthesized root (N16), the third thing the
+        # platform holds for this sandbox: ``<pure_rootfs_dir>/<id>`` is the
+        # skeleton the sandbox's own mount namespace binds into. It goes with
+        # the tree for the same reason the runtime record does -- a skeleton
+        # whose sandbox is gone is a root nobody owns, and this one has no
+        # collector either (the namespace is reserved, so neither the
+        # orphan-tree GC nor the fail-safe quota scan walks it).
+        #
+        # The path is the *executor's* own source of truth rather than a
+        # workspace-base convention: ``settings.pure_rootfs_dir`` is what
+        # ``executors.factory`` hands the executor, and ``E2B_PURE_ROOTFS_DIR``
+        # may pin it onto a volume of the worker's own -- deriving
+        # ``<base>/_pure_rootfs`` here would look right by default and leak on
+        # exactly the deployments that moved it.
+        pure_rootfs_dir = Path(settings.pure_rootfs_dir)
+        if pure_rootfs_dir != Path(pure_rootfs_dir.anchor):
+            # A filesystem root is never a synthesized-root parent: a
+            # misconfigured ``E2B_PURE_ROOTFS_DIR=/`` must not turn a teardown
+            # into an ``rmtree`` of ``/<id>``, exactly as the executor's heal
+            # refuses to ``chmod`` one (``_materialize_synthetic_rootfs``).
+            shutil.rmtree(pure_rootfs_dir / sandbox_id, ignore_errors=True)
         # ...and the checkpoint images, which live *beside* that runtime dir
         # (``_runtime/.checkpoints/<id>``, `gateway_common.paths`) because the
         # sandbox's own slot has to be able to write them. They are the largest
