@@ -20,7 +20,6 @@ from control_plane.registry.manager import (
     ResourceUnavailableError,
     SandboxRegistry,
     SandboxStateConflictError,
-    workspace_disk_refusal,
 )
 from gateway_common.timeutil import utcnow
 
@@ -250,7 +249,7 @@ def test_shared_store_record_round_trips_quota_released(workspace):
 
 
 def test_disk_reservation_is_exactly_the_sum_of_live_records(registry, make_record):
-    a = make_record(registry, disk_size_mb=64)
+    _a = make_record(registry, disk_size_mb=64)
     b = make_record(registry, disk_size_mb=128)
     assert registry.global_reserved()["disk"] == 192
     registry.release_quota(b)
@@ -260,6 +259,13 @@ def test_disk_reservation_is_exactly_the_sum_of_live_records(registry, make_reco
 def test_every_path_that_frees_a_sandbox_releases_the_disk_row_exactly_once(
     registry, make_record
 ):
+    """The gate every freeing path shares, called directly.
+
+    "Every path" means pause, delete and TTL expiry, and what they share is
+    ``release_quota``: this case pins the gate itself (first call ``True``,
+    second ``False``, ``hold_quota`` books it back), while the cases below
+    drive each of those paths for real, on both ledgers.
+    """
     r = make_record(registry, disk_size_mb=64)
     assert registry.release_quota(r) is True  # pause / delete / expiry share it
     assert registry.release_quota(r) is False  # the second one is a no-op
@@ -270,7 +276,9 @@ def test_every_path_that_frees_a_sandbox_releases_the_disk_row_exactly_once(
 
 def test_an_over_budget_sandbox_keeps_its_reservation(registry, make_record):
     r = make_record(registry, disk_size_mb=64)
-    registry.enforce_disk_budget({r.sandbox_id: 128 * 1024 * 1024})
+    over_budget = registry.enforce_disk_budget({r.sandbox_id: 128 * 1024 * 1024})
+    # The premise has to be self-evident: the crossing was *seen* as one.
+    assert [x.sandbox_id for x in over_budget] == [r.sandbox_id]
     assert registry.global_reserved()["disk"] == 64
 
 
@@ -332,7 +340,10 @@ def test_a_released_disk_budget_is_bookable_by_the_next_create():
 
     with pytest.raises(ResourceUnavailableError) as exc:
         _create(registry, sandbox_id="sbx_n30_second")
-    assert str(exc.value) == workspace_disk_refusal(64, 64)
+    assert (
+        str(exc.value)
+        == "shared workspace disk budget exhausted: 64 MiB reserved of 64 MiB"
+    )
 
     registry.release_quota(first)
     assert registry.global_reserved()["disk"] == 0
@@ -397,6 +408,40 @@ def test_shared_store_disk_row_follows_the_live_records_and_returns_once(make_re
     registry.delete(b.sandbox_id)
     assert registry.global_reserved()["disk"] == 64
     assert registry.global_reserved()["disk"] == live_disk_mb()
+
+
+def test_shared_store_ttl_expiry_returns_the_disk_row_once(make_record):
+    """The sweep on the shared ledger goes through ``release_quota`` too.
+
+    ``remove_expired`` re-reads each expired record from the store and hands
+    it to ``_release``; the row and the record's own ``quota_released`` flag
+    therefore move together, which is what makes the *next* release a no-op.
+    A sweep that gave the rows back itself ("delete the records in bulk, then
+    subtract each one") would leave the flag unset -- and on this backend
+    there is no clamp, so the second subtraction drives the row negative.
+
+    The second record is the instrument: with only the expired one booked the
+    row reads 0 either way.
+    """
+    registry = SandboxRegistry(_settings(), redis_client=fakeredis.FakeRedis())
+    record = make_record(registry, disk_size_mb=64)
+    other = make_record(registry, disk_size_mb=128)
+    assert registry.global_reserved()["disk"] == 192
+
+    record.end_at = utcnow() - timedelta(seconds=10)
+    # The sweep enumerates the shared store, so the deadline has to land there.
+    registry.save(record)
+
+    expired = registry.remove_expired()
+    assert [r.sandbox_id for r in expired] == [record.sandbox_id]
+    assert registry.global_reserved()["disk"] == 128
+    # The object the sweep released came back with the flag set: the row it
+    # moved belonged to *this* reservation, so releasing it again moves nothing.
+    assert registry.release_quota(expired[0]) is False
+    assert registry.global_reserved()["disk"] == 128
+    # ...and the row of the record that is still alive was not touched.
+    assert registry.get(other.sandbox_id).quota_released is False
+    assert registry.global_reserved()["disk"] == 128
 
 
 # -- N41: one reservation, one return -- across replicas ------------------
