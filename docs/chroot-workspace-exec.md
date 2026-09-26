@@ -527,10 +527,17 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 
    **关掉 `real_root`（只用模拟 chroot）同样复现** ⇒ 这条**不是真根独有**，是"带 root 的形态"
    通病；fork 自己的 OCI 用例里早有一句注记"restore of a chrooted checkpoint is a separate
-   limitation"，与此一致。**已做的处理（fork `43cc62a`）**：在配置了 chroot 根而 stub 不在该根内时
+   limitation"，与此一致。~~**已做的处理（fork `43cc62a`）**：在配置了 chroot 根而 stub 不在该根内时
    **立刻拒绝**并写明 stub、根与两条出路（用策略挂载把 stub 带进根里 / 恢复到无 chroot 的政策），
    不再让人等 10 s 超时；无 chroot 的恢复**不受影响**（`test_restore_glibc_vdso_program_resumes`
-   仍绿），两种根形态的"立即拒绝"由新用例 `test_restore_resumes_inside_a_real_root` 钉住。
+   仍绿），两种根形态的"立即拒绝"由新用例 `test_restore_resumes_inside_a_real_root` 钉住。~~
+   **✅ 已真正解掉（2026-09-26 更正）**：`43cc62a` 的"立即拒绝"只在那时成立，
+   fork `a6f6b04`（*feat(restore): deliver the stub by descriptor, so a chroot root can
+   restore*）把它取代了 —— stub 由**描述符**投递（`execveat(AT_EMPTY_PATH)`），规则集给这一个
+   宿主文件 Landlock 真正判定的那个权利，于是**两种 chroot 形态都能恢复**，由
+   `test_restore_resumes_inside_a_chroot_root` 钉住（模拟根与真根都跑）。依据：
+   `third_party/sandlock/crates/sandlock-core/src/sandbox.rs:1419-1463`，那段注释本身就是
+   被更正过的历史。**本文件下面 §11 的"当前已临时改为立即拒绝"同样过期。**
    **③ 对 E2B 的含义**：E2B 的生产形态就是 chroot 根（`E2B_BASE_IMAGE=python-mcp:3.14` ⇒
    image-rootfs），所以在把 stub 送进根里之前，**"恢复沙箱"这类功能在这条 API 上不可用**——这条
    写成前置条件，真要做时按它开工，而不是"将来若启用需重新验证"这种含糊说法。
@@ -611,8 +618,11 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 
 **问题（§9.7.9 实测）**：`restore_interactive` 把 restore stub 当**宿主路径** exec；任何
 chroot 根（模拟的、真根的）都把 workload 路径解析到 rootfs 内 ⇒
-`execvp '…/restore-stub': No such file or directory` 后 10 s READY 超时。当前已临时改为
-**立即拒绝**（fork `43cc62a`），方案落地前拒绝对话就是正确行为。
+`execvp '…/restore-stub': No such file or directory` 后 10 s READY 超时。当时临时改为
+**立即拒绝**（fork `43cc62a`）。**✅ 本节末尾的结论已被取代（2026-09-26）**：fork `a6f6b04`
+用**描述符投递**（`execveat(AT_EMPTY_PATH)`）解掉了它，两种 chroot 形态都能恢复
+（`test_restore_resumes_inside_a_chroot_root` 跑模拟根与真根两态）。本节的探针与结论保留为
+推导过程；**落地做法见 `third_party/sandlock/crates/sandlock-core/src/sandbox.rs:1419-1463`**。
 
 **关键未知量：按 fd 执行（`execveat(fd, "", …, AT_EMPTY_PATH)`）能不能绕过 Landlock？**
 探针 `tmp/k0s/probe_landlock_execveat.py` 自建 Landlock 域（decoy 目录全权、`/` 与 `/tmp`

@@ -56,12 +56,23 @@
 
 ⇒ 所以 checkpoint/restore 的产品化**没有"恢复后不能 exec"这道拦路虎**。
 `docs/checkpoint-restore-e2b-half.md` §0/§(d) 的原文按"不能 exec"写、误导过一轮排查，
-已就地更正。计划（`2026-09-26-checkpoint-restore-productization.md`）里把 D9 当
-第一道题的那部分**需要按本条重写**，剩余的真实问题是：
+已就地更正。
 
-- **restore stub 与 chroot/真根不兼容**（fork `43cc62a` 改成"立即拒绝并写明出路"）：
-  restore stub 按**宿主路径** exec，而生产形态是 image-rootfs + `E2B_REAL_ROOT=1`
-  ⇒ **这道才是生产能不能用的第一道题**，要在计划里升为 Task 1。
-- pause 抓的是会话里那个活子进程（对外语义）。
-- API/SDK 可见性、配额与磁盘账（blob 与 `_runtime`）、生命周期（TTL/驱逐与 paused）、
-  可观测性、文档。
+> **⚠️ 同日第二次更正（写本节时我又犯了同一个错，一并记下）**：本节初稿还写了
+> "restore stub 与 chroot/真根不兼容 ⇒ 这道才是生产能不能用的第一道题"。**那句也是过期的。**
+> `43cc62a` 的"立即拒绝"只在那时成立；`a6f6b04`（*feat(restore): deliver the stub by
+> descriptor, so a chroot root can restore*）已把它取代：stub 由**描述符**投递
+> （`execveat(AT_EMPTY_PATH)`），规则集给这一个宿主文件 Landlock 真正判定的那个权利，
+> 于是"两种 chroot 形态都能恢复"，由 `test_restore_resumes_inside_a_chroot_root` 钉住
+> （模拟根与真根都跑）。依据是 fork `crates/sandlock-core/src/sandbox.rs:1419-1463` ——
+> 那段注释本身就是被更正过的历史（"and for a while the call was refused up front instead
+> (43cc62a), because that was true. **It is not true any more**"）。
+>
+> **两次错的是同一个东西**：我拿 E2B 侧文档（`open-issues.md` / `checkpoint-restore-e2b-half.md`）
+> 的叙述当引擎事实，而那份叙述滞后于 fork。**纪律**：凡"引擎能不能做某事"的判断，
+> 一律读 **fork 代码 + 当前 tip 的用例**，不读 E2B 侧的转述。
+>
+> 结论：生产形态**今天没有**已知的引擎侧拦路虎（会话恢复保留 exec、两种根形态都能恢复 stub）。
+> 计划（重写后的 `2026-09-26-checkpoint-restore-productization.md`）的 Task 1 因此改成
+> **覆盖缺口**而不是"解一道禁令"：模拟根缺会话恢复用例、真根缺"恢复后仍能 exec"断言、
+> "会话启动时没装上 stub 的 grant"是**静默失败**（这三条才是要补的）。
