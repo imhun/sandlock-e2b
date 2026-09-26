@@ -326,3 +326,81 @@ export E2B_API_URL=http://172.18.78.49:3000
 export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d)
 .venv/bin/python tmp/k0s/cpu_activity_acceptance.py
 ```
+
+## 11. N27（平台状态另起 `state base`）的上线记录与集群验收（2026-09-26）
+
+**版本**：`0.1.0-597-g3701a53-20260926-163057`（= `deploy/stack/.version`）。整栈同一版本 ——
+`autoscaler` / `control-plane` / `e2b-worker` 三个工作负载的镜像都是这一版（实测）。布局（树根下沉一级、
+平台状态成为同挂载的兄弟目录）见 `docs/k8s-deployment.md` §23；迁移窗口的执行记录见
+`.superpowers/sdd/progress.md` 的「N27 迁移已执行 + 已上线」段（`done=12 unknown=0`、逐条
+`same_inode=yes`、journal 0600）。
+
+### 11.1 卷上现状（2026-09-26 只读复核，`e2b-worker-0`）
+
+```
+/var/lib/e2b-sandboxes             1777  _builds _images _secrets _snapshots _templates _volumes state workspaces
+/var/lib/e2b-sandboxes/state       1777  .route-b  .state-base-migration.journal(0600,585B)  .uid_pool.lock  _runtime
+/var/lib/e2b-sandboxes/workspaces  1777  _migrate + 7 棵 <id> 树
+```
+
+* 顶层**没有** `_runtime` / `.route-b`：迁移是同挂载 `rename(2)` ⇒ 旧路径**不再存在**（不是"留了一份副本"）。
+  回退窗口 = `state/.state-base-migration.journal`（0600）+ `migrate-state-base.sh --rollback --apply` 反向改名。
+* 没有 migrate Job / ConfigMap 残留；`statefulset/e2b-worker` = **2/2 ready**；两个 control-plane 副本启动都打印
+  `workspace base = /var/lib/e2b-sandboxes/workspaces` / `platform state base = /var/lib/e2b-sandboxes/state`。
+* 证据：`tmp/k0s/n27-t7-cluster-state.log`、`n27-t7-cluster-volume.log`、`n27-t7-cluster-layout.log`。
+
+### 11.2 形态无关性：两种形态 + 一条反例（探针 `tmp/k0s/probe_state_base_visibility.py`）
+
+两条判据，都在沙箱内跑：① `stat` 四个平台状态路径（`<base>`、`<base>/_runtime`、`<base>/.route-b`、
+`<base>/_runtime/.checkpoints`）必须**全失败**且 errno ∈ {`ENOENT`, `EACCES`}（N15 之后 pure 形态是中介的
+策略拒绝，不是 ENOENT，所以只认 ENOENT 的探针会只在一个形态上通过）；② 从 `cwd` 到 `/` 的**每一层**
+要么列不出来、要么列出来**不含** `state` / `_runtime` / `.route-b` / `_secrets`。退出码 `0`=成立 / `1`=不成立 /
+`2`=VACUOUS。两条判据各带**正对照**（沙箱自己写的 canary 必须能 `stat` 到、workspace 那一层必须列出它），
+所以"到处都拒"不会被读成"干净"；反例是"迁移前布局"（平台状态就在树根上），它必须报 `1`。
+
+| 形态 | 怎么跑 | ① `stat` ×4 | ② 祖先链 | 退出码 |
+|---|---|---|---|---|
+| **image-rootfs（生产）** | `probe … cluster`（真集群、真 `Sandbox`） | `ENOENT` ×4 | 3 层（`/home/user` → `/home` → 沙箱自己的 `/`），无泄漏 | **0** |
+| **pure + 合成根 + 真根**（N16） | `probe … lane --shape synth-realroot --layout n27` | `ENOENT` ×4 | 3 层（合成根），无泄漏 | **0** |
+| **pure + identity（无根，N15）** | `probe … lane --shape identity --layout n27` | `EACCES` ×4（**读不到 ✔**） | ✘ 在 `<export>` 一层列出 `["_secrets", "state"]` | **1** |
+| 对照：**迁移前布局** | `probe … lane --shape identity --layout legacy` | 状态目录**本身可 `stat`**（该层还列出 `_runtime` / `.route-b` / `_secrets`） | ✘ | **1** |
+| pure + 合成根 + 模拟根 | `probe … lane --shape synth-emulated --layout n27` | 起不来（`SlotRefusal: instance is closed`） | — | 形态不可服务：N16 守卫要求 `E2B_PURE_ROOTFS=synth` 必须配 `E2B_REAL_ROOT=1` |
+
+**结论（形态无关性的准确边界）**：**有根的形态**（生产 image-rootfs、pure+合成根+真根）两条判据都成立 ——
+平台状态**既不在祖先链上、也读不到**；**无根的 identity 形态只成立一半**：四次 `stat` 全 `EACCES`（读不到 ✔），
+但那条形态的"祖先链"**就是宿主路径链**（中介必须放行 workspace 的祖先目录），于是 `../..`（= `<export>`）能列出
+`state` 与 `_secrets` 的**名字**（内容仍不可达 —— 对它们 `stat` 就是 `EACCES`）。这条残差不是 N27 引入的
+（迁移前同一条形态在 `..` 一层就列出 `_runtime` 等），它是"没有根"这件事本身，也就是
+`docs/superpowers/plans/2026-09-26-pure-shape-synthetic-rootfs.md`（N16 合成根）要消掉的那条。
+⇒ **`docs/pure-shape-decision.md` §2、`docs/open-issues.md`、`docs/task-backlog.md` 里"pure 形态也不在祖先链上"
+这句要按本表限定为"有根形态"**（Task 8 写它时没有实跑，见 `.superpowers/sdd/n27-task-7-report.md`）。
+
+机制旁证（"祖先"而不是"随便一个目录"）：identity 形态下 workspace 的父目录可列（`ls -a /tmp/n27-mount` `rc=0`），
+同一个挂载里**不是祖先**的 `/workspace/...` 一律 `Permission denied` —— `tmp/k0s/n27-t7-lane-mount.log`。
+
+### 11.3 不回归（两条冒烟，凭据只从 Secret 取、不打印）
+
+| 冒烟 | 结果 | 日志 |
+|---|---|---|
+| `deploy/scripts/multinode_smoke.py` | 两个 worker 各落 2 个沙箱（`NODE DISTRIBUTION` 两个节点都在），commands / files / health / stdin 全过，kill 后两边预约归零 ⇒ `MULTI-NODE SMOKE OK` | `tmp/k0s/n27-t7-smoke-multinode.log` |
+| `deploy/scripts/deployment_smoke.py` | 命令/文件、跨节点迁移保文件、网络配置、远端卷、**template build → registry push → worker pull → image rootfs**、MCP gateway 全过 ⇒ `DEPLOYMENT SMOKE OK` | `tmp/k0s/n27-t7-smoke-deployment.log` |
+
+### 11.4 怎么再跑一遍
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+deploy/scripts/open-cluster-tunnel.sh                       # 建通道 + 自检 2 节点 arm64
+export E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000
+export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d | cut -d, -f1)
+tmp/testenv/bin/python tmp/k0s/probe_state_base_visibility.py cluster
+tmp/testenv/bin/python deploy/scripts/multinode_smoke.py
+tmp/testenv/bin/python deploy/scripts/deployment_smoke.py
+
+# 形态对照（prod-shaped 测试容器；仓库挂在 /src，因为 identity 形态拒 /workspace）
+sh tmp/k0s/n27-t7-lane.sh python3 -u tmp/k0s/probe_state_base_visibility.py lane --shape identity     --layout n27
+sh tmp/k0s/n27-t7-lane.sh python3 -u tmp/k0s/probe_state_base_visibility.py lane --shape identity     --layout legacy
+sh tmp/k0s/n27-t7-lane.sh python3 -u tmp/k0s/probe_state_base_visibility.py lane --shape synth-realroot --layout n27
+```
+
+（lane 容器是 `e2b-sandlock-test:latest`（amd64），caps 与 seccomp 档同
+`deploy/scripts/arm-lane/x86-security.sh`；`E2B_BASE_IMAGE` 必须**显式传空**，`${VAR:-default}` 会把它换成默认值。）
