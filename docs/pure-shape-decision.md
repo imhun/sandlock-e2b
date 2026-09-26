@@ -26,7 +26,7 @@ mediation_shape = bool(settings.base_image and image_rootfs is not None)
 | 路径可见性 | 路径 syscall 全被中介，`chroot_root` 翻译 | **Landlock 一道网**；Landlock 访问位是闭集，"带路径但不在闭集里"的调用无人拦 |
 | 具体暴露 | — | 同一宿主文件上实测：`openat` EACCES，而 `getxattr` **读回宿主 xattr**、`open_tree` **返回 fd**、`inotify_add_watch` **投递宿主事件与宿主文件名**（OBS-7）；`path_surface.rs::PURE_UNGATED` 把这一类**逐条 pin 成 33 条**（stat/readlink/chdir/chmod/utimensat/*xattr/inotify_add_watch + 5 条 at 风格，其中 5 条在当前内核 ENOSYS 或被 worker seccomp 档拒） |
 | 磁盘闸门 | 中介的**活账本**：`openat` 按剩余额度发上限、超预算建条目 ENOSPC、unlink 即时归还、N31 的条目计数闸门 | 只有 init 在 fork 里施加的 **per-exec `RLIMIT_FSIZE` 硬上限**（单文件、shape 无关，仍生效）；**没有活账本**：跑飞的写者可以一直写到自己那条 exec 的额度，`diskMB` 那层语义在这个形态下不成立（OBS-5） |
-| 平台状态可见性 | `_runtime` 对沙箱 ENOENT（沙箱的根是它自己的 rootfs） | `/home/user` 就是 `<base>/<id>` 的真实路径 ⇒ `..` 到 `<base>`，`_runtime` "看得见但打不开"（DAC `0700` → EACCES）。**不是洞，但是形态漂移**（N27） |
+| 平台状态可见性 | `_runtime` 对沙箱 ENOENT（沙箱的根是它自己的 rootfs） | `/home/user` 就是 `<base>/<id>` 的真实路径 ⇒ `..` 到 `<base>`，`_runtime` "看得见但打不开"（DAC `0700` → EACCES）。**不是洞，但是形态漂移**（N27）。**N27 上线后（2026-09-26）**：树根下沉一级，`/home/user` = `<export>/workspaces/<id>`、平台状态在 `<export>/state/` ⇒ 既不在祖先链上、也读不到（image-rootfs 给 `ENOENT`，pure 给中介的策略拒绝 `EACCES`），形态漂移已消除 |
 
 ## 3. 三条路
 
@@ -66,7 +66,7 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
 | 项 | 是什么 | 独立性 | 代价 |
 |---|---|---|---|
 | **N15 + OBS-5** | **一件工作**：给"没有 rootfs 的形态"补路径中介 —— 33 条 `PURE_UNGATED`（元数据泄漏）与活账本（`diskMB`/条目闸门）是**同一个缺失**的两个面（今天那个形态的 mediator 什么都不中介："auto keeps the pure (no-chroot) shape in-process: it mediates nothing"） | **不依赖任何 pure 决定**：它是"只要沙箱没有 rootfs 就生效"的代码 | 中：策略面（非 chroot 的 readable/writable + "仅 Landlock"档位）+ 33 条逐条定语义（清单已被单测 pin 住）+ 写路径记账 |
-| **N27** | E2B 侧把平台状态搬到沙箱永远不经过的 base（`E2B_STATE_BASE` + 挂载 + 一次性迁移） | **完全独立**，任何时候都能做，做了就是保险 | 中：新 base + 挂载清单 + 迁移脚本 + EXDEV 账（行内已列） |
+| **N27** | E2B 侧把平台状态搬到沙箱永远不经过的 base（`E2B_STATE_BASE` + 挂载 + 一次性迁移） | **已落地（2026-09-26）** —— 原本"完全独立、任何时候都能做"；实际选的是**同挂载 + 树根下沉**（用户裁定见 `docs/superpowers/plans/2026-09-26-decisions.md` 第 1/2 条） | 低：同挂载 `rename(2)`（秒级、可原路回退），原列的 EXDEV 账**不发生**；上线状态与验收口径见 §5 第 2 条 |
 | **N14** | 用 mount ns + pivot_root 换"虚拟根" | **可选替代路线**，不阻塞上面两件 | 大：core 引入 mount ns + 宿主兼容矩阵 + exec 路径简化 |
 
 **做完 N15 + OBS-5 之后，"要不要支持 pure"这道题基本消失**：那个形态不再是"只有 Landlock
@@ -88,8 +88,17 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
    槽位"、另有 4 条形态差异），迁移后跑 **gate B（`E2B_BASE_IMAGE=""`）+ 默认档**双复验。
    验收线照 chroot 形态的现有契约等强 —— 宿主文件的存在性/大小/时间戳/inode/链接目标/
    xattr/事件都不可见，且 `diskMB` 那层账本在该形态下也有等价物。
-2. **N27 单独排期**（E2B 侧）：按行内已收口的落点（`gateway_common/paths.py` 三个 helper +
-   新 `E2B_STATE_BASE` + 迁移脚本）做，验收是 pure 形态下从沙箱内 `stat(<新 base>)` 为 ENOENT。
+2. **N27 已落地（2026-09-26，E2B 侧）**：落点全部兑现 —— `gateway_common/paths.py` 的 helper 认
+   `E2B_STATE_BASE`（未设 = 树根 ⇒ 逐字节零变化）+ 清单把树根下沉一级（树 `<export>/workspaces/<id>`、
+   平台状态 `<export>/state/`，**同一个挂载**）+ 一次性迁移脚本（`deploy/scripts/migrate-state-base.sh`，
+   同挂载 `rename(2)`；集群实测 `done=12 unknown=0`、逐条 `same_inode=yes` ⇒ 原先记的 EXDEV 账不发生）。
+   **形态无关性**：平台状态**不在沙箱的祖先链上、也读不到** —— image-rootfs 形态给 `ENOENT`，pure 形态
+   由中介按策略拒绝（`EACCES`）；两者都**不是"能读"**，所以验收**不再**是"pure 形态下从沙箱内
+   `stat(<新 base>)` 为 ENOENT"这条单形态判据（该判据随 N15 的中介化作废）。**回退窗口**：旧
+   `<export>/_runtime` 不需要保留副本 —— `--rollback` 是同一张映射表的反向 `mv`
+   （`state/_runtime` → `<export>/_runtime`，inode 保留、不拷数据），依据是留在盘上的
+   `state/.state-base-migration.journal`（0600），一个发布周期内不删它即可原路退回。
+   证据：`docs/deploy-clusters.md` 的 N27 上线记录节 + 探针 `tmp/k0s/probe_state_base_visibility.py`。
 3. **N14 挂在 N15+OBS-5 之后评估**：如果 33 条做完之后仍觉得"拦截清单完整性"这层负担不值，
    再走真根；那时它是个优化，不是前提。
 4. **顺带**（与上面不冲突，且很小）：今天的默认仍是"base image 忘配 ⇒ 静默降级到无中介形态"。
