@@ -25,6 +25,7 @@ docker run --rm --init --network host \
     --security-opt apparmor=unconfined \
     -e HOST_ONLY="${HOST_ONLY:-/workspace/AGENTS.md}" \
     -e DEV_VARIANT="${DEV_VARIANT:-host-tree}" \
+    -e DEV_SKELETON_PROC="${DEV_SKELETON_PROC:-0}" \
     -e PROC_VARIANT="${PROC_VARIANT:-absent}" \
     -v "$(pwd):/workspace" -w /workspace \
     e2b-sandlock-test:latest \

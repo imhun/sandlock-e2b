@@ -269,16 +269,78 @@ def dev_node_identity(node: str) -> str:
     return f"{kind} rdev={st.st_rdev} mode={oct(st.st_mode)}"
 
 
+#: 两条候选要比的节点（`minimal` 的六节点就是 fork 的 `minimal_dev`：
+#: `builder.rs:938-952` 的 `/dev/{ptmx,pts,null,urandom,zero,tty}`）。
+DEV_INTEREST = ("null", "zero", "urandom", "tty", "ptmx", "pts")
+
+#: 只用来打印形状、**不参与任何候选的装配**：`/dev/fd`、`/dev/std{in,out,err}` 在容器里
+#: 都是 `-> /proc/self/fd/…` 的软链，悬空与否取决于 `/proc`，不是取决于 `/dev` 装了什么。
+DEV_SYMLINKS = ("fd", "stdin", "stdout", "stderr")
+
+
+def dev_node_shape(node: str) -> str:
+    """节点在合成根里**是什么**：软链（带目标与是否解析得开）/ 目录 / 设备身份。
+
+    比 `dev_node_identity()` 多两类：`/dev/fd`、`/dev/stderr` 这类**软链**（`stat` 只答它的
+    目标在不在），以及 `/dev/pts`、`/dev/shm` 这类**目录**。差集表要按这一行区分
+    "① 少了节点" 与 "① 有节点、但目标不在"——`os.path.exists` 会把两者都答成 False。
+    """
+    if os.path.islink(node):
+        return f"symlink -> {os.readlink(node)} (resolves: {os.path.exists(node)})"
+    if os.path.isdir(node):
+        return "directory"
+    return dev_node_identity(node)
+
+
+def dev_shm_probe() -> str:
+    """`/dev/shm` 不只是"目录在不在"：今天它是一个**可写的 tmpfs**（POSIX shm 的落点）。
+
+    候选② 里这个目录根本不存在，所以这一行要同时量"在不在"和"能不能用"——只量存在性
+    会把"少一个能用的 shm"读成"少一条列表项"。
+    """
+    if not os.path.isdir("/dev/shm"):
+        return "absent"
+    try:
+        with open("/dev/shm/.dev-probe", "w") as fh:
+            fh.write("x")
+        os.unlink("/dev/shm/.dev-probe")
+    except OSError as exc:
+        return f"present, NOT writable ({type(exc).__name__} errno={exc.errno} {exc.strerror})"
+    return f"present, writable, ismount={os.path.ismount('/dev/shm')}"
+
+
 def part_dev() -> int:
-    """三条 /dev 候选各自装配，跑同一组命令，产出可比较的一行。"""
+    """三条 /dev 候选各自装配，跑同一组命令，产出可比较的一行。
+
+    两个臂的骨架**字面相同**，只差 `dev` 里装的东西：
+    - `host-tree`（= 候选①，也是今天 pure 的可见集合）：递归 bind 容器的整棵 `/dev`；
+    - `minimal`（= 候选②）：先自建六个同名节点占位，再逐个 bind 宿主同名节点
+      （`/dev/pts` 是目录）。绑定失败会 `FAILED` 而不是留在占位文件上（假绿入口）。
+
+    两处与简报 Steps 不同的地方，都是为了让"差集"有信息量（简报 Files 允许改本 part）：
+    1. 骨架补上 `lib64` 并绑定 `/lib64`：`/bin/sh -> dash` 是动态链接、PT_INTERP 是
+       `/lib64/ld-linux-x86-64.so.2`，缺它就得不到 exec 型的答案（Task 1 §5 第 2 条 / §8.1）。
+       任务要求的"exec 型命令"两行（`echo >/dev/null`、`head -c1 /dev/urandom`）因此才成立，
+       且同一份日志里有 `skeleton has /lib64: True` 作为正向证据。
+    2. `DEV_SKELETON_PROC=1` 时骨架里多一个空 `proc`（Task 2 已把 `proc` 钉进骨架常量）。
+       默认关 = 简报 Steps 的形状；开 = Task 4 交付的形状。`/dev/fd -> /proc/self/fd`
+       是软链，**答什么取决于 `/proc` 在不在**，所以两种形状都要有数字。
+    """
     variant = os.environ.get("DEV_VARIANT", "host-tree")
+    if variant not in ("host-tree", "minimal"):
+        note(f"unknown DEV_VARIANT={variant!r} (expected host-tree|minimal)")
+        return 2
+    skeleton_proc = os.environ.get("DEV_SKELETON_PROC", "0") == "1"
     root = fresh(f"synth-root-dev-{variant}")
-    for name in ("usr", "bin", "lib", "etc", "tmp", "home", "home/user", "workspace"):
+    for name in ("usr", "bin", "lib", "lib64", "etc", "tmp",
+                 "home", "home/user", "workspace"):
         os.makedirs(os.path.join(root, name), mode=0o755, exist_ok=True)
+    if skeleton_proc:
+        os.makedirs(os.path.join(root, "proc"), mode=0o755, exist_ok=True)
     dev = os.path.join(root, "dev")
     os.makedirs(dev, mode=0o755, exist_ok=True)
     if variant == "minimal":
-        for node in ("null", "zero", "urandom", "tty", "ptmx", "pts"):
+        for node in DEV_INTEREST:
             target = os.path.join(dev, node)
             if node == "pts":
                 os.makedirs(target, exist_ok=True)
@@ -286,14 +348,14 @@ def part_dev() -> int:
                 open(target, "w").close()
     if not enter_ns():
         return 1
-    for src in ("/usr", "/bin", "/lib"):
+    for src in ("/usr", "/bin", "/lib", "/lib64"):
         if os.path.isdir(src):
             mount(src, os.path.join(root, src.lstrip("/")), None, MS_BIND | MS_REC)
     if variant == "host-tree":
         if not ok("bind /dev", mount("/dev", dev, None, MS_BIND | MS_REC)):
             return 1
     elif variant == "minimal":
-        for node in ("null", "zero", "urandom", "tty", "ptmx", "pts"):
+        for node in DEV_INTEREST:
             src = os.path.join("/dev", node)
             if not os.path.exists(src):
                 continue
@@ -306,19 +368,55 @@ def part_dev() -> int:
         return 1
     present = sorted(os.listdir("/dev")) if os.path.isdir("/dev") else []
     note(f"variant={variant}")
-    note(f"ls /dev: {present[:12]}")
+    note(f"skeleton_proc={int(skeleton_proc)} skeleton has /lib64: {os.path.exists('/lib64')}"
+         f" /proc: {os.path.exists('/proc')}")
+    #: 整份列表（原来是 `[:12]` 的截断）："/dev 一个都不多、一个都不少"要按条数比，
+    #: 截断之后第 13 条及其后的增删都看不见。
+    note(f"ls /dev count: {len(present)}")
+    note(f"ls /dev: {present}")
     note(f"/dev/shm exists: {os.path.exists('/dev/shm')}")
     note(f"/dev/fd exists: {os.path.exists('/dev/fd')}")
+    note(f"/dev/shm: {dev_shm_probe()}; ismount /dev/pts: {os.path.ismount('/dev/pts')}")
+    for name in DEV_INTEREST + DEV_SYMLINKS:
+        note(f"/dev/{name}: {dev_node_shape(os.path.join('/dev', name))}")
+    #: `/dev/fd`（以及 `/dev/stdout`、`/dev/stderr`）是**软链**：`exists` 答的是"目标在不在"，
+    #: 而目标 `/proc/self/fd` 由 `/proc` 决定 —— `/proc` 是骨架里的空目录时它不在，
+    #: 于是软链悬空、`exists` = False。这一行把成因量出来，免得把 False 读成"没绑上 /dev"。
+    note(f"stat /proc: {'exists' if os.path.exists('/proc') else 'ENOENT'}"
+         f"; stat /proc/self/fd: {'exists' if os.path.exists('/proc/self/fd') else 'ENOENT'}")
     #: 这两行以前是 `os.system('echo x > /dev/null')` / `head -c1 /dev/urandom`，量到的却是
     #: exec 自己：`/bin/sh -> dash` 是动态链接，PT_INTERP 是绝对路径
-    #: `/lib64/ld-linux-x86-64.so.2`，而本 part 的骨架（上面的目录清单）没有 `lib64`，
+    #: `/lib64/ld-linux-x86-64.so.2`，而本 part 当时的骨架（上面的目录清单）没有 `lib64`，
     #: 于是两个 `False` 与 `/dev` 毫无关系，看起来却像"/dev/null 不可用"。
-    #: 现在：先记骨架里到底有没有 /lib64（正向证据），再用不经 exec 的纯 Python 探。
-    note(f"skeleton has /lib64: {os.path.exists('/lib64')}")
-    note(f"/dev/null identity: {dev_node_identity('/dev/null')}")
-    note(f"/dev/urandom identity: {dev_node_identity('/dev/urandom')}")
+    #: 现在：骨架补上 `lib64`（上面的正向证据行），所以这两行确确实实是 exec 型的答案；
+    #: 再叠两行不经 exec 的纯 Python 探，交叉验证"解释器缺不缺"没在替 exec 作答。
+    note(f"echo >/dev/null: {os.system('echo x > /dev/null') == 0}")
+    note(f"head -c1 /dev/urandom: {os.system('head -c1 /dev/urandom > /dev/null') == 0}")
     note(f"open('/dev/null','w') writes: {write_dev_null()}")
     note(f"open('/dev/urandom','rb').read(1): {read_one_urandom()}")
+    return 0
+
+
+def part_devbase() -> int:
+    """**今天 pure 的可见集合**：pure 的 `chroot` 是 `"/"`（N15），所以就是容器的 `/dev`。
+
+    不 `unshare`、不 `pivot`：这份日志是"候选① 把 `/dev` 绑进合成根之后应当与之相等"的
+    那一端（`ls /dev` 的条数与逐条类型）。差集表左边那一列由此来，而不是由"host-tree 臂
+    大概等于宿主 /dev"这句推断来。
+    """
+    present = sorted(os.listdir("/dev"))
+    note(f"ls /dev count: {len(present)}")
+    note(f"ls /dev: {present}")
+    note(f"/dev/shm exists: {os.path.exists('/dev/shm')}")
+    note(f"/dev/fd exists: {os.path.exists('/dev/fd')}")
+    note(f"/dev/shm: {dev_shm_probe()}; ismount /dev/pts: {os.path.ismount('/dev/pts')}")
+    for name in DEV_INTEREST + DEV_SYMLINKS:
+        note(f"/dev/{name}: {dev_node_shape(os.path.join('/dev', name))}")
+    note(f"stat /proc: {'exists' if os.path.exists('/proc') else 'ENOENT'}"
+         f"; stat /proc/self/fd: {'exists' if os.path.exists('/proc/self/fd') else 'ENOENT'}")
+    note(f"echo >/dev/null: {os.system('echo x > /dev/null') == 0}")
+    note(f"head -c1 /dev/urandom: {os.system('head -c1 /dev/urandom > /dev/null') == 0}")
+    note("verdict: PASS (the tree today's pure shape reads; the left column of the diff)")
     return 0
 
 
@@ -328,6 +426,7 @@ PARTS = {
     "symlinks": part_symlinks,
     "proc": part_proc,
     "dev": part_dev,
+    "devbase": part_devbase,
 }
 
 if __name__ == "__main__":

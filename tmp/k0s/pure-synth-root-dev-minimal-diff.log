@@ -1,0 +1,35 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part dev] unshare(CLONE_NEWUSER): ok
+[part dev] unshare(CLONE_NEWNS): ok
+[part dev] mount(/ private): ok
+[part dev] bind /dev/null -> /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/null: ok
+[part dev] bind /dev/zero -> /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/zero: ok
+[part dev] bind /dev/urandom -> /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/urandom: ok
+[part dev] bind /dev/tty -> /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/tty: ok
+[part dev] bind /dev/ptmx -> /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/ptmx: ok
+[part dev] bind /dev/pts -> /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/pts: ok
+[part dev] self-bind /workspace/tmp/k0s/scratch/synth-root-dev-minimal: ok
+[part dev] pivot_root('.', '.'): ok
+[part dev] umount2('.', MNT_DETACH): ok
+[part dev] variant=minimal
+[part dev] skeleton_proc=0 skeleton has /lib64: True /proc: False
+[part dev] ls /dev count: 6
+[part dev] ls /dev: ['null', 'ptmx', 'pts', 'tty', 'urandom', 'zero']
+[part dev] /dev/shm exists: False
+[part dev] /dev/fd exists: False
+[part dev] /dev/shm: absent; ismount /dev/pts: True
+[part dev] /dev/null: char-device rdev=259 mode=0o20666
+[part dev] /dev/zero: char-device rdev=261 mode=0o20666
+[part dev] /dev/urandom: char-device rdev=265 mode=0o20666
+[part dev] /dev/tty: char-device rdev=1280 mode=0o20666
+[part dev] /dev/ptmx: char-device rdev=1282 mode=0o20666
+[part dev] /dev/pts: directory
+[part dev] /dev/fd: unavailable (FileNotFoundError errno=2 No such file or directory)
+[part dev] /dev/stdin: unavailable (FileNotFoundError errno=2 No such file or directory)
+[part dev] /dev/stdout: unavailable (FileNotFoundError errno=2 No such file or directory)
+[part dev] /dev/stderr: unavailable (FileNotFoundError errno=2 No such file or directory)
+[part dev] stat /proc: ENOENT; stat /proc/self/fd: ENOENT
+[part dev] echo >/dev/null: True
+[part dev] head -c1 /dev/urandom: True
+[part dev] open('/dev/null','w') writes: True
+[part dev] open('/dev/urandom','rb').read(1): True

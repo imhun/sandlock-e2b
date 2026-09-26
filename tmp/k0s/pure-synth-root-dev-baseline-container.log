@@ -1,0 +1,20 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part devbase] ls /dev count: 14
+[part devbase] ls /dev: ['fd', 'full', 'mqueue', 'null', 'ptmx', 'pts', 'random', 'shm', 'stderr', 'stdin', 'stdout', 'tty', 'urandom', 'zero']
+[part devbase] /dev/shm exists: True
+[part devbase] /dev/fd exists: True
+[part devbase] /dev/shm: present, writable, ismount=True; ismount /dev/pts: True
+[part devbase] /dev/null: char-device rdev=259 mode=0o20666
+[part devbase] /dev/zero: char-device rdev=261 mode=0o20666
+[part devbase] /dev/urandom: char-device rdev=265 mode=0o20666
+[part devbase] /dev/tty: char-device rdev=1280 mode=0o20666
+[part devbase] /dev/ptmx: symlink -> pts/ptmx (resolves: True)
+[part devbase] /dev/pts: directory
+[part devbase] /dev/fd: symlink -> /proc/self/fd (resolves: True)
+[part devbase] /dev/stdin: symlink -> /proc/self/fd/0 (resolves: True)
+[part devbase] /dev/stdout: symlink -> /proc/self/fd/1 (resolves: True)
+[part devbase] /dev/stderr: symlink -> /proc/self/fd/2 (resolves: True)
+[part devbase] stat /proc: exists; stat /proc/self/fd: exists
+[part devbase] echo >/dev/null: True
+[part devbase] head -c1 /dev/urandom: True
+[part devbase] verdict: PASS (the tree today's pure shape reads; the left column of the diff)

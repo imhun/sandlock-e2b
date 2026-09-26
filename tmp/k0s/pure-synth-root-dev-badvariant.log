@@ -1,0 +1,2 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part dev] unknown DEV_VARIANT='minimal_dev' (expected host-tree|minimal)
