@@ -100,3 +100,35 @@ def test_the_factory_hands_over_the_root_once_the_switch_is_synth(
     assert executor._pure_rootfs_dir == settings.pure_rootfs_dir
     assert executor._synthetic_rootfs == settings.pure_rootfs_dir / "sbx_switch"
     assert executor._has_sandbox_root is True
+
+
+def test_the_security_helper_mirrors_the_shape_switch(monkeypatch, tmp_path) -> None:
+    """A lane that sets the env must reach the executor the tests build.
+
+    `route_b_sandbox` is the only place the security suite builds a shape, so a
+    switch it does not read is a lane that silently tests the old shape.
+    """
+    from tests.security.conftest import route_b_sandbox
+
+    monkeypatch.setenv("E2B_PURE_ROOTFS", "synth")
+    monkeypatch.setenv("E2B_PURE_ROOTFS_DIR", str(tmp_path / "_pure_rootfs"))
+    executor, _workspace = route_b_sandbox(None, None)
+    try:
+        assert executor._has_sandbox_root is True
+        assert executor._chroot_root.startswith(str(tmp_path / "_pure_rootfs"))
+    finally:
+        executor.close()
+
+
+def test_the_security_helper_stays_on_the_identity_root_by_default(
+    monkeypatch, tmp_path
+) -> None:
+    from tests.security.conftest import route_b_sandbox
+
+    monkeypatch.delenv("E2B_PURE_ROOTFS", raising=False)
+    executor, _workspace = route_b_sandbox(None, None)
+    try:
+        assert executor._has_sandbox_root is False
+        assert executor._chroot_root == "/"
+    finally:
+        executor.close()

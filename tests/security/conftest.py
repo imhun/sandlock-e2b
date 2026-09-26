@@ -229,6 +229,14 @@ def route_b_sandbox(
     # both shapes: the emulated root (default) and the real one the fork builds
     # with a mount namespace + pivot_root (see docs/chroot-workspace-exec.md).
     real_root = os.environ.get("E2B_REAL_ROOT", "0").strip() == "1"
+    # ...and `Settings.pure_rootfs` (E2B_PURE_ROOTFS) for the same reason: the
+    # pure shape has two roots now (N15's host root, N16's synthesized skeleton)
+    # and a lane that sets the switch has to reach the executor this helper
+    # builds, or it silently measures the other one.
+    pure_rootfs = os.environ.get("E2B_PURE_ROOTFS", "off").strip().lower()
+    pure_rootfs_dir = os.environ.get("E2B_PURE_ROOTFS_DIR") or str(
+        sandbox_tmpdir(suffix="-pure-rootfs")
+    )
     fields: dict = dict(
         workspace_dir=str(workspace if workspace is not None else sandbox_tmpdir(suffix="-ws")),
         base_image=image,
@@ -236,6 +244,7 @@ def route_b_sandbox(
         host_uid=host_uid,
         per_sandbox_uid=per_sandbox_uid,
         real_root=real_root,
+        pure_rootfs_dir=(Path(pure_rootfs_dir) if pure_rootfs == "synth" else None),
         memory_mb=512,
         cpu_percent=100,
         disk_mb=1024,
