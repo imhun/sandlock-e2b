@@ -947,7 +947,7 @@ git commit -m "docs(shape): drop the stale low-port-window comments"
 ### Task 6: 文档与账本同步（含 ④ 的"未实测"结案）
 
 **Files:**
-- Modify: `docs/production-deployment-requirements.md:184`（§2.4.1 引用句）、`:366`（§2.4.3 追加）、`:534-538`（§2.4.7 顶部追加）、`:575`、`:687`（历史记录加注）—— **注：§2.4.5 已在 Task 1 补了 2026-09-26 更正（+9 行），`:534` 之后的引用行号请按当时文件重新核对**
+- Modify: `docs/production-deployment-requirements.md:184`（§2.4.1 引用句）、`:366`（§2.4.3 追加）、`:534-538`（§2.4.7 顶部追加）、`:575`、`:687`（历史记录加注）—— **注：§2.4.5 已在 Task 1 补了 2026-09-26 更正（新增 `:501-513`，14 行），`:534` 之后的引用行号请按当时文件重新核对**
 - Modify: `docs/SCALING.md:301-306`
 - Modify: `README.md:374-382`
 - Modify: `docs/k8s-deployment.md:166-176`
