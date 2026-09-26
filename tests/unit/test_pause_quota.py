@@ -16,6 +16,7 @@ fakeredis = pytest.importorskip("fakeredis")
 
 from control_plane.config import Settings
 from control_plane.registry.manager import (
+    QUOTA_RELEASE_CLAIM_TTL_S,
     ResourceUnavailableError,
     SandboxRegistry,
     SandboxStateConflictError,
@@ -396,3 +397,104 @@ def test_shared_store_disk_row_follows_the_live_records_and_returns_once(make_re
     registry.delete(b.sandbox_id)
     assert registry.global_reserved()["disk"] == 64
     assert registry.global_reserved()["disk"] == live_disk_mb()
+
+
+# -- N41: one reservation, one return -- across replicas ------------------
+#
+# ``pause`` is two shared-store writes: the ledger rows move first, the record
+# that carries ``quota_released`` is saved second. Another replica whose delete
+# lands in between reads the *pre-pause* flag, decides the reservation is still
+# held, and gives it back a second time. The ledger then under-counts
+# reservations, which is the direction that over-sells the fleet -- so the
+# "somebody is already returning this" fact has to be one atomic store write
+# rather than a flag the loser has not seen yet.
+
+
+def _replicas(**overrides):
+    """Two registries sharing one fakeredis, in the production shape."""
+    server = fakeredis.FakeServer()
+    return (
+        SandboxRegistry(_settings(**overrides), redis_client=fakeredis.FakeRedis(server=server)),
+        SandboxRegistry(_settings(**overrides), redis_client=fakeredis.FakeRedis(server=server)),
+    )
+
+
+def test_a_delete_inside_the_pauses_window_cannot_return_the_row_twice(make_record):
+    """The N41 shape: replica B's delete lands between A's two store writes."""
+    replica_a, replica_b = _replicas()
+    make_record(replica_a, disk_size_mb=128, sandbox_id="sbx_n41")
+
+    stale = replica_b.get("sbx_n41")  # B's copy, read while the record is live
+    assert replica_a.release_quota(replica_a.get("sbx_n41")) is True  # pause, 1 of 2
+    assert replica_a.global_reserved()["disk"] == 0
+
+    # A has not saved the record yet, so B's copy still says the reservation is
+    # held. The delete must not be able to move the row a second time.
+    replica_b.delete(stale.sandbox_id)
+    assert replica_a.global_reserved()["disk"] == 0
+    assert replica_b.global_reserved()["disk"] == 0
+
+
+def test_the_return_claim_is_dropped_when_the_reservation_comes_back(make_record):
+    """The claim belongs to *one* episode: resume must clear it.
+
+    Otherwise the row it protects would never be returnable again -- the
+    reservation would leak for the marker's whole TTL, which is the same bug
+    wearing the other sign.
+    """
+    registry = SandboxRegistry(_settings(), redis_client=fakeredis.FakeRedis())
+    record = make_record(registry, disk_size_mb=128)
+
+    registry.pause(registry.get(record.sandbox_id))
+    assert registry.global_reserved()["disk"] == 0
+    registry.resume(registry.get(record.sandbox_id))
+    assert registry.global_reserved()["disk"] == 128
+    registry.delete(record.sandbox_id)
+    assert registry.global_reserved()["disk"] == 0
+
+
+def test_a_reused_sandbox_id_is_not_blocked_by_the_previous_episodes_claim(make_record):
+    """A second record under the same id holds a reservation of its own.
+
+    Clients may pass ``X-Sandbox-Id`` and the suite reuses ids constantly, so
+    the claim has to name the *reservation* (the created record), not the id.
+    """
+    registry = SandboxRegistry(_settings(), redis_client=fakeredis.FakeRedis())
+    make_record(registry, disk_size_mb=64, sandbox_id="sbx_reused")
+    registry.delete("sbx_reused")
+    assert registry.global_reserved()["disk"] == 0
+
+    make_record(registry, disk_size_mb=64, sandbox_id="sbx_reused")
+    assert registry.global_reserved()["disk"] == 64
+    registry.delete("sbx_reused")
+    assert registry.global_reserved()["disk"] == 0
+
+
+def test_the_return_claim_outlives_the_delete_it_protects_and_has_a_ttl(make_record):
+    """Why the delete must *not* clear the guard, and why the TTL matters.
+
+    Clearing it there would reopen the very window it closes (the loser's
+    delete runs last). Leaving it forever would leak a reservation whenever a
+    replica dies holding the claim, so it expires -- bounded, and small enough
+    to be a recovery time rather than a leak.
+    """
+    server = fakeredis.FakeServer()
+    client_b = fakeredis.FakeRedis(server=server)
+    replica_a = SandboxRegistry(
+        _settings(), redis_client=fakeredis.FakeRedis(server=server)
+    )
+    replica_b = SandboxRegistry(_settings(), redis_client=client_b)
+    make_record(replica_a, disk_size_mb=64, sandbox_id="sbx_n41_claim")
+
+    stale = replica_b.get("sbx_n41_claim")
+    assert replica_a.release_quota(replica_a.get("sbx_n41_claim")) is True
+    replica_b.delete(stale.sandbox_id)
+    assert replica_a.global_reserved()["disk"] == 0
+
+    key = replica_a._quota_release_key(stale)
+    assert client_b.get(key) == b"1"  # the loser's delete left the guard alone
+    assert client_b.ttl(key) == QUOTA_RELEASE_CLAIM_TTL_S
+    assert 0 < QUOTA_RELEASE_CLAIM_TTL_S <= 3600
+    # ...so a third attempt at the same reservation is refused as well.
+    assert replica_b.release_quota(stale) is False
+    assert replica_a.global_reserved()["disk"] == 0

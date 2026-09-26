@@ -100,6 +100,16 @@ _MAX_EVICTION_NOTICES = 10_000
 #: E9.3: canonical eviction reason used in logs, notices and the 404 payload.
 EVICTION_REASON = "evicted-idle"
 
+#: N41: how long the fleet-wide "this reservation has already been returned"
+#: marker lives (see :meth:`SandboxRegistry._claim_quota_release`). It has to
+#: outlive the two store writes it guards -- the ledger rows and the record's
+#: ``quota_released`` flag, microseconds apart in ``pause`` -- with an enormous
+#: margin, because the loser of the race may be a replica that already read the
+#: pre-release record. It must not be forever: a replica that dies between
+#: claiming and writing leaves a reservation *booked* (over-counted, which
+#: costs capacity and can never over-sell) until this expires.
+QUOTA_RELEASE_CLAIM_TTL_S = 600
+
 
 def _safe_priority(value: object) -> int:
     """Coerce a supplied/stored ``priority`` into the accepted range.
@@ -883,6 +893,77 @@ class SandboxRegistry:
             "processes": s.max_total_processes,
         }
 
+    # -- the release claim (N41) -------------------------------------------
+
+    def _quota_release_key(self, record: SandboxRecord) -> str:
+        """Where *this reservation's* "already given back" marker lives.
+
+        The unit is the reservation episode, not the sandbox id: the marker
+        lives for minutes (``QUOTA_RELEASE_CLAIM_TTL_S``) while an id can be
+        created again at any moment (the suite reuses ids constantly, and a
+        client may pass ``X-Sandbox-Id``), and a fresh record holds a fresh
+        reservation that must be returnable even while the old marker is
+        alive. ``client_id`` is minted per create and survives pause/resume,
+        so it names exactly one episode.
+        """
+        return f"{self._ns}:quota:released:{record.sandbox_id}:{record.client_id}"
+
+    def _claim_quota_release(self, record: SandboxRecord) -> bool:
+        """Claim the right to be the replica that gives this reservation back.
+
+        N41: the ledger rows and the record's own ``quota_released`` flag are
+        two shared-store writes, and ``pause`` does them in that order. A
+        second replica whose delete lands in between reads the *pre-pause*
+        record, concludes the reservation is still held, and returns it a
+        second time -- leaving ``global_reserved()`` short of what the live
+        records hold, i.e. over-selling the fleet. This marker is that window's
+        closure: one ``SETNX`` decides who may move the rows, the loser leaves
+        them alone, and the winner's record write follows immediately. The
+        choice of *claim first, release second* is deliberate -- dying in
+        between leaves the reservation booked (over-counted, which costs
+        capacity until the TTL) rather than returned twice.
+
+        Same shape as ``SnapshotRegistry.try_acquire_copy`` (F11 step 3), TTL
+        included; the TTL's reasoning is on the constant. Without the shared
+        store there is one process, the record's own flag is the whole answer,
+        and this returns ``True``. Store trouble proceeds rather than refuses
+        (the pre-N41 behaviour): a Redis hiccup must not park every reservation
+        in the fleet until its TTL.
+        """
+        if self._redis is None:
+            return True
+        try:
+            return bool(
+                self._redis.set(
+                    self._quota_release_key(record),
+                    "1",
+                    nx=True,
+                    ex=QUOTA_RELEASE_CLAIM_TTL_S,
+                )
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "quota release claim failed; releasing anyway", exc_info=True
+            )
+            return True
+
+    def _clear_quota_release(self, record: SandboxRecord) -> None:
+        """The reservation is held again, so the claim must go with it.
+
+        Called by :meth:`hold_quota` only, and only after the re-booking
+        succeeded: a claim that outlived its reservation would block the *next*
+        return, turning one bug (under-counted rows) into its mirror image
+        (rows that can never come back). Never called from the delete side --
+        clearing it there would reopen the window it closes, because the loser
+        of the race is the last writer.
+        """
+        if self._redis is None:
+            return
+        try:
+            self._redis.delete(self._quota_release_key(record))
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("quota release claim clear failed", exc_info=True)
+
     # -- pause / resume accounting (E9.2) ---------------------------------
 
     def release_quota(self, record: SandboxRecord) -> bool:
@@ -892,11 +973,21 @@ class SandboxRegistry:
         created before E9.2 that was never accounted for) returns ``False``
         and changes nothing, so the delete path can never underflow the
         ledgers by releasing twice.
+
+        Across replicas the flag above is not enough on its own: it is written
+        by the *caller* (``pause`` saves the record after this returns), so a
+        rival's delete can arrive while the rows have moved and the record
+        still says "held". The shared-store path therefore takes the N41
+        release claim first (see :meth:`_claim_quota_release`); a record whose
+        reservation another replica is already returning reports ``False`` and
+        leaves the rows where they are.
         """
         if record.quota_released:
             return False
         dims = self._global_dims(record)
         if self._quota_store is not None:
+            if not self._claim_quota_release(record):
+                return False
             self._quota_store.release("global", dims)
             tenant_limits = self._tenant_limits(record.tenant_id, is_admin=False)
             if tenant_limits is not None:
@@ -960,6 +1051,13 @@ class SandboxRegistry:
             ):
                 self._quota_store.release("global", dims)
                 raise ResourceUnavailableError("tenant quota exceeded")
+            # N41: the rows are booked again, so the "already returned" claim
+            # goes with them -- otherwise the *next* return of this record
+            # would be refused and the row would be stuck until the TTL. Only
+            # after both reservations succeeded: a refusal above leaves the
+            # reservation released and its claim in place, which is the state
+            # the caller's retry needs to find.
+            self._clear_quota_release(record)
             record.quota_released = False
             return True
         with self._lock:
