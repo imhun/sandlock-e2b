@@ -185,7 +185,7 @@ async def _run_build(
     template: TemplateRecord,
     build: BuildRecord,
     dockerfile: str,
-    workspace_base: Path,
+    platform_root: Path,
 ) -> None:
     def publish() -> None:
         # Every state move and every log line goes to the shared volume as well
@@ -195,7 +195,12 @@ async def _run_build(
 
     build.status = "building"
     publish()
-    build_dir = workspace_base / "_builds" / template.template_id
+    # ``platform_root``, not the workspace base: ``_builds`` is one of the
+    # platform's own top-level namespaces and stays on the shared export root
+    # while N27 sinks the tree root to ``<export>/workspaces`` (this pod's
+    # writable subPath is ``<export>/_builds``; the tree root is where the
+    # sandboxes live).
+    build_dir = platform_root / "_builds" / template.template_id
     build_dir.mkdir(parents=True, exist_ok=True)
     try:
         ctx_dir = _extract_build_context(build_dir)
@@ -305,12 +310,12 @@ async def _run_build_with_slot(
     template: TemplateRecord,
     build: BuildRecord,
     dockerfile: str,
-    workspace_base: Path,
+    platform_root: Path,
     release_slot: Any,
 ) -> None:
     """Run a build and always release its concurrency slot afterwards."""
     try:
-        await _run_build(app, template, build, dockerfile, workspace_base)
+        await _run_build(app, template, build, dockerfile, platform_root)
     except Exception as e:  # defensive: never leave a stuck "building"
         build.status = "error"
         build.error = f"build failed unexpectedly: {e}"
@@ -463,8 +468,8 @@ async def template_file_upload(
     if not record.verify_upload_token(file_hash, token):
         raise OfficialError(401, "Invalid upload token")
     app = request.app
-    workspace_base = app.state.workspace_base
-    archives = workspace_base / "_builds" / template_id / "archives"
+    platform_root = app.state.platform_root
+    archives = platform_root / "_builds" / template_id / "archives"
     archives.mkdir(parents=True, exist_ok=True)
     target = archives / f"{file_hash}.tar.gz"
     # Unique temp file: concurrent PUTs of the same file_hash each stage
@@ -558,10 +563,10 @@ async def trigger_template_build(
         _discard_failed_build(request.app, record)
         return Response(status_code=202)
     app = request.app
-    workspace_base = app.state.workspace_base
+    platform_root = app.state.platform_root
     asyncio.create_task(
         _run_build_with_slot(
-            app, record, build, dockerfile, workspace_base, release_slot
+            app, record, build, dockerfile, platform_root, release_slot
         )
     )
     return Response(status_code=202)

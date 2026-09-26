@@ -8,6 +8,7 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI
@@ -42,6 +43,9 @@ from control_plane.registry.volumes import VolumeRegistry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only (envd may be absent)
     from envd_service.quota_agent import QuotaAgentClient
+
+
+logger = logging.getLogger(__name__)
 
 
 class _NoopRuntimeRegistry:
@@ -363,7 +367,8 @@ def create_app(
             RuntimeRegistry = None  # type: ignore[assignment]
         if RuntimeRegistry is not None:
             runtime_registry = RuntimeRegistry(
-                workspace_base or settings.workspace_base
+                workspace_base or settings.workspace_base,
+                state_base=settings.state_base,
             )
         else:
             runtime_registry = _NoopRuntimeRegistry()
@@ -382,8 +387,41 @@ def create_app(
         )
     app.state.workspace_base = workspace_base or settings.workspace_base
     app.state.workspace_base.mkdir(parents=True, exist_ok=True)
+    # N27: the base the platform's *own* files live under -- the sandboxes'
+    # runtime records, their command logs, the checkpoint images. Same rule as
+    # the worker's (``envd_service.app``): the *registry's* answer wins, because
+    # that is where the records this app serves were written; ``create_app`` may
+    # have been handed a registry of its own (tests, embedders) sitting on a
+    # base the settings do not name. Unset, this is the workspace base, i.e. the
+    # layout that predates N27.
+    app.state.state_base = (
+        getattr(runtime_registry, "state_base", None) or settings.state_base
+    )
+    # N27: the root the platform's *shared* directories sit on (``_secrets``,
+    # ``_snapshots``, ``_templates``, ``_volumes``). That is the shared
+    # workspace root, *not* the workspace base: the latter names the sunk tree
+    # root (``<export>/workspaces``) once N27 is deployed, while those
+    # directories stay where the worker's ``workspace-root-init`` creates them
+    # and where this pod's writable subPath mounts are. Deriving them from the
+    # tree root instead would put every one of these registries on the
+    # read-only view of the volume (OBS-9).
+    platform_root = (
+        Path(settings.shared_workspace_root).resolve()
+        if settings.shared_workspace_root
+        else app.state.workspace_base
+    )
+    #: ...and the same root for the rest of the platform's top-level namespaces
+    #: (``_builds`` is the one another module reaches for). Exposed on
+    #: ``app.state`` so no module has to re-derive it from the tree base.
+    app.state.platform_root = platform_root
+    # The two bases, said out loud once: a deployment that moves either one can
+    # be reconciled against the worker's line by grepping (Task 7), and the
+    # split between the two processes is otherwise invisible until a record
+    # "goes missing".
+    logger.info("workspace base = %s", app.state.workspace_base)
+    logger.info("platform state base = %s", app.state.state_base)
     volume_root = settings.shared_volume_root or (
-        (workspace_base or settings.workspace_base) / "_volumes"
+        platform_root / "_volumes"
     )
     app.state.volumes = volumes_registry or VolumeRegistry(
         volume_root,
@@ -391,13 +429,13 @@ def create_app(
         token_ttl_seconds=settings.volume_token_ttl_s,
     )
     app.state.secrets = secrets_registry or SecretRegistry(
-        (workspace_base or settings.workspace_base) / "_secrets",
+        platform_root / "_secrets",
         redis_client=redis_client,
         master_key=settings.secret_master_key,
         legacy_master_keys=settings.secret_master_keys,
     )
     app.state.snapshots = snapshots_registry or SnapshotRegistry(
-        (workspace_base or settings.workspace_base),
+        platform_root,
         # F11 step 3: the per-id copy claim is fleet-wide when the deployment
         # has a shared store (the record's ``creating`` status is the durable
         # half of it; this is the window between "no record" and "record").
@@ -409,7 +447,7 @@ def create_app(
     )
     app.state.recent_failures = SlidingWindowCounter()
     app.state.templates = templates_registry or TemplateRegistry(
-        (workspace_base or settings.workspace_base) / "_templates"
+        platform_root / "_templates"
     )
     # F11 step 4: every limiter below is named and shares its window through
     # the deployment's Redis when there is one. Without a name they would share

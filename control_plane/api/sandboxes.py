@@ -701,10 +701,17 @@ async def _command_logs(request, record) -> list[dict[str, str]]:
     )
     # Platform file, so it lives beside the tree (``_runtime/<id>/``) rather
     # than inside it; the in-tree path is the pre-split location and stays
-    # readable during a rolling upgrade.
+    # readable during a rolling upgrade. The *platform's* base is the app's,
+    # not the one derived from the record above: with N27 the tree base and the
+    # state base are different directories, and deriving one from the other is
+    # how a reader ends up looking in a directory no writer ever wrote to.
     base = Path(workspace).parent
-    log_path = sandbox_command_log_path(base, record.sandbox_id)
+    log_path = sandbox_command_log_path(
+        base, record.sandbox_id, state_base=request.app.state.state_base
+    )
     if not log_path.is_file():
+        # The pre-split location is inside the sandbox's own tree, so this one
+        # is a workspace-base question (the state base plays no part in it).
         log_path = sandbox_command_log_path(base, record.sandbox_id, legacy=True)
     entries: list[dict[str, str]] = []
     if log_path.is_file():
@@ -1811,7 +1818,9 @@ def _remove_local_tree_confirming(state, sandbox_id: str) -> bool:
             shutil.rmtree(tree)
     except FileNotFoundError:
         shutil.rmtree(
-            sandbox_runtime_dir(state.workspace_base, sandbox_id),
+            sandbox_runtime_dir(
+                state.workspace_base, sandbox_id, state_base=state.state_base
+            ),
             ignore_errors=True,
         )
         return True
@@ -1834,7 +1843,10 @@ def _remove_local_tree_confirming(state, sandbox_id: str) -> bool:
     # they go with it -- and only with it, since the record is what the next
     # delete verifies against.
     shutil.rmtree(
-        sandbox_runtime_dir(state.workspace_base, sandbox_id), ignore_errors=True
+        sandbox_runtime_dir(
+            state.workspace_base, sandbox_id, state_base=state.state_base
+        ),
+        ignore_errors=True,
     )
     return True
 

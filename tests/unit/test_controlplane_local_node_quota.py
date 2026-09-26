@@ -238,7 +238,11 @@ def _recorded_cleanup_kwargs(tmp_path, monkeypatch) -> list[dict]:
     ]
     runtime = _LocalRuntimeStub(volume_projects)
     state = SimpleNamespace(
-        runtime_registry=runtime, workspace_base=tmp_path / "workspaces"
+        runtime_registry=runtime,
+        workspace_base=tmp_path / "workspaces",
+        # N27: ``app.state`` carries the platform's own base beside the tree
+        # base; the teardown takes the record's directory from it.
+        state_base=tmp_path / "workspaces",
     )
     calls: list[dict] = []
     monkeypatch.setattr(

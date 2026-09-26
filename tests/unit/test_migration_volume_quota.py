@@ -62,7 +62,11 @@ def _state_with_runtime(tmp_path, sandbox_id: str, *, with_slice: bool):
         ),
     )
     return SimpleNamespace(
-        runtime_registry=registry, workspace_base=workspace_base
+        runtime_registry=registry,
+        workspace_base=workspace_base,
+        # N27: ``app.state`` carries the platform's own base beside the tree
+        # base; the teardown takes the record's directory from it.
+        state_base=workspace_base,
     ), ws_dir, slice_dir
 
 

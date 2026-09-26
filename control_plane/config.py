@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,19 @@ from gateway_common.env import (
 #: cannot drift apart; each endpoint keeps its own env override and, per repo
 #: convention, ``0`` disables its limiter.
 DEFAULT_CREATE_RATE_LIMIT_PER_MIN = 120
+
+
+def _state_base_from_env() -> Path | None:
+    """``E2B_STATE_BASE``, resolved, or ``None`` when the deployment has none.
+
+    ``None`` means "the platform's files stay under the workspace base" --
+    :meth:`Settings.__post_init__` fills the field in with *that object's*
+    ``workspace_base``. Deliberately not done here: a factory cannot see the
+    field the caller passed, and a base read out of the environment while the
+    trees sit under a different one is exactly the split this switch is about.
+    """
+    raw = os.getenv("E2B_STATE_BASE")
+    return Path(raw).resolve() if raw else None
 
 
 @dataclass
@@ -88,6 +102,25 @@ class Settings:
             os.getenv("E2B_WORKSPACE_BASE", "tmp/sandboxes")
         ).resolve()
     )
+    #: The base the platform's *own* files live under (N27): the sandboxes'
+    #: runtime records, their command logs and their checkpoint images -- the
+    #: same fact ``envd_service.config.Settings.state_base`` names on the
+    #: worker side, and deliberately spelled the same way, because the two
+    #: processes have to agree about it or a record is written where nobody
+    #: reads it.
+    #:
+    #: ``E2B_STATE_BASE`` moves them out from under the tree root, so "a sandbox
+    #: cannot reach the platform's state" stops depending on the sandbox's shape
+    #: (``docs/pure-shape-decision.md`` §4). Unset = the workspace base, which is
+    #: today's layout -- and the field has to be ``None`` until
+    #: :meth:`__post_init__` fills it in, because the default is *this object's*
+    #: ``workspace_base`` and not whatever ``E2B_WORKSPACE_BASE`` says.
+    #:
+    #: ``resolve()`` mirrors ``workspace_base`` above, and it is load-bearing:
+    #: ``tmp/`` and the cluster's NFS export both carry symlinks, and a relative
+    #: or unnormalised spelling of one base makes "are these two the same
+    #: directory?" answer wrong.
+    state_base: Path | None = field(default_factory=_state_base_from_env)
     image_cache_dir: Path = field(
         default_factory=lambda: Path(
             os.getenv("E2B_IMAGE_CACHE_DIR", "tmp/sandboxes/_images")
@@ -348,6 +381,16 @@ class Settings:
     )
 
     def __post_init__(self) -> None:
+        """Give ``state_base`` its default: *this* object's workspace base.
+
+        No second base unless ``E2B_STATE_BASE`` names one. A caller that passes
+        ``workspace_base`` explicitly (a test, an embedder, a combined
+        deployment) must not end up with the platform's record and checkpoint
+        directories under some other base the environment happened to name:
+        that split is silent, and it makes every "same base?" answer wrong.
+        """
+        if self.state_base is None:
+            self.state_base = self.workspace_base
         normalized: dict[str, list[str]] = {}
         for tenant, keys in (self.tenant_map or {}).items():
             if not isinstance(keys, list):
@@ -423,6 +466,29 @@ def uvicorn_ssl_kwargs(settings: Settings) -> dict[str, str]:
     if cert_file is None:
         return {}
     return {"ssl_certfile": cert_file, "ssl_keyfile": key_file}
+
+
+def configure_logging(settings: Settings) -> int:
+    """Make the control plane's own INFO logging visible (N27).
+
+    ``uvicorn.run(log_level=...)`` only configures the ``uvicorn*`` loggers;
+    ``control_plane.*`` inherits the root logger, whose default WARNING level
+    drops every INFO line -- including the startup ``workspace base = ...`` /
+    ``platform state base = ...`` pair an operator reconciles against the
+    worker's, and any ``E2B_LOG_LEVEL=DEBUG``. This is the same arrangement the
+    worker's entry point has (``envd_service.__main__._configure_logging``);
+    the control plane needs it for the same reason.
+
+    ``logging.basicConfig`` is a no-op when the root logger already has handlers
+    (e.g. under pytest), so the level is pinned explicitly as well. Returns the
+    numeric level applied.
+    """
+    # An unknown name falls back to INFO (getattr's default) instead of raising
+    # the way ``basicConfig(level="BOGUS")`` would.
+    level = getattr(logging, str(settings.log_level).upper(), logging.INFO)
+    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s")
+    logging.getLogger().setLevel(level)
+    return level
 
 
 def local_node_quota_via_agent() -> bool:

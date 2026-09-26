@@ -26,10 +26,17 @@ import uvicorn
 
 def main() -> None:
     from control_plane.app import create_app
-    from control_plane.config import Settings, uvicorn_ssl_kwargs
+    from control_plane.config import (
+        Settings,
+        configure_logging,
+        uvicorn_ssl_kwargs,
+    )
     from gateway_common.keepalive import uvicorn_keep_alive_kwargs
 
     settings = Settings()
+    # N27: same as ``python -m control_plane`` -- the merged image is a control
+    # plane entry point too, and its startup bases have to be visible.
+    configure_logging(settings)
     port = settings.control_plane_port
 
     # Route lookup/invalidation through the merged process itself when unset.

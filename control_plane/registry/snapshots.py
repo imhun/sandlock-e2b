@@ -180,6 +180,14 @@ class SnapshotRegistry:
         namespace: str = "e2b",
     ) -> None:
         self._base = Path(base_dir).resolve()
+        #: Where the snapshots themselves live: ``<base>/_snapshots``.
+        #: Resolved once here, from the root ``create_app`` hands us -- the
+        #: *shared export root* (N27), never the tree root: once the tree root
+        #: sinks (``<export>/workspaces``) that directory holds sandbox trees,
+        #: and re-deriving this path from it at a read site is how a snapshot
+        #: lookup would start reading somebody's sandbox. ``_snapshots`` is
+        #: deliberately not part of the state base (N27 Task 3).
+        self._snapshots_root = self._base / "_snapshots"
         self._snapshots: dict[str, SnapshotRecord] = {}
         self._lock = threading.Lock()
         self._redis = redis_client
@@ -237,7 +245,7 @@ class SnapshotRegistry:
         plane started mounting the shared volume read-only (OBS-9), because the
         root-level form has nowhere to be mounted back read-write.
         """
-        return self._base / "_snapshots" / snapshot_id
+        return self._snapshots_root / snapshot_id
 
     def _fs_path(self, snapshot_id: str) -> Path:
         return self._snapshot_dir(snapshot_id) / "fs"
@@ -253,7 +261,12 @@ class SnapshotRegistry:
         return self._fs_path(snapshot_id)
 
     def _legacy_snapshot_dir(self, snapshot_id: str) -> Path:
-        """The pre-OBS-9 root-level layout, still read (and removed) if present."""
+        """The pre-OBS-9 root-level layout, still read (and removed) if present.
+
+        Root-level on purpose and unchanged by N27: it describes where a
+        snapshot *was*, and the read paths above are the ones that had to stop
+        inferring the platform's directory from whatever base they were handed.
+        """
         return self._base / snapshot_id
 
     def _record_path(self, snapshot_id: str) -> tuple[Path, Path]:
@@ -392,7 +405,7 @@ class SnapshotRegistry:
 
     def in_progress(self) -> list[SnapshotRecord]:
         """Every record whose copy has not finished (startup reconciliation)."""
-        for path in sorted((self._base / "_snapshots").glob("*/snapshot.json")):
+        for path in sorted(self._snapshots_root.glob("*/snapshot.json")):
             snapshot_id = path.parent.name
             try:
                 record = self.get(snapshot_id)
