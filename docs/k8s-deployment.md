@@ -204,7 +204,9 @@ rotate 再逐成员打一遍窗口列表 —— finalize 的地址既可以是 k
 回滚：同表 1 —— 第 5 步之前回滚 = 不做（旧 key 仍在列表里生效）；第 5 步之后不可恢复，
 只能再轮换一次。**第 3 步是窗口的代价**：其他步骤都能在工作时间做，只有它会让所有沙箱消失。
 
-对账（三张表都用，不改任何东西、不回显明文；redis 口令也在 `--fingerprint` 的输出里）：
+对账（表 1–3 都用，不改任何东西、不回显明文；redis 口令也在 `--fingerprint` 的输出里。表 4 的
+两个凭据只在开发机上、不进 `e2b-secrets`，所以**不会**出现在这个指纹里 —— 它的对账是文件权限，
+见表 4）：
 
 ```bash
 export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
@@ -248,6 +250,33 @@ env 展开，env 是 `secretKeyRef` → `e2b-secrets/E2B_REDIS_PASSWORD`；contr
 同一个键**。所以换口令只写 Secret、清单里永远没有字面口令 —— 由
 `tests/unit/test_worker_manifest_permissions.py::test_k8s_redis_auth_comes_from_the_secret_not_a_literal`
 钉住（同一条测试还钉住 redis 仍是单用户：要采纳上面的 ACL 备选，就得先改它）。
+
+### 表 4：开发机上的明文凭据（ACR / SSH，不进 Secret）
+
+表 1–3 的凭据都住在 `sandlock/e2b-secrets` 里，**表 4 这两个不住**：它们是开发机上的
+`deploy/scripts/acr.env`（ACR 推送口令）与 `deploy/scripts/bastion.env`（跳板机 SSH 私钥 +
+口令）。两个文件都 gitignore 了，但**实测是 mode 644** —— 同机其他用户可读，而"没进 git"
+并不等于"别人读不到"。2026-09-26 起 `deploy/scripts/lib/helpers.sh` 在 source 它们**之前**
+逐个校验权限：不是 600 就 `refuse: <path> is mode <mode>, not 600 -- run: chmod 600 <path>`
+并 `exit 1`（脚本**不替**你 chmod：共享目录里出现过的副本要人看过才算数）；唯一例外是显式设
+`ALLOW_LOOSE_CREDENTIAL_FILES=1`（CI：凭据只在环境变量里、从未落盘）。本机这两个文件已经
+改成 600。
+
+| 凭据 | 步骤 | 影响面 | 不可逆点 |
+|---|---|---|---|
+| ACR 推送凭据（`deploy/scripts/acr.env` 的 `ACR_USERNAME`/`ACR_PASSWORD`，600） | ① 在云上新建一份专用凭据（RAM 子账号 / AKR）② 更新 `deploy/scripts/acr.env`（改完仍是 600；守卫会让 644 的脚本直接拒绝启动）③ `./deploy/scripts/build-and-push.sh` 验证能 push ④ 若这套部署开了私有拉取，再同步 `E2B_IMAGE_REGISTRY_USERNAME`/`E2B_IMAGE_REGISTRY_PASSWORD`（compose 形态：`deploy/stack/.env.example:71-73`；k8s 形态未设，见 `deploy/k8s/control-plane.yaml` 的 `E2B_IMAGE_REGISTRY` 注释）⑤ 删掉旧凭据 | 只影响**构建 / 推送**与私有仓库的模板镜像拉取：旧凭据一删，`build-and-push.sh` 第 41 行的 `docker login` 立刻失败（重跑即可，没有半成品状态）。**集群运行时不受影响**：k0s 拉 ACR 是**匿名**的（§F9 实测 token 流程 200），pod 不带 `imagePullSecrets`，模板镜像走共享卷上的 OCI layout tar | **删除旧凭据**（旧值只剩在本机 `acr.env` 里；删了就只能再轮换一次） |
+| SSH 私钥 / 口令（`deploy/scripts/bastion.env` 的 `SSH_KEY`/`SSH_PASSPHRASE`，600） | ① 把新公钥追加到**跳板机**的 `authorized_keys`（`SSH_KEY` 是登录跳板机的钥匙；`deploy/scripts/lib/run-target.exp` 的第二跳"跳板机 → 节点"**不带 `-i`**，用的是跳板机自己的凭据，所以这次不动节点的 `authorized_keys`）② 更新 `bastion.env`（改完仍是 600）③ 验收：`deploy/scripts/open-cluster-tunnel.sh`（建通道 + 自检，走的正是这把钥匙）＋ `. deploy/scripts/lib/helpers.sh; run_target "hostname"`（走 `run-target.exp` 两跳）＋ `DRY_RUN=1 deploy/k8s-k0s/apply.sh`（只渲染，不碰集群；它顺带证明部署脚本仍读得到 `bastion.env`）④ 从跳板机的 `authorized_keys` 移除旧公钥 | 只影响**运维通道**：本机 → 跳板机 → 节点，以及控制面 6443 的本地转发。集群内部（pod 之间、NodePort 入口、已在跑的沙箱）不受影响。旧公钥一移除，还在用它的本机/同事**立刻失去**部署与开隧道的能力 | **移除旧公钥**（之后没更新的本机失去部署能力；要回去只能再轮换一次） |
+
+三条与权限守卫配套的事实：
+
+- **对账就是权限**：`ls -l deploy/scripts/acr.env deploy/scripts/bastion.env` 必须是
+  `-rw-------`。这两个文件不在 `e2b-secrets` 里，所以上面的 `secrets.sh --fingerprint`
+  **不覆盖**它们。
+- **明文不进日志/argv**：ACR 口令只经 `printf '%s' "$ACR_PASSWORD" | docker login …
+  --password-stdin`（`build-and-push.sh:41`）交给 docker；`bastion.env` 的口令经环境变量进
+  `expect`（`run-target.exp` 在有口令时 `log_user 0`，连 spawn 回显都关掉）。
+- **私钥本体不在守卫范围内**：`SSH_KEY` 指向的**私钥文件**（默认 `$HOME/.ssh/id_pub`）由
+  ssh 自己的权限规则管；守卫只管上面那两个 env 文件。
 
 ### 4.5.1 一次性清理既有明文 secret（O3 第二轮，2026-09-26 裁定）
 

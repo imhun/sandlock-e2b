@@ -200,10 +200,18 @@ CPU/磁盘）。恶意 key 可并发构建轰炸（`/sandboxes` 已限流，模�
   `E2B_SECRET_MASTER_KEYS` 双 key 窗口（`upgrade.sh
   --rotate-secret-master-key` / `--finalize-secret-master-key-rotation`）。
   未配置 master key 时保持降级（内存 + 明文盘）并启动告警。
-- `.env`（ACR 密码/API key/redis 密码/secret master key）、`bastion.env`
-  （SSH 口令）明文落盘（权限 600）；生产建议 master key 与 ACR 口令上
-  密钥管理（O3：Secret Manager / KMS，启动时注入环境变量，避免 `.env`
-  明文长期驻留）。
+- **目标机**上的 `.env`（ACR 密码/API key/redis 密码/secret master key）明文落盘，
+  权限由脚本自己兜住：`deploy/scripts/upgrade.sh:86`/`:102` 落盘后立刻 `chmod 600`；
+- **开发机**上的 `deploy/scripts/acr.env`（ACR 口令）与 `deploy/scripts/bastion.env`
+  （跳板机 SSH 口令）同样是明文落盘，而且**实测是 644**（同机其他用户可读）——
+  gitignore 只保证"没进 git"，不等于"别人读不到"。2026-09-26 起
+  `deploy/scripts/lib/helpers.sh` 在 source 这两个文件**之前**逐个校验：不是 600 就
+  `refuse: <path> is mode <mode>, not 600 -- run: chmod 600 <path>` 并退出码 1，
+  **不替**操作者 chmod；唯一例外是显式设 `ALLOW_LOOSE_CREDENTIAL_FILES=1`（CI：
+  凭据只在环境变量里、从未落盘）。本机这两个文件已改成 600，轮换步骤见
+  `docs/k8s-deployment.md` §4.5 表 4；
+- 长期方案：master key 与 ACR 口令上密钥管理（O3：Secret Manager / KMS，启动时
+  注入环境变量，避免 `.env` 明文长期驻留）。
 
 ## 8. 内存 DoS 与进程权限（新增，2026-09-01 二轮评估）
 

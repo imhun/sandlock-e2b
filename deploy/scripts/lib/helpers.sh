@@ -26,6 +26,48 @@ ACR_NAMESPACE="${ACR_NAMESPACE:-byteplan}"
 ACR_USERNAME="${ACR_USERNAME:-}"
 ACR_PASSWORD="${ACR_PASSWORD:-}"
 
+# --- local credential files: mode 600, or refuse to read them ---------------
+#
+#: `deploy/scripts/{bastion,acr}.env` are gitignored, which keeps the ACR push
+#: password and the bastion SSH passphrase out of commits -- not out of other
+#: local users' reach. Both arrived at mode 644 on the dev machine, so the
+#: guard below runs *before* the two `.` lines and every existing file must be
+#: exactly 600. It refuses (exit 1, repair command on stderr) rather than
+#: chmodding on the operator's behalf: a copy that showed up in a shared
+#: directory is something a human has to look at, and the script may run as a
+#: different user than the one who wrote it. `ALLOW_LOOSE_CREDENTIAL_FILES=1`
+#: is the one explicit bypass (CI: credentials injected via the environment,
+#: never written to disk).
+_file_mode() {
+    # GNU stat first, then BSD/macOS: `stat -c` does not exist on darwin, and
+    # these scripts do run on the dev machine.
+    stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null
+}
+
+_require_private_file() {
+    local file="$1" mode
+    [ -e "$file" ] || return 0
+    mode="$(_file_mode "$file" || true)"
+    if [ "$mode" = "600" ]; then
+        return 0
+    fi
+    if [ "${ALLOW_LOOSE_CREDENTIAL_FILES:-0}" = "1" ]; then
+        printf 'warning: %s is mode %s, not 600 -- allowed by ALLOW_LOOSE_CREDENTIAL_FILES=1\n' \
+            "$file" "$mode" >&2
+        return 0
+    fi
+    printf 'refuse: %s is mode %s, not 600 -- run: chmod 600 %s\n' \
+        "$file" "$mode" "$file" >&2
+    exit 1
+}
+
+_require_local_credential_files() {
+    _require_private_file "$SCRIPT_DIR/bastion.env"
+    _require_private_file "$SCRIPT_DIR/acr.env"
+}
+
+_require_local_credential_files
+
 if [ -f "$SCRIPT_DIR/bastion.env" ]; then
     # shellcheck disable=SC1091
     . "$SCRIPT_DIR/bastion.env"
