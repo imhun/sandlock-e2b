@@ -251,12 +251,16 @@ def _exec_cmd(cmd=None, **over) -> ExecConfig:
         pytest.param({"route_b": None, "want": False}, id="unconfigured"),
         pytest.param({"route_b": _config(mode="off"), "want": False}, id="mode-off"),
         pytest.param({"route_b": _config(mode="auto"), "want": True}, id="auto-chroot"),
+        # N15: the pure shape is mediated too -- host root, identity
+        # translation -- so `auto` leases a slot for it exactly as it does for
+        # the image shape. Keeping it in-process would run the mediation as the
+        # mediator's uid, which is the T5 attribution the fork refuses.
         pytest.param(
             {
                 "route_b": _config(mode="auto"),
                 "base_image": None,
                 "image_rootfs": None,
-                "want": False,
+                "want": True,
             },
             id="auto-pure",
         ),
@@ -814,12 +818,15 @@ def test_in_process_chroot_shape_is_disclosed(monkeypatch, caplog) -> None:
             {"euid": 0, "host_uid": 0, "caps": False, "want": False},
             id="root-sandbox-accepted",
         ),
-        # No chroot means no path mediation means nothing to refuse, whatever
-        # the identity looks like.
+        # N15: the pure shape has path mediation now (host root as the
+        # mediator's root), so it carries the same T5 rule as the image shape
+        # -- a root mediator remapping the sandbox to another uid is refused,
+        # whatever the shape is. Before N15 this case was accepted *because*
+        # that shape mediated nothing.
         pytest.param(
-            {"euid": 0, "host_uid": HOST_UID, "caps": False, "want": False,
+            {"euid": 0, "host_uid": HOST_UID, "caps": False, "want": True,
              "image_rootfs": None},
-            id="pure-shape-accepted",
+            id="pure-shape-refused",
         ),
     ],
 )

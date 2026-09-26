@@ -21,6 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from envd_service.priv_helpers import dir_size
+from envd_service.runtime import checkpoint_store
 from envd_service.runtime.checkpoint_store import (
     IMAGE_NAME,
     capture_checkpoint_image,
@@ -188,7 +189,16 @@ def test_the_image_directory_is_handed_to_the_slot_that_will_write_it(
     )
 
     image = checkpoint_image_dir(base, "sbx_store")
-    assert handed == [(20001, str(image.parent), False)]
+    if os.geteuid() == 0:
+        # A root worker hands the directory over itself -- the broker is the
+        # non-root mechanism (`e2b-maint` with CAP_CHOWN). What both paths have
+        # to agree on is *which uid* ends up owning it, because that uid is who
+        # writes the image inside the slot; so the direct case pins the effect
+        # rather than a call the broker would have recorded.
+        assert handed == []
+        assert image.parent.stat().st_uid == 20001
+    else:
+        assert handed == [(20001, str(image.parent), False)]
     assert reply["captured"] is True, f"a hand-off must not block the capture: {reply}"
 
 
@@ -202,6 +212,16 @@ def test_a_directory_that_cannot_be_handed_over_is_not_captured(
         raise priv_helpers.PrivHelperError("no brokers on this worker")
 
     monkeypatch.setattr(priv_helpers, "broker_chown", refuse)
+    if os.geteuid() == 0:
+        # As root the hand-off is the worker's own chown, so the broker above is
+        # never consulted: make the mechanism this privilege actually selects
+        # fail the same way. The contract under test is the caller's ("a
+        # hand-off that raises is reported, never a capture that dies inside the
+        # slot"), and it must not depend on who is running the test.
+        def broken(path, uid, *, recursive=False):
+            raise priv_helpers.PrivHelperError("no brokers on this worker")
+
+        monkeypatch.setattr(checkpoint_store, "_hand_to_sandbox", broken)
     base = tmp_path / "sandboxes"
     _sandbox_tree(base, "sbx_store")
     executor = _FakeExecutor()

@@ -17,6 +17,7 @@ only needs the worker app and a fake executor.
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import httpx
@@ -108,11 +109,24 @@ async def test_nonexistent_binary_exits_127_with_no_output(workspace) -> None:
         pytest.skip("needs Linux + sandlock (Docker test runner)")
     runtime_registry = RuntimeRegistry(workspace)
     # The sandbox is registered directly (no provisioning), so no host uid was
-    # allocated -- pin the legacy shared-identity shape instead of letting the
-    # E3.2 default fail loudly on a record the test built by hand. The route-B
-    # counterpart of this contract is
+    # allocated: hand it the pooled uid and let route B lease a slot, which is
+    # the shape every deployment runs since N15 made *both* mediation shapes
+    # mediate (the legacy shared-uid shape on a root worker is refused now --
+    # the fork will not attribute a sandbox's mediated writes to root). The
+    # route-B counterpart of this contract is
     # tests/contract/test_route_b_executor.py::test_missing_binary_exits_127_through_the_slot
-    settings = EnvdSettings(executor="sandlock", per_sandbox_uid=False)
+    from tests.security.conftest import SANDBOX_UID, sandbox_tmpdir
+
+    settings = EnvdSettings(
+        executor="sandlock",
+        per_sandbox_uid=True,
+        route_b="on",
+        route_b_tmp_root=sandbox_tmpdir(suffix="-route-b"),
+        # The slot segment has to contain the uid the record carries (the
+        # pool refuses a uid outside it, by name).
+        uid_pool_start=SANDBOX_UID,
+        uid_pool_size=2,
+    )
     app = create_envd_app(
         settings=settings,
         runtime_registry=runtime_registry,
@@ -126,13 +140,21 @@ async def test_nonexistent_binary_exits_127_with_no_output(workspace) -> None:
         sandbox_id=sandbox_id,
         access_token="tok",
         workspace_dir=str(sandbox_dir),
+        host_uid=SANDBOX_UID,
     )
+    os.chown(sandbox_dir, SANDBOX_UID, SANDBOX_UID)
+    os.chmod(sandbox_dir, 0o700)
     ctx = app.state.context_factory(runtime_registry.get(sandbox_id))
     app.state.runtimes[sandbox_id] = ctx
     try:
         running = await ctx.executor.start(
             ExecConfig(
-                cmd=["/nonexistent-e2b-bin"],
+                # Inside the sandbox's readable set: an unreadable path is
+                # *refused* (EACCES + one named line) rather than reported as
+                # missing, which is N15's closed existence oracle. The contract
+                # here is the kernel's own "not found" answer, so the probe asks
+                # for a name that is missing where the sandbox may look.
+                cmd=["/usr/bin/e2b-no-such-binary"],
                 env={},
                 cwd=str(sandbox_dir),
                 stdin_enabled=False,

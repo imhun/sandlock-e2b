@@ -69,8 +69,20 @@ _UNAUTHORIZED_BODY = (
 
 
 def _base_image() -> str:
-    """The MCP-capable base image the sandboxes run on."""
-    return os.environ.get("E2B_BASE_IMAGE", "python-mcp:3.14")
+    """The MCP-capable base image the sandboxes run on.
+
+    An *explicitly empty* ``E2B_BASE_IMAGE`` is how a lane asks for the
+    pure (no-image-rootfs) shape -- `deploy/scripts/test-prod-shaped.sh` cannot
+    express it (its ``${VAR:-default}`` turns the empty value back into the
+    default), but ``tmp/k0s/gateB-full.sh`` does, and the deployment-shape
+    selectors are deliberately outside the strict-skip list. There is no image
+    to inspect in that shape: `docker run ""` would report a docker usage
+    error, which reads as a broken contract rather than a narrower matrix.
+    """
+    image = os.environ.get("E2B_BASE_IMAGE")
+    if image == "":
+        pytest.skip("no base image configured (pure shape): nothing to inspect")
+    return image or "python-mcp:3.14"
 
 
 def _require_docker() -> None:

@@ -125,7 +125,17 @@ def test_image_rootfs_keeps_explicit_chroot_cwd(tmp_path: Path) -> None:
     assert _params(executor, cmd=["/bin/sh"], cwd="/tmp")["cwd"] == "/tmp"
 
 
-def test_non_chroot_cwd_passes_through_unchanged() -> None:
+def test_non_chroot_cwd_is_the_host_path_the_fork_can_chdir_to() -> None:
+    """N15: the pure shape still answers with the *host* path, and that is a
+    decision, not an oversight.
+
+    The fork's launch cwd is a real ``chdir`` on ``chroot_root.join(cwd)``. The
+    image shape therefore answers with the virtual ``/home/user`` (its rootfs
+    has that directory); the pure shape's root is "/", so the same answer would
+    be the host's own ``/home/user``, which need not exist. It answers with the
+    host workspace path -- which the mediator then maps back to ``/home/user``
+    through the mount table, so the sandbox still reports the canonical alias.
+    """
     executor = SandlockExecutor(
         workspace_dir="/tmp/ws",
         base_image=None,
@@ -140,6 +150,11 @@ def test_non_chroot_cwd_passes_through_unchanged() -> None:
     )
     params = _params(executor, cmd=["/bin/sh"], cwd="/tmp/ws")
     assert params["cwd"] == "/tmp/ws"
+    other = _params(executor, cmd=["/bin/sh"], cwd="/tmp")
+    assert other["cwd"] == "/tmp"
+    # No cwd at all means the workspace, not "leave the worker's cwd inherited".
+    default = _params(executor, cmd=["/bin/sh"], cwd="")
+    assert default["cwd"] == "/tmp/ws"
 
 
 def test_dev_shared_paths_absent_with_minimal_dev_mounts(tmp_path: Path) -> None:

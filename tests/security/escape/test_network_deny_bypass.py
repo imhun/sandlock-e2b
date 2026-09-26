@@ -19,10 +19,12 @@ only thing standing between a sandbox and the worker's loopback.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import socket
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -66,10 +68,7 @@ def test_default_denylist_keeps_public_internet_open():
 def test_loopback_spellings_cannot_reach_a_worker_local_listener():
     """The reproducer, as a live assertion: a listener bound to the worker's
     loopback must be unreachable from the sandbox under every spelling."""
-    from envd_service.executors.base import ExecConfig
-    from envd_service.executors.sandlock import SandlockExecutor
-
-    from tests.security.conftest import sandbox_tmpdir
+    from tests.security.conftest import route_b_sandbox, run_sh, sandbox_tmpdir
 
     servers: list[socket.socket] = []
 
@@ -114,38 +113,33 @@ for tag, fam, hosts in FAMILIES:
 print(json.dumps(out, sort_keys=True))
 """ % LISTEN_PORT
 
-    ws = str(sandbox_tmpdir())
-    executor = SandlockExecutor(
-        workspace_dir=ws,
-        base_image=None,
-        image_rootfs=None,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=64,
-        max_open_files=4096,
+    # N15: the pure shape is mediated now, so a hand-built in-process executor
+    # on a root worker is the shape the fork refuses (SL-1). The probe goes
+    # through the deployment's entry point instead, and runs from a file: the
+    # probe source carries quotes and newlines that a `sh -c` string would eat.
+    ws = Path(sandbox_tmpdir())
+    (ws / "loopback_probe.py").write_text(probe)
+    executor, workspace = route_b_sandbox(
+        None,
+        None,
+        workspace=ws,
         allow_internet_access=True,
         enable_network=True,
         network={"allowInternetAccess": True},
         network_deny_cidrs=DEFAULT_NETWORK_DENY_CIDRS,
     )
     try:
-        result = executor._build_sandbox(
-            ExecConfig(
-                cmd=["/usr/local/bin/python3", "-c", probe],
-                env={},
-                cwd=ws,
-                stdin_enabled=False,
-            )
-        ).run(["/usr/local/bin/python3", "-c", probe])
-        assert result.exit_code == 0, result.error
-        assert json.loads(result.stdout.decode()) == {
+        code, out, err = asyncio.run(
+            run_sh(executor, workspace, "/usr/local/bin/python3 /workspace/loopback_probe.py")
+        )
+        assert code == 0, err
+        assert json.loads(out.decode()) == {
             "v4/0.0.0.0": "DENIED",
             "v4/0.0.0.1": "DENIED",
             "v4/127.0.0.1": "DENIED",
             "v6/::": "DENIED",
             "v6/::1": "DENIED",
-        }, result.stdout.decode()
+        }, out.decode()
     finally:
         for sock in servers:
             sock.close()

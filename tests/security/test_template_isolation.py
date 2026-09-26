@@ -145,13 +145,18 @@ async def test_in_process_chroot_is_refused_without_a_slot(caplog):
     finally:
         executor.close()
 
-    # Control: same root worker, same host uid, same extracted image -- only
-    # the mediated chroot removed. It starts (uid 0 inside the namespace, the
-    # sandbox uid on the host, exactly as the mediated shape would want to be),
-    # which is what makes the refusal above evidence about mediation rather
-    # than about a runner that cannot create any sandbox at all.
-    plain, plain_ws = route_b_sandbox(None, None, with_route_b=False)
+    # Control: the same root worker and the same sandbox host uid, but with a
+    # slot -- i.e. the mediator *is* that uid. It starts, which is what makes
+    # the refusal above evidence about *who* mediates rather than about a
+    # runner that cannot create any sandbox at all.
+    #
+    # This control used to be "the same shape with the mediation removed" (the
+    # pure shape, route B off). N15 made that shape mediated too -- the host
+    # root as the mediator's root -- so it is refused for exactly the same
+    # reason, and the control had to move to the axis that still differs.
+    plain, plain_ws = route_b_sandbox(None, None)
     try:
+        require_mediation_capable(plain)
         code, out, err = await run_sh(
             plain, str(plain_ws), "id -u; printf x > probe.txt"
         )

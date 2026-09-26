@@ -95,3 +95,68 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
 4. **顺带**（与上面不冲突，且很小）：今天的默认仍是"base image 忘配 ⇒ 静默降级到无中介形态"。
    在 N15+OBS-5 落地前，我建议把那一段改成**显式选择**（fail closed 默认、lane 里显式打开），
    否则"忘了配"就等于"悄悄少一道墙"。
+
+## 6. 实施记录（2026-09-25/26）：pure 形态已中介化
+
+**产品改动**（`envd_service/executors/sandlock.py`）：pure 形态（无 base image）与镜像形态走
+**同一条**中介路径 —— `_chroot_root` 返回宿主根 `/`（identity 翻译），`fs_mount` 把 workspace
+挂在 `/home/user` 与 `/workspace`，`fs_readable/fs_writable` **保持原样的白名单**（不因为
+有了中介就放开 `/`：那是镜像形态"整颗 rootfs"的写法，在宿主根上等于放开整个文件系统）。
+配套三处，都是"root 不再是 jail"的直接后果：
+
+* **cwd 必须是宿主路径**：fork 的启动 cwd 是 `chroot_root.join(cwd)` 的真实 `chdir`；镜像形态给
+  虚拟 `/home/user`（rootfs 里有这个目录），pure 给同样的值就落到宿主的 `/home/user` → ENOENT。
+  现在 pure 给宿主 workspace 路径，中介再经挂载表映射回 `/home/user`（`pwd` 仍是它）。
+* **ceiling 要写回 `kwargs`**：`_policy_ceiling` 的 dict 在形状分支**之前**就建好了（镜像形态靠
+  `fs_readable` 含 `/` 恰好绕开这条检查），只改局部变量是死代码 ⇒ per-exec cwd 被 fork 拒
+  （`exec params exceed the instance policy ceiling`）。
+* **凭据文件跟读者走**：route-B 槽位以**沙箱的 uid**运行，而 E2B 原先把 http-auth 的 secret 写成
+  `0600 root` ⇒ 槽位读不到，策略校验直接失败（`invalid sandbox: credential file … Permission
+  denied`）。现在 chown 给 `host_uid`（文件仍 `0600`）；这不是暴露 —— 它落在沙箱所有 fs 授权
+  之外（镜像形态在 rootfs 之外，pure 形态在 `can_read` 白名单之外）。
+
+路由选择：`_route_b_decline_reason` 的 `mediation_shape` 现在对**所有**形状为真（`auto` 到处上
+槽位，因为中介必须以沙箱自己的 uid 跑，T5）；`_in_process_mediation_is_refused` 同理不再对 pure
+短路。拿不到槽位且中介只能以 root 跑时**照样 fail closed**（SL-1），不再有"共享 uid 的 root
+worker + pure"这条能跑但不中介的路。
+
+**fork 侧两处"root 不是 jail"**（同一个 bug 的两个面，都带回归用例）：
+
+* `compose_virtual_etc_hosts` 在 `root="/"` 时读的是**宿主** `/etc/hosts` ⇒ 宿主能解析的名字以
+  **字面 IP** 进沙箱，`allowOut` 规则再也拦不住（实测：测试往宿主 hosts 加
+  `127.0.0.1 api.egress.test` 后，沙箱直连 loopback，egress 代理根本没看到连接，两条 wildcard
+  用例 ECONNREFUSED）。现在 `root="/"` 与"没有镜像"等价。
+* 凭据暴露警告把 chroot 根当成一条 grant ⇒ `root="/"` 时**任何**宿主路径都"在授权内"，警告变噪音。
+  该形状的可达集合是策略白名单（`can_read`），警告只看它。
+
+**顺带修掉的真 bug（与 N15 无关，是它把测试推到了能发现的位置）**：两个同时活着的 wildcard
+沙箱会撞 DNS 网关地址 —— `dns_synth::allocate_gateway_addr` 是**进程内**计数器，而路由 B 下
+每个沙箱一个 supervisor 进程、每个都从 `127.0.1.1` 开始 ⇒ 第二个槽位启动即
+`bind DNS gateway: Address already in use`。现在改成**探测式**取地址（fork `8f9c8d2`，含
+`test_a_held_gateway_address_is_skipped_not_fatal`）。
+
+**验收（两档全量）**：
+
+| 档 | 命令 | 结果 |
+|---|---|---|
+| gate A（镜像形态，默认） | `tmp/k0s/gateA-full.sh`（= phase 1 的形状 + `E2B_BASE_IMAGE=python-mcp:3.14`） | **1772 passed / 6 skipped / 3 xfailed / 0 failed**（581 s） |
+| gate B（pure） | `tmp/k0s/gateB-full.sh`（同形状 + `E2B_BASE_IMAGE=`） | **1765 passed / 13 skipped / 3 xfailed / 0 failed**（436 s） |
+| phase 2（非 root worker） | `tmp/k0s/phase2.sh` | **57 passed / 1 skipped / 0 failed** |
+| security 两态（`E2B_REAL_ROOT=0/1`） | `deploy/scripts/arm-lane/x86-security.sh` | 默认档 44 passed / 1 skipped / 3 xfailed；pure 42 passed / 3 skipped / 3 xfailed |
+| `tests/unit`（macOS 本机） | `.venv/bin/python -m pytest tests/unit` | 16 failed / 1164 passed（**基线未变**：gateway/priv_helpers/real_root_gate/xfs_quotactl） |
+
+> **`test-prod-shaped.sh` 不能跑 gate B**：它的 `-e E2B_BASE_IMAGE="${E2B_BASE_IMAGE:-…}"` 会把
+> **空值**变回默认镜像（`:-` 对"已设但为空"同样取默认）。`tmp/k0s/gateB-full.sh` 就是它 phase 1 的
+> 复制品，只把这一处写成真正的空。
+
+**N15②（ETXTBSY 一拍窗口）已随本条一起被覆盖**：`test_user_cli_install_within_workspace_persists`
+（"写脚本 → chmod +x → 立刻执行"，即 N35 那条同拍窗口）现在跑在 pure+中介形态上并**通过** ——
+fork 侧 `handle_chroot_exec` 的 `settle_closed_writes` 在每次 exec 前结算并释放持有中的写描述符，
+两条形状共用同一段代码。
+
+**顺带在验收里修掉的 9 条既有红**（都不是 N15 引入，用"把 E2B 改动静音、同一个镜像再跑一遍"
+归因出来的）：6 条是 gate B 既有红（`mcp_gateway_keepalive` ×2 需要 base image、`checkpoint_store`
+×2 与 `disk_scan_offload` ×1 在容器 root 下的机制/调度假设、`pure_shape_workspace_ownership` 读的
+是平台状态分离**之前**的 record 路径），3 条是 N15 引起（missing-binary 契约：授权外的路径现在按
+**拒绝**答 EACCES 而不是"不存在"，这正是 N15 关掉的存在性 oracle —— 契约用例改用白名单内的路径，
+并把"授权外 = EACCES + 一行诊断"按逐字节断言钉住）。

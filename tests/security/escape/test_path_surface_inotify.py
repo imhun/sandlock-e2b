@@ -185,39 +185,33 @@ def test_mediated_shape_resolves_the_watch_inside_the_virtual_root():
         (host_only / "HOST_FILE").unlink(missing_ok=True)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "known residual: the pure (no-chroot) shape has no path mediation at all "
-        "-- Landlock is its only barrier and it has no access right for inotify -- "
-        "so the watch still resolves against the host root there"
-    ),
-)
-def test_pure_shape_inotify_still_reaches_the_host_root():
-    """Pin the residual: the pure shape is unmediated, so this must fail."""
-    from envd_service.executors.base import ExecConfig
-    from envd_service.executors.sandlock import SandlockExecutor
+def test_the_pure_shape_is_mediated_too_and_the_watch_stays_inside():
+    """N15's acceptance: the pure (no-rootfs) shape answers this the same way.
 
-    from tests.security.conftest import sandbox_tmpdir
+    This case used to be `xfail(strict=True)` -- "known residual: the pure
+    (no-chroot) shape has no path mediation at all, so the watch still resolves
+    against the host root" -- and it is the measurement the route was chosen
+    from (`docs/pure-shape-decision.md` §5): with the *host root* as the
+    mediator's root, virtual path == host path (identity translation), the
+    existing handlers apply unchanged and the assertions below hold without a
+    second gate written for this shape.
 
+    Both halves matter: the host directory must be refused (that is the leak),
+    and the sandbox's own workspace must still be watchable (that is why the
+    answer is mediation rather than blocklisting `inotify_add_watch`).
+    """
     host_only = Path(HOST_ONLY_DIR)
     host_only.mkdir(parents=True, exist_ok=True)
-    workspace = Path(sandbox_tmpdir(suffix="-obs2-pure"))
-    executor = SandlockExecutor(
-        workspace_dir=str(workspace),
-        base_image=None,
-        image_rootfs=None,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=64,
-        max_open_files=4096,
-        allow_internet_access=False,
-        enable_network=False,
-    )
+    executor, workspace = route_b_sandbox(None, None)
     try:
+        require_mediation_capable(executor)
         leaked = _drive(executor, workspace, HOST_ONLY_DIR, host_only / "HOST_FILE")
+        assert leaked["wd"] < 0, f"host directory was watchable: {leaked}"
+        assert leaked["events"] == [], f"host activity leaked into the sandbox: {leaked}"
+
+        inside = _drive(executor, workspace, "/workspace", workspace / "INSIDE_FILE")
+        assert inside["wd"] >= 0, f"watching the workspace was refused: {inside}"
+        assert inside["events"] == [[256, "INSIDE_FILE"], [2, "INSIDE_FILE"]], inside
     finally:
         executor.close()
         (host_only / "HOST_FILE").unlink(missing_ok=True)
-    assert leaked["events"] == [], f"host activity leaked into the sandbox: {leaked}"

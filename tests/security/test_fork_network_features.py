@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.security.conftest import sandbox_tmpdir
+from tests.security.conftest import route_b_sandbox, sandbox_tmpdir
 
 from envd_service.executors.base import ExecConfig
 from envd_service.executors.sandlock import SandlockExecutor
@@ -64,20 +64,21 @@ def _executor(
     network: dict | None,
     secrets_dir: str | None = None,
 ) -> SandlockExecutor:
-    return SandlockExecutor(
-        workspace_dir=ws,
-        base_image=None,
-        image_rootfs=None,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=64,
-        max_open_files=4096,
-        allow_internet_access=False,
+    """A pure sandbox with this network policy, in the deployment's shape.
+
+    Through `route_b_sandbox` rather than hand-built (N15): the pure shape is
+    mediated now, and a hand-built one on a root worker is the shape the fork
+    refuses (SL-1).
+    """
+    executor, _ = route_b_sandbox(
+        None,
+        None,
+        workspace=ws,
         enable_network=True,
         network=network,
         secrets_dir=secrets_dir,
     )
+    return executor
 
 
 def _route_b_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExecutor:

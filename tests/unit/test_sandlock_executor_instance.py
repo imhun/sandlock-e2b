@@ -403,6 +403,9 @@ async def test_start_execs_onto_held_instance_with_per_exec_params(
     # resolve_cmd still translates /bin/bash for slim images.
     assert call["cmd"] == ["/bin/sh", "-c", "echo hi"]
     assert call["stdio"] is sl.ExecStdio.PIPED
+    # N15 keeps the *host* workspace path here on purpose: the fork chdir's to
+    # `chroot_root.join(cwd)` for real, and the pure shape's root is "/". The
+    # mediator maps the host path back to /home/user through the mount table.
     assert call["kwargs"]["cwd"] == "/tmp/ws"
     assert call["kwargs"]["env"] == {"A": "b"}
     assert call["kwargs"]["clean_env"] is True

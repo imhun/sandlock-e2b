@@ -20,47 +20,39 @@ these tests are the root form and skip otherwise.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from envd_service.executors.base import ExecConfig
-from envd_service.executors.sandlock import SandlockExecutor
+from tests.security.conftest import route_b_sandbox, run_sh
 
 UID_A = 10000
 UID_B = 10001
 
 
-def _executor(workspace: str, uid: int) -> SandlockExecutor:
-    return SandlockExecutor(
-        workspace_dir=workspace,
-        base_image=None,
-        image_rootfs=None,
-        host_uid=uid,
-        per_sandbox_uid=True,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=64,
-        max_open_files=4096,
-        allow_internet_access=False,
-        enable_network=False,
-    )
-
-
 def _run(workspace: str, uid: int, cmd: list[str]):
-    proc = _executor(workspace, uid)._build_sandbox(
-        ExecConfig(
-            cmd=cmd,
-            env={},
-            cwd=workspace,
-            stdin_enabled=False,
-        )
-    ).run(cmd)
-    return proc
+    """Run one command as ``uid``, in the shape a worker would build.
+
+    This used to hand-build an in-process sandbox carrying an explicit host
+    uid. N15 made the pure shape mediated, and a *root* mediator running as a
+    different sandbox uid is exactly what the fork refuses (SL-1), so the
+    command has to run on a slot -- which is how a real worker gives one
+    sandbox its own uid in the first place. What the case is about (kernel DAC
+    between two ``0770 <uid>:<worker gid>`` trees) is untouched by that; only
+    the route is.
+    """
+    executor, _ = route_b_sandbox(None, None, host_uid=uid, workspace=workspace)
+    try:
+        shell = cmd[2] if cmd[:2] == ["/bin/sh", "-c"] else " ".join(cmd)
+        code, out, err = asyncio.run(run_sh(executor, workspace, shell))
+    finally:
+        executor.close()
+    return SimpleNamespace(exit_code=code, stdout=out, stderr=err)
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="requires root (Docker runner)")

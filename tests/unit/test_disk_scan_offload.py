@@ -120,6 +120,16 @@ async def test_only_one_round_is_in_flight(tmp_path, release):
         agent._disk_report_for_heartbeat()
         await asyncio.sleep(0)
 
+    # The walk itself runs in a thread (`asyncio.to_thread`), so "one call" only
+    # becomes observable once that thread has been scheduled -- and five loop
+    # iterations are not always enough for that on a loaded runner (measured
+    # 2026-09-25: `0 == 1` inside the gate's container while the same test
+    # passed on an idle host). Wait for the count to appear; the assertion is
+    # that it never becomes two, which the blocked provider still guarantees.
+    for _ in range(200):
+        if registry.calls:
+            break
+        await asyncio.sleep(0.01)
     assert registry.calls == 1
     release.set()
     await agent._disk_scan_task

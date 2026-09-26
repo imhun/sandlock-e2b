@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import os
 import sys
@@ -85,29 +86,21 @@ def sandbox_owns_files_it_creates() -> tuple[bool, str]:
     the mount owner, so ``chmod``/``touch`` return EPERM. Docker runners on
     overlayfs (OrbStack/Docker Desktop) hit this; host-local XFS/ext4 storage
     -- the production shape -- does not.
-    """
-    ws = str(sandbox_tmpdir())
-    from envd_service.executors.base import ExecConfig
-    from envd_service.executors.sandlock import SandlockExecutor
 
-    executor = SandlockExecutor(
-        workspace_dir=ws,
-        base_image=None,
-        image_rootfs=None,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=64,
-        max_open_files=4096,
-        allow_internet_access=False,
-        enable_network=False,
-    )
-    cmd = ["/bin/sh", "-c", "printf x > tool && chmod 700 tool && echo CHOWNED"]
-    result = executor._build_sandbox(
-        ExecConfig(cmd=cmd, env={}, cwd=ws, stdin_enabled=False)
-    ).run(cmd)
-    detail = (result.stderr or b"").decode("utf-8", "replace").strip()
-    return result.exit_code == 0, f"exit_code={result.exit_code} stderr={detail!r}"
+    N15: through the deployment's entry point, like every other probe here. A
+    hand-built executor cannot even create the sandbox on a root worker now
+    (SL-1), and its ``exit_code=-1`` would have been read as "this storage does
+    not support ownership" -- skipping the very tests this fixture guards.
+    """
+    executor, workspace = route_b_sandbox(None, None, workspace=sandbox_tmpdir())
+    try:
+        code, _out, err = asyncio.run(
+            run_sh(executor, workspace, "printf x > tool && chmod 700 tool && echo CHOWNED")
+        )
+    finally:
+        executor.close()
+    detail = err.decode("utf-8", "replace").strip()
+    return code == 0, f"exit_code={code} stderr={detail!r}"
 
 
 @pytest.fixture()
@@ -147,34 +140,21 @@ def require_sandlock():
     # confined process before any isolation assertion runs. A create failure
     # here must fail loudly instead of letting ``exit_code != 0`` assertions
     # below pass vacuously.
-    from envd_service.executors.base import ExecConfig
-    from envd_service.executors.sandlock import SandlockExecutor
-
-    ws = str(sandbox_tmpdir())
-    executor = SandlockExecutor(
-        workspace_dir=ws,
-        base_image=None,
-        image_rootfs=None,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=64,
-        max_open_files=4096,
-        allow_internet_access=False,
-        enable_network=False,
+    #
+    # N15: the probe goes through the *deployment's* entry point
+    # (`route_b_sandbox`) rather than a bare executor. The pure shape is
+    # mediated now, so a bare executor on a root worker is exactly the shape the
+    # fork refuses (SL-1: the mediation would run as the host root and the
+    # sandbox's own writes would belong to it). Probing a shape no deployment
+    # has would turn every isolation assertion below into a setup error.
+    executor, workspace = route_b_sandbox(None, None)
+    code, out, err = asyncio.run(
+        run_sh(executor, workspace, "/bin/echo ok")
     )
-    smoke = executor._build_sandbox(
-        ExecConfig(
-            cmd=["/bin/echo", "ok"],
-            env={},
-            cwd=ws,
-            stdin_enabled=False,
-        )
-    ).run(["/bin/echo", "ok"])
-    if smoke.exit_code != 0:
+    if code != 0:
         pytest.fail(
             f"sandlock cannot execute commands in this environment "
-            f"(smoke test exit_code={smoke.exit_code}, error={smoke.error!r}); "
+            f"(smoke test exit_code={code}, stdout={out!r}, stderr={err!r}); "
             "run the test runner with seccomp unconfined / privileged"
         )
 
@@ -213,13 +193,16 @@ def route_b_sandbox(
     with_route_b: bool = True,
     host_uid: int | None = SANDBOX_UID if os.geteuid() == 0 else None,
     per_sandbox_uid: bool = True,
+    workspace: str | Path | None = None,
+    **overrides,
 ) -> tuple["object", Path]:
     """A sandbox built the way the worker builds one, as (executor, workspace).
 
     ``image`` + ``rootfs`` are the chroot (mediated) shape; both ``None`` give
-    the pure shape, which asks the fork for no mediation at all -- the control
-    that tells a mediation refusal apart from a runner that cannot create any
-    sandbox.
+    the pure shape. Since N15 *both* are mediated -- the pure one with the host
+    root as the mediator's root, i.e. identity translation -- so this helper is
+    also the way a test asks for "the deployment's shape" rather than for one
+    particular mediation state.
 
     ``with_route_b`` mirrors the production default (``E2B_ROUTE_B=auto``): the
     mediated shape is exactly the one auto engages a slot for. ``False`` stands
@@ -232,17 +215,22 @@ def route_b_sandbox(
     sandbox runs as the worker's identity (E5.1). Passing an explicit uid on a
     non-root worker is a real configuration error (the fork refuses the
     ``RunAs``), which is worth testing but not by default.
+
+    ``workspace`` overrides the scratch directory (for cases that own their
+    tree, e.g. the per-uid isolation matrix), and ``**overrides`` are passed to
+    ``SandlockExecutor`` for the rest (network policy, secrets, a fixed pooled
+    uid): the point of routing every security case through here is that no test
+    hand-builds a shape the deployment does not have.
     """
     from envd_service.executors.sandlock import SandlockExecutor
     from envd_service.route_b import RouteBConfig
 
-    workspace = sandbox_tmpdir(suffix="-ws")
     # Mirror `Settings.real_root` (E2B_REAL_ROOT) so the suite can be run in
     # both shapes: the emulated root (default) and the real one the fork builds
     # with a mount namespace + pivot_root (see docs/chroot-workspace-exec.md).
     real_root = os.environ.get("E2B_REAL_ROOT", "0").strip() == "1"
-    executor = SandlockExecutor(
-        workspace_dir=str(workspace),
+    fields: dict = dict(
+        workspace_dir=str(workspace if workspace is not None else sandbox_tmpdir(suffix="-ws")),
         base_image=image,
         image_rootfs=rootfs,
         host_uid=host_uid,
@@ -263,7 +251,9 @@ def route_b_sandbox(
             tmp_root=sandbox_tmpdir(suffix="-route-b"),
         ),
     )
-    return executor, workspace
+    fields.update(overrides)
+    executor = SandlockExecutor(**fields)
+    return executor, Path(fields["workspace_dir"])
 
 
 async def run_sh(executor, cwd: str | Path, sh: str) -> tuple[int, bytes, bytes]:

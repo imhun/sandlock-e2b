@@ -630,12 +630,28 @@ async def test_missing_binary_exits_127_through_the_slot(workspace) -> None:
     """A missing in-sandbox executable is the child's exit status (127, no
     output), not an exception -- the same fork execvp semantics the in-process
     instance has (``test_sandbox_lifecycle_rebuild``), now pinned across the
-    channel because route B is the chroot shape's default backend."""
+    channel because route B is the chroot shape's default backend.
+
+    The path sits **inside** the sandbox's readable set on purpose. N15 gave
+    the pure shape a real policy (the host root, identity translation), so a
+    path outside it is *refused* (EACCES) rather than reported as missing --
+    that refusal is what stops a sandbox probing host paths for existence, and
+    it is the same answer a ``stat`` of that path gets. Both halves are pinned
+    below so the difference stays deliberate.
+    """
     ex = _executor(workspace, "sbx_rbe_127")
     try:
-        running = await ex.start(_config(["/nonexistent-e2b-bin"], str(workspace)))
+        running = await ex.start(_config(["/usr/bin/e2b-no-such-binary"], str(workspace)))
         code, out, err = await _collect(running)
         assert (code, out, err) == (127, b"", b"")
+
+        running = await ex.start(_config(["/nonexistent-e2b-bin"], str(workspace)))
+        code, out, err = await _collect(running)
+        assert (code, out, err) == (
+            127,
+            b"",
+            b'sandlock-init: exec "/nonexistent-e2b-bin" failed (errno 13)\n',
+        )
     finally:
         ex.close()
 
@@ -660,6 +676,11 @@ async def test_the_missing_binary_contract_survives_the_diagnostic_trace(
     variable reaches the slot because the pool spawns it from this process's
     environment, and each iteration leases a fresh sandbox id so it gets a
     freshly spawned slot.
+
+    The probe path is inside the sandbox's readable set, for the reason given
+    in ``test_missing_binary_exits_127_through_the_slot``: N15 refuses paths
+    outside it with EACCES, and this case is about the *errno the kernel
+    reported*, which a refusal would replace.
     """
     for trace_path in (None, "/tmp/e2b-contract-trace"):
         if trace_path is None:
@@ -671,7 +692,7 @@ async def test_the_missing_binary_contract_survives_the_diagnostic_trace(
         ex = _executor(workspace, sandbox_id)
         try:
             running = await ex.start(
-                _config(["/nonexistent-e2b-bin"], str(workspace))
+                _config(["/usr/bin/e2b-no-such-binary"], str(workspace))
             )
             code, out, err = await _collect(running)
             assert (code, out, err) == (127, b"", b"")

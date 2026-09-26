@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
-from tests.security.conftest import sandbox_tmpdir
+from tests.security.conftest import (
+    require_mediation_capable,
+    route_b_sandbox,
+    run_sh,
+    sandbox_tmpdir,
+)
 
 from envd_service.executors.local import LocalExecutor
 from envd_service.process.manager import ProcessManager
@@ -31,44 +37,43 @@ async def test_command_timeout_kills_and_cleans(workspace):
 
 @pytest.mark.usefixtures("require_sandlock")
 def test_max_processes_limits_forks():
-    from envd_service.executors.base import ExecConfig
-    from envd_service.executors.sandlock import SandlockExecutor
-
-    import tempfile
-
-    ws = str(sandbox_tmpdir())
-    executor = SandlockExecutor(
-        workspace_dir=ws,
-        base_image=None,
-        image_rootfs=None,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=8,
-        max_open_files=4096,
-        allow_internet_access=False,
-        enable_network=False,
-    )
     script = (
         "import os,sys\n"
         "pids=[]\n"
         "try:\n"
         "    for _ in range(200):\n"
         "        p=os.fork()\n"
-        "        if p==0: os._exit(0)\n"
+        "        if p==0:\n"
+        "            import time; time.sleep(30)\n"
+        "            os._exit(0)\n"
         "        pids.append(p)\n"
         "except OSError:\n"
         "    sys.exit(7)\n"
-        "for p in pids:\n"
-        "    os.waitpid(p,0)\n"
+        "import time; time.sleep(1)\n"
         "sys.exit(0)\n"
     )
-    result = executor._build_sandbox(
-        ExecConfig(
-            cmd=["/usr/local/bin/python3", "-c", script],
-            env={},
-            cwd=ws,
-            stdin_enabled=False,
+    # The children must *stay alive*: `max_processes` is a whole-box ceiling
+    # over live processes, so a burst of forks whose children exit before the
+    # next one is registered never reaches it (measured 2026-09-25 in this very
+    # shape: 200 exit-immediately forks pass under a ceiling of 8, 200 holding
+    # children are refused). The old probe used the exit-immediately shape and
+    # only ever "passed" because its hand-built executor could not create a
+    # sandbox at all.
+    # Through the deployment's shape (N15): the ceiling this exercises is
+    # carried by the instance, and a hand-built in-process one is refused on a
+    # root worker now that the pure shape is mediated (SL-1). The probe goes
+    # from a file because it carries newlines a `sh -c` string would eat.
+    executor, workspace = route_b_sandbox(
+        None, None, workspace=sandbox_tmpdir(), max_processes=8
+    )
+    try:
+        require_mediation_capable(executor)
+        (Path(workspace) / "fork_probe.py").write_text(script)
+        code, out, err = asyncio.run(
+            run_sh(executor, workspace, "/usr/local/bin/python3 /workspace/fork_probe.py")
         )
-    ).run(["/usr/local/bin/python3", "-c", script])
-    assert result.exit_code != 0
+        # 7 is the probe's own "the fork was refused" exit -- pinned exactly, so
+        # a sandbox that failed to start cannot satisfy this assertion.
+        assert code == 7, f"exit={code} out={out!r} err={err!r}"
+    finally:
+        executor.close()

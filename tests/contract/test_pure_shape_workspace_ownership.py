@@ -51,9 +51,19 @@ def _recorded_host_uids(sandbox_id: str) -> set[int]:
     pool; the source may still hold its record. Both are legitimate identities
     for the exported bytes -- what must not happen is root ownership or an
     identity nobody allocated.
+
+    The record lives under ``_runtime`` since the platform-state split
+    (``docs/disk-accounting-dirty-dirs.md`` §12); the path inside the sandbox
+    tree is the legacy location, still read for a harness that predates it --
+    the registry itself resolves records the same way ("new path first, legacy
+    fallback"). Without the first glob this returned an empty set and the
+    ownership assertion below could only ever accept the shared uid.
     """
     uids: set[int] = set()
-    for path in _HARNESS_ROOT.glob(f"worker-*/{sandbox_id}/sandbox.json"):
+    records = list(
+        _HARNESS_ROOT.glob(f"worker-*/_runtime/{sandbox_id}/sandbox.json")
+    ) + list(_HARNESS_ROOT.glob(f"worker-*/{sandbox_id}/sandbox.json"))
+    for path in records:
         host_uid = json.loads(path.read_text(encoding="utf-8")).get("host_uid")
         if host_uid is not None:
             uids.add(int(host_uid))

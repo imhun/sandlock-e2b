@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+
 import pytest
 
 from tests.security.conftest import (
@@ -13,198 +16,89 @@ from tests.security.conftest import (
 )
 
 
+def _one_shot(sh: str) -> tuple[int, bytes, bytes]:
+    """Run one shell command in a pure sandbox, in the deployment's shape.
+
+    Every case in this file asserts a *refusal*, and a refusal assertion passes
+    on any non-zero exit -- including the one a sandbox that never got created
+    produces. Hand-building the executor (as these cases used to) stopped being
+    a shape a deployment has when N15 made the pure shape mediated: on a root
+    worker the fork now refuses in-process mediation (SL-1), so the assertions
+    below would have been measuring the harness. Going through
+    `route_b_sandbox` means they measure the product again.
+    """
+    executor, workspace = route_b_sandbox(None, None, workspace=sandbox_tmpdir())
+    try:
+        require_mediation_capable(executor)
+        return asyncio.run(run_sh(executor, workspace, sh))
+    finally:
+        executor.close()
+
+
 @pytest.mark.usefixtures("require_sandlock")
 def test_read_etc_passwd_denied():
-    from envd_service.executors.base import ExecConfig
-    from envd_service.executors.sandlock import SandlockExecutor
-
-    import tempfile
-
-    ws = str(sandbox_tmpdir())
-    executor = SandlockExecutor(
-        workspace_dir=ws,
-        base_image=None,
-        image_rootfs=None,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=64,
-        max_open_files=4096,
-        allow_internet_access=False,
-        enable_network=False,
-    )
-    sb = executor._build_sandbox(
-        ExecConfig(cmd=["/bin/cat", "/etc/passwd"], env={}, cwd=ws, stdin_enabled=False)
-    )
-    result = sb.run(["/bin/cat", "/etc/passwd"])
-    assert result.exit_code != 0
-    assert b"root:" not in result.stdout
+    code, out, err = _one_shot("cat /etc/passwd")
+    assert code != 0, out
+    assert b"root:" not in out
 
 
 @pytest.mark.usefixtures("require_sandlock")
 def test_write_outside_workspace_denied():
-    from envd_service.executors.base import ExecConfig
-    from envd_service.executors.sandlock import SandlockExecutor
-
-    import tempfile
-
-    ws = str(sandbox_tmpdir())
-    executor = SandlockExecutor(
-        workspace_dir=ws,
-        base_image=None,
-        image_rootfs=None,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=64,
-        max_open_files=4096,
-        allow_internet_access=False,
-        enable_network=False,
-    )
-    result = executor._build_sandbox(
-        ExecConfig(
-            cmd=["/bin/sh", "-c", "echo x > /tmp/escaped"],
-            env={},
-            cwd=ws,
-            stdin_enabled=False,
-        )
-    ).run(["/bin/sh", "-c", "echo x > /tmp/escaped"])
-    assert result.exit_code != 0
+    code, out, err = _one_shot("echo x > /tmp/escaped")
+    assert code != 0, out
 
 
 @pytest.mark.usefixtures("require_sandlock")
 def test_sys_and_proc_kcore_denied():
-    from envd_service.executors.base import ExecConfig
-    from envd_service.executors.sandlock import SandlockExecutor
-
-    import tempfile
-
-    ws = str(sandbox_tmpdir())
-    executor = SandlockExecutor(
-        workspace_dir=ws,
-        base_image=None,
-        image_rootfs=None,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=64,
-        max_open_files=4096,
-        allow_internet_access=False,
-        enable_network=False,
-    )
     for probe in ("cat /proc/kcore", "ls /sys"):
-        result = executor._build_sandbox(
-            ExecConfig(
-                cmd=["/bin/sh", "-c", probe],
-                env={},
-                cwd=ws,
-                stdin_enabled=False,
-            )
-        ).run(["/bin/sh", "-c", probe])
-        assert result.exit_code != 0
+        code, out, err = _one_shot(probe)
+        assert code != 0, out
 
 
 @pytest.mark.usefixtures("require_sandlock")
 def test_default_network_denied():
-    from envd_service.executors.base import ExecConfig
-    from envd_service.executors.sandlock import SandlockExecutor
-
-    import tempfile
-
-    ws = str(sandbox_tmpdir())
-    executor = SandlockExecutor(
-        workspace_dir=ws,
-        base_image=None,
-        image_rootfs=None,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=64,
-        max_open_files=4096,
-        allow_internet_access=False,
-        enable_network=False,
-    )
-    script = (
+    ws = Path(sandbox_tmpdir())
+    (ws / "net_probe.py").write_text(
         "import urllib.request, sys;"
         "sys.exit(0 if urllib.request.urlopen('http://example.com', timeout=3) else 1)"
     )
-    result = executor._build_sandbox(
-        ExecConfig(
-            cmd=["/usr/local/bin/python3", "-c", script],
-            env={},
-            cwd=ws,
-            stdin_enabled=False,
-        )
-    ).run(["/usr/local/bin/python3", "-c", script])
-    assert result.exit_code != 0
+    code, out, err = _one_shot("/usr/local/bin/python3 /workspace/net_probe.py")
+    assert code != 0, out
 
 
 @pytest.mark.usefixtures("require_sandlock")
 def test_install_to_system_path_denied():
-    from envd_service.executors.base import ExecConfig
-    from envd_service.executors.sandlock import SandlockExecutor
-
-    import tempfile
-
-    ws = str(sandbox_tmpdir())
-    executor = SandlockExecutor(
-        workspace_dir=ws,
-        base_image=None,
-        image_rootfs=None,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=64,
-        max_open_files=4096,
-        allow_internet_access=False,
-        enable_network=False,
-    )
-    result = executor._build_sandbox(
-        ExecConfig(
-            cmd=["/bin/sh", "-c", "echo x > /usr/local/bin/pwned"],
-            env={},
-            cwd=ws,
-            stdin_enabled=False,
-        )
-    ).run(["/bin/sh", "-c", "echo x > /usr/local/bin/pwned"])
-    assert result.exit_code != 0
+    code, out, err = _one_shot("echo x > /usr/local/bin/pwned")
+    assert code != 0, out
 
 
 @pytest.mark.usefixtures("require_sandlock", "require_sandbox_file_ownership")
 def test_user_cli_install_within_workspace_persists():
     """User-level installs into the sandbox dir survive across commands."""
-    from envd_service.executors.base import ExecConfig
-    from envd_service.executors.sandlock import SandlockExecutor
+    executor, workspace = route_b_sandbox(None, None, workspace=sandbox_tmpdir())
+    try:
+        require_mediation_capable(executor)
 
-    import tempfile
+        async def _install_then_run():
+            # One instance, two commands: the point is that the second one sees
+            # the first one's file (a *fresh* sandbox cannot prove persistence).
+            first = await run_sh(
+                executor,
+                workspace,
+                "mkdir -p bin && printf '#!/bin/sh\\necho hi\\n' > bin/tool "
+                "&& chmod +x bin/tool",
+            )
+            second = await run_sh(executor, workspace, "bin/tool")
+            return first, second
 
-    ws = str(sandbox_tmpdir())
-    executor = SandlockExecutor(
-        workspace_dir=ws,
-        base_image=None,
-        image_rootfs=None,
-        memory_mb=512,
-        cpu_percent=100,
-        disk_mb=1024,
-        max_processes=64,
-        max_open_files=4096,
-        allow_internet_access=False,
-        enable_network=False,
-    )
-    cfg = ExecConfig(
-        cmd=["/bin/sh", "-c", "mkdir -p bin && printf '#!/bin/sh\\necho hi\\n' > bin/tool && chmod +x bin/tool"],
-        env={"PATH": f"{ws}/bin:/usr/bin:/bin"},
-        cwd=ws,
-        stdin_enabled=False,
-    )
-    result = executor._build_sandbox(cfg).run(
-        ["/bin/sh", "-c", "mkdir -p bin && printf '#!/bin/sh\\necho hi\\n' > bin/tool && chmod +x bin/tool"]
-    )
-    assert result.exit_code == 0
-    # Second command in a fresh Sandbox instance sees the persisted file.
-    second = executor._build_sandbox(cfg).run([f"{ws}/bin/tool"])
-    assert second.exit_code == 0
-    assert second.stdout.strip() == b"hi"
+        (code, out, err), (second_code, second_out, second_err) = asyncio.run(
+            _install_then_run()
+        )
+        assert code == 0, err
+        assert second_code == 0, second_err
+        assert second_out.strip() == b"hi"
+    finally:
+        executor.close()
 
 
 @pytest.mark.usefixtures("require_sandlock")
