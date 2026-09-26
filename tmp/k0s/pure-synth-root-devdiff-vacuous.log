@@ -1,0 +1,2 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part devdiff] DEVDIFF_LOGS names the same file twice: tmp/k0s/pure-synth-root-dev-hosttree-guarded.log

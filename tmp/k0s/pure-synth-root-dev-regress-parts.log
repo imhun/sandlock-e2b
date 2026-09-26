@@ -1,0 +1,15 @@
+# regression: the other parts are byte-identical after the part_dev/devdiff change
+# probe sha256: 1f37b5e455162387d82605ca4ad607a83f9cf1aeb2a161da2b693a73b08f742f
+# runner sha256: 01d7e724c1d0e2fa196880ba582d25b6856cdca67622c1cee9a7e4304d181e93
+b2 rc=0
+proc rc=0
+proc(emptydir) rc=0
+tmpfs rc=0
+symlinks rc=0
+devbase rc=0
+identical: tmp/k0s/pure-synth-root-prodshape-default.log == tmp/k0s/scratch/regress-b2.log
+identical: tmp/k0s/pure-synth-root-proc.log == tmp/k0s/scratch/regress-proc.log
+identical: tmp/k0s/pure-synth-root-proc-emptydir.log == tmp/k0s/scratch/regress-proc-empty.log
+identical: tmp/k0s/pure-synth-root-tmpfs.log == tmp/k0s/scratch/regress-tmpfs.log
+identical: tmp/k0s/pure-synth-root-symlinks.log == tmp/k0s/scratch/regress-symlinks.log
+identical: tmp/k0s/pure-synth-root-dev-baseline-container.log == tmp/k0s/scratch/regress-devbase.log

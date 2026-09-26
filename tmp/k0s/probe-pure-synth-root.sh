@@ -4,14 +4,23 @@
 #
 # 退出码就是探针的判定契约（`ok()`/各 part 的 return 值）：
 #   0 = 该 part 的判定成立：b2 PASS / tmpfs PASS-NEGATIVE / symlinks PASS /
-#       proc 的两臂（absent=ENOENT、emptydir=空目录）/ dev 的事实记录
+#       proc 的两臂（absent=ENOENT、emptydir=空目录）/ dev 的事实记录 /
+#       devdiff 的集合相等（无增无减）
 #   1 = 走不下去：某一步 `FAILED errno=…`（形状不允许、绑定失败、pivot 失败），
-#       或 b2 里 host-only 在 pivot 之后**仍然可见**（隔离没成立）
-#   2 = VACUOUS：b2 与 proc 会返回 —— b2 是传进来的 HOST_ONLY 在 pivot **之前**就不存在，
-#       那句 `hidden` 会白给、没有任何信息量，所以直接判无效而不是报 PASS
-#       （默认值 `HOST_ONLY=/workspace/AGENTS.md` 是 lane 镜像里真有的路径，
-#       因此**不传 -e HOST_ONLY 也应当 PASS**；拿到 2 只说明你显式传了一个不存在的路径）；
-#       proc 是那一臂声明自己没有 /proc、pivot 之后却存在（形状不是它声称的那个）。
+#       或 b2 里 host-only 在 pivot 之后**仍然可见**（隔离没成立）。
+#       dev 的绑定失败走这里：host-tree 臂的整棵 /dev、minimal 臂的逐节点 bind。
+#       devdiff 的"有增删"也走这里（集合不相等，但两份证据都是有效的）。
+#   2 = VACUOUS：b2 / proc / dev / devdiff 会返回 ——
+#       b2 是传进来的 HOST_ONLY 在 pivot **之前**就不存在，那句 `hidden` 会白给、没有任何
+#       信息量，所以直接判无效而不是报 PASS（默认值 `HOST_ONLY=/workspace/AGENTS.md` 是 lane
+#       镜像里真有的路径，因此**不传 -e HOST_ONLY 也应当 PASS**；拿到 2 只说明你显式传了一个
+#       不存在的路径）；
+#       proc 是那一臂声明自己没有 /proc、pivot 之后却存在（形状不是它声称的那个）；
+#       dev 是形状无效：DEV_VARIANT 不在 host-tree|minimal，minimal 臂的某个候选节点在
+#       本宿主上**根本不存在**（骨架里预造的普通占位文件会替它作答，所以判无效而不是跳过），
+#       或骨架里没有 /lib64（exec 型两行会量到"解释器不在"，与 /dev 无关）；
+#       devdiff 是它拿不到有效输入：日志读不到 / 取不到自洽的 `ls /dev` 清单 / 两份日志是
+#       同一个文件（"集合相等"在这些情况下没有信息量）。
 set -eu
 cd "$(dirname "$0")/../.."
 part="$1"
@@ -25,7 +34,9 @@ docker run --rm --init --network host \
     --security-opt apparmor=unconfined \
     -e HOST_ONLY="${HOST_ONLY:-/workspace/AGENTS.md}" \
     -e DEV_VARIANT="${DEV_VARIANT:-host-tree}" \
+    -e DEV_ABSENT_DEMO="${DEV_ABSENT_DEMO:-}" \
     -e DEV_SKELETON_PROC="${DEV_SKELETON_PROC:-0}" \
+    -e DEVDIFF_LOGS="${DEVDIFF_LOGS:-tmp/k0s/pure-synth-root-dev-baseline-container.log:tmp/k0s/pure-synth-root-dev-hosttree-guarded.log}" \
     -e PROC_VARIANT="${PROC_VARIANT:-absent}" \
     -v "$(pwd):/workspace" -w /workspace \
     e2b-sandlock-test:latest \

@@ -1,0 +1,12 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part dev] unshare(CLONE_NEWUSER): ok
+[part dev] unshare(CLONE_NEWNS): ok
+[part dev] mount(/ private): ok
+[part dev] bind /dev/null -> /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/null: ok
+[part dev] bind /dev/zero -> /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/zero: ok
+[part dev] bind /dev/urandom -> /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/urandom: ok
+[part dev] bind /dev/tty -> /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/tty: ok
+[part dev] bind /dev/ptmx -> /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/ptmx: ok
+[part dev] bind /dev/pts -> /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/pts: ok
+[part dev] skip /dev/absent-demo-node (absent on this host)
+[part dev] the placeholder left at /workspace/tmp/k0s/scratch/synth-root-dev-minimal/dev/absent-demo-node is NOT-a-device rdev=0 mode=0o100644 -- a write would land on it, not on a bound device

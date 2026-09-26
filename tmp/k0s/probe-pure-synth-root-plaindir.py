@@ -22,6 +22,7 @@ here, and CAP_SYS_ADMIN inside it is what authorises every mount and the pivot_r
 """
 from __future__ import annotations
 
+import ast
 import ctypes
 import os
 import shutil
@@ -325,11 +326,22 @@ def part_dev() -> int:
     2. `DEV_SKELETON_PROC=1` 时骨架里多一个空 `proc`（Task 2 已把 `proc` 钉进骨架常量）。
        默认关 = 简报 Steps 的形状；开 = Task 4 交付的形状。`/dev/fd -> /proc/self/fd`
        是软链，**答什么取决于 `/proc` 在不在**，所以两种形状都要有数字。
+
+    两条硬前提（Task 3 评审 Important 1/3 补的），各带一个 rc 2 的守卫：
+    - `minimal` 臂的候选节点在宿主上**不存在**时不再 `continue` 跳过一个 —— 骨架里预造的
+      普通同名占位文件会留下来替它作答（`open('/dev/null','w')` 照样 True），形状就不是
+      它声称的六节点 ⇒ 点名 + rc 2（VACUOUS），不是"成立"；
+    - exec 型两行的骨架必须真有 `/lib64`（动态解释器的 PT_INTERP），没有就 rc 2。
     """
     variant = os.environ.get("DEV_VARIANT", "host-tree")
     if variant not in ("host-tree", "minimal"):
         note(f"unknown DEV_VARIANT={variant!r} (expected host-tree|minimal)")
         return 2
+    #: 只为演示"源缺失 ⇒ rc 2"这一支而存在：把一个宿主上**确定不存在**的节点名追加进候选
+    #: 清单，让那次 `os.path.exists(src)` 为假。默认空；它只可能让探针返回 2（更保守），
+    #: 不会让任何判定变绿。
+    demo_absent = os.environ.get("DEV_ABSENT_DEMO", "")
+    nodes = DEV_INTEREST + ((demo_absent,) if demo_absent else ())
     skeleton_proc = os.environ.get("DEV_SKELETON_PROC", "0") == "1"
     root = fresh(f"synth-root-dev-{variant}")
     for name in ("usr", "bin", "lib", "lib64", "etc", "tmp",
@@ -340,7 +352,7 @@ def part_dev() -> int:
     dev = os.path.join(root, "dev")
     os.makedirs(dev, mode=0o755, exist_ok=True)
     if variant == "minimal":
-        for node in DEV_INTEREST:
+        for node in nodes:
             target = os.path.join(dev, node)
             if node == "pts":
                 os.makedirs(target, exist_ok=True)
@@ -355,10 +367,21 @@ def part_dev() -> int:
         if not ok("bind /dev", mount("/dev", dev, None, MS_BIND | MS_REC)):
             return 1
     elif variant == "minimal":
-        for node in DEV_INTEREST:
+        for node in nodes:
             src = os.path.join("/dev", node)
             if not os.path.exists(src):
-                continue
+                # 以前这里是 `continue`：静默跳过一个节点，而上面 `open(target, "w")` 预造的
+                # 普通同名文件会留在 `/dev/<node>` 上 —— `open('/dev/null','w')` 这类纯 Python
+                # 探照样答 True，于是"六节点齐全"是假绿。现在点名 + rc 2：形状不是它声称的
+                # 那个，属**空洞（VACUOUS）**而不是成立。
+                note(f"skip {src} (absent on this host)")
+                #: 把"替它作答的是什么"也留在日志里：那个预造的占位文件是**普通文件**，
+                #: `open(...,'w')` 会在它身上成功 —— 假绿就是这么来的。
+                target = os.path.join(dev, node)
+                if os.path.exists(target):
+                    note(f"the placeholder left at {target} is {dev_node_identity(target)}"
+                         " -- a write would land on it, not on a bound device")
+                return 2
             # 这条 bind 以前是静默的：失败时骨架里那个自造的普通同名文件留在原地，
             # 后面的 `open(...,'w')` 会替它答 True —— 假绿的入口就在这里。
             if not ok(f"bind {src} -> {dev}/{node}",
@@ -377,7 +400,7 @@ def part_dev() -> int:
     note(f"/dev/shm exists: {os.path.exists('/dev/shm')}")
     note(f"/dev/fd exists: {os.path.exists('/dev/fd')}")
     note(f"/dev/shm: {dev_shm_probe()}; ismount /dev/pts: {os.path.ismount('/dev/pts')}")
-    for name in DEV_INTEREST + DEV_SYMLINKS:
+    for name in nodes + DEV_SYMLINKS:
         note(f"/dev/{name}: {dev_node_shape(os.path.join('/dev', name))}")
     #: `/dev/fd`（以及 `/dev/stdout`、`/dev/stderr`）是**软链**：`exists` 答的是"目标在不在"，
     #: 而目标 `/proc/self/fd` 由 `/proc` 决定 —— `/proc` 是骨架里的空目录时它不在，
@@ -390,6 +413,12 @@ def part_dev() -> int:
     #: 于是两个 `False` 与 `/dev` 毫无关系，看起来却像"/dev/null 不可用"。
     #: 现在：骨架补上 `lib64`（上面的正向证据行），所以这两行确确实实是 exec 型的答案；
     #: 再叠两行不经 exec 的纯 Python 探，交叉验证"解释器缺不缺"没在替 exec 作答。
+    #: 上面那句 `skeleton has /lib64:` 是**正向证据**，这里是**守卫**（评审 Important 3）：
+    #: 少了它，exec 结论就依赖"骨架恰好有 lib64"这个巧合，而不是依赖 `/dev`。
+    if not os.path.exists("/lib64"):
+        note("VACUOUS: the skeleton has no /lib64, so the exec lines would answer "
+             "about the interpreter, not about /dev")
+        return 2
     note(f"echo >/dev/null: {os.system('echo x > /dev/null') == 0}")
     note(f"head -c1 /dev/urandom: {os.system('head -c1 /dev/urandom > /dev/null') == 0}")
     note(f"open('/dev/null','w') writes: {write_dev_null()}")
@@ -420,6 +449,101 @@ def part_devbase() -> int:
     return 0
 
 
+#: `devdiff` 的输入：`<基准日志>:<候选日志>`，两段都必须是**已经跑完的那份现场**。
+#: 默认 = 今天 pure 的枚举（`devbase`）与本轮的 host-tree 臂（`dev`）。
+#: runner 会把这个默认值同样写一份（与 DEV_VARIANT 的默认值同款），改默认要两边一起改。
+DEVDIFF_LOGS = os.environ.get(
+    "DEVDIFF_LOGS",
+    "tmp/k0s/pure-synth-root-dev-baseline-container.log"
+    ":tmp/k0s/pure-synth-root-dev-hosttree-guarded.log",
+)
+
+
+def _dev_list_from_log(path: str) -> tuple[str, list[str]] | None:
+    """从一份 `part_dev` / `part_devbase` 日志里取出 `ls /dev` 那份清单。
+
+    返回 `(part 名, 列表)`。取不到那行、解析失败、列表为空、或日志里自报的
+    `ls /dev count:` 与清单长度对不上（= 这份证据自己就不自洽）都返回 None ——
+    对判定来说，这些都不是"相等"的证据。
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError as exc:
+        note(f"cannot read {path} ({type(exc).__name__} errno={exc.errno} {exc.strerror})")
+        return None
+    tag = "?"
+    declared: int | None = None
+    listed: list[str] | None = None
+    for line in lines:
+        if line.startswith("[part ") and "] " in line and tag == "?":
+            tag = line[len("[part "):line.index("] ")]
+        if "] ls /dev count: " in line:
+            try:
+                declared = int(line.split("] ls /dev count: ", 1)[1])
+            except ValueError:
+                return None
+        if "] ls /dev: " in line:
+            raw = line.split("] ls /dev: ", 1)[1]
+            try:
+                value = ast.literal_eval(raw)
+            except (SyntaxError, ValueError):
+                return None
+            if not isinstance(value, list) or not value:
+                return None
+            listed = [str(item) for item in value]
+    if listed is None or declared is None or declared != len(listed):
+        return None
+    return tag, listed
+
+
+def part_devdiff() -> int:
+    """**复算"候选 == 今天"这句判定**，而不是把它留在报告的散文里。
+
+    读两份日志（`DEVDIFF_LOGS` = `<基准>:<候选>`）按**集合**比 `ls /dev` 那一行：
+
+    - rc 0 = 集合相等（无增、无减）；
+    - rc 1 = 有增删（打印 removed / added 两个精确列表）；
+    - rc 2 = VACUOUS：某份日志读不到 / 取不到自洽的 `ls /dev` 清单 / 两份日志是同一个文件 ——
+      "相等"这句话在这些情况下没有信息量，不许报 rc 0。
+
+    `dev` 的 rc 0 只说明"装配走通了"；这一 part 才是"14 = 14"那个结论的可复算产物。
+    """
+    base_path, sep, cand_path = DEVDIFF_LOGS.partition(":")
+    if not sep or not base_path or not cand_path:
+        note(f"DEVDIFF_LOGS={DEVDIFF_LOGS!r} is not '<base log>:<candidate log>'")
+        return 2
+    if os.path.realpath(base_path) == os.path.realpath(cand_path):
+        note(f"DEVDIFF_LOGS names the same file twice: {base_path}")
+        return 2
+    for label, path in (("base", base_path), ("candidate", cand_path)):
+        if not os.path.exists(path):
+            note(f"{label} log absent: {path}")
+            return 2
+    base = _dev_list_from_log(base_path)
+    cand = _dev_list_from_log(cand_path)
+    if base is None:
+        note(f"no self-consistent 'ls /dev' listing in the base log: {base_path}")
+        return 2
+    if cand is None:
+        note(f"no self-consistent 'ls /dev' listing in the candidate log: {cand_path}")
+        return 2
+    base_tag, base_list = base
+    cand_tag, cand_list = cand
+    base_set, cand_set = set(base_list), set(cand_list)
+    removed = sorted(base_set - cand_set)
+    added = sorted(cand_set - base_set)
+    note(f"base={base_path} (part {base_tag}) count={len(base_list)}")
+    note(f"candidate={cand_path} (part {cand_tag}) count={len(cand_list)}")
+    note(f"removed: {removed}")
+    note(f"added: {added}")
+    if removed or added:
+        note(f"verdict: DIFF ({len(removed)} removed, {len(added)} added)")
+        return 1
+    note(f"verdict: EQUAL (set of {len(base_set)} entries, no additions, no removals)")
+    return 0
+
+
 PARTS = {
     "b2": part_b2,
     "tmpfs": part_tmpfs,
@@ -427,6 +551,7 @@ PARTS = {
     "proc": part_proc,
     "dev": part_dev,
     "devbase": part_devbase,
+    "devdiff": part_devdiff,
 }
 
 if __name__ == "__main__":

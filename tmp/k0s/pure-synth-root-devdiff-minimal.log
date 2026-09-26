@@ -1,0 +1,6 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part devdiff] base=tmp/k0s/pure-synth-root-dev-baseline-container.log (part devbase) count=14
+[part devdiff] candidate=tmp/k0s/pure-synth-root-dev-minimal-guarded.log (part dev) count=6
+[part devdiff] removed: ['fd', 'full', 'mqueue', 'random', 'shm', 'stderr', 'stdin', 'stdout']
+[part devdiff] added: []
+[part devdiff] verdict: DIFF (8 removed, 0 added)

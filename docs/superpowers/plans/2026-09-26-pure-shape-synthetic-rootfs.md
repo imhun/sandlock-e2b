@@ -76,7 +76,7 @@
 
 **Interfaces:**
 - Consumes: nothing
-- Produces: `probe-pure-synth-root-plaindir.py <b2|tmpfs|proc|dev|symlinks>`（stdout 每条结论一行，退出码 0 = 该 part 的判定成立）；`probe-pure-synth-root.sh <part> <log>` 在生产 cap 形状的容器里跑它
+- Produces: `probe-pure-synth-root-plaindir.py <b2|tmpfs|proc|dev|devbase|devdiff|symlinks>`（stdout 每条结论一行，退出码 0 = 该 part 的判定成立）；`probe-pure-synth-root.sh <part> <log>` 在生产 cap 形状的容器里跑它
 
 - [ ] **Step 1: 写探针脚本**
 
@@ -317,6 +317,8 @@ if __name__ == "__main__":
 # 退出码就是判定契约：0 = 该 part 的判定成立；1 = 某一步 FAILED（或 b2 的 host-only
 # 在 pivot 后仍可见）；2 = VACUOUS（只有 b2：传进来的 HOST_ONLY 在 pivot 前就不存在，
 # 那句 `hidden` 会白给）。见 §Step 3。
+# （这份是初版副本；rc 契约以 tmp/k0s/probe-pure-synth-root.sh 为准 —— Task 3 起
+#  `dev` 与 `devdiff` 也会返回 1/2，枚举见 Task 3 的 Step 2b。）
 set -eu
 cd "$(dirname "$0")/../.."
 part="$1"
@@ -422,26 +424,59 @@ git commit -m "probe(pure): the skeleton needs an empty /proc (ENOENT otherwise)
 - [ ] **Step 1: 跑 host-tree 候选（= 今天 pure 看到的 /dev）**
 
 Run: `DEV_VARIANT=host-tree sh tmp/k0s/probe-pure-synth-root.sh dev tmp/k0s/pure-synth-root-dev-hosttree.log && cat tmp/k0s/pure-synth-root-dev-hosttree.log`
-Expected: `variant=host-tree` 段里 `/dev/shm exists: True`、`/dev/fd exists: True`、`echo >/dev/null: True`、`head -c1 /dev/urandom: True`
+Expected（**按实测修正**，见 5358cef 报告 §4.1/§4.2）: `variant=host-tree` 段里
+`ls /dev count: 14`（全量、不再 `[:12]` 截断）、`/dev/shm exists: True`、
+`/dev/fd exists: **False**`（这条是 `-> /proc/self/fd` 的软链，`exists` 答的是**目标**在不在；
+骨架里没有真 procfs ⇒ 悬空 —— 节点本身在，别把它读成"没绑上 /dev"）、
+`skeleton has /lib64: True`（必须出现在 exec 两行**之前**）、`echo >/dev/null: True`、
+`head -c1 /dev/urandom: True`
 
 - [ ] **Step 2: 跑 minimal_dev 候选（fork 的六节点）**
 
 Run: `DEV_VARIANT=minimal sh tmp/k0s/probe-pure-synth-root.sh dev tmp/k0s/pure-synth-root-dev-minimal.log && cat tmp/k0s/pure-synth-root-dev-minimal.log`
-Expected: `variant=minimal` 段里 `/dev/shm exists: False`、`/dev/fd exists: False`
+Expected（同样按实测修正）: `variant=minimal` 段里 `ls /dev count: 6`、`/dev/shm exists: False`、
+`/dev/fd exists: False`（连节点都没有 ⇒ `/dev/fd: unavailable (FileNotFoundError errno=2)`，
+与候选① 的"节点在、目标不在"是**两种** False）
+
+- [ ] **Step 2b: 把"集合相等"做成可复算的产物（`devdiff` part，评审 Important 2）**
+
+`part dev` 的 rc 0 只说明"装配走通了"；"14 = 14、无增无减"这个判定由探针自己的 `devdiff`
+part 复算 —— 它读两份日志的 `ls /dev` 清单按**集合**比，rc 语义是
+**0 = 集合相等 / 1 = 有增删 / 2 = VACUOUS**（日志读不到、取不到自洽的 `ls /dev` 清单或
+count 对不上、两份日志是同一个文件 —— 这些情况下"相等"没有信息量，不许报 0）。
+
+Run: `sh tmp/k0s/probe-pure-synth-root.sh devdiff tmp/k0s/pure-synth-root-devdiff-hosttree.log`
+Expected: rc **0**，末行 `verdict: EQUAL (set of 14 entries, no additions, no removals)`
+
+Run: `DEVDIFF_LOGS=tmp/k0s/pure-synth-root-dev-baseline-container.log:tmp/k0s/pure-synth-root-dev-minimal-guarded.log sh tmp/k0s/probe-pure-synth-root.sh devdiff tmp/k0s/pure-synth-root-devdiff-minimal.log`
+Expected: rc **1**，`removed: ['fd', 'full', 'mqueue', 'random', 'shm', 'stderr', 'stdin', 'stdout']`、`added: []`
 
 - [ ] **Step 3: 把差集表写进决定（D1 的拍板输入）**
 
 ```
 | 项 | 今天 pure（宿主 /dev） | 候选① host-tree | 候选② minimal_dev |
 |---|---|---|---|
-| ls /dev | 容器 /dev 的全部 | 同左 | 六个节点 |
+| ls /dev | 容器 /dev 的全部（14 条） | 同左（14 条，集合逐条相等） | 六个节点 |
 | /dev/shm 存在 | True | True | False |
-| /dev/fd 存在 | True | True | False |
+| /dev/fd 存在 | True（`/proc` 是真 procfs ⇒ 软链解析得开） | **False**（同一软链，悬空） | False（连节点都没有） |
 | echo >/dev/null | True | True | True |
 | head -c1 /dev/urandom | True | True | True |
 ```
 
-规则：本计划的默认是**候选①（递归 bind 容器的 `/dev`）**——它"一个都不多、一个都不少"地等于今天 pure 的可见集合。候选② 是一次**收紧**（`/dev/fd`、`/dev/shm` 消失），要做就必须作为独立的行为变更单独立项与验收。
+（上面 `/dev/fd` 与 `ls /dev` 两行是按 5358cef 的实测改过的原表：初版把候选① 写成
+`/dev/fd exists: True`，实测是 False —— 见 Task 3 报告 §4.1。候选② 少的也不是 2 条而是
+**8 条**：`fd`、`full`、`mqueue`、`random`、`shm`、`stderr`、`stdin`、`stdout`。）
+
+规则：本计划的默认是**候选①（递归 bind 容器的 `/dev`）**——它"一个都不多、一个都不少"地等于今天 pure 的可见集合。候选② 是一次**收紧**（实测少 8 条：`fd`、`full`、`mqueue`、`random`、`shm`、`stderr`、`stdin`、`stdout`），要做就必须作为独立的行为变更单独立项与验收。
+
+本轮（Task 3 评审修复）补的两条守卫，都在探针里，且都只用 rc **2** 说话：
+
+1. **源缺失不再是静默跳过**（评审 Important 1）：`minimal` 臂的候选节点在宿主上不存在时，
+   骨架里那个预造的普通同名占位文件会留在 `/dev/<node>` 上替它作答（纯 Python 探照样答 True）
+   ⇒ 点名 `skip <src> (absent on this host)` 并返回 rc **2**（形状不是声称的六节点，属空洞）；
+2. **exec 型结论不再依赖巧合**（评审 Important 3）：`echo >/dev/null` / `head -c1 /dev/urandom`
+   这两行前面加了 `/lib64` 守卫（骨架没有它就 rc **2**），让它们依赖 `/dev` 而不是"骨架恰好
+   有 lib64"。
 
 - [ ] **Step 4: 提交**
 
@@ -449,6 +484,12 @@ Expected: `variant=minimal` 段里 `/dev/shm exists: False`、`/dev/fd exists: F
 git add tmp/k0s/pure-synth-root-dev-hosttree.log tmp/k0s/pure-synth-root-dev-minimal.log
 git commit -m "probe(pure): /dev candidate diff table (host-tree is the equivalence choice)"
 ```
+
+（**这两个日志名是 Task 1 那轮已提交的历史证据，不要覆盖**。本轮的两臂日志因此是
+`tmp/k0s/pure-synth-root-dev-hosttree-guarded.log` /
+`-minimal-guarded.log`，`devdiff` 的产物是
+`tmp/k0s/pure-synth-root-devdiff-{hosttree,minimal}.log`，rc 2 的演示是
+`tmp/k0s/pure-synth-root-dev-minimal-srcabsent.log`。）
 
 ### Task 4: E2B 侧形态谓词 + 骨架物化 + 挂载表（单元级，macOS 可跑）
 
@@ -633,10 +674,20 @@ def _synthetic_rootfs_mounts() -> dict[str, str]:
 
     `/dev` is bound as the whole container tree, not as ``minimal_dev``'s six
     nodes: the pure shape's `/dev` has always *been* that tree, and the six
-    nodes would silently drop `/dev/fd` (bash process substitution) and
-    `/dev/shm` -- a tightening of the tenant's view this route must not do by
-    accident. Measured: tmp/k0s/pure-synth-root-dev-hosttree.log vs
-    tmp/k0s/pure-synth-root-dev-minimal.log.
+    nodes would silently drop `/dev/shm` plus seven more entries -- a tightening
+    of the tenant's view this route must not do by accident. What the whole bind
+    buys is **node-level** equivalence: the same 14 entries, with the four
+    symlinks into ``/proc/self/fd`` (``fd``/``stdin``/``stdout``/``stderr``)
+    preserved in *shape*. Whether those four resolve is the `/proc` synthesis /
+    mediator's line of business, not this mount's -- and it is **not** a promise
+    that bash process substitution works in a synthesized root (in this lane the
+    four dangle; today's pure shape resolves them only because its `/proc` is a
+    real procfs, while the skeleton's is an empty directory).
+    Measured: tmp/k0s/pure-synth-root-dev-hosttree-guarded.log vs
+    tmp/k0s/pure-synth-root-dev-minimal-guarded.log (this round's rerun: full
+    listing, no `[:12]` truncation, `skeleton has /lib64: True` ahead of the exec
+    lines). The "sets are equal" call is re-runnable as the probe's ``devdiff``
+    part: tmp/k0s/pure-synth-root-devdiff-hosttree.log (rc 0 = equal, 14 = 14).
     """
     mounts = {
         directory: directory
@@ -1407,6 +1458,13 @@ COMMANDS = [
     "echo x > /dev/null && echo ok",
     "echo x > /tmp/n16-probe && cat /tmp/n16-probe",
     "ls /dev | head -3",
+    # The four `/proc/self/fd` symlinks the whole-tree `/dev` bind preserves *in shape*.
+    # The probe lane only ever measured the bare answer in a synthesized tree (they
+    # dangle there, because the skeleton's `/proc` is an empty directory); whether they
+    # resolve end-to-end is a `/proc`-synthesis question -- so it gets an accept command
+    # here, in the census, instead of staying an open question in a report.
+    "test -e /dev/fd; echo fd=$?",
+    "test -e /dev/stdout; echo stdout=$?",
 ]
 
 
@@ -1462,7 +1520,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 跑普查（在 lane 里跑，三种形态都在位）**
 
 Run: `sh tmp/k0s/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-census-lane.log tests/unit/test_pure_rootfs_shape.py && docker run --rm --network host --cap-drop ALL --cap-add SYS_ADMIN --security-opt seccomp="$(pwd)/deploy/seccomp/sandlock-worker.json" --security-opt apparmor=unconfined -e E2B_HOST_PROJECT="$(pwd)" -e E2B_BASE_IMAGE= -v "$(pwd):/workspace" -w /workspace e2b-sandlock-test:latest python tmp/k0s/probe-pure-workload-census.py | tee tmp/k0s/pure-workload-census.log`
-Expected: 末行 `commands=15 shapes=3 diffs=<n>`；`diffs=0` 直接进 Task 10；`diffs>0` 时把每条 `DIFF [...]` 行分类到"路径缺失 / errno 变化"，分类结果写进 Task 11 —— 不接受"看一眼觉得没事"
+Expected: 末行 `commands=17 shapes=3 diffs=<n>`（17 = 原 15 条 + 四条软链的两条 accept）；`diffs=0` 直接进 Task 10；`diffs>0` 时把每条 `DIFF [...]` 行分类到"路径缺失 / errno 变化"，分类结果写进 Task 11 —— 不接受"看一眼觉得没事"
 
 - [ ] **Step 5: 提交**
 
@@ -1805,7 +1863,7 @@ git commit -m "docs(n14/n16): the pure shape's synthesized root is implemented, 
 ## 拍板点（执行前需要人确认，各一行）
 
 1. **D2 骨架落点**：本计划取"每沙箱一份 + 平台保留命名空间"（`<base>/_pure_rootfs/<id>`）——理由是 `_runtime/<id>` 是 0700 而 bind/`chdir` 以沙箱自己的 uid 跑（穿不过去），沙箱自己的树又会被它自己删掉。代价是每沙箱多一个顶层目录与一次拆箱清理（Task 6）。
-2. **D1 `/dev` 集合**：本计划取候选①（递归 bind 容器的 `/dev`，= 今天 pure 的可见集合）。若你要求对齐镜像形态的 `minimal_dev` 六节点，那是**收紧**（`/dev/fd`、`/dev/shm` 消失），Task 3 的表是输入，Task 4 的常量是落点。
+2. **D1 `/dev` 集合**：本计划取候选①（递归 bind 容器的 `/dev`，= 今天 pure 的可见集合，14 条集合相等）。若你要求对齐镜像形态的 `minimal_dev` 六节点，那是**收紧**（实测少 8 条：`fd`、`full`、`mqueue`、`random`、`shm`、`stderr`、`stdin`、`stdout`），Task 3 的表与 `devdiff` 是输入，Task 4 的常量是落点。
 3. **D2 `/etc`**：本计划**不绑**宿主 `/etc`（骨架里是空目录）。绑了会把宿主的名字表与凭据面重新灌进沙箱，正是 N15 修掉的那条 wildcard 绕过。
 4. **D4 过渡态**：本计划允许"合成根 + `E2B_REAL_ROOT=0`"（两态都跑、都验收），这样开关可以灰度。
 5. **D5 `minimal_dev` 显式化**：本计划**没有**把"/dev 用哪套"变成策略字段（那是纯重构），只在 `_synthetic_rootfs_mounts()` 的 docstring 里写清两个形态各自的取法。
