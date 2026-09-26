@@ -307,18 +307,27 @@ spec:
             #   * `state` -- the platform's own files (runtime records, command
             #     logs, checkpoint images, the uid pool's lock). Without this
             #     mount every record write is EROFS.
-            #   * `workspaces` -- the sunk tree root. The control plane's
-            #     migration staging lives under it (`<workspaces>/_migrate`), and
-            #     so does the tree root itself, which `create_app` creates if it
-            #     is missing; on a read-only view that mkdir is EROFS and the pod
-            #     cannot come up before a worker's init has run.
+            #   * `workspaces/_migrate` -- the migration staging, and the **only**
+            #     thing this pod writes under the sunk tree root. Deliberately the
+            #     staging directory and not the tree root: OBS-9 measured
+            #     "the control plane writing a sandbox tree is EROFS" on
+            #     2026-09-18 and that property is wanted, so the tree root itself
+            #     stays read-only here.
             #
-            # ⚠ 这是对 OBS-9 的一次**有意放宽**：`workspaces` 可写意味着控制面
-            # 又能写沙箱树（2026-09-18 实测过"写树即 EROFS"）。换取的是迁移
-            # 暂存（`_migrate`）与"树根不存在时能自建"这两件事在 N27 之后仍然
-            # 成立。要收回这条放宽，把 `workspaces` 换成 `workspaces/_migrate`
-            # 的 subPath 即可（那时 `_migrate` 必须由 `workspace-root-init`
-            # 预建，见 `.superpowers/sdd/n27-task-5-report.md` §担忧）。
+            # 为什么只到这里就够（逐条核过，见 `.superpowers/sdd/n27-task-5-report.md`
+            # §13）：控制面在 `<workspaces>` 下的写只有两处 —— 迁移暂存
+            # （`_export_sandbox_archive` 把远端节点的 tar 落到
+            # `<workspace_base>/_migrate`）和 `create_app` 的
+            # `workspace_base.mkdir(exist_ok=True)`；后者在目录已存在时被
+            # `exist_ok` 吞掉（`Path.mkdir` 对 EROFS 也走 `is_dir()` 复核那一条），
+            # 而沙箱树本身只在 `node.address == "local://"` 的分支里被写过，
+            # 本清单 `E2B_ENABLE_LOCAL_NODE=false`。真要在这种部署里开本地节点，
+            # 写树会 EROFS 并在日志里响 —— 那时再谈要不要放宽。
+            #
+            # ⚠ 上线顺序（N27 是一次迁移）：**worker 先缩到 0 → 跑迁移脚本 →
+            # 再 apply 这份清单**。绝不能在迁移之前 apply：这两个 subPath 的源
+            # （`state/`、`workspaces/_migrate/`）还不存在，pod 会停在
+            # ContainerCreating；而 worker 换了 base 之后旧位置的树与新位置对不上。
             # The directories are pre-created by the worker's
             # `workspace-root-init` (a pod that needs a subPath source that does
             # not exist yet stays in ContainerCreating and the kubelet retries,
@@ -345,8 +354,8 @@ spec:
               mountPath: /var/lib/e2b-sandboxes/_volumes
               subPath: _volumes
             - name: shared
-              mountPath: /var/lib/e2b-sandboxes/workspaces
-              subPath: workspaces
+              mountPath: /var/lib/e2b-sandboxes/workspaces/_migrate
+              subPath: workspaces/_migrate
             - name: shared
               mountPath: /var/lib/e2b-sandboxes/state
               subPath: state

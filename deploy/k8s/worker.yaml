@@ -134,6 +134,12 @@ spec:
         # Only those roots' own modes are touched: the sandbox trees below them
         # belong to their sandbox uids (client-side `chgrp`/`chmod -R` must never
         # walk them).
+        #
+        # ⚠ 上线顺序（N27 是一次迁移，不是一次滚动）：**worker 先缩到 0 →
+        # 跑 `deploy/scripts/migrate-state-base.sh`（Task 6）→ 再 apply 这份清单**。
+        # 迁移之前 apply 会得到一个"新 base 里什么都没有"的 worker（旧位置的树与
+        # `_runtime` 都还没搬过来），控制面的两个新 subPath 源也还不存在。
+        # 详见 `.superpowers/sdd/n27-task-5-report.md` §13。
         - name: workspace-root-init
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
           securityContext:
@@ -170,11 +176,17 @@ spec:
               #     into ENOENT instead of a uid. Nothing derives it from the
               #     tree root, on purpose: a base the code made up out of band
               #     would land with the wrong owner on NFS.
-              #   * `workspaces`: it is the worker's own tree root, and the
-              #     directory the control plane mounts back writable.
+              #   * `workspaces`: it is the worker's own tree root.
               for dir in "$base" "$state"; do
                 mkdir -p "$dir"
               done
+              # ...and one directory *inside* the tree root, `<workspaces>/_migrate`:
+              # the control plane's migration staging, and the only thing that pod
+              # is allowed to write under the tree root (its one writable subPath
+              # there -- sandbox trees stay EROFS for it, OBS-9). The worker's own
+              # migration endpoints use `<workspace_base>/_migrate` too
+              # (`envd_service/agent.py`), so both sides name one directory.
+              mkdir -p "$base/_migrate"
               # The checkpoint store's gate. An image is written by the
               # sandbox's *own* slot, so every level down to it has to be
               # traversable by that pooled uid -- while nobody below the worker
@@ -204,14 +216,17 @@ spec:
                   exit 1
                 fi
               done
-              # Both of the worker's own roots get today's judgement, unchanged
-              # in shape: the worker creates top-level names in each of them
-              # directly (a sandbox tree under `workspaces`, the uid pool's lock
-              # and the runtime records under `state`), so each has to be
-              # writable by it -- owner 65534, or 1777 as the compose
-              # convention -- and a base that is neither stops the pod here with
-              # the one-time fix instead of failing every create.
-              for target in "$base" "$state"; do
+              # The two roots -- and the migration staging inside the tree root,
+              # which the worker itself writes a tar into and reads back
+              # (`envd_service/agent.py`'s export/import endpoints) -- get
+              # today's judgement, unchanged in shape: the worker creates
+              # top-level names in each of them directly (a sandbox tree under
+              # `workspaces`, the uid pool's lock and the runtime records under
+              # `state`), so each has to be writable by it -- owner 65534, or
+              # 1777 as the compose convention -- and a target that is neither
+              # stops the pod here with the one-time fix instead of failing
+              # every create.
+              for target in "$base" "$state" "$base/_migrate"; do
                 owner="$(stat -c %u "$target")"
                 mode="$(stat -c %a "$target")"
                 echo "workspace-root-init: $target owner=$owner mode=$mode"
@@ -307,6 +322,23 @@ spec:
             # pre-N27 one.
             - name: E2B_STATE_BASE
               value: /var/lib/e2b-sandboxes/state
+            # N27: name the export root as the third root the privileged
+            # helpers/broker may touch. It used to be covered *by accident*
+            # (the workspace base was the export root); now that the tree root
+            # sinks under it, `_volumes` and `_images` would fall outside the
+            # whitelist unless this is set -- and `_chown_path()` falls back to
+            # an in-process `os.chown` for a path the brokers do not cover,
+            # which a 65534 worker cannot do (EPERM, silent per-volume
+            # degradation). It changes nothing for *this* cluster's root worker:
+            # a root worker resolves no brokers at all (`resolve_priv_helpers()`
+            # returns None on euid 0), so `helpers_cover()` stays False and the
+            # in-process path is the one used, exactly as before. The two
+            # readers that do care are the A5 startup probe (warning only) and
+            # `build_volume_mounts`' "volume hostPath must be under the shared
+            # root" check -- the CP derives every volume path from the same
+            # export root, so it holds by construction.
+            - name: E2B_SHARED_VOLUME_ROOT
+              value: /var/lib/e2b-sandboxes
             # Track Z / Z-F7: the extracted image rootfs cache goes on the same
             # RWX PVC as the workspaces, not inside the pod. The k8s shape has
             # the same gap the compose stack had: the default is the *relative*

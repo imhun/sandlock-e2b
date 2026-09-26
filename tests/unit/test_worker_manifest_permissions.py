@@ -689,6 +689,10 @@ def test_k0s_overlay_sinks_the_tree_root_and_keeps_state_as_a_sibling() -> None:
     assert env["E2B_WORKSPACE_BASE"] == "/var/lib/e2b-sandboxes/workspaces"
     assert env["E2B_STATE_BASE"] == "/var/lib/e2b-sandboxes/state"
     assert env["E2B_ROUTE_B_TMP_ROOT"] == "/var/lib/e2b-sandboxes/state/.route-b"
+    # N27 (Task 5 follow-up): the export root is named as the *third* broker
+    # root, because the tree root no longer is it -- `_volumes`/`_images` would
+    # otherwise fall outside the whitelist a non-root worker's brokers enforce.
+    assert env["E2B_SHARED_VOLUME_ROOT"] == "/var/lib/e2b-sandboxes"
     # The image cache is *not* platform state (the control plane exports the OCI
     # layout tars into it and every worker resolves them from there), so it stays
     # on the shared export root.
@@ -698,15 +702,20 @@ def test_k0s_overlay_sinks_the_tree_root_and_keeps_state_as_a_sibling() -> None:
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
-def test_k0s_overlay_control_plane_mounts_both_roots_writable() -> None:
+def test_k0s_overlay_control_plane_writes_only_the_migration_staging_and_state() -> None:
     """The control plane's writes have to land on writable subPaths (OBS-9).
 
     The whole volume stays read-only, so a directory the control plane writes to
-    is only writable if it is mounted back on top as a `subPath`. After N27 the
-    tree root itself is one of those directories: the platform's own
-    ``_migrate`` staging lives under it (``<workspaces>/_migrate``), and the
-    sandbox records moved to ``<export>/state``. Missing either mount leaves the
-    pod in ``ContainerCreating`` (no subPath source) or every write EROFS.
+    is only writable if it is mounted back on top as a `subPath`. After N27
+    there are two more of those: ``state`` (the platform's own files -- without
+    it every record write is EROFS) and ``workspaces/_migrate`` (the migration
+    staging, where a remote node's export tar is written).
+
+    `workspaces/_migrate` and **not** `workspaces`: OBS-9 measured "the control
+    plane writing a sandbox tree is EROFS" (2026-09-18) and that property is
+    kept -- mounting the tree root writable would hand it back. Missing either
+    mount leaves the pod in ``ContainerCreating`` (no subPath source) or the
+    write EROFS.
     """
     rendered = subprocess.run(
         [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s-k0s")],
@@ -757,10 +766,13 @@ def test_k0s_overlay_control_plane_mounts_both_roots_writable() -> None:
             "mountPath": "/var/lib/e2b-sandboxes/_volumes",
             "subPath": "_volumes",
         },
-        "workspaces": {
+        # The staging directory, *not* the tree root: sandbox trees stay EROFS
+        # for this pod (OBS-9). The key is the subPath, so a future edit that
+        # widened it to `workspaces` fails here.
+        "workspaces/_migrate": {
             "name": "shared",
-            "mountPath": "/var/lib/e2b-sandboxes/workspaces",
-            "subPath": "workspaces",
+            "mountPath": "/var/lib/e2b-sandboxes/workspaces/_migrate",
+            "subPath": "workspaces/_migrate",
         },
         "state": {
             "name": "shared",
@@ -774,7 +786,7 @@ def test_k0s_overlay_control_plane_mounts_both_roots_writable() -> None:
 def test_k0s_overlay_worker_init_creates_both_roots_and_the_checkpoint_gate() -> None:
     """The two roots and the checkpoint store's gate are the init container's job.
 
-    Two failures this pins, both measured elsewhere in N27:
+    Three failures this pins, all measured elsewhere in N27:
 
     * ``<state>`` missing -- ``uid_pool.acquire`` opens ``<state>/.uid_pool.lock``
       with ``O_CREAT`` under the base it is handed, so the *first*
@@ -783,9 +795,13 @@ def test_k0s_overlay_worker_init_creates_both_roots_and_the_checkpoint_gate() ->
       traversable by the pooled sandbox uid (the slot is what writes the image)
       and listable by nobody, which is ``0711``; ``0700`` there is the
       measured EACCES that killed the first checkpoint capture (2026-09-25).
+    * ``<workspaces>/_migrate`` missing -- it is the *source* of the control
+      plane's one writable subPath under the tree root, and a subPath whose
+      source does not exist keeps that pod in ``ContainerCreating``.
 
-    The script is matched line by line, on stripped lines: a rewritten line has
-    to be re-read here rather than pass on a substring of the old one.
+    The environment dictionary is compared whole and the script is matched line
+    by line, on stripped lines: a rewritten line has to be re-read here rather
+    than pass on a substring of the old one.
     """
     rendered = subprocess.run(
         [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s-k0s")],
@@ -818,13 +834,19 @@ def test_k0s_overlay_worker_init_creates_both_roots_and_the_checkpoint_gate() ->
         # control plane mounts, and the state base the uid pool needs).
         'for dir in "$base" "$state"; do',
         'mkdir -p "$dir"',
+        # ...plus the one directory inside the tree root the control plane is
+        # allowed to write (its migration staging).
+        'mkdir -p "$base/_migrate"',
         'mkdir -p "$state/_runtime/.checkpoints"',
         'chmod 0711 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||',
-        # base and state get the same "writable by the worker" judgement.
-        'for target in "$base" "$state"; do',
+        # base, state and the migration staging get the same "writable by the
+        # worker" judgement (the worker stages a tar in `_migrate` too).
+        'for target in "$base" "$state" "$base/_migrate"; do',
         'owner="$(stat -c %u "$target")"',
     ):
         assert expected in lines, expected
+
+
 def _rendered_workload(rendered: str, kind: str, name: str) -> dict:
     """The one rendered object of ``kind``/``name``.
 
