@@ -67,6 +67,19 @@ spec:
                 secretKeyRef:
                   name: e2b-secrets
                   key: E2B_INTERNAL_API_KEY
+            # O3 Task 3: the same rotation window as the other two workloads.
+            # This pod only *sends* the key, and it reads it from the single slot
+            # above, so the window costs it no code: its copy stays valid until
+            # the list drops it and this pod rolls. Declared anyway so all three
+            # readers of `e2b-secrets` carry the pair, and so a later server-side
+            # use of the list finds it already wired. `optional: true` for the
+            # same reason as the others -- absent outside a window.
+            - name: E2B_INTERNAL_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_INTERNAL_API_KEYS
+                  optional: true
             - name: E2B_AS_BACKEND
               value: k8s
             - name: E2B_AS_K8S_NAMESPACE

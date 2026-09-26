@@ -34,7 +34,9 @@ KUBECONFIG=... deploy/k8s-k0s/apply.sh
 
 第 2 步取代了 `docs/k8s-deployment.md` §2 那份手工 `kubectl -n $NS create secret generic`
 命令（这就是它在 k0s 上的版本）。`secrets.sh` 建/补的是清单里 `secretKeyRef` 读的四个键：
-`E2B_API_KEYS`、`E2B_INTERNAL_API_KEY`、`E2B_REDIS_PASSWORD`、`E2B_SECRET_MASTER_KEY`。
+`E2B_API_KEYS`、`E2B_INTERNAL_API_KEY`、`E2B_REDIS_PASSWORD`、`E2B_SECRET_MASTER_KEY`
+（第五个 `E2B_INTERNAL_API_KEYS` 是 internal key 的双窗列表，只在点名 `--rotate-internal-key` /
+`--finalize-internal-key-rotation` 时写 —— 窗口之外它不在 Secret 里）。
 它**只打印 `sha256(前16)` 指纹与长度**，不打印明文，也不开 `set -x`；除这四个键之外的键
 （例如主 key 轮换窗口用的 `E2B_SECRET_MASTER_KEYS`）原样带过去，不会被 apply 抹掉。
 
@@ -51,7 +53,7 @@ KUBECONFIG=... deploy/k8s-k0s/apply.sh
 | 轮换的键 | 影响面 | 不可逆窗口 / 备注 |
 |---|---|---|
 | `E2B_REDIS_PASSWORD` | **10–30 s 中断**：redis 带着新口令重启、到 control-plane / autoscaler 滚动完拿到新口令之间，共享后端（配额/节点视图/限流/单飞）不可用 ⇒ 建箱与路由失败。沙箱本身不经过 redis，不受影响 | 2026-09-26 裁定**接受**这段中断，不做 ACL 双用户热轮换（`docs/superpowers/plans/2026-09-26-decisions.md` 第 5 条）。redis 是 `appendonly yes` ⇒ 数据不丢。顺序：`secrets.sh --rotate E2B_REDIS_PASSWORD` → `rollout restart deploy/redis` → `rollout restart deploy/control-plane deploy/autoscaler` |
-| `E2B_API_KEYS` / `E2B_INTERNAL_API_KEY` | 单值被换掉的瞬间旧 key 就失效：未切换的客户端 401；`E2B_INTERNAL_API_KEY` 还要 worker / autoscaler 都滚到新值 | 放维护窗口做（滚 worker = 杀掉全部 running 沙箱）。双窗列表与完整 runbook 见 `docs/superpowers/plans/2026-09-26-o3-credential-rotation.md` Task 2–6 |
+| `E2B_API_KEYS` / `E2B_INTERNAL_API_KEY` | **双窗轮换**：新 key 与旧 key 并存 → 滚动 → finalize 摘旧 key，中间不断服。唯一掉东西的一步是 internal key 的 worker 滚动 = **杀光全部 running 沙箱**（树与卷数据保留） | `secrets.sh --rotate-api-keys` / `--rotate-internal-key`，完事用 `--finalize-api-key-rotation` / `--finalize-internal-key-rotation <旧 key 或它的 sha256 前 16 位>` 收口；两张表的 runbook 见 `docs/k8s-deployment.md` §4.5。⚠ `--rotate E2B_API_KEYS` / `--rotate E2B_INTERNAL_API_KEY` 仍是**单槽换值**（旧 key 立刻失效），要窗口别用它 |
 | `E2B_SECRET_MASTER_KEY` | 脚本**拒绝**就地轮换：旧 key 必须先留在 `E2B_SECRET_MASTER_KEYS`，否则既有 `_secrets/**` 与 redis `e2b:secret:*` 的密文永远解不开 | 两窗三拍（rotate → 滚 CP → finalize）由 `deploy/k8s-k0s/rotate-secret-master.sh` 承担 |
 
 只读核对（不改任何东西，也不回显明文）：

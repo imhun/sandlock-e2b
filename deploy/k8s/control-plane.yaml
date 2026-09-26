@@ -162,6 +162,17 @@ spec:
                 secretKeyRef:
                   name: e2b-secrets
                   key: E2B_INTERNAL_API_KEY
+            # O3 Task 3: the rotation window for `X-Internal-Key` (E3.6).
+            # `config.py::all_internal_api_keys` unions this list with the single
+            # slot above, so a rotation can add the new key here and roll the
+            # fleet at leisure instead of swapping one value everywhere at once.
+            # `optional: true`: absent outside a window.
+            - name: E2B_INTERNAL_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_INTERNAL_API_KEYS
+                  optional: true
             - name: E2B_ENABLE_LOCAL_NODE
               value: "false"
             # SECURITY: credentials come from the `e2b-secrets` Secret that the

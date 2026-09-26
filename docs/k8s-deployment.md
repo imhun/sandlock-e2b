@@ -153,6 +153,64 @@ worker 侧关键 env（语义见 `deploy/stack/.env.example` 的同名键）：
 
 ---
 
+## 4.5 凭据轮换 runbook：API key 与 internal key（O3 Task 3）
+
+两个凭据都走**双窗**：新 key 与旧 key 并存 → 滚动 → finalize 摘掉旧的。中间任何一步都
+不需要"所有进程同时换值"，所以**不断服**；唯一会掉东西的那一步是 worker 滚动 —— 沙箱是
+worker pod 内部的进程，重启 worker 等于**杀光全部 running 沙箱**（树与卷数据保留，
+排低峰/窗口）。算法与 compose 侧 `deploy/scripts/upgrade.sh:122-168` 的
+`--rotate-internal-key` / `--finalize-internal-key-rotation` 是**同一套语义**，只是介质换成
+k8s Secret（k0s 上用 `deploy/k8s-k0s/secrets.sh`）。
+
+窗口能成立，靠的是消费者读"列表 ∪ 单值槽"（`control_plane/config.py::all_internal_api_keys`
+与 `envd_service/config.py::all_internal_api_keys` 同一语义），而且三个工作负载都拿到了那个
+列表键：`control-plane`、`e2b-worker`、`autoscaler` 各有一个 `optional: true` 的
+`E2B_INTERNAL_API_KEYS`（`secretKeyRef` → `e2b-secrets`），由
+`tests/unit/test_worker_manifest_permissions.py::test_all_three_workloads_can_accept_an_old_and_a_new_internal_key`
+钉住。`optional: true` 是必须的：窗口之外这个键根本不在 Secret 里。
+autoscaler 只是控制面的客户端（它发 `E2B_AS_INTERNAL_API_KEY` 的单值槽），窗口内它拿着旧值
+不会 401；列表键在它那里是为三处形状一致、并为以后的 server 端用途留位。
+
+**凭据明文绝不出现**：脚本只打 `sha256(前16)`（长度顺手带上）。`--fingerprint` 打一遍全键，
+rotate 再逐成员打一遍窗口列表 —— finalize 的地址既可以是 key 本身，也可以是**那个指纹**
+（推荐；值从不离开脚本，报错也只打指纹）。
+
+### 表 1：`E2B_API_KEYS`（外部 API key，客户端持有）
+
+| 步 | 动作 | 影响面 | 不可逆点 |
+|---|---|---|---|
+| 1 | `deploy/k8s-k0s/secrets.sh --rotate-api-keys`：新 key **追加**进列表 | 无（两个 key 都有效） | — |
+| 2 | `kubectl -n sandlock rollout restart deploy/control-plane` + `rollout status` | 两台 CP 副本滚动；期间 API 可用（`maxUnavailable: 1`） | — |
+| 3 | 客户端切到新 key，逐个验证 | 只影响未切换的客户端 | 未切换的客户端在下一步会 401 |
+| 4 | `secrets.sh --finalize-api-key-rotation sha256:<旧指纹>` + 再滚动一次 | 未切换的客户端立即 401 | **移除旧 key** |
+
+回滚：第 4 步之前什么都不用做（旧 key 还在列表里，未切换的客户端照常能用）。第 4 步之后
+**不可恢复** —— 被摘掉的 key 的值已不在 Secret 里，脚本也从未打印过它；要换只能"再轮换一次"，
+走同一个窗口。验收：用新 key 跑 `deploy/scripts/deployment_smoke.py`；finalize 之后旧 key 应 401。
+
+### 表 2：`E2B_INTERNAL_API_KEY`（worker / control-plane / autoscaler 之间）
+
+| 步 | 动作 | 影响面 | 不可逆点 |
+|---|---|---|---|
+| 1 | `deploy/k8s-k0s/secrets.sh --rotate-internal-key`（旧 key 进列表，新 key 成主 key） | 无（列表里两个都认） | — |
+| 2 | `kubectl -n sandlock rollout restart deploy/control-plane` | CP 无感（滚动） | — |
+| 3 | `kubectl -n sandlock rollout restart statefulset/e2b-worker` | **杀掉全部 running 沙箱**（沙箱是 worker pod 内进程；树与卷数据保留）⇒ 必须低峰/窗口 | — |
+| 4 | `kubectl -n sandlock rollout restart deploy/autoscaler` | autoscaler 无感 | — |
+| 5 | `secrets.sh --finalize-internal-key-rotation sha256:<旧指纹>` + 滚动 CP | 旧 key 立即失效 | **finalize** |
+
+回滚：同表 1 —— 第 5 步之前回滚 = 不做（旧 key 仍在列表里生效）；第 5 步之后不可恢复，
+只能再轮换一次。**第 3 步是窗口的代价**：其他步骤都能在工作时间做，只有它会让所有沙箱消失。
+
+对账（两个表都用，不改任何东西、不回显明文）：
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+deploy/k8s-k0s/secrets.sh --fingerprint        # 逐键 sha256(前16)+长度；未轮换的键逐字不变
+kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data}' | wc -c   # 只报大小
+```
+
+---
+
 ## 5. 把 k8s 切到与 compose 相同的形态（✅ 2026-09-17 已落地：N5 / N10）
 
 **本节已按下列步骤落地（`deploy/k8s/worker.yaml`，2026-09-17）**，但**尚未在真实集群复跑 §6** ——

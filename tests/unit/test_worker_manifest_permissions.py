@@ -1159,3 +1159,67 @@ def test_k8s_control_plane_hosts_no_sandboxes_so_the_flag_is_left_out() -> None:
     """
     assert _k8s_env_value(K8S_CONTROL_PLANE, "E2B_ENABLE_LOCAL_NODE") == "false"
     assert "\n            - name: E2B_ENABLE_NETWORK\n" not in K8S_CONTROL_PLANE
+
+
+#: The three workloads that must carry the internal key's rotation window.
+#: `control-plane` and the worker *verify* `X-Internal-Key` (the worker's
+#: gateway and its agent both read the list); the autoscaler only *sends* one,
+#: and it reads the single slot under its own `E2B_AS_*` name -- the pair is
+#: asserted together so a copy of the secret key cannot be dropped silently.
+INTERNAL_KEY_WORKLOADS = (
+    ("Deployment", "control-plane", "E2B_INTERNAL_API_KEY"),
+    ("StatefulSet", "e2b-worker", "E2B_INTERNAL_API_KEY"),
+    ("Deployment", "autoscaler", "E2B_AS_INTERNAL_API_KEY"),
+)
+
+
+def _env_of(workload: dict) -> dict:
+    """Every container's env by name (sidecars included), as written."""
+    env: dict = {}
+    for container in workload["spec"]["template"]["spec"]["containers"]:
+        for entry in container.get("env") or []:
+            env[entry["name"]] = entry
+    return env
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_all_three_workloads_can_accept_an_old_and_a_new_internal_key() -> None:
+    """O3 Task 3: the internal key rotates in two windows, so every reader of
+    `X-Internal-Key` must carry `E2B_INTERNAL_API_KEYS` beside the single slot.
+
+    Why this is machine-checked rather than left to the runbook: the window is
+    what keeps a rotation from breaking the fleet. Rotate writes the old key
+    into the list and the new one into `E2B_INTERNAL_API_KEY`; a workload that
+    reads only the single slot would 401 the moment a *peer* rolled -- before
+    its own restart -- which is exactly the outage the list exists to prevent.
+
+    `optional: true` is deliberate: outside a rotation window the key is absent
+    from the Secret, and a required `secretKeyRef` would leave the pod in
+    `CreateContainerConfigError` (the kustomize render is the only thing that
+    notices, since unit tests cannot ask a cluster). The single slot stays
+    non-optional in the same object: with no window list, it *is* the key.
+    """
+    rendered = subprocess.run(
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s-k0s")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    for kind, name, single in INTERNAL_KEY_WORKLOADS:
+        env = _env_of(_rendered_workload(rendered.stdout, kind, name))
+        assert "E2B_INTERNAL_API_KEYS" in env, f"{name} 缺双窗键位"
+        assert env["E2B_INTERNAL_API_KEYS"] == {
+            "name": "E2B_INTERNAL_API_KEYS",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": "e2b-secrets",
+                    "key": "E2B_INTERNAL_API_KEYS",
+                    "optional": True,
+                }
+            },
+        }, name
+        assert env[single]["valueFrom"]["secretKeyRef"] == {
+            "name": "e2b-secrets",
+            "key": "E2B_INTERNAL_API_KEY",
+        }, name

@@ -342,8 +342,9 @@ def test_a_second_run_keeps_every_value_and_reports_the_same_fingerprints(stub_c
 
 def test_an_existing_extra_key_survives_and_only_the_missing_one_is_added(stub_cluster):
     _, state_path = stub_cluster
-    # `E2B_INTERNAL_API_KEYS` 是轮换窗口用的键（Task 3/4 写它），本脚本不认识它 ——
-    # 正因如此它是"apply 不许把别人的键抹掉"的探针。`E2B_API_KEYS` 已存在 ⇒ 保留。
+    # `E2B_INTERNAL_API_KEYS` 是轮换窗口用的键（Task 3 的双窗脚本**点名**才会写它）——
+    # 没点名时它必须原样带过去，所以它是"apply 不许把别人的键抹掉"的探针。
+    # `E2B_API_KEYS` 已存在 ⇒ 保留。
     _seed(
         state_path,
         {"E2B_INTERNAL_API_KEYS": "old-key-a,old-key-b", "E2B_API_KEYS": "keep-me"},
@@ -428,3 +429,336 @@ def test_fingerprint_mode_refuses_a_missing_secret(stub_cluster):
     assert result.returncode != 0
     assert result.stdout == ""
     assert "e2b-secrets 不存在" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# 双窗轮换（O3 Task 3）：E2B_INTERNAL_API_KEYS 与 E2B_API_KEYS
+# ---------------------------------------------------------------------------
+# rotate 的语义照 deploy/scripts/upgrade.sh:122-168（compose 侧已用过的两窗算法）：
+# 旧 key 留在列表里继续可用，新 key 进单值槽（internal）或追加进列表（api），
+# 等三个消费者都滚到新 key 之后再由 finalize 把旧 key 摘掉。中间不断服。
+#
+# 差别只有一处，且是刻意的：upgrade.sh 的 finalize 会把旧 key **明文**打进终端，
+# 本脚本只打 sha256(前 16)，并且 finalize 可以**用这个指纹**当地址 —— 操作者本来
+# 也只拿得到指纹（值从不离开脚本）。
+
+
+def _seed_internal_window(
+    state_path: Path,
+    primary: str = "internal-old",
+    keys: str | None = None,
+) -> dict[str, str]:
+    payload = {
+        "E2B_API_KEYS": "api-old",
+        "E2B_INTERNAL_API_KEY": primary,
+        "E2B_REDIS_PASSWORD": "redis-old",
+        "E2B_SECRET_MASTER_KEY": "master-old",
+    }
+    if keys is not None:
+        payload["E2B_INTERNAL_API_KEYS"] = keys
+    _seed(state_path, payload)
+    return payload
+
+
+def _fp(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def test_a_plain_run_does_not_invent_a_window_list(stub_cluster):
+    """没有点名轮换就绝不写列表：重复 apply 不该把"窗口"打开。"""
+    _, state_path = stub_cluster
+    before = _seed_internal_window(state_path)
+
+    result = _run(stub_cluster)
+
+    assert result.returncode == 0
+    assert _state(state_path) == before
+
+
+def test_rotate_internal_key_keeps_the_old_key_in_the_window_list(stub_cluster):
+    _, state_path = stub_cluster
+    _seed_internal_window(state_path)
+
+    result = _run(stub_cluster, "--rotate-internal-key")
+
+    assert result.returncode == 0
+    stored = _state(state_path)
+    new_primary = stored["E2B_INTERNAL_API_KEY"]
+    assert re.fullmatch(r"[0-9a-f]{64}", new_primary)
+    # upgrade.sh 的形状：列表 = 旧列表（或旧主 key）+ 新主 key，主 key 另存单值槽。
+    # 两个读者都会把单值槽并进列表，所以新旧两把在窗口内都认 —— 这就是不断服的那一步。
+    assert stored["E2B_INTERNAL_API_KEYS"] == f"internal-old,{new_primary}"
+    assert stored["E2B_API_KEYS"] == "api-old"
+    assert stored["E2B_REDIS_PASSWORD"] == "redis-old"
+    assert stored["E2B_SECRET_MASTER_KEY"] == "master-old"
+    # 硬要求：任何输出里不许出现凭据明文（含被轮换掉的旧 key）。
+    assert "internal-old" not in result.stdout + result.stderr
+    assert new_primary not in result.stdout + result.stderr
+    # 整个 runbook（含逐步命令）逐行固定：窗口的两把 key 只以指纹出现。
+    assert result.stdout == _fingerprint_table(stored)
+    assert result.stderr.splitlines() == [
+        "已轮换 internal key：新主 key 写入 E2B_INTERNAL_API_KEY；旧 key 留在 "
+        "E2B_INTERNAL_API_KEYS（窗口内新旧都认，这一步不重启任何 pod）",
+        f"  新主 key {_fp(new_primary)}",
+        "  窗口列表成员（finalize 用这里的指纹）：",
+        f"    E2B_INTERNAL_API_KEYS 成员 {_fp('internal-old')} len:12",
+        f"    E2B_INTERNAL_API_KEYS 成员 {_fp(new_primary)} len:64",
+        "  滚动顺序（唯一不断服的顺序；第 2 步会杀光全部 running 沙箱 ⇒ 放低峰/窗口）：",
+        "    1) kubectl -n sandlock rollout restart deploy/control-plane && "
+        "kubectl -n sandlock rollout status deploy/control-plane",
+        "    2) kubectl -n sandlock rollout restart statefulset/e2b-worker",
+        "       （这一步会杀光全部 running 沙箱 —— 树与卷数据保留，但放低峰/窗口做）",
+        "    3) kubectl -n sandlock rollout restart deploy/autoscaler",
+        "    4) 三处都滚完后：deploy/k8s-k0s/secrets.sh "
+        f"--finalize-internal-key-rotation {_fp('internal-old')}",
+        "保留 E2B_API_KEYS（已有值；要换值请显式 --rotate E2B_API_KEYS）",
+        "保留 E2B_INTERNAL_API_KEY（已有值；要换值请显式 --rotate E2B_INTERNAL_API_KEY）",
+        "保留 E2B_REDIS_PASSWORD（已有值；要换值请显式 --rotate E2B_REDIS_PASSWORD）",
+        "保留 E2B_SECRET_MASTER_KEY（已有值；要换值请显式 --rotate E2B_SECRET_MASTER_KEY）",
+        "secret/e2b-secrets configured",
+    ]
+
+
+def test_rotate_internal_key_refuses_without_a_current_key_or_a_secret(stub_cluster):
+    _, state_path = stub_cluster
+    _seed(state_path, {"E2B_API_KEYS": "api-old"})
+
+    no_primary = _run(stub_cluster, "--rotate-internal-key")
+
+    assert no_primary.returncode != 0
+    assert no_primary.stderr.splitlines() == [
+        "secrets.sh: 无法确定当前 internal key（Secret 缺 E2B_INTERNAL_API_KEY）"
+    ]
+    assert _state(state_path) == {"E2B_API_KEYS": "api-old"}
+
+    state_path.unlink()
+    missing = _run(stub_cluster, "--rotate-internal-key")
+
+    assert missing.returncode != 0
+    assert missing.stdout == ""
+    assert missing.stderr.splitlines() == [
+        "secrets.sh: --rotate-internal-key / --rotate-api-keys / --finalize-* 都需要先有 "
+        "sandlock/e2b-secrets：先跑一次不带这些参数的本脚本把它建出来"
+    ]
+
+
+def test_finalize_internal_key_rotation_removes_the_named_key(stub_cluster):
+    _, state_path = stub_cluster
+    _seed(
+        state_path,
+        {
+            "E2B_API_KEYS": "api-old",
+            "E2B_INTERNAL_API_KEY": "internal-new",
+            "E2B_INTERNAL_API_KEYS": "internal-old,internal-new",
+            "E2B_REDIS_PASSWORD": "redis-old",
+            "E2B_SECRET_MASTER_KEY": "master-old",
+        },
+    )
+
+    # 地址既能是值（upgrade.sh 的形状），也能是 --fingerprint 打出来的 sha256 前 16 位。
+    by_fingerprint = _run(
+        stub_cluster, "--finalize-internal-key-rotation", _fp("internal-old")
+    )
+
+    assert by_fingerprint.returncode == 0
+    stored = _state(state_path)
+    assert stored["E2B_INTERNAL_API_KEYS"] == "internal-new"
+    assert stored["E2B_INTERNAL_API_KEY"] == "internal-new"
+    assert stored["E2B_API_KEYS"] == "api-old"
+    assert "internal-old" not in by_fingerprint.stdout + by_fingerprint.stderr
+    assert by_fingerprint.stdout == _fingerprint_table(stored)
+    assert by_fingerprint.stderr.splitlines() == [
+        f"已从 E2B_INTERNAL_API_KEYS 移除 {_fp('internal-old')}：该 key 立即失效",
+        "保留 E2B_API_KEYS（已有值；要换值请显式 --rotate E2B_API_KEYS）",
+        "保留 E2B_INTERNAL_API_KEY（已有值；要换值请显式 --rotate E2B_INTERNAL_API_KEY）",
+        "保留 E2B_REDIS_PASSWORD（已有值；要换值请显式 --rotate E2B_REDIS_PASSWORD）",
+        "保留 E2B_SECRET_MASTER_KEY（已有值；要换值请显式 --rotate E2B_SECRET_MASTER_KEY）",
+        "secret/e2b-secrets configured",
+    ]
+
+    by_value = _run(stub_cluster, "--finalize-internal-key-rotation", "internal-new")
+    assert by_value.returncode != 0
+    assert by_value.stderr.splitlines() == [
+        f"secrets.sh: 不能移除当前主 key（{_fp('internal-new')}）："
+        "先 --rotate-internal-key 生成新主 key"
+    ]
+    assert _state(state_path) == stored
+
+
+def test_finalize_internal_key_rotation_refuses_an_unknown_key_or_an_empty_list(
+    stub_cluster,
+):
+    _, state_path = stub_cluster
+    seeded = _seed_internal_window(
+        state_path, primary="internal-new", keys="internal-old"
+    )
+
+    unknown = _run(stub_cluster, "--finalize-internal-key-rotation", "not-in-list")
+
+    assert unknown.returncode != 0
+    assert unknown.stderr.splitlines() == [
+        f"secrets.sh: E2B_INTERNAL_API_KEYS 里没有 {_fp('not-in-list')}："
+        "地址既不是列表里的 key，也不是它打印过的 sha256 前 16 位"
+    ]
+    assert _state(state_path) == seeded
+
+    _seed(
+        state_path,
+        {
+            "E2B_API_KEYS": "api-old",
+            "E2B_INTERNAL_API_KEY": "internal-new",
+            "E2B_REDIS_PASSWORD": "redis-old",
+            "E2B_SECRET_MASTER_KEY": "master-old",
+        },
+    )
+    empty = _run(stub_cluster, "--finalize-internal-key-rotation", "internal-old")
+
+    assert empty.returncode != 0
+    assert empty.stderr.splitlines() == [
+        "secrets.sh: E2B_INTERNAL_API_KEYS 为空：旧 key 已不在生效列表"
+    ]
+
+
+def test_rotate_api_keys_appends_a_new_key_and_keeps_the_old_one(stub_cluster):
+    _, state_path = stub_cluster
+    _seed_internal_window(state_path)
+
+    result = _run(stub_cluster, "--rotate-api-keys")
+
+    assert result.returncode == 0
+    stored = _state(state_path)
+    new_key = stored["E2B_API_KEYS"].removeprefix("api-old,")
+    assert re.fullmatch(r"[0-9a-f]{64}", new_key)
+    assert stored["E2B_INTERNAL_API_KEY"] == "internal-old"
+    assert stored["E2B_REDIS_PASSWORD"] == "redis-old"
+    assert "api-old" not in result.stdout + result.stderr
+    assert new_key not in result.stdout + result.stderr
+    assert result.stdout == _fingerprint_table(stored)
+    assert result.stderr.splitlines() == [
+        "已轮换 API key：新 key 追加进 E2B_API_KEYS（旧 key 仍有效，"
+        "这一步不重启任何 pod）",
+        "  窗口列表成员（finalize 用这里的指纹）：",
+        f"    E2B_API_KEYS 成员 {_fp('api-old')} len:7",
+        f"    E2B_API_KEYS 成员 {_fp(new_key)} len:64",
+        "  滚动顺序（只有 control-plane 读外部 API key）：",
+        "    1) kubectl -n sandlock rollout restart deploy/control-plane && "
+        "kubectl -n sandlock rollout status deploy/control-plane",
+        f"    2) 客户端逐个切到新 key（{_fp(new_key)}）并验证",
+        "    3) 都切完：deploy/k8s-k0s/secrets.sh "
+        "--finalize-api-key-rotation sha256:<要退役那把的指纹>",
+        "保留 E2B_API_KEYS（已有值；要换值请显式 --rotate E2B_API_KEYS）",
+        "保留 E2B_INTERNAL_API_KEY（已有值；要换值请显式 --rotate E2B_INTERNAL_API_KEY）",
+        "保留 E2B_REDIS_PASSWORD（已有值；要换值请显式 --rotate E2B_REDIS_PASSWORD）",
+        "保留 E2B_SECRET_MASTER_KEY（已有值；要换值请显式 --rotate E2B_SECRET_MASTER_KEY）",
+        "secret/e2b-secrets configured",
+    ]
+
+
+def test_finalize_api_key_rotation_removes_the_named_key_but_never_the_last_one(
+    stub_cluster,
+):
+    _, state_path = stub_cluster
+    _seed(
+        state_path,
+        {
+            "E2B_API_KEYS": "api-old,api-new",
+            "E2B_INTERNAL_API_KEY": "internal-old",
+            "E2B_REDIS_PASSWORD": "redis-old",
+            "E2B_SECRET_MASTER_KEY": "master-old",
+        },
+    )
+
+    result = _run(stub_cluster, "--finalize-api-key-rotation", "api-old")
+
+    assert result.returncode == 0
+    stored = _state(state_path)
+    assert stored["E2B_API_KEYS"] == "api-new"
+    assert "api-old" not in result.stdout + result.stderr
+    assert result.stdout == _fingerprint_table(stored)
+    assert result.stderr.splitlines() == [
+        f"已从 E2B_API_KEYS 移除 {_fp('api-old')}：该 key 立即失效",
+        "保留 E2B_API_KEYS（已有值；要换值请显式 --rotate E2B_API_KEYS）",
+        "保留 E2B_INTERNAL_API_KEY（已有值；要换值请显式 --rotate E2B_INTERNAL_API_KEY）",
+        "保留 E2B_REDIS_PASSWORD（已有值；要换值请显式 --rotate E2B_REDIS_PASSWORD）",
+        "保留 E2B_SECRET_MASTER_KEY（已有值；要换值请显式 --rotate E2B_SECRET_MASTER_KEY）",
+        "secret/e2b-secrets configured",
+    ]
+
+    last = _run(stub_cluster, "--finalize-api-key-rotation", "api-new")
+
+    assert last.returncode != 0
+    assert last.stderr.splitlines() == [
+        "secrets.sh: 不能移除最后一个 API key：所有客户端会被锁在门外"
+    ]
+    assert _state(state_path)["E2B_API_KEYS"] == "api-new"
+
+
+def test_fingerprint_mode_and_the_window_flags_are_mutually_exclusive(stub_cluster):
+    _, state_path = stub_cluster
+    seeded = _seed_internal_window(state_path)
+
+    for args in (
+        ("--rotate-internal-key",),
+        ("--rotate-api-keys",),
+        ("--finalize-internal-key-rotation", "internal-old"),
+        ("--finalize-api-key-rotation", "api-old"),
+    ):
+        result = _run(stub_cluster, "--fingerprint", *args)
+        assert result.returncode != 0, args
+        assert result.stdout == "", args
+        assert result.stderr.splitlines() == [
+            "secrets.sh: --fingerprint 只读，不能与 --rotate-internal-key / "
+            "--rotate-api-keys / --finalize-* 一起用"
+        ], args
+    assert _state(state_path) == seeded
+
+
+def test_the_window_finalize_flags_need_a_non_empty_address(stub_cluster):
+    """空地址必须报错，不能被当成"没点名"而静默地做一次幂等 apply。"""
+    _, state_path = stub_cluster
+    seeded = _seed_internal_window(state_path, primary="internal-new", keys="internal-old")
+
+    for flag in (
+        "--finalize-internal-key-rotation",
+        "--finalize-api-key-rotation",
+    ):
+        result = _run(stub_cluster, flag, "")
+        assert result.returncode != 0, flag
+        assert result.stdout == "", flag
+        assert result.stderr.splitlines() == [
+            f"secrets.sh: {flag} 需要参数（旧 key 或它的 sha256 前 16 位；不能是空串）"
+        ], flag
+    assert _state(state_path) == seeded
+
+
+def test_the_single_slot_rotate_of_a_windowed_key_points_at_the_window_pair(
+    stub_cluster,
+):
+    """`--rotate <KEY>` 仍是单槽换值（旧 key 立刻失效）；对这两个键要指路。"""
+    _, state_path = stub_cluster
+    _seed_internal_window(state_path)
+
+    mixed = _run(
+        stub_cluster,
+        "--rotate",
+        "E2B_INTERNAL_API_KEY",
+        "--rotate-internal-key",
+    )
+
+    assert mixed.returncode != 0
+    assert mixed.stderr.splitlines() == [
+        "secrets.sh: E2B_INTERNAL_API_KEY 不能同时用 --rotate 与 --rotate-internal-key"
+    ]
+    assert _state(state_path) == {
+        "E2B_API_KEYS": "api-old",
+        "E2B_INTERNAL_API_KEY": "internal-old",
+        "E2B_REDIS_PASSWORD": "redis-old",
+        "E2B_SECRET_MASTER_KEY": "master-old",
+    }
+
+    warned = _run(stub_cluster, "--rotate", "E2B_API_KEYS")
+    assert warned.returncode == 0
+    assert (
+        "⚠ --rotate E2B_API_KEYS 是单槽换值（旧 key 立刻失效）；"
+        "双窗轮换请用 --rotate-api-keys" in warned.stderr.splitlines()
+    )

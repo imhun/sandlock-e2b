@@ -211,6 +211,19 @@ spec:
                 secretKeyRef:
                   name: e2b-secrets
                   key: E2B_INTERNAL_API_KEY
+            # O3 Task 3: the internal key's rotation window (E3.6). The worker's
+            # gateway and agent accept every key in this list, which is what lets
+            # a rotation put the new key in the slot above while the old one is
+            # still accepted here -- no worker has to be restarted before the
+            # control plane's new key is in use. `optional: true`: outside a
+            # window the key is absent from the Secret, and a required ref would
+            # leave the pod in CreateContainerConfigError.
+            - name: E2B_INTERNAL_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_INTERNAL_API_KEYS
+                  optional: true
             - name: E2B_WORKSPACE_BASE
               value: /var/lib/e2b-sandboxes
             # Track Z / Z-F7: the extracted image rootfs cache goes on the same
