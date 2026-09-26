@@ -179,10 +179,23 @@ def part_symlinks() -> int:
 
 
 def part_proc() -> int:
-    """骨架里**故意不建** /proc：能不能起、里面是什么。"""
+    """骨架里到底要不要那个空 /proc：两个方向各量一次，不是推断。
+
+    `PROC_VARIANT=absent`（默认，= 简报 Step 1 的形状）故意不建 /proc，量的是"没有这个
+    目录时内核答什么"；`PROC_VARIANT=emptydir` 建一个空 /proc（0755，与真骨架同模式），
+    量的是"有这个目录时内核答什么"。`/proc` 里的**内容**由中介合成（fork 的
+    `procfs.rs::handle_proc_open`），与这个目录存不存在是两件事 —— 本 part 量的是
+    "列目录本身"看到的东西，所以两臂都要有数字，"要不要建"才不是推断出来的。
+    """
+    variant = os.environ.get("PROC_VARIANT", "absent")
+    if variant not in ("absent", "emptydir"):
+        note(f"unknown PROC_VARIANT={variant!r} (expected absent|emptydir)")
+        return 2
     root = fresh("synth-root-proc")
     for name in ("usr", "bin", "lib", "dev", "etc", "tmp", "home", "home/user", "workspace"):
         os.makedirs(os.path.join(root, name), mode=0o755, exist_ok=True)
+    if variant == "emptydir":
+        os.makedirs(os.path.join(root, "proc"), mode=0o755, exist_ok=True)
     if not enter_ns():
         return 1
     for src in ("/usr", "/bin", "/lib", "/dev"):
@@ -190,9 +203,23 @@ def part_proc() -> int:
             mount(src, os.path.join(root, src.lstrip("/")), None, MS_BIND | MS_REC)
     if not self_bind_and_pivot(root):
         return 1
+    note(f"variant={variant}")
     note("stat /proc: " + ("exists" if os.path.exists("/proc") else "ENOENT"))
     listed = sorted(os.listdir("/proc"))[:5] if os.path.isdir("/proc") else "ENOTDIR/ENOENT"
     note(f"listdir /proc: {listed}")
+    if variant == "absent":
+        if os.path.exists("/proc"):
+            note("verdict: VACUOUS (this arm is 'no /proc', yet /proc exists after the pivot)")
+            return 2
+        note("verdict: ENOENT -- without the directory the kernel has nothing to show")
+        return 0
+    if not os.path.isdir("/proc"):
+        note("verdict: FAILED (the empty directory did not survive the pivot)")
+        return 1
+    if listed:
+        note(f"verdict: FAILED (the directory is not empty: {listed})")
+        return 1
+    note("verdict: exists and lists 0 entries -- the directory, not a mount, answers here")
     return 0
 
 

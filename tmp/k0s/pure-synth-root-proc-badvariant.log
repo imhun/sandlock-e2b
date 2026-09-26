@@ -1,0 +1,2 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part proc] unknown PROC_VARIANT='bogus' (expected absent|emptydir)

@@ -5,7 +5,7 @@ test-runner: no /dev/loop-control: XFS gates unavailable
 [part proc] self-bind /workspace/tmp/k0s/scratch/synth-root-proc: ok
 [part proc] pivot_root('.', '.'): ok
 [part proc] umount2('.', MNT_DETACH): ok
-[part proc] variant=absent
-[part proc] stat /proc: ENOENT
-[part proc] listdir /proc: ENOTDIR/ENOENT
-[part proc] verdict: ENOENT -- without the directory the kernel has nothing to show
+[part proc] variant=emptydir
+[part proc] stat /proc: exists
+[part proc] listdir /proc: []
+[part proc] verdict: exists and lists 0 entries -- the directory, not a mount, answers here
