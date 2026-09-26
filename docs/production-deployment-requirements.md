@@ -393,6 +393,22 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
   的清单，不如把口径写死在这里；等有真实 k8s + XFS 环境再补清单，并把本节改成「已提供」。
   `deploy/k8s/worker.yaml` 的 A6 注释块指向本节。
 
+**N30 口径（2026-09-26）**：`diskMB` 是**存量（位置边界）**口径 —— "这棵沙箱树**当前**占用的
+字节，**删除即归还**"（裁定见 `docs/superpowers/plans/2026-09-26-decisions.md`《N30 口径确认》）。
+**没有** agent 的 k8s 形态下这个口径**同样成立**，只是强制点在别处：中介的活账本 + per-exec
+`RLIMIT_FSIZE`（超预算的 `O_CREAT`/`mkdir`/`symlink`/`link` 由中介返回 `ENOSPC`；条目维见
+`E2B_DISK_MAX_ENTRIES`，`docs/sandbox-disk-quota.md` §1.1）。agent 路径只是把**同一个口径**交给
+内核：建箱 `limit -p bhard=<disk_mb>M`（不是"还能写多少"的预算），删除后 `limit -p bsoft=0 bhard=0`
+把行**归还**给 XFS —— 少了后半句，行就变成高水位记录，正是 N30 否决的峰值口径。两条路径的语义必须
+一致：`envd_service/xfs_quota.py` 的 `provision_project(disk_mb=…)` 与 `deploy/quota_agent/app.py`
+的 `project_create`（`limit_mb` → `disk_mb=body.limit_mb`）各只有一处入参，钉子
+`tests/contract/test_xfs_project_quota.py::test_the_quota_row_is_a_position_boundary_not_a_write_budget`。
+**有配额行的两种形态下，沙箱看到的都是 `ENOSPC`（errno 28）**：本地 XFS 是内核把项目配额越界
+直接映射成 ENOSPC（钉子 `test_over_limit_write_enforced_with_enospc`），NFS 线是 NFS 客户端把
+服务器端的 `EDQUOT` 映射过去（§5.2 第 2 条，实测），所以 agent 这一层**不翻译** errno —— 改了它
+就会让 §5.2 的客户端形状多出一个只在本形态存在的第二来源。钉子
+`tests/unit/test_quota_agent_server.py::test_server_side_errno_is_carried_through_untranslated`。
+
 ### 2.4.5 worker seccomp 面：从 `unconfined` 收敛到「默认档 + 2 条」（2026-09-15）
 
 **结论**：worker 容器不再用 `seccomp=unconfined`，改用

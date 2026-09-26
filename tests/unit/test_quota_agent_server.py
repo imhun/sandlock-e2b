@@ -384,3 +384,40 @@ async def test_token_unconfigured_refuses_requests():
         )
     assert response.status_code == 500
     assert response.json() == {"error": "quota-agent token not configured"}
+
+
+async def test_server_side_errno_is_carried_through_untranslated(monkeypatch):
+    """N30 (2026-09-26): this service is not where ``EDQUOT`` becomes ``ENOSPC``.
+
+    On the agent line the sandbox's own ``write(2)`` never reaches the worker:
+    it goes to the NFS client, which turns the server's ``EDQUOT`` into the
+    client-visible ``ENOSPC`` (errno 28 -- docs §5.2 item 2, measured by
+    ``deploy/scripts/nfs_quota_probe.sh`` case B), and the kernel hands that
+    straight to the sandbox. So the agent's half of the contract is the
+    *opposite* of a translation: a server-side errno reaching this admin
+    surface has to come back out with its own name. Rewriting it here -- the
+    tempting move, "make the caller see what the sandbox will see" -- would
+    give §5.2's client-visible shape a second source of truth that exists on
+    one deployment form only, and would hide which side of the NFS boundary
+    the errno was raised on.
+    """
+    server_text = "xfs_quota 'limit -p bhard=2048M 7' failed: EDQUOT"
+
+    def fake_provision(**kwargs):
+        raise ProjectQuotaError(server_text)
+
+    monkeypatch.setattr(xfs_quota, "provision_project", fake_provision)
+    app = create_app(settings=Settings(token=KEY))
+    async with _client(app) as client:
+        response = await client.post(
+            "/project_create",
+            headers={"X-Internal-Key": KEY},
+            json={
+                "projid": 7,
+                "path": "/srv/sandboxes/sbx_1",
+                "limit_mb": 2048,
+                "mount": "/srv/sandboxes",
+            },
+        )
+    assert response.status_code == 500
+    assert response.json() == {"error": server_text}

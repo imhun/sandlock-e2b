@@ -24,6 +24,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from envd_service import xfs_quota
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
@@ -211,3 +212,56 @@ async def test_reconcile_removes_record_lost_project_but_keeps_dir(xfs_app):
     # Files are disowned from the orphan project but never deleted.
     assert (XFS_MOUNT / sandbox_id).is_dir()
     await _delete_sandbox(xfs_app, sandbox_id)
+
+
+def test_the_quota_row_is_a_position_boundary_not_a_write_budget(monkeypatch):
+    """N30: the row is a ceiling on what the tree *holds*, and it is handed back.
+
+    Provisioning gives XFS ``bhard=<disk_mb>M`` -- a boundary on the tree's
+    *current* size (存量口径), not an allowance of bytes to write -- and the
+    delete path's two calls reset the state and then ``bsoft``/``bhard``, so
+    the accounting is **returned** rather than kept as a high-water mark. That
+    second half is the whole difference from the rejected peak reading (which
+    would hold a spent budget: write once to the limit and the tree is
+    permanently read-only). Both halves are the commands below, verbatim, and
+    the pair on the delete side is the one ``envd_service/agent.py``'s teardown
+    makes (``release_project`` before the tree goes, ``clear_project_limits``
+    after it -- N12). Unlike the rest of this file the case needs no XFS: it
+    fakes the two module seams
+    (``_local_run_xfs_quota`` / ``_use_quotactl``) the way
+    ``tests/contract/test_teardown_failure_semantics.py::_reconcile_rows``
+    does, so it is the one row here that runs on the APFS dev host too.
+    """
+    commands: list[str] = []
+    monkeypatch.setattr(xfs_quota, "_use_quotactl", lambda _mount: False)
+    monkeypatch.setattr(
+        xfs_quota,
+        "_local_run_xfs_quota",
+        lambda _mount, command: commands.append(command) or "",
+    )
+
+    projid = xfs_quota.provision_project(
+        sandbox_id="sbx_n30",
+        project_dir="/srv/sandboxes/sbx_n30",
+        mount_point="/srv/sandboxes",
+        disk_mb=64,
+        project_id=1004,
+    )
+    assert projid == 1004
+    assert commands == [
+        "project -s -p /srv/sandboxes/sbx_n30 1004",
+        "limit -p bhard=64M 1004",
+    ]
+
+    xfs_quota.release_project(
+        project_dir="/srv/sandboxes/sbx_n30",
+        mount_point="/srv/sandboxes",
+        projid=1004,
+    )
+    xfs_quota.clear_project_limits(mount_point="/srv/sandboxes", projid=1004)
+    assert commands == [
+        "project -s -p /srv/sandboxes/sbx_n30 1004",
+        "limit -p bhard=64M 1004",
+        "project -C -p /srv/sandboxes/sbx_n30 1004",
+        "limit -p bsoft=0 bhard=0 1004",
+    ]
