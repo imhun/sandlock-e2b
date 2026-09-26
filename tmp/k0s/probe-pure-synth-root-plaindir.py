@@ -110,6 +110,15 @@ def part_b2() -> int:
                  "etc", "tmp", "root", "run", "var", "srv", "media", "mnt",
                  "home", "home/user", "workspace"):
         os.makedirs(os.path.join(root, name), mode=0o755, exist_ok=True)
+    #: 隔离断言只有在"这个路径 pivot 之前真的存在"时才有信息量。默认的 `/src` 在本 lane
+    #: （仓库挂在 `/workspace`）并不存在，那样 `host-only ...: hidden` 是一条**假绿**：
+    #: pivot 之前就看不见，pivot 之后当然也看不见。先记事实，再决定能不能判。
+    host_only_pre_pivot = os.path.exists(HOST_ONLY)
+    note(f"host-only {HOST_ONLY} exists pre-pivot: {host_only_pre_pivot}")
+    if not host_only_pre_pivot:
+        note("verdict: VACUOUS (HOST_ONLY does not exist before the pivot, so `hidden` below "
+             "would be free -- pass -e HOST_ONLY=<a path that exists in this container>)")
+        return 2
     if not enter_ns():
         return 1
     bound = 0
@@ -184,6 +193,25 @@ def part_proc() -> int:
     return 0
 
 
+def write_dev_null() -> bool:
+    """纯 Python 探 `/dev/null`：不经 exec，所以不会被"解释器不在骨架里"污染。"""
+    try:
+        with open("/dev/null", "w") as fh:
+            fh.write("x")
+    except OSError:
+        return False
+    return True
+
+
+def read_one_urandom() -> bool:
+    """同上：`/dev/urandom` 能不能读出一个字节，与动态解释器无关。"""
+    try:
+        with open("/dev/urandom", "rb") as fh:
+            return len(fh.read(1)) == 1
+    except OSError:
+        return False
+
+
 def part_dev() -> int:
     """三条 /dev 候选各自装配，跑同一组命令，产出可比较的一行。"""
     variant = os.environ.get("DEV_VARIANT", "host-tree")
@@ -219,8 +247,14 @@ def part_dev() -> int:
     note(f"ls /dev: {present[:12]}")
     note(f"/dev/shm exists: {os.path.exists('/dev/shm')}")
     note(f"/dev/fd exists: {os.path.exists('/dev/fd')}")
-    note(f"echo >/dev/null: {os.system('echo x > /dev/null') == 0}")
-    note(f"head -c1 /dev/urandom: {os.system('head -c1 /dev/urandom > /dev/null') == 0}")
+    #: 这两行以前是 `os.system('echo x > /dev/null')` / `head -c1 /dev/urandom`，量到的却是
+    #: exec 自己：`/bin/sh -> dash` 是动态链接，PT_INTERP 是绝对路径
+    #: `/lib64/ld-linux-x86-64.so.2`，而本 part 的骨架（上面的目录清单）没有 `lib64`，
+    #: 于是两个 `False` 与 `/dev` 毫无关系，看起来却像"/dev/null 不可用"。
+    #: 现在：先记骨架里到底有没有 /lib64（正向证据），再用不经 exec 的纯 Python 探。
+    note(f"skeleton has /lib64: {os.path.exists('/lib64')}")
+    note(f"open('/dev/null','w') writes: {write_dev_null()}")
+    note(f"open('/dev/urandom','rb').read(1): {read_one_urandom()}")
     return 0
 
 

@@ -1,0 +1,3 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part b2] host-only /src exists pre-pivot: False
+[part b2] verdict: VACUOUS (HOST_ONLY does not exist before the pivot, so `hidden` below would be free -- pass -e HOST_ONLY=<a path that exists in this container>)
