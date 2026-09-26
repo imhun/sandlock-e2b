@@ -18,9 +18,16 @@ class TTLSweeper:
         *,
         interval_seconds: float = 1.0,
         on_expired: Callable[[object], None] | None = None,
+        claim: Callable[[], bool] | None = None,
     ) -> None:
         self._interval = interval_seconds
         self._on_expired = on_expired
+        #: F11 step 4: a round is single-flight across replicas. ``remove_expired``
+        #: is driven by wall-clock deadlines on *shared* records, so two replicas
+        #: sweeping the same window expire the same sandboxes -- duplicated work,
+        #: duplicated teardown calls and a duplicated ``TTL expired`` line. The
+        #: claim is a TTL'd key; ``None`` means "one process, no need to ask".
+        self._claim = claim
         self._task: asyncio.Task | None = None
 
     def start(self, registry) -> None:
@@ -31,6 +38,9 @@ class TTLSweeper:
     async def _loop(self, registry) -> None:
         while True:
             try:
+                if self._claim is not None and not self._claim():
+                    await asyncio.sleep(self._interval)
+                    continue
                 expired = registry.remove_expired()
                 for record in expired:
                     logger.info("TTL expired sandbox %s", record.sandbox_id)

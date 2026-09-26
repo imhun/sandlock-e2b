@@ -33,6 +33,11 @@ from control_plane.registry.snapshots import SnapshotRegistry
 from control_plane.registry.templates import TemplateRegistry
 from control_plane.ratelimit import SlidingWindowRateLimiter
 from control_plane.registry.ttl import TTLSweeper
+from control_plane.registry.redis_backend import try_claim
+
+#: The TTL sweeper's cadence, and therefore the width of its single-flight
+#: claim (F11 step 4): one replica per interval, no lock to release.
+_TTL_SWEEP_INTERVAL_S = 1.0
 from control_plane.registry.volumes import VolumeRegistry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only (envd may be absent)
@@ -282,7 +287,16 @@ def create_app(
                         record.sandbox_id,
                     )
 
-        sweeper = TTLSweeper(on_expired=_on_sandbox_removed)
+        sweeper = TTLSweeper(
+            on_expired=_on_sandbox_removed,
+            interval_seconds=_TTL_SWEEP_INTERVAL_S,
+            # F11 step 4: one replica per round. The deadlines live on shared
+            # records, so every replica would otherwise expire the same
+            # sandboxes (and call every teardown twice).
+            claim=lambda: try_claim(
+                redis_client, "e2b:ttl:sweep", ttl_s=int(_TTL_SWEEP_INTERVAL_S)
+            ),
+        )
         app.state.sweeper = sweeper
         sweeper.start(registry)
 
@@ -395,37 +409,42 @@ def create_app(
     app.state.templates = templates_registry or TemplateRegistry(
         (workspace_base or settings.workspace_base) / "_templates"
     )
-    app.state.create_limiter = SlidingWindowRateLimiter(
-        settings.create_rate_limit_per_min
-    )
+    # F11 step 4: every limiter below is named and shares its window through
+    # the deployment's Redis when there is one. Without a name they would share
+    # a key namespace and two limits would spend each other's budget; without
+    # Redis they keep the per-process window they always had.
+    def _limiter(name: str, limit: int) -> SlidingWindowRateLimiter:
+        return SlidingWindowRateLimiter(
+            limit, name=name, redis_client=redis_client
+        )
+
+    app.state.create_limiter = _limiter("create", settings.create_rate_limit_per_min)
     # E3.5: template build admission. The slot counter bounds concurrent
     # buildkit builds (the actual CPU/disk consumer); the per-key limiter
     # additionally throttles serial build bombardment. Both are per-process
     # (same shape as the create limiter; single control-plane deployment).
     app.state.template_build_slots = 0
     app.state.template_build_slots_lock = threading.Lock()
-    app.state.template_build_limiter = SlidingWindowRateLimiter(
-        settings.template_build_rate_limit_per_min
+    app.state.template_build_limiter = _limiter(
+        "template-build", settings.template_build_rate_limit_per_min
     )
-    app.state.tenant_create_limiter = SlidingWindowRateLimiter(
-        settings.create_rate_limit_per_min
+    app.state.tenant_create_limiter = _limiter(
+        "tenant-create", settings.create_rate_limit_per_min
     )
     # Same admission shape for the other resource-creating endpoints. Per
     # endpoint, so a snapshot burst cannot spend the sandbox-create budget.
-    app.state.snapshot_limiter = SlidingWindowRateLimiter(
-        settings.snapshot_rate_limit_per_min
+    app.state.snapshot_limiter = _limiter(
+        "snapshot", settings.snapshot_rate_limit_per_min
     )
-    app.state.volume_limiter = SlidingWindowRateLimiter(
-        settings.volume_rate_limit_per_min
+    app.state.volume_limiter = _limiter("volume", settings.volume_rate_limit_per_min)
+    app.state.tenant_snapshot_limiter = _limiter(
+        "tenant-snapshot", settings.snapshot_rate_limit_per_min
     )
-    app.state.tenant_snapshot_limiter = SlidingWindowRateLimiter(
-        settings.snapshot_rate_limit_per_min
-    )
-    app.state.tenant_volume_limiter = SlidingWindowRateLimiter(
-        settings.volume_rate_limit_per_min
+    app.state.tenant_volume_limiter = _limiter(
+        "tenant-volume", settings.volume_rate_limit_per_min
     )
     app.state.tenant_limiters = {
-        tenant_id: SlidingWindowRateLimiter(limit)
+        tenant_id: _limiter(f"tenant:{tenant_id}", limit)
         for tenant_id, limit in settings.tenant_rate_limits.items()
     }
     if settings.enable_local_node and app.state.nodes.get("local") is None:

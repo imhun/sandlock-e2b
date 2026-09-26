@@ -115,7 +115,26 @@ sweeper。
 `test_registry_dirty_snapshot.py`、`test_node_partition_reconcile.py`、`tests/contract/test_snapshots.py`
 全绿；本机 `tests/unit` 仍是 16 条既有 macOS 红 / 1164 passed，`tests/contract` 321 passed。
 
-**第 4 步仍未做**（明确保持"多副本语义变差但不破坏正确性"的排序）：`CreateQueue` 的跨副本
-唤醒、7 个限流器换共享计数、`template_build_slots` 换 Redis 槽位、`TTLSweeper` 单飞。
-四者的共同形态与第 2 步相同（TTL'd claim 或共享计数器），`RedisNodeStore`/`try_acquire_sweep`
-是现成的模板。
+**第 4 步（2026-09-26，同日）**：三件做了，一件判定为"不影响正确性、只影响延迟"：
+
+* **`TTLSweeper` 单飞**：`try_claim`（`SETNX + EX`，TTL = 扫描间隔）—— 过期判定基于**共享记录**上的
+  墙钟点，两个副本扫同一轮会过期同一批沙箱、各调一次 teardown、各打一行 `TTL expired`。
+* **7 个限流器换共享窗口**：`SlidingWindowRateLimiter` 多了一个 `name`（键前缀：create /
+  template-build / snapshot / volume / tenant-*）与可选的 Redis 客户端；有 Redis 时窗口是
+  **一个 ZSET**（score=时刻，`ZREMRANGEBYSCORE` 修剪，`ZCARD` 计数），check 与 insert 走
+  `WATCH/MULTI` —— 与 `RedisQuotaStore.reserve` 同一形状。没有 Redis 时保持原来的进程内窗口。
+  **为什么必须共享**：两个副本各自执行"每分钟 60 次"，实际上限就是 120 次。
+  注意 score 用**墙钟**（`time.time()`）：score 必须在每个副本里含义一致，代价是副本间时钟偏差
+  进入限额的精度 —— 换来的是"限额在舰队范围内只有一个含义"。
+* **`template_build_slots` 换 Redis 计数器**：`INCR`；超过 `template_build_concurrency` 就
+  `DECR` + 429；释放 `DECR`（带 `released` 幂等标志，`finally` 可能重入）。键带 24 h TTL：
+  构建本身有超时，所以一个崩掉的副本泄漏的槽位有界。
+* **`CreateQueue` 的跨副本唤醒：不做（有意）**。它已有**有界 tick 兜底**（默认 0.25 s 一跳），
+  所以"副本 A 释放的容量唤醒副本 B 的等待者"只影响**延迟**，不影响正确性（准入是同一个原子
+  探测）。把它做成 Redis 通知等于把 tick 换成另一个 tick，收益与复杂度不成比例；若将来有人
+  实测到队列延迟不可接受，`try_claim`/`RedisNodeStore` 是现成模板。
+
+**第 4 步的验收**：`tests/unit/test_redis_multireplica.py` 再添 4 条（共享限额、两个限额不吃
+对方预算、无 Redis 走本地窗口、TTL 扫描单飞）；加上 `test_create_queue.py`、`test_ratelimit.py`、
+`test_ttl.py`、模板构建的单测与契约，容器内 **80 passed**；本机 `tests/unit` 仍是
+16 条既有 macOS 红 / 1164 passed，`tests/contract` 321 passed / 53 skipped。

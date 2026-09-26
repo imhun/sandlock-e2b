@@ -311,10 +311,53 @@ async def _run_build_with_slot(
 
 
 def _acquire_build_slot(request: Request) -> Any:
-    """Reserve one build concurrency slot; raises 429 when full."""
+    """Reserve one build concurrency slot; raises 429 when full.
+
+    F11 step 4: with a shared store the counter is shared too -- otherwise a
+    "two concurrent builds" ceiling quietly becomes two *per replica*, and each
+    of them is a buildkit build on the same fleet. INCR/DECR is the whole
+    protocol: INCR, and back out when the result is over the limit. (A replica
+    that dies mid-build leaks its slot until the key's TTL; template builds are
+    bounded by their own timeouts, and the leak is bounded with them.)
+    """
     limit = request.app.state.settings.template_build_concurrency
     if limit <= 0:
         return lambda: None
+    redis_client = getattr(request.app.state, "redis_client", None)
+    if redis_client is not None:
+        key = "e2b:templates:build-slots"
+        try:
+            used = int(redis_client.incr(key))
+            if used > limit:
+                redis_client.decr(key)
+                raise OfficialError(
+                    429, "Template build concurrency limit exceeded"
+                )
+            # Refreshed per build: the key must outlive the longest build, not
+            # expire under a running one.
+            redis_client.expire(key, 86400)
+        except OfficialError:
+            raise
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "shared template-build slots unavailable; using the local counter",
+                exc_info=True,
+            )
+        else:
+            released = False
+
+            def release_shared() -> None:
+                nonlocal released
+                if released:  # idempotent: the endpoint's `finally` may repeat
+                    return
+                released = True
+                try:
+                    if int(redis_client.decr(key)) < 0:
+                        redis_client.set(key, 0)
+                except Exception:  # pragma: no cover - defensive
+                    logger.warning("template-build slot release failed", exc_info=True)
+
+            return release_shared
     lock = request.app.state.template_build_slots_lock
     with lock:
         if request.app.state.template_build_slots >= limit:

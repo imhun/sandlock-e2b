@@ -383,3 +383,60 @@ def test_a_creating_record_is_re_read_so_a_poll_sees_the_other_replicas_flip(tmp
 
     reg_a.mark_completed("snap_poll")
     assert reg_b.get("snap_poll").status == "completed"
+
+
+# --------------------------------------------------------------- F11 step 4
+
+
+def test_a_rate_limit_is_one_budget_across_replicas():
+    """Two replicas must not each spend the *configured* limit."""
+    from control_plane.ratelimit import SlidingWindowRateLimiter
+
+    server = fakeredis.FakeServer()
+    client_a = fakeredis.FakeRedis(server=server)
+    client_b = fakeredis.FakeRedis(server=server)
+    limiter_a = SlidingWindowRateLimiter(3, name="create", redis_client=client_a)
+    limiter_b = SlidingWindowRateLimiter(3, name="create", redis_client=client_b)
+
+    assert [limiter_a.allow("k") for _ in range(3)] == [True, True, True]
+    assert limiter_b.allow("k") is False, "the budget is fleet-wide, not per replica"
+    assert limiter_b.allow("other") is True, "another key has its own budget"
+    assert limiter_a.remaining("k") == 0
+    assert limiter_b.remaining("other") == 2
+
+
+def test_two_limits_do_not_spend_each_others_budget():
+    """The limiter's *name* is part of the key (snapshot vs volume, ...)."""
+    from control_plane.ratelimit import SlidingWindowRateLimiter
+
+    server = fakeredis.FakeServer()
+    client = fakeredis.FakeRedis(server=server)
+    snapshots = SlidingWindowRateLimiter(1, name="snapshot", redis_client=client)
+    volumes = SlidingWindowRateLimiter(1, name="volume", redis_client=client)
+
+    assert snapshots.allow("k") is True
+    assert snapshots.allow("k") is False
+    assert volumes.allow("k") is True
+
+
+def test_without_redis_the_window_stays_local():
+    from control_plane.ratelimit import SlidingWindowRateLimiter
+
+    limiter = SlidingWindowRateLimiter(1, name="create")
+    assert limiter.allow("k") is True
+    assert limiter.allow("k") is False
+
+
+def test_the_ttl_sweep_claim_is_single_flight():
+    """F11 step 4: one replica expires sandboxes per round (shared deadlines)."""
+    from control_plane.registry.redis_backend import try_claim
+
+    server = fakeredis.FakeServer()
+    client_a = fakeredis.FakeRedis(server=server)
+    client_b = fakeredis.FakeRedis(server=server)
+
+    assert try_claim(client_a, "e2b:ttl:sweep", ttl_s=1) is True
+    assert try_claim(client_b, "e2b:ttl:sweep", ttl_s=1) is False
+    time.sleep(1.1)
+    assert try_claim(client_b, "e2b:ttl:sweep", ttl_s=1) is True
+    assert try_claim(None, "e2b:ttl:sweep", ttl_s=1) is True, "no store = one process"

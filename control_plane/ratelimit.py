@@ -1,29 +1,103 @@
-"""In-process sliding-window rate limiter for control-plane endpoints.
+"""Sliding-window rate limiter for control-plane endpoints.
 
-Single-process accounting (per API key). ``limit == 0`` disables the limiter.
-Multi-replica deployments that need strict global limits should move this to
-the shared Redis ledger; for the single control-plane deployment shape this
-is sufficient to stop per-key create amplification.
+``limit == 0`` disables the limiter. The window is kept per process by default,
+and in the shared Redis ledger when the deployment has one (F11 step 4): with
+two replicas an in-process limiter enforces the configured limit *per replica*,
+which is how a "60 creates a minute" ceiling quietly becomes 120. The Redis
+window is the same algorithm over a ZSET, so the limit means one thing fleet-wide.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
+import uuid
 from collections import deque
+
+try:  # pragma: no cover - the import is what decides the local fallback
+    import redis
+except ImportError:  # pragma: no cover
+    redis = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 class SlidingWindowRateLimiter:
-    def __init__(self, limit: int, window_s: float = 60.0) -> None:
+    def __init__(
+        self,
+        limit: int,
+        window_s: float = 60.0,
+        *,
+        name: str | None = None,
+        redis_client=None,
+        namespace: str = "e2b",
+    ) -> None:
         self._limit = limit
         self._window = window_s
         self._hits: dict[str, deque[float]] = {}
         self._lock = threading.Lock()
+        self._name = name or "default"
+        self._redis = redis_client
+        self._ns = namespace
+
+    def _key(self, key: str) -> str:
+        return f"{self._ns}:ratelimit:{self._name}:{key}"
+
+    def _allow_shared(self, key: str) -> bool | None:
+        """The shared window, or ``None`` when the store cannot answer.
+
+        A ZSET per key: the score is the moment of the hit, members older than
+        the window are trimmed, and the count is how many are left. Check and
+        insert have to be one step -- otherwise two replicas can both find one
+        slot free and both take it -- so this is WATCH/MULTI, the same shape
+        ``RedisQuotaStore.reserve`` already uses for node quota.
+
+        Scores are wall-clock seconds, not ``time.monotonic``: the score has to
+        mean the same thing in every replica, which puts inter-replica clock
+        skew into the accuracy of the limit. That is the trade for a window
+        every replica agrees on.
+        """
+        if self._redis is None:
+            return None
+        redis_key = self._key(key)
+        member = f"{time.time():.6f}:{uuid.uuid4().hex}"
+        now = time.time()
+        try:
+            with self._redis.pipeline() as pipe:
+                while True:
+                    try:
+                        pipe.watch(redis_key)
+                        pipe.zremrangebyscore(redis_key, 0, now - self._window)
+                        used = pipe.zcard(redis_key)
+                        if used >= self._limit:
+                            pipe.unwatch()
+                            return False
+                        pipe.multi()
+                        pipe.zadd(redis_key, {member: now})
+                        pipe.expire(redis_key, int(self._window) + 1)
+                        pipe.execute()
+                        return True
+                    except (redis.WatchError, redis.exceptions.WatchError):  # type: ignore[union-attr]
+                        continue
+        except Exception:  # pragma: no cover - defensive
+            # The store is down: answer with the local window rather than
+            # failing the request. The limit is protection, not a contract the
+            # caller negotiated, and the local window is strictly stricter
+            # than nothing.
+            logger.warning("shared rate-limit window failed; using the local one", exc_info=True)
+            return None
 
     def allow(self, key: str) -> bool:
         """Record one hit for ``key``; True when within the budget."""
         if self._limit <= 0:
             return True
+        shared = self._allow_shared(key)
+        if shared is not None:
+            return shared
+        return self._allow_local(key)
+
+    def _allow_local(self, key: str) -> bool:
         now = time.monotonic()
         with self._lock:
             dq = self._hits.setdefault(key, deque())
@@ -37,6 +111,13 @@ class SlidingWindowRateLimiter:
     def remaining(self, key: str) -> int:
         if self._limit <= 0:
             return -1
+        if self._redis is not None:
+            try:
+                redis_key = self._key(key)
+                self._redis.zremrangebyscore(redis_key, 0, time.time() - self._window)
+                return max(0, self._limit - int(self._redis.zcard(redis_key)))
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("shared rate-limit read failed", exc_info=True)
         now = time.monotonic()
         with self._lock:
             dq = self._hits.get(key)

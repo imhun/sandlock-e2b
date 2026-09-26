@@ -266,3 +266,25 @@ def create_redis_client(url: str | None):
     if not url or redis is None:
         return None
     return redis.from_url(url, decode_responses=False)
+
+
+def try_claim(client: Any, key: str, *, ttl_s: int) -> bool:
+    """One fleet-wide claim: True when this process owns ``key`` for ``ttl_s``.
+
+    The shape every periodic job needs once the control plane can run as more
+    than one replica (F11 steps 2 and 4): a TTL'd key is the whole protocol --
+    whoever sets it wins the round, a winner that dies mid-round costs the
+    fleet exactly one round, and there is no lock to release. Without a client
+    there is one process, which is the winner by definition.
+
+    Failure to reach the store errs on the side of *doing the work*: a round
+    that runs twice is duplicated effort, while a round that never runs is a
+    resource that never comes back.
+    """
+    if client is None:
+        return True
+    try:
+        return bool(client.set(key, "1", nx=True, ex=max(1, int(ttl_s))))
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("claim %s failed; doing the work anyway", key, exc_info=True)
+        return True
