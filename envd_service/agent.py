@@ -32,8 +32,10 @@ from envd_service.runtime.image_resolver import (
 from envd_service.runtime.checkpoint_store import (
     capture_checkpoint_image,
     checkpoint_status,
+    list_checkpoint_stores,
     record_restore_outcome,
     remove_checkpoint_images,
+    remove_orphan_checkpoint_stores,
     restore_checkpoint_image,
     resume_sandbox,
 )
@@ -1981,12 +1983,15 @@ class NodeAgent:
         in the summary -- ``disk_sweep_skipped`` and ``untrusted_records`` in
         particular -- were observable as WARNING text alone. Per-tree detail
         stays at WARNING; this is the positive, greppable record of a round
-        that ran and what it decided.
+        that ran and what it decided. The checkpoint images are in it for the
+        same reason (E4): what a round reclaimed from the platform's own account
+        is the number an operator watching a full account is looking for.
         """
         logger.info(
             "reconcile summary: deleted=%d delete_failures=%d unmaterialised=%d "
             "protected_elsewhere=%d concurrent_creates=%d quota_cleaned=%d "
-            "quota_unreclaimed=%d disk_sweep_skipped=[%s] untrusted_records=[%s]",
+            "quota_unreclaimed=%d disk_sweep_skipped=[%s] untrusted_records=[%s] "
+            "checkpoints_reclaimed=[%s] checkpoints_sweep_skipped=[%s]",
             len(summary["deleted"]),
             len(summary["delete_failures"]),
             len(summary["unmaterialised"]),
@@ -1996,6 +2001,8 @@ class NodeAgent:
             len(summary["quota_unreclaimed"]),
             ",".join(summary["disk_sweep_skipped"]),
             ",".join(summary["untrusted_records"]),
+            ",".join(summary["checkpointsReclaimed"]),
+            ",".join(summary["checkpointsSweepSkipped"]),
         )
 
     def _reconcile_due(self) -> bool:
@@ -2066,6 +2073,12 @@ class NodeAgent:
           left the trees, the ``sandbox.json`` files and their XFS quota rows
           behind forever — the fail-safe quota reconcile only ever reclaims
           rows whose tree is gone;
+        * the checkpoint images are collected by the same round under the same
+          fence (E4). Their store (``_runtime/.checkpoints/<id>``) is the one
+          namespace no other scan walks — both scans above enumerate trees — so
+          an image whose record is gone was invisible to every collector while
+          being the largest thing the platform holds for a sandbox and the very
+          thing its account refuses the next capture on;
         * the remaining local ids are reported back together with the
           snapshot ids, so the control plane un-orphans the records it
           still has, removes records for sandboxes we no longer run (only
@@ -2142,10 +2155,28 @@ class NodeAgent:
         } - concurrent_creates
         disk_candidates = set(scanned) - known - concurrent_creates
         candidates = orphaned | disk_candidates
+        # The checkpoint images have a namespace of their own and, until now, no
+        # candidate set of their own either: both scans above enumerate *trees*,
+        # and a store is a sibling of the per-sandbox runtime dir rather than a
+        # child of any tree. So an image whose record is gone -- the record was
+        # deleted, or the capture finished and the record vanished right after --
+        # stayed on the platform's account forever, until the account was full
+        # and refused the next capture. It is the largest thing the platform
+        # holds for a sandbox, and it is billed to the platform, so the same
+        # round collects it (see ``remove_orphan_checkpoint_stores``).
+        images_on_disk = await asyncio.to_thread(
+            list_checkpoint_stores,
+            _registry_workspace_base(self._runtime_registry, self._settings),
+            state_base=_registry_state_base(self._runtime_registry, self._settings),
+        )
         deletable = orphaned
         protected_elsewhere: list[str] = []
         disk_sweep_skipped: list[str] = []
-        if candidates:
+        checkpoints_sweep_skipped: list[str] = []
+        checkpoints_reclaimed: list[str] = []
+        image_owners: set[str] = set()
+        fleet_owned: set[str] | None = None
+        if candidates or images_on_disk:
             fleet_owned = await self._fleet_sandbox_ids(client, headers)
             if fleet_owned is None:
                 # Fleet-wide ownership cannot be established: fall back to
@@ -2155,16 +2186,38 @@ class NodeAgent:
                 # capped backoff (M1) so this state can never be permanent
                 # and silent.
                 disk_sweep_skipped = sorted(disk_candidates)
-                logger.warning(
-                    "reconcile: leaving %d orphan tree(s) on disk alone this "
-                    "round (fleet record enumeration unavailable): %s",
-                    len(disk_candidates),
-                    ",".join(sorted(disk_candidates)),
-                )
+                checkpoints_sweep_skipped = sorted(images_on_disk)
+                if candidates:
+                    logger.warning(
+                        "reconcile: leaving %d orphan tree(s) on disk alone this "
+                        "round (fleet record enumeration unavailable): %s",
+                        len(disk_candidates),
+                        ",".join(sorted(disk_candidates)),
+                    )
+                if images_on_disk:
+                    # Same fence, higher stake: an image this round cannot
+                    # attribute may belong to a live sandbox on a node that has
+                    # not re-registered yet, and deleting it destroys a user's
+                    # state rather than leaving a tree behind.
+                    logger.warning(
+                        "reconcile: leaving %d checkpoint image(s) alone this "
+                        "round (fleet record enumeration unavailable): %s",
+                        len(images_on_disk),
+                        ",".join(sorted(images_on_disk)),
+                    )
                 self._defer_sweep()
             else:
                 deletable = candidates - fleet_owned
                 protected_elsewhere = sorted(candidates & fleet_owned)
+                # Who may claim an image: every control-plane record in the
+                # fleet (the store is on the shared volume, so this worker sees
+                # other nodes' images and only a fleet-wide answer separates
+                # those from orphans), plus every sandbox this worker still
+                # holds a record for -- in memory, or as a tree on its disk. "No
+                # record" has to mean nowhere before an image may go.
+                image_owners = (
+                    set(known) | set(local) | concurrent_creates | fleet_owned
+                )
         deleted: list[str] = []
         delete_failures: list[str] = []
         untrusted_records: list[str] = []
@@ -2271,6 +2324,18 @@ class NodeAgent:
                 len(protected_elsewhere),
                 ",".join(protected_elsewhere),
             )
+        if images_on_disk and fleet_owned is not None:
+            # After the teardowns, not before: an id this round just deleted
+            # still counts as an owner (it is in ``local``), so its image is
+            # the teardown's to remove -- one action, one owner -- and a
+            # teardown that *failed* leaves the image for the next round
+            # instead of having the sweep delete it behind the failure.
+            checkpoints_reclaimed = await asyncio.to_thread(
+                remove_orphan_checkpoint_stores,
+                _registry_workspace_base(self._runtime_registry, self._settings),
+                keep=image_owners,
+                state_base=_registry_state_base(self._runtime_registry, self._settings),
+            )
         remaining = (set(local) & known) | concurrent_creates
         quota_cleaned: list[int] = []
         quota_unreclaimed: list[int] = []
@@ -2320,9 +2385,12 @@ class NodeAgent:
             quota_cleaned, quota_unreclaimed = await self._reclaim_quota_rows(
                 reclaimable_projids
             )
-        if not disk_sweep_skipped:
+        if not disk_sweep_skipped and not checkpoints_sweep_skipped:
             # A round that reached the fleet's full record set clears the
             # deferred-sweep backoff; a deferred one keeps its schedule.
+            # ``checkpoints_sweep_skipped`` counts here because the images are
+            # deferred by the *same* fence and the retry it schedules would
+            # otherwise be cleared in the same round that armed it.
             self._sweep_completed()
         summary = {
             "deleted": sorted(deleted),
@@ -2334,6 +2402,8 @@ class NodeAgent:
             "concurrent_creates": sorted(concurrent_creates),
             "quota_cleaned": quota_cleaned,
             "quota_unreclaimed": quota_unreclaimed,
+            "checkpointsReclaimed": sorted(checkpoints_reclaimed),
+            "checkpointsSweepSkipped": checkpoints_sweep_skipped,
         }
         return summary
 

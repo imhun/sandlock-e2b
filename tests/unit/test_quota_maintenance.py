@@ -18,6 +18,7 @@ import envd_service.xfs_quota as xfs_quota
 from envd_service import xfs_quotactl
 from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings as ControlSettings
+from control_plane.registry.manager import SandboxRegistry
 from control_plane.registry.nodes import NodeRegistry
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
@@ -1601,3 +1602,154 @@ def test_create_app_nonroot_via_agent_no_disclosure(tmp_path, monkeypatch, caplo
         runtime_registry=RuntimeRegistry(tmp_path),
     )
     assert [r for r in caplog.records if "磁盘配额不可用" in r.message] == []
+
+
+# ------------------------------------------------- orphan checkpoint images
+
+
+
+def _register_node(nodes: NodeRegistry, node_id: str, port: int) -> None:
+    nodes.register(
+        node_id=node_id,
+        address=f"http://127.0.0.1:{port}",
+        total_memory_mb=8192,
+        total_cpu_percent=800,
+        total_disk_mb=16384,
+        total_processes=512,
+        images=["python:3.11-slim"],
+    )
+
+
+async def _run_reconcile_round(
+    base: Path,
+    *,
+    records: dict[str, str] | None = None,
+    nodes: tuple[str, ...] = ("node_a",),
+) -> tuple[dict, agent.NodeAgent]:
+    """One reconcile round of a worker on ``base``, plus that worker.
+
+    ``records`` maps a sandbox id to the node its control-plane record names;
+    ``nodes`` is who has re-registered. A record whose node is missing from
+    ``nodes`` is exactly the shape the round's fleet enumeration refuses to
+    trust (M1), which is what fences both of its sweeps -- so a case can say
+    "another node owns this" or "the fleet cannot be enumerated" and mean it,
+    without patching anything.
+    """
+    node_registry = NodeRegistry()
+    registry = SandboxRegistry(ControlSettings(api_keys=("local-key",)))
+    for index, node_id in enumerate(nodes):
+        _register_node(node_registry, node_id, 49990 + index)
+    for sandbox_id, node_id in (records or {}).items():
+        record = registry.create(
+            template_id="base",
+            sandbox_id=sandbox_id,
+            timeout=300,
+            metadata={},
+            env_vars={},
+            secure=True,
+            allow_internet_access=False,
+            base_image=None,
+        )
+        record.node_id = node_id
+        registry.save(record)
+    control = create_control_app(
+        settings=ControlSettings(api_keys=("local-key",)),
+        registry=registry,
+        nodes_registry=node_registry,
+        workspace_base=base,
+    )
+    worker = agent.NodeAgent(
+        settings=EnvdSettings(executor="local", workspace_base=base),
+        runtime_registry=RuntimeRegistry(base),
+        control_plane_url="http://control",
+        node_address="http://127.0.0.1:1",
+    )
+    worker._node_id = "node_a"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control), base_url="http://control"
+    ) as client:
+        summary = await worker._reconcile_with_control_plane(
+            client, {"X-Internal-Key": "internal-key"}
+        )
+    return summary, worker
+
+
+def _leftover_image(base: Path, sandbox_id: str) -> Path:
+    """The image a paused sandbox left behind, without any record of it."""
+    image = sandbox_checkpoint_dir(base, sandbox_id) / "latest"
+    image.mkdir(parents=True)
+    (image / "meta.json").write_bytes(b"x")
+    return image
+
+
+async def test_reconcile_collects_an_image_whose_owner_is_gone(tmp_path) -> None:
+    """图是平台持有最大的东西：没有记录的孤儿图必须被同一个 reconcile 收走。
+
+    ``.checkpoints/*`` 从前没有自己的候选集（它只来自内存注册表与顶层沙箱树），
+    于是"记录没了、图还在"会一直占着平台账 —— 账满了就拒新捕获。这一条同时钉住
+    判据的另一半：树还在（``unmaterialised``，平台不删它）而图照样走，因为**没有
+    任何记录**认领这张图；认领者只有控制面的记录与本地的运行时记录。
+    """
+    base = tmp_path / "sandboxes"
+    (base / "sbx_gone" / "workspace").mkdir(parents=True)
+    image = _leftover_image(base, "sbx_gone")
+
+    summary, _worker = await _run_reconcile_round(base, records={})
+
+    assert summary == {
+        "deleted": [],
+        "delete_failures": [],
+        "unmaterialised": ["sbx_gone"],
+        "protected_elsewhere": [],
+        "disk_sweep_skipped": [],
+        "untrusted_records": [],
+        "concurrent_creates": [],
+        "quota_cleaned": [],
+        "quota_unreclaimed": [],
+        "checkpointsReclaimed": ["sbx_gone"],
+        "checkpointsSweepSkipped": [],
+    }
+    assert not image.parent.exists()
+
+
+async def test_reconcile_keeps_an_image_another_nodes_record_still_owns(
+    tmp_path,
+) -> None:
+    """双判据：控制面还认识它 ⇒ 一个字都不动。
+
+    store 在共享卷上，本节点看得见别的节点的图，而"别的节点的沙箱"在本节点上
+    既没有内存记录也没有树。少了全舰队这层判据，一个 worker 就会把另一个 worker
+    的图当孤儿删掉 —— 那是一个用户的状态。
+    """
+    base = tmp_path / "sandboxes"
+    image = _leftover_image(base, "sbx_elsewhere")
+
+    summary, _worker = await _run_reconcile_round(
+        base, records={"sbx_elsewhere": "node_b"}, nodes=("node_a", "node_b")
+    )
+
+    assert summary["checkpointsReclaimed"] == []
+    assert summary["checkpointsSweepSkipped"] == []
+    assert image.is_dir()
+
+
+async def test_reconcile_leaves_images_alone_without_a_complete_fleet_record_set(
+    tmp_path,
+) -> None:
+    """M1 的纪律同样适用于图，而且这里更贵：读不到全舰队的记录就不动图。
+
+    ``node_b`` 还没重新注册（控制面重启后的常态）而它的记录还在：此时"没有任何
+    记录认领 sbx_elsewhere"是个假的结论。和树一样，这一轮跳过、报告、排重试。
+    """
+    base = tmp_path / "sandboxes"
+    image = _leftover_image(base, "sbx_elsewhere")
+
+    summary, worker = await _run_reconcile_round(
+        base, records={"sbx_elsewhere": "node_b"}, nodes=("node_a",)
+    )
+
+    assert summary["checkpointsReclaimed"] == []
+    assert summary["checkpointsSweepSkipped"] == ["sbx_elsewhere"]
+    assert image.is_dir()
+    # 跳过要**留下**重试（而不是被同一轮的 `_sweep_completed` 清掉）。
+    assert worker._reconcile_retry_in == 1

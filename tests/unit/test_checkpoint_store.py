@@ -634,3 +634,81 @@ def test_the_restore_outcome_is_recorded_beside_the_runtime_record(
     stamp = datetime.fromisoformat(written["at"])
     assert stamp.tzinfo is timezone.utc
     assert written["at"] == stamp.isoformat(timespec="seconds")
+
+
+def test_an_image_with_no_record_is_reported_as_an_orphan(tmp_path: Path) -> None:
+    """图有自己的 store，而 store 从前没有扫描入口。
+
+    ``.checkpoints/*`` 的候选集只来自内存注册表与顶层沙箱树，所以"记录没了、图还在"
+    的孤儿会一直占着平台账 —— 图是平台为这个沙箱持有的最大东西，账满了就拒新捕获。
+    这一条钉的是**只列**与**双判据**：只要有任何一处还认领它，就原样留着。
+    """
+    base = tmp_path / "sandboxes"
+    _sandbox_tree(base, "sbx_orphan")
+    image = checkpoint_image_dir(base, "sbx_orphan")
+    image.mkdir(parents=True)
+    (image / "meta.json").write_bytes(b"x")
+
+    assert checkpoint_store.list_checkpoint_stores(base) == ["sbx_orphan"]
+
+    # keep 里有它 ⇒ 一个字都不动（"CP 不认识它"不是唯一的判据）。
+    assert (
+        checkpoint_store.remove_orphan_checkpoint_stores(base, keep={"sbx_orphan"})
+        == []
+    )
+    assert image.is_dir()
+    assert checkpoint_store.checkpoint_store_is_empty(image) is False
+
+    # 没有任何一处认领它 ⇒ 整棵 store 走，连同那张图。
+    assert checkpoint_store.remove_orphan_checkpoint_stores(base, keep=set()) == [
+        "sbx_orphan"
+    ]
+    assert not image.is_dir()
+    assert not image.parent.exists()
+    assert checkpoint_store.list_checkpoint_stores(base) == []
+
+
+def test_a_refused_capture_leaves_no_empty_directory(tmp_path: Path) -> None:
+    """拒绝不是"半个动作"：调用前后目录树必须逐字节相同。
+
+    ``_prepare_image_parent`` 是先建目录、再让 slot 抓的，所以一个被 slot 拒掉的
+    捕获从前会留下一个空 ``<id>/``：账上量得到它、没人认领它，下一次捕获还会以为
+    "目录已经就绪"。
+    """
+    base = tmp_path / "sandboxes"
+    _sandbox_tree(base, "sbx_noroom")
+    executor = _FakeExecutor(capture_reply={"captured": False, "reason": "1 live child"})
+
+    reply = capture_checkpoint_image(base, _ctx(executor), "sbx_noroom")
+
+    assert reply == {
+        "sandbox_id": "sbx_noroom",
+        "captured": False,
+        "reason": "1 live child",
+        "image": None,
+        "imageMB": 0,
+        "platformDiskUsedMB": 0,
+        "platformDiskBudgetMB": 0,
+    }
+    assert not checkpoint_image_dir(base, "sbx_noroom").parent.exists()
+
+
+def test_an_image_refused_by_the_account_is_removed_with_its_store(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """记账拒绝的那条路：图删了，装它的空目录也要一起走。
+
+    这条路径连 ``latest`` 都没留下（引擎的 save 是 rename，只有成功才落名），
+    留下来的只有 ``_prepare_image_parent`` 建的那层目录 —— 而它就是平台账上那
+    个"没人认领、也装不下任何东西"的 4 KiB。
+    """
+    base = tmp_path / "sandboxes"
+    _sandbox_tree(base, "sbx_over")
+    monkeypatch.setenv("E2B_PLATFORM_DISK_MB", "1")
+    executor = _FakeExecutor(image_bytes=2 * MIB)
+
+    reply = capture_checkpoint_image(base, _ctx(executor), "sbx_over")
+
+    assert reply["captured"] is False
+    assert reply["imageMB"] == 0
+    assert not checkpoint_image_dir(base, "sbx_over").parent.exists()

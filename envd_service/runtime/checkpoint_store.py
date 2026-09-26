@@ -56,6 +56,22 @@ the record would be a second source of truth about a process the control plane
 never saw. The record keeps answering "is this sandbox paused"; the worker
 answers "what did the last resume actually bring back", and a node that cannot
 be reached says so rather than guessing (``unreachable`` in the proxy reply).
+
+**The store's owner rule (E4, 2026-09-26).** The images are the largest thing
+the platform holds for a sandbox, and the store they live in
+(``_runtime/.checkpoints/``) is the one namespace no other scan walks: the
+orphan-tree GC enumerates *trees*, so an image whose record is gone -- the
+record was deleted and the image was not, or a capture finished and the record
+vanished right after -- used to sit on the platform's account forever, until
+the account was full and refused the next capture. The rule that ends that is
+the one in :func:`remove_orphan_checkpoint_stores`: an image goes only when
+**nothing** claims its id (no control-plane record anywhere in the fleet, no
+in-memory runtime, no tree on this worker's disk), because deleting one by
+mistake destroys a user's state. The other half is that a *refused* capture
+leaves nothing behind: the store directory a refusal created is removed again
+when it holds no image (:func:`_discard_empty_store`), so "the sandbox is left
+exactly as it was found" is true of the directory tree too, not just of the
+bytes the account measures.
 """
 
 from __future__ import annotations
@@ -72,7 +88,13 @@ from envd_service.runtime.platform_disk import (
     measure_platform_disk_bytes,
     platform_budget_bytes,
 )
-from gateway_common.paths import sandbox_checkpoint_dir, sandbox_runtime_dir
+from gateway_common.paths import (
+    CHECKPOINT_ROOT_NAME,
+    RUNTIME_DIR_NAME,
+    resolve_state_base,
+    sandbox_checkpoint_dir,
+    sandbox_runtime_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -356,6 +378,13 @@ def capture_checkpoint_image(
             "the checkpoint directory could not be handed to the sandbox's "
             f"uid {owner_uid}: {type(exc).__name__}: {exc}"
         )
+        # The hand-off can fail *after* the directory exists (the mkdir ran, the
+        # chown did not): a refusal keeps no half-created store either. The path
+        # is recomputed rather than read back from the ``try`` above, which is
+        # where ``image`` would have been bound if the call had returned.
+        _discard_empty_store(
+            checkpoint_image_dir(workspace_base, sandbox_id, state_base=state_base)
+        )
         logger.warning("sandbox %s: %s", sandbox_id, reason)
         return _capture_reply(
             sandbox_id, False, reason, used=used_before, limit=limit
@@ -363,6 +392,7 @@ def capture_checkpoint_image(
     holder = _executor_of(ctx)
     capture = getattr(holder, "capture_checkpoint", None)
     if capture is None:
+        _discard_empty_store(image)
         return _capture_reply(
             sandbox_id,
             False,
@@ -373,6 +403,7 @@ def capture_checkpoint_image(
     outcome = capture(str(image))
     if not outcome.get("captured"):
         reason = str(outcome.get("reason") or "the slot did not capture")
+        _discard_empty_store(image)
         return _capture_reply(
             sandbox_id, False, reason, used=used_before, limit=limit
         )
@@ -386,6 +417,7 @@ def capture_checkpoint_image(
         # knowable by capturing, so the image is removed again and the sandbox is
         # left exactly as it was found.
         _remove_image(image)
+        _discard_empty_store(image)
         logger.warning(
             "sandbox %s: checkpoint image of %d MiB refused and removed: %s",
             sandbox_id,
@@ -603,6 +635,120 @@ def remove_checkpoint_images(
         return False
     _remove_image(store)
     return True
+
+
+def checkpoint_store_is_empty(image: Path) -> bool:
+    """Whether the store ``image`` would live in holds nothing at all.
+
+    ``True`` for a store that was never created as well as for the empty
+    directory a refused capture leaves behind -- both are the answer "there is
+    no image here" to the question its callers ask. A store that holds anything
+    (an image, a half-written one, a leftover) is ``False``, and so is one that
+    cannot be read: neither caller may remove a directory it could not look
+    into.
+    """
+    store = image.parent
+    try:
+        with os.scandir(store) as entries:
+            return next(entries, None) is None
+    except FileNotFoundError:
+        return True
+    except OSError:  # pragma: no cover - unreadable: assume it holds something
+        return False
+
+
+def _discard_empty_store(image: Path) -> None:
+    """Take back the store directory a **refused** capture created.
+
+    ``_prepare_image_parent`` creates ``<id>/`` before the slot is asked to
+    write the image into it, so every refusal that comes after it used to leave
+    an empty directory behind: measurable on the platform's account, claimed by
+    nobody, and -- to the *next* capture -- "the directory is already there".
+    Removing it is what makes "refused" mean the directory tree is the one the
+    caller started with, rather than half an action.
+
+    Only an *empty* store goes. One that holds an image (a previous capture, or
+    a refusal that landed after one) is left exactly as it is.
+    """
+    if not checkpoint_store_is_empty(image):
+        return
+    try:
+        image.parent.rmdir()
+    except OSError:  # includes FileNotFoundError: nothing left to take back
+        pass
+
+
+def list_checkpoint_stores(workspace_base, *, state_base=None) -> list[str]:
+    """The sandbox ids ``_runtime/.checkpoints/`` holds a store for (list only).
+
+    The candidate set the orphan sweep starts from, and the one namespace no
+    other scan walks: the orphan-tree GC and the fail-safe quota reconcile both
+    enumerate *trees*, and this store is a sibling of the per-sandbox runtime
+    dirs rather than a child of any of them (see the module doc). Without this
+    entry an image whose record is gone is invisible to every collector.
+
+    No name rule on purpose (M1's lesson): any ``[A-Za-z0-9_-]`` string is a
+    legal sandbox id, so a filter here could drop a real store whose id happens
+    to spell something the platform also uses as a name. Every directory under
+    the store root is a candidate; whether it may go is
+    :func:`remove_orphan_checkpoint_stores`'s question, not this one's.
+
+    An unreadable store root reads as "no candidates": the caller is a
+    maintenance round, and "I could not look" must never be read as "these
+    images are ownerless".
+    """
+    root = (
+        resolve_state_base(workspace_base, state_base)
+        / RUNTIME_DIR_NAME
+        / CHECKPOINT_ROOT_NAME
+    )
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:  # no store root, or one this worker cannot read
+        return []
+    return [
+        entry.name for entry in entries if entry.is_dir() and not entry.is_symlink()
+    ]
+
+
+def remove_orphan_checkpoint_stores(
+    workspace_base, *, keep: set[str], state_base=None
+) -> list[str]:
+    """Remove the images of sandboxes ``keep`` does not claim; return those ids.
+
+    ``keep`` is the caller's complete evidence of ownership, and it has to be
+    *both* halves: every control-plane record in the fleet -- a store lives on
+    the shared volume, so this worker sees other nodes' images, and only a
+    fleet-wide answer separates those from orphans -- **and** every sandbox
+    this worker still holds a record for, in memory or on disk. "There is no
+    record" has to mean "nowhere": an image is the user's whole process, so the
+    default here is *not* to delete, and one claimant anywhere is enough to
+    keep it.
+
+    Nothing is guessed from a name or a size, and a store the worker cannot
+    remove is reported and left for the next round instead of costing this one
+    its remaining work.
+    """
+    removed: list[str] = []
+    for sandbox_id in list_checkpoint_stores(workspace_base, state_base=state_base):
+        if sandbox_id in keep:
+            continue
+        logger.warning(
+            "checkpoint store of unknown sandbox %s: reclaiming", sandbox_id
+        )
+        try:
+            if remove_checkpoint_images(
+                workspace_base, sandbox_id, state_base=state_base
+            ):
+                removed.append(sandbox_id)
+        except Exception:  # noqa: BLE001 - reported, never fatal to the round
+            logger.warning(
+                "checkpoint store of unknown sandbox %s: could not be removed; "
+                "leaving it for the next reconcile",
+                sandbox_id,
+                exc_info=True,
+            )
+    return removed
 
 
 def consume_checkpoint_image(
