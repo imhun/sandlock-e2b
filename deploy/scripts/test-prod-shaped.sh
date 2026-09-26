@@ -161,14 +161,24 @@ if [ -n "${E2B_PID_NS:-}" ]; then
 fi
 
 # The per-sandbox network namespace is a *deployment* shape too (E7.2): the
-# shipped stack and the k8s manifest run `E2B_ENABLE_NET_ISOLATION=true` +
-# `E2B_FD_INJECT_CONNECT=true`, and this lane exists to reproduce the deployed
-# shape. The two are a pair -- `create_app` refuses the single-switch shape by
-# name (it would leave every sandbox loopback-only, i.e. "the network is
-# down" with no error anywhere) -- so forward them together, and only when
-# both are set. Unset stays unset: the code default is the shared-netns shape.
-# `E2B_TEST_NET_ISOLATION` is what un-skips `tests/contract/test_mcp_netns.py`
-# (three cases); without it a "netns shape" run is green for the wrong reason.
+# shipped stack (`docker-compose.prod.yml`) and the k8s manifest run
+# `E2B_ENABLE_NET_ISOLATION=true` + `E2B_FD_INJECT_CONNECT=true`, and this lane
+# exists to reproduce the deployed shape -- of the *whole* suite, because the
+# in-process control plane and worker read these two variables as their
+# deployment default (envd_service/config.py, pinned by
+# tests/unit/test_net_isolation_config.py). Forward them when both are set;
+# without that the lane could only ever run the code default (shared netns)
+# shape, which is why the documented netns-shaped full run (§2.4.5) was not
+# reproducible from the script.
+# `tests/contract/test_mcp_netns.py` is *not* the reason: it never needed this
+# passthrough (the runner image bakes `E2B_TEST_NET_ISOLATION=1`, and the
+# contract's own harness sets the worker's pair), so it runs the same way
+# whether the pair arrives here or not. `E2B_TEST_NET_ISOLATION` is forwarded
+# only so the shape stays explicit end to end.
+# The two are a pair -- `create_app` refuses the single-switch shape by name (it
+# would leave every sandbox loopback-only, i.e. "the network is down" with no
+# error anywhere) -- so forward them together, and only when both are set.
+# Unset stays unset: the code default is the shared-netns shape.
 NETNS_ENV=""
 if [ -n "${E2B_ENABLE_NET_ISOLATION:-}" ] && [ -n "${E2B_FD_INJECT_CONNECT:-}" ]; then
     NETNS_ENV="-e E2B_ENABLE_NET_ISOLATION=${E2B_ENABLE_NET_ISOLATION} -e E2B_FD_INJECT_CONNECT=${E2B_FD_INJECT_CONNECT} -e E2B_TEST_NET_ISOLATION=${E2B_TEST_NET_ISOLATION:-1}"
@@ -231,7 +241,7 @@ if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
         $MIRRORS_ENV \
         $MEMORY_ENV \
         $PIDNS_ENV \
-    $NETNS_ENV \
+        $NETNS_ENV \
         $CACHE_ENV \
         -v "$(pwd):/workspace" -w /workspace \
         "$IMAGE" \
