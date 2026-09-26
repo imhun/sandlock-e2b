@@ -208,7 +208,8 @@ Calico VXLAN 只能建集群时定）见 `deploy/k8s-k0s/README.md`；集群层�
 
 ## 9. checkpoint/restore 的上线记录（2026-09-25）
 
-**版本**：`0.1.0-525-g65ad183-20260925-212439`（= `deploy/stack/.version`）。这一轮改了三样
+**版本**：`0.1.0-525-g65ad183-20260925-212439`（= 当轮 `deploy/stack/.version`；**当前部署版本
+见 §11**，本节末的 2026-09-26 复核行给出重跑这条验收时的版本）。这一轮改了三样
 东西，所以 rebuild 链条跑了两遍：E2B 侧代码（主仓 `9ddebc5`）、fork 的 `exclude_main`
 （fork `da0faf5`）、fork 的 restore-stub 随 wheel（fork `2d5f2e9`）。整栈同一版本，
 `kubectl diff` 只剩版本行 + worker 的两个新环境变量。
@@ -262,7 +263,7 @@ Calico VXLAN 只能建集群时定）见 `deploy/k8s-k0s/README.md`；集群层�
   fork 侧登记见 `docs/fork-plan-followups.md` FUP-30（已关，含定位方法与两组数字）。
 * ⚠️ **验收脚本的部署语义**：`max_concurrent_commands_per_sandbox` 默认 **1**，
   所以"后台进程还在跑 + 再 exec 一条命令"会排队 30 s 然后 429；脚本里先 `handle.kill()`
-  再 exec（`tmp/k0s/checkpoint_acceptance.py` 已按此写）。
+  再 exec（`deploy/scripts/checkpoint_acceptance.py` 已按此写）。
 
 **怎么再跑一遍**（密钥从集群里取，不写进仓库）：
 
@@ -271,7 +272,7 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 export E2B_API_URL=http://172.18.78.49:3000
 export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d)
 export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data.E2B_INTERNAL_API_KEY}' | base64 -d)
-.venv/bin/python tmp/k0s/checkpoint_acceptance.py
+.venv/bin/python deploy/scripts/checkpoint_acceptance.py
 ```
 
 （脚本最后会把沙箱 `kill` 掉；想留下现场排障就用 `tmp/k0s/probe_restore_state.py`，它不 kill，
@@ -285,6 +286,28 @@ export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o json
 > 开头就 `kubectl get nodes` 前置断言，并把 stderr 带进断言消息）；② 夹具的计时器文件改成
 > **临时文件 + `os.replace`**（原来 `open(w)` 的截断窗口一旦被 `pause()` 冻住，文件在整个冻结期
 > 都是空的，读者拿到的 `""` 被当作"还没写" ⇒ 误报"计数消失"）。
+
+> **2026-09-26 复核**：`deploy/scripts/checkpoint_acceptance.py`（本轮**从 `tmp/k0s/` 转正进仓库**，
+> 成了这条能力的常备判据）在 `0.1.0-597-g3701a53-20260926-163057`（= `deploy/stack/.version`，
+> 含 N15 的 `_chroot_root`、F11 多副本、两次 fork 修复、**N27 的树根下沉迁移**）上全绿：
+> 20 行 `{"step": …}`、末行 `{"step": "OK"}`、退出码 `0`（日志 `tmp/k0s/checkpoint-task2.log`）。
+> 这条能力在生产形态（image-rootfs + `E2B_REAL_ROOT=1`）下**可用**。
+>
+> **"恢复后不能 exec"不是拦路虎**：D9 已在 2026-09-25 由 fork `1f41f1a` 关闭 —— E2B 走
+> `restore` verb 把镜像恢复**进会话**，`exec` 继续由 init 服务（判据就是上面「验收状态」里那条
+> `exec_after_resume`：`EXEC_OK\n`）。restore stub 的交付也不再走宿主路径：fork `a6f6b04`
+> 改成按描述符投递，模拟根与真根两态都有用例（`test_restore_resumes_inside_a_chroot_root`）。
+> 剩下的都是**语义与运维**问题，以及 Task 1 在会话路径上补的那两条用例（见
+> `docs/superpowers/plans/2026-09-26-checkpoint-restore-productization.md`）。
+>
+> **转正这一轮改掉的第 3 个"脚本自己的毛病"（N27 的路径假设）**：脚本原来按
+> `<export>/_runtime/.checkpoints/<id>` 找图，而 N27 把平台状态搬成了树根的**兄弟**
+> （`<export>/state/_runtime/.checkpoints/<id>`，同一个挂载上的 `rename(2)` ⇒ 旧路径**不存在**）
+> ⇒ 照旧写法读到的是 `No such file or directory`，与"图根本没写"**字面不可分**（就是上面
+> ①/② 那类假红）。现在脚本按 worker 清单里的 `E2B_STATE_BASE` 算（缺省回退
+> `E2B_WORKSPACE_BASE`，再缺省回退导出根），并在任何捕获之前先 `test -d` 断一次——
+> `{"step": "layout"}` 就是这一条。同一轮补了三条前置断言（`E2B_PAUSE_CHECKPOINT=1` /
+> `E2B_REAL_ROOT=1` / `E2B_PLATFORM_DISK_MB=8192`）：开关没开时，失败原因不是引擎。
 
 **重建链条（改了 fork 就要从第一步走）**：`deploy/scripts/build-sandlock-wheels.sh`
 （交叉编两个 arch 的 wheel + supervise + restore-stub，约 4 分钟）→ `deploy/scripts/build-and-push.sh`
