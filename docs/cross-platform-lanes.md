@@ -241,7 +241,7 @@ E2B `tests/security` 四格（同轮、同镜像/同 seccomp 档）：
 | core_integ 42 条网络红，报 "run the test container entrypoint (root prep)" | 镜像里 entrypoint 做的 root prep 没人做：`/etc/hosts` 与 `198.18.0.0/15` 地址没预置 | 跑 `guest-prep.sh`（`lima-vm.sh prep`） |
 | ACL/egress 用例连不上，strace 显示只连了**代理** | Lima 把宿主的 `http_proxy` 转发进 guest，被测工作负载也遵守它 | `lima-vm.sh run` 会先 unset 全部 proxy 变量 |
 | 五个 named-unix 门禁返回 CONNECTED/SENT（应 EACCES） | 目标根落在 `/tmp` 里 ⇒ 夹具落进了 `fs_write("/tmp")` 授权 | 目标根改 `/var/tmp/aarch64-target` |
-| `bind DNS gateway: Permission denied (os error 13)` | 共享 netns + 非 root 绑 `<127.0.1.x>:53`（stock 1024） | lane 保留 `ip_unprivileged_port_start=0`；**不能**用 `CAP_NET_BIND_SERVICE` 替代（file-cap exec 让进程 non-dumpable ⇒ `pidfd_getfd: EPERM`） |
+| `bind DNS gateway: Permission denied (os error 13)` | 共享 netns + 非 root 绑 `<127.0.1.x>:53`（stock 1024） | lane 保留 `ip_unprivileged_port_start=0`（**仅这条 arm lane**，不代表任何部署形态：stack/k8s/compose 示例/本地池都不需要窗口）；**不能**用 `CAP_NET_BIND_SERVICE` 替代（file-cap exec 让进程 non-dumpable ⇒ `pidfd_getfd: EPERM`） |
 | 注册控制套接字 `path must be shorter than SUN_LEN` | `/src` 是符号链接 ⇒ canonicalize 后路径变长 | `/src` 用 **bind mount** |
 | 到处 `NotFound` / 结果像上一次的 | 9p 给了旧文件；rsync 认为不用复制 | 源码/产物走 ssh 上的 tar |
 | 想按目录缩小 pytest 范围却缩不动 | `test-prod-shaped.sh` 是 `pytest tests ... "$@"`，路径只是追加 | 用 `-k`，或用 `x86-security.sh` |

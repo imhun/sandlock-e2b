@@ -86,6 +86,11 @@
 `envd_service/executors/factory.py:210` 传给 **sandlock** 执行器。
 也就是说：**按原裁定做完，② 的目标（池与车队对齐）并未达成**，而低端口窗口一删，
 共享 netns + 通配规则就会 EACCES。
+**⚠️ 2026-09-26 同日实测更正**：后一句的触发条件不准 —— 删窗口这个动作本身在本机 Docker 容器上
+**不**引发 EACCES（容器 `ip_unprivileged_port_start` 本来就是 0）；把窗口强行关到 1024 才复现
+`bind DNS gateway: Permission denied (os error 13)`，切到 per-sandbox netns 后即使窗口仍是 1024 也正常。
+真正会让通配 `allowOut` 静默失效的是缺 `E2B_ENABLE_NETWORK`（N42）。实测与账本见
+`docs/open-issues.md` N36 与 `tmp/netns-unify-wildcard-*.log`。
 
 **用户裁定（选 A）**：**把池的 `E2B_EXECUTOR` 也改成 `auto`**，让池真吃 per-sandbox netns。
 

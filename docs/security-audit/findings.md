@@ -63,7 +63,9 @@ worker 自己的回环。实测两种形态都可达（见下表）。
 即：**沙箱内一条 TCP 连接即可调用 worker 的内部管理 API**。`0.0.0.0` 与 `127.0.0.1`
 同一端口、同一监听器，只有目的写法不同 —— 这一对照排除了「本来就没在监听」的解释。
 
-netns 形态（`E2B_ENABLE_NET_ISOLATION=true`，compose stack 默认）复跑同一探针，
+netns 形态（`E2B_ENABLE_NET_ISOLATION=true`，compose stack 默认，2026-09-26 起
+`deploy/compose` 的 prod/multinode 示例与本地池 `autoscaler/backends/local.py` 也是同一形态）
+复跑同一探针，
 修复前**同样 REACHED**，证实 netns 不构成缓解。
 
 ### 影响面

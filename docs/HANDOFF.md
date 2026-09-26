@@ -122,7 +122,7 @@ hooks ⇒ 只有**没配 agent** 的合体节点才本地直连，见
 |---|---|---|---|
 | ① | 共享卷 `mount --bind` 进 workspace | A4 删掉 bind（卷视图 = 请求路径决定的符号链接，双别名 `/workspace/<rel>` + `/home/user/<rel>`）；A5 补齐卷根及祖先对租户 uid 的 `o+x` 穿透位 | `d3c390e`(A4)、`e18120d`(A5) |
 | ② | worker 本地直连 `xfs_quota -x` | A6 改由 **quota-agent** 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关；`SYS_ADMIN` 只留在 `profiles: ["quota"]` 的 agent 上） | `f2af31e`(A6) |
-| ③ | 写 namespaced sysctl（`ip_unprivileged_port_start`） | A6 改由**容器 spec 声明**（compose `sysctls:`；k8s 见本文件顶部 ⚡ 块 fix-1：**pod 级** `securityContext.sysctls`，非 root pod 靠 `NET_BIND_SERVICE` 不够） | `f2af31e`(A6) |
+| ③ | 写 namespaced sysctl（`ip_unprivileged_port_start`） | A6 改由**容器 spec 声明**（compose/k8s 的**部署形态**已不需要它：2026-09-16 compose 撤、2026-09-17 k8s（N5）撤；仅 arm lane 的共享 netns 套件仍靠 `guest-prep.sh` 写一次） | `f2af31e`(A6) |
 
 fork 侧支撑这次改动的三个 commit（同一轮 A1–A3，**未推送**）：`aadb5ad`（A1 RED：子挂载 +
 别名下的相对路径）、`c6cbe03`（A2 修复：虚拟 cwd 由请求决定、host→virtual 平局规则确定化）、
@@ -1397,8 +1397,9 @@ lib `773 passed, 0 failed`；integration `445 passed, 0 failed`（netns
   sandlock 的 no_new_privs 禁用——所以 sysctl 声明是唯一干净的方式。
   **注意**：`--network host` 的容器 Docker 拒绝应用 net sysctl（宿主
   netns 不允许），所以测试容器（host 网络）必须靠入口脚本 root 写一次；
-  生产 worker 用桥接网络，compose `sysctls` 生效（deploy/compose/docker-compose.prod.yml
-  已加）。
+  生产 worker 用桥接网络，但那套 compose 示例 2026-09-26 起也跑 per-sandbox netns、
+  不再声明 `sysctls`（低端口 `:53` 绑在沙箱自己的 netns 内）；`sysctl` 声明这条路现在
+  只为 aarch64 lane 的共享 netns 套件保留（`deploy/scripts/arm-lane/guest-prep.sh`）。
 - **构建以 root 跑一次**（`--user root --entrypoint bash`，见下），**测试
   全程非 root**——这是 sandlock 无 root 原则的落地；整个套件不再有
   "root 环境性失败"。需要 root 的操作显式

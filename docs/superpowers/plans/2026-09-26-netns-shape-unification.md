@@ -63,6 +63,17 @@
 | `security_opt: seccomp=unconfined`（仅此一项） | `:128-129` / `:163-164` / `:198-199` |
 | 无 `sysctls`、无 netns ⇒ 通配 `allowOut` 时 wildcard DNS 网关 bind `127.0.1.x:53` 必然 EACCES（仓库自己标注"未实测"） | `docs/open-issues.md:22`（N36 行） |
 
+> **⚠️ 2026-09-26 实测更正（Task 4）：本文件里"通配 `allowOut` 必 EACCES"的说法不成立**
+> —— Global Constraints 的 ④ 一条、本节的两行事实、Task 4 正文的"净效果"与"回滚"两条都按这句读。
+> ④ 文件**原样**时通配**并不会** EACCES：容器 `ip_unprivileged_port_start` 本来就是 0，沙箱
+> `IFACES=['lo','eth0']`、`RESOLV=127.0.0.2`、`DNS=10.250.0.2`、`EGRESS=CONNECT-OK 104.20.23.154`
+> （`tmp/netns-unify-wildcard-before-b2.log`）；**把窗口强行关到 1024 才逐字复现**
+> `bind DNS gateway: Permission denied (os error 13)`
+> （`tmp/netns-unify-wildcard-forced-window-shut.log`），而切到 netns 后即使窗口仍是 1024 也照常解析+出网
+> （`tmp/netns-unify-wildcard-after-window-shut.log`）—— 机制真实、原表述的触发条件不准。④ 真正的缺口是缺
+> `E2B_ENABLE_NETWORK`（N42）。账本与正文的更正见 `docs/open-issues.md` N36、
+> `docs/task-backlog.md` N36、`docs/production-deployment-requirements.md` §2.4.3。
+
 ### ③ `deploy/scripts/arm-lane/guest-prep.sh`（保留，不动）
 
 `:39-64` 一次性打开窗口：有 `sysctl` 用 `sysctl -qw`（`:61`），没有则写 `/proc/sys/net/ipv4/ip_unprivileged_port_start`（`:63`）；理由与实测写在 `:46-57`。调用方 `deploy/scripts/fork-gate.sh:46,77`、`deploy/scripts/arm-lane/lima-vm.sh:171`。

@@ -301,9 +301,10 @@ compose scale 的副本共享同一份 env，`E2B_NODE_ADDRESS` 无法按副本�
   注入唯一 `E2B_NODE_ID` / `E2B_NODE_ADDRESS=http://e2b-worker-<n>:49983`
   （Docker 网络内容器名可解析，gateway 同网络可达）；
 - 运行参数与现状一致：`seccomp=unconfined`、
-  `--sysctl net.ipv4.ip_unprivileged_port_start=0`（容器 spec 声明，A6 之后
-  不再需要 `--cap-add SYS_ADMIN`：共享卷 bind 已删、配额走 quota-agent）、
-  共享 workspace 卷挂载；
+  `E2B_ENABLE_NET_ISOLATION=true` + `E2B_FD_INJECT_CONNECT=true`（与车队同形态，
+  每沙箱自有 netns；A6 之后不再需要 `--cap-add SYS_ADMIN`：共享卷 bind 已删、
+  配额走 quota-agent，低端口窗口也一并撤掉了 —— 通配 DNS 的 `:53` 绑在沙箱自己的
+  netns 内，由 userns root 覆盖）、共享 workspace 卷挂载；
 - 缩容：先调控制面 drain（第 9 节），活跃沙箱归零后 `docker rm -f`；
 - 启动时对已有容器做对账（孤儿回收 / 缺失补齐），幂等可重启。
 

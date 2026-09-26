@@ -1223,3 +1223,43 @@ def test_all_three_workloads_can_accept_an_old_and_a_new_internal_key() -> None:
             "name": "e2b-secrets",
             "key": "E2B_INTERNAL_API_KEY",
         }, name
+
+
+def _without_comment_lines(text: str) -> str:
+    """The text minus every line whose first non-blank character is `#`.
+
+    The N36 alignment left prose that *names* the knob (what was measured, and
+    why the window is gone) in all three files this test reads. A manifest that
+    only mentions the window inside a comment declares no window -- which is
+    the thing being judged here -- and the declaration lines themselves are
+    asserted by the shape tests above, so dropping comments cannot let one back
+    in.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def test_only_the_arm_lane_keeps_a_low_port_window() -> None:
+    """N36 closed 2026-09-26: the window survives in exactly one place.
+
+    The three deployment-ish sites (compose prod example, local pool, compose
+    multinode example) were aligned with the fleet; the aarch64 lane's
+    `guest-prep.sh` keeps its one-shot window because the Rust suites still run
+    the shared-netns shape as uid 501 and cannot drop it (measured; see that
+    file's comment and docs/open-issues.md N36).
+
+    The three aligned files are read comment-stripped: the 2026-09-26
+    measurement is written down *in* those files, so the knob's name survives
+    there as prose (and the raw substring would fail on nothing but comments).
+    """
+    lane = (REPO / "deploy" / "scripts" / "arm-lane" / "guest-prep.sh").read_text(
+        encoding="utf-8"
+    )
+    pool = (REPO / "autoscaler" / "backends" / "local.py").read_text(encoding="utf-8")
+    assert "net.ipv4.ip_unprivileged_port_start=0" in lane
+    assert "ip_unprivileged_port_start" not in _without_comment_lines(COMPOSE_PROD)
+    assert "ip_unprivileged_port_start" not in _without_comment_lines(COMPOSE_MULTINODE)
+    assert "ip_unprivileged_port_start" not in _without_comment_lines(pool)
+    # The k8s pod-level window is gone (N5) and must stay gone.
+    assert POD_SYSCTL not in K8S_WORKER

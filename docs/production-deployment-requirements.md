@@ -181,7 +181,7 @@ follow-up（一句，仍未做）：若将来出现"worker 必须**读成功**�
 | `CHOWN` | workspace/slice 交给该沙箱 uid，属组 = worker 的 gid、模式 `0770`（fix round 1 / c1）；uid 回收时再 chown 回来 | E3.2 的属主前提不成立（非 root 形态由 `e2b-maint` 代做） |
 | `DAC_OVERRIDE` | **兜底**：worker 的属组访问够不到的树 —— 沙箱自建 `0700` 子目录、`1777` 卷根、升级前遗留的 root 属主目录（`e2b-maint rm/walk`）。c1 之后 files API / watcher / 命令日志 / 快照 / 删除租户树都走 worker 自己的属组权限，不经 broker | 旧 `0700` 模型下：`PermissionError: …/sbx_a/workspace`、对账与共享卷持久化用例 4 failed / 4 error；新模型下日常路径已不需要它 |
 | `SETUID`+`SETGID`+`CHOWN`+`DAC_OVERRIDE`（**BND**，非 root worker） | 非 root worker 的那四条 cap 只出现在容器 **bounding set** 里，不落到 worker 进程：`capabilities.add` 对非 root 不产生 `CapEff`（实测 `--user 65534 --cap-add SETUID` 仍 `CapEff=0`），它们唯一的作用是给 broker 的 file caps「开闸」——**file caps 必须是 BND 的子集，否则连 exec 都 EPERM**（实测 rc=126）。worker 侧的四步特权动作全部由两个专用 broker 完成（见 §2.4 的 F1 段） | 缺任一条 ⇒ broker exec 被内核拒绝（`Operation not permitted`），`e2b-slot-spawn`/`e2b-maint` 全废：非 root worker 退回进程内 E5.1 形态（无 per-sandbox uid、无槽位；chroot 形态建箱被 fork 拒绝）。`E2B_PRIV_HELPERS` 自检会点名缺哪条并让 worker 拒绝启动。**另：`--cap-drop ALL` 必须跟 `--cap-add`**（单独 drop ALL ⇒ BND=0 ⇒ 同样死），**绝不能加 no-new-privileges**（实测 NNP=1 时 file caps 被忽略：`setgroups/setgid/setuid: Operation not permitted`） |
-| `SYS_ADMIN` | **出厂镜像与清单形态下，worker 侧不需要它**（A6 迁出，A7 固化）。全库只剩一处用途，且不在 worker 上：`deploy/stack/docker-compose.prod.yml` 的 **quota-agent** 服务（`profiles: ["quota"]`）执行 `xfs_quota -x` —— 内核按 effective `CAP_SYS_ADMIN` 门控（§2.4.3）。worker 侧原来那三处：① 共享卷 `mount --bind` 进 workspace —— **A4 删 bind**（卷视图 = 请求路径决定的符号链接）+ **A5 补祖先穿透位**；② 直接执行 `xfs_quota -x` —— **A6** 改由 quota-agent 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关）；③ 写 namespaced sysctl（`ip_unprivileged_port_start`）—— **A6** 改由容器 spec 声明（compose `sysctls:` / `docker --sysctl`；k8s 是 **pod 级** `spec.template.spec.securityContext.sysctls`；`NET_BIND_SERVICE` 对非 root pod **不足以**覆盖 `:53`，实测见 §2.4.3）。⚠️ **限定**：代码里仍有两条非部署默认的路径需要它 —— 合体节点（`E2B_ENABLE_LOCAL_NODE` 默认 **true**：控制面在进程内自建卷配额；W4 起它的 `via_agent` **跟随** envd 的开关 —— `E2B_QUOTA_AGENT_URL` 存在就走 agent（§2.4.3/§2.4.4），所以只有**没配 agent** 的合体节点才在控制面进程里本地直连、才需要它）与 legacy `E2B_ENABLE_NETNS=true`（运行时写 `net.ipv4.ip_forward` + iptables）；这两条在**出厂镜像**里也跑不起来（无 `xfs_quota`/`sysctl`/`iptables`，实测镜像 `command -v` 全 MISSING），所以「不需要」只在镜像 + 清单形态下成立 | 摘掉它的后果**只剩配额降级**：quota-agent 未配置/不可达 ⇒ 建箱与挂卷照常、无 per-sandbox 磁盘硬限 + 一条 WARNING。共享卷不再是理由 —— A4/A5 的契约（`tests/contract/test_shared_volume_relative_cwd.py` 等 36 条）+ 13 条穿透单测在**无 `SYS_ADMIN`** lane 三连绿（`tmp/a4-final-step4-run{1,2,3}.log`）；A7 起整份套件也在**无 `SYS_ADMIN`** 下全绿：`PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` = `1075 passed, 3 skipped, 0 failed`（`tmp/a7-nosa.log`，cap 探针 `CapEff 0xa02c35fb → 0xa00c35fb`）。A6 的配额 lane（同形状，无 `SYS_ADMIN`）：agent 形态 `tmp/a6-agent.log` = `107 passed`；降级形态 `tmp/a6-degrade.log` = `29 passed, 5 errors`（5 个 error 是 XFS prjquota 门用例被 `E2B_TEST_STRICT_SKIPS=1` 显式暴露；A7 起 `tests/unit/test_xfs_project_quota_agent.py` 不再被 deselect，见 §2.5） |
+| `SYS_ADMIN` | **出厂镜像与清单形态下，worker 侧不需要它**（A6 迁出，A7 固化）。全库只剩一处用途，且不在 worker 上：`deploy/stack/docker-compose.prod.yml` 的 **quota-agent** 服务（`profiles: ["quota"]`）执行 `xfs_quota -x` —— 内核按 effective `CAP_SYS_ADMIN` 门控（§2.4.3）。worker 侧原来那三处：① 共享卷 `mount --bind` 进 workspace —— **A4 删 bind**（卷视图 = 请求路径决定的符号链接）+ **A5 补祖先穿透位**；② 直接执行 `xfs_quota -x` —— **A6** 改由 quota-agent 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关）；③ 写 namespaced sysctl（`ip_unprivileged_port_start`）—— **A6** 改由容器 spec 声明（compose `sysctls:` / `docker --sysctl`；k8s 是 **pod 级** `spec.template.spec.securityContext.sysctls`；`NET_BIND_SERVICE` 对非 root pod **不足以**覆盖 `:53`，实测见 §2.4.3）——**2026-09-26 起** `deploy/compose` 的 prod/multinode 示例与本地池已不再声明窗口（见 §2.4.3 末）。⚠️ **限定**：代码里仍有两条非部署默认的路径需要它 —— 合体节点（`E2B_ENABLE_LOCAL_NODE` 默认 **true**：控制面在进程内自建卷配额；W4 起它的 `via_agent` **跟随** envd 的开关 —— `E2B_QUOTA_AGENT_URL` 存在就走 agent（§2.4.3/§2.4.4），所以只有**没配 agent** 的合体节点才在控制面进程里本地直连、才需要它）与 legacy `E2B_ENABLE_NETNS=true`（运行时写 `net.ipv4.ip_forward` + iptables）；这两条在**出厂镜像**里也跑不起来（无 `xfs_quota`/`sysctl`/`iptables`，实测镜像 `command -v` 全 MISSING），所以「不需要」只在镜像 + 清单形态下成立 | 摘掉它的后果**只剩配额降级**：quota-agent 未配置/不可达 ⇒ 建箱与挂卷照常、无 per-sandbox 磁盘硬限 + 一条 WARNING。共享卷不再是理由 —— A4/A5 的契约（`tests/contract/test_shared_volume_relative_cwd.py` 等 36 条）+ 13 条穿透单测在**无 `SYS_ADMIN`** lane 三连绿（`tmp/a4-final-step4-run{1,2,3}.log`）；A7 起整份套件也在**无 `SYS_ADMIN`** 下全绿：`PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` = `1075 passed, 3 skipped, 0 failed`（`tmp/a7-nosa.log`，cap 探针 `CapEff 0xa02c35fb → 0xa00c35fb`）。A6 的配额 lane（同形状，无 `SYS_ADMIN`）：agent 形态 `tmp/a6-agent.log` = `107 passed`；降级形态 `tmp/a6-degrade.log` = `29 passed, 5 errors`（5 个 error 是 XFS prjquota 门用例被 `E2B_TEST_STRICT_SKIPS=1` 显式暴露；A7 起 `tests/unit/test_xfs_project_quota_agent.py` 不再被 deselect，见 §2.5） |
 | `SYS_PTRACE` | 只服务**进程内 RunAs**（父进程给子进程写 `uid_map` 需要对该子进程的 ptrace 访问权） | 非 route-B 的 per-uid 沙箱每个建箱挂在 `sandlock_create failed`；route B 完全不需要 |
 
 **构建期 vs 运行期（F1 实测，都是踩过的坑）**：`setcap` 需要 `libcap2-bin`，而执行
@@ -364,6 +364,13 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
   但清单以 Dockerfile 的 `USER` 为准，声明这条 sysctl 对两种形态都安全）。该 sysctl 自 k8s 1.22 起属
   **safe sysctl**（无需 kubelet `--allowed-unsafe-sysctls`）；`hostNetwork: true` 下 `net.*`
   会被拒。MCP 入站端口是 50005+，从来不需要低端口窗口。
+
+  **2026-09-26：仓库里带低端口窗口的位置只剩一处** —— aarch64 lane 的
+  `deploy/scripts/arm-lane/guest-prep.sh:39-64`（Rust 套件默认共享 netns、以 uid 501 跑，
+  实测删不掉）。同日 `deploy/compose/docker-compose.prod.yml`、
+  `deploy/compose/docker-compose.multinode.yml` 与本地池 `autoscaler/backends/local.py`
+  已与车队对齐（成对打开 `E2B_ENABLE_NET_ISOLATION` + `E2B_FD_INJECT_CONNECT`、删除窗口），
+  落地与验证见 `docs/open-issues.md` N36 行。
 
 ### 2.4.4 k8s 清单形态的配额口径：降级（2026-09-13 裁定，W4）
 
@@ -572,6 +579,9 @@ E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true` 跑全量 =
 root-in-userns 自带 `CAP_NET_BIND_SERVICE`；k8s 清单 2026-09-17（N5）切 netns 时把 pod 级
 那份一并撤掉，理由同上 —— 并且 pod 级窗口让 pod 里**任何**进程都能绑低端口）。
 
+2026-09-26：`deploy/compose` 的两个本地示例与 `autoscaler/backends/local.py` 也切到同一
+形态（见 §2.4.3 末尾），仓库里只剩 arm lane 的 Rust 套件还跑共享 netns。
+
 以下为灰度期的记录，保留作追溯：**形态**：`deploy/stack/docker-compose.prod.yml` 里**只有 worker-2** 带
 `E2B_ENABLE_NET_ISOLATION=true` + `E2B_FD_INJECT_CONNECT=true`（默认即 true，可用
 `E2B_ENABLE_NET_ISOLATION_WORKER2`/`E2B_FD_INJECT_CONNECT_WORKER2` 覆盖），worker-1 保持共享
@@ -602,6 +612,9 @@ netns ⇒ 一套栈上两种形态并存，用真实流量判断。
    启动）；容器非 0 退出 = 配置被拒，读错误原文即可定位。
 6. **内核资源**：`user.max_user_namespaces` 水位（每沙箱 +1 个 netns；目标机实测 30519）、
    `ip netns list | wc -l` 应 ≈ 该节点并发沙箱数。
+
+**（历史记录，已被本节顶部的全量结果取代：两个 worker 都跑 per-sandbox netns，容器级
+`ip_unprivileged_port_start=0` 已于 2026-09-16 撤掉。）**
 
 **退出到全量的判据（已按实测判据执行，未等 24h）**：原判据是 24h 内 1–4 无回归、无客户可感知
 差异；但车队没有真实流量，"24h" 事实上不会产生证据，所以改用**按节点分组的定向实测**替代：
@@ -717,6 +730,9 @@ EXIT=0、0 failed（`tmp/gate-inject-full2.log`）；`mediation_2uid` 的 6 个�
 
 wildcard DNS 在**没有容器级低端口 sysctl** 的情况下仍然可用，正是"`:53` 现在绑在沙箱自己的
 netns、由 userns root 覆盖"的直接证据；`IFACES=lo` 则确认车队里不再存在共享 netns 的沙箱。
+
+**（历史记录，已被本节顶部的全量结果取代：两个 worker 都跑 per-sandbox netns，容器级
+`ip_unprivileged_port_start=0` 已于 2026-09-16 撤掉。）**
 
 **因此：worker-1 保持共享 netns，`ip_unprivileged_port_start=0` 不撤**，等 fork 侧把这条
 每请求代价定位并修掉后再走全量。复测脚本：`tmp/netns-node-compare.py`（按节点）、

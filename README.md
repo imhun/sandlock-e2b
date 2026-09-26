@@ -371,10 +371,12 @@ SDK → Control Plane + Envd Gateway :3000（注册表 / 调度 / 准入 / 按
     （`Sandbox.create(iam={"tokens": {...}})`），占位符会替换为签发的
     JWT-SVID，签名密钥 `E2B_IAM_SIGNING_KEY`，默认本地开发密钥）。
   - **通配域名**：普通模式（无需 egressProxy / netns）经每沙箱 loopback
-    DNS 网关（`127.0.1.x:53`；共享 netns 形态下一次
-    `net.ipv4.ip_unprivileged_port_start=0` 即可，部署用的 per-sandbox netns
-    形态把该 bind 放进沙箱自己的 netns、由 root-in-userns 覆盖，清单里因此
-    没有低端口窗口）把通配子域解析为合成 IP，connect 由
+    DNS 网关（`127.0.1.x:53`；部署用的 per-sandbox netns 形态把该 bind 放进
+    沙箱自己的 netns、由 root-in-userns 覆盖，清单里因此没有低端口窗口 ——
+    仓库里只剩 arm lane 的 Rust 套件还跑共享 netns
+    （`deploy/scripts/arm-lane/guest-prep.sh`），那里的窗口是一次性的、实测必需；
+    部署形态（stack / k8s / `deploy/compose` 的两个示例 / 本地池）都不需要窗口）
+    把通配子域解析为合成 IP，connect 由
     supervisor 代连并二次校验（SSRF 护栏拒绝私网/回环），静态/Go 应用
     同样受限。fork 已切到上游 PR 的无 netns 版本（netns-free），
     `E2B_ENABLE_NETNS` 仅作兼容保留、不再生效，全程无需 root /
