@@ -53,14 +53,19 @@ int priv_validate_uid(long uid, char *err, size_t errlen);
  * chgrp-to-own-gid is never a privilege widening. */
 int priv_gid_allowed(long gid, char *err, size_t errlen);
 
-/* realpath() + containment in <workspace_base>/ or <shared_volume_root>/.
+/* N27: the platform state base -- `E2B_STATE_BASE` when the deployment names
+ * one, the workspace base otherwise (one shape, one root). */
+const char *priv_state_base(void);
+
+/* realpath() + containment in <workspace_base>/, <state_base>/ (only when it
+ * is a root of its own) or <shared_volume_root>/.
  * `strict` additionally refuses the roots themselves (delete/chown must never
  * target a whole managed root). Returns 0 on success and writes the resolved
  * absolute path into `resolved` (>= PATH_MAX bytes). */
 int priv_resolve_allowed_path(const char *path, int strict, char *resolved,
                               size_t resolved_len, char *err, size_t errlen);
 
-/* The roots, as "a" or "a, b" (for diagnostics). */
+/* The roots, as "a" or "a, b, c" (for diagnostics). */
 void priv_roots_text(char *out, size_t outlen);
 
 /* The pinned sandlock-supervise path (E2B_SUPERVISE_BIN or the build default). */

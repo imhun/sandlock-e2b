@@ -189,6 +189,39 @@ def test_workspace_and_shared_volume_paths_resolve_inside(tmp_path: Path) -> Non
     assert helpers.resolve_path(inside_shared) == inside_shared
 
 
+def test_a_path_that_only_exists_under_the_state_base_resolves(
+    workspace: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """N27 Task 4: the state base is a whitelisted root in its own right.
+
+    The platform's records (``_runtime/<id>/sandbox.json``) move to
+    ``E2B_STATE_BASE`` while the sandbox trees stay under
+    ``E2B_WORKSPACE_BASE``; a broker that only knows the workspace base would
+    refuse every ``walk``/``rm``/``chown`` the worker aims at those records.
+    The whitelist is what the broker enforces, so this goes through the real
+    ``resolve_path`` containment (``realpath`` + root membership) rather than
+    a string comparison against the environment.
+    """
+    monkeypatch.delenv("E2B_STATE_BASE", raising=False)
+    state_base = workspace / "state"
+    record = state_base / "_runtime" / "sbx_state" / "sandbox.json"
+    record.parent.mkdir(parents=True)
+    record.write_text("{}", encoding="utf-8")
+    helpers = _helpers(tmp_path, state_base=state_base)
+    assert helpers.state_base == state_base
+    assert helpers.resolve_path(record) == Path(os.path.realpath(record))
+    # A path under neither base stays refused: the state base widens the
+    # whitelist by exactly one root.
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        helpers.resolve_path(outside)
+    assert str(excinfo.value) == (
+        f"path {outside} is outside the privileged helper roots "
+        f"({helpers.workspace_base}, {state_base}, {helpers.shared_volume_root})"
+    )
+
+
 # ------------------------------------------------------------------ argv[0]
 
 
@@ -238,6 +271,41 @@ def test_spawn_argv_shape_and_env_carry_the_pool(tmp_path: Path) -> None:
     assert env["E2B_WORKSPACE_BASE"] == str(helpers.workspace_base)
     assert env["E2B_SHARED_VOLUME_ROOT"] == str(helpers.shared_volume_root)
     assert env["E2B_SUPERVISE_BIN"] == str(helpers.supervise_bin)
+
+
+def test_broker_env_carries_the_state_base(monkeypatch) -> None:
+    """N27 Task 4: the broker is told the state base, explicitly and always.
+
+    ``subprocess_env`` is the *whole* environment a broker sees, so a base the
+    worker reads out of its own settings has to be written here -- otherwise
+    the broker silently falls back to the workspace base and refuses every
+    path under ``E2B_STATE_BASE``. Written unconditionally: with no state base
+    configured the two are the same directory, and the broker must not have to
+    infer "unset means same" from the variable's presence.
+    """
+    monkeypatch.setenv("E2B_STATE_BASE", "/var/lib/e2b/state")
+    # The environment variable is *not* the source: the shape carries the base
+    # the worker resolved, which is the only thing the broker may act on.
+    helpers = ph.PrivHelpers(
+        slot_spawn=Path("/x/e2b-slot-spawn"),
+        maint=Path("/x/e2b-maint"),
+        supervise_bin=Path("/x/sandlock-supervise"),
+        uid_pool_start=10000,
+        uid_pool_size=1000,
+        workspace_base=Path("/ws"),
+        state_base=Path("/var/lib/e2b/state"),
+    )
+    assert helpers.subprocess_env()["E2B_STATE_BASE"] == "/var/lib/e2b/state"
+    defaults = ph.PrivHelpers(
+        slot_spawn=Path("/x/e2b-slot-spawn"),
+        maint=Path("/x/e2b-maint"),
+        supervise_bin=Path("/x/sandlock-supervise"),
+        uid_pool_start=10000,
+        uid_pool_size=1000,
+        workspace_base=Path("/ws"),
+    )
+    assert defaults.state_base == Path("/ws")
+    assert defaults.subprocess_env()["E2B_STATE_BASE"] == "/ws"
 
 
 def test_chown_rm_and_walk_argv_shape(tmp_path: Path) -> None:
@@ -672,6 +740,9 @@ def test_the_route_b_scratch_root_must_be_reachable_by_the_maintenance_broker(
     policy -- which carries egress-proxy credentials -- world-readable, so the
     broker shape refuses it by name instead of shipping the leak."""
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    # N27: the expectation below spells out the whole whitelist, so the
+    # ambient environment must not be the one that names a state base.
+    monkeypatch.delenv("E2B_STATE_BASE", raising=False)
     _install(tmp_path, monkeypatch)
     settings = _settings(tmp_path, route_b_tmp_root=Path("/tmp/sandlock-route-b"))
     with pytest.raises(ph.PrivHelperError) as excinfo:
@@ -680,7 +751,8 @@ def test_the_route_b_scratch_root_must_be_reachable_by_the_maintenance_broker(
         "route-B scratch root /tmp/sandlock-route-b is outside the privileged "
         f"helper roots ({_roots_text(settings.workspace_base, tmp_path / 'shared')}): "
         "the slot documents are group-scoped to the slot uid through "
-        "e2b-maint, so point E2B_ROUTE_B_TMP_ROOT at the workspace base"
+        "e2b-maint, so point E2B_ROUTE_B_TMP_ROOT at the workspace base or "
+        "the state base"
     )
 
 
@@ -693,7 +765,9 @@ def test_a_complete_broker_pair_resolves(tmp_path: Path, monkeypatch) -> None:
     import envd_service.route_b as route_b
 
     monkeypatch.setattr(route_b, "default_supervise_bin", lambda: supervise)
-    helpers = ph.resolve_priv_helpers(_settings(tmp_path))
+    helpers = ph.resolve_priv_helpers(
+        _settings(tmp_path, state_base=tmp_path / "state")
+    )
     assert helpers is not None
     assert helpers.slot_spawn == helper_dir / "e2b-slot-spawn"
     assert helpers.maint == helper_dir / "e2b-maint"
@@ -702,6 +776,10 @@ def test_a_complete_broker_pair_resolves(tmp_path: Path, monkeypatch) -> None:
     assert helpers.uid_pool_size == 1000
     assert helpers.workspace_base == tmp_path / "sandboxes"
     assert helpers.shared_volume_root == tmp_path / "shared"
+    # N27: the state base the worker resolved is what the brokers are given
+    # (through E2B_STATE_BASE in ``subprocess_env``), not the environment's.
+    assert helpers.state_base == tmp_path / "state"
+    assert helpers.subprocess_env()["E2B_STATE_BASE"] == str(tmp_path / "state")
 
 
 # ------------------------------------------------------------- capability IO

@@ -20,8 +20,9 @@
  * 16384 at 2000 entries while `st_blocks` and `du -s` stayed at 512 the whole
  * way, and the consumer's contract is to be the number `du` reports.
  *
- * Every path is `realpath`-resolved and must land under `<workspace_base>/` or
- * `<shared_volume_root>/`; symlinks are never followed while recursing
+ * Every path is `realpath`-resolved and must land under `<workspace_base>/`,
+ * `<state_base>/` (E2B_STATE_BASE, N27) or `<shared_volume_root>/`; symlinks
+ * are never followed while recursing
  * (`FTS_PHYSICAL` + `lchown`/`unlinkat` semantics), so a tenant cannot plant a
  * link that makes the broker touch something outside the roots.
  *

@@ -32,9 +32,10 @@ outside every sandbox mount view) and do the privileged step themselves:
   exec'd binary has no file capabilities of its own.
 * ``e2b-maint`` (``cap_chown,cap_dac_override+ep``) --
   ``chown --uid X [--recursive] --path P`` / ``rm --path P`` /
-  ``walk --path P`` for paths that resolve under ``<workspace_base>/`` or
-  ``<shared_volume_root>/`` only (``realpath``, so ``..`` and symlinks cannot
-  escape).
+  ``walk --path P`` for paths that resolve under ``<workspace_base>/``,
+  ``<state_base>/`` (N27's ``E2B_STATE_BASE``, where the platform's own
+  records live) or ``<shared_volume_root>/`` only (``realpath``, so ``..`` and
+  symlinks cannot escape).
 
 Both link one shared validator (``deploy/priv/priv_common.c``) so the pool
 range / root whitelist / argument shapes cannot drift apart.
@@ -308,6 +309,9 @@ class PrivHelpers:
     uid_pool_start: int
     uid_pool_size: int
     workspace_base: Path
+    #: N27: where the platform's own records live. ``None`` means "the
+    #: workspace base", exactly like ``priv_state_base()`` in the C brokers.
+    state_base: Path | None = None
     shared_volume_root: Path | None = None
 
     def __post_init__(self) -> None:
@@ -315,6 +319,9 @@ class PrivHelpers:
         self.maint = Path(self.maint)
         self.supervise_bin = Path(self.supervise_bin)
         self.workspace_base = Path(self.workspace_base)
+        self.state_base = (
+            self.workspace_base if self.state_base is None else Path(self.state_base)
+        )
         if self.shared_volume_root is not None:
             self.shared_volume_root = Path(self.shared_volume_root)
         if not self.supervise_bin.is_absolute():
@@ -370,6 +377,11 @@ class PrivHelpers:
 
     def _root_paths(self) -> tuple[Path, ...]:
         roots = [self.workspace_base]
+        # A second root only when the state base *is* one: with no
+        # E2B_STATE_BASE the two are the same directory, and naming one
+        # directory twice would misreport the shape.
+        if self.state_base != self.workspace_base:
+            roots.append(self.state_base)
         if self.shared_volume_root is not None:
             roots.append(self.shared_volume_root)
         return tuple(roots)
@@ -422,6 +434,10 @@ class PrivHelpers:
             "E2B_UID_POOL_START": str(self.uid_pool_start),
             "E2B_UID_POOL_SIZE": str(self.uid_pool_size),
             "E2B_WORKSPACE_BASE": str(self.workspace_base),
+            # Unconditional: the broker reads one variable and falls back to
+            # the workspace base only for want of a value, so "no state base
+            # in this deployment" is spelled as the workspace base itself.
+            "E2B_STATE_BASE": str(self.state_base),
             "E2B_SUPERVISE_BIN": str(self.supervise_bin),
             "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
         }
@@ -897,6 +913,10 @@ def resolve_priv_helpers(settings) -> PrivHelpers | None:
         uid_pool_start=int(getattr(settings, "uid_pool_start", 10000)),
         uid_pool_size=int(getattr(settings, "uid_pool_size", 1000)),
         workspace_base=Path(getattr(settings, "workspace_base")),
+        state_base=Path(
+            getattr(settings, "state_base", None)
+            or getattr(settings, "workspace_base")
+        ),
         shared_volume_root=(
             Path(settings.shared_volume_root)
             if getattr(settings, "shared_volume_root", None)
@@ -1024,7 +1044,10 @@ def _require_route_b_scratch_root(helpers: PrivHelpers, settings) -> None:
     root:<uid>``). A non-root worker can only do that through ``e2b-maint``,
     and the broker touches whitelisted roots only -- elsewhere the policy
     (which carries egress-proxy credentials) would fall back to world-readable
-    ``0444``. Refuse the shape by name instead of shipping that leak.
+    ``0444``. Refuse the shape by name instead of shipping that leak. Since
+    N27 there are two legitimate bases to point it at: the workspace base and
+    the state base (``E2B_STATE_BASE``), the latter being where ``.route-b``
+    moves with the rest of the platform's own files.
     """
     if str(getattr(settings, "route_b", "auto")).lower() == "off":
         return
@@ -1036,5 +1059,5 @@ def _require_route_b_scratch_root(helpers: PrivHelpers, settings) -> None:
             f"route-B scratch root {tmp_root} is outside the privileged "
             f"helper roots ({helpers.roots_text}): the slot documents are "
             "group-scoped to the slot uid through e2b-maint, so point "
-            "E2B_ROUTE_B_TMP_ROOT at the workspace base"
+            "E2B_ROUTE_B_TMP_ROOT at the workspace base or the state base"
         ) from None

@@ -124,17 +124,45 @@ static const char *priv_workspace_base(void) {
     return (value != NULL && *value != '\0') ? value : PRIV_DEFAULT_WORKSPACE_BASE;
 }
 
+/* N27: the platform's own records (``_runtime/<id>/sandbox.json``, the
+ * checkpoint/snapshot stores, the uid pool) live under ``E2B_STATE_BASE``,
+ * which is a *sibling* of the sandbox trees once the deployment names one.
+ * Without the variable it *is* the workspace base -- one shape, one root. */
+const char *priv_state_base(void) {
+    const char *value = getenv("E2B_STATE_BASE");
+    return (value != NULL && *value != '\0') ? value : priv_workspace_base();
+}
+
+/* A second root only when the deployment names one. Both the whitelist and the
+ * diagnostic that reports it ask this, so "which roots do you accept?" has a
+ * single answer. */
+static int priv_has_second_state_root(void) {
+    return strcmp(priv_state_base(), priv_workspace_base()) != 0;
+}
+
 static const char *priv_shared_volume_root(void) {
     const char *value = getenv("E2B_SHARED_VOLUME_ROOT");
     return (value != NULL && *value != '\0') ? value : NULL;
 }
 
+static void priv_append_root(char *out, size_t outlen, const char *root) {
+    size_t used = strlen(out);
+    if (used >= outlen) {
+        return;
+    }
+    snprintf(out + used, outlen - used, ", %s", root);
+}
+
 void priv_roots_text(char *out, size_t outlen) {
+    const char *workspace = priv_workspace_base();
     const char *shared = priv_shared_volume_root();
+
+    snprintf(out, outlen, "%s", workspace);
+    if (priv_has_second_state_root()) {
+        priv_append_root(out, outlen, priv_state_base());
+    }
     if (shared != NULL) {
-        snprintf(out, outlen, "%s, %s", priv_workspace_base(), shared);
-    } else {
-        snprintf(out, outlen, "%s", priv_workspace_base());
+        priv_append_root(out, outlen, shared);
     }
 }
 
@@ -188,6 +216,12 @@ int priv_resolve_allowed_path(const char *path, int strict, char *resolved,
         return -1;
     }
     priv_check_root(priv_workspace_base(), real, strict, &matched, err, errlen);
+    if (!matched) {
+        if (priv_has_second_state_root()) {
+            priv_check_root(priv_state_base(), real, strict, &matched, err,
+                            errlen);
+        }
+    }
     if (!matched) {
         const char *shared = priv_shared_volume_root();
         if (shared != NULL) {
