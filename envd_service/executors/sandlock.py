@@ -364,6 +364,89 @@ def _minimal_dev_mounts() -> dict[str, str]:
     return dict(_MINIMAL_DEV_MOUNTS)
 
 
+#: The system directories a synthesized pure root (N16) binds from the host.
+#: Filtered by host existence at build time: the fork *skips* a mount whose
+#: source is gone but *fails* on a missing target, so a directory the host does
+#: not have must never reach the map (it would leave an empty stub behind and
+#: make `/opt` exist or not depending on the node). Measured table:
+#: tmp/k0s/pure-synth-root-symlinks.log.
+_SYNTHETIC_ROOTFS_SYSTEM_DIRS: tuple[str, ...] = (
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/opt",
+)
+
+#: Everything the sandbox must see as a directory in its own root, whether or
+#: not anything is bound onto it. The list is the shape, not a convenience:
+#: `/proc` is only ever *listed* through it (its content is the mediator's
+#: synthesis) and the rest is where today's pure shape answers `EACCES` for a
+#: path outside the allow-list -- an empty directory answers the same way, a
+#: missing one answers `ENOENT` and changes the contract.
+_SYNTHETIC_ROOTFS_SKELETON_DIRS: tuple[str, ...] = (
+    "proc",
+    "dev",
+    "etc",
+    "tmp",
+    "root",
+    "run",
+    "var",
+    "srv",
+    "media",
+    "mnt",
+    "home",
+    "workspace",
+)
+
+
+def _synthetic_rootfs_mounts() -> dict[str, str]:
+    """The bind mounts that fill a synthesized pure root.
+
+    `/dev` is bound as the whole container tree, not as ``minimal_dev``'s six
+    nodes: the pure shape's `/dev` has always *been* that tree, and the six
+    nodes would silently drop `/dev/shm` plus seven more entries -- a tightening
+    of the tenant's view this route must not do by accident. What the whole bind
+    buys is **node-level** equivalence: the same 14 entries, with the four
+    symlinks into ``/proc/self/fd`` (``fd``/``stdin``/``stdout``/``stderr``)
+    preserved in *shape*. Whether those four resolve is the `/proc` synthesis /
+    mediator's line of business, not this mount's -- and it is **not** a promise
+    that bash process substitution works in a synthesized root (in this lane the
+    four dangle; today's pure shape resolves them only because its `/proc` is a
+    real procfs, while the skeleton's is an empty directory).
+    Measured: tmp/k0s/pure-synth-root-dev-hosttree-guarded.log vs
+    tmp/k0s/pure-synth-root-dev-minimal-guarded.log (this round's rerun: full
+    listing, no `[:12]` truncation, `skeleton has /lib64: True` ahead of the exec
+    lines). The "sets are equal" call is re-runnable as the probe's ``devdiff``
+    part: tmp/k0s/pure-synth-root-devdiff-hosttree.log (rc 0 = equal, 14 = 14).
+    """
+    mounts = {
+        directory: directory
+        for directory in _SYNTHETIC_ROOTFS_SYSTEM_DIRS
+        if Path(directory).is_dir()
+    }
+    mounts["/dev"] = "/dev"
+    return mounts
+
+
+def _materialize_synthetic_rootfs(root: Path, mounts: dict[str, str]) -> None:
+    """Create the skeleton and every mount target a synthesized root needs.
+
+    ``0755`` on purpose: the binds and the ``chdir`` into the root happen in the
+    sandbox's own user namespace as the sandbox's own host uid, which owns none
+    of these directories (a ``0700`` root fails the bind with EACCES before the
+    sandbox ever starts). ``_ensure_chroot_mount_points`` then creates the
+    targets the fork refuses to run without.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o755)
+    for name in _SYNTHETIC_ROOTFS_SKELETON_DIRS:
+        (root / name).mkdir(mode=0o755, exist_ok=True)
+    (root / "home" / "user").mkdir(mode=0o755, exist_ok=True)
+    _ensure_chroot_mount_points(root, mounts)
+
+
 class SandlockRunningProcess(RunningProcess):
     """Wraps a fork ``ExecProcess`` returned by ``SandboxInstance.exec``.
 
@@ -626,6 +709,7 @@ class SandlockExecutor(Executor):
         extra_fs_writable: list[str] | None = None,
         fs_mounts: dict[str, str] | None = None,
         sandbox_id: str | None = None,
+        pure_rootfs_dir: Path | str | None = None,
         route_b: RouteBConfig | None = None,
     ) -> None:
         self._workspace_dir = workspace_dir
@@ -670,7 +754,8 @@ class SandlockExecutor(Executor):
         self._extra_fs_writable = list(extra_fs_writable or [])
         self._fs_mounts = dict(fs_mounts or {})
         self._sandbox_id = sandbox_id
-        if self._real_root and self._base_image and self._image_rootfs is not None:
+        self._pure_rootfs_dir = Path(pure_rootfs_dir) if pure_rootfs_dir else None
+        if self._real_root and self._has_sandbox_root:
             # The flag and the worker's seccomp profile have to travel together;
             # probe once per process and fail with the operator's next action
             # instead of failing every create with "instance is closed".
@@ -1891,15 +1976,108 @@ class SandlockExecutor(Executor):
         return bool(self._base_image and self._image_rootfs is not None)
 
     @property
+    def _synthetic_rootfs(self) -> Path | None:
+        """The synthesized root this pure sandbox pivots into, or None (N16).
+
+        Keyed on the *absence* of a base image: a sandbox with an image always
+        uses the image. ``E2B_PURE_ROOTFS=off`` (the default) leaves the pure
+        shape on N15's identity translation, so this is a shape switch an
+        operator flips -- not a silent change to a fleet.
+        """
+        if self._base_image or self._image_rootfs is not None:
+            return None
+        if self._pure_rootfs_dir is None:
+            return None
+        return Path(self._pure_rootfs_dir) / (self._sandbox_id or "unnamed")
+
+    @property
+    def _has_sandbox_root(self) -> bool:
+        """Whether this sandbox has a root of its own to be confined to."""
+        return self._is_image_rootfs or self._synthetic_rootfs is not None
+
+    @property
+    def _sandbox_root(self) -> Path | None:
+        """The root the path mediator and the fork's real root work on."""
+        if self._is_image_rootfs:
+            return Path(self._image_rootfs)
+        return self._synthetic_rootfs
+
+    def _volume_only_mount_map(self) -> dict[str, str]:
+        """N15's mount map: the workspace under both aliases, plus the volumes.
+
+        Named so the two builders stop carrying a third copy of these five
+        lines (``_policy_ceiling`` and ``_build_sandbox``).
+        """
+        mount_map = {
+            "/home/user": self._workspace_dir,
+            "/workspace": self._workspace_dir,
+        }
+        mount_map.update(self._fs_mounts)
+        return mount_map
+
+    def _volume_only_mount_map_writable(self, fs_writable: list[str]) -> list[str]:
+        """The mount points the pure shape must declare writable.
+
+        Load-bearing twice over: the fork derives a mount *source*'s rights from
+        what the policy declares for its mount point, and the per-exec cwd
+        (`/home/user`) has to be inside the instance ceiling or the exec is
+        refused outright ("exec params exceed the instance policy ceiling").
+        """
+        return (
+            list(fs_writable)
+            + ["/workspace", "/home/user"]
+            + [str(virtual) for virtual in self._fs_mounts]
+        )
+
+    def _materialize_root(self, root: Path) -> dict[str, str]:
+        """This sandbox's mount map, with every target created on disk.
+
+        The image branch is verbatim today's code (it is production; its
+        pre-created ``workspace``/``home/user``/``dev`` entries exist because
+        slim images extract without them). The synthesized branch adds the host
+        system directories and the whole-tree ``/dev`` bind on top of the
+        workspace aliases and the volumes.
+        """
+        mount_map = self._volume_only_mount_map()
+        if self._is_image_rootfs:
+            # The workspace alias (/home/user, declared first: the fork breaks
+            # host-source ties by declaration order) plus /workspace, and the
+            # /dev parent dir minimal_dev's nodes hang under -- slim base
+            # images extract without any of the three.
+            for mount_point in ("workspace", "home/user", "dev"):
+                root.joinpath(mount_point).mkdir(parents=True, exist_ok=True)
+            for virtual in self._fs_mounts:
+                root.joinpath(virtual.removeprefix("/")).mkdir(
+                    parents=True, exist_ok=True
+                )
+            # minimal_dev replaces the whole-tree host /dev mount: only the six
+            # single-node mounts (ptmx, pts, null, urandom, zero, tty) are
+            # visible under the chroot's /dev, so /dev/shm and /dev/mqueue
+            # cannot leak in and no fs_deny carve-out is needed. Native
+            # ExecStdio.PTY lives host-side, so no devpts node grants are part
+            # of this shape either.
+            mount_map.update(_minimal_dev_mounts())
+            _ensure_chroot_mount_points(root, mount_map)
+            return mount_map
+        # The synthesized pure root: the host's system directories and the
+        # whole-tree /dev bind go on top of the workspace aliases and volumes.
+        mount_map.update(_synthetic_rootfs_mounts())
+        _materialize_synthetic_rootfs(root, mount_map)
+        return mount_map
+
+    @property
     def _chroot_root(self) -> str:
-        """The root the path mediator confines this sandbox to (N15).
+        """The root the path mediator confines this sandbox to (N15/N16).
 
         An image-rootfs sandbox gets the extracted image. A **pure** sandbox
-        (no base image, no rootfs) gets the **host root**, and that is what
-        makes it mediated at all: virtual path == host path, i.e. identity
-        translation, so every existing chroot handler applies unchanged and the
-        syscalls Landlock has no access right for (stat/readlink/chmod/xattr/
-        inotify_add_watch/open_tree/...) stop leaking host metadata.
+        (no base image, no rootfs) gets the **host root** -- unless the
+        synthesized-root switch (N16, ``pure_rootfs_dir``) is on, in which case
+        it gets its own directory and the synthetic mount table. Host root is
+        what makes the pure shape mediated at all: virtual path == host path,
+        i.e. identity translation, so every existing chroot handler applies
+        unchanged and the syscalls Landlock has no access right for (stat/
+        readlink/chmod/xattr/inotify_add_watch/open_tree/...) stop leaking host
+        metadata.
 
         The alternative -- a second gate written for the pure shape -- was
         rejected in `docs/pure-shape-decision.md` §5: the same 33 entries would
@@ -1913,9 +2091,8 @@ class SandlockExecutor(Executor):
         in-process path is refused rather than silently attributing the
         sandbox's writes to the mediator (SL-1, fail closed).
         """
-        if self._is_image_rootfs:
-            return str(self._image_rootfs)
-        return "/"
+        root = self._sandbox_root
+        return str(root) if root is not None else "/"
 
     def _view_cwd(self, config: ExecConfig) -> str | None:
         """Map a host-side command cwd into the sandbox's view for exec.
@@ -1928,18 +2105,23 @@ class SandlockExecutor(Executor):
 
         * the image shape answers with the **virtual** spelling, which the fork
           joins under the rootfs before its real ``chdir``;
-        * the pure shape (N15) has root "/" -- joining would give the host's own
-          ``/home/user``, which need not exist -- so it answers with the **host**
-          workspace path, which is what the fork can actually chdir to; the
-          mediator then maps that back to /home/user through the mount table
-          (``resolve.rs::host_to_virtual`` checks mount targets first), so the
-          sandbox still reports the canonical alias.
+        * the synthesized pure shape (N16) is a root of its own, so it answers
+          the virtual spelling for the same reason the image shape does;
+        * the pure shape without a root (N15) has root "/" -- joining would give
+          the host's own ``/home/user``, which need not exist -- so it answers
+          with the **host** workspace path, which is what the fork can actually
+          chdir to; the mediator then maps that back to /home/user through the
+          mount table (``resolve.rs::host_to_virtual`` checks mount targets
+          first), so the sandbox still reports the canonical alias.
 
         Paths outside the workspace pass through unchanged in both shapes (S9:
         the image shape's fs_readable covers /).
         """
         cwd = (config.cwd or "").strip()
-        if self._is_image_rootfs:
+        if self._has_sandbox_root:
+            # Both rooted shapes answer with the virtual spelling: the fork
+            # joins it under the root before its real chdir, and both roots
+            # carry /home/user as the workspace's canonical alias.
             if not cwd or cwd.startswith(str(self._workspace_dir)):
                 return "/home/user"
             return cwd or None
@@ -2049,6 +2231,15 @@ class SandlockExecutor(Executor):
                 + [str(virtual) for virtual in self._fs_mounts]
             )
             fs_denied = ["/proc/kcore", "/sys"]
+        else:
+            # N15's pure allow-list, with or without a synthesized root: the
+            # synthetic root does **not** add "/" (in the image shape that
+            # spelling means "the whole rootfs"; here it would only name the
+            # skeleton) and keeps `fs_denied` empty (Landlock's allow-list
+            # already refuses everything outside it). What the mounts do need
+            # is their mount points declared writable -- see
+            # `_volume_only_mount_map_writable`.
+            fs_writable = self._volume_only_mount_map_writable(fs_writable)
         net_allow: list[str] = []
         net_deny: list[str] = []
         http_allow: list[str] = []
@@ -2126,14 +2317,16 @@ class SandlockExecutor(Executor):
             # resolves paths (a `#!` interpreter, a static binary) inside the
             # sandbox's own tree. Only meaningful with a chroot root, and the
             # setting is deployment-wide while the shape is per-sandbox: a
-            # sandbox without a rootfs has nothing to pivot into, so the flag is
-            # a no-op there (loud once per executor) rather than a failed create.
-            if self._base_image and self._image_rootfs is not None:
+            # sandbox with neither an image rootfs nor a synthesized one has
+            # nothing to pivot into, so the flag is a no-op there (loud once per
+            # executor) rather than a failed create.
+            if self._has_sandbox_root:
                 kwargs["real_root"] = True
             else:
                 logger.warning(
                     "E2B_REAL_ROOT is set but sandbox %s has no image rootfs "
-                    "(pure shape): real_root has no effect for it",
+                    "and no synthesized root (pure shape): real_root has no "
+                    "effect for it",
                     self._sandbox_id or "<unnamed>",
                 )
         if self._enable_net_isolation:
@@ -2161,57 +2354,41 @@ class SandlockExecutor(Executor):
                 )
         elif self._fd_inject_connect:
             kwargs["fd_inject_connect"] = True
-        if self._base_image and self._image_rootfs is not None:
-            # Image rootfs mode: chroot into the extracted image and expose
-            # the sandbox directory as /home/user (canonical alias: declared
-            # first, and the fork breaks host-source ties by declaration
-            # order) and /workspace (official SDK spelling) inside it.
-            # fs_mount only takes effect at runtime, so the mount points must
-            # already exist inside the rootfs for chdir() to work.
-            # The rootfs must carry the standard /dev parent dir for
-            # traversal and listings (minimal_dev provides the node names);
-            # slim base images extract without one, so pre-create it like the
-            # other mount points.
-            for mount_point in ("workspace", "home/user", "dev"):
-                Path(self._image_rootfs).joinpath(mount_point).mkdir(
-                    parents=True, exist_ok=True
-                )
-            # Volume mount targets must exist inside the rootfs too.
-            for virtual in self._fs_mounts:
-                Path(self._image_rootfs).joinpath(
-                    virtual.removeprefix("/")
-                ).mkdir(parents=True, exist_ok=True)
-            kwargs["chroot"] = str(self._image_rootfs)
-            mount_map = {
-                "/home/user": self._workspace_dir,
-                "/workspace": self._workspace_dir,
-            }
-            mount_map.update(self._fs_mounts)
-            # minimal_dev replaces the whole-tree host /dev mount: only the
-            # six single-node mounts (ptmx, pts, null, urandom, zero, tty)
-            # are visible under the chroot's /dev, so /dev/shm and
-            # /dev/mqueue cannot leak in and no fs_deny carve-out is needed.
-            # Native ExecStdio.PTY lives host-side, so no devpts node grants
-            # are part of the ceiling either.
-            mount_map.update(_minimal_dev_mounts())
-            _ensure_chroot_mount_points(Path(self._image_rootfs), mount_map)
-            kwargs["fs_mount"] = mount_map
+        root = self._sandbox_root
+        if root is not None:
+            # A root of its own -- the extracted image, or the synthesized pure
+            # root (N16) -- is what the mediator and the fork's real root work
+            # on, and `_materialize_root` is the one place the mount targets are
+            # created inside it (fs_mount only takes effect at runtime, so the
+            # points must already exist for chdir() to work).
+            kwargs["chroot"] = self._chroot_root
+            kwargs["fs_mount"] = self._materialize_root(root)
+            if not self._is_image_rootfs:
+                # Written into `kwargs`, not just into the local: this builder
+                # creates its dict *before* the shape branch (the image shape
+                # never noticed, because its `fs_readable` covers "/" and so
+                # puts `/home/user` inside the ceiling by itself). Without this
+                # the per-exec cwd is refused -- "exec params exceed the
+                # instance policy ceiling: cwd /home/user is outside the
+                # allowed set".
+                kwargs["fs_writable"] = fs_writable
         else:
-            # N15: the pure shape (no base image) is mediated too, with the host
-            # root as the mediator's root -- identity translation, so the
-            # handlers it reaches are the ones that already exist. The mount
-            # table is the image branch's minus `minimal_dev`: on the host root
-            # `/dev` is the host's own, exactly as it was before this change,
-            # and re-mounting six nodes into the sandbox's view would be a
-            # second behaviour change smuggled into this one.
+            # N15: the pure shape (no base image, no synthesized root) is
+            # mediated too, with the host root as the mediator's root --
+            # identity translation, so the handlers it reaches are the ones
+            # that already exist. The mount table is the image branch's minus
+            # `minimal_dev`: on the host root `/dev` is the host's own, exactly
+            # as it was before this change, and re-mounting six nodes into the
+            # sandbox's view would be a second behaviour change smuggled into
+            # this one.
             #
-            # `fs_readable` deliberately does *not* gain "/" here -- in the
-            # image shape that spelling means "the whole image rootfs", and on
-            # the host root it would grant the entire filesystem. Keeping the
-            # allow-list is what makes this a *second* gate rather than a new
-            # policy: `can_read`/`can_write` now enforce on the syscalls
-            # Landlock cannot see exactly what Landlock already enforces on the
-            # ones it can.
+            # `fs_readable` deliberately does *not* gain "/" in either pure
+            # shape -- in the image shape that spelling means "the whole image
+            # rootfs", and on the host root it would grant the entire
+            # filesystem. Keeping the allow-list is what makes this a *second*
+            # gate rather than a new policy: `can_read`/`can_write` now enforce
+            # on the syscalls Landlock cannot see exactly what Landlock already
+            # enforces on the ones it can.
             #
             # Volumes used to reach this shape as symlinks inside the sandbox
             # directory ("virtual mount paths cannot be materialized"): they are
@@ -2219,31 +2396,11 @@ class SandlockExecutor(Executor):
             # so the symlink path is no longer what carries them.
             #
             # The mount points go into `fs_writable` for the image branch's
-            # reason, which is load-bearing twice over: the fork derives a
-            # mount *source*'s rights from what the policy declares for the
-            # mount point, and the per-exec cwd (`/home/user`) has to be inside
-            # the instance ceiling or the exec is refused outright ("exec params
-            # exceed the instance policy ceiling"). The host spellings that are
-            # granted this way are never resolved by the sandbox -- the mount
-            # table wins before the root, for every mediated syscall.
-            fs_writable = (
-                list(fs_writable)
-                + ["/workspace", "/home/user"]
-                + [str(virtual) for virtual in self._fs_mounts]
-            )
-            mount_map = {
-                "/home/user": self._workspace_dir,
-                "/workspace": self._workspace_dir,
-            }
-            mount_map.update(self._fs_mounts)
+            # reason (see `_volume_only_mount_map_writable`). The host spellings
+            # that are granted this way are never resolved by the sandbox -- the
+            # mount table wins before the root, for every mediated syscall.
             kwargs["chroot"] = self._chroot_root
-            kwargs["fs_mount"] = mount_map
-            # Written into `kwargs`, not just into the local: this builder
-            # creates its dict *before* the shape branch (the image shape never
-            # noticed, because its `fs_readable` covers "/" and so puts
-            # `/home/user` inside the ceiling by itself). Without this the
-            # per-exec cwd is refused -- "exec params exceed the instance policy
-            # ceiling: cwd /home/user is outside the allowed set".
+            kwargs["fs_mount"] = self._volume_only_mount_map()
             kwargs["fs_writable"] = fs_writable
         if http_allow and self._image_rootfs is not None:
             # HTTPS MITM for rule-registered domains: sandlock intercepts 443
@@ -2325,6 +2482,11 @@ class SandlockExecutor(Executor):
                 + [str(virtual) for virtual in self._fs_mounts]
             )
             fs_denied = ["/proc/kcore", "/sys"]
+        else:
+            # The one-shot twin of `_policy_ceiling`'s pure branch: same
+            # allow-list, with or without a synthesized root, and the mount
+            # points of the sandbox's own tree declared writable.
+            fs_writable = self._volume_only_mount_map_writable(fs_writable)
         net_allow: list[str] = []
         net_deny: list[str] = []
         http_allow: list[str] = []
@@ -2405,14 +2567,16 @@ class SandlockExecutor(Executor):
             # resolves paths (a `#!` interpreter, a static binary) inside the
             # sandbox's own tree. Only meaningful with a chroot root, and the
             # setting is deployment-wide while the shape is per-sandbox: a
-            # sandbox without a rootfs has nothing to pivot into, so the flag is
-            # a no-op there (loud once per executor) rather than a failed create.
-            if self._base_image and self._image_rootfs is not None:
+            # sandbox with neither an image rootfs nor a synthesized one has
+            # nothing to pivot into, so the flag is a no-op there (loud once per
+            # executor) rather than a failed create.
+            if self._has_sandbox_root:
                 kwargs["real_root"] = True
             else:
                 logger.warning(
                     "E2B_REAL_ROOT is set but sandbox %s has no image rootfs "
-                    "(pure shape): real_root has no effect for it",
+                    "and no synthesized root (pure shape): real_root has no "
+                    "effect for it",
                     self._sandbox_id or "<unnamed>",
                 )
         if self._enable_net_isolation:
@@ -2437,63 +2601,29 @@ class SandlockExecutor(Executor):
                 )
         elif self._fd_inject_connect:
             kwargs["fd_inject_connect"] = True
-        if self._base_image and self._image_rootfs is not None:
-            # Image rootfs mode: chroot into the extracted image and expose
-            # the sandbox directory as /home/user (canonical alias: declared
-            # first, and the fork breaks host-source ties by declaration
-            # order) and /workspace (official SDK spelling) inside it.
-            # fs_mount only takes effect at runtime, so the mount points must
-            # already exist inside the rootfs for chdir() to work.
-            # The rootfs must carry the standard /dev parent dir for
-            # traversal and listings (minimal_dev provides the node names);
-            # slim base images extract without one, so pre-create it like the
-            # other mount points.
-            for mount_point in ("workspace", "home/user", "dev"):
-                Path(self._image_rootfs).joinpath(mount_point).mkdir(
-                    parents=True, exist_ok=True
-                )
-            # Volume mount targets must exist inside the rootfs too.
-            for virtual in self._fs_mounts:
-                Path(self._image_rootfs).joinpath(
-                    virtual.removeprefix("/")
-                ).mkdir(parents=True, exist_ok=True)
-            kwargs["chroot"] = str(self._image_rootfs)
-            mount_map = {
-                "/home/user": self._workspace_dir,
-                "/workspace": self._workspace_dir,
-            }
-            mount_map.update(self._fs_mounts)
-            # minimal_dev replaces the whole-tree host /dev mount: only the
-            # six single-node mounts (ptmx, pts, null, urandom, zero, tty)
-            # are visible under the chroot's /dev, so /dev/shm and
-            # /dev/mqueue cannot leak in and no fs_deny carve-out is needed.
-            # Native ExecStdio.PTY lives host-side, so no devpts node grants
-            # are part of this shape either.
-            mount_map.update(_minimal_dev_mounts())
-            _ensure_chroot_mount_points(Path(self._image_rootfs), mount_map)
-            kwargs["fs_mount"] = mount_map
-            cwd = (config.cwd or "").strip()
-            if not cwd or cwd.startswith(str(self._workspace_dir)):
-                kwargs["cwd"] = "/home/user"
-            else:
-                kwargs["cwd"] = cwd
+        root = self._sandbox_root
+        if root is not None:
+            # A root of its own, either shape: chroot into it and expose the
+            # sandbox directory as /home/user (canonical alias: declared first,
+            # and the fork breaks host-source ties by declaration order) and
+            # /workspace (official SDK spelling) inside it. The mount targets
+            # are created by `_materialize_root` (fs_mount only takes effect at
+            # runtime, so they must already exist for chdir() to work).
+            kwargs["chroot"] = self._chroot_root
+            kwargs["fs_mount"] = self._materialize_root(root)
+            if not self._is_image_rootfs:
+                # This builder's dict predates the shape branch (the image
+                # shape never noticed, because its `fs_readable` covers "/" and
+                # so puts `/home/user` inside the ceiling by itself).
+                kwargs["fs_writable"] = fs_writable
         else:
             # N15, the one-shot twin of `_policy_ceiling`'s pure branch: host
             # root, identity translation, the workspace under both aliases and
             # the sandbox's volumes as mounts (no `minimal_dev` -- see there).
-            fs_writable = (
-                list(fs_writable)
-                + ["/workspace", "/home/user"]
-                + [str(virtual) for virtual in self._fs_mounts]
-            )
-            mount_map = {
-                "/home/user": self._workspace_dir,
-                "/workspace": self._workspace_dir,
-            }
-            mount_map.update(self._fs_mounts)
             kwargs["chroot"] = self._chroot_root
-            kwargs["fs_mount"] = mount_map
-            kwargs["cwd"] = self._view_cwd(config)
+            kwargs["fs_mount"] = self._volume_only_mount_map()
+            kwargs["fs_writable"] = fs_writable
+        kwargs["cwd"] = self._view_cwd(config)
         if http_allow and self._image_rootfs is not None:
             # HTTPS MITM for rule-registered domains: sandlock intercepts 443
             # with an ephemeral CA; splice that CA into a per-sandbox copy of
