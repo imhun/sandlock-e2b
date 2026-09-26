@@ -98,3 +98,28 @@
 4. 池默认 worker 镜像 tag 是 `0.1.0`（08-30 那版，零 netns 代码）⇒ 形态验证必须显式指镜像。
 
 **登记**：`docs/open-issues.md` 的 N38 / N39。
+
+## 追加裁定（2026-09-26）：N42 网络全开 + ④ 的 seccomp 按出厂要求
+
+**背景一（N42，实测）**：线上集群的沙箱**没有出网** —— 一个 `allowInternetAccess=True` 的沙箱
+`1.1.1.1:443` → `PermissionError [Errno 13]`、`pypi.org:443` → `gaierror [Errno -3]`。
+根因：`E2B_ENABLE_NETWORK` 只出现在两套 compose 里，**`deploy/k8s/worker.yaml` 缺**
+（`envd_service/config.py:131` 默认 `false`）⇒ `sandlock.py:2307` 的
+`self._allow_internet_access and self._enable_network` 恒假 ⇒ **SDK 的 `allowInternetAccess` 在线上静默无效**。
+
+**用户裁定（2026-09-26）：「网络先全开吧」。**
+⇒ 缺 `E2B_ENABLE_NETWORK` 的清单都补 `"true"`：`deploy/k8s/worker.yaml`、
+`deploy/compose/docker-compose.multinode.yml`，以及 `deploy/k8s/control-plane.yaml`（先查用途再定，
+依据写报告）。已有的那几处（stack / prod example / autoscale / `local.py`）**不动**。
+语义：沙箱**可按请求**出网；**不带 `network` 的请求仍只到固定域名集**（pypi/npm/github）。
+
+**背景二**：④ `docker-compose.multinode.yml` 三处用 `seccomp=unconfined`，而**出厂要求**
+（`deploy/stack/docker-compose.prod.yml:328`）是 `seccomp=${E2B_SECCOMP_PROFILE:-../seccomp/sandlock-worker.json}`
+—— 即挂真档；`seccomp=unconfined` 是**旧的**做法（stack `:323-326` 的注释写明它被换掉的原因见
+`deploy/seccomp/README.md`）。按树里镜像，④ 的 worker 因为 `E2B_REQUIRE_SECCOMP_FILTER` 会**一个都起不来**。
+
+**用户裁定（2026-09-26）：「另一条按出厂要求修」。**
+⇒ ④ 的三处改成与 stack **同形**的真档，并把出厂要求的 `E2B_REQUIRE_SECCOMP_FILTER` 一并对齐。
+
+**部署侧（控制器负责，不在清单任务内）**：k8s 改完要 `apply.sh` 上集群，并用"`allowInternetAccess=True`
+的沙箱能否连出去"复测 —— 那是 N42 的验收判据。
