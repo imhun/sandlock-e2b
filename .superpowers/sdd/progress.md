@@ -2215,3 +2215,135 @@ Ampere 与 Huygens 各自撞过一次"并行 agent 的暂存文件被卷进自�
 
 **N30 Task 6 的探针因此没通过**：`inside=0 platform=3001024` —— 不是口径不一致，而是**沙箱内量不出来**。
 探针里另外两条**已通过**：超预算写入被拒（`dd` 报 `File too large`，停在 1021 MiB）、删掉后能继续写（`WROTE=ok`）。
+
+## 本轮四条收口（2026-09-26）
+
+| commit | 内容 | 关键证据 |
+|---|---|---|
+| `ab8520a` | pure Task 6：拆箱清账 —— `_delete_sandbox_runtime` 在 `_runtime/<id>` 之后清 `settings.pure_rootfs_dir/<id>`（tree/record/骨架一次拆干净，reconcile 收孤儿同享；取配置而非 base 约定） | TDD RED→GREEN；14 红名单逐条同名 |
+| `5a8077b` | O3 明文清理工具 | 机制=用带主 key 的 `SecretRegistry` 自己的读路径（`_scan_disk`→`_record_from_payload`→`_persist_record`）把 `encrypted != true` 的记录**就地重写成 Fernet 密文**，再删"已被加密记录证明还活着"的明文副本，最后用**第二个全新 registry 重读整棵目录校验**；幂等=第二次 0 重写且 `{path: bytes}` 快照**完全相等**；无 master key 时 **exit 2 且写前拒绝**（两份 `secret.json` 的 sha256 前后不变） |
+| `96c3e4b` | netns Task 6：文档/账本同步（10 文件） | 钉 `test_only_the_arm_lane_keeps_a_low_port_window()`；**简报的裸子串断言在 `COMPOSE_MULTINODE` 上必红**（Task 4 写进文件的实测注释里有该键名）⇒ 改成"剥注释行再判"（RED/GREEN 两份日志）；lane 两相位 `1905 passed`+`57 passed`，`LANE-EXIT=0` |
+| — | N43 定因（`Dewey`，未改源码） | 见下 |
+
+## N43 定因结论（**真回归，已派修**）
+
+`chroot/dispatch.rs:609-610` 的 dirfd 分支先 `readlink(/proc/<pid>/fd/N)`，再交给 `reported_to_virtual`（`:368-373`）；
+后者的"已 pivot ⇒ 内核报的就是虚拟路径"**捷径对 fd 不成立**：沙箱 fd 全是中介在**宿主**上打开后
+用 `NOTIF_ADDFD` 投递的（`:800`/`:922`），内核把链接渲染成**宿主路径**，该串被当虚拟路径塞进
+`resolve_in_root*` ⇒ ENOENT（must-exist 一族 `:753`）或 EACCES（nofollow/open/readlink 一族 `:735`/`:802`/`:2480`）。
+**引入者 `86630ea`（真根，2026-09-23）⇒ N35/N14 的回归**，不是 `PURE_UNGATED`/`Open` 桶。
+**形状**：只有 image-rootfs + `E2B_REAL_ROOT=1` 挂（线上两次 + 本机实跑）；模拟根与 pure 四件套全 OK。
+**修法**：最小修在 `:606-611`（或改 `reported_to_virtual`）"能 host→virtual 映射就先映射、映射不到才当已是虚拟路径"，
+代价一次 mount 前缀比较、无新 syscall；风险=同名目录歧义；根治走 `pidfd_getfd`+`openat`（留给 N14 退役）。
+**并补 fork 用例**（当前 tip 的 dirfd 用例都是非 chroot shim，抓不到）。
+
+## 过程教训（本轮新增一条，已写进派单）
+**简报/计划里的断言可能"看着在守、其实没守"**：本轮撞到三次 ——
+netns T5 的 `"the canary turns it on for worker-2 only"` **因换行从未匹配**（死断言）、
+netns T6 的裸子串断言**必红**（实测注释里有键名）、N30 T4 的 `files == sum(...)` 是**同义反复**。
+⇒ 派单里加了"**断言要能真的证伪**，写不出证伪路径就说明理由"。
+
+## O3 部署侧执行（2026-09-26，控制器做的）
+
+1. **只读现状**：Secret 只有 3 个键（`E2B_API_KEYS`/`E2B_INTERNAL_API_KEY`/`E2B_REDIS_PASSWORD`），
+   **没有 master key**；control-plane **没挂** master key ref ⇒ 正是计划说的**降级态**（`_secrets/**` 明文落盘）。
+2. `secrets.sh --fingerprint` 只读 → `secrets.sh`（幂等补缺）**补出 `E2B_SECRET_MASTER_KEY`**，
+   已有三个键的**指纹逐字未变**（脚本承诺的幂等做到）。
+3. `DRY_RUN` 差异 = worker/autoscaler 加 `E2B_INTERNAL_API_KEYS`、control-plane 加
+   `E2B_SECRET_MASTER_KEY` + `E2B_SECRET_MASTER_KEYS`（共 42 行）；`apply.sh` EXIT=0，CP 滚完。
+4. **两个 CP 副本都拿到主 key**（`len=64`），启动日志里**没有降级告警**。
+5. **清理**：按 runbook 跑 `deploy/scripts/cleanup-plaintext-secrets.py` ⇒ `verified: true`，
+   但报告 `plaintext_records_before: 0` / `rewritten: 0` / `deleted: []`。
+   **控制器独立核实**：`_secrets` 是**空目录**（`find -type f | wc -l` = 0，目录创建于 Sep 18）。
+   ⇒ **是真的没有明文可清**，不是工具看错地方。所以本轮的实际收获是
+   **master key 上线 + 降级态消除 + 清理工具可用且已验过**，而不是"清掉了一堆明文"。
+
+## O3 Task 2（`c360fdc`）：主 key 轮换，"全副本已滚"的判据是**三读三比**
+
+① deploy status（`observedGeneration==generation`、`updatedReplicas==replicas==spec.replicas==availableReplicas`、`unavailableReplicas==0`）；
+② 逐 running 副本 `kubectl exec … printenv E2B_SECRET_MASTER_KEY` 的**指纹** == Secret 当前主 key 指纹，
+且副本数 == `spec.replicas`（env 是容器创建时解析的 ⇒ 这就是"进程此刻真正持有哪把 key"）；
+③ 在 CP pod 内扫 `_secrets/**` 与 `e2b:secret:*`，每条都 `encrypted:true` 且**主 key 单独可解**。
+②不过则③不执行、不算通过 ⇒ **全过才允许 finalize 摘旧 key**。
+
+## N43 修复 + 上线 + 集群复验（2026-09-26，控制器做的部署侧）
+
+- fork `d750fa1`（`reported_to_virtual` 改成"能 host→virtual 映射就先映射"）+ 父仓 `85c5ef2`；
+  真根 dirfd 用例 tip 红（`stat ENOENT(2)` / `lstat·open·readlink EACCES(13)`）→ 修后绿；
+  整档非 root 门禁 913/563/104/98/55/3/0/465 matches baseline；`core_integ` 562→563。
+- wheel 按新 tip 重建（manifest HEAD=`d750fa19…`）→ `build-and-push` → `apply.sh`（只 7 处镜像 tag 差异）
+  → 版本 `0.1.0-597-g3701a53-20260926-163057`。
+- **集群复验逐条通过**：`du -s` `0/rc=1` → `3001000/rc=0`；`find` 无错列出两文件；`tar` rc=0 无错；
+  `os.stat(dir_fd=…)` `FileNotFoundError` → `3000000`。
+
+## N30 Task 6：**集群验收全绿**（`inside == platform` 逐字节相等）
+
+`[PASS] inside == platform: inside=3001024 platform=3001024`
+`[PASS] over-budget write refused: RC=1`（`dd` 报 `File too large`，停在 1021 MiB）
+`[PASS] write after delete: WROTE=ok`
+⇒ 存量口径的**行为面与数字面都验过了**。
+
+⚠️ **一条计划与口径的自相矛盾（记下）**：计划 Step 2 写"沙箱内 `du -sb --apparent-size`"，
+但同一份计划 Task 1/4 定的口径是"**文件按 `st_size`、目录按分配块 `st_blocks×512`**" ——
+`du --apparent-size` 给目录记的是 apparent size，**恰好差一个目录块项**（实测差 1024 B / 一个目录）。
+探针已按口径改（用 `os.walk` + `lstat` 复算），改后逐字节相等。
+
+## 一条 ACR 瞬态（记下，不是凭据失效）
+`build-and-push.sh` 首次在推 **autoscaler** 时报 `insufficient_scope: authorization failed`（worker 同一轮推成功）；
+**原样重试即成功**（`0.1.0-597`）。上午 09:04 同一脚本同一账号也推成功过 ⇒ 判为 ACR 瞬态。
+
+## N27 迁移已执行 + 已上线（2026-09-26，控制器做的运维动作）
+
+窗口影响面：**当前 0 个运行中沙箱**（不会杀进程）；卷上 7 个平台命名空间 + 7 棵沙箱树。
+1. `kubectl scale statefulset/e2b-worker --replicas=0` + 等 pod 删净；tunnel 自检：2 节点 arm64。
+2. `migrate-state-base.sh`（dry-run）计划：7 树→`workspaces/<id>`、`_runtime`+`.route-b`→`state/`、
+   平台命名空间 `STAY`、建 `state`/`workspaces`/`_migrate`(1777)、`SUMMARY … unknown=0`。
+3. `--apply`：**`done=12 unknown=0`**，每条 VERIFY 都是 `same_inode=yes src_gone=yes` 且 files/dirs/bytes 前后相同
+   ⇒ **纯 rename、inode 保留**；`_runtime` 抽样 `sha_same=yes ino_same=yes`；journal `/shared/state/.state-base-migration.journal` **mode=0600**（我要求的硬项）。
+4. `apply.sh`（新清单）+ `scale --replicas=2` ⇒ 两 worker `Running`，CP 滚动完成。
+5. **控制器自验**：卷上布局 = `_builds/_images/_secrets/_snapshots/_templates/_volumes/state/workspaces`；
+   `workspaces/` 下有迁移后的树 + `_migrate`；**冒烟**：新建沙箱 `echo N27-SMOKE-OK` 正常、`pwd=/home/user`。
+
+在途：Kant（pure Task 9 收尾）。
+
+## 全部计划收口（2026-09-26 深夜）
+
+| 工作流 | 结果 |
+|---|---|
+| netns 统一（N36） | **6/6** ✅ |
+| 磁盘口径（N30） | **6/6** ✅（集群验收 `inside == platform` 逐字节相等） |
+| 平台状态另起 BASE（N27） | **8/8** ✅（迁移已执行上线 + 验收 + 文档限定） |
+| 凭据（O3） | **6/6** ✅（含已上线的 master key 与清理工具） |
+| storage-and-nfs（§10.5） | **4/4** ✅（§5.4 两条硬门槛 + 复核判据 + 收口账） |
+| pure 合成 rootfs（N16） | **15/15 + 5b + 配置守卫** ✅（四档 lane 全 `0 failed`） |
+| checkpoint/restore 产品化 | Task 1/2/F2/E2/E3/E4 ✅（F3 条件、F4 已裁定不做） |
+| O2 入口 TLS | 用户裁定搁置（0/6），未动 |
+
+**pure Task 13 的四档**：gate A `2022/10/3/0`、gate B off `2015/17/3/0`、`=1` 合成根+真根 `2019/16/0/0`
+（3 条 N35 xfail 转 pass）、`=0` 与 off 逐字相同、phase 2 `57/1`、本机 unit `14f/1517p` 失败名单逐条同名。
+`synth + REAL_ROOT=0` 那档**只有拒绝**（配置守卫）。
+
+**checkpoint 产品化的两个可见性成果**：`pause` 日志现在说出捕获的是谁
+（`captured /usr/bin/python3 [...]`）、公开只读 `GET /sandboxes/{id}/checkpoint` 能答
+`hasImage/imageMB/capturedAt/lastRestore{...}`；生产形态验收脚本已转正进仓库并**跑绿**。
+
+## 收尾时仍未清的欠账（都已登记，非阻塞）
+
+1. **共享测试镜像 `:latest` 仍是旧引擎**（`.so 4014fa43…` vs `wheels/fork` 的 `fadb7e8d…`）——
+   pure 的 lane 本轮靠显式指 `task12cur` 绕开；**下次跑任何依赖 `:latest` 的 lane 前必须重烤**。
+2. **checkpoint 验收脚本会删宿主 worker pod**，会连打该 pod 上别人的沙箱 —— 缺"这个 worker 上没有别人的沙箱"的礼貌检查。
+3. **三处文档引用 `.superpowers/sdd/pure-task-13-report.md` 的数字，而该报告 gitignored ⇒ 长期会断链**（要么搬进 `docs/`，要么把表复制过去）。
+4. **FUP-28** 仍缺前提③产品路径 soak（要在部署宿主跑 arm64 soak 二进制）。
+5. **N40**（池里 MCP 必 503：基镜像漂移）、**N41 残余**（`save` 失败那半窗口）、**N27 identity 残差**（读不到但看得见名字，我建议由 N16 自然收敛）。
+
+## 欠账清理轮（2026-09-27）
+
+| # | 欠账 | 结果 |
+|---|---|---|
+| 1 | 共享测试镜像 `:latest` 是旧引擎 | **✅ 已清**：`build-test-image.sh` 重烤；镜像内 `libsandlock_ffi.so` = `fadb7e8de9ea24f9`，**与 wheel 内逐字节相同**（重烤前 `4014fa43…`）。这条的失效方式是**静默的**（lane 全绿但测旧引擎），且 Task 9/10/11/13 都靠显式指 `task12cur` 绕开 ⇒ 现在坑关了 |
+| 2 | checkpoint 验收脚本删 worker pod 无礼貌检查 | **✅ 已清**（`d6c6807`）：删 pod 前先读控制面 `GET /internal/nodes/<id>/sandboxes`，名单不是"恰好只有本次验收自己"就**打印出路 + 退出码 2 + 一个 pod 都不碰**，`--force` 是唯一显式出口；RED 6 failed → GREEN 6 passed |
+| 3 | 三处文档引用 gitignored 的报告 ⇒ 断链 | **✅ 已清**（`4f077d6` + `83653d0`）：验收表搬进 `docs/pure-shape-decision.md` §7 作**唯一权威表**；**实际引用是 4 处不是 3 处**（欠账描述本身就错，本轮第 N 次"账面与实际不符"）；`n14-retire` §5.3 的数字表**删掉只留机制+指路**（本轮见过基线漂 `1288→1501→1517`、gate A `2003→2022`，两份带数字的表迟早有一份是错的） |
+| 4 | FUP-28 缺产品路径 soak | **✅ 跑通了**（`020ff58`）：两宿主三条判据全过 —— 受管 open **0/97482**、300×`exec` **0/300**、内核原始 EAGAIN **1124–3713/40000 > 0**；**带变异对照**（预算改 0 ⇒ open 2616/2015 失败、exec 120/248 红）自证不是空跑。<br>⚠️ **但它诚实标了一条要紧的**：**arm64 的镜像 loader 路径没有 `..`** ⇒ FUP-28 那条「exec /bin/echo」判据在 arm64 上是**恒真的空检查** ⇒ **前提③只满足了"受管 open"那一半**，exec 那半要改成"解释器挂 `..`"的形状才有效 |
+| 5 | N40 / N41 残余 / N27 identity 残差 | **未动**（见下） |
+
+**节点清理（控制器做的）**：Kuhn 在节点上留了 `/opt/fup28` —— 实测 `.94` **1.8 GB**、`.140` **253 MB**（比它报的 200MB×2 大），已 `find -depth -delete` 清掉，两边复核 `CLEAN`。
