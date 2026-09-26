@@ -31,6 +31,8 @@ from envd_service.runtime.image_resolver import (
 )
 from envd_service.runtime.checkpoint_store import (
     capture_checkpoint_image,
+    checkpoint_status,
+    record_restore_outcome,
     remove_checkpoint_images,
     restore_checkpoint_image,
     resume_sandbox,
@@ -2950,6 +2952,62 @@ async def _checkpoint_before_pause(
         )
 
 
+def _restore_outcome_of(reply: dict) -> dict:
+    """The four facts a read-only query repeats, out of a resume's reply (E3).
+
+    A resume has three honest endings and one of them used to be silent: the
+    image came back (``restored`` with the pid and the fd count), there was no
+    image (a reason), or the session never left this worker and was thawed --
+    the reply's ``reason`` is empty there, and an empty reason beside
+    ``restored: false`` reads like a failure the reader has to guess about. So
+    the outcome says which one it was.
+    """
+    reason = str(reply.get("reason") or "")
+    restored = bool(reply.get("restored"))
+    if not restored and not reason:
+        reason = (
+            "nothing was restored from an image: this worker thawed a session "
+            "that was still here"
+        )
+    count = reply.get("unrecoveredFdCount")
+    if count is None:
+        count = len(reply.get("unrecoveredFds") or [])
+    return {
+        "restored": restored,
+        "reason": reason,
+        "pid": reply.get("pid"),
+        "unrecoveredFdCount": count,
+    }
+
+
+async def _record_restore_outcome(
+    settings: Settings, request: Request, sandbox_id: str, reply: dict
+) -> None:
+    """Let the read-only query answer for this resume (E3).
+
+    Off the event loop for the same reason the resume itself is: the file lives
+    on the network-backed volume. Failure to record is a warning, never a
+    change to what the resume just did -- the platform's rule for bookkeeping
+    that sits next to a delivery (compare the capture path's own reasons).
+    """
+    try:
+        await asyncio.to_thread(
+            record_restore_outcome,
+            _registry_workspace_base(request.app.state.runtime_registry, settings),
+            sandbox_id,
+            _restore_outcome_of(reply),
+            state_base=_registry_state_base(
+                request.app.state.runtime_registry, settings
+            ),
+        )
+    except Exception:  # noqa: BLE001 - a note cannot fail the thing it describes
+        logger.warning(
+            "resume of sandbox %s could not record its outcome",
+            sandbox_id,
+            exc_info=True,
+        )
+
+
 async def _resume_process_tree(
     settings: Settings, request: Request, sandbox_id: str
 ) -> None:
@@ -2975,14 +3033,23 @@ async def _resume_process_tree(
                 request.app.state.runtime_registry, settings
             ),
         )
-    except Exception:  # noqa: BLE001 - the resume delivery still succeeds
+    except Exception as exc:  # noqa: BLE001 - the resume delivery still succeeds
         logger.warning(
             "resume of sandbox %s could not bring its process back from the "
             "checkpoint; it is running with an empty process tree",
             sandbox_id,
             exc_info=True,
         )
+        # E3: the failure is recorded too -- "why did the last resume bring
+        # nothing back" is the question the read-only query exists for.
+        await _record_restore_outcome(
+            settings,
+            request,
+            sandbox_id,
+            {"restored": False, "reason": f"{type(exc).__name__}: {exc}"},
+        )
         return
+    await _record_restore_outcome(settings, request, sandbox_id, reply)
     if reply.get("restored"):
         logger.info(
             "resume of sandbox %s resumed image %s into the session (pid %s); "
@@ -3084,6 +3151,40 @@ async def agent_checkpoint_sandbox(sandbox_id: str, request: Request) -> Respons
     return JSONResponse(reply)
 
 
+@router.get("/agent/sandboxes/{sandbox_id}/checkpoint")
+async def agent_checkpoint_status(sandbox_id: str, request: Request) -> Response:
+    """Read-only: what this worker knows about the sandbox's image (E3).
+
+    The other half of :func:`agent_checkpoint_sandbox`: that one writes the
+    image, this one reports it -- whether there is one, how big it is, when it
+    appeared, and how the last resume went (``lastRestore``, which is where a
+    user finally sees the fds D6 says a restored process cannot bring back).
+
+    Delivery contract, the same shape as the write endpoint: 401 without the
+    internal key, 404 for a sandbox this worker holds no record of (it has no
+    image and no restore history to speak about), 200 with the answer
+    otherwise. It changes nothing -- no file is written, no state is touched --
+    so a control plane may ask it at any time.
+    """
+    settings = request.app.state.settings
+    try:
+        _require_internal_key(request, settings)
+    except PermissionError:
+        return Response(status_code=401)
+    runtime = request.app.state.runtime_registry.get(sandbox_id)
+    if runtime is None:
+        return Response(status_code=404)
+    # Off the event loop: ``imageMB`` is a directory walk, and on the
+    # network-backed volume that walk is the expensive part of this answer.
+    reply = await asyncio.to_thread(
+        checkpoint_status,
+        _registry_workspace_base(request.app.state.runtime_registry, settings),
+        sandbox_id,
+        state_base=_registry_state_base(request.app.state.runtime_registry, settings),
+    )
+    return JSONResponse(reply)
+
+
 @router.post("/agent/sandboxes/{sandbox_id}/restore")
 async def agent_restore_sandbox(sandbox_id: str, request: Request) -> Response:
     """Resume this sandbox's checkpoint image into a session on this worker (S2/S4).
@@ -3126,6 +3227,10 @@ async def agent_restore_sandbox(sandbox_id: str, request: Request) -> Response:
         return Response(
             status_code=500, content=f"{type(exc).__name__}: {exc}"[:500]
         )
+    # E3: the restore endpoint is the other way an image comes back (the resume
+    # lifecycle is the first), and its outcome is what the read-only query
+    # repeats -- so it is recorded here too.
+    await _record_restore_outcome(settings, request, sandbox_id, reply)
     return JSONResponse(reply)
 
 

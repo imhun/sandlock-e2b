@@ -137,6 +137,17 @@ async def _post(worker, sandbox_id: str, action: str, key: str | None):
         )
 
 
+async def _get(worker, sandbox_id: str, action: str, key: str | None):
+    app, _settings, _registry = worker
+    headers = {} if key is None else {"X-Internal-Key": key}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://worker"
+    ) as client:
+        return await client.get(
+            f"/agent/sandboxes/{sandbox_id}/{action}", headers=headers
+        )
+
+
 async def test_checkpoint_requires_the_internal_key(workspace) -> None:
     worker = _make_worker(workspace)
     app, settings, runtime_registry = worker
@@ -385,3 +396,89 @@ async def test_resume_thaws_a_session_that_is_still_here(workspace) -> None:
         "a stale image must not survive the sandbox running again, or the next "
         "resume would rewind it to an older process"
     )
+
+
+async def test_checkpoint_status_requires_the_internal_key(workspace) -> None:
+    """只读不等于公开：这条是 worker 的内部面，读也要内部钥匙。"""
+    worker = _make_worker(workspace)
+    app, settings, runtime_registry = worker
+    _register_runtime(app, runtime_registry, "sbx_status_auth")
+
+    anonymous = await _get(worker, "sbx_status_auth", "checkpoint", None)
+    wrong = await _get(worker, "sbx_status_auth", "checkpoint", "not-the-key")
+
+    assert anonymous.status_code == 401
+    assert wrong.status_code == 401
+
+
+async def test_checkpoint_status_of_a_sandbox_this_worker_does_not_own_is_404(
+    workspace,
+) -> None:
+    worker = _make_worker(workspace)
+    _app, settings, _registry = worker
+
+    resp = await _get(
+        worker, "sbx_status_missing", "checkpoint", settings.internal_api_key
+    )
+
+    assert resp.status_code == 404
+
+
+async def test_checkpoint_status_says_an_image_is_there(workspace) -> None:
+    """有图但还没恢复过：图在、多大、什么时候的，恢复那一栏是空的。"""
+    worker = _make_worker(workspace)
+    app, settings, runtime_registry = worker
+    _register_runtime(app, runtime_registry, "sbx_status_image")
+    image = sandbox_checkpoint_dir(workspace, "sbx_status_image") / "latest"
+    image.mkdir(parents=True)
+    (image / "meta.json").write_bytes(b"x" * (2 * 1024 * 1024))
+
+    resp = await _get(
+        worker, "sbx_status_image", "checkpoint", settings.internal_api_key
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "sandboxID": "sbx_status_image",
+        "hasImage": True,
+        "imageMB": 2,
+        "capturedAt": int(image.stat().st_mtime),
+        "lastRestore": None,
+    }
+
+
+async def test_checkpoint_status_reports_what_the_restore_left_behind(
+    workspace,
+) -> None:
+    """恢复之后：图被吃掉（hasImage 回到 false），丢掉几个 fd 留在 lastRestore 里。"""
+    worker = _make_worker(workspace)
+    app, settings, runtime_registry = worker
+    events: list[str] = []
+    executor = _RecordingExecutor(live_session=False, events=events)
+    _live_context(app, runtime_registry, "sbx_status_restored", executor, events)
+    image = sandbox_checkpoint_dir(workspace, "sbx_status_restored") / "latest"
+    image.mkdir(parents=True)
+    (image / "meta.json").write_text("{}", encoding="utf-8")
+
+    restored = await _post(
+        worker, "sbx_status_restored", "restore", settings.internal_api_key
+    )
+    assert restored.status_code == 200
+
+    resp = await _get(
+        worker, "sbx_status_restored", "checkpoint", settings.internal_api_key
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["sandboxID"] == "sbx_status_restored"
+    assert body["hasImage"] is False
+    assert body["imageMB"] == 0
+    assert body["capturedAt"] is None
+    assert body["lastRestore"] == {
+        "restored": True,
+        "reason": "",
+        "pid": 31337,
+        "unrecoveredFdCount": 1,
+        "at": body["lastRestore"]["at"],
+    }

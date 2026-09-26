@@ -15,8 +15,10 @@ about what the *deployment* does with an image once it exists.
 
 from __future__ import annotations
 
+import json
 import os
 import stat
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,13 +28,16 @@ from envd_service.runtime.checkpoint_store import (
     IMAGE_NAME,
     capture_checkpoint_image,
     checkpoint_image_dir,
+    checkpoint_status,
     consume_checkpoint_image,
     live_session_present,
+    record_restore_outcome,
+    restore_outcome_path,
     restore_checkpoint_image,
     resume_sandbox,
 )
 from envd_service.runtime.platform_disk import measure_platform_disk_bytes
-from gateway_common.paths import sandbox_checkpoint_dir
+from gateway_common.paths import sandbox_checkpoint_dir, sandbox_runtime_dir
 
 MIB = 1024 * 1024
 
@@ -541,3 +546,91 @@ def test_the_capture_log_names_the_program_it_captured(
         "captured /usr/bin/dash ['/bin/sh', '-c', \"sh -c 'exec python3 -c pass'\"]); "
         "the platform account now holds 0 MiB of an unlimited budget"
     )
+
+
+def test_checkpoint_status_says_there_is_no_image(tmp_path: Path) -> None:
+    """A sandbox that was never paused answers with the shape, not with an error.
+
+    一个从没 checkpoint 过的沙箱和一次也没恢复过的沙箱都是正常状态：读的人要能
+    一眼拿到"没有图 / 没有恢复记录"，而不是去区分 404 和空值。
+    """
+    base = tmp_path / "sandboxes"
+    _sandbox_tree(base, "sbx_status")
+
+    assert checkpoint_status(base, "sbx_status") == {
+        "sandboxID": "sbx_status",
+        "hasImage": False,
+        "imageMB": 0,
+        "capturedAt": None,
+        "lastRestore": None,
+    }
+
+
+def test_checkpoint_status_reports_the_image_and_the_last_restore(
+    tmp_path: Path,
+) -> None:
+    """有图 / 图多大 / 上次恢复丢了几个 fd —— 三个问题一次答完。"""
+    base = tmp_path / "sandboxes"
+    _sandbox_tree(base, "sbx_status")
+    image = checkpoint_image_dir(base, "sbx_status")
+    image.mkdir(parents=True)
+    (image / "meta.json").write_bytes(b"x" * (2 * MIB))
+    record_restore_outcome(
+        base,
+        "sbx_status",
+        {
+            "restored": True,
+            "reason": "",
+            "pid": 31337,
+            "unrecoveredFdCount": 2,
+        },
+    )
+
+    status = checkpoint_status(base, "sbx_status")
+
+    assert status["sandboxID"] == "sbx_status"
+    assert status["hasImage"] is True
+    assert status["imageMB"] == 2
+    assert isinstance(status["capturedAt"], int)
+    # 整份相等（不做子串判据）：键集就是契约，`at` 之后由实现从盘上读回。
+    assert status["lastRestore"] == {
+        "restored": True,
+        "reason": "",
+        "pid": 31337,
+        "unrecoveredFdCount": 2,
+        "at": status["lastRestore"]["at"],
+    }
+
+
+def test_the_restore_outcome_is_recorded_beside_the_runtime_record(
+    tmp_path: Path,
+) -> None:
+    """恢复结果落在 worker 自己的运行时目录里，与 ``sandbox.json`` 并列。
+
+    不往控制面的沙箱记录里加字段：那次恢复是某个 worker 做过的事，记录里再存一份
+    就成了第二个真相来源（见模块 docstring 的 D3/D5）。
+    """
+    base = tmp_path / "sandboxes"
+    _sandbox_tree(base, "sbx_status")
+
+    record_restore_outcome(
+        base,
+        "sbx_status",
+        {"restored": False, "reason": "no checkpoint image for this sandbox"},
+    )
+
+    path = restore_outcome_path(base, "sbx_status")
+    assert path == sandbox_runtime_dir(base, "sbx_status") / "last-restore.json"
+    mode = stat.S_IMODE(path.parent.stat().st_mode)
+    assert mode == 0o700, (
+        f"the runtime dir holds the record too and must stay 0700, got {oct(mode)}"
+    )
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["restored"] is False
+    assert written["reason"] == "no checkpoint image for this sandbox"
+    assert written["pid"] is None
+    assert written["unrecoveredFdCount"] == 0
+    # 秒级、UTC：一处诊断读数不该给出它没有的分辨率，也不该让读者去猜时区。
+    stamp = datetime.fromisoformat(written["at"])
+    assert stamp.tzinfo is timezone.utc
+    assert written["at"] == stamp.isoformat(timespec="seconds")

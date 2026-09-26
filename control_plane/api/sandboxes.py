@@ -2762,6 +2762,76 @@ async def get_sandbox_logs(
 
 
 @router.get(
+    "/sandboxes/{sandbox_id}/checkpoint",
+    dependencies=[Depends(require_api_key)],
+)
+async def get_sandbox_checkpoint(
+    sandbox_id: str, request: Request
+) -> dict[str, Any]:
+    """只读：这个沙箱的 checkpoint 图与最近一次恢复（E3）。
+
+    The image and the last restore are facts about what a *sandbox node* did --
+    the worker's own directory holds them (see
+    :mod:`envd_service.runtime.checkpoint_store`), and this endpoint asks that
+    node. The alternative (a ``checkpoint`` field on the sandbox record) was
+    refused: the record would then be a second source of truth about a process
+    the control plane never saw, and every field there has to survive the
+    storage round trip. Deliberately **read-only**: ``pause``/``resume`` keep
+    answering 204 and nothing here writes anything.
+
+    Answers 404 for a sandbox this control plane does not know (or that belongs
+    to another tenant, same as every other read). For a known sandbox it always
+    answers 200: a node that cannot be reached adds ``unreachable: true`` to the
+    "no image" shape rather than turning a diagnostic question into a new kind
+    of failure, and a node whose worker answers something else is treated the
+    same way.
+    """
+    registry = _registry(request)
+    try:
+        record = registry.get(sandbox_id)
+        _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+    node = request.app.state.nodes.get(record.node_id or "local")
+    if node is not None and node.address != "local://":
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"{node.address}/agent/sandboxes/{sandbox_id}/checkpoint",
+                    headers={
+                        "X-Internal-Key": request.app.state.settings.internal_api_key
+                    },
+                )
+            if resp.status_code == 200:
+                payload = resp.json()
+                if isinstance(payload, dict) and "hasImage" in payload:
+                    return payload
+        except (httpx.HTTPError, ValueError):
+            pass
+        return {
+            "sandboxID": sandbox_id,
+            "hasImage": False,
+            "imageMB": 0,
+            "capturedAt": None,
+            "lastRestore": None,
+            "unreachable": True,
+        }
+    # ``local://`` (or a node this control plane has no agent for): the shared
+    # worker is in this process, so the answer is read where the worker would
+    # have read it -- from the platform's own base, never from the record's tree
+    # (compare ``_command_logs``).
+    from envd_service.runtime.checkpoint_store import checkpoint_status
+
+    return checkpoint_status(
+        request.app.state.workspace_base,
+        sandbox_id,
+        state_base=request.app.state.state_base,
+    )
+
+
+@router.get(
     "/v2/sandboxes/{sandbox_id}/logs",
     dependencies=[Depends(require_api_key)],
 )

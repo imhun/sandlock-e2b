@@ -42,12 +42,28 @@ in its place) and ``resume`` removes it, on *both* of its paths: the thaw of a
 session that is still here, and the restore of one that is gone. That is what
 keeps "an image exists" meaning "a paused sandbox whose process is not on any
 worker", so a later resume can never rewind a sandbox to an older process.
+
+**Where the answer to a read-only question lives (E3, 2026-09-26).** A sandbox's
+image, its size and "how many fds did the last resume lose" are facts about what
+*a worker* did, so the last of them is written by the worker into **its own**
+runtime directory (``_runtime/<id>/last-restore.json``, beside ``sandbox.json``
+and the same ``0700``) and the control plane only proxies
+(``GET /sandboxes/{id}/checkpoint``). The alternative -- adding the outcome to
+the control plane's sandbox record -- was rejected on purpose: every field there
+has to survive a Redis round trip and both ``to_storage_dict``/``from_dict``
+paths, and "the last restore" is the sandbox *node's* observation, so a copy in
+the record would be a second source of truth about a process the control plane
+never saw. The record keeps answering "is this sandbox paused"; the worker
+answers "what did the last resume actually bring back", and a node that cannot
+be reached says so rather than guessing (``unreachable`` in the proxy reply).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from envd_service.runtime.platform_disk import (
@@ -56,7 +72,7 @@ from envd_service.runtime.platform_disk import (
     measure_platform_disk_bytes,
     platform_budget_bytes,
 )
-from gateway_common.paths import sandbox_checkpoint_dir
+from gateway_common.paths import sandbox_checkpoint_dir, sandbox_runtime_dir
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +81,13 @@ logger = logging.getLogger(__name__)
 #: like an extension would make that temporary directory a sibling of something
 #: else entirely.
 IMAGE_NAME = "latest"
+
+#: The last restore this worker performed (see :func:`record_restore_outcome`).
+#: It sits beside the runtime record (``sandbox.json``) and the command log, and
+#: it is *never* inside :data:`IMAGE_NAME`: the image is written by the sandbox's
+#: own slot under its own uid, and a read-only query's bookkeeping does not
+#: belong in the one directory that hand-off is about.
+LAST_RESTORE_NAME = "last-restore.json"
 
 _MIB = 1024 * 1024
 
@@ -152,6 +175,115 @@ def image_bytes(image: Path) -> int:
         return 0
     size = priv_helpers.dir_size(image)
     return 0 if size is None else int(size)
+
+
+def restore_outcome_path(
+    workspace_base, sandbox_id: str, *, state_base=None
+) -> Path:
+    """``<state base>/_runtime/<id>/last-restore.json`` -- the last restore's result.
+
+    Beside the runtime record and the command log, not inside the image tree:
+    the image belongs to the sandbox's own uid (see the module doc), while this
+    file is the worker's own note about what it did with that image.
+    """
+    return (
+        sandbox_runtime_dir(workspace_base, sandbox_id, state_base=state_base)
+        / LAST_RESTORE_NAME
+    )
+
+
+def record_restore_outcome(
+    workspace_base, sandbox_id: str, outcome: dict, *, state_base=None
+) -> None:
+    """Remember how the last resume went for this sandbox (D5/D6's readable half).
+
+    Written to disk rather than kept in memory: a resume can be followed by
+    another worker restart, and "the last resume lost two fds" is exactly the
+    thing somebody reads *later*, while looking at a sandbox they did not watch
+    fail. The file is replaced in one ``os.replace`` inside its own directory,
+    so a reader sees either the whole previous record or the whole new one.
+
+    A failed restore is recorded too -- the reason is the answer the reader came
+    for -- and a recording that cannot happen is a warning, never a failure of
+    the resume it describes.
+    """
+    record = restore_outcome_path(workspace_base, sandbox_id, state_base=state_base)
+    try:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # The same mode the registry gives ``_runtime/<id>``
+            # (``RuntimeRegistry._ensure_runtime_dir``): a first-record race must
+            # not leave the directory of the record, this file and the command
+            # log traversable by the sandbox whose record it holds. Best effort,
+            # like every other mode in this module.
+            os.chmod(record.parent, 0o700)
+        except OSError:  # pragma: no cover - best effort
+            pass
+        payload = {
+            "restored": bool(outcome.get("restored")),
+            "reason": str(outcome.get("reason") or ""),
+            "pid": outcome.get("pid"),
+            "unrecoveredFdCount": int(outcome.get("unrecoveredFdCount") or 0),
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        tmp = record.with_name(record.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, record)
+    except OSError:  # pragma: no cover - a bookkeeping write cannot fail a resume
+        logger.warning(
+            "sandbox %s: could not record the restore outcome",
+            sandbox_id,
+            exc_info=True,
+        )
+
+
+def checkpoint_status(
+    workspace_base, sandbox_id: str, *, state_base=None
+) -> dict:
+    """This sandbox's image and its last restore, in the read-only query's shape.
+
+    Answers the three questions a user could not ask before E3 -- is there an
+    image, how big is it, and what did the last resume bring back -- from the
+    two places that know: the image directory (``gateway_common.paths``) and the
+    outcome file this worker writes (:func:`record_restore_outcome`).
+
+    Nothing here is a failure when absent: a sandbox that was never paused and a
+    sandbox that was never resumed both answer with ``0``/``None`` rather than
+    an error, because "there is no image" is the answer to the question.
+
+    ``capturedAt`` is the image directory's mtime in whole seconds (the engine's
+    save is a rename, so it is the moment the image appeared) and ``None`` when
+    there is no image.
+    """
+    image = checkpoint_image_dir(workspace_base, sandbox_id, state_base=state_base)
+    has_image = image.is_dir()
+    captured_at: int | None = None
+    if has_image:
+        try:
+            captured_at = int(image.stat().st_mtime)
+        except OSError:  # pragma: no cover - a vanished image is "no image"
+            captured_at = None
+            has_image = False
+    last: dict | None = None
+    try:
+        last = json.loads(
+            restore_outcome_path(
+                workspace_base, sandbox_id, state_base=state_base
+            ).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        # Never resumed, or a half-written file from an older shape: both read
+        # as "nothing to report", which is what a diagnostic query may say.
+        last = None
+    if not isinstance(last, dict):
+        last = None
+    return {
+        "sandboxID": sandbox_id,
+        "hasImage": has_image,
+        "imageMB": (image_bytes(image) // _MIB) if has_image else 0,
+        "capturedAt": captured_at,
+        "lastRestore": last,
+    }
 
 
 def _platform_numbers(workspace_base, state_base=None) -> tuple[int, int]:
