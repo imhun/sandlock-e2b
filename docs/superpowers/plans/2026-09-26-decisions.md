@@ -76,3 +76,25 @@
 > 计划（重写后的 `2026-09-26-checkpoint-restore-productization.md`）的 Task 1 因此改成
 > **覆盖缺口**而不是"解一道禁令"：模拟根缺会话恢复用例、真根缺"恢复后仍能 exec"断言、
 > "会话启动时没装上 stub 的 grant"是**静默失败**（这三条才是要补的）。
+
+## 追加裁定（2026-09-26，同日）：N38 —— 本地池的 `E2B_EXECUTOR` 也切成 `auto`
+
+**背景**：实现 N36-② 时实测发现，把 `E2B_ENABLE_NET_ISOLATION` + `E2B_FD_INJECT_CONNECT`
+成对打开后，**池里跑的仍是共享 netns** —— 因为 `deploy/compose/docker-compose.autoscale.yml:116`
+的 `E2B_EXECUTOR` 默认是 `local`，而 `envd_service/executors/local.py` 明写
+"No Sandlock isolation"，`enable_net_isolation` 只在
+`envd_service/executors/factory.py:210` 传给 **sandlock** 执行器。
+也就是说：**按原裁定做完，② 的目标（池与车队对齐）并未达成**，而低端口窗口一删，
+共享 netns + 通配规则就会 EACCES。
+
+**用户裁定（选 A）**：**把池的 `E2B_EXECUTOR` 也改成 `auto`**，让池真吃 per-sandbox netns。
+
+**随之要做的（已实测的连带项，按顺序解）**：
+1. `E2B_ENABLE_NETWORK` 在池的 worker env 里也缺 —— 补上；
+2. 补上后实测仍 `ECONNREFUSED`、且沙箱内 `127.0.1.1:53` **不监听** ⇒ 这一串要单独查（连接口 50005+
+   的入站映射与通配 DNS 网关在池形态下的行为）；
+3. `E2B_ROUTE_B_TMP_ROOT` 在 `E2B_AS_WORKER_ENV` 里缺失 ⇒ 当前镜像在池里 **exit 1**（N39），
+   要先于形态验证修掉；
+4. 池默认 worker 镜像 tag 是 `0.1.0`（08-30 那版，零 netns 代码）⇒ 形态验证必须显式指镜像。
+
+**登记**：`docs/open-issues.md` 的 N38 / N39。
