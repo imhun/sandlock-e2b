@@ -288,18 +288,11 @@ workspace 仍以 `/home/user`、`/workspace` 两个别名进树，拆箱时骨�
 **真漏洞**（前者把 wildcard 绕过灌回来，后者把凭据放进沙箱的授权集）。今天这条约束由骨架常量
 `_SYNTHETIC_ROOTFS_SYSTEM_DIRS` 表达（里面没有 `/etc`），并由上表两处判据守着。
 
-**两态与验收**（`E2B_REAL_ROOT` 的读法按 2026-09-26 的追加裁定：`=0` ⇔ N15 identity、
-`=1` ⇔ 合成根 + 真根）：
-
-| 档 | 结果 |
-|---|---|
-| pure 默认（`E2B_PURE_ROOTFS` 不设 = `off`） | gate B off **2015 passed / 17 skipped / 3 xfailed / 0 failed** |
-| pure + 合成根（`E2B_PURE_ROOTFS=synth` + `E2B_REAL_ROOT=1`） | **2019 passed / 16 skipped / 0 failed**（3 条 N35 xfail 转 pass、1 条别名用例不再 skip） |
-| 镜像形态（gate A） | 2022 passed / 10 skipped / 3 xfailed / 0 failed |
-| phase 2（非 root worker） | 57 passed / 1 skipped |
-
-全表（逐档数字、基线与差、被拒组合）在 `docs/pure-shape-decision.md` §7，那是本轮的
-权威落点；原始 lane 日志在 gitignored 的 `tmp/k0s/n16-*.log`，日志若被清以该文档的数字为准。**`E2B_PURE_ROOTFS=synth` 配 `E2B_REAL_ROOT=0` 没有"这一档"**：那个组合结构性不成立
+**两态**（`E2B_REAL_ROOT` 的读法按 2026-09-26 的追加裁定：`=0` ⇔ N15 identity、
+`=1` ⇔ 合成根 + 真根）：两态与四档全量（gate A / gate B off / 合成根 / phase 2）的逐档数字、
+基线与差，**唯一权威表在 `docs/pure-shape-decision.md` §7**，本节不再复述数字（两份各自带数字的
+表迟早有一份是错的）。原始 lane 日志在 gitignored 的 `tmp/k0s/n16-*.log`，日志若被清以 §7 的数字为准。
+**`E2B_PURE_ROOTFS=synth` 配 `E2B_REAL_ROOT=0` 没有"这一档"**：那个组合结构性不成立
 （bind 只在真根那条路径上发生，模拟形态把虚拟路径翻译进**空骨架** ⇒ 生成期 `execvp("/bin/sh")`
 errno 13 ⇒ container 崩塌 ⇒ 之后每个 verb 都答 `InstanceClosed`），所以 `create_app` 当场 loud
 拒绝、exit 1（原句见追加裁定与 Task 13 报告 §2）。**一条验收注记（Task 12）**：
