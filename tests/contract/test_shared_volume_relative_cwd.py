@@ -4,15 +4,22 @@ Regression for backlog #25: a cwd-derived relative open (`cat mnt/data/x`)
 bypassed the /workspace/<rel> sub-mount, so chroot sandboxes saw EACCES (or
 ENOENT) for every relative volume path once the bind workaround was removed.
 
-Shape scope: both aliases are *chroot* virtual paths -- ``_view_cwd`` maps a
-host workspace cwd to ``/home/user`` only when a base image is in play, and the
-pure shape's cwd is the host workspace directory with ``fs_mounts`` ignored
-(``envd_service/executors/sandlock.py``). The end-to-end test below is
-therefore gated on the image-rootfs shape, the mirror image of
-``tests/contract/test_pure_shape_workspace_ownership.py``'s ``_NO_BASE_IMAGE``;
-the alias key set itself is asserted shape-independently by
+Shape scope: both aliases are *rooted* virtual paths -- resolved by the mount
+table (``/home/user`` and ``/workspace`` are both bound to the workspace), which
+is why a command that inherits the sandbox cwd reports ``/home/user``. Two
+shapes have such a root: the image's rootfs, and the pure shape's synthesized
+skeleton (N16, ``E2B_PURE_ROOTFS=synth``). The end-to-end test below is
+therefore gated on *a rooted shape* (``_ROOTED_SHAPE_ONLY``), the mirror image
+of ``tests/contract/test_pure_shape_workspace_ownership.py``'s
+``_NO_BASE_IMAGE``; the alias key set itself is asserted shape-independently by
 ``test_runtime_context_registers_both_volume_aliases`` here and by
 ``tests/unit/test_policy_mapping.py::test_volume_views_map_under_both_workspace_aliases``.
+
+The old gate was ``E2B_BASE_IMAGE`` alone, and its skip reason said "the pure
+shape runs with the host workspace cwd and has no /home/user alias". That
+premise expired with N15 (which put the workspace under both aliases in *both*
+shapes -- the pure one through the same mediator with the host root as its
+root) and is wrong twice over since N16 gave the pure shape a root of its own.
 """
 from __future__ import annotations
 
@@ -30,14 +37,20 @@ from tests.contract.test_uid_permissions import (
 )
 
 # Mirrors tests/contract/test_pure_shape_workspace_ownership.py::_NO_BASE_IMAGE
-# (marker object + decorator), inverted: this contract needs the image-rootfs
-# (chroot) shape, which is what makes the two aliases sandbox-visible paths.
-_IMAGE_ROOTFS_ONLY = pytest.mark.skipif(
-    not os.environ.get("E2B_BASE_IMAGE"),
+# (marker object + decorator), inverted and widened: this contract needs a shape
+# with a *root* to be confined to, which is what makes the two aliases
+# sandbox-visible paths. The two legal pure shapes are set by the 2026-09-26
+# ruling (docs/superpowers/plans/2026-09-26-decisions.md): the identity root
+# (no root at all -- out of scope here) and the synthesized root.
+_ROOTED_SHAPE_ONLY = pytest.mark.skipif(
+    not (
+        os.environ.get("E2B_BASE_IMAGE")
+        or os.environ.get("E2B_PURE_ROOTFS") == "synth"
+    ),
     reason=(
-        "image-rootfs contract requires a non-empty E2B_BASE_IMAGE "
-        "(chroot shape); the pure shape runs with the host workspace cwd "
-        "and has no /home/user alias"
+        "the workspace aliases are resolved by the mount table, which needs a "
+        "sandbox root: set E2B_BASE_IMAGE (image shape) or "
+        "E2B_PURE_ROOTFS=synth (pure shape)"
     ),
 )
 
@@ -50,7 +63,7 @@ ALIAS_POOL_SIZE = 16
 
 
 @pytest.mark.asyncio
-@_IMAGE_ROOTFS_ONLY
+@_ROOTED_SHAPE_ONLY
 async def test_volume_visible_from_both_workspace_aliases(make_apps, workspace):
     # This file gets its **own** uid pool. Route-B leases one live slot per
     # uid, and the suite's other ownership contracts run on 20000/21000: a
@@ -104,12 +117,17 @@ async def test_volume_visible_from_both_workspace_aliases(make_apps, workspace):
         assert stdout == b"hello\nhello\nhello\n"
         assert stderr == b""
 
-        # Decision ① (2026-09-10): the chroot shape's canonical workspace
-        # alias is `/home/user`, so a command that inherits the sandbox cwd
-        # reports `/home/user` -- the alias the pre-A2 reverse lookup handed
-        # out by accident, now pinned by the declaration order. The sandbox
-        # above is reused on purpose: one sandbox per test file keeps the
-        # worker's per-uid route-B slot ledger free of cross-test leases.
+        # Decision ① (2026-09-10): a rooted shape's canonical workspace alias is
+        # `/home/user`, so a command that inherits the sandbox cwd reports
+        # `/home/user` -- the alias the pre-A2 reverse lookup handed out by
+        # accident, now pinned by the declaration order. The assertion holds in
+        # both rooted shapes (image rootfs and synthesized pure root, measured
+        # 2026-09-26). The rootless identity shape has no `/home/user` to report
+        # at all -- it answers "can't cd to /home/user" and its `pwd` is the
+        # host workspace path (same probe) -- which is why it is skipped above.
+        # The sandbox above is reused on purpose: one sandbox per test file
+        # keeps the worker's per-uid route-B slot ledger free of cross-test
+        # leases.
         code, stdout, stderr = _result(
             await _run_cmd(client, payload, "pwd && pwd -P")
         )

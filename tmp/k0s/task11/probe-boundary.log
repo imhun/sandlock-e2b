@@ -1,0 +1,79 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+shape [identity] has_sandbox_root=False chroot_root=/ root_listing=''
+shape [synth-realroot] has_sandbox_root=True chroot_root=/tmp/tmp7ztlk0uy-pure-rootfs/sbx_slot_1 root_listing='bin dev etc home lib lib64 media mnt opt proc root run sbin srv tmp usr var workspace'
+
+DIFF pwd                                                  identity=[0, '/var/lib/e2b-test-runtime/task11-boundary/sbx_probe\n', '']
+                                                          synth   =[0, '/home/user\n', '']
+DIFF ls /                                                 identity=[0, 'bin\nboot\ndev\netc\nhome\nlib\nlib64\nmedia\nmnt\nopt\nproc\nroot\nrun\nsbin\nsrv\nsys\ntmp\nusr\nvar\nworkspace\n', '']
+                                                          synth   =[0, 'bin\ndev\netc\nhome\nlib\nlib64\nmedia\nmnt\nopt\nproc\nroot\nrun\nsbin\nsrv\ntmp\nusr\nvar\nworkspace\n', '']
+DIFF stat /                                               identity=[0, '  File: /\n  Size: 30        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 51397127    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:03.798270411 +0000\nModify: 2026-09-26 11:48:02.374599317 +0000\nChange: 2026-09-26 11:48:03.774309607 +0000\n Birth: 2026-09-26 11:48:02.374599317 +0000\n', '']
+                                                          synth   =[0, '  File: /\n  Size: 136       \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 51397274    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:04.141496834 +0000\nModify: 2026-09-26 11:48:04.115874205 +0000\nChange: 2026-09-26 11:48:04.115874205 +0000\n Birth: 2026-09-26 11:48:04.113754330 +0000\n', '']
+     stat /etc                                            identity=[1, '', "stat: cannot statx '/etc': Permission denied\n"]
+                                                          synth   =[1, '', "stat: cannot statx '/etc': Permission denied\n"]
+
+     stat /etc/passwd                                     identity=[1, '', "stat: cannot statx '/etc/passwd': Permission denied\n"]
+                                                          synth   =[1, '', "stat: cannot statx '/etc/passwd': Permission denied\n"]
+
+DIFF stat /var                                            identity=[0, '  File: /var\n  Size: 6         \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 50784556    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-08-24 00:00:00.000000000 +0000\nModify: 2026-08-24 00:00:00.000000000 +0000\nChange: 2026-09-26 11:48:03.744285334 +0000\n Birth: 2026-09-26 11:48:03.742361869 +0000\n', '']
+                                                          synth   =[0, '  File: /var\n  Size: 0         \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 51397281    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:04.114824794 +0000\nModify: 2026-09-26 11:48:04.114824794 +0000\nChange: 2026-09-26 11:48:04.114887953 +0000\n Birth: 2026-09-26 11:48:04.114824794 +0000\n', '']
+DIFF stat /var/lib                                        identity=[0, '  File: /var/lib\n  Size: 32        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 50784557    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-08-24 00:00:00.000000000 +0000\nModify: 2026-09-26 10:01:37.435606436 +0000\nChange: 2026-09-26 11:48:03.744319898 +0000\n Birth: 2026-09-26 11:48:03.744285334 +0000\n', '']
+                                                          synth   =[1, '', "stat: cannot statx '/var/lib': No such file or directory\n"]
+DIFF stat /var/lib/e2b-test-runtime                       identity=[0, '  File: /var/lib/e2b-test-runtime\n  Size: 30        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 50784422    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (65534/ UNKNOWN)   Gid: (65534/ UNKNOWN)\nAccess: 2026-09-26 10:01:31.653526555 +0000\nModify: 2026-09-26 11:48:03.744319898 +0000\nChange: 2026-09-26 11:48:03.744319898 +0000\n Birth: 2026-09-26 11:48:03.744319898 +0000\n', '']
+                                                          synth   =[1, '', "stat: cannot statx '/var/lib/e2b-test-runtime': No such file or directory\n"]
+     stat /usr                                            identity=[0, '  File: /usr\n  Size: 18        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 50784637    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-08-24 00:00:00.000000000 +0000\nModify: 2026-08-24 00:00:00.000000000 +0000\nChange: 2026-09-26 11:48:02.611936914 +0000\n Birth: 2026-09-26 11:48:02.559618023 +0000\n', '']
+                                                          synth   =[0, '  File: /usr\n  Size: 18        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 50784637    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-08-24 00:00:00.000000000 +0000\nModify: 2026-08-24 00:00:00.000000000 +0000\nChange: 2026-09-26 11:48:02.611936914 +0000\n Birth: 2026-09-26 11:48:02.559618023 +0000\n', '']
+
+     stat /usr/bin                                        identity=[0, '  File: /usr/bin\n  Size: 22        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 50784476    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-03 03:42:34.444984071 +0000\nModify: 2026-09-26 10:01:31.800748895 +0000\nChange: 2026-09-26 10:01:31.985077318 +0000\n Birth: 2026-09-26 10:01:31.985045296 +0000\n', '']
+                                                          synth   =[0, '  File: /usr/bin\n  Size: 22        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 50784476    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-03 03:42:34.444984071 +0000\nModify: 2026-09-26 10:01:31.800748895 +0000\nChange: 2026-09-26 10:01:31.985077318 +0000\n Birth: 2026-09-26 10:01:31.985045296 +0000\n', '']
+
+DIFF stat /dev                                            identity=[1, '', "stat: cannot statx '/dev': Permission denied\n"]
+                                                          synth   =[0, '  File: /dev\n  Size: 320       \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1025\tInode: 1           Links: 5\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:02.557300442 +0000\nModify: 2026-09-26 11:48:02.561905525 +0000\nChange: 2026-09-26 11:48:02.561905525 +0000\n Birth: 2026-09-26 11:48:02.557300442 +0000\n', '']
+DIFF stat /dev/null                                       identity=[1, '', "stat: cannot statx '/dev/null': Permission denied\n"]
+                                                          synth   =[0, '  File: /dev/null\n  Size: 0         \tBlocks: 0          IO Block: 4096   character special file\nDevice: 0,1025\tInode: 5           Links: 1     Device type: 1,3\nAccess: (0666/crw-rw-rw-)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:02.561293909 +0000\nModify: 2026-09-26 11:48:02.561293909 +0000\nChange: 2026-09-26 11:48:02.561371493 +0000\n Birth: 2026-09-26 11:48:02.561293909 +0000\n', '']
+DIFF stat /home                                           identity=[0, '  File: /home\n  Size: 0         \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 13548114    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-07-04 09:05:00.000000000 +0000\nModify: 2026-07-04 09:05:00.000000000 +0000\nChange: 2026-08-28 13:56:09.967734942 +0000\n Birth: 2026-08-28 13:56:08.836301487 +0000\n', '']
+                                                          synth   =[0, '  File: /home\n  Size: 8         \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 51397285    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:04.115077123 +0000\nModify: 2026-09-26 11:48:04.115202469 +0000\nChange: 2026-09-26 11:48:04.115398368 +0000\n Birth: 2026-09-26 11:48:04.115077123 +0000\n', '']
+DIFF stat /home/user                                      identity=[0, '  File: /home/user\n  Size: 18        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 51397246    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:03.744319898 +0000\nModify: 2026-09-26 11:48:03.744319898 +0000\nChange: 2026-09-26 11:48:03.744319898 +0000\n Birth: 2026-09-26 11:48:03.744319898 +0000\n', '']
+                                                          synth   =[0, '  File: /home/user\n  Size: 18        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 51397268    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:04.070824556 +0000\nModify: 2026-09-26 11:48:04.070824556 +0000\nChange: 2026-09-26 11:48:04.070824556 +0000\n Birth: 2026-09-26 11:48:04.070824556 +0000\n', '']
+DIFF stat /home/user/workspace                            identity=[0, '  File: /home/user/workspace\n  Size: 14        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 51397247    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:03.744319898 +0000\nModify: 2026-09-26 11:48:03.744319898 +0000\nChange: 2026-09-26 11:48:03.744319898 +0000\n Birth: 2026-09-26 11:48:03.744319898 +0000\n', '']
+                                                          synth   =[0, '  File: /home/user/workspace\n  Size: 14        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 51397269    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:04.070824556 +0000\nModify: 2026-09-26 11:48:04.070824556 +0000\nChange: 2026-09-26 11:48:04.070824556 +0000\n Birth: 2026-09-26 11:48:04.070824556 +0000\n', '']
+DIFF stat /workspace                                      identity=[0, '  File: /workspace\n  Size: 18        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 51397246    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:03.744319898 +0000\nModify: 2026-09-26 11:48:03.744319898 +0000\nChange: 2026-09-26 11:48:03.744319898 +0000\n Birth: 2026-09-26 11:48:03.744319898 +0000\n', '']
+                                                          synth   =[0, '  File: /workspace\n  Size: 18        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 51397268    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:04.070824556 +0000\nModify: 2026-09-26 11:48:04.070824556 +0000\nChange: 2026-09-26 11:48:04.070824556 +0000\n Birth: 2026-09-26 11:48:04.070824556 +0000\n', '']
+DIFF stat /workspace/workspace                            identity=[0, '  File: /workspace/workspace\n  Size: 14        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 51397247    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:03.744319898 +0000\nModify: 2026-09-26 11:48:03.744319898 +0000\nChange: 2026-09-26 11:48:03.744319898 +0000\n Birth: 2026-09-26 11:48:03.744319898 +0000\n', '']
+                                                          synth   =[0, '  File: /workspace/workspace\n  Size: 14        \tBlocks: 0          IO Block: 4096   directory\nDevice: 0,1005\tInode: 51397269    Links: 1\nAccess: (0755/drwxr-xr-x)  Uid: (    0/ UNKNOWN)   Gid: (    0/ UNKNOWN)\nAccess: 2026-09-26 11:48:04.070824556 +0000\nModify: 2026-09-26 11:48:04.070824556 +0000\nChange: 2026-09-26 11:48:04.070824556 +0000\n Birth: 2026-09-26 11:48:04.070824556 +0000\n', '']
+     stat /src                                            identity=[1, '', "stat: cannot statx '/src': Permission denied\n"]
+                                                          synth   =[1, '', "stat: cannot statx '/src': Permission denied\n"]
+
+     stat /src/host-only                                  identity=[1, '', "stat: cannot statx '/src/host-only': No such file or directory\n"]
+                                                          synth   =[1, '', "stat: cannot statx '/src/host-only': No such file or directory\n"]
+
+     stat /src/host-only/SECRET                           identity=[1, '', "stat: cannot statx '/src/host-only/SECRET': No such file or directory\n"]
+                                                          synth   =[1, '', "stat: cannot statx '/src/host-only/SECRET': No such file or directory\n"]
+
+     stat /nonexistent-task11                             identity=[1, '', "stat: cannot statx '/nonexistent-task11': Permission denied\n"]
+                                                          synth   =[1, '', "stat: cannot statx '/nonexistent-task11': Permission denied\n"]
+
+     stat /home/user/nonexistent-task11                   identity=[1, '', "stat: cannot statx '/home/user/nonexistent-task11': No such file or directory\n"]
+                                                          synth   =[1, '', "stat: cannot statx '/home/user/nonexistent-task11': No such file or directory\n"]
+
+     cat /etc/passwd                                      identity=[1, '', 'cat: /etc/passwd: Permission denied\n']
+                                                          synth   =[1, '', 'cat: /etc/passwd: Permission denied\n']
+
+     cat /src                                             identity=[1, '', 'cat: /src: Permission denied\n']
+                                                          synth   =[1, '', 'cat: /src: Permission denied\n']
+
+     cat /nonexistent-task11                              identity=[1, '', 'cat: /nonexistent-task11: Permission denied\n']
+                                                          synth   =[1, '', 'cat: /nonexistent-task11: Permission denied\n']
+
+     cat workspace/own.txt                                identity=[0, 'own\n', '']
+                                                          synth   =[0, 'own\n', '']
+
+     stat ../../workspaces/sbx_other                      identity=[1, '', "stat: cannot statx '../../workspaces/sbx_other': No such file or directory\n"]
+                                                          synth   =[1, '', "stat: cannot statx '../../workspaces/sbx_other': No such file or directory\n"]
+
+DIFF stat /var/lib/e2b-test-runtime/siblings              identity=[1, '', "stat: cannot statx '/var/lib/e2b-test-runtime/siblings': Permission denied\n"]
+                                                          synth   =[1, '', "stat: cannot statx '/var/lib/e2b-test-runtime/siblings': No such file or directory\n"]
+DIFF cd /home/user && pwd && pwd -P                       identity=[2, '', "/bin/sh: 1: cd: can't cd to /home/user\n"]
+                                                          synth   =[0, '/home/user\n/home/user\n', '']
+     cd /workspace && pwd                                 identity=[0, '/workspace\n', '']
+                                                          synth   =[0, '/workspace\n', '']
+

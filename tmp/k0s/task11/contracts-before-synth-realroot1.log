@@ -1,0 +1,11 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+s..                                                                      [100%]
+=============================== warnings summary ===============================
+tests/contract/test_pure_shape_workspace_ownership.py: 33 warnings
+  /usr/local/lib/python3.14/asyncio/threads.py:26: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    return await loop.run_in_executor(None, func_call)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/contract/test_shared_volume_relative_cwd.py:52: image-rootfs contract requires a non-empty E2B_BASE_IMAGE (chroot shape); the pure shape runs with the host workspace cwd and has no /home/user alias
+2 passed, 1 skipped, 33 warnings in 3.09s

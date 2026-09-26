@@ -1,0 +1,173 @@
+{
+  "shapes": {
+    "identity": {
+      "B": {
+        "E2B_PURE_ROOTFS": "off",
+        "E2B_REAL_ROOT": "0",
+        "has_sandbox_root": false,
+        "chroot_root": "/",
+        "synthetic_rootfs": null
+      },
+      "A": {
+        "E2B_PURE_ROOTFS": "off",
+        "E2B_REAL_ROOT": "0",
+        "has_sandbox_root": false,
+        "chroot_root": "/",
+        "synthetic_rootfs": null
+      }
+    },
+    "synth-realroot": {
+      "B": {
+        "E2B_PURE_ROOTFS": "synth",
+        "E2B_REAL_ROOT": "1",
+        "has_sandbox_root": true,
+        "chroot_root": "/tmp/tmpaofix2sk-pure-rootfs/sbx_slot_2",
+        "synthetic_rootfs": "/tmp/tmpaofix2sk-pure-rootfs/sbx_slot_2"
+      },
+      "A": {
+        "E2B_PURE_ROOTFS": "synth",
+        "E2B_REAL_ROOT": "1",
+        "has_sandbox_root": true,
+        "chroot_root": "/tmp/tmp4v4k2xtv-pure-rootfs/sbx_slot_3",
+        "synthetic_rootfs": "/tmp/tmp4v4k2xtv-pure-rootfs/sbx_slot_3"
+      }
+    }
+  },
+  "results": {
+    "identity": {
+      "[B] cd /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace": [
+        2,
+        "",
+        "/bin/sh: 1: cd: can't cd to /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace\n"
+      ],
+      "[B] /bin/stat /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace": [
+        1,
+        "",
+        "stat: cannot statx '/var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace': Permission denied\n"
+      ],
+      "[B] /bin/cat /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt": [
+        1,
+        "",
+        "cat: /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt: Permission denied\n"
+      ],
+      "[B] printf x > /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/b-wrote.txt": [
+        2,
+        "",
+        "/bin/sh: 1: cannot create /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/b-wrote.txt: Permission denied\n"
+      ],
+      "[B] /bin/rm /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt": [
+        1,
+        "",
+        "rm: cannot remove '/var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt': Permission denied\n"
+      ],
+      "[B] cat workspace/secret.txt": [
+        0,
+        "B-secret",
+        ""
+      ],
+      "[B] cat ../sbx_a/workspace/secret.txt": [
+        1,
+        "",
+        "cat: ../sbx_a/workspace/secret.txt: Permission denied\n"
+      ],
+      "[B] cat /etc/passwd": [
+        1,
+        "",
+        "cat: /etc/passwd: Permission denied\n"
+      ],
+      "[B] cat /src/host-only/SECRET": [
+        1,
+        "",
+        "cat: /src/host-only/SECRET: Permission denied\n"
+      ],
+      "[B] stat /src": [
+        1,
+        "",
+        "stat: cannot statx '/src': Permission denied\n"
+      ],
+      "[A] /bin/cat /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt": [
+        0,
+        "A-secret",
+        ""
+      ],
+      "[A] cat workspace/secret.txt": [
+        0,
+        "A-secret",
+        ""
+      ],
+      "[A] pwd": [
+        0,
+        "/var/lib/e2b-test-runtime/task11-uid-probe/sbx_a\n",
+        ""
+      ]
+    },
+    "synth-realroot": {
+      "[B] cd /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace": [
+        2,
+        "",
+        "/bin/sh: 1: cd: can't cd to /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace\n"
+      ],
+      "[B] /bin/stat /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace": [
+        1,
+        "",
+        "stat: cannot statx '/var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace': No such file or directory\n"
+      ],
+      "[B] /bin/cat /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt": [
+        1,
+        "",
+        "cat: /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt: Permission denied\n"
+      ],
+      "[B] printf x > /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/b-wrote.txt": [
+        2,
+        "",
+        "/bin/sh: 1: cannot create /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/b-wrote.txt: Permission denied\n"
+      ],
+      "[B] /bin/rm /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt": [
+        1,
+        "",
+        "rm: cannot remove '/var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt': Permission denied\n"
+      ],
+      "[B] cat workspace/secret.txt": [
+        0,
+        "B-secret",
+        ""
+      ],
+      "[B] cat ../sbx_a/workspace/secret.txt": [
+        1,
+        "",
+        "cat: ../sbx_a/workspace/secret.txt: Permission denied\n"
+      ],
+      "[B] cat /etc/passwd": [
+        1,
+        "",
+        "cat: /etc/passwd: Permission denied\n"
+      ],
+      "[B] cat /src/host-only/SECRET": [
+        1,
+        "",
+        "cat: /src/host-only/SECRET: Permission denied\n"
+      ],
+      "[B] stat /src": [
+        1,
+        "",
+        "stat: cannot statx '/src': Permission denied\n"
+      ],
+      "[A] /bin/cat /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt": [
+        1,
+        "",
+        "cat: /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt: Permission denied\n"
+      ],
+      "[A] cat workspace/secret.txt": [
+        0,
+        "A-secret",
+        ""
+      ],
+      "[A] pwd": [
+        0,
+        "/home/user\n",
+        ""
+      ]
+    }
+  },
+  "diffs": 3
+}

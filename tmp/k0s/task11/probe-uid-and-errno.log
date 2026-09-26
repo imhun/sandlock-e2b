@@ -1,0 +1,35 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+shape [identity/B] pure_rootfs='off' real_root='0' has_sandbox_root=False chroot_root=/ synthetic_rootfs=None
+shape [identity/A] pure_rootfs='off' real_root='0' has_sandbox_root=False chroot_root=/ synthetic_rootfs=None
+shape [synth-realroot/B] pure_rootfs='synth' real_root='1' has_sandbox_root=True chroot_root=/tmp/tmpaofix2sk-pure-rootfs/sbx_slot_2 synthetic_rootfs=/tmp/tmpaofix2sk-pure-rootfs/sbx_slot_2
+shape [synth-realroot/A] pure_rootfs='synth' real_root='1' has_sandbox_root=True chroot_root=/tmp/tmp4v4k2xtv-pure-rootfs/sbx_slot_3 synthetic_rootfs=/tmp/tmp4v4k2xtv-pure-rootfs/sbx_slot_3
+
+identity        [B] cd /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace = [2, '', "/bin/sh: 1: cd: can't cd to /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace\n"]
+identity        [B] /bin/stat /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace = [1, '', "stat: cannot statx '/var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace': Permission denied\n"]
+identity        [B] /bin/cat /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt = [1, '', 'cat: /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt: Permission denied\n']
+identity        [B] printf x > /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/b-wrote.txt = [2, '', '/bin/sh: 1: cannot create /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/b-wrote.txt: Permission denied\n']
+identity        [B] /bin/rm /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt = [1, '', "rm: cannot remove '/var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt': Permission denied\n"]
+identity        [B] cat workspace/secret.txt                                     = [0, 'B-secret', '']
+identity        [B] cat ../sbx_a/workspace/secret.txt                            = [1, '', 'cat: ../sbx_a/workspace/secret.txt: Permission denied\n']
+identity        [B] cat /etc/passwd                                              = [1, '', 'cat: /etc/passwd: Permission denied\n']
+identity        [B] cat /src/host-only/SECRET                                    = [1, '', 'cat: /src/host-only/SECRET: Permission denied\n']
+identity        [B] stat /src                                                    = [1, '', "stat: cannot statx '/src': Permission denied\n"]
+identity        [A] /bin/cat /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt = [0, 'A-secret', '']
+identity        [A] cat workspace/secret.txt                                     = [0, 'A-secret', '']
+identity        [A] pwd                                                          = [0, '/var/lib/e2b-test-runtime/task11-uid-probe/sbx_a\n', '']
+
+synth-realroot  [B] cd /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace = [2, '', "/bin/sh: 1: cd: can't cd to /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace\n"]
+synth-realroot  [B] /bin/stat /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace = [1, '', "stat: cannot statx '/var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace': No such file or directory\n"]
+synth-realroot  [B] /bin/cat /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt = [1, '', 'cat: /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt: Permission denied\n']
+synth-realroot  [B] printf x > /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/b-wrote.txt = [2, '', '/bin/sh: 1: cannot create /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/b-wrote.txt: Permission denied\n']
+synth-realroot  [B] /bin/rm /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt = [1, '', "rm: cannot remove '/var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt': Permission denied\n"]
+synth-realroot  [B] cat workspace/secret.txt                                     = [0, 'B-secret', '']
+synth-realroot  [B] cat ../sbx_a/workspace/secret.txt                            = [1, '', 'cat: ../sbx_a/workspace/secret.txt: Permission denied\n']
+synth-realroot  [B] cat /etc/passwd                                              = [1, '', 'cat: /etc/passwd: Permission denied\n']
+synth-realroot  [B] cat /src/host-only/SECRET                                    = [1, '', 'cat: /src/host-only/SECRET: Permission denied\n']
+synth-realroot  [B] stat /src                                                    = [1, '', "stat: cannot statx '/src': Permission denied\n"]
+synth-realroot  [A] /bin/cat /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt = [1, '', 'cat: /var/lib/e2b-test-runtime/task11-uid-probe/sbx_a/workspace/secret.txt: Permission denied\n']
+synth-realroot  [A] cat workspace/secret.txt                                     = [0, 'A-secret', '']
+synth-realroot  [A] pwd                                                          = [0, '/home/user\n', '']
+
+measured=identity,synth-realroot failed=- diffs=3

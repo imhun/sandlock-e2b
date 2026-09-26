@@ -1,0 +1,22 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+.................s...................s..s........                        [100%]
+=============================== warnings summary ===============================
+tests/security/test_fork_network_features.py: 15 warnings
+tests/security/test_network_enforcement.py: 41 warnings
+tests/security/test_process_limits.py: 155 warnings
+tests/security/test_quota_admission.py: 296 warnings
+tests/security/test_real_root_denials.py: 20 warnings
+tests/security/test_real_root_mounts.py: 13 warnings
+tests/security/test_sandlock_isolation.py: 20 warnings
+tests/security/test_template_isolation.py: 42 warnings
+tests/security/test_uid_isolation.py: 1 warning
+tests/security/test_worker_nonroot.py: 142 warnings
+  /usr/local/lib/python3.14/asyncio/threads.py:26: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    return await loop.run_in_executor(None, func_call)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/security/test_fork_network_features.py:370: requires E2B_BASE_IMAGE (image-rootfs sandboxes)
+SKIPPED [1] tests/security/test_template_isolation.py:45: no base image configured for template isolation test
+SKIPPED [1] tests/security/test_template_isolation.py:169: the unprivileged worker shape both production manifests ship
+46 passed, 3 skipped, 745 warnings in 175.52s (0:02:55)

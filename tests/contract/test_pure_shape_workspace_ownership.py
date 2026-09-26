@@ -1,11 +1,13 @@
 """FUP #6 regression contract: pure-sandlock workspace ownership.
 
-The pure shape (``E2B_BASE_IMAGE`` empty) runs commands directly with the
-host RunAs identity — no chroot, and therefore no supervisor mediation tier
-to create files on the sandbox's behalf. A root worker therefore has to
-chown the root-created workspace to the sandbox's own host identity,
-otherwise the first shell write to the workspace root is EACCES (the gate-B
-migration trio; evidence ``tmp/m4-bisect-t1-pure.log``).
+The pure shape (``E2B_BASE_IMAGE`` empty) runs commands as the host RunAs
+identity, and its workspace is a plain host directory that the worker (root)
+creates before the sandbox starts. The mediator that N15 put in front of the
+pure shape resolved that directory, but it cannot hand it to a sandbox the
+worker still owns: a root worker therefore has to chown the root-created
+workspace to the sandbox's own host identity, otherwise the first shell write
+to the workspace root is EACCES (the gate-B migration trio; evidence
+``tmp/m4-bisect-t1-pure.log``).
 
 "Own host identity" is per-sandbox since E3.2 became the default (the uid
 allocated from the worker's pool); with the pool switched off explicitly it is
@@ -21,8 +23,11 @@ target is owned by the shared RunAs uid — not root and not a world-writable
 permission change.
 
 Skipped outside the Linux sandlock runner and whenever a base image is
-configured (the image-rootfs/chroot shape uses supervisor mediation and is
-covered by gate A).
+configured (the image-rootfs shape is covered by gate A). The ownership
+requirement does not depend on *which* of the pure shape's two legal roots is
+in play (the identity root, or the synthesized skeleton of N16,
+``E2B_PURE_ROOTFS=synth``), so this case is deliberately not gated on the root
+switch -- only on ``E2B_BASE_IMAGE`` being empty.
 """
 
 from __future__ import annotations

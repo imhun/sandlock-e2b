@@ -16,6 +16,16 @@ the E2B layer.
 Under a non-root supervisor sandlock refuses arbitrary ``RunAs`` uids
 (S1.2 fail-closed contract, verified in the sandlock fork's own suite);
 these tests are the root form and skip otherwise.
+
+The pure shape has two legal roots since the 2026-09-26 ruling
+(``docs/superpowers/plans/2026-09-26-decisions.md``): the identity root (N15,
+root ``/``) and the synthesized skeleton (N16, ``E2B_PURE_ROOTFS=synth``). The
+case below is about isolation, and isolation holds in both -- but the *spelling*
+of one refusal differs, because a sibling sandbox's workspace is a host path
+that exists in the identity tree and is nowhere in the skeleton: ``stat`` of it
+answers EACCES in the first shape and ENOENT in the second. That split is pinned
+below (and contracted in ``tests/security/test_pure_root_errno_contract.py``);
+it is the Task 10 red this migration closed.
 """
 
 from __future__ import annotations
@@ -33,6 +43,13 @@ from tests.security.conftest import route_b_sandbox, run_sh
 
 UID_A = 10000
 UID_B = 10001
+
+#: Which of the pure shape's two legal roots this lane runs (see the module
+#: docstring). ``tests/security/conftest.py::route_b_sandbox`` mirrors
+#: ``E2B_PURE_ROOTFS`` into the executor, so the switch is the shape.
+_ROOTED_PURE_SHAPE = (
+    os.environ.get("E2B_PURE_ROOTFS", "off").strip().lower() == "synth"
+)
 
 
 def _run(workspace: str, uid: int, cmd: list[str]):
@@ -100,7 +117,10 @@ def test_distinct_host_uids_isolate_same_path_files(workspace):
     # Kernel DAC backstop (unmediated syscalls): B cannot chdir or stat into
     # A's `0770 A:worker-gid` workspace even though both uids are different
     # sandboxes -- B runs with `setgroups([])` and gid=B, so it is not in the
-    # worker's group and the other bits are 0.
+    # worker's group and the other bits are 0. With a synthesized root the same
+    # `stat` never reaches the DAC check: the path is under the skeleton's empty
+    # `/var`, so it is not in the tree at all (ENOENT). `chdir`'s diagnostic is
+    # the same word in both shapes, and both are pinned byte-exactly.
     chdir_b = _run(
         str(ws_b), UID_B, ["/bin/sh", "-c", f"cd {ws_a / 'workspace'}"]
     )
@@ -112,7 +132,13 @@ def test_distinct_host_uids_isolate_same_path_files(workspace):
     stat_b = _run(str(ws_b), UID_B, ["/bin/stat", str(ws_a / "workspace")])
     assert stat_b.exit_code != 0
     assert stat_b.stderr in _diagnostic(
-        "stat", f"cannot statx '{ws_a / 'workspace'}': Permission denied"
+        "stat",
+        f"cannot statx '{ws_a / 'workspace'}': "
+        + (
+            "No such file or directory"
+            if _ROOTED_PURE_SHAPE
+            else "Permission denied"
+        ),
     )
 
     # Open path: sandlock's grant check (B is never granted A's workspace)
@@ -123,8 +149,11 @@ def test_distinct_host_uids_isolate_same_path_files(workspace):
     assert cat_b.exit_code != 0
     assert cat_b.stderr in _diagnostic("cat", f"{secret_a}: Permission denied")
 
-    # A's control read succeeds.
-    cat_a = _run(str(ws_a), UID_A, ["/bin/cat", str(secret_a)])
+    # A's control read succeeds -- through its own cwd, the one spelling of the
+    # path both root states share. (The *host* path of A's own file is not a
+    # shared spelling: the identity shape refuses it as ungranted and the
+    # synthesized shape has no such path; neither is what this case is about.)
+    cat_a = _run(str(ws_a), UID_A, ["/bin/cat", "workspace/secret.txt"])
     assert cat_a.exit_code == 0
     assert cat_a.stdout == b"A-secret"
 
