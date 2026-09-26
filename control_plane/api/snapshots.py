@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +38,11 @@ router = APIRouter()
 #: retry arrives, *during* the first copy. Serializing on the id makes that
 #: retry wait for the first attempt and then answer with its record, instead of
 #: starting a second full copy. A second control-plane replica would need this
-#: in the shared store; the deployment runs one (`deploy/k8s/control-plane.yaml`),
-#: and the docstring of `create_snapshot` says so.
+#: in the shared store, and it has it since F11 step 3: `try_acquire_copy`
+#: takes a TTL'd claim in Redis for a *named* id, and the record's ``creating``
+#: status (on the shared volume) is what a loser waits on. This dict stays for
+#: the single-process deployment and for the unnamed case, where every request
+#: already has an id of its own.
 _SNAPSHOT_LOCKS: dict[str, asyncio.Lock] = {}
 
 
@@ -63,6 +67,27 @@ def _existing_snapshot(request: Request, snapshot_id: str):
     except UnknownSnapshotError:
         return None
     return None if record.status == "failed" else record
+
+
+async def _await_snapshot_record(
+    request: Request, snapshot_id: str, *, timeout_s: float = 2.0
+):
+    """Wait for the record the replica that owns ``snapshot_id`` writes.
+
+    The claim and the record are written by the same replica, so this is a
+    short poll rather than a long wait: a copy can run for minutes (N32
+    measured 76 s for 2000 files), and the caller behind an entry proxy has its
+    own timeout. Finding the record is what makes the loser answer exactly like
+    a local retry (``alreadyExists``, 202 while the copy is still running).
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        existing = _existing_snapshot(request, snapshot_id)
+        if existing is not None:
+            return existing
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.05)
 
 
 def _registry(request: Request):
@@ -292,41 +317,63 @@ async def create_snapshot(
         existing = _existing_snapshot(request, requested_id)
         if existing is not None:
             return _already_exists(existing)
-
-    async with _lock_for(requested_id or sandbox_id):
-        # Re-checked inside the lock: the attempt we waited behind may just
-        # have written its record.
-        if requested_id is not None:
-            existing = _existing_snapshot(request, requested_id)
+        # F11 step 3: a *named* id is fleet-wide. Take the shared claim before
+        # the per-process lock, so two replicas cannot both look, both miss and
+        # both copy the same tree into the same directory. The loser waits for
+        # the winner's record (the copy answers with it, exactly like a local
+        # retry) and otherwise says who holds it.
+        if not _snapshots(request).try_acquire_copy(requested_id):
+            existing = await _await_snapshot_record(request, requested_id)
             if existing is not None:
                 return _already_exists(existing)
-        if _wants_async(request):
-            return await _create_snapshot_async(
-                request, sandbox_id, name, requested_id
+            raise OfficialError(
+                409,
+                f"snapshot {requested_id} is being copied by another "
+                "control-plane replica",
             )
-        try:
-            # N32: the capture talks to the worker with a *synchronous* HTTP
-            # call (the copy is synchronous there too) and can take as long as
-            # the tree is big -- measured 76 s for 2000 files. Running it on
-            # this thread used to block the whole event loop for exactly that
-            # long: the access log went silent for 76.1 s, so the workers'
-            # *arrival* timestamps for heartbeats were one copy old, and the
-            # node-health sweep then orphaned live nodes ("node health sweep:
-            # orphaned sandboxes on e2b-worker-1", 2026-09-22 on the k0s
-            # cluster). Everything the loop serves -- facts that decide whether
-            # a node is alive -- has to keep flowing while a copy runs, so the
-            # capture goes to a worker thread.
-            record = await asyncio.to_thread(
-                _capture_snapshot,
-                request,
-                sandbox_id,
-                name,
-                snapshot_id=requested_id,
-            )
-        except UnknownSandboxError:
-            raise OfficialError(404, f"Sandbox {sandbox_id} not found")
-        except SandboxStateConflictError:
-            raise OfficialError(409, f"Sandbox {sandbox_id} is not running")
+    claimed = requested_id is not None
+
+    try:
+        async with _lock_for(requested_id or sandbox_id):
+            # Re-checked inside the lock: the attempt we waited behind may just
+            # have written its record.
+            if requested_id is not None:
+                existing = _existing_snapshot(request, requested_id)
+                if existing is not None:
+                    return _already_exists(existing)
+            if _wants_async(request):
+                return await _create_snapshot_async(
+                    request, sandbox_id, name, requested_id
+                )
+            try:
+                # N32: the capture talks to the worker with a *synchronous* HTTP
+                # call (the copy is synchronous there too) and can take as long as
+                # the tree is big -- measured 76 s for 2000 files. Running it on
+                # this thread used to block the whole event loop for exactly that
+                # long: the access log went silent for 76.1 s, so the workers'
+                # *arrival* timestamps for heartbeats were one copy old, and the
+                # node-health sweep then orphaned live nodes ("node health sweep:
+                # orphaned sandboxes on e2b-worker-1", 2026-09-22 on the k0s
+                # cluster). Everything the loop serves -- facts that decide whether
+                # a node is alive -- has to keep flowing while a copy runs, so the
+                # capture goes to a worker thread.
+                record = await asyncio.to_thread(
+                    _capture_snapshot,
+                    request,
+                    sandbox_id,
+                    name,
+                    snapshot_id=requested_id,
+                )
+            except UnknownSandboxError:
+                raise OfficialError(404, f"Sandbox {sandbox_id} not found")
+            except SandboxStateConflictError:
+                raise OfficialError(409, f"Sandbox {sandbox_id} is not running")
+    finally:
+        if claimed:
+            # Released once the *record* exists (async: it is written before
+            # the 202) or the copy is done: from then on the record's own
+            # ``creating`` status is what any other replica waits on.
+            _snapshots(request).release_copy(requested_id)
     logger.info("snapshot %s captured from sandbox %s", record.snapshot_id, sandbox_id)
     return record.as_snapshot_info()
 

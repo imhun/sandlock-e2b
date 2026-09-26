@@ -152,7 +152,18 @@ async def _node_health_loop(
             await asyncio.sleep(interval_s)
             continue
         try:
-            marked = await asyncio.to_thread(app.state.nodes.reap_unhealthy, registry)
+            # F11 step 2: one replica sweeps per round. The view is shared, so
+            # every replica computes the same health verdict and the same
+            # orphan set -- a second sweep in the same window is duplicated
+            # work (and a duplicated warning), not extra coverage. A round
+            # whose claim is lost simply does nothing; the next one is a
+            # second later.
+            if app.state.nodes.try_acquire_sweep(ttl_s=interval_s):
+                marked = await asyncio.to_thread(
+                    app.state.nodes.reap_unhealthy, registry
+                )
+            else:
+                marked = []
             if marked:
                 log.warning(
                     "node health sweep: orphaned sandboxes on %s",
@@ -370,7 +381,11 @@ def create_app(
         legacy_master_keys=settings.secret_master_keys,
     )
     app.state.snapshots = snapshots_registry or SnapshotRegistry(
-        (workspace_base or settings.workspace_base)
+        (workspace_base or settings.workspace_base),
+        # F11 step 3: the per-id copy claim is fleet-wide when the deployment
+        # has a shared store (the record's ``creating`` status is the durable
+        # half of it; this is the window between "no record" and "record").
+        redis_client=redis_client,
     )
     app.state.nodes = nodes_registry or NodeRegistry(
         redis_client=redis_client,

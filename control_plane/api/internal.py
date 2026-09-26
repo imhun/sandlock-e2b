@@ -106,6 +106,10 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
         platform_disk_used_mb=body.get("platformDiskUsedMB"),
         platform_disk_budget_mb=body.get("platformDiskBudgetMB"),
     )
+    # F11 step 1: the usage numbers ride the same shared view the health and the
+    # reservations do, so every replica places work against what the worker just
+    # reported instead of against its own stale copy.
+    request.app.state.nodes.publish(record)
     activity = body.get("sandboxActivity")
     if activity is not None and not isinstance(activity, dict):
         raise OfficialError(400, "sandboxActivity must be a JSON object")

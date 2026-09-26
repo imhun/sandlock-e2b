@@ -79,3 +79,43 @@ worker 已经能多副本（2/2，autoscaler MIN=2/MAX=16），控制面是薄�
 前置（F5，已满足但要知道它的天花板）：共享存储的锁**只有 NFSv4.0 跨节点真互斥**
 （v3+`nolock` 只是本地锁），而跨节点**没有** compare-and-swap —— 所以 1/2/3 步都要靠
 "锁 + 记录"来做单飞，不能靠内存 flag。
+
+## 6. 实施记录（2026-09-26）：第 1–3 步已落地
+
+**第 1 步：节点视图进 Redis**（`control_plane/registry/redis_backend.py::RedisNodeStore` +
+`nodes.py`）。注册、心跳、排空、预留、用量全部写进共享视图，`get`/`list`、
+`_placeable_candidates_locked`（放置）、`reap_unhealthy`（健康扫描）、`/internal/routes`、
+`/internal/nodes` 一律从它读；进程内 dict 退化成缓存（没有 Redis 时才当权威）。两个要点：
+
+* **健康是"算"出来的，不是"存"出来的**：`_status_of` 用共享的 `heartbeat_at` 与同一超时，
+  在每个读路径现算 ⇒ 两个副本对同一节点不可能给出不同答案（这正是 F11 的验收句）。
+  视图 TTL = `4 × heartbeat_timeout`：worker 真没了，行会在**同一时刻**从所有副本消失。
+* **`local://` 故意不进共享视图**：它是**本副本**内嵌的 worker，发布出去只会让别的副本把活
+  派到一个它够不着的 worker，而且两个副本都会写 `local` 这一行。
+
+**第 2 步：健康扫描单飞**（`NodeRegistry.try_acquire_sweep` + `_node_health_loop`）：每轮一个
+`SETNX + EX`（TTL = 扫描间隔），抢到的那个副本扫；抢不到就跳过。视图共享之后重复扫描是重复
+**劳动**（以及重复的 `orphaned sandboxes on …` 告警），不是额外覆盖。没有 Redis 时单进程即
+sweeper。
+
+**第 3 步：快照拷贝登记共享**（`SnapshotRegistry.try_acquire_copy` / `release_copy` +
+`api/snapshots.py`）：
+
+* **记录是持久的那一半**：`creating` 状态写在共享卷上的 `snapshot.json` 里，每个副本都读得到；
+* **Redis 认领是补窗口的那一半**：记录挡不住"两个副本都还没写完记录"的那一小段，
+  `try_acquire_copy` 用 `SET NX EX`（TTL 600 s，远大于任何一次拷贝）把这段关掉；输的一方
+  等赢家的**记录**（轮询 2 s）并照 N29 的老语义回 `alreadyExists`（还在拷 = 202），
+  等不到才 409 说明是谁在拷；
+* **`get()` 不再对 `creating` 使用缓存**：`creating` 是唯一会被**另一个副本**改掉的状态，
+  按旧实现轮询打到"错"副本会永远看不到完成；完成的记录照旧走缓存（热路径不变）。
+
+**验收（在容器里跑，`fakeredis` 2.37.1）**：`tests/unit/test_redis_multireplica.py` 新增 11 条
+（视图共享、心跳落地、两副本同判健康、TTL、`local` 不外发、用量随视图、单飞扫描、
+快照认领/过期/无 Redis、`creating` 重读），加上 `test_snapshot_registry.py`、
+`test_registry_dirty_snapshot.py`、`test_node_partition_reconcile.py`、`tests/contract/test_snapshots.py`
+全绿；本机 `tests/unit` 仍是 16 条既有 macOS 红 / 1164 passed，`tests/contract` 321 passed。
+
+**第 4 步仍未做**（明确保持"多副本语义变差但不破坏正确性"的排序）：`CreateQueue` 的跨副本
+唤醒、7 个限流器换共享计数、`template_build_slots` 换 Redis 槽位、`TTLSweeper` 单飞。
+四者的共同形态与第 2 步相同（TTL'd claim 或共享计数器），`RedisNodeStore`/`try_acquire_sweep`
+是现成的模板。

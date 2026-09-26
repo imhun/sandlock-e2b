@@ -136,6 +136,73 @@ class RedisRecordStore:
         return [k.split(":record:", 1)[1] for k in keys]
 
 
+class RedisNodeStore:
+    """The fleet's node view, shared across control-plane replicas (F11 step 1).
+
+    The node registry used to keep health, address, capacity and reservations
+    in process memory, and *that* is what made a second replica dangerous: two
+    replicas could answer "healthy" and "unhealthy" about the same node in the
+    same moment (each sweeping its own heartbeat timestamps), a placement
+    decision made on one was invisible to the other, and a worker that
+    heartbeated replica B after registering with A got a 404 and re-registered.
+
+    The view lives here instead. Health is still *derived* -- from the shared
+    ``heartbeat_at``, by every reader, with the same timeout -- so both
+    replicas compute the same answer from the same bytes. The TTL is what
+    retires a node whose worker is gone for good: a view nobody refreshes
+    disappears on its own, and both replicas lose it at the same moment (the
+    Redis clock), rather than each deciding for itself.
+
+    The in-process (``local://``) node deliberately does **not** live here:
+    it is a worker embedded in *this* replica, so publishing it would let
+    another replica place work on a worker it cannot reach, and the two
+    replicas' rows would collide on the id ``local``.
+    """
+
+    def __init__(self, client: Any, namespace: str) -> None:
+        self._client = client
+        self._ns = namespace
+
+    def _key(self, node_id: str) -> str:
+        return f"{self._ns}:node:view:{node_id}"
+
+    def put(
+        self, node_id: str, payload: dict[str, Any], ttl: int | None = None
+    ) -> None:
+        key = self._key(node_id)
+        with self._client.pipeline() as pipe:
+            pipe.set(key, json.dumps(payload, separators=(",", ":")))
+            if ttl:
+                # ``ex`` on the write keeps the refresher from having to make a
+                # second round trip; a heartbeat is the hot path of the fleet.
+                pipe.expire(key, ttl)
+            pipe.execute()
+
+    def get(self, node_id: str) -> dict[str, Any] | None:
+        raw = self._client.get(self._key(node_id))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    def list(self) -> list[dict[str, Any]]:
+        pattern = f"{self._ns}:node:view:*"
+        out: list[dict[str, Any]] = []
+        for raw in self._client.mget(sorted(self._client.keys(pattern))):
+            if not raw:
+                continue
+            try:
+                out.append(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+        return out
+
+    def delete(self, node_id: str) -> None:
+        self._client.delete(self._key(node_id))
+
+
 class RedisUidLedger:
     """Fleet-wide host-uid allocations, authoritative outside the volume.
 

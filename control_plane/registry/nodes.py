@@ -53,6 +53,56 @@ class NodeRecord:
     heartbeat_at: float = field(default_factory=time.time)
     created_at: float = field(default_factory=time.time)
 
+    def to_storage_dict(self) -> dict[str, Any]:
+        """The record as the shared node view carries it (F11 step 1).
+
+        Every field is here, including the reservations: a replica that reads
+        the view must be able to make the same placement decision the writer
+        did. Health is *not* stored as a verdict -- readers derive it from
+        ``heartbeat_at`` with the shared timeout, which is what keeps two
+        replicas from disagreeing.
+        """
+        return {
+            "node_id": self.node_id,
+            "address": self.address,
+            "total_memory_mb": self.total_memory_mb,
+            "total_cpu_percent": self.total_cpu_percent,
+            "total_disk_mb": self.total_disk_mb,
+            "total_processes": self.total_processes,
+            "used_disk_mb": self.used_disk_mb,
+            "quota_over_limit": list(self.quota_over_limit),
+            "quota_near_limit": list(self.quota_near_limit),
+            "quota_over_limit_count": self.quota_over_limit_count,
+            "quota_near_limit_count": self.quota_near_limit_count,
+            "disk_total_mb": self.disk_total_mb,
+            "disk_warn_count": self.disk_warn_count,
+            "disk_error_count": self.disk_error_count,
+            "mcp_ports_in_use": self.mcp_ports_in_use,
+            "mcp_ports_capacity": self.mcp_ports_capacity,
+            "platform_disk_used_mb": self.platform_disk_used_mb,
+            "platform_disk_budget_mb": self.platform_disk_budget_mb,
+            "reserved_memory_mb": self.reserved_memory_mb,
+            "reserved_cpu_percent": self.reserved_cpu_percent,
+            "reserved_disk_mb": self.reserved_disk_mb,
+            "reserved_processes": self.reserved_processes,
+            "draining": self.draining,
+            "images": list(self.images),
+            "labels": dict(self.labels),
+            "status": self.status,
+            "heartbeat_at": self.heartbeat_at,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_storage_dict(cls, data: dict[str, Any]) -> "NodeRecord":
+        """Inverse of :meth:`to_storage_dict`, tolerant of an older row.
+
+        A missing field reads as the dataclass default (a view written by an
+        older replica during a rollout must not take the fleet down).
+        """
+        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
+        return cls(**{k: v for k, v in data.items() if k in known})
+
     def can_fit(self, memory_mb: int, cpu: int, disk_mb: int, processes: int) -> bool:
         return self.blocking_dimension(memory_mb, cpu, disk_mb, processes) is None
 
@@ -185,11 +235,78 @@ class NodeRegistry:
         self._nodes: dict[str, NodeRecord] = {}
         self._lock = threading.Lock()
         self._heartbeat_timeout = heartbeat_timeout
+        self._redis = redis_client
+        self._ns = namespace
         self._quota_store = None
+        self._view = None
         if redis_client is not None:
-            from control_plane.registry.redis_backend import RedisQuotaStore
+            from control_plane.registry.redis_backend import (
+                RedisNodeStore,
+                RedisQuotaStore,
+            )
 
             self._quota_store = RedisQuotaStore(redis_client, f"{namespace}:node")
+            # F11 step 1: the view of the fleet lives in the shared store, so
+            # every replica reads the same nodes, the same addresses and the
+            # same reservations. The process dict stays as a cache for the
+            # single-process deployment (no Redis).
+            self._view = RedisNodeStore(redis_client, namespace)
+        #: A view nobody refreshes has to retire itself: the worker is gone,
+        #: not quiet. Several heartbeat windows wide, so one lost reply cannot
+        #: erase a live node from the fleet's view.
+        self._view_ttl_s = max(60, int(self._heartbeat_timeout * 4))
+
+    # -- shared view (F11 step 1) ------------------------------------------
+
+    def _status_of(self, record: NodeRecord) -> NodeRecord:
+        """Set ``record.status`` from its heartbeat stamp, and return it.
+
+        Health is *derived*, by every reader, from the same shared timestamp
+        and the same timeout -- which is what makes "healthy on replica A,
+        unhealthy on replica B" impossible once the view is shared. The
+        in-process (``local://``) node never heartbeats itself, so it is
+        exempt, exactly as it is in the sweep.
+        """
+        if record.address != "local://" and (
+            time.time() - record.heartbeat_at > self._heartbeat_timeout
+        ):
+            record.status = "unhealthy"
+        return record
+
+    def _load_locked(self, node_id: str) -> NodeRecord | None:
+        """A node's record, read through the shared view when there is one.
+
+        Callers hold ``self._lock``. Reading through the store is what makes a
+        heartbeat -- or a drain, or a reservation -- work for a node another
+        replica registered: this process's dict only ever knows the nodes this
+        replica has already seen.
+        """
+        if self._view is not None:
+            payload = self._view.get(node_id)
+            if payload is not None:
+                record = NodeRecord.from_storage_dict(payload)
+                self._nodes[node_id] = record
+                return record
+        return self._nodes.get(node_id)
+
+    def _persist_locked(self, record: NodeRecord) -> None:
+        """Publish one node's view. Callers hold ``self._lock``.
+
+        The in-process node is deliberately not published: it is a worker
+        embedded in *this* replica, so another replica could only mis-place
+        work on it (and every replica's row would collide on the id
+        ``local``).
+        """
+        if self._view is None or record.address == "local://":
+            return
+        try:
+            self._view.put(
+                record.node_id, record.to_storage_dict(), ttl=self._view_ttl_s
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "could not publish the node view for %s", record.node_id, exc_info=True
+            )
 
     def register(
         self,
@@ -204,7 +321,7 @@ class NodeRegistry:
         labels: dict[str, str] | None = None,
     ) -> NodeRecord:
         with self._lock:
-            record = self._nodes.get(node_id) if node_id else None
+            record = self._load_locked(node_id) if node_id else None
             if record is None:
                 node_id = node_id or sandbox_id().replace("sbx_", "node_")
                 reserved = self._reserved_from_store(node_id)
@@ -234,6 +351,7 @@ class NodeRegistry:
                 record.draining = False
             record.heartbeat_at = time.time()
             record.status = "healthy"
+            self._persist_locked(record)
             return record
 
     def _reserved_from_store(self, node_id: str) -> dict[str, int]:
@@ -253,20 +371,34 @@ class NodeRegistry:
 
     def heartbeat(self, node_id: str) -> NodeRecord | None:
         with self._lock:
-            record = self._nodes.get(node_id)
+            record = self._load_locked(node_id)
             if record is None:
                 return None
             record.heartbeat_at = time.time()
             record.status = "healthy"
+            self._persist_locked(record)
             return record
+
+    def publish(self, record: NodeRecord) -> None:
+        """Write a record back to the shared view after an in-place update.
+
+        The heartbeat endpoint updates usage on the record ``heartbeat()``
+        returned (disk, quota, MCP band, platform account) and then hands it
+        back here, so the numbers every replica places work against are the
+        ones the worker just reported.
+        """
+        with self._lock:
+            self._nodes[record.node_id] = record
+            self._persist_locked(record)
 
     def set_draining(self, node_id: str, draining: bool) -> NodeRecord | None:
         """Mark/unmark a node as draining; returns the record or ``None``."""
         with self._lock:
-            record = self._nodes.get(node_id)
+            record = self._load_locked(node_id)
             if record is None:
                 return None
             record.draining = draining
+            self._persist_locked(record)
             return record
 
     def set_reserved(
@@ -287,24 +419,41 @@ class NodeRegistry:
         avoid over-committing nodes.
         """
         with self._lock:
-            record = self._nodes.get(node_id)
+            record = self._load_locked(node_id)
             if record is None:
                 return None
             record.reserved_memory_mb = max(0, memory_mb)
             record.reserved_cpu_percent = max(0, cpu_percent)
             record.reserved_disk_mb = max(0, disk_mb)
             record.reserved_processes = max(0, processes)
+            self._persist_locked(record)
             return record
 
     def get(self, node_id: str) -> NodeRecord | None:
         self._sweep_health()
         with self._lock:
-            return self._nodes.get(node_id)
+            record = self._load_locked(node_id)
+            return None if record is None else self._status_of(record)
 
     def list(self, *, healthy_only: bool = False) -> list[NodeRecord]:
         self._sweep_health()
         with self._lock:
-            records = list(self._nodes.values())
+            if self._view is not None:
+                records = [
+                    NodeRecord.from_storage_dict(payload)
+                    for payload in self._view.list()
+                ]
+                # This replica's own embedded worker is not in the shared view
+                # (see `_persist_locked`), so it is added back here for the
+                # local API and the local placement.
+                records.extend(
+                    r for r in self._nodes.values() if r.address == "local://"
+                )
+                for record in records:
+                    self._nodes[record.node_id] = record
+                    self._status_of(record)
+            else:
+                records = list(self._nodes.values())
         if healthy_only:
             records = [r for r in records if r.status == "healthy"]
         return records
@@ -322,6 +471,30 @@ class NodeRegistry:
                 continue
             if now - record.heartbeat_at > self._heartbeat_timeout:
                 record.status = "unhealthy"
+
+    def try_acquire_sweep(self, *, ttl_s: float) -> bool:
+        """Claim this round of the health sweep (F11 step 2).
+
+        One sweeper is enough now that the *view* is shared: the sweep marks
+        sandboxes orphaned on nodes that every replica already sees as
+        unhealthy, so a second replica running the same round is duplicated
+        work -- and a duplicated ``orphaned sandboxes on …`` warning -- rather
+        than extra coverage. The claim is a TTL'd key, so a sweeper that dies
+        mid-round only costs the fleet one round.
+
+        Without Redis there is nothing to share and the single process is the
+        sweeper, so this answers ``True``.
+        """
+        if self._redis is None:
+            return True
+        try:
+            claimed = self._redis.set(
+                f"{self._ns}:node:sweep", str(time.time()), nx=True, ex=max(1, int(ttl_s))
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("health-sweep claim failed; sweeping anyway", exc_info=True)
+            return True
+        return bool(claimed)
 
     def reap_unhealthy(self, sandbox_registry) -> list[str]:
         """Mark sandboxes on unhealthy remote nodes as orphaned (E6.1).
@@ -393,12 +566,26 @@ class NodeRegistry:
                 if sandbox_registry.list_by_node(node_id):
                     continue
                 self._nodes.pop(node_id, None)
+                if self._view is not None:
+                    # The row is gone for good: retire it from the shared view
+                    # too instead of leaving it for the TTL to sweep.
+                    try:
+                        self._view.delete(node_id)
+                    except Exception:  # pragma: no cover - defensive
+                        pass
                 pruned.append(node_id)
         return pruned
 
     def remove(self, node_id: str) -> None:
         with self._lock:
             self._nodes.pop(node_id, None)
+            if self._view is not None:
+                try:
+                    self._view.delete(node_id)
+                except Exception:  # pragma: no cover - defensive
+                    logger.warning(
+                        "could not retire the node view for %s", node_id, exc_info=True
+                    )
 
     def add_local_node(
         self,
@@ -431,6 +618,13 @@ class NodeRegistry:
         :meth:`refusal_dimension` start here so an explanation is always about
         the same node set the placement actually considered.
         """
+        if self._view is not None:
+            # Placement sees the *fleet*, not just the nodes this replica has
+            # heard from: the shared view is refreshed on every read, and the
+            # admission decision itself stays atomic in the quota store below.
+            for payload in self._view.list():
+                record = NodeRecord.from_storage_dict(payload)
+                self._nodes[record.node_id] = record
         self._sweep_health_locked()
         now = time.time()
         return [
@@ -542,6 +736,7 @@ class NodeRegistry:
                     if not ok:
                         return None
                 node.reserve(memory_mb, cpu_percent, disk_mb, processes)
+                self._persist_locked(node)
             return node
 
     def reserve_node(
@@ -581,6 +776,7 @@ class NodeRegistry:
                 if not ok:
                     return None
             record.reserve(memory_mb, cpu_percent, disk_mb, processes)
+            self._persist_locked(record)
             return record
 
     def release_quota(
@@ -606,3 +802,4 @@ class NodeRegistry:
                         },
                     )
                 record.release(memory_mb, cpu_percent, disk_mb, processes)
+                self._persist_locked(record)

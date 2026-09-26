@@ -9,6 +9,7 @@ create new sandboxes or fork existing ones.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import threading
 from dataclasses import asdict, dataclass, field
@@ -19,6 +20,8 @@ from typing import Any
 from gateway_common.ids import sandbox_id
 from gateway_common.paths import validate_sandbox_id
 from gateway_common.timeutil import to_iso_z, utcnow
+
+logger = logging.getLogger(__name__)
 
 
 def _is_within(child: Path, parent: Path) -> bool:
@@ -169,11 +172,59 @@ class SnapshotRecord:
 
 
 class SnapshotRegistry:
-    def __init__(self, base_dir: str | Path) -> None:
+    def __init__(
+        self,
+        base_dir: str | Path,
+        *,
+        redis_client=None,
+        namespace: str = "e2b",
+    ) -> None:
         self._base = Path(base_dir).resolve()
         self._snapshots: dict[str, SnapshotRecord] = {}
         self._lock = threading.Lock()
+        self._redis = redis_client
+        self._ns = namespace
         self._base.mkdir(parents=True, exist_ok=True)
+
+    # -- the copy claim (F11 step 3) ---------------------------------------
+
+    def _copy_key(self, snapshot_id: str) -> str:
+        return f"{self._ns}:snapshot:copy:{snapshot_id}"
+
+    def try_acquire_copy(self, snapshot_id: str, *, ttl_s: int = 600) -> bool:
+        """Claim the *copy* for one snapshot id across replicas.
+
+        The record's ``creating`` status is the durable half of this ("somebody
+        is copying id X"): it lives on the shared volume, so every replica can
+        read it. What a record cannot do is close the window between "no record
+        yet" and "record written" -- two replicas can both look, both miss, and
+        both copy the same tree into the same directory. That window is what
+        this key closes.
+
+        The TTL is deliberately longer than any copy (N32 measured 76 s for
+        2000 files; the worker call times out at 120 s) and shorter than
+        "forever": a replica that dies mid-copy leaves an id that can be
+        retried, and its record stays ``creating`` for the reconciliation path
+        to fail. Without Redis there is one process, so the in-process lock is
+        the whole answer and this returns ``True``.
+        """
+        if self._redis is None:
+            return True
+        try:
+            return bool(
+                self._redis.set(self._copy_key(snapshot_id), "1", nx=True, ex=ttl_s)
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("snapshot copy claim failed; proceeding", exc_info=True)
+            return True
+
+    def release_copy(self, snapshot_id: str) -> None:
+        if self._redis is None:
+            return
+        try:
+            self._redis.delete(self._copy_key(snapshot_id))
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("snapshot copy claim release failed", exc_info=True)
 
     def _snapshot_dir(self, snapshot_id: str) -> Path:
         """Where one snapshot's record *and* payload live.
@@ -362,7 +413,13 @@ class SnapshotRegistry:
             raise UnknownSnapshotError(snapshot_id)
         with self._lock:
             record = self._snapshots.get(snapshot_id)
-            if record is not None:
+            # A ``creating`` record is the one state another *replica* can
+            # change under us (it owns the copy and flips it when the bytes are
+            # in), so that one is re-read from the shared record instead of
+            # served from this process's cache -- otherwise a poll that lands
+            # on the "other" replica waits forever on a copy that finished
+            # (F11 step 3). Finished records never change, and stay cached.
+            if record is not None and record.status != "creating":
                 return record
         path, fs_path = self._record_path(snapshot_id)
         if not path.is_file():

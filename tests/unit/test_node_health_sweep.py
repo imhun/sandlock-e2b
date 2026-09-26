@@ -42,6 +42,14 @@ class _Nodes:
         self.verdicts.append(self._clock.last)
         return []
 
+    def try_acquire_sweep(self, *, ttl_s: float) -> bool:
+        """This round is this process's to run (F11 step 2's cross-replica claim).
+
+        A single-process deployment is always the sweeper, which is what these
+        cases are about; the claim itself is pinned in
+        ``test_redis_multireplica.py``.
+        """
+        return True
 
 async def test_a_delayed_round_skips_its_verdict():
     # One scripted reading per round: a normal cadence, then one round that
