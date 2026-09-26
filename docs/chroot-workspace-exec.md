@@ -693,7 +693,14 @@ sandlock 默认黑名单里、seccomp 又是单向的 ⇒ 那会把一个众所�
 4. **验收（RED → GREEN）**：
    * 把 `test_restore_resumes_inside_a_real_root` 从"两种根形态立即拒绝"翻成"两种根形态都能
      恢复、计数器继续前进"，chroot-free 的 `test_restore_glibc_vdso_program_resumes` 继续做正向对照；
-   * 再加一条负向用例：**授权缺失时立即拒绝并点名 stub**（防止退化成 10 s 超时）；
+   * 再加一条负向用例：**授权缺失时立即拒绝并点名 stub**（防止退化成 10 s 超时）
+     —— **已落地（2026-09-26，fork `6ff2505`）**：会话把"启动时装上的那个 stub 路径"记在
+     `SandboxInstance::restore_stub_grant` 上，`restore_into_session` 入口比对、不一致就按名拒绝；
+     RED 就是这句话想防的那个 10 s 超时（`restore stub never signalled READY within 10000ms`，
+     实测 10.08 s），用例 `test_a_session_launched_without_the_stub_grant_refuses_a_restore_by_name`
+     把拒绝文本逐字钉住。同一提交补上了"会话 × 模拟根"那一态
+     （`test_a_static_workload_resumes_into_a_session_under_an_emulated_chroot`，此前**没有任何**
+     会话侧用例覆盖 `real_root(false)`）。
    * E2B 侧：`E2B_REAL_ROOT=1` 跑 `tests/security` + 一条"恢复后计数器前进"的形态用例，并解除
      `tests/unit/test_checkpoint_restore_unused.py` 的守卫（该用例就是为这一刻留的门）。
 5. **风险与待验**：
