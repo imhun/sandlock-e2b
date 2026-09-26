@@ -1,0 +1,9 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+.                                                                        [100%]
+=============================== warnings summary ===============================
+tests/contract/test_pause_resume_sandlock.py: 10 warnings
+  /usr/local/lib/python3.14/asyncio/threads.py:26: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    return await loop.run_in_executor(None, func_call)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 passed, 10 warnings in 3.73s

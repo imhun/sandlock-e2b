@@ -1,0 +1,26 @@
+# lane image source check (2026-09-26T12:30:12Z)
+# repo HEAD eb2246b; fork tip 290761e
+e2b-sandlock-test:task12cur 75753e3fc0c3 2026-09-26 20:30:05 +0800 CST
+e2b-sandlock-test:task10cur bac0b9cc17e8 2026-09-26 18:01:37 +0800 CST
+e2b-sandlock-test:latest 898be9c57d42 2026-09-26 06:59:35 +0800 CST
+
+== wheel members (wheels/fork/sandlock-0.9.0b0-cp314-...x86_64.whl) ==
+fadb7e8de9ea24f94a70da0ff7e42fd7279ddc253704f6944a79e8d7efed9766 5734336 sandlock/libsandlock_ffi.cpython-314-x86_64-linux-gnu.so
+47efb29968ba01e9937d786f62dee275e1b8e4b027468f34308b52f917d5702f 10442 sandlock/supervise.py
+af83dbb7ba4170bd5e1f967d0d0242f66b00579de64c150804dbffcc8bddd199 72741 sandlock/_sdk.py
+50167bb6e64000122202ad14305ab019a9a877bb7033ca16afd4529709303430 6333768 sandlock/bin/sandlock-supervise
+aef61c0e1e58ec9797027609308d5570e8da9c321d04fc200cca965ed2e30f95 9688 sandlock/bin/restore-stub
+
+== image: task12cur ==
+fadb7e8de9ea24f94a70da0ff7e42fd7279ddc253704f6944a79e8d7efed9766  /usr/local/lib/python3.14/site-packages/sandlock/libsandlock_ffi.cpython-314-x86_64-linux-gnu.so
+47efb29968ba01e9937d786f62dee275e1b8e4b027468f34308b52f917d5702f  /usr/local/lib/python3.14/site-packages/sandlock/supervise.py
+af83dbb7ba4170bd5e1f967d0d0242f66b00579de64c150804dbffcc8bddd199  /usr/local/lib/python3.14/site-packages/sandlock/_sdk.py
+50167bb6e64000122202ad14305ab019a9a877bb7033ca16afd4529709303430  /usr/local/lib/python3.14/site-packages/sandlock/bin/sandlock-supervise
+aef61c0e1e58ec9797027609308d5570e8da9c321d04fc200cca965ed2e30f95  /usr/local/lib/python3.14/site-packages/sandlock/bin/restore-stub
+
+== image: task10cur ==
+fadb7e8de9ea24f94a70da0ff7e42fd7279ddc253704f6944a79e8d7efed9766  /usr/local/lib/python3.14/site-packages/sandlock/libsandlock_ffi.cpython-314-x86_64-linux-gnu.so
+47efb29968ba01e9937d786f62dee275e1b8e4b027468f34308b52f917d5702f  /usr/local/lib/python3.14/site-packages/sandlock/supervise.py
+af83dbb7ba4170bd5e1f967d0d0242f66b00579de64c150804dbffcc8bddd199  /usr/local/lib/python3.14/site-packages/sandlock/_sdk.py
+b1869a73b5c96b30bb7fc1ed33d9907baa10d6fd980b4ae3dbdec0c121c12d0e  /usr/local/lib/python3.14/site-packages/sandlock/bin/sandlock-supervise
+aef61c0e1e58ec9797027609308d5570e8da9c321d04fc200cca965ed2e30f95  /usr/local/lib/python3.14/site-packages/sandlock/bin/restore-stub

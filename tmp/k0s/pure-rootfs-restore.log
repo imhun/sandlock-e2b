@@ -1,0 +1,5 @@
+# E2B_TEST_IMAGE=e2b-sandlock-test:task12cur
+===== E2B_REAL_ROOT=0 =====
+1 passed, 10 warnings in 3.79s
+===== E2B_REAL_ROOT=1 =====
+1 passed, 10 warnings in 3.73s

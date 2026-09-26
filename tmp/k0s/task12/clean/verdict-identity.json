@@ -1,0 +1,147 @@
+{
+  "state": "0 (identity: no synthesized root)",
+  "switches": {
+    "E2B_PURE_ROOTFS": "",
+    "E2B_REAL_ROOT": "0"
+  },
+  "stubHostPath": "/usr/local/lib/python3.14/site-packages/sandlock/bin/restore-stub",
+  "stubHostSha256": "aef61c0e1e58ec9797027609308d5570e8da9c321d04fc200cca965ed2e30f95",
+  "rounds": [
+    {
+      "label": "default-stub-path",
+      "sandboxId": "sbx_task12_default_stub_path",
+      "stubOverride": null,
+      "image": "/tmp/tmpnerzkl4w-task12-base/_runtime/.checkpoints/sbx_task12_default_stub_path/latest",
+      "capture": {
+        "captured": true,
+        "reason": "",
+        "image": "/tmp/tmpnerzkl4w-task12-base/_runtime/.checkpoints/sbx_task12_default_stub_path/latest",
+        "imageMB": 0,
+        "pid": 25,
+        "fds": 3,
+        "exe": "/usr/bin/dash",
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "d=$(pwd); i=0; while true; do i=$((i+1)); printf \"%s\" \"$i\" > \"$d/tick.tmp\"; mv \"$d/tick.tmp\" \"$d/tick\"; sleep 0.2; done"
+        ]
+      },
+      "counterAtCapture": 1,
+      "restore": {
+        "restored": true,
+        "reason": "",
+        "pid": 46,
+        "child_id": 1,
+        "unrecoveredFdCount": 3
+      },
+      "restoredProcBefore": {
+        "pid": 46,
+        "exists": true,
+        "state": "S",
+        "cwd": "/"
+      },
+      "execAfterRestore": [
+        0,
+        "restored-ok\n",
+        ""
+      ],
+      "counterAfterRestore": 2,
+      "restoredProcAfter": {
+        "pid": 46,
+        "exists": true,
+        "state": "S",
+        "cwd": "/"
+      },
+      "stubVisibleInGuest": [
+        0,
+        "-rwxr-xr-x 1 0 0 9688 Sep 26 12:29 /usr/local/lib/python3.14/site-packages/sandlock/bin/restore-stub\n",
+        ""
+      ]
+    },
+    {
+      "label": "stub-relocated-outside-the-tree",
+      "sandboxId": "sbx_task12_stub_relocated_outside_the_tree",
+      "stubOverride": "/tmp/tmpnerzkl4w-task12-base/outside-the-sandbox-tree/restore-stub",
+      "image": "/tmp/tmpnerzkl4w-task12-base/_runtime/.checkpoints/sbx_task12_stub_relocated_outside_the_tree/latest",
+      "capture": {
+        "captured": true,
+        "reason": "",
+        "image": "/tmp/tmpnerzkl4w-task12-base/_runtime/.checkpoints/sbx_task12_stub_relocated_outside_the_tree/latest",
+        "imageMB": 0,
+        "pid": 72,
+        "fds": 3,
+        "exe": "/usr/bin/dash",
+        "argv": [
+          "/bin/sh",
+          "-c",
+          "d=$(pwd); i=0; while true; do i=$((i+1)); printf \"%s\" \"$i\" > \"$d/tick.tmp\"; mv \"$d/tick.tmp\" \"$d/tick\"; sleep 0.2; done"
+        ]
+      },
+      "counterAtCapture": 1,
+      "restore": {
+        "restored": true,
+        "reason": "",
+        "pid": 93,
+        "child_id": 1,
+        "unrecoveredFdCount": 3
+      },
+      "restoredProcBefore": {
+        "pid": 93,
+        "exists": true,
+        "state": "D",
+        "cwd": "/"
+      },
+      "execAfterRestore": [
+        0,
+        "restored-ok\n",
+        ""
+      ],
+      "counterAfterRestore": 2,
+      "restoredProcAfter": {
+        "pid": 93,
+        "exists": true,
+        "state": "S",
+        "cwd": "/"
+      },
+      "stubVisibleInGuest": [
+        2,
+        "",
+        "ls: cannot access '/tmp/tmpnerzkl4w-task12-base/outside-the-sandbox-tree/restore-stub': Permission denied\n"
+      ]
+    }
+  ],
+  "negativeControl": {
+    "label": "absent-stub-path",
+    "sandboxId": "sbx_task12_absent_stub_path",
+    "stubOverride": "/workspace/tmp/k0s/task12/absent-restore-stub",
+    "image": "/tmp/tmpnerzkl4w-task12-base/_runtime/.checkpoints/sbx_task12_absent_stub_path/latest",
+    "capture": {
+      "captured": true,
+      "reason": "",
+      "image": "/tmp/tmpnerzkl4w-task12-base/_runtime/.checkpoints/sbx_task12_absent_stub_path/latest",
+      "imageMB": 0,
+      "pid": 118,
+      "fds": 4,
+      "exe": "/usr/bin/dash",
+      "argv": [
+        "/bin/sh",
+        "-c",
+        "d=$(pwd); i=0; while true; do i=$((i+1)); printf \"%s\" \"$i\" > \"$d/tick.tmp\"; mv \"$d/tick.tmp\" \"$d/tick\"; sleep 0.2; done"
+      ]
+    },
+    "counterAtCapture": 1,
+    "restore": {
+      "restored": false,
+      "reason": "instance restore failed: process error: child process error: restore-stub was not built (/workspace/tmp/k0s/task12/absent-restore-stub); a C compiler is required to build sandlock with checkpoint restore",
+      "pid": null,
+      "child_id": null,
+      "unrecoveredFdCount": null
+    },
+    "restoredProcBefore": null,
+    "execAfterRestore": null,
+    "counterAfterRestore": null,
+    "restoredProcAfter": null,
+    "stubVisibleInGuest": null
+  },
+  "verdict": "恢复成立（0 (identity: no synthesized root)）：[default-stub-path] image=0 MiB pid 25 exe '/usr/bin/dash' argv ['/bin/sh', '-c', 'd=$(pwd); i=0; while true; do i=$((i+1)); printf \"%s\" \"$i\" > \"$d/tick.tmp\"; mv \"$d/tick.tmp\" \"$d/tick\"; sleep 0.2; done'] → 新 session pid 46 (child 1)，恢复后 exec rc=0，计数器 1 → 2，未恢复 fd 3 个；stub 在沙箱里看得见（rc=0）；[stub-relocated-outside-the-tree] image=0 MiB pid 72 exe '/usr/bin/dash' argv ['/bin/sh', '-c', 'd=$(pwd); i=0; while true; do i=$((i+1)); printf \"%s\" \"$i\" > \"$d/tick.tmp\"; mv \"$d/tick.tmp\" \"$d/tick\"; sleep 0.2; done'] → 新 session pid 93 (child 1)，恢复后 exec rc=0，计数器 1 → 2，未恢复 fd 3 个；stub 在沙箱里看不见（rc=2）；负对照（把 SANDLOCK_RESTORE_STUB 指到一个不存在的路径）被显式拒绝：'instance restore failed: process error: child process error: restore-stub was not built (/workspace/tmp/k0s/task12/absent-restore-stub); a C compiler is required to build sandlock with checkpoint restore'"
+}
