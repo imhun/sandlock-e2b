@@ -26,7 +26,7 @@ mediation_shape = bool(settings.base_image and image_rootfs is not None)
 | 路径可见性 | 路径 syscall 全被中介，`chroot_root` 翻译 | **Landlock 一道网**；Landlock 访问位是闭集，"带路径但不在闭集里"的调用无人拦 |
 | 具体暴露 | — | 同一宿主文件上实测：`openat` EACCES，而 `getxattr` **读回宿主 xattr**、`open_tree` **返回 fd**、`inotify_add_watch` **投递宿主事件与宿主文件名**（OBS-7）；`path_surface.rs::PURE_UNGATED` 把这一类**逐条 pin 成 33 条**（stat/readlink/chdir/chmod/utimensat/*xattr/inotify_add_watch + 5 条 at 风格，其中 5 条在当前内核 ENOSYS 或被 worker seccomp 档拒） |
 | 磁盘闸门 | 中介的**活账本**：`openat` 按剩余额度发上限、超预算建条目 ENOSPC、unlink 即时归还、N31 的条目计数闸门 | 只有 init 在 fork 里施加的 **per-exec `RLIMIT_FSIZE` 硬上限**（单文件、shape 无关，仍生效）；**没有活账本**：跑飞的写者可以一直写到自己那条 exec 的额度，`diskMB` 那层语义在这个形态下不成立（OBS-5） |
-| 平台状态可见性 | `_runtime` 对沙箱 ENOENT（沙箱的根是它自己的 rootfs） | `/home/user` 就是 `<base>/<id>` 的真实路径 ⇒ `..` 到 `<base>`，`_runtime` "看得见但打不开"（DAC `0700` → EACCES）。**不是洞，但是形态漂移**（N27）。**N27 上线后（2026-09-26）**：树根下沉一级，`/home/user` = `<export>/workspaces/<id>`、平台状态在 `<export>/state/` ⇒ 既不在祖先链上、也读不到（image-rootfs 给 `ENOENT`，pure 给中介的策略拒绝 `EACCES`），形态漂移已消除 |
+| 平台状态可见性 | `_runtime` 对沙箱 ENOENT（沙箱的根是它自己的 rootfs） | `/home/user` 就是 `<base>/<id>` 的真实路径 ⇒ `..` 到 `<base>`，`_runtime` "看得见但打不开"（DAC `0700` → EACCES）。**不是洞，但是形态漂移**（N27）。**N27 上线后（2026-09-26）**：树根下沉一级，`/home/user` = `<export>/workspaces/<id>`、平台状态在 `<export>/state/` ⇒ **有根形态**（生产 image-rootfs、pure+合成根+真根）**既不在祖先链上、也读不到**（`ENOENT`）；但**无根 pure identity**（`E2B_PURE_ROOTFS=off`）**只成立一半** —— 四次 `stat` 全 `EACCES`（读不到 ✔），而 `../..`（= `<export>`）能列出 `state` / `_secrets` 的**名字** ⇒ 形态漂移**未完全消除**。这条残差**不是 N27 引入的**（迁移前同形态在 `..` 一层就列出 `_runtime`），是"没有根"这件事本身，**N16（合成根）才是消掉它的那条路**。实测（四种形态对照）见 `docs/deploy-clusters.md` §11.2 |
 
 ## 3. 三条路
 
@@ -92,9 +92,14 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
    `E2B_STATE_BASE`（未设 = 树根 ⇒ 逐字节零变化）+ 清单把树根下沉一级（树 `<export>/workspaces/<id>`、
    平台状态 `<export>/state/`，**同一个挂载**）+ 一次性迁移脚本（`deploy/scripts/migrate-state-base.sh`，
    同挂载 `rename(2)`；集群实测 `done=12 unknown=0`、逐条 `same_inode=yes` ⇒ 原先记的 EXDEV 账不发生）。
-   **形态无关性**：平台状态**不在沙箱的祖先链上、也读不到** —— image-rootfs 形态给 `ENOENT`，pure 形态
-   由中介按策略拒绝（`EACCES`）；两者都**不是"能读"**，所以验收**不再**是"pure 形态下从沙箱内
-   `stat(<新 base>)` 为 ENOENT"这条单形态判据（该判据随 N15 的中介化作废）。**回退窗口**：旧
+   **形态无关性（按 2026-09-26 集群实测限定）**：**有根形态**（生产 image-rootfs、pure+合成根+真根）
+   平台状态**既不在祖先链上、也读不到**（`ENOENT`）；**无根 pure identity**（`E2B_PURE_ROOTFS=off`）
+   **只成立一半** —— 四次 `stat` 全 `EACCES`（由中介按策略拒绝 ⇒ **读不到** ✔），但 `../..`（= `<export>`）
+   能列出 `state` / `_secrets` 的**名字** ⇒ **不写回"完全形态无关"**。这条残差**不是 N27 引入的**
+   （迁移前同形态在 `..` 一层就列出 `_runtime`），是"没有根"这件事本身，**N16（合成根）才是消掉它的
+   那条路**。两种形态都**不是"能读"** —— 这半边仍成立 —— 所以验收**不再**是"pure 形态下从沙箱内
+   `stat(<新 base>)` 为 ENOENT"这条单形态判据（该判据随 N15 的中介化作废）。证据：`docs/deploy-clusters.md`
+   §11.2 的形态对照表 + 探针 `tmp/k0s/probe_state_base_visibility.py`。**回退窗口**：旧
    `<export>/_runtime` 不需要保留副本 —— `--rollback` 是同一张映射表的反向 `mv`
    （`state/_runtime` → `<export>/_runtime`，inode 保留、不拷数据），依据是留在盘上的
    `state/.state-base-migration.journal`（0600），一个发布周期内不删它即可原路退回。
