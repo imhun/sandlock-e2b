@@ -135,6 +135,10 @@ services:
       # first the worker builds an empty network policy (every connect fails,
       # loopback included), and without the second a current worker exits 1 at
       # `configure_priv_helpers` before it ever listens (N39).
+      # Enabling the first also flips what a pooled sandbox can reach, which a
+      # local debugger should know: the pool goes from silently having no egress
+      # to following the sandbox ruleset -- a request without `network` reaches
+      # only the fixed pypi/npm/github domain set, same as the fleet.
       E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-python:3.14-slim}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-auto}", "E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", "E2B_ENABLE_NETWORK": "true", "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
       E2B_AS_POLL_S: ${E2B_AS_POLL_S:-5}
       E2B_AS_UTIL_THRESHOLD: ${E2B_AS_UTIL_THRESHOLD:-0.70}

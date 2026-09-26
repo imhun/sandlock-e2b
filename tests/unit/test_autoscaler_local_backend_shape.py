@@ -42,6 +42,7 @@ AUTOSCALE_COMPOSE = (
 FLEET_STACK = (REPO / "deploy" / "stack" / "docker-compose.prod.yml").read_text(
     encoding="utf-8"
 )
+FLEET_K8S = (REPO / "deploy" / "k8s" / "worker.yaml").read_text(encoding="utf-8")
 
 NET_ISOLATION_KEY = '\n            "E2B_ENABLE_NET_ISOLATION": "true",\n'
 OVERRIDE_SEAM = "\n            **dict(worker_env or {}),\n"
@@ -52,6 +53,15 @@ OVERRIDE_SEAM = "\n            **dict(worker_env or {}),\n"
 #: `E2B_ROUTE_B_TMP_ROOT` a current worker exits 1 before it ever listens (N38
 #: connected items 1 and 3; N39).
 FLEET_KEYS = ("E2B_ENABLE_NETWORK", "E2B_ROUTE_B_TMP_ROOT")
+
+#: The keys each fleet manifest actually names, pinned: the compose stack
+#: carries both, the k8s pod template only the route-B root (it never names
+#: `E2B_ENABLE_NETWORK`). Both are compared, so a later edit that drops a key
+#: from either one fails here instead of leaving "pool == fleet" half-checked.
+FLEET_MANIFEST_KEYS = {
+    "deploy/stack/docker-compose.prod.yml": FLEET_KEYS,
+    "deploy/k8s/worker.yaml": ("E2B_ROUTE_B_TMP_ROOT",),
+}
 
 
 def test_local_pool_no_longer_declares_a_low_port_window() -> None:
@@ -84,7 +94,7 @@ def test_local_pool_declares_the_pair_above_the_override_seam() -> None:
 
 
 def _worker_env() -> dict[str, str]:
-    """The JSON the autoscaler hands each spawned worker (`:116`)."""
+    """The JSON the autoscaler hands each spawned worker (`E2B_AS_WORKER_ENV`)."""
     lines = [
         line
         for line in AUTOSCALE_COMPOSE.splitlines()
@@ -119,27 +129,66 @@ def test_the_pool_worker_env_carries_the_two_fleet_keys() -> None:
     assert env["E2B_ROUTE_B_TMP_ROOT"] == "/var/lib/e2b-sandboxes/.route-b"
 
 
-def test_the_pool_worker_env_matches_the_fleet_manifest_for_those_keys() -> None:
-    """"Pool == fleet" pinned against the fleet file, not a third copy of it.
-
-    The point of the two keys is alignment with
-    `deploy/stack/docker-compose.prod.yml`; reading the fleet's values here
-    means a later edit on either side that breaks the alignment fails this
-    test instead of surviving as a silent copy-paste.
-    """
-    fleet: dict[str, str] = {}
+def _compose_fleet_values() -> dict[str, str]:
+    """The two keys as `deploy/stack/docker-compose.prod.yml` spells them."""
+    found: dict[str, str] = {}
     for line in FLEET_STACK.splitlines():
         stripped = line.strip()
         for key in FLEET_KEYS:
             if stripped.startswith(f"{key}:"):
-                fleet[key] = stripped.split(":", 1)[1].strip().strip('"')
-    assert fleet == {
+                found[key] = stripped.split(":", 1)[1].strip().strip('"')
+    return found
+
+
+def _k8s_fleet_values() -> dict[str, str]:
+    """The same keys as `deploy/k8s/worker.yaml` spells them."""
+    found: dict[str, str] = {}
+    lines = [line.strip() for line in FLEET_K8S.splitlines()]
+    for index, line in enumerate(lines):
+        if not line.startswith("- name: "):
+            continue
+        key = line[len("- name: ") :].strip()
+        if key not in FLEET_KEYS:
+            continue
+        value_line = lines[index + 1]
+        assert value_line.startswith("value: "), value_line
+        found[key] = value_line[len("value: ") :].strip().strip('"')
+    return found
+
+
+def _fleet_manifest_values() -> dict[str, dict[str, str]]:
+    """Every fleet manifest's values for the two keys, keyed by manifest path.
+
+    Which manifest carries which key is pinned here too (see
+    `FLEET_MANIFEST_KEYS`): "pool == fleet" has to hold against *both* fleet
+    manifests, not just the compose one.
+    """
+    manifests = {
+        "deploy/stack/docker-compose.prod.yml": _compose_fleet_values(),
+        "deploy/k8s/worker.yaml": _k8s_fleet_values(),
+    }
+    assert {path: tuple(values) for path, values in manifests.items()} == FLEET_MANIFEST_KEYS
+    return manifests
+
+
+def test_the_pool_worker_env_matches_every_fleet_manifest_for_those_keys() -> None:
+    """"Pool == fleet" pinned against the fleet files, not a third copy of them.
+
+    Both fleet manifests are read: `deploy/stack/docker-compose.prod.yml` and
+    `deploy/k8s/worker.yaml`. Reading only the first would stay green while the
+    two fleet manifests drifted apart from each other.
+    """
+    manifests = _fleet_manifest_values()
+    assert manifests["deploy/stack/docker-compose.prod.yml"] == {
         "E2B_ENABLE_NETWORK": "true",
         "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b",
     }
+    assert manifests["deploy/k8s/worker.yaml"] == {
+        "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b",
+    }
     env = _worker_env()
-    assert env[FLEET_KEYS[0]] == fleet[FLEET_KEYS[0]]
-    assert env[FLEET_KEYS[1]] == fleet[FLEET_KEYS[1]]
+    for values in manifests.values():
+        assert {key: env[key] for key in values} == values
 
 
 def _env_from_argv(argv: list[str]) -> dict[str, str]:
@@ -202,4 +251,39 @@ def test_spawned_worker_argv_lets_the_operator_override_the_pair(monkeypatch) ->
     assert env["E2B_FD_INJECT_CONNECT"] == "false"
     assert [token for token in argv if token.startswith("E2B_ENABLE_NET_ISOLATION=")] == [
         "E2B_ENABLE_NET_ISOLATION=false"
+    ]
+
+
+def test_spawned_worker_argv_carries_the_two_fleet_keys(monkeypatch) -> None:
+    """The base dictionary is self-sufficient without any `worker_env`.
+
+    `E2B_AS_WORKER_ENV` is the compose file's entry point, not the only one:
+    `DockerPoolBackend()` is also built by hand (this file, and any embedder),
+    and a current image exits 1 without `E2B_ROUTE_B_TMP_ROOT` before it ever
+    listens (N39). Same reason the netns pair sits in the dictionary (N38).
+    """
+    argv = _spawned_argv(monkeypatch)
+    env = _env_from_argv(argv)
+    assert env["E2B_ENABLE_NETWORK"] == "true"
+    assert env["E2B_ROUTE_B_TMP_ROOT"] == "/var/lib/e2b-sandboxes/.route-b"
+    # The base dictionary is a second place the pool declares these values, so
+    # it is pinned against both fleet manifests the same way the compose JSON is.
+    for values in _fleet_manifest_values().values():
+        assert {key: env[key] for key in values} == values
+
+
+def test_spawned_worker_argv_lets_the_operator_override_the_fleet_keys(monkeypatch) -> None:
+    """`E2B_AS_WORKER_ENV` stays the override entry point (last writer wins)."""
+    argv = _spawned_argv(
+        monkeypatch,
+        worker_env={
+            "E2B_ENABLE_NETWORK": "false",
+            "E2B_ROUTE_B_TMP_ROOT": "/elsewhere/.route-b",
+        },
+    )
+    env = _env_from_argv(argv)
+    assert env["E2B_ENABLE_NETWORK"] == "false"
+    assert env["E2B_ROUTE_B_TMP_ROOT"] == "/elsewhere/.route-b"
+    assert [token for token in argv if token.startswith("E2B_ROUTE_B_TMP_ROOT=")] == [
+        "E2B_ROUTE_B_TMP_ROOT=/elsewhere/.route-b"
     ]

@@ -68,6 +68,19 @@ class DockerPoolBackend:
             # to the one seam an operator can override) rather than in `cmd`.
             "E2B_ENABLE_NET_ISOLATION": "true",
             "E2B_FD_INJECT_CONNECT": "true",
+            # The two other keys the pool was missing next to the pair (N38
+            # connected items 1 and 3), values verbatim from the fleet
+            # (`deploy/stack/docker-compose.prod.yml` and
+            # `deploy/k8s/worker.yaml`): without `E2B_ENABLE_NETWORK` the worker
+            # builds an empty network policy (every connect fails, loopback
+            # included), and without `E2B_ROUTE_B_TMP_ROOT` a current worker
+            # exits 1 at `configure_priv_helpers` before it ever listens (N39).
+            # Here for the same reason as the pair: `DockerPoolBackend()` is
+            # built by hand too, so it has to be self-sufficient -- with
+            # `E2B_AS_WORKER_ENV` still the override (the seam below, last
+            # writer wins).
+            "E2B_ENABLE_NETWORK": "true",
+            "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b",
             **dict(worker_env or {}),
         }
 

@@ -49,7 +49,7 @@
 | `--security-opt seccomp=unconfined` | `:84-85` |
 | 需要删掉的两行 | `"--sysctl"` `:86`、`"net.ipv4.ip_unprivileged_port_start=0",` `:87` |
 | `-e E2B_REQUIRE_SECCOMP_FILTER=0`（自检降级为 WARNING） | `:88-91` |
-| 池 worker 的 env 来源 `E2B_AS_WORKER_ENV`（JSON），当前 JSON **不含**任何 netns 键 | `autoscaler/config.py:76-78`；`deploy/compose/docker-compose.autoscale.yml:116` |
+| 池 worker 的 env 来源 `E2B_AS_WORKER_ENV`（JSON），当前 JSON **不含**任何 netns 键 | `autoscaler/config.py:76-78`；`deploy/compose/docker-compose.autoscale.yml` 的 `E2B_AS_WORKER_ENV` 行（本计划不再引行号：它会漂，键名不会） |
 | 池 worker 无 `--cap-add`、无 `--user` 覆盖 → 吃镜像的 `USER 65534` | `:66-107`（整个 `cmd`） |
 | `E2B_AS_WORKER_ENV` 的 `-e` 在 spawn 的 `cmd` 里**后写**，故字典里的默认值可被运维覆盖 | `:106-107`（`for key, value in self._env.items()`） |
 
@@ -274,6 +274,7 @@ Expected:
 1. phase 1 的汇总行是 `… passed, … skipped, 0 failed`，且 `tests/contract/test_mcp_netns.py` 的三条**不是 skip**（`rg -c "test_mcp_netns.py" tmp/netns-unify-lane.log` 不应出现 SKIPPED 行）。**这一条只是回归检查**：该契约本来就自给自足（见 Task 1 的 2026-09-26 更正），通道的作用是让**整档**跑在部署形态的默认值上，不是"解掉它的 skip"。条数应与**同日的共享 netns 档**逐条一致；§2.4.5 记的 `1439 passed / 3 skipped` 是 2026-09-16 的快照，此后测试数已增长，所以以"`0 failed` + 与同日共享 netns 档一致"为准，具体条数记进日志。
 2. phase 2（uid 65534）的行尾是 `0 failed`；条数与共享 netns 档一致（`docs/open-issues.md` OBS-5 行记 phase 2 = 57 passed 可作参照）。
 3. 这两条是**本计划最大的未知**：车队证据（§2.4.6/§2.4.7）来自"root/cap_SETUID worker + per-sandbox uid 开"，而 ①②④ 是 `65534 + per-sandbox uid 自动关`。**phase 2 不绿就不要往下做 Tasks 2–4**，把日志贴回来重新评估（届时 ①②④ 的形态选择要重新拍板）。
+   > **⚠️ 2026-09-26 更正（Task 1 实测）**：这道门只覆盖"成对开关作为 worker 默认值、无特权相位整档仍全绿"，**不覆盖 netns 契约** —— phase 2 的选择集是 5 个 sandlock/route-B 文件，不含 `tests/contract/test_mcp_netns.py`（Task 1 报告 §7.3 实测写明）。"65534 这一格的形态"另有实测通道，见 Task 3 的同日更正。
 
 若 phase 2 因 `unshare(CLONE_NEWUSER)` EPERM 而红，先在宿主核对 §2.4.6 提到的两条内核开关（`kernel.apparmor_restrict_unprivileged_userns`、`user.max_user_namespaces`），并把 `sysctl -a | rg "user.max_user_namespaces|apparmor_restrict"` 的输出一起写进日志。
 
@@ -289,8 +290,11 @@ git commit -m "test(lane): let the prod-shaped lane reproduce the netns shape"
 ### Task 2: ② 本地池 `autoscaler/backends/local.py` 切车队形态
 
 **Files:**
-- Modify: `autoscaler/backends/local.py:48-54`（基础 env 字典）、`:80-87`（注释 + 删两行）
-- Modify: `deploy/compose/docker-compose.autoscale.yml:116`（`E2B_AS_WORKER_ENV` JSON：先补成对的
+- Modify: `autoscaler/backends/local.py`（基础 env 字典 `self._env`、`cmd` 里的注释与要删的两行）
+  —— 基础字典另立一条（2026-09-26 N38 第 4 项，控制器裁定）：`E2B_ENABLE_NETWORK` 与
+  `E2B_ROUTE_B_TMP_ROOT` 也进基础字典，取值同车队，好让不经 `E2B_AS_WORKER_ENV` 直接构造的
+  `DockerPoolBackend()` 自身自足（`E2B_AS_WORKER_ENV` 仍是覆盖入口，后写者赢）
+- Modify: `deploy/compose/docker-compose.autoscale.yml` 的 `E2B_AS_WORKER_ENV` 行（JSON：先补成对的
   `E2B_ENABLE_NET_ISOLATION`/`E2B_FD_INJECT_CONNECT`；2026-09-26 的 N38 追加裁定再补
   `E2B_ENABLE_NETWORK` 与 `E2B_ROUTE_B_TMP_ROOT`，取值逐字取自
   `deploy/stack/docker-compose.prod.yml:196`/`:239`）
@@ -402,7 +406,7 @@ Expected: FAIL —— 第一条报 `assert 'net.ipv4.ip_unprivileged_port_start'
         }
 ```
 
-3d. `deploy/compose/docker-compose.autoscale.yml:116` —— 在 `E2B_AS_WORKER_ENV` 的单引号 JSON 里，紧跟 `"E2B_EXECUTOR": "${E2B_EXECUTOR:-local}", ` 之后插入 `"E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", `。改完那一行是：
+3d. `deploy/compose/docker-compose.autoscale.yml` 的 `E2B_AS_WORKER_ENV` 行 —— 在它的单引号 JSON 里，紧跟 `"E2B_EXECUTOR": "${E2B_EXECUTOR:-local}", ` 之后插入 `"E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", `。改完那一行是：
 
    > **⚠️ 本步已执行，且实际值与本步文字不同（2026-09-26 更正）**：落地时 `E2B_EXECUTOR` 的默认被**一并改成 `auto`**（用户裁定，见《追加裁定：N38》）—— 因为按 `local` 默认，那两个开关是**空转**的（`local` 执行器不做 Sandlock 隔离，`enable_net_isolation` 只在 `envd_service/executors/factory.py:210` 传给 sandlock 执行器）。下面那行 `:-local` 是**改动前**的样子，照它写会得到"改了等于没改"。**实际值**：`"E2B_EXECUTOR": "${E2B_EXECUTOR:-auto}"`，且另补了 `E2B_ENABLE_NETWORK` 与 `E2B_ROUTE_B_TMP_ROOT`（见 Task 2 的收口记录）。
 
@@ -458,8 +462,12 @@ PY
 
 Expected: 最后一行打印 `POOL NETNS SHAPE OK`（收尾 `docker compose -f deploy/compose/docker-compose.autoscale.yml down` 由执行者按需决定；`tmp/netns-unify-pool.txt` 留证）。
 
-**形态验证的两个前提（2026-09-26 补记，N38 追加裁定后实测）**
+**形态验证的前提与池的新出网语义（2026-09-26 补记，N38 追加裁定后实测）**
 
+- **池沙箱的出网语义当场变了（用户可感知，别只当成"修一个让 worker 起不来的键"）**：
+  `E2B_ENABLE_NETWORK` 一补上，"静默无网"就变成**按沙箱规则集出网** —— 请求里不带 `network`
+  的沙箱只能到固定域名集（pypi/npm/github，`envd_service/executors/sandlock.py` 的固定规则集），
+  **与车队一致，但对"池只是本地调试"的人是新行为**。
 - **必须显式传 `WORKER_IMAGE=`。** compose 的 `E2B_AS_DOCKER_IMAGE` 默认
   `.../e2b-sandlock-worker:0.1.0` 是 2026-08-30 的快照，该镜像里 `envd_service/config.py`
   **没有** `E2B_ENABLE_NET_ISOLATION` 这个字段（镜像内 `grep -c` = 0）⇒ 在那个 tag 上
@@ -579,12 +587,14 @@ Expected: FAIL with `assert '\n    sysctls:\n' not in COMPOSE_PROD`（`:198` 就
 
 3c. 删掉整块 `sysctls:`（`:198` 到 `:213`，含 12 行解释性注释与那一条 `- net.ipv4.ip_unprivileged_port_start=0`）。删完后 `volumes: &worker-volumes` 的下一个键就是 `security_opt:`。
 
+> **⚠️ 追加裁定（2026-09-26，同批执行）**：3a–3c 之外**还要**补一行 `E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b`（值照抄车队：`deploy/stack/docker-compose.prod.yml:239`，`deploy/k8s/worker.yaml:258-259` 同值）。本示例的 worker env 从来没有这个键，而镜像里有 F1 的 file-capability brokers ⇒ `configure_priv_helpers` 拿默认 `/tmp/sandlock-route-b`（在 broker 白名单外）按名字拒绝 ⇒ `up -d --build` 出来的 worker **启动即 exit，三个都 `Restarting (1)`** —— 这是 N39 在 ① 的同一根因（N39 原先只记了池那一处）。补上后实测三 worker `Up` + `PROD EXAMPLE NETNS SHAPE OK`；钉子照池那一处的形状写（解析车队清单取值再 `==`，不是把字面量抄两遍），见 `test_compose_prod_worker_env_carries_the_fleets_route_b_root`。
+
 **行为差异（受众＝本地/单机生产示例的运维与 SDK 用户）**
 
 - 形态从"单 uid userns + 共享 netns"变成"单 uid userns + 每沙箱 netns"：沙箱内 `ip addr` 从能看到 worker 的 `eth0` 变成只见 `lo`；**不能再从宿主机直连沙箱端口**（走网关 `/mcp` 或 50005+ 映射）。
 - 出网全部经 supervisor 注入（建连 p50 +0.25 ms 量级；非阻塞 `connect_ex()` 从 `EINPROGRESS` 变 `0 OK`）。
 - `docker inspect` 的 `HostConfig.Sysctls` 变 `null`；容器 `CapEff` 仍为 0。
-- **注意这一格在仓库里证据最薄**：车队证据是 root/cap_SETUID worker + per-sandbox uid 开，而这里 65534 且 `:137-146` 明说 per-sandbox uid 会被自动关掉。Task 1 的 phase 2（uid 65534）就是为这一格准备的实测；**Task 1 的 phase 2 不绿就别合这个 Task**。
+- **注意这一格在仓库里证据最薄**：车队证据是 root/cap_SETUID worker + per-sandbox uid 开，而这里 65534 且 `:137-146` 明说 per-sandbox uid 会被自动关掉。**⚠️ 2026-09-26 更正（原句是错的）**：这里原写"Task 1 的 phase 2（uid 65534）就是为这一格准备的实测；phase 2 不绿就别合这个 Task" —— Task 1 报告 §7.3 实测写明 phase 2 的选择集（5 个 sandlock/route-B 文件）**不含** netns 契约，"phase 2 绿"只等于"把成对开关作为 worker 默认值塞进去、无特权相位仍全绿"。本格真正的两条实测通道（本任务都已跑）：① Task 1 建立的 `NETNS_ENV` 透传（`deploy/scripts/test-prod-shaped.sh` 把成对开关交给两个相位，整档跑在部署形态的默认值上，`1795 passed / 0 failed` + phase 2 `57 / 1 skipped / 0 failed`）；② **本格的容器级实测** —— `docker compose -f deploy/compose/docker-compose.prod.yml up -d --build` 三 worker `Up`、`docker inspect` 三份 `sysctls=null`、SDK 探针 `IFACES=["lo"]` ⇒ `PROD EXAMPLE NETNS SHAPE OK`，wildcard `allowOut` 下沙箱 `/etc/resolv.conf` 是 `nameserver 127.0.0.2`（网关的 `:53` 绑在沙箱自己的 netns 里）、DNS 解析与 `CONNECT-OK` 都成立。合并门槛随之改为**这两条**（无特权相位仍全绿 + 本格容器级实测绿）。
 - 回滚代价（Global Constraints 里已记）：成对设 `false` 即回到共享 netns，此时 wildcard `allowOut` 要把窗口加回来。`deploy/compose/.env.example` 里**没有**这两个键（已核实），所以本地 `.env` 不会意外覆盖 `:-true`。
 
 - [ ] **Step 4: 跑测试确认通过，再跑渲染 + 容器事实 + 业务冒烟（本机 Docker/OrbStack）**
@@ -630,6 +640,8 @@ E2B_API_URL=http://127.0.0.1:3000 E2B_SANDBOX_URL=http://127.0.0.1:3000 E2B_API_
 ```
 
 Expected: 逐段 `OK:` 输出，退出码 0（无 assert 失败）。
+
+> **⚠️ 2026-09-26 实测（Task 3）**：按上面把 `E2B_NODE_*` 调大（`4096 / 400 / 8192 / 1024`，`.env.example:60-70` 的处方；默认 `E2B_NODE_PROCESSES=256` 时一个 worker 只放得下一个沙箱，第 2 段的 migrate 会 `503 Node worker-1 has no capacity`）后，第 1–4 段全绿（`OK: commands + files through gateway` / `migrated worker-1 -> worker-3, files kept` / `OK: network config echo + atomic update` / `OK: volume mounted remotely + sibling volume isolated`）。**第 5 段（template 构建）在本示例里必然失败**，原因与形态无关：`deploy/compose/docker-compose.prod.yml` 不起 buildkitd，控制面于是报 `dial unix /run/buildkit/buildkitd.sock: connect: no such file or directory` ⇒ 这条 Expected 应改成"第 1–4 段逐段 `OK:`；第 5 段需要额外起 buildkit（本示例没有）"。证据：`.superpowers/sdd/netns-task-3-report.md`、`tmp/netns-task3-deployment-smoke*.log`、`tmp/netns-task3-template-build-status.log`。
 
 Run（形态证据：沙箱只见 lo）：
 
@@ -1090,7 +1102,7 @@ Expected: Tasks 2–4 已合 ⇒ 此条 **PASS**（它是收口钉子）；若�
 3k. `docs/open-issues.md:22` —— 状态列 `**待决策**` 改成 `**已完成（2026-09-26）**`，"下一步"列把实测结论写实（条数与文件名按你的实际日志填，下表为模板）：
 
 ```markdown
-**已完成（2026-09-26）**：①②④ 已与车队对齐（成对打开 `E2B_ENABLE_NET_ISOLATION`+`E2B_FD_INJECT_CONNECT`、删除低端口窗口）；③ arm lane **保留**（lane-only 的共享 netns 覆盖）。验收：`deploy/scripts/test-prod-shaped.sh` 的 netns 形态两相位全绿（`0 failed`，phase 2 = uid 65534 这一格此前无实测）、池 `docker inspect sysctls=null`、`deployment_smoke.py` / `multinode_smoke.py` 全绿、④ 的通配规则从 `bind DNS gateway: Permission denied (os error 13)` 变可解析。证据：`tmp/netns-unify-*.log|txt`。
+**已完成（2026-09-26）**：①②④ 已与车队对齐（成对打开 `E2B_ENABLE_NET_ISOLATION`+`E2B_FD_INJECT_CONNECT`、删除低端口窗口）；③ arm lane **保留**（lane-only 的共享 netns 覆盖）。验收：`deploy/scripts/test-prod-shaped.sh` 的 netns 形态两相位全绿（`0 failed`；phase 2 的选择集**不含** netns 契约，"65534 这一格"的形态证据是 ① 的容器级实测：三 worker `Up` + `IFACES=["lo"]`）、池与 ① 的 `docker inspect sysctls=null`、`deployment_smoke.py` 第 1–4 段全绿（第 5 段的 template 构建需要额外的 buildkitd，`deploy/compose` 示例不起它）/ `multinode_smoke.py` 全绿、④ 的通配规则从 `bind DNS gateway: Permission denied (os error 13)` 变可解析。证据：`tmp/netns-unify-*.log|txt`、`tmp/netns-task3-*.log|txt`。
 ```
 
 3l. `docs/task-backlog.md:104` —— 把 `**待决策**：…` 整格替换成同口径的一句："**已完成（2026-09-26）**：①②④ 与车队对齐（成对开关 + 删窗口），③ 保留（lane-only，实测必需）；验收见 `docs/open-issues.md` N36 行。"
