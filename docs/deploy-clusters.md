@@ -278,6 +278,23 @@ export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o json
 （脚本最后会把沙箱 `kill` 掉；想留下现场排障就用 `tmp/k0s/probe_restore_state.py`，它不 kill，
 并打印沙箱 id 与宿主 pod。）
 
+> **这条脚本会删宿主 worker 的 pod，所以不能在有别人沙箱的时候跑（2026-09-27）**：跑到
+> "换 worker"那一半（第二次 `pause` 之后）它会 `kubectl delete pod <宿主 worker>`，让 StatefulSet 重建一个——这是
+> "pause 能不能活过它的 worker"的唯一正确测法；代价是**当时宿在那台 worker 上的任何别人的
+> 沙箱会一起死**，而 worker 的沙箱注册表是内存态 ⇒ 它们再也没有办法 `resume` 回来。
+> 所以脚本在删 pod 之前先读控制面的按节点名单（`GET /internal/nodes/<id>/sandboxes`，
+> 与 worker 做分区 reconcile 用的是同一份权威视图）：
+>
+> * 名单里还有**不属于本次验收**的沙箱 ⇒ **拒绝、退出码 2、一个 pod 都不碰**，并打印出路
+>   （先把那些沙箱迁走/杀掉再重跑，或 `--force` 显式承担）；
+> * 名单**读不到**（通道/控制面坏了），或名单里**连本次验收自己的沙箱都没有** ⇒ 同样拒绝：
+>   拿不到证据就不删，"没有别人"这句话只有在名单完整时才算数；
+> * 只有"名单恰好就是本次验收的那一条"才继续。
+>
+> `--force` 是唯一的显式出口（= 我确认那些沙箱可以和这个 pod 一起死）。**要放 CI 或多人
+> 并行跑，前提是目标 worker 上没有别人的沙箱**——别再退回人工肉眼复核：Task 2 报告 §7.6 的
+> 那次复核就是空判据（worker 镜像里**没有 `ps`**，`ps | grep` 什么都查不出来）。
+
 > **2026-09-25 夜复核**：部署 `0.1.0-527-g946daa9` 上再跑一遍这条验收，全绿（含"删掉宿主
 > worker pod → 重建 → resume"，日志 `tmp/k0s/restore-recheck3.log`）。对照 §9 上面那两轮，
 > 这次先红了**两次**、两次都不在 restore，而是验收脚本自己的两个毛病，已经修掉并写进

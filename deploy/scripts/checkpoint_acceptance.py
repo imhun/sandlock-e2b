@@ -23,15 +23,23 @@ after the resume must return the expected stdout.
 
 Uses the deployed gateway + `kubectl` against the self-hosted k0s cluster
 (`docs/deploy-clusters.md` §2: the KUBECONFIG must point at *that* cluster).
+
+**它会删掉宿主 worker 的 pod**，而那台 worker 上**别人的**沙箱会跟着一起死：
+worker 的沙箱注册表是内存态，pod 没了，那些沙箱就再也 `resume` 不回来。所以删之前脚本先读
+控制面的按节点名单（`GET /internal/nodes/<id>/sandboxes`），名单里只要还有不属于本次验收的
+沙箱就**拒绝并退出（码 2）**，`--force` 是"我确认它们可以和这个 pod 一起死"的唯一说法。
+⇒ **只能在没有别人沙箱的 worker 上跑**（见 `docs/deploy-clusters.md` §9）。
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
 import sys
 import time
+from typing import NoReturn
 
 import httpx
 
@@ -174,6 +182,92 @@ def platform_account() -> dict:
     }
 
 
+def node_sandbox_ids(node_id: str) -> list[str]:
+    """控制面视角下这台 worker 上的沙箱 id 列表。
+
+    读的是**控制面**的按节点视图（`control_plane/api/internal.py::node_sandboxes`，
+    也是 worker 做分区 reconcile 的权威名单），不是 worker 自己的内存注册表：要删的
+    正是这个 pod，它没有资格给自己开一张"我很空"的证明。
+    """
+    resp = httpx.get(
+        f"{API}/internal/nodes/{node_id}/sandboxes",
+        headers={"X-Internal-Key": INTERNAL},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return list(resp.json()["sandboxIDs"])
+
+
+#: 礼貌检查拒绝时的退出码。与断言失败（1）分开：这里连"开始验收"都没发生，
+#: 集群上什么都没动。
+REFUSED_WORKER_BUSY = 2
+
+
+def _refuse_worker_pod(message: str) -> NoReturn:
+    """拒绝删 pod：原文进 stderr（人读），退出码进 shell（脚本读）。"""
+    print(message, file=sys.stderr, end="", flush=True)
+    raise SystemExit(REFUSED_WORKER_BUSY)
+
+
+def ensure_worker_is_exclusively_ours(
+    node_id: str, sandbox_id: str, *, force: bool = False
+) -> None:
+    """删这台 worker 的 pod 之前，先确认它上面只有本次验收的沙箱。
+
+    这条检查是给"共享集群 / CI / 两个人同时跑"用的：删 pod 会连带打死当时宿在它上面的
+    任何别人的沙箱，而没有任何东西能把它们救回来。判据**可证伪**——名单必须真的被读到
+    （读不到 = 拿不到证据 = 拒绝），并且必须真的包含本次验收自己的沙箱（名单连自己都
+    不认 ⇒ 名单不可信 ⇒ 拒绝）。两者都有 `--force` 这个显式出口。
+    """
+    if force:
+        step("politeness_overridden", node=node_id, sandbox=sandbox_id)
+        return
+    try:
+        ids = node_sandbox_ids(node_id)
+    except Exception as exc:  # noqa: BLE001 - any answer other than the list is a refusal
+        _refuse_worker_pod(
+            f"拒删 worker pod {node_id}：读不到控制面的按节点沙箱名单"
+            f"（GET /internal/nodes/{node_id}/sandboxes）：{type(exc).__name__}: {exc}\n"
+            "那张名单是「这台 worker 上没有别人的沙箱」的唯一证据；拿不到就不动 pod。\n"
+            "出路：先把通道/控制面修好（deploy/scripts/open-cluster-tunnel.sh）再重跑；\n"
+            "      确实要不看这张名单就删，用 `--force` 显式承担。\n"
+        )
+    others = sorted(set(ids) - {sandbox_id})
+    if others:
+        listed = "\n".join(f"  - {other}" for other in others)
+        _refuse_worker_pod(
+            f"拒删 worker pod {node_id}：它上面有 {len(others)} 个不属于本次验收的沙箱：\n"
+            f"{listed}\n"
+            "删 pod 会把别人的沙箱一起打死（worker 的注册表是内存态，它们无法再 resume）。\n"
+            "出路：先把它们迁走或杀掉（带 API key 的 `POST /sandboxes/<id>/migrate`，"
+            "或 `Sandbox.kill(id)`）再重跑；\n"
+            "      如果你确认它们可以和这个 pod 一起死，重跑时加 `--force` 显式承担。\n"
+        )
+    if sandbox_id not in ids:
+        shown = " ".join(sorted(ids)) or "空"
+        _refuse_worker_pod(
+            f"拒删 worker pod {node_id}：控制面的按节点名单里没有本次验收的沙箱 "
+            f"{sandbox_id}（名单：{shown}）。\n"
+            "名单连自己都不认的时候，「这上面没有别人」这句话不算数——所以不动 pod。\n"
+            "出路：确认这条沙箱的记录还在（Sandbox.create 之后 `/internal/routes/<id>` 能查到）再重跑；\n"
+            "      确实要不看这张名单就删，用 `--force` 显式承担。\n"
+        )
+
+
+def delete_worker_pod(node_id: str, sandbox_id: str, *, force: bool = False) -> str:
+    """删掉宿主 worker 的 pod 并返回它的 uid —— 本脚本唯一会打死沙箱的动作。
+
+    礼貌检查与这一行 `kubectl delete` 写在同一个函数里，是为了它们不能分家：
+    脚本里其它的 pod 操作只有读（`get`/`logs`/`exec`），删只有这里一处。
+    """
+    ensure_worker_is_exclusively_ours(node_id, sandbox_id, force=force)
+    uid_before = kubectl(
+        "get", "pod", node_id, "-o", "jsonpath={.metadata.uid}"
+    ).stdout.strip()
+    kubectl("delete", "pod", node_id)
+    return uid_before
+
+
 def read_counter(sandbox, name: str = COUNTER) -> int | None:
     """The counter a background process keeps in memory; ``None`` if absent.
 
@@ -246,8 +340,28 @@ def image_on_node(pod: str, sandbox_id: str, state_base: str) -> str:
     return shown
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "生产形态的 pause → 换 worker → resume 验收。它在中途会删掉宿主 worker 的 pod，"
+            "所以先确认那台 worker 上没有别人的沙箱（否则拒绝并退出码 2）。"
+        )
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "跳过「这台 worker 上没有别人的沙箱」这条礼貌检查。"
+            "只在确认上面那些沙箱可以和这个 pod 一起死（= 再也 resume 不回来）时用。"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
     from e2b import Sandbox
+
+    args = parse_args(argv)
 
     # The steps below that read a node or restart a worker go through `kubectl`,
     # which needs the tunnel (`deploy/scripts/open-cluster-tunnel.sh`). A dead
@@ -401,10 +515,9 @@ def main() -> int:
         step("paused_again", counter=paused_at)
 
         # Replace the worker: the slot, and every process it held, dies with it.
-        uid_before = kubectl(
-            "get", "pod", node["nodeID"], "-o", "jsonpath={.metadata.uid}"
-        ).stdout.strip()
-        kubectl("delete", "pod", node["nodeID"])
+        # 这是本脚本唯一会打死沙箱的动作，所以它先过礼貌检查：这台 worker 上只有
+        # 本次验收自己的沙箱，才允许删；否则打印出路、退出码 2、pod 一个都不碰。
+        uid_before = delete_worker_pod(node["nodeID"], sandbox_id, force=args.force)
         step("worker_deleted", pod=node["nodeID"], uid=uid_before)
 
         def replacement_ready():
