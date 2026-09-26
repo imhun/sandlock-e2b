@@ -116,6 +116,13 @@ _SANDBOX_RECORD_NAME = "sandbox.json"
 #: record and its command log) -- deliberately *next to*, never inside, the
 #: sandbox's own tree.
 #:
+#: It sits under the **state base** (:func:`resolve_state_base`), which today
+#: defaults to the workspace base and can be moved out from under it entirely
+#: with ``E2B_STATE_BASE`` (N27): the namespace name is unchanged either way,
+#: and both bases carry it while a migration is in flight, so the name stays
+#: reserved on the workspace side (see
+#: :data:`RESERVED_PLATFORM_NAMESPACES`).
+#:
 #: The sandbox owns its tree directory (``0770 <sandbox uid>:<worker gid>``,
 #: E3.2), and owning a directory means being able to unlink from it: measured
 #: on the live cluster, a sandbox can ``rm sandbox.json`` and write its own
@@ -155,6 +162,26 @@ RUNTIME_DIR_NAME = "_runtime"
 #: behind. Reserved like the rest of the platform's namespaces, below.
 PURE_ROOTFS_DIR_NAME = "_pure_rootfs"
 
+#: The directory name of the **state base** inside the shared export: the
+#: platform's own tree (``_runtime``, ``.route-b``, the uid pool's lock and
+#: reservations) living *beside* the sunk root of the sandbox trees
+#: (``<export>/workspaces/<id>`` + ``<export>/state``), so a sandbox walking up
+#: from its own tree reaches the workspace root and nothing else.
+#:
+#: Neither ``paths`` nor the worker creates it: the deploy-side init container
+#: owns its mode and ownership, exactly like the other platform namespaces. Its
+#: name is here because it is a platform namespace like the rest -- see
+#: :data:`RESERVED_PLATFORM_NAMESPACES` for why a bare ``state`` directory must
+#: not be read as a sandbox tree (it spells a legal id, the same M1 shape).
+STATE_DIR_NAME = "state"
+
+#: Environment variable naming the base the platform's own files live under
+#: (record, command log, checkpoint images). Unset = the workspace base, which
+#: is exactly today's layout -- committing this switch is what makes "the
+#: sandbox cannot reach platform state" independent of the sandbox shape
+#: (docs/pure-shape-decision.md §4, N27).
+STATE_BASE_ENV = "E2B_STATE_BASE"
+
 #: The sandbox's command output log (JSONL), written by the worker.
 COMMAND_LOG_NAME = "command-logs.jsonl"
 
@@ -165,36 +192,81 @@ COMMAND_LOG_NAME = "command-logs.jsonl"
 CHECKPOINT_ROOT_NAME = ".checkpoints"
 
 
-def sandbox_runtime_dir(workspace_base: str | Path, sandbox_id: str) -> Path:
-    """``<base>/_runtime/<id>`` -- the platform's directory for one sandbox."""
-    return Path(workspace_base) / RUNTIME_DIR_NAME / sandbox_id
+def resolve_state_base(
+    workspace_base: str | Path, state_base: str | Path | None = None
+) -> Path:
+    """The base the platform's own files live under.
+
+    ``state_base`` when given, the workspace base otherwise -- which is exactly
+    today's layout, so every helper below is unchanged until a deployment sets
+    ``E2B_STATE_BASE`` (:data:`STATE_BASE_ENV`). ``None``, or an empty value --
+    which is what the environment reads an unset variable as -- means the
+    workspace base.
+    """
+    return Path(state_base) if state_base else Path(workspace_base)
+
+
+def sandbox_runtime_dir(
+    workspace_base: str | Path,
+    sandbox_id: str,
+    *,
+    state_base: str | Path | None = None,
+) -> Path:
+    """``<state base>/_runtime/<id>`` -- the platform's directory for one sandbox.
+
+    Defaults to ``<workspace_base>/_runtime/<id>``, i.e. today's path; see
+    :func:`resolve_state_base`.
+    """
+    return (
+        resolve_state_base(workspace_base, state_base) / RUNTIME_DIR_NAME / sandbox_id
+    )
 
 
 def sandbox_record_path(
-    workspace_base: str | Path, sandbox_id: str, *, legacy: bool = False
+    workspace_base: str | Path,
+    sandbox_id: str,
+    *,
+    legacy: bool = False,
+    state_base: str | Path | None = None,
 ) -> Path:
     """Where a sandbox's runtime record lives.
 
     ``legacy=True`` returns the pre-split location inside the sandbox's own
     tree, which readers still fall back to and writers migrate away from; see
-    ``RuntimeRegistry.adopt_legacy_records``.
+    ``RuntimeRegistry.adopt_legacy_records``. That location is a statement
+    about the *workspace* base and stays there whatever the state base is.
     """
     if legacy:
         return Path(workspace_base) / sandbox_id / _SANDBOX_RECORD_NAME
-    return sandbox_runtime_dir(workspace_base, sandbox_id) / _SANDBOX_RECORD_NAME
+    return (
+        sandbox_runtime_dir(workspace_base, sandbox_id, state_base=state_base)
+        / _SANDBOX_RECORD_NAME
+    )
 
 
 def sandbox_command_log_path(
-    workspace_base: str | Path, sandbox_id: str, *, legacy: bool = False
+    workspace_base: str | Path,
+    sandbox_id: str,
+    *,
+    legacy: bool = False,
+    state_base: str | Path | None = None,
 ) -> Path:
     """Where a sandbox's command log lives (see :func:`sandbox_record_path`)."""
     if legacy:
         return Path(workspace_base) / sandbox_id / COMMAND_LOG_NAME
-    return sandbox_runtime_dir(workspace_base, sandbox_id) / COMMAND_LOG_NAME
+    return (
+        sandbox_runtime_dir(workspace_base, sandbox_id, state_base=state_base)
+        / COMMAND_LOG_NAME
+    )
 
 
-def sandbox_checkpoint_dir(workspace_base: str | Path, sandbox_id: str) -> Path:
-    """``<base>/_runtime/.checkpoints/<id>`` -- a sandbox's checkpoint images.
+def sandbox_checkpoint_dir(
+    workspace_base: str | Path,
+    sandbox_id: str,
+    *,
+    state_base: str | Path | None = None,
+) -> Path:
+    """``<state base>/_runtime/.checkpoints/<id>`` -- a sandbox's checkpoint images.
 
     Platform state, held under ``_runtime`` (never inside the tree the sandbox
     owns, and on the shared volume so another node can resume it), but as a
@@ -216,9 +288,16 @@ def sandbox_checkpoint_dir(workspace_base: str | Path, sandbox_id: str) -> Path:
     It is also, deliberately, *outside* the tree the per-sandbox quota measures
     (``<base>/<id>``). That is why it has an account of its own -- see
     :mod:`envd_service.runtime.platform_disk`.
+
+    Follows the state base like the record and the command log; unset, that is
+    the workspace base and this is ``<workspace_base>/_runtime/.checkpoints/<id>``
+    (see :func:`resolve_state_base`).
     """
     return (
-        Path(workspace_base) / RUNTIME_DIR_NAME / CHECKPOINT_ROOT_NAME / sandbox_id
+        resolve_state_base(workspace_base, state_base)
+        / RUNTIME_DIR_NAME
+        / CHECKPOINT_ROOT_NAME
+        / sandbox_id
     )
 
 #: Where a worker parks a tree it refuses to act on (review W7 / W7-3): such a
@@ -265,6 +344,13 @@ RESERVED_PLATFORM_NAMESPACES = frozenset(
         #: quota scan's second stage -- skip it, and so the create path refuses
         #: the id.
         PURE_ROOTFS_DIR_NAME,
+        #: The state base's own directory name, a sibling of the sunk tree root
+        #: (see :data:`STATE_DIR_NAME`). Under the committed shape it never
+        #: appears *under* this base, so this entry costs nothing there; it is
+        #: what keeps the transitional config (old base still in use, state
+        #: base already created) from reading a whole platform tree as one
+        #: sandbox tree -- ``state`` is a legal sandbox id.
+        STATE_DIR_NAME,
         "_secrets",
         "_snapshots",
         "_templates",
