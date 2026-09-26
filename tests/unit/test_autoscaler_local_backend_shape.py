@@ -159,6 +159,26 @@ def _k8s_fleet_values() -> dict[str, str]:
     return found
 
 
+def _k8s_env(key: str) -> str:
+    """One k8s worker env value by name, in the same dialect as above.
+
+    N27 needs a key outside `FLEET_KEYS` here: the route-B root is no longer a
+    fleet-wide literal, it is *derived* -- the k8s manifest sinks the tree root
+    and puts the platform's own files (`.route-b` among them) under
+    `E2B_STATE_BASE`, while the compose stacks this pool spawns keep the
+    one-base layout. Reading the base from the same manifest is what keeps the
+    assertion a comparison between two declarations instead of a third copy of
+    a literal.
+    """
+    lines = [line.strip() for line in FLEET_K8S.splitlines()]
+    marker = f"- name: {key}"
+    hits = [index for index, line in enumerate(lines) if line == marker]
+    assert len(hits) == 1, f"expected exactly one {key!r} env entry: {hits}"
+    value_line = lines[hits[0] + 1]
+    assert value_line.startswith("value: "), value_line
+    return value_line[len("value: ") :].strip().strip('"')
+
+
 def _fleet_manifest_values() -> dict[str, dict[str, str]]:
     """Every fleet manifest's values for the two keys, keyed by manifest path.
 
@@ -186,6 +206,13 @@ def test_the_pool_worker_env_matches_every_fleet_manifest_for_those_keys() -> No
     Both fleet manifests are read: `deploy/stack/docker-compose.prod.yml` and
     `deploy/k8s/worker.yaml`. Reading only the first would stay green while the
     two fleet manifests drifted apart from each other.
+
+    N27 (2026-09-26) split one of the two values into two *shapes* -- this pool
+    spawns compose-shaped workers (one base), the k8s manifest sinks the tree
+    root and moves `.route-b` under `E2B_STATE_BASE` -- so the k8s file is
+    compared against its own bases here, and "pool == fleet" is asserted against
+    the shape the pool actually spawns. The egress flag is shape-independent and
+    still has to match both.
     """
     manifests = _fleet_manifest_values()
     assert manifests["deploy/stack/docker-compose.prod.yml"] == {
@@ -194,11 +221,13 @@ def test_the_pool_worker_env_matches_every_fleet_manifest_for_those_keys() -> No
     }
     assert manifests["deploy/k8s/worker.yaml"] == {
         "E2B_ENABLE_NETWORK": "true",
-        "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b",
+        "E2B_ROUTE_B_TMP_ROOT": f"{_k8s_env('E2B_STATE_BASE')}/.route-b",
     }
     env = _worker_env()
+    pool_shape = manifests["deploy/stack/docker-compose.prod.yml"]
+    assert {key: env[key] for key in pool_shape} == pool_shape
     for values in manifests.values():
-        assert {key: env[key] for key in values} == values
+        assert env["E2B_ENABLE_NETWORK"] == values["E2B_ENABLE_NETWORK"]
 
 
 def _env_from_argv(argv: list[str]) -> dict[str, str]:
@@ -277,9 +306,14 @@ def test_spawned_worker_argv_carries_the_two_fleet_keys(monkeypatch) -> None:
     assert env["E2B_ENABLE_NETWORK"] == "true"
     assert env["E2B_ROUTE_B_TMP_ROOT"] == "/var/lib/e2b-sandboxes/.route-b"
     # The base dictionary is a second place the pool declares these values, so
-    # it is pinned against both fleet manifests the same way the compose JSON is.
-    for values in _fleet_manifest_values().values():
-        assert {key: env[key] for key in values} == values
+    # it is pinned against the fleet manifest of the shape it spawns (compose,
+    # one base -- see the N27 split above) the same way the compose JSON is; the
+    # egress flag is shape-independent and matches both.
+    manifests = _fleet_manifest_values()
+    pool_shape = manifests["deploy/stack/docker-compose.prod.yml"]
+    assert {key: env[key] for key in pool_shape} == pool_shape
+    for values in manifests.values():
+        assert env["E2B_ENABLE_NETWORK"] == values["E2B_ENABLE_NETWORK"]
 
 
 def test_spawned_worker_argv_lets_the_operator_override_the_fleet_keys(monkeypatch) -> None:

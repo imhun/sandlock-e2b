@@ -1,5 +1,14 @@
 # 共享存储：阿里云 NAS 的静态 NFS PV。
 #
+# ⚠ N27：`workspaces/`（沙箱树根）与 `state/`（平台自己的文件）**必须来自这同一个
+#   挂载**，不是两个 PV、也不是两个 export。理由是 `rename(2)` 的边界就是**挂载点**
+#   （不是服务器上的同一个文件系统）：只要 state 换了挂载，凡是要在两个 base 之间
+#   搬东西的地方 —— 迁移时的逐树改名、`adopt_legacy_records`、park 的成对收尾 ——
+#   就一律 EXDEV，只能退化成"整树拷贝 + 逐文件校验 + 删源"。同挂载让这一步是秒级的
+#   元数据操作（checkpoint 镜像是 GiB 级，拷贝那条路的代价不是线性可接受的），
+#   而且回退同样是 `rename`。所以挂载参数一个字不改：要动的是**目录布局**，
+#   不是这块卷。
+#
 # 为什么是静态 PV 而不是阿里云 CSI 插件：
 #   * 内置的 `nfs` 卷插件就是执行 mount -t nfs，不需要 OpenAPI 凭据、不需要
 #     csi-plugin/csi-provisioner。这台 ECS 没有挂 RAM 角色，走 CSI 得手工配 AK。

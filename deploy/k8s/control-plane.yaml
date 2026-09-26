@@ -223,8 +223,21 @@ spec:
               value: http://control-plane:3000
             - name: E2B_SHARED_WORKSPACE_ROOT
               value: /var/lib/e2b-sandboxes
+            # N27: the *tree* root, one level down (`<export>/workspaces/<id>`),
+            # while `E2B_SHARED_WORKSPACE_ROOT` above stays the export root the
+            # platform's own directories hang off (`_snapshots`, `_volumes`, …)
+            # and the worker's `workspace-root-init` creates them under.
             - name: E2B_WORKSPACE_BASE
-              value: /var/lib/e2b-sandboxes
+              value: /var/lib/e2b-sandboxes/workspaces
+            # ...and the base the platform's own files live under: the runtime
+            # records (`_runtime/<id>/sandbox.json`), the command logs, the
+            # checkpoint images, the uid pool's lock and reservations. A
+            # *sibling* of the sunk tree root and on the same mount, so a
+            # sandbox walking up from its own tree reaches the workspace root
+            # and never this. Unset (every deployment that predates N27) it is
+            # the workspace base, i.e. the old layout unchanged.
+            - name: E2B_STATE_BASE
+              value: /var/lib/e2b-sandboxes/state
             # Track Z / Z-F7: same shared image cache as the workers. This
             # deployment runs 2 replicas over the same RWX PVC at the same
             # path, so with no E2B_IMAGE_REGISTRY configured Template.build
@@ -289,9 +302,24 @@ spec:
             # writes: template builds (`_builds`), the OCI layout tars it
             # exports for the workers (`_images/_oci`), its registries
             # (`_secrets`, `_templates`, `_snapshots`) and the volume
-            # directories (`_volumes`). Sandbox trees are deliberately absent:
-            # writing one from here is now EROFS, which is exactly what OBS-9
-            # asked for. The directories are pre-created by the worker's
+            # directories (`_volumes`). N27 adds the two roots the *tree* split
+            # created:
+            #   * `state` -- the platform's own files (runtime records, command
+            #     logs, checkpoint images, the uid pool's lock). Without this
+            #     mount every record write is EROFS.
+            #   * `workspaces` -- the sunk tree root. The control plane's
+            #     migration staging lives under it (`<workspaces>/_migrate`), and
+            #     so does the tree root itself, which `create_app` creates if it
+            #     is missing; on a read-only view that mkdir is EROFS and the pod
+            #     cannot come up before a worker's init has run.
+            #
+            # ⚠ 这是对 OBS-9 的一次**有意放宽**：`workspaces` 可写意味着控制面
+            # 又能写沙箱树（2026-09-18 实测过"写树即 EROFS"）。换取的是迁移
+            # 暂存（`_migrate`）与"树根不存在时能自建"这两件事在 N27 之后仍然
+            # 成立。要收回这条放宽，把 `workspaces` 换成 `workspaces/_migrate`
+            # 的 subPath 即可（那时 `_migrate` 必须由 `workspace-root-init`
+            # 预建，见 `.superpowers/sdd/n27-task-5-report.md` §担忧）。
+            # The directories are pre-created by the worker's
             # `workspace-root-init` (a pod that needs a subPath source that does
             # not exist yet stays in ContainerCreating and the kubelet retries,
             # so a fresh install converges once a worker has initialised).
@@ -316,6 +344,12 @@ spec:
             - name: shared
               mountPath: /var/lib/e2b-sandboxes/_volumes
               subPath: _volumes
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes/workspaces
+              subPath: workspaces
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes/state
+              subPath: state
             - name: buildkit-data
               mountPath: /run/buildkit
               readOnly: true

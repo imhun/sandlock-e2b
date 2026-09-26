@@ -666,6 +666,165 @@ def test_k0s_overlay_moves_the_seccomp_root_to_the_k0s_kubelet_dir() -> None:
     assert security["runAsGroup"] == 65534
 
 
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_k0s_overlay_sinks_the_tree_root_and_keeps_state_as_a_sibling() -> None:
+    """N27: the sandbox trees sink one level, the platform's state moves beside them.
+
+    Read off the *rendered worker container* rather than the manifest text: the
+    same three variable names occur in the compose stacks and in the baseline
+    manifest, so a text assertion cannot tell which object it matched, and the
+    overlay is what the cluster actually runs.
+    """
+    rendered = subprocess.run(
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s-k0s")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    worker = _rendered_workload(rendered, "StatefulSet", "e2b-worker")
+    env = {
+        e["name"]: e.get("value")
+        for e in worker["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert env["E2B_WORKSPACE_BASE"] == "/var/lib/e2b-sandboxes/workspaces"
+    assert env["E2B_STATE_BASE"] == "/var/lib/e2b-sandboxes/state"
+    assert env["E2B_ROUTE_B_TMP_ROOT"] == "/var/lib/e2b-sandboxes/state/.route-b"
+    # The image cache is *not* platform state (the control plane exports the OCI
+    # layout tars into it and every worker resolves them from there), so it stays
+    # on the shared export root.
+    assert env["E2B_IMAGE_OCI_DIR"] == "/var/lib/e2b-sandboxes/_images"
+    # 反例：state 不得落在树根之下，否则沙箱的 `..` 又会到它
+    assert not env["E2B_STATE_BASE"].startswith(env["E2B_WORKSPACE_BASE"])
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_k0s_overlay_control_plane_mounts_both_roots_writable() -> None:
+    """The control plane's writes have to land on writable subPaths (OBS-9).
+
+    The whole volume stays read-only, so a directory the control plane writes to
+    is only writable if it is mounted back on top as a `subPath`. After N27 the
+    tree root itself is one of those directories: the platform's own
+    ``_migrate`` staging lives under it (``<workspaces>/_migrate``), and the
+    sandbox records moved to ``<export>/state``. Missing either mount leaves the
+    pod in ``ContainerCreating`` (no subPath source) or every write EROFS.
+    """
+    rendered = subprocess.run(
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s-k0s")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    plane = _rendered_workload(rendered, "Deployment", "control-plane")
+    container = plane["spec"]["template"]["spec"]["containers"][0]
+    env = {e["name"]: e.get("value") for e in container["env"]}
+    assert env["E2B_SHARED_WORKSPACE_ROOT"] == "/var/lib/e2b-sandboxes"
+    assert env["E2B_WORKSPACE_BASE"] == "/var/lib/e2b-sandboxes/workspaces"
+    assert env["E2B_STATE_BASE"] == "/var/lib/e2b-sandboxes/state"
+    shared = [m for m in container["volumeMounts"] if m["name"] == "shared"]
+    # The whole volume, read-only, and nothing else on that volume without a
+    # subPath -- the complete shape, not a "these two are present" check.
+    assert [m for m in shared if "subPath" not in m] == [
+        {"name": "shared", "mountPath": "/var/lib/e2b-sandboxes", "readOnly": True}
+    ]
+    assert {m["subPath"]: m for m in shared if "subPath" in m} == {
+        "_builds": {
+            "name": "shared",
+            "mountPath": "/var/lib/e2b-sandboxes/_builds",
+            "subPath": "_builds",
+        },
+        "_images": {
+            "name": "shared",
+            "mountPath": "/var/lib/e2b-sandboxes/_images",
+            "subPath": "_images",
+        },
+        "_secrets": {
+            "name": "shared",
+            "mountPath": "/var/lib/e2b-sandboxes/_secrets",
+            "subPath": "_secrets",
+        },
+        "_snapshots": {
+            "name": "shared",
+            "mountPath": "/var/lib/e2b-sandboxes/_snapshots",
+            "subPath": "_snapshots",
+        },
+        "_templates": {
+            "name": "shared",
+            "mountPath": "/var/lib/e2b-sandboxes/_templates",
+            "subPath": "_templates",
+        },
+        "_volumes": {
+            "name": "shared",
+            "mountPath": "/var/lib/e2b-sandboxes/_volumes",
+            "subPath": "_volumes",
+        },
+        "workspaces": {
+            "name": "shared",
+            "mountPath": "/var/lib/e2b-sandboxes/workspaces",
+            "subPath": "workspaces",
+        },
+        "state": {
+            "name": "shared",
+            "mountPath": "/var/lib/e2b-sandboxes/state",
+            "subPath": "state",
+        },
+    }
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_k0s_overlay_worker_init_creates_both_roots_and_the_checkpoint_gate() -> None:
+    """The two roots and the checkpoint store's gate are the init container's job.
+
+    Two failures this pins, both measured elsewhere in N27:
+
+    * ``<state>`` missing -- ``uid_pool.acquire`` opens ``<state>/.uid_pool.lock``
+      with ``O_CREAT`` under the base it is handed, so the *first*
+      ``Sandbox.create()`` would die with ENOENT instead of handing out a uid;
+    * ``.checkpoints`` at the wrong mode -- the store's gate has to be
+      traversable by the pooled sandbox uid (the slot is what writes the image)
+      and listable by nobody, which is ``0711``; ``0700`` there is the
+      measured EACCES that killed the first checkpoint capture (2026-09-25).
+
+    The script is matched line by line, on stripped lines: a rewritten line has
+    to be re-read here rather than pass on a substring of the old one.
+    """
+    rendered = subprocess.run(
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s-k0s")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    worker = _rendered_workload(rendered, "StatefulSet", "e2b-worker")
+    inits = {
+        c["name"]: c for c in worker["spec"]["template"]["spec"]["initContainers"]
+    }
+    init = inits["workspace-root-init"]
+    assert {e["name"]: e.get("value") for e in init["env"]} == {
+        "SHARED_ROOT": "/var/lib/e2b-sandboxes",
+        "WORKSPACE_BASE": "/var/lib/e2b-sandboxes/workspaces",
+        "STATE_BASE": "/var/lib/e2b-sandboxes/state",
+    }
+    assert init["volumeMounts"] == [
+        {"name": "shared", "mountPath": "/var/lib/e2b-sandboxes"}
+    ]
+    lines = [line.strip() for line in init["command"][2].splitlines()]
+    for expected in (
+        'shared="$SHARED_ROOT"',
+        'base="$WORKSPACE_BASE"',
+        'state="$STATE_BASE"',
+        # The platform's own namespaces stay under the shared export root.
+        "for dir in _builds _images _secrets _templates _snapshots _volumes; do",
+        'mkdir -p "$shared/$dir"',
+        # ...and the two new roots are created (they are the subPath sources the
+        # control plane mounts, and the state base the uid pool needs).
+        'for dir in "$base" "$state"; do',
+        'mkdir -p "$dir"',
+        'mkdir -p "$state/_runtime/.checkpoints"',
+        'chmod 0711 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||',
+        # base and state get the same "writable by the worker" judgement.
+        'for target in "$base" "$state"; do',
+        'owner="$(stat -c %u "$target")"',
+    ):
+        assert expected in lines, expected
 def _rendered_workload(rendered: str, kind: str, name: str) -> dict:
     """The one rendered object of ``kind``/``name``.
 
@@ -872,14 +1031,35 @@ def test_compose_prod_worker_env_carries_the_fleets_route_b_root() -> None:
     wall (N39) and the fleet has always declared the key, so this file takes the
     fleet's value instead of inventing one: the assertion compares against the
     fleet manifests themselves, not against a third copy of the literal.
+
+    N27 (2026-09-26) split that one value into two *shapes*: the k8s manifest
+    sinks the tree root (`<export>/workspaces`) and moves the platform's own
+    files under `E2B_STATE_BASE`, `.route-b` among them, while both compose
+    stacks keep the one-base layout. The rule is the same in both -- the slot
+    pool writes its documents under the base the platform's own files live in --
+    so the pin below compares each manifest against *its own* bases instead of
+    against a single fleet-wide literal.
     """
     fleet = _fleet_route_b_roots()
-    # One value across the fleet, and it is the path under the workspace base
-    # the comment in `deploy/stack/docker-compose.prod.yml:239` explains.
-    assert set(fleet.values()) == {"/var/lib/e2b-sandboxes/.route-b"}, fleet
+    # One base (workspace base == state base), so this file takes the path under
+    # it that `deploy/stack/docker-compose.prod.yml:239` explains.
     assert _compose_prod_worker_route_b_root() == {
-        "E2B_ROUTE_B_TMP_ROOT": next(iter(fleet.values()))
+        "E2B_ROUTE_B_TMP_ROOT": fleet["deploy/stack/docker-compose.prod.yml"]
     }
+    # Two bases in the k8s manifest: `.route-b` is platform state, so it follows
+    # the state base -- and must *not* be under the tree root, which is the one
+    # directory a sandbox reaches by walking `..` (these documents carry the
+    # egress proxy's credentials).
+    state_base = _k8s_env_value(K8S_WORKER, "E2B_STATE_BASE")
+    tree_root = _k8s_env_value(K8S_WORKER, "E2B_WORKSPACE_BASE")
+    assert fleet["deploy/k8s/worker.yaml"] == f"{state_base}/.route-b"
+    assert not fleet["deploy/k8s/worker.yaml"].startswith(f"{tree_root}/")
+    # ...and the two shapes really do differ, so copying either value into the
+    # other manifest fails here.
+    assert (
+        fleet["deploy/k8s/worker.yaml"]
+        != fleet["deploy/stack/docker-compose.prod.yml"]
+    )
 
 
 def _multinode_worker_block(name: str) -> str:
@@ -948,10 +1128,13 @@ def test_multinode_worker_env_carries_the_fleets_route_b_root() -> None:
     N39 is the same wall). The value is taken from the fleet manifests, not
     written a fourth time -- the same comparison ①'s pin makes, and it is per
     worker because this file has no anchor.
+
+    Same N27 split as ①: this is the one-base compose shape, so the value it has
+    to carry is the compose stack's, not the k8s manifest's (which sinks the
+    tree root and puts `.route-b` under `E2B_STATE_BASE`).
     """
     fleet = _fleet_route_b_roots()
-    assert set(fleet.values()) == {"/var/lib/e2b-sandboxes/.route-b"}, fleet
-    fleet_root = next(iter(fleet.values()))
+    fleet_root = fleet["deploy/stack/docker-compose.prod.yml"]
     for name in ("worker-1", "worker-2", "worker-3"):
         assert _multinode_worker_route_b_root(name) == fleet_root, name
 

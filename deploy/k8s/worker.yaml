@@ -120,16 +120,20 @@ spec:
             - name: image-cache
               mountPath: /var/lib/e2b-images
         # The worker (uid 65534) creates each sandbox's top-level tree *directly*
-        # under the volume root, so that root must be writable by it -- the compose
+        # under the tree root, so that root must be writable by it -- the compose
         # convention is mode 1777 (deploy/scripts/README.md, "一次性迁移": 卷根保持
-        # 1777). A freshly provisioned RWX volume is usually neither: on Aliyun NAS
-        # the export arrived as root:root 0755 (2026-09-17) and the very first
+        # 1777). N27 sinks that root one level (it is now `<export>/workspaces`)
+        # and gives the platform's own state its own, equally writable, root
+        # beside it (`<export>/state`); the two get the same judgement. A freshly
+        # provisioned RWX volume is usually neither: on Aliyun NAS the export
+        # arrived as root:root 0755 (2026-09-17) and the very first
         # Sandbox.create() died with
         # `[Errno 13] Permission denied: '/var/lib/e2b-sandboxes/sbx_<id>'`.
         # Repair once, then *verify* -- on a root_squashed NFS the chmod is refused,
         # and the pod stops here with the exact fix instead of failing every create.
-        # Only the root's own mode is touched: the sandbox trees below it belong to
-        # their sandbox uids (client-side `chgrp`/`chmod -R` must never walk them).
+        # Only those roots' own modes are touched: the sandbox trees below them
+        # belong to their sandbox uids (client-side `chgrp`/`chmod -R` must never
+        # walk them).
         - name: workspace-root-init
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
           securityContext:
@@ -139,36 +143,100 @@ spec:
             - -c
             - |-
               set -e
+              shared="$SHARED_ROOT"
               base="$WORKSPACE_BASE"
+              state="$STATE_BASE"
               # OBS-9: the control plane mounts these back on top of its
               # read-only view of the shared volume (subPath mounts), and a
               # subPath whose source does not exist keeps that pod in
               # ContainerCreating. Creating them here -- the one init container
               # that already runs as root with the volume mounted RW -- means a
               # fresh install converges without a separate bootstrap step.
+              # They stay on the *export* root: they are the platform's own
+              # namespaces, not sandbox trees.
               for dir in _builds _images _secrets _templates _snapshots _volumes; do
-                mkdir -p "$base/$dir"
+                mkdir -p "$shared/$dir"
               done
-              owner="$(stat -c %u "$base")"
-              mode="$(stat -c %a "$base")"
-              echo "workspace-root-init: $base owner=$owner mode=$mode"
-              if [ "$owner" != "65534" ]; then
-                chmod 1777 "$base" 2>/dev/null ||
-                  echo "workspace-root-init: chmod refused (NFS root_squash?)"
-                owner="$(stat -c %u "$base")"
-                mode="$(stat -c %a "$base")"
-              fi
-              world_writable=0
-              case "$mode" in *2|*3|*6|*7) world_writable=1 ;; esac
-              if [ "$owner" != "65534" ] && [ "$world_writable" != "1" ]; then
-                echo "workspace-root-init: FATAL: $base is mode $mode, owned by uid $owner -- the worker (uid 65534) cannot create sandbox trees there, so every Sandbox.create() would fail with EACCES" >&2
-                echo "workspace-root-init: fix it once (on the node, or on the storage server): chmod 1777 $base  (or chown 65534:65534 $base)" >&2
-                exit 1
-              fi
-              echo "workspace-root-init: $base is writable by uid 65534 (owner=$owner mode=$mode)"
+              # N27: the sandbox trees sink one level (`<export>/workspaces/<id>`)
+              # and the platform's own state becomes their *sibling*
+              # (`<export>/state`), on this same mount -- that is what makes the
+              # migration a metadata-only `rename` and what puts the platform's
+              # files off the path a sandbox reaches by walking `..`. Two
+              # readers depend on both existing before the worker starts:
+              #   * `<state>`: `uid_pool.acquire` opens
+              #     `<state>/.uid_pool.lock` (and later
+              #     `<state>/_runtime/<id>/sandbox.json`) with the base it was
+              #     handed -- a missing base turns the first `Sandbox.create()`
+              #     into ENOENT instead of a uid. Nothing derives it from the
+              #     tree root, on purpose: a base the code made up out of band
+              #     would land with the wrong owner on NFS.
+              #   * `workspaces`: it is the worker's own tree root, and the
+              #     directory the control plane mounts back writable.
+              for dir in "$base" "$state"; do
+                mkdir -p "$dir"
+              done
+              # The checkpoint store's gate. An image is written by the
+              # sandbox's *own* slot, so every level down to it has to be
+              # traversable by that pooled uid -- while nobody below the worker
+              # may list it: hence 0711 (traverse, no listing), the same
+              # convention `checkpoint_store._prepare_image_parent` sets when it
+              # gets there first. The directories below these (`_runtime/<id>`,
+              # `.checkpoints/<id>`) stay 0700 and are created by the worker and
+              # the slot. The worker owns all three, because it is the worker
+              # that creates the record and image directories under them.
+              mkdir -p "$state/_runtime/.checkpoints"
+              chown 65534:65534 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||
+                echo "workspace-root-init: chown refused ($state/_runtime, NFS root_squash?)"
+              chmod 0711 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||
+                echo "workspace-root-init: chmod refused ($state/_runtime)"
+              # The checkpoint store's gate has to belong to the worker for a
+              # second reason: a root-owned 0711 gate is *traversable* by the
+              # slot but the 65534 worker cannot create `.checkpoints/<id>`
+              # inside it, and that failure only shows up as an EACCES at the
+              # first pause. Say so here instead.
+              for target in "$state/_runtime" "$state/_runtime/.checkpoints"; do
+                owner="$(stat -c %u "$target")"
+                mode="$(stat -c %a "$target")"
+                echo "workspace-root-init: $target owner=$owner mode=$mode"
+                if [ "$owner" != "65534" ]; then
+                  echo "workspace-root-init: FATAL: $target is owned by uid $owner, not the worker uid 65534: the worker creates the record and checkpoint-image directories below it, so a captured image could never be written (EACCES at the first pause)" >&2
+                  echo "workspace-root-init: fix it once (on the node, or on the storage server): chown 65534:65534 $target && chmod 0711 $target" >&2
+                  exit 1
+                fi
+              done
+              # Both of the worker's own roots get today's judgement, unchanged
+              # in shape: the worker creates top-level names in each of them
+              # directly (a sandbox tree under `workspaces`, the uid pool's lock
+              # and the runtime records under `state`), so each has to be
+              # writable by it -- owner 65534, or 1777 as the compose
+              # convention -- and a base that is neither stops the pod here with
+              # the one-time fix instead of failing every create.
+              for target in "$base" "$state"; do
+                owner="$(stat -c %u "$target")"
+                mode="$(stat -c %a "$target")"
+                echo "workspace-root-init: $target owner=$owner mode=$mode"
+                if [ "$owner" != "65534" ]; then
+                  chmod 1777 "$target" 2>/dev/null ||
+                    echo "workspace-root-init: chmod refused (NFS root_squash?)"
+                  owner="$(stat -c %u "$target")"
+                  mode="$(stat -c %a "$target")"
+                fi
+                world_writable=0
+                case "$mode" in *2|*3|*6|*7) world_writable=1 ;; esac
+                if [ "$owner" != "65534" ] && [ "$world_writable" != "1" ]; then
+                  echo "workspace-root-init: FATAL: $target is mode $mode, owned by uid $owner -- the worker (uid 65534) cannot create the top-level names it owns there, so every Sandbox.create() would fail with EACCES" >&2
+                  echo "workspace-root-init: fix it once (on the node, or on the storage server): chmod 1777 $target  (or chown 65534:65534 $target)" >&2
+                  exit 1
+                fi
+                echo "workspace-root-init: $target is writable by uid 65534 (owner=$owner mode=$mode)"
+              done
           env:
-            - name: WORKSPACE_BASE
+            - name: SHARED_ROOT
               value: /var/lib/e2b-sandboxes
+            - name: WORKSPACE_BASE
+              value: /var/lib/e2b-sandboxes/workspaces
+            - name: STATE_BASE
+              value: /var/lib/e2b-sandboxes/state
           volumeMounts:
             - name: shared
               mountPath: /var/lib/e2b-sandboxes
@@ -225,7 +293,20 @@ spec:
                   key: E2B_INTERNAL_API_KEYS
                   optional: true
             - name: E2B_WORKSPACE_BASE
-              value: /var/lib/e2b-sandboxes
+              value: /var/lib/e2b-sandboxes/workspaces
+            # N27: the platform's own files (the runtime records, the command
+            # logs, the checkpoint images, `.route-b`, the uid pool's lock and
+            # reservations) live under a base of their own, a **sibling** of the
+            # sunk tree root and on the same mount. Both halves matter:
+            # `rename(2)` stops at a mount point, so a second mount would make
+            # every migration an EXDEV, and "platform state is not on the path a
+            # sandbox reaches from its own tree" only holds if the state base is
+            # not *under* `E2B_WORKSPACE_BASE` (see the overlay test that pins
+            # exactly that). Unset -- what every other deployment does today --
+            # both bases are one directory and the layout is byte-for-byte the
+            # pre-N27 one.
+            - name: E2B_STATE_BASE
+              value: /var/lib/e2b-sandboxes/state
             # Track Z / Z-F7: the extracted image rootfs cache goes on the same
             # RWX PVC as the workspaces, not inside the pod. The k8s shape has
             # the same gap the compose stack had: the default is the *relative*
@@ -264,12 +345,14 @@ spec:
             # Track F (F1): the non-root worker scopes each slot's
             # policy/program documents to that slot's uid (0440) through
             # e2b-maint, and the broker only touches paths under
-            # <workspace_base>/ or <shared_volume_root>/. Anywhere else the
-            # helpers self-check refuses the shape at startup by name (the
-            # alternative is a world-readable 0444 policy document carrying
-            # the egress-proxy credentials).
+            # <workspace_base>/, <state_base>/ (N27) or <shared_volume_root>/.
+            # Anywhere else the helpers self-check refuses the shape at startup
+            # by name (the alternative is a world-readable 0444 policy document
+            # carrying the egress-proxy credentials). N27 moves `.route-b` under
+            # the state base with the rest of the platform's own files, which is
+            # exactly why the broker's whitelist grew that second root (Task 4).
             - name: E2B_ROUTE_B_TMP_ROOT
-              value: /var/lib/e2b-sandboxes/.route-b
+              value: /var/lib/e2b-sandboxes/state/.route-b
             # Track F (F1): `auto` uses the image's file-capability brokers on
             # this non-root pod; `off` keeps the in-process E5.1 shape.
             - name: E2B_PRIV_HELPERS
