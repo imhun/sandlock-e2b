@@ -504,6 +504,22 @@ async def reconcile_pending_snapshots(app) -> int:
     resolved = 0
     for record in list(app.state.snapshots.in_progress()):
         name = record.names[0] if record.names else None
+        # F11 step 3: not every ``creating`` record is this process's business.
+        # The claim is the half that says "somebody is copying this id right
+        # now", and on a restart that somebody can be a *live* peer: re-driving
+        # its copy submits a second POST for an id whose payload is half
+        # written, which the worker answers 409 -- so this pass would mark
+        # failed a record its owner is one step from completing (and a client
+        # that retries then copies the tree a second time). Taking the claim is
+        # the same test the request path makes; losing it means leaving the
+        # record to the replica that owns it.
+        if not app.state.snapshots.try_acquire_copy(record.snapshot_id):
+            log.info(
+                "snapshot %s: another replica is copying it; leaving the record "
+                "to that replica",
+                record.snapshot_id,
+            )
+            continue
         try:
             if not record.sandbox_id:
                 raise RuntimeError(
@@ -523,6 +539,12 @@ async def reconcile_pending_snapshots(app) -> int:
                 app.state.snapshots.mark_failed, record.snapshot_id, detail
             )
             log.warning("snapshot %s: %s", record.snapshot_id, detail)
+        finally:
+            # Same shape as the request path: once the record itself carries the
+            # answer (completed/failed), the claim has done its job. Holding it
+            # would keep a later pass -- on this replica or the other one -- from
+            # settling a record whose owner died mid-copy.
+            app.state.snapshots.release_copy(record.snapshot_id)
         resolved += 1
     if resolved:
         log.info("reconciled %d in-flight snapshot(s) at startup", resolved)

@@ -115,6 +115,18 @@ sweeper。
 `test_registry_dirty_snapshot.py`、`test_node_partition_reconcile.py`、`tests/contract/test_snapshots.py`
 全绿；本机 `tests/unit` 仍是 16 条既有 macOS 红 / 1164 passed，`tests/contract` 321 passed。
 
+**第 3 步补丁（2026-09-26，开第二副本之前发现并修掉）**：启动时的
+`reconcile_pending_snapshots` 对每条 `creating` 记录都直接重跑拷贝，**没有取那把认领** ——
+两副本下滚动重启于是会撞上另一个副本**正在飞行**的拷贝：worker 对同一 id 的半份载荷回
+409，新副本便把它打成 `failed`，而拥有者一步之遥就要 `completed` ⇒ 客户端看到失败、重试
+再拷一份整树。修法：reconcile 先 `try_acquire_copy`，**抢不到就跳过**（这条记录归拥有者），
+结算完 `release_copy`，与请求路径同一个形状；`control_plane/app.py` 的启动注释一并写明。
+用例 `tests/unit/test_redis_multireplica.py::test_startup_reconcile_skips_the_copy_another_replica_is_running`
+（RED 是 `assert 2 == 1`：改前那一趟把两条都处理了）。
+**残余（写在这里免得下次重新发现）**：某个副本**崩在拷贝中途**时，它的认领会活到 TTL
+（600 s）为止，这条记录要等下一次启动的那一趟才能落定；触发条件（控制面崩在拷贝中、且此后
+再没有重启）出现时，把这趟改成周期任务即可 —— 认领本身就是跨副本的单飞。
+
 **第 4 步（2026-09-26，同日）**：三件做了，一件判定为"不影响正确性、只影响延迟"：
 
 * **`TTLSweeper` 单飞**：`try_claim`（`SETNX + EX`，TTL = 扫描间隔）—— 过期判定基于**共享记录**上的

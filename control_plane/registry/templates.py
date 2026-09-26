@@ -39,6 +39,37 @@ class BuildRecord:
             }
         )
 
+    def to_storage_dict(self) -> dict[str, Any]:
+        """The build as the *other* replica has to see it.
+
+        A build runs as an in-process task on whichever replica took the
+        trigger, but ``Template.build`` is three separate requests (create,
+        trigger, poll) and the Service sends each one wherever it likes. So the
+        build's state cannot live in the owner's memory alone: this is what
+        :meth:`TemplateRegistry.save_build` writes to the shared volume, and
+        what ``GET …/builds/{id}/status`` answers from when the poll lands one
+        replica over.
+        """
+        return {
+            "build_id": self.build_id,
+            "status": self.status,
+            "logs": list(self.logs),
+            "log_entries": list(self.log_entries),
+            "error": self.error,
+            "started_at": self.started_at,
+        }
+
+    @classmethod
+    def from_storage_dict(cls, data: dict[str, Any]) -> "BuildRecord":
+        return cls(
+            build_id=data["build_id"],
+            status=data.get("status", "waiting"),
+            logs=list(data.get("logs", [])),
+            log_entries=list(data.get("log_entries", [])),
+            error=data.get("error"),
+            started_at=float(data.get("started_at", time.time())),
+        )
+
     def as_info(self, template_id: str) -> dict[str, Any]:
         info: dict[str, Any] = {
             "templateID": template_id,
@@ -154,6 +185,10 @@ class TemplateRegistry:
             self._templates[template_id] = record
             self._bind_name(record)
             self._write_record(record)
+            # The build exists from here on, so it goes to the shared volume
+            # too: the *trigger* is a separate request and may well land on the
+            # other replica, which can only find it there.
+            self._write_build(record, build)
             return record, build
 
     def _bind_name(self, record: TemplateRecord) -> None:
@@ -177,6 +212,62 @@ class TemplateRegistry:
         if self._base is None:
             return None
         return self._base / template_id / "template.json"
+
+    def _build_path(self, template_id: str, build_id: str) -> Path | None:
+        if self._base is None:
+            return None
+        return self._base / template_id / "builds" / f"{build_id}.json"
+
+    def _write_build(self, record: TemplateRecord, build: BuildRecord) -> None:
+        path = self._build_path(record.template_id, build.build_id)
+        if path is None or record.discarded:
+            # Same rule as the record: a discarded template's build must not
+            # come back to life on the next scan.
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(build.to_storage_dict(), separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+    def save_build(self, record: TemplateRecord, build: BuildRecord) -> None:
+        """Publish a build's current state to the replicas sharing the volume.
+
+        Called by the replica running the build, on every state move and on
+        every log line. The build file is small (a build's log is tens of
+        lines) and this is a build path, not a request path -- what it buys is
+        that a poll answered by *any* replica sees the live state instead of
+        ``404 Template build … not found``.
+        """
+        with self._lock, suppress(OSError):
+            self._write_build(record, build)
+
+    def get_build(self, template_id: str, build_id: str) -> BuildRecord:
+        """One build, from memory when this replica runs it and from the volume
+        otherwise.
+
+        The disk read is deliberately *not* cached: a build that is still
+        running is the one state another replica changes under this one (its
+        owner keeps writing the file), so a cached copy would freeze a poller
+        at whatever the first poll saw -- the same reason ``creating`` snapshot
+        records are re-read.
+        """
+        record = self.get(template_id)
+        build = record.builds.get(build_id)
+        if build is not None:
+            return build
+        path = self._build_path(template_id, build_id)
+        if path is not None and path.is_file():
+            try:
+                return BuildRecord.from_storage_dict(
+                    json.loads(path.read_text(encoding="utf-8"))
+                )
+            except (OSError, ValueError, KeyError, TypeError):
+                # A half-written file (the owner is mid-write) is not an
+                # answer: fall through to the 404 the caller already handles,
+                # and the next poll gets the finished one.
+                pass
+        raise UnknownTemplateBuildError(build_id)
 
     def _write_record(self, record: TemplateRecord) -> None:
         path = self._record_path(record.template_id)

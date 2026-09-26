@@ -4,23 +4,38 @@ metadata:
   name: control-plane
   namespace: sandlock
 spec:
-  # ONE replica, matching the compose stack the rest of this manifest set mirrors.
-  # ⚠ The node registry is **per-process**: `NodeRegistry._nodes` is an in-memory
-  # dict and only the *quota ledger* and the *sandbox records* go through Redis
-  # (`control_plane/registry/nodes.py`, `redis_backend.py`). With two replicas
-  # behind the Service, a worker's registration and its 5-second heartbeats
-  # stick to whichever pod its HTTP connection reaches, so the other replica's
-  # view of that node ages past the 15-second `heartbeat_timeout` and it marks a
-  # perfectly healthy node `unhealthy`. Measured on k0s on 2026-09-17: replica A
+  # TWO replicas: the node registry, its health verdicts and the periodic jobs
+  # are shared now (F11, 2026-09-26). This block used to forbid >1 replica for a
+  # measured reason -- `NodeRegistry._nodes` is an in-memory dict, so with two
+  # replicas a worker's registration and its 5-second heartbeats stuck to
+  # whichever pod its HTTP connection reached, and the other replica aged that
+  # node past its heartbeat timeout. Measured on k0s 2026-09-17: replica A
   # reported `fxf2j: unhealthy` while replica B reported `fxf2j: healthy`, for 12
-  # consecutive samples. Consequences seen live: `/internal/routes/<id>` served
-  # by the stale replica answers `502 Node ... unavailable` (one blip in a 30s
-  # window), placement only happens where the replica in question believes there
-  # is capacity, and `reap_unhealthy` (E6.1) treats live sandboxes on the
-  # "unhealthy" node as orphans -- which is what turned `deployment_smoke.py`'s
-  # route lookup into a `404 Sandbox ... not found`. Raise this back to >1 only
-  # after the node registry (health + addresses) is shared, not just its quotas.
-  replicas: 1
+  # consecutive samples; live consequences were `502 Node ... unavailable` on
+  # `/internal/routes/<id>`, placement where the replica in question believed
+  # there was capacity, and `reap_unhealthy` (E6.1) orphaning live sandboxes
+  # ("404 Sandbox ... not found" in `deployment_smoke.py`).
+  #
+  # What made >1 legal: the node view went to Redis (`e2b:node:view:<id>`, health
+  # computed from the shared `heartbeat_at` in
+  # `control_plane/registry/redis_backend.py::RedisNodeStore`), and the work that
+  # must not be done twice became single-flight or fleet-wide -- the health sweep
+  # (`try_acquire_sweep`), the TTL sweep (`e2b:ttl:sweep`), the snapshot copy
+  # claim (`e2b:snapshot:copy:<id>`), the seven rate limiters and
+  # `template_build_slots` (see `docs/control-plane-multi-replica.md` §6).
+  # Two things are deliberately still per-replica: `CreateQueue` wakes only its
+  # own waiters (a 0.25 s tick bounds the delay, correctness is unaffected), and
+  # the in-process metrics (`recent503Count`, ...) are now a per-pod number.
+  #
+  # The strategy and the anti-affinity below are part of the shape, not tuning:
+  # the default RollingUpdate with replicas=2 asks for a third pod, and this is a
+  # two-node cluster, so a rollout would sit `Pending` forever.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: control-plane
@@ -29,6 +44,24 @@ spec:
       labels:
         app: control-plane
     spec:
+      # Long enough for the in-flight work a SIGNAL 15 interrupts: uvicorn's
+      # graceful shutdown drains requests, and the exec/MCP paths hold *long*
+      # connections (a stream that is still running is *not* a stuck request).
+      # The preStop sleep is deliberately shorter than this: it lets kube-proxy
+      # take the pod out of the Service before the process starts closing, so
+      # a request never lands on a replica that is already leaving.
+      terminationGracePeriodSeconds: 60
+      # With replicas=2 on a two-node cluster, "both replicas on one node" is a
+      # single point of failure that looks like a HA setup. Required, not
+      # preferred: the scheduler must spread them, and `maxSurge: 0` above keeps
+      # the rollout from ever needing a third slot.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: control-plane
+              topologyKey: kubernetes.io/hostname
       # fsGroup 1000 exists for the buildkit sidecar: the emptyDir k8s creates
       # for it is root-owned, while rootless buildkitd runs as the image's uid
       # 1000 and must create its data directory *and* the unix socket inside it.
@@ -81,6 +114,43 @@ spec:
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-control-plane-gateway:0.1.0
           ports:
             - containerPort: 3000
+          # `/healthz` is the static 200 in `control_plane/app.py` -- it says
+          # "this process is serving", not "Redis and the shared volume are
+          # fine". That is the right question for these two probes: with
+          # `maxUnavailable: 1` the rollout deletes before it creates, and
+          # readiness is what keeps the Service from sending traffic to a pod
+          # that is not listening yet.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          # BestEffort was the old shape (no requests at all), which lets the
+          # scheduler place this pod anywhere -- including a node whose worker
+          # already holds its budget. These are small on purpose: a node has 4
+          # cores, the worker asks for 500m/512Mi, and this pod also carries the
+          # buildkit sidecar.
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
           env:
             - name: E2B_API_KEYS
               valueFrom:
@@ -260,3 +330,18 @@ spec:
     app: control-plane
   ports:
     - port: 3000
+---
+# A drain (node maintenance, k0s upgrade) evicts pods one at a time and has no
+# idea that these two replicas are each other's fallback. Without this a single
+# `kubectl drain` can take both, and the API goes down although nothing failed:
+# `docs/k8s-deployment.md` §10.3 F5 has the same shape for the workers.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: control-plane
+  namespace: sandlock
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: control-plane

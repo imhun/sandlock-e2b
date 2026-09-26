@@ -187,7 +187,14 @@ async def _run_build(
     dockerfile: str,
     workspace_base: Path,
 ) -> None:
+    def publish() -> None:
+        # Every state move and every log line goes to the shared volume as well
+        # as to memory (F11 follow-up): the SDK's status poll is its own request
+        # and may land on the other replica, which has only the volume to read.
+        app.state.templates.save_build(template, build)
+
     build.status = "building"
+    publish()
     build_dir = workspace_base / "_builds" / template.template_id
     build_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -196,6 +203,7 @@ async def _run_build(
         build.status = "error"
         build.error = f"failed to prepare build context: {e}"
         build.append_log(build.error)
+        publish()
         _discard_failed_build(app, template)
         return
     # buildctl's dockerfile frontend reads the Dockerfile from a file in a
@@ -237,6 +245,7 @@ async def _run_build(
                 stale.unlink(missing_ok=True)
         output = f"type=oci,dest={oci_tar}"
     build.append_log(f"building template (buildkit: {settings.buildkit_addr})")
+    publish()
     try:
         proc = await asyncio.create_subprocess_exec(
             "buildctl",
@@ -258,6 +267,7 @@ async def _run_build(
         build.status = "error"
         build.error = "buildctl is not available in this image"
         build.append_log(build.error)
+        publish()
         _discard_failed_build(app, template, oci_tar, oci_link)
         return
     while True:
@@ -266,6 +276,7 @@ async def _run_build(
             break
         text = line.decode("utf-8", "replace").rstrip()
         build.append_log(text)
+        publish()
     code = await proc.wait()
     if code == 0:
         if remote is not None:
@@ -286,6 +297,7 @@ async def _run_build(
         build.error = f"buildkit build exited with code {code}"
         build.append_log(build.error)
         _discard_failed_build(app, template, oci_tar, oci_link)
+    publish()
 
 
 async def _run_build_with_slot(
@@ -303,6 +315,9 @@ async def _run_build_with_slot(
         build.status = "error"
         build.error = f"build failed unexpectedly: {e}"
         build.append_log(build.error)
+        # Published, not just held: without this the other replica keeps
+        # answering 404 for a build that is visibly stuck on this one.
+        app.state.templates.save_build(template, build)
         # An unexpected failure is still a build that produced no image, so the
         # name must not keep pointing at it either (N19).
         _discard_failed_build(app, template)
@@ -505,7 +520,10 @@ async def trigger_template_build(
     # returns the same 404 as a missing one (no existence leak).
     _require_owned(request, record, resource_id=template_id, label="Template")
     try:
-        build = record.get_build(build_id)
+        # Looked up through the registry, not the record: with two replicas the
+        # trigger need not land on the one that created the build, so the build
+        # comes from the shared volume when it is not ours (F11 follow-up).
+        build = _templates(request).get_build(template_id, build_id)
     except UnknownTemplateBuildError:
         raise OfficialError(404, f"Template build {build_id} not found")
     # E3.5: per-key build rate limit (0 = disabled), then the global
@@ -567,7 +585,7 @@ async def template_build_status(
     # template is indistinguishable from a missing one.
     _require_owned(request, record, resource_id=template_id, label="Template")
     try:
-        build = record.get_build(build_id)
+        build = _templates(request).get_build(template_id, build_id)
     except UnknownTemplateBuildError:
         raise OfficialError(404, f"Template build {build_id} not found")
     info = build.as_info(record.template_id)

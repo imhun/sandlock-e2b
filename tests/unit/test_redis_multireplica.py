@@ -352,6 +352,71 @@ def test_a_copy_claim_expires_so_a_dead_replica_does_not_block_the_id(tmp_path):
     assert reg_b.try_acquire_copy("snap_dead", ttl_s=1) is True
 
 
+async def test_startup_reconcile_skips_the_copy_another_replica_is_running(tmp_path):
+    """The startup pass must not walk over a *live* peer's copy.
+
+    Re-driving every ``creating`` record is what settles the ones a restart
+    orphaned -- but with two replicas a rolling restart also meets the peer's
+    in-flight copy, and re-driving *that* submits a second POST for the same
+    id. The worker answers 409 for a half-written payload, so the newcomer used
+    to mark the record failed while its owner was one step from completing it:
+    a client-visible failure, and a retry that copies the tree again. The
+    shared claim is what tells the two apart, so the pass takes it first.
+    """
+    from control_plane.api.snapshots import reconcile_pending_snapshots
+
+    class _Registry:
+        """Stand-in for the sandbox view: reaching a worker is not this test."""
+
+        def get(self, sandbox_id):
+            raise RuntimeError("no worker in this test")
+
+    class _App:
+        class state:  # noqa: N801 - the handler only reads ``app.state``
+            pass
+
+    server = fakeredis.FakeServer()
+    reg_a, reg_b = _snapshot_registries(tmp_path, server)
+    in_flight = reg_a.reserve_from_sandbox(
+        template_id="base",
+        env_vars={},
+        metadata={},
+        volume_mounts=[],
+        base_image=None,
+        allow_internet_access=False,
+        source_sandbox_id="sbx_copying",
+        node_id="worker-1",
+        name="in-flight",
+    )
+    orphaned = reg_a.reserve_from_sandbox(
+        template_id="base",
+        env_vars={},
+        metadata={},
+        volume_mounts=[],
+        base_image=None,
+        allow_internet_access=False,
+        source_sandbox_id="sbx_orphaned",
+        node_id="worker-1",
+        name="orphaned",
+    )
+    # Exactly what the request path leaves behind while it copies: the id is
+    # claimed and the record says ``creating``.
+    assert reg_a.try_acquire_copy(in_flight.snapshot_id) is True
+
+    app = _App()
+    app.state.snapshots = reg_b
+    app.state.registry = _Registry()
+
+    # Only the record nobody claims is this pass's business.
+    assert await reconcile_pending_snapshots(app) == 1
+    left_alone = reg_b.get(in_flight.snapshot_id)
+    assert left_alone.status == "creating"
+    assert left_alone.error is None
+    settled = reg_b.get(orphaned.snapshot_id)
+    assert settled.status == "failed"
+    assert settled.error == "interrupted by a restart: no worker in this test"
+
+
 def test_without_redis_one_process_claims_everything(tmp_path):
     from control_plane.registry.snapshots import SnapshotRegistry
 

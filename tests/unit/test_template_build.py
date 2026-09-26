@@ -45,6 +45,12 @@ class _FakeTemplateRegistry:
     def save(self, record) -> None:  # noqa: ANN001
         self.saved.append(record)
 
+    def save_build(self, record, build) -> None:  # noqa: ANN001
+        # The real registry writes this to the shared volume so the *other*
+        # replica can answer the status poll; the fake only has to exist.
+        self.builds_saved = getattr(self, "builds_saved", [])
+        self.builds_saved.append((record, build))
+
     def discard(self, record) -> None:  # noqa: ANN001
         self.discarded.append(record)
 
@@ -299,3 +305,64 @@ def test_claim_file_upload_is_atomic_and_persists(workspace):
     # Persisted on disk: a fresh registry sees the uploaded state.
     restarted = TemplateRegistry(workspace / "templates")
     assert restarted.get(record.template_id).is_file_uploaded("h1") is True
+
+
+def test_a_build_started_on_one_replica_is_readable_on_the_other(workspace):
+    """Two replicas share the volume, not their memory (F11 follow-up).
+
+    ``Template.build`` is three requests: create the template, trigger the
+    build, then poll its status. Nothing keeps them on one replica -- the SDK
+    reaches whichever pod the Service picks -- and the build runs as an in-process
+    task on the replica that took the trigger. The template record is persisted,
+    but ``to_storage_dict`` deliberately leaves ``builds`` out, so the poll used
+    to answer ``404 Template build … not found`` for a build that was running
+    fine one replica over. Measured on k0s 2026-09-26: create landed on one pod,
+    the trigger on the other, and the smoke's ``Template.build`` got
+    ``404: Template build bld_2299e0da0ae79d1a not found``.
+
+    The build therefore lives on the shared volume too: one small file per build,
+    written as the state moves and as log lines arrive.
+    """
+    base = workspace / "templates"
+    replica_a = TemplateRegistry(base)
+    record, build = replica_a.create("smoke-template")
+    # Exactly what the trigger does on the replica that received it.
+    build.status = "building"
+    build.append_log("building template (buildkit: unix:///run/buildkit)")
+    replica_a.save_build(record, build)
+
+    # The poll lands on the other replica, which has only the shared volume.
+    replica_b = TemplateRegistry(base)
+    seen = replica_b.get_build(record.template_id, build.build_id)
+    assert seen.status == "building"
+    assert seen.logs == ["building template (buildkit: unix:///run/buildkit)"]
+    assert seen.error is None
+
+
+def test_a_finished_build_reports_its_final_state_to_the_other_replica(workspace):
+    base = workspace / "templates"
+    replica_a = TemplateRegistry(base)
+    record, build = replica_a.create("smoke-template")
+    build.status = "ready"
+    build.append_log("Build finished successfully")
+    replica_a.save_build(record, build)
+
+    info = TemplateRegistry(base).get_build(
+        record.template_id, build.build_id
+    ).as_info(record.template_id)
+    assert info["status"] == "ready"
+    assert info["logs"] == ["Build finished successfully"]
+    assert info["buildID"] == build.build_id
+    assert info["templateID"] == record.template_id
+
+
+def test_a_build_file_is_written_where_the_other_replica_looks(workspace):
+    """The layout is part of the contract: no shared registry, just a path."""
+    base = workspace / "templates"
+    registry = TemplateRegistry(base)
+    record, build = registry.create("smoke-template")
+    registry.save_build(record, build)
+
+    path = base / record.template_id / "builds" / f"{build.build_id}.json"
+    assert path.is_file(), path
+    assert json.loads(path.read_text())["build_id"] == build.build_id

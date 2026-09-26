@@ -308,7 +308,9 @@ def create_app(
         # N29 (async shape): a reserved copy is an in-process task, so a
         # restart leaves its record at `creating` and a poller waiting on a
         # copy nobody runs. One pass settles them -- resumed from the worker's
-        # idempotent answer when the payload did finish, failed otherwise.
+        # idempotent answer when the payload did finish, failed otherwise --
+        # and skips the ones whose shared claim a *live* peer still holds
+        # (F11 step 3: those are that replica's copy, not an orphan).
         startup_snapshot_task = asyncio.create_task(
             reconcile_pending_snapshots(app)
         )

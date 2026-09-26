@@ -345,21 +345,33 @@ def test_k8s_worker_is_a_statefulset_so_its_node_ids_survive_a_restart() -> None
     assert "value: statefulset\n" in autoscaler
 
 
-def test_k8s_control_plane_stays_single_replica_until_node_registry_is_shared() -> None:
-    """Two control-plane replicas disagree about which nodes are healthy.
+def test_k8s_control_plane_replicas_come_with_the_shape_that_makes_them_safe() -> None:
+    """Two replicas are legal now -- but only with the shape that keeps them so.
 
-    The node registry is per-process (`NodeRegistry._nodes` is an in-memory dict;
-    Redis carries only the quota ledger and the sandbox records), while a
-    worker's registration and heartbeats stick to whichever replica its HTTP
-    connection reaches. The replica that misses them ages the node past the
-    15-second `heartbeat_timeout` and marks it unhealthy. Measured on k0s on
-    2026-09-17: replica A said `fxf2j: unhealthy` while replica B said
-    `fxf2j: healthy`, for 12 consecutive samples -- which produced `502 Node ...
-    unavailable` route lookups, uneven placement, and `reap_unhealthy` treating
-    live sandboxes as orphans (a `404 Sandbox ... not found` in the smoke).
+    This guard used to say "one replica": the node registry was per-process
+    (`NodeRegistry._nodes` being an in-memory dict, with Redis carrying only the
+    quota ledger and the sandbox records), so a worker's registration and
+    heartbeats stuck to whichever replica its HTTP connection reached and the
+    other aged the node past its heartbeat timeout. Measured on k0s 2026-09-17:
+    replica A said `fxf2j: unhealthy` while replica B said `fxf2j: healthy`, for
+    12 consecutive samples -- which produced `502 Node ... unavailable` route
+    lookups, uneven placement, and `reap_unhealthy` treating live sandboxes as
+    orphans (a `404 Sandbox ... not found` in the smoke).
+
+    F11 (2026-09-26) made the view shared, so the replica count flipped -- and
+    these four lines are the part that is *not* tuning. `maxSurge: 0` keeps the
+    rollout from asking a two-node cluster for a third pod (the default
+    `25%` rounds up, and the pod then sits `Pending` forever against the
+    required anti-affinity below). The anti-affinity is what makes "two
+    replicas" survive a node loss instead of being a single point of failure
+    that looks like HA. The PDB is what stops a drain from evicting both at
+    once. `docs/control-plane-multi-replica.md` §6 is the list of what was made
+    shared (and of the two things deliberately left per-replica).
     """
-    assert "\n  replicas: 1\n" in K8S_CONTROL_PLANE
-    assert "\n  replicas: 2\n" not in K8S_CONTROL_PLANE
+    assert "\n  replicas: 2\n" in K8S_CONTROL_PLANE
+    assert "      maxSurge: 0\n" in K8S_CONTROL_PLANE
+    assert "              topologyKey: kubernetes.io/hostname\n" in K8S_CONTROL_PLANE
+    assert "kind: PodDisruptionBudget" in K8S_CONTROL_PLANE
 
 
 def _buildkit_configmap_payload() -> str:
