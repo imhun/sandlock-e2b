@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from envd_service.priv_helpers import dir_size
+from envd_service.runtime.brief_stat import directory_cost
 from envd_service.runtime.dir_ledger import (
     DirLedger,
     DirLedgerUnknown,
@@ -328,3 +329,95 @@ def test_random_mutations_stay_equal_to_the_walk(root):
         # rename it marks both ends' parents, which is the same directory here.
         ledger.apply(dirty)
         assert ledger.total_bytes == dir_size(root), f"diverged at step {step}"
+
+
+def test_the_ledger_and_os_stat_agree_on_the_same_file(tmp_path):
+    """The byte the ledger charges a file is the byte `os.stat` reports.
+
+    Byte equality, not approximation -- an accounting that drifts is worse
+    than a slow one because nothing notices (`dir_ledger` module docstring).
+    The per-directory number is the directory's own allocation plus each
+    file's size, so the oracle here is `os.stat` on both terms: `st_blocks x
+    512` for the directory and `st_size` for every file.
+
+    The sizes are chosen so a wrong definition shows up instead of cancelling:
+    12345 and 4097 are not block-aligned (charging *allocation* would give
+    16384 and 8192, not 12345 and 4097), the two differ from each other (a
+    mis-assigned file cannot look right), and the empty file contributes a
+    name and zero bytes -- the case the byte half of the ledger is blind to
+    (N31) and the reason the second dimension exists at all.
+    """
+    blob = tmp_path / "a.bin"
+    blob.write_bytes(b"x" * 12345)
+    small = tmp_path / "b.bin"
+    small.write_bytes(b"y" * 4097)
+    empty = tmp_path / "empty.bin"
+    empty.write_bytes(b"")
+
+    scan = scan_subtree(tmp_path, "")
+
+    # The key space is the ledger's: "" is the tree root, not the host path.
+    assert scan.bytes_by_dir[""] == (
+        os.stat(tmp_path).st_blocks * 512
+        + os.stat(blob).st_size
+        + os.stat(small).st_size
+        + os.stat(empty).st_size
+    )
+    assert scan.bytes_by_dir[""] == os.stat(tmp_path).st_blocks * 512 + 12345 + 4097
+    # ...and that is the number the platform reports: the whole-tree walk.
+    assert scan.bytes == dir_size(tmp_path)
+
+
+def test_directory_cost_matches_the_allocated_blocks_not_st_size(tmp_path):
+    """The directory term is the allocation: `st_blocks x 512`, never `st_size`.
+
+    Measured on the cluster's NAS (2026-09-21), a directory's `st_size` is not
+    the space it occupies: empty it read 4096 and at 2000 entries 16384, while
+    `st_blocks x 512` and `du -s` stayed at **512** the whole way. Charging
+    `st_size` would move the platform's number away from the sandbox's own
+    `du` -- the opposite of what the accounting is for -- so `directory_cost`
+    answers the allocation, and this pins it against an `os.stat` the test
+    performs itself (the code under test must not supply its own expectation).
+
+    On ext4 the two agree (4096-byte directories) and this is a weaker
+    assertion; on the NAS, and on the host this runs on, they differ, and a
+    switch to `st_size` fails here.
+    """
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "f.bin").write_bytes(b"z" * 10)
+
+    assert directory_cost(str(tmp_path)) == os.stat(tmp_path).st_blocks * 512
+    assert directory_cost(tmp_path / "sub") == os.stat(tmp_path / "sub").st_blocks * 512
+
+
+def test_entry_counts_are_already_part_of_the_scan(tmp_path):
+    """The second dimension exists in the scan, not only in the docs (N31).
+
+    `SubtreeScan` carries the names beside the bytes, `DirLedger.rebuild`
+    adds them up as files **plus** directories, and that `total_entries` is
+    what each round hands the mediator's gate
+    (`registry._maybe_tighten_entries` -> `update_entry_limit`, `ENOSPC` on
+    create once it is at the limit). The knob is the existing
+    `E2B_DISK_MAX_ENTRIES` (code default 0 = off; the k8s overlay takes
+    500000) -- N30 adds no second knob, and this case pins that the count it
+    would have needed is already here.
+
+    The names are read off the tree this test built, not off the code: two
+    files (one of them empty and therefore free in bytes) and two directories.
+    """
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "empty.bin").write_bytes(b"")
+    (tmp_path / "top.bin").write_bytes(b"x")
+
+    scan = scan_subtree(tmp_path, "")
+    assert scan.files_by_dir == {"": 1, "a": 1}
+    assert scan.files == 2
+    assert scan.bytes_by_dir == {
+        "": os.stat(tmp_path).st_blocks * 512 + 1,
+        "a": os.stat(tmp_path / "a").st_blocks * 512,
+    }
+
+    ledger = DirLedger(tmp_path)
+    ledger.rebuild()
+    assert ledger.total_entries == 4  # two files + two directories
+    assert ledger.directory_count == 2

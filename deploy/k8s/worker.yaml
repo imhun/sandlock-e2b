@@ -482,6 +482,7 @@ spec:
             # mediator would take hours anyway (~21 ms per name measured), so
             # what this defends is the *volume* (inodes and walk cost shared
             # with every other sandbox), not the speed of the writer.
+            # （口径见 docs/sandbox-disk-quota.md §1.1 的“第二维”；N30 定不新增旋钮）
             - name: E2B_DISK_MAX_ENTRIES
               value: "500000"
             # N25: pushed appends wake a scan round instead of waiting for the

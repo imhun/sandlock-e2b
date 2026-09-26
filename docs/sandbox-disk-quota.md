@@ -38,6 +38,16 @@
 > ⚠️ **不要**把这两件事混起来解释（本文档早期一版对比表就把它写成了"img 全算"，是错的）。
 > 真正要防"沙箱写爆共享盘"时选**存量口径**（现在的实现）；只有做"事务预算/回滚"时才需要**增量口径**。
 
+**第二维：条目数（inode）。** 字节账本看不见"空文件"——2000 个空文件在字节口径下增量是 0（N31 实测），
+而风险是真金白银的 inode/元数据耗尽与整树 walk 成本。机制**已经存在**：`dir_ledger` 边算字节边数名字
+（`SubtreeScan.files_by_dir` → `DirLedger.total_entries` = 文件 + 目录），worker 每轮把该数与上限下发给中介
+（`registry._maybe_tighten_entries` → `update_entry_limit`），中介在计数到顶时对
+`O_CREAT`/`mkdir`/`symlink`/`link` 返回 `ENOSPC`；旋钮是 `E2B_DISK_MAX_ENTRIES`
+（代码默认 `0` = 关；k8s 取 `500000` 作失控兜底，见 `deploy/k8s/worker.yaml`）。
+**本期（2026-09-26 N30）不新增第二种旋钮**，只把它写进口径：`diskMB` 管字节，条目上限管数量，
+两者都按"删除即归还"。钉子：`tests/unit/test_dir_ledger.py::test_entry_counts_are_already_part_of_the_scan`
+（条目维度已存在于代码，不只是文档里的一句）。
+
 #### 1.1.1 探针实测（2026-09-13，`.superpowers/sdd/task-cowprobe-report.md`）：**今天根本用不了**
 
 route-B 给了"每沙箱一个常驻 supervise 实例"之后，"`max_disk` 是不是终于可用了"值得实测一次。结论是**不能用**，
