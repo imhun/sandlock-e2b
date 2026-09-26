@@ -2171,3 +2171,47 @@ Minor（终审 triage）：① 日志的 `chroot=yes/no` 判据没换 ⇒ 合成
 - **N42 复测（验收判据）**：`pypi.org:443` → **OK**（DNS + 出网都通）；
   `1.1.1.1:443` 从 `PermissionError [Errno 13]`（根本没规则）变成 **`ConnectionRefusedError [Errno 111]`**
   （**规则生效后按策略拒**：裸 IP 不在固定域名集内，预期形状）。
+
+## 本轮收口（2026-09-26 下半场）
+
+| commit | 内容 |
+|---|---|
+| `fe36104` | N27 Task 1：`E2B_STATE_BASE`/`STATE_DIR_NAME`/`resolve_state_base`，四个 helper 可换 base 且**不传时逐字节零变化**；`state` 与 `_pure_rootfs` 并列进保留表、原条目一个没删 |
+| `8d4c83c` | O3 Task 3：三个工作负载加 `optional: true` 的 `E2B_INTERNAL_API_KEYS`；`secrets.sh` 按 `upgrade.sh:122-168` **同一套两拍**（rotate 把旧 key 留列表／新 key 进单值槽，finalize 摘旧的）新增四组轮换命令，全程只打 `sha256(前16)`；runbook 进 `docs/k8s-deployment.md` §4.5 |
+| `c60c705` | pure Task 5：`E2B_PURE_ROOTFS`（默认 `off`，仅 `synth` 开）+ reserved namespace |
+| `dd96266` | O3 Task 1：`secrets.sh` + 开 `E2B_SECRET_MASTER_KEY` + control-plane 两个 `optional: true` 的 master key ref |
+
+## 用户裁定（2026-09-26，O3 第二轮，已记进 decisions）
+
+- api/internal key → **双窗轮换**（Task 3，已落地）；
+- **redis 仍按"接受中断"**（Task 4 不变）—— 两条凭据取舍不同；
+- **清理既有明文**：`_secrets/**` 上已落盘的明文要清理 —— ⚠️ **计划里原本没有这条**（Task 1 只影响之后的写入），已记为**新任务**，等 Task 3 落地后派。
+
+## N27 Task 1 报上来的三个隐患（控制器登记，未修）
+
+1. **孤儿 GC（`envd_service/agent.py:1423`）不查保留表** ⇒ 过渡配置下裸 `<base>/state` 仍被读成
+   "沙箱形状的树"（**只上报不删**，是噪声不是数据损失）。N27 的 Task 5 或收尾时应处理。
+2. **同形暴露的 `workspaces/` 没人钉** —— 树根下沉之后它是新的兄弟目录，没有任何断言守着。
+3. **清单里 `E2B_STATE_BASE` 的 basename 与 `STATE_DIR_NAME` 是两处说法** ⇒ 需要 Task 5 的断言对齐。
+
+## 过程纪律（升级为派单必带）
+
+**提交用 pathspec，且提交前 `git diff --cached --name-only` 必须只有自己的文件** —— 本轮
+Ampere 与 Huygens 各自撞过一次"并行 agent 的暂存文件被卷进自己 commit"（均事后修正，最终清单已逐个核对干净）。
+
+## ⚠️ N43（新登记，控制器实测发现）：生产沙箱里 `tar`/`du`/`find` 遍历 workspace 会 Permission denied
+
+做 N30 Task 6（对外 `diskMB` 语义的集群现场验收）时撞到的 —— **探针本身是对的**，是沙箱不配合。
+
+最小复现（线上 `0.1.0-535`，image-rootfs + `E2B_REAL_ROOT=1`，`/home/user` 下 `seed.bin`）：
+- `cat` / `stat` / `du <单文件>` **直路径全 OK**；
+- `find /home/user -type f` 列出 `seed.bin` 但 `/home/user/workspace` **Permission denied**；
+- `tar -cf /dev/null /home/user` ⇒ `seed.bin: Cannot stat: Permission denied`；
+- **`os.stat('seed.bin', dir_fd=<dirfd>)` ⇒ `FileNotFoundError [Errno 2]`**（路径明明存在）；
+- 沙箱内 `id` = `uid=0(root)`，两个目录都是 `drwxrwx--- 10000` 真目录 ⇒ **不是权限位，是 fd 相对路径解析**。
+
+⇒ `du`/`tar`/`find`（用户最常用的三件套）在生产沙箱里对 workspace 不可用。已登记 N43 并把定因派出去
+（fork 侧 `chroot/dispatch.rs` 里带 `dirfd` 的那批 handler）。
+
+**N30 Task 6 的探针因此没通过**：`inside=0 platform=3001024` —— 不是口径不一致，而是**沙箱内量不出来**。
+探针里另外两条**已通过**：超预算写入被拒（`dd` 报 `File too large`，停在 1021 MiB）、删掉后能继续写（`WROTE=ok`）。
