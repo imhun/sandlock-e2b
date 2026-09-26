@@ -1,0 +1,5 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+..s.......................................................               [100%]
+=========================== short test summary info ============================
+SKIPPED [1] tests/security/test_template_isolation.py:101: the refusal is about an euid-0 in-process mediator
+57 passed, 1 skipped in 13.69s

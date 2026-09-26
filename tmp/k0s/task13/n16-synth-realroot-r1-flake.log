@@ -1,0 +1,291 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+........................................................................ [  3%]
+.............................................ss......................... [  7%]
+........sss............................................................. [ 10%]
+........................................................................ [ 14%]
+...................................F.................................... [ 17%]
+........................................................................ [ 21%]
+.............................s...................s..s................... [ 24%]
+........................................................................ [ 28%]
+........................................................................ [ 31%]
+.........................s.............................................. [ 35%]
+........................................................................ [ 38%]
+........................................................................ [ 42%]
+........................................................................ [ 45%]
+........................................................................ [ 49%]
+........................................................................ [ 53%]
+........................................................................ [ 56%]
+........................................................................ [ 60%]
+........................................................................ [ 63%]
+........................................................................ [ 67%]
+........................................................................ [ 70%]
+........................................................................ [ 74%]
+........................................................................ [ 77%]
+........................................................................ [ 81%]
+........................................................................ [ 84%]
+........................................................................ [ 88%]
+....s................................................................... [ 91%]
+..........................................sssss..............s.......... [ 95%]
+........................................................................ [ 99%]
+...................                                                      [100%]
+=================================== FAILURES ===================================
+___ test_a_refused_tree_is_parked_and_the_row_it_pinned_is_released[lsattr] ____
+
+workspace = PosixPath('/var/lib/e2b-test-runtime/f072b82a5b64')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f2a3c7f51d0>
+caplog = <_pytest.logging.LogCaptureFixture object at 0x7f2a3c7f5da0>
+disk_read_backend = 'lsattr'
+
+    @pytest.mark.asyncio
+    async def test_a_refused_tree_is_parked_and_the_row_it_pinned_is_released(
+        workspace, monkeypatch, caplog, disk_read_backend
+    ):
+        """W7-3: the GC's refusal has a bounded, non-destructive exit.
+    
+        Once the control plane has released the record (eviction, TTL, a kill
+        while the worker was unreachable) the API's ``force`` can only answer 404
+        -- the record is what named the node. Left in place, the tree's own
+        ``sandbox.json`` keeps the project ids it claims in the fail-safe scan
+        ("still live"), so the row never leaves the table: a permanent pin. The
+        exit moves the tree out of the sandbox namespace (never deletes it) and
+        releases the project id the disk reports.
+        """
+        victim = _write_tree(workspace, "sbx_victim", project_id=VICTIM_PROJID)
+        liar = _write_tree(
+            workspace,
+            "sbx_liar",
+            workspace_dir=str(victim),
+            project_id=LIAR_PROJID,
+        )
+        _install_disk_projids(
+            monkeypatch,
+            {victim: VICTIM_PROJID, liar: LIAR_PROJID},
+            backend=disk_read_backend,
+        )
+        released = _record_agent_releases(monkeypatch)
+        app = _worker_app(workspace)
+        parked_dir = workspace / "_untrusted.trees" / "sbx_liar"
+        caplog.set_level(logging.WARNING)
+        caplog.clear()
+    
+        # 1. the worker refuses to tear the tree down from its record ...
+        refused = await _worker_delete(app, "sbx_liar")
+        assert refused.status_code == 409
+        assert _agent_lines(caplog) == [
+            f"delete: refusing to tear down sbx_liar: its sandbox.json points at "
+            f"{victim}",
+        ]
+    
+        # 2. ... the audit view names it, with the reason and the ids involved ...
+        caplog.clear()
+        listed = await _worker_get(app, "/agent/untrusted")
+        assert listed.status_code == 200
+        assert listed.json() == {
+            "untrusted": [
+                {
+                    "sandbox_id": "sbx_liar",
+                    "reason": f"its sandbox.json points at {victim}",
+                    "disk_project_id": LIAR_PROJID,
+                    "claimed_project_ids": [
+                        LIAR_PROJID,
+                    ],
+                }
+            ]
+        }
+    
+        # 3. ... and the bounded exit parks the tree (moved, never deleted)
+        monkeypatch.setattr(
+            agent_mod, "time", SimpleNamespace(time=lambda: 1_700_000_000.0)
+        )
+        parked = await _worker_post(app, "/agent/untrusted/sbx_liar/park")
+        assert parked.status_code == 200
+        assert parked.json() == {
+            "sandbox_id": "sbx_liar",
+            "reason": f"its sandbox.json points at {victim}",
+            "parked_at": "_untrusted.trees/sbx_liar",
+            "released_project_id": LIAR_PROJID,
+        }
+>       assert _agent_lines(caplog) == [
+            "park: moved the refused tree sbx_liar to _untrusted.trees (payload "
+            f"kept, project {LIAR_PROJID} released)",
+        ]
+E       AssertionError: assert ['node agent ...01 released)'] == ['park: moved...01 released)']
+E         
+E         At index 0 diff: 'node agent heartbeat failed' != 'park: moved the refused tree sbx_liar to _untrusted.trees (payload kept, project 7001 released)'
+E         Left contains one more item: 'park: moved the refused tree sbx_liar to _untrusted.trees (payload kept, project 7001 released)'
+E         Use -v to get more diff
+
+tests/contract/test_teardown_failure_semantics.py:1120: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  envd_service.quota_agent:quota_agent.py:330 E2B_QUOTA_VIA_AGENT is enabled but E2B_QUOTA_AGENT_URL is not set; quota-agent hooks unconfigured, quota operations will degrade with warnings
+WARNING  envd_service.agent:agent.py:1286 delete: refusing to tear down sbx_liar: its sandbox.json points at /var/lib/e2b-test-runtime/f072b82a5b64/sbx_victim
+WARNING  envd_service.agent:agent.py:1674 node agent heartbeat failed
+Traceback (most recent call last):
+  File "/workspace/envd_service/agent.py", line 1667, in _loop
+    await self._pulse()
+  File "/workspace/envd_service/agent.py", line 1706, in _pulse
+    self._disk_report_for_heartbeat(),
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/workspace/envd_service/agent.py", line 1810, in _disk_report_for_heartbeat
+    return self._maybe_scan_disk()
+           ~~~~~~~~~~~~~~~~~~~~~^^
+  File "/workspace/envd_service/agent.py", line 1738, in _maybe_scan_disk
+    now = time.monotonic()
+          ^^^^^^^^^^^^^^
+AttributeError: 'types.SimpleNamespace' object has no attribute 'monotonic'
+WARNING  envd_service.agent:agent.py:1143 park: moved the refused tree sbx_liar to _untrusted.trees (payload kept, project 7001 released)
+=============================== warnings summary ===============================
+tests/contract/test_command_logs.py: 12 warnings
+tests/contract/test_connect_protocol.py: 3 warnings
+tests/contract/test_control_plane.py: 3 warnings
+tests/contract/test_create_queue_api.py: 16 warnings
+tests/contract/test_delete_trusted_targets.py: 3 warnings
+tests/contract/test_disk_budget_enforcement.py: 3 warnings
+tests/contract/test_envd_http.py: 4 warnings
+tests/contract/test_filesystem_rpc.py: 3 warnings
+tests/contract/test_idle_activity.py: 3 warnings
+tests/contract/test_mcp_gateway_failure.py: 26 warnings
+tests/contract/test_mcp_netns.py: 59 warnings
+tests/contract/test_memory_quota_boxed.py: 473 warnings
+tests/contract/test_memory_quota_gateway_command.py: 125 warnings
+tests/contract/test_migration.py: 120 warnings
+tests/contract/test_multinode.py: 9 warnings
+tests/contract/test_network_api.py: 57 warnings
+tests/contract/test_node_partition_reconcile.py: 3 warnings
+tests/contract/test_orphan_tree_gc.py: 236 warnings
+tests/contract/test_pause_resume_metrics_logs.py: 12 warnings
+tests/contract/test_pause_resume_quota.py: 8 warnings
+tests/contract/test_pause_resume_sandlock.py: 77 warnings
+tests/contract/test_pause_resume_sandlock_multinode.py: 186 warnings
+tests/contract/test_pause_write_gating.py: 17 warnings
+tests/contract/test_pty_sandlock.py: 10 warnings
+tests/contract/test_pure_shape_workspace_ownership.py: 19 warnings
+tests/contract/test_redis_multireplica_e2e.py: 51 warnings
+tests/contract/test_resource_create_limits.py: 11 warnings
+tests/contract/test_route_b_executor.py: 50 warnings
+tests/contract/test_scaling.py: 18 warnings
+tests/contract/test_secrets.py: 6 warnings
+tests/contract/test_server_keepalive.py: 274 warnings
+tests/contract/test_server_port_reservation.py: 8 warnings
+tests/contract/test_shared_volume_relative_cwd.py: 5 warnings
+tests/contract/test_size_limits.py: 6 warnings
+tests/contract/test_snapshots.py: 206 warnings
+tests/contract/test_teardown_failure_semantics.py: 40 warnings
+tests/contract/test_template_build_limits.py: 4 warnings
+tests/contract/test_template_upload.py: 20 warnings
+tests/contract/test_tenant_isolation.py: 26 warnings
+tests/contract/test_tls.py: 19 warnings
+tests/contract/test_uid_permissions.py: 3 warnings
+tests/contract/test_volumes.py: 47 warnings
+tests/perf/test_latency.py: 55 warnings
+tests/sdk/js/test_js_sdk.py: 133 warnings
+tests/sdk/python/test_commands.py: 126 warnings
+tests/sdk/python/test_features.py: 20 warnings
+tests/sdk/python/test_files.py: 11 warnings
+tests/sdk/python/test_mcp.py: 56 warnings
+tests/sdk/python/test_multinode.py: 73 warnings
+tests/sdk/python/test_sandbox.py: 3 warnings
+tests/sdk/python/test_shared_volumes.py: 30 warnings
+tests/sdk/python/test_snapshots.py: 24 warnings
+tests/sdk/python/test_stdin.py: 1 warning
+tests/sdk/python/test_templates.py: 2002 warnings
+tests/security/escape/test_path_surface_inotify.py: 301 warnings
+tests/security/test_chroot_exec_shebang.py: 684 warnings
+tests/security/test_egress_proxy.py: 23 warnings
+tests/security/test_fork_network_features.py: 41 warnings
+tests/security/test_network_enforcement.py: 90 warnings
+tests/security/test_process_limits.py: 958 warnings
+tests/security/test_quota_admission.py: 1908 warnings
+tests/security/test_real_root_denials.py: 100 warnings
+tests/security/test_real_root_mounts.py: 94 warnings
+tests/security/test_sandlock_isolation.py: 117 warnings
+tests/security/test_template_isolation.py: 202 warnings
+tests/security/test_traversal_and_ids.py: 2 warnings
+tests/security/test_uid_isolation.py: 7 warnings
+tests/security/test_worker_nonroot.py: 851 warnings
+tests/unit/test_agent_checkpoint_restore.py: 29 warnings
+tests/unit/test_agent_create_sandbox_auth.py: 28 warnings
+tests/unit/test_agent_pause_resume.py: 9 warnings
+tests/unit/test_autoscaler_loop.py: 4 warnings
+tests/unit/test_autoscaler_policy.py: 1 warning
+tests/unit/test_brief_stat.py: 2 warnings
+tests/unit/test_checkpoint_store.py: 5 warnings
+tests/unit/test_cleanup_plaintext_secrets.py: 4 warnings
+tests/unit/test_control_plane_checkpoint_proxy.py: 9 warnings
+tests/unit/test_control_plane_network_local.py: 18 warnings
+tests/unit/test_control_plane_network_remote.py: 34 warnings
+tests/unit/test_controlplane_local_node_quota.py: 3 warnings
+tests/unit/test_cp_state_base.py: 8 warnings
+tests/unit/test_create_queue.py: 1 warning
+tests/unit/test_dir_ledger.py: 32 warnings
+tests/unit/test_disk_overrun_visibility.py: 1 warning
+tests/unit/test_disk_scan_offload.py: 2 warnings
+tests/unit/test_disk_tightening.py: 10 warnings
+tests/unit/test_env_file_permissions_guard.py: 16 warnings
+tests/unit/test_eviction_selector.py: 2 warnings
+tests/unit/test_gateway.py: 148 warnings
+tests/unit/test_image_cache_sharing.py: 302 warnings
+tests/unit/test_image_rootfs_cache_split.py: 2 warnings
+tests/unit/test_k0s_secrets_script.py: 180 warnings
+tests/unit/test_mcp_gateway.py: 31 warnings
+tests/unit/test_migrate_state_base_script.py: 62 warnings
+tests/unit/test_migrate_tenants.py: 1 warning
+tests/unit/test_migration_volume_quota.py: 17 warnings
+tests/unit/test_node_heartbeat_timeout_config.py: 4 warnings
+tests/unit/test_node_registry.py: 4 warnings
+tests/unit/test_oci_registry.py: 126 warnings
+tests/unit/test_pause_quota.py: 3 warnings
+tests/unit/test_policy_mapping.py: 2 warnings
+tests/unit/test_priv_helpers.py: 2 warnings
+tests/unit/test_process_capture_limit.py: 4 warnings
+tests/unit/test_process_command_lock.py: 13 warnings
+tests/unit/test_pure_rootfs_config.py: 1 warning
+tests/unit/test_pure_rootfs_shape.py: 1 warning
+tests/unit/test_quota_agent_server.py: 2 warnings
+tests/unit/test_quota_agent_startup_race.py: 161 warnings
+tests/unit/test_quota_maintenance.py: 29 warnings
+tests/unit/test_ratelimit.py: 1 warning
+tests/unit/test_redis_multireplica.py: 176 warnings
+tests/unit/test_registry_dirty_snapshot.py: 2 warnings
+tests/unit/test_remote_pause_delivery.py: 157 warnings
+tests/unit/test_rotate_secret_master_script.py: 243 warnings
+tests/unit/test_route_b_wiring.py: 26 warnings
+tests/unit/test_sandbox_registry.py: 25 warnings
+tests/unit/test_sandbox_writer.py: 2 warnings
+tests/unit/test_sandlock_executor_instance.py: 1 warning
+tests/unit/test_sandlock_executor_route_b.py: 3 warnings
+tests/unit/test_scheduler.py: 5 warnings
+tests/unit/test_seccomp_selfcheck.py: 13 warnings
+tests/unit/test_secret_registry.py: 6 warnings
+tests/unit/test_template_build.py: 1 warning
+tests/unit/test_tenant_quota.py: 2 warnings
+tests/unit/test_upgrade_digest_validation.py: 5 warnings
+tests/unit/test_upgrade_quota_agent_profile.py: 4 warnings
+tests/unit/test_upload_limits.py: 9 warnings
+tests/unit/test_volume_quota.py: 10 warnings
+tests/unit/test_worker_manifest_permissions.py: 2 warnings
+tests/unit/test_workspace_ownership.py: 1 warning
+tests/unit/test_xfs_project_quota_agent.py: 24 warnings
+tests/unit/test_xfs_quotactl_backend.py: 97 warnings
+  /usr/local/lib/python3.14/asyncio/threads.py:26: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    return await loop.run_in_executor(None, func_call)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [2] tests/contract/test_mcp_gateway_keepalive.py:84: no base image configured (pure shape): nothing to inspect
+SKIPPED [1] tests/contract/test_nonroot_route_b.py:156: the route-B contract needs the sandlock wheel (with the supervise binary) and the image-rootfs shape (E2B_BASE_IMAGE)
+SKIPPED [1] tests/contract/test_nonroot_route_b.py:330: the route-B contract needs the sandlock wheel (with the supervise binary) and the image-rootfs shape (E2B_BASE_IMAGE)
+SKIPPED [1] tests/contract/test_nonroot_route_b.py:373: the route-B contract needs the sandlock wheel (with the supervise binary) and the image-rootfs shape (E2B_BASE_IMAGE)
+SKIPPED [1] tests/security/test_fork_network_features.py:370: requires E2B_BASE_IMAGE (image-rootfs sandboxes)
+SKIPPED [1] tests/security/test_template_isolation.py:45: no base image configured for template isolation test
+SKIPPED [1] tests/security/test_template_isolation.py:169: the unprivileged worker shape both production manifests ship
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_dir_ledger.py:282: root can read a 0000 directory
+SKIPPED [1] tests/unit/test_uid_pool.py:469: the non-root worker shape cannot be asserted as root
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:614: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:669: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:704: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:785: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:868: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:1390: kubectl needed to render the kustomize overlay
+FAILED tests/contract/test_teardown_failure_semantics.py::test_a_refused_tree_is_parked_and_the_row_it_pinned_is_released[lsattr]
+1 failed, 2018 passed, 16 skipped, 12321 warnings in 459.12s (0:07:39)

@@ -1,0 +1,218 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+........................................................................ [  3%]
+.............................................ss......................... [  7%]
+........sss............................................................. [ 10%]
+........................................................................ [ 14%]
+........................................................................ [ 17%]
+.....EE.EEE...........EEEEE.ssss........................................ [ 21%]
+.........................................s...................s..s....... [ 24%]
+........................................................................ [ 28%]
+........................................................................ [ 31%]
+.....................................s.................................. [ 35%]
+........................................................................ [ 38%]
+........................................................................ [ 42%]
+........................................................................ [ 45%]
+........................................................................ [ 49%]
+........................................................................ [ 52%]
+........................................................................ [ 56%]
+........................................................................ [ 59%]
+........................................................................ [ 63%]
+........................................................................ [ 66%]
+........................................................................ [ 70%]
+........................................................................ [ 73%]
+........................................................................ [ 77%]
+........................................................................ [ 80%]
+........................................................................ [ 84%]
+........................................................................ [ 87%]
+................s....................................................... [ 91%]
+......................................................sssss............. [ 94%]
+.s...................................................................... [ 98%]
+...............................                                          [100%]
+==================================== ERRORS ====================================
+____ ERROR at setup of test_multi_sandbox_same_volume_quota_is_independent _____
+tests/contract/test_volume_quota.py::test_multi_sandbox_same_volume_quota_is_independent: this runner is expected to satisfy the gate (matched 'XFS quota integration requires' in E2B_TEST_STRICT_SKIPS mode), but the test skipped with: ('/workspace/tests/contract/test_volume_quota.py', 158, 'Skipped: XFS quota integration requires E2B_XFS_QUOTA_INTEGRATION=1 and prjquota support on /var/lib/e2b-sandboxes')
+_______ ERROR at setup of test_delete_sandbox_cleans_only_its_own_slice ________
+tests/contract/test_volume_quota.py::test_delete_sandbox_cleans_only_its_own_slice: this runner is expected to satisfy the gate (matched 'XFS quota integration requires' in E2B_TEST_STRICT_SKIPS mode), but the test skipped with: ('/workspace/tests/contract/test_volume_quota.py', 232, 'Skipped: XFS quota integration requires E2B_XFS_QUOTA_INTEGRATION=1 and prjquota support on /var/lib/e2b-sandboxes')
+_ ERROR at setup of test_migration_shared_volume_slice_survives_source_destroy _
+tests/contract/test_volume_quota.py::test_migration_shared_volume_slice_survives_source_destroy: this runner is expected to satisfy the gate (matched 'XFS quota integration requires' in E2B_TEST_STRICT_SKIPS mode), but the test skipped with: ('/workspace/tests/contract/test_volume_quota.py', 347, 'Skipped: XFS quota integration requires E2B_XFS_QUOTA_INTEGRATION=1 and prjquota support on /var/lib/e2b-sandboxes')
+_________ ERROR at setup of test_migration_rollback_keeps_shared_slice _________
+tests/contract/test_volume_quota.py::test_migration_rollback_keeps_shared_slice: this runner is expected to satisfy the gate (matched 'XFS quota integration requires' in E2B_TEST_STRICT_SKIPS mode), but the test skipped with: ('/workspace/tests/contract/test_volume_quota.py', 413, 'Skipped: XFS quota integration requires E2B_XFS_QUOTA_INTEGRATION=1 and prjquota support on /var/lib/e2b-sandboxes')
+_________ ERROR at setup of test_snapshot_fork_quota_gets_fresh_slice __________
+tests/contract/test_volume_quota.py::test_snapshot_fork_quota_gets_fresh_slice: this runner is expected to satisfy the gate (matched 'XFS quota integration requires' in E2B_TEST_STRICT_SKIPS mode), but the test skipped with: ('/workspace/tests/contract/test_volume_quota.py', 461, 'Skipped: XFS quota integration requires E2B_XFS_QUOTA_INTEGRATION=1 and prjquota support on /var/lib/e2b-sandboxes')
+__ ERROR at setup of test_agent_create_provisions_project_limit_and_persists ___
+tests/contract/test_xfs_project_quota.py::test_agent_create_provisions_project_limit_and_persists: this runner is expected to satisfy the gate (matched 'XFS quota integration requires' in E2B_TEST_STRICT_SKIPS mode), but the test skipped with: ('/Users/polus/project/ai/sandlock-e2b/tests/contract/test_xfs_project_quota.py', 112, 'Skipped: XFS quota integration requires E2B_XFS_QUOTA_INTEGRATION=1')
+_________ ERROR at setup of test_over_limit_write_enforced_with_enospc _________
+tests/contract/test_xfs_project_quota.py::test_over_limit_write_enforced_with_enospc: this runner is expected to satisfy the gate (matched 'XFS quota integration requires' in E2B_TEST_STRICT_SKIPS mode), but the test skipped with: ('/Users/polus/project/ai/sandlock-e2b/tests/contract/test_xfs_project_quota.py', 133, 'Skipped: XFS quota integration requires E2B_XFS_QUOTA_INTEGRATION=1')
+__________ ERROR at setup of test_agent_delete_clears_project_and_dir __________
+tests/contract/test_xfs_project_quota.py::test_agent_delete_clears_project_and_dir: this runner is expected to satisfy the gate (matched 'XFS quota integration requires' in E2B_TEST_STRICT_SKIPS mode), but the test skipped with: ('/Users/polus/project/ai/sandlock-e2b/tests/contract/test_xfs_project_quota.py', 156, 'Skipped: XFS quota integration requires E2B_XFS_QUOTA_INTEGRATION=1')
+_______ ERROR at setup of test_reconcile_removes_zero_usage_orphan_entry _______
+tests/contract/test_xfs_project_quota.py::test_reconcile_removes_zero_usage_orphan_entry: this runner is expected to satisfy the gate (matched 'XFS quota integration requires' in E2B_TEST_STRICT_SKIPS mode), but the test skipped with: ('/Users/polus/project/ai/sandlock-e2b/tests/contract/test_xfs_project_quota.py', 171, 'Skipped: XFS quota integration requires E2B_XFS_QUOTA_INTEGRATION=1')
+__ ERROR at setup of test_reconcile_removes_record_lost_project_but_keeps_dir __
+tests/contract/test_xfs_project_quota.py::test_reconcile_removes_record_lost_project_but_keeps_dir: this runner is expected to satisfy the gate (matched 'XFS quota integration requires' in E2B_TEST_STRICT_SKIPS mode), but the test skipped with: ('/Users/polus/project/ai/sandlock-e2b/tests/contract/test_xfs_project_quota.py', 195, 'Skipped: XFS quota integration requires E2B_XFS_QUOTA_INTEGRATION=1')
+=============================== warnings summary ===============================
+tests/contract/test_command_logs.py: 12 warnings
+tests/contract/test_connect_protocol.py: 3 warnings
+tests/contract/test_control_plane.py: 3 warnings
+tests/contract/test_create_queue_api.py: 14 warnings
+tests/contract/test_delete_trusted_targets.py: 3 warnings
+tests/contract/test_disk_budget_enforcement.py: 1 warning
+tests/contract/test_envd_http.py: 6 warnings
+tests/contract/test_filesystem_rpc.py: 1 warning
+tests/contract/test_idle_activity.py: 3 warnings
+tests/contract/test_internal_key_rotation.py: 2 warnings
+tests/contract/test_mcp_gateway_failure.py: 23 warnings
+tests/contract/test_mcp_netns.py: 64 warnings
+tests/contract/test_memory_quota_boxed.py: 473 warnings
+tests/contract/test_memory_quota_gateway_command.py: 123 warnings
+tests/contract/test_merged_single_port.py: 2 warnings
+tests/contract/test_migration.py: 124 warnings
+tests/contract/test_multinode.py: 15 warnings
+tests/contract/test_network_api.py: 49 warnings
+tests/contract/test_node_partition_reconcile.py: 7 warnings
+tests/contract/test_orphan_tree_gc.py: 232 warnings
+tests/contract/test_pause_resume_metrics_logs.py: 7 warnings
+tests/contract/test_pause_resume_quota.py: 13 warnings
+tests/contract/test_pause_resume_sandlock.py: 79 warnings
+tests/contract/test_pause_resume_sandlock_multinode.py: 171 warnings
+tests/contract/test_pause_write_gating.py: 16 warnings
+tests/contract/test_pty_sandlock.py: 8 warnings
+tests/contract/test_pure_shape_workspace_ownership.py: 27 warnings
+tests/contract/test_redis_multireplica_e2e.py: 50 warnings
+tests/contract/test_resource_create_limits.py: 8 warnings
+tests/contract/test_route_b_executor.py: 46 warnings
+tests/contract/test_route_b_slot_pool.py: 10 warnings
+tests/contract/test_scaling.py: 5 warnings
+tests/contract/test_secrets.py: 19 warnings
+tests/contract/test_server_keepalive.py: 269 warnings
+tests/contract/test_server_port_reservation.py: 2 warnings
+tests/contract/test_shared_volume_relative_cwd.py: 5 warnings
+tests/contract/test_size_limits.py: 15 warnings
+tests/contract/test_snapshots.py: 211 warnings
+tests/contract/test_teardown_failure_semantics.py: 37 warnings
+tests/contract/test_template_build_limits.py: 8 warnings
+tests/contract/test_template_upload.py: 16 warnings
+tests/contract/test_tenant_isolation.py: 20 warnings
+tests/contract/test_tls.py: 24 warnings
+tests/contract/test_uid_permissions.py: 3 warnings
+tests/contract/test_volume_quota.py: 5 warnings
+tests/contract/test_volumes.py: 49 warnings
+tests/contract/test_xfs_project_quota.py: 2 warnings
+tests/perf/test_latency.py: 1 warning
+tests/sdk/js/test_js_sdk.py: 148 warnings
+tests/sdk/python/test_commands.py: 117 warnings
+tests/sdk/python/test_features.py: 24 warnings
+tests/sdk/python/test_files.py: 6 warnings
+tests/sdk/python/test_mcp.py: 41 warnings
+tests/sdk/python/test_multinode.py: 77 warnings
+tests/sdk/python/test_pty.py: 1 warning
+tests/sdk/python/test_sandbox.py: 15 warnings
+tests/sdk/python/test_shared_volumes.py: 36 warnings
+tests/sdk/python/test_snapshots.py: 20 warnings
+tests/sdk/python/test_templates.py: 1997 warnings
+tests/security/escape/test_network_deny_bypass.py: 1 warning
+tests/security/escape/test_path_surface_inotify.py: 276 warnings
+tests/security/test_chroot_exec_shebang.py: 674 warnings
+tests/security/test_egress_proxy.py: 31 warnings
+tests/security/test_fork_network_features.py: 43 warnings
+tests/security/test_network_enforcement.py: 65 warnings
+tests/security/test_process_limits.py: 962 warnings
+tests/security/test_pure_root_errno_contract.py: 2 warnings
+tests/security/test_quota_admission.py: 1880 warnings
+tests/security/test_real_root_denials.py: 113 warnings
+tests/security/test_real_root_mounts.py: 93 warnings
+tests/security/test_sandlock_isolation.py: 108 warnings
+tests/security/test_template_isolation.py: 207 warnings
+tests/security/test_traversal_and_ids.py: 15 warnings
+tests/security/test_uid_isolation.py: 8 warnings
+tests/security/test_worker_nonroot.py: 849 warnings
+tests/unit/test_agent_checkpoint_restore.py: 28 warnings
+tests/unit/test_agent_create_sandbox_auth.py: 30 warnings
+tests/unit/test_agent_pause_resume.py: 13 warnings
+tests/unit/test_cleanup_plaintext_secrets.py: 2 warnings
+tests/unit/test_control_plane_checkpoint_proxy.py: 20 warnings
+tests/unit/test_control_plane_network_local.py: 5 warnings
+tests/unit/test_control_plane_network_remote.py: 32 warnings
+tests/unit/test_cp_state_base.py: 5 warnings
+tests/unit/test_create_queue.py: 8 warnings
+tests/unit/test_dir_ledger.py: 12 warnings
+tests/unit/test_disk_scan_offload.py: 2 warnings
+tests/unit/test_disk_tightening.py: 4 warnings
+tests/unit/test_env_file_permissions_guard.py: 2 warnings
+tests/unit/test_executor_update_network.py: 2 warnings
+tests/unit/test_filesystem_ops.py: 4 warnings
+tests/unit/test_gateway.py: 149 warnings
+tests/unit/test_image_cache_sharing.py: 342 warnings
+tests/unit/test_image_rootfs_cache_split.py: 2 warnings
+tests/unit/test_k0s_secrets_script.py: 159 warnings
+tests/unit/test_mcp_gateway.py: 34 warnings
+tests/unit/test_migrate_state_base_script.py: 92 warnings
+tests/unit/test_migration_volume_quota.py: 5 warnings
+tests/unit/test_network_config.py: 9 warnings
+tests/unit/test_node_heartbeat_timeout_config.py: 2 warnings
+tests/unit/test_node_registry.py: 5 warnings
+tests/unit/test_oci_registry.py: 133 warnings
+tests/unit/test_pause_quota.py: 4 warnings
+tests/unit/test_priv_helpers.py: 2 warnings
+tests/unit/test_process_command_lock.py: 19 warnings
+tests/unit/test_process_pause_fallback.py: 3 warnings
+tests/unit/test_quota_agent_client.py: 5 warnings
+tests/unit/test_quota_agent_server.py: 4 warnings
+tests/unit/test_quota_agent_startup_race.py: 156 warnings
+tests/unit/test_quota_maintenance.py: 24 warnings
+tests/unit/test_ratelimit.py: 3 warnings
+tests/unit/test_real_root_gate.py: 5 warnings
+tests/unit/test_record_namespace_isolation.py: 2 warnings
+tests/unit/test_redis_multireplica.py: 190 warnings
+tests/unit/test_registry_dirty_snapshot.py: 4 warnings
+tests/unit/test_remote_pause_delivery.py: 182 warnings
+tests/unit/test_rotate_secret_master_script.py: 303 warnings
+tests/unit/test_route_b_wiring.py: 20 warnings
+tests/unit/test_sandbox_registry.py: 36 warnings
+tests/unit/test_sandbox_writer.py: 4 warnings
+tests/unit/test_secret_registry.py: 9 warnings
+tests/unit/test_shared_volume_traversal.py: 9 warnings
+tests/unit/test_state_base_call_sites.py: 1 warning
+tests/unit/test_tenant_quota.py: 3 warnings
+tests/unit/test_uid_authority.py: 3 warnings
+tests/unit/test_uid_pool.py: 7 warnings
+tests/unit/test_upgrade_quota_agent_profile.py: 17 warnings
+tests/unit/test_volume_quota.py: 8 warnings
+tests/unit/test_volume_registry.py: 5 warnings
+tests/unit/test_xfs_project_quota_agent.py: 22 warnings
+tests/unit/test_xfs_quota.py: 3 warnings
+tests/unit/test_xfs_quotactl_backend.py: 108 warnings
+  /usr/local/lib/python3.14/asyncio/threads.py:26: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    return await loop.run_in_executor(None, func_call)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [2] tests/contract/test_mcp_gateway_keepalive.py:84: no base image configured (pure shape): nothing to inspect
+SKIPPED [1] tests/contract/test_nonroot_route_b.py:156: the route-B contract needs the sandlock wheel (with the supervise binary) and the image-rootfs shape (E2B_BASE_IMAGE)
+SKIPPED [1] tests/contract/test_nonroot_route_b.py:330: the route-B contract needs the sandlock wheel (with the supervise binary) and the image-rootfs shape (E2B_BASE_IMAGE)
+SKIPPED [1] tests/contract/test_nonroot_route_b.py:373: the route-B contract needs the sandlock wheel (with the supervise binary) and the image-rootfs shape (E2B_BASE_IMAGE)
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/perf/test_latency.py:15: perf tests require --perf
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/perf/test_latency.py:36: perf tests require --perf
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/perf/test_latency.py:58: perf tests require --perf
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/perf/test_latency.py:79: perf tests require --perf
+SKIPPED [1] tests/security/test_fork_network_features.py:370: requires E2B_BASE_IMAGE (image-rootfs sandboxes)
+SKIPPED [1] tests/security/test_template_isolation.py:45: no base image configured for template isolation test
+SKIPPED [1] tests/security/test_template_isolation.py:169: the unprivileged worker shape both production manifests ship
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_dir_ledger.py:282: root can read a 0000 directory
+SKIPPED [1] tests/unit/test_uid_pool.py:469: the non-root worker shape cannot be asserted as root
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:614: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:669: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:704: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:785: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:868: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:1390: kubectl needed to render the kustomize overlay
+ERROR tests/contract/test_volume_quota.py::test_multi_sandbox_same_volume_quota_is_independent
+ERROR tests/contract/test_volume_quota.py::test_delete_sandbox_cleans_only_its_own_slice
+ERROR tests/contract/test_volume_quota.py::test_migration_shared_volume_slice_survives_source_destroy
+ERROR tests/contract/test_volume_quota.py::test_migration_rollback_keeps_shared_slice
+ERROR tests/contract/test_volume_quota.py::test_snapshot_fork_quota_gets_fresh_slice
+ERROR tests/contract/test_xfs_project_quota.py::test_agent_create_provisions_project_limit_and_persists
+ERROR tests/contract/test_xfs_project_quota.py::test_over_limit_write_enforced_with_enospc
+ERROR tests/contract/test_xfs_project_quota.py::test_agent_delete_clears_project_and_dir
+ERROR tests/contract/test_xfs_project_quota.py::test_reconcile_removes_zero_usage_orphan_entry
+ERROR tests/contract/test_xfs_project_quota.py::test_reconcile_removes_record_lost_project_but_keeps_dir
+2017 passed, 20 skipped, 12357 warnings, 10 errors in 460.74s (0:07:40)

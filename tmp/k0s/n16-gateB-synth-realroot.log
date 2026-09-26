@@ -1,0 +1,197 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+........................................................................ [  3%]
+.............................................ss......................... [  7%]
+........sss............................................................. [ 10%]
+........................................................................ [ 14%]
+........................................................................ [ 17%]
+........................................................................ [ 21%]
+.............................s...................s..s................... [ 24%]
+........................................................................ [ 28%]
+........................................................................ [ 31%]
+.........................s.............................................. [ 35%]
+........................................................................ [ 38%]
+........................................................................ [ 42%]
+........................................................................ [ 45%]
+........................................................................ [ 49%]
+........................................................................ [ 53%]
+........................................................................ [ 56%]
+........................................................................ [ 60%]
+........................................................................ [ 63%]
+........................................................................ [ 67%]
+........................................................................ [ 70%]
+........................................................................ [ 74%]
+........................................................................ [ 77%]
+........................................................................ [ 81%]
+........................................................................ [ 84%]
+........................................................................ [ 88%]
+....s................................................................... [ 91%]
+..........................................sssss..............s.......... [ 95%]
+........................................................................ [ 99%]
+...................                                                      [100%]
+=============================== warnings summary ===============================
+tests/contract/test_command_logs.py: 12 warnings
+tests/contract/test_connect_protocol.py: 3 warnings
+tests/contract/test_control_plane.py: 3 warnings
+tests/contract/test_create_queue_api.py: 14 warnings
+tests/contract/test_delete_trusted_targets.py: 3 warnings
+tests/contract/test_disk_budget_enforcement.py: 1 warning
+tests/contract/test_envd_http.py: 6 warnings
+tests/contract/test_filesystem_rpc.py: 3 warnings
+tests/contract/test_idle_activity.py: 3 warnings
+tests/contract/test_mcp_gateway_failure.py: 26 warnings
+tests/contract/test_mcp_netns.py: 61 warnings
+tests/contract/test_memory_quota_boxed.py: 460 warnings
+tests/contract/test_memory_quota_gateway_command.py: 122 warnings
+tests/contract/test_merged_single_port.py: 5 warnings
+tests/contract/test_migration.py: 127 warnings
+tests/contract/test_multinode.py: 12 warnings
+tests/contract/test_network_api.py: 65 warnings
+tests/contract/test_node_partition_reconcile.py: 8 warnings
+tests/contract/test_orphan_tree_gc.py: 229 warnings
+tests/contract/test_pause_resume_metrics_logs.py: 11 warnings
+tests/contract/test_pause_resume_quota.py: 11 warnings
+tests/contract/test_pause_resume_sandlock.py: 71 warnings
+tests/contract/test_pause_resume_sandlock_multinode.py: 160 warnings
+tests/contract/test_pause_write_gating.py: 19 warnings
+tests/contract/test_pty_sandlock.py: 8 warnings
+tests/contract/test_pure_shape_workspace_ownership.py: 30 warnings
+tests/contract/test_redis_multireplica_e2e.py: 46 warnings
+tests/contract/test_resource_create_limits.py: 9 warnings
+tests/contract/test_route_b_executor.py: 44 warnings
+tests/contract/test_route_b_slot_pool.py: 7 warnings
+tests/contract/test_sandbox_lifecycle_rebuild.py: 2 warnings
+tests/contract/test_scaling.py: 9 warnings
+tests/contract/test_secrets.py: 13 warnings
+tests/contract/test_server_keepalive.py: 273 warnings
+tests/contract/test_server_port_reservation.py: 2 warnings
+tests/contract/test_shared_volume_relative_cwd.py: 7 warnings
+tests/contract/test_size_limits.py: 13 warnings
+tests/contract/test_snapshots.py: 207 warnings
+tests/contract/test_teardown_failure_semantics.py: 32 warnings
+tests/contract/test_template_build_limits.py: 5 warnings
+tests/contract/test_template_upload.py: 11 warnings
+tests/contract/test_tenant_isolation.py: 28 warnings
+tests/contract/test_tls.py: 21 warnings
+tests/contract/test_uid_permissions.py: 7 warnings
+tests/contract/test_volumes.py: 56 warnings
+tests/perf/test_latency.py: 52 warnings
+tests/sdk/js/test_js_sdk.py: 125 warnings
+tests/sdk/python/test_commands.py: 134 warnings
+tests/sdk/python/test_features.py: 14 warnings
+tests/sdk/python/test_files.py: 13 warnings
+tests/sdk/python/test_mcp.py: 46 warnings
+tests/sdk/python/test_multinode.py: 79 warnings
+tests/sdk/python/test_pty.py: 3 warnings
+tests/sdk/python/test_sandbox.py: 4 warnings
+tests/sdk/python/test_shared_volumes.py: 45 warnings
+tests/sdk/python/test_snapshots.py: 13 warnings
+tests/sdk/python/test_stdin.py: 1 warning
+tests/sdk/python/test_templates.py: 2032 warnings
+tests/security/escape/test_network_deny_bypass.py: 6 warnings
+tests/security/escape/test_path_surface_inotify.py: 262 warnings
+tests/security/test_chroot_exec_shebang.py: 1023 warnings
+tests/security/test_egress_proxy.py: 27 warnings
+tests/security/test_fork_network_features.py: 41 warnings
+tests/security/test_network_enforcement.py: 84 warnings
+tests/security/test_process_limits.py: 977 warnings
+tests/security/test_pure_root_errno_contract.py: 2 warnings
+tests/security/test_quota_admission.py: 1915 warnings
+tests/security/test_real_root_denials.py: 128 warnings
+tests/security/test_real_root_mounts.py: 92 warnings
+tests/security/test_sandlock_isolation.py: 123 warnings
+tests/security/test_template_isolation.py: 202 warnings
+tests/security/test_traversal_and_ids.py: 8 warnings
+tests/security/test_uid_isolation.py: 10 warnings
+tests/security/test_worker_nonroot.py: 895 warnings
+tests/unit/test_agent_checkpoint_restore.py: 19 warnings
+tests/unit/test_agent_create_sandbox_auth.py: 26 warnings
+tests/unit/test_agent_pause_resume.py: 10 warnings
+tests/unit/test_autoscaler_local_backend_shape.py: 1 warning
+tests/unit/test_autoscaler_loop.py: 3 warnings
+tests/unit/test_autoscaler_policy.py: 2 warnings
+tests/unit/test_brief_stat.py: 2 warnings
+tests/unit/test_buildkit_mirrors.py: 1 warning
+tests/unit/test_checkpoint_restore_unused.py: 1 warning
+tests/unit/test_checkpoint_store.py: 2 warnings
+tests/unit/test_cleanup_plaintext_secrets.py: 1 warning
+tests/unit/test_control_plane_checkpoint_proxy.py: 14 warnings
+tests/unit/test_control_plane_network_local.py: 11 warnings
+tests/unit/test_control_plane_network_remote.py: 40 warnings
+tests/unit/test_cp_state_base.py: 1 warning
+tests/unit/test_create_queue.py: 5 warnings
+tests/unit/test_dir_ledger.py: 3 warnings
+tests/unit/test_env_file_permissions_guard.py: 15 warnings
+tests/unit/test_executor_append_and_tighten.py: 1 warning
+tests/unit/test_filesystem_ops.py: 1 warning
+tests/unit/test_gateway.py: 159 warnings
+tests/unit/test_image_cache_sharing.py: 326 warnings
+tests/unit/test_image_rootfs_cache_split.py: 1 warning
+tests/unit/test_k0s_secrets_script.py: 179 warnings
+tests/unit/test_local_oci_images.py: 4 warnings
+tests/unit/test_mcp_gateway.py: 28 warnings
+tests/unit/test_mcp_port_pool.py: 2 warnings
+tests/unit/test_memory_quota_contract_sizes.py: 3 warnings
+tests/unit/test_migrate_state_base_script.py: 76 warnings
+tests/unit/test_migrate_tenants.py: 1 warning
+tests/unit/test_migration_volume_quota.py: 13 warnings
+tests/unit/test_node_registry.py: 1 warning
+tests/unit/test_oci_registry.py: 141 warnings
+tests/unit/test_pause_quota.py: 2 warnings
+tests/unit/test_priv_helpers.py: 8 warnings
+tests/unit/test_process_capture_limit.py: 5 warnings
+tests/unit/test_process_command_lock.py: 9 warnings
+tests/unit/test_process_pause_fallback.py: 1 warning
+tests/unit/test_provision_local_uid.py: 1 warning
+tests/unit/test_pure_rootfs_config.py: 4 warnings
+tests/unit/test_pure_rootfs_shape.py: 3 warnings
+tests/unit/test_pushed_append_accounting.py: 2 warnings
+tests/unit/test_quota_agent_client.py: 1 warning
+tests/unit/test_quota_agent_server.py: 7 warnings
+tests/unit/test_quota_agent_startup_race.py: 155 warnings
+tests/unit/test_quota_maintenance.py: 21 warnings
+tests/unit/test_real_root_gate.py: 2 warnings
+tests/unit/test_record_namespace_isolation.py: 8 warnings
+tests/unit/test_redis_multireplica.py: 193 warnings
+tests/unit/test_remote_pause_delivery.py: 171 warnings
+tests/unit/test_rotate_secret_master_script.py: 312 warnings
+tests/unit/test_route_b_event_pump.py: 1 warning
+tests/unit/test_route_b_wiring.py: 14 warnings
+tests/unit/test_sandbox_registry.py: 32 warnings
+tests/unit/test_sandbox_writer.py: 10 warnings
+tests/unit/test_sandlock_executor_instance.py: 5 warnings
+tests/unit/test_sandlock_executor_route_b.py: 2 warnings
+tests/unit/test_secret_registry.py: 1 warning
+tests/unit/test_shared_volume_traversal.py: 7 warnings
+tests/unit/test_template_build.py: 3 warnings
+tests/unit/test_tenant_auth.py: 2 warnings
+tests/unit/test_uid_pool.py: 6 warnings
+tests/unit/test_upgrade_digest_validation.py: 12 warnings
+tests/unit/test_upgrade_quota_agent_profile.py: 7 warnings
+tests/unit/test_volume_quota.py: 6 warnings
+tests/unit/test_volume_registry.py: 10 warnings
+tests/unit/test_watch.py: 3 warnings
+tests/unit/test_worker_manifest_permissions.py: 2 warnings
+tests/unit/test_xfs_project_management.py: 2 warnings
+tests/unit/test_xfs_project_quota_agent.py: 13 warnings
+tests/unit/test_xfs_quotactl_backend.py: 108 warnings
+  /usr/local/lib/python3.14/asyncio/threads.py:26: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    return await loop.run_in_executor(None, func_call)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [2] tests/contract/test_mcp_gateway_keepalive.py:84: no base image configured (pure shape): nothing to inspect
+SKIPPED [1] tests/contract/test_nonroot_route_b.py:156: the route-B contract needs the sandlock wheel (with the supervise binary) and the image-rootfs shape (E2B_BASE_IMAGE)
+SKIPPED [1] tests/contract/test_nonroot_route_b.py:330: the route-B contract needs the sandlock wheel (with the supervise binary) and the image-rootfs shape (E2B_BASE_IMAGE)
+SKIPPED [1] tests/contract/test_nonroot_route_b.py:373: the route-B contract needs the sandlock wheel (with the supervise binary) and the image-rootfs shape (E2B_BASE_IMAGE)
+SKIPPED [1] tests/security/test_fork_network_features.py:370: requires E2B_BASE_IMAGE (image-rootfs sandboxes)
+SKIPPED [1] tests/security/test_template_isolation.py:45: no base image configured for template isolation test
+SKIPPED [1] tests/security/test_template_isolation.py:169: the unprivileged worker shape both production manifests ship
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_dir_ledger.py:282: root can read a 0000 directory
+SKIPPED [1] tests/unit/test_uid_pool.py:469: the non-root worker shape cannot be asserted as root
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:614: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:669: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:704: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:785: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:868: kubectl needed to render the kustomize overlay
+SKIPPED [1] ../Users/polus/project/ai/sandlock-e2b/tests/unit/test_worker_manifest_permissions.py:1390: kubectl needed to render the kustomize overlay
+2019 passed, 16 skipped, 12865 warnings in 474.63s (0:07:54)

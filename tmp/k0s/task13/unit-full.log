@@ -1,0 +1,654 @@
+........................................................................ [  4%]
+........................................................................ [  9%]
+........................................................................ [ 14%]
+........................................................................ [ 18%]
+s....................................................................... [ 23%]
+........................................................................ [ 28%]
+........................................................................ [ 32%]
+........................................................................ [ 37%]
+........................................................................ [ 42%]
+...........................FFFFFF......F....FFFF........................ [ 46%]
+........................................................................ [ 51%]
+........................................................................ [ 56%]
+...................F.................................................... [ 60%]
+........................................................................ [ 65%]
+........................................................................ [ 70%]
+......s................................................................. [ 74%]
+........................................................................ [ 79%]
+........................................................................ [ 84%]
+...ss...s.......s....................................ss.s............... [ 88%]
+........................................................................ [ 93%]
+........ss.............................................................. [ 98%]
+........................FF....                                           [100%]
+=================================== FAILURES ===================================
+________________ test_a_half_installed_broker_pair_fails_closed ________________
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_half_installed_broker_p0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10e8bf380>
+
+    def test_a_half_installed_broker_pair_fails_closed(
+        tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(os, "geteuid", lambda: 65534)
+>       helper_dir = _install(tmp_path, monkeypatch, binaries=("e2b-slot-spawn",))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_priv_helpers.py:445: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_half_installed_broker_p0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10e8bf380>
+binaries = ('e2b-slot-spawn',), caps = None, mode = 456, file_mode = 488
+
+    def _install(
+        tmp_path: Path,
+        monkeypatch,
+        *,
+        binaries: tuple[str, ...] = ("e2b-slot-spawn", "e2b-maint"),
+        caps: dict[str, int] | None = None,
+        mode: int = ph.HELPER_DIR_MODE,
+        file_mode: int = ph.HELPER_FILE_MODE,
+    ) -> Path:
+        """Fake broker files + a stubbed capability reader.
+    
+        The real ``security.capability`` xattr is exercised in the container lane
+        (``getcap``) and by :func:`test_file_capability_xattr_round_trips`; here
+        the reader is stubbed so the resolver's rules stay observable off-Linux.
+        """
+        helper_dir = tmp_path / "e2b-priv"
+        helper_dir.mkdir(mode=mode, exist_ok=True)
+        helper_dir.chmod(mode)
+>       os.chown(helper_dir, 0, os.getegid())
+E       PermissionError: [Errno 1] Operation not permitted: '/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_half_installed_broker_p0/e2b-priv'
+
+tests/unit/test_priv_helpers.py:95: PermissionError
+___________ test_a_helper_without_its_file_capabilities_fails_closed ___________
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_helper_without_its_file0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10efcc910>
+
+    def test_a_helper_without_its_file_capabilities_fails_closed(
+        tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(os, "geteuid", lambda: 65534)
+>       helper_dir = _install(
+            tmp_path,
+            monkeypatch,
+            caps={"e2b-slot-spawn": 0, "e2b-maint": ph.CAP_CHOWN_MASK},
+        )
+
+tests/unit/test_priv_helpers.py:460: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_helper_without_its_file0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10efcc910>
+binaries = ('e2b-slot-spawn', 'e2b-maint')
+caps = {'e2b-slot-spawn': 0, 'e2b-maint': 1}, mode = 456, file_mode = 488
+
+    def _install(
+        tmp_path: Path,
+        monkeypatch,
+        *,
+        binaries: tuple[str, ...] = ("e2b-slot-spawn", "e2b-maint"),
+        caps: dict[str, int] | None = None,
+        mode: int = ph.HELPER_DIR_MODE,
+        file_mode: int = ph.HELPER_FILE_MODE,
+    ) -> Path:
+        """Fake broker files + a stubbed capability reader.
+    
+        The real ``security.capability`` xattr is exercised in the container lane
+        (``getcap``) and by :func:`test_file_capability_xattr_round_trips`; here
+        the reader is stubbed so the resolver's rules stay observable off-Linux.
+        """
+        helper_dir = tmp_path / "e2b-priv"
+        helper_dir.mkdir(mode=mode, exist_ok=True)
+        helper_dir.chmod(mode)
+>       os.chown(helper_dir, 0, os.getegid())
+E       PermissionError: [Errno 1] Operation not permitted: '/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_helper_without_its_file0/e2b-priv'
+
+tests/unit/test_priv_helpers.py:95: PermissionError
+____________ test_a_sandbox_reachable_helper_directory_fails_closed ____________
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_sandbox_reachable_helpe0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10c6311d0>
+
+    def test_a_sandbox_reachable_helper_directory_fails_closed(
+        tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(os, "geteuid", lambda: 65534)
+>       helper_dir = _install(tmp_path, monkeypatch, mode=0o755)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_priv_helpers.py:480: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_sandbox_reachable_helpe0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10c6311d0>
+binaries = ('e2b-slot-spawn', 'e2b-maint'), caps = None, mode = 493
+file_mode = 488
+
+    def _install(
+        tmp_path: Path,
+        monkeypatch,
+        *,
+        binaries: tuple[str, ...] = ("e2b-slot-spawn", "e2b-maint"),
+        caps: dict[str, int] | None = None,
+        mode: int = ph.HELPER_DIR_MODE,
+        file_mode: int = ph.HELPER_FILE_MODE,
+    ) -> Path:
+        """Fake broker files + a stubbed capability reader.
+    
+        The real ``security.capability`` xattr is exercised in the container lane
+        (``getcap``) and by :func:`test_file_capability_xattr_round_trips`; here
+        the reader is stubbed so the resolver's rules stay observable off-Linux.
+        """
+        helper_dir = tmp_path / "e2b-priv"
+        helper_dir.mkdir(mode=mode, exist_ok=True)
+        helper_dir.chmod(mode)
+>       os.chown(helper_dir, 0, os.getegid())
+E       PermissionError: [Errno 1] Operation not permitted: '/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_sandbox_reachable_helpe0/e2b-priv'
+
+tests/unit/test_priv_helpers.py:95: PermissionError
+___________ test_a_worker_inaccessible_broker_directory_fails_closed ___________
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_worker_inaccessible_bro0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10dcf9f60>
+
+    def test_a_worker_inaccessible_broker_directory_fails_closed(
+        tmp_path: Path, monkeypatch
+    ) -> None:
+        """A root-owned 0700 directory is *not* the answer: the worker cannot
+        traverse it either, so the brokers become dead weight."""
+        monkeypatch.setattr(os, "geteuid", lambda: 65534)
+>       helper_dir = _install(tmp_path, monkeypatch, mode=0o700)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_priv_helpers.py:497: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_worker_inaccessible_bro0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10dcf9f60>
+binaries = ('e2b-slot-spawn', 'e2b-maint'), caps = None, mode = 448
+file_mode = 488
+
+    def _install(
+        tmp_path: Path,
+        monkeypatch,
+        *,
+        binaries: tuple[str, ...] = ("e2b-slot-spawn", "e2b-maint"),
+        caps: dict[str, int] | None = None,
+        mode: int = ph.HELPER_DIR_MODE,
+        file_mode: int = ph.HELPER_FILE_MODE,
+    ) -> Path:
+        """Fake broker files + a stubbed capability reader.
+    
+        The real ``security.capability`` xattr is exercised in the container lane
+        (``getcap``) and by :func:`test_file_capability_xattr_round_trips`; here
+        the reader is stubbed so the resolver's rules stay observable off-Linux.
+        """
+        helper_dir = tmp_path / "e2b-priv"
+        helper_dir.mkdir(mode=mode, exist_ok=True)
+        helper_dir.chmod(mode)
+>       os.chown(helper_dir, 0, os.getegid())
+E       PermissionError: [Errno 1] Operation not permitted: '/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_worker_inaccessible_bro0/e2b-priv'
+
+tests/unit/test_priv_helpers.py:95: PermissionError
+___________ test_a_root_worker_keeps_the_unprivileged_brokers_unused ___________
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_root_worker_keeps_the_u0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10efcce50>
+
+    def test_a_root_worker_keeps_the_unprivileged_brokers_unused(
+        tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+>       _install(tmp_path, monkeypatch)
+
+tests/unit/test_priv_helpers.py:512: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_root_worker_keeps_the_u0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10efcce50>
+binaries = ('e2b-slot-spawn', 'e2b-maint'), caps = None, mode = 456
+file_mode = 488
+
+    def _install(
+        tmp_path: Path,
+        monkeypatch,
+        *,
+        binaries: tuple[str, ...] = ("e2b-slot-spawn", "e2b-maint"),
+        caps: dict[str, int] | None = None,
+        mode: int = ph.HELPER_DIR_MODE,
+        file_mode: int = ph.HELPER_FILE_MODE,
+    ) -> Path:
+        """Fake broker files + a stubbed capability reader.
+    
+        The real ``security.capability`` xattr is exercised in the container lane
+        (``getcap``) and by :func:`test_file_capability_xattr_round_trips`; here
+        the reader is stubbed so the resolver's rules stay observable off-Linux.
+        """
+        helper_dir = tmp_path / "e2b-priv"
+        helper_dir.mkdir(mode=mode, exist_ok=True)
+        helper_dir.chmod(mode)
+>       os.chown(helper_dir, 0, os.getegid())
+E       PermissionError: [Errno 1] Operation not permitted: '/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_root_worker_keeps_the_u0/e2b-priv'
+
+tests/unit/test_priv_helpers.py:95: PermissionError
+__________________ test_off_keeps_todays_in_process_behavior ___________________
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_off_keeps_todays_in_proce0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10f03cec0>
+
+    def test_off_keeps_todays_in_process_behavior(tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(os, "geteuid", lambda: 65534)
+>       _install(tmp_path, monkeypatch)
+
+tests/unit/test_priv_helpers.py:518: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_off_keeps_todays_in_proce0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10f03cec0>
+binaries = ('e2b-slot-spawn', 'e2b-maint'), caps = None, mode = 456
+file_mode = 488
+
+    def _install(
+        tmp_path: Path,
+        monkeypatch,
+        *,
+        binaries: tuple[str, ...] = ("e2b-slot-spawn", "e2b-maint"),
+        caps: dict[str, int] | None = None,
+        mode: int = ph.HELPER_DIR_MODE,
+        file_mode: int = ph.HELPER_FILE_MODE,
+    ) -> Path:
+        """Fake broker files + a stubbed capability reader.
+    
+        The real ``security.capability`` xattr is exercised in the container lane
+        (``getcap``) and by :func:`test_file_capability_xattr_round_trips`; here
+        the reader is stubbed so the resolver's rules stay observable off-Linux.
+        """
+        helper_dir = tmp_path / "e2b-priv"
+        helper_dir.mkdir(mode=mode, exist_ok=True)
+        helper_dir.chmod(mode)
+>       os.chown(helper_dir, 0, os.getegid())
+E       PermissionError: [Errno 1] Operation not permitted: '/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_off_keeps_todays_in_proce0/e2b-priv'
+
+tests/unit/test_priv_helpers.py:95: PermissionError
+_____________ test_the_resolver_applies_the_worker_identity_guard ______________
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_the_resolver_applies_the_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10d065b70>
+
+    def test_the_resolver_applies_the_worker_identity_guard(
+        tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(os, "geteuid", lambda: 10005)
+        monkeypatch.setattr(os, "getegid", lambda: 10005)
+>       _install(tmp_path, monkeypatch)
+
+tests/unit/test_priv_helpers.py:581: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_the_resolver_applies_the_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10d065b70>
+binaries = ('e2b-slot-spawn', 'e2b-maint'), caps = None, mode = 456
+file_mode = 488
+
+    def _install(
+        tmp_path: Path,
+        monkeypatch,
+        *,
+        binaries: tuple[str, ...] = ("e2b-slot-spawn", "e2b-maint"),
+        caps: dict[str, int] | None = None,
+        mode: int = ph.HELPER_DIR_MODE,
+        file_mode: int = ph.HELPER_FILE_MODE,
+    ) -> Path:
+        """Fake broker files + a stubbed capability reader.
+    
+        The real ``security.capability`` xattr is exercised in the container lane
+        (``getcap``) and by :func:`test_file_capability_xattr_round_trips`; here
+        the reader is stubbed so the resolver's rules stay observable off-Linux.
+        """
+        helper_dir = tmp_path / "e2b-priv"
+        helper_dir.mkdir(mode=mode, exist_ok=True)
+        helper_dir.chmod(mode)
+>       os.chown(helper_dir, 0, os.getegid())
+E       PermissionError: [Errno 1] Operation not permitted: '/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_the_resolver_applies_the_0/e2b-priv'
+
+tests/unit/test_priv_helpers.py:95: PermissionError
+__________________ test_the_broker_shape_requires_pooled_uids __________________
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_the_broker_shape_requires0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10efcfcb0>
+
+    def test_the_broker_shape_requires_pooled_uids(tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(os, "geteuid", lambda: 65534)
+>       _install(tmp_path, monkeypatch)
+
+tests/unit/test_priv_helpers.py:709: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_the_broker_shape_requires0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10efcfcb0>
+binaries = ('e2b-slot-spawn', 'e2b-maint'), caps = None, mode = 456
+file_mode = 488
+
+    def _install(
+        tmp_path: Path,
+        monkeypatch,
+        *,
+        binaries: tuple[str, ...] = ("e2b-slot-spawn", "e2b-maint"),
+        caps: dict[str, int] | None = None,
+        mode: int = ph.HELPER_DIR_MODE,
+        file_mode: int = ph.HELPER_FILE_MODE,
+    ) -> Path:
+        """Fake broker files + a stubbed capability reader.
+    
+        The real ``security.capability`` xattr is exercised in the container lane
+        (``getcap``) and by :func:`test_file_capability_xattr_round_trips`; here
+        the reader is stubbed so the resolver's rules stay observable off-Linux.
+        """
+        helper_dir = tmp_path / "e2b-priv"
+        helper_dir.mkdir(mode=mode, exist_ok=True)
+        helper_dir.chmod(mode)
+>       os.chown(helper_dir, 0, os.getegid())
+E       PermissionError: [Errno 1] Operation not permitted: '/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_the_broker_shape_requires0/e2b-priv'
+
+tests/unit/test_priv_helpers.py:95: PermissionError
+____________________ test_the_broker_shape_requires_route_b ____________________
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_the_broker_shape_requires1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10f03ee40>
+
+    def test_the_broker_shape_requires_route_b(tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(os, "geteuid", lambda: 65534)
+>       _install(tmp_path, monkeypatch)
+
+tests/unit/test_priv_helpers.py:723: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_the_broker_shape_requires1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10f03ee40>
+binaries = ('e2b-slot-spawn', 'e2b-maint'), caps = None, mode = 456
+file_mode = 488
+
+    def _install(
+        tmp_path: Path,
+        monkeypatch,
+        *,
+        binaries: tuple[str, ...] = ("e2b-slot-spawn", "e2b-maint"),
+        caps: dict[str, int] | None = None,
+        mode: int = ph.HELPER_DIR_MODE,
+        file_mode: int = ph.HELPER_FILE_MODE,
+    ) -> Path:
+        """Fake broker files + a stubbed capability reader.
+    
+        The real ``security.capability`` xattr is exercised in the container lane
+        (``getcap``) and by :func:`test_file_capability_xattr_round_trips`; here
+        the reader is stubbed so the resolver's rules stay observable off-Linux.
+        """
+        helper_dir = tmp_path / "e2b-priv"
+        helper_dir.mkdir(mode=mode, exist_ok=True)
+        helper_dir.chmod(mode)
+>       os.chown(helper_dir, 0, os.getegid())
+E       PermissionError: [Errno 1] Operation not permitted: '/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_the_broker_shape_requires1/e2b-priv'
+
+tests/unit/test_priv_helpers.py:95: PermissionError
+__ test_the_route_b_scratch_root_must_be_reachable_by_the_maintenance_broker ___
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_the_route_b_scratch_root_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10d0652b0>
+
+    def test_the_route_b_scratch_root_must_be_reachable_by_the_maintenance_broker(
+        tmp_path: Path, monkeypatch
+    ) -> None:
+        """The slot's policy/program documents are group-scoped to the slot uid
+        through ``e2b-maint`` (0440 root:<uid>), and the broker only touches paths
+        under its whitelist roots. A scratch root outside them would leave the
+        policy -- which carries egress-proxy credentials -- world-readable, so the
+        broker shape refuses it by name instead of shipping the leak."""
+        monkeypatch.setattr(os, "geteuid", lambda: 65534)
+        # N27: the expectation below spells out the whole whitelist, so the
+        # ambient environment must not be the one that names a state base.
+        monkeypatch.delenv("E2B_STATE_BASE", raising=False)
+>       _install(tmp_path, monkeypatch)
+
+tests/unit/test_priv_helpers.py:746: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_the_route_b_scratch_root_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10d0652b0>
+binaries = ('e2b-slot-spawn', 'e2b-maint'), caps = None, mode = 456
+file_mode = 488
+
+    def _install(
+        tmp_path: Path,
+        monkeypatch,
+        *,
+        binaries: tuple[str, ...] = ("e2b-slot-spawn", "e2b-maint"),
+        caps: dict[str, int] | None = None,
+        mode: int = ph.HELPER_DIR_MODE,
+        file_mode: int = ph.HELPER_FILE_MODE,
+    ) -> Path:
+        """Fake broker files + a stubbed capability reader.
+    
+        The real ``security.capability`` xattr is exercised in the container lane
+        (``getcap``) and by :func:`test_file_capability_xattr_round_trips`; here
+        the reader is stubbed so the resolver's rules stay observable off-Linux.
+        """
+        helper_dir = tmp_path / "e2b-priv"
+        helper_dir.mkdir(mode=mode, exist_ok=True)
+        helper_dir.chmod(mode)
+>       os.chown(helper_dir, 0, os.getegid())
+E       PermissionError: [Errno 1] Operation not permitted: '/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_the_route_b_scratch_root_0/e2b-priv'
+
+tests/unit/test_priv_helpers.py:95: PermissionError
+_____________________ test_a_complete_broker_pair_resolves _____________________
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_complete_broker_pair_re0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10df83bd0>
+
+    def test_a_complete_broker_pair_resolves(tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(os, "geteuid", lambda: 65534)
+>       helper_dir = _install(tmp_path, monkeypatch)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_priv_helpers.py:761: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_complete_broker_pair_re0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10df83bd0>
+binaries = ('e2b-slot-spawn', 'e2b-maint'), caps = None, mode = 456
+file_mode = 488
+
+    def _install(
+        tmp_path: Path,
+        monkeypatch,
+        *,
+        binaries: tuple[str, ...] = ("e2b-slot-spawn", "e2b-maint"),
+        caps: dict[str, int] | None = None,
+        mode: int = ph.HELPER_DIR_MODE,
+        file_mode: int = ph.HELPER_FILE_MODE,
+    ) -> Path:
+        """Fake broker files + a stubbed capability reader.
+    
+        The real ``security.capability`` xattr is exercised in the container lane
+        (``getcap``) and by :func:`test_file_capability_xattr_round_trips`; here
+        the reader is stubbed so the resolver's rules stay observable off-Linux.
+        """
+        helper_dir = tmp_path / "e2b-priv"
+        helper_dir.mkdir(mode=mode, exist_ok=True)
+        helper_dir.chmod(mode)
+>       os.chown(helper_dir, 0, os.getegid())
+E       PermissionError: [Errno 1] Operation not permitted: '/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_a_complete_broker_pair_re0/e2b-priv'
+
+tests/unit/test_priv_helpers.py:95: PermissionError
+_________ test_the_probe_asks_for_the_pivot_root_this_architecture_has _________
+
+>   ???
+
+/workspace/tests/unit/test_real_root_gate.py:180: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+nr = 155
+
+>   ???
+E   AssertionError: Traceback (most recent call last):
+E       File "<string>", line 3, in <module>
+E         libc = ctypes.CDLL("libc.so.6", use_errno=True)
+E       File "/usr/local/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/ctypes/__init__.py", line 433, in __init__
+E         self._handle = self._load_library(name, mode, handle, winmode)
+E                        ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       File "/usr/local/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/ctypes/__init__.py", line 475, in _load_library
+E         return _dlopen(name, mode)
+E     OSError: dlopen(libc.so.6, 0x0006): tried: 'libc.so.6' (no such file), '/System/Volumes/Preboot/Cryptexes/OSlibc.so.6' (no such file), '/usr/local/lib/libc.so.6' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/usr/local/lib/libc.so.6' (no such file), '/usr/local/lib/libc.so.6' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/usr/local/lib/libc.so.6' (no such file), '/usr/lib/libc.so.6' (no such file, not in dyld cache), 'libc.so.6' (no such file)
+E     
+E   assert 1 == 0
+E    +  where 1 = CompletedProcess(args=['/Users/polus/project/ai/sandlock-e2b/tmp/testenv/bin/python', '-c', '\nimport ctypes, json, pl.../libc.so.6\' (no such file), \'/usr/lib/libc.so.6\' (no such file, not in dyld cache), \'libc.so.6\' (no such file)\n').returncode
+
+/workspace/tests/unit/test_real_root_gate.py:162: AssertionError
+___________________ test_probe_reports_unsupported_on_einval ___________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10e3c44b0>
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_probe_reports_unsupported0')
+
+>   ???
+
+/workspace/tests/unit/test_xfs_quotactl_backend.py:342: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+envd_service/xfs_quotactl.py:583: in projid32bit
+    result = _probe_projid32bit(mount_point)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+envd_service/xfs_quotactl.py:610: in _probe_projid32bit
+    clear_projid(scratch)
+envd_service/xfs_quotactl.py:447: in clear_projid
+    words = _fsxattr(fd)
+            ^^^^^^^^^^^^
+envd_service/xfs_quotactl.py:381: in _fsxattr
+    libc = _libc()
+           ^^^^^^^
+envd_service/xfs_quotactl.py:139: in _libc
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/ctypes/__init__.py:433: in __init__
+    self._handle = self._load_library(name, mode, handle, winmode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <CDLL 'libc.so.6', handle 0 at 0x10da54550>, name = 'libc.so.6', mode = 4
+handle = None, winmode = None
+
+    def _load_library(self, name, mode, handle, winmode):
+        # If the filename that has been provided is an iOS/tvOS/watchOS
+        # .fwork file, dereference the location to the true origin of the
+        # binary.
+        if name and name.endswith(".fwork"):
+            with open(name) as f:
+                name = _os.path.join(
+                    _os.path.dirname(_sys.executable),
+                    f.read().strip()
+                )
+        if _sys.platform.startswith("aix"):
+            """When the name contains ".a(" and ends with ")",
+               e.g., "libFOO.a(libFOO.so)" - this is taken to be an
+               archive(member) syntax for dlopen(), and the mode is adjusted.
+               Otherwise, name is presented to dlopen() as a file argument.
+            """
+            if name and name.endswith(")") and ".a(" in name:
+                mode |= _os.RTLD_MEMBER | _os.RTLD_NOW
+        self._name = name
+        if handle is not None:
+            return handle
+>       return _dlopen(name, mode)
+               ^^^^^^^^^^^^^^^^^^^
+E       OSError: dlopen(libc.so.6, 0x0006): tried: 'libc.so.6' (no such file), '/System/Volumes/Preboot/Cryptexes/OSlibc.so.6' (no such file), '/usr/local/lib/libc.so.6' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/usr/local/lib/libc.so.6' (no such file), '/usr/local/lib/libc.so.6' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/usr/local/lib/libc.so.6' (no such file), '/usr/lib/libc.so.6' (no such file, not in dyld cache), 'libc.so.6' (no such file)
+
+/usr/local/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/ctypes/__init__.py:475: OSError
+__________________ test_probe_reports_unknown_on_other_errors __________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10f4a32a0>
+tmp_path = PosixPath('/private/var/folders/47/n2tyc1k55cz212pm_6rr6m4w0000gn/T/pytest-of-polus/pytest-1898/test_probe_reports_unknown_on_0')
+
+>   ???
+
+/workspace/tests/unit/test_xfs_quotactl_backend.py:352: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+envd_service/xfs_quotactl.py:583: in projid32bit
+    result = _probe_projid32bit(mount_point)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+envd_service/xfs_quotactl.py:610: in _probe_projid32bit
+    clear_projid(scratch)
+envd_service/xfs_quotactl.py:447: in clear_projid
+    words = _fsxattr(fd)
+            ^^^^^^^^^^^^
+envd_service/xfs_quotactl.py:381: in _fsxattr
+    libc = _libc()
+           ^^^^^^^
+envd_service/xfs_quotactl.py:139: in _libc
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/ctypes/__init__.py:433: in __init__
+    self._handle = self._load_library(name, mode, handle, winmode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <CDLL 'libc.so.6', handle 0 at 0x10ef03850>, name = 'libc.so.6', mode = 4
+handle = None, winmode = None
+
+    def _load_library(self, name, mode, handle, winmode):
+        # If the filename that has been provided is an iOS/tvOS/watchOS
+        # .fwork file, dereference the location to the true origin of the
+        # binary.
+        if name and name.endswith(".fwork"):
+            with open(name) as f:
+                name = _os.path.join(
+                    _os.path.dirname(_sys.executable),
+                    f.read().strip()
+                )
+        if _sys.platform.startswith("aix"):
+            """When the name contains ".a(" and ends with ")",
+               e.g., "libFOO.a(libFOO.so)" - this is taken to be an
+               archive(member) syntax for dlopen(), and the mode is adjusted.
+               Otherwise, name is presented to dlopen() as a file argument.
+            """
+            if name and name.endswith(")") and ".a(" in name:
+                mode |= _os.RTLD_MEMBER | _os.RTLD_NOW
+        self._name = name
+        if handle is not None:
+            return handle
+>       return _dlopen(name, mode)
+               ^^^^^^^^^^^^^^^^^^^
+E       OSError: dlopen(libc.so.6, 0x0006): tried: 'libc.so.6' (no such file), '/System/Volumes/Preboot/Cryptexes/OSlibc.so.6' (no such file), '/usr/local/lib/libc.so.6' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/usr/local/lib/libc.so.6' (no such file), '/usr/local/lib/libc.so.6' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/usr/local/lib/libc.so.6' (no such file), '/usr/lib/libc.so.6' (no such file, not in dyld cache), 'libc.so.6' (no such file)
+
+/usr/local/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/ctypes/__init__.py:475: OSError
+=============================== warnings summary ===============================
+tests/unit/test_remote_pause_delivery.py::test_pause_rollback_skips_record_deleted_while_push_in_flight
+tests/unit/test_remote_pause_delivery.py::test_resume_rollback_skips_record_deleted_while_push_in_flight
+  /usr/local/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/asyncio/threads.py:26: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    return await loop.run_in_executor(None, func_call)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] ../../../../../workspace/tests/unit/test_executor_policy.py:29: native sandlock module unavailable off-Linux
+SKIPPED [1] ../../../../../workspace/tests/unit/test_sandbox_writer.py:399: os.setxattr is Linux-only, and so is the worker (E5.1)
+SKIPPED [1] ../../../../../workspace/tests/unit/test_uid_pool.py:217: chown requires root
+SKIPPED [1] ../../../../../workspace/tests/unit/test_uid_pool.py:231: chown requires root
+SKIPPED [1] ../../../../../workspace/tests/unit/test_uid_pool.py:293: chown requires root
+SKIPPED [1] ../../../../../workspace/tests/unit/test_uid_pool.py:500: the root worker shape needs privilege
+SKIPPED [3] ../../../../../workspace/tests/unit/test_volume_quota.py:197: E3.2 ownership assertions require root (Docker runner)
+SKIPPED [1] ../../../../../workspace/tests/unit/test_workspace_ownership.py:71: chown requires root
+SKIPPED [1] ../../../../../workspace/tests/unit/test_workspace_ownership.py:89: chown requires root
+FAILED tests/unit/test_priv_helpers.py::test_a_half_installed_broker_pair_fails_closed
+FAILED tests/unit/test_priv_helpers.py::test_a_helper_without_its_file_capabilities_fails_closed
+FAILED tests/unit/test_priv_helpers.py::test_a_sandbox_reachable_helper_directory_fails_closed
+FAILED tests/unit/test_priv_helpers.py::test_a_worker_inaccessible_broker_directory_fails_closed
+FAILED tests/unit/test_priv_helpers.py::test_a_root_worker_keeps_the_unprivileged_brokers_unused
+FAILED tests/unit/test_priv_helpers.py::test_off_keeps_todays_in_process_behavior
+FAILED tests/unit/test_priv_helpers.py::test_the_resolver_applies_the_worker_identity_guard
+FAILED tests/unit/test_priv_helpers.py::test_the_broker_shape_requires_pooled_uids
+FAILED tests/unit/test_priv_helpers.py::test_the_broker_shape_requires_route_b
+FAILED tests/unit/test_priv_helpers.py::test_the_route_b_scratch_root_must_be_reachable_by_the_maintenance_broker
+FAILED tests/unit/test_priv_helpers.py::test_a_complete_broker_pair_resolves
+FAILED tests/unit/test_real_root_gate.py::test_the_probe_asks_for_the_pivot_root_this_architecture_has
+FAILED tests/unit/test_xfs_quotactl_backend.py::test_probe_reports_unsupported_on_einval
+FAILED tests/unit/test_xfs_quotactl_backend.py::test_probe_reports_unknown_on_other_errors
+14 failed, 1517 passed, 11 skipped, 2 warnings in 102.92s (0:01:42)

@@ -1,0 +1,18 @@
+# Task 13 preflight (2026-09-26T12:46:41Z)
+repo HEAD 423a81d90122b0a2a32d310524357675390bd5c8
+fork tip 290761e4432103eeda882d80c34f3993ee303dd6
+-- dirty (working tree) --
+ M .superpowers/sdd/progress.md
+ M envd_service/agent.py
+ M envd_service/runtime/checkpoint_store.py
+ M tests/contract/test_orphan_tree_gc.py
+ M tests/unit/test_checkpoint_store.py
+ M tests/unit/test_quota_maintenance.py
+-- diffstat --
+ .superpowers/sdd/progress.md             |  90 ++++++++++++++++++
+ envd_service/agent.py                    |  90 ++++++++++++++++--
+ envd_service/runtime/checkpoint_store.py | 148 +++++++++++++++++++++++++++++-
+ tests/contract/test_orphan_tree_gc.py    |  35 ++++++-
+ tests/unit/test_checkpoint_store.py      |  78 ++++++++++++++++
+ tests/unit/test_quota_maintenance.py     | 152 +++++++++++++++++++++++++++++++
+ 6 files changed, 579 insertions(+), 14 deletions(-)

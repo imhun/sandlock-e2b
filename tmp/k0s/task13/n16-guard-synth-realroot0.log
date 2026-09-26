@@ -1,0 +1,12 @@
+# Task 13: the brief's third band (synth + E2B_REAL_ROOT=0) as the worker sees it
+# image: e2b-sandlock-test:task12cur; command: python3 -c 'from envd_service.app import create_app; create_app()'
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    from envd_service.app import create_app; create_app()
+                                             ~~~~~~~~~~^^
+  File "/workspace/envd_service/app.py", line 242, in create_app
+    check_pure_rootfs_pairing(settings)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/workspace/envd_service/config.py", line 806, in check_pure_rootfs_pairing
+    raise RuntimeError(PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR)
+RuntimeError: E2B_PURE_ROOTFS=synth without E2B_REAL_ROOT=1: the synthesized root is an empty skeleton, and only the real root (a mount namespace it binds into) puts the host system directories, the workspace and the volumes inside it. With the emulated root every path resolves inside that skeleton, so the sandbox's own /bin/sh does not exist: the create dies with errno 13 and every later command answers `instance is closed`. Set E2B_REAL_ROOT=1 so the skeleton gets its binds, or leave E2B_PURE_ROOTFS unset to keep the pure shape on N15's identity root.

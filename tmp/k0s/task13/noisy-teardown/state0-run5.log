@@ -1,0 +1,3 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+..                                                                       [100%]
+2 passed, 33 deselected in 0.11s
