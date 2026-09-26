@@ -1694,6 +1694,9 @@ worker 走的是 **agent 形态**（`E2B_QUOTA_AGENT_URL` 是开关，`.env` 里
    `_images/**/rootfs/.complete` 仍在、不再重新解压；root（控制面）与 65534（worker）
    都能解析并写入同一条目；`du -s --block-size=1` 不超（显式设置的）上限且与 GC 报的
    `total_bytes` 相等（**不是** `du -sb`）；`image-cache-init` 报的属主是 `65534`。
+9. 共享存储形态（§5）：**换 NAS / 换挂载参数 / 换存储类型之后**按 §5.4.1 复核一遍
+   （PV 的 `mountOptions`、跨节点锁互斥、(b) 的 worker 身份与池 uid 树）；§5.3 那几项
+   NFS 专项在真实生产 NFS 上另跑 `deploy/scripts/nfs_quota_probe.sh`。
 
 ## 5. NFS 共享存储形态（E6.4 实测结论与部署要求）
 
@@ -1774,3 +1777,92 @@ worker 走的是 **agent 形态**（`E2B_QUOTA_AGENT_URL` 是开关，`.env` 里
 **(a) 存储选型门槛（硬，N13/F5）：多副本 worker 共用一份 `E2B_WORKSPACE_BASE` 时，`<base>/.uid_pool.lock` 上的 `flock` 必须跨节点互斥。** 否则两个副本会各自把同一个 uid 发给不同沙箱，E3.2 的每沙箱 uid 隔离会在无人察觉的情况下失效——这不是"降级"，是**静默失效**。本集群实测（`deploy/k8s-k0s/storage-nas.yaml:18-24`）：**只有 NFSv4.0 成立**；`NFSv3 + 服务端锁` 在这台 NAS 的客户端上直接 `ESTALE`；`NFSv3 + nolock` 的锁**只是本机锁**（同机互斥、跨机不互斥）。跨节点**没有 CAS 原语**，因此任何分布式单飞（uid 分配、TTL 扫描、快照拷贝认领、限流窗口）只能实现为"**锁 + 记录**"，不能依赖 `O_EXCL` 之类的原子性假设。各节点的挂载选项（`vers`、`nolock`、`sec`）**必须一致**；**换 NAS 或换挂载参数时必须随部署复核这一条**。它同时是 `replicas ≥ 2` 的前置条件——不是可选优化。
 
 **(b) 基线约束（F4）：非 root worker 只适用于节点本地盘。** 当 workspace/volume 落在**网络文件系统**（NFS/CephFS/…）上时，worker 必须 `runAsUser: 0` 且 `runAsGroup = <worker gid>`（本集群为 `0:65534`）。原因：route B/c1 建箱时要把沙箱树交给池里的 uid（`0770 owner=<sandbox uid> group=<worker gid>`，E3.2），这一步由带 `cap_chown` 的 broker（`e2b-maint`）执行，而 **`CAP_CHOWN` 不过网**——NFS 服务端只读 AUTH_SYS 凭据里的 uid，不看你客户端的能力；实测（`deploy/k8s-k0s/worker-root.patch.yaml:1-26`）：uid 65534 的 broker 做 `chown 10000:65534` **EPERM**，同一挂载上 root 做同样 chown 成功。并且必须**保留 worker 的 gid** 作为属组，否则 worker 进不了 `0770 group=<worker gid>` 的沙箱树（这台 NAS 对 uid 0 也不给越权读别的 uid 的 `0600` 文件）。安全代价是 worker 成为**可信中介**（沙箱仍跑在自己的池 uid 下，隔离模型不变），前提是导出允许 root 访问（`no_root_squash`）。该约束已由单测钉住（`tests/unit/test_worker_manifest_permissions.py:665-666`：对渲染出的 worker 容器精确断言 `securityContext.runAsUser == 0`、`runAsGroup == 65534`），因此**基线的 `deploy/k8s/worker.yaml` 在改用网络存储时必须同步这一设置**，不能沿用默认的非 root 形态；托管集群若用块存储/节点本地盘，可以保持非 root。**复核时机**：换共享存储类型（本地盘 ↔ 网络文件系统）、换导出权限（`no_root_squash` 变化）时必须回来核这一条。
+
+#### 5.4.1 怎么复核才算过（换 NAS / 换挂载参数 / 换存储类型时跑一遍）
+
+(a)(b) 都是**门槛**，所以复核必须给出**通过 / 不通过**，不能停在"看一眼觉得没问题"。
+下面三步都是**只读**的；唯一的副作用是第 2 步会按需创建那个本来就会被创建的锁文件
+（`0600`，跑完没有多余状态）。
+
+**第 0 步：先认集群**（本机默认 `kubectl` 指向另一套 ACK 集群，敲错就是打别人的生产负载；
+连接方式与自检见 `docs/deploy-clusters.md` §0–§3）：
+
+```bash
+cd <仓库根>
+deploy/scripts/open-cluster-tunnel.sh          # 建通道 + 断言集群身份；连错会非零退出
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"    # 之后每条 kubectl 都必须带这个变量
+kubectl -n sandlock get pod e2b-worker-0 e2b-worker-1 -o wide
+```
+
+**第 1 步：挂载参数里不许有 v3 / `nolock`**（锁语义由它决定，见 §5.1）：
+
+```bash
+kubectl get pv sandlock-shared-nas -o jsonpath='{.spec.mountOptions}'; echo
+# 通过：含 vers=4.0 且不含 nolock（本集群：vers=4.0 proto=tcp hard timeo=600
+#       retrans=2 noresvport rsize=1048576 wsize=1048576）
+```
+
+**第 2 步：§5.4(a) 的判据 —— 两个节点抢同一把锁，第二个必须失败。**
+锁路径 = `uid_pool.lock_path` = `<E2B_STATE_BASE>/.uid_pool.lock`（本集群
+`/var/lib/e2b-sandboxes/state/.uid_pool.lock`；`E2B_STATE_BASE` 见 `deploy/k8s/worker.yaml` 的 N27 段）：
+
+```bash
+# 前提：两个 worker 落在**不同 NODE** 上（第 0 步的 -o wide 已看过）——同机时这条测不出跨节点
+kubectl -n sandlock exec e2b-worker-0 -- flock /var/lib/e2b-sandboxes/state/.uid_pool.lock -c 'sleep 20' &
+sleep 3
+kubectl -n sandlock exec e2b-worker-1 -- flock -n /var/lib/e2b-sandboxes/state/.uid_pool.lock -c true; echo "exit=$?"
+wait
+```
+
+- **通过**：`exit=1`（非零）—— `.94` 持锁时 `.140` 抢锁被挡（2026-09-17 实测）；同一测法下
+  `.140` 那份 v3+`nolock` 的参数锁"正常"却**跨机不互斥** ⇒ 第二个 `flock -n` 会拿到锁、`exit=0`。
+- **不通过**：`exit=0` ⇒ 跨节点锁不成立，**多副本形态直接不可用**（不是降级）：两个副本会各自把
+  同一个 uid 发给不同沙箱，E3.2 的每沙箱 uid 隔离**静默失效**。立即停手：回单副本，或换回
+  NFSv4.0 再按本条复跑（前置清单见 `docs/k8s-deployment.md` §13.3）。
+- **其它非零 / 报错同样算不通过**，别当"命令写错了"放过：`EPROTONOSUPPORT`、`ESTALE`
+  （v3 服务端锁）、`Permission denied`（连锁文件都打不开 ⇒ (b) 已被违反：文件属主不是
+  worker 的 uid）都是同一格的现场证据。
+
+```bash
+# 镜像里没有 flock(1) 时的等价写法（同一种 BSD 锁 fcntl.flock，与 uid_pool 的取锁逐字同源）
+kubectl -n sandlock exec e2b-worker-0 -- python3 -c 'import fcntl,time;fd=open("/var/lib/e2b-sandboxes/state/.uid_pool.lock","r+b");fcntl.flock(fd,fcntl.LOCK_EX);print("held",flush=True);time.sleep(20)' &
+sleep 3
+kubectl -n sandlock exec e2b-worker-1 -- python3 -c 'import fcntl,sys;fd=open("/var/lib/e2b-sandboxes/state/.uid_pool.lock","r+b")
+try:
+    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except OSError:
+    print("BLOCKED");sys.exit(1)
+print("ACQUIRED")'; echo "exit=$?"   # 通过 = BLOCKED / exit=1
+wait
+```
+
+**第 3 步：§5.4(b) 的判据 —— worker 的身份、属组，与它建出来的树。**
+
+```bash
+kubectl -n sandlock get statefulset e2b-worker -o jsonpath='{.spec.template.spec.containers[0].securityContext}'; echo
+# 通过：runAsUser=0 **且** runAsGroup=65534（形如 {"capabilities":{…},"runAsUser":0,"runAsGroup":65534}）
+#       两个字段缺一不可：runAsGroup 不是 65534 ⇒ worker 进不去 0770 group=<worker gid> 的沙箱树
+#       （渲染结果已由 tests/unit/test_worker_manifest_permissions.py 钉住）
+
+# 行为判据（只读）：池里的树是不是真的建成了 0770 + 属组 65534
+kubectl -n sandlock exec e2b-worker-0 -- sh -c 'stat -c "%a %u %g %n" /var/lib/e2b-sandboxes/workspaces/*/ | head -5'
+# 通过：模式 770、属主落在池段内（E2B_UID_POOL_START 默认 10000 起）、属组 65534
+```
+
+建箱路径（会真的建沙箱；两条冒烟跑完自己 `sb.kill()` 掉并核对预留归零，凭据只从 Secret 取、不打印）：
+
+```bash
+export E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000
+export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d | cut -d, -f1)
+tmp/testenv/bin/python deploy/scripts/multinode_smoke.py
+tmp/testenv/bin/python deploy/scripts/deployment_smoke.py
+# 通过：两条都全绿（跨节点分布 / 建箱 / 迁移保留文件 / 配额释放）
+# 不通过：`failed to provision` 且原因字段为空 —— (b) 被违反的典型现场（树交不出去）
+```
+
+**适用范围**：第 1、2 步只在"多副本共用一份 base"时需要（单副本 + NFSv3 `nolock` 是允许的，
+见 §5.4(a)）；第 3 步的 `runAsUser: 0` 期望只对**网络文件系统**成立 —— 托管集群用块存储 /
+节点本地盘时 worker 保持非 root，此时第 3 步按"非 0 也可以"判，但**属组仍要与沙箱树一致**。
+
+**证据留档**：把第 1 步的 `mountOptions` 原文、第 2 步的 `exit=`、第 3 步的 `securityContext`
+与 `stat` 输出贴进当次部署记录（k0s 集群落 `docs/deploy-clusters.md` §7 现状表旁边）。
