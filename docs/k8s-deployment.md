@@ -760,8 +760,8 @@ pod 停在 `CreateContainerConfigError` 而不是静默用一个公共 key。
    ✅ 已做（2026-09-17）：Calico 换完（§11）后 A/B/C 全绿，N13 在 §13 收口。
 3. 收尾遗留：worker 的稳定 node id（F7）、~~v3/`nolock` 与 v4 的锁语义差异要不要写进
    存储选型门槛~~ ✅ 已写成硬门槛（2026-09-26）：`docs/production-deployment-requirements.md`
-   §5.4(a)、以及 F4 那条「非 root worker 与网络文件系统不兼容」是否要升级成
-   基线的显式约束。
+   §5.4(a)、~~F4 那条「非 root worker 与网络文件系统不兼容」是否要升级成
+   基线的显式约束~~ ✅ 已升级为基线显式约束（2026-09-26）：§5.4(b)。
 
 ---
 

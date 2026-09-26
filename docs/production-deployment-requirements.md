@@ -255,6 +255,10 @@ cap**」。因此 broker 必须落在沙箱不可达的路径，且路径本身�
 顺序反了就会出现「镜像 rootfs 沙箱全部建不出来」；uid 段也要在同一次变更里拆开。
 升级顺序、待授权事项与取证脚本见 `docs/HANDOFF.md`「特权最小集实测 + 线上就绪审计」。
 
+⚠️ **上面整节（非 root worker + file-capability broker 的最小集）的前提是「workspace/volume 在节点本地盘」**：
+落到**网络文件系统**（NFS/CephFS/…）上时这套不成立——`CAP_CHOWN` 不过网，broker 交不出沙箱树
+（实测见 §5.4(b)），此时按 §5.4(b) 改跑 `runAsUser: 0` + `runAsGroup = <worker gid>`。
+
 ### 2.4.2 共享卷路径的可穿越性（证据来自 A0/A3 探针实测，A5 沿用）
 
 沙箱的路径中介以**沙箱自己的 host uid** 打开卷的宿主路径（route-B 槽位 / RunAs），
@@ -1348,8 +1352,9 @@ E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worke
    同锁、同暂存、同发布语义；`.link` 侧车用"写临时文件 + rename"的方式更新，所以另一
    uid 写的旧侧车不会挡住自己。
 
-**存储不支持跨客户端锁时的口径**（NFS 形态务必知道）：§5.1 允许 NFSv3 `nolock` 挂载，
-那 `flock` 退化为客户端本地锁 ⇒ **跨客户端不再互斥**，两个节点会各解压一份。此时正确性由
+**存储不支持跨客户端锁时的口径**（NFS 形态务必知道）：单副本形态可以挂 NFSv3 `nolock`
+（§5.1；多副本共用一份 base 的门槛见 §5.4(a)），那 `flock` 退化为客户端本地锁 ⇒
+**跨客户端不再互斥**，两个节点会各解压一份。此时正确性由
 第 2/3 条独立保证：两份内容同源（同一 digest），只会有一个条目被发布，另一份暂存树被丢弃，
 读者拿到的始终是完整 rootfs —— 代价是**多一次解压**（不是数据错误）。这也解释了为什么两条
 机制都要，而不是二选一：文件锁买的是"只解压一次"，原子发布买的是"永远不会残缺"。
@@ -1704,9 +1709,10 @@ worker 走的是 **agent 形态**（`E2B_QUOTA_AGENT_URL` 是开关，`.env` 里
 - **迁移保留文件**：`E2B_SHARED_WORKSPACE_ROOT` / `E2B_SHARED_VOLUME_ROOT`
   下的迁移只切路由、不搬文件（keepFiles），实测 NFS 上文件与 projid
   均保留；跨挂载点读写正常（迁移目标 worker 直接读到源文件）。
-- **各节点挂载选项必须一致**：`rw,sync,no_subtree_check`（及 NFSv3
-  `nolock` 如无锁服务）；`vers` 与 `sec` 需一致，否则配额与权限行为
-  随节点漂移。
+- **各节点挂载选项必须一致**：`rw,sync,no_subtree_check`；`vers` 与 `sec`
+  需一致，否则配额与权限行为随节点漂移。**NFSv3 `nolock` 不是等价选项**：
+  它的锁只在**单机内**互斥，多副本共用一份 `E2B_WORKSPACE_BASE` 时会静默
+  失效 —— 门槛、判据与复核时机见 §5.4(a)。
 
 ### 5.2 配额专项（服务器端 XFS + prjquota）
 
@@ -1762,4 +1768,9 @@ worker 走的是 **agent 形态**（`E2B_QUOTA_AGENT_URL` 是开关，`.env` 里
 
 ### 5.4 存储选型门槛（硬）
 
+**本节两条都是「共享存储形态」下的硬前提，不是可选优化**：(a) 决定多副本能不能成立，
+(b) 决定 worker 该以什么身份跑。任一条不成立，对应形态直接**不可用**（不是降级）。
+
 **(a) 存储选型门槛（硬，N13/F5）：多副本 worker 共用一份 `E2B_WORKSPACE_BASE` 时，`<base>/.uid_pool.lock` 上的 `flock` 必须跨节点互斥。** 否则两个副本会各自把同一个 uid 发给不同沙箱，E3.2 的每沙箱 uid 隔离会在无人察觉的情况下失效——这不是"降级"，是**静默失效**。本集群实测（`deploy/k8s-k0s/storage-nas.yaml:18-24`）：**只有 NFSv4.0 成立**；`NFSv3 + 服务端锁` 在这台 NAS 的客户端上直接 `ESTALE`；`NFSv3 + nolock` 的锁**只是本机锁**（同机互斥、跨机不互斥）。跨节点**没有 CAS 原语**，因此任何分布式单飞（uid 分配、TTL 扫描、快照拷贝认领、限流窗口）只能实现为"**锁 + 记录**"，不能依赖 `O_EXCL` 之类的原子性假设。各节点的挂载选项（`vers`、`nolock`、`sec`）**必须一致**；**换 NAS 或换挂载参数时必须随部署复核这一条**。它同时是 `replicas ≥ 2` 的前置条件——不是可选优化。
+
+**(b) 基线约束（F4）：非 root worker 只适用于节点本地盘。** 当 workspace/volume 落在**网络文件系统**（NFS/CephFS/…）上时，worker 必须 `runAsUser: 0` 且 `runAsGroup = <worker gid>`（本集群为 `0:65534`）。原因：route B/c1 建箱时要把沙箱树交给池里的 uid（`0770 owner=<sandbox uid> group=<worker gid>`，E3.2），这一步由带 `cap_chown` 的 broker（`e2b-maint`）执行，而 **`CAP_CHOWN` 不过网**——NFS 服务端只读 AUTH_SYS 凭据里的 uid，不看你客户端的能力；实测（`deploy/k8s-k0s/worker-root.patch.yaml:1-26`）：uid 65534 的 broker 做 `chown 10000:65534` **EPERM**，同一挂载上 root 做同样 chown 成功。并且必须**保留 worker 的 gid** 作为属组，否则 worker 进不了 `0770 group=<worker gid>` 的沙箱树（这台 NAS 对 uid 0 也不给越权读别的 uid 的 `0600` 文件）。安全代价是 worker 成为**可信中介**（沙箱仍跑在自己的池 uid 下，隔离模型不变），前提是导出允许 root 访问（`no_root_squash`）。该约束已由单测钉住（`tests/unit/test_worker_manifest_permissions.py:665-666`：对渲染出的 worker 容器精确断言 `securityContext.runAsUser == 0`、`runAsGroup == 65534`），因此**基线的 `deploy/k8s/worker.yaml` 在改用网络存储时必须同步这一设置**，不能沿用默认的非 root 形态；托管集群若用块存储/节点本地盘，可以保持非 root。**复核时机**：换共享存储类型（本地盘 ↔ 网络文件系统）、换导出权限（`no_root_squash` 变化）时必须回来核这一条。

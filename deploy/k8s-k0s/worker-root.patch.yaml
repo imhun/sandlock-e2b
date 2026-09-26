@@ -14,7 +14,7 @@
 #
 # ⚠ 这不是 k0s 特有的：基线的「非 root worker + RWX PVC」组合在任何网络文件系统
 # （NFS/CephFS/…）上都不成立，只在本地盘（compose 的命名卷）上成立。这里先作为
-# overlay 差异落地，通用的处置见 docs/k8s-deployment.md 与 task-backlog。
+# overlay 差异落地，通用门槛见 docs/production-deployment-requirements.md §5.4(b)。
 #
 # 安全代价与前提：worker 变成可信中介（沙箱仍然跑在自己的池 uid 下，隔离模型不变），
 # 且导出必须允许 root 访问（本 NAS 已允许）。
