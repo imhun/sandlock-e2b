@@ -230,3 +230,74 @@ def test_the_tenant_disk_row_returns_to_zero_in_the_shared_store(make_record):
 
     registry.delete(record.sandbox_id)
     assert registry._quota_store.get("tenant:t1")["disk"] == 0
+
+
+def test_pause_and_the_delete_after_it_return_the_tenant_store_row_once(make_record):
+    """The shared-store half of pause: the tenant row has to come back too.
+
+    The store branch writes the tenant row only for a tenant that configured a
+    limit, and only ``release_quota`` moves it -- so a release that forgot it
+    while the global row looked right is invisible to every in-memory case.
+    ``other`` is the instrument, as in the global case: with a second record
+    booked, a release that moved the parked record's row twice reads 0 instead
+    of 64 (a single record sits at 0 either way).
+
+    Both records are created at ``default_disk_mb`` so the sale helper books
+    them without going through ``release_quota`` -- the mutation this case
+    exists to catch lives on that path, and a setup that re-booked through it
+    would fail there instead of on the path under test.
+    """
+    registry = SandboxRegistry(
+        _settings(
+            default_disk_mb=64, tenant_limits={"t1": {"max_total_disk_mb": 4096}}
+        ),
+        redis_client=fakeredis.FakeRedis(),
+    )
+    parked = make_record(registry, disk_size_mb=64, tenant_id="t1")
+    other = make_record(registry, disk_size_mb=64, tenant_id="t1")
+    assert registry._quota_store.get("tenant:t1")["disk"] == 128
+
+    registry.pause(parked)
+    assert registry._quota_store.get("tenant:t1")["disk"] == 64
+    registry.delete(parked.sandbox_id)
+    # 64 rather than 0: the delete of a parked record releases nothing.
+    assert registry._quota_store.get("tenant:t1")["disk"] == 64
+
+    registry.delete(other.sandbox_id)
+    assert registry._quota_store.get("tenant:t1")["disk"] == 0
+
+
+def test_ttl_expiry_returns_the_tenant_store_row_once(make_record):
+    """The shared-store half of the TTL sweep, for the tenant ledger.
+
+    ``remove_expired`` walks the store and hands each expired record to
+    ``_release`` -> ``release_quota``, which is what moves both rows and sets
+    the flag; the in-memory case cannot vouch for that path, and on this
+    backend the flag is not the only writer of the row.
+
+    ``other`` is the instrument again: with only the expired record booked the
+    tenant row reads 0 either way, so a second subtraction of the swept
+    record's row would be hidden there -- with two booked, it reads 0 instead
+    of 64. Both records are created at ``default_disk_mb`` so the setup does
+    not run through the release path under test (see the case above).
+    """
+    registry = SandboxRegistry(
+        _settings(
+            default_disk_mb=64, tenant_limits={"t1": {"max_total_disk_mb": 4096}}
+        ),
+        redis_client=fakeredis.FakeRedis(),
+    )
+    record = make_record(registry, disk_size_mb=64, tenant_id="t1")
+    other = make_record(registry, disk_size_mb=64, tenant_id="t1")
+    assert registry._quota_store.get("tenant:t1")["disk"] == 128
+
+    record.end_at = utcnow() - timedelta(seconds=10)
+    # The sweep enumerates the shared store, so the deadline has to land there.
+    registry.save(record)
+
+    expired = registry.remove_expired()
+    assert [r.sandbox_id for r in expired] == [record.sandbox_id]
+    assert registry._quota_store.get("tenant:t1")["disk"] == 64
+    assert registry.release_quota(expired[0]) is False
+    assert registry._quota_store.get("tenant:t1")["disk"] == 64
+    assert registry.get(other.sandbox_id).quota_released is False
