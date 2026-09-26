@@ -27,6 +27,10 @@
 - pure 形态**必须有 route-B 槽位**：拿不到槽位时中介以 euid 0 跑会被产品守卫拒（fail closed，`envd_service/executors/sandlock.py:1404-1420`），没有"能跑但不中介"的降级档。
 - 越界路径的 errno 是**契约**：N15 之后"授权外"答 EACCES 而不是 ENOENT（`docs/pure-shape-decision.md` §6 末段）。合成根会改变一部分路径的 errno，改了就按逐字节三元组写进契约，不许"顺带变了"。
 - 提交纪律：每个 Task 结束就提交（`git add` 精确文件，不 `git add -A`）；fork 的改动与父仓的改动分成两个 commit。
+- **`tmp/` 在 `.gitignore` 里**（`.gitignore:5`）⇒ 本计划所有 `git add tmp/…` 的步骤都要写 `git add -f`，否则静默漏掉证据文件（Task 1 已踩过）。
+- **架构**：Task 1 的全部证据是 `x86_64`，而部署目标是全 arm64 k0s（探针的 `SYS_PIVOT_ROOT` 表覆盖了 `aarch64: 41`，但从未在 arm64 上跑过）。**Task 9 的两条 lane 至少要有一条落在 arm 侧**（`deploy/scripts/arm-lane/` 已有现成通道），否则"合成根在部署架构上可用"这句话没有证据。
+- **userns 身份那一半由既有路径覆盖，不属于本计划的新增面**：`context.rs:725-755` 每个 generation 都 `unshare(CLONE_NEWUSER)`，per-sandbox uid 形态下父进程写 `0 -> run_as`（`write_id_maps` `:284-294`）；生产今天跑的 route-B 槽位**每个建箱都走这段**（`test_route_b_restores_guest_root_with_and_without_pid_ns` 的 `id -u = 0` 就是它的验收）。Task 1 的探针不写 uid_map，所以它证明的是"在你已有的 userns 里 mount+pivot 能走通"——**两者的组合**（映射好的 userns + 合成根）由 Task 9 的 lane 覆盖，不需要单独造探针。
+- **worker seccomp 档在集群上是在位的**（2026-09-26 实测）：两台节点 `/var/lib/k0s/kubelet/seccomp/sandlock-worker.json` 都是 14927 字节、sha256 `071486c0…`，与 `deploy/seccomp/sandlock-worker.json` 逐字节相同。所以 `fstype==0` 那条限制在真集群上成立（`docs/deploy-clusters.md:177` 那段"从未 apply"是历史叙述，§7 记的是 2026-09-25 已补）。
 
 ---
 
@@ -309,6 +313,10 @@ if __name__ == "__main__":
 #!/bin/sh
 # 合成根探针的 runner：**生产 cap 形状**（worker 声明的那五个 cap，无 SYS_ADMIN）
 # + 出厂 seccomp 档 + 项目内 scratch。用法：probe-pure-synth-root.sh <part> <log>
+#
+# 退出码就是判定契约：0 = 该 part 的判定成立；1 = 某一步 FAILED（或 b2 的 host-only
+# 在 pivot 后仍可见）；2 = VACUOUS（只有 b2：传进来的 HOST_ONLY 在 pivot 前就不存在，
+# 那句 `hidden` 会白给）。见 §Step 3。
 set -eu
 cd "$(dirname "$0")/../.."
 part="$1"
@@ -320,7 +328,7 @@ docker run --rm --init --network host \
     --cap-add CHOWN --cap-add DAC_OVERRIDE \
     --security-opt seccomp="$(pwd)/deploy/seccomp/sandlock-worker.json" \
     --security-opt apparmor=unconfined \
-    -e HOST_ONLY="${HOST_ONLY:-/src}" \
+    -e HOST_ONLY="${HOST_ONLY:-/workspace/AGENTS.md}" \
     -e DEV_VARIANT="${DEV_VARIANT:-host-tree}" \
     -v "$(pwd):/workspace" -w /workspace \
     e2b-sandlock-test:latest \
@@ -330,7 +338,8 @@ docker run --rm --init --network host \
 - [ ] **Step 3: 跑它（b2 = 这条路线能不能做）**
 
 Run: `sh tmp/k0s/probe-pure-synth-root.sh b2 tmp/k0s/pure-synth-root-prodshape.log && cat tmp/k0s/pure-synth-root-prodshape.log`
-Expected: 最后三行是 `[part b2] bound system dirs: <n>`、`[part b2] host-only /src: hidden`、`[part b2] verdict: PASS (plain directory + bind + pivot_root works in the pinned shape)`，退出码 0
+Expected: 最后三行是 `[part b2] bound system dirs: <n>`、`[part b2] host-only /workspace/AGENTS.md: hidden`、`[part b2] verdict: PASS (plain directory + bind + pivot_root works in the pinned shape)`，退出码 0。
+`HOST_ONLY` 的默认值 `/workspace/AGENTS.md` 是 lane 镜像里**真有**的路径，所以不传 `-e HOST_ONLY` 也必须是 PASS/rc 0；**VACUOUS/rc 2 只留给"显式传了一个 pivot 之前不存在的路径"**（例如 `HOST_ONLY=/src` —— 本 lane 的仓库挂在 `/workspace`，`/src` 不存在）。探针在 `enter_ns()` 之前就会先打一行 `[part b2] host-only <path> exists pre-pivot: <bool>`：`True` 才继续做后面的隔离判定，`False` 直接 `verdict: VACUOUS` + rc 2（见 2026-09-26 Task 1 评审修 M3/M4）。证据：`tmp/k0s/pure-synth-root-prodshape-default.log`（默认值 PASS）、`tmp/k0s/pure-synth-root-prodshape-vacuous-explicit.log`（显式不存在 ⇒ VACUOUS）。**注意**：本 Task Step 1 里内嵌的那份探针代码是初版副本，已落后于 `tmp/k0s/probe-pure-synth-root-plaindir.py`（两轮评审修：`unshare(CLONE_NEWUSER)`、VACUOUS 判定、`dev` 的设备身份断言），以那个文件为准。
 
 - [ ] **Step 4: 跑对照臂（tmpfs 必须是 EPERM）**
 

@@ -1,0 +1,17 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part dev] unshare(CLONE_NEWUSER): ok
+[part dev] unshare(CLONE_NEWNS): ok
+[part dev] mount(/ private): ok
+[part dev] bind /dev: ok
+[part dev] self-bind /workspace/tmp/k0s/scratch/synth-root-dev-host-tree: ok
+[part dev] pivot_root('.', '.'): ok
+[part dev] umount2('.', MNT_DETACH): ok
+[part dev] variant=host-tree
+[part dev] ls /dev: ['fd', 'full', 'mqueue', 'null', 'ptmx', 'pts', 'random', 'shm', 'stderr', 'stdin', 'stdout', 'tty']
+[part dev] /dev/shm exists: True
+[part dev] /dev/fd exists: False
+[part dev] skeleton has /lib64: False
+[part dev] /dev/null identity: char-device rdev=259 mode=0o20666
+[part dev] /dev/urandom identity: char-device rdev=265 mode=0o20666
+[part dev] open('/dev/null','w') writes: True
+[part dev] open('/dev/urandom','rb').read(1): True

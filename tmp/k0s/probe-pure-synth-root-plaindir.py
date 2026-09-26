@@ -25,6 +25,7 @@ from __future__ import annotations
 import ctypes
 import os
 import shutil
+import stat
 import sys
 
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -39,8 +40,10 @@ MNT_DETACH = 2
 #: pivot_root 的 syscall 号按架构不同（x86_64 = 155，aarch64/riscv64 = 41）。
 SYS_PIVOT_ROOT = {"x86_64": 155, "aarch64": 41, "riscv64": 41}[os.uname().machine]
 
-#: 宿主侧有、而合成根里不该有的东西（lane 里仓库就挂在 /src）。
-HOST_ONLY = os.environ.get("HOST_ONLY", "/src")
+#: 宿主侧有、而合成根里不该有的东西。**必须在 pivot 之前就定成绝对路径**：传进来的是相对
+#: 路径时，pivot 前后的 cwd 不同（`/workspace` → `/`），同一个字符串量的是两棵不同的树 ——
+#: `hidden` 会因此可能变绿，而与被断言的那个路径无关。
+HOST_ONLY = os.path.abspath(os.environ.get("HOST_ONLY", "/src"))
 
 #: 与 E2B 侧 `_SYNTHETIC_ROOTFS_SYSTEM_DIRS` 同一份清单。
 SYSTEM_DIRS = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt")
@@ -193,23 +196,50 @@ def part_proc() -> int:
     return 0
 
 
-def write_dev_null() -> bool:
-    """纯 Python 探 `/dev/null`：不经 exec，所以不会被"解释器不在骨架里"污染。"""
+def write_dev_null() -> str:
+    """纯 Python 探 `/dev/null`：不经 exec，所以不会被"解释器不在骨架里"污染。
+
+    返回的是**带 errno 文本的结论字符串**（与 `ok()` 的 `FAILED errno=…` 同一风格），
+    因为这一行会被 Task 3 当事实读；只答 True/False 会丢掉"为什么"。
+    """
     try:
         with open("/dev/null", "w") as fh:
             fh.write("x")
-    except OSError:
-        return False
-    return True
+    except OSError as exc:
+        return f"False ({type(exc).__name__} errno={exc.errno} {exc.strerror})"
+    return "True"
 
 
-def read_one_urandom() -> bool:
+def read_one_urandom() -> str:
     """同上：`/dev/urandom` 能不能读出一个字节，与动态解释器无关。"""
     try:
         with open("/dev/urandom", "rb") as fh:
-            return len(fh.read(1)) == 1
-    except OSError:
-        return False
+            data = fh.read(1)
+    except OSError as exc:
+        return f"False ({type(exc).__name__} errno={exc.errno} {exc.strerror})"
+    if len(data) != 1:
+        return f"False (short read: {len(data)} byte)"
+    return "True"
+
+
+def dev_node_identity(node: str) -> str:
+    """`node` 在新根里的**设备身份**，不是"能不能写"。
+
+    `minimal` 臂会先在骨架里 `open(target, "w")` 造一个普通同名文件，那条 bind 若悄悄失败，
+    `open('/dev/null','w')` 照样成功 —— 它会替一个普通文件作证。所以身份必须单独量一次：
+    真 `/dev/null` 是字符设备（`S_ISCHR`），普通文件会在这里现形。
+    """
+    try:
+        st = os.stat(node)
+    except OSError as exc:
+        return f"unavailable ({type(exc).__name__} errno={exc.errno} {exc.strerror})"
+    if stat.S_ISCHR(st.st_mode):
+        kind = "char-device"
+    elif stat.S_ISBLK(st.st_mode):
+        kind = "block-device"
+    else:
+        kind = "NOT-a-device"
+    return f"{kind} rdev={st.st_rdev} mode={oct(st.st_mode)}"
 
 
 def part_dev() -> int:
@@ -238,8 +268,13 @@ def part_dev() -> int:
     elif variant == "minimal":
         for node in ("null", "zero", "urandom", "tty", "ptmx", "pts"):
             src = os.path.join("/dev", node)
-            if os.path.exists(src):
-                mount(src, os.path.join(dev, node), None, MS_BIND | MS_REC)
+            if not os.path.exists(src):
+                continue
+            # 这条 bind 以前是静默的：失败时骨架里那个自造的普通同名文件留在原地，
+            # 后面的 `open(...,'w')` 会替它答 True —— 假绿的入口就在这里。
+            if not ok(f"bind {src} -> {dev}/{node}",
+                      mount(src, os.path.join(dev, node), None, MS_BIND | MS_REC)):
+                return 1
     if not self_bind_and_pivot(root):
         return 1
     present = sorted(os.listdir("/dev")) if os.path.isdir("/dev") else []
@@ -253,6 +288,8 @@ def part_dev() -> int:
     #: 于是两个 `False` 与 `/dev` 毫无关系，看起来却像"/dev/null 不可用"。
     #: 现在：先记骨架里到底有没有 /lib64（正向证据），再用不经 exec 的纯 Python 探。
     note(f"skeleton has /lib64: {os.path.exists('/lib64')}")
+    note(f"/dev/null identity: {dev_node_identity('/dev/null')}")
+    note(f"/dev/urandom identity: {dev_node_identity('/dev/urandom')}")
     note(f"open('/dev/null','w') writes: {write_dev_null()}")
     note(f"open('/dev/urandom','rb').read(1): {read_one_urandom()}")
     return 0
