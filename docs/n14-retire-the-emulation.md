@@ -90,8 +90,9 @@ mount ns**。模拟根形态下沙箱与容器共享 mount ns ⇒ 它们枚举�
 > ——路径改写（`/proc/self/fd/N`、buffer 重写）、magic link 重写、
 > 按虚拟路径做的策略翻译、以及 13 个 `legacy_*` 转发。
 
-前提是**每个交付形态都得能吃真根**：image-rootfs 已可（线上在跑）；pure 形态是 N15 那条线
-（`chroot_root="/"` 的 identity 翻译）。**过渡期两种形态并存 ⇒ 翻译代码在过渡期不能删**——
+前提是**每个交付形态都得能吃真根**：image-rootfs 已可（线上在跑）；pure 有**两条线** —— N15 的
+identity 翻译（`chroot_root="/"`，默认，`E2B_PURE_ROOTFS=off`）与 N16 的合成根
+（`E2B_PURE_ROOTFS=synth`，普通目录 + bind + `pivot_root`，见 §5.3）。**过渡期两种形态并存 ⇒ 翻译代码在过渡期不能删**——
 否则关了开关的部署会立刻退回"未拦截即在宿主解析"，那才是真正的放大。
 
 ### 4.1 另一条路：按形态分路径（只有**模拟根**走翻译）
@@ -246,6 +247,69 @@ N15 选的路是"补一个中介 + identity 翻译，把那 33 条一条条闸�
 于是"退役模拟"这件事的性质变了：**它不再是安全改进，而是代码卫生**（并且被
 `E2B_REAL_ROOT=0` 这个配置挡着）。要不要做它，取决于愿不愿意为"少维护一套模拟"付重构代价，
 而**不做不再是欠一道防线**。
+
+### 5.3 已选路线与实测（2026-09-26，N16）
+
+§5.1 那三条"都还不知道答案"的前提（`/proc`、`/dev`、"还有没有别的真实用法"）本轮全部量过了，
+所以这一节写的是**已选的路线**，不是推演。
+
+**选了什么**：`E2B_PURE_ROOTFS=synth`（默认 `off` ⇒ 今天的行为一字不变）时，pure 沙箱拿到
+**每沙箱一份的合成骨架** `<base>/_pure_rootfs/<id>`（普通目录，`0755`，名字进了
+`gateway_common.paths.RESERVED_PLATFORM_NAMESPACES`），骨架里 bind 系统目录
+（`/usr /bin /sbin /lib /lib64 /opt`，源不存在的跳过）与**整棵容器的 `/dev`**；真正的挂载由 fork
+在沙箱自己的 mount ns 里做（`unshare → 绑策略挂载 → 递归自绑根 → pivot_root → 丢 CAP_SYS_ADMIN`），
+workspace 仍以 `/home/user`、`/workspace` 两个别名进树，拆箱时骨架与 `<base>/_runtime/<id>`
+一起收掉。
+
+**为什么骨架是"每沙箱一份 + 平台保留命名空间"**：`_runtime/<id>` 是 `0700`，而
+`unshare`/`bind`/`chdir` 是在沙箱**自己的 user namespace 里、以沙箱自己的宿主 uid** 跑的 ——
+它不拥有那些目录（`0700` 会先在 bind 处撞 EACCES）；而放进沙箱自己的树，又会被它自己删掉。
+代价明说：每沙箱多一个顶层目录 + 一次拆箱清理。
+
+**`/dev` 取哪个集合**：递归 bind 容器的 `/dev`，也就是**把今天 pure 的可见集合原样搬进树**
+（`devdiff` 量到集合相等：14 / 14）。**不**取镜像形态的 `minimal_dev` 六节点 —— 那是一次收紧
+（实测少 8 条：`fd`、`full`、`mqueue`、`random`、`shm`、`stderr`、`stdin`、`stdout`）。
+顺带一条边界：骨架的 `/proc` 是**空目录**（§5.1 那条"自建 userns 挂不上真 procfs"的实测），
+所以那四个指向 `/proc/self/fd` 的符号链接在合成根下是**悬空**的 —— 形状保留，能否解析是中介
+`/proc` 合成的活。
+
+**`/etc` 有意不绑**：骨架里它是空目录。绑上就等于把宿主的名字表重新灌进沙箱，正是 N15 修掉的
+那条 wildcard 绕过（`compose_virtual_etc_hosts` 的 `root="/"` 特判就是为它加的）；同理也不绑任何
+凭据目录。
+
+**两处 fork 特例在合成根下重新变成"活分支"**（不是新 bug，是判据的前提换了）：
+
+| fork 特例 | `root="/"`（identity，N15） | 合成根（N16） |
+|---|---|---|
+| `compose_virtual_etc_hosts` 的 `if root != "/"`（`network/rules.rs:665`） | 特判跳过 —— `root="/"` 时读的是**宿主** `/etc/hosts`，会把宿主可解析的名字以字面 IP 灌进沙箱 | **活分支**：读的是**骨架**的 `/etc/hosts`，骨架没有这个文件 ⇒ 回落到 loopback 基线，**与今天等价** |
+| 凭据暴露警告的 `.filter(\|root\| root != "/")`（`sandbox/builder.rs:1261`） | 特判跳过 —— `root="/"` 会让**任何**宿主路径都算"在授权内"，警告变成噪音 | **活分支**：按**骨架**的授权集判定，骨架里没有任何凭据文件 ⇒ **不产生噪音** |
+
+前提写在明处：**合成根绝不绑宿主 `/etc` 或凭据目录**。绑了这两条就从"活分支回到等价行为"变成
+**真漏洞**（前者把 wildcard 绕过灌回来，后者把凭据放进沙箱的授权集）。今天这条约束由骨架常量
+`_SYNTHETIC_ROOTFS_SYSTEM_DIRS` 表达（里面没有 `/etc`），并由上表两处判据守着。
+
+**两态与验收**（`E2B_REAL_ROOT` 的读法按 2026-09-26 的追加裁定：`=0` ⇔ N15 identity、
+`=1` ⇔ 合成根 + 真根）：
+
+| 档 | 结果 |
+|---|---|
+| pure 默认（`E2B_PURE_ROOTFS` 不设 = `off`） | gate B off **2015 passed / 17 skipped / 3 xfailed / 0 failed** |
+| pure + 合成根（`E2B_PURE_ROOTFS=synth` + `E2B_REAL_ROOT=1`） | **2019 passed / 16 skipped / 0 failed**（3 条 N35 xfail 转 pass、1 条别名用例不再 skip） |
+| 镜像形态（gate A） | 2022 passed / 10 skipped / 3 xfailed / 0 failed |
+| phase 2（非 root worker） | 57 passed / 1 skipped |
+
+全表（逐条 skip 归属、原始日志路径）在 `.superpowers/sdd/pure-task-13-report.md` §1，那是本轮的
+权威数字。**`E2B_PURE_ROOTFS=synth` 配 `E2B_REAL_ROOT=0` 没有"这一档"**：那个组合结构性不成立
+（bind 只在真根那条路径上发生，模拟形态把虚拟路径翻译进**空骨架** ⇒ 生成期 `execvp("/bin/sh")`
+errno 13 ⇒ container 崩塌 ⇒ 之后每个 verb 都答 `InstanceClosed`），所以 `create_app` 当场 loud
+拒绝、exit 1（原句见追加裁定与 Task 13 报告 §2）。**一条验收注记（Task 12）**：
+`E2B_PAUSE_CHECKPOINT` 默认**关**，所以合成根下 pause/resume 的第一次探针是**空洞的**（pause 不写图、
+`resume` 面对活会话走 thaw 分支 ⇒ restore verb 一次都不调）；真跑恢复链的是"用 worker 自己的两个
+入口 + 把 restore stub 指到树外"那一版，两态两轮都 `restored: true`、恢复后仍能 exec（`tmp/k0s/task12/`）。
+
+**这也不是"pure 要维护第二套根"**：合成根**只改 `kwargs["chroot"]` 那一个值**，中介一行不退
+（`/proc` 合成、策略判定、COW 视图、磁盘活账本全在中介里，见 §3）。它还顺手答了 §6 里 S5
+（"真根成为唯一形态"）的前提：每个交付形态都能吃真根之后，就没有 `E2B_REAL_ROOT=0` 兜不住的形态了。
 
 ---
 

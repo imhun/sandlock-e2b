@@ -174,3 +174,50 @@ fork 侧 `handle_chroot_exec` 的 `settle_closed_writes` 在每次 exec 前结�
 是平台状态分离**之前**的 record 路径），3 条是 N15 引起（missing-binary 契约：授权外的路径现在按
 **拒绝**答 EACCES 而不是"不存在"，这正是 N15 关掉的存在性 oracle —— 契约用例改用白名单内的路径，
 并把"授权外 = EACCES + 一行诊断"按逐字节断言钉住）。
+
+## 7. N16（2026-09-26）：pure 的第二种根 —— 合成骨架
+
+**先更正 §6 里一句与实测冲突的现况描述**（Task 11 报过）：§6 的三处配套里写着"现在 pure 给宿主
+workspace 路径，中介再经挂载表映射回 `/home/user`（`pwd` 仍是它）"。实测（
+`tmp/k0s/task11/probe-boundary.log`、Task 10 §2.4）**identity 态的 `pwd` 报的是宿主 workspace 路径**，
+`cd /home/user` 直接 `can't cd to /home/user`（rc=2）——**`/home/user` 这个别名只在有根形态存在**。
+挂载表映射管的是 exec 的 cwd 参数，不是 shell 的 `pwd`；把那句读成"identity 下别名可解析"是错的。
+
+**N16 是什么**：`E2B_PURE_ROOTFS=synth`（默认 `off`）时，pure 沙箱拿到**每沙箱一份的合成骨架**
+（`<base>/_pure_rootfs/<id>`，普通目录 + bind 系统目录 + 整棵 `/dev`），fork 在沙箱自己的 mount ns
+里 `pivot_root` ⇒ pure 也有内核根，`E2B_REAL_ROOT=1` 于是在 pure 里也开得起来。产品侧只动
+`kwargs["chroot"]` **一个值**：`_chroot_root` 从 `"/"` 变成骨架目录，中介、策略、COW、活账本一行
+不退。机制、`/dev` 与 `/etc` 的取法、两处 fork 特例在新形态下的身份（以及"合成根绝不绑宿主
+`/etc` 或凭据目录"这条前提）写在 `docs/n14-retire-the-emulation.md` §5.3。
+
+**"合成根 + 模拟根"结构性不成立 ⇒ 配置守卫**（2026-09-26 追加裁定，选 A）：bind 只在真根那条
+路径上发生，`=0` 的模拟形态把虚拟路径翻译进**空骨架** ⇒ 生成期 `execvp("/bin/sh")` errno 13 ⇒
+container 崩塌 ⇒ 之后每个 verb 都答 `InstanceClosed`（security 两态实测：`=0` 1 failed / 14 passed /
+32 errors，`=1` 1 failed / 44 passed）。因此 `E2B_PURE_ROOTFS=synth` 且 `E2B_REAL_ROOT=0` 时
+**`create_app` 当场 loud 拒绝**（`RuntimeError`、exit 1，照 SL-1 与 `real_root` 无根那条的既有风格
+写明出路），配一条 E2B 侧红用例 + 这句文档。
+
+**两态的新读法**（同一裁定）：纯形态的"两态"是 **`=0` ⇔ N15 identity（不设根）**、
+**`=1` ⇔ 合成根 + 真根**；`E2B_PURE_ROOTFS` 默认 `off`，即默认仍是 identity。
+
+**验收（2026-09-26，权威数字在 `.superpowers/sdd/pure-task-13-report.md` §1）**：gate A（镜像形态）
+2022 passed / 10 skipped / 3 xfailed、gate B off（= 新读法下的 `=0`）2015 / 17 / 3、**`=1`
+合成根 + 真根 2019 passed / 16 skipped / 0 failed**（3 条 N35 `xfail` 转 pass、1 条别名用例不再
+skip）、phase 2 57 passed / 1 skipped，**四档全 `0 failed`**；简报与 §6 里 N15 当天那组
+`1772/1765` 已被这组取代。`synth + REAL_ROOT=0` 那档**只有拒绝、没有结果**。security 两态
+（Task 11）identity `43 passed / 3 skipped / 3 xfailed`、合成根 `46 passed / 3 skipped / 0 failed`。
+两条注记：① `E2B_PAUSE_CHECKPOINT` **默认关**，所以合成根下 pause/resume 的第一次探针是**空洞的**
+（pause 不写图、`resume` 面对活会话走 thaw 分支 ⇒ restore verb 一次都不调）；真跑恢复链的是"用
+worker 自己的两个入口 + 把 restore stub 指到树外"那一版（`tmp/k0s/task12/`），两态两轮都
+`restored: true`、恢复后仍能 exec，且合成根下只能靠**投递 fd** 把树外的 stub 交给引擎
+（`docs/chroot-workspace-exec.md` §11.6.1）。② 合成根下 `stat` 家族对"父链缺一环"的路径答
+**ENOENT**（identity 答 EACCES）—— 比 EACCES **更不泄漏存在性**，不是漏拦；契约在
+`tests/security/test_pure_root_errno_contract.py`。
+
+**其他"pure 根 = `/`"的命中怎么处置**（Task 14 Step 1 的全仓扫描，逐条都在这里落定）：产品
+docstring（`envd_service/executors/sandlock.py` 的 `_chroot_root`/`_view_cwd`）与
+`envd_service/config.py` 的字段注释都已经按两形态写；`tests/security/conftest.py`、
+`tests/security/escape/test_path_surface_inotify.py`、`tests/contract/test_route_b_executor.py`
+里的注释说的都是**默认**（identity）形态，成立；`docs/HANDOFF.md` 顶部那段与
+`docs/superpowers/plans/2026-09-10-*` 是**带日期的留档**，按"不改写历史记录"的纪律不动。
+**唯一需要条件标注的现况句就是上面 §6 的 `pwd` 那句**，已更正。
