@@ -39,9 +39,19 @@ LOCAL_BACKEND = (REPO / "autoscaler" / "backends" / "local.py").read_text(
 AUTOSCALE_COMPOSE = (
     REPO / "deploy" / "compose" / "docker-compose.autoscale.yml"
 ).read_text(encoding="utf-8")
+FLEET_STACK = (REPO / "deploy" / "stack" / "docker-compose.prod.yml").read_text(
+    encoding="utf-8"
+)
 
 NET_ISOLATION_KEY = '\n            "E2B_ENABLE_NET_ISOLATION": "true",\n'
 OVERRIDE_SEAM = "\n            **dict(worker_env or {}),\n"
+
+#: The two keys the pool was missing, and the fleet manifest each value comes
+#: from: without `E2B_ENABLE_NETWORK` the worker builds an empty network policy
+#: (every connect fails, loopback included), and without
+#: `E2B_ROUTE_B_TMP_ROOT` a current worker exits 1 before it ever listens (N38
+#: connected items 1 and 3; N39).
+FLEET_KEYS = ("E2B_ENABLE_NETWORK", "E2B_ROUTE_B_TMP_ROOT")
 
 
 def test_local_pool_no_longer_declares_a_low_port_window() -> None:
@@ -100,6 +110,36 @@ def test_autoscale_compose_worker_env_line_declares_the_gated_shape() -> None:
     assert env["E2B_EXECUTOR"] == "${E2B_EXECUTOR:-auto}"
     assert env["E2B_ENABLE_NET_ISOLATION"] == "true"
     assert env["E2B_FD_INJECT_CONNECT"] == "true"
+
+
+def test_the_pool_worker_env_carries_the_two_fleet_keys() -> None:
+    """N38 connected items 1 and 3, spelled out with the fleet's own values."""
+    env = _worker_env()
+    assert env["E2B_ENABLE_NETWORK"] == "true"
+    assert env["E2B_ROUTE_B_TMP_ROOT"] == "/var/lib/e2b-sandboxes/.route-b"
+
+
+def test_the_pool_worker_env_matches_the_fleet_manifest_for_those_keys() -> None:
+    """"Pool == fleet" pinned against the fleet file, not a third copy of it.
+
+    The point of the two keys is alignment with
+    `deploy/stack/docker-compose.prod.yml`; reading the fleet's values here
+    means a later edit on either side that breaks the alignment fails this
+    test instead of surviving as a silent copy-paste.
+    """
+    fleet: dict[str, str] = {}
+    for line in FLEET_STACK.splitlines():
+        stripped = line.strip()
+        for key in FLEET_KEYS:
+            if stripped.startswith(f"{key}:"):
+                fleet[key] = stripped.split(":", 1)[1].strip().strip('"')
+    assert fleet == {
+        "E2B_ENABLE_NETWORK": "true",
+        "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b",
+    }
+    env = _worker_env()
+    assert env[FLEET_KEYS[0]] == fleet[FLEET_KEYS[0]]
+    assert env[FLEET_KEYS[1]] == fleet[FLEET_KEYS[1]]
 
 
 def _env_from_argv(argv: list[str]) -> dict[str, str]:

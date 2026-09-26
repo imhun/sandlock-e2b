@@ -290,7 +290,10 @@ git commit -m "test(lane): let the prod-shaped lane reproduce the netns shape"
 
 **Files:**
 - Modify: `autoscaler/backends/local.py:48-54`（基础 env 字典）、`:80-87`（注释 + 删两行）
-- Modify: `deploy/compose/docker-compose.autoscale.yml:116`（`E2B_AS_WORKER_ENV` JSON 补两个键）
+- Modify: `deploy/compose/docker-compose.autoscale.yml:116`（`E2B_AS_WORKER_ENV` JSON：先补成对的
+  `E2B_ENABLE_NET_ISOLATION`/`E2B_FD_INJECT_CONNECT`；2026-09-26 的 N38 追加裁定再补
+  `E2B_ENABLE_NETWORK` 与 `E2B_ROUTE_B_TMP_ROOT`，取值逐字取自
+  `deploy/stack/docker-compose.prod.yml:196`/`:239`）
 - Create: `tests/unit/test_autoscaler_local_backend_shape.py`
 
 **Interfaces:**
@@ -454,6 +457,22 @@ PY
 ```
 
 Expected: 最后一行打印 `POOL NETNS SHAPE OK`（收尾 `docker compose -f deploy/compose/docker-compose.autoscale.yml down` 由执行者按需决定；`tmp/netns-unify-pool.txt` 留证）。
+
+**形态验证的两个前提（2026-09-26 补记，N38 追加裁定后实测）**
+
+- **必须显式传 `WORKER_IMAGE=`。** compose 的 `E2B_AS_DOCKER_IMAGE` 默认
+  `.../e2b-sandlock-worker:0.1.0` 是 2026-08-30 的快照，该镜像里 `envd_service/config.py`
+  **没有** `E2B_ENABLE_NET_ISOLATION` 这个字段（镜像内 `grep -c` = 0）⇒ 在那个 tag 上
+  `E2B_EXECUTOR=auto`（N38）**等于没切**：实测同一条探针仍是 `lo,eth0`
+  （`tmp/task2-review/run-c-shape-probe-default-image.log`）。池没有"跟着仓库构建 worker"的
+  步骤（`build:` 只给 control-plane/autoscaler），所以这里的一串命令要
+  `WORKER_IMAGE=<用本工作树构建的 tag> docker compose ... up -d`；**默认 tag 要不要换是另一个
+  决定**（未定，登记在 `docs/open-issues.md` N40）。
+- 池的 worker env 与车队**还有若干既有漂移**未修，最直接的一条是 MCP 基镜像：
+  `/usr/bin/mcp-gateway` 是 `COPY` 进 **worker 镜像**的
+  （`deploy/docker/Dockerfile.envd:69`），而池把 `E2B_BASE_IMAGE` 钉在 `python:3.14-slim`
+  ⇒ 池里建 MCP 沙箱必然 503（`mcp gateway failed to start ... can't open file
+  '/usr/bin/mcp-gateway'`）。**既有漂移，见 N40**，不在本计划的改动范围内。
 
 - [ ] **Step 5: 提交**
 

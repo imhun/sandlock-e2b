@@ -107,6 +107,15 @@ services:
       E2B_AS_BACKEND: local
       E2B_AS_MIN_REPLICAS: ${E2B_AS_MIN_REPLICAS:-1}
       E2B_AS_MAX_REPLICAS: ${E2B_AS_MAX_REPLICAS:-8}
+      # The pool has no "build the worker with this repo" step (the `build:`
+      # entries above are control-plane/autoscaler only), so this tag is the
+      # deployed snapshot: 2026-08-30, i.e. *before* any net-isolation code
+      # (`envd_service/config.py` in it does not name `E2B_ENABLE_NET_ISOLATION`
+      # at all), which makes `E2B_EXECUTOR=auto` below inert -- measured
+      # 2026-09-26: sandboxes created through the pool still see `lo,eth0`.
+      # Any shape/egress verification must therefore pass
+      # `WORKER_IMAGE=<tag built from this tree>` explicitly. See
+      # docs/open-issues.md N40.
       E2B_AS_DOCKER_IMAGE: ${WORKER_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0}
       E2B_AS_DOCKER_NETWORK: sandlock
       E2B_AS_WORKSPACE_VOLUME: sandbox-shared
@@ -119,7 +128,14 @@ services:
       # what the fleet runs (N38, 2026-09-26). Set `E2B_EXECUTOR=local` only
       # deliberately: the low-port window the shared-netns wildcard-DNS `:53`
       # bind needs is not declared by the local backend any more.
-      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-python:3.14-slim}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-auto}", "E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
+      # `E2B_ENABLE_NETWORK` and `E2B_ROUTE_B_TMP_ROOT` are the other two keys
+      # the pool was missing next to the pair (N38 connected items 1 and 3),
+      # taken verbatim from the fleet
+      # (`deploy/stack/docker-compose.prod.yml:196` and `:239`): without the
+      # first the worker builds an empty network policy (every connect fails,
+      # loopback included), and without the second a current worker exits 1 at
+      # `configure_priv_helpers` before it ever listens (N39).
+      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-python:3.14-slim}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-auto}", "E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", "E2B_ENABLE_NETWORK": "true", "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
       E2B_AS_POLL_S: ${E2B_AS_POLL_S:-5}
       E2B_AS_UTIL_THRESHOLD: ${E2B_AS_UTIL_THRESHOLD:-0.70}
       E2B_AS_SCALE_UP_COOLDOWN_S: ${E2B_AS_SCALE_UP_COOLDOWN_S:-60}
