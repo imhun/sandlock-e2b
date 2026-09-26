@@ -161,10 +161,26 @@ services:
       # enforced when the platform switch is on.
       E2B_ENABLE_NETWORK: "true"
       E2B_NETWORK_DENY_CIDRS: ${E2B_NETWORK_DENY_CIDRS:-0.0.0.0/8,10.0.0.0/8,100.64.0.0/10,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.168.0.0/16,224.0.0.0/4,240.0.0.0/4,::/128,::1/128,::ffff:0:0/96,fe80::/10,fd00::/8,ff00::/8}
-      # Fork sandlock now tracks the netns-free upstream PR line; wildcard
-      # allowOut works on the unprivileged shared-netns path, so netns is
-      # gone and E2B_ENABLE_NETNS is accepted but ignored.
+      # Legacy, compatibility only: the fork dropped per-sandbox veth/netns,
+      # so this flag is accepted but ignored
+      # (envd_service/executors/sandlock.py:744-748). The shape switch is the
+      # pair below, same as the fleet.
       E2B_ENABLE_NETNS: ${E2B_ENABLE_NETNS:-false}
+      # Fleet shape (deploy/stack/docker-compose.prod.yml:209-210): each
+      # sandbox gets its own loopback-only netns, and outgoing connects are
+      # mediated by the supervisor's connect-fd injection. BOTH are required --
+      # `create_app` refuses the unpaired shape by name
+      # (envd_service/config.py:471-479; the single switch leaves every sandbox
+      # loopback-only, i.e. "the network is down" with nothing in the logs), so
+      # a typo here crash-loops the worker instead of silently breaking
+      # sandboxes. This is why no container-level `sysctls:` window is declared
+      # any more: the wildcard-DNS `:53` bind now happens inside the sandbox's
+      # own netns, covered by its root-in-userns CAP_NET_BIND_SERVICE.
+      # Rollback (stack precedent: deploy/stack/docker-compose.prod.yml:351-352)
+      # is setting both to false in deploy/compose/.env and recreating -- and
+      # then wildcard allowOut needs the low-port window back.
+      E2B_ENABLE_NET_ISOLATION: ${E2B_ENABLE_NET_ISOLATION:-true}
+      E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT:-true}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
@@ -192,25 +208,10 @@ services:
     volumes: &worker-volumes
       - sandbox-shared:/var/lib/e2b-sandboxes
     # A6: the worker needs no SYS_ADMIN (shared-volume bind deleted in A4,
-    # quota served by the quota-agent, low-port window declared below). Enabling
-    # the agent form is setting E2B_QUOTA_AGENT_URL; without it quota degrades
-    # with warnings and the sandbox/volume paths keep working.
-    sysctls:
-      # The wildcard DNS gateway binds 127.0.1.x:53; resolv.conf cannot carry
-      # a port, so allow unprivileged low-port binding (namespaced per
-      # container, applied by the runtime from this spec -- no SYS_ADMIN, no
-      # in-container sysctl write). MCP inbound ports are 50005+.
-      #
-      # Load-bearing for THIS example, which runs the shared-netns shape: the
-      # gateway binds in the worker's netns as uid 65534, and the kernel
-      # refuses :53 there without the window (measured 2026-09-24 on the
-      # aarch64 lane against the same shape: `bind DNS gateway: Permission
-      # denied (os error 13)` with the stock default). The fleet shape --
-      # `deploy/stack/docker-compose.prod.yml` and the k8s `worker.yaml` --
-      # runs per-sandbox netns (`E2B_ENABLE_NET_ISOLATION` +
-      # `E2B_FD_INJECT_CONNECT`), where the bind happens inside the sandbox's
-      # own netns and neither manifest declares a low-port window.
-      - net.ipv4.ip_unprivileged_port_start=0
+    # quota served by the quota-agent, and since 2026-09-26 no low-port window
+    # either -- see the net-isolation pair above). Enabling the agent form is
+    # setting E2B_QUOTA_AGENT_URL; without it quota degrades with warnings and
+    # the sandbox/volume paths keep working.
     security_opt:
       # The worker is the process that builds every sandbox, so it is the one
       # that needs a user namespace and the seccomp-notification fd from the

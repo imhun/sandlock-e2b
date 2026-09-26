@@ -36,6 +36,9 @@ REPO = Path(__file__).resolve().parent.parent.parent
 STACK_COMPOSE = (REPO / "deploy" / "stack" / "docker-compose.prod.yml").read_text(
     encoding="utf-8"
 )
+COMPOSE_PROD = (
+    REPO / "deploy" / "compose" / "docker-compose.prod.yml"
+).read_text(encoding="utf-8")
 K8S_WORKER = (REPO / "deploy" / "k8s" / "worker.yaml").read_text(encoding="utf-8")
 K8S_CONTROL_PLANE = (REPO / "deploy" / "k8s" / "control-plane.yaml").read_text(
     encoding="utf-8"
@@ -770,3 +773,31 @@ def test_worker_manifest_points_at_the_installer() -> None:
     assert "            seccompProfile:\n              type: Localhost\n" in K8S_WORKER
     assert "              localhostProfile: sandlock-worker.json\n" in K8S_WORKER
     assert "seccomp-installer.yaml" in K8S_WORKER
+
+
+def test_compose_prod_example_runs_the_fleet_netns_shape() -> None:
+    """N36: the single-host example follows the fleet, window and all.
+
+    `deploy/compose/docker-compose.prod.yml` ran the shared-netns shape (uid
+    65534) and paid for it with a container-level
+    `net.ipv4.ip_unprivileged_port_start=0` window. It now carries the same
+    paired switches the stack anchor does, so the wildcard-DNS `:53` bind
+    happens inside each sandbox's own netns instead. A half-migration -- window
+    back, or one switch without the other -- is what these assertions catch.
+
+    Pinned here rather than in a new file because this module already owns the
+    "the manifests must not ask the worker to bind a low port" family, and the
+    slice trick below is the same one the stack assertions use.
+    """
+    worker = COMPOSE_PROD.split("\n  worker-1: &worker", 1)[1].split(
+        "\n  worker-2:", 1
+    )[0]
+    # The directive, not the prose: the comment above the line names the old
+    # value on purpose.
+    assert "\n    sysctls:\n" not in COMPOSE_PROD
+    assert "\n      - net.ipv4.ip_unprivileged_port_start=0\n" not in COMPOSE_PROD
+    # The anchor every worker inherits (worker-2/worker-3 use `<<: *worker-env`).
+    assert "\n      E2B_ENABLE_NET_ISOLATION: ${E2B_ENABLE_NET_ISOLATION:-true}\n" in worker
+    assert "\n      E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT:-true}\n" in worker
+    # The worker still runs the shipped seccomp profile, not `unconfined`.
+    assert "\n      - seccomp=${E2B_SECCOMP_PROFILE:-../seccomp/sandlock-worker.json}\n" in worker
