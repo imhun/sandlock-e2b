@@ -46,6 +46,10 @@ KUBECONFIG=... deploy/k8s-k0s/apply.sh
 `optional: true`（刻意的过渡态：先 apply 清单还是先跑脚本都不会让 CP 起不来），所以键补上
 之后要 `kubectl -n sandlock rollout restart deploy/control-plane` 才真正读到。
 
+⚠ 开这个键**只影响之后的写入**：已经在卷上落盘的明文记录要跑一次
+`deploy/scripts/cleanup-plaintext-secrets.py`（经 registry 重写为密文 + 清理残留明文副本 +
+校验；无主 key 时拒绝执行）。操作步骤见 `docs/k8s-deployment.md` §4.5.1。
+
 ## 凭据轮换（k0s）
 
 `secrets.sh` 是唯一允许改值的入口：不点名 `--rotate <KEY>` 时，已有的键**一律不动**。

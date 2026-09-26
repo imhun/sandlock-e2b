@@ -209,6 +209,46 @@ deploy/k8s-k0s/secrets.sh --fingerprint        # 逐键 sha256(前16)+长度；�
 kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data}' | wc -c   # 只报大小
 ```
 
+### 4.5.1 一次性清理既有明文 secret（O3 第二轮，2026-09-26 裁定）
+
+开 `E2B_SECRET_MASTER_KEY`（Task 1 / `dd96266`）只改变**之后**的写入。此前 CP 在降级态
+写下的记录仍是共享卷上的明文（`<workspace_base>/_secrets/<id>/secret.json` 里
+`"encrypted": false` + 明文值），而 worker 整卷 RW 挂载 ⇒ 拿到 pod root 就能读。
+清理工具是 `deploy/scripts/cleanup-plaintext-secrets.py`（**不改任何 secret 的值**）：
+它把目录交给 `SecretRegistry` 用主 key 走一遍读路径（`_scan_disk` 会把明文记录就地重写成
+Fernet 密文），再删掉**已被加密记录证明保留下来的**明文副本（旧 payload 的备份、目录名与
+`secret_id` 不一致留下的残件、内嵌明文的其他文件），最后校验整棵目录：没有明文、每条记录
+都能用主 key 回读。**没有 `E2B_SECRET_MASTER_KEY` 时拒绝执行**（exit 2）——那种"重写"仍会
+落明文，只会给人清理过的错觉。幂等：再跑一次是 0 重写、0 删除、校验通过。
+
+在 **control-plane pod 里**跑（主 key 与卷都在那里；`python3 -` 是
+`deploy/k8s-k0s/apply.sh` 送 in-container helper 的既有写法，stdin 让脚本不进镜像）：
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+
+# ① 先确认主 key 已经进了 Secret（Task 1）：只打指纹，不打明文
+deploy/k8s-k0s/secrets.sh --fingerprint | rg '^E2B_SECRET_MASTER_KEY'
+
+# ② 确认 CP 已经拿着主 key 起来了（不该再有降级告警）
+kubectl -n sandlock rollout status deploy/control-plane --timeout=300s
+kubectl -n sandlock logs deploy/control-plane --tail=200 | rg -n 'E2B_SECRET_MASTER_KEY is not configured' || true
+
+# ③ 迁移 + 清理 + 校验（stdout 是 JSON 报告，只含路径/名字/sha256(前16)）
+kubectl -n sandlock exec -i deploy/control-plane -- \
+    python3 - < deploy/scripts/cleanup-plaintext-secrets.py
+
+# ④ 抽查：每一份 secret.json 都是加密态（grep -L 列出"不含 encrypted:true"的文件 ⇒ 应为空）
+kubectl -n sandlock exec deploy/control-plane -- sh -c \
+    'grep -L "\"encrypted\":true" /var/lib/e2b-sandboxes/_secrets/*/secret.json'
+```
+
+退出码：`0` 校验通过（幂等重跑也落这里）；`2` 没有主 key，拒绝；`3` 有需要人工确认的
+文件（报告里逐条列出；确认无害可加 `--allow-unknown-files` 重跑）；`4` 目标目录/参数不对。
+**不改任何凭据的值**：重写只换落盘形态，secret 的 `version` 不变，读回来的值逐字节相同。
+CP 副本多于一个时，先让所有副本都滚到带主 key 的版本再跑 —— 否则另一个仍在降级态的进程
+按新写入会在下一次写时重新落明文。
+
 ---
 
 ## 5. 把 k8s 切到与 compose 相同的形态（✅ 2026-09-17 已落地：N5 / N10）
@@ -231,6 +271,11 @@ kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data}' | wc -c   # 只
 wildcard-DNS 的 `:53`，而切了 netns 之后那个 bind 发生在沙箱自己的 netns 里，root-in-userns 自带
 `CAP_NET_BIND_SERVICE`（fork `context.rs`）。（`deploy/k8s/worker.yaml` 的注释与
 `tests/unit/test_worker_manifest_permissions.py` 都按"k8s 仍是共享 netns"钉住，切换时要一起改。）
+
+同一形态也是 `deploy/compose/docker-compose.prod.yml`、
+`deploy/compose/docker-compose.multinode.yml` 与本地池 `autoscaler/backends/local.py`
+的形态（2026-09-26 统一），四处的低端口窗口都因此不再需要。仓库里唯一还带窗口的地方是
+aarch64 lane 的共享 netns 套件（`deploy/scripts/arm-lane/guest-prep.sh`，lane-only）。
 
 **pid_ns（N10）**——加一条即可（没有配对守卫；pid_ns 不会让沙箱离线）：
 
