@@ -81,7 +81,19 @@ services:
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
       E2B_IMAGE_CACHE_OWNER_UID: ${E2B_IMAGE_CACHE_OWNER_UID:-65534}
-      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
+      # N40: `/usr/bin/mcp-gateway` -- what a sandbox's `/mcp` route execs -- is
+      # baked into the *base image* the sandbox's rootfs comes from
+      # (`deploy/docker/Dockerfile.mcp-base`; the worker image carries its own
+      # copy at the same path). The plain `python:3.14-slim` this file used to
+      # pin cannot start it, so every pooled `/mcp` was a 503 ("mcp gateway
+      # failed to start ... can't open file '/usr/bin/mcp-gateway'"). The
+      # default is the fleet's own MCP-capable image, verbatim from the digest
+      # pin both fleet manifests carry (`deploy/k8s/worker.yaml` and
+      # `deploy/k8s/control-plane.yaml` -- the manifest comments there call it
+      # the same digest-pinned ACR mirror); `E2B_BASE_IMAGE=` in the pool's
+      # `.env` still overrides it. Pinned by
+      # `tests/unit/test_autoscaler_local_backend_shape.py`.
+      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6}
       E2B_MAX_SANDBOXES: ${E2B_MAX_SANDBOXES:-1000}
       # Dynamic pools: the autoscaler governs fleet capacity, so the
       # single-host global caps are disabled (0 = unlimited).
@@ -139,7 +151,12 @@ services:
       # local debugger should know: the pool goes from silently having no egress
       # to following the sandbox ruleset -- a request without `network` reaches
       # only the fixed pypi/npm/github domain set, same as the fleet.
-      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-python:3.14-slim}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-auto}", "E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", "E2B_ENABLE_NETWORK": "true", "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
+      # `E2B_BASE_IMAGE` is the third key that used to drift here (N40): it was
+      # the plain `python:3.14-slim`, which has no `/usr/bin/mcp-gateway`, so a
+      # pooled sandbox's `/mcp` route was always a 503. It now defaults to the
+      # MCP-capable image the control plane above uses (same variable, so one
+      # `E2B_BASE_IMAGE=` in `.env` moves both sides together).
+      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-auto}", "E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", "E2B_ENABLE_NETWORK": "true", "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
       E2B_AS_POLL_S: ${E2B_AS_POLL_S:-5}
       E2B_AS_UTIL_THRESHOLD: ${E2B_AS_UTIL_THRESHOLD:-0.70}
       E2B_AS_SCALE_UP_COOLDOWN_S: ${E2B_AS_SCALE_UP_COOLDOWN_S:-60}

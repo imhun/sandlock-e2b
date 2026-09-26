@@ -43,9 +43,20 @@ FLEET_STACK = (REPO / "deploy" / "stack" / "docker-compose.prod.yml").read_text(
     encoding="utf-8"
 )
 FLEET_K8S = (REPO / "deploy" / "k8s" / "worker.yaml").read_text(encoding="utf-8")
+FLEET_K8S_CONTROL_PLANE = (REPO / "deploy" / "k8s" / "control-plane.yaml").read_text(
+    encoding="utf-8"
+)
 
 NET_ISOLATION_KEY = '\n            "E2B_ENABLE_NET_ISOLATION": "true",\n'
 OVERRIDE_SEAM = "\n            **dict(worker_env or {}),\n"
+
+#: The base image both the control plane and every worker build sandboxes from.
+#: The pool declared it as `${E2B_BASE_IMAGE:-python:3.14-slim}` in two places
+#: while `/usr/bin/mcp-gateway` is baked into the *image* the sandbox is built
+#: from (`deploy/docker/Dockerfile.mcp-base`, the worker image carrying its own
+#: copy at the same path) -- so a pooled sandbox could not start the gateway and
+#: every `/mcp` route was a 503 (N40).
+BASE_IMAGE_KEY = "E2B_BASE_IMAGE"
 
 #: The two keys the pool was missing, and the fleet manifest each value comes
 #: from: without `E2B_ENABLE_NETWORK` the worker builds an empty network policy
@@ -159,7 +170,7 @@ def _k8s_fleet_values() -> dict[str, str]:
     return found
 
 
-def _k8s_env(key: str) -> str:
+def _k8s_env(key: str, manifest: str = FLEET_K8S) -> str:
     """One k8s worker env value by name, in the same dialect as above.
 
     N27 needs a key outside `FLEET_KEYS` here: the route-B root is no longer a
@@ -170,13 +181,67 @@ def _k8s_env(key: str) -> str:
     assertion a comparison between two declarations instead of a third copy of
     a literal.
     """
-    lines = [line.strip() for line in FLEET_K8S.splitlines()]
+    lines = [line.strip() for line in manifest.splitlines()]
     marker = f"- name: {key}"
     hits = [index for index, line in enumerate(lines) if line == marker]
     assert len(hits) == 1, f"expected exactly one {key!r} env entry: {hits}"
-    value_line = lines[hits[0] + 1]
+    # The value is the entry's business: some carry a comment block above it
+    # (the base image's digest pin explains itself there), so walk past those.
+    cursor = hits[0] + 1
+    while cursor < len(lines) and (lines[cursor] == "" or lines[cursor][0] == "#"):
+        cursor += 1
+    assert cursor < len(lines), f"no value line after {key!r}"
+    value_line = lines[cursor]
     assert value_line.startswith("value: "), value_line
     return value_line[len("value: ") :].strip().strip('"')
+
+
+def _fleet_base_images() -> dict[str, str]:
+    """The fleet's MCP-capable base image, as each manifest spells it.
+
+    The fleet *compose* stack carries this key as a bare `${E2B_BASE_IMAGE}`
+    (its value lives in the node-local, untracked `deploy/stack/.env`), so the
+    fleet files that name the image in-tree are the two k8s manifests -- and
+    the worker manifest's own comment says they have to keep in step ("Same
+    registry + digest pinning ... Docker Hub is unreachable from the deployment
+    hosts"). Reading both is what makes a one-sided fleet drift red here.
+    """
+    return {
+        "deploy/k8s/worker.yaml": _k8s_env(BASE_IMAGE_KEY),
+        "deploy/k8s/control-plane.yaml": _k8s_env(
+            BASE_IMAGE_KEY, FLEET_K8S_CONTROL_PLANE
+        ),
+    }
+
+
+def _pool_base_image_defaults() -> list[str]:
+    """Every default the pool's compose file declares for the base image.
+
+    The control plane resolves, warms and caches this image's rootfs itself
+    (`E2B_IMAGE_CACHE_DIR`), and `E2B_AS_WORKER_ENV` hands the same key to every
+    spawned worker -- a pool that ran two different bases would build sandboxes
+    from a rootfs the control plane never warmed, so both are read. Every
+    `${E2B_BASE_IMAGE:-...}` in the file is collected (not just the two known
+    sites) and the count is pinned, so a third declaration cannot hide: prose in
+    this file may name the old literal on purpose, an interpolation may not.
+
+    The pool declares the base image this way on purpose: one `E2B_BASE_IMAGE=`
+    in `deploy/compose/.env` overrides it for the control plane *and* for the
+    workers `E2B_AS_WORKER_ENV` spawns. What is pinned here is the default --
+    what the pool runs with no `.env` at all.
+    """
+    prefix = f"${{{BASE_IMAGE_KEY}:-"
+    defaults: list[str] = []
+    cursor = 0
+    while (start := AUTOSCALE_COMPOSE.find(prefix, cursor)) != -1:
+        value_start = start + len(prefix)
+        end = AUTOSCALE_COMPOSE.index("}", value_start)
+        defaults.append(AUTOSCALE_COMPOSE[value_start:end])
+        cursor = end + 1
+    # Two sites today: the control plane's own environment and the JSON the
+    # autoscaler hands each spawned worker.
+    assert len(defaults) == 2, defaults
+    return defaults
 
 
 def _fleet_manifest_values() -> dict[str, dict[str, str]]:
@@ -331,3 +396,42 @@ def test_spawned_worker_argv_lets_the_operator_override_the_fleet_keys(monkeypat
     assert [token for token in argv if token.startswith("E2B_ROUTE_B_TMP_ROOT=")] == [
         "E2B_ROUTE_B_TMP_ROOT=/elsewhere/.route-b"
     ]
+
+
+def test_the_pool_base_image_is_the_fleets_mcp_capable_one() -> None:
+    """N40: the pool builds sandboxes from the image the fleet builds them from.
+
+    `/usr/bin/mcp-gateway` is what a sandbox's `/mcp` route execs, and it is
+    baked into the **base image** the sandbox's rootfs comes from
+    (`deploy/docker/Dockerfile.mcp-base`; the worker image carries its own copy
+    at the same path, which is why the drift below only showed up as a 503 on
+    `/mcp` and not as a broken worker). The pool pinned the plain
+    `python:3.14-slim` instead, so every pooled sandbox answered
+    `mcp gateway failed to start ... can't open file '/usr/bin/mcp-gateway'`.
+
+    The value is *read* from the fleet manifests and compared, not copied here
+    a second time: bumping the fleet's pin without the pool (or the other way
+    round) fails this test rather than silently splitting the two.
+    """
+    fleet = _fleet_base_images()
+    assert set(fleet) == {
+        "deploy/k8s/worker.yaml",
+        "deploy/k8s/control-plane.yaml",
+    }
+    # The two fleet manifests carry the same image; either one moving alone is
+    # a drift this pin is about too (the worker manifest's comment says so).
+    assert len(set(fleet.values())) == 1, fleet
+    fleet_base = fleet["deploy/k8s/worker.yaml"]
+    # Digest-pinned (E6.2): a bare tag would silently re-point every sandbox's
+    # rootfs on the next push, which is exactly how a base image drifts.
+    reference, separator, digest = fleet_base.partition("@")
+    assert separator == "@", fleet_base
+    repository, colon, tag = reference.rpartition(":")
+    assert colon == ":" and repository != "" and tag != "", reference
+    assert digest.startswith("sha256:")
+    assert len(digest) == len("sha256:") + 64
+    assert set(digest[len("sha256:") :]) <= set("0123456789abcdef")
+    # ...and the pool's own declarations, out of the box, are that image. The
+    # old default was the plain `python:3.14-slim`, whose rootfs has no
+    # `/usr/bin/mcp-gateway` at all.
+    assert set(_pool_base_image_defaults()) == {fleet_base}
