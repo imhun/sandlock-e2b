@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from envd_service.config import (
     Settings,
     check_net_isolation_pairing,
+    check_pure_rootfs_pairing,
     check_seccomp_filter,
 )
 from envd_service.agent import (
@@ -233,6 +234,12 @@ def create_app(
     # worker whose network looks "down" with nothing in its logs. The
     # intentional no-egress shape sets E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY=1.
     check_net_isolation_pairing(settings)
+    # N16 pairing guard (2026-09-26): `E2B_PURE_ROOTFS=synth` gets its binds
+    # from the real-root path only, so without `E2B_REAL_ROOT` the skeleton
+    # stays empty and every sandbox it builds dies on its own `/bin/sh`
+    # (errno 13, then `instance is closed` for every verb). Same rule as the
+    # switch above: fail at startup, by name, with the way out.
+    check_pure_rootfs_pairing(settings)
     # A7 follow-up (2026-09-16): the worker must actually run under the shipped
     # seccomp profile. A missing one is silent in two different ways -- no filter
     # at all (`Seccomp: 0`: the sandboxes inherit the worker's syscall surface),

@@ -175,9 +175,11 @@ class Settings:
     #: ``synth`` materializes a real root per sandbox -- a plain directory the
     #: sandbox's own mount namespace binds the host system directories, the
     #: workspace and the volumes into -- so the pure shape can use the fork's
-    #: ``real_root`` as well. ``off`` is the default: this is a shape an
-    #: operator flips, not a silent change to a running fleet. The flip has an
-    #: ordering condition -- see
+    #: ``real_root`` as well, and it *needs* it: with ``E2B_REAL_ROOT`` off the
+    #: binds never happen, the skeleton stays empty, and the worker refuses the
+    #: combination at startup (:data:`PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR`).
+    #: ``off`` is the default: this is a shape an operator flips, not a silent
+    #: change to a running fleet. The flip has an ordering condition -- see
     #: :data:`gateway_common.paths.PURE_ROOTFS_DIR_NAME`.
     pure_rootfs: str = field(
         default_factory=lambda: os.getenv("E2B_PURE_ROOTFS", "off").strip().lower()
@@ -555,6 +557,25 @@ NET_ISOLATION_PAIRING_ERROR = (
 )
 
 
+#: Raised when ``E2B_PURE_ROOTFS=synth`` is asked for without ``E2B_REAL_ROOT``
+#: (N16, measured 2026-09-26). The two switches are not a pair an operator may
+#: pick only one of: the synthesized root is an *empty* skeleton and the binds
+#: that fill it (host system directories, the workspace, the volumes) only
+#: happen on the real-root path. Named so the refused pair is one greppable
+#: sentence in a crash-looping worker's log rather than 32 ``instance is
+#: closed`` errors to reverse-engineer.
+PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR = (
+    "E2B_PURE_ROOTFS=synth without E2B_REAL_ROOT=1: the synthesized root is an "
+    "empty skeleton, and only the real root (a mount namespace it binds into) "
+    "puts the host system directories, the workspace and the volumes inside "
+    "it. With the emulated root every path resolves inside that skeleton, so "
+    "the sandbox's own /bin/sh does not exist: the create dies with errno 13 "
+    "and every later command answers `instance is closed`. Set "
+    "E2B_REAL_ROOT=1 so the skeleton gets its binds, or leave E2B_PURE_ROOTFS "
+    "unset to keep the pure shape on N15's identity root."
+)
+
+
 #: Raised when the worker is not running under the shipped seccomp profile.
 #: Named so a crash-looping pod says which knob to turn.
 SECCOMP_FILTER_MISSING_ERROR = (
@@ -760,3 +781,26 @@ def check_net_isolation_pairing(settings: Settings) -> None:
     if getattr(settings, "allow_loopback_only", False):
         return
     raise RuntimeError(NET_ISOLATION_PAIRING_ERROR)
+
+
+def check_pure_rootfs_pairing(settings: Settings) -> None:
+    """Refuse the synthesized pure root without the real root (measured 2026-09-26).
+
+    ``E2B_PURE_ROOTFS=synth`` builds an *empty* skeleton per sandbox and relies
+    on the fork's ``real_root`` path to bind the host system directories, the
+    workspace and the volumes into it. With ``E2B_REAL_ROOT`` off that path
+    never runs, so the mediated paths resolve inside the skeleton, ``/bin/sh``
+    is missing, the create dies with errno 13 and every later verb answers
+    ``instance is closed`` -- a shape an operator cannot read back to a
+    configuration mistake. Fail here, by name, instead of serving it.
+
+    See docs/superpowers/plans/2026-09-26-decisions.md (追加裁定 2026-09-26)
+    and .superpowers/sdd/pure-task-9-report.md §2 for the measurement.
+    """
+    # getattr with the conservative defaults, same as the sibling guard: a
+    # settings double that predates these fields keeps its old behaviour.
+    if getattr(settings, "pure_rootfs", "off") != "synth":
+        return
+    if getattr(settings, "real_root", False):
+        return
+    raise RuntimeError(PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR)

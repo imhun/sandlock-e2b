@@ -132,3 +132,45 @@ def test_the_security_helper_stays_on_the_identity_root_by_default(
         assert executor._chroot_root == "/"
     finally:
         executor.close()
+
+
+def test_the_synthetic_root_is_refused_without_the_real_root() -> None:
+    """`E2B_PURE_ROOTFS=synth` + `E2B_REAL_ROOT` off cannot work (2026-09-26).
+
+    The synthesized root is an empty skeleton, and only the real root (the
+    mount namespace + `pivot_root` path) binds the host system directories, the
+    workspace and the volumes into it. With the emulated root every path stays
+    inside that skeleton, so the sandbox's own `/bin/sh` does not exist: the
+    create dies with errno 13 and every later command answers `instance is
+    closed`. The guard names the two switches and the way out, so a
+    misconfigured worker refuses to start instead of serving sandboxes that are
+    dead on arrival.
+    """
+    from types import SimpleNamespace
+
+    import pytest
+
+    from envd_service.app import create_app
+    from envd_service.config import (
+        PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR,
+        check_pure_rootfs_pairing,
+    )
+
+    def _settings(pure_rootfs: str, real_root: bool) -> SimpleNamespace:
+        return SimpleNamespace(pure_rootfs=pure_rootfs, real_root=real_root)
+
+    # The refused shape, and its exact message.
+    with pytest.raises(RuntimeError) as excinfo:
+        check_pure_rootfs_pairing(_settings("synth", False))
+    assert str(excinfo.value) == PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR
+
+    # The user's own list of switches stays reachable: off, or paired.
+    assert check_pure_rootfs_pairing(_settings("off", False)) is None
+    assert check_pure_rootfs_pairing(_settings("off", True)) is None
+    assert check_pure_rootfs_pairing(_settings("synth", True)) is None
+
+    # The worker refuses to come up with that same sentence, which is the path
+    # a deployment actually takes.
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings=_settings("synth", False))
+    assert str(excinfo.value) == PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR
