@@ -83,10 +83,12 @@ async def _warm_base_image(settings: Settings) -> None:
             logger.warning("worker image warm failed: %s", image, exc_info=True)
 
 
-async def _startup_reconcile(settings: Settings) -> None:
+async def _startup_reconcile(settings: Settings, state_base=None) -> None:
     """Reconcile quota table vs sandbox.json records once at worker startup."""
     try:
-        result = await asyncio.to_thread(_startup_reconcile_once, settings)
+        result = await asyncio.to_thread(
+            _startup_reconcile_once, settings, state_base
+        )
     except ProjectQuotaError as exc:
         logger.warning("startup quota reconciliation skipped: %s", exc)
         return
@@ -97,19 +99,27 @@ async def _startup_reconcile(settings: Settings) -> None:
     )
 
 
-def _startup_reconcile_once(settings: Settings) -> dict:
+def _startup_reconcile_once(settings: Settings, state_base=None) -> dict:
     """One blocking startup reconcile pass (the thread target).
 
     W6: the bounded quota-agent readiness wait runs first and on the same
     worker thread, so a worker that started before the agent did does not
     record the race as a degraded reconciliation — and the wait can never
     block the event loop or the heartbeat loop.
+
+    ``state_base`` is the base the records are read from, and it is passed in
+    rather than taken from ``settings``: the caller is the lifespan, which
+    knows the registry this app actually serves its sandboxes from. The two are
+    the same base in every deployment shape, but this function's whole job is
+    to *not* call a live sandbox's project row an orphan, and an empty record
+    set -- reading a base no record was written to -- is exactly how it would.
     """
     wait_for_startup_readiness(settings.workspace_base)
     return reconcile_orphan_projects(
         workspace_base=settings.workspace_base,
         mount_point=settings.workspace_base,
         via_agent=settings.quota_via_agent,
+        state_base=state_base if state_base is not None else settings.state_base,
     )
 
 
@@ -251,7 +261,18 @@ def create_app(
             timeout_s=settings.quota_agent_timeout_s,
         )
     runtime_registry = runtime_registry or RuntimeRegistry(
-        workspace_base or settings.workspace_base
+        workspace_base or settings.workspace_base,
+        state_base=settings.state_base,
+    )
+    # The base this app's *platform* files live under: the registry's, because
+    # that is where the records it serves were written. ``create_app`` may have
+    # been handed a registry of its own (tests, embedders) built on a base the
+    # settings do not name; every component that has to pair with a record --
+    # the uid pool's own record scan and the quota reconciler -- takes it from
+    # there, so no reader can end up on a base with no records in it. In every
+    # deployment shape this is ``settings.state_base``.
+    platform_state_base = (
+        getattr(runtime_registry, "state_base", None) or settings.state_base
     )
     # Track F (Task F1): resolve the file-capability brokers once, before the
     # uid pool / route-B decisions below depend on them. A half-installed
@@ -295,6 +316,7 @@ def create_app(
             start=settings.uid_pool_start,
             size=settings.uid_pool_size,
             workspace_base=workspace_base or settings.workspace_base,
+            state_base=platform_state_base,
         )
         runtime_registry.add_unregister_callback(
             runtime_registry.uid_pool.release
@@ -332,7 +354,9 @@ def create_app(
         quota_monitor.start()
         reconcile_task: asyncio.Task | None = None
         if settings.quota_reconcile_on_startup:
-            reconcile_task = asyncio.create_task(_startup_reconcile(settings))
+            reconcile_task = asyncio.create_task(
+                _startup_reconcile(settings, platform_state_base)
+            )
             app.state.reconcile_task = reconcile_task
         uid_reconcile_task: asyncio.Task | None = None
         if (

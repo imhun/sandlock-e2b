@@ -281,6 +281,30 @@ def test_reconcile_posts_workspace_and_mount():
     )
 
 
+def test_reconcile_posts_the_state_base_when_the_deployment_has_one():
+    """N27: the agent reads the *records*, so it has to know the base they are in.
+
+    The body above is byte-for-byte the pre-N27 request on purpose: a deployment
+    that has not moved its state sends exactly what it always sent.
+    """
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"cleaned": [], "skipped": []})
+
+    client = _client(handler)
+    assert client.reconcile(
+        workspace_base="/mnt/nfs/workspaces",
+        mount_point="/mnt/nfs",
+        state_base="/mnt/nfs/state",
+    ) == {"cleaned": [], "skipped": []}
+    assert requests[0].read() == (
+        b'{"workspace_base":"/mnt/nfs/workspaces","mount":"/mnt/nfs",'
+        b'"state_base":"/mnt/nfs/state"}'
+    )
+
+
 def test_reconcile_missing_fields_raises():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"cleaned": [1]})

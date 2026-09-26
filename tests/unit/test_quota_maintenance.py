@@ -1011,6 +1011,34 @@ def test_reconcile_via_agent_dispatches(monkeypatch):
     assert result == {"cleaned": [7], "skipped": []}
 
 
+def test_reconcile_via_agent_is_told_when_the_records_moved(monkeypatch):
+    """N27: the agent reads the records, so it is told the base they are in.
+
+    Only when that base is *not* the workspace base -- the default layout
+    sends exactly the pre-N27 request (``test_reconcile_via_agent_dispatches``
+    above), which is what an agent older than the switch understands.
+    """
+    seen: dict = {}
+
+    def reconcile(**kwargs):
+        seen.update(kwargs)
+        return {"cleaned": [7], "skipped": []}
+
+    monkeypatch.setattr(xfs_quota, "agent_ops", {"reconcile": reconcile})
+    result = reconcile_orphan_projects(
+        workspace_base="/nfs/workspaces",
+        mount_point="/nfs",
+        via_agent=True,
+        state_base="/nfs/state",
+    )
+    assert seen == {
+        "workspace_base": "/nfs/workspaces",
+        "mount_point": "/nfs",
+        "state_base": "/nfs/state",
+    }
+    assert result == {"cleaned": [7], "skipped": []}
+
+
 def test_reconcile_via_agent_not_configured_raises(monkeypatch):
     monkeypatch.setattr(xfs_quota, "agent_ops", None)
     with pytest.raises(ProjectQuotaError) as excinfo:
@@ -1452,6 +1480,11 @@ async def test_app_lifespan_starts_quota_maintenance(tmp_path, monkeypatch):
             "workspace_base": tmp_path,
             "mount_point": tmp_path,
             "via_agent": False,
+            # N27: the records are read from the base the registry wrote them
+            # to. Here that is the workspace base -- nothing configured a
+            # second one -- and the reconciler is told so explicitly instead of
+            # having to guess.
+            "state_base": tmp_path,
         }
     assert app.state.quota_monitor._task is None
 

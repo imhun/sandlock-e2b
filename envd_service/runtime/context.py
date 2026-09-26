@@ -348,8 +348,29 @@ class SandboxRuntimeContext:
         )
         # Platform file: written beside the sandbox's tree, not inside it (the
         # sandbox owns its tree and could delete or rewrite anything there).
+        #
+        # Which bases those are comes from the registry when there is one: it
+        # is what read this record, and ``create_app`` may have been pointed at
+        # a base -- with a registry on it -- that the environment does not name
+        # (``agent._registry_state_base``). The old code took the *state* base
+        # from the directory the record's own ``workspace_dir`` sits in, which
+        # cannot answer that question any more: with the tree root sunk one
+        # level (``<export>/workspaces/<id>``) that directory is the
+        # *workspace* base, while the platform's own files live under the state
+        # base (N27).
+        workspace_base = (
+            getattr(runtime_registry, "workspace_base", None)
+            or settings.workspace_base
+        )
+        state_base = (
+            getattr(runtime_registry, "state_base", None) or settings.state_base
+        )
         self.command_logs = CommandLogWriter(
-            sandbox_runtime_dir(Path(record.workspace_dir).parent, record.sandbox_id)
+            sandbox_runtime_dir(
+                workspace_base,
+                record.sandbox_id,
+                state_base=state_base,
+            )
         )
         self.processes = ProcessManager(
             self.executor,

@@ -20,13 +20,15 @@ persist) — reclaims them and chowns the stale directories away from the pool
 so a later allocation cannot inherit foreign files.
 
 Cross-process safety (I1): ``acquire`` briefly takes an exclusive ``flock``
-on the shared state file ``<workspace_base>/.uid_pool.lock`` while it
-recomputes the free set and atomically writes a reservation marker
-(``<workspace_base>/.uid_reservations/<sandbox_id>``). The marker makes the
-reservation visible to every other worker sharing the workspace from the
-moment the uid is handed out — the acquire→register window (volume
-provisioning, recursive chown) can be long, so waiting for the record would
-leave a collision window. The caller persists the ``sandbox.json`` record and
+on the shared state file ``<state base>/.uid_pool.lock`` while it recomputes
+the free set and atomically writes a reservation marker
+(``<state base>/.uid_reservations/<sandbox_id>``). Both are *platform* state,
+so they follow ``E2B_STATE_BASE`` out from under the tree root (N27); with no
+state base configured they are the workspace base, exactly as before. The
+marker makes the reservation visible to every other worker sharing the
+workspace from the moment the uid is handed out — the acquire→register window
+(volume provisioning, recursive chown) can be long, so waiting for the record
+would leave a collision window. The caller persists the ``sandbox.json`` record and
 calls :meth:`UidPool.commit` to drop the marker, or abandons the allocation
 via :meth:`UidPool.release` (failed create / delete), which drops the marker
 and frees the uid. ``flock`` serializes the compute+marker-write critical
@@ -54,13 +56,14 @@ import fcntl
 from envd_service import priv_helpers
 from gateway_common.paths import (
     is_sandbox_workspace_dir,
+    resolve_state_base,
     sandbox_record_path,
     validate_sandbox_id,
 )
 
 logger = logging.getLogger(__name__)
 
-#: Directory (under ``workspace_base``) holding transient cross-process
+#: Directory (under the **state base**) holding transient cross-process
 #: reservation markers written by ``acquire`` and removed by ``commit`` /
 #: ``release``. A marker file is named after the sandbox id and contains the
 #: reserved uid as decimal text.
@@ -124,7 +127,9 @@ def _pool_range(start: int, size: int) -> set[int]:
     return set(range(start, start + size))
 
 
-def _recorded_uid(workspace_base: str | Path, sandbox_id: str) -> int | None:
+def _recorded_uid(
+    workspace_base: str | Path, sandbox_id: str, *, state_base: str | Path | None = None
+) -> int | None:
     """``host_uid`` persisted for one sandbox, or None.
 
     Reads the platform's copy (``_runtime/<id>/sandbox.json``), falling back to
@@ -133,7 +138,9 @@ def _recorded_uid(workspace_base: str | Path, sandbox_id: str) -> int | None:
     is the very file a sandbox can rewrite, which is why it is no longer
     consulted first.
     """
-    record_path = sandbox_record_path(workspace_base, sandbox_id)
+    record_path = sandbox_record_path(
+        workspace_base, sandbox_id, state_base=state_base
+    )
     if not record_path.is_file():
         record_path = sandbox_record_path(workspace_base, sandbox_id, legacy=True)
         if not record_path.is_file():
@@ -147,7 +154,11 @@ def _recorded_uid(workspace_base: str | Path, sandbox_id: str) -> int | None:
 
 
 def _recorded_uids(
-    workspace_base: str | Path, start: int, size: int
+    workspace_base: str | Path,
+    start: int,
+    size: int,
+    *,
+    state_base: str | Path | None = None,
 ) -> set[int]:
     """Every pool-range ``host_uid`` referenced by a ``sandbox.json`` record.
 
@@ -171,7 +182,7 @@ def _recorded_uids(
         # this loop can contribute a uid at all.
         if not is_sandbox_workspace_dir(entry):
             continue
-        uid = _recorded_uid(base, entry.name)
+        uid = _recorded_uid(base, entry.name, state_base=state_base)
         if uid is not None and start <= uid < start + size:
             used.add(uid)
     return used
@@ -371,10 +382,11 @@ class UidPool:
 
     def __init__(
         self,
+        workspace_base: str | Path,
         *,
         start: int = 10000,
         size: int = 1000,
-        workspace_base: str | Path,
+        state_base: str | Path | None = None,
     ) -> None:
         if not isinstance(start, int) or start <= 0:
             raise UidPoolError(f"invalid uid pool start: {start!r}")
@@ -383,6 +395,13 @@ class UidPool:
         self._start = start
         self._size = size
         self._workspace_base = Path(workspace_base)
+        #: The base the pool's own files live under: the cross-process lock and
+        #: the reservation markers are *platform* state, not the sandbox's, so
+        #: they follow ``E2B_STATE_BASE`` out from under the tree root (N27).
+        #: The *records* this pool scans for allocated uids are read from the
+        #: same base (``sandbox_record_path(..., state_base=...)``), while the
+        #: directories it walks stay under the workspace base.
+        self._state_base = resolve_state_base(self._workspace_base, state_base)
         self._allocated: set[int] = set()
         self._by_sandbox: dict[str, int] = {}
         self._lock = threading.Lock()
@@ -398,7 +417,7 @@ class UidPool:
     @property
     def lock_path(self) -> Path:
         """Cross-process serialization point for the free-set computation."""
-        return self._workspace_base / ".uid_pool.lock"
+        return self._state_base / ".uid_pool.lock"
 
     def _open_reservation_lock(self) -> int:
         """Open and exclusively flock the shared state file.
@@ -407,6 +426,12 @@ class UidPool:
         critical section finishes. The kernel drops the lock if the holder
         dies, so a crashed create cannot wedge the pool.
         """
+        # The *workspace* base is ensured on demand (this pool's own scans read
+        # it, and yesterday it was also the lock's parent). The state base is
+        # not: it belongs to the deployment's init container, which owns its
+        # mode and ownership on the shared export -- a worker that created it
+        # out of band would leave a platform directory nobody styled. A missing
+        # state base therefore fails loudly on the ``open`` below.
         self._workspace_base.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
@@ -424,7 +449,7 @@ class UidPool:
             os.close(fd)
 
     def _marker_path(self, sandbox_id: str) -> Path:
-        return self._workspace_base / _RESERVATION_DIR / sandbox_id
+        return self._state_base / _RESERVATION_DIR / sandbox_id
 
     def _write_reservation(self, sandbox_id: str, uid: int) -> None:
         """Atomically persist the reservation marker (under the flock)."""
@@ -451,7 +476,7 @@ class UidPool:
         startup-only scan; the multi-worker concurrent-startup caveat is the
         documented one for orphan reclaim (report §5 / Concerns §3).
         """
-        marker_dir = self._workspace_base / _RESERVATION_DIR
+        marker_dir = self._state_base / _RESERVATION_DIR
         if not marker_dir.is_dir():
             return
         try:
@@ -467,7 +492,7 @@ class UidPool:
 
     def _reserved_uids(self) -> set[int]:
         """Pool-range uids held by reservation markers (cross-process)."""
-        marker_dir = self._workspace_base / _RESERVATION_DIR
+        marker_dir = self._state_base / _RESERVATION_DIR
         reserved: set[int] = set()
         if not marker_dir.is_dir():
             return reserved
@@ -509,7 +534,7 @@ class UidPool:
             # shared predicate accepts can appear in it.
             if not is_sandbox_workspace_dir(entry):
                 continue
-            uid = _recorded_uid(base, entry.name)
+            uid = _recorded_uid(base, entry.name, state_base=self._state_base)
             if (
                 uid is not None
                 and self._start <= uid < self._start + self._size
@@ -536,7 +561,9 @@ class UidPool:
         with self._lock:
             fd = self._open_reservation_lock()
             try:
-                recorded = _recorded_uid(self._workspace_base, sandbox_id)
+                recorded = _recorded_uid(
+                    self._workspace_base, sandbox_id, state_base=self._state_base
+                )
                 if (
                     recorded is not None
                     and self._start <= recorded < self._start + self._size
@@ -544,7 +571,10 @@ class UidPool:
                     uid = recorded
                 else:
                     used = _recorded_uids(
-                        self._workspace_base, self._start, self._size
+                        self._workspace_base,
+                        self._start,
+                        self._size,
+                        state_base=self._state_base,
                     )
                     used.update(self._allocated)
                     used.update(self._reserved_uids())
@@ -616,7 +646,12 @@ class UidPool:
         if not validate_sandbox_id(sandbox_id):
             return
         with self._lock:
-            if _recorded_uid(self._workspace_base, sandbox_id) is None:
+            if (
+                _recorded_uid(
+                    self._workspace_base, sandbox_id, state_base=self._state_base
+                )
+                is None
+            ):
                 return
             self._remove_reservation(sandbox_id)
 

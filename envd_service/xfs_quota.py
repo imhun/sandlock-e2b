@@ -588,12 +588,21 @@ def release_project(
     _local_run_xfs_quota(mount_point, command)
 
 
-def _recorded_projids(workspace_base: str | Path) -> set[int]:
-    """Project ids referenced by any ``sandbox.json`` under workspace_base.
+def _recorded_projids(
+    workspace_base: str | Path, *, state_base: str | Path | None = None
+) -> set[int]:
+    """Project ids referenced by any ``sandbox.json`` record on the volume.
 
     Both the workspace project (``project_id``) and every per-sandbox volume
     project (``volume_projects[].projid``, E2.5) are referenced, so the E2.4
     reconciliation never treats a live volume quota as an orphan.
+
+    The records come from ``state_base`` (defaulting to ``workspace_base``,
+    i.e. today's layout): the trees are what ``workspace_base`` is walked for,
+    but the platform's own files moved out from under the tree root under N27,
+    and reading the *wrong* base here fails open -- an empty "recorded" set
+    turns every live row into an orphan and clears the project state of a live
+    sandbox's directory.
 
     Raises :class:`ProjectQuotaError` when ``workspace_base`` is missing or
     unreadable: reconciliation must never read an unreadable base as "no
@@ -612,7 +621,7 @@ def _recorded_projids(workspace_base: str | Path) -> set[int]:
         # Platform record: ``_runtime/<id>/sandbox.json``, with the pre-split
         # in-tree location still read so a rolling upgrade does not treat live
         # project ids as orphans.
-        record_path = sandbox_record_path(base, entry.name)
+        record_path = sandbox_record_path(base, entry.name, state_base=state_base)
         if not record_path.is_file():
             record_path = sandbox_record_path(base, entry.name, legacy=True)
             if not record_path.is_file():
@@ -1003,7 +1012,10 @@ def clear_project_limits(
 
 
 def _local_reconcile(
-    workspace_base: str | Path, mount_point: str | Path
+    workspace_base: str | Path,
+    mount_point: str | Path,
+    *,
+    state_base: str | Path | None = None,
 ) -> dict[str, Any]:
     """Local reconciliation: quota table entries no record references are
     orphaned and cleaned; recorded projids and project 0 are never touched.
@@ -1027,7 +1039,7 @@ def _local_reconcile(
     reported, never guessed at.
     """
     table = project_quota_table(mount_point)
-    recorded = _recorded_projids(workspace_base)
+    recorded = _recorded_projids(workspace_base, state_base=state_base)
     orphans = sorted(
         projid for projid in table if projid != 0 and projid not in recorded
     )
@@ -1102,6 +1114,7 @@ def reconcile_orphan_projects(
     workspace_base: str | Path,
     mount_point: str | Path,
     via_agent: bool = False,
+    state_base: str | Path | None = None,
 ) -> dict[str, Any]:
     """Reconcile the quota table against ``sandbox.json`` project ids.
 
@@ -1113,22 +1126,38 @@ def reconcile_orphan_projects(
 
     NFS form: ``via_agent=True`` delegates the server-side reconciliation to
     quota-agent (E2.6 contract: ``agent_ops["reconcile"](workspace_base,
-    mount_point) -> {"cleaned": [projid], "skipped": [{"projid", "reason"}]}``).
+    mount_point, state_base=None) -> {"cleaned": [projid], "skipped":
+    [{"projid", "reason"}]}``). ``state_base`` is sent only when the platform's
+    records live somewhere other than ``workspace_base`` (N27): a deployment
+    that has not moved its state keeps the wire contract -- and therefore an
+    agent that predates the switch -- byte-for-byte what it was.
 
     Returns ``{"cleaned": [projid], "skipped": [{"projid", "reason"}]}``.
     """
     if via_agent:
+        kwargs: dict[str, Any] = {
+            "workspace_base": str(workspace_base),
+            "mount_point": str(mount_point),
+        }
+        if state_base is not None and Path(state_base) != Path(workspace_base):
+            # The agent reconciles on the NFS server, where the platform's own
+            # files live under the same base as everywhere else -- only the
+            # path *spelling* differs, which the agent's own ``path_map``
+            # rewrites. Sending nothing is the pre-N27 contract *and* the
+            # answer when the two bases are one directory, so a deployment that
+            # has not moved its state keeps talking to an agent that predates
+            # the switch byte-for-byte.
+            kwargs["state_base"] = str(state_base)
         data = _agent_call(
             "reconcile",
-            workspace_base=str(workspace_base),
-            mount_point=str(mount_point),
+            **kwargs,
         )
         if not isinstance(data, dict):
             raise ProjectQuotaError(
                 f"quota-agent reconcile returned invalid data: {data!r}"
             )
         return data
-    return _local_reconcile(workspace_base, mount_point)
+    return _local_reconcile(workspace_base, mount_point, state_base=state_base)
 
 
 def _fail(reason: str) -> tuple[bool, str]:

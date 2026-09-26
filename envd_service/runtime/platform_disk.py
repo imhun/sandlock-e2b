@@ -25,7 +25,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from gateway_common.env import env_int
-from gateway_common.paths import RUNTIME_DIR_NAME
+from gateway_common.paths import RUNTIME_DIR_NAME, resolve_state_base
 
 #: MiB -> bytes, the unit the knob and every message below are written in.
 _MIB = 1024 * 1024
@@ -43,8 +43,10 @@ def platform_budget_bytes() -> int:
     return max(0, mb) * _MIB
 
 
-def measure_platform_disk_bytes(workspace_base: str | Path) -> int:
-    """Allocated bytes under ``<base>/_runtime``; 0 when the directory is absent.
+def measure_platform_disk_bytes(
+    workspace_base: str | Path, state_base: str | Path | None = None
+) -> int:
+    """Allocated bytes under ``<state base>/_runtime``; 0 when it is absent.
 
     Measured with the same accounting the per-sandbox ledger uses
     (``priv_helpers.dir_size``: files plus every directory's own allocated size),
@@ -53,10 +55,15 @@ def measure_platform_disk_bytes(workspace_base: str | Path) -> int:
     the bytes could not be measured -- reported as 0 here, with the caller free to
     decide what to do about it; the admission rule below never *grants* because a
     measurement failed.
+
+    ``state_base`` defaults to the workspace base, i.e. the directory this
+    measured before N27; with ``E2B_STATE_BASE`` set the account follows the
+    images to the base they actually live under, or a fleet would read 0 while
+    the images pile up on the other base (see :func:`resolve_state_base`).
     """
     from envd_service import priv_helpers
 
-    runtime_dir = Path(workspace_base) / RUNTIME_DIR_NAME
+    runtime_dir = resolve_state_base(workspace_base, state_base) / RUNTIME_DIR_NAME
     if not runtime_dir.is_dir():
         return 0
     size = priv_helpers.dir_size(runtime_dir)

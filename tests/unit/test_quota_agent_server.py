@@ -234,9 +234,10 @@ async def test_report_failure_returns_500_error(monkeypatch):
 async def test_reconcile_delegates_to_local_reconcile(monkeypatch):
     seen: dict = {}
 
-    def fake_reconcile(workspace_base, mount_point):
+    def fake_reconcile(workspace_base, mount_point, state_base=None):
         seen["workspace_base"] = str(workspace_base)
         seen["mount_point"] = str(mount_point)
+        seen["state_base"] = state_base
         return {"cleaned": [7], "skipped": [{"projid": 9, "reason": "busy"}]}
 
     monkeypatch.setattr(xfs_quota, "_local_reconcile", fake_reconcile)
@@ -255,7 +256,32 @@ async def test_reconcile_delegates_to_local_reconcile(monkeypatch):
     assert seen == {
         "workspace_base": "/srv/sandboxes",
         "mount_point": "/srv/sandboxes",
+        "state_base": None,
     }
+
+
+async def test_reconcile_forwards_the_state_base(monkeypatch):
+    """N27: the reconciliation reads the records, so it gets the records' base."""
+    seen: dict = {}
+
+    def fake_reconcile(workspace_base, mount_point, state_base=None):
+        seen["state_base"] = state_base
+        return {"cleaned": [], "skipped": []}
+
+    monkeypatch.setattr(xfs_quota, "_local_reconcile", fake_reconcile)
+    app = create_app(settings=Settings(token=KEY))
+    async with _client(app) as client:
+        response = await client.post(
+            "/reconcile",
+            headers={"X-Internal-Key": KEY},
+            json={
+                "workspace_base": "/srv/workspaces",
+                "mount": "/srv",
+                "state_base": "/srv/state",
+            },
+        )
+    assert response.status_code == 200
+    assert seen == {"state_base": "/srv/state"}
 
 
 async def test_reconcile_fail_closed_when_workspace_base_missing_or_unreadable(

@@ -69,13 +69,24 @@ IMAGE_NAME = "latest"
 _MIB = 1024 * 1024
 
 
-def checkpoint_image_dir(workspace_base, sandbox_id: str) -> Path:
-    """``<base>/_runtime/<id>/checkpoint/latest`` -- this sandbox's image."""
-    return sandbox_checkpoint_dir(workspace_base, sandbox_id) / IMAGE_NAME
+def checkpoint_image_dir(
+    workspace_base, sandbox_id: str, *, state_base=None
+) -> Path:
+    """``<state base>/_runtime/.checkpoints/<id>/latest`` -- the image.
+
+    ``state_base`` defaults to ``workspace_base`` (today's layout); with
+    ``E2B_STATE_BASE`` set the image lands under the base the platform's own
+    files live under (N27), which is where the teardown, the quarantine and the
+    platform account all look for it.
+    """
+    return (
+        sandbox_checkpoint_dir(workspace_base, sandbox_id, state_base=state_base)
+        / IMAGE_NAME
+    )
 
 
 def _prepare_image_parent(
-    workspace_base, sandbox_id: str, *, owner_uid: int | None
+    workspace_base, sandbox_id: str, *, owner_uid: int | None, state_base=None
 ) -> Path:
     """The image path, with a ``0700`` parent **the slot can write**.
 
@@ -89,7 +100,7 @@ def _prepare_image_parent(
     ``owner_uid is None`` means the deployment has no pooled uid (the shared-uid
     shape): the slot already runs as the worker, so nothing has to move.
     """
-    image = checkpoint_image_dir(workspace_base, sandbox_id)
+    image = checkpoint_image_dir(workspace_base, sandbox_id, state_base=state_base)
     root = image.parent.parent
     parent = image.parent
     # The store's own gate: traversable, not listable, owned by the worker. The
@@ -143,8 +154,11 @@ def image_bytes(image: Path) -> int:
     return 0 if size is None else int(size)
 
 
-def _platform_numbers(workspace_base) -> tuple[int, int]:
-    return measure_platform_disk_bytes(workspace_base), platform_budget_bytes()
+def _platform_numbers(workspace_base, state_base=None) -> tuple[int, int]:
+    return (
+        measure_platform_disk_bytes(workspace_base, state_base=state_base),
+        platform_budget_bytes(),
+    )
 
 
 def _executor_of(ctx):
@@ -165,7 +179,12 @@ def live_session_present(ctx) -> bool:
 
 
 def capture_checkpoint_image(
-    workspace_base, ctx, sandbox_id: str, *, owner_uid: int | None = None
+    workspace_base,
+    ctx,
+    sandbox_id: str,
+    *,
+    owner_uid: int | None = None,
+    state_base=None,
 ) -> dict:
     """Take this sandbox's checkpoint, or say why there is none.
 
@@ -176,7 +195,7 @@ def capture_checkpoint_image(
     behaviour it had before this feature existed -- so the reason is always a
     sentence, never an empty string.
     """
-    used_before, limit = _platform_numbers(workspace_base)
+    used_before, limit = _platform_numbers(workspace_base, state_base)
     full = checkpoint_no_room_reason(used_bytes=used_before, limit_bytes=limit)
     if full is not None:
         # Refuse *before* writing: with no room at all there is nothing to learn
@@ -195,7 +214,7 @@ def capture_checkpoint_image(
 
     try:
         image = _prepare_image_parent(
-            workspace_base, sandbox_id, owner_uid=owner_uid
+            workspace_base, sandbox_id, owner_uid=owner_uid, state_base=state_base
         )
     except Exception as exc:  # noqa: BLE001 - reported as "not captured"
         # The directory has to belong to the sandbox's uid or the *save* fails
@@ -295,7 +314,12 @@ def _capture_reply(
 
 
 def restore_checkpoint_image(
-    workspace_base, ctx, sandbox_id: str, *, owner_uid: int | None = None
+    workspace_base,
+    ctx,
+    sandbox_id: str,
+    *,
+    owner_uid: int | None = None,
+    state_base=None,
 ) -> dict:
     """Resume this sandbox's image into a session on **this** worker.
 
@@ -304,7 +328,7 @@ def restore_checkpoint_image(
     happened by then, so this is a record of what the process tree looks like,
     not a gate.
     """
-    image = checkpoint_image_dir(workspace_base, sandbox_id)
+    image = checkpoint_image_dir(workspace_base, sandbox_id, state_base=state_base)
     if not image.is_dir():
         return {
             "sandbox_id": sandbox_id,
@@ -426,7 +450,9 @@ def _remove_image(image: Path) -> None:
     priv_helpers.remove_tree(image)
 
 
-def remove_checkpoint_images(workspace_base, sandbox_id: str) -> bool:
+def remove_checkpoint_images(
+    workspace_base, sandbox_id: str, *, state_base=None
+) -> bool:
     """Delete a sandbox's whole image directory; ``True`` if one was there.
 
     The teardown's and the quarantine's hook: images live *beside* the runtime
@@ -434,14 +460,16 @@ def remove_checkpoint_images(workspace_base, sandbox_id: str) -> bool:
     is what the teardown does, and what it has always done -- would leave them
     behind. Called from both places that make a sandbox's platform state go away.
     """
-    store = sandbox_checkpoint_dir(workspace_base, sandbox_id)
+    store = sandbox_checkpoint_dir(workspace_base, sandbox_id, state_base=state_base)
     if not store.is_dir():
         return False
     _remove_image(store)
     return True
 
 
-def consume_checkpoint_image(workspace_base, sandbox_id: str) -> bool:
+def consume_checkpoint_image(
+    workspace_base, sandbox_id: str, *, state_base=None
+) -> bool:
     """Drop the image of a sandbox whose process is back: ``True`` if one went.
 
     The thaw path of a resume (D5): the session was still on this worker, so the
@@ -449,7 +477,7 @@ def consume_checkpoint_image(workspace_base, sandbox_id: str) -> bool:
     than leaving it to the next pause to overwrite -- is what keeps the platform
     account honest for a sandbox that is resumed and then left running.
     """
-    image = checkpoint_image_dir(workspace_base, sandbox_id)
+    image = checkpoint_image_dir(workspace_base, sandbox_id, state_base=state_base)
     if not image.is_dir():
         return False
     _remove_image(image)
@@ -457,7 +485,12 @@ def consume_checkpoint_image(workspace_base, sandbox_id: str) -> bool:
 
 
 def resume_sandbox(
-    workspace_base, ctx, sandbox_id: str, *, owner_uid: int | None = None
+    workspace_base,
+    ctx,
+    sandbox_id: str,
+    *,
+    owner_uid: int | None = None,
+    state_base=None,
 ) -> dict:
     """The resume half of the lifecycle: thaw what is here, resume what is not.
 
@@ -467,7 +500,9 @@ def resume_sandbox(
     on a session with nothing stopped.
     """
     if live_session_present(ctx):
-        dropped = consume_checkpoint_image(workspace_base, sandbox_id)
+        dropped = consume_checkpoint_image(
+            workspace_base, sandbox_id, state_base=state_base
+        )
         return {
             "sandbox_id": sandbox_id,
             "resumed": True,
@@ -476,6 +511,10 @@ def resume_sandbox(
             "staleImageRemoved": dropped,
         }
     outcome = restore_checkpoint_image(
-        workspace_base, ctx, sandbox_id, owner_uid=owner_uid
+        workspace_base,
+        ctx,
+        sandbox_id,
+        owner_uid=owner_uid,
+        state_base=state_base,
     )
     return {"sandbox_id": sandbox_id, "resumed": True, **outcome}

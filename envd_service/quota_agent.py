@@ -30,8 +30,11 @@ HTTP contract with the agent (every response is a JSON object):
   -> ``{"deleted": int}``.
 - ``GET /report?mount=...`` -> ``{"projects": {projid: {"used_blocks",
   "soft_blocks", "hard_blocks"}}}``.
-- ``POST /reconcile`` ``{"workspace_base", "mount"}`` -> ``{"cleaned":
-  [projid], "skipped": [{"projid", "reason"}]}``.
+- ``POST /reconcile`` ``{"workspace_base", "mount", "state_base"?}`` ->
+  ``{"cleaned": [projid], "skipped": [{"projid", "reason"}]}``. ``state_base``
+  is optional (N27): absent means the platform's records sit under
+  ``workspace_base``, which is what a deployment that has not set
+  ``E2B_STATE_BASE`` sends.
 
 Auth: ``X-Internal-Key`` header carrying the configured agent token
 (``E2B_QUOTA_AGENT_TOKEN``), matching the worker's internal-key style.
@@ -263,16 +266,26 @@ class QuotaAgentClient:
         *,
         workspace_base: str,
         mount_point: str,
+        state_base: str | None = None,
     ) -> dict[str, Any]:
-        """Server-side orphan project reconciliation (E2.4 contract)."""
+        """Server-side orphan project reconciliation (E2.4 contract).
+
+        ``state_base`` (N27) is the base the platform's own files live under;
+        it is sent only when a deployment configured one, so the request body
+        -- and therefore an agent that predates the switch -- is unchanged for
+        every deployment that has not moved its state.
+        """
+        body = {
+            "workspace_base": str(workspace_base),
+            "mount": str(mount_point),
+        }
+        if state_base:
+            body["state_base"] = str(state_base)
         payload = self._request(
             "reconcile",
             "POST",
             "/reconcile",
-            json={
-                "workspace_base": str(workspace_base),
-                "mount": str(mount_point),
-            },
+            json=body,
         )
         cleaned = payload.get("cleaned")
         skipped = payload.get("skipped")

@@ -21,8 +21,10 @@ Request surface (all responses JSON objects):
   rather than at the next reconciliation (N12).
 - ``GET /report?mount=...`` -> ``{"projects": {projid: {"used_blocks",
   "soft_blocks", "hard_blocks"}}}``.
-- ``POST /reconcile`` ``{"workspace_base", "mount"}`` -> ``{"cleaned":
-  [projid], "skipped": [{"projid", "reason"}]}``.
+- ``POST /reconcile`` ``{"workspace_base", "mount", "state_base"?}`` ->
+  ``{"cleaned": [projid], "skipped": [{"projid", "reason"}]}``. The optional
+  ``state_base`` (N27) is where the platform's own records live; absent means
+  ``workspace_base``, the pre-N27 layout.
 
 Auth: every request must carry ``X-Internal-Key`` equal to
 ``E2B_QUOTA_AGENT_TOKEN`` (constant-time compare); the service refuses to
@@ -68,6 +70,13 @@ class ProjectLimitsBody(BaseModel):
 class ReconcileBody(BaseModel):
     workspace_base: str = Field(min_length=1)
     mount: str = Field(min_length=1)
+    #: Optional (N27): the base the platform's own records live under, when the
+    #: deployment moved them out from under the tree root with
+    #: ``E2B_STATE_BASE``. Absent -- the pre-N27 contract, and what an agent
+    #: older than the switch is sent -- means the workspace base. Reading the
+    #: wrong base here is not a no-op: an empty "recorded" set makes every live
+    #: project row look like an orphan.
+    state_base: str | None = Field(default=None, min_length=1)
 
 
 def _settings(request: Request) -> Settings:
@@ -190,6 +199,11 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             return xfs_quota._local_reconcile(
                 _rewrite_path(body.workspace_base, settings),
                 _rewrite_path(body.mount, settings),
+                state_base=(
+                    _rewrite_path(body.state_base, settings)
+                    if body.state_base
+                    else None
+                ),
             )
         except xfs_quota.ProjectQuotaError as exc:
             raise _quota_error(exc) from exc

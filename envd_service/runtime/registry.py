@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from gateway_common.paths import (
+    resolve_state_base,
     sandbox_record_path,
     sandbox_runtime_dir,
     validate_sandbox_id,
@@ -160,8 +161,14 @@ class RuntimeRegistry:
         workspace_base: str | Path,
         *,
         uid_pool=None,
+        state_base: str | Path | None = None,
     ) -> None:
         self._workspace_base = Path(workspace_base)
+        #: The base the platform's own files live under for every sandbox this
+        #: registry describes: the record, the command log, the checkpoint
+        #: images. ``None`` = the workspace base, i.e. the layout that predates
+        #: N27 (``gateway_common.paths.resolve_state_base``).
+        self._state_base = state_base
         self._records: dict[str, RuntimeSandbox] = {}
         #: ``sandbox_id -> monotonic deadline`` of the just-unregistered
         #: marker (see ``UNREGISTER_TOMBSTONE_S``).
@@ -998,10 +1005,17 @@ class RuntimeRegistry:
         record cannot live there and stay trustworthy. Readers still fall back
         to the old in-tree location; :meth:`adopt_legacy_records` moves it.
         """
-        return sandbox_record_path(self._workspace_base, sandbox_id)
+        return sandbox_record_path(
+            self._workspace_base, sandbox_id, state_base=self._state_base
+        )
 
     def _legacy_record_path(self, sandbox_id: str) -> Path:
-        return sandbox_record_path(self._workspace_base, sandbox_id, legacy=True)
+        # ``legacy=True`` ignores the state base on purpose: it is the pre-split
+        # location *inside* the sandbox's own tree, and a record has to be
+        # adopted from there no matter where the platform now writes new ones.
+        return sandbox_record_path(
+            self._workspace_base, sandbox_id, legacy=True, state_base=self._state_base
+        )
 
     def _ensure_runtime_dir(self, sandbox_id: str) -> Path:
         """Create ``_runtime/<id>``, owned by the worker and closed to sandboxes.
@@ -1012,7 +1026,9 @@ class RuntimeRegistry:
         it. Ownership follows whoever runs the worker (root in the production
         shape), never the sandbox uid.
         """
-        path = sandbox_runtime_dir(self._workspace_base, sandbox_id)
+        path = sandbox_runtime_dir(
+            self._workspace_base, sandbox_id, state_base=self._state_base
+        )
         path.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(path, 0o700)
@@ -1030,6 +1046,18 @@ class RuntimeRegistry:
         its target from (W1).
         """
         return self._workspace_base
+
+    @property
+    def state_base(self) -> Path:
+        """The base this registry reads and writes its *own* files under.
+
+        The sandbox's runtime record and, beside it, the command log: platform
+        state, kept where the sandbox cannot reach it. Equal to
+        :attr:`workspace_base` unless ``E2B_STATE_BASE`` names a second base
+        (N27); the two are *not* interchangeable, because the trees live under
+        the workspace base and the platform's own files do not.
+        """
+        return resolve_state_base(self._workspace_base, self._state_base)
 
     def register(
         self,

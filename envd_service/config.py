@@ -64,6 +64,19 @@ def _pure_rootfs_dir() -> Path:
     return base / PURE_ROOTFS_DIR_NAME
 
 
+def _state_base_from_env() -> Path | None:
+    """``E2B_STATE_BASE``, resolved, or ``None`` when the deployment has none.
+
+    ``None`` means "the platform's files stay under the workspace base" --
+    :meth:`Settings.__post_init__` fills the field in with *that object's*
+    ``workspace_base``. Deliberately not done here: a factory cannot see the
+    field the caller passed, and a base read out of the environment while the
+    trees sit under a different one is exactly the split this switch is about.
+    """
+    raw = os.getenv("E2B_STATE_BASE")
+    return Path(raw).resolve() if raw else None
+
+
 # Default private-egress denylist applied to the implicit full-egress branch
 # (no explicit allowOut/denyOut + internet allowed). Covers RFC1918, loopback,
 # link-local / cloud metadata, CGNAT, multicast/reserved, and ULA. Override
@@ -137,6 +150,22 @@ class Settings:
             os.getenv("E2B_WORKSPACE_BASE", "tmp/sandboxes")
         ).resolve()
     )
+    #: The base the platform's *own* files live under (N27): each sandbox's
+    #: runtime record, its command log and its checkpoint images.
+    #:
+    #: ``E2B_STATE_BASE`` moves them out from under the tree root, so "a sandbox
+    #: cannot reach the platform's state" stops depending on the sandbox's shape
+    #: (``docs/pure-shape-decision.md`` §4). Unset = the workspace base, which is
+    #: today's layout -- and the field has to be ``None`` until
+    #: :meth:`__post_init__` fills it in, because the default is *this object's*
+    #: ``workspace_base`` and not whatever ``E2B_WORKSPACE_BASE`` says.
+    #:
+    #: ``resolve()`` mirrors ``workspace_base`` above, and it is load-bearing:
+    #: ``tmp/`` and the cluster's NFS export both carry symlinks, and a relative
+    #: or unnormalised spelling of one base makes "are these two the same
+    #: directory?" answer wrong -- which is the question every "is the state
+    #: base a second mount / a second directory?" decision below rests on.
+    state_base: Path | None = field(default_factory=_state_base_from_env)
     executor: str = field(
         default_factory=lambda: os.getenv("E2B_EXECUTOR", "auto").lower()
     )
@@ -498,6 +527,19 @@ class Settings:
         if self.internal_api_key:
             keys.append(self.internal_api_key)
         return tuple(dict.fromkeys(keys))
+
+    def __post_init__(self) -> None:
+        """Give ``state_base`` its default: *this* object's workspace base.
+
+        No second base unless ``E2B_STATE_BASE`` names one. A caller that passes
+        ``workspace_base`` explicitly (a test, an embedder, the combined
+        single-process deployment) must not end up with the platform's record
+        and checkpoint directories under some other base the environment
+        happened to name: that split is silent, and it makes every helper's
+        "same base?" answer wrong.
+        """
+        if self.state_base is None:
+            self.state_base = self.workspace_base
 
 
 #: Raised (and never swallowed) when the net-isolation switches contradict each

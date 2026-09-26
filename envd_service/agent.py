@@ -242,7 +242,7 @@ def _cpu_activity_percent() -> float:
 _MIB = 1024 * 1024
 
 
-def _measure_platform_account(workspace_base) -> dict[str, int]:
+def _measure_platform_account(workspace_base, state_base=None) -> dict[str, int]:
     """The platform's checkpoint account as heartbeat wire values (S2/D3).
 
     Two numbers, because a budget without its usage says nothing and usage
@@ -255,7 +255,7 @@ def _measure_platform_account(workspace_base) -> dict[str, int]:
         platform_budget_bytes,
     )
 
-    used = measure_platform_disk_bytes(workspace_base)
+    used = measure_platform_disk_bytes(workspace_base, state_base=state_base)
     budget = platform_budget_bytes()
     return {
         "platformDiskUsedMB": used // _MIB,
@@ -1033,8 +1033,17 @@ def _park_refused_tree(
         # review the quarantine, and they describe a tree that is no longer in
         # the workspace scan. Move them in beside it -- keeping the record and
         # the payload together, which is what this path (review W7 / W7-3)
-        # always did, just from two places now instead of one.
-        runtime_dir = sandbox_runtime_dir(base, sandbox_id)
+        # always did, just from two places now instead of one -- the *record*
+        # from the state base (N27) and the payload from the workspace base.
+        # ``os.replace`` is a rename, not a copy: the two bases are directories
+        # of one export under the committed shape, and a deployment that gave
+        # the state base a mount of its own would get the warning below rather
+        # than a half-moved tree.
+        runtime_dir = sandbox_runtime_dir(
+            base,
+            sandbox_id,
+            state_base=_registry_state_base(runtime_registry, settings),
+        )
         if runtime_dir.is_dir():
             for entry in runtime_dir.iterdir():
                 try:
@@ -1055,7 +1064,11 @@ def _park_refused_tree(
         # writes them, so they cannot sit under the worker-owned runtime dir).
         # They move in beside the record rather than staying in the live store,
         # where nothing would describe them any more.
-        images = sandbox_checkpoint_dir(base, sandbox_id)
+        images = sandbox_checkpoint_dir(
+            base,
+            sandbox_id,
+            state_base=_registry_state_base(runtime_registry, settings),
+        )
         if images.is_dir():
             try:
                 os.replace(images, dest / CHECKPOINT_ROOT_NAME)
@@ -1185,6 +1198,20 @@ def _registry_workspace_base(runtime_registry, settings: Settings) -> Path:
     """
     base = getattr(runtime_registry, "workspace_base", None)
     return Path(base) if base is not None else Path(settings.workspace_base)
+
+
+def _registry_state_base(runtime_registry, settings: Settings) -> Path:
+    """Base the registry keeps this sandbox's *platform* files under.
+
+    Same argument as :func:`_registry_workspace_base`, and it is what keeps the
+    pair together: the runtime record, the command log and the checkpoint
+    images are addressed where the registry that read the record wrote them.
+    The two answers differ only for a caller that handed the app a registry of
+    its own on a base the settings do not name; in every deployment shape the
+    registry's state base *is* ``settings.state_base``.
+    """
+    state = getattr(runtime_registry, "state_base", None)
+    return Path(state) if state is not None else Path(settings.state_base)
 
 
 def _delete_sandbox_runtime(
@@ -1347,7 +1374,9 @@ def _delete_sandbox_runtime(
         # which is why ``unregister`` leaves it alone).
         shutil.rmtree(
             sandbox_runtime_dir(
-                _registry_workspace_base(runtime_registry, settings), sandbox_id
+                _registry_workspace_base(runtime_registry, settings),
+                sandbox_id,
+                state_base=_registry_state_base(runtime_registry, settings),
             ),
             ignore_errors=True,
         )
@@ -1378,7 +1407,9 @@ def _delete_sandbox_runtime(
         # thing the platform holds for a sandbox, so a teardown that forgot them
         # would leave the platform account behind with no owner.
         remove_checkpoint_images(
-            _registry_workspace_base(runtime_registry, settings), sandbox_id
+            _registry_workspace_base(runtime_registry, settings),
+            sandbox_id,
+            state_base=_registry_state_base(runtime_registry, settings),
         )
         if project_id is not None:
             # N12: only now, with the tree gone and its accounting at zero, can
@@ -1456,6 +1487,19 @@ def _scan_workspace_runtimes(
             )
             record = None
         if record is None:
+            if is_reserved_platform_namespace(entry.name):
+                # A reserved name without a record is the platform's own
+                # namespace, not an unreadable sandbox tree. ``state`` is the
+                # one that bites (N27): the transitional config keeps the old
+                # workspace base for a while with the new state base already
+                # created under it, and ``state`` spells a legal sandbox id --
+                # without this the platform's whole tree is reported as an
+                # unmaterialised sandbox on every reconcile round (reported,
+                # never deleted: noise, but noise that teaches its reader to
+                # ignore the report). Read through the record first on purpose:
+                # a tree that really carries this id is still materialised, so
+                # this cannot strand one the way a name filter would (M1).
+                continue
             unmaterialised.append(entry.name)
         else:
             records[entry.name] = record
@@ -1778,6 +1822,7 @@ class NodeAgent:
             self._platform_disk_report = await asyncio.to_thread(
                 _measure_platform_account,
                 _registry_workspace_base(self._runtime_registry, self._settings),
+                _registry_state_base(self._runtime_registry, self._settings),
             )
         except asyncio.CancelledError:
             raise
@@ -2371,6 +2416,9 @@ class NodeAgent:
                     workspace_base=self._settings.workspace_base,
                     mount_point=self._settings.workspace_base,
                     via_agent=self._settings.quota_via_agent,
+                    state_base=_registry_state_base(
+                        self._runtime_registry, self._settings
+                    ),
                 )
                 table = await asyncio.to_thread(
                     project_quota_table,
@@ -2872,6 +2920,9 @@ async def _checkpoint_before_pause(
             ctx,
             sandbox_id,
             owner_uid=getattr(runtime, "host_uid", None),
+            state_base=_registry_state_base(
+                request.app.state.runtime_registry, settings
+            ),
         )
     except Exception:  # noqa: BLE001 - see the docstring: the pause proceeds
         logger.warning(
@@ -2918,6 +2969,9 @@ async def _resume_process_tree(
             ctx,
             sandbox_id,
             owner_uid=getattr(runtime, "host_uid", None),
+            state_base=_registry_state_base(
+                request.app.state.runtime_registry, settings
+            ),
         )
     except Exception:  # noqa: BLE001 - the resume delivery still succeeds
         logger.warning(
@@ -3016,6 +3070,9 @@ async def agent_checkpoint_sandbox(sandbox_id: str, request: Request) -> Respons
             ctx,
             sandbox_id,
             owner_uid=getattr(runtime, "host_uid", None),
+            state_base=_registry_state_base(
+                request.app.state.runtime_registry, settings
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - reported, never a silent 200
         logger.exception("agent checkpoint failed for sandbox %s", sandbox_id)
@@ -3058,6 +3115,9 @@ async def agent_restore_sandbox(sandbox_id: str, request: Request) -> Response:
             ctx,
             sandbox_id,
             owner_uid=getattr(runtime, "host_uid", None),
+            state_base=_registry_state_base(
+                request.app.state.runtime_registry, settings
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - reported, never a silent 200
         logger.exception("agent restore failed for sandbox %s", sandbox_id)
@@ -3302,10 +3362,17 @@ async def agent_sandbox_logs(sandbox_id: str, request: Request) -> Response:
     # the tree, not inside it (the sandbox owns the tree and could rewrite or
     # delete anything in there). The in-tree path is the pre-split location and
     # is still read so a rolling upgrade does not lose a sandbox's history.
-    log_path = sandbox_command_log_path(settings.workspace_base, sandbox_id)
+    registry = request.app.state.runtime_registry
+    log_path = sandbox_command_log_path(
+        _registry_workspace_base(registry, settings),
+        sandbox_id,
+        state_base=_registry_state_base(registry, settings),
+    )
     if not log_path.is_file():
+        # The pre-split location is inside the sandbox's own tree, so this one
+        # is a workspace-base question (the state base plays no part in it).
         log_path = sandbox_command_log_path(
-            settings.workspace_base, sandbox_id, legacy=True
+            _registry_workspace_base(registry, settings), sandbox_id, legacy=True
         )
     if not log_path.is_file():
         return JSONResponse(content=[])

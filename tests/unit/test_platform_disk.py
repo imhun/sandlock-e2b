@@ -91,6 +91,27 @@ def test_an_absent_runtime_dir_measures_zero(tmp_path: Path) -> None:
     assert measure_platform_disk_bytes(tmp_path / "nothing-here") == 0
 
 
+def test_the_platform_account_follows_the_state_base(tmp_path: Path) -> None:
+    """The account measures what the *platform* holds, wherever it holds it.
+
+    Under ``E2B_STATE_BASE`` the runtime dir -- checkpoint images included --
+    moves out from under the tree root, and a measurement that stayed on the
+    workspace base would report 0 while the images pile up: the exact
+    "footprint nobody bills" this account exists to prevent.
+    """
+    workspace = tmp_path / "workspaces"
+    state = tmp_path / "state"
+    _sandbox_tree(workspace, "sbx_a")
+    image = sandbox_checkpoint_dir(workspace, "sbx_a", state_base=state) / "gen0"
+    image.mkdir(parents=True)
+    (image / "memory.bin").write_bytes(b"m" * 8192)
+
+    assert measure_platform_disk_bytes(workspace) == 0
+    assert measure_platform_disk_bytes(workspace, state_base=state) == dir_size(
+        state / "_runtime"
+    )
+
+
 def test_admission_is_unlimited_until_a_fleet_opts_in(tmp_path: Path) -> None:
     allowed, reason = checkpoint_admission(used_bytes=10**12, incoming_bytes=10**12)
     assert allowed is True, (
