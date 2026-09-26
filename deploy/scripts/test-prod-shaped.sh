@@ -160,6 +160,23 @@ if [ -n "${E2B_PID_NS:-}" ]; then
     PIDNS_ENV="-e E2B_PID_NS=${E2B_PID_NS}"
 fi
 
+# The per-sandbox network namespace is a *deployment* shape too (E7.2): the
+# shipped stack and the k8s manifest run `E2B_ENABLE_NET_ISOLATION=true` +
+# `E2B_FD_INJECT_CONNECT=true`, and this lane exists to reproduce the deployed
+# shape. The two are a pair -- `create_app` refuses the single-switch shape by
+# name (it would leave every sandbox loopback-only, i.e. "the network is
+# down" with no error anywhere) -- so forward them together, and only when
+# both are set. Unset stays unset: the code default is the shared-netns shape.
+# `E2B_TEST_NET_ISOLATION` is what un-skips `tests/contract/test_mcp_netns.py`
+# (three cases); without it a "netns shape" run is green for the wrong reason.
+NETNS_ENV=""
+if [ -n "${E2B_ENABLE_NET_ISOLATION:-}" ] && [ -n "${E2B_FD_INJECT_CONNECT:-}" ]; then
+    NETNS_ENV="-e E2B_ENABLE_NET_ISOLATION=${E2B_ENABLE_NET_ISOLATION} -e E2B_FD_INJECT_CONNECT=${E2B_FD_INJECT_CONNECT} -e E2B_TEST_NET_ISOLATION=${E2B_TEST_NET_ISOLATION:-1}"
+elif [ -n "${E2B_ENABLE_NET_ISOLATION:-}${E2B_FD_INJECT_CONNECT:-}" ]; then
+    echo "!! E2B_ENABLE_NET_ISOLATION and E2B_FD_INJECT_CONNECT must be set together (create_app refuses the unpaired shape)" >&2
+    exit 2
+fi
+
 # Image-cache location. Unset the lane uses config.py's default, a *relative*
 # path under the CWD -- which on this lane is the repo bind mount, so the cache
 # survives between runs and every create finds a warm image. Pointing it at a
@@ -182,6 +199,7 @@ docker run --rm --init --network host \
     $MIRRORS_ENV \
     $MEMORY_ENV \
     $PIDNS_ENV \
+    $NETNS_ENV \
     $CACHE_ENV \
     -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
     -v "$(pwd):/workspace" -w /workspace \
@@ -213,6 +231,7 @@ if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
         $MIRRORS_ENV \
         $MEMORY_ENV \
         $PIDNS_ENV \
+    $NETNS_ENV \
         $CACHE_ENV \
         -v "$(pwd):/workspace" -w /workspace \
         "$IMAGE" \
