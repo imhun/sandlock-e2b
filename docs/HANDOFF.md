@@ -5,6 +5,88 @@
 > `247 passed, 1 skipped`；macOS `226 passed, 18 skipped`
 > （unit + contract + sdk/python + sdk/js + security 跳过项）。
 
+## ⚡ N15 收口 + F11 落地（2026-09-25/26，E2B `b36c989` / fork `6f951d6`）
+
+**一句话**：pure 形态**也走中介**了（宿主根 + identity 翻译），控制面**可以多副本**了
+（节点视图/健康扫描/快照认领/周期任务/限流器全部共享）。两件都是用户点名要的，做完即提交。
+
+### 1. N15：pure 形态中介化（E2B `780f655` + fork `6f951d6`，含 2 个真 bug 修复）
+
+* 产品：`_chroot_root` 对 pure 返回 `/`；`fs_mount` 挂 workspace 到 `/home/user` + `/workspace`；
+  **允许清单不动**。三个非平凡点写进了代码注释：**cwd 必须是宿主路径**（fork 的启动 cwd 是
+  `chroot_root.join(cwd)` 的真实 chdir，虚拟 `/home/user` 会落到宿主同名目录 ⇒ ENOENT）；
+  **ceiling 要写回 `kwargs`**（`_policy_ceiling` 的 dict 建在形状分支之前，镜像形态靠
+  `fs_readable` 含 `/` 绕过该检查，只改局部变量是死代码）；**http-auth secret 要 chown 给
+  `host_uid`**（槽位以沙箱 uid 运行，`0600 root` 读不到 ⇒ 启动即 `invalid sandbox: credential
+  file … Permission denied`）。
+* 路由：`auto` 在所有形态上槽位化；`_in_process_mediation_is_refused` 不再对 pure 短路 ⇒
+  **"共享 uid 的 root worker + pure" 这条能跑但不中介的路消失**（SL-1 fail closed）。
+* 测试：29 条同族 + 夹具迁到 `route_b_sandbox`（唯一入口，可传 workspace/构造参数）；
+  六条 `test_sandlock_isolation` 原先靠"create 失败的 -1"**假绿**，现在测产品；
+  `test_pure_shape_inotify_still_reaches_the_host_root` 从 `xfail(strict)` 转成**正向验收**。
+* fork 两个真 bug（都带回归用例）：`compose_virtual_etc_hosts` 在 `root="/"` 时读**宿主**
+  `/etc/hosts`（宿主可解析的名字以字面 IP 进沙箱，`allowOut` 拦不住 ⇒ 两条 wildcard 用例
+  ECONNREFUSED）；DNS 网关地址是**进程内**计数器 ⇒ 两个同时活着的 wildcard 槽位必撞
+  `127.0.1.1:53`（改探测式取地址，fork `8f9c8d2`）。
+* 细节与两档数字：`docs/pure-shape-decision.md` §6；OBS-5（pure 无磁盘硬上限）随本条关闭。
+
+### 2. F11：控制面多副本（E2B `8542700` + `b36c989`）
+
+① 节点视图进 Redis（`RedisNodeStore`；健康由共享 `heartbeat_at` 现算 ⇒ 两副本不可能给出相反
+结论；TTL = 4 个心跳窗口；`local://` 故意不外发）；② 健康扫描单飞（`try_acquire_sweep`）；
+③ 快照每 id 认领共享（记录 `creating` 是持久的一半，Redis claim 补"两个副本都没写记录"的窗口；
+`get()` 不再对 `creating` 用缓存）；④ TTL 扫描单飞（`try_claim`）、7 个限流器换共享 ZSET 窗口
+（check+insert 走 WATCH/MULTI，`name` 是键前缀，无 Redis 回退本地窗口）、`template_build_slots`
+换 Redis `INCR/DECR`。**`CreateQueue` 跨副本唤醒有意不做**（已有有界 tick 兜底，只影响延迟）。
+细节：`docs/control-plane-multi-replica.md` §6。
+
+### 3. 同一会话里顺带收口的三件
+
+* **空闲判定 CPU 采样**：集群验收通过（脚本 `tmp/k0s/cpu_activity_acceptance.py`，两段 45 s
+  静默窗口）。**教训**：`GET /sandboxes` 的 `lastActiveAt` 读的是共享 store，而活动最多每
+  `E2B_ACTIVITY_PERSIST_INTERVAL_S`（默认 30 s）才落库 ⇒ **验收窗口必须长于它**，且首段窗口
+  里的"首次请求本身也是活动"，断言要放在第二段静默窗口。见 `docs/deploy-clusters.md` §10。
+* **N14/S3**：真根下放行 `getcwd`（fork `4afd806`），并**读代码否掉**另外两个候选 ——
+  `inotify_add_watch` 带 `can_read` 策略判定（真根下嵌套 deny 挂载集表达不了，放行=放大风险）、
+  `statfs` 触达 `/proc` 合成路径。全家族判据表见 `docs/n14-retire-the-emulation.md` §4.2。
+* **restore 复核**：在 `0.1.0-527` 上重跑 `tmp/k0s/checkpoint_acceptance.py` 全绿；先红的两次
+  都是**验收脚本**的毛病（kubectl 通道死了伪装成"图没写"；计时器文件被 pause 冻在截断窗口里
+  ⇒ 误报"计数消失"），已修并记录（`docs/checkpoint-restore-e2b-half.md` §6(j)）。
+
+### ⚠️ 部署状态（别搞错）
+
+**集群仍跑 `0.1.0-527-g946daa9`**（= `deploy/stack/.version`）。本轮 N15/F11 的改动**都没有
+上线**：fork 侧改了 wheel（`6f951d6`）⇒ 要上线必须走完整链条
+`deploy/scripts/build-sandlock-wheels.sh` → `build-and-push.sh` → `KUBECONFIG=... apply.sh`
+（中途重建过本地测试镜像 `e2b-sandlock-test:latest`）。集群上最后一次验收过的版本仍是 527。
+
+### 本轮的验收数字（下次拿它做对照）
+
+| 档 | 命令 | 结果 |
+|---|---|---|
+| gate A（镜像形态） | `tmp/k0s/gateA-full.sh <log>` | **1772 passed / 6 skipped / 3 xfailed / 0 failed** |
+| gate B（pure） | `tmp/k0s/gateB-full.sh <log>` | **1765 passed / 13 skipped / 3 xfailed / 0 failed** |
+| phase 2（非 root worker） | `tmp/k0s/phase2.sh <log>` | **57 passed / 1 skipped / 0 failed** |
+| security 两态 | `deploy/scripts/arm-lane/x86-security.sh 0/1 <log>` | 默认 44 passed / 1 skipped / 3 xfailed；pure 42 passed / 3 skipped / 3 xfailed |
+| F11 多副本等 9 个文件 | `tmp/k0s/x86-security-one.sh "" <log> <paths…>` | **80 passed** |
+| 本机 | `.venv/bin/python -m pytest tests/unit` / `tests/contract` | 16 条既有 macOS 红 / 1164 绿；contract 321 绿 / 53 skipped |
+
+**工具坑（本轮踩到并修好）**：① `deploy/scripts/test-prod-shaped.sh` **跑不出 gate B** ——
+`-e E2B_BASE_IMAGE="${E2B_BASE_IMAGE:-…}"` 会把"已设但为空"变回默认镜像，所以 `tmp/k0s/gateB-full.sh`
+是它 phase 1 的复制品，只把这一处写成真正的空；② `E2B_TEST_STRICT_SKIPS=1` 把"runner 能力类"
+跳过变红（清单在 `tests/conftest.py::_STRICT_SKIP_FORBIDDEN`），但**部署形态选择器**（空 base
+image 等）的跳过是允许的；③ 临时 runner：`tmp/k0s/x86-security-one.sh <base> <log> <pytest args…>`
+（单文件/单用例）、`tmp/k0s/x86-run-py.sh`（跑脚本）。
+
+### 还剩什么（都需要拍板，不是执行问题）
+
+| 项 | 需要什么 |
+|---|---|
+| **N27**（平台状态另起 BASE） | 你说过"独立排期"；随时能开工（落点已收口：`gateway_common/paths.py` 三个 helper + `E2B_STATE_BASE` + 迁移脚本，注意 EXDEV） |
+| **N14 的 S5**（退役模拟形态） | **要你先拍**"还保不保留 `E2B_REAL_ROOT=0` 的模拟形态"（lane 现在两态都跑） |
+| **FUP-28** | 缺产品路径 soak：要在部署宿主上跑 arm64 soak 二进制（≥97482 受管 open 0 失败等） |
+| N36 / N30 / §10.5 / `Open` 桶 / O1–O3 复核 | 待决策（口径题） |
+
 ## ⚡ 共享卷去 SYS_ADMIN（2026-09-11，A4–A7 收口 / backlog #25）
 
 **一句话**：**出厂镜像与清单形态下** worker 侧不再需要 `SYS_ADMIN` ——「共享卷 `mount --bind`」
