@@ -200,12 +200,24 @@ container 崩塌 ⇒ 之后每个 verb 都答 `InstanceClosed`（security 两态
 **两态的新读法**（同一裁定）：纯形态的"两态"是 **`=0` ⇔ N15 identity（不设根）**、
 **`=1` ⇔ 合成根 + 真根**；`E2B_PURE_ROOTFS` 默认 `off`，即默认仍是 identity。
 
-**验收（2026-09-26，权威数字在 `.superpowers/sdd/pure-task-13-report.md` §1）**：gate A（镜像形态）
-2022 passed / 10 skipped / 3 xfailed、gate B off（= 新读法下的 `=0`）2015 / 17 / 3、**`=1`
-合成根 + 真根 2019 passed / 16 skipped / 0 failed**（3 条 N35 `xfail` 转 pass、1 条别名用例不再
-skip）、phase 2 57 passed / 1 skipped，**四档全 `0 failed`**；简报与 §6 里 N15 当天那组
-`1772/1765` 已被这组取代。`synth + REAL_ROOT=0` 那档**只有拒绝、没有结果**。security 两态
-（Task 11）identity `43 passed / 3 skipped / 3 xfailed`、合成根 `46 passed / 3 skipped / 0 failed`。
+**验收（2026-09-26，Task 13 权威落点）**：四档全量 lane 的逐档数字、基线与差逐字如下（全部在
+revision `1374e87`、同一份树指纹上跑，镜像 `e2b-sandlock-test:task12cur`）：
+
+| 档 | 命令（`E2B_TEST_IMAGE=e2b-sandlock-test:task12cur` 前缀省略） | 结果（末行逐字） | 基线 | 与基线的差 / 判定 |
+|---|---|---|---|---|
+| **gate A**（镜像形态，全量） | `sh tmp/k0s/gateA-full.sh tmp/k0s/n16-gateA.log` | `2022 passed, 10 skipped, 3 xfailed` | Task 11 的 `2003 passed / 0 failed`（revision `47998de`） | **+19 passed、0 failed**；+19 全部是 `47998de` 之后落库的新用例（collect：`47998de` = 2016、现在 = 2035）⇒ **相等或更好** |
+| **gate B off**（= 新读法下的 `=0` identity） | `sh tmp/k0s/gateB-full.sh tmp/k0s/n16-gateB-off.log` | `2015 passed, 17 skipped, 3 xfailed` | 简报的 `1765 passed / 13 skipped / 3 xfailed`（N15 当天，过期）；同形的 Task 11 identity security `43/3/3` | `0 failed`；与基线数字不同只因基线 revision 少 19 条用例 + 7 条形态 skip ⇒ **相等或更好** |
+| **`=1` 合成根 + 真根** | `sh tmp/k0s/gateB-pure-rootfs.sh 1 tmp/k0s/n16-gateB-synth-realroot.log tests --perf --ignore=tests/contract/test_volume_quota.py --ignore=tests/contract/test_xfs_project_quota.py` | `2019 passed, 16 skipped` | 简报"两态都 0 failed、passed ≥ 1765"；同态的 security `46 passed / 3 skipped / 0 failed`（Task 11） | **0 failed / 0 error**，比 identity 多 4：3 条 N35 `xfail` 转 pass + 1 条别名用例不再 skip ⇒ **相等或更好** |
+| **`=0` 那一态**（`gateB-pure-rootfs.sh 0`） | `sh tmp/k0s/gateB-pure-rootfs.sh 0 tmp/k0s/n16-gateB-identity.log tests --perf --ignore=…同上` | `2015 passed, 17 skipped, 3 xfailed` | —（新读法下它就是 gate B off） | 与 gate B off **逐字相同**（同 2015/17/3）⇒ 两态 = 第 2 档 + 第 3 档，**自洽** |
+| **第三组合（`synth` + `REAL_ROOT=0`）** | `docker run … -e E2B_PURE_ROOTFS=synth -e E2B_REAL_ROOT=0 … python3 -c 'from envd_service.app import create_app; create_app()'` | `RuntimeError: E2B_PURE_ROOTFS=synth without E2B_REAL_ROOT=1: …`，**exit 1** | 追加裁定：该组合结构性不成立，守卫当场拒绝 | **没有"这一档"的结果，只有拒绝证据** |
+| **phase 2**（非 root worker） | `sh tmp/k0s/phase2.sh tmp/k0s/n16-phase2.log` | `57 passed, 1 skipped` | 简报 `57 passed, 1 skipped` | **逐字相等** |
+
+**四档全 `0 failed`**；简报与 §6 里 N15 当天那组 `1772/1765` 已被这组取代。security 两态（Task 11，
+`tests/security` 自 `47998de` 起零改动）identity `43 passed / 3 skipped / 3 xfailed`、合成根
+`46 passed / 3 skipped / 0 failed`。数字出处是本地 lane 日志 `tmp/k0s/n16-gateA.log`、
+`tmp/k0s/n16-gateB-off.log`、`tmp/k0s/n16-gateB-identity.log`、`tmp/k0s/n16-gateB-synth-realroot.log`、
+`tmp/k0s/n16-phase2.log` 与被拒证据 `tmp/k0s/task13/n16-guard-synth-realroot0.log`（`tmp/` 是 gitignored）；
+**日志若被清，以本文档的数字为准**。
 两条注记：① `E2B_PAUSE_CHECKPOINT` **默认关**，所以合成根下 pause/resume 的第一次探针是**空洞的**
 （pause 不写图、`resume` 面对活会话走 thaw 分支 ⇒ restore verb 一次都不调）；真跑恢复链的是"用
 worker 自己的两个入口 + 把 restore stub 指到树外"那一版（`tmp/k0s/task12/`），两态两轮都

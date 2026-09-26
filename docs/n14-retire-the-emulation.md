@@ -298,8 +298,8 @@ workspace 仍以 `/home/user`、`/workspace` 两个别名进树，拆箱时骨�
 | 镜像形态（gate A） | 2022 passed / 10 skipped / 3 xfailed / 0 failed |
 | phase 2（非 root worker） | 57 passed / 1 skipped |
 
-全表（逐条 skip 归属、原始日志路径）在 `.superpowers/sdd/pure-task-13-report.md` §1，那是本轮的
-权威数字。**`E2B_PURE_ROOTFS=synth` 配 `E2B_REAL_ROOT=0` 没有"这一档"**：那个组合结构性不成立
+全表（逐档数字、基线与差、被拒组合）在 `docs/pure-shape-decision.md` §7，那是本轮的
+权威落点；原始 lane 日志在 gitignored 的 `tmp/k0s/n16-*.log`，日志若被清以该文档的数字为准。**`E2B_PURE_ROOTFS=synth` 配 `E2B_REAL_ROOT=0` 没有"这一档"**：那个组合结构性不成立
 （bind 只在真根那条路径上发生，模拟形态把虚拟路径翻译进**空骨架** ⇒ 生成期 `execvp("/bin/sh")`
 errno 13 ⇒ container 崩塌 ⇒ 之后每个 verb 都答 `InstanceClosed`），所以 `create_app` 当场 loud
 拒绝、exit 1（原句见追加裁定与 Task 13 报告 §2）。**一条验收注记（Task 12）**：
