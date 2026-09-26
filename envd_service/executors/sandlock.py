@@ -332,7 +332,9 @@ def _mkdir_traversable(path: Path, mode: int = 0o755) -> None:
     call as ``route_b._write_slot_documents``: create, then ``chmod`` each level
     explicitly, because neither the ambient umask nor a private scratch root
     may decide the modes. Directories that already exist are left untouched --
-    this must never widen the modes of something an image shipped.
+    this must never widen the modes of something an image shipped. A tree that
+    is wholly the worker's own (the synthesized root) heals its leftovers
+    instead: see ``_heal_traversable``.
     """
     if path.exists() or path.is_symlink():
         # `Path.mkdir(exist_ok=True)`'s contract: an existing directory is the
@@ -354,7 +356,41 @@ def _mkdir_traversable(path: Path, mode: int = 0o755) -> None:
         os.chmod(directory, mode)
 
 
-def _ensure_chroot_mount_points(rootfs: Path, mounts: dict[str, str]) -> None:
+def _heal_traversable(path: Path, stop: Path, mode: int = 0o755) -> None:
+    """``_mkdir_traversable``, plus a ``chmod`` of every level it *owns*.
+
+    ``_mkdir_traversable`` deliberately leaves an existing directory's mode
+    alone: an **image** may have shipped it ``0700`` on purpose and widening a
+    shipped mode is not this code's call (that is the early return
+    ``_ensure_chroot_mount_points`` relies on). A **synthesized** root has no
+    image behind it -- every level between ``stop`` and ``path`` was created by
+    this worker, this run or an older one, so a ``0700`` there is a leftover
+    under a hostile umask to heal, not a shipped decision. The split is
+    categorical, not a heuristic, which is why the two behaviours live in two
+    functions instead of one flag.
+
+    ``stop`` is the boundary that keeps the heal inside the sandbox's own tree;
+    it has to be ``path`` or one of its ancestors (fail closed otherwise) and is
+    itself re-asserted, which is how the root and ``<pure_rootfs_dir>`` get
+    their ``0755`` back. Nothing above ``stop`` is ever touched.
+    """
+    _mkdir_traversable(path, mode)
+    if stop != path and stop not in path.parents:
+        raise ValueError(
+            f"refusing to heal {path}: {stop} is not an ancestor of it, so the "
+            "chmod would leave the tree this worker owns"
+        )
+    current = path
+    while True:
+        os.chmod(current, mode)
+        if current == stop:
+            return
+        current = current.parent
+
+
+def _ensure_chroot_mount_points(
+    rootfs: Path, mounts: dict[str, str], *, heal: bool = False
+) -> None:
     """Create every mount *target* inside the rootfs.
 
     The emulating shape never needed them: the mediator resolved the virtual
@@ -367,13 +403,25 @@ def _ensure_chroot_mount_points(rootfs: Path, mounts: dict[str, str]) -> None:
     rather than silently leaving a hole. Directories go through
     ``_mkdir_traversable`` -- the sandbox uid does not own them, and a umask
     decided ``0700`` fails the bind.
+
+    ``heal=True`` is for the synthesized root, whose whole tree is the
+    worker's own: targets that *already exist* get their mode re-asserted too
+    (``_heal_traversable``), so a ``0700`` left by an older run heals. It stays
+    False for an image rootfs, where an existing directory may have been shipped
+    with a mode this code has no business widening.
     """
     for virtual, host in mounts.items():
         target = rootfs / str(virtual).removeprefix("/")
         if Path(str(host)).is_dir():
-            _mkdir_traversable(target)
+            if heal:
+                _heal_traversable(target, rootfs)
+            else:
+                _mkdir_traversable(target)
         else:
-            _mkdir_traversable(target.parent)
+            if heal:
+                _heal_traversable(target.parent, rootfs)
+            else:
+                _mkdir_traversable(target.parent)
             if not target.exists():
                 target.touch()
 
@@ -477,19 +525,32 @@ def _materialize_synthetic_rootfs(root: Path, mounts: dict[str, str]) -> None:
     umask and lands as ``0700`` under ``umask 077``, which is the same failure.
     ``_ensure_chroot_mount_points`` then creates the targets the fork refuses to
     run without, by the same rule.
+
+    Everything here is healed, not merely created: the synthesized root has no
+    image behind it, so a ``0700`` left by an older run (or by an operator's own
+    ``mkdir`` under a hostile umask) is a leftover of ours, and leaving it in
+    place would fail every bind from then on -- what the root's old
+    ``os.chmod`` promised while only ever fixing the root itself. The heal is
+    bounded at ``<pure_rootfs_dir>`` and never walks above it.
     """
     # ``_mkdir_traversable`` walks the parents, so ``<pure_rootfs_dir>`` itself
     # is created 0755 too: the switch hands that layer out in Task 5 and the
     # sandbox uid has to be able to traverse into the sandbox's own directory.
     _mkdir_traversable(root)
-    # Re-asserted even when the root was already there: it used to be an
-    # unconditional chmod, and a ``0700`` left behind by an older run must heal
-    # instead of failing every bind from then on.
-    os.chmod(root, 0o755)
+    base = root.parent
+    if base != Path(base.anchor):
+        # ``<pure_rootfs_dir>``: created 0755 above when it was missing, and
+        # *healed* when an older run -- or a ``mkdir`` the operator ran under
+        # ``umask 077`` -- left it 0700, because the sandbox uid traverses this
+        # layer into its own directory. Guarded against a filesystem root
+        # (``E2B_PURE_ROOTFS=/``): a misconfigured switch must never make this
+        # code chmod ``/``.
+        _heal_traversable(base, base)
+    _heal_traversable(root, root)
     for name in _SYNTHETIC_ROOTFS_SKELETON_DIRS:
-        _mkdir_traversable(root / name)
-    _mkdir_traversable(root / "home" / "user")
-    _ensure_chroot_mount_points(root, mounts)
+        _heal_traversable(root / name, root)
+    _heal_traversable(root / "home" / "user", root)
+    _ensure_chroot_mount_points(root, mounts, heal=True)
 
 
 class SandlockRunningProcess(RunningProcess):
@@ -2075,24 +2136,32 @@ class SandlockExecutor(Executor):
     def _materialize_root(self, root: Path) -> dict[str, str]:
         """This sandbox's mount map, with every target created on disk.
 
-        The image branch is verbatim today's code (it is production; its
-        pre-created ``workspace``/``home/user``/``dev`` entries exist because
-        slim images extract without them). The synthesized branch adds the host
-        system directories and the whole-tree ``/dev`` bind on top of the
-        workspace aliases and the volumes.
+        The image branch is production code: its pre-created
+        ``workspace``/``home/user``/``dev`` entries exist because slim images
+        extract without them, and they go through ``_mkdir_traversable`` (the
+        worker's own directories, so a umask may not decide their mode), while
+        anything the image shipped is left alone. The synthesized branch adds
+        the host system directories and the whole-tree ``/dev`` bind on top of
+        the workspace aliases and the volumes, and heals its own tree
+        (``_materialize_synthetic_rootfs``).
         """
         mount_map = self._volume_only_mount_map()
         if self._is_image_rootfs:
             # The workspace alias (/home/user, declared first: the fork breaks
             # host-source ties by declaration order) plus /workspace, and the
             # /dev parent dir minimal_dev's nodes hang under -- slim base
-            # images extract without any of the three.
+            # images extract without any of the three. They are the *worker's*
+            # directories (the image never had them), so they are created by
+            # ``_mkdir_traversable``'s explicit chmod: a plain ``mkdir`` lands
+            # ``0700`` under ``umask 077``, and the ``_ensure_chroot_mount_points``
+            # right below early-returns on the ones that already exist, so
+            # nothing else would ever fix them. Directories the image *did*
+            # ship (its ``home/``, its ``/usr``) are left exactly as they are --
+            # that is the asymmetric half, and it is the image's call, not ours.
             for mount_point in ("workspace", "home/user", "dev"):
-                root.joinpath(mount_point).mkdir(parents=True, exist_ok=True)
+                _mkdir_traversable(root.joinpath(mount_point))
             for virtual in self._fs_mounts:
-                root.joinpath(virtual.removeprefix("/")).mkdir(
-                    parents=True, exist_ok=True
-                )
+                _mkdir_traversable(root.joinpath(virtual.removeprefix("/")))
             # minimal_dev replaces the whole-tree host /dev mount: only the six
             # single-node mounts (ptmx, pts, null, urandom, zero, tty) are
             # visible under the chroot's /dev, so /dev/shm and /dev/mqueue

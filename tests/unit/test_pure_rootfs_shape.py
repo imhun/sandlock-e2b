@@ -144,6 +144,81 @@ def test_the_skeleton_is_traversable_and_0755_under_umask_077(tmp_path: Path) ->
         assert _mode(root / str(virtual).lstrip("/")) == "0o755", virtual
 
 
+def test_the_image_branch_chmods_only_the_directories_it_creates(
+    tmp_path: Path,
+) -> None:
+    """Minor A: the image branch's own mkdir under umask 077 was 0700.
+
+    ``workspace`` / ``home/user`` / ``dev`` and the volume targets are created
+    by the *worker* (slim base images extract without them), so they carry the
+    same bind-EACCES hazard as the synthesized skeleton -- and the very next
+    ``_ensure_chroot_mount_points`` early-returns on them, so nothing else will
+    ever fix their mode. The image's *own* directories are the other half: a
+    ``0700`` ``home/`` the image shipped must stay ``0700``, which is why the
+    fix has to reach only the directories this run created.
+    """
+    rootfs = tmp_path / "image"
+    (rootfs / "home").mkdir(parents=True)
+    os.chmod(rootfs / "home", 0o700)
+    vol = tmp_path / "vol"
+    vol.mkdir()
+    with _umask(0o077):
+        ex = _executor(
+            tmp_path,
+            base_image="python:3.11-slim",
+            image_rootfs=rootfs,
+            fs_mounts={"/mnt/vol": str(vol)},
+        )
+        ex._build_instance_policy()
+    assert _mode(rootfs / "home") == "0o700"
+    assert _mode(rootfs / "workspace") == "0o755"
+    assert _mode(rootfs / "dev") == "0o755"
+    assert _mode(rootfs / "home" / "user") == "0o755"
+    assert _mode(rootfs / "mnt") == "0o755"
+    assert _mode(rootfs / "mnt" / "vol") == "0o755"
+
+
+def test_a_stale_0700_tree_heals_on_the_next_build(tmp_path: Path) -> None:
+    """Minor B: the handed-out layer, the root, the skeleton, the targets.
+
+    A previous run under ``umask 077`` -- or the operator's own ``mkdir`` --
+    leaves the whole tree ``0700``, and ``_mkdir_traversable`` deliberately does
+    not touch an existing directory, so nothing ever healed it. The synthesized
+    root has no image behind it: every level is the worker's own, and the heal
+    is bounded at ``<pure_rootfs_dir>`` (its own parent, deliberately, is left
+    alone) so it cannot widen anything outside the sandbox's directory.
+    """
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    os.chmod(outer, 0o700)
+    base = outer / "pure"
+    root = base / "sbx_synth"
+    stale = [base, root, *(root / name for name in _SYNTHETIC_ROOTFS_SKELETON_DIRS)]
+    stale.append(root / "home" / "user")
+    stale.append(root / "mnt" / "vol")
+    vol = tmp_path / "vol"
+    vol.mkdir()
+    for path in stale:
+        path.mkdir(parents=True, exist_ok=True)
+    for path in stale:
+        os.chmod(path, 0o700)
+    ex = _executor(
+        tmp_path, pure_rootfs_dir=str(base), fs_mounts={"/mnt/vol": str(vol)}
+    )
+    policy = ex._build_instance_policy()
+    assert _mode(outer) == "0o700"
+    assert _mode(base) == "0o755"
+    assert _mode(root) == "0o755"
+    for name in _SYNTHETIC_ROOTFS_SKELETON_DIRS:
+        assert _mode(root / name) == "0o755", name
+    assert _mode(root / "home" / "user") == "0o755"
+    for virtual, host in policy.fs_mount.items():
+        if Path(host).is_dir():
+            target = root / str(virtual).lstrip("/")
+            assert target.is_dir(), virtual
+            assert _mode(target) == "0o755", virtual
+
+
 def test_system_dirs_are_filtered_by_host_existence(tmp_path: Path) -> None:
     """A missing host directory must not become an empty stub in the sandbox."""
     expected = {d: d for d in _SYNTHETIC_ROOTFS_SYSTEM_DIRS if os.path.isdir(d)}
