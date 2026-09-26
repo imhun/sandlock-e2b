@@ -111,28 +111,44 @@
 ### Task 1: 给 prod-shaped lane 加 netns 形态通道（后续三处的验证前提）
 
 **Files:**
-- Modify: `deploy/scripts/test-prod-shaped.sh:155-172`（在 `PIDNS_ENV` 块后插 `NETNS_ENV` 块，并在两处 `docker run` 的 `-e` 列表里各加一行 `$NETNS_ENV \`）
+- Modify: `deploy/scripts/test-prod-shaped.sh:155-180`（在 `PIDNS_ENV` 块后插 `NETNS_ENV` 块，并在两处 `docker run` 的 `-e` 列表里各加一行 `$NETNS_ENV \`，与所在列表的续行同缩进）
 - Create: `tests/unit/test_prod_shaped_lane_netns_passthrough.py`
 
 **Interfaces:**
 - Consumes: `deploy/scripts/test-prod-shaped.sh` 现有的 `MIRRORS_ENV`(`:124-133`)、`MEMORY_ENV`(`:150-153`)、`PIDNS_ENV`(`:158-161`)、`CACHE_ENV`(`:169-172`) 透传风格。
 - Produces: `NETNS_ENV`（一个可空字符串，形如 `-e E2B_ENABLE_NET_ISOLATION=true -e E2B_FD_INJECT_CONNECT=true -e E2B_TEST_NET_ISOLATION=1`），Task 2–4 的形态验证靠它跑；三条 pytest 文本断言供 Task 6 引用为证据。
 
-为什么排第一：`deploy/scripts/test-prod-shaped.sh` 只透传 `MIRRORS/MEMORY/PIDNS/CACHE`（`:124-172`），**没有任何 netns 变量**，而 `tests/contract/test_mcp_netns.py:31-37` 用 `E2B_TEST_NET_ISOLATION=1` 显式门控 —— 所以 §2.4.5 记的"netns 形态本机全量 1439 passed"（`tmp/prod-shaped-netns-on.log`，实测该日志是 phase 1 单相位、`1439 passed, 3 skipped, 369.20s`）**用今天的脚本复现不出来**：contract 三条会被 skip，跑出来的绿是"少跑三条的绿"。
+为什么排第一：`deploy/scripts/test-prod-shaped.sh` 只透传 `MIRRORS/MEMORY/PIDNS/CACHE`（`:124-172`），**没有任何 netns 变量**，于是 §2.4.5 记的那次"netns 形态本机全量"（`tmp/prod-shaped-netns-on.log`，`1439 passed, 3 skipped, 369.20s`）**用脚本复现不出来**。
+
+**2026-09-26 更正（Task 1 实测）**：原因**不是**"contract 三条会被 skip"——那是错的。① runner 镜像自 `407a59c`（2026-09-03）起就有 `ENV E2B_TEST_NET_ISOLATION=1`（`deploy/docker/Dockerfile.test-runner:93-96`）；② `tests/contract/test_mcp_netns.py` 的 `_netns_servers()` 自己起 worker（`envd_settings_extra={"enable_net_isolation": True, "fd_inject_connect": True}`，`:68-70`）⇒ 该契约**自给自足**，lane 传不传那两个开关它都跑：09-16 那份日志里该模块有 45 条告警（= 执行过），它的 3 skipped 是 pure-shape / template_isolation / uid_pool。真正的原因是**另一件事**：lane 跑的是**整档**套件，而 in-process 控制面/worker 的默认形态**确实**读 `E2B_ENABLE_NET_ISOLATION` / `E2B_FD_INJECT_CONNECT`（`envd_service/config.py:142`/`:150`，`tests/unit/test_net_isolation_config.py` 钉住）⇒ "用脚本跑出**部署形态的整档**"在此之前做不到，**那**才是 §2.4.5 日志的复现前提。
 
 - [ ] **Step 1: 写会失败的测试**
 
 ```python
-"""The prod-shaped lane must be able to reproduce the deployed netns shape.
+"""The prod-shaped lane must be able to run the *whole* suite in the deployed shape.
 
-`tests/contract/test_mcp_netns.py` gates itself on `E2B_TEST_NET_ISOLATION=1`
-and the worker reads `E2B_ENABLE_NET_ISOLATION` / `E2B_FD_INJECT_CONNECT`, but
-`deploy/scripts/test-prod-shaped.sh` forwarded only MIRRORS/MEMORY/PIDNS/CACHE
--- so the documented netns-shaped full run (`tmp/prod-shaped-netns-on.log`,
-docs/production-deployment-requirements.md §2.4.5) could not be reproduced
-from the script: the netns contract would have been silently skipped instead.
-This pins the passthrough in *both* phases (phase 1 root worker, phase 2 uid
-65534 worker).
+What this pins -- and, just as important, what it is *not* about:
+
+* **Not the netns contract.** ``tests/contract/test_mcp_netns.py`` is
+  self-sufficient and has been all along: the runner image bakes
+  ``E2B_TEST_NET_ISOLATION=1`` (``deploy/docker/Dockerfile.test-runner:93-96``,
+  since ``407a59c`` 2026-09-03), so it was never skipped, and its
+  ``_netns_servers()`` starts its own worker with
+  ``envd_settings_extra={"enable_net_isolation": True, "fd_inject_connect": True}``.
+  Neither of the lane's switches gates or shapes that module.
+* **The whole suite's deployment shape.** The in-process control plane / worker
+  take their *deployment default* from ``E2B_ENABLE_NET_ISOLATION`` and
+  ``E2B_FD_INJECT_CONNECT`` (``envd_service/config.py:142``/``:150``, pinned by
+  ``tests/unit/test_net_isolation_config.py``), and ``docker-compose.prod.yml``
+  ships both as ``true``. ``deploy/scripts/test-prod-shaped.sh`` forwarded only
+  MIRRORS/MEMORY/PIDNS/CACHE, so "run the suite the way the shipped stack runs"
+  could not be selected from the script at all -- which is the premise of the
+  documented netns-shaped full run (``tmp/prod-shaped-netns-on.log``,
+  docs/production-deployment-requirements.md §2.4.5).
+
+The two switches are a pair in the code (``create_app`` refuses the unpaired
+shape), so the lane forwards them together and refuses half a pair. This pins
+the passthrough in *both* phases (phase 1 root worker, phase 2 uid 65534 worker).
 """
 
 from __future__ import annotations
@@ -143,6 +159,10 @@ REPO = Path(__file__).resolve().parent.parent.parent
 LANE = (REPO / "deploy" / "scripts" / "test-prod-shaped.sh").read_text(
     encoding="utf-8"
 )
+
+
+def _indent(line: str) -> str:
+    return line[: len(line) - len(line.lstrip())]
 
 
 def test_lane_forwards_the_net_isolation_pair_when_set() -> None:
@@ -166,16 +186,33 @@ def test_half_a_pair_is_refused_instead_of_silently_shared() -> None:
 
 
 def test_both_phases_carry_the_net_isolation_pair() -> None:
-    # Two `docker run` invocations: phase 1 (root worker, :178-190) and
-    # phase 2 (uid 65534, :204-221).
-    assert LANE.count("\n    $NETNS_ENV \\\n") == 2
+    # Two `docker run` invocations: phase 1 (root worker) and phase 2 (uid
+    # 65534). Each carries the line in the same argument list as the other
+    # forwarded shapes -- right after `$PIDNS_ENV \`, at that list's own
+    # indentation. Asserting the structure (which run owns the line, what it
+    # sits behind, how it is indented) keeps the pin without hardcoding a
+    # column count that only phase 1 happens to satisfy.
+    lines = LANE.splitlines()
+    runs = [i for i, line in enumerate(lines) if line.strip().startswith("docker run ")]
+    assert len(runs) == 2
+
+    forwarded = [i for i, line in enumerate(lines) if line.strip() == "$NETNS_ENV \\"]
+    assert len(forwarded) == 2
+
+    for index in forwarded:
+        anchor = lines[index - 1]
+        assert anchor.strip() == "$PIDNS_ENV \\"
+        assert _indent(lines[index]) == _indent(anchor)
+
+    owners = {max(run for run in runs if run < index) for index in forwarded}
+    assert owners == set(runs)
 ```
 
 - [ ] **Step 2: 跑它，确认失败**
 
 Run: `tmp/testenv/bin/python -m pytest tests/unit/test_prod_shaped_lane_netns_passthrough.py -q -p no:cacheprovider`
 
-Expected: FAIL —— 三条都红：第一条报 `assert 'NETNS_ENV=""\n' in LANE`（脚本里没有这个符号），第三条报 `assert 0 == 2`。
+Expected: FAIL —— 三条都红：第一条报 `assert 'NETNS_ENV=""\n' in LANE`（脚本里没有这个符号），第三条报 `assert 0 == 2`。（若脚本里已经存在一版缩进不对的 `$NETNS_ENV \`，第三条改为报缩进不符 —— 2026-09-26 第二轮实测：`assert '    ' == '        '`。）
 
 - [ ] **Step 3: 最小改动**
 
@@ -183,14 +220,24 @@ Expected: FAIL —— 三条都红：第一条报 `assert 'NETNS_ENV=""\n' in LA
 
 ```sh
 # The per-sandbox network namespace is a *deployment* shape too (E7.2): the
-# shipped stack and the k8s manifest run `E2B_ENABLE_NET_ISOLATION=true` +
-# `E2B_FD_INJECT_CONNECT=true`, and this lane exists to reproduce the deployed
-# shape. The two are a pair -- `create_app` refuses the single-switch shape by
-# name (it would leave every sandbox loopback-only, i.e. "the network is
-# down" with no error anywhere) -- so forward them together, and only when
-# both are set. Unset stays unset: the code default is the shared-netns shape.
-# `E2B_TEST_NET_ISOLATION` is what un-skips `tests/contract/test_mcp_netns.py`
-# (three cases); without it a "netns shape" run is green for the wrong reason.
+# shipped stack (`docker-compose.prod.yml`) and the k8s manifest run
+# `E2B_ENABLE_NET_ISOLATION=true` + `E2B_FD_INJECT_CONNECT=true`, and this lane
+# exists to reproduce the deployed shape -- of the *whole* suite, because the
+# in-process control plane and worker read these two variables as their
+# deployment default (envd_service/config.py, pinned by
+# tests/unit/test_net_isolation_config.py). Forward them when both are set;
+# without that the lane could only ever run the code default (shared netns)
+# shape, which is why the documented netns-shaped full run (§2.4.5) was not
+# reproducible from the script.
+# `tests/contract/test_mcp_netns.py` is *not* the reason: it never needed this
+# passthrough (the runner image bakes `E2B_TEST_NET_ISOLATION=1`, and the
+# contract's own harness sets the worker's pair), so it runs the same way
+# whether the pair arrives here or not. `E2B_TEST_NET_ISOLATION` is forwarded
+# only so the shape stays explicit end to end.
+# The two are a pair -- `create_app` refuses the single-switch shape by name (it
+# would leave every sandbox loopback-only, i.e. "the network is down" with no
+# error anywhere) -- so forward them together, and only when both are set.
+# Unset stays unset: the code default is the shared-netns shape.
 NETNS_ENV=""
 if [ -n "${E2B_ENABLE_NET_ISOLATION:-}" ] && [ -n "${E2B_FD_INJECT_CONNECT:-}" ]; then
     NETNS_ENV="-e E2B_ENABLE_NET_ISOLATION=${E2B_ENABLE_NET_ISOLATION} -e E2B_FD_INJECT_CONNECT=${E2B_FD_INJECT_CONNECT} -e E2B_TEST_NET_ISOLATION=${E2B_TEST_NET_ISOLATION:-1}"
@@ -200,7 +247,7 @@ elif [ -n "${E2B_ENABLE_NET_ISOLATION:-}${E2B_FD_INJECT_CONNECT:-}" ]; then
 fi
 ```
 
-然后在**两处** `docker run` 的参数列表里，紧跟 `$PIDNS_ENV \` 之后各加一行（phase 1 在 `:184` 之后，phase 2 在 `:215` 之后）：
+然后在**两处** `docker run` 的参数列表里，紧跟 `$PIDNS_ENV \` 之后各加一行（phase 1 在 `:212` 之后、4 空格续行；phase 2 在 `:244` 之后、8 空格续行 —— **与该列表的邻居同缩进**，测试是按结构钉的，不硬编码列数）：
 
 ```sh
     $NETNS_ENV \
@@ -224,7 +271,7 @@ E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true \
 
 Expected:
 
-1. phase 1 的汇总行是 `… passed, … skipped, 0 failed`，且 `tests/contract/test_mcp_netns.py` 的三条**不是 skip**（`rg -c "test_mcp_netns.py" tmp/netns-unify-lane.log` 不应出现 SKIPPED 行）。条数应与**同日的共享 netns 档**逐条一致；§2.4.5 记的 `1439 passed / 3 skipped` 是 2026-09-16 的快照，此后测试数已增长，所以以"`0 failed` + 与同日共享 netns 档一致"为准，具体条数记进日志。
+1. phase 1 的汇总行是 `… passed, … skipped, 0 failed`，且 `tests/contract/test_mcp_netns.py` 的三条**不是 skip**（`rg -c "test_mcp_netns.py" tmp/netns-unify-lane.log` 不应出现 SKIPPED 行）。**这一条只是回归检查**：该契约本来就自给自足（见 Task 1 的 2026-09-26 更正），通道的作用是让**整档**跑在部署形态的默认值上，不是"解掉它的 skip"。条数应与**同日的共享 netns 档**逐条一致；§2.4.5 记的 `1439 passed / 3 skipped` 是 2026-09-16 的快照，此后测试数已增长，所以以"`0 failed` + 与同日共享 netns 档一致"为准，具体条数记进日志。
 2. phase 2（uid 65534）的行尾是 `0 failed`；条数与共享 netns 档一致（`docs/open-issues.md` OBS-5 行记 phase 2 = 57 passed 可作参照）。
 3. 这两条是**本计划最大的未知**：车队证据（§2.4.6/§2.4.7）来自"root/cap_SETUID worker + per-sandbox uid 开"，而 ①②④ 是 `65534 + per-sandbox uid 自动关`。**phase 2 不绿就不要往下做 Tasks 2–4**，把日志贴回来重新评估（届时 ①②④ 的形态选择要重新拍板）。
 
@@ -900,7 +947,7 @@ git commit -m "docs(shape): drop the stale low-port-window comments"
 ### Task 6: 文档与账本同步（含 ④ 的"未实测"结案）
 
 **Files:**
-- Modify: `docs/production-deployment-requirements.md:184`（§2.4.1 引用句）、`:366`（§2.4.3 追加）、`:534-538`（§2.4.7 顶部追加）、`:575`、`:687`（历史记录加注）
+- Modify: `docs/production-deployment-requirements.md:184`（§2.4.1 引用句）、`:366`（§2.4.3 追加）、`:534-538`（§2.4.7 顶部追加）、`:575`、`:687`（历史记录加注）—— **注：§2.4.5 已在 Task 1 补了 2026-09-26 更正（+9 行），`:534` 之后的引用行号请按当时文件重新核对**
 - Modify: `docs/SCALING.md:301-306`
 - Modify: `README.md:374-382`
 - Modify: `docs/k8s-deployment.md:166-176`

@@ -498,6 +498,20 @@ E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true` 跑全量 =
 逐项相同；netns 契约三条（MCP 全链路经代理、CPython `connect()` 走 fd 注入、通配域名）本地
 `3 passed`。⇒ **"能不能跑"这一层已经没有悬念**；开与不开的取舍落在语义与容量上。
 
+**2026-09-26 更正（Task 1 实测）**：上面那次"netns 形态全量"其实**没有把整档切成 netns
+形态** —— 当时 lane 还没有透传，那两个宿主环境变量进不了容器（通道是 2026-09-26 才加的），
+所以跑的是**代码默认（共享 netns）形态的整档 + 一个自给自足的 netns 契约**：该契约的门控
+`E2B_TEST_NET_ISOLATION=1` 烧在 runner 镜像里（`deploy/docker/Dockerfile.test-runner:93-96`，
+自 `407a59c`），worker 的 `enable_net_isolation`/`fd_inject_connect` 由它自己的
+`_netns_servers()` 设 —— lane 传不传那两个开关它都跑，其三条从来不是那 3 skipped
+（那 3 条是 pure-shape / template_isolation / uid_pool）。用脚本跑出**部署形态的整档**从
+2026-09-26 起才可能：
+`E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true ./deploy/scripts/test-prod-shaped.sh`
+= `1795 passed / 6 skipped / 3 xfailed / 0 failed` × phase 1，phase 2（uid 65534）=
+`57 passed / 1 skipped / 0 failed`（`tmp/netns-unify-lane.log`；同日共享档
+`tmp/netns-unify-lane-shared.log` 逐条对照为净零差，只多一次与本开关无关的快照竞态失败，
+见 `.superpowers/sdd/netns-task-1-report.md` §6.2）。
+
 ### 2.4.6 netns 的代价：逐条实测（2026-09-16，本机）
 
 开了 `net_isolation` 与没开，**在同一条 lane、同一份 profile 下**各跑一遍同类探针
