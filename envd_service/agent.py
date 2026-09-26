@@ -2002,7 +2002,7 @@ class NodeAgent:
             ",".join(summary["disk_sweep_skipped"]),
             ",".join(summary["untrusted_records"]),
             ",".join(summary["checkpointsReclaimed"]),
-            ",".join(summary["checkpointsSweepSkipped"]),
+            ",".join(summary["checkpoints_sweep_skipped"]),
         )
 
     def _reconcile_due(self) -> bool:
@@ -2215,6 +2215,17 @@ class NodeAgent:
                 # those from orphans), plus every sandbox this worker still
                 # holds a record for -- in memory, or as a tree on its disk. "No
                 # record" has to mean nowhere before an image may go.
+                #
+                # The asymmetry with the trees above is deliberate and is the
+                # rule the two halves are judged by: **an image is only
+                # meaningful while a record claims it** -- the record is the
+                # only thing that knows how to resume one, so an image no
+                # record anywhere claims can never be used again and only ever
+                # occupies the platform's account -- **while a tree is the
+                # user's data, and a record that cannot be read is no reason to
+                # delete data**. That is why ``unmaterialised`` ids stay out of
+                # this set: the round keeps the tree it could not verify and
+                # still collects an image nothing claims.
                 image_owners = (
                     set(known) | set(local) | concurrent_creates | fleet_owned
                 )
@@ -2403,7 +2414,7 @@ class NodeAgent:
             "quota_cleaned": quota_cleaned,
             "quota_unreclaimed": quota_unreclaimed,
             "checkpointsReclaimed": sorted(checkpoints_reclaimed),
-            "checkpointsSweepSkipped": checkpoints_sweep_skipped,
+            "checkpoints_sweep_skipped": checkpoints_sweep_skipped,
         }
         return summary
 

@@ -1707,7 +1707,7 @@ async def test_reconcile_collects_an_image_whose_owner_is_gone(tmp_path) -> None
         "quota_cleaned": [],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": ["sbx_gone"],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     assert not image.parent.exists()
 
@@ -1729,7 +1729,7 @@ async def test_reconcile_keeps_an_image_another_nodes_record_still_owns(
     )
 
     assert summary["checkpointsReclaimed"] == []
-    assert summary["checkpointsSweepSkipped"] == []
+    assert summary["checkpoints_sweep_skipped"] == []
     assert image.is_dir()
 
 
@@ -1749,7 +1749,7 @@ async def test_reconcile_leaves_images_alone_without_a_complete_fleet_record_set
     )
 
     assert summary["checkpointsReclaimed"] == []
-    assert summary["checkpointsSweepSkipped"] == ["sbx_elsewhere"]
+    assert summary["checkpoints_sweep_skipped"] == ["sbx_elsewhere"]
     assert image.is_dir()
     # 跳过要**留下**重试（而不是被同一轮的 `_sweep_completed` 清掉）。
     assert worker._reconcile_retry_in == 1

@@ -725,6 +725,16 @@ def remove_orphan_checkpoint_stores(
     default here is *not* to delete, and one claimant anywhere is enough to
     keep it.
 
+    **An image is only meaningful while a record claims it.** The record is the
+    only thing that knows how to resume one, so an image no record anywhere
+    claims can never be used again -- it only ever occupies the platform's
+    account and refuses the next capture. That is what makes this rule
+    *different* from the one next door: a **tree** is the user's data, and
+    "its record cannot be read" is no reason to delete data, which is why the
+    reconcile keeps a tree it could not verify (``unmaterialised``) and still
+    collects an image that nothing claims. The two halves of one round
+    disagreeing on the same id is the intended shape, not half an action.
+
     Nothing is guessed from a name or a size, and a store the worker cannot
     remove is reported and left for the next round instead of costing this one
     its remaining work.

@@ -656,7 +656,7 @@ async def test_restart_reports_the_live_tree_instead_of_stranding_it(
         "quota_cleaned": [],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     assert client.posts == [
         {"sandboxIDs": [sandbox_id], "snapshotIDs": [sandbox_id]}
@@ -731,7 +731,7 @@ async def test_restart_reclaims_an_unowned_tree_and_its_quota_row(
         "quota_cleaned": [STRANDED_VOLUME_PROJID, STRANDED_PROJID],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     assert client.posts == [{"sandboxIDs": [], "snapshotIDs": []}]
     # The tree was gone before the second pass: the first pass skipped the
@@ -943,7 +943,7 @@ async def test_gc_protects_paused_migrating_and_reserved_entries(
         "quota_cleaned": [],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     assert _agent_messages(caplog) == []
 
@@ -1023,7 +1023,7 @@ async def test_snapshot_store_directory_is_spared_by_its_shape(
         "quota_cleaned": [],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     # The store is untouched — marker, copied filesystem and the nested record
     # all still there — and the round never reached the disk for it.
@@ -1108,7 +1108,7 @@ async def test_a_client_chosen_prefixed_id_is_reclaimed_not_stranded(
         "quota_cleaned": [],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     assert quota.rows == {}
     # The round walks its targets in id order.
@@ -1199,7 +1199,7 @@ async def test_a_whole_tree_copy_under_a_snapshot_id_is_refused(
         "quota_cleaned": [],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     assert _agent_messages(caplog) == [
         f"reconcile: leaving {snap_id} on disk: its sandbox.json names "
@@ -1272,7 +1272,7 @@ async def test_infrastructure_namespaces_are_still_excluded(
         "quota_cleaned": [],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     for name in ("_volumes", "_snapshots", "_templates", "_secrets"):
         assert (workspace / name).is_dir()
@@ -1320,7 +1320,7 @@ async def test_trees_without_a_readable_record_are_reported_never_deleted(
         "quota_cleaned": [],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     assert _agent_messages(caplog) == [
         f"reconcile: cannot read the sandbox record of {empty}",
@@ -1390,7 +1390,7 @@ async def test_one_failing_tree_does_not_abort_the_round(
         "quota_cleaned": [],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     assert client.posts == [{"sandboxIDs": [], "snapshotIDs": []}]
     assert _agent_messages(caplog) == [
@@ -1443,7 +1443,7 @@ async def test_shared_workspace_keeps_another_nodes_live_tree(workspace, monkeyp
         "quota_cleaned": [3002],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     assert client.posts == [{"sandboxIDs": [], "snapshotIDs": []}]
     async with _client(control_app) as raw:
@@ -1531,7 +1531,7 @@ async def test_incomplete_fleet_enumeration_aborts_the_disk_sweep(
         "quota_cleaned": [],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     # The skip is observable and bounded: the round says why it skipped (log
     # and summary) and schedules the next attempt instead of going silent
@@ -2464,7 +2464,7 @@ async def test_a_slice_deleted_before_the_sweep_is_info_not_a_warning(
         "quota_cleaned": [8402],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     assert _agent_lines(caplog) == [
         (
@@ -2553,7 +2553,7 @@ async def test_a_slice_this_worker_may_not_read_keeps_its_own_warning(
         "quota_cleaned": [8502],
         "quota_unreclaimed": [],
         "checkpointsReclaimed": [],
-        "checkpointsSweepSkipped": [],
+        "checkpoints_sweep_skipped": [],
     }
     assert _agent_lines(caplog) == [
         (
