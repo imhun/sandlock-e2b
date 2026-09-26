@@ -57,7 +57,9 @@
 |---|---|---|---|---|
 | 入口代理 | `172.18.78.49:3000` 是**云上 nginx/VIP**：MAC `ee:ff:ff:ff:ff:ff`（VPC 代理 ARP）、22 端口不可达、80/3000 开放、响应无 `Server:` 头；2000 文件快照固定 **60.1 s → 504**（且两次尝试都真拷了） | **不做（带触发）** | 需要 SSH 或控制台者才能改；触发见 N29④ | `docs/k8s-deployment.md` §22.5.14 |
 | F5 存储锁 | uid 池的 `flock` 互斥**只有 NFSv4.0 跨节点成立**；跨节点**没有** CAS ⇒ 任何分布式单飞只能靠"锁 + 记录" | **约束（已满足）** | 换 NAS/换挂载参数时随部署复核一次 | `docs/k8s-deployment.md` F5 行、§13 |
-| O1/O2/O3 | 目标机 prjquota / TLS 代理层 / 凭据管理 | **本轮未复核** | 见 HANDOFF 的运维台账；做 N27/多副本时顺带确认 | `docs/HANDOFF.md` |
+| O1 | 目标机 prjquota | **本轮未复核** | 见 HANDOFF 的运维台账；做 N27/多副本时顺带确认 | `docs/HANDOFF.md` |
+| O2 | TLS 代理层（入口侧） | **不做（带触发）**（2026-09-26 用户裁定：O2 整条**本轮搁置**，计划保留不执行） | 触发：入口侧真的出现 504/性能问题，或拿到入口主机控制台 | `docs/superpowers/plans/2026-09-26-decisions.md` 第 4 条；`docs/k8s-deployment.md` §22.5.14 |
+| O3 | 凭据管理（k8s Secret、主 key、四类凭据的轮换与对账） | **✅ 已收口（2026-09-26）** | 轮换 runbook（四张表）、指纹对账与统一验收命令见 `docs/k8s-deployment.md` 的《凭据管理》节；线上已开 `E2B_SECRET_MASTER_KEY`（降级告警消失），redis 口令轮换按裁定接受 10–30 s 中断 | `docs/k8s-deployment.md` 《凭据管理》；`docs/superpowers/plans/2026-09-26-decisions.md` 第 5 条 +《追加裁定（O3 第二轮）》 |
 
 ## 四、已关（本轮，防翻旧账）
 

@@ -17,7 +17,7 @@
 |---|---|---|
 | `namespace.yaml` | Namespace `sandlock` | 所有资源的家 |
 | `pvc.yaml` | PVC `sandbox-shared`（RWX，50Gi） | **必须 RWX**（NFS/CephFS）：所有 worker 与两个 control-plane 副本共享它；沙箱工作区、`_images` 缓存、卷切片都在里面 |
-| `redis.yaml` | redis Deployment + Service | **默认无认证**（见 §4 密钥） |
+| `redis.yaml` | redis Deployment + Service | 已带 `--requirepass`，口令来自 `e2b-secrets/E2B_REDIS_PASSWORD`（见 §4 密钥） |
 | `control-plane.yaml` | control-plane Deployment（2 副本，合并镜像，`:3000`） | 内含 envd gateway；root 运行；`E2B_ENABLE_LOCAL_NODE=false`；initContainer 建/验 `_images` 属主 |
 | `gateway.yaml` | Service `gateway`（49983 → 3000） | 保住 compose 时代的 DNS/入口契约 |
 | `k8s-k0s/gateway-nodeport.yaml` | Service `gateway-nodeport`（**NodePort 31907** → 3000） | **只在自建集群的 overlay 里**：托管集群由 SLB/ingress 承担同一角色，这里没有 LB，所以用固定 NodePort 给集群外一个不漂的入口（访问方式见 `deploy/k8s-k0s/README.md`） |
@@ -143,7 +143,7 @@ kubectl -n $NS rollout status sts/e2b-worker
 | `control-plane.yaml` | `E2B_API_KEYS: "local-key"`、`E2B_INTERNAL_API_KEY: "internal-key"` | `secretKeyRef` → `e2b-secrets` |
 | `worker.yaml` | `E2B_INTERNAL_API_KEY: "internal-key"` | 同上（worker↔控制面） |
 | `autoscaler.yaml` | `E2B_AS_INTERNAL_API_KEY: "internal-key"` | 同上 |
-| `redis.yaml` + `control-plane.yaml` | `redis://redis:6379/0`，redis 无口令 | `--requirepass` + `redis://:<password>@redis:6379/0`（否则沙箱可读写全集群账本） |
+| `redis.yaml` + `control-plane.yaml` | ✅ 已落地（redis `--requirepass` 自 `917395b`，control-plane 的 URL 自 `91a59e8`）：`--requirepass "$(REDIS_PASSWORD)"` + `redis://:$(E2B_REDIS_PASSWORD)@redis:6379/0`，两边都读 `e2b-secrets` | 保持：**不再是"无口令 redis"**，认证只能来自 Secret（`tests/unit/test_worker_manifest_permissions.py::test_k8s_redis_auth_comes_from_the_secret_not_a_literal` 钉住清单里没有字面口令、也没有 ACL 文件） |
 | 各 Deployment | `image: ...:<版本>` | 当次构建的真实版本（§2） |
 
 worker 侧关键 env（语义见 `deploy/stack/.env.example` 的同名键）：
@@ -383,6 +383,103 @@ deploy/k8s-k0s/rotate-secret-master.sh finalize sha256:<rotate 打出来的旧�
 唯一的路是"再轮换一次"。finalize 之后再滚一次 CP 是可选的收尾（让旧 key 从副本内存里也消失；
 密文已经不依赖它）。**凭据明文绝不出现**：脚本只打 `sha256(前16)` 与长度，finalize 的地址
 优先用指纹（也可以用值本身，那是 upgrade.sh 的形状，但值会进 shell 历史）。
+
+---
+
+## 凭据管理（O3 收口，2026-09-26）
+
+**一个入口**：k8s 形态的凭据一共五份（四份住在 `sandlock/e2b-secrets` 里，第五份是"加密其它
+所有 secret"的主 key）+ 两份只有开发机才有的明文文件。每一份的"是否双窗、要不要滚 worker、
+不可逆点、回滚、验收"都在下面指到的表里；轮换、对账、验收都从这里走，不要再翻别处。
+
+**两条前提（2026-09-26 的既成事实）**：
+
+- **k8s 形态已不再降级**：`E2B_SECRET_MASTER_KEY` 由 `deploy/k8s-k0s/secrets.sh` 注入
+  `e2b-secrets`，control-plane 两个副本都拿到了它（启动日志里没有那条
+  `E2B_SECRET_MASTER_KEY is not configured` 降级告警）⇒ `_secrets/**` 的落盘是 Fernet 密文，
+  redis 里镜像的那份在 `e2b:secret:*`。**compose 形态仍保留**"没有主 key ⇒ 内存 + 明文盘 +
+  启动告警"的降级路径（`docs/security-hardening.md` §7）。
+- **明文不进任何输出**：脚本只打 `sha256(前16)` 与长度；Secret 本身只报大小
+  （`-o jsonpath='{.data}' | wc -c`），不回贴内容。
+
+### 每份凭据的那一张表
+
+| 凭据 | 表 | 双窗？ | 要滚 worker？ | 不可逆点 | 回滚 | 验收 |
+|---|---|---|---|---|---|---|
+| `E2B_API_KEYS`（外部客户端持有的逗号列表） | §4.5 表 1 | ✅ 双窗（新旧 key 都在列表里） | ❌ 只滚 control-plane（客户端自己切） | 第 4 步 finalize 摘旧 key | finalize 之前**什么都不用做** | 新 key 跑 `deploy/scripts/deployment_smoke.py`；finalize 后旧 key 应 401 |
+| `E2B_INTERNAL_API_KEY`（worker / CP / autoscaler 之间） | §4.5 表 2 | ✅ 双窗（单值槽 + `E2B_INTERNAL_API_KEYS` 列表） | ✅ **重启 = 杀光全部 running 沙箱**（树与卷数据保留）⇒ 低峰/窗口 | 第 5 步 finalize | 同表 1（finalize 之前 = 不做） | 三处工作负载都带列表键（钉子 `test_all_three_workloads_can_accept_an_old_and_a_new_internal_key`）+ 两条冒烟 |
+| `E2B_REDIS_PASSWORD` | §4.5 表 3 | ❌ 单用户单口令（2026-09-26 裁定**接受 10–30 s 中断**，不做 ACL 双用户） | ❌ 只滚 redis + control-plane；`autoscaler` **不读 redis**，跟滚只是形状对齐 | `--rotate` 之后旧口令只剩在 redis 进程内存里 | 再轮换一次（这一类没有 finalize 那种安全位） | 带口令 `PONG`、不带口令 `NOAUTH`（命令见 §4.5 表 3 之后） |
+| `E2B_QUOTA_AGENT_TOKEN` | §4.5 表 3 | ❌ 单值、缺了就 fail-fast | k8s 形态**没有部署 agent** ⇒ 今天没有影响面；将来上 agent 时必须先补双 token 设计 | — | — | 本轮只记账，无验收 |
+| `E2B_SECRET_MASTER_KEY`（加密 `_secrets/**` 与 `e2b:secret:*`） | §4.6 | ✅ 三拍（rotate → 滚 CP → finalize），窗口用 `E2B_SECRET_MASTER_KEYS` | ❌ 只滚 control-plane | finalize 摘旧主 key：还在用它的记录**永久解不开** | finalize 之前 = 不做 | `rotate-secret-master.sh status` 的**三读三比**：deploy status / 每个 running 副本 `printenv` 的指纹 / CP pod 内扫 `_secrets/**` 与每条 `e2b:secret:*` 都 `encrypted:true` 且主 key 单独可解 |
+| ACR 推送凭据、跳板机 SSH 私钥/口令 | §4.5 表 4 | —（**不进** Secret） | — | 删旧凭据 / 移除旧公钥 | 再轮换一次 | **对账就是权限**：`deploy/scripts/{acr,bastion}.env` 必须是 `-rw-------`（600） |
+
+四张表的正文都在 §4.5（表 1 / 表 2 是双窗的两份，表 3 是"没有双窗、必然有一段中断"的两份，
+表 4 是开发机上的两份明文），主 key 单独一节（§4.6）。**表 4 的两个文件不在 Secret 里，
+`--fingerprint` 不覆盖它们** —— 它们的对账看文件权限。
+
+### 指纹对账（只读；不改任何东西）
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+
+deploy/k8s-k0s/secrets.sh --fingerprint    # 逐键 sha256(前16) + 长度；只打印，不改动
+kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data}' | wc -c   # 只报大小，不回贴内容
+```
+
+口径（"可对账"就是这么定义的）：
+
+- `--fingerprint` 打的是 Secret 里**当前真实存在的每一个键**：四个常驻键
+  `E2B_API_KEYS` / `E2B_INTERNAL_API_KEY` / `E2B_REDIS_PASSWORD` / `E2B_SECRET_MASTER_KEY`，
+  外加**只在 internal-key 双窗期间存在**的 `E2B_INTERNAL_API_KEYS`。窗口之外那个键根本不在
+  Secret 里（`secrets.sh` 只在点名的 subcommand 里写它），所以"四个键"是常态、"五个键"是窗口
+  开着 —— 两者都不是异常，别按"固定打印五个键"去判。
+- **没点名轮换的键，指纹逐字不变**。这条同时是幂等判据与影响面判据：默认（只补缺）模式与
+  `--fingerprint` 重复跑，除被点名的键之外必须逐字相同；rotate 只动点名的键，其余键的指纹
+  就是"这次轮换没有碰到它们"的证据。
+- 对账动作就是轮换前后各存一份指纹，逐键 diff：变了的是被轮换的，其余必须逐字相同。
+
+### 统一验收（指纹对账 + 功能回归）
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+
+# ① 指纹对账（只读）：键的个数与"未轮换的逐字不变"见上一段
+deploy/k8s-k0s/secrets.sh --fingerprint
+
+# ② Secret 只报大小，不回贴内容
+kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data}' | wc -c
+
+# ③ redis 认证确实生效（经 kubectl exec 进 pod；口令由 Secret 展开进 env，不打上命令行）
+kubectl -n sandlock exec deploy/redis -- sh -c \
+    'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping; redis-cli ping'   # PONG / NOAUTH
+
+# ④ 功能回归：先证"控制面 + 单节点数据面"，再证"跨节点"
+E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000 \
+    python3 deploy/scripts/deployment_smoke.py
+E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000 \
+    python3 deploy/scripts/multinode_smoke.py
+
+# ⑤ 本机四条凭据测试（契约 + 三个钉子文件）
+tmp/testenv/bin/python -m pytest tests/contract/test_secrets.py \
+    tests/unit/test_k0s_secrets_script.py tests/unit/test_rotate_secret_master_script.py \
+    tests/unit/test_env_file_permissions_guard.py -q
+```
+
+期望：指纹清单把上面那几个键全部打出来；`redis-cli` 带口令 `PONG`、不带口令 `NOAUTH`；
+两条冒烟全绿（后者要求在途 ≥2 个健康 worker）；四条测试文件全 PASS。
+
+**这些命令里哪些已经跑过**：
+
+- ① 指纹对账在 Task 1 上线时跑过：补出 `E2B_SECRET_MASTER_KEY` 之后，**既有三个键的指纹逐字
+  未变**（幂等）；之后每次轮换都要再跑一遍做前后对照。同一次上线的事实：主 key 进 Secret、
+  CP 两个副本都拿到、**降级告警消失**。
+- §4.5.1 的明文清理跑过，报告是 `verified: true` —— 但 `plaintext_records_before: 0`：
+  `_secrets` 当时是**空目录**（独立核实 `find -type f | wc -l` = 0）⇒ **真的没有明文可清**，
+  不是工具看错地方。
+- ②③④（Secret 大小 / redis 认证 / 两条冒烟）要在 k0s 通道里跑
+  （`deploy/scripts/open-cluster-tunnel.sh` 先建通道并自检集群身份），跑完把数字补回本节。
+- ⑤ 本机已跑：四条文件 **108 passed**；`tests/unit` 全量 **14 failed / 1501 passed**，
+  失败名单与那 14 条已知 Linux-only 红**逐条同名**。
 
 ---
 

@@ -480,14 +480,15 @@ if [ "$mode" != "fingerprint" ]; then
 
     if [ "${#rotated[@]}" -gt 0 ] && is_rotate E2B_REDIS_PASSWORD; then
         say ""
-        say "⚠ E2B_REDIS_PASSWORD 轮换的窗口：redis 带着新口令重启、到 control-plane /"
-        say "  autoscaler 滚动完成拿到新口令之间，共享后端（配额/节点视图/限流/单飞）"
+        say "⚠ E2B_REDIS_PASSWORD 轮换的窗口：redis 带着新口令重启、到 control-plane"
+        say "  滚动完成拿到新口令之间，共享后端（配额/节点视图/限流/单飞）"
         say "  不可用，建箱与路由失败 —— **10–30 s 中断**。2026-09-26 用户裁定：**接受**"
         say "  这段中断，不做 ACL 双用户热轮换（docs/superpowers/plans/2026-09-26-decisions.md 第 5 条）。"
         say "  沙箱本身不经过 redis，不受影响；redis 是 appendonly yes ⇒ 数据不丢。"
         say "  步骤：① 排维护窗口 ② 本脚本 --rotate E2B_REDIS_PASSWORD"
         say "        ③ kubectl -n $NAMESPACE rollout restart deploy/redis"
         say "        ④ kubectl -n $NAMESPACE rollout restart deploy/control-plane deploy/autoscaler"
+        say "           （autoscaler 不读 redis —— 它是控制面客户端，跟滚只是形状对齐，不在上面那段窗口里）"
         say "        ⑤ redis-cli -u \"redis://:<新口令>@redis:6379\" ping 应为 PONG"
         say ""
     fi

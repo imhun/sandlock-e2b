@@ -192,26 +192,37 @@ CPU/磁盘）。恶意 key 可并发构建轰炸（`/sandboxes` 已限流，模�
 所有 worker 共用单 `X-Internal-Key`，无轮换机制；默认值 `"internal-key"`
 弱（生产已覆盖，配置漂移风险）。
 
-## 7. secret 明文驻留与凭据落盘（低）
+## 7. secret 明文驻留与凭据落盘（低）—— 2026-09-26 收口
 
 - `SecretRegistry` value 明文存控制面内存，无持久化（重启丢失）、无加密；
 - 已修复（E5.4）：配置 `E2B_SECRET_MASTER_KEY` 后 secret 以 Fernet
   （AES）加密落盘并镜像到 Redis，重启不丢；轮换走
   `E2B_SECRET_MASTER_KEYS` 双 key 窗口（`upgrade.sh
   --rotate-secret-master-key` / `--finalize-secret-master-key-rotation`）。
-  未配置 master key 时保持降级（内存 + 明文盘）并启动告警。
+  **降级态已关闭（k8s 形态，O3 Task 1 上线 2026-09-26）**：`E2B_SECRET_MASTER_KEY`
+  由 `deploy/k8s-k0s/secrets.sh` 注入 `sandlock/e2b-secrets`，control-plane 两个副本
+  都拿到了它（启动日志里没有 `E2B_SECRET_MASTER_KEY is not configured` 那条降级告警）
+  ⇒ 新写入落 Fernet 密文，redis 里镜像的那份在 `e2b:secret:*`；既有明文的清理工具
+  （`deploy/scripts/cleanup-plaintext-secrets.py`）已按 §4.5.1 的步骤在集群上跑过，
+  报告 `verified: true` —— 但 `plaintext_records_before: 0`，`_secrets` 当时是空目录
+  （独立核实过），**是真的没有明文可清**，不是工具没看。**compose 形态仍保留**这条
+  降级路径：没有 master key 就是"内存 + 明文盘 + 一条启动告警"，不设默认值。
 - **目标机**上的 `.env`（ACR 密码/API key/redis 密码/secret master key）明文落盘，
   权限由脚本自己兜住：`deploy/scripts/upgrade.sh:86`/`:102` 落盘后立刻 `chmod 600`；
 - **开发机**上的 `deploy/scripts/acr.env`（ACR 口令）与 `deploy/scripts/bastion.env`
-  （跳板机 SSH 口令）同样是明文落盘，而且**实测是 644**（同机其他用户可读）——
-  gitignore 只保证"没进 git"，不等于"别人读不到"。2026-09-26 起
+  （跳板机 SSH 口令）同样是明文落盘。**权限的实测口径**：这两个文件在 2026-09-26
+  改前是 **644**（`stat -f %Lp`；同机其他用户可读 —— gitignore 只保证"没进 git"，
+  不等于"别人读不到"），现在是 **600**（`-rw-------`，无 ACL；`ls -le` 只有 xattr）。
+  2026-09-26 起
   `deploy/scripts/lib/helpers.sh` 在 source 这两个文件**之前**逐个校验：不是 600 就
   `refuse: <path> is mode <mode>, not 600 -- run: chmod 600 <path>` 并退出码 1，
   **不替**操作者 chmod；唯一例外是显式设 `ALLOW_LOOSE_CREDENTIAL_FILES=1`（CI：
-  凭据只在环境变量里、从未落盘）。本机这两个文件已改成 600，轮换步骤见
+  凭据只在环境变量里、从未落盘）。**硬拒而不是警告后继续**：不合格的文件根本不会被读
+  （守卫的 `exit 1` 发生在 source 之前），对账就是权限 —— 轮换步骤与验收见
   `docs/k8s-deployment.md` §4.5 表 4；
 - 长期方案：master key 与 ACR 口令上密钥管理（O3：Secret Manager / KMS，启动时
-  注入环境变量，避免 `.env` 明文长期驻留）。
+  注入环境变量，避免 `.env` 明文长期驻留）。**触发条件与四张表的入口**见
+  `docs/k8s-deployment.md` 的《凭据管理》节（O3 收口，2026-09-26）。
 
 ## 8. 内存 DoS 与进程权限（新增，2026-09-01 二轮评估）
 

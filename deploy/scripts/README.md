@@ -30,6 +30,7 @@
 # 连接信息与口令（不入库）
 cp deploy/scripts/bastion.env.example deploy/scripts/bastion.env   # 填 BASTION/TARGET/SSH_PASSPHRASE
 cp deploy/scripts/acr.env.example   deploy/scripts/acr.env         # 填 ACR_USERNAME/ACR_PASSWORD
+chmod 600 deploy/scripts/bastion.env deploy/scripts/acr.env        # cp 出来是 644 ⇒ 不 chmod 的话，lib/helpers.sh 会 refuse 并退出码 1
 ```
 
 初始化目标机（装 Docker、建 deploy 用户、ACR 登录、镜像加速）：
