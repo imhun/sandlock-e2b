@@ -435,9 +435,12 @@ def test_executor_identity_token_placeholder_requires_env(tmp_path, monkeypatch)
 
 def test_netns_flag_accepted_but_not_passed_through(monkeypatch):
     """Wildcard allowOut is accepted without an egress proxy (the fork
-    sandlock's unprivileged DNS gateway serves it). The netns-free fork line
-    dropped per-sandbox netns, so enable_netns/E2B_ENABLE_NETNS are accepted
-    for config compatibility but no netns kwarg reaches the sandbox."""
+    sandlock's unprivileged DNS gateway serves it; the deployment default is
+    already per-sandbox netns through `E2B_ENABLE_NET_ISOLATION` +
+    `E2B_FD_INJECT_CONNECT`, and only the arm lane still runs the shared
+    netns). The netns-free fork line dropped the netns *kwarg* (the legacy
+    worker-side path), so enable_netns/E2B_ENABLE_NETNS are accepted for
+    config compatibility but no netns kwarg reaches the sandbox."""
     from gateway_common import network
 
     monkeypatch.setenv("E2B_ENABLE_NETNS", "1")
@@ -539,8 +542,10 @@ def test_executor_mints_iam_jwt_for_registered_token(tmp_path, monkeypatch):
 
 
 def test_wildcard_allowout_accepted_without_netns_flag(monkeypatch):
-    """Wildcard allowOut no longer requires E2B_ENABLE_NETNS: the default
-    unprivileged shared-netns DNS gateway serves it."""
+    """Wildcard allowOut no longer requires E2B_ENABLE_NETNS: the fork's
+    unprivileged DNS gateway serves it. The deployment default is already
+    per-sandbox netns (`E2B_ENABLE_NET_ISOLATION` + `E2B_FD_INJECT_CONNECT`);
+    the shared netns survives only on the arm lane."""
     from gateway_common import network
 
     monkeypatch.delenv("E2B_ENABLE_NETNS", raising=False)

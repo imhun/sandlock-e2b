@@ -4,9 +4,13 @@ Builds ``deploy/docker/Dockerfile.envd`` (the fork sandlock wheel comes from
 ``wheels/fork/``) and verifies from inside the container:
 
 * the image's default USER is uid 65534;
-* with the production security shape (seccomp unconfined, NET_ADMIN, host
-  network, low-port sysctl) a non-root supervisor can still create plain,
-  network-enabled and image-rootfs (chroot) sandboxes.
+* with this probe's privilege shape (seccomp unconfined, NET_ADMIN, host
+  network, root-then-setpriv) a non-root supervisor can still create plain,
+  network-enabled and image-rootfs (chroot) sandboxes. The probe's
+  `docker create` declares no `--sysctl` (`:228-260`): a `--network host`
+  container cannot take a net.* sysctl at all, which is why the low-port
+  window belongs to a bridge-networked worker instead
+  (docs/production-deployment-requirements.md §2.4.3).
 
 The rootfs for the chroot probe is exported from the freshly built worker
 image itself, so the test needs no registry access and is deterministic.

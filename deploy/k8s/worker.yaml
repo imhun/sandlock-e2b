@@ -553,9 +553,10 @@ spec:
           # one WARNING) unless an agent is pointed at from outside; the
           # stance and its consequences are pinned in
           # docs/production-deployment-requirements.md §2.4.4 (W4); ③ the :53
-          # wildcard-DNS gateway is enabled by the pod-level sysctl above
-          # (NET_BIND_SERVICE alone does not cover it for this non-root pod --
-          # see the comment there).
+          # wildcard-DNS gateway binds inside each sandbox's own netns
+          # (`E2B_ENABLE_NET_ISOLATION` is on for this pod), where the guest's
+          # root-in-userns CAP_NET_BIND_SERVICE covers port 53 -- the pod-level
+          # window was deleted in N5 (2026-09-17) and is not needed.
           securityContext:
             capabilities:
               # Track F (F1): the non-root worker's two file-capability brokers
@@ -568,7 +569,9 @@ spec:
               # nothing else. Never set an escalation-blocking field here:
               # NNP=1 makes the kernel ignore file capabilities outright.
               # NET_BIND_SERVICE stays for a root override (runAsUser: 0); it is
-              # inert for the default non-root pod, which uses the sysctl above.
+              # inert for the default non-root pod (CapEff stays 0), and nothing
+              # in this pod binds a low port any more -- the sandbox's own netns
+              # covers :53.
               add:
                 - NET_BIND_SERVICE
                 - SETUID

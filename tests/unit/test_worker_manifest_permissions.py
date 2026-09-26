@@ -953,3 +953,39 @@ def test_multinode_worker_env_carries_the_fleets_route_b_root() -> None:
     fleet_root = next(iter(fleet.values()))
     for name in ("worker-1", "worker-2", "worker-3"):
         assert _multinode_worker_route_b_root(name) == fleet_root, name
+
+
+STACK_ENV_EXAMPLE = (REPO / "deploy" / "stack" / ".env.example").read_text(
+    encoding="utf-8"
+)
+
+
+def test_no_comment_still_claims_a_pod_level_sysctl_exists() -> None:
+    """The window was deleted on 2026-09-17 (N5); two comments missed it.
+
+    `deploy/k8s/worker.yaml` explained the `:53` wildcard-DNS gateway and the
+    `NET_BIND_SERVICE` cap with "the pod-level sysctl above" and "the sysctl
+    above" -- but `:64-72` and `test_no_low_port_window_survives_anywhere`
+    both say that block is gone. Pinned so the stale sentence cannot return.
+    """
+    assert "pod-level sysctl above" not in K8S_WORKER
+    assert "which uses the sysctl above" not in K8S_WORKER
+
+
+def test_stack_env_example_describes_the_rollback_lever_not_a_canary() -> None:
+    """`worker-2` is a per-node rollback lever, not a canary (docs §2.4.7).
+
+    The anchor turns the pair on for every worker since 2026-09-16; the
+    `*_WORKER2` overrides exist so one node can be taken back alone. The env
+    example still said "the canary turns it on for worker-2 only" and shipped
+    `false`, which reads as "the fleet default is off" -- the opposite of the
+    manifests.
+    """
+    assert "the canary turns it on for worker-2 only" not in STACK_ENV_EXAMPLE
+    # The stale sentence was line-wrapped in the file (`... Off by default; the`
+    # / `# canary turns it on for worker-2 only`), so the literal above never
+    # matched it: measured against f8f09b6's copy, only these three fire.
+    assert "canary turns it on for worker-2 only" not in STACK_ENV_EXAMPLE
+    assert "Off by default" not in STACK_ENV_EXAMPLE
+    assert "E2B_ENABLE_NET_ISOLATION=false" not in STACK_ENV_EXAMPLE
+    assert "E2B_FD_INJECT_CONNECT=false" not in STACK_ENV_EXAMPLE
