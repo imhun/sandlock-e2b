@@ -1,0 +1,81 @@
+==> 用当前 wheels 重建 e2b-sandlock-test:task10cur
+    wheels: 2 个，最新的是 sandlock-0.9.0b0-cp314-cp314-manylinux_2_34_aarch64.whl
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile.test-runner
+#1 transferring dockerfile: 6.54kB 0.0s done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/python:3.14-slim
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/moby/buildkit:latest
+#3 DONE 1.5s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 324B done
+#4 DONE 0.0s
+
+#5 [buildkit 1/1] FROM docker.io/moby/buildkit:latest@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
+#5 DONE 0.0s
+
+#6 [stage-1  1/16] FROM docker.io/library/python:3.14-slim
+#6 DONE 0.0s
+
+#7 [internal] load build context
+#7 transferring context: 1.45kB done
+#7 DONE 0.0s
+
+#8 [stage-1  2/16] RUN sed -i         's|http://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g; s|http://security.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g'         /etc/apt/sources.list.d/debian.sources     && apt-get update && apt-get install -y --no-install-recommends     docker.io     docker-cli     iptables     gcc     libc6-dev     iproute2     redis-server     bash     git     curl     xfsprogs     e2fsprogs     nodejs     npm     && rm -rf /var/lib/apt/lists/*
+#8 CACHED
+
+#9 [stage-1  3/16] COPY requirements.txt /tmp/requirements.txt
+#9 CACHED
+
+#10 [stage-1  5/16] RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements-test.txt
+#10 CACHED
+
+#11 [stage-1  8/16] RUN PY_ABI=$(python3 -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')     && ARCH_SUFFIX=$(case "amd64" in         amd64) echo x86_64 ;;         arm64) echo aarch64 ;;         *) echo "amd64" ;;     esac)     && SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-${PY_ABI}-${PY_ABI}-manylinux*${ARCH_SUFFIX}.whl 2>/dev/null | head -1)     && [ -n "$SANLOCK_WHL" ] || SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-${PY_ABI}-${PY_ABI}-linux_${ARCH_SUFFIX}.whl 2>/dev/null | head -1)     && [ -n "$SANLOCK_WHL" ] || SANLOCK_WHL=$(ls /tmp/wheels/sandlock-*-${PY_ABI}-${PY_ABI}-*.whl 2>/dev/null | head -1)     && [ -n "$SANLOCK_WHL" ] || SANLOCK_WHL=$(ls /tmp/wheels/*.whl | head -1)     && pip install --no-cache-dir "$SANLOCK_WHL"     && rm -rf /tmp/wheels
+#11 CACHED
+
+#12 [stage-1  6/16] RUN ln -sf /usr/local/bin/python3 /usr/bin/python3
+#12 CACHED
+
+#13 [stage-1 12/16] COPY envd_service/mcp/gateway.py /usr/bin/mcp-gateway
+#13 CACHED
+
+#14 [stage-1 15/16] COPY deploy/priv/ /tmp/priv/
+#14 CACHED
+
+#15 [stage-1  4/16] COPY requirements-test.txt /tmp/requirements-test.txt
+#15 CACHED
+
+#16 [stage-1  7/16] COPY wheels/fork/ /tmp/wheels/
+#16 CACHED
+
+#17 [stage-1 11/16] WORKDIR /workspace
+#17 CACHED
+
+#18 [stage-1 10/16] RUN mkdir -p /var/lib/e2b-test-runtime     && chown 65534:65534 /var/lib/e2b-test-runtime
+#18 CACHED
+
+#19 [stage-1 13/16] RUN chmod +x /usr/bin/mcp-gateway     && ln -sf /usr/bin/mcp-gateway /usr/local/bin/mcp-gateway
+#19 CACHED
+
+#20 [stage-1  9/16] COPY --from=buildkit /usr/bin/buildctl /usr/bin/buildctl
+#20 CACHED
+
+#21 [stage-1 14/16] COPY deploy/docker/entrypoint.test-runner.sh /usr/local/bin/entrypoint.test-runner.sh
+#21 CACHED
+
+#22 [stage-1 16/16] RUN cc -O2 -Wall -Wextra -o /tmp/priv/e2b-slot-spawn         /tmp/priv/slot_spawn.c /tmp/priv/priv_common.c     && cc -O2 -Wall -Wextra -o /tmp/priv/e2b-maint         /tmp/priv/maint.c /tmp/priv/priv_common.c     && apt-get update     && apt-get install -y --no-install-recommends libcap2-bin     && rm -rf /var/lib/apt/lists/*     && mkdir -p /var/lib/e2b-priv     && chown root:65534 /var/lib/e2b-priv     && chmod 0710 /var/lib/e2b-priv     && install -m 0750 -o root -g 65534         /tmp/priv/e2b-slot-spawn /tmp/priv/e2b-maint /var/lib/e2b-priv/     && setcap cap_setuid,cap_setgid+ep /var/lib/e2b-priv/e2b-slot-spawn     && setcap cap_chown,cap_dac_override+ep /var/lib/e2b-priv/e2b-maint     && rm -rf /tmp/priv     && getcap /var/lib/e2b-priv/e2b-slot-spawn /var/lib/e2b-priv/e2b-maint
+#22 CACHED
+
+#23 exporting to image
+#23 exporting layers done
+#23 writing image sha256:bac0b9cc17e8c4a0befb90f13e1cbaee4e1c99619530063459f2d385f6afb658 done
+#23 naming to docker.io/library/e2b-sandlock-test:task10cur done
+#23 DONE 0.0s
+==> 镜像内 sandlock=0.9.0b0（wheel=0.9.0b0）
+==> 完成：e2b-sandlock-test:task10cur
+    跑套件：./deploy/scripts/test-prod-shaped.sh（两阶段；见 pitfalls §B5-B9 的环境要求）

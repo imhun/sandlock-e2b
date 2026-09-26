@@ -1,0 +1,95 @@
+{
+  "shapes": {
+    "identity": {
+      "E2B_PURE_ROOTFS": "off",
+      "E2B_REAL_ROOT": "0",
+      "has_sandbox_root": false,
+      "chroot_root": "/",
+      "synthetic_rootfs": null
+    },
+    "synth-realroot": {
+      "E2B_PURE_ROOTFS": "synth",
+      "E2B_REAL_ROOT": "1",
+      "has_sandbox_root": true,
+      "chroot_root": "/tmp/tmpdw68fbvl-pure-rootfs/sbx_slot_1",
+      "synthetic_rootfs": "/tmp/tmpdw68fbvl-pure-rootfs/sbx_slot_1"
+    }
+  },
+  "results": {
+    "identity": {
+      "pwd": [
+        0,
+        "/var/lib/e2b-test-runtime/task10-overshoot/export/workspaces/sbx_probe\n",
+        ""
+      ],
+      "cat /proc/kcore": [
+        1,
+        "",
+        "cat: /proc/kcore: Permission denied\n"
+      ],
+      "ls /sys": [
+        2,
+        "",
+        "ls: cannot access '/sys': Permission denied\n"
+      ],
+      "ls ../..": [
+        0,
+        "state\nworkspaces\n",
+        ""
+      ],
+      "stat ../../state": [
+        1,
+        "",
+        "stat: cannot statx '../../state': Permission denied\n"
+      ],
+      "cat ../../state/sbx_probe/secret": [
+        1,
+        "",
+        "cat: ../../state/sbx_probe/secret: Permission denied\n"
+      ],
+      "stat ../../workspaces/sbx_other": [
+        1,
+        "",
+        "stat: cannot statx '../../workspaces/sbx_other': Permission denied\n"
+      ]
+    },
+    "synth-realroot": {
+      "pwd": [
+        0,
+        "/home/user\n",
+        ""
+      ],
+      "cat /proc/kcore": [
+        1,
+        "",
+        "cat: /proc/kcore: Permission denied\n"
+      ],
+      "ls /sys": [
+        2,
+        "",
+        "ls: cannot access '/sys': Permission denied\n"
+      ],
+      "ls ../..": [
+        0,
+        "bin\ndev\netc\nhome\nlib\nlib64\nmedia\nmnt\nopt\nproc\nroot\nrun\nsbin\nsrv\ntmp\nusr\nvar\nworkspace\n",
+        ""
+      ],
+      "stat ../../state": [
+        1,
+        "",
+        "stat: cannot statx '../../state': Permission denied\n"
+      ],
+      "cat ../../state/sbx_probe/secret": [
+        1,
+        "",
+        "cat: ../../state/sbx_probe/secret: Permission denied\n"
+      ],
+      "stat ../../workspaces/sbx_other": [
+        1,
+        "",
+        "stat: cannot statx '../../workspaces/sbx_other': No such file or directory\n"
+      ]
+    }
+  },
+  "diffs": 3
+}

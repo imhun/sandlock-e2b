@@ -1,0 +1,16 @@
+== state 1 (synth + real root) summary
+1 failed, 44 passed, 3 skipped, 700 warnings in 162.44s (0:02:42)
+
+== SKIPPED / XFAIL / FAILED / ERROR lines
+SKIPPED [1] tests/security/test_fork_network_features.py:370: requires E2B_BASE_IMAGE (image-rootfs sandboxes)
+SKIPPED [1] tests/security/test_template_isolation.py:45: no base image configured for template isolation test
+SKIPPED [1] tests/security/test_template_isolation.py:169: the unprivileged worker shape both production manifests ship
+FAILED tests/security/test_uid_isolation.py::test_distinct_host_uids_isolate_same_path_files
+
+== brief Step 2 grep: 'Permission denied|No such file' in state 1
+65:            "stat", f"cannot statx '{ws_a / 'workspace'}': Permission denied"
+67:E       assert b"stat: cannot statx '/var/lib/e2b-test-runtime/6de3b753e0ae/sbx_a/workspace': No such file or directory\n" in (b"stat: cannot statx '/var/lib/e2b-test-runtime/6de3b753e0ae/sbx_a/workspace': Permission denied\n", b"/bin/stat: cannot statx '/var/lib/e2b-test-runtime/6de3b753e0ae/sbx_a/workspace': Permission denied\n")
+68:E        +  where b"stat: cannot statx '/var/lib/e2b-test-runtime/6de3b753e0ae/sbx_a/workspace': No such file or directory\n" = namespace(exit_code=1, stdout=b'', stderr=b"stat: cannot statx '/var/lib/e2b-test-runtime/6de3b753e0ae/sbx_a/workspace': No such file or directory\n").stderr
+69:E        +  and   (b"stat: cannot statx '/var/lib/e2b-test-runtime/6de3b753e0ae/sbx_a/workspace': Permission denied\n", b"/bin/stat: cannot statx '/var/lib/e2b-test-runtime/6de3b753e0ae/sbx_a/workspace': Permission denied\n") = _diagnostic('stat', "cannot statx '/var/lib/e2b-test-runtime/6de3b753e0ae/sbx_a/workspace': Permission denied")
+
+== same grep in state 0 (for the same commands)

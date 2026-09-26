@@ -1,0 +1,10 @@
+== state 0 (identity) summary
+42 passed, 3 skipped, 3 xfailed, 734 warnings in 173.12s (0:02:53)
+
+== SKIPPED / XFAIL / FAILED / ERROR lines
+SKIPPED [1] tests/security/test_fork_network_features.py:370: requires E2B_BASE_IMAGE (image-rootfs sandboxes)
+SKIPPED [1] tests/security/test_template_isolation.py:45: no base image configured for template isolation test
+SKIPPED [1] tests/security/test_template_isolation.py:169: the unprivileged worker shape both production manifests ship
+XFAIL tests/security/test_chroot_exec_shebang.py::test_shebang_script_written_into_the_workspace_runs - N35: refused without a real root (EACCES/ETXTBSY) -- docs/chroot-workspace-exec.md
+XFAIL tests/security/test_chroot_exec_shebang.py::test_script_whose_interpreter_was_written_in_the_same_command_runs - N35: a workspace-resident interpreter is refused without a real root -- docs/chroot-workspace-exec.md
+XFAIL tests/security/test_chroot_exec_shebang.py::test_a_format_handler_resolves_its_interpreter_inside_the_sandbox - N35: a format handler's interpreter is resolved in the host's path space without a real root -- docs/chroot-workspace-exec.md

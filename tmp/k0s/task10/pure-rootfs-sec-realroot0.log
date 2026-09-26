@@ -1,0 +1,25 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+......xxx........s..................s..s........                         [100%]
+=============================== warnings summary ===============================
+tests/security/test_fork_network_features.py: 15 warnings
+tests/security/test_network_enforcement.py: 41 warnings
+tests/security/test_process_limits.py: 153 warnings
+tests/security/test_quota_admission.py: 296 warnings
+tests/security/test_real_root_denials.py: 17 warnings
+tests/security/test_real_root_mounts.py: 11 warnings
+tests/security/test_sandlock_isolation.py: 17 warnings
+tests/security/test_template_isolation.py: 24 warnings
+tests/security/test_traversal_and_ids.py: 4 warnings
+tests/security/test_worker_nonroot.py: 156 warnings
+  /usr/local/lib/python3.14/asyncio/threads.py:26: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    return await loop.run_in_executor(None, func_call)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/security/test_fork_network_features.py:370: requires E2B_BASE_IMAGE (image-rootfs sandboxes)
+SKIPPED [1] tests/security/test_template_isolation.py:45: no base image configured for template isolation test
+SKIPPED [1] tests/security/test_template_isolation.py:169: the unprivileged worker shape both production manifests ship
+XFAIL tests/security/test_chroot_exec_shebang.py::test_shebang_script_written_into_the_workspace_runs - N35: refused without a real root (EACCES/ETXTBSY) -- docs/chroot-workspace-exec.md
+XFAIL tests/security/test_chroot_exec_shebang.py::test_script_whose_interpreter_was_written_in_the_same_command_runs - N35: a workspace-resident interpreter is refused without a real root -- docs/chroot-workspace-exec.md
+XFAIL tests/security/test_chroot_exec_shebang.py::test_a_format_handler_resolves_its_interpreter_inside_the_sandbox - N35: a format handler's interpreter is resolved in the host's path space without a real root -- docs/chroot-workspace-exec.md
+42 passed, 3 skipped, 3 xfailed, 734 warnings in 173.12s (0:02:53)

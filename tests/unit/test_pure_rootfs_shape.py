@@ -297,3 +297,36 @@ def test_the_one_shot_builder_takes_the_same_two_shapes(tmp_path: Path) -> None:
     assert list(off.fs_readable) == list(on.fs_readable)
     assert list(off.fs_denied) == list(on.fs_denied)
     assert off.cwd == str(tmp_path / "ws")
+
+
+def test_the_synthetic_root_hides_the_platform_state(tmp_path: Path) -> None:
+    """`stat <base>/_runtime` used to answer EACCES for the pure shape.
+
+    With a synthesized root the base is not in the sandbox's tree at all, so the
+    residue N27 documented for this shape is gone rather than merely denied.
+    Evidence: tmp/k0s/task10/pure-rootfs-sec-realroot1.log.
+    """
+    base = tmp_path / "base"
+    workspace = base / "sbx_n27"
+    workspace.mkdir(parents=True)
+    (base / "_runtime" / "sbx_n27").mkdir(parents=True)
+    ex = SandlockExecutor(
+        workspace_dir=str(workspace),
+        base_image=None,
+        image_rootfs=None,
+        sandbox_id="sbx_n27",
+        pure_rootfs_dir=str(base / "_pure_rootfs"),
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        enable_network=False,
+    )
+    root = ex._synthetic_rootfs
+    assert root is not None
+    ex._materialize_root(root)
+    assert (base / "_runtime" / "sbx_n27").is_dir() is True
+    assert "_runtime" not in {p.name for p in root.iterdir()}
+    assert root.joinpath("_runtime").exists() is False
