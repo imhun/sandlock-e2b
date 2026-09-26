@@ -202,9 +202,7 @@ pod 里 df /var/lib/e2b-sandboxes : nfs4  10P 总  553G 已用  1%（那是整�
 
 * `_provision_remote` 结尾**显式** `record.workspace_dir = None` —— 远端沙箱的树归 worker 管，
   控制面不插手（否则删除路径会有两个主人）。所以**"谁测量"只能是 worker**；
-* 由此，`GET /sandboxes/{id}/metrics` 在 k8s 上 **`diskUsed` 恒为 0**
-  （`SandboxRecord.sample_metric()` 只在 `workspace_dir` 非空时才 walk，而它永远是 `None`）。
-  SDK 的 `get_metrics()` 因此在 k8s 上看不到磁盘占用 —— 这是 N25 的另一半，见 §7 的 L2b 收口。
+* 由此，该数已由 worker 的实测值落库（`record.workspace_disk_used_bytes`）并从 `GET /sandboxes/{id}/metrics` 的 `diskUsed` 暴露；口径 = 存量（含目录分配块）—— `SandboxRecord.sample_metric()` 优先取这份落库值（`workspace_dir` 为 `None` 时不再回落到整树 walk），SDK 的 `get_metrics()` 在 k8s 上看到的正是它；这是 N25 的另一半，见 §7 的 L2b 收口。
 
 ### 5.3 inotify / COW / mmap 能不能当账源（2026-09-18 实测）
 
@@ -346,11 +344,7 @@ SDK 上传、命令日志、provision 物化）它**看得见**，而 mediator �
   下一个心跳继续推（幂等）。这条与用户主动 pause 的语义**故意不同**（那条要回滚，见 G1a）；
 * resume 仍可发起：树回到预算内就不会再被暂停；**仍在超预算则会在下一个心跳（≤30 s）内被再次暂停**
   —— "暂停而不是 kill"的代价就是这个来回，换来的是现场不丢；
-* 配套老实说清楚：`GET /sandboxes/{id}/metrics` 的 `diskUsed` 在 k8s 上**仍然是 0**
-  （§5.2 第 2 条，远端记录 `workspace_dir=None` 是设计使然）。**这个数还没接到 API 上**，
-  所以现阶段"看得见用量"的地方只有 worker/CP 的 WARNING 日志与
-  `/internal/fleet/metrics` 的卷级台账 —— **下一步就是把每条记录的最后一次实测值落库并暴露出去**
-  （它同时也是"resume 时直接告诉用户超了多少"的输入）。
+* 配套老实说清楚：该数已由 worker 的实测值落库（`record.workspace_disk_used_bytes`）并从 `GET /sandboxes/{id}/metrics` 的 `diskUsed` 暴露；口径 = 存量（含目录分配块）—— 它同时也是"resume 时直接告诉用户超了多少"的输入。
 
 **L2c（已记录，待实施）：mediator 脏目录记账 —— 把"每轮整树 walk"降级为"只重扫脏目录"。**
 设计、盲区、接口、测试计划见 [`docs/disk-accounting-dirty-dirs.md`](disk-accounting-dirty-dirs.md)
@@ -372,6 +366,8 @@ count=1200` 当场 EFBIG），且对树口径永不误伤，代价是 EFBIG/SIGX
 
 **loop 镜像**（§4.1 已实测）：语义最正、完全不依赖存储，代价是密度（50 GiB / 1 GiB =
 50 个沙箱）、吞吐 +35%、`mount`+`/dev/loop` 的权限面，以及"扫树/迁移/GC/模板"整套改造。
+
+⇒ **不作为计划项**（N30 已定存量口径）：**触发条件**（满足任一即回到这条）——① 出现真实使用者要求**写路径上**的字节级 ENOSPC；② 存储换成支持打洞或支持目录配额的文件系统（那时先重新评估目录配额与条目配额，再谈镜像）。已被否决的"峰值口径"（写多少算多少、删除不退）在本集群不可逆：NFS 不支持打洞，镜像占用 = **高水位**，写满一次即永久只读，唯一恢复路径是销毁重建。裁定见 `docs/superpowers/plans/2026-09-26-decisions.md`《N30 口径确认》。
 
 ### 不做
 
