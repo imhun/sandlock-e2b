@@ -401,6 +401,8 @@ Expected: FAIL —— 第一条报 `assert 'net.ipv4.ip_unprivileged_port_start'
 
 3d. `deploy/compose/docker-compose.autoscale.yml:116` —— 在 `E2B_AS_WORKER_ENV` 的单引号 JSON 里，紧跟 `"E2B_EXECUTOR": "${E2B_EXECUTOR:-local}", ` 之后插入 `"E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", `。改完那一行是：
 
+   > **⚠️ 本步已执行，且实际值与本步文字不同（2026-09-26 更正）**：落地时 `E2B_EXECUTOR` 的默认被**一并改成 `auto`**（用户裁定，见《追加裁定：N38》）—— 因为按 `local` 默认，那两个开关是**空转**的（`local` 执行器不做 Sandlock 隔离，`enable_net_isolation` 只在 `envd_service/executors/factory.py:210` 传给 sandlock 执行器）。下面那行 `:-local` 是**改动前**的样子，照它写会得到"改了等于没改"。**实际值**：`"E2B_EXECUTOR": "${E2B_EXECUTOR:-auto}"`，且另补了 `E2B_ENABLE_NETWORK` 与 `E2B_ROUTE_B_TMP_ROOT`（见 Task 2 的收口记录）。
+
 ```yaml
       E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-python:3.14-slim}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-local}", "E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
 ```
