@@ -1,0 +1,5 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+shape=n15 chroot=/ ws=/tmp/tmpo_k2g60i-ws
+[echo hi] rc=0 out=b'hi\n' err=b''
+park.out: None
+park.err: b''

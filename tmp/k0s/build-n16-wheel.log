@@ -1,0 +1,55 @@
+Task 8 (2026-09-26-pure-shape-synthetic-rootfs): **SKIPPED, wheel already current**.
+Written by the Task 9 finisher; this file is the Task 8 artifact (the brief's
+Step 4 `git add tmp/k0s/build-n16-wheel.log`), recording *why* no rebuild ran.
+
+1. Which fork commit the wheel on disk was built at
+
+   $ cat wheels/fork/SHA256SUMS.supervise | grep HEAD=
+   # HEAD=d750fa1932063115f94a05aa8c187eefd7373d0b
+
+   `d750fa1` is Task 7's *parent*; Task 7 itself is `98475b2` (submodule HEAD).
+
+2. What Task 7 changed (`d750fa1 -> 98475b2`)
+
+   $ git -C third_party/sandlock diff --name-only d750fa1 98475b2
+   crates/sandlock-core/tests/integration/test_instance_chroot.rs
+   docs/test-baseline.md
+
+   $ git -C third_party/sandlock diff --stat d750fa1 98475b2 -- crates/sandlock-core/src/
+   (empty)
+
+   Neither file is wheel payload: the wheel carries `sandlock/*.py`,
+   `sandlock/libsandlock_ffi*.so`, `sandlock/bin/sandlock-supervise`,
+   `sandlock/bin/restore-stub`. An integration test and `docs/test-baseline.md`
+   do not enter it, and no compilable source changed at all.
+
+3. Fingerprints of the wheel the lanes consume (branch `wheels/fork/`)
+
+   2c2a57d63892a2be3eeaf18bd42623500fb6aac7ae6ec725b38a8391457a1168  sandlock-0.9.0b0-cp314-cp314-manylinux_2_34_x86_64.whl
+   10f59e8ad07fe98f315aab1a2c9d2bfd7142207da57acf5df707829fad3bbd28  sandlock-0.9.0b0-cp314-cp314-manylinux_2_34_aarch64.whl
+   fadb7e8de9ea24f94a70da0ff7e42fd7279ddc253704f6944a79e8d7efed9766  sandlock/libsandlock_ffi.cpython-314-x86_64-linux-gnu.so
+   b1869a73b5c96b30bb7fc1ed33d9907baa10d6fd980b4ae3dbdec0c121c12d0e  sandlock/bin/sandlock-supervise
+   aef61c0e1e58ec9797027609308d5570e8da9c321d04fc200cca965ed2e30f95  sandlock/bin/restore-stub
+
+   The two extracted payload files are kept as `tmp/k0s/task9/whl/` (same
+   digests), so the wheel Task 9/10 ran against is pinned, not described.
+
+4. What *did* need rebuilding, and did not happen in the previous session: the
+   **lane image**, not the wheel. `e2b-sandlock-test:latest` was built
+   2026-09-26T06:59:35+08:00, i.e. before `wheels/fork/` was rebuilt at 16:23,
+   and its installed payload disagrees with the wheel above:
+
+   :latest     4014fa430c1c66adeec7f8f345b86907e85475e074c5c42d4eda832a075f6be0  libsandlock_ffi.so
+   :latest     5e8de1a1d1b1affdf48cb2d7ae71785da0ef7726aa1df533fdf9193b9b9b8b18  sandlock-supervise
+   (1 byte-count difference too: 5730336 vs 5734336)
+
+   and it is missing a string added by fork `6ff2505` (14:29, i.e. also older
+   than `6f951d6` 07:17 and `d750fa1` 16:15):
+
+   $ strings -a <image .so>      | grep -c "this session cannot resume into a stub that appears afterwards"  -> 0
+   $ strings -a <wheel .so>      | grep -c "this session cannot resume into a stub that appears afterwards"  -> 1
+
+   Re-baked for the re-runs (`IMAGE=e2b-sandlock-test:task9cur
+   ./deploy/scripts/build-test-image.sh`), whose payload hashes are exactly the
+   wheel's (fadb7e8d… / b1869a73…). Everything Task 9 measures reproduced
+   byte-for-byte on it (see the report §3/§6).

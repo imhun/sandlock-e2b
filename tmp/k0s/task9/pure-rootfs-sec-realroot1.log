@@ -1,0 +1,93 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+.................s..................s..s...F....                         [100%]
+=================================== FAILURES ===================================
+_______________ test_distinct_host_uids_isolate_same_path_files ________________
+
+workspace = PosixPath('/var/lib/e2b-test-runtime/e608ea45ef57')
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires root (Docker runner)")
+    @pytest.mark.usefixtures("require_sandlock")
+    def test_distinct_host_uids_isolate_same_path_files(workspace):
+        # The workspace root (0755) is traversable by every sandbox uid; each
+        # sandbox workspace under it is chowned to `0770 <uid>:<worker gid>`.
+        ws_a = workspace / "sbx_a"
+        ws_a.mkdir()
+        (ws_a / "workspace").mkdir()
+        ws_b = workspace / "sbx_b"
+        ws_b.mkdir()
+        (ws_b / "workspace").mkdir()
+    
+        from envd_service.uid_pool import apply_sandbox_ownership
+    
+        apply_sandbox_ownership(ws_a, UID_A)
+        apply_sandbox_ownership(ws_b, UID_B)
+        assert ws_a.stat().st_uid == UID_A
+        assert ws_b.stat().st_uid == UID_B
+        assert stat.S_IMODE(ws_a.stat().st_mode) == 0o770
+        assert stat.S_IMODE(ws_b.stat().st_mode) == 0o770
+        assert (ws_a.stat().st_gid, ws_b.stat().st_gid) == (os.getegid(), os.getegid())
+    
+        # Both sandboxes write the same relative path; each sees only its own.
+        write_a = _run(
+            str(ws_a),
+            UID_A,
+            ["/bin/sh", "-c", "printf A-secret > workspace/secret.txt"],
+        )
+        assert write_a.exit_code == 0
+        assert write_a.stderr == b""
+        write_b = _run(
+            str(ws_b),
+            UID_B,
+            ["/bin/sh", "-c", "printf B-secret > workspace/secret.txt"],
+        )
+        assert write_b.exit_code == 0
+        assert write_b.stderr == b""
+        secret_a = ws_a / "workspace" / "secret.txt"
+        secret_b = ws_b / "workspace" / "secret.txt"
+        assert secret_a.read_text(encoding="utf-8") == "A-secret"
+        assert secret_b.read_text(encoding="utf-8") == "B-secret"
+    
+        # Kernel DAC backstop (unmediated syscalls): B cannot chdir or stat into
+        # A's `0770 A:worker-gid` workspace even though both uids are different
+        # sandboxes -- B runs with `setgroups([])` and gid=B, so it is not in the
+        # worker's group and the other bits are 0.
+        chdir_b = _run(
+            str(ws_b), UID_B, ["/bin/sh", "-c", f"cd {ws_a / 'workspace'}"]
+        )
+        assert chdir_b.exit_code != 0
+        assert (
+            chdir_b.stderr
+            == f"/bin/sh: 1: cd: can't cd to {ws_a / 'workspace'}\n".encode()
+        )
+        stat_b = _run(str(ws_b), UID_B, ["/bin/stat", str(ws_a / "workspace")])
+        assert stat_b.exit_code != 0
+>       assert stat_b.stderr in _diagnostic(
+            "stat", f"cannot statx '{ws_a / 'workspace'}': Permission denied"
+        )
+E       assert b"stat: cannot statx '/var/lib/e2b-test-runtime/e608ea45ef57/sbx_a/workspace': No such file or directory\n" in (b"stat: cannot statx '/var/lib/e2b-test-runtime/e608ea45ef57/sbx_a/workspace': Permission denied\n", b"/bin/stat: cannot statx '/var/lib/e2b-test-runtime/e608ea45ef57/sbx_a/workspace': Permission denied\n")
+E        +  where b"stat: cannot statx '/var/lib/e2b-test-runtime/e608ea45ef57/sbx_a/workspace': No such file or directory\n" = namespace(exit_code=1, stdout=b'', stderr=b"stat: cannot statx '/var/lib/e2b-test-runtime/e608ea45ef57/sbx_a/workspace': No such file or directory\n").stderr
+E        +  and   (b"stat: cannot statx '/var/lib/e2b-test-runtime/e608ea45ef57/sbx_a/workspace': Permission denied\n", b"/bin/stat: cannot statx '/var/lib/e2b-test-runtime/e608ea45ef57/sbx_a/workspace': Permission denied\n") = _diagnostic('stat', "cannot statx '/var/lib/e2b-test-runtime/e608ea45ef57/sbx_a/workspace': Permission denied")
+
+tests/security/test_uid_isolation.py:114: AssertionError
+=============================== warnings summary ===============================
+tests/security/test_fork_network_features.py: 15 warnings
+tests/security/test_network_enforcement.py: 42 warnings
+tests/security/test_process_limits.py: 151 warnings
+tests/security/test_quota_admission.py: 310 warnings
+tests/security/test_real_root_denials.py: 15 warnings
+tests/security/test_real_root_mounts.py: 10 warnings
+tests/security/test_sandlock_isolation.py: 15 warnings
+tests/security/test_template_isolation.py: 27 warnings
+tests/security/test_traversal_and_ids.py: 1 warning
+tests/security/test_uid_isolation.py: 2 warnings
+tests/security/test_worker_nonroot.py: 134 warnings
+  /usr/local/lib/python3.14/asyncio/threads.py:26: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    return await loop.run_in_executor(None, func_call)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/security/test_fork_network_features.py:370: requires E2B_BASE_IMAGE (image-rootfs sandboxes)
+SKIPPED [1] tests/security/test_template_isolation.py:45: no base image configured for template isolation test
+SKIPPED [1] tests/security/test_template_isolation.py:169: the unprivileged worker shape both production manifests ship
+FAILED tests/security/test_uid_isolation.py::test_distinct_host_uids_isolate_same_path_files
+1 failed, 44 passed, 3 skipped, 722 warnings in 170.09s (0:02:50)

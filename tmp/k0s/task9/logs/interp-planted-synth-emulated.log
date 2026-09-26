@@ -1,0 +1,5 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+interpreter of /usr/bin/printf: '/lib64/ld-linux-x86-64.so.2'
+shape=synth-emulated chroot=/workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0
+planted interpreter at /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/lib64/ld-linux-x86-64.so.2 (225672 bytes)
+FAILED SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted

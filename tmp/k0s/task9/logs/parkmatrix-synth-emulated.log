@@ -1,0 +1,6 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+main=production-park  argv=['/bin/sh', '-c', "trap '' TERM HUP INT QUIT USR1 USR2 PIPE; while :; do kill -STOP $$; done"] -> SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+main=sh-sleep         argv=['/bin/sh', '-c', 'sleep 300'] -> SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+main=sh-true          argv=['/bin/sh', '-c', 'true'] -> SlotRefusal: instance exec failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+main=sleep-binary     argv=['/usr/bin/sleep', '300'] -> SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+main=env              argv=['/usr/bin/env'] -> SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted

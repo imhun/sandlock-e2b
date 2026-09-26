@@ -1,0 +1,88 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+LOG DEBUG asyncio: Using selector: EpollSelector
+LOG INFO envd_service.route_b: route-B slot sbx_slot_0 leased uid 1000 (sandbox sbx_slot_0, instance pid 23)
+LOG INFO envd_service.executors.sandlock: route-B instance ready sandbox_id=sbx_slot_0 instance_name=sbx_slot_0 uid=1000 slot=sbx_slot_0 channel=fd-handoff(pid 10) guest-uid=uid-0-in-userns
+LOG INFO envd_service.executors.sandlock: sandbox_id=sbx_slot_0 pushed-append wiring: sink=False slot_events=True
+LOG INFO envd_service.executors.sandlock: sandlock instance created sandbox_id=sbx_slot_0 instance_name=sbx_slot_0 max_memory=512M max_processes=64 chroot=yes
+LOG INFO envd_service.executors.sandlock: sandlock instance closed during exec; rebuilding once sandbox_id=sbx_slot_0 instance_name=sbx_slot_0 argv=['/bin/sh', '-c', 'echo hi']
+LOG INFO envd_service.route_b: route-B slot sbx_slot_0 released uid 1000
+LOG INFO envd_service.route_b: route-B slot sbx_slot_0 leased uid 1000 (sandbox sbx_slot_0, instance pid 38)
+LOG INFO envd_service.executors.sandlock: route-B instance ready sandbox_id=sbx_slot_0 instance_name=sbx_slot_0 uid=1000 slot=sbx_slot_0 channel=fd-handoff(pid 25) guest-uid=uid-0-in-userns
+LOG INFO envd_service.executors.sandlock: sandbox_id=sbx_slot_0 pushed-append wiring: sink=False slot_events=True
+LOG INFO envd_service.executors.sandlock: sandlock instance created sandbox_id=sbx_slot_0 instance_name=sbx_slot_0 max_memory=512M max_processes=64 chroot=yes
+Traceback (most recent call last):
+  File "/workspace/envd_service/executors/sandlock.py", line 2813, in start
+    proc = await _exec_once(inst)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/envd_service/executors/sandlock.py", line 2803, in _exec_once
+    return await asyncio.to_thread(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<6 lines>...
+    )
+    ^
+  File "/usr/local/lib/python3.14/asyncio/threads.py", line 26, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.14/concurrent/futures/thread.py", line 86, in run
+    result = ctx.run(self.task)
+  File "/usr/local/lib/python3.14/concurrent/futures/thread.py", line 73, in run
+    return fn(*args, **kwargs)
+  File "/workspace/envd_service/route_b.py", line 1567, in exec
+    reply = self.request(
+        "exec", args, fds=(child_stdin, child_stdout, child_stderr)
+    )
+  File "/workspace/envd_service/route_b.py", line 1418, in request
+    return ch.request(verb, args, fds=tuple(fds))
+           ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.14/site-packages/sandlock/supervise.py", line 249, in request
+    raise SlotRefusal(
+    ...<2 lines>...
+    )
+sandlock.exceptions.SlotRefusal: instance exec failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/workspace/tmp/k0s/probe-task9-shape2.py", line 47, in main
+    code, out, err = await run_sh(executor, workspace, cmd)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/tests/security/conftest.py", line 272, in run_sh
+    running = await executor.start(
+              ^^^^^^^^^^^^^^^^^^^^^
+    ...<6 lines>...
+    )
+    ^
+  File "/workspace/envd_service/executors/sandlock.py", line 2854, in start
+    proc = await _exec_once(inst)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/envd_service/executors/sandlock.py", line 2803, in _exec_once
+    return await asyncio.to_thread(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<6 lines>...
+    )
+    ^
+  File "/usr/local/lib/python3.14/asyncio/threads.py", line 26, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.14/concurrent/futures/thread.py", line 86, in run
+    result = ctx.run(self.task)
+  File "/usr/local/lib/python3.14/concurrent/futures/thread.py", line 73, in run
+    return fn(*args, **kwargs)
+  File "/workspace/envd_service/route_b.py", line 1567, in exec
+    reply = self.request(
+        "exec", args, fds=(child_stdin, child_stdout, child_stderr)
+    )
+  File "/workspace/envd_service/route_b.py", line 1418, in request
+    return ch.request(verb, args, fds=tuple(fds))
+           ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.14/site-packages/sandlock/supervise.py", line 249, in request
+    raise SlotRefusal(
+    ...<2 lines>...
+    )
+sandlock.exceptions.SlotRefusal: instance exec failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+LOG INFO envd_service.executors.sandlock: sandlock instance closed sandbox_id=sbx_slot_0 instance_name=sbx_slot_0
+LOG INFO envd_service.route_b: route-B slot sbx_slot_0 released uid 1000
+shape=synth-emulated has_root=True chroot=/var/lib/e2b-test-runtime/_pure_rootfs/sbx_slot_0 ws=/tmp/tmpwyfcnrzw-ws
+route_b_active=True decline=None
+instance=<envd_service.route_b.RouteBInstance object at 0x7f2eeedb8190>
+SLOT-STDERR: ''

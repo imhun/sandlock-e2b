@@ -1,0 +1,19 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+mediated sandbox_id=sbx_slot_0 runs in-process, not on a supervise slot (E2B_ROUTE_B=off): path mediation would then execute as the mediator, so the fork refuses the create instead of leaving supervisor-owned files behind (T5, no downgrade tier is set any more). Fix: keep E2B_PER_SANDBOX_UID on and let route B lease a slot (E2B_ROUTE_B=auto/on), or run a privileged launcher or an external slot fleet.
+sandlock instance launch failed sandbox_id=sbx_slot_0 instance_name=sbx_slot_0 error=sandlock_instance_launch failed: process error: child process error: in-process path mediation refused: mediation would run as euid 0 while the sandbox's host uid is 1000; on-behalf files would be owned by the mediator, not the sandbox (SL-1). Run sandlock-supervise as uid 1000 (route B)
+Traceback (most recent call last):
+  File "/workspace/tmp/k0s/probe-task9-inproc.py", line 50, in main
+    code, out, err = await run_sh(executor, workspace, command)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/tests/security/conftest.py", line 272, in run_sh
+    running = await executor.start(
+              ^^^^^^^^^^^^^^^^^^^^^
+    ...<6 lines>...
+    )
+    ^
+  File "/workspace/envd_service/executors/sandlock.py", line 2796, in start
+    inst = await self._ensure_instance_async()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: sandlock_instance_launch failed: process error: child process error: in-process path mediation refused: mediation would run as euid 0 while the sandbox's host uid is 1000; on-behalf files would be owned by the mediator, not the sandbox (SL-1). Run sandlock-supervise as uid 1000 (route B)
+shape=synth-emulated route_b_active=False decline=E2B_ROUTE_B=off chroot=/workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0
+FAILED RuntimeError: sandlock_instance_launch failed: process error: child process error: in-process path mediation refused: mediation would run as euid 0 while the sandbox's host uid is 1000; on-behalf files would be owned by the mediator, not the sandbox (SL-1). Run sandlock-supervise as uid 1000 (route B)

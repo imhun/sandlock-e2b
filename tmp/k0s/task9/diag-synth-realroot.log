@@ -1,0 +1,56 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+### shape=synth-realroot
+### shape: {"E2B_PURE_ROOTFS": "synth", "E2B_REAL_ROOT": "1", "has_sandbox_root": true, "chroot_root": "/workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0", "route_b_active": true, "route_b_decline": null, "workspace": "/tmp/tmp_wp3m4gu-ws"}
+### skeleton tree (/workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0):
+  0o755      dir bin (64B)
+  0o755      dir dev (64B)
+  0o755      dir etc (64B)
+  0o755      dir home (96B)
+  0o755      dir lib (64B)
+  0o755      dir lib64 (96B)
+  0o755      dir media (64B)
+  0o755      dir mnt (64B)
+  0o755      dir opt (64B)
+  0o755      dir proc (64B)
+  0o755      dir root (64B)
+  0o755      dir run (64B)
+  0o755      dir sbin (64B)
+  0o755      dir srv (64B)
+  0o755      dir tmp (64B)
+  0o755      dir usr (64B)
+  0o755      dir var (64B)
+  0o755      dir workspace (64B)
+  0o755      dir home/user (64B)
+  0o755    other lib64/ld-linux-x86-64.so.2 (225672B)
+### translated /bin/sh -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/bin/sh : MISSING
+### translated /usr/bin/python3 -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/usr/bin/python3 : MISSING
+### translated /home/user -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/home/user : exists
+### translated /workspace -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/workspace : exists
+[echo hi] rc=0 out=b'hi\n' err=b''
+[ls /] rc=0 out=b'bin\ndev\netc\nhome\nlib\nlib64\nmedia\nmnt\nopt\nproc\nroot\nrun\nsbin\nsrv\ntmp\nusr\nvar\nworkspace\n' err=b''
+[cat /etc/passwd] rc=1 out=b'' err=b'cat: /etc/passwd: Permission denied\n'
+### child breadcrumbs (/tmp/tmp_wp3m4gu-ws/realroot-trace.txt):
+step: real_root: begin
+step: unshare(CLONE_NEWNS)
+step: make-private
+step: bind /tmp/tmp_wp3m4gu-ws -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/home/user
+step: bind /tmp/tmp_wp3m4gu-ws -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/workspace
+step: bind /usr -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/usr
+step: bind /usr/bin -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/bin
+step: bind /usr/sbin -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/sbin
+step: bind /usr/lib -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/lib
+step: bind /usr/lib64 -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/lib64
+step: bind /opt -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/opt
+step: bind /dev -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/dev
+step: self-bind rootfs (recursive, carries the mounts)
+step: chdir rootfs
+step: pivot_root + detach old root
+step: chdir /
+step: real_root: pivoted
+step: real_root: cwd
+step: real_root: caps dropped
+step: landlock restricted
+step: step9: resolved
+step: step9: assembled
+step: exec /bin/sh
+

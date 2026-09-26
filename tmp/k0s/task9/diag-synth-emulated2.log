@@ -1,0 +1,78 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+Traceback (most recent call last):
+  File "/workspace/tmp/k0s/probe-task9-synth-emulated-cause.py", line 125, in main
+    code, out, err = await run_sh(executor, workspace, command)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/tests/security/conftest.py", line 284, in run_sh
+    code = await running.exit_code()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/envd_service/executors/sandlock.py", line 747, in exit_code
+    result = await asyncio.to_thread(self._proc.wait)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+sandlock.exceptions.SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+Traceback (most recent call last):
+  File "/workspace/tmp/k0s/probe-task9-synth-emulated-cause.py", line 125, in main
+    code, out, err = await run_sh(executor, workspace, command)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/tests/security/conftest.py", line 284, in run_sh
+    code = await running.exit_code()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/envd_service/executors/sandlock.py", line 747, in exit_code
+    result = await asyncio.to_thread(self._proc.wait)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+sandlock.exceptions.SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+Traceback (most recent call last):
+  File "/workspace/tmp/k0s/probe-task9-synth-emulated-cause.py", line 125, in main
+    code, out, err = await run_sh(executor, workspace, command)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/tests/security/conftest.py", line 284, in run_sh
+    code = await running.exit_code()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/envd_service/executors/sandlock.py", line 747, in exit_code
+    result = await asyncio.to_thread(self._proc.wait)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+sandlock.exceptions.SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+### shape=synth-emulated
+### shape: {"E2B_PURE_ROOTFS": "synth", "E2B_REAL_ROOT": "0", "has_sandbox_root": true, "chroot_root": "/workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0", "route_b_active": true, "route_b_decline": null, "workspace": "/tmp/tmp09nlo0oz-ws"}
+### skeleton tree (/workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0):
+  0o755      dir bin (64B)
+  0o755      dir dev (64B)
+  0o755      dir etc (64B)
+  0o755      dir home (96B)
+  0o755      dir lib (64B)
+  0o755      dir lib64 (96B)
+  0o755      dir media (64B)
+  0o755      dir mnt (64B)
+  0o755      dir opt (64B)
+  0o755      dir proc (64B)
+  0o755      dir root (64B)
+  0o755      dir run (64B)
+  0o755      dir sbin (64B)
+  0o755      dir srv (64B)
+  0o755      dir tmp (64B)
+  0o755      dir usr (64B)
+  0o755      dir var (64B)
+  0o755      dir workspace (64B)
+  0o755      dir home/user (64B)
+  0o755    other lib64/ld-linux-x86-64.so.2 (225672B)
+### translated /bin/sh -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/bin/sh : MISSING
+### translated /usr/bin/python3 -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/usr/bin/python3 : MISSING
+### translated /home/user -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/home/user : exists
+### translated /workspace -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/workspace : exists
+[echo hi] RAISED SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+[ls /] RAISED SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+[cat /etc/passwd] RAISED SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+### child breadcrumbs (/tmp/tmp09nlo0oz-ws/realroot-trace.txt):
+step: step9: resolved
+step: step9: assembled
+step: exec /bin/sh
+FAILURE: execvp("/bin/sh") failed (errno 13)
+step: step9: resolved
+step: step9: assembled
+step: exec /bin/sh
+FAILURE: execvp("/bin/sh") failed (errno 13)
+step: step9: resolved
+step: step9: assembled
+step: exec /bin/sh
+FAILURE: execvp("/bin/sh") failed (errno 13)
+

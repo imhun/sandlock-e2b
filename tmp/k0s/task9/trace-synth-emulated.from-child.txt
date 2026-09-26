@@ -1,0 +1,12 @@
+step: step9: resolved
+step: step9: assembled
+step: exec /bin/sh
+FAILURE: execvp("/bin/sh") failed (errno 13)
+step: step9: resolved
+step: step9: assembled
+step: exec /bin/sh
+FAILURE: execvp("/bin/sh") failed (errno 13)
+step: step9: resolved
+step: step9: assembled
+step: exec /bin/sh
+FAILURE: execvp("/bin/sh") failed (errno 13)

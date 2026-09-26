@@ -1,0 +1,5 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+shape=synth-realroot chroot=/workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0 ws=/tmp/tmpcbmw05g4-ws
+[echo hi] rc=0 out=b'hi\n' err=b''
+park.out: None
+park.err: b''

@@ -1,0 +1,20 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+MEASURE-FAIL [synth-emulated] SlotRefusal: instance exec failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted
+shape [n15] pure_rootfs='off' real_root='0' has_sandbox_root=False chroot_root=/ synthetic_rootfs=None
+shape [synth-realroot] pure_rootfs='synth' real_root='1' has_sandbox_root=True chroot_root=/workspace/tmp/k0s/scratch/census-cur/_pure_rootfs/sbx_slot_2 synthetic_rootfs=/workspace/tmp/k0s/scratch/census-cur/_pure_rootfs/sbx_slot_2
+DIFF [synth-realroot] pwd && pwd -P
+  n15  = [0, '/tmp/tmpj_woxyjr-ws\n/tmp/tmpj_woxyjr-ws\n', '']
+  this = [0, '/home/user\n/home/user\n', '']
+DIFF [synth-realroot] ls /
+  n15  = [0, 'bin\nboot\ndev\netc\nhome\nlib\nlib64\nmedia\nmnt\nopt\nproc\nroot\nrun\nsbin\nsrv\nsys\ntmp\nusr\nvar\nworkspace\n', '']
+  this = [0, 'bin\ndev\netc\nhome\nlib\nlib64\nmedia\nmnt\nopt\nproc\nroot\nrun\nsbin\nsrv\ntmp\nusr\nvar\nworkspace\n', '']
+DIFF [synth-realroot] head -c 4 /dev/urandom | wc -c
+  n15  = [0, '0\n', "head: cannot open '/dev/urandom' for reading: Permission denied\n"]
+  this = [0, '4\n', '']
+DIFF [synth-realroot] echo x > /dev/null && echo ok
+  n15  = [2, '', '/bin/sh: 1: cannot create /dev/null: Permission denied\n']
+  this = [0, 'ok\n', '']
+DIFF [synth-realroot] ls /dev | head -3
+  n15  = [0, '', "ls: cannot access '/dev': Permission denied\n"]
+  this = [0, 'fd\nfull\nmqueue\n', '']
+measured=n15,synth-realroot failed=synth-emulated commands=17 shapes=3 diffs=5

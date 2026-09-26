@@ -1,0 +1,3 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+shape=synth-emulated extra=['/sbin', '/lib64', '/dev'] chroot=/workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0
+FAILED SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted

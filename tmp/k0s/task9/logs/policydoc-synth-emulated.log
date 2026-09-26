@@ -1,0 +1,83 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+### shape=synth-emulated ws=/tmp/tmpj857lp3h-ws
+### ceiling:
+{
+  "chroot": "/workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0",
+  "egress_proxy": null,
+  "fs_denied": [],
+  "fs_mount": {
+    "/bin": "/bin",
+    "/dev": "/dev",
+    "/home/user": "/tmp/tmpj857lp3h-ws",
+    "/lib": "/lib",
+    "/lib64": "/lib64",
+    "/opt": "/opt",
+    "/sbin": "/sbin",
+    "/usr": "/usr",
+    "/workspace": "/tmp/tmpj857lp3h-ws"
+  },
+  "fs_readable": [
+    "/usr",
+    "/lib",
+    "/bin",
+    "/opt"
+  ],
+  "fs_writable": [
+    "/tmp/tmpj857lp3h-ws",
+    "/workspace",
+    "/home/user"
+  ],
+  "gid": 1000,
+  "host_mask": null,
+  "http_allow": [],
+  "http_inject": [],
+  "max_cpu": 100,
+  "max_disk": "1024M",
+  "max_file_size": null,
+  "max_memory": "512M",
+  "max_open_files": 4096,
+  "max_processes": 64,
+  "net_allow": [],
+  "net_deny": [],
+  "notify_rate_limit": null,
+  "uid": 1000
+}
+### sandbox document:
+{
+  "chroot": "/workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0",
+  "fs_denied": [],
+  "fs_mount": [
+    "/home/user:/tmp/tmpj857lp3h-ws",
+    "/workspace:/tmp/tmpj857lp3h-ws",
+    "/usr:/usr",
+    "/bin:/bin",
+    "/sbin:/sbin",
+    "/lib:/lib",
+    "/lib64:/lib64",
+    "/opt:/opt",
+    "/dev:/dev"
+  ],
+  "fs_readable": [
+    "/usr",
+    "/lib",
+    "/bin",
+    "/opt"
+  ],
+  "fs_writable": [
+    "/tmp/tmpj857lp3h-ws",
+    "/workspace",
+    "/home/user"
+  ],
+  "gid": 1000,
+  "http_allow": [],
+  "http_inject": [],
+  "max_cpu": 100,
+  "max_disk": "1024M",
+  "max_memory": "512M",
+  "max_open_files": 4096,
+  "max_processes": 64,
+  "net_allow": [],
+  "net_deny": [],
+  "uid": 1000
+}
+### FAILED SlotRefusal: instance wait_child failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted

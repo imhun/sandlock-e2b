@@ -1,0 +1,23 @@
+step: real_root: begin
+step: unshare(CLONE_NEWNS)
+step: make-private
+step: bind /tmp/tmp_wp3m4gu-ws -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/home/user
+step: bind /tmp/tmp_wp3m4gu-ws -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/workspace
+step: bind /usr -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/usr
+step: bind /usr/bin -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/bin
+step: bind /usr/sbin -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/sbin
+step: bind /usr/lib -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/lib
+step: bind /usr/lib64 -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/lib64
+step: bind /opt -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/opt
+step: bind /dev -> /workspace/tmp/k0s/scratch/census/_pure_rootfs/sbx_slot_0/dev
+step: self-bind rootfs (recursive, carries the mounts)
+step: chdir rootfs
+step: pivot_root + detach old root
+step: chdir /
+step: real_root: pivoted
+step: real_root: cwd
+step: real_root: caps dropped
+step: landlock restricted
+step: step9: resolved
+step: step9: assembled
+step: exec /bin/sh
