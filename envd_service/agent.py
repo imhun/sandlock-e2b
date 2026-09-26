@@ -2403,6 +2403,13 @@ class NodeAgent:
             # deferred by the *same* fence and the retry it schedules would
             # otherwise be cleared in the same round that armed it.
             self._sweep_completed()
+        # The naming rule of this dict, written down so the next reader does not
+        # "tidy it up" by hand: **a key the brief or an existing consumer has
+        # already named keeps that spelling** -- ``checkpointsReclaimed`` is
+        # named in the Task E4 brief and in its plan doc -- **and every new key
+        # follows this dictionary's snake_case** (``disk_sweep_skipped``,
+        # ``checkpoints_sweep_skipped``, ``quota_unreclaimed``).
+        # 简报/既有消费方点名的键保留原名；新增键一律跟本字典的 snake_case 走。
         summary = {
             "deleted": sorted(deleted),
             "delete_failures": sorted(delete_failures),
