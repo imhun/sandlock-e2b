@@ -321,6 +321,39 @@ def _real_root_capability() -> str:
     return f"the probe exited {completed.returncode} without a reason"
 
 
+def _mkdir_traversable(path: Path, mode: int = 0o755) -> None:
+    """Create ``path`` -- and every missing parent -- at an explicit ``mode``.
+
+    ``mkdir(mode=...)`` (with or without ``parents``) is masked by the ambient
+    umask: under ``umask 077`` a request for ``0o755`` lands as ``0o700``. Every
+    directory created here is a mount target or a root layer the sandbox's own
+    uid traverses while owning none of them, so a ``0700`` one fails the bind
+    (and the ``chdir``) with ``EACCES`` before the sandbox ever starts. Same
+    call as ``route_b._write_slot_documents``: create, then ``chmod`` each level
+    explicitly, because neither the ambient umask nor a private scratch root
+    may decide the modes. Directories that already exist are left untouched --
+    this must never widen the modes of something an image shipped.
+    """
+    if path.exists() or path.is_symlink():
+        # `Path.mkdir(exist_ok=True)`'s contract: an existing directory is the
+        # only acceptable occupant. A file (or a dangling symlink) in the way
+        # has to fail here, loudly, instead of leaving the bind to explain it.
+        if not path.is_dir():
+            path.mkdir(mode=mode)
+        return
+    pending: list[Path] = []
+    probe = path
+    while not probe.exists():
+        pending.append(probe)
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+    for directory in reversed(pending):
+        directory.mkdir(mode=mode)
+        os.chmod(directory, mode)
+
+
 def _ensure_chroot_mount_points(rootfs: Path, mounts: dict[str, str]) -> None:
     """Create every mount *target* inside the rootfs.
 
@@ -329,15 +362,18 @@ def _ensure_chroot_mount_points(rootfs: Path, mounts: dict[str, str]) -> None:
     binds each source *onto* its target, so the target has to exist -- including
     the single-node files of ``minimal_dev``, which slim base images extract
     without. Directories are created, missing file targets are touched (the bind
-    replaces them with the device node or file the source is); the fork refuses
-    a mount whose target is missing rather than silently leaving a hole.
+    replaces them with the device node or file the source is, so their own mode
+    never reaches the sandbox); the fork refuses a mount whose target is missing
+    rather than silently leaving a hole. Directories go through
+    ``_mkdir_traversable`` -- the sandbox uid does not own them, and a umask
+    decided ``0700`` fails the bind.
     """
     for virtual, host in mounts.items():
         target = rootfs / str(virtual).removeprefix("/")
         if Path(str(host)).is_dir():
-            target.mkdir(parents=True, exist_ok=True)
+            _mkdir_traversable(target)
         else:
-            target.parent.mkdir(parents=True, exist_ok=True)
+            _mkdir_traversable(target.parent)
             if not target.exists():
                 target.touch()
 
@@ -435,15 +471,24 @@ def _materialize_synthetic_rootfs(root: Path, mounts: dict[str, str]) -> None:
 
     ``0755`` on purpose: the binds and the ``chdir`` into the root happen in the
     sandbox's own user namespace as the sandbox's own host uid, which owns none
-    of these directories (a ``0700`` root fails the bind with EACCES before the
-    sandbox ever starts). ``_ensure_chroot_mount_points`` then creates the
-    targets the fork refuses to run without.
+    of these directories (a ``0700`` one fails the bind with EACCES before the
+    sandbox ever starts). The mode is set by ``_mkdir_traversable``'s explicit
+    ``chmod``, never by ``mkdir(mode=0o755)`` -- that argument is masked by the
+    umask and lands as ``0700`` under ``umask 077``, which is the same failure.
+    ``_ensure_chroot_mount_points`` then creates the targets the fork refuses to
+    run without, by the same rule.
     """
-    root.mkdir(parents=True, exist_ok=True)
+    # ``_mkdir_traversable`` walks the parents, so ``<pure_rootfs_dir>`` itself
+    # is created 0755 too: the switch hands that layer out in Task 5 and the
+    # sandbox uid has to be able to traverse into the sandbox's own directory.
+    _mkdir_traversable(root)
+    # Re-asserted even when the root was already there: it used to be an
+    # unconditional chmod, and a ``0700`` left behind by an older run must heal
+    # instead of failing every bind from then on.
     os.chmod(root, 0o755)
     for name in _SYNTHETIC_ROOTFS_SKELETON_DIRS:
-        (root / name).mkdir(mode=0o755, exist_ok=True)
-    (root / "home" / "user").mkdir(mode=0o755, exist_ok=True)
+        _mkdir_traversable(root / name)
+    _mkdir_traversable(root / "home" / "user")
     _ensure_chroot_mount_points(root, mounts)
 
 
@@ -1742,9 +1787,7 @@ class SandlockExecutor(Executor):
                     self._instance_name,
                     f"{self._memory_mb}M",
                     self._max_processes,
-                    "yes"
-                    if self._base_image and self._image_rootfs is not None
-                    else "no",
+                    "yes" if self._has_sandbox_root else "no",
                 )
         return self._instance
 
@@ -2363,15 +2406,12 @@ class SandlockExecutor(Executor):
             # points must already exist for chdir() to work).
             kwargs["chroot"] = self._chroot_root
             kwargs["fs_mount"] = self._materialize_root(root)
-            if not self._is_image_rootfs:
-                # Written into `kwargs`, not just into the local: this builder
-                # creates its dict *before* the shape branch (the image shape
-                # never noticed, because its `fs_readable` covers "/" and so
-                # puts `/home/user` inside the ceiling by itself). Without this
-                # the per-exec cwd is refused -- "exec params exceed the
-                # instance policy ceiling: cwd /home/user is outside the
-                # allowed set".
-                kwargs["fs_writable"] = fs_writable
+            # No `fs_writable` write-back is needed here: the shape branch
+            # above finalizes the list before `kwargs` is built, so the literal
+            # already carries it. What keeps the per-exec cwd inside the
+            # instance ceiling is `_volume_only_mount_map_writable`'s mount
+            # points, not a late reassignment (the old comment here described a
+            # version whose dict predated the branch).
         else:
             # N15: the pure shape (no base image, no synthesized root) is
             # mediated too, with the host root as the mediator's root --
@@ -2611,11 +2651,9 @@ class SandlockExecutor(Executor):
             # runtime, so they must already exist for chdir() to work).
             kwargs["chroot"] = self._chroot_root
             kwargs["fs_mount"] = self._materialize_root(root)
-            if not self._is_image_rootfs:
-                # This builder's dict predates the shape branch (the image
-                # shape never noticed, because its `fs_readable` covers "/" and
-                # so puts `/home/user` inside the ceiling by itself).
-                kwargs["fs_writable"] = fs_writable
+            # Same as `_policy_ceiling`: the shape branch above finalizes
+            # `fs_writable` before `kwargs` is built, so there is nothing to
+            # write back here.
         else:
             # N15, the one-shot twin of `_policy_ceiling`'s pure branch: host
             # root, identity translation, the workspace under both aliases and
