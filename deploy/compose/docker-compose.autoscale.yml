@@ -113,7 +113,7 @@ services:
       # Spawned workers get their env only from this JSON: without the cache
       # dir they would fall back to a container-local relative path and lose
       # the rootfs on every scale-in/out.
-      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-python:3.14-slim}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-local}", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
+      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-python:3.14-slim}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-local}", "E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
       E2B_AS_POLL_S: ${E2B_AS_POLL_S:-5}
       E2B_AS_UTIL_THRESHOLD: ${E2B_AS_UTIL_THRESHOLD:-0.70}
       E2B_AS_SCALE_UP_COOLDOWN_S: ${E2B_AS_SCALE_UP_COOLDOWN_S:-60}

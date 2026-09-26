@@ -50,6 +50,16 @@ class DockerPoolBackend:
             "E2B_NODE_CPU_PERCENT": node_cpu_percent,
             "E2B_NODE_DISK_MB": node_disk_mb,
             "E2B_NODE_PROCESSES": node_processes,
+            # Fleet shape (deploy/stack/docker-compose.prod.yml:209-210): each
+            # sandbox gets its own loopback-only netns and egress is mediated by
+            # the supervisor's connect fd injection. BOTH are required --
+            # `create_app` refuses the unpaired shape by name
+            # (envd_service/config.py:471-479), which crash-loops a worker
+            # rather than silently cutting every sandbox's network. Set here
+            # (not in `cmd`) so E2B_AS_WORKER_ENV can still override the pair
+            # to "false": the dictionary expands first, worker_env last.
+            "E2B_ENABLE_NET_ISOLATION": "true",
+            "E2B_FD_INJECT_CONNECT": "true",
             **dict(worker_env or {}),
         }
 
@@ -79,12 +89,12 @@ class DockerPoolBackend:
                 f"{self._volume}:/var/lib/e2b-sandboxes",
                 # A6: no --cap-add SYS_ADMIN. The shared-volume bind was
                 # deleted in A4 and quota goes through quota-agent
-                # (E2B_QUOTA_AGENT_URL); the low-port window below is a
-                # container-spec declaration, not a runtime sysctl write.
+                # (E2B_QUOTA_AGENT_URL); the container-level low-port window is
+                # gone too (2026-09-26) -- the pooled workers run the fleet's
+                # per-sandbox netns below, where the wildcard-DNS `:53` bind
+                # happens inside the sandbox's own netns as root-in-userns.
                 "--security-opt",
                 "seccomp=unconfined",
-                "--sysctl",
-                "net.ipv4.ip_unprivileged_port_start=0",
                 # The local backend keeps `seccomp=unconfined` (above): the
                 # worker's startup self-check must not refuse that shape.
                 "-e",
