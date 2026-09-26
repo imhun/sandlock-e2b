@@ -54,13 +54,16 @@ OVERRIDE_SEAM = "\n            **dict(worker_env or {}),\n"
 #: connected items 1 and 3; N39).
 FLEET_KEYS = ("E2B_ENABLE_NETWORK", "E2B_ROUTE_B_TMP_ROOT")
 
-#: The keys each fleet manifest actually names, pinned: the compose stack
-#: carries both, the k8s pod template only the route-B root (it never names
-#: `E2B_ENABLE_NETWORK`). Both are compared, so a later edit that drops a key
+#: The keys each fleet manifest actually names, pinned: both carry both now.
+#: The k8s pod template used to be the odd one out here -- it never named
+#: `E2B_ENABLE_NETWORK`, and that silence was N42 (a create request's
+#: `allowInternetAccess` accepted and ignored). The ruling of 2026-09-26 turned
+#: egress on everywhere and the manifest now carries the flag, so the two
+#: fleet files agree again. Both are compared, so a later edit that drops a key
 #: from either one fails here instead of leaving "pool == fleet" half-checked.
 FLEET_MANIFEST_KEYS = {
     "deploy/stack/docker-compose.prod.yml": FLEET_KEYS,
-    "deploy/k8s/worker.yaml": ("E2B_ROUTE_B_TMP_ROOT",),
+    "deploy/k8s/worker.yaml": FLEET_KEYS,
 }
 
 
@@ -167,7 +170,13 @@ def _fleet_manifest_values() -> dict[str, dict[str, str]]:
         "deploy/stack/docker-compose.prod.yml": _compose_fleet_values(),
         "deploy/k8s/worker.yaml": _k8s_fleet_values(),
     }
-    assert {path: tuple(values) for path, values in manifests.items()} == FLEET_MANIFEST_KEYS
+    # Sorted, not file order: the two dialects list the keys differently (the
+    # k8s env list names the route-B root first, the compose env block the
+    # egress flag first) and the order an env list is written in is not a fact
+    # this pin is about.
+    assert {
+        path: tuple(sorted(values)) for path, values in manifests.items()
+    } == FLEET_MANIFEST_KEYS
     return manifests
 
 
@@ -184,6 +193,7 @@ def test_the_pool_worker_env_matches_every_fleet_manifest_for_those_keys() -> No
         "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b",
     }
     assert manifests["deploy/k8s/worker.yaml"] == {
+        "E2B_ENABLE_NETWORK": "true",
         "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b",
     }
     env = _worker_env()

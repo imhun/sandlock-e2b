@@ -441,6 +441,10 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 - **compose**（`deploy/compose/docker-compose.prod.yml`、`deploy/stack/docker-compose.prod.yml`）：
   `seccomp=../seccomp/sandlock-worker.json`。Compose 读取该文件并随请求下发，相对路径按
   compose 文件所在目录解析（已实测：Compose 渲染出的容器里 `unshare(NEWUSER)` 成功）。
+  **2026-09-26**：`deploy/compose/docker-compose.multinode.yml` 的三处 worker（当时全树最后
+  三个 `seccomp=unconfined`）也换成同一行 —— 它的 `../seccomp/sandlock-worker.json` 从
+  `deploy/compose/` 解析到同一份文件；在那之前，这些 worker 会在启动自检里因
+  `Seccomp: 0` 被拒服（`E2B_REQUIRE_SECCOMP_FILTER` 与 stack 一样不设 ⇒ 默认要求有档）。
   ⚠️ **只拷单个 compose 文件的部署（线上 `/opt/sandlock/` 那种）没有 `../seccomp/`**
   ⇒ 必须把 profile 一起放上去并用 `E2B_SECCOMP_PROFILE=<绝对路径>` 指过去；用
   `docker compose config` 检查渲染值，别等到 `up` 才失败。

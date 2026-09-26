@@ -911,8 +911,9 @@ def test_multinode_example_runs_the_fleet_netns_shape() -> None:
     (`tmp/netns-unify-wildcard-forced-window-shut.log`). So these assertions are
     the *alignment* with the fleet, not the repair of a wildcard bug: what this
     file is actually missing for wildcard `allowOut` is `E2B_ENABLE_NETWORK`
-    (N42's shape -- no policy reaches the fork, so no gateway is created), and
-    that key is deliberately left out of this task's scope.
+    (N42's shape -- no policy reaches the fork, so no gateway is created). That
+    key and the seccomp directive were still open here at the time; both landed
+    2026-09-26 and are pinned by the N42 tests at the bottom of this file.
     """
     assert "\n    sysctls:\n" not in COMPOSE_MULTINODE
     assert "\n      - net.ipv4.ip_unprivileged_port_start=0\n" not in COMPOSE_MULTINODE
@@ -989,3 +990,172 @@ def test_stack_env_example_describes_the_rollback_lever_not_a_canary() -> None:
     assert "Off by default" not in STACK_ENV_EXAMPLE
     assert "E2B_ENABLE_NET_ISOLATION=false" not in STACK_ENV_EXAMPLE
     assert "E2B_FD_INJECT_CONNECT=false" not in STACK_ENV_EXAMPLE
+
+
+# --------------------------------------------------------------------------
+# N42 (2026-09-26) + ④'s seccomp: the last two manifest gaps, both closed by
+# taking the factory's own files as the reference instead of a third literal.
+# --------------------------------------------------------------------------
+
+COMPOSE_TEST = (REPO / "deploy" / "compose" / "docker-compose.test.yml").read_text(
+    encoding="utf-8"
+)
+MULTINODE_WORKERS = ("worker-1", "worker-2", "worker-3")
+STACK_COMPOSE_PATH = REPO / "deploy" / "stack" / "docker-compose.prod.yml"
+COMPOSE_MULTINODE_PATH = REPO / "deploy" / "compose" / "docker-compose.multinode.yml"
+SHIPPED_SECCOMP_PROFILE = REPO / "deploy" / "seccomp" / "sandlock-worker.json"
+
+
+def _stack_worker_block() -> str:
+    """The stack's `worker-1: &worker` anchor, up to `worker-2:`."""
+    return STACK_COMPOSE.split("\n  worker-1: &worker", 1)[1].split(
+        "\n  worker-2:", 1
+    )[0]
+
+
+def _seccomp_directive(text: str) -> str:
+    """The single `- seccomp=...` line of a compose service, stripped."""
+    hits = [
+        line.strip() for line in text.splitlines() if line.strip().startswith("- seccomp=")
+    ]
+    assert len(hits) == 1, f"expected exactly one seccomp= line: {hits}"
+    return hits[0]
+
+
+def _compose_seccomp_profile_path(directive: str, compose_file: Path) -> Path:
+    """The file a compose `seccomp=` directive resolves to, from *its* file's dir.
+
+    The directive is the stack's fixed shape -- `E2B_SECCOMP_PROFILE` with the
+    checkout-relative default -- so this only has to read the default out and
+    anchor it at the compose file that carries the line. Both stack and
+    multinode spell `../seccomp/sandlock-worker.json` from directories that sit
+    one level under `deploy/`, which is exactly why the same default text is
+    correct in both files.
+    """
+    match = re.fullmatch(r"- seccomp=\$\{E2B_SECCOMP_PROFILE:-([^}]+)\}", directive)
+    assert match, directive
+    return (compose_file.parent / match.group(1)).resolve()
+
+
+def _require_seccomp_filter_value(text: str) -> str | None:
+    """The file's `E2B_REQUIRE_SECCOMP_FILTER` value, or None when it is unset."""
+    values = [
+        line.strip().split(":", 1)[1].strip().strip('"')
+        for line in text.splitlines()
+        if line.strip().startswith("E2B_REQUIRE_SECCOMP_FILTER:")
+    ]
+    assert len(values) <= 1, values
+    return values[0] if values else None
+
+
+def test_multinode_workers_mount_the_stacks_seccomp_profile() -> None:
+    """④'s seccomp: the last `seccomp=unconfined` in the tree, removed.
+
+    `deploy/compose/docker-compose.multinode.yml` ran all three workers under
+    `seccomp=unconfined` -- the shape the factory replaced on 2026-09-15
+    (`deploy/stack/docker-compose.prod.yml:323-328`, rationale in
+    `deploy/seccomp/README.md`). It is not a cosmetic difference: the worker
+    checks its own filter as the first step of `create_app`
+    (`envd_service/config.py::check_seccomp_filter`) and `Seccomp: 0` is
+    `SECCOMP_FILTER_MISSING`, fatal unless `E2B_REQUIRE_SECCOMP_FILTER=0` --
+    so this file's workers could not serve at all under the shipped default.
+
+    The reference is parsed, not copied: each manifest's directive is resolved
+    against *its own* directory and the two have to land on the same file on
+    disk. A hand-copied literal would keep passing after a path stopped
+    resolving to the shipped profile.
+    """
+    stack_directive = _seccomp_directive(_stack_worker_block())
+    shipped = SHIPPED_SECCOMP_PROFILE.resolve()
+    assert _compose_seccomp_profile_path(stack_directive, STACK_COMPOSE_PATH) == shipped
+    for name in MULTINODE_WORKERS:
+        directive = _seccomp_directive(_multinode_worker_block(name))
+        assert directive == stack_directive, name
+        assert (
+            _compose_seccomp_profile_path(directive, COMPOSE_MULTINODE_PATH) == shipped
+        ), name
+    assert "- seccomp=unconfined" not in COMPOSE_MULTINODE
+
+
+def test_multinode_workers_keep_the_stacks_seccomp_requirement() -> None:
+    """`E2B_REQUIRE_SECCOMP_FILTER` is a product decision, and the stack makes it by silence.
+
+    The stack never sets the key, so the envd default (`True`) applies: a worker
+    that is not running the shipped filter refuses to serve instead of quietly
+    serving unfiltered. Only the shapes that are unfiltered *on purpose* opt out
+    (`deploy/compose/docker-compose.test.yml`: `"0"`, the test runner). ④ has no
+    such reason, so it has to spell the same thing -- and "the same thing" is
+    judged by comparing the two files' values, so a later factory change (both
+    spelling `"1"`, say) stays honest instead of pinning today's literal.
+    """
+    # Positive control: the helper does see an opt-out where one exists.
+    assert _require_seccomp_filter_value(COMPOSE_TEST) == "0"
+    assert _require_seccomp_filter_value(COMPOSE_MULTINODE) == (
+        _require_seccomp_filter_value(STACK_COMPOSE)
+    )
+
+
+def test_k8s_worker_carries_the_fleets_network_flag() -> None:
+    """N42: `allowInternetAccess` was silently inert on the cluster.
+
+    `envd_service/executors/sandlock.py` gates every net-allow rule on
+    `self._allow_internet_access and self._enable_network`, and
+    `E2B_ENABLE_NETWORK` defaults to false (`envd_service/config.py`) -- so the
+    manifest that never declared it shipped a worker where the SDK's
+    `allowInternetAccess=True` was accepted and ignored. Measured 2026-09-26 on
+    the live cluster (`docs/open-issues.md` N42): `1.1.1.1:443` ->
+    `PermissionError [Errno 13]`, `pypi.org:443` -> `gaierror [Errno -3]`.
+
+    The value is read off the stack's worker anchor, and separately pinned to
+    the decided posture ("全开", 2026-09-26): a fleet that flipped the stack to
+    `"false"` would be a *different* ruling, and this test should stop rather
+    than follow it silently. What the flag buys is exactly the compose stacks'
+    semantics -- a sandbox egresses only where its own request allows it.
+    """
+    fleet_value = _value_after_key(
+        _stack_worker_block(), "E2B_ENABLE_NETWORK", indent="      "
+    )
+    assert fleet_value == "true"
+    assert _k8s_env_value(K8S_WORKER, "E2B_ENABLE_NETWORK") == fleet_value
+
+
+def test_multinode_workers_carry_the_fleets_network_flag() -> None:
+    """N42 at site ④: without the key the wildcard/allowOut rules never reach the fork.
+
+    Same wall as the k8s worker's (its own comment names the missing key): no
+    policy reaches the sandbox, no DNS gateway is created, and the sandbox
+    resolves against the image's own resolver. There is no anchor in this file
+    -- each worker repeats its env block -- so all three are asserted.
+    """
+    fleet_value = _value_after_key(
+        _stack_worker_block(), "E2B_ENABLE_NETWORK", indent="      "
+    )
+    assert fleet_value == "true"
+    for name in MULTINODE_WORKERS:
+        assert (
+            _value_after_key(
+                _multinode_worker_block(name), "E2B_ENABLE_NETWORK", indent="      "
+            )
+            == fleet_value
+        ), name
+
+
+def test_k8s_control_plane_hosts_no_sandboxes_so_the_flag_is_left_out() -> None:
+    """Why `deploy/k8s/control-plane.yaml` carries no `E2B_ENABLE_NETWORK`.
+
+    The rule is "the key goes where it is read", and this pod reads neither
+    copy: `control_plane/config.py` declares an `enable_network` field that
+    nothing in `control_plane/` consumes (`rg enable_network control_plane/`
+    finds the field and no reader -- it came along when the module was created
+    whole on 2026-08-29), and the envd app that the merged image embeds is only
+    reached through `create_gateway()`, which builds no `Settings` and creates
+    no sandboxes. The envd copy is the one that gates the policy, and it lives
+    in the worker pods (`envd_service/executors/factory.py`).
+
+    `E2B_ENABLE_LOCAL_NODE=false` is what makes that safe to leave out: with a
+    local node this pod would provision sandboxes itself and the missing key
+    would be N42 again. Both facts are pinned together, so the day the first
+    one flips this test fails and the author has to add the key.
+    """
+    assert _k8s_env_value(K8S_CONTROL_PLANE, "E2B_ENABLE_LOCAL_NODE") == "false"
+    assert "\n            - name: E2B_ENABLE_NETWORK\n" not in K8S_CONTROL_PLANE

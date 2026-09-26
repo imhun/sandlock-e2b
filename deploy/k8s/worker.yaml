@@ -281,6 +281,21 @@ spec:
               value: "true"
             - name: E2B_FD_INJECT_CONNECT
               value: "true"
+            # N42 (2026-09-26): the egress switch, which this manifest never
+            # declared. `envd_service/executors/sandlock.py` gates every net
+            # rule on `self._allow_internet_access and self._enable_network`
+            # and the envd default is `false`, so until now a create request
+            # with `allowInternetAccess=True` was accepted and ignored: the
+            # sandbox got no allow rules and no DNS gateway at all (measured on
+            # the live cluster 2026-09-26: `1.1.1.1:443` ->
+            # `PermissionError [Errno 13]`, `pypi.org:443` -> `gaierror
+            # [Errno -3]`; docs/open-issues.md N42). The user ruling is egress
+            # on everywhere, and the value is the fleet's (the two compose
+            # stacks) -- "on" means a sandbox egresses exactly where its own
+            # request allows it, not a blanket hole: a request that carries no
+            # `network` still gets only the fixed domain set.
+            - name: E2B_ENABLE_NETWORK
+              value: "true"
             # N35: let a sandbox build its own root (mount namespace, the
             # image rootfs bound in as `/`, `pivot_root`, then drop
             # CAP_SYS_ADMIN) instead of having the mediator rewrite every path

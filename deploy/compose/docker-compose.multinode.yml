@@ -141,13 +141,17 @@ services:
       # the wildcard `:53` bind succeeded (`docker exec <worker> cat
       # /proc/sys/net/ipv4/ip_unprivileged_port_start` = 0; forcing the window
       # shut reproduces N36's `bind DNS gateway: Permission denied (os error
-      # 13)`). What wildcard rules really need here is `E2B_ENABLE_NETWORK`,
-      # which this file does not declare: without it the policy never reaches
+      # 13)`). What wildcard rules really need here is `E2B_ENABLE_NETWORK`, and
+      # this file did not declare it: without the key the policy never reaches
       # the fork, no gateway is created and the sandbox resolves against the
       # image's own resolver (N42's shape). Declaring it is an egress-posture
-      # change, so it is left to its own decision rather than smuggled in here.
+      # change, so it was left to its own decision; that decision landed
+      # 2026-09-26 ("network on everywhere", docs/open-issues.md N42), so the
+      # key now stands here with the fleet's value -- "on" still means a sandbox
+      # egresses only where its own request allows it.
       E2B_ENABLE_NET_ISOLATION: "true"
       E2B_FD_INJECT_CONNECT: "true"
+      E2B_ENABLE_NETWORK: "true"
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
@@ -157,7 +161,17 @@ services:
     # no low-port window is declared, and none is needed (as in
     # deploy/stack/docker-compose.prod.yml and deploy/compose/docker-compose.prod.yml).
     security_opt:
-      - seccomp=unconfined
+      # The stack's line, verbatim (deploy/stack/docker-compose.prod.yml:328):
+      # Docker's default filter plus the two syscalls the sandbox-create path
+      # needs (`pidfd_getfd` for the seccomp-notification fd, `unshare` for the
+      # user namespace). `seccomp=unconfined` used to stand here -- this file
+      # was the last place in the tree still on it -- and the worker refuses to
+      # serve unfiltered by default (`envd_service/config.py::check_seccomp_filter`:
+      # `Seccomp: 0` is SECCOMP_FILTER_MISSING, fatal unless
+      # E2B_REQUIRE_SECCOMP_FILTER=0, which this file -- like the stack -- does
+      # not set). Override the path with E2B_SECCOMP_PROFILE when the profile
+      # does not sit next to this file.
+      - seccomp=${E2B_SECCOMP_PROFILE:-../seccomp/sandlock-worker.json}
 
   worker-2:
     build:
@@ -207,13 +221,17 @@ services:
       # the wildcard `:53` bind succeeded (`docker exec <worker> cat
       # /proc/sys/net/ipv4/ip_unprivileged_port_start` = 0; forcing the window
       # shut reproduces N36's `bind DNS gateway: Permission denied (os error
-      # 13)`). What wildcard rules really need here is `E2B_ENABLE_NETWORK`,
-      # which this file does not declare: without it the policy never reaches
+      # 13)`). What wildcard rules really need here is `E2B_ENABLE_NETWORK`, and
+      # this file did not declare it: without the key the policy never reaches
       # the fork, no gateway is created and the sandbox resolves against the
       # image's own resolver (N42's shape). Declaring it is an egress-posture
-      # change, so it is left to its own decision rather than smuggled in here.
+      # change, so it was left to its own decision; that decision landed
+      # 2026-09-26 ("network on everywhere", docs/open-issues.md N42), so the
+      # key now stands here with the fleet's value -- "on" still means a sandbox
+      # egresses only where its own request allows it.
       E2B_ENABLE_NET_ISOLATION: "true"
       E2B_FD_INJECT_CONNECT: "true"
+      E2B_ENABLE_NETWORK: "true"
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
@@ -223,7 +241,17 @@ services:
     # no low-port window is declared, and none is needed (as in
     # deploy/stack/docker-compose.prod.yml and deploy/compose/docker-compose.prod.yml).
     security_opt:
-      - seccomp=unconfined
+      # The stack's line, verbatim (deploy/stack/docker-compose.prod.yml:328):
+      # Docker's default filter plus the two syscalls the sandbox-create path
+      # needs (`pidfd_getfd` for the seccomp-notification fd, `unshare` for the
+      # user namespace). `seccomp=unconfined` used to stand here -- this file
+      # was the last place in the tree still on it -- and the worker refuses to
+      # serve unfiltered by default (`envd_service/config.py::check_seccomp_filter`:
+      # `Seccomp: 0` is SECCOMP_FILTER_MISSING, fatal unless
+      # E2B_REQUIRE_SECCOMP_FILTER=0, which this file -- like the stack -- does
+      # not set). Override the path with E2B_SECCOMP_PROFILE when the profile
+      # does not sit next to this file.
+      - seccomp=${E2B_SECCOMP_PROFILE:-../seccomp/sandlock-worker.json}
 
   worker-3:
     build:
@@ -273,13 +301,17 @@ services:
       # the wildcard `:53` bind succeeded (`docker exec <worker> cat
       # /proc/sys/net/ipv4/ip_unprivileged_port_start` = 0; forcing the window
       # shut reproduces N36's `bind DNS gateway: Permission denied (os error
-      # 13)`). What wildcard rules really need here is `E2B_ENABLE_NETWORK`,
-      # which this file does not declare: without it the policy never reaches
+      # 13)`). What wildcard rules really need here is `E2B_ENABLE_NETWORK`, and
+      # this file did not declare it: without the key the policy never reaches
       # the fork, no gateway is created and the sandbox resolves against the
       # image's own resolver (N42's shape). Declaring it is an egress-posture
-      # change, so it is left to its own decision rather than smuggled in here.
+      # change, so it was left to its own decision; that decision landed
+      # 2026-09-26 ("network on everywhere", docs/open-issues.md N42), so the
+      # key now stands here with the fleet's value -- "on" still means a sandbox
+      # egresses only where its own request allows it.
       E2B_ENABLE_NET_ISOLATION: "true"
       E2B_FD_INJECT_CONNECT: "true"
+      E2B_ENABLE_NETWORK: "true"
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
@@ -289,7 +321,17 @@ services:
     # no low-port window is declared, and none is needed (as in
     # deploy/stack/docker-compose.prod.yml and deploy/compose/docker-compose.prod.yml).
     security_opt:
-      - seccomp=unconfined
+      # The stack's line, verbatim (deploy/stack/docker-compose.prod.yml:328):
+      # Docker's default filter plus the two syscalls the sandbox-create path
+      # needs (`pidfd_getfd` for the seccomp-notification fd, `unshare` for the
+      # user namespace). `seccomp=unconfined` used to stand here -- this file
+      # was the last place in the tree still on it -- and the worker refuses to
+      # serve unfiltered by default (`envd_service/config.py::check_seccomp_filter`:
+      # `Seccomp: 0` is SECCOMP_FILTER_MISSING, fatal unless
+      # E2B_REQUIRE_SECCOMP_FILTER=0, which this file -- like the stack -- does
+      # not set). Override the path with E2B_SECCOMP_PROFILE when the profile
+      # does not sit next to this file.
+      - seccomp=${E2B_SECCOMP_PROFILE:-../seccomp/sandlock-worker.json}
 
 volumes:
   control-data:
