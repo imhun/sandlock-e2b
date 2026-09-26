@@ -508,3 +508,36 @@ def test_a_live_session_is_read_from_the_executor_not_from_state(
     assert live_session_present(live) is True
     assert live_session_present(dead) is False
     assert live_session_present(None) is False
+
+
+def test_the_capture_log_names_the_program_it_captured(
+    tmp_path: Path, caplog
+) -> None:
+    """FUP-30 的教训落在日志上：抓到了谁要写在那一行里，而不是让读者去比内存大小。"""
+    base = tmp_path / "sandboxes"
+    _sandbox_tree(base, "sbx_named")
+    # 假执行器按给定的回复作答 ⇒ 它不写盘，`image_bytes` 因此是 0（日志里的两个 MiB 数
+    # 就是 0）；这一条要钉的是"名字"，不是尺寸。
+    executor = _FakeExecutor(
+        capture_reply={
+            "captured": True,
+            "reason": "",
+            "dir": str(checkpoint_image_dir(base, "sbx_named")),
+            "pid": 4242,
+            "fds": 3,
+            "exe": "/usr/bin/dash",
+            "argv": ["/bin/sh", "-c", "sh -c 'exec python3 -c pass'"],
+        }
+    )
+    with caplog.at_level("INFO", logger="envd_service.runtime.checkpoint_store"):
+        reply = capture_checkpoint_image(base, _ctx(executor), "sbx_named")
+
+    assert reply["exe"] == "/usr/bin/dash"
+    assert reply["argv"] == ["/bin/sh", "-c", "sh -c 'exec python3 -c pass'"]
+    # 整行相等（不做子串判据）：日志里点名 dash，读者一眼就知道"抓错对象"了
+    assert caplog.messages[-1] == (
+        "sandbox sbx_named: checkpoint image written to "
+        f"{checkpoint_image_dir(base, 'sbx_named')} (0 MiB, pid 4242, 3 fd(s), "
+        "captured /usr/bin/dash ['/bin/sh', '-c', \"sh -c 'exec python3 -c pass'\"]); "
+        "the platform account now holds 0 MiB of an unlimited budget"
+    )

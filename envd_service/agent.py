@@ -2934,11 +2934,13 @@ async def _checkpoint_before_pause(
         return
     if reply.get("captured"):
         logger.info(
-            "pause of sandbox %s wrote checkpoint %s (%s MiB, pid %s)",
+            "pause of sandbox %s wrote checkpoint %s (%s MiB, pid %s, captured %s %s)",
             sandbox_id,
             reply.get("image"),
             reply.get("imageMB"),
             reply.get("pid"),
+            reply.get("exe") or "<unknown>",
+            reply.get("argv") or [],
         )
     else:
         logger.info(

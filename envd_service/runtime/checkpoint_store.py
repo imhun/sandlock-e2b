@@ -265,13 +265,15 @@ def capture_checkpoint_image(
         )
 
     logger.info(
-        "sandbox %s: checkpoint image written to %s (%s MiB, pid %s, %s fd(s)); "
-        "the platform account now holds %d MiB of %s",
+        "sandbox %s: checkpoint image written to %s (%s MiB, pid %s, %s fd(s), "
+        "captured %s %s); the platform account now holds %d MiB of %s",
         sandbox_id,
         image,
         written // _MIB,
         outcome.get("pid"),
         outcome.get("fds"),
+        outcome.get("exe") or "<unknown>",
+        list(outcome.get("argv") or []),
         (used_before + written) // _MIB,
         "an unlimited budget" if limit <= 0 else f"{limit // _MIB} MiB",
     )
@@ -310,6 +312,10 @@ def _capture_reply(
     if capture:
         reply["pid"] = capture.get("pid")
         reply["fds"] = capture.get("fds")
+        # FUP-30: 谁被捕获了。空串 / 空表是真实答案（进程在捕获窗口里死了），
+        # 不是一个"没接线"的信号。
+        reply["exe"] = str(capture.get("exe") or "")
+        reply["argv"] = list(capture.get("argv") or [])
     return reply
 
 

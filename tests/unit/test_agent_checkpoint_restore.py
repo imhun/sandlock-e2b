@@ -56,6 +56,8 @@ class _RecordingExecutor:
             "name": name,
             "pid": 4242,
             "fds": 3,
+            "exe": "/usr/bin/python3",
+            "argv": ["python3", "-u", "/home/user/tick.py"],
         }
 
     def restore_checkpoint(self, dir: str) -> dict:
@@ -181,6 +183,9 @@ async def test_checkpoint_returns_the_image_and_the_platform_account(
         "platformDiskBudgetMB": 0,
         "pid": 4242,
         "fds": 3,
+        # FUP-30：pause 抓到的是 dash 还是 python，必须能从回复里看出来
+        "exe": "/usr/bin/python3",
+        "argv": ["python3", "-u", "/home/user/tick.py"],
     }
     assert executor.captures == [str(expected)]
     assert (expected / "parts.bin").is_file()

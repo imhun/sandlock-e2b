@@ -1323,7 +1323,7 @@ class SandlockExecutor(Executor):
             )
             return {"captured": False, "reason": str(exc)}
         outcome: dict = {"captured": True, "reason": ""}
-        for key in ("dir", "name", "pid", "fds"):
+        for key in ("dir", "name", "pid", "fds", "exe", "argv"):
             if key in reply:
                 outcome[key] = reply[key]
         return outcome
