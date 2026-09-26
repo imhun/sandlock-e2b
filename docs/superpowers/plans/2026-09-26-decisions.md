@@ -1,0 +1,67 @@
+# 2026-09-26 用户裁定（四条工作流的开工决策）
+
+用户对八个计划里"需人拍板"点的一次性裁定。**实现者开工前先读本文件**；
+引用计划时以本文件的裁定为准（计划正文写的是建议，这里是决定）。
+
+| # | 计划 | 要定的 | **裁定** |
+|---|---|---|---|
+| 1 | `2026-09-26-n27-state-base.md` | 独立挂载（要拷 GiB 级 checkpoint 镜像、逐文件校验）还是**同挂载 + 树根下沉** | **同挂载 + 树根下沉**：`<export>/workspaces/<id>` + `<export>/state/`。理由：`rename(2)` 的边界本来就是**挂载点**，任何第二个挂载都必然 EXDEV；下沉一级让迁移变成秒级 rename、可原路回退。**独立挂载那版（含 `move_entry` 的 EXDEV 兜底）不写** |
+| 2 | 同上 | 迁移窗口：worker 缩到 0（现有沙箱全部消失、数据保留） | **接受**。排到维护窗口执行 |
+| 3 | `2026-09-26-n30-disk-accounting.md` | 确认存量口径；条目（inode）维度是否升格为对外可配的配额项 | 见下节《N30 口径确认》 |
+| 4 | `2026-09-26-o2-ingress-tls.md` | 是否翻 N29④ 的"不改入口"；443 vs 3000 | **暂时不做** —— O2 整条**本轮搁置**，计划保留不执行。触发：入口侧真的出现 504/性能问题，或拿到入口主机控制台 |
+| 5 | `2026-09-26-o3-credential-rotation.md` | redis 口令：ACL 双用户热轮换，还是接受 10–30 s 中断 | **接受中断**（不做 ACL 双用户）。计划里"ACL 双用户"那版降级为备选，主路径按"接受中断"写；轮换窗口要把这 10–30 s 写进操作步骤与影响面 |
+| 6 | `2026-09-26-checkpoint-restore-productization.md` | 恢复后要不要支持 `exec`；生产形态是否必须支持 | **要支持**，生产形态**必须**支持。**且这不是待做项——已经支持了**，见下节《D9 已关闭》 |
+| 7 | `2026-09-26-pure-shape-synthetic-rootfs.md` | 骨架落点：共享骨架 vs 每沙箱一份 | **每沙箱一份**（`<base>/_pure_rootfs/<id>`，含拆箱清理）。理由：共享骨架会让卷的虚拟路径 stub **跨沙箱累积**，等于给别的租户一个存在性 oracle——那正是 N15 关掉的那类 |
+| 8 | `2026-09-26-netns-shape-unification.md` | 回滚语义：三处成对设 `false` 回共享 netns 时，wildcard `allowOut` **需要把低端口窗口加回来** | **接受**这个回滚代价，并在文档里写实（不承诺"不编辑文件即可干净回滚"） |
+
+## N30 口径确认（第 3 条问的就是这个）
+
+**要你确认的那句话是**：`diskMB` 采用**存量（位置边界）口径** ——
+"这棵沙箱树**当前**占用的字节（文件按 `st_size`、目录按分配块 `st_blocks×512`）"，
+**删除即归还**；上限由三处一起保证：中介在 `open` 时按剩余额度发放单文件上限、
+`unlink`/删除**当场归还**、`O_CREAT`/`mkdir`/`symlink`/`link` 超预算返回 `ENOSPC`，
+另有 per-exec `RLIMIT_FSIZE` 作内核级兜底。
+
+**同时否决**"峰值口径"（写多少算多少、**删了不退**）：它唯一的卖点是"内核级 ENOSPC、
+不经过中介"，而代价不可逆 —— 本集群 NFS **不支持打洞**（`fallocate -p` unsupported，
+`fstrim` 报 973 MiB 而 `du` 不降），于是镜像占用 = **高水位**，"写满一次"会把沙箱
+**永久**降级成只读，唯一恢复路径是销毁重建；另外还要付 privileged/`SYS_ADMIN`、
+`/dev/loop` 或 NBD、宿主 `modprobe nbd`、每节点守护进程、以及"工作区不再是目录"
+（GC/快照/模板/迁移/CP 读树全部跟着改）。
+
+**因此 qcow2-over-NBD（L3）不作为计划项。** 触发条件（满足任一即回到这条）：
+① 出现真实使用者要求**写路径上**的字节级 ENOSPC；② 存储换成支持打洞或支持目录配额的文件系统。
+
+**条目（inode）维度**：按**已有旋钮** `E2B_DISK_MAX_ENTRIES`（代码默认 0，k8s 取 500000）
+写进口径即可，**本期不新增机制、不升格为对外可配项**。
+（计划原文建议新增 `E2B_MAX_ENTRIES_PER_SANDBOX`，作废——那个旋钮已经存在。）
+
+## D9 已关闭（第 6 条的依据）
+
+用户问"fork 应该已经支持了吧"——**对，已经支持了**，D9 在 2026-09-25 就关闭了。
+分工在于引擎有**两条**恢复路径：
+
+- **OCI / `--restore-from`**（`crates/sandlock-oci/src/supervisor.rs:1386`、
+  `crates/sandlock-supervise/src/serve.rs:1481`）：按名拒绝 `exec`，
+  因为 exec 靠 `sandlock-init` 转发，而"从镜像起一个 generation"没有 init。
+- **恢复进会话**（`crates/sandlock-core/src/instance.rs:1205-1211`）：
+  *"Restoring **into** a session keeps `exec`, `wait_child`, `kill_child` and the child
+  table working, which is what a long-lived sandbox needs after a resume."*
+
+**E2B 走的是后者**：`envd_service/route_b.py::restore_checkpoint` 的 docstring 写明
+"resume the image in `dir` **into its own session**… a **session** is what serves `exec`"。
+验收两处都过：fork `test_a_child_restored_into_a_session_keeps_the_session_executable`
+（进程在跑 / **恢复后仍能 exec** / `children_live` 算上它，`core_lib` 911/0），
+集群 §6(g)（重启 worker pod → resume → **进程状态还在、还能 exec**）。
+
+⇒ 所以 checkpoint/restore 的产品化**没有"恢复后不能 exec"这道拦路虎**。
+`docs/checkpoint-restore-e2b-half.md` §0/§(d) 的原文按"不能 exec"写、误导过一轮排查，
+已就地更正。计划（`2026-09-26-checkpoint-restore-productization.md`）里把 D9 当
+第一道题的那部分**需要按本条重写**，剩余的真实问题是：
+
+- **restore stub 与 chroot/真根不兼容**（fork `43cc62a` 改成"立即拒绝并写明出路"）：
+  restore stub 按**宿主路径** exec，而生产形态是 image-rootfs + `E2B_REAL_ROOT=1`
+  ⇒ **这道才是生产能不能用的第一道题**，要在计划里升为 Task 1。
+- pause 抓的是会话里那个活子进程（对外语义）。
+- API/SDK 可见性、配额与磁盘账（blob 与 `_runtime`）、生命周期（TTL/驱逐与 paused）、
+  可观测性、文档。

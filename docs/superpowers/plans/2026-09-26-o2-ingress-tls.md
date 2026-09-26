@@ -1,5 +1,11 @@
 # O2 入口 TLS / 代理层收口实施计划
 
+> **⚠️ 本轮搁置（2026-09-26 用户裁定）**：本计划**不执行**，原文保留备用。
+> 这一条本质是翻 N29④ 早已定下的"不改入口、靠异步绕过"，用户裁定"暂时不做"。
+> **触发条件**（满足任一即回来执行）：① 入口侧真的出现同步路径/长请求撞 504；
+> ② 拿到入口主机的 SSH 或控制台入口（目前只有 VIP）。裁定记录见
+> `docs/superpowers/plans/2026-09-26-decisions.md`。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把"API key 与沙箱数据经公网代理明文传输"（`docs/security-hardening.md:153-157`，P0）在**部署侧**收口：先给出一个可在维护窗口执行的入口 TLS 方案（谁签证书、放哪、怎么验、怎么回滚），再给一个可选的"集群内控制面 TLS"第二窗口方案；并把**只能由人或外部系统完成**的步骤单列成清单。

@@ -23,10 +23,11 @@ checkpoint/restore 补的正是这一段：**把一个正在跑的沙箱写进�
 **所以这个能力的产品形状是：`pause` 变得能在 worker 重启后存活。**
 （不是新造一个用户可见的动词；E2B SDK 的 `pause()`/`connect()` 已经有位置放它。）
 
-**但"存活"有个上限，是引擎给的（§1(d)）**：恢复出来的沙箱里**原有那个进程**回来了，
-而**新的 exec 不被服务**（OCI 的恢复路径按名拒绝，因为 exec 靠 `sandlock-init`，
-恢复出的沙箱没有 init）。所以对"长驻服务要继续服务"够用，对"继续在这个箱子里干活"不够 ——
-这是 §2 的 D9，需要先拍。
+**而"存活"的形状由"恢复进哪条路"决定（§1(d)）**：恢复出来的沙箱里**原有那个进程**回来了；
+能不能**继续 exec** 取决于是把镜像恢复**进会话**（E2B 走这条 ⇒ 能，fork `1f41f1a`）
+还是走 OCI 的 `--restore-from`（按名拒绝 ⇒ 不能）。E2B 用的是前者，
+所以"pause 活过 worker 重启"换来的是一个**进程还在、且还能继续往里敲命令**的沙箱。
+（本段 2026-09-26 更正：原文按"不能 exec"写，那只描述 OCI 那条 E2B 不使用的路。）
 
 > ⚠ 需求本身仍未确认：仓库里没有任何"用户要这个"的记录，`envd` 至今没碰过这套 API。
 > 本设计按"`pause` 存活"这个最有说服力的形状写；如果最后没人要，停在这里的代价也只是这份文档。
@@ -94,30 +95,48 @@ socket / pipe / memfd 恢复不了（引擎固有边界，与架构无关）。�
 `test_restore.rs` 断言"只有 stdio"），所以 E2B 侧要做的是**把它作为恢复结果的一部分**
 返回/记录，并在文档里说清"恢复的沙箱没有原有的网络连接"。
 
-### (d) 恢复出来的沙箱**不能 exec** —— 这是引擎的语义，不是缺口
+### (d) 恢复出来的沙箱能不能 exec —— **分两条路，E2B 走的是能 exec 的那条**
 
-S1 的 `checkpoint` verb 落地后去查 restore 那一半，撞到引擎自己写死的一句话。
-OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs` 的 `serve_one_running`）
-对 `Exec` 的回答是：
+> **2026-09-26 更正**：本节原文按"不能 exec"写（只说 OCI 那条路），下面补上另一条路。
+> 结论以本节末的更正为准；§0 的对应句与 §2 的 D9 行也已同步。
+
+OCI 的恢复路径（`crates/sandlock-oci/src/supervisor.rs:1386` 的 `serve_one_running`）
+对 `Exec` 的回答确实是：
 
     exec is not supported on a restored container
 
-旁边的理由是：**exec 靠 `sandlock-init` 转发**，而恢复出来的沙箱里**没有 init** ——
-`restore_interactive` 起的是一个"被还原的进程"，不是 `sandlock-init`
-（对照 create 路径：它 `spawn` 出 init，再由 init 服务 exec）。
+理由是：**exec 靠 `sandlock-init` 转发**，而 `restore_interactive` 起的是一个"被还原的进程"，
+不是 `sandlock-init`（对照 create 路径：它 `spawn` 出 init，再由 init 服务 exec）。
+`crates/sandlock-supervise/src/serve.rs:1481` 对"从镜像起一个 generation"
+（`--restore-from`）也是同一句拒绝。
 
-**这条改变的是产品含义，不是实现细节**：
+**但引擎另有一条路，而且 E2B 用的就是它 —— 恢复\*进会话\*。**
+`crates/sandlock-core/src/instance.rs:1205-1211` 写得直白：
+*"exec is served by init, so a resumed process that hangs off the supervisor can never be
+exec'd into again (OCI's restore path refuses exactly that case)…
 
-| | 今天（SIGSTOP 冻结） | 恢复之后 |
-|---|---|---|
-| 原来那个进程 | 活着 | **活着**（内存状态回来了） |
-| 能不能 exec 新命令 | 能 | **不能**（引擎按名拒绝） |
+**Restoring \*into\* a session keeps `exec`**, `wait_child`, `kill_child` and the child table
+working, which is what a long-lived sandbox needs after a resume."*
 
-所以"pause 活过 worker 重启"换来的不是一个**完好如初**的沙箱，而是一个
-**进程还在、但不能再往里敲命令**的沙箱。对"跑着长驻服务、要它继续服务"的形状这够了
-（服务照旧）；对"我要继续在这个箱子里干活"的形状，**不够**。
+E2B 侧正是这个形状：`envd_service/route_b.py::restore_checkpoint` 的 docstring ——
+"Ask the slot to resume the image in ``dir`` **into its own session**. …
+It matters because a **session** is what serves ``exec`` —— a resume that produced the
+supervisor's own child could never be exec'd into again"。也就是"worker 租一个槽位，
+**再**告诉它要恢复什么"，而不是"每个镜像起一个槽位"。
 
-于是 E2B 侧必须先回答一个产品问题（§2 D9），而不是先写代码。
+| | 今天（SIGSTOP 冻结） | 恢复之后（**进会话**，E2B 走这条） | 恢复之后（OCI `--restore-from`） |
+|---|---|---|---|
+| 原来那个进程 | 活着 | **活着**（内存状态回来了） | 活着 |
+| 能不能 exec 新命令 | 能 | **能**（fork `1f41f1a` 起） | **不能**（引擎按名拒绝） |
+
+验收（两处都过，不是推演）：fork 用例
+`test_a_child_restored_into_a_session_keeps_the_session_executable` 三条断言
+（进程在跑、**恢复后仍能 exec**、`children_live` 算上它），`core_lib` 911/0；
+集群侧见 §6(g) —— **重启 worker 的 pod → resume → 进程状态还在、且还能 exec**。
+
+所以 §2 的 D9（"恢复后 exec 不可用"）**不是待决的产品问题**：它在 2026-09-25 就由
+fork `1f41f1a` 关闭了。OCI 那句拒绝描述的是**另一条 E2B 不使用的路**。
+
 
 ### (e) **根因（已定位并已修，2026-09-25）**：加载器写进"只读页"的运行时值，在恢复时丢了
 
