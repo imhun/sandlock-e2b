@@ -1,0 +1,8 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part symlinks] /usr: real directory
+[part symlinks] /bin: symlink -> usr/bin (resolved /usr/bin)
+[part symlinks] /sbin: symlink -> usr/sbin (resolved /usr/sbin)
+[part symlinks] /lib: symlink -> usr/lib (resolved /usr/lib)
+[part symlinks] /lib64: symlink -> usr/lib64 (resolved /usr/lib64)
+[part symlinks] /opt: real directory
+[part symlinks] verdict: PASS (this table is the input for the bind list)

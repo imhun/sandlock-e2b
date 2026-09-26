@@ -1,0 +1,18 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part b2] unshare(CLONE_NEWUSER): ok
+[part b2] unshare(CLONE_NEWNS): ok
+[part b2] mount(/ private): ok
+[part b2] bind /usr -> /workspace/tmp/k0s/scratch/synth-root/usr: ok
+[part b2] bind /bin -> /workspace/tmp/k0s/scratch/synth-root/bin: ok
+[part b2] bind /sbin -> /workspace/tmp/k0s/scratch/synth-root/sbin: ok
+[part b2] bind /lib -> /workspace/tmp/k0s/scratch/synth-root/lib: ok
+[part b2] bind /lib64 -> /workspace/tmp/k0s/scratch/synth-root/lib64: ok
+[part b2] bind /opt -> /workspace/tmp/k0s/scratch/synth-root/opt: ok
+[part b2] bind /dev -> /workspace/tmp/k0s/scratch/synth-root/dev: ok
+[part b2] self-bind /workspace/tmp/k0s/scratch/synth-root: ok
+[part b2] pivot_root('.', '.'): ok
+[part b2] umount2('.', MNT_DETACH): ok
+[part b2] bound system dirs: 6
+[part b2] host-only /workspace/AGENTS.md: hidden
+[part b2] exec /bin/sh: ok
+[part b2] verdict: PASS (plain directory + bind + pivot_root works in the pinned shape)

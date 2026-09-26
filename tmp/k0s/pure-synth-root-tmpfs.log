@@ -1,0 +1,6 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part tmpfs] unshare(CLONE_NEWUSER): ok
+[part tmpfs] unshare(CLONE_NEWNS): ok
+[part tmpfs] mount(/ private): ok
+[part tmpfs] mount(tmpfs): FAILED errno=1 (Operation not permitted)
+[part tmpfs] verdict: PASS-NEGATIVE (tmpfs unavailable; plain directory + bind is the route)

@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "/Users/polus/project/ai/sandlock-e2b/tmp/k0s/probe-pure-synth-root-plaindir.py", line 30, in <module>
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+  File "/usr/local/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/ctypes/__init__.py", line 433, in __init__
+    self._handle = self._load_library(name, mode, handle, winmode)
+                   ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/ctypes/__init__.py", line 475, in _load_library
+    return _dlopen(name, mode)
+OSError: dlopen(libc.so.6, 0x0006): tried: 'libc.so.6' (no such file), '/System/Volumes/Preboot/Cryptexes/OSlibc.so.6' (no such file), '/usr/local/lib/libc.so.6' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/usr/local/lib/libc.so.6' (no such file), '/usr/local/lib/libc.so.6' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/usr/local/lib/libc.so.6' (no such file), '/usr/lib/libc.so.6' (no such file, not in dyld cache), 'libc.so.6' (no such file)

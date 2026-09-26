@@ -1,0 +1,24 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+machine=x86_64 uid=0 CapEff=00000000000004c3
+1) 照抄 b2 的顺序（只有 CLONE_NEWNS）
+  unshare(CLONE_NEWNS): FAILED errno=1 (Operation not permitted)
+2) 生产沙箱的顺序（先 CLONE_NEWUSER，再由它拥有 mount ns）—— 完整照 b2 装配
+  unshare(CLONE_NEWUSER): ok
+  after NEWUSER: uid=65534 CapEff=000001ffffffffff
+  unshare(CLONE_NEWNS): ok
+  mount(/ MS_REC|MS_PRIVATE): ok
+  bind /usr -> /workspace/tmp/k0s/scratch/userns-check-root/usr: ok
+  bind /bin -> /workspace/tmp/k0s/scratch/userns-check-root/bin: ok
+  bind /sbin -> /workspace/tmp/k0s/scratch/userns-check-root/sbin: ok
+  bind /lib -> /workspace/tmp/k0s/scratch/userns-check-root/lib: ok
+  bind /lib64 -> /workspace/tmp/k0s/scratch/userns-check-root/lib64: ok
+  bind /opt -> /workspace/tmp/k0s/scratch/userns-check-root/opt: ok
+  bind /dev -> /workspace/tmp/k0s/scratch/userns-check-root/dev: ok
+  self-bind root: ok
+  pivot_root('.', '.'): ok
+  umount2('.', MNT_DETACH): ok
+  bound system dirs: 6
+  after pivot: new root (dev, ino) = (35, 12784647)
+  host-only /src visible: False
+  exec /bin/sh: True
+  verdict: PASS (同样的形状，只补上生产沙箱本来就有的 CLONE_NEWUSER)

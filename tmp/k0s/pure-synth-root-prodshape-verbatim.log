@@ -1,0 +1,2 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part b2] unshare(CLONE_NEWNS): FAILED errno=1 (Operation not permitted)

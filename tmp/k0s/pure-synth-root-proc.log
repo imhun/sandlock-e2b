@@ -1,0 +1,9 @@
+test-runner: no /dev/loop-control: XFS gates unavailable
+[part proc] unshare(CLONE_NEWUSER): ok
+[part proc] unshare(CLONE_NEWNS): ok
+[part proc] mount(/ private): ok
+[part proc] self-bind /workspace/tmp/k0s/scratch/synth-root-proc: ok
+[part proc] pivot_root('.', '.'): ok
+[part proc] umount2('.', MNT_DETACH): ok
+[part proc] stat /proc: ENOENT
+[part proc] listdir /proc: ENOTDIR/ENOENT

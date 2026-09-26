@@ -1,0 +1,7 @@
+	linux-vdso.so.1 (0x00007f1247330000)
+	libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f124710e000)
+	/lib64/ld-linux-x86-64.so.2 (0x00007f1247332000)
+--- /lib64 ---
+lrwxrwxrwx 1 root root 9 Jul  4 09:05 /lib64 -> usr/lib64
+--- /bin/sh ---
+lrwxrwxrwx 1 root root 4 Feb  4  2025 /bin/sh -> dash

@@ -1,0 +1,4 @@
+unshare: write failed /proc/self/uid_map: Operation not permitted
+unshare -Ur rc=1
+uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup)
+map= 0 0 4294967295
