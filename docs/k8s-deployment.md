@@ -249,6 +249,72 @@ kubectl -n sandlock exec deploy/control-plane -- sh -c \
 CP 副本多于一个时，先让所有副本都滚到带主 key 的版本再跑 —— 否则另一个仍在降级态的进程
 按新写入会在下一次写时重新落明文。
 
+### 4.6 凭据轮换 runbook：主 key `E2B_SECRET_MASTER_KEY`（O3 Task 2）
+
+主 key 与 §4.5 那两个凭据**不是一类**：它是加密**其它所有** secret 的那把 key
+（落盘 `<workspace_base>/_secrets/**` 与 redis 镜像 `e2b:secret:*`）。摘掉一把还有记录
+在用的旧主 key，不是"某个客户端 401"，而是**那些记录永久解不开** —— 密文里那句
+`encrypted: true` 还在，值没了，脚本也从没打印过旧 key 的值。所以它是**三拍**，而且
+"中间那一拍做没做到"必须能被证明：
+
+| 拍 | 命令 | 写什么 | 影响面 | 不可逆点 |
+|---|---|---|---|---|
+| 1 rotate | `deploy/k8s-k0s/rotate-secret-master.sh rotate` | `E2B_SECRET_MASTER_KEY` = 新主 key；被换下来的旧值**追加**进 `E2B_SECRET_MASTER_KEYS`；随后 `rollout restart` CP | 无（窗口里新旧都认；滚动是逐 pod 的） | — |
+| 2 全副本滚动 | rotate 里已发起；也可单独 `kubectl -n sandlock rollout restart deploy/control-plane` | 不写 Secret | CP 无感 | — |
+| 3 finalize | `rotate-secret-master.sh finalize sha256:<旧主 key 指纹>` | 从 `E2B_SECRET_MASTER_KEYS` 摘掉旧 key | 旧 key 立即失效 | **finalize** |
+
+算法与 compose 侧 `deploy/scripts/upgrade.sh:171-220` 的 `--rotate-secret-master-key` /
+`--finalize-secret-master-key-rotation` 是**同一套语义**（连两条守卫的句子都一样），只换介质：
+compose 写 `.env`，k0s 写 `sandlock/e2b-secrets`。读方只有 control-plane 一个
+（`control_plane/config.py::secret_master_key / secret_master_keys` ⇒
+`SecretRegistry(master_key=…, legacy_master_keys=…)`），而且这两个键是 `secretKeyRef`
+⇒ **新主 key 只有 CP 重启才生效**；"重新加密"发生在 CP 启动时的 `_scan_disk()` /
+`_scan_redis()`：用旧 key 解开的记录被主 key 就地重写
+（`control_plane/registry/secrets.py::_record_from_payload`）。
+
+**"全副本已滚动"怎么证明**：`finalize` 跑之前会自己跑三批判据（`status` 只读地打同一批），
+任一不过就**拒跑**、Secret 一个字不动：
+
+1. **没有旧副本在跑**：读 `kubectl -n sandlock get deploy control-plane -o json`，比
+   `status.observedGeneration == metadata.generation`、
+   `status.updatedReplicas == status.replicas == spec.replicas == status.availableReplicas`、
+   `status.unavailableReplicas == 0` —— 也就是"没有任何 pod 来自上一版 ReplicaSet"。
+2. **每个 running 副本进程拿的就是当前主 key**：对每个 pod 跑
+   `kubectl -n sandlock exec <pod> -c control-plane -- printenv E2B_SECRET_MASTER_KEY`
+   （`secretKeyRef` 由 kubelet 在**容器创建时**解析，所以这是这个进程此刻真正持有的值），
+   比 `sha256(前16)`：全部等于 Secret 当前 `E2B_SECRET_MASTER_KEY` 的指纹，且副本数等于
+   `spec.replicas`。
+3. **at-rest 上没有还要旧 key 才能解开的记录**：在 CP pod 里（`python3 -`，与
+   `deploy/scripts/cleanup-plaintext-secrets.py` 同一投递方式）用**该 pod 的主 key** 扫
+   `<_secrets>/**` 与每一条 `e2b:secret:*`：每一条都必须 `encrypted: true` 且**主 key 单独
+   就能解开**（crypto 用 registry 自己的 `_fernet`，不另写一份）。
+
+**判据 3 单独看不够**：如果副本还没滚，pod 里那把 key 还是**旧**的，"所有记录都能用（旧）
+key 解开"照样成立，而 Secret 已经指向新 key —— 下次重启就全解不开。所以三条必须一起过。
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+
+# ① 第 1+2 拍：新主 key 进单值槽、旧主 key 进并存列表，然后滚 CP 并等它滚完
+#    （脚本只打 sha256(前16) 与长度；窗口列表成员的指纹就是 finalize 的地址）
+deploy/k8s-k0s/rotate-secret-master.sh rotate
+
+# ② 窗口期：既有 secret 应当照常可读（两 key 并存窗口成立）
+tmp/testenv/bin/python -m pytest tests/contract/test_secrets.py -q
+
+# ③ 只读地验判据（不改任何东西）—— 过了才允许摘
+deploy/k8s-k0s/rotate-secret-master.sh status
+
+# ④ 第 3 拍（不可逆）：从并存列表摘掉旧主 key
+deploy/k8s-k0s/rotate-secret-master.sh finalize sha256:<rotate 打出来的旧主 key 指纹>
+```
+
+回滚：finalize 之前 = 不做（旧 key 还在列表里，记录照常可读；要收回这次 rotate 只能
+再轮一次）。finalize 之后**不可恢复** —— 被摘掉的 key 值已不在 Secret 里，脚本从未打印过它，
+唯一的路是"再轮换一次"。finalize 之后再滚一次 CP 是可选的收尾（让旧 key 从副本内存里也消失；
+密文已经不依赖它）。**凭据明文绝不出现**：脚本只打 `sha256(前16)` 与长度，finalize 的地址
+优先用指纹（也可以用值本身，那是 upgrade.sh 的形状，但值会进 shell 历史）。
+
 ---
 
 ## 5. 把 k8s 切到与 compose 相同的形态（✅ 2026-09-17 已落地：N5 / N10）

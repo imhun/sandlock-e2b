@@ -58,7 +58,7 @@ KUBECONFIG=... deploy/k8s-k0s/apply.sh
 |---|---|---|
 | `E2B_REDIS_PASSWORD` | **10–30 s 中断**：redis 带着新口令重启、到 control-plane / autoscaler 滚动完拿到新口令之间，共享后端（配额/节点视图/限流/单飞）不可用 ⇒ 建箱与路由失败。沙箱本身不经过 redis，不受影响 | 2026-09-26 裁定**接受**这段中断，不做 ACL 双用户热轮换（`docs/superpowers/plans/2026-09-26-decisions.md` 第 5 条）。redis 是 `appendonly yes` ⇒ 数据不丢。顺序：`secrets.sh --rotate E2B_REDIS_PASSWORD` → `rollout restart deploy/redis` → `rollout restart deploy/control-plane deploy/autoscaler` |
 | `E2B_API_KEYS` / `E2B_INTERNAL_API_KEY` | **双窗轮换**：新 key 与旧 key 并存 → 滚动 → finalize 摘旧 key，中间不断服。唯一掉东西的一步是 internal key 的 worker 滚动 = **杀光全部 running 沙箱**（树与卷数据保留） | `secrets.sh --rotate-api-keys` / `--rotate-internal-key`，完事用 `--finalize-api-key-rotation` / `--finalize-internal-key-rotation <旧 key 或它的 sha256 前 16 位>` 收口；两张表的 runbook 见 `docs/k8s-deployment.md` §4.5。⚠ `--rotate E2B_API_KEYS` / `--rotate E2B_INTERNAL_API_KEY` 仍是**单槽换值**（旧 key 立刻失效），要窗口别用它 |
-| `E2B_SECRET_MASTER_KEY` | 脚本**拒绝**就地轮换：旧 key 必须先留在 `E2B_SECRET_MASTER_KEYS`，否则既有 `_secrets/**` 与 redis `e2b:secret:*` 的密文永远解不开 | 两窗三拍（rotate → 滚 CP → finalize）由 `deploy/k8s-k0s/rotate-secret-master.sh` 承担 |
+| `E2B_SECRET_MASTER_KEY` | 脚本**拒绝**就地轮换：旧 key 必须先留在 `E2B_SECRET_MASTER_KEYS`，否则既有 `_secrets/**` 与 redis `e2b:secret:*` 的密文永远解不开 | 两窗三拍（rotate → 滚 CP → finalize）由 `deploy/k8s-k0s/rotate-secret-master.sh` 承担；"全副本已滚动"的三条判据与 runbook 见 `docs/k8s-deployment.md` §4.6 |
 
 只读核对（不改任何东西，也不回显明文）：
 
