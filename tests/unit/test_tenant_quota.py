@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 fakeredis = pytest.importorskip("fakeredis")
 
 from control_plane.config import Settings
 from control_plane.registry.manager import ResourceUnavailableError, SandboxRegistry
+from gateway_common.timeutil import utcnow
 
 
 def _settings(**overrides) -> Settings:
@@ -146,3 +149,84 @@ def test_tenant_usage_aggregation(workspace):
         "t2": {"sandboxes": 1, "memoryMB": 512, "cpuPercent": 100, "diskMB": 1024, "processes": 64},
         None: {"sandboxes": 1, "memoryMB": 512, "cpuPercent": 100, "diskMB": 1024, "processes": 64},
     }
+
+
+# -- N30: the tenant ledger's disk row ------------------------------------
+#
+# The tenant ledger is the second copy of the same sale (``_tenant_dims``
+# beside ``_global_dims``), and it is written only for tenants that configured
+# a limit -- which is exactly why a release can forget it while the global row
+# still looks right. ``tenant_usage`` is a different question (it counts every
+# record, parked ones included); these cases are about the reservation rows.
+
+
+def _live_tenant_disk_mb(registry, tenant_id: str) -> int:
+    return sum(
+        r.disk_size_mb
+        for r in registry.list()
+        if r.tenant_id == tenant_id and not r.quota_released
+    )
+
+
+def test_the_tenant_disk_row_is_the_sum_of_its_live_records(make_record):
+    registry = SandboxRegistry(
+        _settings(
+            tenant_limits={
+                "t1": {"max_total_disk_mb": 4096},
+                "t2": {"max_total_disk_mb": 4096},
+            }
+        )
+    )
+    make_record(registry, disk_size_mb=64, tenant_id="t1")
+    make_record(registry, disk_size_mb=128, tenant_id="t1")
+    make_record(registry, disk_size_mb=1024, tenant_id="t2")
+
+    assert registry._tenant_reserved["t1"]["disk"] == 192
+    assert registry._tenant_reserved["t1"]["disk"] == _live_tenant_disk_mb(
+        registry, "t1"
+    )
+    # The other tenant's row is its own: nothing about t1's rows may move it.
+    assert registry._tenant_reserved["t2"]["disk"] == 1024
+
+
+def test_pause_and_the_delete_after_it_return_the_tenant_disk_row_once(make_record):
+    registry = SandboxRegistry(
+        _settings(tenant_limits={"t1": {"max_total_disk_mb": 4096}})
+    )
+    parked = make_record(registry, disk_size_mb=64, tenant_id="t1")
+    other = make_record(registry, disk_size_mb=128, tenant_id="t1")
+    assert registry._tenant_reserved["t1"]["disk"] == 192
+
+    registry.pause(parked)
+    assert registry._tenant_reserved["t1"]["disk"] == 128
+    registry.delete(parked.sandbox_id)
+    # 128 rather than 64: the delete of a parked record releases nothing.
+    assert registry._tenant_reserved["t1"]["disk"] == 128
+
+    registry.delete(other.sandbox_id)
+    assert registry._tenant_reserved["t1"]["disk"] == 0
+
+
+def test_ttl_expiry_returns_the_tenant_disk_row_once(make_record):
+    registry = SandboxRegistry(
+        _settings(tenant_limits={"t1": {"max_total_disk_mb": 4096}})
+    )
+    record = make_record(registry, disk_size_mb=64, tenant_id="t1")
+    record.end_at = utcnow() - timedelta(seconds=10)
+
+    expired = registry.remove_expired()
+    assert [r.sandbox_id for r in expired] == [record.sandbox_id]
+    assert registry._tenant_reserved["t1"]["disk"] == 0
+    assert registry.release_quota(record) is False
+
+
+def test_the_tenant_disk_row_returns_to_zero_in_the_shared_store(make_record):
+    registry = SandboxRegistry(
+        _settings(tenant_limits={"t1": {"max_total_disk_mb": 4096}}),
+        redis_client=fakeredis.FakeRedis(),
+    )
+    record = make_record(registry, disk_size_mb=64, tenant_id="t1")
+    assert registry._quota_store.get("tenant:t1")["disk"] == 64
+
+    registry.delete(record.sandbox_id)
+    assert registry._quota_store.get("tenant:t1")["disk"] == 0

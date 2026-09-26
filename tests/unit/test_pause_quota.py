@@ -19,6 +19,7 @@ from control_plane.registry.manager import (
     ResourceUnavailableError,
     SandboxRegistry,
     SandboxStateConflictError,
+    workspace_disk_refusal,
 )
 from gateway_common.timeutil import utcnow
 
@@ -235,3 +236,163 @@ def test_shared_store_record_round_trips_quota_released(workspace):
     stored = registry._record_store.get("sbx_q")
     assert stored["quota_released"] is True
     assert registry.get("sbx_q").quota_released is True
+
+
+# -- N30: the disk row on the ledger --------------------------------------
+#
+# The disk dimension is the one the ledger's other rows cannot vouch for: the
+# pool it guards is the shared workspace, and the half a change moves is the
+# release -- "resume re-books" is easy to remember, while the pause that gives
+# the row back, the delete after a pause that must *not* give it back twice,
+# and the crossing that must not look like a release are what a later edit to
+# the pause/delete/TTL chain quietly breaks.
+
+
+def test_disk_reservation_is_exactly_the_sum_of_live_records(registry, make_record):
+    a = make_record(registry, disk_size_mb=64)
+    b = make_record(registry, disk_size_mb=128)
+    assert registry.global_reserved()["disk"] == 192
+    registry.release_quota(b)
+    assert registry.global_reserved()["disk"] == 64
+
+
+def test_every_path_that_frees_a_sandbox_releases_the_disk_row_exactly_once(
+    registry, make_record
+):
+    r = make_record(registry, disk_size_mb=64)
+    assert registry.release_quota(r) is True  # pause / delete / expiry share it
+    assert registry.release_quota(r) is False  # the second one is a no-op
+    assert registry.global_reserved()["disk"] == 0
+    assert registry.hold_quota(r) is True  # resume takes it back
+    assert registry.global_reserved()["disk"] == 64
+
+
+def test_an_over_budget_sandbox_keeps_its_reservation(registry, make_record):
+    r = make_record(registry, disk_size_mb=64)
+    registry.enforce_disk_budget({r.sandbox_id: 128 * 1024 * 1024})
+    assert registry.global_reserved()["disk"] == 64
+
+
+def test_pause_releases_the_disk_row_once_and_the_delete_after_it_is_a_no_op(
+    registry, make_record
+):
+    """A parked sandbox keeps its record, so its delete calls release again.
+
+    The second record is the instrument: with only the parked one booked the
+    ledger sits at 0 either way, and a clamped double release would hide
+    there. With ``other`` holding 128 MiB, a delete that subtracted the parked
+    record's 64 MiB a second time shows up as 0 instead of 128.
+    """
+    parked = make_record(registry, disk_size_mb=64)
+    other = make_record(registry, disk_size_mb=128)
+    registry.pause(parked)
+    assert registry.global_reserved()["disk"] == 128
+
+    registry.delete(parked.sandbox_id)
+    assert registry.global_reserved()["disk"] == 128
+    registry.delete(other.sandbox_id)
+    assert registry.global_reserved()["disk"] == 0
+
+
+def test_delete_releases_the_disk_row_once(registry, make_record):
+    record = make_record(registry, disk_size_mb=64)
+    registry.delete(record.sandbox_id)
+    assert registry.global_reserved()["disk"] == 0
+    # The record object survives the delete, so a caller that released it
+    # again (or a retry of the same delete) must still be a no-op.
+    assert registry.release_quota(record) is False
+
+
+def test_ttl_expiry_releases_the_disk_row_once(registry, make_record):
+    record = make_record(registry, disk_size_mb=64)
+    # A second record: the sweep of the first must not touch this one's row.
+    other = make_record(registry, disk_size_mb=128)
+    record.end_at = utcnow() - timedelta(seconds=10)
+
+    expired = registry.remove_expired()
+    assert [r.sandbox_id for r in expired] == [record.sandbox_id]
+    assert registry.global_reserved()["disk"] == 128
+    assert registry.release_quota(record) is False
+    assert registry.get(other.sandbox_id).quota_released is False
+
+
+def test_a_released_disk_budget_is_bookable_by_the_next_create():
+    """The row comes back *and* it was the thing standing in the way.
+
+    Bounded on purpose: on an unbounded pool "the next create took it" is true
+    even when nothing was returned, so the case first makes the 64 MiB ceiling
+    refuse the second create, and checks the refusal is the disk one.
+    """
+    registry = SandboxRegistry(
+        _settings(max_total_memory_mb=0, max_total_disk_mb=64, default_disk_mb=64)
+    )
+    first = _create(registry, sandbox_id="sbx_n30_first")
+    assert registry.global_reserved()["disk"] == 64
+
+    with pytest.raises(ResourceUnavailableError) as exc:
+        _create(registry, sandbox_id="sbx_n30_second")
+    assert str(exc.value) == workspace_disk_refusal(64, 64)
+
+    registry.release_quota(first)
+    assert registry.global_reserved()["disk"] == 0
+
+    second = _create(registry, sandbox_id="sbx_n30_second")
+    assert second.disk_size_mb == 64
+    assert registry.global_reserved()["disk"] == 64
+
+
+def test_shared_store_pause_then_delete_returns_the_disk_row_once(make_record):
+    """A parked record's delete must be a no-op on the shared ledger too.
+
+    Here the gate is the flag *in the store*: the delete re-reads the record,
+    so a release path that trusted the caller's in-memory copy instead would
+    subtract the parked sandbox's row a second time -- and on this backend
+    there is no clamp to hide it, the row goes negative.
+    """
+    registry = SandboxRegistry(_settings(), redis_client=fakeredis.FakeRedis())
+    parked = make_record(registry, disk_size_mb=64)
+    make_record(registry, disk_size_mb=128)
+    registry.pause(registry.get(parked.sandbox_id))
+    assert registry.global_reserved()["disk"] == 128
+
+    registry.delete(parked.sandbox_id)
+    assert registry.global_reserved()["disk"] == 128
+    assert registry.global_reserved()["disk"] == sum(
+        r.disk_size_mb for r in registry.list() if not r.quota_released
+    )
+
+
+def test_shared_store_disk_row_follows_the_live_records_and_returns_once(make_record):
+    """The same invariant on the ledger the replicas share.
+
+    The in-memory counters and the shared store are two implementations of one
+    contract; a release that only moved one of them would be invisible to a
+    single-replica case, and the store path is the one a fix forgets.
+
+    The case drives ``pause``/``resume``/``delete`` rather than calling
+    ``release_quota`` directly: on this backend the record's own row lives in
+    the store as well, and it is the paths (each of which saves the record)
+    that keep the two copies agreeing.
+    """
+    client = fakeredis.FakeRedis()
+    registry = SandboxRegistry(_settings(), redis_client=client)
+    make_record(registry, disk_size_mb=64)
+    b = make_record(registry, disk_size_mb=128)
+
+    def live_disk_mb() -> int:
+        return sum(r.disk_size_mb for r in registry.list() if not r.quota_released)
+
+    assert registry.global_reserved()["disk"] == 192
+    assert registry.global_reserved()["disk"] == live_disk_mb()
+
+    registry.pause(registry.get(b.sandbox_id))
+    assert registry.global_reserved()["disk"] == 64
+    assert registry.global_reserved()["disk"] == live_disk_mb()
+
+    registry.resume(registry.get(b.sandbox_id))
+    assert registry.global_reserved()["disk"] == 192
+    assert registry.global_reserved()["disk"] == live_disk_mb()
+
+    registry.delete(b.sandbox_id)
+    assert registry.global_reserved()["disk"] == 64
+    assert registry.global_reserved()["disk"] == live_disk_mb()
