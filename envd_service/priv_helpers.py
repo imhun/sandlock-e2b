@@ -194,6 +194,16 @@ def _read_broker_line(sock: socket.socket) -> str:
     return raw.split(b"\n", 1)[0].decode("utf-8", errors="replace")
 
 
+def _realpath(path: str) -> str:
+    """``realpath`` without requiring the path to exist (comparison only).
+
+    ``os.path.realpath`` is the non-strict counterpart of ``Path.resolve()``:
+    the trailing component may be missing, which is the normal case for a
+    whitelist root an initContainer has not created yet.
+    """
+    return os.path.realpath(path)
+
+
 # capability(7) numbers, as bit positions in a capability mask.
 CAP_CHOWN = 0
 CAP_DAC_OVERRIDE = 1
@@ -1126,57 +1136,25 @@ def resolve_priv_helpers(settings) -> PrivHelpers | None:
         return _resolve_socket_shape(settings, socket_path=socket_path)
     slot = DEFAULT_HELPER_DIR / SLOT_SPAWN_NAME
     maint = DEFAULT_HELPER_DIR / MAINT_NAME
-    slot_present = slot.exists()
-    maint_present = maint.exists()
-    if not slot_present and not maint_present:
+    # The exec branch's own entry condition: with no binary at all there is
+    # nothing this worker could exec, so it keeps today's in-process (E5.1)
+    # shape. Everything past this point -- including the "one binary missing"
+    # refusal -- is shared with the daemon shape by :func:`_build_helpers`.
+    if not slot.exists() and not maint.exists():
         return None
-    if slot_present != maint_present:
-        present = slot if slot_present else maint
-        missing = maint if slot_present else slot
-        raise PrivHelperError(
-            f"{missing} is missing while {present} is present: a partial "
-            "broker install must not be guessed at"
-        )
-    _require_unreachable(slot, maint)
-    _require_caps(slot, SLOT_SPAWN_CAPS)
-    _require_caps(maint, MAINT_CAPS)
-    _require_consistent_shape(settings)
-    check_worker_identity_outside_pool(
-        uid=os.geteuid(),
-        gid=os.getegid(),
-        start=int(getattr(settings, "uid_pool_start", 10000)),
-        size=int(getattr(settings, "uid_pool_size", 1000)),
-    )
-    helpers = PrivHelpers(
-        slot_spawn=slot,
-        maint=maint,
-        supervise_bin=_supervise_bin(),
-        uid_pool_start=int(getattr(settings, "uid_pool_start", 10000)),
-        uid_pool_size=int(getattr(settings, "uid_pool_size", 1000)),
-        workspace_base=Path(getattr(settings, "workspace_base")),
-        state_base=Path(
-            getattr(settings, "state_base", None)
-            or getattr(settings, "workspace_base")
-        ),
-        shared_volume_root=(
-            Path(settings.shared_volume_root)
-            if getattr(settings, "shared_volume_root", None)
-            else None
-        ),
-    )
-    _require_route_b_scratch_root(helpers, settings)
-    return helpers
+    return _build_helpers(settings, transport="exec")
 
 
 def _resolve_socket_shape(settings, *, socket_path: Path) -> PrivHelpers:
     """The c1 shape: a per-node root daemon performs the privileged steps.
 
-    Everything the worker checks about *itself* is the same self-check as the
-    exec shape -- the image still ships both binaries (decision 3), so their
-    reachability and file capabilities are still validated whenever they are
-    installed, and ``e2b-slot-spawn`` is still the worker's own. What is new
-    is that the broker, not this process, will act: its uid pool and its root
-    whitelist have to be this worker's, verbatim, or the shape is refused.
+    Only two things are specific to this branch: the socket has to be there,
+    and once the shape is built the daemon has to *agree* with it (its uid
+    pool and root whitelist are compared by :func:`_require_broker_agreement`).
+    The shape self-check itself is the shared one (see :func:`_build_helpers`)
+    -- the image still ships both binaries (decision 3), so their reachability
+    and file capabilities are still validated whenever they are installed,
+    and ``e2b-slot-spawn`` is still the worker's own.
 
     There is deliberately no fallback. ``E2B_PRIV_HELPER_TRANSPORT=socket`` is
     an operator saying "a broker is up on this node"; silently running the
@@ -1191,6 +1169,30 @@ def _resolve_socket_shape(settings, *, socket_path: Path) -> PrivHelpers:
             "the worker (an explicit socket shape must not silently fall back "
             "to the file-capability binaries)"
         )
+    helpers = _build_helpers(
+        settings, transport="socket", broker_socket=socket_path
+    )
+    _require_broker_agreement(helpers)
+    return helpers
+
+
+def _build_helpers(
+    settings, *, transport: str, broker_socket: Path | None = None
+) -> PrivHelpers:
+    """Build (and self-check) the broker shape: the one copy, both transports.
+
+    ``exec`` and ``socket`` differ in *who* performs a privileged step, not in
+    what the worker considers installed or managed. The partial-install rule,
+    the reachability/file-capability checks, the pool-plus-route-B shape, the
+    worker-identity guard, every field of the shape and the route-B scratch
+    root check are therefore asked here, once: a check the next change adds
+    cannot land in one transport and be forgotten in the other (socket is the
+    production path).
+
+    Transport-specific *entry* conditions stay in the callers -- there is
+    nothing to exec without the binaries, a daemon shape needs its socket --
+    and the socket caller adds the handshake on top.
+    """
     slot = DEFAULT_HELPER_DIR / SLOT_SPAWN_NAME
     maint = DEFAULT_HELPER_DIR / MAINT_NAME
     slot_present = slot.exists()
@@ -1203,6 +1205,9 @@ def _resolve_socket_shape(settings, *, socket_path: Path) -> PrivHelpers:
             "broker install must not be guessed at"
         )
     if slot_present:
+        # Present means the image shipped them, so they have to pass: mode
+        # 0710 root-owned (executable by the worker's group, not by a sandbox
+        # uid) with the file capability applied in the final image stage.
         _require_unreachable(slot, maint)
         _require_caps(slot, SLOT_SPAWN_CAPS)
         _require_caps(maint, MAINT_CAPS)
@@ -1229,11 +1234,10 @@ def _resolve_socket_shape(settings, *, socket_path: Path) -> PrivHelpers:
             if getattr(settings, "shared_volume_root", None)
             else None
         ),
-        transport="socket",
-        broker_socket=socket_path,
+        transport=transport,
+        broker_socket=broker_socket,
     )
     _require_route_b_scratch_root(helpers, settings)
-    _require_broker_agreement(helpers)
     return helpers
 
 
@@ -1247,6 +1251,16 @@ def _require_broker_agreement(helpers: PrivHelpers) -> None:
     -- ask it to touch a path this worker never meant to expose. Named at
     startup, never guessed at, which is also why the image cache root has to
     be configured on both sides of the socket.
+
+    The two lists are read from different places -- the worker from its
+    already-resolved ``Settings`` (its workspace base goes through
+    ``Path.resolve()``), the daemon verbatim from its own environment (the C
+    side takes ``getenv`` as-is, Task 1) -- so the *same* directory may be
+    spelled two ways: an NFS export reached through a symlink, a trailing
+    slash, a relative spelling. The comparison therefore normalizes both
+    sides with ``realpath`` (non-strict, like ``Path.resolve()``) while the
+    refusal keeps printing each side's own strings, which is the pair an
+    operator has to reconcile.
     """
     response = helpers.hello()
     if not response.get("ok"):
@@ -1264,10 +1278,11 @@ def _require_broker_agreement(helpers: PrivHelpers) -> None:
             "socket"
         )
     roots = response.get("roots")
-    if isinstance(roots, list):
-        roots = [str(root) for root in roots]
+    roots = [str(root) for root in roots] if isinstance(roots, list) else None
     expected_roots = [str(path) for path in helpers._root_paths()]
-    if roots != expected_roots:
+    if roots is None or [_realpath(root) for root in roots] != [
+        _realpath(root) for root in expected_roots
+    ]:
         raise PrivHelperError(
             f"the maintenance broker at {helpers.broker_socket} holds roots "
             f"{roots}, this worker holds {expected_roots}: "

@@ -398,6 +398,195 @@ def test_a_matching_daemon_resolves_over_the_socket(
     assert daemon.requests == [{"v": 1, "hello": True}]
 
 
+def _symlinked_layout(tmp_path: Path) -> tuple[Path, Path]:
+    """``<tmp>/real`` with ``<tmp>/link`` pointing at it (two spellings)."""
+    real = tmp_path / "real"
+    (real / "sandboxes").mkdir(parents=True, exist_ok=True)
+    (real / "shared").mkdir(exist_ok=True)
+    link = tmp_path / "link"
+    if not link.exists():
+        link.symlink_to(real, target_is_directory=True)
+    return real, link
+
+
+def test_both_transports_build_through_the_same_shape_self_check(
+    tmp_path: Path, monkeypatch, fake_daemon
+) -> None:
+    """One shape self-check, two transports -- the drift guard for the split.
+
+    ``exec`` and ``socket`` differ in *who* performs a privileged step, not in
+    what this worker accepts as a shape, so both have to ask the same
+    questions in the same order *and* both have to come out of the one
+    builder: a check (or a shape field) added to a branch and forgotten in the
+    other -- with ``socket`` the production path -- would resolve a shape with
+    a pool / route-B / scratch-root hole and only fail at the first privileged
+    step, in the field.
+    """
+    calls: list[str] = []
+    for name, marker in (
+        ("_require_consistent_shape", "shape"),
+        ("check_worker_identity_outside_pool", "identity"),
+        ("_require_route_b_scratch_root", "scratch_root"),
+    ):
+        original = getattr(ph, name)
+
+        def _spy(*args, _marker=marker, _original=original, **kwargs):
+            calls.append(_marker)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(ph, name, _spy)
+
+    built: list[str] = []
+    original_build = ph._build_helpers
+
+    def _build(settings, *, transport, broker_socket=None):
+        built.append(transport)
+        return original_build(
+            settings, transport=transport, broker_socket=broker_socket
+        )
+
+    monkeypatch.setattr(ph, "_build_helpers", _build)
+
+    _stub_worker_identity(monkeypatch)
+    _install(tmp_path, monkeypatch)
+    supervise = (
+        tmp_path / "site-packages" / "sandlock" / "bin" / "sandlock-supervise"
+    )
+    import envd_service.route_b as route_b
+
+    monkeypatch.setattr(route_b, "default_supervise_bin", lambda: supervise)
+    monkeypatch.setenv("E2B_IMAGE_CACHE_DIR", str(tmp_path / "images"))
+    daemon = fake_daemon(
+        lambda request: _hello(
+            [
+                str(_workspace(tmp_path)),
+                str(_shared(tmp_path)),
+                str(tmp_path / "images"),
+            ]
+        ),
+        name="both.sock",
+    )
+    monkeypatch.setenv("E2B_PRIV_HELPER_SOCKET", str(daemon.socket_path))
+
+    monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "socket")
+    over_the_socket = ph.resolve_priv_helpers(_settings(tmp_path))
+    monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "exec")
+    through_exec = ph.resolve_priv_helpers(_settings(tmp_path))
+
+    assert calls == ["shape", "identity", "scratch_root"] * 2
+    assert built == ["socket", "exec"]
+    assert over_the_socket.transport == "socket"
+    assert over_the_socket.broker_socket == daemon.socket_path
+    assert through_exec.transport == "exec"
+    assert through_exec.broker_socket is None
+    assert daemon.requests == [{"v": 1, "hello": True}]
+
+
+def test_a_symlinked_spelling_of_the_same_roots_still_agrees(
+    tmp_path: Path, monkeypatch, fake_daemon
+) -> None:
+    """Same directory, two spellings: the handshake compares one normalization.
+
+    The worker's roots come out of ``Settings`` (whose workspace base is
+    ``.resolve()``d -- ``config.py`` calls that load-bearing, because the NFS
+    export and ``tmp/`` both carry symlinks), while the daemon names the very
+    same directories through ``getenv``, verbatim (Task 1). Refusing a daemon
+    over a spelling would take the whole shape down, so ``realpath`` decides
+    the comparison -- and only the comparison: the refusal still prints each
+    side's own strings.
+    """
+    real, link = _symlinked_layout(tmp_path)
+    monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "socket")
+    monkeypatch.setenv("E2B_IMAGE_CACHE_DIR", str(real / "images"))
+    _stub_worker_identity(monkeypatch)
+    _install(tmp_path, monkeypatch)
+    supervise = (
+        tmp_path / "site-packages" / "sandlock" / "bin" / "sandlock-supervise"
+    )
+    import envd_service.route_b as route_b
+
+    monkeypatch.setattr(route_b, "default_supervise_bin", lambda: supervise)
+    daemon = fake_daemon(
+        lambda request: _hello(
+            [
+                str(link / "sandboxes"),
+                str(link / "shared"),
+                str(link / "images"),
+            ]
+        ),
+        name="link.sock",
+    )
+    monkeypatch.setenv("E2B_PRIV_HELPER_SOCKET", str(daemon.socket_path))
+    settings = _settings(
+        tmp_path,
+        workspace_base=real / "sandboxes",
+        shared_volume_root=str(real / "shared"),
+        route_b_tmp_root=real / "sandboxes" / ".route-b",
+    )
+
+    helpers = ph.resolve_priv_helpers(settings)
+
+    assert helpers is not None
+    assert helpers.transport == "socket"
+    assert helpers.broker_socket == daemon.socket_path
+    assert [str(p) for p in helpers._root_paths()] == [
+        str(real / "sandboxes"),
+        str(real / "shared"),
+        str(real / "images"),
+    ]
+    assert daemon.requests == [{"v": 1, "hello": True}]
+
+
+def test_a_genuinely_different_root_is_not_hidden_by_the_normalization(
+    tmp_path: Path, monkeypatch, fake_daemon
+) -> None:
+    """Normalizing spelling must not paper over a *different* directory."""
+    real, link = _symlinked_layout(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "socket")
+    monkeypatch.setenv("E2B_IMAGE_CACHE_DIR", str(real / "images"))
+    _stub_worker_identity(monkeypatch)
+    _install(tmp_path, monkeypatch)
+    supervise = (
+        tmp_path / "site-packages" / "sandlock" / "bin" / "sandlock-supervise"
+    )
+    import envd_service.route_b as route_b
+
+    monkeypatch.setattr(route_b, "default_supervise_bin", lambda: supervise)
+    daemon_roots = [
+        str(link / "sandboxes"),
+        str(link / "other"),
+        str(link / "images"),
+    ]
+    daemon = fake_daemon(
+        lambda request: _hello(daemon_roots),
+        name="other.sock",
+    )
+    monkeypatch.setenv("E2B_PRIV_HELPER_SOCKET", str(daemon.socket_path))
+    settings = _settings(
+        tmp_path,
+        workspace_base=real / "sandboxes",
+        shared_volume_root=str(real / "shared"),
+        route_b_tmp_root=real / "sandboxes" / ".route-b",
+    )
+    worker_roots = [
+        str(real / "sandboxes"),
+        str(real / "shared"),
+        str(real / "images"),
+    ]
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        ph.resolve_priv_helpers(settings)
+
+    assert str(excinfo.value) == (
+        f"the maintenance broker at {daemon.socket_path} holds roots "
+        f"{daemon_roots}, this worker holds {worker_roots}: "
+        "E2B_IMAGE_CACHE_DIR (and every other whitelisted root) must be the "
+        "same on both sides of the socket"
+    )
+
+
 def test_missing_socket_refuses_to_start_when_transport_is_socket(
     tmp_path: Path, monkeypatch
 ) -> None:
