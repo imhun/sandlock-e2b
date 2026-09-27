@@ -8,6 +8,26 @@
 
 **Tech Stack:** C99（`deploy/priv/`，Linux-only，`cc -O2 -Wall -Wextra`）、Python 3.14（`envd_service/priv_helpers.py`）、pytest、k8s（k0s overlay + kustomize）。
 
+## 执行状态（2026-09-27 收尾）
+
+| 任务 | 状态 |
+|---|---|
+| Task 1（C 侧 `serve`/`ping` + 白名单四根） | ✅ 已合并（wave 1，`526f581`） |
+| Task 2（Python socket transport + hello 自检） | ✅ 已合并（wave 1） |
+| Task 3（secret 属主三分支） | ✅ 已合并（wave 1） |
+| Task 4（root broker DaemonSet，**基线**） | ✅ 已合并（wave 2，`8163f9b` 之前） |
+| Task 5（worker 去 root + `wait-for-broker`） | ✅ 已合并（wave 2） |
+| Task 6（平台态属主迁移工具 + Job） | ✅ 已合并（wave 2） |
+| Task 7（文档与 pin 收口） | ✅ 已合并（wave 2） |
+| Task 9（终审 Minor 收口） | ✅ 已合并（wave 2 + `2ef457e`） |
+| **Task 8（真机 rollout 与验收）** | ⏸ **未执行**：需要 KUBECONFIG + 停机窗口授权（worker 缩 0 跑迁移）。前置清单见下文与 `docs/k8s-deployment.md` §24。 |
+
+**已知延后（非阻断，均已记账）**
+1. `drop: [ALL]`：broker 目前仍是"默认 root 集 + 三条 cap"，需真机确认只有 `CHOWN/DAC_OVERRIDE/FOWNER` 时 `walk/rm/chown` 仍成立后再加（`deploy/k8s/priv-broker.yaml` 注释已写明）。
+2. Python 侧单行读取上限 ≈3 GiB > worker 容器 `limits.memory: 2Gi`：要真正生效需把 `walk` 改成流式读（现在名义有界、实际 OOM 先行）。
+3. `image-cache-init` 对 `secrets/` 的两条 chown 是静默 best-effort（失败只有顶层 `$dir` 的 FATAL），以及 `-maxdepth 2` 即契约——两条可观测性/注释类 Minor，留给下一轮。
+4. `deploy/scripts/migrate-state-base.sh` 有与 `$VAR（` 同形的 bash 3.2 隐患（本 wave 顺手修了 `migrate-state-owner.sh` 的那几处）。
+
 ## Global Constraints
 
 - 沟通中文；最小改动，保持既有风格；临时文件一律放仓库 `tmp/`（不是 `/tmp`、不是 `$TMPDIR`）。
