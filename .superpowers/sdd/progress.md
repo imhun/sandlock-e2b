@@ -2540,3 +2540,10 @@ N37 的 4000 文件判据与 checkpoint 端到端在上一版 `0.1.0-652` 上全
 - 合并后验证：本机 `test_worker_manifest_permissions + test_migrate_state_base_script + test_worker_env_key_sets + test_state_owner_migrate` = **113 passed**；容器内 `test_broker_socket_c + test_broker_socket_identity + test_priv_broker_protocol + test_priv_helpers + test_sandbox_secret_ownership` = **102 passed / 1 failed**（唯一失败是预先存在的 `test_create_app_refuses_a_pool_that_contains_the_worker_identity`）；`kubectl kustomize deploy/k8s` 与 `deploy/k8s-k0s` 各恰 1 个 `e2b-priv-broker`；`apply --dry-run=client` 通过；跨任务端到端探针 `tmp/c1_e2e_probe.py` OK。
 - 清理：5 个 wave-2 worktree 与分支已删（均并入 main）；报告/评审包/mutation 日志归档到 `.superpowers/sdd/c1-wave2-*`。
 - **待办：Task 8（真机 rollout 与验收）未执行** —— 需要 KUBECONFIG（`deploy/scripts/open-cluster-tunnel.sh` + `export KUBECONFIG=$PWD/tmp/k0s/kubeconfig`）与停机窗口授权（worker 缩 0 → `migrate-state-owner.sh --apply` → apply（`apply.sh` 已内建先 broker 后 worker）→ 起 worker → 两条冒烟）。另有 4 条已记账的延后项（`drop:[ALL]` 待真机、3 GiB 读取上限需流式、secrets chown 的静默 best-effort 与 `-maxdepth 2` 契约、`migrate-state-base.sh` 的 bash 3.2 隐患），见计划"执行状态"节。
+
+**C1 三条尾项收口（2026-09-27，`eb8b49b` 合入 main）**
+- `walk` 独立上限：`BROKER_MAX_WALK_RESPONSE_BYTES = 512 MiB`（推导写实：单树 500000 条目 × ~80 B ≈ 40 MB 未转义 × 6 转义 ≈ 229 MiB 线路 ⇒ 2.2× 余量、< 容器 2Gi）；分 verb 读取、超限点名、`chunks+join`。
+- **关键返工（评审抓到的推导错误）**：`runtime/platform_disk.measure_platform_disk_bytes` 原本一次 walk 整棵 `<state>/_runtime`（多树、不受单树条目上限约束）⇒ 单树前提不成立、合法答案会被拒。改为逐子项 `dir_size` 求和（数值与旧口径相等，有等式用例），并把这条约束写进两处注释；"测不到 → 0" 现在打 WARNING（不再静默 fail-open）。
+- `image-cache-init` 对 `secrets/` 的 chown：`|| true` → 可见的 `|| echo "chown refused …"`（non-fatal），并 pin 住 `-mindepth 1 -maxdepth 2 -type d` 契约。
+- `migrate-state-base.sh`：4 处 `$VAR（` → `${VAR}`、`usage()` sed 上界改准、新增静态扫描用例。
+- 判据：main 上 host `134 passed`、容器 `58 passed`（protocol + 两条契约 lane）；逐条撤销即红均已取证（含新加的 WARNING 用例的 RED/GREEN）。

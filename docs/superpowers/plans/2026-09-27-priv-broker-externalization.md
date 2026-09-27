@@ -26,9 +26,9 @@
 
 **已知延后（非阻断，均已记账）**
 1. ~~`drop: [ALL]`~~ ✅ **已做并在真机验证（2026-09-27）**：broker 的 `CapEff=0xcb` = 恰好 `CHOWN`+`DAC_OVERRIDE`+`FOWNER`+`SETUID`+`SETGID`（不再是运行时默认的满 root 集）；`chown`/`rm`/`walk` 三个 verb 都在这个集合下现场验过（新建沙箱树 `770 10000:65534`、kill 后树消失、worker 记账的 `walk` 计数在走）。其中 `SETUID`/`SETGID` 是给**探针**保留的：探针必须以对端身份连 socket 才过 peer 门，用 `setpriv` 降权需要这两条。
-2. Python 侧单行读取上限 ≈3 GiB > worker 容器 `limits.memory: 2Gi`：要真正生效需把 `walk` 改成流式读（现在名义有界、实际 OOM 先行）。
-3. `image-cache-init` 对 `secrets/` 的两条 chown 是静默 best-effort（失败只有顶层 `$dir` 的 FATAL），以及 `-maxdepth 2` 即契约——两条可观测性/注释类 Minor，留给下一轮。
-4. `deploy/scripts/migrate-state-base.sh` 有与 `$VAR（` 同形的 bash 3.2 隐患（本 wave 顺手修了 `migrate-state-owner.sh` 的那几处）。
+2. ~~Python 侧单行读取上限 ≈3 GiB~~ ✅ **已收（2026-09-27）**：`walk` 有自己的 `BROKER_MAX_WALK_RESPONSE_BYTES = 512 MiB`（推导写实：单树 ≤ `E2B_DISK_MAX_ENTRIES`=500000 条目 × ~80 B ≈ 40 MB 未转义 × 6 转义 ≈ 229 MiB 线路 ⇒ 512 MiB ≈ 2.2×，且 < 容器 2Gi；80 B 明确标为估计而非上界）；**`runtime/platform_disk.measure_platform_disk_bytes` 从"整棵 `_runtime` 一次 walk"改成逐子项求和**（否则单树前提不成立、合法答案会被拒），数值与旧口径相等并有等式用例；`raw += chunk` 改 `chunks+join`；两条 pin（`-mindepth 1 -maxdepth 2 -type d` 与 manifest 侧 `limits.memory == 2Gi` / `E2B_DISK_MAX_ENTRIES == 500000`）。"测不到 → 0" 现在会打一条 WARNING（不再静默 fail-open）。
+3. ~~`image-cache-init` 对 `secrets/` 的 chown 是静默 best-effort~~ ✅ **已收**：两条 `|| true` 改成可见的 `|| echo "image-cache-init: chown refused …"`（仍 non-fatal），注释写明 `-mindepth 1 -maxdepth 2` 就是契约，pin 同步。
+4. ~~`deploy/scripts/migrate-state-base.sh` 的 bash 3.2 隐患~~ ✅ **已收**：4 处 `$VAR（` 改成 `${VAR}`，`usage()` 的 sed 上界改准（`2,39p`），并加了静态扫描用例（该脚本里 `$VAR` 紧邻非 ASCII 必须 0 次）。
 5. 环境侧既有噪声：CP 有两个副本而构建状态是进程内的 ⇒ `deployment_smoke` 的模板构建轮询偶发 404（重跑即绿）。与"控制面只能 1 副本"同源，不属 C1。
 6. **上线时真机才暴露、已修的缺陷**：DaemonSet 第一版的 liveness/readiness 以容器 root 跑 `e2b-maint ping` → 被 peer 门拒（`peer uid 0 does not match`），daemon 正常但 pod 停在 `Running 0/1`、反复重启、rollout 超时。修法：探针用 `setpriv --reuid/--regid 65534 --clear-groups` 降到对端身份；pin 见 `tests/unit/test_worker_manifest_permissions.py::test_the_broker_probes_connect_as_the_peer_identity`。
 
