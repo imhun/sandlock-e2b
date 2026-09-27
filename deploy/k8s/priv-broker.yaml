@@ -117,12 +117,39 @@ spec:
               for dir in $CACHE_DIRS; do
                 mkdir -p "$dir/_oci"
                 chmod 0755 "$dir" "$dir/_oci" 2>/dev/null || true
-                chown -R 65534:65534 "$dir" 2>/dev/null ||
-                echo "image-cache-init: chown refused ($dir, NFS root_squash?) -- verifying the owner instead"
+                # 只动这个 init 真正负责的东西：顶层目录**非递归** chown（65534 的
+                # worker 要在它下面建锁文件与 staging 树），`_oci/`（控制面写进来的
+                # tar）**递归** chown。
+                #
+                # ⚠ 绝不 `chown -R "$dir"`：`$dir/secrets/<sandbox_id>/<name>.secret`
+                # 是**在跑沙箱自己的 0600 文件**（属主是那个沙箱的池 uid，hand-over
+                # 见 envd_service/executors/sandlock.py 与 factory.py:236）。这个 init
+                # 原来在 worker pod 里（worker 重启 ⇒ 沙箱必然重启，抢属主无所谓），
+                # 搬到 DaemonSet 之后就是"broker 滚动 ⇒ 在跑沙箱的 secret 被抢回
+                # 65534"——而文档明确的升级步骤就会滚 broker。
+                #
+                # 但 `secrets/` **不能整支跳过**：`secrets/` 自己与它下面的**目录**
+                # 必须是 worker（65534）的，否则升级路径上（老 worker 是 root，
+                # /var/lib/e2b-images 是持久 hostPath）worker 连
+                # `secret_dir.mkdir()` / `path.unlink()` 都做不到（`<secrets>` 是
+                # root:0755 ⇒ MKDIR/UNLINK 全 DENIED），而**没有别的代码**会 chown
+                # 它们（image_resolver 只建 cache 根与 `_oci/`；§24 的迁移只挂 PVC、
+                # 碰不到节点本地 hostPath）。所以这里按"目录交给 worker、文件留给
+                # 沙箱"分开处理：`secrets` 与它下面的目录 chown 65534，`*.secret`
+                # **一个字都不碰**（`-type d` 是这条不变量本身，不是为了省事）。
+                chown 65534:65534 "$dir" 2>/dev/null ||
+                  echo "image-cache-init: chown refused ($dir, NFS root_squash?) -- verifying the owner instead"
+                chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||
+                  echo "image-cache-init: chown refused ($dir/_oci, NFS root_squash?) -- verifying the owner instead"
+                if [ -d "$dir/secrets" ]; then
+                  chown 65534:65534 "$dir/secrets" 2>/dev/null || true
+                  find "$dir/secrets" -mindepth 1 -maxdepth 2 -type d -exec chown 65534:65534 {} + 2>/dev/null || true
+                  echo "image-cache-init: handed $dir/secrets (directories only; *.secret files stay with their sandbox uid) to uid 65534"
+                fi
                 owner="$(stat -c %u "$dir")"
                 if [ "$owner" != "65534" ]; then
                   echo "image-cache-init: FATAL: $dir is owned by uid $owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
-                  echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown -R 65534:65534 $dir" >&2
+                  echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $dir && chown -R 65534:65534 $dir/_oci" >&2
                   exit 1
                 fi
                 echo "image-cache-init: $dir is owned by uid 65534"

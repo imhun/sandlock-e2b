@@ -7,10 +7,11 @@ wave 1/2 之后 worker 是 uid 65534，而今天这台 NAS 上的平台态文件
 * **静态**：钉脚本与 Job 的文本 —— dry-run 是默认、唯一的写操作是 `chown`（没有 chmod、
   没有删除、没有 `trap` 清理现场）、worker 不在 0 副本就拒绝、Job 以 root 跑在同一条
   PVC 上且不自动重试、三处占位符让"直接 apply 原文件"什么也做不了；
-* **行为**：在没有集群的情况下跑 `--print-plan` 与 `--root` 彩排 —— 计划恰是 brief 的
-  那 7 个平台目录；路径计划里任何落在 `workspaces/` 之下的拼写（含 `..` 与符号链接）都
-  被点名拒绝。毒化过的 `kubectl`（记录自己被调用过、然后失败）把"这些路径不连集群"
-  变成断言而不是承诺。
+* **行为**：在没有集群的情况下跑 `--print-plan` 与 `--root` 彩排 —— 计划恰是 7 个平台
+  目标；树根下**只允许 `workspaces/_migrate` 这一条确切条目**（控制面唯一可写的 subPath，
+  也是 `workspace-root-init` 建的那个），其余任何落在 `workspaces/` 之下的拼写（含
+  `workspaces` 本身、它的兄弟、`..` 与符号链接的变体）都被点名拒绝。毒化过的 `kubectl`
+  （记录自己被调用过、然后失败）把"这些路径不连集群"变成断言而不是承诺。
 
 脚本行按 `strip()` 后精确比对（同 `test_migrate_state_base_script.py`）：重写过的行要在
 这里重新对一遍，而不是靠旧行的子串蒙过去。
@@ -21,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -39,10 +41,13 @@ WORKER_GID = 65534
 #: `<export>`：集群里那块 PVC（`sandbox-shared`）的挂载点，也是 Job 挂它的路径。
 EXPORT_IN_CLUSTER = "/var/lib/e2b-sandboxes"
 
-#: 计划里那 7 个平台目录，**顺序即脚本的打印顺序**（Task 6 brief 的顺序）。
+#: 计划里那 7 个平台目标，**顺序即脚本的打印顺序**（Task 6 brief 的顺序）。
+#: `_migrate` 在 N27 之后落在**树根之下**（`workspaces/_migrate`，控制面在那里的 subPath），
+#: 不在 export 根上 —— 迁移工具的目标路径必须与清单和 worker 端点同名，否则真机上它恒
+#: MISSING（这个 bug 就是本轮修的那条）。
 PLATFORM_TARGETS = (
     "state",
-    "_migrate",
+    "workspaces/_migrate",
     "_images",
     "_secrets",
     "_snapshots",
@@ -50,8 +55,11 @@ PLATFORM_TARGETS = (
     "_builds",
 )
 
-#: 沙箱树。池 uid 的树，不是 worker 的 —— 这个前缀下的任何路径都必须被拒。
+#: 沙箱树。池 uid 的树，不是 worker 的 —— 这个前缀下除 `MIGRATE_STAGING` 外一律拒绝。
 SANDBOX_TREES = "workspaces"
+
+#: 树根下唯一被允许的那一条：控制面的迁移暂存（worker 自己也写它下面那份）。
+MIGRATE_STAGING = "workspaces/_migrate"
 
 
 def _lines(path: Path) -> list[str]:
@@ -160,7 +168,8 @@ def export_root(tmp_path: Path) -> Path:
     )
     (root / "state" / ".route-b" / "10000").mkdir(parents=True)
     (root / "state" / ".uid_pool.lock").write_text("", encoding="utf-8")
-    for name in ("_migrate", "_images", "_secrets", "_snapshots", "_templates", "_builds"):
+    (root / SANDBOX_TREES / "_migrate").mkdir(parents=True)
+    for name in ("_images", "_secrets", "_snapshots", "_templates", "_builds"):
         (root / name).mkdir()
     (root / "_builds" / "ctx.tar").write_bytes(b"build-context")
     (root / SANDBOX_TREES / "sbx_aaa" / "workspace").mkdir(parents=True)
@@ -306,18 +315,18 @@ def test_the_job_is_not_part_of_the_rendered_overlay() -> None:
 # --- 行为：路径计划（不连集群） -------------------------------------------
 
 
-def test_print_plan_lists_exactly_the_seven_platform_directories(tmp_path: Path) -> None:
+def test_print_plan_lists_exactly_the_seven_platform_targets(tmp_path: Path) -> None:
     proc = _run(["--print-plan"], env=_offline_env(tmp_path))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     targets = _targets(proc.stdout)
     assert targets == [
         f"TARGET rel={name} owner={WORKER_UID}:{WORKER_GID}" for name in PLATFORM_TARGETS
     ]
-    # 计划里的每一条都不是沙箱树（`workspaces` 本身也不行）。
+    # 树根下唯一允许的条目就是控制面的迁移暂存；`workspaces` 本身、它的兄弟、树都拒绝。
     rels = [line.split("rel=")[1].split(" ")[0] for line in targets]
     assert [
         rel for rel in rels if rel == SANDBOX_TREES or rel.startswith(SANDBOX_TREES + "/")
-    ] == []
+    ] == [MIGRATE_STAGING]
     assert not (tmp_path / "kubectl-was-called.log").exists()
 
 
@@ -326,7 +335,12 @@ def test_print_plan_lists_exactly_the_seven_platform_directories(tmp_path: Path)
     [
         "workspaces",
         "workspaces/sbx_1",
+        # 树根下唯一放行的那条**不**给它开侧门：树根下的别的目录、或经 `..`/额外层级
+        # 绕回树里，都还是"落在 workspaces/ 之下"。
+        "workspaces/_migrate/sbx_1",
+        "workspaces/_migrate/../sbx_1",
         f"{EXPORT_IN_CLUSTER}/workspaces/../workspaces/sbx_1",
+        f"{EXPORT_IN_CLUSTER}/workspaces/_migrate/../workspaces/sbx_1",
     ],
 )
 def test_a_declared_path_under_the_sandbox_trees_is_refused_by_name(
@@ -337,9 +351,62 @@ def test_a_declared_path_under_the_sandbox_trees_is_refused_by_name(
     # 点名：拒绝文案里就是调用方写的那条路径。
     assert proc.stderr.splitlines()[0] == (
         f"REFUSE(2): 拒绝：{declared} 落在 {SANDBOX_TREES}/ 之下"
-        "（沙箱树属于池 uid，不是 worker 的）"
+        f"（沙箱树属于池 uid，不是 worker 的；树根下唯一放行的是 {MIGRATE_STAGING}）"
     )
     # fail-closed：拒绝发生在打印计划之前，stdout 里一条 TARGET 都没有。
+    assert proc.stdout == ""
+
+
+def test_the_migration_staging_is_the_one_entry_the_tree_root_allows(
+    export_root: Path, tmp_path: Path
+) -> None:
+    """`workspaces/_migrate` 是树根下唯一放行的一条 —— 而且它是那条真的路径。
+
+    它是 N27 之后控制面唯一可写的 subPath（`workspace-root-init` 建的就是它），所以迁移
+    工具必须去 chown 它；工具曾在 export 根上找 `_migrate`，在真机上因此恒 MISSING。
+    `--target` 再声明一遍是幂等的：计划去重，打印出来仍是那 7 条。
+    """
+    proc = _run(
+        ["--root", str(export_root), "--print-plan", "--target", MIGRATE_STAGING],
+        env=_offline_env(tmp_path),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _targets(proc.stdout) == [
+        f"TARGET rel={name} owner={WORKER_UID}:{WORKER_GID}" for name in PLATFORM_TARGETS
+    ]
+
+
+def test_the_staging_entry_must_be_its_own_real_directory(
+    export_root: Path, tmp_path: Path
+) -> None:
+    """放行 `workspaces/_migrate` 的前提是它就是那个真实目录，不是一条符号链接。"""
+    shutil.rmtree(export_root / SANDBOX_TREES / "_migrate")
+    (export_root / SANDBOX_TREES / "_migrate").symlink_to("sbx_aaa")
+    real = os.path.realpath(export_root / SANDBOX_TREES / "_migrate")
+    proc = _run(["--root", str(export_root), "--print-plan"], env=_offline_env(tmp_path))
+    assert proc.returncode == 2
+    assert proc.stderr.splitlines()[0] == (
+        f"REFUSE(2): 拒绝：{MIGRATE_STAGING} 经符号链接落到 {real}"
+        " —— 迁移只碰真实目录，且树根下放行的就是它自己那一个（停下来人看）"
+    )
+    assert proc.stdout == ""
+
+
+def test_a_symlink_alias_of_the_staging_directory_is_refused(
+    export_root: Path, tmp_path: Path
+) -> None:
+    """换个名字走同一条路也不行：白名单是那**一条**确切条目，不是"解析到它就算"。"""
+    (export_root / "mig-alias").symlink_to(MIGRATE_STAGING)
+    real = os.path.realpath(export_root / "mig-alias")
+    proc = _run(
+        ["--root", str(export_root), "--print-plan", "--target", "mig-alias"],
+        env=_offline_env(tmp_path),
+    )
+    assert proc.returncode == 2
+    assert proc.stderr.splitlines()[0] == (
+        f"REFUSE(2): 拒绝：mig-alias 经符号链接落在 {SANDBOX_TREES}/ 之下（{real}）"
+        "—— 沙箱树属于池 uid，不是 worker 的"
+    )
     assert proc.stdout == ""
 
 

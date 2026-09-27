@@ -82,7 +82,10 @@ kubectl -n $NS rollout status ds/seccomp-installer     # 每个节点一个 Read
 kubectl apply -f deploy/k8s/priv-broker.yaml
 kubectl -n $NS rollout status ds/e2b-priv-broker      # 每个节点一个 Ready
 
-# 7) worker（缺 profile 的节点会起来失败 —— 这是 fail closed，不是 flake）
+# 7) ★ worker（缺 profile 的节点会起来失败 —— 这是 fail closed，不是 flake）
+#    从 root-worker 卷升级：apply worker **之前**先跑一次 §24 的属主迁移
+#    （deploy/scripts/migrate-state-owner.sh —— 非 root worker 读不了 root 写下的平台态）；
+#    全新卷可以跳过。升级已存在的集群时顺序仍是"先 broker（第 6 步）后 worker"。
 kubectl apply -f deploy/k8s/worker.yaml
 kubectl -n $NS rollout status sts/e2b-worker
 
@@ -2714,10 +2717,14 @@ kubectl -n sandlock exec e2b-worker-0 -c worker -- sh -c '
 fail closed —— 直接 apply 原文件不会 chown 任何东西。
 
 迁移的**唯一写操作**是 `chown -R 65534:65534`：不改权限位、不删东西、不拷内容。范围是一张
-显式的路径计划（`<export>` 相对的 `state`/`_migrate`/`_images`/`_secrets`/`_snapshots`/
-`_templates`/`_builds` 七条），**绝不进入 `<export>/workspaces/**`** —— 那些树属于池 uid、
-不是 worker 的；计划里任何一条落在它下面（含用 `..` 或符号链接绕过去的拼写）脚本一律拒绝
-并点名。硬性质由 `tests/unit/test_state_owner_migrate.py` 逐条钉住。
+显式的路径计划（`<export>` 相对的 `state`/`workspaces/_migrate`/`_images`/`_secrets`/
+`_snapshots`/`_templates`/`_builds` 七条）—— **树根下只放行 `workspaces/_migrate` 那一
+条**：迁移暂存在 N27 之后就在树根之下（`workspace-root-init` 建的是它，控制面唯一可写的
+subPath 也是它），而工具曾在 export 根上找 `_migrate` ⇒ 真机上它恒 MISSING、那一条从来没
+迁过（2026-09-27 修正）。其余 `<export>/workspaces/**` 绝不进入 —— 那些树属于池 uid、不是
+worker 的；计划里任何一条落在它下面（含 `workspaces` 本身、它的兄弟、用 `..` 或符号链接
+绕过去的拼写）脚本一律拒绝并点名。硬性质由 `tests/unit/test_state_owner_migrate.py` 逐条
+钉住。
 
 ### 24.1 执行顺序
 

@@ -150,10 +150,12 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
   worker 才放行；等的是 `hello` 往返，不只是 socket 文件存在）。
 * **第一次滚这个形态必须先把平台态属主迁过来**（一次迁移，不是滚动）：worker 缩到 0 →
   `deploy/scripts/migrate-state-owner.sh --apply` → 再把 worker 起回来。它只 `chown` 七个平台目录
-  （`state`/`_migrate`/`_images`/`_secrets`/`_snapshots`/`_templates`/`_builds`），**绝不碰
-  `<export>/workspaces/**`**（那是池 uid 的树）。用法见 `deploy/k8s-k0s/README.md`「平台态属主迁移」、
-  正文见 `docs/k8s-deployment.md` §24。顺序反了（先上 worker）会得到读不了 `0600`/`0700`
-  平台态的 worker —— 也就是每个 `Sandbox.create()` 都失败。
+  （`state`/`workspaces/_migrate`/`_images`/`_secrets`/`_snapshots`/`_templates`/`_builds`），
+  **树根下只放行 `workspaces/_migrate` 那一条**（N27 之后控制面的迁移暂存就在树根之下，不是
+  export 根），其余 `<export>/workspaces/**`（那是池 uid 的树）**绝不碰**。用法见
+  `deploy/k8s-k0s/README.md`「平台态属主迁移」、正文见 `docs/k8s-deployment.md` §24。顺序反了
+  （先上 worker）会得到读不了 `0600`/`0700` 平台态的 worker —— 也就是每个 `Sandbox.create()`
+  都失败。
 
 > 上面「pod（2026-09-27 实测）」里的几个 pod 是**早先**的读数（当时 worker 还以 root 跑）；
 > C1 的 broker DaemonSet 与无 root worker 以仓库规格为准，实测数字在 C1 上线后按 §12 的方式重取。

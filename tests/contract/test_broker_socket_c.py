@@ -1325,11 +1325,11 @@ def test_serve_refuses_a_non_positive_timeout(serve, tmp_path: Path) -> None:
     otherwise read as a completed step.
 
     The other half -- a request that outlives ``timeout_s`` and is SIGKILLed,
-    with ``ok:false`` -- is deliberately not here: it needs a tree large
-    enough that the walk *reliably* exceeds the budget (the wave-1 review
-    measured ~700k entries: ~26 s to build the tree, ~1.3 s to walk it), which
-    is neither deterministic enough nor cheap enough for this lane. It is
-    carried by the wave-2 plan; the wave-1 fix pins the refusal only.
+    with ``ok:false`` -- is
+    ``test_a_walk_that_outlives_the_budget_is_killed_and_the_daemon_survives``
+    below: it needs a tree large enough that the walk *reliably* outlives a
+    1 s budget, so it pays ~20 s of setup and is kept separate from this
+    cheap refusal.
     """
     handle = serve("timeout")
     _await_listening(handle)
@@ -1350,3 +1350,97 @@ def test_serve_refuses_a_non_positive_timeout(serve, tmp_path: Path) -> None:
             "ok": False,
             "error": f"timeout_s must be positive (got {budget})",
         }
+
+
+#: The runaway tree: entry count and name length are the two levers on how long
+#: a ``walk`` takes, and hard links are by far the cheapest way to buy walk
+#: time -- measured on this lane, 150k *files* build in 6.6 s and walk in
+#: 0.29 s, the same 150k *hard links* build in 3.2 s and walk in 0.80 s (one
+#: shared inode per directory, one name per entry, no data).
+#:
+#: Sizes are measured, not guessed. On the arm64 development box's
+#: ``e2b-sandlock-test`` container (overlayfs, VirtioFS-backed VM disk):
+#:
+#:   * the walk's own rate is the stable half, 4.9-6.5 us/entry (300k -> 1.5 s,
+#:     600k -> 3.3-3.9 s), so **350k entries with 200-byte names** walk in
+#:     1.7-2.3 s and outlive the 1 s budget by ~2x -- the SIGKILL is reached
+#:     deterministically, not by a coin flip between "the walk finished" and
+#:     "the walk was killed";
+#:   * building the tree is the noisy half (inode allocation through the VM's
+#:     disk), 21-66 us/entry: 350k entries cost 7-23 s. The request itself is
+#:     killed at 1 s, so the case costs one build plus ~1 s: **9-25 s total**,
+#:     inside the 30 s lane budget even when the host is busy.
+RUNAWAY_ENTRIES = 350_000
+RUNAWAY_PER_DIR = 16_384
+#: 200 bytes: long enough to make the walk's per-entry printf/pipe work matter,
+#: short enough to stay away from NAME_MAX (255).
+RUNAWAY_NAME_WIDTH = 200
+
+
+def _build_runaway_tree(root: Path) -> None:
+    """A tree whose ``walk`` outlives a 1 s budget; see ``RUNAWAY_ENTRIES``."""
+    root.mkdir(parents=True)
+    made = 0
+    index = 0
+    while made < RUNAWAY_ENTRIES:
+        sub = root / f"d{index:04d}"
+        sub.mkdir()
+        seed = sub / "seed"
+        with open(seed, "wb") as sink:
+            sink.write(b"x")
+        made += 1
+        limit = min(RUNAWAY_PER_DIR, RUNAWAY_ENTRIES - made)
+        for i in range(limit):
+            os.link(seed, sub / ("f%05d" % i + "x" * (RUNAWAY_NAME_WIDTH - 6)))
+        made += limit
+        index += 1
+
+
+def test_a_walk_that_outlives_the_budget_is_killed_and_the_daemon_survives(
+    serve, tmp_path: Path
+) -> None:
+    """The budget is enforced by killing the grandchild, and only that request.
+
+    ``walk`` is the one verb whose runtime the caller does not bound (it is the
+    quota ledger's path over an arbitrarily large tree), so ``timeout_s`` is
+    the only thing standing between a runaway walk and a handler that never
+    answers. This is the execution half of that contract, next to the cheap
+    refusal in ``test_serve_refuses_a_non_positive_timeout``:
+
+    * ``ok:false`` with the daemon's own account ("timed out after 1s and was
+      killed with SIGKILL") -- not a partial ``stdout`` the caller could
+      mistake for a finished tree, and not a silent truncation;
+    * the daemon is still up afterwards, and the very next ``hello`` succeeds:
+      the kill costs that one connection, not the node's broker.
+
+    The tree is built with hard links (see ``_build_runaway_tree``); its size
+    is whatever makes the walk reliably outlive the budget on this lane -- the
+    numbers are in the ``RUNAWAY_ENTRIES`` comment.
+    """
+    handle = serve("runaway")
+    _await_listening(handle)
+    tree = _workspace(tmp_path) / "sbx_runaway"
+    _build_runaway_tree(tree)
+
+    started = time.monotonic()
+    response = _request(
+        handle.socket,
+        {"v": 1, "args": ["walk", "--path", str(tree)], "timeout_s": 1},
+        process=handle.process,
+    )
+    elapsed = time.monotonic() - started
+
+    # Exactly the refusal: no stdout, no exit code -- the walk never completed.
+    assert response == {
+        "v": 1,
+        "ok": False,
+        "error": "the request timed out after 1s and was killed with SIGKILL",
+    }
+    # The kill happened on the budget, not after the walk happened to finish.
+    assert elapsed < 5.0
+    # ...and it cost one request, not the broker.
+    assert handle.process.poll() is None
+    hello = _request(handle.socket, {"v": 1, "hello": True}, process=handle.process)
+    assert hello["ok"] is True
+    assert hello["peer_uid"] == _peer_uid()
+    assert hello["peer_gid"] == _peer_gid()
