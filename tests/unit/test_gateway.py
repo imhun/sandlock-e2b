@@ -100,6 +100,56 @@ def test_route_cache_ttl_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_sdk_keepalive_interval_reaches_the_node() -> None:
+    """N37: the forwarded header is what lets the worker pick the cadence.
+
+    ``Keepalive-Ping-Interval`` rides the request the SDK sends on a streaming
+    RPC, and the worker's process stream resolves its ping interval from it.
+    The gateway forwards a *whitelist*, so a header missing from that list is
+    dropped here and the node can never see it -- the client's only lever over
+    an edge whose idle cut is tighter than ours. Asserted end to end (a real
+    request through the real app into the node) rather than by inspecting the
+    set, so the forwarding path itself is under test.
+    """
+    seen: dict[str, str] = {}
+    node = FastAPI()
+
+    @node.post("/process.Process/Start")
+    async def start(request: Request) -> Response:
+        seen.update(request.headers)
+        return Response(status_code=200, content=b"")
+
+    node_port, node_sock = _bind_low_port()
+    node_server = _ServerThread(node, node_port, sock=node_sock)
+    node_server.start()
+    cp = _ControlPlane()
+    cp.routes["sbx_1"] = [f"http://127.0.0.1:{node_server.server.config.port}"]
+    cp_server, cp_port = cp.start()
+    gw_server, gw_port = await _start_gateway(f"http://127.0.0.1:{cp_port}")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                f"http://127.0.0.1:{gw_port}/process.Process/Start",
+                headers={
+                    "E2b-Sandbox-Id": "sbx_1",
+                    "X-Access-Token": "tok",
+                    "Content-Type": "application/connect+json",
+                    "Keepalive-Ping-Interval": "50",
+                },
+                content=b"{}",
+            )
+        assert response.status_code == 200
+        assert seen["keepalive-ping-interval"] == "50"
+        assert seen["e2b-sandbox-id"] == "sbx_1"
+        assert seen["x-access-token"] == "tok"
+        # The framing headers stay the gateway's own, never the client's.
+        assert seen["host"] == f"127.0.0.1:{node_server.server.config.port}"
+    finally:
+        for s in (node_server, cp_server, gw_server):
+            s.stop()
+
+
+@pytest.mark.asyncio
 async def test_retry_replays_after_node_moved_502() -> None:
     """First node answers 502, control plane route moved; retry succeeds."""
     node1, calls1 = _make_node([502])

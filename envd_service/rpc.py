@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -14,7 +15,12 @@ from fastapi import Request
 
 from envd_service.connect.router import register_routes
 from envd_service.executors.base import FailedRunningProcess
-from envd_service.process.events import data_event, end_event, start_event
+from envd_service.process.events import (
+    data_event,
+    end_event,
+    keepalive_event,
+    start_event,
+)
 from envd_service.process.manager import ManagedProcess, parse_signal
 from envd_service.runtime.context import runtime_context
 from gateway_common.errors import (
@@ -23,8 +29,15 @@ from gateway_common.errors import (
     not_found,
     unimplemented as connect_unimplemented,
 )
+from gateway_common.keepalive import stream_keepalive_interval_s
 
 logger = logging.getLogger(__name__)
+
+#: The request header the official SDK uses to ask for in-band pings on a
+#: streaming RPC (``e2b/connection_config.py`` ``KEEPALIVE_PING_HEADER``). The
+#: gateway forwards it; see ``gateway_common.keepalive`` for why the stream
+#: has to answer and what the interval resolves to.
+KEEPALIVE_HEADER = "Keepalive-Ping-Interval"
 
 # FUP #9: while a drifted record stays unreconciled, every command RPC would
 # otherwise repeat the same WARNING. Log at most one drift warning per sandbox
@@ -94,11 +107,27 @@ def _require_str(payload: dict, key: str, default: str = "") -> str:
 
 
 async def _consume_stream(
-    proc: ManagedProcess, queue: Any
+    proc: ManagedProcess, queue: Any, keepalive_s: float
 ) -> AsyncIterator[dict[str, Any]]:
+    """Relay one process's events, pinging the client when it goes quiet.
+
+    ``keepalive_s`` bounds how long the response body may stay silent: the
+    edge in front of the API cuts an idle stream after 60 s (measured, N37),
+    and a command that prints nothing for a minute -- a 4000-file write on
+    NFS -- is exactly that shape. The wait is per read, so a command that is
+    producing output never pings.
+    """
     try:
         while True:
-            item = await queue.get()
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=keepalive_s)
+            except asyncio.TimeoutError:
+                # Nothing from the sandbox for a whole interval: say
+                # *something* so the connection does not look dead. A
+                # cancelled ``Queue.get`` never consumes an item, so the
+                # event that arrives next is not lost.
+                yield keepalive_event()
+                continue
             kind = item[0]
             if kind == "data":
                 yield data_event(item[1], item[2])
@@ -214,10 +243,13 @@ def build_process_handlers() -> tuple[dict[str, Any], dict[str, Any]]:
             max_file_size=ctx.max_file_size_for_exec(),
         )
         queue = proc.subscribe(replay=False)
+        keepalive_s = stream_keepalive_interval_s(
+            request.headers.get(KEEPALIVE_HEADER)
+        )
 
         async def gen() -> AsyncIterator[dict[str, Any]]:
             yield start_event(proc.pid)
-            async for event in _consume_stream(proc, queue):
+            async for event in _consume_stream(proc, queue, keepalive_s):
                 yield event
 
         return gen()
@@ -229,10 +261,13 @@ def build_process_handlers() -> tuple[dict[str, Any], dict[str, Any]]:
         pid = _pid(process)
         proc = ctx.processes.get(pid)
         queue = proc.subscribe(replay=True)
+        keepalive_s = stream_keepalive_interval_s(
+            request.headers.get(KEEPALIVE_HEADER)
+        )
 
         async def gen() -> AsyncIterator[dict[str, Any]]:
             yield start_event(proc.pid)
-            async for event in _consume_stream(proc, queue):
+            async for event in _consume_stream(proc, queue, keepalive_s):
                 yield event
 
         return gen()

@@ -202,6 +202,13 @@ def create_gateway(
         "e2b-sandbox-port",
         "accept",
         "connect-protocol-version",
+        # N37: the SDK's requested cadence for in-band pings on a streaming
+        # RPC (``Keepalive-Ping-Interval: 50``). Dropping it here would leave
+        # the process stream pinging at the default interval only -- harmless
+        # today, but it would silently ignore a client that asked for
+        # something shorter, which is a client's only lever over a proxy whose
+        # idle cut is tighter than ours.
+        "keepalive-ping-interval",
         "x-mcp-access-token",
         # MCP streamable-HTTP sessions: the client sends Mcp-Session-Id on
         # every request after the first POST; dropping it makes the upstream
