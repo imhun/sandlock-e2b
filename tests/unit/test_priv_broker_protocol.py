@@ -894,6 +894,113 @@ def test_a_genuinely_different_root_is_not_hidden_by_the_normalization(
     )
 
 
+#: Why a relative root is refused *before* the two lists are compared: the
+#: normalization that makes a symlinked spelling agree is ``realpath``, and a
+#: relative spelling has no single meaning -- it resolves against whichever
+#: process calls it, and the daemon's cwd is not this worker's. So the pair
+#: could compare equal while naming two different directories, or be refused
+#: over a spelling. The deployments spell every root absolutely; anything else
+#: is a configuration this worker cannot check at all, so it fails closed.
+_RELATIVE_ROOT_REASON = (
+    "the broker's whitelist and this worker's must both be absolute to be "
+    "comparable -- realpath resolves a relative spelling against each "
+    "process's own cwd, and the daemon's cwd is not this worker's, so a "
+    "relative root is refused instead of compared (deployments spell every "
+    "root absolutely)"
+)
+
+
+def _socket_shape_daemon(tmp_path: Path, monkeypatch, fake_daemon, roots, name):
+    """A daemon answering ``hello`` with ``roots``, on the socket transport."""
+    monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "socket")
+    _stub_worker_identity(monkeypatch)
+    _install(tmp_path, monkeypatch)
+    supervise = (
+        tmp_path / "site-packages" / "sandlock" / "bin" / "sandlock-supervise"
+    )
+    import envd_service.route_b as route_b
+
+    monkeypatch.setattr(route_b, "default_supervise_bin", lambda: supervise)
+    daemon = fake_daemon(lambda request: _hello(roots), name=name)
+    monkeypatch.setenv("E2B_PRIV_HELPER_SOCKET", str(daemon.socket_path))
+    return daemon
+
+
+def test_a_relative_root_from_the_daemon_is_refused_before_it_is_compared(
+    tmp_path: Path, monkeypatch, fake_daemon
+) -> None:
+    """The daemon is a separate process: its relative spelling is unreadable.
+
+    "sandboxes" resolves against *this worker's* cwd when printed and
+    compared, and against the daemon's own when it enforces its whitelist --
+    two directories, or the same one by luck. Either way the worker cannot
+    decide, and guessing is what this handshake exists to replace.
+    """
+    real, link = _symlinked_layout(tmp_path)
+    daemon = _socket_shape_daemon(
+        tmp_path,
+        monkeypatch,
+        fake_daemon,
+        ["sandboxes", str(link / "shared"), str(link / "images")],
+        "daemon-relative.sock",
+    )
+    monkeypatch.setenv("E2B_IMAGE_CACHE_DIR", str(real / "images"))
+    settings = _settings(
+        tmp_path,
+        workspace_base=real / "sandboxes",
+        shared_volume_root=str(real / "shared"),
+        route_b_tmp_root=real / "sandboxes" / ".route-b",
+    )
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        ph.resolve_priv_helpers(settings)
+
+    assert str(excinfo.value) == (
+        f"the maintenance broker at {daemon.socket_path} names the relative "
+        f"root 'sandboxes': {_RELATIVE_ROOT_REASON}"
+    )
+
+
+def test_a_relative_local_root_is_refused_before_it_is_compared(
+    tmp_path: Path, monkeypatch, fake_daemon
+) -> None:
+    """The worker's own side is held to the same rule (here it is the offender).
+
+    ``Settings.workspace_base`` is normally ``.resolve()``d, which is exactly
+    why the handshake can use ``realpath``; a caller that spells it relatively
+    (an embedder, a test, a hand-rolled deployment) has the same
+    two-directories problem, and it is this worker that has to refuse.
+    """
+    real, link = _symlinked_layout(tmp_path)
+    daemon = _socket_shape_daemon(
+        tmp_path,
+        monkeypatch,
+        fake_daemon,
+        [
+            str(link / "sandboxes"),
+            str(link / "shared"),
+            str(link / "images"),
+        ],
+        "worker-relative.sock",
+    )
+    monkeypatch.setenv("E2B_IMAGE_CACHE_DIR", str(real / "images"))
+    settings = _settings(
+        tmp_path,
+        workspace_base=Path("rel/sandboxes"),
+        shared_volume_root=str(real / "shared"),
+        route_b_tmp_root=Path("rel/sandboxes/.route-b"),
+    )
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        ph.resolve_priv_helpers(settings)
+
+    assert str(excinfo.value) == (
+        f"this worker names the relative root 'rel/sandboxes': "
+        f"{_RELATIVE_ROOT_REASON}"
+    )
+    assert daemon.requests == [{"v": 1, "hello": True}]
+
+
 def test_missing_socket_refuses_to_start_when_transport_is_socket(
     tmp_path: Path, monkeypatch
 ) -> None:

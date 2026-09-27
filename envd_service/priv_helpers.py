@@ -158,20 +158,29 @@ BROKER_ESCAPE_BLOWUP = 6
 BROKER_MAX_RESPONSE_BYTES = (
     2 * BROKER_MAX_OUTPUT_BYTES * BROKER_ESCAPE_BLOWUP + BROKER_READ_CHUNK
 )
-#: The ceiling on one ``walk`` answer line -- *smaller* than the generic one
-#: above on purpose, and sized for the worst **single tree**:
+#: The ceiling on one ``walk`` answer line. It is the worker's own bound on how
+#: much it will buffer for that verb, and it is derived from the daemon's, so
+#: the two sides are one decision rather than two guesses:
 #:
-#: * ``E2B_DISK_MAX_ENTRIES`` (N31; 500000, ``deploy/k8s/worker.yaml``) caps the
-#:   entries of *one* tree;
-#: * ~80 B a line is an **estimate, not an upper bound** => ~40 MB unescaped;
-#: * the answer is one JSON line and escaping inflates it up to
-#:   ``BROKER_ESCAPE_BLOWUP`` (6x) => ~229 MiB on the wire.
+#: * the daemon caps a ``walk``'s **unescaped** output at 64 MiB
+#:   (``PRIV_MAX_WALK_OUTPUT`` in ``deploy/priv/maint.c``; the generic
+#:   ``PRIV_MAX_OUTPUT`` above still governs every other verb) and answers
+#:   ``ok:false`` past it, so no conforming daemon ever sends a longer line;
+#: * the answer is one JSON line, and escaping inflates it up to
+#:   ``BROKER_ESCAPE_BLOWUP`` (6x) => at most 384 MiB on the wire.
 #:
-#: 512 MiB is ~2.2x that worst line, so a tree whose average line stays within
-#: the estimate is not refused. A tree beyond it (unusually long lines, or
-#: escaping close to the full 6x) hits the daemon's own 256 MiB **unescaped**
-#: ceiling first, which answers ``ok:false`` rather than a long line -- that
-#: "measurement failed" category predates this ceiling. 512 MiB is still
+#: 512 MiB is ~1.3x that widest possible line, which is the point: it never
+#: refuses an answer a conforming daemon considered legal. Crossing it means
+#: the stream is not an answer at all -- an impostor on the socket (or a daemon
+#: far newer than this worker) trying to make the *worker* buffer without
+#: bound, which is why the read is abandoned and named rather than grown.
+#:
+#: The unescaped cap's own sizing is the daemon's decision:
+#: ``E2B_DISK_MAX_ENTRIES`` (N31; 500000, ``deploy/k8s/worker.yaml``) caps one
+#: tree's entries and ~80 B a line puts that at ~40 MB unescaped, and a tree
+#: that outgrows the estimate fails the daemon's *measurement* as ``ok:false``
+#: rather than arriving here as a long line -- that "measurement failed"
+#: category predates this ceiling. 512 MiB is still
 #: deliberately *below* the worker container's ``limits.memory`` (2Gi; pinned
 #: in ``tests/unit/test_worker_manifest_permissions.py``), so crossing it is
 #: this refusal and not the kernel's OOM kill first.
@@ -1433,6 +1442,14 @@ def _require_broker_agreement(helpers: PrivHelpers) -> None:
     sides with ``realpath`` (non-strict, like ``Path.resolve()``) while the
     refusal keeps printing each side's own strings, which is the pair an
     operator has to reconcile.
+
+    A3: normalizing with ``realpath`` only means something for **absolute**
+    spellings. ``realpath("tmp/sandboxes")`` resolves against *this* process's
+    cwd, and the daemon's cwd is not the worker's (a different pod, working
+    directory or namespace) -- so a relative root would either be refused over
+    a spelling or, worse, compare *equal* while the two whitelists name
+    different directories. Every deployment spells its roots absolutely, so a
+    relative one on either side is refused by name before any comparison.
     """
     response = helpers.hello()
     if not response.get("ok"):
@@ -1461,6 +1478,20 @@ def _require_broker_agreement(helpers: PrivHelpers) -> None:
     roots = response.get("roots")
     roots = [str(root) for root in roots] if isinstance(roots, list) else None
     expected_roots = [str(path) for path in helpers._root_paths()]
+    for who, values in (
+        (f"the maintenance broker at {helpers.broker_socket}", roots),
+        ("this worker", expected_roots),
+    ):
+        for value in values or ():
+            if not Path(value).is_absolute():
+                raise PrivHelperError(
+                    f"{who} names the relative root {value!r}: the broker's "
+                    "whitelist and this worker's must both be absolute to be "
+                    "comparable -- realpath resolves a relative spelling "
+                    "against each process's own cwd, and the daemon's cwd is "
+                    "not this worker's, so a relative root is refused instead "
+                    "of compared (deployments spell every root absolutely)"
+                )
     if roots is None or [_realpath(root) for root in roots] != [
         _realpath(root) for root in expected_roots
     ]:
