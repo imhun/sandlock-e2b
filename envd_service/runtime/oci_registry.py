@@ -560,6 +560,11 @@ def _chroot_symlinks(members: Iterable[tarfile.TarInfo]) -> None:
     also escape the rootfs when the tree is read from the host. Converting
     to a relative link keeps the in-chroot semantics identical and the
     link inside the rootfs from the host side too.
+
+    The resolver used to rewrite these back into root-absolute targets, to
+    keep the sandbox's ``openat2`` fast path free of ``..``; it does not any
+    more (FUP-28, retired 2026-09-27) -- the walk stays, and the engine's
+    bounded retry covers the kernel's retryable ``EAGAIN``.
     """
     for member in members:
         if not (member.issym() and posixpath.isabs(member.linkname)):

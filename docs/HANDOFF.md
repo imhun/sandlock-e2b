@@ -84,7 +84,7 @@ image 等）的跳过是允许的；③ 临时 runner：`tmp/k0s/x86-security-on
 |---|---|
 | **N27**（平台状态另起 BASE） | 你说过"独立排期"；随时能开工（落点已收口：`gateway_common/paths.py` 三个 helper + `E2B_STATE_BASE` + 迁移脚本，注意 EXDEV） |
 | **N14 的 S5**（退役模拟形态） | **要你先拍**"还保不保留 `E2B_REAL_ROOT=0` 的模拟形态"（lane 现在两态都跑） |
-| **FUP-28** | 前提③（产品路径 soak）**已跑完**（2026-09-27，两台部署宿主；exec 判据已从 arm64 上恒真的 `exec /bin/echo` 换成"解释器挂 `..`"的有效形状，带红→绿变异对照）；剩"撤不撤那行 `..` 软链改写"由你拍板。报告 `.superpowers/sdd/debt-fup28-exec-shape-report.md` |
+| **FUP-28** | ✅ **已撤（2026-09-27）—— 这条不再需要你拍板**：三条前提齐（②两宿主机内核实测 EAGAIN，③产品路径 soak 带红→绿变异对照；证据 `.superpowers/sdd/debt-fup28-soak-report.md` / `debt-fup28-exec-shape-report.md` 与 fork 的 `docs/fork-plan-followups.md` FUP-28），`envd_service/runtime/image_resolver.py` 的 `_root_absolute_links` 与调用点已删、两条钉子同步调整、两档 lane 复跑 `0 failed` 且与基线相等或更好。报告 `.superpowers/sdd/debt-fup28-retire-the-rewrite-report.md` |
 | N36 / N30 / §10.5 / `Open` 桶 / O1–O3 复核 | 待决策（口径题） |
 
 ## ⚡ 共享卷去 SYS_ADMIN（2026-09-11，A4–A7 收口 / backlog #25）

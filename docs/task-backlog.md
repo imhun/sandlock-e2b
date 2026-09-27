@@ -155,7 +155,9 @@ netns 灰度暴露 MCP 入站每请求 +390 ms，根因是 readiness 合成，fo
    EAGAIN，探针 `tmp/k0s/probe_openat2_eagain.py`）、前提① 也成立（集群 wheel manifest
    HEAD=`7b60349c` 含 FUP-26）；**缺的是前提③的产品路径 soak**（要在部署宿主上跑，
    需要 arm64 的 soak 二进制或节点上起 dev 镜像），所以本轮**保留**改写 —— 明细在
-   fork `docs/fork-plan-followups.md` 的 FUP-28。
+   fork `docs/fork-plan-followups.md` 的 FUP-28。**（2026-09-27 更新：前提③已在两台部署
+   宿主上跑完并带红→绿变异对照，那行改写已按 FUP-28 撤掉 —— 见 `docs/open-issues.md` 的
+   FUP-28 行与 `.superpowers/sdd/debt-fup28-retire-the-rewrite-report.md`。）**
 3. 不需要环境就能做的：~~T3（快照展开自嵌套守卫）~~ ✅ 已完成（G2，2026-09-06，见上表行）；
    T2 已随 fork P3 完成；~~#22 候选补丁（协议缺陷）~~ ✅ 已完成（F15，见 #23）。
 

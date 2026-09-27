@@ -287,6 +287,27 @@ def test_resolve_applies_whiteouts(registry, tmp_path):
     assert (rootfs / "sub" / "y.txt").read_text() == "y"
 
 
+def _inode(path: Path) -> tuple[int, int]:
+    stat = os.stat(path)
+    return (stat.st_dev, stat.st_ino)
+
+
+def _resolved_in_chroot(rootfs: Path, link: Path) -> Path:
+    """The path the sandbox's ``RESOLVE_IN_ROOT`` lookup lands on.
+
+    An absolute target anchors at the chroot root and a relative one at the
+    link's own directory; ``..`` is clamped at the root, which is exactly what
+    ``os.path.normpath`` does to the absolute spelling (it cannot climb above
+    ``/``).
+    """
+    target = os.readlink(link)
+    if os.path.isabs(target):
+        spelling = target
+    else:
+        spelling = posixpath.join("/", str(link.relative_to(rootfs).parent), target)
+    return rootfs / os.path.normpath(spelling).lstrip("/")
+
+
 def test_resolve_keeps_symlink_targets_resolving_inside_the_chroot(
     registry, tmp_path
 ):
@@ -300,12 +321,11 @@ def test_resolve_keeps_symlink_targets_resolving_inside_the_chroot(
     The extracted tree is handed to the sandbox as a chroot root, and every
     path lookup inside it is ``openat2(RESOLVE_IN_ROOT)``: an absolute target
     resolves at the sandbox root, exactly like the relative link the extractor
-    writes to get past the ``data`` filter. What must *never* remain is a
-    ``..``-relative target, because the kernel may refuse that walk with the
-    documented *retryable* ``EAGAIN`` -- and the fork's executor turns any
-    lookup failure into a silent "exit 127, empty stderr" (see
-    ``tests/unit/test_image_rootfs_links.py`` for the rewrite and its
-    inode-for-inode equivalence).
+    writes to get past the ``data`` filter. Those targets keep their ``..``
+    components -- the resolver used to rewrite them into the rooted absolute
+    equivalent (FUP-28) and no longer does, so the ``..`` walk is the engine's
+    to retry (fork FUP-26). What has to hold either way is the inode: the link
+    lands on the rootfs copy, never on the host's ``/etc``.
     """
     config_digest = _sha256(b"{}")
     l1 = registry.add_layer(
@@ -334,36 +354,38 @@ def test_resolve_keeps_symlink_targets_resolving_inside_the_chroot(
     cert_link = rootfs / "usr/lib/ssl/cert.pem"
     assert cert_link.is_symlink()
     target = cert_link.readlink()
-    assert ".." not in target.parts
-    # Resolve the target the way the sandbox does: an absolute target is
-    # anchored at the chroot root, a relative one at the link's own directory.
-    if target.is_absolute():
-        resolved = rootfs / target.relative_to("/")
-    else:
-        resolved = cert_link.parent / target
-    assert resolved.resolve() == (
+    assert not target.is_absolute()
+    assert ".." in target.parts
+    assert _inode(_resolved_in_chroot(rootfs, cert_link)) == _inode(
         rootfs / "etc/ssl/certs/ca-certificates.crt"
-    ).resolve()
-    assert resolved.read_text() == "CA\n"
+    )
+    assert _resolved_in_chroot(rootfs, cert_link).read_text() == "CA\n"
 
     certs_link = rootfs / "usr/lib/ssl/certs"
     assert certs_link.is_symlink()
     certs_target = certs_link.readlink()
-    assert ".." not in certs_target.parts
-    if certs_target.is_absolute():
-        resolved_certs = rootfs / certs_target.relative_to("/")
-    else:
-        resolved_certs = certs_link.parent / certs_target
-    assert resolved_certs.resolve() == (rootfs / "etc/ssl/certs").resolve()
+    assert not certs_target.is_absolute()
+    assert ".." in certs_target.parts
+    assert _inode(_resolved_in_chroot(rootfs, certs_link)) == _inode(
+        rootfs / "etc/ssl/certs"
+    )
 
-    # The whole extracted tree is ``..``-free, which is what keeps every
-    # mediated lookup on the openat2 fast path.
-    offenders = [
-        path
-        for path in rootfs.rglob("*")
-        if path.is_symlink() and ".." in Path(os.readlink(path)).parts
-    ]
-    assert offenders == []
+    # The whole extracted tree, link by link: the extractor's relative targets
+    # survive (the retired rewrite is what turned them rooted-absolute, and
+    # this is the guard that it does not come back), no link is absolute (the
+    # host-side spelling of the tree stays inside it), and every link resolves
+    # to the inode the image meant.
+    expected = {
+        "usr/lib/ssl/cert.pem": rootfs / "etc/ssl/certs/ca-certificates.crt",
+        "usr/lib/ssl/certs": rootfs / "etc/ssl/certs",
+    }
+    links = sorted(path for path in rootfs.rglob("*") if path.is_symlink())
+    assert [str(path.relative_to(rootfs)) for path in links] == sorted(expected)
+    for link in links:
+        assert not Path(os.readlink(link)).is_absolute()
+        assert _inode(_resolved_in_chroot(rootfs, link)) == _inode(
+            expected[str(link.relative_to(rootfs))]
+        )
 
 
 def test_resolve_with_bearer_auth_and_redirect(registry, tmp_path):
