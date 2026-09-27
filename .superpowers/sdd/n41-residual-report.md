@@ -242,6 +242,17 @@ IDENTICAL failed list
 5. 变异 (d)（TTL → 1 s）只能靠 TTL 常量断言变红，不是行为性红：修后认领 TTL 的行为后果
    需要"持有旧对象 > TTL"才显现（见第 1 条），单测里无法在 1 s 内稳定构造。这一点写进
    报告以免读者以为 (d) 证明了别的东西。
+6. **WATCH 冲突重试有界 ⇒ 新增了一条 `RuntimeError` 出口**（`RELEASE_ONCE_MAX_ATTEMPTS = 64`）。
+   要撞上需要"同一份记录/账本键在别人手里的读-写窗口内被改 64 次"，而车队只有两个副本、
+   一次归还的窗口是亚毫秒级 —— 实际概率极低；真撞上时的行为等同"拒绝归还"（预留留在账上，
+   调用方可重试），方向安全。修前没有这个出口（代价是没有事务）。
+7. 附带跑了一次 `tests/contract -q` 作为额外保险：**1 failed / 338 passed / 49 skipped**，
+   唯一那条 `test_a_refused_tree_is_parked_and_the_row_it_pinned_is_released[lsattr]` 是
+   **与本单无关的既有抖动**（失败点在 `envd_service.agent._disk_loop`：用例把
+   `agent_mod.time` 换成 `SimpleNamespace` 后，后台磁盘轮询那一拍撞上 `time.monotonic`
+   缺失，多出一行 `disk loop tick failed` 日志，被 `_agent_lines(caplog)` 的精确比对抓住；
+   单独跑该用例 **2 passed**）。本单要求的是 `tests/unit` 的 failed 名单（§7），contract
+   车道不参与判据。
 
 ---
 
