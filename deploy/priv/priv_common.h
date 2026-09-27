@@ -24,8 +24,17 @@
 #define PRIV_DEFAULT_UID_POOL_START 10000L
 #define PRIV_DEFAULT_UID_POOL_SIZE 1000L
 #define PRIV_DEFAULT_WORKSPACE_BASE "/var/lib/e2b-sandboxes"
+#define PRIV_DEFAULT_MAINT_BIN "/var/lib/e2b-priv/e2b-maint"
+#define PRIV_DEFAULT_BROKER_SOCKET "/run/e2b-broker/broker.sock"
 #define PRIV_DEFAULT_SUPERVISE_BIN \
     "/usr/local/lib/python3.14/site-packages/sandlock/bin/sandlock-supervise"
+
+/* C1: the socket broker is only ever talked to by the worker, which runs as
+ * this identity in the non-root shape. */
+#define PRIV_DEFAULT_PEER_UID 65534L
+#define PRIV_DEFAULT_PEER_GID 65534L
+
+#define PRIV_MAX_ROOTS 4
 
 /* The program name used in every diagnostic. */
 const char *priv_progname(void);
@@ -34,6 +43,11 @@ void priv_set_progname(const char *name);
 /* Print "e2b-...: <fmt>" to stderr and exit(PRIV_EXIT_REFUSED). */
 void priv_fail(const char *fmt, ...) __attribute__((format(printf, 1, 2)))
     __attribute__((noreturn));
+
+/* Print "e2b-...: refused: <message>" to stderr and *stay up*: the socket
+ * broker answers the refusal on the connection it came from and keeps
+ * serving, so a single bad peer must not take the node's broker down. */
+void priv_report_refused(const char *message);
 
 /* Print "e2b-...: <fmt>" to stderr and exit(PRIV_EXIT_USAGE). */
 void priv_usage(const char *fmt, ...) __attribute__((format(printf, 1, 2)))
@@ -53,12 +67,39 @@ int priv_validate_uid(long uid, char *err, size_t errlen);
  * chgrp-to-own-gid is never a privilege widening. */
 int priv_gid_allowed(long gid, char *err, size_t errlen);
 
+/* C1 (serve): the peer gate. The socket file mode cannot express "the worker
+ * and nothing else" -- the sandboxes share the node's filesystem view -- so
+ * the accepted connection's SO_PEERCRED uid and gid must both equal
+ * E2B_BROKER_PEER_UID / E2B_BROKER_PEER_GID (default 65534). */
+int priv_peer_allowed(long uid, long gid, char *err, size_t errlen);
+
+/* The configured peer identity (default 65534), so `serve` can refuse to
+ * start on a value it cannot read instead of answering every request with a
+ * message the caller cannot act on. Does not return on a bad value. */
+void priv_peer_identity(long *uid, long *gid);
+
 /* N27: the platform state base -- `E2B_STATE_BASE` when the deployment names
  * one, the workspace base otherwise (one shape, one root). */
 const char *priv_state_base(void);
 
-/* realpath() + containment in <workspace_base>/, <state_base>/ (only when it
- * is a root of its own) or <shared_volume_root>/.
+/* The whitelist, in the order -- and with the same conditional entries -- as
+ * the Python side (PrivHelpers._root_paths): the workspace base, the state
+ * base only when it is a root of its own, the shared volume root whenever the
+ * deployment names one, and the image cache (`E2B_IMAGE_CACHE_DIR`) only when
+ * it is named and is not already one of them -- the last one because a
+ * sandbox's secret file lives at
+ * `<image_cache_dir>/secrets/<sandbox_id>/` and a non-root worker has to be
+ * able to hand it to a pool uid. There is deliberately **no default** for it:
+ * the Python side's unset value is *cwd-relative*, so a daemon whose cwd is
+ * somewhere else would whitelist a directory nobody means -- and the two
+ * sides' root lists would disagree, which is what the hello handshake refuses.
+ * Returns how many were written. */
+size_t priv_root_paths(const char **out, size_t max);
+
+/* The same roots as a JSON array, for the `hello` handshake. */
+void priv_roots_json(char *out, size_t outlen);
+
+/* realpath() + containment in the roots above.
  * `strict` additionally refuses the roots themselves (delete/chown must never
  * target a whole managed root). Returns 0 on success and writes the resolved
  * absolute path into `resolved` (>= PATH_MAX bytes). */
@@ -70,5 +111,16 @@ void priv_roots_text(char *out, size_t outlen);
 
 /* The pinned sandlock-supervise path (E2B_SUPERVISE_BIN or the build default). */
 const char *priv_supervise_bin(void);
+
+/* The installed maintenance broker (E2B_MAINT_BIN or the build default): the
+ * daemon refuses to serve unless it *is* this path (see `serve` in maint.c). */
+const char *priv_maint_bin(void);
+
+/* The broker socket path (E2B_PRIV_HELPER_SOCKET or the build default). */
+const char *priv_broker_socket(void);
+
+/* JSON-escape `len` bytes of `data` into `out`, which must hold at least
+ * `6 * len` bytes (the widest escape is \u00XX). Returns the bytes written. */
+size_t priv_json_escape(char *out, const char *data, size_t len);
 
 #endif /* E2B_PRIV_COMMON_H */
