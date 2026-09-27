@@ -93,7 +93,9 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 `autoscaler`（Deployment）、`e2b-worker`（StatefulSet，`e2b-worker-0/1` 各落一个节点）、
 `redis`（Deployment）、`seccomp-installer`（DaemonSet，2/2）、
 `gateway-nodeport`（NodePort **31907**）、`gateway` / `control-plane` / `redis` /
-`worker-headless`（ClusterIP）。
+`worker-headless`（ClusterIP）。（**C1 wave 2 起基线还会多一个 `e2b-priv-broker` DaemonSet**：
+每节点一个 root broker，`chown`/`rm`/`walk` 经 unix socket 代做 —— 见 §7 与
+`deploy/k8s/priv-broker.yaml`；本节上面的 pod 清单是 2026-09-25 的读数。）
 
 镜像 tag 必须等于 `deploy/stack/.version`（`apply.sh` 就是拿它渲染的）。2026-09-25 实测
 两边都是 `0.1.0-440-g9b57736-20260922-191343`。
@@ -134,6 +136,27 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **pod（2026-09-27 实测）**：`control-plane` 两个副本各 `2/2`（控制面 + gateway，F11 多副本已上线）、
 `autoscaler` `1/1`、`e2b-worker-0/1` 各 `1/1`（分别落在 `.80.94` / `.80.140`）、`redis` `1/1`、
 `seccomp-installer` `2/2`（一节点一个）。节点仍是 2 台 arm64 / `v1.36.4+k0s`。
+
+**C1 特权外置后的形态（2026-09-27，wave 2；仓库规格 = 下一次 apply 之后的集群形态）**：
+
+* 基线 `deploy/k8s/priv-broker.yaml` 新增 **`e2b-priv-broker` DaemonSet**，每节点一个 **root** 容器
+  （`runAsUser: 0` + `capabilities.add: [CHOWN, DAC_OVERRIDE, FOWNER]`）：`chown`/`rm`/`walk`
+  由它经 unix socket `/run/e2b-broker/broker.sock` 代做，并接管了原来在 worker pod 里的两个
+  属主 init（`image-cache-init` / `workspace-root-init`）。它挂在**基线**里（不是 overlay），
+  kustomize 渲染出的 `name: e2b-priv-broker` 在 `deploy/k8s` 与 `deploy/k8s-k0s` 各恰一份。
+* **worker pod 里不再有 root**：`e2b-worker` 的 worker 容器没有 `runAsUser`（回落镜像
+  `deploy/docker/Dockerfile.envd` 的 `USER 65534:65534`），`capabilities.add` 只剩
+  `SETUID`/`SETGID`，唯一的 initContainer 是**非 root** 的 `wait-for-broker`（broker 先监听、
+  worker 才放行；等的是 `hello` 往返，不只是 socket 文件存在）。
+* **第一次滚这个形态必须先把平台态属主迁过来**（一次迁移，不是滚动）：worker 缩到 0 →
+  `deploy/scripts/migrate-state-owner.sh --apply` → 再把 worker 起回来。它只 `chown` 七个平台目录
+  （`state`/`_migrate`/`_images`/`_secrets`/`_snapshots`/`_templates`/`_builds`），**绝不碰
+  `<export>/workspaces/**`**（那是池 uid 的树）。用法见 `deploy/k8s-k0s/README.md`「平台态属主迁移」、
+  正文见 `docs/k8s-deployment.md` §24。顺序反了（先上 worker）会得到读不了 `0600`/`0700`
+  平台态的 worker —— 也就是每个 `Sandbox.create()` 都失败。
+
+> 上面「pod（2026-09-27 实测）」里的几个 pod 是**早先**的读数（当时 worker 还以 root 跑）；
+> C1 的 broker DaemonSet 与无 root worker 以仓库规格为准，实测数字在 C1 上线后按 §12 的方式重取。
 
 > **"现在跑的是哪一版"永远以 `deploy/stack/.version` + 集群里 `autoscaler/control-plane/e2b-worker`
 > 三个工作负载的实际镜像为准**（两边必须一致），别引用本文任何一节里写死的版本号。本节记的是
@@ -224,9 +247,9 @@ DRY_RUN=1 deploy/k8s-k0s/apply.sh 2>/dev/null | kubectl diff -f -        # 看�
 DRY_RUN=1 deploy/k8s-k0s/apply.sh 2>/dev/null | kubectl apply --dry-run=server -f -
 ```
 
-overlay 改了什么、为什么（NAS PV 必须 NFSv4.0、worker `runAsUser: 0`、容量与 resources、
-Calico VXLAN 只能建集群时定）见 `deploy/k8s-k0s/README.md`；集群层设计的全貌见
-`docs/k8s-deployment.md`。
+overlay 改了什么、为什么（NAS PV 必须 NFSv4.0、容量与 resources、Calico VXLAN 只能建集群时定）
+见 `deploy/k8s-k0s/README.md` —— C1 起**没有** worker `runAsUser: 0` 这一行：特权动作在**基线**的
+`e2b-priv-broker` DaemonSet 里（§7）。集群层设计的全貌见 `docs/k8s-deployment.md`。
 
 ---
 
