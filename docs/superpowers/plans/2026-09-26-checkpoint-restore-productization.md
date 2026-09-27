@@ -1,8 +1,11 @@
 # checkpoint/restore 产品化实施计划
 
-> **执行状态（2026-09-27 更新）**：**Task 1 / 2 / F2 / E2 / E3 / E4 / E8 已完成并上线**（`E2B_PAUSE_CHECKPOINT=1` 写在 `deploy/k8s/worker.yaml`，集群端到端验收全绿）；条件任务 **F3/F4 的决定门都落在"不做"**（复核 0 命中）。
-> **仍有效的决定**：恢复**进会话**（保留 `exec`）；平台账是**软账**（允许并发短超）。
-> **已作废的假设**：正文早期"恢复后不能 exec""restore stub 与 chroot 根不兼容"两条 —— 均已被 fork 取代，`2026-09-26-decisions.md`《D9 已关闭》已两次更正。**仍未做/未定**：`E2B_PAUSED_TTL_S`（paused 过期策略）**待拍板**、今天无实现。证据：`docs/checkpoint-restore-e2b-half.md` §6(k) 与 `docs/reports/checkpoint-e5-e8-audit-report.md`。
+> **执行状态（2026-09-27 更新）**：**Task 1 / 2 / F2 / E2 / E3 / E4 / E8 已完成并上线**（`E2B_PAUSE_CHECKPOINT=1` 写在 `deploy/k8s/worker.yaml`，集群端到端验收全绿）；条件任务 **F3/F4 的决定门都落在"不做"**（复核 0 命中）。**E5–E7 三条尾巴也已收口**：
+> `E6`（`E2B_PAUSED_TTL_S`）**已实现、默认 `0` = 不启用**（周期任务，走与 delete 同一条清理 + 点名日志 + 跨副本单飞）；
+> `E7`（平台账告警）**已实现、默认阈值 `0.8`、进入/退出各一条 + 单飞**；
+> `E5` **判定为无独立交付（被 E4/E8 吸收）**，依赖表已就地标注。见文末《E5–E7 收口（2026-09-27）》。
+> **仍有效的决定**：恢复**进会话**（保留 `exec`）；平台账是**软账**（允许并发短超，**告警不是准入判据**）。
+> **已作废的假设**：正文早期"恢复后不能 exec""restore stub 与 chroot 根不兼容"两条 —— 均已被 fork 取代，`2026-09-26-decisions.md`《D9 已关闭》已两次更正；本计划曾经"留待拍板"的 `E2B_PAUSED_TTL_S` 也已按默认关落地。证据：`docs/checkpoint-restore-e2b-half.md` §6(k)/§6(l) 与 `docs/reports/checkpoint-e5-e8-audit-report.md`。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -57,9 +60,9 @@
 | E2 | F2 的 wheel | E7 的只读查询指标 |
 | E3 | 无 | E7 |
 | E4 | 无 | E8（文档要写"孤儿会回收"） |
-| E5 | 无 | E8 |
-| E6 | 拍板 | E8 |
-| E7 | E2 + E3 | E8 |
+| E5 | **无独立交付，见 E4/E8**（2026-09-27 判定：本表这一行只被 E8 引用，而 E8 要的文档义务已由 E4/E6/E7 与决策点表第 2 行各自承担；正文从未定义它。证据见文末《E5–E7 收口》③） | E8 |
+| E6 | 已拍板：默认 `0` = 不启用（2026-09-27 已实现，见文末《E5–E7 收口》①） | E8 |
+| E7 | E2 + E3（数字可见） | E8（告警已于 2026-09-27 补上，见《E5–E7 收口》②） |
 | E8 | 全部 | — |
 
 ---
@@ -83,6 +86,9 @@
 | 单测（checkpoint 家族） | `tmp/testenv/bin/python -m pytest tests/unit/test_checkpoint_store.py tests/unit/test_agent_checkpoint_restore.py tests/unit/test_sandlock_executor_route_b.py -q` | 全绿（现基线：18 + 11 + 37 条，2026-09-26 实测） |
 | 契约（生命周期） | `tmp/testenv/bin/python -m pytest tests/contract/test_pause_write_gating.py tests/contract/test_pause_resume_sandlock_multinode.py -q` | 全绿 |
 | 新增契约（只读查询） | `tmp/testenv/bin/python -m pytest tests/contract/test_checkpoint_status_api.py -q` | 全绿（E3 新建） |
+| 新增单测（E6 paused 过期） | `tmp/testenv/bin/python -m pytest tests/unit/test_paused_ttl_sweep.py -q` | **11 passed**（`0` 的反证 / 只删"超期且 paused" / 配额归零 / 单飞 / 点名日志 / `create_app` 接线） |
+| 新增单测（E7 平台账告警） | `tmp/testenv/bin/python -m pytest tests/unit/test_platform_ledger_alert.py -q` | **13 passed**（越限恰一条 / 未越限不打 / 退出再进入再打 / `budget=0` 不告警 / 单飞 / `create_app` 接线） |
+| 变异反证（两条尾巴的守卫） | `tmp/testenv/bin/python deploy/scripts/acceptance/e567_mutations.py` | **11 个变异体逐个被杀**（每条判据一个变体；脚本改前备份、`finally` 恢复，输出抄进 `.superpowers/sdd/checkpoint-e567-report.md` §4） |
 | 容器 lane（镜像形态） | `deploy/scripts/acceptance/gateA-full.sh tmp/k0s/e-plan-gateA.log` | **1772 passed / 6 skipped / 3 xfailed / 0 failed**（只加测试时同步上浮） |
 | 容器 lane（pure 形态） | `deploy/scripts/acceptance/gateB-full.sh tmp/k0s/e-plan-gateB.log` | **1765 passed / 13 skipped / 3 xfailed / 0 failed** |
 
@@ -104,7 +110,7 @@
 | 1 | ~~D9 是否按"恢复进会话"封板~~ **已关闭**（2026-09-25）——剩下的同类问题是：OCI / `--restore-from` 那条**另一条路**要不要也支持 exec | 不投人：E2B 从不走 `--restore-from`（`route_b.py` 只发 `checkpoint` / `restore` 两个 verb），等出现真实消费者再评估 | Task F4（决定门，不命中就不做）/ Task 2 Step 3 ③（判据里写明两条路的差别） |
 | 2 | **恢复后进程的 stdout 是否接到平台日志**（今天进 `/dev/null`） | 不接，只**写进对外语义**（"恢复的沙箱日志消失"） | Task E8 |
 | 3 | **平台账接受"软账 + 并发可超"，还是做跨节点硬账** | 接受软账：保持"整个 `_runtime`"口径 + 把 `used/budget` 暴露 + 告警 | Task E7（暴露数字）/ Task E8（写清口径） |
-| 4 | **paused 是否要有 TTL 以及多久**（会摧毁用户状态） | `E2B_PAUSED_TTL_S` 默认 **0 = 不启用**；只在拍板后打开 | Task E6 |
+| 4 | **paused 是否要有 TTL 以及多久**（会摧毁用户状态） | `E2B_PAUSED_TTL_S` 默认 **0 = 不启用**；只在拍板后打开 | Task E6 —— **已定（2026-09-27）**：默认 `0` 就是不启用的裁定，机制已实现且默认关（§《E5–E7 收口》①） |
 | 5 | 是否新增**公开端点** `GET /sandboxes/{id}/checkpoint`（API 契约扩张，要和 SDK 对齐） | 新增（只读、不碰 204 契约） | Task E3 |
 | 6 | 是否把 `deploy/scripts/checkpoint_acceptance.py` **转正进仓库** | 转正（它现在是唯一的生产形态验收，却躺在被 `.gitignore` 忽略的 `tmp/` 里） | Task 2 |
 | 7 | `E2B_PAUSE_CHECKPOINT` 是否长期默认开（它让 `pause` 变成"写整个进程内存"的动作） | 保持清单里 `"1"`，并把代价写进文档 | Task E8 |
@@ -1928,3 +1934,63 @@ git commit -m "fix(checkpoint): reclaim ownerless images, and leave no empty sto
 |---|---|---|---|
 | F3 | `rg "os\.replace\|mv \|rename" docs/checkpoint-restore-e2b-half.md docs/k8s-deployment.md` —— 出现"业务文件会被 replace"才做 | 命中只有本能力自己的 rename（引擎保存 `<dir>.tmp`→`latest`、验收脚本"临时文件 + `os.replace`"）与磁盘记账的 rename，**无业务文件被 replace 的用法** | **不做（默认）**；已复核并把"同路径换 inode 不校验"这句**已知边界**补进 §6(k)⑤ |
 | F4 | `rg "restore-from\|restore_from" envd_service control_plane deploy tests` —— 有命中才做 | **0 命中**（无消费者） | **不做（默认）**；结论补进 §2 D9 行 + §6(k)⑤ |
+
+---
+
+## E5–E7 收口（2026-09-27）
+
+上一节是**审计**（每一处引用到树里取证据，判"做没做"）；这一节是**交付**：三条尾巴各自有了
+结局——两条实现（默认关/默认静默）、一条判为无独立交付。运营口径写在
+`docs/checkpoint-restore-e2b-half.md` **§6(l)**（开关、语义、阈值、单飞、日志口径、怎么开关），
+逐条证据与变异体记录在 `.superpowers/sdd/checkpoint-e567-report.md`。
+
+### ① `Task E6` = `E2B_PAUSED_TTL_S`（已实现，默认 `0` = 不启用）
+
+* **定形**（此前从未有形状）：paused 的沙箱不参与普通 TTL（`_ttl_reapable` 明确豁免它，因为
+  "停车"就是要保住会话、而且它不占准入额度），于是没人给它兜底——`E2B_PAUSED_TTL_S` 就是那条
+  兜底：**超过 TTL 仍是 `paused` ⇒ 走与 `DELETE /sandboxes/{id}` 同一条清理**。
+* **Files**：新增 `control_plane/registry/paused_ttl.py`；接线在 `control_plane/app.py`（lifespan 里
+  与既有 `TTLSweeper` 并排）；`_on_sandbox_removed` 现在**返回它真删了什么**，两个扫描共用。
+* **语义**：周期任务（与控制面 TTL 扫描同节奏 1 s）→ 选 `state == "paused"` 且
+  `now - (paused_at or last_active_at) >= ttl` → 节点侧 teardown（远程 worker 的
+  `DELETE /agent/sandboxes/{id}`，删 runtime + 树 + `_runtime/.checkpoints/<id>`）→
+  `registry.delete()`（删记录、幂等归还配额、释放 host uid）。**先拆后删**，与 delete 端点同序。
+* **一条点名日志**：`paused TTL: sandbox <id> had been paused <N>s (>= <ttl>s); removed <清单>`；
+  清单只列真删掉的（`runtime, checkpoint-image` / `record`；配额**仍持有**时才追加 `quota`——
+  今天的 `pause` 在暂停那一刻就还了它，E9.2）。
+* **单飞**：`try_claim(redis_client, "e2b:paused-ttl:sweep", ttl_s=1)`，与 `F11` step 4 同一协议；
+  多副本下每轮只有一个副本动手。
+* **默认安全的反证**：`0` 时**连任务都不建**（`start()` 直接返回），所以不是"跑了没删"。
+* **怎么开/关**：控制面进程环境 `E2B_PAUSED_TTL_S=<秒>`；不设或 `0` = 关。
+* **Tests**：`tests/unit/test_paused_ttl_sweep.py`（11 条，含 `create_app` 接线：真发 worker DELETE +
+  删记录 + 恰一条日志；关闭时不建任务）。
+
+### ② `Task E7` = 平台账告警（已实现，默认阈值 `0.8`）
+
+* **定形**：决策点表第 3 行选了"软账 + 暴露 `used/budget` + 告警"，其中数字已在 S2 上报到节点
+  视图，**缺的只有告警**。`control_plane/registry/ledger_alert.py` 周期读**同一个节点视图**
+  （`platform_disk_used_mb` / `platform_disk_budget_mb`）算比例，越限打一条点名 WARNING。
+* **阈值**：`E2B_PLATFORM_LEDGER_ALERT_RATIO`，默认 **0.8**，`0` = 关闭。
+  `budget = 0` = 不限 ⇒ 不告警。**恰好等于阈值算越限**（`>=`）。
+* **刷屏策略**：**进入/退出各一条**（进入 WARNING、退出 INFO、预算被撤一条单独的 INFO、
+  节点从视图消失不打"恢复"），停在阈值之上不重复。理由：跨越才是事件；要周期采样的话那是
+  指标管道的事，而部署里没有（`rg 'alert|PrometheusRule' deploy/` 0 命中）。
+* **周期与单飞**：30 s 一轮（`_LEDGER_ALERT_INTERVAL_S`），单飞键 `e2b:ledger-alert:sweep`。
+* **它不改准入**：软账 + 允许并发短超仍是 §6(k)② 的口径；这条告警只是"该看一眼了"。
+* **Tests**：`tests/unit/test_platform_ledger_alert.py`（13 条，含 `create_app` 会启动扫描）。
+
+### ③ `E5` 的处置 = **无独立交付，见 E4/E8**（作废）
+
+不是"看起来没人用"，是逐处引用都指到了别的东西：
+
+1. **依赖表这一行是唯一实质引用**：`| E5 | 无 | E8 |`（本表上方）。它要的是"`E8` 的收口文档里
+   补一句 `E5` 的交付"，而 `E8` 继承的四条文档义务已被 **E4**（孤儿图会回收，§6(k)③）、
+   **E6**（paused 会过期，§6(l)①）、**E7**（账口径 + 告警，§6(l)②）与**决策点表第 2 行**
+   （恢复后 stdout 语义，直接归 E8，§6(k)①）各自承担。
+2. **架构行（本节上方 `:11`）枚举 E2B 侧要补的四件**时，归属是 `exe`/`argv` 透传（E2）、
+   只读查询端点（E3）、孤儿图回收（E4）、paused 过期策略（E6）+ 平台账（E7）——**E5 没有一件**。
+3. **执行顺序（`:48`）**只把 `E2 → E8` 串起来（E2 依赖 F2 的 wheel、E7 依赖 E2/E3/E4），
+   **E5 从未被排进任何一步**；`rg -n 'E5'` 全计划只有这些引用。
+4. 所以 `E5` 与 `E4` 在账面上是同一个缺口（"某一件事要 E8 的文档兜底"），而它要兜的那件事
+   已经由上面四个交付覆盖——判为**无独立交付**，依赖表已就地标注。若日后有人要给它真实形状，
+   审计 §5.1 的提示仍然成立：应是某项 E2B 工作才有意义，而今天四件都有主。

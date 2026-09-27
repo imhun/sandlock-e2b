@@ -8,7 +8,9 @@
 > 设计已落地、已上线并已集群验收（S2/S3/S4 见 §6，E5–E8 收口审计见 §6(k)）；需求也**已确认**
 > （用户裁定"有需求、恢复后必须支持 exec"，见 §0 的 ✅ 段与 §6(k)）。本文现在的读法：
 > **`E2B_PAUSE_CHECKPOINT` 默认关**是**代码**默认；**生产清单把它设成 `"1"`**（`deploy/k8s/worker.yaml`），
-> 所以线上 `pause` 已经变成"先写整份进程内存"。唯一**仍开放**的一条是 `E2B_PAUSED_TTL_S`（§6(k)⑥，待拍板、今天无实现）。
+> 所以线上 `pause` 已经变成"先写整份进程内存"。**E5–E8 的尾巴已全部收口**（2026-09-27，见 §6(l)）：
+> `E2B_PAUSED_TTL_S` 已实现（默认 `0` = 不启用）、平台账告警已实现（默认阈值 `0.8`）、`E5` 判为
+> **无独立交付（被 E4/E8 吸收）**。两条开关都**默认关/默认静默**，打开是部署的决定。
 >
 > **引用约定（2026-09-27 更新）**：正文里的 `tmp/**` 与 `.superpowers/sdd/**` 都在 `.gitignore` 里
 > （**不是仓库路径**）。可重跑脚本已迁到 [`deploy/scripts/acceptance/`](../deploy/scripts/acceptance/)
@@ -563,9 +565,98 @@ replace"的用法** ⇒ 不做。**已知边界**：恢复按**路径**重开 fd
 （真要支持时按 F3 的候选做）。Task F4（让 `--restore-from` 也能 exec）——决定门 0 命中 ⇒
 不做（见 §2 的 D9 行）。
 
-⑥ **`E2B_PAUSED_TTL_S`（paused 的过期策略）仍未拍板**：计划默认 **0 = 不启用**，且今天
-**没有实现**（全库 `rg 'E2B_PAUSED_TTL_S'` 只命中计划本身）——这是**有意不实现**，因为
-它会摧毁用户状态，形状没定就不写。登记在 `docs/open-issues.md` 的 checkpoint 行。
+⑥ **`E2B_PAUSED_TTL_S`（paused 的过期策略）——已实现，默认关**（2026-09-27 收口，见 §6(l)）。
+本节写这段时的状态是"未拍板、有意不实现"；现在这条尾巴按"默认 **0 = 不启用**"落地：
+开关、语义、日志、单飞与验收全在 §6(l)。
+
+---
+
+### (l) E5–E7 三条尾巴的收口（2026-09-27）
+
+计划正文只写到 `Task E4`，依赖表/决策点表却引用了 `E5`–`E8`（审计见
+`docs/reports/checkpoint-e5-e8-audit-report.md`）。本轮把 `E5`/`E6`/`E7` 三条收口，**两条默认关**、
+**一条判为没有独立交付**。
+
+① **E6：`E2B_PAUSED_TTL_S`（paused 过期策略）——已实现，默认 `0` = 不启用。**
+
+* **语义**：每轮扫出"状态仍是 `paused`、且已停了超过 TTL"的沙箱，走**与 `DELETE
+  /sandboxes/{id}` 同一条清理**——先把沙箱在**它所在的节点**上拆掉（worker 的
+  `DELETE /agent/sandboxes/{id}`，也就是会删 `_runtime/.checkpoints/<id>` 那张图的那个动作），
+  再 `registry.delete()` 掉记录（同一条 `_release` 链：幂等归还配额 + 释放 host uid）。
+  **顺序是承重的**，与 delete 端点一致：先拆树再删记录；反过来就留下一棵没有任何记录引用的
+  孤儿树（E4 的 reconcile 才是兜底，不是首选）。
+* **"paused 多久"的取数**：优先 `record.paused_at`；平台自己发起的暂停（驱逐、resume 回滚）带
+  reason、带这个时间戳，**调用方发起的暂停不带**（`SandboxRecord.pause(reason=None)` 把它写成
+  `None`），此时回退到 `last_active_at` —— 而 pause 端点在那之前刚 `record.touch()`（E9.1），
+  所以回退值就是暂停时刻本身（对更老的记录只是上界）。两个戳都没有 ⇒ **不可计时 ⇒ 跳过**
+  （"不知道多老"绝不能被读成"很老"）。
+* **一条点名日志**（每删一个沙箱一行，WARNING）：
+  `paused TTL: sandbox <id> had been paused <N>s (>= <ttl>s); removed <清单>`。
+  清单是**真删掉的东西**：节点侧拆干净 ⇒ `runtime, checkpoint-image`；记录删掉 ⇒ `record`；
+  配额**确实还持有**时才追加 `quota`（今天的 `pause` 在暂停那一刻就还了它，见 E9.2 —— 所以这一项
+  通常不出现，出现就说明这是一条 E9.2 之前的旧记录，或别的副本读到了过期副本）。
+  节点拒绝/不可达时不谎报：那一路的 WARNING 由 teardown 自己打（点名节点与原因，说明留给该
+  worker 的下一轮 reconcile），本行只列真正完成的动作。
+* **周期与单飞**：与控制面既有的 TTL 扫描同一个节奏（`_TTL_SWEEP_INTERVAL_S = 1.0`），
+  单飞用同一套协议（`try_claim` 的 TTL 键，`F11` step 4）——键是
+  `e2b:paused-ttl:sweep`，`ttl_s` 等于扫描间隔，所以多副本下**每轮只有一个副本动手**；
+  候选集来自**共享**记录，两个副本同扫必然选中同一批沙箱，没有单飞就会拆两遍。
+* **怎么开 / 怎么关**：`E2B_PAUSED_TTL_S=<秒>`（控制面进程的环境变量；集群里加到
+  `deploy/k8s/control-plane.yaml` 的 control-plane 容器 `env:` 下）。**不设或设 `0` 就是关闭**：
+  关闭时**连任务都不建、连 claim 都不取**（`PausedTTLSweeper.start()` 直接返回），
+  不是"跑了但没删"。**打开之前请确认代价**：这会**摧毁用户状态**（被回收的是已经写盘的
+  进程镜像，恢复不回来）。
+* **本地形态的一处差别（已知边界）**：`local://` 节点走的是控制面自己的 `_destroy_local`，
+  它删的是 `<workspace_base>/<id>`，**不含** `<state_base>/_runtime/.checkpoints/<id>`，
+  所以本地形态这一行只报 `runtime, workspace`，图留给 worker 的 reconcile 按"没有记录认领"
+  收走（E4，§6(k)③）。生产形态（远程 worker、`E2B_PAUSE_CHECKPOINT=1` 的那套）走的是
+  worker 的 delete，图在同一动作里删掉。
+
+② **E7：平台账告警——已实现，默认阈值 `0.8`。** 周期扫描读的是**同一个节点视图**
+（`NodeRecord.platform_disk_used_mb` / `platform_disk_budget_mb`，即 `/internal/nodes` 给的那两个数），
+算 `used/budget`，**越限打一条点名 WARNING**：
+`platform ledger over budget: node <id> used <used> MiB of <budget> MiB (ratio <r> >= <t>)`。
+
+* **阈值**：`E2B_PLATFORM_LEDGER_ALERT_RATIO`，默认 **0.8**（生产形态上 512 MiB 的沙箱、
+  每张图几十到几百 MiB，"还剩五分之一"大致就是"再放得下一张图"），`0` = 关闭告警。
+  `budget = 0` 是**不限**（全仓的读法），所以没有预算的节点**永不告警**。
+* **刷屏策略：进入/退出各一条**，停在阈值之上不再重复。跨过去是**事件**，"还在上面"不是新信息；
+  真的要每 N 分钟报一次的话，那是指标管道的事，而部署里没有指标管道
+  （`rg 'alert|PrometheusRule' deploy/` 0 命中）——所以这里只做"一条点名日志"。退出时打一条
+  INFO（`platform ledger back under budget: …`）；预算被撤掉（`budget` 变 `0`）时打的是
+  `platform ledger is no longer budgeted: node <id> had used <used> MiB`，**不谎称"回落"**。
+  节点整个从视图里消失（worker 退役、视图条目过期）不打恢复行——那不是"降下来了"。
+* **周期与单飞**：30 s 一轮（`_LEDGER_ALERT_INTERVAL_S`；数字只在心跳/捕获时动，告警是跨越事件
+  而不是实时仪表，也没必要把共享节点视图按秒读一遍），单飞键 `e2b:ledger-alert:sweep`。
+* **怎么开 / 怎么关**：同上，`E2B_PLATFORM_LEDGER_ALERT_RATIO` 放进控制面进程环境；
+  默认值即"开，阈值 0.8"，设 `0` 关闭。
+* **口径**仍然是 §6(k)② 那句：**软账、允许并发短超**——所以这条告警**不是**准入判据，
+  它只是"你该看一眼了"，准入依旧是捕获时那两道账检查。
+
+③ **E5：判定为"无独立交付"，被 E4/E8 吸收**（不是"看起来没人用"）：
+
+* 计划里 `E5` **只出现在三处**：依赖表的一行 `| E5 | 无 | E8 |`（`E8` 依赖它）与执行顺序里
+  `Task E2 → Task E8` 这一段范围（`:42`、`:48` 的"E2B 侧任务/顺序"行）——**正文里没有任何一节
+  定义它**（`rg -n 'E5' docs/superpowers/plans/2026-09-26-checkpoint-restore-productization.md`
+  的命中只有这些引用与审计段落）。
+* 依赖表那一行要的是"`E8` 的文档里补一句 `E5` 的交付"。而 `E8` 继承的文档义务已经被
+  **E4**（"孤儿图会回收"，§6(k)③）、**E6**（"paused 会过期"，§6(l)①）、**E7**（"账口径 + 告警"，
+  §6(l)②）与决策点表第 2 行（恢复后 stdout 语义，**直接归 E8**，§6(k)①）各自承担；
+  架构行（`:11`）枚举 E2B 侧要补的东西时是"`exe`/`argv` 透传（E2）、只读查询端点（E3）、
+  孤儿图回收（E4）、paused 过期策略（E6）+ 账（E7）"，**E5 没有任何一件**。
+* 结论：**`E5` = 无独立交付，见 E4/E8**（计划依赖表已就地标注）。判定证据与"为什么不能只说
+  '没人用'"写在 `.superpowers/sdd/checkpoint-e567-report.md`，审计期结论见
+  `docs/reports/checkpoint-e5-e8-audit-report.md` §5.1。
+
+④ **验收**：`tests/unit/test_paused_ttl_sweep.py`（11 条：开关默认值、`0` 的反证、只选"超期且
+paused"、配额归零（含 E9.2 之前仍持有的旧记录）、**不重复释放**、点名日志、丢 claim 跳过、
+共享 claim 只有一个副本动手、`create_app` 的**接线**（真发 worker DELETE + 删记录 + 一条日志）、
+关闭时不建任务）；`tests/unit/test_platform_ledger_alert.py`（13 条：阈值默认/关闭、越限恰一条、
+不重复、未越限不打、恰好等于阈值算越限、`budget=0` 不告警、退出再进入再打、节点消失不谎报恢复、
+预算撤销不谎报回落、单飞、周期循环里每次跨越只打一条、视图不可列举时不炸、`create_app` 会启动
+扫描）。11 个变异体（去关闭守卫、去 paused 过滤、
+去单飞、去 teardown、不删记录、不接线、不记状态、`budget=0` 当满等）**逐个真跑并被杀**，
+命令与输出在报告 §4。
 
 ---
 

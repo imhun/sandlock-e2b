@@ -28,7 +28,16 @@ from control_plane.config import Settings, local_node_quota_via_agent
 from control_plane.metrics import SlidingWindowCounter
 from control_plane.queue import CreateQueue
 from control_plane.registry.manager import SandboxRegistry
+from control_plane.registry.ledger_alert import (
+    PlatformLedgerAlerter,
+    ledger_alert_ratio,
+)
 from control_plane.registry.nodes import NodeRegistry
+from control_plane.registry.paused_ttl import (
+    PausedTTLSweeper,
+    paused_ttl_seconds,
+    reap_paused_sandbox,
+)
 from control_plane.registry.secrets import SecretRegistry
 from control_plane.registry.snapshots import SnapshotRegistry
 from control_plane.registry.templates import TemplateRegistry
@@ -39,6 +48,13 @@ from control_plane.registry.redis_backend import try_claim
 #: The TTL sweeper's cadence, and therefore the width of its single-flight
 #: claim (F11 step 4): one replica per interval, no lock to release.
 _TTL_SWEEP_INTERVAL_S = 1.0
+
+#: E7's platform-account scan. Deliberately slower than the TTL sweep: the
+#: numbers only move when a worker heartbeats (every 5 s) or a capture lands,
+#: and the alert is a crossing, not a live gauge -- 30 s is well inside the
+#: window in which an operator can still react to "a fifth of the account
+#: left", and it keeps the shared node view off the once-a-second hot path.
+_LEDGER_ALERT_INTERVAL_S = 30.0
 from control_plane.registry.volumes import VolumeRegistry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only (envd may be absent)
@@ -233,7 +249,19 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        async def _on_sandbox_removed(record):
+        async def _on_sandbox_removed(record) -> list[str]:
+            """Tear a sandbox down where it lives; report what went with it.
+
+            Shared by the two sweeps that outlive their caller (the ordinary
+            TTL sweep, and E6's paused sweep). Both of them answer a *deadline*
+            rather than a request, so both run the teardown the delete endpoint
+            runs -- the worker's own ``DELETE /agent/sandboxes/{id}``, which is
+            what removes the runtime, the tree and the checkpoint image (the
+            largest thing the platform holds for a sandbox). A node that
+            refuses or cannot be reached is a WARNING and "the worker's next
+            reconcile reclaims it", never a silent success, and the return
+            value says what really went so the caller's one line can name it.
+            """
             node = app.state.nodes.get(record.node_id or "local")
             if node is not None and node.address != "local://":
                 import httpx
@@ -263,6 +291,7 @@ def create_app(
                         node.node_id,
                         exc,
                     )
+                    return []
                 else:
                     if resp.status_code != 204:
                         # The node answered and refused (a rewritten
@@ -277,7 +306,9 @@ def create_app(
                             resp.status_code,
                             (resp.text or "")[:300],
                         )
+                        return []
                 app.state.runtime_registry.unregister(record.sandbox_id)
+                return ["runtime", "checkpoint-image"]
             else:
                 # Local runtime: full teardown (unregister + workspace and
                 # per-sandbox volume slice cleanup, E2.5).
@@ -290,6 +321,11 @@ def create_app(
                         "orphan-tree GC",
                         record.sandbox_id,
                     )
+                    return []
+                # The local shape's checkpoint images are not part of that
+                # tree; the worker's own reconcile reclaims an image with no
+                # owner (E4), so this branch reports exactly what it removed.
+                return ["runtime", "workspace"]
 
         sweeper = TTLSweeper(
             on_expired=_on_sandbox_removed,
@@ -303,6 +339,40 @@ def create_app(
         )
         app.state.sweeper = sweeper
         sweeper.start(registry)
+
+        # E6: parked sandboxes are exempt from the TTL sweep above on purpose
+        # (destroying a park destroys user state), so ending a park is its own
+        # opt-in switch with its own single-flight claim -- and its cleanup is
+        # the *same* teardown the delete endpoint runs, never a parallel one.
+        paused_sweeper = PausedTTLSweeper(
+            ttl_s=paused_ttl_seconds(settings),
+            interval_seconds=_TTL_SWEEP_INTERVAL_S,
+            on_expired=lambda record, paused_for_s: reap_paused_sandbox(
+                record, registry=registry, teardown=_on_sandbox_removed
+            ),
+            claim=lambda: try_claim(
+                redis_client,
+                "e2b:paused-ttl:sweep",
+                ttl_s=int(_TTL_SWEEP_INTERVAL_S),
+            ),
+        )
+        app.state.paused_sweeper = paused_sweeper
+        paused_sweeper.start(registry)
+
+        # E7: the platform account is a soft ledger (see §6(k)②), so the one
+        # thing it needs is a reader. One replica per interval, one line per
+        # crossing -- the shared node view is what makes both possible.
+        ledger_alerter = PlatformLedgerAlerter(
+            threshold_ratio=ledger_alert_ratio(settings),
+            interval_seconds=_LEDGER_ALERT_INTERVAL_S,
+            claim=lambda: try_claim(
+                redis_client,
+                "e2b:ledger-alert:sweep",
+                ttl_s=int(_LEDGER_ALERT_INTERVAL_S),
+            ),
+        )
+        app.state.ledger_alerter = ledger_alerter
+        ledger_alerter.start(app.state.nodes)
 
         health_task = asyncio.create_task(
             _node_health_loop(
@@ -335,6 +405,8 @@ def create_app(
             except asyncio.CancelledError:
                 pass
         await sweeper.stop()
+        await paused_sweeper.stop()
+        await ledger_alerter.stop()
         if quota_agent_client is not None:
             quota_agent_client.close()
 
