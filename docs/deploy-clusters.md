@@ -551,3 +551,31 @@ deploy/k8s-k0s/apply.sh                                 # 渲染 + apply + 预�
 
 > 本节的日志都在 `tmp/`（gitignored，会被清）。数字要复核就按上面这几行自己跑一遍 ——
 > 上一轮踩过的坑是"文档里嵌了一份会飘的数字表"，所以这里连判据命令一起给，别只信表格。
+
+## 13. 2026-09-27 第二次发版：`0.1.0-664-gdf5eec5-20260927-150255`
+
+**为什么发**：当天第二批裁定（用户"都做了吧"）里有两件只在镜像里生效，另外两件是纯形态与文档：
+
+* **N46**（`c5acc04` + 接线）：未命名异步拷贝现在**持有租约**（值 = owner 的租约令牌，TTL 30 s、
+  每 10 s 续租），`reconcile_pending_snapshots` 由 `snapshot_reconcile_loop` **每 10 s** 跑（单飞），
+  于是"有主在拷"与"孤儿"可区分；孤儿 settle 上界 ≈ 最后续租 + 40 s。
+* **E6/E7**（`4396915`）：`E2B_PAUSED_TTL_S`（默认 0 = 不启用）与
+  `E2B_PLATFORM_LEDGER_ALERT_RATIO`（默认 0.8，进入/退出各一条 WARNING）。
+* 不在车队生效的：**pure 默认根 `off`→`synth`**（`098ba10`；生产是 image-rootfs 形态，零变化）
+  与三处"提升后指错一级"的路径修复。
+
+**构建与上线**：`./deploy/scripts/build-and-push.sh`（层缓存命中，约 1 分钟）→
+`KUBECONFIG=… deploy/k8s-k0s/apply.sh`（**7 个镜像引用已 pin**；worker StatefulSet 滚完、
+control-plane/autoscaler `configured`；base image 仍 `…@sha256:3675662d…`、两 worker `cached=true`）。
+上线后仓库渲染 vs 线上 `kubectl diff` 为 **0 行**。
+
+| 判据 | 结果 | 证据 |
+|---|---|---|
+| `deployment_smoke.py` | 命令+文件、跨节点迁移保文件、网络配置、远端卷+兄弟卷隔离、模板构建→registry→worker→rootfs、MCP gateway 全过；kill 后两节点预约 0 | `tmp/k0s/release-664-acceptance.log` |
+| `multinode_smoke.py` | 两 worker 各 2 个沙箱、commands/files/health/stdin 全过、预约 0 | 同上 |
+| **N46 的可见签名**（`deploy/scripts/acceptance/n46-copy-lease-probe.py`） | 未命名异步快照：`202 creating` → 拷贝期间 `GET e2b:snapshot:copy:<id>` **有值**（= owner 的租约令牌，**修前这张键从不出现**）→ 终态 `completed` → 键**已释放** ⇒ `N46 LEASE PROBE OK` | 同上 |
+
+> 未在本版复跑的两条：N37 的 4000 文件判据与 checkpoint 端到端 —— 它们昨天在 `0.1.0-652` 上全绿
+> （§12），而本版改的是控制面的快照/暂停路径，不碰 process 流与根形态；要复核按 §12 的命令跑。
+> E6/E7 的默认值是"关/0.8 阈值"，线上没有可观测行为（不删东西、未越限不打日志），
+> 它们的判据在仓库里是确定性用例（`4396915`）。

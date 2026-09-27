@@ -2446,3 +2446,10 @@ Fermat 第二班 + 控制器收尾）：
 | 5 | 控制器收尾 | 接线 `snapshot_reconcile_loop` 进 `app.py` lifespan（含关闭时取消）；修掉提升后残留的 **3 处路径 bug**（`phase2.sh`、`probe-pure-restore-synthroot.sh` 的 `cd ../..` 与 `sync-seccomp-installer.py` 的 `parents[2]` —— 提升一级后都指错）；给 `test_shared_volume_relative_cwd.py` 补 `sandlock_ready()` 环境门（默认翻 synth 后它在 macOS 会真跑并死在"没有 sandlock 模块"，同目录其它契约都有这道门）；索引三条行就地更新 | 本提交 |
 
 全量 `tests/unit + tests/contract` = **14 failed**（已知 macOS-only 那 14 条，逐条同名）/ 1952 passed / 61 skipped。
+
+**发版（控制器，2026-09-27 第二次）**：`0.1.0-664-gdf5eec5-20260927-150255`（`build-and-push` 缓存命中约 1 分钟
+→ `apply.sh` 7 处 pin + worker 滚动；上线后 `kubectl diff` 0 行）。验收：两条冒烟 OK；
+**N46 的可见签名在线上成立** —— 新探针 `deploy/scripts/acceptance/n46-copy-lease-probe.py` 量到未命名异步拷贝
+在拷贝期间**持有** `e2b:snapshot:copy:<id>`（值 = owner 的租约令牌，**修前这张键从不出现**）、
+终态 `completed`、键已释放 ⇒ `N46 LEASE PROBE OK`（日志 `tmp/k0s/release-664-acceptance.log`）。
+N37 的 4000 文件判据与 checkpoint 端到端在上一版 `0.1.0-652` 上全绿，本版改的是快照/暂停路径、未复跑（记录 §13 已注明）。

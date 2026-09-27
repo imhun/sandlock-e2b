@@ -62,6 +62,7 @@
 | `n27-t7-lane.sh` | N27 Task 7: run a command inside the prod-shaped lane container. | `Usage: sh deploy/scripts/acceptance/n27-t7-lane.sh python3 -u deploy/scripts/acceptance/probe_state_base_visibility.py lane --shape identity --layout n27` |
 | `n35-lane.sh` | Run one command in the prod-shaped lane (the same container shape as | `sh deploy/scripts/acceptance/n35-lane.sh python3 -u deploy/scripts/acceptance/probe_n35_exec_gate.py chroot all` |
 | `n39-pool-pidns-probe2.py` | N39 follow-up, take 2: raw `/proc` view inside a *pooled* sandbox. | —（头部无 Usage 行；见脚本 `--help`） |
+| `n46-copy-lease-probe.py` | N46 on the fleet: does an *unnamed* async copy hold the fleet-wide lease? | `TREE_FILES=2000 .venv/bin/python deploy/scripts/acceptance/n46-copy-lease-probe.py`（要 `E2B_API_KEY` + `KUBECONFIG`；树别超过 worker 调用 120 s 超时） |
 | `n42-egress-probe.py` | N42 acceptance on the live fleet: does `allow_internet_access=True` reach out? | —（头部无 Usage 行；见脚本 `--help`） |
 | `netns-node-compare.py` | Per-node comparison: SDK command RTT, MCP /mcp RTT, wildcard DNS. | —（头部无 Usage 行；见脚本 `--help`） |
 | `node-mmap-storage.sh` | Same kernel, four storages: does a mapped store past EOF extend the file? | —（头部无 Usage 行；见脚本头部） |
