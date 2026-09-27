@@ -144,7 +144,7 @@ Task 0–5 全部走完，未推送。终态：**fork HEAD == wheel manifest HEA
 
 ### 本波的意外收获（必须继续跟进）
 
-`tmp/f11_fup3_probe.py` 由绿翻红没有被当成「脚本噪音」放过，二分定性为**本波引入的
+`deploy/scripts/acceptance/f11_fup3_probe.py` 由绿翻红没有被当成「脚本噪音」放过，二分定性为**本波引入的
 真实回归**：pure 形态 exec stdio 在「客户端下一个可用 fd = 3」时把子进程 fd 1 接错
 （stdout 全丢）。登记为 fork FUP-23 / main task-backlog #22（含复现配方与修法），
 CHANGELOG 顶部有升级警示。**三档门禁的绿不排除它**（pytest 进程持有几十个 fd）。

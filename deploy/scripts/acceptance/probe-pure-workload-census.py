@@ -22,11 +22,11 @@ import os
 import sys
 from pathlib import Path
 
-# `python tmp/k0s/probe-pure-workload-census.py` puts *this* directory on
+# `python deploy/scripts/acceptance/probe-pure-workload-census.py` puts *this* directory on
 # sys.path[0], not the repo root, so `tests.…` is not importable below. The repo
 # root is also the bind-mount point of the lane (`-v "$(pwd):/workspace"`), which
 # is what makes the scratch path below resolve to the same file from either side.
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

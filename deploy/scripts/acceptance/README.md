@@ -1,0 +1,116 @@
+# 判据入口（acceptance）
+
+这个目录是**判据入口**：`docs/**` 里说"怎么再量一遍"的那些 **lane / 探针 / 验收脚本**都住在这里，
+文档里的引用一律指这里，不再指 `tmp/`。
+
+## 入库政策
+
+**文档里让人照着跑的东西必须在这里；`tmp/` 只放一次性日志与被搬走前的原件。**
+
+脚本进这个目录是一次 `git mv` —— 文件名一字不改，只是路径从 `tmp/...` 变成
+`deploy/scripts/acceptance/...`，这样"清 `tmp/` / 换台机器 `git checkout`"就不再是
+复现判据的前提。往回漂会被钉子挡住：`tests/unit/test_docs_only_point_at_repo_artifacts.py`
+里，活文档（`docs/**`，冻结归档 `docs/reports/**` 除外）再引用一个**已有仓库副本**的
+`tmp/**.py|sh` 路径**直接判红**，错误信息会写出该改指的新路径。
+
+## 与 `tmp/` 的关系
+
+* 从 `tmp/` 搬进来的脚本（上一轮 67 个 + 本轮 10 个），**`tmp/` 下的同名原件已不存在**。
+  本轮搬入的 10 个是：`gateA-full.sh`、`gateB-full.sh`、`gateB-pure-rootfs.sh`、
+  `n27-t7-lane.sh`、`phase2.sh`、`probe_state_base_visibility.py`、
+  `probe-pure-restore-synthroot.sh`、`probe-pure-synth-root-plaindir.py`、
+  `probe-pure-synth-root.sh`、`probe-pure-workload-census.py`。
+* **回滚副本在 git 历史里**：`git log --follow -- deploy/scripts/acceptance/<名字>` 能找到搬迁提交，
+  `git show <搬迁提交>^:<旧 tmp 路径>` 能取回逐字节原件。
+* 一处例外，是个**删除**而不是搬迁：`tmp/k0s/checkpoint_acceptance.py` 是仓库版
+  `deploy/scripts/checkpoint_acceptance.py` 的**旧副本**（437 行 vs 632 行）——
+  两份不一致会把人带沟里，所以删掉。它当时**没有被 git 跟踪**（整个 `tmp/` 在 `.gitignore` 里），
+  因此**不在** git 历史里；删除前留了一份字节副本在
+  `.superpowers/sdd/artifact-promotion-round2-removed-tmp-k0s-checkpoint_acceptance.py`
+  （sha256 `494e464e3f93aa604e5bb5b610444adccc6241ad8b77b85b8f164354c47f43af`）。
+
+## 索引
+
+"怎么跑"一列照抄脚本自己的头部注释（`--help` / 头部都没有的写 `—`），所以它可能落后于脚本实际参数 ——
+以脚本本身为准。少数上一轮搬入的脚本头部还留着搬迁前的 `tmp/...` 拼写（那轮没有"引用也必须改"的纪律，
+本轮的钉子只管 `docs/**` 与 `tests/`），照抄时未改写。
+
+| 文件 | 服务于哪个问题（取自脚本头部） | 怎么跑（取自脚本头部 / `--help`） |
+| --- | --- | --- |
+| `capacity_check.py` | Capacity + per-sandbox memory check. | —（头部无 Usage 行；见脚本 `--help`） |
+| `cleanup_scratch.py` | One-shot scratch cleanup: delete regenerable test scratch under tmp/, keep | —（头部无 Usage 行；见脚本 `--help`） |
+| `cluster_keepalive_probe.py` | N37 probes: is the cut an *idle* one, and does output hold the stream open? | —（头部无 Usage 行；见脚本 `--help`） |
+| `cluster_run.py` | N37 cluster run: one command writing N files, on the deployed fleet. | —（头部无 Usage 行；见脚本 `--help`） |
+| `cpu_activity_acceptance.py` | Cluster acceptance for E9.1 blind spot 2: a CPU-only sandbox is not idle. | —（头部无 Usage 行；见脚本 `--help`） |
+| `f11_direct_exec_probe.py` | Control experiment: pure-shape exec over the direct executor, low fd table. | —（头部无 Usage 行；见脚本 `--help`） |
+| `f11_fdcount_probe.py` | Does the standalone probe's stdout loss depend on the client's fd layout? | —（头部无 Usage 行；见脚本 `--help`） |
+| `f11_fup3_probe.py` | F11 E2B rerun probe: gateway+command boxed quota on the F11 tip wheel. | —（头部无 Usage 行；见脚本 `--help`） |
+| `f23_multi_probe.py` | FUP-23 paired send/recv probe: several marker execs on one pure instance. | —（头部无 Usage 行；见脚本 `--help`） |
+| `final-verify.sh` | Sequential final verification of the tier-removal tree. One phase at a time, | —（头部无 Usage 行；见脚本头部） |
+| `gateA-full.sh` | The whole suite in the production-shaped root worker with `E2B_BASE_IMAGE=python-mcp:3.14`. | `sh deploy/scripts/acceptance/gateA-full.sh <log>` |
+| `gateB-full.sh` | The whole suite in the production-shaped root worker with `E2B_BASE_IMAGE=`（pure 形态）. | `sh deploy/scripts/acceptance/gateB-full.sh <log>` |
+| `gateB-pure-rootfs.sh` | gate B's twin: the *pure* shape (`E2B_BASE_IMAGE=""`) in both root states. | `Usage: gateB-pure-rootfs.sh <state 0\|1> <log> [pytest target...]` |
+| `guard_probe.py` | Probe the shape guard: does it actually fire, and is it non-vacuous? | —（头部无 Usage 行；见脚本 `--help`） |
+| `guard_probe2.py` | Post-fix probe: the vacuity hole is now an assertion, not a silent green. | —（头部无 Usage 行；见脚本 `--help`） |
+| `ledger-arena-test.py` | Is the 72 MiB/thread cost glibc's per-thread malloc arena? | —（头部无 Usage 行；见脚本 `--help`） |
+| `ledger-thread-cost.py` | What does each kind of thing cost in the sandlock ledger, in a plain box? | —（头部无 Usage 行；见脚本 `--help`） |
+| `mcp-3way.py` | Split an MCP call into forward path / server work / return path. | —（头部无 Usage 行；见脚本 `--help`） |
+| `mcp-512-size.py` | In a 512MB box: wait for the gateway, then find the largest stdio server. | —（头部无 Usage 行；见脚本 `--help`） |
+| `mem512-limit.py` | Live: is the 512MB box a hard limit, and what does an MCP gateway cost? | —（头部无 Usage 行；见脚本 `--help`） |
+| `mmap-probe.py` | Does a MAP_SHARED store past EOF grow the file on *this* filesystem? | `Run as: mmap-probe.py <dir> <label>` |
+| `n27-t7-lane.sh` | N27 Task 7: run a command inside the prod-shaped lane container. | `Usage: sh deploy/scripts/acceptance/n27-t7-lane.sh python3 -u deploy/scripts/acceptance/probe_state_base_visibility.py lane --shape identity --layout n27` |
+| `n35-lane.sh` | Run one command in the prod-shaped lane (the same container shape as | 头部示例（旧拼写）`sh tmp/k0s/n35-lane.sh python3 -u tmp/k0s/probe_n35_exec_gate.py chroot all` |
+| `n39-pool-pidns-probe2.py` | N39 follow-up, take 2: raw `/proc` view inside a *pooled* sandbox. | —（头部无 Usage 行；见脚本 `--help`） |
+| `n42-egress-probe.py` | N42 acceptance on the live fleet: does `allow_internet_access=True` reach out? | —（头部无 Usage 行；见脚本 `--help`） |
+| `netns-node-compare.py` | Per-node comparison: SDK command RTT, MCP /mcp RTT, wildcard DNS. | —（头部无 Usage 行；见脚本 `--help`） |
+| `node-mmap-storage.sh` | Same kernel, four storages: does a mapped store past EOF extend the file? | —（头部无 Usage 行；见脚本头部） |
+| `overlay-probe.sh` | 在不改云网络的前提下，验证封装型 overlay 能不能跨这两个节点工作。 | —（头部无 Usage 行；见脚本头部） |
+| `phase1-probe2.sh` | —（头部没写） | —（头部无 Usage 行；见脚本头部） |
+| `phase2.sh` | test-prod-shaped.sh's phase 2 (the unprivileged worker), runnable on its own. | `sh deploy/scripts/acceptance/phase2.sh <log>` |
+| `pidns-cost-probe.py` | Probe: what does `pid_ns` cost on the syscalls it traps? | `Run in the prod-shaped lane, both shapes, same image:` |
+| `pidns-shape-probe.py` | Probe: which shape did a route-B sandbox actually get? | 头部示例（旧拼写）`./deploy/scripts/test-prod-shaped.sh tmp/pidns-shape-probe.py -k pidns_shape_probe` |
+| `probe-pure-realroot.py` | pure 能不能走真根？把 pivot_root 的两种用法实测一遍。 | —（头部无 Usage 行；见脚本头部） |
+| `probe-pure-restore-synthroot.sh` | pure + 合成根下的 pause/resume：restore stub 从"根内"变成"根外"。 | `用法：probe-pure-restore-synthroot.sh <log>` |
+| `probe-pure-synth-root-plaindir.py` | 合成根在生产 cap 形状下能不能 pivot？以及 /dev、/proc 该怎么装。 | —（头部无 Usage 行；见脚本头部；由 `probe-pure-synth-root.sh <part>` 驱动） |
+| `probe-pure-synth-root.sh` | 合成根探针的 runner：**生产 cap 形状**（worker 那五个 cap，无 SYS_ADMIN）+ 出厂 seccomp 档。 | 头部：`用法：probe-pure-synth-root.sh <part> <log>`（part ∈ b2/tmpfs/symlinks/proc/dev/devdiff） |
+| `probe-pure-workload-census.py` | 同一组命令在三种形态下的 (rc, stdout, stderr)，逐字节 diff。 | —（头部无 Usage 行；见脚本头部） |
+| `probe_127_errno.py` | Why does a *missing* path answer EACCES(13) instead of ENOENT(2)? | 头部示例（旧拼写）`sh tmp/k0s/phase1-probe2.sh /workspace/tmp/k0s/probe_127_errno.py` |
+| `probe_brief_stat_live.py` | A/B of the fix on the live cluster (N25): os.stat vs entry_size. | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_ceiling_completeness.py` | Can anything still grow the tree once the ceiling is exactly zero? | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_copy_range_zero.py` | `copy_file_range` reported 300 MiB moved while the file stayed 4096 bytes. | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_dir_cost.py` | What a directory really costs on this NAS: st_size vs st_blocks, by entry count. | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_dir_ledger.py` | N25/L2c acceptance: the incremental ledger must equal a measurement made | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_dir_stsize.py` | N31 fix 2 acceptance: the platform number charges what a tree allocates. | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_disk_metric_agreement.py` | N30 T6 acceptance: the platform's `diskUsed` equals a measurement taken | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_etxtbsy_shape.py` | Is the write-then-exec ETXTBSY window real in the *chroot* (production) shape? | `Usage (inside the lane container):`, `python3 tmp/k0s/probe_etxtbsy_shape.py [chroot\|pure] [iterations]`（旧拼写） |
+| `probe_exec_limit.py` | N25/C acceptance: the per-exec ceiling is "what is left", refreshed per exec. | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_kernel_copy.py` | Do kernel-side copies respect RLIMIT_FSIZE? | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_landlock_execveat.py` | Can a Landlock-confined process exec a binary it only holds *by fd*? | `Usage (inside the lane container):`, `python3 /src/tmp/k0s/probe_landlock_execveat.py`（旧拼写） |
+| `probe_mmap_growth.py` | Exactly where does a MAP_SHARED store stop growing the file? | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_n28_acceptance.py` | N28 acceptance on the live fleet: A (pause gates), B (one writer), C, D. | —（头部无 Usage 行；见脚本头部） |
+| `probe_n29_sync.py` | N29: what a client actually sees when a snapshot outlives the entry proxy. | `Run with E2B_API_URL/E2B_SANDBOX_URL/E2B_API_KEY set, from the deploy host.` |
+| `probe_n35_exec_gate.py` | N35 (directed follow-up): who refuses to exec a file the sandbox owns? | `Usage (inside the lane container)`，`python3 -u tmp/k0s/probe_n35_exec_gate.py [chroot\|pure] [grant] [leg\|all\|list]`（旧拼写） |
+| `probe_n35_ns.py` | Which namespaces and caps does a chroot-shaped sandbox actually have today? | `Usage (inside the lane container):`, `python3 -u tmp/k0s/probe_n35_ns.py [chroot\|pure]`（旧拼写） |
+| `probe_n35_realmount.py` | Can a real root (mount ns + pivot_root) be built in the deployed shape? | `Usage (inside the lane container, root)`，`PROD_DROP_CAPS=SYS_ADMIN sh tmp/k0s/n35-lane.sh python3 -u tmp/k0s/probe_n35_realmount.py`（旧拼写） |
+| `probe_openat2_eagain.py` | Does *this* kernel answer EAGAIN for openat2(RESOLVE_IN_ROOT) through a `..`? | `Usage: python3 probe_openat2_eagain.py [iterations] [racer_on\|racer_off]` |
+| `probe_push_and_tighten.py` | Cluster evidence for N25's push reporting and the live tightening. | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_restore_state.py` | Why does a *restored* sandbox not tick? (2026-09-25, cluster probe) | `Run with KUBECONFIG + E2B_API_URL + E2B_API_KEY set; it prints the sandbox id` |
+| `probe_state_base_visibility.py` | N27 Task 7 acceptance probe: is the platform's state base visible from a sandbox? | 头部 Modes：`cluster`（默认，走 API）/ `lane`（lane 容器内）/ `in-sandbox`（checker 本体）；退出码 0/1/2 |
+| `probe_write_paths.py` | Which ways of making a file bigger does RLIMIT_FSIZE actually stop? | —（头部无 Usage 行；见脚本 `--help`） |
+| `rb_token_probe.py` | What actually leaks when the channel token travels in supervise's argv. | —（头部无 Usage 行；见脚本 `--help`） |
+| `red-routeb-stderr-drain.py` | RED/GREEN check for the slot-stderr drain (N35 side quest). | `sh tmp/k0s/n35-lane.sh python3 -u tmp/k0s/red-routeb-stderr-drain.py`（旧拼写） |
+| `relay_probe.py` | N37 end-to-end: a 60 s idle cut in front of the local stack. | `Run it twice: once with the keepalive removed (RED), once as shipped (GREEN).` |
+| `routeb_cap_probe.py` | 机制级探针：在给定 capset 的容器里，逐项问 route B / 进程内后端「还活着吗」。 | —（头部无 Usage 行；见脚本 `--help`） |
+| `run-f31.sh` | Sequential re-verification (f31) on the final bytes, one container per phase. | —（头部无 Usage 行；见脚本头部） |
+| `run.sh` | The local aarch64 lane's kernel: qemu-system-aarch64 under TCG (this host is | —（头部无 Usage 行；见脚本头部） |
+| `sdkflake-cacheprobe.py` | Measure the image-cache maintenance walk that sits inside the first-command path. | `Usage: python tmp/sdkflake-cacheprobe.py [cache-dir]`（旧拼写） |
+| `sec-run-probe.sh` | Reusable runner: the prod-shaped capability set the sandlock create path needs. | —（头部无 Usage 行；见脚本头部） |
+| `slot_cap_probe.py` | 量一件事：route-B 槽位（=路径中介进程）与被 confine 的子进程各自持有哪些 cap。 | —（头部无 Usage 行；见脚本 `--help`） |
+| `sync-seccomp-installer.py` | Re-embed `deploy/seccomp/sandlock-worker.json` into the ConfigMap installer. | `python3 tmp/k0s/sync-seccomp-installer.py`（dry run）/ `… --write`（旧拼写） |
+| `t1-ownership-probe.py` | O1/T1 re-measurement on the live fleet: who owns a file the sandbox writes? | —（头部无 Usage 行；见脚本 `--help`） |
+| `task8_fup3_probe.py` | M4 Task 8 (FUP-E3) Step 1 probe: record the exact rejection shape. | —（头部无 Usage 行；见脚本 `--help`） |
+| `unprivileged_userns_probe.py` | Can a route-B slot (euid == the sandbox host uid) map 0 -> X in its own | —（头部无 Usage 行；见脚本 `--help`） |
+| `verify-arena-live.py` | Post-deploy: the MCP stdio server's ceiling with the pinned arena. | —（头部无 Usage 行；见脚本 `--help`） |
+| `vol_fs_mount_probe.py` | Mechanism probe: why does the chroot volume view fail without SYS_ADMIN? | —（头部无 Usage 行；见脚本 `--help`） |
+| `x86-run-py.sh` | Run one python file in the production-shaped root worker, x86_64. | 头部：`Run one python file in the production-shaped root worker, x86_64.` |
+| `x86-security-one.sh` | One security case (or a -k filter) in the production-shaped root worker, x86_64. | `Usage: x86-security-one.sh <E2B_BASE_IMAGE> <log> <pytest args...>` |

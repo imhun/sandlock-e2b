@@ -74,7 +74,7 @@ def _base_image() -> str:
     An *explicitly empty* ``E2B_BASE_IMAGE`` is how a lane asks for the
     pure (no-image-rootfs) shape -- `deploy/scripts/test-prod-shaped.sh` cannot
     express it (its ``${VAR:-default}`` turns the empty value back into the
-    default), but ``tmp/k0s/gateB-full.sh`` does, and the deployment-shape
+    default), but ``deploy/scripts/acceptance/gateB-full.sh`` does, and the deployment-shape
     selectors are deliberately outside the strict-skip list. There is no image
     to inspect in that shape: `docker run ""` would report a docker usage
     error, which reads as a broken contract rather than a narrower matrix.

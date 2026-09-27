@@ -271,4 +271,4 @@ E2B `tests/security` 四格（同轮、同镜像/同 seccomp 档）：
 * fork wheel 的交叉构建与推送：`deploy/scripts/build-sandlock-wheels.sh`（早就出 aarch64 腿）。
 * 多节点 / 模板 / 卷的远端验收：`deploy/scripts/smoke.sh`（在目标机本机跑）。
 * 性能类相位（`supervise_cost`）：只在 x86_64 容器里跑，仿真 lane 上无意义。
-* 历史：`tmp/arm-vm/run.sh` 是 Lima 之前手搓的 qemu 直启 lane，已被 `vm.yaml` 取代，留作参考。
+* 历史：`deploy/scripts/acceptance/run.sh` 是 Lima 之前手搓的 qemu 直启 lane，已被 `vm.yaml` 取代，留作参考。

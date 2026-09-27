@@ -13,7 +13,7 @@ here, and CAP_SYS_ADMIN inside it is what authorises every mount and the pivot_r
 补上 userns 之后：unshare(CLONE_NEWNS) → `/` 设 MS_REC|MS_PRIVATE → 逐个 bind 到 `<root>/<virtual>` →
 **递归自绑 root** → `chdir(root)` + `pivot_root(".", ".")` + `umount2(".", MNT_DETACH)` + `chdir("/")`。
 
-与 `tmp/k0s/probe-pure-realroot.py` 的三点区别（这是本轮的方法论修正点）：
+与 `deploy/scripts/acceptance/probe-pure-realroot.py` 的三点区别（这是本轮的方法论修正点）：
 1. **不用 tmpfs**：`deploy/seccomp/sandlock-worker.json:837-852` 只允许 fstype==0 的 mount，
    tmpfs 在生产档下必然 EPERM（`docs/chroot-workspace-exec.md` §9.7 第 3 条已实测）；
    合成根 = 普通目录 + bind。

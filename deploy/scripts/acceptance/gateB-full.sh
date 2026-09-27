@@ -6,16 +6,13 @@
 #
 # Same caps, same env as that script's phase 1, plus the registry mirror the
 # image-rootfs cases in the tree still need.
-#
-# `E2B_TEST_IMAGE` overrides the runner image (default
-# `e2b-sandlock-test:latest`), for the same reason `gateB-pure-rootfs.sh` has
-# the knob: the image bakes in `wheels/fork/*.whl` and nothing rebuilds it when
-# those wheels change (`deploy/scripts/build-test-image.sh`, pitfalls §B7), so
-# re-running a lane on a re-baked image without touching the shared `:latest`
-# tag needs a knob.
 set -eu
-cd /Users/polus/project/ai/sandlock-e2b
+cd "$(cd "$(dirname "$0")/../.." && pwd)"
 log="$1"
+# Same knob as `gateA-full.sh`/`gateB-pure-rootfs.sh`: the image bakes in
+# `wheels/fork/*.whl`, so a lane that must be same-source with the wheels on
+# disk has to name the image rather than fall back to the shared `:latest`
+# (`deploy/scripts/build-test-image.sh` header, pitfalls §B7).
 IMAGE="${E2B_TEST_IMAGE:-e2b-sandlock-test:latest}"
 SECCOMP_PROFILE="$(pwd)/deploy/seccomp/sandlock-worker.json"
 docker run --rm --init --network host \
@@ -28,7 +25,7 @@ docker run --rm --init --network host \
     --security-opt apparmor=unconfined \
     -e E2B_HOST_PROJECT="$(pwd)" \
     -e E2B_TEST_STRICT_SKIPS=1 \
-    -e E2B_BASE_IMAGE=python-mcp:3.14 \
+    -e E2B_BASE_IMAGE= \
     -e E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2 \
     -e E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
     -e E2B_REAL_ROOT=0 \

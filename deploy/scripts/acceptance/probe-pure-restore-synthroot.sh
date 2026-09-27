@@ -10,7 +10,7 @@
 # `task12cur`（逐文件 sha 与 `wheels/fork` 相等，见 tmp/k0s/task12/image-source-check.txt）。
 # 共享 `:latest` 一字未动。
 set -eu
-cd /Users/polus/project/ai/sandlock-e2b
+cd "$(cd "$(dirname "$0")/../.." && pwd)"
 E2B_TEST_IMAGE="${E2B_TEST_IMAGE:-e2b-sandlock-test:task12cur}"
 export E2B_TEST_IMAGE
 log="$1"
@@ -18,7 +18,7 @@ log="$1"
 printf '# E2B_TEST_IMAGE=%s\n' "$E2B_TEST_IMAGE" >> "$log"
 for real_root in 0 1; do
     printf '===== E2B_REAL_ROOT=%s =====\n' "$real_root" >> "$log"
-    sh tmp/k0s/gateB-pure-rootfs.sh "$real_root" \
+    sh deploy/scripts/acceptance/gateB-pure-rootfs.sh "$real_root" \
         "tmp/k0s/pure-rootfs-restore-$real_root.log" \
         tests/contract/test_pause_resume_sandlock.py >> "$log" 2>&1 || true
     tail -1 "tmp/k0s/pure-rootfs-restore-$real_root.log" >> "$log"

@@ -345,7 +345,7 @@
 ### Task 6: 对外 `diskMB` 语义的集群现场验收
 
 **Files:**
-- Create: `tmp/k0s/probe_disk_metric_agreement.py`
+- Create: `deploy/scripts/acceptance/probe_disk_metric_agreement.py`
 - Modify: `docs/k8s-deployment.md:2003-2033`（§22.5.12，把"超支可见"那半从"仍未决"改成实测结论）
 
 **Interfaces:**
@@ -354,7 +354,7 @@
 
 - [ ] **Step 1: 写探针，并先在当前版本上跑一次拿到对照**
 
-  形状（照 `tmp/k0s/probe_dir_ledger.py` 那套"沙箱内自己量 == 平台上报"的既有套路）：
+  形状（照 `deploy/scripts/acceptance/probe_dir_ledger.py` 那套"沙箱内自己量 == 平台上报"的既有套路）：
 
   ```
   1) 建 diskMB=64 的沙箱
@@ -364,7 +364,7 @@
   5) GET /sandboxes/{id}/metrics 的 diskUsed 与第 2 步的 du 数字逐字节相等
   ```
 
-  Run: `E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000 tmp/testenv/bin/python tmp/k0s/probe_disk_metric_agreement.py`
+  Run: `E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000 tmp/testenv/bin/python deploy/scripts/acceptance/probe_disk_metric_agreement.py`
 
   Expected（对照组）：第 3 步失败、第 4 步成功、第 5 步两边数字相等（这条今天应当已经成立——`docs/k8s-deployment.md` §22.5.9/§22.5.10 与 §22.5.12 记的实测就是它）。若不成立，先把差异记下来：那是**口径没对齐**的真缺口，比文档措辞重要。
 

@@ -52,7 +52,7 @@ E2B（FastAPI envd + pytest 契约/单测）、Docker 门禁（`sandlock-dev:lat
 
 ## 设计与证据（先读这段再动代码）
 
-探针 `tmp/vol_fs_mount_probe.py`（无 SYS_ADMIN 容器 + 真 fork wheel + route-B 槽位）实测：
+探针 `deploy/scripts/acceptance/vol_fs_mount_probe.py`（无 SYS_ADMIN 容器 + 真 fork wheel + route-B 槽位）实测：
 
 | 工作区卷条目 | 绝对路径 `cat /workspace/mnt/data/x` | 相对 `cat mnt/data/x` | 相对写 | `/proc/self/cwd/...` |
 |---|---|---|---|---|
@@ -140,7 +140,7 @@ docker run --rm --network host \
   --cap-add SETGID --cap-add SETUID --cap-add SETPCAP --cap-add AUDIT_WRITE --cap-add SETFCAP \
   --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
   -v "$PWD:/workspace" -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
-  -w /workspace e2b-sandlock-test:latest python tmp/vol_fs_mount_probe.py 2>&1 | tee tmp/a0-probe.log
+  -w /workspace e2b-sandlock-test:latest python deploy/scripts/acceptance/vol_fs_mount_probe.py 2>&1 | tee tmp/a0-probe.log
 ```
 
 Expected: `chroot+fs_mount/symlink` 的 `rel-read=1`、`rel-write=2`；
@@ -616,7 +616,7 @@ Expected: FAIL（`cat mnt/data/a.txt` Permission denied）。
                 # aliases (they are the same host directory). A cwd-derived
                 # relative open resolves against whichever alias the sandbox
                 # sits in, and only that alias's sub-mount can serve it --
-                # evidence: tmp/vol_fs_mount_probe.py.
+                # evidence: deploy/scripts/acceptance/vol_fs_mount_probe.py.
                 **{
                     alias: m["hostPath"]
                     for m in record.volume_mounts
@@ -729,7 +729,7 @@ worker 启动时用池内第一个 uid 探测 `settings.shared_volume_root` 的�
 新增 §2.4.2：**共享卷根及其祖先必须对租户 uid 可穿过（0711/0755）**。
 
 > **控制器更正（2026-09-11，A5 评审）**：本步骤原写"否则只有绝对路径可用、相对路径会
-> EACCES"——**实测不成立**。`tmp/vol_fs_mount_probe.py` 的 `symlink-tight-ancestor` 场景
+> EACCES"——**实测不成立**。`deploy/scripts/acceptance/vol_fs_mount_probe.py` 的 `symlink-tight-ancestor` 场景
 > （祖先 `0700`）里，绝对路径 `cat /workspace/mnt/data/data.txt` **同样** `EACCES`
 > （`tmp/a0-probe.log`）。原因是中介以沙箱自己的 uid 打开同一宿主路径，绝对/相对都要过
 > 同一 DAC 判定。文档应写成"祖先不可穿过 ⇒ 卷视图整体不可用"，并注明证据来自 A0/A3 探针
@@ -825,7 +825,7 @@ Expected: **0 failed / 0 error**（本计划前基线 `tmp/nosa-full.log` = 4 fa
 - [x] **Step 3: 常规三档门禁无漂移**
 
 ```bash
-bash tmp/run-f31.sh   # gate A / gate B / 生产形 phase1/phase2（macOS 另跑）
+bash deploy/scripts/acceptance/run-f31.sh   # gate A / gate B / 生产形 phase1/phase2（macOS 另跑）
 ```
 
 Expected: 与上一基线逐项一致（±本次新增用例数）。
@@ -1085,7 +1085,7 @@ git commit -m "chore(sandlock): bump to the no-downgrade wheel and drop the supe
 > **入口条件（全部满足才动线上）**：
 > 1. Track F / Task F1 闭环：两个 broker 在非 root 形态下端到端五条断言全绿 + Track Z 非 root 复跑全绿；
 > 2. `PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` 与
->    `bash tmp/run-f31.sh` 六相在本地**连续两轮全绿**；
+>    `bash deploy/scripts/acceptance/run-f31.sh` 六相在本地**连续两轮全绿**；
 > 3. 线上**回滚点已记录**（现网镜像 tag/digest、`docker-compose.prod.yml`、远端 `.env` 三份快照落 `tmp/rollback-<ts>/`）；
 > 4. 用户确认维护窗口（现网审计为空载，适合窗口）。
 >

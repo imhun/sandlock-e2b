@@ -22,7 +22,7 @@
 - 临时文件（探针脚本、scratch、日志）一律放项目内 `tmp/`，容器内即 `/workspace/tmp/...`；不用系统 `/tmp`、不用 `$TMPDIR`。
 - 测试断言必须**精确匹配**（禁 `toContain` / `includes` / `assertIn` 等部分匹配）；禁止 SKIP 或过滤失败输出；失败先看日志再改代码。
 - 本机单测命令是 `tmp/testenv/bin/python -m pytest`（`.venv` 缺 `fakeredis`），基线 `tests/unit` = **16 failed / 1164 passed**（`docs/pure-shape-decision.md` §6 那张表，4 组已知红：gateway / priv_helpers / real_root_gate / xfs_quotactl），本计划不许改动这个数字。
-- 容器 lane 与基线：`tmp/k0s/gateA-full.sh`（镜像形态，`E2B_BASE_IMAGE=python-mcp:3.14`）= **1772 passed / 6 skipped / 3 xfailed / 0 failed**；`tmp/k0s/gateB-full.sh`（pure，`E2B_BASE_IMAGE=`）= **1765 / 13 / 3 / 0**；`tmp/k0s/phase2.sh`（非 root worker）= **57 passed / 1 skipped / 0 failed**。
+- 容器 lane 与基线：`deploy/scripts/acceptance/gateA-full.sh`（镜像形态，`E2B_BASE_IMAGE=python-mcp:3.14`）= **1772 passed / 6 skipped / 3 xfailed / 0 failed**；`deploy/scripts/acceptance/gateB-full.sh`（pure，`E2B_BASE_IMAGE=`）= **1765 / 13 / 3 / 0**；`deploy/scripts/acceptance/phase2.sh`（非 root worker）= **57 passed / 1 skipped / 0 failed**。
 - `deploy/scripts/arm-lane/x86-security.sh <E2B_REAL_ROOT 0|1> <log>` **只跑镜像形态**（它写死 `E2B_BASE_IMAGE=python-mcp:3.14`）⇒ pure 的两态 security 必须另起一条 lane，不能拿它冒充。
 - fork 是 git submodule（`.gitmodules`：`path = third_party/sandlock`、`branch = upstream-pr/netns-free-clean`）⇒ 改动先在 submodule 里提交，再在父仓提交指针；两者的 commit 不是一个。
 - fork 的套件通过数是**逐套钉死**的（`third_party/sandlock/docs/test-baseline.md` 的 `core_integ = 560`、`core_lib = 913`；`scripts/test-all.sh` 按"相等"判定），加用例必须同步改那一行。
@@ -73,8 +73,8 @@
 ### Task 1: 生产 cap 形状下的 go/no-go 探针（P1 + P5）
 
 **Files:**
-- Create: `tmp/k0s/probe-pure-synth-root-plaindir.py`
-- Create: `tmp/k0s/probe-pure-synth-root.sh`
+- Create: `deploy/scripts/acceptance/probe-pure-synth-root-plaindir.py`
+- Create: `deploy/scripts/acceptance/probe-pure-synth-root.sh`
 - Test: `tmp/k0s/pure-synth-root-prodshape.log`、`tmp/k0s/pure-synth-root-tmpfs.log`、`tmp/k0s/pure-synth-root-symlinks.log`
 
 **Interfaces:**
@@ -91,7 +91,7 @@
 unshare(CLONE_NEWNS) → `/` 设 MS_REC|MS_PRIVATE → 逐个 bind 到 `<root>/<virtual>` →
 **递归自绑 root** → `chdir(root)` + `pivot_root(".", ".")` + `umount2(".", MNT_DETACH)` + `chdir("/")`。
 
-与 `tmp/k0s/probe-pure-realroot.py` 的三点区别（这是本轮的方法论修正点）：
+与 `deploy/scripts/acceptance/probe-pure-realroot.py` 的三点区别（这是本轮的方法论修正点）：
 1. **不用 tmpfs**：`deploy/seccomp/sandlock-worker.json:837-852` 只允许 fstype==0 的 mount，
    tmpfs 在生产档下必然 EPERM（`docs/chroot-workspace-exec.md` §9.7 第 3 条已实测）；
    合成根 = 普通目录 + bind。
@@ -320,7 +320,7 @@ if __name__ == "__main__":
 # 退出码就是判定契约：0 = 该 part 的判定成立；1 = 某一步 FAILED（或 b2 的 host-only
 # 在 pivot 后仍可见）；2 = VACUOUS（只有 b2：传进来的 HOST_ONLY 在 pivot 前就不存在，
 # 那句 `hidden` 会白给）。见 §Step 3。
-# （这份是初版副本；rc 契约以 tmp/k0s/probe-pure-synth-root.sh 为准 —— Task 3 起
+# （这份是初版副本；rc 契约以 deploy/scripts/acceptance/probe-pure-synth-root.sh 为准 —— Task 3 起
 #  `dev` 与 `devdiff` 也会返回 1/2，枚举见 Task 3 的 Step 2b。）
 set -eu
 cd "$(dirname "$0")/../.."
@@ -337,36 +337,36 @@ docker run --rm --init --network host \
     -e DEV_VARIANT="${DEV_VARIANT:-host-tree}" \
     -v "$(pwd):/workspace" -w /workspace \
     e2b-sandlock-test:latest \
-    python tmp/k0s/probe-pure-synth-root-plaindir.py "$part" > "$log" 2>&1
+    python deploy/scripts/acceptance/probe-pure-synth-root-plaindir.py "$part" > "$log" 2>&1
 ```
 
 - [ ] **Step 3: 跑它（b2 = 这条路线能不能做）**
 
-Run: `sh tmp/k0s/probe-pure-synth-root.sh b2 tmp/k0s/pure-synth-root-prodshape.log && cat tmp/k0s/pure-synth-root-prodshape.log`
+Run: `sh deploy/scripts/acceptance/probe-pure-synth-root.sh b2 tmp/k0s/pure-synth-root-prodshape.log && cat tmp/k0s/pure-synth-root-prodshape.log`
 Expected: 最后三行是 `[part b2] bound system dirs: <n>`、`[part b2] host-only /workspace/AGENTS.md: hidden`、`[part b2] verdict: PASS (plain directory + bind + pivot_root works in the pinned shape)`，退出码 0。
-`HOST_ONLY` 的默认值 `/workspace/AGENTS.md` 是 lane 镜像里**真有**的路径，所以不传 `-e HOST_ONLY` 也必须是 PASS/rc 0；**VACUOUS/rc 2 只留给"显式传了一个 pivot 之前不存在的路径"**（例如 `HOST_ONLY=/src` —— 本 lane 的仓库挂在 `/workspace`，`/src` 不存在）。探针在 `enter_ns()` 之前就会先打一行 `[part b2] host-only <path> exists pre-pivot: <bool>`：`True` 才继续做后面的隔离判定，`False` 直接 `verdict: VACUOUS` + rc 2（见 2026-09-26 Task 1 评审修 M3/M4）。证据：`tmp/k0s/pure-synth-root-prodshape-default.log`（默认值 PASS）、`tmp/k0s/pure-synth-root-prodshape-vacuous-explicit.log`（显式不存在 ⇒ VACUOUS）。**注意**：本 Task Step 1 里内嵌的那份探针代码是初版副本，已落后于 `tmp/k0s/probe-pure-synth-root-plaindir.py`（两轮评审修：`unshare(CLONE_NEWUSER)`、VACUOUS 判定、`dev` 的设备身份断言），以那个文件为准。
+`HOST_ONLY` 的默认值 `/workspace/AGENTS.md` 是 lane 镜像里**真有**的路径，所以不传 `-e HOST_ONLY` 也必须是 PASS/rc 0；**VACUOUS/rc 2 只留给"显式传了一个 pivot 之前不存在的路径"**（例如 `HOST_ONLY=/src` —— 本 lane 的仓库挂在 `/workspace`，`/src` 不存在）。探针在 `enter_ns()` 之前就会先打一行 `[part b2] host-only <path> exists pre-pivot: <bool>`：`True` 才继续做后面的隔离判定，`False` 直接 `verdict: VACUOUS` + rc 2（见 2026-09-26 Task 1 评审修 M3/M4）。证据：`tmp/k0s/pure-synth-root-prodshape-default.log`（默认值 PASS）、`tmp/k0s/pure-synth-root-prodshape-vacuous-explicit.log`（显式不存在 ⇒ VACUOUS）。**注意**：本 Task Step 1 里内嵌的那份探针代码是初版副本，已落后于 `deploy/scripts/acceptance/probe-pure-synth-root-plaindir.py`（两轮评审修：`unshare(CLONE_NEWUSER)`、VACUOUS 判定、`dev` 的设备身份断言），以那个文件为准。
 
 - [ ] **Step 4: 跑对照臂（tmpfs 必须是 EPERM）**
 
-Run: `sh tmp/k0s/probe-pure-synth-root.sh tmpfs tmp/k0s/pure-synth-root-tmpfs.log && cat tmp/k0s/pure-synth-root-tmpfs.log`
+Run: `sh deploy/scripts/acceptance/probe-pure-synth-root.sh tmpfs tmp/k0s/pure-synth-root-tmpfs.log && cat tmp/k0s/pure-synth-root-tmpfs.log`
 Expected: 含 `[part tmpfs] mount(tmpfs): FAILED errno=1 (Operation not permitted)` 与 `[part tmpfs] verdict: PASS-NEGATIVE (tmpfs unavailable; plain directory + bind is the route)`
 
 - [ ] **Step 5: 跑软链表（P5，宿主侧，直接用本机 python）**
 
-Run: `tmp/testenv/bin/python tmp/k0s/probe-pure-synth-root-plaindir.py symlinks | tee tmp/k0s/pure-synth-root-symlinks.log`
+Run: `tmp/testenv/bin/python deploy/scripts/acceptance/probe-pure-synth-root-plaindir.py symlinks | tee tmp/k0s/pure-synth-root-symlinks.log`
 Expected: 逐行是 `/usr: real directory`、`/bin: symlink -> usr/bin` 这类事实行，末行 `[part b2] verdict: PASS (this table is the input for the bind list)`；这张表就是 Task 4 的系统目录清单的输入
 
 - [ ] **Step 6: 提交**
 
 ```bash
-git add tmp/k0s/probe-pure-synth-root-plaindir.py tmp/k0s/probe-pure-synth-root.sh tmp/k0s/pure-synth-root-prodshape.log tmp/k0s/pure-synth-root-tmpfs.log tmp/k0s/pure-synth-root-symlinks.log
+git add deploy/scripts/acceptance/probe-pure-synth-root-plaindir.py deploy/scripts/acceptance/probe-pure-synth-root.sh tmp/k0s/pure-synth-root-prodshape.log tmp/k0s/pure-synth-root-tmpfs.log tmp/k0s/pure-synth-root-symlinks.log
 git commit -m "probe(pure): a plain directory + bind + pivot_root works under the pinned worker shape"
 ```
 
 ### Task 2: `/proc` 判定（P2：骨架里到底要不要建空 `/proc`）
 
 **Files:**
-- Modify: `tmp/k0s/probe-pure-synth-root-plaindir.py` 的 `part_proc`（Task 1 已写入）
+- Modify: `deploy/scripts/acceptance/probe-pure-synth-root-plaindir.py` 的 `part_proc`（Task 1 已写入）
 - Test: `tmp/k0s/pure-synth-root-proc.log`
 
 **Interfaces:**
@@ -375,7 +375,7 @@ git commit -m "probe(pure): a plain directory + bind + pivot_root works under th
 
 - [ ] **Step 1: 跑 part_proc，把"骨架里没有 /proc"的真实结果记下来**
 
-Run: `sh tmp/k0s/probe-pure-synth-root.sh proc tmp/k0s/pure-synth-root-proc.log && cat tmp/k0s/pure-synth-root-proc.log`
+Run: `sh deploy/scripts/acceptance/probe-pure-synth-root.sh proc tmp/k0s/pure-synth-root-proc.log && cat tmp/k0s/pure-synth-root-proc.log`
 Expected: 打印 `[part proc] stat /proc: ENOENT`，退出码 0
 
 - [ ] **Step 2: 把"今天 pure 的 /proc 由中介合成"这条事实钉住（只读）**
@@ -417,7 +417,7 @@ git commit -m "probe(pure): the skeleton needs an empty /proc (ENOENT otherwise)
 ### Task 3: `/dev` 判定表（P3，三条候选的差集）
 
 **Files:**
-- Modify: `tmp/k0s/probe-pure-synth-root-plaindir.py` 的 `part_dev`（Task 1 已写入）
+- Modify: `deploy/scripts/acceptance/probe-pure-synth-root-plaindir.py` 的 `part_dev`（Task 1 已写入）
 - Test: `tmp/k0s/pure-synth-root-dev-hosttree.log`、`tmp/k0s/pure-synth-root-dev-minimal.log`
 
 **Interfaces:**
@@ -426,7 +426,7 @@ git commit -m "probe(pure): the skeleton needs an empty /proc (ENOENT otherwise)
 
 - [ ] **Step 1: 跑 host-tree 候选（= 今天 pure 看到的 /dev）**
 
-Run: `DEV_VARIANT=host-tree sh tmp/k0s/probe-pure-synth-root.sh dev tmp/k0s/pure-synth-root-dev-hosttree.log && cat tmp/k0s/pure-synth-root-dev-hosttree.log`
+Run: `DEV_VARIANT=host-tree sh deploy/scripts/acceptance/probe-pure-synth-root.sh dev tmp/k0s/pure-synth-root-dev-hosttree.log && cat tmp/k0s/pure-synth-root-dev-hosttree.log`
 Expected（**按实测修正**，见 5358cef 报告 §4.1/§4.2）: `variant=host-tree` 段里
 `ls /dev count: 14`（全量、不再 `[:12]` 截断）、`/dev/shm exists: True`、
 `/dev/fd exists: **False**`（这条是 `-> /proc/self/fd` 的软链，`exists` 答的是**目标**在不在；
@@ -436,7 +436,7 @@ Expected（**按实测修正**，见 5358cef 报告 §4.1/§4.2）: `variant=hos
 
 - [ ] **Step 2: 跑 minimal_dev 候选（fork 的六节点）**
 
-Run: `DEV_VARIANT=minimal sh tmp/k0s/probe-pure-synth-root.sh dev tmp/k0s/pure-synth-root-dev-minimal.log && cat tmp/k0s/pure-synth-root-dev-minimal.log`
+Run: `DEV_VARIANT=minimal sh deploy/scripts/acceptance/probe-pure-synth-root.sh dev tmp/k0s/pure-synth-root-dev-minimal.log && cat tmp/k0s/pure-synth-root-dev-minimal.log`
 Expected（同样按实测修正）: `variant=minimal` 段里 `ls /dev count: 6`、`/dev/shm exists: False`、
 `/dev/fd exists: False`（连节点都没有 ⇒ `/dev/fd: unavailable (FileNotFoundError errno=2)`，
 与候选① 的"节点在、目标不在"是**两种** False）
@@ -448,10 +448,10 @@ part 复算 —— 它读两份日志的 `ls /dev` 清单按**集合**比，rc �
 **0 = 集合相等 / 1 = 有增删 / 2 = VACUOUS**（日志读不到、取不到自洽的 `ls /dev` 清单或
 count 对不上、两份日志是同一个文件 —— 这些情况下"相等"没有信息量，不许报 0）。
 
-Run: `sh tmp/k0s/probe-pure-synth-root.sh devdiff tmp/k0s/pure-synth-root-devdiff-hosttree.log`
+Run: `sh deploy/scripts/acceptance/probe-pure-synth-root.sh devdiff tmp/k0s/pure-synth-root-devdiff-hosttree.log`
 Expected: rc **0**，末行 `verdict: EQUAL (set of 14 entries, no additions, no removals)`
 
-Run: `DEVDIFF_LOGS=tmp/k0s/pure-synth-root-dev-baseline-container.log:tmp/k0s/pure-synth-root-dev-minimal-guarded.log sh tmp/k0s/probe-pure-synth-root.sh devdiff tmp/k0s/pure-synth-root-devdiff-minimal.log`
+Run: `DEVDIFF_LOGS=tmp/k0s/pure-synth-root-dev-baseline-container.log:tmp/k0s/pure-synth-root-dev-minimal-guarded.log sh deploy/scripts/acceptance/probe-pure-synth-root.sh devdiff tmp/k0s/pure-synth-root-devdiff-minimal.log`
 Expected: rc **1**，`removed: ['fd', 'full', 'mqueue', 'random', 'shm', 'stderr', 'stdin', 'stdout']`、`added: []`
 
 - [ ] **Step 3: 把差集表写进决定（D1 的拍板输入）**
@@ -1373,13 +1373,13 @@ git commit -m "chore(wheel): rebuild sandlock wheels for the N16 probe lanes"
 ### Task 9: 纯形态 lane + 工作负载普查（P4：三形态逐字节 diff）
 
 **Files:**
-- Create: `tmp/k0s/gateB-pure-rootfs.sh`
-- Create: `tmp/k0s/probe-pure-workload-census.py`
+- Create: `deploy/scripts/acceptance/gateB-pure-rootfs.sh`
+- Create: `deploy/scripts/acceptance/probe-pure-workload-census.py`
 - Test: `tmp/k0s/pure-workload-census.log`
 
 **Interfaces:**
 - Consumes: Task 5 的 `E2B_PURE_ROOTFS=synth`、Task 8 的 wheel
-- Produces: `sh tmp/k0s/gateB-pure-rootfs.sh <0|1> <log> [pytest 目标...]`（pure + 合成根 + 指定 `E2B_REAL_ROOT` 的 lane）；一份三形态三元组 diff 清单
+- Produces: `sh deploy/scripts/acceptance/gateB-pure-rootfs.sh <0|1> <log> [pytest 目标...]`（pure + 合成根 + 指定 `E2B_REAL_ROOT` 的 lane）；一份三形态三元组 diff 清单
 
 - [ ] **Step 1: 写 lane runner（`gateB-full.sh` 的孪生，只多两个 env 与一个可选目标）**
 
@@ -1417,7 +1417,7 @@ docker run --rm --init --network host \
 
 - [ ] **Step 2: 跑一份最小烟测，确认 lane 本身通**
 
-Run: `sh tmp/k0s/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-smoke.log tests/unit/test_pure_rootfs_shape.py && tail -2 tmp/k0s/pure-rootfs-smoke.log`
+Run: `sh deploy/scripts/acceptance/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-smoke.log tests/unit/test_pure_rootfs_shape.py && tail -2 tmp/k0s/pure-rootfs-smoke.log`
 Expected: 末行形如 `7 passed in ...s`，无 failed / error。若报 `E2B_REAL_ROOT is on, but this worker cannot build a sandbox root: ...`，说明 Task 8 的 wheel 没进 lane，回 Task 8
 
 - [ ] **Step 3: 写普查脚本（同一份代表性工作负载在三形态下逐字节比较）**
@@ -1522,13 +1522,13 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: 跑普查（在 lane 里跑，三种形态都在位）**
 
-Run: `sh tmp/k0s/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-census-lane.log tests/unit/test_pure_rootfs_shape.py && docker run --rm --network host --cap-drop ALL --cap-add SYS_ADMIN --security-opt seccomp="$(pwd)/deploy/seccomp/sandlock-worker.json" --security-opt apparmor=unconfined -e E2B_HOST_PROJECT="$(pwd)" -e E2B_BASE_IMAGE= -v "$(pwd):/workspace" -w /workspace e2b-sandlock-test:latest python tmp/k0s/probe-pure-workload-census.py | tee tmp/k0s/pure-workload-census.log`
+Run: `sh deploy/scripts/acceptance/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-census-lane.log tests/unit/test_pure_rootfs_shape.py && docker run --rm --network host --cap-drop ALL --cap-add SYS_ADMIN --security-opt seccomp="$(pwd)/deploy/seccomp/sandlock-worker.json" --security-opt apparmor=unconfined -e E2B_HOST_PROJECT="$(pwd)" -e E2B_BASE_IMAGE= -v "$(pwd):/workspace" -w /workspace e2b-sandlock-test:latest python deploy/scripts/acceptance/probe-pure-workload-census.py | tee tmp/k0s/pure-workload-census.log`
 Expected: 末行 `commands=17 shapes=3 diffs=<n>`（17 = 原 15 条 + 四条软链的两条 accept）；`diffs=0` 直接进 Task 10；`diffs>0` 时把每条 `DIFF [...]` 行分类到"路径缺失 / errno 变化"，分类结果写进 Task 11 —— 不接受"看一眼觉得没事"
 
 - [ ] **Step 5: 提交**
 
 ```bash
-git add tmp/k0s/gateB-pure-rootfs.sh tmp/k0s/probe-pure-workload-census.py tmp/k0s/pure-workload-census.log tmp/k0s/pure-rootfs-census-lane.log
+git add deploy/scripts/acceptance/gateB-pure-rootfs.sh deploy/scripts/acceptance/probe-pure-workload-census.py tmp/k0s/pure-workload-census.log tmp/k0s/pure-rootfs-census-lane.log
 git commit -m "probe(pure): three-shape workload census for the synthesized root"
 ```
 
@@ -1544,7 +1544,7 @@ git commit -m "probe(pure): three-shape workload census for the synthesized root
 
 - [ ] **Step 1: 跑两态 security**
 
-Run: `sh tmp/k0s/gateB-pure-rootfs.sh 0 tmp/k0s/pure-rootfs-sec-realroot0.log tests/security && sh tmp/k0s/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-sec-realroot1.log tests/security && tail -1 tmp/k0s/pure-rootfs-sec-realroot0.log && tail -1 tmp/k0s/pure-rootfs-sec-realroot1.log`
+Run: `sh deploy/scripts/acceptance/gateB-pure-rootfs.sh 0 tmp/k0s/pure-rootfs-sec-realroot0.log tests/security && sh deploy/scripts/acceptance/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-sec-realroot1.log tests/security && tail -1 tmp/k0s/pure-rootfs-sec-realroot0.log && tail -1 tmp/k0s/pure-rootfs-sec-realroot1.log`
 Expected: 两行都是 `... passed, ... skipped, ... xfailed`、**没有 failed / error**。参照系是镜像形态的 `deploy/scripts/arm-lane/x86-security.sh`（`44 passed / 1 skipped / 3 xfailed`）—— pure 形态 skip 更多属正常，failed 必须 0
 
 - [ ] **Step 2: 捞现场证据（正例验收：越界路径变 ENOENT 而不是被拒）**
@@ -1614,7 +1614,7 @@ git commit -m "test(pure): security suite in both real-root states, N27 residue 
 
 - [ ] **Step 1: 先证伪那条 skip 理由（N15 之后 pure 已经有 `/home/user` 挂载了）**
 
-Run: `sh tmp/k0s/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-contracts-before.log tests/contract/test_shared_volume_relative_cwd.py tests/contract/test_pure_shape_workspace_ownership.py; tail -1 tmp/k0s/pure-rootfs-contracts-before.log`
+Run: `sh deploy/scripts/acceptance/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-contracts-before.log tests/contract/test_shared_volume_relative_cwd.py tests/contract/test_pure_shape_workspace_ownership.py; tail -1 tmp/k0s/pure-rootfs-contracts-before.log`
 Expected: `test_shared_volume_relative_cwd.py` 的用例被 `_IMAGE_ROOTFS_ONLY` 整文件 skip（理由是 `image-rootfs contract requires a non-empty E2B_BASE_IMAGE`）—— 记下 skipped 的数量作为迁移前的基线
 
 - [ ] **Step 2: 迁移 skip 判据（从"要镜像"改成"要一个可进入的根"）**
@@ -1642,12 +1642,12 @@ _ROOTED_SHAPE_ONLY = pytest.mark.skipif(
 
 - [ ] **Step 3: 跑迁移后的契约（有根的两档各一次）**
 
-Run: `sh tmp/k0s/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-alias-realroot1.log tests/contract/test_shared_volume_relative_cwd.py && tail -1 tmp/k0s/pure-rootfs-alias-realroot1.log`
+Run: `sh deploy/scripts/acceptance/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-alias-realroot1.log tests/contract/test_shared_volume_relative_cwd.py && tail -1 tmp/k0s/pure-rootfs-alias-realroot1.log`
 Expected: `5 passed`（含 `test_relative_paths_resolve_from_both_workspace_aliases` 的 `hello\nhello\nhello\n` 与 `pwd && pwd -P` = `/home/user\n/home/user\n`），无 skipped
 
 - [ ] **Step 4: 确认镜像形态没被改坏**
 
-Run: `sh tmp/k0s/gateA-full.sh tmp/k0s/n16-gateA-alias.log; grep -c "passed" tmp/k0s/n16-gateA-alias.log; tmp/testenv/bin/python -m pytest tests/contract/test_shared_volume_relative_cwd.py -q`
+Run: `sh deploy/scripts/acceptance/gateA-full.sh tmp/k0s/n16-gateA-alias.log; grep -c "passed" tmp/k0s/n16-gateA-alias.log; tmp/testenv/bin/python -m pytest tests/contract/test_shared_volume_relative_cwd.py -q`
 Expected: gate A 的汇总行仍是 `1772 passed, 6 skipped, 3 xfailed`；本机（既无 `E2B_BASE_IMAGE` 也无 `E2B_PURE_ROOTFS`）整文件 skipped，行数与迁移前一致
 
 - [ ] **Step 5: 把越界路径的 errno 写成明文契约**
@@ -1703,7 +1703,7 @@ async def test_the_errno_for_a_path_outside_every_grant_is_pinned():
 
 - [ ] **Step 6: 跑它，确认通过（两态）**
 
-Run: `sh tmp/k0s/gateB-pure-rootfs.sh 0 tmp/k0s/pure-rootfs-errno-realroot0.log tests/security/test_pure_root_errno_contract.py && sh tmp/k0s/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-errno-realroot1.log tests/security/test_pure_root_errno_contract.py && tail -1 tmp/k0s/pure-rootfs-errno-realroot0.log && tail -1 tmp/k0s/pure-rootfs-errno-realroot1.log`
+Run: `sh deploy/scripts/acceptance/gateB-pure-rootfs.sh 0 tmp/k0s/pure-rootfs-errno-realroot0.log tests/security/test_pure_root_errno_contract.py && sh deploy/scripts/acceptance/gateB-pure-rootfs.sh 1 tmp/k0s/pure-rootfs-errno-realroot1.log tests/security/test_pure_root_errno_contract.py && tail -1 tmp/k0s/pure-rootfs-errno-realroot0.log && tail -1 tmp/k0s/pure-rootfs-errno-realroot1.log`
 Expected: 两态都 `1 passed` 且三重元逐字节相同 —— 这就是 D4"模拟形态必须保留"的落地证据
 
 - [ ] **Step 7: 提交**
@@ -1716,7 +1716,7 @@ git commit -m "test(contract): both rooted shapes resolve the aliases; pin the e
 ### Task 12: pause/resume 在合成根 + 真根下复验（P6）
 
 **Files:**
-- Create: `tmp/k0s/probe-pure-restore-synthroot.sh`
+- Create: `deploy/scripts/acceptance/probe-pure-restore-synthroot.sh`
 - Test: `tmp/k0s/pure-rootfs-restore.log`
 
 **Interfaces:**
@@ -1736,7 +1736,7 @@ log="$1"
 : > "$log"
 for real_root in 0 1; do
     printf '===== E2B_REAL_ROOT=%s =====\n' "$real_root" >> "$log"
-    sh tmp/k0s/gateB-pure-rootfs.sh "$real_root" \
+    sh deploy/scripts/acceptance/gateB-pure-rootfs.sh "$real_root" \
         "tmp/k0s/pure-rootfs-restore-$real_root.log" \
         tests/contract/test_pause_resume_sandlock.py >> "$log" 2>&1 || true
     tail -1 "tmp/k0s/pure-rootfs-restore-$real_root.log" >> "$log"
@@ -1745,7 +1745,7 @@ done
 
 - [ ] **Step 2: 跑它**
 
-Run: `sh tmp/k0s/probe-pure-restore-synthroot.sh tmp/k0s/pure-rootfs-restore.log && cat tmp/k0s/pure-rootfs-restore.log`
+Run: `sh deploy/scripts/acceptance/probe-pure-restore-synthroot.sh tmp/k0s/pure-rootfs-restore.log && cat tmp/k0s/pure-rootfs-restore.log`
 Expected: 两段各一行 pytest 汇总，都是 `... passed` 或 `... skipped`（**没有 failed / error**）。若出现 `restore stub never signalled READY within 10000ms` 或 `No such file or directory (os error 2)`，那是 `docs/chroot-workspace-exec.md` §11 的"立即拒绝"路径：把它作为**前置条件未满足**写进 `docs/checkpoint-restore-e2b-half.md`，并且**先别合**这条纯形态路径
 
 - [ ] **Step 3: 盯住那条守卫（envd 仍然不用 fork 的 checkpoint/restore）**
@@ -1756,7 +1756,7 @@ Expected: PASS
 - [ ] **Step 4: 提交**
 
 ```bash
-git add tmp/k0s/probe-pure-restore-synthroot.sh tmp/k0s/pure-rootfs-restore.log
+git add deploy/scripts/acceptance/probe-pure-restore-synthroot.sh tmp/k0s/pure-rootfs-restore.log
 git commit -m "probe(pure): pause/resume under the synthesized root, both real-root states"
 ```
 
@@ -1771,22 +1771,22 @@ git commit -m "probe(pure): pause/resume under the synthesized root, both real-r
 
 - [ ] **Step 1: gate A（镜像形态，不能被这次改动碰到）**
 
-Run: `sh tmp/k0s/gateA-full.sh tmp/k0s/n16-gateA.log && tail -1 tmp/k0s/n16-gateA.log`
+Run: `sh deploy/scripts/acceptance/gateA-full.sh tmp/k0s/n16-gateA.log && tail -1 tmp/k0s/n16-gateA.log`
 Expected: `1772 passed, 6 skipped, 3 xfailed` 且 `0 failed`（与 `docs/pure-shape-decision.md` §6 逐字相同）
 
 - [ ] **Step 2: gate B（pure，开关关 = N15 的今天）**
 
-Run: `sh tmp/k0s/gateB-full.sh tmp/k0s/n16-gateB-off.log && tail -1 tmp/k0s/n16-gateB-off.log`
+Run: `sh deploy/scripts/acceptance/gateB-full.sh tmp/k0s/n16-gateB-off.log && tail -1 tmp/k0s/n16-gateB-off.log`
 Expected: `1765 passed, 13 skipped, 3 xfailed` 且 `0 failed`（默认 `off` 时与今天逐字相同 —— 这是"可回退"的证明）
 
 - [ ] **Step 3: gate B 的孪生（pure + 合成根）两态**
 
-Run: `sh tmp/k0s/gateB-pure-rootfs.sh 0 tmp/k0s/n16-gateB-synth-realroot0.log && sh tmp/k0s/gateB-pure-rootfs.sh 1 tmp/k0s/n16-gateB-synth-realroot1.log && tail -1 tmp/k0s/n16-gateB-synth-realroot0.log && tail -1 tmp/k0s/n16-gateB-synth-realroot1.log`
+Run: `sh deploy/scripts/acceptance/gateB-pure-rootfs.sh 0 tmp/k0s/n16-gateB-synth-realroot0.log && sh deploy/scripts/acceptance/gateB-pure-rootfs.sh 1 tmp/k0s/n16-gateB-synth-realroot1.log && tail -1 tmp/k0s/n16-gateB-synth-realroot0.log && tail -1 tmp/k0s/n16-gateB-synth-realroot1.log`
 Expected: 两态都 `0 failed`；skipped 允许多于 gate B（形态相关的 skip 是设计的一部分），passed 数必须 ≥ `1765`
 
 - [ ] **Step 4: phase 2（非 root worker）与 fork 全量**
 
-Run: `sh tmp/k0s/phase2.sh tmp/k0s/n16-phase2.log && tail -1 tmp/k0s/n16-phase2.log`
+Run: `sh deploy/scripts/acceptance/phase2.sh tmp/k0s/n16-phase2.log && tail -1 tmp/k0s/n16-phase2.log`
 Expected: `57 passed, 1 skipped` 且 `0 failed`
 
 Run: `cd third_party/sandlock && chmod -R a+rwX tmp && docker run --privileged --rm -v "$PWD":/src -w /src sandlock-dev:latest sh scripts/test-all.sh 2>&1 | tail -8`
@@ -1797,11 +1797,11 @@ Expected: 每个 label 的计数与 `docs/test-baseline.md` 相等（`core_integ
 ```
 | 档 | 命令 | 结果 | 基线 | 判定 |
 |---|---|---|---|---|
-| gate A | tmp/k0s/gateA-full.sh | ... | 1772/6/3/0 | 相等 |
-| gate B（off） | tmp/k0s/gateB-full.sh | ... | 1765/13/3/0 | 相等 |
-| gate B + 合成根（REAL_ROOT=0） | tmp/k0s/gateB-pure-rootfs.sh 0 | ... | — | 0 failed |
-| gate B + 合成根（REAL_ROOT=1） | tmp/k0s/gateB-pure-rootfs.sh 1 | ... | — | 0 failed |
-| phase 2 | tmp/k0s/phase2.sh | ... | 57/1/0 | 相等 |
+| gate A | deploy/scripts/acceptance/gateA-full.sh | ... | 1772/6/3/0 | 相等 |
+| gate B（off） | deploy/scripts/acceptance/gateB-full.sh | ... | 1765/13/3/0 | 相等 |
+| gate B + 合成根（REAL_ROOT=0） | deploy/scripts/acceptance/gateB-pure-rootfs.sh 0 | ... | — | 0 failed |
+| gate B + 合成根（REAL_ROOT=1） | deploy/scripts/acceptance/gateB-pure-rootfs.sh 1 | ... | — | 0 failed |
+| phase 2 | deploy/scripts/acceptance/phase2.sh | ... | 57/1/0 | 相等 |
 | security 两态 | tmp/k0s/pure-rootfs-sec-realroot{0,1}.log | ... | 镜像档 44/1/3 | 0 failed |
 | fork | third_party/sandlock/scripts/test-all.sh | ... | core_integ 561 | 相等 |
 | 本机单测 | tmp/testenv/bin/python -m pytest tests/unit -q | ... | 16 failed / 1171 passed | 相等 |

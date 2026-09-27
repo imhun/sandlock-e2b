@@ -41,7 +41,7 @@
 ## B 的剩余工作（2026-09-21 量清事实，未改代码）
 
 原计划写的是「幂等 + 网关超时 + 文档」，本轮把**客户端实际看到的形状**量了一遍
-（`tmp/k0s/probe_n29_sync.py`，日志 `tmp/k0s/n29-sync.log`；2000 个文件 / 512 B 的树，
+（`deploy/scripts/acceptance/probe_n29_sync.py`，日志 `tmp/k0s/n29-sync.log`；2000 个文件 / 512 B 的树，
 入口 `http://172.18.78.49:3000`）：
 
 | 观察 | 事实 |
@@ -64,7 +64,7 @@
    提到覆盖一次合法拷贝（或按 ① 的异步语义彻底绕开），并复核
    `max_fails`/`fail_timeout`/`proxy_next_upstream`（`non_idempotent` 尤其要看——它决定一次
    超时后重试打不打到**第二个上游**，这正是重复拷一份的另一个来源）。改完要用
-   `tmp/k0s/probe_n29_sync.py` 复跑：期望 1st POST 不再 504，或重试拿回**同一个** snapshot。
+   `deploy/scripts/acceptance/probe_n29_sync.py` 复跑：期望 1st POST 不再 504，或重试拿回**同一个** snapshot。
 4. **文档**：把"客户端超时但服务端成功"的语义写进 API 文档（快照是幂等的、以 `name` 或
    `Idempotency-Key` 为准；超时后先 `GET /snapshots` 再决定是否重试）。
 
@@ -81,7 +81,7 @@
 | 项 | 证据 |
 |---|---|
 | 部署 | `apply.sh` EXIT=0；两个 worker 都滚动到新版本；预热步骤照跑（两节点 `peek cached=true`，`warmed=skipped`） |
-| A（目录计费） | `tmp/k0s/probe_dir_stsize.py`：平台数 = 沙箱内独立测量 = `du -s -B1` = **33792**，逐字节相等、du diff 0 |
+| A（目录计费） | `deploy/scripts/acceptance/probe_dir_stsize.py`：平台数 = 沙箱内独立测量 = `du -s -B1` = **33792**，逐字节相等、du diff 0 |
 | F（预热） | `apply.sh` 内置步骤输出两节点 `cached=true`；冷节点路径在 2026-09-21 已单独验证过（`cached=false` → POST → `cached=true`，18.8 s） |
 | 端到端 | `deployment_smoke.py` **DEPLOYMENT SMOKE OK**（命令/文件、迁移保留文件、网络配置、远端卷隔离、模板构建→拉取→rootfs、箱内 MCP 经代理、kill 后预留归零）；`multinode_smoke.py` **MULTI-NODE SMOKE OK**（4 箱 2+2 跨节点） |
 | 非 root 形态 | 由 lane 的 phase 2 覆盖（`UNPRIVILEGED_PHASE` 默认跑）：51 passed；集群这份清单是 **root worker**（`worker-root.patch.yaml` 的 `runAsUser: 0`），走的是 `route_b._spawn_slot`，不受那条修复影响 |

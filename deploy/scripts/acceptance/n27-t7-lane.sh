@@ -11,7 +11,7 @@
 #     there cannot even be chdir'd into (exit 125) -- see
 #     tmp/k0s/n27-t7-lane-mount.log.
 #
-# Usage: sh tmp/k0s/n27-t7-lane.sh python3 -u tmp/k0s/probe_state_base_visibility.py lane --shape identity --layout n27
+# Usage: sh deploy/scripts/acceptance/n27-t7-lane.sh python3 -u deploy/scripts/acceptance/probe_state_base_visibility.py lane --shape identity --layout n27
 set -eu
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 IMAGE="${IMAGE:-e2b-sandlock-test:latest}"

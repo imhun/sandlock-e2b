@@ -40,7 +40,7 @@
 # (`deploy/scripts/build-test-image.sh`, pitfalls §B7): re-running a lane on a
 # re-baked image without touching the shared `:latest` tag needs a knob.
 set -eu
-cd /Users/polus/project/ai/sandlock-e2b
+cd "$(cd "$(dirname "$0")/../.." && pwd)"
 IMAGE="${E2B_TEST_IMAGE:-e2b-sandlock-test:latest}"
 state="$1"
 log="$2"

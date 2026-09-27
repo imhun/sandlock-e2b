@@ -38,10 +38,10 @@ XFS prjquota 不可用、缺 `SYS_ADMIN/SYS_PTRACE` 导致 `uid` 映射失败）
 
 ## 探针运行器
 
-本审计自建的可复用运行器（`tmp/sec-run-probe.sh`）复刻 lane 的能力集，默认挂**部署用**的
+本审计自建的可复用运行器（`deploy/scripts/acceptance/sec-run-probe.sh`）复刻 lane 的能力集，默认挂**部署用**的
 seccomp profile（worker 在无过滤器下会拒绝启动：`SECCOMP_FILTER_MISSING`）：
 
 ```bash
-./tmp/sec-run-probe.sh python tmp/<probe>.py
-SECCOMP_PROFILE=unconfined ./tmp/sec-run-probe.sh python -m pytest tests/security/escape -q
+./deploy/scripts/acceptance/sec-run-probe.sh python tmp/<probe>.py
+SECCOMP_PROFILE=unconfined ./deploy/scripts/acceptance/sec-run-probe.sh python -m pytest tests/security/escape -q
 ```

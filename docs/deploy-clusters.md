@@ -265,7 +265,7 @@ Calico VXLAN 只能建集群时定）见 `deploy/k8s-k0s/README.md`；集群层�
    `stub_path()` 用的正是那条路径 ⇒ 装到 worker 上的 wheel 里没有它，每次 resume 都被
    `restore-stub was not built` 拒绝（见 fork `2d5f2e9`，修完立刻通）。
 
-**验收状态**（脚本 `tmp/k0s/checkpoint_acceptance.py`，每步都断言）：
+**验收状态**（脚本 `deploy/scripts/checkpoint_acceptance.py`，每步都断言）：
 
 * ✅ `pause` 写图：`_runtime/.checkpoints/<id>/latest`，422 KiB，含 `meta.json` / `policy.dat` /
   `process`；属主是那个沙箱的 uid；沙箱自己的树一个字节没动。
@@ -302,7 +302,7 @@ export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o json
 .venv/bin/python deploy/scripts/checkpoint_acceptance.py
 ```
 
-（脚本最后会把沙箱 `kill` 掉；想留下现场排障就用 `tmp/k0s/probe_restore_state.py`，它不 kill，
+（脚本最后会把沙箱 `kill` 掉；想留下现场排障就用 `deploy/scripts/acceptance/probe_restore_state.py`，它不 kill，
 并打印沙箱 id 与宿主 pod。）
 
 > **这条脚本会删宿主 worker 的 pod，所以不能在有别人沙箱的时候跑（2026-09-27）**：跑到
@@ -371,7 +371,7 @@ export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o json
 默认 5），`E2B_CPU_TRACE=1` 只是排障用的每轮摘要，线上**没开**。控制面一行没改 —— 这条信号
 走的是既有的 `sandboxActivity` 心跳。
 
-**验收**：`tmp/k0s/cpu_activity_acceptance.py` 全绿（两个沙箱、两段 45 s 静默窗口；
+**验收**：`deploy/scripts/acceptance/cpu_activity_acceptance.py` 全绿（两个沙箱、两段 45 s 静默窗口；
 两组时间戳见 `docs/resource-contention.md` §6 的表）。
 
 **这次量出来的两件事（以后验收任何"活动/空闲"类功能都要记得）**：
@@ -394,14 +394,14 @@ export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o json
 export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 export E2B_API_URL=http://172.18.78.49:3000
 export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d)
-.venv/bin/python tmp/k0s/cpu_activity_acceptance.py
+.venv/bin/python deploy/scripts/acceptance/cpu_activity_acceptance.py
 ```
 
 ## 11. N27（平台状态另起 `state base`）的上线记录与集群验收（2026-09-26）—— 历史记录（该版本当天的验收）
 
 > **这是历史记录**：本节记的是 N27 上线当天的实测与集群验收，**不是当前部署状态**
-> （当前版本与形态开关见 §7，最近一次发版见 §12）。§11.4 里的 `tmp/k0s/...` 命令路径按
-> 本轮约定暂不改（搬运未完），改的是状态与事实。
+> （当前版本与形态开关见 §7，最近一次发版见 §12）。§11.4 里的命令路径已按判据入口的
+> 搬迁改指 `deploy/scripts/acceptance/`，改的是状态与事实。
 
 **版本**：`0.1.0-597-g3701a53-20260926-163057`（= **当轮** `deploy/stack/.version`；今天已不是，
 见 §7/§12）。整栈同一版本 ——
@@ -424,7 +424,7 @@ export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.d
   `workspace base = /var/lib/e2b-sandboxes/workspaces` / `platform state base = /var/lib/e2b-sandboxes/state`。
 * 证据：`tmp/k0s/n27-t7-cluster-state.log`、`n27-t7-cluster-volume.log`、`n27-t7-cluster-layout.log`。
 
-### 11.2 形态无关性：两种形态 + 一条反例（探针 `tmp/k0s/probe_state_base_visibility.py`）
+### 11.2 形态无关性：两种形态 + 一条反例（探针 `deploy/scripts/acceptance/probe_state_base_visibility.py`）
 
 两条判据，都在沙箱内跑：① `stat` 四个平台状态路径（`<base>`、`<base>/_runtime`、`<base>/.route-b`、
 `<base>/_runtime/.checkpoints`）必须**全失败**且 errno ∈ {`ENOENT`, `EACCES`}（N15 之后 pure 形态是中介的
@@ -479,14 +479,14 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 deploy/scripts/open-cluster-tunnel.sh                       # 建通道 + 自检 2 节点 arm64
 export E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000
 export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d | cut -d, -f1)
-tmp/testenv/bin/python tmp/k0s/probe_state_base_visibility.py cluster
+tmp/testenv/bin/python deploy/scripts/acceptance/probe_state_base_visibility.py cluster
 tmp/testenv/bin/python deploy/scripts/multinode_smoke.py
 tmp/testenv/bin/python deploy/scripts/deployment_smoke.py
 
 # 形态对照（prod-shaped 测试容器；仓库挂在 /src，因为 identity 形态拒 /workspace）
-sh tmp/k0s/n27-t7-lane.sh python3 -u tmp/k0s/probe_state_base_visibility.py lane --shape identity     --layout n27
-sh tmp/k0s/n27-t7-lane.sh python3 -u tmp/k0s/probe_state_base_visibility.py lane --shape identity     --layout legacy
-sh tmp/k0s/n27-t7-lane.sh python3 -u tmp/k0s/probe_state_base_visibility.py lane --shape synth-realroot --layout n27
+sh deploy/scripts/acceptance/n27-t7-lane.sh python3 -u deploy/scripts/acceptance/probe_state_base_visibility.py lane --shape identity     --layout n27
+sh deploy/scripts/acceptance/n27-t7-lane.sh python3 -u deploy/scripts/acceptance/probe_state_base_visibility.py lane --shape identity     --layout legacy
+sh deploy/scripts/acceptance/n27-t7-lane.sh python3 -u deploy/scripts/acceptance/probe_state_base_visibility.py lane --shape synth-realroot --layout n27
 ```
 
 （lane 容器是 `e2b-sandlock-test:latest`（amd64），caps 与 seccomp 档同
@@ -544,8 +544,8 @@ deploy/k8s-k0s/apply.sh                                 # 渲染 + apply + 预�
 | 配额账本（N41 的副作用面） | 上述全部跑完后 `GET /internal/nodes`：两节点 `reservedMemoryMB=0`、`reservedDiskMB=0` | 同上 |
 
 **怎么再跑一遍**：通道与两个 key 同 §11.4，把最后三行换成
-`.venv/bin/python tmp/n37/cluster_run.py --files 4000 --runs 3`、
-`.venv/bin/python tmp/k0s/n42-egress-probe.py`、
+`.venv/bin/python deploy/scripts/acceptance/cluster_run.py --files 4000 --runs 3`、
+`.venv/bin/python deploy/scripts/acceptance/n42-egress-probe.py`、
 `.venv/bin/python deploy/scripts/checkpoint_acceptance.py`（后者**会删宿主 worker 的 pod**，
 脚本自带"这台 worker 上还有别人的沙箱就拒绝"的礼貌检查，`--force` 是唯一出口）。
 

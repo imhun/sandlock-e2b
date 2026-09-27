@@ -40,4 +40,4 @@ docker run --rm --init --network host \
     -e PROC_VARIANT="${PROC_VARIANT:-absent}" \
     -v "$(pwd):/workspace" -w /workspace \
     e2b-sandlock-test:latest \
-    python tmp/k0s/probe-pure-synth-root-plaindir.py "$part" > "$log" 2>&1
+    python deploy/scripts/acceptance/probe-pure-synth-root-plaindir.py "$part" > "$log" 2>&1

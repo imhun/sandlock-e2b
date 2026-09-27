@@ -105,11 +105,11 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
    （迁移前同形态在 `..` 一层就列出 `_runtime`），是"没有根"这件事本身，**N16（合成根）才是消掉它的
    那条路**。两种形态都**不是"能读"** —— 这半边仍成立 —— 所以验收**不再**是"pure 形态下从沙箱内
    `stat(<新 base>)` 为 ENOENT"这条单形态判据（该判据随 N15 的中介化作废）。证据：`docs/deploy-clusters.md`
-   §11.2 的形态对照表 + 探针 `tmp/k0s/probe_state_base_visibility.py`。**回退窗口**：旧
+   §11.2 的形态对照表 + 探针 `deploy/scripts/acceptance/probe_state_base_visibility.py`。**回退窗口**：旧
    `<export>/_runtime` 不需要保留副本 —— `--rollback` 是同一张映射表的反向 `mv`
    （`state/_runtime` → `<export>/_runtime`，inode 保留、不拷数据），依据是留在盘上的
    `state/.state-base-migration.journal`（0600），一个发布周期内不删它即可原路退回。
-   证据：`docs/deploy-clusters.md` 的 N27 上线记录节 + 探针 `tmp/k0s/probe_state_base_visibility.py`。
+   证据：`docs/deploy-clusters.md` 的 N27 上线记录节 + 探针 `deploy/scripts/acceptance/probe_state_base_visibility.py`。
    **（2026-09-27 更新：同一支探针按 lane 三档重跑复核，结论逐字未变）** —— `synth` + `E2B_REAL_ROOT=1`
    档**已消掉**"能列出名字"（`chain=PASS`，`<export>` 根本不在祖先链上）；**默认的 `identity` 档仍有残差**
    （`<export>` 一层 `LEAK ["_secrets", "state"]`、四次 `stat` 仍 `EACCES`）；legacy 反例档 `exit 1`
@@ -165,14 +165,14 @@ worker + pure"这条能跑但不中介的路。
 
 | 档 | 命令 | 结果 |
 |---|---|---|
-| gate A（镜像形态，默认） | `tmp/k0s/gateA-full.sh`（= phase 1 的形状 + `E2B_BASE_IMAGE=python-mcp:3.14`） | **1772 passed / 6 skipped / 3 xfailed / 0 failed**（581 s） |
-| gate B（pure） | `tmp/k0s/gateB-full.sh`（同形状 + `E2B_BASE_IMAGE=`） | **1765 passed / 13 skipped / 3 xfailed / 0 failed**（436 s） |
-| phase 2（非 root worker） | `tmp/k0s/phase2.sh` | **57 passed / 1 skipped / 0 failed** |
+| gate A（镜像形态，默认） | `deploy/scripts/acceptance/gateA-full.sh`（= phase 1 的形状 + `E2B_BASE_IMAGE=python-mcp:3.14`） | **1772 passed / 6 skipped / 3 xfailed / 0 failed**（581 s） |
+| gate B（pure） | `deploy/scripts/acceptance/gateB-full.sh`（同形状 + `E2B_BASE_IMAGE=`） | **1765 passed / 13 skipped / 3 xfailed / 0 failed**（436 s） |
+| phase 2（非 root worker） | `deploy/scripts/acceptance/phase2.sh` | **57 passed / 1 skipped / 0 failed** |
 | security 两态（`E2B_REAL_ROOT=0/1`） | `deploy/scripts/arm-lane/x86-security.sh` | 默认档 44 passed / 1 skipped / 3 xfailed；pure 42 passed / 3 skipped / 3 xfailed |
 | `tests/unit`（macOS 本机） | `.venv/bin/python -m pytest tests/unit` | 16 failed / 1164 passed（**基线未变**：gateway/priv_helpers/real_root_gate/xfs_quotactl） |
 
 > **`test-prod-shaped.sh` 不能跑 gate B**：它的 `-e E2B_BASE_IMAGE="${E2B_BASE_IMAGE:-…}"` 会把
-> **空值**变回默认镜像（`:-` 对"已设但为空"同样取默认）。`tmp/k0s/gateB-full.sh` 就是它 phase 1 的
+> **空值**变回默认镜像（`:-` 对"已设但为空"同样取默认）。`deploy/scripts/acceptance/gateB-full.sh` 就是它 phase 1 的
 > 复制品，只把这一处写成真正的空。
 
 **N15②（ETXTBSY 一拍窗口）已随本条一起被覆盖**：`test_user_cli_install_within_workspace_persists`
@@ -221,12 +221,12 @@ revision `1374e87`、同一份树指纹上跑，镜像 `e2b-sandlock-test:task12
 
 | 档 | 命令（`E2B_TEST_IMAGE=e2b-sandlock-test:task12cur` 前缀省略） | 结果（末行逐字） | 基线 | 与基线的差 / 判定 |
 |---|---|---|---|---|
-| **gate A**（镜像形态，全量） | `sh tmp/k0s/gateA-full.sh tmp/k0s/n16-gateA.log` | `2022 passed, 10 skipped, 3 xfailed` | Task 11 的 `2003 passed / 0 failed`（revision `47998de`） | **+19 passed、0 failed**；+19 全部是 `47998de` 之后落库的新用例（collect：`47998de` = 2016、现在 = 2035）⇒ **相等或更好** |
-| **gate B off**（= 新读法下的 `=0` identity） | `sh tmp/k0s/gateB-full.sh tmp/k0s/n16-gateB-off.log` | `2015 passed, 17 skipped, 3 xfailed` | 简报的 `1765 passed / 13 skipped / 3 xfailed`（N15 当天，过期）；同形的 Task 11 identity security `43/3/3` | `0 failed`；与基线数字不同只因基线 revision 少 19 条用例 + 7 条形态 skip ⇒ **相等或更好** |
-| **`=1` 合成根 + 真根** | `sh tmp/k0s/gateB-pure-rootfs.sh 1 tmp/k0s/n16-gateB-synth-realroot.log tests --perf --ignore=tests/contract/test_volume_quota.py --ignore=tests/contract/test_xfs_project_quota.py` | `2019 passed, 16 skipped` | 简报"两态都 0 failed、passed ≥ 1765"；同态的 security `46 passed / 3 skipped / 0 failed`（Task 11） | **0 failed / 0 error**，比 identity 多 4：3 条 N35 `xfail` 转 pass + 1 条别名用例不再 skip ⇒ **相等或更好** |
-| **`=0` 那一态**（`gateB-pure-rootfs.sh 0`） | `sh tmp/k0s/gateB-pure-rootfs.sh 0 tmp/k0s/n16-gateB-identity.log tests --perf --ignore=…同上` | `2015 passed, 17 skipped, 3 xfailed` | —（新读法下它就是 gate B off） | 与 gate B off **逐字相同**（同 2015/17/3）⇒ 两态 = 第 2 档 + 第 3 档，**自洽** |
+| **gate A**（镜像形态，全量） | `sh deploy/scripts/acceptance/gateA-full.sh tmp/k0s/n16-gateA.log` | `2022 passed, 10 skipped, 3 xfailed` | Task 11 的 `2003 passed / 0 failed`（revision `47998de`） | **+19 passed、0 failed**；+19 全部是 `47998de` 之后落库的新用例（collect：`47998de` = 2016、现在 = 2035）⇒ **相等或更好** |
+| **gate B off**（= 新读法下的 `=0` identity） | `sh deploy/scripts/acceptance/gateB-full.sh tmp/k0s/n16-gateB-off.log` | `2015 passed, 17 skipped, 3 xfailed` | 简报的 `1765 passed / 13 skipped / 3 xfailed`（N15 当天，过期）；同形的 Task 11 identity security `43/3/3` | `0 failed`；与基线数字不同只因基线 revision 少 19 条用例 + 7 条形态 skip ⇒ **相等或更好** |
+| **`=1` 合成根 + 真根** | `sh deploy/scripts/acceptance/gateB-pure-rootfs.sh 1 tmp/k0s/n16-gateB-synth-realroot.log tests --perf --ignore=tests/contract/test_volume_quota.py --ignore=tests/contract/test_xfs_project_quota.py` | `2019 passed, 16 skipped` | 简报"两态都 0 failed、passed ≥ 1765"；同态的 security `46 passed / 3 skipped / 0 failed`（Task 11） | **0 failed / 0 error**，比 identity 多 4：3 条 N35 `xfail` 转 pass + 1 条别名用例不再 skip ⇒ **相等或更好** |
+| **`=0` 那一态**（`gateB-pure-rootfs.sh 0`） | `sh deploy/scripts/acceptance/gateB-pure-rootfs.sh 0 tmp/k0s/n16-gateB-identity.log tests --perf --ignore=…同上` | `2015 passed, 17 skipped, 3 xfailed` | —（新读法下它就是 gate B off） | 与 gate B off **逐字相同**（同 2015/17/3）⇒ 两态 = 第 2 档 + 第 3 档，**自洽** |
 | **第三组合（`synth` + `REAL_ROOT=0`）** | `docker run … -e E2B_PURE_ROOTFS=synth -e E2B_REAL_ROOT=0 … python3 -c 'from envd_service.app import create_app; create_app()'` | `RuntimeError: E2B_PURE_ROOTFS=synth without E2B_REAL_ROOT=1: …`，**exit 1** | 追加裁定：该组合结构性不成立，守卫当场拒绝 | **没有"这一档"的结果，只有拒绝证据** |
-| **phase 2**（非 root worker） | `sh tmp/k0s/phase2.sh tmp/k0s/n16-phase2.log` | `57 passed, 1 skipped` | 简报 `57 passed, 1 skipped` | **逐字相等** |
+| **phase 2**（非 root worker） | `sh deploy/scripts/acceptance/phase2.sh tmp/k0s/n16-phase2.log` | `57 passed, 1 skipped` | 简报 `57 passed, 1 skipped` | **逐字相等** |
 
 **四档全 `0 failed`**；简报与 §6 里 N15 当天那组 `1772/1765` 已被这组取代。security 两态（Task 11，
 `tests/security` 自 `47998de` 起零改动）identity `43 passed / 3 skipped / 3 xfailed`、合成根

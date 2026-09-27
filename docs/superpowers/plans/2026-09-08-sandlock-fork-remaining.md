@@ -636,8 +636,8 @@ Expected: sha256 == `wheels/fork/SHA256SUMS.supervise` 对应架构行；mode `0
 - [x] **Step 2：低 fd 表探针（FUP-23 + F15 的联合回归门）**
 
 ```bash
-for n in 0 1 2 8; do tmp/venv/bin/python tmp/f11_fdcount_probe.py $n > "tmp/f15-fdcount-$n.log" 2>&1; done
-tmp/venv/bin/python tmp/f23_multi_probe.py 0 4 > tmp/f15-multi.log 2>&1
+for n in 0 1 2 8; do tmp/venv/bin/python deploy/scripts/acceptance/f11_fdcount_probe.py $n > "tmp/f15-fdcount-$n.log" 2>&1; done
+tmp/venv/bin/python deploy/scripts/acceptance/f23_multi_probe.py 0 4 > tmp/f15-multi.log 2>&1
 rg -c "FAILURES: \[\]" tmp/f15-fdcount-*.log     # 期望 4 个文件各命中一次
 ```
 

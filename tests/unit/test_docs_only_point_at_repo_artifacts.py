@@ -1,33 +1,56 @@
-"""Docs must not send a reader to a `tmp/` script that only exists on one machine.
+"""Docs must not send a reader to a `tmp/` script.
 
 Most of this repo's acceptance evidence used to live in `tmp/` (gitignored) and
 `.superpowers/sdd/` (gitignored) while `docs/**` told the reader to go run it *by
 name*. `tmp/` gets cleaned, and a fresh checkout has neither file, so the sentence
 "how to run this again" was the first thing to rot -- one round of it produced an
-acceptance table that only existed inside a gitignored report. The scripts have
-now been promoted to `deploy/scripts/acceptance/` (reports: `docs/reports/`), and
-this file pins that mapping so the next tmp-only criterion cannot be introduced
-by quietly adding a line to a doc.
+acceptance table that only existed inside a gitignored report. The fixed tools now
+live in `deploy/scripts/acceptance/` (reports: `docs/reports/`) and the reports in
+`docs/reports/`.
 
-What is asserted: every `tmp/**.py|sh` path a *live* doc cites as the way to
-re-run a criterion is named either in `PROMOTED` (it is in the repo now) or in
-`ALLOWED_TMP_REFERENCES` (it is not, and the reason says why). The comparison is
-set equality against an explicit manifest -- not a substring or prefix match --
-so a new reference, or the removal of an allowance, changes the answer.
+The first version of this pin only asserted *membership*: a live doc citing a
+`tmp/` path was fine as long as the path was either `PROMOTED` (a repo copy
+existed) or explicitly allowed. That was too weak in a specific way -- a live doc
+could keep pointing at `tmp/` forever and stay green, because "a repo copy exists
+somewhere" is not the same as "the doc points at it". The rule is now:
 
-`docs/reports/**` is deliberately *not* part of the pin: those files are
-byte-exact copies of historical work notes, so their `tmp/` mentions are the past
-narrated, not instructions. They are still scanned (see
+* `PROMOTED` is a *deny list*. A live doc citing one of those old `tmp/` paths is
+  red, and the failure text names the promoted path to point it at instead. The
+  point of the promotion was to change the reference, not to bless the old one.
+* `ALLOWED_TMP_REFERENCES` keeps only the paths that genuinely cannot be
+  reproduced from today's tree -- one-off diagnostics, wrappers whose payloads
+  were never in the reference set, or files that no longer exist at all. Each one
+  carries a one-line reason, and an allowance that no live doc cites any more is
+  itself an error (a stale excuse is how the weak version would come back).
+
+What is asserted:
+
+* no live doc cites a `PROMOTED` old `tmp/` path (the deny list);
+* every `tmp/**.py|sh` path a live doc cites is in `ALLOWED_TMP_REFERENCES`;
+* every allowance is still cited by a live doc, and carries a one-line reason;
+* every promoted *source* is gone from `tmp/` and every promoted *target* is a
+  file in the repo -- "promoted" means moved, not copied;
+* every `deploy/scripts/acceptance/*.py|sh` path a live doc cites exists on disk,
+  so the replacement reference is checked the same way the old one is.
+
+`docs/reports/**` is deliberately *not* part of the pin: those files are byte-exact
+copies of historical work notes, so their `tmp/` mentions are the past narrated,
+not instructions. They are still scanned (see
 `test_the_frozen_archive_is_not_live_docs`) so that this is a decision on the
 record rather than a glob accident.
 
-Falsifiability -- both run against the tree of the commit that added this file,
-red output pasted into `docs/reports/README.md`:
+Falsifiability -- four mutations, each run against the tree of the commit that
+wrote this file, red output pasted into
+`.superpowers/sdd/artifact-promotion-round2-report.md`:
 
-* appending `see tmp/does-not-exist-probe.py` to a live doc: the unpinned path is
-  named and the set comparison fails;
-* deleting a still-cited entry from `ALLOWED_TMP_REFERENCES` (the run used
-  `tmp/k0s/gateA-full.sh`): the same assertion names that path.
+* appending `see tmp/foo-probe.py` to a live doc: the uncited, unpinned path is
+  named and the allowance comparison fails;
+* writing a promoted old path back into a live doc (the run used
+  `tmp/k0s/gateB-full.sh`): the deny list names it and the promoted path;
+* deleting a still-cited allowance (`tmp/k0s/tools.sh`): the allowance comparison
+  fails and names that path;
+* renaming a cited `deploy/scripts/acceptance/` script (`capacity_check.py`): the
+  existence check for the repo-side reference fails.
 """
 
 from __future__ import annotations
@@ -44,7 +67,17 @@ FROZEN_ARCHIVE = DOCS / "reports"
 #: lookbehind keeps `foo/tmp/x.py` (a path *outside* this repo) out of the set.
 TMP_SCRIPT = re.compile(r"(?<![A-Za-z0-9_])tmp/[A-Za-z0-9._/-]+\.(?:py|sh)")
 
-#: source (gitignored) -> where the byte-exact copy lives now. 67 entries.
+#: A reference to the promoted tree. Anchored the same way, so `tmp/…` cannot
+#: satisfy it and a bare `capacity_check.py` (no directory) is not a reference.
+ACCEPTANCE_SCRIPT = re.compile(
+    r"(?<![A-Za-z0-9_])deploy/scripts/acceptance/[A-Za-z0-9._/-]+\.(?:py|sh)"
+)
+
+#: deny list: old (gitignored) path -> where the byte-exact copy lives now. A
+#: live doc citing the left-hand side is red; the failure says to cite the right.
+#: 78 entries: the 67 from the first promotion round, the 10 fixed tools of the
+#: second round, and `checkpoint_acceptance.py` (whose old 437-line copy was a
+#: duplicate of the 632-line `deploy/scripts/checkpoint_acceptance.py`).
 PROMOTED_ENTRIES = (
     ("tmp/arm-vm/run.sh", "deploy/scripts/acceptance/run.sh"),
     ("tmp/capacity_check.py", "deploy/scripts/acceptance/capacity_check.py"),
@@ -56,13 +89,19 @@ PROMOTED_ENTRIES = (
     ("tmp/f11_fup3_probe.py", "deploy/scripts/acceptance/f11_fup3_probe.py"),
     ("tmp/f23_multi_probe.py", "deploy/scripts/acceptance/f23_multi_probe.py"),
     ("tmp/final-verify.sh", "deploy/scripts/acceptance/final-verify.sh"),
+    ("tmp/k0s/checkpoint_acceptance.py", "deploy/scripts/checkpoint_acceptance.py"),
     ("tmp/k0s/cpu_activity_acceptance.py", "deploy/scripts/acceptance/cpu_activity_acceptance.py"),
+    ("tmp/k0s/gateA-full.sh", "deploy/scripts/acceptance/gateA-full.sh"),
+    ("tmp/k0s/gateB-full.sh", "deploy/scripts/acceptance/gateB-full.sh"),
+    ("tmp/k0s/gateB-pure-rootfs.sh", "deploy/scripts/acceptance/gateB-pure-rootfs.sh"),
     ("tmp/k0s/mmap-probe.py", "deploy/scripts/acceptance/mmap-probe.py"),
+    ("tmp/k0s/n27-t7-lane.sh", "deploy/scripts/acceptance/n27-t7-lane.sh"),
     ("tmp/k0s/n35-lane.sh", "deploy/scripts/acceptance/n35-lane.sh"),
     ("tmp/k0s/n42-egress-probe.py", "deploy/scripts/acceptance/n42-egress-probe.py"),
     ("tmp/k0s/node-mmap-storage.sh", "deploy/scripts/acceptance/node-mmap-storage.sh"),
     ("tmp/k0s/overlay-probe.sh", "deploy/scripts/acceptance/overlay-probe.sh"),
     ("tmp/k0s/phase1-probe2.sh", "deploy/scripts/acceptance/phase1-probe2.sh"),
+    ("tmp/k0s/phase2.sh", "deploy/scripts/acceptance/phase2.sh"),
     ("tmp/k0s/probe_127_errno.py", "deploy/scripts/acceptance/probe_127_errno.py"),
     ("tmp/k0s/probe_brief_stat_live.py", "deploy/scripts/acceptance/probe_brief_stat_live.py"),
     ("tmp/k0s/probe_ceiling_completeness.py", "deploy/scripts/acceptance/probe_ceiling_completeness.py"),
@@ -86,6 +125,11 @@ PROMOTED_ENTRIES = (
     ("tmp/k0s/probe_restore_state.py", "deploy/scripts/acceptance/probe_restore_state.py"),
     ("tmp/k0s/probe_write_paths.py", "deploy/scripts/acceptance/probe_write_paths.py"),
     ("tmp/k0s/probe-pure-realroot.py", "deploy/scripts/acceptance/probe-pure-realroot.py"),
+    ("tmp/k0s/probe-pure-restore-synthroot.sh", "deploy/scripts/acceptance/probe-pure-restore-synthroot.sh"),
+    ("tmp/k0s/probe-pure-synth-root-plaindir.py", "deploy/scripts/acceptance/probe-pure-synth-root-plaindir.py"),
+    ("tmp/k0s/probe-pure-synth-root.sh", "deploy/scripts/acceptance/probe-pure-synth-root.sh"),
+    ("tmp/k0s/probe-pure-workload-census.py", "deploy/scripts/acceptance/probe-pure-workload-census.py"),
+    ("tmp/k0s/probe_state_base_visibility.py", "deploy/scripts/acceptance/probe_state_base_visibility.py"),
     ("tmp/k0s/red-routeb-stderr-drain.py", "deploy/scripts/acceptance/red-routeb-stderr-drain.py"),
     ("tmp/k0s/sync-seccomp-installer.py", "deploy/scripts/acceptance/sync-seccomp-installer.py"),
     ("tmp/k0s/t1-ownership-probe.py", "deploy/scripts/acceptance/t1-ownership-probe.py"),
@@ -117,29 +161,18 @@ PROMOTED_ENTRIES = (
 
 PROMOTED = dict(PROMOTED_ENTRIES)
 
-#: References a live doc may keep pointing at `tmp/`, one reason per line. Every
-#: entry is either already tracked by git at that very path (so a cleaned `tmp/`
-#: or another machine costs a `git checkout`, not an artifact), or one-off /
-#: historical work that cannot be reproduced from today's tree -- the promotion
-#: criterion is "which file does a reader need to re-run this conclusion", and
-#: for these the honest answer is "not this one".
+#: References a live doc may *still* point at `tmp/`, one reason per line. These
+#: are the ones with no repo copy and no honest way to make one: one-off
+#: diagnostics whose conclusion is now a test, wrappers whose payloads were never
+#: in the reference set, or files that are simply gone. Everything reproducible
+#: is promoted and therefore denied above; an entry here is a statement that a
+#: fresh checkout *cannot* run this, not a statement that it is fine to try.
 ALLOWED_TMP_REFERENCES = {
     "tmp/a7-fix1-run.sh": "一次性复跑 runner（A7 fix round 1），依赖同轮临时文件 tmp/a7-run.sh，属一次性验证",
     "tmp/instance_probe.py": "一次性诊断（F6.1 期 wheel）：monkeypatch 当时的 executor，结论已转成 tests/contract 断言",
-    "tmp/k0s/checkpoint_acceptance.py": "已有仓库副本 deploy/scripts/checkpoint_acceptance.py（docs 应改指它）；tmp 那份是旧副本，不搬也不覆盖",
-    "tmp/k0s/gateA-full.sh": "已在版本库：git 已跟踪这个 tmp 路径本身（清 tmp / 换机后 git checkout 可还原），不搬",
-    "tmp/k0s/gateB-full.sh": "已在版本库：git 已跟踪这个 tmp 路径本身（清 tmp / 换机后 git checkout 可还原），不搬",
-    "tmp/k0s/gateB-pure-rootfs.sh": "已在版本库：git 已跟踪这个 tmp 路径本身（清 tmp / 换机后 git checkout 可还原），不搬",
-    "tmp/k0s/n27-t7-lane.sh": "已在版本库：git 已跟踪这个 tmp 路径本身（清 tmp / 换机后 git checkout 可还原），不搬",
     "tmp/k0s/open-tunnels.sh": "历史/坏的那一版：已被仓库内 deploy/scripts/open-cluster-tunnel.sh 取代",
-    "tmp/k0s/phase2.sh": "已在版本库：git 已跟踪这个 tmp 路径本身（清 tmp / 换机后 git checkout 可还原），不搬",
-    "tmp/k0s/probe-pure-restore-synthroot.sh": "已在版本库：git 已跟踪这个 tmp 路径本身（清 tmp / 换机后 git checkout 可还原），不搬",
-    "tmp/k0s/probe-pure-synth-root-plaindir.py": "已在版本库：git 已跟踪这个 tmp 路径本身（清 tmp / 换机后 git checkout 可还原），不搬",
-    "tmp/k0s/probe-pure-synth-root.sh": "已在版本库：git 已跟踪这个 tmp 路径本身（清 tmp / 换机后 git checkout 可还原），不搬",
-    "tmp/k0s/probe-pure-workload-census.py": "已在版本库：git 已跟踪这个 tmp 路径本身（清 tmp / 换机后 git checkout 可还原），不搬",
-    "tmp/k0s/probe_state_base_visibility.py": "已在版本库：git 已跟踪这个 tmp 路径本身（清 tmp / 换机后 git checkout 可还原），不搬",
-    "tmp/k0s/reset-smoke-template.sh": "一次性冒烟清理：读本机未跟踪的 tmp/k0s/secrets.env 取 key、curl 固定本机端口，只在那次环境成立",
     "tmp/k0s/tools.sh": "跳板机 wrapper：依赖未在文档引用清单内、因此未搬的 tmp/k0s/lib/*.exp，单搬 wrapper 不能复现",
+    "tmp/k0s/reset-smoke-template.sh": "一次性冒烟清理：读本机未跟踪的 tmp/k0s/secrets.env 取 key、curl 固定本机端口，只在那次环境成立",
     "tmp/mediation_probe.py": "一次性诊断（F6.1 期 wheel）：monkeypatch 当时实现，结论已转成 tests/contract 断言",
     "tmp/mem_overcommit_probe.py": "口径只在当时的真 sandlock wheel 上成立（unit 档不可复现）；结论已钉进 tests/contract",
     "tmp/pidns-canary-contracts.sh": "wrapper：payload 是临时上传到目标机上跑的那个 .py，不在文档引用清单内，无法单搬复现",
@@ -160,10 +193,10 @@ def _live_docs() -> tuple[Path, ...]:
     return tuple(p for p in _doc_files() if FROZEN_ARCHIVE not in p.parents)
 
 
-def _references(files: tuple[Path, ...]) -> set[str]:
+def _references(files: tuple[Path, ...], pattern: re.Pattern[str] = TMP_SCRIPT) -> set[str]:
     found: set[str] = set()
     for path in files:
-        found.update(TMP_SCRIPT.findall(path.read_text(encoding="utf-8")))
+        found.update(pattern.findall(path.read_text(encoding="utf-8")))
     return found
 
 
@@ -175,28 +208,46 @@ def test_the_frozen_archive_is_not_live_docs() -> None:
     assert _references(frozen), "the frozen archive is expected to cite tmp/ paths"
 
 
-def test_every_live_doc_reference_is_pinned_by_name() -> None:
-    unpinned = _references(_live_docs()) - set(PROMOTED) - set(ALLOWED_TMP_REFERENCES)
-    assert unpinned == set(), (
-        "a live doc sends the reader to a tmp/ script that is neither promoted "
-        f"into the repo nor allowed with a reason: {sorted(unpinned)}"
+def test_no_live_doc_points_at_a_promoted_tmp_path() -> None:
+    """The deny list: a promoted path is a *moved* path, not a blessed one."""
+    offenders = sorted(_references(_live_docs()) & set(PROMOTED))
+    assert offenders == [], (
+        "a live doc still sends the reader to tmp/ after the file was promoted "
+        "into the repo (point it at the repo path instead): "
+        + "; ".join(f"{old} -> {PROMOTED[old]}" for old in offenders)
     )
 
 
-def test_no_unpinned_reference_still_exists_in_tmp() -> None:
-    """The literal rule: outside the allowance, a cited tmp path is not there."""
-    present = sorted(
-        ref
-        for ref in _references(_live_docs())
-        if ref not in ALLOWED_TMP_REFERENCES and (REPO / ref).exists()
-    )
-    assert present == [], (
-        "these tmp scripts are cited by a live doc and still on disk, so the doc "
-        f"is pointing at a scratch file: {present}"
+def test_every_live_doc_tmp_reference_is_allowed_with_a_reason() -> None:
+    unpinned = sorted(_references(_live_docs()) - set(PROMOTED) - set(ALLOWED_TMP_REFERENCES))
+    assert unpinned == [], (
+        "a live doc sends the reader to a tmp/ script that has no repo copy and "
+        f"no recorded reason: {unpinned}"
     )
 
 
-def test_promoted_scripts_are_in_the_repo_and_gone_from_tmp() -> None:
+def test_every_allowance_is_still_cited_and_carries_a_one_line_reason() -> None:
+    cited = _references(_live_docs())
+    stale = sorted(set(ALLOWED_TMP_REFERENCES) - cited)
+    assert stale == [], (
+        "these allowances no longer excuse anything, so they are only a way for "
+        f"the next tmp/ reference to slip back in: {stale}"
+    )
+    bad = sorted(
+        path
+        for path, reason in ALLOWED_TMP_REFERENCES.items()
+        if not reason.strip() or "\n" in reason
+    )
+    assert bad == [], f"allowances need a one-line reason each: {bad}"
+
+
+def test_a_reference_is_never_both_promoted_and_allowed() -> None:
+    overlap = sorted(set(PROMOTED) & set(ALLOWED_TMP_REFERENCES))
+    assert overlap == [], f"each path has exactly one disposition: {overlap}"
+
+
+def test_promoted_targets_are_in_the_repo_and_gone_from_tmp() -> None:
+    """Promotion means moved: the repo copy exists and the tmp original is gone."""
     missing, leftovers = [], []
     for source, target in PROMOTED_ENTRIES:
         if not (REPO / target).is_file():
@@ -207,15 +258,12 @@ def test_promoted_scripts_are_in_the_repo_and_gone_from_tmp() -> None:
     assert leftovers == [], f"promoted sources are still in tmp/: {leftovers}"
 
 
-def test_a_reference_is_never_both_promoted_and_allowed() -> None:
-    overlap = sorted(set(PROMOTED) & set(ALLOWED_TMP_REFERENCES))
-    assert overlap == [], f"each path has exactly one disposition: {overlap}"
-
-
-def test_every_allowed_reference_carries_a_one_line_reason() -> None:
-    bad = sorted(
-        path
-        for path, reason in ALLOWED_TMP_REFERENCES.items()
-        if not reason.strip() or "\n" in reason
+def test_every_cited_acceptance_script_exists() -> None:
+    """The replacement reference is checked too: no dangling repo-side pointer."""
+    missing = sorted(
+        ref for ref in _references(_live_docs(), ACCEPTANCE_SCRIPT) if not (REPO / ref).is_file()
     )
-    assert bad == [], f"allowances need a one-line reason each: {bad}"
+    assert missing == [], (
+        "a live doc points at an acceptance script that is not in the repo: "
+        f"{missing}"
+    )

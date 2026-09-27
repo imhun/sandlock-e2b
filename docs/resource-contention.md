@@ -285,7 +285,7 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after�
    而什么都没做的那个**还在** —— 正是这条决策的验收。
 
    **集群验收（2026-09-25，自建 k0s 两节点，`0.1.0-527-g946daa9`，脚本
-   `tmp/k0s/cpu_activity_acceptance.py`）**：两个沙箱 —— A 只烧 CPU（一条 `commands.run` 之后
+   `deploy/scripts/acceptance/cpu_activity_acceptance.py`）**：两个沙箱 —— A 只烧 CPU（一条 `commands.run` 之后
    彻底静默），B 建完就不碰；观测值取自 `GET /sandboxes`（**读不算活动**，故意选的）。
    因为 `lastActiveAt` 读的是**共享 store 里的值**，而活动在内存里只前进、最多每
    `E2B_ACTIVITY_PERSIST_INTERVAL_S`（默认 30 s，本集群未设）才穿透一次，所以窗口必须长于它，
@@ -355,7 +355,7 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after�
 FUP-E3 sibling-exec 断言（`tests/contract/test_memory_quota_boxed.py`）落成真档。
 fork-blocked 边界登记在 `docs/task-backlog.md`「M4 收口后的 open follow-ups」：fork F11
 （多线程 MCP gateway/uvicorn 进程进入实例后，后续 exec 触发 argv-safety 冻结
-EPERM——网关+命令同实例变体依赖其修复，探针 `tmp/task8_fup3_probe.py`）。网关 ledger
+EPERM——网关+命令同实例变体依赖其修复，探针 `deploy/scripts/acceptance/task8_fup3_probe.py`）。网关 ledger
 headroom 已关闭在 E2B 侧（FUP #3）：默认箱从 512 MiB 提到 1 GiB
 （`E2B_DEFAULT_MEMORY_MB`），fork 逻辑未改动。
 

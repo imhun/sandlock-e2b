@@ -24,7 +24,7 @@
 - 改完必须同步更新：`tests/unit/test_worker_manifest_permissions.py`（形态钉子）、`docs/production-deployment-requirements.md` §2.4.3/§2.4.7、`docs/SCALING.md` §7.1、`README.md`、`docs/k8s-deployment.md` §5、`docs/HANDOFF.md`、`docs/cross-platform-lanes.md`、`docs/security-audit/findings.md`、`docs/task-backlog.md` N36、`docs/open-issues.md` N36。
 - Task 3、Task 4、Task 5、Task 6 都改 `tests/unit/test_worker_manifest_permissions.py` ⇒ **按序串行执行**（或各自 rebase 后再合），不要并行改同一文件。
 - 决策已定（不改判就不再问）：② 的本地池**不加** userns 启动探针 —— `seccomp=unconfined` 时 `check_seccomp_filter` 在 `envd_service/config.py:634-641` 提前 return，`_userns_probe`（`config.py:539`）根本不跑；宿主禁 unprivileged userns 时表现为**每个 create 失败**而不是启动失败。本地池本来就是宽松档，接受这个语义（与 `E2B_REQUIRE_SECCOMP_FILTER=0` 同源）。
-- 本计划**不**单独量化性能：netns 的量化代价已在 `docs/production-deployment-requirements.md` §2.4.6 记过（建连 p50/p95 `0.034/0.082 ms` → `0.291/0.560 ms`，~8.5×，只影响建连）；如需 A/B 复测用现成脚本 `tmp/netns-node-compare.py` 与 `tmp/mcp-3way.py`，那是独立动作，不阻塞本计划。
+- 本计划**不**单独量化性能：netns 的量化代价已在 `docs/production-deployment-requirements.md` §2.4.6 记过（建连 p50/p95 `0.034/0.082 ms` → `0.291/0.560 ms`，~8.5×，只影响建连）；如需 A/B 复测用现成脚本 `deploy/scripts/acceptance/netns-node-compare.py` 与 `deploy/scripts/acceptance/mcp-3way.py`，那是独立动作，不阻塞本计划。
 
 ---
 

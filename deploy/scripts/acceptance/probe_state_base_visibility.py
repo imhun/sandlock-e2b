@@ -439,7 +439,7 @@ def lane_main(args: argparse.Namespace) -> int:
     import asyncio
     import shutil
 
-    repo = Path(__file__).resolve().parents[2]
+    repo = Path(__file__).resolve().parents[3]
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
     from tests.security.conftest import (
@@ -572,7 +572,7 @@ def main() -> int:
         "--scratch",
         default=os.environ.get(
             "N27_SCRATCH_DIR",
-            str(Path(__file__).resolve().parents[2] / "tmp/k0s/scratch/n27"),
+            str(Path(__file__).resolve().parents[3] / "tmp/k0s/scratch/n27"),
         ),
     )
     lane.set_defaults(func=lane_main)

@@ -21,7 +21,7 @@ The second case is the *gap*, not the contract: it is pinned as a strict
 failure, on purpose) the day it is fixed by N14's real root or by a shebang
 branch in the mediator. Reasoning, evidence, the static-ELF half of the gap and
 the A/B account are in ``docs/chroot-workspace-exec.md``; the probe that
-measured it is ``tmp/k0s/probe_n35_exec_gate.py``.
+measured it is ``deploy/scripts/acceptance/probe_n35_exec_gate.py``.
 """
 
 from __future__ import annotations

@@ -18,4 +18,4 @@ N = int(sys.argv[1]) if len(sys.argv) > 1 else 64
 held = [os.open("/dev/null", os.O_RDONLY) for _ in range(N)]
 print(f"holding {len(held)} extra fds; highest={max(held) if held else -1}", flush=True)
 sys.argv = ["f11_fup3_probe.py"]
-runpy.run_path("/workspace/tmp/f11_fup3_probe.py", run_name="__main__")
+runpy.run_path("/workspace/deploy/scripts/acceptance/f11_fup3_probe.py", run_name="__main__")

@@ -19,7 +19,7 @@
 - **改了 fork 的用例条数，必须同步 `third_party/sandlock/docs/test-baseline.md` 的计数**（`test-all.sh` 对"套件悄悄少跑/多跑"判红）；当前值：`core_lib = 913`、`core_integ = 560`、`supervise = 55`、`oci = 157`、`ffi = 104`、`cli = 98`、`python = 465`。
 - **`test-all.sh` 的 `run()` 用匿名管道跑每条套件**（N34）：checkpoint/restore 的用例在**直接跑二进制且 stdio 是普通文件**时会确定性红（`restore skipped fds` 只列 `fd 0`，恢复出的进程立刻以 `Code(10)` 退出）；复跑一律走门禁入口，不要 `cargo test > file 2>&1`。
 - **本机 pytest lane**：`tmp/testenv/bin/python -m pytest`（`.venv` 缺 `fakeredis`，contract 相位会红）；**集群验收脚本**反过来用 `.venv/bin/python`（`e2b` SDK 只在 `.venv` 里，`testenv` 没有）。
-- **容器 lane**：`tmp/k0s/gateA-full.sh <log>`（镜像形态）/ `tmp/k0s/gateB-full.sh <log>`（pure 形态）；本机对照基线 gate A **1772 passed / 6 skipped / 3 xfailed / 0 failed**、gate B **1765 passed / 13 skipped / 3 xfailed / 0 failed**。
+- **容器 lane**：`deploy/scripts/acceptance/gateA-full.sh <log>`（镜像形态）/ `deploy/scripts/acceptance/gateB-full.sh <log>`（pure 形态）；本机对照基线 gate A **1772 passed / 6 skipped / 3 xfailed / 0 failed**、gate B **1765 passed / 13 skipped / 3 xfailed / 0 failed**。
 - **临时文件一律放项目内 `tmp/`**（不用系统 `/tmp`、不用 `$TMPDIR`）；本计划里出现的探针脚本、日志都在 `tmp/` 下。
 - **断言必须精确匹配**：新增/改动的断言禁用 `toContain` / `includes` / `assertIn` / 子串判据；比较用 `==`（既有用例里那种"整句日志文本相等"是本仓的写法）。
 - **`tests/unit/test_checkpoint_restore_unused.py` 当前钉着"envd 不碰这套 API"**（`FORBIDDEN = (".checkpoint(", "restore_interactive", ".restore_skipped(")`，扫 `envd_service/**/*.py`）——它是**形状守卫**，不是"做不了"的声明；本计划新增的行为级验收会与它并存，Task E8 必须把它的 docstring 改到与事实一致。
@@ -83,8 +83,8 @@
 | 单测（checkpoint 家族） | `tmp/testenv/bin/python -m pytest tests/unit/test_checkpoint_store.py tests/unit/test_agent_checkpoint_restore.py tests/unit/test_sandlock_executor_route_b.py -q` | 全绿（现基线：18 + 11 + 37 条，2026-09-26 实测） |
 | 契约（生命周期） | `tmp/testenv/bin/python -m pytest tests/contract/test_pause_write_gating.py tests/contract/test_pause_resume_sandlock_multinode.py -q` | 全绿 |
 | 新增契约（只读查询） | `tmp/testenv/bin/python -m pytest tests/contract/test_checkpoint_status_api.py -q` | 全绿（E3 新建） |
-| 容器 lane（镜像形态） | `tmp/k0s/gateA-full.sh tmp/k0s/e-plan-gateA.log` | **1772 passed / 6 skipped / 3 xfailed / 0 failed**（只加测试时同步上浮） |
-| 容器 lane（pure 形态） | `tmp/k0s/gateB-full.sh tmp/k0s/e-plan-gateB.log` | **1765 passed / 13 skipped / 3 xfailed / 0 failed** |
+| 容器 lane（镜像形态） | `deploy/scripts/acceptance/gateA-full.sh tmp/k0s/e-plan-gateA.log` | **1772 passed / 6 skipped / 3 xfailed / 0 failed**（只加测试时同步上浮） |
+| 容器 lane（pure 形态） | `deploy/scripts/acceptance/gateB-full.sh tmp/k0s/e-plan-gateB.log` | **1765 passed / 13 skipped / 3 xfailed / 0 failed** |
 
 ### 集群侧（生产形态：image-rootfs + `E2B_REAL_ROOT=1`）
 
@@ -106,7 +106,7 @@
 | 3 | **平台账接受"软账 + 并发可超"，还是做跨节点硬账** | 接受软账：保持"整个 `_runtime`"口径 + 把 `used/budget` 暴露 + 告警 | Task E7（暴露数字）/ Task E8（写清口径） |
 | 4 | **paused 是否要有 TTL 以及多久**（会摧毁用户状态） | `E2B_PAUSED_TTL_S` 默认 **0 = 不启用**；只在拍板后打开 | Task E6 |
 | 5 | 是否新增**公开端点** `GET /sandboxes/{id}/checkpoint`（API 契约扩张，要和 SDK 对齐） | 新增（只读、不碰 204 契约） | Task E3 |
-| 6 | 是否把 `tmp/k0s/checkpoint_acceptance.py` **转正进仓库** | 转正（它现在是唯一的生产形态验收，却躺在被 `.gitignore` 忽略的 `tmp/` 里） | Task 2 |
+| 6 | 是否把 `deploy/scripts/checkpoint_acceptance.py` **转正进仓库** | 转正（它现在是唯一的生产形态验收，却躺在被 `.gitignore` 忽略的 `tmp/` 里） | Task 2 |
 | 7 | `E2B_PAUSE_CHECKPOINT` 是否长期默认开（它让 `pause` 变成"写整个进程内存"的动作） | 保持清单里 `"1"`，并把代价写进文档 | Task E8 |
 
 ---
@@ -581,8 +581,8 @@ F11 的多副本、两次 fork 侧修复）。那两次验收的脚本本身也�
 也可以排在 Task 1 之前跑。
 
 **Files:**
-- Create: `deploy/scripts/checkpoint_acceptance.py`（源：`tmp/k0s/checkpoint_acceptance.py`，实测 437 行，E2B 仓）
-- Modify: `docs/deploy-clusters.md:265-280`（§9 的"怎么再跑一遍"，:`274` 那行指 `tmp/k0s/checkpoint_acceptance.py` ⇒ 改成仓库内的脚本）
+- Create: `deploy/scripts/checkpoint_acceptance.py`（源：`deploy/scripts/checkpoint_acceptance.py`，实测 437 行，E2B 仓）
+- Modify: `docs/deploy-clusters.md:265-280`（§9 的"怎么再跑一遍"，:`274` 那行指 `deploy/scripts/checkpoint_acceptance.py` ⇒ 改成仓库内的脚本）
 - Test: 脚本自身（每步 `assert`，末行 `{"step": "OK"}`）
 
 **Interfaces:**
@@ -594,7 +594,7 @@ F11 的多副本、两次 fork 侧修复）。那两次验收的脚本本身也�
 ```bash
 cd /Users/polus/project/ai/sandlock-e2b
 mkdir -p deploy/scripts
-cp tmp/k0s/checkpoint_acceptance.py deploy/scripts/checkpoint_acceptance.py
+cp deploy/scripts/checkpoint_acceptance.py deploy/scripts/checkpoint_acceptance.py
 ```
 
 改文件头第二行（说明它已经是仓库的一部分）：
@@ -602,7 +602,7 @@ cp tmp/k0s/checkpoint_acceptance.py deploy/scripts/checkpoint_acceptance.py
 ```python
 """Cluster acceptance for S2/S3/S4: a pause that survives its worker.
 
-仓库版（2026-09-26 从 ``tmp/k0s/checkpoint_acceptance.py`` 搬入）。它回答的是**生产形态**
+仓库版（2026-09-26 从 ``deploy/scripts/checkpoint_acceptance.py`` 搬入）。它回答的是**生产形态**
 （image-rootfs + ``E2B_REAL_ROOT=1``）下这条能力到底能不能用，所以它不只是回归测试，
 也是"这一版能不能对外声明"的判据。用法见 ``docs/deploy-clusters.md`` §9。
 """
@@ -637,11 +637,11 @@ worker 上的 `E2B_PAUSE_CHECKPOINT` 被关掉时，这条验收会以另一种�
     )
 ```
 
-同时把 `docs/deploy-clusters.md` §9 末尾"怎么再跑一遍"的 `tmp/k0s/checkpoint_acceptance.py`
+同时把 `docs/deploy-clusters.md` §9 末尾"怎么再跑一遍"的 `deploy/scripts/checkpoint_acceptance.py`
 改成 `deploy/scripts/checkpoint_acceptance.py`：
 
 ```bash
-sed -n '268,282p' docs/deploy-clusters.md   # 改前：.venv/bin/python tmp/k0s/checkpoint_acceptance.py
+sed -n '268,282p' docs/deploy-clusters.md   # 改前：.venv/bin/python deploy/scripts/checkpoint_acceptance.py
 ```
 
 - [ ] **Step 2: 跑它，把结论记下来（这一步的输出就是判据）**
@@ -1889,7 +1889,7 @@ git commit -m "fix(checkpoint): reclaim ownerless images, and leave no empty sto
 | 3 平台账"软账 + 并发可超"，暴露 `used/budget` + 告警 | Task E7（暴露）/ E8（口径） | 数字已上报节点视图（`envd_service/agent.py:265-266` → `control_plane/api/internal.py:106-107` → `control_plane/registry/nodes.py:206-207`），worker 回复也带（`envd_service/runtime/checkpoint_store.py:473-474`）；**公开端点不带**（`control_plane/api/sandboxes.py:2825-2832` → `checkpoint_store.py:302-308`）；口径句只在计划 `:102`；**无告警**（`rg 'alert\|PrometheusRule' deploy/` 0 命中） | **部分**：数字可见 ✔ / 口径**已补写** §6(k)② / **告警未做 → 登记 `docs/open-issues.md`** |
 | 4 paused 是否要有 TTL（`E2B_PAUSED_TTL_S`，默认 0） | Task E6 | `rg 'E2B_PAUSED_TTL_S' .` = **只命中本计划 `:103`**（无实现、无替代语义） | **未做 + 待决策** → 登记 `docs/open-issues.md`（**默认 0 = 不启用**） |
 | 5 新增公开只读 `GET /sandboxes/{id}/checkpoint` | Task E3 | `control_plane/api/sandboxes.py:2764-2832`；契约 `tests/contract/test_checkpoint_status_api.py` | **已做 ✔** |
-| 6 把 `tmp/k0s/checkpoint_acceptance.py` 转正进仓库 | Task 2 | `deploy/scripts/checkpoint_acceptance.py`（前置断言 `:379-380`） | **已做 ✔** |
+| 6 把 `deploy/scripts/checkpoint_acceptance.py` 转正进仓库 | Task 2 | `deploy/scripts/checkpoint_acceptance.py`（前置断言 `:379-380`） | **已做 ✔** |
 | 7 `E2B_PAUSE_CHECKPOINT` 长期默认 `"1"`，代价写进文档 | Task E8 | 清单 `deploy/k8s/worker.yaml:483-484`（`"1"`）+ 代价注释 `:455-492`；**代码默认仍关**（`envd_service/config.py:378`） | **已做 ✔**（清单注释即代价）；"长期默认开"的结论补进 §6(k)④ |
 
 ### 依赖表（`:53-59`）里 E5–E8 的引用
@@ -1920,7 +1920,7 @@ git commit -m "fix(checkpoint): reclaim ownerless images, and leave no empty sto
 （`test_the_scan_actually_reads_the_worker_tree`）；② 合成树里的 `.checkpoint(` 调用点必须被
 判成 offender（`test_the_scan_flags_a_call_site_in_a_synthetic_tree`，`assert _offenders(...) ==
 ["envd_service/bad.py: .checkpoint("]`，整表相等）。RED = 空树静默通过（探针
-`tmp/e5e8/guard_probe.py`）；GREEN = 两条用例在真树上通过（`tmp/e5e8/guard_probe2.py`）。
+`deploy/scripts/acceptance/guard_probe.py`）；GREEN = 两条用例在真树上通过（`deploy/scripts/acceptance/guard_probe2.py`）。
 
 ### 两条条件任务的决定门（`Task F3` / `Task F4`）
 

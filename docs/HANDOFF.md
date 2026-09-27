@@ -42,14 +42,14 @@
 
 ### 3. 同一会话里顺带收口的三件
 
-* **空闲判定 CPU 采样**：集群验收通过（脚本 `tmp/k0s/cpu_activity_acceptance.py`，两段 45 s
+* **空闲判定 CPU 采样**：集群验收通过（脚本 `deploy/scripts/acceptance/cpu_activity_acceptance.py`，两段 45 s
   静默窗口）。**教训**：`GET /sandboxes` 的 `lastActiveAt` 读的是共享 store，而活动最多每
   `E2B_ACTIVITY_PERSIST_INTERVAL_S`（默认 30 s）才落库 ⇒ **验收窗口必须长于它**，且首段窗口
   里的"首次请求本身也是活动"，断言要放在第二段静默窗口。见 `docs/deploy-clusters.md` §10。
 * **N14/S3**：真根下放行 `getcwd`（fork `4afd806`），并**读代码否掉**另外两个候选 ——
   `inotify_add_watch` 带 `can_read` 策略判定（真根下嵌套 deny 挂载集表达不了，放行=放大风险）、
   `statfs` 触达 `/proc` 合成路径。全家族判据表见 `docs/n14-retire-the-emulation.md` §4.2。
-* **restore 复核**：在 `0.1.0-527` 上重跑 `tmp/k0s/checkpoint_acceptance.py` 全绿；先红的两次
+* **restore 复核**：在 `0.1.0-527` 上重跑 `deploy/scripts/checkpoint_acceptance.py` 全绿；先红的两次
   都是**验收脚本**的毛病（kubectl 通道死了伪装成"图没写"；计时器文件被 pause 冻在截断窗口里
   ⇒ 误报"计数消失"），已修并记录（`docs/checkpoint-restore-e2b-half.md` §6(j)）。
 
@@ -68,11 +68,11 @@
 
 | 档 | 命令 | 结果 |
 |---|---|---|
-| gate A（镜像形态） | `tmp/k0s/gateA-full.sh <log>` | **1772 passed / 6 skipped / 3 xfailed / 0 failed** |
-| gate B（pure） | `tmp/k0s/gateB-full.sh <log>` | **1765 passed / 13 skipped / 3 xfailed / 0 failed** |
-| phase 2（非 root worker） | `tmp/k0s/phase2.sh <log>` | **57 passed / 1 skipped / 0 failed** |
+| gate A（镜像形态） | `deploy/scripts/acceptance/gateA-full.sh <log>` | **1772 passed / 6 skipped / 3 xfailed / 0 failed** |
+| gate B（pure） | `deploy/scripts/acceptance/gateB-full.sh <log>` | **1765 passed / 13 skipped / 3 xfailed / 0 failed** |
+| phase 2（非 root worker） | `deploy/scripts/acceptance/phase2.sh <log>` | **57 passed / 1 skipped / 0 failed** |
 | security 两态 | `deploy/scripts/arm-lane/x86-security.sh 0/1 <log>` | 默认 44 passed / 1 skipped / 3 xfailed；pure 42 passed / 3 skipped / 3 xfailed |
-| F11 多副本等 9 个文件 | `tmp/k0s/x86-security-one.sh "" <log> <paths…>` | **80 passed** |
+| F11 多副本等 9 个文件 | `deploy/scripts/acceptance/x86-security-one.sh "" <log> <paths…>` | **80 passed** |
 | 本机 | `.venv/bin/python -m pytest tests/unit` / `tests/contract` | 16 条既有 macOS 红 / 1164 绿；contract 321 绿 / 53 skipped |
 
 > **2026-09-27 更新**：上表是 N15/F11 当天的两档数字，**已被后续多轮取代**。最新权威的形态
@@ -81,11 +81,11 @@
 > `2060 passed / 10 skipped / 3 xfailed`、gate B `2053 / 17 / 3`，见 `docs/deploy-clusters.md` §12。
 
 **工具坑（本轮踩到并修好）**：① `deploy/scripts/test-prod-shaped.sh` **跑不出 gate B** ——
-`-e E2B_BASE_IMAGE="${E2B_BASE_IMAGE:-…}"` 会把"已设但为空"变回默认镜像，所以 `tmp/k0s/gateB-full.sh`
+`-e E2B_BASE_IMAGE="${E2B_BASE_IMAGE:-…}"` 会把"已设但为空"变回默认镜像，所以 `deploy/scripts/acceptance/gateB-full.sh`
 是它 phase 1 的复制品，只把这一处写成真正的空；② `E2B_TEST_STRICT_SKIPS=1` 把"runner 能力类"
 跳过变红（清单在 `tests/conftest.py::_STRICT_SKIP_FORBIDDEN`），但**部署形态选择器**（空 base
-image 等）的跳过是允许的；③ 临时 runner：`tmp/k0s/x86-security-one.sh <base> <log> <pytest args…>`
-（单文件/单用例）、`tmp/k0s/x86-run-py.sh`（跑脚本）。
+image 等）的跳过是允许的；③ 临时 runner：`deploy/scripts/acceptance/x86-security-one.sh <base> <log> <pytest args…>`
+（单文件/单用例）、`deploy/scripts/acceptance/x86-run-py.sh`（跑脚本）。
 
 ### 还剩什么（都需要拍板，不是执行问题；2026-09-27 复核）
 
@@ -410,7 +410,7 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   （in-process 是「ns 内 root、宿主为 X」；槽位本来就是 X，core 因此不建 userns、
   不映射 `0 → X`）。文件属主/T5 两侧一致，差别在客体内 `apt-get`/`chown`/bind :80
   这类用法。要在 route B 复原 in-guest root，fork 侧让槽位自 `unshare(CLONE_NEWUSER)`
-  + 写 `0 X 1` 即可（可行性已实测：`tmp/unprivileged_userns_probe.py` 以 uid 21850
+  + 写 `0 X 1` 即可（可行性已实测：`deploy/scripts/acceptance/unprivileged_userns_probe.py` 以 uid 21850
   成功映射，`in-ns euid: 0`）。见计划文档「实现期的修正」#7。
 - **门禁（终态，默认开之后）**：gate A `1057 passed / 3 skipped / 0 failed`
   （`tmp/e32-default-gate-a.log`）、gate B `1056 / 4 / 0`
@@ -513,7 +513,7 @@ cbindgen 头 / CLI `--mediation-run-as` / Python 取值校验 / `stats()` 的
   `require_route_b_slot` 改名 `require_mediation_capable`，判据从「租不到槽位就跳」
   改成「两个后端都建不了才跳」，否则无特权那一相会把自己的用例跳没。
 
-**终态门禁（同一棵终态树，`tmp/final-verify.sh` 一相一容器顺序跑，绝不并发）**：
+**终态门禁（同一棵终态树，`deploy/scripts/acceptance/final-verify.sh` 一相一容器顺序跑，绝不并发）**：
 
 | 相 | 形态 | 结果 | 日志 |
 |---|---|---|---|
@@ -528,7 +528,7 @@ skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」�
 没有一条来自 `require_mediation_capable`（容器两侧 strict skips 都开着，漏列会变 error）。
 两相各跑过**两遍**（`f30-*` 在临时文件清理前、`f31-*` 在清理后），六相数字逐条相同
 ⇒ 清掉的确实只是可再生产物（`tmp/` 79 GB → 6 GB，回收 75.8 GB）。清理脚本
-`tmp/cleanup_scratch.py` 默认 dry-run，且**按文档引用名保号**：凡 docs/README/spec 里
+`deploy/scripts/acceptance/cleanup_scratch.py` 默认 dry-run，且**按文档引用名保号**：凡 docs/README/spec 里
 点过名的 `tmp/*` 一律不删；`_images` 里 base 镜像的 rootfs 与 `.link` 也留着
 （`python-mcp:3.14` 已经不在 registry 镜像站白名单里，删了就重建不出来，gate A 会挂）。
 
@@ -601,7 +601,7 @@ skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」�
 `37fa9af` 删档 → `f7aeb94` 配额用例 caplog 按 logger 收窄 → `7b4fba5` 无特权部署形态
 进测试（lane phase 2）→ `e6415dc`/`569a70a`/`c2b7f92` 文档与终态门禁表 →
 本轮 `docs: 修正特权口径 + 记录线上审计`（§2.4 / 新增 §2.4.1 / 线上审计块、检查表第 10 条、
-backlog #25）。终态门禁（`tmp/run-f31.sh`，一相一容器顺序跑）：gate A `1069/4/0`、
+backlog #25）。终态门禁（`deploy/scripts/acceptance/run-f31.sh`，一相一容器顺序跑）：gate A `1069/4/0`、
 gate B `1068/5/0`、mediated-chroot 切片 `100/1/0`、生产形 phase 1 `966/3/0`、
 phase 2 `47/1/0`、macOS `989/84/0`、`tests/unit` `736/10`。临时文件清理回收 75.8 GB
 （`tmp/` 79G→6G），清理前后六相数字逐条相同。
@@ -621,9 +621,9 @@ phase 2 `47/1/0`、macOS `989/84/0`、`tests/unit` `736/10`。临时文件清理
 5. 待授权清理项：`tmp/stale-20260902`（4.9G，G2 取证目录，文档写明"确认无用后可单独删"）、
    docker 侧 images 18G / volumes 39.7G / build cache 8.7G（卷里混着**别的项目**的数据，
    我没有 `prune`）。
-6. 复现脚本（都在 gitignored 的 `tmp/`，只读，可按名重跑）：`tmp/run-f31.sh`（六相门禁）、
-   `tmp/cleanup_scratch.py`（回收，默认 dry-run）、`tmp/routeb_cap_probe.py`（capset × 形态
-   矩阵）、`tmp/slot_cap_probe.py`（槽位 CapEff 取证）、`tmp/prod-audit{,2,3}.sh` +
+6. 复现脚本（都在 gitignored 的 `tmp/`，只读，可按名重跑）：`deploy/scripts/acceptance/run-f31.sh`（六相门禁）、
+   `deploy/scripts/acceptance/cleanup_scratch.py`（回收，默认 dry-run）、`deploy/scripts/acceptance/routeb_cap_probe.py`（capset × 形态
+   矩阵）、`deploy/scripts/acceptance/slot_cap_probe.py`（槽位 CapEff 取证）、`tmp/prod-audit{,2,3}.sh` +
    `tmp/prod-run.sh`（线上只读审计，走 `deploy/scripts/lib/helpers.sh` 的跳板通道）。
    若要把后两组固化成 `deploy/scripts/audit-*.sh`（进仓库、可长期重跑），说一声即可。
 
@@ -768,7 +768,7 @@ chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-s
   `supports_signal_pause=True`（SIGSTOP 真停，进程内后端仍 False/SIGKILL-only）。
 - **口径更正（重要，实测推翻本块上一版的一句结论）**：本块初版写「token 在 argv 里，
   但跨 uid 读 `/proc/<pid>/cmdline` 需要 ptrace 权限 ⇒ 租户读不到」—— **错的**。
-  特权容器实测（`tmp/rb_token_probe.py`）：`cmdline` 是 0444 且**不走** ptrace 门
+  特权容器实测（`deploy/scripts/acceptance/rb_token_probe.py`）：`cmdline` 是 0444 且**不走** ptrace 门
   （只有 `environ` 0400 被挡），foreign uid 21501 直接读出 21500 槽位的
   `--token <64hex>`。真正挡住攻击的是 registered 路径的鉴权顺序
   ①`SO_PEERCRED` ∈ `--peer-uid`（不在名单里静默关连接）②token —— 实测非白名单 uid
@@ -854,8 +854,8 @@ chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-s
   ③ 父进程 fork 后关闭保留副本、子进程关闭保留号与原始接收号（不漏描述符、不破坏宿主侧 EOF）。
 - **FUP-14 重新上线**：signalfd 事件化 reap 的回退（`bb1cb42`）撤销，exec 往返 p50
   **101.75 → 5.35 ms** 收益回来；本轮全部验证都在「FUP-14 + FUP-23 修复」同一棵树上做。
-- **取证与复现（E2B 侧）**：`tmp/f11_fdcount_probe.py N` 的 **N=0 / 1 / 2 / 8 全部
-  `FAILURES: []`**（此前 N=0 必红）；`tmp/f23_multi_probe.py 0 4` 四条不同 marker 连发各得
+- **取证与复现（E2B 侧）**：`deploy/scripts/acceptance/f11_fdcount_probe.py N` 的 **N=0 / 1 / 2 / 8 全部
+  `FAILURES: []`**（此前 N=0 必红）；`deploy/scripts/acceptance/f23_multi_probe.py 0 4` 四条不同 marker 连发各得
   自己那条 stdout；gateway 探针 4/4、thread 探针 GREEN（`tmp/perf/f23c-*.log`）。
   fork 夹具：core_lib +4（搬迁与身份 / 占号退让 / 三端精确不串流 / 换端拒装配）、
   root 档 oci +1（真 `run_init` 控制环 40 轮 exec：逐轮输出精确 + init fd 表逐轮回基线）。
@@ -960,7 +960,7 @@ FUP-23 登记）。
   无漂移（`tmp/f11-e2b-gate-a.log`＋前四档 `-r1..r5`、`tmp/f11-e2b-gate-b.log`＋
   `-r1-with-scratch-test.log`、`tmp/f11-e2b-macos-r2.log`）。
 - **⚠ 本波暴露的真实回归（FUP-23 / 本文 #22，未修，升级前必读）**：网关+命令探针
-  （`tmp/f11_fup3_probe.py`）从上一波「4/4 全绿」翻为本轮「任何写 stdout 的命令都
+  （`deploy/scripts/acceptance/f11_fup3_probe.py`）从上一波「4/4 全绿」翻为本轮「任何写 stdout 的命令都
   `exit=120`/`stdout=''`」。两步二分定性：①只在**承载 harness 的客户端进程 fd 表只剩
   0/1/2**（下一个可用 fd=3）时必现，预先多开 1 个 fd 即全绿；②同一镜像只热替换 debug
   `libsandlock_ffi.so` 做 A/B ⇒ 本波之前 tip `4d5f385` 绿、FUP-14 `7671240` 红
@@ -971,7 +971,7 @@ FUP-23 登记）。
   pytest 进程天然持有几十个 fd，落不进危险号段。生产 envd 启动后即持有监听 socket ⇒
   不在触发条件内，但「以近乎空的 fd 表嵌入沙箱」的形态会踩到。修法与取证见 fork
   `docs/fork-plan-followups.md` FUP-23 + fork `docs/CHANGELOG.md` 升级警示 +
-  本文 #22；`tmp/f11_fdcount_probe.py`（N=0 vs N≥1）是现成回归门。
+  本文 #22；`deploy/scripts/acceptance/f11_fdcount_probe.py`（N=0 vs N≥1）是现成回归门。
 - **环境教训（新增 open 项 #19/#20/#21）**：本轮公共 Docker Hub 源整体劣化
   ——daocloud 拉 29.8 MB 层实测 37.2 s > 客户端 30 s 请求预算（必然 ReadTimeout）、
   1ms.run TLS EOF/Cloudflare 403、dockerproxy.net 曾交付**损坏层**却因
@@ -2014,7 +2014,7 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
 |---|---|---|---|
 | XFS project quota（`test_xfs_project_quota.py` / `test_volume_quota.py`） | 10 | 需要 `E2B_XFS_QUOTA_INTEGRATION=1` **且**工作目录在带 `prjquota` 的真实 XFS 上；容器根是 overlay，镜像里也没有 `xfs_quota`（日志里 `FileNotFoundError: 'xfs_quota'`） | 测试镜像装 `xfsprogs`，容器里 losetup 一个 XFS+prjquota 挂到 `/var/lib/e2b-sandboxes`（`docs/sandbox-disk-quota.md §4` 有步骤），再加 `-e E2B_XFS_QUOTA_INTEGRATION=1`；生产上就是运维项 O1。**（2026-09-27 复核，`docs/open-issues.md` O1：出厂集群的共享卷是阿里云 NAS / `nfs4`，XFS 项目配额结构上不可得 ⇒ 这 10 条在 fleet 上"无落点"、不是配置漏项；触发条件是换到支持项目配额的存储。）** |
 | netns 隔离形态（`test_mcp_netns.py`） | 3 | 显式门控：`E2B_TEST_NET_ISOLATION=1` + worker 侧 `E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true`（默认关，因为运行时基线是无 netns 的无特权形态） | 按 `third_party/sandlock/docs/netns-isolation-fd-injection.md` 的那套开关跑一遍专用作业 |
-| 沙箱文件属主（T1 的两条：`test_sandlock_isolation::test_user_cli_install...`、`test_uid_permissions::test_volume_shared_rw...`） | 2 | 实测本机 overlayfs 上沙箱写的文件宿主属主是 uid 0（沙箱 host_uid 是 20000），于是 ① 沙箱 `chmod` 自己文件 EPERM，② 共享卷 1777+sticky 的跨 uid 保护无法成立。两条都改成"先量再断言"，不匹配带证据跳过 | **已在出厂集群上复测（2026-09-27，O1/T1 那一半）**：宿主属主 = 沙箱自己的 uid（两箱同时在位时 `10000`/`10001`，各自子树一致），`chmod 600` 自己写的文件 `rc=0` ⇒ **overlayfs 时代那个失效模式在 fleet 上不成立**，这两条在线上可以断言；探针 `tmp/k0s/t1-ownership-probe.py`、口径见 `docs/open-issues.md` 的 O1 行。仍**不适用**的是"共享卷 1777+sticky 跨 uid"那条的**部署形态**（fleet 每箱一棵 NAS 子树、无跨箱共享目录，见 N27）——要它成立得走 volumes 形态 |
+| 沙箱文件属主（T1 的两条：`test_sandlock_isolation::test_user_cli_install...`、`test_uid_permissions::test_volume_shared_rw...`） | 2 | 实测本机 overlayfs 上沙箱写的文件宿主属主是 uid 0（沙箱 host_uid 是 20000），于是 ① 沙箱 `chmod` 自己文件 EPERM，② 共享卷 1777+sticky 的跨 uid 保护无法成立。两条都改成"先量再断言"，不匹配带证据跳过 | **已在出厂集群上复测（2026-09-27，O1/T1 那一半）**：宿主属主 = 沙箱自己的 uid（两箱同时在位时 `10000`/`10001`，各自子树一致），`chmod 600` 自己写的文件 `rc=0` ⇒ **overlayfs 时代那个失效模式在 fleet 上不成立**，这两条在线上可以断言；探针 `deploy/scripts/acceptance/t1-ownership-probe.py`、口径见 `docs/open-issues.md` 的 O1 行。仍**不适用**的是"共享卷 1777+sticky 跨 uid"那条的**部署形态**（fleet 每箱一棵 NAS 子树、无跨箱共享目录，见 N27）——要它成立得走 volumes 形态 |
 | 需要 OCI 形态（`test_fork_network_features`、`test_template_isolation`） | 2 | 只有设了 `E2B_BASE_IMAGE`（镜像 rootfs 沙箱）才有意义 | 已在带 `E2B_BASE_IMAGE=python:3.11-slim` 的那次全量里执行（所以那一轮是 16 skip） |
 | JS SDK（`tests/sdk/js`） | 1 | 测试镜像里没有 npm | 本机 macOS 全量里跑（`812 passed`）；或镜像装 `nodejs`/`npm` 后在容器里跑 |
   - macOS 全量（unit+contract+sdk python/js+security）：`812 passed / 53 skipped /

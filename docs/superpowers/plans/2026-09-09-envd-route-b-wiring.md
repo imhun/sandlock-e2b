@@ -88,7 +88,7 @@ acquire 重新生成；socket =
    原因与修法；非 root worker（中介即沙箱自己的 euid）不构成拒绝，故不打。
    容器实测：`tests/security/test_template_isolation.py` 三条（两条走真槽位、
    一条钉住拒绝 + 对照组）。
-   删档后终态门禁（`tmp/final-verify.sh` / `tmp/run-f31.sh` 顺序单容器逐相跑，
+   删档后终态门禁（`deploy/scripts/acceptance/final-verify.sh` / `deploy/scripts/acceptance/run-f31.sh` 顺序单容器逐相跑，
    互不并发；清理前后各一遍，六相数字逐条相同）：
    gate A `1069/4/0`、gate B `1068/5/0`、mediated-chroot 切片 `100/1/0`、
    生产形 lane phase 1（root + 部署 capset）`966/3/0`、**phase 2
@@ -214,7 +214,7 @@ acquire 重新生成；socket =
 | 5 | fork 里 `SandboxError` 是 `SandlockError` 的**子类** | 服务端「拒绝」不能被当成「槽位死了」⇒ `request()` 必须先原样抛 `SandboxError`；否则一个策略错误会触发一次无谓的槽位重启 |
 | 6 | registered 形态的 channel token 只能走 **argv**（fork F16 只有 transport 2 的语言面）（`/proc/<pid>/cmdline` 0444，**不受** ptrace 门约束） | envd 默认改用 **transport 1（fd handoff）**：fork F17 为 `--control-fd` 通道补了 C ABI（`sandlock_supervise_connect_fd` / `sandlock_supervise_set_timeout` / `sandlock_supervise_check_fd`）与 Python 面，池用 `socketpair()` + `pass_fds` 交付 worker 端 ⇒ 无 socket 路径、无 argv 秘密（SL-10 关闭），并附带「worker 崩溃 → 通道 EOF → 槽位自收口」。持久单流 ⇒ 动词在客户端侧也串行化；verb 超时（`E2B_ROUTE_B_VERB_TIMEOUT_S`，默认 15 s）即退役会话并按死箱处理 |
 
-| 7 | **route-B 沙箱内不再是 root**：core 的 userns 只在「请求身份 ≠ 当前 euid」时创建（`context.rs` 的 `userns_needed`），而槽位本来就以沙箱 host uid 运行 ⇒ 不建 ns、不映射 `0 → X` | 实测（root worker + chroot，同一负载两档对照）：in-process `id -u`=**0**（ns 内 root，宿主侧仍是 X），route-B `id -u`=**X**。文件属主 / T5 两侧一致（宿主 X），差别只在**客体内**是否 root：`apt-get`/`chown`/bind :80 这类「容器内 root」用法在 route-B 沙箱不再可用。要复原需 fork 侧让槽位自己 `unshare(CLONE_NEWUSER)` + 写 `0 X 1`（非特权即可，可行性见 `tmp/unprivileged_userns_probe.py`）——**语义决策，未擅自改**。这也解释了一条门禁红：shell 的「无控制终端」banner 与首个提示符（`# ` vs `$ `）的交错位置两档不同，PTY 契约因此改成「每片恰好一次」并补了 resize 到达证明 |
+| 7 | **route-B 沙箱内不再是 root**：core 的 userns 只在「请求身份 ≠ 当前 euid」时创建（`context.rs` 的 `userns_needed`），而槽位本来就以沙箱 host uid 运行 ⇒ 不建 ns、不映射 `0 → X` | 实测（root worker + chroot，同一负载两档对照）：in-process `id -u`=**0**（ns 内 root，宿主侧仍是 X），route-B `id -u`=**X**。文件属主 / T5 两侧一致（宿主 X），差别只在**客体内**是否 root：`apt-get`/`chown`/bind :80 这类「容器内 root」用法在 route-B 沙箱不再可用。要复原需 fork 侧让槽位自己 `unshare(CLONE_NEWUSER)` + 写 `0 X 1`（非特权即可，可行性见 `deploy/scripts/acceptance/unprivileged_userns_probe.py`）——**语义决策，未擅自改**。这也解释了一条门禁红：shell 的「无控制终端」banner 与首个提示符（`# ` vs `$ `）的交错位置两档不同，PTY 契约因此改成「每片恰好一次」并补了 resize 到达证明 |
 
 | 8 | 内核写**别人进程**的 `uid_map` 除 `CAP_SETUID` 外还要求对该进程的 ptrace 访问权 | 进程内 `RunAs`（root worker 把沙箱映射到 X）因此需要 **`CAP_SYS_PTRACE`**；此前一直用 `--privileged` 跑门禁，所以没人发现。实测 `--cap-drop ALL`：缺它则每个建箱报 `sandlock_create failed`，只补它即通。**route B 完全不需要**（槽位自映射），这是选它的第二个理由。envd 侧现在会在启动时探测并 WARNING（`PER_UID_NO_PTRACE_WARNING`），非特权跑法进 `deploy/scripts/test-prod-shaped.sh` |
 
