@@ -55,11 +55,14 @@ spec:
     spec:
       # A6/fix-1: the worker image builds with `USER 65534:65534`
       # (deploy/docker/Dockerfile.envd) and this pod does NOT override it.
-      # NET_BIND_SERVICE stays declared: a non-root process gets no effective
-      # capabilities (Kubernetes has no ambient-capability semantics), so the
-      # declaration grants the pod nothing by itself -- it is there for a root
-      # override (`runAsUser: 0`), and it keeps the file-capability brokers'
-      # bounding set complete.
+      # C1 (wave 2) restored that: the privileged hand-over (chown / rm / walk)
+      # lives in the per-node `e2b-priv-broker` DaemonSet and this pod reaches
+      # it over a unix socket, so the pod carries no root container and no root
+      # override. What is left below are only the two capabilities the *local*
+      # file-capability `e2b-slot-spawn` needs in the container's bounding set;
+      # a non-root process gets no effective capabilities (Kubernetes has no
+      # ambient-capability semantics), so the declaration grants the pod
+      # nothing by itself.
       #
       # No `securityContext.sysctls` any more (N5, 2026-09-17). The pod-level
       # `net.ipv4.ip_unprivileged_port_start=0` window existed for exactly one
@@ -71,6 +74,73 @@ spec:
       # also removes a pod-level hole that had nothing to do with sandboxes:
       # every process in this pod could bind low ports.
       terminationGracePeriodSeconds: 120
+      # C1 (wave 2): the one init this pod still needs -- and it is *not* root.
+      #
+      # The two owner inits that used to live here (image-cache-init,
+      # workspace-root-init) moved to the `e2b-priv-broker` DaemonSet: they have
+      # to chown the volume roots, and this pod is no longer allowed a root
+      # container of any kind.
+      #
+      # What is left is an ordering gate. `E2B_PRIV_HELPER_TRANSPORT=socket` is
+      # fail-closed: a worker that starts before the broker serves would refuse
+      # to start, and on a fresh node the DaemonSet and this StatefulSet are
+      # scheduled independently -- so without the gate the first worker pod
+      # would crash-loop for as long as the broker takes to come up. It waits
+      # for a successful `hello` round-trip, not merely for the socket file to
+      # exist: the daemon answers `ok:false` when the peer identity does not
+      # match (E2B_BROKER_PEER_UID/GID vs this pod's uid/gid), and that refusal
+      # is exactly the half-migration this gate must not paper over.
+      #
+      # 30 x 2 s, then exit non-zero naming the socket: a visibly unready pod
+      # (and a log line with the broker's own refusal) instead of a silently
+      # privileged retry loop. No `runAsUser`: the image's 65534 is what the
+      # socket's group (0660 root:65534) was built for.
+      initContainers:
+        - name: wait-for-broker
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
+          command:
+            - /bin/sh
+            - -c
+            - |-
+              set -eu
+              socket=/run/e2b-broker/broker.sock
+              attempt=1
+              while [ "$attempt" -le 30 ]; do
+                if python3 - "$socket" <<'PY'
+              import json
+              import socket
+              import sys
+
+              client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+              client.settimeout(2)
+              try:
+                  client.connect(sys.argv[1])
+                  client.sendall(b'{"v":1,"hello":true}\n')
+                  reply = json.loads(client.makefile("rb").readline() or b"{}")
+              except (OSError, ValueError) as exc:
+                  print("wait-for-broker: %s: %s" % (sys.argv[1], exc))
+                  sys.exit(1)
+              finally:
+                  client.close()
+              if not reply.get("ok"):
+                  print("wait-for-broker: the broker refused hello: %s" % reply.get("error"))
+                  sys.exit(1)
+              PY
+                then
+                  echo "wait-for-broker: $socket answered hello (attempt $attempt)"
+                  exit 0
+                fi
+                echo "wait-for-broker: $socket is not ready yet (attempt $attempt/30)"
+                attempt=$((attempt + 1))
+                sleep 2
+              done
+              echo "wait-for-broker: FATAL: $socket did not answer a hello within 60s -- the per-node e2b-priv-broker DaemonSet is not serving on this node (check that it is scheduled here and that the socket dir is 0710 root:65534)" >&2
+              exit 1
+          volumeMounts:
+            # Read-only: connect(2) is all this pod ever does with the socket.
+            - name: broker-socket
+              mountPath: /run/e2b-broker
+              readOnly: true
       containers:
         - name: worker
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
@@ -205,6 +275,17 @@ spec:
             # this non-root pod; `off` keeps the in-process E5.1 shape.
             - name: E2B_PRIV_HELPERS
               value: "auto"
+            # C1 (wave 2): `socket` is a hard switch -- the worker dials the
+            # per-node `e2b-priv-broker` DaemonSet, and the Python resolver
+            # refuses to start if the handshake does not succeed (no silent
+            # fallback to the in-pod file-capability binaries: the whole point
+            # is that the worker pod no longer holds the capability that can
+            # hand a sandbox tree to a pooled uid). The socket is a hostPath
+            # shared with the DaemonSet; only connect(2) is ever needed here.
+            - name: E2B_PRIV_HELPER_TRANSPORT
+              value: socket
+            - name: E2B_PRIV_HELPER_SOCKET
+              value: /run/e2b-broker/broker.sock
             # N5/N10 closed (2026-09-17): this manifest now runs the same
             # per-sandbox namespace shape the compose stack has run in
             # production since 2026-09-16.
@@ -524,19 +605,20 @@ spec:
               # from the file xattr, but the exec is refused with EPERM unless
               # those caps are in the container's *bounding* set (measured).
               # `add` grants a non-root process nothing effective -- the worker
-              # still runs with CapEff=0 -- so the four are declared and
-              # nothing else. Never set an escalation-blocking field here:
+              # still runs with CapEff=0 -- so this is a BND declaration, not a
+              # privilege grant. Never set an escalation-blocking field here:
               # NNP=1 makes the kernel ignore file capabilities outright.
-              # NET_BIND_SERVICE stays for a root override (runAsUser: 0); it is
-              # inert for the default non-root pod (CapEff stays 0), and nothing
-              # in this pod binds a low port any more -- the sandbox's own netns
-              # covers :53.
+              #
+              # C1 (wave 2): exactly two, because only `e2b-slot-spawn` is still
+              # the worker's own (a slot must be spawned in the worker's own
+              # namespaces). CHOWN and DAC_OVERRIDE -- the caps `e2b-maint`
+              # needs -- are gone from this pod: the chown/rm/walk verbs run in
+              # the root broker DaemonSet. NET_BIND_SERVICE is gone too; it had
+              # no user left once the :53 bind moved into each sandbox's own
+              # netns (N5), and there is no root override in this pod any more.
               add:
-                - NET_BIND_SERVICE
                 - SETUID
                 - SETGID
-                - CHOWN
-                - DAC_OVERRIDE
             # Node-local state: the kubelet resolves a Localhost profile on the
             # host filesystem, so deploy/k8s/seccomp-installer.yaml (ConfigMap +
             # DaemonSet) installs deploy/seccomp/sandlock-worker.json into the
@@ -556,6 +638,12 @@ spec:
               mountPath: /var/lib/e2b-sandboxes
             - name: image-cache
               mountPath: /var/lib/e2b-images
+            # C1 (wave 2): the broker's unix socket, read-only -- this pod only
+            # connects to it (the mount namespace the mutations happen in is
+            # the DaemonSet's).
+            - name: broker-socket
+              mountPath: /run/e2b-broker
+              readOnly: true
       volumes:
         - name: shared
           persistentVolumeClaim:
@@ -569,6 +657,17 @@ spec:
         - name: image-cache
           hostPath:
             path: /var/lib/e2b-images
+            type: DirectoryOrCreate
+        # C1 (wave 2): one hostPath per node, shared with the
+        # `e2b-priv-broker` DaemonSet's container (different pods, different
+        # mount namespaces -- nothing but a hostPath lets both see one socket).
+        # DirectoryOrCreate matches the DaemonSet's own volume so the two
+        # manifests agree on who creates it; its 0710 root:65534 mode is set by
+        # the DaemonSet's socket-dir-init, which is guaranteed to have run
+        # before this pod's wait-for-broker gate lets the worker start.
+        - name: broker-socket
+          hostPath:
+            path: /run/e2b-broker
             type: DirectoryOrCreate
 ---
 apiVersion: v1

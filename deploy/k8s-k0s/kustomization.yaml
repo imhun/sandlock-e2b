@@ -28,13 +28,9 @@ patches:
       name: seccomp-installer
       namespace: sandlock
     path: seccomp-root.patch.yaml
-  - target:
-      group: apps
-      version: v1
-      kind: StatefulSet
-      name: e2b-worker
-      namespace: sandlock
-    path: worker-root.patch.yaml
+  # C1 (wave 2): no more `worker-root.patch.yaml`. The worker pod no longer runs
+  # as root (the image's USER 65534:65534 is the shape again), and the
+  # privileged hand-over moved into the root `priv-broker.yaml` DaemonSet.
   - target:
       group: apps
       version: v1
