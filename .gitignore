@@ -7,6 +7,15 @@ wheels/fork/
 deploy/stack/.env
 deploy/stack/.version
 deploy/stack/tls/
+# The compose stacks' *instance* env, same rule as `deploy/stack/.env` above.
+# Every `deploy/**/*.env.example` is a tracked template; the file you get by
+# copying it holds the operator's values (ports and image tags today, and the
+# first credential key somebody adds tomorrow). Documented commands do
+# `cp .../.env.example .../.env`, so the instance files all have to be ignored
+# -- being born untracked is not something to rely on, since the next
+# `git add -A` does not ask. `tests/unit/test_deploy_env_examples_are_ignored.py`
+# pins the symmetry rather than this list.
+deploy/compose/.env
 deploy/compose/tls/
 deploy/scripts/bastion.env
 deploy/scripts/acr.env

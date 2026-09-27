@@ -2347,3 +2347,28 @@ netns T6 的裸子串断言**必红**（实测注释里有键名）、N30 T4 的
 | 5 | N40 / N41 残余 / N27 identity 残差 | **未动**（见下） |
 
 **节点清理（控制器做的）**：Kuhn 在节点上留了 `/opt/fup28` —— 实测 `.94` **1.8 GB**、`.140` **253 MB**（比它报的 200MB×2 大），已 `find -depth -delete` 清掉，两边复核 `CLEAN`。
+
+## "都做了"收口（2026-09-27）：N44 三层 + FUP-28 退役
+
+**N44（基镜像漂移）—— 三层全清**：
+1. 清单默认值 8 处（`858d5d8` + `26bca22`）：`compose/prod`×2、`test`、`docker-compose.yml`、`multinode`×4；
+   值**解析 `deploy/k8s/worker.yaml` 取得**；`deploy/stack` 两处**判定不动**（裸 `${E2B_BASE_IMAGE}`、无仓库内默认值，
+   `.env`/`.env.example` 已是车队 digest）。**实测**：旧值 30/30 次 `503 … can't open file '/usr/bin/mcp-gateway'`，
+   新默认第 4 次 `200` + 真 JSON-RPC `initialize`。
+2. **示例 env**（`26739e1`）：`deploy/compose/.env.example` 那一处 —— 而**文档教的正是 `cp .env.example .env`**，
+   所以这是"照文档操作会重新引入 bug"的入口。加了"示例 env vs 清单"的钉子。
+3. **刻意保留并点明**：`deploy/stack/.env.example`（本就车队 `python-mcp:3.14`，digest 是 E6.2 占位符）、
+   `Dockerfile.test-runner` 与 `smoke-prod-worker.sh`（测试/冒烟跑器形态，用它建的沙箱**没有 MCP**，已写进 N44 行）。
+
+**FUP-28：撤掉 E2B 侧 `..` 相对软链改写**（`d42d563` + `1549255`；fork `c4d18c0`）：
+- 改写本体与调用点已撤、**两条钉子先红后绿**（证明钉子确实钉在被撤的东西上）；
+- **两档 lane 重跑**：gate A `2027/10/3/0`、gate B `2020/17/3/0` → 对 Task 13 基线各 **+5 passed**，
+  skip/xfail **逐字不变**、0 failed；差额逐条归因成立（collect 2035→2040 = 基线后新落的 11 条减本任务撤掉的 6 条钉子）；
+- 未动 fork 引擎、未重建 wheel、未碰 k0s。
+
+**Einstein 的四条自陈（值得留给下一个人）**：
+1. **arm64 镜像仍自带 9 条 `..` 相对软链**（`/etc/os-release` 等沙箱真会读）⇒ 撤掉改写后真正救场的是
+   **fork 的有界重试**，不是"没有 `..`" —— 别再以为"撤了改写就没有 `..` 了"；
+2. **节点热缓存里老 entry 仍是改写过的形态**，会与新 entry 并存**到下次重烤**；
+3. lane 只跑在本机 orbstack（x86_64），**部署宿主（arm64）上没跑 envd→route B→wheel 那条接线**；
+4. 绝对 collect 数会随并行 agent 变化 ⇒ 对基线时要用"同树对比 + 逐条归因"，不是比绝对数。
