@@ -1,5 +1,8 @@
 # netns 形态统一实施计划
 
+> **执行状态（2026-09-27 更新）**：**已落地** —— ①②④ 与车队对齐（成对开 `E2B_ENABLE_NET_ISOLATION`+`E2B_FD_INJECT_CONNECT`、删低端口窗口），③ arm lane 保留；随后 **N38** 把池的 `E2B_EXECUTOR` 改成 `auto`、**N42** 补 `E2B_ENABLE_NETWORK="true"`、④ 的 seccomp 按出厂要求换成真档。
+> **仍有效的决定**：回滚到共享 netns 时**需把低端口窗口加回来**（接受这个回滚代价，不承诺"不编辑文件即可干净回滚"）。**已更正的假设**：正文"删窗口这个动作本身会 EACCES"的**触发条件不准** —— 真正会让通配 `allowOut` 静默失效的是**缺 `E2B_ENABLE_NETWORK`**（N42），实测见 `docs/open-issues.md` N36。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把仓库里三处"共享 netns + 非 root + 低端口窗口"的示例/工具（① `deploy/compose/docker-compose.prod.yml`、② `autoscaler/backends/local.py`、④ `deploy/compose/docker-compose.multinode.yml`）与出厂车队对齐——成对打开 `E2B_ENABLE_NET_ISOLATION` + `E2B_FD_INJECT_CONNECT`、删除 `net.ipv4.ip_unprivileged_port_start=0`，只保留 ③ arm lane 的 `deploy/scripts/arm-lane/guest-prep.sh` 不动。

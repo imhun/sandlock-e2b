@@ -1,5 +1,9 @@
 # checkpoint/restore 产品化实施计划
 
+> **执行状态（2026-09-27 更新）**：**Task 1 / 2 / F2 / E2 / E3 / E4 / E8 已完成并上线**（`E2B_PAUSE_CHECKPOINT=1` 写在 `deploy/k8s/worker.yaml`，集群端到端验收全绿）；条件任务 **F3/F4 的决定门都落在"不做"**（复核 0 命中）。
+> **仍有效的决定**：恢复**进会话**（保留 `exec`）；平台账是**软账**（允许并发短超）。
+> **已作废的假设**：正文早期"恢复后不能 exec""restore stub 与 chroot 根不兼容"两条 —— 均已被 fork 取代，`2026-09-26-decisions.md`《D9 已关闭》已两次更正。**仍未做/未定**：`E2B_PAUSED_TTL_S`（paused 过期策略）**待拍板**、今天无实现。证据：`docs/checkpoint-restore-e2b-half.md` §6(k) 与 `docs/reports/checkpoint-e5-e8-audit-report.md`。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把已经能用、集群验收全绿（2026-09-25 的 `0.1.0-525` / `0.1.0-527` 两轮）的 checkpoint/restore 变成**有对外语义、有可观测性、有回收路径、有守卫**的产品功能——`pause` 写下的进程镜像能在 worker 重启后回来、能继续 `exec`、能被用户看见、不会永远占着平台账。

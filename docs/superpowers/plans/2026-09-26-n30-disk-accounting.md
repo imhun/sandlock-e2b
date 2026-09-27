@@ -1,5 +1,9 @@
 # N30 磁盘配额口径（存量 vs 峰值）收口实施计划
 
+> **执行状态（2026-09-27 更新）**：**已定案并落地** —— `diskMB` = 存量（位置边界）口径、删除即归还；"超限**不冻结**、只拒写"升格为被单测钉住的对外契约；qcow2-over-NBD（L3）**不做（带触发）**。
+> **仍有效的决定**：存量口径 + 已有旋钮 `E2B_DISK_MAX_ENTRIES` 管条目数。**已作废的假设**：计划原文建议新增 `E2B_MAX_ENTRIES_PER_SANDBOX`——**作废**（该旋钮已存在），见 `2026-09-26-decisions.md`《N30 口径确认》。
+> 证据：`docs/open-issues.md` N30、`docs/disk-quota-options.md` §7。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 给 `diskMB` 一个**唯一口径**并在代码、文档、对外语义三处对齐：采用**存量（位置边界）**——"这棵沙箱树当前占的字节 + 每个目录自身的分配块"，删除即归还；**否决峰值口径**，并据此把"qcow2-over-NBD 镜像路线（L3）"从"待决策"改成"不做（带触发）"。

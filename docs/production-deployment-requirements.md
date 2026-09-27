@@ -2,6 +2,12 @@
 
 <!-- 本文档同时收录 E6.4 NFS 共享存储形态部署要求与实测结论（§5）。 -->
 
+> **引用约定（2026-09-27 更新）**：正文里的 `tmp/**`（`.log`、`tmp/f1/` 等）与
+> `.superpowers/sdd/**` 都在仓库 `.gitignore` 里，**不是仓库路径**。可重跑脚本已迁到
+> [`deploy/scripts/acceptance/`](../deploy/scripts/acceptance/)（原名不变），报告迁到
+> [`docs/reports/`](reports/)（原名不变）；`tmp/**.log` 一律是**原始日志**（会被清、可重跑，
+> 脚本见 `deploy/scripts/acceptance/`）。
+
 ## 1. 前置条件（已确认目标机满足）
 
 | 要求 | 目标机现状 | 达标 |
@@ -56,7 +62,7 @@ workspace 的属主 = 该沙箱 uid、**属组 = worker 的 effective gid**、�
 worker 自己 `setuid`——uid 65534 的进程 `CapEff=0`，`setuid(X)` 必 EPERM——而是 exec
 镜像里两个带 **file capabilities** 的**编译型** broker（file caps 对 `#!` 脚本不生效）：
 
-> **userns 路线的事实更正（2026-09-12，`.superpowers/sdd/task-usernsprobe-report.md`）**：
+> **userns 路线的事实更正（2026-09-12，`docs/reports/task-usernsprobe-report.md`）**：
 F1 探针当时判"userns 需要 `CAP_SYS_ADMIN`"，那是在**本机 OrbStack 内核**上测的——该环境
 对 `uid_map` 写入一律 EPERM，**与 BND 无关**，属环境假象而非机制限制。在目标机同款内核
 （aarch64 / 6.12）上、用**线上同款 BND `0xc3`**，发行版 `newuidmap`/`newgidmap` 成功写入
@@ -83,7 +89,7 @@ F1 探针当时判"userns 需要 `CAP_SYS_ADMIN`"，那是在**本机 OrbStack �
 > 与内核无关；`newuidmap`+subuid 那条路另有自己的前提（helper 特权、`/etc/subuid` 按
 > **调用者用户名**配段、挂载非 `nosuid`、无 NNP）。
 > ⇒ **本地完全能做 userns（以及 `net_isolation`）的验证**；"只能上目标机验"的说法撤回，
-> `.superpowers/sdd/task-usernsprobe-report.md` §6 的那条建议随之失效。
+> `docs/reports/task-usernsprobe-report.md` §6 的那条建议随之失效。
 
 | broker（`/var/lib/e2b-priv/`） | file caps | 调用形态 |
 |---|---|---|
@@ -267,7 +273,7 @@ cap**」。因此 broker 必须落在沙箱不可达的路径，且路径本身�
 `/workspace/<rel>` 解析回宿主卷路径后逐级打开，缺哪级就死在哪级，沙箱里只看到一句
 没有上下文的 `Permission denied`。
 
-下表来自探针 `tmp/vol_fs_mount_probe.py` 的场景 `symlink-tight-ancestor`
+下表来自探针 `deploy/scripts/acceptance/vol_fs_mount_probe.py` 的场景 `symlink-tight-ancestor`
 （**A0/A3 轮次实测，日志 `tmp/a0-probe.log`**；A5 本轮沿用该结论，**未重跑**宿主探针，
 现场复现归 Track Z 的本地部署测试）：
 
@@ -541,7 +547,7 @@ E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true` 跑全量 =
 = `1795 passed / 6 skipped / 3 xfailed / 0 failed` × phase 1，phase 2（uid 65534）=
 `57 passed / 1 skipped / 0 failed`（`tmp/netns-unify-lane.log`；同日共享档
 `tmp/netns-unify-lane-shared.log` 逐条对照为净零差，只多一次与本开关无关的快照竞态失败，
-见 `.superpowers/sdd/netns-task-1-report.md` §6.2）。
+见 `docs/reports/netns-task-1-report.md` §6.2）。
 
 ### 2.4.6 netns 的代价：逐条实测（2026-09-16，本机）
 
@@ -635,7 +641,7 @@ netns ⇒ 一套栈上两种形态并存，用真实流量判断。
 | 命令 RTT p50 | 34.3 ms | 33.9 ms |
 | wildcard DNS | ok（10.250.0.2） | ok（10.250.0.2） |
 
-三段拆分（`tmp/mcp-3way.py`：测试自己的 MCP server 在工具处理里打时间戳，客户端在 worker 侧
+三段拆分（`deploy/scripts/acceptance/mcp-3way.py`：测试自己的 MCP server 在工具处理里打时间戳，客户端在 worker 侧
 打时间戳，同一宿主墙钟）定位到**传输路径**而不是网关逻辑：
 
 | 阶段 | worker-1 | worker-2 |
@@ -672,7 +678,7 @@ netns 箱内 DNS 是"快速失败"（0.4 ms，不是解析）。⇒ 每请求 ~3
 ③ 从设计上消掉这条映射——让网关改用 supervisor 交付的 socketpair 而不是在沙箱 netns 里
 bind+listen，则 `inbound_port_map` 关掉、拦截整体消失（改动最大，收益也最彻底）。
 
-修完要重跑同一条 A/B（`tmp/netns-node-compare.py`）确认收敛，才谈 worker-1 全量与撤
+修完要重跑同一条 A/B（`deploy/scripts/acceptance/netns-node-compare.py`）确认收敛，才谈 worker-1 全量与撤
 `ip_unprivileged_port_start`。
 
 **修复已实现（方案 ③ 的落地形态，fork `fe492be`）**：`net_bind_inject` —— 映射端口的
@@ -699,7 +705,7 @@ E2B 侧开关：`E2B_NET_BIND_INJECT`（默认 `true`，`envd_service/config.py`
 镜像/重启，策略立刻回到主机监听器映射。
 
 **上线实测（2026-09-16，随 `0.1.0-297-g15d4726` 发布，worker-2 仍是唯一 netns 节点）**：
-同一条按节点 A/B（`tmp/netns-node-compare.py`）在修复前后对比：
+同一条按节点 A/B（`deploy/scripts/acceptance/netns-node-compare.py`）在修复前后对比：
 
 | 指标 | worker-1（共享） | worker-2 修复前 | worker-2 修复后 |
 |---|---|---|---|
@@ -708,7 +714,7 @@ E2B 侧开关：`E2B_NET_BIND_INJECT`（默认 `true`，`envd_service/config.py`
 | 命令 RTT p50 | 33.7 ms | 33.9 ms | 33.2 ms |
 | wildcard DNS | ok | ok | ok |
 
-三段拆分（`tmp/mcp-3way.py`）同步收敛：worker-2 的去程 170–183 ms → **5.3 ms**、回程
+三段拆分（`deploy/scripts/acceptance/mcp-3way.py`）同步收敛：worker-2 的去程 170–183 ms → **5.3 ms**、回程
 226 ms → **2.5 ms**（服务端自身仍是 0.2 ms），与 worker-1 的 5.3/2.3 ms 持平。
 
 形状不变量（worker 容器内 `/proc/net/tcp`，决定性证据）：共享形态的监听是
@@ -739,8 +745,8 @@ netns、由 userns root 覆盖"的直接证据；`IFACES=lo` 则确认车队里�
 `ip_unprivileged_port_start=0` 已于 2026-09-16 撤掉。）**
 
 **因此：worker-1 保持共享 netns，`ip_unprivileged_port_start=0` 不撤**，等 fork 侧把这条
-每请求代价定位并修掉后再走全量。复测脚本：`tmp/netns-node-compare.py`（按节点）、
-`tmp/mcp-3way.py`（三段拆分）。
+每请求代价定位并修掉后再走全量。复测脚本：`deploy/scripts/acceptance/netns-node-compare.py`（按节点）、
+`deploy/scripts/acceptance/mcp-3way.py`（三段拆分）。
 
 ### 2.4.8 并发容量口径（2026-09-16 调整）
 
@@ -761,7 +767,7 @@ control-plane 与 worker（此前只在代码里有默认值 1024MB/100%/1024MB/
 | 沙箱数 | — | 100 | 100 | — | — |
 
 ⇒ **车队上限 8（CPU/进程维度绑定），每节点 4**。实测：一次 8 个 create 全部成功、4+4 分摊到
-两个 worker；沙箱记录 `memoryMB=512`（`tmp/capacity_check.py` 的验证输出）。
+两个 worker；沙箱记录 `memoryMB=512`（`deploy/scripts/acceptance/capacity_check.py` 的验证输出）。
 
 两个必须知道的后果：
 ① **沙箱内存上限减半（1024→512MB）是用户可见变更** —— 之前用满 1GB 的负载现在会被
@@ -770,7 +776,7 @@ control-plane 与 worker（此前只在代码里有默认值 1024MB/100%/1024MB/
 ② 之前"最多 4 个并发、第 5 个起 `503 No resources available`"的根因就是这张表：
 `E2B_MAX_TOTAL_CPU_PERCENT=400` 与 `E2B_MAX_TOTAL_PROCESSES=1024` 各折算 4 个。
 
-线上实测（2026-09-16，`tmp/mem512-limit.py` / `tmp/mcp-512-size.py`）：
+线上实测（2026-09-16，`deploy/scripts/acceptance/mem512-limit.py` / `deploy/scripts/acceptance/mcp-512-size.py`）：
 
 - **上限是真硬约束**：箱内 `MemTotal=524288 kB`；同箱内 400 MiB 分配 exit 0，700 MiB 分配
   被 SIGKILL（SDK 侧 exit 137 / stderr `Killed`）。
@@ -827,7 +833,7 @@ E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
   （`crates/sandlock-core/src/procfs.rs::generate_meminfo`），所以可以直接在箱内读数。
 
 2026-09-16 在线上 512MB 箱里逐项量的**单位成本**（每次都是独立前台进程，读同一个账本；
-`tmp/ledger-thread-cost.py`、`tmp/ledger-arena-test.py`）：
+`deploy/scripts/acceptance/ledger-thread-cost.py`、`deploy/scripts/acceptance/ledger-arena-test.py`）：
 
 | 项 | 记账 | 说明 |
 |---|---|---|
@@ -855,7 +861,7 @@ E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
   `DEFAULT_INHERITED_ENV_VARS`（HOME/LOGNAME/PATH/SHELL/TERM/USER），所以 envd 把它注入
   mcp config 的 `envs`（调用方自带的值优先）。
 
-线上复测（同一只 512MB 箱，`tmp/verify-arena-live.py`）：server 持 **110 / 200 / 300 MiB
+线上复测（同一只 512MB 箱，`deploy/scripts/acceptance/verify-arena-live.py`）：server 持 **110 / 200 / 300 MiB
 都能 serve**（`tools/list` + `echo` 往返），340 MiB 仍失败；server 侧 `echo` 回读环境变量确认
 拿到 `MALLOC_ARENA_MAX=1`。普通箱 400 MiB 分配不受影响——这个变量**只**加在网关/server
 这条链上，不进用户命令的默认环境，因为多线程分配密集的负载会吃到 arena 竞争。
@@ -868,6 +874,11 @@ E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
 本来就有）。lane 也透传该变量（`E2B_PID_NS=1 ./deploy/scripts/test-prod-shaped.sh ...`），
 所以两种形态都能跑门禁。**阻断项（route-B 自映射）与代价（stat 族拦截）本轮都已闭环**，
 剩下的是灰度/默认值这个部署决策（N3）：形态正确性见 2.4.10.1，代价见 2.4.10.2。
+
+> **（2026-09-27 更新）**：**"默认值"这条今天仍未拍板切换** —— `E2B_PID_NS` 的**代码默认仍是 `false`**
+> （`envd_service/config.py:251`）。但**部署侧早就不靠这个默认**：`deploy/k8s/worker.yaml` 自 2026-09-17
+> 就是 `E2B_PID_NS: "true"`，2026-09-27 的 **N45**（`e2e5f1a`）又把池与其余每个 worker 栈都补成
+> `"true"`（见 `docs/open-issues.md` N45）。所以"待定"只在"代码默认值"这一层，车队形态已是全开。
 
 **fork 侧机制本身是健康的**（在部署 profile 下实测，`seccomp=$PWD/deploy/seccomp/sandlock-worker.json`）：
 
@@ -908,7 +919,7 @@ mediation_2uid 9），wheel 按同 tip 重建（manifest `5b16855`）。
 | 箱内 `kill(<worker pid>, 0)` | `EPERM`（共享 pid ns） | — | **`ESRCH`（自有 pid ns，真开了）** |
 
 最后一行是**形态证据**：`id -u` = 0 在 pid_ns 关着时同样成立，所以只凭它无法排除"开关没生效"
-的假绿；`kill()` 探针（探针文件 `tmp/pidns-shape-probe.py`，日志 `tmp/pidns-shape-{on,off}.log`）
+的假绿；`kill()` 探针（探针文件 `deploy/scripts/acceptance/pidns-shape-probe.py`，日志 `tmp/pidns-shape-{on,off}.log`）
 把两种形态区分开，确认这一轮的绿是真开了 pid_ns 的绿。
 
 **邻接契约与两相位**：`E2B_PID_NS=1` 下按 `-k 'route_b or pid_ns'` 跑完 lane 的两个相位
@@ -921,7 +932,7 @@ route B 的邻接面（槽位池、跨 uid 拒绝、池化 uid 建箱、非 root
 pid_ns 打开后 fork 要拦 `newfstatat`/`statx`/`faccessat`/`faccessat2`/`readlinkat`（+ 旧 ABI 的
 `stat`/`lstat`/`access`/`readlink`，见 `seccomp_plan.rs::pid_ns_procfs_stat_syscalls`），
 seccomp 无法按路径过滤 ⇒ 每次调用进 supervisor。量法：5000 次 × 4 轮，取中位数，同一镜像同一
-lane，只差 `E2B_PID_NS`（探针 `tmp/pidns-cost-probe.py`）。
+lane，只差 `E2B_PID_NS`（探针 `deploy/scripts/acceptance/pidns-cost-probe.py`）。
 
 | 形态 / 负载（ms / 5000 次，表内为 c 次跑） | `open`（对照，未拦） | `stat` | `access` | `readlink` |
 |---|---|---|---|---|
@@ -947,6 +958,9 @@ lane，只差 `E2B_PID_NS`（探针 `tmp/pidns-cost-probe.py`）。
 **剩余决策（N3）**：形态正确性（2.4.10.1）与代价（2.4.10.2）都已就绪，`E2B_PID_NS` 仍是
 **默认关闭**；灰度形态（先一个 worker，`E2B_PID_NS` 是进程级开关、按 worker 分容器 env）与
 默认值待择期执行。
+**（2026-09-27 更新）**：灰度与全量（2.4.10.3/2.4.10.4）都在 2026-09-16 做完了；这里剩的只是
+**代码默认值**没切（仍是 `false`），而**部署清单早已全开**（k8s 自 2026-09-17、池与其余栈随 N45
+于 2026-09-27 补齐）——所以"待择期执行"指的是"切代码默认值"这一动作，不是"pid_ns 还没上"。
 
 #### 2.4.10.3 灰度已上线：worker-2 开、worker-1 对照（2026-09-16）
 
@@ -976,7 +990,7 @@ lane，只差 `E2B_PID_NS`（探针 `tmp/pidns-cost-probe.py`）。
 `id -u` 两列都是 0（route-B 自映射本来就把客人做成 root），所以**判形态的是最后三列**：
 自有 pid ns 才可能让 pid 1 属于自己、让 `$$` 落在个位数。
 
-**性能**：`tmp/mcp-3way.py`（netns 那次用的同一支探针，`tmp/pidns-canary-mcp.log`）稳态每请求
+**性能**：`deploy/scripts/acceptance/mcp-3way.py`（netns 那次用的同一支探针，`tmp/pidns-canary-mcp.log`）稳态每请求
 `worker-1 = 7.7/8.0/8.0 ms`、`worker-2 = 8.2/8.0/9.3 ms`（首请求各 ~127 ms 为连接建立）。
 两节点持平，没有 netns 那类每请求 +390 ms 的回退，与 §2.4.10.2 的"部署形态里 stat 族本来就已经
 被 chroot 中介拦着、pid_ns 增量测不到"一致。
@@ -1046,6 +1060,9 @@ worker 形态不能在 root 相位断言），与开不开 pid_ns 无关；也�
 
 **范围说明**：这一轮只覆盖 compose 形态（线上目标机）。k8s 清单仍是共享 pid ns —— 与 N5
 （k8s 是否切 per-sandbox netns）同一类决定，另立条目跟踪，不在本轮范围内。
+**（2026-09-27 更新：这句已过期）** —— k8s 清单**不再是共享 pid ns**：`deploy/k8s/worker.yaml`
+自 2026-09-17（N5/N10 一并落地）就设了 `E2B_PID_NS: "true"` + `E2B_ENABLE_NET_ISOLATION/FD_INJECT_CONNECT`；
+池与其余 worker 栈在 2026-09-27 的 N45（`e2e5f1a`）补齐。**每个交付形态都是 per-sandbox pid ns 了。**
 
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
@@ -1188,6 +1205,13 @@ digest 固定的引用；修复前这两条一红一 error）。
 会拿到 428 `warm_required`（`upgrade.sh` 内置的那次冒烟就撞上过，补跑 `smoke.sh` 即绿）；
 ② 重建 base 镜像（`build-and-push.sh` 的 `MIRROR_BASE_IMAGE=1`）会换 digest，必须同步更新
 `.env` 的钉值 —— tag 变更不更新 digest 会被 `upgrade.sh` 按 E6.2 拒绝，这正是它的意图。
+
+> **（2026-09-27 复核：`sha256:3675662d…` 仍是各清单钉的同一个 digest，没有漂）** —— `deploy/k8s/worker.yaml:510`
+> 与 `deploy/k8s/control-plane.yaml:280` 都钉 `registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6`；
+> 各 compose 栈（prod/multinode/autoscale/单机/test 与 `.env(.example)`）也是同一个值，N44 已把曾漂的那几处对齐。
+> ⚠️ 注意区分：2026-09-27 发版（`0.1.0-652-g43fb88a`）**只**把 ACR 上的 mirror **tag**
+> `byteplan/python-mcp:3.14` 重推成了新 digest `sha256:4474e78f…`，**清单里的 digest pin 没动**
+> —— 别把"tag 的 digest 变了"读成"线上基镜像换了"（见 `docs/deploy-clusters.md` §12）。
 
 ### 2.6.3 已知退路：`<image>.digest` 侧车（本轮不做）
 
@@ -1373,7 +1397,7 @@ E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worke
   就是**沙箱的第一条命令**——worker 在第一个 RPC 上才建运行时上下文（`SandboxRuntimeContext`
   → `create_executor()` → `resolve_image_rootfs()`），而 SDK 对这条请求的预算是
   `request_timeout`/`timeout`（默认 60s）。实测（`tmp/sdkflake-diag2.log`、`-diag3.log`、
-  `tmp/sdkflake-cacheprobe.py`）：在 13.98 GiB / 383k 文件的暖缓存上，**一次 GC 里的量取
+  `deploy/scripts/acceptance/sdkflake-cacheprobe.py`）：在 13.98 GiB / 383k 文件的暖缓存上，**一次 GC 里的量取
   走一遍就要 24.3s（空载）、43.3s（6 核压载），而 `prune_image_cache()` 走两遍**（先判再报），
   整趟 97.9s ⇒ 一次冷创建的"首条命令"≈105s，SDK 到点把请求杀掉，测试看到的是
   `process.Process/Start` 客户端超时。因此 `_materialize_entry()` 现在只**排队**

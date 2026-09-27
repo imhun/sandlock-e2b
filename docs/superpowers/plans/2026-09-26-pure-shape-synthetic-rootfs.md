@@ -1,5 +1,8 @@
 # Pure 形态合成 rootfs 实施计划
 
+> **执行状态（2026-09-27 更新）**：**Task 1–14 已落地**，四档全量 lane 验收全 `0 failed`（权威表在 `docs/pure-shape-decision.md` §7）。
+> **仍有效的决定**：骨架**每沙箱一份**（`<base>/_pure_rootfs/<id>`，含拆箱清理）——共享骨架会给别的租户一个存在性 oracle。**已作废的假设**：`E2B_PURE_ROOTFS=synth` + `E2B_REAL_ROOT=0` 这个组合（**结构性不成立**，改成 `create_app` 当场 loud 拒绝的配置守卫）。**未定**：`E2B_PURE_ROOTFS` 默认值 `off` 要不要切 `synth` —— 留给用户拍板（`docs/deploy-clusters.md` §11.2）。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 给 pure 形态（无 base image）合成一个真实的 rootfs（普通目录 + bind 宿主系统目录 + workspace + 卷），让它也能吃 fork 的 `real_root`，从而那 33 条 `PURE_UNGATED` 从"在宿主路径空间解析"变成"在沙箱自己的树里解析"。

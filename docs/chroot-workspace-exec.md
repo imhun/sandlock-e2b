@@ -4,6 +4,17 @@
 上一轮把问题定成"shebang 脚本被拒"，定向探针跑完发现**范围比 shebang 大**，也把
 **A（真根 N14）与 B（中介补 shebang）** 的账算清楚了。
 
+> **状态（2026-09-27 更新：那个"待拍的决定"已经拍了，且已上线）** —— 用户选 **A（真根 N14）**：
+> `E2B_REAL_ROOT=1` 已完成、写进清单，2026-09-25 灰度并在两台 worker 上验收（同一条探针在模拟根
+> worker 上 `exit 126 Permission denied`、真根 worker 上 `exit 0 SHEBANG_OK`，见 `docs/deploy-clusters.md` §7）。
+> B（中介补 shebang）降为**备选**（硬边界见 §6.2）。所以本文现在的读法：**A/B 的选择题已结，§8 第 2 条
+> 的"取决于两个问题"只作留档**；"退役模拟"那半（§5.3 / `docs/n14-retire-the-emulation.md`）仍未做，
+> 但已降级为代码卫生。
+>
+> **引用约定（2026-09-27 更新）**：正文里的 `tmp/**` 都在 `.gitignore` 里（**不是仓库路径**）。
+> 可重跑脚本已迁到 [`deploy/scripts/acceptance/`](../deploy/scripts/acceptance/)（原名不变）；
+> `tmp/**.log` 一律是**原始日志**（会被清、可重跑，脚本见 `deploy/scripts/acceptance/`）。
+
 ## 0. 摘要
 
 1. 生产（image-rootfs / chroot）形态下，**workspace 里只有"动态 ELF"能执行** ——
@@ -24,8 +35,8 @@
 
 ## 1. 实测（prod-shaped lane，root worker + route B 槽位；**下表是 §7 修复之前**）
 
-探针 `tmp/k0s/probe_n35_exec_gate.py`（每条腿独立 executor、逐条命令 30 s 超时），
-lane 入口 `tmp/k0s/n35-lane.sh`，日志 `tmp/k0s/n35-chroot{,2..6}.log`、`tmp/k0s/n35-pure.log`。
+探针 `deploy/scripts/acceptance/probe_n35_exec_gate.py`（每条腿独立 executor、逐条命令 30 s 超时），
+lane 入口 `deploy/scripts/acceptance/n35-lane.sh`，日志 `tmp/k0s/n35-chroot{,2..6}.log`、`tmp/k0s/n35-pure.log`。
 `python:3.11-slim` rootfs 由 `resolve_test_rootfs` 提供；静态 ELF 用 lane 镜像里的
 `/usr/sbin/docker-init`（tini 0.19.0，无 PT_INTERP）。
 
@@ -145,7 +156,7 @@ child of mediator pid=21
 ```
 
 即：**缺的只是 mount ns 和"去用这些 caps"的代码**，不是权限本身。探针
-`tmp/k0s/probe_n35_realmount.py` 验证了这一点：在**带 SYS_ADMIN 的 lane 形状**里，
+`deploy/scripts/acceptance/probe_n35_realmount.py` 验证了这一点：在**带 SYS_ADMIN 的 lane 形状**里，
 `unshare(CLONE_NEWUSER)` → `unshare(CLONE_NEWNS)` → `mount --bind` **全部成功**。
 
 ### 5.2 部署账（这是 A 真正的成本）
@@ -278,7 +289,9 @@ A 或 B 来解。
    * 产品是否要求"沙箱里的文件系统就是普通文件系统语义"（`$0`、`sys.path[0]`、静态二进制、
      `mountinfo`、任何内核侧解析）？若是 ⇒ **A**，并接受一次 seccomp 档/安全评审的部署改动。
    * 若只是要尽快解锁 console script（且能接受 `$0` 变 fd 路径的写作差异）⇒ **B**，
-     作为止血，并在文档/发布说明里写明这条差异。
+    作为止血，并在文档/发布说明里写明这条差异。
+   **（2026-09-27 更新：已选 A 并已上线）** —— 用户按上一条的前半选 **A（真根）**；`E2B_REAL_ROOT=1`
+   已实现、进清单、双节点验收（`docs/deploy-clusters.md` §7）。B 保留为备选。
 3. **不建议 C**（放宽规则覆盖宿主解释器目录）：它把宿主二进制当镜像二进制用，是静默的
    语义替换，与隔离目标冲突。
 
@@ -403,7 +416,7 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 ② 建箱→销毁 N 次后宿主 `mount` 计数回到基线（挂载泄漏）——**已补**为
 `tests/security/test_real_root_mounts.py`（§9.6 第 4 条）；
 ③ 丢 `CAP_SYS_ADMIN` 之后，`chown`/`chmod`/低端口这些"沙箱内 root"行为不变
-（按现有 security 套件回归）——**已验（2026-09-23 复跑，lane `tmp/k0s/n35-lane.sh`）**：
+（按现有 security 套件回归）——**已验（2026-09-23 复跑，lane `deploy/scripts/acceptance/n35-lane.sh`）**：
 `tests/security` 两种形状分别 **45 passed / 1 skipped / 1 xfailed（真根开，XFAIL 是 pure 形态
 的既有残余）** 与 **42 passed / 1 skipped / 4 xfailed（默认关，4 条 XFAIL 就是真根能救的那 4 条）**；
 同轮 `tests/unit` 全档 **1236 passed / 4 skipped**（4 条 skip 都是形态要求：XFS、非 root worker、
@@ -448,7 +461,7 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
      DaemonSet 的节点会拿到旧档**（旧档里连无门闩的 `mount` 都没有）。现已按该文件自己写的
      流程重嵌，并把 `checksum/profile` 注解更新为 profile 文本的 sha256（`071486c0…`）；
      `tests/unit/test_worker_manifest_permissions.py` 同时钉住"内嵌副本与 profile 逐字节相等"
-     与"注解 == sha256(profile 文本)"，重嵌工具 `tmp/k0s/sync-seccomp-installer.py`（自检是
+     与"注解 == sha256(profile 文本)"，重嵌工具 `deploy/scripts/acceptance/sync-seccomp-installer.py`（自检是
      "把盘上 payload 重新编码必须逐字节复现"，先证明编码器可信再改写）。
 4. **已补的验收（§9.5 的 ②）**：`tests/security/test_real_root_mounts.py` 钉住"建箱→销毁 3 次后
    worker 自己的挂载表一字不变"——两种形状都跑，任何"把挂载做在宿主命名空间里"的实现会立刻红。
@@ -587,13 +600,13 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
    打 FUP-26 那一行。而 `record_failure` 会 `open("/tmp/sandlock-real-root-error")`
    （`SANLOCK_REALROOT_TRACE` 未设时的默认路径）——**沙箱的规则集不给 `/tmp` 写权限**
    （实测 guest 里 `open /tmp/sandlock-real-root-error` = **EACCES(13)**，见
-   `tmp/k0s/probe_127_errno.py` 的矩阵），于是这次 open 的 EACCES **盖掉了** execvp 真正的
+   `deploy/scripts/acceptance/probe_127_errno.py` 的矩阵），于是这次 open 的 EACCES **盖掉了** execvp 真正的
    ENOENT(2)，`errno != ENOENT` 成立、诊断行被打印，契约随之破掉。
 
    **为什么"开着 trace 就没事"**：`trace_enabled()` 就是 `env::var(..).is_ok()`
    （`realroot.rs:114`），而 `note("exec …")` 就在 `execvp` **之前**、且只在 trace 开时调用 ——
    它先把 trace 文件开了一遍（TRACE 单元被初始化），`record_failure` 于是不再 open、也就不会
-   改 errno。实测矩阵（同一 phase-1 形状，只改这一个环境变量，脚本 `tmp/k0s/phase1-probe2.sh`）：
+   改 errno。实测矩阵（同一 phase-1 形状，只改这一个环境变量，脚本 `deploy/scripts/acceptance/phase1-probe2.sh`）：
    * **未设** → `test_route_b_executor.py` **1 failed / 13 passed**（errno 13）；
    * 设成任意值（`/workspace/tmp/...`、`/tmp/...`，甚至**空字符串**）→ **14 passed**。
 
@@ -632,7 +645,7 @@ chroot 根（模拟的、真根的）都把 workload 路径解析到 rootfs 内 
 推导过程；**落地做法见 `third_party/sandlock/crates/sandlock-core/src/sandbox.rs:1419-1463`**。
 
 **关键未知量：按 fd 执行（`execveat(fd, "", …, AT_EMPTY_PATH)`）能不能绕过 Landlock？**
-探针 `tmp/k0s/probe_landlock_execveat.py` 自建 Landlock 域（decoy 目录全权、`/` 与 `/tmp`
+探针 `deploy/scripts/acceptance/probe_landlock_execveat.py` 自建 Landlock 域（decoy 目录全权、`/` 与 `/tmp`
 只给 search），用**静态**二进制（`tests/rootfs-helper`）当 stub —— 第一版用 `/bin/true`
 时 EACCES 其实来自"动态解释器读不到"，属测量污染，记在这里以免后来人重踩。
 

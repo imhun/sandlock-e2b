@@ -5,6 +5,12 @@
 **N27**（平台状态可见性依赖形态）、**N14**（用 mount ns + pivot_root 换掉"虚拟根"）。
 它们不是四个问题，是**同一个缺失**的四个面：pure 形态没有 rootfs，也就没有路径中介。
 
+> **引用约定（2026-09-27 更新）**：本文正文里的 `tmp/**`（`.log`、`tmp/k0s/task*/` 等）与
+> `.superpowers/sdd/**` 都在仓库 `.gitignore` 里，**不是仓库路径**。可重跑脚本已迁到
+> [`deploy/scripts/acceptance/`](../deploy/scripts/acceptance/)（原名不变），报告迁到
+> [`docs/reports/`](reports/)（原名不变）；仍写成 `tmp/**.log` 的都是**原始日志**（会被清，
+> 可重跑，脚本见 `deploy/scripts/acceptance/`）——判据不要只挂在日志上。
+
 ## 1. 今天这个形态是什么、怎么落进去的
 
 不是"可选特性"，是**没有镜像 rootfs 时自动落到**的那条路：
@@ -104,6 +110,12 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
    （`state/_runtime` → `<export>/_runtime`，inode 保留、不拷数据），依据是留在盘上的
    `state/.state-base-migration.journal`（0600），一个发布周期内不删它即可原路退回。
    证据：`docs/deploy-clusters.md` 的 N27 上线记录节 + 探针 `tmp/k0s/probe_state_base_visibility.py`。
+   **（2026-09-27 更新：同一支探针按 lane 三档重跑复核，结论逐字未变）** —— `synth` + `E2B_REAL_ROOT=1`
+   档**已消掉**"能列出名字"（`chain=PASS`，`<export>` 根本不在祖先链上）；**默认的 `identity` 档仍有残差**
+   （`<export>` 一层 `LEAK ["_secrets", "state"]`、四次 `stat` 仍 `EACCES`）；legacy 反例档 `exit 1`
+   ⇒ 判据非恒真。要让**默认**形态也消掉，唯一一步是把 `E2B_PURE_ROOTFS` 的默认值从 `off` 切到 `synth`
+   （代价见 §7），**今天没有拍板切、默认值也没动**。原始输出 `tmp/k0s/n27resid-*.log`，逐档表见
+   `docs/deploy-clusters.md` §11.2、报告 `docs/reports/n27-identity-residual-report.md`。
 3. **N14 挂在 N15+OBS-5 之后评估**：如果 33 条做完之后仍觉得"拦截清单完整性"这层负担不值，
    再走真根；那时它是个优化，不是前提。
 4. **顺带**（与上面不冲突，且很小）：今天的默认仍是"base image 忘配 ⇒ 静默降级到无中介形态"。
@@ -199,6 +211,10 @@ container 崩塌 ⇒ 之后每个 verb 都答 `InstanceClosed`（security 两态
 
 **两态的新读法**（同一裁定）：纯形态的"两态"是 **`=0` ⇔ N15 identity（不设根）**、
 **`=1` ⇔ 合成根 + 真根**；`E2B_PURE_ROOTFS` 默认 `off`，即默认仍是 identity。
+**（2026-09-27 更新：默认值已复核，仍是 `off`、未切换）** —— lane 三档重跑确认：`synth` 档已消掉
+`<export>` 列名、**默认 identity 档仍列名**（残差在"没有根"本身，不是 N16 没修）；要不要把默认切到
+`synth` 是**留给用户拍板**的一步（代价三条：每沙箱一份骨架目录、依赖 `E2B_REAL_ROOT=1`、依赖 worker
+seccomp 档），本轮没动任何默认值。证据见 §5 第 2 条与 `docs/deploy-clusters.md` §11.2。
 
 **验收（2026-09-26，Task 13 权威落点）**：四档全量 lane 的逐档数字、基线与差逐字如下（全部在
 revision `1374e87`、同一份树指纹上跑，镜像 `e2b-sandlock-test:task12cur`）：

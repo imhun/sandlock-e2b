@@ -1,5 +1,10 @@
 # 沙箱磁盘配额最终方案（XFS project quota）
 
+> **引用约定（2026-09-27 更新）**：正文里的 `tmp/**` 与 `.superpowers/sdd/**` 都在仓库 `.gitignore`
+> 里，**不是仓库路径**。可重跑脚本已迁到 [`deploy/scripts/acceptance/`](../deploy/scripts/acceptance/)
+> （原名不变），报告迁到 [`docs/reports/`](reports/)（原名不变）；`tmp/**.log` 一律是**原始日志**
+> （会被清、可重跑，脚本见 `deploy/scripts/acceptance/`）。
+
 ## 1. 决策记录
 
 | 候选路线 | 结论 | 原因 |
@@ -48,7 +53,7 @@
 两者都按"删除即归还"。钉子：`tests/unit/test_dir_ledger.py::test_entry_counts_are_already_part_of_the_scan`
 （条目维度已存在于代码，不只是文档里的一句）。
 
-#### 1.1.1 探针实测（2026-09-13，`.superpowers/sdd/task-cowprobe-report.md`）：**今天根本用不了**
+#### 1.1.1 探针实测（2026-09-13，`docs/reports/task-cowprobe-report.md`）：**今天根本用不了**
 
 route-B 给了"每沙箱一个常驻 supervise 实例"之后，"`max_disk` 是不是终于可用了"值得实测一次。结论是**不能用**，
 而且不是口径问题，是**能不能激活 + 强制点在哪**：
@@ -119,6 +124,13 @@ rootfs 条目**；`_oci/*.oci.tar`（无 registry 形态下本地构建镜像的
    │   └─ workspace/
    └─ _cow/  _snapshots/  ...       # 其他目录（默认 project 0，无限额）
 ```
+
+> **（2026-09-27 更新：树根已下沉一级，上面的 `├─ <sandbox_id>/` 位置变了）** —— N27（2026-09-26）
+> 之后沙箱树在 **`<export>/workspaces/<id>`**、平台状态（`_runtime`/`.route-b`/checkpoint）在
+> **`<export>/state/`** 这一层（**同一个挂载**，`rename(2)` 秒级迁移）。配额口径不变（projid 仍按
+> **沙箱树**这一个目录打，`PROJINHERIT` 仍随之下沉），但下面 §3.2/§3.3 里写死的
+> `/var/lib/e2b-sandboxes/<id>` 路径要读成 `<export>/workspaces/<id>`。布局与迁移见
+> `docs/k8s-deployment.md` §23。
 
 - 每个沙箱目录分配独立 project id（projid），限额 = `RuntimeSandbox.disk_mb`
   （控制面已下发的沙箱配额）；
@@ -263,6 +275,12 @@ mount -t xfs -o prjquota /dev/loop0 /var/lib/e2b-sandboxes
 | M3 | 命令串行锁 | 并发命令排队/429 测试 |
 | M4 | 孤儿 project 清理 + 监控告警 | worker 启动扫描 |
 | M5 | 生产部署（见部署要求文档） | 远程复测 |
+
+> **（2026-09-27 更新：M1–M5 早已完成，本文档的里程碑表只作留档）** —— 生产形态的 per-sandbox
+> 硬限、孤儿清理与监控都已落地并在真集群复验（O1：目标机是 XFS，但**共享卷实际是阿里云 NAS/NFS**
+> ⇒ 走的是 §3.6 的 **quota-agent 降级形态**，见 `docs/open-issues.md` O1）。**N30（2026-09-26）
+> 又定案：`diskMB` = 存量口径硬上限，峰值口径否决、qcow2-over-NBD（L3）不做**（见 `docs/disk-quota-options.md`
+> §7 与 `docs/superpowers/plans/2026-09-26-decisions.md`《N30 口径确认》）。
 
 ## 7. 相关文档
 

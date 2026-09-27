@@ -1,5 +1,9 @@
 # envd route-B 接线设计（2026-09-09；backlog #5 剩余项）
 
+> **执行状态（2026-09-27 更新）**：**已落地并上线** —— route B（supervise 槽位模型）已是生产形态，`envd_service/route_b.py` 长期在线；T5 xfail 已摘。
+> **仍有效的决定**：W1 槽位模型——槽位按**沙箱自己的 host uid** 定向租用；停车程序不能用 `/dev/zero`（文末"实现期的修正"8 条仍有效）。
+> **已作废的假设**：无（设计期被推翻的 8 条已就地写在文末）。证据：`docs/open-issues.md` T5 行。
+
 > 状态：**设计定稿 + Task 1（W1 槽位管理器）+ Task 2–4（executor 全面走 supervise、
 > 摘 T5 xfail）已落地（2026-09-09）**，Task 5 的三档门禁复跑全绿。
 > fork 侧 F16 语言客户端见 `6571c36`。

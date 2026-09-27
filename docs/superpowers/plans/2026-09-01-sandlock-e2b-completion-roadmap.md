@@ -1,5 +1,9 @@
 # Sandlock + E2B 全部开发目标整体实施路线图
 
+> **执行状态（2026-09-27 更新）**：两阶段（fork S/E）**全部收口并已上线**，本文件是**历史路线图**。
+> **仍有效的决定**：一个 E2B 沙箱 = 一个长命 sandlock 实例（"执行边界 = 产品边界"，此决定贯穿至今）。
+> **已作废的假设**：Global Constraints 的"不推送远程 = 不做目标机远程部署"——自建 k0s 车队已是部署目标、已多轮发版（`docs/deploy-clusters.md` §12）。证据与收口账见 `docs/open-issues.md` §四/§五。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Each task group below is executed as its own detailed plan (split out before execution); this document is the roadmap that fixes order, dependencies, files, and verification for every group.
 
 **Goal:** 完成 sandlock fork 与本项目（E2B 服务端）全部 backlog 计划目标的开发与验证；按"先 sandlock、后本项目"两大阶段推进。"不推送远程"= 不做目标机远程部署；ACR 镜像推送照常，git 远程推送（上游 PR / origin push）暂缓，仅在最终交付时按需执行。

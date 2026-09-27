@@ -1,4 +1,4 @@
-# k8s 部署指南（upgraded 2026-09-16）
+# k8s 部署指南
 
 本文是 `deploy/k8s/` 这套清单的部署指南，与 `deploy/scripts/README.md`（compose/目标机
 那条线）并列。**读之前先知道两件事**：
@@ -8,6 +8,18 @@
    k8s 清单**没有在真实集群验证过**，本文把"哪些是已验证事实、哪些是待验证"逐条标出来。
 2. k8s 与 compose **故意不是同一形态**：netns、pid_ns、配额口径、卷与身份池都不同。差异表见
    §3，切换项见 §5。不要假设 compose 的结论能直接搬过来。
+
+> **（2026-09-27 更新：上面第 1 条已过期）** —— 自建 **k0s 集群**（2 节点 arm64，`172.18.80.94`/`.140`，
+> namespace `sandlock`）**已是本仓库的部署目标**，k8s 清单早已在它上面跑通并反复验收（compose 线于
+> §20 停用）。**"现在跑的是哪一版"永远以 `deploy/stack/.version` + 集群里三个工作负载的实际镜像为准**；
+> 2026-09-27 发版是 `0.1.0-652-g43fb88a-20260927-102733`（见 `docs/deploy-clusters.md` §12）。本文 §9.3/§9.5/
+> §13.3 里写死的 `0.1.0-350-…`/`0.1.0-330-…` 都是 **2026-09-18 当时的** 值，只作留档，别当现值用。
+> ⚠️ 认集群 + 连集群的纪律见 [`docs/deploy-clusters.md`](deploy-clusters.md)：不加 `KUBECONFIG=tmp/k0s/kubeconfig`
+> 的话本机 `kubectl` 会静默落到另一套阿里云 ACK 集群上。
+>
+> **引用约定（2026-09-27 更新）**：正文里的 `tmp/**`（`.log`、`tmp/k0s/task*/` 等）都在 `.gitignore` 里
+> （**不是仓库路径**）。可重跑脚本已迁到 [`deploy/scripts/acceptance/`](../deploy/scripts/acceptance/)
+> （原名不变）；`tmp/**.log` 一律是**原始日志**（会被清、可重跑，脚本见 `deploy/scripts/acceptance/`）。
 
 ---
 
@@ -94,6 +106,11 @@ k8s 侧没有等价的自动机制，所以要显式把 tag 换成当次构建�
 `reconcile` 解耦那批都在里面）。**两套栈现在跑同一个 tag**：compose 生产栈（`.140`）与这台
 k0s 集群都指到它，`deploy/stack/.version` 重新成为唯一权威 —— §13.3 里那个"k8s 侧 tag 漂移"
 已经消掉。升级时：
+
+> **（2026-09-27 更新）**：`0.1.0-350` 是 **2026-09-18 当时**的版本，**不是现值**。此后又发了几版
+> （`0.1.0-437`→`0.1.0-495`→`0.1.0-525`→`0.1.0-527`→`0.1.0-597`），2026-09-27 这版是
+> **`0.1.0-652-g43fb88a-20260927-102733`**。查现值就一条命令：`cat deploy/stack/.version` 并与
+> `kubectl -n sandlock get deploy,sts -o jsonpath=...` 的实际镜像对齐 —— **两边必须一致**。
 
 ```bash
 kubectl -n $NS set image sts/e2b-worker worker=<REGISTRY>/byteplan/e2b-sandlock-worker:<VERSION>
@@ -645,7 +662,8 @@ Landlock 要 5.13+），且 `user.max_user_namespaces = 0` ⇒ `unshare -U` 直�
 2. **共享存储**：单节点 → k3s `local-path` 即可；**多副本 → 必须 NFS**。
    `deploy/k8s/pvc.yaml` 已预留 `# storageClassName: nfs`，仓库里已有 `deploy/scripts/nfs-probe`、
    `nfs_quota_probe.sh` 与相关文档口径 —— 是先例，不是新坑。
-3. **镜像**：直接用当前发布 `0.1.0-350-g212850d-20260918-152008`（值见 `deploy/stack/.version`；
+3. **镜像**：直接用当前发布 `0.1.0-350-g212850d-20260918-152008`（**2026-09-18 当时的值**；现值以
+   `deploy/stack/.version` 为准，2026-09-27 是 `0.1.0-652-g43fb88a-20260927-102733`；
    含 `auto` 在无 Landlock 内核上 fail-closed 的修复，已在 ACK 复验过）。
 
 ### 9.5 最短路径（内核闸门通过后）
@@ -661,7 +679,7 @@ curl -sfL https://get.k3s.io | sh -
 
 # 清单适配（自建集群版）：
 #   pvc.yaml      -> local-path（单节点）或 NFS PV（多副本）
-#   *.yaml 镜像 tag -> 0.1.0-330-g235fc34-20260917-142808
+#   *.yaml 镜像 tag -> 0.1.0-330-g235fc34-20260917-142808   # 旧值留档；现值见 deploy/stack/.version
 #   其余照 §2 顺序：ns -> secret -> redis -> control-plane -> seccomp-installer(等 Ready) -> worker
 ```
 
@@ -714,13 +732,19 @@ k0s 的 containerd socket（`/run/k0s/containerd.sock`）与 docker 的互不相
 对齐（redis 镜像到 ACR、`E2B_BASE_IMAGE` 固定 digest、密钥改走 Secret）落在基线清单里，
 见 §10.3 F8/F9。
 
+> **（2026-09-27 复核：基镜像 digest 没漂）** —— `deploy/k8s/worker.yaml:510` 与
+> `deploy/k8s/control-plane.yaml:280` 都钉 `registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6`，
+> 与各 compose 栈（N44 对齐后）同一个值。**换基准镜像按 digest 换、不要按 tag 换**；2026-09-27 发版只把
+> ACR 上 mirror tag `byteplan/python-mcp:3.14` 重推成新 digest `sha256:4474e78f…`，**清单里的 pin 没动**
+> （见 `docs/deploy-clusters.md` §12 与 `docs/production-deployment-requirements.md` §2.6.2）。
+
 ### 10.3 真集群才会暴露的问题（每条都有实测证据）
 
 | # | 问题 | 证据与处置 |
 |---|---|---|
 | **F1** | **kubelet 的 seccomp 根不是固定路径**：它解析 Localhost profile 时用的是 `<kubelet --root-dir>/seccomp`。k0s 的 `--root-dir=/var/lib/k0s/kubelet`，而清单写的是 `/var/lib/kubelet/seccomp` | 实验：把 `probe-a.json` 只放 `/var/lib/kubelet/seccomp`、`probe-b.json` 只放 `/var/lib/k0s/kubelet/seccomp`，前者报 `cannot load seccomp profile "/var/lib/k0s/kubelet/seccomp/probe-a.json"`，后者 Running。**处置**：安装器的脚本/挂载/hostPath 三处参数化（`E2B_SECCOMP_ROOT`，默认仍是 kubeadm 路径），k0s overlay 一起改三处，并加了「三处必须一致」的用例 |
 | **F2** | **Deployment 的 pod 在 headless Service 下没有 per-pod DNS 名**，`E2B_NODE_ADDRESS: http://$(POD_NAME).worker-headless...` 永远解析不了（`docs/SCALING.md` §8.1 的设计来自 compose，那里靠 Docker 内嵌 DNS 解析容器名） | EndpointSlice 里 endpoint 的 `hostname` 为空（hostname 来自 `pod.spec.hostname`，Deployment 不设），`Sandbox.create()` 全部报 `502: Node ... unavailable: [Errno -2] Name or service not known`。**处置**：地址改用 pod IP（`fieldRef: status.podIP`），pod 重启后重新注册即更新 |
-| **F3** | **跨节点 pod 流量被云网络拦掉**（kube-router 不做封装，跨节点包带的是 `10.244.x`）。两个独立机制叠加：① ENI 的**「源/目的地址检查」**只放行源/目的属于本实例的报；② 安全组规则是 **`172.16.0.0/12` 全通**，而 `172.16.0.0/12 = 172.16–172.31`，**不含 pod 网段 `10.244.0.0/16`** | 干净复测（上一轮的「零收包」是抓包过滤器被 `.140` 上 compose redis 的 `172.19.0.2:6379` 流量填满导致的假象，已纠正）：<br>• `.94 → .140` **自身 IP**：到达（`.140` eth0 抓到 echo request）——节点链路正常，与「172.16/12 全通」一致；<br>• 入包二层源 MAC 是 `ee:ff:ff:ff:ff:ff`，不是 `.94` 的真实 MAC `00:16:3e:6f:a2:a4` ⇒ VPC **代理 ARP、按 IP 转发**；<br>• `.94 → 10.244.1.6 / 10.244.1.1`：不到达；<br>• **`.94 → 172.18.94.250`**（手动加在 `.140` eth0 上、也在 172.16/12 内、但非平台分配）：**也不到达** ⇒ 这不是安全组能解释的，ENI 检查存在；<br>• `.140` 用**外来源** `10.244.1.1` ping `.94` 自身 IP：包离开 `.140` 网卡，`.94` 抓包 **0 个**（`.94` 的入向规则只授权 172.16/12，而源是 `10.244.x`）。<br>**处置（两条路）**：<br>**A. 保留原生路由**：安全组加 `10.244.0.0/16`（或 `10.0.0.0/8`）放行 + 关掉两块 ENI 的源/目的地址检查；因为该 VPC 是「代理 ARP + 按 IP 转发」，**很可能还需要给 pod 网段加 VPC 自定义路由**（下一步指向对应 ENI），否则路由器查不到 `10.244.x`；<br>**B. 不动云配置**：把 CNI 换成带封装的（k0s `network.provider: calico` + `calico.mode: vxlan`，或 ipip），节点间只出现 `172.18.x`（已在放行范围内）。**这条已实测可行**：手工建 VXLAN(UDP/4789) 与 IP-in-IP(proto 4) 隧道，两节点双向 ping 均 0% 丢包、亚毫秒（`tmp/k0s/overlay-probe.sh`）。代价：多一层封装、MTU 要降、Pod 网段重建。<br>未修之前多副本与冒烟都跑不了（见 §10.4） |
+| **F3** | **跨节点 pod 流量被云网络拦掉**（kube-router 不做封装，跨节点包带的是 `10.244.x`）。两个独立机制叠加：① ENI 的**「源/目的地址检查」**只放行源/目的属于本实例的报；② 安全组规则是 **`172.16.0.0/12` 全通**，而 `172.16.0.0/12 = 172.16–172.31`，**不含 pod 网段 `10.244.0.0/16`** | 干净复测（上一轮的「零收包」是抓包过滤器被 `.140` 上 compose redis 的 `172.19.0.2:6379` 流量填满导致的假象，已纠正）：<br>• `.94 → .140` **自身 IP**：到达（`.140` eth0 抓到 echo request）——节点链路正常，与「172.16/12 全通」一致；<br>• 入包二层源 MAC 是 `ee:ff:ff:ff:ff:ff`，不是 `.94` 的真实 MAC `00:16:3e:6f:a2:a4` ⇒ VPC **代理 ARP、按 IP 转发**；<br>• `.94 → 10.244.1.6 / 10.244.1.1`：不到达；<br>• **`.94 → 172.18.94.250`**（手动加在 `.140` eth0 上、也在 172.16/12 内、但非平台分配）：**也不到达** ⇒ 这不是安全组能解释的，ENI 检查存在；<br>• `.140` 用**外来源** `10.244.1.1` ping `.94` 自身 IP：包离开 `.140` 网卡，`.94` 抓包 **0 个**（`.94` 的入向规则只授权 172.16/12，而源是 `10.244.x`）。<br>**处置（两条路）**：<br>**A. 保留原生路由**：安全组加 `10.244.0.0/16`（或 `10.0.0.0/8`）放行 + 关掉两块 ENI 的源/目的地址检查；因为该 VPC 是「代理 ARP + 按 IP 转发」，**很可能还需要给 pod 网段加 VPC 自定义路由**（下一步指向对应 ENI），否则路由器查不到 `10.244.x`；<br>**B. 不动云配置**：把 CNI 换成带封装的（k0s `network.provider: calico` + `calico.mode: vxlan`，或 ipip），节点间只出现 `172.18.x`（已在放行范围内）。**这条已实测可行**：手工建 VXLAN(UDP/4789) 与 IP-in-IP(proto 4) 隧道，两节点双向 ping 均 0% 丢包、亚毫秒（`deploy/scripts/acceptance/overlay-probe.sh`）。代价：多一层封装、MTU 要降、Pod 网段重建。<br>未修之前多副本与冒烟都跑不了（见 §10.4） |
 | **F4** | **网络文件系统 + 非 root worker 做不了 chown**：c1/route B 要把沙箱树交给池 uid（`0770 owner=<沙箱 uid> group=<worker gid>`），这一步由镜像里带 `cap_chown` 的 broker 执行——但 **CAP_CHOWN 不过网**，NFS 只看 AUTH_SYS 凭据里的 uid，而「把文件让给别的 uid」只有 root 能做 | 实测：worker（uid 65534，broker `cap_chown,cap_dac_override=ep`）`chown 10000:65534` → `Operation not permitted`；同一挂载上 root 做同样 chown → 成功。**处置**：worker 以 `runAsUser: 0` + `runAsGroup: 65534` 跑（保留 worker 组才能进出 `0770 group=<worker gid>` 的沙箱树）。**这条不是 k0s 特有**：基线的「非 root worker + RWX PVC」组合在任何 NFS/CephFS 上都不成立，只在本地盘（compose 命名卷）上成立；已升级为**基线显式约束**，门槛与复核时机见 `docs/production-deployment-requirements.md` §5.4(b) |
 | **F5** | **NAS 的锁语义决定多副本能不能成立**：uid 池靠 `flock(<base>/.uid_pool.lock)` 在副本之间排他 | 三种挂载实测：v3+服务端锁 → flock/fcntl 全 `ESTALE`；v3+`nolock`（`.140` 现用参数）→ 锁正常但**只在单机内有效**；**v4.0 → 跨节点互斥成立**（`.94` 持锁时 `.140` 抢锁被挡）。另：这台 NAS 只支持 v4.0，`vers=4.1/4.2` 客户端直接 `EPROTONOSUPPORT`。**处置**：PV 用 `vers=4.0`，不要 `nolock` |
 | **F6** | **卷根必须对 worker 可写**：worker 直接在卷根下建 `sbx_*`（compose 的约定是 `1777`），而新供给的 RWX 卷通常是 `root:root 0755` | 第一个 `Sandbox.create()` 直接 `[Errno 13] Permission denied: '/var/lib/e2b-sandboxes/sbx_<id>'`。**处置**：worker 加 `workspace-root-init`（只动卷根自身的模式，不动下面的沙箱树），修完**校验**属主/模式并在修不动时报一次性修法——与 `image-cache-init` 同一套路 |
@@ -775,7 +799,7 @@ pod 网段不再出现在云网络上。**跨节点 pod 流量已打通**，冒�
 
 ### 11.1 为什么 B 可行（先验证再动手）
 
-在改 CNI 之前先手工建了两条隧道做判定（`tmp/k0s/overlay-probe.sh`）：
+在改 CNI 之前先手工建了两条隧道做判定（`deploy/scripts/acceptance/overlay-probe.sh`）：
 
 | 隧道 | `.94 → .140` | `.140 → .94` |
 |---|---|---|
@@ -995,7 +1019,8 @@ N13 之前基线是钉死单副本的（`deploy/k8s/worker.yaml` `replicas: 1` +
 所以收口 N18/N13 时 worker 与 control-plane 各推了**不同**的临时 tag 再用 `kubectl set image`
 指过去 —— 而任何一次 `apply.sh` 都会把它们复位成 `.version`（当时是个更早的版本）。
 **现在不用再这么做了**：`./deploy/scripts/build-and-push.sh` 会为每个组件推同一个版本号，
-compose 栈与这台 k0s 集群都指到它（当前 `0.1.0-350-g212850d-20260918-152008`），
+compose 栈与这台 k0s 集群都指到它（`0.1.0-350-…` 是 **2026-09-18 当时的值**；现值见
+`deploy/stack/.version`，2026-09-27 为 `0.1.0-652-g43fb88a-20260927-102733`），
 `apply.sh` 渲染出来的 tag 与线上一致。部署顺序就是「build-and-push → upgrade.sh（compose）
 → apply.sh 或 set image（k8s）」。
 
@@ -1933,7 +1958,7 @@ fd 表里回退查找（`/proc/<pid>/fd/<n>` 的解析目标 == mediator 打开�
 watch 也翻不出任何 pid。现在：inode 读不到会在下次 refresh 重试，仍读不到时按**进程树**判定归属
 （只需 world-readable 的 `/proc/<pid>/stat`），并且表为空时必然打一行 stderr，带上 leader pid 与 inode 状态。
 
-**集群最终实测**（`0.1.0-405-g8ca0551-20260919-192955`，`tmp/k0s/probe_push_and_tighten.py`，三次）：
+**集群最终实测**（`0.1.0-405-g8ca0551-20260919-192955`，`deploy/scripts/acceptance/probe_push_and_tighten.py`，三次）：
 
 | 指标 | 值 |
 |---|---|
@@ -2105,7 +2130,7 @@ description），所以"现在多大"只差一次 `fdinfo` 读——现在 `is_e
 **已收口（2026-09-21，`0.1.0-425-…-20260921-172405`）：目录按「实际分配」计费，不是 `st_size`。**
 先说清被实测推翻的前提：N31 记的是「NFS 每目录至少 16 KiB 的目录块」，但在这台 NAS 上
 **目录的 `st_size` 不是它占的空间**——空目录 `st_size=4096`、2000 个条目时 `st_size=16384`，
-而 `st_blocks×512` 与 `du -s` **全程都是 512**（`tmp/k0s/probe_dir_cost.py`，0/10/200/1000/2000
+而 `st_blocks×512` 与 `du -s` **全程都是 512**（`deploy/scripts/acceptance/probe_dir_cost.py`，0/10/200/1000/2000
 五档，逐档打印）。所以修法② 落成 **`st_blocks × 512`**（`brief_stat.directory_cost`），文件侧维持
 原来的 `entry_size` 口径不变；若按 `st_size` 计费，平台数会比沙箱自己的 `du` **更远**，正好与验收
 判据相反。
@@ -2120,7 +2145,7 @@ description），所以"现在多大"只差一次 `fdinfo` 读——现在 `is_e
 | `envd_service/http/health.py` | `/metrics` 的兜底分支同口径（它只在前两条都读不到时才走到，但不能第三套定义） |
 | `tests/unit/test_dir_ledger.py` 等 6 个测试文件 | 期望值改成 `<文件字节> + 目录 `st_blocks×512`（用 `os.stat` 独立探测，不调用被测代码），并新增「只含空目录的树」一条契约测试 |
 
-**集群实测（`tmp/k0s/probe_dir_stsize.py`，两类独立测量）**：沙箱内建 40 个目录 + 1 个 4096 B 文件
+**集群实测（`deploy/scripts/acceptance/probe_dir_stsize.py`，两类独立测量）**：沙箱内建 40 个目录 + 1 个 4096 B 文件
 （外加一棵只有目录的树）：
 
 ```
@@ -2191,7 +2216,7 @@ phase 2** 抓出来的。现在两条路径同形（`--events-fd` + `pass_fds` �
 #### 22.5.14 快照：同步拷贝的契约、幂等重试与入口超时（N29，2026-09-22）
 
 快照是**同步**端点：控制面把沙箱树整个拷一份（实测 ≈ **16 ms/文件**，2000 个文件 > 入口 60 s）。
-2026-09-21 在集群上把客户端实际看到的形状量了一遍（`tmp/k0s/probe_n29_sync.py`、`n29-sync.log`）：
+2026-09-21 在集群上把客户端实际看到的形状量了一遍（`deploy/scripts/acceptance/probe_n29_sync.py`、`n29-sync.log`）：
 
 | 观察 | 事实 |
 |---|---|
@@ -2302,8 +2327,8 @@ phase 2** 抓出来的。现在两条路径同形（`--events-fd` + `pass_fds` �
 **10 PB / 已用 557 G / 1%**（整个 NAS 文件系统），所以"看 statfs 判断还有没有空间"在沙箱内毫无意义——
 这正是这条闸门必须建立在**我们自己的台账**上的原因。
 
-复现：`tmp/k0s/probe_write_paths.py`、`tmp/k0s/probe_mmap_growth.py`、`tmp/k0s/probe_kernel_copy.py`、
-`tmp/k0s/probe_ceiling_completeness.py`、`tmp/k0s/probe_copy_range_zero.py`。
+复现：`deploy/scripts/acceptance/probe_write_paths.py`、`deploy/scripts/acceptance/probe_mmap_growth.py`、`deploy/scripts/acceptance/probe_kernel_copy.py`、
+`deploy/scripts/acceptance/probe_ceiling_completeness.py`、`deploy/scripts/acceptance/probe_copy_range_zero.py`。
 
 **剩下三种形状也补了（同一形状：900/1024 已用、天花板 ~124 MiB、目标 300 MiB）：**
 
@@ -2315,7 +2340,7 @@ phase 2** 抓出来的。现在两条路径同形（`--events-fd` + `pass_fds` �
 
 三个探针坑，记下来免得下次重踩：① `O_DIRECT` 短写是常态，判停条件不能写成"第一次短写"（否则会把 84.9 MiB 误读成被拦）；② socket→pipe 的 `splice` 每次只搬 socket 缓冲区那点（~64 KiB），迭代次数上限会先于天花板触顶（我第一版用 `4×目标MiB` 次迭代，把 70 MiB 误读成被拦）；③ `files.write("/home/user/x")` 会落到 `/home/user/home/user/x`——SDK 的绝对路径按**树根**解析（N28 记录过的未修语义），要传相对路径。
 
-**"换存储要不要重验"这件事本身也验了（2026-09-20）。** 之前这条写的是"这是**这台 NFS**上的事实、换存储要重新验证"——量过之后那句话**不准确**：同一份探针（`tmp/k0s/mmap-probe.py`，越 EOF 三页内/4 MiB 外、末页内、文件内对照各一次）在两个内核、六种存储/协议上**结果逐字一致**：
+**"换存储要不要重验"这件事本身也验了（2026-09-20）。** 之前这条写的是"这是**这台 NFS**上的事实、换存储要重新验证"——量过之后那句话**不准确**：同一份探针（`deploy/scripts/acceptance/mmap-probe.py`，越 EOF 三页内/4 MiB 外、末页内、文件内对照各一次）在两个内核、六种存储/协议上**结果逐字一致**：
 
 | 存储 | 内核 | 越 EOF 存储 | 末页内越 EOF |
 |---|---|---|---|
@@ -2337,7 +2362,7 @@ phase 2** 抓出来的。现在两条路径同形（`--events-fd` + `pass_fds` �
 4. 目录配额 / `FileCountLimit` 是否存在（N31 第三条修法）。
 5. 属性缓存与 `.nfsXXXX` 行为（§22.5.9 那条修法依赖"最后一个持有者放手后 NFS 才回收"）。
 
-**验不了的**：另一个**内核版本**（生产目标是 ACK 5.10，我们手上只有 6.12 与 7.0.14），以及另一个 **NAS 产品**——分别需要一台 5.10 的机器（或 ACK 集群）和目标产品的 export。复现手段：`tmp/k0s/node-mmap-storage.sh` + `tmp/k0s/mmap-probe.py`，经 `tmp/k0s/tools.sh node-run <host>` 打到节点上（节点是 root，可 `losetup`/`mkfs.ext4`）。
+**验不了的**：另一个**内核版本**（生产目标是 ACK 5.10，我们手上只有 6.12 与 7.0.14），以及另一个 **NAS 产品**——分别需要一台 5.10 的机器（或 ACK 集群）和目标产品的 export。复现手段：`deploy/scripts/acceptance/node-mmap-storage.sh` + `deploy/scripts/acceptance/mmap-probe.py`，经 `tmp/k0s/tools.sh node-run <host>` 打到节点上（节点是 root，可 `losetup`/`mkfs.ext4`）。
 
 #### 22.5.12 三件未决的事：条目配额、样本自证时间、超支可见（N25/N31，2026-09-20）
 
@@ -2431,7 +2456,7 @@ ctypes 直接调 libc 的 `statx`（`struct statx.stx_size` 在 256 字节记录
   正卡在上面这 1.4 s 里。
 * 换掉整树 walk 也不够：增量账本已经只重扫脏目录了，脏目录里的**那个文件**照样要问大小。
 
-**上线实测**（`0.1.0-400-g37e8da3-20260919-103017`，`tmp/k0s/probe_brief_stat_live.py` /
+**上线实测**（`0.1.0-400-g37e8da3-20260919-103017`，`deploy/scripts/acceptance/probe_brief_stat_live.py` /
 `probe_freeze_latency_cp.py` 可复跑）：
 
 | 项 | 改前 | 改后 |
@@ -2475,7 +2500,7 @@ C 原来的口径是"任何单个文件不得超过**整棵树**的预算"（免
   否则用 5 s 前的旧值，连续写会各自读到"还剩 1024 MiB"
 * `E2B_DISK_EXEC_LIMIT=1`、`E2B_DISK_EXEC_LIMIT_FLOOR_MB=1`（代码默认为关）
 
-**集群验收**（`tmp/k0s/probe_exec_limit.py`）：
+**集群验收**（`deploy/scripts/acceptance/probe_exec_limit.py`）：
 
 ```
 树已用 700 MiB（预算 1024）
@@ -2518,7 +2543,7 @@ C 原来的口径是"任何单个文件不得超过**整棵树**的预算"（免
   从一次**真实整树 walk** 重建。中介**结构上**看不见的东西（描述符开着超过 grace、别的信任域写的）
   只有这条兜得住 —— 换成增量之前，"永远错"不是可能，是没有东西会去发现。
 
-**验收**：`tmp/k0s/probe_dir_ledger.py` —— 在**沙箱内**独立量出树大小（`os.walk`+`getsize`，与
+**验收**：`deploy/scripts/acceptance/probe_dir_ledger.py` —— 在**沙箱内**独立量出树大小（`os.walk`+`getsize`，与
 `priv_helpers.dir_size` 同口径），与平台上报的 `diskUsed` **逐字节相等**：变异序列
 （多层新文件 / 新目录 / rename / 整枝删除）**6144 = 6144**，追加写场景 **12144 = 12144**。
 worker 同时打印每轮用了哪条路，避免"功能其实是空转"看不出来：
@@ -2529,7 +2554,7 @@ worker 同时打印每轮用了哪条路，避免"功能其实是空转"看不�
 
 ### 22.1 集群验收（2026-09-19，`0.1.0-388-ge76d38e-20260919-010638`）
 
-`tmp/k0s/probe_n28_acceptance.py`（可复跑，逐条打印证据）全绿，实测输出要点：
+`deploy/scripts/acceptance/probe_n28_acceptance.py`（可复跑，逐条打印证据）全绿，实测输出要点：
 
 | 项 | 实测 |
 |---|---|

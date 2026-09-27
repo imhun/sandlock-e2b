@@ -4,6 +4,17 @@
 **引擎能用了，但 E2B 这一半没设计。** 本文把它设计出来，并把方案里
 "看起来能做、其实做不了"的三处先钉住（§1）。
 
+> **状态（2026-09-27 更新）**：这句开头是 **2026-09-25 写设计时的现况，已过期** ——
+> 设计已落地、已上线并已集群验收（S2/S3/S4 见 §6，E5–E8 收口审计见 §6(k)）；需求也**已确认**
+> （用户裁定"有需求、恢复后必须支持 exec"，见 §0 的 ✅ 段与 §6(k)）。本文现在的读法：
+> **`E2B_PAUSE_CHECKPOINT` 默认关**是**代码**默认；**生产清单把它设成 `"1"`**（`deploy/k8s/worker.yaml`），
+> 所以线上 `pause` 已经变成"先写整份进程内存"。唯一**仍开放**的一条是 `E2B_PAUSED_TTL_S`（§6(k)⑥，待拍板、今天无实现）。
+>
+> **引用约定（2026-09-27 更新）**：正文里的 `tmp/**` 与 `.superpowers/sdd/**` 都在 `.gitignore` 里
+> （**不是仓库路径**）。可重跑脚本已迁到 [`deploy/scripts/acceptance/`](../deploy/scripts/acceptance/)
+> （原名不变），报告迁到 [`docs/reports/`](reports/)（原名不变）；`tmp/**.log` 一律是**原始日志**
+> （会被清、可重跑，脚本见 `deploy/scripts/acceptance/`）。
+
 ---
 
 ## 0. 这个能力在产品上是什么
@@ -283,7 +294,7 @@ fork `1f41f1a` 关闭了。OCI 那句拒绝描述的是**另一条 E2B 不使用
 | **S0** | ✅ 修掉守卫用例里过时的架构说法（它仍写着"引擎只支持 x86_64/riscv64、aarch64 要先移植"，而 aarch64 的 S0–S5 2026-09-24 已落地） | 用例文本与代码一致 |
 | **S1a** | ✅ fork：slot 加 `checkpoint` verb（写 blob 到调用方指定的路径）—— fork `e76cb2f`，主仓 pin `82a26df` | fork 的 supervise 相位 **31 passed / 0 failed**，新用例钉住"镜像是引擎格式"与"捕获不是 kill" |
 | **S1b** | ✅ fork：**从镜像起一个 slot**（`Checkpoint::load` → 用镜像里的 policy 起沙箱 → `restore_interactive`），服务 `config`/`stats`/`shutdown`、**按名拒绝 exec**（照 OCI 的既有语义）。不是 verb，是启动模式 | fork `58264eb`，supervise 相位 **32 passed / 0 failed**。用例钉住：恢复出的进程**真的在跑**（计数器继续前进）、`stats.restored` 可辨、`exec` 得到引擎原话、`shutdown` 干净退出、**进程死后报 `Exited` 而不是 `Live`**（僵尸那个 bug 就是这一步量出来的）。**警告**：workload 必须是 §1(e) 那格里"能恢复"的类型 |
-| **S2** | ✅ **已完成**：worker：agent 端点（`/checkpoint`、`/restore`）+ D1/D2/D8 的落地 + **D3 的平台账与拒绝路径**（`runtime/checkpoint_store.py`、`runtime/platform_disk.py`、`route_b.RouteBInstance` 的两个 verb 客户端、`executors/sandlock.py` 的两个能力入口） | 单测：blob 落在 `_runtime`、目录 0700 且属主是 worker、沙箱树一个字节不动、**平台账计入且用户的 `diskMB` 不变**、账满时**先拒**（一条 verb 都不发）、写超了**删掉再拒**、refusal 带原因、teardown 删净 —— `tests/unit/test_checkpoint_store.py`（16 条）+ `tests/unit/test_agent_checkpoint_restore.py`（11 条）+ `tests/unit/test_sandlock_executor_route_b.py` 的 6 条 verb 用例 |
+| **S2** | ✅ **已完成**：worker：agent 端点（`/checkpoint`、`/restore`）+ D1/D2/D8 的落地 + **D3 的平台账与拒绝路径**（`runtime/checkpoint_store.py`、`runtime/platform_disk.py`、`route_b.RouteBInstance` 的两个 verb 客户端、`executors/sandlock.py` 的两个能力入口） | 单测：blob 落在 `_runtime`、目录 0700 且属主是**沙箱自己的池 uid**（D2 的修正；无池 uid 时才留在 worker，`test_checkpoint_store.py:150-160`/`:193-204`）、沙箱树一个字节不动、**平台账计入且用户的 `diskMB` 不变**、账满时**先拒**（一条 verb 都不发）、写超了**删掉再拒**、refusal 带原因、teardown 删净 —— `tests/unit/test_checkpoint_store.py`（16 条）+ `tests/unit/test_agent_checkpoint_restore.py`（11 条）+ `tests/unit/test_sandlock_executor_route_b.py` 的 6 条 verb 用例 |
 | **S3** | ✅ **完成**：`pause` 先捕获再冻结、`resume` 先解冻/恢复再改状态，`E2B_PAUSE_CHECKPOINT` 默认关 | 单测把两条顺序钉成事实（事件序列 `["executor.capture_checkpoint", "ctx.pause"]` / `["executor.restore_checkpoint", "ctx.resume"]`，`test_agent_checkpoint_restore.py`）。**集群验收见 §6(g)：全绿** —— 起一个跑着的沙箱 → 重启它的 worker → resume → **进程状态还在、还能 exec**（中途那段"恢复了但进程不见"是验收脚本自己的命令形状，见 §6(g) 第三轮） |
 | **S4** | ✅ **已完成**：`restore_skipped` 的对外语义（D6） | `unrecoveredFds` 随 `/restore` 与 `resume` 的结果返回、逐条进日志（用例断言的是**整句**日志文本，不是子串），文档在这一节与 §6(e) 里明说"恢复的沙箱没有原有的网络连接" |
 
@@ -297,6 +308,8 @@ fork `1f41f1a` 关闭了。OCI 那句拒绝描述的是**另一条 E2B 不使用
 * **不做"自动迁移正在跑的沙箱"**：blob 在共享 NFS 上让这条路技术上可行，但那是调度器的活，
   且要先把 §2 全部落地。留给以后按需评估。
 * **不改 `pause` 今天的行为**（旗标默认关）：S3 之前，pause 仍只是 SIGSTOP。
+  **（2026-09-27 更新：这句只描述"代码默认关"）** —— S3 已完成，且**生产清单把 `E2B_PAUSE_CHECKPOINT` 设成 `"1"`**
+  （`deploy/k8s/worker.yaml`），所以线上 `pause` 已经会先捕获再冻结（见 §6(k)④）。回滚就是把这个 env 改回 `0`。
 
 ---
 
@@ -389,7 +402,7 @@ worker 上把 per-sandbox 扫描整个关掉（`E2B_DISK_ENFORCE_INTERVAL_S=0`�
 `docs/deploy-clusters.md`。
 
 **2026-09-25 实测（第一、二轮）：看起来"一半绿、一半红"**。脚本
-`tmp/k0s/checkpoint_acceptance.py`（每步都断言，不是打印）走到：
+`deploy/scripts/checkpoint_acceptance.py`（每步都断言，不是打印）走到：
 
 * ✅ `pause` 写了图，落在**平台的**目录里、**属主是那个沙箱的 uid**（`_runtime/.checkpoints/
   <id>/latest`，`meta.json` + `policy.dat` + `process/`，422 KiB），沙箱自己的树一个字节没动；
@@ -476,7 +489,7 @@ dash 原地 `exec`（所以 `python3 …` 这种形状抓到的就是 python）�
 
 ### (j) 复核（2026-09-25 深夜，部署 `0.1.0-527-g946daa9`）
 
-在同一套环境上把这条验收又跑了一遍，**全绿**（脚本 `tmp/k0s/checkpoint_acceptance.py`，
+在同一套环境上把这条验收又跑了一遍，**全绿**（脚本 `deploy/scripts/checkpoint_acceptance.py`，
 日志 `tmp/k0s/restore-recheck3.log`）：
 
 * pause 写图 → `latest`（6162 KB，含 `meta.json` / `policy.dat` / `process`，属主是沙箱的
@@ -509,7 +522,7 @@ dash 原地 `exec`（所以 `python3 …` 这种形状抓到的就是 python）�
 这一节补的全是"决定已经拍过、只是没写下来"的话。出处是
 `docs/superpowers/plans/2026-09-26-checkpoint-restore-productization.md` 的决策点表与依赖表，
 逐条证据见同计划尾部的《E5–E8 收口审计》与
-`.superpowers/sdd/checkpoint-e5-e8-audit-report.md`。
+`docs/reports/checkpoint-e5-e8-audit-report.md`（报告已迁入 `docs/reports/`；原 `.superpowers/sdd/` 那份 gitignored）。
 
 ① **恢复出来的进程没有可读的 stdout/stderr —— 它进 `/dev/null`**（决策点表第 2 行）。
 会话把主程序的 stdio 接到 `/dev/null`（`envd_service/route_b.py:332`、

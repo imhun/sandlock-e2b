@@ -1,5 +1,9 @@
 # sandlock fork 收尾计划（F15 帧-描述符归属修复 + 台账 + 门禁/wheel + 推送发布）
 
+> **执行状态（2026-09-27 更新）**：**Task 1–9 已完成**（F15 帧头声明 fd 数 + 截断 fail-closed、F16 route-B 客户端面、双架构 wheel 重建、fork 全量门禁全绿、台账收口）；
+> **Task 10（推送与上游 PR）仍未做** —— 需用户授权（`gh`/token 只读），登记在 `docs/task-backlog.md` **N11**。
+> **仍有效的决定**：wire 变更必跑 E2B 侧接线复验。**已作废的假设**：无。证据：fork `docs/fork-plan-followups.md`。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: 用 `superpowers:subagent-driven-development`（推荐）或
 > `superpowers:executing-plans` 逐任务实施。步骤用 `- [ ]` 勾选跟踪，一个 Task 一个提交。
 

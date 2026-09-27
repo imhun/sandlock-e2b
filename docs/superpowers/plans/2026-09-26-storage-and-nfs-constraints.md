@@ -1,5 +1,8 @@
 # §10.5 两条遗留结论收口（存储锁门槛 + 非 root worker 约束）实施计划
 
+> **执行状态（2026-09-27 更新）**：**已收口** —— 两条结论已落 `docs/production-deployment-requirements.md` §5.4(a)/(b)（NFSv4.0 的 `flock` 是唯一跨节点互斥；网络文件系统上 worker 必须 `runAsUser: 0`），§10.5/§13.3/open-issues/task-backlog 指针对齐。
+> **仍有效的决定**：这两条**已升级为基线显式约束**（换 NAS 或换挂载参数时按 §5.4(a) 复核）。**已作废的假设**：无（纯文档收口）。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把 `docs/k8s-deployment.md` §10.5 里那两条"要不要写进门槛"的悬置问题各用一个**可直接粘贴的段落**结掉，并落到唯一一处（`docs/production-deployment-requirements.md` 新增 §5.4），随后把 §10.5 / §13.3 / `docs/open-issues.md` / `docs/task-backlog.md` 的指针对齐。

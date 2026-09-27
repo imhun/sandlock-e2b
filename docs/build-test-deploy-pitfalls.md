@@ -3,6 +3,10 @@
 这里只记**已经真实踩过、并且看起来像"代码坏了"但其实不是**的坑。每条都是
 「症状 → 原因 → 做法」。新增一条的判据：它至少骗过一次人（或花掉一轮排查）。
 
+> **引用约定（2026-09-27 更新）**：正文里的 `tmp/**` 都在仓库 `.gitignore` 里（**不是仓库路径**）。
+> 可重跑脚本已迁到 [`deploy/scripts/acceptance/`](../deploy/scripts/acceptance/)（原名不变）；
+> `tmp/**.log` 一律是**原始日志**（会被清、可重跑，脚本见 `deploy/scripts/acceptance/`）。
+
 ---
 
 ## A. 构建（fork wheel / 镜像）
@@ -145,7 +149,7 @@ volume mount 会**原样透传**这个数（`single_file_ceiling_bytes` 靠它�
 **B11. "箱内 `id -u` = 0"不能单独当形态证据。**
 原因：pid_ns 关着时这条同样成立（route-B 自映射本来就把客人做成 root），所以拿它当 pid_ns 的
 验收时会得到假绿。做法：配对一条只有该形态才成立的观测 —— 例如 `kill(<宿主 pid>, 0)`：
-自有 pid ns 里是 `ESRCH`，共享宿主 pid ns 里是 `EPERM`（探针 `tmp/pidns-shape-probe.py`）。
+自有 pid ns 里是 `ESRCH`，共享宿主 pid ns 里是 `EPERM`（探针 `deploy/scripts/acceptance/pidns-shape-probe.py`）。
 
 **B12. fork 门禁里 chroot 家族集体红，报 `execvp 'rootfs-helper': Exec format error`（或 exit 127），
 而 `tests/rootfs-helper` 变成 0 字节。**
@@ -316,7 +320,7 @@ netns 开关与 `E2B_NET_BIND_INJECT` 都在 `deploy/stack/docker-compose.prod.y
 脚本要轮询到 200 再断言。
 
 **D5. 定位"路径慢还是处理慢"用三段拆分**：客户端与测试自己的服务端各打墙钟时间戳（同一宿主时钟），
-去程 / 服务端自身 / 回程一目了然（`tmp/mcp-3way.py` 的思路）。这次就是靠它把 390 ms 归到传输层。
+去程 / 服务端自身 / 回程一目了然（`deploy/scripts/acceptance/mcp-3way.py` 的思路）。这次就是靠它把 390 ms 归到传输层。
 
 **D6. 探针与清理**：脚本放项目 `tmp/`；跑完 kill 掉所有沙箱、删掉目标机上的探针文件
 （`tmp/cleanup*.sh` 有模板），别给下一轮留冷缓存陷阱和残留箱。

@@ -1,5 +1,9 @@
 # Sandlock 未实现目标 —— 剩余工作实施计划（2026-09-04）
 
+> **执行状态（2026-09-27 更新）**：清零目标**已达成**（M0′–M4、SL-1/T4 全部落地并上线），本文件留档。
+> **仍有效的决定**：一个沙箱 = 一个实例；`SL-1` 的"建箱前拒绝、无降级档"纪律至今有效。
+> **已作废的假设**：把运行时基线钉在 `upstream-pr/netns-free-clean`（**无** netns）——2026-09-16/17 起 per-sandbox netns 与 pid_ns 已全量（`docs/production-deployment-requirements.md` §2.4.10）。证据：`docs/open-issues.md` §四。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. 本文是"还剩什么 + 按什么顺序做"的执行计划；每个阶段（尤其阶段 1/2 的 Rust 改造）在执行前仍需按本仓库惯例拆出组粒度的详细 plan（见 `docs/superpowers/plans/2026-09-01-sandlock-e2b-completion-roadmap.md` 的分层方式）。
 
 **Goal:** 清零 sandlock 项目当前**所有未实现目标**：先用两个"不需要环境"的缺陷修复（T2/T3）换取干净基线，再按 fork 侧安全门槛 M0′ → 实例化 M0–M3 → E2B 接线 M4 → 路径中介身份 SL-1/T4 的顺序推进，最后收口发布前置与环境受限项。

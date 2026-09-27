@@ -1,5 +1,8 @@
 # O3 凭据管理（从"明文/Secret 混用"到"有轮换流程"）实施计划
 
+> **执行状态（2026-09-27 更新）**：**已收口** —— 轮换 runbook（四张表）、指纹对账与统一验收落 `docs/k8s-deployment.md`《凭据管理》；线上已开 `E2B_SECRET_MASTER_KEY`（降级告警消失）。api/internal key 走**双窗轮换**，redis 按裁定**接受 10–30 s 中断**（不做 ACL 双用户）。
+> **仍有效的决定**：三类凭据分开处理、双窗 vs 接受中断的取舍。**已作废的假设**：把"开 master key"当成"既有 `_secrets` 明文自动加密"——**不成立**，既有明文需一次性清理（`deploy/scripts/cleanup-plaintext-secrets.py`，见 `docs/k8s-deployment.md` §4.5.1）。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把 k8s 形态的凭据从"人手工 `kubectl create secret` + 一份降级态的 secret 存储"变成**有脚本、有指纹、有轮换窗口**的流程：先做零窗口加固（开启 `E2B_SECRET_MASTER_KEY`，让 `_secrets` 不再是共享卷上的明文），再把每个凭据的**轮换步骤与影响面**写成可执行 runbook（哪些服务要重启、有没有不可逆窗口）。

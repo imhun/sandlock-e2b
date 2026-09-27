@@ -1,5 +1,9 @@
 # 共享卷去 SYS_ADMIN（fork 确定性 cwd 根治）+ 剩余任务收口 实施计划
 
+> **执行状态（2026-09-27 更新）**：**Track A（A0–A7，共享卷去 `SYS_ADMIN` 的确定性 cwd）/ Track B（SL-1/SL-11/SL-12）/ Track C（非 root 形态上线 + 线上测试全绿）全部收口并已上线**。
+> **仍有效的决定**：worker 侧不声明 `SYS_ADMIN`；卷视图/路径由请求路径决定（不 bind）。**已作废的假设**：无。
+> 证据：`docs/production-deployment-requirements.md` §2.4.3/§2.4（A4–A7 的实测表）与 `docs/open-issues.md` T5/F1。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: 用 superpowers:subagent-driven-development
 > （推荐）或 superpowers:executing-plans 按任务逐条执行。步骤用 `- [ ]` 勾选跟踪；
 > 每个 Task 自带验证，不通过不进入下一个 Task。fork 侧进度账本

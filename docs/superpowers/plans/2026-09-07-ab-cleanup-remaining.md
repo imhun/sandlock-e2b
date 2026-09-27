@@ -1,5 +1,9 @@
 # A/B cleanup 剩余任务执行计划（FUP-11 + wheel/E2B 收口）
 
+> **执行状态（2026-09-27 更新）**：**已收口** —— FUP-11 剩余硬化落地，wheel 按 fork tip 重建并 verify，E2B 侧 bump + 探针 + full gates 复跑全绿。
+> **仍有效的决定**：fork 改动按完整门禁验（`deploy/scripts/fork-gate.sh`）、先证据后实现。
+> **已作废的假设**：无（本计划无被推翻的语义假设）。证据：`docs/task-backlog.md` 与 fork `docs/fork-plan-followups.md`。
+
 > **For agentic workers:** 按任务顺序执行；代码改动先落测试/证据再实现；每任务
 > 独立可验证后提交。fork 侧进度账本 `third_party/sandlock/.superpowers/sdd/progress.md`，
 > main 侧 `.superpowers/sdd/progress.md`；收口台账 fork-plan-followups /

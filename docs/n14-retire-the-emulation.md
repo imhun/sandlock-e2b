@@ -4,6 +4,10 @@
 但"简化"能删的东西比"3492 行中介"小得多，有两处**不是安全中性的**（§3），
 而它们决定了这件事只能分阶段做（§4）。
 
+> **引用约定（2026-09-27 更新）**：正文里的 `tmp/**`（`.log`、`tmp/k0s/task12/` 等）都在仓库
+> `.gitignore` 里（**不是仓库路径**）。可重跑脚本已迁到 [`deploy/scripts/acceptance/`](../deploy/scripts/acceptance/)
+> （原名不变）；`tmp/**.log` 一律是**原始日志**（会被清、可重跑，脚本见 `deploy/scripts/acceptance/`）。
+
 ---
 
 ## 0. 这件事是什么
@@ -194,7 +198,7 @@ S2 原本问的是"pure 形态能不能也吃真根"。分三层答，每层都�
 （`context.rs`：*"real_root requires a chroot root (the image rootfs)"*），而 pure 从不设 chroot
 （`sandlock.py:2001` 那句 `kwargs["chroot"] = …` 只在 `base_image and image_rootfs` 分支里）。
 
-**② "把 chroot 设成 `/` 再开真根"也不行**，两条路都试过（`tmp/k0s/probe-pure-realroot.py`，
+**② "把 chroot 设成 `/` 再开真根"也不行**，两条路都试过（`deploy/scripts/acceptance/probe-pure-realroot.py`，
 特权容器、照抄 `realroot::build` 的顺序）：
 
 | 做法 | 结果 |
@@ -311,10 +315,15 @@ errno 13 ⇒ container 崩塌 ⇒ 之后每个 verb 都答 `InstanceClosed`）�
 | 阶段 | 做什么 | 验收 |
 |---|---|---|
 | S1 | ✅ **已完成**：真根成为线上形态，并写进清单（**收益已交付**，见 §5） | `kubectl diff` 为空；两形态对照表（`deploy-clusters.md` §7） |
-| S2 | ✅ **已回答**：pure 走真根**可行但要合成 rootfs**，而那份 rootfs 的内容正好是它今天的 Landlock 白名单 ⇒ 这同时是 **N15 的一条替代路线**（一次合成换掉 33 条闸门） | 结论与实测见 §5；三个探针 `tmp/k0s/probe-pure-realroot.py`（A=EBUSY、A2=同树无隔离、B=合成根真隔离） |
+| S2 | ✅ **已回答**：pure 走真根**可行但要合成 rootfs**，而那份 rootfs 的内容正好是它今天的 Landlock 白名单 ⇒ 这同时是 **N15 的一条替代路线**（一次合成换掉 33 条闸门） | 结论与实测见 §5；三个探针 `deploy/scripts/acceptance/probe-pure-realroot.py`（A=EBUSY、A2=同树无隔离、B=合成根真隔离） |
 | S3 | **已跑完（2026-09-25）**：真根下的 handler 改成 `Continue`（沿用 `exec`/`chdir` 已有的 `child_is_pivoted` 判据），翻译只留给模拟根。**放行了 `getcwd`，其余全家族读完后否掉**（§4.1 的三个候选 + §4.2 的判据表）——真根下"纯翻译"的 handler 只有它一个；剩下的中介工作不是翻译，而是策略 / COW 视图 / 磁盘活账本，归 S4 与 S5 | **已验收（`getcwd`）**：fork 的 `core_integ` 559（+1 新用例，判别性已证）+ 两态 security 套件 —— `E2B_REAL_ROOT=0` **43 passed / 1 skipped / 4 xfailed**、`=1` **46 passed / 1 skipped / 1 xfailed**，与改动前的基线逐字相同（crate 侧 `test_chroot` 51 / `test_instance_exec` 28 / `test_cow` 26 / `test_restore` 5 全绿）。不可放行的那批（`open`/`write`/`stat`/`statx`/`readlink`/`xattr`/`utimensat`）**保持不变**，每个否掉的都在 §4.1/§4.2 写明为什么 |
 | S4 | 账本换观察点（或证明周期扫描足够），再退写拦截 | 磁盘门禁的单测与集群验收不变 |
 | S5 | 真根成为**唯一**形态，模拟那套整体退役。**注意这是代码卫生，不是安全改进**（§5） | 没有 `E2B_REAL_ROOT=0` 也能全绿 |
+
+> **（2026-09-27 更新：S4/S5 仍未做 —— `docs/open-issues.md` N14 的"简化那半未做"就是这个）** ——
+> `chroot/dispatch.rs`、`procfs.rs`、`chroot/resolve.rs` 全套仍在位，真根"退役模拟"的收益（拦截清单
+> 不再承担安全职责）**在生产里已由 S1 交付**，所以这一步现在只是**代码卫生**、不是欠一道防线；
+> 它被 `E2B_REAL_ROOT=0` 这个配置挡着。要不要做、什么时候做，按 §7 的账单独评估。
 
 **S3 之前不要动翻译代码**：现在删除任何一条，都会在 `E2B_REAL_ROOT=0` 的部署上
 把"被拦截"变成"在宿主解析"。
