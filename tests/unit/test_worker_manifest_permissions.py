@@ -1156,10 +1156,13 @@ def test_the_image_cache_init_hands_the_secret_directories_over_without_touching
         assert command.endswith(
             'the per-sandbox secret dirs must belong to uid 65534"'
         ), command
-    # ...the directory sweep keeps `-type d` (the depth pair is the payload
-    # contract: `<secrets>/<sandbox_id>/<name>.secret`, directories only to
-    # depth 1).
+    # ...the directory sweep keeps `-type d` (the payload contract:
+    # `<secrets>/<sandbox_id>/<name>.secret`, directories only to depth 1) and
+    # the depth pair itself -- loosening `-maxdepth` to 3, or dropping it, would
+    # still avoid `*.secret` while reaching past the layout this is sized for.
     assert any("-type d" in command for command in secrets_commands)
+    (find_sweep,) = [c for c in secrets_commands if c.startswith("find")]
+    assert "-mindepth 1 -maxdepth 2 -type d" in find_sweep
     # ...and no chown may name a secret *file*: those stay with the sandbox uid
     # the executor handed them to.
     assert [line for line in commands if "chown" in line and ".secret" in line] == []
@@ -1170,6 +1173,29 @@ def test_the_image_cache_init_hands_the_secret_directories_over_without_touching
     assert [
         line for line in lines if line.startswith('chown -R 65534:65534 "$dir')
     ] == ['chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||']
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_the_worker_limits_match_the_walk_derivation() -> None:
+    """The two manifest numbers the broker walk ceiling is derived from.
+
+    ``envd_service/priv_helpers.BROKER_MAX_WALK_RESPONSE_BYTES`` is sized as a
+    small multiple of one tree's worst *wire* answer, and has to stay below the
+    worker container's memory. Both halves are read off this manifest, so they
+    are pinned here rather than repeated as literals in the Python test that
+    names this one -- a bump to either has to be a deliberate, visible edit.
+    """
+    rendered = subprocess.run(
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    worker = _rendered_workload(rendered, "StatefulSet", "e2b-worker")
+    (container,) = worker["spec"]["template"]["spec"]["containers"]
+    assert container["resources"]["limits"]["memory"] == "2Gi"
+    variables = {entry["name"]: entry.get("value") for entry in container["env"]}
+    assert variables["E2B_DISK_MAX_ENTRIES"] == "500000"
 
 
 def test_apply_waits_for_the_broker_daemonset_before_the_worker() -> None:

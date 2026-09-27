@@ -159,18 +159,31 @@ BROKER_MAX_RESPONSE_BYTES = (
     2 * BROKER_MAX_OUTPUT_BYTES * BROKER_ESCAPE_BLOWUP + BROKER_READ_CHUNK
 )
 #: The ceiling on one ``walk`` answer line -- *smaller* than the generic one
-#: above on purpose. ``walk`` is the one verb whose answer is a whole tree
-#: written out one entry per line, but every caller walks a *single* tree
-#: (``registry`` per record's workspace, ``health`` for one sandbox's
-#: workspace, ``checkpoint_store`` for one checkpoint image -- none of them
-#: walks the whole workspace base), and a tree is capped at
-#: ``E2B_DISK_MAX_ENTRIES`` (N31, 500000) entries; ~80 B a line is ~40 MB
-#: worst case. 256 MiB is ~6x that, and deliberately *below* the worker
-#: container's ``limits.memory: 2Gi``, so crossing it is this refusal and not
-#: the kernel's OOM kill first. The generic ceiling stays for ``chown`` /
-#: ``rm`` (whose answers are a handful of bytes) because their refusal text
-#: has no such tree bound to lean on.
-BROKER_MAX_WALK_RESPONSE_BYTES = 256 * 1024 * 1024
+#: above on purpose, and sized for the worst **single tree**:
+#:
+#: * ``E2B_DISK_MAX_ENTRIES`` (N31; 500000, ``deploy/k8s/worker.yaml``) caps the
+#:   entries of *one* tree;
+#: * ~80 B a line is an **estimate, not an upper bound** => ~40 MB unescaped;
+#: * the answer is one JSON line and escaping inflates it up to
+#:   ``BROKER_ESCAPE_BLOWUP`` (6x) => ~229 MiB on the wire.
+#:
+#: 512 MiB is ~2.2x that worst line, so a legitimate tree is never refused --
+#: and still deliberately *below* the worker container's ``limits.memory``
+#: (2Gi; pinned in ``tests/unit/test_worker_manifest_permissions.py``), so
+#: crossing it is this refusal and not the kernel's OOM kill first.
+#:
+#: **Single-tree, never multi.** Every caller walks one tree (``registry`` per
+#: record's workspace, ``health`` for one sandbox's workspace,
+#: ``checkpoint_store`` for one checkpoint image), and
+#: ``runtime/platform_disk.measure_platform_disk_bytes`` used to be the
+#: exception: it walked all of ``<state base>/_runtime`` -- every sandbox's
+#: platform dir plus ``.checkpoints``, which the per-tree entry cap does *not*
+#: bound -- so a legitimate answer could cross this ceiling and be refused
+#: (the accounting paths only warn, so the number would go silently stale). It
+#: now sums one ``dir_size`` per child instead; a new multi-tree caller here
+#: would re-open exactly that hole. The generic ceiling stays for ``chown`` /
+#: ``rm``, whose answers are a handful of bytes.
+BROKER_MAX_WALK_RESPONSE_BYTES = 512 * 1024 * 1024
 
 
 def _image_cache_root() -> Path | None:

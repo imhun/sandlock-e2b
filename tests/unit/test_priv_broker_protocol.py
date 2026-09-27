@@ -529,15 +529,27 @@ def test_a_chown_answer_of_the_same_size_is_not_held_to_the_walk_limit(
 
 
 def test_the_walk_read_limit_is_below_the_generic_one_and_the_worker_memory() -> None:
-    """The ordering that keeps a runaway ``walk`` a refusal instead of an OOM.
+    """The ordering that keeps a legitimate ``walk`` readable and safe.
 
-    ``BROKER_MAX_WALK_RESPONSE_BYTES`` has to stay *below* the generic
-    two-stream ceiling (so ``walk`` is the verb that reads under the smaller
-    bound) and below the worker container's ``limits.memory: 2Gi`` (so
-    crossing it is a named refusal, never the kernel's OOM kill). Swapping
-    either relation is the regression this pins.
+    The ceiling has to be:
+
+    * *above* the worst single-tree answer **on the wire** -- otherwise a
+      legitimate tree is refused (the silent-staleness bug: the accounting and
+      checkpoint paths only warn/skip). The worst tree is one at the
+      ``E2B_DISK_MAX_ENTRIES`` cap (500000, ``deploy/k8s/worker.yaml``), ~80 B
+      a line (an estimate, not an upper bound), ~40 MB unescaped, times the 6x
+      wire escape blow-up (~229 MiB). 2x that is the margin this pins;
+    * *below* the generic two-stream ceiling, so ``walk`` is the verb that
+      reads under the smaller bound;
+    * *below* the worker container's ``limits.memory`` (2Gi) so crossing it is
+      a named refusal, never the kernel's OOM kill first. That memory number
+      itself is pinned off the render in
+      ``test_worker_manifest_permissions.test_the_worker_limits_match_the_walk_derivation``
+      -- the two drift together or not at all.
     """
+    worst_single_tree_wire_bytes = 500_000 * 80 * 6
     assert ph.BROKER_MAX_WALK_RESPONSE_BYTES < ph.BROKER_MAX_RESPONSE_BYTES
+    assert ph.BROKER_MAX_WALK_RESPONSE_BYTES >= 2 * worst_single_tree_wire_bytes
     assert ph.BROKER_MAX_WALK_RESPONSE_BYTES < 2 * 1024**3
 
 

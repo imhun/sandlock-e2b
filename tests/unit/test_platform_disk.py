@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from envd_service import priv_helpers as ph
 from envd_service.priv_helpers import dir_size
 from envd_service.runtime.platform_disk import (
     checkpoint_admission,
@@ -84,6 +85,57 @@ def test_the_platform_account_uses_the_ledgers_own_arithmetic(tmp_path: Path) ->
     assert measure_platform_disk_bytes(base) == dir_size(base / "_runtime"), (
         "the platform account must be the ledger's arithmetic over the runtime dir"
     )
+
+
+def test_the_platform_account_walks_one_runtime_child_at_a_time(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``_runtime`` is measured child by child, and the number does not move.
+
+    ``_runtime`` is the *node's* namespace: every sandbox's platform dir and the
+    whole ``.checkpoints`` gate live under it, so one walk of it is a multi-tree
+    answer -- and the broker's ``walk`` answer has a single-tree sized ceiling
+    (the 500000-entry cap is a per-tree number, and the answer travels
+    JSON-escaped). So the account asks one tree per child and sums. The
+    arithmetic stays the ledger's, byte for byte: ``<runtime>``'s own directory
+    cost plus one ``dir_size`` per child -- exactly what one walk of the whole
+    runtime dir used to return.
+    """
+    workspace = tmp_path / "workspaces"
+    state = tmp_path / "state"
+    runtime = state / "_runtime"
+    # Two sandboxes' platform dirs, two levels deep...
+    (runtime / "sbx_a" / "logs").mkdir(parents=True)
+    (runtime / "sbx_a" / "logs" / "cmd.jsonl").write_bytes(b"a" * 4096)
+    (runtime / "sbx_b").mkdir(parents=True)
+    (runtime / "sbx_b" / "sandbox.json").write_bytes(b"b" * 8192)
+    # ...plus the checkpoint gate, which is a namespace of its own under the
+    # same root (and, unlike the runtime dirs, is written by the sandbox's slot).
+    image = sandbox_checkpoint_dir(workspace, "sbx_a", state_base=state) / "latest"
+    (image / "process").mkdir(parents=True)
+    (image / "process" / "memory.bin").write_bytes(b"m" * 16384)
+
+    whole = dir_size(runtime)
+    assert whole is not None, "the synthetic runtime dir must be walkable in-process"
+
+    calls: list[str] = []
+    real = ph.dir_size
+
+    def _spy(path):
+        calls.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(ph, "dir_size", _spy)
+    measured = measure_platform_disk_bytes(workspace, state_base=state)
+
+    assert measured == whole
+    # One walk per child of ``_runtime`` -- and never one walk of ``_runtime``.
+    assert sorted(Path(call).name for call in calls) == [
+        ".checkpoints",
+        "sbx_a",
+        "sbx_b",
+    ]
+    assert str(runtime) not in calls
 
 
 def test_an_absent_runtime_dir_measures_zero(tmp_path: Path) -> None:
