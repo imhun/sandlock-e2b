@@ -46,6 +46,7 @@ import dataclasses
 import errno
 import json
 import os
+import select
 import shutil
 import signal
 import socket
@@ -66,6 +67,42 @@ PRIV_DIR = PROJECT_ROOT / "deploy" / "priv"
 #: broker (``PRIV_DEFAULT_MAINT_BIN``), precisely so that no setting can move
 #: the trust. The test lane therefore installs the freshly built binary there.
 INSTALLED_BROKER = Path("/var/lib/e2b-priv/e2b-maint")
+
+
+def _require_disposable_container() -> None:
+    """Refuse loudly unless this really is the lane's one-shot container.
+
+    This module (and ``test_broker_socket_identity.py`` with it) overwrites the
+    *image's* ``/var/lib/e2b-priv/e2b-maint`` -- in the identity lane with its
+    capability xattr -- and puts the original back at teardown. That is only
+    ever legitimate where the file belongs to a container the image built:
+    on a Linux **root** development machine the same path is the host's real
+    installation, so the overwrite would land in (and, after a hard kill
+    between the two, stay in) the host's privileged broker. ``serve`` also
+    refuses to run from any other path, so there is no "harmless" variant of
+    this mistake to point the lane at instead.
+
+    An explicit ``RuntimeError`` and not a skip: a silently skipped lane is
+    indistinguishable from a passing one in a summary line, and the shape
+    below (root, ``SO_PEERCRED``, ``chown``, AF_UNIX) is the only place these
+    guarantees are exercised at all.
+    """
+    in_container = any(
+        marker.exists()
+        for marker in (Path("/.dockerenv"), Path("/run/.containerenv"))
+    )
+    if os.geteuid() != 0 or not in_container:
+        raise RuntimeError(
+            "this lane only runs inside the one-shot test container "
+            "(e2b-sandlock-test:latest, as root, with /.dockerenv or "
+            "/run/.containerenv present): it replaces the installed broker "
+            f"{INSTALLED_BROKER} in place and restores it at teardown, which "
+            "outside that container means writing the host's own "
+            "installation"
+        )
+
+
+_require_disposable_container()
 
 #: This module's own pool segment. The gate is a range membership test, so a
 #: daemon started here must not overlap another lane's pool -- and the chown
@@ -251,6 +288,20 @@ class _Serve:
     socket: Path
     process: subprocess.Popen
     _output: tuple[bytes, bytes] | None = None
+    _log: str = ""
+
+    def log(self) -> str:
+        """What the daemon has logged so far -- without waiting for it to exit.
+
+        The daemon's own account of a connection ("refused: ...", one line per
+        connection, written *before* the answer goes to the socket) is the only
+        evidence that survives the peer, so a test that hangs up on it has to
+        read it while the process is still up. Non-blocking, and accumulated:
+        ``stop`` returns the whole log rather than only whatever was left in
+        the pipe.
+        """
+        self._log += _read_available(self.process.stderr)
+        return self._log
 
     def stop(self) -> str:
         """Kill the daemon's whole process group and return what it logged."""
@@ -258,7 +309,20 @@ class _Serve:
             if self.process.poll() is None:
                 os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
             self._output = self.process.communicate(timeout=30)
-        return self._output[1].decode()
+        self._log += self._output[1].decode()
+        return self._log
+
+
+def _read_available(stream) -> str:
+    """Everything readable on ``stream`` right now (never blocks)."""
+    fd = stream.fileno()
+    out = b""
+    while select.select([fd], [], [], 0)[0]:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break  # EOF: the writer (or its pipe) is gone
+        out += chunk
+    return out.decode()
 
 
 def _snapshot(path: Path) -> tuple[bytes, int, int, int, bytes | None] | None:
@@ -462,6 +526,35 @@ def _await_handlers(handle: _Serve, count: int, timeout: float = 15.0) -> None:
     pytest.fail(
         f"the broker never reached {count} handlers (saw {len(_handlers(handle))})"
     )
+
+
+def _await_log(handle: _Serve, expected: str, timeout: float = 15.0) -> None:
+    """Poll the daemon's own log until it is exactly ``expected``.
+
+    The alternative -- a fixed sleep, then "the daemon is still up" -- leaves
+    a reviewer to take two things on trust (that the writes landed inside the
+    window, and that nothing was killed after it). Polling for the daemon's
+    account of every connection makes it explicit: one "refused: ..." line per
+    connection is written *before* its answer goes to the socket, so it exists
+    regardless of what happened to that answer, and a daemon that died on
+    SIGPIPE stops logging -- so a short log and a dead process both fail here,
+    as soon as they happen.
+    """
+    deadline = time.monotonic() + timeout
+    log = handle.log()
+    while log != expected:
+        if handle.process.poll() is not None:
+            log = handle.log()
+            if log != expected:
+                pytest.fail(
+                    f"the broker exited (rc={handle.process.returncode}) with "
+                    f"{log!r} logged, expected {expected!r}"
+                )
+            return
+        if time.monotonic() >= deadline:
+            pytest.fail(f"the broker logged {log!r}, expected {expected!r}")
+        time.sleep(0.01)
+        log = handle.log()
 
 
 def _connect_as(uid: int, socket_path: Path) -> str:
@@ -855,6 +948,13 @@ def test_hello_rejects_a_peer_gid_mismatch(serve) -> None:
     )
 
 
+#: How many hung-up peers the regression sends at one daemon. One would do
+#: (measured: the daemon's very first write to a dead socket is the one that
+#: matters); 25 keeps the burst the wave-1 report described while staying far
+#: below PRIV_MAX_HANDLERS (32), so the handlers' own exit is what frees them.
+HUNG_UP_CONNECTIONS = 25
+
+
 def test_a_peer_that_hangs_up_cannot_take_the_broker_down(serve) -> None:
     """``connect()`` then ``close()`` at once, against both serving paths.
 
@@ -865,19 +965,41 @@ def test_a_peer_that_hangs_up_cannot_take_the_broker_down(serve) -> None:
     worker's own transport cancelling a request. ``Popen`` restores default
     signal dispositions, so this daemon really does start with SIGPIPE at its
     default: this is the regression, not a mocked one.
+
+    The evidence is the daemon's own log instead of a sleep: every hung-up
+    connection leaves exactly one refusal line *before* its answer is written
+    (the accepted path refuses an empty request, the gated one refuses the
+    peer), so the burst is waited out by polling for those lines. A daemon
+    that took SIGPIPE on a dead write stops at one line and exits -- which is
+    what makes "red" here a certainty rather than a race inside a fixed
+    timing window.
     """
     stranger = _peer_uid() + 1
+    refusal = f"peer uid {_peer_uid()} does not match E2B_BROKER_PEER_UID={stranger}"
     refused = serve("hangup-refused", E2B_BROKER_PEER_UID=str(stranger))
     served = serve("hangup-served")
-    _await_listening(served)
-    _await_listening(refused)
-
+    # Readiness by each daemon's own "serving on" line: a request would answer
+    # here (a refusal *is* an answer) and add a line to the count below.
     for handle in (refused, served):
-        for _ in range(25):
+        _await_log(handle, f"e2b-maint: serving on {handle.socket}\n")
+
+    for handle, refusal_line in (
+        (refused, f"e2b-maint: refused: {refusal}\n"),
+        (served, "e2b-maint: refused: empty request\n"),
+    ):
+        for _ in range(HUNG_UP_CONNECTIONS):
             client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             client.connect(str(handle.socket))
             client.close()  # no read, no shutdown: just gone
-        time.sleep(0.3)  # the window in which those writes land
+            # Give the daemon room to accept this one before the next: what
+            # this pins is the write to a peer that is *already* gone, and a
+            # connection the daemon never accepted would prove nothing.
+            time.sleep(0.01)
+        _await_log(
+            handle,
+            f"e2b-maint: serving on {handle.socket}\n"
+            + refusal_line * HUNG_UP_CONNECTIONS,
+        )
         assert handle.process.poll() is None
 
     # And both are still serving.
@@ -960,6 +1082,77 @@ def test_serve_refuses_connections_over_the_handler_cap(serve, tmp_path: Path) -
             break
         assert time.monotonic() < deadline, final
         time.sleep(0.02)
+
+
+def test_a_silent_peer_is_refused_and_the_broker_keeps_serving(serve) -> None:
+    """A connection that says nothing is answered ``ok:false`` and closed.
+
+    The peer gate runs before the fork, so a peer that reaches a handler is an
+    authenticated one -- and an authenticated peer whose transport wedges is
+    exactly the shape that used to park a handler for as long as it liked: the
+    cap (PRIV_MAX_HANDLERS) then turns 32 silent connections into a broker that
+    accepts every worker on the node and serves none of them, without a single
+    failure to look at. Reading the request therefore has a deadline
+    (``E2B_BROKER_REQUEST_READ_MS``, an operator's knob -- see
+    PRIV_DEFAULT_REQUEST_READ_MS for why the node's broker owns that value).
+
+    The test names a small deadline on purpose: the default is 30 s of
+    protection, and spending it here would buy nothing. Both halves matter --
+    the connection is refused inside the deadline *and* with a named error,
+    and the daemon is still there afterwards, serving the next caller.
+    """
+    handle = serve("read-deadline", E2B_BROKER_REQUEST_READ_MS="400")
+    _await_listening(handle)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    # The refusal has to *arrive*, not merely be decided; without a timeout a
+    # broker that never answers would hang this lane instead of failing it.
+    client.settimeout(10.0)
+    try:
+        client.connect(str(handle.socket))
+        started = time.monotonic()
+        raw = b""
+        while b"\n" not in raw:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            raw += chunk
+        elapsed = time.monotonic() - started
+    finally:
+        client.close()
+
+    assert _response(raw) == {
+        "v": 1,
+        "ok": False,
+        "error": "the request was not sent within 400 ms",
+    }
+    # Not before the deadline (a refusal that never waited would be a
+    # different path), and not long after it.
+    assert 0.3 <= elapsed <= 3.0
+    # Fail closed, never self-harm: the refusal cost this one handler.
+    assert handle.process.poll() is None
+    assert (
+        _request(handle.socket, {"v": 1, "hello": True}, process=handle.process)[
+            "ok"
+        ]
+        is True
+    )
+
+
+def test_serve_refuses_an_unusable_request_read_deadline(serve) -> None:
+    """The knob is a startup gate, like the peer identity and the uid pool.
+
+    A value the daemon cannot read must stop it from serving: the alternative
+    is a broker that answers every request with a message its caller cannot
+    act on (and, with a deadline of 0, one that never reads a request at all).
+    """
+    handle = serve("bad-read-ms", E2B_BROKER_REQUEST_READ_MS="0")
+
+    assert handle.process.wait(timeout=30) == 77
+    assert handle.stop() == (
+        "e2b-maint: refused: invalid request read deadline: "
+        "E2B_BROKER_REQUEST_READ_MS must be a positive number of milliseconds "
+        "(got '0')\n"
+    )
 
 
 def test_walk_escapes_a_non_utf8_name_like_python_does(
@@ -1045,7 +1238,11 @@ def test_the_streaming_escaper_never_stalls(tmp_path: Path) -> None:
     answer. The C layer is where this can be driven directly -- a `walk`
     response always ends in a newline, so the daemon path cannot reach the
     shape -- and the harness calls the same two functions the writer calls, in
-    the same 4 KiB loop.
+    the same 4 KiB loop. What the harness has to produce is checked as the
+    consumer's round trip (`json.loads` of the escaped stream is
+    `os.fsdecode` of the payload), for an illegal tail *and* for a legal
+    character straddling the chunk boundary: the two shapes the writer cannot
+    be allowed to treat alike.
     """
     source = tmp_path / "escape_harness.c"
     source.write_text(ESCAPE_HARNESS)
@@ -1069,20 +1266,31 @@ def test_the_streaming_escaper_never_stalls(tmp_path: Path) -> None:
     assert build.returncode == 0, build.stderr
     assert build.stderr == ""
 
-    # 4096 bytes whose last byte is a lead byte: the final chunk is exactly the
-    # incomplete sequence.
-    payload = b"a" * 4095 + b"\xf0"
+    cases = {
+        # 4096 bytes whose last byte is a lead byte: the final chunk is exactly
+        # the incomplete sequence.
+        "incomplete-tail": b"a" * 4095 + b"\xf0",
+        # ...and one whose 4 KiB boundary falls *inside* a legal two-byte
+        # sequence, so the chunker has to back off rather than split it.
+        "boundary-inside-a-character": b"a" * 4095 + "\u00e9".encode("utf-8"),
+    }
     data = tmp_path / "payload.bin"
-    data.write_bytes(payload)
+    for name, payload in cases.items():
+        data.write_bytes(payload)
+        run = subprocess.run(
+            [str(harness), str(data)], capture_output=True, text=True, timeout=30
+        )
 
-    run = subprocess.run(
-        [str(harness), str(data)], capture_output=True, text=True, timeout=30
-    )
-
-    assert run.returncode == 0, run.stderr
-    # Byte for byte what Python's own surrogateescape spelling of that payload
-    # is, so the caller's `json.loads` gets back `os.fsdecode(payload)`.
-    assert run.stdout == json.dumps(os.fsdecode(payload))[1:-1]
+        assert run.returncode == 0, (name, run.stderr)
+        # The invariant is the round trip, not one spelling of one payload:
+        # whatever the harness emits, the caller's `json.loads` has to hand
+        # back exactly what `os.fsdecode` made of those bytes. Comparing the
+        # two spellings byte for byte only ever held for payloads that were
+        # pure ASCII plus isolated illegal bytes -- `json.dumps` writes a legal
+        # non-ASCII character as `\uXXXX` while the writer emits its UTF-8
+        # bytes -- which made the assertion narrower than the contract it was
+        # standing in for.
+        assert json.loads('"' + run.stdout + '"') == os.fsdecode(payload), name
 
 
 def test_serve_refuses_to_run_from_a_copy(broker_bin: Path, tmp_path: Path) -> None:

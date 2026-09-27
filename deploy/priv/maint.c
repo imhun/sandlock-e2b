@@ -69,9 +69,14 @@
  * unauthorized peer costs one refused answer and never a child. A fork error
  * or too many handlers (PRIV_MAX_HANDLERS) refuses that one connection and
  * leaves the daemon serving: nothing a local peer does may take the node's
- * broker down. That includes hanging up mid-answer: SIGPIPE is ignored and the
- * socket writes pass MSG_NOSIGNAL, because the refusal path writes from the
- * *parent* and a signal there would end the broker.
+ * broker down. A peer that connects and then says nothing is bounded the same
+ * way -- the request read has a deadline (`E2B_BROKER_REQUEST_READ_MS`, 30 s
+ * by default: an operator's knob for this daemon, see the constant), so a
+ * silent connection costs its one handler and is answered `ok:false` instead
+ * of parking a handler (of the 32 there are) forever. That includes hanging up
+ * mid-answer: SIGPIPE is ignored and the socket writes pass MSG_NOSIGNAL,
+ * because the refusal path writes from the *parent* and a signal there would
+ * end the broker.
  *
  * Output is JSON, so every byte of it has to be. A path is not necessarily
  * UTF-8 (a Linux filename may be any byte but NUL and '/'), and one such name
@@ -111,6 +116,26 @@
  * bytes already on their way down a local socket (which is what keeps the
  * answer from being destroyed by RST). */
 #define PRIV_REFUSAL_WAIT_MS 50
+/* How long a handler waits for its request line, in milliseconds
+ * (`E2B_BROKER_REQUEST_READ_MS` overrides it). A **bounded** read, and this is
+ * an operator's knob for the node's broker -- not a test switch. The peer gate
+ * runs before the fork, so the peer that reaches a handler is an
+ * authenticated one; but "authenticated" is not "well behaved": a worker that
+ * connects and then says nothing (a wedged transport, a cancelled request, a
+ * half-open connection) would otherwise hold that handler for as long as it
+ * likes, and handlers are capped (PRIV_MAX_HANDLERS, 32). Enough silent
+ * connections and the node's broker is holding every handler without serving
+ * anyone -- one peer taking the whole node's privileged steps away from the
+ * other workers on it. Past the deadline the connection is answered
+ * `ok:false` and closed, exactly like any other refusal: fail closed, never
+ * self-harm (the daemon keeps serving, and the handler it spent is freed).
+ *
+ * 30 s is three orders of magnitude above what sending one <= 64 KiB request
+ * over a local socket takes, so no working caller can reach it, while a
+ * dead-but-connected peer is bounded. Tighten it on a site whose workers are
+ * known to answer in milliseconds; the cost of a too-small value is that a
+ * slow caller's request is refused instead of served. */
+#define PRIV_DEFAULT_REQUEST_READ_MS 30000
 /* Per stream, not per response: `walk` legitimately prints megabytes, and the
  * cap is where the daemon kills the producer. */
 #define PRIV_MAX_OUTPUT ((unsigned long long)256 * 1024 * 1024)
@@ -1117,19 +1142,87 @@ static int run_child(char *const *args, long timeout_s, long peer_uid,
 
 /* --------------------------------------------------------------- reading -- */
 
+/* The request-read deadline: `E2B_BROKER_REQUEST_READ_MS` (milliseconds) or
+ * PRIV_DEFAULT_REQUEST_READ_MS. See the constant for why the read is bounded
+ * at all; a value that cannot be read is a deployment defect (`serve` refuses
+ * to start on it), not something to guess at. */
+static int request_read_ms(long *out, char *err, size_t errlen) {
+    const char *text = getenv("E2B_BROKER_REQUEST_READ_MS");
+    char *end = NULL;
+    long value;
+
+    if (text == NULL || *text == '\0') {
+        *out = PRIV_DEFAULT_REQUEST_READ_MS;
+        return 0;
+    }
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value <= 0 ||
+        value > INT_MAX) {
+        snprintf(err, errlen,
+                 "E2B_BROKER_REQUEST_READ_MS must be a positive number of "
+                 "milliseconds (got '%s')",
+                 text);
+        return -1;
+    }
+    *out = value;
+    return 0;
+}
+
 /* One line, at most PRIV_MAX_REQUEST bytes. An over-long line keeps being read
  * (and thrown away) so the refusal arrives as a response instead of as the
- * kernel's RST on a connection closed with unread input. */
+ * kernel's RST on a connection closed with unread input.
+ *
+ * The whole read is also bounded in *time* (request_read_ms): `poll` before
+ * each read, one deadline for the request, and a peer that never sends is
+ * refused by name -- the alternative is a handler (of the 32 there are)
+ * parked on a peer that will never speak. Nothing here exits the daemon. */
 static int read_request(int fd, char **out, size_t *out_len, char *err,
                         size_t errlen) {
     char scratch[4096];
     char *buffer = NULL;
     size_t len = 0, cap = 0, drained = 0;
+    long budget_ms = PRIV_DEFAULT_REQUEST_READ_MS;
+    long long deadline;
     int over_limit = 0;
+
+    if (request_read_ms(&budget_ms, err, errlen) != 0) {
+        return -1;
+    }
+    deadline = now_ms() + budget_ms;
     for (;;) {
-        ssize_t got = read(fd, scratch, sizeof(scratch));
+        struct pollfd waiter;
+        long long remaining = deadline - now_ms();
+        ssize_t got;
         char *newline;
         size_t chunk;
+
+        if (remaining <= 0) {
+            free(buffer);
+            snprintf(err, errlen, "the request was not sent within %ld ms",
+                     budget_ms);
+            return -1;
+        }
+        waiter.fd = fd;
+        waiter.events = POLLIN;
+        waiter.revents = 0;
+        if (poll(&waiter, 1,
+                 remaining > INT_MAX ? INT_MAX : (int)remaining) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            free(buffer);
+            snprintf(err, errlen, "reading the request failed: %s",
+                     strerror(errno));
+            return -1;
+        }
+        if (waiter.revents == 0) {
+            free(buffer);
+            snprintf(err, errlen, "the request was not sent within %ld ms",
+                     budget_ms);
+            return -1;
+        }
+        got = read(fd, scratch, sizeof(scratch));
         if (got < 0) {
             if (errno == EINTR) {
                 continue;
@@ -1436,6 +1529,7 @@ static int serve(const char *socket_path) {
     char exe[PATH_MAX];
     char err[PRIV_ERR_LEN];
     long peer_uid, peer_gid, pool_start, pool_size;
+    long read_ms = PRIV_DEFAULT_REQUEST_READ_MS;
     long conn_uid, conn_gid;
     int live_handlers = 0;
     int fd;
@@ -1448,7 +1542,15 @@ static int serve(const char *socket_path) {
      * every request with a message the caller cannot act on. */
     priv_peer_identity(&peer_uid, &peer_gid);
     priv_uid_pool(&pool_start, &pool_size);
+    /* The request-read deadline is the third startup gate, for the same
+     * reason as the other two: an unreadable value must stop the broker from
+     * serving, not turn every request into a refusal the caller cannot act
+     * on. */
+    if (request_read_ms(&read_ms, err, sizeof(err)) != 0) {
+        priv_fail("invalid request read deadline: %s", err);
+    }
     (void)peer_uid;
+    (void)read_ms;
     (void)pool_start;
     (void)pool_size;
     if (strlen(socket_path) >= sizeof(addr.sun_path)) {

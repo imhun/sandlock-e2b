@@ -389,6 +389,33 @@ def test_socket_transport_rejects_a_response_that_is_not_version_1(
     )
 
 
+def test_socket_transport_rejects_an_ok_that_is_not_a_boolean(
+    tmp_path: Path, fake_daemon
+) -> None:
+    """``ok`` has to be a *boolean* -- a truthy string is not a completed step.
+
+    The envelope check is the whole difference between "the broker ran the
+    request" and "the broker said something that reads as truthy": ``if
+    response["ok"]`` accepts ``"yes"`` (and ``1``, and ``[0]``), so a
+    hand-rolled or truncated-and-repaired answer would be reported as a
+    privileged step that happened. Both halves are pinned: the refusal is
+    raised at all, and it names ``ok``.
+    """
+    daemon = fake_daemon(lambda request: {"v": 1, "ok": "yes", "exit": 0})
+    helpers = _helpers(tmp_path, socket_path=daemon.socket_path)
+    target = helpers.workspace_base / "sbx_a"
+    target.mkdir()
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        helpers.remove(target)
+
+    assert str(excinfo.value) == (
+        f"the maintenance broker at {daemon.socket_path} answered "
+        f'{json.dumps({"v": 1, "ok": "yes", "exit": 0})!r}, whose "ok" is not '
+        "a boolean"
+    )
+
+
 def test_socket_transport_raises_on_a_timeout(
     tmp_path: Path, fake_daemon, monkeypatch
 ) -> None:
@@ -412,6 +439,40 @@ def test_socket_transport_raises_on_a_timeout(
 
     assert str(excinfo.value) == (
         f"the maintenance broker at {daemon.socket_path} is unreachable: timed out"
+    )
+
+
+def test_socket_transport_refuses_an_answer_over_the_read_limit(
+    tmp_path: Path, fake_daemon, monkeypatch
+) -> None:
+    """The one-line answer is read with a ceiling, not with a timer alone.
+
+    A socket timeout bounds how *long* the worker waits, not how many bytes it
+    buffers, and the daemon's own output cap does not bound the line either:
+    it counts **unescaped** bytes, and the daemon writes every undecodable
+    filename byte as ``\\udcXX`` -- six times the size it judged. So the
+    ceiling here is that cap at the escape blow-up (times both streams); the
+    test drives it with an injected small value instead of producing 256 MiB,
+    and asserts that crossing it is a refusal that names the limit (not a
+    ``MemoryError``, and not a worker that keeps reading forever).
+    """
+    monkeypatch.setattr(ph, "BROKER_MAX_RESPONSE_BYTES", 4096)
+    daemon = fake_daemon(
+        lambda request: {"v": 1, "ok": True, "exit": 0, "stdout": "x" * 8192}
+    )
+    helpers = _helpers(tmp_path, socket_path=daemon.socket_path)
+    target = helpers.workspace_base / "sbx_a"
+    target.mkdir()
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        helpers.remove(target)
+
+    assert str(excinfo.value) == (
+        f"the maintenance broker at {daemon.socket_path} answered more than "
+        "4096 bytes without a newline: refusing to buffer an answer over the "
+        "limit (the daemon caps one stream at 256 MiB of unescaped bytes and "
+        "escaping can inflate that sixfold, so nothing this broker could "
+        "answer legitimately is longer than this line)"
     )
 
 
@@ -773,6 +834,43 @@ def test_missing_socket_refuses_to_start_when_transport_is_socket(
         f"{tmp_path / 'gone.sock'} does not exist: start the per-node broker "
         "before the worker (an explicit socket shape must not silently fall "
         "back to the file-capability binaries)"
+    )
+
+
+def test_socket_transport_still_needs_the_local_slot_spawn(
+    tmp_path: Path, monkeypatch, fake_daemon
+) -> None:
+    """``e2b-slot-spawn`` is never externalized, so the socket shape needs it.
+
+    Only ``chown``/``rm``/``walk`` travel to the node's daemon; a route-B slot
+    has to start inside *this* pod's namespaces, so ``spawn_argv`` runs the
+    local binary in both transports. Without this gate the shape resolved with
+    no binary at all (the exec branch's "no broker installed" answer leaked
+    into the branch that has a daemon) and the missing file only surfaced at
+    the first ``Sandbox.create()`` -- a half-installed broker has to be named
+    at startup. The check is local, so no handshake is involved.
+    """
+    monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "socket")
+    _stub_worker_identity(monkeypatch)
+    # A daemon that would agree, and a helper directory the image did *not*
+    # populate: nothing in it, not even the binary the worker still runs.
+    monkeypatch.setattr(ph, "DEFAULT_HELPER_DIR", tmp_path / "e2b-priv")
+    daemon = fake_daemon(
+        lambda request: _hello([str(_workspace(tmp_path)), str(_shared(tmp_path))]),
+        name="uninstalled.sock",
+    )
+    monkeypatch.setenv("E2B_PRIV_HELPER_SOCKET", str(daemon.socket_path))
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        ph.resolve_priv_helpers(_settings(tmp_path))
+
+    assert str(excinfo.value) == (
+        f"E2B_PRIV_HELPER_TRANSPORT=socket but the local "
+        f"{ph.SLOT_SPAWN_NAME} ({tmp_path / 'e2b-priv' / 'e2b-slot-spawn'}) is "
+        "missing: route-B slots start inside this worker's own namespaces, so "
+        "e2b-slot-spawn is never handed to the node's daemon -- a socket shape "
+        "without it is a half-installed broker and is named at startup, not at "
+        "the first Sandbox.create()"
     )
 
 
