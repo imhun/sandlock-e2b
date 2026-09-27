@@ -1900,7 +1900,8 @@ class SandlockExecutor(Executor):
         sandbox creation instead of silently sending the request
         unauthenticated. Every value is resolved *before* the first file is
         written, so that failure leaves the secrets dir exactly as it found
-        it.
+        it. The returned entries keep the input order, env- and file-backed
+        alike (a header rule's order is part of what the caller configured).
         """
         if not entries:
             return []
@@ -1922,7 +1923,10 @@ class SandlockExecutor(Executor):
         # while the secrets dir is still empty; the write phase below cannot
         # raise from resolution at all.
         out: list[dict] = []
-        pending: list[tuple[dict, str]] = []
+        # Phase 2 walks this in input order, so an env-backed entry (whose
+        # value is already final and needs no file: ``None``) keeps its place
+        # among the file-backed ones instead of being hoisted to the front.
+        pending: list[tuple[dict, str | None]] = []
         for entry in entries:
             value = str(entry["value"])
             m = placeholder.fullmatch(value)
@@ -1939,7 +1943,7 @@ class SandlockExecutor(Executor):
                 entry = dict(entry)
                 entry.pop("value", None)
                 entry["secret"] = f"env:{var}"
-                out.append(entry)
+                pending.append((entry, None))
                 continue
             if "${e2b.identity.tokens." in value:
 
@@ -1968,6 +1972,11 @@ class SandlockExecutor(Executor):
         from envd_service import priv_helpers
 
         for entry, value in pending:
+            if value is None:
+                # The env-backed entry was finished in phase 1; only its place
+                # in the order is owed here.
+                out.append(entry)
+                continue
             secret_dir = self._secrets_dir / os.path.basename(
                 self._workspace_dir.rstrip("/")
             )

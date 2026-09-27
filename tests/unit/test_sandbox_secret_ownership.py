@@ -495,3 +495,101 @@ def test_a_sticky_parent_directory_refuses_the_reclaim(tmp_path, monkeypatch):
         "parent owned by the worker with no sticky bit -- who chowned it or "
         "set its mode?"
     )
+
+
+def _mixed_entries() -> list[dict]:
+    """env -> file -> env -> file: both sources, alternating."""
+    return [
+        {
+            "matcher": "api.example.com",
+            "auth": "header:X-First-Key",
+            "value": "${e2b.identity.tokens.FIRST}",
+            "name": "hdr_0_env",
+            "on_existing": "replace",
+        },
+        {
+            "matcher": "api.example.com",
+            "auth": "header:X-Second-Key",
+            "value": "sk-second",
+            "name": "hdr_1_file",
+            "on_existing": "replace",
+        },
+        {
+            "matcher": "api.example.com",
+            "auth": "header:X-Third-Key",
+            "value": "${e2b.identity.tokens.THIRD}",
+            "name": "hdr_2_env",
+            "on_existing": "replace",
+        },
+        {
+            "matcher": "api.example.com",
+            "auth": "header:X-Fourth-Key",
+            "value": "sk-fourth",
+            "name": "hdr_3_file",
+            "on_existing": "replace",
+        },
+    ]
+
+
+def test_env_and_file_entries_keep_their_input_order(tmp_path, monkeypatch):
+    """Resolving first must not reorder what the caller configured.
+
+    The two passes exist to make publishing all-or-nothing, and an env-backed
+    entry is finished in the first pass (it becomes ``env:<VAR>`` and never
+    touches the disk). Appending it there while file-backed entries wait for
+    the second pass turned ``[env, file, env, file]`` into
+    ``[env, env, file, file]`` -- the same values, in an order the caller did
+    not ask for, so two rules for one matcher/header would flip which one wins.
+    """
+    host = _Host(euid=WORKER_UID, covers=True)
+    _install(monkeypatch, host, tmp_path / "secrets")
+    monkeypatch.setenv("E2B_IDENTITY_TOKEN_FIRST", "jwt-first")
+    monkeypatch.setenv("E2B_IDENTITY_TOKEN_THIRD", "jwt-third")
+
+    out = _executor(tmp_path)._materialize_http_inject(_mixed_entries())
+
+    secret_dir = tmp_path / "secrets" / "sbx_1"
+    assert [entry["name"] for entry in out] == [
+        "hdr_0_env",
+        "hdr_1_file",
+        "hdr_2_env",
+        "hdr_3_file",
+    ]
+    assert out == [
+        {
+            "matcher": "api.example.com",
+            "auth": "header:X-First-Key",
+            "name": "hdr_0_env",
+            "on_existing": "replace",
+            "secret": "env:E2B_IDENTITY_TOKEN_FIRST",
+        },
+        {
+            "matcher": "api.example.com",
+            "auth": "header:X-Second-Key",
+            "name": "hdr_1_file",
+            "on_existing": "replace",
+            "secret": f"file:{secret_dir / 'hdr_1_file.secret'}",
+        },
+        {
+            "matcher": "api.example.com",
+            "auth": "header:X-Third-Key",
+            "name": "hdr_2_env",
+            "on_existing": "replace",
+            "secret": "env:E2B_IDENTITY_TOKEN_THIRD",
+        },
+        {
+            "matcher": "api.example.com",
+            "auth": "header:X-Fourth-Key",
+            "name": "hdr_3_file",
+            "on_existing": "replace",
+            "secret": f"file:{secret_dir / 'hdr_3_file.secret'}",
+        },
+    ]
+    assert host.events == [
+        ("unlink", str(secret_dir / "hdr_1_file.secret")),
+        ("open", str(secret_dir / "hdr_1_file.secret"), 0o600),
+        ("broker_chown", SANDBOX_UID, str(secret_dir / "hdr_1_file.secret"), False),
+        ("unlink", str(secret_dir / "hdr_3_file.secret")),
+        ("open", str(secret_dir / "hdr_3_file.secret"), 0o600),
+        ("broker_chown", SANDBOX_UID, str(secret_dir / "hdr_3_file.secret"), False),
+    ]
