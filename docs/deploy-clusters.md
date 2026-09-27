@@ -303,8 +303,15 @@ peer 身份 `ping` 回 `ok:true` 且四根一致；
 | `E2B_PLATFORM_DISK_MB` | `8192` | checkpoint 图的平台账上限 |
 | `E2B_BASE_IMAGE` | `…python-mcp:3.14@sha256:3675662d…` | MCP-capable 基镜像（digest 固定，见 §12） |
 
-`E2B_PURE_ROOTFS` **未设** ⇒ 走代码默认 `off`（pure 部署时是 identity 形态；生产是 image-rootfs，
-不受它影响）。
+`E2B_PURE_ROOTFS` **未设** ⇒ 走代码默认 **`synth`**（2026-09-27 起；N16 合成骨架 + 真根，`E2B_REAL_ROOT`
+未显式设置时跟着它走 —— `envd_service/config.py::resolve_real_root`）。**退回杆是一句话**：
+`E2B_PURE_ROOTFS=off`（回到 N15 的 identity 根）。生产是 image-rootfs（两套清单都设 `E2B_BASE_IMAGE`），
+不受它影响；只有**不带 base image** 的 pure 部署 / 本地池才用到这条默认，见
+`docs/production-deployment-requirements.md` §2.4.11。**2026-09-28 直接问线上 worker**（镜像
+`0.1.0-721-g01e4b72-20260927-231235`，`kubectl exec e2b-worker-0 -- python3 -c …`）：把两个键从进程环境里
+去掉后 `pure_rootfs=synth`、`resolve_real_root(pure_shape=True)=True`、`resolve_real_root(pure_shape=False)=False`
+（image 形态不变）；显式 `E2B_REAL_ROOT=0` + `synth` 时 `check_pure_rootfs_pairing` 按名拒绝
+（`E2B_PURE_ROOTFS=synth without E2B_REAL_ROOT=1: …`）—— 即**线上跑的这份镜像就是新默认**。
 
 **别把 `python-mcp:3.14` 当稳定引用**：`deploy/docker/Dockerfile.mcp-base` 用的是
 `pip install --no-cache-dir mcp uvicorn`，**没有钉版本**，所以每次重建它都可能产出不同内容 ——
@@ -587,7 +594,7 @@ basename**（2026-09-27 起：chain 半边跟着 `--state-base` 走，探针会�
 |---|---|---|---|---|
 | **image-rootfs（生产）** | `probe … cluster`（真集群、真 `Sandbox`） | `ENOENT` ×4 | 3 层（`/home/user` → `/home` → 沙箱自己的 `/`），无泄漏 | **0** |
 | **pure + 合成根 + 真根**（N16） | `probe … lane --shape synth-realroot --layout n27` | `ENOENT` ×4 | 3 层（合成根），无泄漏 | **0** |
-| **pure + identity（无根，N15）** | `probe … lane --shape identity --layout n27` | `EACCES` ×4（**读不到 ✔**） | ✘ 在 `<export>` 一层列出 `["_secrets", "state"]` | **1** |
+| **pure + identity（无根，N15；2026-09-27 前是默认，现在是退回杆）** | `probe … lane --shape identity --layout n27` | `EACCES` ×4（**读不到 ✔**） | ✘ 在 `<export>` 一层列出 `["_secrets", "state"]` | **1** |
 | 对照：**迁移前布局** | `probe … lane --shape identity --layout legacy` | 状态目录**本身可 `stat`**（该层还列出 `_runtime` / `.route-b` / `_secrets`） | ✘ | **1** |
 | pure + 合成根 + 模拟根 | `probe … lane --shape synth-emulated --layout n27` | — | — | **2**（`LANE VACUOUS`）：起不来（`SlotRefusal: instance is closed`，checker 一次都没跑到）⇒ 形态不可服务 —— N16 守卫要求 `E2B_PURE_ROOTFS=synth` 必须配 `E2B_REAL_ROOT=1`；**2026-09-27 之前这一档是 traceback + `exit 1`**（与"反例成立"同一个退出码），现已由探针改成 VACUOUS |
 
@@ -603,10 +610,10 @@ basename**（2026-09-27 起：chain 半边跟着 `--state-base` 走，探针会�
 **2026-09-27 复核（同一探针、三档重跑；原始输出 `tmp/k0s/n27resid-{identity-n27,synth-realroot-n27,identity-legacy}.log`）**：结论逐字未变，并把"要让**默认**形态也消掉该做什么"补齐 ——
 
 - `--shape synth-realroot --layout n27`（`E2B_PURE_ROOTFS=synth` + `E2B_REAL_ROOT=1`）⇒ `exit 0`，`stat=PASS`（`ENOENT` ×4）、`chain=PASS`（3 层 = 沙箱自己的合成根；`<export>` **根本不在链上**）⇒ **N16 已消掉"能列出名字"**。
-- `--shape identity --layout n27`（`E2B_PURE_ROOTFS=off`，**默认**）⇒ `exit 1`，`stat=PASS`（`EACCES` ×4 —— **不是** `ENOENT`）、`chain=FAIL`，`LEAK ["_secrets", "state"]` ⇒ **残差仍在**（就是本表的 identity 那一行）。
+- `--shape identity --layout n27`（`E2B_PURE_ROOTFS=off` —— **切换前是默认档**，2026-09-27 起它只是退回杆）⇒ `exit 1`，`stat=PASS`（`EACCES` ×4 —— **不是** `ENOENT`）、`chain=FAIL`，`LEAK ["_secrets", "state"]` ⇒ **残差仍在，但不再属于默认形态**（就是本表的 identity 那一行）。
 - `--shape identity --layout legacy`（反例档）⇒ `exit 1`，`stat=FAIL`（状态目录**本身**可 `stat`：`OK mode=0o40755`）、`chain=FAIL`，`LEAK [".route-b", "_runtime", "_secrets"]` ⇒ **判据不是恒真的空检查**。
 
-**要让默认形态也消掉，只有一步：把 `E2B_PURE_ROOTFS` 的默认值从 `off` 切到 `synth`。** 代价/风险三条 —— ① pure 形态**每沙箱一份骨架目录**（`<workspace base>/_pure_rootfs/<id>`：普通目录 + bind 系统目录 + 整棵 `/dev` + `pivot_root`；`gateway_common.paths.PURE_ROOTFS_DIR_NAME`）；② **依赖 `E2B_REAL_ROOT=1`** —— `synth` 配 `REAL_ROOT=0` 结构性不成立（本轮 `--shape synth-emulated` 实测起不来，按 VACUOUS `exit 2` 报；N16 的成对守卫还会在 worker 启动时 loud 拒）；③ **依赖 worker seccomp 档已应用**（`mount/umount2/pivot_root` 无门闩），漏了会被 worker 启动自检当场拒（见 N16/N35）。生产两条清单都设 `E2B_BASE_IMAGE` ⇒ 生产是 image-rootfs 形态、不受这次切换影响，受影响的只有 pure 部署。
+**默认档已经切了（2026-09-27 用户裁定，`098ba10`）：`E2B_PURE_ROOTFS` 默认从 `off` 切到 `synth`。** 所以现在**默认**的 pure 形态走本表第二行（`chain=PASS`），本表第三行的 identity 档降级成**显式退回杆**（`E2B_PURE_ROOTFS=off`）—— 它的残差不再属于默认形态。**2026-09-28 复核（默认档真的跑了，不是推断；日志 `tmp/n27-default-synth-lane.log` / `tmp/n27-off-identity-lane.log`）**：不设任何键（= 产品默认）时 `route_b_active=True has_root=True chroot=/tmp/…-pure-rootfs/sbx_slot_0`、`stat=PASS`（`ENOENT` ×4）、`chain=PASS`（3 层 = 合成根自己）、`exit 0`；退回杆 `E2B_PURE_ROOTFS=off` 时 `has_root=False chroot=/`、`chain=FAIL` + `LEAK ["_secrets", "state"]`、`exit 1` ⇒ **默认档的残差已消**，而判据在退回杆上仍可翻红。**切默认那天暴露的探针 bug 也在这次复核里修掉**：`lane` 会把脚本拷进沙箱当 `/home/user/n27-checker.py` 再跑 `in-sandbox`，而 `--scratch` 的默认值在解析期就去算 `parents[3]` —— 浅路径上 `IndexError: 3`，lane 报 `FAIL lane: expected exactly one VERDICT and one EXIT line, got 0 and 0`（就是默认档第一次跑出来的样子）；现在默认值只在 `lane` 里惰性求值，pin 见 `tests/unit/test_n27_probe_cli.py`。切换的三条代价/风险 —— ① pure 形态**每沙箱一份骨架目录**（`<workspace base>/_pure_rootfs/<id>`：普通目录 + bind 系统目录 + 整棵 `/dev` + `pivot_root`；`gateway_common.paths.PURE_ROOTFS_DIR_NAME`）；② **依赖 `E2B_REAL_ROOT=1`** —— `synth` 配 `REAL_ROOT=0` 结构性不成立（本轮 `--shape synth-emulated` 实测起不来，按 VACUOUS `exit 2` 报；N16 的成对守卫还会在 worker 启动时 loud 拒）；③ **依赖 worker seccomp 档已应用**（`mount/umount2/pivot_root` 无门闩），漏了会被 worker 启动自检当场拒（见 N16/N35）。生产两条清单都设 `E2B_BASE_IMAGE` ⇒ 生产是 image-rootfs 形态、不受这次切换影响，受影响的只有 pure 部署。
 
 **探针自身两处假闸本轮一并修掉**（RED→GREEN 见 `.superpowers/sdd/n27-identity-residual-report.md`）：**(a)** ② 的 chain 半边只认四条硬编码名字 ⇒ 一旦 `E2B_STATE_BASE` 的 basename 不在那四条里（例：换名成 `platform`）就**失明** —— `<export>` 照旧列着那个名字，探针却报 `chain=PASS`；现在 chain 半边跟着 `--state-base` 走，并把这一轮真正在守的名字打成 `CHECKER-WATCHED`。**(b)** lane 在 checker 跑起来**之前**崩掉也走 `exit 1`，与"反例成立"同一个退出码 ⇒ 崩溃会被读成反例；现在报 `LANE VACUOUS` + `exit 2`。
 

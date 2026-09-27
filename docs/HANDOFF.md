@@ -87,18 +87,19 @@
 image 等）的跳过是允许的；③ 临时 runner：`deploy/scripts/acceptance/x86-security-one.sh <base> <log> <pytest args…>`
 （单文件/单用例）、`deploy/scripts/acceptance/x86-run-py.sh`（跑脚本）。
 
-### 还剩什么（都需要拍板，不是执行问题；2026-09-27 复核）
+### 还剩什么（都需要拍板，不是执行问题；2026-09-27 复核，2026-09-28 更新）
 
 | 项 | 需要什么 |
 |---|---|
-| **`E2B_PURE_ROOTFS` 默认是否从 `off` 切到 `synth`** | 决定 pure 形态的**默认根**换不换。现状：默认 `off` = identity（无根）⇒ `../..`（= `<export>`）能列出 `state` / `_secrets` 的**名字**（内容仍 `EACCES`）；切到 `synth` 后每沙箱多一份骨架目录、**必须配 `E2B_REAL_ROOT=1`**、且依赖 worker seccomp 档已应用 ⇒ 该残差消失，代价与风险见 `docs/deploy-clusters.md` §11.2。生产是 image-rootfs、不受影响，受影响的只有 pure 部署。**本轮不擅自改默认值。** |
 | **checkpoint 计划 E6：`E2B_PAUSED_TTL_S` 默认值** | paused 沙箱要不要按 TTL 过期、多久（过期**摧毁用户状态**）。计划默认 **0 = 不启用**、今天**无实现**（全库 `rg 'E2B_PAUSED_TTL_S'` 仅命中计划）；只在拍板后才打开。口径见 `docs/superpowers/plans/2026-09-26-checkpoint-restore-productization.md` 决策点表 :103 + `.superpowers/sdd/checkpoint-e5-e8-audit-report.md` §1.4。 |
 | **checkpoint 计划 E7：超预算告警谁做** | 平台账 `used/budget` 已随心跳上报节点视图、**公开只读端点不带**、且**无告警**（`rg 'alert\|PrometheusRule' deploy/` 0 命中）⇒ 口径 = 软账 + 并发可超（已写进 `docs/checkpoint-restore-e2b-half.md` §6(k)）。告警是**本仓库加**还是**入口/监控侧加**需要拍板。 |
 
 > 旧表里那几条**已不在"待拍板"里**：N27 已上线（2026-09-26）、FUP-28 已撤（2026-09-27）、
 N36/N30/§10.5/O1–O3 各自收口（逐条见 `docs/open-issues.md`）；**N14 的 S5 那问法**（"还保不
-保留 `E2B_REAL_ROOT=0` 的模拟形态"）已变成上面第一行 —— pure 侧的默认根由 `E2B_PURE_ROOTFS`
-决定，N16 合成根（2026-09-26 落地）是它的前提。
+保留 `E2B_REAL_ROOT=0` 的模拟形态"）与**`E2B_PURE_ROOTFS` 的默认根**都由 2026-09-27 的裁定
+答掉：pure 侧默认 = `synth`（N16 合成骨架 + 成对耦合的真根，`098ba10`），`E2B_PURE_ROOTFS=off`
+是唯一的退回杆；取舍与影响面见 `docs/production-deployment-requirements.md` §2.4.11、
+`docs/pure-shape-decision.md` §7。生产是 image-rootfs，零变化。
 
 ## ⚡ 共享卷去 SYS_ADMIN（2026-09-11，A4–A7 收口 / backlog #25）
 
@@ -532,9 +533,6 @@ skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」�
 点过名的 `tmp/*` 一律不删；`_images` 里 base 镜像的 rootfs 与 `.link` 也留着
 （`python-mcp:3.14` 已经不在 registry 镜像站白名单里，删了就重建不出来，gate A 会挂）。
 
-⚠️ 门禁容器**必须 `--network host`**：漏掉它 5 条 `tests/sdk/python/test_templates.py`
-会以 `buildkit build exited with code 1` 假红（`buildctl` 在 bridge 网络里连不上
-宿主随机端口上的 buildkitd），本轮第一次跑就踩了，与代码无关。
 ⚠️ 门禁容器**必须 `--network host`**：漏掉它 5 条 `tests/sdk/python/test_templates.py`
 会以 `buildkit build exited with code 1` 假红（`buildctl` 在 bridge 网络里连不上
 `127.0.0.1:<随机端口>` 的 buildkitd），本轮第一次跑就踩了，与代码无关。
@@ -1660,7 +1658,7 @@ fork 分支 `feature/network-netns`（基于 feature/network-wildcard）：
    注意：多节点 harness worker 现设 `enable_network=True`（默认 false 时
    网络策略不生效）。
 
-## 本会话已完成
+## 本会话已完成（迁移锁 + 双活窗口 + rootfs 缓存 + JS SDK 宿主 lane）
 
 1. **P0 并发迁移锁**：`SandboxRegistry.try_acquire_migration/release_migration`
    —— Redis 多副本用 `SETNX` 标记 + TTL（WATCH 对比删除，兼容 fakeredis），
@@ -1686,7 +1684,7 @@ macOS: 200 passed, 6 skipped（tests/unit + tests/contract + tests/sdk/python + 
 Linux: 225 passed, 1 skipped（全量含 Sandlock/registry/真实 Redis/模板隔离）
 ```
 
-## 本会话已完成
+## 本会话已完成（Template COPY 上下文 + 真实 Redis 多副本 + 故障迁移 + 镜像仓库分发）
 
 1. **Template COPY 文件上下文**：`GET /templates/{id}/files/{hash}`（201）返回
    带 token 的上传 URL，`PUT .../upload` 校验 token 并存储归档；构建时解包进

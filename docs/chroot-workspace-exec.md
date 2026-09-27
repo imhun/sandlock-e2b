@@ -191,7 +191,7 @@ defense-in-depth 的一个面（userns 的 mount 仍受内核的 userns 限制�
   真根落地后，**路径翻译**的大部分可以退役（内核自己会解析），但策略、COW、磁盘活账本
   仍然需要中介 —— 也就是说 A 是"换掉虚拟根那半"，不是"删掉中介"。
 * 与 N15/N16 的交叉（**2026-09-26 已答**）：pure 有**两条线** —— N15 的 identity 翻译
-  （默认，`E2B_PURE_ROOTFS=off`）与 N16 的合成根（`E2B_PURE_ROOTFS=synth` + `E2B_REAL_ROOT=1`；
+  （`E2B_PURE_ROOTFS=off`，2026-09-27 前是默认、现在是退回杆）与 N16 的合成根（`E2B_PURE_ROOTFS=synth` + `E2B_REAL_ROOT=1`，**2026-09-27 起是默认**；
   每沙箱一份普通目录骨架 + bind 系统目录 + 整棵 `/dev` + `pivot_root`）。也就是说 **pure 也能吃
   真根**，"两套路径空间要不要收敛"不再是待决问题 —— 有根形态各自有内核根，identity 那条是
   明确标注的默认形态。机制、`/dev` 与 `/etc` 的取法、两态验收见

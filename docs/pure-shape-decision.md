@@ -32,7 +32,7 @@ mediation_shape = bool(settings.base_image and image_rootfs is not None)
 | 路径可见性 | 路径 syscall 全被中介，`chroot_root` 翻译 | **Landlock 一道网**；Landlock 访问位是闭集，"带路径但不在闭集里"的调用无人拦 |
 | 具体暴露 | — | 同一宿主文件上实测：`openat` EACCES，而 `getxattr` **读回宿主 xattr**、`open_tree` **返回 fd**、`inotify_add_watch` **投递宿主事件与宿主文件名**（OBS-7）；`path_surface.rs::PURE_UNGATED` 把这一类**逐条 pin 成 33 条**（stat/readlink/chdir/chmod/utimensat/*xattr/inotify_add_watch + 5 条 at 风格，其中 5 条在当前内核 ENOSYS 或被 worker seccomp 档拒） |
 | 磁盘闸门 | 中介的**活账本**：`openat` 按剩余额度发上限、超预算建条目 ENOSPC、unlink 即时归还、N31 的条目计数闸门 | 只有 init 在 fork 里施加的 **per-exec `RLIMIT_FSIZE` 硬上限**（单文件、shape 无关，仍生效）；**没有活账本**：跑飞的写者可以一直写到自己那条 exec 的额度，`diskMB` 那层语义在这个形态下不成立（OBS-5） |
-| 平台状态可见性 | `_runtime` 对沙箱 ENOENT（沙箱的根是它自己的 rootfs） | `/home/user` 就是 `<base>/<id>` 的真实路径 ⇒ `..` 到 `<base>`，`_runtime` "看得见但打不开"（DAC `0700` → EACCES）。**不是洞，但是形态漂移**（N27）。**N27 上线后（2026-09-26）**：树根下沉一级，`/home/user` = `<export>/workspaces/<id>`、平台状态在 `<export>/state/` ⇒ **有根形态**（生产 image-rootfs、pure+合成根+真根）**既不在祖先链上、也读不到**（`ENOENT`）；但**无根 pure identity**（`E2B_PURE_ROOTFS=off`）**只成立一半** —— 四次 `stat` 全 `EACCES`（读不到 ✔），而 `../..`（= `<export>`）能列出 `state` / `_secrets` 的**名字** ⇒ 形态漂移**未完全消除**。这条残差**不是 N27 引入的**（迁移前同形态在 `..` 一层就列出 `_runtime`），是"没有根"这件事本身，**N16（合成根）才是消掉它的那条路**。实测（四种形态对照）见 `docs/deploy-clusters.md` §11.2 |
+| 平台状态可见性 | `_runtime` 对沙箱 ENOENT（沙箱的根是它自己的 rootfs） | `/home/user` 就是 `<base>/<id>` 的真实路径 ⇒ `..` 到 `<base>`，`_runtime` "看得见但打不开"（DAC `0700` → EACCES）。**不是洞，但是形态漂移**（N27）。**N27 上线后（2026-09-26）**：树根下沉一级，`/home/user` = `<export>/workspaces/<id>`、平台状态在 `<export>/state/` ⇒ **有根形态**（生产 image-rootfs、pure+合成根+真根）**既不在祖先链上、也读不到**（`ENOENT`）；但**无根 pure identity**（`E2B_PURE_ROOTFS=off`；2026-09-27 起它只是**退回杆**，默认已翻到合成根）**只成立一半** —— 四次 `stat` 全 `EACCES`（读不到 ✔），而 `../..`（= `<export>`）能列出 `state` / `_secrets` 的**名字** ⇒ 形态漂移**未完全消除**。这条残差**不是 N27 引入的**（迁移前同形态在 `..` 一层就列出 `_runtime`），是"没有根"这件事本身，**N16（合成根）才是消掉它的那条路**。实测（四种形态对照）见 `docs/deploy-clusters.md` §11.2 |
 
 ## 3. 三条路
 
@@ -100,7 +100,7 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
    同挂载 `rename(2)`；集群实测 `done=12 unknown=0`、逐条 `same_inode=yes` ⇒ 原先记的 EXDEV 账不发生）。
    **形态无关性（按 2026-09-26 集群实测限定）**：**有根形态**（生产 image-rootfs、pure+合成根+真根）
    平台状态**既不在祖先链上、也读不到**（`ENOENT`）；**无根 pure identity**（`E2B_PURE_ROOTFS=off`）
-   **只成立一半** —— 四次 `stat` 全 `EACCES`（由中介按策略拒绝 ⇒ **读不到** ✔），但 `../..`（= `<export>`）
+   **只成立一半**（**2026-09-27 前是默认档**；现在默认已翻到合成根，它只是退回杆）—— 四次 `stat` 全 `EACCES`（由中介按策略拒绝 ⇒ **读不到** ✔），但 `../..`（= `<export>`）
    能列出 `state` / `_secrets` 的**名字** ⇒ **不写回"完全形态无关"**。这条残差**不是 N27 引入的**
    （迁移前同形态在 `..` 一层就列出 `_runtime`），是"没有根"这件事本身，**N16（合成根）才是消掉它的
    那条路**。两种形态都**不是"能读"** —— 这半边仍成立 —— 所以验收**不再**是"pure 形态下从沙箱内
@@ -111,7 +111,7 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
    `state/.state-base-migration.journal`（0600），一个发布周期内不删它即可原路退回。
    证据：`docs/deploy-clusters.md` 的 N27 上线记录节 + 探针 `deploy/scripts/acceptance/probe_state_base_visibility.py`。
    **（2026-09-27 更新：同一支探针按 lane 三档重跑复核，结论逐字未变）** —— `synth` + `E2B_REAL_ROOT=1`
-   档**已消掉**"能列出名字"（`chain=PASS`，`<export>` 根本不在祖先链上）；**默认的 `identity` 档仍有残差**
+   档**已消掉**"能列出名字"（`chain=PASS`，`<export>` 根本不在祖先链上）；**当时的默认档（`identity`）仍有残差**
    （`<export>` 一层 `LEAK ["_secrets", "state"]`、四次 `stat` 仍 `EACCES`）；legacy 反例档 `exit 1`
    ⇒ 判据非恒真。要让**默认**形态也消掉，唯一一步是把 `E2B_PURE_ROOTFS` 的默认值从 `off` 切到 `synth`
    （代价见 §7）。**（2026-09-27 后半：已拍板切并落地 —— 默认值现在是 `synth`；上面那几句读作
@@ -220,6 +220,11 @@ container 崩塌 ⇒ 之后每个 verb 都答 `InstanceClosed`（security 两态
 用户裁定（本条）：**默认切成 `synth`** —— 残差的成因是"没有根"本身（§5 第 2 条），所以消掉它只能
 靠默认档换根。切换前 lane 三档的复核（`synth` 档 `chain=PASS`、默认 identity 档 `LEAK
 ["_secrets","state"]`、legacy 反例 `exit 1`）证据见 §5 第 2 条与 `docs/deploy-clusters.md` §11.2。
+**切换后（2026-09-28）在 lane 上复核过默认档本身**：不设任何键 = `route_b_active=True has_root=True`、
+`stat=PASS`/`chain=PASS`/`exit 0`，而 `E2B_PURE_ROOTFS=off` 仍 `LEAK ["_secrets","state"]`/`exit 1`
+（日志 `tmp/n27-default-synth-lane.log` / `tmp/n27-off-identity-lane.log`）；同一轮修掉探针在浅路径上
+（沙箱里那份 `/home/user/n27-checker.py`）算 `parents[3]` 的 `IndexError`，pin 见
+`tests/unit/test_n27_probe_cli.py`。
 
 **两个默认怎么一起动（选 B：成对耦合）**。`pure_rootfs` 默认 `synth`；`E2B_REAL_ROOT` **未被显式
 设置**时按"跟着合成根走"处理（`envd_service/config.py::resolve_real_root`）：**有合成根的箱**
@@ -281,6 +286,7 @@ worker 自己的两个入口 + 把 restore stub 指到树外"那一版（`tmp/k0
 docstring（`envd_service/executors/sandlock.py` 的 `_chroot_root`/`_view_cwd`）与
 `envd_service/config.py` 的字段注释都已经按两形态写；`tests/security/conftest.py`、
 `tests/security/escape/test_path_surface_inotify.py`、`tests/contract/test_route_b_executor.py`
-里的注释说的都是**默认**（identity）形态，成立；`docs/HANDOFF.md` 顶部那段与
+里的注释按产品默认写（`E2B_PURE_ROOTFS` 未设 = `synth`；`tests/security/conftest.py` 已改成照
+`Settings` 解析，不再自带一份形状规则）；`docs/HANDOFF.md` 顶部那段与
 `docs/superpowers/plans/2026-09-10-*` 是**带日期的留档**，按"不改写历史记录"的纪律不动。
 **唯一需要条件标注的现况句就是上面 §6 的 `pwd` 那句**，已更正。

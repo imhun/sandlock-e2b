@@ -1089,7 +1089,8 @@ worker 形态不能在 root 相位断言），与开不开 pid_ns 无关；也�
 **为什么**：N27 的残差只在"没有根"的形态里存在 —— 默认 identity 档下 `<export>`（`../..`）能列出
 `state`/`_secrets` 的**名字**（读不到内容，但那本身就是形态漂移）；合成根档已消掉（`chain=PASS`）。
 判定与实测证据：`docs/pure-shape-decision.md` §5 第 2 条与 §7、`docs/deploy-clusters.md` §11.2、
-`docs/reports/n27-identity-residual-report.md`。
+`docs/reports/n27-identity-residual-report.md`；实施记录（默认值 / 成对耦合 / 守卫 / 影响面 / 两档 lane）
+在 `docs/reports/pure-default-synth-report.md`。
 
 **两个开关必须一起动（成对耦合）**：`E2B_REAL_ROOT` **未显式设置**时按"跟着合成根走"解析
 （`envd_service/config.py::resolve_real_root`）——有合成根的箱（pure）装真根，其余（image 形态）

@@ -43,6 +43,7 @@ sha256 对照见 `.superpowers/sdd/artifact-promotion-report.md`）。原件目�
 | `.superpowers/sdd/netns-task-3-report.md` | `docs/reports/netns-task-3-report.md` |
 | `.superpowers/sdd/o1-t1-fleet-report.md` | `docs/reports/o1-t1-fleet-report.md` |
 | `.superpowers/sdd/progress.md` | `docs/reports/progress.md` |
+| `.superpowers/sdd/pure-default-synth-report.md` | `docs/reports/pure-default-synth-report.md` |
 | `.superpowers/sdd/task-A7-report.md` | `docs/reports/task-A7-report.md` |
 | `.superpowers/sdd/task-cowprobe-report.md` | `docs/reports/task-cowprobe-report.md` |
 | `.superpowers/sdd/task-F1-report.md` | `docs/reports/task-F1-report.md` |
@@ -58,6 +59,10 @@ sha256 对照见 `.superpowers/sdd/artifact-promotion-report.md`）。原件目�
 `fix-{a,b,c,d}-report.md` 是 **C1 wave 3**（把 C1 收尾时记账的遗留项全部做掉）四支并行的
 工作流报告，2026-09-27 同日追加；正文引用在 `docs/deploy-clusters.md` §7.3 与计划文件
 `docs/superpowers/plans/2026-09-27-priv-broker-externalization.md`。
+
+`pure-default-synth-report.md` 是 **N27 的默认根切换**（`E2B_PURE_ROOTFS` 默认 `off`→`synth`，
+`098ba10`）的实施记录：默认值、成对耦合的 `E2B_REAL_ROOT`、配置守卫、逐处影响面与两档 lane；
+正文引用在 `docs/production-deployment-requirements.md` §2.4.11 与 `docs/pure-shape-decision.md` §7。
 
 ## 与钉子测试的关系
 
