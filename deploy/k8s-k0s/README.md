@@ -72,7 +72,7 @@ KUBECONFIG=... deploy/k8s-k0s/secrets.sh --fingerprint   # 每个键的 sha256(�
 |---|---|---|
 | `seccomp-root.patch.yaml` | 安装器的三处路径 → `/var/lib/k0s/kubelet/seccomp` | kubelet 把 Localhost profile 解析到 `<--root-dir>/seccomp`；k0s 的 `--root-dir` 是 `/var/lib/k0s/kubelet`，kubeadm/托管集群才是 `/var/lib/kubelet`。只改一处会让 worker 起不来 |
 | `storage-nas.yaml` | 静态 NFS PV（阿里云 NAS，**NFSv4.0**） | 基线只声明 RWX PVC、不自带 PV。用内置 `nfs` 卷插件即可，不需要阿里云 CSI 插件（这台 ECS 没挂 RAM 角色）。**必须 v4**：v3 上 flock 要么 ESTALE，要么只是本地锁 |
-| `worker-root.patch.yaml` | worker `runAsUser: 0` + `runAsGroup: 65534` | 网络文件系统按 AUTH_SYS 凭据授权，CAP_CHOWN 不过网 —— 非 root worker 的 file-capability broker 无法把沙箱树让给池 uid。保留 fsgid 65534 是因为沙箱树是 `0770 group=<worker gid>` |
+| ~~`worker-root.patch.yaml`~~ —— **已删除**（2026-09-27，C1 wave 2） | 曾经给 worker 加 `runAsUser: 0` + `runAsGroup: 65534` | 这张表里**不再有这一行**：worker 回到镜像自带的 `USER 65534:65534`，而网络文件系统那句理由（`CAP_CHOWN` 不过网）没有消失 —— 它成了**基线** `e2b-priv-broker` DaemonSet 的职责（`deploy/k8s/priv-broker.yaml`：每节点一个 root 容器 + unix socket，`chown`/`rm`/`walk` 由它代做）。broker **不是**这个 overlay 的差异 —— 它与发行版/存储类型都无关、跟基线那个共享 RWX PVC 一起走，所以写在 `deploy/k8s/kustomization.yaml` 里；放在 overlay 会让"不经 overlay 的非 root 部署"起不来 |
 | `worker-capacity.patch.yaml` | `E2B_NODE_*` → 4096/400/8192/1024；pod requests 500m/512Mi、limits 4/4Gi | 基线默认 2048/200 只放得下 1 个沙箱（README 的 F8 就是这条）；且基线 `limits` 无 `requests` 会被当成 requests=2 CPU，滚动更新无处安放 |
 
 另外基线自己已经按「节点本地」分开了两类镜像缓存（`deploy/k8s/worker.yaml`）：
@@ -83,6 +83,38 @@ KUBECONFIG=... deploy/k8s-k0s/secrets.sh --fingerprint   # 每个键的 sha256(�
   控制面 `Template.build` 导出的、每个节点都要读的东西。
 
 两者的区别就是 N18 那 240 倍；拆开之后 `deployment_smoke.py` 从「分钟级挂在模板阶段」变成 **20.6 秒全绿**。
+
+## 平台态属主迁移（C1 wave 2，**上线前置**）
+
+worker 换成 uid 65534 之后，**今天卷上那些 root worker 写下的平台态**（`0600`/`0700`）它读不了 ⇒
+第一次上线这个形态之前必须先跑一次属主迁移。它和 N27 的 `migrate-state-base.sh`（Job
+`state-base-migrate`）是并列的两个一次性迁移，工具是 `deploy/scripts/migrate-state-owner.sh`
+加 `deploy/k8s-k0s/state-owner-migrate.yaml`（一次性 Job，`runAsUser: 0` +
+`runAsGroup: 65534`，`backoffLimit: 0`）：
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+
+# 1) 停写：worker 缩到 0，并确认没有 worker pod 还在跑（脚本自己也会验一遍）
+kubectl -n sandlock scale statefulset/e2b-worker --replicas=0
+kubectl -n sandlock wait --for=delete pod -l app=e2b-worker --timeout=300s
+
+# 2) 先只看不写（默认 dry-run）：经控制面 pod 读实物、打印路径计划与 stat
+deploy/scripts/migrate-state-owner.sh
+
+# 3) 真迁移：脚本建 configmap + Job，跑完收日志并清理
+deploy/scripts/migrate-state-owner.sh --apply
+
+# 4) 起 worker 并复核
+kubectl -n sandlock scale statefulset/e2b-worker --replicas=2
+```
+
+它做的是**递归 `chown 65534:65534`，只改属主**：不改权限位、不删东西、不拷内容。范围是一张显式
+的路径计划（`<export>` 下的 `state`、`_migrate`、`_images`、`_secrets`、`_snapshots`、
+`_templates`、`_builds` 七条），**绝不进入 `<export>/workspaces/**`** —— 那些树属于池 uid，
+不是 worker 的；计划里任何一条落在它下面（包括用 `..` 或符号链接绕过去的拼写）脚本一律拒绝
+并点名。硬性质由 `tests/unit/test_state_owner_migrate.py` 逐条钉住。步骤、回退与判据的正文
+见 `docs/k8s-deployment.md` §24。
 
 ## CNI 必须建集群时定：这套集群用 Calico VXLAN
 
@@ -173,9 +205,16 @@ control-plane 的 `:3000`，与基线那个 ClusterIP `gateway` 同一个后端�
 * 清单里原本**没有 buildkit**，`Template.build` 无从执行 ⇒ 按 compose 的形态补成
   control-plane 的 **sidecar**（unix socket 要同 pod 才能共享 emptyDir）；镜像
   `moby/buildkit:rootless` 在 Docker Hub ⇒ 已镜像到 ACR 的 `byteplan/buildkit:rootless`。
-* worker 以 **root** 跑（网络文件系统的 chown 需要 euid 0），因此会打
-  `E2B_PER_SANDBOX_UID … without CAP_SYS_PTRACE` 的告警；非 route-B 路径的模板沙箱
-  可能因此受影响（见 backlog N18）。
+* **worker pod 里没有任何 root 容器**（C1 wave 2，2026-09-27）：worker 容器不写
+  `runAsUser`（回落镜像 `deploy/docker/Dockerfile.envd` 的 `USER 65534:65534`），
+  `capabilities.add` 只剩 `SETUID`/`SETGID`（本地 file-capability `e2b-slot-spawn` 要的
+  两条 BND），唯一的 initContainer 是**非 root** 的 `wait-for-broker`。网络文件系统的
+  chown 确实只有 euid 0 做得到，但那个 euid 0 现在只在每节点一个的
+  **`e2b-priv-broker` DaemonSet**（基线）里 —— worker 通过 `E2B_PRIV_HELPER_TRANSPORT=socket`
+  把 `chown`/`rm`/`walk` 交给它。
+  * 历史口径（已作废，留档）：此前 worker 自己 `runAsUser: 0`、`runAsGroup: 65534` 读挂载上的树，
+    会打 `E2B_PER_SANDBOX_UID … without CAP_SYS_PTRACE` 的告警，非 route-B 路径的模板沙箱可能
+    因此受影响（见 backlog N18）；route B 与 per-sandbox host uid 在两种 transport 下都成立。
 
 ## 一组验证脚本（跑在真集群上）
 

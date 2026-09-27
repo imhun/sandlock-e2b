@@ -9,8 +9,9 @@
 #     deploy/scripts/migrate-state-owner.sh --apply    # 就是这两条 + 等 + 收日志 + 清理
 #
 # 为什么是 Job：这是一次 `chown -R`，跑完就该消失。
-# 为什么必须 runAsUser 0：这台 NFS 只认凭据里的 uid —— 读 root worker 写下的 0600/0700
-# 文件、把平台态让给 worker uid，都只有 uid 0 能做（见 deploy/k8s-k0s/worker-root.patch.yaml）。
+# 为什么必须 runAsUser 0：这台 NFS 只认凭据里的 uid —— 读旧 root worker 写下的 0600/0700
+# 文件、把平台态让给 worker uid，都只有 uid 0 能做（同一条 NFS 语义的实测见
+# deploy/k8s/priv-broker.yaml：uid 65534 做 chown 是 EPERM，root 做同样的事成功）。
 # 为什么 runAsGroup 65534：与 worker 同组，chown 之后属组不出现第三个数字。
 #
 # ⚠ 三处占位符是有意的 fail-closed（与 state-base-migrate.yaml 同形）：

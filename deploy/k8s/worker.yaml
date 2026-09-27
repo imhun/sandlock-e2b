@@ -214,12 +214,15 @@ spec:
             # sinks under it, `_volumes` and `_images` would fall outside the
             # whitelist unless this is set -- and `_chown_path()` falls back to
             # an in-process `os.chown` for a path the brokers do not cover,
-            # which a 65534 worker cannot do (EPERM, silent per-volume
-            # degradation). It changes nothing for *this* cluster's root worker:
-            # a root worker resolves no brokers at all (`resolve_priv_helpers()`
-            # returns None on euid 0), so `helpers_cover()` stays False and the
-            # in-process path is the one used, exactly as before. The two
-            # readers that do care are the A5 startup probe (warning only) and
+            # which this pod's 65534 worker cannot do (EPERM, silent per-volume
+            # degradation). C1 (wave 2) made that the live shape: the worker is
+            # no longer root and its E2B_PRIV_HELPER_TRANSPORT is `socket`, so
+            # the broker's whitelist is what decides whether a chown can happen
+            # at all. (Before C1 this line changed nothing on this cluster -- a
+            # root worker resolves no brokers, `resolve_priv_helpers()` returns
+            # None on euid 0, so `helpers_cover()` stayed False and the
+            # in-process path was used.) The two readers that do care are the A5
+            # startup probe (warning only) and
             # `build_volume_mounts`' "volume hostPath must be under the shared
             # root" check -- the CP derives every volume path from the same
             # export root, so it holds by construction.
