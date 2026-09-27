@@ -243,8 +243,11 @@ def test_scan_project_dirs_separates_the_store_from_a_prefixed_tree(
 ):
     """M1 rework: ``snap_`` is separated by shape, not by name.
 
-    ``SnapshotRegistry``'s base is the workspace base, so a snapshot store sits
-    at the top level next to the ``sbx_*`` trees and passes
+    ``SnapshotRegistry`` is built on the platform's *shared export root*
+    (``control_plane/app.py``: ``platform_root = settings.shared_workspace_root``
+    ⇒ ``<export>/_snapshots``), not the workspace base; with one root handed to
+    both -- this test's shape, and the shape that predates OBS-9 -- a snapshot
+    store sits at the top level next to the ``sbx_*`` trees and passes
     ``validate_sandbox_id`` (``_`` is a legal id character). But the prefix is
     not reserved on the create side — ``X-Sandbox-Id`` goes through
     ``validate_sandbox_id`` alone — so ``snap_client1`` is a legal *sandbox* id

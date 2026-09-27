@@ -40,8 +40,11 @@ def _write_record(workspace: Path, sandbox_id: str, host_uid: int | None) -> Non
 def _snapshot_store(base: Path, name: str) -> Path:
     """The shape ``SnapshotRegistry`` writes: ``snapshot.json`` + ``fs/``.
 
-    The store's base *is* the workspace base (``control_plane/app.py``), so a
-    store sits at the top level next to the sandbox trees and its name passes
+    ``SnapshotRegistry`` is built on the platform's *shared export root*
+    (``control_plane/app.py``: ``platform_root = settings.shared_workspace_root``
+    ⇒ ``<export>/_snapshots``), **not** the workspace base -- this test just
+    hands one root to both, which is the shape where the two coincide. So a
+    store can sit at the top level next to the sandbox trees and its name passes
     ``validate_sandbox_id``. The record it carries is the *copied sandbox's*,
     at ``fs/sandbox.json`` -- never at the top level -- and it claims a uid of
     its own, so reading it would pin that uid for the wrong reason.
@@ -368,13 +371,14 @@ def test_reconcile_spares_the_store_the_copy_and_the_infrastructure_namespace(
     an orphan-uid reclaim target.
 
     ``snap_*`` and ``_*`` names pass ``validate_sandbox_id`` (``_`` is a legal
-    id character), and the snapshot store's base *is* the workspace base, so
-    the store lands in this scan next to the real trees. Reclaiming the uid a
-    pool-owned *non-tree* happens to carry also **recursively chowns** that
-    tree to the worker -- handing a foreign tree's ownership to the next
-    allocation -- so both prefixed shapes stay out while the real ``sbx_*``
-    orphan is still reclaimed and handed back to the worker (uid accounting
-    and chown targets both unchanged for it).
+    id character), and the snapshot store's base is the platform's *shared
+    export root* (``control_plane/app.py``) -- which this test hands in as the
+    same root as the trees -- so the store lands in this scan next to the real
+    trees. Reclaiming the uid a pool-owned *non-tree* happens to carry also
+    **recursively chowns** that tree to the worker -- handing a foreign tree's
+    ownership to the next allocation -- so both prefixed shapes stay out while
+    the real ``sbx_*`` orphan is still reclaimed and handed back to the worker
+    (uid accounting and chown targets both unchanged for it).
     """
     stranded = tmp_path / "sbx_stranded"
     stranded.mkdir()

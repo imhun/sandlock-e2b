@@ -954,14 +954,16 @@ async def test_snapshot_store_directory_is_spared_by_its_shape(
 ):
     """M1 rework, RED-B: the store's own shape is still never a candidate.
 
-    ``SnapshotRegistry``'s base *is* the workspace base
-    (``control_plane/app.py``), so a snapshot is a top-level ``snap_<hex>``
-    directory next to the ``sbx_*`` trees, and ``snap_`` passes
-    ``validate_sandbox_id`` (``_`` is a legal id character). The predicate
-    separates it from a sandbox tree by shape, not by name: the store holds
-    ``snapshot.json`` and the copied filesystem under ``fs/`` (the sandbox
-    record of that copy lives at ``snap_X/fs/sandbox.json``), so it carries no
-    *top-level* ``sandbox.json`` and stays out of both scans.
+    ``SnapshotRegistry``'s base is the platform's *shared export root*
+    (``control_plane/app.py``: ``platform_root = settings.shared_workspace_root``
+    ⇒ ``<export>/_snapshots``), not the workspace base; with a single root for
+    both (this test's shape, and the shape that predates OBS-9) a snapshot is a
+    top-level ``snap_<hex>`` directory next to the ``sbx_*`` trees, and
+    ``snap_`` passes ``validate_sandbox_id`` (``_`` is a legal id character).
+    The predicate separates it from a sandbox tree by shape, not by name: the
+    store holds ``snapshot.json`` and the copied filesystem under ``fs/`` (the
+    sandbox record of that copy lives at ``snap_X/fs/sandbox.json``), so it
+    carries no *top-level* ``sandbox.json`` and stays out of both scans.
 
     ``tmp/fu-m1-02-verify-prior.log`` pins that shape against the real
     ``SnapshotRegistry`` and the real snapshot API (top level is exactly

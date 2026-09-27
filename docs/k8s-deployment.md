@@ -144,6 +144,13 @@ closed，worker 会直接起不来。所以升级顺序是**先 broker（`ds`）
 `kubectl -n sandlock get deploy,sts,ds -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {...}'`
 （或直接 `kubectl -n sandlock get deploy,sts,ds -o wide`）里的镜像要一致。
 
+⚠ **反过来撤 broker DaemonSet 时，socket 文件不会自己消失**：`E2B_PRIV_HELPER_SOCKET` 是**节点
+hostPath**（`/run/e2b-broker/broker.sock`，两节点各一个），删掉 broker pod 文件还在。worker 的
+`E2B_PRIV_HELPER_TRANSPORT` 是显式的 `socket`（`auto` 默认也一样），按**文件是否存在**选形态 ⇒
+worker 会拿一个死 socket 去握手，启动自检失败即**拒服**（fail closed 是**有意**的，不回落 exec）。
+所以撤掉 `e2b-priv-broker` 前/后，把**每节点**那个 `/run/e2b-broker/broker.sock` 一并删掉，或把
+worker 显式切回 `E2B_PRIV_HELPER_TRANSPORT=exec`。
+
 ⚠ 老集群（worker 还是 Deployment 的）切到 StatefulSet 要多一步：`worker.yaml` 换了 `kind`，
 `kubectl apply` 只会新建 `e2b-worker` StatefulSet，**旧的 Deployment 还在**（同名不同 kind，
 两者会各自跑副本、各自注册成 worker）。顺序：
@@ -2775,3 +2782,13 @@ kubectl -n sandlock exec e2b-worker-0 -c worker -- sh -c '
 ⚠ 两个常见坑：① 脚本拿不到镜像版本（`deploy/stack/.version` 不存在且没给 `VERSION=…`）会直接
 拒绝 —— 与 `apply.sh` 同一口径；② 直接 `kubectl apply -f deploy/k8s-k0s/state-owner-migrate.yaml`
 会在 `__WORKER_REPLICAS__` 那道闸门上拒绝，**不会** chown（Job 必须由脚本渲染后 apply）。
+
+**`_pure_rootfs` 为什么不在迁移计划里**（C1，2026-09-27 只读查证）：pure 形态的
+`<workspaces>/_pure_rootfs/<id>` 骨架是 **worker 自己创建、自己拆**的
+（`envd_service/executors/sandlock.py::_materialize_synthetic_rootfs` 经 `_mkdir_traversable`
+以 65534 建 `0755`；拆箱在 `envd_service/agent.py` 的 `shutil.rmtree`），全程不碰 root ——
+因为 `<workspaces>` 树根已由 broker 的 `workspace-root-init` 保证对 65534 可写（属主 65534 或
+`1777`，见 `deploy/k8s/priv-broker.yaml` 的 writability gate），而 `e2b-maint` 的四根白名单本
+就含 `E2B_WORKSPACE_BASE`。它又只在**无基镜像的 pure 沙箱**下落盘（`_synthetic_rootfs` 对图像
+沙箱返回 None），线上基线的沙箱都带基镜像 ⇒ 迁移时盘上**没有** root worker 留下的
+`_pure_rootfs` 要 chown。所以它不在那 8 条里是因为**没有 root 属主要迁**，不是被漏掉。

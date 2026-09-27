@@ -192,6 +192,12 @@ follow-up（一句，仍未做）：若将来出现"worker 必须**读成功**�
 | `SYS_ADMIN` | **出厂镜像与清单形态下，worker 侧不需要它**（A6 迁出，A7 固化）。全库只剩一处用途，且不在 worker 上：`deploy/stack/docker-compose.prod.yml` 的 **quota-agent** 服务（`profiles: ["quota"]`）执行 `xfs_quota -x` —— 内核按 effective `CAP_SYS_ADMIN` 门控（§2.4.3）。worker 侧原来那三处：① 共享卷 `mount --bind` 进 workspace —— **A4 删 bind**（卷视图 = 请求路径决定的符号链接）+ **A5 补祖先穿透位**；② 直接执行 `xfs_quota -x` —— **A6** 改由 quota-agent 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关）；③ 写 namespaced sysctl（`ip_unprivileged_port_start`）—— **A6** 改由容器 spec 声明（compose `sysctls:` / `docker --sysctl`；k8s 是 **pod 级** `spec.template.spec.securityContext.sysctls`；`NET_BIND_SERVICE` 对非 root pod **不足以**覆盖 `:53`，实测见 §2.4.3）——**2026-09-26 起** `deploy/compose` 的 prod/multinode 示例与本地池已不再声明窗口（见 §2.4.3 末）。⚠️ **限定**：代码里仍有两条非部署默认的路径需要它 —— 合体节点（`E2B_ENABLE_LOCAL_NODE` 默认 **true**：控制面在进程内自建卷配额；W4 起它的 `via_agent` **跟随** envd 的开关 —— `E2B_QUOTA_AGENT_URL` 存在就走 agent（§2.4.3/§2.4.4），所以只有**没配 agent** 的合体节点才在控制面进程里本地直连、才需要它）与 legacy `E2B_ENABLE_NETNS=true`（运行时写 `net.ipv4.ip_forward` + iptables）；这两条在**出厂镜像**里也跑不起来（无 `xfs_quota`/`sysctl`/`iptables`，实测镜像 `command -v` 全 MISSING），所以「不需要」只在镜像 + 清单形态下成立 | 摘掉它的后果**只剩配额降级**：quota-agent 未配置/不可达 ⇒ 建箱与挂卷照常、无 per-sandbox 磁盘硬限 + 一条 WARNING。共享卷不再是理由 —— A4/A5 的契约（`tests/contract/test_shared_volume_relative_cwd.py` 等 36 条）+ 13 条穿透单测在**无 `SYS_ADMIN`** lane 三连绿（`tmp/a4-final-step4-run{1,2,3}.log`）；A7 起整份套件也在**无 `SYS_ADMIN`** 下全绿：`PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` = `1075 passed, 3 skipped, 0 failed`（`tmp/a7-nosa.log`，cap 探针 `CapEff 0xa02c35fb → 0xa00c35fb`）。A6 的配额 lane（同形状，无 `SYS_ADMIN`）：agent 形态 `tmp/a6-agent.log` = `107 passed`；降级形态 `tmp/a6-degrade.log` = `29 passed, 5 errors`（5 个 error 是 XFS prjquota 门用例被 `E2B_TEST_STRICT_SKIPS=1` 显式暴露；A7 起 `tests/unit/test_xfs_project_quota_agent.py` 不再被 deselect，见 §2.5） |
 | `SYS_PTRACE` | 只服务**进程内 RunAs**（父进程给子进程写 `uid_map` 需要对该子进程的 ptrace 访问权） | 非 route-B 的 per-uid 沙箱每个建箱挂在 `sandlock_create failed`；route B 完全不需要 |
 
+**直接 exec 形态的退出码（C1，2026-09-27）**：`e2b-maint` 的 `main` 现在 `signal(SIGPIPE, SIG_IGN)`
+（socket 形态需要它：拒答从**父进程**写出，一个信号会打死整节点 broker）。对**直接 exec** 的 verb
+这是行为变化：调用方中途断管时，二进制不再被 SIGPIPE 打死（旧退出码 **141**），而是写失败
+`EPIPE` → 走 `priv_fail`（退出码 **77**，与其它 fail-closed 拒绝对齐）。仓库内没有消费者读 141，
+所以只影响自己解析退出码的外部脚本：认 **`77` = 拒绝**，别再拿 141 当"被信号杀"。
+
 **构建期 vs 运行期（F1 实测，都是踩过的坑）**：`setcap` 需要 `libcap2-bin`，而执行
 `setcap` 的构建容器自身要有 `CAP_SETFCAP`；**打 cap 必须发生在最终镜像阶段**——
 `COPY --from` **不保留** `security.capability` xattr，在 builder 阶段打的 cap 会静默丢失
@@ -1168,6 +1174,21 @@ pure 形态从此依赖真根（也就是依赖上面的 seccomp 档）；`E2B_P
   缓存落在 phase 1 那套 harness 目录里，65534 写不进去。
 - **原有特权跑法**：继续承担 XFS 配额全量与 loop 相关用例。
   两条 lane 的差集只应当是「配额/loop」这一类，任何别处的差集都是生产可用性缺陷。
+
+⚠ **单跑一个测试文件也必须带 seccomp 档（2026-09-27 实测）**：用裸 `docker run --rm … pytest …`
+（**不带** `--security-opt seccomp=…`）跑 `tests/unit/test_priv_helpers.py` 会得到一条**假红** ——
+`create_app` 的 seccomp 自检先响，`test_create_app_refuses_a_pool_that_contains_the_worker_identity`
+拿到的是"没跑在过滤档下"的错误，而不是它要钉的"uid 池串了 worker 身份"。带上上线那份档就绿：
+
+```bash
+docker run --rm -v "$PWD:/w" -w /w \
+  --security-opt seccomp=deploy/seccomp/sandlock-worker.json \
+  e2b-sandlock-test:latest pytest tests/unit/test_priv_helpers.py -q
+```
+
+正确命令就是 `test-prod-shaped.sh` 一直在用的那面档（`seccomp=<deploy/seccomp/sandlock-worker.json>`，
+见上一条）：容器形状要么照它走，要么至少带上这一行 `--security-opt`。真要在无档容器里跑单文件，
+把 `E2B_REQUIRE_SECCOMP_FILTER=0` 设上（自检降成 warning），但**那只是测试形状，不是线上口径**。
 
 ## 2.6 公共镜像源与 OCI 限流回落（D2 口径，2026-09-11）
 

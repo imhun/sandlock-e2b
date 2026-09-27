@@ -239,12 +239,19 @@ CPU/磁盘）。恶意 key 可并发构建轰炸（`/sandboxes` 已限流，模�
 - 上传超大文件 = 控制面/worker 内存 DoS；
 - 修复：流式写盘 + `Content-Length`/分块大小限制。
 
-### 8.3 worker/supervisor 以 root 运行（高，逃逸放大）
+### 8.3 worker/supervisor 以 root 运行（高，逃逸放大）—— ✅ 已收口（C1，2026-09-27）
+
+> 下面这段是**原始风险记录**（保留原文，不抹历史）。
 
 `Dockerfile.envd` 无 `USER`——worker 容器以 root 跑，sandlock supervisor
 是 root 进程。Landlock/seccomp 被完全绕过时攻击者获得容器 root。
 sandlock 官方支持非 root 运行（uid 65534 全绿）——worker 应以非 root 用户
 跑 supervisor，降低逃逸后果。
+
+> ✅ **已收口（C1，2026-09-27）**：现状已非如此 —— 镜像 `deploy/docker/Dockerfile.envd` 是
+> `USER 65534:65534`，C1 之后 k8s 基线 worker 连 `runAsUser` 都不覆盖（worker 容器回落镜像的
+> 非 root 用户；pod 里唯一的 root 容器是每节点一个的 `e2b-priv-broker` DaemonSet，特权在它那边）。
+> 实测见 `docs/deploy-clusters.md` §7.1。
 
 ### 8.4 依赖未锁定（中，供应链）
 
