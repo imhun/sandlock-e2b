@@ -414,34 +414,61 @@ spec:
             # 池 uid 的树也只有 root 做得到。c1 的整个设计就是把这几个特权动作
             # 收进这一个进程，pod 里其他容器（worker）不再有 root。
             #
-            # 三条 cap 是"它到底要什么"的清单：CHOWN 把文件让给池 uid，
-            # DAC_OVERRIDE 穿过沙箱树的权限位，FOWNER 改自己建的 socket 的模式。
+            # 这份 `drop: [ALL]` + `add` 才是"最小集"的**事实**：对以 uid 0 跑的
+            # 容器，只写 `capabilities.add` 是在运行时默认能力集之上**追加**，
+            # runc 不会因为显式 add 而清空默认集 —— 那样进程实际仍持有
+            # DAC_READ_SEARCH、SETUID、NET_RAW… 整套 root 默认集。三条 verb 要的是：
+            # CHOWN 把文件让给池 uid，DAC_OVERRIDE 穿过沙箱树的权限位，FOWNER 改
+            # 自己建的 socket 的模式。另加 `SETUID`/`SETGID` **只为探针**：探针必须
+            # 以对端身份（65534）连 socket 才过 peer 门，而容器是 root，所以它用
+            # `setpriv` 降权 —— 那需要这两条；daemon 自己那三个 verb 不需要它们。
             #
-            # ⚠ 但**它不是最小集**：对以 uid 0 跑的容器，`capabilities.add` 是
-            # 「在运行时默认能力集之上追加」，runc 不会因为显式 add 而清空默认集，
-            # 所以这个进程实际仍然持有默认的 root 集（DAC_READ_SEARCH、SETUID…
-            # 都在）。真要收紧成"只有这三条"，得同时写 `drop: [ALL]`——那必须先在
-            # 真机确认 `walk`（fts 遍历他人属主的目录）、`rm`、`chown` 在只有这三条
-            # cap 时仍然成立之后再加（Task 8）。加的时候注意仓库记录过的坑：
-            # `drop: [ALL]` 必须配 `add`（否则连这三条都没了），且**绝不能**引入
-            # no-new-privileges（NNP=1 会让内核直接忽略 file capabilities，等于把
-            # 镜像里的 e2b-maint/e2b-slot-spawn 变成无特权二进制）。
+            # 2026-09-27 在目标 k0s 集群上真机验证过：只有这份集合时 `chown`
+            # （建箱把树交给池 uid）、`rm`（删除沙箱树）、`walk`（配额记账）都仍然
+            # 成立 —— 验收证据（两条冒烟 + 树 `770 10000:65534`）记在
+            # `docs/deploy-clusters.md` §7 与计划文件的 Task 8 记录里。
+            #
+            # 注意两条仓库实测过的坑：`drop: [ALL]` 必须配 `add`（否则连这几条都
+            # 没了），且**绝不能**引入 no-new-privileges（NNP=1 会让内核直接忽略
+            # file capabilities，等于把镜像里的 e2b-maint/e2b-slot-spawn 变成无特权
+            # 二进制）。
             #
             # runAsGroup 不覆盖：镜像的 USER 65534:65534 已经给了 worker 的 gid，
             # broker 以 root:65534 跑，socket 与目录的属组才有意义。
             runAsUser: 0
             capabilities:
+              # 先清空默认的 root 集，再逐条加回它真正要的：不加 drop 时
+              # `add` 只是追加，进程仍是满 root。
+              drop:
+                - ALL
               add:
                 - CHOWN
                 - DAC_OVERRIDE
                 - FOWNER
+                # 探针用 `setpriv` 降到对端身份，需要这两条（daemon 的 verb 不用）。
+                - SETUID
+                - SETGID
           # 探活就是协议里的 ping：连上 socket、发 hello、把响应打到 stdout，
           # 退出码 ok=0 / 拒=77。两条探针共用它 —— broker 不在（socket 文件没了、
           # 监听死了、或对端校验把它挡下来）时，唯一正确的反应是重启这个 pod：
           # worker 的 socket transport 没有回落路径。
+          #
+          # ⚠ 探针必须以**对端身份**（`E2B_BROKER_PEER_UID/GID`）去连，所以用
+          # `setpriv` 先降到 65534:65534（容器是 root，降权没问题）。这不是装饰：
+          # 探针是 broker 的真实客户端，而 daemon 的 peer 门只认这个 uid —— 直接以
+          # root 跑 `ping` 会被 `refused: peer uid 0 does not match …` 挡掉，探针永远
+          # 失败、DaemonSet 永远不 Ready（2026-09-27 上线时实测：容器 Running 0/1、
+          # 反复重启、rollout 超时；daemon 本身一直在正常服务）。降权之后的探针同时
+          # 顺带证明了"worker 那条路真的能握手"。
           livenessProbe:
             exec:
               command:
+                - /usr/bin/setpriv
+                - --reuid
+                - "65534"
+                - --regid
+                - "65534"
+                - --clear-groups
                 - /var/lib/e2b-priv/e2b-maint
                 - ping
                 - --socket
@@ -453,6 +480,12 @@ spec:
           readinessProbe:
             exec:
               command:
+                - /usr/bin/setpriv
+                - --reuid
+                - "65534"
+                - --regid
+                - "65534"
+                - --clear-groups
                 - /var/lib/e2b-priv/e2b-maint
                 - ping
                 - --socket

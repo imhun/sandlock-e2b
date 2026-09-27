@@ -987,10 +987,20 @@ def test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identit
     ]
     security = container["securityContext"]
     assert security["runAsUser"] == 0
+    # C1 Task 8 (2026-09-27, verified on the live k0s cluster): the broker is the
+    # *minimal* set, not "whatever the root default happens to be". `drop: [ALL]`
+    # is what makes that true -- `add` alone only appends to the runtime's default
+    # root set -- and the three verbs (chown/rm/walk) were exercised against a
+    # live cluster with exactly these caps. SETUID/SETGID are not for the daemon:
+    # the liveness/readiness probes dial the socket as the *peer* identity and
+    # `setpriv` needs them to drop from root to 65534.
+    assert security["capabilities"]["drop"] == ["ALL"]
     assert set(security["capabilities"]["add"]) == {
         "CHOWN",
         "DAC_OVERRIDE",
         "FOWNER",
+        "SETUID",
+        "SETGID",
     }
     env = {e["name"]: e.get("value") for e in container["env"]}
     # The identity trio (worker pod == peer env == socket group) is 65534.
@@ -1010,6 +1020,16 @@ def test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identit
     assert env["E2B_UID_POOL_SIZE"] == "1000"
     for probe in ("livenessProbe", "readinessProbe"):
         assert container[probe]["exec"]["command"] == [
+            # The probe is a real client: it has to pass the same peer gate the
+            # worker does, so it drops to the authenticated identity first (see
+            # test_the_broker_probes_connect_as_the_peer_identity for the
+            # measurement that made this necessary).
+            "/usr/bin/setpriv",
+            "--reuid",
+            env["E2B_BROKER_PEER_UID"],
+            "--regid",
+            env["E2B_BROKER_PEER_GID"],
+            "--clear-groups",
             "/var/lib/e2b-priv/e2b-maint",
             "ping",
             "--socket",
@@ -2140,3 +2160,53 @@ def test_the_runbook_carries_the_no_double_window_table() -> None:
         "`tests/unit/test_worker_manifest_permissions.py::"
         "test_k8s_redis_auth_comes_from_the_secret_not_a_literal`" in RUNBOOK
     )
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_the_broker_probes_connect_as_the_peer_identity() -> None:
+    """C1 rollout hotfix: the probes are real clients and must pass the peer gate.
+
+    Measured 2026-09-27 on the k0s cluster (first `apply.sh` of C1): with the
+    probe running as the container's own uid 0, `e2b-maint ping` was refused
+    (`refused: peer uid 0 does not match E2B_BROKER_PEER_UID=65534`) while the
+    daemon itself was serving normally -- the pod stayed `Running 0/1`,
+    restarted every ~90 s and the DaemonSet rollout timed out, leaving the
+    cluster with no broker and no worker. The probes now drop to the *peer*
+    identity with `setpriv` before dialling, which also makes each probe prove
+    the exact path the worker's own `E2B_PRIV_HELPER_TRANSPORT=socket` client
+    uses.
+
+    The uid/gid are read from the container's own `E2B_BROKER_PEER_UID/GID`
+    rather than hardcoded here: the gate, the socket directory's group and this
+    probe are one value, and a probe that drifts from the env would fail closed
+    in production (the failure this test exists to prevent).
+    """
+    rendered = subprocess.run(
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    broker = _rendered_workload(rendered, "DaemonSet", "e2b-priv-broker")
+    container = broker["spec"]["template"]["spec"]["containers"][0]
+    env = {entry["name"]: entry.get("value") for entry in container["env"]}
+    peer_uid = env["E2B_BROKER_PEER_UID"]
+    peer_gid = env["E2B_BROKER_PEER_GID"]
+    expected = [
+        "/usr/bin/setpriv",
+        "--reuid",
+        peer_uid,
+        "--regid",
+        peer_gid,
+        "--clear-groups",
+        "/var/lib/e2b-priv/e2b-maint",
+        "ping",
+        "--socket",
+        "/run/e2b-broker/broker.sock",
+    ]
+    for probe in ("livenessProbe", "readinessProbe"):
+        assert container[probe]["exec"]["command"] == expected, (
+            f"{probe} must connect as the peer identity "
+            f"(E2B_BROKER_PEER_UID/GID={peer_uid}/{peer_gid}): "
+            f"{container[probe]['exec']['command']}"
+        )
