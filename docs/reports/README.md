@@ -26,6 +26,10 @@ sha256 对照见 `.superpowers/sdd/artifact-promotion-report.md`）。原件目�
 | `.superpowers/sdd/debt-n40-pool-mcp-report.md` | `docs/reports/debt-n40-pool-mcp-report.md` |
 | `.superpowers/sdd/debt-n44-compose-base-image-report.md` | `docs/reports/debt-n44-compose-base-image-report.md` |
 | `.superpowers/sdd/debt-n44-env-example-report.md` | `docs/reports/debt-n44-env-example-report.md` |
+| `.superpowers/sdd/fix-a-report.md` | `docs/reports/fix-a-report.md` |
+| `.superpowers/sdd/fix-b-report.md` | `docs/reports/fix-b-report.md` |
+| `.superpowers/sdd/fix-c-report.md` | `docs/reports/fix-c-report.md` |
+| `.superpowers/sdd/fix-d-report.md` | `docs/reports/fix-d-report.md` |
 | `.superpowers/sdd/n27-identity-residual-report.md` | `docs/reports/n27-identity-residual-report.md` |
 | `.superpowers/sdd/n27-task-7-report.md` | `docs/reports/n27-task-7-report.md` |
 | `.superpowers/sdd/n30-task-3-report.md` | `docs/reports/n30-task-3-report.md` |
@@ -50,6 +54,10 @@ sha256 对照见 `.superpowers/sdd/artifact-promotion-report.md`）。原件目�
 
 `progress.md` 是那份工作台账的快照（原件仍在被各轮任务追加）；固化的是"截止 2026-09-27
 它长什么样"，不是让仓库里的副本继续滚动。
+
+`fix-{a,b,c,d}-report.md` 是 **C1 wave 3**（把 C1 收尾时记账的遗留项全部做掉）四支并行的
+工作流报告，2026-09-27 同日追加；正文引用在 `docs/deploy-clusters.md` §7.3 与计划文件
+`docs/superpowers/plans/2026-09-27-priv-broker-externalization.md`。
 
 ## 与钉子测试的关系
 

@@ -128,13 +128,15 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（2026-09-27 实测，改部署前先复核；最近一次发版记录见 §12）
+## 7. 当前部署状态（2026-09-27 实测，改部署前先复核；最近一次发版记录见 §7.3）
 
-**版本**：`0.1.0-708-g3f92ba3-20260927-211625`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的；
-C1 的三条尾项也在这一版）。2026-09-27 两次上线实测：`autoscaler` / `control-plane` / `e2b-worker` /
-`e2b-priv-broker` 四个工作负载的镜像都是同一版（broker 与 worker 必须同版本滚，见 §7.1）。
+**版本**：`0.1.0-721-g01e4b72-20260927-231235`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的；
+C1 的三条尾项与「记账项批次」都在这一版）。2026-09-27 **三次上线**实测：`autoscaler` /
+`control-plane` / `e2b-worker` / `e2b-priv-broker` 四个工作负载的镜像都是同一版（broker 与 worker
+必须同版本滚，见 §7.1）。三次的经过分别见 §7.1（第一次，C1 主体）/ §7.2（第二次，三条尾项）/
+§7.3（第三次，记账项批次）。
 
-**pod（2026-09-27 20:0x 实测，C1 上线后）**：`control-plane` 两个副本各 `2/2`、
+**pod（2026-09-27 23:1x 实测，C1 三次上线后）**：`control-plane` 两个副本各 `2/2`、
 `autoscaler` `1/1`、`e2b-worker-0/1` 各 `1/1`（分别落在 `.80.94` / `.80.140`）、`redis` `1/1`、
 `seccomp-installer` `2/2`、**`e2b-priv-broker` `2/2`（一节点一个）**。节点仍是 2 台 arm64 /
 `v1.36.4+k0s`。
@@ -162,7 +164,8 @@ C1 的三条尾项也在这一版）。2026-09-27 两次上线实测：`autoscal
   `{"ok":true,"peer_uid":65534,"peer_gid":65534,"uid_pool":[10000,1000],"roots":[workspaces,state,<export>,image-cache]}`
   （四根顺序与 Python 侧逐位一致）；
 * broker 的**有效能力集 `CapEff=0xcb`** = 恰好 `CHOWN`+`DAC_OVERRIDE`+`FOWNER`+`SETGID`+`SETUID`
-  （`drop: [ALL]` + 这五条 add；不再是运行时默认的满 root 集）；
+  （`drop: [ALL]` + 这五条 add；不再是运行时默认的满 root 集）—— 这是**第一次上线当时**的读数：
+  那版探针还在用 `setpriv` 降权，所以留了 `SETUID`/`SETGID`；§7.3 起收成三条（`0x0b`）；
 * `multinode_smoke.py` = `MULTI-NODE SMOKE OK`（4 箱 2+2、命令/文件/stdin、预留归零），
   `deployment_smoke.py` = `DEPLOYMENT SMOKE OK`（含跨节点迁移保文件、远端卷隔离、
   模板构建→registry→worker 拉取→镜像 rootfs、MCP 网关）；**最小能力集下又各跑一遍 multinode = OK**；
@@ -175,12 +178,19 @@ C1 的三条尾项也在这一版）。2026-09-27 两次上线实测：`autoscal
    root 跑 `e2b-maint ping` → 被 peer 门拒（`refused: peer uid 0 does not match
    E2B_BROKER_PEER_UID=65534`），daemon 本身一直正常服务，但 pod 停在 `Running 0/1`、
    反复重启、rollout 超时。修法：探针先用 `setpriv --reuid/--regid 65534 --clear-groups`
-   降到对端身份再 ping（`deploy/k8s/priv-broker.yaml`，pin 见
-   `tests/unit/test_worker_manifest_permissions.py::test_the_broker_probes_connect_as_the_peer_identity`）。
-   这也意味着 broker 的 cap 集必须保留 `SETUID`/`SETGID`。
+   降到对端身份再 ping（`deploy/k8s/priv-broker.yaml`，pin 当时叫
+   `tests/unit/test_worker_manifest_permissions.py::test_the_broker_probes_connect_as_the_peer_identity`，
+   §7.3 起已改名 `…::test_the_broker_probes_dial_the_root_only_health_socket`）。
+   这也意味着 broker 的 cap 集必须保留 `SETUID`/`SETGID`。**（后续修订，见 §7.3）**：探针不再
+   降权 —— 改连**容器私有**的健康 socket，`SETUID`/`SETGID` 已从 cap 集撤掉；**业务 socket 的
+   对端门本身没动**（仍然只放 `E2B_BROKER_PEER_UID`/`GID`）。
 2. **`deployment_smoke` 第一次跑在模板构建轮询上 404**（`Template build bld_… not found`），
-   立刻重跑即全绿。CP 有两个副本而构建状态是进程内的：轮询被 Service 打到另一个副本就会
-   404（与文档里"控制面只能 1 副本"同源，属**既有**环境问题，不是 C1 引入）。
+   立刻重跑即全绿。当时归因成"控制面 2 副本 + 构建状态在进程内"，**这个归因是错的**：状态本来
+   就在共享卷上、跨副本读取是设计的一部分（`_write_build` 的注释写明 trigger 与 poll 可能落在
+   不同副本）。真根因是**记录文件的非原子写**（`Path.write_text` 先 `O_TRUNC` 再分次写，poll
+   落在这个窗口里 `json.loads` 抛 `ValueError`，被 `except` 吞掉后变成 404）—— wave 3 的 fix-c
+   改用 `write_text_atomically`（同目录临时文件 + fsync + `os.replace`）后一次跑过，**与副本数
+   无关**，也不用把控制面缩到 1 副本。根因链条见 `docs/reports/fix-c-report.md` §1。
 
 ### 7.2 第二次上线：三条尾项收口（2026-09-27，已执行）
 
@@ -193,7 +203,8 @@ C1 的三条尾项也在这一版）。2026-09-27 两次上线实测：`autoscal
 一次 walk"改成逐子项求和（否则单树前提不成立、合法答案会被拒）；`image-cache-init` 对 `secrets/`
 的 chown 失败不再静默；`migrate-state-base.sh` 的 4 处 bash 3.2 隐患修掉。
 
-验收：broker/worker 全 `1/1`；broker `CapEff=0xcb`；peer 身份 `ping` 回 `ok:true` 且四根一致；
+验收：broker/worker 全 `1/1`；broker `CapEff=0xcb`（**该版仍是五条形态**；§7.3 收到三条）；
+peer 身份 `ping` 回 `ok:true` 且四根一致；
 运行中的镜像里 `BROKER_MAX_WALK_RESPONSE_BYTES == 512 MiB`；`multinode_smoke` 与
 `deployment_smoke` **都一次跑过**（`DEPLOYMENT SMOKE OK`）。
 
@@ -201,7 +212,51 @@ C1 的三条尾项也在这一版）。2026-09-27 两次上线实测：`autoscal
 `dial tcp 127.0.0.1:16443: connect: connection refused`）——重跑
 `deploy/scripts/open-cluster-tunnel.sh` 即可，别把它当成集群问题。
 
-**C1 特权外置后的形态（2026-09-27，wave 2；仓库规格 = 下一次 apply 之后的集群形态）**：
+### 7.3 第三次上线：记账项批次（2026-09-27，已执行）
+
+版本 `0.1.0-721-g01e4b72-20260927-231235`。这一版把上两轮收尾时**记账**的遗留项做进代码与
+清单后重新上线：四支并行 worktree/分支（`feat/c1-fix-{a,b,c,d}`，各由子代理实现并通过评审）
+`--no-ff` 并入 main，再由 `apply.sh` 滚上集群。分支报告归档在 `docs/reports/fix-{a,b,c,d}-report.md`（工作笔记原件在同名 `.superpowers/sdd/`）。
+
+内容（每条都"修"而不是"记账"）：
+
+* **fix-a（C 侧 / 清单）**：新增**健康 socket** `--health-socket`（**容器私有**路径
+  `/run/e2b-broker-health.sock`、`0660 root:root`、键集严格只答 `{v,hello}`、要求 peer uid 0）；
+  liveness/readiness 改为容器 root **直连健康 socket**（不再 `setpriv` 降权；**业务 socket 的
+  peer 门逐字未动**）；broker cap 从五条收到 **`drop:[ALL]` + `[CHOWN, DAC_OVERRIDE, FOWNER]`**；
+  拒绝路径改为"非阻塞首读，只有沉默对端才退到一次有界 poll"（诊断开关
+  `E2B_BROKER_REFUSAL_TRACE` 默认关）；`walk` 有**自己的** 64 MiB 未转义上限、两条流共享额度
+  （推导 `6 × 64 MiB = 384 MiB < worker 侧 512 MiB`）。
+* **fix-b（Python 侧）**：secret 注入**先全部解析、再统一落地**；`os.open(..., 0o600)` 消除 umask
+  窗口；reclaim 前显式检查父目录属主 / 非 sticky；roots 归一**拒绝相对拼写**（fail closed）；
+  混合 env/文件条目保持输入顺序。
+* **fix-c（原子写）**：新增 `write_text_atomically` / `write_json_atomically`（同目录临时文件 +
+  fsync + `os.replace`）并替换 7 处调用点。根因是控制面 2 副本 + 非原子 `write_text` 让
+  `deployment_smoke` 的模板构建轮询偶发 404；**更严重的一条**是
+  `envd_service/runtime/registry.py` 写 `_runtime/<id>/sandbox.json` 非原子，而
+  `uid_pool._recorded_uid` 把"解析失败"当作"没有记录" ⇒ 两个 worker 可能发出**同一个 host uid**
+  （E3.2 隔离静默失效）。
+* **fix-d（文档 / 注释）**：`auto` 模式遇残留 socket 硬拒启动写进 README 与 k8s-deployment；
+  `security-hardening.md` §8.3 标已收口（保留历史）；四处 "registry base = workspace base" 的
+  docstring 改对；容器内跑测试必须带 seccomp 档写入文档；直接 exec 断管退出码 141→77 一句。
+  调查结论：`<workspaces>/_pure_rootfs` **无缺口**（0755 由 worker 在自己可写的树根下建，只在
+  无基镜像的 pure 沙箱落盘），无需改清单。
+
+**验收（全部现场实测，均在 `0.1.0-721` 上）**：
+
+| 判据 | 结果 |
+|---|---|
+| `apply.sh` | 通过；broker 先滚、worker 后滚、随后预热 base image |
+| broker 能力集 | **`CapEff=0x0b`** = 恰好 `CHOWN`+`DAC_OVERRIDE`+`FOWNER`（`SETUID`/`SETGID` 已不在） |
+| socket 形态 | `/run/e2b-broker` `710 0:65534`、`broker.sock` `660 0:65534`、`/run/e2b-broker-health.sock` `660 0:0` |
+| 两条探针 | 容器 root 直连健康 socket → `ok:true`；worker pod 内 uid 65534 连业务 socket → `ok:true`（`peer_uid/gid=65534`，四根白名单一致） |
+| 三个 verb（三条 cap 下） | `chown` 新树 `770 10000:65534`、`rm` kill 后树消失、`walk` worker 记账计数在走 |
+| 两条冒烟 | `multinode_smoke` = `MULTI-NODE SMOKE OK`；`deployment_smoke` = **`DEPLOYMENT SMOKE OK`（一次跑过，模板构建不再 404）** |
+
+> §7.1 里"探针必须保留 `SETUID`/`SETGID`"的结论**已被本节取代**：探针不再降权，改连健康 socket。
+> 业务 socket 的对端门没有变化，仍然只放 `E2B_BROKER_PEER_UID`/`GID`（worker 的 65534）。
+
+### 7.4 C1 特权外置后的形态（2026-09-27 起；仓库规格 = 集群现状）
 
 * 基线 `deploy/k8s/priv-broker.yaml` 新增 **`e2b-priv-broker` DaemonSet**，每节点一个 **root** 容器
   （`runAsUser: 0` + `capabilities.add: [CHOWN, DAC_OVERRIDE, FOWNER]`）：`chown`/`rm`/`walk`
@@ -224,13 +279,14 @@ C1 的三条尾项也在这一版）。2026-09-27 两次上线实测：`autoscal
   （先上 worker）会得到读不了 `0600`/`0700` 平台态的 worker —— 也就是每个 `Sandbox.create()`
   都失败。
 
-> 上面「pod（2026-09-27 实测）」里的几个 pod 是**早先**的读数（当时 worker 还以 root 跑）；
-> C1 的 broker DaemonSet 与无 root worker 以仓库规格为准，实测数字在 C1 上线后按 §12 的方式重取。
+> 上面「pod（2026-09-27 实测）」是 **C1 三次上线之后**的读数：broker DaemonSet 每节点 `1/1`、
+> worker 容器无 `runAsUser`（非 root）。改部署前按 §2 的方式重取。
 
 > **"现在跑的是哪一版"永远以 `deploy/stack/.version` + 集群里 `autoscaler/control-plane/e2b-worker`
 > 三个工作负载的实际镜像为准**（两边必须一致），别引用本文任何一节里写死的版本号。本节记的是
 > **2026-09-27** 的实测状态；§9/§10/§11 是**历史上线记录**（各自写的是那一版当天的验收），
-> §12 是最近一次发版（2026-09-27）的验收记录。
+> §7.1/§7.2/§7.3 是 2026-09-27 三次上线的验收记录（最近一次 = §7.3），§12/§13 是当天早先
+> 两次发版的细节记录。
 
 **2026-09-27 实测的形态开关**（`sts/e2b-worker` 的 env；`e2b-worker-0` 运行中容器的 `env` 与之一致）：
 

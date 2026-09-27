@@ -474,13 +474,16 @@ spec:
             # 这一条由契约用例 `test_hello_rejects_a_peer_uid_mismatch`
             # （`assert _handlers(handle) == []`）与 `test_the_health_socket_*` 一起钉住。
             #
-            # 真机验证状态（评审 Important，措辞更正）：2026-09-27 在目标 k0s 集群上验过的是
-            # **五条**的形态（`CapEff=0xcb`，含 `SETUID`/`SETGID`）—— 那次 `chown`（建箱把树
-            # 交给池 uid）、`rm`（删除沙箱树）、`walk`（配额记账）都成立，验收证据（两条冒烟 +
-            # 树 `770 10000:65534`）记在 `docs/deploy-clusters.md` §7 与计划文件的 Task 8 记录里。
-            # 去掉的 `SETUID`/`SETGID` 在那次验证里**只被（当时的）`setpriv` 探针使用**，三个
-            # verb 不需要它们；**三条形态还没上过真机**，将在下一次上线 apply 时复验（复验通过后
-            # 把这段改成完成时）。
+            # 真机验证状态（已完成）：2026-09-27 **第三次上线**（版本
+            # `0.1.0-721-g01e4b72-20260927-231235`）把这份清单滚上集群，实测 `CapEff=0x0b`
+            # = 恰好这三条（`SETUID`/`SETGID` 确实不在了），三个 verb 在三条下现场复验成立：
+            # `chown`（建箱把树交给池 uid，新树 `770 10000:65534`）、`rm`（kill 后树消失）、
+            # `walk`（worker 记账的 walk 计数在走）；容器 root 直连健康 socket 与 worker pod 内
+            # uid 65534 连业务 socket 各回 `ok:true`，两条冒烟（`multinode_smoke` /
+            # `deployment_smoke`）全绿。证据记在 `docs/deploy-clusters.md` §7.3。
+            # （历史：第一次上线验的是**五条**形态 `CapEff=0xcb`（含 `SETUID`/`SETGID`），
+            # 那时探针还在用 `setpriv` 降权 —— `chown`/`rm`/`walk` 同样成立，但两条 cap 只为
+            # 探针而留；健康 socket 落地后它们就没有存在理由了。）
             #
             # 注意两条仓库实测过的坑：`drop: [ALL]` 必须配 `add`（否则连这几条都
             # 没了），且**绝不能**引入 no-new-privileges（NNP=1 会让内核直接忽略

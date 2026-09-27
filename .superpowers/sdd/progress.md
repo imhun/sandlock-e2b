@@ -2553,3 +2553,41 @@ N37 的 4000 文件判据与 checkpoint 端到端在上一版 `0.1.0-652` 上全
 - 验收：broker/worker 全 1/1；broker `CapEff=0xcb`；peer 身份 ping `ok:true` 且四根一致；运行镜像里 `BROKER_MAX_WALK_RESPONSE_BYTES == 512 MiB`；`multinode_smoke` + `deployment_smoke` **都一次过**。
 - 记录：`docs/deploy-clusters.md` §7.2（含"重建镜像期间隧道会掉，重开 `open-cluster-tunnel.sh` 即可"这个运维坑）。
 - 至此 C1（wave 1 + wave 2 + 尾项）**代码、清单、文档、真机部署与验收全部完成**；plan 的"执行状态"节里已无未完成项，只剩一条环境侧既有噪声（CP 两副本导致 `deployment_smoke` 模板轮询偶发 404）。
+
+---
+
+## 2026-09-27 C1 wave 3：记账项批次（把遗留项全部做掉）
+
+用户口径："**有问题的记账都应该做，不应该只记账，除非有不确定的地方需要确认**"。据此起四支并行
+worktree（`tmp/wt-c1-fix-{a,b,c,d}` / 分支 `feat/c1-fix-{a,b,c,d}`），各由子代理实现、任务级评审后
+`--no-ff` 并入 main（`c2ff20c`/`7725d36`/`1bf0472`/`648fe48` 四个合并提交，HEAD `01e4b72`）。
+
+- **fix-a（C 侧/清单）** `c1f9353` → 修复 `4615ef2`：健康 socket `--health-socket`（容器私有、
+  `0660 root:root`、键集严格、要求 peer uid 0）；探针以容器 root 直连健康 socket，**不再 `setpriv`**，
+  broker cap 从五条收到 **`drop:[ALL]` + `[CHOWN,DAC_OVERRIDE,FOWNER]`**；拒绝路径非阻塞首读 +
+  有界 poll 兜底；`walk` 自有 64 MiB 上限、两条流共享额度（`6×64 MiB = 384 MiB < 512 MiB`）。
+- **fix-b（Python 侧）** `10a8fa1` → `ac93e7e`：secret 先全部解析再统一落地；`os.open(0o600)` 消
+  umask 窗口；reclaim 前检查父目录属主/非 sticky；roots 拒相对拼写；混合条目保输入顺序。
+- **fix-c（原子写）** `4fba6d4` → `5253785`：`write_text_atomically`/`write_json_atomically` + 7 处调用点；
+  修掉模板构建 404 的根因（非原子 `write_text`），并修掉一条**更严重**的静默缺陷 ——
+  `envd_service/runtime/registry.py` 的 `sandbox.json` 非原子写 + `uid_pool._recorded_uid` 把解析失败
+  当"没有记录" ⇒ 两个 worker 可能发出**同一个 host uid**（E3.2 隔离静默失效）。
+- **fix-d（文档/注释）** `5b6eb95`：README/k8s-deployment 的残留 socket 硬拒、`security-hardening.md`
+  §8.3 收口、四处 "registry base = workspace base" docstring 纠正、容器测试必须带 seccomp 档、
+  直接 exec 断管退出码 141→77；调查确认 `<workspaces>/_pure_rootfs` **无缺口**，不需改清单。
+
+**第三次上线（版本 `0.1.0-721-g01e4b72-20260927-231235`）**：`apply.sh` 通过（broker 先滚、worker 后滚、
+预热）；broker `CapEff=0x0b` = 恰好三条；socket 权限 `/run/e2b-broker` `710 0:65534`、`broker.sock`
+`660 0:65534`、`/run/e2b-broker-health.sock` `660 0:0`；两条探针（容器 root 直连健康 socket / worker
+pod 内 uid 65534 连业务 socket）都 `ok:true`；`chown`/`rm`/`walk` 在三条下现场复验成立；
+`multinode_smoke` = OK、`deployment_smoke` = **OK（一次跑过，模板构建不再 404）**。
+记录：`docs/deploy-clusters.md` §7.3。
+
+**本轮同时纠正的文档漂移**（"只记账"留下的）：`deploy/k8s/priv-broker.yaml` "三条形态还没上过真机"→完成时；
+`docs/production-deployment-requirements.md` §2.4.1 能力表 `drop: [ALL]` 现状；`docs/deploy-clusters.md`
+§7/§7.1/§7.2 的版本、`CapEff=0xcb`、"探针必须保留 SETUID/SETGID"、旧 pin 名；计划文件执行状态与
+已知延后 6 条全部改写成完成态，并新增 "wave 3" 小节。
+
+**清理**：4 个 worktree 与 4 个分支已 remove/delete；报告固化为 `docs/reports/fix-{a,b,c,d}-report.md`
+（逐字节副本，`docs/reports/README.md` 索引同步；工作笔记原件在同名 `.superpowers/sdd/`，三份评审 diff
+留在那里）。**至此 C1 全部完成，无遗留记账项。**

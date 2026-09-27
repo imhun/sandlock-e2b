@@ -21,16 +21,17 @@
 | Task 7（文档与 pin 收口） | ✅ 已合并（wave 2） |
 | Task 9（终审 Minor 收口） | ✅ 已合并（wave 2 + `2ef457e`） |
 | **Task 8（真机 rollout 与验收）** | ✅ **已执行（2026-09-27，用户授权）**：版本 `0.1.0-698-g55e5e79-20260927-195247`；worker 缩 0 → 迁移（8 条目标、`chowned=8`、files/dirs 计数前后一致）→ `apply.sh`（broker 先滚、worker 后滚）→ 验收全绿。完整记录与证据见 `docs/deploy-clusters.md` §7.1。 |
+| **wave 3（记-A/B/C/D 批次：把记账项全部做掉）** | ✅ **已合并并上线**：四支 worktree `tmp/wt-c1-fix-{a,b,c,d}`（分支 `feat/c1-fix-{a,b,c,d}`）各由子代理实现 + 任务级评审后 `--no-ff` 并入 main（`c1f9353`/`10a8fa1`/`4fba6d4`/`5b6eb95` → 评审修复 `4615ef2`/`ac93e7e`/`5253785`）；随后第三次上线版本 `0.1.0-721-g01e4b72-20260927-231235`，broker `CapEff=0x0b`（三条）、两条冒烟一次跑过。详见 `docs/deploy-clusters.md` §7.3，报告 `docs/reports/fix-{a,b,c,d}-report.md`（工作笔记原件在同名 `.superpowers/sdd/`）。 |
 
 **Task 8 真机预检发现（2026-09-27，只读）**：**worker 的快照 payload 根** `<workspaces>/_snapshots`（`envd_service/agent.py` 硬编码 `<workspace_base>/_snapshots`；控制面的记录根是另一条 `<export>/_snapshots`）坐在树根下、属主 `root:0755` —— C1 之后 65534 的 worker 写不进去（"上线后第一次 create snapshot 才炸"的静默类型）。已由本次修复覆盖：`deploy/k8s/priv-broker.yaml` 的 `workspace-root-init` 把它交给 65534（`mkdir -p` + `chown 65534:65534` + 校验），`deploy/scripts/migrate-state-owner.sh` 的树根白名单放行它（`workspaces/_migrate`、`workspaces/_snapshots` 两条）。见 `docs/k8s-deployment.md` §24。
 
-**已知延后（非阻断，均已记账）**
-1. ~~`drop: [ALL]`~~ ✅ **已做并在真机验证（2026-09-27）**：broker 的 `CapEff=0xcb` = 恰好 `CHOWN`+`DAC_OVERRIDE`+`FOWNER`+`SETUID`+`SETGID`（不再是运行时默认的满 root 集）；`chown`/`rm`/`walk` 三个 verb 都在这个集合下现场验过（新建沙箱树 `770 10000:65534`、kill 后树消失、worker 记账的 `walk` 计数在走）。其中 `SETUID`/`SETGID` 是给**探针**保留的：探针必须以对端身份连 socket 才过 peer 门，用 `setpriv` 降权需要这两条。
+**已知延后（全部已收，无遗留）**
+1. ~~`drop: [ALL]`~~ ✅ **已做并在真机验证（2026-09-27，第三次上线收成三条）**：broker 的 `CapEff=0x0b` = 恰好 `CHOWN`+`DAC_OVERRIDE`+`FOWNER`（不再是运行时默认的满 root 集）；`chown`/`rm`/`walk` 三个 verb 都在这个集合下现场验过（新建沙箱树 `770 10000:65534`、kill 后树消失、worker 记账的 `walk` 计数在走）。第一次上线时曾为 `setpriv` 探针多留 `SETUID`/`SETGID`（`0xcb` 五条）；wave 3 的**健康 socket**（fix-a）让探针不再降权，那两条随之撤掉。
 2. ~~Python 侧单行读取上限 ≈3 GiB~~ ✅ **已收（2026-09-27）**：`walk` 有自己的 `BROKER_MAX_WALK_RESPONSE_BYTES = 512 MiB`（推导写实：单树 ≤ `E2B_DISK_MAX_ENTRIES`=500000 条目 × ~80 B ≈ 40 MB 未转义 × 6 转义 ≈ 229 MiB 线路 ⇒ 512 MiB ≈ 2.2×，且 < 容器 2Gi；80 B 明确标为估计而非上界）；**`runtime/platform_disk.measure_platform_disk_bytes` 从"整棵 `_runtime` 一次 walk"改成逐子项求和**（否则单树前提不成立、合法答案会被拒），数值与旧口径相等并有等式用例；`raw += chunk` 改 `chunks+join`；两条 pin（`-mindepth 1 -maxdepth 2 -type d` 与 manifest 侧 `limits.memory == 2Gi` / `E2B_DISK_MAX_ENTRIES == 500000`）。"测不到 → 0" 现在会打一条 WARNING（不再静默 fail-open）。
 3. ~~`image-cache-init` 对 `secrets/` 的 chown 是静默 best-effort~~ ✅ **已收**：两条 `|| true` 改成可见的 `|| echo "image-cache-init: chown refused …"`（仍 non-fatal），注释写明 `-mindepth 1 -maxdepth 2` 就是契约，pin 同步。
 4. ~~`deploy/scripts/migrate-state-base.sh` 的 bash 3.2 隐患~~ ✅ **已收**：4 处 `$VAR（` 改成 `${VAR}`，`usage()` 的 sed 上界改准（`2,39p`），并加了静态扫描用例（该脚本里 `$VAR` 紧邻非 ASCII 必须 0 次）。
-5. 环境侧既有噪声：CP 有两个副本而构建状态是进程内的 ⇒ `deployment_smoke` 的模板构建轮询偶发 404（重跑即绿）。与"控制面只能 1 副本"同源，不属 C1。
-6. **上线时真机才暴露、已修的缺陷**：DaemonSet 第一版的 liveness/readiness 以容器 root 跑 `e2b-maint ping` → 被 peer 门拒（`peer uid 0 does not match`），daemon 正常但 pod 停在 `Running 0/1`、反复重启、rollout 超时。修法：探针用 `setpriv --reuid/--regid 65534 --clear-groups` 降到对端身份；pin 见 `tests/unit/test_worker_manifest_permissions.py::test_the_broker_probes_connect_as_the_peer_identity`。
+5. ~~环境侧既有噪声：CP 有两个副本而构建状态是进程内的 ⇒ `deployment_smoke` 的模板构建轮询偶发 404~~ ✅ **已修（wave 3 的 fix-c）**：根因是非原子 `write_text`（控制面 2 副本轮询会读到半截文件），改 `write_text_atomically`/`write_json_atomically` 后 `deployment_smoke` 一次跑过；同一批还修掉**更严重**的一条 —— `envd_service/runtime/registry.py` 的 `sandbox.json` 非原子写会让两个 worker 发出同一个 host uid（E3.2 隔离静默失效）。CP 副本数是 F11 之后的刻意设计，**不改**。
+6. ~~DaemonSet 第一版的探针被 peer 门拒（`peer uid 0 does not match E2B_BROKER_PEER_UID=65534`），pod `Running 0/1`、rollout 超时~~ ✅ **已修（wave 3 的 fix-a）**：当时用 `setpriv --reuid/--regid 65534 --clear-groups` 降到对端身份，wave 3 改为**健康 socket**（容器私有路径、`0660 root:root`、只答 `{v,hello}`、要求 peer uid 0），探针以容器 root 直连、**不再降权**，`SETUID`/`SETGID` 也从 broker cap 集撤掉；业务 socket 的 peer 门逐字未动。pin 现在是 `tests/unit/test_worker_manifest_permissions.py::test_the_broker_probes_dial_the_root_only_health_socket`。
 
 ## Global Constraints
 
@@ -206,15 +207,41 @@ kubectl -n sandlock exec e2b-worker-0 -- sh -c 'stat -c "%a %u %g %n" /var/lib/e
 | 1 | `ok` 必须是 bool 的守卫没有测试（改 `if False:` 套件仍全绿） | 终审二评 Minor 1 | ✅ 已覆盖：`tests/unit/test_priv_broker_protocol.py::test_socket_transport_rejects_an_ok_that_is_not_a_boolean`（`{"v":1,"ok":"yes","exit":0}` → `PrivHelperError`） |
 | 2 | `timeout_s` 的杀进程路径无用例（唯一兜住 runaway `walk` 的边界，而 `walk` 是配额记账常驻路径） | 终审 Important 4 的剩余 | ✅ 已覆盖（2026-09-27 本轮补齐）：`tests/contract/test_broker_socket_c.py::test_a_walk_that_outlives_the_budget_is_killed_and_the_daemon_survives` —— 硬链接农场 60 万条目 / 200 字节名字，实测（arm64 dev 机、`e2b-sandlock-test` 容器、overlayfs）造树 ~19s、完整 walk ~3.3s、被杀的请求 1s（预算 1s，余量 >3×）；断言 `ok:false` + `timed out … SIGKILL`、daemon 存活、随后 hello 成功。单条用例 **22.8s**（lane 上限 30s），规模与成本写在 docstring 里 |
 | 3 | `read_request` 无读截止（现由 `PRIV_MAX_HANDLERS=32` 兜着） | T1 复审 Minor | ✅ 已覆盖：`maint.c` 的 `request_read_ms`（`E2B_BROKER_REQUEST_READ_MS`）+ `test_a_silent_peer_is_refused_and_the_broker_keeps_serving` / `test_serve_refuses_an_unusable_request_read_deadline` |
-| 4 | 拒绝路径 50ms/连接的 accept 节流 | T1 复审 Minor | 既有实现，**本轮未改**：拒绝路径先 `poll(PRIV_REFUSAL_WAIT_MS = 50ms)` 等**第一个字节**（等不到就放弃），之后才用 `recv(MSG_DONTWAIT)` 把已在途的请求排空 —— 每个被拒连接最多花 50ms，accept 循环不会被一个挂着的对端拖住；由 `test_serve_refuses_connections_over_the_handler_cap` / `test_a_peer_that_hangs_up_cannot_take_the_broker_down` 压住 |
+| 4 | 拒绝路径 50ms/连接的 accept 节流 | T1 复审 Minor | ✅ **已改（wave 3 的 fix-a）**：拒绝路径改成"先一次 `recv(MSG_DONTWAIT)` 非阻塞排空，只有**沉默且在连**的对端才退到一次有界 `poll(PRIV_REFUSAL_WAIT_MS = 50ms)`"——拿到数据/看到 EOF 的对端**零等待**；那唯一仍等 50ms 的一格正是"答案不被 close 的 RST 吞掉"所需。分支可观测（诊断开关 `E2B_BROKER_REFUSAL_TRACE`，默认关），由 `test_serve_refuses_connections_over_the_handler_cap` / `test_a_peer_that_hangs_up_cannot_take_the_broker_down` 与分支报告用例压住 |
 | 5 | `_read_broker_line` 无长度上限 + 转义 6× 放大（256 MiB 算的是未转义字节） | T2 终审 Minor | ✅ 已覆盖：worker 侧读取设了上限，转义后的字节也计入（`envd_service/priv_helpers.py::_read_broker_line`）+ `test_socket_transport_refuses_an_answer_over_the_read_limit` |
 | 6 | `_build_helpers` 对 socket 形态不要求"二进制存在"，而 `e2b-slot-spawn` 两种 transport 都要本地 | T2 复审 Minor | ✅ 已覆盖：`resolve_priv_helpers` 的 socket 分支要求本地 `e2b-slot-spawn` 存在，缺了就点名拒绝 + `test_socket_transport_still_needs_the_local_slot_spawn` |
 | 7 | 契约测试 fixture 覆盖镜像内 `/var/lib/e2b-priv/e2b-maint`（硬杀不还原；Linux root 开发机会写到宿主） | T1 复审 Minor | ✅ 已覆盖：`_require_disposable_container()` 在 `euid != 0` 或不在一次性容器里时显式 `RuntimeError`（**不是** skip） |
 | 8 | `E2B_BROKER_WORKER_UID/GID` 在**直接 exec** 形态下可被调用方环境污染（可达者本就能 exec 带 cap 的 broker） | 终审残留 | ✅ 已覆盖：`deploy/k8s/priv-broker.yaml` 的 `E2B_BROKER_PEER_UID/GID` 注释写明 "worker pod 侧**不得**设置 `E2B_BROKER_WORKER_UID/GID`"（它们是每次连接由 `SO_PEERCRED` 得出的结论，不是可配输入） |
-| 9 | secret 侧：多条目失败不回滚 / `open()`→`chmod()` umask 窗口（**预先存在**）/ reclaim 依赖 worker 建的 `<secrets>/<id>` 非 sticky | T3 三评 Minor | 永久记录（本轮不动代码）：真机验收（Task 8）时确认 `<secrets>/<sandbox_id>` 由 worker 创建且非 sticky |
-| 10 | SIGPIPE 回归测试含时序成分；harness 逐字节断言只对纯 ASCII 载荷成立；`SIG_IGN` 让直连 verb 的断管退出码 141→77 | T1 三评 Minor | 永久记录（本轮不动代码）：`141 → 77` 只影响"直连 verb 的调用方，在对端挂断时看到的退出码"，协议两侧都不读它（socket 形态由 daemon 自己收尾）；测试的时序成分已被 `test_a_peer_that_hangs_up_cannot_take_the_broker_down` 的轮询收口 |
+| 9 | secret 侧：多条目失败不回滚 / `open()`→`chmod()` umask 窗口（**预先存在**）/ reclaim 依赖 worker 建的 `<secrets>/<id>` 非 sticky | T3 三评 Minor | ✅ **已修（wave 3 的 fix-b）**：注入改成"**先全部解析、再统一落地**"（解析失败 ⇒ 磁盘上一条都不留）；写盘改 `os.open(..., 0o600)` + `fdopen`（消除 umask 窗口）；reclaim 前显式检查父目录属主/非 sticky，不满足即 `PrivHelperError` 点名（fail closed）；roots 归一拒绝相对拼写。三条各有"撤销即红"用例 |
+| 10 | SIGPIPE 回归测试含时序成分；harness 逐字节断言只对纯 ASCII 载荷成立；`SIG_IGN` 让直连 verb 的断管退出码 141→77 | T1 三评 Minor | ✅ **已收（wave 3 的 fix-d 文档化）**：`141 → 77` 现在写在 `docs/production-deployment-requirements.md` 里（"直接 exec 形态的退出码"一段），调用方认 **77 = 拒绝**、别再拿 141 当"被信号杀"；仓库内没有读 141 的消费者。测试的时序成分由 `test_a_peer_that_hangs_up_cannot_take_the_broker_down` 的轮询收口；harness 逐字节断言的不变量仍是"纯 ASCII 载荷"（已在用例里写明） |
 
 **上线顺序（终审要求写进 Task 4/5 文档）**：先 apply **DaemonSet（新 C）**，再上**新 worker 镜像**——新 Python + 旧 daemon 会在握手期因缺 `peer_gid` fail closed（设计如此），而旧 Python + 新 daemon 向前兼容。
+
+---
+
+## wave 3：记账项批次 —— 把遗留项全部做掉（2026-09-27，已执行）
+
+用户口径："**有问题的记账都应该做，不应该只记账，除非有不确定的地方需要确认**"。据此把 wave 1/2
+收尾时记下的账拆成四支互不重叠的工作流，各起一个 worktree（`tmp/wt-c1-fix-{a,b,c,d}`）由子代理
+实现，任务级评审后 `--no-ff` 并入 main：
+
+| 支 | 分支 / commit | 内容 | 报告 |
+|---|---|---|---|
+| **fix-a**（C 侧 / 清单） | `feat/c1-fix-a` `c1f9353` → 评审修复 `4615ef2` | 健康 socket（探针不再 `setpriv`、`SETUID`/`SETGID` 撤掉、broker cap 收到三条）；拒绝路径非阻塞首读 + 有界 poll 兜底；`walk` 自有 64 MiB 上限且两条流共享额度；`E2B_BROKER_REQUEST_READ_MS` 写进清单 | `docs/reports/fix-a-report.md` |
+| **fix-b**（Python 侧） | `feat/c1-fix-b` `10a8fa1` → `ac93e7e` | secret 先解析后落地；`os.open(0o600)` 消 umask 窗口；reclaim 父目录属主/非 sticky 检查；roots 拒相对拼写；混合条目保序 | `docs/reports/fix-b-report.md` |
+| **fix-c**（原子写） | `feat/c1-fix-c` `4fba6d4` → `5253785` | `write_text_atomically` / `write_json_atomically` + 7 处调用点；修掉模板构建 404 与 `registry.py` 非原子写导致的 **uid 静默重复** | `docs/reports/fix-c-report.md` |
+| **fix-d**（文档 / 注释） | `feat/c1-fix-d` `5b6eb95` | README/k8s-deployment 的残留 socket 硬拒、`security-hardening.md` §8.3 收口、docstring 纠正、容器测试要带 seccomp 档、退出码 141→77；调查确认 `<workspaces>/_pure_rootfs` 无缺口 | `docs/reports/fix-d-report.md` |
+
+**真机验收（第三次上线，版本 `0.1.0-721-g01e4b72-20260927-231235`）**：`apply.sh` 通过（broker 先滚、
+worker 后滚、预热）；broker `CapEff=0x0b` = 恰好三条；socket 权限与两条探针都 `ok:true`；
+三个 verb 在三条 cap 下现场复验；`multinode_smoke` 与 `deployment_smoke` **都一次跑过**。
+完整记录见 `docs/deploy-clusters.md` §7.3。
+
+**收口时同步纠正的文档漂移**：`deploy/k8s/priv-broker.yaml` 里"三条形态还没上过真机"改成完成时；
+`docs/production-deployment-requirements.md` §2.4.1 的能力表把 `drop: [ALL]` 的现状写实；
+`docs/deploy-clusters.md` §7.1/§7.2 的 `CapEff=0xcb`/"探针必须保留 `SETUID`/`SETGID`"标注为当时读数
+并指向 §7.3。**结论：C1（wave 1 + wave 2 + wave 3）代码、清单、文档、真机部署与验收全部完成，
+无遗留记账项。**
 
 ---
 
