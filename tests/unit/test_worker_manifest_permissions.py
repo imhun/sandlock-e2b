@@ -1140,11 +1140,26 @@ def test_the_image_cache_init_hands_the_secret_directories_over_without_touching
     # mkdirs `<sandbox_id>` below it) and the directories under it (the worker
     # unlinks and writes `<name>.secret` inside them).
     assert 'if [ -d "$dir/secrets" ]; then' in lines
-    assert 'chown 65534:65534 "$dir/secrets" 2>/dev/null || true' in lines
-    assert (
-        'find "$dir/secrets" -mindepth 1 -maxdepth 2 -type d '
-        '-exec chown 65534:65534 {} + 2>/dev/null || true'
-    ) in lines
+    # ...and the two chowns are best-effort *and audible*: each one ends with
+    # the same visible "chown refused" message, so an NFS `root_squash` that
+    # leaves the per-sandbox secret directories root-owned is named in the
+    # init log instead of vanishing under a silent `|| true`.
+    secrets_commands = [
+        line
+        for line in lines
+        if line.startswith('chown 65534:65534 "$dir/secrets"')
+        or line.startswith('find "$dir/secrets"')
+    ]
+    assert len(secrets_commands) == 2
+    for command in secrets_commands:
+        assert '|| echo "image-cache-init: chown refused' in command, command
+        assert command.endswith(
+            'the per-sandbox secret dirs must belong to uid 65534"'
+        ), command
+    # ...the directory sweep keeps `-type d` (the depth pair is the payload
+    # contract: `<secrets>/<sandbox_id>/<name>.secret`, directories only to
+    # depth 1).
+    assert any("-type d" in command for command in secrets_commands)
     # ...and no chown may name a secret *file*: those stay with the sandbox uid
     # the executor handed them to.
     assert [line for line in commands if "chown" in line and ".secret" in line] == []

@@ -158,6 +158,19 @@ BROKER_ESCAPE_BLOWUP = 6
 BROKER_MAX_RESPONSE_BYTES = (
     2 * BROKER_MAX_OUTPUT_BYTES * BROKER_ESCAPE_BLOWUP + BROKER_READ_CHUNK
 )
+#: The ceiling on one ``walk`` answer line -- *smaller* than the generic one
+#: above on purpose. ``walk`` is the one verb whose answer is a whole tree
+#: written out one entry per line, but every caller walks a *single* tree
+#: (``registry`` per record's workspace, ``health`` for one sandbox's
+#: workspace, ``checkpoint_store`` for one checkpoint image -- none of them
+#: walks the whole workspace base), and a tree is capped at
+#: ``E2B_DISK_MAX_ENTRIES`` (N31, 500000) entries; ~80 B a line is ~40 MB
+#: worst case. 256 MiB is ~6x that, and deliberately *below* the worker
+#: container's ``limits.memory: 2Gi``, so crossing it is this refusal and not
+#: the kernel's OOM kill first. The generic ceiling stays for ``chown`` /
+#: ``rm`` (whose answers are a handful of bytes) because their refusal text
+#: has no such tree bound to lean on.
+BROKER_MAX_WALK_RESPONSE_BYTES = 256 * 1024 * 1024
 
 
 def _image_cache_root() -> Path | None:
@@ -200,34 +213,56 @@ def _broker_timeout(argv: Sequence[str]) -> int:
     return min(budget, BROKER_TIMEOUT_MAX_S)
 
 
-def _read_broker_line(sock: socket.socket, *, where: Path) -> str:
+def _broker_response_limit(verb: str) -> int:
+    """The widest answer line this worker will buffer for ``verb``.
+
+    ``walk`` is the one verb whose answer is a whole tree, so it is read under
+    its own, smaller ceiling (``BROKER_MAX_WALK_RESPONSE_BYTES``); every other
+    verb answers with a handful of bytes and keeps the generic one.
+    """
+    if verb == "walk":
+        return BROKER_MAX_WALK_RESPONSE_BYTES
+    return BROKER_MAX_RESPONSE_BYTES
+
+
+def _read_broker_line(
+    sock: socket.socket, *, where: Path, verb: str, limit: int
+) -> str:
     """Read up to the terminating newline of the daemon's one-line answer.
 
-    Bounded on purpose. Reading until a newline with socket timeouts as the
-    only backstop meant an unbounded ``bytes`` buffer: the daemon's own output
-    cap counts *unescaped* bytes, so a ``walk`` over names that are not UTF-8
-    comes back JSON-escaped and inflates up to sixfold on the wire -- and
-    nothing at all stops a daemon (or whatever else is on that socket) from
-    streaming one line forever. Past ``BROKER_MAX_RESPONSE_BYTES`` the answer
-    is refused by name rather than buffered, so this is a
+    Bounded on purpose, and the bound is the *verb's* (``limit``, from
+    :func:`_broker_response_limit`): ``walk`` streams a whole tree as one long
+    line and is read under the smaller walk ceiling, every other verb answers
+    with a handful of bytes. Reading until a newline with socket timeouts as
+    the only backstop meant an unbounded ``bytes`` buffer: the daemon's own
+    output cap counts *unescaped* bytes, so a ``walk`` over names that are not
+    UTF-8 comes back JSON-escaped and inflates up to sixfold on the wire --
+    and nothing at all stops a daemon (or whatever else is on that socket)
+    from streaming one line forever. Past ``limit`` the answer is refused by
+    name (the verb and the ceiling it used), so this is a
     :class:`PrivHelperError` (the caller asked for a privileged step and did
     not get one), never a ``MemoryError`` or a hung worker.
     """
-    raw = b""
-    while b"\n" not in raw:
+    # ``chunks`` + one ``join`` rather than ``raw += chunk``: the quadratic
+    # re-copy of a repeated concatenation is what makes a big ``walk`` answer
+    # both slow and peak-heavy just below the ceiling.
+    chunks: list[bytes] = []
+    total = 0
+    while True:
         chunk = sock.recv(BROKER_READ_CHUNK)
         if not chunk:
             break
-        raw += chunk
-        if len(raw) > BROKER_MAX_RESPONSE_BYTES:
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
             raise PrivHelperError(
                 f"the maintenance broker at {where} answered more than "
-                f"{BROKER_MAX_RESPONSE_BYTES} bytes without a newline: "
-                "refusing to buffer an answer over the limit (the daemon caps "
-                "one stream at 256 MiB of unescaped bytes and escaping can "
-                "inflate that sixfold, so nothing this broker could answer "
-                "legitimately is longer than this line)"
+                f"{limit} bytes without a newline to a {verb} request: "
+                f"refusing to buffer an answer over the {verb} limit"
             )
+        if b"\n" in chunk:
+            break
+    raw = b"".join(chunks)
     return raw.split(b"\n", 1)[0].decode("utf-8", errors="replace")
 
 
@@ -778,6 +813,7 @@ class PrivHelpers:
         without an ``exit`` used to read as "exit 0" -- i.e. success).
         """
         name = Path(argv[0]).name
+        verb = argv[1] if len(argv) > 1 else ""
         timeout_s = _broker_timeout(argv)
         response = self._broker_request(
             {
@@ -786,6 +822,7 @@ class PrivHelpers:
                 "timeout_s": timeout_s,
             },
             timeout_s=timeout_s,
+            verb=verb,
         )
         if not response["ok"]:
             error = response.get("error")
@@ -810,7 +847,7 @@ class PrivHelpers:
             )
         return _broker_stream(response, "stdout", what=what, name=name) or ""
 
-    def _broker_request(self, payload: dict, *, timeout_s: int) -> dict:
+    def _broker_request(self, payload: dict, *, timeout_s: int, verb: str) -> dict:
         """One JSON line out, one JSON line back (the frozen wire protocol).
 
         Every transport failure -- no socket, refused connection, a timeout
@@ -838,7 +875,12 @@ class PrivHelpers:
                 sock.settimeout(timeout_s + BROKER_TIMEOUT_SLACK_S)
                 sock.connect(str(self.broker_socket))
                 sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-                raw = _read_broker_line(sock, where=self.broker_socket)
+                raw = _read_broker_line(
+                    sock,
+                    where=self.broker_socket,
+                    verb=verb,
+                    limit=_broker_response_limit(verb),
+                )
         except OSError as exc:
             raise PrivHelperError(
                 f"the maintenance broker at {self.broker_socket} is "
@@ -874,6 +916,7 @@ class PrivHelpers:
         return self._broker_request(
             {"v": BROKER_PROTOCOL_VERSION, "hello": True},
             timeout_s=BROKER_HELLO_TIMEOUT_S,
+            verb="hello",
         )
 
     def chown(
