@@ -37,6 +37,10 @@ void priv_fail(const char *fmt, ...) {
     exit(PRIV_EXIT_REFUSED);
 }
 
+void priv_report_refused(const char *message) {
+    fprintf(stderr, "%s: refused: %s\n", priv_progname(), message);
+}
+
 void priv_usage(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -57,6 +61,60 @@ static int priv_env_positive_long(const char *name, long fallback, long *out,
         return -1;
     }
     *out = value;
+    return 0;
+}
+
+/* The peer identity is the one place uid/gid 0 is legitimate (a root worker
+ * exists in the compose/test shapes), so this is deliberately not
+ * priv_parse_uid: "0" is a value here, not a refusal. */
+static int priv_env_peer_id(const char *name, long fallback, long *out, char *err,
+                            size_t errlen) {
+    const char *text = getenv(name);
+    char *end = NULL;
+    long value;
+    if (text == NULL) {
+        *out = fallback;
+        return 0;
+    }
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value < 0) {
+        snprintf(err, errlen, "%s must be a non-negative decimal integer (got '%s')",
+                 name, text);
+        return -1;
+    }
+    *out = value;
+    return 0;
+}
+
+void priv_peer_identity(long *uid, long *gid) {
+    long want_uid, want_gid;
+    char err[PRIV_ERR_LEN];
+    if (priv_env_peer_id("E2B_BROKER_PEER_UID", PRIV_DEFAULT_PEER_UID, &want_uid,
+                         err, sizeof(err)) != 0 ||
+        priv_env_peer_id("E2B_BROKER_PEER_GID", PRIV_DEFAULT_PEER_GID, &want_gid,
+                         err, sizeof(err)) != 0) {
+        /* A peer gate that cannot be read is a deployment defect, not a
+         * request-level refusal: name it and refuse to serve at all. */
+        priv_fail("invalid peer configuration: %s", err);
+    }
+    *uid = want_uid;
+    *gid = want_gid;
+}
+
+int priv_peer_allowed(long uid, long gid, char *err, size_t errlen) {
+    long want_uid, want_gid;
+    priv_peer_identity(&want_uid, &want_gid);
+    if (uid != want_uid) {
+        snprintf(err, errlen, "peer uid %ld does not match E2B_BROKER_PEER_UID=%ld",
+                 uid, want_uid);
+        return -1;
+    }
+    if (gid != want_gid) {
+        snprintf(err, errlen, "peer gid %ld does not match E2B_BROKER_PEER_GID=%ld",
+                 gid, want_gid);
+        return -1;
+    }
     return 0;
 }
 
@@ -133,42 +191,288 @@ const char *priv_state_base(void) {
     return (value != NULL && *value != '\0') ? value : priv_workspace_base();
 }
 
-/* A second root only when the deployment names one. Both the whitelist and the
- * diagnostic that reports it ask this, so "which roots do you accept?" has a
- * single answer. */
-static int priv_has_second_state_root(void) {
-    return strcmp(priv_state_base(), priv_workspace_base()) != 0;
-}
-
 static const char *priv_shared_volume_root(void) {
     const char *value = getenv("E2B_SHARED_VOLUME_ROOT");
     return (value != NULL && *value != '\0') ? value : NULL;
 }
 
-static void priv_append_root(char *out, size_t outlen, const char *root) {
-    size_t used = strlen(out);
-    if (used >= outlen) {
-        return;
+/* C1: the extracted-rootfs cache. A sandbox's secret file is written to
+ * `<image_cache_dir>/secrets/<sandbox_id>/` and then handed to that sandbox's
+ * own uid; the worker is not the owner of it, so the hand-over needs this root.
+ * **Only** when the deployment names one (every real one does): the Python
+ * side's unset value is `tmp/sandboxes/_images`, relative to *its* cwd, and
+ * whitelisting a resolved-into-the-daemon's-cwd directory would both widen the
+ * whitelist and make the two sides' root lists disagree. */
+static const char *priv_image_cache(void) {
+    const char *value = getenv("E2B_IMAGE_CACHE_DIR");
+    return (value != NULL && *value != '\0') ? value : NULL;
+}
+
+size_t priv_root_paths(const char **out, size_t max) {
+    /* This is the Python side's list (PrivHelpers._root_paths) byte for byte,
+     * including *which* of its entries are conditional: a consumer that reads
+     * the diagnostic and one that walks the whitelist must not disagree, and
+     * the hello handshake compares the two lists. */
+    const char *workspace = priv_workspace_base();
+    const char *state = priv_state_base();
+    const char *shared = priv_shared_volume_root();
+    const char *cache = priv_image_cache();
+    size_t count = 0, seen;
+    if (count < max) {
+        out[count++] = workspace;
     }
-    snprintf(out + used, outlen - used, ", %s", root);
+    /* A second root only when the state base *is* one: with no E2B_STATE_BASE
+     * the two are the same directory, and naming one directory twice would
+     * misreport the shape. */
+    if (state != NULL && strcmp(state, workspace) != 0 && count < max) {
+        out[count++] = state;
+    }
+    /* Named whenever the deployment names one -- even a shared root that
+     * points at the workspace base is kept, because that is what the Python
+     * side does and the two lists have to match. */
+    if (shared != NULL && count < max) {
+        out[count++] = shared;
+    }
+    /* C1's root, and the one entry with a dedupe of its own: every deployment
+     * points it somewhere of its own, but two roots that resolve to the same
+     * directory are still one root. */
+    if (cache != NULL) {
+        for (seen = 0; seen < count; seen++) {
+            if (strcmp(out[seen], cache) == 0) {
+                break;
+            }
+        }
+        if (seen == count && count < max) {
+            out[count++] = cache;
+        }
+    }
+    return count;
 }
 
 void priv_roots_text(char *out, size_t outlen) {
-    const char *workspace = priv_workspace_base();
-    const char *shared = priv_shared_volume_root();
-
-    snprintf(out, outlen, "%s", workspace);
-    if (priv_has_second_state_root()) {
-        priv_append_root(out, outlen, priv_state_base());
+    const char *roots[PRIV_MAX_ROOTS];
+    size_t count = priv_root_paths(roots, PRIV_MAX_ROOTS);
+    size_t index, used = 0;
+    if (outlen == 0) {
+        return;
     }
-    if (shared != NULL) {
-        priv_append_root(out, outlen, shared);
+    out[0] = '\0';
+    for (index = 0; index < count && used + 1 < outlen; index++) {
+        int written = snprintf(out + used, outlen - used, "%s%s",
+                               index == 0 ? "" : ", ", roots[index]);
+        if (written < 0) {
+            break;
+        }
+        used += (size_t)written;
+        if (used >= outlen) {
+            used = outlen - 1;
+            break;
+        }
     }
 }
 
 const char *priv_supervise_bin(void) {
     const char *value = getenv("E2B_SUPERVISE_BIN");
     return (value != NULL && *value != '\0') ? value : PRIV_DEFAULT_SUPERVISE_BIN;
+}
+
+const char *priv_broker_socket(void) {
+    const char *value = getenv("E2B_PRIV_HELPER_SOCKET");
+    return (value != NULL && *value != '\0') ? value : PRIV_DEFAULT_BROKER_SOCKET;
+}
+
+/* The length of the sequence a lead byte starts, or 0 for a byte that cannot
+ * start one (stranded continuation bytes, overlong leads, 5/6-byte forms). */
+static size_t priv_utf8_lead(unsigned char byte) {
+    if (byte < 0x80) {
+        return 1;
+    }
+    if (byte >= 0xc2 && byte <= 0xdf) {
+        return 2;
+    }
+    if (byte >= 0xe0 && byte <= 0xef) {
+        return 3;
+    }
+    if (byte >= 0xf0 && byte <= 0xf4) {
+        return 4;
+    }
+    return 0;
+}
+
+/* The length of the well-formed UTF-8 sequence at `data`, or 0 when the bytes
+ * there are not one (RFC 3629: no overlongs, no surrogates, <= U+10FFFF). */
+static size_t priv_utf8_sequence(const char *data, size_t len) {
+    unsigned char lead = (unsigned char)data[0];
+    size_t need = priv_utf8_lead(lead);
+    size_t index;
+    if (need == 0 || len < need) {
+        return 0;
+    }
+    for (index = 1; index < need; index++) {
+        if (((unsigned char)data[index] & 0xc0) != 0x80) {
+            return 0;
+        }
+    }
+    if (need == 3) {
+        if (lead == 0xe0 && (unsigned char)data[1] < 0xa0) {
+            return 0; /* overlong */
+        }
+        if (lead == 0xed && (unsigned char)data[1] >= 0xa0) {
+            return 0; /* a surrogate is not a character */
+        }
+    }
+    if (need == 4) {
+        if (lead == 0xf0 && (unsigned char)data[1] < 0x90) {
+            return 0; /* overlong */
+        }
+        if (lead == 0xf4 && (unsigned char)data[1] > 0x8f) {
+            return 0; /* past U+10FFFF */
+        }
+    }
+    return need;
+}
+
+size_t priv_json_escape_boundary(const char *data, size_t len) {
+    size_t start = len;
+    size_t tail;
+    if (len == 0) {
+        return 0;
+    }
+    /* Step back over the continuation bytes of the last sequence to its lead. */
+    while (start > 0 && ((unsigned char)data[start - 1] & 0xc0) == 0x80) {
+        start--;
+    }
+    if (start == 0) {
+        /* Nothing but continuation bytes: every one of them is invalid on its
+         * own, so escaping them here is correct. */
+        return len;
+    }
+    tail = len - (start - 1);
+    if (priv_utf8_lead((unsigned char)data[start - 1]) > tail) {
+        /* The sequence continues in the next chunk: hand it over whole. */
+        return start - 1;
+    }
+    return len;
+}
+
+size_t priv_json_escape(char *out, const char *data, size_t len) {
+    static const char *hex = "0123456789abcdef";
+    size_t index = 0, used = 0;
+    while (index < len) {
+        unsigned char c = (unsigned char)data[index];
+        size_t sequence;
+        if (c >= 0x80) {
+            sequence = priv_utf8_sequence(data + index, len - index);
+            if (sequence == 0) {
+                /* Not UTF-8: a Linux filename may be any byte but NUL and '/',
+                 * and JSON has to survive it. `\udcXX` is Python's
+                 * surrogateescape spelling of byte 0xXX, so the caller's
+                 * `json.loads` produces exactly the string `os.fsdecode()`
+                 * produced on the Python side -- the name stays matchable. */
+                unsigned int code = 0xdc00 + c;
+                out[used++] = '\\';
+                out[used++] = 'u';
+                out[used++] = hex[(code >> 12) & 0xf];
+                out[used++] = hex[(code >> 8) & 0xf];
+                out[used++] = hex[(code >> 4) & 0xf];
+                out[used++] = hex[code & 0xf];
+                index++;
+                continue;
+            }
+            /* A well-formed sequence goes through byte for byte: the protocol
+             * carries UTF-8, and re-encoding it would mean inventing a charset
+             * the caller did not ask for. */
+            memcpy(out + used, data + index, sequence);
+            used += sequence;
+            index += sequence;
+            continue;
+        }
+        switch (c) {
+        case '"':
+            out[used++] = '\\';
+            out[used++] = '"';
+            break;
+        case '\\':
+            out[used++] = '\\';
+            out[used++] = '\\';
+            break;
+        case '\b':
+        case '\f':
+        case '\n':
+        case '\r':
+        case '\t':
+            /* The short escapes, so a `walk` line stays readable on the wire. */
+            out[used++] = '\\';
+            out[used++] = c == '\b'   ? 'b'
+                          : c == '\f' ? 'f'
+                          : c == '\n' ? 'n'
+                          : c == '\r' ? 'r'
+                                      : 't';
+            break;
+        default:
+            if (c < 0x20) {
+                out[used++] = '\\';
+                out[used++] = 'u';
+                out[used++] = '0';
+                out[used++] = '0';
+                out[used++] = hex[(c >> 4) & 0xf];
+                out[used++] = hex[c & 0xf];
+            } else {
+                /* Anything else goes through byte for byte: the protocol
+                 * carries UTF-8, and re-encoding it here would mean inventing
+                 * a charset the caller did not ask for. */
+                out[used++] = (char)c;
+            }
+            break;
+        }
+        index++;
+    }
+    return used;
+}
+
+/* Append `text` to the buffer that ends at `out[outlen]`, or leave it as it
+ * was when it does not fit (the caller sizes the buffer for the shape it
+ * froze, so truncation is a bug, not a case to paper over). */
+static void priv_append_text(char *out, size_t outlen, size_t *used,
+                             const char *text) {
+    size_t text_len = strlen(text);
+    if (*used + text_len + 1 > outlen) {
+        return;
+    }
+    memcpy(out + *used, text, text_len);
+    *used += text_len;
+    out[*used] = '\0';
+}
+
+void priv_roots_json(char *out, size_t outlen) {
+    const char *roots[PRIV_MAX_ROOTS];
+    size_t count = priv_root_paths(roots, PRIV_MAX_ROOTS);
+    size_t index, used = 0;
+    /* A root is one path and the widest escape is 6 bytes per byte. */
+    char escaped[6 * PATH_MAX];
+    out[0] = '\0';
+    priv_append_text(out, outlen, &used, "[");
+    for (index = 0; index < count; index++) {
+        size_t root_len = strlen(roots[index]);
+        size_t escaped_len;
+        /* A root that cannot fit in PATH_MAX can never match a resolved path
+         * either (realpath() cannot produce one), so this is a deployment
+         * defect rather than a shape to squeeze: answer with an empty array
+         * instead of a truncated -- i.e. lying -- one. */
+        if (root_len >= sizeof(escaped) / 6) {
+            snprintf(out, outlen, "[]");
+            return;
+        }
+        escaped_len = priv_json_escape(escaped, roots[index], root_len);
+        escaped[escaped_len] = '\0';
+        if (index > 0) {
+            priv_append_text(out, outlen, &used, ",");
+        }
+        priv_append_text(out, outlen, &used, "\"");
+        priv_append_text(out, outlen, &used, escaped);
+        priv_append_text(out, outlen, &used, "\"");
+    }
+    priv_append_text(out, outlen, &used, "]");
 }
 
 /* len(prefix) == strlen(prefix); "equal or a proper subpath" test. */
@@ -205,7 +509,8 @@ int priv_resolve_allowed_path(const char *path, int strict, char *resolved,
                               size_t resolved_len, char *err, size_t errlen) {
     char *real = realpath(path, NULL);
     int matched = 0;
-    char roots[PRIV_ERR_LEN];
+    const char *roots[PRIV_MAX_ROOTS];
+    size_t root_count, index;
     if (real == NULL) {
         snprintf(err, errlen, "cannot resolve path %s: %s", path, strerror(errno));
         return -1;
@@ -215,24 +520,16 @@ int priv_resolve_allowed_path(const char *path, int strict, char *resolved,
         free(real);
         return -1;
     }
-    priv_check_root(priv_workspace_base(), real, strict, &matched, err, errlen);
-    if (!matched) {
-        if (priv_has_second_state_root()) {
-            priv_check_root(priv_state_base(), real, strict, &matched, err,
-                            errlen);
-        }
+    root_count = priv_root_paths(roots, PRIV_MAX_ROOTS);
+    for (index = 0; index < root_count && !matched; index++) {
+        priv_check_root(roots[index], real, strict, &matched, err, errlen);
     }
     if (!matched) {
-        const char *shared = priv_shared_volume_root();
-        if (shared != NULL) {
-            priv_check_root(shared, real, strict, &matched, err, errlen);
-        }
-    }
-    if (!matched) {
-        priv_roots_text(roots, sizeof(roots));
+        char text[PRIV_ERR_LEN];
+        priv_roots_text(text, sizeof(text));
         snprintf(err, errlen,
                  "path %s is outside the privileged helper roots (%s)", path,
-                 roots);
+                 text);
         free(real);
         return -1;
     }
