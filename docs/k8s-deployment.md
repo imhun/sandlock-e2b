@@ -2089,7 +2089,7 @@ NFS 会把"已被 unlink 但仍被打开"的文件改名为 `.nfsXXXX` 并保留
 
 **"同一条命令里删了再写"可用**：`unlink`/`rmdir` 成功时中介按**删除前**的 `symlink_metadata` 把字节记进
 `freed`（目录记 0），并**当场**把这份额度通过 `prlimit` 交还调用者（软限 = 剩余 + 该进程已写量），
-不等下一轮记账。实测 `probe_delete_then_write.py`：填满 1024 MiB → 一条命令 `rm -f fill.bin; dd of=after.bin 1MiB`
+不等下一轮记账。实测 `deploy/scripts/acceptance/probe_delete_then_write.py`：填满 1024 MiB → 一条命令 `rm -f fill.bin; dd of=after.bin 1MiB`
 → `rc=0`、`after.bin=1048576`；下一条命令照样能写。
 
 **代价**：单个文件的上限仍然等于实例上限（`RLIMIT_FSIZE` 分不开同一进程的两个文件），"总量"约束靠
@@ -2112,9 +2112,9 @@ description），所以"现在多大"只差一次 `fdinfo` 读——现在 `is_e
 | `probe_push_and_tighten.py` A（3×900 MiB / 1024 预算） | **0 MiB** 超支（三次 run 全部 1024 整）PASS |
 | 同 B（一条命令里的失控写者） | 拦住写 + 删除可用 + 腾空间后可写，且**不冻结** PASS |
 | `probe_exec_limit.py` | 单文件 **324.0 MiB**；第二个文件 **0 MiB**；串行 324.0 / 0，树 1024 MiB |
-| `probe_second_file_race.py`（同一形状 ×8，两命令之间不停顿） | **0/8** 越界 |
-| `probe_delete_then_write.py` | 同命令删后写 `rc=0`，`after.bin=1048576` |
-| `probe_guest_raise_ctypes.py` | 抬高全 `EPERM`、下调 `0`、之后正常写 |
+| `deploy/scripts/acceptance/probe_second_file_race.py`（同一形状 ×8，两命令之间不停顿） | **0/8** 越界 |
+| `deploy/scripts/acceptance/probe_delete_then_write.py` | 同命令删后写 `rc=0`，`after.bin=1048576` |
+| `deploy/scripts/acceptance/probe_guest_raise_ctypes.py` | 抬高全 `EPERM`、下调 `0`、之后正常写 |
 | `probe_dir_ledger.py` | 6144=6144、12144=12144，逐字节相等 |
 | `deployment_smoke.py` / `multinode_smoke.py` | 全绿；kill 后预留归零 |
 | fork 测试 | core lib **887** 通过；supervise 28 通过 / 1 预存在失败（`test_supervise_path_serve_launches_instance_and_serves_verbs_until_shutdown`，未改动的树上同样失败） |
@@ -2457,7 +2457,7 @@ ctypes 直接调 libc 的 `statx`（`struct statx.stx_size` 在 256 字节记录
 * 换掉整树 walk 也不够：增量账本已经只重扫脏目录了，脏目录里的**那个文件**照样要问大小。
 
 **上线实测**（`0.1.0-400-g37e8da3-20260919-103017`，`deploy/scripts/acceptance/probe_brief_stat_live.py` /
-`probe_freeze_latency_cp.py` 可复跑）：
+`deploy/scripts/acceptance/probe_freeze_latency_cp.py` 可复跑）：
 
 | 项 | 改前 | 改后 |
 |---|---|---|

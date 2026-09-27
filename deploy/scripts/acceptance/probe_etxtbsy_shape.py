@@ -13,7 +13,7 @@ code, and uses the pure shape as a negative control (unmediated there, so its
 writes register no watch).
 
 Usage (inside the lane container):
-    python3 tmp/k0s/probe_etxtbsy_shape.py [chroot|pure] [iterations]
+    python3 deploy/scripts/acceptance/probe_etxtbsy_shape.py [chroot|pure] [iterations]
 """
 
 import asyncio

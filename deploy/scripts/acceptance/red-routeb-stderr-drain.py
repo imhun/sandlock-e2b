@@ -9,7 +9,7 @@ test_a_talkative_slot_stderr_cannot_wedge_its_writer, run twice:
            ``proc.wait(...) == 0`` an assertion instead of a tautology.
 * GREEN -- the shipped drain: the same writer exits 0 and the tail is kept.
 
-    sh tmp/k0s/n35-lane.sh python3 -u tmp/k0s/red-routeb-stderr-drain.py
+    sh deploy/scripts/acceptance/n35-lane.sh python3 -u deploy/scripts/acceptance/red-routeb-stderr-drain.py
 """
 from __future__ import annotations
 

@@ -13,7 +13,7 @@ confirms that a *path* exec outside that grant is refused, and then measures the
 fd exec. Both are reported with their errno.
 
     docker run --privileged --rm -v "$PWD":/src -w /src sandlock-dev:latest \
-        python3 /src/tmp/k0s/probe_landlock_execveat.py
+        python3 /workspace/deploy/scripts/acceptance/probe_landlock_execveat.py
 """
 
 from __future__ import annotations

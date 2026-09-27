@@ -13,7 +13,7 @@ would measure the platform's claims, not the kernel's state.
 
 Usage (inside the lane container):
 
-    python3 -u tmp/k0s/probe_n35_ns.py [chroot|pure]
+    python3 -u deploy/scripts/acceptance/probe_n35_ns.py [chroot|pure]
 """
 
 import asyncio

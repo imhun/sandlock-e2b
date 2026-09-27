@@ -2,7 +2,7 @@
 # Run one command in the prod-shaped lane (the same container shape as
 # deploy/scripts/test-prod-shaped.sh phase 1), for the N35 probes.
 #
-#   sh tmp/k0s/n35-lane.sh python3 -u tmp/k0s/probe_n35_exec_gate.py chroot all
+#   sh deploy/scripts/acceptance/n35-lane.sh python3 -u deploy/scripts/acceptance/probe_n35_exec_gate.py chroot all
 #
 # SANLOCK_EVENT_TRACE=1 is on: the fork's step trace goes to the container's
 # stderr, which is exactly where this script leaves it.

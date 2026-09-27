@@ -20,8 +20,8 @@ synthesized):
 
 Usage (inside the lane container, root):
 
-    python3 -u tmp/k0s/probe_n35_realmount.py
-    PROD_DROP_CAPS=SYS_ADMIN sh tmp/k0s/n35-lane.sh python3 -u tmp/k0s/probe_n35_realmount.py
+    python3 -u deploy/scripts/acceptance/probe_n35_realmount.py
+    PROD_DROP_CAPS=SYS_ADMIN sh deploy/scripts/acceptance/n35-lane.sh python3 -u deploy/scripts/acceptance/probe_n35_realmount.py
 """
 
 import ctypes

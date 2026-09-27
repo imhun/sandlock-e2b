@@ -7,9 +7,9 @@ tests/contract/test_route_b_executor.py::_executor (pure shape forced onto route
 B) and asks the guest for an errno matrix: which paths are *searchable*, which
 answer ENOENT, and whether the matrix moves with SANLOCK_REALROOT_TRACE.
 
-    sh tmp/k0s/phase1-probe2.sh /workspace/tmp/k0s/probe_127_errno.py     # trace unset
+    sh deploy/scripts/acceptance/phase1-probe2.sh /workspace/deploy/scripts/acceptance/probe_127_errno.py     # trace unset
     TRACE_ENV="-e SANLOCK_REALROOT_TRACE=/tmp/x" \
-        sh tmp/k0s/phase1-probe2.sh /workspace/tmp/k0s/probe_127_errno.py # trace set
+        sh deploy/scripts/acceptance/phase1-probe2.sh /workspace/deploy/scripts/acceptance/probe_127_errno.py # trace set
 """
 
 from __future__ import annotations

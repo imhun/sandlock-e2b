@@ -39,7 +39,7 @@ access(2) with the supervisor idle, which is a result in its own right.
 Usage (inside the lane container, i.e. the docker run of
 deploy/scripts/test-prod-shaped.sh without the pytest tail):
 
-    python3 -u tmp/k0s/probe_n35_exec_gate.py [chroot|pure] [grant] [leg|all|list]
+    python3 -u deploy/scripts/acceptance/probe_n35_exec_gate.py [chroot|pure] [grant] [leg|all|list]
 
 "grant" only means anything for the chroot shape; it is ignored (and said so)
 in the pure shape.

@@ -56,6 +56,7 @@ wrote this file, red output pasted into
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent
@@ -75,9 +76,11 @@ ACCEPTANCE_SCRIPT = re.compile(
 
 #: deny list: old (gitignored) path -> where the byte-exact copy lives now. A
 #: live doc citing the left-hand side is red; the failure says to cite the right.
-#: 78 entries: the 67 from the first promotion round, the 10 fixed tools of the
-#: second round, and `checkpoint_acceptance.py` (whose old 437-line copy was a
-#: duplicate of the 632-line `deploy/scripts/checkpoint_acceptance.py`).
+#: 84 entries: the 67 from the first promotion round, the 10 fixed tools of the
+#: second round, `checkpoint_acceptance.py` (whose old 437-line copy was a
+#: duplicate of the 632-line `deploy/scripts/checkpoint_acceptance.py`), and the
+#: six probes a third pass caught -- they were cited by *bare filename*, which
+#: the path-shaped scan above cannot see (see `BARE_NAME_ALLOWANCES`).
 PROMOTED_ENTRIES = (
     ("tmp/arm-vm/run.sh", "deploy/scripts/acceptance/run.sh"),
     ("tmp/capacity_check.py", "deploy/scripts/acceptance/capacity_check.py"),
@@ -114,10 +117,16 @@ PROMOTED_ENTRIES = (
     ("tmp/k0s/probe_exec_limit.py", "deploy/scripts/acceptance/probe_exec_limit.py"),
     ("tmp/k0s/probe_kernel_copy.py", "deploy/scripts/acceptance/probe_kernel_copy.py"),
     ("tmp/k0s/probe_landlock_execveat.py", "deploy/scripts/acceptance/probe_landlock_execveat.py"),
+    ("tmp/k0s/probe_delete_then_write.py", "deploy/scripts/acceptance/probe_delete_then_write.py"),
+    ("tmp/k0s/probe_freeze_latency_cp.py", "deploy/scripts/acceptance/probe_freeze_latency_cp.py"),
+    ("tmp/k0s/probe_guest_raise_ctypes.py", "deploy/scripts/acceptance/probe_guest_raise_ctypes.py"),
+    ("tmp/k0s/probe_second_file_race.py", "deploy/scripts/acceptance/probe_second_file_race.py"),
     ("tmp/k0s/probe_mmap_growth.py", "deploy/scripts/acceptance/probe_mmap_growth.py"),
     ("tmp/k0s/probe_n28_acceptance.py", "deploy/scripts/acceptance/probe_n28_acceptance.py"),
     ("tmp/k0s/probe_n29_sync.py", "deploy/scripts/acceptance/probe_n29_sync.py"),
     ("tmp/k0s/probe_n35_exec_gate.py", "deploy/scripts/acceptance/probe_n35_exec_gate.py"),
+    ("tmp/k0s/probe_n35_mount_perms.py", "deploy/scripts/acceptance/probe_n35_mount_perms.py"),
+    ("tmp/k0s/probe_n35_mount_variants.py", "deploy/scripts/acceptance/probe_n35_mount_variants.py"),
     ("tmp/k0s/probe_n35_ns.py", "deploy/scripts/acceptance/probe_n35_ns.py"),
     ("tmp/k0s/probe_n35_realmount.py", "deploy/scripts/acceptance/probe_n35_realmount.py"),
     ("tmp/k0s/probe_openat2_eagain.py", "deploy/scripts/acceptance/probe_openat2_eagain.py"),
@@ -267,3 +276,62 @@ def test_every_cited_acceptance_script_exists() -> None:
         "a live doc points at an acceptance script that is not in the repo: "
         f"{missing}"
     )
+
+
+#: The same promise, one level up. A doc often cites a criterion by *bare
+#: filename* -- "实测 `probe_delete_then_write.py`" -- and that form has no
+#: directory for the path-shaped scan above to bite on. It is not hypothetical:
+#: five N35/disk probes plus `probe_n35_mount_variants.py` were cited this way and
+#: stayed in `tmp/` through both promotion rounds, so a reader following the doc
+#: on a fresh checkout would find nothing. A bare name is now required to name a
+#: file this repo tracks (by basename) or to be explained in the manifest below --
+#: which is where the fork's own files go, since a submodule's contents are a
+#: gitlink to the parent and never appear in `git ls-files`.
+BARE_SCRIPT = re.compile(r"`([A-Za-z0-9_.-]+\.(?:py|sh))`")
+
+BARE_NAME_ALLOWANCES = {
+    "_sdk.py": "fork 子模块里的文件（third_party/sandlock/python/src/sandlock/_sdk.py）；父仓 git ls-files 看不到子模块内容",
+    "build-wheels.sh": "fork 子模块里的构建脚本（third_party/sandlock/python/build-wheels.sh），同上",
+    "exceptions.py": "fork 子模块里的异常类型模块（third_party/sandlock/python/src/sandlock/exceptions.py），同上",
+    "sandbox.py": "fork 子模块里的 SDK 模块（third_party/sandlock/python/src/sandlock/sandbox.py），同上",
+    "test-all.sh": "fork 子模块里的套件入口（third_party/sandlock/scripts/test-all.sh），同上",
+    "test_supervise_channel.py": "fork 子模块里的用例（third_party/sandlock/python/tests/），同上",
+    "verify-wheel.sh": "fork 子模块里的校验脚本（third_party/sandlock/python/verify-wheel.sh），同上",
+    "connection_config.py": "上游 e2b SDK 的内部模块（只在 SCALING.md 里做来源说明，本仓与其子模块都没有这个文件）",
+    "test_runtime_context_volumes.py": "A4 已删掉的历史测试（HANDOFF 在叙述那次改动，不是让人去跑）",
+}
+
+
+def _bare_names() -> set[str]:
+    found: set[str] = set()
+    for path in _live_docs():
+        found.update(BARE_SCRIPT.findall(path.read_text(encoding="utf-8")))
+    return found
+
+
+def _repo_basenames() -> set[str]:
+    listed = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files"], capture_output=True, text=True, check=True
+    )
+    return {Path(line).name for line in listed.stdout.splitlines()}
+
+
+def test_no_live_doc_names_a_script_that_this_repo_does_not_have() -> None:
+    """A bare filename in a live doc must resolve, or be a recorded exception."""
+    unresolved = sorted(_bare_names() - _repo_basenames() - set(BARE_NAME_ALLOWANCES))
+    assert unresolved == [], (
+        "a live doc tells the reader to use a script by name, and no file of "
+        f"that name is in this repo: {unresolved}"
+    )
+
+
+def test_every_bare_name_allowance_is_still_cited_and_explained() -> None:
+    cited = _bare_names()
+    stale = sorted(set(BARE_NAME_ALLOWANCES) - cited)
+    assert stale == [], f"these bare-name allowances no longer excuse anything: {stale}"
+    bad = sorted(
+        name
+        for name, reason in BARE_NAME_ALLOWANCES.items()
+        if not reason.strip() or "\n" in reason
+    )
+    assert bad == [], f"allowances need a one-line reason each: {bad}"

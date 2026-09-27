@@ -7,8 +7,8 @@ DaemonSet would have kept shipping an old filter to every node while the docs
 said to apply the new one (measured: the embedded payload is the profile as of
 `f532e39~1`).
 
-    python3 tmp/k0s/sync-seccomp-installer.py            # dry run (self-check + report)
-    python3 tmp/k0s/sync-seccomp-installer.py --write
+    python3 deploy/scripts/acceptance/sync-seccomp-installer.py            # dry run (self-check + report)
+    python3 deploy/scripts/acceptance/sync-seccomp-installer.py --write
 
 The self-check is a round trip: re-encoding the payload the file carries today
 must reproduce the block body byte-for-byte, which is what makes the encoder
