@@ -2453,3 +2453,68 @@ Fermat 第二班 + 控制器收尾）：
 在拷贝期间**持有** `e2b:snapshot:copy:<id>`（值 = owner 的租约令牌，**修前这张键从不出现**）、
 终态 `completed`、键已释放 ⇒ `N46 LEASE PROBE OK`（日志 `tmp/k0s/release-664-acceptance.log`）。
 N37 的 4000 文件判据与 checkpoint 端到端在上一版 `0.1.0-652` 上全绿，本版改的是快照/暂停路径、未复跑（记录 §13 已注明）。
+
+
+---
+
+## 2026-09-27 C1 特权外置（plan: `docs/superpowers/plans/2026-09-27-priv-broker-externalization.md`）
+
+**base commit**：`5c78065`（main，clean）
+
+**基线（wave 1 开始前实测）**
+- 容器内 `pytest tests/unit/test_priv_helpers.py -q -p no:cacheprovider` = **41 passed / 1 failed**
+  （`test_create_app_refuses_a_pool_that_contains_the_worker_identity` 预先存在，主干同样 → 视为环境基线，不得新增其它失败）
+- 本机 macOS 同一文件 = 31 passed / 11 failed（fixture 需要 `chown root`，**环境性失败**，不作为判据）
+- 测试环境统一用容器：`docker run --rm -v <worktree>:/w -w /w e2b-sandlock-test:latest sh -c '<cmd>'`
+  （镜像已有 cc/pytest/httpx/sandlock wheel，容器内为 root）
+
+**wave 1 派发（并行，各自独立 worktree/分支，写集互不重叠）**
+- Task 1（C 侧 `e2b-maint serve`/`ping` + 白名单第 4 根 `E2B_IMAGE_CACHE_DIR`）→ `tmp/wt-c1-t1` / `feat/c1-broker-serve`
+- Task 2（`priv_helpers` socket transport + hello 自检）→ `tmp/wt-c1-t2` / `feat/c1-socket-transport`
+- Task 3（非 root worker 下 secret 文件交给池 uid，修现存缺陷）→ `tmp/wt-c1-t3` / `feat/c1-secret-ownership`
+
+**冻结接口**：socket `/run/e2b-broker/broker.sock`；`E2B_PRIV_HELPER_TRANSPORT=auto|exec|socket`；
+请求 `{"v":1,"args":[...],"timeout_s":N}`（args **不含 argv[0]**，daemon 只 exec 自己）；
+响应 `{"v":1,"ok":true,"exit":N,"stdout":...,"stderr":...}`；握手 `{"v":1,"hello":true}`；
+`roots` 顺序 = workspace_base → state_base(若不同) → shared_volume_root(若有) → image_cache(若未出现)。
+
+**wave 1 进度（截至 2026-09-27 本轮）**
+- **Task 1（C broker）**：实现 `5b9ec0c`（14 passed，容器内连跑 5 次稳）。
+  评审（review-5c78065..5b9ec0c.diff）= **Needs fixes**，2 Important + 1 Extra：
+  ① `serve` 在**鉴权前**无权上限 `fork`，且 socket `0666`、`fork` 失败即 `priv_fail` 自杀 → 非特权 uid 可打死节点 broker（修：父进程先 `SO_PEERCRED` 判定、fork 失败只拒当前连接、并发上限、socket 改 `0660`+`chown 0:<peer gid>`）；
+  ② `walk` 输出对非 UTF-8 文件名产出非法 JSON（修：非法字节按 `surrogateescape` 输出 `\udcXX`）；
+  ③ Extra：删掉 `E2B_MAINT_BIN`，自检锚定编译期安装路径。**修复在途**。
+  已记 Minor 待最终评审：请求读取无超时 / 重复键语义 / roots 去重字符串比较 / 僵尸回收时机 / 某测试单键断言；以及 timeout 与 256 MiB 输出上限**无自动化覆盖**。
+- **Task 2（Python transport）**：实现 `269402a`（新文件 13 passed）。评审 = **Approved**，2 Important：
+  ① exec/socket 两分支 ~25 行**逐字重复**（抽 `_build_helpers`）；
+  ② `roots` 比对依赖两侧同口径归一（C 侧 `getenv` 原样 vs Python 已 `resolve()`；修：比较前两侧 `realpath` 归一 + 符号链接拼写用例）；
+  另扩展写集到 `tests/unit/test_priv_helpers.py`：修 plan-mandated 的环境敏感（加 `monkeypatch.delenv("E2B_IMAGE_CACHE_DIR")` + 新增第 4 根用例）。**修复在途**。
+  已记 Minor 待最终评审：畸形应答的异常类型 / `_read_broker_line` 无长度上限 / 未校验 `v` 与 `peer_uid` / 覆盖可更广 / `auto` 模式下残留 socket 会硬拒启动（**裁定：保持 fail closed，由 Task 7 文档承担**）。
+- **Task 3（secret 属主）**：实现 `6bb065a`。一评 = Needs fixes（Critical：交主后 `os.chmod` 必 EPERM，修复等于无效；Important：fail-closed 留 0644 凭据；Important：测试未钉顺序；Minor：`if identity:`）。
+  修复 `85de121`（chmod 提前 + unlink 清理 + 有序事件整表断言 + `is not None`）。二评 = **Needs fixes**，新 Important：交主后同一 `.secret` 在**后续 policy 重建**（idle/24h reopen）会被自己挡住 → `open(w)` EACCES（修：写前 `path.unlink(missing_ok=True)` + 两次调用用例 + root 用例去环境依赖）。**修复在途**。
+- 冻结协议与第 4 根规则的**裁定**已写入计划文件（`docs/superpowers/plans/2026-09-27-priv-broker-externalization.md` Global Constraints + Task 1 Step 3）：image cache 根**仅当 `E2B_IMAGE_CACHE_DIR` 显式非空时**纳入，无默认值。
+- **Task 3：complete（commits 6bb065a..0a6d27d，第 3 轮 review 通过）**
+  三轮：① 一评 Critical（交主后 chmod EPERM → 修 85de121）+ Important（0644 残留 / 测试未钉顺序）；② 二评 Important（交主后第二次 policy 重建 open(w) EACCES → 修 0a6d27d：写前 `path.unlink(missing_ok=True)` + 两次调用用例）；③ 三评 **Approved**（无 Critical/Important）。
+  三评留下的 Minor（留给最终整支评审）：多条目失败不回滚已交主文件 / `open()`→`chmod()` umask 窗口（**预先存在**）/ reclaim 依赖 `<secrets>/<sandbox_id>` 由 worker 创建且非 sticky（隐式契约，需真机确认）。
+  ⚠️ 跨任务待验：Task 2 的第 4 根合入后，非 root+broker 形态才不会走 fail-closed 分支（本 checkout 里 `_root_paths()` 只有三根，属预期）。
+- **Task 2：complete（commits 269402a..7a96838，第 2 轮 review 通过）**
+  两轮：① 一评 Approved，但 2 Important（exec/socket ~25 行逐字重复 → 抽 `_build_helpers`；roots 比对依赖两侧同口径归一 → `_realpath` 归一 + symlink 用例）；② 二评 **Approved**（reviewer 自己做了三次变异验证守卫双向灵敏度，并实测"导出/不导出 `E2B_IMAGE_CACHE_DIR`"两环境数字一致 1 failed/58 passed）。
+  写集授权扩到 `tests/unit/test_priv_helpers.py`（4 处 `delenv` + 1 条第 4 根用例），属计划强制的第 8 条收口。
+  待最终评审的 Minor：畸形应答异常类型 / `_read_broker_line` 无长度上限 / 未校验 `v`+`peer_uid` / `auto` 下残留 socket 硬拒（**裁定保持**）/ 测试面仍缺半包与去重用例 / `_build_helpers` 的"至少一个二进制"前提只写在调用方 / 相对路径归一是按 worker cwd 解析（仅记录）。
+  ⚠️ 跨任务关键约束（给 Task 1 与合并验证）：**roots 比较对顺序严格**，归一只解决拼写；C 侧顺序必须 = `[workspace, state(若不同), shared(若有), image_cache(若已配置且未重复)]`。
+- **Task 1 修复**：`049db0e`（父进程先鉴权→不 fork、fork 失败不自杀、`PRIV_MAX_HANDLERS 32`、socket 0660+chown、非 UTF-8 按 `surrogateescape` 输出 `\udcXX`、删 `E2B_MAINT_BIN` 锚定编译期路径），4 条变异验证；**复审在途**。
+- **集成分支 `feat/c1-wave1`（worktree `tmp/wt-c1-integration`）**：三次 `--no-ff` 合并无冲突。
+  - 合并后联合跑（容器内）：`test_priv_broker_protocol + test_priv_helpers + test_sandbox_secret_ownership + test_shared_volume_traversal + test_broker_socket_c` = **94 passed / 2 failed**，两条失败在**主干同红**（`test_worker_lifespan_runs_the_startup_probe`、`test_create_app_refuses_a_pool_that_contains_the_worker_identity`，已用主干 checkout 复现）⇒ 无新增失败。
+  - **跨任务端到端探针全绿**（`tmp/wt-c1-integration/tmp/c1_e2e_probe.py`，容器内 root daemon + uid 65534 client）：
+    `configure_priv_helpers` 接受 C daemon 的 hello（roots 逐位一致，含第 4 根 image cache）→ `broker_chown` 经 socket 把树交给 21000 → image-cache 下的 secret 也能交主 → worker 可 unlink 已交主的 secret（Task 3 reclaim 前提）→ 池外 uid 999 端到端被拒（消息含池段）。
+  - 探针顺带确认两条**真实部署前提**：① 必须设 `E2B_ROUTE_B_TMP_ROOT`（默认 `/tmp/sandlock-route-b` 不在白名单，共享形状自检会点名拒服）；② `resolve_priv_helpers` 只解析不安装单例，模块级 `broker_chown`（Task 3 用的入口）依赖 `configure_priv_helpers` 已在 `create_app` 里跑过。
+  - 探针目前只在 `tmp/`（gitignored）：**建议**后续提升为 `tests/contract/` 的常驻用例（是唯一钉住 C↔Python 接口的测试）。
+- 待办（T1 复审通过后）：最终整支评审 → 向用户汇报 wave 1 状态与 wave 2 选项。
+- **Task 1 终态：complete（commits 5b9ec0c→049db0e→a26758e，第 3 轮 review Approved）**。
+- **最终整支评审（reviewer: 独立 agent，range 5c78065..998cdda）= "With fixes"**，抓到两个**只有跨支评审才能发现**的 Critical（同一根因：exec 形态里"进程身份 = worker"，`serve` 之后不再成立）：
+  ① `chown --worker` 经 socket 把孤儿树交给 **root**（静默 `exit 0`，owner `0:0`；`uid_pool.py:206-208` 的"永不命名 root"契约被打破）；
+  ② `--gid <worker gid>` 经 socket 被 daemon 拒（`priv_gid_allowed` 的 own-gid 取的是 daemon 的 `getgid()`=0）→ **wave 2 每次 `Sandbox.create()` 都会挂**（c1 的树模型 `0770 owner=<池 uid> group=<worker gid>` 必然带这个 gid）。
+  另 Important：socket 形态 `--worker`/`--gid` 零覆盖（lane 把 peer uid/gid 设成测试进程自己，恰好掩盖）；`timeout_s` 零覆盖；Python 侧不校验 `peer_uid`、`exit` 缺省 0；`README.md:247` 旧口径且不在 Task 7 清单里（**已由我补进计划**）。
+- **终审修复（提交 `8c50698`，跨 C+Python）**：daemon 通过 `SO_PEERCRED` 后**无条件覆盖** `E2B_BROKER_WORKER_UID/GID` 传给子进程；`--worker` 与 `priv_gid_allowed` 的 own-gid 改用它（直接 exec 无该变量 → 回落 `getuid()/getgid()`，逐字不变）；`hello` 增 `peer_gid`；Python 侧断言 `peer_uid/peer_gid == euid/egid`、`v==1`、`exit` 必须为 int；新增跨侧契约测试 `tests/contract/test_broker_socket_identity.py`（root daemon + `setpriv` 到 65534 的客户端，daemon gid ≠ 对端 gid）。判据：`cc` 零输出；三文件 49 passed；`test_priv_helpers.py` 仍 1 failed/42 passed（预存）；`tmp/c1_e2e_probe.py` 全 OK；M1–M5 变异各让对应断言精确变红。
+- 计划文件已更新：Global Constraints 增"对端身份必须显式传给子进程"（含 wave 2 的 DaemonSet 必须把 `E2B_BROKER_PEER_UID/GID` 设成 worker 的 uid/gid 且与 socket 组一致）；Task 7 文件清单补上 `README.md`。
+- 滚存疑虑（留给 wave 2）：`timeout_s` 杀进程用例（~70 万条目/造树 26s，已在报告里记录配方）；滚动升级期"新 Python + 旧 daemon"会因缺 `peer_gid` 启动 fail closed（设计如此）。
