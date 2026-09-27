@@ -14,7 +14,7 @@ container, and the worker is the process that runs untrusted workloads.
   file has to be installed there: `deploy/k8s/seccomp-installer.yaml` (ConfigMap
   + DaemonSet) writes this exact file into `/var/lib/kubelet/seccomp/` on every
   node. Apply the installer and wait for it to be ready *before* rolling the
-  worker Deployment.
+  worker StatefulSet.
 
 The profile is **the Docker default profile plus exactly two syscalls** —
 nothing else is relaxed. Everything the sandbox itself needs (`seccomp` with
@@ -133,7 +133,7 @@ relaxation therefore reaches the worker/supervisor only.
 * **kubernetes** (`deploy/k8s/worker.yaml`): `Localhost` profiles are
   node-local state. Install the file as
   `/var/lib/kubelet/seccomp/sandlock-worker.json` on every node before rolling
-  the Deployment. `Localhost` is also an allowed value under the Pod Security
+  the StatefulSet. `Localhost` is also an allowed value under the Pod Security
   `baseline` seccomp rule, which `Unconfined` is not.
   Not every pod on the node carries this profile, and that is deliberate: the
   per-node `e2b-priv-broker` DaemonSet (`deploy/k8s/priv-broker.yaml`, C1) runs

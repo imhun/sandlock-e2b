@@ -94,7 +94,7 @@ F1 探针当时判"userns 需要 `CAP_SYS_ADMIN`"，那是在**本机 OrbStack �
 | broker（`/var/lib/e2b-priv/`） | file caps | 调用形态 |
 |---|---|---|
 | `e2b-slot-spawn` | `cap_setuid,cap_setgid+ep` | `spawn --uid X --gid X -- <sandlock-supervise 绝对路径> <args…>`；内部 `setgroups([])`→`setgid(X)`→`setuid(X)`→`execve`。`argv[0]` 钉死为 supervise 绝对路径、X 必须在已配 uid 池内，所以它不是「以任意 uid 跑任意程序」的通用工具；**不 shell、也不转手 exec 别的 setuid 工具**（实测那样 caps 会在 exec 时丢失：`setresuid failed: EPERM`）。槽位 exec 后自动零 cap（uid 变更清空 permitted/effective，supervise 自身无 file caps）。 |
-| `e2b-maint` | `cap_chown,cap_dac_override+ep` | `chown --uid X [--gid G] [--recursive] --path P`、`chown --worker …`、`rm --path P`、`walk --path P`。P 必须经 `realpath` 落在 `<workspace_base>/` 或 `<shared_volume_root>/` 之下，`..`/符号链接逃逸一律拒绝；`rm`/`chown` 还必须**严格在**根之下（不接受根本身）。 |
+| `e2b-maint` | `cap_chown,cap_dac_override+ep` | `chown --uid X [--gid G] [--recursive] --path P`、`chown --worker …`、`rm --path P`、`walk --path P`。P 必须经 `realpath` 落在**四根**之一之下：`E2B_WORKSPACE_BASE`、`E2B_STATE_BASE`（N27，平台自己的记录/日志/checkpoint/`.route-b` 在这）、`E2B_SHARED_VOLUME_ROOT`（导出根，`_volumes`/`_images` 在这）、`E2B_IMAGE_CACHE_DIR`（**仅当显式非空**，沙箱 secret 文件 `<image_cache_dir>/secrets/<id>/` 在那）；`..`/符号链接逃逸一律拒绝；`rm`/`chown` 还必须**严格在**根之下（不接受根本身）。 |
 
 两者共用一份校验模块（`deploy/priv/priv_common.c`）：uid 池范围、根白名单、参数
 形状各只有一处实现，避免「其中一份忘了检查」。**broker 的职责分工（c1 之后）**：
@@ -106,7 +106,8 @@ route-B 的 `RouteBConfig.spawner` 指向 `e2b-slot-spawn`（唯一的"以池内
 （`envd_service/priv_helpers.py`：`remove_tree`/`dir_size` 都是「先自己来、EACCES 才找 broker」）；
 `E2B_PRIV_HELPERS=auto|off` 是开关，启动自检验证「存在 + cap 正确 + 沙箱不可达 +
 路径正确」，半安装的 broker 对一律 fail closed 并点名。非 root 形态的
-`E2B_ROUTE_B_TMP_ROOT` 必须在白名单根之下（清单已设 `/var/lib/e2b-sandboxes/.route-b`）：
+`E2B_ROUTE_B_TMP_ROOT` 必须在白名单根之下（compose 设 `/var/lib/e2b-sandboxes/.route-b`；
+k8s 设 `deploy/k8s/worker.yaml` 里的 `/var/lib/e2b-sandboxes/state/.route-b`，N27 把它挪进了 state base）：
 槽位 policy/program 文档靠 `e2b-maint` 归到该槽位 uid（`0440`，
 owner=worker 以便 W1 重启重写），否则会退化成 world-readable（策略文档带 egress
 proxy 凭据），自检会按名字拒绝。**root worker 形态保持现状**（root 自己有这些
@@ -211,7 +212,10 @@ cap**」。因此 broker 必须落在沙箱不可达的路径，且路径本身�
   broker 会变成沙箱可达；这也是「沙箱不可达」不能只靠 Landlock 论证的原因。
 - 面已经被收窄到最小：只授予**单个专用二进制**（不是通用 `setpriv`/`chown` 副本）、
   uid 必须在池内（**永不接受 uid 0**）、`spawn` 的 program 钉死为 `sandlock-supervise`
-  绝对路径、`maint` 的路径必须 `realpath` 落在两个白名单根之下。
+  绝对路径、`maint` 的路径必须 `realpath` 落在白名单根之下（四根：`E2B_WORKSPACE_BASE`、
+  `E2B_STATE_BASE`、`E2B_SHARED_VOLUME_ROOT`、`E2B_IMAGE_CACHE_DIR`（仅当显式非空）——
+  顺序与「仅当非空」的规则由 `deploy/priv/priv_common.c::priv_root_paths()` 与
+  `envd_service/priv_helpers.py::_root_paths()` 逐字钉住，两侧不一致 hello 握手就拒服）。
   沙箱若真能 exec broker 就等于拿到 `cap_setuid`——这是这条路线**接受**的风险，
   用上述四条把它压到「需要先突破 DAC + Landlock」的前提里。
 
