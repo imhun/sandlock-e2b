@@ -157,8 +157,12 @@ def test_spawn_argv_refuses_a_uid_without_a_matching_gid(tmp_path: Path) -> None
     ],
 )
 def test_path_escape_from_the_privileged_roots_is_refused(
-    tmp_path: Path, escape: str
+    tmp_path: Path, escape: str, monkeypatch
 ) -> None:
+    # C1 Task 2 (decision 2) added ``E2B_IMAGE_CACHE_DIR`` as a fourth root,
+    # and the expectation below spells the whitelist out: the ambient
+    # environment must not be the one that names an image cache.
+    monkeypatch.delenv("E2B_IMAGE_CACHE_DIR", raising=False)
     helpers = _helpers(tmp_path)
     if escape == "absolute":
         raw: Path = Path("/etc/passwd")
@@ -189,6 +193,29 @@ def test_workspace_and_shared_volume_paths_resolve_inside(tmp_path: Path) -> Non
     assert helpers.resolve_path(inside_shared) == inside_shared
 
 
+def test_the_image_cache_is_a_whitelist_root_of_its_own(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C1 Task 2 (decision 2): the sandbox secrets live under the image cache.
+
+    ``<E2B_IMAGE_CACHE_DIR>/secrets/<sandbox_id>/`` holds ``0600`` files a
+    non-root worker can only hand to a pooled uid through the broker, so the
+    cache is a root in its own right -- last, after the workspace, state and
+    shared bases, which is the order the C broker reports in its ``hello``
+    answer (the worker compares the two lists literally, per-spelling
+    normalized).
+    """
+    cache = tmp_path / "images"
+    monkeypatch.setenv("E2B_IMAGE_CACHE_DIR", str(cache))
+    helpers = _helpers(tmp_path)
+    assert helpers._root_paths()[-1] == cache
+    assert helpers.roots_text == (
+        f"{helpers.workspace_base}, {helpers.shared_volume_root}, {cache}"
+    )
+    assert helpers.resolve_path(cache) == Path(os.path.realpath(cache))
+    assert helpers.subprocess_env()["E2B_IMAGE_CACHE_DIR"] == str(cache)
+
+
 def test_a_path_that_only_exists_under_the_state_base_resolves(
     workspace: Path, tmp_path: Path, monkeypatch
 ) -> None:
@@ -203,6 +230,7 @@ def test_a_path_that_only_exists_under_the_state_base_resolves(
     a string comparison against the environment.
     """
     monkeypatch.delenv("E2B_STATE_BASE", raising=False)
+    monkeypatch.delenv("E2B_IMAGE_CACHE_DIR", raising=False)
     state_base = workspace / "state"
     record = state_base / "_runtime" / "sbx_state" / "sandbox.json"
     record.parent.mkdir(parents=True)
@@ -382,7 +410,12 @@ def test_chown_refuses_a_uid_outside_the_pool(tmp_path: Path) -> None:
     )
 
 
-def test_delete_and_chown_never_target_a_whole_managed_root(tmp_path: Path) -> None:
+def test_delete_and_chown_never_target_a_whole_managed_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The whitelist is spelled out below, so it has to be an explicit one: an
+    # ambient ``E2B_IMAGE_CACHE_DIR`` would add a fourth root to the text.
+    monkeypatch.delenv("E2B_IMAGE_CACHE_DIR", raising=False)
     helpers = _helpers(tmp_path)
     for build in (helpers.rm_argv, helpers.chown_worker_argv):
         with pytest.raises(ph.PrivHelperError) as excinfo:
@@ -743,6 +776,8 @@ def test_the_route_b_scratch_root_must_be_reachable_by_the_maintenance_broker(
     # N27: the expectation below spells out the whole whitelist, so the
     # ambient environment must not be the one that names a state base.
     monkeypatch.delenv("E2B_STATE_BASE", raising=False)
+    # Same for the fourth root C1 Task 2 added.
+    monkeypatch.delenv("E2B_IMAGE_CACHE_DIR", raising=False)
     _install(tmp_path, monkeypatch)
     settings = _settings(tmp_path, route_b_tmp_root=Path("/tmp/sandlock-route-b"))
     with pytest.raises(ph.PrivHelperError) as excinfo:
