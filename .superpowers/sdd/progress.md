@@ -2434,3 +2434,15 @@ Fermat 第二班 + 控制器收尾）：
   而它不被取），会把在飞记录当孤儿重驱动 → worker 对半写 payload 回 409 → `mark_failed`。
   **当前够不着**（拷贝先超时），但只要 ① 重启变快（把那 13x 秒的 chown 优化掉，我们本来就想做）或
   ② 拷贝超时调大，窗口立刻非空。两个候选修法（未命名也持认领 / 记录里落 owner+心跳）与各自代价写在 N46 行内。
+
+## 2026-09-27 第三轮："都做了吧" = 三条待拍板 + N46 全做
+
+| # | 裁定 | 结果 | commit |
+|---|---|---|---|
+| 1 | **pure 默认根 `off`→`synth`** | ✅ 选**成对耦合**：`E2B_PURE_ROOTFS` 默认 `synth`；`E2B_REAL_ROOT` 未设时"有合成根就装真根"（`resolve_real_root`），显式 `=0` 仍被守卫按名拒绝；image 形态与两套生产清单**零变化**；退回杆一句话 `E2B_PURE_ROOTFS=off`。gateA `2119/10/3`、gateB(identity) `2112/17/3`、pure 两态 contract `380/5` 与 `379/6` 全 **0 failed**；3 变异各红。影响面：只有 `deploy/compose/docker-compose.yml` 的 `envd` 必须补键（无 base image + Docker 默认 seccomp 档实测 `unshare: EPERM`），6 个 lane 脚本补 `off` | `098ba10`（Sartre） |
+| 2 | **E6 `E2B_PAUSED_TTL_S`** | ✅ 默认 **0 = 不启用**（关时连任务/claim 都不建）；打开后周期任务只删"超期且 paused"，先走 delete 同一 teardown（删 `_runtime/.checkpoints/<id>`）再删记录，点名日志；单飞 `e2b:paused-ttl:sweep` | `4396915`（Turing） |
+| 3 | **E7 超预算告警 + E5 定义** | ✅ `E2B_PLATFORM_LEDGER_ALERT_RATIO` 默认 **0.8**，进入/退出各一条点名 WARNING、单飞、`budget=0` 永不告警；**E5 判"无独立交付"**（全计划正文零定义、只被 E8 引用，那处依赖落在 E4/E6/E7 + 决策点表第 2 行），依赖表就地标注。24 条新用例、11 个变异逐个被杀 | 同上 |
+| 4 | **N46 修掉** | ✅ 选**租约版**：未命名异步拷贝也持认领（值 `token:owner`），owner 每 10 s 续租（TTL 30 s），条件续租/条件释放；`snapshot_reconcile_loop` 每 10 s 跑启动扫描（单飞 `try_acquire_reconcile`）⇒ "有主在拷"与"孤儿"可区分，孤儿 settle 上界 ≈ 最后续租 + 40 s；带名路径逐字未变，无租约的 `creating` 仍被 settle。8 条单测（假时钟）+5 条契约先红后绿、**7 个变异各红一次** | `c5acc04`（Darwin） |
+| 5 | 控制器收尾 | 接线 `snapshot_reconcile_loop` 进 `app.py` lifespan（含关闭时取消）；修掉提升后残留的 **3 处路径 bug**（`phase2.sh`、`probe-pure-restore-synthroot.sh` 的 `cd ../..` 与 `sync-seccomp-installer.py` 的 `parents[2]` —— 提升一级后都指错）；给 `test_shared_volume_relative_cwd.py` 补 `sandlock_ready()` 环境门（默认翻 synth 后它在 macOS 会真跑并死在"没有 sandlock 模块"，同目录其它契约都有这道门）；索引三条行就地更新 | 本提交 |
+
+全量 `tests/unit + tests/contract` = **14 failed**（已知 macOS-only 那 14 条，逐条同名）/ 1952 passed / 61 skipped。

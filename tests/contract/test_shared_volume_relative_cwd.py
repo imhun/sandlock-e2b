@@ -35,6 +35,22 @@ from tests.contract.test_uid_permissions import (
     _result,
     _run_cmd,
 )
+from tests.security.conftest import sandlock_ready
+
+#: The shape gate below says *when the aliases exist*; this one says whether we
+#: can build the sandbox that has them. Both are needed: since 2026-09-27 the
+#: pure shape is rooted by default, so the shape condition is satisfied on a
+#: machine with no sandlock wheel at all -- the test then died inside
+#: ``create_executor`` ("the sandlock package is not installed") instead of
+#: skipping, which is the same environment gate its sibling contracts
+#: (``test_pure_shape_workspace_ownership``, ``test_route_b_executor``) carry.
+pytestmark = pytest.mark.skipif(
+    not sandlock_ready(),
+    reason=(
+        "the workspace-alias contract needs Linux + sandlock "
+        "(run inside the Docker test runner)"
+    ),
+)
 
 # Mirrors tests/contract/test_pure_shape_workspace_ownership.py::_NO_BASE_IMAGE
 # (marker object + decorator), inverted and widened: this contract needs a shape

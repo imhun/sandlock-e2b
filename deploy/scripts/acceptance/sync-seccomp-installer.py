@@ -23,7 +23,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 INSTALLER = REPO / "deploy" / "k8s" / "seccomp-installer.yaml"
 PROFILE = REPO / "deploy" / "seccomp" / "sandlock-worker.json"
 MARKER = "  sandlock-worker.json: |-\n"

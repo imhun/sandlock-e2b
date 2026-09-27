@@ -10,7 +10,7 @@
 # `task12cur`（逐文件 sha 与 `wheels/fork` 相等，见 tmp/k0s/task12/image-source-check.txt）。
 # 共享 `:latest` 一字未动。
 set -eu
-cd "$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$(cd "$(dirname "$0")/../../.." && pwd)"
 E2B_TEST_IMAGE="${E2B_TEST_IMAGE:-e2b-sandlock-test:task12cur}"
 export E2B_TEST_IMAGE
 log="$1"

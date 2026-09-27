@@ -1,7 +1,7 @@
 #!/bin/sh
 # test-prod-shaped.sh's phase 2 (the unprivileged worker), runnable on its own.
 set -eu
-cd "$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$(cd "$(dirname "$0")/../../.." && pwd)"
 log="$1"
 # Same `E2B_TEST_IMAGE` knob as the gate scripts: the image bakes in
 # `wheels/fork/*.whl`, so a same-source lane must name it instead of taking the

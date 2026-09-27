@@ -21,6 +21,7 @@ from control_plane.api.secrets import router as secrets_router
 from control_plane.api.snapshots import (
     reconcile_pending_snapshots,
     router as snapshots_router,
+    snapshot_reconcile_loop,
 )
 from control_plane.api.templates import router as templates_router
 from control_plane.api.volumes import router as volumes_router
@@ -388,6 +389,16 @@ def create_app(
         startup_snapshot_task = asyncio.create_task(
             reconcile_pending_snapshots(app)
         )
+        # N46: the startup pass above is not enough once ``creating`` records
+        # can belong to a *live* owner. An unnamed async copy now holds a
+        # short lease that its owner renews while it runs, so "no claim" still
+        # means "orphan" -- but only after the owner's lease lapses, which the
+        # one-shot pass cannot wait for. This cadence is that second look; it
+        # is single-flight (``try_acquire_reconcile``), so two replicas never
+        # settle the same record.
+        snapshot_reconcile_task = asyncio.create_task(
+            snapshot_reconcile_loop(app)
+        )
         app.state.node_health_task = health_task
         try:
             yield
@@ -402,6 +413,11 @@ def create_app(
             health_task.cancel()
             try:
                 await health_task
+            except asyncio.CancelledError:
+                pass
+            snapshot_reconcile_task.cancel()
+            try:
+                await snapshot_reconcile_task
             except asyncio.CancelledError:
                 pass
         await sweeper.stop()
