@@ -2547,3 +2547,9 @@ N37 的 4000 文件判据与 checkpoint 端到端在上一版 `0.1.0-652` 上全
 - `image-cache-init` 对 `secrets/` 的 chown：`|| true` → 可见的 `|| echo "chown refused …"`（non-fatal），并 pin 住 `-mindepth 1 -maxdepth 2 -type d` 契约。
 - `migrate-state-base.sh`：4 处 `$VAR（` → `${VAR}`、`usage()` sed 上界改准、新增静态扫描用例。
 - 判据：main 上 host `134 passed`、容器 `58 passed`（protocol + 两条契约 lane）；逐条撤销即红均已取证（含新加的 WARNING 用例的 RED/GREEN）。
+
+**尾项已随新版本上集群（2026-09-27 第二次上线）**
+- 版本 `0.1.0-708-g3f92ba3-20260927-211625`；走的是**真正的升级路径**（集群上已有 broker），日志顺序证明 `apply.sh` 的"先 broker 后 worker"闸门生效（`等待 broker DaemonSet 滚动完成` → broker rolled out → `等待 worker 滚动完成` → 预热）。
+- 验收：broker/worker 全 1/1；broker `CapEff=0xcb`；peer 身份 ping `ok:true` 且四根一致；运行镜像里 `BROKER_MAX_WALK_RESPONSE_BYTES == 512 MiB`；`multinode_smoke` + `deployment_smoke` **都一次过**。
+- 记录：`docs/deploy-clusters.md` §7.2（含"重建镜像期间隧道会掉，重开 `open-cluster-tunnel.sh` 即可"这个运维坑）。
+- 至此 C1（wave 1 + wave 2 + 尾项）**代码、清单、文档、真机部署与验收全部完成**；plan 的"执行状态"节里已无未完成项，只剩一条环境侧既有噪声（CP 两副本导致 `deployment_smoke` 模板轮询偶发 404）。

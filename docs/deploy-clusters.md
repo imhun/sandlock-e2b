@@ -130,9 +130,9 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 
 ## 7. 当前部署状态（2026-09-27 实测，改部署前先复核；最近一次发版记录见 §12）
 
-**版本**：`0.1.0-698-g55e5e79-20260927-195247`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的；
-C1 wave 1+2 的代码从这里开始上线）。2026-09-27 实测：`autoscaler` / `control-plane` / `e2b-worker`
-三个工作负载的镜像都是这一版。
+**版本**：`0.1.0-708-g3f92ba3-20260927-211625`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的；
+C1 的三条尾项也在这一版）。2026-09-27 两次上线实测：`autoscaler` / `control-plane` / `e2b-worker` /
+`e2b-priv-broker` 四个工作负载的镜像都是同一版（broker 与 worker 必须同版本滚，见 §7.1）。
 
 **pod（2026-09-27 20:0x 实测，C1 上线后）**：`control-plane` 两个副本各 `2/2`、
 `autoscaler` `1/1`、`e2b-worker-0/1` 各 `1/1`（分别落在 `.80.94` / `.80.140`）、`redis` `1/1`、
@@ -181,6 +181,25 @@ C1 wave 1+2 的代码从这里开始上线）。2026-09-27 实测：`autoscaler`
 2. **`deployment_smoke` 第一次跑在模板构建轮询上 404**（`Template build bld_… not found`），
    立刻重跑即全绿。CP 有两个副本而构建状态是进程内的：轮询被 Service 打到另一个副本就会
    404（与文档里"控制面只能 1 副本"同源，属**既有**环境问题，不是 C1 引入）。
+
+### 7.2 第二次上线：三条尾项收口（2026-09-27，已执行）
+
+版本 `0.1.0-708-g3f92ba3-20260927-211625`。这次是**真正的升级路径**（集群上已有 broker），
+顺带验证了 `apply.sh` 内建的"先 `ds/e2b-priv-broker` 后 `sts/e2b-worker`"闸门：
+`build-and-push.sh` → `apply.sh`（日志顺序：`等待 broker DaemonSet 滚动完成` →
+`daemon set "e2b-priv-broker" successfully rolled out` → `等待 worker 滚动完成` → 预热）→ 冒烟。
+
+尾项内容：`walk` 有自己的 512 MiB 上限（推导写实）且 `runtime/platform_disk` 从"整棵 `_runtime`
+一次 walk"改成逐子项求和（否则单树前提不成立、合法答案会被拒）；`image-cache-init` 对 `secrets/`
+的 chown 失败不再静默；`migrate-state-base.sh` 的 4 处 bash 3.2 隐患修掉。
+
+验收：broker/worker 全 `1/1`；broker `CapEff=0xcb`；peer 身份 `ping` 回 `ok:true` 且四根一致；
+运行中的镜像里 `BROKER_MAX_WALK_RESPONSE_BYTES == 512 MiB`；`multinode_smoke` 与
+`deployment_smoke` **都一次跑过**（`DEPLOYMENT SMOKE OK`）。
+
+**一个小坑**：重建镜像期间隧道会掉（`apply.sh` 报
+`dial tcp 127.0.0.1:16443: connect: connection refused`）——重跑
+`deploy/scripts/open-cluster-tunnel.sh` 即可，别把它当成集群问题。
 
 **C1 特权外置后的形态（2026-09-27，wave 2；仓库规格 = 下一次 apply 之后的集群形态）**：
 
