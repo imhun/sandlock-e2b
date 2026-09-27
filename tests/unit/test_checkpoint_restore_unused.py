@@ -57,13 +57,54 @@ REPO = Path(__file__).resolve().parents[2]
 FORBIDDEN = (".checkpoint(", "restore_interactive", ".restore_skipped(")
 
 
-def test_no_worker_source_calls_the_fork_checkpoint_restore_api() -> None:
+def _worker_sources(repo: Path) -> list[Path]:
+    """Every ``envd_service/**/*.py`` under *repo* -- the scan's whole input."""
+    return sorted((repo / "envd_service").rglob("*.py"))
+
+
+def _offenders(repo: Path) -> list[str]:
+    """``relative/path.py: needle`` for each forbidden call site, in file order."""
     offenders: list[str] = []
-    for path in sorted((REPO / "envd_service").rglob("*.py")):
+    for path in _worker_sources(repo):
         text = path.read_text(encoding="utf-8")
         for needle in FORBIDDEN:
             if needle in text:
-                offenders.append(f"{path.relative_to(REPO)}: {needle}")
+                offenders.append(f"{path.relative_to(repo)}: {needle}")
+    return offenders
+
+
+def test_the_scan_actually_reads_the_worker_tree() -> None:
+    """The guard has to *look at something* before it can be green about it.
+
+    ``offenders == []`` is also what a scan of nothing returns, so a renamed
+    ``envd_service/`` (or a package that stopped shipping ``.py`` files) would
+    leave this suite green while the call sites it exists to forbid went
+    unread. The count is asserted rather than a file list because the tree
+    legitimately grows.
+    """
+    assert _worker_sources(REPO) != [], (
+        "the scan found no `envd_service/**/*.py`; the guard is no longer "
+        "reading the worker tree, so its emptiness proves nothing"
+    )
+
+
+def test_the_scan_flags_a_call_site_in_a_synthetic_tree(tmp_path: Path) -> None:
+    """The other half: a call site is an *offender*, not merely "not found".
+
+    Monkeypatching the real ``REPO`` to show this would race the other
+    workstreams sharing this worktree, so the tree is built here and matched by
+    the same :func:`_offenders` the real scan uses.
+    """
+    package = tmp_path / "envd_service"
+    package.mkdir()
+    (package / "bad.py").write_text(
+        "def f(sandbox):\n    return sandbox.checkpoint(dir)\n", encoding="utf-8"
+    )
+    assert _offenders(tmp_path) == ["envd_service/bad.py: .checkpoint("]
+
+
+def test_no_worker_source_calls_the_fork_checkpoint_restore_api() -> None:
+    offenders = _offenders(REPO)
     assert offenders == [], (
         "envd reached into the fork's checkpoint/restore bindings directly. Under "
         "route B the `Sandbox` lives in the slot, so a checkpoint or a restore has "

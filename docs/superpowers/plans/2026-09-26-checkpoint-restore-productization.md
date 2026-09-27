@@ -1866,3 +1866,61 @@ git commit -m "fix(checkpoint): reclaim ownerless images, and leave no empty sto
 ```
 
 ---
+
+## E5–E8 收口审计（2026-09-27）
+
+**这是一节审计，不是新设计。** 本计划正文写到 `Task E4` 为止，`Task E5`/`E6`/`E7`/`E8`
+**没有任何一节正文**——它们只出现在上面的**依赖表**（`:53-59`）、**决策点表**（`:96-108`）
+与**验收矩阵**里。于是"E5–E8 今天各自到哪一步"在账面上没有答案。这一节把每一处引用逐条
+摘出来，到树里取证据（`rg` 具体符号，不凭印象），给处置；**已经拍过决定的补写进文档，
+没拍板的登记待决策，绝不为它们发明形状**。逐条原文摘录、判理由与文件清单见
+`.superpowers/sdd/checkpoint-e5-e8-audit-report.md`。
+
+### 决策点表（`:96-108`）7 行
+
+| 决策 | 落在哪 | 现状证据（文件:行） | 处置 |
+|---|---|---|---|
+| 1（余项）OCI / `--restore-from` 要不要也支持 exec | Task F4 决定门 / Task 2 Step 3 ③ | `rg -n "restore-from\|restore_from" envd_service control_plane deploy tests` = **0 命中**（2026-09-27 复核）；结论此前只落在 gitignored 的 `.superpowers/sdd/progress.md:2319` | **随裁定取消（不做）**；结论已补进 `docs/checkpoint-restore-e2b-half.md` §2 D9 行 + §6(k)⑤ |
+| 2 恢复后进程 stdout 是否接平台日志（今天 `/dev/null`） | Task E8 | 机制有据（`envd_service/route_b.py:332`、`deploy/k8s/worker.yaml:490-492`、`docs/checkpoint-restore-e2b-half.md` §6(j)），**对外语义全库无** | **已补写** → `docs/checkpoint-restore-e2b-half.md` §6(k)① |
+| 3 平台账"软账 + 并发可超"，暴露 `used/budget` + 告警 | Task E7（暴露）/ E8（口径） | 数字已上报节点视图（`envd_service/agent.py:265-266` → `control_plane/api/internal.py:106-107` → `control_plane/registry/nodes.py:206-207`），worker 回复也带（`envd_service/runtime/checkpoint_store.py:473-474`）；**公开端点不带**（`control_plane/api/sandboxes.py:2825-2832` → `checkpoint_store.py:302-308`）；口径句只在计划 `:102`；**无告警**（`rg 'alert\|PrometheusRule' deploy/` 0 命中） | **部分**：数字可见 ✔ / 口径**已补写** §6(k)② / **告警未做 → 登记 `docs/open-issues.md`** |
+| 4 paused 是否要有 TTL（`E2B_PAUSED_TTL_S`，默认 0） | Task E6 | `rg 'E2B_PAUSED_TTL_S' .` = **只命中本计划 `:103`**（无实现、无替代语义） | **未做 + 待决策** → 登记 `docs/open-issues.md`（**默认 0 = 不启用**） |
+| 5 新增公开只读 `GET /sandboxes/{id}/checkpoint` | Task E3 | `control_plane/api/sandboxes.py:2764-2832`；契约 `tests/contract/test_checkpoint_status_api.py` | **已做 ✔** |
+| 6 把 `tmp/k0s/checkpoint_acceptance.py` 转正进仓库 | Task 2 | `deploy/scripts/checkpoint_acceptance.py`（前置断言 `:379-380`） | **已做 ✔** |
+| 7 `E2B_PAUSE_CHECKPOINT` 长期默认 `"1"`，代价写进文档 | Task E8 | 清单 `deploy/k8s/worker.yaml:483-484`（`"1"`）+ 代价注释 `:455-492`；**代码默认仍关**（`envd_service/config.py:378`） | **已做 ✔**（清单注释即代价）；"长期默认开"的结论补进 §6(k)④ |
+
+### 依赖表（`:53-59`）里 E5–E8 的引用
+
+| 引用 | 现状证据（文件:行） | 处置 |
+|---|---|---|
+| `E4 → E8`（"文档要写'孤儿会回收'"） | 代码已做：`envd_service/runtime/checkpoint_store.py:640/681/714`、`envd_service/agent.py:2345`（reconcile 里调）、`:2423`（`checkpointsReclaimed`）；用例 `tests/unit/test_quota_maintenance.py:1686`。**文档无**（`rg '孤儿\|orphan\|回收' docs/checkpoint-restore-e2b-half.md docs/deploy-clusters.md` 0 命中） | 代码 ✔ / 文档**已补写** §6(k)③ |
+| `E5 → E8` | **本计划从未定义 `Task E5`**——`rg -n 'E5'` 全计划只有 `:38`/`:44`/`:56`/`:59` 四处*引用*，其中 `:56` 就是依赖表这一行 | **计划缺口 → 登记 `docs/open-issues.md`**（要先有形状才能判"做没做"） |
+| `E6 → E8` | 同决策 4 | **未做 + 待决策** |
+| `E7 → E8` | 同决策 3（"暴露数字"那半已在 S2 落地，见 §6(f)）；端到端验收已由 Task 2 的 `checkpoint_acceptance.py` 转正 | **部分**（告警未做 → 登记） |
+| `E8 → 全部`（文档/守卫收口） | 四件事：① 守卫 `docstring` 与 `FORBIDDEN` **已逐条验与事实一致 ✔**（见下）；② 对外语义未落盘 → 本轮补 §6(k)；③ 守卫**确实会红 ✔**，但空树静默绿 → 本轮加非空断言（RED→GREEN）；④ F3/F4 结论未落盘 → 本轮补 | ①②③④ 本轮收口，详见各行 |
+
+### Task E8 的守卫项：`tests/unit/test_checkpoint_restore_unused.py`
+
+计划 `:21` 与 Global Constraints 说"Task E8 必须把它的 docstring 改到与事实一致"。**验下来
+它今天已经一致**（不需要改），逐条：
+
+| docstring 的说法 | 事实（文件:行） |
+|---|---|
+| stub 靠描述符投递（`execveat(AT_EMPTY_PATH)`）、规则集给那一个宿主文件 `EXECUTE\|READ_FILE` | fork `crates/sandlock-core/src/sandbox.rs:1445-1463` |
+| `test_restore_resumes_inside_a_chroot_root` 两种根都跑、断言计数器前进且 fd 表干净 | 用例 `crates/sandlock-core/tests/integration/test_restore.rs:192`（`:199` 循环两态、`:283-294` 断言） |
+| 引擎覆盖 x86_64 / aarch64 / riscv64；stub 有 `__aarch64__`；build.rs 对缺失 stub 判 fatal | `sandbox.rs:1392-1398`、`restore-stub.c:2/85`、`crates/sandlock-core/build.rs:47-58` |
+| E2B 侧已建（S2/S3/S4） | `docs/checkpoint-restore-e2b-half.md` §3/§6 |
+
+**唯一发现的洞是"看着在守、其实没守"的空转**：`offenders == []` 也是"什么都没扫"的返回值，
+所以 `envd_service/` 一旦改名（或不再有 `*.py`），这条守卫会**静默变绿**。已按 TDD 收口：
+`_worker_sources`/`_offenders` 抽成可传入根目录的助手，加两条用例——① 真树必须非空
+（`test_the_scan_actually_reads_the_worker_tree`）；② 合成树里的 `.checkpoint(` 调用点必须被
+判成 offender（`test_the_scan_flags_a_call_site_in_a_synthetic_tree`，`assert _offenders(...) ==
+["envd_service/bad.py: .checkpoint("]`，整表相等）。RED = 空树静默通过（探针
+`tmp/e5e8/guard_probe.py`）；GREEN = 两条用例在真树上通过（`tmp/e5e8/guard_probe2.py`）。
+
+### 两条条件任务的决定门（`Task F3` / `Task F4`）
+
+| 任务 | 决定门 | 今天的结论 | 处置 |
+|---|---|---|---|
+| F3 | `rg "os\.replace\|mv \|rename" docs/checkpoint-restore-e2b-half.md docs/k8s-deployment.md` —— 出现"业务文件会被 replace"才做 | 命中只有本能力自己的 rename（引擎保存 `<dir>.tmp`→`latest`、验收脚本"临时文件 + `os.replace`"）与磁盘记账的 rename，**无业务文件被 replace 的用法** | **不做（默认）**；已复核并把"同路径换 inode 不校验"这句**已知边界**补进 §6(k)⑤ |
+| F4 | `rg "restore-from\|restore_from" envd_service control_plane deploy tests` —— 有命中才做 | **0 命中**（无消费者） | **不做（默认）**；结论补进 §2 D9 行 + §6(k)⑤ |

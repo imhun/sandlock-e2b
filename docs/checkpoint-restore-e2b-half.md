@@ -29,12 +29,15 @@ checkpoint/restore 补的正是这一段：**把一个正在跑的沙箱写进�
 所以"pause 活过 worker 重启"换来的是一个**进程还在、且还能继续往里敲命令**的沙箱。
 （本段 2026-09-26 更正：原文按"不能 exec"写，那只描述 OCI 那条 E2B 不使用的路。）
 
-> ⚠ 需求本身仍未确认：仓库里没有任何"用户要这个"的记录，`envd` 至今没碰过这套 API。
-> 本设计按"`pause` 存活"这个最有说服力的形状写；如果最后没人要，停在这里的代价也只是这份文档。
+> ✅ **需求已确认（2026-09-26，用户裁定）**：checkpoint/restore 是真实需求，按产品功能推进，
+> 恢复后**必须**支持 `exec`、生产形态**必须**支持（裁定表第 6 行，见
+> `docs/superpowers/plans/2026-09-26-decisions.md`）。原文那句"仓库里没有任何'用户要这个'的
+> 记录 / 需求仍未确认"**已过期**，这里就地更正。
 >
 > **实现已完成（2026-09-25，S2/S3/S4 见 §6）**：能力在 `E2B_PAUSE_CHECKPOINT`
 > 后面，**默认关** —— 打开它才改变 `pause` 的成本与 `resume` 的行为，
-> 这也是"需求未确认"这件事在代码里的形状。
+> 这是"能力默认不改变今天的行为"这件事在代码里的形状（生产清单把它设成 `"1"`，
+> 见 `deploy/k8s/worker.yaml`）。
 
 ---
 
@@ -59,7 +62,7 @@ worker 早就把"这个 slot 不认识这个 verb"（旧二进制）当成一种
 `sandlock-init` 只在主子进程活着时服务 `exec`，而 envd 实例在启动时没有自己的负载，
 所以 slot 用 `PARKING_PROGRAM`（一个自我 SIGSTOP 的 shell）当 M0。于是"用户跑过东西的沙箱"
 永远是 **2 个活子进程**（park + 负载），引擎（正确地）拒绝对它捕获。
-解法是让**只有部署能知道的那句话**说出来：`exclude_main`（见 §6(h)）。
+解法是让**只有部署能知道的那句话**说出来：`exclude_main`（见 §6(i) ②）。
 
 ### (b) blob 的天然位置**不在**磁盘账本里，而"计进账"这句话得说清记到谁头上
 
@@ -268,7 +271,7 @@ fork `1f41f1a` 关闭了。OCI 那句拒绝描述的是**另一条 E2B 不使用
 | D6 | `restore_skipped` 对外 | ✅ **已做**：恢复结果里带 fd 表（`unrecoveredFds` / `unrecoveredFdCount`），日志逐条列出，文档（本节 + §6(e)）明说"连接不回来"；**不**假装成功 | §1(c) |
 | D7 | 跨节点 | 允许（blob 在共享 NFS 上），但**同内核**是硬前提 | 引擎前提，与架构无关 |
 | D8 | 清理 | ✅ **已做，但是两条调用**：`_delete_sandbox_runtime` 删 `_runtime/<id>`，**再加** `checkpoint_store.remove_checkpoint_images` 删 `.checkpoints/<id>`（D1 改成并列之后，"删 `_runtime/<id>` 就够"不再成立）；隔离区（`_park_refused_tree`）同样把图搬进隔离区 | 图是平台为一个沙箱持有的最大东西，漏掉它就是把账留给一个没有人认领的目录 |
-| D9 | **恢复后 exec 不可用** | ✅ **已做（2026-09-25，fork `1f41f1a`）**：走 (b) —— 恢复**进会话**，会话继续服务 exec/wait/kill/记账。验收用例 `test_a_child_restored_into_a_session_keeps_the_session_executable`（三条断言：进程在跑、**恢复后仍能 exec**、`children_live` 算上它），`core_lib` 911/0、`test_restore::` 5/0、`test_instance*` 50/0 | 见 §(g) |
+| D9 | **恢复后 exec 不可用** | ✅ **已做（2026-09-25，fork `1f41f1a`）**：走 (b) —— 恢复**进会话**，会话继续服务 exec/wait/kill/记账。验收用例 `test_a_child_restored_into_a_session_keeps_the_session_executable`（三条断言：进程在跑、**恢复后仍能 exec**、`children_live` 算上它），`core_lib` 911/0、`test_restore::` 5/0、`test_instance*` 50/0。**OCI / `--restore-from` 那条 E2B 不消费的路按 Task F4 的决定门本轮不做**（2026-09-27 复核：`rg "restore-from\|restore_from" envd_service control_plane deploy tests` = **0 命中** ⇒ 无消费者） | 见 §(g)、§6(k) ⑤ |
 | D10 | **碰加载器只读页的程序恢复后即崩** | ✅ **已修（2026-09-25，fork `e9b8b6c`）**：捕获把 RELRO 段一并 dump；四类形状（`malloc`、vDSO、`fopen`、静态对照）全部恢复，`test_restore` 5/0、`core_lib` 904/0 | §1(e)/(f)。**不再是阻塞项**：这个能力对"真实程序"（python/node/sh）现在成立 |
 
 ---
@@ -500,3 +503,53 @@ dash 原地 `exec`（所以 `python3 …` 这种形状抓到的就是 python）�
    留的窗口）⇒ 断言 `the counter vanished at the pause`，看起来像"进程死了"。改成
    **临时文件 + `os.replace`**（同目录内原子）之后，任何时刻观察到的都是一个完整的值
    （旧的或新的），这条红消失。两次跑里红绿各一次，正是它随机的直接证据。
+
+### (k) 对外语义与两条条件任务的结论（2026-09-27，E5–E8 收口审计补写）
+
+这一节补的全是"决定已经拍过、只是没写下来"的话。出处是
+`docs/superpowers/plans/2026-09-26-checkpoint-restore-productization.md` 的决策点表与依赖表，
+逐条证据见同计划尾部的《E5–E8 收口审计》与
+`.superpowers/sdd/checkpoint-e5-e8-audit-report.md`。
+
+① **恢复出来的进程没有可读的 stdout/stderr —— 它进 `/dev/null`**（决策点表第 2 行）。
+会话把主程序的 stdio 接到 `/dev/null`（`envd_service/route_b.py:332`、
+`deploy/k8s/worker.yaml:490-492`），所以 `pause` 之前已经落在命令日志里的东西不会重放，
+恢复之后那个进程**新写的**东西也不进平台日志；唯一的引擎自述通道是 slot 的 stderr
+（`SANLOCK_RESTORE_TRACE`，见 `envd_service/executors/sandlock.py::_log_slot_stderr`）。
+对外一句话：**恢复的沙箱日志消失**，要日志就自己写文件。这是"恢复进会话"这条路的形状，
+不是缺陷。
+
+② **平台账是软账：允许并发短超。** 图记**平台**的账（`E2B_PLATFORM_DISK_MB`，`0` = 不限），
+口径是**整个 `_runtime`**（`envd_service/runtime/platform_disk.py::measure_platform_disk_bytes`），
+随心跳上报节点视图（`envd_service/agent.py:265-266` →
+`control_plane/api/internal.py:106-107` → `control_plane/registry/nodes.py:206-207`），
+worker 的 checkpoint 回复里也带（`checkpoint_store.py:473-474`）。图的大小只能写出来才知道，
+所以拒绝分两道（写前按剩余额度、写后按实际字节），第 2 道之下那次**短暂超账**是必然
+（§6(d)）；多个 worker 并发捕获时各自按自己看到的账判定 ⇒ **总数可以短时超过预算**。
+决策点表第 3 行接受这个口径（**不做**跨节点硬账）。**仍未做的是告警**：数字已经上报，
+但没有任何消费者拿它报警（`rg 'alert|PrometheusRule' deploy/` 0 命中），已登记
+`docs/open-issues.md`。
+
+③ **孤儿图会被回收。** 一张图只有在**任何一处记录都不认领它**时才删；回收走的是 worker
+每轮的 reconcile（`envd_service/agent.py:2345` 调
+`envd_service/runtime/checkpoint_store.py::remove_orphan_checkpoint_stores`，归属判据见
+`docs/superpowers/plans/2026-09-26-checkpoint-restore-productization.md` 的 Task E4），
+结果进 summary 的 `checkpointsReclaimed`（`envd_service/agent.py:2423`）。所以"删了记录忘了图"
+不会永远占着平台账。
+
+④ **`E2B_PAUSE_CHECKPOINT` 在生产清单里长期默认 `"1"`，代价是 `pause` 变成"写整个进程内存"**
+（决策点表第 7 行）——图量级是沙箱内存（512 MiB 生产形态下几十到几百 MiB），装不下就
+**拒绝并删图、沙箱原地保持 paused**；代价写在 `deploy/k8s/worker.yaml:455-492` 的注释里。
+代码默认仍是关（`envd_service/config.py:378`）：打开是**部署**的决定，不是库的默认。
+
+⑤ **两条条件任务的决定门都落在"不做"，并已复核**：Task F3（fd 按路径重开时的身份校验）
+——`rg "os\.replace|mv |rename" docs/checkpoint-restore-e2b-half.md docs/k8s-deployment.md`
+今天的命中只有本能力自己的 rename（引擎保存的 `<dir>.tmp`→`latest`、验收脚本的
+"临时文件 + `os.replace`"）与磁盘记账的 rename，**没有"业务文件在 pause 与 resume 之间被
+replace"的用法** ⇒ 不做。**已知边界**：恢复按**路径**重开 fd，同路径换了 inode **不校验**
+（真要支持时按 F3 的候选做）。Task F4（让 `--restore-from` 也能 exec）——决定门 0 命中 ⇒
+不做（见 §2 的 D9 行）。
+
+⑥ **`E2B_PAUSED_TTL_S`（paused 的过期策略）仍未拍板**：计划默认 **0 = 不启用**，且今天
+**没有实现**（全库 `rg 'E2B_PAUSED_TTL_S'` 只命中计划本身）——这是**有意不实现**，因为
+它会摧毁用户状态，形状没定就不写。登记在 `docs/open-issues.md` 的 checkpoint 行。
