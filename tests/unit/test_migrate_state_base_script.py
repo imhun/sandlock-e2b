@@ -302,14 +302,15 @@ def test_the_job_runs_as_root_on_the_shared_volume_without_retries() -> None:
 def test_the_job_is_not_part_of_the_rendered_overlay() -> None:
     """It is a one-shot an operator applies by hand, never an `apply.sh` member."""
     kustomization = yaml.safe_load(KUSTOMIZATION.read_text(encoding="utf-8"))
-    # C1 (wave 2) added `priv-broker.yaml` -- the per-node root broker that
-    # replaces the worker's own root init containers -- as a *member*. This
-    # one-shot Job is the opposite: it is rendered with the operator's
-    # placeholders and applies by hand, so it must not appear here.
+    # C1's broker DaemonSet is deliberately *not* here: it belongs to the
+    # baseline (`deploy/k8s/priv-broker.yaml`, pulled in through `../k8s`), so
+    # this overlay stays what it says it is -- the distribution differences
+    # (seccomp root, NAS PV, NodePort) plus the capacity patch. This one-shot
+    # Job is the other kind of non-member: it is rendered with the operator's
+    # placeholders and applies by hand.
     assert kustomization["resources"] == [
         "../k8s",
         "storage-nas.yaml",
-        "priv-broker.yaml",
         "gateway-nodeport.yaml",
     ]
 

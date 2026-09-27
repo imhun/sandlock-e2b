@@ -43,13 +43,12 @@ COMPOSE_MULTINODE = (
     REPO / "deploy" / "compose" / "docker-compose.multinode.yml"
 ).read_text(encoding="utf-8")
 K8S_WORKER = (REPO / "deploy" / "k8s" / "worker.yaml").read_text(encoding="utf-8")
-# C1 (wave 2): the k0s overlay's root broker DaemonSet. It is not part of the
-# baseline manifest set -- a network filesystem is what forces the privileged
-# actions out of the pod *and* leaves them needing root (see the file's own
-# header), so it lands in the overlay that already carries the NAS PV.
-K0S_PRIV_BROKER = (
-    REPO / "deploy" / "k8s-k0s" / "priv-broker.yaml"
-).read_text(encoding="utf-8")
+# C1 (wave 2): the per-node root broker DaemonSet. It belongs to the *baseline*,
+# next to the worker manifest whose socket switch depends on it: the privileged
+# actions (`chown`/`rm`/`walk`) need root on this baseline's own shared PVC, and
+# the worker pod may not hold that root itself -- on any filesystem, not just
+# the NAS the k0s overlay happens to carry (see the file's own header).
+PRIV_BROKER = (REPO / "deploy" / "k8s" / "priv-broker.yaml").read_text(encoding="utf-8")
 K8S_CONTROL_PLANE = (REPO / "deploy" / "k8s" / "control-plane.yaml").read_text(
     encoding="utf-8"
 )
@@ -255,7 +254,7 @@ def test_k8s_worker_drops_sys_admin_and_declares_the_broker_caps() -> None:
         in K8S_WORKER
     )
     # ...and nothing else: the chown/dac_override half moved to the per-node
-    # broker DaemonSet (deploy/k8s-k0s/priv-broker.yaml), and NET_BIND_SERVICE
+    # broker DaemonSet (deploy/k8s/priv-broker.yaml), and NET_BIND_SERVICE
     # has had no user since the per-sandbox netns work (N5).
     for gone in (
         "\n                - NET_BIND_SERVICE\n",
@@ -485,7 +484,7 @@ def test_worker_keeps_the_extracted_rootfs_off_the_shared_volume() -> None:
     # worker has no root left to chown a cache with). Byte-exact on the
     # ordered list, because the resolver and the init must agree on which
     # directory comes first.
-    assert "value: /var/lib/e2b-images /var/lib/e2b-sandboxes/_images\n" in K0S_PRIV_BROKER
+    assert "value: /var/lib/e2b-images /var/lib/e2b-sandboxes/_images\n" in PRIV_BROKER
 
 
 # ----------------------------------------------------------------------------
@@ -695,10 +694,17 @@ def test_k0s_overlay_moves_the_seccomp_root_to_the_k0s_kubelet_dir() -> None:
     # now: a leftover patch, or a `runAsUser` added back to the baseline, would
     # put a root container back in the worker pod.
     worker = _rendered_workload(out, "StatefulSet", "e2b-worker")
-    container = worker["spec"]["template"]["spec"]["containers"][0]
+    pod_spec = worker["spec"]["template"]["spec"]
+    container = pod_spec["containers"][0]
     security = container["securityContext"]
     assert "runAsUser" not in security
     assert "runAsGroup" not in security
+    # ...and at the pod level: Kubernetes resolves the uid from pod *and*
+    # container (`spec.securityContext` wins), so a pod-level `runAsUser` would
+    # put root back while the container-level assertions above stayed green.
+    pod_security = pod_spec.get("securityContext", {})
+    assert "runAsUser" not in pod_security
+    assert "runAsGroup" not in pod_security
     # Exactly the two caps the local file-capability `e2b-slot-spawn` needs in
     # the bounding set -- not one more. CHOWN/DAC_OVERRIDE are the DaemonSet's
     # now, and NET_BIND_SERVICE has had no user since N5.
@@ -826,7 +832,7 @@ def test_k0s_overlay_control_plane_writes_only_the_migration_staging_and_state()
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
-def test_k0s_overlay_broker_init_creates_both_roots_and_the_checkpoint_gate() -> None:
+def test_the_broker_init_creates_both_roots_and_the_checkpoint_gate() -> None:
     """The two roots and the checkpoint store's gate are an init container's job.
 
     Three failures this pins, all measured elsewhere in N27:
@@ -844,16 +850,18 @@ def test_k0s_overlay_broker_init_creates_both_roots_and_the_checkpoint_gate() ->
 
     C1 moved the container: it has to run as root to chown the volume roots,
     and the worker pod is no longer allowed a root container of any kind, so
-    the DaemonSet carries it (the worker keeps no copy -- pinned below, because
-    a leftover root init in the pod is exactly the half-switch this move has to
-    rule out).
+    the baseline's `priv-broker.yaml` DaemonSet carries it (the worker keeps no
+    copy -- pinned below, because a leftover root init in the pod is exactly the
+    half-switch this move has to rule out). The *baseline* render is read here
+    because that is where the DaemonSet lives now: it is a dependency of the
+    worker manifest, not a distribution difference.
 
     The environment dictionary is compared whole and the script is matched line
     by line, on stripped lines: a rewritten line has to be re-read here rather
     than pass on a substring of the old one.
     """
     rendered = subprocess.run(
-        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s-k0s")],
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s")],
         capture_output=True,
         text=True,
         check=True,
@@ -907,7 +915,7 @@ def test_k0s_overlay_broker_init_creates_both_roots_and_the_checkpoint_gate() ->
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
-def test_k0s_overlay_runs_the_root_broker_daemonset_with_the_workers_identity() -> None:
+def test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identity() -> None:
     """C1: the privileged actions leave the pod; a per-node root broker does them.
 
     What is pinned, and why each half matters:
@@ -917,9 +925,13 @@ def test_k0s_overlay_runs_the_root_broker_daemonset_with_the_workers_identity() 
       contract between the two manifests;
     * ``runAsUser: 0`` + exactly ``CHOWN, DAC_OVERRIDE, FOWNER``: a network
       filesystem authorizes a chown by the AUTH_SYS uid, not by the client's
-      capabilities (measured on this NAS, ``worker-root.patch.yaml``), so the
+      capabilities (the measurement is in ``deploy/k8s/priv-broker.yaml``'s own
+      header: `chown 10000:65534` as uid 65534 -> EPERM, as root -> ok), so the
       privileged hand-over needs root -- and only root can remove or walk an
-      arbitrarily-owned sandbox tree;
+      arbitrarily-owned sandbox tree. The DaemonSet sits in the *baseline*
+      because that need is not a property of the NAS: any local/block-storage
+      worker needs the same three verbs, and the k0s overlay must not be the
+      only manifest set that obtains a broker;
     * ``E2B_BROKER_PEER_UID/GID == 65534``: the daemon answers ``hello`` with
       the identity it authenticated, and the worker's Python startup asserts
       ``peer_uid/peer_gid == its own euid/egid`` (a mismatch is a refusal with
@@ -937,7 +949,7 @@ def test_k0s_overlay_runs_the_root_broker_daemonset_with_the_workers_identity() 
     workloads, so only the parsed object says which pod the values belong to.
     """
     rendered = subprocess.run(
-        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s-k0s")],
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s")],
         capture_output=True,
         text=True,
         check=True,
@@ -1014,6 +1026,93 @@ def test_k0s_overlay_runs_the_root_broker_daemonset_with_the_workers_identity() 
         "chmod 0710 /run/e2b-broker",
     ):
         assert expected in socket_lines, expected
+
+
+@pytest.mark.parametrize("manifests", ["deploy/k8s", "deploy/k8s-k0s"])
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_socket_transport_and_its_broker_are_inseparable(manifests: str) -> None:
+    """C1 regression: the socket switch and the broker that serves it travel together.
+
+    The switch lives in the shared baseline worker manifest, but the DaemonSet
+    first landed in the k0s overlay only -- so ``kubectl kustomize deploy/k8s``
+    (which docs/k8s-deployment.md treats as a deployable set, and which a managed
+    cluster on block/local disk is explicitly allowed to run non-root) emitted a
+    worker that dials ``/run/e2b-broker/broker.sock`` *and* whose two owner inits
+    had moved out, with no broker in the render at all. Its ``wait-for-broker``
+    gate then burned its 60s and left the pod in ``Init:Error``.
+
+    So this is not "the DaemonSet also exists": it is one render answering one
+    question -- if this manifest set ships the switch, this same manifest set has
+    to serve the socket. It reads both the baseline and the overlay, because
+    either one alone being broken is the regression. Everything is read off the
+    parsed render (never off either file), so moving the pair apart again, or
+    renaming the socket on one side only, fails here instead of on a cluster.
+    """
+    rendered = subprocess.run(
+        [KUBECTL, "kustomize", str(REPO / manifests)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    documents = [doc for doc in yaml.safe_load_all(rendered) if isinstance(doc, dict)]
+    worker = _rendered_workload(rendered, "StatefulSet", "e2b-worker")
+    pod = worker["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    env = {e["name"]: e.get("value") for e in container["env"]}
+    # The premise of the pin: this render really does dial the broker.
+    assert env["E2B_PRIV_HELPER_TRANSPORT"] == "socket"
+    assert env["E2B_PRIV_HELPER_SOCKET"] == "/run/e2b-broker/broker.sock"
+    socket_path = env["E2B_PRIV_HELPER_SOCKET"]
+    socket_dir = socket_path.rsplit("/", 1)[0]
+    brokers = [
+        doc
+        for doc in documents
+        if doc.get("kind") == "DaemonSet"
+        and doc.get("metadata", {}).get("name") == "e2b-priv-broker"
+    ]
+    assert len(brokers) == 1, (
+        f"{manifests}: the worker dials {socket_path} but this render carries "
+        f"{len(brokers)} e2b-priv-broker DaemonSets"
+    )
+    broker_pod = brokers[0]["spec"]["template"]["spec"]
+    broker = broker_pod["containers"][0]
+    # The broker `serve`s on the very path the worker dials, from the same
+    # hostPath -- one socket, one node, both pods.
+    assert broker["command"] == [
+        "/var/lib/e2b-priv/e2b-maint",
+        "serve",
+        "--socket",
+        socket_path,
+    ]
+    broker_volume = {v["name"]: v for v in broker_pod["volumes"]}["broker-socket"]
+    assert broker_volume["hostPath"] == {
+        "path": socket_dir,
+        "type": "DirectoryOrCreate",
+    }
+    assert {m["name"]: m for m in broker["volumeMounts"]}["broker-socket"] == {
+        "name": "broker-socket",
+        "mountPath": socket_dir,
+    }
+    assert {m["name"]: m for m in container["volumeMounts"]}["broker-socket"][
+        "mountPath"
+    ] == socket_dir
+    # The identity the broker authenticates has to be the identity this worker
+    # runs as. The image is `USER 65534:65534` and neither pod nor container may
+    # override it -- a pod-level `runAsUser` would put root back just as surely
+    # as a container-level one, and the peer check would then fail closed.
+    assert "runAsUser" not in pod.get("securityContext", {})
+    assert "runAsGroup" not in pod.get("securityContext", {})
+    assert "runAsUser" not in container["securityContext"]
+    assert "runAsGroup" not in container["securityContext"]
+    broker_env = {e["name"]: e.get("value") for e in broker["env"]}
+    assert broker_env["E2B_BROKER_PEER_UID"] == "65534"
+    assert broker_env["E2B_BROKER_PEER_GID"] == "65534"
+    # ...and the socket directory is handed to that same group, or the worker's
+    # own gid could not traverse into a `0660` socket.
+    socket_init = {c["name"]: c for c in broker_pod["initContainers"]}["socket-dir-init"]
+    socket_lines = [line.strip() for line in socket_init["command"][2].splitlines()]
+    assert f"chown 0:65534 {socket_dir}" in socket_lines
+    assert f"chmod 0710 {socket_dir}" in socket_lines
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")

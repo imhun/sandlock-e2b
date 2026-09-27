@@ -15,9 +15,10 @@ kind: Kustomization
 namespace: sandlock
 
 resources:
-  - ../k8s        # 基线清单目录（deploy/k8s/，没有 kustomization.yaml ⇒ 裸清单集）
+  # 基线清单集（deploy/k8s/kustomization.yaml）。C1 的 root broker DaemonSet
+  # 也在里面：它对发行版/存储类型无差别，不能只在这个 overlay 里存在。
+  - ../k8s
   - storage-nas.yaml
-  - priv-broker.yaml        # C1：每节点 root broker（worker pod 不再有 root）
   - gateway-nodeport.yaml   # 集群外的固定入口（基线由 SLB/ingress 承担，这里没有）
 
 patches:
@@ -30,7 +31,11 @@ patches:
     path: seccomp-root.patch.yaml
   # C1 (wave 2): no more `worker-root.patch.yaml`. The worker pod no longer runs
   # as root (the image's USER 65534:65534 is the shape again), and the
-  # privileged hand-over moved into the root `priv-broker.yaml` DaemonSet.
+  # privileged hand-over moved into the root broker DaemonSet -- which lives in
+  # the *baseline* (`../k8s/priv-broker.yaml`), not here: it is not a
+  # distribution difference, and this overlay must not be the only path that
+  # obtains one (a baseline-only apply would otherwise gate on a socket nobody
+  # serves).
   - target:
       group: apps
       version: v1

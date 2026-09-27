@@ -342,8 +342,19 @@ spec:
             # 池 uid 的树也只有 root 做得到。c1 的整个设计就是把这几个特权动作
             # 收进这一个进程，pod 里其他容器（worker）不再有 root。
             #
-            # 三条 cap 是"它到底要什么"的清单，不是提权：CHOWN 把文件让给池 uid，
+            # 三条 cap 是"它到底要什么"的清单：CHOWN 把文件让给池 uid，
             # DAC_OVERRIDE 穿过沙箱树的权限位，FOWNER 改自己建的 socket 的模式。
+            #
+            # ⚠ 但**它不是最小集**：对以 uid 0 跑的容器，`capabilities.add` 是
+            # 「在运行时默认能力集之上追加」，runc 不会因为显式 add 而清空默认集，
+            # 所以这个进程实际仍然持有默认的 root 集（DAC_READ_SEARCH、SETUID…
+            # 都在）。真要收紧成"只有这三条"，得同时写 `drop: [ALL]`——那必须先在
+            # 真机确认 `walk`（fts 遍历他人属主的目录）、`rm`、`chown` 在只有这三条
+            # cap 时仍然成立之后再加（Task 8）。加的时候注意仓库记录过的坑：
+            # `drop: [ALL]` 必须配 `add`（否则连这三条都没了），且**绝不能**引入
+            # no-new-privileges（NNP=1 会让内核直接忽略 file capabilities，等于把
+            # 镜像里的 e2b-maint/e2b-slot-spawn 变成无特权二进制）。
+            #
             # runAsGroup 不覆盖：镜像的 USER 65534:65534 已经给了 worker 的 gid，
             # broker 以 root:65534 跑，socket 与目录的属组才有意义。
             runAsUser: 0

@@ -16,5 +16,13 @@ resources:
   - control-plane.yaml
   - gateway.yaml
   - seccomp-installer.yaml
+  # C1: the per-node root broker (socket + the two owner inits). It lives in the
+  # baseline, not in an overlay, because it has nothing to do with the
+  # distribution or the storage *type*: `chown`/`rm`/`walk` on this baseline's
+  # own shared PVC need root on a local disk too (`deploy/k8s/priv-broker.yaml`
+  # has the measurement). Wherever `worker.yaml` ships the socket switch, this
+  # file has to ship the broker that serves it -- `test_..._inseparable` renders
+  # exactly that.
+  - priv-broker.yaml
   - worker.yaml
   - autoscaler.yaml
