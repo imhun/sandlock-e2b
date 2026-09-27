@@ -1,0 +1,71 @@
+# C1 wave 2 Task 6 —— 平台态属主一次性迁移的 Job（递归 `chown 65534:65534`，不 chmod、
+# 不动内容）。
+#
+# 由 `deploy/scripts/migrate-state-owner.sh` 渲染（把下面三处占位符填掉）后 apply：
+#
+#     kubectl -n sandlock create configmap state-owner-migrate \
+#         --from-file=migrate-state-owner.sh=deploy/scripts/migrate-state-owner.sh \
+#         --dry-run=client -o yaml | kubectl -n sandlock apply -f -
+#     deploy/scripts/migrate-state-owner.sh --apply    # 就是这两条 + 等 + 收日志 + 清理
+#
+# 为什么是 Job：这是一次 `chown -R`，跑完就该消失。
+# 为什么必须 runAsUser 0：这台 NFS 只认凭据里的 uid —— 读 root worker 写下的 0600/0700
+# 文件、把平台态让给 worker uid，都只有 uid 0 能做（见 deploy/k8s-k0s/worker-root.patch.yaml）。
+# 为什么 runAsGroup 65534：与 worker 同组，chown 之后属组不出现第三个数字。
+#
+# ⚠ 三处占位符是有意的 fail-closed（与 state-base-migrate.yaml 同形）：
+#   * `__WORKER_REPLICAS__` —— worker 是否真的停写由操作脚本**观测**（
+#     `statefulset/e2b-worker` 的 spec.replicas + 没有 worker pod），不在这里猜；直接 apply
+#     原文件时它是字符串 `__WORKER_REPLICAS__`，脚本会因为"不是 0"而拒绝。
+#   * `__ENGINE_FLAGS__` —— 直接 apply 原文件时 `args` 是一个未知参数，脚本立刻非零退出，
+#     **不会 chown 任何东西**。
+#   * `__IMAGE_VERSION__` —— 与 apply.sh 同一口径（deploy/stack/.version）。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: state-owner-migrate
+  namespace: sandlock
+  labels:
+    app: state-owner-migrate
+spec:
+  # 一次迁移：半途失败的容器**不**自动重试（重试会把刚 chown 的一半再来一遍）。
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: state-owner-migrate
+    spec:
+      restartPolicy: Never
+      # euid 0 + 保留 worker 的组：NFS 只认凭据里的 uid（chown 要 root），组则与 worker 的
+      # 65534 对齐，免得把平台态的属组留成新东西。
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 65534
+      containers:
+        - name: migrate
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:__IMAGE_VERSION__
+          command: ["bash", "/scripts/migrate-state-owner.sh"]
+          args: [__ENGINE_FLAGS__]
+          env:
+            # PVC `sandbox-shared` 就是集群里那份 `<export>`；整卷以 RW 挂进来（chown 的
+            # 端点都在这一份挂载里），路径与 worker 看到的逐字相同。
+            - name: MIGRATE_ROOT
+              value: /var/lib/e2b-sandboxes
+            # 上面说的那道闸门：不是 "0" 就不动。
+            - name: MIGRATE_WORKER_REPLICAS
+              value: "__WORKER_REPLICAS__"
+          volumeMounts:
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: sandbox-shared
+        - name: script
+          configMap:
+            name: state-owner-migrate
+            # 由 create configmap 建；只读，且不需要可执行位（命令是 `bash <path>`）。
+            defaultMode: 0444
