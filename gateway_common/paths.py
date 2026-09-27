@@ -73,12 +73,16 @@ def validate_sandbox_id(sandbox_id: str) -> bool:
 #: * ``_`` — the reserved root namespace: ``_snapshots`` / ``_migrate`` /
 #:   ``_cow`` / ``_volumes`` / ``_templates`` / ``_secrets`` / ``_builds`` /
 #:   ``_images``.
-#: * ``snap_`` — the snapshot store's own trees. ``SnapshotRegistry``'s base
-#:   *is* the workspace base (``control_plane/app.py``), so a snapshot is a
-#:   top-level ``snap_<hex>`` directory sitting right next to the sandbox trees
+#: * ``snap_`` — the snapshot store's own trees. ``SnapshotRegistry`` is built
+#:   on the *shared export root* (``control_plane/app.py``: ``platform_root`` =
+#:   ``settings.shared_workspace_root``), **not** on the workspace base, so a
+#:   snapshot is ``<export>/_snapshots/snap_<hex>``
 #:   (``control_plane/registry/snapshots.py``): it holds ``snapshot.json`` and
 #:   the copied filesystem under ``fs/``, and the sandbox record that copy
-#:   carries sits at ``snap_X/fs/sandbox.json``, never at the top level.
+#:   carries sits at ``snap_X/fs/sandbox.json``, never at the top level. (The
+#:   pre-OBS-9 root-level ``<export>/snap_<hex>`` is still read; the worker's
+#:   payload endpoints hard-code ``<workspace_base>/_snapshots`` --
+#:   ``envd_service/agent.py``.)
 #:
 #: Neither prefix is reserved on the create side — ``X-Sandbox-Id`` is checked
 #: with :func:`validate_sandbox_id` alone (``control_plane/api/sandboxes.py``)

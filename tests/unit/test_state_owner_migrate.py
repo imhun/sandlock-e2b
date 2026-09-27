@@ -9,9 +9,10 @@ wave 1/2 之后 worker 是 uid 65534，而今天这台 NAS 上的平台态文件
   PVC 上且不自动重试、三处占位符让"直接 apply 原文件"什么也做不了；
 * **行为**：在没有集群的情况下跑 `--print-plan` 与 `--root` 彩排 —— 计划恰是 8 个平台
   目标；树根下**恰允许 `workspaces/_migrate` 与 `workspaces/_snapshots` 这两条确切条目**
-  （前者是控制面唯一可写的 subPath、也是 `workspace-root-init` 建的那个；后者是**活的
-  快照存储** —— `SnapshotRegistry` 的 base 就是 workspace base，C1 之后 worker 以 uid
-  65534 往它里面写，属主必须是 worker），其余任何落在 `workspaces/` 之下的拼写（含
+  （前者是控制面唯一可写的 subPath、也是 `workspace-root-init` 建的那个；后者是 **worker
+  的快照 payload 根** —— `envd_service/agent.py` 硬编码为 `<workspace_base>/_snapshots`，
+  C1 之后 worker 以 uid 65534 往它里面写，属主必须是 worker；控制面的记录根是另一条
+  `<export>/_snapshots`），其余任何落在 `workspaces/` 之下的拼写（含
   `workspaces` 本身、它的兄弟、那两条下面的东西、`..` 与符号链接的变体）都被点名拒绝。
   毒化过的 `kubectl`（记录自己被调用过、然后失败）把"这些路径不连集群"变成断言而不是
   承诺。
@@ -45,10 +46,12 @@ WORKER_GID = 65534
 EXPORT_IN_CLUSTER = "/var/lib/e2b-sandboxes"
 
 #: 计划里那 8 个平台目标，**顺序即脚本的打印顺序**（Task 6 brief 的顺序）。
-#: `_migrate` 与 `_snapshots` 在 N27 之后落在**树根之下**（前者是控制面在那里的 subPath，
-#: 后者是活的快照存储——`SnapshotRegistry` 的 base 就是 workspace base），不在 export 根上
-#: —— 迁移工具的目标路径必须与清单和 worker 端点同名，否则真机上它们恒 MISSING（`_migrate`
-#: 那条就是这个 bug，本轮修的就是它；`_snapshots` 是 Task 8 真机预检新发现的补丁）。
+#: `_migrate` 与 `_snapshots` 在 N27 之后落在**树根之下**（前者是控制面在那里的 subPath；
+#: 后者是 worker 的快照 payload 根，`envd_service/agent.py` 硬编码
+#: `<workspace_base>/_snapshots`），不在 export 根上 —— 迁移工具的目标路径必须与清单和
+#: worker 端点同名，否则真机上它们恒 MISSING（`_migrate` 那条就是这个 bug，本轮修的就是它；
+#: `_snapshots` 是 Task 8 真机预检新发现的补丁）。控制面的快照**记录**根是另一条
+#: `<export>/_snapshots`（`SnapshotRegistry` 建在共享 export 根上），也在计划里。
 PLATFORM_TARGETS = (
     "state",
     "workspaces/_migrate",
@@ -63,8 +66,9 @@ PLATFORM_TARGETS = (
 #: 沙箱树。池 uid 的树，不是 worker 的 —— 这个前缀下除 `TREE_ROOT_ALLOWED` 外一律拒绝。
 SANDBOX_TREES = "workspaces"
 
-#: 树根下**恰好**放行的两条：控制面的迁移暂存（worker 自己也写它下面那份）与活的快照存储
-#: （`<base>/_snapshots/<id>`；C1 之后 worker 以 uid 65534 在里面建快照，属主必须是 worker）。
+#: 树根下**恰好**放行的两条：控制面的迁移暂存（worker 自己也写它下面那份）与 **worker 的
+#: 快照 payload 根**（`<workspace_base>/_snapshots/<id>`；C1 之后 worker 以 uid 65534 往它
+#: 里面写 payload，属主必须是 worker。控制面的记录根是另一条 `<export>/_snapshots`）。
 MIGRATE_STAGING = "workspaces/_migrate"
 SNAPSHOT_STORE = "workspaces/_snapshots"
 TREE_ROOT_ALLOWED = (MIGRATE_STAGING, SNAPSHOT_STORE)
@@ -177,9 +181,10 @@ def export_root(tmp_path: Path) -> Path:
     (root / "state" / ".route-b" / "10000").mkdir(parents=True)
     (root / "state" / ".uid_pool.lock").write_text("", encoding="utf-8")
     (root / SANDBOX_TREES / "_migrate").mkdir(parents=True)
-    # 活的快照存储：树根下的第二条平台目录（`SnapshotRegistry` 的 base = workspace base）。
-    # 它必须**真的在盘上**，否则"放行 workspaces/_snapshots"可以在一棵根本没有它的树上
-    # 恒 MISSING 地通过 —— 那正是这条修复要防的静默类型。
+    # worker 的快照 payload 根：树根下的第二条平台目录（`envd_service/agent.py` 硬编码
+    # `<workspace_base>/_snapshots`）。它必须**真的在盘上**，否则"放行
+    # workspaces/_snapshots"可以在一棵根本没有它的树上恒 MISSING 地通过 —— 那正是这条修复
+    # 要防的静默类型。
     (root / SANDBOX_TREES / "_snapshots" / "sbx_aaa").mkdir(parents=True)
     (root / SANDBOX_TREES / "_snapshots" / "sbx_aaa" / "fs").mkdir(parents=True)
     for name in ("_images", "_secrets", "_snapshots", "_templates", "_builds"):
@@ -336,7 +341,7 @@ def test_print_plan_lists_exactly_the_eight_platform_targets(tmp_path: Path) -> 
         f"TARGET rel={name} owner={WORKER_UID}:{WORKER_GID}" for name in PLATFORM_TARGETS
     ]
     assert len(targets) == 8
-    # 树根下恰允许那两条：控制面的迁移暂存与活的快照存储；`workspaces` 本身、它的兄弟、
+    # 树根下恰允许那两条：控制面的迁移暂存与 worker 的快照 payload 根；`workspaces` 本身、它的兄弟、
     # 别的目录都拒绝 —— 这条断言钉的就是"放行集恰是那两条"。
     rels = [line.split("rel=")[1].split(" ")[0] for line in targets]
     assert [
@@ -381,7 +386,8 @@ def test_the_two_tree_root_platform_dirs_are_the_entries_the_tree_root_allows(
     """树根下恰放行那两条 —— 而且它们都是那两条**真的路径**（fixture 里确实存在）。
 
     `workspaces/_migrate` 是 N27 之后控制面唯一可写的 subPath（`workspace-root-init` 建的就是
-    它）；`workspaces/_snapshots` 是活的快照存储（C1 之后 worker 从里面建快照）。两者都坐在
+    它）；`workspaces/_snapshots` 是 worker 的快照 payload 根（C1 之后 worker 把 payload 写进
+    它）。两者都坐在
     树根下，所以迁移工具必须去 chown 它们。`--target` 再声明一遍是幂等的：计划去重，打印出来
     仍是那 8 条；相对与绝对拼写都 rc=0。
     """
