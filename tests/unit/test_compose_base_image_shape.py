@@ -50,6 +50,11 @@ DEFAULTED_STACKS = {
 #: `deploy/stack/.env`. See the test below for why it stays that way.
 FLEET_STACK = "deploy/stack/docker-compose.prod.yml"
 
+#: The digest placeholder `deploy/stack/.env.example` ships and the operator
+#: fills in from `build-and-push.sh` (E6.2). Compared by substitution, so the
+#: template is still pinned to the fleet's MCP-capable repository *and* tag.
+STACK_DIGEST_PLACEHOLDER = "__E2B_BASE_IMAGE_DIGEST__"
+
 
 def _fleet_base_image() -> str:
     """The single base image both fleet manifests spell out.
@@ -141,3 +146,58 @@ def test_the_fleet_stack_keeps_the_base_image_as_a_bare_env_override() -> None:
         "${" + BASE_IMAGE_KEY + "}",
         "${" + BASE_IMAGE_KEY + "}",
     ]
+
+
+def _example_env_base_image(path: Path) -> str:
+    """The single ``E2B_BASE_IMAGE=`` value an example env file declares.
+
+    `.env` files spell an assignment ``KEY=value`` (the compose files spell the
+    key ``KEY:``), and the digest pin's prose sits on comment lines above it, so
+    this is line-oriented the same way `_declared_base_images` is. The count is
+    pinned: a second declaration in one file could otherwise hide behind the
+    first.
+    """
+    prefix = BASE_IMAGE_KEY + "="
+    values: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith(prefix):
+            values.append(stripped[len(prefix) :].strip().strip('"').strip("'"))
+    assert len(values) == 1, (str(path), values)
+    return values[0]
+
+
+def test_the_compose_example_env_defaults_to_the_fleets_mcp_capable_base_image() -> None:
+    """The documented ``cp`` must not re-pin the stacks to a base without MCP.
+
+    `README.md` and the headers of `docker-compose.prod.yml` /
+    `docker-compose.autoscale.yml` all tell the operator to run
+    ``cp deploy/compose/.env.example deploy/compose/.env``, and that `.env`
+    *wins* over the compose files' own ``${E2B_BASE_IMAGE:-...}`` default. With
+    the stale ``python:3.11-slim@sha256:d1e9ca7c...`` literal here, following
+    the docs re-introduced N44: sandboxes built from that base answer every
+    `/mcp` route with ``503 ... can't open file '/usr/bin/mcp-gateway'``.
+    """
+    assert (
+        _example_env_base_image(REPO / "deploy/compose/.env.example")
+        == _fleet_base_image()
+    )
+
+
+def test_the_stack_example_env_keeps_the_fleets_mcp_capable_image() -> None:
+    """The fleet's own template: the fleet image, digest still to be filled in.
+
+    `deploy/stack/.env.example` is the tracked template for the untracked,
+    node-local `deploy/stack/.env` that the bare ``${E2B_BASE_IMAGE}`` above
+    reads. It already names the fleet's MCP-capable `python-mcp:3.14`; only the
+    digest is a placeholder (E6.2: the operator substitutes the ACR manifest
+    digest after `build-and-push.sh`). Pinned so "the other example env is
+    stale too" cannot quietly move this one back to a non-MCP base either.
+    """
+    repository = _fleet_base_image().partition("@sha256:")[0]
+    assert (
+        _example_env_base_image(REPO / "deploy/stack/.env.example")
+        == repository + "@sha256:" + STACK_DIGEST_PLACEHOLDER
+    )
