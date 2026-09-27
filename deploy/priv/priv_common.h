@@ -112,15 +112,26 @@ void priv_roots_text(char *out, size_t outlen);
 /* The pinned sandlock-supervise path (E2B_SUPERVISE_BIN or the build default). */
 const char *priv_supervise_bin(void);
 
-/* The installed maintenance broker (E2B_MAINT_BIN or the build default): the
- * daemon refuses to serve unless it *is* this path (see `serve` in maint.c). */
-const char *priv_maint_bin(void);
-
 /* The broker socket path (E2B_PRIV_HELPER_SOCKET or the build default). */
 const char *priv_broker_socket(void);
 
 /* JSON-escape `len` bytes of `data` into `out`, which must hold at least
- * `6 * len` bytes (the widest escape is \u00XX). Returns the bytes written. */
+ * `6 * len` bytes (the widest escape is \uXXXX). Returns the bytes written.
+ *
+ * The bytes are validated as UTF-8. A well-formed sequence goes through
+ * unchanged; a byte that is *not* UTF-8 is written the way Python's
+ * `surrogateescape` writes it -- `\udcXX` for byte 0xXX -- because a Linux
+ * filename may be any byte sequence, and the consumer compares these paths
+ * against what `os.walk`/`os.fsdecode` saw. `\uFFFD` would be lossy: the name
+ * could never be matched again, and one such file would cost the whole
+ * response (JSON that is not UTF-8 parses as nothing at all). */
 size_t priv_json_escape(char *out, const char *data, size_t len);
+
+/* How many bytes of `data` may be escaped without splitting a UTF-8 sequence:
+ * a streaming caller hands out chunks and must not cut one in half, or the
+ * second half would look like invalid bytes. A non-empty chunk never yields 0
+ * (a chunk of only continuation bytes is invalid anyway and is escaped byte by
+ * byte). */
+size_t priv_json_escape_boundary(const char *data, size_t len);
 
 #endif /* E2B_PRIV_COMMON_H */

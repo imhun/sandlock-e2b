@@ -51,6 +51,20 @@
  * daemon refuses to run answers `ok:false`; a request the child refuses
  * answers with the child's own exit status (77 is the fail-closed refusal)
  * and its stderr, which is what the caller logs.
+ *
+ * Who may talk to it, and at what cost: the socket is `0660 root:<peer gid>`
+ * (the same pair as `/var/lib/e2b-priv`, 0710), so a pool uid cannot even
+ * `connect()`; the daemon then checks SO_PEERCRED **before it forks**, so an
+ * unauthorized peer costs one refused answer and never a child. A fork error
+ * or too many handlers (PRIV_MAX_HANDLERS) refuses that one connection and
+ * leaves the daemon serving: nothing a local peer does may take the node's
+ * broker down.
+ *
+ * Output is JSON, so every byte of it has to be. A path is not necessarily
+ * UTF-8 (a Linux filename may be any byte but NUL and '/'), and one such name
+ * must not cost the caller the whole response: an ill-formed byte is written
+ * as `\udcXX` -- Python's surrogateescape -- so `json.loads` on the other side
+ * produces exactly the string `os.fsdecode()` produced for the same name.
  */
 #define _GNU_SOURCE
 
@@ -79,10 +93,21 @@
  * refusal is answered: a client that is still writing when the daemon closes
  * would get the kernel's RST instead of the answer. */
 #define PRIV_DRAIN_LIMIT (4 * 1024 * 1024)
+/* How long the *daemon* waits for the request of a connection it is refusing.
+ * It is time the accept loop spends, so it is short: it only has to cover the
+ * bytes already on their way down a local socket (which is what keeps the
+ * answer from being destroyed by RST). */
+#define PRIV_REFUSAL_WAIT_MS 50
 /* Per stream, not per response: `walk` legitimately prints megabytes, and the
  * cap is where the daemon kills the producer. */
 #define PRIV_MAX_OUTPUT ((unsigned long long)256 * 1024 * 1024)
 #define PRIV_MAX_ARGS 32
+/* Concurrent handlers. One process per in-flight request is the design, but a
+ * number is still needed: without a cap, a *trusted* peer with a leak (or a
+ * client that opens connections and says nothing) turns into unlimited forked
+ * root processes. Over the cap the connection is refused by name, and the
+ * daemon stays up. */
+#define PRIV_MAX_HANDLERS 32
 #define PRIV_DEFAULT_TIMEOUT_S 300L
 #define PRIV_MAX_TIMEOUT_S 3600L
 /* Resolved per child: the daemon only ever execs its own image. */
@@ -391,9 +416,18 @@ static int json_string(struct json *j, char **out, size_t *out_len, char *err,
                     return json_error(err, errlen, "a surrogate without its pair");
                 }
                 code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+            } else if (code >= 0xdc80 && code <= 0xdcff) {
+                /* Python's json.dumps spells a byte that is *not* UTF-8 as a
+                 * lone low surrogate (`\udcXX`, surrogateescape). The argv
+                 * entry has to carry that byte again, or a sandbox tree with
+                 * such a name could never be torn down. A high surrogate plus
+                 * a low one stays a real character (the branch above). */
+                buffer[used++] = (char)(code & 0xff);
+                break;
             } else if (code >= 0xdc00 && code <= 0xdfff) {
                 free(buffer);
-                return json_error(err, errlen, "a lone low surrogate");
+                return json_error(err, errlen,
+                                  "a lone low surrogate that is not a byte");
             }
             if (code == 0) {
                 /* A NUL cannot survive as an argv byte: the tail of that
@@ -775,6 +809,9 @@ static int sink_write_json_string(int fd, const char *data, size_t len) {
     }
     while (used < len) {
         size_t chunk = len - used > 4096 ? 4096 : len - used;
+        /* Never cut a UTF-8 sequence in half: the two halves would both look
+         * like invalid bytes and come out as two surrogate escapes. */
+        chunk = priv_json_escape_boundary(data + used, chunk);
         if (sink_write(fd, escaped, priv_json_escape(escaped, data + used,
                                                     chunk)) != 0) {
             return -1;
@@ -1264,33 +1301,81 @@ static void finish_connection(int fd) {
     }
 }
 
-static void handle_connection(int fd) {
+/* The peer gate for one accepted connection: SO_PEERCRED is fixed at connect
+ * time, so this is the same answer in the daemon and in the handler that
+ * inherits the fd. */
+static int peer_gate(int fd, long *peer_uid, char *err, size_t errlen) {
     struct ucred peer;
     socklen_t peer_len = sizeof(peer);
+
+    memset(&peer, 0, sizeof(peer));
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_len) != 0) {
+        snprintf(err, errlen, "cannot read the peer credentials: %s",
+                 strerror(errno));
+        return -1;
+    }
+    if (priv_peer_allowed((long)peer.uid, (long)peer.gid, err, errlen) != 0) {
+        return -1;
+    }
+    *peer_uid = (long)peer.uid;
+    return 0;
+}
+
+/* Answer a refusal the daemon itself decided on and let the connection go,
+ * **without ever forking for it**.
+ *
+ * The drain has to happen before the close (closing a socket that still holds
+ * unread input makes the kernel send RST, and the RST destroys the refusal
+ * that was just written), but it must not be able to hold the accept loop
+ * either: an unprivileged peer that is allowed to `connect()` because of the
+ * socket's mode could otherwise stall every other caller. So: one bounded wait
+ * for the *first* byte (PRIV_REFUSAL_WAIT_MS), then non-blocking reads until
+ * the request that is already in flight has been consumed -- never a wait for
+ * more than that. */
+static void refuse_connection(int fd, const char *message) {
+    struct pollfd waiter;
+    char scratch[4096];
+    size_t drained = 0;
+    respond_error(fd, message);
+    shutdown(fd, SHUT_WR);
+    waiter.fd = fd;
+    waiter.events = POLLIN;
+    waiter.revents = 0;
+    while (drained < PRIV_DRAIN_LIMIT &&
+           poll(&waiter, 1, PRIV_REFUSAL_WAIT_MS) > 0) {
+        ssize_t got = recv(fd, scratch, sizeof(scratch), MSG_DONTWAIT);
+        if (got > 0) {
+            drained += (size_t)got;
+            while (drained < PRIV_DRAIN_LIMIT &&
+                   (got = recv(fd, scratch, sizeof(scratch), MSG_DONTWAIT)) > 0) {
+                drained += (size_t)got;
+            }
+            break;
+        }
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        break; /* EOF */
+    }
+    close(fd);
+}
+
+static void handle_connection(int fd) {
+    long peer_uid = -1;
     char err[PRIV_ERR_LEN];
 
     /* A client that hangs up mid-answer must not take the handler (and with it
      * the socket) down: the write error below is the signal to stop. */
     signal(SIGPIPE, SIG_IGN);
-    memset(&peer, 0, sizeof(peer));
-    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_len) != 0) {
-        snprintf(err, sizeof(err), "cannot read the peer credentials: %s",
-                 strerror(errno));
+    /* Depth in defence: the daemon gated this connection before it forked, and
+     * a handler must not serve a peer the daemon would have refused. */
+    if (peer_gate(fd, &peer_uid, err, sizeof(err)) != 0) {
         priv_report_refused(err);
         respond_error(fd, err);
         finish_connection(fd);
         return;
     }
-    /* The socket has to be reachable by the unprivileged worker whatever its
-     * gid, so the file mode cannot be the gate -- this is. */
-    if (priv_peer_allowed((long)peer.uid, (long)peer.gid, err, sizeof(err)) !=
-        0) {
-        priv_report_refused(err);
-        respond_error(fd, err);
-        finish_connection(fd);
-        return;
-    }
-    respond_to_request(fd, (long)peer.uid);
+    respond_to_request(fd, peer_uid);
     finish_connection(fd);
 }
 
@@ -1301,8 +1386,9 @@ static void handle_connection(int fd) {
 static int serve(const char *socket_path) {
     struct sockaddr_un addr;
     char exe[PATH_MAX];
-    char *installed;
+    char err[PRIV_ERR_LEN];
     long peer_uid, peer_gid, pool_start, pool_size;
+    int live_handlers = 0;
     int fd;
 
     if (socket_path == NULL || *socket_path == '\0') {
@@ -1314,7 +1400,6 @@ static int serve(const char *socket_path) {
     priv_peer_identity(&peer_uid, &peer_gid);
     priv_uid_pool(&pool_start, &pool_size);
     (void)peer_uid;
-    (void)peer_gid;
     (void)pool_start;
     (void)pool_size;
     if (strlen(socket_path) >= sizeof(addr.sun_path)) {
@@ -1323,22 +1408,19 @@ static int serve(const char *socket_path) {
     }
     /* Fail closed at startup: a broker that is not the installed one is a
      * deployment defect (a copy of the binary with the file capability, in a
-     * sandbox-reachable place) and must be named, never served from. */
+     * sandbox-reachable place) and must be named, never served from. The path
+     * is fixed at compile time on purpose -- an environment variable naming
+     * where the broker "really" lives would only move the trust, not the
+     * check. */
     if (realpath(PRIV_SELF_EXE, exe) == NULL) {
         priv_fail("cannot resolve %s: %s", PRIV_SELF_EXE, strerror(errno));
     }
-    installed = realpath(priv_maint_bin(), NULL);
-    if (installed == NULL) {
-        priv_fail("cannot resolve the installed broker path %s: %s",
-                  priv_maint_bin(), strerror(errno));
-    }
-    if (strcmp(installed, exe) != 0) {
+    if (strcmp(PRIV_DEFAULT_MAINT_BIN, exe) != 0) {
         priv_fail(
-            "this broker must run from the installed path %s (E2B_MAINT_BIN), "
-            "but the running image is %s: not serving from a copy",
-            installed, exe);
+            "this broker must run from the installed path %s, but the running "
+            "image is %s: not serving from a copy",
+            PRIV_DEFAULT_MAINT_BIN, exe);
     }
-    free(installed);
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         priv_fail("socket() failed: %s", strerror(errno));
@@ -1355,10 +1437,17 @@ static int serve(const char *socket_path) {
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         priv_fail("bind %s failed: %s", socket_path, strerror(errno));
     }
-    /* Connectable by the worker whatever its gid: the gate is SO_PEERCRED
-     * above, not this mode. */
-    if (chmod(socket_path, 0666) != 0) {
+    /* Owner + peer group only (root:<worker gid>, the same pair the broker
+     * directory uses): a pool uid cannot even `connect()`, which is the point
+     * of a gate that must not be reachable by a tenant. SO_PEERCRED stays the
+     * real check; this is the layer that keeps unauthorized traffic out of the
+     * accept loop entirely. */
+    if (chmod(socket_path, 0660) != 0) {
         priv_fail("chmod %s failed: %s", socket_path, strerror(errno));
+    }
+    if (chown(socket_path, 0, (gid_t)peer_gid) != 0) {
+        priv_fail("chown %s to 0:%ld failed: %s", socket_path, peer_gid,
+                  strerror(errno));
     }
     if (listen(fd, 16) != 0) {
         priv_fail("listen %s failed: %s", socket_path, strerror(errno));
@@ -1370,6 +1459,9 @@ static int serve(const char *socket_path) {
         while (waitpid(-1, NULL, WNOHANG) > 0) {
             /* Reap finished handlers: a node broker is long-lived, and a
              * zombie per request would be the leak. */
+            if (live_handlers > 0) {
+                live_handlers--;
+            }
         }
         conn = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
         if (conn < 0) {
@@ -1378,16 +1470,40 @@ static int serve(const char *socket_path) {
             }
             priv_fail("accept() on %s failed: %s", socket_path, strerror(errno));
         }
+        /* The gate runs here, in the daemon, *before* fork(): an unauthorized
+         * local uid must not be able to make the root broker fork at all, and
+         * reading the credential needs no child. */
+        if (peer_gate(conn, &peer_uid, err, sizeof(err)) != 0) {
+            priv_report_refused(err);
+            refuse_connection(conn, err);
+            continue;
+        }
+        if (live_handlers >= PRIV_MAX_HANDLERS) {
+            snprintf(err, sizeof(err),
+                     "the broker is already serving %d requests",
+                     PRIV_MAX_HANDLERS);
+            priv_report_refused(err);
+            refuse_connection(conn, err);
+            continue;
+        }
         pid = fork();
         if (pid < 0) {
-            close(conn);
-            priv_fail("fork() failed: %s", strerror(errno));
+            /* EAGAIN/ENOMEM: refuse *this* connection. A fork failure is not a
+             * reason to take the node's broker -- and with it every other
+             * caller -- down. */
+            snprintf(err, sizeof(err),
+                     "cannot fork a handler for the connection: %s",
+                     strerror(errno));
+            priv_report_refused(err);
+            refuse_connection(conn, err);
+            continue;
         }
         if (pid == 0) {
             close(fd);
             handle_connection(conn);
             _exit(PRIV_EXIT_OK);
         }
+        live_handlers++;
         close(conn);
     }
 }

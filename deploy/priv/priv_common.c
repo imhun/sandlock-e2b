@@ -276,21 +276,117 @@ const char *priv_supervise_bin(void) {
     return (value != NULL && *value != '\0') ? value : PRIV_DEFAULT_SUPERVISE_BIN;
 }
 
-const char *priv_maint_bin(void) {
-    const char *value = getenv("E2B_MAINT_BIN");
-    return (value != NULL && *value != '\0') ? value : PRIV_DEFAULT_MAINT_BIN;
-}
-
 const char *priv_broker_socket(void) {
     const char *value = getenv("E2B_PRIV_HELPER_SOCKET");
     return (value != NULL && *value != '\0') ? value : PRIV_DEFAULT_BROKER_SOCKET;
 }
 
+/* The length of the sequence a lead byte starts, or 0 for a byte that cannot
+ * start one (stranded continuation bytes, overlong leads, 5/6-byte forms). */
+static size_t priv_utf8_lead(unsigned char byte) {
+    if (byte < 0x80) {
+        return 1;
+    }
+    if (byte >= 0xc2 && byte <= 0xdf) {
+        return 2;
+    }
+    if (byte >= 0xe0 && byte <= 0xef) {
+        return 3;
+    }
+    if (byte >= 0xf0 && byte <= 0xf4) {
+        return 4;
+    }
+    return 0;
+}
+
+/* The length of the well-formed UTF-8 sequence at `data`, or 0 when the bytes
+ * there are not one (RFC 3629: no overlongs, no surrogates, <= U+10FFFF). */
+static size_t priv_utf8_sequence(const char *data, size_t len) {
+    unsigned char lead = (unsigned char)data[0];
+    size_t need = priv_utf8_lead(lead);
+    size_t index;
+    if (need == 0 || len < need) {
+        return 0;
+    }
+    for (index = 1; index < need; index++) {
+        if (((unsigned char)data[index] & 0xc0) != 0x80) {
+            return 0;
+        }
+    }
+    if (need == 3) {
+        if (lead == 0xe0 && (unsigned char)data[1] < 0xa0) {
+            return 0; /* overlong */
+        }
+        if (lead == 0xed && (unsigned char)data[1] >= 0xa0) {
+            return 0; /* a surrogate is not a character */
+        }
+    }
+    if (need == 4) {
+        if (lead == 0xf0 && (unsigned char)data[1] < 0x90) {
+            return 0; /* overlong */
+        }
+        if (lead == 0xf4 && (unsigned char)data[1] > 0x8f) {
+            return 0; /* past U+10FFFF */
+        }
+    }
+    return need;
+}
+
+size_t priv_json_escape_boundary(const char *data, size_t len) {
+    size_t start = len;
+    size_t tail;
+    if (len == 0) {
+        return 0;
+    }
+    /* Step back over the continuation bytes of the last sequence to its lead. */
+    while (start > 0 && ((unsigned char)data[start - 1] & 0xc0) == 0x80) {
+        start--;
+    }
+    if (start == 0) {
+        /* Nothing but continuation bytes: every one of them is invalid on its
+         * own, so escaping them here is correct. */
+        return len;
+    }
+    tail = len - (start - 1);
+    if (priv_utf8_lead((unsigned char)data[start - 1]) > tail) {
+        /* The sequence continues in the next chunk: hand it over whole. */
+        return start - 1;
+    }
+    return len;
+}
+
 size_t priv_json_escape(char *out, const char *data, size_t len) {
     static const char *hex = "0123456789abcdef";
-    size_t index, used = 0;
-    for (index = 0; index < len; index++) {
+    size_t index = 0, used = 0;
+    while (index < len) {
         unsigned char c = (unsigned char)data[index];
+        size_t sequence;
+        if (c >= 0x80) {
+            sequence = priv_utf8_sequence(data + index, len - index);
+            if (sequence == 0) {
+                /* Not UTF-8: a Linux filename may be any byte but NUL and '/',
+                 * and JSON has to survive it. `\udcXX` is Python's
+                 * surrogateescape spelling of byte 0xXX, so the caller's
+                 * `json.loads` produces exactly the string `os.fsdecode()`
+                 * produced on the Python side -- the name stays matchable. */
+                unsigned int code = 0xdc00 + c;
+                out[used++] = '\\';
+                out[used++] = 'u';
+                out[used++] = hex[(code >> 12) & 0xf];
+                out[used++] = hex[(code >> 8) & 0xf];
+                out[used++] = hex[(code >> 4) & 0xf];
+                out[used++] = hex[code & 0xf];
+                index++;
+                continue;
+            }
+            /* A well-formed sequence goes through byte for byte: the protocol
+             * carries UTF-8, and re-encoding it would mean inventing a charset
+             * the caller did not ask for. */
+            memcpy(out + used, data + index, sequence);
+            used += sequence;
+            index += sequence;
+            continue;
+        }
         switch (c) {
         case '"':
             out[used++] = '\\';
@@ -329,6 +425,7 @@ size_t priv_json_escape(char *out, const char *data, size_t len) {
             }
             break;
         }
+        index++;
     }
     return used;
 }

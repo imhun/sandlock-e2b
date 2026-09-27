@@ -10,12 +10,21 @@ the C side of it:
 * one request line in, one response line out -- ``ok``/``exit``/``stdout``/
   ``stderr`` for a request that ran, ``ok:false`` + ``error`` for one that
   never did;
-* the gate is ``SO_PEERCRED`` against ``E2B_BROKER_PEER_UID`` /
-  ``E2B_BROKER_PEER_GID`` (default 65534), never the socket file mode: the
-  unprivileged worker has to be able to ``connect()``;
-* the daemon execs **its own image** (``/proc/self/exe``) and never a program
-  from the request -- ``args[0]`` is one of ``chown`` / ``rm`` / ``walk``, so
-  it is not a general launcher;
+* the socket is ``0660 root:<peer gid>`` and the gate is ``SO_PEERCRED``
+  against ``E2B_BROKER_PEER_UID`` / ``E2B_BROKER_PEER_GID`` (default 65534) --
+  a pooled sandbox uid cannot even ``connect()``, and a peer that fails the
+  gate is refused **by the daemon, before it forks** (an unauthorized local
+  peer must not be able to make the root broker spawn anything);
+* a refused connection, a ``fork()`` failure or too many in-flight handlers
+  cost that one connection and nothing else: the daemon stays up and serving;
+* the daemon execs **its own image** (``/proc/self/exe``, which must be the
+  compiled-in ``/var/lib/e2b-priv/e2b-maint``) and never a program from the
+  request -- ``args[0]`` is one of ``chown`` / ``rm`` / ``walk``, so it is not
+  a general launcher;
+* the response is JSON, so a byte that is not UTF-8 (a Linux filename may be
+  any byte but NUL and ``/``) comes back as ``\\udcXX`` -- Python's
+  ``surrogateescape`` -- and the decoded path still equals ``os.fsdecode()`` of
+  the name ``os.walk`` reported;
 * the whitelist is the Python side's roots (*this* order): workspace base, the
   state base when it is a root of its own, the shared volume root, and -- new
   in C1 -- ``E2B_IMAGE_CACHE_DIR``, because a sandbox's secret file lives at
@@ -34,11 +43,15 @@ container lane and not in ``tests/unit``:
 from __future__ import annotations
 
 import dataclasses
+import errno
 import json
 import os
+import shutil
 import signal
 import socket
+import stat
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -47,6 +60,11 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PRIV_DIR = PROJECT_ROOT / "deploy" / "priv"
+
+#: Where ``serve`` insists on running from: the path is compiled into the
+#: broker (``PRIV_DEFAULT_MAINT_BIN``), precisely so that no setting can move
+#: the trust. The test lane therefore installs the freshly built binary there.
+INSTALLED_BROKER = Path("/var/lib/e2b-priv/e2b-maint")
 
 #: This module's own pool segment. The gate is a range membership test, so a
 #: daemon started here must not overlap another lane's pool -- and the chown
@@ -57,6 +75,10 @@ POOL_END = POOL_START + POOL_SIZE - 1
 
 #: The request-line cap frozen by the protocol (64 KiB).
 MAX_REQUEST = 64 * 1024
+
+#: Mirrors ``PRIV_MAX_HANDLERS`` in maint.c: over this many in-flight handlers
+#: the daemon refuses the connection instead of forking for it.
+MAX_HANDLERS = 32
 
 #: A path that exists in the image and is outside every whitelist root.
 OUTSIDE = "/etc/hosts"
@@ -113,6 +135,9 @@ def _broker_env(
         "E2B_STATE_BASE",
         "E2B_SHARED_VOLUME_ROOT",
         "E2B_PRIV_HELPER_SOCKET",
+        # Cleared on purpose: the compiled-in install path is the only thing
+        # `serve` trusts, so this variable must have no effect at all.
+        "E2B_MAINT_BIN",
     ):
         env.pop(name, None)
     env.update(
@@ -123,7 +148,6 @@ def _broker_env(
             "E2B_BROKER_PEER_GID": str(_peer_gid()),
             "E2B_WORKSPACE_BASE": str(_workspace(scratch)),
             "E2B_IMAGE_CACHE_DIR": str(_image_cache(scratch)),
-            "E2B_MAINT_BIN": str(binary),
         }
     )
     for name, value in overrides.items():
@@ -155,15 +179,50 @@ class _Serve:
         return self._output[1].decode()
 
 
+def _snapshot(path: Path) -> tuple[bytes, int, int, int, bytes | None] | None:
+    """The file as the image shipped it -- xattr (the capability) included."""
+    if not path.exists():
+        return None
+    info = path.stat()
+    try:
+        xattr = os.getxattr(path, "security.capability")
+    except OSError:
+        xattr = None
+    return (
+        path.read_bytes(),
+        stat.S_IMODE(info.st_mode),
+        info.st_uid,
+        info.st_gid,
+        xattr,
+    )
+
+
+def _restore(
+    path: Path, snapshot: tuple[bytes, int, int, int, bytes | None] | None
+) -> None:
+    if snapshot is None:
+        path.unlink(missing_ok=True)
+        return
+    data, mode, uid, gid, xattr = snapshot
+    path.write_bytes(data)
+    os.chmod(path, mode)
+    os.chown(path, uid, gid)
+    if xattr is not None:
+        os.setxattr(path, "security.capability", xattr)
+
+
 @pytest.fixture(scope="module")
 def broker_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """``deploy/priv`` built the way the image builds it, warnings and all.
+    """``deploy/priv`` built the way the image builds it, and installed.
 
     The empty ``stderr`` is part of the assertion: ``-Wall -Wextra`` clean is
-    the bar the other brokers are held to.
+    the bar the other brokers are held to. The binary then goes to the
+    canonical install path -- ``serve`` refuses to run from anywhere else, and
+    that refusal is itself tested -- and the image's own copy (capability xattr
+    included) is put back when this module is done.
     """
     out = tmp_path_factory.mktemp("priv-c1")
-    binary = out / "e2b-maint"
+    built = out / "e2b-maint"
     build = subprocess.run(
         [
             "cc",
@@ -171,7 +230,7 @@ def broker_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
             "-Wall",
             "-Wextra",
             "-o",
-            str(binary),
+            str(built),
             str(PRIV_DIR / "maint.c"),
             str(PRIV_DIR / "priv_common.c"),
         ],
@@ -180,7 +239,15 @@ def broker_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
     )
     assert build.returncode == 0, build.stderr
     assert build.stderr == ""
-    return binary
+    previous = _snapshot(INSTALLED_BROKER)
+    INSTALLED_BROKER.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(built, INSTALLED_BROKER)
+    os.chmod(INSTALLED_BROKER, 0o750)
+    os.chown(INSTALLED_BROKER, 0, os.getegid())
+    try:
+        yield INSTALLED_BROKER
+    finally:
+        _restore(INSTALLED_BROKER, previous)
 
 
 @pytest.fixture()
@@ -192,9 +259,11 @@ def serve(broker_bin: Path, tmp_path: Path):
         name: str = "broker",
         *,
         pass_flag: bool = True,
+        socket_path: Path | None = None,
         **overrides: str | None,
     ) -> _Serve:
-        socket_path = tmp_path / f"{name}.sock"
+        if socket_path is None:
+            socket_path = tmp_path / f"{name}.sock"
         env = _broker_env(broker_bin, tmp_path, **overrides)
         argv = [str(broker_bin), "serve"]
         if pass_flag:
@@ -287,6 +356,64 @@ def _await_listening(handle: _Serve) -> None:
     the harness waits with a real, side-effect-free request first.
     """
     _request(handle.socket, {"v": 1, "hello": True}, process=handle.process)
+
+
+def _handlers(handle: _Serve) -> list[int]:
+    """The daemon's live handler processes.
+
+    Linux reports a process's own children here, and one handler per accepted
+    connection is the design -- so this is the observable that says whether the
+    daemon forked for a connection at all.
+    """
+    children = Path(
+        f"/proc/{handle.process.pid}/task/{handle.process.pid}/children"
+    )
+    return [int(pid) for pid in children.read_text().split()]
+
+
+def _await_handlers(handle: _Serve, count: int, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if len(_handlers(handle)) >= count:
+            return
+        time.sleep(0.01)
+    pytest.fail(
+        f"the broker never reached {count} handlers (saw {len(_handlers(handle))})"
+    )
+
+
+def _connect_as(uid: int, socket_path: Path) -> str:
+    """``connect()`` once as `uid`, in a forked child, and report the outcome.
+
+    The socket's mode is the layer a pool uid has to be stopped by (before any
+    peer check can run), so the test has to drop to that uid to see it.
+    """
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            os.setgroups([])
+            os.setgid(uid)
+            os.setuid(uid)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(socket_path))
+            outcome = "connected"
+        except OSError as exc:
+            outcome = f"error:{exc.errno}"
+        os.write(write_fd, outcome.encode())
+        os.close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    chunks = b""
+    while True:
+        chunk = os.read(read_fd, 4096)
+        if not chunk:
+            break
+        chunks += chunk
+    os.close(read_fd)
+    os.waitpid(pid, 0)
+    return chunks.decode()
 
 
 def _chown(path: Path, uid: int = POOL_START) -> dict:
@@ -615,10 +742,16 @@ def test_hello_rejects_a_peer_uid_mismatch(serve) -> None:
     stranger = _peer_uid() + 1
     handle = serve("peer-uid", E2B_BROKER_PEER_UID=str(stranger))
     refusal = f"peer uid {_peer_uid()} does not match E2B_BROKER_PEER_UID={stranger}"
+    assert _handlers(handle) == []
 
     response = _request(handle.socket, {"v": 1, "hello": True}, process=handle.process)
 
     assert response == {"v": 1, "ok": False, "error": refusal}
+    # The refusal was decided *before* the fork: an unauthorized local uid must
+    # not be able to make the root daemon spawn anything, and must not be able
+    # to stall it either.
+    assert _handlers(handle) == []
+    assert handle.process.poll() is None
     assert handle.stop() == (
         f"e2b-maint: serving on {handle.socket}\n"
         f"e2b-maint: refused: {refusal}\n"
@@ -633,39 +766,139 @@ def test_hello_rejects_a_peer_gid_mismatch(serve) -> None:
     response = _request(handle.socket, {"v": 1, "hello": True}, process=handle.process)
 
     assert response == {"v": 1, "ok": False, "error": refusal}
+    assert _handlers(handle) == []
+    assert handle.process.poll() is None
     assert handle.stop() == (
         f"e2b-maint: serving on {handle.socket}\n"
         f"e2b-maint: refused: {refusal}\n"
     )
 
 
-def test_serve_refuses_to_run_from_an_unpinned_path(
-    broker_bin: Path, tmp_path: Path
+def test_the_socket_is_reachable_only_by_its_peer(serve) -> None:
+    """``0660 root:<peer gid>``: a pool uid cannot even connect().
+
+    SO_PEERCRED is still the real gate, but this is the layer that keeps an
+    unauthorized uid out of the daemon's accept loop (and out of fork()) in the
+    first place.
+
+    The socket goes in a world-traversable directory on purpose: pytest's
+    ``tmp_path`` is ``0700``, where a pool uid would be refused by the
+    directory and the mode of the socket itself would never be exercised.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="e2b-broker-socket-"))
+    os.chmod(directory, 0o755)
+    try:
+        handle = serve("mode", socket_path=directory / "broker.sock")
+        _await_listening(handle)
+
+        info = os.stat(handle.socket)
+        assert (info.st_uid, info.st_gid) == (0, _peer_gid())
+        assert stat.S_IMODE(info.st_mode) == 0o660
+        assert _connect_as(POOL_START, handle.socket) == f"error:{errno.EACCES}"
+        assert _connect_as(_peer_uid(), handle.socket) == "connected"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_serve_refuses_connections_over_the_handler_cap(serve, tmp_path: Path) -> None:
+    """A trusted peer's leak must not turn into unlimited forked root processes."""
+    handle = serve()
+    _await_listening(handle)
+    idle = [
+        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        for _ in range(MAX_HANDLERS)
+    ]
+    try:
+        # Nothing is sent on these: a handler blocks reading its request, which
+        # is exactly how the cap gets reached.
+        for client in idle:
+            client.connect(str(handle.socket))
+        _await_handlers(handle, MAX_HANDLERS)
+
+        extra = _request(handle.socket, {"v": 1, "hello": True}, process=handle.process)
+
+        assert extra == {
+            "v": 1,
+            "ok": False,
+            "error": f"the broker is already serving {MAX_HANDLERS} requests",
+        }
+        # Refused means refused *without* a handler, and the daemon lives.
+        assert len(_handlers(handle)) == MAX_HANDLERS
+        assert handle.process.poll() is None
+    finally:
+        for client in idle:
+            client.close()
+
+    # Once the connections go away the daemon serves again (its handlers exit
+    # on EOF and the daemon reaps them before the next accept).
+    deadline = time.monotonic() + 15
+    while True:
+        final = _request(handle.socket, {"v": 1, "hello": True}, process=handle.process)
+        if final["ok"] is True:
+            break
+        assert time.monotonic() < deadline, final
+        time.sleep(0.02)
+
+
+def test_walk_escapes_a_non_utf8_name_like_python_does(
+    serve, tmp_path: Path
 ) -> None:
-    unpinned = tmp_path / "elsewhere" / "e2b-maint"
+    """One undecodable byte must not cost the caller the whole answer.
 
-    run = subprocess.run(
-        [str(broker_bin), "serve", "--socket", str(tmp_path / "unpinned.sock")],
-        env=_broker_env(broker_bin, tmp_path, E2B_MAINT_BIN=str(unpinned)),
-        capture_output=True,
-        text=True,
-        timeout=30,
+    A Linux filename may be any byte but NUL and '/'. The response is JSON, so
+    that byte comes back as Python's surrogateescape spelling (``\\udc80`` for
+    ``\\x80``) -- the decoded path then equals ``os.fsdecode()`` of the same
+    name, i.e. it still matches what ``os.walk`` reported.
+    """
+    handle = serve()
+    tree = _workspace(tmp_path) / "sb-1"
+    tree.mkdir()
+    raw = os.fsencode(tree) + b"/bad\x80name"
+    weird = os.fsdecode(raw)
+    with open(weird, "wb") as sink:
+        sink.write(b"x")
+
+    response = _request(
+        handle.socket,
+        {"v": 1, "args": ["walk", "--path", str(tree)]},
+        process=handle.process,
     )
 
-    assert run.returncode == 77
-    assert run.stdout == ""
-    assert run.stderr == (
-        f"e2b-maint: refused: cannot resolve the installed broker path "
-        f"{unpinned}: No such file or directory\n"
-    )
-
-    # An existing path that is *not* the running image is refused too: serve
-    # only ever runs from the installed path, never a copy of it.
-    run = subprocess.run(
-        [str(broker_bin), "serve", "--socket", str(tmp_path / "unpinned.sock")],
-        env=_broker_env(
-            broker_bin, tmp_path, E2B_MAINT_BIN=str(_image_cache(tmp_path))
+    assert response == {
+        "v": 1,
+        "ok": True,
+        "exit": 0,
+        "stdout": (
+            f"d {_peer_uid()} {_peer_gid()} 755 "
+            f"{os.stat(tree).st_blocks * 512} {tree}\n"
+            f"f {_peer_uid()} {_peer_gid()} 644 1 {os.fsdecode(raw)}\n"
         ),
+        "stderr": "",
+    }
+    assert response["stdout"].splitlines()[1].split(" ", 5)[5] == os.fsdecode(raw)
+
+    # And the request direction: that same name has to be *usable*, or a tree
+    # with such a file could never be torn down or handed over.
+    assert _request(handle.socket, _chown(Path(weird)), process=handle.process) == {
+        "v": 1,
+        "ok": True,
+        "exit": 0,
+        "stdout": "",
+        "stderr": "",
+    }
+    assert os.stat(weird).st_uid == POOL_START
+
+
+def test_serve_refuses_to_run_from_a_copy(broker_bin: Path, tmp_path: Path) -> None:
+    """The installed path is compiled in: a copy must not serve."""
+    copy = tmp_path / "copy" / "e2b-maint"
+    copy.parent.mkdir()
+    shutil.copyfile(broker_bin, copy)
+    os.chmod(copy, 0o750)
+
+    run = subprocess.run(
+        [str(copy), "serve", "--socket", str(tmp_path / "copy.sock")],
+        env=_broker_env(broker_bin, tmp_path),
         capture_output=True,
         text=True,
         timeout=30,
@@ -675,7 +908,6 @@ def test_serve_refuses_to_run_from_an_unpinned_path(
     assert run.stdout == ""
     assert run.stderr == (
         f"e2b-maint: refused: this broker must run from the installed path "
-        f"{os.path.realpath(_image_cache(tmp_path))} (E2B_MAINT_BIN), but the "
-        f"running image is {os.path.realpath(broker_bin)}: not serving from a "
-        "copy\n"
+        f"{INSTALLED_BROKER}, but the running image is {os.path.realpath(copy)}: "
+        "not serving from a copy\n"
     )
