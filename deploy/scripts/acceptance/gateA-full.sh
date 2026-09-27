@@ -7,6 +7,12 @@
 # Same caps, same env as that script's phase 1, plus the registry mirror the
 # image-rootfs cases in the tree still need.
 #
+# `E2B_PURE_ROOTFS=off` (+ the `E2B_REAL_ROOT=0` below) names the *emulated*
+# image root this lane has always measured. The pure sibling of that switch is
+# `synth` by default since 2026-09-27, and an explicit `E2B_REAL_ROOT=0` with it
+# is refused by name -- the guard cannot see that every sandbox in this lane has
+# an image, so the lane says which shape it means.
+#
 # `E2B_TEST_IMAGE` overrides the runner image (default
 # `e2b-sandlock-test:latest`), for the same reason `gateB-pure-rootfs.sh` has
 # the knob: the image bakes in `wheels/fork/*.whl` and nothing rebuilds it when
@@ -14,7 +20,11 @@
 # re-running a lane on a re-baked image without touching the shared `:latest`
 # tag needs a knob.
 set -eu
-cd "$(cd "$(dirname "$0")/../.." && pwd)"
+# Repo root. Three levels, not two: this file lives in
+# `deploy/scripts/acceptance/`, and the `../..` it carried over from its
+# original `tmp/<task>/` home resolved to `deploy/` here (measured: the log
+# redirect failed, and `-v "$(pwd):/workspace"` would have mounted `deploy/`).
+cd "$(cd "$(dirname "$0")/../../.." && pwd)"
 log="$1"
 IMAGE="${E2B_TEST_IMAGE:-e2b-sandlock-test:latest}"
 SECCOMP_PROFILE="$(pwd)/deploy/seccomp/sandlock-worker.json"
@@ -32,6 +42,7 @@ docker run --rm --init --network host \
     -e E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2 \
     -e E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
     -e E2B_REAL_ROOT=0 \
+    -e E2B_PURE_ROOTFS=off \
     -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
     -v "$(pwd):/workspace" -w /workspace \
     "$IMAGE" \

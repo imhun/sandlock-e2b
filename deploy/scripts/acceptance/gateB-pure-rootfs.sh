@@ -7,8 +7,11 @@
 # ruling leaves standing
 # (`docs/superpowers/plans/2026-09-26-decisions.md`, "「合成根 + 模拟根」结构性不成立"):
 #
-#   state 0 -- N15 identity: no synthesized root (`E2B_PURE_ROOTFS` unset,
-#              `E2B_REAL_ROOT=0`).
+#   state 0 -- N15 identity: no synthesized root (`E2B_PURE_ROOTFS=off`,
+#              `E2B_REAL_ROOT=0`). Since 2026-09-27 the *default* is `synth`,
+#              so the identity lane has to name the retreat lever -- and the
+#              explicit `E2B_REAL_ROOT=0` alone would be refused by name
+#              (`PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR`).
 #   state 1 -- synthesized root + real root (`E2B_PURE_ROOTFS=synth`,
 #              `E2B_REAL_ROOT=1`).
 #
@@ -24,7 +27,9 @@
 # `E2B_PURE_ROOTFS` matters for a *different* reason than it looks:
 # it is what `tests/security/conftest.py::route_b_sandbox` -- the security
 # suite's only shape entry point (Task 5b, de0a817) -- mirrors into the
-# executor. A lane that runs the suite without it measures the identity shape.
+# executor, *and* since 2026-09-27 it is what the product defaults to `synth`:
+# a lane that does not name it measures the synthesized root, and `=off` is the
+# one key back to the identity root.
 # `E2B_PURE_ROOTFS_DIR` is deliberately left unset so the helper's own
 # `sandbox_tmpdir(suffix="-pure-rootfs")` default applies (a directory the
 # sandbox uid can walk into); set it to pin one, as the deployment does with
@@ -40,7 +45,9 @@
 # (`deploy/scripts/build-test-image.sh`, pitfalls §B7): re-running a lane on a
 # re-baked image without touching the shared `:latest` tag needs a knob.
 set -eu
-cd "$(cd "$(dirname "$0")/../.." && pwd)"
+# Repo root, three levels (same promotion bug as `gateA-full.sh`/`gateB-full.sh`:
+# from `deploy/scripts/acceptance/`, `../..` lands on `deploy/`).
+cd "$(cd "$(dirname "$0")/../../.." && pwd)"
 IMAGE="${E2B_TEST_IMAGE:-e2b-sandlock-test:latest}"
 state="$1"
 log="$2"
@@ -55,7 +62,7 @@ case "$state" in
     0|1) ;;
     *) echo "usage: $0 <state 0|1> <log> [pytest target...]" >&2; exit 2 ;;
 esac
-set -- -e E2B_REAL_ROOT=0
+set -- -e E2B_PURE_ROOTFS=off -e E2B_REAL_ROOT=0
 if [ "$state" = "1" ]; then
     set -- -e E2B_PURE_ROOTFS=synth -e E2B_REAL_ROOT=1
 fi

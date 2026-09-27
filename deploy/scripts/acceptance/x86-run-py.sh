@@ -17,6 +17,7 @@ docker run --rm --init --network host \
     -e E2B_BASE_IMAGE="$base" \
     -e E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
     -e E2B_REAL_ROOT=0 \
+    -e E2B_PURE_ROOTFS=off \
     -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
     -v "$(pwd):/workspace" -w /workspace \
     e2b-sandlock-test:latest \

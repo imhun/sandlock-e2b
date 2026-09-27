@@ -222,18 +222,21 @@ def route_b_sandbox(
     uid): the point of routing every security case through here is that no test
     hand-builds a shape the deployment does not have.
     """
+    from envd_service.config import Settings, resolve_real_root
     from envd_service.executors.sandlock import SandlockExecutor
     from envd_service.route_b import RouteBConfig
 
-    # Mirror `Settings.real_root` (E2B_REAL_ROOT) so the suite can be run in
-    # both shapes: the emulated root (default) and the real one the fork builds
-    # with a mount namespace + pivot_root (see docs/chroot-workspace-exec.md).
-    real_root = os.environ.get("E2B_REAL_ROOT", "0").strip() == "1"
-    # ...and `Settings.pure_rootfs` (E2B_PURE_ROOTFS) for the same reason: the
-    # pure shape has two roots now (N15's host root, N16's synthesized skeleton)
-    # and a lane that sets the switch has to reach the executor this helper
-    # builds, or it silently measures the other one.
-    pure_rootfs = os.environ.get("E2B_PURE_ROOTFS", "off").strip().lower()
+    # Mirror `Settings.pure_rootfs` + `Settings.real_root` (E2B_PURE_ROOTFS /
+    # E2B_REAL_ROOT) -- *through the product's own resolution*, so this helper
+    # cannot own a second copy of the pair's rule. The pure shape has two roots
+    # (N15's host root, N16's synthesized skeleton, the default since
+    # 2026-09-27) and the real root the fork builds with a mount namespace +
+    # pivot_root travels with the synthesized one while `E2B_REAL_ROOT` is
+    # unset. A lane that sets a switch has to reach the executor this helper
+    # builds, or it silently measures another shape.
+    shape = Settings()
+    pure_rootfs = shape.pure_rootfs
+    real_root = resolve_real_root(shape, pure_shape=image is None)
     pure_rootfs_dir = os.environ.get("E2B_PURE_ROOTFS_DIR") or str(
         sandbox_tmpdir(suffix="-pure-rootfs")
     )

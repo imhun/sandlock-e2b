@@ -46,9 +46,10 @@ UID_B = 10001
 
 #: Which of the pure shape's two legal roots this lane runs (see the module
 #: docstring). ``tests/security/conftest.py::route_b_sandbox`` mirrors
-#: ``E2B_PURE_ROOTFS`` into the executor, so the switch is the shape.
+#: ``E2B_PURE_ROOTFS`` into the executor, so the switch is the shape -- and
+#: since 2026-09-27 the default it mirrors is the synthesized root.
 _ROOTED_PURE_SHAPE = (
-    os.environ.get("E2B_PURE_ROOTFS", "off").strip().lower() == "synth"
+    (os.environ.get("E2B_PURE_ROOTFS") or "synth").strip().lower() == "synth"
 )
 
 

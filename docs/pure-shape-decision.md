@@ -114,7 +114,9 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
    档**已消掉**"能列出名字"（`chain=PASS`，`<export>` 根本不在祖先链上）；**默认的 `identity` 档仍有残差**
    （`<export>` 一层 `LEAK ["_secrets", "state"]`、四次 `stat` 仍 `EACCES`）；legacy 反例档 `exit 1`
    ⇒ 判据非恒真。要让**默认**形态也消掉，唯一一步是把 `E2B_PURE_ROOTFS` 的默认值从 `off` 切到 `synth`
-   （代价见 §7），**今天没有拍板切、默认值也没动**。原始输出 `tmp/k0s/n27resid-*.log`，逐档表见
+   （代价见 §7）。**（2026-09-27 后半：已拍板切并落地 —— 默认值现在是 `synth`；上面那几句读作
+   「切换之前」的实测，切换记录见 §7 的「默认已切（2026-09-27）」一节。）** 原始输出
+   `tmp/k0s/n27resid-*.log`，逐档表见
    `docs/deploy-clusters.md` §11.2、报告 `docs/reports/n27-identity-residual-report.md`。
 3. **N14 挂在 N15+OBS-5 之后评估**：如果 33 条做完之后仍觉得"拦截清单完整性"这层负担不值，
    再走真根；那时它是个优化，不是前提。
@@ -195,7 +197,7 @@ workspace 路径，中介再经挂载表映射回 `/home/user`（`pwd` 仍是它
 `cd /home/user` 直接 `can't cd to /home/user`（rc=2）——**`/home/user` 这个别名只在有根形态存在**。
 挂载表映射管的是 exec 的 cwd 参数，不是 shell 的 `pwd`；把那句读成"identity 下别名可解析"是错的。
 
-**N16 是什么**：`E2B_PURE_ROOTFS=synth`（默认 `off`）时，pure 沙箱拿到**每沙箱一份的合成骨架**
+**N16 是什么**：`E2B_PURE_ROOTFS=synth`（**2026-09-27 起是默认**，`off` 是退回杆）时，pure 沙箱拿到**每沙箱一份的合成骨架**
 （`<base>/_pure_rootfs/<id>`，普通目录 + bind 系统目录 + 整棵 `/dev`），fork 在沙箱自己的 mount ns
 里 `pivot_root` ⇒ pure 也有内核根，`E2B_REAL_ROOT=1` 于是在 pure 里也开得起来。产品侧只动
 `kwargs["chroot"]` **一个值**：`_chroot_root` 从 `"/"` 变成骨架目录，中介、策略、COW、活账本一行
@@ -210,11 +212,44 @@ container 崩塌 ⇒ 之后每个 verb 都答 `InstanceClosed`（security 两态
 写明出路），配一条 E2B 侧红用例 + 这句文档。
 
 **两态的新读法**（同一裁定）：纯形态的"两态"是 **`=0` ⇔ N15 identity（不设根）**、
-**`=1` ⇔ 合成根 + 真根**；`E2B_PURE_ROOTFS` 默认 `off`，即默认仍是 identity。
-**（2026-09-27 更新：默认值已复核，仍是 `off`、未切换）** —— lane 三档重跑确认：`synth` 档已消掉
-`<export>` 列名、**默认 identity 档仍列名**（残差在"没有根"本身，不是 N16 没修）；要不要把默认切到
-`synth` 是**留给用户拍板**的一步（代价三条：每沙箱一份骨架目录、依赖 `E2B_REAL_ROOT=1`、依赖 worker
-seccomp 档），本轮没动任何默认值。证据见 §5 第 2 条与 `docs/deploy-clusters.md` §11.2。
+**`=1` ⇔ 合成根 + 真根**。两态仍然都在（`gateB-pure-rootfs.sh 0|1`），但**默认档从 identity 换成了
+合成根**（下一节）。
+
+**默认已切（2026-09-27）：`E2B_PURE_ROOTFS=synth` + 成对耦合的 `E2B_REAL_ROOT`**
+
+用户裁定（本条）：**默认切成 `synth`** —— 残差的成因是"没有根"本身（§5 第 2 条），所以消掉它只能
+靠默认档换根。切换前 lane 三档的复核（`synth` 档 `chain=PASS`、默认 identity 档 `LEAK
+["_secrets","state"]`、legacy 反例 `exit 1`）证据见 §5 第 2 条与 `docs/deploy-clusters.md` §11.2。
+
+**两个默认怎么一起动（选 B：成对耦合）**。`pure_rootfs` 默认 `synth`；`E2B_REAL_ROOT` **未被显式
+设置**时按"跟着合成根走"处理（`envd_service/config.py::resolve_real_root`）：**有合成根的箱**
+（pure 形态）装上真根，**其余形态**（有 base image 的 image-rootfs 箱）保持今天的模拟根。
+不选 A（把 `E2B_REAL_ROOT` 的全局默认一起翻成 `on`）的理由是影响面：A 会让**两套生产清单里没显式
+写这个键的那些栈**（`deploy/stack/docker-compose.prod.yml`、`deploy/compose/*.yml`）在无人声明的
+情况下从模拟根换到 pivot_root，而这次裁定的范围只是"pure 的默认根"；B 之下 image 形态**逐字节
+不变**，生产车队（两套清单都设 `E2B_BASE_IMAGE`）不受影响（逐处行号见本节末的影响面表）。
+
+**退回杆是一句话**：`E2B_PURE_ROOTFS=off`。它把 pure 形态放回 N15 的 identity 根，同时因为
+"没有合成根可跟随"，耦合出来的真根默认也随之回到 `off` —— **旧形态是这一个键，不是两个**。
+`E2B_REAL_ROOT=1/0` 仍然显式优先（`=0` + `synth` 就是配置守卫拒绝的那对）。
+
+**代价（三条，都写进 `config.py` 的字段 docstring）**：① 每沙箱一份骨架目录
+`<base>/_pure_rootfs/<id>`（拆箱时收掉）；② pure 形态从此**依赖真根**，也就是依赖节点上的
+`deploy/seccomp/sandlock-worker.json`——**实测**：同一个镜像、只差 seccomp 档，探针在 Docker 默认档
+下答 `unshare(CLONE_NEWUSER): Operation not permitted`、在仓库档下答 `ok`
+（`envd_service/executors/sandlock.py::_real_root_capability`；没有档的宿主上，建箱会**按名字**
+拒绝，不会静默降级）；③ 空值仍读作"未设"（本仓库 env 助手的
+惯例），所以"选 identity"要写 `off`，写 `E2B_PURE_ROOTFS=` 是取默认。
+
+**影响面（逐处实测/逐处给行号）**：
+
+| 面 | 例子（文件:行） | 翻默认后 |
+|---|---|---|
+| image-rootfs 车队（设 `E2B_BASE_IMAGE`） | `deploy/k8s/worker.yaml:507`（`k8s` 另设 `E2B_REAL_ROOT=1`，`:457`）、`deploy/stack/docker-compose.prod.yml:145`、`deploy/compose/docker-compose.prod.yml:114` | **不变**（B 的耦合按形态解析；`E2B_REAL_ROOT` 未设 ⇒ image 箱仍是模拟根） |
+| 池（`E2B_AS_WORKER_ENV`）/ autoscale 栈 | `deploy/compose/docker-compose.autoscale.yml:166`、`autoscaler/backends/local.py:48`（`_env` 字典；`seccomp=unconfined` 在 `:141`） | 池默认带 base image ⇒ **不变**；**手搭的不带 base image 的池**会走 `synth`，宿主不允许非特权 userns 时建箱按名字拒绝，退回杆 = `E2B_AS_WORKER_ENV` 里加 `"E2B_PURE_ROOTFS": "off"` |
+| 不带 base image 的 compose 栈 | `deploy/compose/docker-compose.yml:82`（`envd`，无 `E2B_BASE_IMAGE`、也没换 seccomp 档） | **会走 `synth` 并在 Docker 默认档下起不来** ⇒ 已显式加 `E2B_PURE_ROOTFS: ${E2B_PURE_ROOTFS:-off}`（`:103`；要跑新默认就装上仓库档并删掉这个键） |
+| 形态 lane | `deploy/scripts/acceptance/gateA-full.sh`、`gateB-full.sh`、`gateB-pure-rootfs.sh`（state 0）、`x86-security-one.sh`、`x86-run-py.sh`、`deploy/scripts/arm-lane/x86-security.sh` | 它们显式写 `E2B_REAL_ROOT=0`，翻默认后**必须同时点名 `E2B_PURE_ROOTFS=off`**（否则被守卫拒绝）⇒ 已逐处加上 |
+| N27 探针 lane | `deploy/scripts/acceptance/n27-t7-lane.sh:35`（`E2B_BASE_IMAGE=` 空 ⇒ pure） | 原来靠"默认即 identity"；现在**转发** `E2B_PURE_ROOTFS`（`:36`），由调用者与探针自己的 `--shape` 对齐 |
 
 **验收（2026-09-26，Task 13 权威落点）**：四档全量 lane 的逐档数字、基线与差逐字如下（全部在
 revision `1374e87`、同一份树指纹上跑，镜像 `e2b-sandlock-test:task12cur`）：

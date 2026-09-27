@@ -77,6 +77,21 @@ def _state_base_from_env() -> Path | None:
     return Path(raw).resolve() if raw else None
 
 
+def _real_root_from_env() -> bool | None:
+    """``E2B_REAL_ROOT`` as a *tri-state*: on, off, or unset (``None``).
+
+    ``None`` is not "off". Since the pure shape's default root became the
+    synthesized skeleton (N16, 2026-09-27), unset means the real root travels
+    *with* that skeleton -- see :func:`resolve_real_root`. Spelling ``0`` still
+    means off, and off together with ``synth`` is the combination
+    :func:`check_pure_rootfs_pairing` refuses by name.
+    """
+    raw = os.getenv("E2B_REAL_ROOT")
+    if raw is None or raw.strip() == "":
+        return None
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # Default private-egress denylist applied to the implicit full-egress branch
 # (no explicit allowOut/denyOut + internet allowed). Covers RFC1918, loopback,
 # link-local / cloud metadata, CGNAT, multicast/reserved, and ULA. Override
@@ -178,11 +193,25 @@ class Settings:
     #: ``real_root`` as well, and it *needs* it: with ``E2B_REAL_ROOT`` off the
     #: binds never happen, the skeleton stays empty, and the worker refuses the
     #: combination at startup (:data:`PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR`).
-    #: ``off`` is the default: this is a shape an operator flips, not a silent
-    #: change to a running fleet. The flip has an ordering condition -- see
-    #: :data:`gateway_common.paths.PURE_ROOTFS_DIR_NAME`.
+    #:
+    #: ``synth`` is the default (2026-09-27 ruling, after the N27 residual was
+    #: measured on the default lane): identity's `<export>` still lists the
+    #: *names* of `state`/`_secrets` -- not their contents, but shape drift the
+    #: synthesized root removes, because `<export>` stops being an ancestor at
+    #: all. The costs are stated where they are paid: one skeleton directory
+    #: per sandbox, the real root it depends on (which needs the shipped
+    #: seccomp profile on the node, `deploy/seccomp/sandlock-worker.json`), and
+    #: the teardown that removes `<base>/_pure_rootfs/<id>`.
+    #:
+    #: **The retro lever is one sentence**: ``E2B_PURE_ROOTFS=off`` puts the
+    #: pure shape -- and with it the coupled real-root default, see
+    #: :func:`resolve_real_root` -- back on N15's identity root. Setting it back
+    #: to ``off`` is the whole retreat; an empty value means "unset" (the
+    #: default), following this module's other env helpers.
     pure_rootfs: str = field(
-        default_factory=lambda: os.getenv("E2B_PURE_ROOTFS", "off").strip().lower()
+        default_factory=lambda: (os.getenv("E2B_PURE_ROOTFS") or "synth")
+        .strip()
+        .lower()
     )
     #: Where those roots land: ``E2B_PURE_ROOTFS_DIR``, else beside the sandbox
     #: trees under the workspace base. Read only when ``pure_rootfs`` is
@@ -257,13 +286,16 @@ class Settings:
     # static binaries, i.e. everything the *kernel* resolves by itself, which
     # the emulated root can only refuse (docs/chroot-workspace-exec.md).
     #
-    # Off by default, and it must not be turned on before the *deployment* is
-    # ready: the worker's seccomp profile has to admit the mount-family
+    # ``E2B_REAL_ROOT`` is a *tri-state*: ``None`` (unset) means "follow the
+    # synthesized root" -- which is what makes the flipped pure default a pair
+    # instead of two independent flips (see ``resolve_real_root`` and
+    # ``pure_rootfs`` above). It must not be turned on before the *deployment*
+    # is ready: the worker's seccomp profile has to admit the mount-family
     # syscalls (deploy/seccomp/sandlock-worker.json carries them; a node still
     # running the old profile refuses every sandbox create with EPERM). The
     # workload itself never gains the ability to mount -- the fork's own filter
     # denies it and the capability is gone.
-    real_root: bool = field(default_factory=lambda: _env_bool("E2B_REAL_ROOT", False))
+    real_root: bool | None = field(default_factory=_real_root_from_env)
     # E7.2: the pairing guard's escape hatch. `net_isolation` without
     # `fd_inject_connect` yields a loopback-only sandbox: every external
     # connect fails at the kernel (no route), which in production looks like
@@ -562,22 +594,23 @@ NET_ISOLATION_PAIRING_ERROR = (
 )
 
 
-#: Raised when ``E2B_PURE_ROOTFS=synth`` is asked for without ``E2B_REAL_ROOT``
+#: Raised when ``E2B_PURE_ROOTFS=synth`` meets an *explicit* ``E2B_REAL_ROOT=0``
 #: (N16, measured 2026-09-26). The two switches are not a pair an operator may
 #: pick only one of: the synthesized root is an *empty* skeleton and the binds
 #: that fill it (host system directories, the workspace, the volumes) only
-#: happen on the real-root path. Named so the refused pair is one greppable
-#: sentence in a crash-looping worker's log rather than 32 ``instance is
-#: closed`` errors to reverse-engineer.
+#: happen on the real-root path. Unset is not this shape -- unset is the
+#: coupled default (:func:`resolve_real_root`). Named so the refused pair is one
+#: greppable sentence in a crash-looping worker's log, with the retreat lever in
+#: it, rather than 32 ``instance is closed`` errors to reverse-engineer.
 PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR = (
     "E2B_PURE_ROOTFS=synth without E2B_REAL_ROOT=1: the synthesized root is an "
     "empty skeleton, and only the real root (a mount namespace it binds into) "
     "puts the host system directories, the workspace and the volumes inside "
     "it. With the emulated root every path resolves inside that skeleton, so "
     "the sandbox's own /bin/sh does not exist: the create dies with errno 13 "
-    "and every later command answers `instance is closed`. Set "
-    "E2B_REAL_ROOT=1 so the skeleton gets its binds, or leave E2B_PURE_ROOTFS "
-    "unset to keep the pure shape on N15's identity root."
+    "and every later command answers `instance is closed`. Drop the explicit "
+    "E2B_REAL_ROOT=0 so the pair travels together (that is the default), or set "
+    "E2B_PURE_ROOTFS=off to keep the pure shape on N15's identity root."
 )
 
 
@@ -788,16 +821,40 @@ def check_net_isolation_pairing(settings: Settings) -> None:
     raise RuntimeError(NET_ISOLATION_PAIRING_ERROR)
 
 
+def resolve_real_root(settings: Settings, *, pure_shape: bool) -> bool:
+    """The real root this sandbox is built with (N35 + N16).
+
+    ``E2B_REAL_ROOT`` unset means the flag *travels with the synthesized root*:
+    the shape that has one (the pure shape, while ``E2B_PURE_ROOTFS=synth``)
+    arms it, and every other shape keeps the emulated root it has today. That
+    is the single deviation from "the flags are independent", and it exists so
+    the flipped default is a *pair* rather than two flips: an image-rootfs
+    fleet -- both production manifests set ``E2B_BASE_IMAGE`` -- keeps the shape
+    it runs today, and ``E2B_PURE_ROOTFS=off`` is the whole retreat instead of
+    half of one.
+
+    Spelling ``E2B_REAL_ROOT=1``/``0`` outranks the coupling and keeps its old
+    meaning, so ``=0`` together with ``synth`` stays the contradiction
+    :func:`check_pure_rootfs_pairing` refuses at startup.
+    """
+    explicit = getattr(settings, "real_root", None)
+    if explicit is not None:
+        return bool(explicit)
+    return pure_shape and getattr(settings, "pure_rootfs", "off") == "synth"
+
+
 def check_pure_rootfs_pairing(settings: Settings) -> None:
     """Refuse the synthesized pure root without the real root (measured 2026-09-26).
 
     ``E2B_PURE_ROOTFS=synth`` builds an *empty* skeleton per sandbox and relies
     on the fork's ``real_root`` path to bind the host system directories, the
-    workspace and the volumes into it. With ``E2B_REAL_ROOT`` off that path
-    never runs, so the mediated paths resolve inside the skeleton, ``/bin/sh``
-    is missing, the create dies with errno 13 and every later verb answers
-    ``instance is closed`` -- a shape an operator cannot read back to a
-    configuration mistake. Fail here, by name, instead of serving it.
+    workspace and the volumes into it. With ``E2B_REAL_ROOT`` *explicitly off*
+    that path never runs, so the mediated paths resolve inside the skeleton,
+    ``/bin/sh`` is missing, the create dies with errno 13 and every later verb
+    answers ``instance is closed`` -- a shape an operator cannot read back to a
+    configuration mistake. Fail here, by name, instead of serving it. An
+    *unset* ``E2B_REAL_ROOT`` is the coupled default (:func:`resolve_real_root`)
+    and therefore not this case: it is what arms the pair.
 
     See docs/superpowers/plans/2026-09-26-decisions.md (追加裁定 2026-09-26)
     and .superpowers/sdd/pure-task-9-report.md §2 for the measurement.
@@ -806,6 +863,9 @@ def check_pure_rootfs_pairing(settings: Settings) -> None:
     # settings double that predates these fields keeps its old behaviour.
     if getattr(settings, "pure_rootfs", "off") != "synth":
         return
-    if getattr(settings, "real_root", False):
+    # `True` is the pair. So is `None` -- unset is the *coupled* default
+    # (:func:`resolve_real_root`), i.e. the pair travelling together, not half
+    # of it: refusing it would refuse this repository's own default.
+    if getattr(settings, "real_root", None) is not False:
         return
     raise RuntimeError(PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR)

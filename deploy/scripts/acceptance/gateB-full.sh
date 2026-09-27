@@ -6,8 +6,17 @@
 #
 # Same caps, same env as that script's phase 1, plus the registry mirror the
 # image-rootfs cases in the tree still need.
+#
+# `E2B_PURE_ROOTFS=off` (+ the `E2B_REAL_ROOT=0` below) is this lane's shape on
+# purpose: N15's identity pure root, the one shape an operator retreats to.
+# Since 2026-09-27 the product's default is the *synthesized* root, so the lane
+# names the lever instead of inheriting it -- see gateB-pure-rootfs.sh for the
+# two states side by side.
 set -eu
-cd "$(cd "$(dirname "$0")/../.." && pwd)"
+# Repo root, three levels (the same `../..`-vs-`../../..` promotion bug as
+# `gateA-full.sh`: from `deploy/scripts/acceptance/` two levels lands on
+# `deploy/`).
+cd "$(cd "$(dirname "$0")/../../.." && pwd)"
 log="$1"
 # Same knob as `gateA-full.sh`/`gateB-pure-rootfs.sh`: the image bakes in
 # `wheels/fork/*.whl`, so a lane that must be same-source with the wheels on
@@ -29,6 +38,7 @@ docker run --rm --init --network host \
     -e E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2 \
     -e E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
     -e E2B_REAL_ROOT=0 \
+    -e E2B_PURE_ROOTFS=off \
     -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
     -v "$(pwd):/workspace" -w /workspace \
     "$IMAGE" \

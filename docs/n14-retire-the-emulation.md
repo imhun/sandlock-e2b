@@ -257,7 +257,7 @@ N15 选的路是"补一个中介 + identity 翻译，把那 33 条一条条闸�
 §5.1 那三条"都还不知道答案"的前提（`/proc`、`/dev`、"还有没有别的真实用法"）本轮全部量过了，
 所以这一节写的是**已选的路线**，不是推演。
 
-**选了什么**：`E2B_PURE_ROOTFS=synth`（默认 `off` ⇒ 今天的行为一字不变）时，pure 沙箱拿到
+**选了什么**：`E2B_PURE_ROOTFS=synth`（**2026-09-27 起是默认**；`off` 是退回杆，见下）时，pure 沙箱拿到
 **每沙箱一份的合成骨架** `<base>/_pure_rootfs/<id>`（普通目录，`0755`，名字进了
 `gateway_common.paths.RESERVED_PLATFORM_NAMESPACES`），骨架里 bind 系统目录
 （`/usr /bin /sbin /lib /lib64 /opt`，源不存在的跳过）与**整棵容器的 `/dev`**；真正的挂载由 fork
@@ -308,6 +308,14 @@ errno 13 ⇒ container 崩塌 ⇒ 之后每个 verb 都答 `InstanceClosed`）�
 （`/proc` 合成、策略判定、COW 视图、磁盘活账本全在中介里，见 §3）。它还顺手答了 §6 里 S5
 （"真根成为唯一形态"）的前提：每个交付形态都能吃真根之后，就没有 `E2B_REAL_ROOT=0` 兜不住的形态了。
 
+**（2026-09-27 更新：默认已切，S5 的前提就此成立）** —— `E2B_PURE_ROOTFS` 默认从 `off` 翻到
+`synth`，且 `E2B_REAL_ROOT` 未显式设置时**跟着合成根走**（`envd_service/config.py::resolve_real_root`）：
+于是**每一个默认交付形态都装真根**（image 形态本来就走真根那条路；pure 形态现在也有骨架可 pivot，
+`E2B_REAL_ROOT` 的存在与否不再是一个交付形态的分叉）。合成根 + 显式 `E2B_REAL_ROOT=0` 这对仍然被守卫
+当场拒绝（那句错误信息里带着退路）。要回到模拟根只有两条显式路径：`E2B_PURE_ROOTFS=off`（pure 形态）或
+`E2B_REAL_ROOT=0`（image 形态）；S5 的"没有 `E2B_REAL_ROOT=0` 也能全绿"因此变成了**默认档**的验收口径。
+代价与影响面逐处列在 `docs/pure-shape-decision.md` §7 的「默认已切（2026-09-27）」一节。
+
 ---
 
 ## 6. 阶段与验收（每阶段独立可验）
@@ -318,12 +326,14 @@ errno 13 ⇒ container 崩塌 ⇒ 之后每个 verb 都答 `InstanceClosed`）�
 | S2 | ✅ **已回答**：pure 走真根**可行但要合成 rootfs**，而那份 rootfs 的内容正好是它今天的 Landlock 白名单 ⇒ 这同时是 **N15 的一条替代路线**（一次合成换掉 33 条闸门） | 结论与实测见 §5；三个探针 `deploy/scripts/acceptance/probe-pure-realroot.py`（A=EBUSY、A2=同树无隔离、B=合成根真隔离） |
 | S3 | **已跑完（2026-09-25）**：真根下的 handler 改成 `Continue`（沿用 `exec`/`chdir` 已有的 `child_is_pivoted` 判据），翻译只留给模拟根。**放行了 `getcwd`，其余全家族读完后否掉**（§4.1 的三个候选 + §4.2 的判据表）——真根下"纯翻译"的 handler 只有它一个；剩下的中介工作不是翻译，而是策略 / COW 视图 / 磁盘活账本，归 S4 与 S5 | **已验收（`getcwd`）**：fork 的 `core_integ` 559（+1 新用例，判别性已证）+ 两态 security 套件 —— `E2B_REAL_ROOT=0` **43 passed / 1 skipped / 4 xfailed**、`=1` **46 passed / 1 skipped / 1 xfailed**，与改动前的基线逐字相同（crate 侧 `test_chroot` 51 / `test_instance_exec` 28 / `test_cow` 26 / `test_restore` 5 全绿）。不可放行的那批（`open`/`write`/`stat`/`statx`/`readlink`/`xattr`/`utimensat`）**保持不变**，每个否掉的都在 §4.1/§4.2 写明为什么 |
 | S4 | 账本换观察点（或证明周期扫描足够），再退写拦截 | 磁盘门禁的单测与集群验收不变 |
-| S5 | 真根成为**唯一**形态，模拟那套整体退役。**注意这是代码卫生，不是安全改进**（§5） | 没有 `E2B_REAL_ROOT=0` 也能全绿 |
+| S5 | 真根成为**唯一**形态，模拟那套整体退役。**注意这是代码卫生，不是安全改进**（§5） | **默认档已经是真根**（2026-09-27 起 pure 默认也是合成根 + 真根 ⇒ "没有 `E2B_REAL_ROOT=0` 也能全绿"成立）；模拟形态只剩两条显式退路（pure 的 `E2B_PURE_ROOTFS=off`、image 的 `E2B_REAL_ROOT=0`），它们才是"退役"要清掉的最后两个入口 |
 
 > **（2026-09-27 更新：S4/S5 仍未做 —— `docs/open-issues.md` N14 的"简化那半未做"就是这个）** ——
 > `chroot/dispatch.rs`、`procfs.rs`、`chroot/resolve.rs` 全套仍在位，真根"退役模拟"的收益（拦截清单
 > 不再承担安全职责）**在生产里已由 S1 交付**，所以这一步现在只是**代码卫生**、不是欠一道防线；
-> 它被 `E2B_REAL_ROOT=0` 这个配置挡着。要不要做、什么时候做，按 §7 的账单独评估。
+> 它被 `E2B_REAL_ROOT=0` 这个配置挡着（**2026-09-27 之后**：pure 形态要看模拟根，需要同时写
+> `E2B_PURE_ROOTFS=off` 与 `E2B_REAL_ROOT=0`；只写后者会被 `PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR`
+> 拒绝 —— 也就是说模拟根现在**只出现在显式声明的地方**）。要不要做、什么时候做，按 §7 的账单独评估。
 
 **S3 之前不要动翻译代码**：现在删除任何一条，都会在 `E2B_REAL_ROOT=0` 的部署上
 把"被拦截"变成"在宿主解析"。

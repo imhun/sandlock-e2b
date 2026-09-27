@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from envd_service.config import Settings
+from envd_service.config import Settings, resolve_real_root
 from envd_service.executors.base import Executor
 from envd_service.executors.local import LocalExecutor
 from envd_service.runtime.image_resolver import resolve_image_rootfs
@@ -197,8 +197,8 @@ def create_executor(
                 base_image=base_image,
                 image_rootfs=image_rootfs,
                 # N16: the pure shape gets a synthesized root only when the
-                # operator flipped the switch. `off` (the default) hands over
-                # no directory at all, which is what keeps N15's shape.
+                # switch says so -- `synth` is the default since 2026-09-27, and
+                # `off` is the one-key retreat to N15's identity root.
                 pure_rootfs_dir=(
                     settings.pure_rootfs_dir
                     if settings.pure_rootfs == "synth"
@@ -220,7 +220,14 @@ def create_executor(
                 port_mappings=settings.port_mappings,
                 bind_inject=settings.net_bind_inject,
                 pid_ns=settings.pid_ns,
-                real_root=settings.real_root,
+                # The pair (N16): an unset `E2B_REAL_ROOT` travels with the
+                # synthesized root -- the pure shape arms it, an image sandbox
+                # keeps the emulated root it has today. An explicit `=0`/`=1`
+                # still wins, which is what keeps the explicit contradiction
+                # refused at startup (`check_pure_rootfs_pairing`).
+                real_root=resolve_real_root(
+                    settings, pure_shape=base_image is None
+                ),
                 network=network,
                 network_deny_cidrs=settings.network_deny_cidrs,
                 notify_rate_limit=settings.sandbox_notify_rate_limit,

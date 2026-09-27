@@ -57,7 +57,9 @@ async def test_the_errno_for_a_path_outside_every_grant_is_pinned(workspace):
     # Prove the shape before asserting on it: `route_b_sandbox` is the only
     # place the switch is mirrored, and a lane that forgot it would silently
     # measure the identity shape and make the split below vacuous.
-    synth = os.environ.get("E2B_PURE_ROOTFS", "off").strip().lower() == "synth"
+    # The default of the switch is the synthesized root (2026-09-27): an
+    # unset value is `synth`, and `E2B_PURE_ROOTFS=off` is the other lane.
+    synth = (os.environ.get("E2B_PURE_ROOTFS") or "synth").strip().lower() == "synth"
     assert executor._has_sandbox_root is synth, (
         f"shape mismatch: E2B_PURE_ROOTFS={os.environ.get('E2B_PURE_ROOTFS')!r} "
         f"but has_sandbox_root={executor._has_sandbox_root}"

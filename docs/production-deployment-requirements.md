@@ -1064,6 +1064,47 @@ worker 形态不能在 root 相位断言），与开不开 pid_ns 无关；也�
 自 2026-09-17（N5/N10 一并落地）就设了 `E2B_PID_NS: "true"` + `E2B_ENABLE_NET_ISOLATION/FD_INJECT_CONNECT`；
 池与其余 worker 栈在 2026-09-27 的 N45（`e2e5f1a`）补齐。**每个交付形态都是 per-sandbox pid ns 了。**
 
+### 2.4.11 pure 形态的默认根：合成根（2026-09-27 裁定）
+
+**部署要求（新的默认）**：`E2B_PURE_ROOTFS` 的默认从 `off`（N15 identity：中介的根 = 宿主 `/`）
+翻到 **`synth`**（N16：每沙箱一份合成骨架 + 真根）。触发条件是"没有 base image 的箱"，所以
+**设了 `E2B_BASE_IMAGE` 的车队不受影响**；受影响的是不带 base image 的 compose 栈、本地池与形态 lane。
+
+**为什么**：N27 的残差只在"没有根"的形态里存在 —— 默认 identity 档下 `<export>`（`../..`）能列出
+`state`/`_secrets` 的**名字**（读不到内容，但那本身就是形态漂移）；合成根档已消掉（`chain=PASS`）。
+判定与实测证据：`docs/pure-shape-decision.md` §5 第 2 条与 §7、`docs/deploy-clusters.md` §11.2、
+`docs/reports/n27-identity-residual-report.md`。
+
+**两个开关必须一起动（成对耦合）**：`E2B_REAL_ROOT` **未显式设置**时按"跟着合成根走"解析
+（`envd_service/config.py::resolve_real_root`）——有合成根的箱（pure）装真根，其余（image 形态）
+保持今天的模拟根。**为什么不让 `E2B_REAL_ROOT` 独立翻默认**：那会把两套生产清单里没写这个键的栈
+（`deploy/stack/docker-compose.prod.yml`、`deploy/compose/*.yml`）在无人声明的情况下从模拟根换到
+pivot_root，超出"pure 的默认根"这次裁定的范围。
+
+**节点前置（硬）**：合成根靠真根那条路径 bind，而真根要求 worker 的 seccomp 档放行 mount 族 ——
+即 `deploy/seccomp/sandlock-worker.json`。**实测**：同镜像、同命令，Docker 默认档下
+`_real_root_capability()` 答 `unshare(CLONE_NEWUSER): Operation not permitted`，仓库档下答 `ok`。
+没有档的宿主上**不会静默降级**：该节点的每个建箱都按名字拒绝（`E2B_REAL_ROOT is on, but this worker
+cannot build a sandbox root: … apply deploy/seccomp/sandlock-worker.json`）。因此：
+
+* 带 base image 的 worker（`deploy/k8s/worker.yaml`、`deploy/stack/docker-compose.prod.yml`、
+  `deploy/compose/*.yml`）：**无需改键**，它们本来就跑仓库档；只有箱本身是 pure 时才用到合成根。
+* **不带 base image** 的栈（`deploy/compose/docker-compose.yml` 的 `envd`）：已显式写
+  `E2B_PURE_ROOTFS: ${E2B_PURE_ROOTFS:-off}`（`E2B_PURE_ROOTFS=synth` 可 opt-in，前提是给该服务装上
+  仓库档）；否则 Docker 默认档下 pure 箱起不来。
+* 本地池（`E2B_AS_WORKER_ENV` / `autoscaler/backends/local.py:48`）：池的 compose JSON 带
+  `E2B_BASE_IMAGE` ⇒ 不变；**手搭的、不带 base image 的池**会走 `synth`，退回杆是在
+  `E2B_AS_WORKER_ENV` 里加 `"E2B_PURE_ROOTFS": "off"`。
+
+**退回杆是一句话**：`E2B_PURE_ROOTFS=off` —— pure 形态回到 identity 根，耦合出来的真根默认也随之
+回 `off`，即"旧形态是这一个键，不是两个"。`E2B_REAL_ROOT=0` **显式**与 `synth` 同用仍是配置错误，
+`create_app` 当场拒绝并给出这句退路（`PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR`）。
+注意空值读作"未设"（本仓库 env 助手惯例）：要 identity 就写 `off`。
+
+**代价（写进 docstring 的三条）**：每沙箱多一个顶层骨架目录 `<base>/_pure_rootfs/<id>`（拆箱时收掉）；
+pure 形态从此依赖真根（也就是依赖上面的 seccomp 档）；`E2B_PURE_ROOTFS_DIR` 的默认落点不变。
+两态 lane：`deploy/scripts/acceptance/gateB-pure-rootfs.sh 0|1`（`=off` 与合成根各一遍）。
+
 ## 2.5 门禁容器的两种形态（别把测试特权当成生产需要）
 
 - **`deploy/scripts/test-prod-shaped.sh`（生产形，默认推荐）**：容器不带 `--privileged`，

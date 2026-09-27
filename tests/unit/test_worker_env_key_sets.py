@@ -288,6 +288,15 @@ EXTRA_CLASSES: dict[str, set[str]] = {
     "legacy_enable_netns": {"E2B_ENABLE_NETNS"},
     # The pool chooses its executor (N38's rollback lever).
     "pool_executor": {"E2B_EXECUTOR"},
+    # N16's default flip (2026-09-27): `E2B_PURE_ROOTFS` is `synth` in the
+    # product now, and the single-machine example is a *pure* stack (no base
+    # image) run under Docker's own default seccomp profile -- which does not
+    # admit `unshare`, so the real root that fills the synthesized skeleton
+    # cannot be built there (measured: `unshare(CLONE_NEWUSER): Operation not
+    # permitted`). The example names the retreat lever
+    # (`${E2B_PURE_ROOTFS:-off}`; set it to `synth` after installing
+    # `deploy/seccomp/sandlock-worker.json` on that service).
+    "demo_pure_rootfs_lever": {"E2B_PURE_ROOTFS"},
     # The test runner is an SDK client, not a worker: these are its own
     # switches (the shape it runs is selected by the runner image and the
     # suite's fixtures -- `deploy/docker/Dockerfile.test-runner`).
@@ -381,7 +390,7 @@ ALLOWED_EXTRA: dict[str, set[str]] = {
         | EXTRA_CLASSES["legacy_enable_netns"]
     ),
     COMPOSE_MULTINODE: set(),
-    COMPOSE_DEMO: set(),
+    COMPOSE_DEMO: EXTRA_CLASSES["demo_pure_rootfs_lever"],
     COMPOSE_RUNNER: EXTRA_CLASSES["runner_client"],
 }
 

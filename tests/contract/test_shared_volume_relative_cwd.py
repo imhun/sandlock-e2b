@@ -41,11 +41,12 @@ from tests.contract.test_uid_permissions import (
 # with a *root* to be confined to, which is what makes the two aliases
 # sandbox-visible paths. The two legal pure shapes are set by the 2026-09-26
 # ruling (docs/superpowers/plans/2026-09-26-decisions.md): the identity root
-# (no root at all -- out of scope here) and the synthesized root.
+# (no root at all -- out of scope here) and the synthesized root, which is the
+# *default* since 2026-09-27.
 _ROOTED_SHAPE_ONLY = pytest.mark.skipif(
     not (
         os.environ.get("E2B_BASE_IMAGE")
-        or os.environ.get("E2B_PURE_ROOTFS") == "synth"
+        or (os.environ.get("E2B_PURE_ROOTFS") or "synth").strip().lower() == "synth"
     ),
     reason=(
         "the workspace aliases are resolved by the mount table, which needs a "
