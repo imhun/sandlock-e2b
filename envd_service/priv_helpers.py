@@ -194,6 +194,24 @@ def _read_broker_line(sock: socket.socket) -> str:
     return raw.split(b"\n", 1)[0].decode("utf-8", errors="replace")
 
 
+def _broker_stream(response: dict, field: str, *, what: str, name: str) -> str | None:
+    """One optional stream of a broker answer, checked to be text.
+
+    ``None`` (absent) is a stream the daemon had nothing to say on; anything
+    that is not a string is a malformed answer and has to be named rather than
+    silently coerced into the refusal text.
+    """
+    value = response.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise PrivHelperError(
+            f"{what} refused by {name}: the broker's {field} is not a string "
+            f"({value!r})"
+        )
+    return value
+
+
 def _realpath(path: str) -> str:
     """``realpath`` without requiring the path to exist (comparison only).
 
@@ -716,6 +734,11 @@ class PrivHelpers:
         ``ok:false`` means the request never ran at all; a non-zero ``exit``
         is the broker's own refusal and keeps the exec path's wording verbatim
         (including the "what" the caller passed, so the two shapes log alike).
+
+        Every field is checked by type before it is used: the answer is the
+        *only* evidence a privileged step happened, so a missing or
+        wrong-typed field has to be a refusal, never a default (``ok:true``
+        without an ``exit`` used to read as "exit 0" -- i.e. success).
         """
         name = Path(argv[0]).name
         timeout_s = _broker_timeout(argv)
@@ -727,17 +750,28 @@ class PrivHelpers:
             },
             timeout_s=timeout_s,
         )
-        if not response.get("ok"):
+        if not response["ok"]:
+            error = response.get("error")
+            if not isinstance(error, str):
+                raise PrivHelperError(
+                    f"{what} refused by {name}: the broker's refusal carries "
+                    f"no error string ({error!r})"
+                )
+            raise PrivHelperError(f"{what} refused by {name}: {error}")
+        exit_code = response.get("exit")
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
             raise PrivHelperError(
-                f"{what} refused by {name}: {response.get('error')}"
+                f"{what} refused by {name}: the broker answered ok without an "
+                f"integer exit ({exit_code!r})"
             )
-        exit_code = int(response.get("exit", 0))
         if exit_code != 0:
-            detail = (response.get("stderr") or response.get("stdout") or "").strip()
+            stderr = _broker_stream(response, "stderr", what=what, name=name)
+            stdout = _broker_stream(response, "stdout", what=what, name=name)
+            detail = (stderr or stdout or "").strip()
             raise PrivHelperError(
                 f"{what} refused by {name} (exit {exit_code}): {detail}"
             )
-        return response.get("stdout") or ""
+        return _broker_stream(response, "stdout", what=what, name=name) or ""
 
     def _broker_request(self, payload: dict, *, timeout_s: int) -> dict:
         """One JSON line out, one JSON line back (the frozen wire protocol).
@@ -747,6 +781,11 @@ class PrivHelpers:
         object -- becomes a :class:`PrivHelperError`: the caller asked for a
         privileged step and did not get it, so "nothing happened" must never
         be reported as success.
+
+        The envelope is checked here, once, for both the handshake and every
+        verb: the protocol version is the frozen ``1`` and ``ok`` is a real
+        boolean. A daemon that answers something else is not one this worker
+        may interpret optimistically.
         """
         if self.broker_socket is None:
             raise PrivHelperError(
@@ -779,6 +818,17 @@ class PrivHelpers:
             raise PrivHelperError(
                 f"the maintenance broker at {self.broker_socket} answered "
                 f"{raw!r}, which is not one JSON object"
+            )
+        if response.get("v") != BROKER_PROTOCOL_VERSION:
+            raise PrivHelperError(
+                f"the maintenance broker at {self.broker_socket} answered "
+                f"protocol version {response.get('v')!r}, not "
+                f"{BROKER_PROTOCOL_VERSION}"
+            )
+        if not isinstance(response.get("ok"), bool):
+            raise PrivHelperError(
+                f"the maintenance broker at {self.broker_socket} answered "
+                f"{raw!r}, whose \"ok\" is not a boolean"
             )
         return response
 
@@ -1242,7 +1292,7 @@ def _build_helpers(
 
 
 def _require_broker_agreement(helpers: PrivHelpers) -> None:
-    """The daemon's uid pool and roots must be this worker's, verbatim.
+    """The daemon's peer, uid pool and roots must be this worker's, verbatim.
 
     The broker enforces *its* whitelist and pool, the worker pre-filters with
     its own, so a difference is not cosmetic: the worker would hand the broker
@@ -1251,6 +1301,13 @@ def _require_broker_agreement(helpers: PrivHelpers) -> None:
     -- ask it to touch a path this worker never meant to expose. Named at
     startup, never guessed at, which is also why the image cache root has to
     be configured on both sides of the socket.
+
+    The peer identity is the same kind of contract one layer down: the daemon
+    makes every "the worker's own identity" decision (``chown --worker``,
+    ``--gid <own>``) against the credentials it authenticated, so a daemon
+    gating on a *different* uid/gid would act for somebody else while the
+    worker believed the steps were its own. ``peer_uid``/``peer_gid`` are that
+    pair; this worker's are ``os.geteuid()``/``os.getegid()``.
 
     The two lists are read from different places -- the worker from its
     already-resolved ``Settings`` (its workspace base goes through
@@ -1267,6 +1324,15 @@ def _require_broker_agreement(helpers: PrivHelpers) -> None:
         raise PrivHelperError(
             f"the maintenance broker at {helpers.broker_socket} refused the "
             f"hello handshake: {response.get('error')}"
+        )
+    peer_uid = response.get("peer_uid")
+    peer_gid = response.get("peer_gid")
+    if peer_uid != os.geteuid() or peer_gid != os.getegid():
+        raise PrivHelperError(
+            f"the maintenance broker at {helpers.broker_socket} authenticated "
+            f"the peer as {peer_uid}:{peer_gid}, this worker runs as "
+            f"{os.geteuid()}:{os.getegid()}: the broker's "
+            "E2B_BROKER_PEER_UID/GID must be this worker's own uid/gid"
         )
     pool = response.get("uid_pool")
     expected_pool = [helpers.uid_pool_start, helpers.uid_pool_size]

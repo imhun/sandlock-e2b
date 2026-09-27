@@ -179,6 +179,7 @@ def _hello(roots: list[str], *, uid_pool: list[int] | None = None) -> dict:
         "v": 1,
         "ok": True,
         "peer_uid": 65534,
+        "peer_gid": 65534,
         "uid_pool": [10000, 1000] if uid_pool is None else uid_pool,
         "roots": roots,
     }
@@ -282,6 +283,109 @@ def test_socket_transport_raises_on_ok_false(tmp_path: Path, fake_daemon) -> Non
     assert str(excinfo.value) == (
         f"remove {target} refused by e2b-maint: path /etc/hosts is outside "
         "the privileged helper roots"
+    )
+
+
+def test_socket_transport_rejects_an_ok_without_an_exit(
+    tmp_path: Path, fake_daemon
+) -> None:
+    """``{"ok": true}`` alone is not a completed privileged step.
+
+    The daemon only says ``ok`` for a request it *ran*; without an integer
+    ``exit`` there is nothing that says it succeeded. Defaulting the missing
+    field to 0 turned a truncated (or hand-rolled) answer into a silent
+    success -- the one thing a privileged step must never be.
+    """
+    daemon = fake_daemon(lambda request: {"v": 1, "ok": True, "stdout": ""})
+    helpers = _helpers(tmp_path, socket_path=daemon.socket_path)
+    target = helpers.workspace_base / "sbx_a"
+    target.mkdir()
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        helpers.remove(target)
+
+    assert str(excinfo.value) == (
+        f"remove {target} refused by e2b-maint: the broker answered ok "
+        "without an integer exit (None)"
+    )
+
+
+def test_socket_transport_rejects_a_non_integer_exit(
+    tmp_path: Path, fake_daemon
+) -> None:
+    """An exit the worker cannot interpret is a refusal, not a pass."""
+    daemon = fake_daemon(
+        lambda request: {"v": 1, "ok": True, "exit": "0", "stdout": ""}
+    )
+    helpers = _helpers(tmp_path, socket_path=daemon.socket_path)
+    target = helpers.workspace_base / "sbx_a"
+    target.mkdir()
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        helpers.remove(target)
+
+    assert str(excinfo.value) == (
+        f"remove {target} refused by e2b-maint: the broker answered ok "
+        "without an integer exit ('0')"
+    )
+
+
+def test_socket_transport_rejects_a_non_string_refusal(
+    tmp_path: Path, fake_daemon
+) -> None:
+    """``ok:false`` has to carry the daemon's own words, as a string."""
+    daemon = fake_daemon(lambda request: {"v": 1, "ok": False, "error": 42})
+    helpers = _helpers(tmp_path, socket_path=daemon.socket_path)
+    target = helpers.workspace_base / "sbx_a"
+    target.mkdir()
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        helpers.remove(target)
+
+    assert str(excinfo.value) == (
+        f"remove {target} refused by e2b-maint: the broker's refusal carries "
+        "no error string (42)"
+    )
+
+
+def test_socket_transport_rejects_a_non_string_stream(
+    tmp_path: Path, fake_daemon
+) -> None:
+    """A non-zero exit whose detail is not text cannot be reported verbatim."""
+    daemon = fake_daemon(
+        lambda request: {"v": 1, "ok": True, "exit": 77, "stderr": 5}
+    )
+    helpers = _helpers(tmp_path, socket_path=daemon.socket_path)
+    target = helpers.workspace_base / "sbx_a"
+    target.mkdir()
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        helpers.remove(target)
+
+    assert str(excinfo.value) == (
+        f"remove {target} refused by e2b-maint: the broker's stderr is not a "
+        "string (5)"
+    )
+
+
+def test_socket_transport_rejects_a_response_that_is_not_version_1(
+    tmp_path: Path, fake_daemon
+) -> None:
+    """The wire version is frozen; another one is a daemon this worker cannot
+    interpret, not one to read optimistically."""
+    daemon = fake_daemon(
+        lambda request: {"v": 2, "ok": True, "exit": 0, "stdout": ""}
+    )
+    helpers = _helpers(tmp_path, socket_path=daemon.socket_path)
+    target = helpers.workspace_base / "sbx_a"
+    target.mkdir()
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        helpers.remove(target)
+
+    assert str(excinfo.value) == (
+        f"the maintenance broker at {daemon.socket_path} answered protocol "
+        "version 2, not 1"
     )
 
 
@@ -396,6 +500,71 @@ def test_a_matching_daemon_resolves_over_the_socket(
     assert helpers.broker_socket == daemon.socket_path
     assert [str(p) for p in helpers._root_paths()] == roots
     assert daemon.requests == [{"v": 1, "hello": True}]
+
+
+def test_a_daemon_that_authenticated_a_different_uid_refuses_to_start(
+    tmp_path: Path, monkeypatch, fake_daemon
+) -> None:
+    """The daemon must treat *this* worker as its peer, by uid.
+
+    ``peer_uid``/``peer_gid`` are the credentials the daemon gated the socket
+    on -- the identity every ``chown --worker`` and ``--gid <own>`` decision is
+    made against. Reading them and not comparing them is how a broker that
+    authenticates somebody else passes two green unit suites and a broken
+    deployment: fail at startup and print both sides.
+    """
+    monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "socket")
+    monkeypatch.setenv("E2B_IMAGE_CACHE_DIR", str(tmp_path / "images"))
+    _stub_worker_identity(monkeypatch)
+    roots = [
+        str(_workspace(tmp_path)),
+        str(_shared(tmp_path)),
+        str(tmp_path / "images"),
+    ]
+    hello = _hello(roots)
+    hello["peer_uid"] = 10001
+    daemon = fake_daemon(lambda request: hello, name="peer-uid.sock")
+    monkeypatch.setenv("E2B_PRIV_HELPER_SOCKET", str(daemon.socket_path))
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        ph.resolve_priv_helpers(_settings(tmp_path))
+
+    assert str(excinfo.value) == (
+        f"the maintenance broker at {daemon.socket_path} authenticated the "
+        "peer as 10001:65534, this worker runs as 65534:65534: the broker's "
+        "E2B_BROKER_PEER_UID/GID must be this worker's own uid/gid"
+    )
+
+
+def test_a_daemon_that_authenticated_a_different_gid_refuses_to_start(
+    tmp_path: Path, monkeypatch, fake_daemon
+) -> None:
+    """...and by gid: the gid is what ``--gid <worker gid>`` is judged against.
+
+    The socket lane that shares a gid between daemon and peer cannot see this,
+    so a daemon whose gate names another group has to be refused here.
+    """
+    monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "socket")
+    monkeypatch.setenv("E2B_IMAGE_CACHE_DIR", str(tmp_path / "images"))
+    _stub_worker_identity(monkeypatch)
+    roots = [
+        str(_workspace(tmp_path)),
+        str(_shared(tmp_path)),
+        str(tmp_path / "images"),
+    ]
+    hello = _hello(roots)
+    hello["peer_gid"] = 0
+    daemon = fake_daemon(lambda request: hello, name="peer-gid.sock")
+    monkeypatch.setenv("E2B_PRIV_HELPER_SOCKET", str(daemon.socket_path))
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        ph.resolve_priv_helpers(_settings(tmp_path))
+
+    assert str(excinfo.value) == (
+        f"the maintenance broker at {daemon.socket_path} authenticated the "
+        "peer as 65534:0, this worker runs as 65534:65534: the broker's "
+        "E2B_BROKER_PEER_UID/GID must be this worker's own uid/gid"
+    )
 
 
 def _symlinked_layout(tmp_path: Path) -> tuple[Path, Path]:

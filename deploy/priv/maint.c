@@ -43,7 +43,8 @@
  *   {"v":1,"args":["chown","--uid","21000","--path","/..."],"timeout_s":300}
  *   -> {"v":1,"ok":true,"exit":0,"stdout":"...","stderr":"..."}
  *   {"v":1,"hello":true}
- *   -> {"v":1,"ok":true,"peer_uid":65534,"uid_pool":[10000,1000],"roots":[...]}
+ *   -> {"v":1,"ok":true,"peer_uid":65534,"peer_gid":65534,
+ *       "uid_pool":[10000,1000],"roots":[...]}
  *
  * `args` never carries argv[0]: the daemon execs **its own image**
  * (`/proc/self/exe`) with the request's argv, so the socket is the same broker
@@ -51,6 +52,16 @@
  * daemon refuses to run answers `ok:false`; a request the child refuses
  * answers with the child's own exit status (77 is the fail-closed refusal)
  * and its stderr, which is what the caller logs.
+ *
+ * The socket does not change what "the worker's own identity" means -- only
+ * who knows it. Directly exec'd, the broker *is* the worker (`getuid()` /
+ * `getgid()`); under `serve` it is root and forks a root child, so the daemon
+ * passes the peer it authenticated down in `E2B_BROKER_WORKER_UID` /
+ * `E2B_BROKER_WORKER_GID` -- written by the daemon for every request it
+ * forks for, never taken from the request. Those two are the uid/gid
+ * `chown --worker` hands a reclaimed orphan back to and the "own gid"
+ * `priv_gid_allowed()` accepts; with neither set they fall back to
+ * `getuid()` / `getgid()`, which is exactly the direct-exec behaviour.
  *
  * Who may talk to it, and at what cost: the socket is `0660 root:<peer gid>`
  * (the same pair as `/var/lib/e2b-priv`, 0710), so a pool uid cannot even
@@ -870,7 +881,7 @@ static void respond_run(int fd, int code, const struct output *out,
     conn_write_literal(fd, "}\n");
 }
 
-static void respond_hello(int fd, long peer_uid, long pool_start,
+static void respond_hello(int fd, long peer_uid, long peer_gid, long pool_start,
                           long pool_size) {
     const char *roots[PRIV_MAX_ROOTS];
     size_t count = priv_root_paths(roots, PRIV_MAX_ROOTS);
@@ -894,9 +905,9 @@ static void respond_hello(int fd, long peer_uid, long pool_start,
     }
     priv_roots_json(roots_json, needed);
     snprintf(head, sizeof(head),
-             "{\"v\":1,\"ok\":true,\"peer_uid\":%ld,\"uid_pool\":[%ld,%ld],"
-             "\"roots\":",
-             peer_uid, pool_start, pool_size);
+             "{\"v\":1,\"ok\":true,\"peer_uid\":%ld,\"peer_gid\":%ld,"
+             "\"uid_pool\":[%ld,%ld],\"roots\":",
+             peer_uid, peer_gid, pool_start, pool_size);
     if (conn_write_literal(fd, head) == 0 &&
         conn_write_literal(fd, roots_json) == 0) {
         conn_write_literal(fd, "}\n");
@@ -927,9 +938,9 @@ static int exit_code_from_status(int status) {
  * -1 with `message` set when the daemon itself had to stop it (timeout, output
  * cap, a broken pipe): those are the cases the caller must not read as an exit
  * status it can interpret. */
-static int run_child(char *const *args, long timeout_s, struct output *out,
-                     struct output *err_out, int *code, char *message,
-                     size_t message_len) {
+static int run_child(char *const *args, long timeout_s, long peer_uid,
+                     long peer_gid, struct output *out, struct output *err_out,
+                     int *code, char *message, size_t message_len) {
     int out_pipe[2];
     int err_pipe[2];
     struct pollfd fds[2];
@@ -966,7 +977,17 @@ static int run_child(char *const *args, long timeout_s, struct output *out,
     if (pid == 0) {
         /* The grandchild: the two pipes are its stdout/stderr and the program
          * is *this* image -- resolved for the child itself, so nothing can be
-         * swapped in between the daemon's check and this exec. */
+         * swapped in between the daemon's check and this exec.
+         *
+         * The image is root, but the worker it acts for is the *peer the
+         * daemon just authenticated*: `chown --worker` and `priv_gid_allowed`
+         * read the worker's own identity from these two variables, and the
+         * daemon -- not the request -- writes them, per connection (see
+         * Global Constraints of the C1 plan). In the direct-exec shape they
+         * are absent and the two functions fall back to getuid()/getgid(),
+         * i.e. the process itself. */
+        char worker_uid[32];
+        char worker_gid[32];
         close(out_pipe[0]);
         close(err_pipe[0]);
         if (dup2(out_pipe[1], STDOUT_FILENO) < 0 ||
@@ -975,6 +996,12 @@ static int run_child(char *const *args, long timeout_s, struct output *out,
         }
         close(out_pipe[1]);
         close(err_pipe[1]);
+        snprintf(worker_uid, sizeof(worker_uid), "%ld", peer_uid);
+        snprintf(worker_gid, sizeof(worker_gid), "%ld", peer_gid);
+        if (setenv("E2B_BROKER_WORKER_UID", worker_uid, 1) != 0 ||
+            setenv("E2B_BROKER_WORKER_GID", worker_gid, 1) != 0) {
+            _exit(PRIV_EXIT_SYSTEM);
+        }
         execv(PRIV_SELF_EXE, args);
         _exit(PRIV_EXIT_SYSTEM);
     }
@@ -1209,7 +1236,7 @@ static int request_timeout(const struct priv_request *request, char *err,
     return 0;
 }
 
-static void respond_to_request(int fd, long peer_uid) {
+static void respond_to_request(int fd, long peer_uid, long peer_gid) {
     struct priv_request request;
     struct output out, err_out;
     char err[PRIV_ERR_LEN];
@@ -1237,7 +1264,7 @@ static void respond_to_request(int fd, long peer_uid) {
     }
     if (request.hello) {
         priv_uid_pool(&pool_start, &pool_size);
-        respond_hello(fd, peer_uid, pool_start, pool_size);
+        respond_hello(fd, peer_uid, peer_gid, pool_start, pool_size);
         goto done;
     }
     if (request.nargs == 0) {
@@ -1262,7 +1289,8 @@ static void respond_to_request(int fd, long peer_uid) {
         argv[index + 1] = request.args[index];
     }
     argv[request.nargs + 1] = NULL;
-    if (run_child(argv, timeout_s, &out, &err_out, &code, err, sizeof(err)) != 0) {
+    if (run_child(argv, timeout_s, peer_uid, peer_gid, &out, &err_out, &code,
+                  err, sizeof(err)) != 0) {
         goto refuse;
     }
     respond_run(fd, code, &out, &err_out);
@@ -1321,7 +1349,8 @@ static void finish_connection(int fd) {
 /* The peer gate for one accepted connection: SO_PEERCRED is fixed at connect
  * time, so this is the same answer in the daemon and in the handler that
  * inherits the fd. */
-static int peer_gate(int fd, long *peer_uid, char *err, size_t errlen) {
+static int peer_gate(int fd, long *peer_uid, long *peer_gid, char *err,
+                     size_t errlen) {
     struct ucred peer;
     socklen_t peer_len = sizeof(peer);
 
@@ -1335,6 +1364,7 @@ static int peer_gate(int fd, long *peer_uid, char *err, size_t errlen) {
         return -1;
     }
     *peer_uid = (long)peer.uid;
+    *peer_gid = (long)peer.gid;
     return 0;
 }
 
@@ -1379,6 +1409,7 @@ static void refuse_connection(int fd, const char *message) {
 
 static void handle_connection(int fd) {
     long peer_uid = -1;
+    long peer_gid = -1;
     char err[PRIV_ERR_LEN];
 
     /* SIGPIPE is already ignored (main) and the socket writes pass
@@ -1386,13 +1417,13 @@ static void handle_connection(int fd) {
      * return -1 instead of killing this handler. */
     /* Depth in defence: the daemon gated this connection before it forked, and
      * a handler must not serve a peer the daemon would have refused. */
-    if (peer_gate(fd, &peer_uid, err, sizeof(err)) != 0) {
+    if (peer_gate(fd, &peer_uid, &peer_gid, err, sizeof(err)) != 0) {
         priv_report_refused(err);
         respond_error(fd, err);
         finish_connection(fd);
         return;
     }
-    respond_to_request(fd, peer_uid);
+    respond_to_request(fd, peer_uid, peer_gid);
     finish_connection(fd);
 }
 
@@ -1405,6 +1436,7 @@ static int serve(const char *socket_path) {
     char exe[PATH_MAX];
     char err[PRIV_ERR_LEN];
     long peer_uid, peer_gid, pool_start, pool_size;
+    long conn_uid, conn_gid;
     int live_handlers = 0;
     int fd;
 
@@ -1490,11 +1522,17 @@ static int serve(const char *socket_path) {
         /* The gate runs here, in the daemon, *before* fork(): an unauthorized
          * local uid must not be able to make the root broker fork at all, and
          * reading the credential needs no child. */
-        if (peer_gate(conn, &peer_uid, err, sizeof(err)) != 0) {
+        /* The daemon gate keeps the identities to itself: the handler reads
+         * SO_PEERCRED again from the fd it inherited (the same answer, fixed
+         * at connect time) and is the one that passes them to the exec'd
+         * child. */
+        if (peer_gate(conn, &conn_uid, &conn_gid, err, sizeof(err)) != 0) {
             priv_report_refused(err);
             refuse_connection(conn, err);
             continue;
         }
+        (void)conn_uid;
+        (void)conn_gid;
         if (live_handlers >= PRIV_MAX_HANDLERS) {
             snprintf(err, sizeof(err),
                      "the broker is already serving %d requests",
@@ -1663,9 +1701,13 @@ int main(int argc, char **argv) {
             if (uid >= 0) {
                 priv_usage("--worker cannot be combined with --uid");
             }
-            uid = (long)getuid();
+            /* Behind `serve` this process is root and the *worker* is the
+             * authenticated peer the daemon named; directly exec'd there is
+             * no such variable and it is getuid()/getgid() -- today's
+             * behaviour, unchanged. */
+            uid = priv_worker_uid();
             if (gid < 0) {
-                gid = (long)getgid();
+                gid = priv_worker_gid();
             } else if (priv_gid_allowed(gid, err, sizeof(err)) != 0) {
                 priv_fail("%s", err);
             }

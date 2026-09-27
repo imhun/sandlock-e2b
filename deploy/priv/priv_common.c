@@ -161,9 +161,39 @@ int priv_validate_uid(long uid, char *err, size_t errlen) {
     return 0;
 }
 
+/* See priv_worker_uid()/priv_worker_gid() in priv_common.h. A value the
+ * daemon wrote is a decimal integer; 0 is legitimate (a root worker exists in
+ * the compose and test shapes -- see priv_env_peer_id), anything else is a
+ * deployment defect, and falling back to getuid()/getgid() there would mean
+ * *root* behind `serve`, so this fails closed instead. */
+static long priv_env_worker_identity(const char *name, long fallback) {
+    const char *text = getenv(name);
+    char *end = NULL;
+    long value;
+    if (text == NULL || *text == '\0') {
+        return fallback;
+    }
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value < 0) {
+        priv_fail("%s must be a non-negative decimal integer (got '%s')", name,
+                  text);
+    }
+    return value;
+}
+
+long priv_worker_uid(void) {
+    return priv_env_worker_identity("E2B_BROKER_WORKER_UID", (long)getuid());
+}
+
+long priv_worker_gid(void) {
+    return priv_env_worker_identity("E2B_BROKER_WORKER_GID", (long)getgid());
+}
+
 int priv_gid_allowed(long gid, char *err, size_t errlen) {
     long start, size;
-    if (gid == (long)getgid()) {
+    long own = priv_worker_gid();
+    if (gid == own) {
         return 0;
     }
     priv_uid_pool(&start, &size);
@@ -173,7 +203,7 @@ int priv_gid_allowed(long gid, char *err, size_t errlen) {
     snprintf(err, errlen,
              "gid %ld is neither the worker's own gid (%ld) nor a member of "
              "the privileged helper uid pool %ld..%ld",
-             gid, (long)getgid(), start, start + size - 1);
+             gid, own, start, start + size - 1);
     return -1;
 }
 

@@ -67,6 +67,17 @@ int priv_validate_uid(long uid, char *err, size_t errlen);
  * chgrp-to-own-gid is never a privilege widening. */
 int priv_gid_allowed(long gid, char *err, size_t errlen);
 
+/* C1: the identity to treat as "the worker's own", for `chown --worker` and
+ * for the own-gid arm of `priv_gid_allowed` (and ``validate_chown_gid`` on the
+ * Python side). Directly exec'd, the process *is* the worker and these are
+ * ``getuid()`` / ``getgid()``. Behind ``serve`` the process is root, so the
+ * daemon writes the **authenticated peer's** uid/gid into
+ * ``E2B_BROKER_WORKER_UID`` / ``E2B_BROKER_WORKER_GID`` for every request it
+ * forks for -- a request cannot forge them (the daemon overwrites them itself,
+ * per connection), and with neither set this is exactly today's behaviour. */
+long priv_worker_uid(void);
+long priv_worker_gid(void);
+
 /* C1 (serve): the peer gate. The socket file mode cannot express "the worker
  * and nothing else" -- the sandboxes share the node's filesystem view -- so
  * the accepted connection's SO_PEERCRED uid and gid must both equal

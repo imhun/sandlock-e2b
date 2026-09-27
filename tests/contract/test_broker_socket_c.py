@@ -561,6 +561,7 @@ def test_image_cache_root_is_absent_when_the_deployment_names_none(
                 "v": 1,
                 "ok": True,
                 "peer_uid": _peer_uid(),
+                "peer_gid": _peer_gid(),
                 "uid_pool": [POOL_START, POOL_SIZE],
                 "roots": [str(_workspace(tmp_path))],
             },
@@ -788,6 +789,7 @@ def test_ping_answers_hello_with_pool_and_roots(
                 "v": 1,
                 "ok": True,
                 "peer_uid": _peer_uid(),
+                "peer_gid": _peer_gid(),
                 "uid_pool": [POOL_START, POOL_SIZE],
                 "roots": [str(_workspace(tmp_path)), str(_image_cache(tmp_path))],
             },
@@ -1105,3 +1107,38 @@ def test_serve_refuses_to_run_from_a_copy(broker_bin: Path, tmp_path: Path) -> N
         f"{INSTALLED_BROKER}, but the running image is {os.path.realpath(copy)}: "
         "not serving from a copy\n"
     )
+
+
+def test_serve_refuses_a_non_positive_timeout(serve, tmp_path: Path) -> None:
+    """``timeout_s`` is a positive budget and nothing runs for ``<= 0``.
+
+    The daemon checks the budget *before* it forks the grandchild, so this is
+    the cheap half of the timeout contract and the refusal the worker would
+    otherwise read as a completed step.
+
+    The other half -- a request that outlives ``timeout_s`` and is SIGKILLed,
+    with ``ok:false`` -- is deliberately not here: it needs a tree large
+    enough that the walk *reliably* exceeds the budget (the wave-1 review
+    measured ~700k entries: ~26 s to build the tree, ~1.3 s to walk it), which
+    is neither deterministic enough nor cheap enough for this lane. It is
+    carried by the wave-2 plan; the wave-1 fix pins the refusal only.
+    """
+    handle = serve("timeout")
+    _await_listening(handle)
+    tree = tmp_path / "sandboxes" / "sbx_timeout"
+    tree.mkdir(parents=True)
+    for budget in (0, -5):
+        response = _request(
+            handle.socket,
+            {
+                "v": 1,
+                "args": ["walk", "--path", str(tree)],
+                "timeout_s": budget,
+            },
+            process=handle.process,
+        )
+        assert response == {
+            "v": 1,
+            "ok": False,
+            "error": f"timeout_s must be positive (got {budget})",
+        }
