@@ -2717,14 +2717,17 @@ kubectl -n sandlock exec e2b-worker-0 -c worker -- sh -c '
 fail closed —— 直接 apply 原文件不会 chown 任何东西。
 
 迁移的**唯一写操作**是 `chown -R 65534:65534`：不改权限位、不删东西、不拷内容。范围是一张
-显式的路径计划（`<export>` 相对的 `state`/`workspaces/_migrate`/`_images`/`_secrets`/
-`_snapshots`/`_templates`/`_builds` 七条）—— **树根下只放行 `workspaces/_migrate` 那一
-条**：迁移暂存在 N27 之后就在树根之下（`workspace-root-init` 建的是它，控制面唯一可写的
-subPath 也是它），而工具曾在 export 根上找 `_migrate` ⇒ 真机上它恒 MISSING、那一条从来没
-迁过（2026-09-27 修正）。其余 `<export>/workspaces/**` 绝不进入 —— 那些树属于池 uid、不是
-worker 的；计划里任何一条落在它下面（含 `workspaces` 本身、它的兄弟、用 `..` 或符号链接
-绕过去的拼写）脚本一律拒绝并点名。硬性质由 `tests/unit/test_state_owner_migrate.py` 逐条
-钉住。
+显式的路径计划（`<export>` 相对的 `state`/`workspaces/_migrate`/`workspaces/_snapshots`/
+`_images`/`_secrets`/`_snapshots`/`_templates`/`_builds` 八条）—— **树根下恰放行
+`workspaces/_migrate` 与 `workspaces/_snapshots` 这两条**：前者是控制面的迁移暂存（N27 之后
+就在树根之下，`workspace-root-init` 建的是它，控制面唯一可写的 subPath 也是它）；后者是
+**活的快照存储**（`SnapshotRegistry` 的 base 就是 workspace base ⇒ 快照坐在沙箱树旁边，
+2026-09-27 真机预检发现它在树根下、属主 `root:0755`，C1 之后 65534 的 worker 写不进去）。
+树根下这两条平台命名空间由 broker 的 `workspace-root-init` 在每次启动时保底（`mkdir -p` +
+`chown 65534:65534`），迁移工具只是对存量再补一次属主。其余 `<export>/workspaces/**` 绝不
+进入 —— 那些树属于池 uid、不是 worker 的；计划里任何一条落在它下面（含 `workspaces` 本身、
+它的兄弟、那两条下面的东西、用 `..` 或符号链接绕过去的拼写）脚本一律拒绝并点名。硬性质由
+`tests/unit/test_state_owner_migrate.py` 逐条钉住。
 
 ### 24.1 执行顺序
 

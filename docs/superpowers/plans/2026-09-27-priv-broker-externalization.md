@@ -22,6 +22,8 @@
 | Task 9（终审 Minor 收口） | ✅ 已合并（wave 2 + `2ef457e`） |
 | **Task 8（真机 rollout 与验收）** | ⏸ **未执行**：需要 KUBECONFIG + 停机窗口授权（worker 缩 0 跑迁移）。前置清单见下文与 `docs/k8s-deployment.md` §24。 |
 
+**Task 8 真机预检发现（2026-09-27，只读）**：活的快照存储 `<workspaces>/_snapshots` 坐在树根下、属主 `root:0755` —— C1 之后 65534 的 worker 写不进去（"上线后第一次 create snapshot 才炸"的静默类型）。已由本次修复覆盖：`deploy/k8s/priv-broker.yaml` 的 `workspace-root-init` 把它交给 65534（`mkdir -p` + `chown 65534:65534` + 校验），`deploy/scripts/migrate-state-owner.sh` 的树根白名单放行它（`workspaces/_migrate`、`workspaces/_snapshots` 两条）。见 `docs/k8s-deployment.md` §24。
+
 **已知延后（非阻断，均已记账）**
 1. `drop: [ALL]`：broker 目前仍是"默认 root 集 + 三条 cap"，需真机确认只有 `CHOWN/DAC_OVERRIDE/FOWNER` 时 `walk/rm/chown` 仍成立后再加（`deploy/k8s/priv-broker.yaml` 注释已写明）。
 2. Python 侧单行读取上限 ≈3 GiB > worker 容器 `limits.memory: 2Gi`：要真正生效需把 `walk` 改成流式读（现在名义有界、实际 OOM 先行）。

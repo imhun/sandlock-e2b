@@ -909,6 +909,19 @@ def test_the_broker_init_creates_both_roots_and_the_checkpoint_gate() -> None:
         # ...plus the one directory inside the tree root the control plane is
         # allowed to write (its migration staging).
         'mkdir -p "$base/_migrate"',
+        # Task 8 preflight: the *live* snapshot store is the other platform
+        # directory under the tree root (`SnapshotRegistry`'s base IS the
+        # workspace base), and C1's 65534 worker writes snapshots into it. It is
+        # created and handed to the worker here; a root:0755 `<base>/_snapshots`
+        # is the silent "first create_snapshot is EACCES" failure. Dropping
+        # either of these two lines must turn this test red.
+        'mkdir -p "$base/_snapshots"',
+        'chown 65534:65534 "$base/_snapshots" 2>/dev/null ||',
+        # ...and the mode stays the platform convention (0755), never the
+        # sandbox-tree root's 1777 -- the snapshot store needs no cross-uid
+        # sharing.
+        'chmod 0755 "$base/_snapshots" 2>/dev/null ||',
+        'if [ "$snap_owner" != "65534" ]; then',
         'mkdir -p "$state/_runtime/.checkpoints"',
         'chmod 0711 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||',
         # base, state and the migration staging get the same "writable by the
@@ -917,6 +930,9 @@ def test_the_broker_init_creates_both_roots_and_the_checkpoint_gate() -> None:
         'owner="$(stat -c %u "$target")"',
     ):
         assert expected in lines, expected
+    # The 1777 fallback loop is for the two roots and the migration staging; the
+    # snapshot store must not be swept into it.
+    assert [line for line in lines if "1777" in line and "_snapshots" in line] == []
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")

@@ -110,12 +110,15 @@ kubectl -n sandlock scale statefulset/e2b-worker --replicas=2
 ```
 
 它做的是**递归 `chown 65534:65534`，只改属主**：不改权限位、不删东西、不拷内容。范围是一张显式
-的路径计划（`<export>` 下的 `state`、`workspaces/_migrate`、`_images`、`_secrets`、
-`_snapshots`、`_templates`、`_builds` 七条）—— **树根下只放行 `workspaces/_migrate` 那一
-条**（N27 之后控制面的迁移暂存就在树根之下；工具曾在 export 根上找 `_migrate`，真机上因此
-恒 MISSING，2026-09-27 修正），其余 `<export>/workspaces/**` **绝不进入** —— 那些树属于池
-uid，不是 worker 的；计划里任何一条落在它下面（包括 `workspaces` 本身、它的兄弟、用 `..`
-或符号链接绕过去的拼写）脚本一律拒绝并点名。硬性质由
+的路径计划（`<export>` 下的 `state`、`workspaces/_migrate`、`workspaces/_snapshots`、
+`_images`、`_secrets`、`_snapshots`、`_templates`、`_builds` 八条）—— **树根下恰放行
+`workspaces/_migrate` 与 `workspaces/_snapshots` 这两条**（前者是 N27 之后控制面的迁移暂存
+——工具曾在 export 根上找 `_migrate`，真机上因此恒 MISSING；后者是**活的快照存储**，
+`SnapshotRegistry` 的 base 就是 workspace base，2026-09-27 真机预检发现它在树根下、属主
+`root:0755`，C1 之后 65534 的 worker 写不进去），其余 `<export>/workspaces/**` **绝不进入**
+—— 那些树属于池 uid，不是 worker 的；计划里任何一条落在它下面（包括 `workspaces` 本身、它
+的兄弟、那两条下面的东西、用 `..` 或符号链接绕过去的拼写）脚本一律拒绝并点名。树根下这两
+条平台命名空间由 broker 的 `workspace-root-init` 在每次启动时保底。硬性质由
 `tests/unit/test_state_owner_migrate.py` 逐条钉住。步骤、回退与判据的正文见
 `docs/k8s-deployment.md` §24。
 

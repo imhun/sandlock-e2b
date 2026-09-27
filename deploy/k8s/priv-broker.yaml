@@ -238,6 +238,40 @@ spec:
               # migration endpoints use `<workspace_base>/_migrate` too
               # (`envd_service/agent.py`), so both sides name one directory.
               mkdir -p "$base/_migrate"
+              # ...and the *other* platform directory that lives inside the tree
+              # root: the **live snapshot store**. `SnapshotRegistry`'s base is the
+              # workspace base itself (`gateway_common/paths.py`: "SnapshotRegistry
+              # 的 base 就是 workspace base，所以快照就坐在沙箱树旁边"), so
+              # `<base>/_snapshots/<id>` is where snapshots land --
+              # `control_plane/registry/snapshots.py`'s `_snapshot_dir` reads it and
+              # the worker's snapshot endpoints (`envd_service/agent.py`) write
+              # `<workspace_base>/_snapshots/<id>/fs` into it. N27 sank the tree
+              # root to `<export>/workspaces` (no longer the export root), so after
+              # C1 -- when the worker runs as uid 65534 -- this directory has to be
+              # handed to it: left as root:0755 (which is what it is on the cluster
+              # today), the 65534 worker's *first* snapshot create is EACCES. That
+              # is the silent kind: nothing fails until the first create_snapshot.
+              # Same failure semantics as the gate below -- chown, then verify, and
+              # refuse loudly instead of starting a worker that cannot snapshot.
+              #
+              # Mode **0755** (the existing convention for the platform's own
+              # top-level directories), *not* 1777: the snapshot store serves the
+              # worker (root can still write it -- the control plane's registry
+              # runs as root), so it needs no cross-uid sharing and must not be
+              # staged like the sandbox tree root.
+              mkdir -p "$base/_snapshots"
+              chown 65534:65534 "$base/_snapshots" 2>/dev/null ||
+                echo "workspace-root-init: chown refused ($base/_snapshots, NFS root_squash?)"
+              chmod 0755 "$base/_snapshots" 2>/dev/null ||
+                echo "workspace-root-init: chmod refused ($base/_snapshots)"
+              snap_owner="$(stat -c %u "$base/_snapshots")"
+              snap_mode="$(stat -c %a "$base/_snapshots")"
+              echo "workspace-root-init: $base/_snapshots owner=$snap_owner mode=$snap_mode"
+              if [ "$snap_owner" != "65534" ]; then
+                echo "workspace-root-init: FATAL: $base/_snapshots is owned by uid $snap_owner, not the worker uid 65534: the 65534 worker creates every snapshot under it (SnapshotRegistry's base is the workspace base), so the first create_snapshot would fail with EACCES" >&2
+                echo "workspace-root-init: fix it once (on the node, or on the storage server): chown 65534:65534 $base/_snapshots" >&2
+                exit 1
+              fi
               # The checkpoint store's gate. An image is written by the
               # sandbox's *own* slot, so every level down to it has to be
               # traversable by that pooled uid -- while nobody below the worker
