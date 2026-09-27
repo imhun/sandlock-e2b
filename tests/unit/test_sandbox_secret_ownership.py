@@ -1,4 +1,4 @@
-"""C1 / Task 3: who owns the secret file a non-root worker writes.
+"""C1 / Task 3: the order the executor uses to publish a secret file.
 
 ``_materialize_http_inject`` writes ``<secrets>/<sandbox>/<name>.secret`` in
 mode 0600 and then hands it to the sandbox's pooled host uid. The **slot** is
@@ -9,10 +9,17 @@ denied``) and the sandbox never starts.
 
 Until this task the hand-over was ``if os.geteuid() == 0 and identity`` -- on a
 non-root worker it was skipped in silence, which is the shape the production
-non-root deployment uses (per-sandbox uid + route B). The cases below pin the
-three branches on the *shape of the call*: what the brokers are asked to do,
-that the 0600 mode still lands, and that a whitelist which does not cover the
-secret path fails loudly instead of leaving the file worker-owned.
+non-root deployment uses (per-sandbox uid + route B).
+
+**Ordering is the property these cases pin**, not just the call shape: once the
+uid has been handed over the worker is neither the owner nor ``CAP_FOWNER``, so
+a ``chmod`` that runs *after* the hand-over is ``EPERM`` on a real host (the
+review T3-1 finding: the first version of this fix moved the failure from
+supervise to create instead of removing it). :class:`_Host` therefore records
+one ordered event list *and* refuses a late ``chmod`` the way the kernel does,
+so "same calls, wrong order" goes red. The mode is also pinned to land on a
+file that is already 0600-readable by nobody but the reader it is meant for:
+a refusal must not leave a umask-mode (0644) credential file behind.
 """
 
 from __future__ import annotations
@@ -27,23 +34,52 @@ from envd_service.executors.sandlock import SandlockExecutor
 from gateway_common.network import sandlock_network_policy
 
 SANDBOX_UID = 21001
+WORKER_UID = 65534
 
 
-class _Brokers:
-    """A recording stand-in for the ``priv_helpers`` module functions.
+class _Host:
+    """The worker's syscalls plus the brokers, one ordered event list.
 
-    The executor only ever reaches the brokers through the module-level
-    helpers (``helpers_cover`` / ``broker_chown``), so the stub is installed on
-    the module and records the *arguments the executor chose* -- the uid, the
-    path and the recursion flag -- rather than any broker behaviour.
+    Only the executor's *own* calls are recorded -- the filesystem helpers it
+    shares with the rest of the platform are not -- and the events carry the
+    arguments the executor chose, so the assertion is on the sequence the
+    reader (``supervise``) depends on.
     """
 
-    def __init__(self, *, covers: bool) -> None:
-        self._covers = covers
-        self.chowns: list[tuple[int, Path, bool]] = []
+    def __init__(self, *, euid: int, covers: bool) -> None:
+        self.euid = euid
+        self.covers = covers
+        self.events: list[tuple] = []
+        self._handed_over = False
+        self._real_chmod = os.chmod
+        self._real_chown = os.chown
+        self._real_unlink = os.unlink
+
+    # ------------------------------------------------------- syscalls
+
+    def geteuid(self) -> int:
+        return self.euid
+
+    def chmod(self, path, mode, *args, **kwargs):
+        if self._handed_over and self.euid != 0:
+            # What the kernel answers once the file belongs to the sandbox
+            # uid: the worker is not the owner and holds no CAP_FOWNER.
+            raise PermissionError(1, "Operation not permitted", str(path))
+        self.events.append(("chmod", str(path), mode))
+        return self._real_chmod(path, mode, *args, **kwargs)
+
+    def chown(self, path, uid, gid, *args, **kwargs):
+        self.events.append(("chown", str(path), uid, gid))
+        return self._real_chown(path, uid, gid, *args, **kwargs)
+
+    def unlink(self, path, *args, **kwargs):
+        self.events.append(("unlink", str(path)))
+        return self._real_unlink(path)
+
+    # -------------------------------------------------------- brokers
 
     def helpers_cover(self, path: str | Path) -> bool:
-        return self._covers
+        return self.covers
 
     def broker_chown(
         self,
@@ -53,12 +89,17 @@ class _Brokers:
         recursive: bool = True,
         gid: int | None = None,
     ) -> None:
-        self.chowns.append((uid, Path(path), recursive))
+        self.events.append(("broker_chown", uid, str(path), recursive))
+        self._handed_over = True
 
 
-def _install(monkeypatch, brokers: _Brokers) -> None:
-    monkeypatch.setattr(priv_helpers, "helpers_cover", brokers.helpers_cover)
-    monkeypatch.setattr(priv_helpers, "broker_chown", brokers.broker_chown)
+def _install(monkeypatch, host: _Host) -> None:
+    monkeypatch.setattr(os, "geteuid", host.geteuid)
+    monkeypatch.setattr(os, "chmod", host.chmod)
+    monkeypatch.setattr(os, "chown", host.chown)
+    monkeypatch.setattr(os, "unlink", host.unlink)
+    monkeypatch.setattr(priv_helpers, "helpers_cover", host.helpers_cover)
+    monkeypatch.setattr(priv_helpers, "broker_chown", host.broker_chown)
 
 
 def _executor(tmp_path: Path, *, host_uid: int | None = SANDBOX_UID) -> SandlockExecutor:
@@ -115,30 +156,17 @@ def _expected_secret_path(tmp_path: Path) -> Path:
     return tmp_path / "secrets" / "sbx_1" / "hdr_api_example_com_x_api_key.secret"
 
 
-def _record_chmod(monkeypatch) -> list[tuple[Path, int]]:
-    """Record ``os.chmod`` while still applying it, so the mode is real."""
-    calls: list[tuple[Path, int]] = []
-    real_chmod = os.chmod
-
-    def _chmod(path, mode, *args, **kwargs):
-        calls.append((Path(path), mode))
-        return real_chmod(path, mode, *args, **kwargs)
-
-    monkeypatch.setattr(os, "chmod", _chmod)
-    return calls
-
-
-def test_nonroot_worker_hands_the_secret_to_the_sandbox_uid(tmp_path, monkeypatch):
-    monkeypatch.setattr(os, "geteuid", lambda: 65534)
-    brokers = _Brokers(covers=True)
-    _install(monkeypatch, brokers)
-    chmod_calls = _record_chmod(monkeypatch)
+def test_nonroot_worker_sets_the_mode_then_hands_the_file_over(tmp_path, monkeypatch):
+    host = _Host(euid=WORKER_UID, covers=True)
+    _install(monkeypatch, host)
 
     out = _executor(tmp_path)._materialize_http_inject(_http_inject_entries())
 
     path = _expected_secret_path(tmp_path)
-    assert brokers.chowns == [(SANDBOX_UID, path, False)]
-    assert chmod_calls == [(path, 0o600)]
+    assert host.events == [
+        ("chmod", str(path), 0o600),
+        ("broker_chown", SANDBOX_UID, str(path), False),
+    ]
     assert oct(path.stat().st_mode & 0o777) == "0o600"
     assert out == [
         {
@@ -151,44 +179,35 @@ def test_nonroot_worker_hands_the_secret_to_the_sandbox_uid(tmp_path, monkeypatc
     ]
 
 
-def test_root_worker_keeps_the_direct_chown(tmp_path, monkeypatch):
-    monkeypatch.setattr(os, "geteuid", lambda: 0)
-    brokers = _Brokers(covers=True)
-    _install(monkeypatch, brokers)
-    chmod_calls = _record_chmod(monkeypatch)
-    chown_calls: list[tuple[Path, int, int]] = []
-    real_chown = os.chown
-
-    def _chown(path, uid, gid, *args, **kwargs):
-        chown_calls.append((Path(path), uid, gid))
-        return real_chown(path, uid, gid, *args, **kwargs)
-
-    monkeypatch.setattr(os, "chown", _chown)
+def test_root_worker_sets_the_mode_then_chowns(tmp_path, monkeypatch):
+    host = _Host(euid=0, covers=True)
+    _install(monkeypatch, host)
 
     _executor(tmp_path)._materialize_http_inject(_http_inject_entries())
 
     path = _expected_secret_path(tmp_path)
-    assert brokers.chowns == []
-    # root chowns only the uid and passes -1 for the gid, exactly as today.
-    assert chown_calls == [(path, SANDBOX_UID, -1)]
-    assert chmod_calls == [(path, 0o600)]
+    assert host.events == [
+        ("chmod", str(path), 0o600),
+        # root chowns only the uid and passes -1 for the gid, exactly as today.
+        ("chown", str(path), SANDBOX_UID, -1),
+    ]
+    # The end state root produced all along: 0600, owned by the sandbox uid.
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    assert path.stat().st_uid == SANDBOX_UID
 
 
-def test_legacy_shared_uid_shape_asks_nobody(tmp_path, monkeypatch):
+def test_legacy_shared_uid_shape_only_sets_the_mode(tmp_path, monkeypatch):
     """No per-sandbox uid: no identity to hand the file to, as before."""
     worker_uid = os.geteuid()
-    monkeypatch.setattr(os, "geteuid", lambda: 65534)
-    brokers = _Brokers(covers=True)
-    _install(monkeypatch, brokers)
-    chmod_calls = _record_chmod(monkeypatch)
+    host = _Host(euid=WORKER_UID, covers=True)
+    _install(monkeypatch, host)
 
     _executor(tmp_path, host_uid=None)._materialize_http_inject(
         _http_inject_entries()
     )
 
     path = _expected_secret_path(tmp_path)
-    assert brokers.chowns == []
-    assert chmod_calls == [(path, 0o600)]
+    assert host.events == [("chmod", str(path), 0o600)]
     assert path.stat().st_uid == worker_uid
 
 
@@ -197,19 +216,24 @@ def test_helpers_not_covering_the_path_fails_loudly(tmp_path, monkeypatch):
 
     Silently skipping the hand-over is the defect: the file stays worker-owned
     and the sandbox dies later, at supervise, with a permission error naming
-    neither the path nor the missing whitelist root.
+    neither the path nor the missing whitelist root. A refusal also has to take
+    the credential file with it -- a 0644 (umask) leftover in the shared image
+    cache is readable by every other tenant on the host.
     """
-    monkeypatch.setattr(os, "geteuid", lambda: 65534)
-    brokers = _Brokers(covers=False)
-    _install(monkeypatch, brokers)
+    host = _Host(euid=WORKER_UID, covers=False)
+    _install(monkeypatch, host)
 
     path = _expected_secret_path(tmp_path)
     with pytest.raises(priv_helpers.PrivHelperError) as excinfo:
         _executor(tmp_path)._materialize_http_inject(_http_inject_entries())
 
+    assert host.events == [
+        ("chmod", str(path), 0o600),
+        ("unlink", str(path)),
+    ]
     assert str(excinfo.value) == (
         f"cannot hand {path} to sandbox uid {SANDBOX_UID} on a non-root "
         "worker: the file-capability broker whitelist does not contain it "
         "(E2B_IMAGE_CACHE_DIR must be one of the broker's roots)"
     )
-    assert brokers.chowns == []
+    assert path.exists() is False

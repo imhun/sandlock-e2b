@@ -1968,8 +1968,16 @@ class SandlockExecutor(Executor):
             # file lives outside every fs grant the sandbox has -- outside the
             # rootfs in the image shape, and outside `can_read`'s allow-list in
             # the pure one -- so the sandbox cannot reach it even owning it.
+            #
+            # The mode is set **while the worker still owns the file**: after
+            # the hand-over below the worker is neither the owner nor
+            # CAP_FOWNER, so a chmod that ran after it would be EPERM and the
+            # whole create would fail -- the same order
+            # `checkpoint_store._prepare_image_parent` uses (chmod, then hand
+            # the tree over).
+            os.chmod(path, 0o600)
             identity = self._host_uid if self._per_sandbox_uid else None
-            if identity:
+            if identity is not None:
                 if os.geteuid() == 0:
                     with suppress(OSError):
                         os.chown(path, identity, -1)
@@ -1986,6 +1994,10 @@ class SandlockExecutor(Executor):
                     from envd_service import priv_helpers
 
                     if not priv_helpers.helpers_cover(path):
+                        # Leave nothing behind: the file is already there and
+                        # carries a live credential, and the next create is
+                        # what writes a fresh one.
+                        path.unlink(missing_ok=True)
                         raise priv_helpers.PrivHelperError(
                             f"cannot hand {path} to sandbox uid {identity} on "
                             "a non-root worker: the file-capability broker "
@@ -1994,7 +2006,6 @@ class SandlockExecutor(Executor):
                             "roots)"
                         )
                     priv_helpers.broker_chown(identity, path, recursive=False)
-            os.chmod(path, 0o600)
             entry = dict(entry)
             entry.pop("value", None)
             entry["secret"] = f"file:{path}"
