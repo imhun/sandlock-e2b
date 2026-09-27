@@ -72,7 +72,7 @@ services:
       E2B_IMAGE_REGISTRY_USERNAME: ""
       E2B_IMAGE_REGISTRY_PASSWORD: ""
       E2B_MAX_SANDBOXES: 100
-      E2B_BASE_IMAGE: python:3.14-slim
+      E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       # Per-sandbox default memory 1024 MiB (FUP3, 2026-09-06).
       E2B_DEFAULT_MEMORY_MB: 1024
       E2B_DEFAULT_CPU_PERCENT: 100
@@ -105,7 +105,7 @@ services:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-1:49983
       E2B_NODE_ID: worker-1
-      E2B_BASE_IMAGE: python:3.14-slim
+      E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       # Route B's scratch root (the per-slot policy/program documents). The
@@ -185,7 +185,7 @@ services:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-2:49983
       E2B_NODE_ID: worker-2
-      E2B_BASE_IMAGE: python:3.14-slim
+      E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       # Route B's scratch root (the per-slot policy/program documents). The
@@ -265,7 +265,7 @@ services:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-3:49983
       E2B_NODE_ID: worker-3
-      E2B_BASE_IMAGE: python:3.14-slim
+      E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       # Route B's scratch root (the per-slot policy/program documents). The

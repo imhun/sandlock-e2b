@@ -24,7 +24,7 @@ services:
       E2B_API_KEY: local-key
       E2B_API_URL: http://127.0.0.1:3000
       E2B_SANDBOX_URL: http://127.0.0.1:49983
-      E2B_BASE_IMAGE: python:3.14-slim
+      E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_WORKSPACE_BASE: /workspace/tmp/sandboxes
     volumes:
       - .:/workspace

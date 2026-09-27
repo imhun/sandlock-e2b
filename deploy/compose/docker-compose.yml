@@ -59,7 +59,7 @@ services:
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
       E2B_IMAGE_CACHE_OWNER_UID: ${E2B_IMAGE_CACHE_OWNER_UID:-65534}
       E2B_MAX_SANDBOXES: 100
-      E2B_BASE_IMAGE: python:3.14-slim
+      E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_TEMPLATE_IMAGES: '{"python3.14": "python:3.14-slim", "node22": "node:22-slim"}'
       # Per-sandbox default memory 1024 MiB (FUP3, 2026-09-06).
       E2B_DEFAULT_MEMORY_MB: 1024

@@ -111,7 +111,7 @@ services:
       E2B_IMAGE_REGISTRY: ${E2B_IMAGE_REGISTRY:-}
       E2B_IMAGE_REGISTRY_USERNAME: ${E2B_IMAGE_REGISTRY_USERNAME:-}
       E2B_IMAGE_REGISTRY_PASSWORD: ${E2B_IMAGE_REGISTRY_PASSWORD:-}
-      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
+      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6}
       E2B_MAX_SANDBOXES: ${E2B_MAX_SANDBOXES:-100}
       E2B_MAX_TOTAL_MEMORY_MB: ${E2B_MAX_TOTAL_MEMORY_MB:-8192}
       E2B_MAX_TOTAL_CPU_PERCENT: ${E2B_MAX_TOTAL_CPU_PERCENT:-400}
@@ -181,7 +181,7 @@ services:
       # then wildcard allowOut needs the low-port window back.
       E2B_ENABLE_NET_ISOLATION: ${E2B_ENABLE_NET_ISOLATION:-true}
       E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT:-true}
-      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-python:3.14-slim}
+      E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       # Route B's scratch root (the per-slot policy/program documents). The
       # fleet value, copied from deploy/stack/docker-compose.prod.yml:239 --
