@@ -209,6 +209,25 @@ def counts_of(path):
     return files, dirs
 
 
+def assert_export_shape(root):
+    """形状闸门（与 migrate-state-base.sh 的"这不像是本平台的 export 根"同形）。
+
+    判据：`<root>/state` 与 `<root>/state/_runtime` **都不在**才拒绝 —— 那说明挂进来的
+    不是这份卷（PVC 没挂上、挂错了），或者根给错了。只要有一个在，就当它是合法 export
+    根：`state/_runtime` 缺失是"这个集群还没有任何沙箱记录"的合法状态，不该拦住迁移。
+    运行的是 `--plan-only`（纯路径计划，不读盘）时这道闸门不参与 —— 它是对实物的判断。
+    """
+    state = os.path.join(root, "state")
+    runtime = os.path.join(root, "state", "_runtime")
+    if os.path.lexists(state) or os.path.lexists(runtime):
+        return
+    raise Refuse(
+        EXIT_SHAPE,
+        "没有任何目标被 chown：%s 下既没有 state 也没有 state/_runtime —— 这不像是本平台的 "
+        "export 根（卷没挂上？--root/MIGRATE_ROOT 给错了？），停下来人看" % root,
+    )
+
+
 def describe(rel, path, prefix):
     """打印一个目录的 stat（属主/权限位）与条目数 —— 跑完便于和迁移前对比。"""
     st = os.lstat(path)
@@ -236,6 +255,9 @@ def main(argv):
         if os.path.isdir(root):
             for raw, rel in plan:
                 assert_no_symlink_escape(root, rel, raw)
+            # 形状闸门要在**打印与动手之前**：挂上来的不是这份卷时，一条计划都别当真。
+            if not args.plan_only:
+                assert_export_shape(root)
 
         mode = "apply" if (args.mode == "apply" and not args.plan_only) else "plan"
         emit("== state-owner-migration(C1 wave 2) ==")
@@ -290,6 +312,16 @@ def main(argv):
                 )
             emit("CHOWN rel=%s uid=%d gid=%d" % (rel, WORKER_UID, WORKER_GID))
             chowned += 1
+
+        # apply 模式什么也没 chown 就不算成功（"跑完了"必须是"真的迁了"，否则运维会以为
+        # 迁移完成，起来 worker 才发现平台态还是 root 的 0600）。形状闸门先兜"卷没挂上"，
+        # 这一条兜住"计划与实物都对不上"的其它样子。
+        if mode == "apply" and chowned == 0:
+            raise Refuse(
+                EXIT_SHAPE,
+                "没有任何目标被 chown：apply 模式跑完 %d 条计划、一条都没落地 —— 卷没挂上、"
+                "或者 --root/MIGRATE_ROOT 给错了根，停下来人看" % len(plan),
+            )
 
         emit(
             "SUMMARY mode=%s targets=%d chowned=%d missing=%d"
@@ -346,7 +378,7 @@ check_kubeconfig() {
     fi
     got="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$KUBECONFIG")"
     if [ "$got" != "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$want")" ]; then
-        refuse 2 "KUBECONFIG=$KUBECONFIG 不是本项目那一份（要 $want）——绝不要把写操作打到别的集群上，见 docs/deploy-clusters.md §0"
+        refuse 2 "KUBECONFIG=$KUBECONFIG 不是本项目那一份（要 ${want}）——绝不要把写操作打到别的集群上，见 docs/deploy-clusters.md §0"
     fi
 }
 
@@ -360,19 +392,23 @@ check_cluster_identity() {
 }
 
 check_worker_stopped() {
-    local replicas pods
+    local replicas pods want_replicas
     want_replicas=0
-    replicas="$(kubectl -n "$NAMESPACE" get statefulset/e2b-worker -o jsonpath='{.spec.replicas}')"
+    # 两条读盘都显式 `|| refuse`：`local x="$(cmd)"` 会把 cmd 的失败吞掉（`local` 自己返回 0），
+    # 而且读不到就等于"停写没有被验证过"—— 点名拒绝，不要被 `set -e` 静默带走。
+    replicas="$(kubectl -n "$NAMESPACE" get statefulset/e2b-worker -o jsonpath='{.spec.replicas}')" ||
+        refuse 2 "kubectl get statefulset/e2b-worker 失败 —— 停写没有被验证过，拒绝继续（通道断了？RBAC？）"
     if [ "$replicas" != "$want_replicas" ]; then
         refuse 2 "statefulset/e2b-worker 有 $replicas 个副本（要 want_replicas=0）——先停写：kubectl -n $NAMESPACE scale statefulset/e2b-worker --replicas=0 && kubectl -n $NAMESPACE wait --for=delete pod -l app=e2b-worker --timeout=300s"
     fi
-    pods="$(kubectl -n "$NAMESPACE" get pods -l app=e2b-worker -o name)"
+    pods="$(kubectl -n "$NAMESPACE" get pods -l app=e2b-worker -o name)" ||
+        refuse 2 "kubectl get pods -l app=e2b-worker 失败 —— 停写没有被验证过，拒绝继续（通道断了？RBAC？）"
     if [ -n "$pods" ]; then
         refuse 2 "app=e2b-worker 还有 pod 在跑（停写没完成）：$(printf '%s' "$pods" | tr '\n' ' ')"
     fi
-    # 观到的副本数带进 Job 的 env（只有这一个数 Job 自己看不到）。它此刻必然是 0；
+    # 观到的副本数从 stdout 交给调用点（只有这一个数 Job 自己看不到）。它此刻必然是 0；
     # 万一没走到这里，渲染出来的空值也会让 Job 自己拒绝。
-    observed_replicas="$replicas"
+    printf '%s' "$replicas"
 }
 
 #: 渲染出来 / 观测到的副本数必须是 0：这份 Job 只允许在"有人确认过 worker 停写"之后跑。
@@ -459,7 +495,9 @@ job_wait() {
 job_run() {
     local rendered
     rendered="$(render_job)"
-    warn "迁移由 Job 执行：$JOB（runAsUser 0，PVC sandbox-shared 以 RW 挂到 $EXPORT_IN_POD）"
+    # 变量紧挨着全角字符时必须写 `${VAR}`：macOS 自带的 bash 3.2 会把多字节字符的首字节吞进
+    # 变量名（`JOB\xef: unbound variable`），`set -u` 下直接中止。
+    warn "迁移由 Job 执行：${JOB}（runAsUser 0，PVC sandbox-shared 以 RW 挂到 ${EXPORT_IN_POD}）"
     kubectl -n "$NAMESPACE" create configmap "$CONFIGMAP" \
         --from-file="migrate-state-owner.sh=$SCRIPT_PATH" --dry-run=client -o yaml |
         kubectl -n "$NAMESPACE" apply -f - >&2
@@ -468,11 +506,11 @@ job_run() {
         warn "job/$JOB 没有成功完成，日志与 pod 状态如下（对象保留，便于排查）"
         kubectl -n "$NAMESPACE" logs "job/$JOB" || true
         kubectl -n "$NAMESPACE" get pods -l job-name="$JOB" -o wide || true
-        refuse 1 "Job 失败：看上面的日志。job/$JOB 与 configmap/$CONFIGMAP 都留着（查完手动 kubectl -n $NAMESPACE delete job/$JOB configmap/$CONFIGMAP）"
+        refuse 1 "Job 失败：看上面的日志。job/${JOB} 与 configmap/${CONFIGMAP} 都留着（查完手动 kubectl -n $NAMESPACE delete job/${JOB} configmap/${CONFIGMAP}）"
     fi
     kubectl -n "$NAMESPACE" logs "job/$JOB"
     if [ "$KEEP_JOB" = "1" ]; then
-        warn "保留 job/$JOB 与 configmap/$CONFIGMAP（--keep-job）"
+        warn "保留 job/${JOB} 与 configmap/${CONFIGMAP}（--keep-job）"
         return 0
     fi
     kubectl -n "$NAMESPACE" delete job "$JOB" --ignore-not-found
@@ -530,7 +568,9 @@ fi
 require_python
 check_kubeconfig
 check_cluster_identity
-check_worker_stopped
+# 观测到的副本数（此刻必然是 0）带进 Job 的 env：`refuse` 在子 shell 里 exit 非零会让
+# 这个赋值非零、`set -e` 立刻收工，所以被拒时的行为与直接调用它一样。
+observed_replicas="$(check_worker_stopped)"
 
 # 写操作之前先把只读的计划跑一遍：经控制面 pod（它那份 export 是只读挂载，正好只够读计划），
 # 任何口径不一致都会在这里先响。

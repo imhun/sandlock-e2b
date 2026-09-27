@@ -18,7 +18,9 @@ wave 1/2 之后 worker 是 uid 65534，而今天这台 NAS 上的平台态文件
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -93,6 +95,28 @@ def _run(args: list[str], *, env: dict[str, str]) -> subprocess.CompletedProcess
         env=env,
         cwd=str(REPO),
     )
+
+
+def _chown_recorder_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    """`_offline_env` + 一个"记录 argv、不改属主"的假 `chown`（非 root 的开发机上用）。"""
+    env = _offline_env(tmp_path)
+    recorder = tmp_path / "poison-bin" / "chown"
+    recorder.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        'with open(os.environ["CHOWN_LOG"], "a", encoding="utf-8") as fh:\n'
+        '    fh.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    recorder.chmod(0o755)
+    log = tmp_path / "chown-argv.jsonl"
+    env["CHOWN_LOG"] = str(log)
+    return env, log
+
+
+def _recorded_chown(log: Path) -> list[list[str]]:
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
 
 
 def _targets(stdout: str) -> list[str]:
@@ -177,12 +201,18 @@ def test_the_script_keeps_the_scene_when_a_step_fails() -> None:
 def test_the_script_requires_the_worker_to_be_scaled_to_zero() -> None:
     lines = _lines(SCRIPT)
     assert "want_replicas=0" in lines
+    # `cmd ||` + 下一行的 `refuse`：与兄弟脚本同一形状 —— `set -e` 不会因为
+    # `local x="$(cmd)"` 把失败吞掉，读不到副本数就等于"停写没有被验证过"。
     assert (
         'replicas="$(kubectl -n "$NAMESPACE" get statefulset/e2b-worker '
-        "-o jsonpath='{.spec.replicas}')\""
+        "-o jsonpath='{.spec.replicas}')\" ||"
     ) in lines
     # 缩容还不够：正在终止的 pod 还占着卷。闸门也读 pod 列表，并写出怎么修。
-    assert 'pods="$(kubectl -n "$NAMESPACE" get pods -l app=e2b-worker -o name)"' in lines
+    assert 'pods="$(kubectl -n "$NAMESPACE" get pods -l app=e2b-worker -o name)" ||' in lines
+    assert (
+        'refuse 2 "kubectl get statefulset/e2b-worker 失败 —— 停写没有被验证过，拒绝继续'
+        '（通道断了？RBAC？）"'
+    ) in lines
     assert "scale statefulset/e2b-worker --replicas=0" in SCRIPT.read_text(encoding="utf-8")
 
 
@@ -195,6 +225,20 @@ def test_the_engine_heredoc_is_inside_a_function_not_a_command_substitution() ->
     lines = _lines(SCRIPT)
     assert "py_engine() {" in lines
     assert [line for line in lines if "$(cat <<'PY_ENGINE'" in line] == []
+
+
+def test_no_shell_variable_is_left_adjacent_to_a_non_ascii_character() -> None:
+    """`$JOB（` 这种写法在 macOS 自带的 bash 3.2 上会炸：
+
+    `bash: line N: JOB\\xef: unbound variable` —— 3.2 不是多字节感知的，它会把全角字符的
+    首字节吞进变量名，`set -u` 下直接中止（实测：`job_run` 的 `warn` 一跑就退出）。所以
+    变量紧挨全角标点时必须写 `${JOB}`。兄弟脚本里有同样的四处（不在本次写集内）。
+    """
+    offenders = []
+    for number, line in enumerate(_lines(SCRIPT), start=1):
+        for match in re.finditer(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]", line):
+            offenders.append((number, match.group(0)))
+    assert offenders == []
 
 
 def test_the_print_plan_and_offline_paths_never_touch_the_cluster() -> None:
@@ -252,13 +296,11 @@ def test_the_job_runs_as_root_on_the_shared_volume_without_retries() -> None:
 def test_the_job_is_not_part_of_the_rendered_overlay() -> None:
     """它是一次性、由人手 apply 的对象，绝不是 `apply.sh` 的一员。"""
     text = KUSTOMIZATION.read_text(encoding="utf-8")
-    assert "state-owner-migrate.yaml" not in text
-    kustomization = yaml.safe_load(text)
-    assert kustomization["resources"] == [
-        "../k8s",
-        "storage-nas.yaml",
-        "gateway-nodeport.yaml",
-    ]
+    # 只断言与本次相关的那一项：同波次的 Task 4 正在往 resources 里加 `priv-broker.yaml`，
+    # 整份列表相等的断言会因为别人的正当改动变红。
+    assert "state-owner-migrate" not in text
+    resources = yaml.safe_load(text)["resources"]
+    assert [entry for entry in resources if "state-owner-migrate" in entry] == []
 
 
 # --- 行为：路径计划（不连集群） -------------------------------------------
@@ -356,6 +398,80 @@ def test_the_offline_dry_run_plans_every_target_and_writes_nothing(
     assert not (tmp_path / "kubectl-was-called.log").exists()
 
 
+def test_an_empty_root_refuses_in_apply_mode(tmp_path: Path) -> None:
+    """卷没挂上（空目录）时**不能**以成功收尾。
+
+    挂在空目录上的 PVC 实测就是"7 条全 MISSING、chowned=0、RC=0"——运维会以为迁完了，
+    起来 worker 才发现平台态还是 root 的 0600。所以两个闸门都必须在写路径上：形状闸门
+    （`state` 与 `state/_runtime` 都不在 ⇒ 这不是本平台的 export 根）先响，`chowned == 0`
+    那条兜住其它"计划与实物对不上"的样子。兄弟工具在同样情形用的是 `EXIT_SHAPE`(=3)。
+    """
+    root = tmp_path / "empty"
+    root.mkdir()
+    env, chown_log = _chown_recorder_env(tmp_path)
+    proc = _run(["--root", str(root), "--apply"], env=env)
+    assert proc.returncode == 3
+    assert proc.stderr.splitlines()[0] == (
+        f"REFUSE(3): 没有任何目标被 chown：{root} 下既没有 state 也没有 state/_runtime"
+        " —— 这不像是本平台的 export 根（卷没挂上？--root/MIGRATE_ROOT 给错了？），停下来人看"
+    )
+    # fail-closed：拒绝发生在打印计划与动手之前 —— 一条 TARGET/STAT/AFTER/SUMMARY 都没有，
+    # 也没有任何 chown 被调用。
+    assert [
+        line
+        for line in proc.stdout.splitlines()
+        if line.startswith(("TARGET ", "STAT ", "AFTER ", "SUMMARY "))
+    ] == []
+    assert not chown_log.exists()
+    assert not (tmp_path / "kubectl-was-called.log").exists()
+
+
+def test_a_root_with_state_but_no_runtime_is_not_a_shape_error(tmp_path: Path) -> None:
+    """判据（与引擎 `assert_export_shape` 逐字一致）：只有 `state` 与 `state/_runtime`
+    **都不在**才算"这不是本平台的 export 根"。`state` 在、`state/_runtime` 不在 = 这个集群
+    还没有任何沙箱记录 —— 那是合法状态，不拦（否则一个刚建好的部署会被自己的迁移工具拒绝）。
+    """
+    root = tmp_path / "export"
+    (root / "state").mkdir(parents=True)
+    (root / "state" / ".uid_pool.lock").write_text("", encoding="utf-8")
+    proc = _run(["--root", str(root)], env=_offline_env(tmp_path))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = proc.stdout.splitlines()
+    assert [line for line in lines if line.startswith("TARGET rel=")] == [
+        f"TARGET rel={name} owner={WORKER_UID}:{WORKER_GID}" for name in PLATFORM_TARGETS
+    ]
+    st = os.lstat(root / "state")
+    assert [line for line in lines if line.startswith("STAT rel=")] == [
+        "STAT rel=state uid=%d gid=%d mode=0%o files=1 dirs=0"
+        % (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode))
+    ]
+    assert "SUMMARY mode=plan targets=7 chowned=0 missing=6" in lines
+
+
+def test_the_engine_asks_chown_to_re_own_the_planned_path(
+    export_root: Path, tmp_path: Path
+) -> None:
+    """`--apply` 真的去调 `chown -R 65534:65534 <计划里的路径>`，第一条是 `state`。
+
+    这台开发机不是 root，chown 不会生效，所以这里用一个"记录 argv、不改属主"的假 chown：
+    它同时把引擎的 fail-closed 后置检查（属主没变成 worker 就拒绝）变成断言。7 条路径的
+    全集在容器里用"记录 + 转发给真 chown"的包装脚本证明（见 task-6-report.md）。
+    """
+    env, chown_log = _chown_recorder_env(tmp_path)
+    proc = _run(["--root", str(export_root), "--apply"], env=env)
+    assert proc.returncode == 4
+    state = export_root / "state"
+    st = os.lstat(state)
+    assert proc.stderr.splitlines()[0] == (
+        f"REFUSE(4): state chown 之后属主还是 {st.st_uid}:{st.st_gid}"
+        "（存储把 chown 当成 no-op？）—— 停下来查"
+    )
+    calls = _recorded_chown(chown_log)
+    assert calls == [["-R", f"{WORKER_UID}:{WORKER_GID}", str(state)]]
+    trees = str(export_root / SANDBOX_TREES)
+    assert [path for _flag, _pair, path in calls if path == trees or path.startswith(trees + os.sep)] == []
+
+
 # --- 行为：Job 渲染（不连集群） -------------------------------------------
 
 
@@ -425,3 +541,175 @@ def test_an_unknown_argument_is_refused(tmp_path: Path) -> None:
     proc = _run(["__ENGINE_FLAGS__"], env=_offline_env(tmp_path))
     assert proc.returncode == 2
     assert proc.stderr.splitlines()[0] == "REFUSE(2): 未知参数：__ENGINE_FLAGS__（--help 看用法）"
+
+
+# --- 行为：操作脚本（stubbed kubectl） -------------------------------------
+#
+# `check_worker_stopped` 是"worker 真的停写了吗"的唯一判据，所以它必须被**行为地**钉住：
+# 静态断言只能证明那两行还在，证明不了它们真的被走到、拒绝了、并且没往下走。
+
+STUB_KUBECTL = '''#!/usr/bin/env python3
+"""A kubectl that records its argv and answers the calls the driver makes."""
+import json, os, sys
+
+argv = sys.argv[1:]
+with open(os.environ["STUB_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(argv) + "\\n")
+stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
+if argv[:2] == ["get", "nodes"]:
+    # Cluster-scoped, so deliberately no `-n`: the driver has to be able to
+    # check *which* cluster it is talking to before anything else.
+    nodes = [
+        {"metadata": {"name": "izuf697v12g31dyz4uvsjlz"},
+         "status": {"nodeInfo": {"architecture": "arm64", "kubeletVersion": "v1.36.4+k0s"}}},
+        {"metadata": {"name": "izuf6d1usviqv6x9qk1hpcz"},
+         "status": {"nodeInfo": {"architecture": "arm64", "kubeletVersion": "v1.36.4+k0s"}}},
+    ]
+    print(json.dumps({"items": nodes}))
+    raise SystemExit(0)
+assert argv[:2] == ["-n", "sandlock"], argv
+rest = argv[2:]
+if rest[:2] == ["get", "statefulset/e2b-worker"]:
+    print(os.environ.get("STUB_REPLICAS", "0"))
+elif rest[:2] == ["get", "pods"]:
+    print(os.environ.get("STUB_PODS", ""))
+elif rest[:1] == ["exec"]:
+    assert stdin.startswith("#!/usr/bin/env python3"), stdin[:60]
+    print("SUMMARY mode=plan targets=7 chowned=0 missing=0")
+elif rest[:2] == ["create", "configmap"]:
+    print("apiVersion: v1\\nkind: ConfigMap\\nmetadata:\\n  name: state-owner-migrate\\n")
+elif rest[:1] == ["apply"]:
+    with open(os.environ["STUB_APPLIED"], "a", encoding="utf-8") as fh:
+        fh.write(stdin)
+elif rest[:3] == ["get", "job", "state-owner-migrate"]:
+    print("1" if argv[-1].endswith(".status.succeeded}") else "0")
+elif rest[:1] == ["logs"]:
+    print("JOB LOG LINE")
+elif rest[:1] == ["delete"]:
+    pass
+else:
+    raise SystemExit("unhandled argv: %r" % (argv,))
+'''
+
+
+def _stub_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
+    bindir = tmp_path / "stub-bin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "kubectl"
+    stub.write_text(STUB_KUBECTL, encoding="utf-8")
+    stub.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["KUBECONFIG"] = str(REPO / "tmp" / "k0s" / "kubeconfig")
+    env["VERSION"] = "test-version-6"
+    env["STUB_LOG"] = str(tmp_path / "kubectl-argv.jsonl")
+    env["STUB_APPLIED"] = str(tmp_path / "applied.yaml")
+    return env, tmp_path / "kubectl-argv.jsonl", tmp_path / "applied.yaml"
+
+
+def _recorded(log: Path) -> list[list[str]]:
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+def test_the_operator_path_refuses_when_the_worker_is_still_up(tmp_path: Path) -> None:
+    env, log, applied = _stub_env(tmp_path)
+    env["STUB_REPLICAS"] = "2"
+    proc = _run(["--apply"], env=env)
+    assert proc.returncode == 2
+    # 集群身份自检先把节点清单打到 stderr，所以这条按"其中一行"精确匹配。
+    assert (
+        "REFUSE(2): statefulset/e2b-worker 有 2 个副本（要 want_replicas=0）——先停写："
+        "kubectl -n sandlock scale statefulset/e2b-worker --replicas=0 && "
+        "kubectl -n sandlock wait --for=delete pod -l app=e2b-worker --timeout=300s"
+    ) in proc.stderr.splitlines()
+    # 停在闸门上：没有读计划、没有 apply、没有 Job。
+    assert not applied.exists()
+    assert [argv for argv in _recorded(log) if argv[2:3] == ["apply"]] == []
+    assert [argv for argv in _recorded(log) if argv[2:3] == ["exec"]] == []
+
+
+def test_the_operator_path_refuses_a_lingering_worker_pod(tmp_path: Path) -> None:
+    env, log, applied = _stub_env(tmp_path)
+    env["STUB_REPLICAS"] = "0"
+    env["STUB_PODS"] = "pod/e2b-worker-0\npod/e2b-worker-1"
+    proc = _run(["--apply"], env=env)
+    assert proc.returncode == 2
+    assert (
+        "REFUSE(2): app=e2b-worker 还有 pod 在跑（停写没完成）："
+        "pod/e2b-worker-0 pod/e2b-worker-1"
+    ) in proc.stderr.splitlines()
+    assert not applied.exists()
+    assert [argv for argv in _recorded(log) if argv[2:3] == ["apply"]] == []
+
+
+def test_the_operator_path_renders_and_runs_the_job(tmp_path: Path) -> None:
+    env, log, applied = _stub_env(tmp_path)
+    proc = _run(["--apply"], env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "JOB LOG LINE" in proc.stdout.splitlines()
+
+    rendered = applied.read_text(encoding="utf-8")
+    assert [
+        token
+        for token in ("__WORKER_REPLICAS__", "__ENGINE_FLAGS__", "__IMAGE_VERSION__")
+        if token in rendered
+    ] == []
+    job = list(yaml.safe_load_all(rendered))[-1]
+    assert job["kind"] == "Job"
+    (container,) = job["spec"]["template"]["spec"]["containers"]
+    assert container["command"] == ["bash", "/scripts/migrate-state-owner.sh"]
+    assert container["args"] == ["--in-cluster", "--apply"]
+    assert container["image"] == (
+        "registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:test-version-6"
+    )
+    # 观测值（0）真的从 `check_worker_stopped` 一路走到 Job 的 env 里 —— 这条线是纯行为的。
+    variables = {entry["name"]: entry.get("value") for entry in container["env"]}
+    assert variables == {
+        "MIGRATE_ROOT": EXPORT_IN_CLUSTER,
+        "MIGRATE_WORKER_REPLICAS": "0",
+    }
+
+    recorded = _recorded(log)
+
+    def index_of(*prefix: str) -> int:
+        return next(
+            index for index, argv in enumerate(recorded) if argv[: len(prefix)] == list(prefix)
+        )
+
+    stop_write = index_of("-n", "sandlock", "get", "statefulset/e2b-worker")
+    pods = index_of("-n", "sandlock", "get", "pods", "-l", "app=e2b-worker")
+    plan = index_of("-n", "sandlock", "exec")
+    job_apply = max(index for index, argv in enumerate(recorded) if argv[2:3] == ["apply"])
+    logs = index_of("-n", "sandlock", "logs", "job/state-owner-migrate")
+    delete = index_of("-n", "sandlock", "delete", "job", "state-owner-migrate")
+    # 先认集群 → 观测停写 → 读一遍只读计划 → 才 apply Job → 收日志 → 清理。
+    assert index_of("get", "nodes", "-o", "json") < stop_write < pods < plan
+    assert plan < job_apply < logs < delete
+    assert [
+        "-n",
+        "sandlock",
+        "exec",
+        "-i",
+        "deploy/control-plane",
+        "-c",
+        "control-plane",
+        "--",
+        "python3",
+        "-",
+        "--root",
+        EXPORT_IN_CLUSTER,
+        "--mode",
+        "plan",
+    ] in recorded
+    assert [
+        "-n",
+        "sandlock",
+        "create",
+        "configmap",
+        "state-owner-migrate",
+        f"--from-file=migrate-state-owner.sh={SCRIPT}",
+        "--dry-run=client",
+        "-o",
+        "yaml",
+    ] in recorded
+    assert ["-n", "sandlock", "delete", "configmap", "state-owner-migrate", "--ignore-not-found"] in recorded
