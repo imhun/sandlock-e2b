@@ -20,15 +20,17 @@
 | Task 6（平台态属主迁移工具 + Job） | ✅ 已合并（wave 2） |
 | Task 7（文档与 pin 收口） | ✅ 已合并（wave 2） |
 | Task 9（终审 Minor 收口） | ✅ 已合并（wave 2 + `2ef457e`） |
-| **Task 8（真机 rollout 与验收）** | ⏸ **未执行**：需要 KUBECONFIG + 停机窗口授权（worker 缩 0 跑迁移）。前置清单见下文与 `docs/k8s-deployment.md` §24。 |
+| **Task 8（真机 rollout 与验收）** | ✅ **已执行（2026-09-27，用户授权）**：版本 `0.1.0-698-g55e5e79-20260927-195247`；worker 缩 0 → 迁移（8 条目标、`chowned=8`、files/dirs 计数前后一致）→ `apply.sh`（broker 先滚、worker 后滚）→ 验收全绿。完整记录与证据见 `docs/deploy-clusters.md` §7.1。 |
 
 **Task 8 真机预检发现（2026-09-27，只读）**：**worker 的快照 payload 根** `<workspaces>/_snapshots`（`envd_service/agent.py` 硬编码 `<workspace_base>/_snapshots`；控制面的记录根是另一条 `<export>/_snapshots`）坐在树根下、属主 `root:0755` —— C1 之后 65534 的 worker 写不进去（"上线后第一次 create snapshot 才炸"的静默类型）。已由本次修复覆盖：`deploy/k8s/priv-broker.yaml` 的 `workspace-root-init` 把它交给 65534（`mkdir -p` + `chown 65534:65534` + 校验），`deploy/scripts/migrate-state-owner.sh` 的树根白名单放行它（`workspaces/_migrate`、`workspaces/_snapshots` 两条）。见 `docs/k8s-deployment.md` §24。
 
 **已知延后（非阻断，均已记账）**
-1. `drop: [ALL]`：broker 目前仍是"默认 root 集 + 三条 cap"，需真机确认只有 `CHOWN/DAC_OVERRIDE/FOWNER` 时 `walk/rm/chown` 仍成立后再加（`deploy/k8s/priv-broker.yaml` 注释已写明）。
+1. ~~`drop: [ALL]`~~ ✅ **已做并在真机验证（2026-09-27）**：broker 的 `CapEff=0xcb` = 恰好 `CHOWN`+`DAC_OVERRIDE`+`FOWNER`+`SETUID`+`SETGID`（不再是运行时默认的满 root 集）；`chown`/`rm`/`walk` 三个 verb 都在这个集合下现场验过（新建沙箱树 `770 10000:65534`、kill 后树消失、worker 记账的 `walk` 计数在走）。其中 `SETUID`/`SETGID` 是给**探针**保留的：探针必须以对端身份连 socket 才过 peer 门，用 `setpriv` 降权需要这两条。
 2. Python 侧单行读取上限 ≈3 GiB > worker 容器 `limits.memory: 2Gi`：要真正生效需把 `walk` 改成流式读（现在名义有界、实际 OOM 先行）。
 3. `image-cache-init` 对 `secrets/` 的两条 chown 是静默 best-effort（失败只有顶层 `$dir` 的 FATAL），以及 `-maxdepth 2` 即契约——两条可观测性/注释类 Minor，留给下一轮。
 4. `deploy/scripts/migrate-state-base.sh` 有与 `$VAR（` 同形的 bash 3.2 隐患（本 wave 顺手修了 `migrate-state-owner.sh` 的那几处）。
+5. 环境侧既有噪声：CP 有两个副本而构建状态是进程内的 ⇒ `deployment_smoke` 的模板构建轮询偶发 404（重跑即绿）。与"控制面只能 1 副本"同源，不属 C1。
+6. **上线时真机才暴露、已修的缺陷**：DaemonSet 第一版的 liveness/readiness 以容器 root 跑 `e2b-maint ping` → 被 peer 门拒（`peer uid 0 does not match`），daemon 正常但 pod 停在 `Running 0/1`、反复重启、rollout 超时。修法：探针用 `setpriv --reuid/--regid 65534 --clear-groups` 降到对端身份；pin 见 `tests/unit/test_worker_manifest_permissions.py::test_the_broker_probes_connect_as_the_peer_identity`。
 
 ## Global Constraints
 

@@ -130,12 +130,57 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 
 ## 7. 当前部署状态（2026-09-27 实测，改部署前先复核；最近一次发版记录见 §12）
 
-**版本**：`0.1.0-652-g43fb88a-20260927-102733`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的）。
-2026-09-27 实测：`autoscaler` / `control-plane` / `e2b-worker` 三个工作负载的镜像都是这一版。
+**版本**：`0.1.0-698-g55e5e79-20260927-195247`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的；
+C1 wave 1+2 的代码从这里开始上线）。2026-09-27 实测：`autoscaler` / `control-plane` / `e2b-worker`
+三个工作负载的镜像都是这一版。
 
-**pod（2026-09-27 实测）**：`control-plane` 两个副本各 `2/2`（控制面 + gateway，F11 多副本已上线）、
+**pod（2026-09-27 20:0x 实测，C1 上线后）**：`control-plane` 两个副本各 `2/2`、
 `autoscaler` `1/1`、`e2b-worker-0/1` 各 `1/1`（分别落在 `.80.94` / `.80.140`）、`redis` `1/1`、
-`seccomp-installer` `2/2`（一节点一个）。节点仍是 2 台 arm64 / `v1.36.4+k0s`。
+`seccomp-installer` `2/2`、**`e2b-priv-broker` `2/2`（一节点一个）**。节点仍是 2 台 arm64 /
+`v1.36.4+k0s`。
+
+### 7.1 C1 上线实测（2026-09-27，已执行）
+
+**动作与顺序**（当时 CP 的沙箱列表为 **0 个**，停机窗口无代价）：
+
+1. `build-and-push.sh` → 新版本 `0.1.0-698-g55e5e79-20260927-195247`（多架构，含新 C broker：
+   镜像里 `e2b-maint` 的 usage 已含 `serve|ping`，file caps `cap_chown,cap_dac_override=ep` 在位）；
+2. `kubectl -n sandlock scale statefulset/e2b-worker --replicas=0`；
+3. `migrate-state-owner.sh`（先默认 dry-run 看计划）→ `--apply`：**8 条目标、`missing=0`、
+   `chowned=8`**，每条都打印了 STAT/AFTER 且 **files/dirs 计数前后完全一致**（无丢文件）：
+   `state` 1996 文件/1036 目录、`workspaces/_snapshots` 2001/4、`_snapshots`（控制面记录根）
+   2005/7、`_templates` 53/53、`_builds` 54/108，另有 `_images`（已是 65534）、`_secrets`、
+   `workspaces/_migrate`。Job 与 ConfigMap 跑完自清理；
+4. `apply.sh`：等 `ds/e2b-priv-broker` 先滚完再滚 worker（脚本内建顺序），随后预热 base image。
+
+**验收证据（全部现场实测）**：
+
+* worker 容器 securityContext = `{"capabilities":{"add":["SETUID","SETGID"]},"seccompProfile":…}`
+  —— **没有 `runAsUser`**，即 worker 真的不再是 root；
+* `e2b-priv-broker` 每节点 `1/1`；socket 形态 `710 0:65534 /run/e2b-broker` 与
+  `660 0:65534 /run/e2b-broker/broker.sock`；以 peer 身份 `ping` 回
+  `{"ok":true,"peer_uid":65534,"peer_gid":65534,"uid_pool":[10000,1000],"roots":[workspaces,state,<export>,image-cache]}`
+  （四根顺序与 Python 侧逐位一致）；
+* broker 的**有效能力集 `CapEff=0xcb`** = 恰好 `CHOWN`+`DAC_OVERRIDE`+`FOWNER`+`SETGID`+`SETUID`
+  （`drop: [ALL]` + 这五条 add；不再是运行时默认的满 root 集）；
+* `multinode_smoke.py` = `MULTI-NODE SMOKE OK`（4 箱 2+2、命令/文件/stdin、预留归零），
+  `deployment_smoke.py` = `DEPLOYMENT SMOKE OK`（含跨节点迁移保文件、远端卷隔离、
+  模板构建→registry→worker 拉取→镜像 rootfs、MCP 网关）；**最小能力集下又各跑一遍 multinode = OK**；
+* 活沙箱的树 = `770 10000 65534`（`<池 uid>:<worker gid>`，由 broker 经 NFS 交出去），
+  `kill` 后树被删除、worker 记账里的 `walk` 计数在走（三个 verb 都验证过）。
+
+**上线时踩到的两件事（都已修/已记）**：
+
+1. **探针必须以对端身份连 socket**。第一版 DaemonSet 的 liveness/readiness 直接以容器的
+   root 跑 `e2b-maint ping` → 被 peer 门拒（`refused: peer uid 0 does not match
+   E2B_BROKER_PEER_UID=65534`），daemon 本身一直正常服务，但 pod 停在 `Running 0/1`、
+   反复重启、rollout 超时。修法：探针先用 `setpriv --reuid/--regid 65534 --clear-groups`
+   降到对端身份再 ping（`deploy/k8s/priv-broker.yaml`，pin 见
+   `tests/unit/test_worker_manifest_permissions.py::test_the_broker_probes_connect_as_the_peer_identity`）。
+   这也意味着 broker 的 cap 集必须保留 `SETUID`/`SETGID`。
+2. **`deployment_smoke` 第一次跑在模板构建轮询上 404**（`Template build bld_… not found`），
+   立刻重跑即全绿。CP 有两个副本而构建状态是进程内的：轮询被 Service 打到另一个副本就会
+   404（与文档里"控制面只能 1 副本"同源，属**既有**环境问题，不是 C1 引入）。
 
 **C1 特权外置后的形态（2026-09-27，wave 2；仓库规格 = 下一次 apply 之后的集群形态）**：
 
@@ -149,10 +194,13 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
   `SETUID`/`SETGID`，唯一的 initContainer 是**非 root** 的 `wait-for-broker`（broker 先监听、
   worker 才放行；等的是 `hello` 往返，不只是 socket 文件存在）。
 * **第一次滚这个形态必须先把平台态属主迁过来**（一次迁移，不是滚动）：worker 缩到 0 →
-  `deploy/scripts/migrate-state-owner.sh --apply` → 再把 worker 起回来。它只 `chown` 七个平台目录
-  （`state`/`workspaces/_migrate`/`_images`/`_secrets`/`_snapshots`/`_templates`/`_builds`），
-  **树根下只放行 `workspaces/_migrate` 那一条**（N27 之后控制面的迁移暂存就在树根之下，不是
-  export 根），其余 `<export>/workspaces/**`（那是池 uid 的树）**绝不碰**。用法见
+  `deploy/scripts/migrate-state-owner.sh --apply` → 再把 worker 起回来。它只 `chown` **八个**平台目录
+  （`state`/`workspaces/_migrate`/`workspaces/_snapshots`/`_images`/`_secrets`/`_snapshots`/
+  `_templates`/`_builds`），**树根下恰放行两条**：`workspaces/_migrate`（N27 之后控制面的迁移暂存
+  就在树根之下，不是 export 根）与 `workspaces/_snapshots`（**worker 的快照 payload 根**，
+  `envd_service/agent.py` 硬编码在 `<workspace_base>/_snapshots`；控制面的快照*记录*在另一个根
+  `<export>/_snapshots`，两条都在计划里）；其余 `<export>/workspaces/**`（那是池 uid 的树）
+  **绝不碰**。用法见
   `deploy/k8s-k0s/README.md`「平台态属主迁移」、正文见 `docs/k8s-deployment.md` §24。顺序反了
   （先上 worker）会得到读不了 `0600`/`0700` 平台态的 worker —— 也就是每个 `Sandbox.create()`
   都失败。
