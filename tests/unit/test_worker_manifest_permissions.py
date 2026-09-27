@@ -1034,8 +1034,8 @@ def test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identit
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
-def test_the_image_cache_init_never_rechowns_the_per_sandbox_secrets() -> None:
-    """C1 final review: the cache init must not ``chown -R`` the whole cache dir.
+def test_the_image_cache_init_hands_the_secret_directories_over_without_touching_the_files() -> None:
+    """C1 final review: the cache init owns the cache's directories, never ``*.secret``.
 
     ``image-cache-init`` used to be the *worker* pod's init, where a rolling
     restart meant the sandboxes on that pod restarted too -- so a recursive
@@ -1047,11 +1047,37 @@ def test_the_image_cache_init_never_rechowns_the_per_sandbox_secrets() -> None:
     65534 on **every broker rollout** -- and the documented upgrade step rolls
     the broker -- leaving running sandboxes unable to read their own secrets.
 
-    So the init owns exactly what it is responsible for: the top-level
-    directory (non-recursive, so the 65534 worker can create its lock files and
-    staging trees) and ``_oci/`` recursively (the tars the control plane writes
-    there). The recursive form on ``$dir`` is the regression, and ``secrets``
-    is skipped by name so the next reader does not "tidy" it back in.
+    But "do not touch ``secrets``" is *not* the invariant either, and skipping
+    the subtree outright is the second half of the same bug: ``secrets/``
+    itself and the ``<sandbox_id>`` directories below it have to belong to the
+    65534 worker, because the worker is what creates them
+    (``secret_dir.mkdir(parents=True, exist_ok=True)``), reclaims the name
+    (``path.unlink(missing_ok=True)``, which needs write permission on the
+    parent *directory*) and then writes the secret file. Nothing else ever
+    chowns them: ``image_resolver`` only creates the cache root and ``_oci/``,
+    and the §24 ownership migration only mounts the PVC -- it cannot reach this
+    node-local ``hostPath``. On the upgrade path the old root worker leaves
+    ``secrets/sbx_old/`` as ``root:0755``, so an init that skips the subtree
+    leaves the new worker with MKDIR/UNLINK DENIED -- and the init's own gate
+    only looks at top-level ``$dir``, so it starts cleanly and fails later, at
+    the first secret-bearing sandbox.
+
+    The invariants pinned here, then, are:
+
+    * the top-level directory (non-recursive: the worker creates its lock files
+      and staging trees there) and ``_oci/`` recursively (the control plane's
+      tars);
+    * ``<dir>/secrets`` and the **directories** below it go to 65534, via a
+      ``find … -type d`` -- the ``-type d`` is the contract, not an optimization;
+    * no chown in the script may name a ``*.secret`` file -- the files belong to
+      the running sandbox's pooled uid;
+    * the whole-tree recursive form on ``$dir`` never comes back.
+
+    Both regressions therefore fail here: restoring the recursive chown trips the
+    last point, and dropping the ``secrets`` handling trips the middle two. The
+    script's own ``stat``-level behaviour (directories -> 65534, ``*.secret``
+    files untouched) is exercised in the container for the wave-2 report; this
+    is the render-level pin that runs in every lane.
 
     Read off the rendered DaemonSet (not the file text): the same command
     shape's siblings live in other manifests.
@@ -1068,18 +1094,31 @@ def test_the_image_cache_init_never_rechowns_the_per_sandbox_secrets() -> None:
         for c in broker["spec"]["template"]["spec"]["initContainers"]
     }["image-cache-init"]
     lines = [line.strip() for line in init["command"][2].splitlines()]
+    # Every line that actually runs. The script's comments name `*.secret` on
+    # purpose; only the commands are the contract.
+    commands = [line for line in lines if not line.startswith("#")]
     # The two chowns it *is* responsible for, each pinned exactly.
     assert 'chown 65534:65534 "$dir" 2>/dev/null ||' in lines
     assert 'chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||' in lines
+    # The secret *directories* are handed over: `secrets/` itself (the worker
+    # mkdirs `<sandbox_id>` below it) and the directories under it (the worker
+    # unlinks and writes `<name>.secret` inside them).
+    assert 'if [ -d "$dir/secrets" ]; then' in lines
+    assert 'chown 65534:65534 "$dir/secrets" 2>/dev/null || true' in lines
+    assert (
+        'find "$dir/secrets" -mindepth 1 -maxdepth 2 -type d '
+        '-exec chown 65534:65534 {} + 2>/dev/null || true'
+    ) in lines
+    # ...and no chown may name a secret *file*: those stay with the sandbox uid
+    # the executor handed them to.
+    assert [line for line in commands if "chown" in line and ".secret" in line] == []
+    # ...and the directory sweep is `-type d` only (no `-type f` anywhere).
+    assert [line for line in commands if "secrets" in line and "-type f" in line] == []
     # ...and the one line that must never come back: the whole-tree recursion.
     assert 'chown -R 65534:65534 "$dir" 2>/dev/null ||' not in lines
     assert [
         line for line in lines if line.startswith('chown -R 65534:65534 "$dir')
     ] == ['chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||']
-    # The exclusion is said out loud (the pin is "the script names secrets",
-    # not merely "it happens not to touch them today").
-    assert [line for line in lines if "$dir/secrets" in line] != []
-    assert 'if [ -d "$dir/secrets" ]; then' in lines
 
 
 def test_apply_waits_for_the_broker_daemonset_before_the_worker() -> None:

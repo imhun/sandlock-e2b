@@ -126,14 +126,25 @@ spec:
                 # 见 envd_service/executors/sandlock.py 与 factory.py:236）。这个 init
                 # 原来在 worker pod 里（worker 重启 ⇒ 沙箱必然重启，抢属主无所谓），
                 # 搬到 DaemonSet 之后就是"broker 滚动 ⇒ 在跑沙箱的 secret 被抢回
-                # 65534"——而文档明确的升级步骤就会滚 broker。secrets/ 是沙箱 uid 的
-                # 账，这里只**点名跳过**，绝不进入。
+                # 65534"——而文档明确的升级步骤就会滚 broker。
+                #
+                # 但 `secrets/` **不能整支跳过**：`secrets/` 自己与它下面的**目录**
+                # 必须是 worker（65534）的，否则升级路径上（老 worker 是 root，
+                # /var/lib/e2b-images 是持久 hostPath）worker 连
+                # `secret_dir.mkdir()` / `path.unlink()` 都做不到（`<secrets>` 是
+                # root:0755 ⇒ MKDIR/UNLINK 全 DENIED），而**没有别的代码**会 chown
+                # 它们（image_resolver 只建 cache 根与 `_oci/`；§24 的迁移只挂 PVC、
+                # 碰不到节点本地 hostPath）。所以这里按"目录交给 worker、文件留给
+                # 沙箱"分开处理：`secrets` 与它下面的目录 chown 65534，`*.secret`
+                # **一个字都不碰**（`-type d` 是这条不变量本身，不是为了省事）。
                 chown 65534:65534 "$dir" 2>/dev/null ||
                   echo "image-cache-init: chown refused ($dir, NFS root_squash?) -- verifying the owner instead"
                 chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||
                   echo "image-cache-init: chown refused ($dir/_oci, NFS root_squash?) -- verifying the owner instead"
                 if [ -d "$dir/secrets" ]; then
-                  echo "image-cache-init: skipping $dir/secrets (per-sandbox secret files belong to their sandbox uid, not 65534)"
+                  chown 65534:65534 "$dir/secrets" 2>/dev/null || true
+                  find "$dir/secrets" -mindepth 1 -maxdepth 2 -type d -exec chown 65534:65534 {} + 2>/dev/null || true
+                  echo "image-cache-init: handed $dir/secrets (directories only; *.secret files stay with their sandbox uid) to uid 65534"
                 fi
                 owner="$(stat -c %u "$dir")"
                 if [ "$owner" != "65534" ]; then
