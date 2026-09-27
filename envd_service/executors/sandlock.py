@@ -1969,9 +1969,31 @@ class SandlockExecutor(Executor):
             # rootfs in the image shape, and outside `can_read`'s allow-list in
             # the pure one -- so the sandbox cannot reach it even owning it.
             identity = self._host_uid if self._per_sandbox_uid else None
-            if os.geteuid() == 0 and identity:
-                with suppress(OSError):
-                    os.chown(path, identity, -1)
+            if identity:
+                if os.geteuid() == 0:
+                    with suppress(OSError):
+                        os.chown(path, identity, -1)
+                else:
+                    # Only root holds CAP_CHOWN itself; a non-root worker
+                    # reaches a pooled uid through the ``e2b-maint`` broker
+                    # (C1/T3). The broker's whitelist has to cover the secrets
+                    # dir -- it lives under ``E2B_IMAGE_CACHE_DIR``, outside the
+                    # three original roots -- or the file would stay
+                    # worker-owned and every create would die later, at
+                    # supervise, with a permission error naming neither the
+                    # path nor the missing root. Name both here instead
+                    # (fail closed, never "hand it over if we can").
+                    from envd_service import priv_helpers
+
+                    if not priv_helpers.helpers_cover(path):
+                        raise priv_helpers.PrivHelperError(
+                            f"cannot hand {path} to sandbox uid {identity} on "
+                            "a non-root worker: the file-capability broker "
+                            "whitelist does not contain it "
+                            "(E2B_IMAGE_CACHE_DIR must be one of the broker's "
+                            "roots)"
+                        )
+                    priv_helpers.broker_chown(identity, path, recursive=False)
             os.chmod(path, 0o600)
             entry = dict(entry)
             entry.pop("value", None)
