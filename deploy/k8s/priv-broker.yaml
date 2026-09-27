@@ -117,12 +117,28 @@ spec:
               for dir in $CACHE_DIRS; do
                 mkdir -p "$dir/_oci"
                 chmod 0755 "$dir" "$dir/_oci" 2>/dev/null || true
-                chown -R 65534:65534 "$dir" 2>/dev/null ||
-                echo "image-cache-init: chown refused ($dir, NFS root_squash?) -- verifying the owner instead"
+                # 只动这个 init 真正负责的东西：顶层目录**非递归** chown（65534 的
+                # worker 要在它下面建锁文件与 staging 树），`_oci/`（控制面写进来的
+                # tar）**递归** chown。
+                #
+                # ⚠ 绝不 `chown -R "$dir"`：`$dir/secrets/<sandbox_id>/<name>.secret`
+                # 是**在跑沙箱自己的 0600 文件**（属主是那个沙箱的池 uid，hand-over
+                # 见 envd_service/executors/sandlock.py 与 factory.py:236）。这个 init
+                # 原来在 worker pod 里（worker 重启 ⇒ 沙箱必然重启，抢属主无所谓），
+                # 搬到 DaemonSet 之后就是"broker 滚动 ⇒ 在跑沙箱的 secret 被抢回
+                # 65534"——而文档明确的升级步骤就会滚 broker。secrets/ 是沙箱 uid 的
+                # 账，这里只**点名跳过**，绝不进入。
+                chown 65534:65534 "$dir" 2>/dev/null ||
+                  echo "image-cache-init: chown refused ($dir, NFS root_squash?) -- verifying the owner instead"
+                chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||
+                  echo "image-cache-init: chown refused ($dir/_oci, NFS root_squash?) -- verifying the owner instead"
+                if [ -d "$dir/secrets" ]; then
+                  echo "image-cache-init: skipping $dir/secrets (per-sandbox secret files belong to their sandbox uid, not 65534)"
+                fi
                 owner="$(stat -c %u "$dir")"
                 if [ "$owner" != "65534" ]; then
                   echo "image-cache-init: FATAL: $dir is owned by uid $owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
-                  echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown -R 65534:65534 $dir" >&2
+                  echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $dir && chown -R 65534:65534 $dir/_oci" >&2
                   exit 1
                 fi
                 echo "image-cache-init: $dir is owned by uid 65534"

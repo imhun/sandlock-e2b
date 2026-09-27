@@ -49,6 +49,17 @@ fi
 
 printf '%s\n' "$rendered" | kubectl apply -f -
 
+# --- rollout 闸门：先 broker，后 worker（顺序不能反）------------------------
+# broker（`ds/e2b-priv-broker`，socket 上的 C 侧协议）与 worker（`sts/e2b-worker`，
+# Python 侧的握手/白名单）是**一个镜像契约**的两半：新 Python 撞旧 daemon 会在 hello
+# 握手期因缺 `peer_gid` 拒绝服务（socket 形态没有回落路径，fail closed），所以升级顺序
+# 永远是"先 broker，后 worker"（docs/k8s-deployment.md §2「镜像与升级」与 §24）。
+# 两个都等完再往下；只等 worker 的话，这道闸门可能在一个从未收敛的 broker 上放行。
+echo "等待 broker DaemonSet 滚动完成" >&2
+kubectl -n "$NAMESPACE" rollout status ds/e2b-priv-broker --timeout=300s
+echo "等待 worker 滚动完成" >&2
+kubectl -n "$NAMESPACE" rollout status statefulset/e2b-worker --timeout=300s
+
 # --- rollout 之后预热 base image（N25 / §22.5.10 那条运维事实）---------------
 # 一次滚动重启可以打断正在进行的解包，缓存目录里只剩 `…sha256_….lock`（没有实体
 # 目录）；此时该节点的 `Sandbox.create()` 回 **428 warm_required** —— 而 e2b SDK
@@ -61,9 +72,6 @@ if [ "${SKIP_WARM:-0}" = "1" ]; then
 fi
 
 [ -f "$WARM_HELPER" ] || { echo "缺少 $WARM_HELPER" >&2; exit 1; }
-
-echo "等待 worker 滚动完成" >&2
-kubectl -n "$NAMESPACE" rollout status statefulset/e2b-worker --timeout=300s
 
 image="$(kubectl -n "$NAMESPACE" get statefulset e2b-worker \
     -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="E2B_BASE_IMAGE")].value}')"

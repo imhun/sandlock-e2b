@@ -404,6 +404,10 @@ spec:
             # docs/k8s-deployment.md §13), so no per-pod segments are needed --
             # but the flock above is only real if the storage's locks cross
             # nodes (NFSv4; NFSv3 + `nolock` is single-node only).
+            #
+            # ⚠ 改池（在这里补上 E2B_UID_POOL_START/SIZE，或改代码默认）必须**同时**改
+            # broker DaemonSet（deploy/k8s/priv-broker.yaml）里同名的那一对 env：池是启动
+            # 握手的一部分，两侧不一致时 worker 直接拒服并点名（设计如此，见该文件头）。
             - name: E2B_BASE_IMAGE
               # Keep in step with control-plane.yaml (same digest-pinned ACR
               # mirror; Docker Hub is unreachable from the deployment hosts).

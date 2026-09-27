@@ -110,11 +110,14 @@ kubectl -n sandlock scale statefulset/e2b-worker --replicas=2
 ```
 
 它做的是**递归 `chown 65534:65534`，只改属主**：不改权限位、不删东西、不拷内容。范围是一张显式
-的路径计划（`<export>` 下的 `state`、`_migrate`、`_images`、`_secrets`、`_snapshots`、
-`_templates`、`_builds` 七条），**绝不进入 `<export>/workspaces/**`** —— 那些树属于池 uid，
-不是 worker 的；计划里任何一条落在它下面（包括用 `..` 或符号链接绕过去的拼写）脚本一律拒绝
-并点名。硬性质由 `tests/unit/test_state_owner_migrate.py` 逐条钉住。步骤、回退与判据的正文
-见 `docs/k8s-deployment.md` §24。
+的路径计划（`<export>` 下的 `state`、`workspaces/_migrate`、`_images`、`_secrets`、
+`_snapshots`、`_templates`、`_builds` 七条）—— **树根下只放行 `workspaces/_migrate` 那一
+条**（N27 之后控制面的迁移暂存就在树根之下；工具曾在 export 根上找 `_migrate`，真机上因此
+恒 MISSING，2026-09-27 修正），其余 `<export>/workspaces/**` **绝不进入** —— 那些树属于池
+uid，不是 worker 的；计划里任何一条落在它下面（包括 `workspaces` 本身、它的兄弟、用 `..`
+或符号链接绕过去的拼写）脚本一律拒绝并点名。硬性质由
+`tests/unit/test_state_owner_migrate.py` 逐条钉住。步骤、回退与判据的正文见
+`docs/k8s-deployment.md` §24。
 
 ## CNI 必须建集群时定：这套集群用 Calico VXLAN
 

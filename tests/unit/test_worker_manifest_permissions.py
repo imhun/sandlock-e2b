@@ -49,6 +49,11 @@ K8S_WORKER = (REPO / "deploy" / "k8s" / "worker.yaml").read_text(encoding="utf-8
 # the worker pod may not hold that root itself -- on any filesystem, not just
 # the NAS the k0s overlay happens to carry (see the file's own header).
 PRIV_BROKER = (REPO / "deploy" / "k8s" / "priv-broker.yaml").read_text(encoding="utf-8")
+# The k0s render-and-apply driver. It is the one place that walks a whole
+# upgrade for the operator, so its rollout gates are part of the C1 contract
+# between the broker (C) and the worker (Python) -- see
+# ``test_apply_waits_for_the_broker_daemonset_before_the_worker``.
+APPLY_SH_PATH = REPO / "deploy" / "k8s-k0s" / "apply.sh"
 K8S_CONTROL_PLANE = (REPO / "deploy" / "k8s" / "control-plane.yaml").read_text(
     encoding="utf-8"
 )
@@ -1026,6 +1031,91 @@ def test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identit
         "chmod 0710 /run/e2b-broker",
     ):
         assert expected in socket_lines, expected
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_the_image_cache_init_never_rechowns_the_per_sandbox_secrets() -> None:
+    """C1 final review: the cache init must not ``chown -R`` the whole cache dir.
+
+    ``image-cache-init`` used to be the *worker* pod's init, where a rolling
+    restart meant the sandboxes on that pod restarted too -- so a recursive
+    ``chown -R 65534:65534 "$dir"`` was harmless bookkeeping. It now runs in the
+    broker DaemonSet, and ``CACHE_DIRS`` includes ``/var/lib/e2b-images``, whose
+    ``secrets/<sandbox_id>/<name>.secret`` files are handed to the *sandbox's*
+    pooled uid (0600) by the executor (``envd_service/executors/sandlock.py``,
+    ``factory.py``). A whole-tree recursive chown would take those files back to
+    65534 on **every broker rollout** -- and the documented upgrade step rolls
+    the broker -- leaving running sandboxes unable to read their own secrets.
+
+    So the init owns exactly what it is responsible for: the top-level
+    directory (non-recursive, so the 65534 worker can create its lock files and
+    staging trees) and ``_oci/`` recursively (the tars the control plane writes
+    there). The recursive form on ``$dir`` is the regression, and ``secrets``
+    is skipped by name so the next reader does not "tidy" it back in.
+
+    Read off the rendered DaemonSet (not the file text): the same command
+    shape's siblings live in other manifests.
+    """
+    rendered = subprocess.run(
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    broker = _rendered_workload(rendered, "DaemonSet", "e2b-priv-broker")
+    init = {
+        c["name"]: c
+        for c in broker["spec"]["template"]["spec"]["initContainers"]
+    }["image-cache-init"]
+    lines = [line.strip() for line in init["command"][2].splitlines()]
+    # The two chowns it *is* responsible for, each pinned exactly.
+    assert 'chown 65534:65534 "$dir" 2>/dev/null ||' in lines
+    assert 'chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||' in lines
+    # ...and the one line that must never come back: the whole-tree recursion.
+    assert 'chown -R 65534:65534 "$dir" 2>/dev/null ||' not in lines
+    assert [
+        line for line in lines if line.startswith('chown -R 65534:65534 "$dir')
+    ] == ['chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||']
+    # The exclusion is said out loud (the pin is "the script names secrets",
+    # not merely "it happens not to touch them today").
+    assert [line for line in lines if "$dir/secrets" in line] != []
+    assert 'if [ -d "$dir/secrets" ]; then' in lines
+
+
+def test_apply_waits_for_the_broker_daemonset_before_the_worker() -> None:
+    """C1: the upgrade gate is ordered broker-then-worker, by line number.
+
+    ``docs/k8s-deployment.md`` §2 and §24 both say a broker-and-worker upgrade
+    is one image contract and always runs broker first: the new Python asserts
+    the daemon's ``peer_gid``/roots in the ``hello`` handshake and refuses to
+    serve otherwise (there is no fallback in socket mode). ``apply.sh`` applied
+    the whole render and only waited on ``statefulset/e2b-worker``, so a
+    rollout could pass this gate with a broker that had never converged.
+
+    A line-number comparison, not a substring test: both commands exist today,
+    and what the contract fixes is their order.
+    """
+    lines = [
+        line.strip() for line in APPLY_SH_PATH.read_text(encoding="utf-8").splitlines()
+    ]
+    apply_line = next(
+        index
+        for index, line in enumerate(lines)
+        if line == 'printf \'%s\\n\' "$rendered" | kubectl apply -f -'
+    )
+    broker = [
+        index
+        for index, line in enumerate(lines)
+        if "rollout status ds/e2b-priv-broker" in line
+    ]
+    worker = [
+        index
+        for index, line in enumerate(lines)
+        if "rollout status statefulset/e2b-worker" in line
+    ]
+    assert len(broker) == 1, lines
+    assert len(worker) == 1, lines
+    assert apply_line < broker[0] < worker[0]
 
 
 @pytest.mark.parametrize("manifests", ["deploy/k8s", "deploy/k8s-k0s"])

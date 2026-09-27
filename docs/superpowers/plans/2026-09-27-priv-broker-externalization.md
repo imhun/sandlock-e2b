@@ -146,7 +146,7 @@
 
 **Files:** Create `deploy/k8s-k0s/state-owner-migrate.yaml`（仿 `state-base-migrate.yaml`：`runAsUser: 0`、`backoffLimit: 0`、占位符 fail-closed）；Create `deploy/scripts/migrate-state-owner.sh`。
 
-**要点**：worker 缩 0 → 对 `<export>/state/**`、`<export>/_migrate`、`<export>/_images`、`<export>/_secrets`、`<export>/_snapshots`、`<export>/_templates`、`<export>/_builds` 递归 `chown 65534:65534`，**绝不进入 `workspaces/<id>`**（那是池 uid 的树，脚本里用显式白名单 + 断言拒绝）。跑完 `stat` 留证。
+**要点**：worker 缩 0 → 对 `<export>/state/**`、`<export>/workspaces/_migrate`、`<export>/_images`、`<export>/_secrets`、`<export>/_snapshots`、`<export>/_templates`、`<export>/_builds` 递归 `chown 65534:65534`，**树根下只放行 `workspaces/_migrate` 那一条确切条目，其余 `workspaces/**`（含 `workspaces` 本身、兄弟、`..` 与符号链接变体）一律拒绝**（那是池 uid 的树，脚本里用精确白名单 + 断言拒绝）。跑完 `stat` 留证。
 
 **验收**：迁移后 `ls -ld <export>/state` 属主 65534；树的属主仍是池 uid（`stat` 前后对比）。
 
@@ -179,16 +179,16 @@ kubectl -n sandlock exec e2b-worker-0 -- sh -c 'stat -c "%a %u %g %n" /var/lib/e
 
 | # | 条目 | 出处 | 处置 |
 |---|---|---|---|
-| 1 | `ok` 必须是 bool 的守卫没有测试（改 `if False:` 套件仍全绿） | 终审二评 Minor 1 | 补一条用例：fake daemon 回 `{"v":1,"ok":"yes","exit":0}` → 期望 `PrivHelperError` |
-| 2 | `timeout_s` 的杀进程路径无用例（唯一兜住 runaway `walk` 的边界，而 `walk` 是配额记账常驻路径） | 终审 Important 4 的剩余 | ~70 万条目 / 造树 ~26s / walk ~1.3s，`timeout_s=1` → `ok:false … killed with SIGKILL`；把 ~30s lane 成本写进验收说明 |
-| 3 | `read_request` 无读截止（现由 `PRIV_MAX_HANDLERS=32` 兜着） | T1 复审 Minor | wave 2 给 handler 加请求读截止 |
-| 4 | 拒绝路径 50ms/连接的 accept 节流 | T1 复审 Minor | wave 2 可选：先 `recv(MSG_DONTWAIT)` 再决定是否 poll |
-| 5 | `_read_broker_line` 无长度上限 + 转义 6× 放大（256 MiB 算的是未转义字节） | T2 终审 Minor | wave 2：把转义后字节数也计入 cap，或给 worker 侧读取设上限 |
-| 6 | `_build_helpers` 对 socket 形态不要求"二进制存在"，而 `e2b-slot-spawn` 两种 transport 都要本地 | T2 复审 Minor | wave 2：一行 `if not slot.exists(): raise` |
-| 7 | 契约测试 fixture 覆盖镜像内 `/var/lib/e2b-priv/e2b-maint`（硬杀不还原；Linux root 开发机会写到宿主） | T1 复审 Minor | wave 2：加 `euid != 0` 显式报错（**不要**加 skip） |
-| 8 | `E2B_BROKER_WORKER_UID/GID` 在**直接 exec** 形态下可被调用方环境污染（可达者本就能 exec 带 cap 的 broker） | 终审残留 | wave 2 文档写明：worker pod 不得设置这两个变量 |
-| 9 | secret 侧：多条目失败不回滚 / `open()`→`chmod()` umask 窗口（**预先存在**）/ reclaim 依赖 worker 建的 `<secrets>/<id>` 非 sticky | T3 三评 Minor | 永久记录；真机验收时确认 `<secrets>/<sandbox_id>` 由 worker 创建且非 sticky |
-| 10 | SIGPIPE 回归测试含时序成分；harness 逐字节断言只对纯 ASCII 载荷成立；`SIG_IGN` 让直连 verb 的断管退出码 141→77 | T1 三评 Minor | 永久记录；wave 2 文档提一句退出码变化 |
+| 1 | `ok` 必须是 bool 的守卫没有测试（改 `if False:` 套件仍全绿） | 终审二评 Minor 1 | ✅ 已覆盖：`tests/unit/test_priv_broker_protocol.py::test_socket_transport_rejects_an_ok_that_is_not_a_boolean`（`{"v":1,"ok":"yes","exit":0}` → `PrivHelperError`） |
+| 2 | `timeout_s` 的杀进程路径无用例（唯一兜住 runaway `walk` 的边界，而 `walk` 是配额记账常驻路径） | 终审 Important 4 的剩余 | ✅ 已覆盖（2026-09-27 本轮补齐）：`tests/contract/test_broker_socket_c.py::test_a_walk_that_outlives_the_budget_is_killed_and_the_daemon_survives` —— 硬链接农场 60 万条目 / 200 字节名字，实测（arm64 dev 机、`e2b-sandlock-test` 容器、overlayfs）造树 ~19s、完整 walk ~3.3s、被杀的请求 1s（预算 1s，余量 >3×）；断言 `ok:false` + `timed out … SIGKILL`、daemon 存活、随后 hello 成功。单条用例 **22.8s**（lane 上限 30s），规模与成本写在 docstring 里 |
+| 3 | `read_request` 无读截止（现由 `PRIV_MAX_HANDLERS=32` 兜着） | T1 复审 Minor | ✅ 已覆盖：`maint.c` 的 `request_read_ms`（`E2B_BROKER_REQUEST_READ_MS`）+ `test_a_silent_peer_is_refused_and_the_broker_keeps_serving` / `test_serve_refuses_an_unusable_request_read_deadline` |
+| 4 | 拒绝路径 50ms/连接的 accept 节流 | T1 复审 Minor | ✅ 已覆盖：先 `recv(MSG_DONTWAIT)` 再决定是否 poll（`maint.c`）；拒绝路径的成本由 `test_serve_refuses_connections_over_the_handler_cap` / `test_a_peer_that_hangs_up_cannot_take_the_broker_down` 压住 |
+| 5 | `_read_broker_line` 无长度上限 + 转义 6× 放大（256 MiB 算的是未转义字节） | T2 终审 Minor | ✅ 已覆盖：worker 侧读取设了上限，转义后的字节也计入（`envd_service/priv_helpers.py::_read_broker_line`）+ `test_socket_transport_refuses_an_answer_over_the_read_limit` |
+| 6 | `_build_helpers` 对 socket 形态不要求"二进制存在"，而 `e2b-slot-spawn` 两种 transport 都要本地 | T2 复审 Minor | ✅ 已覆盖：`resolve_priv_helpers` 的 socket 分支要求本地 `e2b-slot-spawn` 存在，缺了就点名拒绝 + `test_socket_transport_still_needs_the_local_slot_spawn` |
+| 7 | 契约测试 fixture 覆盖镜像内 `/var/lib/e2b-priv/e2b-maint`（硬杀不还原；Linux root 开发机会写到宿主） | T1 复审 Minor | ✅ 已覆盖：`_require_disposable_container()` 在 `euid != 0` 或不在一次性容器里时显式 `RuntimeError`（**不是** skip） |
+| 8 | `E2B_BROKER_WORKER_UID/GID` 在**直接 exec** 形态下可被调用方环境污染（可达者本就能 exec 带 cap 的 broker） | 终审残留 | ✅ 已覆盖：`deploy/k8s/priv-broker.yaml` 的 `E2B_BROKER_PEER_UID/GID` 注释写明 "worker pod 侧**不得**设置 `E2B_BROKER_WORKER_UID/GID`"（它们是每次连接由 `SO_PEERCRED` 得出的结论，不是可配输入） |
+| 9 | secret 侧：多条目失败不回滚 / `open()`→`chmod()` umask 窗口（**预先存在**）/ reclaim 依赖 worker 建的 `<secrets>/<id>` 非 sticky | T3 三评 Minor | 永久记录（本轮不动代码）：真机验收（Task 8）时确认 `<secrets>/<sandbox_id>` 由 worker 创建且非 sticky |
+| 10 | SIGPIPE 回归测试含时序成分；harness 逐字节断言只对纯 ASCII 载荷成立；`SIG_IGN` 让直连 verb 的断管退出码 141→77 | T1 三评 Minor | 永久记录（本轮不动代码）：`141 → 77` 只影响"直连 verb 的调用方，在对端挂断时看到的退出码"，协议两侧都不读它（socket 形态由 daemon 自己收尾）；测试的时序成分已被 `test_a_peer_that_hangs_up_cannot_take_the_broker_down` 的轮询收口 |
 
 **上线顺序（终审要求写进 Task 4/5 文档）**：先 apply **DaemonSet（新 C）**，再上**新 worker 镜像**——新 Python + 旧 daemon 会在握手期因缺 `peer_gid` fail closed（设计如此），而旧 Python + 新 daemon 向前兼容。
 

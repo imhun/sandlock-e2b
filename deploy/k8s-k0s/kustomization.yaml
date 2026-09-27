@@ -8,7 +8,7 @@
 #      这里用阿里云 NAS 的静态 NFS PV 落实它。
 #
 # 用法（先 kubectl -n sandlock create secret，见 README）：
-#   kubectl kustomize deploy/k8s/selfhosted | kubectl apply -f -
+#   kubectl kustomize deploy/k8s-k0s | kubectl apply -f -
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
