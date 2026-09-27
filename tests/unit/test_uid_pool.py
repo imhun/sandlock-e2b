@@ -214,6 +214,66 @@ def test_registry_persists_host_uid(tmp_path):
     assert loaded.host_uid == POOL_START
 
 
+def test_a_uid_is_not_lost_while_the_registry_record_is_rewritten(
+    tmp_path, publish_spy
+):
+    """Two workers share the workspace: one writes the record, one allocates.
+
+    ``uid_pool._recorded_uid`` answers "which host uid does this sandbox
+    hold?" from ``_runtime/<id>/sandbox.json``, and it reads an unparsable
+    file as *no record* (``JSONDecodeError`` -> ``None``). ``_recorded_uids``
+    then builds "this uid is already taken" out of exactly that answer, so a
+    worker whose allocator catches a peer's record mid-rewrite can hand the
+    same host uid to a second sandbox -- E3.2's per-sandbox isolation gone
+    for as long as the window is open, and only visible as two sandboxes that
+    can read each other's files.
+    """
+    (tmp_path / "sbx_a").mkdir()
+    registry = RuntimeRegistry(tmp_path)
+    registry.register(
+        sandbox_id="sbx_a",
+        access_token="token-a",
+        workspace_dir=str(tmp_path / "sbx_a"),
+        host_uid=POOL_START,
+    )
+    record_path = tmp_path / "_runtime" / "sbx_a" / "sandbox.json"
+    assert uid_pool._recorded_uid(tmp_path, "sbx_a") == POOL_START
+    publish_spy.reset()
+
+    with publish_spy.hold_next_publish() as in_window:
+        writer = threading.Thread(
+            target=registry.register,
+            kwargs=dict(
+                sandbox_id="sbx_a",
+                access_token="token-b",
+                workspace_dir=str(tmp_path / "sbx_a"),
+                host_uid=POOL_START + 1,
+            ),
+            daemon=True,
+        )
+        writer.start()
+        publish_spy.await_publish(in_window, "a runtime record")
+        # The allocator on the *other* worker, standing in the window: it has
+        # to still see sbx_a's uid as taken (and as the one it was told).
+        assert uid_pool._recorded_uid(tmp_path, "sbx_a") == POOL_START
+        assert uid_pool._recorded_uids(tmp_path, POOL_START, POOL_SIZE) == {
+            POOL_START
+        }
+    writer.join(timeout=10)
+    assert not writer.is_alive()
+    assert uid_pool._recorded_uid(tmp_path, "sbx_a") == POOL_START + 1
+    assert uid_pool._recorded_uids(tmp_path, POOL_START, POOL_SIZE) == {
+        POOL_START + 1
+    }
+
+    # And why that window is a *silent* failure rather than a degraded mode:
+    # half a document is indistinguishable from "sbx_a holds no uid", so the
+    # allocator would report the uid as free.
+    record_path.write_text('{"sandbox_id": "sbx_a", "host_uid": 10', encoding="utf-8")
+    assert uid_pool._recorded_uid(tmp_path, "sbx_a") is None
+    assert uid_pool._recorded_uids(tmp_path, POOL_START, POOL_SIZE) == set()
+
+
 @pytest.mark.skipif(os.geteuid() != 0, reason="chown requires root")
 def test_apply_sandbox_ownership_chowns_tree_and_tightens_dir(tmp_path):
     ws = tmp_path / "ws"

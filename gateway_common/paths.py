@@ -1,10 +1,13 @@
-"""Path safety helpers shared by both services."""
+"""Path safety -- and shared-record publishing -- for both services."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
+from contextlib import suppress
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 
 def resolve_under_root(root: str | Path, user_path: str) -> Path:
@@ -408,3 +411,51 @@ def safe_join(root: str | Path, *parts: str) -> Path:
     for part in parts:
         path = path.joinpath(part)
     return path.resolve(strict=False)
+
+
+def write_text_atomically(path: str | Path, text: str) -> None:
+    """Publish ``text`` at ``path`` so a reader never sees half a file.
+
+    Every record under the shared volume is read by a *different process*
+    while it is written -- the other control-plane replica
+    (``control_plane/registry/``: builds, templates, snapshots, volumes,
+    secrets) and the other worker (``envd_service/runtime/registry.py``).
+    ``Path.write_text`` truncates the target and then writes it, so a reader
+    arriving in that window reads an empty or half-written document: for a
+    template build that was ``404 Template build … not found`` on a build that
+    was running fine (measured on k0s 2026-09-26, and the e2b SDK does not
+    retry), and for a sandbox record it is the uid pool handing one host uid
+    out twice -- E3.2's per-sandbox isolation, gone silently, because
+    ``uid_pool._recorded_uid`` reads an unparsable record as "no record".
+
+    Writing a sibling file and renaming it over the target makes the update
+    appear in one step: a reader sees the previous complete document or the
+    new one, never a mixture. The staged file is a sibling on purpose -- the
+    rename has to stay inside one filesystem to be atomic -- and it is created
+    ``0o666 & ~umask`` (what a plain ``write_text`` produces) rather than
+    ``mkstemp``'s ``0o600``, so who may read the published file does not
+    change. A failure leaves the target as it was and no partial file behind.
+    """
+    path = Path(path)
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    staged = directory / f".{path.name}.{os.urandom(8).hex()}.tmp"
+    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            # Commit the bytes before publishing the name: on the shared NFS
+            # volume another node must never open the new name and find the
+            # write still in flight.
+            os.fsync(handle.fileno())
+        os.replace(staged, path)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(staged)
+        raise
+
+
+def write_json_atomically(path: str | Path, payload: Any) -> None:
+    """``write_text_atomically`` for the JSON records they all are."""
+    write_text_atomically(path, json.dumps(payload, separators=(",", ":")))

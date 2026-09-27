@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from gateway_common.ids import sandbox_id
+from gateway_common.paths import write_json_atomically
 from gateway_common.timeutil import to_iso_z, utcnow
 
 logger = logging.getLogger(__name__)
@@ -256,11 +257,10 @@ class SecretRegistry:
         payload = record.to_storage_dict(encrypt=encrypt)
         path = self._record_path(record.secret_id)
         if path is not None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(payload, separators=(",", ":")),
-                encoding="utf-8",
-            )
+            # Atomic: ``_scan_disk`` parses every record on the shared volume
+            # when a lookup misses, and the replica scanning may be the one
+            # that is not writing.
+            write_json_atomically(path, payload)
         if self._redis is not None and self._fernet is not None:
             self._redis.set(
                 self._redis_key(record.secret_id),

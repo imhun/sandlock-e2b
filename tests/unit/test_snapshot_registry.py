@@ -9,7 +9,9 @@ copies so a snapshot never carries the registry store into itself.
 
 from __future__ import annotations
 
+import json
 import shutil
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -174,3 +176,43 @@ def test_the_local_async_payload_copy_is_a_no_op_when_it_is_already_there(tmp_pa
         _copy_local_payload(
             SimpleNamespace(snapshots=nested), workspace, "snap_self"
         )
+
+
+def test_a_snapshot_record_is_published_in_one_step(tmp_path, publish_spy):
+    """The ``creating`` record is the half another replica polls from (F11.3).
+
+    ``get()`` re-reads a ``creating`` record from the shared volume on purpose
+    -- its owner flips it when the bytes are in -- so the copy going the other
+    way is a reader of the file being rewritten. In the write window it has to
+    find the previous *whole* record: half a file only raises, and that raise
+    is a pole answering "no such snapshot" about one that is being copied
+    right now.
+    """
+    base = tmp_path / "control"
+    registry = SnapshotRegistry(base)
+    record = registry.reserve_from_sandbox(
+        template_id="base",
+        env_vars={},
+        metadata={},
+        volume_mounts=[],
+        base_image=None,
+        allow_internet_access=False,
+        source_sandbox_id=None,
+        snapshot_id="snap_00000000000000ff",
+    )
+    record_path = registry._snapshot_dir(record.snapshot_id) / "snapshot.json"
+    publish_spy.reset()
+
+    with publish_spy.hold_next_publish() as in_window:
+        writer = threading.Thread(
+            target=registry.mark_completed, args=(record.snapshot_id,), daemon=True
+        )
+        writer.start()
+        publish_spy.await_publish(in_window, "a snapshot record")
+        on_disk = json.loads(record_path.read_text(encoding="utf-8"))
+        assert on_disk["status"] == "creating"
+        assert SnapshotRegistry(base).get(record.snapshot_id).status == "creating"
+    writer.join(timeout=10)
+    assert not writer.is_alive()
+
+    assert SnapshotRegistry(base).get(record.snapshot_id).status == "completed"
