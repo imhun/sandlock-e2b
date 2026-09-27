@@ -126,23 +126,47 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（2026-09-25 实测，改部署前先复核）
+## 7. 当前部署状态（2026-09-27 实测，改部署前先复核；最近一次发版记录见 §12）
 
-**版本**：`0.1.0-495-gcbe55df-20260925-100509`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的）。
+**版本**：`0.1.0-652-g43fb88a-20260927-102733`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的）。
+2026-09-27 实测：`autoscaler` / `control-plane` / `e2b-worker` 三个工作负载的镜像都是这一版。
 
-> 本节其余内容记的是**这一版**（0.1.0-495）的实测状态。之后又上了两版：§9（checkpoint/restore，
-> `0.1.0-525`）、§10（空闲判定 CPU 采样，`0.1.0-527`）。**"现在跑的是哪一版"永远以
-> `deploy/stack/.version` + 集群里 `autoscaler/control-plane/e2b-worker` 三个工作负载的
-> 实际镜像为准**（两边必须一致），别引用本文任何一节里写死的版本号。
+**pod（2026-09-27 实测）**：`control-plane` 两个副本各 `2/2`（控制面 + gateway，F11 多副本已上线）、
+`autoscaler` `1/1`、`e2b-worker-0/1` 各 `1/1`（分别落在 `.80.94` / `.80.140`）、`redis` `1/1`、
+`seccomp-installer` `2/2`（一节点一个）。节点仍是 2 台 arm64 / `v1.36.4+k0s`。
+
+> **"现在跑的是哪一版"永远以 `deploy/stack/.version` + 集群里 `autoscaler/control-plane/e2b-worker`
+> 三个工作负载的实际镜像为准**（两边必须一致），别引用本文任何一节里写死的版本号。本节记的是
+> **2026-09-27** 的实测状态；§9/§10/§11 是**历史上线记录**（各自写的是那一版当天的验收），
+> §12 是最近一次发版（2026-09-27）的验收记录。
+
+**2026-09-27 实测的形态开关**（`sts/e2b-worker` 的 env；`e2b-worker-0` 运行中容器的 `env` 与之一致）：
+
+| 变量 | 值 | 是什么 |
+|---|---|---|
+| `E2B_WORKSPACE_BASE` | `/var/lib/e2b-sandboxes/workspaces` | 树根（N27 下沉一级后的位置） |
+| `E2B_STATE_BASE` | `/var/lib/e2b-sandboxes/state` | 平台状态（N27：树的同挂载兄弟，沙箱看不到） |
+| `E2B_ROUTE_B_TMP_ROOT` | `/var/lib/e2b-sandboxes/state/.route-b` | route-B 槽位临时根（随 N27 挪进 state） |
+| `E2B_REAL_ROOT` | `1` | 真根（N35/N14 已上线） |
+| `E2B_PID_NS` | `true` | 每沙箱独立 pid ns（N45） |
+| `E2B_ENABLE_NET_ISOLATION` | `true` | 每沙箱 netns + fd 注入 connect |
+| `E2B_ENABLE_NETWORK` | `true` | 通配/字面 `allowOut` 生效（N42） |
+| `E2B_PAUSE_CHECKPOINT` | `1` | pause 先写 checkpoint 图再冻结 |
+| `E2B_PLATFORM_DISK_MB` | `8192` | checkpoint 图的平台账上限 |
+| `E2B_BASE_IMAGE` | `…python-mcp:3.14@sha256:3675662d…` | MCP-capable 基镜像（digest 固定，见 §12） |
+
+`E2B_PURE_ROOTFS` **未设** ⇒ 走代码默认 `off`（pure 部署时是 identity 形态；生产是 image-rootfs，
+不受它影响）。
 
 **别把 `python-mcp:3.14` 当稳定引用**：`deploy/docker/Dockerfile.mcp-base` 用的是
 `pip install --no-cache-dir mcp uvicorn`，**没有钉版本**，所以每次重建它都可能产出不同内容 ——
-2026-09-25 这次重建后该 tag 指向 `sha256:e91b0ae2…`，而集群的 `E2B_BASE_IMAGE` 钉的仍是
-`sha256:3675662d…`（**刻意保留**：这一轮只改"真根"一件事，不同时动沙箱基底；旧 digest 依旧
-可解析，push 之后 worker 还成功预热过它）。**换基准镜像时按 digest 换，不要按 tag 换**，
-否则会静默换掉所有沙箱的基底。
+2026-09-27 这次发版重建后该 mirror tag 指向 `sha256:4474e78f…`，而集群与其它清单里钉的
+`E2B_BASE_IMAGE` 仍是 `sha256:3675662d…`（**刻意保留**：mirror tag 的 digest 变了**不代表**
+线上基镜像换了；旧 digest 依旧可解析，worker 还成功预热过它）。**换基准镜像时按 digest 换，
+不要按 tag 换**，否则会静默换掉所有沙箱的基底。（2026-09-25 那次重建同样把 tag 推成过
+`sha256:e91b0ae2…`，pin 同样没动；两个 digest 的对照见 §12。）
 
-**真根（N35/N14）已上线**（2026-09-25 单节点灰度 → 推广，两台 worker）：
+**真根（N35/N14）已上线**（2026-09-25 单节点灰度 → 推广，两台 worker；2026-09-27 仍在线上）：
 
 * worker 环境里有 `E2B_REAL_ROOT=1`，**写在 `deploy/k8s/worker.yaml`**（不是临时 patch）；
 * **整栈都在同一版本**（`autoscaler` / `control-plane` / `e2b-worker` 三个工作负载），
@@ -206,10 +230,13 @@ Calico VXLAN 只能建集群时定）见 `deploy/k8s-k0s/README.md`；集群层�
 
 ---
 
-## 9. checkpoint/restore 的上线记录（2026-09-25）
+## 9. checkpoint/restore 的上线记录（2026-09-25）—— 历史记录（该版本当天的验收）
+
+> **这是历史记录**：本节记的是 checkpoint/restore 上线当天的实测，**不是当前部署状态**
+> （当前版本与形态开关见 §7，最近一次发版见 §12）。本节末的复核行各自跟着当天的版本。
 
 **版本**：`0.1.0-525-g65ad183-20260925-212439`（= 当轮 `deploy/stack/.version`；**当前部署版本
-见 §11**，本节末的 2026-09-26 复核行给出重跑这条验收时的版本）。这一轮改了三样
+见 §7/§12**，本节末的 2026-09-26 复核行给出重跑这条验收时的版本）。这一轮改了三样
 东西，所以 rebuild 链条跑了两遍：E2B 侧代码（主仓 `9ddebc5`）、fork 的 `exclude_main`
 （fork `da0faf5`）、fork 的 restore-stub 随 wheel（fork `2d5f2e9`）。整栈同一版本，
 `kubectl diff` 只剩版本行 + worker 的两个新环境变量。
@@ -331,9 +358,12 @@ export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o json
 （镜像推 ACR，层缓存命中时 1 分钟）→ `KUBECONFIG=... deploy/k8s-k0s/apply.sh`（滚两台 worker +
 预热 base image，约 3–5 分钟）。
 
-## 10. 空闲判定补采样（CPU）的上线记录（2026-09-25）
+## 10. 空闲判定补采样（CPU）的上线记录（2026-09-25）—— 历史记录（该版本当天的验收）
 
-**版本**：`0.1.0-527-g946daa9-20260925-215057`（= `deploy/stack/.version`），整栈同一版本
+> **这是历史记录**：本节记的是 CPU 采样上线当天的实测，**不是当前部署状态**
+> （当前版本与形态开关见 §7，最近一次发版见 §12）。
+
+**版本**：`0.1.0-527-g946daa9-20260925-215057`（= **当轮** `deploy/stack/.version`），整栈同一版本
 （`kubectl diff` 只剩版本行）。这一轮**只改 worker 侧代码**（主仓 `946daa9`：新模块
 `envd_service/runtime/cpu_activity.py` + `agent.py` 里一条独立采样循环），fork 没动 ⇒ 链条
 只有 **镜像 → `apply.sh`** 两跳（`build-sandlock-wheels.sh` 不必跑）。**没有新环境变量**：
@@ -367,9 +397,14 @@ export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.d
 .venv/bin/python tmp/k0s/cpu_activity_acceptance.py
 ```
 
-## 11. N27（平台状态另起 `state base`）的上线记录与集群验收（2026-09-26）
+## 11. N27（平台状态另起 `state base`）的上线记录与集群验收（2026-09-26）—— 历史记录（该版本当天的验收）
 
-**版本**：`0.1.0-597-g3701a53-20260926-163057`（= `deploy/stack/.version`）。整栈同一版本 ——
+> **这是历史记录**：本节记的是 N27 上线当天的实测与集群验收，**不是当前部署状态**
+> （当前版本与形态开关见 §7，最近一次发版见 §12）。§11.4 里的 `tmp/k0s/...` 命令路径按
+> 本轮约定暂不改（搬运未完），改的是状态与事实。
+
+**版本**：`0.1.0-597-g3701a53-20260926-163057`（= **当轮** `deploy/stack/.version`；今天已不是，
+见 §7/§12）。整栈同一版本 ——
 `autoscaler` / `control-plane` / `e2b-worker` 三个工作负载的镜像都是这一版（实测）。布局（树根下沉一级、
 平台状态成为同挂载的兄弟目录）见 `docs/k8s-deployment.md` §23；迁移窗口的执行记录见
 `.superpowers/sdd/progress.md` 的「N27 迁移已执行 + 已上线」段（`done=12 unknown=0`、逐条
@@ -459,6 +494,9 @@ sh tmp/k0s/n27-t7-lane.sh python3 -u tmp/k0s/probe_state_base_visibility.py lane
 
 ## 12. 2026-09-27 发版：`0.1.0-652-g43fb88a-20260927-102733`
 
+> **当前部署状态的权威表在 §7**（版本、pod、形态开关都以 §7 为准）；本节只记这次发版当时
+> 做了什么、验收数字是多少。§7 与本节若有重复，以 §7 为准、到这里来查发版细节。
+
 **为什么发**：`main` 领先上一版（`0.1.0-597-g3701a53-20260926-163057`）**55 个提交**，其中三条只在
 镜像里生效，线上不滚就一直是旧行为：
 
@@ -484,7 +522,12 @@ deploy/k8s-k0s/apply.sh                                 # 渲染 + apply + 预�
   `python-mcp:3.14@sha256:3675662d…`（两个 worker 的 `peek` 都 `cached=true`、`warmed=skipped`）。
   ⚠️ 这次构建把 ACR 上的 **mirror tag** `byteplan/python-mcp:3.14` 重推成了新 digest
   `sha256:4474e78f…`；**清单里的 digest pin 没动**，所以线上仍跑原来那条 —— 别把"tag 的 digest 变了"
-  读成"线上基镜像换了"。
+  读成"线上基镜像换了"。**（2026-09-27 复核：pin 确实没动 —— `deploy/k8s/worker.yaml` 与
+  `deploy/k8s/control-plane.yaml` 的 `E2B_BASE_IMAGE` 仍是 `…python-mcp:3.14@sha256:3675662d…`，
+  `deploy/k8s*` 里只有这两处 `E2B_BASE_IMAGE` 声明、digest 一致；运行中的 `e2b-worker-0` 容器
+  `env` 也逐字相同。
+  mirror tag `byteplan/python-mcp:3.14` 当前在 ACR 上指向哪个 digest 需要 ACR 凭据才能复核，
+  本仓库内不复核 —— 但 pin 与线上都还是 `3675662d…` 这一条。）**
 * 上线后 `kubectl diff`（`DRY_RUN=1 apply.sh` 渲染的整栈 vs 线上）**0 行差异** ⇒ 仓库规格与线上一致。
 
 **验收（全部在 `0.1.0-652` 上跑）**

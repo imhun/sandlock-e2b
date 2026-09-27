@@ -53,12 +53,16 @@
   都是**验收脚本**的毛病（kubectl 通道死了伪装成"图没写"；计时器文件被 pause 冻在截断窗口里
   ⇒ 误报"计数消失"），已修并记录（`docs/checkpoint-restore-e2b-half.md` §6(j)）。
 
-### ⚠️ 部署状态（别搞错）
+### ⚠️ 部署状态（别搞错；2026-09-27 更新）
 
-**集群仍跑 `0.1.0-527-g946daa9`**（= `deploy/stack/.version`）。本轮 N15/F11 的改动**都没有
-上线**：fork 侧改了 wheel（`6f951d6`）⇒ 要上线必须走完整链条
-`deploy/scripts/build-sandlock-wheels.sh` → `build-and-push.sh` → `KUBECONFIG=... apply.sh`
-（中途重建过本地测试镜像 `e2b-sandlock-test:latest`）。集群上最后一次验收过的版本仍是 527。
+**上面那段写于 2026-09-25/26，当时集群还在 `0.1.0-527-g946daa9` —— 现在已经不是了。**
+2026-09-27 实测：集群跑 `0.1.0-652-g43fb88a-20260927-102733`（= `deploy/stack/.version`），
+`autoscaler` / `control-plane` / `e2b-worker` 三个工作负载同一版本。本节 N15/F11 的改动**早已
+上线**；此后又发了多版（checkpoint / CPU 采样 / N27 / N16 / N37 / N41 / N45 等，逐轮记录见
+`docs/deploy-clusters.md` §9–§12）。
+**"现在跑的是哪一版"永远以 `deploy/stack/.version` + 集群里三个工作负载的实际镜像为准**；
+本文件里任何写死的版本号（含下面那张验收表）都只是**当天的留档**。当前状态与逐轮上线记录见
+`docs/deploy-clusters.md` §7（当前状态）+ §12（最近一次发版）。
 
 ### 本轮的验收数字（下次拿它做对照）
 
@@ -71,6 +75,11 @@
 | F11 多副本等 9 个文件 | `tmp/k0s/x86-security-one.sh "" <log> <paths…>` | **80 passed** |
 | 本机 | `.venv/bin/python -m pytest tests/unit` / `tests/contract` | 16 条既有 macOS 红 / 1164 绿；contract 321 绿 / 53 skipped |
 
+> **2026-09-27 更新**：上表是 N15/F11 当天的两档数字，**已被后续多轮取代**。最新权威的形态
+> 数字在 `docs/pure-shape-decision.md` §7（gate A `2022` / gate B off `2015` / synth `2019` /
+> phase 2 `57`，四档全 `0 failed`）；最近一次发版预检是 `0.1.0-652` 上的 gate A
+> `2060 passed / 10 skipped / 3 xfailed`、gate B `2053 / 17 / 3`，见 `docs/deploy-clusters.md` §12。
+
 **工具坑（本轮踩到并修好）**：① `deploy/scripts/test-prod-shaped.sh` **跑不出 gate B** ——
 `-e E2B_BASE_IMAGE="${E2B_BASE_IMAGE:-…}"` 会把"已设但为空"变回默认镜像，所以 `tmp/k0s/gateB-full.sh`
 是它 phase 1 的复制品，只把这一处写成真正的空；② `E2B_TEST_STRICT_SKIPS=1` 把"runner 能力类"
@@ -78,14 +87,18 @@
 image 等）的跳过是允许的；③ 临时 runner：`tmp/k0s/x86-security-one.sh <base> <log> <pytest args…>`
 （单文件/单用例）、`tmp/k0s/x86-run-py.sh`（跑脚本）。
 
-### 还剩什么（都需要拍板，不是执行问题）
+### 还剩什么（都需要拍板，不是执行问题；2026-09-27 复核）
 
 | 项 | 需要什么 |
 |---|---|
-| **N27**（平台状态另起 BASE） | 你说过"独立排期"；随时能开工（落点已收口：`gateway_common/paths.py` 三个 helper + `E2B_STATE_BASE` + 迁移脚本，注意 EXDEV） |
-| **N14 的 S5**（退役模拟形态） | **要你先拍**"还保不保留 `E2B_REAL_ROOT=0` 的模拟形态"（lane 现在两态都跑） |
-| **FUP-28** | ✅ **已撤（2026-09-27）—— 这条不再需要你拍板**：三条前提齐（②两宿主机内核实测 EAGAIN，③产品路径 soak 带红→绿变异对照；证据 `.superpowers/sdd/debt-fup28-soak-report.md` / `debt-fup28-exec-shape-report.md` 与 fork 的 `docs/fork-plan-followups.md` FUP-28），`envd_service/runtime/image_resolver.py` 的 `_root_absolute_links` 与调用点已删、两条钉子同步调整、两档 lane 复跑 `0 failed` 且与基线相等或更好。报告 `.superpowers/sdd/debt-fup28-retire-the-rewrite-report.md` |
-| N36 / N30 / §10.5 / `Open` 桶 / O1–O3 复核 | 待决策（口径题） |
+| **`E2B_PURE_ROOTFS` 默认是否从 `off` 切到 `synth`** | 决定 pure 形态的**默认根**换不换。现状：默认 `off` = identity（无根）⇒ `../..`（= `<export>`）能列出 `state` / `_secrets` 的**名字**（内容仍 `EACCES`）；切到 `synth` 后每沙箱多一份骨架目录、**必须配 `E2B_REAL_ROOT=1`**、且依赖 worker seccomp 档已应用 ⇒ 该残差消失，代价与风险见 `docs/deploy-clusters.md` §11.2。生产是 image-rootfs、不受影响，受影响的只有 pure 部署。**本轮不擅自改默认值。** |
+| **checkpoint 计划 E6：`E2B_PAUSED_TTL_S` 默认值** | paused 沙箱要不要按 TTL 过期、多久（过期**摧毁用户状态**）。计划默认 **0 = 不启用**、今天**无实现**（全库 `rg 'E2B_PAUSED_TTL_S'` 仅命中计划）；只在拍板后才打开。口径见 `docs/superpowers/plans/2026-09-26-checkpoint-restore-productization.md` 决策点表 :103 + `.superpowers/sdd/checkpoint-e5-e8-audit-report.md` §1.4。 |
+| **checkpoint 计划 E7：超预算告警谁做** | 平台账 `used/budget` 已随心跳上报节点视图、**公开只读端点不带**、且**无告警**（`rg 'alert\|PrometheusRule' deploy/` 0 命中）⇒ 口径 = 软账 + 并发可超（已写进 `docs/checkpoint-restore-e2b-half.md` §6(k)）。告警是**本仓库加**还是**入口/监控侧加**需要拍板。 |
+
+> 旧表里那几条**已不在"待拍板"里**：N27 已上线（2026-09-26）、FUP-28 已撤（2026-09-27）、
+N36/N30/§10.5/O1–O3 各自收口（逐条见 `docs/open-issues.md`）；**N14 的 S5 那问法**（"还保不
+保留 `E2B_REAL_ROOT=0` 的模拟形态"）已变成上面第一行 —— pure 侧的默认根由 `E2B_PURE_ROOTFS`
+决定，N16 合成根（2026-09-26 落地）是它的前提。
 
 ## ⚡ 共享卷去 SYS_ADMIN（2026-09-11，A4–A7 收口 / backlog #25）
 
@@ -251,6 +264,12 @@ fix round 1 的原始记录（保留，供对照）：
   ⇒ 负载型 flake，留档 `tmp/a7-nosa-flake-multinode.log`。
 
 ### 5. 遗留（都不是本次要解决的）
+
+> **2026-09-27 更新**：下面这几条是**当时（2026-09-11）**的遗留，多数已不成立，保留作留档：
+> 「线上升级未做 / fork 未 push」早已完成（集群现在是 `0.1.0-652`，见顶部部署状态块）；
+> 「`test_volume_quota.py` 降级路径进不来」在**测试镜像**里已用 `xfsprogs` + loop XFS+prjquota
+> 解决（见「09-03 续」块），而**生产**上那条按 2026-09-27 的 O1 复核是 **NAS（nfs4）上结构上
+> 不可得**、不是配置漏项（`docs/open-issues.md` O1 行）。
 
 - **线上升级未做**：现网 worker 仍是旧 wheel（无 route-B 语言面）+ 两个 worker 的 uid 段
   重叠 ⇒ 升级顺序「先前面的镜像、后代码」与自检见下面「特权最小集实测 + 线上就绪审计」块。
@@ -1993,7 +2012,7 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
 
 | 分组 | 数量 | 为什么跳 | 怎么跑起来 |
 |---|---|---|---|
-| XFS project quota（`test_xfs_project_quota.py` / `test_volume_quota.py`） | 10 | 需要 `E2B_XFS_QUOTA_INTEGRATION=1` **且**工作目录在带 `prjquota` 的真实 XFS 上；容器根是 overlay，镜像里也没有 `xfs_quota`（日志里 `FileNotFoundError: 'xfs_quota'`） | 测试镜像装 `xfsprogs`，容器里 losetup 一个 XFS+prjquota 挂到 `/var/lib/e2b-sandboxes`（`docs/sandbox-disk-quota.md §4` 有步骤），再加 `-e E2B_XFS_QUOTA_INTEGRATION=1`；生产上就是运维项 O1 |
+| XFS project quota（`test_xfs_project_quota.py` / `test_volume_quota.py`） | 10 | 需要 `E2B_XFS_QUOTA_INTEGRATION=1` **且**工作目录在带 `prjquota` 的真实 XFS 上；容器根是 overlay，镜像里也没有 `xfs_quota`（日志里 `FileNotFoundError: 'xfs_quota'`） | 测试镜像装 `xfsprogs`，容器里 losetup 一个 XFS+prjquota 挂到 `/var/lib/e2b-sandboxes`（`docs/sandbox-disk-quota.md §4` 有步骤），再加 `-e E2B_XFS_QUOTA_INTEGRATION=1`；生产上就是运维项 O1。**（2026-09-27 复核，`docs/open-issues.md` O1：出厂集群的共享卷是阿里云 NAS / `nfs4`，XFS 项目配额结构上不可得 ⇒ 这 10 条在 fleet 上"无落点"、不是配置漏项；触发条件是换到支持项目配额的存储。）** |
 | netns 隔离形态（`test_mcp_netns.py`） | 3 | 显式门控：`E2B_TEST_NET_ISOLATION=1` + worker 侧 `E2B_ENABLE_NET_ISOLATION=true E2B_FD_INJECT_CONNECT=true`（默认关，因为运行时基线是无 netns 的无特权形态） | 按 `third_party/sandlock/docs/netns-isolation-fd-injection.md` 的那套开关跑一遍专用作业 |
 | 沙箱文件属主（T1 的两条：`test_sandlock_isolation::test_user_cli_install...`、`test_uid_permissions::test_volume_shared_rw...`） | 2 | 实测本机 overlayfs 上沙箱写的文件宿主属主是 uid 0（沙箱 host_uid 是 20000），于是 ① 沙箱 `chmod` 自己文件 EPERM，② 共享卷 1777+sticky 的跨 uid 保护无法成立。两条都改成"先量再断言"，不匹配带证据跳过 | **已在出厂集群上复测（2026-09-27，O1/T1 那一半）**：宿主属主 = 沙箱自己的 uid（两箱同时在位时 `10000`/`10001`，各自子树一致），`chmod 600` 自己写的文件 `rc=0` ⇒ **overlayfs 时代那个失效模式在 fleet 上不成立**，这两条在线上可以断言；探针 `tmp/k0s/t1-ownership-probe.py`、口径见 `docs/open-issues.md` 的 O1 行。仍**不适用**的是"共享卷 1777+sticky 跨 uid"那条的**部署形态**（fleet 每箱一棵 NAS 子树、无跨箱共享目录，见 N27）——要它成立得走 volumes 形态 |
 | 需要 OCI 形态（`test_fork_network_features`、`test_template_isolation`） | 2 | 只有设了 `E2B_BASE_IMAGE`（镜像 rootfs 沙箱）才有意义 | 已在带 `E2B_BASE_IMAGE=python:3.11-slim` 的那次全量里执行（所以那一轮是 16 skip） |
