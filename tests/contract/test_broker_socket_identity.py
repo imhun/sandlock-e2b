@@ -65,6 +65,39 @@ PRIV_DIR = PROJECT_ROOT / "deploy" / "priv"
 #: goes where the image installs it (as in ``test_broker_socket_c.py``).
 INSTALLED_BROKER = Path("/var/lib/e2b-priv/e2b-maint")
 
+
+def _require_disposable_container() -> None:
+    """Refuse loudly unless this really is the lane's one-shot container.
+
+    This module replaces the *image's* ``/var/lib/e2b-priv/e2b-maint`` -- with
+    a fresh build and a fresh ``setcap`` xattr -- and puts the original back
+    when the module is done. Only a container the image built may be treated
+    that way: on a Linux **root** development machine that path is the host's
+    real installation, and a hard kill between the two leaves the host holding
+    a test build of its privileged broker (``serve`` refuses to run from any
+    other path, so pointing the lane elsewhere is not an option either).
+
+    ``RuntimeError`` and never a skip: a skipped lane reads exactly like a
+    passing one in a summary, and the root-daemon/uid-65534 split below is the
+    only coverage of "the daemon acts for the peer it authenticated".
+    """
+    in_container = any(
+        marker.exists()
+        for marker in (Path("/.dockerenv"), Path("/run/.containerenv"))
+    )
+    if os.geteuid() != 0 or not in_container:
+        raise RuntimeError(
+            "this lane only runs inside the one-shot test container "
+            "(e2b-sandlock-test:latest, as root, with /.dockerenv or "
+            "/run/.containerenv present): it replaces the installed broker "
+            f"{INSTALLED_BROKER} (and its capability xattr) and restores it at "
+            "teardown, which outside that container means writing the host's "
+            "own installation"
+        )
+
+
+_require_disposable_container()
+
 #: The two identities that must stay *different* for this file to mean
 #: anything: the daemon is root, the worker it brokers for is 65534.
 WORKER_UID = 65534

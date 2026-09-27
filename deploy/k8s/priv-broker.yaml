@@ -333,6 +333,12 @@ spec:
             # 校验 SO_PEERCRED（uid 与 gid 都要相等），并把它们当作"worker 身份"
             # 做 `chown --worker` / `--gid <worker gid>`。改这里必须同时改 worker
             # 镜像的 USER 与 socket-dir-init；Python 侧启动断言会点名不一致。
+            #
+            # ⚠ worker pod 侧**不得**设置 E2B_BROKER_WORKER_UID / GID：那两个变量
+            # 由 daemon 每次连接用 SO_PEERCRED 的结果**无条件覆盖**后传给子进程，
+            # 它们是"这次请求属于谁"的结论，不是可配的输入。在 worker 上设了不但
+            # 无效，还会让人以为"worker 身份"能在 pod 里改（能改就等于能把别人的
+            # 树 chown 走）；写在这里是契约，不是配置项。
             - name: E2B_BROKER_PEER_UID
               value: "65534"
             - name: E2B_BROKER_PEER_GID

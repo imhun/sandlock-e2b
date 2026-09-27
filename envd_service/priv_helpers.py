@@ -141,6 +141,23 @@ BROKER_TIMEOUT_SLACK_S = 5
 BROKER_HELLO_TIMEOUT_S = 10
 #: Read granularity for the one-line answer (``walk`` streams a big one).
 BROKER_READ_CHUNK = 65536
+#: The daemon's per-stream output cap (``PRIV_MAX_OUTPUT`` in ``maint.c``): it
+#: kills a producing child at this many **unescaped** bytes, once for stdout
+#: and once for stderr.
+BROKER_MAX_OUTPUT_BYTES = 256 * 1024 * 1024
+#: The widest inflation one byte can get on the wire: the daemon's writer
+#: JSON-escapes every undecodable byte (a Linux filename is any byte but NUL
+#: and ``/``) as ``\udcXX`` -- six bytes for one.
+BROKER_ESCAPE_BLOWUP = 6
+#: The ceiling on one answer line this worker will read before it refuses.
+#: Same origin as the daemon's own cap, because that cap does *not* bound the
+#: line: it counts unescaped bytes, so a tree full of undecodable names can
+#: put six times that (both streams) on the socket. Anything larger is not an
+#: answer -- it is a daemon (or an impostor on the socket) making the *worker*
+#: buffer without bound, so the read is abandoned and named instead.
+BROKER_MAX_RESPONSE_BYTES = (
+    2 * BROKER_MAX_OUTPUT_BYTES * BROKER_ESCAPE_BLOWUP + BROKER_READ_CHUNK
+)
 
 
 def _image_cache_root() -> Path | None:
@@ -183,14 +200,34 @@ def _broker_timeout(argv: Sequence[str]) -> int:
     return min(budget, BROKER_TIMEOUT_MAX_S)
 
 
-def _read_broker_line(sock: socket.socket) -> str:
-    """Read up to the terminating newline of the daemon's one-line answer."""
+def _read_broker_line(sock: socket.socket, *, where: Path) -> str:
+    """Read up to the terminating newline of the daemon's one-line answer.
+
+    Bounded on purpose. Reading until a newline with socket timeouts as the
+    only backstop meant an unbounded ``bytes`` buffer: the daemon's own output
+    cap counts *unescaped* bytes, so a ``walk`` over names that are not UTF-8
+    comes back JSON-escaped and inflates up to sixfold on the wire -- and
+    nothing at all stops a daemon (or whatever else is on that socket) from
+    streaming one line forever. Past ``BROKER_MAX_RESPONSE_BYTES`` the answer
+    is refused by name rather than buffered, so this is a
+    :class:`PrivHelperError` (the caller asked for a privileged step and did
+    not get one), never a ``MemoryError`` or a hung worker.
+    """
     raw = b""
     while b"\n" not in raw:
         chunk = sock.recv(BROKER_READ_CHUNK)
         if not chunk:
             break
         raw += chunk
+        if len(raw) > BROKER_MAX_RESPONSE_BYTES:
+            raise PrivHelperError(
+                f"the maintenance broker at {where} answered more than "
+                f"{BROKER_MAX_RESPONSE_BYTES} bytes without a newline: "
+                "refusing to buffer an answer over the limit (the daemon caps "
+                "one stream at 256 MiB of unescaped bytes and escaping can "
+                "inflate that sixfold, so nothing this broker could answer "
+                "legitimately is longer than this line)"
+            )
     return raw.split(b"\n", 1)[0].decode("utf-8", errors="replace")
 
 
@@ -801,7 +838,7 @@ class PrivHelpers:
                 sock.settimeout(timeout_s + BROKER_TIMEOUT_SLACK_S)
                 sock.connect(str(self.broker_socket))
                 sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-                raw = _read_broker_line(sock)
+                raw = _read_broker_line(sock, where=self.broker_socket)
         except OSError as exc:
             raise PrivHelperError(
                 f"the maintenance broker at {self.broker_socket} is "
@@ -1206,6 +1243,15 @@ def _resolve_socket_shape(settings, *, socket_path: Path) -> PrivHelpers:
     and file capabilities are still validated whenever they are installed,
     and ``e2b-slot-spawn`` is still the worker's own.
 
+    "Still the worker's own" is why the *local* ``e2b-slot-spawn`` is required
+    here, not only the daemon: a route-B slot has to start inside this pod's
+    namespaces, so :meth:`PrivHelpers.spawn_argv` runs the local binary in
+    **both** transports, and the exec branch's "no binary at all means the
+    in-process shape" answer has no counterpart behind a daemon -- there the
+    missing binary would be found at the first ``Sandbox.create()`` instead of
+    at startup. Presence past this gate is what runs the shared reachability
+    and file-capability checks in :func:`_build_helpers`.
+
     There is deliberately no fallback. ``E2B_PRIV_HELPER_TRANSPORT=socket`` is
     an operator saying "a broker is up on this node"; silently running the
     file-capability binaries instead would hide exactly the deployment defect
@@ -1218,6 +1264,15 @@ def _resolve_socket_shape(settings, *, socket_path: Path) -> PrivHelpers:
             f"{socket_path} does not exist: start the per-node broker before "
             "the worker (an explicit socket shape must not silently fall back "
             "to the file-capability binaries)"
+        )
+    slot = DEFAULT_HELPER_DIR / SLOT_SPAWN_NAME
+    if not slot.exists():
+        raise PrivHelperError(
+            f"E2B_PRIV_HELPER_TRANSPORT=socket but the local {SLOT_SPAWN_NAME} "
+            f"({slot}) is missing: route-B slots start inside this worker's own "
+            "namespaces, so e2b-slot-spawn is never handed to the node's daemon "
+            "-- a socket shape without it is a half-installed broker and is "
+            "named at startup, not at the first Sandbox.create()"
         )
     helpers = _build_helpers(
         settings, transport="socket", broker_socket=socket_path
