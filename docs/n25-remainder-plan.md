@@ -84,7 +84,7 @@
 | A（目录计费） | `deploy/scripts/acceptance/probe_dir_stsize.py`：平台数 = 沙箱内独立测量 = `du -s -B1` = **33792**，逐字节相等、du diff 0 |
 | F（预热） | `apply.sh` 内置步骤输出两节点 `cached=true`；冷节点路径在 2026-09-21 已单独验证过（`cached=false` → POST → `cached=true`，18.8 s） |
 | 端到端 | `deployment_smoke.py` **DEPLOYMENT SMOKE OK**（命令/文件、迁移保留文件、网络配置、远端卷隔离、模板构建→拉取→rootfs、箱内 MCP 经代理、kill 后预留归零）；`multinode_smoke.py` **MULTI-NODE SMOKE OK**（4 箱 2+2 跨节点） |
-| 非 root 形态 | 由 lane 的 phase 2 覆盖（`UNPRIVILEGED_PHASE` 默认跑）：51 passed；集群这份清单是 **root worker**（`worker-root.patch.yaml` 的 `runAsUser: 0`），走的是 `route_b._spawn_slot`，不受那条修复影响 |
+| 非 root 形态 | 由 lane 的 phase 2 覆盖（`UNPRIVILEGED_PHASE` 默认跑）：51 passed；集群这份清单是 **root worker**（`worker-root.patch.yaml` 的 `runAsUser: 0`），走的是 `route_b._spawn_slot`，不受那条修复影响。<br>⚠ **这一格是 2026-09-21 当天的形态，已被 C1 wave 2（2026-09-27）取代**：`worker-root.patch.yaml` 已删除，worker 不再有任何 root 容器、`chown`/`rm`/`walk` 交给基线 `e2b-priv-broker` DaemonSet（见 `docs/k8s-deployment.md` §24） |
 
 即：A/F 已在集群复验，B 仍未做（见上），C/D 是书面结论。
 
