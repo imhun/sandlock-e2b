@@ -1,0 +1,430 @@
+# C1（特权外置）：每节点一个最小 root broker，worker pod 从此不再有 root。
+#
+# 为什么需要它：沙箱树是 `0770 owner=<池 uid> group=<worker gid>`，建箱/回收/记账
+# 三个特权动作（chown / rm / walk）必须由某个有 root 权限的东西来做。worker 侧把它
+# 们交给 unix socket 上的这个 daemon（`E2B_PRIV_HELPER_TRANSPORT=socket`），socket
+# 模式下 worker **必须**能完成 hello 握手，否则拒服（fail closed，绝不静默回落到
+# 镜像里的 file-capability 二进制）。
+#
+# 为什么 broker 必须是 root：workspace 落在阿里云 NAS 上，NFS 走 AUTH_SYS，服务端
+# 只按凭据里的 uid 授权、不看客户端的能力 —— `CAP_CHOWN` 不过网。2026-09-17 实测：
+#   * uid 65534 的 broker 做 `chown 10000:65534` → EPERM（连自己拥有的文件也让不出去）
+#   * 同一挂载上以 root 做同样的 chown → 成功
+# 同理，只有 root 能删/走一棵属于任意池 uid 的树。代价是把 `chown/rm/walk` 三个
+# 动作收进一个每节点一个有白名单的 daemon；沙箱仍跑在自己的池 uid 下，隔离模型不变。
+#
+# ⚠ 三处同源（终审要求，改一处就得同时改另两处）：**worker pod 的 uid/gid** ==
+#   **E2B_BROKER_PEER_UID/GID** == **/run/e2b-broker 目录与 broker.sock 的属组**，
+#   三者都是 **65534**。它来自同一个事实：worker 镜像 `deploy/docker/Dockerfile.envd`
+#   的 `USER 65534:65534`（worker pod 不再覆盖它，见 deploy/k8s/worker.yaml）。
+#   为什么必须同源：
+#     * daemon 把已鉴权对端的 uid/gid 当作"worker 身份"（`chown --worker` 与
+#       `--gid <worker gid>` 都靠它），并在 hello 里回 `peer_uid/peer_gid`；
+#       worker 的 Python 启动自检断言它们 == 自己的 euid/egid，不一致即拒服并点名。
+#     * socket 是 `0660 root:<peer gid>`、目录是 `0710 root:<peer gid>`：worker 靠
+#       **属组**才能连进来，而沙箱 uid（10000+）既不在组里、也没有目录的 x 位，
+#       压根到不了这个 socket。
+#   Python 侧的启动断言强制前两者，目录/文件的属组由下面的 init 与 daemon 自己保证；
+#   三处漂移的任何一种组合都会在 worker 启动或第一次特权调用上显性失败。
+#
+# 上线顺序（终审要求）：**先 apply 这个 DaemonSet，再上新 worker 镜像**。新 Python +
+# 旧 daemon 会在握手期因缺 `peer_gid` fail closed（设计如此）；旧 Python + 新 daemon
+# 向前兼容。
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: e2b-priv-broker
+  namespace: sandlock
+  labels:
+    app: e2b-priv-broker
+spec:
+  selector:
+    matchLabels:
+      app: e2b-priv-broker
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: e2b-priv-broker
+    spec:
+      # 调度域与 worker 完全一致。worker 的 socket transport 是硬开关（socket 不在
+      # 就拒服），所以凡是 worker 能落地的节点都必须有 broker；而 worker 自己不带
+      # tolerations（虚拟节点与任何带 taint 的节点都去不了），broker 也就不需要 ——
+      # 它不该被放到一个没有 worker 的节点上。nodeAffinity 与 seccomp 安装器同一
+      # 条理由：ACK 的虚拟节点（ECI / 任何 virtual-kubelet）跑不了这个 pod。
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: type
+                    operator: NotIn
+                    values:
+                      - virtual-kubelet
+      # 该 pod 里没有任何东西需要 e2b-slot-spawn（它必须在 worker 自己的命名空间里
+      # 起进程），也不再写 configmap；两个属主 init 只是把卷根/缓存交给 worker uid。
+      initContainers:
+        # socket 目录的属主与模式（第三处"同源"）。
+        #
+        # 为什么目录是 **0710**：root（daemon）在里面建 socket；worker 需要能**穿过**
+        # 目录去 open 那个 socket（组 x），但不需要、也不该能列出目录里有什么（组无 r）。
+        # 每个"谁能连"的判断都落在 socket 自身的 0660 上，目录只做最小收口。
+        #
+        # 为什么组是 **65534**：与 E2B_BROKER_PEER_GID / worker 的 gid 同源，见文件头。
+        # daemon 自己把 socket 建成 `0660 root:<peer gid>`（maint.c `serve`），所以这里
+        # 只负责把目录本身交给 root:65534 —— 目录若留给 kubelet 建的 root:root，worker
+        # 连 x 位都没有，socket 模式会在启动期直接拒服。
+        - name: socket-dir-init
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
+          securityContext:
+            runAsUser: 0
+          command:
+            - /bin/sh
+            - -c
+            - |-
+              set -e
+              mkdir -p /run/e2b-broker
+              chown 0:65534 /run/e2b-broker
+              chmod 0710 /run/e2b-broker
+              echo "socket-dir-init: $(stat -c '%a %u %g %n' /run/e2b-broker)"
+          volumeMounts:
+            - name: broker-socket
+              mountPath: /run/e2b-broker
+        # Z-F7 C1: the cache on the shared PVC is written by root (the
+        # control-plane pod exports template layout tars into ``_images/_oci/``)
+        # and by this pod (65534, extracting rootfs entries). Creating it once
+        # with the worker's ownership is what lets both write it without a
+        # world-writable cache (0777 would let a sandbox poison another sandbox's
+        # image) -- and the ownership is *verified*, because on NFS with
+        # root_squash the chown can be refused: a best-effort init that ends up
+        # with a root-owned directory is how every image resolve on this node
+        # fails later (the 65534 worker cannot even create its lock file). The
+        # pod then stays in Init:Error with the exact one-time fix in its log,
+        # instead of starting and failing every create. Note that the
+        # `mkdir -p` below leaves the directory behind, so "the worker can build
+        # its own cache" is not true once this container has run.
+        # docs/production-deployment-requirements.md §2.7.1.
+        - name: image-cache-init
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
+          securityContext:
+            runAsUser: 0
+          command:
+            - /bin/sh
+            - -c
+            - |-
+              set -e
+              for dir in $CACHE_DIRS; do
+                mkdir -p "$dir/_oci"
+                chmod 0755 "$dir" "$dir/_oci" 2>/dev/null || true
+                chown -R 65534:65534 "$dir" 2>/dev/null ||
+                echo "image-cache-init: chown refused ($dir, NFS root_squash?) -- verifying the owner instead"
+                owner="$(stat -c %u "$dir")"
+                if [ "$owner" != "65534" ]; then
+                  echo "image-cache-init: FATAL: $dir is owned by uid $owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
+                  echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown -R 65534:65534 $dir" >&2
+                  exit 1
+                fi
+                echo "image-cache-init: $dir is owned by uid 65534"
+              done
+          env:
+            - name: CACHE_DIRS
+              # Both caches, in the order they are created: the node-local one
+              # this pod unpacks into, and the shared one whose ``_oci/`` the
+              # control plane writes tars into.
+              value: /var/lib/e2b-images /var/lib/e2b-sandboxes/_images
+          volumeMounts:
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
+            - name: image-cache
+              mountPath: /var/lib/e2b-images
+        # The worker (uid 65534) creates each sandbox's top-level tree *directly*
+        # under the tree root, so that root must be writable by it -- the compose
+        # convention is mode 1777 (deploy/scripts/README.md, "一次性迁移": 卷根保持
+        # 1777). N27 sinks that root one level (it is now `<export>/workspaces`)
+        # and gives the platform's own state its own, equally writable, root
+        # beside it (`<export>/state`); the two get the same judgement. A freshly
+        # provisioned RWX volume is usually neither: on Aliyun NAS the export
+        # arrived as root:root 0755 (2026-09-17) and the very first
+        # Sandbox.create() died with
+        # `[Errno 13] Permission denied: '/var/lib/e2b-sandboxes/sbx_<id>'`.
+        # Repair once, then *verify* -- on a root_squashed NFS the chmod is refused,
+        # and the pod stops here with the exact fix instead of failing every create.
+        # Only those roots' own modes are touched: the sandbox trees below them
+        # belong to their sandbox uids (client-side `chgrp`/`chmod -R` must never
+        # walk them).
+        #
+        # ⚠ 上线顺序（N27 是一次迁移，不是一次滚动）：**worker 先缩到 0 →
+        # 跑 `deploy/scripts/migrate-state-base.sh`（Task 6）→ 再 apply 这份清单**。
+        # 迁移之前 apply 会得到一个"新 base 里什么都没有"的 worker（旧位置的树与
+        # `_runtime` 都还没搬过来），控制面的两个新 subPath 源也还不存在。
+        # 详见 `.superpowers/sdd/n27-task-5-report.md` §13。
+        #
+        # C1 把这两个 init 从 worker pod 搬到了这里（daemon 的 pod 里）：它们要 root
+        # 才能把卷根交给 worker uid，而 worker pod 已经不允许有任何 root 容器了。搬
+        # 过来之后 init 的顺序与依赖没变 —— DaemonSet 的 init 先跑完，broker 才监听，
+        # worker 的 wait-for-broker 再放行，所以属主一定先于 worker 的开始建立。
+        - name: workspace-root-init
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
+          securityContext:
+            runAsUser: 0
+          command:
+            - /bin/sh
+            - -c
+            - |-
+              set -e
+              shared="$SHARED_ROOT"
+              base="$WORKSPACE_BASE"
+              state="$STATE_BASE"
+              # OBS-9: the control plane mounts these back on top of its
+              # read-only view of the shared volume (subPath mounts), and a
+              # subPath whose source does not exist keeps that pod in
+              # ContainerCreating. Creating them here -- the one init container
+              # that already runs as root with the volume mounted RW -- means a
+              # fresh install converges without a separate bootstrap step.
+              # They stay on the *export* root: they are the platform's own
+              # namespaces, not sandbox trees.
+              for dir in _builds _images _secrets _templates _snapshots _volumes; do
+                mkdir -p "$shared/$dir"
+              done
+              # N27: the sandbox trees sink one level (`<export>/workspaces/<id>`)
+              # and the platform's own state becomes their *sibling*
+              # (`<export>/state`), on this same mount -- that is what makes the
+              # migration a metadata-only `rename` and what puts the platform's
+              # files off the path a sandbox reaches by walking `..`. Two
+              # readers depend on both existing before the worker starts:
+              #   * `<state>`: `uid_pool.acquire` opens
+              #     `<state>/.uid_pool.lock` (and later
+              #     `<state>/_runtime/<id>/sandbox.json`) with the base it was
+              #     handed -- a missing base turns the first `Sandbox.create()`
+              #     into ENOENT instead of a uid. Nothing derives it from the
+              #     tree root, on purpose: a base the code made up out of band
+              #     would land with the wrong owner on NFS.
+              #   * `workspaces`: it is the worker's own tree root.
+              for dir in "$base" "$state"; do
+                mkdir -p "$dir"
+              done
+              # ...and one directory *inside* the tree root, `<workspaces>/_migrate`:
+              # the control plane's migration staging, and the only thing that pod
+              # is allowed to write under the tree root (its one writable subPath
+              # there -- sandbox trees stay EROFS for it, OBS-9). The worker's own
+              # migration endpoints use `<workspace_base>/_migrate` too
+              # (`envd_service/agent.py`), so both sides name one directory.
+              mkdir -p "$base/_migrate"
+              # The checkpoint store's gate. An image is written by the
+              # sandbox's *own* slot, so every level down to it has to be
+              # traversable by that pooled uid -- while nobody below the worker
+              # may list it: hence 0711 (traverse, no listing), the same
+              # convention `checkpoint_store._prepare_image_parent` sets when it
+              # gets there first. The directories below these (`_runtime/<id>`,
+              # `.checkpoints/<id>`) stay 0700 and are created by the worker and
+              # the slot. The worker owns all three, because it is the worker
+              # that creates the record and image directories under them.
+              mkdir -p "$state/_runtime/.checkpoints"
+              chown 65534:65534 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||
+                echo "workspace-root-init: chown refused ($state/_runtime, NFS root_squash?)"
+              chmod 0711 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||
+                echo "workspace-root-init: chmod refused ($state/_runtime)"
+              # The checkpoint store's gate has to belong to the worker for a
+              # second reason: a root-owned 0711 gate is *traversable* by the
+              # slot but the 65534 worker cannot create `.checkpoints/<id>`
+              # inside it, and that failure only shows up as an EACCES at the
+              # first pause. Say so here instead.
+              for target in "$state/_runtime" "$state/_runtime/.checkpoints"; do
+                owner="$(stat -c %u "$target")"
+                mode="$(stat -c %a "$target")"
+                echo "workspace-root-init: $target owner=$owner mode=$mode"
+                if [ "$owner" != "65534" ]; then
+                  echo "workspace-root-init: FATAL: $target is owned by uid $owner, not the worker uid 65534: the worker creates the record and checkpoint-image directories below it, so a captured image could never be written (EACCES at the first pause)" >&2
+                  echo "workspace-root-init: fix it once (on the node, or on the storage server): chown 65534:65534 $target && chmod 0711 $target" >&2
+                  exit 1
+                fi
+              done
+              # The two roots -- and the migration staging inside the tree root,
+              # which the worker itself writes a tar into and reads back
+              # (`envd_service/agent.py`'s export/import endpoints) -- get
+              # today's judgement, unchanged in shape: the worker creates
+              # top-level names in each of them directly (a sandbox tree under
+              # `workspaces`, the uid pool's lock and the runtime records under
+              # `state`), so each has to be writable by it -- owner 65534, or
+              # 1777 as the compose convention -- and a target that is neither
+              # stops the pod here with the one-time fix instead of failing
+              # every create.
+              for target in "$base" "$state" "$base/_migrate"; do
+                owner="$(stat -c %u "$target")"
+                mode="$(stat -c %a "$target")"
+                echo "workspace-root-init: $target owner=$owner mode=$mode"
+                if [ "$owner" != "65534" ]; then
+                  chmod 1777 "$target" 2>/dev/null ||
+                    echo "workspace-root-init: chmod refused (NFS root_squash?)"
+                  owner="$(stat -c %u "$target")"
+                  mode="$(stat -c %a "$target")"
+                fi
+                world_writable=0
+                case "$mode" in *2|*3|*6|*7) world_writable=1 ;; esac
+                if [ "$owner" != "65534" ] && [ "$world_writable" != "1" ]; then
+                  echo "workspace-root-init: FATAL: $target is mode $mode, owned by uid $owner -- the worker (uid 65534) cannot create the top-level names it owns there, so every Sandbox.create() would fail with EACCES" >&2
+                  echo "workspace-root-init: fix it once (on the node, or on the storage server): chmod 1777 $target  (or chown 65534:65534 $target)" >&2
+                  exit 1
+                fi
+                echo "workspace-root-init: $target is writable by uid 65534 (owner=$owner mode=$mode)"
+              done
+          env:
+            - name: SHARED_ROOT
+              value: /var/lib/e2b-sandboxes
+            - name: WORKSPACE_BASE
+              value: /var/lib/e2b-sandboxes/workspaces
+            - name: STATE_BASE
+              value: /var/lib/e2b-sandboxes/state
+          volumeMounts:
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
+      containers:
+        - name: broker
+          # Same image as the worker: it already carries
+          # /var/lib/e2b-priv/e2b-maint (the verb implementations and the path
+          # whitelist), and the DaemonSet is versioned with the worker on
+          # purpose -- the socket protocol is a contract between the two.
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
+          imagePullPolicy: IfNotPresent
+          # `serve` only ever execs *itself* (`/var/lib/e2b-priv/e2b-maint`,
+          # verified against /proc/self/exe at startup) -- it is not a general
+          # launcher -- so this argv plus the socket path is the whole
+          # interface the worker's E2B_PRIV_HELPER_SOCKET dials.
+          command:
+            - /var/lib/e2b-priv/e2b-maint
+            - serve
+            - --socket
+            - /run/e2b-broker/broker.sock
+          env:
+            # The whitelist and the pool are part of the startup handshake:
+            # the worker resolves its own roots (its workspace/state bases, the
+            # export root, the node-local image cache) and refuses to serve if
+            # the daemon's list differs. Keep both sides byte-identical.
+            - name: E2B_WORKSPACE_BASE
+              value: /var/lib/e2b-sandboxes/workspaces
+            - name: E2B_STATE_BASE
+              value: /var/lib/e2b-sandboxes/state
+            - name: E2B_SHARED_VOLUME_ROOT
+              value: /var/lib/e2b-sandboxes
+            # The fourth root, and the one that only counts when it is set: a
+            # sandbox's secret file is written to
+            # `<E2B_IMAGE_CACHE_DIR>/secrets/<sandbox_id>/` and then handed to
+            # that sandbox's uid, which is a chown by the worker -- so the
+            # directory has to be inside the whitelist. Both sides must name it
+            # or the hello handshake fails (deliberately).
+            - name: E2B_IMAGE_CACHE_DIR
+              value: /var/lib/e2b-images
+            # The pool bounds every uid/gid the broker will accept. The worker
+            # does not override the k8s defaults, so these are the same
+            # 10000/1000 the code uses; naming them here keeps the handshake
+            # comparison against explicit values on both sides.
+            - name: E2B_UID_POOL_START
+              value: "10000"
+            - name: E2B_UID_POOL_SIZE
+              value: "1000"
+            # Route-B 的 scratch root 落在 E2B_STATE_BASE 之下（已在白名单里），
+            # daemon 自己不需要它；仍然按 worker 的同名值写上，是为了让两侧的
+            # 环境互为镜像，避免"worker 改了、broker 忘了"这类漂移。
+            - name: E2B_ROUTE_B_TMP_ROOT
+              value: /var/lib/e2b-sandboxes/state/.route-b
+            # 三处同源的第一处：worker pod 的 uid/gid（镜像 USER 65534:65534）
+            # == 这两个值 == socket 目录/文件的属组。daemon 用它做两件事：
+            # 校验 SO_PEERCRED（uid 与 gid 都要相等），并把它们当作"worker 身份"
+            # 做 `chown --worker` / `--gid <worker gid>`。改这里必须同时改 worker
+            # 镜像的 USER 与 socket-dir-init；Python 侧启动断言会点名不一致。
+            - name: E2B_BROKER_PEER_UID
+              value: "65534"
+            - name: E2B_BROKER_PEER_GID
+              value: "65534"
+          securityContext:
+            # root，因为上面解释了：CAP_CHOWN 不过网，而删除/遍历一棵属于任意
+            # 池 uid 的树也只有 root 做得到。c1 的整个设计就是把这几个特权动作
+            # 收进这一个进程，pod 里其他容器（worker）不再有 root。
+            #
+            # 三条 cap 是"它到底要什么"的清单：CHOWN 把文件让给池 uid，
+            # DAC_OVERRIDE 穿过沙箱树的权限位，FOWNER 改自己建的 socket 的模式。
+            #
+            # ⚠ 但**它不是最小集**：对以 uid 0 跑的容器，`capabilities.add` 是
+            # 「在运行时默认能力集之上追加」，runc 不会因为显式 add 而清空默认集，
+            # 所以这个进程实际仍然持有默认的 root 集（DAC_READ_SEARCH、SETUID…
+            # 都在）。真要收紧成"只有这三条"，得同时写 `drop: [ALL]`——那必须先在
+            # 真机确认 `walk`（fts 遍历他人属主的目录）、`rm`、`chown` 在只有这三条
+            # cap 时仍然成立之后再加（Task 8）。加的时候注意仓库记录过的坑：
+            # `drop: [ALL]` 必须配 `add`（否则连这三条都没了），且**绝不能**引入
+            # no-new-privileges（NNP=1 会让内核直接忽略 file capabilities，等于把
+            # 镜像里的 e2b-maint/e2b-slot-spawn 变成无特权二进制）。
+            #
+            # runAsGroup 不覆盖：镜像的 USER 65534:65534 已经给了 worker 的 gid，
+            # broker 以 root:65534 跑，socket 与目录的属组才有意义。
+            runAsUser: 0
+            capabilities:
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+          # 探活就是协议里的 ping：连上 socket、发 hello、把响应打到 stdout，
+          # 退出码 ok=0 / 拒=77。两条探针共用它 —— broker 不在（socket 文件没了、
+          # 监听死了、或对端校验把它挡下来）时，唯一正确的反应是重启这个 pod：
+          # worker 的 socket transport 没有回落路径。
+          livenessProbe:
+            exec:
+              command:
+                - /var/lib/e2b-priv/e2b-maint
+                - ping
+                - --socket
+                - /run/e2b-broker/broker.sock
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /var/lib/e2b-priv/e2b-maint
+                - ping
+                - --socket
+                - /run/e2b-broker/broker.sock
+            # 比 liveness 快：readiness 只影响"要不要把新 worker 调度到这个节点
+            # 旁边"，而 worker 的 wait-for-broker 会自己等 socket 就绪。
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            # The same RWX claim the worker mounts, at the same path: the
+            # whitelist entries are compared as resolved paths, and the trees
+            # the broker chowns/removes have to be the ones the worker sees.
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
+            # Node-local extracted-rootfs cache -- also inside the whitelist
+            # (the secret hand-over), so the same hostPath as the worker's.
+            - name: image-cache
+              mountPath: /var/lib/e2b-images
+            - name: broker-socket
+              mountPath: /run/e2b-broker
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              # The daemon forks one handler per connection and a grandchild per
+              # request (bounded, PRIV_MAX_HANDLERS). `walk` streams the tree
+              # through fts, so memory is paths, not entries: 1 GiB is the
+              # runaway backstop, not a working set.
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: sandbox-shared
+        - name: image-cache
+          hostPath:
+            path: /var/lib/e2b-images
+            type: DirectoryOrCreate
+        # 每节点一个，宿主机上：worker 与 broker 在不同的 pod（不同的 mount
+        # namespace）里，只有 hostPath 能让两者看到同一个 socket 文件。
+        - name: broker-socket
+          hostPath:
+            path: /run/e2b-broker
+            type: DirectoryOrCreate

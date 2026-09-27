@@ -213,6 +213,11 @@ KEY_CLASSES: dict[str, set[str]] = {
     "rotation_window": {"E2B_INTERNAL_API_KEYS"},
     # Track F/route-B scratch root: the file-capability brokers.
     "priv_helpers": {"E2B_PRIV_HELPERS"},
+    # C1 (wave 2): the k8s worker dials the per-node broker DaemonSet over a
+    # unix socket instead of running the privileged binaries itself. The
+    # compose stacks ship no such daemon -- they keep the file-capability
+    # shape (C1's `exec` transport) -- so both keys are k8s-only.
+    "priv_broker_transport": {"E2B_PRIV_HELPER_TRANSPORT", "E2B_PRIV_HELPER_SOCKET"},
     # Named template images (`docs/HANDOFF.md`: unset = the fixed set only).
     "template_images": {"E2B_TEMPLATE_IMAGES"},
     # Per-worker wiring: who the worker is and which control plane it dials.
@@ -312,12 +317,14 @@ _FLEET_STACK_MISSING = (
     KEY_CLASSES["k8s_state_layout"]
     | KEY_CLASSES["k8s_disk_enforcement"]
     | KEY_CLASSES["k8s_real_root_and_checkpoint"]
+    | KEY_CLASSES["priv_broker_transport"]
 )
 
 #: The compose example stacked with a control plane + Redis: it declares the
 #: worker's wiring, cache, capacity, shape and egress, but not the k8s-only
-#: classes above, the rotation window, the broker opt-in (default `auto`) or
-#: named templates (default: none).
+#: classes above (state layout, disk enforcement, real-root/checkpoint, and the
+#: C1 broker socket), the rotation window, the broker opt-in (default `auto`)
+#: or named templates (default: none).
 _COMPOSE_EXAMPLE_MISSING = (
     _FLEET_STACK_MISSING
     | KEY_CLASSES["rotation_window"]
