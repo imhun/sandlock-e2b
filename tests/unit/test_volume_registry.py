@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import timedelta
 
 import pytest
@@ -372,3 +373,30 @@ def test_invalid_per_sandbox_quota_rejected(workspace, quota):
     registry = VolumeRegistry(workspace / "volumes")
     with pytest.raises(ValueError):
         registry.create("data", per_sandbox_quota_mb=quota)
+
+
+def test_a_volume_record_is_published_in_one_step(workspace, publish_spy):
+    """A volume record is read while it is written (peers, and the worker).
+
+    Revoking a token is a rewrite of ``_meta/<id>.json``, and a replica or a
+    worker that reads the file inside that window gets half a document rather
+    than "revoked": the disk copy is what a Redis-less deployment resolves the
+    volume from, and what a Redis-mode replica backfills from.
+    """
+    registry = VolumeRegistry(workspace / "volumes")
+    record = registry.create("data")
+    path = registry._record_path(record.volume_id)
+    before = json.loads(path.read_text(encoding="utf-8"))
+    publish_spy.reset()
+
+    record.token_revoked = True
+    with publish_spy.hold_next_publish() as in_window:
+        writer = threading.Thread(target=registry.save, args=(record,), daemon=True)
+        writer.start()
+        publish_spy.await_publish(in_window, "a volume record")
+        assert json.loads(path.read_text(encoding="utf-8")) == before
+    writer.join(timeout=10)
+    assert not writer.is_alive()
+
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert after["token_revoked"] is True

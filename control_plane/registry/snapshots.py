@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from gateway_common.ids import sandbox_id
-from gateway_common.paths import validate_sandbox_id
+from gateway_common.paths import validate_sandbox_id, write_json_atomically
 from gateway_common.timeutil import to_iso_z, utcnow
 
 logger = logging.getLogger(__name__)
@@ -528,10 +528,12 @@ class SnapshotRegistry:
                 yield record
 
     def _write_record(self, record: SnapshotRecord) -> None:
-        path = self._snapshot_dir(record.snapshot_id) / "snapshot.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(record.to_dict(), separators=(",", ":")), encoding="utf-8"
+        # Atomic because the reader is another *process* by design: ``get()``
+        # re-reads a ``creating`` record from this file precisely because the
+        # replica that owns the copy is the one flipping it (F11 step 3).
+        write_json_atomically(
+            self._snapshot_dir(record.snapshot_id) / "snapshot.json",
+            record.to_dict(),
         )
 
     def get(self, snapshot_id: str) -> SnapshotRecord:

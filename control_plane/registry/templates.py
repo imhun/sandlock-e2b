@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from gateway_common.ids import sandbox_id
+from gateway_common.paths import write_json_atomically
 from gateway_common.timeutil import to_iso_z, utcnow
 
 
@@ -224,11 +225,11 @@ class TemplateRegistry:
             # Same rule as the record: a discarded template's build must not
             # come back to life on the next scan.
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(build.to_storage_dict(), separators=(",", ":")),
-            encoding="utf-8",
-        )
+        # Atomic on purpose: the status poll is its own request and may land on
+        # the *other* replica, which has only this file to read -- a
+        # truncating write here is what answered a healthy build with
+        # ``404 Template build … not found`` (the SDK does not retry).
+        write_json_atomically(path, build.to_storage_dict())
 
     def save_build(self, record: TemplateRecord, build: BuildRecord) -> None:
         """Publish a build's current state to the replicas sharing the volume.
@@ -275,11 +276,10 @@ class TemplateRegistry:
             # A discarded record must not come back to life: the whole point is
             # that a name only resolves to a build that produced an image.
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(record.to_storage_dict(), separators=(",", ":")),
-            encoding="utf-8",
-        )
+        # Atomic for the build file's reason: name resolution rescans this
+        # file, and the replica that scans it is not necessarily the one that
+        # wrote it.
+        write_json_atomically(path, record.to_storage_dict())
 
     def _scan_disk(self) -> None:
         if self._base is None or not self._base.is_dir():

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -366,3 +369,173 @@ def test_a_build_file_is_written_where_the_other_replica_looks(workspace):
     path = base / record.template_id / "builds" / f"{build.build_id}.json"
     assert path.is_file(), path
     assert json.loads(path.read_text())["build_id"] == build.build_id
+    # Published from a sibling file, so the mode is the one a plain
+    # ``write_text`` leaves (0666 & umask) rather than ``mkstemp``'s 0600:
+    # the *other replica* reads this file as a different process.
+    reference = path.with_name("reference.json")
+    reference.write_text("{}", encoding="utf-8")
+    assert stat.S_IMODE(path.stat().st_mode) == stat.S_IMODE(
+        reference.stat().st_mode
+    )
+
+
+def test_a_publish_that_fails_leaves_the_previous_record_intact(
+    workspace, monkeypatch, publish_spy
+):
+    """No half target and no leftover staging file when the rename cannot land.
+
+    ``publish_spy`` (above) is installed first; this override is what the
+    writer meets instead, so the failure path is the one being exercised --
+    the bytes are staged, the rename is refused, and what readers see has to
+    stay the previous whole document.
+    """
+    base = workspace / "templates"
+    registry = TemplateRegistry(base)
+    record, _ = registry.create("smoke-template")
+    record_path = base / record.template_id / "template.json"
+    before = json.loads(record_path.read_text(encoding="utf-8"))
+
+    def refuse(src, dst, *args, **kwargs):
+        raise OSError("rename refused")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    record.upload_url_token("h1")
+    with pytest.raises(OSError):
+        registry.save(record)
+
+    assert json.loads(record_path.read_text(encoding="utf-8")) == before
+    assert [
+        p.name for p in record_path.parent.iterdir() if p.name.endswith(".tmp")
+    ] == []
+
+
+def test_a_replica_reading_during_a_write_never_sees_half_a_record(
+    workspace, publish_spy
+):
+    """``create``/``trigger``/poll are three requests: one writes, one reads.
+
+    The Service scatters them, so the replica answering a poll parses the very
+    file the replica owning the build is rewriting. Truncate-then-write makes
+    "this build is being updated" indistinguishable from "no such build" --
+    measured on k0s 2026-09-26 as ``404 Template build bld_… not found`` on a
+    build that was running fine, which the SDK turns straight into
+    ``BuildException`` because it does not retry. ``template.json`` is read
+    the same way (name resolution rescans it), so both files are looped here
+    while a writer rewrites them: every observation has to be a whole
+    document, and every update has to reach the file in one step.
+    """
+    base = workspace / "templates"
+    registry = TemplateRegistry(base)
+    record, build = registry.create("smoke-template")
+    build_path = base / record.template_id / "builds" / f"{build.build_id}.json"
+    record_path = base / record.template_id / "template.json"
+    publish_spy.reset()
+
+    stop = threading.Event()
+    failures: list[tuple[str, str]] = []
+
+    def read(path: Path, name: str) -> None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            failures.append((name, repr(e)))
+            return
+        if not isinstance(payload, dict):
+            failures.append((name, f"not an object: {payload!r}"))
+
+    def reader() -> None:
+        while not stop.is_set():
+            read(build_path, "build")
+            read(record_path, "template")
+
+    def writer() -> None:
+        for _ in range(40):
+            build.status = "building"
+            # Grown past a single syscall: this is the payload whose write
+            # window a truncating implementation exposes.
+            build.append_log("y" * 2048)
+            registry.save_build(record, build)
+            registry.save(record)
+
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
+    try:
+        writer()
+    finally:
+        stop.set()
+        reader_thread.join(timeout=10)
+
+    assert not reader_thread.is_alive()
+    assert failures == []
+    # 40 rounds of "publish the build, publish the record": every one of them
+    # is a same-directory rename, which is what makes those bytes atomic for
+    # the reader one replica over.
+    assert len(publish_spy.calls) == 80
+    assert {dst for _, dst in publish_spy.calls} == {build_path, record_path}
+    assert all(src.parent == dst.parent for src, dst in publish_spy.calls)
+
+
+def test_a_poller_inside_the_write_window_reads_the_previous_build(
+    workspace, publish_spy
+):
+    """The window itself, deterministically: no race, just the old document.
+
+    The writer is frozen between staging the new bytes and renaming them over
+    the target -- i.e. at the exact moment a truncating implementation has
+    already emptied the file a poll is about to read. The reader in the window
+    is a registry that owns nothing (the replica one over): it has only the
+    shared volume, and it must answer with the build that was published last.
+    """
+    base = workspace / "templates"
+    registry = TemplateRegistry(base)
+    record, build = registry.create("smoke-template")
+    build.status = "building"
+    build.append_log("building template (buildkit: unix:///run/buildkit)")
+    registry.save_build(record, build)
+    build_path = base / record.template_id / "builds" / f"{build.build_id}.json"
+    publish_spy.reset()
+
+    build.status = "ready"
+    build.append_log("Build finished successfully")
+    with publish_spy.hold_next_publish() as in_window:
+        writer = threading.Thread(
+            target=registry.save_build, args=(record, build), daemon=True
+        )
+        writer.start()
+        publish_spy.await_publish(in_window, "a build file")
+        seen = TemplateRegistry(base).get_build(record.template_id, build.build_id)
+        assert seen.status == "building"
+        assert seen.logs == ["building template (buildkit: unix:///run/buildkit)"]
+    writer.join(timeout=10)
+    assert not writer.is_alive()
+
+    finished = json.loads(build_path.read_text(encoding="utf-8"))
+    assert finished["status"] == "ready"
+    assert finished["logs"] == [
+        "building template (buildkit: unix:///run/buildkit)",
+        "Build finished successfully",
+    ]
+
+
+def test_a_template_record_is_published_in_one_step(workspace, publish_spy):
+    """``template.json`` is the other half: a name resolves by rescanning it."""
+    base = workspace / "templates"
+    registry = TemplateRegistry(base)
+    record, _ = registry.create("smoke-template")
+    record_path = base / record.template_id / "template.json"
+    before = json.loads(record_path.read_text(encoding="utf-8"))
+    publish_spy.reset()
+
+    record.upload_url_token("h1")
+    with publish_spy.hold_next_publish() as in_window:
+        writer = threading.Thread(target=registry.save, args=(record,), daemon=True)
+        writer.start()
+        publish_spy.await_publish(in_window, "a template record")
+        # The copy on the volume is still the previous whole document; a
+        # truncated one would not even parse.
+        assert json.loads(record_path.read_text(encoding="utf-8")) == before
+    writer.join(timeout=10)
+    assert not writer.is_alive()
+
+    after = json.loads(record_path.read_text(encoding="utf-8"))
+    assert list(after["upload_tokens"]) == ["h1"]

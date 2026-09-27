@@ -25,6 +25,7 @@ from gateway_common.paths import (
     sandbox_record_path,
     sandbox_runtime_dir,
     validate_sandbox_id,
+    write_json_atomically,
 )
 from envd_service.runtime.dir_ledger import DirLedger, DirLedgerUnknown
 
@@ -1122,9 +1123,13 @@ class RuntimeRegistry:
             try:
                 self._ensure_runtime_dir(sandbox_id)
                 path = self._record_path(sandbox_id)
-                path.write_text(
-                    json.dumps(record.to_dict(), separators=(",", ":")), encoding="utf-8"
-                )
+                # Atomic because the reader is a *different process*: another
+                # worker sharing this workspace reads the record to decide
+                # which host uids are taken (``uid_pool._recorded_uid``), and
+                # it reads a half-written file as "no record" -- i.e. as "this
+                # uid is free", which is how two sandboxes end up sharing one
+                # host uid with E3.2's isolation silently gone.
+                write_json_atomically(path, record.to_dict())
                 # The in-tree copy was the pre-split location and is still
                 # writable by the sandbox itself; once the authoritative copy
                 # exists outside the tree, drop it rather than leave a

@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from gateway_common.ids import access_token, sandbox_id
-from gateway_common.paths import validate_sandbox_id
+from gateway_common.paths import (
+    validate_sandbox_id,
+    write_json_atomically,
+    write_text_atomically,
+)
 from gateway_common.timeutil import to_iso_z, utcnow
 
 
@@ -268,11 +272,10 @@ class VolumeRegistry:
 
     def _write_record(self, record: VolumeRecord) -> None:
         path = self._record_path(record.volume_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(record.to_storage_dict(), separators=(",", ":")),
-            encoding="utf-8",
-        )
+        # Atomic: this file is read by a peer with no record store, by the
+        # worker side mounting the volume, and by ``_ensure_backfilled`` at
+        # startup -- all of them while this replica may be rewriting it.
+        write_json_atomically(path, record.to_storage_dict())
         if self._record_store is not None:
             self._record_store.put(
                 record.volume_id, record.to_storage_dict(), ttl=None
@@ -393,8 +396,9 @@ class VolumeRegistry:
         # stops any stale disk copy — this replica's or another one's —
         # from being backfilled into the shared store after a restart.
         tombstone = self._tombstone_path(volume_id)
-        tombstone.parent.mkdir(parents=True, exist_ok=True)
-        tombstone.write_text("deleted\n", encoding="utf-8")
+        # Only its existence is read, but it is the one thing standing between
+        # a deleted volume and a backfill, so it is published whole too.
+        write_text_atomically(tombstone, "deleted\n")
         if self._record_store is not None:
             self._record_store.tombstone(volume_id)
         self._record_path(volume_id).unlink(missing_ok=True)
