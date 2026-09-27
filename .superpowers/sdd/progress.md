@@ -2518,3 +2518,15 @@ N37 的 4000 文件判据与 checkpoint 端到端在上一版 `0.1.0-652` 上全
 - **终审修复（提交 `8c50698`，跨 C+Python）**：daemon 通过 `SO_PEERCRED` 后**无条件覆盖** `E2B_BROKER_WORKER_UID/GID` 传给子进程；`--worker` 与 `priv_gid_allowed` 的 own-gid 改用它（直接 exec 无该变量 → 回落 `getuid()/getgid()`，逐字不变）；`hello` 增 `peer_gid`；Python 侧断言 `peer_uid/peer_gid == euid/egid`、`v==1`、`exit` 必须为 int；新增跨侧契约测试 `tests/contract/test_broker_socket_identity.py`（root daemon + `setpriv` 到 65534 的客户端，daemon gid ≠ 对端 gid）。判据：`cc` 零输出；三文件 49 passed；`test_priv_helpers.py` 仍 1 failed/42 passed（预存）；`tmp/c1_e2e_probe.py` 全 OK；M1–M5 变异各让对应断言精确变红。
 - 计划文件已更新：Global Constraints 增"对端身份必须显式传给子进程"（含 wave 2 的 DaemonSet 必须把 `E2B_BROKER_PEER_UID/GID` 设成 worker 的 uid/gid 且与 socket 组一致）；Task 7 文件清单补上 `README.md`。
 - 滚存疑虑（留给 wave 2）：`timeout_s` 杀进程用例（~70 万条目/造树 26s，已在报告里记录配方）；滚动升级期"新 Python + 旧 daemon"会因缺 `peer_gid` 启动 fail closed（设计如此）。
+
+---
+
+## 2026-09-27 C1 wave 1 合并 + wave 2 开工
+
+**wave 1 已合并进 main**：`git merge --no-ff feat/c1-wave1` → main `526f581`（合并前 main `a916f25` = 计划 + 账本）。合并结果在容器内复跑：`test_broker_socket_c + test_broker_socket_identity + test_priv_broker_protocol + test_priv_helpers + test_sandbox_secret_ownership + test_shared_volume_traversal` = **110 passed / 2 failed**（两条与 base `5c78065` 同红），`tmp/c1_e2e_probe.py` 全 OK。终审结论 **Ready to merge: Yes**。
+清理：4 个 worktree（`tmp/wt-c1-t{1,2,3}`、`tmp/wt-c1-integration`）已 remove + prune；分支 `feat/c1-broker-serve`/`-socket-transport`/`-secret-ownership`/`-wave1` 已删（均已并入 main）。**归档**（从 worktree 拷进主仓，避免随清理丢失）：`.superpowers/sdd/c1-task-{1,2,3}-{brief,report}.md`、`c1-review-{t1,t2,t3,wave1}-final.diff`、`c1-wave1-final-fix-report.md`、`tmp/c1_e2e_probe.py`。
+
+**wave 2（从 main `526f581` 起，两个并行 worktree）**
+- **Task 4 + Task 5**（worktree `tmp/wt-c1-w2a` / 分支 `feat/c1-w2-deploy`）：`df27148`（DaemonSet `e2b-priv-broker`）+ `0cd1464`（worker 去 root）。自报：`test_worker_manifest_permissions.py` 46 passed、三文件 77 passed、全量单测失败名单与基线逐字节相同；渲染与 client dry-run 通过；`wait-for-broker` 三条路径离线实跑过。**自陈风险 ①**：`E2B_PRIV_HELPER_TRANSPORT=socket` 被加进**共享基线** `deploy/k8s/worker.yaml`，而 DaemonSet 只在 k0s overlay ⇒ 不经 overlay 的部署（托管集群 + 块/本地盘）会因缺 socket 拒服；**④** DaemonSet 未 `drop: [ALL]`。另为不红改了写集外两处 pin（`test_migrate_state_base_script.py`、`test_worker_env_key_sets.py`）。评审中（reviewer 被要求逐条判断）。
+- **Task 6**（worktree `tmp/wt-c1-w2b` / 分支 `feat/c1-w2-migrate`）：`8d421a1`（迁移脚本 + Job + 测试）→ 一评 Needs fixes（Important：空/错根 apply 会静默成功；Minor：整份 resources 断言会与 T4 冲突等）→ 修 `0bba9a0`（形状闸门 + `chowned==0` backstop + 断言收窄 + 行为用例 + 顺手修 bash 3.2 `$JOB（` 真 bug）→ **二评 Approved**（26 passed；reviewer 容器内端到端复现空根 rc=3、幂等、红线不下潜）。
+  遗留 Minor（记入计划 Task 9）：`chowned==0` backstop 实为 TOCTOU 兜底无对应用例 / "7 条全集"的证明仍在彩排里 / `observed_replicas` 声明冗余 / 兄弟脚本 `migrate-state-base.sh:838,946,955,959` 同样的 bash 3.2 隐患。

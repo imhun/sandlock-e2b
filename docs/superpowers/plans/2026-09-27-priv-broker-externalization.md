@@ -39,7 +39,7 @@
 | `envd_service/executors/sandlock.py` | secret 文件属主：非 root worker 走 broker（现存缺陷） |
 | `tests/unit/test_priv_broker_protocol.py` | 协议/凭据/漂移/超时单测（Python 假 daemon，跨平台可跑） |
 | `tests/contract/test_broker_socket_c.py` | 真 C broker 的 socket 往返（Linux 容器内跑） |
-| `deploy/k8s-k0s/priv-broker.yaml` | （wave 2）root DaemonSet + socket 目录 + 接管两个属主 init |
+| `deploy/k8s/priv-broker.yaml` | （wave 2）root DaemonSet + socket 目录 + 接管两个属主 init。**放基线、不放 overlay**（2026-09-27 裁定，见 Task 4 的改动说明）：它与存储类型无关，而 socket 开关在共享基线里，放 overlay 会让"不经 overlay 的非 root 部署"起不来 |
 | `deploy/k8s-k0s/state-owner-migrate.yaml` | （wave 2）平台态属主一次性迁移 Job |
 
 ---
@@ -120,7 +120,9 @@
 
 ### Task 4（wave 2）: root broker DaemonSet + socket 目录 + 接管属主 init
 
-**Files:** Create `deploy/k8s-k0s/priv-broker.yaml`；Modify `deploy/k8s-k0s/kustomization.yaml`。
+**Files:** Create `deploy/k8s/priv-broker.yaml`（基线，**不是** overlay）；Modify `deploy/k8s/kustomization.yaml`（加进 resources）；Modify `deploy/k8s-k0s/kustomization.yaml`（overlay 只保留 NAS PV、seccomp 根、NodePort 这些发行版差异）。
+
+⚠️ **2026-09-27 裁定（Task 4/5 评审的 Important 回归）**：最初把 DaemonSet 放在 `deploy/k8s-k0s/`，但 Task 5 把 `E2B_PRIV_HELPER_TRANSPORT=socket` 写进了**共享基线** `deploy/k8s/worker.yaml` ⇒ 不经 overlay 的部署（`docs/k8s-deployment.md` 把 `deploy/k8s/` 当可部署清单集）会因缺 socket 而 `Init:Error` 且属主 init 无人接管。修法就是把 DaemonSet 提到基线：基线本来就是"单个 RWX PVC + 2 副本"的共享卷形态，DaemonSet 挂同一 PVC 是自洽的；overlay 只留发行版差异。并补一条一致性 pin：**渲染基线时若 worker 声明 socket transport，同一渲染里必须存在 broker DaemonSet**。
 
 **要点（不可变）**：`runAsUser: 0` + `capabilities.add: [CHOWN, DAC_OVERRIDE, FOWNER]`；`command: ["/var/lib/e2b-priv/e2b-maint","serve","--socket","/run/e2b-broker/broker.sock"]`；env 带 `E2B_UID_POOL_START/SIZE`、`E2B_WORKSPACE_BASE`、`E2B_STATE_BASE`、`E2B_SHARED_VOLUME_ROOT`、`E2B_IMAGE_CACHE_DIR`、`E2B_ROUTE_B_TMP_ROOT=<state>/.route-b`、`E2B_BROKER_PEER_UID=65534`/`E2B_BROKER_PEER_GID=65534`；挂同一个 RWX PVC（同路径）+ hostPath `/run/e2b-broker`（DirectoryOrCreate，initContainer 里 `chown 0:65534 && chmod 0710`）；把 `worker.yaml` 的两个属主 initContainer（`image-cache-init`、`workspace-root-init`）原样搬进来；livenessProbe = `e2b-maint ping --socket ...`。
 
@@ -152,7 +154,9 @@
 
 ### Task 7（wave 2）: 文档与 pin 收尾
 
-**Files:** `docs/production-deployment-requirements.md`（§2.4 能力表、§5.4(b) 判据改写）、`deploy/k8s-k0s/README.md`（overlay 差异表：`worker-root.patch.yaml` 那行改成 broker DaemonSet）、`docs/deploy-clusters.md` §7、`deploy/seccomp/README.md` 的 worker 形态描述、`tests/unit/test_worker_manifest_permissions.py`，以及 **`README.md`（第 247 行的白名单口径：补齐 state base、第 4 根 image cache、`E2B_PRIV_HELPER_TRANSPORT`/`E2B_PRIV_HELPER_SOCKET`；终审点名它在原清单里漏了）**。
+**Files:** `docs/production-deployment-requirements.md`（§2.4 能力表、§5.4(b) 判据改写、:173 的"线上实际是 root"审计句）、`deploy/k8s-k0s/README.md`（overlay 差异表：`worker-root.patch.yaml` 那行**删掉**并说明特权动作已移到**基线**的 broker——注意 broker **不是** overlay 差异，别作为新行加进那张表；:176 的"worker 以 root 跑"段落重写）、`docs/deploy-clusters.md` §7、`deploy/seccomp/README.md` 的 worker 形态描述（若无实质变化就写明"无变化"）、`tests/unit/test_worker_manifest_permissions.py`（若 Task 4/5 已收口则只做核对）、**`README.md`（第 247 行 `E2B_PRIV_HELPERS` 行的白名单口径：补齐 state base、第 4 根 image cache、以及 `E2B_PRIV_HELPER_TRANSPORT`/`E2B_PRIV_HELPER_SOCKET` 两个新旋钮）**，以及 **`docs/k8s-deployment.md`**（终审 Task 4/5 评审点名：§1 清单表补 `priv-broker.yaml` 一行、§2 部署顺序把 apply broker 放在 worker **之前**、升级段的 `kubectl set image` 补 `ds/e2b-priv-broker` 并把一致性自查的 `get deploy,sts` 扩成含 `ds`——broker 与 worker 镜像是一个契约、必须同版本滚）。
+
+**验收（Task 7）**：`rg -n 'runAsUser: 0' deploy/k8s deploy/k8s-k0s` 只剩 broker DaemonSet（容器 + 3 个 init）、seccomp installer、control-plane 与两个一次性 Job，且每处都有注释说明为什么；全仓不再有指向已删除 `deploy/k8s-k0s/worker-root.patch.yaml` 的活引用（历史计划文档除外）；`docs/k8s-deployment.md` 的 apply 顺序与升级命令与新形态一致；`README.md` 的白名单口径含四根；渲染与单测仍全绿。
 
 **验收**：`rg -n 'runAsUser: 0' deploy/k8s deploy/k8s-k0s` 只剩 seccomp installer / migration Job / broker DaemonSet 三处，且每处都有注释说明为什么。
 
