@@ -239,10 +239,15 @@ class Settings:
     # Per-sandbox PID namespace (fork `pid_ns`, S2.2's sibling): the sandbox is
     # the first process of its own PID namespace, so host/other-sandbox pids are
     # invisible from inside and the sandbox gets a real pid-1 reaper. Off by
-    # default: the fork's self-map shape (route-B: guest uid 0 while the host uid
-    # stays the slot uid) is not implemented on the pid-ns path yet, so turning
-    # this on today costs the guest its root identity -- see
-    # docs/production-deployment-requirements.md §2.4.10.
+    # default -- and that is a *deployment* decision (N3), not a capability
+    # limit: the route-B self-map this path used to be missing landed in fork
+    # `5b16855` (2026-09-16), so turning it on no longer costs the guest its root
+    # identity. Measured on the fleet (which runs with this on): a sandbox still
+    # reads `id` = `0:0` while the host owner of a file it writes is the
+    # sandbox's own uid, and `kill(<worker pid>, 0)` comes back ESRCH instead of
+    # EPERM -- the latter being the shape evidence, since `id -u` = 0 holds with
+    # the switch off too. What it buys and costs (procfs + stat interception):
+    # docs/production-deployment-requirements.md §2.4.10.1 / §2.4.10.2.
     pid_ns: bool = field(default_factory=lambda: _env_bool("E2B_PID_NS", False))
     # Real root (fork `real_root`, N35): instead of emulating the image root by
     # rewriting every path the mediator sees, the sandbox builds one -- a mount

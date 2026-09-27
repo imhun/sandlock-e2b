@@ -2372,3 +2372,26 @@ netns T6 的裸子串断言**必红**（实测注释里有键名）、N30 T4 的
 2. **节点热缓存里老 entry 仍是改写过的形态**，会与新 entry 并存**到下次重烤**；
 3. lane 只跑在本机 orbstack（x86_64），**部署宿主（arm64）上没跑 envd→route B→wheel 那条接线**；
 4. 绝对 collect 数会随并行 agent 变化 ⇒ 对基线时要用"同树对比 + 逐条归因"，不是比绝对数。
+
+## 2026-09-27 欠账清理第二轮（"都做了吧"这一轮）
+
+六单并行（Hypatia/Cicero/Nietzsche/Aquinas/Aristotle/Singer），控制器自己做 `.gitignore` 与 O1/T1 两件。
+
+| # | 欠账 | 结果 | commit |
+|---|---|---|---|
+| 1 | `deploy/compose/.env` 不被 ignore（示例/实例不对称） | ✅ 补 ignore + **钉子**"每个 `deploy/**/*.env.example` 的实例必须被忽略（用真 `git check-ignore --no-index`）、示例本身必须不被忽略"，两向变异各红一次 | `59c3d4e`（我） |
+| 2 | **O1 目标机 prjquota**（原"本轮未复核"） | ✅ **已复核**：fleet 共享卷是**阿里云 NAS（nfs4）**⇒ prjquota 结构上无落点、worker 无 `E2B_QUOTA_AGENT_URL` = 文档写的降级形态；触发条件写进行内 | `e31ee4f`（我） |
+| 3 | **T1**（挂在 O1 名下）沙箱写的文件宿主属主是谁 | ✅ **实测**：宿主属主 = 沙箱自己的 uid（两箱 `10000`/`10001`），`chmod 600` 自己文件 `rc=0` ⇒ overlayfs 时代那个 EPERM 失效模式**在 fleet 上不成立**；跨 uid 共享目录那条仍只在 volumes 形态下有定义 | `e31ee4f`（我） |
+| 4 | **N41 残余**（save 失败半窗口） | ✅ `RedisQuotaStore.release_once`：标记 + 账本 DECR 进**一次 `WATCH/MULTI`**，认领 TTL 过期不再是重放判据；RED 2 → GREEN 30、4 变异各红、单副本分支逐字未动 | `f6d35d4`/`f6dbd30`（Hypatia） |
+| 5 | **N27 identity 残差** | ✅ 三档实测：`synth`+真根**已消掉**（`chain=PASS`）、默认 `identity` **仍列名**（`stat` 全 `EACCES`）、legacy 反例真 FAIL ⇒ 判据非恒真；**另修探针两处假闸**（四条硬编码名 / lane 崩掉与"反例成立"同码）。默认形态切不切留给用户 | `84e21c8`/`a3d0957`（Cicero） |
+| 6 | **N39**（池 worker env） | ✅ ① 已清（池按出厂默认起得来、`E2B_EXECUTOR=auto`、`ifaces=lo`）；② 是"环境纪事"（默认 tag 仍是 08-30 版）；**并查出 N45** | `d6241ea`（Nietzsche） |
+| 7 | **N45**（池缺 `E2B_PID_NS`） | ✅ 补到 7 个栈 + 新增"worker env 键集合 vs k8s 清单"钉子（RED 6/7 → GREEN 7/7）；动态三臂 `getpid=7 / kill(1,0)=ok`（反证臂 EPERM） | `e2e5f1a`（Singer） |
+| 8 | **N37**（4 千文件断流） | ✅ **根因不是文件数，是"命令流静默 > 60 s 被边缘空闲切断"**：envd 的 process 流从不发 SDK 要的 in-band `KeepAlive`（filesystem watch 一直发）⇒ 12 处实测 + 本机 60 s 中继复刻 + 修复 + 13 条用例 | `8253ad6`/`43fb88a`（Aquinas） |
+| 9 | **checkpoint 计划 E5–E8 尾部** | ✅ 逐条审计（E2/E3/E4 已做、E5 计划从未定义、E6 待决策、E7 部分、E8 语义补齐）；**并揪出一条假守卫**（`test_checkpoint_restore_unused` 在空树上静默绿） | `f0b2fcd`（Aristotle） |
+
+**发版（控制器，2026-09-27）**：`main` 领先线上 55 个提交 ⇒ 预检两档 lane（gate A `2060/10/3/0`、
+gate B `2053/17/3/0`，各 +33 passed 逐条归因）→ `build-and-push.sh` → `apply.sh`，
+线上 **`0.1.0-652-g43fb88a-20260927-102733`**，`kubectl diff` **0 行**。
+验收：两条冒烟 OK、**N37 集群 4000 文件 ×3 = 3/3**（修前 61.4 s 断）、N42 出网判据
+（`pypi.org` CONNECTED + 裸 IP 策略拒）、checkpoint 端到端 `{"step":"OK"}`、账本两节点归零。
+记录 `docs/deploy-clusters.md` §12；日志 `tmp/k0s/release-652-acceptance.log`。

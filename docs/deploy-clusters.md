@@ -456,3 +456,55 @@ sh tmp/k0s/n27-t7-lane.sh python3 -u tmp/k0s/probe_state_base_visibility.py lane
 
 （lane 容器是 `e2b-sandlock-test:latest`（amd64），caps 与 seccomp 档同
 `deploy/scripts/arm-lane/x86-security.sh`；`E2B_BASE_IMAGE` 必须**显式传空**，`${VAR:-default}` 会把它换成默认值。）
+
+## 12. 2026-09-27 发版：`0.1.0-652-g43fb88a-20260927-102733`
+
+**为什么发**：`main` 领先上一版（`0.1.0-597-g3701a53-20260926-163057`）**55 个提交**，其中三条只在
+镜像里生效，线上不滚就一直是旧行为：
+
+* **N37** `8253ad6`：envd 的 **process 流从不发 SDK 要的 in-band `KeepAlive`**（filesystem watch 每 15 s 发、
+  process 没有）⇒ 边缘对**静默 60.0 s** 的响应体做空闲切断，表现为"单条命令写 4 千个文件就断流"。
+  修完线上单命令 4000 文件 **3/3 通过**（见下表）。
+* **N41** `f6d35d4`：归还预留变成 store 侧的**一次 `WATCH/MULTI` 事务**（标记 + 账本 DECR 同批）。
+* **N45** `e2e5f1a`：`E2B_PID_NS` 补齐到每一个 worker 栈（池里沙箱此前与 worker 共 pid ns）。
+
+（同一批里还有 FUP-28 撤掉 `..` 相对软链改写、N44 的基镜像对齐、N43 的 `du`/`tar`/`find` 回归修复。）
+
+**构建与上线**
+
+```bash
+./deploy/scripts/build-and-push.sh                      # 版本戳自动写 deploy/stack/.version
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+deploy/k8s-k0s/apply.sh                                 # 渲染 + apply + 预热 base image + 等滚动
+```
+
+* 版本：`0.1.0-652-g43fb88a-20260927-102733`（= `deploy/stack/.version`）。
+* `apply.sh`：**7 个镜像引用已 pin**；`e2b-worker` StatefulSet 滚完（2/2）、`control-plane`/`autoscaler`
+  `configured`、`redis` `unchanged`；base image 仍是清单里那条
+  `python-mcp:3.14@sha256:3675662d…`（两个 worker 的 `peek` 都 `cached=true`、`warmed=skipped`）。
+  ⚠️ 这次构建把 ACR 上的 **mirror tag** `byteplan/python-mcp:3.14` 重推成了新 digest
+  `sha256:4474e78f…`；**清单里的 digest pin 没动**，所以线上仍跑原来那条 —— 别把"tag 的 digest 变了"
+  读成"线上基镜像换了"。
+* 上线后 `kubectl diff`（`DRY_RUN=1 apply.sh` 渲染的整栈 vs 线上）**0 行差异** ⇒ 仓库规格与线上一致。
+
+**验收（全部在 `0.1.0-652` 上跑）**
+
+| 判据 | 结果 | 证据 |
+|---|---|---|
+| 预检两档 lane（冻结 HEAD `43fb88a`，发布前） | gate A `2060 passed / 10 skipped / 3 xfailed / 0 failed`、gate B `2053 / 17 / 3 / 0`；对上一基线各 **+33 passed** 且逐条归因（无删除、skip/xfail 逐字不变） | `tmp/k0s/preflight-gate{A,B}.log` |
+| 仓库规格 ≡ 线上 | `kubectl diff` **0 行**（渲染 1024 行 / 7 处 pin） | `tmp/k0s/apply-render2.yaml`、`tmp/k0s/apply-diff2.txt` |
+| `multinode_smoke.py` | 两 worker 各 2 个沙箱；commands / files / health / stdin 全过；kill 后两边预约 0 ⇒ `MULTI-NODE SMOKE OK` | 见下一行的日志 |
+| `deployment_smoke.py` | 命令+文件、跨节点迁移保文件、网络配置 echo+原子更新、远端卷+兄弟卷隔离、**模板构建→registry push→worker pull→image rootfs**、MCP gateway 全过 ⇒ `DEPLOYMENT SMOKE OK` | `tmp/k0s/release-652-acceptance.log` |
+| **N37 判据**（单命令写 4000 文件，×3） | **两轮各 3/3**（首轮 `92.9/94.2/93.5 s`、落盘那轮 `92.5/93.6/93.2 s`），每轮 `files on disk=4000`；修前同形状在 **61.4 s** 就断 | 同上（`grep 'run [0-9]: OK'`） |
+| **N42 判据**（`allowInternetAccess=True`） | `pypi.org:443 CONNECTED` + `TLSv1.3`；裸 IP `104.20.23.154:443` 按策略 `ConnectionRefusedError 111`（对照说明不是"网络全开"） | 同上 |
+| checkpoint 端到端 | pause → 图落 `state/_runtime/.checkpoints/<id>/latest` → **换掉宿主 worker pod** → resume → 计数 `3→4` → `exec_after_resume EXEC_OK` → 图被消费 ⇒ `{"step":"OK"}` | `deploy/scripts/checkpoint_acceptance.py`（输出见本节文字） |
+| 配额账本（N41 的副作用面） | 上述全部跑完后 `GET /internal/nodes`：两节点 `reservedMemoryMB=0`、`reservedDiskMB=0` | 同上 |
+
+**怎么再跑一遍**：通道与两个 key 同 §11.4，把最后三行换成
+`.venv/bin/python tmp/n37/cluster_run.py --files 4000 --runs 3`、
+`.venv/bin/python tmp/k0s/n42-egress-probe.py`、
+`.venv/bin/python deploy/scripts/checkpoint_acceptance.py`（后者**会删宿主 worker 的 pod**，
+脚本自带"这台 worker 上还有别人的沙箱就拒绝"的礼貌检查，`--force` 是唯一出口）。
+
+> 本节的日志都在 `tmp/`（gitignored，会被清）。数字要复核就按上面这几行自己跑一遍 ——
+> 上一轮踩过的坑是"文档里嵌了一份会飘的数字表"，所以这里连判据命令一起给，别只信表格。
