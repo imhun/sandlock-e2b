@@ -5,16 +5,21 @@
 # 写下的（0600/0700）。非 root worker 读不了 root 的文件 ⇒ 这一步是硬前置。
 # 沙箱树 `<export>/workspaces/<id>` 属于池 uid（不是 worker 的），**绝不在迁移范围内**：
 # 要迁的目录是一份显式的路径计划（引擎里的 `PLATFORM_TARGETS` + 调用方用 `--target` 追加的
-# 条目），每一条都过 `normalize_target()`：树根下**只放行 `workspaces/_migrate` 这一条确切
-# 条目**（控制面的迁移暂存，`workspace-root-init` 建的就是它），其余任何落在 `workspaces/`
-# 之下 —— 包括用 `..` 或符号链接绕过去的拼写 —— 一律拒绝并点名。
+# 条目），每一条都过 `normalize_target()`：树根下**恰放行 `workspaces/_migrate` 与
+# `workspaces/_snapshots` 这两条确切条目**（前者是控制面的迁移暂存，`workspace-root-init`
+# 建的就是它；后者是 **worker 的快照 payload 根** —— `envd_service/agent.py` 把它硬编码在
+# `<workspace_base>/_snapshots`），其余任何落在 `workspaces/` 之下 —— 包括用 `..` 或符号
+# 链接绕过去的拼写 —— 一律拒绝并点名。注意控制面的快照*记录*在另一个根上
+# （`<export>/_snapshots`，见下），两个根都在计划里，所以两边都覆盖到。
 #
 # 迁移目标（相对 `<export>` = `/var/lib/e2b-sandboxes`，**只改属主**）：
 #   state/**     记录、命令日志、.checkpoints、.route-b、.uid_reservations、.uid_pool.lock
 #   workspaces/_migrate   控制面迁移暂存（N27 之后它在树根之下；worker 只写它下面自己那份）
+#   workspaces/_snapshots worker 的快照 payload 根（agent.py 硬编码 <workspace_base>/_snapshots，
+#                        坐在树根旁边；控制面的记录根是另一条 <export>/_snapshots）
 #   _images      OCI layout / rootfs 缓存
 #   _secrets     沙箱 secret 文件
-#   _snapshots   快照
+#   _snapshots   控制面的快照记录/载荷根（SnapshotRegistry 建在共享 export 根上）
 #   _templates   模板
 #   _builds      构建产物
 #   （`_volumes` 不在其中：它的数据要被 bind 进沙箱，属主是池 uid 的账，另做。）
@@ -32,8 +37,8 @@
 #   * DRY_RUN=1 是默认；只有显式 --apply（以及 Job 里的 --in-cluster --apply）才写
 #   * 唯一的写操作是 `chown -R 65534:65534`：不改权限位、不删任何东西、不拷内容
 #   * worker 不在 0 副本、或还有 worker pod 在跑，就拒绝（观测，不是猜）
-#   * 路径计划只放行那一条 <export>/workspaces/_migrate；其余任何落在 <export>/workspaces/
-#     之下的路径都拒绝（含 `..` / 符号链接的拼写）
+#   * 路径计划只放行 <export>/workspaces/_migrate 与 <export>/workspaces/_snapshots 这两条；
+#     其余任何落在 <export>/workspaces/ 之下的路径都拒绝（含 `..` / 符号链接的拼写）
 #   * 先跑一遍只读的计划（经控制面 pod），再让 Job 去写；跑完每个目录 stat 留证
 #   * 任何一步失败都非零退出并**保留现场**（没有 trap、没有 try/finally 式清理）
 #
@@ -112,8 +117,9 @@ py_engine() {
 唯一的写操作是 `chown -R 65534:65534 <target>`；这里不改权限位、没有 unlink/rmdir、
 没有任何形式的删除 —— 迁移改的只是属主。路径计划是显式数据，每一条都过
 `normalize_target()`：归一化（`posixpath.normpath` 把 `..` 消掉）之后只要落在
-`<export>/workspaces/` 之下就拒绝（**唯一例外**是那一条确切条目
-`workspaces/_migrate`，控制面的迁移暂存）—— 其余的都是池 uid 的沙箱树，不是 worker 的。
+`<export>/workspaces/` 之下就拒绝（**例外恰是那两条确切条目**：`workspaces/_migrate`
+控制面的迁移暂存；`workspaces/_snapshots` worker 的快照 payload 根，`envd_service/agent.py`
+硬编码为 `<workspace_base>/_snapshots`）—— 其余的都是池 uid 的沙箱树，不是 worker 的。
 根目录在盘上时再过一道 `realpath`：放行的那一条必须**就是它自己那个真实目录**，符号
 链接绕过去的拼写（包括换个名字解析到它的）同样被拒。
 """
@@ -139,6 +145,7 @@ WORKER_GID = 65534
 PLATFORM_TARGETS = (
     "state",
     "workspaces/_migrate",
+    "workspaces/_snapshots",
     "_images",
     "_secrets",
     "_snapshots",
@@ -146,13 +153,24 @@ PLATFORM_TARGETS = (
     "_builds",
 )
 
-#: 沙箱树：池 uid 的树，不是 worker 的。这个前缀下除 `MIGRATE_STAGING` 外一律拒绝。
+#: 沙箱树：池 uid 的树，不是 worker 的。这个前缀下除 `TREE_ROOT_ALLOWED` 外一律拒绝。
 SANDBOX_TREES = "workspaces"
 
-#: 树根下唯一放行的那一条：控制面的迁移暂存（N27 之后它在 `<export>/workspaces/` 之下，
-#: 不在 export 根上 —— 这条路径与 `workspace-root-init`、控制面 subPath、worker 的迁移
-#: 端点四处同名）。写白名单而不是"解析到它就放行"：只有这一条确切条目能过。
-MIGRATE_STAGING = "workspaces/_migrate"
+#: 树根下**恰好**放行的两条。两条都在 `<export>/workspaces/` 之下（N27 之后平台命名空间沉
+#: 到树根下，不在 export 根上 —— 它们与 `workspace-root-init`、控制面 subPath、worker 端点
+#: 四处同名）：
+#:   * `workspaces/_migrate`：控制面的迁移暂存（`workspace-root-init` 建的就是它，控制面唯一
+#:     可写的 subPath；worker 的迁移端点也写它）；
+#:   * `workspaces/_snapshots`：**worker 的快照 payload 根** —— `envd_service/agent.py` 把它的
+#:     copy/export/delete 路由硬编码在 `<workspace_base>/_snapshots/<id>`（`fs/` 载荷 +
+#:     `.complete` 标记），也就是树根下的这一条。C1 之后 worker 以 uid 65534 跑，它要往这里
+#:     写，所以属主必须是 worker。（控制面的快照**记录**在另一个根上：`SnapshotRegistry` 建在
+#:     共享 export 根 -- `control_plane/app.py` 的 `platform_root` =
+#:     `settings.shared_workspace_root` -- 于是 `_snapshot_dir` = `<export>/_snapshots/<id>`，
+#:     见 `control_plane/registry/snapshots.py`；那条就是计划里的第 6 条 `_snapshots`。两个根
+#:     都在计划里，所以谁写哪个根都被覆盖到。）
+#: 写白名单而不是"解析到它就放行"：只有这两条确切条目能过。
+TREE_ROOT_ALLOWED = ("workspaces/_migrate", "workspaces/_snapshots")
 
 
 class Refuse(Exception):
@@ -187,11 +205,11 @@ def normalize_target(raw, root):
     if parts[0] == "..":
         raise Refuse(EXIT_PLAN, "拒绝：%s 用 .. 爬到 export 根之外" % raw)
     rel = "/".join(parts)
-    if parts[0] == SANDBOX_TREES and rel != MIGRATE_STAGING:
+    if parts[0] == SANDBOX_TREES and rel not in TREE_ROOT_ALLOWED:
         raise Refuse(
             EXIT_PLAN,
-            "拒绝：%s 落在 %s/ 之下（沙箱树属于池 uid，不是 worker 的；树根下唯一放行的"
-            "是 %s）" % (raw, SANDBOX_TREES, MIGRATE_STAGING),
+            "拒绝：%s 落在 %s/ 之下（沙箱树属于池 uid，不是 worker 的；树根下只放行 %s "
+            "两条）" % (raw, SANDBOX_TREES, "、".join(TREE_ROOT_ALLOWED)),
         )
     return rel
 
@@ -201,15 +219,16 @@ def assert_no_symlink_escape(root, rel, raw):
     real_root = os.path.realpath(root)
     real = os.path.realpath(os.path.join(root, rel))
     trees = os.path.join(real_root, SANDBOX_TREES)
-    if rel == MIGRATE_STAGING:
-        # 放行的那一条必须**就是它自己**：`<export>/workspaces/_migrate` 若是一条指向
-        # 别处的符号链接（指向沙箱树、指向 export 之外都算），realpath 就落到别处了。
-        expected = os.path.join(trees, "_migrate")
+    if rel in TREE_ROOT_ALLOWED:
+        # 放行的两条必须**就是它们自己**：`<export>/workspaces/_snapshots`（或 `_migrate`）
+        # 若是一条指向别处的符号链接（指向沙箱树、指向 export 之外都算），realpath 就落到
+        # 别处了。
+        expected = os.path.join(trees, os.path.basename(rel))
         if real != expected:
             raise Refuse(
                 EXIT_PLAN,
-                "拒绝：%s 经符号链接落到 %s —— 迁移只碰真实目录，且树根下放行的就是它自己"
-                "那一个（停下来人看）" % (raw, real),
+                "拒绝：%s 经符号链接落到 %s —— 迁移只碰真实目录，且树根下放行的就是它们自己"
+                "那两个（停下来人看）" % (raw, real),
             )
         return
     if real == trees or real.startswith(trees + os.sep):

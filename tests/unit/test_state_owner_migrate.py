@@ -7,11 +7,15 @@ wave 1/2 之后 worker 是 uid 65534，而今天这台 NAS 上的平台态文件
 * **静态**：钉脚本与 Job 的文本 —— dry-run 是默认、唯一的写操作是 `chown`（没有 chmod、
   没有删除、没有 `trap` 清理现场）、worker 不在 0 副本就拒绝、Job 以 root 跑在同一条
   PVC 上且不自动重试、三处占位符让"直接 apply 原文件"什么也做不了；
-* **行为**：在没有集群的情况下跑 `--print-plan` 与 `--root` 彩排 —— 计划恰是 7 个平台
-  目标；树根下**只允许 `workspaces/_migrate` 这一条确切条目**（控制面唯一可写的 subPath，
-  也是 `workspace-root-init` 建的那个），其余任何落在 `workspaces/` 之下的拼写（含
-  `workspaces` 本身、它的兄弟、`..` 与符号链接的变体）都被点名拒绝。毒化过的 `kubectl`
-  （记录自己被调用过、然后失败）把"这些路径不连集群"变成断言而不是承诺。
+* **行为**：在没有集群的情况下跑 `--print-plan` 与 `--root` 彩排 —— 计划恰是 8 个平台
+  目标；树根下**恰允许 `workspaces/_migrate` 与 `workspaces/_snapshots` 这两条确切条目**
+  （前者是控制面唯一可写的 subPath、也是 `workspace-root-init` 建的那个；后者是 **worker
+  的快照 payload 根** —— `envd_service/agent.py` 硬编码为 `<workspace_base>/_snapshots`，
+  C1 之后 worker 以 uid 65534 往它里面写，属主必须是 worker；控制面的记录根是另一条
+  `<export>/_snapshots`），其余任何落在 `workspaces/` 之下的拼写（含
+  `workspaces` 本身、它的兄弟、那两条下面的东西、`..` 与符号链接的变体）都被点名拒绝。
+  毒化过的 `kubectl`（记录自己被调用过、然后失败）把"这些路径不连集群"变成断言而不是
+  承诺。
 
 脚本行按 `strip()` 后精确比对（同 `test_migrate_state_base_script.py`）：重写过的行要在
 这里重新对一遍，而不是靠旧行的子串蒙过去。
@@ -41,13 +45,17 @@ WORKER_GID = 65534
 #: `<export>`：集群里那块 PVC（`sandbox-shared`）的挂载点，也是 Job 挂它的路径。
 EXPORT_IN_CLUSTER = "/var/lib/e2b-sandboxes"
 
-#: 计划里那 7 个平台目标，**顺序即脚本的打印顺序**（Task 6 brief 的顺序）。
-#: `_migrate` 在 N27 之后落在**树根之下**（`workspaces/_migrate`，控制面在那里的 subPath），
-#: 不在 export 根上 —— 迁移工具的目标路径必须与清单和 worker 端点同名，否则真机上它恒
-#: MISSING（这个 bug 就是本轮修的那条）。
+#: 计划里那 8 个平台目标，**顺序即脚本的打印顺序**（Task 6 brief 的顺序）。
+#: `_migrate` 与 `_snapshots` 在 N27 之后落在**树根之下**（前者是控制面在那里的 subPath；
+#: 后者是 worker 的快照 payload 根，`envd_service/agent.py` 硬编码
+#: `<workspace_base>/_snapshots`），不在 export 根上 —— 迁移工具的目标路径必须与清单和
+#: worker 端点同名，否则真机上它们恒 MISSING（`_migrate` 那条就是这个 bug，本轮修的就是它；
+#: `_snapshots` 是 Task 8 真机预检新发现的补丁）。控制面的快照**记录**根是另一条
+#: `<export>/_snapshots`（`SnapshotRegistry` 建在共享 export 根上），也在计划里。
 PLATFORM_TARGETS = (
     "state",
     "workspaces/_migrate",
+    "workspaces/_snapshots",
     "_images",
     "_secrets",
     "_snapshots",
@@ -55,11 +63,15 @@ PLATFORM_TARGETS = (
     "_builds",
 )
 
-#: 沙箱树。池 uid 的树，不是 worker 的 —— 这个前缀下除 `MIGRATE_STAGING` 外一律拒绝。
+#: 沙箱树。池 uid 的树，不是 worker 的 —— 这个前缀下除 `TREE_ROOT_ALLOWED` 外一律拒绝。
 SANDBOX_TREES = "workspaces"
 
-#: 树根下唯一被允许的那一条：控制面的迁移暂存（worker 自己也写它下面那份）。
+#: 树根下**恰好**放行的两条：控制面的迁移暂存（worker 自己也写它下面那份）与 **worker 的
+#: 快照 payload 根**（`<workspace_base>/_snapshots/<id>`；C1 之后 worker 以 uid 65534 往它
+#: 里面写 payload，属主必须是 worker。控制面的记录根是另一条 `<export>/_snapshots`）。
 MIGRATE_STAGING = "workspaces/_migrate"
+SNAPSHOT_STORE = "workspaces/_snapshots"
+TREE_ROOT_ALLOWED = (MIGRATE_STAGING, SNAPSHOT_STORE)
 
 
 def _lines(path: Path) -> list[str]:
@@ -169,6 +181,12 @@ def export_root(tmp_path: Path) -> Path:
     (root / "state" / ".route-b" / "10000").mkdir(parents=True)
     (root / "state" / ".uid_pool.lock").write_text("", encoding="utf-8")
     (root / SANDBOX_TREES / "_migrate").mkdir(parents=True)
+    # worker 的快照 payload 根：树根下的第二条平台目录（`envd_service/agent.py` 硬编码
+    # `<workspace_base>/_snapshots`）。它必须**真的在盘上**，否则"放行
+    # workspaces/_snapshots"可以在一棵根本没有它的树上恒 MISSING 地通过 —— 那正是这条修复
+    # 要防的静默类型。
+    (root / SANDBOX_TREES / "_snapshots" / "sbx_aaa").mkdir(parents=True)
+    (root / SANDBOX_TREES / "_snapshots" / "sbx_aaa" / "fs").mkdir(parents=True)
     for name in ("_images", "_secrets", "_snapshots", "_templates", "_builds"):
         (root / name).mkdir()
     (root / "_builds" / "ctx.tar").write_bytes(b"build-context")
@@ -315,18 +333,20 @@ def test_the_job_is_not_part_of_the_rendered_overlay() -> None:
 # --- 行为：路径计划（不连集群） -------------------------------------------
 
 
-def test_print_plan_lists_exactly_the_seven_platform_targets(tmp_path: Path) -> None:
+def test_print_plan_lists_exactly_the_eight_platform_targets(tmp_path: Path) -> None:
     proc = _run(["--print-plan"], env=_offline_env(tmp_path))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     targets = _targets(proc.stdout)
     assert targets == [
         f"TARGET rel={name} owner={WORKER_UID}:{WORKER_GID}" for name in PLATFORM_TARGETS
     ]
-    # 树根下唯一允许的条目就是控制面的迁移暂存；`workspaces` 本身、它的兄弟、树都拒绝。
+    assert len(targets) == 8
+    # 树根下恰允许那两条：控制面的迁移暂存与 worker 的快照 payload 根；`workspaces` 本身、它的兄弟、
+    # 别的目录都拒绝 —— 这条断言钉的就是"放行集恰是那两条"。
     rels = [line.split("rel=")[1].split(" ")[0] for line in targets]
     assert [
         rel for rel in rels if rel == SANDBOX_TREES or rel.startswith(SANDBOX_TREES + "/")
-    ] == [MIGRATE_STAGING]
+    ] == list(TREE_ROOT_ALLOWED)
     assert not (tmp_path / "kubectl-was-called.log").exists()
 
 
@@ -334,13 +354,16 @@ def test_print_plan_lists_exactly_the_seven_platform_targets(tmp_path: Path) -> 
     "declared",
     [
         "workspaces",
-        "workspaces/sbx_1",
-        # 树根下唯一放行的那条**不**给它开侧门：树根下的别的目录、或经 `..`/额外层级
-        # 绕回树里，都还是"落在 workspaces/ 之下"。
+        "workspaces/sbx_aaa",
+        # 树根下放行的那两条**不**给它们开侧门：树根下的别的目录、它们下面的东西、或经
+        # `..`/额外层级绕回树里，都还是"落在 workspaces/ 之下"。
         "workspaces/_migrate/sbx_1",
         "workspaces/_migrate/../sbx_1",
-        f"{EXPORT_IN_CLUSTER}/workspaces/../workspaces/sbx_1",
+        "workspaces/_snapshots/sbx_aaa",
+        "workspaces/_snapshots/../sbx_aaa",
+        f"{EXPORT_IN_CLUSTER}/workspaces/../workspaces/sbx_aaa",
         f"{EXPORT_IN_CLUSTER}/workspaces/_migrate/../workspaces/sbx_1",
+        f"{EXPORT_IN_CLUSTER}/workspaces/_snapshots/../workspaces/sbx_aaa",
     ],
 )
 def test_a_declared_path_under_the_sandbox_trees_is_refused_by_name(
@@ -351,60 +374,89 @@ def test_a_declared_path_under_the_sandbox_trees_is_refused_by_name(
     # 点名：拒绝文案里就是调用方写的那条路径。
     assert proc.stderr.splitlines()[0] == (
         f"REFUSE(2): 拒绝：{declared} 落在 {SANDBOX_TREES}/ 之下"
-        f"（沙箱树属于池 uid，不是 worker 的；树根下唯一放行的是 {MIGRATE_STAGING}）"
+        f"（沙箱树属于池 uid，不是 worker 的；树根下只放行 {'、'.join(TREE_ROOT_ALLOWED)} 两条）"
     )
     # fail-closed：拒绝发生在打印计划之前，stdout 里一条 TARGET 都没有。
     assert proc.stdout == ""
 
 
-def test_the_migration_staging_is_the_one_entry_the_tree_root_allows(
+def test_the_two_tree_root_platform_dirs_are_the_entries_the_tree_root_allows(
     export_root: Path, tmp_path: Path
 ) -> None:
-    """`workspaces/_migrate` 是树根下唯一放行的一条 —— 而且它是那条真的路径。
+    """树根下恰放行那两条 —— 而且它们都是那两条**真的路径**（fixture 里确实存在）。
 
-    它是 N27 之后控制面唯一可写的 subPath（`workspace-root-init` 建的就是它），所以迁移
-    工具必须去 chown 它；工具曾在 export 根上找 `_migrate`，在真机上因此恒 MISSING。
-    `--target` 再声明一遍是幂等的：计划去重，打印出来仍是那 7 条。
+    `workspaces/_migrate` 是 N27 之后控制面唯一可写的 subPath（`workspace-root-init` 建的就是
+    它）；`workspaces/_snapshots` 是 worker 的快照 payload 根（C1 之后 worker 把 payload 写进
+    它）。两者都坐在
+    树根下，所以迁移工具必须去 chown 它们。`--target` 再声明一遍是幂等的：计划去重，打印出来
+    仍是那 8 条；相对与绝对拼写都 rc=0。
     """
-    proc = _run(
-        ["--root", str(export_root), "--print-plan", "--target", MIGRATE_STAGING],
-        env=_offline_env(tmp_path),
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert _targets(proc.stdout) == [
-        f"TARGET rel={name} owner={WORKER_UID}:{WORKER_GID}" for name in PLATFORM_TARGETS
+    for rel in TREE_ROOT_ALLOWED:
+        assert (export_root / rel).is_dir(), rel
+    # 相对拼写：就是计划里那一条确切条目，`--target` 再声明一遍是幂等的（去重后仍是那 8 条）。
+    for declared in TREE_ROOT_ALLOWED:
+        proc = _run(
+            ["--root", str(export_root), "--print-plan", "--target", declared],
+            env=_offline_env(tmp_path),
+        )
+        assert proc.returncode == 0, declared + proc.stdout + proc.stderr
+        assert _targets(proc.stdout) == [
+            f"TARGET rel={name} owner={WORKER_UID}:{WORKER_GID}" for name in PLATFORM_TARGETS
+        ], declared
+    # 绝对拼写：同一条路径换个写法也必须放行（rc=0，且该 rel 在计划里）。
+    for rel in TREE_ROOT_ALLOWED:
+        proc = _run(
+            ["--root", str(export_root), "--print-plan", "--target", f"{export_root}/{rel}"],
+            env=_offline_env(tmp_path),
+        )
+        assert proc.returncode == 0, rel + proc.stdout + proc.stderr
+        rels = [line.split("rel=")[1].split(" ")[0] for line in _targets(proc.stdout)]
+        assert set(rels) == set(PLATFORM_TARGETS)
+        assert rel in rels
+    # 两条放行条目**真的在盘上**、被 stat 到 —— 不是恒 MISSING 的摆设。
+    planned = _run(["--root", str(export_root)], env=_offline_env(tmp_path))
+    assert planned.returncode == 0, planned.stdout + planned.stderr
+    assert [line for line in planned.stdout.splitlines() if line.startswith("MISSING rel=")] == []
+    stat_rels = [
+        line.split("rel=")[1].split(" ")[0]
+        for line in planned.stdout.splitlines()
+        if line.startswith("STAT rel=")
     ]
+    assert [rel for rel in TREE_ROOT_ALLOWED if rel in stat_rels] == list(TREE_ROOT_ALLOWED)
 
 
-def test_the_staging_entry_must_be_its_own_real_directory(
-    export_root: Path, tmp_path: Path
+@pytest.mark.parametrize("rel", TREE_ROOT_ALLOWED)
+def test_each_tree_root_entry_must_be_its_own_real_directory(
+    rel: str, export_root: Path, tmp_path: Path
 ) -> None:
-    """放行 `workspaces/_migrate` 的前提是它就是那个真实目录，不是一条符号链接。"""
-    shutil.rmtree(export_root / SANDBOX_TREES / "_migrate")
-    (export_root / SANDBOX_TREES / "_migrate").symlink_to("sbx_aaa")
-    real = os.path.realpath(export_root / SANDBOX_TREES / "_migrate")
+    """放行一条树根下的平台目录的前提是它就是那个真实目录，不是一条符号链接。"""
+    shutil.rmtree(export_root / rel)
+    (export_root / rel).symlink_to("sbx_aaa")
+    real = os.path.realpath(export_root / rel)
     proc = _run(["--root", str(export_root), "--print-plan"], env=_offline_env(tmp_path))
     assert proc.returncode == 2
     assert proc.stderr.splitlines()[0] == (
-        f"REFUSE(2): 拒绝：{MIGRATE_STAGING} 经符号链接落到 {real}"
-        " —— 迁移只碰真实目录，且树根下放行的就是它自己那一个（停下来人看）"
+        f"REFUSE(2): 拒绝：{rel} 经符号链接落到 {real}"
+        " —— 迁移只碰真实目录，且树根下放行的就是它们自己那两个（停下来人看）"
     )
     assert proc.stdout == ""
 
 
-def test_a_symlink_alias_of_the_staging_directory_is_refused(
-    export_root: Path, tmp_path: Path
+@pytest.mark.parametrize("rel", TREE_ROOT_ALLOWED)
+def test_a_symlink_alias_of_a_tree_root_entry_is_refused(
+    rel: str, export_root: Path, tmp_path: Path
 ) -> None:
-    """换个名字走同一条路也不行：白名单是那**一条**确切条目，不是"解析到它就算"。"""
-    (export_root / "mig-alias").symlink_to(MIGRATE_STAGING)
-    real = os.path.realpath(export_root / "mig-alias")
+    """换个名字走同一条路也不行：白名单是那**两条**确切条目，不是"解析到它就算"。"""
+    alias = "platform-alias"
+    (export_root / alias).symlink_to(rel)
+    real = os.path.realpath(export_root / alias)
     proc = _run(
-        ["--root", str(export_root), "--print-plan", "--target", "mig-alias"],
+        ["--root", str(export_root), "--print-plan", "--target", alias],
         env=_offline_env(tmp_path),
     )
     assert proc.returncode == 2
     assert proc.stderr.splitlines()[0] == (
-        f"REFUSE(2): 拒绝：mig-alias 经符号链接落在 {SANDBOX_TREES}/ 之下（{real}）"
+        f"REFUSE(2): 拒绝：{alias} 经符号链接落在 {SANDBOX_TREES}/ 之下（{real}）"
         "—— 沙箱树属于池 uid，不是 worker 的"
     )
     assert proc.stdout == ""
@@ -459,7 +511,7 @@ def test_the_offline_dry_run_plans_every_target_and_writes_nothing(
             % (name, st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), files, dirs)
         )
     assert [line for line in lines if line.startswith("STAT rel=")] == expected
-    assert "SUMMARY mode=plan targets=7 chowned=0 missing=0" in lines
+    assert "SUMMARY mode=plan targets=8 chowned=0 missing=0" in lines
     # dry-run 什么也没写：条目、inode、权限位、mtime 逐条不变。
     assert _inventory(export_root) == before
     assert not (tmp_path / "kubectl-was-called.log").exists()
@@ -468,7 +520,7 @@ def test_the_offline_dry_run_plans_every_target_and_writes_nothing(
 def test_an_empty_root_refuses_in_apply_mode(tmp_path: Path) -> None:
     """卷没挂上（空目录）时**不能**以成功收尾。
 
-    挂在空目录上的 PVC 实测就是"7 条全 MISSING、chowned=0、RC=0"——运维会以为迁完了，
+    挂在空目录上的 PVC 实测就是"8 条全 MISSING、chowned=0、RC=0"——运维会以为迁完了，
     起来 worker 才发现平台态还是 root 的 0600。所以两个闸门都必须在写路径上：形状闸门
     （`state` 与 `state/_runtime` 都不在 ⇒ 这不是本平台的 export 根）先响，`chowned == 0`
     那条兜住其它"计划与实物对不上"的样子。兄弟工具在同样情形用的是 `EXIT_SHAPE`(=3)。
@@ -512,7 +564,7 @@ def test_a_root_with_state_but_no_runtime_is_not_a_shape_error(tmp_path: Path) -
         "STAT rel=state uid=%d gid=%d mode=0%o files=1 dirs=0"
         % (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode))
     ]
-    assert "SUMMARY mode=plan targets=7 chowned=0 missing=6" in lines
+    assert "SUMMARY mode=plan targets=8 chowned=0 missing=7" in lines
 
 
 def test_the_engine_asks_chown_to_re_own_the_planned_path(
@@ -521,7 +573,7 @@ def test_the_engine_asks_chown_to_re_own_the_planned_path(
     """`--apply` 真的去调 `chown -R 65534:65534 <计划里的路径>`，第一条是 `state`。
 
     这台开发机不是 root，chown 不会生效，所以这里用一个"记录 argv、不改属主"的假 chown：
-    它同时把引擎的 fail-closed 后置检查（属主没变成 worker 就拒绝）变成断言。7 条路径的
+    它同时把引擎的 fail-closed 后置检查（属主没变成 worker 就拒绝）变成断言。8 条路径的
     全集在容器里用"记录 + 转发给真 chown"的包装脚本证明（见 task-6-report.md）。
     """
     env, chown_log = _chown_recorder_env(tmp_path)
@@ -642,7 +694,7 @@ elif rest[:2] == ["get", "pods"]:
     print(os.environ.get("STUB_PODS", ""))
 elif rest[:1] == ["exec"]:
     assert stdin.startswith("#!/usr/bin/env python3"), stdin[:60]
-    print("SUMMARY mode=plan targets=7 chowned=0 missing=0")
+    print("SUMMARY mode=plan targets=8 chowned=0 missing=0")
 elif rest[:2] == ["create", "configmap"]:
     print("apiVersion: v1\\nkind: ConfigMap\\nmetadata:\\n  name: state-owner-migrate\\n")
 elif rest[:1] == ["apply"]:

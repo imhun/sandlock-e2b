@@ -22,6 +22,8 @@
 | Task 9（终审 Minor 收口） | ✅ 已合并（wave 2 + `2ef457e`） |
 | **Task 8（真机 rollout 与验收）** | ⏸ **未执行**：需要 KUBECONFIG + 停机窗口授权（worker 缩 0 跑迁移）。前置清单见下文与 `docs/k8s-deployment.md` §24。 |
 
+**Task 8 真机预检发现（2026-09-27，只读）**：**worker 的快照 payload 根** `<workspaces>/_snapshots`（`envd_service/agent.py` 硬编码 `<workspace_base>/_snapshots`；控制面的记录根是另一条 `<export>/_snapshots`）坐在树根下、属主 `root:0755` —— C1 之后 65534 的 worker 写不进去（"上线后第一次 create snapshot 才炸"的静默类型）。已由本次修复覆盖：`deploy/k8s/priv-broker.yaml` 的 `workspace-root-init` 把它交给 65534（`mkdir -p` + `chown 65534:65534` + 校验），`deploy/scripts/migrate-state-owner.sh` 的树根白名单放行它（`workspaces/_migrate`、`workspaces/_snapshots` 两条）。见 `docs/k8s-deployment.md` §24。
+
 **已知延后（非阻断，均已记账）**
 1. `drop: [ALL]`：broker 目前仍是"默认 root 集 + 三条 cap"，需真机确认只有 `CHOWN/DAC_OVERRIDE/FOWNER` 时 `walk/rm/chown` 仍成立后再加（`deploy/k8s/priv-broker.yaml` 注释已写明）。
 2. Python 侧单行读取上限 ≈3 GiB > worker 容器 `limits.memory: 2Gi`：要真正生效需把 `walk` 改成流式读（现在名义有界、实际 OOM 先行）。
@@ -166,9 +168,9 @@
 
 **Files:** Create `deploy/k8s-k0s/state-owner-migrate.yaml`（仿 `state-base-migrate.yaml`：`runAsUser: 0`、`backoffLimit: 0`、占位符 fail-closed）；Create `deploy/scripts/migrate-state-owner.sh`。
 
-**要点**：worker 缩 0 → 对 `<export>/state/**`、`<export>/workspaces/_migrate`、`<export>/_images`、`<export>/_secrets`、`<export>/_snapshots`、`<export>/_templates`、`<export>/_builds` 递归 `chown 65534:65534`，**树根下只放行 `workspaces/_migrate` 那一条确切条目，其余 `workspaces/**`（含 `workspaces` 本身、兄弟、`..` 与符号链接变体）一律拒绝**（那是池 uid 的树，脚本里用精确白名单 + 断言拒绝）。跑完 `stat` 留证。
+**要点**：worker 缩 0 → 对 `<export>/state/**`、`<export>/workspaces/_migrate`、`<export>/workspaces/_snapshots`、`<export>/_images`、`<export>/_secrets`、`<export>/_snapshots`、`<export>/_templates`、`<export>/_builds` 递归 `chown 65534:65534`（**8 条**），**树根下恰放行 `workspaces/_migrate` 与 `workspaces/_snapshots` 这两条确切条目，其余 `workspaces/**`（含 `workspaces` 本身、兄弟、两条下面的东西、`..` 与符号链接变体）一律拒绝**（那是池 uid 的树，脚本里用精确白名单 + 断言拒绝）。`workspaces/_snapshots` 是 **worker 的快照 payload 根**（`envd_service/agent.py` 把 copy/export/delete 硬编码在 `<workspace_base>/_snapshots`），控制面的快照**记录**根是另一条 `<export>/_snapshots`（`SnapshotRegistry` 建在共享 export 根上）——两条都在计划里。跑完 `stat` 留证。
 
-**验收**：迁移后 `ls -ld <export>/state` 属主 65534；树的属主仍是池 uid（`stat` 前后对比）。
+**验收**：迁移后 `ls -ld <export>/state` 与 `ls -ld <export>/workspaces/_snapshots` 属主 65534；树的属主仍是池 uid（`stat` 前后对比）。
 
 ---
 
