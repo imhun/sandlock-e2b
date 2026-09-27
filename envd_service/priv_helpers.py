@@ -167,10 +167,14 @@ BROKER_MAX_RESPONSE_BYTES = (
 #: * the answer is one JSON line and escaping inflates it up to
 #:   ``BROKER_ESCAPE_BLOWUP`` (6x) => ~229 MiB on the wire.
 #:
-#: 512 MiB is ~2.2x that worst line, so a legitimate tree is never refused --
-#: and still deliberately *below* the worker container's ``limits.memory``
-#: (2Gi; pinned in ``tests/unit/test_worker_manifest_permissions.py``), so
-#: crossing it is this refusal and not the kernel's OOM kill first.
+#: 512 MiB is ~2.2x that worst line, so a tree whose average line stays within
+#: the estimate is not refused. A tree beyond it (unusually long lines, or
+#: escaping close to the full 6x) hits the daemon's own 256 MiB **unescaped**
+#: ceiling first, which answers ``ok:false`` rather than a long line -- that
+#: "measurement failed" category predates this ceiling. 512 MiB is still
+#: deliberately *below* the worker container's ``limits.memory`` (2Gi; pinned
+#: in ``tests/unit/test_worker_manifest_permissions.py``), so crossing it is
+#: this refusal and not the kernel's OOM kill first.
 #:
 #: **Single-tree, never multi.** Every caller walks one tree (``registry`` per
 #: record's workspace, ``health`` for one sandbox's workspace,

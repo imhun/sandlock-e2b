@@ -19,6 +19,8 @@ to freezing in place rather than quietly spending a user's space.
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 
 from envd_service import priv_helpers as ph
@@ -141,6 +143,39 @@ def test_the_platform_account_walks_one_runtime_child_at_a_time(
 def test_an_absent_runtime_dir_measures_zero(tmp_path: Path) -> None:
     """A worker that has never checkpointed must not report a bogus number."""
     assert measure_platform_disk_bytes(tmp_path / "nothing-here") == 0
+
+
+def test_an_unlistable_runtime_dir_says_so_before_reporting_zero(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """``None`` becomes 0, and 0 reads as "the platform stores nothing".
+
+    That number feeds the ledger alert *and* the checkpoint admission ("there is
+    room to try"), so the one path that turns a failed measurement into it must
+    not be silent -- the reachability is low (the broker's ``workspace-root-init``
+    chowns ``state/_runtime`` to the worker), but a silent 0 is exactly the
+    fail-open this log line exists to make visible.
+    """
+    state = tmp_path / "state"
+    runtime = state / "_runtime"
+    runtime.mkdir(parents=True)
+
+    real_scandir = os.scandir
+
+    def refuse(path):
+        if Path(path) == runtime:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", refuse)
+    with caplog.at_level(logging.WARNING, logger="envd_service.runtime.platform_disk"):
+        measured = measure_platform_disk_bytes(tmp_path, state_base=state)
+    assert measured == 0
+    assert [record.levelname for record in caplog.records] == ["WARNING"]
+    assert (
+        caplog.records[0].getMessage().split(";", 1)[0]
+        == f"cannot list {runtime} to measure the platform disk one tree at a time"
+    )
 
 
 def test_the_platform_account_follows_the_state_base(tmp_path: Path) -> None:

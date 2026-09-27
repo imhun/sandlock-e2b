@@ -22,11 +22,14 @@ instead of quietly spending a user's space.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 from gateway_common.env import env_int
 from gateway_common.paths import RUNTIME_DIR_NAME, resolve_state_base
+
+logger = logging.getLogger(__name__)
 
 #: MiB -> bytes, the unit the knob and every message below are written in.
 _MIB = 1024 * 1024
@@ -85,10 +88,14 @@ def _runtime_bytes_one_tree_at_a_time(runtime_dir: Path) -> int | None:
     so a multi-tree answer is exactly the shape that gets refused -- and the
     accounting paths only warn, so the number would go silently stale.
 
-    The arithmetic is unchanged, byte for byte: ``directory_cost`` of
-    ``<runtime>`` itself plus one ``dir_size`` per child is precisely what one
-    walk of the whole tree visits (``os.walk`` costs every directory it enters
-    and every file beneath it). ``None`` still means "could not be measured".
+    The arithmetic is unchanged: ``directory_cost`` of ``<runtime>`` itself plus
+    one ``dir_size`` per child is precisely what one walk of the whole tree
+    visits (``os.walk`` costs every directory it enters and every file beneath
+    it). "Unchanged" is within one *route family*: a child that the worker can
+    read in process and one it hands to ``e2b-maint walk`` already disagreed on
+    symlinks before this change (the broker walks ``FTS_PHYSICAL``), and
+    splitting only decides which children take which route. ``None`` still means
+    "could not be measured".
     """
     from envd_service import priv_helpers
     from envd_service.runtime.brief_stat import directory_cost, entry_size
@@ -104,6 +111,14 @@ def _runtime_bytes_one_tree_at_a_time(runtime_dir: Path) -> int | None:
     except OSError:
         # Nothing to split on: an unsplit broker walk is the multi-tree answer
         # this exists to prevent, so report "unknown" rather than ask for it.
+        # Say so once per call: the caller turns ``None`` into 0, and 0 reads as
+        # "the platform uses nothing" to both the ledger alert and the
+        # checkpoint admission -- silence here is what makes that fail-open.
+        logger.warning(
+            "cannot list %s to measure the platform disk one tree at a time; "
+            "reporting 0 (the caller's contract for an unmeasurable account)",
+            runtime_dir,
+        )
         return None
     for entry in children:
         try:
