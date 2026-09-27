@@ -37,6 +37,7 @@
 
 | 文件 | 服务于哪个问题（取自脚本头部） | 怎么跑（取自脚本头部 / `--help`） |
 | --- | --- | --- |
+| `c2-p0-probe.sh` | C2 P0 探针的 runner：把 `probe_c2_ownership_p0.py` 送进集群、在那份 RWX claim 上跑一次、收日志、删 Job（Job 清单 `deploy/k8s-k0s/c2-p0-probe.yaml`）。 | `deploy/scripts/acceptance/c2-p0-probe.sh --print-plan\|--render-job\|--root DIR\|--apply`（`--help`） |
 | `capacity_check.py` | Capacity + per-sandbox memory check. | —（头部无 Usage 行；见脚本 `--help`） |
 | `cleanup_scratch.py` | One-shot scratch cleanup: delete regenerable test scratch under tmp/, keep | —（头部无 Usage 行；见脚本 `--help`） |
 | `cluster_keepalive_probe.py` | N37 probes: is the cut an *idle* one, and does output hold the stream open? | —（头部无 Usage 行；见脚本 `--help`） |
@@ -78,6 +79,7 @@
 | `probe-pure-workload-census.py` | 同一组命令在三种形态下的 (rc, stdout, stderr)，逐字节 diff。 | —（头部无 Usage 行；见脚本头部） |
 | `probe_127_errno.py` | Why does a *missing* path answer EACCES(13) instead of ENOENT(2)? | 头部示例（旧拼写）`sh tmp/k0s/phase1-probe2.sh /workspace/tmp/k0s/probe_127_errno.py` |
 | `probe_brief_stat_live.py` | A/B of the fix on the live cluster (N25): os.stat vs entry_size. | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_c2_ownership_p0.py` | C2 P0：uid 0 对别人 `0600`/`0700` 的语义（读/遍历/删/改）+ 粘滞位与组位（`docs/c2-ownership-frontload.md` §7）。 | 由 `c2-p0-probe.sh` 在 Job 里跑（root + NFS）；本机彩排 `sh deploy/scripts/acceptance/c2-p0-probe.sh --root DIR`；退出码 0/1/2/3/4/5 |
 | `probe_ceiling_completeness.py` | Can anything still grow the tree once the ceiling is exactly zero? | —（头部无 Usage 行；见脚本 `--help`） |
 | `probe_copy_range_zero.py` | `copy_file_range` reported 300 MiB moved while the file stayed 4096 bytes. | —（头部无 Usage 行；见脚本 `--help`） |
 | `probe_dir_cost.py` | What a directory really costs on this NAS: st_size vs st_blocks, by entry count. | —（头部无 Usage 行；见脚本 `--help`） |

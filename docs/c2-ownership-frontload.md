@@ -5,10 +5,11 @@
 > `CHOWN`+`DAC_OVERRIDE`+`FOWNER`）+ 非 root worker —— 见
 > `docs/superpowers/plans/2026-09-27-priv-broker-externalization.md` 与
 > `docs/deploy-clusters.md` §7.1–§7.3。本文记的是**另一条路线**的完整设计、它能解决什么、
-> 4 条硬限制，以及落地前必须先量的两件事。
+> 4 条硬限制；那两条 NAS 事实已在 §7 量过（2026-09-28）。
 >
-> **这篇不是待办。** 要捡起 C2，先读 §6（硬限制）与 §7（先量的事实）；那两条事实没量之前，
-> 本文只能当"设计备选"，不能当实施计划。
+> **这篇不是待办。** §7 的两条 NAS 事实已于 2026-09-28 用探针量过（结论 `zero-regression`，
+> 并推翻了一条旧记录、量出一条新的硬约束）；要捡起 C2，先读 §6（硬限制）、§5 第 2 条与 §4 末的
+> 两个**必须裁定的设计点** —— 它们没定之前，本文仍然只是"设计备选"，不是实施计划。
 
 ## 1. 两条 C 路线怎么分岔
 
@@ -87,13 +88,18 @@ e2b-as-uid extract --uid X --gid G             --path D     # stdin = tar 流，
 > **删除与记账**（`rm` / `walk`）也必须"以 X 身份"做 —— 要么补 4/5 个 verb（`rm`/`walk` 以 X 运行），
 > 要么复用"已经以 X 在跑的 route-B 槽位"来代劳。两条路的失败模式与审计面不同，要在写实施计划时
 > 单列一节定死。
+>
+> **第二个设计点（2026-09-28 量出来的）**：池 uid **不能**把自己的目录 `chgrp` 到 worker 的组
+> （探针 cell `A6` = `EPERM`，§7）。也就是说 §5 第 2 条要断言的"目录 `gid = <worker gid>`、`0770`"
+> **不是 X 自己能产生的**。三选一：保留一次极小的交棒（谁来做、算不算 "worker 永不 chown" 的
+> 例外）、放弃组位模型（worker 也改成"以 X 为唯一通道"）、或者换存储。这同样必须在写计划之前定死。
 
 ## 5. 需要改的位点（全部）
 
 | # | 位点（当前树的锚点） | 现状 | C2 之后 |
 |---|---|---|---|
 | 1 | 建树：`envd_service/agent.py`（`workspace_dir.mkdir` / `shutil.copytree` 快照 / `<ws>/workspace` 三级）与 `control_plane/api/sandboxes.py` 同形处 | worker `mkdir` + `copytree` 快照 | `mkdir` 原语建树；快照内容走 `extract` 流 |
-| 2 | 属主交棒：`envd_service/uid_pool.py::apply_sandbox_ownership` | 递归 `chown` 给池 uid | 改成**校验**：walk 断言每个 entry 属主=X、目录 gid=worker gid、mode `0770`，不符即 fail closed 点名 |
+| 2 | 属主交棒：`envd_service/uid_pool.py::apply_sandbox_ownership` | 递归 `chown` 给池 uid | 改成**校验**：walk 断言每个 entry 属主=X、目录 gid=worker gid、mode `0770`，不符即 fail closed 点名 —— ⚠ **这里的 "gid=worker gid" 是 2026-09-28 量出来的设计问题**：池 uid 自己 `chgrp` 到 worker 的组会 `EPERM`（§4 末、§7），所以这一位要么保留一次显式交棒，要么放弃组位模型 |
 | 3 | 卷切片：`envd_service/volumes.py`（卷根 `_chown_path(volume_root, host_uid)` 与 slice 建立） | worker 建 slice 再 chown；**卷根属主 = 当前挂载的那个沙箱** | `mkdir` 原语建 slice；卷根的 chown 直接删掉（`1777` 足够）⇒ **"卷根属主=首个挂载沙箱"这条语义废弃**，`tests/unit/test_volume_quota.py` 里那条 `root_st.st_uid` 断言要跟着改 |
 | 4 | 检查点镜像目录：`envd_service/runtime/checkpoint_store.py`（`_hand_to_sandbox`；`.checkpoints` gate 今天是 `os.chmod(root, 0o711)`） | worker 建 parent 再交属主 | `mkdir` 原语建；**`.checkpoints` 的 `0711` 对池 uid 不可写，要单独定策**（见 §8 风险 2） |
 | 5 | route-B 策略文档：`envd_service/route_b.py`（lease 文档由 worker 写） | worker 写 + `chgrp` 到 slot gid（NFS 上给非属组 `chgrp` 必被拒） | 用 `write` 原语写进 slot 自己的目录 |
@@ -129,23 +135,63 @@ X 私有（worker 完全碰不到，要改只能通过"以 X 身份"的原语整
 worker，因为它要在 W1 重启后改写 lease"（`envd_service/route_b.py`）。C2 下做不到"worker 可改写
 + 仅 X 可读"，只能改成"每次通过原语以 X 重写"。secret 注入同理。
 
-**H4：沙箱自造的 `0600`/`0700` 对 worker 不可达，记账/删除/快照都得"以 X 身份"做。**
-否则垃圾树清不掉、uid 池被永久占住（池 1000 个，成了真实上限）。**注意这条今天可能已经存在**：
-`docs/production-deployment-requirements.md` §5.4(b) 记着 2026-09-17 的实测 —— **这台 NAS 对 uid 0
-也不给越权读别的 uid 的 `0600` 文件**。也就是说 root worker 今天同样读不到沙箱自造的 `0600`；
-C2 不引入这个洞，但 C2 也修不了它。这正是 §7 的 P0-a 要把"读/删/改"三件事分开量的原因。
+**H4：沙箱自造的 `0600`/`0700` 对 worker 与 C2 的原语都不可达，"以 X 身份"是唯一通道。**
+否则垃圾树清不掉、uid 池被永久占住（池 1000 个，成了真实上限）。这里的"不可达"是**实测量出来的**，
+但对谁是量出来的要分清（2026-09-28，§7）：
 
-## 7. 落地前必须先量的事实（没量完，方案不成立）
+- **worker（65534）**：`D2`（删 `1777` 里 X 的条目）= `EPERM`、`D4`（拆 X 的 `0700` 树）= `EACCES`
+  ⇒ 它确实只能请求"以 X 身份"的代劳。
+- **C2 的原语（只有 `SETUID`/`SETGID`、没有 `DAC_OVERRIDE`）**：同理，它只能变成 X。
+- **uid 0 那个今天的 broker 例外**：探针量到 **uid 0 能越权**（`P0A-uid0-override=yes`，两条臂
+  一致，连"由 65534 创建的 `0600`"这个原记录形状也是 `OK`）—— 所以这个洞**今天并不存在**，
+  它是 C2 才会真正遇到的东西（C2 里没有 uid 0 可依赖）。旧记录说反了，见 §7 的"推翻的旧记录"。
 
-- **P0-a：这台 NAS 对 uid 0 的越权语义** —— 读/删/改别人 `0600`/`0700` 的能力。**已知一半**：
-  2026-09-17 那次实测说"uid 0 读别人的 `0600` 也 EACCES"（与通用 nfsd 行为不同，所以要重测）；
-  **删/改那两半没量过**。这一条决定 C2 相对今天的 root worker 是**零回归**还是**回归**。
-- **P0-b：NFSv4.0 上的粘滞位/组位行为** —— `1777`+sticky 目录里"拥有父目录但不是条目属主"能否
-  `rmdir`；`0770 group=<worker gid>` 目录里 worker 能否 `unlink`。三个 gate 目录
-  （`<workspaces>`、`_volumes/<vid>`、`_runtime/.checkpoints`）的做法全押在这上面。
+## 7. 已量：2026-09-28 的真集群结果（探针两条臂）
 
-量法：只读 + 临时目录的探针，跑在真集群上，跑完自清理；结论按"零回归 / 有回归 / 不可用"三档写下来，
-再决定要不要写实施计划。
+**探针**：`deploy/scripts/acceptance/probe_c2_ownership_p0.py`（引擎）+ `c2-p0-probe.sh`（runner，
+渲染 `deploy/k8s-k0s/c2-p0-probe.yaml` 的 root Job）。它在集群里挂同一份 PVC
+（`/var/lib/e2b-sandboxes`，实测 `P0-MOUNT … vers=4.0,…,sec=sys`），fork 成 5 个身份
+（`root` 0:0、`broker` 0:65534、`worker` 65534、`pool` 10000、`other` 10001）跑 21 个 cell，
+搭 fixture 的位置只在自己 `_probes/c2-p0-*/` 里，跑完由每个 cell 的 owner 自删。
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"      # 见 docs/deploy-clusters.md §0/§2
+deploy/scripts/acceptance/c2-p0-probe.sh --apply                      # 臂 1：容器默认 cap
+deploy/scripts/acceptance/c2-p0-probe.sh --apply --drop-dac-override  # 臂 2：uid 0 不带 DAC_OVERRIDE
+```
+
+**结论（两臂一致）**：
+
+| 判据 | 结果 | 说明 |
+|---|---|---|
+| `C1-CONTROL` | **ok** | 今天的模型在这台 NAS 上照旧：`broker` 能 list/stat/unlink `0770` 树、`chown` verb 成功；`worker` 靠组位读写 |
+| `C2-PREMISE` | **ok** | "以 X 创建"落盘属主/模式**就是**请求的样子（`A1` 读回 `10000:10000` `0700`/`0600`），X 能拆自己的树、能在 `1777` 里建/删自己的条目、能写自己的 `0770` |
+| `P0A-uid0-override` | **yes** | uid 0 能读 10000/65534 的 `0600`、进 `0700`、删 `0700`/`0755`/`0770` 里的条目 |
+| `P0A-uid0-needs-the-group` | **no** | 同一件事：uid 0 **不带**树属组也做得到 ⇒ 服务端给的是 uid 0 特权 |
+| `P0A-uid0-record-check` | **no-longer** | 复刻 09-17 那条形状（由 65534 创建的 `0600`，uid 0 打开）= `OK`；旧记录说 `EACCES` |
+| `P0B-sticky` | **enforced** | `other`（10001）删不掉 X 在 `1777` 里的条目（`EPERM`） |
+| `P0B-x-can-chgrp` | **no** | X **不能**把自己的目录 `chgrp` 到 worker 的组（`EPERM`） |
+| `C2-P0-VERDICT` | **zero-regression** | 相对今天的 root worker/broker，C2 的三条替换（以 X 创建 / 以 X 拆 / 在 sticky 父目录里自助）在这台 NAS 上都成立 |
+
+两条臂的差别只在 `P0-CAPS`（臂 1 `CapEff=…a80425fb` 含 `DAC_OVERRIDE`；臂 2 `…a80425f9` 不含），
+**cell 结果逐格相同** ⇒ 批准 uid 0 的是**服务端**，不是客户端 cap。原始日志：`tmp/c2p0-cluster-run*.log`。
+
+**推翻的旧记录**：`deploy/k8s-k0s/worker-root.patch.yaml`（C1 删除，git 历史里还在）与
+`docs/production-deployment-requirements.md` §5.4(b) 里原来写着"这台 NAS 对 uid 0 也不给越权读
+别人的 `0600`（一个由 65534 建的 `.uid_pool.lock`，root 打开报 EACCES）"。同一挂载、同一 uid 0
+身份下复现不出来；已按探针结果更正（§6 H4 与 §5.2 的对应结论也一并改了）。**"保留 worker 的
+gid" 依然成立，但理由要读对**：它服务的是 **worker（65534，没有任何有效 cap）靠组位进树**，
+以及 broker 新造出来的东西要带上 worker 的组；不是"uid 0 也进不去"。
+
+**新量出来的硬约束（设计点，见 §5 第 2 条与 §4 末）**：`P0B-x-can-chgrp=no` —— 池 uid
+**不能**把目录的组改成 worker 的 gid。所以 C2 里"目录 `gid = <worker gid>`"这个形状**不可能由 X
+自己产生**（无论本地盘还是 NFS，这是 POSIX 规则）；要么保留一次极小的交棒（谁来改这一位、算不算
+C2 的不变量例外），要么干脆放弃组位模型、让 worker 改成"以 X 为主要通道"。这是 **C2 落地前必须
+裁定的第一件事**，不是探针能替设计做的决定。
+
+**还没量、也不该由这次探针回答的**：三个 gate 目录（`<workspaces>`、`_volumes/<vid>`、
+`_runtime/.checkpoints`）在真实布局下要不要放宽、放宽到哪一档（§8 风险 1）；以及 §4 末那个
+"`rm`/`walk` 以 X 身份怎么承载"的设计点。
 
 ## 8. 会咬人但不算硬限制
 
@@ -161,7 +207,7 @@ C2 不引入这个洞，但 C2 也修不了它。这正是 §7 的 P0-a 要把"�
 
 | 期 | 内容 | 验收 |
 |---|---|---|
-| P0 | NAS 行为探针（只读+临时目录）：以 X 建目录/写文件落盘属主是否=X；`1777` 粘滞目录下 worker 能否删 X 的条目；worker 用组位读写 `0770`；复现"uid 0 无 DAC 覆盖" | 三条探针输出留档，决定第 3/4/7 条的具体做法 |
+| P0 | NAS 行为探针（只读+临时目录）：以 X 建目录/写文件落盘属主是否=X；`1777` 粘滞目录下 worker 能否删 X 的条目；worker 用组位读写 `0770`；uid 0 的越权语义（两条臂） | ✅ **已完成（2026-09-28）**：`deploy/scripts/acceptance/{probe_c2_ownership_p0.py,c2-p0-probe.sh}` + `deploy/k8s-k0s/c2-p0-probe.yaml`；21 个 cell，`C2-P0-VERDICT=zero-regression`，另量出 `P0B-x-can-chgrp=no`（§7） |
 | P1 | `e2b-as-uid` + `priv_materialize` + 单测（池外 uid/越界路径/符号链接逃逸/半安装 fail closed） | `tests/unit/test_priv_helpers.py` 同形断言 |
 | P2 | 第 1/2 条（建树+校验），开关 `E2B_TREE_OWNERSHIP=chown\|create-as` | 真机：新建箱 → `stat` 属主=池 uid、mode `770`；`deployment_smoke` |
 | P3 | 第 3/4/5/6 条（卷切片、检查点、策略文档、secret） | 各带一条 NAS 用例；`multinode_smoke` 全绿 |
@@ -183,8 +229,12 @@ C2 不引入这个洞，但 C2 也修不了它。这正是 §7 的 P0-a 要把"�
   特权动作收敛到白名单组件）。C2 要付的是 3–5 周、一次产品语义变更、以及每个位点的真机验收。
 - **什么时候才值得做**：只要"**这套数据面里不允许存在任何 root 组件**"成为硬要求（例如审计口径
   明确到这一步），或者出现"节点级 root 组件本身不被允许"的约束。
-- **做之前的三件事**：① 量 P0-a/P0-b（§7）；② 定"删除/记账怎么以 X 身份做"（§4 末的设计点）；
-  ③ 明确接受 §6 的三条产品语义变更（属主不可修复、无法"worker 可写且仅 X 可读"、回收=删除）。
+- **P0 已经量完（2026-09-28）**：两条 NAS 事实都站在 C2 这边（`C1-CONTROL=ok`、`C2-PREMISE=ok`、
+  `P0B-sticky=enforced`、`C2-P0-VERDICT=zero-regression`），并且顺带推翻了一条旧记录、量出一条
+  新约束。**所以现在挡住 C2 的不是"能不能做"，而是两个必须裁定的设计点**。
+- **做之前的三件事**：① 定"删除/记账怎么以 X 身份做"（§4 末的设计点）；② 定 `gid = worker gid`
+  这一位谁来产生（§4 末的第二个设计点 / §5 第 2 条）；③ 明确接受 §6 的三条产品语义变更
+  （属主不可修复、无法"worker 可写且仅 X 可读"、回收=删除）。
 - **与 C1 的关系**：不是升级关系。C1 减能力面、保留一个 uid 0 组件；C2 消 root 进程、但把
   `CAP_CHOWN` 换成更宽的 `CAP_SETUID`。两条路各有取舍，别把 C2 当成"更安全的 C1"。
 
@@ -195,6 +245,10 @@ C2 不引入这个洞，但 C2 也修不了它。这正是 §7 的 P0-a 要把"�
   `deploy/k8s/priv-broker.yaml`（文件头记着 NAS/`CAP_CHOWN` 不过网的实测）。
 - **同族的选项文档**（同样"评估过、按触发条件决定做不做"的写法）：
   `docs/disk-quota-options.md`、`docs/pure-shape-decision.md`、`docs/n14-retire-the-emulation.md`。
+- **P0 探针（§7 的实测）**：引擎 `deploy/scripts/acceptance/probe_c2_ownership_p0.py`、
+  runner `deploy/scripts/acceptance/c2-p0-probe.sh`、Job 清单 `deploy/k8s-k0s/c2-p0-probe.yaml`；
+  pin `tests/unit/test_c2_p0_probe.py`；原始日志 `tmp/c2p0-cluster-run*.log`（会随 `tmp/` 清掉，
+  要复核就按 §7 的两行命令重跑）。
 - **源码锚点**（§5 的位点，按函数名而不是行号引用，行号会漂）：
   `envd_service/uid_pool.py::apply_sandbox_ownership`、`envd_service/volumes.py`、
   `envd_service/runtime/checkpoint_store.py::_hand_to_sandbox`、`envd_service/route_b.py`、

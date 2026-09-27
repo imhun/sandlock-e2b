@@ -1,0 +1,70 @@
+# C2 P0 探针的 Job（`docs/c2-ownership-frontload.md` §7 的两条 NAS 事实）。
+#
+# 由 `deploy/scripts/acceptance/c2-p0-probe.sh` 渲染后 apply：
+#
+#     kubectl -n sandlock create configmap c2-p0-probe \
+#         --from-file=probe_c2_ownership_p0.py=deploy/scripts/acceptance/probe_c2_ownership_p0.py \
+#         --dry-run=client -o yaml | kubectl -n sandlock apply -f -
+#     deploy/scripts/acceptance/c2-p0-probe.sh --apply
+#
+# 为什么是一个 Job：矩阵只在"能 setuid/setgid"的进程里成立（每个 cell 都要 fork 成池 uid /
+# worker 去看同一份 NAS 的回答），而这件事只在集群里、在那份 RWX claim 上做才有意义。
+#
+# 为什么必须 runAsUser 0：探针要**变成**别的身份（`setgroups([])` + setgid + setuid），
+# 父进程必须是 root；它自己不做任何特权动作（chown 只在自己的 scratch 里、用于搭 fixture）。
+# 为什么 runAsGroup 65534：与 broker 同形，顺带把"uid 0 + worker 组"这个今天真正在用的
+# 身份作为对照臂测进去（探针里叫 `broker`）。
+#
+# 安全姿态：只读 + 自清理 —— 唯一的写是 `<export>/_probes/c2-p0-<utc>-<pid>/`（每个 cell
+# 一个几字节的目录+文件），跑完由探针自己删掉；不打印任何凭据、不碰平台态/沙箱树。
+#
+# ⚠ 两个占位符是有意的 fail-closed（与 `state-owner-migrate.yaml` 同形）：
+#   * `__IMAGE_VERSION__` —— 与 apply.sh 同一口径（deploy/stack/.version）。
+#   * `__PROBE_ARGS__` —— 直接 apply 原文件时它是一个未知参数，探针立刻以 usage(2) 退出，
+#     一个字节都不会写。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: c2-p0-probe
+  namespace: sandlock
+  labels:
+    app: c2-p0-probe
+spec:
+  # 一次测量：半途失败就停在那里看日志，别自动重试（重试只会把同一个问题再问一遍）。
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: c2-p0-probe
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 65534
+      containers:
+        - name: probe
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:__IMAGE_VERSION__
+          # `__CAPS__` 是 P0-a 的**第二条臂**：空 map = 容器默认 cap 集（root 带
+          # DAC_OVERRIDE，客户端那一层就可能放行）；runner 的 `--drop-dac-override`
+          # 渲染成 `{capabilities: {drop: [DAC_OVERRIDE]}}` —— 把客户端越权摘掉之后，
+          # uid 0 到服务端还剩什么，才是"uid 0 在这台 NAS 上到底能不能越权"的答案。
+          securityContext: __CAPS__
+          command: ["python3", "/scripts/probe_c2_ownership_p0.py"]
+          args: [__PROBE_ARGS__]
+          volumeMounts:
+            # 与 worker/broker 看到的同一份 `<export>`（PVC `sandbox-shared`），
+            # 挂载点逐字相同 —— 探针问的就是线上那份存储。
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: sandbox-shared
+        - name: script
+          configMap:
+            name: c2-p0-probe
+            # 由 create configmap 建；只读，命令是 `python3 <path>`，不需要可执行位。
+            defaultMode: 0444
