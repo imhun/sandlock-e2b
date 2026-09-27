@@ -13,6 +13,11 @@
 # 同理，只有 root 能删/走一棵属于任意池 uid 的树。代价是把 `chown/rm/walk` 三个
 # 动作收进一个每节点一个有白名单的 daemon；沙箱仍跑在自己的池 uid 下，隔离模型不变。
 #
+# 另一条路线（**设计定稿、未实施**）：让池 uid **亲手创建**每一个属于沙箱的 inode（把 `chown`
+# 换成"以 X 创建"），从而把数据面里的 uid 0 也消掉 —— 代价是 `CAP_CHOWN`→`CAP_SETUID`、三条
+# 产品语义变更（属主不可修复 / 无法"worker 可写且仅 X 可读" / 回收=删除）与两个还没量的 NAS 事实。
+# 见 docs/c2-ownership-frontload.md。
+#
 # ⚠ 三处同源（终审要求，改一处就得同时改另两处）：**worker pod 的 uid/gid** ==
 #   **E2B_BROKER_PEER_UID/GID** == **/run/e2b-broker 目录与 broker.sock 的属组**，
 #   三者都是 **65534**。它来自同一个事实：worker 镜像 `deploy/docker/Dockerfile.envd`

@@ -2792,3 +2792,8 @@ kubectl -n sandlock exec e2b-worker-0 -c worker -- sh -c '
 就含 `E2B_WORKSPACE_BASE`。它又只在**无基镜像的 pure 沙箱**下落盘（`_synthetic_rootfs` 对图像
 沙箱返回 None），线上基线的沙箱都带基镜像 ⇒ 迁移时盘上**没有** root worker 留下的
 `_pure_rootfs` 要 chown。所以它不在那 8 条里是因为**没有 root 属主要迁**，不是被漏掉。
+
+**另一条路线（设计定稿、未实施）**：不走"每节点 root broker"，而是让池 uid **亲手创建**每个属于
+沙箱的 inode —— 属主从出生起就对，于是 `chown` 这个动作整体消失。它同样需要本节这份平台态迁移
+（已经付过），但不再需要那个 broker；代价是 `CAP_CHOWN`→`CAP_SETUID` 与三条产品语义变更，外加
+两个还没在目标 NAS 上量过的事实。设计与硬限制见 `docs/c2-ownership-frontload.md`（**不是待办**）。
