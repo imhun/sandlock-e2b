@@ -394,7 +394,9 @@ export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.d
 两条判据，都在沙箱内跑：① `stat` 四个平台状态路径（`<base>`、`<base>/_runtime`、`<base>/.route-b`、
 `<base>/_runtime/.checkpoints`）必须**全失败**且 errno ∈ {`ENOENT`, `EACCES`}（N15 之后 pure 形态是中介的
 策略拒绝，不是 ENOENT，所以只认 ENOENT 的探针会只在一个形态上通过）；② 从 `cwd` 到 `/` 的**每一层**
-要么列不出来、要么列出来**不含** `state` / `_runtime` / `.route-b` / `_secrets`。退出码 `0`=成立 / `1`=不成立 /
+要么列不出来、要么列出来**不含** `state` / `_runtime` / `.route-b` / `_secrets` **以及 `<state base>` 的
+basename**（2026-09-27 起：chain 半边跟着 `--state-base` 走，探针会把这一轮真正在守的名字打成
+`CHECKER-WATCHED`；换基名即失明的那版见本节末）。退出码 `0`=成立 / `1`=不成立 /
 `2`=VACUOUS。两条判据各带**正对照**（沙箱自己写的 canary 必须能 `stat` 到、workspace 那一层必须列出它），
 所以"到处都拒"不会被读成"干净"；反例是"迁移前布局"（平台状态就在树根上），它必须报 `1`。
 
@@ -404,7 +406,7 @@ export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.d
 | **pure + 合成根 + 真根**（N16） | `probe … lane --shape synth-realroot --layout n27` | `ENOENT` ×4 | 3 层（合成根），无泄漏 | **0** |
 | **pure + identity（无根，N15）** | `probe … lane --shape identity --layout n27` | `EACCES` ×4（**读不到 ✔**） | ✘ 在 `<export>` 一层列出 `["_secrets", "state"]` | **1** |
 | 对照：**迁移前布局** | `probe … lane --shape identity --layout legacy` | 状态目录**本身可 `stat`**（该层还列出 `_runtime` / `.route-b` / `_secrets`） | ✘ | **1** |
-| pure + 合成根 + 模拟根 | `probe … lane --shape synth-emulated --layout n27` | 起不来（`SlotRefusal: instance is closed`） | — | 形态不可服务：N16 守卫要求 `E2B_PURE_ROOTFS=synth` 必须配 `E2B_REAL_ROOT=1` |
+| pure + 合成根 + 模拟根 | `probe … lane --shape synth-emulated --layout n27` | — | — | **2**（`LANE VACUOUS`）：起不来（`SlotRefusal: instance is closed`，checker 一次都没跑到）⇒ 形态不可服务 —— N16 守卫要求 `E2B_PURE_ROOTFS=synth` 必须配 `E2B_REAL_ROOT=1`；**2026-09-27 之前这一档是 traceback + `exit 1`**（与"反例成立"同一个退出码），现已由探针改成 VACUOUS |
 
 **结论（形态无关性的准确边界）**：**有根的形态**（生产 image-rootfs、pure+合成根+真根）两条判据都成立 ——
 平台状态**既不在祖先链上、也读不到**；**无根的 identity 形态只成立一半**：四次 `stat` 全 `EACCES`（读不到 ✔），
@@ -414,6 +416,16 @@ export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.d
 `docs/superpowers/plans/2026-09-26-pure-shape-synthetic-rootfs.md`（N16 合成根）要消掉的那条。
 ⇒ **`docs/pure-shape-decision.md` §2、`docs/open-issues.md`、`docs/task-backlog.md` 里"pure 形态也不在祖先链上"
 这句要按本表限定为"有根形态"**（Task 8 写它时没有实跑，见 `.superpowers/sdd/n27-task-7-report.md`）。
+
+**2026-09-27 复核（同一探针、三档重跑；原始输出 `tmp/k0s/n27resid-{identity-n27,synth-realroot-n27,identity-legacy}.log`）**：结论逐字未变，并把"要让**默认**形态也消掉该做什么"补齐 ——
+
+- `--shape synth-realroot --layout n27`（`E2B_PURE_ROOTFS=synth` + `E2B_REAL_ROOT=1`）⇒ `exit 0`，`stat=PASS`（`ENOENT` ×4）、`chain=PASS`（3 层 = 沙箱自己的合成根；`<export>` **根本不在链上**）⇒ **N16 已消掉"能列出名字"**。
+- `--shape identity --layout n27`（`E2B_PURE_ROOTFS=off`，**默认**）⇒ `exit 1`，`stat=PASS`（`EACCES` ×4 —— **不是** `ENOENT`）、`chain=FAIL`，`LEAK ["_secrets", "state"]` ⇒ **残差仍在**（就是本表的 identity 那一行）。
+- `--shape identity --layout legacy`（反例档）⇒ `exit 1`，`stat=FAIL`（状态目录**本身**可 `stat`：`OK mode=0o40755`）、`chain=FAIL`，`LEAK [".route-b", "_runtime", "_secrets"]` ⇒ **判据不是恒真的空检查**。
+
+**要让默认形态也消掉，只有一步：把 `E2B_PURE_ROOTFS` 的默认值从 `off` 切到 `synth`。** 代价/风险三条 —— ① pure 形态**每沙箱一份骨架目录**（`<workspace base>/_pure_rootfs/<id>`：普通目录 + bind 系统目录 + 整棵 `/dev` + `pivot_root`；`gateway_common.paths.PURE_ROOTFS_DIR_NAME`）；② **依赖 `E2B_REAL_ROOT=1`** —— `synth` 配 `REAL_ROOT=0` 结构性不成立（本轮 `--shape synth-emulated` 实测起不来，按 VACUOUS `exit 2` 报；N16 的成对守卫还会在 worker 启动时 loud 拒）；③ **依赖 worker seccomp 档已应用**（`mount/umount2/pivot_root` 无门闩），漏了会被 worker 启动自检当场拒（见 N16/N35）。生产两条清单都设 `E2B_BASE_IMAGE` ⇒ 生产是 image-rootfs 形态、不受这次切换影响，受影响的只有 pure 部署。
+
+**探针自身两处假闸本轮一并修掉**（RED→GREEN 见 `.superpowers/sdd/n27-identity-residual-report.md`）：**(a)** ② 的 chain 半边只认四条硬编码名字 ⇒ 一旦 `E2B_STATE_BASE` 的 basename 不在那四条里（例：换名成 `platform`）就**失明** —— `<export>` 照旧列着那个名字，探针却报 `chain=PASS`；现在 chain 半边跟着 `--state-base` 走，并把这一轮真正在守的名字打成 `CHECKER-WATCHED`。**(b)** lane 在 checker 跑起来**之前**崩掉也走 `exit 1`，与"反例成立"同一个退出码 ⇒ 崩溃会被读成反例；现在报 `LANE VACUOUS` + `exit 2`。
 
 机制旁证（"祖先"而不是"随便一个目录"）：identity 形态下 workspace 的父目录可列（`ls -a /tmp/n27-mount` `rc=0`），
 同一个挂载里**不是祖先**的 `/workspace/...` 一律 `Permission denied` —— `tmp/k0s/n27-t7-lane-mount.log`。

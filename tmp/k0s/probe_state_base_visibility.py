@@ -11,8 +11,11 @@ What it asserts, inside the sandbox (the "checker" below, mode ``in-sandbox``):
    errno is an answer the criterion does not cover and is reported as VACUOUS.
 2. The ancestor chain, from ``os.getcwd()`` up to ``/``: every layer must either
    refuse ``os.listdir`` (``ENOENT``/``EACCES``) or list without any of
-   ``state``, ``_runtime``, ``.route-b``, ``_secrets``. "It was listed" is a
-   violation. Every layer's raw answer (errno or the listing) is printed.
+   ``state``, ``_runtime``, ``.route-b``, ``_secrets`` -- or the basename of the
+   state base this run was pointed at (``CHECKER-WATCHED`` names the set, so the
+   chain half follows ``--state-base`` the way the stat half does). "It was
+   listed" is a violation. Every layer's raw answer (errno or the listing) is
+   printed.
 
 A positive control makes both halves falsifiable instead of self-satisfying: the
 checker writes a canary into the workspace and requires that it can stat it and
@@ -21,6 +24,11 @@ that the workspace layer lists it. If that fails the run is VACUOUS (exit 2) --
 able to *fail*: ``lane --layout legacy`` runs it against the pre-N27 layout
 (platform state in the tree base), where a real sandbox lists ``_runtime`` --
 that run is the counter-example, and it comes back exit 1.
+
+Exit 1 has to mean "the checker ran and the criterion failed", so a lane that
+cannot run the checker at all (the harness never got a command into the sandbox)
+reports VACUOUS (exit 2) rather than letting the interpreter's own failure exit
+1 stand in for a counter-example.
 
 Modes
 -----
@@ -54,6 +62,24 @@ DENIALS = (errno.ENOENT, errno.EACCES)
 CANARY = ".n27-probe-canary"
 
 
+def watched_names(state_base: str) -> tuple[str, ...]:
+    """The names the ancestor chain may never show, for *this* state base.
+
+    The brief's four literals, plus the basename of the state base this run was
+    pointed at. The stat half already follows ``--state-base``; a chain half
+    that watches four hardcoded strings instead goes blind the moment a
+    deployment points ``E2B_STATE_BASE`` at a differently named directory --
+    ``<export>`` still lists that name, and the probe answers PASS. (Fixture
+    pair and the RED/GREEN evidence:
+    ``.superpowers/sdd/n27-identity-residual-report.md``.)
+    """
+    base = os.path.basename(os.path.normpath(state_base))
+    names = set(STATE_NAMES)
+    if base and base not in ("/", "."):
+        names.add(base)
+    return tuple(sorted(names))
+
+
 def _errno_name(exc: OSError) -> str:
     return errno.errorcode.get(exc.errno, str(exc.errno))
 
@@ -67,6 +93,8 @@ def checker_main(state_base: str, workspace: str) -> int:
     print(f"CHECKER-PWD {os.getcwd()}")
     print(f"CHECKER-STATE-BASE {state_base}")
     print(f"CHECKER-WORKSPACE {workspace}")
+    watched = watched_names(state_base)
+    print(f"CHECKER-WATCHED {json.dumps(list(watched))}")
 
     stat_vacuous = False
     chain_vacuous = False
@@ -141,7 +169,7 @@ def checker_main(state_base: str, workspace: str) -> int:
         else:
             listed_layers += 1
             print(f"CHECKER-LAYER {layer} LISTED {json.dumps(sorted(listing))}")
-            hits = sorted(set(listing) & set(STATE_NAMES))
+            hits = sorted(set(listing) & set(watched))
             if hits:
                 print(f"CHECKER-LAYER {layer} LEAK {json.dumps(hits)}")
                 chain_violation = True
@@ -394,6 +422,19 @@ LANE_SHAPES = {
 }
 
 
+def _vacuous_unreachable(exc: BaseException) -> int:
+    """The harness could not run the checker at all -- report VACUOUS (2).
+
+    Never let this leave as exit 1. The contract on this probe is "the legacy
+    layout is the counter-example and it comes back 1"; a lane whose sandbox
+    died before the checker ran exits 1 too, so an operator (or a script)
+    reading only the exit code would read a crash as a working counter-example.
+    This is the same code the other "cannot measure" paths use.
+    """
+    print(f"LANE VACUOUS: the checker never ran ({type(exc).__name__}: {exc})")
+    return 2
+
+
 def lane_main(args: argparse.Namespace) -> int:
     import asyncio
     import shutil
@@ -493,10 +534,16 @@ def lane_main(args: argparse.Namespace) -> int:
                 # root; start from the alias instead, and say so.
                 print(f"LANE cwd-retry=/home/user (host path refused: "
                       f"{type(exc).__name__}: {exc})")
-                code, out, err = await run_sh(executor, "/home/user", command)
+                try:
+                    code, out, err = await run_sh(executor, "/home/user", command)
+                except Exception as retry_exc:  # noqa: BLE001
+                    return _vacuous_unreachable(retry_exc)
             if code == 125:
                 print("LANE cwd-retry=/home/user (host workspace path refused)")
-                code, out, err = await run_sh(executor, "/home/user", command)
+                try:
+                    code, out, err = await run_sh(executor, "/home/user", command)
+                except Exception as retry_exc:  # noqa: BLE001
+                    return _vacuous_unreachable(retry_exc)
             print("----- checker stdout -----")
             print(out.decode(errors="replace"), end="")
             if err:
