@@ -435,6 +435,18 @@ def write_text_atomically(path: str | Path, text: str) -> None:
     ``0o666 & ~umask`` (what a plain ``write_text`` produces) rather than
     ``mkstemp``'s ``0o600``, so who may read the published file does not
     change. A failure leaves the target as it was and no partial file behind.
+
+    What this promises, and what it does not: the guarantee is *visibility*
+    atomicity -- a reader sees the whole previous document or the whole new
+    one, which is the property every reader above depends on. It is **not** a
+    durability promise for the rename: the staged bytes are ``fsync``-ed (so
+    they are on the shared volume before the name is published), but the
+    containing directory is not, so a machine dying in the instant after
+    ``os.replace`` can come back with the previous name. Falling back to the
+    previous whole record is the safe direction, and the ``.<name>.<hex>.tmp``
+    such a crash leaves behind is garbage that nothing has to collect for
+    correctness: no scan matches it (records are read by their exact name, and
+    ``_meta/*.json`` requires the ``.json`` suffix).
     """
     path = Path(path)
     directory = path.parent

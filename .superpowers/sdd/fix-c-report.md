@@ -144,7 +144,7 @@ IDENTICAL failure sets (      20 lines)
 
 ## 6. 残余与疑虑
 
-1. **崩溃时的残留**：`os.replace` 之前进程被 kill，会留下一个 `.<原名>.<hex>.tmp` 隐藏文件。它不落入任何扫描的 glob（`template.json`/`snapshot.json`/`secret.json` 都是精确文件名，`_meta/*.json` 要求 `.json` 结尾，envd 侧按精确路径读），所以**语义上无害**，只是垃圾；本轮不加清理任务（会引入新的扫描面）。
+1. **承诺边界（评审 Minor，已写进 helper docstring）**：本 helper 保证的是**可见性原子**（读者永远看到旧的完整内容或新的完整内容），**不承诺跨崩溃的 rename 持久性** —— 暂存文件 `fsync` 了、**目录没有**，所以 `os.replace` 之后立刻掉电可能回到旧名（回退到旧的完整记录是安全方向）。`os.replace` 之前进程被 kill 会留下一个 `.<原名>.<hex>.tmp` 隐藏文件：它不落入任何扫描的 glob（`template.json`/`snapshot.json`/`secret.json` 都是精确文件名，`_meta/*.json` 要求 `.json` 结尾，envd 侧按精确路径读），所以**语义上无害**，只是垃圾；本轮不加清理任务（会引入新的扫描面）。
 2. **成本**：每次发布多一次 `fsync` + 一次 rename。build 的日志行路径（`save_build`）在一场构建里是几十次量级，相对 buildkit 构建本身可忽略；如果将来有 profile 显示它成了热点，可以按"日志行不 fsync、状态迁移 fsync"分级 —— 本轮不做，先要正确性。
 3. **跨节点原子性**：同目录 rename 的原子性依赖共享卷（NFSv4.0）的语义，`docs/control-plane-multi-replica.md` §F5 已把这条列成"任何依赖共享文件锁/原语的协调"的天花板；本单的写法只依赖"rename 原子"，比文件锁弱，是这份卷能提供的。
 4. **`_recorded_uid` 的语义没动**：它现在安全的前提是"写者原子"；若将来有人再在共享卷上加一条非原子的记录写，同一个坑会回来 —— helper 的 docstring 就是给那一刻看的。
