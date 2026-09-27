@@ -435,6 +435,20 @@ def _vacuous_unreachable(exc: BaseException) -> int:
     return 2
 
 
+def _default_lane_scratch() -> str:
+    """``<repo>/tmp/k0s/scratch/n27`` -- ``lane``'s fixtures when unset.
+
+    Computed *here* instead of while the parser is built: ``lane`` re-runs this
+    file from inside the sandbox (``lane_main`` writes it there as
+    ``/home/user/n27-checker.py``), where ``parents[3]`` is an ``IndexError``,
+    and an eager default killed that copy before ``main()`` could dispatch --
+    measured 2026-09-28, once the synthesized root became the pure shape's
+    default (the copy then really lands three parents deep). Only ``lane`` reads
+    the value; ``tests/unit/test_n27_probe_cli.py`` pins both halves.
+    """
+    return str(Path(__file__).resolve().parents[3] / "tmp/k0s/scratch/n27")
+
+
 def lane_main(args: argparse.Namespace) -> int:
     import asyncio
     import shutil
@@ -454,7 +468,7 @@ def lane_main(args: argparse.Namespace) -> int:
     os.environ["E2B_REAL_ROOT"] = real_root
     os.environ["E2B_BASE_IMAGE"] = ""
 
-    scratch = Path(args.scratch)
+    scratch = Path(args.scratch or _default_lane_scratch())
     root = scratch / f"{args.shape}-{args.layout}"
     if root.exists():
         shutil.rmtree(root)
@@ -568,12 +582,11 @@ def main() -> int:
     lane = sub.add_parser("lane", help="in-process sandbox (run inside the lane)")
     lane.add_argument("--shape", choices=sorted(LANE_SHAPES), required=True)
     lane.add_argument("--layout", choices=("n27", "legacy"), required=True)
+    # No eager default: see ``_default_lane_scratch`` (the sandbox copy of this
+    # file is too shallow for ``parents[3]``). ``N27_SCRATCH_DIR`` still wins.
     lane.add_argument(
         "--scratch",
-        default=os.environ.get(
-            "N27_SCRATCH_DIR",
-            str(Path(__file__).resolve().parents[3] / "tmp/k0s/scratch/n27"),
-        ),
+        default=os.environ.get("N27_SCRATCH_DIR"),
     )
     lane.set_defaults(func=lane_main)
 
