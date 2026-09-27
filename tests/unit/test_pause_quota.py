@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
+import redis
 
 fakeredis = pytest.importorskip("fakeredis")
 
@@ -453,6 +454,16 @@ def test_shared_store_ttl_expiry_returns_the_disk_row_once(make_record):
 # reservations, which is the direction that over-sells the fleet -- so the
 # "somebody is already returning this" fact has to be one atomic store write
 # rather than a flag the loser has not seen yet.
+#
+# ``86d4e92`` made that fact a fleet-wide claim (``SETNX`` + TTL) taken
+# *before* the rows move. That closed the double-return, but it left the claim
+# as the only record of the return: when the ``save`` above never lands, the
+# shared record keeps saying "held", and once the claim's TTL elapses a later
+# delete re-reads that record and returns the rows again -- the same
+# under-count, one TTL later. The claim therefore has to stop being the guard:
+# the return moves the ledger rows, the claim *and* the record's own
+# ``quota_released`` flag in one store transaction, so the durable copy of the
+# fact outlives the claim that will expire.
 
 
 def _replicas(**overrides):
@@ -543,3 +554,179 @@ def test_the_return_claim_outlives_the_delete_it_protects_and_has_a_ttl(make_rec
     # ...so a third attempt at the same reservation is refused as well.
     assert replica_b.release_quota(stale) is False
     assert replica_a.global_reserved()["disk"] == 0
+
+
+def test_a_replay_after_the_claim_ttl_cannot_return_the_row_twice(make_record):
+    """The residual itself: the claim's TTL must stop being load-bearing.
+
+    ``pause`` moves the ledger rows and *then* writes the record that carries
+    ``quota_released``. When that write never lands -- the replica died, the
+    store hiccupped -- the shared record still says the reservation is held
+    while the rows are already back, and a paused record is never expired by
+    the TTL sweep, so "the record is stale" is not self-healing. The claim's
+    TTL is the trap: one expiry later the delete re-reads that record, finds no
+    marker, concludes the reservation is still booked and returns the rows a
+    second time. Under-counting the ledger is the direction that over-sells the
+    fleet, so the released fact has to live somewhere that outlives the claim:
+    in the shared record, written by the same store transaction that moved the
+    rows.
+    """
+    client = fakeredis.FakeRedis()
+    registry = SandboxRegistry(_settings(), redis_client=client)
+    make_record(registry, disk_size_mb=64, sandbox_id="sbx_n41_ttl")
+    record = registry.get("sbx_n41_ttl")
+
+    # The pause's ledger half lands; the record write that would carry the
+    # fact across replicas does not happen at all (that is the failure).
+    assert registry.release_quota(record) is True
+    assert registry.global_reserved()["disk"] == 0
+    assert registry._record_store.get("sbx_n41_ttl")["quota_released"] is True
+
+    # The claim the delete side leans on expires (its TTL elapses).
+    client.delete(registry._quota_release_key(record))
+    assert client.get(registry._quota_release_key(record)) is None
+
+    # A delete re-reads the shared record -- which still says "held" -- and
+    # must not be able to move the row a second time.
+    registry.delete("sbx_n41_ttl")
+    assert registry.global_reserved()["disk"] == 0
+
+
+class _RaceClient:
+    """A client whose next transaction lets a rival replica finish first.
+
+    The N41 race, made deterministic: replica A has read the claim and the
+    record (both say the reservation is still held) and is one ``EXEC`` away
+    from moving the rows when replica B's whole release lands. An
+    implementation that re-decides inside the transaction notices the writes it
+    was about to clobber and stands down; one that reads outside it and writes
+    anyway moves the row a second time.
+    """
+
+    def __init__(self, client):
+        self._client = client
+        self._rival = None
+        self._spent = False
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    def arm(self, rival) -> None:
+        self._rival = rival
+
+    def pipeline(self):
+        return _RacePipeline(self._client.pipeline(), self)
+
+    def _let_the_rival_finish(self) -> None:
+        if self._rival is None or self._spent:
+            return
+        self._spent = True
+        self._rival()
+
+
+class _RacePipeline:
+    def __init__(self, pipe, owner: _RaceClient):
+        self._pipe = pipe
+        self._owner = owner
+
+    def __getattr__(self, name):
+        return getattr(self._pipe, name)
+
+    def __enter__(self):
+        self._pipe.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._pipe.__exit__(*exc)
+
+    def execute(self, *args, **kwargs):
+        self._owner._let_the_rival_finish()
+        return self._pipe.execute(*args, **kwargs)
+
+
+def test_two_replicas_releasing_at_once_move_the_row_once(make_record):
+    """Both replicas decide to return the same reservation; one row moves.
+
+    The rival's release is injected between replica A's read and replica A's
+    write, which is the only window this bug has: A's claim is not there yet,
+    A's record copy says "held", and a release that simply writes would both
+    lose B's marker and subtract the row twice. What makes it safe is that the
+    read and the write are one transaction over the claim, the record and the
+    ledger, so A's ``EXEC`` conflicts, A re-reads, and A stands down.
+    """
+    server = fakeredis.FakeServer()
+    racer = _RaceClient(fakeredis.FakeRedis(server=server))
+    replica_a = SandboxRegistry(_settings(), redis_client=racer)
+    replica_b = SandboxRegistry(
+        _settings(), redis_client=fakeredis.FakeRedis(server=server)
+    )
+    make_record(replica_a, disk_size_mb=128, sandbox_id="sbx_n41_race")
+    held_a = replica_a.get("sbx_n41_race")
+    held_b = replica_b.get("sbx_n41_race")  # B's copy, also "still held"
+
+    racer.arm(lambda: replica_b.release_quota(held_b))
+    released = replica_a.release_quota(held_a)
+    assert replica_a.global_reserved()["disk"] == 0
+    assert replica_b.global_reserved()["disk"] == 0
+    assert released is False  # B got there first, so A stood down
+
+
+def test_a_resumed_reservation_can_be_returned_by_a_later_pause(make_record):
+    """The durable flag belongs to one episode, exactly like the claim.
+
+    ``hold_quota`` books the rows again, so the next ``pause`` has to be able
+    to give them back: a flag the resumed record never reset would refuse that
+    second return and leak the reservation for good -- the same bug wearing the
+    other sign. Both copies of the fact therefore move together on the way
+    back in as well.
+    """
+    registry = SandboxRegistry(_settings(), redis_client=fakeredis.FakeRedis())
+    record = make_record(registry, disk_size_mb=64, sandbox_id="sbx_n41_episode")
+    assert registry.global_reserved()["disk"] == 64
+
+    registry.pause(registry.get(record.sandbox_id))
+    assert registry.global_reserved()["disk"] == 0
+
+    registry.resume(registry.get(record.sandbox_id))
+    assert registry.global_reserved()["disk"] == 64
+    assert registry._record_store.get(record.sandbox_id)["quota_released"] is False
+
+    registry.pause(registry.get(record.sandbox_id))
+    assert registry.global_reserved()["disk"] == 0
+
+
+class _DownClient:
+    """A store that can no longer start a transaction (Redis is gone)."""
+
+    def __init__(self, client):
+        self._client = client
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    def pipeline(self):
+        raise redis.exceptions.ConnectionError("store is down")
+
+
+def test_a_store_that_cannot_record_the_return_keeps_the_row_booked(make_record):
+    """The deliberate half of the trade: no store, no release.
+
+    A release the store never accepted has moved no rows, so answering
+    "returned" would advertise capacity the fleet has not got (under-count --
+    the over-selling direction this whole section is about). Failing instead
+    leaves the reservation *booked*: the caller sees an error, retries, and the
+    capacity comes back; nothing downstream is told the row returned when it
+    did not. The single-replica branch has no such failure mode.
+    """
+    client = fakeredis.FakeRedis()
+    registry = SandboxRegistry(_settings(), redis_client=client)
+    record = make_record(registry, disk_size_mb=64, sandbox_id="sbx_n41_down")
+
+    registry._quota_store._client = _DownClient(client)
+    with pytest.raises(redis.exceptions.ConnectionError) as exc:
+        registry.release_quota(record)
+    assert str(exc.value) == "store is down"
+
+    registry._quota_store._client = client
+    assert record.quota_released is False
+    assert registry.global_reserved()["disk"] == 64

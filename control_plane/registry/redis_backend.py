@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,13 @@ except ImportError:  # pragma: no cover
 #: ``is_tombstoned()`` lets backfill logic distinguish "never existed"
 #: from "was deleted" (deleted must never be resurrected from disk).
 TOMBSTONE = "__deleted__"
+
+#: How many WATCH conflicts ``RedisQuotaStore.release_once`` retries before it
+#: gives up. A conflict means another replica moved one of the watched keys
+#: between this replica's read and its write, so the loop re-reads and
+#: re-decides. The bound exists so a hot key cannot spin forever: dozens of
+#: conflicts in a row is not contention, it is a wedged replica.
+RELEASE_ONCE_MAX_ATTEMPTS = 64
 
 
 class RedisQuotaStore:
@@ -79,6 +86,111 @@ class RedisQuotaStore:
                 pipe.hincrby(key, dim, -value)
             pipe.execute()
 
+    def release_once(
+        self,
+        rows: Sequence[tuple[str, dict[str, int]]],
+        marker_key: str,
+        *,
+        marker_ttl_s: int,
+        record_key: str | None = None,
+    ) -> bool:
+        """Give every row in ``rows`` back exactly once per reservation episode.
+
+        ``release`` just subtracts, which is only safe for a caller that
+        already knows the reservation is held. ``pause`` is where that breaks
+        (N41): it moves the rows, then saves the record that carries
+        ``quota_released``, so a replica that reads the record in between
+        concludes the reservation is still held and returns it a second time.
+        Under-counting the ledger is the direction that over-sells the fleet,
+        so "this reservation is already back" has to be a store-side fact
+        rather than a flag the loser has not read yet.
+
+        Two copies of that fact are written by **one** WATCH/MULTI over the
+        record key, the marker key and every ledger key:
+
+        * ``marker_key`` (TTL'd, ``marker_ttl_s``) is the cheap shared claim.
+          It is what refuses a rival whose stale read predates the release --
+          including one whose record object is all it has left, because the
+          delete path removes the record before it releases.
+        * the record's own ``quota_released`` flag, set on the copy already in
+          the store, is the copy that survives the marker. A replica that dies
+          between the release and its ``save`` leaves that record saying "held"
+          and a paused record is never expired by the TTL sweep, so the marker
+          alone would let a much later delete return the rows again, one TTL
+          after the bug was supposed to be closed.
+
+        ``rows`` is a sequence of ``(scope, dims)`` pairs rather than a single
+        ledger because one reservation may sit in two of them (``global`` and
+        ``tenant:<id>``); giving them back in two calls would need two markers
+        and leave room for an episode to be half-returned.
+
+        Returns ``True`` when this call moved the rows; ``False`` when either
+        guard says the reservation is already back, in which case nothing is
+        written. Store trouble is deliberately *not* swallowed (unlike
+        :func:`try_claim` and the rate limiter's window): a release that cannot
+        reach the store has moved no rows, and reporting it as done would be
+        the under-count direction again, while the caller's pause/delete can
+        simply fail and be retried, leaving the reservation booked
+        (over-counted -- capacity that is only recovered by retrying).
+        """
+        ledger_keys = [self._key(name) for name, _ in rows]
+        watched = [*ledger_keys, marker_key]
+        if record_key is not None:
+            watched.append(record_key)
+        with self._client.pipeline() as pipe:
+            for _ in range(RELEASE_ONCE_MAX_ATTEMPTS):
+                try:
+                    pipe.watch(*watched)
+                    if pipe.exists(marker_key):
+                        pipe.unwatch()
+                        return False
+                    record_value: str | None = None
+                    if record_key is not None:
+                        raw = pipe.get(record_key)
+                        marked, record_value = self._released_record(raw)
+                        if marked:
+                            pipe.unwatch()
+                            return False
+                    pipe.multi()
+                    pipe.set(marker_key, "1", ex=max(1, int(marker_ttl_s)))
+                    if record_value is not None:
+                        pipe.set(record_key, record_value)
+                    for (_, dims), key in zip(rows, ledger_keys):
+                        for dim, value in dims.items():
+                            pipe.hincrby(key, dim, -value)
+                    pipe.execute()
+                    return True
+                except (redis.WatchError, redis.exceptions.WatchError):  # type: ignore[union-attr]
+                    continue
+        raise RuntimeError(  # pragma: no cover - defensive
+            f"quota release for {marker_key} kept losing its WATCH race"
+        )
+
+    @staticmethod
+    def _released_record(raw: Any) -> tuple[bool, str | None]:
+        """Read the store's copy of a record for the release transaction.
+
+        Returns ``(already_released, value_to_write)``. A record that is absent,
+        unparseable or not a sandbox record (the namespace is shared with the
+        volume registry) yields ``(False, None)``: there is no durable copy to
+        consult or to mark, and the marker is left to guard the window. Only the
+        stored payload is touched -- the caller's own object keeps whatever the
+        calling path put in it, and another replica's concurrent edits to other
+        fields are not clobbered with a stale copy.
+        """
+        if not raw:
+            return False, None
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return False, None
+        if not isinstance(payload, dict) or "quota_released" not in payload:
+            return False, None
+        if payload["quota_released"]:
+            return True, None
+        payload["quota_released"] = True
+        return False, json.dumps(payload, separators=(",", ":"))
+
     def get(self, name: str) -> dict[str, int]:
         """Current reserved values for a name ({} when never reserved)."""
         key = self._key(name)
@@ -98,6 +210,15 @@ class RedisRecordStore:
 
     def _key(self, record_id: str) -> str:
         return f"{self._ns}:record:{record_id}"
+
+    def record_key(self, record_id: str) -> str:
+        """The shared key ``record_id`` lives under.
+
+        Public because the quota release transaction has to WATCH -- and mark
+        -- the stored record atomically with the ledger rows it guards (N41);
+        a second copy of this layout would drift.
+        """
+        return self._key(record_id)
 
     def put(self, record_id: str, payload: dict[str, Any], ttl: int | None = None) -> None:
         key = self._key(record_id)
