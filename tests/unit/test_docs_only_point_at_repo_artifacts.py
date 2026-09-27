@@ -88,6 +88,7 @@ PROMOTED_ENTRIES = (
     ("tmp/e5e8/guard_probe.py", "deploy/scripts/acceptance/guard_probe.py"),
     ("tmp/e5e8/guard_probe2.py", "deploy/scripts/acceptance/guard_probe2.py"),
     ("tmp/f11_direct_exec_probe.py", "deploy/scripts/acceptance/f11_direct_exec_probe.py"),
+    ("tmp/plan-2026-09-26/f11_snapshot_restart_acceptance.py", "deploy/scripts/acceptance/f11_snapshot_restart_acceptance.py"),
     ("tmp/f11_fdcount_probe.py", "deploy/scripts/acceptance/f11_fdcount_probe.py"),
     ("tmp/f11_fup3_probe.py", "deploy/scripts/acceptance/f11_fup3_probe.py"),
     ("tmp/f23_multi_probe.py", "deploy/scripts/acceptance/f23_multi_probe.py"),

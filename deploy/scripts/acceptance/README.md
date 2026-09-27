@@ -45,6 +45,7 @@
 | `f11_direct_exec_probe.py` | Control experiment: pure-shape exec over the direct executor, low fd table. | —（头部无 Usage 行；见脚本 `--help`） |
 | `f11_fdcount_probe.py` | Does the standalone probe's stdout loss depend on the client's fd layout? | —（头部无 Usage 行；见脚本 `--help`） |
 | `f11_fup3_probe.py` | F11 E2B rerun probe: gateway+command boxed quota on the F11 tip wheel. | —（头部无 Usage 行；见脚本 `--help`） |
+| `f11_snapshot_restart_acceptance.py` | F11 acceptance: a rolling restart must not kill a live peer's copy. | `TREE_FILES=8000 .venv/bin/python deploy/scripts/acceptance/f11_snapshot_restart_acceptance.py`（**先读头部**：本部署当前 `重启 134 s > 拷贝超时 120 s`，窗口是空集 ⇒ 只会 INCONCLUSIVE，见 `docs/open-issues.md` N46） |
 | `f23_multi_probe.py` | FUP-23 paired send/recv probe: several marker execs on one pure instance. | —（头部无 Usage 行；见脚本 `--help`） |
 | `final-verify.sh` | Sequential final verification of the tier-removal tree. One phase at a time, | —（头部无 Usage 行；见脚本头部） |
 | `gateA-full.sh` | The whole suite in the production-shaped root worker with `E2B_BASE_IMAGE=python-mcp:3.14`. | `sh deploy/scripts/acceptance/gateA-full.sh <log>` |
@@ -59,7 +60,7 @@
 | `mem512-limit.py` | Live: is the 512MB box a hard limit, and what does an MCP gateway cost? | —（头部无 Usage 行；见脚本 `--help`） |
 | `mmap-probe.py` | Does a MAP_SHARED store past EOF grow the file on *this* filesystem? | `Run as: mmap-probe.py <dir> <label>` |
 | `n27-t7-lane.sh` | N27 Task 7: run a command inside the prod-shaped lane container. | `Usage: sh deploy/scripts/acceptance/n27-t7-lane.sh python3 -u deploy/scripts/acceptance/probe_state_base_visibility.py lane --shape identity --layout n27` |
-| `n35-lane.sh` | Run one command in the prod-shaped lane (the same container shape as | 头部示例（旧拼写）`sh tmp/k0s/n35-lane.sh python3 -u tmp/k0s/probe_n35_exec_gate.py chroot all` |
+| `n35-lane.sh` | Run one command in the prod-shaped lane (the same container shape as | `sh deploy/scripts/acceptance/n35-lane.sh python3 -u deploy/scripts/acceptance/probe_n35_exec_gate.py chroot all` |
 | `n39-pool-pidns-probe2.py` | N39 follow-up, take 2: raw `/proc` view inside a *pooled* sandbox. | —（头部无 Usage 行；见脚本 `--help`） |
 | `n42-egress-probe.py` | N42 acceptance on the live fleet: does `allow_internet_access=True` reach out? | —（头部无 Usage 行；见脚本 `--help`） |
 | `netns-node-compare.py` | Per-node comparison: SDK command RTT, MCP /mcp RTT, wildcard DNS. | —（头部无 Usage 行；见脚本 `--help`） |

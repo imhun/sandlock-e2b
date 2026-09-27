@@ -2395,3 +2395,42 @@ gate B `2053/17/3/0`，各 +33 passed 逐条归因）→ `build-and-push.sh` →
 验收：两条冒烟 OK、**N37 集群 4000 文件 ×3 = 3/3**（修前 61.4 s 断）、N42 出网判据
 （`pypi.org` CONNECTED + 裸 IP 策略拒）、checkpoint 端到端 `{"step":"OK"}`、账本两节点归零。
 记录 `docs/deploy-clusters.md` §12；日志 `tmp/k0s/release-652-acceptance.log`。
+
+## 2026-09-27 第二轮：文档真话化 + 把 gitignored 的固定产物搬进仓库
+
+用户要求："清理更新过时的文档记录，并把 tmp 目录中固定的文件提取到仓库，防止后面丢失。"
+
+**起因**：本仓库大量**判据脚本**住在 `tmp/`（gitignored）、**证据报告**住在 `.superpowers/sdd/`（gitignored），
+而 `docs/**` 在正文里按名字叫读者去跑它们。`tmp/` 被清/换机就断链 —— 本会话已经吃过一次
+（纯形态验收表只存在于 gitignored 报告里；另一轮有人顺手删掉 `tmp/f26` 的 harness）。
+
+**四单并行 + 两班搬运**（Heisenberg 索引 / Helmholtz 上手文档 / Descartes 其余文档 / Rawls 搬运 /
+Fermat 第二班 + 控制器收尾）：
+
+| 项 | 结果 | commit |
+|---|---|---|
+| `docs/open-issues.md` 逐行核状态 + 引用改写 | 18 改 18；多条形如"本轮未复核/未上集群"其实已被前几轮改掉（核出并注明） | `204ad26` |
+| `docs/HANDOFF.md` + `docs/deploy-clusters.md` | §7 更新为 2026-09-27 实测（版本 652 + 开关表）、§9–§11 标为历史、HANDOFF 的"还剩什么"改成**三条真实待拍板** | `01a09e9` |
+| 其余文档 + 16 份计划加执行状态 | 断链引用改指仓库；计划**只加顶部状态**、正文不动；"没设计/未复核"等就地加更新 | `9c5383f` |
+| **搬运第一班** | 67 个未被跟踪的判据脚本 → `deploy/scripts/acceptance/`；28 份被引用报告 → `docs/reports/`（逐字节 cp + sha）；钉子 `test_docs_only_point_at_repo_artifacts.py` | `5cf033d` |
+| **搬运第二班** | 10 个**已被 git 跟踪**的固定工具（gateA/gateB lane、N27 探针…）`git mv` 出 `tmp/`；过期的 `tmp/k0s/checkpoint_acceptance.py` 删除（437 行 vs 仓库 632 行）；钉子改成**禁用清单**（指向旧位置即红） | `e70dbd0` |
+| **控制器收尾** | 揪出**路径正则的盲区**：6 个探针被文档用**裸文件名**引用（例：k8s-deployment 的磁盘账一节、N35 行的 `probe_n35_mount_variants.py` 甚至被标注"仍在 tmp/"）→ 逐字节搬 + 改引用 + **新增裸名钉子**（含 8 条待解释项：6 条是 fork 子模块内部文件、2 条是历史引用），变异验证会红；另修 11 个脚本里过期的自引用用法行 | `d6faafb` |
+
+**搬运后的形态**：判据入口一律在 `deploy/scripts/acceptance/`（README 是索引与政策）；
+证据报告在 `docs/reports/`（README 说明固化来源）；`tmp/` 只放**一次性日志**与被搬走前的原件
+（`tmp/artifact-promotion/originals/`）。钉子保证：活文档**不能**再指向 `tmp/` 里的脚本
+（除非在白名单并有理由），也不能用裸名指向仓库里没有的文件。凭据一律未入库（apikey/passphrase 命中 0）。
+
+**发版后那条验收：跑了，结论是"这个部署测不了"，并且顺带挖到 N46**（`6001c7f`）：
+
+* 脚本原前置条件**永远不可能成立** —— 未命名异步快照从不取 fleet 级认领（`claimed = requested_id is not None`），
+  异步路径写记录后立刻 `release_copy`；对端真正读的是**记录上的 `creating`**。改成要求后者后，跑法才成立。
+* 实测（8000 文件，`0.1.0-652`）：记录 `creating` ✔、认领键不存在（符合未命名形状）、替换副本 **134.2 s** 就绪、
+  替换副本日志 **0 行**提到该记录、终态 **`failed: timed out`** ⇒ 拷贝先撞 worker RPC 的 `timeout=120`，
+  **既没被抢、也没被验证**。
+* 带宽算术：2000 文件拷贝 ~76 s、上限 120 s；重启 134.2 s ⇒ 需要的 `重启 < 拷贝 < 120 s` **是空集**，
+  任何 TREE_FILES 都没用。
+* ⇒ **N46（带触发）**：未命名异步快照在飞时，另一副本的启动扫描**分不清"有主在拷"与"孤儿"**（认领是唯一判据，
+  而它不被取），会把在飞记录当孤儿重驱动 → worker 对半写 payload 回 409 → `mark_failed`。
+  **当前够不着**（拷贝先超时），但只要 ① 重启变快（把那 13x 秒的 chown 优化掉，我们本来就想做）或
+  ② 拷贝超时调大，窗口立刻非空。两个候选修法（未命名也持认领 / 记录里落 owner+心跳）与各自代价写在 N46 行内。
