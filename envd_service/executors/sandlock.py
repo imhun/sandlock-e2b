@@ -1956,6 +1956,21 @@ class SandlockExecutor(Executor):
             )
             secret_dir.mkdir(parents=True, exist_ok=True)
             path = secret_dir / f"{entry['name']}.secret"
+            # Reclaim the name before writing it. A previous build already
+            # handed this exact path to the pooled uid (``broker_chown``
+            # below), and an earlier fix is not enough for the *second* write:
+            # a non-root worker whose file now belongs to a sandbox uid has no
+            # ownership, no CAP_FOWNER and no CAP_DAC_OVERRIDE, so ``open(w)``
+            # -- and every later ``chmod`` -- is EACCES/EPERM. This is the
+            # normal path, not a corner: ``_policy_ceiling()`` caches nothing
+            # and runs again on every route-B (re)open and every idle/expiry
+            # respawn, and nothing else ever deletes these files, so a sandbox
+            # would otherwise live exactly one instance lifetime. ``unlink``
+            # asks only for write permission on the parent directory, which is
+            # the worker's own non-sticky ``<secrets>/<sandbox_id>`` -- so the
+            # one step that still works is also the correct one (start the
+            # name over rather than try to overwrite a file we gave away).
+            path.unlink(missing_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(value)
             # The **slot** is what reads this file, and a slot runs as the
@@ -1968,11 +1983,44 @@ class SandlockExecutor(Executor):
             # file lives outside every fs grant the sandbox has -- outside the
             # rootfs in the image shape, and outside `can_read`'s allow-list in
             # the pure one -- so the sandbox cannot reach it even owning it.
-            identity = self._host_uid if self._per_sandbox_uid else None
-            if os.geteuid() == 0 and identity:
-                with suppress(OSError):
-                    os.chown(path, identity, -1)
+            #
+            # The mode is set **while the worker still owns the file**: after
+            # the hand-over below the worker is neither the owner nor
+            # CAP_FOWNER, so a chmod that ran after it would be EPERM and the
+            # whole create would fail -- the same order
+            # `checkpoint_store._prepare_image_parent` uses (chmod, then hand
+            # the tree over).
             os.chmod(path, 0o600)
+            identity = self._host_uid if self._per_sandbox_uid else None
+            if identity is not None:
+                if os.geteuid() == 0:
+                    with suppress(OSError):
+                        os.chown(path, identity, -1)
+                else:
+                    # Only root holds CAP_CHOWN itself; a non-root worker
+                    # reaches a pooled uid through the ``e2b-maint`` broker
+                    # (C1/T3). The broker's whitelist has to cover the secrets
+                    # dir -- it lives under ``E2B_IMAGE_CACHE_DIR``, outside the
+                    # three original roots -- or the file would stay
+                    # worker-owned and every create would die later, at
+                    # supervise, with a permission error naming neither the
+                    # path nor the missing root. Name both here instead
+                    # (fail closed, never "hand it over if we can").
+                    from envd_service import priv_helpers
+
+                    if not priv_helpers.helpers_cover(path):
+                        # Leave nothing behind: the file is already there and
+                        # carries a live credential, and the next create is
+                        # what writes a fresh one.
+                        path.unlink(missing_ok=True)
+                        raise priv_helpers.PrivHelperError(
+                            f"cannot hand {path} to sandbox uid {identity} on "
+                            "a non-root worker: the file-capability broker "
+                            "whitelist does not contain it "
+                            "(E2B_IMAGE_CACHE_DIR must be one of the broker's "
+                            "roots)"
+                        )
+                    priv_helpers.broker_chown(identity, path, recursive=False)
             entry = dict(entry)
             entry.pop("value", None)
             entry["secret"] = f"file:{path}"
