@@ -49,6 +49,24 @@ K8S_WORKER = (REPO / "deploy" / "k8s" / "worker.yaml").read_text(encoding="utf-8
 # the worker pod may not hold that root itself -- on any filesystem, not just
 # the NAS the k0s overlay happens to carry (see the file's own header).
 PRIV_BROKER = (REPO / "deploy" / "k8s" / "priv-broker.yaml").read_text(encoding="utf-8")
+# The C side's own constants, for the manifest values that must equal them
+# (A5: the broker's request-read deadline). Read from the source rather than
+# repeated as a literal, so a bump on one side cannot silently miss the other.
+PRIV_MAINT_C = (REPO / "deploy" / "priv" / "maint.c").read_text(encoding="utf-8")
+
+#: The broker's health socket (A4). It is deliberately **container-private**:
+#: not on the `/run/e2b-broker` hostPath the worker -- and any other uid 0
+#: process on the node that can traverse that directory -- can reach. Its only
+#: client is this container's own probe, and it answers the daemon's `roots` and
+#: `uid_pool`, so it has no business being host-visible (review Minor 5).
+BROKER_HEALTH_SOCKET = "/run/e2b-broker-health.sock"
+
+
+def _c_integer_define(name: str) -> int:
+    """The value of a plain-integer ``#define`` in ``maint.c``."""
+    match = re.search(rf"^#define {name} ([0-9]+)$", PRIV_MAINT_C, re.MULTILINE)
+    assert match is not None, f"maint.c has no plain-integer #define {name}"
+    return int(match.group(1))
 # The k0s render-and-apply driver. It is the one place that walks a whole
 # upgrade for the operator, so its rollout gates are part of the C1 contract
 # between the broker (C) and the worker (Python) -- see
@@ -941,9 +959,9 @@ def test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identit
 
     What is pinned, and why each half matters:
 
-    * the command is ``e2b-maint serve --socket …``: the daemon only execs
-      itself, so the argv (and the socket path the worker dials) is the
-      contract between the two manifests;
+    * the command is ``e2b-maint serve --socket … --health-socket …``: the
+      daemon only execs itself, so the argv (and the two socket paths: the
+      worker's and the probe's, A4) is the contract between the two manifests;
     * ``runAsUser: 0`` + exactly ``CHOWN, DAC_OVERRIDE, FOWNER``: a network
       filesystem authorizes a chown by the AUTH_SYS uid, not by the client's
       capabilities (the measurement is in ``deploy/k8s/priv-broker.yaml``'s own
@@ -952,7 +970,12 @@ def test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identit
       arbitrarily-owned sandbox tree. The DaemonSet sits in the *baseline*
       because that need is not a property of the NAS: any local/block-storage
       worker needs the same three verbs, and the k0s overlay must not be the
-      only manifest set that obtains a broker;
+      only manifest set that obtains a broker. Those three are also *all* of
+      them since A4: the probe no longer impersonates the worker, so nothing in
+      the pod needs SETUID/SETGID;
+    * the two probes are the container's own root dialling the health socket
+      (A4), and ``E2B_BROKER_REQUEST_READ_MS`` is named at the code default
+      (A5) -- both pinned once more, from their own angles, below;
     * ``E2B_BROKER_PEER_UID/GID == 65534``: the daemon answers ``hello`` with
       the identity it authenticated, and the worker's Python startup asserts
       ``peer_uid/peer_gid == its own euid/egid`` (a mismatch is a refusal with
@@ -984,6 +1007,12 @@ def test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identit
         "serve",
         "--socket",
         "/run/e2b-broker/broker.sock",
+        # A4: the second listener the probes dial. It is the container's own
+        # path, *not* one inside the shared hostPath -- see BROKER_HEALTH_SOCKET
+        # and the assertion below, which takes the path from *this* argv rather
+        # than repeating it.
+        "--health-socket",
+        BROKER_HEALTH_SOCKET,
     ]
     security = container["securityContext"]
     assert security["runAsUser"] == 0
@@ -991,16 +1020,17 @@ def test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identit
     # *minimal* set, not "whatever the root default happens to be". `drop: [ALL]`
     # is what makes that true -- `add` alone only appends to the runtime's default
     # root set -- and the three verbs (chown/rm/walk) were exercised against a
-    # live cluster with exactly these caps. SETUID/SETGID are not for the daemon:
-    # the liveness/readiness probes dial the socket as the *peer* identity and
-    # `setpriv` needs them to drop from root to 65534.
+    # live cluster with exactly these caps. A4: SETUID/SETGID are gone because
+    # nothing in this pod drops privileges any more -- the probes dial the
+    # root-only health socket directly. Putting either of them back means the
+    # probe (or something else in this container) is impersonating the worker
+    # again, which is the thing the health socket removed; the suite
+    # ``test_the_broker_probes_*`` pins the other end of that.
     assert security["capabilities"]["drop"] == ["ALL"]
     assert set(security["capabilities"]["add"]) == {
         "CHOWN",
         "DAC_OVERRIDE",
         "FOWNER",
-        "SETUID",
-        "SETGID",
     }
     env = {e["name"]: e.get("value") for e in container["env"]}
     # The identity trio (worker pod == peer env == socket group) is 65534.
@@ -1018,22 +1048,28 @@ def test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identit
     # (the k8s worker follows the code default, 10000/1000).
     assert env["E2B_UID_POOL_START"] == "10000"
     assert env["E2B_UID_POOL_SIZE"] == "1000"
+    # A5: the request-read deadline is an operator's knob for *this* daemon, and
+    # it is named here (at the code default) instead of living only in a C
+    # comment; `test_the_broker_names_the_request_read_deadline` reads
+    # maint.c's PRIV_DEFAULT_REQUEST_READ_MS and asserts the two are equal.
+    assert env["E2B_BROKER_REQUEST_READ_MS"] == "30000"
+    health_socket = container["command"][container["command"].index("--health-socket") + 1]
+    # Review Minor 5: the health socket must stay off the shared hostPath --
+    # nothing outside this container has any business asking the daemon for its
+    # roots, and the worker's own uid cannot read it anyway.
+    assert health_socket == BROKER_HEALTH_SOCKET
+    assert not health_socket.startswith("/run/e2b-broker/")
     for probe in ("livenessProbe", "readinessProbe"):
         assert container[probe]["exec"]["command"] == [
-            # The probe is a real client: it has to pass the same peer gate the
-            # worker does, so it drops to the authenticated identity first (see
-            # test_the_broker_probes_connect_as_the_peer_identity for the
-            # measurement that made this necessary).
-            "/usr/bin/setpriv",
-            "--reuid",
-            env["E2B_BROKER_PEER_UID"],
-            "--regid",
-            env["E2B_BROKER_PEER_GID"],
-            "--clear-groups",
+            # A4: the probe is a real client, but of the *health* socket -- the
+            # one this container's own root may use -- so it runs as root,
+            # without setpriv, and the broker needs no SETUID/SETGID. It names
+            # the socket the daemon was told to serve, taken from the argv
+            # above so the probe and the daemon cannot drift apart.
             "/var/lib/e2b-priv/e2b-maint",
             "ping",
             "--socket",
-            "/run/e2b-broker/broker.sock",
+            health_socket,
         ]
     mounts = {m["name"]: m for m in container["volumeMounts"]}
     assert mounts["shared"]["mountPath"] == "/var/lib/e2b-sandboxes"
@@ -1283,13 +1319,19 @@ def test_socket_transport_and_its_broker_are_inseparable(manifests: str) -> None
     broker_pod = brokers[0]["spec"]["template"]["spec"]
     broker = broker_pod["containers"][0]
     # The broker `serve`s on the very path the worker dials, from the same
-    # hostPath -- one socket, one node, both pods.
+    # hostPath -- one socket, one node, both pods -- plus the probe's health
+    # socket (A4), which is deliberately **not** in that hostPath: it is the
+    # container's own path, because its only client is this container's probe
+    # (review Minor 5) and it answers the daemon's roots.
     assert broker["command"] == [
         "/var/lib/e2b-priv/e2b-maint",
         "serve",
         "--socket",
         socket_path,
+        "--health-socket",
+        BROKER_HEALTH_SOCKET,
     ]
+    assert not BROKER_HEALTH_SOCKET.startswith(f"{socket_dir}/")
     broker_volume = {v["name"]: v for v in broker_pod["volumes"]}["broker-socket"]
     assert broker_volume["hostPath"] == {
         "path": socket_dir,
@@ -2204,23 +2246,81 @@ def test_the_runbook_carries_the_no_double_window_table() -> None:
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
-def test_the_broker_probes_connect_as_the_peer_identity() -> None:
-    """C1 rollout hotfix: the probes are real clients and must pass the peer gate.
+def test_the_broker_probes_dial_the_root_only_health_socket() -> None:
+    """A4: the probes are real clients -- of a socket that is *not* the worker's.
 
     Measured 2026-09-27 on the k0s cluster (first `apply.sh` of C1): with the
-    probe running as the container's own uid 0, `e2b-maint ping` was refused
+    probe running as the container's own uid 0, `e2b-maint ping` was refused by
+    the business socket's peer gate
     (`refused: peer uid 0 does not match E2B_BROKER_PEER_UID=65534`) while the
     daemon itself was serving normally -- the pod stayed `Running 0/1`,
     restarted every ~90 s and the DaemonSet rollout timed out, leaving the
-    cluster with no broker and no worker. The probes now drop to the *peer*
-    identity with `setpriv` before dialling, which also makes each probe prove
-    the exact path the worker's own `E2B_PRIV_HELPER_TRANSPORT=socket` client
-    uses.
+    cluster with no broker and no worker. The first fix made the probes drop to
+    the peer identity with `setpriv`, which dragged SETUID/SETGID into the
+    broker's capability set for no reason other than the probe.
 
-    The uid/gid are read from the container's own `E2B_BROKER_PEER_UID/GID`
-    rather than hardcoded here: the gate, the socket directory's group and this
-    probe are one value, and a probe that drifts from the env would fail closed
-    in production (the failure this test exists to prevent).
+    Now the daemon serves a second, `0660 root:root` health socket that answers
+    only `{"v":1,"hello":true}` and never consults `E2B_BROKER_PEER_UID`: the
+    probes dial *that*, as the container's own root, with no setpriv anywhere
+    in the pod. The business socket's gate is untouched (the contract lane
+    pins it: a root peer is refused there, before any fork), and its three
+    capabilities are all the broker needs.
+
+    The socket path is read out of the same container's argv rather than
+    repeated as a literal, so a probe that dials something the daemon was not
+    told to serve fails here instead of on a node.
+    """
+    rendered = subprocess.run(
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    broker = _rendered_workload(rendered, "DaemonSet", "e2b-priv-broker")
+    container = broker["spec"]["template"]["spec"]["containers"][0]
+    command = container["command"]
+    socket_path = command[command.index("--socket") + 1]
+    health_socket = command[command.index("--health-socket") + 1]
+    assert socket_path == "/run/e2b-broker/broker.sock"
+    # Container-private on purpose (review Minor 5): the hostPath directory is
+    # reachable by any uid 0 process on the node, and this socket answers the
+    # same hello (roots, uid_pool) as the business one.
+    assert health_socket == BROKER_HEALTH_SOCKET
+    assert not health_socket.startswith("/run/e2b-broker/")
+    assert socket_path != health_socket
+    expected = [
+        "/var/lib/e2b-priv/e2b-maint",
+        "ping",
+        "--socket",
+        health_socket,
+    ]
+    for probe in ("livenessProbe", "readinessProbe"):
+        assert container[probe]["exec"]["command"] == expected, (
+            f"{probe} must dial this container's own root-only health socket "
+            f"({health_socket}), as the container's root and without setpriv: "
+            f"{container[probe]['exec']['command']}"
+        )
+    # Nothing in this container drops privileges any more: the moment a
+    # `setpriv` (or a `--reuid`) comes back, the capability set has to grow
+    # again -- which is exactly what A4 removed.
+    assert [entry for entry in command if "setpriv" in entry] == []
+    assert "SETUID" not in container["securityContext"]["capabilities"]["add"]
+    assert "SETGID" not in container["securityContext"]["capabilities"]["add"]
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_the_broker_names_the_request_read_deadline() -> None:
+    """A5: the node broker's read deadline is a manifest value, not a C comment.
+
+    ``E2B_BROKER_REQUEST_READ_MS`` bounds what a peer that passed the gate and
+    then says nothing can cost: at the deadline its connection is refused
+    (`ok:false`, naming the deadline) and the handler is freed -- the daemon
+    keeps serving and the other workers on the node never notice. The value in
+    the manifest must be the code's own default (``PRIV_DEFAULT_REQUEST_READ_MS``
+    in ``maint.c``), and it is read out of that source here rather than trusted
+    to stay in sync: a knob that only exists in a comment is a knob nobody can
+    find, and a manifest value that disagrees with the code default is a silent
+    behaviour change on the node.
     """
     rendered = subprocess.run(
         [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s")],
@@ -2231,23 +2331,7 @@ def test_the_broker_probes_connect_as_the_peer_identity() -> None:
     broker = _rendered_workload(rendered, "DaemonSet", "e2b-priv-broker")
     container = broker["spec"]["template"]["spec"]["containers"][0]
     env = {entry["name"]: entry.get("value") for entry in container["env"]}
-    peer_uid = env["E2B_BROKER_PEER_UID"]
-    peer_gid = env["E2B_BROKER_PEER_GID"]
-    expected = [
-        "/usr/bin/setpriv",
-        "--reuid",
-        peer_uid,
-        "--regid",
-        peer_gid,
-        "--clear-groups",
-        "/var/lib/e2b-priv/e2b-maint",
-        "ping",
-        "--socket",
-        "/run/e2b-broker/broker.sock",
-    ]
-    for probe in ("livenessProbe", "readinessProbe"):
-        assert container[probe]["exec"]["command"] == expected, (
-            f"{probe} must connect as the peer identity "
-            f"(E2B_BROKER_PEER_UID/GID={peer_uid}/{peer_gid}): "
-            f"{container[probe]['exec']['command']}"
-        )
+
+    assert env["E2B_BROKER_REQUEST_READ_MS"] == str(
+        _c_integer_define("PRIV_DEFAULT_REQUEST_READ_MS")
+    )
