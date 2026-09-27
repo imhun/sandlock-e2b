@@ -51,6 +51,7 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -82,6 +83,87 @@ MAX_HANDLERS = 32
 
 #: A path that exists in the image and is outside every whitelist root.
 OUTSIDE = "/etc/hosts"
+
+#: The daemon's response writer is "escape in 4 KiB chunks, never splitting a
+#: UTF-8 sequence". This harness drives those same two functions with that same
+#: loop, so the shapes that cannot be produced through a verb (a payload ending
+#: in an incomplete sequence -- `walk` output always ends in a newline) are
+#: still covered.
+ESCAPE_HARNESS = r"""
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "priv_common.h"
+
+struct boundary_case {
+    const char *bytes;
+    size_t len;
+};
+
+int main(int argc, char **argv) {
+    static const struct boundary_case cases[] = {
+        {"\xf0\x80", 2},      /* a lead byte whose sequence never completes */
+        {"abc\xe0", 4},       /* ... at the end of a longer chunk */
+        {"\xe0", 1},          /* the chunk *is* the lead byte */
+        {"\xf0\x9f\x98", 3},  /* three bytes of a four-byte sequence */
+        {"\x80\x80", 2},      /* nothing but continuation bytes */
+        {"a", 1},
+    };
+    char *data = NULL;
+    char *escaped = NULL;
+    size_t cap = 0, len = 0, used = 0, index;
+    FILE *file;
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s FILE\n", argv[0]);
+        return 2;
+    }
+    for (index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+        if (priv_json_escape_boundary(cases[index].bytes, cases[index].len) == 0) {
+            fprintf(stderr, "boundary case %zu made no progress\n", index);
+            return 1;
+        }
+    }
+    file = fopen(argv[1], "rb");
+    if (file == NULL) {
+        perror("fopen");
+        return 2;
+    }
+    for (;;) {
+        size_t got;
+        while (len + 4097 > cap) {
+            char *grown;
+            cap = cap != 0 ? cap * 2 : 8192;
+            grown = realloc(data, cap);
+            if (grown == NULL) {
+                return 2;
+            }
+            data = grown;
+        }
+        got = fread(data + len, 1, 4096, file);
+        len += got;
+        if (got < 4096) {
+            break;
+        }
+    }
+    fclose(file);
+    escaped = malloc(6 * 4096 + 1);
+    if (escaped == NULL) {
+        return 2;
+    }
+    while (used < len) {
+        size_t chunk = len - used > 4096 ? 4096 : len - used;
+        chunk = priv_json_escape_boundary(data + used, chunk);
+        if (chunk == 0) {
+            fprintf(stderr, "the chunker stalled at byte %zu\n", used);
+            return 1;
+        }
+        fwrite(escaped, 1, priv_json_escape(escaped, data + used, chunk), stdout);
+        used += chunk;
+    }
+    return 0;
+}
+"""
 
 
 def _peer_uid() -> int:
@@ -383,37 +465,34 @@ def _await_handlers(handle: _Serve, count: int, timeout: float = 15.0) -> None:
 
 
 def _connect_as(uid: int, socket_path: Path) -> str:
-    """``connect()`` once as `uid`, in a forked child, and report the outcome.
+    """``connect()`` once as `uid`, in a child process, and report the outcome.
 
     The socket's mode is the layer a pool uid has to be stopped by (before any
     peer check can run), so the test has to drop to that uid to see it.
+    ``subprocess`` rather than ``os.fork()``: this suite runs in a process that
+    other lanes may have made multi-threaded, where forking warns.
     """
-    read_fd, write_fd = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        os.close(read_fd)
-        try:
-            os.setgroups([])
-            os.setgid(uid)
-            os.setuid(uid)
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                client.connect(str(socket_path))
-            outcome = "connected"
-        except OSError as exc:
-            outcome = f"error:{exc.errno}"
-        os.write(write_fd, outcome.encode())
-        os.close(write_fd)
-        os._exit(0)
-    os.close(write_fd)
-    chunks = b""
-    while True:
-        chunk = os.read(read_fd, 4096)
-        if not chunk:
-            break
-        chunks += chunk
-    os.close(read_fd)
-    os.waitpid(pid, 0)
-    return chunks.decode()
+    script = (
+        "import os, socket, sys\n"
+        "uid = int(sys.argv[1])\n"
+        "os.setgroups([])\n"
+        "os.setgid(uid)\n"
+        "os.setuid(uid)\n"
+        "client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "try:\n"
+        "    client.connect(sys.argv[2])\n"
+        "    print('connected')\n"
+        "except OSError as exc:\n"
+        "    print(f'error:{exc.errno}')\n"
+    )
+    run = subprocess.run(
+        [sys.executable, "-c", script, str(uid), str(socket_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert run.returncode == 0, run.stderr
+    return run.stdout.strip()
 
 
 def _chown(path: Path, uid: int = POOL_START) -> dict:
@@ -774,6 +853,47 @@ def test_hello_rejects_a_peer_gid_mismatch(serve) -> None:
     )
 
 
+def test_a_peer_that_hangs_up_cannot_take_the_broker_down(serve) -> None:
+    """``connect()`` then ``close()`` at once, against both serving paths.
+
+    The refusal for a peer the daemon does not accept is written by the daemon
+    itself (no handler is forked for it), so that write lands in a socket whose
+    other end is already gone. With SIGPIPE at its default disposition the
+    *daemon* died there -- killing the node's broker, and the trigger is the
+    worker's own transport cancelling a request. ``Popen`` restores default
+    signal dispositions, so this daemon really does start with SIGPIPE at its
+    default: this is the regression, not a mocked one.
+    """
+    stranger = _peer_uid() + 1
+    refused = serve("hangup-refused", E2B_BROKER_PEER_UID=str(stranger))
+    served = serve("hangup-served")
+    _await_listening(served)
+    _await_listening(refused)
+
+    for handle in (refused, served):
+        for _ in range(25):
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.connect(str(handle.socket))
+            client.close()  # no read, no shutdown: just gone
+        time.sleep(0.3)  # the window in which those writes land
+        assert handle.process.poll() is None
+
+    # And both are still serving.
+    refused_reply = _request(
+        refused.socket, {"v": 1, "hello": True}, process=refused.process
+    )
+    assert refused_reply == {
+        "v": 1,
+        "ok": False,
+        "error": (
+            f"peer uid {_peer_uid()} does not match E2B_BROKER_PEER_UID={stranger}"
+        ),
+    }
+    assert _request(served.socket, {"v": 1, "hello": True}, process=served.process)[
+        "ok"
+    ] is True
+
+
 def test_the_socket_is_reachable_only_by_its_peer(serve) -> None:
     """``0660 root:<peer gid>``: a pool uid cannot even connect().
 
@@ -887,6 +1007,80 @@ def test_walk_escapes_a_non_utf8_name_like_python_does(
         "stderr": "",
     }
     assert os.stat(weird).st_uid == POOL_START
+
+    # A name that ends in an *incomplete* sequence is the same story, and it is
+    # the shape the chunker has to keep its hands off: each of its bytes is
+    # escaped on its own, exactly as `os.fsdecode()` decoded them.
+    other = _workspace(tmp_path) / "sb-2"
+    other.mkdir()
+    raw2 = os.fsencode(other) + b"/a\xf0\x9f\x98b"
+    weird2 = os.fsdecode(raw2)
+    with open(weird2, "wb") as sink:
+        sink.write(b"x")
+
+    assert _request(
+        handle.socket,
+        {"v": 1, "args": ["walk", "--path", str(other)]},
+        process=handle.process,
+    ) == {
+        "v": 1,
+        "ok": True,
+        "exit": 0,
+        "stdout": (
+            f"d {_peer_uid()} {_peer_gid()} 755 "
+            f"{os.stat(other).st_blocks * 512} {other}\n"
+            f"f {_peer_uid()} {_peer_gid()} 644 1 {os.fsdecode(raw2)}\n"
+        ),
+        "stderr": "",
+    }
+
+
+def test_the_streaming_escaper_never_stalls(tmp_path: Path) -> None:
+    """The 4 KiB chunker must always make progress.
+
+    A payload whose end is an incomplete UTF-8 sequence used to hand the writer
+    a 0-byte step: the handler then spun forever and the caller never got an
+    answer. The C layer is where this can be driven directly -- a `walk`
+    response always ends in a newline, so the daemon path cannot reach the
+    shape -- and the harness calls the same two functions the writer calls, in
+    the same 4 KiB loop.
+    """
+    source = tmp_path / "escape_harness.c"
+    source.write_text(ESCAPE_HARNESS)
+    harness = tmp_path / "escape-harness"
+    build = subprocess.run(
+        [
+            "cc",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-I",
+            str(PRIV_DIR),
+            "-o",
+            str(harness),
+            str(source),
+            str(PRIV_DIR / "priv_common.c"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert build.returncode == 0, build.stderr
+    assert build.stderr == ""
+
+    # 4096 bytes whose last byte is a lead byte: the final chunk is exactly the
+    # incomplete sequence.
+    payload = b"a" * 4095 + b"\xf0"
+    data = tmp_path / "payload.bin"
+    data.write_bytes(payload)
+
+    run = subprocess.run(
+        [str(harness), str(data)], capture_output=True, text=True, timeout=30
+    )
+
+    assert run.returncode == 0, run.stderr
+    # Byte for byte what Python's own surrogateescape spelling of that payload
+    # is, so the caller's `json.loads` gets back `os.fsdecode(payload)`.
+    assert run.stdout == json.dumps(os.fsdecode(payload))[1:-1]
 
 
 def test_serve_refuses_to_run_from_a_copy(broker_bin: Path, tmp_path: Path) -> None:

@@ -349,8 +349,14 @@ size_t priv_json_escape_boundary(const char *data, size_t len) {
     }
     tail = len - (start - 1);
     if (priv_utf8_lead((unsigned char)data[start - 1]) > tail) {
-        /* The sequence continues in the next chunk: hand it over whole. */
-        return start - 1;
+        /* The sequence continues in the next chunk: hand it over whole. When
+         * there is no earlier byte to stop at (the chunk *starts* with the
+         * sequence and the chunk is all that is left), the sequence is
+         * truncated by the end of the data -- consuming one byte keeps the
+         * caller moving and the escaper writes that byte the same way Python's
+         * surrogateescape writes a truncated sequence. Never 0: a streaming
+         * caller that gets 0 back would spin forever. */
+        return start > 1 ? start - 1 : 1;
     }
     return len;
 }

@@ -58,7 +58,9 @@
  * unauthorized peer costs one refused answer and never a child. A fork error
  * or too many handlers (PRIV_MAX_HANDLERS) refuses that one connection and
  * leaves the daemon serving: nothing a local peer does may take the node's
- * broker down.
+ * broker down. That includes hanging up mid-answer: SIGPIPE is ignored and the
+ * socket writes pass MSG_NOSIGNAL, because the refusal path writes from the
+ * *parent* and a signal there would end the broker.
  *
  * Output is JSON, so every byte of it has to be. A path is not necessarily
  * UTF-8 (a Linux filename may be any byte but NUL and '/'), and one such name
@@ -779,11 +781,18 @@ static int output_append(struct output *sink, const char *data, size_t len) {
 }
 
 /* Everything or nothing: a half-written response would desynchronize a
- * protocol that has no framing of its own. */
-static int sink_write(int fd, const char *data, size_t len) {
+ * protocol that has no framing of its own.
+ *
+ * `socket_fd` picks send(MSG_NOSIGNAL) over write(). The daemon ignores SIGPIPE
+ * as well (see main), but the two together are what make "the peer hung up
+ * mid-answer" an ordinary error here: a refusal is written by the *parent*, and
+ * a signal that kills the parent takes the node's broker with it. */
+static int sink_write_to(int fd, const char *data, size_t len, int socket_fd) {
     size_t used = 0;
     while (used < len) {
-        ssize_t written = write(fd, data + used, len - used);
+        ssize_t written = socket_fd
+                              ? send(fd, data + used, len - used, MSG_NOSIGNAL)
+                              : write(fd, data + used, len - used);
         if (written < 0) {
             if (errno == EINTR) {
                 continue;
@@ -795,16 +804,24 @@ static int sink_write(int fd, const char *data, size_t len) {
     return 0;
 }
 
-static int sink_write_literal(int fd, const char *literal) {
-    return sink_write(fd, literal, strlen(literal));
+static int sink_write(int fd, const char *data, size_t len) {
+    return sink_write_to(fd, data, len, 0);
+}
+
+static int conn_write(int fd, const char *data, size_t len) {
+    return sink_write_to(fd, data, len, 1);
+}
+
+static int conn_write_literal(int fd, const char *literal) {
+    return conn_write(fd, literal, strlen(literal));
 }
 
 /* `data` as a JSON string literal, escaped in chunks: a 256 MiB `walk` must
  * not need a second copy of itself to be answered. */
-static int sink_write_json_string(int fd, const char *data, size_t len) {
+static int conn_write_json_string(int fd, const char *data, size_t len) {
     char escaped[6 * 4096];
     size_t used = 0;
-    if (sink_write_literal(fd, "\"") != 0) {
+    if (conn_write_literal(fd, "\"") != 0) {
         return -1;
     }
     while (used < len) {
@@ -812,23 +829,23 @@ static int sink_write_json_string(int fd, const char *data, size_t len) {
         /* Never cut a UTF-8 sequence in half: the two halves would both look
          * like invalid bytes and come out as two surrogate escapes. */
         chunk = priv_json_escape_boundary(data + used, chunk);
-        if (sink_write(fd, escaped, priv_json_escape(escaped, data + used,
-                                                    chunk)) != 0) {
+        if (conn_write(fd, escaped, priv_json_escape(escaped, data + used,
+                                                     chunk)) != 0) {
             return -1;
         }
         used += chunk;
     }
-    return sink_write_literal(fd, "\"");
+    return conn_write_literal(fd, "\"");
 }
 
 static void respond_error(int fd, const char *message) {
-    if (sink_write_literal(fd, "{\"v\":1,\"ok\":false,\"error\":") != 0) {
+    if (conn_write_literal(fd, "{\"v\":1,\"ok\":false,\"error\":") != 0) {
         return;
     }
-    if (sink_write_json_string(fd, message, strlen(message)) != 0) {
+    if (conn_write_json_string(fd, message, strlen(message)) != 0) {
         return;
     }
-    sink_write_literal(fd, "}\n");
+    conn_write_literal(fd, "}\n");
 }
 
 static void respond_run(int fd, int code, const struct output *out,
@@ -836,21 +853,21 @@ static void respond_run(int fd, int code, const struct output *out,
     char head[64];
     snprintf(head, sizeof(head), "{\"v\":1,\"ok\":true,\"exit\":%d,\"stdout\":",
              code);
-    if (sink_write_literal(fd, head) != 0) {
+    if (conn_write_literal(fd, head) != 0) {
         return;
     }
-    if (sink_write_json_string(fd, out->data != NULL ? out->data : "", out->len) !=
+    if (conn_write_json_string(fd, out->data != NULL ? out->data : "", out->len) !=
         0) {
         return;
     }
-    if (sink_write_literal(fd, ",\"stderr\":") != 0) {
+    if (conn_write_literal(fd, ",\"stderr\":") != 0) {
         return;
     }
-    if (sink_write_json_string(fd, err_out->data != NULL ? err_out->data : "",
+    if (conn_write_json_string(fd, err_out->data != NULL ? err_out->data : "",
                                err_out->len) != 0) {
         return;
     }
-    sink_write_literal(fd, "}\n");
+    conn_write_literal(fd, "}\n");
 }
 
 static void respond_hello(int fd, long peer_uid, long pool_start,
@@ -880,9 +897,9 @@ static void respond_hello(int fd, long peer_uid, long pool_start,
              "{\"v\":1,\"ok\":true,\"peer_uid\":%ld,\"uid_pool\":[%ld,%ld],"
              "\"roots\":",
              peer_uid, pool_start, pool_size);
-    if (sink_write_literal(fd, head) == 0 &&
-        sink_write_literal(fd, roots_json) == 0) {
-        sink_write_literal(fd, "}\n");
+    if (conn_write_literal(fd, head) == 0 &&
+        conn_write_literal(fd, roots_json) == 0) {
+        conn_write_literal(fd, "}\n");
     }
     free(roots_json);
 }
@@ -1364,9 +1381,9 @@ static void handle_connection(int fd) {
     long peer_uid = -1;
     char err[PRIV_ERR_LEN];
 
-    /* A client that hangs up mid-answer must not take the handler (and with it
-     * the socket) down: the write error below is the signal to stop. */
-    signal(SIGPIPE, SIG_IGN);
+    /* SIGPIPE is already ignored (main) and the socket writes pass
+     * MSG_NOSIGNAL, so a client that hangs up mid-answer makes those writes
+     * return -1 instead of killing this handler. */
     /* Depth in defence: the daemon gated this connection before it forked, and
      * a handler must not serve a peer the daemon would have refused. */
     if (peer_gate(fd, &peer_uid, err, sizeof(err)) != 0) {
@@ -1538,7 +1555,7 @@ static int ping(const char *socket_path) {
         priv_fail("cannot connect to the broker socket %s: %s", socket_path,
                   strerror(errno));
     }
-    if (sink_write(fd, hello, sizeof(hello) - 1) != 0) {
+    if (conn_write(fd, hello, sizeof(hello) - 1) != 0) {
         close(fd);
         priv_fail("cannot send the hello to %s: %s", socket_path,
                   strerror(errno));
@@ -1568,6 +1585,14 @@ int main(int argc, char **argv) {
     char err[PRIV_ERR_LEN];
 
     priv_set_progname("e2b-maint");
+    /* Ignore SIGPIPE for the whole program, before anything can be forked or
+     * executed from here. A peer that hangs up mid-answer makes a write fail
+     * with EPIPE, and the default disposition would kill whoever is writing --
+     * which for `serve` is the *parent*, i.e. the node's broker. Handlers and
+     * the exec'd child inherit this; the socket writes also pass
+     * MSG_NOSIGNAL, so the crash needs both "ignored" and "done by hand" to be
+     * wrong at once. */
+    signal(SIGPIPE, SIG_IGN);
     if (argc < 2) {
         priv_usage("expected chown|rm|walk|serve|ping");
     }
