@@ -7,6 +7,7 @@ import json
 import logging
 import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,11 @@ from control_plane.registry.manager import (
     SandboxStateConflictError,
     UnknownSandboxError,
 )
-from control_plane.registry.snapshots import UnknownSnapshotError
+from control_plane.registry.snapshots import (
+    COPY_LEASE_REFRESH_S,
+    COPY_LEASE_TTL_S,
+    UnknownSnapshotError,
+)
 from gateway_common.ids import sandbox_id as new_sandbox_id
 from gateway_common.paths import validate_sandbox_id
 from gateway_common.upload import UploadTooLargeError, read_json_body
@@ -44,6 +49,24 @@ router = APIRouter()
 #: the single-process deployment and for the unnamed case, where every request
 #: already has an id of its own.
 _SNAPSHOT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+#: The snapshot ids *this* process is copying right now (N46). The fleet-wide
+#: lease is what tells *other* replicas a copy is in flight; this is the same
+#: fact for the one replica that cannot read it back as a stranger -- itself.
+#: Without a store the lease is trivially ours, so a periodic reconcile pass
+#: would read this process's own copy as an orphan and re-drive it; and with a
+#: store the set still answers the question a round earlier than a round trip
+#: does.
+_IN_FLIGHT_COPIES: set[str] = set()
+
+#: The cadence of the reconcile pass (N46). The *startup* pass settles what a
+#: restart left behind, but once a live copy holds a lease the startup pass is
+#: no longer enough on its own: a record whose owner died *after* startup would
+#: wait for the next restart to be settled, which is worse than the hole the
+#: lease closes (where any ``creating`` record was fair game). One replica per
+#: round, like the health sweep and the TTL sweep.
+SNAPSHOT_RECONCILE_INTERVAL_S = 10.0
 
 
 def _lock_for(snapshot_id: str) -> asyncio.Lock:
@@ -311,6 +334,11 @@ async def create_snapshot(
     requested_id = request.headers.get("Idempotency-Key") or (
         body.get("snapshotID") if isinstance(body, dict) else None
     )
+    #: The token under which this request holds the id (N46). The claim itself
+    #: is the F11 step 3 shape; the token is what lets the *copy* keep holding
+    #: it -- an async copy refreshes this very lease for as long as it runs, so
+    #: a peer's reconcile pass can tell "somebody is copying" from "orphan".
+    claim_token = uuid.uuid4().hex if requested_id is not None else None
     if requested_id is not None:
         if not isinstance(requested_id, str) or not validate_sandbox_id(requested_id):
             raise OfficialError(400, "snapshotID/Idempotency-Key is not a valid id")
@@ -322,7 +350,9 @@ async def create_snapshot(
         # both copy the same tree into the same directory. The loser waits for
         # the winner's record (the copy answers with it, exactly like a local
         # retry) and otherwise says who holds it.
-        if not _snapshots(request).try_acquire_copy(requested_id):
+        if not _snapshots(request).try_acquire_copy(
+            requested_id, token=claim_token
+        ):
             existing = await _await_snapshot_record(request, requested_id)
             if existing is not None:
                 return _already_exists(existing)
@@ -332,6 +362,7 @@ async def create_snapshot(
                 "control-plane replica",
             )
     claimed = requested_id is not None
+    handed_off = False
 
     try:
         async with _lock_for(requested_id or sandbox_id):
@@ -342,9 +373,16 @@ async def create_snapshot(
                 if existing is not None:
                     return _already_exists(existing)
             if _wants_async(request):
-                return await _create_snapshot_async(
-                    request, sandbox_id, name, requested_id
+                response = await _create_snapshot_async(
+                    request, sandbox_id, name, requested_id, lease_token=claim_token
                 )
+                # N46: the copy task owns the lease from here, so this request
+                # must not release it on the way out (it used to, for the
+                # named async shape -- which left the in-flight record with no
+                # marker at all). It is released when the record carries the
+                # answer, or by the lease's TTL if this replica dies.
+                handed_off = True
+                return response
             try:
                 # N32: the capture talks to the worker with a *synchronous* HTTP
                 # call (the copy is synchronous there too) and can take as long as
@@ -369,11 +407,11 @@ async def create_snapshot(
             except SandboxStateConflictError:
                 raise OfficialError(409, f"Sandbox {sandbox_id} is not running")
     finally:
-        if claimed:
+        if claimed and not handed_off:
             # Released once the *record* exists (async: it is written before
             # the 202) or the copy is done: from then on the record's own
             # ``creating`` status is what any other replica waits on.
-            _snapshots(request).release_copy(requested_id)
+            _snapshots(request).release_copy(requested_id, token=claim_token)
     logger.info("snapshot %s captured from sandbox %s", record.snapshot_id, sandbox_id)
     return record.as_snapshot_info()
 
@@ -424,6 +462,8 @@ async def _create_snapshot_async(
     sandbox_id: str,
     name: str | None,
     requested_id: str | None,
+    *,
+    lease_token: str | None = None,
 ) -> JSONResponse:
     """Reserve the id, answer 202, and copy in the background (N29 ①).
 
@@ -437,6 +477,15 @@ async def _create_snapshot_async(
     request path, so a 202 always means "accepted, copying"; only the bytes
     move later. The reservation is inside the same per-id lock as the sync
     path, so the one-id-one-live-copy rule is unchanged.
+
+    N46: the copy takes the id under a *lease* before the record is written,
+    and hands that same lease to the background task. For a named id the token
+    is the one the request already claimed under (so this is the same claim,
+    now held by the copy); for an unnamed id there is no earlier claim to
+    adopt, so this is where it is taken. The order matters: between "record
+    written" and "a peer can tell somebody is copying it" there must be no
+    window, or a reconcile pass reading the record in that window settles a
+    copy that is running.
     """
     registry = _registry(request)
     record = registry.get(sandbox_id)
@@ -446,6 +495,18 @@ async def _create_snapshot_async(
     node = request.app.state.nodes.get(record.node_id or "local")
     if node is None:
         raise OfficialError(502, f"Node {record.node_id} not found")
+    snapshot_id = requested_id or new_sandbox_id().replace("sbx_", "snap_")
+    token = lease_token or uuid.uuid4().hex
+    if not _snapshots(request).try_acquire_copy(
+        snapshot_id, ttl_s=int(COPY_LEASE_TTL_S), token=token
+    ):
+        # Only reachable for a named id (an unnamed one was minted a line ago,
+        # so nothing can be holding it): the caller's claim was taken over.
+        raise OfficialError(
+            409,
+            f"snapshot {snapshot_id} is being copied by another "
+            "control-plane replica",
+        )
     reserved = _snapshots(request).reserve_from_sandbox(
         template_id=record.template_id,
         env_vars=record.env_vars,
@@ -458,12 +519,16 @@ async def _create_snapshot_async(
         source_sandbox_id=sandbox_id,
         node_id=node.node_id,
         name=name,
-        snapshot_id=requested_id,
+        snapshot_id=snapshot_id,
         tenant_id=record.tenant_id,
     )
+    # Registered before the task starts: a reconcile round can run between the
+    # record being written and the task's first byte, and this is the copy's
+    # in-process marker for the whole of that time.
+    _IN_FLIGHT_COPIES.add(reserved.snapshot_id)
     task = asyncio.create_task(
         _run_reserved_capture(
-            request.app, reserved.snapshot_id, sandbox_id, name
+            request.app, reserved.snapshot_id, sandbox_id, name, token
         )
     )
     _PENDING_CAPTURES.add(task)
@@ -471,10 +536,70 @@ async def _create_snapshot_async(
     return JSONResponse(status_code=202, content=reserved.as_snapshot_status())
 
 
-async def _run_reserved_capture(
-    app, snapshot_id: str, sandbox_id: str, name: str | None
+async def _refresh_copy_lease(
+    snapshots,
+    snapshot_id: str,
+    token: str,
+    *,
+    ttl_s: float = COPY_LEASE_TTL_S,
+    refresh_s: float = COPY_LEASE_REFRESH_S,
+    sleep=asyncio.sleep,
 ) -> None:
-    """Drive one reserved capture and publish how it ended."""
+    """Keep this replica's copy lease alive for as long as its copy runs (N46).
+
+    The lease's whole point is that it *expires*: an owner that dies mid-copy
+    has to stop looking live within seconds, so the TTL is short and the owner
+    has to keep saying "still here" (a copy can run for minutes -- the worker
+    call times out at 120 s, and N32 measured 76 s for a 2000-file tree).
+    Without this refresh the lease would be the *weaker* half of the fix: a
+    copy that outlived its TTL is exactly the record a peer's reconcile pass
+    settles.
+
+    Losing the lease is not fatal to the copy. The bytes are the user's work,
+    so this keeps copying and says so in the log once: what a lost lease
+    changes is *who a peer may settle*, not what this replica is doing.
+
+    ``sleep`` is injected so the property is testable on a fake clock
+    (``tests/unit/test_snapshot_copy_lease.py``): a real clock would need
+    minutes of sleeping to show that ten TTLs of copying do not lapse the
+    lease.
+    """
+    log = logging.getLogger(__name__)
+    lost = False
+    while True:
+        await sleep(refresh_s)
+        if snapshots.refresh_copy(snapshot_id, token, ttl_s=int(ttl_s)):
+            lost = False
+            continue
+        if not lost:
+            lost = True
+            log.warning(
+                "snapshot %s: this replica's copy lease is no longer held "
+                "(taken over, or the shared store is unreachable); a reconcile "
+                "pass may now settle the record while this replica is still "
+                "copying it",
+                snapshot_id,
+            )
+
+
+async def _run_reserved_capture(
+    app,
+    snapshot_id: str,
+    sandbox_id: str,
+    name: str | None,
+    lease_token: str,
+) -> None:
+    """Drive one reserved capture and publish how it ended.
+
+    The copy holds the fleet-wide lease (N46) for as long as it runs, so a
+    peer's reconcile pass reads "somebody is copying this" and leaves the
+    record alone -- and stops reading it that way on its own within
+    ``COPY_LEASE_TTL_S`` if this process dies mid-copy.
+    """
+    snapshots = app.state.snapshots
+    refresher = asyncio.create_task(
+        _refresh_copy_lease(snapshots, snapshot_id, lease_token)
+    )
     try:
         await asyncio.to_thread(
             _capture_reserved, app.state, snapshot_id, sandbox_id, name
@@ -484,19 +609,35 @@ async def _run_reserved_capture(
             "async snapshot %s failed: %s", snapshot_id, exc
         )
         await asyncio.to_thread(
-            app.state.snapshots.mark_failed, snapshot_id, str(exc)
+            snapshots.mark_failed, snapshot_id, str(exc)
         )
+    finally:
+        _IN_FLIGHT_COPIES.discard(snapshot_id)
+        refresher.cancel()
+        try:
+            await refresher
+        except asyncio.CancelledError:
+            pass
+        # The record now carries the answer (completed/failed), which is what
+        # a peer reads; the lease has done its job.
+        snapshots.release_copy(snapshot_id, token=lease_token)
 
 
 async def reconcile_pending_snapshots(app) -> int:
-    """Resolve every copy that was in flight when this process stopped.
+    """Resolve every copy whose owner is gone.
 
     A reserved capture lives in an in-process task, so a restart (or a crash)
     leaves its record at ``creating`` forever and a poller would wait on a copy
-    nobody is running. One pass at startup settles each of them: the worker's
+    nobody is running. One pass settles each of them: the worker's
     ``POST /agent/snapshots`` is idempotent (a finished payload answers
     ``alreadyExists``), so a copy that *did* finish is simply recorded as
     completed, and anything else is marked failed with the reason.
+
+    Run at startup, and then on ``SNAPSHOT_RECONCILE_INTERVAL_S`` by
+    :func:`snapshot_reconcile_loop` -- the pass has to keep running, because
+    "the owner is not copying any more" is now decided by the copy's lease, and
+    an owner that dies after startup would otherwise wait for the next restart
+    to be settled.
 
     Returns how many records were resolved, for the log line.
     """
@@ -504,22 +645,41 @@ async def reconcile_pending_snapshots(app) -> int:
     resolved = 0
     for record in list(app.state.snapshots.in_progress()):
         name = record.names[0] if record.names else None
-        # F11 step 3: not every ``creating`` record is this process's business.
-        # The claim is the half that says "somebody is copying this id right
-        # now", and on a restart that somebody can be a *live* peer: re-driving
-        # its copy submits a second POST for an id whose payload is half
-        # written, which the worker answers 409 -- so this pass would mark
-        # failed a record its owner is one step from completing (and a client
-        # that retries then copies the tree a second time). Taking the claim is
-        # the same test the request path makes; losing it means leaving the
-        # record to the replica that owns it.
-        if not app.state.snapshots.try_acquire_copy(record.snapshot_id):
+        if record.snapshot_id in _IN_FLIGHT_COPIES:
+            # N46: this very process is copying it. The fleet-wide lease below
+            # answers the same question when a store is configured, but without
+            # one the lease is trivially ours, and a periodic pass would then
+            # read this process's own in-flight copy as an orphan and re-drive
+            # it -- the exact harm the lease exists to stop, self-inflicted.
+            log.info(
+                "snapshot %s: this replica is copying it; leaving it alone",
+                record.snapshot_id,
+            )
+            continue
+        # F11 step 3 + N46: not every ``creating`` record is this process's
+        # business. The lease is the half that says "somebody is copying this
+        # id *now*" -- held and refreshed by whoever is running the copy, named
+        # or unnamed -- and taking it is the same test the request path makes.
+        # Losing it means leaving the record to the replica that owns it;
+        # winning it means nobody owns the record any more, so this pass does.
+        claim_token = uuid.uuid4().hex
+        if not app.state.snapshots.try_acquire_copy(
+            record.snapshot_id,
+            ttl_s=int(COPY_LEASE_TTL_S),
+            token=claim_token,
+        ):
             log.info(
                 "snapshot %s: another replica is copying it; leaving the record "
                 "to that replica",
                 record.snapshot_id,
             )
             continue
+        # The re-drive can itself take as long as a copy (the worker call times
+        # out at 120 s), so it holds a refreshed lease too: a second replica
+        # must not start re-driving the same record while this one is midway.
+        refresher = asyncio.create_task(
+            _refresh_copy_lease(app.state.snapshots, record.snapshot_id, claim_token)
+        )
         try:
             if not record.sandbox_id:
                 raise RuntimeError(
@@ -544,11 +704,73 @@ async def reconcile_pending_snapshots(app) -> int:
             # answer (completed/failed), the claim has done its job. Holding it
             # would keep a later pass -- on this replica or the other one -- from
             # settling a record whose owner died mid-copy.
-            app.state.snapshots.release_copy(record.snapshot_id)
+            refresher.cancel()
+            try:
+                await refresher
+            except asyncio.CancelledError:
+                pass
+            app.state.snapshots.release_copy(
+                record.snapshot_id, token=claim_token
+            )
         resolved += 1
     if resolved:
-        log.info("reconciled %d in-flight snapshot(s) at startup", resolved)
+        log.info("reconciled %d ownerless snapshot copy(ies)", resolved)
     return resolved
+
+
+async def snapshot_reconcile_loop(
+    app,
+    *,
+    interval_s: float = SNAPSHOT_RECONCILE_INTERVAL_S,
+    clock=time.monotonic,
+    sleep=asyncio.sleep,
+) -> None:
+    """Settle ownerless copies on a cadence, one replica per round (N46).
+
+    **Wiring**: this belongs next to the startup pass in ``create_app``'s
+    lifespan --
+    ``reconcile_task = asyncio.create_task(snapshot_reconcile_loop(app))`` --
+    with the same cancel-on-shutdown discipline as ``node_health_task``.
+    (This module owns the loop rather than ``app.py`` so the control plane's
+    task wiring stays one line; ``control_plane/app.py`` is not part of this
+    change.)
+
+    The round claim is the TTL'd-key single-flight every sweep here uses
+    (``NodeRegistry.try_acquire_sweep``, ``try_claim``): two replicas would
+    otherwise settle the same records twice.
+
+    A round that runs after the loop itself was stalled is skipped. The reason
+    is the one the health sweep documents, one level down: this replica's
+    leases are refreshed *by this loop*, so a stall longer than a lease is
+    exactly when a record with no lease is not yet evidence that its owner is
+    gone -- and settling one is destructive (it re-drives the copy and
+    publishes ``failed`` when the worker refuses a half-written payload).
+    """
+    log = logging.getLogger(__name__)
+    previous = clock()
+    while True:
+        await sleep(interval_s)
+        now = clock()
+        behind = now - previous
+        previous = now
+        if behind > COPY_LEASE_TTL_S:
+            log.warning(
+                "snapshot reconcile: skipping this round -- this loop was "
+                "%.1fs behind (>= the %.0fs copy lease), so a record with no "
+                "lease is not yet evidence that its owner is gone",
+                behind,
+                COPY_LEASE_TTL_S,
+            )
+            continue
+        try:
+            if app.state.snapshots.try_acquire_reconcile(ttl_s=int(interval_s)):
+                resolved = await reconcile_pending_snapshots(app)
+                if resolved:
+                    log.info("snapshot reconcile: settled %d record(s)", resolved)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - defensive
+            log.exception("snapshot reconcile pass failed")
 
 
 @router.get(

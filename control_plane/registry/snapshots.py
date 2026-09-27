@@ -24,6 +24,29 @@ from gateway_common.timeutil import to_iso_z, utcnow
 logger = logging.getLogger(__name__)
 
 
+#: How long the *named* copy claim lives (F11 step 3). It has no refresher
+#: behind it, so it has to outlive one whole synchronous copy on its own: the
+#: worker call times out at 120 s and N32 measured 76 s for a 2000-file tree.
+COPY_CLAIM_TTL_S = 600
+
+#: The copy *lease* (N46): the TTL a claim lives without a refresh, and how
+#: often its owner refreshes it. Much shorter than the named claim above and
+#: refreshed on purpose: the point of the lease is that it *expires*, so an
+#: owner that died mid-copy stops looking like a live one within seconds
+#: instead of holding the id for ten minutes. The TTL is several refresh
+#: intervals long, so a copy keeps its lease across an ordinary stall of the
+#: control-plane loop rather than losing it to one missed tick.
+COPY_LEASE_TTL_S = 30
+COPY_LEASE_REFRESH_S = 10
+
+
+def _text(value) -> str | None:
+    """A store value as text (``bytes`` when the client is not decoding)."""
+    if value is None:
+        return None
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
 def _is_within(child: Path, parent: Path) -> bool:
     """``child`` is equal to or under ``parent`` (both already resolved)."""
     try:
@@ -199,7 +222,13 @@ class SnapshotRegistry:
     def _copy_key(self, snapshot_id: str) -> str:
         return f"{self._ns}:snapshot:copy:{snapshot_id}"
 
-    def try_acquire_copy(self, snapshot_id: str, *, ttl_s: int = 600) -> bool:
+    def try_acquire_copy(
+        self,
+        snapshot_id: str,
+        *,
+        ttl_s: int = COPY_CLAIM_TTL_S,
+        token: str | None = None,
+    ) -> bool:
         """Claim the *copy* for one snapshot id across replicas.
 
         The record's ``creating`` status is the durable half of this ("somebody
@@ -209,30 +238,114 @@ class SnapshotRegistry:
         both copy the same tree into the same directory. That window is what
         this key closes.
 
-        The TTL is deliberately longer than any copy (N32 measured 76 s for
-        2000 files; the worker call times out at 120 s) and shorter than
-        "forever": a replica that dies mid-copy leaves an id that can be
-        retried, and its record stays ``creating`` for the reconciliation path
-        to fail. Without Redis there is one process, so the in-process lock is
-        the whole answer and this returns ``True``.
+        Two shapes of caller, and the difference is who the claim belongs to
+        (N46):
+
+        * ``token=None`` -- the original claim. The *named* request path takes
+          it before the copy starts (and releases it when the record carries
+          the answer), and the reconcile pass takes it to ask "is somebody
+          copying this id?" before re-driving a record. The TTL is
+          ``COPY_CLAIM_TTL_S``: no refresher is behind either caller, so it has
+          to outlive one copy on its own.
+        * ``token=<id>`` -- the copy *lease*. The replica running a copy takes
+          the id under a token it can refresh (:meth:`refresh_copy`), so an
+          in-flight copy stays claimed for as long as it runs and an owner that
+          dies stops being claimed after ``COPY_LEASE_TTL_S``. Answering ``True``
+          for an id already held with *this* token is the "adopt the claim I
+          just took" case; a rival's token is refused.
+
+        Without Redis there is one process, so the in-process lock is the whole
+        answer and this returns ``True``.
+        """
+        if self._redis is None:
+            return True
+        key = self._copy_key(snapshot_id)
+        try:
+            if token is None:
+                return bool(self._redis.set(key, "1", nx=True, ex=ttl_s))
+            if self._redis.set(key, token, nx=True, ex=max(1, int(ttl_s))):
+                return True
+            # Already claimed: ours to refresh, or somebody else's to respect.
+            return _text(self._redis.get(key)) == token
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("snapshot copy claim failed; proceeding", exc_info=True)
+            return True
+
+    def refresh_copy(
+        self, snapshot_id: str, token: str, *, ttl_s: int = COPY_LEASE_TTL_S
+    ) -> bool:
+        """Extend *this replica's* copy lease; ``False`` when it is not ours.
+
+        The owner of an in-flight copy has to keep saying so (N46): a copy can
+        run for minutes, and a lease that outlived its owner would be the
+        opposite mistake from the one this whole mechanism fixes. The value is
+        the token rather than a bare ``1`` precisely so this can be a
+        *conditional* refresh -- an unconditional "extend this key" would also
+        extend a peer's lease, and hiding a peer's expiry is what would make a
+        settled record look live again.
+
+        A store that cannot be reached answers ``False``: the caller keeps
+        copying (the bytes are the user's work) and says so in the log, because
+        what a lost lease changes is *who a peer may settle*, not what this
+        replica is doing.
+        """
+        if self._redis is None:
+            return True
+        key = self._copy_key(snapshot_id)
+        try:
+            if _text(self._redis.get(key)) != token:
+                return False
+            self._redis.expire(key, max(1, int(ttl_s)))
+            return True
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("snapshot copy lease refresh failed", exc_info=True)
+            return False
+
+    def release_copy(self, snapshot_id: str, *, token: str | None = None) -> None:
+        """Drop the claim for one snapshot id.
+
+        ``token=None`` releases unconditionally (the legacy shape, used by
+        callers that know the claim is theirs); with a token the claim is only
+        dropped when it is still *that* lease, so a release that arrives after
+        the lease expired and a peer took it cannot delete the peer's claim.
+        """
+        if self._redis is None:
+            return
+        key = self._copy_key(snapshot_id)
+        try:
+            if token is None:
+                self._redis.delete(key)
+            elif _text(self._redis.get(key)) == token:
+                self._redis.delete(key)
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("snapshot copy claim release failed", exc_info=True)
+
+    def try_acquire_reconcile(self, *, ttl_s: float) -> bool:
+        """Claim one round of the reconcile pass (N46).
+
+        Same shape as ``NodeRegistry.try_acquire_sweep`` and the TTL sweeper's
+        ``try_claim``: the pass settles records every replica can see, so a
+        second replica running the same round is duplicated work -- and a
+        duplicated ``mark_failed``/re-drive -- rather than extra coverage. A
+        replica that dies mid-round costs the fleet one round. Without Redis
+        there is one process, which is the sweeper by definition.
         """
         if self._redis is None:
             return True
         try:
             return bool(
-                self._redis.set(self._copy_key(snapshot_id), "1", nx=True, ex=ttl_s)
+                self._redis.set(
+                    f"{self._ns}:snapshot:reconcile",
+                    "1",
+                    nx=True,
+                    ex=max(1, int(ttl_s)),
+                )
             )
         except Exception:  # pragma: no cover - defensive
-            logger.warning("snapshot copy claim failed; proceeding", exc_info=True)
+            logger.warning(
+                "snapshot reconcile claim failed; sweeping anyway", exc_info=True
+            )
             return True
-
-    def release_copy(self, snapshot_id: str) -> None:
-        if self._redis is None:
-            return
-        try:
-            self._redis.delete(self._copy_key(snapshot_id))
-        except Exception:  # pragma: no cover - defensive
-            logger.warning("snapshot copy claim release failed", exc_info=True)
 
     def _snapshot_dir(self, snapshot_id: str) -> Path:
         """Where one snapshot's record *and* payload live.

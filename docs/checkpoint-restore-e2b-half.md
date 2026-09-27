@@ -566,3 +566,67 @@ replace"的用法** ⇒ 不做。**已知边界**：恢复按**路径**重开 fd
 ⑥ **`E2B_PAUSED_TTL_S`（paused 的过期策略）仍未拍板**：计划默认 **0 = 不启用**，且今天
 **没有实现**（全库 `rg 'E2B_PAUSED_TTL_S'` 只命中计划本身）——这是**有意不实现**，因为
 它会摧毁用户状态，形状没定就不写。登记在 `docs/open-issues.md` 的 checkpoint 行。
+
+---
+
+## 7. 未命名异步快照的拷贝租约（N46，2026-09-27）
+
+**这条缺陷与 checkpoint 无关，但落在这份文档要守的同一段代码上**（快照拷贝的
+`control_plane/api/snapshots.py` + `control_plane/registry/snapshots.py`），运维口径写在这里；
+机制与证据见 `docs/open-issues.md` 的 N46 行（控制器维护）与 `.superpowers/sdd/n46-fix-report.md`。
+
+### 缺陷一句话
+
+异步快照的记录先落 `creating`（共享卷上，谁都能读），而"有人在拷"的标记过去只有**带名**
+（`Idempotency-Key`/`snapshotID`）的请求才持有。**未命名**异步拷贝因此没有活性标记：对端
+`reconcile_pending_snapshots` 读到一条没人认领的 `creating` 记录，只能理解成"owner 崩了"
+（孤儿），于是**重驱动**一条还在跑着的拷贝 —— 第二份整树拷贝，以及 worker 对半写 payload 回
+409 后把记录 `mark_failed`。
+
+### 修法：拷贝租约（lease）
+
+* **未命名异步拷贝也持有认领**（`e2b:snapshot:copy:<id>`），值是一个 **token**（不是 `1`），
+  由**owner 续租**（`SnapshotRegistry.refresh_copy`，条件续租：不是自己的 lease 不续）。
+* 认领在**记录之前**取：`_create_snapshot_async` 先 `try_acquire_copy(token=...)` 再
+  `reserve_from_sandbox`，所以"记录 `creating`"与"别人看得出有人在拷"之间没有窗口。
+* 拷贝任务 `_run_reserved_capture` 全程跑 `_refresh_copy_lease`，结束时释放；
+  **带名 id 的老路径逐字不变**（认领 + 输家等记录、等不到回 409
+  `snapshot <id> is being copied by another control-plane replica`）——租约加在它下面，不替换它。
+* **启动扫描改为周期性**（`snapshot_reconcile_loop`）：只有启动跑一次的话，owner 在启动**之后**
+  崩掉的记录要等到下一次重启才被 settle —— 那比现状更糟。每轮用 `try_acquire_reconcile`
+  单飞（与 `try_acquire_sweep` / `try_claim` 同形），重启时的那一次仍由
+  `reconcile_pending_snapshots` 的启动任务负责。
+
+### 运维口径（数字与常量）
+
+| 量 | 值 | 常量 / 位置 |
+|---|---|---|
+| 拷贝租约 TTL（无续租即过期） | **30 s** | `COPY_LEASE_TTL_S`（`control_plane/registry/snapshots.py`） |
+| owner 续租间隔 | **10 s** | `COPY_LEASE_REFRESH_S`（同上） |
+| 孤儿扫描节奏（周期） | **10 s** | `SNAPSHOT_RECONCILE_INTERVAL_S`（`control_plane/api/snapshots.py`） |
+| 带名**同步**拷贝的认领 TTL（无续租，老形状） | **600 s** | `COPY_CLAIM_TTL_S`（registry） |
+| **孤儿 settle 时延上界** | owner 最后一次续租 + **≤ ~40 s**（TTL 30 s + 一轮扫描 10 s）之后进入"可被 settle"；settle 本身再花一次重驱动的时间（worker 拷贝 RPC 自带 `timeout=120`） | 上面三个常量 |
+| 活拷贝被保护的条件 | 续租在跑（即控制面事件循环没被卡过 TTL） | 同上 |
+
+两条由此推出的运维事实：
+
+1. **带名异步拷贝的恢复也变快了**：它的认领过去是"一挂 600 s 不刷新"，现在是同一把租约
+   （30 s + 续租）。owner 崩掉后这个 id 约 30 s 就能被重试/接管，而不是等 10 分钟。
+2. **被保护的前提是续租线程活着**：控制面事件循环若被卡住超过 `COPY_LEASE_TTL_S`，
+   本副本的续租也一起停，此时对端的扫描**可能**把这条还在拷的记录当孤儿 settle（日志里
+   有 `this replica's copy lease is no longer held ...` 一行）。这是"由 owner 定期刷新"
+   这一形状的固有代价；把 TTL 调大能缓解，代价是孤儿 settle 变慢。
+   周期扫描自己也有一次同样的刹车：上一轮之后若发现本循环落后 ≥ `COPY_LEASE_TTL_S`，
+   这一轮**跳过**（沿用 `_node_health_loop` 的"落后就别拿旧证据下破坏性结论"）。
+
+### 接线（挂点，留给控制器）
+
+`control_plane/api/snapshots.py` 提供好了循环，`control_plane/app.py` 里需要在 lifespan 中
+加一行（与启动那次 `reconcile_pending_snapshots(app)` 并列、同样在 shutdown 时取消）：
+
+```python
+reconcile_task = asyncio.create_task(snapshot_reconcile_loop(app))
+```
+
+**本节提交前该行尚未接线**（`control_plane/app.py` 由另一单持有），所以今天的实际行为是
+"启动扫描一次 + 租约已生效"；接上线之后才是"周期性 settle 孤儿"。
