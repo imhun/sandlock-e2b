@@ -469,11 +469,88 @@ def test_socket_transport_refuses_an_answer_over_the_read_limit(
 
     assert str(excinfo.value) == (
         f"the maintenance broker at {daemon.socket_path} answered more than "
-        "4096 bytes without a newline: refusing to buffer an answer over the "
-        "limit (the daemon caps one stream at 256 MiB of unescaped bytes and "
-        "escaping can inflate that sixfold, so nothing this broker could "
-        "answer legitimately is longer than this line)"
+        "4096 bytes without a newline to a rm request: refusing to buffer an "
+        "answer over the rm limit"
     )
+
+
+def test_a_walk_answer_over_the_walk_limit_is_named_and_refused(
+    tmp_path: Path, fake_daemon, monkeypatch
+) -> None:
+    """``walk`` reads under its own, smaller ceiling -- and the refusal says so.
+
+    A ``walk`` answer is one sandbox tree, and a tree is capped at
+    ``E2B_DISK_MAX_ENTRIES`` (500_000) entries (~80 B a line, ~40 MB), so the
+    walk line is read under ``BROKER_MAX_WALK_RESPONSE_BYTES`` instead of the
+    two-stream escape-blowup ceiling the other verbs keep. The worker buffers
+    that line and the worker container is capped at ``limits.memory: 2Gi``:
+    without the smaller walk ceiling an overrun is an OOM kill before it is
+    ever a refusal. Injected small, the way the ceiling above is driven, and
+    asserted to name both the verb and the ceiling it used.
+    """
+    monkeypatch.setattr(ph, "BROKER_MAX_WALK_RESPONSE_BYTES", 4096)
+    daemon = fake_daemon(
+        lambda request: {"v": 1, "ok": True, "exit": 0, "stdout": "x" * 8192}
+    )
+    helpers = _helpers(tmp_path, socket_path=daemon.socket_path)
+    target = helpers.workspace_base / "sbx_a"
+    target.mkdir()
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        helpers.walk(target)
+
+    assert str(excinfo.value) == (
+        f"the maintenance broker at {daemon.socket_path} answered more than "
+        "4096 bytes without a newline to a walk request: refusing to buffer "
+        "an answer over the walk limit"
+    )
+
+
+def test_a_chown_answer_of_the_same_size_is_not_held_to_the_walk_limit(
+    tmp_path: Path, fake_daemon, monkeypatch
+) -> None:
+    """The smaller ceiling is the walk verb's, not a quieter global one.
+
+    Only ``walk`` can be big; a ``chown`` answer is a handful of bytes. An
+    answer the *walk* ceiling refuses must still pass for ``chown`` -- proving
+    the split is per-verb, not a shrunken ceiling for every verb.
+    """
+    monkeypatch.setattr(ph, "BROKER_MAX_WALK_RESPONSE_BYTES", 4096)
+    daemon = fake_daemon(
+        lambda request: {"v": 1, "ok": True, "exit": 0, "stdout": "x" * 8192}
+    )
+    helpers = _helpers(tmp_path, socket_path=daemon.socket_path)
+    target = helpers.workspace_base / "sbx_a"
+    target.mkdir()
+
+    helpers.chown(uid=10000, path=target)
+
+    assert daemon.requests[0]["args"][0] == "chown"
+
+
+def test_the_walk_read_limit_is_below_the_generic_one_and_the_worker_memory() -> None:
+    """The ordering that keeps a legitimate ``walk`` readable and safe.
+
+    The ceiling has to be:
+
+    * *above* the worst single-tree answer **on the wire** -- otherwise a
+      legitimate tree is refused (the silent-staleness bug: the accounting and
+      checkpoint paths only warn/skip). The worst tree is one at the
+      ``E2B_DISK_MAX_ENTRIES`` cap (500000, ``deploy/k8s/worker.yaml``), ~80 B
+      a line (an estimate, not an upper bound), ~40 MB unescaped, times the 6x
+      wire escape blow-up (~229 MiB). 2x that is the margin this pins;
+    * *below* the generic two-stream ceiling, so ``walk`` is the verb that
+      reads under the smaller bound;
+    * *below* the worker container's ``limits.memory`` (2Gi) so crossing it is
+      a named refusal, never the kernel's OOM kill first. That memory number
+      itself is pinned off the render in
+      ``test_worker_manifest_permissions.test_the_worker_limits_match_the_walk_derivation``
+      -- the two drift together or not at all.
+    """
+    worst_single_tree_wire_bytes = 500_000 * 80 * 6
+    assert ph.BROKER_MAX_WALK_RESPONSE_BYTES < ph.BROKER_MAX_RESPONSE_BYTES
+    assert ph.BROKER_MAX_WALK_RESPONSE_BYTES >= 2 * worst_single_tree_wire_bytes
+    assert ph.BROKER_MAX_WALK_RESPONSE_BYTES < 2 * 1024**3
 
 
 def test_socket_transport_raises_when_the_socket_is_gone(tmp_path: Path) -> None:

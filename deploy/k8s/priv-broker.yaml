@@ -142,8 +142,14 @@ spec:
                 chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||
                   echo "image-cache-init: chown refused ($dir/_oci, NFS root_squash?) -- verifying the owner instead"
                 if [ -d "$dir/secrets" ]; then
-                  chown 65534:65534 "$dir/secrets" 2>/dev/null || true
-                  find "$dir/secrets" -mindepth 1 -maxdepth 2 -type d -exec chown 65534:65534 {} + 2>/dev/null || true
+                  # `-mindepth 1 -maxdepth 2` 同样是契约本身：payload 布局固定为
+                  # `<secrets>/<sandbox_id>/<name>.secret`（目录只到深度 1），将来若出现
+                  # 更深的布局必须回来改这里。下面两条 chown 保持 non-fatal —— `secrets/`
+                  # 可能压根不存在，个别存储也会拒绝 chown —— 但每条都补一句可见的失败
+                  # 提示：静默的 `|| true` 会让"NFS root_squash 把目录留成 root:0755"
+                  # 无声无息，而那个 worker 之后连 `secret_dir.mkdir()` 都做不到。
+                  chown 65534:65534 "$dir/secrets" 2>/dev/null || echo "image-cache-init: chown refused ($dir/secrets, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid 65534"
+                  find "$dir/secrets" -mindepth 1 -maxdepth 2 -type d -exec chown 65534:65534 {} + 2>/dev/null || echo "image-cache-init: chown refused ($dir/secrets -mindepth 1 -maxdepth 2, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid 65534"
                   echo "image-cache-init: handed $dir/secrets (directories only; *.secret files stay with their sandbox uid) to uid 65534"
                 fi
                 owner="$(stat -c %u "$dir")"

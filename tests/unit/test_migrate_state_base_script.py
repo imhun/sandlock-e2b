@@ -229,6 +229,45 @@ def test_the_engine_heredoc_is_inside_a_function_not_a_command_substitution() ->
     assert [line for line in lines if "$(cat <<'PY_ENGINE'" in line] == []
 
 
+def test_no_shell_variable_is_left_adjacent_to_a_non_ascii_character() -> None:
+    """`$want）` parses as `want<first byte>: unbound variable` under bash 3.2.
+
+    macOS `/bin/bash` is 3.2 and not multibyte-aware: it swallows the first
+    byte of a full-width punctuation mark that follows a bare `$VAR` into the
+    variable name, and `set -u` aborts the script on the spot. This file had
+    four such sites (`$want）`, `$JOB（`, `$CONFIGMAP）`, `$CONFIGMAP（`) -- the
+    same shape `migrate-state-owner.sh` was fixed for. A variable next to
+    full-width punctuation must therefore be spelled `${VAR}`.
+    """
+    offenders = []
+    for number, line in enumerate(_lines(SCRIPT), start=1):
+        for match in re.finditer(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]", line):
+            offenders.append((number, match.group(0)))
+    assert offenders == []
+
+
+def test_usage_prints_exactly_the_leading_comment_block() -> None:
+    """`usage()`'s `sed` range must be the comment block's real extent.
+
+    The leading comment block is the script's own `--help`: it starts on line
+    2 (line 1 is the shebang) and ends at the last comment line before the
+    first statement. A range that overshoots spills a real command into the
+    help text; one that falls short hides the tail of it.
+    """
+    lines = SCRIPT.read_text(encoding="utf-8").splitlines()
+    last_comment = 1  # the shebang is line 1; the block starts on line 2
+    for number, line in enumerate(lines, start=1):
+        if number < 2:
+            continue
+        if not line.startswith("#"):
+            break
+        last_comment = number
+    assert (
+        f"sed -n '2,{last_comment}p' \"$SCRIPT_PATH\""
+        in SCRIPT.read_text(encoding="utf-8")
+    ), f"usage() should read lines 2..{last_comment}"
+
+
 def test_the_migration_stages_every_file_it_creates_at_0600() -> None:
     """The hard requirement: nothing this script creates is world-readable.
 

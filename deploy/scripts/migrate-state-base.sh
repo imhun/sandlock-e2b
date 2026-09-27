@@ -75,7 +75,7 @@ warn() {
 }
 
 usage() {
-    sed -n '2,40p' "$SCRIPT_PATH"
+    sed -n '2,39p' "$SCRIPT_PATH"
 }
 
 while [ $# -gt 0 ]; do
@@ -835,7 +835,7 @@ check_kubeconfig() {
     fi
     got="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$KUBECONFIG")"
     if [ "$got" != "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$want")" ]; then
-        refuse 2 "KUBECONFIG=$KUBECONFIG 不是本项目那一份（要 $want）——绝不要把写操作打到别的集群上，见 docs/deploy-clusters.md §0"
+        refuse 2 "KUBECONFIG=$KUBECONFIG 不是本项目那一份（要 ${want}）——绝不要把写操作打到别的集群上，见 docs/deploy-clusters.md §0"
     fi
 }
 
@@ -943,7 +943,7 @@ job_wait() {
 job_run() {
     local rendered
     rendered="$(render_job)"
-    warn "迁移由 Job 执行：$JOB（runAsUser 0，PVC sandbox-shared 以 RW 挂到 /shared）"
+    warn "迁移由 Job 执行：${JOB}（runAsUser 0，PVC sandbox-shared 以 RW 挂到 /shared）"
     kubectl -n "$NAMESPACE" create configmap "$CONFIGMAP" \
         --from-file="migrate-state-base.sh=$SCRIPT_PATH" --dry-run=client -o yaml |
         kubectl -n "$NAMESPACE" apply -f - >&2
@@ -952,11 +952,11 @@ job_run() {
         warn "job/$JOB 没有成功完成，日志与 pod 状态如下（对象保留，便于排查）"
         kubectl -n "$NAMESPACE" logs "job/$JOB" || true
         kubectl -n "$NAMESPACE" get pods -l job-name="$JOB" -o wide || true
-        refuse 1 "Job 失败：看上面的日志。job/$JOB 与 configmap/$CONFIGMAP 都留着（查完手动 kubectl -n $NAMESPACE delete job/$JOB configmap/$CONFIGMAP）"
+        refuse 1 "Job 失败：看上面的日志。job/$JOB 与 configmap/$CONFIGMAP 都留着（查完手动 kubectl -n $NAMESPACE delete job/$JOB configmap/${CONFIGMAP}）"
     fi
     kubectl -n "$NAMESPACE" logs "job/$JOB"
     if [ "$KEEP_JOB" = "1" ]; then
-        warn "保留 job/$JOB 与 configmap/$CONFIGMAP（--keep-job）"
+        warn "保留 job/$JOB 与 configmap/${CONFIGMAP}（--keep-job）"
         return 0
     fi
     kubectl -n "$NAMESPACE" delete job "$JOB" --ignore-not-found

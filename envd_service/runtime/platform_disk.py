@@ -22,10 +22,14 @@ instead of quietly spending a user's space.
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 
 from gateway_common.env import env_int
 from gateway_common.paths import RUNTIME_DIR_NAME, resolve_state_base
+
+logger = logging.getLogger(__name__)
 
 #: MiB -> bytes, the unit the knob and every message below are written in.
 _MIB = 1024 * 1024
@@ -60,14 +64,81 @@ def measure_platform_disk_bytes(
     measured before N27; with ``E2B_STATE_BASE`` set the account follows the
     images to the base they actually live under, or a fleet would read 0 while
     the images pile up on the other base (see :func:`resolve_state_base`).
-    """
-    from envd_service import priv_helpers
 
+    One tree at a time, through :func:`_runtime_bytes_one_tree_at_a_time`: this
+    root is the *node's*, not any one sandbox's.
+    """
     runtime_dir = resolve_state_base(workspace_base, state_base) / RUNTIME_DIR_NAME
     if not runtime_dir.is_dir():
         return 0
-    size = priv_helpers.dir_size(runtime_dir)
+    size = _runtime_bytes_one_tree_at_a_time(runtime_dir)
     return 0 if size is None else int(size)
+
+
+def _runtime_bytes_one_tree_at_a_time(runtime_dir: Path) -> int | None:
+    """``dir_size(<runtime>)``, split into one walk per child of ``<runtime>``.
+
+    Why split: ``<state base>/_runtime`` is the **node's** namespace -- every
+    sandbox's platform dir (``_runtime/<id>``) and the whole ``.checkpoints``
+    gate live under it -- so measuring it with one ``priv_helpers.dir_size`` is
+    a *multi-tree* walk as soon as a child is out of the worker's own reach (a
+    checkpoint image written by a sandbox's slot, say) and the walk falls
+    through to ``e2b-maint walk``. The broker's answer is one line whose ceiling
+    is sized for a **single** tree (``E2B_DISK_MAX_ENTRIES`` is a per-tree cap),
+    so a multi-tree answer is exactly the shape that gets refused -- and the
+    accounting paths only warn, so the number would go silently stale.
+
+    The arithmetic is unchanged: ``directory_cost`` of ``<runtime>`` itself plus
+    one ``dir_size`` per child is precisely what one walk of the whole tree
+    visits (``os.walk`` costs every directory it enters and every file beneath
+    it). "Unchanged" is within one *route family*: a child that the worker can
+    read in process and one it hands to ``e2b-maint walk`` already disagreed on
+    symlinks before this change (the broker walks ``FTS_PHYSICAL``), and
+    splitting only decides which children take which route. ``None`` still means
+    "could not be measured".
+    """
+    from envd_service import priv_helpers
+    from envd_service.runtime.brief_stat import directory_cost, entry_size
+
+    total = 0
+    try:
+        total += directory_cost(runtime_dir)
+    except OSError:
+        pass
+    try:
+        with os.scandir(runtime_dir) as listing:
+            children = list(listing)
+    except OSError:
+        # Nothing to split on: an unsplit broker walk is the multi-tree answer
+        # this exists to prevent, so report "unknown" rather than ask for it.
+        # Say so once per call: the caller turns ``None`` into 0, and 0 reads as
+        # "the platform uses nothing" to both the ledger alert and the
+        # checkpoint admission -- silence here is what makes that fail-open.
+        logger.warning(
+            "cannot list %s to measure the platform disk one tree at a time; "
+            "reporting 0 (the caller's contract for an unmeasurable account)",
+            runtime_dir,
+        )
+        return None
+    for entry in children:
+        try:
+            is_dir = entry.is_dir()  # follows symlinks, like ``os.walk``'s dirs
+            is_symlink = entry.is_symlink()
+        except OSError:
+            return None
+        if is_dir:
+            if is_symlink:
+                continue  # ``os.walk`` lists it, never descends -- so it costs 0
+            size = priv_helpers.dir_size(entry.path)
+        else:
+            try:
+                size = entry_size(entry.path)
+            except OSError:
+                continue
+        if size is None:
+            return None
+        total += size
+    return total
 
 
 def checkpoint_admission(
