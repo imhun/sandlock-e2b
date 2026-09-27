@@ -21,6 +21,14 @@ services:
       # This runner is unfiltered on purpose (`seccomp=unconfined` above); the
       # worker's own startup self-check would otherwise refuse to serve.
       E2B_REQUIRE_SECCOMP_FILTER: "0"
+      # N45: the in-container suite builds its sandboxes under the fleet's
+      # per-sandbox pid namespace (the key is the only shape switch this file
+      # declares; the netns pair and the image shape are selected by the runner
+      # image and the suite's own fixtures -- `deploy/docker/Dockerfile.test-runner`,
+      # `tests/contract/test_mcp_netns.py`). Without it the suite would run a
+      # shape the fleet does not have, and the fork's pid-ns path would only be
+      # covered when someone passed the variable by hand.
+      E2B_PID_NS: ${E2B_PID_NS:-true}
       E2B_API_KEY: local-key
       E2B_API_URL: http://127.0.0.1:3000
       E2B_SANDBOX_URL: http://127.0.0.1:49983

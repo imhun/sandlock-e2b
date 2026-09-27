@@ -96,6 +96,17 @@ services:
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
       E2B_IMAGE_CACHE_OWNER_UID: ${E2B_IMAGE_CACHE_OWNER_UID:-65534}
+      # N45: the same per-sandbox pid namespace the fleet runs (the rest of
+      # this file stays the minimal single-machine example: no control-plane
+      # wiring, no node budget, no netns pair). Without it a sandbox here
+      # shares the worker's pid namespace, so `kill(pid, 0)` answers EPERM for
+      # the worker's live PID 1 -- an existence oracle. `Sandbox::pid_ns`
+      # needs no partner switch (the fork builds its own user namespace), and
+      # the escape hatch on a host without unprivileged user namespaces is
+      # `E2B_PID_NS=false`. The file-capability/no-USerns builds that
+      # development is meant to tolerate are the reason the key is spelled out
+      # here instead of relying on the image default (`false`).
+      E2B_PID_NS: ${E2B_PID_NS:-true}
     ports:
       - "49983:49983"
     volumes:

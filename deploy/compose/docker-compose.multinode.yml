@@ -151,6 +151,13 @@ services:
       # egresses only where its own request allows it.
       E2B_ENABLE_NET_ISOLATION: "true"
       E2B_FD_INJECT_CONNECT: "true"
+      # N45: the per-sandbox pid namespace, the fleet's value. Without it a
+      # sandbox shares this worker's pid namespace and `kill(pid, 0)` answers
+      # EPERM for the worker's live PID 1 -- an existence oracle. Independent
+      # of the pair above: `Sandbox::pid_ns` makes the fork build the user
+      # namespace it needs itself, so it has no partner switch and no shape
+      # that takes a sandbox offline.
+      E2B_PID_NS: "true"
       E2B_ENABLE_NETWORK: "true"
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
@@ -231,6 +238,13 @@ services:
       # egresses only where its own request allows it.
       E2B_ENABLE_NET_ISOLATION: "true"
       E2B_FD_INJECT_CONNECT: "true"
+      # N45: the per-sandbox pid namespace, the fleet's value. Without it a
+      # sandbox shares this worker's pid namespace and `kill(pid, 0)` answers
+      # EPERM for the worker's live PID 1 -- an existence oracle. Independent
+      # of the pair above: `Sandbox::pid_ns` makes the fork build the user
+      # namespace it needs itself, so it has no partner switch and no shape
+      # that takes a sandbox offline.
+      E2B_PID_NS: "true"
       E2B_ENABLE_NETWORK: "true"
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
@@ -311,6 +325,13 @@ services:
       # egresses only where its own request allows it.
       E2B_ENABLE_NET_ISOLATION: "true"
       E2B_FD_INJECT_CONNECT: "true"
+      # N45: the per-sandbox pid namespace, the fleet's value. Without it a
+      # sandbox shares this worker's pid namespace and `kill(pid, 0)` answers
+      # EPERM for the worker's live PID 1 -- an existence oracle. Independent
+      # of the pair above: `Sandbox::pid_ns` makes the fork build the user
+      # namespace it needs itself, so it has no partner switch and no shape
+      # that takes a sandbox offline.
+      E2B_PID_NS: "true"
       E2B_ENABLE_NETWORK: "true"
     volumes:
       - worker-data:/var/lib/e2b-sandboxes

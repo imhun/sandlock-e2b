@@ -147,6 +147,13 @@ services:
       # first the worker builds an empty network policy (every connect fails,
       # loopback included), and without the second a current worker exits 1 at
       # `configure_priv_helpers` before it ever listens (N39).
+      # `E2B_PID_NS` is the third (N45): without it a pooled sandbox shares the
+      # worker's pid namespace, so `kill(pid, 0)` answers EPERM for the worker's
+      # PID 1 -- an existence oracle (measured: `getpid=81`/`kill1=EPERM` as
+      # shipped, `getpid=7`/`kill1=ok` with the key, same probe, only this
+      # variable different). It is *not* part of the netns pair: the fork
+      # creates the user namespace for it itself, there is no pairing guard,
+      # and an unpaired pid_ns cannot take a sandbox offline.
       # Enabling the first also flips what a pooled sandbox can reach, which a
       # local debugger should know: the pool goes from silently having no egress
       # to following the sandbox ruleset -- a request without `network` reaches
@@ -156,7 +163,7 @@ services:
       # pooled sandbox's `/mcp` route was always a 503. It now defaults to the
       # MCP-capable image the control plane above uses (same variable, so one
       # `E2B_BASE_IMAGE=` in `.env` moves both sides together).
-      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-auto}", "E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", "E2B_ENABLE_NETWORK": "true", "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
+      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-auto}", "E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", "E2B_PID_NS": "true", "E2B_ENABLE_NETWORK": "true", "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
       E2B_AS_POLL_S: ${E2B_AS_POLL_S:-5}
       E2B_AS_UTIL_THRESHOLD: ${E2B_AS_UTIL_THRESHOLD:-0.70}
       E2B_AS_SCALE_UP_COOLDOWN_S: ${E2B_AS_SCALE_UP_COOLDOWN_S:-60}

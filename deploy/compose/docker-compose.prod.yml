@@ -181,6 +181,15 @@ services:
       # then wildcard allowOut needs the low-port window back.
       E2B_ENABLE_NET_ISOLATION: ${E2B_ENABLE_NET_ISOLATION:-true}
       E2B_FD_INJECT_CONNECT: ${E2B_FD_INJECT_CONNECT:-true}
+      # N45: the per-sandbox PID namespace, the fleet's value
+      # (`deploy/stack/docker-compose.prod.yml:220`, `deploy/k8s/worker.yaml:406`).
+      # Without it a sandbox shares this worker's pid namespace, so
+      # `kill(pid, 0)` answers EPERM for the worker's live PID 1 -- an existence
+      # oracle. Not part of the pair above: the fork creates the user namespace
+      # for it itself (`Sandbox::pid_ns`), so it needs no partner to be a valid
+      # shape. Rollback, like the stack: `E2B_PID_NS=false` in
+      # `deploy/compose/.env`.
+      E2B_PID_NS: ${E2B_PID_NS:-true}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       # Route B's scratch root (the per-slot policy/program documents). The

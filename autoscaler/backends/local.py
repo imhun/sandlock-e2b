@@ -81,6 +81,25 @@ class DockerPoolBackend:
             # writer wins).
             "E2B_ENABLE_NETWORK": "true",
             "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b",
+            # N45: without this a pooled sandbox shares the worker's pid
+            # namespace and `kill(pid, 0)` answers EPERM for the worker's live
+            # PID 1 (an existence oracle). Independent of the netns pair above:
+            # the fork creates the user namespace for it itself, so there is no
+            # pairing guard and no offline failure mode. The pool's compose
+            # JSON declares the same value.
+            "E2B_PID_NS": "true",
+            # The shared image cache and its bound (Z-F7 C1). The fleet and the
+            # pool's own compose JSON both name these; the dictionary did not,
+            # and then the worker resolved `E2B_IMAGE_CACHE_DIR` to its
+            # container-relative default (`tmp/sandboxes/_images`, i.e. off the
+            # workspace volume) with eviction disabled (`E2B_IMAGE_CACHE_MAX_BYTES`
+            # defaults to 0 = unbounded) -- so a hand-built backend re-extracted
+            # the base rootfs into every worker and never bounded that cache.
+            # Found by the N45 key-set audit; values are the fleet's.
+            "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images",
+            "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296",
+            "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300",
+            "E2B_IMAGE_CACHE_OWNER_UID": "65534",
             **dict(worker_env or {}),
         }
 
