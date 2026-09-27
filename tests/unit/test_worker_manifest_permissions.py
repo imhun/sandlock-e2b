@@ -54,6 +54,13 @@ PRIV_BROKER = (REPO / "deploy" / "k8s" / "priv-broker.yaml").read_text(encoding=
 # repeated as a literal, so a bump on one side cannot silently miss the other.
 PRIV_MAINT_C = (REPO / "deploy" / "priv" / "maint.c").read_text(encoding="utf-8")
 
+#: The broker's health socket (A4). It is deliberately **container-private**:
+#: not on the `/run/e2b-broker` hostPath the worker -- and any other uid 0
+#: process on the node that can traverse that directory -- can reach. Its only
+#: client is this container's own probe, and it answers the daemon's `roots` and
+#: `uid_pool`, so it has no business being host-visible (review Minor 5).
+BROKER_HEALTH_SOCKET = "/run/e2b-broker-health.sock"
+
 
 def _c_integer_define(name: str) -> int:
     """The value of a plain-integer ``#define`` in ``maint.c``."""
@@ -1000,10 +1007,12 @@ def test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identit
         "serve",
         "--socket",
         "/run/e2b-broker/broker.sock",
-        # A4: the second listener the probes dial -- see the probe assertion
-        # below, which takes the path from *this* argv rather than repeating it.
+        # A4: the second listener the probes dial. It is the container's own
+        # path, *not* one inside the shared hostPath -- see BROKER_HEALTH_SOCKET
+        # and the assertion below, which takes the path from *this* argv rather
+        # than repeating it.
         "--health-socket",
-        "/run/e2b-broker/health.sock",
+        BROKER_HEALTH_SOCKET,
     ]
     security = container["securityContext"]
     assert security["runAsUser"] == 0
@@ -1045,6 +1054,11 @@ def test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identit
     # maint.c's PRIV_DEFAULT_REQUEST_READ_MS and asserts the two are equal.
     assert env["E2B_BROKER_REQUEST_READ_MS"] == "30000"
     health_socket = container["command"][container["command"].index("--health-socket") + 1]
+    # Review Minor 5: the health socket must stay off the shared hostPath --
+    # nothing outside this container has any business asking the daemon for its
+    # roots, and the worker's own uid cannot read it anyway.
+    assert health_socket == BROKER_HEALTH_SOCKET
+    assert not health_socket.startswith("/run/e2b-broker/")
     for probe in ("livenessProbe", "readinessProbe"):
         assert container[probe]["exec"]["command"] == [
             # A4: the probe is a real client, but of the *health* socket -- the
@@ -1306,16 +1320,18 @@ def test_socket_transport_and_its_broker_are_inseparable(manifests: str) -> None
     broker = broker_pod["containers"][0]
     # The broker `serve`s on the very path the worker dials, from the same
     # hostPath -- one socket, one node, both pods -- plus the probe's health
-    # socket (A4) in that same directory, so the single hostPath mount carries
-    # both listeners.
+    # socket (A4), which is deliberately **not** in that hostPath: it is the
+    # container's own path, because its only client is this container's probe
+    # (review Minor 5) and it answers the daemon's roots.
     assert broker["command"] == [
         "/var/lib/e2b-priv/e2b-maint",
         "serve",
         "--socket",
         socket_path,
         "--health-socket",
-        f"{socket_dir}/health.sock",
+        BROKER_HEALTH_SOCKET,
     ]
+    assert not BROKER_HEALTH_SOCKET.startswith(f"{socket_dir}/")
     broker_volume = {v["name"]: v for v in broker_pod["volumes"]}["broker-socket"]
     assert broker_volume["hostPath"] == {
         "path": socket_dir,
@@ -2266,7 +2282,11 @@ def test_the_broker_probes_dial_the_root_only_health_socket() -> None:
     socket_path = command[command.index("--socket") + 1]
     health_socket = command[command.index("--health-socket") + 1]
     assert socket_path == "/run/e2b-broker/broker.sock"
-    assert health_socket == "/run/e2b-broker/health.sock"
+    # Container-private on purpose (review Minor 5): the hostPath directory is
+    # reachable by any uid 0 process on the node, and this socket answers the
+    # same hello (roots, uid_pool) as the business one.
+    assert health_socket == BROKER_HEALTH_SOCKET
+    assert not health_socket.startswith("/run/e2b-broker/")
     assert socket_path != health_socket
     expected = [
         "/var/lib/e2b-priv/e2b-maint",

@@ -252,3 +252,91 @@ IDENTICAL-FAILURE-SETS
    mode/owner、root 直答、非 root 拒、业务 socket 仍拒 root 这几条覆盖住。
 5. A2 的语义边界：健康 socket 的非 root 拒绝也走同一条 `refuse_connection()`（同一 drain + 同一
    分支报告），这是有意的——两个 listener 的拒绝路径不该有两套行为。
+
+---
+
+## 8. 评审轮（第二个 commit）：1 条 Important + 5 条 Minor
+
+评审结论 Approved，附 1 Important + 4 Minor（其中 Minor 2/3 是同一个常量的推导与写法）。逐条：
+
+### 8.1 Important：健康 handler 的两条出口都要排空
+
+**问题**（评审复现）：`handle_health_connection` 应答后**没有** `finish_connection`，而 `read_request`
+在**第一个换行**就返回 —— 客户端请求行之后的尾巴留在 socket 里没人读，close 时内核发 RST，
+**已经写出的答案被 RST 吞掉**：`ConnectionResetError(104)`。
+
+**改法**（`maint.c`）：
+- 正常出口：`respond_hello(...)` 之后走业务 handler 同一套 `finish_connection(fd)`；
+- `refuse:` 出口：直接复用**父进程拒绝路径** `refuse_connection(fd, err)`（应答 + 有界排空 + 分支报告），
+  两条出口都不再裸 close。
+
+**TDD**：先写 `test_the_health_socket_drains_the_request_before_it_closes`（健康 socket 上分别发
+`hello + 200 KB 尾巴` 与 `verb 请求 + 200 KB 尾巴`，断言**完整答案**且 **`recv` 返回干净 EOF**
+——不是 `ConnectionResetError`），RED 实测：
+
+```
+E  AssertionError: the broker closed on top of the client's own tail, so the answer
+   was destroyed by the kernel's RST: ConnectionResetError(104, 'Connection reset by peer')
+```
+
+**撤销即红**（修完后把正常出口的 `finish_connection(fd)` 拿掉）：同一条断言再红一次。
+
+### 8.2 Minor 1：cap 集合的真机验证措辞
+
+`priv-broker.yaml` 那段改成："2026-09-27 真机验过的是**五条**（`CapEff=0xcb`，含 SETUID/SETGID）；
+去掉的两条只被（当时的）`setpriv` 探针使用，三个 verb 不需要；**三条形态还没上过真机**，将在下一次
+上线 apply 时复验（复验通过后改成完成时）"。不改代码/断言。
+
+### 8.3 Minor 2 + 3：walk 额度改成**双流共享**，并把真边界写准
+
+- `struct output` 的 `limit` 换成 `struct output_budget *budget`：`walk` 的 stdout/stderr 指向
+  **同一个** 64 MiB 额度（`struct request_limits { shared; per_stream[2]; }`）；其它 verb 仍是
+  **每条流** 256 MiB（与改动前逐字同义）。于是"最坏线路量"这条推导才成立：
+  `6 × 64 MiB = 384 MiB < worker 侧 512 MiB 线路/整行上限`（每条流各 64 MiB 的话是 768 MiB，
+  推导不成立 —— 评审指出的正是这一点）。
+- 常量注释补上**真边界**：`64 MiB ÷ 500000 条目 ≈ 134 B/行`；80 B 只是估算、不是上界，
+  平均行超过 134 B 的合法单树会拿到 `ok:false`（记账侧只 warn、不当沙箱故障）。
+
+**撤销即红**：把 walk 分支改回"每条流各 64 MiB" ⇒ 契约用例里的结构性断言红
+（`walk's stdout and stderr must share one output budget … assert 0 == 2`）；把 walk 放回 256 MiB ⇒
+超限用例红（上一轮已验）。共享这一条只能在源码上钉（构造不出"两条流同时大量输出"的合法 `walk`：
+stdout 是树、stderr 是一行诊断），用例注释里写明了这个取舍。
+
+### 8.4 Minor 4：健康 socket 的契约是**键集**，不只是值
+
+`json_parse_request` 现在记 `request.keys`（`v` / `hello` / `timeout_s` / `args` / 其它各一位），
+健康 socket 要求 `keys == (v|hello)` 且 `hello` 为真：`{"v":1,"hello":true,"args":[]}`、
+`…,"timeout_s":30}`、`…,"extra":1}` 现在都被点名拒（`hello:false` 本来就拒）。
+**撤销即红**：把判定换回 `!hello || nargs > 0` ⇒ 用例红
+（`AssertionError: {'v': 1, 'hello': True, 'args': []} … {'ok': True} != {'ok': False}`）。
+
+### 8.5 Minor 5：健康 socket 挪到**容器私有路径**
+
+`--health-socket` 现在是 `/run/e2b-broker-health.sock`（不再落在共享 hostPath `/run/e2b-broker` 目录里
+——那个目录节点上任何能穿过的 uid 0 都能进，而健康 hello 会答出 daemon 的 `roots`/`uid_pool`）。
+取舍（评审要求说明）：**不用改挂载** —— `/run` 是容器自己的可写目录、broker 容器没有
+`readOnlyRootFilesystem`、也没把 `/run` 整棵挂进来，`socket-dir-init` 只管它自己那条
+`/run/e2b-broker`，因此 init 与 volumeMounts 一字未动；探针在**同一个容器**里跑，看到的还是那个路径。
+清单注释（文件头、socket-dir-init、command、探针）与单测钉子（`BROKER_HEALTH_SOCKET`）同步，
+并新增"健康 socket 不得在 `/run/e2b-broker/` 之下"的断言。
+
+**撤销即红**（先把清单改回旧路径、测试保持新期望）：3 条单测红，例如
+`AssertionError: assert ['/var/lib/e2…/health.sock'] == ['/var/lib/e2…-health.sock']`。
+
+### 8.6 本轮判据
+
+```console
+$ … pytest tests/contract/test_broker_socket_c.py -q -p no:cacheprovider
+29 passed in 14.07s
+
+$ … pytest tests/contract/test_broker_socket_identity.py tests/contract/test_broker_socket_c.py -q -p no:cacheprovider
+35 passed in 16.12s
+
+$ tmp/testenv/bin/python -m pytest tests/unit/test_worker_manifest_permissions.py -q -p no:cacheprovider
+53 passed in 3.16s
+
+$ kubectl kustomize deploy/k8s | kubectl apply --dry-run=client -f -
+KUSTOMIZE-DRYRUN-OK
+```
+
+`E2B_BROKER_REFUSAL_TRACE` 按评审保留原样（默认关、行为中性）。

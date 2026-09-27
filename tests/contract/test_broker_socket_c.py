@@ -1273,24 +1273,106 @@ def test_the_health_socket_is_root_only_and_answers_the_probe_hello(
     assert ping.stderr == ""
     assert json.loads(ping.stdout)["ok"] is True
 
-    # Not a second business socket: a verb is refused by name, and so is a
-    # "hello" that carries arguments.
+    # Not a second business socket: a verb is refused by name, and so is any
+    # request that is not *exactly* `{"v":1,"hello":true}` -- arguments, an
+    # empty `args`, a deadline, or an unknown key all count (the key set is
+    # what the socket contract is about, not just the values it recognises).
     health_only = 'the health socket answers only {"v":1,"hello":true}'
-    assert _request(
-        health, {"v": 1, "args": ["walk", "--path", str(_workspace(tmp_path))]}
-    ) == {"v": 1, "ok": False, "error": health_only}
-    assert _request(
-        health, {"v": 1, "hello": True, "args": ["walk", "--path", "/"]}
-    ) == {"v": 1, "ok": False, "error": health_only}
+    refused_probes = [{"v": 1, "args": ["walk", "--path", str(_workspace(tmp_path))]}]
+    for extra in (
+        {"hello": True, "args": ["walk", "--path", "/"]},
+        {"hello": True, "args": []},
+        {"hello": True, "timeout_s": 30},
+        {"hello": True, "extra": 1},
+        {"hello": False},
+    ):
+        probe = {"v": 1}
+        probe.update(extra)
+        refused_probes.append(probe)
+    for probe in refused_probes:
+        assert _request(health, probe) == {
+            "v": 1,
+            "ok": False,
+            "error": health_only,
+        }, probe
 
     # Nothing above took the daemon down, and the health socket still answers.
     assert _request(health, {"v": 1, "hello": True})["ok"] is True
     assert handle.process.poll() is None
-    assert handle.stop().endswith(
+    log = handle.stop()
+    # One "refused:" line per request, in order: the business socket's peer
+    # refusal first, then the health socket's -- one per probe above.
+    assert log.startswith(
+        f"e2b-maint: serving on {handle.socket}\n"
+        f"e2b-maint: health on {health}\n"
         f"e2b-maint: refused: {refusal}\n"
-        f"e2b-maint: refused: {health_only}\n"
-        f"e2b-maint: refused: {health_only}\n"
     )
+    assert log.count(f"e2b-maint: refused: {health_only}\n") == len(refused_probes)
+
+
+def test_the_health_socket_drains_the_request_before_it_closes(
+    serve, tmp_path: Path
+) -> None:
+    """A4, review Important: an answer must survive the close on *both* exits.
+
+    A health client that sends anything behind its request line (measured in
+    review with a verb request plus a 200 KB tail -- the tail is never read,
+    because ``read_request`` stops at the newline) leaves unread bytes in the
+    socket. Closing on top of them is what makes the kernel send RST, and the
+    RST destroys the answer the client had not finished reading: it sees the
+    JSON and then ``ConnectionResetError`` instead of a clean EOF. The business
+    handler drains for exactly this reason (``finish_connection``), so the
+    health handler has to drain too -- and its refusal branch reuses
+    ``refuse_connection``, the daemon's own refusal path, so both exits drain.
+
+    Both exits are exercised, and the daemon has to stay up afterwards: the
+    point is not "one of the two paths happens to be fine".
+    """
+    health = tmp_path / "probe-health.sock"
+    handle = serve("health-drain", health_socket=health)
+    _await_log(
+        handle,
+        f"e2b-maint: serving on {handle.socket}\n"
+        f"e2b-maint: health on {health}\n",
+    )
+
+    verb = {"v": 1, "args": ["walk", "--path", str(_workspace(tmp_path))]}
+    hello = {"v": 1, "hello": True}
+    refused = 'the health socket answers only {"v":1,"hello":true}'
+    hello_answer = {
+        "v": 1,
+        "ok": True,
+        "peer_uid": _peer_uid(),
+        "peer_gid": _peer_gid(),
+        "uid_pool": [POOL_START, POOL_SIZE],
+        "roots": [str(_workspace(tmp_path)), str(_image_cache(tmp_path))],
+    }
+    refused_answer = {"v": 1, "ok": False, "error": refused}
+    for request, expected in ((hello, hello_answer), (verb, refused_answer)):
+        payload = json.dumps(request).encode() + b"\n" + b"x" * (200 * 1024)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(15.0)
+        raw = b""
+        reset: OSError | None = None
+        try:
+            client.connect(str(health))
+            client.sendall(payload)
+            try:
+                while True:
+                    chunk = client.recv(65536)
+                    if not chunk:
+                        break  # a clean EOF is the contract
+                    raw += chunk
+            except OSError as exc:
+                reset = exc
+        finally:
+            client.close()
+        assert reset is None, (
+            f"the broker closed on top of the client's own tail, so the answer "
+            f"was destroyed by the kernel's RST: {reset!r}"
+        )
+        assert _response(raw) == expected
+        assert handle.process.poll() is None
 
 
 def test_the_health_socket_gate_refuses_a_non_root_peer_by_name(serve) -> None:
@@ -1845,6 +1927,21 @@ def test_walk_has_its_own_smaller_output_ceiling(
     # 6x is the widest escape: even then the daemon refuses before the worker's
     # 512 MiB line ceiling is anywhere near.
     assert shipped * 6 < 512 * 1024**2
+    # Review Minor 2: that 384 MiB bound only holds because the two streams
+    # draw from **one** budget -- a per-stream cap would allow 2 x 64 MiB, i.e.
+    # 768 MiB on the line. Pinned in the source, not behaviourally: no
+    # legitimate walk writes both streams in volume (stdout is the tree, stderr
+    # is a one-line diagnostic), so no payload could tell the two apart.
+    walk_branch = re.search(
+        r'strcmp\(request->args\[0\], "walk"\) == 0\) \{(.*?)\n    \}',
+        MAINT_C,
+        re.DOTALL,
+    )
+    assert walk_branch is not None, "set_output_limits has no walk branch"
+    assert walk_branch.group(1).count("->budget = &limits->shared;") == 2, (
+        "walk's stdout and stderr must share one output budget "
+        f"(found {walk_branch.group(1)!r})"
+    )
 
 
 #: The runaway tree: entry count and name length are the two levers on how long

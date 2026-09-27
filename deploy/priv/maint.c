@@ -164,19 +164,33 @@
  * cap is where the daemon kills the producer. */
 #define PRIV_MAX_OUTPUT ((unsigned long long)256 * 1024 * 1024)
 /* A7: `walk`'s own ceiling, and it is deliberately *smaller* than every other
- * verb's. One `walk` answers about one tree, and a tree is bounded by
- * E2B_DISK_MAX_ENTRIES (500000 entries) at ~80 bytes per line -- ~40 MB
- * unescaped -- so 64 MiB is that with 1.6x of head room. 64 MiB unescaped
- * reaches at most 6x that on the *wire* (the widest JSON escape), i.e. 384 MiB,
- * which is still below the worker side's line ceiling
- * (envd_service.priv_helpers.BROKER_MAX_WALK_RESPONSE_BYTES = 512 MiB): a
- * legitimate walk answer is therefore always refused by the daemon **itself**,
+ * verb's, and it is a **shared** budget: stdout and stderr of one `walk` draw
+ * from the same 64 MiB (see `struct output_budget`), because what the worker
+ * bounds is the whole answer line, not each stream on its own.
+ *
+ * Why 64 MiB: one `walk` answers about one tree, and a tree is bounded by
+ * E2B_DISK_MAX_ENTRIES (500000 entries). At the ~80 bytes per line the sizing
+ * on the Python side *estimates*, that is ~40 MB unescaped -- but 64 MiB is
+ * only 1.6x of that, so the real boundary this constant draws is
+ * 64 MiB / 500000 ~= **134 bytes per line**: a tree whose *average* line is
+ * longer than that is refused by this cap even though it is a legitimate single
+ * tree (80 B is an estimate, not an upper bound -- a path may be far longer).
+ * That is the intended trade: the accounting side (dir walk / ledger) treats an
+ * `ok:false` from here as a warning, not as a sandbox failure, and a walk that
+ * is *meant* to be huge is a fleet-sizing question, not something this daemon
+ * should answer by materialising hundreds of megabytes.
+ *
+ * The line bound, then: 64 MiB unescaped reaches at most 6x that on the *wire*
+ * (the widest JSON escape), i.e. 384 MiB, which is below the worker side's line
+ * ceiling (envd_service.priv_helpers.BROKER_MAX_WALK_RESPONSE_BYTES = 512 MiB).
+ * A legitimate walk answer is therefore always refused by the daemon **itself**,
  * `ok:false` and naming the walk cap, and the worker's larger ceiling only ever
- * catches an answer that did not come from this daemon. The `#ifndef` is not
- * decoration: the contract lane builds this same source with a tiny
- * `-DPRIV_MAX_WALK_OUTPUT` to drive a crossing without producing 64 MiB of walk
- * output, and a bare `#define` would turn that into a redefinition warning --
- * taking the lane's "-Wall -Wextra clean" bar with it. */
+ * catches an answer that did not come from this daemon.
+ *
+ * The `#ifndef` is not decoration: the contract lane builds this same source
+ * with a tiny `-DPRIV_MAX_WALK_OUTPUT` to drive a crossing without producing
+ * 64 MiB of walk output, and a bare `#define` would turn that into a
+ * redefinition warning -- taking the lane's "-Wall -Wextra clean" bar with it. */
 #ifndef PRIV_MAX_WALK_OUTPUT
 #define PRIV_MAX_WALK_OUTPUT ((unsigned long long)64 * 1024 * 1024)
 #endif
@@ -351,12 +365,23 @@ struct json {
     const char *end;
 };
 
+/* Which of the known keys a request actually carried, plus one bit for "some
+ * other key" (A4: the health socket's contract is the exact key set
+ * `{v, hello}`, so it has to see what was there, not only what the values
+ * meant). Duplicate keys do not change the set. */
+#define PRIV_KEY_VERSION 1
+#define PRIV_KEY_HELLO 2
+#define PRIV_KEY_TIMEOUT_S 4
+#define PRIV_KEY_ARGS 8
+#define PRIV_KEY_OTHER 16
+
 struct priv_request {
     long version;
     int has_version;
     int hello;
     long timeout_s;
     int has_timeout;
+    int keys;
     size_t nargs;
     char *args[PRIV_MAX_ARGS];
 };
@@ -713,6 +738,7 @@ static int json_parse_request(const char *data, size_t len,
                 return -1;
             }
             request->has_version = 1;
+            request->keys |= PRIV_KEY_VERSION;
         } else if (strcmp(key, "hello") == 0) {
             if (json_literal(&j, "true") == 0) {
                 request->hello = 1;
@@ -720,20 +746,25 @@ static int json_parse_request(const char *data, size_t len,
                 free(key);
                 return json_error(err, errlen, "\"hello\" must be a boolean");
             }
+            request->keys |= PRIV_KEY_HELLO;
         } else if (strcmp(key, "timeout_s") == 0) {
             if (json_integer(&j, &request->timeout_s, err, errlen) != 0) {
                 free(key);
                 return -1;
             }
             request->has_timeout = 1;
+            request->keys |= PRIV_KEY_TIMEOUT_S;
         } else if (strcmp(key, "args") == 0) {
             if (json_parse_args(&j, request, err, errlen) != 0) {
                 free(key);
                 return -1;
             }
+            request->keys |= PRIV_KEY_ARGS;
         } else if (json_skip_value(&j, 0, err, errlen) != 0) {
             free(key);
             return -1;
+        } else {
+            request->keys |= PRIV_KEY_OTHER;
         }
         free(key);
         json_ws(&j);
@@ -819,13 +850,23 @@ static void request_clear(struct priv_request *request) {
 
 /* --------------------------------------------------------------- writing -- */
 
+/* One request's unescaped-byte ceiling. `walk`'s two streams share **one**
+ * budget (A7): what the worker bounds is the whole answer line, so a per-stream
+ * limit would not bound it -- worst case two streams at the ceiling would put
+ * 6 * 2 * 64 MiB on the wire, over the worker's own 512 MiB. The other verbs
+ * keep the old per-stream ceiling. */
+struct output_budget {
+    unsigned long long limit;
+    unsigned long long used;
+};
+
 struct output {
     char *data;
     size_t len;
     size_t cap;
-    /* The byte ceiling for the verb this request runs (A7: `walk` has one of
-     * its own) and how a refusal names it. `cap` is the buffer's capacity. */
-    unsigned long long limit;
+    /* The ceiling this stream draws from (A7) and how a refusal names it.
+     * `cap` is the buffer's capacity. */
+    struct output_budget *budget;
     const char *limit_name;
     int overflow;
 };
@@ -834,7 +875,7 @@ static int output_append(struct output *sink, const char *data, size_t len) {
     if (sink->overflow) {
         return 0; /* already over the cap: keep draining, keep discarding */
     }
-    if (sink->len + len > sink->limit) {
+    if (sink->budget->used + len > sink->budget->limit) {
         sink->overflow = 1;
         return 0;
     }
@@ -845,8 +886,8 @@ static int output_append(struct output *sink, const char *data, size_t len) {
         while (cap < wanted) {
             cap *= 2;
         }
-        if (cap > sink->limit + 1) {
-            cap = sink->limit + 1;
+        if (cap > sink->budget->limit + 1) {
+            cap = sink->budget->limit + 1;
         }
         grown = realloc(sink->data, cap);
         if (grown == NULL) {
@@ -858,27 +899,41 @@ static int output_append(struct output *sink, const char *data, size_t len) {
     memcpy(sink->data + sink->len, data, len);
     sink->len += len;
     sink->data[sink->len] = '\0';
+    sink->budget->used += len;
     return 0;
 }
 
-/* The ceiling one request runs under: `walk` gets PRIV_MAX_WALK_OUTPUT (A7),
- * every other verb keeps PRIV_MAX_OUTPUT, and both of a request's streams share
- * the verb's value. `request == NULL` is the default, for the window before the
- * request line has been parsed. */
-static void set_output_limits(const struct priv_request *request,
-                              struct output *out, struct output *err_out) {
-    unsigned long long limit = PRIV_MAX_OUTPUT;
-    const char *name = "output";
+/* The budgets one request can draw from: one shared, plus one per stream for
+ * the verbs that keep the per-stream ceiling. */
+struct request_limits {
+    struct output_budget shared;
+    struct output_budget per_stream[2];
+};
 
+/* Point one request's streams at their ceilings: `walk` gets
+ * PRIV_MAX_WALK_OUTPUT (A7) as a **shared** budget for stdout and stderr
+ * together, every other verb keeps PRIV_MAX_OUTPUT **per stream** as before.
+ * `request == NULL` is the default, for the window before the request line has
+ * been parsed. */
+static void set_output_limits(const struct priv_request *request,
+                              struct output *out, struct output *err_out,
+                              struct request_limits *limits) {
+    memset(limits, 0, sizeof(*limits));
     if (request != NULL && request->nargs > 0 &&
         strcmp(request->args[0], "walk") == 0) {
-        limit = PRIV_MAX_WALK_OUTPUT;
-        name = "walk output";
+        limits->shared.limit = PRIV_MAX_WALK_OUTPUT;
+        out->budget = &limits->shared;
+        err_out->budget = &limits->shared;
+        out->limit_name = "walk output";
+        err_out->limit_name = "walk output";
+        return;
     }
-    out->limit = limit;
-    out->limit_name = name;
-    err_out->limit = limit;
-    err_out->limit_name = name;
+    limits->per_stream[0].limit = PRIV_MAX_OUTPUT;
+    limits->per_stream[1].limit = PRIV_MAX_OUTPUT;
+    out->budget = &limits->per_stream[0];
+    err_out->budget = &limits->per_stream[1];
+    out->limit_name = "output";
+    err_out->limit_name = "output";
 }
 
 /* Everything or nothing: a half-written response would desynchronize a
@@ -1199,7 +1254,7 @@ static int run_child(char *const *args, long timeout_s, long peer_uid,
         snprintf(message, message_len,
                  "%s exceeded the %llu-byte %s cap and was killed",
                  out->overflow ? "stdout" : "stderr",
-                 out->overflow ? out->limit : err_out->limit,
+                 out->overflow ? out->budget->limit : err_out->budget->limit,
                  out->overflow ? out->limit_name : err_out->limit_name);
         return -1;
     }
@@ -1441,6 +1496,7 @@ static int request_timeout(const struct priv_request *request, char *err,
 static void respond_to_request(int fd, long peer_uid, long peer_gid) {
     struct priv_request request;
     struct output out, err_out;
+    struct request_limits limits;
     char err[PRIV_ERR_LEN];
     char *line = NULL;
     char *argv[PRIV_MAX_ARGS + 2];
@@ -1453,7 +1509,7 @@ static void respond_to_request(int fd, long peer_uid, long peer_gid) {
     memset(&request, 0, sizeof(request));
     memset(&out, 0, sizeof(out));
     memset(&err_out, 0, sizeof(err_out));
-    set_output_limits(NULL, &out, &err_out);
+    set_output_limits(NULL, &out, &err_out, &limits);
     if (read_request(fd, &line, &line_len, err, sizeof(err)) != 0) {
         goto refuse;
     }
@@ -1488,7 +1544,7 @@ static void respond_to_request(int fd, long peer_uid, long peer_gid) {
         goto refuse;
     }
     /* A7: the verb is known now, so the streams get their own ceiling. */
-    set_output_limits(&request, &out, &err_out);
+    set_output_limits(&request, &out, &err_out, &limits);
     argv[0] = (char *)"e2b-maint";
     for (index = 0; index < request.nargs; index++) {
         argv[index + 1] = request.args[index];
@@ -1728,7 +1784,14 @@ static int health_gate(int fd, long *peer_uid, long *peer_gid, char *err,
  * exactly one answer -- the same hello the business socket answers, so
  * `e2b-maint ping` needs no second protocol. Everything else is refused by
  * name: this is not a second business socket, so it must never grow into one
- * (the verbs stay behind the peer gate, on the socket the worker dials). */
+ * (the verbs stay behind the peer gate, on the socket the worker dials).
+ *
+ * Both exits drain before closing, exactly like the business handler: the
+ * client's tail past its request line is unread bytes, and closing on top of
+ * those is what turns the answer into an RST. The refusal exit reuses the
+ * daemon's own refusal path (`refuse_connection`), so it also gets the bounded
+ * wait for a request that is still in flight; the answered exit uses the same
+ * `finish_connection` the business handler ends with. */
 static void handle_health_connection(int fd, long peer_uid, long peer_gid) {
     struct priv_request request;
     char err[PRIV_ERR_LEN];
@@ -1748,7 +1811,11 @@ static void handle_health_connection(int fd, long peer_uid, long peer_gid) {
                  request.version);
         goto refuse;
     }
-    if (!request.hello || request.nargs > 0) {
+    /* The contract is the *key set*, not the values: a hello that also carries
+     * `args` (even an empty one), a deadline, or any unknown key is not
+     * `{"v":1,"hello":true}` and is refused. */
+    if (!request.hello ||
+        request.keys != (PRIV_KEY_VERSION | PRIV_KEY_HELLO)) {
         snprintf(err, sizeof(err),
                  "the health socket answers only {\"v\":1,\"hello\":true}");
         goto refuse;
@@ -1759,8 +1826,12 @@ static void handle_health_connection(int fd, long peer_uid, long peer_gid) {
 
 refuse:
     priv_report_refused(err);
-    respond_error(fd, err);
+    refuse_connection(fd, err);
+    request_clear(&request);
+    free(line);
+    return;
 done:
+    finish_connection(fd);
     request_clear(&request);
     free(line);
 }
