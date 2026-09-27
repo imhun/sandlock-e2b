@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -1897,7 +1898,9 @@ class SandlockExecutor(Executor):
         worker (platform-injected literal secret). Raises when a placeholder
         has no backing source, so a misconfigured IAM secret fails at
         sandbox creation instead of silently sending the request
-        unauthenticated.
+        unauthenticated. Every value is resolved *before* the first file is
+        written, so that failure leaves the secrets dir exactly as it found
+        it.
         """
         if not entries:
             return []
@@ -1906,14 +1909,22 @@ class SandlockExecutor(Executor):
                 "http_inject (rules[].transform.headers) requires a "
                 "supervisor secrets dir"
             )
+        import re
+
+        placeholder = re.compile(
+            r"\$\{e2b\.identity\.tokens\.([A-Za-z0-9_]+)\}"
+        )
+        # A1a: resolve **every** entry's value before anything is written.
+        # Resolution is the step that can fail on configuration (a placeholder
+        # no token or env var backs), and publishing entry-by-entry used to
+        # leave the earlier entries' files on disk -- already chowned to the
+        # sandbox uid -- for a sandbox that was never created. Fail the build
+        # while the secrets dir is still empty; the write phase below cannot
+        # raise from resolution at all.
         out: list[dict] = []
+        pending: list[tuple[dict, str]] = []
         for entry in entries:
             value = str(entry["value"])
-            import re
-
-            placeholder = re.compile(
-                r"\$\{e2b\.identity\.tokens\.([A-Za-z0-9_]+)\}"
-            )
             m = placeholder.fullmatch(value)
             if m is not None and m.group(1) not in self._iam_tokens:
                 # Pure env-backed placeholder: keep the supervisor env source
@@ -1951,6 +1962,12 @@ class SandlockExecutor(Executor):
                     )
 
                 value = placeholder.sub(_resolve, value)
+            pending.append((entry, value))
+        # The write phase: every value is resolved by now, so the only failures
+        # from here on are I/O ones (cleaned up and raised, as before).
+        from envd_service import priv_helpers
+
+        for entry, value in pending:
             secret_dir = self._secrets_dir / os.path.basename(
                 self._workspace_dir.rstrip("/")
             )
@@ -1970,8 +1987,32 @@ class SandlockExecutor(Executor):
             # the worker's own non-sticky ``<secrets>/<sandbox_id>`` -- so the
             # one step that still works is also the correct one (start the
             # name over rather than try to overwrite a file we gave away).
+            #
+            # A1c: "the worker's own non-sticky parent" is the *whole* premise
+            # of that reclaim, so it is checked, not assumed. If something
+            # re-chowned the directory (or made it sticky) the ``unlink`` no
+            # longer holds and the create below would fail as a bare EACCES
+            # naming neither the directory nor the contract -- fail closed
+            # here, naming the parent, the owner it has and the one it needs.
+            parent = os.stat(secret_dir)
+            if parent.st_uid != os.geteuid() or parent.st_mode & stat.S_ISVTX:
+                raise priv_helpers.PrivHelperError(
+                    f"refusing to reclaim {path}: the parent directory "
+                    f"{secret_dir} is not this worker's own non-sticky "
+                    f"directory (owner uid {parent.st_uid}, mode "
+                    f"{oct(parent.st_mode & 0o7777)}): reclaiming a "
+                    "handed-over name needs a parent owned by the worker with "
+                    "no sticky bit -- who chowned it or set its mode?"
+                )
             path.unlink(missing_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
+            # A1b: 0600 is the *create* mode, never a chmod afterwards. A plain
+            # ``open(path, "w")`` creates at ``0666 & ~umask`` (0644 under the
+            # usual 022) and only the following chmod tightened it -- a window
+            # in which the credential was readable by every other tenant on the
+            # host. ``os.open`` with the mode makes the file 0600 from its
+            # first byte, and there is nothing left to set after the hand-over.
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(value)
             # The **slot** is what reads this file, and a slot runs as the
             # sandbox's own host uid (T5) -- so a 0600 file owned by the worker
@@ -1984,13 +2025,12 @@ class SandlockExecutor(Executor):
             # rootfs in the image shape, and outside `can_read`'s allow-list in
             # the pure one -- so the sandbox cannot reach it even owning it.
             #
-            # The mode is set **while the worker still owns the file**: after
+            # The mode lands **while the worker still owns the file**: after
             # the hand-over below the worker is neither the owner nor
             # CAP_FOWNER, so a chmod that ran after it would be EPERM and the
             # whole create would fail -- the same order
-            # `checkpoint_store._prepare_image_parent` uses (chmod, then hand
+            # `checkpoint_store._prepare_image_parent` uses (mode, then hand
             # the tree over).
-            os.chmod(path, 0o600)
             identity = self._host_uid if self._per_sandbox_uid else None
             if identity is not None:
                 if os.geteuid() == 0:
@@ -2006,8 +2046,6 @@ class SandlockExecutor(Executor):
                     # supervise, with a permission error naming neither the
                     # path nor the missing root. Name both here instead
                     # (fail closed, never "hand it over if we can").
-                    from envd_service import priv_helpers
-
                     if not priv_helpers.helpers_cover(path):
                         # Leave nothing behind: the file is already there and
                         # carries a live credential, and the next create is
