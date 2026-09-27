@@ -42,10 +42,12 @@ container lane and not in ``tests/unit``:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import errno
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -62,6 +64,38 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PRIV_DIR = PROJECT_ROOT / "deploy" / "priv"
+MAINT_C = (PRIV_DIR / "maint.c").read_text(encoding="utf-8")
+
+
+def _c_integer_define(name: str) -> int:
+    """The value of a plain-integer ``#define`` in ``maint.c``.
+
+    The C side's numbers are the contract this lane pins (the refusal throttle
+    and the walk ceiling); reading them out of the source keeps the assertions
+    on the messages and the constants one edit apart instead of two.
+    """
+    match = re.search(rf"^#define {name} ([0-9]+)$", MAINT_C, re.MULTILINE)
+    assert match is not None, f"maint.c has no plain-integer #define {name}"
+    return int(match.group(1))
+
+
+def _c_bytes_define(name: str) -> int:
+    """The value of a byte ceiling spelt as a product, e.g.
+    ``((unsigned long long)64 * 1024 * 1024)`` -- the shape every output cap in
+    ``maint.c`` has, so the relations between them can be asserted rather than
+    restated.
+    """
+    match = re.search(rf"^#define {name} \((.*)\)$", MAINT_C, re.MULTILINE)
+    assert match is not None, f"maint.c has no #define {name} (...)"
+    product = 1
+    for factor in match.group(1).split("*"):
+        product *= int(factor.strip().removeprefix("(unsigned long long)").strip())
+    return product
+
+
+#: The bounded wait ``refuse_connection`` may spend on a refused peer that has
+#: still to say anything (``PRIV_REFUSAL_WAIT_MS``).
+REFUSAL_WAIT_MS = _c_integer_define("PRIV_REFUSAL_WAIT_MS")
 
 #: Where ``serve`` insists on running from: the path is compiled into the
 #: broker (``PRIV_DEFAULT_MAINT_BIN``), precisely so that no setting can move
@@ -286,6 +320,7 @@ class _Serve:
     """A running ``e2b-maint serve`` and the socket it bound."""
 
     socket: Path
+    health: Path | None
     process: subprocess.Popen
     _output: tuple[bytes, bytes] | None = None
     _log: str = ""
@@ -357,6 +392,54 @@ def _restore(
         os.setxattr(path, "security.capability", xattr)
 
 
+def _build_broker(binary: Path, *defines: str) -> None:
+    """Build ``deploy/priv`` the way the image does, with optional -D overrides.
+
+    ``-Wall -Wextra`` clean is the same bar the module fixture holds the
+    shipped build to, so a test that compiles a second variant cannot smuggle a
+    warning in with it.
+    """
+    build = subprocess.run(
+        [
+            "cc",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            *defines,
+            "-o",
+            str(binary),
+            str(PRIV_DIR / "maint.c"),
+            str(PRIV_DIR / "priv_common.c"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert build.returncode == 0, build.stderr
+    assert build.stderr == ""
+
+
+@contextlib.contextmanager
+def _installed_with_walk_cap(bytes_cap: int, tmp_path: Path):
+    """Install the same source built with a tiny ``PRIV_MAX_WALK_OUTPUT`` (A7).
+
+    Every ceiling in the daemon is a compile-time constant, and crossing the
+    shipped 64 MiB one would take a tree of ~1M entries -- so the crossing is
+    driven by the same source built with a smaller cap. The module fixture's
+    binary is put back afterwards; the rest of the lane keeps running the
+    shipped constant, whose relations are asserted separately.
+    """
+    built = tmp_path / "e2b-maint-small-walk-cap"
+    _build_broker(built, f"-DPRIV_MAX_WALK_OUTPUT={bytes_cap}")
+    previous = _snapshot(INSTALLED_BROKER)
+    shutil.copyfile(built, INSTALLED_BROKER)
+    os.chmod(INSTALLED_BROKER, 0o750)
+    os.chown(INSTALLED_BROKER, 0, os.getegid())
+    try:
+        yield INSTALLED_BROKER
+    finally:
+        _restore(INSTALLED_BROKER, previous)
+
+
 @pytest.fixture(scope="module")
 def broker_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """``deploy/priv`` built the way the image builds it, and installed.
@@ -406,6 +489,7 @@ def serve(broker_bin: Path, tmp_path: Path):
         *,
         pass_flag: bool = True,
         socket_path: Path | None = None,
+        health_socket: Path | None = None,
         **overrides: str | None,
     ) -> _Serve:
         if socket_path is None:
@@ -417,6 +501,8 @@ def serve(broker_bin: Path, tmp_path: Path):
         else:
             # No flag: the path has to come from the environment.
             env["E2B_PRIV_HELPER_SOCKET"] = str(socket_path)
+        if health_socket is not None:
+            argv += ["--health-socket", str(health_socket)]
         process = subprocess.Popen(
             argv,
             env=env,
@@ -424,7 +510,7 @@ def serve(broker_bin: Path, tmp_path: Path):
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        handle = _Serve(socket=socket_path, process=process)
+        handle = _Serve(socket=socket_path, health=health_socket, process=process)
         started.append(handle)
         return handle
 
@@ -588,8 +674,80 @@ def _connect_as(uid: int, socket_path: Path) -> str:
     return run.stdout.strip()
 
 
+def _hello_as(uid: int, socket_path: Path) -> bytes:
+    """One ``hello`` as `uid`, returning the answer (or the connect failure).
+
+    The business socket's gate is only ever tested from a mismatching *env*
+    (this lane's clients are root, and the mode stops a pool uid first), but
+    the health socket's gate is "uid 0" itself -- so the peer has to really be
+    somebody else. Same child-process trick as ``_connect_as``: this suite may
+    run in a multi-threaded process, where ``os.fork()`` warns.
+    """
+    script = (
+        "import os, socket, sys\n"
+        "uid = int(sys.argv[1])\n"
+        "os.setgroups([])\n"
+        "os.setgid(uid)\n"
+        "os.setuid(uid)\n"
+        "client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "client.settimeout(15)\n"
+        "try:\n"
+        "    client.connect(sys.argv[2])\n"
+        "except OSError as exc:\n"
+        "    print(f'connect-error:{exc.errno}')\n"
+        "    raise SystemExit(0)\n"
+        "client.sendall(b'{\"v\":1,\"hello\":true}\\n')\n"
+        "client.shutdown(socket.SHUT_WR)\n"
+        "answer = b''\n"
+        "while not answer.endswith(b'\\n'):\n"
+        "    chunk = client.recv(65536)\n"
+        "    if not chunk:\n"
+        "        break\n"
+        "    answer += chunk\n"
+        "sys.stdout.write(answer.decode())\n"
+    )
+    run = subprocess.run(
+        [sys.executable, "-c", script, str(uid), str(socket_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert run.returncode == 0, run.stderr
+    return run.stdout.encode()
+
+
 def _chown(path: Path, uid: int = POOL_START) -> dict:
     return {"v": 1, "args": ["chown", "--uid", str(uid), "--path", str(path)]}
+
+
+def _freeze(pid: int) -> None:
+    """SIGSTOP ``pid`` and wait until the kernel has it stopped.
+
+    ``os.kill`` only queues the signal, so a test that wants "the bytes are in
+    the socket *before* the daemon looks" has to wait for the stop to land --
+    otherwise the daemon can accept and read while the client's ``send`` is
+    still on its way, which is the race the caller is trying to remove.
+    ``/proc/<pid>/stat`` is the observable: unlike a second ``waitpid`` it does
+    not consume the stop notification the ``Popen`` object may want later.
+    """
+    os.kill(pid, signal.SIGSTOP)
+    deadline = time.monotonic() + 15
+    while True:
+        state = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1][0]
+        if state == "T":
+            return
+        assert time.monotonic() < deadline, f"pid {pid} never stopped (state {state})"
+        time.sleep(0.005)
+
+
+def _read_answer(client: socket.socket) -> bytes:
+    """Read one response line (the protocol has no other framing)."""
+    raw = b""
+    while b"\n" not in raw:
+        chunk = client.recv(65536)
+        assert chunk, "the broker closed the connection without an answer"
+        raw += chunk
+    return raw
 
 
 def test_serve_round_trips_a_chown(serve, tmp_path: Path) -> None:
@@ -1044,6 +1202,153 @@ def test_the_socket_is_reachable_only_by_its_peer(serve) -> None:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def test_the_health_socket_is_root_only_and_answers_the_probe_hello(
+    broker_bin: Path, serve, tmp_path: Path
+) -> None:
+    """A4: the probe's socket -- root-only, hello-only, no peer gate at all.
+
+    The DaemonSet's liveness/readiness probes run as the container's own root,
+    and the *business* socket's gate is about the worker
+    (``E2B_BROKER_PEER_UID``): a root probe is refused there by name (measured
+    on the k0s cluster, 2026-09-27, and pinned below). That refusal is what
+    used to drag ``setpriv`` into the probe and SETUID/SETGID into the broker's
+    capability set. The health socket removes the need: it is ``0660
+    root:root``, it answers ``{"v":1,"hello":true}`` to root without consulting
+    the peer identity, and it must never become a second business socket --
+    every other request is refused by name. The business socket itself is
+    unchanged: same mode, same peer group, same gate in the parent.
+    """
+    stranger = _peer_uid() + 1
+    health = tmp_path / "probe-health.sock"
+    handle = serve(
+        "health-probe",
+        health_socket=health,
+        E2B_BROKER_PEER_UID=str(stranger),
+    )
+    _await_log(
+        handle,
+        f"e2b-maint: serving on {handle.socket}\n"
+        f"e2b-maint: health on {health}\n",
+    )
+
+    # Two sockets, two contracts: the health one is root's, the business one
+    # stays the worker's.
+    health_info = os.stat(health)
+    assert (health_info.st_uid, health_info.st_gid) == (0, 0)
+    assert stat.S_IMODE(health_info.st_mode) == 0o660
+    business_info = os.stat(handle.socket)
+    assert (business_info.st_uid, business_info.st_gid) == (0, _peer_gid())
+    assert stat.S_IMODE(business_info.st_mode) == 0o660
+
+    # The premise of the whole item: root is refused on the business socket...
+    refusal = f"peer uid {_peer_uid()} does not match E2B_BROKER_PEER_UID={stranger}"
+    assert _request(handle.socket, {"v": 1, "hello": True}, process=handle.process) == {
+        "v": 1,
+        "ok": False,
+        "error": refusal,
+    }
+    # ...by the daemon, before it forks for it: that gate is untouched (the
+    # health socket forks for its own clients, so this has to be checked before
+    # any of them connect).
+    assert _handlers(handle) == []
+
+    # ...and answered on the health socket, verbatim, by the same client the
+    # manifest runs (`ping`, no setpriv, this process's own root identity).
+    assert _request(health, {"v": 1, "hello": True}, process=handle.process) == {
+        "v": 1,
+        "ok": True,
+        "peer_uid": _peer_uid(),
+        "peer_gid": _peer_gid(),
+        "uid_pool": [POOL_START, POOL_SIZE],
+        "roots": [str(_workspace(tmp_path)), str(_image_cache(tmp_path))],
+    }
+    ping = subprocess.run(
+        [str(broker_bin), "ping", "--socket", str(health)],
+        env=_broker_env(broker_bin, tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert ping.returncode == 0
+    assert ping.stderr == ""
+    assert json.loads(ping.stdout)["ok"] is True
+
+    # Not a second business socket: a verb is refused by name, and so is a
+    # "hello" that carries arguments.
+    health_only = 'the health socket answers only {"v":1,"hello":true}'
+    assert _request(
+        health, {"v": 1, "args": ["walk", "--path", str(_workspace(tmp_path))]}
+    ) == {"v": 1, "ok": False, "error": health_only}
+    assert _request(
+        health, {"v": 1, "hello": True, "args": ["walk", "--path", "/"]}
+    ) == {"v": 1, "ok": False, "error": health_only}
+
+    # Nothing above took the daemon down, and the health socket still answers.
+    assert _request(health, {"v": 1, "hello": True})["ok"] is True
+    assert handle.process.poll() is None
+    assert handle.stop().endswith(
+        f"e2b-maint: refused: {refusal}\n"
+        f"e2b-maint: refused: {health_only}\n"
+        f"e2b-maint: refused: {health_only}\n"
+    )
+
+
+def test_the_health_socket_gate_refuses_a_non_root_peer_by_name(serve) -> None:
+    """The other half of A4: fail closed, and say who was let down.
+
+    In the DaemonSet the health socket is unreachable for anyone but root (the
+    file is ``0660 root:root`` and the worker's uid/gid is 65534), which is why
+    this is defence in depth rather than the first gate -- so the test *relaxes
+    the mode* to prove the gate itself holds if the mode ever drifts: a pool
+    uid that can connect is refused by a message that names its uid, and the
+    daemon keeps serving.
+    """
+    # pytest's tmp_path is 0700: without this the pool uid would be stopped by
+    # the directory and the gate would never be reached.
+    directory = Path(tempfile.mkdtemp(prefix="e2b-broker-health-"))
+    os.chmod(directory, 0o755)
+    try:
+        health = directory / "health.sock"
+        handle = serve("health-gate", health_socket=health)
+        _await_log(
+            handle,
+            f"e2b-maint: serving on {handle.socket}\n"
+            f"e2b-maint: health on {health}\n",
+        )
+
+        # 0660 root:root is the first gate: a pool uid cannot even connect.
+        refused = f"connect-error:{errno.EACCES}\n".encode()
+        assert _hello_as(POOL_START, health) == refused
+
+        # Now the gate itself, with the mode out of the way.
+        os.chmod(health, 0o666)
+        assert _response(_hello_as(POOL_START, health)) == {
+            "v": 1,
+            "ok": False,
+            "error": (
+                f"peer uid {POOL_START} is not root: the health socket is for "
+                "this container's own probe"
+            ),
+        }
+        assert handle.process.poll() is None
+        assert _request(health, {"v": 1, "hello": True})["ok"] is True
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_serve_refuses_a_health_socket_that_is_the_broker_socket(
+    serve, tmp_path: Path
+) -> None:
+    """Two listeners on one path would silently pick one contract over the other."""
+    both = tmp_path / "both.sock"
+    handle = serve("health-clash", socket_path=both, health_socket=both)
+    assert handle.process.wait(timeout=30) == 77
+    assert handle.stop() == (
+        "e2b-maint: refused: the health socket and the broker socket are the "
+        f"same path: {both}\n"
+    )
+
+
 def test_serve_refuses_connections_over_the_handler_cap(serve, tmp_path: Path) -> None:
     """A trusted peer's leak must not turn into unlimited forked root processes."""
     handle = serve()
@@ -1082,6 +1387,124 @@ def test_serve_refuses_connections_over_the_handler_cap(serve, tmp_path: Path) -
             break
         assert time.monotonic() < deadline, final
         time.sleep(0.02)
+
+
+def test_a_refusal_only_waits_for_a_peer_that_has_not_spoken_yet(serve) -> None:
+    """A2: the refusal throttle is spent on "nothing yet", never on "here already".
+
+    ``refuse_connection`` has to drain what the refused peer already sent --
+    closing a socket that still holds unread input is what turns the written
+    answer into an RST -- and that drain is time the *accept loop* pays, one
+    refused connection at a time. So the first look at the connection is a
+    **non-blocking read**: a request that is already in the socket (the
+    ordinary refusal: the peer spoke before the answer was written) or the EOF
+    of a peer that hung up is drained and closed *now*, with no timer
+    involved; only a peer that has said nothing at all falls back to the
+    bounded wait.
+
+    Wall time alone cannot pin that: a refusal whose input is here costs
+    microseconds either way, so the distinction is the *branch*, which the
+    daemon reports when ``E2B_BROKER_REFUSAL_TRACE`` is set -- and the accept
+    loop's cost of the whole exchange is what the second half measures. Three
+    assertions, one property each:
+
+    * two refusals whose requests were already written (both connections are
+      filled while the daemon is SIGSTOPped, so "already in the socket" is a
+      fact and not a race against the client) are answered with exactly one
+      ``had already spoken`` trace each -- restoring the old ``poll`` first
+      reports the wait branch instead, which is the red half of "no fixed
+      50 ms";
+    * the one from the *second* connection arrives promptly after the daemon is
+      allowed to run again: an "wait anyway" implementation would answer it
+      a whole ``PRIV_REFUSAL_WAIT_MS`` late, which is the cost this removes
+      from the accept loop;
+    * a peer that stays connected and says nothing *does* take the bounded wait
+      (the positive control: removing the fallback would stop the answer from
+      surviving its own close, and the trace line disappears with it).
+    """
+    stranger = _peer_uid() + 1
+    refusal = f"peer uid {_peer_uid()} does not match E2B_BROKER_PEER_UID={stranger}"
+    payload = json.dumps({"v": 1, "hello": True}).encode() + b"\n"
+    spoken_line = (
+        "e2b-maint: refusal trace: the peer had already spoken: "
+        f"{len(payload)} bytes drained without waiting\n"
+    )
+
+    spoken = serve(
+        "refuse-spoken",
+        E2B_BROKER_PEER_UID=str(stranger),
+        E2B_BROKER_REFUSAL_TRACE="1",
+    )
+    _await_log(spoken, f"e2b-maint: serving on {spoken.socket}\n")
+    first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    second = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    for client in (first, second):
+        client.settimeout(15.0)
+    try:
+        _freeze(spoken.process.pid)
+        for client in (first, second):
+            client.connect(str(spoken.socket))
+            client.sendall(payload)
+        started = time.monotonic()
+        os.kill(spoken.process.pid, signal.SIGCONT)
+        assert _response(_read_answer(first)) == {
+            "v": 1,
+            "ok": False,
+            "error": refusal,
+        }
+        assert _response(_read_answer(second)) == {
+            "v": 1,
+            "ok": False,
+            "error": refusal,
+        }
+        # The first refusal's drain was paid for by the second: both were in
+        # the socket before the daemon ran, so answering the second one is
+        # where a fixed wait would show up as accept-loop latency.
+        elapsed = time.monotonic() - started
+    finally:
+        first.close()
+        second.close()
+
+    # Half the throttle: far above the microseconds the drain costs, far below
+    # the extra 50 ms a refusal that waits anyway would add to this pair.
+    assert elapsed < (REFUSAL_WAIT_MS / 2) / 1000, (
+        f"two refusals whose requests were already in the socket took "
+        f"{elapsed * 1000:.1f} ms; the accept loop is paying the "
+        f"{REFUSAL_WAIT_MS} ms throttle on a connection that did not need it"
+    )
+    assert spoken.stop() == (
+        f"e2b-maint: serving on {spoken.socket}\n"
+        f"e2b-maint: refused: {refusal}\n" + spoken_line
+        + f"e2b-maint: refused: {refusal}\n" + spoken_line
+    )
+
+    silent = serve(
+        "refuse-silent",
+        E2B_BROKER_PEER_UID=str(stranger),
+        E2B_BROKER_REFUSAL_TRACE="1",
+    )
+    _await_log(silent, f"e2b-maint: serving on {silent.socket}\n")
+    quiet = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    quiet.settimeout(15.0)
+    try:
+        quiet.connect(str(silent.socket))
+        assert _response(_read_answer(quiet)) == {
+            "v": 1,
+            "ok": False,
+            "error": refusal,
+        }
+        # The positive control: this peer really does take the bounded wait,
+        # and the daemon says so (the line is written before the wait, so it
+        # exists even though the answer itself did not need it).
+        _await_log(
+            silent,
+            f"e2b-maint: serving on {silent.socket}\n"
+            f"e2b-maint: refused: {refusal}\n"
+            "e2b-maint: refusal trace: the peer has not spoken yet: waiting up "
+            f"to {REFUSAL_WAIT_MS} ms for its request\n",
+        )
+    finally:
+        quiet.close()
 
 
 def test_a_silent_peer_is_refused_and_the_broker_keeps_serving(serve) -> None:
@@ -1350,6 +1773,78 @@ def test_serve_refuses_a_non_positive_timeout(serve, tmp_path: Path) -> None:
             "ok": False,
             "error": f"timeout_s must be positive (got {budget})",
         }
+
+
+def test_walk_has_its_own_smaller_output_ceiling(
+    broker_bin: Path, serve, tmp_path: Path
+) -> None:
+    """A7: `walk` answers under 64 MiB, and this daemon is what enforces it.
+
+    One ``walk`` answers about one tree, and a tree is bounded by
+    ``E2B_DISK_MAX_ENTRIES`` (500000 entries) at ~80 bytes a line -- ~40 MB
+    unescaped -- so the walk ceiling is 64 MiB (1.6x) while every other verb
+    keeps ``PRIV_MAX_OUTPUT`` (256 MiB). 64 MiB unescaped reaches at most 6x
+    that on the wire (the widest JSON escape), 384 MiB, still under the worker
+    side's own 512 MiB *line* ceiling: a legitimate walk answer is therefore
+    always refused by this daemon -- ``ok:false``, naming the walk cap -- and
+    the worker's larger ceiling only ever catches an answer that did not come
+    from here.
+
+    The crossing is driven with a small compile-time cap (the shipped one would
+    need ~1M entries), and the tree is walked directly first, so the refusal is
+    known to be about a walk that really does exceed the cap rather than about
+    the tree being empty. The shipped constants' relations are asserted at the
+    end, against the source, because they are what makes the small number safe.
+    """
+    small_cap = 4096
+    tree = _workspace(tmp_path) / "sb-walk-cap"
+    tree.mkdir(parents=True)
+    for index in range(200):
+        (tree / f"entry-{index:04d}").write_text("x")
+
+    with _installed_with_walk_cap(small_cap, tmp_path):
+        direct = subprocess.run(
+            [str(broker_bin), "walk", "--path", str(tree)],
+            env=_broker_env(broker_bin, tmp_path),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert direct.returncode == 0, direct.stderr
+        assert len(direct.stdout) > small_cap
+
+        handle = serve("walk-cap")
+        _await_listening(handle)
+        response = _request(
+            handle.socket,
+            {"v": 1, "args": ["walk", "--path", str(tree)]},
+            process=handle.process,
+        )
+
+        assert response == {
+            "v": 1,
+            "ok": False,
+            "error": (
+                f"stdout exceeded the {small_cap}-byte walk output cap and was "
+                "killed"
+            ),
+        }
+        # The cap kills the walk, never the broker.
+        assert handle.process.poll() is None
+        assert _request(handle.socket, {"v": 1, "hello": True})["ok"] is True
+        # The variant binary has to be off this path before the shipped one goes
+        # back: a running daemon holds the inode (ETXTBSY), and the module
+        # fixture's teardown would otherwise race with this restore.
+        handle.stop()
+
+    shipped = _c_bytes_define("PRIV_MAX_WALK_OUTPUT")
+    every_verb = _c_bytes_define("PRIV_MAX_OUTPUT")
+    assert shipped == 64 * 1024**2
+    assert every_verb == 256 * 1024**2
+    assert shipped < every_verb
+    # 6x is the widest escape: even then the daemon refuses before the worker's
+    # 512 MiB line ceiling is anywhere near.
+    assert shipped * 6 < 512 * 1024**2
 
 
 #: The runaway tree: entry count and name length are the two levers on how long

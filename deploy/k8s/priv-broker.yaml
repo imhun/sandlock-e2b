@@ -27,6 +27,11 @@
 #   Python 侧的启动断言强制前两者，目录/文件的属组由下面的 init 与 daemon 自己保证；
 #   三处漂移的任何一种组合都会在 worker 启动或第一次特权调用上显性失败。
 #
+# A4（本 pod 内）：daemon 还听第二个 socket `health.sock`（`0660 root:root`，只答
+#   `{"v":1,"hello":true}`，**不查** `E2B_BROKER_PEER_UID`），liveness/readiness 探针
+#   以容器自己的 root 直接 `ping` 它 —— 上面那三处同源与业务 socket 的 peer 门**完全不变**，
+#   broker 的 cap 集因此从五条收到三条（见下面 securityContext 的注释）。
+#
 # 上线顺序（终审要求）：**先 apply 这个 DaemonSet，再上新 worker 镜像**。新 Python +
 # 旧 daemon 会在握手期因缺 `peer_gid` fail closed（设计如此）；旧 Python + 新 daemon
 # 向前兼容。
@@ -75,6 +80,13 @@ spec:
         # daemon 自己把 socket 建成 `0660 root:<peer gid>`（maint.c `serve`），所以这里
         # 只负责把目录本身交给 root:65534 —— 目录若留给 kubelet 建的 root:root，worker
         # 连 x 位都没有，socket 模式会在启动期直接拒服。
+        #
+        # A4 真机注意：这个目录里现在有**两个** socket，属组只决定"能不能**穿过**目录"，
+        # 两个文件各自的模式由 daemon 建立时决定：
+        #   * `broker.sock` —— `0660 root:65534`，worker（uid/gid 65534）靠**属组**连进来；
+        #   * `health.sock` —— `0660 root:root`，worker **连不上**（它既不是 root，也不在
+        #     root 组里），那是**有意的**：健康 socket 只给这个容器自己的 root 探针用。
+        # 所以目录保持 0710 root:65534 就够：worker 能穿过目录、只能用业务 socket。
         - name: socket-dir-init
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
           securityContext:
@@ -361,13 +373,17 @@ spec:
           imagePullPolicy: IfNotPresent
           # `serve` only ever execs *itself* (`/var/lib/e2b-priv/e2b-maint`,
           # verified against /proc/self/exe at startup) -- it is not a general
-          # launcher -- so this argv plus the socket path is the whole
-          # interface the worker's E2B_PRIV_HELPER_SOCKET dials.
+          # launcher -- so this argv plus the two socket paths is the whole
+          # interface: the worker's E2B_PRIV_HELPER_SOCKET dials `broker.sock`,
+          # the probes below dial `health.sock` (A4), and neither can ask for
+          # anything else.
           command:
             - /var/lib/e2b-priv/e2b-maint
             - serve
             - --socket
             - /run/e2b-broker/broker.sock
+            - --health-socket
+            - /run/e2b-broker/health.sock
           env:
             # The whitelist and the pool are part of the startup handshake:
             # the worker resolves its own roots (its workspace/state bases, the
@@ -415,6 +431,17 @@ spec:
               value: "65534"
             - name: E2B_BROKER_PEER_GID
               value: "65534"
+            # A5：请求读截止（毫秒），显式写在这里，值与代码默认
+            # （`PRIV_DEFAULT_REQUEST_READ_MS` in maint.c = 30000）一致 —— 这个旋钮
+            # 保护的是**这个节点的 broker**：通过 peer 门的对端迟迟不发请求时，读截止
+            # 到点后只拒当前连接（`ok:false`，点名 "the request was not sent within
+            # N ms"），daemon 不退出、同一节点上其它 worker 不受影响（处理器有上限
+            # PRIV_MAX_HANDLERS=32，没有这条截止，32 个沉默连接就能把整个节点挡在门
+            # 外）。调小要谨慎：小于 worker 正常请求耗时的值会把合法调用拒掉。删掉这
+            # 一行会回落到同一个 30000，但写在清单上是让"节点级的运维参数"在运维面
+            # 可见，而不是只活在 C 注释里。
+            - name: E2B_BROKER_REQUEST_READ_MS
+              value: "30000"
           securityContext:
             # root，因为上面解释了：CAP_CHOWN 不过网，而删除/遍历一棵属于任意
             # 池 uid 的树也只有 root 做得到。c1 的整个设计就是把这几个特权动作
@@ -425,9 +452,21 @@ spec:
             # runc 不会因为显式 add 而清空默认集 —— 那样进程实际仍持有
             # DAC_READ_SEARCH、SETUID、NET_RAW… 整套 root 默认集。三条 verb 要的是：
             # CHOWN 把文件让给池 uid，DAC_OVERRIDE 穿过沙箱树的权限位，FOWNER 改
-            # 自己建的 socket 的模式。另加 `SETUID`/`SETGID` **只为探针**：探针必须
-            # 以对端身份（65534）连 socket 才过 peer 门，而容器是 root，所以它用
-            # `setpriv` 降权 —— 那需要这两条；daemon 自己那三个 verb 不需要它们。
+            # 自己建的 socket 的模式。**就这三条。**
+            #
+            # A4：`SETUID`/`SETGID` 已经从这份集合里去掉。它们曾经**只为探针**存在：
+            # 探针以容器 root 去连业务 socket，被 peer 门按 `peer uid 0 does not
+            # match E2B_BROKER_PEER_UID=65534` 拒掉，于是探针改成 `setpriv` 先降到
+            # 65534，那一步就把这两条能力拖了进来。现在探针连的是 **health socket**：
+            # daemon 用 `--health-socket` 建的第二个 listener，`0660 root:root`、只答
+            # `{"v":1,"hello":true}`、且**不查 `E2B_BROKER_PEER_UID`**（maint.c 的
+            # health_gate / handle_health_connection）。健康 socket 只有 root 能连，
+            # 所以探针不需要降权 —— 于是这两条能力也不必留。
+            #
+            # **业务 socket 的门没动**：它仍在父进程里、fork 之前按 SO_PEERCRED 判
+            # uid/gid，worker（65534）之外任何 uid 都被它挡在外面；被拒连接不 fork，
+            # 这一条由契约用例 `test_hello_rejects_a_peer_uid_mismatch`
+            # （`assert _handlers(handle) == []`）与 `test_the_health_socket_*` 一起钉住。
             #
             # 2026-09-27 在目标 k0s 集群上真机验证过：只有这份集合时 `chown`
             # （建箱把树交给池 uid）、`rm`（删除沙箱树）、`walk`（配额记账）都仍然
@@ -451,34 +490,25 @@ spec:
                 - CHOWN
                 - DAC_OVERRIDE
                 - FOWNER
-                # 探针用 `setpriv` 降到对端身份，需要这两条（daemon 的 verb 不用）。
-                - SETUID
-                - SETGID
           # 探活就是协议里的 ping：连上 socket、发 hello、把响应打到 stdout，
           # 退出码 ok=0 / 拒=77。两条探针共用它 —— broker 不在（socket 文件没了、
           # 监听死了、或对端校验把它挡下来）时，唯一正确的反应是重启这个 pod：
           # worker 的 socket transport 没有回落路径。
           #
-          # ⚠ 探针必须以**对端身份**（`E2B_BROKER_PEER_UID/GID`）去连，所以用
-          # `setpriv` 先降到 65534:65534（容器是 root，降权没问题）。这不是装饰：
-          # 探针是 broker 的真实客户端，而 daemon 的 peer 门只认这个 uid —— 直接以
-          # root 跑 `ping` 会被 `refused: peer uid 0 does not match …` 挡掉，探针永远
-          # 失败、DaemonSet 永远不 Ready（2026-09-27 上线时实测：容器 Running 0/1、
-          # 反复重启、rollout 超时；daemon 本身一直在正常服务）。降权之后的探针同时
-          # 顺带证明了"worker 那条路真的能握手"。
+          # A4：探针连的是**健康 socket**（`--health-socket` 建的那个），并且**直接**
+          # 用容器自己的 root 跑 `ping`，不再 `setpriv` 降权。原因写在 cap 集合那段：
+          # 业务 socket 的 peer 门是给 worker 的，root 会被它按
+          # `peer uid 0 does not match E2B_BROKER_PEER_UID=65534` 拒掉（2026-09-27 上线
+          # 实测：容器 Running 0/1、反复重启、rollout 超时；daemon 本身一直在正常服务），
+          # 而健康 socket 是 `0660 root:root`、只答 hello、不查这个变量 —— 它就是这个容器
+          # 的 root 探针专用的。于是 broker 的 cap 集也不需要再留 `SETUID`/`SETGID`。
           livenessProbe:
             exec:
               command:
-                - /usr/bin/setpriv
-                - --reuid
-                - "65534"
-                - --regid
-                - "65534"
-                - --clear-groups
                 - /var/lib/e2b-priv/e2b-maint
                 - ping
                 - --socket
-                - /run/e2b-broker/broker.sock
+                - /run/e2b-broker/health.sock
             initialDelaySeconds: 10
             periodSeconds: 15
             timeoutSeconds: 5
@@ -486,16 +516,10 @@ spec:
           readinessProbe:
             exec:
               command:
-                - /usr/bin/setpriv
-                - --reuid
-                - "65534"
-                - --regid
-                - "65534"
-                - --clear-groups
                 - /var/lib/e2b-priv/e2b-maint
                 - ping
                 - --socket
-                - /run/e2b-broker/broker.sock
+                - /run/e2b-broker/health.sock
             # 比 liveness 快：readiness 只影响"要不要把新 worker 调度到这个节点
             # 旁边"，而 worker 的 wait-for-broker 会自己等 socket 就绪。
             initialDelaySeconds: 2

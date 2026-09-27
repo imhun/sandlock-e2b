@@ -31,7 +31,7 @@
  *   e2b-maint chown  (--uid U --gid G | --worker) [--recursive] --path P
  *   e2b-maint rm     --path P
  *   e2b-maint walk   --path P
- *   e2b-maint serve  [--socket P]          (C1) the node's socket broker
+ *   e2b-maint serve  [--socket P] [--health-socket P]   (C1) the node's broker
  *   e2b-maint ping   [--socket P]          (C1) one hello round-trip, exit 0/77
  *
  * C1 -- why the socket exists: this binary is the privileged thing in the
@@ -51,7 +51,10 @@
  * one hop further out -- never a general "run this as root" launcher. A request the
  * daemon refuses to run answers `ok:false`; a request the child refuses
  * answers with the child's own exit status (77 is the fail-closed refusal)
- * and its stderr, which is what the caller logs.
+ * and its stderr, which is what the caller logs. A `walk` whose answer would
+ * cross PRIV_MAX_WALK_OUTPUT is refused the same way (`ok:false`, naming the
+ * walk cap) by the daemon itself, before the worker's own, larger line ceiling
+ * could ever see it (A7).
  *
  * The socket does not change what "the worker's own identity" means -- only
  * who knows it. Directly exec'd, the broker *is* the worker (`getuid()` /
@@ -69,7 +72,12 @@
  * unauthorized peer costs one refused answer and never a child. A fork error
  * or too many handlers (PRIV_MAX_HANDLERS) refuses that one connection and
  * leaves the daemon serving: nothing a local peer does may take the node's
- * broker down. A peer that connects and then says nothing is bounded the same
+ * broker down. The refusal is drained before the close so the answer cannot be
+ * destroyed by the RST, but the drain waits -- a bounded PRIV_REFUSAL_WAIT_MS --
+ * only for a peer that has *not spoken yet*: a request (or a hang-up) that is
+ * already in the socket is drained without any timer, and the wait logs itself
+ * because it is accept-loop time every other caller spends queued. A peer that
+ * connects and then says nothing is bounded the same
  * way -- the request read has a deadline (`E2B_BROKER_REQUEST_READ_MS`, 30 s
  * by default: an operator's knob for this daemon, see the constant), so a
  * silent connection costs its one handler and is answered `ok:false` instead
@@ -77,6 +85,18 @@
  * mid-answer: SIGPIPE is ignored and the socket writes pass MSG_NOSIGNAL,
  * because the refusal path writes from the *parent* and a signal there would
  * end the broker.
+ *
+ * A4 -- the health socket: `serve --health-socket P` adds a second listener
+ * that is `0660 root:root` and answers **only** `{"v":1,"hello":true}`, to a
+ * **root** peer, without consulting `E2B_BROKER_PEER_UID` at all. It is not a
+ * second business socket (a verb request is refused by name) and it exists so
+ * the DaemonSet's liveness/readiness probes can keep running as the container's
+ * own root: the business socket's gate is about the *worker*, so a root probe
+ * would be refused there (`peer uid 0 does not match E2B_BROKER_PEER_UID=…`),
+ * which is what used to force `setpriv` into the probe and `SETUID`/`SETGID`
+ * into the broker's capability set. Without `--health-socket` the daemon serves
+ * exactly one socket, i.e. the shape before this flag existed. The business
+ * socket's gate is untouched -- it still runs in the parent, before any fork.
  *
  * Output is JSON, so every byte of it has to be. A path is not necessarily
  * UTF-8 (a Linux filename may be any byte but NUL and '/'), and one such name
@@ -114,7 +134,11 @@
 /* How long the *daemon* waits for the request of a connection it is refusing.
  * It is time the accept loop spends, so it is short: it only has to cover the
  * bytes already on their way down a local socket (which is what keeps the
- * answer from being destroyed by RST). */
+ * answer from being destroyed by RST). It is a **fallback**, not a fixed cost:
+ * a request (or a hang-up) that is already in the socket is drained without
+ * any wait at all, and only a peer that has said nothing yet reaches this
+ * bound -- set `E2B_BROKER_REFUSAL_TRACE` to have the daemon say which of the
+ * two it did (see `refuse_connection`). */
 #define PRIV_REFUSAL_WAIT_MS 50
 /* How long a handler waits for its request line, in milliseconds
  * (`E2B_BROKER_REQUEST_READ_MS` overrides it). A **bounded** read, and this is
@@ -139,6 +163,23 @@
 /* Per stream, not per response: `walk` legitimately prints megabytes, and the
  * cap is where the daemon kills the producer. */
 #define PRIV_MAX_OUTPUT ((unsigned long long)256 * 1024 * 1024)
+/* A7: `walk`'s own ceiling, and it is deliberately *smaller* than every other
+ * verb's. One `walk` answers about one tree, and a tree is bounded by
+ * E2B_DISK_MAX_ENTRIES (500000 entries) at ~80 bytes per line -- ~40 MB
+ * unescaped -- so 64 MiB is that with 1.6x of head room. 64 MiB unescaped
+ * reaches at most 6x that on the *wire* (the widest JSON escape), i.e. 384 MiB,
+ * which is still below the worker side's line ceiling
+ * (envd_service.priv_helpers.BROKER_MAX_WALK_RESPONSE_BYTES = 512 MiB): a
+ * legitimate walk answer is therefore always refused by the daemon **itself**,
+ * `ok:false` and naming the walk cap, and the worker's larger ceiling only ever
+ * catches an answer that did not come from this daemon. The `#ifndef` is not
+ * decoration: the contract lane builds this same source with a tiny
+ * `-DPRIV_MAX_WALK_OUTPUT` to drive a crossing without producing 64 MiB of walk
+ * output, and a bare `#define` would turn that into a redefinition warning --
+ * taking the lane's "-Wall -Wextra clean" bar with it. */
+#ifndef PRIV_MAX_WALK_OUTPUT
+#define PRIV_MAX_WALK_OUTPUT ((unsigned long long)64 * 1024 * 1024)
+#endif
 #define PRIV_MAX_ARGS 32
 /* Concurrent handlers. One process per in-flight request is the design, but a
  * number is still needed: without a cap, a *trusted* peer with a leak (or a
@@ -782,6 +823,10 @@ struct output {
     char *data;
     size_t len;
     size_t cap;
+    /* The byte ceiling for the verb this request runs (A7: `walk` has one of
+     * its own) and how a refusal names it. `cap` is the buffer's capacity. */
+    unsigned long long limit;
+    const char *limit_name;
     int overflow;
 };
 
@@ -789,7 +834,7 @@ static int output_append(struct output *sink, const char *data, size_t len) {
     if (sink->overflow) {
         return 0; /* already over the cap: keep draining, keep discarding */
     }
-    if (sink->len + len > PRIV_MAX_OUTPUT) {
+    if (sink->len + len > sink->limit) {
         sink->overflow = 1;
         return 0;
     }
@@ -800,8 +845,8 @@ static int output_append(struct output *sink, const char *data, size_t len) {
         while (cap < wanted) {
             cap *= 2;
         }
-        if (cap > PRIV_MAX_OUTPUT + 1) {
-            cap = PRIV_MAX_OUTPUT + 1;
+        if (cap > sink->limit + 1) {
+            cap = sink->limit + 1;
         }
         grown = realloc(sink->data, cap);
         if (grown == NULL) {
@@ -814,6 +859,26 @@ static int output_append(struct output *sink, const char *data, size_t len) {
     sink->len += len;
     sink->data[sink->len] = '\0';
     return 0;
+}
+
+/* The ceiling one request runs under: `walk` gets PRIV_MAX_WALK_OUTPUT (A7),
+ * every other verb keeps PRIV_MAX_OUTPUT, and both of a request's streams share
+ * the verb's value. `request == NULL` is the default, for the window before the
+ * request line has been parsed. */
+static void set_output_limits(const struct priv_request *request,
+                              struct output *out, struct output *err_out) {
+    unsigned long long limit = PRIV_MAX_OUTPUT;
+    const char *name = "output";
+
+    if (request != NULL && request->nargs > 0 &&
+        strcmp(request->args[0], "walk") == 0) {
+        limit = PRIV_MAX_WALK_OUTPUT;
+        name = "walk output";
+    }
+    out->limit = limit;
+    out->limit_name = name;
+    err_out->limit = limit;
+    err_out->limit_name = name;
 }
 
 /* Everything or nothing: a half-written response would desynchronize a
@@ -1132,8 +1197,10 @@ static int run_child(char *const *args, long timeout_s, long peer_uid,
     }
     if (killed) {
         snprintf(message, message_len,
-                 "%s exceeded the 268435456-byte output cap and was killed",
-                 out->overflow ? "stdout" : "stderr");
+                 "%s exceeded the %llu-byte %s cap and was killed",
+                 out->overflow ? "stdout" : "stderr",
+                 out->overflow ? out->limit : err_out->limit,
+                 out->overflow ? out->limit_name : err_out->limit_name);
         return -1;
     }
     *code = exit_code_from_status(status);
@@ -1311,6 +1378,48 @@ static const char *socket_from_args(int argc, char **argv, int start) {
     return socket_path != NULL ? socket_path : priv_broker_socket();
 }
 
+/* `serve`'s own flags: the business socket, exactly as before, plus the
+ * optional health socket (A4). A missing `--health-socket`, or one with an
+ * empty value, means "this deployment did not name one" -- one socket, i.e.
+ * the shape before the flag existed. */
+static void serve_options_from_argv(int argc, char **argv, int start,
+                                    const char **socket_path,
+                                    const char **health_path) {
+    int index;
+
+    *socket_path = NULL;
+    *health_path = NULL;
+    for (index = start; index < argc; index++) {
+        const char *arg = argv[index];
+        if (strcmp(arg, "--socket") == 0) {
+            if (index + 1 >= argc) {
+                priv_usage("--socket needs a value");
+            }
+            *socket_path = argv[++index];
+            continue;
+        }
+        if (strncmp(arg, "--socket=", 9) == 0 && arg[9] != '\0') {
+            *socket_path = arg + 9;
+            continue;
+        }
+        if (strcmp(arg, "--health-socket") == 0) {
+            if (index + 1 >= argc) {
+                priv_usage("--health-socket needs a value");
+            }
+            *health_path = argv[++index];
+            continue;
+        }
+        if (strncmp(arg, "--health-socket=", 16) == 0) {
+            *health_path = arg[16] != '\0' ? arg + 16 : NULL;
+            continue;
+        }
+        priv_usage("unexpected argument '%s'", arg);
+    }
+    if (*socket_path == NULL) {
+        *socket_path = priv_broker_socket();
+    }
+}
+
 static int request_timeout(const struct priv_request *request, char *err,
                            size_t errlen, long *out) {
     if (!request->has_timeout) {
@@ -1344,6 +1453,7 @@ static void respond_to_request(int fd, long peer_uid, long peer_gid) {
     memset(&request, 0, sizeof(request));
     memset(&out, 0, sizeof(out));
     memset(&err_out, 0, sizeof(err_out));
+    set_output_limits(NULL, &out, &err_out);
     if (read_request(fd, &line, &line_len, err, sizeof(err)) != 0) {
         goto refuse;
     }
@@ -1377,6 +1487,8 @@ static void respond_to_request(int fd, long peer_uid, long peer_gid) {
     if (request_timeout(&request, err, sizeof(err), &timeout_s) != 0) {
         goto refuse;
     }
+    /* A7: the verb is known now, so the streams get their own ceiling. */
+    set_output_limits(&request, &out, &err_out);
     argv[0] = (char *)"e2b-maint";
     for (index = 0; index < request.nargs; index++) {
         argv[index + 1] = request.args[index];
@@ -1461,41 +1573,102 @@ static int peer_gate(int fd, long *peer_uid, long *peer_gid, char *err,
     return 0;
 }
 
-/* Answer a refusal the daemon itself decided on and let the connection go,
- * **without ever forking for it**.
- *
- * The drain has to happen before the close (closing a socket that still holds
- * unread input makes the kernel send RST, and the RST destroys the refusal
- * that was just written), but it must not be able to hold the accept loop
- * either: an unprivileged peer that is allowed to `connect()` because of the
- * socket's mode could otherwise stall every other caller. So: one bounded wait
- * for the *first* byte (PRIV_REFUSAL_WAIT_MS), then non-blocking reads until
- * the request that is already in flight has been consumed -- never a wait for
- * more than that. */
-static void refuse_connection(int fd, const char *message) {
-    struct pollfd waiter;
-    char scratch[4096];
-    size_t drained = 0;
-    respond_error(fd, message);
-    shutdown(fd, SHUT_WR);
-    waiter.fd = fd;
-    waiter.events = POLLIN;
-    waiter.revents = 0;
-    while (drained < PRIV_DRAIN_LIMIT &&
-           poll(&waiter, 1, PRIV_REFUSAL_WAIT_MS) > 0) {
-        ssize_t got = recv(fd, scratch, sizeof(scratch), MSG_DONTWAIT);
+/* Whether the refusal path reports which of its branches it took
+ * (`E2B_BROKER_REFUSAL_TRACE`, any non-empty value). The branches differ only
+ * in whether the accept loop touches the timer at all: a peer whose request is
+ * already in the socket costs microseconds either way, and a peer that stays
+ * silent costs the same bounded wait either way -- so a timing assertion alone
+ * cannot tell "drained immediately" from "even waited without needing to".
+ * Off by default: a refusal is an ordinary event and must not become log spam. */
+static int refusal_trace_enabled(void) {
+    const char *text = getenv("E2B_BROKER_REFUSAL_TRACE");
+    return text != NULL && *text != '\0';
+}
+
+/* Read whatever the refused peer has **already** sent, without ever blocking:
+ * the answer to that request is already written, and the close that follows
+ * must not destroy it (closing a socket that still holds unread input makes
+ * the kernel send RST). Returns 1 when there is nothing left to *wait* for --
+ * the peer's end is gone (EOF), the peer/transport errored, or the drain limit
+ * was reached -- and 0 only when the socket is simply empty right now, which
+ * is the one case that justifies waiting for it to speak. */
+static int drain_available(int fd, char *scratch, size_t scratch_len,
+                           size_t *drained) {
+    for (;;) {
+        ssize_t got;
+        if (*drained >= PRIV_DRAIN_LIMIT) {
+            return 1;
+        }
+        got = recv(fd, scratch, scratch_len, MSG_DONTWAIT);
         if (got > 0) {
-            drained += (size_t)got;
-            while (drained < PRIV_DRAIN_LIMIT &&
-                   (got = recv(fd, scratch, sizeof(scratch), MSG_DONTWAIT)) > 0) {
-                drained += (size_t)got;
-            }
-            break;
+            *drained += (size_t)got;
+            continue;
         }
         if (got < 0 && errno == EINTR) {
             continue;
         }
-        break; /* EOF */
+        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0; /* nothing here yet */
+        }
+        return 1; /* EOF, or a peer/transport that is already gone */
+    }
+}
+
+/* Answer a refusal the daemon itself decided on and let the connection go,
+ * **without ever forking for it**.
+ *
+ * The drain has to happen before the close, but it must not be able to hold
+ * the accept loop either: an unprivileged peer that may `connect()` because of
+ * the socket's mode could otherwise stall every other caller. So the *first*
+ * look is non-blocking: a request that is already here -- the ordinary
+ * refusal, the peer spoke before the answer was written -- or a peer that is
+ * already gone (EOF) is drained and dropped with no timer involved at all. Only
+ * "nothing yet" falls back to the single bounded wait for the first byte
+ * (PRIV_REFUSAL_WAIT_MS); whatever that wait finds is then drained the same
+ * non-blocking way, and the wait is never repeated. */
+static void refuse_connection(int fd, const char *message) {
+    struct pollfd waiter;
+    char scratch[4096];
+    size_t drained = 0;
+    int traced = refusal_trace_enabled();
+    int ready;
+    int finished;
+
+    respond_error(fd, message);
+    shutdown(fd, SHUT_WR);
+    finished = drain_available(fd, scratch, sizeof(scratch), &drained);
+    if (traced) {
+        if (drained > 0) {
+            fprintf(stderr,
+                    "%s: refusal trace: the peer had already spoken: %zu "
+                    "bytes drained without waiting\n",
+                    priv_progname(), drained);
+        } else if (finished) {
+            fprintf(stderr,
+                    "%s: refusal trace: the peer is already gone: nothing to "
+                    "drain\n",
+                    priv_progname());
+        }
+    }
+    if (drained == 0 && !finished) {
+        /* Nothing in the socket yet: this is the one case where refusing
+         * costs the accept loop the bounded wait, because a request that is
+         * still on its way has to be read or the close's RST eats the answer. */
+        if (traced) {
+            fprintf(stderr,
+                    "%s: refusal trace: the peer has not spoken yet: waiting "
+                    "up to %d ms for its request\n",
+                    priv_progname(), PRIV_REFUSAL_WAIT_MS);
+        }
+        waiter.fd = fd;
+        waiter.events = POLLIN;
+        waiter.revents = 0;
+        do {
+            ready = poll(&waiter, 1, PRIV_REFUSAL_WAIT_MS);
+        } while (ready < 0 && errno == EINTR);
+        if (ready > 0) {
+            drain_available(fd, scratch, sizeof(scratch), &drained);
+        }
     }
     close(fd);
 }
@@ -1520,18 +1693,135 @@ static void handle_connection(int fd) {
     finish_connection(fd);
 }
 
+/* The health socket's gate (A4). Unlike the business socket's, this one is
+ * **not** about the worker: the health socket exists so the container's own
+ * probe -- which runs as the container's root -- can ask "are you alive"
+ * without first becoming the peer identity, which is what used to drag
+ * SETUID/SETGID into the broker's capability set. So the gate is "uid 0 and
+ * nothing else", and it fails closed *by name*: a peer that is not root is
+ * refused and told why (the request side of the same promise lives in
+ * `handle_health_connection`). */
+static int health_gate(int fd, long *peer_uid, long *peer_gid, char *err,
+                       size_t errlen) {
+    struct ucred peer;
+    socklen_t peer_len = sizeof(peer);
+
+    memset(&peer, 0, sizeof(peer));
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_len) != 0) {
+        snprintf(err, errlen, "cannot read the peer credentials: %s",
+                 strerror(errno));
+        return -1;
+    }
+    if (peer.uid != 0) {
+        snprintf(err, errlen,
+                 "peer uid %ld is not root: the health socket is for this "
+                 "container's own probe",
+                 (long)peer.uid);
+        return -1;
+    }
+    *peer_uid = (long)peer.uid;
+    *peer_gid = (long)peer.gid;
+    return 0;
+}
+
+/* The health socket answers exactly one request, `{"v":1,"hello":true}`, with
+ * exactly one answer -- the same hello the business socket answers, so
+ * `e2b-maint ping` needs no second protocol. Everything else is refused by
+ * name: this is not a second business socket, so it must never grow into one
+ * (the verbs stay behind the peer gate, on the socket the worker dials). */
+static void handle_health_connection(int fd, long peer_uid, long peer_gid) {
+    struct priv_request request;
+    char err[PRIV_ERR_LEN];
+    char *line = NULL;
+    size_t line_len = 0;
+    long pool_start, pool_size;
+
+    memset(&request, 0, sizeof(request));
+    if (read_request(fd, &line, &line_len, err, sizeof(err)) != 0) {
+        goto refuse;
+    }
+    if (json_parse_request(line, line_len, &request, err, sizeof(err)) != 0) {
+        goto refuse;
+    }
+    if (!request.has_version || request.version != 1) {
+        snprintf(err, sizeof(err), "unsupported protocol version %ld (expected 1)",
+                 request.version);
+        goto refuse;
+    }
+    if (!request.hello || request.nargs > 0) {
+        snprintf(err, sizeof(err),
+                 "the health socket answers only {\"v\":1,\"hello\":true}");
+        goto refuse;
+    }
+    priv_uid_pool(&pool_start, &pool_size);
+    respond_hello(fd, peer_uid, peer_gid, pool_start, pool_size);
+    goto done;
+
+refuse:
+    priv_report_refused(err);
+    respond_error(fd, err);
+done:
+    request_clear(&request);
+    free(line);
+}
+
+/* One listening socket: created, made `0660 root:<group>`, and left listening.
+ * The file mode is the first gate (who may even `connect()`, which is what
+ * keeps a tenant uid out of the accept loop entirely); SO_PEERCRED stays the
+ * real one. `group` is the *worker's* gid for the business socket and root's
+ * for the health socket -- that difference is the whole point of the second
+ * listener. */
+static int bind_listener(const char *path, gid_t group) {
+    struct sockaddr_un addr;
+    int fd;
+
+    if (path == NULL || *path == '\0') {
+        priv_fail("a broker socket path is empty");
+    }
+    if (strlen(path) >= sizeof(addr.sun_path)) {
+        priv_fail("the broker socket path is too long (max %zu bytes): %s",
+                  sizeof(addr.sun_path) - 1, path);
+    }
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        priv_fail("socket() for %s failed: %s", path, strerror(errno));
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    /* What a previous incarnation left behind; without this, every restart
+     * would fail with EADDRINUSE forever. */
+    if (unlink(path) != 0 && errno != ENOENT) {
+        priv_fail("cannot remove the stale socket %s: %s", path,
+                  strerror(errno));
+    }
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        priv_fail("bind %s failed: %s", path, strerror(errno));
+    }
+    if (chmod(path, 0660) != 0) {
+        priv_fail("chmod %s failed: %s", path, strerror(errno));
+    }
+    if (chown(path, 0, group) != 0) {
+        priv_fail("chown %s to 0:%ld failed: %s", path, (long)group,
+                  strerror(errno));
+    }
+    if (listen(fd, 16) != 0) {
+        priv_fail("listen %s failed: %s", path, strerror(errno));
+    }
+    return fd;
+}
+
 /* The daemon: one root process per node. A handler per connection, and the
  * handler forks the grandchild that execs this same image, so the accepted fd
  * (and with it SO_PEERCRED) stays in a process that never becomes a sandbox
  * uid. */
-static int serve(const char *socket_path) {
-    struct sockaddr_un addr;
+static int serve(const char *socket_path, const char *health_path) {
     char exe[PATH_MAX];
     char err[PRIV_ERR_LEN];
     long peer_uid, peer_gid, pool_start, pool_size;
     long read_ms = PRIV_DEFAULT_REQUEST_READ_MS;
-    long conn_uid, conn_gid;
     int live_handlers = 0;
+    int health_fd = -1;
     int fd;
 
     if (socket_path == NULL || *socket_path == '\0') {
@@ -1549,14 +1839,20 @@ static int serve(const char *socket_path) {
     if (request_read_ms(&read_ms, err, sizeof(err)) != 0) {
         priv_fail("invalid request read deadline: %s", err);
     }
+    /* A second socket is optional, but it may never *be* the first one: two
+     * listeners on one path would mean the health contract silently replaces
+     * the peer-gated one (or the reverse), which is exactly the confusion this
+     * socket exists to remove. Checked before anything is created. */
+    if (health_path != NULL && *health_path != '\0' &&
+        strcmp(health_path, socket_path) == 0) {
+        priv_fail(
+            "the health socket and the broker socket are the same path: %s",
+            health_path);
+    }
     (void)peer_uid;
     (void)read_ms;
     (void)pool_start;
     (void)pool_size;
-    if (strlen(socket_path) >= sizeof(addr.sun_path)) {
-        priv_fail("the broker socket path is too long (max %zu bytes): %s",
-                  sizeof(addr.sun_path) - 1, socket_path);
-    }
     /* Fail closed at startup: a broker that is not the installed one is a
      * deployment defect (a copy of the binary with the file capability, in a
      * sandbox-reachable place) and must be named, never served from. The path
@@ -1572,40 +1868,27 @@ static int serve(const char *socket_path) {
             "image is %s: not serving from a copy",
             PRIV_DEFAULT_MAINT_BIN, exe);
     }
-    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
-        priv_fail("socket() failed: %s", strerror(errno));
-    }
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
-    /* What a previous incarnation left behind; without this, every restart
-     * would fail with EADDRINUSE forever. */
-    if (unlink(socket_path) != 0 && errno != ENOENT) {
-        priv_fail("cannot remove the stale socket %s: %s", socket_path,
-                  strerror(errno));
-    }
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        priv_fail("bind %s failed: %s", socket_path, strerror(errno));
-    }
-    /* Owner + peer group only (root:<worker gid>, the same pair the broker
-     * directory uses): a pool uid cannot even `connect()`, which is the point
-     * of a gate that must not be reachable by a tenant. SO_PEERCRED stays the
-     * real check; this is the layer that keeps unauthorized traffic out of the
-     * accept loop entirely. */
-    if (chmod(socket_path, 0660) != 0) {
-        priv_fail("chmod %s failed: %s", socket_path, strerror(errno));
-    }
-    if (chown(socket_path, 0, (gid_t)peer_gid) != 0) {
-        priv_fail("chown %s to 0:%ld failed: %s", socket_path, peer_gid,
-                  strerror(errno));
-    }
-    if (listen(fd, 16) != 0) {
-        priv_fail("listen %s failed: %s", socket_path, strerror(errno));
+    /* The business socket: `0660 root:<worker gid>`, the same pair the broker
+     * directory uses -- a pool uid cannot even `connect()` to it. */
+    fd = bind_listener(socket_path, (gid_t)peer_gid);
+    if (health_path != NULL && *health_path != '\0') {
+        /* A4: `0660 root:root`. Only root may connect -- the container's own
+         * probe -- and the worker (uid/gid 65534) cannot, even though the
+         * directory it sits in (`0710 root:<worker gid>`) is traversable: the
+         * socket's own mode and group are root's, on purpose. */
+        health_fd = bind_listener(health_path, 0);
     }
     fprintf(stderr, "%s: serving on %s\n", priv_progname(), socket_path);
+    if (health_fd >= 0) {
+        fprintf(stderr, "%s: health on %s\n", priv_progname(), health_path);
+    }
     for (;;) {
+        struct pollfd waiters[2];
+        int nfds = 0;
+        int ready;
+        int index;
         int conn;
+        int is_health;
         pid_t pid;
         while (waitpid(-1, NULL, WNOHANG) > 0) {
             /* Reap finished handlers: a node broker is long-lived, and a
@@ -1614,54 +1897,97 @@ static int serve(const char *socket_path) {
                 live_handlers--;
             }
         }
-        conn = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
-        if (conn < 0) {
+        /* Both listeners, one loop: the health socket must not be able to
+         * starve the business one (or the other way round), so the daemon
+         * waits on the pair instead of blocking in accept() on either. */
+        waiters[nfds].fd = fd;
+        waiters[nfds].events = POLLIN;
+        waiters[nfds].revents = 0;
+        nfds++;
+        if (health_fd >= 0) {
+            waiters[nfds].fd = health_fd;
+            waiters[nfds].events = POLLIN;
+            waiters[nfds].revents = 0;
+            nfds++;
+        }
+        ready = poll(waiters, (nfds_t)nfds, -1);
+        if (ready < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            priv_fail("accept() on %s failed: %s", socket_path, strerror(errno));
+            priv_fail("poll() on the broker sockets failed: %s",
+                      strerror(errno));
         }
-        /* The gate runs here, in the daemon, *before* fork(): an unauthorized
-         * local uid must not be able to make the root broker fork at all, and
-         * reading the credential needs no child. */
-        /* The daemon gate keeps the identities to itself: the handler reads
-         * SO_PEERCRED again from the fd it inherited (the same answer, fixed
-         * at connect time) and is the one that passes them to the exec'd
-         * child. */
-        if (peer_gate(conn, &conn_uid, &conn_gid, err, sizeof(err)) != 0) {
-            priv_report_refused(err);
-            refuse_connection(conn, err);
-            continue;
+        for (index = 0; index < nfds; index++) {
+            long conn_uid, conn_gid;
+            if (waiters[index].revents == 0) {
+                continue;
+            }
+            is_health = index == 1;
+            conn = accept4(waiters[index].fd, NULL, NULL, SOCK_CLOEXEC);
+            if (conn < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                priv_fail("accept() on %s failed: %s",
+                          is_health ? health_path : socket_path,
+                          strerror(errno));
+            }
+            /* Both gates run here, in the daemon, *before* fork(): an
+             * unauthorized local uid must not be able to make the root broker
+             * fork at all, and reading the credential needs no child. */
+            /* The daemon gate keeps the identities to itself: the handler reads
+             * SO_PEERCRED again from the fd it inherited (the same answer,
+             * fixed at connect time) and is the one that passes them to the
+             * exec'd child. */
+            if (is_health) {
+                if (health_gate(conn, &conn_uid, &conn_gid, err, sizeof(err)) !=
+                    0) {
+                    priv_report_refused(err);
+                    refuse_connection(conn, err);
+                    continue;
+                }
+            } else if (peer_gate(conn, &conn_uid, &conn_gid, err,
+                                 sizeof(err)) != 0) {
+                priv_report_refused(err);
+                refuse_connection(conn, err);
+                continue;
+            }
+            if (live_handlers >= PRIV_MAX_HANDLERS) {
+                snprintf(err, sizeof(err),
+                         "the broker is already serving %d requests",
+                         PRIV_MAX_HANDLERS);
+                priv_report_refused(err);
+                refuse_connection(conn, err);
+                continue;
+            }
+            pid = fork();
+            if (pid < 0) {
+                /* EAGAIN/ENOMEM: refuse *this* connection. A fork failure is
+                 * not a reason to take the node's broker -- and with it every
+                 * other caller -- down. */
+                snprintf(err, sizeof(err),
+                         "cannot fork a handler for the connection: %s",
+                         strerror(errno));
+                priv_report_refused(err);
+                refuse_connection(conn, err);
+                continue;
+            }
+            if (pid == 0) {
+                close(fd);
+                if (health_fd >= 0) {
+                    close(health_fd);
+                }
+                if (is_health) {
+                    handle_health_connection(conn, conn_uid, conn_gid);
+                } else {
+                    handle_connection(conn);
+                }
+                _exit(PRIV_EXIT_OK);
+            }
+            live_handlers++;
+            close(conn);
         }
-        (void)conn_uid;
-        (void)conn_gid;
-        if (live_handlers >= PRIV_MAX_HANDLERS) {
-            snprintf(err, sizeof(err),
-                     "the broker is already serving %d requests",
-                     PRIV_MAX_HANDLERS);
-            priv_report_refused(err);
-            refuse_connection(conn, err);
-            continue;
-        }
-        pid = fork();
-        if (pid < 0) {
-            /* EAGAIN/ENOMEM: refuse *this* connection. A fork failure is not a
-             * reason to take the node's broker -- and with it every other
-             * caller -- down. */
-            snprintf(err, sizeof(err),
-                     "cannot fork a handler for the connection: %s",
-                     strerror(errno));
-            priv_report_refused(err);
-            refuse_connection(conn, err);
-            continue;
-        }
-        if (pid == 0) {
-            close(fd);
-            handle_connection(conn);
-            _exit(PRIV_EXIT_OK);
-        }
-        live_handlers++;
-        close(conn);
     }
 }
 
@@ -1740,7 +2066,10 @@ int main(int argc, char **argv) {
     /* serve/ping take their own (socket-shaped) arguments; the maintenance
      * verbs' flag parser below has no meaning for either. */
     if (strcmp(verb, "serve") == 0) {
-        return serve(socket_from_args(argc, argv, 2));
+        const char *socket_path;
+        const char *health_path;
+        serve_options_from_argv(argc, argv, 2, &socket_path, &health_path);
+        return serve(socket_path, health_path);
     }
     if (strcmp(verb, "ping") == 0) {
         return ping(socket_from_args(argc, argv, 2));
