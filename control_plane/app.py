@@ -27,6 +27,7 @@ from control_plane.api.templates import router as templates_router
 from control_plane.api.volumes import router as volumes_router
 from control_plane.config import Settings, local_node_quota_via_agent
 from control_plane.metrics import SlidingWindowCounter
+from control_plane.node_address import build_node_address_resolver
 from control_plane.queue import CreateQueue
 from control_plane.registry.manager import SandboxRegistry
 from control_plane.registry.ledger_alert import (
@@ -213,6 +214,7 @@ def create_app(
     snapshots_registry=None,
     nodes_registry=None,
     templates_registry=None,
+    node_address_resolver=None,
 ) -> FastAPI:
     settings = settings or Settings()
     redis_client = None
@@ -532,6 +534,13 @@ def create_app(
     app.state.nodes = nodes_registry or NodeRegistry(
         redis_client=redis_client,
         heartbeat_timeout=settings.node_heartbeat_timeout_s,
+    )
+    # C3 Task 2 / D4: where the internal API's *expected* node address and
+    # source IP come from. Injected by tests and embedders; otherwise built from
+    # ``E2B_NODE_ADDRESS_MODE`` (k8s pod API, or compose hostname resolution).
+    # Never learned from the request being validated (N49).
+    app.state.node_address_resolver = (
+        node_address_resolver or build_node_address_resolver(settings)
     )
     app.state.recent_failures = SlidingWindowCounter()
     app.state.templates = templates_registry or TemplateRegistry(

@@ -310,6 +310,32 @@ class Settings:
     internal_api_keys: tuple[str, ...] = field(
         default_factory=lambda: _env_list("E2B_INTERNAL_API_KEYS", ())
     )
+    # C3 Task 2 / N49: the near-term per-node credential (design §11.1 item 9
+    # option (a)). A JSON object ``{"<key>": "<node_id>"}``; a key listed here
+    # is *node-bound* -- the node-scoped internal handlers require the request's
+    # self-declared node to equal this mapping and enforce the source-IP second
+    # factor against the resolver. Keys absent from this map (including the
+    # shared ``E2B_INTERNAL_API_KEY``) remain fleet credentials: they keep the
+    # pre-C3 behavior and log an explicit degradation once (see
+    # ``control_plane/api/internal.py``). Empty by default so an existing
+    # deployment is untouched until it opts in.
+    internal_node_keys: dict[str, str] = field(
+        default_factory=lambda: _env_json_dict("E2B_INTERNAL_NODE_KEYS")
+    )
+    # C3 Task 2 / D4: where the *expected* node address and source IP come from.
+    # ``k8s`` queries the pod API by node id (StatefulSet pod name) with the
+    # mounted ServiceAccount; ``hostname`` resolves the node id as a compose
+    # service name; ``auto`` picks k8s when a ServiceAccount is mounted and
+    # hostname otherwise. Never learned from the request (N49).
+    node_address_mode: str = field(
+        default_factory=lambda: os.getenv("E2B_NODE_ADDRESS_MODE", "auto")
+    )
+    node_address_port: int = field(
+        default_factory=lambda: _env_int("E2B_NODE_ADDRESS_PORT", 49983)
+    )
+    node_address_namespace: str = field(
+        default_factory=lambda: os.getenv("E2B_NODE_ADDRESS_NAMESPACE", "sandlock")
+    )
     # E5.4: secret-at-rest encryption. When E2B_SECRET_MASTER_KEY is unset
     # the secret registry degrades to the previous in-memory + plaintext
     # disk behavior with a startup warning and is never persisted to Redis.
@@ -419,10 +445,18 @@ class Settings:
 
     @property
     def all_internal_api_keys(self) -> tuple[str, ...]:
-        """Active X-Internal-Key credentials (list first, single fallback)."""
+        """Active X-Internal-Key credentials (list first, single fallback).
+
+        C3 Task 2: the per-node keys (``E2B_INTERNAL_NODE_KEYS``) authenticate
+        ``X-Internal-Key`` like every other internal credential -- they are the
+        same mechanism, only *additionally* bound to a node (see
+        ``control_plane.auth.node_id_for_key``). Leaving them out here would
+        make a node-bound worker 401 before the binding was ever consulted.
+        """
         keys = list(self.internal_api_keys)
         if self.internal_api_key:
             keys.append(self.internal_api_key)
+        keys.extend(self.internal_node_keys)
         return tuple(dict.fromkeys(keys))
 
     @property

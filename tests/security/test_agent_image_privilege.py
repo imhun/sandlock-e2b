@@ -12,8 +12,10 @@ Linux kernel with user namespaces, so it builds and runs
     docker run --rm -v "$PWD:/w" -w /w e2b-sandlock-test:latest \\
         sh -c 'python3 -m pytest tests/security/test_agent_image_privilege.py -q'
 
-The image is built from a minimal context (only ``deploy/priv/`` and the
-Dockerfile: the image itself needs nothing else), and the grant runs against a
+The image is built from a minimal context (``deploy/priv/`` for the two
+binaries, the Dockerfile, and -- since Task 2 -- the ``deploy.c3_agent`` package
+the CMD runs plus its one ``gateway_common.env`` reader; the image needs nothing
+else), and the grant runs against a
 second container started from that same image with ``--pid=container:`` -- the
 worker-side half of the production topology, where the agent sees the worker's
 pids and the worker has no capability at all. The target it forks
@@ -147,9 +149,11 @@ def _run(*args: str, timeout: float | None = 600) -> subprocess.CompletedProcess
 def agent_image(tmp_path_factory: pytest.TempPathFactory) -> str:
     """``deploy/docker/Dockerfile.agent`` built from a minimal context.
 
-    The context carries ``deploy/priv/`` (the Dockerfile compiles from it) and
-    nothing else -- the image deliberately does not consume the repo, and a
-    context that did would hide a missing COPY behind a stray file.
+    The context carries exactly what the Dockerfile copies: ``deploy/priv/``
+    (the two binaries it compiles), the ``deploy.c3_agent`` package the CMD runs
+    (Task 2's control-plane channel), the ``deploy`` package marker, and the
+    single ``gateway_common.env`` reader it imports -- and nothing else, so a
+    context that grew would hide a missing COPY behind a stray file.
     """
     context = tmp_path_factory.mktemp("c3-agent-context")
     shutil.copy2(
@@ -158,6 +162,15 @@ def agent_image(tmp_path_factory: pytest.TempPathFactory) -> str:
     )
     shutil.copytree(
         PROJECT_ROOT / "deploy" / "priv", context / "deploy" / "priv"
+    )
+    shutil.copy2(
+        PROJECT_ROOT / "deploy" / "__init__.py", context / "deploy" / "__init__.py"
+    )
+    shutil.copytree(
+        PROJECT_ROOT / "deploy" / "c3_agent", context / "deploy" / "c3_agent"
+    )
+    shutil.copytree(
+        PROJECT_ROOT / "gateway_common", context / "gateway_common"
     )
     built = _run("docker", "build", "-t", AGENT_IMAGE, str(context))
     assert built.returncode == 0, f"{built.stdout}\n{built.stderr}"

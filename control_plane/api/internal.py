@@ -1,4 +1,38 @@
-"""Internal APIs used by worker agents and the envd gateway."""
+"""Internal APIs used by worker agents and the envd gateway.
+
+C3 Task 2 / N49 closes the "self-declared node" hole here. ``X-Internal-Key``
+used to be a fleet-wide bearer credential and the node identity came from the
+URL/body, so any component holding the key could speak for any node -- and C3
+turns that into privilege amplification (the control plane then instructs the
+privileged agent). Every handler is now in exactly one of two named classes:
+
+**Node-scoped** (a worker speaks for *itself*; the credential must be bound to
+the node it claims, the object must be the control plane's own record for that
+node, and the request must come from the node's expected address):
+
+* ``POST /internal/nodes/register`` -- claim is ``body["nodeID"]``
+* ``POST /internal/nodes/{node_id}/heartbeat``
+* ``GET  /internal/nodes/{node_id}/sandboxes``
+* ``POST /internal/nodes/{node_id}/reconcile``
+
+**Fleet/ops scope** (the caller is not a node and has no node identity to bind:
+the autoscaler, the envd gateway, or an operator). These keep the shared key
+and are *explicitly* exempt, by name -- see :func:`_require_fleet_key`:
+
+* ``GET  /internal/routes/{sandbox_id}`` (gateway route lookup)
+* ``GET  /internal/nodes``, ``GET /internal/fleet/metrics`` (autoscaler/ops)
+* ``POST /internal/nodes/{node_id}/drain|undrain`` (operator action *on* a node)
+* ``GET  /internal/tenants`` (ops reconciliation)
+
+The three-step validation itself lives in :func:`_require_node_identity`: ①
+credential → node (``control_plane.auth.node_id_for_key``); ② the request's
+claim must equal it; ③ the objects are the control plane's own records, scoped
+by that node (done by the registry calls the handler already makes); plus the
+source-IP second factor, whose expected value comes from a resolver -- never
+from the request. A node-bound request whose expected address cannot be
+determined **fails closed, named**. A key bound to no node is a named
+degradation, logged once, so the exemption is greppable rather than invisible.
+"""
 
 from __future__ import annotations
 
@@ -10,24 +44,159 @@ from typing import Any
 from fastapi import APIRouter, Header, Request, Response
 
 from control_plane.api.errors import OfficialError
-from control_plane.auth import verify_internal_key
+from control_plane.auth import node_id_for_key, verify_internal_key
+from control_plane.node_address import NodeEndpoint
 from gateway_common.paths import validate_sandbox_id
 
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
+#: Fleet keys already reported as unbound, so the degradation is named once per
+#: key rather than on every 5-second heartbeat.
+_fleet_keys_reported: set[str] = set()
 
-def _require_internal_key(request: Request) -> None:
+
+def _require_internal_key(request: Request) -> str:
+    """The credential half: a valid ``X-Internal-Key``, else 401."""
     settings = request.app.state.settings
-    if not verify_internal_key(
-        request.headers.get("X-Internal-Key"), settings
-    ):
+    key = request.headers.get("X-Internal-Key")
+    if not verify_internal_key(key, settings):
         raise OfficialError(401, "Unauthorized")
+    return key or ""
+
+
+def _require_fleet_key(request: Request) -> None:
+    """Editorial name for the *non-node-scoped* surfaces (see module docstring).
+
+    The autoscaler, the gateway and an operator are not nodes: they have no node
+    identity to bind, so these endpoints authenticate with the shared key and
+    are exempt from the node identity/IP checks **by name** -- called out here
+    and in the module docstring, never silently. Any valid internal credential
+    is accepted (a node-bound key included: it is a valid internal key), because
+    the surface acts for no node and so has nothing to bind an identity to.
+    """
+    _require_internal_key(request)
+
+
+def _resolve_node(request: Request, node_id: str | None) -> NodeEndpoint | None:
+    """The expected endpoint for ``node_id``, or ``None`` when unknown.
+
+    ``None`` is never a guess and never the observed peer address (D4): callers
+    either fail closed (node-bound) or name the degradation (fleet key).
+    """
+    resolver = getattr(request.app.state, "node_address_resolver", None)
+    if resolver is None or node_id is None:
+        return None
+    return resolver.resolve(node_id)
+
+
+def _address_enforcement_configured(settings) -> bool:
+    """True when the deployment **opted in** to an address mode explicitly.
+
+    ``auto`` keeps the pre-C3 behavior for *unbound* keys (see
+    :func:`_require_node_identity`): the harness and every combined/local lane
+    run with no resolvable node names, and a wildcard DNS search domain would
+    otherwise turn a fleet-key heartbeat into a false 403. An explicit
+    ``E2B_NODE_ADDRESS_MODE=k8s|hostname`` is the operator saying "the expected
+    addresses are real here", so a fleet key then gets the same second factor a
+    node-bound key always gets.
+    """
+    mode = (getattr(settings, "node_address_mode", "auto") or "auto").strip().lower()
+    return mode in ("k8s", "hostname")
+
+
+def _enforce_source_ip(request: Request, node_id: str, endpoint: NodeEndpoint) -> None:
+    """Second factor: the request must arrive from the node's own address.
+
+    This is the layer that defends against a *stolen* key (the credential layer
+    only defends against no key at all, §11.1 item 9). The refusal names both
+    the observed and the expected value so a binding drift ("this node suddenly
+    rejects everything") is visible in one line.
+    """
+    observed = request.client.host if request.client else None
+    if observed != endpoint.ip:
+        logger.warning(
+            "internal API: request for node %s came from %s, expected %s; "
+            "refusing (source-IP second factor)",
+            node_id,
+            observed,
+            endpoint.ip,
+        )
+        raise OfficialError(
+            403,
+            f"request for node {node_id} came from {observed}, expected {endpoint.ip}",
+        )
+
+
+def _require_node_identity(
+    request: Request, claimed_node_id: str | None
+) -> tuple[str | None, NodeEndpoint | None]:
+    """Steps ①② + the source-IP layer for a node-scoped handler.
+
+    Returns ``(node_id, endpoint)``: the node the request acts for (the
+    credential-derived one for a bound key) and its expected endpoint, or
+    ``(claim, None)`` for a fleet key whose address could not be resolved.
+    """
+    key = _require_internal_key(request)
+    settings = request.app.state.settings
+    derived = node_id_for_key(key, settings)
+    if derived is None:
+        # Step ① cannot bind this key to a node. Named, once per key: the
+        # request keeps the pre-C3 behavior (so local/combined and un-migrated
+        # lanes work), but "the N49 layers are off for this key" is greppable.
+        if key not in _fleet_keys_reported:
+            _fleet_keys_reported.add(key)
+            logger.warning(
+                "internal API: X-Internal-Key is a fleet key with no node binding "
+                "(E2B_INTERNAL_NODE_KEYS): the node-identity claim check is inactive "
+                "for node-scoped requests; bind keys to nodes to close N49",
+            )
+        endpoint = None
+        if _address_enforcement_configured(settings):
+            # An explicit mode means the deployment has real expected addresses:
+            # the key cannot vouch for *which* node this is, but the network
+            # position still can -- a resolvable claim must speak from it.
+            endpoint = _resolve_node(request, claimed_node_id)
+            if endpoint is not None:
+                _enforce_source_ip(request, claimed_node_id or "", endpoint)
+        return claimed_node_id, endpoint
+
+    if claimed_node_id is not None and claimed_node_id != derived:
+        logger.warning(
+            "internal API: X-Internal-Key is bound to node %s but the request "
+            "claims node %s; refusing",
+            derived,
+            claimed_node_id,
+        )
+        raise OfficialError(
+            403,
+            f"X-Internal-Key is bound to node {derived}; "
+            f"request claims node {claimed_node_id}",
+        )
+    endpoint = _resolve_node(request, derived)
+    if endpoint is None:
+        # Fail closed: "I cannot determine where this node is" must never mean
+        # "so allow it". The line below is the alarm for a fleet-wide,
+        # self-inflicted refusal (the pod API / DNS is down).
+        logger.warning(
+            "internal API: cannot determine the expected address for node %s; "
+            "refusing (fail closed)",
+            derived,
+        )
+        raise OfficialError(
+            503, f"cannot determine the expected address for node {derived}"
+        )
+    _enforce_source_ip(request, derived, endpoint)
+    return derived, endpoint
 
 
 @router.post("/internal/nodes/register")
 async def register_node(request: Request) -> dict[str, Any]:
+    # The credential first (401 before any body error), then the claim in the
+    # body: for a node-bound key the node id comes from the credential, not the
+    # request (steps ①②), and the address the control plane dials is the
+    # resolver's, never ``body["address"]`` (N49 / D4).
     _require_internal_key(request)
     try:
         body = await request.json()
@@ -35,9 +204,21 @@ async def register_node(request: Request) -> dict[str, Any]:
         raise OfficialError(400, "Invalid JSON body")
     if not isinstance(body, dict):
         raise OfficialError(400, "Request body must be a JSON object")
+    node_id, endpoint = _require_node_identity(request, body.get("nodeID"))
+    address = body.get("address")
+    if endpoint is not None:
+        if address and address != endpoint.address:
+            logger.warning(
+                "internal API: node %s registered the address %s but the "
+                "resolver expects %s; using the resolver's",
+                node_id,
+                address,
+                endpoint.address,
+            )
+        address = endpoint.address
     record = request.app.state.nodes.register(
-        node_id=body.get("nodeID"),
-        address=body.get("address"),
+        node_id=node_id,
+        address=address,
         total_memory_mb=int(body.get("totalMemoryMB", 0)),
         total_cpu_percent=int(body.get("totalCPUPercent", 0)),
         total_disk_mb=int(body.get("totalDiskMB", 0)),
@@ -79,7 +260,7 @@ def _rebuild_node_reservations(request: Request, record) -> None:
 
 @router.post("/internal/nodes/{node_id}/heartbeat")
 async def node_heartbeat(node_id: str, request: Request) -> Response:
-    _require_internal_key(request)
+    _require_node_identity(request, node_id)
     body: dict[str, Any] = {}
     raw = await request.body()
     if raw:
@@ -163,7 +344,7 @@ async def node_sandboxes(node_id: str, request: Request) -> dict[str, Any]:
     removes records that existed when the snapshot was taken (a record
     created after the snapshot is a concurrent create and must survive).
     """
-    _require_internal_key(request)
+    _require_node_identity(request, node_id)
     records = request.app.state.registry.list_by_node(node_id)
     return {"nodeID": node_id, "sandboxIDs": [r.sandbox_id for r in records]}
 
@@ -180,7 +361,7 @@ async def node_reconcile(node_id: str, request: Request) -> dict[str, Any]:
     records created after the snapshot (concurrent creates) are kept. The
     result mirrors :meth:`SandboxRegistry.recover_node`.
     """
-    _require_internal_key(request)
+    _require_node_identity(request, node_id)
     try:
         body = await request.json()
     except json.JSONDecodeError:
@@ -209,7 +390,7 @@ async def node_reconcile(node_id: str, request: Request) -> dict[str, Any]:
 
 @router.get("/internal/routes/{sandbox_id}")
 async def get_route(sandbox_id: str, request: Request) -> dict[str, Any]:
-    _require_internal_key(request)
+    _require_fleet_key(request)
     registry = request.app.state.registry
     try:
         record = registry.get(sandbox_id)
@@ -225,13 +406,13 @@ async def get_route(sandbox_id: str, request: Request) -> dict[str, Any]:
 
 @router.get("/internal/nodes")
 async def list_nodes_internal(request: Request) -> list[dict[str, Any]]:
-    _require_internal_key(request)
+    _require_fleet_key(request)
     return [n.to_dict() for n in request.app.state.nodes.list()]
 
 
 @router.post("/internal/nodes/{node_id}/drain")
 async def drain_node(node_id: str, request: Request) -> dict[str, Any]:
-    _require_internal_key(request)
+    _require_fleet_key(request)
     nodes = request.app.state.nodes
     record = nodes.set_draining(node_id, True)
     if record is None:
@@ -246,7 +427,7 @@ async def drain_node(node_id: str, request: Request) -> dict[str, Any]:
 
 @router.post("/internal/nodes/{node_id}/undrain")
 async def undrain_node(node_id: str, request: Request) -> Response:
-    _require_internal_key(request)
+    _require_fleet_key(request)
     record = request.app.state.nodes.set_draining(node_id, False)
     if record is None:
         raise OfficialError(404, f"Node {node_id} not found")
@@ -260,7 +441,7 @@ async def fleet_metrics(request: Request) -> dict[str, Any]:
     Returns per-node utilization/active sandboxes, fleet aggregates, the
     remaining standard-sandbox capacity, and the recent 503 error count.
     """
-    _require_internal_key(request)
+    _require_fleet_key(request)
     settings = request.app.state.settings
     nodes = request.app.state.nodes.list()
     registry = request.app.state.registry
@@ -387,7 +568,7 @@ async def internal_tenants(request: Request) -> dict[str, Any]:
     ``unowned`` usage (tenant_id None) is included when present so operators
     can detect resources that still need the migration script.
     """
-    _require_internal_key(request)
+    _require_fleet_key(request)
     settings = request.app.state.settings
     usage = request.app.state.registry.tenant_usage()
     tenant_ids = (
