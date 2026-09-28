@@ -181,6 +181,17 @@ def _spawn_slot(
     setpriv = shutil.which("setpriv")
     if setpriv is None:
         raise RuntimeError("route-B slot spawn needs util-linux setpriv")
+    supervise, fd_list = _supervise_argv(
+        supervise_bin,
+        uid=uid,
+        policy_path=policy_path,
+        program_path=program_path,
+        name=name,
+        token=token,
+        worker_uid=worker_uid,
+        control_fd=control_fd,
+        events_fd=events_fd,
+    )
     argv = [
         setpriv,
         "--reuid",
@@ -189,6 +200,47 @@ def _spawn_slot(
         str(uid),
         "--clear-groups",
         "--",
+        *supervise,
+    ]
+    if fd_list:
+        return subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            env=env,
+            # pass_fds clears CLOEXEC on exactly this descriptor and keeps the
+            # same number in the child, which is what --control-fd names.
+            pass_fds=tuple(fd_list),
+        )
+    return subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=stdout,
+        stderr=stderr,
+        env=env,
+    )
+
+
+def _supervise_argv(
+    supervise_bin: Path,
+    *,
+    uid: int,
+    policy_path: Path,
+    program_path: Path,
+    name: str,
+    token: str,
+    worker_uid: int,
+    control_fd: int | None,
+    events_fd: int | None,
+) -> tuple[list[str], list[int]]:
+    """``sandlock-supervise``'s own argv, and the descriptors it must inherit.
+
+    One builder for both starters: the ``setpriv`` form (:func:`_spawn_slot`)
+    and C3's unprivileged form (:func:`_spawn_slot_identity`) differ in *who*
+    performs the identity change, never in what the slot is told.
+    """
+    argv = [
         str(supervise_bin),
         "--policy",
         str(policy_path),
@@ -215,16 +267,7 @@ def _spawn_slot(
             "--program",
             str(program_path),
         ]
-        return subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout,
-            stderr=stderr,
-            env=env,
-            # pass_fds clears CLOEXEC on exactly this descriptor and keeps the
-            # same number in the child, which is what --control-fd names.
-            pass_fds=tuple(fd_list),
-        )
+        return argv, fd_list
     # transport 2: for a slot this pool did not start (an external W1 fleet
     # reached through an injected spawner + channel factory).
     argv += [
@@ -237,12 +280,56 @@ def _spawn_slot(
         "--program",
         str(program_path),
     ]
+    return argv, []
+
+
+def _spawn_slot_identity(
+    supervise_bin: Path,
+    uid: int,
+    policy_path: Path,
+    program_path: Path,
+    name: str,
+    token: str,
+    worker_uid: int,
+    stdout,
+    stderr,
+    control_fd: int | None = None,
+    events_fd: int | None = None,
+) -> subprocess.Popen:
+    """The C3 starter: fork a child that unshares and waits for its identity.
+
+    No root, no ``setpriv``, no file-capability broker. The child
+    (:mod:`envd_service.slot_identity`) unshares a user namespace and polls
+    ``setresuid(X)``; the pool reports its container pid to the control plane,
+    which instructs agent face A to write the map. The child is the one that
+    execs ``sandlock-supervise`` -- so the process tree, the cgroup and the
+    session stay the worker's (hard rule 1).
+    """
+    from envd_service.slot_identity import child_argv
+
+    env = dict(os.environ)
+    # Same reason as the setpriv form: the registry-root formula must not follow
+    # an inherited test override.
+    env.pop("SANDBOX_CTL_ROOT", None)
+    supervise, fd_list = _supervise_argv(
+        supervise_bin,
+        uid=uid,
+        policy_path=policy_path,
+        program_path=program_path,
+        name=name,
+        token=token,
+        worker_uid=worker_uid,
+        control_fd=control_fd,
+        events_fd=events_fd,
+    )
+    argv = child_argv(uid=uid, supervise_argv=supervise)
     return subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
         stdout=stdout,
         stderr=stderr,
         env=env,
+        pass_fds=tuple(fd_list),
     )
 
 
@@ -413,12 +500,28 @@ class W1SlotPool:
         socket_timeout_s: float = 30.0,
         transport: str = "fd",
         verb_timeout_s: float = 15.0,
+        slot_identity: str = "spawn",
+        identity_reporter: Callable[[str, int], object] | None = None,
     ) -> None:
         if transport not in ("fd", "path"):
             raise ValueError(
                 "route-B transport must be 'fd' (handoff, the default: no "
                 "registry path and no token in the slot's argv) or 'path' "
                 "(a registered slot an external fleet started)"
+            )
+        if slot_identity not in ("spawn", "agent-grant"):
+            raise ValueError(
+                "route-B slot identity must be 'spawn' (the worker starts the "
+                "slot at uid X itself) or 'agent-grant' (C3: the child "
+                "unshares and the per-node agent writes its identity)"
+            )
+        if slot_identity == "agent-grant" and identity_reporter is None:
+            # A child whose identity nobody reports would poll setresuid until
+            # its own deadline and then die. Refusing here names the wiring
+            # mistake at construction time instead of at the first create.
+            raise ValueError(
+                "route-B slot identity 'agent-grant' needs a reporter "
+                "(envd_service.worker_identity.build_identity_reporter)"
             )
         if size < 1:
             raise ValueError("route-B slot pool size must be >= 1")
@@ -427,14 +530,24 @@ class W1SlotPool:
         self._tmp_root = tmp_root or Path("/tmp/sandlock-route-b")
         self._tmp_root.mkdir(parents=True, exist_ok=True)
         self._supervise_bin = supervise_bin or default_supervise_bin()
-        self._spawner = spawner or (
-            lambda **kw: _spawn_slot(
+        if spawner is not None:
+            self._spawner = spawner
+        elif slot_identity == "agent-grant":
+            self._spawner = lambda **kw: _spawn_slot_identity(
                 self._supervise_bin,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 **kw,
             )
-        )
+        else:
+            self._spawner = lambda **kw: _spawn_slot(
+                self._supervise_bin,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                **kw,
+            )
+        self.slot_identity = slot_identity
+        self._identity_reporter = identity_reporter
         self.transport = transport
         self.verb_timeout_s = verb_timeout_s
         self.channel_factory = channel_factory or default_channel_factory
@@ -609,6 +722,29 @@ class W1SlotPool:
             # the pipe (and wedge the slot) while the generation is still
             # coming up, which is exactly when this waits.
             stderr_drain = SlotStderrDrain(process)
+            if self._identity_reporter is not None:
+                # C3 Task 3 (ruling D9.1): report the child, then keep going --
+                # nothing "releases" it, it polls setresuid itself. The report
+                # goes out before the readiness wait below, because that wait is
+                # for a child that cannot come up until this grant lands.
+                try:
+                    self._identity_reporter(sandbox_id, process.pid)
+                except BaseException:
+                    # Fail closed, and leave nothing behind: a child nobody will
+                    # ever grant would otherwise poll until its own deadline.
+                    logger.error(
+                        "route-B slot %s: the slot-identity report for sandbox "
+                        "%s (pid %s) failed; killing the child",
+                        slot_name,
+                        sandbox_id,
+                        process.pid,
+                        exc_info=True,
+                    )
+                    try:
+                        process.kill()
+                    except OSError:  # pragma: no cover - already gone
+                        pass
+                    raise
             handle = SlotHandle(
                 sandbox_id=sandbox_id,
                 uid=uid,
@@ -1694,6 +1830,10 @@ def slot_pool_for(
         str(config.tmp_root),
         config.transport,
         float(config.verb_timeout_s),
+        # Two fleets with different identity modes are different shapes: one
+        # starts privileged children, the other unprivileged ones that wait for
+        # a grant. They must never share a ledger.
+        config.slot_identity,
     )
     pool = _POOLS.get(key)
     if pool is None:
@@ -1706,6 +1846,8 @@ def slot_pool_for(
             supervise_bin=supervise_bin,
             transport=config.transport,
             verb_timeout_s=config.verb_timeout_s,
+            slot_identity=config.slot_identity,
+            identity_reporter=config.identity_reporter,
         )
         _POOLS[key] = pool
     return pool
@@ -1734,6 +1876,17 @@ class RouteBConfig:
     transport: str = "fd"
     #: Per-verb response deadline on the slot channel (seconds).
     verb_timeout_s: float = 15.0
+    #: C3 Task 3: how a slot gets its identity. ``spawn`` (default, and the
+    #: fallback until Task 4/7) is the privileged starter above -- the worker (or
+    #: its broker) performs the ``setuid``. ``agent-grant`` is the C3 path: the
+    #: child unshares, the worker reports its pid, and the per-node agent writes
+    #: the identity. Selected by ``E2B_SLOT_IDENTITY``.
+    slot_identity: str = "spawn"
+    #: The CP caller for ``agent-grant`` (``(sandbox_id, pid) -> answer``). It is
+    #: resolved from settings/environment in production
+    #: (``envd_service.worker_identity.build_identity_reporter``) and injected by
+    #: tests; ``agent-grant`` without one is refused by the pool.
+    identity_reporter: Callable[[str, int], object] | None = None
 
     @classmethod
     def from_settings(cls, settings) -> "RouteBConfig":
@@ -1751,8 +1904,19 @@ class RouteBConfig:
         and keeps the ``setpriv`` form in :func:`_spawn_slot`.
         """
         from envd_service import priv_helpers
+        from envd_service.worker_identity import build_identity_reporter
 
         helpers = priv_helpers.active_helpers()
+        raw_slot_identity = str(
+            getattr(settings, "slot_identity", None)
+            or os.getenv("E2B_SLOT_IDENTITY", "spawn")
+        ).strip().lower()
+        if raw_slot_identity not in ("spawn", "agent-grant"):
+            raise PrivHelperError(
+                "E2B_SLOT_IDENTITY must be 'spawn' or 'agent-grant' (got "
+                f"{raw_slot_identity!r})"
+            )
+        slot_identity = raw_slot_identity
         return cls(
             mode=str(getattr(settings, "route_b", "auto")).lower(),
             slots=int(getattr(settings, "route_b_slots", 0) or 0),
@@ -1761,16 +1925,35 @@ class RouteBConfig:
             tmp_root=Path(
                 getattr(settings, "route_b_tmp_root", "/tmp/sandlock-route-b")
             ),
-            spawner=helpers.slot_spawner if helpers is not None else None,
+            # Only the *spawn* path uses the broker: on ``agent-grant`` the
+            # starter is the unprivileged unshare-and-poll child, and handing
+            # the pool a broker spawner would quietly put the old privileged
+            # step back in front of the path C3 is replacing.
+            spawner=(
+                helpers.slot_spawner
+                if helpers is not None and slot_identity == "spawn"
+                else None
+            ),
             transport=str(getattr(settings, "route_b_transport", "fd")).lower(),
             verb_timeout_s=float(
                 getattr(settings, "route_b_verb_timeout_s", 15.0)
+            ),
+            slot_identity=slot_identity,
+            identity_reporter=(
+                build_identity_reporter(settings)
+                if slot_identity == "agent-grant"
+                else None
             ),
         )
 
     @property
     def privileged_starter(self) -> bool:
         """Can this worker start a slot at another uid?"""
+        if self.slot_identity == "agent-grant":
+            # Nobody here changes an identity: the child unshares and the agent
+            # writes the map. What the worker needs instead is a way to *report*
+            # the child -- without one the child would never be granted.
+            return self.identity_reporter is not None
         return self.spawner is not None or os.geteuid() == 0
 
 

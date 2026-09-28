@@ -43,6 +43,7 @@ from envd_service.uid_pool import (
     align_shared_uid_workspace,
     apply_sandbox_ownership,
 )
+from envd_service.worker_identity import worker_pid_namespace
 from envd_service.xfs_quota import (
     ProjectDirectoryGone,
     ProjectQuotaError,
@@ -176,7 +177,7 @@ def _register_payload(
     instead of relying on ``E2B_NODE_ID`` in the process environment; production
     leaves it ``None`` and reads the env, exactly as before.
     """
-    return {
+    payload = {
         "nodeID": node_id or os.getenv("E2B_NODE_ID"),
         "address": os.getenv("E2B_NODE_ADDRESS"),
         "images": [i for i in (settings.base_image,) if i],
@@ -185,6 +186,16 @@ def _register_payload(
         },
         **_node_resources(settings),
     }
+    # C3 Task 3 (ruling D9.3): the worker's own pid namespace identity. The
+    # control plane stores it and hands it to the agent, which is what makes the
+    # container-pid → host-pid lookup unambiguous when one host runs several
+    # workers. Absent on a platform without ``/proc/self/ns/pid`` (a macOS dev
+    # box): the control plane then refuses grants for this node by name instead
+    # of matching on the pid alone.
+    pid_namespace = worker_pid_namespace()
+    if pid_namespace:
+        payload["pidNamespace"] = pid_namespace
+    return payload
 
 
 def _disk_enforce_interval_s() -> float:
@@ -280,9 +291,17 @@ def _heartbeat_usage_payload(
     port_provider: Callable[[], dict[str, int]] | None = None,
     disk_report: dict[str, int] | None = None,
     platform_disk: dict[str, int] | None = None,
+    pid_namespace: str | None = None,
 ) -> dict[str, Any]:
     """Disk usage + quota alerts + MCP port band carried by each heartbeat."""
     payload: dict[str, Any] = {}
+    if pid_namespace:
+        # C3 Task 3: refreshed with every heartbeat, because a restarted worker
+        # container is a *new* pid namespace under the same node id -- without
+        # this the control plane would keep handing the agent the dead inode and
+        # every slot grant on this node would be refused until it was forgotten
+        # (the "node pinned" failure mode §11.1 item 9 warns about).
+        payload["pidNamespace"] = pid_namespace
     try:
         usage = shutil.disk_usage(settings.workspace_base)
         payload["diskUsedMB"] = usage.used // (1024 * 1024)
@@ -1731,6 +1750,7 @@ class NodeAgent:
                         self._port_provider,
                         self._disk_report_for_heartbeat(),
                         self._platform_disk_report,
+                        worker_pid_namespace(),
                     ),
                     headers=headers,
                 )

@@ -1085,6 +1085,84 @@ class PrivHelpers:
         )
 
 
+def request_identity(
+    pid: int,
+    sandbox_id: str,
+    *,
+    control_plane_url: str,
+    node_id: str,
+    internal_key: str,
+    timeout_s: float = 5.0,
+    transport=None,
+) -> dict:
+    """Report a slot child's ``{sandbox_id, pid}`` to the control plane.
+
+    C3 Task 3 (ruling D9.1): this is the worker's *whole* contribution to the
+    identity hand-off. The signature is the shape -- there is deliberately **no
+    uid here and no uid on the wire**: the worker names the sandbox and the pid
+    it sees, the control plane looks the uid up in its own records, and the
+    agent writes it. A worker that could name a uid would be an identity
+    authority, which is exactly what C3 removes.
+
+    It lives beside the broker client because that is where the worker's
+    privileged-adjacent plumbing already is, but it is *not* a broker call: the
+    only host it ever dials is the control plane's, and the only credential it
+    ever sends is the worker's own internal key. There is no worker↔agent
+    channel to reach from here (hard rule 5).
+
+    Raises :class:`PrivHelperError` -- named, fail-closed -- when the control
+    plane refuses the report or cannot be reached, so a slot that can never be
+    granted an identity fails the create instead of polling forever.
+    """
+    import httpx
+
+    url = (
+        f"{str(control_plane_url).rstrip('/')}/internal/nodes/{node_id}"
+        "/slot-identity"
+    )
+    try:
+        with httpx.Client(timeout=float(timeout_s), transport=transport) as client:
+            response = client.post(
+                url,
+                json={"sandbox_id": sandbox_id, "pid": int(pid)},
+                headers={"X-Internal-Key": internal_key},
+            )
+    except httpx.HTTPError as exc:
+        detail = str(exc) or type(exc).__name__
+        raise PrivHelperError(
+            "the control plane is unreachable for the slot-identity report of "
+            f"sandbox {sandbox_id}: {detail}"
+        ) from exc
+    if response.status_code >= 300:
+        detail = _error_detail(response)
+        raise PrivHelperError(
+            "the control plane refused the slot-identity report for sandbox "
+            f"{sandbox_id} (HTTP {response.status_code}): {detail}"
+        )
+    try:
+        answer = response.json()
+    except ValueError as exc:
+        raise PrivHelperError(
+            "the control plane answered the slot-identity report for sandbox "
+            f"{sandbox_id} with a non-JSON body"
+        ) from exc
+    return answer if isinstance(answer, dict) else {"answer": answer}
+
+
+def _error_detail(response) -> str:
+    """The refusal's own words: ``message`` (control plane) or ``error``."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text.strip()
+    if isinstance(payload, dict):
+        for key in ("message", "error"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return response.text.strip()
+
+
 # --------------------------------------------------------------- self-check
 
 

@@ -327,6 +327,34 @@ def test_forced_route_b_without_a_privileged_starter_fails_loudly(monkeypatch) -
         _executor(monkeypatch, route_b=_config(mode="on"))
 
 
+def test_agent_grant_engages_route_b_without_root_or_a_broker(monkeypatch) -> None:
+    """C3 Task 3: the unprivileged worker runs slots through the agent.
+
+    Nothing in this process changes an identity any more, so root is not the
+    gate -- the *reporter* is. With one, a 65534 worker with no broker spawner
+    leases slots; without one, it says exactly what is missing rather than
+    forking a child nobody would ever grant.
+    """
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    engaged = _executor(
+        monkeypatch,
+        route_b=_config(
+            mode="auto", slot_identity="agent-grant", identity_reporter=lambda *a: {}
+        ),
+    )
+    assert engaged._route_b_active is True
+
+    declined = _executor(
+        monkeypatch, route_b=_config(mode="auto", slot_identity="agent-grant")
+    )
+    assert declined._route_b_active is False
+    assert declined._route_b_decline == (
+        "E2B_SLOT_IDENTITY=agent-grant needs the control-plane reporter, and "
+        "this worker does not know where its control plane is "
+        "(E2B_CONTROL_PLANE_URL and E2B_NODE_ID)"
+    )
+
+
 def test_forced_route_b_without_a_host_uid_fails_loudly(monkeypatch) -> None:
     with pytest.raises(
         RuntimeError,
