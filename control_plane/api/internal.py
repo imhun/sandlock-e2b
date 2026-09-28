@@ -14,6 +14,10 @@ node, and the request must come from the node's expected address):
 * ``POST /internal/nodes/{node_id}/heartbeat``
 * ``GET  /internal/nodes/{node_id}/sandboxes``
 * ``POST /internal/nodes/{node_id}/reconcile``
+* ``POST /internal/nodes/{node_id}/slot-identity`` -- the worker reports the
+  ``{sandbox_id, pid}`` of a slot child it just forked (C3 Task 3, ruling D9.1);
+  the control plane answers by instructing the node's agent, **with the uid and
+  the worker identity taken from its own records**
 
 **Fleet/ops scope** (the caller is not a node and has no node identity to bind:
 the autoscaler, the envd gateway, or an operator). These keep the shared key
@@ -63,8 +67,11 @@ from fastapi import APIRouter, Header, Request, Response
 
 from control_plane.api.errors import OfficialError
 from control_plane.auth import node_id_for_key, verify_internal_key
+from control_plane.c3_agent_client import AgentClientError
 from control_plane.node_address import NodeEndpoint
+from control_plane.registry.manager import UnknownSandboxError
 from gateway_common.paths import validate_sandbox_id
+from gateway_common.worker_identity import validate_pid_namespace
 
 router = APIRouter()
 
@@ -100,6 +107,28 @@ def _require_fleet_key(request: Request) -> None:
     the surface acts for no node and so has nothing to bind an identity to.
     """
     _require_internal_key(request)
+
+
+def _worker_pid_namespace(body: dict[str, Any]) -> str | None:
+    """The worker's reported pid namespace identity, or a named refusal.
+
+    C3 Task 3 / ruling D9.3: the value is compared against ``/proc/<pid>/ns/pid``
+    links and against a cgroup path, so it is shape-checked before it is stored
+    -- a value that cannot be a namespace identity is refused here rather than
+    compared loosely later. Absent (an older worker during a rollout) is *not*
+    an error: the record simply keeps no identity, and the slot-identity
+    endpoint then refuses those grants by name.
+    """
+    value = body.get("pidNamespace")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not validate_pid_namespace(value):
+        raise OfficialError(
+            400,
+            "pidNamespace must be a pid namespace identity such as "
+            "'pid:[4026532458]'",
+        )
+    return value
 
 
 def _resolve_node(request: Request, node_id: str) -> NodeEndpoint | None:
@@ -243,6 +272,7 @@ async def register_node(request: Request) -> dict[str, Any]:
             endpoint.address,
         )
     address = endpoint.address
+    pid_namespace = _worker_pid_namespace(body)
     record = request.app.state.nodes.register(
         node_id=node_id,
         address=address,
@@ -252,6 +282,7 @@ async def register_node(request: Request) -> dict[str, Any]:
         total_processes=int(body.get("totalProcesses", 0)),
         images=body.get("images") or [],
         labels=body.get("labels") or {},
+        pid_namespace=pid_namespace,
     )
     _rebuild_node_reservations(request, record)
     return {"nodeID": record.node_id}
@@ -300,6 +331,13 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
     record = request.app.state.nodes.heartbeat(node_id)
     if record is None:
         raise OfficialError(404, f"Node {node_id} not found")
+    # C3 Task 3: the worker's identity travels with every heartbeat, so a
+    # restarted container (new pid namespace inode, same node id) is never
+    # pinned to the namespace it had before -- and an older worker that reports
+    # nothing leaves the stored value alone.
+    pid_namespace = _worker_pid_namespace(body)
+    if pid_namespace is not None:
+        record.pid_namespace = pid_namespace
     record.update_usage(
         used_disk_mb=body.get("diskUsedMB"),
         disk_total_mb=body.get("diskTotalMB"),
@@ -413,6 +451,97 @@ async def node_reconcile(node_id: str, request: Request) -> dict[str, Any]:
         set(snapshot_ids),
         timeout=request.app.state.settings.default_timeout,
     )
+
+
+@router.post("/internal/nodes/{node_id}/slot-identity")
+async def node_slot_identity(node_id: str, request: Request) -> dict[str, Any]:
+    """Forward a slot child's reported pid to this node's agent (C3 Task 3).
+
+    The worker forks the slot's child and reports ``{sandbox_id, pid}`` -- the
+    pid it knows (its own pid namespace) and **no uid** (ruling D9.1). This
+    handler is the middle of C3's only two channels: it validates the caller
+    with the same identity layer every node-scoped handler uses (① credential →
+    node, ② claim == credential, ③ the object is the control plane's own record
+    and belongs to that node, plus the source-IP second factor), then instructs
+    the node's agent with the uid **from its own records** and the worker's
+    identity it stored at registration (ruling D9.3).
+
+    Every hop is named and fail-closed: an unknown sandbox is a 404, another
+    node's sandbox a 403, a sandbox with no allocated uid or a node with no
+    reported identity a 503, a stuck agent a 504 and an unreachable one a 502.
+    None of them is allowed to look like "the sandbox create hangs".
+    """
+    node_id, _endpoint = _require_node_identity(request, node_id)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise OfficialError(400, "Invalid JSON body")
+    if not isinstance(body, dict):
+        raise OfficialError(400, "Request body must be a JSON object")
+    if "uid" in body:
+        # Silently ignoring it would leave the next reader believing the value
+        # was considered; the shape itself is what the worker sent that is wrong
+        # (hard rule 1/3: the identity is the control plane's to name).
+        raise OfficialError(
+            400,
+            "a slot-identity report carries {sandbox_id, pid} and no uid: the "
+            "identity comes from the control plane's records",
+        )
+    sandbox_id = body.get("sandbox_id")
+    pid = body.get("pid")
+    if not isinstance(sandbox_id, str) or not validate_sandbox_id(sandbox_id):
+        raise OfficialError(400, "sandbox_id must be a valid sandbox id")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise OfficialError(400, "pid must be a positive integer")
+    try:
+        record = request.app.state.registry.get(sandbox_id)
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found") from None
+    owner = record.node_id or "local"
+    if owner != node_id:
+        # Step ③: the object is the control plane's own record and it says this
+        # sandbox lives elsewhere. A worker may not act outside its node.
+        raise OfficialError(
+            403, f"Sandbox {sandbox_id} belongs to node {owner}, not {node_id}"
+        )
+    if record.host_uid is None:
+        raise OfficialError(
+            503,
+            f"sandbox {sandbox_id} has no allocated host uid: refusing to "
+            "instruct the agent",
+        )
+    node = request.app.state.nodes.get(node_id)
+    worker_pid_namespace = getattr(node, "pid_namespace", None)
+    if not worker_pid_namespace:
+        raise OfficialError(
+            503,
+            f"node {node_id} has reported no pid namespace identity: refusing "
+            "to instruct the agent without it",
+        )
+    client = getattr(request.app.state, "c3_agent_client", None)
+    if client is None:
+        raise OfficialError(
+            503,
+            "this control plane has no C3 agent client configured: refusing to "
+            "report a slot identity",
+        )
+    try:
+        answer = await client.grant_slot(
+            node_id=node_id,
+            sandbox_id=sandbox_id,
+            container_pid=pid,
+            uid=int(record.host_uid),
+            worker_pid_namespace=worker_pid_namespace,
+        )
+    except AgentClientError as exc:
+        raise OfficialError(exc.status_code, str(exc)) from exc
+    return {
+        "nodeID": node_id,
+        "sandboxID": sandbox_id,
+        "uid": int(record.host_uid),
+        "pid": pid,
+        "agent": answer,
+    }
 
 
 @router.get("/internal/fleet/sandboxes")

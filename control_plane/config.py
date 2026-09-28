@@ -336,6 +336,40 @@ class Settings:
     node_address_namespace: str = field(
         default_factory=lambda: os.getenv("E2B_NODE_ADDRESS_NAMESPACE", "sandlock")
     )
+    # C3 Task 3 (rulings D9.2/D9.4/D9.5): the CP→agent instruction channel.
+    # The agent is found the same way the node's own address is (k8s: the worker
+    # pod's spec.nodeName, then the agent pod on that host by label; compose:
+    # the configured service name) -- never from a request body.
+    c3_agent_url: str | None = field(
+        default_factory=lambda: os.getenv("E2B_C3_AGENT_URL")
+    )
+    c3_agent_namespace: str = field(
+        default_factory=lambda: os.getenv("E2B_C3_AGENT_NAMESPACE", "sandlock")
+    )
+    c3_agent_label: str = field(
+        default_factory=lambda: os.getenv("E2B_C3_AGENT_LABEL", "app=c3-agent")
+    )
+    c3_agent_port: int = field(
+        default_factory=lambda: _env_int("E2B_C3_AGENT_PORT", 49985)
+    )
+    #: The credential the agent demands on every instruction. Unset means "no
+    #: agent instructions": the client refuses by name rather than dialling
+    #: without auth.
+    c3_agent_token: str = field(
+        default_factory=lambda: os.getenv("E2B_C3_AGENT_TOKEN", "")
+    )
+    #: One deadline per instruction. A stuck agent must never read as "the
+    #: sandbox create hangs" (D9.5); the refusal is a named 504.
+    c3_agent_timeout_s: float = field(
+        default_factory=lambda: _env_float("E2B_C3_AGENT_TIMEOUT_S", 5.0)
+    )
+    #: How many CP→agent instructions may be in flight at once. ``0`` is
+    #: unbounded (today's behavior); slice B sizes the shipped default from the
+    #: concurrent-create arm, and the acceptance matrix's negative arm sets it
+    #: to 1 to prove the queueing it must *not* have.
+    c3_agent_max_concurrency: int = field(
+        default_factory=lambda: _env_int("E2B_C3_AGENT_MAX_CONCURRENCY", 0)
+    )
     # E5.4: secret-at-rest encryption. When E2B_SECRET_MASTER_KEY is unset
     # the secret registry degrades to the previous in-memory + plaintext
     # disk behavior with a startup warning and is never persisted to Redis.

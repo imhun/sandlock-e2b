@@ -49,6 +49,12 @@ class NodeRecord:
     draining: bool = False
     images: list[str] = field(default_factory=list)
     labels: dict[str, str] = field(default_factory=dict)
+    #: C3 Task 3 (ruling D9.3): the worker's own pid namespace identity
+    #: (``pid:[4026532458]``), reported at register/heartbeat. It is what makes
+    #: the agent's container-pid → host-pid lookup unambiguous when one host
+    #: runs several workers, and it is refreshed on every heartbeat because a
+    #: restarted worker container has a new inode under the *same* node id.
+    pid_namespace: str | None = None
     status: str = "healthy"
     heartbeat_at: float = field(default_factory=time.time)
     created_at: float = field(default_factory=time.time)
@@ -88,6 +94,7 @@ class NodeRecord:
             "draining": self.draining,
             "images": list(self.images),
             "labels": dict(self.labels),
+            "pid_namespace": self.pid_namespace,
             "status": self.status,
             "heartbeat_at": self.heartbeat_at,
             "created_at": self.created_at,
@@ -319,6 +326,7 @@ class NodeRegistry:
         total_processes: int,
         images: list[str] | None = None,
         labels: dict[str, str] | None = None,
+        pid_namespace: str | None = None,
     ) -> NodeRecord:
         with self._lock:
             record = self._load_locked(node_id) if node_id else None
@@ -334,6 +342,7 @@ class NodeRegistry:
                     total_processes=total_processes,
                     images=list(images or []),
                     labels=dict(labels or {}),
+                    pid_namespace=pid_namespace,
                     reserved_memory_mb=reserved.get("memory", 0),
                     reserved_cpu_percent=reserved.get("cpu", 0),
                     reserved_disk_mb=reserved.get("disk", 0),
@@ -348,6 +357,12 @@ class NodeRegistry:
                 record.total_processes = total_processes
                 record.images = list(images or [])
                 record.labels = dict(labels or {})
+                # Only ever *set* here: a heartbeat that carries no identity
+                # (an older worker during a rollout) must not erase the one the
+                # record already holds -- that would make every slot grant on
+                # this node fail closed until the next register.
+                if pid_namespace is not None:
+                    record.pid_namespace = pid_namespace
                 record.draining = False
             record.heartbeat_at = time.time()
             record.status = "healthy"

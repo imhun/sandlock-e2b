@@ -25,6 +25,10 @@ from control_plane.api.snapshots import (
 )
 from control_plane.api.templates import router as templates_router
 from control_plane.api.volumes import router as volumes_router
+from control_plane.c3_agent_client import (
+    C3AgentClient,
+    build_agent_address_resolver,
+)
 from control_plane.config import Settings, local_node_quota_via_agent
 from control_plane.metrics import SlidingWindowCounter
 from control_plane.node_address import build_node_address_resolver
@@ -64,6 +68,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only (envd may be absent)
 
 
 logger = logging.getLogger(__name__)
+
+#: "The caller said nothing about the C3 agent client", as opposed to passing
+#: ``None`` -- which is a deployment that deliberately has none, and must make
+#: the slot-identity endpoint refuse by name rather than quietly build one.
+_UNSET = object()
 
 
 class _NoopRuntimeRegistry:
@@ -215,6 +224,7 @@ def create_app(
     nodes_registry=None,
     templates_registry=None,
     node_address_resolver=None,
+    c3_agent_client=_UNSET,
 ) -> FastAPI:
     settings = settings or Settings()
     redis_client = None
@@ -542,6 +552,18 @@ def create_app(
     app.state.node_address_resolver = (
         node_address_resolver or build_node_address_resolver(settings)
     )
+    # C3 Task 3: the CP→agent instruction channel (the other half of the fleet's
+    # two channels). Built from the deployment's own shape; the token is what
+    # the agent demands, and an unset one is a named refusal per instruction
+    # rather than a silent unauthenticated call.
+    if c3_agent_client is _UNSET:
+        c3_agent_client = C3AgentClient(
+            resolver=build_agent_address_resolver(settings),
+            token=settings.c3_agent_token,
+            timeout_s=settings.c3_agent_timeout_s,
+            max_concurrency=settings.c3_agent_max_concurrency,
+        )
+    app.state.c3_agent_client = c3_agent_client
     app.state.recent_failures = SlidingWindowCounter()
     app.state.templates = templates_registry or TemplateRegistry(
         platform_root / "_templates"
