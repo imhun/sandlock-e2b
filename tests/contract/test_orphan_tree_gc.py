@@ -1574,10 +1574,11 @@ async def test_incomplete_fleet_enumeration_aborts_the_disk_sweep(
     removed the node-row cause this scenario used to model; the invariant and
     the mechanism are unchanged.)
     """
-    control_nodes, registry, control_app = _stack(workspace)
+    _control_nodes, registry, control_app = _stack(workspace)
+    # The record exists so the control plane's own count includes it; it is the
+    # *list* below that will not carry it, which is what makes the round short.
     ghost_id = "sbx_ghost_node"
     _control_record(registry, "node_ghost", ghost_id)
-    assert [node.node_id for node in control_nodes.list()] == ["node_a"]
     orphan_dir = _tree(workspace, "sbx_unowned", project_id=4001)
     quota = _QuotaFake({4001: 8})
     quota.install(monkeypatch)
@@ -1586,7 +1587,7 @@ async def test_incomplete_fleet_enumeration_aborts_the_disk_sweep(
 
     agent = _agent(workspace)
     # The list this round saw omitted a record the metrics count still carries.
-    short = ShortFleetView(control_app, [])
+    short = ShortFleetView(control_app, {})
     async with _client(short) as raw:
         summary = await agent._reconcile_with_control_plane(raw, _headers())
 
@@ -1688,7 +1689,7 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
     sweep_round: int | None = None
     parked = asyncio.Event()
     # The fleet list is short until the hook below makes it complete.
-    short = ShortFleetView(control_app, [])
+    short = ShortFleetView(control_app, {})
 
     async def hook(interval):
         nonlocal rounds, sweep_round
@@ -1705,7 +1706,7 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
         if rounds == 2:
             # The record is seen again: the enumeration is complete, so the
             # deferred sweep can run.
-            short.sandbox_ids = [ghost_id]
+            short.sandboxes = {"node_ghost": [ghost_id]}
         if sweep_round is not None or rounds >= 8:
             parked.set()
             await asyncio.sleep(3600)
@@ -1787,7 +1788,7 @@ async def test_deferred_disk_sweep_backs_off_instead_of_polling_every_heartbeat(
     attempt_rounds: list[int] = []
     parked = asyncio.Event()
     # Never repaired: this lane is about the backoff schedule.
-    short = ShortFleetView(control_app, [])
+    short = ShortFleetView(control_app, {})
 
     async def hook(interval):
         nonlocal rounds

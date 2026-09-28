@@ -143,12 +143,83 @@ def test_an_unreadable_list_refuses_instead_of_guessing(
     assert exited.value.code == 2
     assert kubectl.calls == []
     assert capsys.readouterr().err == (
-        "拒删 worker pod e2b-worker-0：读不到控制面的按节点沙箱名单"
-        "（GET /internal/nodes/e2b-worker-0/sandboxes）：RuntimeError: boom\n"
+        "拒删 worker pod e2b-worker-0：读不到控制面的舰队沙箱归属名单"
+        "（GET /internal/fleet/sandboxes）：RuntimeError: boom\n"
         "那张名单是「这台 worker 上没有别人的沙箱」的唯一证据；拿不到就不动 pod。\n"
-        "出路：先把通道/控制面修好（deploy/scripts/open-cluster-tunnel.sh）再重跑；\n"
+        "出路：先把通道/控制面修好（deploy/scripts/open-cluster-tunnel.sh），"
+        "并确认用的内部 key 能读 /internal/fleet/sandboxes（舰队作用域、需要内部 key，"
+        "不需要是那个节点）再重跑；\n"
         "      确实要不看这张名单就删，用 `--force` 显式承担。\n"
     )
+
+
+def test_the_politeness_list_comes_from_the_attributed_fleet_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One fleet-scope read, then this node's slice of the attribution.
+
+    The old shape asked the **node-scoped** endpoint, which after C3 Task 2
+    refuses an out-of-cluster caller holding the shared key (403) -- so this
+    script would have hard-failed every run, in exactly the deploy window where
+    it is used. The fleet view answers the same question without impersonation.
+    """
+    seen: list[str] = []
+
+    def fake_get(url, *, headers, timeout):
+        seen.append(url)
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {
+                "sandboxes": {
+                    "node_a": ["sbx_a1", "sbx_a2"],
+                    "node_b": ["sbx_b"],
+                }
+            },
+        )
+
+    monkeypatch.setattr(acceptance.httpx, "get", fake_get)
+    assert acceptance.node_sandbox_ids("node_b") == ["sbx_b"]
+    assert acceptance.node_sandbox_ids("node_a") == ["sbx_a1", "sbx_a2"]
+    # Absent from the attribution = the control plane attributes it nothing.
+    assert acceptance.node_sandbox_ids("node_absent") == []
+    assert seen == [
+        f"{acceptance.API}/internal/fleet/sandboxes",
+        f"{acceptance.API}/internal/fleet/sandboxes",
+        f"{acceptance.API}/internal/fleet/sandboxes",
+    ]
+    # The node-scoped endpoint (identity + source IP) is deliberately not used.
+    assert all("/internal/nodes/" not in url for url in seen)
+
+
+def test_the_politeness_lookup_refuses_a_malformed_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anything that is not the attributed view is a refusal, not a guess."""
+    for payload, message in (
+        ([], "fleet sandbox view is not an object"),
+        (
+            {"sandboxIDs": ["sbx_a"]},
+            "fleet sandbox view carries no `sandboxes` attribution",
+        ),
+        (
+            {"sandboxes": []},
+            "fleet sandbox view carries no `sandboxes` attribution",
+        ),
+        (
+            {"sandboxes": {"node_a": "sbx_a"}},
+            "fleet sandbox view for node node_a is not a list",
+        ),
+    ):
+        monkeypatch.setattr(
+            acceptance.httpx,
+            "get",
+            lambda *args, payload=payload, **kwargs: SimpleNamespace(
+                raise_for_status=lambda: None, json=lambda: payload
+            ),
+        )
+        with pytest.raises(ValueError) as excinfo:
+            acceptance.node_sandbox_ids("node_a")
+        assert str(excinfo.value) == message
 
 
 def test_a_list_without_our_own_sandbox_is_not_believed(

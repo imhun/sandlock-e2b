@@ -631,23 +631,29 @@ async def test_an_unresolvable_node_warns_once_but_refuses_every_time(
     ]
 
 
-# ------------------------- 舰队作用域的新枚举端点（D6）
+# ------------------------- 舰队作用域的枚举端点（D6/D7：带归属）
 
 
 @pytest.mark.asyncio
-async def test_the_fleet_sandbox_list_is_named_fleet_scope(workspace) -> None:
-    """A worker's ownership sweep asks a *fleet* question, not a node one.
+async def test_the_fleet_sandbox_view_is_attributed_and_fleet_scope(workspace) -> None:
+    """The fleet view carries **attribution**, and a fleet caller may read it.
 
-    It authenticates with the shared key and needs no node identity -- including
-    when a registered node is unresolvable (which is the state this endpoint
-    exists for). It is in ``_require_fleet_key``'s set, named in the module
-    docstring; the per-node endpoints stay identity-guarded.
+    Two properties in one place, because the contrast is the point:
+
+    * the shape is ``{"sandboxes": {node_id: [id, …]}}`` so a caller can ask
+      "which ids does node X own?" *without impersonating X* (D7: an
+      out-of-cluster operator holds the shared key and cannot be node X);
+    * the same key, from the same non-node address, may read this fleet view and
+      is **refused** on the node-scoped endpoint -- identity is still bound to
+      the node there, and this endpoint does not relax that.
     """
     nodes = NodeRegistry(heartbeat_timeout=600.0)
     registry = SandboxRegistry(_settings())
-    _sandbox_on(registry, "node_a", "sbx_a")
+    _sandbox_on(registry, "node_a", "sbx_a1")
+    _sandbox_on(registry, "node_a", "sbx_a2")
     _sandbox_on(registry, "node_b", "sbx_b")
-    # A record on a node the resolver does not know (its worker is gone).
+    # A record on a node the resolver does not know (its worker is gone) is
+    # still accounted for -- this view is complete, not node-registry-bound.
     _sandbox_on(registry, "node_ghost", "sbx_ghost")
     app = _app(workspace, registry=registry, nodes=nodes)
     async with _client(app, source_ip="10.9.9.9") as client:
@@ -659,8 +665,25 @@ async def test_the_fleet_sandbox_list_is_named_fleet_scope(workspace) -> None:
             "/internal/fleet/sandboxes", headers={"X-Internal-Key": FLEET_KEY}
         )
         assert listed.status_code == 200
-        assert sorted(listed.json()["sandboxIDs"]) == [
-            "sbx_a",
-            "sbx_b",
-            "sbx_ghost",
-        ]
+        assert listed.json() == {
+            "sandboxes": {
+                "node_a": ["sbx_a1", "sbx_a2"],
+                "node_b": ["sbx_b"],
+                "node_ghost": ["sbx_ghost"],
+            }
+        }
+
+        # The contrast: the *node-scoped* read from the very same position (and
+        # with the very same key) is refused -- this endpoint does not weaken
+        # that one.
+        node_scoped = await client.get(
+            "/internal/nodes/node_a/sandboxes",
+            headers={"X-Internal-Key": FLEET_KEY},
+        )
+        assert node_scoped.status_code == 403
+        assert node_scoped.json() == {
+            "code": 403,
+            "message": (
+                "request for node node_a came from 10.9.9.9, expected 10.0.0.1"
+            ),
+        }

@@ -1779,8 +1779,11 @@ worker-2 日志 30×503 / 0×500 / 0 traceback，`tmp/n6-live-race.log`）。
 
 **未关闭（点名）**：出厂仍是**一把舰队共享 key**。换成 per-node key
 （`E2B_INTERNAL_NODE_KEYS`，机制已实现、未接线）是所谓**近期**加固，mTLS 是目标态；
-`/internal/routes`、`/internal/nodes`、`drain/undrain`、`/internal/fleet/metrics`、
-`/internal/tenants` 是**fleet 作用域**，本任务不覆盖。逐条见 `docs/open-issues.md` N49。
+`/internal/routes`、`/internal/nodes`、`/internal/fleet/sandboxes`（归属视图，
+D6/D7：worker 的孤儿回收与集群外的 `deploy/scripts/checkpoint_acceptance.py` 都读它）、
+`/internal/fleet/metrics`、`drain/undrain`、`/internal/tenants` 是**fleet 作用域**，
+本任务不覆盖（持有共享 key 即可读全部沙箱 id 的归属，见 N49 行）。逐条见
+`docs/open-issues.md` N49。
 
 ## 3. 运维要求
 

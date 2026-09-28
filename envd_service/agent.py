@@ -2473,14 +2473,19 @@ class NodeAgent:
         the other workers have not re-registered yet) makes the caller skip
         the sweep instead of deleting someone else's live tree.
 
-        D6: the records come from the **fleet-scope** ``/internal/fleet/sandboxes``
-        endpoint, not from one call per node. Asking each node for its own list
-        would make this sweep depend on *every* node being resolvable — and a
-        worker that is permanently gone keeps its registry row (and its
-        records) until its sandboxes' TTL, so the per-node shape would stall
-        reclamation fleet-wide exactly when a node has died. The per-node
-        endpoints stay identity-guarded; this sweep was never speaking for
-        another node.
+        D6/D7: the records come from the **fleet-scope**
+        ``/internal/fleet/sandboxes`` endpoint, not from one call per node.
+        Asking each node for its own list would make this sweep depend on
+        *every* node being resolvable — and a worker that is permanently gone
+        keeps its registry row (and its records) until its sandboxes' TTL, so
+        the per-node shape would stall reclamation fleet-wide exactly when a
+        node has died. The per-node endpoints stay identity-guarded; this sweep
+        was never speaking for another node.
+
+        The answer is attributed (``{"sandboxes": {node_id: [id, …]}}``, D7);
+        for the sweep the attribution is irrelevant and only the id set matters,
+        so it is flattened here. The completeness rule below (count vs
+        ``/internal/fleet/metrics``) is unchanged and deliberately strict.
         """
         try:
             resp = await client.get(
@@ -2490,7 +2495,14 @@ class NodeAgent:
             payload = resp.json()
             if not isinstance(payload, dict):
                 raise ValueError("fleet sandbox list is not an object")
-            owned = {str(sid) for sid in (payload.get("sandboxIDs") or [])}
+            by_node = payload.get("sandboxes")
+            if not isinstance(by_node, dict):
+                raise ValueError("fleet sandbox attribution is not an object")
+            owned = {
+                str(sid)
+                for node_ids in by_node.values()
+                for sid in (node_ids or [])
+            }
             metrics = await client.get(
                 f"{self._control_url}/internal/fleet/metrics", headers=headers
             )

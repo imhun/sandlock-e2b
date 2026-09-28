@@ -26,8 +26,10 @@ Uses the deployed gateway + `kubectl` against the self-hosted k0s cluster
 
 **它会删掉宿主 worker 的 pod**，而那台 worker 上**别人的**沙箱会跟着一起死：
 worker 的沙箱注册表是内存态，pod 没了，那些沙箱就再也 `resume` 不回来。所以删之前脚本先读
-控制面的按节点名单（`GET /internal/nodes/<id>/sandboxes`），名单里只要还有不属于本次验收的
-沙箱就**拒绝并退出（码 2）**，`--force` 是"我确认它们可以和这个 pod 一起死"的唯一说法。
+控制面的**舰队归属名单**（`GET /internal/fleet/sandboxes`，`{"sandboxes": {node_id: [id, …]}}`，
+取本节点那一格；C3 Task 2 之前读的是按节点端点，那个端点现在要求调用方就是该节点，而本脚本
+在集群外拿共享 key 跑），名单里只要还有不属于本次验收的沙箱就**拒绝并退出（码 2）**，
+`--force` 是"我确认它们可以和这个 pod 一起死"的唯一说法。
 ⇒ **只能在没有别人沙箱的 worker 上跑**（见 `docs/deploy-clusters.md` §9）。
 """
 
@@ -185,17 +187,37 @@ def platform_account() -> dict:
 def node_sandbox_ids(node_id: str) -> list[str]:
     """控制面视角下这台 worker 上的沙箱 id 列表。
 
-    读的是**控制面**的按节点视图（`control_plane/api/internal.py::node_sandboxes`，
-    也是 worker 做分区 reconcile 的权威名单），不是 worker 自己的内存注册表：要删的
-    正是这个 pod，它没有资格给自己开一张"我很空"的证明。
+    读的是控制面的**舰队归属视图**（`GET /internal/fleet/sandboxes`，
+    `control_plane/api/internal.py::fleet_sandboxes`），取 `node_id` 那一格，不是
+    worker 自己的内存注册表：要删的正是这个 pod，它没有资格给自己开一张"我很空"的证明。
+
+    ⚠ 不走按节点端点（`GET /internal/nodes/<id>/sandboxes`）：C3 Task 2 之后那个端点
+    要求调用方**就是**这个节点（凭据绑定 + 源 IP），而本脚本在集群外拿共享 key 跑，
+    冒充不了它（实测会 403）。归属视图回答的是同一个问题——"控制面认为这台 worker
+    上有哪些沙箱"——而且不需要冒充。
+
+    Fail closed：读不到、或形状不是归属视图，一律抛；调用方据此拒删 pod（连 kubectl
+    都不碰）。节点不在视图里 = 控制面认为它没有沙箱（空列表），由调用方"名单连自己都
+    不认"那一关拒掉。
     """
     resp = httpx.get(
-        f"{API}/internal/nodes/{node_id}/sandboxes",
+        f"{API}/internal/fleet/sandboxes",
         headers={"X-Internal-Key": INTERNAL},
         timeout=30,
     )
     resp.raise_for_status()
-    return list(resp.json()["sandboxIDs"])
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise ValueError("fleet sandbox view is not an object")
+    by_node = payload.get("sandboxes")
+    if not isinstance(by_node, dict):
+        raise ValueError("fleet sandbox view carries no `sandboxes` attribution")
+    ids = by_node.get(node_id)
+    if ids is None:
+        return []
+    if not isinstance(ids, list):
+        raise ValueError(f"fleet sandbox view for node {node_id} is not a list")
+    return [str(sandbox_id) for sandbox_id in ids]
 
 
 #: 礼貌检查拒绝时的退出码。与断言失败（1）分开：这里连"开始验收"都没发生，
@@ -226,10 +248,12 @@ def ensure_worker_is_exclusively_ours(
         ids = node_sandbox_ids(node_id)
     except Exception as exc:  # noqa: BLE001 - any answer other than the list is a refusal
         _refuse_worker_pod(
-            f"拒删 worker pod {node_id}：读不到控制面的按节点沙箱名单"
-            f"（GET /internal/nodes/{node_id}/sandboxes）：{type(exc).__name__}: {exc}\n"
+            f"拒删 worker pod {node_id}：读不到控制面的舰队沙箱归属名单"
+            f"（GET /internal/fleet/sandboxes）：{type(exc).__name__}: {exc}\n"
             "那张名单是「这台 worker 上没有别人的沙箱」的唯一证据；拿不到就不动 pod。\n"
-            "出路：先把通道/控制面修好（deploy/scripts/open-cluster-tunnel.sh）再重跑；\n"
+            "出路：先把通道/控制面修好（deploy/scripts/open-cluster-tunnel.sh），"
+            "并确认用的内部 key 能读 /internal/fleet/sandboxes（舰队作用域、需要内部 key，"
+            "不需要是那个节点）再重跑；\n"
             "      确实要不看这张名单就删，用 `--force` 显式承担。\n"
         )
     others = sorted(set(ids) - {sandbox_id})

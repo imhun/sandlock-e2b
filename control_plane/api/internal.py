@@ -417,7 +417,7 @@ async def node_reconcile(node_id: str, request: Request) -> dict[str, Any]:
 
 @router.get("/internal/fleet/sandboxes")
 async def fleet_sandboxes(request: Request) -> dict[str, Any]:
-    """Every sandbox id the control plane records, fleet-wide (D6).
+    """Every sandbox id the control plane records, attributed to its node (D6/D7).
 
     Fleet scope, not node scope. A worker's ownership sweep asks "does anyone
     *anywhere* own this tree/image?", which is not a statement about the node it
@@ -429,11 +429,24 @@ async def fleet_sandboxes(request: Request) -> dict[str, Any]:
     ``reap_unhealthy`` keeps its row until its sandboxes' TTL) refuse that
     worker's whole round, which is exactly when orphan reclamation must work.
     The per-node endpoints stay identity-guarded; this one answers the fleet
-    question directly. Shape matches the per-node answer's ``sandboxIDs``.
+    question directly.
+
+    **Attribution is part of the shape** (D7): ``{"sandboxes": {node_id: [id,
+    ...]}}``. A fleet-scope caller (the out-of-cluster acceptance script is the
+    reason) can then ask "which ids does node X own?" without *impersonating*
+    X, which is what the node-scoped endpoint requires and what an operator
+    outside the cluster cannot do. Records with no node (the in-process
+    ``local`` worker) are attributed to ``"local"`` -- the id the control plane
+    uses for that node everywhere else -- so the view is complete: a caller can
+    always account for *every* record.
     """
     _require_fleet_key(request)
-    records = request.app.state.registry.list()
-    return {"sandboxIDs": [r.sandbox_id for r in records]}
+    by_node: dict[str, list[str]] = {}
+    for record in request.app.state.registry.list():
+        by_node.setdefault(record.node_id or "local", []).append(record.sandbox_id)
+    # Sorted per node: the view is read by operators and by a diff-friendly
+    # acceptance script, and the registry's own order carries no meaning.
+    return {"sandboxes": {node: sorted(ids) for node, ids in by_node.items()}}
 
 
 @router.get("/internal/routes/{sandbox_id}")

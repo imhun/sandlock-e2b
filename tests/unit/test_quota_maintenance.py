@@ -1634,7 +1634,7 @@ async def _run_reconcile_round(
     *,
     records: dict[str, str] | None = None,
     nodes: tuple[str, ...] = ("node_a",),
-    fleet_view: list[str] | None = None,
+    fleet_view: dict[str, list[str]] | None = None,
 ) -> tuple[dict, agent.NodeAgent]:
     """One reconcile round of a worker on ``base``, plus that worker.
 
@@ -1766,7 +1766,7 @@ async def test_reconcile_leaves_images_alone_without_a_complete_fleet_record_set
         base,
         records={"sbx_elsewhere": "node_b"},
         nodes=("node_a",),
-        fleet_view=[],
+        fleet_view={},
     )
 
     assert summary["checkpointsReclaimed"] == []
