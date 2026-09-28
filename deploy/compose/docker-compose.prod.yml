@@ -72,6 +72,14 @@ services:
     environment:
       E2B_API_KEYS: ${E2B_API_KEYS:-local-key}
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
+      # C3 Task 2 (N49 / controller ruling D5): the internal API resolves a
+      # node's *expected* address from its id -- which is the worker's compose
+      # service name (`worker-1`…), resolvable from this container over the
+      # project network. Explicit, never `auto`: a node-scoped claim that does
+      # not resolve is refused, and the address is never taken from the request
+      # body. Per-node credentials (`E2B_INTERNAL_NODE_KEYS`) are the design's
+      # near-term hardening and are not set here; see `docs/open-issues.md` N49.
+      E2B_NODE_ADDRESS_MODE: hostname
       # Secret at-rest encryption + Redis persistence (E5.4).
       E2B_SECRET_MASTER_KEY: ${E2B_SECRET_MASTER_KEY:-}
       E2B_SECRET_MASTER_KEYS: ${E2B_SECRET_MASTER_KEYS:-}

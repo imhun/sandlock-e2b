@@ -169,9 +169,17 @@ def _node_type() -> str:
     return "physical"
 
 
-def _register_payload(settings: Settings) -> dict[str, Any]:
+def _register_payload(
+    settings: Settings, node_id: str | None = None
+) -> dict[str, Any]:
+    """The registration/heartbeat payload.
+
+    ``node_id`` lets an embedder (the test harness) declare a stable node id
+    instead of relying on ``E2B_NODE_ID`` in the process environment; production
+    leaves it ``None`` and reads the env, exactly as before.
+    """
     return {
-        "nodeID": os.getenv("E2B_NODE_ID"),
+        "nodeID": node_id or os.getenv("E2B_NODE_ID"),
         "address": os.getenv("E2B_NODE_ADDRESS"),
         "images": [i for i in (settings.base_image,) if i],
         "labels": {
@@ -1520,6 +1528,7 @@ class NodeAgent:
         runtime_registry,
         control_plane_url: str | None,
         node_address: str | None,
+        node_id: str | None = None,
         metrics_provider: Callable[[], dict[str, Any]] | None = None,
         port_provider: Callable[[], dict[str, int]] | None = None,
     ) -> None:
@@ -1527,6 +1536,10 @@ class NodeAgent:
         self._runtime_registry = runtime_registry
         self._control_url = (control_plane_url or "").rstrip("/")
         self._node_address = node_address or ""
+        #: The id this worker declares when it registers. Production reads
+        #: ``E2B_NODE_ID`` (``_register_payload``); a harness sets this so the
+        #: control plane's resolver can be pointed at the worker's endpoint.
+        self._declared_node_id = node_id
         self._metrics_provider = metrics_provider
         #: N8: the MCP gateway port band's watermark, shipped with every
         #: heartbeat so the control plane's node view is the single place to
@@ -1678,7 +1691,7 @@ class NodeAgent:
         """One register-or-heartbeat exchange, then whatever round it triggers."""
         headers = {"X-Internal-Key": self._settings.internal_api_key}
         async with httpx.AsyncClient(timeout=10) as client:
-            payload = _register_payload(self._settings)
+            payload = _register_payload(self._settings, self._declared_node_id)
             payload["address"] = self._node_address
             if self._node_id is None:
                 resp = await client.post(
@@ -3593,7 +3606,10 @@ async def agent_health(request: Request) -> dict[str, Any]:
     except PermissionError:
         return Response(status_code=401)
     payload = _register_payload(settings)
-    payload["nodeID"] = os.getenv("E2B_NODE_ID")
+    agent = getattr(request.app.state, "node_agent", None)
+    payload["nodeID"] = getattr(agent, "_declared_node_id", None) or os.getenv(
+        "E2B_NODE_ID"
+    )
     return payload
 
 

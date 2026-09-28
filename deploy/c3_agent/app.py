@@ -19,6 +19,13 @@ Auth: every request must carry ``X-Internal-Key`` equal to
 ``E2B_C3_AGENT_TOKEN`` (constant-time); the service refuses to answer when the
 token is unconfigured.
 
+Exposure (Task 3 owns the DaemonSet): this process listens on
+``E2B_C3_AGENT_HOST``/``E2B_C3_AGENT_PORT`` -- ``0.0.0.0:49985`` by default,
+because the control plane dials it from another pod. The bind address is
+configurable on purpose; what must bound the reach is a **NetworkPolicy
+allowing only CP→agent** and the rule that ``E2B_C3_AGENT_TOKEN`` never appears
+in a worker manifest or the worker image. Neither is built here.
+
 The container-pid → host-pid reverse lookup is **not here**: it belongs to
 Task 3, which owns the ``NSpid`` chain plus the target worker pod's cgroup match
 and will pass the host pid in. The stub below says so at the call site.
@@ -36,6 +43,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from deploy.c3_agent.config import Settings
+from gateway_common.paths import validate_sandbox_id
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +90,18 @@ class SubprocessAsUidRunner:
                 timeout=self._timeout_s,
                 check=False,
             )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise AgentRefusal(f"could not run as_uid at {self._path}: {exc}") from exc
+        except OSError as exc:
+            # ``strerror`` keeps the message deterministic and operator-sized
+            # ("No such file or directory") instead of the platform's OSError
+            # repr; the path is already in the message.
+            detail = exc.strerror or type(exc).__name__
+            raise AgentRefusal(
+                f"could not run as_uid at {self._path}: {detail}"
+            ) from exc
+        except subprocess.SubprocessError as exc:
+            raise AgentRefusal(
+                f"could not run as_uid at {self._path}: {type(exc).__name__}"
+            ) from exc
         if proc.returncode != 0:
             raise AgentRefusal(
                 f"as_uid exit {proc.returncode}: {proc.stderr.strip()}"
@@ -111,8 +129,21 @@ def _require_key(request: Request) -> None:
             status_code=500, detail={"error": "c3-agent token not configured"}
         )
     provided = request.headers.get("X-Internal-Key")
-    if provided is None or not secrets.compare_digest(provided, settings.token):
+    if provided is None or not _token_matches(provided, settings.token):
         raise HTTPException(status_code=401, detail={"error": "unauthorized"})
+
+
+def _token_matches(provided: str, expected: str) -> bool:
+    """Constant-time token compare; a non-ASCII header is a mismatch, not a 500.
+
+    ``secrets.compare_digest`` raises ``TypeError`` for non-ASCII ``str`` (the
+    constant-time path is ASCII/bytes only) and a header is attacker-controlled
+    bytes decoded as latin-1.
+    """
+    try:
+        return secrets.compare_digest(provided, expected)
+    except TypeError:
+        return False
 
 
 def create_app(
@@ -122,7 +153,15 @@ def create_app(
     runner = runner or SubprocessAsUidRunner(
         settings.as_uid_path, timeout_s=settings.as_uid_timeout_s
     )
-    app = FastAPI(title="E2B Sandlock C3 Agent", version="0.1.0")
+    # No interactive surface: the instruction API is the whole contract, and
+    # `/openapi.json`/`/docs` on a privileged service is inventory for free.
+    app = FastAPI(
+        title="E2B Sandlock C3 Agent",
+        version="0.1.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     app.state.settings = settings
     app.state.runner = runner
 
@@ -148,6 +187,17 @@ def create_app(
         if op != "grant-slot":
             raise HTTPException(
                 status_code=404, detail={"error": f"unknown agent op {op!r}"}
+            )
+        # Same shape rule the control plane uses: a hostile id must not reach a
+        # log line (or a later path/lookup) verbatim. The message deliberately
+        # does not echo it back.
+        if not validate_sandbox_id(body.sandbox_id):
+            logger.warning(
+                "c3-agent refused grant-slot: sandbox_id is not a valid sandbox id"
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "sandbox_id is not a valid sandbox id"},
             )
         try:
             line = runner.grant(body.uid, body.pid)

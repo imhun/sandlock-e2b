@@ -38,6 +38,7 @@ import envd_service.agent as agent_mod
 import envd_service.priv_helpers as priv_helpers
 import envd_service.xfs_quota as xfs_quota
 from envd_service import xfs_quotactl
+from tests._c3_resolver import AnyNodeLoopbackResolver
 from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings as ControlSettings
 from control_plane.registry.manager import SandboxRegistry
@@ -329,6 +330,12 @@ def _stack(workspace: Path, *, nodes: tuple[str, ...] = ("node_a",)):
         registry=registry,
         nodes_registry=control_nodes,
         workspace_base=workspace,
+        # C3 Task 2: the lane drives the internal API over an in-process client,
+        # so the expected endpoints are injected (production reads them from the
+        # pod API / compose DNS, never from the request). Nodes register
+        # dynamically here (`node_ghost` mid-round), so every id answers
+        # loopback -- the address this lane's requests actually come from.
+        node_address_resolver=AnyNodeLoopbackResolver(),
     )
     # Force scheduling onto the registered remote worker, exactly like the
     # E6.1 contracts next door.
@@ -345,6 +352,9 @@ def _agent(
         runtime_registry=RuntimeRegistry(workspace),
         control_plane_url="http://control",
         node_address="http://127.0.0.1:1",
+        # C3 Task 2: the declared id is what a node-scoped register is verified
+        # against (the `local://`/generated-id shape is out of C3's scope).
+        node_id="node_a",
         metrics_provider=metrics_provider,
     )
     agent._node_id = "node_a"
@@ -362,6 +372,7 @@ def _foreign_agent(workspace: Path, metrics_provider=None) -> NodeAgent:
         runtime_registry=RuntimeRegistry(workspace),
         control_plane_url="http://127.0.0.1:1",
         node_address="http://127.0.0.1:1",
+        node_id="node_foreign",
         metrics_provider=metrics_provider,
     )
     agent._node_id = "node_foreign"

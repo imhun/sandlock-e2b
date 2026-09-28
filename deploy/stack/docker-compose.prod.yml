@@ -93,6 +93,15 @@ services:
       E2B_API_KEYS: ${E2B_API_KEYS}
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY}
       E2B_INTERNAL_API_KEYS: ${E2B_INTERNAL_API_KEYS:-}
+      # C3 Task 2 (N49 / controller ruling D5): the internal API resolves a
+      # node's *expected* address from its id -- the worker compose service
+      # name (`worker-1`…), which docker's embedded DNS answers for every
+      # service on this project network. Explicit, never `auto`: a node-scoped
+      # claim that does not resolve is refused, and the address the control
+      # plane dials is never `body["address"]`. Per-node credentials
+      # (`E2B_INTERNAL_NODE_KEYS`) are the design's near-term hardening and are
+      # not set here; `docs/open-issues.md` N49 says exactly what that leaves.
+      E2B_NODE_ADDRESS_MODE: hostname
       # Secret at-rest encryption + Redis persistence (E5.4).
       E2B_SECRET_MASTER_KEY: ${E2B_SECRET_MASTER_KEY:-}
       E2B_SECRET_MASTER_KEYS: ${E2B_SECRET_MASTER_KEYS:-}

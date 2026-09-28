@@ -363,6 +363,26 @@ kubectl apply -f deploy/k8s/seccomp-installer.yaml   # ① 档（先）
 # 等 DaemonSet ready，再动 worker 的 E2B_REAL_ROOT    ② 开关（后）
 ```
 
+### 7.5 C3 Task 2 的 internal API 身份绑定（**仓库已落，集群未上线**）
+
+**现状（未变）**：集群跑的还是 §7 那一版；`control_plane.yaml` 里**没有** `E2B_NODE_ADDRESS_MODE`，
+也没有控制面的 ServiceAccount/RBAC。也就是说线上此刻仍是"舰队共享 key + 自陈 node_id/address"。
+
+**下一次上线会带什么**（仓库现状，`docs/open-issues.md` N49 行有"关了哪些/没关哪些"的逐条说明）：
+
+- `deploy/k8s/control-plane.yaml` 显式 `E2B_NODE_ADDRESS_MODE=k8s` + 同名 ServiceAccount 与一条
+  **只读 pods**（`get`，namespaced Role/RoleBinding）；没有它解析器**取不到地址就拒**（503 点名），
+  不会退回自陈。
+- node-scoped 四个端点（`register` / `{id}/heartbeat` / `{id}/sandboxes` / `{id}/reconcile`）的自陈
+  直接用不了：解析不到的**自称**一律 503，注册地址不再取 `body["address"]`。
+- **没有** per-node key：仍是共享 key，所以"同一节点上的其它东西同时有该节点 IP 与 key"这档盲区
+  **仍在**（N49 的"未关闭"）。
+
+**⏳ 待部署窗口执行（判据 ③：两节点 worker 的请求在 CP 侧源 IP 不同）**：命令见 C3 Task 2 报告
+§7（`open-cluster-tunnel.sh` → `KUBECONFIG=tmp/k0s/kubeconfig` → 取两个 worker 的 pod IP →
+rollout 后从两个 pod 各发一次节点作用域请求 → `kubectl -n sandlock logs deploy/control-plane` 里
+两行 `came from` 必须是**两个不同**的 pod IP）。**本行待该窗口完成后回填结果。**
+
 ## 8. 改部署的入口
 
 ```bash

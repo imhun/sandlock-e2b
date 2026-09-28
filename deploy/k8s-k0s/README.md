@@ -50,6 +50,13 @@ KUBECONFIG=... deploy/k8s-k0s/apply.sh
 `deploy/scripts/cleanup-plaintext-secrets.py`（经 registry 重写为密文 + 清理残留明文副本 +
 校验；无主 key 时拒绝执行）。操作步骤见 `docs/k8s-deployment.md` §4.5.1。
 
+**C3 Task 2（N49）起不需要新的 Secret 键**：`control-plane` 改为用同名 ServiceAccount +
+一条**只读 pods**（`get`）的 namespaced Role/RoleBinding，按 `node_id`（= StatefulSet pod 名）
+查 pod 得到每个节点的**期望地址**（`E2B_NODE_ADDRESS_MODE=k8s`，都写在基线
+`deploy/k8s/control-plane.yaml` 里，随 `apply.sh` 一起 apply）。没有这个权限时解析失败
+⇒ node-scoped 内部请求**一律 503 点名**（fail closed），不会退回请求自陈的地址。
+registry 表在这件事上不变。
+
 ## 凭据轮换（k0s）
 
 `secrets.sh` 是唯一允许改值的入口：不点名 `--rotate <KEY>` 时，已有的键**一律不动**。

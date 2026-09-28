@@ -22,11 +22,19 @@ the pod API in production, compose resolves the worker's hostname -- see
 ``control_plane/node_address.py`` and controller ruling D4). A resolver that
 cannot determine a node-scoped request's expected address is **fail closed**.
 
-Where a caller genuinely has no node identity (the autoscaler, the gateway, an
-operator, or a fleet key that was never bound to a node) the path is named in
-``control_plane/api/internal.py``'s module docstring and logged; it is never a
-silent exemption. Those fleet surfaces are pinned by ``test_internal_tenants``,
-``test_multinode`` and ``test_internal_key_rotation``.
+The shipped shapes do **not** bind keys to nodes yet, so the fleet key's path
+matters as much as the node-bound one (controller ruling D5): an unbound key may
+no longer claim any node it likes. Its claim must resolve to an expected
+address and the request must arrive from it; a claim that resolves nowhere --
+or no claim at all on ``register`` -- is a named refusal, never the request's
+word and never ``body["address"]``. The credential layer (step ①) is what a
+per-node key adds, and that is the deployment change left for the design's
+"近期" hardening.
+
+Callers that genuinely are not nodes (the autoscaler, the gateway, an operator)
+are on the *fleet* surfaces, which keep the shared key and are exempt by name
+(``_require_fleet_key``, ``docs/open-issues.md`` N49); those are pinned by
+``test_internal_tenants``, ``test_multinode`` and ``test_internal_key_rotation``.
 """
 
 from __future__ import annotations
@@ -390,76 +398,117 @@ async def test_unresolvable_claim_is_refused_named_for_heartbeats(workspace) -> 
         }
 
 
-# ------------------------------------- the named, explicit non-node-scoped path
+# --- the fleet key (the shape the manifests actually ship today): no free pass
 
 
 @pytest.mark.asyncio
-async def test_a_fleet_key_is_an_explicit_named_degradation(
+async def test_a_fleet_key_with_an_unresolvable_claim_is_refused_named(
     workspace, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A key bound to no node is *named*, not quietly exempt.
+    """D5: an unbound key may not claim a node that resolves nowhere.
 
-    The fleet key keeps the pre-C3 behavior (the registration body's address is
-    used, no identity claim is checked) so local/combined and not-yet-migrated
-    lanes keep working -- but each such key logs the degradation once, so
-    "the N49 layers are off here" is a fact an operator can grep for rather
-    than an invisible bypass.
+    This is the hole the review found: with the shipped fleet key, a compromised
+    worker used to be able to ``POST /internal/nodes/register
+    {"nodeID": "e2b-worker-1", "address": "http://attacker:1"}`` and have the
+    control plane dial the attacker. Now the claim must resolve to an expected
+    address, and a claim that resolves nowhere is a refusal -- the body address
+    is never used as a fallback. The degradation is still named once per key.
     """
     nodes = NodeRegistry(heartbeat_timeout=600.0)
     settings = _settings(
-        internal_api_key="fleet-key-degraded-probe", internal_node_keys={}
+        internal_api_key="fleet-key-unresolvable-probe", internal_node_keys={}
     )
     app = _app(workspace, settings=settings, nodes=nodes, endpoints={})
     with caplog.at_level(logging.WARNING, logger="control_plane.api.internal"):
         async with _client(app, source_ip="10.9.9.9") as client:
             resp = await _register(
                 client,
-                key="fleet-key-degraded-probe",
-                node_id="node_x",
-                address="http://10.9.9.9:49983",
+                key="fleet-key-unresolvable-probe",
+                node_id="e2b-worker-1",
+                address="http://attacker.example:1",
             )
-            assert resp.status_code == 200
-    assert nodes.get("node_x").address == "http://10.9.9.9:49983"
-    assert any(
-        "fleet key with no node binding" in record.getMessage()
-        for record in caplog.records
-    )
+            assert resp.status_code == 503
+            assert resp.json() == {
+                "code": 503,
+                "message": (
+                    "cannot determine the expected address for node e2b-worker-1"
+                ),
+            }
+            heartbeat = await client.post(
+                "/internal/nodes/e2b-worker-1/heartbeat",
+                headers={"X-Internal-Key": "fleet-key-unresolvable-probe"},
+                json={},
+            )
+            assert heartbeat.status_code == 503
+    # The impersonated node was never created, and the impersonation is logged.
+    assert nodes.get("e2b-worker-1") is None
+    messages = [record.getMessage() for record in caplog.records]
+    assert (
+        "internal API: cannot determine the expected address for node "
+        "e2b-worker-1; refusing (fail closed)"
+    ) in messages
 
 
 @pytest.mark.asyncio
-async def test_an_explicit_address_mode_gives_a_fleet_key_the_second_factor(
+async def test_a_fleet_key_register_without_a_claim_is_refused_named(
     workspace,
 ) -> None:
-    """A deployment that names its address mode gets layer ④ even on a fleet key.
+    """With no credential-derived node, register must *declare* one to be checked."""
+    nodes = NodeRegistry(heartbeat_timeout=600.0)
+    settings = _settings(
+        internal_api_key="fleet-key-noclaim-probe", internal_node_keys={}
+    )
+    app = _app(workspace, settings=settings, nodes=nodes)
+    async with _client(app, source_ip=ENDPOINT_A.ip) as client:
+        resp = await client.post(
+            "/internal/nodes/register",
+            headers={"X-Internal-Key": "fleet-key-noclaim-probe"},
+            json={"address": "http://anything:1"},
+        )
+        assert resp.status_code == 403
+        assert resp.json() == {
+            "code": 403,
+            "message": (
+                "a node-scoped request with a fleet key must declare the node "
+                "it acts for (register: body.nodeID)"
+            ),
+        }
+    # Nothing was registered -- only the in-process ``local`` node exists.
+    assert [n.node_id for n in nodes.list()] == ["local"]
 
-    The shipped compose/k8s stacks still share one ``E2B_INTERNAL_API_KEY``, so
-    binding keys to nodes is the deployment change that activates step ①. Naming
-    the address mode explicitly is a weaker but free step: the claim cannot be
-    verified against a credential, but it *can* be verified against the network
-    position -- "steal the key and speak from another node's IP" is still
-    refused, and the register address still comes from the resolver.
+
+@pytest.mark.asyncio
+async def test_a_fleet_key_is_accepted_only_from_the_claims_resolved_address(
+    workspace,
+) -> None:
+    """The whole point of D5: the claim is checked against the network position.
+
+    Node B's claim is accepted (and the record's address comes from the
+    resolver, not the body) exactly when the request arrives from the address
+    the resolver maps node B to; the *identical* request from node A's address
+    is refused. This is also what makes the shipped shapes work: the fleet key
+    keeps functioning where the resolver is configured -- and only there.
     """
     nodes = NodeRegistry(heartbeat_timeout=600.0)
     settings = _settings(
-        internal_api_key="fleet-key-mode-probe",
-        internal_node_keys={},
-        node_address_mode="hostname",
+        internal_api_key="fleet-key-position-probe", internal_node_keys={}
     )
     app = _app(workspace, settings=settings, nodes=nodes)
     async with _client(app, source_ip=ENDPOINT_B.ip) as client:
         ok = await _register(
             client,
-            key="fleet-key-mode-probe",
+            key="fleet-key-position-probe",
             node_id="node_b",
             address="http://evil.example:1",
         )
         assert ok.status_code == 200
+        assert ok.json() == {"nodeID": "node_b"}
     assert nodes.get("node_b").address == ENDPOINT_B.address
 
     async with _client(app, source_ip=ENDPOINT_A.ip) as client:
         stolen = await client.post(
             "/internal/nodes/node_b/heartbeat",
-            headers={"X-Internal-Key": "fleet-key-mode-probe"},
+            headers={"X-Internal-Key": "fleet-key-position-probe"},
             json={},
         )
         assert stolen.status_code == 403
@@ -469,3 +518,26 @@ async def test_an_explicit_address_mode_gives_a_fleet_key_the_second_factor(
                 "request for node node_b came from 10.0.0.1, expected 10.0.0.2"
             ),
         }
+
+
+# ------------------------------------------- a non-ASCII credential is a 401
+
+
+@pytest.mark.asyncio
+async def test_a_non_ascii_internal_key_is_a_401_not_a_500(workspace) -> None:
+    """``secrets.compare_digest`` raises on non-ASCII ``str``; a header is bytes.
+
+    The header is decoded as latin-1, so any client can put a non-ASCII value
+    there. That is "wrong credential" (401), never a 500 from the comparison.
+    """
+    app = _app(workspace)
+    async with _client(app, source_ip=ENDPOINT_A.ip) as client:
+        resp = await client.get(
+            "/internal/nodes/node_a/sandboxes",
+            # ``str`` header values are encoded as ASCII by the client, so the
+            # non-ASCII value travels as raw bytes -- which is exactly what a
+            # hostile client can send.
+            headers={b"X-Internal-Key": "\u00e9-not-ascii".encode("utf-8")},
+        )
+        assert resp.status_code == 401
+        assert resp.json() == {"code": 401, "message": "Unauthorized"}

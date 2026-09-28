@@ -155,7 +155,11 @@ class K8sPodAddressResolver:
             # A body that is not JSON is "cannot determine", like any other
             # failure on this path -- never a reason to fall back to the request.
             return None
-        pod_ip = ((payload or {}).get("status") or {}).get("podIP")
+        # ``status`` is a dict on a real Pod; any other shape (a "Status" error
+        # object, a truncated body) is "no address", never an ``AttributeError``
+        # that would surface as a 500 instead of the named fail-closed refusal.
+        status = (payload or {}).get("status") if isinstance(payload, dict) else None
+        pod_ip = status.get("podIP") if isinstance(status, dict) else None
         if not pod_ip:
             return None
         return NodeEndpoint(f"{self._scheme}://{pod_ip}:{self._port}", pod_ip)

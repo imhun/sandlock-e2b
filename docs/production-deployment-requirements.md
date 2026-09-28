@@ -1753,6 +1753,30 @@ for n in json.load(sys.stdin):
 打 `/mcp` 的竞态窗口现在回 **503 + `Retry-After: 1`**（现场探针 `{503: 26, 200: 1}`，
 worker-2 日志 30×503 / 0×500 / 0 traceback，`tmp/n6-live-race.log`）。
 
+### 2.10 internal API 的身份绑定（C3 Task 2 / N49）
+
+节点自己说话的那四个内部端点（`POST /internal/nodes/register`、
+`POST /internal/nodes/{id}/heartbeat`、`GET /internal/nodes/{id}/sandboxes`、
+`POST /internal/nodes/{id}/reconcile`）**不再采信请求自陈的 `node_id`/`address`**：
+
+- **①** 若 key 被 `E2B_INTERNAL_NODE_KEYS` 绑定到某个节点，身份由**凭据**推出；URL/body 里的
+  自称与它不一致即 `403`。
+- **②** 未绑定的**舰队 key 不再免检**：自称必须由 **`E2B_NODE_ADDRESS_MODE`** 解析到一个
+  **期望地址**，且请求必须**从那个地址发出**（源 IP 第二因子）。解析不到（pod 不存在、
+  DNS 不通、API 不可达）即 **`503` 点名**，注册地址**永不取** `body["address"]`。
+- **③** 对象仍只用控制面自己的记录（按推导出的节点过滤）。
+
+| 形态 | 必须设置 | 说明 |
+|---|---|---|
+| k8s（`deploy/k8s/`） | `E2B_NODE_ADDRESS_MODE=k8s`（出厂已设）+ 控制面 SA 的 `get pods` | 出厂清单带一份 namespaced Role/RoleBinding + `serviceAccountName: control-plane`。没有 RBAC 时解析失败 ⇒ **全舰队 503**（fail closed，点名），不是静默放行 |
+| compose（`deploy/compose/*`、`deploy/stack/*`） | `E2B_NODE_ADDRESS_MODE=hostname`（出厂已设） | `node_id` = worker 的 compose 服务名（`worker-1`…）/ 池里容器名，docker 内嵌 DNS 解析；控制面与 worker 必须同网 |
+| 开发/合体（`local://`） | 不用设（`auto`） | 没有 HTTP 注册的独立 worker；C3 明确不覆盖 `local://` |
+
+**未关闭（点名）**：出厂仍是**一把舰队共享 key**。换成 per-node key
+（`E2B_INTERNAL_NODE_KEYS`，机制已实现、未接线）是所谓**近期**加固，mTLS 是目标态；
+`/internal/routes`、`/internal/nodes`、`drain/undrain`、`/internal/fleet/metrics`、
+`/internal/tenants` 是**fleet 作用域**，本任务不覆盖。逐条见 `docs/open-issues.md` N49。
+
 ## 3. 运维要求
 
 ### 3.1 quota 管理（E2B worker 自动执行）

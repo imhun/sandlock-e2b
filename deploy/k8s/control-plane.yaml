@@ -51,6 +51,13 @@ spec:
       # take the pod out of the Service before the process starts closing, so
       # a request never lands on a replica that is already leaving.
       terminationGracePeriodSeconds: 60
+      # C3 Task 2 (N49 / D5): the internal API resolves each node's *expected*
+      # address by reading that node's pod (`E2B_NODE_ADDRESS_MODE=k8s` below).
+      # This is the only API access the control plane needs -- `get` on pods in
+      # its own namespace (Role/RoleBinding at the bottom of this file) -- and
+      # it is what lets a node-scoped request be verified against the network
+      # position instead of the self-declared body.
+      serviceAccountName: control-plane
       # With replicas=2 on a two-node cluster, "both replicas on one node" is a
       # single point of failure that looks like a HA setup. Required, not
       # preferred: the scheduler must spread them, and `maxSurge: 0` above keeps
@@ -173,6 +180,19 @@ spec:
                   name: e2b-secrets
                   key: E2B_INTERNAL_API_KEYS
                   optional: true
+            # C3 Task 2 (N49 / controller ruling D5). Explicit, never `auto`:
+            # the shipped shape must not silently fall back to a mode that
+            # cannot verify a claim. A node-scoped request whose claim does not
+            # resolve to a pod address is refused (503), and the address the
+            # control plane dials back is the pod's -- never `body["address"]`.
+            # `E2B_INTERNAL_NODE_KEYS` (per-node credentials, the design's
+            # near-term hardening) is deliberately *not* set here; read
+            # `docs/open-issues.md` N49 for exactly what this does and does not
+            # close.
+            - name: E2B_NODE_ADDRESS_MODE
+              value: k8s
+            - name: E2B_NODE_ADDRESS_NAMESPACE
+              value: sandlock
             - name: E2B_ENABLE_LOCAL_NODE
               value: "false"
             # SECURITY: credentials come from the `e2b-secrets` Secret that the
@@ -426,3 +446,43 @@ spec:
   selector:
     matchLabels:
       app: control-plane
+---
+# C3 Task 2 (N49 / controller ruling D5): the control plane's identity source.
+#
+# The internal API binds a caller to a node by resolving that node's expected
+# address, and in this shape (`E2B_NODE_ADDRESS_MODE=k8s`) the resolver reads
+# `pods/<node_id>` -- `node_id` *is* the StatefulSet pod name -- with this pod's
+# ServiceAccount. `get` on pods in this namespace is the whole requirement, so
+# it is a namespaced Role (not a ClusterRole) and nothing else is granted.
+# Without it the resolver answers "cannot determine" and every node-scoped
+# request is refused (fail closed, named) -- which is the intended failure
+# shape, not a silent fallback to the caller's word.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: control-plane
+  namespace: sandlock
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: control-plane-pod-reader
+  namespace: sandlock
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: control-plane-pod-reader
+  namespace: sandlock
+subjects:
+  - kind: ServiceAccount
+    name: control-plane
+    namespace: sandlock
+roleRef:
+  kind: Role
+  name: control-plane-pod-reader
+  apiGroup: rbac.authorization.k8s.io

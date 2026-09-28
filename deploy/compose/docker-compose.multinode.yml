@@ -51,6 +51,13 @@ services:
     environment:
       E2B_API_KEYS: local-key
       E2B_INTERNAL_API_KEY: internal-key
+      # C3 Task 2 (N49 / D5): a node's expected address comes from its id --
+      # the compose service name (`worker-1`…), which docker's embedded DNS
+      # resolves for every service on this project network. Explicit, never
+      # `auto`; an unresolvable node-scoped claim is refused. Per-node
+      # credentials (`E2B_INTERNAL_NODE_KEYS`) are not set here -- see
+      # `docs/open-issues.md` N49 for what that leaves open.
+      E2B_NODE_ADDRESS_MODE: hostname
       E2B_ENABLE_LOCAL_NODE: "false"
       # Embedded gateway: route lookups and invalidation stay in-process.
       E2B_CONTROL_PLANE_URL: http://control-plane:3000

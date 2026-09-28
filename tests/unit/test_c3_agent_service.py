@@ -201,28 +201,45 @@ def test_subprocess_runner_refuses_anything_that_is_not_the_ok_line(
 
     The four shapes cover the primitive's own contract (Task 1): non-zero exit
     (usage 2, refusal 77), a stdout that is not the exact line, a missing line,
-    and *any* stderr -- stdout is the grant, stderr is a refusal channel.
+    and *any* stderr -- stdout is the grant, stderr is a refusal channel. The
+    messages are asserted as whole strings (not ``match=``): the point is the
+    exact refusal an operator reads, not that a substring is present.
     """
-    with pytest.raises(AgentRefusal, match="exit 77: .*outside the pool"):
+    with pytest.raises(AgentRefusal) as nonzero:
         SubprocessAsUidRunner(
             str(_script(tmp_path, "echo 'outside the pool' >&2\nexit 77\n"))
         ).grant(999, 4242)
-    with pytest.raises(AgentRefusal, match="unexpected stdout"):
+    assert str(nonzero.value) == "as_uid exit 77: outside the pool"
+    with pytest.raises(AgentRefusal) as wrong_line:
         SubprocessAsUidRunner(
             str(_script(tmp_path, "echo 'C3-ASUID-OK pid=1 uid=2'\n"))
         ).grant(10007, 4242)
-    with pytest.raises(AgentRefusal, match="unexpected stdout"):
+    assert str(wrong_line.value) == (
+        "as_uid returned an unexpected stdout for uid 10007 pid 4242: "
+        "'C3-ASUID-OK pid=1 uid=2\\n'"
+    )
+    with pytest.raises(AgentRefusal) as empty_line:
         SubprocessAsUidRunner(str(_script(tmp_path, "true\n"))).grant(10007, 4242)
-    with pytest.raises(AgentRefusal, match="stderr"):
+    assert str(empty_line.value) == (
+        "as_uid returned an unexpected stdout for uid 10007 pid 4242: ''"
+    )
+    with pytest.raises(AgentRefusal) as noisy_stderr:
         SubprocessAsUidRunner(
             str(_script(tmp_path, "echo oops >&2\necho 'C3-ASUID-OK pid=4242 uid=10007'\n"))
         ).grant(10007, 4242)
+    assert str(noisy_stderr.value) == (
+        "as_uid wrote to stderr for uid 10007 pid 4242: 'oops\\n'"
+    )
 
 
 def test_subprocess_runner_refuses_a_missing_binary(tmp_path: Path) -> None:
     """``as_uid`` not installed is a named refusal, never an exception out."""
-    with pytest.raises(AgentRefusal, match="could not run"):
-        SubprocessAsUidRunner(str(tmp_path / "does-not-exist")).grant(10007, 4242)
+    missing = str(tmp_path / "does-not-exist")
+    with pytest.raises(AgentRefusal) as excinfo:
+        SubprocessAsUidRunner(missing).grant(10007, 4242)
+    assert str(excinfo.value) == (
+        f"could not run as_uid at {missing}: No such file or directory"
+    )
 
 
 # --------------------------------------------------------------------- startup
@@ -240,3 +257,56 @@ def test_the_service_refuses_to_start_without_its_own_identity() -> None:
         "E2B_C3_AGENT_TOKEN is required; refusing to start without auth"
     )
     assert _startup_error(_settings()) is None
+
+
+# ----------------------------------------------------------------- hardening
+
+
+@pytest.mark.asyncio
+async def test_the_service_exposes_no_interactive_surface() -> None:
+    """A privileged service ships no docs schema to enumerate."""
+    app = create_app(settings=_settings(), runner=_StubRunner())
+    async with _client(app) as client:
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            resp = await client.get(path)
+            assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_a_hostile_sandbox_id_is_refused_before_the_runner() -> None:
+    """The id is validated the same way the control plane validates it.
+
+    The refusal is named and does not echo the id back, and the privileged
+    runner is never reached.
+    """
+    runner = _StubRunner()
+    app = create_app(settings=_settings(), runner=runner)
+    async with _client(app) as client:
+        resp = await client.post(
+            GRANT_URL, headers=_headers(), json=_body(sandbox_id="../../etc/passwd")
+        )
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "sandbox_id is not a valid sandbox id"}
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_non_ascii_token_is_a_401_not_a_500() -> None:
+    """``compare_digest`` raises on non-ASCII ``str``; a header can be anything."""
+    app = create_app(settings=_settings(), runner=_StubRunner())
+    async with _client(app) as client:
+        resp = await client.post(
+            GRANT_URL,
+            headers={b"X-Internal-Key": "\u00e9".encode("utf-8")},
+            json=_body(),
+        )
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "unauthorized"}
+
+
+def test_the_listen_host_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bind address is deliberate (Task 3 bounds it with a NetworkPolicy)."""
+    monkeypatch.setenv("E2B_C3_AGENT_HOST", "127.0.0.1")
+    assert Settings(token=TOKEN, node_id=NODE).host == "127.0.0.1"
+    monkeypatch.delenv("E2B_C3_AGENT_HOST")
+    assert Settings(token=TOKEN, node_id=NODE).host == "0.0.0.0"

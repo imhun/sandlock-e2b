@@ -62,6 +62,14 @@ services:
     environment:
       E2B_API_KEYS: ${E2B_API_KEYS:-local-key}
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
+      # C3 Task 2 (N49 / D5): spawned workers are named `e2b-worker-<ts>-<rand>`
+      # and joined to the `sandlock` network (see E2B_AS_DOCKER_NETWORK below),
+      # so the control plane resolves each node's expected address from its id
+      # (container name) via docker's embedded DNS. Explicit, never `auto`; an
+      # unresolvable node-scoped claim is refused. Per-node credentials
+      # (`E2B_INTERNAL_NODE_KEYS`) are not set here -- see `docs/open-issues.md`
+      # N49.
+      E2B_NODE_ADDRESS_MODE: hostname
       # Secret at-rest encryption + Redis persistence (E5.4).
       E2B_SECRET_MASTER_KEY: ${E2B_SECRET_MASTER_KEY:-}
       E2B_SECRET_MASTER_KEYS: ${E2B_SECRET_MASTER_KEYS:-}

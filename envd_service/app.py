@@ -226,6 +226,7 @@ def create_app(
     workspace_base=None,
     control_plane_url: str | None = None,
     node_address: str | None = None,
+    node_id: str | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     # E7.2 pairing guard (2026-09-16): refuse the shape whose only symptom is a
@@ -345,6 +346,7 @@ def create_app(
         runtime_registry=runtime_registry,
         control_plane_url=control_plane_url,
         node_address=node_address,
+        node_id=node_id,
         metrics_provider=quota_monitor.metrics,
     )
 
@@ -411,6 +413,7 @@ def create_app(
 
     app = FastAPI(title="E2B Sandlock Gateway - Envd Service", lifespan=lifespan)
     app.state.settings = settings
+    app.state.node_agent = agent
     app.state.quota_agent_client = quota_agent_client
     app.state.runtime_registry = runtime_registry
     app.state.runtimes: dict[str, SandboxRuntimeContext] = {}

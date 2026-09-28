@@ -208,3 +208,112 @@ def test_compose_workers_dial_the_control_plane_directly() -> None:
             # value here asserts (an override is the operator's own doing).
             default = value.split(":-", 1)[1].rstrip("}") if ":-" in value else value
             assert default == "http://control-plane:3000", f"{path.name}:{name}"
+
+
+# ------------------------------- the mode is pinned in every production shape
+
+
+def _k8s_control_plane_env() -> dict[str, str]:
+    """The `control-plane` container's env by name (parsed, not grepped)."""
+    deployments = [
+        doc
+        for doc in _load_all(K8S / "control-plane.yaml")
+        if doc.get("kind") == "Deployment"
+    ]
+    assert len(deployments) == 1
+    containers = deployments[0]["spec"]["template"]["spec"]["containers"]
+    env = next(c for c in containers if c["name"] == "control-plane")["env"]
+    return {entry["name"]: entry.get("value") for entry in env}
+
+
+def test_the_k8s_control_plane_pins_the_k8s_address_mode() -> None:
+    """D5.2/D5.4: production must not be on ``auto``.
+
+    ``auto`` is the dev/local default (``local://`` is explicitly out of C3's
+    scope). A production manifest left on ``auto`` could silently pick a mode
+    that cannot verify a claim; the explicit value is what the internal API's
+    fail-closed/resolve behavior is designed against.
+    """
+    assert _k8s_control_plane_env()["E2B_NODE_ADDRESS_MODE"] == "k8s"
+    assert _k8s_control_plane_env()["E2B_NODE_ADDRESS_NAMESPACE"] == "sandlock"
+
+
+def test_the_k8s_control_plane_can_read_pods_and_nothing_else() -> None:
+    """The `k8s` resolver needs `get pods`; the RBAC grants exactly that.
+
+    Without it the mode fails closed (every node-scoped request 503s), so the
+    grant is part of the shipped shape, not an operator extra.
+    """
+    docs = _load_all(K8S / "control-plane.yaml")
+    by_kind = {}
+    for doc in docs:
+        by_kind.setdefault(doc.get("kind"), []).append(doc)
+    accounts = by_kind.get("ServiceAccount") or []
+    assert [a["metadata"]["name"] for a in accounts] == ["control-plane"]
+    roles = by_kind.get("Role") or []
+    assert len(roles) == 1
+    assert roles[0]["rules"] == [
+        {"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}
+    ]
+    bindings = by_kind.get("RoleBinding") or []
+    assert len(bindings) == 1
+    assert bindings[0]["roleRef"] == {
+        "kind": "Role",
+        "name": "control-plane-pod-reader",
+        "apiGroup": "rbac.authorization.k8s.io",
+    }
+    assert bindings[0]["subjects"] == [
+        {
+            "kind": "ServiceAccount",
+            "name": "control-plane",
+            "namespace": "sandlock",
+        }
+    ]
+    deployment = (by_kind["Deployment"] or [])[0]
+    assert (
+        deployment["spec"]["template"]["spec"]["serviceAccountName"]
+        == "control-plane"
+    )
+    # No ClusterRole / ClusterRoleBinding: the resolver only ever reads pods in
+    # its own namespace, so cluster-wide reads are not granted.
+    assert "ClusterRole" not in by_kind
+    assert "ClusterRoleBinding" not in by_kind
+
+
+def test_every_production_compose_control_plane_pins_the_hostname_mode() -> None:
+    """Same rule for the compose shapes: explicit ``hostname``, never ``auto``."""
+    paths = [
+        REPO / "deploy" / "compose" / "docker-compose.prod.yml",
+        REPO / "deploy" / "compose" / "docker-compose.multinode.yml",
+        REPO / "deploy" / "compose" / "docker-compose.autoscale.yml",
+        REPO / "deploy" / "stack" / "docker-compose.prod.yml",
+    ]
+    for path in paths:
+        services = _compose(path).get("services") or {}
+        control_plane = services.get("control-plane")
+        assert control_plane is not None, f"{path.name} has no control-plane"
+        env = _compose_env(control_plane)
+        assert env["E2B_NODE_ADDRESS_MODE"] == "hostname", path.name
+
+
+def test_no_worker_shape_carries_the_agent_token() -> None:
+    """Task 3's rule, pinned early: the agent's credential is CP↔agent only.
+
+    A worker that could read ``E2B_C3_AGENT_TOKEN`` would hold the agent's
+    credential, and the ``CP→agent`` channel would be reachable from the
+    (untrusted) data plane -- exactly the channel hard rule 5 says does not
+    exist. Task 3 owns the DaemonSet/NetworkPolicy; this pin keeps the token out
+    of every worker manifest and the worker image meanwhile.
+    """
+    worker_sources = [
+        K8S / "worker.yaml",
+        K8S / "autoscaler.yaml",
+        REPO / "deploy" / "compose" / "docker-compose.prod.yml",
+        REPO / "deploy" / "compose" / "docker-compose.multinode.yml",
+        REPO / "deploy" / "compose" / "docker-compose.autoscale.yml",
+        REPO / "deploy" / "stack" / "docker-compose.prod.yml",
+        REPO / "deploy" / "docker" / "Dockerfile.envd",
+        REPO / "autoscaler" / "backends" / "local.py",
+    ]
+    for path in worker_sources:
+        assert "E2B_C3_AGENT_TOKEN" not in path.read_text(encoding="utf-8"), path

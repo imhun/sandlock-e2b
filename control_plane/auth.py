@@ -53,7 +53,22 @@ def verify_internal_key(provided: str | None, settings) -> bool:
         )
     if not keys:
         return False
-    return any(secrets.compare_digest(provided, key) for key in keys)
+    return any(_keys_match(provided, key) for key in keys)
+
+
+def _keys_match(provided: str, expected: str) -> bool:
+    """Constant-time compare that treats a non-ASCII header as a mismatch.
+
+    ``secrets.compare_digest`` raises ``TypeError`` for a ``str`` outside the
+    ASCII range (the constant-time path only exists for ASCII/bytes). A header
+    is attacker-controlled bytes decoded as latin-1, so a non-ASCII
+    ``X-Internal-Key`` used to turn "wrong credential" into a 500. It is a
+    mismatch, and nothing else.
+    """
+    try:
+        return secrets.compare_digest(provided, expected)
+    except TypeError:
+        return False
 
 
 def node_id_for_key(provided: str | None, settings) -> str | None:
@@ -76,7 +91,7 @@ def node_id_for_key(provided: str | None, settings) -> str | None:
     mapping = getattr(settings, "internal_node_keys", None) or {}
     matched: str | None = None
     for key, node_id in mapping.items():
-        if secrets.compare_digest(provided, key):
+        if _keys_match(provided, key):
             matched = node_id
     return matched
 

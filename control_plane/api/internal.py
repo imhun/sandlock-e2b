@@ -17,7 +17,9 @@ node, and the request must come from the node's expected address):
 
 **Fleet/ops scope** (the caller is not a node and has no node identity to bind:
 the autoscaler, the envd gateway, or an operator). These keep the shared key
-and are *explicitly* exempt, by name -- see :func:`_require_fleet_key`:
+and are *explicitly* exempt, by name -- see :func:`_require_fleet_key`. This is
+pre-existing behavior the task does not change; the exemption is named here and
+in ``docs/open-issues.md`` row N49 so it cannot be mistaken for coverage:
 
 * ``GET  /internal/routes/{sandbox_id}`` (gateway route lookup)
 * ``GET  /internal/nodes``, ``GET /internal/fleet/metrics`` (autoscaler/ops)
@@ -29,9 +31,23 @@ credential → node (``control_plane.auth.node_id_for_key``); ② the request's
 claim must equal it; ③ the objects are the control plane's own records, scoped
 by that node (done by the registry calls the handler already makes); plus the
 source-IP second factor, whose expected value comes from a resolver -- never
-from the request. A node-bound request whose expected address cannot be
-determined **fails closed, named**. A key bound to no node is a named
-degradation, logged once, so the exemption is greppable rather than invisible.
+from the request.
+
+Two keys are *not* interchangeable here, and the difference is the whole point
+of N49:
+
+* a **node-bound** key (``E2B_INTERNAL_NODE_KEYS``) fixes the identity before
+  the request is read: the claim must equal it (403 otherwise), and the request
+  must then come from that node's expected address.
+* a **fleet** key (the shared ``E2B_INTERNAL_API_KEY``) cannot say *which* node
+  is calling. It is accepted on a node-scoped handler only when the claim
+  **resolves to an expected address** and the request comes from it -- i.e. only
+  where the network position can vouch for the node. A claim that resolves
+  nowhere is **refused** (503, named), never taken on faith, and the register
+  address is never ``body["address"]``. This keeps the unbound key working
+  where the resolver is configured (every shipped shape sets
+  ``E2B_NODE_ADDRESS_MODE``) while closing the "claim any node from anywhere"
+  hole the review found.
 """
 
 from __future__ import annotations
@@ -79,31 +95,16 @@ def _require_fleet_key(request: Request) -> None:
     _require_internal_key(request)
 
 
-def _resolve_node(request: Request, node_id: str | None) -> NodeEndpoint | None:
+def _resolve_node(request: Request, node_id: str) -> NodeEndpoint | None:
     """The expected endpoint for ``node_id``, or ``None`` when unknown.
 
-    ``None`` is never a guess and never the observed peer address (D4): callers
-    either fail closed (node-bound) or name the degradation (fleet key).
+    ``None`` is never a guess and never the observed peer address (D4): the
+    caller **fails closed** and names the node.
     """
     resolver = getattr(request.app.state, "node_address_resolver", None)
-    if resolver is None or node_id is None:
+    if resolver is None:
         return None
     return resolver.resolve(node_id)
-
-
-def _address_enforcement_configured(settings) -> bool:
-    """True when the deployment **opted in** to an address mode explicitly.
-
-    ``auto`` keeps the pre-C3 behavior for *unbound* keys (see
-    :func:`_require_node_identity`): the harness and every combined/local lane
-    run with no resolvable node names, and a wildcard DNS search domain would
-    otherwise turn a fleet-key heartbeat into a false 403. An explicit
-    ``E2B_NODE_ADDRESS_MODE=k8s|hostname`` is the operator saying "the expected
-    addresses are real here", so a fleet key then gets the same second factor a
-    node-bound key always gets.
-    """
-    mode = (getattr(settings, "node_address_mode", "auto") or "auto").strip().lower()
-    return mode in ("k8s", "hostname")
 
 
 def _enforce_source_ip(request: Request, node_id: str, endpoint: NodeEndpoint) -> None:
@@ -131,38 +132,20 @@ def _enforce_source_ip(request: Request, node_id: str, endpoint: NodeEndpoint) -
 
 def _require_node_identity(
     request: Request, claimed_node_id: str | None
-) -> tuple[str | None, NodeEndpoint | None]:
+) -> tuple[str, NodeEndpoint]:
     """Steps ①② + the source-IP layer for a node-scoped handler.
 
-    Returns ``(node_id, endpoint)``: the node the request acts for (the
-    credential-derived one for a bound key) and its expected endpoint, or
-    ``(claim, None)`` for a fleet key whose address could not be resolved.
+    Returns the node the request acts for (the credential-derived one for a
+    bound key, the declared one otherwise) and its **resolved** endpoint. Both
+    failure modes are named: a bound key whose claim disagrees is a 403, and any
+    claim that cannot be resolved to an expected address -- bound or not -- is a
+    503. There is deliberately no "unresolvable, so take the request's word"
+    branch (that was N49).
     """
     key = _require_internal_key(request)
     settings = request.app.state.settings
     derived = node_id_for_key(key, settings)
-    if derived is None:
-        # Step ① cannot bind this key to a node. Named, once per key: the
-        # request keeps the pre-C3 behavior (so local/combined and un-migrated
-        # lanes work), but "the N49 layers are off for this key" is greppable.
-        if key not in _fleet_keys_reported:
-            _fleet_keys_reported.add(key)
-            logger.warning(
-                "internal API: X-Internal-Key is a fleet key with no node binding "
-                "(E2B_INTERNAL_NODE_KEYS): the node-identity claim check is inactive "
-                "for node-scoped requests; bind keys to nodes to close N49",
-            )
-        endpoint = None
-        if _address_enforcement_configured(settings):
-            # An explicit mode means the deployment has real expected addresses:
-            # the key cannot vouch for *which* node this is, but the network
-            # position still can -- a resolvable claim must speak from it.
-            endpoint = _resolve_node(request, claimed_node_id)
-            if endpoint is not None:
-                _enforce_source_ip(request, claimed_node_id or "", endpoint)
-        return claimed_node_id, endpoint
-
-    if claimed_node_id is not None and claimed_node_id != derived:
+    if derived is not None and claimed_node_id is not None and claimed_node_id != derived:
         logger.warning(
             "internal API: X-Internal-Key is bound to node %s but the request "
             "claims node %s; refusing",
@@ -174,21 +157,48 @@ def _require_node_identity(
             f"X-Internal-Key is bound to node {derived}; "
             f"request claims node {claimed_node_id}",
         )
-    endpoint = _resolve_node(request, derived)
+    node_id = derived if derived is not None else claimed_node_id
+    if derived is None:
+        # Step ① cannot bind this key to a node, so the network position is the
+        # only thing that can vouch for the claim. Named once per key: the
+        # credential half is off here, and an operator greps for this line.
+        if key not in _fleet_keys_reported:
+            _fleet_keys_reported.add(key)
+            logger.warning(
+                "internal API: X-Internal-Key is a fleet key with no node binding "
+                "(E2B_INTERNAL_NODE_KEYS): the credential cannot say which node is "
+                "calling, so a node-scoped request is accepted only from the claim's "
+                "resolved address; bind keys to nodes to restore step ①",
+            )
+        if node_id is None:
+            # Only ``register`` can get here (the URL carries the node for the
+            # other three): a fleet key must say which node it is registering
+            # as, because there is nothing else to check the claim against.
+            logger.warning(
+                "internal API: register with a fleet key carried no nodeID; "
+                "refusing (nothing to verify the identity against)",
+            )
+            raise OfficialError(
+                403,
+                "a node-scoped request with a fleet key must declare the node "
+                "it acts for (register: body.nodeID)",
+            )
+    endpoint = _resolve_node(request, node_id)
     if endpoint is None:
         # Fail closed: "I cannot determine where this node is" must never mean
-        # "so allow it". The line below is the alarm for a fleet-wide,
-        # self-inflicted refusal (the pod API / DNS is down).
+        # "so take the caller's word (or the body's address)". The line below is
+        # the alarm for a fleet-wide, self-inflicted refusal (the pod API / DNS
+        # is down, or the node id does not exist).
         logger.warning(
             "internal API: cannot determine the expected address for node %s; "
             "refusing (fail closed)",
-            derived,
+            node_id,
         )
         raise OfficialError(
-            503, f"cannot determine the expected address for node {derived}"
+            503, f"cannot determine the expected address for node {node_id}"
         )
-    _enforce_source_ip(request, derived, endpoint)
-    return derived, endpoint
+    _enforce_source_ip(request, node_id, endpoint)
+    return node_id, endpoint
 
 
 @router.post("/internal/nodes/register")
@@ -206,16 +216,17 @@ async def register_node(request: Request) -> dict[str, Any]:
         raise OfficialError(400, "Request body must be a JSON object")
     node_id, endpoint = _require_node_identity(request, body.get("nodeID"))
     address = body.get("address")
-    if endpoint is not None:
-        if address and address != endpoint.address:
-            logger.warning(
-                "internal API: node %s registered the address %s but the "
-                "resolver expects %s; using the resolver's",
-                node_id,
-                address,
-                endpoint.address,
-            )
-        address = endpoint.address
+    if address and address != endpoint.address:
+        # A self-declared address that disagrees is a rewrite attempt (or a
+        # stale worker): the resolver's answer is the only one ever dialed.
+        logger.warning(
+            "internal API: node %s registered the address %s but the "
+            "resolver expects %s; using the resolver's",
+            node_id,
+            address,
+            endpoint.address,
+        )
+    address = endpoint.address
     record = request.app.state.nodes.register(
         node_id=node_id,
         address=address,

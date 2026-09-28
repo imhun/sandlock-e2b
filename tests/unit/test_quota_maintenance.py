@@ -24,6 +24,7 @@ from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.quota_maintenance import QuotaMonitor
 from envd_service.runtime.registry import RuntimeRegistry
+from tests._c3_resolver import loopback_resolver
 from envd_service.xfs_quota import (
     ProjectDirectoryGone,
     ProjectDirectoryUnreadable,
@@ -1400,6 +1401,9 @@ async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
         settings=ControlSettings(api_keys=("local-key",)),
         runtime_registry=RuntimeRegistry(tmp_path),
         workspace_base=tmp_path,
+        # C3 Task 2: a node-scoped request is only accepted from the address the
+        # resolver maps its claim to (the fleet key cannot vouch for the node).
+        node_address_resolver=loopback_resolver("node_a"),
     )
     headers = {"X-Internal-Key": "internal-key"}
     async with httpx.AsyncClient(
@@ -1409,6 +1413,7 @@ async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
             "/internal/nodes/register",
             headers=headers,
             json={
+                "nodeID": "node_a",
                 "address": "http://127.0.0.1:49983",
                 "totalMemoryMB": 1024,
                 "totalCPUPercent": 200,
@@ -1660,7 +1665,12 @@ async def _run_reconcile_round(
         registry=registry,
         nodes_registry=node_registry,
         workspace_base=base,
+        node_address_resolver=loopback_resolver(*nodes),
     )
+    # A separated control plane has no in-process worker; the lane models the
+    # remote workers it registered (the ``local`` node would otherwise be
+    # enumerated by the round's fleet sweep and refused as unresolvable).
+    control.state.nodes.remove("local")
     worker = agent.NodeAgent(
         settings=EnvdSettings(executor="local", workspace_base=base),
         runtime_registry=RuntimeRegistry(base),

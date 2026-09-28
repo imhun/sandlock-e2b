@@ -29,6 +29,11 @@ class Settings:
         default_factory=lambda: os.getenv("E2B_C3_AGENT_NODE_ID")
         or os.getenv("E2B_NODE_ID", "")
     )
+    #: Listen address. ``0.0.0.0`` by default because the control plane dials
+    #: this service from another pod; what must bound the reach is a
+    #: NetworkPolicy allowing only CP→agent (Task 3's DaemonSet), not a loopback
+    #: bind that would just break the channel. Kept configurable so a shape with
+    #: a local sidecar can bind deliberately.
     host: str = field(
         default_factory=lambda: os.getenv("E2B_C3_AGENT_HOST", "0.0.0.0")
     )
