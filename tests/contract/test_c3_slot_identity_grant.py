@@ -48,6 +48,37 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AGENT_IMAGE = "e2b-sandlock-agent:c3-task3-test"
 WORKER_IMAGE = "python:3.14-slim"
+#: The lane's own scratch, inside the repository's ``tmp/`` (the rule for every
+#: lane here). The driver container writes the program the child execs into it.
+LANE_TMP = PROJECT_ROOT / "tmp" / "c3-slot-child"
+#: The worker-side driver: the *production* child path, run where the worker
+#: runs (65534, no capabilities, repository mounted).
+CHILD_DRIVER = "/w/tests/contract/c3_slot_child_driver.py"
+CHILD_DRIVER_MOUNT = "/w"
+
+
+def _host_repo_path() -> str:
+    """Where this repository lives *on the Docker host*.
+
+    The worker containers are started by the daemon, so a bind mount has to name
+    a path the **host** can resolve -- while this test may itself be running
+    inside a container (the lane's normal place), where the repository is mounted
+    somewhere else. The mount table of the container we are in is the honest
+    source, and a run directly on the host falls back to our own path.
+    """
+    inspected = _run(
+        "docker",
+        "inspect",
+        "--format",
+        "{{range .Mounts}}{{.Source}}->{{.Destination}}\n{{end}}",
+        os.uname().nodename,
+    )
+    if inspected.returncode == 0:
+        for line in inspected.stdout.splitlines():
+            source, _, destination = line.partition("->")
+            if destination.strip() == str(PROJECT_ROOT):
+                return source.strip()
+    return str(PROJECT_ROOT)
 
 #: The pool uid the grant hands out (E2B_UID_POOL_START/SIZE in the C side).
 GRANT_UID = 10009
@@ -87,7 +118,7 @@ import sys
 from deploy.c3_agent.lookup import LookupRefusal, ProcLookup, WorkerIdentity
 container_pid, pid_namespace, node_id, sandbox_id = sys.argv[1:5]
 try:
-    host = ProcLookup().host_pid(
+    slot = ProcLookup().host_pid(
         int(container_pid),
         WorkerIdentity(node_id=node_id, pid_namespace=pid_namespace),
         sandbox_id=sandbox_id,
@@ -95,7 +126,10 @@ try:
 except LookupRefusal as exc:
     print(f"C3-REFUSED {exc}", flush=True)
 else:
-    print(f"C3-RESOLVED host={host}", flush=True)
+    print(
+        f"C3-RESOLVED host={slot.host_pid} start={slot.start_time}",
+        flush=True,
+    )
 '''
 
 
@@ -147,7 +181,9 @@ def agent_image(tmp_path_factory: pytest.TempPathFactory) -> str:
 
 def _logs(container: str) -> str:
     logs = _run("docker", "logs", container)
-    return logs.stdout + logs.stderr
+    # ``docker logs`` prefixes each stream's chunks with a framing byte; strip
+    # the control range so line-anchored patterns see the real lines.
+    return re.sub(r"[\x00-\x08\x0e-\x1f]", "", logs.stdout + logs.stderr)
 
 
 def _wait_for(container: str, pattern: str, timeout: float = 60.0) -> str:
@@ -228,9 +264,64 @@ class _Topology:
         )
         assert started.returncode == 0, started.stderr
 
+    def start_child_driver(
+        self, name: str, *, mode: str, delay: float = 0.0
+    ) -> tuple[str, float]:
+        """Start a worker container running the production child path.
+
+        Returns the container name and the moment it was started, so a lane can
+        bound *when* the worker reported (``--mode delayed`` is only reported
+        once the child's handshake byte has arrived).
+        """
+        LANE_TMP.mkdir(parents=True, exist_ok=True)
+        LANE_TMP.chmod(0o777)
+        container = f"c3-si-driver-{name}-{self.suffix}"
+        started_at = time.monotonic()
+        started = _run(
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            container,
+            "--user",
+            "65534:65534",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "seccomp=unconfined",
+            "-v",
+            f"{_host_repo_path()}:{CHILD_DRIVER_MOUNT}",
+            "-w",
+            CHILD_DRIVER_MOUNT,
+            "-e",
+            "PYTHONPATH=/w",
+            "--entrypoint",
+            "python3",
+            WORKER_IMAGE,
+            CHILD_DRIVER,
+            "--uid",
+            str(GRANT_UID),
+            "--mode",
+            mode,
+            "--delay",
+            str(delay),
+            "--tmp-dir",
+            "/w/tmp/c3-slot-child",
+        )
+        assert started.returncode == 0, started.stderr
+        self.drivers = getattr(self, "drivers", [])
+        self.drivers.append(container)
+        return container, started_at
+
     def stop(self) -> None:
-        names = [*self.workers.values(), self.agent]
+        names = [*self.workers.values(), self.agent, *getattr(self, "drivers", [])]
         _run("docker", "rm", "-f", *names)
+
+    def pid_namespace_of(self, container: str) -> str:
+        """The container's pid namespace, as any process inside it reads it."""
+        result = _run("docker", "exec", container, "readlink", "/proc/self/ns/pid")
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
 
     def finish_child(self, name: str) -> str:
         return _wait_for(
@@ -284,6 +375,37 @@ def _container_id(container: str) -> str:
     return inspected.stdout.strip()
 
 
+def _cgroup_owner(cgroup_text: str) -> str:
+    """The container id a host-side cgroup path ends in.
+
+    Docker's cgroup drivers spell the leaf three ways -- ``docker-<id>.scope``
+    (systemd), ``<id>`` (cgroupfs) and the same under a runtime prefix -- so the
+    wrapper is stripped before the comparison, never the id itself.
+    """
+    leaf = cgroup_text.strip().rsplit("/", 1)[-1]
+    for prefix in ("docker-", "crio-", "cri-containerd-"):
+        if leaf.startswith(prefix):
+            leaf = leaf[len(prefix) :]
+            break
+    if leaf.endswith(".scope"):
+        leaf = leaf[: -len(".scope")]
+    return leaf
+
+
+def _resolved_pid(resolved: str) -> int:
+    """The host pid out of the driver's answer, shape checked exactly.
+
+    The start time rides along because the lookup is required to record it (a
+    pid alone cannot be re-found after the fact); asserting the shape here is
+    what keeps the real ``/proc/<pid>/stat`` parse honest on a real kernel.
+    """
+    # ``start`` is the kernel's birth tick: a parse that silently read the wrong
+    # field would give 0, not a positive number.
+    match = re.fullmatch(r"C3-RESOLVED host=(\d+) start=([1-9]\d*)", resolved)
+    assert match is not None, resolved
+    return int(match.group(1))
+
+
 @pytest.fixture()
 def topology(agent_image: str) -> _Topology:
     topo = _Topology(agent_image)
@@ -294,6 +416,134 @@ def topology(agent_image: str) -> _Topology:
         yield topo
     finally:
         topo.stop()
+
+
+@pytest.fixture()
+def agent_only(agent_image: str) -> _Topology:
+    """Just the agent (hostPID), for the lanes that bring their own worker."""
+    topo = _Topology(agent_image)
+    try:
+        topo.start_agent()
+        yield topo
+    finally:
+        topo.stop()
+
+
+def _wait_for_ready(container: str, timeout: float = 60.0) -> tuple[int, str, float]:
+    """``(container_pid, mode, seconds from the call until the report)``.
+
+    The elapsed time is the observable the ordering lane needs: the driver
+    prints this line *after* its handshake, so it cannot precede the child's
+    ``unshare`` -- but a worker that reported on the spawn alone would print it
+    immediately.
+    """
+    started = time.monotonic()
+    pattern = r"^C3-DRIVER-READY container_pid=(\d+) mode=([\w-]+)$"
+    deadline = started + timeout
+    while time.monotonic() < deadline:
+        match = re.search(pattern, _logs(container), re.MULTILINE)
+        if match is not None:
+            return int(match.group(1)), match.group(2), time.monotonic() - started
+        time.sleep(0.05)
+    raise AssertionError(
+        f"{container}: no {pattern!r} within {timeout}s:\n{_logs(container)}"
+    )
+
+
+@pytest.mark.parametrize("iteration", [1, 2, 3, 4, 5])
+def test_the_production_child_path_grants_then_execs(
+    agent_only: _Topology, iteration: int
+) -> None:
+    """D11.2: the *worker's* child module, not a stand-in, end to end.
+
+    ``_spawn_slot_identity`` builds ``child_argv`` for
+    ``python -m envd_service.slot_identity``, hands it the handshake descriptor
+    and returns only after the child's ``unshare``. From there the real grant
+    runs (face A's ``as_uid`` against the real ``/proc``) and the child -- which
+    has been polling ``setresuid`` -- execs the program it was told to run. That
+    covers argv parsing, the handshake, the poll loop and the descriptor
+    surviving the interpreter start, and it is repeated because a race is not
+    disproved by one pass.
+    """
+    name = f"production-{iteration}"
+    container, _started = agent_only.start_child_driver(name, mode="production")
+    container_pid, mode, _elapsed = _wait_for_ready(container)
+    assert mode == "production"
+    identity = agent_only.pid_namespace_of(container)
+
+    resolved = agent_only.lookup(container_pid, identity, name)
+    host_pid = _resolved_pid(resolved)
+
+    granted = agent_only.grant(host_pid)
+    assert granted.returncode == 0, granted.stderr
+    assert granted.stdout == f"C3-ASUID-OK pid={host_pid} uid={GRANT_UID}\n"
+    assert granted.stderr == ""
+
+    # The child got past setresuid and exec'd -- with the identity the agent
+    # wrote, and still inside the worker's own pid namespace.
+    assert _wait_for(
+        container, r"^(C3-SLOT-EXEC-OK uid=\d+ pidns=pid:\[\d+\])$"
+    ) == f"C3-SLOT-EXEC-OK uid={GRANT_UID} pidns={identity}"
+    stat = agent_only.exec_in_agent("stat", "-c", "%u", f"/proc/{host_pid}")
+    assert stat.stdout.strip() == str(GRANT_UID)
+
+
+def test_the_report_waits_for_a_slow_childs_unshare(agent_only: _Topology) -> None:
+    """D11, in the lane: the worker is *late* by exactly the child's delay.
+
+    The child here is the production module behind a wrapper that sleeps one
+    second before exec'ing it, and the descriptor rides through both execs. The
+    worker's report is printed only after the handshake byte, so it cannot appear
+    before the child has unshared -- while a worker that reported on the spawn
+    alone would print immediately (and then grant a namespace that does not
+    exist yet).
+    """
+    delay = 1.0
+    container, _started = agent_only.start_child_driver(
+        "slow", mode="delayed", delay=delay
+    )
+    container_pid, mode, elapsed = _wait_for_ready(container)
+    assert mode == "delayed"
+    assert elapsed >= delay
+
+    identity = agent_only.pid_namespace_of(container)
+    resolved = agent_only.lookup(container_pid, identity, "slow")
+    host_pid = _resolved_pid(resolved)
+    granted = agent_only.grant(host_pid)
+    assert granted.returncode == 0, granted.stderr
+    assert _wait_for(
+        container, r"^(C3-SLOT-EXEC-OK uid=\d+ pidns=pid:\[\d+\])$"
+    ) == f"C3-SLOT-EXEC-OK uid={GRANT_UID} pidns={identity}"
+
+
+def test_a_grant_that_precedes_the_unshare_is_refused_by_name(
+    agent_only: _Topology,
+) -> None:
+    """The counter-arm: the old ordering is a *refusal*, not a slow success.
+
+    ``--mode no-wait`` is the pre-D11 worker: it reports the pid straight off
+    ``Popen``, with the child still a second away from its ``unshare``. Face A
+    then reads the initial namespace's full-range map and refuses by name --
+    which is exactly the intermittent create failure the handshake removes, and
+    the reason the ordering is a contract and not a tuning detail.
+    """
+    container, _started = agent_only.start_child_driver(
+        "nowait", mode="no-wait", delay=1.0
+    )
+    container_pid, mode, _elapsed = _wait_for_ready(container)
+    assert mode == "no-wait"
+    identity = agent_only.pid_namespace_of(container)
+    resolved = agent_only.lookup(container_pid, identity, "nowait")
+    host_pid = _resolved_pid(resolved)
+
+    granted = agent_only.grant(host_pid)
+    assert granted.returncode == 77
+    assert granted.stdout == ""
+    assert granted.stderr == (
+        f"as_uid: refused: uid_map for pid {host_pid} is the initial namespace's "
+        "full range: this pid has not unshared a user namespace, so there is "
+        "no new identity to grant\n"
+    )
 
 
 def test_two_workers_with_the_same_container_pid_are_not_confusable(
@@ -317,21 +567,30 @@ def test_two_workers_with_the_same_container_pid_are_not_confusable(
 
     resolved_1 = topology.lookup(first, topology.identities["worker-1"], "worker-1")
     resolved_2 = topology.lookup(second, topology.identities["worker-2"], "worker-2")
-    assert re.fullmatch(r"C3-RESOLVED host=\d+", resolved_1), resolved_1
-    assert re.fullmatch(r"C3-RESOLVED host=\d+", resolved_2), resolved_2
-    host_1 = int(resolved_1.split("=")[1])
-    host_2 = int(resolved_2.split("=")[1])
+    host_1 = _resolved_pid(resolved_1)
+    host_2 = _resolved_pid(resolved_2)
     assert host_1 != host_2
 
     # Ownership, independently of the lookup: the host-side cgroup of each
-    # resolved process carries that worker's own container id (the same shape
-    # the k8s lane matches on with ``pod<uid>``, §14.2.7).
+    # resolved process *is* its own worker's cgroup, byte for byte -- and the two
+    # workers' cgroups are different strings, because they are different
+    # containers. That is the same shape the k8s lane matches on with
+    # ``pod<uid>`` (§14.2.7), asserted exactly rather than "contains".
     cgroup_1 = topology.proc_text(host_1, "cgroup")
     cgroup_2 = topology.proc_text(host_2, "cgroup")
-    assert _container_id(topology.workers["worker-1"]) in cgroup_1
-    assert _container_id(topology.workers["worker-2"]) in cgroup_2
-    assert _container_id(topology.workers["worker-2"]) not in cgroup_1
-    assert _container_id(topology.workers["worker-1"]) not in cgroup_2
+    worker_1_pid = _resolved_pid(
+        topology.lookup(1, topology.identities["worker-1"], "worker-1")
+    )
+    worker_2_pid = _resolved_pid(
+        topology.lookup(1, topology.identities["worker-2"], "worker-2")
+    )
+    assert cgroup_1 == topology.proc_text(worker_1_pid, "cgroup")
+    assert cgroup_2 == topology.proc_text(worker_2_pid, "cgroup")
+    assert cgroup_1 != cgroup_2
+    # ... and the cgroup's own last path element is that worker's container id
+    # (``docker-<id>.scope`` on a systemd host, the bare id on a cgroupfs one).
+    assert _cgroup_owner(cgroup_1) == _container_id(topology.workers["worker-1"])
+    assert _cgroup_owner(cgroup_2) == _container_id(topology.workers["worker-2"])
 
 
 def test_a_worker_identity_that_matches_nobody_is_refused_by_name(
@@ -369,12 +628,12 @@ def test_the_grant_lands_on_the_host_identity_and_keeps_the_workers_cgroup(
     resolved = topology.lookup(
         container_pid, topology.identities["worker-1"], "worker-1"
     )
-    host_pid = int(resolved.split("=")[1])
+    host_pid = _resolved_pid(resolved)
     # The worker's *own* process, resolved the same way (it is pid 1 inside its
     # container): the comparison in ② is against the worker's cgroup, so this
     # has to be a host pid too, never the container pid.
-    worker_pid = int(
-        topology.lookup(1, topology.identities["worker-1"], "worker-1").split("=")[1]
+    worker_pid = _resolved_pid(
+        topology.lookup(1, topology.identities["worker-1"], "worker-1")
     )
 
     granted = topology.grant(host_pid)
@@ -405,9 +664,8 @@ def test_the_grant_lands_on_the_host_identity_and_keeps_the_workers_cgroup(
         if line.startswith("CapEff:")
     ]
     assert caps == ["0000000000000000"]
-    # ... and it is the same worker whose cgroup the slot is in (the identity
-    # the control plane matched is the *worker's*, not "some process on the
-    # host").
-    assert _container_id(topology.workers["worker-1"]) in topology.proc_text(
-        worker_pid, "cgroup"
+    # ... and it is the same worker whose cgroup the slot is in (the identity the
+    # control plane matched is the *worker's*, not "some process on the host").
+    assert _cgroup_owner(topology.proc_text(worker_pid, "cgroup")) == _container_id(
+        topology.workers["worker-1"]
     )

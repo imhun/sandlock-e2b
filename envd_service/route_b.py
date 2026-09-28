@@ -304,8 +304,13 @@ def _spawn_slot_identity(
     which instructs agent face A to write the map. The child is the one that
     execs ``sandlock-supervise`` -- so the process tree, the cgroup and the
     session stay the worker's (hard rule 1).
+
+    It returns only **after** the child's handshake byte (D11): reporting on the
+    spawn alone races the child's ``unshare``, and a grant that wins that race is
+    refused by face A ("this pid has not unshared a user namespace"), which is an
+    intermittent create failure.
     """
-    from envd_service.slot_identity import child_argv
+    from envd_service.slot_identity import spawn_child
 
     env = dict(os.environ)
     # Same reason as the setpriv form: the registry-root formula must not follow
@@ -322,10 +327,9 @@ def _spawn_slot_identity(
         control_fd=control_fd,
         events_fd=events_fd,
     )
-    argv = child_argv(uid=uid, supervise_argv=supervise)
-    return subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
+    return spawn_child(
+        uid=uid,
+        supervise_argv=supervise,
         stdout=stdout,
         stderr=stderr,
         env=env,

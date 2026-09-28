@@ -23,7 +23,10 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,6 +46,8 @@ NODE_ID = "worker-1"
 SANDBOX_ID = "sbx_slot_identity"
 CHILD_PID = 4242
 PID_NAMESPACE = "pid:[4026532458]"
+#: The real ``Popen``, kept before any test patches the module attribute.
+_REAL_POPEN = subprocess.Popen
 
 
 class FakeProcess:
@@ -163,9 +168,11 @@ def test_agent_grant_never_hands_the_pool_the_broker_spawner(
             slot_spawner=lambda **kw: FakeProcess()
         )
     )
+    monkeypatch.setenv("E2B_CONTROL_PLANE_URL", CONTROL_PLANE_URL)
+    monkeypatch.setenv("E2B_NODE_ID", NODE_ID)
     assert RouteBConfig.from_settings(_settings(slot_identity="spawn")).spawner is not None
     agent_grant = RouteBConfig.from_settings(
-        _settings(slot_identity="agent-grant", control_plane_url=CONTROL_PLANE_URL)
+        _settings(slot_identity="agent-grant")
     )
     assert agent_grant.spawner is None
     assert agent_grant.identity_reporter is not None
@@ -195,6 +202,21 @@ def test_the_child_is_started_without_any_privileged_helper() -> None:
     assert argv[6] == "/wheels/sandlock/bin/sandlock-supervise"
     assert "setpriv" not in argv
     assert not any("e2b-slot-spawn" in arg for arg in argv)
+
+    # With the handshake (the production form): the descriptor comes before the
+    # ``--`` separator, and the slot's own argv is untouched after it.
+    with_fd = si.child_argv(
+        uid=20007,
+        supervise_argv=["/wheels/sandlock/bin/sandlock-supervise", "--uid", "20007"],
+        unshared_fd=9,
+    )
+    assert with_fd[3:7] == ["--uid", "20007", "--unshared-fd", "9"]
+    assert with_fd[7:] == [
+        "--",
+        "/wheels/sandlock/bin/sandlock-supervise",
+        "--uid",
+        "20007",
+    ]
 
 
 # ------------------------------------------------------------- the report itself
@@ -279,7 +301,24 @@ def test_an_unreachable_control_plane_is_a_named_refusal() -> None:
     )
 
 
-def test_the_reporter_is_only_built_when_the_worker_knows_where_the_cp_is() -> None:
+def test_the_reporter_is_built_from_the_workers_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real source of "where is my control plane, who am I".
+
+    ``envd_service.config.Settings`` has no field for either, so the environment
+    (``E2B_CONTROL_PLANE_URL`` / ``E2B_NODE_ID`` -- the same two the node agent
+    registers with) is what a worker actually reads. An embedder may override
+    both, and an explicit ``""`` means "not wired" rather than "fall back".
+    """
+    monkeypatch.delenv("E2B_CONTROL_PLANE_URL", raising=False)
+    monkeypatch.delenv("E2B_NODE_ID", raising=False)
+    assert wi.build_identity_reporter(_settings()) is None
+    monkeypatch.setenv("E2B_CONTROL_PLANE_URL", CONTROL_PLANE_URL)
+    assert wi.build_identity_reporter(_settings()) is None
+    monkeypatch.setenv("E2B_NODE_ID", NODE_ID)
+    assert callable(wi.build_identity_reporter(_settings()))
+
     assert (
         wi.build_identity_reporter(
             _settings(), control_plane_url="", node_id=NODE_ID
@@ -292,12 +331,6 @@ def test_the_reporter_is_only_built_when_the_worker_knows_where_the_cp_is() -> N
         )
         is None
     )
-    reporter = wi.build_identity_reporter(
-        _settings(),
-        control_plane_url=CONTROL_PLANE_URL,
-        node_id=NODE_ID,
-    )
-    assert callable(reporter)
 
 
 def test_the_workers_pid_namespace_is_read_from_proc(tmp_path: Path) -> None:
@@ -316,10 +349,16 @@ def test_the_worker_has_neither_the_agents_address_nor_its_token() -> None:
     """⑥/⑦ The second and third checkpoints of "only two channels exist".
 
     The worker's own settings surface has no agent knobs at all, and nothing
-    under ``envd_service/`` -- the package the worker image ships -- mentions
-    the agent's URL or token variable. A worker that cannot name them cannot
-    dial them, which is what makes the connection-layer refusal in slice B a
-    *second* line rather than the only one.
+    under ``envd_service/`` -- the package the worker image ships -- mentions the
+    agent's URL, its token variable, or even the port it listens on. A worker
+    that cannot *name* the agent cannot dial it, which is what makes slice B's
+    connection-layer refusal (the NetworkPolicy) a second line rather than the
+    only one.
+
+    What this does **not** cover, and slice B owns: the real connection refusal
+    between the two containers on a live node, and the same check against the
+    worker *manifests* (``tests/unit/test_c3_internal_api_shape.py`` pins the
+    token half of that today).
     """
     assert not [
         name for name in vars(Settings()) if "c3_agent" in name.lower()
@@ -327,12 +366,169 @@ def test_the_worker_has_neither_the_agents_address_nor_its_token() -> None:
     offender = []
     for path in (REPO_ROOT / "envd_service").rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        if "E2B_C3_AGENT_URL" in text or "E2B_C3_AGENT_TOKEN" in text:
+        if (
+            "E2B_C3_AGENT_URL" in text
+            or "E2B_C3_AGENT_TOKEN" in text
+            or "49985" in text
+        ):
             offender.append(str(path.relative_to(REPO_ROOT)))
     assert offender == []
 
 
 # ------------------------------------------------------------ the pool's wiring
+
+
+def _fake_child(si_module, monkeypatch, body: str):
+    """Make ``child_argv`` produce a stand-in child with a controlled body.
+
+    The real child is ``python -m envd_service.slot_identity``; a stand-in whose
+    signal time the test controls is how the ordering claim becomes measurable
+    instead of a coin flip. The lane that runs the *real* child is
+    ``tests/contract/test_c3_slot_identity_grant.py``.
+    """
+
+    def _argv(*, uid: int, supervise_argv, unshared_fd: int | None = None):
+        fd = -1 if unshared_fd is None else unshared_fd
+        return [sys.executable, "-c", body.replace("__FD__", str(fd))]
+
+    monkeypatch.setattr(si_module, "child_argv", _argv)
+
+
+class _RecordedPopen:
+    """Records every Popen the module starts, so a killed child is visible."""
+
+    instances: list["_RecordedPopen"] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.inner = _REAL_POPEN(*args, **kwargs)
+        type(self).instances.append(self)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def test_the_starter_returns_only_after_the_child_signals_its_unshare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D11: the report must follow the child's ``unshare``, not its ``execve``.
+
+    ``Popen`` returns when the child has *exec'd*; the child's ``unshare``
+    happens later, inside the child module. Reporting on the spawn therefore
+    races the grant -- and when the grant wins, ``as_uid`` sees the initial
+    namespace's full-range map and refuses, so the create fails. The child here
+    signals after a known delay, and the starter must still be inside its
+    handshake when that delay has not elapsed.
+    """
+    import envd_service.slot_identity as si
+
+    delay = 0.4
+    _fake_child(
+        si,
+        monkeypatch,
+        "import os, time\n"
+        f"time.sleep({delay})\n"
+        "os.write(__FD__, b'x')\n"
+        "os.close(__FD__)\n"
+        "time.sleep(60)\n",
+    )
+    started = time.monotonic()
+    process = si.spawn_child(
+        uid=20001,
+        supervise_argv=[sys.executable, "-c", "pass"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    elapsed = time.monotonic() - started
+    try:
+        # It waited for the signal: a starter that reported on the spawn alone
+        # would be back in a few milliseconds.
+        assert elapsed >= delay
+    finally:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def test_a_child_that_never_signals_is_named_and_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child wedged before ``unshare`` fails the create by name, not a hang."""
+    import envd_service.slot_identity as si
+
+    _fake_child(si, monkeypatch, "import time; time.sleep(60)\n")
+    monkeypatch.setattr(si, "unshared_timeout_s", lambda: 0.3)
+    monkeypatch.setattr(si.subprocess, "Popen", _RecordedPopen)
+    _RecordedPopen.instances = []
+    with pytest.raises(si.UnshareHandshakeError) as excinfo:
+        si.spawn_child(
+            uid=20001,
+            supervise_argv=[sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    assert str(excinfo.value) == (
+        f"the slot child (pid {_RecordedPopen.instances[0].pid}) did not report "
+        "its user namespace within 0.3s: refusing (the identity grant would "
+        "race the unshare)"
+    )
+    # Nothing was left behind to poll setresuid forever.
+    assert _RecordedPopen.instances[0].inner.wait(timeout=10) == -signal.SIGKILL
+
+
+def test_a_child_that_dies_before_signalling_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EOF on the handshake is "the child is gone", and it says so."""
+    import envd_service.slot_identity as si
+
+    _fake_child(si, monkeypatch, "raise SystemExit(3)\n")
+    monkeypatch.setattr(si.subprocess, "Popen", _RecordedPopen)
+    _RecordedPopen.instances = []
+    with pytest.raises(si.UnshareHandshakeError) as excinfo:
+        si.spawn_child(
+            uid=20001,
+            supervise_argv=[sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    assert str(excinfo.value) == (
+        f"the slot child (pid {_RecordedPopen.instances[0].pid}) exited before "
+        "reporting its user namespace: refusing"
+    )
+
+
+def test_the_pool_reports_only_after_the_childs_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two together: the CP is told about a child that has already unshared."""
+    import envd_service.slot_identity as si
+
+    delay = 0.4
+    _fake_child(
+        si,
+        monkeypatch,
+        "import os, time\n"
+        f"time.sleep({delay})\n"
+        "os.write(__FD__, b'x')\n"
+        "os.close(__FD__)\n"
+        "time.sleep(60)\n",
+    )
+    marks: list[float] = []
+
+    def _reporter(sandbox_id: str, pid: int):
+        marks.append(time.monotonic())
+        return {"status": "ok"}
+
+    pool, _spawned, order, _reports = _pool(
+        tmp_path, spawner=None, identity_reporter=_reporter
+    )
+    started = time.monotonic()
+    handle = pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001)
+    try:
+        assert len(marks) == 1
+        assert marks[0] - started >= delay
+    finally:
+        handle.process.kill()
+        handle.process.wait(timeout=10)
 
 
 def test_the_register_and_heartbeat_payloads_carry_the_identity(
