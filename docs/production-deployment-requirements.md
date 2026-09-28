@@ -91,6 +91,35 @@ F1 探针当时判"userns 需要 `CAP_SYS_ADMIN`"，那是在**本机 OrbStack �
 > ⇒ **本地完全能做 userns（以及 `net_isolation`）的验证**；"只能上目标机验"的说法撤回，
 > `docs/reports/task-usernsprobe-report.md` §6 的那条建议随之失效。
 
+> **三次更正（2026-09-28，真集群实测，更正上面那条"充分条件"的**归因**）**：上面写的
+> 「映射非自身 uid 的充分条件是 **BND ⊇ SETUID + 发行版 helper + `/etc/subuid` 委托段**」
+> —— **结论方向对（不需要 root、不需要 `CAP_SYS_ADMIN`），但归因错**。真集群上把
+> `open()` 与 `write()` 分开测出来的规则是：
+>
+> **写者的 euid 必须等于目标 user namespace 的 `owner`**（= 目标 `unshare(CLONE_NEWUSER)`
+> 那一刻的 euid），外加 `CAP_SETUID`/`CAP_SETGID` 以写任意 outside id；再外加"能打开目标的
+> `/proc/<pid>/uid_map`"（同 uid 且目标 **dumpable**，或有 `DAC_OVERRIDE`）。
+>
+> **helper 与 `/etc/subuid` 都不在这条规则里** —— 它们是 `newuidmap` 这个**具体工具**的自我约束，
+> 不是内核判据。`newuidmap` 之所以能工作，恰恰因为目标机上的它是 **file-cap `cap_setuid=ep`
+> （0755）、以调用者 uid 运行**：写者 euid 65534 == 目标 ns owner 65534。
+> **反例已实测**：同一个真集群上，**root 写者**（euid 0 + 默认 cap 集含 `CAP_SETUID`，甚至
+> 另加 `SYS_PTRACE`）给一个"以 65534 unshare"的目标写同一份 map，`write` 一律 `EPERM`；
+> 把写者换成 **euid 65534 + 仅 `SETUID|SETGID`**，**跨 pod、跨 pid namespace、且不是父进程**，
+> 写入成功且宿主侧 `stat` 到 `10000:65534`。
+>
+> **机理（同日查证，并一次可证伪的预言命中）**：节点的内核是 `6.12.0-211.34.1.el10_2.aarch64`
+> （RHEL 6.12 树，已 backport 上游那道检查）。`kernel/user_namespace.c::map_write()` 里在
+> `new_idmap_permitted()` **之前**有一道先决检查：*"Adjusting namespace settings requires
+> capabilities on the target"* —— `!file_ns_capable(file, map_ns, CAP_SYS_ADMIN)` 即 `-EPERM`，
+> **打开该文件的进程必须在目标 userns 里持有 `CAP_SYS_ADMIN`**。而 `cap_capable()` 的
+> **owner 规则**（`(ns->parent == cred->user_ns) && uid_eq(ns->owner, cred->euid)` ⇒ 拥有全部能力）
+> 让"**euid == 目标 ns 的 owner**"的写者**白得**这个能力 —— 这正是同 uid 写者能成的原因，也解释了
+> 为什么 root 写者需要真 `CAP_SYS_ADMIN`（实测：**给 root 加上 `SYS_ADMIN` 即成功**，而加
+> `SYS_PTRACE` 无效——**那是加错了能力**）。**可复现的规则 → 已定性的机理。**
+> 细节、8 个数据点与那条预言见 `docs/c3-privilege-relocation.md` §14.2.7；探针
+> `deploy/scripts/acceptance/probe_c3_userns_map_handoff.py`。
+
 | broker（`/var/lib/e2b-priv/`） | file caps | 调用形态 |
 |---|---|---|
 | `e2b-slot-spawn` | `cap_setuid,cap_setgid+ep` | `spawn --uid X --gid X -- <sandlock-supervise 绝对路径> <args…>`；内部 `setgroups([])`→`setgid(X)`→`setuid(X)`→`execve`。`argv[0]` 钉死为 supervise 绝对路径、X 必须在已配 uid 池内，所以它不是「以任意 uid 跑任意程序」的通用工具；**不 shell、也不转手 exec 别的 setuid 工具**（实测那样 caps 会在 exec 时丢失：`setresuid failed: EPERM`）。槽位 exec 后自动零 cap（uid 变更清空 permitted/effective，supervise 自身无 file caps）。 |

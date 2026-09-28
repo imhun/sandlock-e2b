@@ -1465,6 +1465,18 @@ F1 探针（`task-f1probe-report.md` B5-1）"非 root 映射非自身 uid 需要
 "userns 也要 `setcap`"是把 **file caps** 与 userns 混为一谈：userns 走的是发行版 helper 的
 setuid 位（RHEL 系实现为 file caps），容器侧只需 BND 里那几条，而 `0xc3` 本就含。
 
+> **2026-09-28 三次更正（真集群实测，更正上面那条"充分条件"的归因）**：上面写的「充分条件是
+> **BND ⊇ `SETUID` + 发行版 helper + `/etc/subuid` 委托段**」—— **结论方向对（不需要 root、
+> 不需要 `SYS_ADMIN`），但归因错**。真集群上把 `open()` 与 `write()` 分开测出来的规则是：
+> **写者的 euid 必须等于目标 user namespace 的 `owner`**（= 目标 `unshare(CLONE_NEWUSER)` 那一刻
+> 的 euid），外加 `CAP_SETUID`/`CAP_SETGID`。**helper 与 `/etc/subuid` 都不在这条规则里** ——
+> 它们是 `newuidmap` 这个**具体工具**的自我约束。上面那句"helper 走 setuid 位（RHEL 实现为 file
+> caps）"其实已经指对了方向：**file-cap ⇒ 它以调用者 uid 运行 ⇒ euid 与目标同为 65534**，这才是
+> 它能工作的原因。**反例已实测**：同一集群上 root 写者（默认 cap 集含 `CAP_SETUID`，加
+> `SYS_PTRACE` 亦同）给"以 65534 unshare"的目标写同一份 map，`write` 一律 `EPERM`；换成
+> **euid 65534 + 仅 `SETUID`/`SETGID`**、跨 pod、非父进程，写入成功。
+> 细节与 8 个数据点机理已定性：`map_write()` 要求在目标 ns 有 `CAP_SYS_ADMIN`，而 `cap_capable()` 的 owner 规则让「euid == 目标 ns 的 owner」白得它（实测：给 root 加 `SYS_ADMIN` 亦成立）。见 `docs/c3-privilege-relocation.md` §14.2.7。
+
 ### U.2 触发条件（修正后）
 
 | # | 触发条件 | 说明 |

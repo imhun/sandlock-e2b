@@ -79,7 +79,10 @@
 | `probe-pure-workload-census.py` | 同一组命令在三种形态下的 (rc, stdout, stderr)，逐字节 diff。 | —（头部无 Usage 行；见脚本头部） |
 | `probe_127_errno.py` | Why does a *missing* path answer EACCES(13) instead of ENOENT(2)? | 头部示例（旧拼写）`sh tmp/k0s/phase1-probe2.sh /workspace/tmp/k0s/probe_127_errno.py` |
 | `probe_brief_stat_live.py` | A/B of the fix on the live cluster (N25): os.stat vs entry_size. | —（头部无 Usage 行；见脚本 `--help`） |
+| `probe_broker_authorization_surface.py` | C1 broker 的**授权面**：确认它对"哪一个沙箱"没有任何概念（`docs/c3-privilege-relocation.md` §14.3）。 | 三 phase 分别在不同容器：`--phase setup / cleanup` 在 **broker pod**（root，PVC 可写），`--phase attempt` 在 **worker pod**（65534，需 `PYTHONPATH=/app`）；判据 `C1-AUTHZ-VERDICT=no-sandbox-authorization` |
+| `probe_c3_userns_map_handoff.py` | C3 §14.2.7：**非父进程、跨 pod、跨 pid namespace** 能不能替 worker 的已 unshare 子进程写 uid/gid 映射（决定 worker 能否既保进程树又零特权）。 | 三个 role：`--role forker` 跑在 `e2b-worker-0`（65534）、`--role agent --agent-keep-caps-uid 65534` 跑在 `deploy/k8s-k0s/c3map-probe-agent.yaml` 那个 `hostPID` pod 里、`--role matrix` 做写者/目标身份的对照矩阵（单 pod 内）；判据 `C3-MAPHANDOFF-VERDICT=agent-can-map` |
 | `probe_c2_ownership_p0.py` | C2 P0：uid 0 对别人 `0600`/`0700` 的语义（读/遍历/删/改）+ 粘滞位与组位（`docs/c2-ownership-frontload.md` §7）。 | 由 `c2-p0-probe.sh` 在 Job 里跑（root + NFS）；本机彩排 `sh deploy/scripts/acceptance/c2-p0-probe.sh --root DIR`；退出码 0/1/2/3/4/5 |
+| `probe_c3_a5_silent_rmtree.py` | C3 §13.7/A5：CP 的"配对删除"在非属主身份下**静默失败**（调用真实函数 `_remove_local_tree_confirming`，4 个 cell）。 | 在**挂了共享 PVC 的 root 容器**里：`env PYTHONPATH=/app python3 probe_c3_a5_silent_rmtree.py --root <那 8 条 RW 子挂载之一下的目录>`（CP 根挂载只读，见 `docs/c3-privilege-relocation.md` §13.8）；退出码 0/2 |
 | `probe_ceiling_completeness.py` | Can anything still grow the tree once the ceiling is exactly zero? | —（头部无 Usage 行；见脚本 `--help`） |
 | `probe_copy_range_zero.py` | `copy_file_range` reported 300 MiB moved while the file stayed 4096 bytes. | —（头部无 Usage 行；见脚本 `--help`） |
 | `probe_dir_cost.py` | What a directory really costs on this NAS: st_size vs st_blocks, by entry count. | —（头部无 Usage 行；见脚本 `--help`） |

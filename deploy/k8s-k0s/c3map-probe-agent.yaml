@@ -1,0 +1,35 @@
+# C3「uid_map 代写」探针的 **agent 侧** pod（`docs/c3-privilege-relocation.md` §14.2.7）。
+#
+# 它模拟"每节点 agent"要当的那个角色，只为了量一件事：**一个不是父进程、且在别的
+# pid namespace 里的进程**，能不能给 worker 的已 unshare 子进程写 uid/gid 映射。
+#
+# 需要的最小条件是这两条（都不是 CAP_SYS_ADMIN）：
+#   * `hostPID: true` —— 否则看不到 worker 那边的 pid，`/proc/<pid>/uid_map` 无从谈起；
+#   * 容器内 root（默认 cap 集里的 CAP_SETUID/CAP_SETGID）—— 写 map 要的正是它们。
+#
+# 对面（forker 侧）不需要任何改动，直接 exec 进 `e2b-worker-0` 跑同一个探针脚本的
+# `--role forker`。跑完 `kubectl delete -f` 即可。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: c3map-probe-agent
+  namespace: sandlock
+  labels:
+    app: c3map-probe-agent
+spec:
+  hostPID: true
+  restartPolicy: Never
+  containers:
+    - name: agent
+      # 与 worker 同一个镜像：省一次拉取，且它已经在本节点上。
+      image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0-721-g01e4b72-20260927-231235
+      command: ["sleep", "infinity"]
+      securityContext:
+        runAsUser: 0
+      volumeMounts:
+        - name: shared
+          mountPath: /var/lib/e2b-sandboxes
+  volumes:
+    - name: shared
+      persistentVolumeClaim:
+        claimName: sandbox-shared
