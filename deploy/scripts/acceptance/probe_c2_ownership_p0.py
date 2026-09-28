@@ -52,6 +52,16 @@ Printed contract (one ``P0-CELL`` line per cell, then the verdicts):
                                     ``0770 owner=X group=<worker gid>`` shape the
                                     C2 plan asserts can only come from a hand-over
                                     -- a decision, not a probe failure.)
+  ``P0C-setgid-inheritance=yes|partial|no``
+                                    does a one-time setgid on the shared parent
+                                    carry the worker's group (and the setgid bit)
+                                    down X's whole tree? (``partial`` = right one
+                                    level deep, gone below.)
+  ``P0C-worker-deletes-via-group``  can the worker unlink inside such a tree
+                                    (``umask 007``, ``2770``)? If yes, walk/delete
+                                    inside the tree need no "become X".
+  ``P0C-sticky-preserved``          ...while the sticky bit still keeps it from
+                                    removing another uid's *whole* subtree.
   ``C2-P0-VERDICT=zero-regression|regression:<cell>|unusable:<cell>``
 
 Exit codes: 0 = zero-regression printed, 1 = regression/unusable, 2 = usage,
@@ -175,6 +185,14 @@ def fixtures(worker_uid: int, worker_gid: int, pool_uid: int,
         # two measurements can be compared like for like (cells E1-E3).
         "worker-0700": FixtureSpec("worker-0700", 0o700, "worker", worker_uid, worker_gid,
                                    0o600, "worker", worker_uid, worker_gid),
+        # The candidate answer to the `gid = <worker gid>` decision: a **setgid +
+        # sticky** shared parent (`0o3777`, group = the worker's gid), created once
+        # by the platform. If the storage lets X's children inherit that group --
+        # and the setgid bit -- then "create as X" produces the whole
+        # ``owner=X group=<worker gid>`` tree with no hand-over at all, while the
+        # sticky bit keeps X from deleting anyone else's tree (cells F1-F4).
+        "setgid-parent": FixtureSpec("setgid-parent", 0o3777, "root", 0, worker_gid,
+                                     0o644, "root", 0, worker_gid),
     }
 
 
@@ -220,17 +238,23 @@ def _fork_result(action: Callable[[], str]) -> str:
 
 
 def run_as(identity: Identity, op: str, path: Path, *, mode: int = 0o700,
-           target_uid: int = -1, target_gid: int = -1) -> str:
+           target_uid: int = -1, target_gid: int = -1,
+           umask: int | None = None) -> str:
     """Fork, become ``identity``, perform ``op`` on ``path``; return ``OK``/``ERR:..``."""
     def action() -> str:
         _become(identity)
         return _perform(op, path, mode=mode, target_uid=target_uid,
-                        target_gid=target_gid)
+                        target_gid=target_gid, umask=umask)
     return _fork_result(action)
 
 
 def _perform(op: str, path: Path, *, mode: int, target_uid: int,
-             target_gid: int) -> str:
+             target_gid: int, umask: int | None = None) -> str:
+    if umask is not None:
+        # The deployment's own lever: `mkdir` mode is masked by the umask, so a
+        # sandbox that must produce group-writable directories has to run with
+        # `umask 007` (022 would strip the group write bit).
+        os.umask(umask)
     if op == "stat":
         os.stat(path)
     elif op == "listdir":
@@ -263,10 +287,13 @@ def _perform(op: str, path: Path, *, mode: int, target_uid: int,
 # ---------------------------------------------------------------------------
 
 
-def create_as(identity: Identity, path: Path, mode: int, *, directory: bool) -> str:
+def create_as(identity: Identity, path: Path, mode: int, *, directory: bool,
+              umask: int | None = None) -> str:
     """Fork a child that creates ``path`` (directory or file) as ``identity``."""
     def action() -> str:
         _become(identity)
+        if umask is not None:
+            os.umask(umask)
         if directory:
             os.mkdir(path, mode)
         else:
@@ -554,6 +581,87 @@ def _e3(ctx: Ctx) -> str:
     return ctx.run("root", "listdir", ctx.dir)
 
 
+# --- can a one-time setgid on the shared parent carry the worker's group? ----
+
+
+def _gid_mode(path: Path) -> tuple[int, int]:
+    info = os.stat(path)
+    return info.st_gid, stat.S_IMODE(info.st_mode)
+
+
+@_cell("F1-as-X-child-inherits-worker-group", "setgid-parent")
+def _f1(ctx: Ctx) -> str:
+    """X creates a directory inside the platform's setgid parent: whose group?
+
+    ``umask 007`` is the other half of the recipe: the mode X asks for is masked by
+    its umask, so a group-writable tree requires the sandbox to run with `007`
+    (with `022` the child loses the group write bit and the worker cannot delete
+    inside it -- see ``F3``).
+    """
+    child = ctx.dir / "pool-child"
+    created = ctx.run("pool", "mkdir", child, mode=0o770, umask=0o007)
+    if created != "OK":
+        return created
+    gid, _ = _gid_mode(child)
+    return "OK" if gid == ctx.worker_gid else f"ERR:gid={gid}"
+
+
+@_cell("F1b-child-keeps-the-setgid-bit", "setgid-parent")
+def _f1b(ctx: Ctx) -> str:
+    """...and does the storage keep the setgid bit on it (so *grand*children inherit)?"""
+    child = ctx.dir / "pool-child"
+    created = ctx.run("pool", "mkdir", child, mode=0o770, umask=0o007)
+    if created != "OK":
+        return created
+    _, mode = _gid_mode(child)
+    return "OK" if mode & stat.S_ISGID else f"ERR:setgid-cleared:mode={oct(mode)}"
+
+
+@_cell("F2-as-X-grandchild-still-worker-group", "setgid-parent")
+def _f2(ctx: Ctx) -> str:
+    """Two levels down: does the group still come out as the worker's?"""
+    child = ctx.dir / "pool-child"
+    created = ctx.run("pool", "mkdir", child, mode=0o770, umask=0o007)
+    if created != "OK":
+        return created
+    grandchild = child / "deeper"
+    created = ctx.run("pool", "mkdir", grandchild, mode=0o770, umask=0o007)
+    if created != "OK":
+        return created
+    gid, _ = _gid_mode(grandchild)
+    return "OK" if gid == ctx.worker_gid else f"ERR:gid={gid}"
+
+
+@_cell("F3-worker-deletes-inside-inherited-tree", "setgid-parent")
+def _f3(ctx: Ctx) -> str:
+    """The worker (65534) unlinks a file inside X's setgid-inherited directory."""
+    child = ctx.dir / "pool-child"
+    created = ctx.run("pool", "mkdir", child, mode=0o770, umask=0o007)
+    if created != "OK":
+        return created
+    payload = child / "tenant-file"
+    created = create_as(ctx.ident("pool"), payload, 0o660, directory=False, umask=0o007)
+    if created != "OK":
+        return created
+    return ctx.run("worker", "unlink", payload)
+
+
+@_cell("F4-worker-removes-X-subtree", "setgid-parent")
+def _f4(ctx: Ctx) -> str:
+    """The worker must **not** be able to remove X's subtree: the sticky bit holds.
+
+    (The setgid change must not cost the shared root its cross-uid protection --
+    if the worker *can* remove another uid's tree here, the shared root became
+    unsafe for a different reason.)
+    """
+    child = ctx.dir / "pool-child"
+    created = ctx.run("pool", "mkdir", child, mode=0o770, umask=0o007)
+    if created != "OK":
+        return created
+    result = ctx.run("worker", "rmtree", child)
+    return "OK" if result.startswith("ERR:") else f"ERR:worker-could-remove:{result}"
+
+
 # ---------------------------------------------------------------------------
 # verdicts
 # ---------------------------------------------------------------------------
@@ -568,7 +676,9 @@ PREMISE_CELLS = (
 )
 VERDICT_KEYS = (
     "C1-CONTROL", "C2-PREMISE", "P0A-uid0-override", "P0A-uid0-needs-the-group",
-    "P0A-uid0-record-check", "P0B-sticky", "P0B-x-can-chgrp", "C2-P0-VERDICT",
+    "P0A-uid0-record-check", "P0B-sticky", "P0B-x-can-chgrp",
+    "P0C-setgid-inheritance", "P0C-worker-deletes-via-group",
+    "P0C-sticky-preserved", "C2-P0-VERDICT",
 )
 
 
@@ -604,6 +714,9 @@ def verdicts(rows: dict[str, str]) -> dict[str, str]:
             "P0A-uid0-record-check": "unknown",
             "P0B-sticky": "unknown",
             "P0B-x-can-chgrp": "unknown",
+            "P0C-setgid-inheritance": "unknown",
+            "P0C-worker-deletes-via-group": "unknown",
+            "P0C-sticky-preserved": "unknown",
             "C2-P0-VERDICT": f"unusable:{unknown}",
         }
 
@@ -613,6 +726,9 @@ def verdicts(rows: dict[str, str]) -> dict[str, str]:
     record_read = rows.get("E1-uid0-read-worker-0600", "MISSING")
     sticky = rows.get("D1-other-unlink-in-1777", "MISSING")
     chgrp = rows.get("A6-as-X-chgrp-to-worker-gid", "MISSING")
+    inherit_child = rows.get("F1-as-X-child-inherits-worker-group", "MISSING")
+    inherit_bit = rows.get("F1b-child-keeps-the-setgid-bit", "MISSING")
+    inherit_deep = rows.get("F2-as-X-grandchild-still-worker-group", "MISSING")
     out = {
         "C1-CONTROL": "ok" if control is None else f"broken:{control}",
         "C2-PREMISE": "ok" if premise is None else f"broken:{premise}",
@@ -640,6 +756,25 @@ def verdicts(rows: dict[str, str]) -> dict[str, str]:
         ),
         "P0B-x-can-chgrp": (
             "yes" if chgrp == "OK" else "no" if chgrp.startswith("ERR:") else "unknown"
+        ),
+        # The candidate answer to the `gid = <worker gid>` decision: one setgid bit
+        # on the shared parent, no hand-over. `partial` = the group comes out right
+        # for the first level but the bit (and therefore the next level) does not.
+        "P0C-setgid-inheritance": (
+            "yes" if (inherit_child, inherit_bit, inherit_deep) == ("OK", "OK", "OK")
+            else "partial" if inherit_child == "OK"
+            else "no" if inherit_child.startswith("ERR:")
+            else "unknown"
+        ),
+        "P0C-worker-deletes-via-group": (
+            "yes" if rows.get("F3-worker-deletes-inside-inherited-tree") == "OK"
+            else "no" if str(rows.get("F3-worker-deletes-inside-inherited-tree", "MISSING")).startswith("ERR:")
+            else "unknown"
+        ),
+        "P0C-sticky-preserved": (
+            "yes" if rows.get("F4-worker-removes-X-subtree") == "OK"
+            else "no" if str(rows.get("F4-worker-removes-X-subtree", "MISSING")).startswith("ERR:")
+            else "unknown"
         ),
     }
     if control is not None:

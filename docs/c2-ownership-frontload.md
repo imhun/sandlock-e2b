@@ -94,6 +94,78 @@ e2b-as-uid extract --uid X --gid G             --path D     # stdin = tar 流，
 > **不是 X 自己能产生的**。三选一：保留一次极小的交棒（谁来做、算不算 "worker 永不 chown" 的
 > 例外）、放弃组位模型（worker 也改成"以 X 为唯一通道"）、或者换存储。这同样必须在写计划之前定死。
 
+### 4.1 裁定一：`rm` / `walk`（删除与记账）怎么"以 X 身份"做
+
+**先看它们今天在哪、以谁的身边跑**（C1 之后都经 broker 的 socket；`grep priv_helpers`）：
+
+| 调用点 | 干什么 | C2 下"以 X"是否必须 |
+|---|---|---|
+| `uid_pool` 的孤儿回收（把 stale 树 chown/删掉） | 删整棵无主树 | **必须**：树根在粘滞的 `<workspaces>` 里，worker 删不掉（`D2`/`F4`），而且没有活着的槽位可借 |
+| `agent.py` 建箱失败/拆箱（`remove_tree(workspace_dir)`）、迁移源清理（`remove_tree(workspace)`） | 删整棵树 | **必须**，同上 |
+| `volumes.py` 的卷切片删除（`remove_tree(sandbox_dir)`） | 删切片 | **必须**（卷根 `1777` 也是粘滞的） |
+| `checkpoint_store` 的镜像目录回收（`remove_tree(image)`） | 删 worker 自己的目录 | 不需要："gate" `_runtime/.checkpoints` 是 **worker 自己**的（`0711 owner=65534`，init 保证），worker 直接删 |
+| `dir_size` / `brief_stat` / 磁盘账本 walk | 遍历+sizes | **不需要**（见下：组位够用，`F3` 实测） |
+| `sandlock.py` 的 secret 交属主、`checkpoint_store._hand_to_sandbox`、`volumes` 的卷根/切片交属主 | `chown`/`chgrp` | 见 §4.2：`chgrp` 那半由 setgid 顶掉；`chown` 那半只有在"整棵树要换 uid"时才需要（迁移/接管） |
+
+**选项**：
+
+1. **给 `e2b-as-uid` 补一个窄的 `rm --recursive` verb**（推荐）。它只服务上表里那 4 个"必须"的调用点，
+   路径过 `priv_common.c` 的 `realpath` + 白名单、uid 必须落在池内、**且必须与树/记录的属主一致**
+   （否则一个池 uid 就能删另一个沙箱的树 —— 这条要在实现时写死并有用例）。**实测支持**：`A2`
+   （X 拆自己的树）= `OK`、`A4`（X 在粘滞父目录里删自己的条目）= `OK`。
+2. 借已经以 X 在跑的 **route-B 槽位**代劳。**不成立**：槽位跑在沙箱自己的 mount ns 里（`pivot_root`
+   之后宿主路径不可达），而且要删的树大多属于**已经死掉**的沙箱 —— 没有槽位可借。除非改 fork 暴露一条
+   "宿主视角、以 X 身份"的通路，那是比 1 更大的改动。
+3. **去掉粘滞位**（`<workspaces>` 从 `1777` 变 `2777`），让 worker 用组位直接删树根。**实测支持**：
+   `F4` 显示在没有粘滞位时 worker 删得掉 X 的子树。**代价**：任何沙箱 uid 都能 rename/删掉别人的树根
+   （抢名/DoS），今天 `1777` 的粘滞位正是防这个的。**不建议**。
+4. 留一个只做 `rm` 的 root broker。等于保留 uid 0 —— 与 C2 的目标直接冲突，只适合当过渡（C1.5）。
+
+### 4.2 裁定二：`gid = <worker gid>` 这一位谁来产生
+
+**约束（实测）**：池 uid **不能**把自己的目录 `chgrp` 到 worker 的组（`A6` = `EPERM`；POSIX 规则，
+本地盘一样）。所以要得到"整棵树 `owner=X group=<worker gid>`"，只有下面几条路：
+
+1. **共享根打 setgid（`3777` = setgid + sticky + rwx），沙箱用 `umask 007`**（推荐，**已实测**）。
+   `<workspaces>` 与每个卷根一次性由平台（init/CP，root）改成 `gid=<worker gid>` + `3777`，
+   之后"以 X 创建"的每一个 inode 都自动带上 `group=<worker gid>`，**且不再需要任何 chgrp**。
+   2026-09-28 在真 NAS 上的 6 个 cell（fixture `setgid-parent`，`0o3777`，gid 65534）：
+
+   | cell | 结果 | 含义 |
+   |---|---|---|
+   | `F1-as-X-child-inherits-worker-group` | **OK** | X 在 setgid 父目录里建的目录，组 = 65534 |
+   | `F1b-child-keeps-the-setgid-bit` | **OK** | 服务端**保留**了子目录的 setgid 位（否则下一层就断） |
+   | `F2-as-X-grandchild-still-worker-group` | **OK** | 两层之后组仍是 65534 ⇒ 整棵树都是 |
+   | `F3-worker-deletes-inside-inherited-tree` | **OK** | worker 通过组位（`2770` 的 group-w）能删里面的文件 ⇒ **记账/删除不必"以 X"** |
+   | `F4-worker-removes-X-subtree` | **OK** | 树根仍在粘滞位保护下（worker 删不掉别人的整棵树） |
+   | `P0C-setgid-inheritance` | **yes** | |
+   | `P0C-worker-deletes-via-group` / `P0C-sticky-preserved` | **yes / yes** | |
+
+   **两个必须一起动的旋钮**：① 共享根 `gid=65534` + `3777`（一次性；`<workspaces>` 今天是
+   `1777 0:65534`，卷根是 `1777`）；② 沙箱进程的 **umask = 007**（今天默认 `022`：`0755`/`0644`
+   的树里 worker 没有组写位，`F3` 会变成 `EACCES` —— 本机彩排第一次跑就撞上了）。
+   umask 要设在**被 spawn 的子进程**上（slot/supervise），不能动 worker 自己的 umask。
+2. **每个树根交一次棒**（root 只 `chgrp` 一个 inode，其余靠 setgid 继承）。比 1 多一次 root 介入，
+   但可以在"共享根不方便改"时用；`setgid` 位还是要有人打（同一条规则）。
+3. **放弃组位模型**：worker 不再直接读写树，所有操作都"以 X"。这样 primitive 要扩成
+   `mkdir/write/extract/rm/walk/read…`（一个"以 X 执行"的通用服务），审计面变大、且每次 walk 都要
+   跨进程；但换来"worker 对树零直连"。**与 §6 H3 的取舍正好相反**，除非合规要求"worker 连读都不许"。
+4. 槽位以 `gid=65534` 运行（fork/spawn 改 `--regid`）。结果与 1 类似，但**改变了沙箱自己的组身份**
+   （ns 内 gid 映射、`setgroups([])` 语义、以及若干断言"宿主 uid/gid == 池 uid"的测试都要重核），
+   风险比 1 大，收益不多。
+
+**推荐组合**：**4.2 选 1**（`3777` + `umask 007`）⇒ 树天生就是 `owner=X group=65534`；**4.1 选 1**
+（`e2b-as-uid` 只补一个带属主校验的 `rm --recursive`）⇒ 只有"整棵树要消失"的那几个调用点走"以 X"，
+记账/遍历/删内部文件都还在组位上（`F3`）。这也是这次实测把两个裁定一起收窄的结果。
+
+**尚未核清、写计划前要做的**：① 卷根今天由**控制面 API**建（`volumes.py` 的注释说 CP 建 `0o1777`），
+改成 `3777` 要碰 CP 那一侧；② setgid 树在**沙箱内**看到的组是未映射的 65534（沙箱的 gid_map 只有
+`0→X`）—— 要用一个真沙箱确认 `ls -l`/`os.stat` 的组不影响租户（不会因为"组不是自己"而拒绝访问，
+因为属主位仍在）；③ 盘上现在有几棵**属主 0** 的老树（`755 0:65534`，`state/_runtime` 里有 58 条
+Sep-19 的记录、这些树没有记录）—— `uid_pool` 的孤儿回收只回收**池内** uid，`0` 不在池里，所以它们
+永远回收不掉。C2 落地前要先把这一批清掉（root 一次性 `rm`），否则"树必须出生即正确"的不变量从第一天
+就带着例外。
+
 ## 5. 需要改的位点（全部）
 
 | # | 位点（当前树的锚点） | 现状 | C2 之后 |
@@ -104,10 +176,10 @@ e2b-as-uid extract --uid X --gid G             --path D     # stdin = tar 流，
 | 4 | 检查点镜像目录：`envd_service/runtime/checkpoint_store.py`（`_hand_to_sandbox`；`.checkpoints` gate 今天是 `os.chmod(root, 0o711)`） | worker 建 parent 再交属主 | `mkdir` 原语建；**`.checkpoints` 的 `0711` 对池 uid 不可写，要单独定策**（见 §8 风险 2） |
 | 5 | route-B 策略文档：`envd_service/route_b.py`（lease 文档由 worker 写） | worker 写 + `chgrp` 到 slot gid（NFS 上给非属组 `chgrp` 必被拒） | 用 `write` 原语写进 slot 自己的目录 |
 | 6 | 沙箱 secret 文件：`envd_service/executors/sandlock.py` 的注入路径 | C1 wave 3 起走 broker chown（已修静默跳过） | 用 `write` 原语（"以 X 写"代替"写完再 chown"） |
-| 7 | 孤儿回收：`envd_service/uid_pool.py` 的 reconcile（把 stale 树 `_chown_tree` 回 worker） | 把 stale 树 chown 回 worker，uid 可复用 | 改成**删除**（池 uid 回收 + `rmtree`，以 X 身份）；"chown 回 worker"在 NFS 上做不到 |
+| 7 | 孤儿回收：`envd_service/uid_pool.py` 的 reconcile（把 stale 树 `_chown_tree` 回 worker） | 把 stale 树 chown 回 worker，uid 可复用 | 改成**删除**（池 uid 回收 + `rmtree`，以 X 身份 ⇒ §4.1 的 `rm --recursive` verb）；"chown 回 worker"在 NFS 上做不到。⚠ 今天的回收谓词是"属主 ∈ 池 且 无记录"，**属主 0 的老树永远进不来**（§4.2 末）|
 | 8 | 迁移导入：`envd_service/agent.py` 的 tar 解包（`tar.extractall`）与 `align_shared_uid_workspace` | worker 解 tar | `extract` 原语；`align_shared_uid_workspace` 按形态保留 |
 | 9 | 平台态属主 | 今天 root worker 把 `_runtime/**`、`.uid_pool.lock`、`_images`、`_secrets` 写成 root | ✅ **C1 已完成**（`migrate-state-owner.sh`，见 §2）|
-| 10 | 树根可写 | init 只在 owner≠65534 时 `chmod 1777` | 必须**无条件** `1777`（池 uid 要在里面建树，粘滞位防互删）|
+| 10 | 树根可写 | init 只在 owner≠65534 时 `chmod 1777` | 必须**无条件** `3777`（setgid 带组 + 粘滞位防互删；见 §4.2）——卷根同理 |
 
 ## 6. 硬限制（产品语义层面，绕不过去）
 
@@ -132,8 +204,11 @@ e2b-as-uid extract --uid X --gid G             --path D     # stdin = tar 流，
 沙箱是 `setgroups([])`，没有共享组可用；能力又不过网。所以给一个 inode 定权限时只有两个选项：
 X 私有（worker 完全碰不到，要改只能通过"以 X 身份"的原语整体重写），或者放开组位/其它位
 （那就等于放开给所有读者）。这条直接顶死一个现有需求：route-B 策略文档的注释写着"owner 必须留在
-worker，因为它要在 W1 重启后改写 lease"（`envd_service/route_b.py`）。C2 下做不到"worker 可改写
-+ 仅 X 可读"，只能改成"每次通过原语以 X 重写"。secret 注入同理。
+worker，因为它要在 W1 重启后改写 lease"（`envd_service/route_b.py`）。所以这里必须**二选一**：走
+"X 私有"就得每次通过原语以 X 重写（策略文档、secret 都是这一类）；走"放开组位"就是 §4.2 选的
+setgid 方案 —— worker 靠组位直接读写（`F3` 实测），代价是 worker 作为可信中介能读树里的一切
+（这也是今天的姿态：树里 `0755`/`0644` 的条目本来就近乎对所有读者开放）。**§4.2 选的是后者**；
+secret 注入那一类"只有 X 该读"的东西仍走"以 X 写"（`F` 系列之外，见 §5 第 6 条）。
 
 **H4：沙箱自造的 `0600`/`0700` 对 worker 与 C2 的原语都不可达，"以 X 身份"是唯一通道。**
 否则垃圾树清不掉、uid 池被永久占住（池 1000 个，成了真实上限）。这里的"不可达"是**实测量出来的**，
@@ -151,7 +226,7 @@ worker，因为它要在 W1 重启后改写 lease"（`envd_service/route_b.py`�
 **探针**：`deploy/scripts/acceptance/probe_c2_ownership_p0.py`（引擎）+ `c2-p0-probe.sh`（runner，
 渲染 `deploy/k8s-k0s/c2-p0-probe.yaml` 的 root Job）。它在集群里挂同一份 PVC
 （`/var/lib/e2b-sandboxes`，实测 `P0-MOUNT … vers=4.0,…,sec=sys`），fork 成 5 个身份
-（`root` 0:0、`broker` 0:65534、`worker` 65534、`pool` 10000、`other` 10001）跑 21 个 cell，
+（`root` 0:0、`broker` 0:65534、`worker` 65534、`pool` 10000、`other` 10001）跑 29 个 cell，
 搭 fixture 的位置只在自己 `_probes/c2-p0-*/` 里，跑完由每个 cell 的 owner 自删。
 
 ```bash
@@ -171,6 +246,9 @@ deploy/scripts/acceptance/c2-p0-probe.sh --apply --drop-dac-override  # 臂 2：
 | `P0A-uid0-record-check` | **no-longer** | 复刻 09-17 那条形状（由 65534 创建的 `0600`，uid 0 打开）= `OK`；旧记录说 `EACCES` |
 | `P0B-sticky` | **enforced** | `other`（10001）删不掉 X 在 `1777` 里的条目（`EPERM`） |
 | `P0B-x-can-chgrp` | **no** | X **不能**把自己的目录 `chgrp` 到 worker 的组（`EPERM`） |
+| `P0C-setgid-inheritance` | **yes** | 共享根改成 `3777`（gid=65534）+ 沙箱 `umask 007` 时，X 的目录与**孙目录**都自动带 `gid=65534`，且 setgid 位被服务端保留（`F1`/`F1b`/`F2`） |
+| `P0C-worker-deletes-via-group` | **yes** | 那种树里 worker 用组位就能删文件（`F3`）⇒ 记账/删内部文件**不必**"以 X" |
+| `P0C-sticky-preserved` | **yes** | 同一父目录仍粘滞：worker 删不掉 X 的整棵子树（`F4`）⇒ 树根删除必须"以 X"（§4.1） |
 | `C2-P0-VERDICT` | **zero-regression** | 相对今天的 root worker/broker，C2 的三条替换（以 X 创建 / 以 X 拆 / 在 sticky 父目录里自助）在这台 NAS 上都成立 |
 
 两条臂的差别只在 `P0-CAPS`（臂 1 `CapEff=…a80425fb` 含 `DAC_OVERRIDE`；臂 2 `…a80425f9` 不含），
@@ -183,15 +261,16 @@ deploy/scripts/acceptance/c2-p0-probe.sh --apply --drop-dac-override  # 臂 2：
 gid" 依然成立，但理由要读对**：它服务的是 **worker（65534，没有任何有效 cap）靠组位进树**，
 以及 broker 新造出来的东西要带上 worker 的组；不是"uid 0 也进不去"。
 
-**新量出来的硬约束（设计点，见 §5 第 2 条与 §4 末）**：`P0B-x-can-chgrp=no` —— 池 uid
-**不能**把目录的组改成 worker 的 gid。所以 C2 里"目录 `gid = <worker gid>`"这个形状**不可能由 X
-自己产生**（无论本地盘还是 NFS，这是 POSIX 规则）；要么保留一次极小的交棒（谁来改这一位、算不算
-C2 的不变量例外），要么干脆放弃组位模型、让 worker 改成"以 X 为主要通道"。这是 **C2 落地前必须
-裁定的第一件事**，不是探针能替设计做的决定。
+**新量出来的硬约束（选项与建议见 §4.1/§4.2）**：`P0B-x-can-chgrp=no` —— 池 uid **不能**把目录的组
+改成 worker 的 gid（POSIX 规则，本地盘一样）。但同一轮也量到**它的答案是可行的**：共享根打 setgid
+（`3777`，gid=65534）+ 沙箱 `umask 007` ⇒ X 建出来的整棵树自动是 `owner=X group=65534`，而且 worker
+在树内用组位就能删（`F1`–`F4`）。于是两个裁定收窄成"选哪条路"而不是"能不能做"：
+**§4.2 选 1（setgid + umask 007）+ §4.1 选 1（`e2b-as-uid` 只补一个带属主校验的 `rm --recursive`）**。
 
-**还没量、也不该由这次探针回答的**：三个 gate 目录（`<workspaces>`、`_volumes/<vid>`、
-`_runtime/.checkpoints`）在真实布局下要不要放宽、放宽到哪一档（§8 风险 1）；以及 §4 末那个
-"`rm`/`walk` 以 X 身份怎么承载"的设计点。
+**还没量、也不该由这次探针回答的**（都写在 §4.1/§4.2 的选项里）：① 卷根由**控制面 API** 创建
+（`0o1777`），改 `3777` 要同时改 CP 那一侧；② setgid 树在**沙箱内**看到的组是未映射的 65534，
+要用一个真沙箱确认租户侧观感/工具链没问题；③ 盘上那批**属主 0** 的老树（§4.2 末）先清掉；
+④ `rm --recursive` 的"必须与树属主一致"这条守卫怎么写成用例。
 
 ## 8. 会咬人但不算硬限制
 
@@ -207,7 +286,7 @@ C2 的不变量例外），要么干脆放弃组位模型、让 worker 改成"�
 
 | 期 | 内容 | 验收 |
 |---|---|---|
-| P0 | NAS 行为探针（只读+临时目录）：以 X 建目录/写文件落盘属主是否=X；`1777` 粘滞目录下 worker 能否删 X 的条目；worker 用组位读写 `0770`；uid 0 的越权语义（两条臂） | ✅ **已完成（2026-09-28）**：`deploy/scripts/acceptance/{probe_c2_ownership_p0.py,c2-p0-probe.sh}` + `deploy/k8s-k0s/c2-p0-probe.yaml`；21 个 cell，`C2-P0-VERDICT=zero-regression`，另量出 `P0B-x-can-chgrp=no`（§7） |
+| P0 | NAS 行为探针（只读+临时目录）：以 X 建目录/写文件落盘属主是否=X；`1777` 粘滞目录下 worker 能否删 X 的条目；worker 用组位读写 `0770`；uid 0 的越权语义（两条臂） | ✅ **已完成（2026-09-28）**：`deploy/scripts/acceptance/{probe_c2_ownership_p0.py,c2-p0-probe.sh}` + `deploy/k8s-k0s/c2-p0-probe.yaml`；29 个 cell，`C2-P0-VERDICT=zero-regression`，另量出 `P0B-x-can-chgrp=no`（§7） |
 | P1 | `e2b-as-uid` + `priv_materialize` + 单测（池外 uid/越界路径/符号链接逃逸/半安装 fail closed） | `tests/unit/test_priv_helpers.py` 同形断言 |
 | P2 | 第 1/2 条（建树+校验），开关 `E2B_TREE_OWNERSHIP=chown\|create-as` | 真机：新建箱 → `stat` 属主=池 uid、mode `770`；`deployment_smoke` |
 | P3 | 第 3/4/5/6 条（卷切片、检查点、策略文档、secret） | 各带一条 NAS 用例；`multinode_smoke` 全绿 |

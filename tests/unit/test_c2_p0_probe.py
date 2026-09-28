@@ -74,6 +74,14 @@ EXPECTED_NAS_MATRIX = {
     "E1-uid0-read-worker-0600": "OK",
     "E2-broker-read-worker-0600": "OK",
     "E3-uid0-listdir-worker-0700": "OK",
+    # The setgid candidate: a one-time `3777` + `umask 007` carries the worker's
+    # group down the whole tree, keeps the sticky bit, and lets the worker delete
+    # inside it -- all measured on the NAS (docs/c2-ownership-frontload.md §4.2).
+    "F1-as-X-child-inherits-worker-group": "OK",
+    "F1b-child-keeps-the-setgid-bit": "OK",
+    "F2-as-X-grandchild-still-worker-group": "OK",
+    "F3-worker-deletes-inside-inherited-tree": "OK",
+    "F4-worker-removes-X-subtree": "OK",
 }
 
 
@@ -166,7 +174,27 @@ def test_the_measured_nas_matrix_is_zero_regression() -> None:
     assert verdict["P0A-uid0-record-check"] == "no-longer"
     assert verdict["P0B-sticky"] == "enforced"
     assert verdict["P0B-x-can-chgrp"] == "no"
+    assert verdict["P0C-setgid-inheritance"] == "yes"
+    assert verdict["P0C-worker-deletes-via-group"] == "yes"
+    assert verdict["P0C-sticky-preserved"] == "yes"
     assert verdict["C2-P0-VERDICT"] == "zero-regression"
+
+
+def test_setgid_inheritance_is_partial_when_the_bit_is_dropped() -> None:
+    """The group can come out right one level deep and still not travel further."""
+    verdict = PROBE_MODULE.verdicts(_rows(**{
+        "F1b-child-keeps-the-setgid-bit": "ERR:setgid-cleared:mode=0o770",
+        "F2-as-X-grandchild-still-worker-group": "ERR:gid=10000",
+    }))
+    assert verdict["P0C-setgid-inheritance"] == "partial"
+    assert verdict["C2-P0-VERDICT"] == "zero-regression"
+
+
+def test_setgid_inheritance_is_no_when_the_group_never_lands() -> None:
+    verdict = PROBE_MODULE.verdicts(_rows(**{
+        "F1-as-X-child-inherits-worker-group": "ERR:gid=10000",
+    }))
+    assert verdict["P0C-setgid-inheritance"] == "no"
 
 
 def test_a_storage_that_denies_uid0_override_matches_the_old_record() -> None:
@@ -247,6 +275,9 @@ def test_the_create_as_x_fixture_is_built_by_x_and_the_hand_over_one_by_root() -
         "worker", 65534, 65534
     )
     assert (recorded.dir_mode, recorded.file_mode) == (0o700, 0o600)
+    setgid = specs["setgid-parent"]
+    assert (setgid.dir_builder, setgid.dir_uid, setgid.dir_gid) == ("root", 0, 65534)
+    assert setgid.dir_mode == 0o3777  # setgid + sticky + rwx
 
 
 # --- the runner and the Job -------------------------------------------------
