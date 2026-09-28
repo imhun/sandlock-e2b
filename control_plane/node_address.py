@@ -40,6 +40,8 @@ from typing import Mapping, Protocol
 
 import httpx
 
+from gateway_common.paths import validate_node_id
+
 logger = logging.getLogger(__name__)
 
 #: Where a pod-mounted ServiceAccount lives. Its presence is what ``auto`` reads.
@@ -59,10 +61,22 @@ class NodeEndpoint:
     address is what the control plane dials, the IP is the second factor's
     expected value. Keeping them in one value makes "the resolver answered" the
     single precondition for both.
+
+    ``ips`` is the *whole* set a name resolved to, when that is more than one
+    address (a compose service name can answer AAAA as well as A). A station
+    whose connection arrives over IPv4 must not be refused because the first
+    ``getaddrinfo`` entry happened to be IPv6. ``ip`` stays the primary/display
+    value; :attr:`source_ips` is what the check uses.
     """
 
     address: str
     ip: str
+    ips: tuple[str, ...] = ()
+
+    @property
+    def source_ips(self) -> tuple[str, ...]:
+        """Every address the node's name is allowed to speak from."""
+        return self.ips or (self.ip,)
 
 
 class NodeAddressResolver(Protocol):
@@ -94,17 +108,21 @@ class HostnameAddressResolver:
         self._scheme = scheme
 
     def resolve(self, node_id: str) -> NodeEndpoint | None:
+        if not validate_node_id(node_id):
+            return None
         try:
             infos = socket.getaddrinfo(node_id, None, proto=socket.IPPROTO_TCP)
         except OSError:
             return None
-        for info in infos:
-            ip = info[4][0]
-            if ip:
-                # Keep the *name* in the dial-back address: it tracks a
-                # restarted container whose IP moved, which is premise (b).
-                return NodeEndpoint(f"{self._scheme}://{node_id}:{self._port}", ip)
-        return None
+        ips = tuple(dict.fromkeys(info[4][0] for info in infos if info[4][0]))
+        if not ips:
+            return None
+        # Keep the *name* in the dial-back address: it tracks a restarted
+        # container whose IP moved, which is premise (b). Every resolved
+        # address is acceptable as a source (see ``NodeEndpoint.source_ips``).
+        return NodeEndpoint(
+            f"{self._scheme}://{node_id}:{self._port}", ips[0], ips
+        )
 
 
 class K8sPodAddressResolver:
@@ -139,6 +157,8 @@ class K8sPodAddressResolver:
         )
 
     def resolve(self, node_id: str) -> NodeEndpoint | None:
+        if not validate_node_id(node_id):
+            return None
         try:
             resp = self._client.get(
                 f"/api/v1/namespaces/{self._namespace}/pods/{node_id}"

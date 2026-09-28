@@ -38,7 +38,8 @@ import envd_service.agent as agent_mod
 import envd_service.priv_helpers as priv_helpers
 import envd_service.xfs_quota as xfs_quota
 from envd_service import xfs_quotactl
-from tests._c3_resolver import AnyNodeLoopbackResolver
+from tests._c3_resolver import AnyNodeLoopbackResolver, loopback_resolver
+from tests._fleet_view import ShortFleetView
 from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings as ControlSettings
 from control_plane.registry.manager import SandboxRegistry
@@ -319,7 +320,12 @@ def _tree(
     return sandbox_dir
 
 
-def _stack(workspace: Path, *, nodes: tuple[str, ...] = ("node_a",)):
+def _stack(
+    workspace: Path,
+    *,
+    nodes: tuple[str, ...] = ("node_a",),
+    resolver=None,
+):
     """Control plane over one workspace, with every node address unreachable."""
     control_nodes = NodeRegistry(heartbeat_timeout=600.0)
     for node_id in nodes:
@@ -335,7 +341,9 @@ def _stack(workspace: Path, *, nodes: tuple[str, ...] = ("node_a",)):
         # pod API / compose DNS, never from the request). Nodes register
         # dynamically here (`node_ghost` mid-round), so every id answers
         # loopback -- the address this lane's requests actually come from.
-        node_address_resolver=AnyNodeLoopbackResolver(),
+        # A caller can hand in a *narrower* table to model a node that is
+        # registered but no longer resolvable.
+        node_address_resolver=resolver or AnyNodeLoopbackResolver(),
     )
     # Force scheduling onto the registered remote worker, exactly like the
     # E6.1 contracts next door.
@@ -1468,6 +1476,54 @@ async def test_shared_workspace_keeps_another_nodes_live_tree(workspace, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_fleet_enumeration_survives_a_registered_but_unresolvable_node(
+    workspace, monkeypatch
+):
+    """D6 / Task 6 judgment 9: a dead-but-still-registered node must not stall us.
+
+    ``reap_unhealthy`` keeps a lost worker's registry row -- and its records --
+    until its sandboxes' TTL, so "registered but unresolvable" is the normal
+    post-mortem state, and it is exactly when orphan reclamation has to work.
+    While the fleet enumeration went through the identity-guarded *per-node*
+    endpoint, that state answered 503 and every live worker skipped the sweep;
+    the fleet-scope endpoint answers the fleet question directly, so the orphan
+    is still reclaimed.
+
+    This is the regression pin: revert the worker to the per-node path and
+    ``node_ghost``'s 503 makes ``disk_sweep_skipped`` name this orphan.
+    """
+    # ``node_ghost`` is registered (it is in /internal/nodes) but deliberately
+    # left out of the resolver: its worker is gone.
+    control_nodes, registry, control_app = _stack(
+        workspace, resolver=loopback_resolver("node_a")
+    )
+    _register_node(control_nodes, "node_ghost", "http://127.0.0.1:1")
+    ghost_id = "sbx_ghost_record"
+    _control_record(registry, "node_ghost", ghost_id)
+    orphan_id = "sbx_unowned_dead_node"
+    orphan_dir = _tree(workspace, orphan_id, project_id=4301)
+    quota = _QuotaFake({4301: 8})
+    quota.install(monkeypatch)
+
+    agent = _agent(workspace)
+    async with _client(control_app) as raw:
+        summary = await agent._reconcile_with_control_plane(
+            _RecordingClient(raw), _headers()
+        )
+
+    assert summary["disk_sweep_skipped"] == []
+    assert summary["deleted"] == [orphan_id]
+    assert summary["quota_cleaned"] == [4301]
+    assert summary["quota_unreclaimed"] == []
+    assert orphan_dir.exists() is False
+    assert quota.rows == {}
+    # The dead node's own record is untouched: only its *absence* would have
+    # made this tree reclaimable, and it is still there.
+    assert registry.get(ghost_id).state == "running"
+    assert registry.get(ghost_id).node_id == "node_ghost"
+
+
+@pytest.mark.asyncio
 async def test_runtime_whose_record_moved_away_is_not_torn_down(
     workspace, monkeypatch
 ):
@@ -1512,10 +1568,11 @@ async def test_incomplete_fleet_enumeration_aborts_the_disk_sweep(
 ):
     """Delete nothing when the fleet's records cannot all be accounted for.
 
-    A record whose node is not in the node registry (right after a
-    control-plane restart, before that worker re-registers) makes the
-    enumeration short of ``/internal/fleet/metrics``'s record count. The sweep
-    must then leave every disk tree alone instead of guessing.
+    The fleet list and ``/internal/fleet/metrics``'s record count disagree (a
+    create that landed after the list was read), so the enumeration is short.
+    The sweep must then leave every disk tree alone instead of guessing. (D6
+    removed the node-row cause this scenario used to model; the invariant and
+    the mechanism are unchanged.)
     """
     control_nodes, registry, control_app = _stack(workspace)
     ghost_id = "sbx_ghost_node"
@@ -1528,7 +1585,9 @@ async def test_incomplete_fleet_enumeration_aborts_the_disk_sweep(
     caplog.clear()
 
     agent = _agent(workspace)
-    async with _client(control_app) as raw:
+    # The list this round saw omitted a record the metrics count still carries.
+    short = ShortFleetView(control_app, [])
+    async with _client(short) as raw:
         summary = await agent._reconcile_with_control_plane(raw, _headers())
 
     assert orphan_dir.exists()
@@ -1605,16 +1664,16 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
 ):
     """M1: one non-enumerable record cannot silence the disk sweep forever.
 
-    ``node_id`` defaults to ``"local"`` and the production stack runs with
-    ``E2B_ENABLE_LOCAL_NODE=false``, so a single record on a node that is not
-    in ``/internal/nodes`` makes the enumeration short of
-    ``/internal/fleet/metrics`` and defers the sweep. The agent has to come
-    back on a later heartbeat and reclaim the tree once the enumeration is
-    complete again: the first rounds may skip, the sweep must not stay silent
-    for the life of the process.
+    One record the fleet list did not carry (while ``/internal/fleet/metrics``
+    still counted it) makes the enumeration short and defers the sweep. The
+    agent has to come back on a later heartbeat and reclaim the tree once the
+    enumeration is complete again: the first rounds may skip, the sweep must not
+    stay silent for the life of the process. (D6: the list no longer depends on
+    node registry rows, so the shortfall is modelled directly.)
     """
     control_nodes, registry, control_app = _stack(workspace)
-    _control_record(registry, "node_ghost", "sbx_ghost_record")
+    ghost_id = "sbx_ghost_record"
+    _control_record(registry, "node_ghost", ghost_id)
     orphan_id = "sbx_unowned_retry"
     orphan_dir = _tree(workspace, orphan_id, project_id=4101)
     quota = _QuotaFake({4101: 8})
@@ -1628,6 +1687,8 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
     skipped_rounds: list[int] = []
     sweep_round: int | None = None
     parked = asyncio.Event()
+    # The fleet list is short until the hook below makes it complete.
+    short = ShortFleetView(control_app, [])
 
     async def hook(interval):
         nonlocal rounds, sweep_round
@@ -1642,15 +1703,15 @@ async def test_incomplete_fleet_enumeration_is_retried_until_the_fleet_is_comple
         if sweep_round is None and not orphan_dir.exists():
             sweep_round = rounds
         if rounds == 2:
-            # The node holding the record re-registers: the enumeration is
-            # complete again, so the deferred sweep can run.
-            _register_node(control_nodes, "node_ghost", "http://127.0.0.1:1")
+            # The record is seen again: the enumeration is complete, so the
+            # deferred sweep can run.
+            short.sandbox_ids = [ghost_id]
         if sweep_round is not None or rounds >= 8:
             parked.set()
             await asyncio.sleep(3600)
 
     task = asyncio.create_task(agent._loop())
-    _patch_loop_transport(monkeypatch, control_app, driven=task, agent=agent)
+    _patch_loop_transport(monkeypatch, short, driven=task, agent=agent)
     _patch_loop_sleep(monkeypatch, hook, driven=task, agent=agent)
     try:
         await asyncio.wait_for(parked.wait(), timeout=30)
@@ -1725,6 +1786,8 @@ async def test_deferred_disk_sweep_backs_off_instead_of_polling_every_heartbeat(
     rounds = 0
     attempt_rounds: list[int] = []
     parked = asyncio.Event()
+    # Never repaired: this lane is about the backoff schedule.
+    short = ShortFleetView(control_app, [])
 
     async def hook(interval):
         nonlocal rounds
@@ -1741,7 +1804,7 @@ async def test_deferred_disk_sweep_backs_off_instead_of_polling_every_heartbeat(
             await asyncio.sleep(3600)
 
     task = asyncio.create_task(agent._loop())
-    _patch_loop_transport(monkeypatch, control_app, driven=task, agent=agent)
+    _patch_loop_transport(monkeypatch, short, driven=task, agent=agent)
     _patch_loop_sleep(monkeypatch, hook, driven=task, agent=agent)
     try:
         await asyncio.wait_for(parked.wait(), timeout=30)

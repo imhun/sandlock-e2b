@@ -541,3 +541,126 @@ async def test_a_non_ascii_internal_key_is_a_401_not_a_500(workspace) -> None:
         )
         assert resp.status_code == 401
         assert resp.json() == {"code": 401, "message": "Unauthorized"}
+
+
+# ------------------------- ④ 的多地址：名字解析出 AAAA+A 时任一都算匹配
+
+
+@pytest.mark.asyncio
+async def test_a_node_that_resolves_to_several_addresses_is_accepted_from_any(
+    workspace,
+) -> None:
+    """A name answering both AAAA and A must not lose by ordering.
+
+    ``getaddrinfo`` may list IPv6 first while the worker's connection arrives
+    over IPv4; only the *set* is the expected value, not the first entry.
+    """
+    endpoints = _endpoints()
+    endpoints["node_b"] = NodeEndpoint(
+        "http://node-b:49983", "2001:db8::1", ("2001:db8::1", "10.0.0.2")
+    )
+    nodes = NodeRegistry(heartbeat_timeout=600.0)
+    app = _app(workspace, nodes=nodes, endpoints=endpoints)
+    async with _client(app, source_ip="10.0.0.2") as client:
+        ok = await _register(client, key=KEY_B, node_id="node_b", address="")
+        assert ok.status_code == 200
+        heartbeat = await client.post(
+            "/internal/nodes/node_b/heartbeat",
+            headers={"X-Internal-Key": KEY_B},
+            json={},
+        )
+        assert heartbeat.status_code == 204
+
+    # A source in neither address is still refused, and the refusal names the
+    # whole set so "why did this node start failing?" is one line.
+    async with _client(app, source_ip="10.0.0.9") as client:
+        refused = await client.post(
+            "/internal/nodes/node_b/heartbeat",
+            headers={"X-Internal-Key": KEY_B},
+            json={},
+        )
+        assert refused.status_code == 403
+        assert refused.json() == {
+            "code": 403,
+            "message": (
+                "request for node node_b came from 10.0.0.9, expected one of "
+                "2001:db8::1, 10.0.0.2"
+            ),
+        }
+
+
+# ------------------------- 503 的告警节流（拒绝不变，日志不刷屏）
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_node_warns_once_but_refuses_every_time(
+    workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A fleet-wide resolver/RBAC outage is one cause for every node and round.
+
+    The refusal (503, named) is per request and unchanged; the WARNING is once
+    per node, so a heartbeat every 5 s does not flood the log. A unique node id
+    keeps this deterministic across a shared pytest session.
+    """
+    key = "key-node-zz"
+    nodes = NodeRegistry(heartbeat_timeout=600.0)
+    settings = _settings(internal_node_keys={key: "node_zz"})
+    app = _app(workspace, settings=settings, nodes=nodes, endpoints={})
+    with caplog.at_level(logging.WARNING, logger="control_plane.api.internal"):
+        async with _client(app, source_ip=ENDPOINT_A.ip) as client:
+            for _ in range(3):
+                resp = await client.post(
+                    "/internal/nodes/node_zz/heartbeat",
+                    headers={"X-Internal-Key": key},
+                    json={},
+                )
+                assert resp.status_code == 503
+                assert resp.json() == {
+                    "code": 503,
+                    "message": (
+                        "cannot determine the expected address for node node_zz"
+                    ),
+                }
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "control_plane.api.internal"
+    ] == [
+        "internal API: cannot determine the expected address for node node_zz; "
+        "refusing (fail closed)"
+    ]
+
+
+# ------------------------- 舰队作用域的新枚举端点（D6）
+
+
+@pytest.mark.asyncio
+async def test_the_fleet_sandbox_list_is_named_fleet_scope(workspace) -> None:
+    """A worker's ownership sweep asks a *fleet* question, not a node one.
+
+    It authenticates with the shared key and needs no node identity -- including
+    when a registered node is unresolvable (which is the state this endpoint
+    exists for). It is in ``_require_fleet_key``'s set, named in the module
+    docstring; the per-node endpoints stay identity-guarded.
+    """
+    nodes = NodeRegistry(heartbeat_timeout=600.0)
+    registry = SandboxRegistry(_settings())
+    _sandbox_on(registry, "node_a", "sbx_a")
+    _sandbox_on(registry, "node_b", "sbx_b")
+    # A record on a node the resolver does not know (its worker is gone).
+    _sandbox_on(registry, "node_ghost", "sbx_ghost")
+    app = _app(workspace, registry=registry, nodes=nodes)
+    async with _client(app, source_ip="10.9.9.9") as client:
+        unauthorized = await client.get("/internal/fleet/sandboxes")
+        assert unauthorized.status_code == 401
+        assert unauthorized.json() == {"code": 401, "message": "Unauthorized"}
+
+        listed = await client.get(
+            "/internal/fleet/sandboxes", headers={"X-Internal-Key": FLEET_KEY}
+        )
+        assert listed.status_code == 200
+        assert sorted(listed.json()["sandboxIDs"]) == [
+            "sbx_a",
+            "sbx_b",
+            "sbx_ghost",
+        ]

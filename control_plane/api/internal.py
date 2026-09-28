@@ -22,6 +22,8 @@ pre-existing behavior the task does not change; the exemption is named here and
 in ``docs/open-issues.md`` row N49 so it cannot be mistaken for coverage:
 
 * ``GET  /internal/routes/{sandbox_id}`` (gateway route lookup)
+* ``GET  /internal/fleet/sandboxes`` (a worker's fleet-wide ownership sweep:
+  "does anyone anywhere own this tree?" -- not "may I act for node X")
 * ``GET  /internal/nodes``, ``GET /internal/fleet/metrics`` (autoscaler/ops)
 * ``POST /internal/nodes/{node_id}/drain|undrain`` (operator action *on* a node)
 * ``GET  /internal/tenants`` (ops reconciliation)
@@ -72,6 +74,11 @@ logger = logging.getLogger(__name__)
 #: key rather than on every 5-second heartbeat.
 _fleet_keys_reported: set[str] = set()
 
+#: Nodes whose expected address could not be determined, already reported. A
+#: fleet-wide resolver/RBAC outage is one cause for *every* node, so the
+#: refusal (unchanged, 503) must not flood the log at heartbeat cadence.
+_unresolvable_nodes_reported: set[str] = set()
+
 
 def _require_internal_key(request: Request) -> str:
     """The credential half: a valid ``X-Internal-Key``, else 401."""
@@ -116,17 +123,23 @@ def _enforce_source_ip(request: Request, node_id: str, endpoint: NodeEndpoint) -
     rejects everything") is visible in one line.
     """
     observed = request.client.host if request.client else None
-    if observed != endpoint.ip:
+    expected_ips = endpoint.source_ips
+    if observed not in expected_ips:
+        expected_text = (
+            expected_ips[0]
+            if len(expected_ips) == 1
+            else "one of " + ", ".join(expected_ips)
+        )
         logger.warning(
             "internal API: request for node %s came from %s, expected %s; "
             "refusing (source-IP second factor)",
             node_id,
             observed,
-            endpoint.ip,
+            expected_text,
         )
         raise OfficialError(
             403,
-            f"request for node {node_id} came from {observed}, expected {endpoint.ip}",
+            f"request for node {node_id} came from {observed}, expected {expected_text}",
         )
 
 
@@ -188,12 +201,15 @@ def _require_node_identity(
         # Fail closed: "I cannot determine where this node is" must never mean
         # "so take the caller's word (or the body's address)". The line below is
         # the alarm for a fleet-wide, self-inflicted refusal (the pod API / DNS
-        # is down, or the node id does not exist).
-        logger.warning(
-            "internal API: cannot determine the expected address for node %s; "
-            "refusing (fail closed)",
-            node_id,
-        )
+        # is down, or the node id does not exist) -- named once per node, not
+        # once per heartbeat.
+        if node_id not in _unresolvable_nodes_reported:
+            _unresolvable_nodes_reported.add(node_id)
+            logger.warning(
+                "internal API: cannot determine the expected address for node %s; "
+                "refusing (fail closed)",
+                node_id,
+            )
         raise OfficialError(
             503, f"cannot determine the expected address for node {node_id}"
         )
@@ -397,6 +413,27 @@ async def node_reconcile(node_id: str, request: Request) -> dict[str, Any]:
         set(snapshot_ids),
         timeout=request.app.state.settings.default_timeout,
     )
+
+
+@router.get("/internal/fleet/sandboxes")
+async def fleet_sandboxes(request: Request) -> dict[str, Any]:
+    """Every sandbox id the control plane records, fleet-wide (D6).
+
+    Fleet scope, not node scope. A worker's ownership sweep asks "does anyone
+    *anywhere* own this tree/image?", which is not a statement about the node it
+    speaks for -- so this endpoint is in the named fleet-scope set and
+    authenticates with the shared key like the other ops surfaces.
+
+    Why it exists: enumerating the fleet through the *per-node* endpoints would
+    make a registered-but-unresolvable node (worker permanently gone;
+    ``reap_unhealthy`` keeps its row until its sandboxes' TTL) refuse that
+    worker's whole round, which is exactly when orphan reclamation must work.
+    The per-node endpoints stay identity-guarded; this one answers the fleet
+    question directly. Shape matches the per-node answer's ``sandboxIDs``.
+    """
+    _require_fleet_key(request)
+    records = request.app.state.registry.list()
+    return {"sandboxIDs": [r.sandbox_id for r in records]}
 
 
 @router.get("/internal/routes/{sandbox_id}")

@@ -13,8 +13,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote
-
 import httpx
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -1708,6 +1706,21 @@ class NodeAgent:
                     # control plane may have orphaned what this worker still
                     # runs while it was away.
                     self._reconcile_pending = True
+                else:
+                    # Diagnosability (C3 Task 2): a worker whose registration is
+                    # refused used to say nothing at all locally -- every round
+                    # just retried. The named line is what makes "this worker
+                    # never joined" visible on the node; the most common cause
+                    # is the shape this identity layer requires: a *separated*
+                    # worker must declare ``E2B_NODE_ID`` (the control plane
+                    # verifies a node-scoped claim against the node's resolved
+                    # address, and cannot invent an identity from a shared key).
+                    logger.warning(
+                        "node agent: registration rejected by the control plane "
+                        "(HTTP %s): this worker will not join; a separated worker "
+                        "must declare E2B_NODE_ID",
+                        resp.status_code,
+                    )
             else:
                 resp = await client.post(
                     f"{self._control_url}/internal/nodes/{self._node_id}/heartbeat",
@@ -1725,6 +1738,16 @@ class NodeAgent:
                     # The control plane lost us (e.g. it restarted);
                     # re-register on the next cycle.
                     self._node_id = None
+                elif resp.status_code >= 300:
+                    # Same diagnosability rule for the heartbeat: a refusal the
+                    # control plane explains in its own log is otherwise
+                    # invisible from this node's side.
+                    logger.warning(
+                        "node agent: heartbeat for node %s rejected by the "
+                        "control plane (HTTP %s)",
+                        self._node_id,
+                        resp.status_code,
+                    )
         # Outside the pulse's client scope on purpose: the round owns its client
         # (this one is closed when the ``async with`` above exits, and a detached
         # round outlives it).
@@ -2449,34 +2472,25 @@ class NodeAgent:
         from the node registry, e.g. right after a control-plane restart while
         the other workers have not re-registered yet) makes the caller skip
         the sweep instead of deleting someone else's live tree.
+
+        D6: the records come from the **fleet-scope** ``/internal/fleet/sandboxes``
+        endpoint, not from one call per node. Asking each node for its own list
+        would make this sweep depend on *every* node being resolvable — and a
+        worker that is permanently gone keeps its registry row (and its
+        records) until its sandboxes' TTL, so the per-node shape would stall
+        reclamation fleet-wide exactly when a node has died. The per-node
+        endpoints stay identity-guarded; this sweep was never speaking for
+        another node.
         """
         try:
             resp = await client.get(
-                f"{self._control_url}/internal/nodes", headers=headers
+                f"{self._control_url}/internal/fleet/sandboxes", headers=headers
             )
             resp.raise_for_status()
-            node_list = resp.json()
-            if not isinstance(node_list, list):
-                raise ValueError("node list is not an array")
-            node_ids = [
-                str(node["nodeID"])
-                for node in node_list
-                if isinstance(node, dict) and node.get("nodeID")
-            ]
-            owned: set[str] = set()
-            for node_id in node_ids:
-                node_url = (
-                    f"{self._control_url}/internal/nodes/"
-                    f"{quote(node_id, safe='')}/sandboxes"
-                )
-                listed = await client.get(node_url, headers=headers)
-                listed.raise_for_status()
-                payload = listed.json()
-                if not isinstance(payload, dict):
-                    raise ValueError(
-                        f"sandbox list for {node_id} is not an object"
-                    )
-                owned.update(payload.get("sandboxIDs") or [])
+            payload = resp.json()
+            if not isinstance(payload, dict):
+                raise ValueError("fleet sandbox list is not an object")
+            owned = {str(sid) for sid in (payload.get("sandboxIDs") or [])}
             metrics = await client.get(
                 f"{self._control_url}/internal/fleet/metrics", headers=headers
             )

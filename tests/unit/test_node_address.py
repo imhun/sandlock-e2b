@@ -72,9 +72,92 @@ def test_hostname_resolver_reads_the_ip_and_keeps_the_dial_name(
 
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
     resolver = HostnameAddressResolver(port=49983)
-    assert resolver.resolve("worker-1") == NodeEndpoint(
-        "http://worker-1:49983", "172.18.0.5"
+    endpoint = resolver.resolve("worker-1")
+    assert endpoint.address == "http://worker-1:49983"
+    assert endpoint.ip == "172.18.0.5"
+    assert endpoint.source_ips == ("172.18.0.5",)
+
+
+def test_hostname_resolver_keeps_every_resolved_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A name that answers AAAA + A is accepted from *either* address.
+
+    Taking only the first ``getaddrinfo`` entry would refuse a worker whose
+    connection arrives over IPv4 just because the resolver listed IPv6 first.
+    """
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (
+                socket.AF_INET6,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("2001:db8::1", 0, 0, 0),
+            ),
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("172.18.0.5", 0),
+            ),
+            # A duplicate entry must not repeat in the accepted set.
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("172.18.0.5", 0),
+            ),
+        ],
     )
+    endpoint = HostnameAddressResolver(port=49983).resolve("worker-1")
+    assert endpoint.ip == "2001:db8::1"
+    assert endpoint.source_ips == ("2001:db8::1", "172.18.0.5")
+
+
+def test_a_malformed_node_id_never_reaches_the_api_or_the_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shape check before interpolation (path segment / DNS name).
+
+    Both resolvers must answer "no address" for an id that cannot be a pod or
+    service name, without calling the k8s API and without handing the id to
+    ``getaddrinfo``.
+    """
+    called: list[tuple] = []
+
+    def fake_getaddrinfo(*args, **kwargs):
+        called.append(args)
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("127.0.0.1", 0),
+            )
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    hostname = HostnameAddressResolver(port=49983)
+    for bad in ("../etc", "a/b", "", "-leading", "has space", "x" * 129, "a\nb"):
+        assert hostname.resolve(bad) is None
+    assert called == []
+
+    def explode(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("the k8s API must not be called for a bad id")
+
+    k8s = K8sPodAddressResolver(
+        namespace="sandlock",
+        port=49983,
+        client=httpx.Client(transport=httpx.MockTransport(explode)),
+    )
+    assert k8s.resolve("../etc") is None
 
 
 def test_hostname_resolver_fails_to_none_never_to_a_guess(
@@ -141,6 +224,37 @@ def test_k8s_resolver_missing_pod_or_ip_is_none() -> None:
         namespace="sandlock", port=49983, client=_pod_client("pending", None)
     )
     assert pending.resolve("pending") is None
+
+
+def _raw_json_client(body) -> httpx.Client:
+    return httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json=body)
+        ),
+        base_url="https://kubernetes.default.svc",
+    )
+
+
+def test_k8s_resolver_200_with_a_non_dict_body_is_no_address() -> None:
+    """A 200 is not enough: the body must be the Pod object this code reads.
+
+    A ``Status`` object, a list, a bare string or a null all mean "no address"
+    -- the ``isinstance`` guard exists so none of them raises out of the
+    resolver (which would surface as a 500 instead of the named 503).
+    """
+    for body in (
+        [],
+        ["pods"],
+        "boom",
+        7,
+        None,
+        {"status": "Pending"},  # a status that is not the pod's object
+        {"status": []},
+    ):
+        resolver = K8sPodAddressResolver(
+            namespace="sandlock", port=49983, client=_raw_json_client(body)
+        )
+        assert resolver.resolve("e2b-worker-0") is None, body
 
 
 # --------------------------------------------------------------- mode selection

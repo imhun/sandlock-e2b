@@ -1772,6 +1772,11 @@ worker-2 日志 30×503 / 0×500 / 0 traceback，`tmp/n6-live-race.log`）。
 | compose（`deploy/compose/*`、`deploy/stack/*`） | `E2B_NODE_ADDRESS_MODE=hostname`（出厂已设） | `node_id` = worker 的 compose 服务名（`worker-1`…）/ 池里容器名，docker 内嵌 DNS 解析；控制面与 worker 必须同网 |
 | 开发/合体（`local://`） | 不用设（`auto`） | 没有 HTTP 注册的独立 worker；C3 明确不覆盖 `local://` |
 
+**前置（分离形态）**：worker **必须声明 `E2B_NODE_ID`**。身份校验的对象是"自称解析到的
+地址"，共享 key 本身不能说明"你是谁"，所以一个不带 `E2B_NODE_ID` 的分离 worker 注册会被
+拒（403/503 点名），CP 也不会替它编一个身份。worker 侧现在会打一条点名日志
+（`node agent: registration rejected … must declare E2B_NODE_ID`），不是静默重试。
+
 **未关闭（点名）**：出厂仍是**一把舰队共享 key**。换成 per-node key
 （`E2B_INTERNAL_NODE_KEYS`，机制已实现、未接线）是所谓**近期**加固，mTLS 是目标态；
 `/internal/routes`、`/internal/nodes`、`drain/undrain`、`/internal/fleet/metrics`、
