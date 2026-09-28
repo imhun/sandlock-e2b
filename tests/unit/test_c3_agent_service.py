@@ -35,10 +35,18 @@ import pytest
 
 from deploy.c3_agent.app import AgentRefusal, SubprocessAsUidRunner, create_app
 from deploy.c3_agent.config import Settings
+from deploy.c3_agent.lookup import LookupRefusal, missing_slot_pid_message
 
 TOKEN = "c3-agent-sekret"
 NODE = "e2b-worker-0"
 GRANT_URL = f"/internal/nodes/{NODE}/agent/grant-slot"
+#: The worker's own pid namespace identity, as the control plane carries it
+#: (Task 3 ruling D9.3: the candidate must live in exactly this namespace).
+PID_NAMESPACE = "pid:[4026532458]"
+#: What the stub lookup answers for any container pid: the host pid the agent
+#: hands to ``as_uid``. The instruction's pid is the *container* pid, so the two
+#: must never be confused with one another.
+HOST_PID = 990425
 
 
 def _settings(**overrides) -> Settings:
@@ -58,7 +66,12 @@ def _headers(token: str = TOKEN) -> dict[str, str]:
 
 
 def _body(**overrides) -> dict:
-    payload = {"sandbox_id": "sbx_grant", "uid": 10007, "pid": 4242}
+    payload = {
+        "sandbox_id": "sbx_grant",
+        "uid": 10007,
+        "pid": 4242,
+        "worker": {"node_id": NODE, "pid_namespace": PID_NAMESPACE},
+    }
     payload.update(overrides)
     return payload
 
@@ -77,13 +90,39 @@ class _StubRunner:
         return f"C3-ASUID-OK pid={pid} uid={uid}"
 
 
+class _StubLookup:
+    """Stands in for the ``/proc`` rendezvous; records what it was asked."""
+
+    def __init__(
+        self,
+        *,
+        host_pid: int = HOST_PID,
+        refuse: str | None = None,
+        present: bool = True,
+    ) -> None:
+        self.calls: list[tuple[int, str, str]] = []
+        self._host_pid = host_pid
+        self._refuse = refuse
+        self._present = present
+
+    def host_pid(self, container_pid, identity, *, sandbox_id: str) -> int:
+        self.calls.append((container_pid, sandbox_id, identity.pid_namespace))
+        if self._refuse is not None:
+            raise LookupRefusal(self._refuse)
+        return self._host_pid
+
+    def present(self, host_pid: int) -> bool:
+        return self._present
+
+
 # ------------------------------------------------------------------ the surface
 
 
 @pytest.mark.asyncio
 async def test_grant_slot_runs_as_uid_and_answers_the_instruction() -> None:
     runner = _StubRunner()
-    app = create_app(settings=_settings(), runner=runner)
+    lookup = _StubLookup()
+    app = create_app(settings=_settings(), runner=runner, lookup=lookup)
     async with _client(app) as client:
         resp = await client.post(GRANT_URL, headers=_headers(), json=_body())
         assert resp.status_code == 200
@@ -92,10 +131,15 @@ async def test_grant_slot_runs_as_uid_and_answers_the_instruction() -> None:
             "sandboxID": "sbx_grant",
             "uid": 10007,
             "pid": 4242,
-            "asUid": "C3-ASUID-OK pid=4242 uid=10007",
+            "hostPid": HOST_PID,
+            "pidNamespace": PID_NAMESPACE,
+            "asUid": f"C3-ASUID-OK pid={HOST_PID} uid=10007",
         }
-    # The uid is the control plane's parameter, handed straight through.
-    assert runner.calls == [(10007, 4242)]
+    # The container pid is what the instruction carried; the *host* pid is what
+    # the lookup resolved and what face A writes. The uid is the control
+    # plane's parameter, handed straight through.
+    assert lookup.calls == [(4242, "sbx_grant", PID_NAMESPACE)]
+    assert runner.calls == [(10007, HOST_PID)]
 
 
 @pytest.mark.asyncio
@@ -163,7 +207,7 @@ async def test_a_refused_grant_is_fail_closed_and_named() -> None:
     runner = _StubRunner(
         refuse="as_uid refused: uid 999 is outside the privileged helper uid pool"
     )
-    app = create_app(settings=_settings(), runner=runner)
+    app = create_app(settings=_settings(), runner=runner, lookup=_StubLookup())
     async with _client(app) as client:
         resp = await client.post(
             GRANT_URL, headers=_headers(), json=_body(uid=999)
@@ -175,6 +219,92 @@ async def test_a_refused_grant_is_fail_closed_and_named() -> None:
                 "uid pool"
             )
         }
+
+
+@pytest.mark.asyncio
+async def test_a_worker_identity_that_cannot_be_resolved_is_refused_named() -> None:
+    """The lookup's refusals reach the control plane by name, not as a 500."""
+    runner = _StubRunner()
+    lookup = _StubLookup(
+        refuse="container pid 4242 is not in worker e2b-worker-0's pid "
+        "namespace (pid:[4026532999]): 1 process(es) with this container pid, "
+        "none of them in it"
+    )
+    app = create_app(settings=_settings(), runner=runner, lookup=lookup)
+    async with _client(app) as client:
+        resp = await client.post(GRANT_URL, headers=_headers(), json=_body())
+        assert resp.status_code == 502
+        assert resp.json() == {
+            "error": (
+                "container pid 4242 is not in worker e2b-worker-0's pid "
+                "namespace (pid:[4026532999]): 1 process(es) with this "
+                "container pid, none of them in it"
+            )
+        }
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_slot_pid_that_vanishes_before_the_write_is_named() -> None:
+    """The one detail the brief singles out: the child crashed mid-grant.
+
+    The lookup resolved the host pid and ``as_uid`` then failed -- and because
+    that pid is *gone* from the process table, the refusal must name it as gone
+    instead of forwarding the primitive's reading of a missing ``/proc`` entry.
+    Fail closed, named, never a silent continue.
+    """
+    runner = _StubRunner(
+        refuse=f"as_uid exit 77: cannot read uid_map for pid {HOST_PID}: "
+        "No such file or directory"
+    )
+    lookup = _StubLookup(present=False)
+    app = create_app(settings=_settings(), runner=runner, lookup=lookup)
+    async with _client(app) as client:
+        resp = await client.post(GRANT_URL, headers=_headers(), json=_body())
+        assert resp.status_code == 502
+        assert resp.json() == {"error": missing_slot_pid_message("sbx_grant")}
+    assert runner.calls == [(10007, HOST_PID)]
+
+
+@pytest.mark.asyncio
+async def test_an_instruction_without_a_worker_identity_is_refused_named() -> None:
+    """D9.3: no identity, no grant -- never "the first pid whose NSpid matches".
+
+    The instruction is the control plane's; a body that omits the worker is a
+    call the agent can prove nothing about, so it is refused before the
+    privileged runner is reached.
+    """
+    runner = _StubRunner()
+    app = create_app(settings=_settings(), runner=runner, lookup=_StubLookup())
+    body = _body()
+    del body["worker"]
+    async with _client(app) as client:
+        resp = await client.post(GRANT_URL, headers=_headers(), json=body)
+        assert resp.status_code == 422
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_instruction_whose_worker_disagrees_with_its_node_is_refused() -> None:
+    """The instruction may not say "for node A" and "for worker B"."""
+    runner = _StubRunner()
+    app = create_app(settings=_settings(), runner=runner, lookup=_StubLookup())
+    async with _client(app) as client:
+        resp = await client.post(
+            GRANT_URL,
+            headers=_headers(),
+            json=_body(
+                worker={"node_id": "e2b-worker-9", "pid_namespace": PID_NAMESPACE}
+            ),
+        )
+        assert resp.status_code == 400
+        assert resp.json() == {
+            "error": (
+                "the instruction is addressed to node e2b-worker-0 but names "
+                "worker e2b-worker-9"
+            )
+        }
+    assert runner.calls == []
 
 
 # ------------------------------------------- the subprocess acceptance rule
@@ -277,10 +407,11 @@ async def test_a_hostile_sandbox_id_is_refused_before_the_runner() -> None:
     """The id is validated the same way the control plane validates it.
 
     The refusal is named and does not echo the id back, and the privileged
-    runner is never reached.
+    runner and the ``/proc`` lookup are never reached.
     """
     runner = _StubRunner()
-    app = create_app(settings=_settings(), runner=runner)
+    lookup = _StubLookup()
+    app = create_app(settings=_settings(), runner=runner, lookup=lookup)
     async with _client(app) as client:
         resp = await client.post(
             GRANT_URL, headers=_headers(), json=_body(sandbox_id="../../etc/passwd")
@@ -288,6 +419,7 @@ async def test_a_hostile_sandbox_id_is_refused_before_the_runner() -> None:
         assert resp.status_code == 400
         assert resp.json() == {"error": "sandbox_id is not a valid sandbox id"}
     assert runner.calls == []
+    assert lookup.calls == []
 
 
 @pytest.mark.asyncio

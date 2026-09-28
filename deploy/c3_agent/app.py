@@ -9,11 +9,14 @@ only local decision is whether the instruction is addressed to *this* node.
 Surface (all responses JSON objects):
 
 - ``POST /internal/nodes/{node_id}/agent/grant-slot``
-  ``{"sandbox_id", "uid", "pid"}`` -> ``{"op", "sandboxID", "uid", "pid",
-  "asUid"}``. Runs ``as_uid --uid X --pid N``; the *only* accepted result is
-  exit 0 with exactly the ``C3-ASUID-OK pid=N uid=X`` line on stdout and an
-  empty stderr. Anything else is a ``502`` named fail-closed refusal (a
-  half-applied grant must never read as success).
+  ``{"sandbox_id", "uid", "pid", "worker"}`` -> ``{"op", "sandboxID", "uid",
+  "pid", "hostPid", "pidNamespace", "asUid"}``. ``pid`` is the pid the *worker*
+  knows (its own pid namespace); ``worker`` is who the control plane says that
+  pid belongs to. The agent resolves the host pid first
+  (:mod:`deploy.c3_agent.lookup`), then runs ``as_uid --uid X --pid <host>``;
+  the *only* accepted result is exit 0 with exactly the ``C3-ASUID-OK
+  pid=N uid=X`` line on stdout and an empty stderr. Anything else is a ``502``
+  named fail-closed refusal (a half-applied grant must never read as success).
 
 Auth: every request must carry ``X-Internal-Key`` equal to
 ``E2B_C3_AGENT_TOKEN`` (constant-time); the service refuses to answer when the
@@ -26,9 +29,9 @@ configurable on purpose; what must bound the reach is a **NetworkPolicy
 allowing only CP→agent** and the rule that ``E2B_C3_AGENT_TOKEN`` never appears
 in a worker manifest or the worker image. Neither is built here.
 
-The container-pid → host-pid reverse lookup is **not here**: it belongs to
-Task 3, which owns the ``NSpid`` chain plus the target worker pod's cgroup match
-and will pass the host pid in. The stub below says so at the call site.
+The container-pid → host-pid reverse lookup lives beside this module, in
+``deploy/c3_agent/lookup.py``: it is a pure function of a ``/proc`` tree so the
+DaemonSet drives the same code the lanes drive against a synthetic one.
 """
 
 from __future__ import annotations
@@ -43,6 +46,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from deploy.c3_agent.config import Settings
+from deploy.c3_agent.lookup import (
+    LookupRefusal,
+    ProcLookup,
+    WorkerIdentity,
+    missing_slot_pid_message,
+)
 from gateway_common.paths import validate_sandbox_id
 
 logger = logging.getLogger(__name__)
@@ -55,10 +64,27 @@ class AgentRefusal(Exception):
     """A named, fail-closed refusal from the agent's privileged operation."""
 
 
+class WorkerInstruction(BaseModel):
+    """Who the control plane says the reported container pid belongs to.
+
+    ``pid_namespace`` is the worker's own reported identity (the one value that
+    exists in both lanes and in both directions -- ruling D9.3); ``pod_uid`` is
+    the k8s lane's independent proof, resolved by the control plane from the pod
+    API. Both are required *when their lane has them*: a body without the
+    identity is rejected by the schema, and a lane that cannot supply one is
+    refused by the control plane before this service is dialled.
+    """
+
+    node_id: str = Field(min_length=1)
+    pid_namespace: str = Field(min_length=1)
+    pod_uid: str | None = None
+
+
 class GrantSlotBody(BaseModel):
     sandbox_id: str = Field(min_length=1)
     uid: int = Field(ge=1)
     pid: int = Field(ge=1)
+    worker: WorkerInstruction
 
 
 class AsUidRunner(Protocol):
@@ -147,12 +173,18 @@ def _token_matches(provided: str, expected: str) -> bool:
 
 
 def create_app(
-    *, settings: Settings | None = None, runner: AsUidRunner | None = None
+    *,
+    settings: Settings | None = None,
+    runner: AsUidRunner | None = None,
+    lookup: ProcLookup | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     runner = runner or SubprocessAsUidRunner(
         settings.as_uid_path, timeout_s=settings.as_uid_timeout_s
     )
+    # The host's process table: face A runs with ``hostPID: true`` (Task 3's
+    # DaemonSet), which is what makes the worker's container pid visible here.
+    lookup = lookup or ProcLookup()
     # No interactive surface: the instruction API is the whole contract, and
     # `/openapi.json`/`/docs` on a privileged service is inventory for free.
     app = FastAPI(
@@ -164,6 +196,7 @@ def create_app(
     )
     app.state.settings = settings
     app.state.runner = runner
+    app.state.lookup = lookup
 
     @app.exception_handler(HTTPException)
     async def _http_exception_handler(request: Request, exc: HTTPException):
@@ -188,6 +221,20 @@ def create_app(
             raise HTTPException(
                 status_code=404, detail={"error": f"unknown agent op {op!r}"}
             )
+        if body.worker.node_id != node_id:
+            # The instruction's "who" and its "for which node" must agree: the
+            # address the agent was dialled on and the worker the lookup will
+            # match are the same fact, and a pair that disagrees is refused
+            # rather than resolved against either half.
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": (
+                        f"the instruction is addressed to node {node_id} but "
+                        f"names worker {body.worker.node_id}"
+                    )
+                },
+            )
         # Same shape rule the control plane uses: a hostile id must not reach a
         # log line (or a later path/lookup) verbatim. The message deliberately
         # does not echo it back.
@@ -199,9 +246,40 @@ def create_app(
                 status_code=400,
                 detail={"error": "sandbox_id is not a valid sandbox id"},
             )
+        identity = WorkerIdentity(
+            node_id=body.worker.node_id,
+            pid_namespace=body.worker.pid_namespace,
+            pod_uid=body.worker.pod_uid,
+        )
         try:
-            line = runner.grant(body.uid, body.pid)
+            host_pid = lookup.host_pid(
+                body.pid, identity, sandbox_id=body.sandbox_id
+            )
+        except LookupRefusal as exc:
+            logger.warning(
+                "c3-agent refused grant-slot for sandbox %s: %s",
+                body.sandbox_id,
+                exc,
+            )
+            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+        try:
+            line = runner.grant(body.uid, host_pid)
         except AgentRefusal as exc:
+            if not lookup.present(host_pid):
+                # The child ended between the report and the write. Name that,
+                # rather than forwarding the primitive's reading of a missing
+                # ``/proc`` entry (D9.5): "the slot's pid is gone" is the one
+                # failure an operator has to be able to grep for.
+                logger.warning(
+                    "c3-agent refused grant-slot for sandbox %s: the host pid "
+                    "%d is gone",
+                    body.sandbox_id,
+                    host_pid,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail={"error": missing_slot_pid_message(body.sandbox_id)},
+                ) from exc
             logger.warning(
                 "c3-agent refused grant-slot for sandbox %s: %s",
                 body.sandbox_id,
@@ -213,6 +291,8 @@ def create_app(
             "sandboxID": body.sandbox_id,
             "uid": body.uid,
             "pid": body.pid,
+            "hostPid": host_pid,
+            "pidNamespace": body.worker.pid_namespace,
             "asUid": line,
         }
 
