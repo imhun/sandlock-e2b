@@ -36,7 +36,12 @@ from pathlib import Path
 
 import pytest
 
-from deploy.c3_agent.lookup import LookupRefusal, ProcLookup, WorkerIdentity
+from deploy.c3_agent.lookup import (
+    LookupRefusal,
+    ProcLookup,
+    SlotProcess,
+    WorkerIdentity,
+)
 
 #: Two containers' pid namespaces, as ``readlink`` spells them.
 NAMESPACE_A = "pid:[4026532458]"
@@ -61,8 +66,9 @@ def _candidate(
     pid_namespace: str,
     cgroup: str = "0::/\n",
     comm: str = "python3",
+    start_time: int = 4242,
 ) -> Path:
-    """One ``/proc/<pid>`` entry with the three files the lookup reads."""
+    """One ``/proc/<pid>`` entry with the files the lookup reads."""
     entry = _proc(proc_root) / str(pid)
     (entry / "ns").mkdir(parents=True, exist_ok=True)
     (entry / "status").write_text(
@@ -70,6 +76,12 @@ def _candidate(
         encoding="utf-8",
     )
     (entry / "cgroup").write_text(cgroup, encoding="utf-8")
+    # ``/proc/<pid>/stat``: after ``comm`` the fields start at the state, so the
+    # 22nd field overall is index 19 of everything following the last ')'.
+    (entry / "stat").write_text(
+        f"{pid} ({comm}) S " + " ".join(["0"] * 18 + [str(start_time)]) + "\n",
+        encoding="utf-8",
+    )
     link = entry / "ns" / "pid"
     if link.is_symlink() or link.exists():
         link.unlink()
@@ -101,7 +113,9 @@ def test_the_host_pid_is_the_candidate_whose_nspid_chain_ends_in_the_reported_pi
 
     assert _lookup(root).host_pid(
         425, _identity_a(), sandbox_id="sbx_lookup"
-    ) == 2147848
+    ) == SlotProcess(
+        host_pid=2147848, start_time="4242", pid_namespace=NAMESPACE_A
+    )
 
 
 def test_two_workers_with_the_same_container_pid_are_not_confusable(
@@ -121,8 +135,12 @@ def test_two_workers_with_the_same_container_pid_are_not_confusable(
     identity_a = WorkerIdentity(node_id="worker-1", pid_namespace=NAMESPACE_A)
     identity_b = WorkerIdentity(node_id="worker-2", pid_namespace=NAMESPACE_B)
 
-    assert lookup.host_pid(42, identity_a, sandbox_id="sbx_a") == 3000042
-    assert lookup.host_pid(42, identity_b, sandbox_id="sbx_b") == 3000099
+    assert lookup.host_pid(
+        42, identity_a, sandbox_id="sbx_a"
+    ) == SlotProcess(3000042, "4242", NAMESPACE_A)
+    assert lookup.host_pid(
+        42, identity_b, sandbox_id="sbx_b"
+    ) == SlotProcess(3000099, "4242", NAMESPACE_B)
     with pytest.raises(LookupRefusal) as excinfo:
         lookup.host_pid(
             42,
@@ -204,7 +222,9 @@ def test_the_k8s_lane_also_requires_the_pod_in_the_candidates_cgroup(
     )
     identity = _identity_a(pod_uid=POD_UID)
 
-    assert _lookup(root).host_pid(42, identity, sandbox_id="sbx_k8s") == 3000042
+    assert _lookup(root).host_pid(
+        42, identity, sandbox_id="sbx_k8s"
+    ) == SlotProcess(3000042, "4242", NAMESPACE_A)
 
 
 def test_a_candidate_outside_the_target_pod_is_refused_by_name(
@@ -272,10 +292,39 @@ def test_the_reported_container_pid_that_is_gone_is_named(tmp_path: Path) -> Non
     assert str(excinfo.value) == "沙箱 sbx_gone 的槽位 pid 已不在"
 
 
-def test_presence_is_asked_of_the_same_proc_tree(tmp_path: Path) -> None:
+def test_the_resolved_process_is_the_one_that_is_still_there(tmp_path: Path) -> None:
     root = _proc(tmp_path / "proc")
     _candidate(root, 3000042, nspid=[3000042, 42], pid_namespace=NAMESPACE_A)
     lookup = _lookup(root)
+    slot = lookup.host_pid(42, _identity_a(), sandbox_id="sbx_alive")
 
-    assert lookup.present(3000042) is True
-    assert lookup.present(3000099) is False
+    assert lookup.still_alive(slot) is True
+    assert lookup.still_alive(
+        SlotProcess(3000099, "4242", NAMESPACE_A)
+    ) is False
+
+
+def test_a_recycled_pid_is_not_the_slot_process(tmp_path: Path) -> None:
+    """A pid that came back is a *different* process, and it says "gone".
+
+    The kernel reuses pids, so "the write failed and pid 3000042 is still in the
+    table" is not the same fact as "the slot's child is still there". The
+    resolution records the kernel's own discriminator (``stat`` field 22), and a
+    later check that finds a different one must report the child as gone rather
+    than forward the primitive's reading of whatever now holds that number.
+    """
+    root = _proc(tmp_path / "proc")
+    _candidate(
+        root, 3000042, nspid=[3000042, 42], pid_namespace=NAMESPACE_A,
+        start_time=111,
+    )
+    lookup = _lookup(root)
+    slot = lookup.host_pid(42, _identity_a(), sandbox_id="sbx_recycled")
+    assert lookup.still_alive(slot) is True
+
+    # Same pid, same namespace, same container pid -- a different process.
+    _candidate(
+        root, 3000042, nspid=[3000042, 42], pid_namespace=NAMESPACE_A,
+        start_time=999,
+    )
+    assert lookup.still_alive(slot) is False

@@ -252,7 +252,7 @@ def create_app(
             pod_uid=body.worker.pod_uid,
         )
         try:
-            host_pid = lookup.host_pid(
+            slot = lookup.host_pid(
                 body.pid, identity, sandbox_id=body.sandbox_id
             )
         except LookupRefusal as exc:
@@ -263,18 +263,19 @@ def create_app(
             )
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
         try:
-            line = runner.grant(body.uid, host_pid)
+            line = runner.grant(body.uid, slot.host_pid)
         except AgentRefusal as exc:
-            if not lookup.present(host_pid):
-                # The child ended between the report and the write. Name that,
-                # rather than forwarding the primitive's reading of a missing
-                # ``/proc`` entry (D9.5): "the slot's pid is gone" is the one
-                # failure an operator has to be able to grep for.
+            if not lookup.still_alive(slot):
+                # The child ended (or its pid was recycled) between the report
+                # and the write. Name that, rather than forwarding the
+                # primitive's reading of a missing ``/proc`` entry (D9.5):
+                # "the slot's pid is gone" is the one failure an operator has to
+                # be able to grep for.
                 logger.warning(
                     "c3-agent refused grant-slot for sandbox %s: the host pid "
                     "%d is gone",
                     body.sandbox_id,
-                    host_pid,
+                    slot.host_pid,
                 )
                 raise HTTPException(
                     status_code=502,
@@ -291,7 +292,7 @@ def create_app(
             "sandboxID": body.sandbox_id,
             "uid": body.uid,
             "pid": body.pid,
-            "hostPid": host_pid,
+            "hostPid": slot.host_pid,
             "pidNamespace": body.worker.pid_namespace,
             "asUid": line,
         }

@@ -350,4 +350,13 @@ class C3AgentClient:
                 f"the agent for node {node_id} answered with a non-JSON body",
                 status_code=502,
             ) from exc
-        return payload if isinstance(payload, dict) else {"answer": payload}
+        if not isinstance(payload, dict):
+            # A 2xx that is not an instruction answer is not a grant: the caller
+            # reads fields out of it, and "wrapped something else" would let a
+            # broken or substituted answer pass for one the agent never gave.
+            raise AgentClientError(
+                f"the agent for node {node_id} answered with a "
+                f"{type(payload).__name__}, not an instruction answer",
+                status_code=502,
+            )
+        return payload

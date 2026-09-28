@@ -69,6 +69,23 @@ class WorkerIdentity:
     pod_uid: str | None = None
 
 
+@dataclass(frozen=True)
+class SlotProcess:
+    """The slot's child, identified the way the kernel identifies a process.
+
+    A pid on its own is not an identity: the kernel reuses numbers, so "pid
+    990425 is gone" and "pid 990425 is somebody else now" are different facts
+    that a bare number cannot tell apart. ``start_time`` is the kernel's own
+    discriminator for one process instance (``/proc/<pid>/stat`` field 22), and
+    ``pid_namespace`` is the worker whose namespace it was resolved in -- both
+    are read at resolution time so a later check can tell the two apart.
+    """
+
+    host_pid: int
+    start_time: str
+    pid_namespace: str
+
+
 def missing_slot_pid_message(sandbox_id: str) -> str:
     """The name for "the child is not there any more" (task brief, verbatim).
 
@@ -101,14 +118,49 @@ class ProcLookup:
     def proc_root(self) -> Path:
         return self._proc_root
 
-    def present(self, host_pid: int) -> bool:
-        """Is this host pid still in the process table?
+    def still_alive(self, slot: SlotProcess) -> bool:
+        """Is this host pid still *the* process the lookup resolved?
 
-        Asked *after* a failed write as well as before one: a child that ends
-        between the lookup and the write must be named as gone rather than
-        reported as an opaque refusal from the primitive.
+        Asked *after* a failed write: a child that ended between the lookup and
+        the write must be named as gone rather than reported as an opaque
+        refusal from the primitive. A recycled pid is not that child either --
+        the kernel's ``start_time`` differs, and a pid that came back in another
+        worker's namespace is a different process by construction.
         """
-        return (self._proc_root / str(host_pid)).is_dir()
+        current = self._process_identity(slot.host_pid)
+        if current is None:
+            return False
+        pid_namespace, start_time = current
+        if slot.start_time and start_time and slot.start_time != start_time:
+            # The number was reused: the slot's child is gone even though its
+            # pid is not.
+            return False
+        return pid_namespace == slot.pid_namespace
+
+    def _process_identity(self, pid: int) -> tuple[str, str] | None:
+        """``(pid namespace, start time)`` for a live pid, or ``None``."""
+        pid_namespace = self._pid_namespace(pid)
+        if pid_namespace is None:
+            return None
+        return pid_namespace, self._start_time(pid)
+
+    def _start_time(self, pid: int) -> str:
+        """``/proc/<pid>/stat`` field 22: this pid instance's birth tick.
+
+        ``comm`` may contain spaces and parentheses, which is why the split is
+        anchored on the *last* ``)``. An unreadable stat is ``""`` (unknown),
+        never a match for a recorded value.
+        """
+        try:
+            text = (
+                (self._proc_root / str(pid) / "stat")
+                .read_text(encoding="utf-8", errors="replace")
+            )
+        except OSError:
+            return ""
+        fields = text.rsplit(")", 1)[-1].split()
+        # After ``comm`` the first field is the state, so field N is index N-3.
+        return fields[19] if len(fields) > 19 else ""
 
     def _status(self, pid: int) -> str | None:
         try:
@@ -139,8 +191,12 @@ class ProcLookup:
 
     def host_pid(
         self, container_pid: int, identity: WorkerIdentity, *, sandbox_id: str
-    ) -> int:
-        """The host pid of the worker's process known as ``container_pid``.
+    ) -> SlotProcess:
+        """The host process the worker knows as ``container_pid``.
+
+        The answer is a :class:`SlotProcess` -- the host pid *plus* the identity
+        the kernel gives that pid instance -- so a later "is it still there?"
+        cannot mistake a recycled number for the slot's child.
 
         Raises :class:`LookupRefusal` -- always by name, never with a guess --
         when the identity is unusable, when nothing matches, when nothing
@@ -216,7 +272,12 @@ class ProcLookup:
                 f"container pid {container_pid} matches more than one process "
                 f"of worker {identity.node_id}: refusing (ambiguous)"
             )
-        return in_namespace[0]
+        host_pid = in_namespace[0]
+        return SlotProcess(
+            host_pid=host_pid,
+            start_time=self._start_time(host_pid),
+            pid_namespace=identity.pid_namespace,
+        )
 
     def _iter_entries(self) -> list[int]:
         """Every numeric pid in the tree, or none when it cannot be listed."""

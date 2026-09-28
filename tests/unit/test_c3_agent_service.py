@@ -27,6 +27,7 @@ match and will pass the host pid in. The service says so at the call site.
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -35,7 +36,12 @@ import pytest
 
 from deploy.c3_agent.app import AgentRefusal, SubprocessAsUidRunner, create_app
 from deploy.c3_agent.config import Settings
-from deploy.c3_agent.lookup import LookupRefusal, missing_slot_pid_message
+from deploy.c3_agent.lookup import (
+    LookupRefusal,
+    ProcLookup,
+    SlotProcess,
+    missing_slot_pid_message,
+)
 
 TOKEN = "c3-agent-sekret"
 NODE = "e2b-worker-0"
@@ -105,13 +111,17 @@ class _StubLookup:
         self._refuse = refuse
         self._present = present
 
-    def host_pid(self, container_pid, identity, *, sandbox_id: str) -> int:
+    def host_pid(self, container_pid, identity, *, sandbox_id: str) -> SlotProcess:
         self.calls.append((container_pid, sandbox_id, identity.pid_namespace))
         if self._refuse is not None:
             raise LookupRefusal(self._refuse)
-        return self._host_pid
+        return SlotProcess(
+            host_pid=self._host_pid,
+            start_time="4242",
+            pid_namespace=identity.pid_namespace,
+        )
 
-    def present(self, host_pid: int) -> bool:
+    def still_alive(self, slot: SlotProcess) -> bool:
         return self._present
 
 
@@ -223,12 +233,17 @@ async def test_a_refused_grant_is_fail_closed_and_named() -> None:
 
 @pytest.mark.asyncio
 async def test_a_worker_identity_that_cannot_be_resolved_is_refused_named() -> None:
-    """The lookup's refusals reach the control plane by name, not as a 500."""
+    """The lookup's refusals reach the control plane by name, not as a 500.
+
+    The text here is the *real* refusal's spelling, built the way the lookup
+    builds it -- a stub whose wording drifted would let the wire contract and the
+    operator-facing name diverge (the real module is driven in
+    :func:`test_the_real_lookup_names_its_refusals_through_the_service`).
+    """
     runner = _StubRunner()
     lookup = _StubLookup(
         refuse="container pid 4242 is not in worker e2b-worker-0's pid "
-        "namespace (pid:[4026532999]): 1 process(es) with this container pid, "
-        "none of them in it"
+        "namespace (pid:[4026532999]): refusing"
     )
     app = create_app(settings=_settings(), runner=runner, lookup=lookup)
     async with _client(app) as client:
@@ -237,8 +252,47 @@ async def test_a_worker_identity_that_cannot_be_resolved_is_refused_named() -> N
         assert resp.json() == {
             "error": (
                 "container pid 4242 is not in worker e2b-worker-0's pid "
-                "namespace (pid:[4026532999]): 1 process(es) with this "
-                "container pid, none of them in it"
+                "namespace (pid:[4026532999]): refusing"
+            )
+        }
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_real_lookup_names_its_refusals_through_the_service(
+    tmp_path: Path,
+) -> None:
+    """The service's 502 carries the *real* module's words, not a paraphrase.
+
+    A synthetic ``/proc`` holding a candidate in another worker's pid namespace
+    is the shape that must be refused; nothing about the text is restated here,
+    so a wording change in the lookup shows up in this test rather than in
+    production logs.
+    """
+    proc_root = tmp_path / "proc"
+    entry = proc_root / "3000042"
+    entry.mkdir(parents=True)
+    (entry / "ns").mkdir()
+    (entry / "status").write_text("Name:\tpython3\nNSpid:\t3000042\t4242\n", encoding="utf-8")
+    (entry / "cgroup").write_text("0::/\n", encoding="utf-8")
+    (entry / "stat").write_text(
+        "3000042 (python3) S " + " ".join(["0"] * 18 + ["77"]) + "\n",
+        encoding="utf-8",
+    )
+    os.symlink("pid:[4026532999]", entry / "ns" / "pid")
+    runner = _StubRunner()
+    app = create_app(
+        settings=_settings(),
+        runner=runner,
+        lookup=ProcLookup(proc_root=proc_root),
+    )
+    async with _client(app) as client:
+        resp = await client.post(GRANT_URL, headers=_headers(), json=_body())
+        assert resp.status_code == 502
+        assert resp.json() == {
+            "error": (
+                "container pid 4242 is not in worker e2b-worker-0's pid "
+                "namespace (pid:[4026532458]): refusing"
             )
         }
     assert runner.calls == []

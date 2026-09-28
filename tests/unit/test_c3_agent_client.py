@@ -327,12 +327,18 @@ def test_the_real_agent_service_accepts_the_clients_instruction() -> None:
             return f"C3-ASUID-OK pid={pid} uid={uid}"
 
     class _Lookup:
-        def host_pid(self, container_pid, identity, *, sandbox_id: str) -> int:
+        def host_pid(self, container_pid, identity, *, sandbox_id: str):
+            from deploy.c3_agent.lookup import SlotProcess
+
             assert identity.pid_namespace == PID_NAMESPACE
             assert identity.pod_uid == WORKER_POD_UID
-            return 990425
+            return SlotProcess(
+                host_pid=990425,
+                start_time="4242",
+                pid_namespace=identity.pid_namespace,
+            )
 
-        def present(self, host_pid: int) -> bool:
+        def still_alive(self, slot) -> bool:
             return True
 
     runner = _Runner()
@@ -422,6 +428,33 @@ def test_the_agents_own_refusal_is_forwarded_verbatim() -> None:
         _grant(_client(handler))
     assert str(excinfo.value) == (
         f"the agent for node {NODE} refused the grant: 沙箱 sbx_forward 的槽位 pid 已不在"
+    )
+    assert excinfo.value.status_code == 502
+
+
+def test_an_answer_that_is_not_an_object_is_refused_not_wrapped() -> None:
+    """A 2xx body the caller cannot read fields out of is not a grant."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=["grant-slot"])
+
+    with pytest.raises(AgentClientError) as excinfo:
+        _grant(_client(handler))
+    assert str(excinfo.value) == (
+        f"the agent for node {NODE} answered with a list, not an instruction "
+        "answer"
+    )
+    assert excinfo.value.status_code == 502
+
+
+def test_an_answer_that_is_not_json_is_refused() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="C3-ASUID-OK pid=1 uid=1")
+
+    with pytest.raises(AgentClientError) as excinfo:
+        _grant(_client(handler))
+    assert str(excinfo.value) == (
+        f"the agent for node {NODE} answered with a non-JSON body"
     )
     assert excinfo.value.status_code == 502
 

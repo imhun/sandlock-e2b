@@ -52,6 +52,13 @@ def build_identity_reporter(
 ) -> Callable[[str, int], Any] | None:
     """The ``(sandbox_id, pid) -> answer`` reporter, or ``None`` when unwired.
 
+    The control plane's URL and this worker's node id come from the worker's
+    environment (``E2B_CONTROL_PLANE_URL`` / ``E2B_NODE_ID``) -- the same two the
+    node agent registers with, and ``envd_service.config.Settings`` has no field
+    for either, so there is nothing else to read. The keyword overrides exist for
+    an embedder that already knows them (the tests) and are used verbatim when
+    given, including an explicit ``""``.
+
     ``None`` is the honest answer for a worker that does not know where its
     control plane is (or which node it is): route B then declines the
     identity-grant path by name instead of forking a child nobody will grant.
@@ -59,13 +66,12 @@ def build_identity_reporter(
     url = (
         control_plane_url
         if control_plane_url is not None
-        else getattr(settings, "control_plane_url", None)
-        or os.getenv("E2B_CONTROL_PLANE_URL", "")
+        else os.getenv("E2B_CONTROL_PLANE_URL", "")
     )
     node = (
         node_id
         if node_id is not None
-        else getattr(settings, "node_id", None) or os.getenv("E2B_NODE_ID", "")
+        else os.getenv("E2B_NODE_ID", "")
     )
     if not url or not node:
         return None
