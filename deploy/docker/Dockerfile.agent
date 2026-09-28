@@ -1,0 +1,89 @@
+# C3 (Task 1): the per-node agent's **own** image -- two file-capability
+# binaries and nothing else.
+#
+# Why a second image instead of reusing the worker's (deploy/docker/Dockerfile.envd):
+# the plan's judgement #2 is that the *worker* image must not contain the
+# privileged binaries at all ("0 privileged binaries", P3/Task 4). That is only
+# an assertable property if the agent's copy lives somewhere the worker image
+# never builds from -- a shared image would make "worker image has no
+# /var/lib/e2b-priv" a statement about a build arg instead of about a file. The
+# old reason to share the image was that the socket protocol was the two sides'
+# contract; under C3 there is no `worker <-> agent` channel at all (hard rule
+# 5), so that reason is gone.
+#
+# Two binaries, two faces, two owners:
+#
+#   /var/lib/e2b-priv/as_uid     face A: `cap_setuid,cap_setgid+ep`, runs as
+#                                65534. Writes the identity map of a pid the
+#                                worker just unshared (`deploy/priv/as_uid.c`;
+#                                the capability is what lets it name an id at
+#                                all, the 65534 is what makes the *target's*
+#                                namespace accept the write -- §14.2.7).
+#   /var/lib/e2b-priv/e2b-maint  face B: `cap_chown,cap_dac_override+ep`. The
+#                                same broker C1 shipped (`deploy/priv/maint.c`),
+#                                moved to the agent's file face -- deliberately
+#                                unchanged, capability for capability.
+#
+# The directory is `0710 root:<agent gid>`, the binaries `0750`, exactly as
+# `docs/c3-privilege-relocation.md` §2 records: DAC (not Landlock) is the
+# barrier, and a sandbox uid is a pooled uid that is never in this group.
+#
+# Face B runs as uid 0 (NFS AUTH_SYS only honours uid 0 for `chown`), which the
+# DaemonSet sets per container (`runAsUser: 0` + `drop: [ALL]` +
+# `add: [CHOWN, DAC_OVERRIDE, FOWNER]`). This image's own `USER` is face A's,
+# because a container that forgets to override it must end up unprivileged, not
+# root. `no-new-privileges` must stay **off**: NNP=1 makes the kernel ignore
+# file capabilities, and both faces would fail silently.
+FROM python:3.14-slim AS builder
+
+RUN sed -i \
+        's|http://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g; s|http://security.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY deploy/priv/ /tmp/priv/
+RUN cc -O2 -Wall -Wextra -o /tmp/priv/as_uid \
+        /tmp/priv/as_uid.c /tmp/priv/priv_common.c \
+    && cc -O2 -Wall -Wextra -o /tmp/priv/e2b-maint \
+        /tmp/priv/maint.c /tmp/priv/priv_common.c
+
+# A slim Debian base, for the same reasons every other Dockerfile here uses
+# one: it already carries `ca-certificates`, which the mirror's https sources
+# need before anything can be installed. Nothing of the *sandbox* runtime --
+# no envd_service, no gateway_common, no egress library, no sandlock wheel --
+# is copied in: the two lines below are this image's whole privileged payload.
+FROM python:3.14-slim
+
+RUN sed -i \
+        's|http://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g; s|http://security.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends libcap2-bin \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/e2b-priv \
+    && chown root:65534 /var/lib/e2b-priv \
+    && chmod 0710 /var/lib/e2b-priv
+
+# The binaries are copied into the FINAL stage and capped *here*: a
+# `COPY --from` does not carry the `security.capability` xattr, so applying the
+# caps in the builder would ship two unprivileged helpers that look installed.
+# `libcap2-bin` stays (the same call the worker image makes): the lane verifies
+# the result with `getcap`, and nothing on any runtime path needs the package.
+COPY --from=builder /tmp/priv/as_uid /tmp/priv/e2b-maint /var/lib/e2b-priv/
+RUN chown root:65534 /var/lib/e2b-priv/as_uid /var/lib/e2b-priv/e2b-maint \
+    && chmod 0750 /var/lib/e2b-priv/as_uid /var/lib/e2b-priv/e2b-maint \
+    && setcap cap_setuid,cap_setgid+ep /var/lib/e2b-priv/as_uid \
+    && setcap cap_chown,cap_dac_override+ep /var/lib/e2b-priv/e2b-maint \
+    && getcap /var/lib/e2b-priv/as_uid /var/lib/e2b-priv/e2b-maint
+
+# Face A's identity. The agent DaemonSet overrides it per container (face B is
+# root by manifest, `runAsUser: 0`); the default has to be the unprivileged one.
+USER 65534:65534
+
+# No runtime contract of its own: the two faces' argv (and their health/liveness
+# commands) belong to the DaemonSet -- Task 3 wires face A into route B, Task 2
+# gives it the control-plane channel. This is a placeholder that keeps the
+# container alive without inventing a surface a later task would have to undo.
+CMD ["sleep", "infinity"]
