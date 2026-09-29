@@ -219,6 +219,38 @@ COMMAND_LOG_NAME = "command-logs.jsonl"
 #: :data:`UNTRUSTED_TREE_DIR`.
 CHECKPOINT_ROOT_NAME = ".checkpoints"
 
+#: How many bytes of a sandbox id may become a route-B **instance name**
+#: (:func:`route_b_instance_name`). Longer ids are replaced by their hash: a
+#: filename is bounded by ``NAME_MAX``, and the name is also the slot's
+#: unix-socket path component in the registered transport.
+ROUTE_B_INSTANCE_NAME_MAX_BYTES = 64
+
+
+def route_b_instance_name(sandbox_id: str) -> str:
+    """The route-B **instance name** for a sandbox -- one rule, two consumers.
+
+    It is the slot's identity in the pool (``W1SlotPool.acquire_sync``'s
+    ``name``) *and* the leaf of the directory that holds the slot's
+    ``policy.json`` / ``program.json`` (``<route-b root>/<uid>/<name>/``). Two
+    derivations of that one name existed until C3 Task 4's second review: the
+    worker's executor computed it here and the control plane guessed
+    ``rb-<sandbox_id>``, so the ``scope-slot-document`` op pointed at a
+    directory that does not exist -- on the document that carries the
+    egress-proxy credentials. Ruling D20: the rule lives here, in the module the
+    control plane and envd both already share (``gateway_common``), and both
+    sides call it.
+
+    The >``ROUTE_B_INSTANCE_NAME_MAX_BYTES`` case is part of the rule, not an
+    implementation detail of the worker: an id long enough to matter is replaced
+    by ``sbx_<sha256(id)[:16]>``, and a control plane that did not know that
+    would derive the wrong directory for exactly those sandboxes.
+    """
+    if len(sandbox_id.encode()) <= ROUTE_B_INSTANCE_NAME_MAX_BYTES:
+        return sandbox_id
+    import hashlib
+
+    return "sbx_" + hashlib.sha256(sandbox_id.encode()).hexdigest()[:16]
+
 
 def resolve_state_base(
     workspace_base: str | Path, state_base: str | Path | None = None

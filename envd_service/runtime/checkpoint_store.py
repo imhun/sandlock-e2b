@@ -331,7 +331,22 @@ def checkpoint_status(
         last = None
     image_mb = 0
     if has_image:
-        image_mb = image_bytes(image, sandbox_id=sandbox_id) // _MIB
+        # Same "nothing to report" contract as the reads above (C3 Task 4
+        # review, N4): this is a *diagnostic*, and a transient control-plane
+        # outage in the agent shape used to turn it into a 500 -- while a
+        # half-written image two lines up is deliberately reported as absent.
+        # Unknown bytes therefore read as 0 (the convention ``image_bytes``
+        # already uses for a broker it cannot ask), with the reason on record.
+        try:
+            image_mb = image_bytes(image, sandbox_id=sandbox_id) // _MIB
+        except Exception as exc:  # noqa: BLE001 - a diagnostic may not raise
+            logger.warning(
+                "sandbox %s: cannot measure the checkpoint image: %s: %s",
+                sandbox_id,
+                type(exc).__name__,
+                exc,
+            )
+            image_mb = 0
     return {
         "sandboxID": sandbox_id,
         "hasImage": has_image,
@@ -664,6 +679,16 @@ def _remove_image(image: Path, *, sandbox_id: str | None = None) -> None:
     which the orphan sweep is what collects, and that sweep is exactly what the
     agent shape turns off. If a second image ever becomes legal here, this is
     the line to revisit.
+
+    ⚠ **Also recorded** (C3 Task 4 second review, N6): unlike
+    :func:`envd_service.agent._remove_agent_half`, this branch has no
+    "already absent" arm -- ``e2b-maint rm`` refuses a path that is not there,
+    so an image that vanished between the caller's own ``is_dir()`` check and
+    the op raises instead of reading as "nothing to consume". Every caller
+    checks first (``remove_checkpoint_images``, ``_discard_empty_store``, and
+    the resume path's own guard), so the window is one syscall wide and the
+    outcome is a named refusal, not a silent skip; recorded here so the final
+    review can decide whether to fold this branch into ``_remove_agent_half``.
     """
     from envd_service import agent_fileops, priv_helpers
 

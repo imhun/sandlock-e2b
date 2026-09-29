@@ -31,6 +31,7 @@ from pathlib import Path
 
 from gateway_common.errors import ConnectError, unimplemented
 from gateway_common.network import NetworkUpdateConflictError
+from gateway_common.paths import route_b_instance_name
 from envd_service.executors.base import ExecConfig, Executor, RunningProcess
 from envd_service.uid_pool import (
     CAP_SETGID,
@@ -1441,12 +1442,11 @@ class SandlockExecutor(Executor):
             return None
 
     def _instance_name_for(self) -> str:
+        # The rule itself lives in ``gateway_common`` (D20): the control plane
+        # derives the slot documents' directory from the same function, so a
+        # slot the worker created is one the CP can address.
         sid = self._sandbox_id or Path(self._workspace_dir).name
-        if len(sid.encode()) <= 64:
-            return sid
-        import hashlib
-
-        return "sbx_" + hashlib.sha256(sid.encode()).hexdigest()[:16]
+        return route_b_instance_name(sid)
 
     # Warn-once switches for the shapes that decline a slot. The reason itself
     # comes from `_route_b_decline_reason` -- one decision, quoted verbatim by

@@ -421,7 +421,26 @@ class RuntimeRegistry:
 
                 client = agent_fileops.active()
                 if client is not None:
-                    size = client.workspace_bytes(record.sandbox_id)
+                    # Same contract as ``priv_helpers.dir_size`` below: ``None``
+                    # is "unknown", which every reader already models -- so a
+                    # control plane that cannot be reached must not take the
+                    # heartbeat (or the caller) down with it (C3 Task 4 review,
+                    # N4). Named, never silent.
+                    # Same contract as ``priv_helpers.dir_size`` below: ``None``
+                    # is "unknown", which every reader already models -- so a
+                    # control plane that cannot be reached must not take the
+                    # heartbeat (or the caller) down with it (C3 Task 4 review,
+                    # N4). Named, never silent.
+                    try:
+                        size = client.workspace_bytes(record.sandbox_id)
+                    except Exception as exc:  # noqa: BLE001 - see above
+                        logger.warning(
+                            "cannot measure %s through the agent: %s: %s",
+                            record.sandbox_id,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        size = None
                 else:
                     size = priv_helpers.dir_size(record.workspace_dir)
                 if dirty:

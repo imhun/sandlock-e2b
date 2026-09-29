@@ -643,6 +643,15 @@ class W1SlotPool:
         with self._ledger:
             uid = self._take_uid_locked(sandbox_id, uid)
         program = program_json or PARKING_PROGRAM
+        # ``name`` is the per-instance directory leaf under ``<root>/<uid>/``.
+        # The production caller is the executor's route-B acquire and it always
+        # passes ``name=self.instance_name`` (``executors/sandlock.py``), which
+        # is ``gateway_common.paths.route_b_instance_name`` -- the same rule the
+        # control plane derives the slot documents' path with. The ``rb-``
+        # fallback exists only for a caller that names no instance (an embedder,
+        # a test); it is never taken in production, and
+        # ``_scope_slot_document`` refuses it by name in the agent shape rather
+        # than letting the CP be pointed at a directory nobody created (D20).
         slot_name = name or f"rb-{sandbox_id}"
         # The token is only ever a *registered*-transport credential. On the fd
         # handoff it is generated and never sent: nothing secret may land in the
@@ -886,6 +895,24 @@ class W1SlotPool:
                 raise PrivHelperError(
                     "the C3 agent shape needs the sandbox id to scope a slot "
                     f"document: {path} was not named by one"
+                )
+            # D20's check: the control plane derives this directory from the
+            # shared naming rule, so the worker must be looking at exactly that
+            # directory. A caller that named the slot something else (the
+            # name-less ``rb-<id>`` fallback, or an embedder's own name) would
+            # otherwise have its *other* document handed to the agent under the
+            # CP's path -- scope the wrong file, or refuse this one. Refusing by
+            # name is the only shape that cannot silently do the wrong thing.
+            from gateway_common.paths import route_b_instance_name
+
+            expected = route_b_instance_name(sandbox_id)
+            if path.parent.name != expected:
+                raise PrivHelperError(
+                    f"the route-B slot directory for sandbox {sandbox_id} is "
+                    f"{path.parent.name!r}, but the shared naming rule says "
+                    f"{expected!r}: the control plane derives the slot "
+                    "documents' path from that rule, so this deployment would "
+                    "scope the wrong path -- refusing"
                 )
             client.scope_slot_document(sandbox_id, path.name)
             return

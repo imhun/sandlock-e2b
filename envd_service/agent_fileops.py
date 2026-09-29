@@ -38,6 +38,13 @@ logger = logging.getLogger(__name__)
 #: "abandoned" does not mean "stopped".
 DEFAULT_TIMEOUT_S = 660.0
 
+#: The connect phase gets its own, short deadline (C3 Task 4 review, N2). A
+#: control plane that is not *answering* is entitled to the file-op deadline --
+#: a big tree takes minutes -- but one that cannot be *reached* is known in
+#: seconds, and in that case the caller is usually a request handler that must
+#: not park the worker's event loop behind it.
+DEFAULT_CONNECT_TIMEOUT_S = 5.0
+
 
 class AgentFileOpsError(RuntimeError):
     """A named, fail-closed failure of one file operation."""
@@ -59,6 +66,7 @@ class AgentFileOps:
         self._node_id = str(node_id)
         self._internal_key = internal_key or ""
         self._timeout_s = float(timeout_s)
+        self._connect_timeout_s = min(DEFAULT_CONNECT_TIMEOUT_S, self._timeout_s)
         self._transport = transport
         #: Every op this client will send. Named here so the whitelist is
         #: readable in one place (and so a typo is a refusal, not a 400 from the
@@ -94,7 +102,13 @@ class AgentFileOps:
         body = {"op": op, "sandbox_id": sandbox_id, **params}
         try:
             with httpx.Client(
-                timeout=self._timeout_s, transport=self._transport
+                # ``httpx.Timeout`` and not the bare float: the read phase is the
+                # operation's budget, the connect phase is this service's
+                # reachability (see ``DEFAULT_CONNECT_TIMEOUT_S``).
+                timeout=httpx.Timeout(
+                    self._timeout_s, connect=self._connect_timeout_s
+                ),
+                transport=self._transport,
             ) as client:
                 response = client.post(
                     url, json=body, headers={"X-Internal-Key": self._internal_key}

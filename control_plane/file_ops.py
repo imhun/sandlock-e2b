@@ -23,7 +23,7 @@ re-invented) and onto one target:
 | ``chown-volume-root`` | ``chown`` | ``<volume>`` |
 | ``remove-volume-slice`` | ``rm`` | ``<volume>/<id>`` |
 | ``chown-secret`` | ``chown`` | ``<image cache>/secrets/<id>/<name>.secret`` |
-| ``scope-slot-document`` | ``chown`` | ``<route-B root>/<uid>/rb-<id>/<name>`` |
+| ``scope-slot-document`` | ``chown`` | ``<route-B root>/<uid>/<instance name>/<name>``, where the leaf comes from :func:`gateway_common.paths.route_b_instance_name` -- the **same** function the worker's executor names the slot with (ruling D20) |
 
 Two rules are enforced *here* as well as in the agent, on purpose (C3 §14.4:
 "两道，不互相替代" -- the agent still resolves and whitelists independently):
@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from gateway_common.paths import (
+    route_b_instance_name,
     sandbox_checkpoint_dir,
     sandbox_runtime_dir,
     validate_sandbox_id,
@@ -381,7 +382,18 @@ def _slot_document(
             "path: refusing",
             status_code=503,
         )
-    return paths.route_b_tmp_root / str(host_uid) / f"rb-{sandbox_id}" / name
+    # D20: the leaf is the worker's **instance name**, and it is computed by
+    # the shared rule rather than guessed here. ``rb-<id>`` was a second copy of
+    # that rule, and it was wrong for every production caller (the executor
+    # always names the slot), so this op pointed at a directory that exists
+    # nowhere -- the slot's own ``policy.json``/``program.json``, which is the
+    # document carrying the egress-proxy credentials.
+    return (
+        paths.route_b_tmp_root
+        / str(host_uid)
+        / route_b_instance_name(sandbox_id)
+        / name
+    )
 
 
 def _require_in_roots(paths: ControlPaths, path: Path, spec: FileOpSpec) -> None:

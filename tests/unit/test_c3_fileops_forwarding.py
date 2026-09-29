@@ -25,6 +25,7 @@ from control_plane.node_address import NodeEndpoint, StaticAddressResolver
 from control_plane.registry.manager import SandboxRegistry
 from control_plane.registry.nodes import NodeRegistry
 from control_plane.registry.volumes import VolumeRegistry
+from gateway_common.paths import route_b_instance_name
 
 KEY_A = "key-node-a"
 ENDPOINT_A = NodeEndpoint("http://10.0.0.1:49983", "10.0.0.1")
@@ -137,7 +138,12 @@ class _C3Shape:
         return self.image_cache / "secrets" / SANDBOX / f"{name}.secret"
 
     def slot_document(self, name: str = "policy.json") -> Path:
-        return self.route_b / str(UID_X) / f"rb-{SANDBOX}" / name
+        # The directory leaf is the worker's *instance name*, from the shared
+        # rule (D20) -- not ``rb-<id>``, which was this test's own copy of a
+        # rule the worker never used.
+        return (
+            self.route_b / str(UID_X) / route_b_instance_name(SANDBOX) / name
+        )
 
 
 def _app(shape: _C3Shape, *, client) -> tuple:

@@ -126,6 +126,18 @@ def _remove_agent_half(
     The re-check after a refusal also covers the race where the path disappears
     between the pre-check and the agent's ``rm`` -- the one case where the
     refusal is correct about the mechanism and wrong about the outcome.
+
+    ⚠ **Recorded narrowness** (C3 Task 4 second review, N5): the absence this
+    checks is the *worker's* path, while the removal the agent performs is on
+    the path the *control plane* derived. A deployment whose two bases disagree
+    (``E2B_WORKSPACE_BASE``/``E2B_STATE_BASE`` named differently on the CP and
+    the worker) could therefore report success here while the tree still exists
+    where the CP looks. It is not a security hole -- the CP's derivation is
+    still the one that is (not) executed -- and a divergence of that kind is
+    already visible elsewhere (the disk report never sees the tree the worker
+    measures, and the sandbox's own files disappear from every API). Recording
+    it rather than adding a second round trip per teardown; the final review may
+    want a config-agreement check at registration instead.
     """
     if not _lexists(path):
         logger.info(

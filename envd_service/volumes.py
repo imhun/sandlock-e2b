@@ -42,6 +42,7 @@ import stat
 from pathlib import Path
 from typing import Any
 
+from envd_service.agent_fileops import AgentFileOpsError
 from envd_service.xfs_quota import (
     ProjectQuotaError,
     clear_project_limits,
@@ -111,6 +112,17 @@ def _ensure_traversable(path: Path) -> None:
                 )
 
 
+def _volume_root_needs_handover(st) -> bool:
+    """Whether the shared volume root still belongs to root and must move (N3).
+
+    A seam as much as a rule: the hand-over only runs for a root-owned root
+    (the legacy layout the control-plane API used to create), and a test that
+    wants the branch has to force the predicate rather than depend on who owns
+    its fixture.
+    """
+    return st.st_uid == 0
+
+
 def _ensure_shared_volume_root(
     volume_root: Path,
     host_uid: int,
@@ -163,7 +175,7 @@ def _ensure_shared_volume_root(
             "cannot chmod volume root %s to %o: %s", volume_root, wanted, exc
         )
     try:
-        if st.st_uid == 0:
+        if _volume_root_needs_handover(st):
             _chown_path(
                 volume_root,
                 host_uid,
@@ -174,6 +186,22 @@ def _ensure_shared_volume_root(
     except OSError as exc:
         logger.warning(
             "cannot hand volume root %s to uid %s: %s",
+            volume_root,
+            host_uid,
+            exc,
+        )
+    except AgentFileOpsError as exc:
+        # C3 Task 4 review, N3: the agent shape raises a ``RuntimeError`` (an
+        # ``AgentFileOpsError``), which the ``OSError`` arm above does not
+        # catch -- so a *documented best-effort* step would have aborted
+        # ``build_volume_mounts`` and therefore the sandbox create. Best-effort
+        # is kept, deliberately and for the same reason the OS arm keeps it:
+        # only a *root-owned* root is moved (a legacy-layout migration), and the
+        # sandbox's own mount view is its ``0770`` slice, which is handed over
+        # separately and still fails closed. So a refusal here degrades the
+        # shared root, not the mount -- named, never silent.
+        logger.warning(
+            "cannot hand volume root %s to uid %s through the agent: %s",
             volume_root,
             host_uid,
             exc,
