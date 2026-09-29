@@ -722,22 +722,47 @@ worker 侧的特权面并没有真的消失。**(d) 是唯一的例外，因为�
    `tests/unit/test_worker_manifest_permissions.py`（文本 + 渲染两处）与
    `tests/unit/test_c3_agent_manifest.py::test_the_worker_is_on_the_agent_grant_path_and_carries_no_agent_secret`。
 9. **compose（含 `deploy/stack/docker-compose.prod.yml`，D17 在范围内）**（第五轮评审补记；
-   **Task 4 片 B 已落 `pid: host`，但选项 2 还缺代码**）：给 face B（`c3-agent-maint`）加了
-   `pid: host` —— 这是 D21 选项 2（agent 从内核读 worker 进程的 uid/gid）的**部署前提**，
-   三个 compose 栈都设了。但**选项 2 本身需要 agent 侧现在没有的代码**：agent 今天只把 CP
-   指令里的 `worker.uid/gid` 写进子进程环境，没有任何"按 worker pid 读 `/proc/<pid>` 属主"
-   的路径。⇒ 该车道今天仍走**选项 1 的 fail-closed 一侧**（`NoWorkerIdentitySource`：节点记录
-   不到身份，凡需要身份的 op 具名 503），**`pid: host` 是为那一步代码预留的**；接上它就是
-   一次 agent 侧的新增（不在本片范围）。三个栈的清单 pin 见
-   `tests/unit/test_c3_agent_manifest.py`（`face_b["pid"] == "host"` 与两个端点）。
+   **Task 4 片 C 收口：选项 2 已落地**）：给 face B（`c3-agent-maint`）加的 `pid: host`
+   是 D21 选项 2（agent 从内核读 worker 进程的 uid/gid）的**部署前提**，三个 compose 栈都设了。
+   片 B 之前这条链缺的是 agent 侧代码（agent 只把 CP 指令里的 `worker.uid/gid` 写进子进程
+   环境，没有任何"从内核读"的路径）⇒ 该车道当时走**选项 1 的 fail-closed 一侧**
+   （`NoWorkerIdentitySource`：节点记不到身份，凡需要身份的 op 具名 503），而**建箱路径上的
+   第一个特权步骤就是属主交棒**（`envd_service/agent.py:2869-2870` →
+   `uid_pool.apply_sandbox_ownership` → `agent_fileops.chown_workspace`），所以那三个 compose
+   车道当时**连建箱都完不成**（`Sandbox.create()` 直接 503，不是"建好了但身份操作不可用"）。
 
-   ⚠ **票面比"身份类 op 503"更重：这三个 compose 车道在选项 2 落地前连"建箱"都完不成。**
-   属主交棒是建箱路径上的**第一个特权步骤**（`envd_service/agent.py:2869-2870` →
-   `uid_pool.apply_sandbox_ownership` → `agent_fileops.chown_workspace`），而它要的
-   `chown-workspace` op 在 CP 侧先要节点记录里的 `worker_uid/gid`（可信来源）——compose 拿到
-   `null` ⇒ 具名 503 ⇒ **`Sandbox.create()` 直接失败**（不是"建好了但身份操作不可用"）。
-   ⇒ **compose 的部署窗口必须等这段 agent 代码**（或显式把 `E2B_PRIV_HELPER_TRANSPORT` 留在
-   旧镜像/旧形状上，那又回到"worker 里带特权二进制"）。k8s 不受影响（它的可信来源就是 pod spec）。
+   **片 C 接上的形状（2026-09-29）**：CP 侧新增 `KernelWorkerIdentitySource`（`hostname` 形状
+   即 compose 走它，`configured=True`、`kernel_verified=True`）——节点把 worker 上报的
+   `worker_uid/gid` 记为**待内核确认的声明**，并在每条"以 worker 身份执行"的指令里带上
+   **锚点**（该节点的 `pidNamespace`，CP 自己记录、`_worker_pid_namespace` 已做形状校验）；
+   agent 侧 face B 在锚点存在时按锚点解出宿主进程并读 `/proc/<pid>/status` 的
+   `Uid:`/`Gid:`（第二列，有效身份），**用它**做 `--worker`/`--gid`，声明与内核不一致、
+   锚点无进程、锚点多于一个进程，都**具名拒**且不 exec 任何 `e2b-maint`（k8s 车道不动：
+   它的指令不带锚点，值仍是 pod spec 校验过的那一个）。实现与用例：
+   `deploy/c3_agent/lookup.py`（`ProcLookup.worker_uid_gid` + `resolve-worker` 入口）、
+   `deploy/c3_agent/app.py`（`WorkerCredentials.pid_namespace`）、
+   `control_plane/{worker_identity_source,api/internal,c3_agent_client}.py`；
+   `tests/unit/test_c3_worker_kernel_identity.py`、
+   `tests/unit/test_c3_fileops_forwarding.py`（compose 声明+锚点）、
+   `tests/contract/test_c3_worker_kernel_identity.py`（真容器/真内核）。
+
+   ⚠ **一个非显然的内核约束（片 C 实测，别再踩）**：`/proc/<pid>/ns/pid` 的 `readlink`
+   走 `ptrace_may_access` —— 只有**同 uid**（或持 `CAP_SYS_PTRACE`）的进程能读别人的名字
+   空间。face B 是 root **且刻意没有 `CAP_SYS_PTRACE`**（它与控制面共享 `pid: host`，给了
+   这个能力就等于让它能 ptrace 控制面），而 worker 是 65534 ⇒ **face B 自己读不到**。
+   所以读 `/proc` 的那一步在 face B 的**子进程**里做，子进程按
+   `E2B_C3_AGENT_RESOLVER_UID`/`_GID`（默认 `65534:65534`，= 三个 compose 栈 worker 的
+   `user:` 与 worker 镜像的 `USER`）运行；该旋钮配错时是**具名拒绝**（"holds no process this
+   identity resolver can see (it runs as …)"），不是错身份。**不要**用 `CAP_SYS_PTRACE`
+   换这段代码：那会让 face B 能读控制面内存。
+
+   ⚠ **仍未收口的残留（记为后续项）**：compose 的锚点本身仍是 **worker 自报**的
+   （`pidNamespace` 在 register/heartbeat 里上报，CP 只做形状校验）。同机、同 uid 的 worker
+   之间可以互相读 `ns/pid`（同上那条 ptrace 规则），因此一个被攻陷的 worker 理论上能枚举
+   ns inode、冒充**同一 uid 的另一个 worker**的名字空间（k8s 有 pod UID 的 cgroup 证
+   `pod<uid>` 挡这条，compose 没有等价物）。影响面窄（同机同 uid、且身份值相同或仅 gid 不同），
+   要收口需要一条 compose 侧的 cgroup/hostname token（与 `pod_cgroup_token` 同形），属于
+   后续 task。
 10. **stack 的 agent uid 池是两个 worker 池的并集，但旋钮是各自独立的**（Task 4 片 B 记录）：
    `deploy/stack/docker-compose.prod.yml` 的 face B 用 `E2B_UID_POOL_START`（默认 10000）+
    `E2B_C3_AGENT_UID_POOL_SIZE`（默认 **2000**，覆盖 worker-1 的 `10000..10999` 与 worker-2 的
