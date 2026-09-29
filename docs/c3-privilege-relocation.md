@@ -464,6 +464,50 @@ agent 看得全（不只自己名下）、被攻破也不构成"说谎"（它本
 **⚠ 剩下的依赖性**：CP 的记录若**过期**，(e) 会照它删 —— 今天那层 `protected_elsewhere`
 （"看不到 fleet 视图就整体推迟"）必须在 CP 侧重做。
 
+> **✅ 2026-09-29 实施（Task 6）—— 形状、三档门、以及"谁是谁的身份"**
+>
+> **形状**：agent 周期扫描自己挂着的 `<workspaces>/*`（面 B，唯一挂了共享工作区的容器），
+> 把**看见的 id** 报给控制面 `POST /internal/nodes/{agent_node_id}/agent/inventory`，body 只有
+> `{"sandboxes": [id, …]}`（没有 path、没有 uid、没有"请删"）；CP 用**权威记录**判定"**没有任何
+> 记录认领这个 id**"才叫孤儿，然后指令**同一个节点**的 agent 用既有的 `rm` 动词删（路径由 CP
+> 从自己的记录/设置推导；agent 再独立做一次 `realpath` + 四根）。agent 不决定、不自己动手、
+> 不持有授权表。**worker 自己的扫盘仍按 Task 4 的具名告警保持关闭**（`chown --worker` 正是
+> §14.3 量到的那条越权），本任务把那个具名缺口补成上面的机制，而不是把它打开。
+>
+> **触发/周期**：首扫 `E2B_C3_AGENT_SCAN_INITIAL_DELAY_S=30`，之后 `E2B_C3_AGENT_SCAN_INTERVAL_S=120`
+> ⇒ 判据① 的"**N 分钟**"= **2–3 分钟**（30s + 120s）。被 CP 具名推迟或报不出去的轮次按倍率退避、
+> 封顶 `E2B_C3_AGENT_SCAN_BACKOFF_MAX_S=600`（既不成整舰队轮询，也不静默停摆）。
+>
+> **`protected_elsewhere` 在 CP 侧的重做 —— 三档门（各自有条用例，删掉任一条即红）**：
+> ① **权威面必须是共享记录**（`_record_store` 存在）。进程内的记录集**不能**证明"舰队里没有记录
+> 认领它"：CP 一重启那套集合就是空的，共享挂载上**每一棵活树**都会看起来无主 —— 这个形状下
+> 巡检**惰性**（具名推迟），不是危险；
+> ② **读到的每一条都要有答案**（`unreadable == 0`）：`_iter_stored_records` 一向**静默跳过**读不
+> 出来的记录（它不能把 TTL 清扫一起拖死），而继承这个习惯的清扫会删掉"唯一一条读不出的记录"
+> 名下的树；新增 `SandboxRegistry.fleet_id_snapshot()` 把跳过的条数**数出来**（墓碑不算
+> unreadable："已删"是个答案）；
+> ③ **枚举条数 == 舰队记录数**（`GET /internal/fleet/metrics` 的 `activeSandboxes`，Task 4 的评审
+> 钉过的那条纪律）：两次**读**之间的竞态（新建/删除落地）会让两个数不一致 ⇒ 推迟。
+>
+> **身份怎么绑**（本项在文档里原本只有 worker→CP 那一半）：agent 报的是**自己**（D12：身份是
+> **宿主**），所以身份路径也是 agent 的 —— 凭据是 `E2B_C3_AGENT_TOKEN`（**只**在 agent 自己的
+> 面上被接受，`control_plane/auth.py::verify_agent_key`；它**不进** `all_internal_api_keys`，
+> 否则一把 agent token 就等于舰队内部凭据）；地址由**主机键**查出来（k8s：agent pod 的 label +
+> `fieldSelector spec.nodeName=<宿主>`，**不读 worker pod** —— worker 崩了且不重启时 worker pod
+> 可能已经不在，而那正是这条巡检存在的理由；compose：`E2B_C3_AGENT_URL` 的宿主名）；再做**源 IP**
+> 第二因子（拿不到期望地址就 403 具名拒绝，绝不放行）。
+>
+> **网络**：agent 从"今天一个连接都不主动发起"变成**发起一个**——`deploy/k8s/c3-agent.yaml` 的
+> NetworkPolicy 从 `policyTypes: [Ingress]` 扩到 `[Ingress, Egress]`，出口**只**写
+> `app: control-plane` 的 3000（判据在 `tests/unit/test_c3_agent_manifest.py`）。控制面侧本来
+> 就没有 NetworkPolicy（它接收 worker/gateway 的 `/internal/**`），所以**不需要**为这条新增入口
+> 规则；这条差别写在这里，免得下一位读者以为漏了一半。
+>
+> **具名失败**：报不出去（不可达/被拒/非 JSON）、CP 推迟（三档门）、agent 拒绝 `rm`（例如另一个
+> agent 已经把同一棵树删了：共享挂载上每个 agent 都看得见全盘）、**worker 面不许要这条 op**
+> （`file_ops.spec_for(..., caller=...)`：`remove-orphan-workspace` 只属 `self-heal`，worker 问就
+> 具名 400）—— 全部有名有姓，且"removed"永远不会用来描述一次没发生的删除。
+
 #### 6. 策略文档 / 身份参数的权威来源 —— **在 (d) 之后已经变形，需要重述**
 
 **问题**：原 §4.3 的想法是"把 route-B 策略文档从 worker 上移到 CP 写"。**(d) 之后这条要重述**：
@@ -1570,6 +1614,16 @@ agent 的白名单（复用 `priv_common.c` 的 `realpath` + 四根）只有在*
   条件下重算。今天 worker 里那层 `protected_elsewhere` 保护（`deploy/k8s/worker.yaml` 注释记着
   一次实测：重启的 worker 把四棵活树都看成无主，全靠它才没删）**必须在 CP 侧重做一遍**，
   否则会出现"CP 判无主 ⇒ 删活沙箱"。
+
+> **✅ 2026-09-29 实施（Task 6）—— 上报是谁发起、谁决策、谁执行**
+>
+> 落地形状与 §11.1 第 5 项那段实施记录一致（主机键寻址 + agent 自己的凭据 + 源 IP 第二因子；
+> id-only 的报告；CP 侧三档门）。这里只补一句"今天到底谁在扫"：**worker 的
+> `_startup_uid_reconcile` / `_startup_reconcile_once` 在 agent 形状下仍然不跑**（Task 4 的具名
+> 告警逐字保留、`envd_service/app.py` 里那行 warning 仍在），而非 agent 形状里那条既有清扫
+> **一字未动** —— Task 4 的评审钉过的两条契约（看不到完整舰队视图就跳过 + 具名 + 退避；id 条数对
+> `/internal/fleet/metrics`）在它自己的用例里继续成立，本任务只在**有权威记录的那一侧**把同样的
+> 纪律重做了一遍。
 
 ### 14.6 这套模型**不**解决的问题
 

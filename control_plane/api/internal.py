@@ -67,12 +67,17 @@ from typing import Any
 from fastapi import APIRouter, Header, Request, Response
 
 from control_plane.api.errors import OfficialError
-from control_plane.auth import node_id_for_key, verify_internal_key
-from control_plane.c3_agent_client import AgentClientError
+from control_plane.auth import node_id_for_key, verify_agent_key, verify_internal_key
+from control_plane.c3_agent_client import AgentClientError, AgentTarget
 from control_plane import file_ops
+from control_plane import self_heal
 from control_plane.node_address import NodeEndpoint
 from control_plane.registry.manager import UnknownSandboxError
-from gateway_common.paths import validate_sandbox_id
+from gateway_common.paths import (
+    is_reserved_platform_namespace,
+    validate_node_id,
+    validate_sandbox_id,
+)
 from gateway_common.worker_identity import validate_pid_namespace
 
 router = APIRouter()
@@ -277,6 +282,75 @@ def _enforce_source_ip(request: Request, node_id: str, endpoint: NodeEndpoint) -
             403,
             f"request for node {node_id} came from {observed}, expected {expected_text}",
         )
+
+
+def _require_agent_identity(request: Request, claimed_host: str) -> AgentTarget:
+    """The agent behind a report: credential, host claim, and source IP (Task 6).
+
+    The agent reports on its own behalf, so the identity path is the agent's,
+    not a worker's (D12 puts the agent's identity on the **host**):
+
+    1. the credential is ``E2B_C3_AGENT_TOKEN`` -- the agent's own, accepted on
+       the agent's surfaces only (``control_plane.auth.verify_agent_key``, never
+       part of the fleet-wide internal key list);
+    2. the claim in the URL must be the host the control plane can *find an
+       agent on*: the lookup goes to the agent pods themselves (k8s) or the
+       configured agent name (compose), never to a worker -- a worker that
+       crashed and never came back must not be able to make its node
+       unaddressable, and a claim nothing resolves is a named 503;
+    3. the source IP must be one the same lookup named (§11.1 item 9's layer 4:
+       the credential stops "no key", the network position stops "stolen key").
+       A lane that cannot state an expected address refuses here rather than
+       accepting a claim it cannot verify.
+    """
+    settings = request.app.state.settings
+    if not (getattr(settings, "c3_agent_token", "") or ""):
+        raise OfficialError(
+            503,
+            "this control plane names no agent credential "
+            "(E2B_C3_AGENT_TOKEN): refusing agent reports",
+        )
+    if not verify_agent_key(request.headers.get("X-Internal-Key"), settings):
+        raise OfficialError(401, "Unauthorized")
+    if not validate_node_id(claimed_host):
+        raise OfficialError(
+            400, f"an agent report must name its node (got {claimed_host!r})"
+        )
+    client = getattr(request.app.state, "c3_agent_client", None)
+    if client is None:
+        raise OfficialError(
+            503,
+            "this control plane has no C3 agent client configured: refusing "
+            "agent reports",
+        )
+    try:
+        target = client.resolve_agent(claimed_host)
+    except AgentClientError as exc:
+        raise OfficialError(exc.status_code, str(exc)) from exc
+    observed = request.client.host if request.client else None
+    expected_ips = target.source_ips
+    if observed not in expected_ips:
+        if len(expected_ips) == 1:
+            expected_text = expected_ips[0]
+        elif expected_ips:
+            expected_text = "one of " + ", ".join(expected_ips)
+        else:
+            # The lane could not state an address: "cannot check" is a refusal
+            # here, never "so accept it" (the ruling's fail-closed sharpening).
+            expected_text = "an address this control plane can resolve for the agent"
+        logger.warning(
+            "internal API: a report for agent %s came from %s, expected %s; "
+            "refusing (source-IP second factor)",
+            claimed_host,
+            observed,
+            expected_text,
+        )
+        raise OfficialError(
+            403,
+            f"a report for agent {claimed_host} came from {observed}, "
+            f"expected {expected_text}",
+        )
+    return target
 
 
 def _require_node_identity(
@@ -787,6 +861,68 @@ async def node_file_op(node_id: str, request: Request) -> dict[str, Any]:
         stdout = answer.get("stdout") if isinstance(answer, dict) else None
         response["stdout"] = stdout if isinstance(stdout, str) else None
     return response
+
+
+@router.post("/internal/nodes/{node_id}/agent/inventory")
+async def agent_inventory(node_id: str, request: Request) -> dict[str, Any]:
+    """An agent reports the sandbox trees it can see; the control plane decides.
+
+    C3 Task 6's self-heal shape (option (e)): **the agent is the eyes and the
+    control plane is the brain**. The body is ``{"sandboxes": [id, ...]}`` and
+    nothing else -- no path, no uid, no verb, no "please delete" (§14.4, hard
+    rules 1/3): the ids are what the agent observed on its own mount, and the
+    control plane is the only party that may derive a target from them
+    (``control_plane/self_heal.py``).
+
+    Why the direction is the agent's, not the worker's: the sweep must survive
+    a worker that crashed and never restarted, so nothing here reads a worker
+    pod or a worker record. ``node_id`` is the **agent's** identity -- the host
+    it runs on (D12) -- checked against the credential and the source IP by
+    :func:`_require_agent_identity`.
+
+    Every outcome is named: a deferral is a normal answer (200) whose
+    ``deferred`` field carries the reason (the agent logs it and backs off), a
+    refusal is 400/401/403/503, and a removal that the agent refused is
+    reported in ``failed`` -- never as a removal that happened.
+    """
+    target = _require_agent_identity(request, node_id)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise OfficialError(400, "Invalid JSON body")
+    if not isinstance(body, dict):
+        raise OfficialError(400, "an agent inventory report must be a JSON object")
+    extra = set(body) - {"sandboxes"}
+    if extra:
+        # Refused by name: an ignored ``path``/``uid`` would leave its author
+        # believing it was considered (the same rule the file-op surface uses).
+        raise OfficialError(
+            400,
+            "an inventory report carries only its sandbox ids: refusing "
+            + ", ".join(sorted(extra)),
+        )
+    sandboxes = body.get("sandboxes")
+    if not isinstance(sandboxes, list):
+        raise OfficialError(400, "sandboxes must be a list of sandbox ids")
+    for sandbox_id in sandboxes:
+        if (
+            not isinstance(sandbox_id, str)
+            or not validate_sandbox_id(sandbox_id)
+            or is_reserved_platform_namespace(sandbox_id)
+        ):
+            raise OfficialError(
+                400,
+                "sandboxes must be a list of sandbox ids: "
+                f"{sandbox_id!r} is not one",
+            )
+    outcome = await self_heal.run_sweep(
+        request.app.state,
+        client=request.app.state.c3_agent_client,
+        node_id=node_id,
+        target=target,
+        reported=sorted(set(sandboxes)),
+    )
+    return outcome.as_response()
 
 
 @router.get("/internal/fleet/sandboxes")

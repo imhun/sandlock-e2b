@@ -235,6 +235,15 @@ services:
       # default, 10000/1000).
       E2B_UID_POOL_START: ${E2B_UID_POOL_START:-10000}
       E2B_UID_POOL_SIZE: ${E2B_UID_POOL_SIZE:-1000}
+      # C3 Task 6: the eyes. This is face B because it is the container that
+      # mounts the workspaces; the report is `{"sandboxes": [ids]}` and the
+      # control plane decides and instructs, exactly as in k8s. 30s + 120s ⇒ a
+      # worker that crashed and never restarts is converged in 2–3 minutes.
+      E2B_C3_AGENT_SCAN: "on"
+      E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}
+      E2B_C3_AGENT_SCAN_INITIAL_DELAY_S: ${E2B_C3_AGENT_SCAN_INITIAL_DELAY_S:-30}
+      E2B_C3_AGENT_SCAN_INTERVAL_S: ${E2B_C3_AGENT_SCAN_INTERVAL_S:-120}
+      E2B_C3_AGENT_SCAN_BACKOFF_MAX_S: ${E2B_C3_AGENT_SCAN_BACKOFF_MAX_S:-600}
     volumes:
       - sandbox-shared:/var/lib/e2b-sandboxes
     restart: unless-stopped

@@ -330,6 +330,30 @@ spec:
               value: "10000"
             - name: E2B_UID_POOL_SIZE
               value: "1000"
+            # ------------------------------------------------------------------
+            # C3 Task 6：自愈的"眼睛"。这是 agent 今天**唯一主动发起**的连接：
+            # 它周期扫描自己挂着的 `<workspaces>/*`，把看见的沙箱 id 报给控制面
+            # (`POST /internal/nodes/<本节点名>/agent/inventory`)，控制面用**权威
+            # 记录**判定哪些树真的没人认领，再指令**本节点**的 agent 用既有的
+            # `rm` 删掉。判据：worker 崩溃且**不重启**时盘上仍在 N 分钟内收敛 ——
+            # 30s 首扫 + 120s 周期 ⇒ **2–3 分钟**。
+            #
+            # 只挂在 face B 上：扫描要的是共享工作区挂载，只有这个容器有（face A
+            # 一个 volumeMount 都没有）。报的是 id 和别的什么也没有（没有 path、
+            # 没有 uid、没有"请删"）—— 目标一律由控制面推导（硬规则 3 / §14.4）。
+            - name: E2B_C3_AGENT_SCAN
+              value: "on"
+            # 与 worker/gateway 同一个变量、同一个语义（k8s 里就是 Service 名）。
+            - name: E2B_CONTROL_PLANE_URL
+              value: http://control-plane:3000
+            - name: E2B_C3_AGENT_SCAN_INITIAL_DELAY_S
+              value: "30"
+            - name: E2B_C3_AGENT_SCAN_INTERVAL_S
+              value: "120"
+            # 被控制面具名推迟的轮次按倍率退避，封顶 10 分钟：既不会变成整舰队的
+            # 轮询，也不会安静地停摆。
+            - name: E2B_C3_AGENT_SCAN_BACKOFF_MAX_S
+              value: "600"
           # The CP dials this port; nothing else may (the NetworkPolicy below
           # allows exactly the control plane's pod on the two agent ports).
           ports:
@@ -392,12 +416,15 @@ spec:
             path: /var/lib/e2b-images
             type: DirectoryOrCreate
 ---
-# "只有两条通道"的连接层那一半：agent 只接受 **control-plane** pod 进来的连接，
-# 而且只在那一个端口上。worker 直接来敲会被网络层挡掉 —— 不靠 agent 自己判断
-# （判据 ⑥ 的"连接层就拒"）。
+# "只有两条通道"的连接层：agent 只接受 **control-plane** pod 进来的连接（只在那两
+# 个端口上），worker 直接来敲会被网络层挡掉 —— 不靠 agent 自己判断（判据 ⑥ 的
+# "连接层就拒"）。
 #
-# `policyTypes: [Ingress]` 只管入口：agent 今天不发起任何网络连接（它读 `/proc`、写
-# 一次 uid_map），所以出口留给默认，不在这一条里做文章。
+# `Egress`（C3 Task 6 加上）：agent 从"今天一个连接都不发起"变成**发起一个**——
+# 巡检上报（它是"眼睛"，`E2B_C3_AGENT_SCAN=on` 的那张报告）。这条出口写到最窄：
+# 只允许到 control-plane pod 的 3000 端口，别的目的地一律仍被挡（不是"出口放开"，
+# 是把那条具名的通道写出来）。控制面侧没有 NetworkPolicy（它本来就接收 worker 与
+# gateway 的 `/internal/**`），所以这里只收紧 agent 这一端。
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -409,6 +436,7 @@ spec:
       app: c3-agent
   policyTypes:
     - Ingress
+    - Egress
   ingress:
     - from:
         - podSelector:
@@ -424,3 +452,15 @@ spec:
         # entry would.
         - protocol: TCP
           port: 49986
+  egress:
+    # C3 Task 6：巡检上报是 agent 主动发起的**唯一**连接，出口就写这一条。
+    # 端口是 control-plane Service 的 3000（`E2B_CONTROL_PLANE_URL` 指向的
+    # 就是它）；目的地只写 pod selector，不写 IP/DNS —— 它是 pod 级策略，
+    # 所以 agent 仍然够不到任何别的东西。
+    - to:
+        - podSelector:
+            matchLabels:
+              app: control-plane
+      ports:
+        - protocol: TCP
+          port: 3000

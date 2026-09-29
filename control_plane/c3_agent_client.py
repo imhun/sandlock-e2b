@@ -40,7 +40,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol
 from urllib.parse import urlsplit
 
@@ -57,6 +57,20 @@ DEFAULT_AGENT_PORT = 49985
 #: "the same node's face B" is the same address with this second port; compose
 #: names the face-B service outright instead (``E2B_C3_AGENT_MAINT_URL``).
 DEFAULT_AGENT_MAINT_PORT = 49986
+
+
+def _host_source_ips(host: str) -> tuple[str, ...]:
+    """The IPs a host name resolves to, for the source-IP second factor.
+
+    Reuses the node-address resolver's own ``hostname`` lane (the same
+    ``getaddrinfo`` call the worker-facing endpoints use) instead of a second
+    implementation, and answers ``()`` -- "cannot state one" -- rather than a
+    guess when the name does not resolve.
+    """
+    from control_plane.node_address import HostnameAddressResolver
+
+    endpoint = HostnameAddressResolver().resolve(host)
+    return endpoint.source_ips if endpoint is not None else ()
 
 
 @dataclass(frozen=True)
@@ -85,11 +99,27 @@ class AgentTarget:
     url: str
     pod_uid: str | None = None
     maint_url: str | None = None
+    #: The address(es) this agent must speak from -- the source-IP second
+    #: factor (§11.1 item 9's layer 4). Empty means "this lane cannot state
+    #: one", and a caller that needs the check then refuses by name rather
+    #: than accepting a claim it cannot verify (C3 Task 6's report endpoint).
+    source_ips: tuple[str, ...] = ()
 
 
 class AgentAddressResolver(Protocol):
     def resolve(self, node_id: str) -> AgentTarget | None:
         """The node's agent, or ``None`` when it cannot be determined."""
+        ...
+
+    def resolve_host(self, node_identity: str) -> AgentTarget | None:
+        """The agent **on that host**, keyed by the agent's own identity (D12).
+
+        C3 Task 6 needs this direction: the agent reports on its own behalf, and
+        the report is addressed by the host it runs on. ``resolve`` cannot
+        answer that question when the *worker* pod is gone -- which is exactly
+        the case the sweep exists for (a worker that crashed and never came
+        back), so the lookup goes to the agent pods themselves.
+        """
         ...
 
 
@@ -101,6 +131,14 @@ class StaticAgentAddressResolver:
 
     def resolve(self, node_id: str) -> AgentTarget | None:
         return self._targets.get(node_id)
+
+    def resolve_host(self, node_identity: str) -> AgentTarget | None:
+        target = self._targets.get(node_identity)
+        if target is None or target.node_identity != node_identity:
+            # A table keyed by something else must not answer for this host:
+            # the identity the agent is addressed by is the agent's own.
+            return None
+        return target
 
 
 class ComposeAgentAddressResolver:
@@ -147,6 +185,20 @@ class ComposeAgentAddressResolver:
             pod_uid=None,
             maint_url=maint_url,
         )
+
+    def resolve_host(self, node_identity: str) -> AgentTarget | None:
+        """The configured agent, when the claim names *its* host.
+
+        Compose has no per-node agents: the resolver answers for one name, so a
+        claim for any other name is ``None`` (fail closed) rather than "probably
+        that one". The expected source IPs come from the same name the control
+        plane dials (``socket.getaddrinfo`` at request time, so a restarted
+        container's new IP is followed -- §11.1 item 9's premise (b)).
+        """
+        target = self.resolve(node_identity)
+        if target is None or target.node_identity != node_identity:
+            return None
+        return replace(target, source_ips=_host_source_ips(node_identity))
 
 
 class K8sAgentAddressResolver:
@@ -237,6 +289,52 @@ class K8sAgentAddressResolver:
             # own port -- never a second lookup, and never anything the worker
             # said.
             maint_url=f"{self._scheme}://{candidates[0]}:{self._maint_port}",
+        )
+
+    def resolve_host(self, node_identity: str) -> AgentTarget | None:
+        """The agent pod **on that node**, addressed by the host itself (D12).
+
+        Unlike :meth:`resolve`, this path never reads a worker pod: the worker
+        may be gone -- that is exactly the case the self-heal sweep exists for
+        -- while the DaemonSet's face on the node is not. The lookup is the
+        agent pods' own label plus ``spec.nodeName``, and two agent pods on one
+        node (a stale DaemonSet revision) is a refusal, never an arbitrary pick.
+        """
+        if not validate_node_id(node_identity):
+            return None
+        listing = self._get(
+            f"/api/v1/namespaces/{self._namespace}/pods",
+            params={
+                "labelSelector": self._label_selector,
+                "fieldSelector": f"spec.nodeName={node_identity}",
+            },
+        )
+        if listing is None:
+            return None
+        pods = listing.get("items") if isinstance(listing, dict) else None
+        if not isinstance(pods, list):
+            return None
+        candidates = [
+            pod_ip
+            for pod in pods
+            if isinstance(pod, dict) and (pod_ip := _nested_str(pod, "status", "podIP"))
+        ]
+        if len(candidates) != 1:
+            logger.warning(
+                "c3 agent lookup: host %s has %d agent pods with an address; "
+                "refusing (fail closed)",
+                node_identity,
+                len(candidates),
+            )
+            return None
+        return AgentTarget(
+            node_identity=node_identity,
+            url=f"{self._scheme}://{candidates[0]}:{self._port}",
+            # No worker pod is involved, so there is no worker pod UID to carry:
+            # ``grant-slot``'s reverse lookup is that proof's only consumer.
+            pod_uid=None,
+            maint_url=f"{self._scheme}://{candidates[0]}:{self._maint_port}",
+            source_ips=(candidates[0],),
         )
 
     def _get(self, path: str, params: dict[str, str] | None = None):
@@ -440,16 +538,22 @@ class C3AgentClient:
         node_id: str,
         sandbox_id: str,
         path: str,
-        worker_uid: int,
-        worker_gid: int,
+        worker_uid: int | None = None,
+        worker_gid: int | None = None,
+        target: AgentTarget | None = None,
     ) -> dict[str, Any]:
-        """Instruct the agent to run ``e2b-maint rm`` on a CP-derived path."""
-        body = {
-            "sandbox_id": sandbox_id,
-            "path": path,
-            "worker": {"uid": int(worker_uid), "gid": int(worker_gid)},
-        }
-        return await self._file_op(node_id, "rm", body)
+        """Instruct the agent to run ``e2b-maint rm`` on a CP-derived path.
+
+        A worker-initiated removal carries the worker's identity (it is the
+        node record's, and the agent writes it into ``--worker``'s environment).
+        C3 Task 6's **self-heal** removal does not: it deletes a tree no record
+        claims, as nobody, through the ``target`` the caller already
+        authenticated the report against (``resolve_agent``).
+        """
+        body: dict[str, Any] = {"sandbox_id": sandbox_id, "path": path}
+        if worker_uid is not None and worker_gid is not None:
+            body["worker"] = {"uid": int(worker_uid), "gid": int(worker_gid)}
+        return await self._file_op(node_id, "rm", body, target=target)
 
     async def walk(
         self,
@@ -469,9 +573,16 @@ class C3AgentClient:
         return await self._file_op(node_id, "walk", body)
 
     async def _file_op(
-        self, node_id: str, verb: str, body: dict[str, Any]
+        self,
+        node_id: str,
+        verb: str,
+        body: dict[str, Any],
+        *,
+        target: AgentTarget | None = None,
     ) -> dict[str, Any]:
-        target = self._target(node_id)
+        target = self._target(node_id) if target is None else self._prepare_target(
+            target, node_id
+        )
         # D22: the file verbs go to face B's own endpoint. A shape that named
         # none (compose without `E2B_C3_AGENT_MAINT_URL`) refuses by name here
         # rather than dialling face A -- where every chown on NFS would come
@@ -502,6 +613,33 @@ class C3AgentClient:
                 "refusing to instruct an agent the control plane cannot locate",
                 status_code=503,
             )
+        return self._prepare_target(target, node_id)
+
+    def resolve_agent(self, node_identity: str) -> AgentTarget:
+        """The agent **on that host**, by the host's own name (C3 Task 6).
+
+        The lookup is keyed by the agent's identity rather than a worker's, so
+        a node whose worker is gone can still be addressed (the sweep's whole
+        reason to exist). Every way it can fail is a named 503 -- there is no
+        "cannot check, so accept" branch.
+        """
+        target = self._resolver.resolve_host(node_identity)
+        if target is None:
+            raise AgentClientError(
+                f"cannot determine the address of the agent for node "
+                f"{node_identity}: refusing (fail closed)",
+                status_code=503,
+            )
+        if target.node_identity != node_identity:
+            raise AgentClientError(
+                f"the agent lookup for node {node_identity} answered for "
+                f"{target.node_identity}: refusing",
+                status_code=503,
+            )
+        return self._prepare_target(target, node_identity)
+
+    def _prepare_target(self, target: AgentTarget, node_id: str) -> AgentTarget:
+        """The preconditions that hold for a resolved target, whoever resolved it."""
         if not validate_node_id(target.node_identity):
             raise AgentClientError(
                 f"the agent address for node {node_id} carries no usable agent "

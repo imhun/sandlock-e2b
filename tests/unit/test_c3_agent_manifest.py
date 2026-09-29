@@ -249,13 +249,14 @@ def test_the_networkpolicy_names_the_control_plane_as_the_only_ingress() -> None
     """The connection layer of hard rule 5: `worker <-> agent` does not exist.
 
     A single ingress rule, from exactly the control-plane pods, on exactly the
-    agent's port. `policyTypes: [Ingress]` only: the agent's own egress (none
-    today -- it reads `/proc` and writes a uid map) is not what this rule is
-    about.
+    agent's ports. `policyTypes` carries `Egress` as well since Task 6, because
+    the agent gained **one** connection it initiates (the inventory report);
+    that direction is pinned separately below, and this rule is still the whole
+    ingress story.
     """
     policy = _only(_load_all(AGENT_MANIFEST), "NetworkPolicy", "e2b-c3-agent")
     assert policy["spec"]["podSelector"]["matchLabels"] == AGENT_LABEL
-    assert policy["spec"]["policyTypes"] == ["Ingress"]
+    assert policy["spec"]["policyTypes"] == ["Ingress", "Egress"]
     assert policy["spec"]["ingress"] == [
         {
             "from": [{"podSelector": {"matchLabels": CONTROL_PLANE_LABEL}}],
@@ -275,6 +276,47 @@ def test_the_networkpolicy_names_the_control_plane_as_the_only_ingress() -> None
         assert all(
             entry.get("podSelector", {}).get("matchLabels") for entry in rule["from"]
         )
+
+
+def test_the_agents_new_egress_is_one_narrow_named_rule() -> None:
+    """Task 6 flips "the agent makes no connection" into one *named* one.
+
+    The agent is the eyes: it reports the trees it can see to the control plane
+    (``POST /internal/nodes/<host>/agent/inventory``). The property that must not
+    quietly change is the *shape* of that new freedom -- one destination (the
+    control-plane pods), one port (3000, the Service the manifest points
+    ``E2B_CONTROL_PLANE_URL`` at), no IPs, no DNS, nothing else. A wildcard
+    egress rule would be the silent regression this pin exists for.
+    """
+    policy = _only(_load_all(AGENT_MANIFEST), "NetworkPolicy", "e2b-c3-agent")
+    assert policy["spec"]["egress"] == [
+        {
+            "to": [{"podSelector": {"matchLabels": CONTROL_PLANE_LABEL}}],
+            "ports": [{"protocol": "TCP", "port": 3000}],
+        }
+    ]
+
+
+def test_only_face_b_scans_the_workspaces() -> None:
+    """The scan needs the shared mount; face A has none, so it must not scan.
+
+    An agent that reported an empty inventory because it cannot see the
+    workspaces would look exactly like an agent that sees no orphans -- so the
+    knob lives on the one container that carries the mount, and the control
+    plane's URL it reports to is the same name the service answers on.
+    """
+    agent = _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
+    containers = _containers(agent)
+    face_a = _env(containers["agent"])
+    face_b = _env(containers["maint"])
+    assert "E2B_C3_AGENT_SCAN" not in face_a
+    assert "E2B_CONTROL_PLANE_URL" not in face_a
+    assert face_b["E2B_C3_AGENT_SCAN"]["value"] == "on"
+    assert face_b["E2B_CONTROL_PLANE_URL"]["value"] == "http://control-plane:3000"
+    # 30s + 120s ⇒ "worker crashed and never restarts" converges in 2–3 minutes.
+    assert face_b["E2B_C3_AGENT_SCAN_INITIAL_DELAY_S"]["value"] == "30"
+    assert face_b["E2B_C3_AGENT_SCAN_INTERVAL_S"]["value"] == "120"
+    assert face_b["E2B_C3_AGENT_SCAN_BACKOFF_MAX_S"]["value"] == "600"
 
 
 def test_the_agent_is_in_the_baseline_kustomization() -> None:
@@ -515,6 +557,15 @@ def test_each_compose_stack_runs_exactly_one_agent_facing_the_control_plane() ->
         else:
             assert b_env["E2B_UID_POOL_START"] == "${E2B_UID_POOL_START:-10000}"
             assert b_env["E2B_UID_POOL_SIZE"] == "${E2B_UID_POOL_SIZE:-1000}"
+        # C3 Task 6: the same split as k8s -- only the face that mounts the
+        # workspaces scans, and it reports to the control plane's own name.
+        assert "E2B_C3_AGENT_SCAN" not in env
+        assert "E2B_CONTROL_PLANE_URL" not in env
+        assert b_env["E2B_C3_AGENT_SCAN"] == "on"
+        assert b_env["E2B_CONTROL_PLANE_URL"] in (
+            "http://control-plane:3000",
+            "${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}",
+        )
 
 
 def test_the_compose_control_plane_dials_the_agent_by_service_name() -> None:

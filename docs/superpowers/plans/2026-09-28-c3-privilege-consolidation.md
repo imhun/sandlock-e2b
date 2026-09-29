@@ -422,13 +422,24 @@ worker 镜像**不再含任何特权二进制**。
 
 **Deliverable:** 孤儿回收 = **agent 巡检 → CP 决策 → agent 执行**；worker 不再扫盘。
 
-- [ ] 写用例：① worker 崩溃且**不重启**时盘上仍在 N 分钟内收敛；
+- [x] 写用例：① worker 崩溃且**不重启**时盘上仍在 N 分钟内收敛；
   ② CP 滚动重启期间**不误删活沙箱**；③ CP 记录**过期**时整体推迟
   （把 `protected_elsewhere` 的语义在 CP 侧重做）。
-- [ ] 跑确认**红**。
-- [ ] 实现：agent 周期扫描 `<workspaces>/*` → 报 CP → CP 用权威记录判孤儿 → 指令 agent 删。
-- [ ] 跑确认**绿**；`multiworker_interference`。
-- [ ] Commit。
+- [x] 跑确认**红**（三档门各自一条"删掉即红"的臂，见 Task 6 报告）。
+- [x] 实现：agent 周期扫描 `<workspaces>/*` → 报 CP → CP 用权威记录判孤儿 → 指令 agent 删。
+- [x] 跑确认**绿**；`multiworker_interference` **跑不了**（要活集群 + e2b SDK，见报告），
+      改跑进程内车道（真 CP app + 真 agent app + `tmp/` 下真树）与既有孤儿契约。
+- [x] Commit。
+
+> **★ T6 裁定（2026-09-29，controller）**：1–4 项按提报的形状通过（触发/周期 30s + 120s、退避封顶
+> 10min；报告 = `POST /internal/nodes/{agent_node_id}/agent/inventory`，body 只有 `{"sandboxes":[…]}`；
+> 身份 = agent 自己的凭据 `E2B_C3_AGENT_TOKEN` + **主机键**寻址 + 源 IP 第二因子；三档门
+> （共享记录 / `unreadable == 0` / id 条数对 `/internal/fleet/metrics`））。另加两条：**NetworkPolicy
+> 的改动是刻意的、要可审**（同一提交里更新 pin `test_c3_agent_manifest.py`，注释写明 agent 为什么
+> 需要出口，并保持"没有别的入口"不变）；`multiworker_interference.py` 需要活集群是**可接受的缺口**，
+> 说清楚并改跑进程内车道，不伪造集群运行。**worker 键的寻址路径（grant-slot / file op）不得被削弱**
+> —— 新增的是 `resolve_host`，它读 agent pod 自己，`resolve` 一字未动（`test_c3_agent_client.py` 的
+> 既有 pin 原样通过）。
 
 ## Task 7: 退役 C1 与现场清理
 

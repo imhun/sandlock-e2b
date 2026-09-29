@@ -108,8 +108,15 @@ class FileOpInstruction:
     gid: int | None = None
     recursive: bool = False
     worker_owned: bool = False
-    worker_uid: int = 0
-    worker_gid: int = 0
+    #: The worker this instruction acts as, when it acts as one. ``chown``
+    #: always does (``--worker`` *is* the identity, and ``--gid``'s gate
+    #: compares against the worker's own gid), so its absence is a shape
+    #: refusal there. The **self-heal removal** does not: the control plane's
+    #: sweep deletes a tree no record claims, as nobody -- carrying a worker
+    #: identity there would mean naming one for a step that does not use it
+    #: (and a worker that crashed and never came back has none to name).
+    worker_uid: int | None = None
+    worker_gid: int | None = None
 
 
 class MaintRunner(Protocol):
@@ -119,7 +126,7 @@ class MaintRunner(Protocol):
 
 
 def maint_env(
-    settings, *, worker_uid: int, worker_gid: int
+    settings, *, worker_uid: int | None, worker_gid: int | None
 ) -> dict[str, str]:
     """The environment ``e2b-maint`` must see (see the module docstring).
 
@@ -136,9 +143,15 @@ def maint_env(
         "E2B_UID_POOL_SIZE": str(settings.uid_pool_size),
         "E2B_WORKSPACE_BASE": str(settings.workspace_base),
         "E2B_STATE_BASE": str(settings.state_base or settings.workspace_base),
-        "E2B_BROKER_WORKER_UID": str(worker_uid),
-        "E2B_BROKER_WORKER_GID": str(worker_gid),
     }
+    if worker_uid is not None and worker_gid is not None:
+        # Both halves or neither (the same rule the control plane applies to a
+        # worker's own report): behind ``serve`` these come from the
+        # authenticated peer, and exec'd directly the binary falls back to its
+        # own (root) identity -- which is why a step that acts as the worker
+        # must name one, and a step that acts as nobody must not.
+        env["E2B_BROKER_WORKER_UID"] = str(worker_uid)
+        env["E2B_BROKER_WORKER_GID"] = str(worker_gid)
     if settings.shared_volume_root:
         env["E2B_SHARED_VOLUME_ROOT"] = str(settings.shared_volume_root)
     if settings.image_cache_dir:
@@ -272,6 +285,15 @@ def run_file_op(
             raise FileOpShapeRefusal(
                 "chown needs one of uid (a pooled uid) or worker (the "
                 "worker's own identity): refusing"
+            )
+        if instruction.worker_uid is None or instruction.worker_gid is None:
+            # ``--worker`` writes ``priv_worker_uid()`` (the child's
+            # environment) and ``--gid`` is checked against the worker's own
+            # gid; without that identity the first would name *root* and the
+            # second would be refused by the binary. Fail here, by shape.
+            raise FileOpShapeRefusal(
+                "a chown instruction needs the worker's own identity "
+                "(it is the --worker form and the group gate): refusing"
             )
     argv = build_maint_argv(verb, instruction, settings=settings)
     env = maint_env(

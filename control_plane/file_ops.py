@@ -24,6 +24,12 @@ re-invented) and onto one target:
 | ``remove-volume-slice`` | ``rm`` | ``<volume>/<id>`` |
 | ``chown-secret`` | ``chown`` | ``<image cache>/secrets/<id>/<name>.secret`` |
 | ``scope-slot-document`` | ``chown`` | ``<route-B root>/<uid>/<instance name>/<name>``, where the leaf comes from :func:`gateway_common.paths.route_b_instance_name` -- the **same** function the worker's executor names the slot with (ruling D20) |
+| ``remove-orphan-workspace`` | ``rm`` | ``<workspace base>/<id>`` (**self-heal only**, C3 Task 6): the tree the control plane's records claim nowhere. It is the one op with no record to derive a uid from -- that is its definition -- and the worker surface refuses it by name. |
+
+The last row is the only op whose ``callers`` set is not ``{"worker"}``: it is
+the agent-shape sweep's removal (``control_plane/self_heal.py``), listed here
+so this table stays the complete, reviewable list of what the platform can ask
+a node to do, while the worker's own vocabulary stays exactly the worker's.
 
 Two rules are enforced *here* as well as in the agent, on purpose (C3 §14.4:
 "两道，不互相替代" -- the agent still resolves and whitelists independently):
@@ -44,6 +50,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from gateway_common.paths import (
+    is_reserved_platform_namespace,
     route_b_instance_name,
     sandbox_checkpoint_dir,
     sandbox_runtime_dir,
@@ -61,11 +68,22 @@ class FileOpRefusal(Exception):
 
 @dataclass(frozen=True)
 class FileOpSpec:
-    """One named op: its verb and the parameters it accepts."""
+    """One named op: its verb, the parameters it accepts, and who may ask.
+
+    ``callers`` exists because the table is the *complete* list of privileged
+    file actions the platform can ask a node to do -- reviewing it is how one
+    audits the agent's surface -- while the request vocabulary of the worker
+    (``POST /internal/nodes/{node}/file-op``) must stay exactly the worker's.
+    C3 Task 6's self-heal removal is in this table (so there is no second,
+    unreviewable path) and is **not** in the worker's set: a worker may not ask
+    the platform to delete an unrecorded tree, which is the whole point of the
+    sweep being the control plane's decision.
+    """
 
     op: str
     verb: str
     params: frozenset[str] = frozenset()
+    callers: frozenset[str] = frozenset({"worker"})
 
 
 #: The op whitelist (D18.2). ``sandbox_id`` is implicit -- every op acts on one
@@ -92,6 +110,13 @@ FILE_OPS: dict[str, FileOpSpec] = {
     "chown-secret": FileOpSpec("chown-secret", "chown", frozenset({"name"})),
     "scope-slot-document": FileOpSpec(
         "scope-slot-document", "chown", frozenset({"name"})
+    ),
+    # Task 6: the self-heal sweep's removal. Same verb as ``remove-workspace``
+    # (D18.3 -- no new verb), a *different* caller, and no record to derive a
+    # uid from (that is the definition of the tree it acts on), so it is the
+    # one op that needs no ``host_uid``.
+    "remove-orphan-workspace": FileOpSpec(
+        "remove-orphan-workspace", "rm", callers=frozenset({"self-heal"})
     ),
 }
 
@@ -187,15 +212,32 @@ def control_paths(state, settings) -> ControlPaths:
     )
 
 
-def spec_for(op: Any) -> FileOpSpec:
-    """The named op, or a refusal that names the op it did not know."""
+def spec_for(op: Any, *, caller: str = "worker") -> FileOpSpec:
+    """The named op for ``caller``, or a refusal that names what it did not know."""
     if not isinstance(op, str) or op not in FILE_OPS:
+        allowed = sorted(
+            name for name, spec in FILE_OPS.items() if caller in spec.callers
+        )
+        # The list is the *caller's* vocabulary, not the whole table: an
+        # unknown op is refused by naming what this surface actually offers
+        # (the self-heal removal is in the table and not in the worker's set).
         raise FileOpRefusal(
             f"unknown file op {op!r}: the surface is "
-            + ", ".join(sorted(FILE_OPS)),
+            + ", ".join(allowed),
             status_code=400,
         )
-    return FILE_OPS[op]
+    spec = FILE_OPS[op]
+    if caller not in spec.callers:
+        # Named, not ignored: a worker asking for the sweep's removal would
+        # otherwise either succeed (an unreviewable privilege) or be told the
+        # op does not exist (which would be a lie about this table).
+        raise FileOpRefusal(
+            f"the {caller} surface may not ask for {spec.op} (it is in the "
+            + ", ".join(sorted(spec.callers))
+            + " set): refusing",
+            status_code=400,
+        )
+    return spec
 
 
 def validate_params(spec: FileOpSpec, body: Mapping[str, Any]) -> None:
@@ -250,6 +292,24 @@ def derive(
     sandbox_id = body.get("sandbox_id")
     if not isinstance(sandbox_id, str) or not validate_sandbox_id(sandbox_id):
         raise FileOpRefusal("sandbox_id must be a valid sandbox id", status_code=400)
+    if spec.op == "remove-orphan-workspace":
+        # The sweep's removal: the tree no record claims, so there is no
+        # ``host_uid`` to hand over and no worker gid to use -- and the same
+        # two containment layers apply (this one, then ``maint.c``'s realpath +
+        # four roots on the agent).
+        if is_reserved_platform_namespace(sandbox_id):
+            # ``state`` spells a legal sandbox id: the platform's own
+            # namespaces are not orphans, whatever the disk scan says.
+            raise FileOpRefusal(
+                f"{sandbox_id!r} is one of the platform's own namespaces, not "
+                "a sandbox tree: refusing",
+                status_code=400,
+            )
+        path = _workspace(paths, sandbox_id)
+        _require_in_roots(paths, path, spec)
+        return FileOpInstruction(
+            op=spec.op, verb=spec.verb, path=str(path), recursive=False
+        )
     if host_uid is None:
         raise FileOpRefusal(
             f"sandbox {sandbox_id} has no allocated host uid: refusing to "

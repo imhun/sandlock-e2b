@@ -479,6 +479,38 @@ pod 里有一个 `runAsUser: 0` 的 `image-cache-init`，盘上 `_volumes` 是 *
 处理即可）。随后跑 `docs/c3-privilege-relocation.md` §13.6.1 的六步复验，并把结果回填到本节
 与 §13.6 的那张表。**本行待该窗口完成后回填结果。**
 
+### 7.8 C3 Task 6 的自愈（**仓库已落，集群未上线**）
+
+**现状（未变）**：集群上的 agent 仍是 Task 4/5 那一版 —— 它不扫描、不主动发起任何连接
+（NetworkPolicy 是 `policyTypes: [Ingress]`），而 worker 的孤儿清扫在 agent 形状下被具名关掉
+（`E2B_PRIV_HELPER_TRANSPORT=agent` 的启动告警）。所以**今天的集群上，孤儿树没有人回收** ——
+这正是 Task 6 要补的那条可用性硬依赖。
+
+**仓库现状（下一次上线会带什么）**：
+
+- **面 B 多了一个周期巡检**（`E2B_C3_AGENT_SCAN=on`，只挂在挂了共享工作区的那个容器上）：
+  首扫 30s、之后每 120s 扫 `<workspaces>/*`，把**看见的沙箱 id** 报给控制面
+  `POST /internal/nodes/<宿主名>/agent/inventory`（body 只有 `{"sandboxes": […]}`），控制面用
+  **权威记录**判定孤儿后指令**同一节点**的 agent 用既有的 `rm` 删。
+- **一条新的出口**：`deploy/k8s/c3-agent.yaml` 的 NetworkPolicy 变成 `[Ingress, Egress]`，出口
+  只允许 `app: control-plane` 的 3000 端口（`E2B_CONTROL_PLANE_URL` 指向它）。控制面侧没有
+  NetworkPolicy，无需为这条新入口加规则。
+- **CP 侧的三档门**（记录不共享 / 有记录读不出来 / 枚举条数对不上 `activeSandboxes` 三者任一
+  ⇒ **整轮具名推迟**，什么都不删）写在 `control_plane/self_heal.py`，逐条有用例。
+
+**⏳ 待部署窗口执行（判据 9：worker 崩溃不重启时盘上仍在 N 分钟内收敛）**：
+
+1. 先把 agent 滚上去（面 B 的新 env + NetworkPolicy），确认 `E2B_C3_AGENT_SCAN=on` 的那行启动日志
+   与 `c3-agent inventory:` 的周期行；若看到 `E2B_CONTROL_PLANE_URL is empty` 或
+   `the control plane refused the inventory report (status 403)`，先查 CNI 是否保留了源地址
+   （§11.1 第 9 项那两个前提）与 `E2B_C3_AGENT_TOKEN` 两边是否一致。
+2. 造一棵"记录已不在、树还在"的孤儿（例如删掉 CP 记录后让 worker 停摆 / 直接造一棵无记录的
+   `sbx_*` 树），**等 2–3 分钟**，断言树消失、CP 日志出现 `c3 self-heal: node=… removed the
+   orphan tree …`。
+3. 反向臂：留一棵**有记录**的树（活沙箱），确认它出现在 `protected` 里且**不**被删；再滚一次
+   control-plane 复做同一断言（Task 6 简报的用例②："滚动重启期间不误删活沙箱"）。
+4. 把结果回填到本节与 `docs/c3-privilege-relocation.md` §11.1 第 5 项。
+
 ## 8. 改部署的入口
 
 ```bash

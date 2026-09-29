@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from gateway_common.env import _env_int
+from gateway_common.env import _env_bool, _env_float, _env_int
 
 
 @dataclass
@@ -98,4 +98,41 @@ class Settings:
     )
     uid_pool_size: int = field(
         default_factory=lambda: _env_int("E2B_UID_POOL_SIZE", 1000)
+    )
+    #: C3 Task 6: where the control plane answers agent reports. The same
+    #: variable the workers and the gateway use, on purpose -- one name for
+    #: "the control plane of this deployment", so the two directions cannot
+    #: drift apart. Empty means "this container does not report" (face A never
+    #: does: the scan needs the shared workspace mount, which face B carries),
+    #: and a container that asks for the scan without it says so by name.
+    control_plane_url: str = field(
+        default_factory=lambda: os.getenv("E2B_CONTROL_PLANE_URL", "").rstrip("/")
+    )
+    #: The inventory scan ("the agent is the eyes", C3 §11.1 item 5 / Task 6).
+    #: Off unless the deployment names it, because only the face that mounts
+    #: the workspaces can scan them; the shipped manifests turn it on there
+    #: (``deploy/k8s/c3-agent.yaml`` face B, and the compose/stack agent
+    #: services) rather than leaving the shape to degrade quietly.
+    scan_enabled: bool = field(
+        default_factory=lambda: _env_bool("E2B_C3_AGENT_SCAN", False)
+    )
+    #: First scan this long after start, then one every interval. The brief's
+    #: "worker crashed and never restarts ⇒ the disk converges within N
+    #: minutes" is these two numbers: 30 s + 120 s ⇒ **2–3 minutes**.
+    scan_initial_delay_s: float = field(
+        default_factory=lambda: _env_float("E2B_C3_AGENT_SCAN_INITIAL_DELAY_S", 30.0)
+    )
+    scan_interval_s: float = field(
+        default_factory=lambda: _env_float("E2B_C3_AGENT_SCAN_INTERVAL_S", 120.0)
+    )
+    #: A round the control plane *deferred* (its records could not certify the
+    #: fleet) is retried on a doubling schedule, capped here: never a
+    #: per-interval poll of the whole fleet, never silent.
+    scan_backoff_max_s: float = field(
+        default_factory=lambda: _env_float("E2B_C3_AGENT_SCAN_BACKOFF_MAX_S", 600.0)
+    )
+    #: One report's own deadline. The scan itself is a directory read; this
+    #: bounds the hop so a wedged control plane cannot pin the agent's loop.
+    report_timeout_s: float = field(
+        default_factory=lambda: _env_float("E2B_C3_AGENT_REPORT_TIMEOUT_S", 10.0)
     )

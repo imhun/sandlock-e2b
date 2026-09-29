@@ -56,6 +56,29 @@ def verify_internal_key(provided: str | None, settings) -> bool:
     return any(_keys_match(provided, key) for key in keys)
 
 
+def verify_agent_key(provided: str | None, settings) -> bool:
+    """The C3 agent's **own** credential (``E2B_C3_AGENT_TOKEN``), and only that.
+
+    C3 Task 6 adds one direction this credential had never been used for: the
+    agent reports what it sees on the disk
+    (``POST /internal/nodes/{host}/agent/inventory``). It is deliberately *not*
+    added to :attr:`Settings.all_internal_api_keys` -- that list authenticates
+    every internal surface (register, heartbeat, reconcile, file-op, fleet
+    views), and an agent token that opened those would turn one compromised
+    agent into a fleet-wide internal credential. So the agent credential is
+    checked here, by name, on the surfaces that are the agent's.
+
+    ``False`` also means "nothing to compare against": a shape that names no
+    agent token cannot authenticate a report at all, and the caller says so
+    (a 503, not a 401 -- "not configured" and "wrong key" are different
+    deployment problems).
+    """
+    expected = getattr(settings, "c3_agent_token", "") or ""
+    if not expected or provided is None:
+        return False
+    return _keys_match(provided, expected)
+
+
 def _keys_match(provided: str, expected: str) -> bool:
     """Constant-time compare that treats a non-ASCII header as a mismatch.
 

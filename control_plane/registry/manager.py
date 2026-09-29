@@ -60,6 +60,27 @@ class UnknownSandboxError(KeyError):
     """Raised when a sandbox ID is not in the registry."""
 
 
+@dataclass(frozen=True)
+class FleetIdSnapshot:
+    """Every sandbox id the record store holds -- and what the read could not answer.
+
+    C3 Task 6's staleness gate reads this: ``ids`` is the fleet's ownership
+    answer, ``unreadable`` counts the store entries the read could *not* answer
+    (unknown is not empty), and ``shared`` says whether the store is the shared
+    one (Redis) at all.
+
+    Why the third field exists: a control plane whose records are only its own
+    memory cannot certify "no record **anywhere** claims this tree" -- after a
+    restart its set is empty and every live tree on the shared mount looks like
+    an orphan. That is the one shape the self-heal sweep must never act on
+    (``control_plane/self_heal.py`` refuses with a named deferral).
+    """
+
+    ids: frozenset[str]
+    unreadable: int
+    shared: bool
+
+
 def workspace_disk_refusal(reserved_mb: int, limit_mb: int) -> str:
     """The one wording for "the shared workspace budget is what stopped you".
 
@@ -497,7 +518,13 @@ class SandboxRegistry:
     behavior through the provided helper methods which take no lock argument.
     """
 
-    def __init__(self, settings, redis_client=None, namespace: str = "e2b") -> None:
+    def __init__(
+        self,
+        settings,
+        redis_client=None,
+        namespace: str = "e2b",
+        record_store=None,
+    ) -> None:
         self._settings = settings
         self._sandboxes: dict[str, SandboxRecord] = {}
         self._reserved_memory = 0
@@ -555,6 +582,12 @@ class SandboxRegistry:
             self._quota_store = RedisQuotaStore(redis_client, namespace)
             self._record_store = RedisRecordStore(redis_client, namespace)
             self._uid_ledger = RedisUidLedger(redis_client, namespace)
+        if record_store is not None:
+            # The same seam, injected: a lane with no Redis (a unit test, a
+            # single-process embedder) can still be the *shared-store* shape the
+            # self-heal sweep requires -- which is a different fact from "the
+            # records are this process's memory" and has to be expressible.
+            self._record_store = record_store
 
     def add_on_removed(self, callback: Callable[[SandboxRecord], None]) -> None:
         self._on_removed_callbacks.append(callback)
@@ -1947,6 +1980,51 @@ class SandboxRegistry:
                 yield self.get(record_id)
             except UnknownSandboxError:
                 continue
+
+    def fleet_id_snapshot(self) -> FleetIdSnapshot:
+        """Every sandbox id this control plane's records hold, and their quality.
+
+        The self-heal sweep's ownership answer (C3 Task 6). Two properties are
+        the point of returning a *snapshot* rather than a set:
+
+        * ``shared`` -- a store-less registry answers from ``self._sandboxes``,
+          which is this process's memory; it cannot certify the fleet;
+        * ``unreadable`` -- entries the store holds but the read could not turn
+          into a sandbox id. The listing path above *skips* them (one broken
+          record must not take out the TTL sweep), which is exactly how a live
+          sandbox's record becomes invisible to a sweep that then deletes its
+          tree. Counting them is what lets the caller defer instead.
+
+        A tombstoned entry is not an unreadable one: "deleted" is an answer.
+        """
+        if self._record_store is None:
+            with self._lock:
+                ids = frozenset(self._sandboxes)
+            return FleetIdSnapshot(ids=ids, unreadable=0, shared=False)
+        ids, unreadable = self._store_sandbox_ids()
+        return FleetIdSnapshot(ids=frozenset(ids), unreadable=unreadable, shared=True)
+
+    def _store_sandbox_ids(self) -> tuple[set[str], int]:
+        """``(sandbox ids, count the store could not answer)`` for the store."""
+        ids: set[str] = set()
+        unreadable = 0
+        for record_id in self._record_store.keys():
+            payload = self._record_store.get(record_id)
+            if payload is None:
+                is_tombstoned = getattr(self._record_store, "is_tombstoned", None)
+                if callable(is_tombstoned) and is_tombstoned(record_id):
+                    continue
+                # ``None`` from a key that is not a tombstone is a record the
+                # store cannot answer (evicted, truncated, undecodable).
+                unreadable += 1
+                continue
+            if _is_sandbox_record_payload(payload):
+                ids.add(record_id)
+            elif "volume_id" not in payload:
+                # Neither a sandbox record nor a volume record: the store holds
+                # something this control plane cannot account for.
+                unreadable += 1
+        return ids, unreadable
 
     def tenant_usage(self) -> dict[str, dict[str, int]]:
         """Per-tenant usage from live records (independent of reservation

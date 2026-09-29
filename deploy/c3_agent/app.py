@@ -40,6 +40,13 @@ Auth: every request must carry ``X-Internal-Key`` equal to
 ``E2B_C3_AGENT_TOKEN`` (constant-time); the service refuses to answer when the
 token is unconfigured.
 
+Task 6 adds the one connection the agent *initiates*: the periodic inventory
+scan (:mod:`deploy.c3_agent.scan`) reports the sandbox-shaped trees it can see
+to ``POST /internal/nodes/{host}/agent/inventory``, and the control plane
+answers with its decision. The report carries ids and nothing else, the agent
+decides nothing, and it removes nothing on its own -- the removal is still one
+``e2b-maint rm`` under a control-plane instruction with a control-plane path.
+
 Exposure (Task 3 owns the DaemonSet): this process listens on
 ``E2B_C3_AGENT_HOST``/``E2B_C3_AGENT_PORT`` -- ``0.0.0.0:49985`` by default,
 because the control plane dials it from another pod. The bind address is
@@ -58,6 +65,7 @@ import asyncio
 import logging
 import secrets
 import subprocess
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Protocol
 
 from fastapi import FastAPI, HTTPException, Request
@@ -81,12 +89,18 @@ from deploy.c3_agent.lookup import (
     WorkerIdentity,
     missing_slot_pid_message,
 )
+from deploy.c3_agent.scan import InventoryScanner, scanner_for
 from gateway_common.paths import validate_node_id, validate_sandbox_id
 
 logger = logging.getLogger(__name__)
 
 #: The one line ``as_uid`` prints on success (Task 1).
 AS_UID_OK_PREFIX = "C3-ASUID-OK"
+
+#: Distinguishes "the caller said nothing, build the default scanner" from
+#: "the caller says this container does not scan" (``None``) -- the same
+#: injection shape ``control_plane/app.py`` uses for its registries.
+_UNSET: Any = object()
 
 
 class WorkerInstruction(BaseModel):
@@ -146,7 +160,12 @@ class FileOpBody(BaseModel):
     gid: int | None = Field(default=None, ge=1)
     recursive: bool = False
     worker_owned: bool = False
-    worker: WorkerCredentials
+    #: The worker this instruction acts as, for the verbs that act as one
+    #: (``chown``: the ``--worker`` form and the group gate). A **self-heal
+    #: removal** carries none, and it may: the control plane's sweep deletes a
+    #: tree no record claims, as nobody, and a worker that crashed and never
+    #: came back has no identity to name.
+    worker: WorkerCredentials | None = None
 
 
 class AsUidRunner(Protocol):
@@ -240,6 +259,7 @@ def create_app(
     runner: AsUidRunner | None = None,
     maint_runner: MaintRunner | None = None,
     lookup: ProcLookup | None = None,
+    inventory: Any = _UNSET,
 ) -> FastAPI:
     settings = settings or Settings()
     runner = runner or SubprocessAsUidRunner(
@@ -255,6 +275,36 @@ def create_app(
     # The host's process table: face A runs with ``hostPID: true`` (Task 3's
     # DaemonSet), which is what makes the worker's container pid visible here.
     lookup = lookup or ProcLookup()
+    # Task 6's eyes: built from the container's own knobs unless the caller
+    # injected one (tests, an embedder) -- and ``None`` means "this container
+    # does not scan", which only the face that mounts the workspaces should be
+    # asked to do (the manifests say so by name).
+    if inventory is _UNSET:
+        inventory = scanner_for(settings)
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        scanner: InventoryScanner | None = app.state.inventory
+        stop = asyncio.Event()
+        task: asyncio.Task | None = None
+        if scanner is not None:
+            task = asyncio.create_task(scanner.run(stop))
+            logger.info(
+                "c3-agent inventory: the scan loop started (first round in "
+                "%.0fs, then every %.0fs, deferral backoff capped at %.0fs)",
+                scanner.schedule.first_delay_s,
+                scanner.schedule.interval_s,
+                scanner.schedule.backoff_max_s,
+            )
+        try:
+            yield
+        finally:
+            if task is not None:
+                stop.set()
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
     # No interactive surface: the instruction API is the whole contract, and
     # `/openapi.json`/`/docs` on a privileged service is inventory for free.
     app = FastAPI(
@@ -263,11 +313,13 @@ def create_app(
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=_lifespan,
     )
     app.state.settings = settings
     app.state.runner = runner
     app.state.maint_runner = maint_runner
     app.state.lookup = lookup
+    app.state.inventory = inventory
 
     @app.exception_handler(HTTPException)
     async def _http_exception_handler(request: Request, exc: HTTPException):
@@ -351,8 +403,8 @@ def create_app(
             gid=body.gid,
             recursive=body.recursive,
             worker_owned=body.worker_owned,
-            worker_uid=body.worker.uid,
-            worker_gid=body.worker.gid,
+            worker_uid=body.worker.uid if body.worker is not None else None,
+            worker_gid=body.worker.gid if body.worker is not None else None,
         )
         try:
             return run_file_op(
