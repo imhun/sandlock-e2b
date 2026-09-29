@@ -84,11 +84,18 @@ RUN chown root:65534 /var/lib/e2b-priv/as_uid /var/lib/e2b-priv/e2b-maint \
 # web stack, `gateway_common.env` (one integer reader) and `deploy.c3_agent`
 # itself. Still deliberately *not* the sandbox runtime: no envd_service, no
 # sandlock wheel, no egress library.
+#
+# `httpx` is part of that stack and not decoration: Task 6's inventory scan
+# (`deploy/c3_agent/scan.py`, imported by `app.py` unconditionally) uses it to
+# report to the control plane. Measured 2026-09-29 on this tree: without it the
+# image does not even *import* (`ModuleNotFoundError: No module named 'httpx'`
+# at `app.py` line 105), so the service crash-loops and every grant refuses.
 WORKDIR /app
 
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
         fastapi==0.141.1 \
         'uvicorn[standard]==0.52.4' \
+        httpx==0.28.1 \
         pydantic==2.13.5
 
 COPY deploy/__init__.py /app/deploy/__init__.py
