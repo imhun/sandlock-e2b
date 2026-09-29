@@ -239,6 +239,14 @@ CP 变 65534 之后它会从"静默失败"变成"硬失败"，**必须走 agent 
 - **agent 部署形态**：**一个 DaemonSet、两个容器**（面 A / 面 B）；**独立镜像**，**不复用 worker 镜像**。
 - **`NSpid` 反查**：必须**匹配整条链**（同一节点可能跑多个 worker），**不得只比最后一项**。
 - **覆盖范围**：k8s **与分离 compose 栈（含 `docker-compose.multinode.yml`）**；**只排除 `local://`**。
+  **按名字排除、且被排除者要自己声明"没有文件操作能力"（裁定 D23）**：`local://`（合体节点）、
+  autoscaler 的 docker pool（`deploy/compose/docker-compose.autoscale.yml` +
+  `autoscaler/backends/local.py`）、单机示例（`deploy/compose/docker-compose.yml`）——后两个在
+  各自清单里显式写 `E2B_PRIV_HELPERS=off`（"从不用 broker"），钉在
+  `tests/unit/test_c3_agent_manifest.py::test_the_shapes_excluded_from_c3_declare_that_they_have_no_file_ops`
+  与 `tests/unit/test_worker_env_key_sets.py`。**follow-up（带触发条件）**：给 pool 配 agent
+  需要先解决"CP 如何寻址一个 pooled worker 落在的**宿主**"（pool 的 worker 是 autoscaler 用
+  `docker run` 起的，没有 pod/nodeName）—— 触发条件是"pool 需要 per-sandbox uid 或 route-B"。
 - **CP 取值**：主容器 `runAsUser: 65534`。
 - **worker 取值**：镜像 `USER 65534:65534`；目标 BND **空集**（P3 完成后）。
 - **禁项**（worker / agent 面 A）：`SYS_ADMIN`、`SYS_PTRACE`、`NET_RAW`、`privileged`、

@@ -237,8 +237,9 @@ follow-up（一句，仍未做）：若将来出现"worker 必须**读成功**�
 `COPY --from` **不保留** `security.capability` xattr，在 builder 阶段打的 cap 会静默丢失
 （镜像里 `getcap` 读回空）。运行期不需要 `SETFCAP`：worker 自身没有任何有效 cap，
 能力只在 exec broker 的那一刻由文件 xattr 授予，槽位 exec 后又是零 cap（`/proc/<pid>/status`
-实测 `Uid 10007 … CapEff 0000000000000000`）。worker 镜像基于 `python:3.14-slim`（无编译器），
-所以 broker 走多阶段编译（builder 装 `gcc`/`libc6-dev`），最终阶段只 `COPY` 二进制 + `setcap`。
+实测 `Uid 10007 … CapEff 0000000000000000`）。**装了这两个二进制的镜像**（C3 Task 4 片 B 起是
+agent 镜像 `deploy/docker/Dockerfile.agent`；之前是 worker 镜像）**基于 `python:3.14-slim`（无编译器），
+所以 broker 走多阶段编译（builder 装 `gcc`/`libc6-dev`），最终阶段只 `COPY` 二进制 + `setcap`。**
 
 **威胁模型（file capabilities）**：file cap 的语义就是「**任何能 exec 该文件的进程获得该
 cap**」。因此 broker 必须落在沙箱不可达的路径，且路径本身的 DAC 要比 Landlock 更可靠：
@@ -246,6 +247,9 @@ cap**」。因此 broker 必须落在沙箱不可达的路径，且路径本身�
 - `/var/lib/e2b-priv`：root 所有、**组 = worker 的 gid（65534）**、mode `0710`，二进制 `0750`。
   沙箱的 uid 是池内 uid（10000+），不在该组，既不能穿目录也不能 exec（lane 实测
   `uid 10001` exec 返回 `Permission denied`）；而 worker（uid/gid 65534）能 exec。
+  ⚠ **Task 4 片 B 起这个目录只在 agent 镜像里**（`deploy/docker/Dockerfile.agent`）：worker 镜像
+  不再含它，判据 2/15 钉的就是"worker 镜像里没有 `/var/lib/e2b-priv/`"，DAC 模型（root:65534 +
+  `0710`/`0750`）与 caps 逐字不变，只是换了一个镜像。
   **注意不能照抄成「root 所有 0700」**：那样 worker 自己也 `Permission denied`（F1 实测），
   整条 file-cap 路线直接死掉。
 - 也**不要**放 `/usr/local` 或 `/opt`：纯形态（无 chroot）的 Landlock 规则覆盖这两个前缀，
@@ -306,14 +310,18 @@ cap**」。因此 broker 必须落在沙箱不可达的路径，且路径本身�
 顺序反了就会出现「镜像 rootfs 沙箱全部建不出来」；uid 段也要在同一次变更里拆开。
 升级顺序、待授权事项与取证脚本见 `docs/HANDOFF.md`「特权最小集实测 + 线上就绪审计」。
 
-⚠️ **C1（2026-09-27）改写了这一节的前提。新口径：worker 非 root 与存储类型无关，「必须有 root」那条落在 broker 上。**
+⚠️ **C1（2026-09-27）改写了这一节的前提；C3 Task 4 片 B（2026-09-29）再改一次。新口径：worker 非 root 与存储类型无关，「必须有 root」那条落在 broker **与 agent 面 B** 上。**
 `CAP_CHOWN` 不过网这条事实没变（NFS 服务端只读 AUTH_SYS 凭据里的 uid，实测见 §5.4(b)），
-但承担它的不再是 worker 自己 —— `chown`/`rm`/`walk` 移到每节点一个 **root** 的 `e2b-priv-broker`
-DaemonSet（`deploy/k8s/priv-broker.yaml`），worker 侧只声明 `E2B_PRIV_HELPER_TRANSPORT=socket`
-把 argv 送过去。所以**网络文件系统上 worker 也保持非 root**（不写 `runAsUser`，回落镜像的
-`USER 65534:65534`），需要 euid 0 的只有 broker。**历史（已作废）**：旧口径是"上面这节的前提是
-workspace/volume 在节点本地盘"，网络存储上按 §5.4(b) 让 worker 自己跑 `runAsUser: 0` +
-`runAsGroup = <worker gid>`（overlay 的 `worker-root.patch.yaml`，2026-09-27 删除）。
+但承担它的不再是 worker 自己 —— `chown`/`rm`/`walk` 移到每节点一个 **root** 的
+`e2b-priv-broker` DaemonSet（`deploy/k8s/priv-broker.yaml`）；**Task 4 片 B 起同一件事由每节点的
+agent 面 B 做**（`deploy/k8s/c3-agent.yaml` 的 `maint` 容器，`runAsUser: 0`、听 49986），
+worker 侧声明 `E2B_PRIV_HELPER_TRANSPORT=agent` + `E2B_SLOT_IDENTITY=agent-grant`
+（`socket` 只剩保留到 Task 7 的回退）。所以**网络文件系统上 worker 也保持非 root**：
+它现在**显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（C3 的 CP 读 pod spec 取可信身份），
+**不声明任何 capability**（BND 空集），需要 euid 0 的只有 agent 面 B 与（回退期的）broker。
+**历史（已作废）**：旧口径是"上面这节的前提是 workspace/volume 在节点本地盘"，网络存储上按 §5.4(b) 让
+worker 自己跑 `runAsUser: 0` + `runAsGroup = <worker gid>`（overlay 的 `worker-root.patch.yaml`，
+2026-09-27 删除）。
 
 ### 2.4.2 共享卷路径的可穿越性（证据来自 A0/A3 探针实测，A5 沿用）
 
@@ -1952,7 +1960,7 @@ worker 走的是 **agent 形态**（`E2B_QUOTA_AGENT_URL` 是开关，`.env` 里
 
 **(a) 存储选型门槛（硬，N13/F5）：多副本 worker 共用一份 `E2B_WORKSPACE_BASE` 时，`<base>/.uid_pool.lock` 上的 `flock` 必须跨节点互斥。** 否则两个副本会各自把同一个 uid 发给不同沙箱，E3.2 的每沙箱 uid 隔离会在无人察觉的情况下失效——这不是"降级"，是**静默失效**。本集群实测（`deploy/k8s-k0s/storage-nas.yaml:18-24`）：**只有 NFSv4.0 成立**；`NFSv3 + 服务端锁` 在这台 NAS 的客户端上直接 `ESTALE`；`NFSv3 + nolock` 的锁**只是本机锁**（同机互斥、跨机不互斥）。跨节点**没有 CAS 原语**，因此任何分布式单飞（uid 分配、TTL 扫描、快照拷贝认领、限流窗口）只能实现为"**锁 + 记录**"，不能依赖 `O_EXCL` 之类的原子性假设。各节点的挂载选项（`vers`、`nolock`、`sec`）**必须一致**；**换 NAS 或换挂载参数时必须随部署复核这一条**。它同时是 `replicas ≥ 2` 的前置条件——不是可选优化。
 
-**(b) 基线约束（F4，C1 修订）：需要 root 的那一步在 broker 上，不在 worker 上 —— worker 非 root 与存储类型无关。** 当 workspace/volume 落在**网络文件系统**（NFS/CephFS/…）上时，建箱/回收要把沙箱树交给池里的 uid（`0770 owner=<sandbox uid> group=<worker gid>`，E3.2），这一步必须由 **euid 0** 做：C1 wave 2 起它归每节点一个 **root** 的 `e2b-priv-broker` DaemonSet（`deploy/k8s/priv-broker.yaml`，`runAsUser: 0`，socket `/run/e2b-broker/broker.sock`），worker pod 里不再有任何 root 容器 —— 它不写 `runAsUser`、回落镜像 `deploy/docker/Dockerfile.envd` 的 `USER 65534:65534`，`E2B_PRIV_HELPER_TRANSPORT=socket`。为什么非要 euid 0：这一步由带 `cap_chown` 的 `e2b-maint` 执行，而 **`CAP_CHOWN` 不过网**——NFS 服务端只读 AUTH_SYS 凭据里的 uid，不看你客户端的能力；实测（2026-09-17，记在 `deploy/k8s/priv-broker.yaml` 文件头）：uid 65534 的进程做 `chown 10000:65534` **EPERM**（连自己拥有的文件也让不出去），同一挂载上 root 做同样的事成功。并且必须**保留 worker 的 gid** 作为属组 —— 这不是可选项：**worker（65534）只靠组位进出 `0770 group=<worker gid>` 的沙箱树**（它没有任何有效 cap、本地也没有 DAC 覆盖）。**但没有必要把"uid 0 也没有越权"当成理由**：2026-09-28 的 C2 P0 探针实测（见下面那段）说反了 —— 服务端把 uid 0 当特权。安全代价是 worker 成为**可信中介**（沙箱仍跑在自己的池 uid 下，隔离模型不变），前提是导出允许 root 访问（`no_root_squash`）。该约束已由单测钉住（`tests/unit/test_worker_manifest_permissions.py`：`test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identity` 与 `test_socket_transport_and_its_broker_are_inseparable` 对渲染出的 worker 与 broker 精确断言 —— worker 容器里没有 `runAsUser`、broker 容器 `runAsUser: 0`，且 socket transport 与 broker 在同一份渲染里不可分离），因此**基线的 `deploy/k8s/worker.yaml` 与 `deploy/k8s/priv-broker.yaml` 必须一起走**；托管集群用块存储/节点本地盘时是同一个非 root 形态（差异只在 NFS 那条 AUTH_SYS 理由）。**历史（已被取代）**：C1 之前是"非 root worker 只适用于节点本地盘"，网络存储上让 worker 自己 `runAsUser: 0` + `runAsGroup: 65534`（`deploy/k8s-k0s/worker-root.patch.yaml`，2026-09-27 删除），单测当时对 worker 容器断言 `runAsUser == 0`。**复核时机**：换共享存储类型（本地盘 ↔ 网络文件系统）、换导出权限（`no_root_squash` 变化）时必须回来核这一条 —— 现在要核的是 **broker 的 root 身份**与那三处同源（worker pod 的 uid/gid == `E2B_BROKER_PEER_UID/GID` == `/run/e2b-broker` 目录与 socket 的属组），不再核 worker 的 uid。
+**(b) 基线约束（F4，C1 修订 + C3 Task 4 片 B 再修订）：需要 root 的那一步在 broker/agent 上，不在 worker 上 —— worker 非 root 与存储类型无关。** 当 workspace/volume 落在**网络文件系统**（NFS/CephFS/…）上时，建箱/回收要把沙箱树交给池里的 uid（`0770 owner=<sandbox uid> group=<worker gid>`，E3.2），这一步必须由 **euid 0** 做：C1 wave 2 起它归每节点一个 **root** 的 `e2b-priv-broker` DaemonSet（`deploy/k8s/priv-broker.yaml`，`runAsUser: 0`，socket `/run/e2b-broker/broker.sock`），**Task 4 片 B 起同一件事由每节点 agent 的面 B 做**（`deploy/k8s/c3-agent.yaml` 的 `maint` 容器，`runAsUser: 0`、听 49986；broker 保留到 Task 7，并且改跑 agent 镜像，因为 `e2b-maint` 已不在 worker 镜像里）。worker pod 里没有任何 root 容器：它**显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（Task 4 片 B —— CP 的可信身份来源读的就是 pod spec 的这两个值）、`E2B_PRIV_HELPER_TRANSPORT=agent`、`E2B_SLOT_IDENTITY=agent-grant`，且**不声明任何 capability**（BND 空集）。为什么非要 euid 0：这一步由带 `cap_chown` 的 `e2b-maint` 执行，而 **`CAP_CHOWN` 不过网**——NFS 服务端只读 AUTH_SYS 凭据里的 uid，不看你客户端的能力；实测（2026-09-17，记在 `deploy/k8s/priv-broker.yaml` 文件头）：uid 65534 的进程做 `chown 10000:65534` **EPERM**（连自己拥有的文件也让不出去），同一挂载上 root 做同样的事成功。并且必须**保留 worker 的 gid** 作为属组 —— 这不是可选项：**worker（65534）只靠组位进出 `0770 group=<worker gid>` 的沙箱树**（它没有任何有效 cap、本地也没有 DAC 覆盖）。**但没有必要把"uid 0 也没有越权"当成理由**：2026-09-28 的 C2 P0 探针实测（见下面那段）说反了 —— 服务端把 uid 0 当特权。安全代价是 worker 成为**可信中介**（沙箱仍跑在自己的池 uid 下，隔离模型不变），前提是导出允许 root 访问（`no_root_squash`）。该约束已由单测钉住（`tests/unit/test_worker_manifest_permissions.py`：`test_the_baseline_renders_the_root_broker_daemonset_with_the_workers_identity` 与 `test_the_workers_upstream_is_the_agent_and_the_broker_stays_consistent` 对渲染出的 worker / broker / agent 精确断言 —— worker 容器 pin `runAsUser: 65534`、`runAsGroup: 65534` 且**没有 capabilities 块**，broker 容器 `runAsUser: 0` 且与 agent 同镜像，worker 的 `agent` 形态与它要用的 agent DaemonSet 在同一份渲染里），因此**基线的 `deploy/k8s/worker.yaml` 与 `deploy/k8s/priv-broker.yaml` 必须一起走**；托管集群用块存储/节点本地盘时是同一个非 root 形态（差异只在 NFS 那条 AUTH_SYS 理由）。**历史（已被取代）**：C1 之前是"非 root worker 只适用于节点本地盘"，网络存储上让 worker 自己 `runAsUser: 0` + `runAsGroup: 65534`（`deploy/k8s-k0s/worker-root.patch.yaml`，2026-09-27 删除），单测当时对 worker 容器断言 `runAsUser == 0`。**复核时机**：换共享存储类型（本地盘 ↔ 网络文件系统）、换导出权限（`no_root_squash` 变化）时必须回来核这一条 —— 现在要核的是 **broker 的 root 身份**与那三处同源（worker pod 的 uid/gid == `E2B_BROKER_PEER_UID/GID` == `/run/e2b-broker` 目录与 socket 的属组），不再核 worker 的 uid。
 
 **2026-09-28：uid 0 在这台 NAS 上**是**特权的（P0 探针两条臂，实测）**。`deploy/scripts/acceptance/c2-p0-probe.sh --apply`（一个 root Job，挂同一份 PVC，`sec=sys`/`vers=4.0`）
 跑了 29 个 cell：`P0A-uid0-override=yes` —— uid 0 能读 65534 与 10000 的 `0600`、进它们的 `0700`
@@ -2031,16 +2039,26 @@ print("ACQUIRED")'; echo "exit=$?"   # 通过 = BLOCKED / exit=1
 wait
 ```
 
-**第 3 步：§5.4(b) 的判据 —— worker 不是 root、broker 才是，属组仍与树一致。**
+**第 3 步：§5.4(b) 的判据 —— worker 不是 root、broker/agent 才是，属组仍与树一致。**
 
 ```bash
 kubectl -n sandlock get statefulset e2b-worker -o jsonpath='{.spec.template.spec.containers[0].securityContext}'; echo
-# 通过：**没有** runAsUser / runAsGroup（worker 回落镜像的 65534），capabilities.add 恰为
-#       [SETUID, SETGID]（本地 e2b-slot-spawn 要的两条 BND）
+# 通过（C3 Task 4 片 B 起）：runAsUser=65534、runAsGroup=65534（**显式 pin** —— CP 的可信身份来源
+#       读的就是 pod spec 这两个值；只靠镜像 USER 会被读成"未知"），且**没有 capabilities 块**
+#       （BND 空集：镜像里的 file-capability 二进制已移出）
 #       （渲染结果已由 tests/unit/test_worker_manifest_permissions.py 钉住）
+
+kubectl -n sandlock get sts e2b-worker -o jsonpath='{.spec.template.spec.containers[0].env}'; echo
+# 通过：E2B_PRIV_HELPER_TRANSPORT=agent、E2B_SLOT_IDENTITY=agent-grant
+#       （E2B_PRIV_HELPER_SOCKET 仍在，但出厂形态下没人读它 —— 它是保留到 Task 7 的 socket 回退）
 
 kubectl -n sandlock get ds e2b-priv-broker -o jsonpath='{.spec.template.spec.containers[0].securityContext.runAsUser}'; echo
 # 通过：0 —— 需要 euid 0 的那一步（chown/rm/walk）在每节点一个的 broker 里，不在 worker pod 里
+kubectl -n sandlock get ds e2b-priv-broker -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+# 通过：**agent 镜像**（…/e2b-sandlock-agent:<版本>）—— e2b-maint 只在它里面（Task 4 片 B）
+
+kubectl -n sandlock get ds e2b-c3-agent -o jsonpath='{.spec.template.spec.containers[*].securityContext.runAsUser}'; echo
+# 通过：65534 0 —— 面 A（身份授予，uid_map 的 owner 规则）与面 B（文件操作，NFS 上 chown 必须 euid 0）
 
 # 行为判据（只读）：池里的树是不是真的建成了 0770 + 属组 65534
 kubectl -n sandlock exec e2b-worker-0 -- sh -c 'stat -c "%a %u %g %n" /var/lib/e2b-sandboxes/workspaces/*/ | head -5'

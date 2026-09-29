@@ -230,13 +230,15 @@ control-plane 的 `:3000`，与基线那个 ClusterIP `gateway` 同一个后端�
 * 清单里原本**没有 buildkit**，`Template.build` 无从执行 ⇒ 按 compose 的形态补成
   control-plane 的 **sidecar**（unix socket 要同 pod 才能共享 emptyDir）；镜像
   `moby/buildkit:rootless` 在 Docker Hub ⇒ 已镜像到 ACR 的 `byteplan/buildkit:rootless`。
-* **worker pod 里没有任何 root 容器**（C1 wave 2，2026-09-27）：worker 容器不写
-  `runAsUser`（回落镜像 `deploy/docker/Dockerfile.envd` 的 `USER 65534:65534`），
-  `capabilities.add` 只剩 `SETUID`/`SETGID`（本地 file-capability `e2b-slot-spawn` 要的
-  两条 BND），唯一的 initContainer 是**非 root** 的 `wait-for-broker`。网络文件系统的
-  chown 确实只有 euid 0 做得到，但那个 euid 0 现在只在每节点一个的
-  **`e2b-priv-broker` DaemonSet**（基线）里 —— worker 通过 `E2B_PRIV_HELPER_TRANSPORT=socket`
-  把 `chown`/`rm`/`walk` 交给它。
+* **worker pod 里没有任何 root 容器**（C1 wave 2，2026-09-27；**C3 Task 4 片 B，2026-09-29 再收敛**）：
+  worker 容器**显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（C3 的 CP 从 pod spec 取"这个
+  worker 是谁"的可信答案），**没有任何 cap 声明**（BND 空集 —— 镜像里的 file-capability 二进制已
+  移出，见判据 2/15），唯一的 initContainer 是**非 root** 的 `wait-for-broker`（保留到 Task 7，
+  与 `E2B_PRIV_HELPER_SOCKET` 一起构成 `socket` 回退）。网络文件系统的 chown 确实只有 euid 0
+  做得到，但那个 euid 0 现在在 **`e2b-c3-agent` DaemonSet 的面 B**（基线；听 49986）里 —— worker
+  通过 `E2B_PRIV_HELPER_TRANSPORT=agent` 把 `chown`/`rm`/`walk` 交给 CP，再由 CP 指令它；
+  C1 的 **`e2b-priv-broker`** DaemonSet 仍在基线里（保留到 Task 7，跑 agent 镜像），
+  它是 `socket` 回退的另一半。
   * 历史口径（已作废，留档）：此前 worker 自己 `runAsUser: 0`、`runAsGroup: 65534` 读挂载上的树，
     会打 `E2B_PER_SANDBOX_UID … without CAP_SYS_PTRACE` 的告警，非 route-B 路径的模板沙箱可能
     因此受影响（见 backlog N18）；route B 与 per-sandbox host uid 在两种 transport 下都成立。

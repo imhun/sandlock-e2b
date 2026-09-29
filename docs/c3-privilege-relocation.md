@@ -431,7 +431,7 @@ C3 之后 worker 不再有权扫盘/回收，必须三选一：
 
 | 选项 | 做法 | 代价 |
 |---|---|---|
-| **(a) 声明不支持** | C3 只覆盖**分离形态**（k8s + 分离 compose 栈）；`local://` 保留今天的形态 | 本地开发/smoke 与生产形态分叉；要在 lane 清单里点名 |
+| **(a) 声明不支持** | C3 只覆盖**分离形态**（k8s + 分离 compose 栈）；`local://` 保留今天的形态 | 本地开发/smoke 与生产形态分叉；要在 lane 清单里点名。**Task 4 片 B 按 D23 把这条扩成"按名字排除"**：除 `local://` 外，autoscaler 的 docker pool（`deploy/compose/docker-compose.autoscale.yml` + `autoscaler/backends/local.py`）与单机示例（`deploy/compose/docker-compose.yml`）同样排除——两者在各自清单里显式写 `E2B_PRIV_HELPERS=off`（"没有文件操作能力"），因为它们也靠过 worker 镜像里的 file-capability 二进制，而 worker 镜像已不含它们 |
 | (b) 也在 local 里"走一遍 C3" | 同进程内走同一条"以 X"路径 | **等于自己给自己发指令，审计价值为零**（同一进程既是决策者又是执行者） |
 | (c) 让 local lane 消失 | 本地开发改起一个分离小栈 | compose 已经在这么做；但会动开发流程 |
 
@@ -686,6 +686,23 @@ worker 侧的特权面并没有真的消失。**(d) 是唯一的例外，因为�
    不到身份，凡需要身份的 op 具名 503），**`pid: host` 是为那一步代码预留的**；接上它就是
    一次 agent 侧的新增（不在本片范围）。三个栈的清单 pin 见
    `tests/unit/test_c3_agent_manifest.py`（`face_b["pid"] == "host"` 与两个端点）。
+
+   ⚠ **票面比"身份类 op 503"更重：这三个 compose 车道在选项 2 落地前连"建箱"都完不成。**
+   属主交棒是建箱路径上的**第一个特权步骤**（`envd_service/agent.py:2869-2870` →
+   `uid_pool.apply_sandbox_ownership` → `agent_fileops.chown_workspace`），而它要的
+   `chown-workspace` op 在 CP 侧先要节点记录里的 `worker_uid/gid`（可信来源）——compose 拿到
+   `null` ⇒ 具名 503 ⇒ **`Sandbox.create()` 直接失败**（不是"建好了但身份操作不可用"）。
+   ⇒ **compose 的部署窗口必须等这段 agent 代码**（或显式把 `E2B_PRIV_HELPER_TRANSPORT` 留在
+   旧镜像/旧形状上，那又回到"worker 里带特权二进制"）。k8s 不受影响（它的可信来源就是 pod spec）。
+10. **stack 的 agent uid 池是两个 worker 池的并集，但旋钮是各自独立的**（Task 4 片 B 记录）：
+   `deploy/stack/docker-compose.prod.yml` 的 face B 用 `E2B_UID_POOL_START`（默认 10000）+
+   `E2B_C3_AGENT_UID_POOL_SIZE`（默认 **2000**，覆盖 worker-1 的 `10000..10999` 与 worker-2 的
+   `11000..11999`），而两个 worker 各自的池是 `E2B_UID_POOL_START(_WORKER2)` /
+   `E2B_UID_POOL_SIZE(_WORKER2)`（默认各 1000）。默认值恰好是并集，但**把 worker-2 的池挪到
+   10000..11999 之外、又不同步抬 agent 的池**，会让 worker-2 的每一步在 agent 侧变成具名拒绝
+   （`priv_common.c` 按 `START..+SIZE` 校验 `--uid`）——**安全、可见，但需要运维知道**。
+   更好的形状是让 agent 的池从一个显式"本机所有 worker 池的并集"变量派生（或做成注册期一致性
+   检查），记在 Task 5/6 的候选清单里。
 
 ## 12. 结论
 
