@@ -555,6 +555,21 @@ def test_the_pools_two_declarations_agree() -> None:
     assert "E2B_PID_NS" in literals
 
 
+def test_the_pool_pins_off_and_does_not_merely_agree_with_itself() -> None:
+    """D23: `off` is the *value*, and it is pinned in both declarations.
+
+    `test_the_pools_two_declarations_agree` compares the backend dictionary
+    against the compose JSON -- so flipping **both** to `auto` would stay green
+    while the pool went back to "resolve no brokers, log one warning, keep the
+    E5.1 shape": exactly the silent downgrade D23 exists to prevent. These two
+    assertions are on the value itself, one per place the pool declares its
+    worker env (the JSON the autoscaler hands each spawned worker, and the
+    hand-built `DockerPoolBackend`).
+    """
+    assert _pool_compose_env()["E2B_PRIV_HELPERS"] == "off"
+    assert _unquote(_pool_backend_env()["E2B_PRIV_HELPERS"]) == "off"
+
+
 def test_the_three_multinode_workers_declare_the_same_env_keys() -> None:
     """One whitelist must not hide a per-service drift in the example."""
     workers = {

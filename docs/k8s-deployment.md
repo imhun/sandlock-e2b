@@ -46,9 +46,10 @@
 * 存储类支持 **RWX**，并且 worker（uid 65534）能在上面建目录 —— NFS 上如果开了 `root_squash`，
   `initContainer` 的 `chown` 会被拒，它会**验证**属主并停在 `Init:Error` 并打印一次性修法，
   而不是起来以后每个 image resolve 都失败（§2.7.1）；
-* Pod Security：worker 用 `Localhost` seccomp + `capabilities.add: [SETUID, SETGID]`（BND，非 root
-  进程的 `CapEff` 仍是 0），在 baseline 档内；**不要**给它 `no-new-privileges`（会让内核直接忽略
-  file capabilities，`e2b-slot-spawn` 失效）。pod 级 `net.*` sysctl 在 N5 之后就撤掉了（:53 的
+* Pod Security：worker 用 `Localhost` seccomp，**没有任何 `capabilities` 声明**（C3 Task 4 片 B 起
+  BND 空集 —— 镜像里的 file-capability 二进制已移出），在 baseline 档内；**不要**给它
+  `no-new-privileges`（agent 面 A 靠 file capabilities 写 `uid_map`，NNP=1 会让内核直接忽略它们，
+  面 A 会静默失效）。pod 级 `net.*` sysctl 在 N5 之后就撤掉了（:53 的
   DNS 网关改在每个沙箱自己的 netns 里绑，见 §5）。
 
 ---
@@ -80,18 +81,25 @@ kubectl -n $NS rollout status deploy/control-plane
 kubectl apply -f deploy/k8s/seccomp-installer.yaml
 kubectl -n $NS rollout status ds/seccomp-installer     # 每个节点一个 Ready
 
-# 6) ★ broker DaemonSet：必须在 worker 之前（worker 的 socket transport 没有回落路径）
+# 6) ★ broker DaemonSet：保留到 Task 7 的 `socket` 回退的另一半（它现在跑 agent 镜像），
+#    但出厂形态下 worker 不再依赖它 —— 真正的上游是第 7 步的 agent。
 kubectl apply -f deploy/k8s/priv-broker.yaml
 kubectl -n $NS rollout status ds/e2b-priv-broker      # 每个节点一个 Ready
 
-# 7) ★ worker（缺 profile 的节点会起来失败 —— 这是 fail closed，不是 flake）
+# 7) ★ C3 agent DaemonSet：必须在 worker 之前（worker 的 `transport=agent` 与 `slot=agent-grant`
+#    都以它为上游，agent 不在 ⇒ 建箱时 CP 的转发具名拒绝）。顺序与 `deploy/k8s-k0s/apply.sh`
+#    的 rollout 闸门逐条一致：broker → agent → worker。
+kubectl apply -f deploy/k8s/c3-agent.yaml
+kubectl -n $NS rollout status ds/e2b-c3-agent         # 每个节点一个 Ready（两个容器都 Ready）
+
+# 8) ★ worker（缺 profile 的节点会起来失败 —— 这是 fail closed，不是 flake）
 #    从 root-worker 卷升级：apply worker **之前**先跑一次 §24 的属主迁移
 #    （deploy/scripts/migrate-state-owner.sh —— 非 root worker 读不了 root 写下的平台态）；
-#    全新卷可以跳过。升级已存在的集群时顺序仍是"先 broker（第 6 步）后 worker"。
+#    全新卷可以跳过。升级已存在的集群时顺序仍是 broker（6）→ agent（7）→ worker（8）。
 kubectl apply -f deploy/k8s/worker.yaml
 kubectl -n $NS rollout status sts/e2b-worker
 
-# 8) autoscaler（可选）
+# 9) autoscaler（可选）
 kubectl apply -f deploy/k8s/autoscaler.yaml
 ```
 
@@ -107,18 +115,18 @@ pod 实测 `Seccomp: 2 / Seccomp_filters: 1`（即 worker 启动自检所需的�
 自检：profile 没生效就拒绝服务（`SECCOMP_PROFILE_NOT_APPLIED`），所以"pod 起来了但 profile
 没真加载"这条不会静默通过。
 
-**第 6 步（broker 与 agent）也不能省、不能和 worker 并行**：`deploy/k8s/worker.yaml` 现在声明
-`E2B_PRIV_HELPER_TRANSPORT=agent`（文件操作与槽位身份都走每节点的 agent），而 agent/socket 两条
-路**都没有回落** —— agent 不在，建箱时 CP 的转发就拒；socket 那一侧（保留到 Task 7 的回退）
-握手不过也拒服（不静默退回 file caps）。broker 自己则必须能起：它的二进制的家在 **agent 镜像**
-里（见下节），指错镜像就是 CrashLoop，而 worker 的 `wait-for-broker` init 会等满 60 秒
-（30 × 2 s）后退出，pod 停在 `Init:Error` 并在日志里点名 socket。所以**升级顺序永远是
-broker → agent → worker**，与 `deploy/k8s-k0s/apply.sh` 的闸门逐条一致。
+**第 6/7 步（broker 与 agent）也不能省、不能和 worker 并行**：`deploy/k8s/worker.yaml` 现在声明
+`E2B_PRIV_HELPER_TRANSPORT=agent`（文件操作与槽位身份都走每节点的 agent，第 7 步），而 agent/socket
+两条路**都没有回落** —— agent 不在，建箱时 CP 的转发就拒（连建箱的第一步"属主交棒"都要它）；
+socket 那一侧（保留到 Task 7 的回退，第 6 步）握手不过也拒服（不静默退回 file caps）。broker 自己
+则必须能起：它的二进制的家在 **agent 镜像**里（见下节），指错镜像就是 CrashLoop，而 worker 的
+`wait-for-broker` init 会等满 60 秒（30 × 2 s）后退出，pod 停在 `Init:Error` 并在日志里点名 socket。
+所以**升级顺序永远是 broker（6）→ agent（7）→ worker（8）**，与 `deploy/k8s-k0s/apply.sh` 的闸门逐条一致。
 
 ### 镜像与升级
 
 清单里的镜像 tag 目前是占位的 `:0.1.0`。发布流程与 compose 同源：`build-and-push.sh` 把
-worker / control-plane-gateway / autoscaler / quota-agent 推到 ACR，并**把版本写进
+worker / control-plane-gateway / agent / autoscaler / quota-agent 推到 ACR，并**把版本写进
 `deploy/stack/.version`（gitignored）**；compose 侧 `upgrade.sh` 直接读它来 pin tag，
 k8s 侧没有等价的自动机制，所以要显式把 tag 换成当次构建的版本。
 **2026-09-18 的最近一次发布**：**`0.1.0-350-g212850d-20260918-152008`**（N12/N19/N20/N21/N22-N24 与
