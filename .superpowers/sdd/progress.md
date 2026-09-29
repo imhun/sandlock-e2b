@@ -3249,3 +3249,32 @@ push 之前），删 pod 后立即 Running；现全 workload 在新版本上。
 - **冒烟**：`MULTI-NODE SMOKE OK`；`deployment_smoke` 的 C3 段全绿（**含跨节点迁移保文件——F1 已修**），
   卡在 Track Z 模板构建（buildkit 拉 `docker.io/python:3.11-slim`，CP pod 里 docker.io
   `Network is unreachable`）——**改动之前那一轮同一步同一个异常**（`tmp/build/deployment_smoke.log`）。
+
+---
+
+## ✅ C3 全部完成（2026-09-29）
+
+**7 个任务、38 个提交已并入 main**（`5930dd8` merge，135 文件 +27836/-3829）。
+**线上版本 `0.1.0-768-g17aa2fb-20260929-223205`**，k0s 集群 12 个 pod 全 Ready，**`e2b-priv-broker` 已退役**。
+
+**整支终审 = Ready to merge（三条 must-fix 已清）**：运行时安全模型经"直接证伪尝试"成立——
+① 只有两条通道；② CP 的记录是路径/uid 的唯一权威；③ 面 B 恰为 `{CHOWN,DAC_OVERRIDE,FOWNER}`。
+终审后的收口把最后两处口径也弄成字面成立：**worker `CapBnd` 由运行时默认 `0xa80425fb` 收到 `0`（空集）**、
+`workspace-root-init` 由默认 14 条（含 `NET_RAW`）收到恰好三条，并把禁项 pin 扩到 agent pod 的**每个**容器。
+
+**真机判据**：2/3/4 在集群取证（worker `CapEff=0`+镜像无 `/var/lib/e2b-priv`；面 A `as_uid` 恰
+`cap_setgid,cap_setuid=ep`；面 B `CapEff=0xb`）；13/16 在 compose multinode 取证（含反面臂）；
+`multinode_smoke` = OK（4 箱 2+2、命令/文件/stdin、预约归零）；`deployment_smoke` 的 C3 段全绿（含跨节点
+迁移保文件）；其模板构建段因集群拉不到 docker.io 失败，改动前后同一步同因，属环境问题。
+
+**真机才暴露、已修的真 bug**：agent 镜像缺 `httpx`；槽位子进程缺 `setresgid`；face B 能力集生不出身份解析
+子进程（改走世界可读的 `/proc/<pid>/cgroup`，D25）；锚点谓词与真实槽位互斥（要求候选是容器 init）；
+**跨节点迁移被 CP 的文件操作作用域拒**（迁移先改记录指向目标节点）；k8s 车道误打 compose 车道的告警。
+
+**未做但已记账**（都写进 `docs/c3-privilege-relocation.md` §11.2.1 与 `docs/deploy-clusters.md`）：
+compose 两条栈的 CP 仍 root；`platform_disk` 两处分量级静默 0；`manager.cleanup_workspace` 的同型静默
+rmtree；compose 无策略层；`docker-compose.multinode.yml` 无 Redis 故该车道本轮无自愈；判据 1 与 6③ 尚无
+单独的现场取证（机制已被端到端冒烟覆盖）。**N47 关闭、N48 关闭（5 棵属主 0 老树在动手前已不在盘上）、
+N49 保留。**
+
+**恢复入口**：`git log --oneline`（HEAD = 本提交）；报告在 `.superpowers/sdd/task-*` 与 `c3-*`。
