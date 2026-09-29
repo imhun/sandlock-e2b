@@ -431,7 +431,7 @@ worker 镜像**不再含任何特权二进制**。
 | # | 判据 | 在哪测 | 出处 |
 |---|---|---|---|
 | 1 | 槽位宿主 uid == X，且 `/proc/<pid>/cgroup` 与 worker 逐字相同 | 真机（Task 3） | §14.2.7 已预演 |
-| 2 | worker `CapEff=0` 且镜像里**没有**特权二进制 | 单测 + 真机 | §2.4 |
+| 2 | worker `CapEff=0` 且镜像里**没有**特权二进制 | 单测 pin（Task 4 片 B 已落：`test_c3_agent_manifest.py::test_the_worker_image_has_no_privileged_binary_and_the_agent_image_has_both`）+ 真机 | §2.4 |
 | 3 | agent 面 A 的 caps **恰为** `cap_setuid,cap_setgid+ep`，uid 65534 | 单测（`getcap` + `stat`） | §2.1 |
 | 4 | agent 面 B 的 caps **恰为** `0x0b` | 真机 `grep CapEff` | §2.2 |
 | 5 | 禁项（`SYS_ADMIN`/`SYS_PTRACE`/`NET_RAW`/`privileged`）不在 agent 与 worker 上 | 单测 pin | §2.3 |
@@ -444,7 +444,7 @@ worker 镜像**不再含任何特权二进制**。
 | 12 | **agent 面 A 的容器 BND 含 `SETUID`/`SETGID`**（否则 file caps 连 exec 都 EPERM） | 单测 pin | §2.1 |
 | 13 | **反查 = `NSpid` 命中 + worker pod 的 cgroup 命中**（两者都要）：同节点两个 worker 各有一个容器 pid 相同的子进程时，只认对的那个 | 单测 + 真机（**compose multinode**，Task 3） | §1 的 ⚠ |
 | 14 | **compose 分离栈（含 multinode）里有 agent 服务**，且 `local://` 形态未被改动 | 清单解析 pin | Global Constraints |
-| 15 | agent 用**独立镜像**：`Dockerfile.agent` 存在，且 **worker 镜像里没有 `/var/lib/e2b-priv/`** | 单测 pin | §2.0 |
+| 15 | agent 用**独立镜像**：`Dockerfile.agent` 存在，且 **worker 镜像里没有 `/var/lib/e2b-priv/`** | 单测 pin（Task 4 片 B 已落：`test_c3_agent_manifest.py::test_the_worker_image_has_no_privileged_binary_and_the_agent_image_has_both`） | §2.0 |
 | 16 | **并发建箱不因 CP 中转而串行化**：N 个 worker 同时建箱 ⇒ 全部成功、零队列超时、无超线性退化；**反面臂**（CP→agent 池压到 1）必须复现排队 | 真机（**compose multinode**，Task 3） | §4 规则 5 的代价 |
 
 > **⚠ 判据 13 与 16 的验收环境必须是"同机多 worker"**（`docker-compose.multinode.yml`，3 个 worker）。

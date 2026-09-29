@@ -383,10 +383,11 @@ kubectl apply -f deploy/k8s/seccomp-installer.yaml   # ① 档（先）
 rollout 后从两个 pod 各发一次节点作用域请求 → `kubectl -n sandlock logs deploy/control-plane` 里
 两行 `came from` 必须是**两个不同**的 pod IP）。**本行待该窗口完成后回填结果。**
 
-### 7.6 C3 Task 3 的 per-node agent（**仓库已落，集群未上线**）
+### 7.6 C3 的 per-node agent（**仓库已落（Task 3 + Task 4 片 B），集群未上线**）
 
 **现状（未变）**：集群跑的还是 §7 那一版 —— 没有 agent，worker 的 `E2B_SLOT_IDENTITY` 仍是
-代码默认 `spawn`（槽位身份由 worker 镜像里的 file-capability `e2b-slot-spawn` 授予）。
+代码默认 `spawn`（槽位身份由 worker 镜像里的 file-capability `e2b-slot-spawn` 授予），
+`E2B_PRIV_HELPER_TRANSPORT` 仍是 `socket`。
 
 **仓库现状（下一次上线会带什么）**：
 
@@ -394,11 +395,28 @@ rollout 后从两个 pod 各发一次节点作用域请求 → `kubectl -n sandl
   面 A `agent` = 独立镜像 `e2b-sandlock-agent`（`USER 65534:65534`、BND 只声明
   `SETUID`/`SETGID`、身份取自 `spec.nodeName`）；面 B `maint` = root + `drop:[ALL]` +
   `CHOWN/DAC_OVERRIDE/FOWNER`（与 C1 broker 逐条相同），挂基线那个 `sandbox-shared` PVC 与
-  节点本地 `/var/lib/e2b-images`，**载荷属 Task 4**，现在不听端口。两者都在基线（不在
+  节点本地 `/var/lib/e2b-images`，**载荷是 Task 4 片 B 装上的**：与面 A **同一个服务**
+  （一张 op 表：`grant-slot` + `chown`/`rm`/`walk`），但听**自己的端口 49986**（D22 ——
+  两个容器共享 pod netns，都绑 49985 会 `EADDRINUSE`；而 file op 落到 65534 的面 A 上，
+  NFS 每个 chown 都 `EPERM`）。两者都在基线（不在
   overlay 差异里），禁项逐条成立：无 `SYS_ADMIN`/`SYS_PTRACE`/`NET_RAW`/host 网络/特权容器，
   且**没有**任何"禁止提权"式字段（那会让内核静默忽略 file capabilities）。
-- 同文件的 `NetworkPolicy e2b-c3-agent`：agent 的入口**只允许 control-plane pod**（同一端
-  49985）—— "只有两条通道"的连接层那一半，`worker ↔ agent` 在连接层就不存在。
+- 同文件的 `NetworkPolicy e2b-c3-agent`：agent 的入口**只允许 control-plane pod**（**两个
+  端口**：49985 面 A、49986 面 B，同一条规则的端口列表）—— "只有两条通道"的连接层那一半，
+  `worker ↔ agent` 在连接层就不存在。
+- **身份来源（D21 选项 1 的部署前提）**：`worker.yaml` 的 worker 容器现在**显式 pin**
+  `runAsUser: 65534`/`runAsGroup: 65534` —— CP 的可信来源读的就是 pod spec 的
+  `securityContext`，只靠镜像 `USER` 会读成"未知"⇒ 不记身份 ⇒ 每个需要身份的文件 op 具名 503。
+- **worker 镜像不再含 `/var/lib/e2b-priv/`**（判据 2/15）：`e2b-slot-spawn`/`e2b-maint` 只在
+  agent 镜像里；worker 的 BND 因此是**空集**（`SETUID`/`SETGID` 随二进制一起去掉），
+  `E2B_PRIV_HELPER_TRANSPORT=agent`。C1 的 `e2b-priv-broker` DaemonSet 保留到 Task 7，
+  但它现在跑 **agent 镜像**（`e2b-maint` 在那儿），这是 `socket` 回退与 worker 的
+  `wait-for-broker` 闸门还能成立的前提。
+- **CP 侧新增**：`E2B_ROUTE_B_TMP_ROOT`（`scope-slot-document` 的路径由 CP 推导，缺它该 op
+  具名 503）、`E2B_C3_AGENT_MAINT_PORT=49986`（面 B 端口）、`E2B_IMAGE_CACHE_DIR` 改为
+  fork 出 worker 的节点本地缓存路径 `/var/lib/e2b-images` 并显式设
+  `E2B_IMAGE_OCI_DIR=/var/lib/e2b-sandboxes/_images`（`chown-secret` 的路径必须与 worker
+  写 secret 的目录逐字一致，而 template 的 OCI tar 必须留在共享卷上）。
 - 凭据 `E2B_C3_AGENT_TOKEN`：**只**出现在 control-plane 与 agent 两处（worker 清单/镜像里
   一个字都没有，pin 在 `tests/unit/test_c3_internal_api_shape.py`），由
   `deploy/k8s-k0s/secrets.sh` 与其他托管键一起生成（**上线前必须先跑它**，否则 agent pod 起不来）。
@@ -410,8 +428,9 @@ rollout 后从两个 pod 各发一次节点作用域请求 → `kubectl -n sandl
   worker 的新上游，fail-closed 没有回落路径）。
 - 旋钮：`E2B_SLOT_IDENTITY`（worker，`spawn|agent-grant`）、`E2B_SLOT_IDENTITY_REPORT_TIMEOUT_S`、
   `E2B_SLOT_IDENTITY_WAIT_TIMEOUT_S`、`E2B_SLOT_IDENTITY_UNSHARED_TIMEOUT_S`、
-  `E2B_C3_AGENT_URL`/`_NAMESPACE`/`_LABEL`/`_PORT`/`_TOKEN`/`_TIMEOUT_S`/`_MAX_CONCURRENCY`
-  （后者出厂 **64**，理由写在 `control_plane/config.py` 与清单注释里）。
+  `E2B_C3_AGENT_URL`/`_NAMESPACE`/`_LABEL`/`_PORT`/`_MAINT_URL`/`_MAINT_PORT`/`_TOKEN`/
+  `_TIMEOUT_S`/`_FILE_OP_TIMEOUT_S`/`_MAX_CONCURRENCY`（末者出厂 **64**，理由写在
+  `control_plane/config.py` 与清单注释里；k8s 只设 `_MAINT_PORT`，compose 设 `_MAINT_URL`）。
 
 **⏳ 待部署窗口执行（判据 1/2/3/7 的 k8s 臂 + agent 上线 + `E2B_SLOT_IDENTITY` 切换）**：命令见
 C3 Task 3 slice B 报告 §4（`open-cluster-tunnel.sh` → `KUBECONFIG=tmp/k0s/kubeconfig` →

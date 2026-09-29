@@ -84,9 +84,15 @@ KUBECONFIG=... deploy/k8s-k0s/secrets.sh --fingerprint   # 每个键的 sha256(�
 
 另外基线自己已经按「节点本地」分开了两类镜像缓存（`deploy/k8s/worker.yaml`）：
 
-C3（Task 3）的 `e2b-c3-agent` DaemonSet 与 broker 同一处境：它**不在**这张 overlay 表里，
+C3 的 `e2b-c3-agent` DaemonSet 与 broker 同一处境：它**不在**这张 overlay 表里，
 因为 overlay 不需要为它改任何东西 —— 它的 PVC claim 就是基线那个 `sandbox-shared`，节点本地
 缓存的 hostPath 也是基线已有的 `/var/lib/e2b-images`（`deploy/k8s/c3-agent.yaml`）。
+
+**Task 4 片 B 后**，这个 DaemonSet 的两个容器都有载荷（面 A 是身份授予、面 B 是文件操作），
+它们用**两个端口**（49985/49986，D22 —— 两个进程的 uid 必须不同，共享 pod netns 下同端口会
+`EADDRINUSE`），NetworkPolicy 也从一条端口列表扩成两条。同一片还让** worker 显式 pin
+`runAsUser`/`runAsGroup: 65534`（CP 的可信身份来源读的就是 pod spec），并把 C1 的
+`e2b-priv-broker` 改跑 **agent 镜像**（`e2b-maint` 不再在 worker 镜像里）。
 
 * `E2B_IMAGE_CACHE_DIR=/var/lib/e2b-images` —— **解出来的 rootfs**，`hostPath` 节点本地。解到共享卷上
   要 61.4 秒、解到本地盘 0.26 秒（同一份 python-slim rootfs，2111 个文件，2026-09-17 实测）。
