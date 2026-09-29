@@ -27,6 +27,8 @@ comment cannot whisper a capability in either.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -245,6 +247,103 @@ def test_the_agent_manifest_never_names_a_forbidden_privilege() -> None:
         assert not container["securityContext"].get("privileged")
 
 
+def test_the_manifest_set_ships_no_priv_broker_any_more() -> None:
+    """C3 Task 7: C1's per-node broker is retired, and nothing may revive it.
+
+    Three assertions, because each catches a different half:
+
+    * the manifest is **deleted** (a leftover file is one `kubectl apply -f`
+      away from a DaemonSet nobody expects);
+    * the baseline's `resources:` list no longer pulls one in;
+    * the *rendered* set -- what `deploy/k8s-k0s/apply.sh` actually applies --
+      contains no object called `e2b-priv-broker`, whichever kind it grew into.
+
+    Comments that *mention* the retired DaemonSet (history, the storage-init
+    move) are deliberately allowed: they are prose, not a resource.
+    """
+    assert not (K8S / "priv-broker.yaml").exists()
+    assert "- priv-broker.yaml" not in KUSTOMIZATION.read_text(encoding="utf-8")
+    if shutil.which("kubectl") is None:
+        return
+    for manifests in ("deploy/k8s", "deploy/k8s-k0s"):
+        rendered = subprocess.run(
+            ["kubectl", "kustomize", str(REPO / manifests)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert rendered.returncode == 0, rendered.stderr
+        names = [
+            (doc.get("kind"), doc.get("metadata", {}).get("name"))
+            for doc in yaml.safe_load_all(rendered.stdout)
+            if isinstance(doc, dict)
+        ]
+        assert ("DaemonSet", "e2b-priv-broker") not in names, manifests
+        assert not [name for _kind, name in names if name == "e2b-priv-broker"], manifests
+
+
+def test_the_worker_and_face_a_stay_outside_the_forbidden_set() -> None:
+    """判据 5 + 11 on this task's two non-root faces: worker and agent face A.
+
+    §2.3's forbidden list, verbatim, and the escalation flag has to be
+    **absent** -- not `false`. `allowPrivilegeEscalation: false` sets NNP=1,
+    the kernel then ignores `as_uid`'s file capabilities, and face A stops
+    granting identities *silently* (the failure looks like a missing
+    capability at the first slot start, not like a mis-set flag).
+    """
+    worker = _containers(
+        _only(_load_all(WORKER_MANIFEST), "StatefulSet", "e2b-worker")
+    )["worker"]
+    face_a = _containers(
+        _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
+    )["agent"]
+    for name, container in (("worker", worker), ("agent face A", face_a)):
+        text = json.dumps(container)
+        for token in FORBIDDEN_TOKENS:
+            assert token not in text, (name, token)
+        assert "hostNetwork" not in text, name
+        security = container["securityContext"]
+        assert "allowPrivilegeEscalation" not in security, name
+        assert not security.get("privileged"), name
+
+
+def test_the_retired_socket_rollback_lever_is_gone() -> None:
+    """Task 7: `E2B_PRIV_HELPER_TRANSPORT=socket` is not a shape any more.
+
+    The environment variable that named the broker's socket is not declared
+    anywhere, and the only transport the shipped worker pins is `agent`. The
+    transport *switch* itself stays -- it is what selects the agent shape --
+    but `socket` is no longer a value the worker accepts
+    (`envd_service/priv_helpers.py::TRANSPORTS`), which its own unit lane
+    pins.
+    """
+    if shutil.which("kubectl") is not None:
+        # ...and in what is actually applied, so a value added in an overlay
+        # patch (or a second, straggler manifest) cannot slip past the file.
+        for manifests in ("deploy/k8s", "deploy/k8s-k0s"):
+            rendered = subprocess.run(
+                ["kubectl", "kustomize", str(REPO / manifests)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert rendered.returncode == 0, rendered.stderr
+            workers = [
+                doc
+                for doc in yaml.safe_load_all(rendered.stdout)
+                if isinstance(doc, dict)
+                and doc.get("kind") == "StatefulSet"
+                and doc.get("metadata", {}).get("name") == "e2b-worker"
+            ]
+            assert len(workers) == 1, manifests
+            for container in workers[0]["spec"]["template"]["spec"]["containers"]:
+                assert "E2B_PRIV_HELPER_SOCKET" not in json.dumps(container)
+    worker = _containers(
+        _only(_load_all(WORKER_MANIFEST), "StatefulSet", "e2b-worker")
+    )["worker"]
+    assert _env(worker)["E2B_PRIV_HELPER_TRANSPORT"]["value"] == "agent"
+
+
 def test_the_networkpolicy_names_the_control_plane_as_the_only_ingress() -> None:
     """The connection layer of hard rule 5: `worker <-> agent` does not exist.
 
@@ -363,9 +462,10 @@ def test_the_k0s_apply_gate_converges_the_agent_before_the_worker() -> None:
     """The worker's new upstream has to be up before the worker rolls.
 
     `E2B_SLOT_IDENTITY=agent-grant` is fail-closed: a worker whose node has no
-    agent fails every slot start by name. The gate is therefore broker -> agent
-    -> worker (line order, like the broker-before-worker contract in
-    `tests/unit/test_worker_manifest_permissions.py`).
+    agent fails every slot start by name. The gate is therefore agent ->
+    worker, and **nothing else**: C1's broker-before-worker gate is retired
+    (C3 Task 7), so a `ds/e2b-priv-broker` line here would be a write against
+    a DaemonSet no manifest ships any more (it would fail, not no-op).
     """
     lines = [
         line.strip()
@@ -388,10 +488,12 @@ def test_the_k0s_apply_gate_converges_the_agent_before_the_worker() -> None:
         assert len(matches) == 1, (target, matches)
         return matches[0]
 
-    broker = _rollout("ds/e2b-priv-broker")
+    assert not [
+        line for line in lines if "rollout status ds/e2b-priv-broker" in line
+    ], "the retired broker's rollout gate is still in apply.sh"
     agent = _rollout("ds/e2b-c3-agent")
     worker = _rollout("statefulset/e2b-worker")
-    assert apply_line < broker < agent < worker
+    assert apply_line < agent < worker
 
 
 def test_the_control_plane_role_may_read_and_list_pods() -> None:
@@ -496,7 +598,7 @@ def test_the_worker_is_on_the_agent_grant_path_and_carries_no_agent_secret() -> 
     assert env["E2B_SLOT_IDENTITY"]["value"] == "agent-grant"
     # Task 4 slice B: the file steps are the agent's too. The two switches move
     # together with the binary removal -- a worker without the binaries and
-    # still on the `spawn`/`socket` path is the broken intermediate state.
+    # still on the `spawn`/`exec` path is the broken intermediate state.
     assert env["E2B_PRIV_HELPER_TRANSPORT"]["value"] == "agent"
     # ...and the identity the control plane's trusted source reads (Task 4
     # slice A's D21 option 1) has to be pinned *in the pod spec*: the CP reads

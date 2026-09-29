@@ -491,6 +491,19 @@ worker 镜像**不再含任何特权二进制**。
   所以 P1–P5 期间两条路可以并存，直到 Task 7 才拆桥。
 - **顺序**：Task 7（拆桥）**必须**在所有真机验收通过之后。
 
+**⚠ Task 7 已执行（2026-09-29）—— 上面第二条的那半句话到此为止。** 桥拆了：`e2b-priv-broker`
+DaemonSet、`E2B_PRIV_HELPER_SOCKET`、worker 的 `wait-for-broker` 闸门与 `socket` transport 全部退役
+（`E2B_PRIV_HELPER_TRANSPORT=socket` 现在是启动期**具名拒绝**）。现行的回退面只有两条**单点**开关，
+再往前的形状都要整批 revert：
+
+- `E2B_SLOT_IDENTITY=spawn|agent-grant`（Task 2）—— **仍然可原地切**（agent 还得在，文件操作还走它）；
+- `E2B_PRIV_HELPER_TRANSPORT=agent|exec`（Task 4）—— 可切，但 `exec` **要求镜像里那两个
+  file-capability 二进制还在**（出厂 worker 镜像已不含它们）⇒ 只改 env 不改镜像 = 启动自检具名拒绝；
+- 退出到 **C1 的 broker 形状 / root worker**：**整批 revert 清单 + 镜像**，没有单开关。
+
+盘上数据不受影响（树仍是 `0770 owner=<池 uid> group=<worker gid>`，任何 root 进程都能接管）。
+完整口径见 `docs/c3-privilege-relocation.md` §14.8 与 `docs/k8s-deployment.md` §24.2。
+
 ## Self-Review
 
 - **口径一致**：全篇按「数据面 worker 无 root」；agent 面 B 的 root **明文记录并被接受**，

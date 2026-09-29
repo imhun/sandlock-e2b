@@ -9,8 +9,9 @@
 #
 # 为什么是 Job：这是一次同挂载 `rename(2)`，跑完就该消失；而它必须
 # **runAsUser: 0** —— 这台 NFS 只认凭据里的 uid（把树让给池里的 uid 只有 root 能做，
-# 那条实测见 deploy/k8s/priv-broker.yaml 的文件头，C1 之后 root 的特权动作都收在
-# 那个每节点 broker 里），而且迁移留在卷上的那份回退 journal 是 0600 root 的，
+# 那条实测见 docs/production-deployment-requirements.md §5.4(b)；C1 之后 root 的
+# 特权动作收在每节点的特权组件里 —— C3 Task 7 起是 agent 的面 B，被它取代的
+# `e2b-priv-broker` DaemonSet 已退役），而且迁移留在卷上的那份回退 journal 是 0600 root 的，
 # 回退那一次也要 root 才读得回来。
 #
 # ⚠ 三处占位符是有意的 fail-closed：

@@ -316,7 +316,11 @@ def test_the_volume_store_hand_over_targets_the_path_the_control_plane_writes() 
     init = _init_containers(agent)["storage-init"]
     env = {entry["name"]: entry["value"] for entry in init["env"]}
     assert env["SHARED_ROOT"] == SHARED_ROOT
-    assert env["CACHE_DIRS"] == f"{SHARED_ROOT}/_images"
+    # The shared cache is one of the two caches this init prepares. (C3 Task 7
+    # moved C1's broker `image-cache-init` in here too, which is why the list
+    # also carries the node-local `/var/lib/e2b-images`; the volume-store
+    # hand-over this test is about is unaffected.)
+    assert f"{SHARED_ROOT}/_images" in env["CACHE_DIRS"].split()
     # ...and the control plane's own store, from the app's wiring: the registry
     # is built on `<shared root>/_volumes` when no explicit root is configured
     # (`control_plane/app.py`). Pinned as the same literal.

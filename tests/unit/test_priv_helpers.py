@@ -471,6 +471,34 @@ def test_missing_helpers_keep_the_worker_in_process_and_name_the_binary(
     )
 
 
+def test_an_unknown_transport_is_refused(tmp_path: Path, monkeypatch) -> None:
+    """The shape switch is a closed list: 'socket' is not a value any more.
+
+    C1's per-node broker was the third value; C3 Task 7 retired it with the
+    DaemonSet, so `E2B_PRIV_HELPER_TRANSPORT=socket` has to be a *named*
+    refusal at startup rather than a shape that silently resolves no helpers
+    (which would degrade to the in-process E5.1 model on a worker that meant to
+    route its steps somewhere).
+    """
+    monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "telepathy")
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        ph.resolve_priv_helpers(_settings(tmp_path))
+
+    assert str(excinfo.value) == (
+        "E2B_PRIV_HELPER_TRANSPORT must be 'auto', 'exec' or 'agent' "
+        "(got 'telepathy')"
+    )
+    monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "socket")
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        ph.resolve_priv_helpers(_settings(tmp_path))
+    assert str(excinfo.value) == (
+        "E2B_PRIV_HELPER_TRANSPORT must be 'auto', 'exec' or 'agent' "
+        "(got 'socket')"
+    )
+
+
 def test_a_half_installed_broker_pair_fails_closed(
     tmp_path: Path, monkeypatch
 ) -> None:

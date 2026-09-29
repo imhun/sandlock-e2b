@@ -2591,3 +2591,628 @@ pod 内 uid 65534 连业务 socket）都 `ok:true`；`chown`/`rm`/`walk` 在三�
 **清理**：4 个 worktree 与 4 个分支已 remove/delete；报告固化为 `docs/reports/fix-{a,b,c,d}-report.md`
 （逐字节副本，`docs/reports/README.md` 索引同步；工作笔记原件在同名 `.superpowers/sdd/`，三份评审 diff
 留在那里）。**至此 C1 全部完成，无遗留记账项。**
+
+---
+
+## 2026-09-28 C3 特权收敛（计划 `docs/superpowers/plans/2026-09-28-c3-privilege-consolidation.md`）
+
+**执行方式**：subagent-driven-development；worktree `tmp/wt-c3`，分支 `feat/c3-consolidation`，
+BASE = `be00f74`（main 上的"C3 计划落盘"提交）。控制器：本会话。
+
+**Pre-flight 扫描的两条裁定（控制器）**：
+- **D1**：Task 1 的 pin ② 与 Task 3 的契约判据 ④ 都要求"worker 镜像里没有特权二进制"，
+  但删除动作是 **Task 4** 的 deliverable，而 Task 3 同时要求 `E2B_SLOT_IDENTITY` 默认 `spawn`
+  保回退（正需要 `e2b-slot-spawn`）。⇒ **两条 worker 镜像 pin 推迟到 Task 4 落地**，
+  Task 1 只 pin agent 镜像；判据 2/15 在 Task 4 收口。
+- **D2**：Task 1 的拒绝用例 ④（"非恒等映射被拒"）没有天然的调用面（生产形态只有
+  `--uid X --pid N`，mapping 由二进制自算）⇒ 由实现者自选最小形态并在报告里说明，
+  若需要新增生产面则先问控制器。
+
+**任务顺序**：按依赖（Task 2 先于 Task 3）执行 1 → 2 → 3 → 4 → 5 → 6 → 7。
+
+- Task 1（面 A 原语 `as_uid` + 独立 agent 镜像）：派发中（implementer: Herschel）。
+- **Task 1: complete（commits be00f74..f3f93f2，review Approved）**
+  - 交付：`deploy/priv/as_uid.c`（写恒等 map、四条拒绝、`C3-ASUID-OK pid=N uid=X`）、
+    `deploy/docker/Dockerfile.agent`（独立镜像，恰两个特权二进制 `as_uid`/`e2b-maint`，
+    `0710 root:65534`/`0750`）、`tests/unit/test_priv_as_uid.py`、`tests/security/test_agent_image_privilege.py`。
+  - 控制器复验（我自己跑，不是转述）：unit lane 9 passed；容器 lane 8 passed（含 getcap 逐字 +
+    真实跨 ns 授予后宿主侧 `stat` 到池 uid）。
+  - ⚠️ 已收口：macOS 上 `tests/unit` 全量在**主树与工作树**停在同一条 `fakeredis` 收集错误
+    （环境既有，非回归）；容器 lane 才是真正门禁。
+  - 裁定执行：D1 = pin ② 只做 agent 镜像（worker 那半留 Task 4）；D2 = `AS_UID_NO_MAIN`
+    编译期切分，未新增生产调用面。
+  - minors（留给最终整支评审）：① uid 0 用例把 usage(exit 2) 记成 "REFUSED"；
+    ② 规则④ 在 `main` 写路径上的调用点无回归保护；③ `--pid` 无 cgroup/命名空间约束（计划归 Task 3）；
+    ④ `getcap` 只枚举两个文件 + 禁项扫描是 Dockerfile 文本大小写敏感子串；
+    ⑤ `PRIV_DIR` 在两条 lane 里含义不同（宿主源目录 vs 容器安装路径）；
+    ⑥ 主机 lane 直接调函数而非驱动真二进制；⑦ agent 镜像尚未进 `deploy/scripts/build-images.sh`。
+- Task 2（agent 通道 + 三步校验，含 N49）：实现 `1f328ab` → 一评 **Needs fixes**（Critical：N49 只落在配置后面，
+  出厂清单没设显式地址模式，被攻破的 worker 仍可自称别的节点）→ 修复 `679d2f2`（裁定 D5：未绑定/不可解析的
+  claim 一律 fail closed；k8s/compose 五处清单设显式 `E2B_NODE_ADDRESS_MODE`；补 CP SA 的 `get pods` RBAC；
+  文档降级为"部分关闭"）→ 二评：**Critical 已关闭**（有可翻转钉子），但新暴露一条 Important：
+  worker 的跨节点枚举 `_fleet_sandbox_ids` 走了刚被守住的 node-scoped 端点 ⇒ 任一"在册但解析不到"的节点
+  会让全舰队孤儿回收停摆（庭外证据 `tests/unit/test_quota_maintenance.py:1668-1673`）。
+  → 裁定 D6：新增 fleet-scope 的 `GET /internal/fleet/sandboxes`，worker 改走它（不放宽身份层）；第三轮修复中。
+  - 复审判定"四个既有测试文件 + conftest 的改动全是补前置、0 行删除"，非改期望迁就实现。
+- **Task 2: complete（commits f3f93f2..2f849b3，四轮评审后 Approved）**
+  - 交付：CP→agent 指令通道（agent 侧 `deploy/c3_agent/`，无状态、token 未配置则拒绝启动、只认
+    `C3-ASUID-OK` 逐字 + 空 stderr）、internal API 三步校验 + 源 IP 第二因子、地址解析器
+    （k8s/hostname 两模式，fail closed）、出厂清单显式 `E2B_NODE_ADDRESS_MODE` + CP SA 的 pods RBAC、
+    fleet 作用域归属视图 `GET /internal/fleet/sandboxes`。
+  - 三轮修复的裁定：D5（未绑定/不可解析 claim 一律 fail closed + 出厂清单显式模式）、
+    D6（worker 跨节点枚举改走 fleet 作用域端点）、D7（fleet 视图带节点归属，验收脚本改读它）。
+  - N49 → **部分关闭**（文档已逐条写清关了哪些/没关哪些：per-node key 未接线、fleet 五端点仍豁免）。
+  - minors（留给最终整支评审）：① `docs/deploy-clusters.md:487-488` 仍写脚本读按节点名单（已改为舰队视图）；
+    ② N49 状态格的 fleet 端点括号列表没并入新端点（下一句已点名）；③ `envd_service/agent.py:2471-2474`
+    docstring 残留旧成因（"节点行缺失"），与紧随其后的 D6/D7 段落矛盾；④ 扁平化时未校验 `node_ids` 是 list
+    （计数比对实际兜住，但 `owned` 参与删树判定，建议 `isinstance` + 一条单测）；⑤ 脚本 `raise_for_status`
+    的 HTTPStatusError 分支没有专门用例（同一 `except` 已覆盖）。
+  - 待部署窗口：判据 6 的 ③ 真机臂（两节点源 IP 不同）——`docs/deploy-clusters.md` §7.5 已标 ⏳。
+- Task 3（槽位身份由 CP 下发、由 agent 授予）：按控制器裁定拆两片执行。
+  - **片 A（代码语义）**：commits `d555064`(agent 反查 NSpid+pidns) / `bf40772`(CP 转发 + agent 寻址客户端) /
+    `378f7c7`(worker 零特权启动路径 `E2B_SLOT_IDENTITY=agent-grant`) / `4594b64`(容器 lane 复验)。
+    新增：`deploy/c3_agent/lookup.py`、`control_plane/c3_agent_client.py`、`envd_service/slot_identity.py`、
+    `envd_service/worker_identity.py`、`gateway_common/worker_identity.py` + 4 个新测试文件。
+  - 裁定 **D9.3 = pid namespace inode 判别**（compose worker 读不到自身 cgroup 但读得到 `readlink /proc/self/ns/pid`；
+    hostPID 侧 agent 读得到候选的 `ns/pid`）；k8s lane 叠加 `pod<UID>` cgroup 命中；(A) 容器 id（会被
+    compose `hostname:` 静默打破）与 (C) netns 匹配（net 隔离下依赖时序）都被排除；"worker 无法枚举宿主 pid ⇒
+    无法知道同伴的 pidns inode" 是 (B) 安全性的理由。
+  - 待片 B：k8s DaemonSet、compose agent 服务（Task 4 原文把它放在 Task 4，但片 B 的验收需要它，故提前）、
+    token/NetworkPolicy、`get,list pods` RBAC、并发上限默认值 + 反面臂、真机验收（需部署窗口）。
+  - **片 A 一评 = Needs fixes**（1 条安全语义之外的可靠性 Important + 1 条验证缺口 Important，同根）：
+    ① 上报发生在子进程 `unshare` **之前**（`route_b.py:725-752` 在 `Popen` 返回后立刻报 pid，而
+    `unshare` 在 `slot_identity.py:126`）⇒ 授予可能落在未 unshare 的进程上，as_uid 拒绝 ⇒ 间歇建箱失败；
+    ② "真内核"用例跑的是测试自写的 fork+unshare 脚本，**生产子进程模块从未被执行**（正是①没被测出的原因）。
+    → 裁定 **D11**：子进程 unshare 成功后用有界握手（ready fd/字节）通知 worker，worker 再上报；
+    并补一条真正执行 `python -m envd_service.slot_identity` 的容器 lane 用例。修复中。
+  - 片区 B 待办（评审交回的接口清单）：NetworkPolicy + ⑥/⑦ 连接层臂；`E2B_C3_AGENT_MAX_CONCURRENCY`
+    出厂值 + 压到 1 的反面臂；CP SA 的 `get,list pods`；**worker pod 绝不能带 `hostPID`**（否则全机
+    worker 共用一个 pidns，判据 13 的判别值塌掉，compose 没有 cgroup 证明兜底）。
+  - **片 A 收口**：修复 `034be2b`（D11 握手）+ `a0e3f89`（minors）→ 二评 **Approved**（剩 3 条非阻断：
+    反面臂余量 ~0.2-0.5s、embedder 注入 spawner 会绕过握手、elapsed 计时起点）。
+  - **片 B（部署面）派发中**（implementer: Mill），裁定：D12 agent 的自身身份 = **k8s node 名**
+    （不是 worker pod 名；一节点多 worker 时后者有歧义），worker pod 身份走指令体；D13 k8s 一个 DaemonSet
+    两容器 + pod 级 hostPID + 面A 65534/BND{SETUID,SETGID}/不许 NNP:false + 面B root/三 cap；
+    NetworkPolicy 只允许 CP 入站；CP Role 扩到 `get,list pods`；D14 compose prod+multinode 各加一个
+    `c3-agent`（local:// 不动）；D15 agent 镜像接进 build 脚本；D16 并发上限出厂值（B2 实测后定）。
+  - **片 B 提交：`e7e1dbd`**（25 文件）：k8s DaemonSet `e2b-c3-agent` + NetworkPolicy、
+    compose prod/multinode 的 `c3-agent`/`c3-agent-maint`、build 脚本接线、secrets/RBAC/docs。
+    （片 B 实现者被 429 限流打断过一次；控制器核对产物后让其收尾提交。）
+  - 片 B 自报：binding unit 309 passed / 1 skipped；`kubectl kustomize deploy/k8s`（24 kinds）与
+    `deploy/k8s-k0s`（26 kinds）都渲染出 agent DaemonSet + NetworkPolicy，`--dry-run=client` 通过。
+  - 片 B 待办/疑问：① `deploy/stack/docker-compose.prod.yml` 也是分离栈但不在 D14 文件清单里
+    （按字面执行、待裁定）；② `E2B_C3_AGENT_TOKEN` 没有双窗轮换列表（单跳，已写进 runbook）；
+    ③ 面 B 目前是 `sleep infinity` 占位，等 Task 4 落文件操作载荷。
+  - **片 B 尚缺任务级评审**（片 A 已 Approved）。
+
+### 暂停点（2026-09-29，用户指示"暂停"）
+
+已完成：Task 1、Task 2（四轮评审 Approved）、Task 3 片 A（Approved）+ 片 B（`e7e1dbd`，**待评审**）。
+未做：Task 4（文件面归 agent + worker 去特权，含 D1 约定的 worker 镜像 pin）、Task 5（CP 无 root）、
+Task 6（自愈走 agent）、Task 7（退役 C1 + 清 N48）；以及 Task 3 的**真机验收**（判据 13/16 需
+compose multinode 3 worker 同机；判据 6③ 与 1 需集群，均需部署窗口授权）。
+
+恢复入口：先读本账本 → `cd tmp/wt-c3` → `git log --oneline`（HEAD 应为 `e7e1dbd`）→
+对片 B 跑任务评审 → 再按序推进 Task 4。
+
+本机环境注意：`tests/unit` 全量在 macOS 停在既有的 `fakeredis` 收集错误（要跑具体文件）；
+容器 lane 才是真门禁；写文件用 `apply_patch`（MCP 版 patchloom 写入在本次会话被权限策略拒绝）。
+
+### 2026-09-29 继续（用户"继续"）
+
+- **Task 3 片 B 任务评审 = Approved**（4 条 Minor，无 Critical/Important）。评审做了只读渲染核对
+  （两份 kustomize rc=0）并逐条验了 D12/D13/D14/D15/D16：禁项零出现、worker 无 token/label/hostPID 泄漏、
+  NetworkPolicy 是真限制（单条 ingress，from 只 `pod-selector app=control-plane`，ports 只 49985）。
+  - minors（留最终整支评审）：① `deploy/stack/docker-compose.prod.yml` 没加 agent、worker 也没设
+    `E2B_SLOT_IDENTITY`（pin 把"窄口径"写死）⇒ **控制器裁定 D17：该栈纳入 C3 覆盖，在 Task 4 片 B 落地 +
+    在 `docs/open-issues.md` 留一行**；② compose worker 缺 `pid: host` 的反向 pin；③ D16 的
+    `E2B_C3_AGENT_MAX_CONCURRENCY=64` 理由里"不会第一个被等"对 create 上限 100 不成立（值本身没问题，
+    措辞应收紧）；④ `docs/k8s-deployment.md:197` 把 agent token 归进"明文占位"表（实际是 secretKeyRef），
+    以及 `apply.sh` 的"闸门"只是 rollout status 等待（表述略强）。
+- **Task 3 片 B 完成**：`e7e1dbd`（25 文件）。
+- **Task 4 片 A 派发中**（implementer: Epicurus）：面 B 载荷（复用 `maint.c` 的 chown/rm/walk + 
+  `priv_common.c` 路径纪律）+ CP/envd 调用点改走 agent + A5 顺手修。裁定 D18.1（无 verb 即 fail closed
+  点名，绝不回退本地特权调用）、D18.2（动词白名单，未知动词点名拒）、D18.3（复用既有 verb，不新写一套）。
+  - 已知地雷（交给实现者）：slot 文档的 `chown -1:<uid>` 走维护 broker（`envd_service/route_b.py:777-800`），
+    0444 兜底（:757-772）含 egress-proxy 凭据 —— 必须先建立"worker 还需要哪些文件操作"的清单再逐个改走 agent。
+- **Task 4 片 A 完成：`49b7f48`**（31 文件）。自报：宿主 210 passed；容器 `tests/unit` 1934 passed /
+  22 failed（对照 HEAD 的容器同样失败 ⇒ 既有环境项）；A5 探针在 root 容器里 `reproduced` → `not-reproduced`。
+  - 自报的**行为变化**（评审专项核）：① agent 形态下 worker 的孤儿回收**已关停**（`chown --worker` 是
+    §14.3 实测越权面，Task 6 接手）；② `_runtime/<id>` 与其 `.checkpoints` 的删除改为 fail-closed
+    （会以 500/502 显形）。
+  - 自报的 D18.3 缺口（**没有 verb，只报告不自写**）：A3 的 `_volumes` mkdir/chmod（Task 5）、
+    `platform_disk` 枚举 `<state>/_runtime` 子目录。
+  - 给片 B 的交接：CP 侧要补 `E2B_ROUTE_B_TMP_ROOT`（否则 `scope-slot-document` 503 点名、route-B 起不来）；
+    DaemonSet 的 `E2B_IMAGE_CACHE_DIR` 与 CP 的 `/_images` 必须对齐；上线顺序**先滚 worker 再滚 CP**
+    （CP 的 file-op 依赖节点记录里的 `workerUID/GID`）。
+  - **片 A 一评 = Needs fixes**（3 Important，全部是"新测试看不见"的真缺陷）：
+    ① 卷操作按显示名建索引而 worker 送卷 id ⇒ `chown/remove-volume-*` 一律 404，挂卷沙箱删除失败且切片
+    永不删；② agent 形态下 `active_helpers()` 恒 None，而 `agent.py:2706-2710` 与 `volumes.py:241-243`
+    两处调用点仍用它做闸门 ⇒ **所有权移交根本不被调用**（树仍属 worker、沙箱 uid 写不了）且不报错
+    （D18.1 禁止的静默弱形态）；③ 删除失去幂等（`e2b-maint rm` 对不存在路径硬拒）且 `remove_runtime`
+    在具名异常之外 ⇒ 裸 500。
+    → 裁定 **D19**：DELETE 保持幂等（"路径已不存在" = 成功 + 具名日志行，树与 runtime 两半都要），
+    但非 ENOENT 的失败仍须 fail closed 点名；并把 `remove_runtime` 纳入同一具名异常处理。
+    minors 4-7（worker_uid 的 503 守卫覆盖面、孤儿扫描停用缺具名日志、`remove-checkpoint` 过度删除、
+    `startswith` 断言）一并修。修复中。
+
+### 暂停点 2（2026-09-29，用户"先暂停"）
+
+**当前 HEAD = `49b7f48`（Task 4 片 A 的首个提交）。** Task 4 片 A 的评审修复轮**尚未提交**，
+工作树是脏的（9 个文件 modified，未 commit）：
+
+- 已落地的三条 Important 修复：`control_plane/file_ops.py`（卷映射按 `record.volume_id` 建索引）、
+  `envd_service/volumes.py`（`_can_manage_sandbox_uid` 改用 `file_steps_available()`）、
+  `envd_service/agent.py`（新增 `_remove_agent_half`：树/runtime/import 三处幂等删除 + 建箱闸门改
+  `file_steps_available(settings)`）、`tests/unit/test_c3_fileops_worker.py`（5 条新用例）。
+- 正在做/未确认完成的 minors：`control_plane/api/internal.py`（worker_uid 的 503 守卫覆盖面）、
+  `envd_service/app.py`（孤儿扫描停用的具名日志）、`envd_service/runtime/checkpoint_store.py`
+  （`remove_checkpoint_images` 过度删除）、`tests/unit/test_c3_fileops_forwarding.py`、
+  `tests/unit/test_c3_fileops_worker.py:435` 的 `startswith` 断言。
+
+⚠ **恢复时第一件事**：`cd tmp/wt-c3 && git log --oneline -2 && git status --short`。
+若那 9 个文件仍未提交，先跑该片覆盖测试确认绿，再提交（消息建议
+`fix(c3): Task 4 片 A 评审修复 —— 卷 id 索引/所有权闸门/幂等删除 + minors`），
+然后**对修复后的整片重跑任务评审**（一评是 Needs fixes，尚未复审）。
+
+已收口：Task 1、Task 2、Task 3（片 A + 片 B 均 Approved）、Task 4 片 A 一评（Needs fixes，修复未复审）。
+未做：Task 4 片 B（worker 镜像去特权 + compose（含 `deploy/stack`，裁定 D17）+ 探针 + 文档 pin 清扫）、
+Task 5、Task 6、Task 7、以及 Task 3/4 的真机验收（需部署窗口授权）。
+
+### 2026-09-29 继续（第二次）
+
+- **Task 4 片 A 修复轮已提交：`0f944fc`**（前置 `49b7f48`）。实现者被 429 打断两次；控制器核对产物后
+  由实现者收尾提交（控制器独立复跑 5 个新增/受影响单测文件 = **117 passed**）。
+  - 三条 Important 全修：卷映射按 `record.volume_id` 建索引（+ 用例改用 id）；两处调用点改走
+    `file_steps_available()`（欠 `host_uid` 与卷属主模型恢复可达）；新增 `_remove_agent_half`
+    实现 D19 幂等删除（树/runtime/import 三处 + 建箱/删除端到端用例）。
+  - 4 条 minors 全处理：m4 `worker_uid` 身份门的 503 覆盖面、m5 孤儿扫描停用加具名日志、
+    m6 记录漂移（未收窄 `remove_checkpoint_images`）、m7 `startswith` 断言改正。
+  - 修复轮留下的两处交代（交最终评审判定）：① m6 只记录未收窄（收窄会留空 store，而清理它的扫描
+    在本形状被关掉）；② m7 只记录：CP 的 `_inside()` 仍是手写第二道包含性规则，与 `priv_common.c`
+    的 `realpath` 纪律不共享实现（符号链接/ENOENT 两角可能有分歧；要收口应让 CP 复用 `deploy/priv/`
+    实现，而不是删掉它）。
+  - **片 A 复审 = Needs fixes**（I1/I2/I3 + minors 4-7 全部确认已修，但抓到同类新缺陷 + 4 条新回归）：
+    - **N1（必须修）**：`scope-slot-document` 推导 `rb-<id>`，而 worker 实际写 `<id>`（或长 id 的
+      `sbx_<sha256[:16]>`，来自 `_instance_name_for`；`rb-` 只是 `name` 省略时的回退，而生产**总是**传
+      `instance_name`）⇒ agent 形态下这条路径永不解析、`AgentFileOpsError` 从 `route_b.py:845-860` 逃逸、
+      route-B 槽位起不来——正是携带 egress-proxy 凭据的那份文档。两个新测试都没抓到，因为各自只跟
+      **自己的表**对齐，而没跟**对端**对齐（与 I1 同因）。
+      → 裁定 **D20**：槽位目录名必须来自**一处共享规则**（`gateway_common/`，CP 与 envd 都可 import），
+      不写第二份；CP 仍为权威；测试必须驱动**真实 worker 路径**并断言 CP 推导的叶子 == worker 实际建的目录
+      （普通 id 与 >64 字节 id 各一条）。
+    - N2（修）`/metrics` 是 async 却做阻塞 HTTP（超时 660s）⇒ 黑洞 CP 会把 worker 事件循环卡 ~11 分钟；
+      N3（定并记录）`_ensure_shared_volume_root` 只捕 `OSError` 而 agent 分支抛 `RuntimeError` ⇒ 尽力而为的
+      步骤变成致命；N4（修或记录）`checkpoint_status` 把诊断变成 500；N5/N6（记录）。
+    - 修复第 3 轮进行中。
+
+### 暂停点 3（2026-09-29，用户"先暂停"）
+
+- **Task 4 片 A 修复第 2 轮已提交：`f18cb52`**（前序 `0f944fc`、`49b7f48`）。工作树干净（只剩本账本）。
+  - **N1 按 D20 收口**：命名规则落到 `gateway_common/paths.py::route_b_instance_name`（含 >64 字节 →
+    `sbx_<sha256[:16]>`），worker 的 `_instance_name_for` 与 CP 的 `_slot_document` 都调它；`rb-` 兜底保留
+    给不命名实例的调用者，但 agent 形状下若"目录叶 ≠ 共享规则"就**点名拒**，生产永不走兜底。
+    新增**对等用例**（驱动真执行器 route-B acquire + 真 `W1SlotPool` + 假 spawner/channel，拿磁盘上真出现的
+    目录与 CP 推导逐字比；普通 id 与 >64 字节 id 各一条）。原先两个"自证"用例已改为引用共享规则。
+  - **N2**：`/metrics` 改 `asyncio.to_thread` + agent 客户端 connect 阶段 5s 短超时 + agent 失败降级为具名
+    warning 并回落本地 walk（不再 500）。**N3**：刻意选 best-effort（只有 root 属主的卷根才交棒，沙箱自己
+    的切片 chown 仍 fail closed）。**N4**：`checkpoint_status` 归零并具名 warning，`disk_usage_snapshot`
+    按"缺席"上报。
+  - **N5/N6 记录未改**：`_remove_agent_half` 的"已缺席"分支吞任意异常（配置漂移下可能报成功而树还在，
+    建议最终评审改为注册时做配置一致性检查）；`_remove_image` 的 agent 分支无"已缺席"处理。
+  - 自报：宿主 420 passed / 7 skipped；容器 `tests/unit` 1950 passed / 22 failed（与对照 HEAD 逐条相同的
+    既有环境项）；N1/N2/N3/N4 各自 RED 留证。
+  - **片 A 第三轮复审尚未做**（一评 Needs fixes → 修 → 二评 Needs fixes → 修 `f18cb52` → 待三评）。
+
+**恢复入口**：`cd tmp/wt-c3` → `git log --oneline -4`（HEAD 应为 `f18cb52`）→ 生成
+`review-e7e1dbd..f18cb52.diff` 对整片跑第三轮任务评审 → 通过后派 **Task 4 片 B**
+（worker 镜像去特权 + 删 BND + compose 三栈（含 `deploy/stack`，D17）+ 探针 + 文档/pin 清扫；
+片 A 交回的片 B 必办：CP 加 `E2B_ROUTE_B_TMP_ROOT`、`E2B_IMAGE_CACHE_DIR` 与 `E2B_IMAGE_OCI_DIR` 拆分配对、
+worker 开关与删二进制同批、DaemonSet face B 换载荷）。
+
+**已完成**：Task 1、Task 2、Task 3（片 A + 片 B）、Task 4 片 A（代码 + 两轮修复，待三评）。
+**未做**：Task 4 片 B、Task 5、Task 6、Task 7、以及全部真机验收（需部署窗口授权）。
+
+### 2026-09-29 继续（第三次）
+
+- **片 A 三评 = Needs fixes**。N1 **确认已关闭**（单一共享规则 `gateway_common/paths.py::route_b_instance_name`，
+  worker 真实路径用它、CP 用它、>64 字节分支覆盖、对等用例驱动真执行器 route-B acquire 并拿磁盘上真出现的
+  目录比对）；N3/N4 形状正确。但抓到 3 条新 Important（同样都对测试不可见）：
+  - **I-1（最重，会打断 agent 形态本身）**：`uid_pool.py:263-275` 在 `chown_workspace` 之后**直接 return**，
+    跳过了下面的 0o770 模式 pass（`:277-289`，其唯一调用者）⇒ 树不再属于 worker，worker 对每个沙箱树
+    只剩 `r-x` 甚至不可访问（文件 API/快照/生命周期都要写它）。注释还写着"模式 pass 保留在上面"，而代码在
+    `return` 下面。修法：把模式 pass 移到交棒**之前**（此时 worker 仍是属主），并用**断言模式**（而非只断言
+    发了 op）的用例钉住。
+  - **I-2**：N2 的修复漏了 `agent_import_sandbox`（`agent.py:3709` 是 async 却内联调用阻塞的同步
+    `httpx.Client`）⇒ 导入走已有树的分支会把 worker 事件循环卡住（读超时 660s）。修法：移出事件循环 +
+    扫一遍其余 async handler 的同类内联阻塞。
+  - **I-3**：`platform_disk.py:132` 在 agent 形态下 walk 得到 EACCES → `dir_size` 返 None → **静默变 0**
+    且无日志，而模块自己的 docstring 说这会被读成"平台没占空间"（影响 checkpoint 准入与账目告警）。
+    修法：或改走 agent（CP 有记录、`walk` verb 已存在），或显式具名 "unknown" 并写明准入/告警如何对待它；
+    无论哪种都要有"静默 0 回归即红"的用例。
+  - minors：m-1 root worker 无法注册（每个形态都带该字段、报错文案未点明根因）、m-2 route-B 只比叶子没比
+    `<uid>` 目录、m-3 两处段落重复、m-4 `_provision_local` 仍是旧谓词（local lane，记录）、m-5 N5/N6 只在
+    代码与报告里（补进文档记录）。
+  - **修复第 3 轮已提交：`573dd35`**（4 个提交：`49b7f48` → `0f944fc` → `f18cb52` → `573dd35`）。
+    - I-1：`uid_pool.apply_sandbox_ownership` 的模式 pass（0o770）移到 agent 交棒**之前**，新用例断言
+      磁盘上的 mode（RED `assert 493 == 504` = 0o755 vs 0o770）。
+    - I-2：`agent_import_sandbox` 的清理移入 `asyncio.to_thread`；扫过其余 async handler（create/delete/
+      checkpoint 写与状态/restore/snapshot copy 已都在 to_thread）。
+    - I-3：选了**显式具名 unknown** —— `measure_platform_disk_bytes()` 返回 `int | None`（目录不存在仍 =0），
+      准入与 pre-capture 对 None 一律拒（同一句 `UNKNOWN_ACCOUNT_REASON`，出口是"沙箱原地冻结"），
+      心跳**省略** `platformDiskUsedMB`（CP 保留上次的数）。**未收口**：把 `.checkpoints` 真正接回 agent
+      需要 CP 允许 walk"记录已不在的孤儿 store"，属设计决定；"CP 的 int 字段'从未收到 usage'与 0 不可分"
+      这条局限也写进了 `docs/c3-privilege-relocation.md` §11.2.1。
+    - m-1 连带修了一条会被契约 lane 抓到的缺陷：worker 以 root 运行时不再上报 `workerUID/GID`（省略 +
+      具名 warning），否则节点整个 join 不上；需要身份的 op 仍由 CP 以具名 503 拒。
+    - A5 的契约 pin 同步为"精确两次"（树 + `sandbox_runtime_dir(...)`）。
+    - 自报：宿主 492 passed / 7 skipped；容器 2066 passed / 17 failed（全为既有环境类），本片用例零失败。
+  - **片 A 四评 = Needs fixes**。I-1/I-2/I-3 与 m-1…m-5 **全部确认已兑现**（模式 pass 顺序 + 磁盘 mode 钉、
+    import 离循环、unknown 账链路、root worker 可入列且身份 op 具名 503、`<uid>` 组件比较、去重、§11.2.1 记录）；
+    但抓到**本片自己写的 agent 载荷里的两条新 Important**：
+    - **①** `deploy/c3_agent/app.py:276` 的 `agent_op` 从 `def` 改成 `async def`（只为 `await request.json()`），
+      于是 300s 的 `e2b-maint` exec 变成**内联阻塞单个事件循环**（`__main__.py:36` 单进程 uvicorn）⇒ 一次
+      `rm`/`walk` 期间不接受新连接、并发建箱撞上 CP 的 5s 死线变 504，并推翻 `control_plan/config.py:381-382`
+      为 `max_concurrency=64` 写下的前提（"agent 是同步服务、handler 跑线程池"）。修法：`await asyncio.to_thread`。
+    - **②（安全回归）** `--worker` 的身份现在是 **worker 自报**（节点记录 ← 注册/心跳 body ← worker 自己），
+      C1 里它来自内核的 `SO_PEERCRED`（`maint.c:1144-1147`）不可伪造；`maint.c --worker` 把它当作**交棒的目标
+      身份**（`maint.c:2196-2200`）⇒ 被攻破的 worker 报别人的 uid，即可让 `scope-slot-document` 把带
+      egress-proxy 凭据的 `policy.json`（0440）交给该租户 = 同节点跨租户读凭据。正是 §14.3 要堵的面，而
+      `deploy/c3_agent/fileops.py` 模块注释还写着"不可伪造"。
+      → 裁定 **D21**（按优先序，要求实现者说明选了哪条）：① 用可信源印证上报值（k8s 走已有 pod resolver 读
+      pod spec 的 runAsUser/runAsGroup，比对失败则该节点**不记身份**，绝不采用上报值；无可信源的形态身份留空
+      ⇒ 该 op fail closed）；② 由 agent 从内核推导（hostPID + 已有 pid 读 `/proc/<pid>` 属主）；③ 若本片内
+      都做不到：agent 形状下**凡需要 worker 身份的 op 一律具名拒**、改掉那句"不可伪造"注释、把缺口记进
+      §11.2.1 交片 B 开关前收口。任一选择都要有"报错 uid/gid 无法把树交给该身份"的用例（RED→GREEN）。
+    - minors：agent 的 `WALK_KINDS` 只认 `d/f/l` 而 `maint.c` 对 fifo/socket/device 输出 `o`（含 socket 的树
+      会让整条 `walk-*` 被拒）、`control_paths` 在 async handler 里同步 `volumes.list()`、
+      `checkpoint_store._hand_to_sandbox` 的 agent 形状组设成了 worker gid、`platform_disk` 另两处仍静默 0、
+      `agent.py:1556/1577` 两处同型 `rmtree(ignore_errors=True)`、以及报告附录 C 的 sweep 表把
+      `agent_export_sandbox`/import 的写入与解包误记为"不触达文件层"。
+  - **修复第 4 轮已提交：`31e0c43`**（5 个提交：`49b7f48` → `0f944fc` → `f18cb52` → `573dd35` → `31e0c43`）。
+    - ① agent 的特权 exec 移出事件循环（`asyncio.to_thread`）；RED：退回内联则两次 exec 的时间区间重叠。
+    - ② **选了 D21 选项 1（可信来源校验）**：无可信来源即不记身份 ⇒ 需要身份的 op 具名 503。RED：
+      "the forged claim must never replace a verified identity" + `assert (65534, 65534) == (None, None)`。
+    - **⚠ 选项 1 真正生效需片 B 配平（两条硬约束，已写进 §11.2.1 + 报告附录 D）**：
+     ① k8s 必须在 `worker.yaml` 的 worker 容器/pod 上**显式 pin `runAsUser/runAsGroup: 65534`**
+        （现在只靠镜像 `USER`，pod spec 里没有 ⇒ 今天 CP 记不到身份、文件操作按设计 fail closed）；
+     ② compose（含 `deploy/stack/…`）**今天没有可信来源** ⇒ 建议给 `c3-agent-maint` 加 `pid: host` 后
+        走 D21 选项 2（agent 从内核读 worker 进程的 uid/gid）；该模式同时覆盖 k8s。
+    - 已修 minors：walk 接受 `o`（socket/fifo/设备）、file-op 端点的 `control_paths`+`derive` 挪到
+      `to_thread`、`chown-checkpoint`/`chown-secret` 的 gid 对齐为 `<uid>:<uid>`（只有工作区树保留 worker gid）。
+    - 仍记录未改：`platform_disk` 两处**分量级**静默 0、`agent.py:1556/1577` 两处同型 `rmtree(ignore_errors=True)`、
+      `agent_export_sandbox` 的 `tar.add` 与 import 的写入/解包仍内联在事件循环（不触达 agent 层、非本片引入；
+      附录 C 的表已改正，并入 §11.2.1 第 7 条作片 B/Task 7 清扫项）。
+  - **片 A 五评 = Approved（片 A 收口）**：两条 Important 均确认"真修"且用例退回即红（① 特权 exec 离
+    事件循环；② 可信来源校验——claim 永不入记录、无可信源即具名 503），6 条 minors 修或记，四项裁定
+    （D17/D18/D19/D20）在收尾检查中仍成立。
+    - 剩余两条非阻断 minor，已派 mini-fix：① `_verified_worker_identity`（`internal.py:188-199`）在每次
+      心跳都打 warning（k8s 出厂形态每 worker ~5s 一条，且文案把"pod 没 pin 身份"说成"没有可信源"）
+      ⇒ 复用同文件既有的 once-per-node 模式并拆分两条文案；② §11.2.1 补两条**片 B 必须满足**的身份来源约束
+      （k8s 要在 worker pod 显式 pin `runAsUser/runAsGroup`，否则 CP 记不到身份、身份类文件 op 全 503；
+      compose（含 `deploy/stack`，D17）今天无可信源 ⇒ 需 face B 加 `pid: host` 走 D21 选项 2，或明确决定
+      该形态不跑文件 op）。
+  - 片 A 最终提交线：`49b7f48` → `0f944fc` → `f18cb52` → `573dd35` → `31e0c43`（+ mini-fix）。
+
+- **Task 4 片 A 收口：`d2bfd84`**（mini-fix：身份不可校验的告警改为按 (节点,原因) 只报一次 + 拆三条文案：
+  `no-source`/`no-pin`/`mismatch`；`WorkerIdentitySource` 协议加 `configured: bool`；
+  `docs/c3-privilege-relocation.md` §11.2.1 新增第 8/9 条 = 片 B 的两条身份来源约束）。
+  自报：宿主 445 passed / 3 skipped；容器 1976 passed / 17 failed（既有环境类），本片零失败。
+  **片 A 全线索：`49b7f48` → `0f944fc` → `f18cb52` → `573dd35` → `31e0c43` → `d2bfd84`（Approved）。**
+
+### Task 4 片 B（部署面）派发
+
+范围：worker 镜像去两个特权二进制 + 删 BND（SETUID/SETGID）；worker 侧 `E2B_SLOT_IDENTITY=agent-grant` +
+`E2B_PRIV_HELPER_TRANSPORT` 开关与删二进制**同批**；compose 三个栈（prod / multinode / **`deploy/stack`，D17**）
+加 agent 服务；DaemonSet face B 换载荷（去掉 `sleep infinity`）+ image-cache 路径对齐 + CP 补
+`E2B_ROUTE_B_TMP_ROOT`；§11.2.1 第 8/9 条（k8s worker pod 显式 pin `runAsUser/runAsGroup`；compose face B
+`pid: host` 走 D21 选项 2）；清单/文档 pin 清扫 + 判据 2/15 收口（D1 约定的 worker 镜像 pin 到这一片才做）。
+真机验收（判据 13/16 需 compose multinode、判据 6③/1 需集群）单独一轮、需部署窗口授权。
+
+**片 B 的实现者在读代码时发现一条计划没写清的缺口并求助（好问题）**：CP→agent 现在**只有一个端点**
+（`control_plane/c3_agent_client.py::_post` 对 `grant-slot` 与 `chown/rm/walk` 用同一个 `target.url`），
+而两个面**必须是两个不同身份的进程**（面 A euid 65534 才写得了 `uid_map`；面 B 必须 uid 0 且只有它挂了
+四个根、只有它能 exec `e2b-maint`）。k8s 两容器共享 pod netns ⇒ 都绑 49985 必 `EADDRINUSE`；若只让一个绑，
+file op 就落到 65534 的面 A 上（NFS 上 chown 必 `EPERM`）。compose 本来就是两个服务名。
+→ 裁定 **D22 = 选项 A**：**给面 B 单独端点** —— CP 加 `E2B_C3_AGENT_MAINT_URL`（compose →
+`http://c3-agent-maint:49986`）/`E2B_C3_AGENT_MAINT_PORT`（k8s 面 B 绑 49986），`grant-slot` 仍走面 A 的
+49985；同一个客户端模块按 op 选 target（不另起第二个客户端）；面 B 地址同样来自**可信来源**（同节点的
+agent 查找），取不到即 fail closed 点名；NetworkPolicy 放两个端口且仍只允许 CP 入站。
+**未选 (B)** 的理由：那要给面 B 的 BND 加 `SETUID/SETGID` 并改判据 4 已钉死的 `CapEff=0x0b` 口径。
+片 B 恢复执行中（含 item 1/2/5/6/7 的非阻塞部分）。
+
+- **片 B 完成：`8111cce`（面 B 独立端点 D22 + worker 去特权二进制与 BND）+ `3030722`（清单/文档同步与验收矩阵 2/15 收口）。**
+  自报：13 个相关文件 272 passed；`tests/unit` 49 failed/1806 passed（与同 HEAD 对照 worktree 的失败集合**逐条相同**）；
+  `tests/contract` 1 failed（基线时序 flake）；两份 kustomize 与三个 compose `config --quiet` 全 exit 0。
+  - 它自报的 4 条 concern（已交评审判断）：
+    ① `deploy/k8s/priv-broker.yaml` 的 4 个 image 从 worker 改到 **agent 镜像**（不在派发清单字面范围内）——
+       `e2b-maint` 已随项 1 移出 worker 镜像，不改就是 broker CrashLoop → `apply.sh` 闸门卡死 → worker 起不来；
+    ② autoscaler 的 docker pool 与单机示例仍靠 worker 镜像里的 file-cap 二进制 ⇒ 删掉后会**静默**退到 E5.1
+       （无 per-sandbox uid / 无 route-B），本片没动这两个文件，待裁定"给 pool 配 agent"还是"排除出 C3"；
+    ③ compose 车道的 D21 选项 2 仍需 agent 侧代码（按 worker pid 读 `/proc`），`pid: host` 已落，今天该车道
+       凡需身份的 op 具名 503（设计内 fail closed）；
+    ④ stack 的 agent uid 池取两个 worker 池的并集（10000/2000），只改 worker-2 的池而不改 agent 会具名拒。
+  - **片 B 一评 = Needs fixes**。三项裁定（**D1/D22/D21+§11.2.1-8/9**）**全部确认落地且钉在正确方向**
+    （worker 镜像/清单真干净、pin 读的是指令而非子串、面 B 端点真、走可信查找、路由带具名 503 且不回退面 A、
+    k8s 身份 pin 正好放在可信源解析的位置）。需修四条，其中两条是**部署窗口阻塞项**：
+    - **①（裁定 D23）** pool（`deploy/compose/docker-compose.autoscale.yml` + `autoscaler/backends/local.py:83`）
+      与单机示例（`deploy/compose/docker-compose.yml`）原本靠 worker 镜像的 file-cap 二进制；删掉后
+      `E2B_PRIV_HELPERS=auto` 只打一条 WARNING 就退到 E5.1（无 per-sandbox uid、无 route-B）而沙箱照建——
+      **单机示例原本是拒绝启动，现在变成静默降级**（"响→哑"，正是 C3 要防的形态）。
+      → 裁定：这两个形态**排除出 C3、按名字排除（照 `local://` 先例）**，但排除必须**显式且被钉住**——
+      在清单里显式声明"本形态没有特权文件操作"，加 pin，并在覆盖范围文档里与 `local://` 并列点名。
+    - **②（阻塞）** `docs/k8s-deployment.md:135` 仍教人把 broker 的 image 设成 worker 镜像 ⇒ 照做会
+      broker CrashLoop → worker 的 `wait-for-broker` 闸门卡死 → worker 起不来；`:142-147` 已失真；
+      整段没提 `ds/e2b-c3-agent`。另 `:38/:111/:180/:204-206` 也要改。
+    - **③（阻塞）** `deploy/scripts/upgrade.sh` 首次部署会生成 `E2B_C3_AGENT_TOKEN`（`:88-98`），但
+      carry-over 只改**已存在**的键（`:110-120`），`set_env_file_value` 的 add-if-missing 只用于四个 image 键
+      （`:238`）⇒ stack 首次 slice-B 部署时两个面都起不来（agent 无 token 拒绝启动）。同文件修 + 加 pin。
+    - **④** 文档/注释清扫：pdr `:1955`/`:2038-2041`/`:312-313`/`:246`、README `:248` vs `:250` 同一 env 键
+      默认值矛盾、`worker.yaml:223`、`priv-broker.yaml:17-22`、`test_worker_env_key_sets.py:334-342`、
+      `c4-prjquota-window.sh:636` 的 `getcap` 会报错。
+    - 另两条记录项：**compose 三个栈在 D21 选项 2 的 agent 侧代码落地前"无法完成建箱"**（所有权交棒是建箱的
+      第一个特权步骤），不是仅"身份 op 503"——要写进记录并作为 compose 部署窗口的门禁；stack 的 face B uid 池
+      与两个 worker 池是独立旋钮（默认恰好是并集），`E2B_C3_AGENT_UID_POOL_SIZE` 未进 stack 的 `.env.example`。
+    - **修复轮已提交：`c1be884`（排除形态显式声明 D23 + stack 补 token 键）+ `1f0d79e`（runbook 与文档清扫）。**
+      自报：本片相关 10 个文件 204 passed（含新 `test_upgrade_c3_agent_token.py` 6 条、D23 排除声明 1 条）；
+      `tests/unit` 49 failed/1813 passed（失败集合与同 HEAD 对照树逐条相同）；两份 kustomize + 5 个 compose
+      `config --quiet` 全 OK；3 个改过的 shell `bash -n` 通过。
+      RED：删 `E2B_PRIV_HELPERS=off` → `KeyError`；token 回填改 `return 0` → 4 条红。
+      - 它自留的两点：排除形态只是显式声明（没恢复 per-sandbox uid/route-B；pool 要恢复需先设计"CP 如何寻址
+        pooled worker 的宿主"，触发条件已写进覆盖范围）；broker 镜像在 runbook 与清单里仍是两处字面量
+        （只把**测试**改成与渲染逐字比对，文档层面要真收敛需生成步骤，本轮未做）。
+    - **片 B 复审 = 只剩两条文档级残余**（其余全部确认）：D23 的声明与 pin（删声明即红，含 `local.py` 那条）、
+      token 回填（add-if-missing + 保留已部署值 + 拒占位符，pin 退回即红）、两条记录、以及整段 image/upgrade
+      runbook 都验过；k0s 路径（`apply.sh` → kustomize，broker→agent→worker）是实的。残余：
+      ① `docs/k8s-deployment.md` §2 的**逐文件部署顺序**（`:56-90` 区）漏了 `c3-agent.yaml` ⇒ 按它逐文件
+         首装会得到"worker 已在 agent 形态但**没有 agent**"，每次建箱 503（k0s/apply.sh 路径不受影响）；
+         同段还有两句仍在把 socket 讲成活形态（`:49` 的 Pod Security 前置、`:83` step 6 括注）。
+      ② `autoscaler/backends/local.py:113` 的 `E2B_PRIV_HELPERS` 只被 pin 了"存在"，没 pin 值 ⇒ 改成 `auto`
+         不会红（compose JSON 那半已按值钉）。
+    - 最后一小轮已提交：**`a4fc553`**（§2 逐文件顺序插入 agent DaemonSet，broker → **agent** → worker，与
+      `apply.sh` 闸门一致；Pod Security 前置与第 6/7 步的 socket 表述一并修正；新增
+      `test_the_pool_pins_off_and_does_not_merely_agree_with_itself` 把 `local.py` 与 pool compose JSON 的
+      `E2B_PRIV_HELPERS` **各按值**钉成 `"off"`——原先只比"两份声明互相一致"，两边一起改 `auto` 仍绿）。
+      自报：相关 8 文件 154 passed（RED：backend 改 `"auto"` 即红）；`tests/unit` 49 failed/1814 passed
+      （失败集合与同 HEAD 对照树逐条相同；期间 3 条 `test_mcp_port_pool*`/`test_mcp_gateway` 是一次性端口
+      分配 flake，单独跑 37 passed）。
+
+## ✅ Task 4 完成（片 A + 片 B）
+
+**提交线**：`49b7f48` → `0f944fc` → `f18cb52` → `573dd35` → `31e0c43` → `d2bfd84`（片 A，Approved）
+→ `8111cce` → `3030722` → `c1be884` → `1f0d79e` → `a4fc553`（片 B）。
+
+**本片落地的裁定**：D1（两条 worker 镜像/BND pin 在此收口）、D17（`deploy/stack` 纳入覆盖）、
+D18.1/18.2/18.3（fail closed 具名 / 动词白名单 / 复用 verb 不new写）、D19（删除幂等 + 具名）、
+D20（route-B 槽位命名收敛到 `gateway_common` 单处 + 对等用例）、D21 选项 1（worker 身份必须由可信源印证，
+无可信源即不记身份、身份类 op 具名 503）、D22（面 B 独立端点 49986）、D23（pool 与单机示例按名字排除 +
+显式声明 `E2B_PRIV_HELPERS=off` + 钉住）。
+
+**交给真机验收轮的事项**（未做，需部署窗口授权）：
+- 判据 2/15 的**镜像级**取证（worker 镜像里确无 `/var/lib/e2b-priv`）——单测只钉 Dockerfile 文本。
+- compose 三个车道在 **D21 选项 2 的 agent 侧代码落地前无法完成建箱**（属主交棒是建箱第一步）⇒
+  **compose 部署窗口必须先等它**；k8s 不受影响。已记 `c3-privilege-relocation.md:690`。
+- k8s worker pod 已显式 pin `runAsUser/runAsGroup: 65534`（D21 选项 1 生效的前提）。
+
+### Task 5（CP 收敛到无 root）派发
+
+**Bohr 的侦察发现计划缺口（值得记）**：① `maint.c` **没有 mkdir/chmod verb**（只有 chown/rm/walk），
+所以 §3.2 步骤 2 的"卷根 mkdir + chmod 1777 交给 agent"无法复用既有 verb；② `_volumes` **不是 CP 唯一的写入**
+——`VolumeRegistry` 还要写 `<_volumes>/_meta/<id>.json`，而 `_meta` 在 `0:0 755` 的卷根里
+⇒ CP→65534 后**连卷记录都写不进去**，§3.2 的"不需要磁盘迁移"本身不完整（§13.6 表也漏了 `_meta`）；
+③ 把共享存储的 op 交给 agent 需要"以哪个节点寻址"，而卷记录的 `node_id` 是 `"local"`，这是一条文档没有的新规则；
+④ 新增 mkdir verb 会**扩大 root 的 `e2b-maint` 面**，与 C3 的目的相反。
+
+→ 裁定 **D24 = 路线 B**：对 `_volumes` 根（含 `_meta`）做**一次性、非递归**的属主移交到 65534（池 uid 的卷数据
+目录不动），之后 CP 自己的 mkdir/chmod 就是普通属主操作、不需要特权。理由：两条路都躲不掉这次移交（A 也列了
+`_meta` 移交），那 A 的增量就只剩"新 verb + 新寻址规则"，而新 verb 正是 C3 要缩小的面。
+**这是对计划 §3.2 字面的刻意偏离**（要求写进报告与记录，并引 §13.6① 的第一选项 / §13.2 作为计划自备的替代），
+判据措辞随之改为"**CP 拥有 `_volumes`，所以它的 mkdir/chmod 不需要特权**"并就此加 pin（丢掉属主前置或重新引入
+特权 op 即红）。移交必须：非递归（并 pin 不递归）、幂等且对已迁移的根安全、**具名可见**（做了什么/无事可做）。
+
+- **Task 5 完成：`2c67fcc`**（CP 主容器 65534 + 卷存储一次性交棒）。自报：新 `tests/unit/test_c3_cp_rootless.py`
+  RED 7/3 → GREEN 10/10；13 个相关文件 190 passed/2 skipped；容器 lane 149 passed/14 skipped；两份 kustomize
+  exit 0；宿主全量 50 failed 与 HEAD 基线**逐条相同**；`storage-init` 手工跑了四格（缺目录建、非递归、幂等、
+  chown 被拒 ⇒ FATAL + exit 1），并据此修掉一条 fresh-install 缺陷。
+  - 它的 concern：① compose 两条栈的 CP 仍 root（本任务判据是 k8s pod），已记 `deploy-clusters.md` §7.7；
+    ② `_volumes/_meta` 的真机属主只能在集群上量，§13.6.1 第 4 步列为必须项；③ `deployment_smoke` 跑到迁移步
+    503（`nodes.reserve_node` 容量预留，与本改动无关），`multinode_smoke` 未跑（本机 worker 镜像早于 Task 4、
+    不认识 `agent` 传输；Landlock ABI 读成 -1）——替代是用本树重建的 CP 镜像跑通建卷 + `_meta` 落盘；
+    ④ 待真机确认 buildkit socket 现靠 pod 级 `fsGroup` 组位读（原靠 DAC_OVERRIDE）；另记
+    `manager.cleanup_workspace` 的 local-lane 静默 rmtree、compose `image-cache-init` 的 `chown -R`。
+  - **Task 5 评审中**（reviewer: Hume）。
+
+  - **Task 5 一评 = Approved**（三项 §3.2 步骤在两份渲染里都落地；CP 的 k8s A 类降为属主操作；D24 偏离被
+    文档化、有理由、按行为钉住；非递归属性有"改成 -R 即红"的 pin；fsGroup/B5 机制经上游源码核实成立）。
+    留 1 条 Important + 若干 minor：
+    - **Important**：`_meta` 那一半的移交**没有闸门**，`chown` 被拒时仍打印成功行（`:144` 无条件 echo，
+      唯一闸门 `:165` 只看 `$volume_store`）⇒ 报告 §8.2 与 `c3-privilege-relocation.md:939` 承诺的"可见失败"
+      对 `_meta` 是假的，故障会推迟到卷创建时的**未具名**错误（`volumes.py:310-315` +
+      `paths.py:505-506` 在 `VolumeRootNotOwnedError` 包裹之外）。修法：两条路径都加闸门（FATAL+exit 1）、
+      成功行移进 `if`、按此加两条 pin、并改正文档里让运维 grep 的日志串。
+    - minors：`storage-init` 以 root 跑且**没有 `capabilities.drop`**（持有运行时默认集含 `NET_RAW`，而旁边的
+      面 B 是 `drop:[ALL]`+3 条）——脚本只需要 CHOWN/FOWNER，收紧；`VolumeRegistry.__init__` 的 mkdir
+      （`volumes.py:184`）未包具名错误；新拒绝文案把 k8s 补救方式/uid 硬编码进 compose 与 `local://` 也共用的模块。
+    - 另记：compose 两条栈的 CP 仍 root（判据/File Structure 都是 k8s pod 范围，属可辩护的范围选择，但确是
+      "CP 收敛到无 root"的缺口，已记 `deploy-clusters.md:444-482` 与 pdr`:1382-1388`，**不要让它溶进 Task 7**）。
+    - **修复轮进行中。**
+
+  - **Task 5 修复已提交：`c31aa09`**（1 Important + 4 minors 全关）。要点：
+    - `hand_over` 现在**自己复核并 FATAL + return 1**，成功行移到闸门**之后**；两个调用点各自 `|| exit 1`
+      （原独立 `store_owner` 门并进 helper）。新增**真跑 `sh`** 的行为臂（`stat`/`chown` shim 固定、跨平台）：
+      只拒 `_meta` 的臂 exit 1、stdout 无 `_meta` 成功行、stderr 是指名 `_meta` 的 FATAL。
+      RED：抽掉 helper 校验 → 3 failed；只抽 `_meta` 门 → 2 failed。文档里的"期望日志/grep"改成脚本实际打印的字面量。
+    - ⚠ **它实测纠正了我的能力集建议**：`CHOWN`+`FOWNER` **不够** —— `--cap-drop ALL --cap-add CHOWN --cap-add FOWNER`
+      下 `mkdir -p "<已 65534:0755 目录>/_oci"` 报 `Permission denied`（幂等重跑/半初始化缓存会中），
+      `set -e` 会把健康部署变成 `Init:Error`；故 `storage-init` 按实测取**与面 B 逐条相同的三条**
+      （`drop:[ALL]` + `CHOWN/DAC_OVERRIDE/FOWNER`），理由写进清单注释与 §13.6。
+    - 另修：`VolumeRegistry.__init__` 的 store 创建也套同一具名失败；拒绝文案改**形态中立**
+      （用 `os.geteuid()` + 一次非递归交棒）。
+    - 控制器复核（我读代码确认）：两半各自 `hand_over ... || exit 1`、成功 echo 在闸门之下、拒绝为具名 FATAL。
+    - 自报：宿主 13 文件 194 passed/2 skipped；容器 9 文件 153 passed/14 skipped；两份 kustomize exit 0；
+      宿主全量失败集合与 `a4fc553` 基线逐条相同；`test_c3_cp_rootless.py` 14 passed。
+
+## ✅ Task 5 完成
+
+**提交线**：`2c67fcc`（CP 主容器 65534 + 卷存储一次性交棒）→ `c31aa09`（评审修复：两半各自设闸 +
+storage-init 能力集收紧）。
+**裁定**：**D24 = 路线 B**（一次性非递归属主移交，CP 自己的 mkdir/chmod 变普通属主操作），
+刻意偏离计划 §3.2 字面，理由与 pin 都写进了计划/§13.6。
+**留给部署窗口**：§13.6.1 的检查步骤（含 `_volumes/<id>/` 必须仍是池 uid、`_volumes/_meta` 必须 65534）；
+buildkit socket 靠 pod 级 `fsGroup` 组位读这一条的现场正向记录。
+**已知缺口（不许溶进 Task 7）**：compose 两条栈的 CP 仍是 root（判据与 File Structure 都是 k8s pod 范围，
+属可辩护的范围选择，已记 `deploy-clusters.md:444-482` / pdr `:1382-1388`）。
+### Task 6（自愈改走 agent）派发
+
+**Mencius 的侦察（三条事实都指到真问题）**：
+(a) `c3-agent.yaml` 今天**两个面都没有 CP URL**，NetworkPolicy 刻意只有 `Ingress`
+（被 `test_c3_agent_manifest.py:258` 按"agent 自身无 egress"钉住）——本任务的形态会**翻转这条事实**；
+(b) CP 唯一的 agent 寻址 `K8sAgentAddressResolver` 是**按 worker pod 键**的（读 worker pod 的 `spec.nodeName`），
+而案例①正是"worker 崩了且不重启" ⇒ CP 没法按今天的方式寻址该节点的 agent；
+(c) `SandboxRegistry._iter_stored_records()` **静默跳过**读不到/解析不了的 store 条目 —— 这正是"CP 记录过期"
+会误删活树的形态。
+
+→ 控制器裁定（**1–4 全批**）：① 触发器/周期：首扫延迟 30s、间隔 120s、失败退避加倍封顶 10min（"N 分钟"=2–3 分钟，
+两个旋钮可配）；② 报文形态 `POST /internal/nodes/{agent_node_id}/agent/inventory`，body 只有
+`{"sandboxes":[ids]}`（**只有 id，永远不带路径/uid/也不带"请删除"**），CP 同步用自己记录决策、再指令**同一节点**的
+agent 用既有 `rm`，响应带决策（protected/orphans/removed/deferred）便于每轮一行 grep；③ 身份：既有 fleet
+`E2B_C3_AGENT_TOKEN` + **源 IP 第二因子** 对新加的**按 host 键**的查找（k8s: agent pod by label +
+`fieldSelector spec.nodeName=`；compose: 配置的 agent host → DNS），解析不到即 **503 具名**、绝不"查不到就放行"；
+**不做** per-node key 这层新凭据面；CP→agent 方向在同一路径上也要能在 worker 已消失时寻址到该节点的 agent
+（必要时扩 `K8sAgentAddressResolver` 接受 node 名，但**不得削弱** grant-slot/文件操作用的 worker-键路径）；
+④ 陈旧闸门（本任务的安全核心，三条腿各自设 pin）：(a) 只有**共享 store** 才允许扫（`_record_store` 存在，
+进程内集合不能证明"哪里都没有记录"，CP 重启不得让活树看起来像孤儿）、(b) `unreadable == 0`
+（把 `_iter_stored_records` 今天静默跳过的**计数**出来，非零即推迟）、(c) 与 `/internal/fleet/metrics` 的
+id 计数比对 + 封顶退避（Task 4 评审钉过的那条）。每条腿都要有"单独撤掉即红"的用例（案例③抓 (b)）。
+另加两条：⑤ NetworkPolicy 的改动要**可评审**（agent 增 egress 到 `control-plane:3000`、CP 增 agent pod 入站；
+同批更新 `test_c3_agent_manifest.py:258` 的 pin 并在注释里写明"agent 现在需要 egress 因为它是眼睛"，
+"其余入站仍然全拒"保持不变）；⑥ `multiworker_interference.py` 需要活集群 ⇒ 属可接受缺口，**明说**，
+改跑进程内车道（真 CP app + 真 agent app + 真树，落在仓库 `tmp/`），不要伪造集群运行。
+
+- **Task 6 完成：`693fe39`（自愈改走 agent + 三档推迟门）+ `5db1e2d`（评审修复）**。自报：宿主 414 passed、
+  容器 lane 259 passed、全量 2216 passed 且失败集合与 HEAD 基线**逐条相同**；三条新 RED 臂实测
+  （删 DNS 出口 ⇒ 1 failed；`resolve_host` 退回 worker 键 ⇒ 2 failed；multinode 加回 `E2B_C3_AGENT_SCAN` ⇒ 1 failed）。
+  - **一评 = Needs fixes**（决策路径与三档门本身已验：报文只有 id + 多余键 400、CP 自推导路径、用既有 `rm` 发给
+    已认证的**同节点** agent、agent 无本地决策/无授权表、案例③确实打的是腿 (b) 而不是 (c)、案例②靠枚举完整性
+    而非时序），两条 Important：① 新加的 **Egress 策略会挡集群 DNS**（agent 要解析 `control-plane:3000` 这个
+    Service 名，而白名单里没有 DNS）⇒ k8s 上这条通道会死；② 让案例①成立的生产 **`resolve_host` 零覆盖**
+    （测试注入 stub）。均已修：**选窄 DNS 出口**（两条规则：control-plane:3000 + kube-system 的 `k8s-app: kube-dns`
+    53/udp+tcp，无通配；不选字面 ClusterIP 因为重建会漂）+ 新增 `test_a_node_whose_worker_pod_is_gone_still_resolves_its_agent`。
+  - 我复核：egress 确为两条窄规则；resolver 测试已在 `tests/unit/test_c3_agent_client.py`。
+  - 记录项：`docker-compose.multinode.yml` **无 Redis** ⇒ 门 (a) 恒推迟，该车道本轮**没有自愈**（没有开扫描以免
+    造"每 120s 报一次被推迟"的假象，触发条件写进清单注释并双向 pin）；`_require_agent_identity` 已移出事件循环
+    但每轮仍一次 k8s list（不做缓存 = 不做 TTL，与本形状"CP 侧不做表"的口味一致，记账不改）；
+    共享盘多 agent 重复上报（输家 `rm` 记 `failed`，未做 cross-agent 单飞）；源 IP 层在代理/sidecar 前置时恒真；
+    compose 无策略层；平台账 unknown 留 Task 7。
+
+## ✅ Task 6 完成
+
+**提交线**：`693fe39` → `5db1e2d`。
+
+### D21 选项 2（compose 车道身份）已完成
+
+`e41bd46`（compose 车道 worker 身份改由内核推导）+ `c663c63`（§11.2.1 记录）+ `9ae9d83`（pin 三个 compose 栈的
+worker 身份 == resolver 默认）。锚点 = worker 注册时自报、CP 存节点记录的 **pidNamespace**；agent 用
+`/proc/<pid>/ns/pid` 找进程并从 `/proc/<pid>/status` 读 uid/gid **作为身份**，与 CP 送来的 claim 不一致即具名拒，
+锚点无进程/多进程也具名拒。自报：3 文件 98 passed（含真容器/真内核 7 条）；RED 退回"信任送来的值" ⇒ 3 条拒绝
+用例变 200 并真的 chown。
+- **实测约束**：`/proc/<pid>/ns/pid` 走 `ptrace_may_access`，只有同 uid 或 `CAP_SYS_PTRACE` 可读；面 B 是 root
+  且刻意无该能力（与 CP 共享 `pid: host`，给了就能 ptrace 控制面）⇒ 读取放在按 `E2B_C3_AGENT_RESOLVER_UID/_GID`
+  （默认 65534:65534）运行的子进程里；该旋钮必须等于 worker 的 uid，已由 manifest 测试钉住，配错 = 每个 op
+  具名拒绝（不会退化成信任上报值）。
+- **残留（已记 §11.2.1 第 9 条）**：compose 的锚点仍是 worker 自报，同机同 uid 可互读 `ns/pid` ⇒ 被攻陷 worker
+  理论上能冒充**同一 uid** 的另一 worker 的名字空间（k8s 侧有 `pod<uid>` cgroup 证明兜底）。
+
+### 本机 compose multinode 验收（判据 13/16）—— 13 与 16 都真跑通
+
+在 `docker-compose.multinode.yml`（3 worker 同机）上验收：
+- **判据 13**：worker-1/worker-2 各有容器 pid **300** 的子进程 → 分别解出宿主 pid `3640303`/`3640363`
+  （走真实 worker→CP→grant-slot→agent→`as_uid`）；反面：worker-3 用同一 pid、worker-1 用只有 worker-2 有的
+  pid 317，均**逐字**具名拒（`container pid … is not in worker …: refusing`）。
+- **判据 16**（N=3）：正臂 5 轮全成功、总耗时 2.37–2.54s（串行基线 4.11–4.24s，无超线性退化）、零
+  `E2B_CREATE_QUEUE_TIMEOUT_S`、仪器实测同刻最多 3 条 grant 在飞；**反面臂** `E2B_C3_AGENT_MAX_CONCURRENCY=1`
+  三轮 `max_in_flight` 恒为 1（复现排队）。
+- **并发裁决**：`E2B_C3_AGENT_MAX_CONCURRENCY` **保持 64**（实测上界 = 形态 worker 数 3；车队 16 副本/100 准入/
+  agent 40 线程池都要求 ≥16 且不先成瓶颈）。
+
+**验收同时量出 4 个 HEAD 过不了的阻塞项**（只有这个环境能暴露）：
+- 已修：`746ad6b`（agent 镜像缺 `httpx`，服务起不来）、`833d20c`（槽位子进程缺 `setresgid`，每个槽位读不到
+  自己的 policy）。
+- **D2**（待裁定→已裁定 D25）：face B 的固定能力集 `0xb` 生不出身份解析子进程（实测 0xb→EPERM、0xcb→通）。
+- **D4**（待裁定→已裁定 D25）：锚点谓词"该命名空间恰好一个进程"与真实槽位互斥（`sandlock-supervise` 就在
+  worker 的 pid ns 里），且任何 `docker exec`/zombie 都触发 ⇒ 把该车道压成每 worker 1 个活槽位
+  （`multinode_smoke` 4 箱即挂）。
+
+→ **裁定 D25（一条改动同时关掉 D2 与 D4）**：compose 车道的身份解析改走**世界可读**的 `/proc`——
+`/proc/<pid>/cgroup` 匹配锚点 + `/proc/<pid>/status` 的 `Uid:`/`Gid:` 读值，**face B 保持 `0xb`、
+不加 SETUID/SETGID、不动判据 4**；锚点用 worker 能自证的容器身份（Docker 把 hostname 设成容器 id），
+compose 里若覆盖 `hostname:` 会得到**具名拒绝**而非静默错答（写进文档）。谓词改为"**至少一个** cgroup 命中 +
+**所有**候选对 (uid,gid) **一致**（零命中/不一致均具名拒），**不再要求进程唯一**——容器内进程共享一个 uid，
+所以候选不唯一不等于取值有歧义；真正必须禁止的是采用内核没为该 worker 进程报过的值。槽位路径（face A 的
+`ns/pid`）保持不变。
+
+- **D25 已实现并实测（`ce6f3d6`）**：face B 用 container id 匹配**世界可读**的 `/proc/<pid>/cgroup`、读
+  `/proc/<pid>/status`，无新能力、无降 uid、无子进程；`SubprocessWorkerIdentityResolver` 与
+  `E2B_C3_AGENT_RESOLVER_*` 已删，判据 4 的 `0xb` **一字未动**，本地 `SETUID/SETGID` override 已删。
+  - **实现者实测纠正了我的假设**：同一 cgroup 里的进程**不**共享 uid（`uid=65534 NSpid=[host,1]` 与
+    `uid=10000 NSpid=[host,71]` 同 cgroup，因为槽位跑在池 uid 上）⇒ 光要求"所有候选一致"会让每个有活槽位的
+    worker 被判歧义；故还要求候选是**容器 init**（`NSpid=[host,1]`）。理由与实测写进代码注释 + 钉子。
+  - face B 实跑 `CapEff=0xb`；单测 26 + 契约 7（真内核，含"同 cgroup 放一个 10000 进程仍解出 65534"的 D4 回归）
+    全绿；`multinode_smoke`（4 箱、worker-1 上 2 个）**通过**；判据 16 正臂 5 轮 `max_in_flight` **恒 3**、
+    2.36–2.62s vs 串行 4.13–4.34s，反面臂恒 1；判据 13 复跑全绿。
+  - 新约束（写进清单注释 + §11.2.1 + pin）：compose 栈**不得**给 C3 worker 设 `hostname:`、也不得用 `pid: host`
+    （两者都是具名拒）。
+  - 验收用的 multinode 栈仍开着：拆 `docker compose -p c3acc -f deploy/compose/docker-compose.multinode.yml down -v`。
+
+## 集群阶段开始（用户授权）
+### 2026-09-29 集群部署（已执行，用户授权）
+
+**前置（我踩的坑，记下免得重犯）**：
+- worktree 里没有 gitignored 的 `deploy/scripts/{bastion,acr}.env` 与 arm64 wheel ⇒ 从主 checkout 复制进
+  worktree（`cp deploy/scripts/{bastion,acr}.env`、`cp wheels/fork/sandlock-*-aarch64.whl` 等）。
+- **`build-and-push.sh` 用 `PLATFORMS=linux/arm64`（单架构）时 `build-images.sh` 走 `--load` 而不是 `--push`
+  ⇒ worker/agent/autoscaler/quota-agent 四个镜像只进了本地 daemon、没上 ACR**，部署时全线 ImagePullBackOff。
+  补救：对本地已构建的四个 tag 直接 `docker push`（确认 5 个镜像 manifest 都 OK 后再 apply）。
+  下次要么用默认多架构（会 push），要么显式 `PUSH=1` 后手动 push。
+- `deploy/k8s-k0s/secrets.sh` 补上 `E2B_C3_AGENT_TOKEN`（幂等补缺；指纹 `sha256:8b4a044b…`）。
+
+**部署**：`DRY_RUN=1 deploy/k8s-k0s/apply.sh` 渲染抽查形状全部正确（CP `runAsUser/runAsGroup: 65534` 且
+`initContainers` 为空；buildkit `Unconfined` 无 runAsUser；worker 65534、**无 capabilities**、无 hostPID、
+`E2B_PRIV_HELPER_TRANSPORT=agent` + `E2B_SLOT_IDENTITY=agent-grant`；agent pod 级 `hostPID: true`，
+面 A `65534`+BND{SETUID,SETGID}、面 B 与 storage-init `0`+`drop:[ALL]`+三 cap），然后
+`./deploy/k8s-k0s/apply.sh` **rc=0**：broker → agent → worker 依次滚动完成，两个 worker 的 base image 预热成功。
+版本 `0.1.0-762-gce6f3d6-20260929-202404`。autoscaler 新 pod 起初卡在 ImagePullBackOff（kubelet 退避期停在我
+push 之前），删 pod 后立即 Running；现全 workload 在新版本上。
+
+**真机判据（已取证）**：
+- **判据 2** ✅：worker pod 内 `id -u` = 65534、`CapEff: 0000000000000000`、
+  `ls /var/lib/e2b-priv` = No such file or directory（镜像级 D1 一并证到）。
+- **判据 3** ✅：agent 面 A（`agent` 容器）`id -u` = 65534，`getcap /var/lib/e2b-priv/as_uid` =
+  `cap_setgid,cap_setuid=ep`（恰好两条），且容器 `CapEff: 0`（BND 声明不给非 root 有效能力）。
+- **判据 4** ✅：面 B（`maint` 容器）`id -u` = 0、`CapEff: 000000000000000b`（恰 = CHOWN|DAC_OVERRIDE|FOWNER），
+  `getcap /var/lib/e2b-priv/e2b-maint` = `cap_chown,cap_dac_override=ep`。
+- **端到端** ✅ `multinode_smoke` = **MULTI-NODE SMOKE OK**：4 个沙箱跨两节点 2+2 分布、命令/文件/健康/stdin
+  全通、kill 后两节点预留均归零。这条把 建箱 → worker 上报槽位 → CP 转发 → agent 写 uid_map → 槽位
+  `setresuid` → 文件操作（建树/交棒/secret）→ 删除 全走了一遍。
+
+### ❗真机暴露的两个问题（`deployment_smoke` 抓到的，需修）
+
+- **F1（真 bug，阻塞 `deployment_smoke`）跨节点迁移时文件操作被按"记录所属节点"拒**：
+  `deployment_smoke` 的迁移步报 `502 Node e2b-worker-1 failed to provision:`（消息为空），worker-1 日志里的
+  真因是：
+  ```
+  envd_service.agent_fileops.AgentFileOpsError: the control plane refused chown-workspace for
+  sandbox sbx_f28af987d85c8f0f (HTTP 403): Sandbox sbx_f28af987d85c8f0f belongs to node e2b-worker-0,
+  not e2b-worker-1
+  ```
+  调用链 `envd_service/uid_pool.py:300 apply_sandbox_ownership` → `agent_fileops.chown_workspace(sandbox_id)`
+  → CP 的 file-op 作用域校验（沙箱必须属于**调用节点**）。迁移的语义恰恰是"把箱建到**另一个**节点"，
+  所以 CP 的 scoping 与迁移冲突。修法方向：迁移期间 CP 自己是发起方，它知道目的地——要么在迁移里把
+  记录先行/以期权重定向，要么给该 op 一个"迁移中"的作用域（仍由 CP 决定，绝不采信请求方），并加一条
+  覆盖"跨节点迁移"的用例。**注意**：`multinode_smoke` 全绿说明常规建箱/删除路径没问题，问题只在迁移。
+- **F2（噪声，需修）k8s 车道打了 compose 车道的告警**：worker 日志反复出现
+  `this worker's hostname ('e2b-worker-1') is not a container id, so it has no container identity to report:
+  the control plane will refuse every C3 file operation on this node by name -- do not set hostname: on a C3
+  worker`。k8s 车道的身份走 **pod spec 的 runAsUser/runAsGroup**（那条路是通的，文件操作确实成功了），
+  所以这条是 compose 车道的容器身份上报在 k8s 里也跑了的**误导性告警**。修法：只在 compose 车道做容器
+  身份上报（按形态门控），并保留 k8s 侧"pod 没 pin 身份"那条真告警。

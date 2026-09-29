@@ -1703,11 +1703,36 @@ agent 的白名单（复用 `priv_common.c` 的 `realpath` + 四根）只有在*
 「**哪个节点，在什么时候，请求了对哪个沙箱的什么动作；CP 依据哪条记录批准了；agent 实际做了
 哪一次系统调用**」。这是这个形状相对 C1/C2 最实在的好处，也是它值得写实施计划的原因。
 
+### 14.8 C3 的回退面（**C3 Task 7 之后**）
+
+Task 7 之前，C3 的回退故事有一条"两条路并存"的便利：新树由 worker 建成，**老代码（C1 的 broker）仍能
+`chown` 接管**，所以盘上的树在 C1 与 C3 之间是**双向可读**的（计划文件
+`docs/superpowers/plans/2026-09-28-c3-privilege-consolidation.md` 的「回退」段就是按这个写的）。
+**Task 7 拆掉了那座桥**（broker DaemonSet + `E2B_PRIV_HELPER_SOCKET` + worker 的 `wait-for-broker`
+闸门全部退役，`E2B_PRIV_HELPER_TRANSPORT=socket` 变成启动期具名拒绝），所以现在要说清楚**回退面剩什么**：
+
+| 想退回到 | 怎么退 | 代价 |
+|---|---|---|
+| **Task 2 的"槽位身份不走 agent"**（`E2B_SLOT_IDENTITY=spawn`） | 改一个 env（worker 清单里那一行） | agent 仍要在（文件操作还走它）；只少了 `grant-slot` 这一跳。**这是仍然存在的旋钮** |
+| **Task 4 的"文件操作不走 agent"**（`E2B_PRIV_HELPER_TRANSPORT=exec`） | 改 env，**并且必须回到含 file-capability 二进制的 worker 镜像** | 出厂镜像里已经没有 `/var/lib/e2b-priv/` ⇒ 只改 env 是**半安装**（启动自检具名拒绝，不是静默降级）。要退就得**清单 + 镜像同批**退 |
+| **C1 的"节点 broker 做特权动作"**（`E2B_PRIV_HELPER_TRANSPORT=socket`） | **不再是原地可切的开关** | 代码路径已删（`TRANSPORTS` 不含 `socket`），DaemonSet 清单也删了。要退回这个形状只能**整批 revert 到 C1 那一版**（清单 + 镜像 + 那个 DaemonSet） |
+
+⇒ **一句话**：C3 的开关面现在只剩 `E2B_SLOT_IDENTITY`（两态）与 `E2B_PRIV_HELPER_TRANSPORT`
+（`agent` / `exec`，且 `exec` 需要配套镜像）。**再往前的形状（root worker / C1 broker）都要按
+"整批 revert 镜像 + 清单"来做**，不存在"翻一个 env 就回到 C1"的路。盘上的数据不受影响：树仍是
+`0770 owner=<池 uid> group=<worker gid>`，**任何 root 进程都能接管它**（这正是 §5.4(b) 那条 NFS
+语义的另一面）——所以整批 revert 不会丢数据。运维口径与 `docs/k8s-deployment.md` §24.2 的回退节逐字一致。
+
+> **相关**：N47（broker 的授权面）随本次退役关闭、残余挪到 N49；N48（属主 0 老树）按 2026-09-29 的
+> 实测关闭 —— 两条的裁决与证据见 `docs/open-issues.md` 与 `.superpowers/sdd/task-7-report.md`。
+
 ## 15. 参考
 
 - **同族路线**：`docs/c2-ownership-frontload.md`（C2，本文的替代对象）、
-  `docs/deploy-clusters.md` §7.1–§7.4（C1 现状）、
-  `deploy/k8s/priv-broker.yaml`（文件头 + cap 集注释，记着 NAS/`CAP_CHOWN` 不过网与 peer 门实测）。
+  `docs/deploy-clusters.md` §7.1–§7.4（C1 现状）与 §7.9（C3 Task 7 的退役）。
+  `deploy/k8s/priv-broker.yaml`（文件头 + cap 集注释，记着 NAS/`CAP_CHOWN` 不过网与 peer 门实测）
+  **已由 C3 Task 7 删除**：那些实测的现行落点是 `docs/production-deployment-requirements.md` §5.4(b)
+  与 `docs/deploy-clusters.md` §7.3；要读原文就看 git 历史。
 - **CP 侧先例与协调**：`deploy/quota_agent/`（"worker 外包特权给服务端 agent"的现成形态，
   注意它在 k8s 里没部署）、`docs/control-plane-multi-replica.md`（Redis + `flock` 协调）、
   `docs/production-deployment-requirements.md` §2.4.4（W4）。

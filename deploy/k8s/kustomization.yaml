@@ -16,20 +16,13 @@ resources:
   - control-plane.yaml
   - gateway.yaml
   - seccomp-installer.yaml
-  # C1: the per-node root broker (socket + the two owner inits). It lives in the
-  # baseline, not in an overlay, because it has nothing to do with the
-  # distribution or the storage *type*: `chown`/`rm`/`walk` on this baseline's
-  # own shared PVC need root on a local disk too (`deploy/k8s/priv-broker.yaml`
-  # has the measurement). Wherever `worker.yaml` ships the socket switch, this
-  # file has to ship the broker that serves it -- `test_..._inseparable` renders
-  # exactly that.
-  - priv-broker.yaml
   # C3 (Task 3): the per-node agent -- the only component that grants a slot its
-  # identity. It lives in the baseline with the broker for the same reason the
-  # broker does (nothing about it is a distribution or storage difference), and
-  # the k0s overlay inherits it unchanged: its one PVC claim is the base
+  # identity, and since C3 Task 7 the **only** privileged node component at all
+  # (C1's `e2b-priv-broker` DaemonSet used to sit here; it is retired). It lives
+  # in the baseline, not in an overlay, because nothing about it is a
+  # distribution or storage difference: its one PVC claim is the base
   # `sandbox-shared`, and its node-local cache is the same `/var/lib/e2b-images`
-  # hostPath the worker and the broker already share.
+  # hostPath the worker already uses.
   - c3-agent.yaml
   - worker.yaml
   - autoscaler.yaml

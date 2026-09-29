@@ -237,14 +237,15 @@ AGENT_TRANSPORT = "agent"
 
 
 def transport_setting(settings) -> str:
-    """``E2B_PRIV_HELPER_TRANSPORT`` -- the same switch the broker transport uses.
+    """``E2B_PRIV_HELPER_TRANSPORT`` -- the same switch the exec shape uses.
 
-    Read from the environment, like ``priv_helpers._transport_setting``: the
-    worker's ``Settings`` has no field for it (it is a *shape* choice, made once
-    at startup), and a second copy in a dataclass field could only drift from
-    the value the resolver actually reads. An explicit attribute, when a test or
-    an embedder sets one, wins -- that is the one way to make the shape
-    observable without an environment variable.
+    Read from the environment, like ``priv_helpers._transport_setting`` (the two
+    share ``TRANSPORT_ENV`` and the accepted values): the worker's ``Settings``
+    has no field for it (it is a *shape* choice, made once at startup), and a
+    second copy in a dataclass field could only drift from the value the
+    resolver actually reads. An explicit attribute, when a test or an embedder
+    sets one, wins -- that is the one way to make the shape observable without
+    an environment variable.
     """
     from envd_service.priv_helpers import TRANSPORT_ENV
 

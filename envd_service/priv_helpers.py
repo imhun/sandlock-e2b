@@ -53,19 +53,20 @@ range / root whitelist / argument shapes cannot drift apart.
 * ``off``: never use the brokers (today's behaviour everywhere). The escape
   hatch for environments that cannot carry file capabilities.
 
-``E2B_PRIV_HELPER_TRANSPORT`` picks *how* a maintenance request travels (c1,
-裁定 "特权外置"): ``exec`` (today) runs the file-capability binary here, and
-``socket`` hands the same argv to one root broker per node, which listens on
-``E2B_PRIV_HELPER_SOCKET`` (default ``/run/e2b-broker/broker.sock``) and
-``fork``/``exec``s *itself* with it -- the request only ever carries the verb
-and its flags, never the program. ``auto`` (the default) is ``socket`` when
-that socket is there and ``exec`` otherwise. The two transports share every
-argv builder and validator, so what the broker is asked for cannot drift from
-what the exec shape asks for; only who performs the privileged step differs.
-An explicit ``socket`` shape **never falls back**: a missing socket, or a
-daemon whose uid pool / root whitelist differs from this worker's, is refused
-by name at startup (the daemon enforces *its* configuration, so a silent
-drift would turn every privileged step into a runtime failure).
+``E2B_PRIV_HELPER_TRANSPORT`` picks *how* a maintenance request travels:
+``exec`` runs the file-capability binary here, in this process's namespaces,
+and ``agent`` is C3's shape -- the request is not an argv at all but
+``{sandbox_id, op}``, and it travels to the control plane, which instructs the
+per-node agent that executes it (hard rules 1/3, §14.4). ``auto`` (the
+default) is ``agent`` when that shape is configured and ``exec`` otherwise.
+The two share nothing but the validator discipline: under ``agent`` this
+module's argv builders and the file-capability binaries are not used at all,
+and :mod:`envd_service.agent_fileops` is the client instead.
+
+C1's per-node root broker -- a ``socket`` transport that handed the argv to one
+daemon per node over ``E2B_PRIV_HELPER_SOCKET`` -- is **retired** (C3 Task 7).
+There is no third transport any more: a deployment either execs the
+file-capability binary or routes to the agent, decided once at startup.
 
 ``e2b-slot-spawn`` is never externalized: a route-B slot has to start inside
 the worker's own namespaces, so :meth:`PrivHelpers.spawn_argv` always runs the
@@ -77,10 +78,8 @@ keeps using its own privileged starter.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import socket
 import stat
 import struct
 import subprocess
@@ -115,12 +114,6 @@ MAINT_NAME = "e2b-maint"
 HELPER_DIR_MODE = 0o710
 HELPER_FILE_MODE = 0o750
 
-#: c1: the per-node root broker's unix socket (``E2B_PRIV_HELPER_SOCKET``
-#: overrides). The worker only ever *connects* to it -- the DaemonSet owns the
-#: path (``0710 root:<worker gid>``), one socket per node, so every worker pod
-#: on that node asks the same broker for its privileged steps.
-DEFAULT_BROKER_SOCKET = Path("/run/e2b-broker/broker.sock")
-BROKER_SOCKET_ENV = "E2B_PRIV_HELPER_SOCKET"
 TRANSPORT_ENV = "E2B_PRIV_HELPER_TRANSPORT"
 #: ``agent`` is C3's shape (Task 4): the maintenance verbs are not executed
 #: here at all -- every file operation travels to the control plane as
@@ -128,83 +121,9 @@ TRANSPORT_ENV = "E2B_PRIV_HELPER_TRANSPORT"
 #: is a *shape*, not a transport in the argv sense: this module's argv builders
 #: and the file-capability binaries are simply not used in it, and
 #: :mod:`envd_service.agent_fileops` is the client instead.
-TRANSPORTS = ("auto", "exec", "socket", "agent")
+TRANSPORTS = ("auto", "exec", "agent")
 #: The transport value that selects the C3 shape.
 AGENT_TRANSPORT = "agent"
-
-#: The frozen wire version (Task 1's daemon and this side must agree on it).
-BROKER_PROTOCOL_VERSION = 1
-#: One request budget per verb (裁定 4); ``walk`` of a big tree is not a
-#: ``chown``, and nothing may ask for more than the protocol's ceiling. The
-#: daemon kills the command at ``timeout_s`` itself, so these are the budget
-#: of the *step*, not of the queue behind it.
-BROKER_TIMEOUT_S = {"chown": 300, "rm": 300, "walk": 120}
-BROKER_TIMEOUT_MAX_S = 3600
-#: The daemon kills a command at ``timeout_s`` and *then* answers, so the
-#: worker's own socket timeout is the request's budget plus this slack: a
-#: daemon about to report what it did must not be abandoned mid-answer.
-BROKER_TIMEOUT_SLACK_S = 5
-#: The startup handshake is one small round trip: a daemon that cannot answer
-#: it in this long is not one this worker should route its chowns to.
-BROKER_HELLO_TIMEOUT_S = 10
-#: Read granularity for the one-line answer (``walk`` streams a big one).
-BROKER_READ_CHUNK = 65536
-#: The daemon's per-stream output cap (``PRIV_MAX_OUTPUT`` in ``maint.c``): it
-#: kills a producing child at this many **unescaped** bytes, once for stdout
-#: and once for stderr.
-BROKER_MAX_OUTPUT_BYTES = 256 * 1024 * 1024
-#: The widest inflation one byte can get on the wire: the daemon's writer
-#: JSON-escapes every undecodable byte (a Linux filename is any byte but NUL
-#: and ``/``) as ``\udcXX`` -- six bytes for one.
-BROKER_ESCAPE_BLOWUP = 6
-#: The ceiling on one answer line this worker will read before it refuses.
-#: Same origin as the daemon's own cap, because that cap does *not* bound the
-#: line: it counts unescaped bytes, so a tree full of undecodable names can
-#: put six times that (both streams) on the socket. Anything larger is not an
-#: answer -- it is a daemon (or an impostor on the socket) making the *worker*
-#: buffer without bound, so the read is abandoned and named instead.
-BROKER_MAX_RESPONSE_BYTES = (
-    2 * BROKER_MAX_OUTPUT_BYTES * BROKER_ESCAPE_BLOWUP + BROKER_READ_CHUNK
-)
-#: The ceiling on one ``walk`` answer line. It is the worker's own bound on how
-#: much it will buffer for that verb, and it is derived from the daemon's, so
-#: the two sides are one decision rather than two guesses:
-#:
-#: * the daemon caps a ``walk``'s **unescaped** output at 64 MiB
-#:   (``PRIV_MAX_WALK_OUTPUT`` in ``deploy/priv/maint.c``; the generic
-#:   ``PRIV_MAX_OUTPUT`` above still governs every other verb) and answers
-#:   ``ok:false`` past it, so no conforming daemon ever sends a longer line;
-#: * the answer is one JSON line, and escaping inflates it up to
-#:   ``BROKER_ESCAPE_BLOWUP`` (6x) => at most 384 MiB on the wire.
-#:
-#: 512 MiB is ~1.3x that widest possible line, which is the point: it never
-#: refuses an answer a conforming daemon considered legal. Crossing it means
-#: the stream is not an answer at all -- an impostor on the socket (or a daemon
-#: far newer than this worker) trying to make the *worker* buffer without
-#: bound, which is why the read is abandoned and named rather than grown.
-#:
-#: The unescaped cap's own sizing is the daemon's decision:
-#: ``E2B_DISK_MAX_ENTRIES`` (N31; 500000, ``deploy/k8s/worker.yaml``) caps one
-#: tree's entries and ~80 B a line puts that at ~40 MB unescaped, and a tree
-#: that outgrows the estimate fails the daemon's *measurement* as ``ok:false``
-#: rather than arriving here as a long line -- that "measurement failed"
-#: category predates this ceiling. 512 MiB is still
-#: deliberately *below* the worker container's ``limits.memory`` (2Gi; pinned
-#: in ``tests/unit/test_worker_manifest_permissions.py``), so crossing it is
-#: this refusal and not the kernel's OOM kill first.
-#:
-#: **Single-tree, never multi.** Every caller walks one tree (``registry`` per
-#: record's workspace, ``health`` for one sandbox's workspace,
-#: ``checkpoint_store`` for one checkpoint image), and
-#: ``runtime/platform_disk.measure_platform_disk_bytes`` used to be the
-#: exception: it walked all of ``<state base>/_runtime`` -- every sandbox's
-#: platform dir plus ``.checkpoints``, which the per-tree entry cap does *not*
-#: bound -- so a legitimate answer could cross this ceiling and be refused
-#: (the accounting paths only warn, so the number would go silently stale). It
-#: now sums one ``dir_size`` per child instead; a new multi-tree caller here
-#: would re-open exactly that hole. The generic ceiling stays for ``chown`` /
-#: ``rm``, whose answers are a handful of bytes.
-BROKER_MAX_WALK_RESPONSE_BYTES = 512 * 1024 * 1024
 
 
 def _image_cache_root() -> Path | None:
@@ -228,104 +147,10 @@ def _transport_setting() -> str:
     value = str(os.environ.get(TRANSPORT_ENV, "auto") or "auto").lower()
     if value not in TRANSPORTS:
         raise PrivHelperError(
-            "E2B_PRIV_HELPER_TRANSPORT must be 'auto', 'exec' or 'socket' "
+            "E2B_PRIV_HELPER_TRANSPORT must be 'auto', 'exec' or 'agent' "
             f"(got {value!r})"
         )
     return value
-
-
-def _broker_socket_path() -> Path:
-    """``E2B_PRIV_HELPER_SOCKET`` or the per-node default."""
-    raw = os.environ.get(BROKER_SOCKET_ENV)
-    return Path(raw) if raw else DEFAULT_BROKER_SOCKET
-
-
-def _broker_timeout(argv: Sequence[str]) -> int:
-    """The request budget for one verb (裁定 4), capped at the ceiling."""
-    verb = argv[1] if len(argv) > 1 else ""
-    budget = BROKER_TIMEOUT_S.get(verb, BROKER_TIMEOUT_S["chown"])
-    return min(budget, BROKER_TIMEOUT_MAX_S)
-
-
-def _broker_response_limit(verb: str) -> int:
-    """The widest answer line this worker will buffer for ``verb``.
-
-    ``walk`` is the one verb whose answer is a whole tree, so it is read under
-    its own, smaller ceiling (``BROKER_MAX_WALK_RESPONSE_BYTES``); every other
-    verb answers with a handful of bytes and keeps the generic one.
-    """
-    if verb == "walk":
-        return BROKER_MAX_WALK_RESPONSE_BYTES
-    return BROKER_MAX_RESPONSE_BYTES
-
-
-def _read_broker_line(
-    sock: socket.socket, *, where: Path, verb: str, limit: int
-) -> str:
-    """Read up to the terminating newline of the daemon's one-line answer.
-
-    Bounded on purpose, and the bound is the *verb's* (``limit``, from
-    :func:`_broker_response_limit`): ``walk`` streams a whole tree as one long
-    line and is read under the smaller walk ceiling, every other verb answers
-    with a handful of bytes. Reading until a newline with socket timeouts as
-    the only backstop meant an unbounded ``bytes`` buffer: the daemon's own
-    output cap counts *unescaped* bytes, so a ``walk`` over names that are not
-    UTF-8 comes back JSON-escaped and inflates up to sixfold on the wire --
-    and nothing at all stops a daemon (or whatever else is on that socket)
-    from streaming one line forever. Past ``limit`` the answer is refused by
-    name (the verb and the ceiling it used), so this is a
-    :class:`PrivHelperError` (the caller asked for a privileged step and did
-    not get one), never a ``MemoryError`` or a hung worker.
-    """
-    # ``chunks`` + one ``join`` rather than ``raw += chunk``: the quadratic
-    # re-copy of a repeated concatenation is what makes a big ``walk`` answer
-    # both slow and peak-heavy just below the ceiling.
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        chunk = sock.recv(BROKER_READ_CHUNK)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-        if total > limit:
-            raise PrivHelperError(
-                f"the maintenance broker at {where} answered more than "
-                f"{limit} bytes without a newline to a {verb} request: "
-                f"refusing to buffer an answer over the {verb} limit"
-            )
-        if b"\n" in chunk:
-            break
-    raw = b"".join(chunks)
-    return raw.split(b"\n", 1)[0].decode("utf-8", errors="replace")
-
-
-def _broker_stream(response: dict, field: str, *, what: str, name: str) -> str | None:
-    """One optional stream of a broker answer, checked to be text.
-
-    ``None`` (absent) is a stream the daemon had nothing to say on; anything
-    that is not a string is a malformed answer and has to be named rather than
-    silently coerced into the refusal text.
-    """
-    value = response.get(field)
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise PrivHelperError(
-            f"{what} refused by {name}: the broker's {field} is not a string "
-            f"({value!r})"
-        )
-    return value
-
-
-def _realpath(path: str) -> str:
-    """``realpath`` without requiring the path to exist (comparison only).
-
-    ``os.path.realpath`` is the non-strict counterpart of ``Path.resolve()``:
-    the trailing component may be missing, which is the normal case for a
-    whitelist root an initContainer has not created yet.
-    """
-    return os.path.realpath(path)
 
 
 # capability(7) numbers, as bit positions in a capability mask.
@@ -546,14 +371,6 @@ class PrivHelpers:
     #: workspace base", exactly like ``priv_state_base()`` in the C brokers.
     state_base: Path | None = None
     shared_volume_root: Path | None = None
-    #: c1: how a maintenance request travels. ``exec`` is today's shape (this
-    #: process execs the file-capability binary); ``socket`` sends the argv to
-    #: the per-node root broker. Only :meth:`_run` reads it -- every argv
-    #: builder is shared, which is what stops the two transports from drifting
-    #: apart; ``e2b-slot-spawn`` is exec whatever this says.
-    transport: str = "exec"
-    #: The broker's unix socket when ``transport`` is ``socket``.
-    broker_socket: Path | None = None
     #: The image cache's whitelist root (``E2B_IMAGE_CACHE_DIR``), or ``None``
     #: when the deployment named no cache. Read from the environment at
     #: construction: see :func:`_image_cache_root`.
@@ -571,18 +388,6 @@ class PrivHelpers:
             self.shared_volume_root = Path(self.shared_volume_root)
         if self.image_cache_dir is not None:
             self.image_cache_dir = Path(self.image_cache_dir)
-        if self.transport not in ("exec", "socket"):
-            raise PrivHelperError(
-                f"the broker transport is either 'exec' or 'socket' "
-                f"(got {self.transport!r})"
-            )
-        if self.broker_socket is not None:
-            self.broker_socket = Path(self.broker_socket)
-        if self.transport == "socket" and self.broker_socket is None:
-            raise PrivHelperError(
-                "the socket transport needs the broker's unix socket "
-                f"({BROKER_SOCKET_ENV})"
-            )
         if not self.supervise_bin.is_absolute():
             raise PrivHelperError(
                 "the route-B supervise binary must be an absolute path "
@@ -646,8 +451,8 @@ class PrivHelpers:
         # c1: the image cache, where the sandbox secrets live. Last, because a
         # deployment that keeps the cache inside the workspace base (the
         # legacy relative default does) must not have the *same* directory
-        # named twice -- ``priv_roots_json()`` on the C side de-duplicates the
-        # same way, and the hello handshake compares the two lists literally.
+        # named twice -- ``priv_root_paths()`` on the C side de-duplicates the
+        # same way, and both sides must agree on the whitelist.
         if self.image_cache_dir is not None and self.image_cache_dir not in roots:
             roots.append(self.image_cache_dir)
         return tuple(roots)
@@ -709,10 +514,10 @@ class PrivHelpers:
         }
         if self.shared_volume_root is not None:
             env["E2B_SHARED_VOLUME_ROOT"] = str(self.shared_volume_root)
-        # Only when this shape has one: the broker falls back to the image
+        # Only when this shape has one: ``e2b-maint`` falls back to the image
         # cache it was built with, and naming a *different* cache here would
-        # put a directory in the broker's whitelist that the worker does not
-        # consider managed (the two lists are compared at the handshake).
+        # put a directory in the binary's whitelist that the worker does not
+        # consider managed.
         if self.image_cache_dir is not None:
             env["E2B_IMAGE_CACHE_DIR"] = str(self.image_cache_dir)
         return env
@@ -805,21 +610,18 @@ class PrivHelpers:
     # --------------------------------------------------------- operations
 
     def _run(self, argv: list[str], *, what: str) -> str:
-        """Run one broker request over the resolved transport (c1).
+        """Run one maintenance request through the file-capability binary.
 
-        The argv is built once, by the same validators, whichever way it then
-        travels -- ``exec`` hands it to the file-capability binary in this
-        process's namespaces, ``socket`` strips ``argv[0]`` and sends the rest
-        to the daemon, which execs *itself* with it. A caller therefore cannot
-        tell the two transports apart, and a step that is refused is refused
-        with the same wording either way.
+        The argv is built by the validators above and only ever has one
+        destination: ``e2b-maint`` (or ``e2b-slot-spawn``) in this process's
+        own namespaces. C1's second destination -- a per-node daemon behind
+        ``E2B_PRIV_HELPER_SOCKET`` -- is retired (C3 Task 7); the ``agent``
+        shape never reaches this method at all.
         """
-        if self.transport == "socket":
-            return self._run_socket(argv, what=what)
         return self._run_exec(argv, what=what)
 
     def _run_exec(self, argv: list[str], *, what: str) -> str:
-        """Today's shape, unchanged: exec the local file-capability binary."""
+        """Exec the local file-capability binary."""
         proc = subprocess.run(
             argv,
             env=self.subprocess_env(),
@@ -833,125 +635,6 @@ class PrivHelpers:
                 f"(exit {proc.returncode}): {detail}"
             )
         return proc.stdout or ""
-
-    def _run_socket(self, argv: list[str], *, what: str) -> str:
-        """Send the argv to the per-node broker and map its answer the same way.
-
-        ``ok:false`` means the request never ran at all; a non-zero ``exit``
-        is the broker's own refusal and keeps the exec path's wording verbatim
-        (including the "what" the caller passed, so the two shapes log alike).
-
-        Every field is checked by type before it is used: the answer is the
-        *only* evidence a privileged step happened, so a missing or
-        wrong-typed field has to be a refusal, never a default (``ok:true``
-        without an ``exit`` used to read as "exit 0" -- i.e. success).
-        """
-        name = Path(argv[0]).name
-        verb = argv[1] if len(argv) > 1 else ""
-        timeout_s = _broker_timeout(argv)
-        response = self._broker_request(
-            {
-                "v": BROKER_PROTOCOL_VERSION,
-                "args": [str(arg) for arg in argv[1:]],
-                "timeout_s": timeout_s,
-            },
-            timeout_s=timeout_s,
-            verb=verb,
-        )
-        if not response["ok"]:
-            error = response.get("error")
-            if not isinstance(error, str):
-                raise PrivHelperError(
-                    f"{what} refused by {name}: the broker's refusal carries "
-                    f"no error string ({error!r})"
-                )
-            raise PrivHelperError(f"{what} refused by {name}: {error}")
-        exit_code = response.get("exit")
-        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
-            raise PrivHelperError(
-                f"{what} refused by {name}: the broker answered ok without an "
-                f"integer exit ({exit_code!r})"
-            )
-        if exit_code != 0:
-            stderr = _broker_stream(response, "stderr", what=what, name=name)
-            stdout = _broker_stream(response, "stdout", what=what, name=name)
-            detail = (stderr or stdout or "").strip()
-            raise PrivHelperError(
-                f"{what} refused by {name} (exit {exit_code}): {detail}"
-            )
-        return _broker_stream(response, "stdout", what=what, name=name) or ""
-
-    def _broker_request(self, payload: dict, *, timeout_s: int, verb: str) -> dict:
-        """One JSON line out, one JSON line back (the frozen wire protocol).
-
-        Every transport failure -- no socket, refused connection, a timeout
-        the daemon never answered within, an answer that is not one JSON
-        object -- becomes a :class:`PrivHelperError`: the caller asked for a
-        privileged step and did not get it, so "nothing happened" must never
-        be reported as success.
-
-        The envelope is checked here, once, for both the handshake and every
-        verb: the protocol version is the frozen ``1`` and ``ok`` is a real
-        boolean. A daemon that answers something else is not one this worker
-        may interpret optimistically.
-        """
-        if self.broker_socket is None:
-            raise PrivHelperError(
-                "the socket transport needs the broker's unix socket "
-                f"({BROKER_SOCKET_ENV})"
-            )
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                # The daemon kills the command at its own ``timeout_s`` and
-                # *then* answers; ``BROKER_TIMEOUT_SLACK_S`` is that answer's
-                # budget, so the worker never abandons a daemon that is about
-                # to report what it did.
-                sock.settimeout(timeout_s + BROKER_TIMEOUT_SLACK_S)
-                sock.connect(str(self.broker_socket))
-                sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-                raw = _read_broker_line(
-                    sock,
-                    where=self.broker_socket,
-                    verb=verb,
-                    limit=_broker_response_limit(verb),
-                )
-        except OSError as exc:
-            raise PrivHelperError(
-                f"the maintenance broker at {self.broker_socket} is "
-                f"unreachable: {exc.strerror or exc}"
-            ) from exc
-        try:
-            response = json.loads(raw)
-        except ValueError as exc:
-            raise PrivHelperError(
-                f"the maintenance broker at {self.broker_socket} answered "
-                f"{raw!r}, which is not one JSON object"
-            ) from exc
-        if not isinstance(response, dict):
-            raise PrivHelperError(
-                f"the maintenance broker at {self.broker_socket} answered "
-                f"{raw!r}, which is not one JSON object"
-            )
-        if response.get("v") != BROKER_PROTOCOL_VERSION:
-            raise PrivHelperError(
-                f"the maintenance broker at {self.broker_socket} answered "
-                f"protocol version {response.get('v')!r}, not "
-                f"{BROKER_PROTOCOL_VERSION}"
-            )
-        if not isinstance(response.get("ok"), bool):
-            raise PrivHelperError(
-                f"the maintenance broker at {self.broker_socket} answered "
-                f"{raw!r}, whose \"ok\" is not a boolean"
-            )
-        return response
-
-    def hello(self) -> dict:
-        """The daemon's own account of its shape (pool + root whitelist)."""
-        return self._broker_request(
-            {"v": BROKER_PROTOCOL_VERSION, "hello": True},
-            timeout_s=BROKER_HELLO_TIMEOUT_S,
-            verb="hello",
-        )
 
     def chown(
         self,
@@ -1112,8 +795,9 @@ def request_identity(
     agent writes it. A worker that could name a uid would be an identity
     authority, which is exactly what C3 removes.
 
-    It lives beside the broker client because that is where the worker's
-    privileged-adjacent plumbing already is, but it is *not* a broker call: the
+    It lives beside the privileged-helper plumbing because that is where the
+    worker's identity hand-off already is, but it is *not* a privileged call:
+    the
     only host it ever dials is the control plane's, and the only credential it
     ever sends is the worker's own internal key. There is no worker↔agent
     channel to reach from here (hard rule 5).
@@ -1185,8 +869,8 @@ def configure_priv_helpers(settings) -> PrivHelpers | None:
     """Resolve + install the singleton the worker wires itself to.
 
     Two singletons are resolved here, and exactly one of them is the live shape
-    (``E2B_PRIV_HELPER_TRANSPORT``): the file-capability brokers (``exec`` /
-    ``socket``) or C3's agent client (``agent``). ``agent`` installs **no**
+    (``E2B_PRIV_HELPER_TRANSPORT``): the file-capability binaries (``exec`` /
+    ``auto``) or C3's agent client (``agent``). ``agent`` installs **no**
     ``PrivHelpers`` -- the argv builders and their binaries are not part of that
     shape at all -- and :func:`file_steps_available` is what the call sites ask
     instead of "are there brokers".
@@ -1205,7 +889,7 @@ def configure_priv_helpers(settings) -> PrivHelpers | None:
 def file_steps_available(settings=None) -> bool:
     """Whether *some* shape can perform this worker's privileged file steps.
 
-    Either the file-capability brokers resolved (``auto``/``exec``/``socket``)
+    Either the file-capability binaries resolved (``auto`` / ``exec``)
     or C3's agent client did (``agent``). The call sites gate on this rather
     than on :func:`active_helpers` alone: a worker in the agent shape has no
     brokers and still has every step it needs -- routed elsewhere.
@@ -1397,10 +1081,10 @@ def resolve_priv_helpers(settings) -> PrivHelpers | None:
     is root, or no brokers are installed at all (named by
     :func:`helpers_unavailable_reason`).
 
-    c1 adds the transport split: ``socket`` (or ``auto`` with the daemon's
-    socket already on disk) resolves the daemon shape, which has no in-process
-    fallback and no "no brokers installed" answer -- see
-    :func:`_resolve_socket_shape`.
+    There is exactly one installed shape left (C3 Task 7 retired C1's per-node
+    ``socket`` daemon): this process execs the file-capability binaries, or --
+    when ``E2B_PRIV_HELPER_TRANSPORT=agent`` -- :func:`configure_priv_helpers`
+    never gets here because the file steps travel to the agent instead.
     """
     mode = str(getattr(settings, "priv_helpers", "auto") or "auto").lower()
     if mode not in ("auto", "off"):
@@ -1409,86 +1093,36 @@ def resolve_priv_helpers(settings) -> PrivHelpers | None:
         )
     if mode == "off" or os.geteuid() == 0:
         return None
-    transport = _transport_setting()
-    socket_path = _broker_socket_path()
-    if transport == "socket" or (transport == "auto" and socket_path.exists()):
-        return _resolve_socket_shape(settings, socket_path=socket_path)
+    # ``_transport_setting()`` is still consulted: it validates the value (an
+    # unknown transport is a named refusal, not a shape guessed at), and
+    # ``agent`` is the one value that must never resolve a local privileged
+    # shape -- the caller handles that shape before reaching here, so seeing it
+    # this far down means the two halves of the switch disagree.
+    if _transport_setting() == AGENT_TRANSPORT:
+        raise PrivHelperError(
+            "E2B_PRIV_HELPER_TRANSPORT=agent must resolve through "
+            "configure_priv_helpers(): refusing to build a local privileged "
+            "shape for the agent transport"
+        )
     slot = DEFAULT_HELPER_DIR / SLOT_SPAWN_NAME
     maint = DEFAULT_HELPER_DIR / MAINT_NAME
     # The exec branch's own entry condition: with no binary at all there is
     # nothing this worker could exec, so it keeps today's in-process (E5.1)
     # shape. Everything past this point -- including the "one binary missing"
-    # refusal -- is shared with the daemon shape by :func:`_build_helpers`.
+    # refusal -- lives in :func:`_build_helpers`.
     if not slot.exists() and not maint.exists():
         return None
-    return _build_helpers(settings, transport="exec")
+    return _build_helpers(settings)
 
 
-def _resolve_socket_shape(settings, *, socket_path: Path) -> PrivHelpers:
-    """The c1 shape: a per-node root daemon performs the privileged steps.
+def _build_helpers(settings) -> PrivHelpers:
+    """Build (and self-check) the file-capability shape.
 
-    Only two things are specific to this branch: the socket has to be there,
-    and once the shape is built the daemon has to *agree* with it (its uid
-    pool and root whitelist are compared by :func:`_require_broker_agreement`).
-    The shape self-check itself is the shared one (see :func:`_build_helpers`)
-    -- the image still ships both binaries (decision 3), so their reachability
-    and file capabilities are still validated whenever they are installed,
-    and ``e2b-slot-spawn`` is still the worker's own.
-
-    "Still the worker's own" is why the *local* ``e2b-slot-spawn`` is required
-    here, not only the daemon: a route-B slot has to start inside this pod's
-    namespaces, so :meth:`PrivHelpers.spawn_argv` runs the local binary in
-    **both** transports, and the exec branch's "no binary at all means the
-    in-process shape" answer has no counterpart behind a daemon -- there the
-    missing binary would be found at the first ``Sandbox.create()`` instead of
-    at startup. Presence past this gate is what runs the shared reachability
-    and file-capability checks in :func:`_build_helpers`.
-
-    There is deliberately no fallback. ``E2B_PRIV_HELPER_TRANSPORT=socket`` is
-    an operator saying "a broker is up on this node"; silently running the
-    file-capability binaries instead would hide exactly the deployment defect
-    the shape exists to prevent (a pod that carries the capabilities the
-    externalization was supposed to take out of it).
-    """
-    if not socket_path.exists():
-        raise PrivHelperError(
-            f"E2B_PRIV_HELPER_TRANSPORT=socket but the broker socket "
-            f"{socket_path} does not exist: start the per-node broker before "
-            "the worker (an explicit socket shape must not silently fall back "
-            "to the file-capability binaries)"
-        )
-    slot = DEFAULT_HELPER_DIR / SLOT_SPAWN_NAME
-    if not slot.exists():
-        raise PrivHelperError(
-            f"E2B_PRIV_HELPER_TRANSPORT=socket but the local {SLOT_SPAWN_NAME} "
-            f"({slot}) is missing: route-B slots start inside this worker's own "
-            "namespaces, so e2b-slot-spawn is never handed to the node's daemon "
-            "-- a socket shape without it is a half-installed broker and is "
-            "named at startup, not at the first Sandbox.create()"
-        )
-    helpers = _build_helpers(
-        settings, transport="socket", broker_socket=socket_path
-    )
-    _require_broker_agreement(helpers)
-    return helpers
-
-
-def _build_helpers(
-    settings, *, transport: str, broker_socket: Path | None = None
-) -> PrivHelpers:
-    """Build (and self-check) the broker shape: the one copy, both transports.
-
-    ``exec`` and ``socket`` differ in *who* performs a privileged step, not in
-    what the worker considers installed or managed. The partial-install rule,
-    the reachability/file-capability checks, the pool-plus-route-B shape, the
-    worker-identity guard, every field of the shape and the route-B scratch
-    root check are therefore asked here, once: a check the next change adds
-    cannot land in one transport and be forgotten in the other (socket is the
-    production path).
-
-    Transport-specific *entry* conditions stay in the callers -- there is
-    nothing to exec without the binaries, a daemon shape needs its socket --
-    and the socket caller adds the handshake on top.
+    The partial-install rule, the reachability/file-capability checks, the
+    pool-plus-route-B shape, the worker-identity guard, every field of the
+    shape and the route-B scratch root check are all asked here, once: this is
+    the only installed shape left (C3 Task 7), so there is nothing left to
+    keep two callers consistent with.
     """
     slot = DEFAULT_HELPER_DIR / SLOT_SPAWN_NAME
     maint = DEFAULT_HELPER_DIR / MAINT_NAME
@@ -1531,99 +1165,9 @@ def _build_helpers(
             if getattr(settings, "shared_volume_root", None)
             else None
         ),
-        transport=transport,
-        broker_socket=broker_socket,
     )
     _require_route_b_scratch_root(helpers, settings)
     return helpers
-
-
-def _require_broker_agreement(helpers: PrivHelpers) -> None:
-    """The daemon's peer, uid pool and roots must be this worker's, verbatim.
-
-    The broker enforces *its* whitelist and pool, the worker pre-filters with
-    its own, so a difference is not cosmetic: the worker would hand the broker
-    requests it refuses (every ``chown`` on a tree the worker believes is
-    covered fails at its first privileged step), or -- with a *wider* broker
-    -- ask it to touch a path this worker never meant to expose. Named at
-    startup, never guessed at, which is also why the image cache root has to
-    be configured on both sides of the socket.
-
-    The peer identity is the same kind of contract one layer down: the daemon
-    makes every "the worker's own identity" decision (``chown --worker``,
-    ``--gid <own>``) against the credentials it authenticated, so a daemon
-    gating on a *different* uid/gid would act for somebody else while the
-    worker believed the steps were its own. ``peer_uid``/``peer_gid`` are that
-    pair; this worker's are ``os.geteuid()``/``os.getegid()``.
-
-    The two lists are read from different places -- the worker from its
-    already-resolved ``Settings`` (its workspace base goes through
-    ``Path.resolve()``), the daemon verbatim from its own environment (the C
-    side takes ``getenv`` as-is, Task 1) -- so the *same* directory may be
-    spelled two ways: an NFS export reached through a symlink, a trailing
-    slash, a relative spelling. The comparison therefore normalizes both
-    sides with ``realpath`` (non-strict, like ``Path.resolve()``) while the
-    refusal keeps printing each side's own strings, which is the pair an
-    operator has to reconcile.
-
-    A3: normalizing with ``realpath`` only means something for **absolute**
-    spellings. ``realpath("tmp/sandboxes")`` resolves against *this* process's
-    cwd, and the daemon's cwd is not the worker's (a different pod, working
-    directory or namespace) -- so a relative root would either be refused over
-    a spelling or, worse, compare *equal* while the two whitelists name
-    different directories. Every deployment spells its roots absolutely, so a
-    relative one on either side is refused by name before any comparison.
-    """
-    response = helpers.hello()
-    if not response.get("ok"):
-        raise PrivHelperError(
-            f"the maintenance broker at {helpers.broker_socket} refused the "
-            f"hello handshake: {response.get('error')}"
-        )
-    peer_uid = response.get("peer_uid")
-    peer_gid = response.get("peer_gid")
-    if peer_uid != os.geteuid() or peer_gid != os.getegid():
-        raise PrivHelperError(
-            f"the maintenance broker at {helpers.broker_socket} authenticated "
-            f"the peer as {peer_uid}:{peer_gid}, this worker runs as "
-            f"{os.geteuid()}:{os.getegid()}: the broker's "
-            "E2B_BROKER_PEER_UID/GID must be this worker's own uid/gid"
-        )
-    pool = response.get("uid_pool")
-    expected_pool = [helpers.uid_pool_start, helpers.uid_pool_size]
-    if pool != expected_pool:
-        raise PrivHelperError(
-            f"the maintenance broker at {helpers.broker_socket} holds the uid "
-            f"pool {pool}, this worker holds {expected_pool}: "
-            "E2B_UID_POOL_START/SIZE must be the same on both sides of the "
-            "socket"
-        )
-    roots = response.get("roots")
-    roots = [str(root) for root in roots] if isinstance(roots, list) else None
-    expected_roots = [str(path) for path in helpers._root_paths()]
-    for who, values in (
-        (f"the maintenance broker at {helpers.broker_socket}", roots),
-        ("this worker", expected_roots),
-    ):
-        for value in values or ():
-            if not Path(value).is_absolute():
-                raise PrivHelperError(
-                    f"{who} names the relative root {value!r}: the broker's "
-                    "whitelist and this worker's must both be absolute to be "
-                    "comparable -- realpath resolves a relative spelling "
-                    "against each process's own cwd, and the daemon's cwd is "
-                    "not this worker's, so a relative root is refused instead "
-                    "of compared (deployments spell every root absolutely)"
-                )
-    if roots is None or [_realpath(root) for root in roots] != [
-        _realpath(root) for root in expected_roots
-    ]:
-        raise PrivHelperError(
-            f"the maintenance broker at {helpers.broker_socket} holds roots "
-            f"{roots}, this worker holds {expected_roots}: "
-            "E2B_IMAGE_CACHE_DIR (and every other whitelisted root) must be "
-            "the same on both sides of the socket"
-        )
 
 
 def _require_consistent_shape(settings) -> None:

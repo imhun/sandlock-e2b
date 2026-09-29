@@ -93,9 +93,11 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 `autoscaler`（Deployment）、`e2b-worker`（StatefulSet，`e2b-worker-0/1` 各落一个节点）、
 `redis`（Deployment）、`seccomp-installer`（DaemonSet，2/2）、
 `gateway-nodeport`（NodePort **31907**）、`gateway` / `control-plane` / `redis` /
-`worker-headless`（ClusterIP）。（**C1 wave 2 起基线还会多一个 `e2b-priv-broker` DaemonSet**：
-每节点一个 root broker，`chown`/`rm`/`walk` 经 unix socket 代做 —— 见 §7 与
-`deploy/k8s/priv-broker.yaml`；本节上面的 pod 清单是 2026-09-25 的读数。）
+`worker-headless`（ClusterIP）。**（2026-09-29，C3 Task 7 起）**：基线的 DaemonSet 有两个 ——
+`e2b-c3-agent`（每节点一个，两个容器：非 root 的面 A + root 的面 B）与 `seccomp-installer`；
+C1 那个 `e2b-priv-broker`（每节点一个 root broker，`chown`/`rm`/`walk` 经 unix socket 代做）
+**已随 `socket` 形态一起退役**，现行的特权动作只在 agent 面 B 里（见 §7.9 与
+`docs/production-deployment-requirements.md` §5.4(b)）。本节上面的 pod 清单是 2026-09-25 的读数。
 
 镜像 tag 必须等于 `deploy/stack/.version`（`apply.sh` 就是拿它渲染的）。2026-09-25 实测
 两边都是 `0.1.0-440-g9b57736-20260922-191343`。
@@ -128,7 +130,12 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（2026-09-27 实测，改部署前先复核；最近一次发版记录见 §7.3）
+## 7. 当前部署状态（**最近一次：见 §7.9（2026-09-29，C3 Task 7）**；下面 §7.1–§7.8 是历史记录）
+
+> **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
+> 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
+> **动手前先读 §7.9**：那是现役的 pod 清单、版本与"没有 `e2b-priv-broker`"的读数；§7.1–§7.8
+> 保留为上线经过与当时判据。
 
 **版本**：`0.1.0-721-g01e4b72-20260927-231235`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的；
 C1 的三条尾项与「记账项批次」都在这一版）。2026-09-27 **三次上线**实测：`autoscaler` /

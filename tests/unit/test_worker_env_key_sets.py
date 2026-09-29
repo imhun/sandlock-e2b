@@ -221,11 +221,11 @@ KEY_CLASSES: dict[str, set[str]] = {
     # separated examples and the target host's stack). The arm-lane fleet, the
     # pool, the single-machine example and the test runner have no agent.
     "priv_helper_transport": {"E2B_PRIV_HELPER_TRANSPORT"},
-    # C1 (wave 2) / Task 4 slice B: the k8s worker keeps the broker's unix
-    # socket path as the `socket` rollback lever (and its `wait-for-broker`
-    # gate) until Task 7 retires the DaemonSet. No compose stack runs a broker
-    # at all, so this one stays k8s-only.
-    "priv_broker_socket": {"E2B_PRIV_HELPER_SOCKET"},
+    # C1 (wave 2) / Task 4 slice B: the socket rollback lever
+    # (`E2B_PRIV_HELPER_SOCKET` + the `wait-for-broker` gate) was the k8s
+    # worker's, and only the k8s worker's. C3 Task 7 retired it with the broker
+    # DaemonSet, so there is no key to classify any more -- the manifest pin
+    # that it stays gone lives in `test_c3_agent_manifest.py`.
     # C3 (Task 3): which path grants a route-B slot its identity. The k8s worker
     # and the two separated production compose stacks (the ones that ship a
     # `c3-agent` service) run `agent-grant`; the arm-lane fleet stack, the local
@@ -338,21 +338,20 @@ EXTRA_CLASSES: dict[str, set[str]] = {
 #:   in `KEY_CLASSES`);
 #: * `E2B_SLOT_IDENTITY=agent-grant` (likewise, `slot_identity`).
 #:
-#: What is left is k8s-only: the state layout, the disk-enforcement knobs, the
-#: real-root/checkpoint switches, and (since C1) the broker's socket path --
-#: that one stays here because no compose shape runs a broker at all.
+#: What is left is k8s-only: the state layout, the disk-enforcement knobs and
+#: the real-root/checkpoint switches. (C1's broker socket path used to be in
+#: this set too; C3 Task 7 retired it with the DaemonSet.)
 _FLEET_STACK_MISSING = (
     KEY_CLASSES["k8s_state_layout"]
     | KEY_CLASSES["k8s_disk_enforcement"]
     | KEY_CLASSES["k8s_real_root_and_checkpoint"]
-    | KEY_CLASSES["priv_broker_socket"]
 )
 
 #: The compose example stacked with a control plane + Redis: it declares the
 #: worker's wiring, cache, capacity, shape and egress, but not the k8s-only
-#: classes above (state layout, disk enforcement, real-root/checkpoint, and the
-#: C1 broker socket), the rotation window, the broker opt-in (default `auto`)
-#: or named templates (default: none).
+#: classes above (state layout, disk enforcement, real-root/checkpoint), the
+#: rotation window, the broker opt-in (default `auto`) or named templates
+#: (default: none).
 _COMPOSE_EXAMPLE_MISSING = (
     _FLEET_STACK_MISSING
     | KEY_CLASSES["priv_helper_transport"]

@@ -323,8 +323,8 @@ def test_the_job_runs_as_root_on_the_shared_volume_without_retries() -> None:
 def test_the_job_is_not_part_of_the_rendered_overlay() -> None:
     """它是一次性、由人手 apply 的对象，绝不是 `apply.sh` 的一员。"""
     text = KUSTOMIZATION.read_text(encoding="utf-8")
-    # 只断言与本次相关的那一项：同波次的 Task 4 正在往 resources 里加 `priv-broker.yaml`，
-    # 整份列表相等的断言会因为别人的正当改动变红。
+    # 只断言与本次相关的那一项（整份列表相等的断言会因为别人的正当改动变红 ——
+    # 例如 C3 Task 7 从 resources 里删掉 `priv-broker.yaml`）。
     assert "state-owner-migrate" not in text
     resources = yaml.safe_load(text)["resources"]
     assert [entry for entry in resources if "state-owner-migrate" in entry] == []
