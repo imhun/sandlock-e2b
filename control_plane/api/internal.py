@@ -630,13 +630,21 @@ async def node_file_op(node_id: str, request: Request) -> dict[str, Any]:
         )
     except file_ops.FileOpRefusal as exc:
         raise OfficialError(exc.status_code, str(exc)) from exc
-    if instruction.worker_owned or spec.verb == "chown":
-        if getattr(node, "worker_uid", None) is None:
-            raise OfficialError(
-                503,
-                f"node {node_id} has reported no worker identity: refusing to "
-                "instruct the agent without it",
-            )
+    # Every file op carries the worker's identity to the agent -- the
+    # ``--worker`` form *is* that identity, and the group a tree is handed to is
+    # the worker's own gid -- so a node that has not reported one cannot be
+    # instructed for **any** op, not only the chown ones the derivation happens
+    # to check. Guarding here (and not just on the chown arm) is what keeps a
+    # rollout window -- an older worker that reports no identity -- a named 503
+    # instead of an unhandled ``TypeError`` behind a bare 500.
+    worker_uid = getattr(node, "worker_uid", None)
+    worker_gid = getattr(node, "worker_gid", None)
+    if worker_uid is None or worker_gid is None:
+        raise OfficialError(
+            503,
+            f"node {node_id} has reported no worker identity (workerUID/"
+            "workerGID): refusing to instruct the agent",
+        )
     client = getattr(state, "c3_agent_client", None)
     if client is None:
         raise OfficialError(
@@ -648,8 +656,8 @@ async def node_file_op(node_id: str, request: Request) -> dict[str, Any]:
         "node_id": node_id,
         "sandbox_id": sandbox_id,
         "path": instruction.path,
-        "worker_uid": int(node.worker_uid),
-        "worker_gid": int(node.worker_gid),
+        "worker_uid": int(worker_uid),
+        "worker_gid": int(worker_gid),
     }
     try:
         if spec.verb == "chown":

@@ -94,6 +94,72 @@ def _agent_fileops():
     return agent_fileops.active()
 
 
+def _lexists(path: Path) -> bool:
+    """``True`` for anything on that path, including a dangling symlink."""
+    return path.exists() or path.is_symlink()
+
+
+def _remove_agent_half(
+    client,
+    sandbox_id: str,
+    *,
+    path: Path,
+    op: str,
+    what: str,
+) -> None:
+    """Remove one half of a teardown through the agent, idempotently (D19).
+
+    ``e2b-maint rm`` hard-refuses a path that is not there (``realpath`` →
+    NULL), while a *teardown* has to stay idempotent: the control plane retries
+    deletes, and a sandbox that never materialised its runtime directory has
+    nothing to remove in the first place. So "already absent" is **success** --
+    said out loud in the log, never inferred -- and everything else is
+    fail-closed and named:
+
+    * a refusal that leaves the path in place (a permission or IO error) is
+      re-raised as :class:`SandboxTreeNotRemoved`, so the endpoint answers 500
+      with the reason instead of a 204 that makes the control plane drop the
+      record of a tree still on the disk;
+    * the post-check is the disk's answer, not the agent's: a return that
+      leaves the path behind is a failure too.
+
+    The re-check after a refusal also covers the race where the path disappears
+    between the pre-check and the agent's ``rm`` -- the one case where the
+    refusal is correct about the mechanism and wrong about the outcome.
+    """
+    if not _lexists(path):
+        logger.info(
+            "agent delete %s: the %s of %s is already absent; nothing to remove",
+            sandbox_id,
+            what,
+            sandbox_id,
+        )
+        return
+    try:
+        getattr(client, op)(sandbox_id)
+    except Exception as exc:
+        if not _lexists(path):
+            logger.info(
+                "agent delete %s: the %s of %s was already absent (%s: %s); "
+                "nothing to remove",
+                sandbox_id,
+                what,
+                sandbox_id,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        raise SandboxTreeNotRemoved(
+            f"the {what} of {sandbox_id} could not be removed ({path}): "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if _lexists(path):
+        raise SandboxTreeNotRemoved(
+            f"the {what} of {sandbox_id} survived its teardown: {path} is "
+            "still on disk"
+        )
+
+
 #: A disk sweep that had to be deferred because the fleet's records could not
 #: all be enumerated is retried on later heartbeats: doubling, capped, so a
 #: persistent shortfall (a record whose node never comes back) cannot hide the
@@ -1409,10 +1475,20 @@ def _delete_sandbox_runtime(
                 # (``e2b-maint rm`` over the tree the control plane derived
                 # from the same records). The worker asks with
                 # ``{sandbox_id, op}`` -- no path -- and the disk's own answer
-                # still decides below.
-                agent_fileops_client.remove_workspace(sandbox_id)
+                # decides (including "already absent" = success, D19).
+                _remove_agent_half(
+                    agent_fileops_client,
+                    sandbox_id,
+                    path=workspace_dir,
+                    op="remove_workspace",
+                    what="tree",
+                )
             else:
                 priv_helpers.remove_tree(workspace_dir, on_error="raise")
+        except SandboxTreeNotRemoved:
+            # Already named by the helper: re-wrap below would only hide the
+            # reason behind a second layer of the same sentence.
+            raise
         except Exception as exc:
             # The in-process ``rmtree`` failed *and* the brokers were absent,
             # refused, or failed too (W7-4 is what makes the broker branch
@@ -1443,17 +1519,20 @@ def _delete_sandbox_runtime(
         )
         agent_fileops_client = _agent_fileops()
         if agent_fileops_client is not None:
-            # The paired half goes through the agent too -- and, unlike the
+            # The paired half goes through the agent too, under the *same*
+            # named-error handling as the tree (D19): unlike the
             # ``ignore_errors=True`` this replaces, a runtime dir that survives
             # its removal is a failure the caller sees (the N12/N24 lesson:
-            # "recorded as removed" with the files still on disk is the shape
-            # no GC can ever reclaim).
-            agent_fileops_client.remove_runtime(sandbox_id)
-            if runtime_dir.exists():
-                raise SandboxTreeNotRemoved(
-                    f"the platform state of {sandbox_id} survived its teardown: "
-                    f"{runtime_dir} is still on disk"
-                )
+            # "recorded as removed" with the files still on disk is the shape no
+            # GC can ever reclaim) -- and "it was never there" is a success the
+            # log names.
+            _remove_agent_half(
+                agent_fileops_client,
+                sandbox_id,
+                path=runtime_dir,
+                op="remove_runtime",
+                what="platform state",
+            )
         else:
             shutil.rmtree(runtime_dir, ignore_errors=True)
         # ...and the pure shape's synthesized root (N16), the third thing the
@@ -2695,17 +2774,24 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
     existing = runtime_registry.get(sandbox_id)
     # E3.2: allocate the sandbox's host uid before materializing volumes so
     # per-sandbox volume slices can be chowned to it. Only a root worker -- or
-    # a non-root worker that resolved the file-capability brokers (Track F),
-    # which is what makes the chown possible there -- can put a sandbox under
-    # its own host uid; everything else keeps the fixed-uid + Landlock model
-    # and never allocates.
+    # a non-root worker that can ask *someone* for the chown: the
+    # file-capability brokers (Track F) or, in C3's shape, the agent
+    # (``priv_helpers.file_steps_available``) -- can put a sandbox under its own
+    # host uid; everything else keeps the fixed-uid + Landlock model and never
+    # allocates.
+    #
+    # ⚠ This gate is what makes the hand-over *reachable* at all: with it
+    # answered by ``active_helpers()`` alone, C3's agent shape (which installs no
+    # ``PrivHelpers``) left ``host_uid`` None, so ``apply_sandbox_ownership`` and
+    # every face-B ``chown`` were skipped in silence (review Task 4 slice A,
+    # Important 2).
     host_uid = None
     pool = getattr(runtime_registry, "uid_pool", None)
     from envd_service import priv_helpers
 
     if (
         settings.per_sandbox_uid
-        and (os.geteuid() == 0 or priv_helpers.active_helpers() is not None)
+        and (os.geteuid() == 0 or priv_helpers.file_steps_available(settings))
         and pool is not None
     ):
         # OBS-9: the control plane allocates the fleet-wide uid and passes it
@@ -3627,8 +3713,16 @@ async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
         client = _agent_fileops()
         if client is not None:
             # C3 Task 4: same step, the agent's execution (and the same
-            # "no path in the request" rule).
-            client.remove_workspace(sandbox_id)
+            # "no path in the request" rule). Idempotent for the same reason the
+            # teardown is: an import is retried, and "there was nothing there"
+            # is exactly what this branch is for.
+            _remove_agent_half(
+                client,
+                sandbox_id,
+                path=workspace,
+                op="remove_workspace",
+                what="tree",
+            )
         else:
             priv_helpers.remove_tree(workspace)
     workspace.mkdir(parents=True, exist_ok=True)

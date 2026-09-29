@@ -17,7 +17,7 @@ re-invented) and onto one target:
 | ``walk-workspace`` | ``walk`` | ``<workspace base>/<id>`` |
 | ``remove-runtime`` | ``rm`` | ``<state base>/_runtime/<id>`` |
 | ``chown-checkpoint`` | ``chown`` | ``<state base>/_runtime/.checkpoints/<id>`` |
-| ``remove-checkpoint`` | ``rm`` | ``<state base>/_runtime/.checkpoints/<id>`` |
+| ``remove-checkpoint`` | ``rm`` | ``<state base>/_runtime/.checkpoints/<id>`` (**the store**, not ``<store>/latest``: one image per sandbox, and the teardown's hook means the store -- see ``envd_service.runtime.checkpoint_store._remove_image``) |
 | ``walk-checkpoint`` | ``walk`` | ``<state base>/_runtime/.checkpoints/<id>`` |
 | ``chown-volume-slice`` | ``chown`` | ``<volume>/<id>`` |
 | ``chown-volume-root`` | ``chown`` | ``<volume>`` |
@@ -163,7 +163,13 @@ def control_paths(state, settings) -> ControlPaths:
         for record in volumes.list():
             if record.path is None:  # pragma: no cover - defensive
                 continue
-            volume_paths[record.name] = Path(record.path)
+            # Keyed by the **volume id** (``vol_…``), not the display name: the
+            # mount payload's ``name`` field is the id -- the control plane's own
+            # create path resolves it with ``volumes.get(name)`` and
+            # ``VolumeRegistry.get`` takes an id -- so a map keyed by the display
+            # name could never resolve an op and 404'd every volume operation
+            # (review Task 4 slice A, Important 1).
+            volume_paths[record.volume_id] = Path(record.path)
     shared = getattr(settings, "shared_volume_root", None) or getattr(
         settings, "shared_workspace_root", None
     )
@@ -328,7 +334,7 @@ def _volume_root(paths: ControlPaths, body: Mapping[str, Any]) -> Path:
     name = body.get("volume")
     if not isinstance(name, str) or name not in paths.volume_paths:
         raise FileOpRefusal(
-            f"volume {name!r} is not a volume this control plane records",
+            f"volume {name!r} is not a volume id this control plane records",
             status_code=404,
         )
     return paths.volume_paths[name]

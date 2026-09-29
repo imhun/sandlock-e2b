@@ -652,6 +652,18 @@ def _remove_image(image: Path, *, sandbox_id: str | None = None) -> None:
 
     C3 Task 4: the agent shape asks the control plane for ``remove-checkpoint``,
     which resolves to the same ``<state base>/_runtime/.checkpoints/<id>`` path.
+
+    ⚠ **A recorded drift, not an oversight** (review Task 4 slice A, Minor 6):
+    the callers pass the *image* (``<store>/latest``) while the op's target is
+    the **store** -- ``remove-checkpoint`` removes the sandbox's whole
+    checkpoint directory. That is exact rather than approximate because the
+    store holds exactly one image by construction ("one image per sandbox,
+    consumed on the way out", module doc), and the teardown's own hook
+    (:func:`remove_checkpoint_images`) does mean the store. Narrowing the op to
+    ``<store>/latest`` would leave an empty store behind after every consume --
+    which the orphan sweep is what collects, and that sweep is exactly what the
+    agent shape turns off. If a second image ever becomes legal here, this is
+    the line to revisit.
     """
     from envd_service import agent_fileops, priv_helpers
 

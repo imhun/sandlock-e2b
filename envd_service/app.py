@@ -382,21 +382,31 @@ def create_app(
             )
             app.state.reconcile_task = reconcile_task
         uid_reconcile_task: asyncio.Task | None = None
-        if (
+        sweep_wanted = (
             settings.per_sandbox_uid
             and settings.uid_reconcile_on_startup
             and (os.geteuid() == 0 or priv_helpers.file_steps_available(settings))
             and runtime_registry.uid_pool is not None
+        )
+        if sweep_wanted and agent_fileops.enabled(settings):
             # C3 Task 4 / Task 6: the worker's own orphan sweep *reclaims* trees
             # (``chown --worker``) that it decided were ownerless -- exactly the
             # authorization the new model removes (C3 §14.3's probe: any worker
             # that can reclaim any tree can read it). In the agent shape the
-            # sweep does not run at all: the decision moves to the control plane
+            # sweep does not run: the decision moves to the control plane
             # (Task 6, "agent 巡检 → CP 决策 → agent 执行"). Until then an orphan
             # tree stays on disk -- visible in the disk report -- rather than
-            # being handed to a worker with no right to take it.
-            and not agent_fileops.enabled(settings)
-        ):
+            # being handed to a worker with no right to take it, and the
+            # deployment has to be able to see that its switch was overruled
+            # (D18.1: never silently skip).
+            logger.warning(
+                "C3 agent shape: the worker's own uid-reconcile sweep is "
+                "disabled -- reclaiming an orphan tree needs `chown --worker`, "
+                "which this shape does not offer; orphan trees stay on disk "
+                "until the control plane reclaims them (Task 6). "
+                "E2B_UID_RECONCILE_ON_STARTUP has no effect in this shape"
+            )
+        if sweep_wanted and not agent_fileops.enabled(settings):
             uid_reconcile_task = asyncio.create_task(
                 _startup_uid_reconcile(runtime_registry.uid_pool)
             )

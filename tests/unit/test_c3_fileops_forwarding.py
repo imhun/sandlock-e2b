@@ -35,6 +35,12 @@ WORKER_UID = 65534
 WORKER_GID = 65534
 SANDBOX = "sbx_forward"
 VOLUME_NAME = "data"
+#: The mount payload's ``name`` field is the volume **id** (``vol_…``), which is
+#: what the worker sends and what the control plane resolves
+#: (``volumes.get(name)``); the display name is not a key. The table below says
+#: "the volume this fixture created" and the test substitutes the id, so a map
+#: keyed by the display name cannot pass it (review Task 4 slice A, Important 1).
+VOLUME_PLACEHOLDER = "<volume-id>"
 FLEET_KEY = "fleet-key"
 
 
@@ -309,7 +315,7 @@ async def test_a_heartbeat_refreshes_the_workers_identity(workspace) -> None:
             {
                 "op": "chown-volume-slice",
                 "sandbox_id": SANDBOX,
-                "volume": VOLUME_NAME,
+                "volume": VOLUME_PLACEHOLDER,
                 "recursive": True,
             },
             {
@@ -325,7 +331,7 @@ async def test_a_heartbeat_refreshes_the_workers_identity(workspace) -> None:
             {
                 "op": "chown-volume-root",
                 "sandbox_id": SANDBOX,
-                "volume": VOLUME_NAME,
+                "volume": VOLUME_PLACEHOLDER,
             },
             {
                 "verb": "chown",
@@ -340,7 +346,7 @@ async def test_a_heartbeat_refreshes_the_workers_identity(workspace) -> None:
             {
                 "op": "remove-volume-slice",
                 "sandbox_id": SANDBOX,
-                "volume": VOLUME_NAME,
+                "volume": VOLUME_PLACEHOLDER,
             },
             {"verb": "rm"},
             "volume_slice",
@@ -387,6 +393,8 @@ async def test_every_op_reaches_the_agent_with_its_exact_parameters(
     agent = _StubAgentClient()
     app = _app(shape, client=agent)
     await _enroll(app)
+    if body.get("volume") == VOLUME_PLACEHOLDER:
+        body = {**body, "volume": shape.volume.volume_id}
     resp = await _file_op(app, body)
     assert resp.status_code == 200
     expected_path = {
@@ -548,7 +556,27 @@ async def test_a_volume_the_control_plane_does_not_record_is_refused(workspace) 
     assert resp.json() == {
         "code": 404,
         "message": (
-            "volume 'not-a-volume' is not a volume this control plane records"
+            "volume 'not-a-volume' is not a volume id this control plane records"
+        ),
+    }
+    assert agent.calls == []
+
+    # ...and the *display name* is not a key either: the map used to be keyed by
+    # it, which made every volume op 404 while the request looked correct.
+    display_name = await _file_op(
+        app,
+        {
+            "op": "remove-volume-slice",
+            "sandbox_id": SANDBOX,
+            "volume": VOLUME_NAME,
+        },
+    )
+    assert display_name.status_code == 404
+    assert display_name.json() == {
+        "code": 404,
+        "message": (
+            f"volume {VOLUME_NAME!r} is not a volume id this control plane "
+            "records"
         ),
     }
     assert agent.calls == []
@@ -664,6 +692,32 @@ async def test_a_sandbox_without_a_host_uid_is_refused(workspace) -> None:
         "message": (
             f"sandbox {SANDBOX} has no allocated host uid: refusing to "
             "instruct the agent"
+        ),
+    }
+    assert agent.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_node_without_a_worker_identity_refuses_every_op(workspace) -> None:
+    """A rollout window must be a named 503 for *every* op, not a 500.
+
+    Every instruction carries the worker's identity (the ``--worker`` form *is*
+    that identity, and the group a tree is handed to is the worker's own gid),
+    so guarding only the chown arm let ``remove-*`` / ``walk-*`` reach
+    ``int(None)`` -- a bare 500 exactly while a fleet is rolling, which is when
+    an operator most needs the named refusal.
+    """
+    shape = _C3Shape(workspace)
+    agent = _StubAgentClient()
+    app = _app(shape, client=agent)
+    await _enroll(app, worker_identity=False)
+    resp = await _file_op(app, {"op": "remove-workspace", "sandbox_id": SANDBOX})
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "code": 503,
+        "message": (
+            f"node {NODE_A} has reported no worker identity (workerUID/"
+            "workerGID): refusing to instruct the agent"
         ),
     }
     assert agent.calls == []

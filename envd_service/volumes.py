@@ -237,10 +237,17 @@ def _chown_path(
 
 
 def _can_manage_sandbox_uid() -> bool:
-    """Whether this worker can put a path under a sandbox's own host uid."""
+    """Whether this worker can put a path under a sandbox's own host uid.
+
+    ``file_steps_available`` and not ``active_helpers``: C3's agent shape
+    installs no ``PrivHelpers`` -- its chowns travel to the agent -- so the
+    broker-only predicate answered "no" there and the whole volume ownership
+    model (the shared ``1777`` root and the slice's ``0770``) was skipped
+    silently (review Task 4 slice A, Important 2).
+    """
     from envd_service import priv_helpers
 
-    return os.geteuid() == 0 or priv_helpers.active_helpers() is not None
+    return os.geteuid() == 0 or priv_helpers.file_steps_available()
 
 
 def provision_sandbox_volume_mount(
