@@ -93,6 +93,19 @@ def _containers(workload: dict) -> dict[str, dict]:
     return {c["name"]: c for c in spec["containers"]}
 
 
+def _pod_containers(workload: dict) -> dict[str, dict]:
+    """Every container in the pod -- the regular ones *and* the inits.
+
+    The inits are where the review's widening hid (`workspace-root-init` kept
+    the runtime default capability set because a pin read only `containers`).
+    """
+    spec = workload["spec"]["template"]["spec"]
+    return {
+        c["name"]: c
+        for c in [*spec["containers"], *(spec.get("initContainers") or [])]
+    }
+
+
 def _pod_spec(workload: dict) -> dict:
     return workload["spec"]["template"]["spec"]
 
@@ -282,22 +295,47 @@ def test_the_manifest_set_ships_no_priv_broker_any_more() -> None:
         assert not [name for _kind, name in names if name == "e2b-priv-broker"], manifests
 
 
-def test_the_worker_and_face_a_stay_outside_the_forbidden_set() -> None:
-    """判据 5 + 11 on this task's two non-root faces: worker and agent face A.
+#: The file face's capability set, verbatim (face B = C1's broker, moved). Every
+#: container in the agent pod that still runs as uid 0 must carry exactly this:
+#: `drop: [ALL]` first, so the runtime's default set (which contains `NET_RAW`)
+#: is not inherited, then the three verbs the file scripts actually use.
+ROOT_FILE_FACE_CAPS = {
+    "drop": ["ALL"],
+    "add": ["CHOWN", "DAC_OVERRIDE", "FOWNER"],
+}
+
+
+def test_the_worker_and_every_agent_container_stay_outside_the_forbidden_set() -> None:
+    """判据 5 + 11 on the worker and on **every** container in the agent pod.
 
     §2.3's forbidden list, verbatim, and the escalation flag has to be
     **absent** -- not `false`. `allowPrivilegeEscalation: false` sets NNP=1,
     the kernel then ignores `as_uid`'s file capabilities, and face A stops
     granting identities *silently* (the failure looks like a missing
     capability at the first slot start, not like a mis-set flag).
+
+    Review round 2 (item 1): this pin used to read only the worker and face A,
+    so the two root inits (`storage-init`, moved in Task 5, and
+    `workspace-root-init`, moved verbatim from the retired broker in Task 7)
+    were outside it -- and `workspace-root-init` was shipping `runAsUser: 0`
+    with **no** `capabilities:` block, i.e. the runtime default BND. It now
+    reads the initContainers too, and every uid-0 container has to declare the
+    file face's set rather than lean on the runtime default.
     """
     worker = _containers(
         _only(_load_all(WORKER_MANIFEST), "StatefulSet", "e2b-worker")
     )["worker"]
-    face_a = _containers(
-        _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
-    )["agent"]
-    for name, container in (("worker", worker), ("agent face A", face_a)):
+    agent = _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
+    containers = _pod_containers(agent)
+    # The pod is exactly the two faces and the two root inits -- if a third
+    # init or a sidecar appears, the coverage below has to grow with it.
+    assert sorted(containers) == [
+        "agent",
+        "maint",
+        "storage-init",
+        "workspace-root-init",
+    ]
+    for name, container in [("worker", worker), *containers.items()]:
         text = json.dumps(container)
         for token in FORBIDDEN_TOKENS:
             assert token not in text, (name, token)
@@ -305,6 +343,8 @@ def test_the_worker_and_face_a_stay_outside_the_forbidden_set() -> None:
         security = container["securityContext"]
         assert "allowPrivilegeEscalation" not in security, name
         assert not security.get("privileged"), name
+        if security.get("runAsUser") == 0:
+            assert security.get("capabilities") == ROOT_FILE_FACE_CAPS, name
 
 
 def test_the_retired_socket_rollback_lever_is_gone() -> None:
@@ -606,7 +646,9 @@ def test_the_worker_is_on_the_agent_grant_path_and_carries_no_agent_secret() -> 
     # image's `USER 65534:65534` alone would leave it answering "unknown".
     assert container["securityContext"]["runAsUser"] == 65534
     assert container["securityContext"]["runAsGroup"] == 65534
-    assert "capabilities" not in container["securityContext"]
+    # Review round 2 (item 4): the BND is declared empty with `drop: [ALL]`
+    # rather than inherited from the runtime default (`CapBnd` was 0x…a80425fb).
+    assert container["securityContext"]["capabilities"] == {"drop": ["ALL"]}
     assert "E2B_C3_AGENT_TOKEN" not in env
     assert "E2B_C3_AGENT_URL" not in env
     assert "E2B_C3_AGENT_TOKEN" not in WORKER_MANIFEST.read_text(encoding="utf-8")

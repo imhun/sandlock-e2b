@@ -261,10 +261,16 @@ spec:
             # supervisor -- there is no "go ahead" step, and this pod still
             # holds no capability (its `CapEff` is 0).
             #
-            # `spawn` remains the shipped default in the code and is the
-            # rollback: set this key back to `spawn` and the worker uses the
-            # image's file-capability `e2b-slot-spawn` as before (Task 4 removes
-            # that binary; Task 7 removes the fallback).
+            # `spawn` is still the code's default, and it is the rollback --
+            # but only with the file-capable worker image, exactly like the
+            # `socket` lever. `spawn` needs `helpers.slot_spawner`
+            # (`envd_service/route_b.py`), i.e. the file-capability
+            # `e2b-slot-spawn` binary that Task 4 removed from this image;
+            # without it `privileged_starter` is false and route B simply goes
+            # unavailable (`envd_service/executors/sandlock.py`) -- not the
+            # pre-C3 behaviour. So flipping this key alone is a *half* revert:
+            # the full revert is the manifest **and** the image, see
+            # `docs/c3-privilege-relocation.md` §14.8.
             #
             # ⚠ Do **not** give this pod `hostPID`. The agent's reverse lookup
             # discriminates two workers on one node by the slot child's `NSpid`
@@ -590,17 +596,29 @@ spec:
           # root-in-userns CAP_NET_BIND_SERVICE covers port 53 -- the pod-level
           # window was deleted in N5 (2026-09-17) and is not needed.
           securityContext:
-            # C3 (Task 4 slice B): **the BND declaration is gone entirely.**
+            # C3 (Task 4 slice B): the worker's bounding set is the **empty
+            # set**, and this is now *literally* true -- `drop: [ALL]` with
+            # nothing added, so `CapBnd=0`.
             # Track F/C1 kept `SETUID`/`SETGID` here because the image's
             # file-capability `e2b-slot-spawn` was refused at `exec` unless its
             # caps were a subset of the container's bounding set. That binary
             # is no longer in the image (nor is `e2b-maint`), and the slot's
-            # identity is now granted by the agent, so the worker's BND is the
-            # empty set -- which is the property 判据 2/15 pin. (`SETUID`/
-            # `SETGID` are what `e2b-slot-spawn` needed; every other cap was
-            # already gone: CHOWN/DAC_OVERRIDE moved to the C1 broker in wave 2,
-            # NET_BIND_SERVICE had no user after N5 moved the :53 bind into each
-            # sandbox's own netns.)
+            # identity is now granted by the agent, so nothing in this worker
+            # needs a capability -- which is the property 判据 2/15 pin.
+            # (`SETUID`/`SETGID` are what `e2b-slot-spawn` needed; every other
+            # cap was already gone: CHOWN/DAC_OVERRIDE moved to the C1 broker in
+            # wave 2, NET_BIND_SERVICE had no user after N5 moved the :53 bind
+            # into each sandbox's own netns.)
+            #
+            # Review round 2 (item 4): the earlier shape was "no `capabilities:`
+            # block at all". That reads as a BND of zero in the *review text*
+            # but not on the node -- omitting the block inherits the runtime's
+            # **default** bounding set, and the cluster read `CapBnd=0x…a80425fb`
+            # (`docs/deploy-clusters.md` §7.9/§7.10). Declaring the drop makes
+            # the target and the reading agree (`CapEff` was already 0).
+            capabilities:
+              drop:
+                - ALL
             #
             # The explicit, non-root identity below is **load-bearing for
             # C3's file operations**, not a restatement of the image's `USER`:

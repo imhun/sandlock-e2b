@@ -271,6 +271,32 @@ spec:
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
           securityContext:
             runAsUser: 0
+            # Review round 2 (item 1): this container came over from the
+            # retired broker's `workspace-root-init` verbatim, `runAsUser: 0`
+            # and **no** `capabilities:` block -- i.e. the runtime's default
+            # bounding set, the same widening `storage-init` was fixed for in
+            # round 1. The set below is face B's, and it is what *this* script
+            # actually uses, one verb at a time:
+            #   * `CHOWN`        -- the hand-over itself (`chown 65534:65534`
+            #                       on `_snapshots` / `_runtime` / `.checkpoints`);
+            #   * `DAC_OVERRIDE` -- `mkdir -p` into a directory the process
+            #                       does not own on the idempotent re-run (a
+            #                       second node on the shared mount, or a
+            #                       half-initialised export). Measured the same
+            #                       way as `storage-init`: as uid 0 with only
+            #                       `CHOWN`+`FOWNER`, `mkdir -p <65534-owned
+            #                       dir>/<new>` is `EACCES`;
+            #   * `FOWNER`       -- `chmod 0755`/`0711`/`1777` on directories
+            #                       this process does not own.
+            # NNP is still absent (the kernel must not ignore face A's file
+            # capabilities), and the forbidden tokens stay off the file.
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
           command:
             - /bin/sh
             - -c

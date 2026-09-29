@@ -244,7 +244,7 @@ def test_stack_quota_agent_owns_the_capability_behind_a_profile() -> None:
 
 
 def test_k8s_worker_drops_sys_admin_and_declares_the_broker_caps() -> None:
-    """C3 Task 4 slice B: the worker's bounding set is **empty**.
+    """C3 Task 4 slice B (amended in review round 2): the worker's BND is empty.
 
     Track F/C1 declared `SETUID`/`SETGID` here for one reason only: the image's
     file-capability `e2b-slot-spawn` is refused at `exec` unless its caps are a
@@ -254,11 +254,23 @@ def test_k8s_worker_drops_sys_admin_and_declares_the_broker_caps() -> None:
     agent's, so the declaration is gone. `CHOWN`/`DAC_OVERRIDE` moved out in C1
     (the per-node broker) and `NET_BIND_SERVICE` had no user after N5 moved the
     `:53` bind into each sandbox's own netns.
+
+    Review round 2 (item 4): "no `capabilities:` block" was the old pin, but an
+    absent block inherits the runtime's **default** bounding set -- the cluster
+    read `CapBnd=0x…a80425fb`, not zero (`docs/deploy-clusters.md` §7.9/§7.10).
+    The manifest now declares `drop: [ALL]` with nothing added, so the target
+    ("BND 空集") is literally true; the pin asserts the drop, not the absence.
     """
     assert 'add: ["SYS_ADMIN"' not in K8S_WORKER
     assert "\n                - SYS_ADMIN\n" not in K8S_WORKER
-    # No capabilities block at all -- not an empty `add:`, an absent one.
-    assert "capabilities:" not in K8S_WORKER
+    # `drop: [ALL]` and nothing added -- an *empty* bounding set, literally,
+    # not the runtime default an absent block would leave behind.
+    assert (
+        "            capabilities:\n"
+        "              drop:\n"
+        "                - ALL\n"
+    ) in K8S_WORKER
+    assert "\n              add:" not in K8S_WORKER
     for gone in (
         "\n                - SETUID\n",
         "\n                - SETGID\n",
@@ -727,10 +739,11 @@ def test_k0s_overlay_moves_the_seccomp_root_to_the_k0s_kubelet_dir() -> None:
     pod_security = pod_spec.get("securityContext", {})
     assert "runAsUser" not in pod_security
     assert "runAsGroup" not in pod_security
-    # C3 Task 4 slice B: no capability block at all -- the image's file-cap
-    # binaries are gone and both privileged jobs are the agent's, so the
-    # container's bounding set is the empty set (判据 2/15).
-    assert "capabilities" not in security
+    # C3 Task 4 slice B (review round 2 item 4): the image's file-cap binaries
+    # are gone and both privileged jobs are the agent's, so the container's
+    # bounding set is the empty set (判据 2/15) -- declared, so it does not
+    # silently inherit the runtime's default BND.
+    assert security["capabilities"] == {"drop": ["ALL"]}
     env = {e["name"]: e.get("value") for e in container["env"]}
     assert env["E2B_PRIV_HELPER_TRANSPORT"] == "agent"
     assert "E2B_PRIV_HELPER_SOCKET" not in env
