@@ -88,6 +88,13 @@ _fleet_keys_reported: set[str] = set()
 #: refusal (unchanged, 503) must not flood the log at heartbeat cadence.
 _unresolvable_nodes_reported: set[str] = set()
 
+#: ``(node, reason)`` pairs whose worker-identity mismatch/unverifiability has
+#: already been reported, so one mispinned fleet does not print a line every
+#: five seconds per worker (the same once-per-node discipline as the two sets
+#: above). A node whose identity is verified again is dropped from it, so a
+#: later regression is reported again.
+_unverified_identity_reported: set[tuple[str, str]] = set()
+
 
 def _require_internal_key(request: Request) -> str:
     """The credential half: a valid ``X-Internal-Key``, else 401."""
@@ -179,34 +186,56 @@ def _verified_worker_identity(
     refuses by name (the fail-closed posture the ruling prescribes).
     """
     source = getattr(request.app.state, "worker_identity_source", None)
+    configured = bool(getattr(source, "configured", source is not None))
     trusted = source.identity_for(node_id) if source is not None else None
     claimed_uid, claimed_gid = claimed
     if claimed_uid is None and claimed_gid is None:
         # An older worker reports nothing; the trusted answer (when there is
         # one) is still the deployment's fact and is what gets stored.
+        if trusted is not None:
+            _unverified_identity_reported.discard((node_id, "no-source"))
+            _unverified_identity_reported.discard((node_id, "no-pin"))
         return trusted if trusted is not None else (None, None)
-    if trusted is None:
-        logger.warning(
-            "internal API: node %s reported worker identity %s, but this "
-            "control plane has no trusted source for it (the k8s lane reads the "
-            "worker pod's securityContext; other shapes have none): recording "
-            "no identity -- the file operations that need one will refuse by "
-            "name",
-            node_id,
-            (claimed_uid, claimed_gid),
+    if trusted is not None and trusted == (claimed_uid, claimed_gid):
+        # Verified: forget any earlier complaint about this node, so a later
+        # regression is reported again.
+        _unverified_identity_reported.discard((node_id, "no-source"))
+        _unverified_identity_reported.discard((node_id, "no-pin"))
+        return trusted
+    # Unverifiable from here on. Two different operator problems, and the log
+    # says which -- once per node each, because the heartbeat runs every few
+    # seconds (the ``_unresolvable_nodes_reported`` discipline).
+    if trusted is None and not configured:
+        reason = "no-source"
+        message = (
+            "internal API: node %s reported worker identity %s, but this shape "
+            "has no trusted source for it (only the k8s lane can verify a "
+            "report): recording no identity -- the file operations that need "
+            "one will refuse by name"
         )
-        return None, None
-    if trusted != (claimed_uid, claimed_gid):
-        logger.warning(
+        arguments: tuple = (node_id, (claimed_uid, claimed_gid))
+    elif trusted is None:
+        reason = "no-pin"
+        message = (
+            "internal API: node %s reported worker identity %s, but its pod "
+            "spec pins no runAsUser/runAsGroup (the worker relies on the "
+            "image's USER, which the API cannot read): recording no identity "
+            "-- pin both in the worker manifest, or the file operations that "
+            "need one will refuse by name"
+        )
+        arguments = (node_id, (claimed_uid, claimed_gid))
+    else:
+        reason = "mismatch"
+        message = (
             "internal API: node %s reported worker identity %s, but the "
             "deployment pins %s: refusing the reported value (a worker does not "
-            "name the identity its privileged steps act as)",
-            node_id,
-            (claimed_uid, claimed_gid),
-            trusted,
+            "name the identity its privileged steps act as)"
         )
-        return None, None
-    return trusted
+        arguments = (node_id, (claimed_uid, claimed_gid), trusted)
+    if (node_id, reason) not in _unverified_identity_reported:
+        _unverified_identity_reported.add((node_id, reason))
+        logger.warning(message, *arguments)
+    return None, None
 
 
 def _resolve_node(request: Request, node_id: str) -> NodeEndpoint | None:

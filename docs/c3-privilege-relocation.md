@@ -670,6 +670,18 @@ worker 侧的特权面并没有真的消失。**(d) 是唯一的例外，因为�
    `tar.add(workspace, recursive=True)`（整棵树 + gzip）与 import 的 `write_bytes` +
    `_extract_sandbox_archive`。它们**不触达 agent 层**、也不是 Task 4 引入的，但与 I-2/`/metrics`
    同类；slice B 或 Task 7 的清扫可以顺手把它们移到 `asyncio.to_thread`。
+8. **k8s：worker pod 必须显式 pin 身份**（第五轮评审补记，**开关打开前必须先落地**）：
+   `control_plane/worker_identity_source.py` 只在 worker pod 的 `securityContext` 里**读到**
+   `runAsUser`/`runAsGroup` 时才认为可信。`deploy/k8s/worker.yaml` 现在**没有**这两项（靠镜像
+   `USER 65534:65534` 生效），于是 pod spec 里没有值、CP 的可信来源返回 `None`、节点记录不到身份，
+   而需要身份的**每一个**文件操作都会以具名 503 拒绝。⇒ slice B 的清单里加一条：在 worker 容器
+   （必要时 pod 级，以覆盖 init 容器）显式写 `runAsUser: 65534` + `runAsGroup: 65534`。
+9. **compose（含 `deploy/stack/docker-compose.prod.yml`，D17 在范围内）：今天没有可信来源**（第五轮
+   评审补记）：compose 文件控制面看不到，`build_worker_identity_source` 只能给
+   `NoWorkerIdentitySource` ⇒ 该车道的文件操作同样 fail closed。要让它可用，选一条并在 slice B 落地：
+   ① **推荐**：给 face B（`c3-agent-maint`，目前**没有** `pid: host`；face A `c3-agent` 已有）加
+   `pid: host`，走 D21 选项 2 —— agent 从内核读 worker 进程的 uid/gid（这条**同时**覆盖 k8s，
+   k8s 侧 face B 本来就有 pod 级 `hostPID`）；② 显式裁定该形态"不提供文件操作"。
 
 ## 12. 结论
 

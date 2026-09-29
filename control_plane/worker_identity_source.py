@@ -43,6 +43,12 @@ logger = logging.getLogger(__name__)
 class WorkerIdentitySource(Protocol):
     """A trusted answer to "which uid/gid does this worker run as?"."""
 
+    #: Whether this *shape* has a trusted source at all. False for a deployment
+    #: that can never answer (compose today), True for one whose source exists
+    #: even when this particular pod pins nothing -- the two are different
+    #: operator problems and are reported differently.
+    configured: bool
+
     def identity_for(self, node_id: str) -> tuple[int, int] | None:
         """``(uid, gid)`` of the worker pod, or ``None`` when unknowable."""
         ...
@@ -55,12 +61,16 @@ class NoWorkerIdentitySource:
     identity and the operations that need one refuse by name.
     """
 
+    configured = False
+
     def identity_for(self, node_id: str) -> tuple[int, int] | None:
         return None
 
 
 class StaticWorkerIdentitySource:
     """A fixed table (tests, embedders, an operator-pinned fleet)."""
+
+    configured = True
 
     def __init__(self, identities: Mapping[str, tuple[int, int]]) -> None:
         self._identities = dict(identities)
@@ -82,6 +92,8 @@ class K8sWorkerIdentitySource:
     ) -> None:
         self._namespace = namespace
         self._client = client or self._in_cluster_client()
+
+    configured = True
 
     @staticmethod
     def _in_cluster_client():

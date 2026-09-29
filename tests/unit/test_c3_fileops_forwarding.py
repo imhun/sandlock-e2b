@@ -440,6 +440,114 @@ async def test_a_shape_without_a_trusted_source_records_no_identity(
     assert agent.calls == []
 
 
+# ------------------------- the two "cannot verify" messages (fifth review, 1)
+
+
+async def _heartbeat(app) -> int:
+    async with _client(app) as client:
+        resp = await client.post(
+            f"/internal/nodes/{NODE_A}/heartbeat",
+            headers={"X-Internal-Key": KEY_A},
+            json={"workerUID": WORKER_UID, "workerGID": WORKER_GID},
+        )
+    return resp.status_code
+
+
+def _identity_warnings(caplog) -> list[str]:
+    return [
+        record.message
+        for record in caplog.records
+        if record.name == "control_plane.api.internal"
+        and "worker identity" in record.message
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_unverifiable_identity_is_reported_once_per_node(
+    workspace, monkeypatch, caplog
+) -> None:
+    """Fifth review 1: one line per node, not one per 5-second heartbeat.
+
+    The shipped k8s shape configures the source but pins nothing on the worker
+    pod, so it cannot verify -- and the heartbeat runs every few seconds for
+    every worker. The once-per-node discipline is the one
+    ``_unresolvable_nodes_reported`` already uses.
+    """
+    from control_plane.api import internal as internal_module
+
+    monkeypatch.setattr(internal_module, "_unverified_identity_reported", set())
+    shape = _C3Shape(workspace)
+    app = _app(
+        shape,
+        client=_StubAgentClient(),
+        # A k8s-shaped source whose pod pins nothing: "configured, but no pin".
+        worker_identity=_k8s_source(
+            lambda request: httpx.Response(200, json=_pod_spec(None, None))
+        ),
+    )
+    caplog.set_level("WARNING", logger="control_plane.api.internal")
+    caplog.clear()
+    # One registration and two heartbeats: the line is owed once, not three
+    # times (and in production the heartbeat is every ~5 s, forever).
+    await _enroll(app)
+    assert await _heartbeat(app) == 204
+    assert await _heartbeat(app) == 204
+
+    assert _identity_warnings(caplog) == [
+        f"internal API: node {NODE_A} reported worker identity "
+        f"({WORKER_UID}, {WORKER_GID}), but its pod spec pins no "
+        "runAsUser/runAsGroup (the worker relies on the image's USER, which the "
+        "API cannot read): recording no identity -- pin both in the worker "
+        "manifest, or the file operations that need one will refuse by name",
+    ]
+    node = app.state.nodes.get(NODE_A)
+    assert (node.worker_uid, node.worker_gid) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_shape_with_no_source_at_all_says_that_instead(
+    workspace, monkeypatch, caplog
+) -> None:
+    """"No source in this shape" and "the pod pins nothing" are different problems."""
+    from control_plane.api import internal as internal_module
+
+    monkeypatch.setattr(internal_module, "_unverified_identity_reported", set())
+    shape = _C3Shape(workspace)
+    app = _app(
+        shape, client=_StubAgentClient(), worker_identity=NoWorkerIdentitySource()
+    )
+    caplog.set_level("WARNING", logger="control_plane.api.internal")
+    caplog.clear()
+    await _enroll(app)
+    assert await _heartbeat(app) == 204
+    assert await _heartbeat(app) == 204
+
+    assert _identity_warnings(caplog) == [
+        f"internal API: node {NODE_A} reported worker identity "
+        f"({WORKER_UID}, {WORKER_GID}), but this shape has no trusted source "
+        "for it (only the k8s lane can verify a report): recording no identity "
+        "-- the file operations that need one will refuse by name",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_verified_identity_logs_nothing(
+    workspace, monkeypatch, caplog
+) -> None:
+    """The happy path stays quiet -- and a later regression is reported again."""
+    from control_plane.api import internal as internal_module
+
+    monkeypatch.setattr(internal_module, "_unverified_identity_reported", set())
+    shape = _C3Shape(workspace)
+    app = _app(shape, client=_StubAgentClient())
+    caplog.set_level("WARNING", logger="control_plane.api.internal")
+    caplog.clear()
+    await _enroll(app)
+    assert await _heartbeat(app) == 204
+    assert _identity_warnings(caplog) == []
+    assert (NODE_A, "no-pin") not in internal_module._unverified_identity_reported
+
+
 # ------------------------------- the k8s trusted source itself (②, option 1)
 
 
