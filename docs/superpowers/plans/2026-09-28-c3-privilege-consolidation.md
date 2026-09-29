@@ -164,6 +164,19 @@ CP 变 65534 之后它会从"静默失败"变成"硬失败"，**必须走 agent 
 且**不能**设 `allowPrivilegeEscalation: false`（rootlesskit 的 `newuidmap` 会死）。
 它**不是 root**，所以不违反口径，但它是 CP pod 里唯一保留宽 seccomp 的容器，**写进文档**。
 
+> **★ D24 修订（2026-09-29，Task 5）——第 2 步的实现方式改了**：第 2 步的**判据**（"CP 侧 A 类
+> 清零；卷根建得出来、`_runtime` 删得掉"）不变，但其中的 `_volumes` 卷根**不走 agent**：Task 5
+> 的复核发现 `_volumes` 不是 CP 在那里唯一的写（`_volumes/_meta/<id>.json` 也在同一个 `0:0 755`
+> 根里），于是**两条路都必须先做一次属主交棒**；交棒既然不可省，agent 路线的剩余增量就是
+> **给 root 的 `e2b-maint` 加一条 `mkdir` 动词** + 给共享存储的 op 定一条节点寻址规则 —— 而
+> **扩 root 文件面恰是 C3 要收的那张面**。故改走本节 ① 的第一条备选（"把 `_volumes` 迁给 CP 的
+> uid 后由 CP 自己做"，§13.2/§13.5 也把它列为备选）：**`_volumes`（含 `_meta`）一次性、非递归
+> 地交给 65534**，CP 保留自己的 `mkdir` + `chmod 1777` —— 交棒之后它们是**属主操作**。
+> 完整理由、硬性质（非递归 / 幂等 / 有名有姓 / 校验）与**部署窗口复验程序**见
+> `docs/c3-privilege-relocation.md` §13.6（裁定）与 §13.6.1（程序）。判据改写：brief 的
+> "`_volumes` 的 `mkdir` 不在 CP 代码路径里" ⇒ "**CP 拥有 `_volumes`，所以它的 `mkdir`/`chmod`
+> 不需要特权**"，钉在 `tests/unit/test_c3_cp_rootless.py`。
+
 ## 4. 不变量与硬规则（每个 task 的要求都隐含包含）
 
 1. **不变量**：*谁 `fork` 槽位，谁的进程树里必须有一个能变成池 uid X 的进程。*

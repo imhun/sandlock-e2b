@@ -1383,7 +1383,11 @@ E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worke
   workspace base 顶层不新增任何名字（有单测钉住，见 2.7.5）。
 - **两个 uid 共享同一个 `_images`（必须设 `E2B_IMAGE_CACHE_OWNER_UID`）**：两套清单里
   **控制面跑 root、worker 跑 65534**（k8s 的 worker pod 继承镜像的 `USER 65534:65534`，
-  控制面 pod 覆盖镜像的 root），而两者指向同一个目录。第一版就死在这里：root 先跑
+  控制面 pod 覆盖镜像的 root），而两者指向同一个目录。**C3 Task 5 之后 k8s 这一半变了**：
+  控制面主容器是 **65534**（`deploy/k8s/control-plane.yaml`，D24），于是它和 worker 是同一个
+  uid、"谁先建"不再是问题；compose 那两条栈仍是 root 控制面（记账项，见
+  `docs/deploy-clusters.md` §7.7）。下面这段是 root 控制面形态下的实测，仍然适用于 compose。
+  第一版就死在这里：root 先跑
   （不配 registry 时控制面导出模板 tar，**必然** root 先建 `_images`）⇒ `_images` 是
   `root:root 0755`，worker 连 `<image>.lock` 与暂存树都建不出来（`PermissionError` ⇒
   该镜像解析全量失败）；反向同理（哪一方先建了 `0600` 的锁文件，另一方**永远**打不开，
@@ -1426,7 +1430,10 @@ E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worke
   **两套清单的一次性 `image-cache-init`：以 root 建 `_images`（含 `_oci`）→ `chown 65534` →
   `chmod 0755` → 最后按 `stat -c %u` 校验目录确实归 worker uid**，不合格就 `exit 1` 并把
   上面那条 `chown -R 65534:65534 <cache>` 打到 stderr。校验这一步是"能自愈就自愈、不能就
-  明确报错"的分界（实测 5 种形态，见 `tmp/zf7tail-init-behaviour.log`）：
+  明确报错"的分界（实测 5 种形态，见 `tmp/zf7tail-init-behaviour.log`）。**C3 Task 5 起
+  k8s 的这份 init 不再在控制面 pod 里**：同一个脚本、同一个校验，搬到了 agent DaemonSet 的
+  `storage-init`（`deploy/k8s/c3-agent.yaml`，它同时做 `_volumes` 的非递归交棒 —— 裁定 D24）；
+  compose 的那份仍是独立服务 `image-cache-init`：
 
   | 形态 | 结果 |
   |---|---|
@@ -1669,8 +1676,9 @@ E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worke
 7. 单测门禁：`tests/unit/test_image_cache_sharing.py`（跨进程竞争、失败不误伤、重启复用、
    `_images` 不是沙箱树、上限逐出、`nolock` 形态、两个 uid、引用钉子、真实占用口径、
    `nolock`+残留不删已发布条目、锁超时）全绿。
-8. `image-cache-init` 在每个形态都报 `image-cache-init: <dir> is owned by uid 65534`（compose
-   的 `docker compose logs image-cache-init` / k8s 的 `kubectl logs <pod> -c image-cache-init`）；
+8. 那份 cache init 在每个形态都报 `<name>: <dir> is owned by uid 65534`（compose
+   的 `docker compose logs image-cache-init` / k8s 的
+   `kubectl logs ds/e2b-c3-agent -c storage-init`，C3 Task 5 起它搬到了 agent pod）；
    若它报 `FATAL … owned by uid <n>`，按它给出的 `chown -R 65534:65534 <dir>` 执行一次再重建
    （NFS 形态在服务端执行等价动作）——这是"旧卷一次性动作"的判定点；
 9. 引用钉子 fail-closed：`0711` 的 workspace base 或不可读记录的形态下，逐出被拒绝且日志

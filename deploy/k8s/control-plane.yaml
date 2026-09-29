@@ -76,49 +76,50 @@ spec:
       # the socket through the same volume (mounted read-only at /run/buildkit).
       securityContext:
         fsGroup: 1000
-      # Z-F7 C1: this pod runs as root and exports template layout tars into
-      # ``_images/_oci/`` on the shared PVC; the worker pods (65534) extract the
-      # rootfs entries. Create the cache once with the worker's ownership before
-      # either side writes -- never 0777, since a writable rootfs cache lets a
-      # sandbox poison another sandbox's image -- and *verify* the ownership:
-      # on NFS with root_squash the chown can be refused, and a best-effort init
-      # that leaves the directory root-owned makes every image resolve on this
-      # node fail afterwards (the 65534 worker cannot create its lock file).
-      # The pod then stops in Init:Error with the exact one-time fix in its log
-      # instead of starting and failing every create.
-      # docs/production-deployment-requirements.md §2.7.1.
-      initContainers:
-        - name: image-cache-init
-          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
-          securityContext:
-            runAsUser: 0
-          command:
-            - /bin/sh
-            - -c
-            - |-
-              set -e
-              for dir in $CACHE_DIRS; do
-                mkdir -p "$dir/_oci"
-                chmod 0755 "$dir" "$dir/_oci" 2>/dev/null || true
-                chown -R 65534:65534 "$dir" 2>/dev/null ||
-                echo "image-cache-init: chown refused ($dir, NFS root_squash?) -- verifying the owner instead"
-                owner="$(stat -c %u "$dir")"
-                if [ "$owner" != "65534" ]; then
-                  echo "image-cache-init: FATAL: $dir is owned by uid $owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
-                  echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown -R 65534:65534 $dir" >&2
-                  exit 1
-                fi
-                echo "image-cache-init: $dir is owned by uid 65534"
-              done
-          env:
-            - name: CACHE_DIRS
-              value: /var/lib/e2b-sandboxes/_images
-          volumeMounts:
-            - name: shared
-              mountPath: /var/lib/e2b-sandboxes
+      # C3 Task 5 (D24): this pod carries **no root container at all**, so the
+      # two ownership jobs that used to live here moved to the agent's own pod
+      # (`deploy/k8s/c3-agent.yaml`, `storage-init`):
+      #
+      #   * Z-F7 C1's `image-cache-init` (root, chowned `_images` to 65534 and
+      #     refused to start on a root_squashed NFS that would not take it);
+      #   * the volume store's hand-over, added by D24 in its place (§3.2 step 2
+      #     says "hand A3 to the agent"; recon for this task showed `_volumes`
+      #     is not the CP's only write there -- `_volumes/_meta/<id>.json` is
+      #     inside the same `0:0 755` root -- so *both* routes need the
+      #     ownership change anyway, and the remaining delta of the agent route
+      #     is a new `mkdir` verb inside the **root** `e2b-maint` plus a new
+      #     node-addressing rule for a shared-storage op. D24 keeps the CP's own
+      #     `mkdir`/`chmod` and makes them ordinary owner operations instead.
+      #     The deviation is recorded in `docs/c3-privilege-relocation.md` §13.6).
+      #
+      # The control plane therefore has no `initContainers` left: it starts as
+      # uid 65534 (below) and every path it writes belongs to it.
       containers:
         - name: control-plane
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-control-plane-gateway:0.1.0
+          # C3 Task 5 (ruling D24 / §3.2 step 1): the control plane is the
+          # worker's uid, and that is a *measured* choice, not a symmetry:
+          # all of the platform's own directories on the shared volume are
+          # already `65534:65534`, `state/.uid_pool.lock` is `65534:65534 0600`
+          # (a different uid cannot even open it, and it is touched at startup
+          # -- the first uid allocation), and the image cache's owner is 65534,
+          # so a different uid would create cache entries it could no longer
+          # write. `runAsGroup` goes with it: a `65534:0` container would write
+          # every record with the root group.
+          #
+          # The price is real and named: CP and worker are no longer
+          # distinguishable at the filesystem layer. Buying that back is a
+          # dedicated uid plus a second migration package (§13.2 / §13.6's
+          # "三条合起来指向同一个结论"), not a side change.
+          #
+          # ⚠ The `buildkit` sidecar below is the one container in this pod that
+          # is *not* held to this: it stays uid 1000 (the image's) with
+          # `seccompProfile: Unconfined`. It is not root, so it does not break
+          # the口径, but it is the only wide-profile container left here and the
+          # plan requires it to be named rather than left implicit (§3.2).
+          securityContext:
+            runAsUser: 65534
+            runAsGroup: 65534
           ports:
             - containerPort: 3000
           # `/healthz` is the static 200 in `control_plane/app.py` -- it says

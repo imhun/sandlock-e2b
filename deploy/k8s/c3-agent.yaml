@@ -66,6 +66,116 @@ spec:
                     operator: NotIn
                     values:
                       - virtual-kubelet
+      # C3 Task 5 (D24): the platform-storage ownership jobs, moved off the
+      # control-plane pod -- §3.2 step 3's `image-cache-init`, plus the volume
+      # store's hand-over that D24 added in its place.
+      #
+      # Both are "hand a directory on the shared mount to the uid that writes
+      # it", and both need uid 0 for the same reason face B does (`chown` on
+      # this NAS goes through AUTH_SYS, which honours only uid 0):
+      #
+      #   * `_images` -- the rootfs/OCI cache. The control plane (now 65534)
+      #     exports the template layout tars into `_images/_oci/` and the
+      #     workers extract from the same root, so it has to belong to 65534
+      #     before either writes. Moved verbatim from the control-plane pod:
+      #     the recursive form is safe *there* because the shared `_images`
+      #     holds only `_oci/` (per-sandbox secrets live in the node-local
+      #     `E2B_IMAGE_CACHE_DIR`, `/var/lib/e2b-images`, whose directories the
+      #     broker's own init owns -- Task 7 retires that copy).
+      #   * `_volumes` -- the volume store. The control plane creates
+      #     `<store>/<volume_id>` and writes `<store>/_meta/<volume_id>.json`,
+      #     and with the CP at 65534 both are *owner* operations only if the
+      #     store belongs to it. D24: the hand-over is one `chown` of the store
+      #     itself, **non-recursive on purpose** -- the entries below it are the
+      #     sandbox volume data (`<id>/` and the per-sandbox quota slices),
+      #     which belong to pooled sandbox uids and must never be taken back by
+      #     a platform rollout. The recursive form is the regression this file
+      #     must not acquire.
+      #
+      # Idempotent and audible: every target is either "already belongs to uid
+      # 65534" (nothing to do -- the second node of a shared mount lands here)
+      # or "handed over", and the store's own ownership is *verified*, so an
+      # NFS `root_squash` that refuses the chown stops this pod with the exact
+      # one-time fix instead of failing later, at the first volume create,
+      # inside the control plane (which now names the same command --
+      # `control_plane.registry.volumes.VolumeRootNotOwnedError`).
+      initContainers:
+        - name: storage-init
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
+          securityContext:
+            runAsUser: 0
+          command:
+            - /bin/sh
+            - -c
+            - |-
+              set -e
+              # 1. The shared rootfs/OCI cache, before the control plane or any
+              #    worker writes it (Z-F7 C1, moved here by C3 Task 5).
+              for dir in $CACHE_DIRS; do
+                mkdir -p "$dir/_oci"
+                chmod 0755 "$dir" "$dir/_oci" 2>/dev/null || true
+                chown -R 65534:65534 "$dir" 2>/dev/null ||
+                  echo "storage-init: chown refused ($dir, NFS root_squash?) -- verifying the owner instead"
+                owner="$(stat -c %u "$dir")"
+                if [ "$owner" != "65534" ]; then
+                  echo "storage-init: FATAL: $dir is owned by uid $owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
+                  echo "storage-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $dir && chown -R 65534:65534 $dir/_oci" >&2
+                  exit 1
+                fi
+                echo "storage-init: $dir is owned by uid 65534"
+              done
+              # 2. The volume store (D24). `hand_over` moves one directory's
+              #    owner and nothing else; `_meta` is created lazily by the
+              #    control plane, so a missing one is a no-op and not a failure.
+              hand_over() {
+                target="$1"
+                if [ ! -e "$target" ]; then
+                  echo "storage-init: $target does not exist -- nothing to hand over (the control plane creates it as its owner when it first needs it)"
+                  return 0
+                fi
+                owner="$(stat -c %u "$target")"
+                mode="$(stat -c %a "$target")"
+                if [ "$owner" = "65534" ]; then
+                  echo "storage-init: $target already belongs to uid 65534 (mode $mode) -- nothing to do"
+                  return 0
+                fi
+                chown 65534:65534 "$target" 2>/dev/null ||
+                  echo "storage-init: chown refused ($target, NFS root_squash?) -- the control plane (uid 65534) cannot create or record a volume until this is done once: chown 65534:65534 $target" >&2
+                echo "storage-init: $target -> uid $(stat -c %u "$target") mode $(stat -c %a "$target") (a non-recursive hand-over; the sandbox volume data directories below it keep their pooled uids)"
+                return 0
+              }
+              volume_store="$SHARED_ROOT/_volumes"
+              if [ ! -e "$volume_store" ]; then
+                # It has to *exist* before the control plane pod starts (that
+                # pod mounts it as a subPath, and a missing subPath source
+                # leaves it in ContainerCreating), and the control plane cannot
+                # make it once it is uid 65534 unless the parent happens to be
+                # writable. The broker's `workspace-root-init` creates it today
+                # and Task 7 retires that pod, so this is where the creator
+                # lives now -- root mkdir, then the same hand-over.
+                mkdir -p "$volume_store"
+                echo "storage-init: created $volume_store (the platform's volume store)"
+              fi
+              hand_over "$volume_store"
+              hand_over "$volume_store/_meta"
+              # ...and the gate the hand-over exists for. A store that is still
+              # not 65534 after the attempt above fails *here*, loudly, rather
+              # than as a bare EACCES in the control plane later.
+              store_owner="$(stat -c %u "$volume_store")"
+              if [ "$store_owner" != "65534" ]; then
+                echo "storage-init: FATAL: $volume_store is owned by uid $store_owner, not the control-plane uid 65534: the control plane creates every volume as <store>/<volume_id> and writes <store>/_meta/<volume_id>.json, so the first volume create would fail with EACCES" >&2
+                echo "storage-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $volume_store  (non-recursive: the volume data directories below it belong to pooled sandbox uids)" >&2
+                exit 1
+              fi
+              echo "storage-init: $volume_store is owned by uid 65534 (the volume data directories below it are left alone)"
+          env:
+            - name: CACHE_DIRS
+              value: /var/lib/e2b-sandboxes/_images
+            - name: SHARED_ROOT
+              value: /var/lib/e2b-sandboxes
+          volumeMounts:
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
       containers:
         # ------------------------------------------------------------------
         # face A：身份授予（非 root，两个 file capability）

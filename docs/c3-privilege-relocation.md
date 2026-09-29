@@ -836,11 +836,49 @@ CP 主容器身份实测 `uid=0(root) gid=0(root) groups=0(root),1000`（那个 
 ```
 
 **① `_volumes` 根 = `0:0 755` ⇒ A3 确认归 A 类。** 非 root 的 CP 在 `755 root:root` 下建不了
-`<volume_id>` 子目录（`registry/volumes.py:224` 的 `mkdir` 会 EACCES）。修法二选一：把 `_volumes`
-迁给 CP 的 uid（一次性，`migrate-state-owner.sh` 同形），或让 agent 代建。
+`<volume_id>` 子目录（`registry/volumes.py:224` 的 `mkdir` 会 EACCES）。**Task 5 用 D24 收口
+（见下节的 ④ 与裁定）**。
 
 > 附带观测：这个集群的 `_volumes` 里**只有 `_meta`，一个卷都没建过** —— 说明这条路径在生产上
 > 还没被走过，"首个挂载沙箱当属主"（`_ensure_shared_volume_root`）那套语义**也还没被生产验证过**。
+
+**④（2026-09-29，Task 5 的复核 —— 它推翻了"二选一里 agent 那条更省"的直觉）**：`_volumes`
+不是 CP 在那里的**唯一**写。`VolumeRegistry._write_record` 把卷记录写成
+`<store>/_meta/<volume_id>.json`（`registry/volumes.py:245` 的 `_record_path`），而建 `_meta`
+的是 `write_text_atomically` 的 `directory.mkdir(parents=True, exist_ok=True)` —— "谁第一次写谁
+当属主"，今天就是 root CP。所以**两条路都必须先做一次属主交棒**：只把 `<volume_id>` 的 `mkdir`
+交给 agent，记录那一半仍然 EACCES。§3.2 的"**不需要磁盘迁移**"因此是不完整的 —— 本节那次实测
+只 stat 了 `_volumes` 根，没有 stat `_meta`。
+
+**★ D24 裁定（2026-09-29，Task 5）：走 ① 的第一条修法 —— 把 `_volumes` 一次性、非递归地交给
+CP 的 uid（65534），CP 保留自己的 `mkdir` + `chmod 1777`。**
+
+理由（也是为什么这是对 §3.2 **字面**的有意偏离 —— §3.2 第 2 步写的是"把 CP 剩下的 A 类动作
+交给 agent"）：
+
+1. **交棒既然不可省，agent 路线的剩余增量就全是净成本**：给 root 的 `e2b-maint` 加一条
+   **`mkdir` 动词**，再给共享存储上的那个 op 定一条"发给哪个节点的 agent"的规则（卷记录的
+   `node_id` 是 `local`，而 CP 是按节点寻址 agent 的 —— 硬规则 3 不允许从请求体里拿地址）。
+   新动词跑的正是 **root** 文件面，**扩的恰是 C3 要收的那张面**。D24 两条都不需要。
+2. **判据照样成立**：交棒之后 CP 的 `mkdir`/`chmod` 是**属主操作**，不是特权操作 ——
+   §3.2 第 2 步的判据（"CP 侧 A 类清零；卷根建得出来、`_runtime` 删得掉"）说的是**结果**。
+   `_runtime/<id>`（`0700 65534`）同理：CP 就是它的属主，§13.7 的探针早已量到
+   `A-owner: ok (same uid means no privilege needed)`。
+3. **它是计划自己的备选**：① 的"把 `_volumes` 迁给 CP 的 uid 后由 CP 自己做"、§13.2 的
+   "B 类只需要一个稳定的非 root uid"、§13.5 的"A3 与 A1/A4 一起交给 agent，**或一次性迁属主**"。
+
+**⚠ 两条硬性质（写进实现与钉子）**：
+
+- **非递归是这条不变量本身**：`_volumes` 下面挂着卷数据目录与每沙箱配额切片，属主是**池 uid**。
+  `chown -R` 会在**每次 agent 滚动**（文档里的升级步骤就会滚它）把它们抢回 65534。
+- **幂等且有名有姓**：交棒由 agent 的 `storage-init`（`deploy/k8s/c3-agent.yaml`，每个节点一次）
+  做，每条目标要么 `already belongs to uid 65534`（共享挂载上第二个节点落在这里）要么
+  `handed over`，并且**校验** `_volumes` 根最终的属主 —— NFS `root_squash` 拒绝交棒时 pod 停在
+  init 并打出那条一次性命令，而不是等到第一次建卷才在 CP 里报 EACCES。CP 侧对应的具名失败是
+  `control_plane.registry.volumes.VolumeRootNotOwnedError`（同一句命令）。
+- **判据改写**（brief 的第三条）："`_volumes` 的 `mkdir` 不在 CP 代码路径里" ⇒
+  **"CP 拥有 `_volumes`，所以它的 `mkdir`/`chmod` 不需要特权"**，钉在
+  `tests/unit/test_c3_cp_rootless.py`（清单 + 动词白名单 + 具名失败三处）。
 
 **② `.uid_pool.lock = 65534:65534 0600` ⇒ 换 uid 会直接打断 uid 池。**
 `uid_pool.py::_open_reservation_lock` 是 `os.open(path, O_RDWR | O_CREAT, 0o600)`；文件已存在时
@@ -860,11 +898,98 @@ CP 主容器身份实测 `uid=0(root) gid=0(root) groups=0(root),1000`（那个 
 | 其它 uid | 建完 chown 给 65534 之后**自己也写不了了** ⇒ 镜像缓存直接坏 ✘ |
 
 **三条合起来指向同一个结论**：**CP 非 root 的最省事选择是直接用 65534**（与 worker 同 uid）。
-两条 B 类路径（平台目录、镜像缓存）会照常工作；A3 与 A1/A4 一起交给 agent，或一次性迁属主。
+两条 B 类路径（平台目录、镜像缓存）会照常工作；A3 与 A1/A4 一起交给 agent，或一次性迁属主
+（**Task 5 选了后者，D24**；A1/A4 是 `local://` 车道，不在 C3 覆盖内）。
 
 代价是 **CP 与 worker 在文件系统层面不可区分**。要避免，就得做一次真正的迁移：给 CP 专属 uid
 + 迁 `_volumes`（可能还要 `_images`/`_secrets`/`_snapshots`/`_templates`/`_builds`）
 + 改 `.uid_pool.lock` 与 image resolver 的共享模型。**这不是顺手改，是一个独立的工作包。**
+
+#### 13.6.1 部署窗口的复验程序（Task 5 写下，**未执行**）
+
+上面的表是 **2026-09-28 的基线**（CP 还是 `uid=0`）。Task 5 把 CP 换成 65534 之后，同一张表要
+**在部署窗口里按下面的步骤重新量一遍** —— 那才是"CP=65534 后仍可写"的证据。真机由 controller
+与用户协调，本节只写程序（**不含任何写操作，除了第 4 步那次显式的、一次性的交棒**）。
+
+0. **先认集群**（`docs/deploy-clusters.md` §2 的自检；不加 `KUBECONFIG` 会打到另一套 ACK）：
+
+   ```bash
+   deploy/scripts/open-cluster-tunnel.sh
+   export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+   ```
+
+1. **清单形态生效**（判据 8 的真机臂）：
+
+   ```bash
+   kubectl -n sandlock get deploy control-plane \
+     -o jsonpath='{.spec.template.spec.initContainers}{"\n"}{range .spec.template.spec.containers[*]}{.name}{" "}{.securityContext}{"\n"}{end}'
+   ```
+
+   期望：`initContainers` 是空的（`image-cache-init` 已经搬去 agent 的 pod）；`control-plane`
+   那一行是 `{"runAsGroup":65534,"runAsUser":65534}`；`buildkit` 仍在且是
+   `{"seccompProfile":{"type":"Unconfined"}}`（**保留项，点名**）。
+
+2. **交棒发生了没有**（agent 侧，每个节点一次）：
+
+   ```bash
+   kubectl -n sandlock logs ds/e2b-c3-agent -c storage-init --tail=60
+   ```
+
+   期望：`/var/lib/e2b-sandboxes/_images` 与 `/var/lib/e2b-sandboxes/_volumes` 各一行
+   `already belongs to uid 65534`（已交棒）或 `handed over`（本次交的），最后一行是
+   `... _volumes is owned by uid 65534`。**看到 `FATAL` 就停**：那条日志带着一次性命令。
+
+3. **属主表复量**（本节那张表的 Task 5 版；判据"CP 侧 A 类清零"）：
+
+   ```bash
+   for pod in $(kubectl -n sandlock get pod -l app=control-plane -o name); do
+     echo "== $pod"
+     kubectl -n sandlock exec "$pod" -c control-plane -- sh -c '
+       for p in workspaces _volumes _volumes/_meta _images _secrets _snapshots _templates _builds state; do
+         stat -c "%n %u:%g %a" "/var/lib/e2b-sandboxes/$p"
+       done
+       id'
+   done
+   ```
+
+   期望：`id` 是 `uid=65534 gid=65534`；`_images`/`_secrets`/`_snapshots`/`_templates`/`_builds`/
+   `state` 是 `65534:65534`；**`_volumes` 与 `_volumes/_meta` 必须是 `65534:65534`**（D24 的
+   直接判据；它们是 `0:0` 就是交棒没做，回到第 2 步）。`_volumes/<vol_id>/` 若已存在，**必须
+   仍是它的池 uid**（非递归的反面证据）。
+
+4. **`.uid_pool.lock` 可开**（§13.6② 的回归，启动期就会碰的那一格）：
+
+   ```bash
+   kubectl -n sandlock exec deploy/control-plane -c control-plane -- \
+     python3 -c "import os; os.close(os.open('/var/lib/e2b-sandboxes/state/.uid_pool.lock', os.O_RDWR)); print('uid_pool.lock: ok')"
+   ```
+
+   期望：`uid_pool.lock: ok`（不是 `PermissionError`）。
+
+5. **两条真实写路径各走一次**（判据"卷根建得出来"）：
+
+   ```bash
+   # 卷：CP 以 65534 在 _volumes 下建 <vol_id>，并写 _volumes/_meta/<vol_id>.json
+   curl -sS -X POST -H "X-API-Key: $E2B_API_KEY" -H 'Content-Type: application/json' \
+     -d '{"name":"c3-task5-window"}' http://<入口>/volumes
+   # 建箱：走 deployment_smoke（它同时覆盖 spread / 命令 / 文件 / 卷 / 配额）
+   E2B_API_URL=http://<入口> E2B_SANDBOX_URL=http://<入口> E2B_API_KEY=$E2B_API_KEY \
+     python deploy/scripts/deployment_smoke.py
+   ```
+
+   期望：卷返回 `volumeID`，盘上是 `65534:65534 1777` 的目录 + `_meta` 记录；`deployment_smoke`
+   全绿。**任一格不符就停在那里**（下一次 CP 滚动之前把属主改回来）。
+
+   ⚠ 顺带把 **`Template.build` 也走一次**：控制面读 buildkit 的 unix socket，靠的是 pod 级
+   `fsGroup: 1000` 给的**组位**（socket 由 rootless buildkitd 以 uid 1000 建在那个 emptyDir
+   里）—— 从前 root 是靠 `CAP_DAC_OVERRIDE` 读的，现在 CP 是 65534，走的就是那条组位。
+   socket 读不到时 `Template.build` 会直接失败（不是静默），所以这一格只需要有一条成功记录。
+
+6. 结果回填 `docs/deploy-clusters.md` §7（现状节 + 发版记录），与 §13.6 这张表逐项对照。
+
+> ⚠ 第 3 步的期望**不是**"所有条目都 65534"：`_volumes/<vol_id>/` 属于池 uid，这正是
+> 非递归那条硬性质的现场证据。把它也写进期望值，否则下一次交棒改成 `chown -R` 时这张表
+> 看不出来。
 
 ### 13.7 共享记录面的实测（`state/**`）—— 同一类坑还有几个
 

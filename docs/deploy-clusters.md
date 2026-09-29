@@ -441,6 +441,41 @@ C3 Task 3 slice B 报告 §4（`open-cluster-tunnel.sh` → `KUBECONFIG=tmp/k0s/
 > 副本 worker，两条都会"全绿但什么都没测到"。它们必须在
 > `deploy/compose/docker-compose.multinode.yml`（3 worker 同机，已加 `c3-agent` 服务）上跑。
 
+### 7.7 C3 Task 5 的 CP 无 root（**仓库已落，集群未上线**）
+
+**现状（未变）**：集群上的 control-plane pod 仍是 §7 那一版 —— 主容器以 **`uid=0`** 跑，
+pod 里有一个 `runAsUser: 0` 的 `image-cache-init`，盘上 `_volumes` 是 **`0:0 755`**（§13.6
+那张表就是在这个形态下量的）。
+
+**仓库现状（下一次上线会带什么）**：
+
+- **CP 主容器 `runAsUser: 65534` + `runAsGroup: 65534`**（`deploy/k8s/control-plane.yaml`）。
+  取值是量出来的，不是对称：平台自己的目录已经是 65534、`state/.uid_pool.lock` 是
+  `65534:65534 0600`（换 uid 连开都开不了，而它在启动期就被碰）、镜像缓存的属主也是 65534。
+- **CP pod 里没有 root 容器了**：`initContainers` 为空，`image-cache-init` 搬到了 agent
+  自己的 pod（`deploy/k8s/c3-agent.yaml` 的 `storage-init`，root，与面 B 同一个理由：这台
+  NAS 的 `chown` 走 AUTH_SYS，只认 uid 0）。**`buildkit` sidecar 是点名保留的例外**：仍是
+  镜像的 uid 1000 + `seccompProfile: Unconfined`，且**不能**加
+  `allowPrivilegeEscalation: false`（rootlesskit 的 `newuidmap` 会死）。它不是 root，
+  不违反口径，但它是这个 pod 里唯一保留宽 profile 的容器。
+- **卷存储的属主交棒（裁定 D24）**：`storage-init` 在**每个节点**上做一次
+  `chown 65534:65534 _volumes`（以及已存在的 `_volumes/_meta`），**非递归**（它下面的卷数据
+  目录与每沙箱切片属于池 uid，`chown -R` 会在每次 agent 滚动时把它们抢回来），幂等且有名字
+  （`already belongs to uid 65534` / `handed over`），并**校验**最终属主 —— 拒绝时 pod 停在
+  init 并打印一次性命令。D24 的理由、偏离 §3.2 字面的说明与**部署窗口复验程序**写在
+  `docs/c3-privilege-relocation.md` §13.6（裁定）与 §13.6.1（程序）。
+- **CP 侧的具名失败**：`VolumeRegistry.create` 在属主不对时抛
+  `VolumeRootNotOwnedError`，消息里带同一条 `chown 65534:65534 ...`（不再是裸 `EACCES`）。
+- **compose 车道本任务未动**（记账项）：那两条栈的 control-plane 仍以 root 跑，它们的
+  `image-cache-init` 本来就是**独立服务**（§13.3 判定"形态已经是对的"），而 Task 5 的清单
+  判据是 **k8s 的 pod**。要让 compose 也收敛，是同一套交棒 + 同一条 `runAsUser` 的独立改动。
+
+**⏳ 待部署窗口执行（判据 8 的真机臂）**：**先把 agent 滚起来**（`storage-init` 把 `_volumes`
+交给 65534），**再滚 control-plane** —— 顺序反了也不会坏（交棒幂等、且 CP 只在**用户建卷**时
+才需要它），但反过来时第一次建卷可能撞上 `VolumeRootNotOwnedError`（有名有姓，按它给的命令
+处理即可）。随后跑 `docs/c3-privilege-relocation.md` §13.6.1 的六步复验，并把结果回填到本节
+与 §13.6 的那张表。**本行待该窗口完成后回填结果。**
+
 ## 8. 改部署的入口
 
 ```bash

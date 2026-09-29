@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import threading
@@ -55,6 +56,26 @@ def _widen_ancestors_for_tenant_uids(volume_root: Path) -> None:
 
 class UnknownVolumeError(KeyError):
     pass
+
+
+class VolumeRootNotOwnedError(RuntimeError):
+    """The volume store is not writable by this control plane's own uid.
+
+    C3 Task 5 (ruling **D24**): the control plane runs as **65534** and creates
+    every volume as ``<store>/<volume_id>`` — an ordinary owner operation, not
+    a privileged one — plus the record at ``<store>/_meta/<volume_id>.json``.
+    The store's ownership is therefore a *deployment pre-condition*: it is
+    handed over to 65534 once, **non-recursively** (the directories below it
+    are sandbox volume data owned by pooled sandbox uids), by the agent's
+    ``storage-init`` (``deploy/k8s/c3-agent.yaml``).
+
+    Before D24 this showed up as a bare ``PermissionError`` from ``Path.mkdir``
+    inside the create handler — the operator saw an errno at the first volume
+    create and nothing told them which one-time command fixes it. Raising a
+    named error that carries the exact command is what makes the pre-condition
+    audible, and it is deliberately *not* a fallback: no privileged path is
+    tried, because the plan's whole point is that the CP's A-class is empty.
+    """
 
 
 @dataclass
@@ -221,7 +242,23 @@ class VolumeRegistry:
                 tenant_id=tenant_id,
                 token_expires_at=token_expires_at,
             )
-            record.path.mkdir(parents=True, exist_ok=True)
+            try:
+                record.path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                # C3 Task 5 (D24): the CP is 65534, so this needs the store to
+                # be *its* directory and nothing else. Name the pre-condition
+                # instead of letting a bare EACCES escape (see the class).
+                if exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+                    raise VolumeRootNotOwnedError(
+                        f"cannot create the volume directory {record.path}: the "
+                        f"volume store {self._base} is not writable by this "
+                        f"control plane (uid {os.geteuid()}). It is handed over "
+                        "once, non-recursively -- the directories below it are "
+                        "sandbox volume data owned by pooled sandbox uids -- by "
+                        "the agent's storage-init: chown 65534:65534 "
+                        f'"{self._base}" "{self._base}/_meta"'
+                    ) from exc
+                raise
             # E3.2 volume permission model: the volume root is shared across
             # sandboxes with distinct host uids, so it must be world
             # rwx (single-entry userns has no supplementary groups) with the
