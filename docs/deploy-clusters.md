@@ -130,12 +130,13 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.9（2026-09-29，C3 Task 7）**；下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.10（2026-09-29，C3 收口评审）**；§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
-> **动手前先读 §7.9**：那是现役的 pod 清单、版本与"没有 `e2b-priv-broker`"的读数；§7.1–§7.8
-> 保留为上线经过与当时判据。
+> **动手前先读 §7.9 与 §7.10**：§7.9 是现役的 pod 清单、版本与"没有 `e2b-priv-broker`"的读数，
+> §7.10 是收口评审后重取的 worker/agent cap 读数（§7.9 表里 worker 的 `CapBnd` 已被它取代）；
+> §7.1–§7.8 保留为上线经过与当时判据。
 
 **版本**：`0.1.0-721-g01e4b72-20260927-231235`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的；
 C1 的三条尾项与「记账项批次」都在这一版）。2026-09-27 **三次上线**实测：`autoscaler` /
@@ -587,6 +588,42 @@ workspace-root-init: /var/lib/e2b-sandboxes/workspaces/_migrate owner=65534 mode
 
 **残留（无害，记在这里）**：节点上 `/run/e2b-broker/`（hostPath `DirectoryOrCreate` 建的）目录还在，
 但**没有任何组件挂它、也没有人读**（worker 的挂载已删）。要清就在节点上 `rmdir`；不清也不影响。
+
+> ⚠ **上表里 worker 的 `CapBnd=00000000a80425fb` 是收口评审修掉的那个点** —— 见 §7.10。
+
+### 7.10 收口评审：`workspace-root-init` 的能力集 + worker 的 BND（**2026-09-29，已执行**）
+
+收口评审的两条 must-fix 都落在 pod spec 上，所以各滚了一次栈（同一 tag，只换清单）。
+
+**版本**：`0.1.0-768-g17aa2fb-20260929-223205`（= `deploy/stack/.version`）。构建链与 §7.9 逐字相同：
+`PLATFORMS=linux/arm64 ./deploy/scripts/build-and-push.sh`（单平台分支只 `--load`）→ 四个
+`e2b-sandlock-{worker,agent,autoscaler,quota-agent}` 手动 `docker push` → 五个 tag 逐个
+`docker manifest inspect` 复核 → `apply.sh`（agent DaemonSet → worker StatefulSet → 预热）。
+
+**改了什么**：① `deploy/k8s/c3-agent.yaml` 的 init `workspace-root-init` 从"`runAsUser: 0` +
+无 `capabilities:` 块"改成 `drop: [ALL]` + `{CHOWN, DAC_OVERRIDE, FOWNER}`（与面 B/`storage-init`
+逐条相同，理由同 §7.9 的 `storage-init`）；② `deploy/k8s/worker.yaml` 的 worker 容器加
+`capabilities: {drop: [ALL]}`（此前省掉整块 ⇒ 继承的是 runtime 默认 BND）。
+
+**cap 读数（before → after，`CapBnd` / `CapEff`）**：
+
+| 容器 | before | after |
+|---|---|---|
+| worker `worker` | `0xa80425fb` / `0` | **`0` / `0`** ✔（判据 2/15 现在字面成立） |
+| agent 面 A `agent` | `0xa80425fb` / `0` | `0xa80425fb` / `0`（不动） |
+| agent 面 B `maint` | `0xb` / `0xb` | `0xb` / `0xb`（不动） |
+| agent init `storage-init` | `CHOWN,DAC_OVERRIDE,FOWNER` | 同（不动） |
+| agent init `workspace-root-init` | **运行时默认 14 条（含 `CAP_NET_RAW`）/ 同** | **`CHOWN,DAC_OVERRIDE,FOWNER` / 同** ✔ |
+
+**怎么读的（两个坑）**：① agent pod 是 pod 级 `hostPID: true`，所以 `kubectl exec … cat
+/proc/1/status` 读到的**是宿主机的 pid 1**（会显示满集），不是容器自己 —— 要读容器自己的进程得用
+`/proc/self/status`；② 两个 init 容器退出得比 `exec` 还快，所以它们的读数取自节点上
+`k0s ctr -n k8s.io c info <container-id>` 的 OCI `process.capabilities`（bounding/effective），
+两台节点各查一次。init 的日志在两台节点上都走完并全绿（`… is writable by uid 65534`），
+说明三条 cap 够 `chown`/`chmod`/`mkdir -p` 用 —— 这是 §7.9 `storage-init` 那条实测的现场复核。
+
+**冒烟**：`multinode_smoke.py` = **`MULTI-NODE SMOKE OK`**（4 箱 2+2、命令/文件/stdin 过网关、
+kill 后两个 worker 的预约都归 0）。
 
 ## 8. 改部署的入口
 
