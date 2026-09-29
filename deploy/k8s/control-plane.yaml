@@ -360,12 +360,16 @@ spec:
               value: "4294967296"
             - name: E2B_IMAGE_CACHE_EVICT_MIN_AGE_S
               value: "300"
-            # This pod runs as root and the workers as 65534, so the resolver
-            # hands every directory and file it creates to the worker uid: the
-            # worker writes as the owner, root writes through CAP_DAC_OVERRIDE,
+            # The resolver hands every directory and file it creates to **this**
+            # uid, which is the worker's 65534: the worker writes as the owner,
             # and a sandbox uid (10000+) gets read/traverse bits only -- never
             # 0777, since a writable rootfs cache is a cross-tenant poisoning
             # vector. docs/production-deployment-requirements.md §2.7.1.
+            #
+            # (Until C3 Task 5 this container ran as root and the rationale read
+            # "root writes through CAP_DAC_OVERRIDE"; the CP is 65534 now, so it
+            # writes as the owner of what it created. The value is unchanged --
+            # 65534 was and is the uid the cache must belong to.)
             - name: E2B_IMAGE_CACHE_OWNER_UID
               value: "65534"
             # ⚠ 共享工作区（RWX PVC）必须显式设 `E2B_MAX_TOTAL_DISK_MB`：

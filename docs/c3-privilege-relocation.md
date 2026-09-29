@@ -1,6 +1,8 @@
-# C3 三角分工（控制面零特权 / agent 执行 / worker 跑沙箱）设计评估 —— **未实施**
+# C3 三角分工（控制面零特权 / agent 执行 / worker 跑沙箱）设计评估 —— **已实施（Task 1–7 上线）**
 
-> **状态：设计已选（2026-09-28），一行代码都没动。**
+> **状态：设计已选（2026-09-28）；实现见 Task 1–7 的落地记录（§11.2.1、§14、Task 6 的验收小节），
+> 已于 2026-09-29 在 k0s 集群上线（`docs/deploy-clusters.md` §7.9）。** 下面标着"未实施""本次不做"
+> 的段落是**设计当时的原话**，保留为历史；现行口径以上线记录为准。
 > **✅ 已裁定：采用 C3，agent 作为特权操作组件；合规口径 = 「数据面（worker + 槽位）无 root」。**
 > ⚠ 口径要读准 —— **agent 的文件操作面仍然是 `euid 0`**（NFS 上 `CAP_CHOWN` 不过网，§6）；
 > 买到的是"**uid 0 不在数据面的进程树里**"。更强口径（全链路无 uid 0）的可行路线已评估、
@@ -808,6 +810,27 @@ worker 侧的特权面并没有真的消失。**(d) 是唯一的例外，因为�
    （`priv_common.c` 按 `START..+SIZE` 校验 `--uid`）——**安全、可见，但需要运维知道**。
    更好的形状是让 agent 的池从一个显式"本机所有 worker 池的并集"变量派生（或做成注册期一致性
    检查），记在 Task 5/6 的候选清单里。
+
+> **只在任务报告或清单注释里记过的残余（2026-09-29 收口评审补记）**：下面三条此前只散在
+> `.superpowers/sdd/**`（gitignored）或清单注释里，落到分支的账上，免得下一次评审把它们当漏改
+> 重新发现。都不影响本次收口。
+
+11. **worker 侧的形态探测与 CP 侧各写了一份**（第三/四轮评审的 seam）：
+    `envd_service/worker_identity.py::_identity_shape` 自己读 `E2B_NODE_ADDRESS_MODE` + 探
+    ServiceAccount token 来判 `k8s` / `hostname`，与 `control_plane/node_address.py` 的同一套
+    形态判定**并行存在**。两侧判成不同形态时的表现是**误导性的告警**（worker 以为该报 container-id
+    锚点、CP 以为该按 pod spec 校验，反之亦然），不是错误身份 —— 但值得收口成一处共用判定，或至少
+    钉一条"两侧读到同一个值"的用例。
+12. **`control_plane/registry/manager.py` 还留着一处 A5 形态的静默半删**：
+    `cleanup_workspace` 里 `shutil.rmtree(record.workspace_dir, ignore_errors=True)`
+    （`manager.py:2121-2123`）。与 Task 4 在 `control_plane/api/sandboxes.py` 修掉的 A5 同型
+    （失败被吞掉 ⇒ 看着成功其实是半删），只是这条走的是另一条路。要收口就让它与 A5 同口径报错/点名。
+13. **compose 车道的两个结构性缺口**（Task 6 的记录，落到这里）：
+    ① compose 栈**没有 k8s 的策略层**（没有 NetworkPolicy 等价物），所以"agent 的出口只到
+    `control-plane:3000`"这条**只在 k8s 成立**；② `deploy/compose/docker-compose.multinode.yml`
+    **没有 Redis** ⇒ 没有共享记录 ⇒ self-heal 的**门 (a) 每轮都具名推迟**，那个车道的孤儿巡检是
+    惰性的（清单注释里写了"给它一份记录存储就开"的触发条件，并双向 pin 住它保持关闭）。两条都与
+    Task 5/6 记的"compose CP 还不是 65534"同批。
 
 ## 12. 结论
 
@@ -1713,13 +1736,15 @@ Task 7 之前，C3 的回退故事有一条"两条路并存"的便利：新树�
 
 | 想退回到 | 怎么退 | 代价 |
 |---|---|---|
-| **Task 2 的"槽位身份不走 agent"**（`E2B_SLOT_IDENTITY=spawn`） | 改一个 env（worker 清单里那一行） | agent 仍要在（文件操作还走它）；只少了 `grant-slot` 这一跳。**这是仍然存在的旋钮** |
+| **Task 2 的"槽位身份不走 agent"**（`E2B_SLOT_IDENTITY=spawn`） | 改 env，**并且必须回到含 file-capability 二进制的 worker 镜像** | `spawn` 要的 `helpers.slot_spawner`（`envd_service/route_b.py`）就是 Task 4 从 worker 镜像移走的 `e2b-slot-spawn`。没有它 `privileged_starter` 为假、route B **直接不可用**（`envd_service/executors/sandlock.py`），**不是** C3 之前的行为 ⇒ 只改 env 是**半安装**，要退就得**清单 + 镜像同批**退（和 `socket` 那把杠杆一样） |
 | **Task 4 的"文件操作不走 agent"**（`E2B_PRIV_HELPER_TRANSPORT=exec`） | 改 env，**并且必须回到含 file-capability 二进制的 worker 镜像** | 出厂镜像里已经没有 `/var/lib/e2b-priv/` ⇒ 只改 env 是**半安装**（启动自检具名拒绝，不是静默降级）。要退就得**清单 + 镜像同批**退 |
 | **C1 的"节点 broker 做特权动作"**（`E2B_PRIV_HELPER_TRANSPORT=socket`） | **不再是原地可切的开关** | 代码路径已删（`TRANSPORTS` 不含 `socket`），DaemonSet 清单也删了。要退回这个形状只能**整批 revert 到 C1 那一版**（清单 + 镜像 + 那个 DaemonSet） |
 
-⇒ **一句话**：C3 的开关面现在只剩 `E2B_SLOT_IDENTITY`（两态）与 `E2B_PRIV_HELPER_TRANSPORT`
-（`agent` / `exec`，且 `exec` 需要配套镜像）。**再往前的形状（root worker / C1 broker）都要按
-"整批 revert 镜像 + 清单"来做**，不存在"翻一个 env 就回到 C1"的路。盘上的数据不受影响：树仍是
+⇒ **一句话**：C3 的两个 env 开关 —— `E2B_SLOT_IDENTITY`（`spawn`）与
+`E2B_PRIV_HELPER_TRANSPORT`（`exec`）—— **都只在"含 file-capability 二进制的 worker 镜像"上才
+有效**，而出厂镜像已经把那些二进制移走了，所以两者都不是"翻一个 env 就回到从前"的杠杆，都得
+**清单 + 镜像同批**退。再往前的形状（root worker / C1 broker）更是"整批 revert 镜像 + 清单"。
+盘上的数据不受影响：树仍是
 `0770 owner=<池 uid> group=<worker gid>`，**任何 root 进程都能接管它**（这正是 §5.4(b) 那条 NFS
 语义的另一面）——所以整批 revert 不会丢数据。运维口径与 `docs/k8s-deployment.md` §24.2 的回退节逐字一致。
 

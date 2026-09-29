@@ -248,10 +248,12 @@ CPU/磁盘）。恶意 key 可并发构建轰炸（`/sandboxes` 已限流，模�
 sandlock 官方支持非 root 运行（uid 65534 全绿）——worker 应以非 root 用户
 跑 supervisor，降低逃逸后果。
 
-> ✅ **已收口（C1，2026-09-27）**：现状已非如此 —— 镜像 `deploy/docker/Dockerfile.envd` 是
-> `USER 65534:65534`，C1 之后 k8s 基线 worker 连 `runAsUser` 都不覆盖（worker 容器回落镜像的
-> 非 root 用户；pod 里唯一的 root 容器是每节点一个的 `e2b-priv-broker` DaemonSet，特权在它那边）。
-> 实测见 `docs/deploy-clusters.md` §7.1。
+> ✅ **已收口（C1，2026-09-27；C3 Task 7 更新）**：现状已非如此 —— 镜像
+> `deploy/docker/Dockerfile.envd` 是 `USER 65534:65534`，且 k8s 基线 worker **显式 pin
+> `runAsUser: 65534` / `runAsGroup: 65534`**（C3 Task 4 片 B；CP 从 pod spec 读 worker 身份）。
+> 这台节点上的 root 容器现在在 **`e2b-c3-agent` DaemonSet** 里（面 B `maint` + 两个属主 init，
+> C1 的 `e2b-priv-broker` 已由 C3 Task 7 退役），而**控制面 pod 自己在 C3 Task 5 起也不是 root**
+> （`runAsUser/runAsGroup: 65534`）。实测见 `docs/deploy-clusters.md` §7.9。
 
 ### 8.4 依赖未锁定（中，供应链）
 

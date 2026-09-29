@@ -318,7 +318,8 @@ cap**」。因此 broker 必须落在沙箱不可达的路径，且路径本身�
 `runAsUser: 0`、听 49986），worker 侧声明 `E2B_PRIV_HELPER_TRANSPORT=agent` +
 `E2B_SLOT_IDENTITY=agent-grant`（没有 `socket` 回退了 —— 那个值现在被启动自检具名拒绝）。所以**网络文件系统上 worker 也保持非 root**：
 它现在**显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（C3 的 CP 读 pod spec 取可信身份），
-**不声明任何 capability**（BND 空集），需要 euid 0 的只有 agent 面 B 与（回退期的）broker。
+**没有任何 `add`、只有 `drop: [ALL]`**（BND 空集，字面成立 —— 收口评审把"省掉整块"改成显式 drop，
+否则继承的是 runtime 默认 BND），需要 euid 0 的只有 agent 面 B（C1 的 broker 已由 C3 Task 7 退役）。
 **历史（已作废）**：旧口径是"上面这节的前提是 workspace/volume 在节点本地盘"，网络存储上按 §5.4(b) 让
 worker 自己跑 `runAsUser: 0` + `runAsGroup = <worker gid>`（overlay 的 `worker-root.patch.yaml`，
 2026-09-27 删除）。
@@ -1975,7 +1976,7 @@ worker 走的是 **agent 形态**（`E2B_QUOTA_AGENT_URL` 是开关，`.env` 里
 * worker 的 `agent` 形态（`deploy/k8s/worker.yaml`）与它要用的 agent DaemonSet 在同一份渲染里 —— 只等 worker 的 rollout 闸门会在一个从未起来的 agent 上放行（`apply.sh` 先等 `ds/e2b-c3-agent`）；
 * agent 面 B 的 `E2B_UID_POOL_START/SIZE` 与 worker 的池相同（面 B 用它做 `--uid`/`--gid` 的池门），不一致会被具名拒绝而不是静默放过。
 
-单测钉住：`tests/unit/test_worker_manifest_permissions.py`（worker 容器 pin `runAsUser/runAsGroup: 65534` 且**没有 capabilities 块**、pod 里**没有 init 容器**；agent 的两个属主 init 在它自己的 pod 里、`runAsUser: 0`）与 `tests/unit/test_c3_agent_manifest.py`（清单集里**没有** `e2b-priv-broker`；worker 与面 A 都不含 §2.3 的禁项，且 `allowPrivilegeEscalation` **一个字都不出现**）。
+单测钉住：`tests/unit/test_worker_manifest_permissions.py`（worker 容器 pin `runAsUser/runAsGroup: 65534` 且**只有 `capabilities.drop: [ALL]`、没有任何 `add`**、pod 里**没有 init 容器**；agent 的两个属主 init 在它自己的 pod 里、`runAsUser: 0`）与 `tests/unit/test_c3_agent_manifest.py`（清单集里**没有** `e2b-priv-broker`；worker 与 agent pod 里**每个**容器都不含 §2.3 的禁项，且 `allowPrivilegeEscalation` **一个字都不出现**）。
 
 **历史（已被取代）**：C1 wave 2 → C3 Task 4 片 B 期间，这一步归每节点一个 **root** 的 `e2b-priv-broker` DaemonSet（`deploy/k8s/priv-broker.yaml`，`runAsUser: 0`，socket `/run/e2b-broker/broker.sock`），Task 4 片 B 之后它也跑 agent 镜像；**C3 Task 7 已把这个 DaemonSet、`E2B_PRIV_HELPER_SOCKET` 与 worker 的 `wait-for-broker` 闸门一起退役**（`E2B_PRIV_HELPER_TRANSPORT=socket` 现在是启动期具名拒绝）。C1 之前则是"非 root worker 只适用于节点本地盘"，网络存储上让 worker 自己 `runAsUser: 0` + `runAsGroup: 65534`（`deploy/k8s-k0s/worker-root.patch.yaml`，2026-09-27 删除），单测当时对 worker 容器断言 `runAsUser == 0`。
 
@@ -2063,8 +2064,8 @@ wait
 ```bash
 kubectl -n sandlock get statefulset e2b-worker -o jsonpath='{.spec.template.spec.containers[0].securityContext}'; echo
 # 通过（C3 Task 4 片 B 起）：runAsUser=65534、runAsGroup=65534（**显式 pin** —— CP 的可信身份来源
-#       读的就是 pod spec 这两个值；只靠镜像 USER 会被读成"未知"），且**没有 capabilities 块**
-#       （BND 空集：镜像里的 file-capability 二进制已移出），也没有 init 容器
+#       读的就是 pod spec 这两个值；只靠镜像 USER 会被读成"未知"），且只有 **`drop: [ALL]`、
+#       没有 add**（BND 空集，字面成立：镜像里的 file-capability 二进制已移出），也没有 init 容器
 #       （C3 Task 7 退休了唯一那个 `wait-for-broker` 闸门）
 #       （渲染结果已由 tests/unit/test_worker_manifest_permissions.py 钉住）
 

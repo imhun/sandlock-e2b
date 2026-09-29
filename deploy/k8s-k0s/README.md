@@ -233,8 +233,9 @@ control-plane 的 `:3000`，与基线那个 ClusterIP `gateway` 同一个后端�
   `moby/buildkit:rootless` 在 Docker Hub ⇒ 已镜像到 ACR 的 `byteplan/buildkit:rootless`。
 * **worker pod 里没有任何 root 容器**（C1 wave 2，2026-09-27；**C3 Task 4 片 B，2026-09-29 再收敛**）：
   worker 容器**显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（C3 的 CP 从 pod spec 取"这个
-  worker 是谁"的可信答案），**没有任何 cap 声明**（BND 空集 —— 镜像里的 file-capability 二进制已
-  移出，见判据 2/15），**也没有任何 initContainer**（C3 Task 7 把唯一的那个非 root
+  worker 是谁"的可信答案），**只有 `capabilities.drop: [ALL]`、没有任何 `add`**（BND 空集，字面
+  成立 —— 收口评审把"省掉整块"改成显式 drop，否则继承的是 runtime 默认 BND；镜像里的
+  file-capability 二进制已移出，见判据 2/15），**也没有任何 initContainer**（C3 Task 7 把唯一的那个非 root
   `wait-for-broker` 闸门与它服务的 `socket` 回退一起退役了）。网络文件系统的 chown 确实只有 euid 0
   做得到，但那个 euid 0 现在在 **`e2b-c3-agent` DaemonSet 的面 B**（基线；听 49986）里 —— worker
   通过 `E2B_PRIV_HELPER_TRANSPORT=agent` 把 `chown`/`rm`/`walk` 交给 CP，再由 CP 指令它；

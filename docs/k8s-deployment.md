@@ -35,7 +35,7 @@
 | `k8s-k0s/gateway-nodeport.yaml` | Service `gateway-nodeport`（**NodePort 31907** → 3000） | **只在自建集群的 overlay 里**：托管集群由 SLB/ingress 承担同一角色，这里没有 LB，所以用固定 NodePort 给集群外一个不漂的入口（访问方式见 `deploy/k8s-k0s/README.md`） |
 | ~~`priv-broker.yaml`~~ —— **已删除（C3 Task 7）** | 曾是 DaemonSet `e2b-priv-broker`（每节点一个 **root** 容器）+ socket hostPath + 3 个 init | **C1 特权外置**：`chown`/`rm`/`walk` 由它经 unix socket `/run/e2b-broker/broker.sock` 做（所以 worker pod 里没有 root）。**C3 Task 7 连同 socket 形态与 `wait-for-broker` 闸门一起退役**：同一批动作现在在 `c3-agent.yaml` 的面 B（见下一行），它的两个属主 init 与 `image-cache-init` 也搬到了那个 pod；本文里凡出现 `priv-broker.yaml` / `ds/e2b-priv-broker` 的步骤都已作废（历史保留）。（整份退役前的清单见 git 历史；能力集与客户端的对照见 `docs/c3-privilege-relocation.md` §14.5） |
 | `c3-agent.yaml` | DaemonSet `e2b-c3-agent`（**每节点一个**、**两个容器**、pod 级 `hostPID: true`）+ NetworkPolicy | **C3 的特权收敛**：面 A `agent` 是**独立镜像** `e2b-sandlock-agent`（`USER 65534:65534` + BND `SETUID/SETGID`）—— CP 把「哪个沙箱、哪个 uid、哪个 pid」发过来，它用宿主 `/proc` 把容器 pid 反查成宿主 pid 再写一次 `uid_map`；面 B `maint` 是 **root** + C1 的三条 cap（`chown`/`dac_override`/`fowner`），**Task 4 片 B 起装上了载荷**：与面 A 同一个服务，听**自己的端口 49986**（D22 —— 两个容器共享 pod netns，同端口会 `EADDRINUSE`；file op 送到 65534 的面 A 上则每个 chown 在 NAS 上 `EPERM`）。入口只允许 control-plane pod（NetworkPolicy，**两个端口**）；它与 `priv-broker` 一样**在基线里**（它的 PVC claim 与 hostPath 都是基线已有的）。**Task 5 加了 initContainer `storage-init`**（root，与面 B 同一理由）：把控制面 pod 里那份 `image-cache-init` 接过来，并按裁定 D24 把 `_volumes`（及 `_volumes/_meta`）**非递归、幂等**地交给 65534 |
-| `worker.yaml` | worker StatefulSet（2 副本 `e2b-worker-0/1`）+ headless Service + PDB | 非 root，且 **Task 4 片 B 起显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（CP 的可信身份来源读的就是 pod spec；只靠镜像 `USER` 会被读成"未知"）；**没有任何 cap 声明**（BND 空集 —— 镜像里的 file-capability 二进制已移出）；`E2B_PRIV_HELPER_TRANSPORT=agent`（文件操作与槽位身份都走每节点的 agent）+ `E2B_SLOT_IDENTITY=agent-grant` + `Localhost` seccomp profile；唯一的 initContainer 是**非 root** 的 `wait-for-broker`（保留到 Task 7，与 `E2B_PRIV_HELPER_SOCKET` 一起构成 `socket` 回退） |
+| `worker.yaml` | worker StatefulSet（2 副本 `e2b-worker-0/1`）+ headless Service + PDB | 非 root，且 **Task 4 片 B 起显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（CP 的可信身份来源读的就是 pod spec；只靠镜像 `USER` 会被读成"未知"）；**没有任何 `add`**，且 **`drop: [ALL]`**（BND 空集，字面成立 —— 镜像里的 file-capability 二进制已移出；早先省掉整个 `capabilities:` 块其实是继承了 runtime 默认 BND，收口评审改成显式 drop）；`E2B_PRIV_HELPER_TRANSPORT=agent`（文件操作与槽位身份都走每节点的 agent）+ `E2B_SLOT_IDENTITY=agent-grant` + `Localhost` seccomp profile；**没有 initContainer**（C1 那个 `wait-for-broker` 闸门已由 C3 Task 7 随 `socket` 形态一起退役） |
 | `autoscaler.yaml` | autoscaler（SA/Role/RoleBinding + Deployment） | `E2B_AS_BACKEND=k8s`，直接 scale `e2b-worker`，`MIN=1 / MAX=16` |
 | `seccomp-installer.yaml` | ConfigMap `sandlock-worker-seccomp` + DaemonSet `seccomp-installer` | 把 `deploy/seccomp/sandlock-worker.json` 写到**每个节点的** `/var/lib/kubelet/seccomp/sandlock-worker.json` |
 
@@ -46,8 +46,9 @@
 * 存储类支持 **RWX**，并且 worker（uid 65534）能在上面建目录 —— NFS 上如果开了 `root_squash`，
   `initContainer` 的 `chown` 会被拒，它会**验证**属主并停在 `Init:Error` 并打印一次性修法，
   而不是起来以后每个 image resolve 都失败（§2.7.1）；
-* Pod Security：worker 用 `Localhost` seccomp，**没有任何 `capabilities` 声明**（C3 Task 4 片 B 起
-  BND 空集 —— 镜像里的 file-capability 二进制已移出），在 baseline 档内；**不要**给它
+* Pod Security：worker 用 `Localhost` seccomp，**只有 `capabilities.drop: [ALL]`、没有任何 `add`**
+  （C3 Task 4 片 B 起 BND 空集，字面成立 —— 镜像里的 file-capability 二进制已移出；收口评审把
+  "省掉整块"改成"显式 drop"，否则继承的是 runtime 默认 BND），在 baseline 档内；**不要**给它
   `no-new-privileges`（agent 面 A 靠 file capabilities 写 `uid_map`，NNP=1 会让内核直接忽略它们，
   面 A 会静默失效）。pod 级 `net.*` sysctl 在 N5 之后就撤掉了（:53 的
   DNS 网关改在每个沙箱自己的 netns 里绑，见 §5）。
@@ -213,9 +214,9 @@ worker 侧关键 env（语义见 `deploy/stack/.env.example` 的同名键）：
 `E2B_WORKSPACE_BASE`、`E2B_IMAGE_CACHE_DIR/MAX_BYTES/EVICT_MIN_AGE_S/OWNER_UID`、
 `E2B_ROUTE_B_TMP_ROOT`（C3 Task 4 片 B 起**CP 也要设**：`scope-slot-document` 的路径由 CP 推导，两侧必须逐字一致；
 值在 `E2B_STATE_BASE` 之下，N27）、`E2B_PRIV_HELPER_TRANSPORT=agent`（**C3 出厂形态**：worker 一个特权二进制都不 exec）、
-`E2B_SLOT_IDENTITY=agent-grant`、`E2B_PRIV_HELPER_SOCKET=/run/e2b-broker/broker.sock`（只有 `socket` 回退才读它，
-Task 7 随 broker 一起删）、
+`E2B_SLOT_IDENTITY=agent-grant`、
 `E2B_NODE_{MEMORY_MB,CPU_PERCENT,DISK_MB,PROCESSES}`（容量声明，autoscaler 与调度都看它）。
+（`E2B_PRIV_HELPER_SOCKET` **已不在 worker env 里**：C3 Task 7 把它连同 `socket` 形态与 broker 一起退役了。）
 控制面侧新增/改动：`E2B_C3_AGENT_MAINT_PORT=49986`（面 B 端口）、`E2B_ROUTE_B_TMP_ROOT`、以及
 `E2B_IMAGE_CACHE_DIR=/var/lib/e2b-images` + `E2B_IMAGE_OCI_DIR=/var/lib/e2b-sandboxes/_images`（**拆分**：
 前者只是 CP 用来推导 `chown-secret` 的路径字符串，必须与 worker 的节点本地缓存逐字一致；后者是模板 OCI tar
@@ -2755,8 +2756,8 @@ fail closed —— 直接 apply 原文件不会 chown 任何东西。
 根**是不同的：控制面的 `SnapshotRegistry` 建在共享 export 根上（`control_plane/app.py` 的
 `platform_root` = `settings.shared_workspace_root` ⇒ `<export>/_snapshots/<id>`），worker 写
 那条在树根下；**两个根都在上面这 8 条计划里，所以谁写哪个根都被覆盖到**。树根下这两条平台
-命名空间由 broker 的 `workspace-root-init` 在每次启动时保底（`mkdir -p` 加
-`chown 65534:65534`），迁移工具只是对存量再补一次属主。其余 `<export>/workspaces/**` 绝不进入 ——
+命名空间由 agent pod 的 `workspace-root-init`（C3 Task 7 从退役的 broker 搬进来）在每次启动时保底
+（`mkdir -p` 加 `chown 65534:65534`），迁移工具只是对存量再补一次属主。其余 `<export>/workspaces/**` 绝不进入 ——
 那些树属于池 uid、不是 worker 的；计划里任何一条落在它下面（含 `workspaces` 本身、它的兄弟、
 那两条下面的东西、用 `..` 或符号链接绕过去的拼写）脚本一律拒绝并点名。硬性质由
 `tests/unit/test_state_owner_migrate.py` 逐条钉住。
@@ -2778,8 +2779,9 @@ deploy/scripts/migrate-state-owner.sh
 deploy/scripts/migrate-state-owner.sh --apply
 deploy/scripts/migrate-state-owner.sh --apply --keep-job    # 想留现场排查时
 
-# 4) 起回来：先 apply broker DaemonSet，再把 worker 起回来（升级顺序见 §2 的"镜像与升级"）
-kubectl apply -f deploy/k8s/priv-broker.yaml
+# 4) 起回来：先 apply agent DaemonSet，再把 worker 起回来（升级顺序见 §2 的"镜像与升级"）
+#    （C3 Task 7 之后是 agent → worker；C1 的 broker DaemonSet 已退役，这一行不再是它）
+kubectl apply -f deploy/k8s/c3-agent.yaml
 kubectl apply -f deploy/k8s/worker.yaml
 kubectl -n sandlock scale statefulset/e2b-worker --replicas=2
 
@@ -2802,11 +2804,13 @@ root 读 uid 65534 的文件本来就有权限。这与 §23 的 N27 迁移不�
 > **⚠ C3 Task 7 之后，回退必须整批 revert（清单 + 镜像），不能再靠翻开关：**
 > C1 时代的回退姿势是"把 worker 切回 `E2B_PRIV_HELPER_TRANSPORT=socket`（broker 还在服务）或
 > `exec`（镜像里还有 file-capability 二进制）"。**两条都不存在了** —— `socket` 已被代码具名拒绝，
-> 二进制也早已不在 worker 镜像里。现在盘上可用的开关只有 `E2B_SLOT_IDENTITY`（`agent-grant` ↔
-> `spawn`，Task 2 的两态）与 `E2B_PRIV_HELPER_TRANSPORT=agent`（Task 4 的形态）**这一对同批的
-> 旋钮**；要回到"没有 agent 也行"的形状，就得**连镜像一起**退到 C1 那一版（`e2b-priv-broker`
-> DaemonSet 的清单也一起回来）。完整口径见
-> `docs/c3-privilege-relocation.md` §14.6 与计划文件 `## 回退`。
+> 二进制也早已不在 worker 镜像里。**`E2B_SLOT_IDENTITY=spawn` 这把也不是"原地可切"**：它要的
+> `e2b-slot-spawn` 同样是被移出 worker 镜像的那个 file-capability 二进制（`helpers.slot_spawner`），
+> 没有它 `privileged_starter` 为假、route B 直接不可用 —— 与 `socket` 那把一样，**得配含
+> file-capability 二进制的 worker 镜像**。所以现在盘上没有"翻一个 env 就回到从前"的杠杆：要回到
+> "没有 agent 也行"的形状，就得**清单 + 镜像一起**退到 C1 那一版（`e2b-priv-broker` DaemonSet 的
+> 清单也一起回来）。完整口径见
+> `docs/c3-privilege-relocation.md` §14.8 与计划文件 `## 回退`。
 
 ⚠ 两个常见坑：① 脚本拿不到镜像版本（`deploy/stack/.version` 不存在且没给 `VERSION=…`）会直接
 拒绝 —— 与 `apply.sh` 同一口径；② 直接 `kubectl apply -f deploy/k8s-k0s/state-owner-migrate.yaml`

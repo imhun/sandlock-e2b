@@ -136,14 +136,16 @@ relaxation therefore reaches the worker/supervisor only.
   the StatefulSet. `Localhost` is also an allowed value under the Pod Security
   `baseline` seccomp rule, which `Unconfined` is not.
   Not every pod on the node carries this profile, and that is deliberate: the
-  per-node `e2b-priv-broker` DaemonSet (`deploy/k8s/priv-broker.yaml`, C1) runs
-  the runtime **default** profile. It is a root daemon whose only job is to
+  per-node `e2b-c3-agent` DaemonSet (`deploy/k8s/c3-agent.yaml`) runs the runtime
+  **default** profile. Its root pieces are face B (`maint`) and the two owner
+  inits (`storage-init`, `workspace-root-init`); face B's only job is to
   `fork`/`exec` *itself* (`/var/lib/e2b-priv/e2b-maint`) for `chown`/`rm`/`walk`
   requests, so the worker's relaxations (`pidfd_getfd`, `unshare`) have no user
   in it — and installing `sandlock-worker.json` there would only widen a
-  process that never runs sandbox code. The installer's DaemonSet and the
-  broker's are separate objects; only `worker.yaml` (and the profiles the lanes
-  use) need this file.
+  process that never runs sandbox code. (C1's per-node `e2b-priv-broker`
+  DaemonSet was the same shape and was retired in C3 Task 7.) The installer's
+  DaemonSet and the agent's are separate objects; only `worker.yaml` (and the
+  profiles the lanes use) need this file.
 * **lanes**: `deploy/scripts/test-prod-shaped.sh` and
   `deploy/scripts/smoke-prod-worker.sh` use the same file (override with
   `SECCOMP_PROFILE=...`) so the gate reproduces the deployed shape.

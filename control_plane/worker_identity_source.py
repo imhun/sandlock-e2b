@@ -29,10 +29,25 @@ compose file the control plane never sees. The ruling's second shape (D21
 option 2) is that it does not have to: the **agent** reads the worker's own
 process identity out of the kernel (face B runs with ``pid: host`` in the
 compose stacks), and the control plane's part is to carry the anchor that makes
-it a lookup -- the worker's recorded pid namespace -- with every instruction
-that acts as the worker. ``KernelWorkerIdentitySource`` is that shape: it keeps
-the reported uid/gid as the value the agent confirms, and the agent refuses by
-name when the kernel disagrees (``deploy/c3_agent/lookup.py``).
+it a lookup with every instruction that acts as the worker.
+``KernelWorkerIdentitySource`` is that shape: it keeps the reported uid/gid as
+the value the agent confirms, and the agent refuses by name when the kernel
+disagrees (``deploy/c3_agent/lookup.py``).
+
+Two anchors coexist, on purpose, and they are two different questions:
+
+* the **file-operation** anchor is the worker's **container id** (ruling D25).
+  Face B reads only world-readable ``/proc`` files, so it needs a value the
+  kernel can re-check without ``CAP_SYS_PTRACE`` -- and the worker's cgroup path
+  carries its container id verbatim (``ProcLookup.worker_uid_gid``);
+* the **slot-grant** anchor is the worker's **pid namespace**. Face A writes
+  ``uid_map`` for a slot the worker forked, and it maps the worker's reported
+  container pid back to a host pid through that namespace's ``NSpid`` chain
+  (``control_plane/api/internal.py``), a different read with a different
+  ``hostPID`` requirement.
+
+The container-id anchor is therefore the one that travels beside a
+file-operation instruction; the pid-namespace anchor stays on the grant path.
 
 ``NoWorkerIdentitySource`` therefore remains for a shape that genuinely cannot
 answer -- an embedder, or a deployment whose agent has no ``pid: host`` at all
@@ -60,8 +75,9 @@ class WorkerIdentitySource(Protocol):
     #: against the kernel at use time (ruling D21 option 2: the compose lane,
     #: whose face B runs ``pid: host``). True for exactly one shape, and the
     #: file-operation path reads it to decide whether the anchor -- the worker's
-    #: pid namespace -- travels with the instruction. A shape that verifies its
-    #: own answer (k8s) carries no anchor and behaves as it always did.
+    #: **container id** (ruling D25) -- travels with the instruction. A shape
+    #: that verifies its own answer (k8s) carries no anchor and behaves as it
+    #: always did.
     kernel_verified: bool
 
     def identity_for(self, node_id: str) -> tuple[int, int] | None:
@@ -185,14 +201,17 @@ class KernelWorkerIdentitySource:
     answer *here* -- but it is not a shape that cannot answer at all. The answer
     is the kernel's, produced by the agent when a file operation is executed:
     the worker's own process identity, read from ``/proc/<pid>/status`` for the
-    process(es) in the pid namespace the control plane records for it
-    (:meth:`deploy.c3_agent.lookup.ProcLookup.worker_uid_gid`).
+    process(es) whose cgroup path contains the **container id** the control
+    plane records for it (D25;
+    :meth:`deploy.c3_agent.lookup.ProcLookup.worker_uid_gid`). The pid namespace
+    is a *different* anchor -- the slot-grant one (see the module docstring) --
+    and is not what travels here.
 
     What that means for the stored value, and why it is not the hole D21 option
     1 exists to close: the reported uid/gid is kept as the value the agent will
     **confirm**, never as an answer the control plane acts on. Every instruction
-    that acts as the worker carries the anchor (the node's recorded pid
-    namespace) beside it, and the agent refuses by name when the kernel does not
+    that acts as the worker carries the anchor (the node's recorded **container
+    id**, D25) beside it, and the agent refuses by name when the kernel does not
     agree -- so a worker that names another tenant's uid gets a refusal, not a
     tree. The claim is carried; the kernel decides.
 
