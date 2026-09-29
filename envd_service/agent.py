@@ -43,7 +43,11 @@ from envd_service.uid_pool import (
     align_shared_uid_workspace,
     apply_sandbox_ownership,
 )
-from envd_service.worker_identity import worker_identity_fields, worker_pid_namespace
+from envd_service.worker_identity import (
+    worker_container_id,
+    worker_identity_fields,
+    worker_pid_namespace,
+)
 from envd_service.xfs_quota import (
     ProjectDirectoryGone,
     ProjectQuotaError,
@@ -287,6 +291,16 @@ def _register_payload(
     pid_namespace = worker_pid_namespace()
     if pid_namespace:
         payload["pidNamespace"] = pid_namespace
+    # C3 Task 4 / ruling D25: the container identity the *file operations*''
+    # anchor is matched against -- the worker's hostname, which the runtime sets
+    # to (a prefix of) the container id and which the agent can find in the
+    # worker's host-side cgroup path (world-readable; face B needs no
+    # ``CAP_SYS_PTRACE`` and no uid change to read that). Absent when this
+    # platform has no container identity, or when a deployment overrode
+    # ``hostname:`` -- the control plane then refuses those operations by name.
+    container_id = worker_container_id()
+    if container_id:
+        payload["containerID"] = container_id
     # C3 Task 4: the worker's own uid/gid, for the same reason (and on the same
     # path): the agent's file operations need the identity a tree's group and
     # ``--worker`` refer to, and the control plane may only take it from its own
@@ -397,6 +411,7 @@ def _heartbeat_usage_payload(
     platform_disk: dict[str, int] | None = None,
     pid_namespace: str | None = None,
     worker_identity: dict[str, int] | None = None,
+    container_id: str | None = None,
 ) -> dict[str, Any]:
     """Disk usage + quota alerts + MCP port band carried by each heartbeat."""
     payload: dict[str, Any] = {}
@@ -413,6 +428,12 @@ def _heartbeat_usage_payload(
         # gid under the same node id, and a stale one would put sandbox trees in
         # a group the worker does not have.
         payload.update(worker_identity)
+    if container_id:
+        # D25: refreshed with every heartbeat for the same reason the pid
+        # namespace is -- a recreated worker container is a *new* container id
+        # under the same node id, and a stale one would make the agent match a
+        # cgroup that no longer exists (every file operation refused by name).
+        payload["containerID"] = container_id
     try:
         usage = shutil.disk_usage(settings.workspace_base)
         payload["diskUsedMB"] = usage.used // (1024 * 1024)
@@ -1897,6 +1918,7 @@ class NodeAgent:
                         self._platform_disk_report,
                         worker_pid_namespace(),
                         worker_identity_fields(),
+                        worker_container_id(),
                     ),
                     headers=headers,
                 )

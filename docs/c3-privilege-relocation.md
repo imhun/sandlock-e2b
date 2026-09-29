@@ -734,35 +734,71 @@ worker 侧的特权面并没有真的消失。**(d) 是唯一的例外，因为�
    **片 C 接上的形状（2026-09-29）**：CP 侧新增 `KernelWorkerIdentitySource`（`hostname` 形状
    即 compose 走它，`configured=True`、`kernel_verified=True`）——节点把 worker 上报的
    `worker_uid/gid` 记为**待内核确认的声明**，并在每条"以 worker 身份执行"的指令里带上
-   **锚点**（该节点的 `pidNamespace`，CP 自己记录、`_worker_pid_namespace` 已做形状校验）；
-   agent 侧 face B 在锚点存在时按锚点解出宿主进程并读 `/proc/<pid>/status` 的
-   `Uid:`/`Gid:`（第二列，有效身份），**用它**做 `--worker`/`--gid`，声明与内核不一致、
-   锚点无进程、锚点多于一个进程，都**具名拒**且不 exec 任何 `e2b-maint`（k8s 车道不动：
-   它的指令不带锚点，值仍是 pod spec 校验过的那一个）。实现与用例：
-   `deploy/c3_agent/lookup.py`（`ProcLookup.worker_uid_gid` + `resolve-worker` 入口）、
-   `deploy/c3_agent/app.py`（`WorkerCredentials.pid_namespace`）、
+   **锚点**；agent 侧 face B 在锚点存在时按锚点解出 worker 自己的进程、读内核的有效身份，
+   **用它**做 `--worker`/`--gid`，声明与内核不一致即**具名拒**且不 exec 任何 `e2b-maint`
+   （k8s 车道不动：它的指令不带锚点，值仍是 pod spec 校验过的那一个）。实现与用例：
+   `deploy/c3_agent/lookup.py`（`ProcLookup.worker_uid_gid`）、
+   `deploy/c3_agent/app.py`（`WorkerCredentials.container_id`）、
    `control_plane/{worker_identity_source,api/internal,c3_agent_client}.py`；
    `tests/unit/test_c3_worker_kernel_identity.py`、
    `tests/unit/test_c3_fileops_forwarding.py`（compose 声明+锚点）、
    `tests/contract/test_c3_worker_kernel_identity.py`（真容器/真内核）。
 
-   ⚠ **一个非显然的内核约束（片 C 实测，别再踩）**：`/proc/<pid>/ns/pid` 的 `readlink`
-   走 `ptrace_may_access` —— 只有**同 uid**（或持 `CAP_SYS_PTRACE`）的进程能读别人的名字
-   空间。face B 是 root **且刻意没有 `CAP_SYS_PTRACE`**（它与控制面共享 `pid: host`，给了
-   这个能力就等于让它能 ptrace 控制面），而 worker 是 65534 ⇒ **face B 自己读不到**。
-   所以读 `/proc` 的那一步在 face B 的**子进程**里做，子进程按
-   `E2B_C3_AGENT_RESOLVER_UID`/`_GID`（默认 `65534:65534`，= 三个 compose 栈 worker 的
-   `user:` 与 worker 镜像的 `USER`）运行；该旋钮配错时是**具名拒绝**（"holds no process this
-   identity resolver can see (it runs as …)"），不是错身份。**不要**用 `CAP_SYS_PTRACE`
-   换这段代码：那会让 face B 能读控制面内存。
+   ⚠ **更正（裁定 D25，2026-09-29 真机验收后）** —— 上面那条"读取放在 face B 的子进程里、
+   子进程按 `E2B_C3_AGENT_RESOLVER_UID`/`_GID` 运行"**被取代**，原因是它有一个当时没被量到
+   的前提：**face B 是 root、能力集恰为 `CHOWN/DAC_OVERRIDE/FOWNER`（判据 4），它没有
+   `CAP_SETUID`/`CAP_SETGID`，因此根本生不出那个降 uid 的子进程**。真机实测（本树 agent
+   镜像，2026-09-29）：`CapEff=0xb` 时 `subprocess.run(user=65534, group=65534)` 直接
+   `PermissionError: [Errno 1] Operation not permitted`；加上 `SETUID`/`SETGID`
+   （`CapEff=0xcb`）才成功。于是 compose 车道的**每一个带锚点的文件操作都拒**
+   （建箱路径的第一步就是 `chown-workspace`）⇒ 三个 compose 栈一个箱都建不成。
+   要"降 uid 读 `/proc`"就必须给 face B 加两条 cap，即**改判据 4**；D25 选了另一条。
 
-   ⚠ **仍未收口的残留（记为后续项）**：compose 的锚点本身仍是 **worker 自报**的
-   （`pidNamespace` 在 register/heartbeat 里上报，CP 只做形状校验）。同机、同 uid 的 worker
-   之间可以互相读 `ns/pid`（同上那条 ptrace 规则），因此一个被攻陷的 worker 理论上能枚举
-   ns inode、冒充**同一 uid 的另一个 worker**的名字空间（k8s 有 pod UID 的 cgroup 证
-   `pod<uid>` 挡这条，compose 没有等价物）。影响面窄（同机同 uid、且身份值相同或仅 gid 不同），
-   要收口需要一条 compose 侧的 cgroup/hostname token（与 `pod_cgroup_token` 同形），属于
-   后续 task。
+   **D25 的形状：锚点换成 container id，读取只碰世界可读的文件。**
+   两条实测事实决定了它（本机 OrbStack，2026-09-29）：
+
+   * `/proc/<pid>/ns/pid` 的 `readlink` 走 `ptrace_may_access` —— 只有**同 uid**（或持
+     `CAP_SYS_PTRACE`）的进程读得到别人的命名空间，所以 face B 读不了（给能力等于让它能
+     ptrace 控制面，不能用）；
+   * `/proc/<pid>/cgroup` 与 `/proc/<pid>/status` 是 **world-readable**：face B 自己就能读，
+     而 worker 的 cgroup 里**逐字带着容器 id**（`0::/../e4a98a0c528215e…`），Docker 又把
+     同一个 id 的前 12 位设成容器的 **hostname**。
+
+   于是：worker 在 register/heartbeat 里上报 `containerID`（= 从内核读到的 hostname，
+   `envd_service/worker_identity.py::worker_container_id`）；CP 只做形状校验
+   （`^[0-9a-f]{12,64}$`）并把它作为**锚点**下发；face B 用
+   `ProcLookup.worker_uid_gid` 取 cgroup 路径**包含该锚点**的候选，再读它们的
+   `/proc/<pid>/status`。**没有新能力、没有降 uid、没有子进程**，判据 4 的 `0xb` 不动。
+
+   ⚠ **锚点的部署约束（写在代码注释旁，也必须写进运维手册）**：container id 是**运行时给的**
+   hostname，所以 **compose 栈不得给 C3 worker 设 `hostname:`**。设了它 → 上报值不是容器 id
+   （形状拒）或形状合法但与任何 cgroup 都不匹配（无候选拒）→ 该节点每个需要 worker 身份的
+   文件操作**具名拒**（"reported no container id …" / "holds no process this agent can see"），
+   **绝不会**静默落到别人的 uid 上。钉子：`tests/unit/test_c3_agent_manifest.py`
+   （三个 compose 栈的 worker service 都不得出现 `hostname`；原来那条"worker 的 `user:`
+   必须等于 resolver 默认 uid"的钉子随旋钮一起删除）。
+
+   ⚠ **判据的放宽（同一轮 D4 的裁定）**：谓词从"该锚点下**恰好一个**进程"改成
+
+   * **至少一个** cgroup 命中（零个 ⇒ 具名拒）；
+   * 所有候选的 `(uid, gid)` 必须**一致**（不一致 ⇒ 具名拒）；
+   * **不**要求进程集合唯一。
+
+   为什么"一致"就够：一个容器的进程共享一个身份，所以容器内的候选多寡**不是值的歧义**；
+   两个 worker 解到同一个锚点也无害（它们同 uid）；绝不能发生的只有"采用一个内核没有为
+   worker 进程报出的值"。旧谓词恰恰把**正常状态**（槽位的 `sandlock-supervise` 就活在
+   worker 的 pid namespace / 容器里，运维一句 `docker exec`、一个没回收的 zombie 也一样）
+   判成歧义 —— 真机上它把 compose 车道压成**每 worker 只能有一个活槽位**（4 个箱的标准
+   `multinode_smoke` 直接失败）。**不要**把唯一性规则"修回来"：
+   `tests/unit/test_c3_worker_kernel_identity.py::test_several_processes_in_one_container_are_not_an_ambiguity`
+   与 `tests/contract/...::test_a_busy_worker_is_not_an_ambiguity` 就是为它立的钉子。
+
+   ⚠ **仍未收口的残留**：锚点本身仍是 **worker 自报**的（`containerID` 在 register/heartbeat
+   里上报，CP 只做形状校验）。它比 pid namespace 强的一点是**可被内核复核**：agent 要求它
+   出现在候选进程的 cgroup 路径里，所以"报一个不存在的 id"是具名拒、不是错身份；弱的一点是
+   它不证明"这个进程**就是**那个 worker"（同机、同 uid 的候选彼此可读），要收口仍需一条
+   compose 侧的更强 token（k8s 那条用 pod UID 的 `pod<uid>` cgroup 证）。影响面窄（同机、
+   同 uid、身份值相同或仅 gid 不同），记此以免与上面的取舍混淆。
 10. **stack 的 agent uid 池是两个 worker 池的并集，但旋钮是各自独立的**（Task 4 片 B 记录）：
    `deploy/stack/docker-compose.prod.yml` 的 face B 用 `E2B_UID_POOL_START`（默认 10000）+
    `E2B_C3_AGENT_UID_POOL_SIZE`（默认 **2000**，覆盖 worker-1 的 `10000..10999` 与 worker-2 的

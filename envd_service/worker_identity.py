@@ -21,10 +21,14 @@ from __future__ import annotations
 
 import os
 import logging
+import socket
 from pathlib import Path
 from typing import Any, Callable
 
-from gateway_common.worker_identity import validate_pid_namespace
+from gateway_common.worker_identity import (
+    validate_container_id,
+    validate_pid_namespace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,46 @@ def worker_pid_namespace(proc_root: Path | str = DEFAULT_PROC_ROOT) -> str | Non
     except OSError:
         return None
     return value if validate_pid_namespace(value) else None
+
+
+def worker_container_id() -> str | None:
+    """The container identity this worker can *prove*: the kernel's hostname.
+
+    Ruling **D25**. A container cannot read its own cgroup -- its cgroup
+    namespace is private, so ``/proc/self/cgroup`` is ``0::/`` -- but the
+    runtime gives it a hostname (Docker: the first 12 characters of the
+    container id) and the **agent** can see that same id in the worker's
+    host-side cgroup path, which is world-readable. So the anchor travels as
+    "what my hostname is" and the agent requires a candidate's cgroup to
+    *contain* it.
+
+    The value is read from the **kernel** (``uname(2)`` via
+    ``socket.gethostname``), not from a file the deployment could have written,
+    and it is shape-checked as a container id (lowercase hex, 12..64) here --
+    because the shape is what makes the agent's substring match meaningful.
+
+    ``None`` has two readings and both are honest: this platform has no
+    container identity (a macOS dev box, an embedder), or the deployment set
+    ``hostname:`` to something that is not a container id. Either way the
+    control plane records nothing and the *file operations* on this node refuse
+    **by name** -- never a looser match. That is the documented cost of the
+    anchor, and it is why a compose stack must not override the worker's
+    hostname (``docs/c3-privilege-relocation.md`` §11.2.1).
+    """
+    try:
+        value = socket.gethostname().strip()
+    except OSError:  # pragma: no cover - uname(2) does not fail in practice
+        return None
+    if not validate_container_id(value):
+        logger.warning(
+            "this worker's hostname (%r) is not a container id, so it has no "
+            "container identity to report: the control plane will refuse every "
+            "C3 file operation on this node by name -- do not set `hostname:` "
+            "on a C3 worker (the runtime's default is the container id)",
+            value,
+        )
+        return None
+    return value
 
 
 def build_identity_reporter(

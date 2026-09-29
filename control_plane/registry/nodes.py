@@ -55,6 +55,15 @@ class NodeRecord:
     #: runs several workers, and it is refreshed on every heartbeat because a
     #: restarted worker container has a new inode under the *same* node id.
     pid_namespace: str | None = None
+    #: C3 Task 4 / ruling D25: the worker's **container identity** (its
+    #: hostname, i.e. a prefix of the container id), reported at
+    #: register/heartbeat. It is the **file-operation** path's anchor: face B is
+    #: root without ``CAP_SYS_PTRACE`` and cannot read another uid's
+    #: ``/proc/<pid>/ns/pid``, but a candidate's host-side ``/proc/<pid>/cgroup``
+    #: is world-readable and carries this id. Refreshed on every heartbeat for
+    #: the same reason ``pid_namespace`` is: a recreated worker container is a
+    #: new container id under the same node id.
+    container_id: str | None = None
     #: C3 Task 4: the worker's own uid/gid, reported at register/heartbeat the
     #: same way its pid namespace is. Face B's file operations need them --
     #: ``e2b-maint chown --uid X --gid <worker gid>`` puts a sandbox tree in
@@ -104,6 +113,7 @@ class NodeRecord:
             "images": list(self.images),
             "labels": dict(self.labels),
             "pid_namespace": self.pid_namespace,
+            "container_id": self.container_id,
             "worker_uid": self.worker_uid,
             "worker_gid": self.worker_gid,
             "status": self.status,
@@ -338,6 +348,7 @@ class NodeRegistry:
         images: list[str] | None = None,
         labels: dict[str, str] | None = None,
         pid_namespace: str | None = None,
+        container_id: str | None = None,
         worker_uid: int | None = None,
         worker_gid: int | None = None,
     ) -> NodeRecord:
@@ -356,6 +367,7 @@ class NodeRegistry:
                     images=list(images or []),
                     labels=dict(labels or {}),
                     pid_namespace=pid_namespace,
+                    container_id=container_id,
                     worker_uid=worker_uid,
                     worker_gid=worker_gid,
                     reserved_memory_mb=reserved.get("memory", 0),
@@ -378,6 +390,11 @@ class NodeRegistry:
                 # this node fail closed until the next register.
                 if pid_namespace is not None:
                     record.pid_namespace = pid_namespace
+                # Same rule again for D25's anchor: only ever *set* here, so a
+                # rollout of older workers does not erase a container id the
+                # record already holds.
+                if container_id is not None:
+                    record.container_id = container_id
                 # Same rule as the pid namespace above: only ever *set* here,
                 # so a rollout of older workers does not erase an identity the
                 # record already holds.

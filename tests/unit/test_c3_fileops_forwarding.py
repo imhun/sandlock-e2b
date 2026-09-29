@@ -36,6 +36,9 @@ KEY_A = "key-node-a"
 ENDPOINT_A = NodeEndpoint("http://10.0.0.1:49983", "10.0.0.1")
 NODE_A = "node_a"
 PID_NAMESPACE = "pid:[4026532458]"
+#: The container identity a compose worker reports (D25): its hostname,
+#: which the runtime sets to the first 12 characters of the container id.
+CONTAINER_ID = "e4a98a0c5282"
 UID_X = 10007
 WORKER_UID = 65534
 WORKER_GID = 65534
@@ -186,6 +189,7 @@ async def _enroll(
     worker_identity: bool = True,
     host_uid: int | None = UID_X,
     pid_namespace: bool = True,
+    container_id: bool = True,
 ):
     """Register node A (with its worker identity) and put one sandbox on it."""
     registry = app.state.registry
@@ -212,6 +216,8 @@ async def _enroll(
     }
     if pid_namespace:
         body["pidNamespace"] = PID_NAMESPACE
+    if container_id:
+        body["containerID"] = CONTAINER_ID
     if worker_identity:
         body["workerUID"] = WORKER_UID
         body["workerGID"] = WORKER_GID
@@ -1222,7 +1228,9 @@ async def test_the_compose_shape_stores_the_claim_and_carries_the_anchor(
     The compose shape has no pod spec to read, so the control plane cannot
     answer here -- but it is not a shape that "cannot answer" either: the agent
     reads the worker's own process identity out of the kernel, and the anchor
-    that lets it do so is the pid namespace this control plane already records.
+    that lets it do so is the container id this control plane already records
+    (ruling D25 -- the cgroup path carries it and is world-readable, which is
+    what lets face B do the read without a capability or a uid change).
     So the node keeps the reported uid/gid as the value the agent will confirm,
     and every instruction that acts as the worker carries the anchor.
     """
@@ -1243,7 +1251,7 @@ async def test_the_compose_shape_stores_the_claim_and_carries_the_anchor(
             "path": str(shape.workspace_dir()),
             "worker_uid": WORKER_UID,
             "worker_gid": WORKER_GID,
-            "worker_pid_namespace": PID_NAMESPACE,
+            "worker_container_id": CONTAINER_ID,
             "verb": "chown",
             "uid": UID_X,
             "gid": WORKER_GID,
@@ -1259,15 +1267,16 @@ async def test_the_compose_shape_refuses_an_instruction_it_cannot_anchor(
 ) -> None:
     """No anchor ⇒ no kernel answer ⇒ the instruction is refused by name.
 
-    A worker that registers without a pid namespace (an older worker, or one
-    whose ``/proc`` carried no namespace identity) leaves nothing for the agent
-    to confirm the claim against. The control plane names that instead of
-    sending an instruction the agent would have to refuse anyway.
+    A worker that registers without a container id (an older worker, or one
+    whose hostname is not one -- a stack that overrode ``hostname:``) leaves
+    nothing for the agent to confirm the claim against. The control plane names
+    that instead of sending an instruction the agent would have to refuse
+    anyway.
     """
     shape = _C3Shape(workspace)
     agent = _StubAgentClient()
     app = _app(shape, client=agent, worker_identity=KernelWorkerIdentitySource())
-    await _enroll(app, pid_namespace=False)
+    await _enroll(app, container_id=False)
     node = app.state.nodes.get(NODE_A)
     assert (node.worker_uid, node.worker_gid) == (WORKER_UID, WORKER_GID)
 
@@ -1277,8 +1286,9 @@ async def test_the_compose_shape_refuses_an_instruction_it_cannot_anchor(
     assert resp.json() == {
         "code": 503,
         "message": (
-            f"node {NODE_A} has no pid namespace identity for the agent to "
-            "confirm its worker identity against: refusing to instruct the agent"
+            f"node {NODE_A} has reported no container id for the agent to "
+            "confirm its worker identity against (a C3 worker must keep the "
+            "runtime's hostname): refusing to instruct the agent"
         ),
     }
     assert agent.calls == []

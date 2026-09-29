@@ -78,7 +78,10 @@ from gateway_common.paths import (
     validate_node_id,
     validate_sandbox_id,
 )
-from gateway_common.worker_identity import validate_pid_namespace
+from gateway_common.worker_identity import (
+    validate_container_id,
+    validate_pid_namespace,
+)
 
 router = APIRouter()
 
@@ -141,6 +144,29 @@ def _worker_pid_namespace(body: dict[str, Any]) -> str | None:
             400,
             "pidNamespace must be a pid namespace identity such as "
             "'pid:[4026532458]'",
+        )
+    return value
+
+
+def _worker_container_id(body: dict[str, Any]) -> str | None:
+    """The worker's reported container identity, or a named refusal (D25).
+
+    The value is matched as a *substring* of a candidate's host-side cgroup
+    path, so it is shape-checked before it is stored: a value that cannot be a
+    container id (12..64 lowercase hex characters -- Docker's hostname is the
+    12-character prefix of the id) is refused here rather than matching loosely
+    later. Absent is *not* an error (an older worker during a rollout, or a
+    platform without a container identity): the record keeps none, and the
+    file-operation endpoint then refuses those instructions by name.
+    """
+    value = body.get("containerID")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not validate_container_id(value):
+        raise OfficialError(
+            400,
+            "containerID must be a container id such as the runtime's default "
+            "hostname (12..64 lowercase hex characters)",
         )
     return value
 
@@ -266,27 +292,36 @@ def _verified_worker_identity(
 
 
 def _worker_identity_anchor(request: Request, node, node_id: str) -> str | None:
-    """The pid namespace the agent must confirm a claim against, or ``None``.
+    """The container identity the agent must confirm a claim against, or ``None``.
+
+    Ruling **D25**: the anchor is the worker's **container id** (what its
+    hostname carries and what its host-side cgroup path contains), not its pid
+    namespace -- face B is root without ``CAP_SYS_PTRACE`` and cannot read
+    another uid's ``/proc/<pid>/ns/pid`` at all, while ``/proc/<pid>/cgroup`` is
+    world-readable. The file-operation path therefore confirms the claim against
+    a value face B can actually read, with no capability and no uid change.
 
     ``None`` has two readings, and both are correct: this deployment's shape
     verifies the identity itself (k8s -- no anchor travels), or the shape defers
-    to the kernel but the node has recorded no pid namespace to defer *with*.
+    to the kernel but the node has recorded no container id to defer *with*
+    (a platform without one, or a compose stack that overrode ``hostname:``).
     The second is a named refusal, not "send it anyway": an instruction the
     agent cannot confirm is exactly the one that must not be sent.
 
-    The value is the control plane's own record (:meth:`_worker_pid_namespace`
+    The value is the control plane's own record (:meth:`_worker_container_id`
     shape-checked it at register/heartbeat) and never the request's, so a
     file-op body still cannot name anything.
     """
     source = getattr(request.app.state, "worker_identity_source", None)
     if not getattr(source, "kernel_verified", False):
         return None
-    anchor = getattr(node, "pid_namespace", None)
-    if not validate_pid_namespace(anchor or ""):
+    anchor = getattr(node, "container_id", None)
+    if not validate_container_id(anchor or ""):
         raise OfficialError(
             503,
-            f"node {node_id} has no pid namespace identity for the agent to "
-            "confirm its worker identity against: refusing to instruct the agent",
+            f"node {node_id} has reported no container id for the agent to "
+            "confirm its worker identity against (a C3 worker must keep the "
+            "runtime's hostname): refusing to instruct the agent",
         )
     return anchor
 
@@ -502,6 +537,7 @@ async def register_node(request: Request) -> dict[str, Any]:
         )
     address = endpoint.address
     pid_namespace = _worker_pid_namespace(body)
+    container_id = _worker_container_id(body)
     worker_uid, worker_gid = _verified_worker_identity(
         request, node_id, _worker_identity_fields(body)
     )
@@ -515,6 +551,7 @@ async def register_node(request: Request) -> dict[str, Any]:
         images=body.get("images") or [],
         labels=body.get("labels") or {},
         pid_namespace=pid_namespace,
+        container_id=container_id,
         worker_uid=worker_uid,
         worker_gid=worker_gid,
     )
@@ -572,6 +609,11 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
     pid_namespace = _worker_pid_namespace(body)
     if pid_namespace is not None:
         record.pid_namespace = pid_namespace
+    # D25: the file-operation path's anchor travels the same way (a recreated
+    # container is a new id under the same node id).
+    container_id = _worker_container_id(body)
+    if container_id is not None:
+        record.container_id = container_id
     # C3 Task 4: same treatment for the worker's own uid/gid -- refreshed on
     # every heartbeat (a restart can change them under a k8s ``runAsGroup``),
     # and left alone when an older worker reports nothing.
@@ -887,7 +929,7 @@ async def node_file_op(node_id: str, request: Request) -> dict[str, Any]:
     # value itself (k8s) sends nothing extra, exactly as before.
     anchor = _worker_identity_anchor(request, node, node_id)
     if anchor is not None:
-        common["worker_pid_namespace"] = anchor
+        common["worker_container_id"] = anchor
     try:
         if spec.verb == "chown":
             answer = await client.chown(

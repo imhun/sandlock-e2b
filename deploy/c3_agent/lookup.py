@@ -7,8 +7,9 @@ discipline -- exact matches, named refusals, never a guess:
 * **which host pid is this slot's child** (C3 Task 3, ruling D9.3) --
   :meth:`ProcLookup.host_pid`;
 * **which uid/gid does this worker itself run as** (C3 Task 4, ruling D21
-  option 2) -- :meth:`ProcLookup.worker_uid_gid`, used by the compose lane,
-  whose face B has no pod spec to read the way the k8s lane does.
+  option 2 as amended by ruling **D25**) -- :meth:`ProcLookup.worker_uid_gid`,
+  used by the compose lane, whose face B has no pod spec to read the way the
+  k8s lane does.
 
 **The slot half (D9.3).** The worker forks the slot's child and reports the pid
 **it** knows; the agent,
@@ -39,30 +40,41 @@ The module is deliberately free of FastAPI and of ``as_uid``: it is a pure
 function of a ``/proc`` tree, so the DaemonSet can drive it unchanged
 (``deploy/c3_agent/app.py``) and this lane can drive it against a synthetic one.
 
-The worker-identity half has one more moving part, and it is the kernel's rather
-than this module's: a process may only read *another* process's ``ns/pid`` when
-their identities match (``ptrace_may_access``'s same-uid shortcut, or
-``CAP_SYS_PTRACE``). Face A is the workers' own uid and can read them directly;
-face B is root without ``CAP_SYS_PTRACE`` (it shares ``pid: host`` with the
-control plane, so that capability is deliberately absent), so *its* reads run in
-:class:`SubprocessWorkerIdentityResolver`'s child, which the deployment tells to
-run as the workers' identity. :func:`main` is that child.
+**The worker-identity half (D25).** The two faces ask different questions and
+read different files, and that is deliberate:
+
+* **face A** (uid 65534, the workers' own identity) resolves a *slot's* pid and
+  may read ``ns/pid`` -- the kernel allows it because the identities match.
+  That path is unchanged.
+* **face B** (root, ``pid: host``, *no* ``CAP_SYS_PTRACE`` and no ability to
+  change uid) cannot read another uid's ``ns/pid`` at all, so it resolves the
+  worker's identity from files that are **world-readable**: it matches
+  candidates by ``/proc/<pid>/cgroup`` (which carries the container id the
+  runtime also puts in the worker's hostname) and reads the identity out of
+  ``/proc/<pid>/status``. No capability is added, no uid is changed, and the
+  slot path stays as narrow as it was.
+
+Every failure is a named refusal: a pid that is gone is named as such (the name
+the task brief fixes), a candidate in another namespace is named, a container
+the agent can see no process of is named, and candidates whose kernel
+identities *disagree* are refused as ambiguous -- while several candidates that
+agree are fine, because one container's processes share one identity (the old
+"exactly one process" rule is what squeezed the compose lanes to one live slot
+per worker; see :meth:`ProcLookup.worker_uid_gid`).
 """
 
 from __future__ import annotations
 
-import argparse
-import json
 import logging
 import os
-import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from gateway_common.worker_identity import (
+    container_cgroup_token,
     pod_cgroup_token,
+    validate_container_id,
     validate_pid_namespace,
     validate_pod_uid,
 )
@@ -76,11 +88,6 @@ DEFAULT_PROC_ROOT = Path("/proc")
 #: not a status file and is refused rather than partially parsed.
 _STATUS_MAX_BYTES = 65536
 
-#: The exit code the resolver entry point uses for a *named* refusal (the same
-#: "the privileged/reference step ran and declined" shape ``maint.c`` has).
-RESOLVER_REFUSED = 3
-
-
 class LookupRefusal(Exception):
     """A named, fail-closed refusal: no host pid may be written from this."""
 
@@ -92,11 +99,31 @@ class WorkerIdentity:
     ``pid_namespace`` is the worker's own reported identity and ``pod_uid`` is
     the k8s lane's independent proof. A lane that cannot supply
     ``pid_namespace`` cannot be resolved at all (see :meth:`ProcLookup.host_pid`).
+
+    This is the **slot** path's identity (face A, the workers' own uid, where
+    ``/proc/<pid>/ns/pid`` is readable). The file-operation path's anchor is
+    :class:`WorkerAnchor` -- a different question, asked by a different face,
+    with a different value (ruling D25).
     """
 
     node_id: str
     pid_namespace: str
     pod_uid: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkerAnchor:
+    """Which worker a *file-operation* claim is about (ruling D25).
+
+    ``container_id`` is the worker's hostname (the runtime sets it to a prefix
+    of the container id). The agent accepts a candidate process only when its
+    host-side ``/proc/<pid>/cgroup`` *contains* this value -- and that file is
+    world-readable, which is the whole point: the face that asks this question
+    cannot read ``ns/pid`` of another uid at all.
+    """
+
+    node_id: str
+    container_id: str
 
 
 @dataclass(frozen=True)
@@ -124,27 +151,6 @@ def missing_slot_pid_message(sandbox_id: str) -> str:
     asserted verbatim by the tests on both sides of the hop.
     """
     return f"沙箱 {sandbox_id} 的槽位 pid 已不在"
-
-
-def worker_identity_refusal_message(
-    node_id: str, pid_namespace: str, reader: tuple[int, int]
-) -> str:
-    """The name for "this anchor holds no process *this resolver* can see".
-
-    Spelled once because it is raised from two places -- the ``/proc`` walk in
-    :meth:`ProcLookup.worker_uid_gid` and the entry point the resolver child
-    runs -- and an operator greps for one spelling. The reader's own identity is
-    part of the name on purpose: the kernel only lets a process read *another*
-    process's namespace when the two identities match (``ptrace_may_access``'s
-    same-uid shortcut, or ``CAP_SYS_PTRACE``), so a resolver running as the
-    wrong uid sees **nothing at all** -- a deployment error, not an unknown
-    worker.
-    """
-    return (
-        f"worker {node_id}'s pid namespace ({pid_namespace}) holds no process "
-        f"this identity resolver can see (it runs as {reader[0]}:{reader[1]}): "
-        "refusing to derive its own uid/gid"
-    )
 
 
 def _effective_column(line: str) -> int | None:
@@ -276,83 +282,155 @@ class ProcLookup:
             return None
         return uid, gid
 
+    def _is_container_init(self, pid: int) -> bool:
+        """Is this process the *container's* own init (i.e. the worker itself)?
+
+        The anchor alone is not enough on this lane, and the reason is measured
+        (compose multinode, 2026-09-29): a sandbox's slot processes live in the
+        **worker's own container cgroup** -- ``sandlock-supervise`` runs as the
+        pooled uid (10000…) while the worker runs as 65534 -- so "processes
+        whose cgroup carries the anchor" is a set with *more than one identity
+        in it*, and picking an answer from it by agreement would refuse every
+        legitimate operation (and picking the majority would be a guess).
+
+        The worker's own process is the one the runtime started as the
+        container's init: its ``NSpid`` chain, read from the host's pid
+        namespace (this face runs ``pid: host``), is exactly ``[<host pid>, 1]``.
+        The slot processes are ``[<host pid>, N]`` with ``N != 1`` (they were
+        forked inside the worker's namespace) or ``[<host pid>, N, 1]`` /
+        ``[<host pid>, N, M]`` (inside the sandbox's own pid namespace, which
+        ``E2B_PID_NS=true`` gives them). Only the init matches, and that is
+        exactly the process whose uid/gid the file operations must act as.
+
+        A deployment that runs the worker with ``pid: host`` (no container pid
+        namespace) has no such process: that is a **named refusal**, the same
+        class of constraint as overriding ``hostname:``.
+        """
+        status = self._status(pid)
+        if status is None:
+            return False
+        chain = _nspid_chain(status)
+        return chain is not None and len(chain) == 2 and chain[-1] == 1
+
     def worker_uid_gid(
         self,
-        identity: WorkerIdentity,
+        anchor: WorkerAnchor,
         *,
         claimed: tuple[int, int] | None = None,
-        reader: tuple[int, int] | None = None,
     ) -> tuple[int, int]:
-        """The worker's **own** uid/gid, read out of the kernel (D21 option 2).
+        """The worker's **own** uid/gid, read out of the kernel (D25).
 
-        The anchor is the worker's pid namespace identity -- the value the
-        worker reports and the control plane records for the slot hand-off
-        (ruling D9.3) -- and the answer is the identity the kernel prints for
-        the process(es) in it. Nothing about the worker's *claim* decides the
-        answer: ``claimed`` is only compared against what the kernel says, so a
-        claim the kernel does not confirm is a refusal, never a value handed to
-        ``--worker``.
+        **Why this does not read ``ns/pid``.** The file-operation path runs on
+        face B: root **without** ``CAP_SYS_PTRACE`` (it shares ``pid: host``
+        with the control plane, so that capability is deliberately absent).
+        ``ptrace_may_access`` allows ``readlink /proc/<pid>/ns/pid`` only for a
+        process of the same uid or with that capability, so face B sees nothing
+        there -- and giving it the capability, or letting it change uid to the
+        worker's, both cost more than the job needs. ``/proc/<pid>/cgroup`` and
+        ``/proc/<pid>/status`` are **world-readable**, and the container id the
+        runtime puts in the worker's hostname appears verbatim in its cgroup
+        path, so this is the same lookup with none of that cost (ruling D25;
+        measured on the compose lanes 2026-09-29: ``0::/../e4a98a0c528215e…``).
 
-        ``reader`` is the identity this resolver runs as (the process's own
-        ``euid``/``egid`` when it is not given). It is not decoration: the
-        kernel's ``ptrace_may_access`` rule means a process can only read the
-        ``/proc/<pid>/ns/pid`` of a process whose identity matches its own, so
-        the reader decides what the walk can see at all -- which is why the
-        "nothing in this namespace" refusal names it.
+        **The predicate is: the container's init, then agreement among
+        candidates** (ruling D4 as measured on this lane). Two steps, and the
+        first one is not decoration:
+
+        1. candidates are the processes whose cgroup carries the anchor **and
+           which are the container's init** (:meth:`_is_container_init`). One
+           container's *processes* do **not** all share one uid on this lane --
+           a sandbox's ``sandlock-supervise`` runs as the pooled uid (10000…)
+           inside the worker's container cgroup, while the worker runs as 65534
+           (measured 2026-09-29: the same cgroup holds ``uid=65534 NSpid=[host,
+           1]`` and ``uid=10000 NSpid=[host, 71]``) -- so the cgroup alone names
+           a *container*, and the init names the *worker*;
+        2. **zero** candidates ⇒ refuse by name (a recreated worker, a stale
+           anchor, a deployment that overrode ``hostname:``, or one that gave
+           the worker the host pid namespace -- never a guess); all candidates
+           must agree on ``(uid, gid)``, and a disagreement ⇒ refuse by name.
+           That is what stops a value the kernel did not report for a worker
+           process from ever being adopted.
+
+        Uniqueness of the *process set* is deliberately **not** required: a
+        running slot, any ``docker exec``, and an unreaped child (a zombie still
+        counts as a process) all made the old "exactly one process in the
+        namespace" rule refuse -- which squeezed the compose lanes to one live
+        slot per worker.
+
+        Nothing about the worker's *claim* decides the answer: ``claimed`` is
+        only compared against what the kernel says, so a claim the kernel does
+        not confirm is a refusal, never a value handed to ``--worker``.
 
         Raises :class:`LookupRefusal` -- always by name, never with a guess --
-        for an unusable anchor, for a namespace that holds no readable process,
-        for one that holds more than one, for a status file the kernel's
-        identity cannot be read from, for a worker that runs as root, and for a
+        for an unusable anchor, for a container the agent can see no process of,
+        for a status file the kernel's identity cannot be read from, for
+        candidates that disagree, for a worker that runs as root, and for a
         claim the kernel does not confirm.
         """
-        if not validate_pid_namespace(identity.pid_namespace):
+        if not validate_container_id(anchor.container_id):
             raise LookupRefusal(
-                f"worker {identity.node_id} carries no usable pid namespace "
-                f"identity ({identity.pid_namespace!r}): refusing to derive its "
-                "own uid/gid from the kernel"
+                f"worker {anchor.node_id} carries no usable container id "
+                f"({anchor.container_id!r}): refusing to derive its own uid/gid "
+                "from the kernel"
             )
-        who = reader if reader is not None else (os.geteuid(), os.getegid())
-        in_namespace: list[int] = []
+        token = container_cgroup_token(anchor.container_id)
+        candidates: list[int] = []
         for pid in self._iter_entries():
-            # ``None`` is "not readable from here" (another identity's process)
-            # or "gone": neither is this worker's own process.
-            if self._pid_namespace(pid) == identity.pid_namespace:
-                in_namespace.append(pid)
-        if not in_namespace:
+            cgroup = self._cgroup(pid)
+            # ``None`` is "gone" or "unreadable"; neither is a process of this
+            # container (the file is world-readable, so this is not a
+            # permission question).
+            if cgroup is not None and token in cgroup and self._is_container_init(pid):
+                candidates.append(pid)
+        if not candidates:
             raise LookupRefusal(
-                worker_identity_refusal_message(
-                    identity.node_id, identity.pid_namespace, who
-                )
+                f"worker {anchor.node_id}'s container ({anchor.container_id}) "
+                "holds no process this agent can identify as the worker (the "
+                "container's init): refusing to derive its own uid/gid from the "
+                "kernel"
             )
-        if len(in_namespace) != 1:
+        values: set[tuple[int, int]] = set()
+        for pid in candidates:
+            pair = self._uid_gid(pid)
+            if pair is None:
+                if (self._proc_root / str(pid)).exists():
+                    raise LookupRefusal(
+                        f"the kernel's uid/gid for one of worker "
+                        f"{anchor.node_id}'s processes cannot be read: refusing"
+                    )
+                # Gone between the walk and the read: it is not a process of
+                # this container any more, and a recycled pid cannot come back
+                # inside the same container id.
+                continue
+            values.add(pair)
+        if not values:
             raise LookupRefusal(
-                f"worker {identity.node_id}'s pid namespace "
-                f"({identity.pid_namespace}) holds more than one process: "
-                "refusing (ambiguous)"
+                f"worker {anchor.node_id}'s container ({anchor.container_id}) "
+                "holds no process this agent can identify as the worker (the "
+                "container's init): refusing to derive its own uid/gid from the "
+                "kernel"
             )
-        pid = in_namespace[0]
-        values = self._uid_gid(pid)
-        if values is None:
+        if len(values) != 1:
             raise LookupRefusal(
-                f"the kernel's uid/gid for worker {identity.node_id} (pid "
-                f"namespace {identity.pid_namespace}) cannot be read: refusing"
+                f"worker {anchor.node_id}'s container ({anchor.container_id}) "
+                f"holds processes whose kernel identities disagree "
+                f"({sorted(values)}): refusing to derive one identity from them"
             )
-        uid, gid = values
+        uid, gid = values.pop()
         if uid <= 0 or gid <= 0:
             # ``--worker`` writes this value and the ``--gid`` gate compares
             # against it; uid 0 is not a worker identity (the same rule the
             # control plane applies to a report, and ``maint.c``'s pool gate
             # applies to a pooled uid).
             raise LookupRefusal(
-                f"worker {identity.node_id}'s process in "
-                f"{identity.pid_namespace} runs as uid/gid {(uid, gid)} "
+                f"worker {anchor.node_id}'s processes in "
+                f"{anchor.container_id} run as uid/gid {(uid, gid)} "
                 "according to the kernel: refusing (a worker may not run as root)"
             )
         if claimed is not None and (uid, gid) != claimed:
             raise LookupRefusal(
-                f"worker {identity.node_id} claims uid/gid {claimed}, but the "
-                f"kernel says {(uid, gid)} for {identity.pid_namespace}: "
+                f"worker {anchor.node_id} claims uid/gid {claimed}, but the "
+                f"kernel says {(uid, gid)} for {anchor.container_id}: "
                 "refusing (a worker does not name the identity its privileged "
                 "steps act as)"
             )
@@ -461,217 +539,28 @@ class WorkerIdentityResolver(Protocol):
     """Face B's seam: one anchor in, the kernel's uid/gid out -- or a refusal."""
 
     def resolve(
-        self, identity: WorkerIdentity, *, claimed: tuple[int, int]
+        self, anchor: WorkerAnchor, *, claimed: tuple[int, int]
     ) -> tuple[int, int]: ...
 
 
 class ProcWorkerIdentityResolver:
-    """In-process resolution against a ``/proc`` tree.
+    """The shipped resolver: in-process, against the host's own ``/proc``.
 
-    This is the code the resolver entry point runs (:func:`main`), and the shape
-    a test or an embedder drives directly. ``reader`` is explicit here for the
-    same reason it is a parameter of :meth:`ProcLookup.worker_uid_gid`: the
-    kernel's rule for reading another process's namespace is what decides what
-    the walk can see, and a synthetic tree has no such rule.
+    Face B runs with ``pid: host``, so ``/proc`` *is* the host's process table
+    and the two files this reads (``cgroup``, ``status``) are world-readable --
+    no uid change, no capability, no child process (ruling D25). The lookup
+    itself lives in :meth:`ProcLookup.worker_uid_gid`, which is a pure function
+    of a ``/proc`` tree so the same code can be driven against a synthetic one.
     """
 
-    def __init__(
-        self, lookup: ProcLookup, *, reader: tuple[int, int] | None = None
-    ) -> None:
+    def __init__(self, lookup: ProcLookup) -> None:
         self._lookup = lookup
-        self._reader = reader
 
     def resolve(
-        self, identity: WorkerIdentity, *, claimed: tuple[int, int]
+        self, anchor: WorkerAnchor, *, claimed: tuple[int, int]
     ) -> tuple[int, int]:
-        return self._lookup.worker_uid_gid(
-            identity, claimed=claimed, reader=self._reader
-        )
+        return self._lookup.worker_uid_gid(anchor, claimed=claimed)
 
 
-class SubprocessWorkerIdentityResolver:
-    """Face B's shipped resolver: the kernel read runs as the workers' identity.
-
-    Face B is root **without** ``CAP_SYS_PTRACE`` on purpose -- it runs with
-    ``pid: host`` beside the control plane, so giving it that capability would
-    let it read the control plane's memory, which is a worse hole than the one
-    this lane closes. The kernel's own rule is the way through instead: a reader
-    whose identity matches a process's may inspect it, so the child that does
-    the ``/proc`` walk runs as the identity the deployment's workers run as
-    (``E2B_C3_AGENT_RESOLVER_UID``/``_GID`` -- the worker image's ``USER`` by
-    default).
-
-    The child is one short-lived process per kernel-anchored instruction: it
-    prints exactly one JSON line (``{"uid":…,"gid":…}`` on success,
-    ``{"error":…}`` on a named refusal) and exits 0/``RESOLVER_REFUSED``. Its
-    environment is built from scratch rather than inherited, so face B's own
-    ``E2B_C3_AGENT_TOKEN`` never reaches it.
-
-    ``process_runner`` is the single seam a test replaces.
-    """
-
-    def __init__(
-        self,
-        *,
-        uid: int,
-        gid: int,
-        timeout_s: float = 10.0,
-        python: str | None = None,
-        process_runner=None,
-        package_root: Path | None = None,
-    ) -> None:
-        self._uid = int(uid)
-        self._gid = int(gid)
-        self._timeout_s = float(timeout_s)
-        self._python = python or sys.executable
-        self._run_process = process_runner or subprocess.run
-        self._package_root = (
-            Path(package_root) if package_root is not None else _package_root()
-        )
-
-    def resolve(
-        self, identity: WorkerIdentity, *, claimed: tuple[int, int]
-    ) -> tuple[int, int]:
-        argv = [
-            self._python,
-            "-m",
-            "deploy.c3_agent.lookup",
-            "resolve-worker",
-            "--node-id",
-            identity.node_id,
-            "--pid-namespace",
-            identity.pid_namespace,
-            "--claimed-uid",
-            str(claimed[0]),
-            "--claimed-gid",
-            str(claimed[1]),
-        ]
-        try:
-            proc = self._run_process(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_s,
-                check=False,
-                env=_resolver_env(self._package_root),
-                user=self._uid,
-                group=self._gid,
-                extra_groups=[],
-            )
-        except OSError as exc:
-            # ``strerror`` keeps the message operator-sized; an agent container
-            # without a python at ``sys.executable`` is a deployment error.
-            detail = exc.strerror or type(exc).__name__
-            raise LookupRefusal(
-                f"could not run the identity resolver as {self._uid}:{self._gid}: "
-                f"{detail}"
-            ) from exc
-        except subprocess.SubprocessError as exc:
-            raise LookupRefusal(
-                f"the identity resolver did not answer within {self._timeout_s}s "
-                f"({type(exc).__name__}): refusing"
-            ) from exc
-        refused = _resolver_error(proc.stdout)
-        if proc.returncode != 0:
-            if refused is not None:
-                # The child's own words, verbatim: the same rule the agent
-                # applies to ``e2b-maint``'s refusals, so one spelling travels
-                # all the way to the operator.
-                raise LookupRefusal(refused)
-            detail = (proc.stderr or proc.stdout or "").strip()
-            raise LookupRefusal(
-                f"the identity resolver refused (exit {proc.returncode}): "
-                f"{detail}"
-            )
-        answer = _resolver_answer(proc.stdout)
-        if answer is None:
-            raise LookupRefusal(
-                "the identity resolver answered something that is not one "
-                f"uid/gid ({proc.stdout!r}): refusing"
-            )
-        return answer
-
-
-def _package_root() -> Path:
-    """The directory ``deploy``'s package lives in (the child's ``PYTHONPATH``)."""
-    return Path(__file__).resolve().parents[2]
-
-
-def _resolver_env(package_root: Path) -> dict[str, str]:
-    """The resolver child's environment: enough to import this package, nothing else.
-
-    Built rather than inherited on purpose: the child is another process on the
-    same host, and face B's environment holds the CP→agent credential.
-    """
-    return {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "PYTHONPATH": str(package_root),
-        "PYTHONUNBUFFERED": "1",
-        "LANG": os.environ.get("LANG", "C.UTF-8"),
-    }
-
-
-def _resolver_answer(stdout: str) -> tuple[int, int] | None:
-    """``(uid, gid)`` from the resolver's one-line answer, or ``None``."""
-    try:
-        payload = json.loads(stdout)
-    except ValueError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    uid = payload.get("uid")
-    gid = payload.get("gid")
-    if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
-        return None
-    if not isinstance(gid, int) or isinstance(gid, bool) or gid <= 0:
-        return None
-    return uid, gid
-
-
-def _resolver_error(stdout: str) -> str | None:
-    """The named refusal in the resolver's answer, when it carries one."""
-    try:
-        payload = json.loads(stdout)
-    except ValueError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    error = payload.get("error")
-    return error if isinstance(error, str) and error else None
-
-
-def main(argv: list[str] | None = None) -> int:
-    """``python -m deploy.c3_agent.lookup resolve-worker …`` (the resolver child).
-
-    This entry point *is* the one thing face B cannot do itself: read another
-    identity's ``/proc/<pid>/ns/pid``. It prints exactly one JSON line and exits
-    0 (an identity) or ``RESOLVER_REFUSED`` (a named refusal), so the parent's
-    judgement is the same strict one this package gives every other
-    subprocess -- a half-printed or extra line is refused there.
-    """
-    parser = argparse.ArgumentParser(prog="deploy.c3_agent.lookup")
-    commands = parser.add_subparsers(dest="command", required=True)
-    resolve = commands.add_parser(
-        "resolve-worker", help="the kernel's uid/gid for a worker's pid namespace"
-    )
-    resolve.add_argument("--node-id", required=True)
-    resolve.add_argument("--pid-namespace", required=True)
-    resolve.add_argument("--claimed-uid", type=int, required=True)
-    resolve.add_argument("--claimed-gid", type=int, required=True)
-    args = parser.parse_args(list(argv) if argv is not None else None)
-    identity = WorkerIdentity(
-        node_id=args.node_id, pid_namespace=args.pid_namespace
-    )
-    try:
-        uid, gid = ProcLookup().worker_uid_gid(
-            identity, claimed=(args.claimed_uid, args.claimed_gid)
-        )
-    except LookupRefusal as exc:
-        print(json.dumps({"error": str(exc)}), flush=True)
-        return RESOLVER_REFUSED
-    print(json.dumps({"uid": uid, "gid": gid}), flush=True)
-    return 0
-
-
-if __name__ == "__main__":  # pragma: no cover - driven by the agent's subprocess
-    sys.exit(main())
+if __name__ == "__main__":  # pragma: no cover - there is nothing to run
+    raise SystemExit("deploy.c3_agent.lookup is a library: the agent imports it")

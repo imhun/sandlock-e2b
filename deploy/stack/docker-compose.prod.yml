@@ -285,6 +285,13 @@ services:
     # E5.1: non-root supervisor (uid 65534). The image pre-creates
     # /var/lib/e2b-sandboxes owned by 65534; upgrade.sh migrates an
     # existing root-owned volume once.
+    # C3 Task 4 / ruling D25: this service's **hostname is its identity** --
+    # the worker reports it (the kernel's value, the runtime sets it to the
+    # container id's 12-character prefix) and the agent matches it against the
+    # cgroup path of the worker's own processes to learn the uid/gid the file
+    # operations act as. So: **do not set `hostname:` here** -- an overridden
+    # hostname is not a container id, which turns every file operation that
+    # needs the worker identity into a *named* refusal on this node.
     user: "65534:65534"
     depends_on:
       control-plane:

@@ -197,6 +197,15 @@ services:
     depends_on:
       image-cache-init:
         condition: service_completed_successfully
+    # C3 Task 4 / ruling D25: this service's **hostname is its identity** --
+    # the worker reports it (the kernel's value, which the runtime sets to the
+    # container id's 12-character prefix) and the agent matches it against the
+    # cgroup path of the worker's own processes to learn the uid/gid the file
+    # operations act as. So: **do not set `hostname:` here.** An overridden
+    # hostname is not a container id, which turns every file operation that
+    # needs the worker identity (including the create-path ownership hand-over)
+    # into a *named* refusal on this node -- never a wrong identity.
+    # `tests/unit/test_c3_agent_manifest.py` pins the absence of the key.
     # E5.1: non-root supervisor (uid 65534); upgrade.sh migrates existing
     # root-owned worker-data volumes once.
     user: "65534:65534"

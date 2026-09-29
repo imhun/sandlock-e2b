@@ -30,21 +30,25 @@ Surface (all responses JSON objects):
   named fail-closed refusal (a half-applied grant must never read as success).
 - ``POST /internal/nodes/{node_id}/agent/{chown|rm|walk}`` (face B, Task 4)
   ``{"sandbox_id", "path", "uid"?, "gid"?, "recursive"?, "worker_owned"?,
-  "worker": {"uid", "gid", "node_id"?, "pid_namespace"?}}`` -> the verb's own
+  "worker": {"uid", "gid", "node_id"?, "container_id"?}}`` -> the verb's own
   answer. The **verb list is the whitelist** (D18.2) and an unknown verb is
   refused by name; ``path`` and ``uid`` are the control plane's values (hard
   rules 1/3 -- the worker never names either), and the path discipline is
   ``e2b-maint``'s (:mod:`deploy.c3_agent.fileops` execs that same binary with
   the same roots).
 
-  ``worker.pid_namespace`` is the compose lane's anchor (ruling D21 option 2):
-  when it is present the worker's uid/gid are read **from the kernel** for the
-  process(es) in that pid namespace
-  (:meth:`deploy.c3_agent.lookup.ProcLookup.worker_uid_gid`) and the values in
-  the body are only a claim to be confirmed. A claim the kernel does not confirm
-  -- or an anchor that names no process, or more than one -- is a named 502 and
-  no ``e2b-maint`` runs. The k8s lane sends no anchor: its value was verified by
-  the control plane against the worker pod's ``securityContext``, and it is used
+  ``worker.container_id`` is the compose lane's anchor (rulings D21 option 2
+  and **D25**): when it is present the worker's uid/gid are read **from the
+  kernel** -- candidates matched by the container id that appears in their
+  world-readable ``/proc/<pid>/cgroup``, the identity then read from
+  ``/proc/<pid>/status``
+  (:meth:`deploy.c3_agent.lookup.ProcLookup.worker_uid_gid`) -- and the values
+  in the body are only a claim to be confirmed. A claim the kernel does not
+  confirm -- or an anchor no process carries, or candidates whose identities
+  disagree -- is a named 502 and no ``e2b-maint`` runs. No capability and no
+  uid change is involved, which is why face B keeps its three-capability set
+  (judgment 4). The k8s lane sends no anchor: its value was verified by the
+  control plane against the worker pod's ``securityContext``, and it is used
   exactly as sent.
 
 Auth: every request must carry ``X-Internal-Key`` equal to
@@ -97,7 +101,8 @@ from deploy.c3_agent.fileops import (
 from deploy.c3_agent.lookup import (
     LookupRefusal,
     ProcLookup,
-    SubprocessWorkerIdentityResolver,
+    ProcWorkerIdentityResolver,
+    WorkerAnchor,
     WorkerIdentity,
     WorkerIdentityResolver,
     missing_slot_pid_message,
@@ -151,20 +156,20 @@ class WorkerCredentials(BaseModel):
     ``chown --worker`` into "hand the tree to root" (see
     :mod:`deploy.c3_agent.fileops`).
 
-    ``pid_namespace`` is present exactly when the control plane's shape could
+    ``container_id`` is present exactly when the control plane's shape could
     not verify the claim itself (the compose lane: no pod spec to read) and is
-    therefore asking the agent to confirm it against the kernel (ruling D21
-    option 2). Its presence is what selects that path, so a k8s instruction --
-    whose value the control plane already verified -- carries none and behaves
-    exactly as it did before. ``node_id`` is the *worker's* name, carried only
-    so a kernel-side refusal can name it (the URL carries the agent's own
-    identity, which is a different fact -- D12).
+    therefore asking the agent to confirm it against the kernel (rulings D21
+    option 2 and D25). Its presence is what selects that path, so a k8s
+    instruction -- whose value the control plane already verified -- carries
+    none and behaves exactly as it did before. ``node_id`` is the *worker's*
+    name, carried only so a kernel-side refusal can name it (the URL carries
+    the agent's own identity, which is a different fact -- D12).
     """
 
     uid: int = Field(ge=1)
     gid: int = Field(ge=1)
     node_id: str | None = Field(default=None, min_length=1)
-    pid_namespace: str | None = Field(default=None, min_length=1)
+    container_id: str | None = Field(default=None, min_length=1)
 
 
 class FileOpBody(BaseModel):
@@ -306,11 +311,7 @@ def create_app(
     # own (and face B, deliberately, has neither the workers' uid nor
     # ``CAP_SYS_PTRACE``). The k8s lane never reaches it -- its instructions
     # carry no anchor.
-    identity_resolver = identity_resolver or SubprocessWorkerIdentityResolver(
-        uid=settings.resolver_uid,
-        gid=settings.resolver_gid,
-        timeout_s=settings.resolver_timeout_s,
-    )
+    identity_resolver = identity_resolver or ProcWorkerIdentityResolver(lookup)
     # Task 6's eyes: built from the container's own knobs unless the caller
     # injected one (tests, an embedder) -- and ``None`` means "this container
     # does not scan", which only the face that mounts the workspaces should be
@@ -469,10 +470,10 @@ def create_app(
         * **no anchor** -- the k8s lane. The control plane verified the value
           against the worker pod's ``securityContext``, so it is used as sent
           (this is the pre-existing behaviour, unchanged);
-        * **an anchor** -- the compose lane (D21 option 2). The value sent is a
-          *claim*: the kernel's answer for the worker's own process is the
-          identity, and a claim the kernel does not confirm is refused **by
-          name**, before any ``chown``/``rm``/``walk`` is exec'd.
+        * **an anchor** -- the compose lane (D21 option 2, D25). The value
+          sent is a *claim*: the kernel's answer for the worker's own processes
+          is the identity, and a claim the kernel does not confirm is refused
+          **by name**, before any ``chown``/``rm``/``walk`` is exec'd.
 
         A refusal is a 502 with the kernel's own words, the same status a
         refused ``e2b-maint`` step gets: the control plane must not read "the
@@ -480,7 +481,7 @@ def create_app(
         """
         if body.worker is None:
             return None, None
-        anchor = body.worker.pid_namespace
+        anchor = body.worker.container_id
         if anchor is None:
             return body.worker.uid, body.worker.gid
         if body.worker.node_id is None:
@@ -493,8 +494,8 @@ def create_app(
                     )
                 },
             )
-        identity = WorkerIdentity(
-            node_id=body.worker.node_id, pid_namespace=anchor
+        identity = WorkerAnchor(
+            node_id=body.worker.node_id, container_id=anchor
         )
         try:
             return identity_resolver.resolve(

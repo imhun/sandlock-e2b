@@ -47,7 +47,11 @@ from urllib.parse import urlsplit
 import httpx
 
 from gateway_common.paths import validate_node_id
-from gateway_common.worker_identity import validate_pid_namespace, validate_pod_uid
+from gateway_common.worker_identity import (
+    validate_container_id,
+    validate_pid_namespace,
+    validate_pod_uid,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -367,33 +371,40 @@ def _worker_body(
     node_id: str,
     worker_uid: int,
     worker_gid: int,
-    worker_pid_namespace: str | None,
+    worker_container_id: str | None,
 ) -> dict[str, Any]:
     """One instruction's ``worker`` block (face B's "who does this act as").
 
     ``uid``/``gid`` are the control plane's own record for the node -- the value
     it verified (k8s) or the claim the agent confirms (compose, D21 option 2).
-    ``pid_namespace`` is the anchor that makes the compose shape's confirmation
-    a *lookup*: it is present only when the shape defers to the kernel, and the
-    worker's own name travels with it so the agent's refusal can name who it was
-    asked about.
+    ``container_id`` is the anchor that makes the compose shape's confirmation a
+    *lookup* (ruling **D25**): it is present only when the shape defers to the
+    kernel, and the worker's own name travels with it so the agent's refusal can
+    name who it was asked about.
+
+    Why the anchor is the container id and not the pid namespace (D25): face B
+    is root **without** ``CAP_SYS_PTRACE``, and ``readlink /proc/<pid>/ns/pid``
+    is only allowed for a process of the same uid or with that capability --
+    while ``/proc/<pid>/cgroup`` is world-readable and carries the container id.
+    The slot path keeps the pid namespace because it runs on face A, as the
+    workers' own uid, where the narrower read is allowed.
 
     The anchor is shape-checked here as well as where it was recorded ("two
     layers, neither replaces the other" -- the same rule the path discipline
-    follows): a value that cannot be a namespace identity must never reach the
+    follows): a value that cannot be a container id must never reach the
     agent's ``/proc`` walk, and this is the last hop that can say so.
     """
     body: dict[str, Any] = {"uid": int(worker_uid), "gid": int(worker_gid)}
-    if worker_pid_namespace is None:
+    if worker_container_id is None:
         return body
-    if not validate_pid_namespace(worker_pid_namespace):
+    if not validate_container_id(worker_container_id):
         raise AgentClientError(
-            f"the pid namespace anchor carried for node {node_id} is not a pid "
-            "namespace identity: refusing to instruct the agent",
+            f"the container-id anchor carried for node {node_id} is not a "
+            "container id: refusing to instruct the agent",
             status_code=503,
         )
     body["node_id"] = node_id
-    body["pid_namespace"] = worker_pid_namespace
+    body["container_id"] = worker_container_id
     return body
 
 
@@ -540,7 +551,7 @@ class C3AgentClient:
         path: str,
         worker_uid: int,
         worker_gid: int,
-        worker_pid_namespace: str | None = None,
+        worker_container_id: str | None = None,
         uid: int | None = None,
         gid: int | None = None,
         recursive: bool = False,
@@ -555,11 +566,12 @@ class C3AgentClient:
         that ``--worker`` and the group gate keep the meaning they have behind
         the worker's broker (see ``deploy/c3_agent/fileops.py``).
 
-        ``worker_pid_namespace`` is D21 option 2's anchor: present when this
-        deployment's shape could not verify the identity itself (compose), so
-        the agent reads it from the kernel and refuses a claim it does not
-        confirm. A shape that verified it (k8s) passes ``None`` and the
-        instruction is byte-for-byte what it always was.
+        ``worker_container_id`` is the anchor (D21 option 2 as amended by
+        **D25**): present when this deployment's shape could not verify the
+        identity itself (compose), so the agent reads the worker's uid/gid from
+        the kernel and refuses a claim it does not confirm. A shape that
+        verified it (k8s) passes ``None`` and the instruction is
+        byte-for-byte what it always was.
         """
         body = {
             "sandbox_id": sandbox_id,
@@ -570,7 +582,7 @@ class C3AgentClient:
                 node_id=node_id,
                 worker_uid=worker_uid,
                 worker_gid=worker_gid,
-                worker_pid_namespace=worker_pid_namespace,
+                worker_container_id=worker_container_id,
             ),
         }
         if uid is not None:
@@ -587,7 +599,7 @@ class C3AgentClient:
         path: str,
         worker_uid: int | None = None,
         worker_gid: int | None = None,
-        worker_pid_namespace: str | None = None,
+        worker_container_id: str | None = None,
         target: AgentTarget | None = None,
     ) -> dict[str, Any]:
         """Instruct the agent to run ``e2b-maint rm`` on a CP-derived path.
@@ -604,7 +616,7 @@ class C3AgentClient:
                 node_id=node_id,
                 worker_uid=worker_uid,
                 worker_gid=worker_gid,
-                worker_pid_namespace=worker_pid_namespace,
+                worker_container_id=worker_container_id,
             )
         return await self._file_op(node_id, "rm", body, target=target)
 
@@ -616,7 +628,7 @@ class C3AgentClient:
         path: str,
         worker_uid: int,
         worker_gid: int,
-        worker_pid_namespace: str | None = None,
+        worker_container_id: str | None = None,
     ) -> dict[str, Any]:
         """Instruct the agent to run ``e2b-maint walk`` on a CP-derived path."""
         body = {
@@ -626,7 +638,7 @@ class C3AgentClient:
                 node_id=node_id,
                 worker_uid=worker_uid,
                 worker_gid=worker_gid,
-                worker_pid_namespace=worker_pid_namespace,
+                worker_container_id=worker_container_id,
             ),
         }
         return await self._file_op(node_id, "walk", body)

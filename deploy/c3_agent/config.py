@@ -76,30 +76,13 @@ class Settings:
             os.getenv("E2B_C3_AGENT_MAINT_TIMEOUT_S", "300")
         )
     )
-    #: The identity face B's **kernel read** runs as (C3 Task 4, ruling D21
-    #: option 2). Not an identity to trust -- the value is read from
-    #: ``/proc/<pid>/status`` -- but the one the kernel requires: a process may
-    #: only read another process's ``/proc/<pid>/ns/pid`` when their identities
-    #: match (``ptrace_may_access``), and face B is deliberately root *without*
-    #: ``CAP_SYS_PTRACE`` (it shares ``pid: host`` with the control plane).
-    #:
-    #: So this is the identity the deployment's workers run as -- the worker
-    #: image's ``USER`` (65534) unless the deployment changed it. A deployment
-    #: that runs its workers as something else and leaves this at the default
-    #: gets a *named* refusal on every file operation ("holds no process this
-    #: identity resolver can see (it runs as 65534:65534)"), never a wrong
-    #: identity.
-    resolver_uid: int = field(
-        default_factory=lambda: _env_int("E2B_C3_AGENT_RESOLVER_UID", 65534)
-    )
-    resolver_gid: int = field(
-        default_factory=lambda: _env_int("E2B_C3_AGENT_RESOLVER_GID", 65534)
-    )
-    #: One kernel read is a ``/proc`` walk plus one file read; the bound is
-    #: there so a wedged child cannot pin a file-operation handler.
-    resolver_timeout_s: float = field(
-        default_factory=lambda: _env_float("E2B_C3_AGENT_RESOLVER_TIMEOUT_S", 10.0)
-    )
+    #: Ruling **D25** removed the identity resolver's uid switch (and with it
+    #: ``E2B_C3_AGENT_RESOLVER_UID/_GID/_TIMEOUT_S``): the file-operation
+    #: anchor is the worker's container id, matched against the
+    #: world-readable ``/proc/<pid>/cgroup``, so face B reads it as itself --
+    #: root, three capabilities, no ``CAP_SYS_PTRACE``, no uid change. The
+    #: knobs existed only because ``ns/pid`` needs the same uid; nothing on
+    #: this path does any more.
     #: The whitelist roots and the uid pool, exactly as ``priv_common.c`` reads
     #: them. Defaults mirror ``envd_service/config.py`` / the C defaults, so an
     #: agent started without the DaemonSet's env is still the same shape.

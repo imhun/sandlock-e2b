@@ -587,17 +587,17 @@ def test_each_compose_stack_runs_exactly_one_agent_facing_the_control_plane() ->
         else:
             assert b_env["E2B_UID_POOL_START"] == "${E2B_UID_POOL_START:-10000}"
             assert b_env["E2B_UID_POOL_SIZE"] == "${E2B_UID_POOL_SIZE:-1000}"
-        # Task 4 slice C (D21 option 2): face B reads the worker's own uid/gid
-        # out of the kernel, and the kernel only lets a process read *another*
-        # process's ``/proc/<pid>/ns/pid`` when the two identities match -- so
-        # the resolver child runs as the workers' own identity
-        # (``E2B_C3_AGENT_RESOLVER_UID``/``_GID``, the agent image's ``USER``).
-        # This pin is that coupling: change a worker's ``user:`` here and every
-        # file operation on that stack starts refusing by name instead of
-        # silently reading nothing.
-        from deploy.c3_agent.config import Settings as AgentSettings
-
-        resolver = AgentSettings()
+        # Ruling D4's relaxation + **D25**: face B resolves the worker's own
+        # uid/gid from files that are *world-readable* -- candidates matched by
+        # the container id in ``/proc/<pid>/cgroup``, the identity read from
+        # ``/proc/<pid>/status`` -- so it needs no ``CAP_SYS_PTRACE``, no
+        # ``SETUID``/``SETGID`` and no matching ``user:``. What it does need is
+        # the runtime's hostname: the anchor *is* "my hostname", so a stack that
+        # overrides ``hostname:`` on a worker makes every file operation on that
+        # node a named refusal ("reported no container id"). That is the whole
+        # constraint, and it is pinned here -- the pin that used to couple a
+        # worker's ``user:`` to the agent's resolver uid is gone with the
+        # resolver's uid switch.
         workers = {
             name: service
             for name, service in services.items()
@@ -605,9 +605,7 @@ def test_each_compose_stack_runs_exactly_one_agent_facing_the_control_plane() ->
         }
         assert workers, path.name
         for name, service in workers.items():
-            assert service.get("user") == (
-                f"{resolver.resolver_uid}:{resolver.resolver_gid}"
-            ), (path.name, name)
+            assert "hostname" not in service, (path.name, name)
         # C3 Task 6: the same split as k8s -- only the face that mounts the
         # workspaces scans, and it reports to the control plane's own name.
         assert "E2B_C3_AGENT_SCAN" not in env
