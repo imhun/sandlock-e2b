@@ -461,8 +461,11 @@ pod 里有一个 `runAsUser: 0` 的 `image-cache-init`，盘上 `_volumes` 是 *
 - **卷存储的属主交棒（裁定 D24）**：`storage-init` 在**每个节点**上做一次
   `chown 65534:65534 _volumes`（以及已存在的 `_volumes/_meta`），**非递归**（它下面的卷数据
   目录与每沙箱切片属于池 uid，`chown -R` 会在每次 agent 滚动时把它们抢回来），幂等且有名字
-  （`already belongs to uid 65534` / `handed over`），并**校验**最终属主 —— 拒绝时 pod 停在
-  init 并打印一次性命令。D24 的理由、偏离 §3.2 字面的说明与**部署窗口复验程序**写在
+  （`already belongs to uid 65534` / `-> uid 65534 mode …` / `_meta` 缺失时的
+  `does not exist -- nothing to hand over`），**两个目标各自校验**（`_meta` 单独一条门 ——
+  评审 round 1 的 Important，它从前没有门且成功行无条件打印），拒绝时 pod 停在 init 并打印
+  一次性命令。它的能力集与面 B 逐条相同（`drop: [ALL]` + `CHOWN/DAC_OVERRIDE/FOWNER`；
+  `DAC_OVERRIDE` 是量出来的，见 §13.6）。D24 的理由、偏离 §3.2 字面的说明与**部署窗口复验程序**写在
   `docs/c3-privilege-relocation.md` §13.6（裁定）与 §13.6.1（程序）。
 - **CP 侧的具名失败**：`VolumeRegistry.create` 在属主不对时抛
   `VolumeRootNotOwnedError`，消息里带同一条 `chown 65534:65534 ...`（不再是裸 `EACCES`）。

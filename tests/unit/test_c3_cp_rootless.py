@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import errno
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,82 @@ def _script_lines(container: dict) -> list[str]:
 def _commands(container: dict) -> list[str]:
     """...and of those, the lines that actually run (comments removed)."""
     return [line for line in _script_lines(container) if not line.startswith("#")]
+
+
+def _shim(directory: Path, name: str, body: str) -> None:
+    """A one-file executable on ``PATH`` for the behavioural pins below."""
+    path = directory / name
+    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _run_storage_init(
+    tmp_path: Path, *, refuse_uid: str | None
+) -> subprocess.CompletedProcess:
+    """Run the manifest's own `storage-init` script under `sh`, for real.
+
+    Verifying the script by reading it is not enough for the two properties
+    this pins (a gate exists *and* a refusal cannot print the success line), so
+    the body is executed against a probe tree. It is made deterministic on any
+    host with two shims, because the script's own tools are Linux-shaped:
+
+    * ``stat -c %u|%a <path>`` is answered through Python's ``os.stat`` (macOS
+      ``stat`` has no ``-c``), reporting ``65534`` everywhere except a path
+      ending in ``/_meta`` -- which is the "record directory is root-owned"
+      shape;
+    * ``chown`` succeeds, except in the refusal case where it fails for exactly
+      that path (which is what an NFS ``root_squash`` refusal looks like).
+
+    ``refuse_uid`` is the uid the shims report for a path that must *not* be
+    handed over; ``None`` means every path hands over, which is the control arm.
+    """
+    store = tmp_path / "probe" / "shared"
+    (store / "_images" / "_oci").mkdir(parents=True)
+    (store / "_volumes" / "_meta").mkdir(parents=True)
+    (store / "_volumes" / "vol_abc").mkdir()
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    refused_uid = "-1" if refuse_uid is None else refuse_uid
+    _shim(
+        shims,
+        "stat",
+        'exec python3 - "$2" "$3" <<\'PY\'\n'
+        "import os, sys\n"
+        "fmt, path = sys.argv[1], sys.argv[2]\n"
+        "refused = os.environ.get('PROBE_REFUSED_UID', '-1')\n"
+        "uid = int(refused) if refused != '-1' and path.endswith('/_meta') "
+        "else 65534\n"
+        "mode = os.stat(path).st_mode & 0o7777\n"
+        "print(uid if '%u' in fmt else format(mode, 'o'))\n"
+        "PY\n",
+    )
+    _shim(
+        shims,
+        "chown",
+        'if [ "$PROBE_REFUSED_UID" != "-1" ]; then\n'
+        '  case "${2:-}" in */_meta) exit 1;; esac\n'
+        "fi\n"
+        "exit 0\n",
+    )
+    script = tmp_path / "storage-init.sh"
+    script.write_text(
+        _init_containers(
+            _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
+        )["storage-init"]["command"][2],
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment["PATH"] = f"{shims}{os.pathsep}{environment['PATH']}"
+    environment["SHARED_ROOT"] = str(store)
+    environment["CACHE_DIRS"] = str(store / "_images")
+    environment["PROBE_REFUSED_UID"] = refused_uid
+    return subprocess.run(
+        ["sh", str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
 
 
 # ------------------------------------------------ the control-plane pod itself
@@ -201,8 +278,6 @@ def test_the_agent_hands_the_volume_store_over_non_recursively_and_says_so() -> 
 
     # The store and its record directory, each handed over by the same helper.
     for expected in (
-        'hand_over "$volume_store"',
-        'hand_over "$volume_store/_meta"',
         # ...one directory at a time, never `-R` (the recursive form would take
         # the sandbox volume data directories back on every agent rollout).
         'chown 65534:65534 "$target" 2>/dev/null ||',
@@ -217,7 +292,10 @@ def test_the_agent_hands_the_volume_store_over_non_recursively_and_says_so() -> 
         # The gate: the store's own ownership is *verified*, and a
         # root_squashed NFS stops the pod here instead of failing the first
         # volume create later, inside the control plane.
-        'if [ "$store_owner" != "65534" ]; then',
+        'if [ "$owner" != "65534" ]; then',
+        'return 1',
+        'hand_over "$volume_store" || exit 1',
+        'hand_over "$volume_store/_meta" || exit 1',
     ):
         assert expected in lines, expected
     assert "chown -R 65534:65534 \"$SHARED_ROOT/_volumes" not in script
@@ -244,6 +322,102 @@ def test_the_volume_store_hand_over_targets_the_path_the_control_plane_writes() 
     # (`control_plane/app.py`). Pinned as the same literal.
     app_source = (REPO / "control_plane" / "app.py").read_text(encoding="utf-8")
     assert '"_volumes"' in app_source
+
+
+def test_a_record_directory_that_hands_over_reports_success(tmp_path: Path) -> None:
+    """The control arm for the two refusal pins below.
+
+    With everything handing over, the script exits 0 and prints a success line
+    for **both** halves -- the store root and the record directory D24's recon
+    added. Without this arm the refusal assertions could pass vacuously (a
+    script that prints no success line ever would satisfy them).
+    """
+    result = _run_storage_init(tmp_path, refuse_uid=None)
+
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == [
+        f"storage-init: {tmp_path}/probe/shared/_images is owned by uid 65534",
+        f"storage-init: {tmp_path}/probe/shared/_volumes already belongs to uid "
+        "65534 (mode 755) -- nothing to do",
+        f"storage-init: {tmp_path}/probe/shared/_volumes/_meta already belongs to "
+        "uid 65534 (mode 755) -- nothing to do",
+        f"storage-init: {tmp_path}/probe/shared/_volumes is owned by uid 65534 "
+        "(the volume data directories below it are left alone)",
+    ]
+    assert result.stderr == ""
+
+
+def test_a_refused_record_directory_cannot_read_as_a_hand_over(tmp_path: Path) -> None:
+    """Review round 1 (Important): ``_meta`` is gated like the store root.
+
+    ``hand_over "<store>/_meta"`` used to run ungated and the success echo
+    printed unconditionally, so an NFS refusal on the record directory read as
+    success *here* and then surfaced much later, un-named, on the second write
+    D24's recon found -- ``_write_record`` → ``write_text_atomically``'s lazy
+    ``mkdir``/``os.open``, which sits **outside** the control plane's own
+    ``VolumeRootNotOwnedError`` wrapper. The operator is entitled to a FATAL at
+    init instead, naming the path and the one-time command.
+
+    The store root still hands over in this arm: the defect is specifically
+    that the *second* target was unchecked, and a pin that refused both would
+    not show it.
+    """
+    result = _run_storage_init(tmp_path, refuse_uid="0")
+
+    assert result.returncode == 1
+    # ...the store root's own state is read and reported (here it already is the
+    # worker uid, which is the shape a re-run on a healthy node has)...
+    assert (
+        f"storage-init: {tmp_path}/probe/shared/_volumes already belongs to uid "
+        "65534 (mode 755) -- nothing to do" in result.stdout.splitlines()
+    )
+    # ...and the refused record directory printed **no** success line.
+    for line in result.stdout.splitlines():
+        assert not line.startswith(
+            f"storage-init: {tmp_path}/probe/shared/_volumes/_meta -> uid"
+        ), line
+    # ...it is a FATAL on stderr that names the path and the exact one-time fix.
+    assert result.stderr.splitlines() == [
+        f"storage-init: chown refused ({tmp_path}/probe/shared/_volumes/_meta, "
+        "NFS root_squash?) -- the control plane (uid 65534) cannot create or "
+        "record a volume until this is done once: chown 65534:65534 "
+        f"{tmp_path}/probe/shared/_volumes/_meta",
+        f"storage-init: FATAL: {tmp_path}/probe/shared/_volumes/_meta is owned by "
+        "uid 0, not the control-plane uid 65534: the control plane creates every "
+        "volume as <store>/<volume_id> and writes <store>/_meta/<volume_id>.json, "
+        "so the first volume create would fail with EACCES",
+        "storage-init: fix it once (as root on the node, or on the NFS server): "
+        f"chown 65534:65534 {tmp_path}/probe/shared/_volumes/_meta  "
+        "(non-recursive: the volume data directories below it belong to pooled "
+        "sandbox uids)",
+    ]
+
+
+def test_both_hand_overs_are_gated_in_the_script_text() -> None:
+    """...and the gate cannot be dropped by an edit that still passes above.
+
+    A text pin on the same property, so a rewrite that keeps the shape but
+    loses the *gate* (e.g. ``hand_over "$volume_store/_meta"`` without its exit,
+    or a helper that echoes before verifying) fails here as well as in the
+    behavioural pins.
+    """
+    agent = _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
+    lines = _commands(_init_containers(agent)["storage-init"])
+    for expected in (
+        'hand_over "$volume_store" || exit 1',
+        'hand_over "$volume_store/_meta" || exit 1',
+    ):
+        assert expected in lines, expected
+    # Inside the helper: verify, then either FATAL+return 1 or the success echo.
+    helper = lines[lines.index("hand_over() {") : lines.index("}") + 1]
+    verify = helper.index('if [ "$owner" != "65534" ]; then')
+    fatal = next(
+        index for index, line in enumerate(helper) if line.startswith('echo "storage-init: FATAL:')
+    )
+    success = next(
+        index for index, line in enumerate(helper) if "-> uid $owner mode $mode" in line
+    )
+    assert verify < fatal < success, helper
 
 
 # ------------------------------------------------------- the CP code path (A3)
@@ -322,11 +496,52 @@ def test_a_volume_store_the_control_plane_does_not_own_is_a_named_refusal(
         registry.create("named-refusal")
 
     assert str(caught.value) == (
-        f"cannot create the volume directory {created}: the volume store {store} "
-        f"is not writable by this control plane (uid {os.geteuid()}). It is "
-        "handed over once, non-recursively -- the directories below it are "
-        "sandbox volume data owned by pooled sandbox uids -- by the agent's "
-        f'storage-init: chown 65534:65534 "{store}" "{store}/_meta"'
+        f"cannot create {created}: the volume store {store} is not writable by "
+        f"this control plane (uid {os.geteuid()}). The store has to belong to "
+        "that uid before a volume can be created in it or a record written "
+        "beside it: hand it over once, non-recursively (never `-R`, since the "
+        "directories below it are sandbox volume data owned by pooled sandbox "
+        f"uids): chown {os.geteuid()}:{os.geteuid()} \"{store}\" "
+        f'"{store}/_meta"'
+    )
+
+
+def test_a_store_the_control_plane_cannot_create_at_startup_is_named_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round 1 (minor 2): the same creation, one layer earlier.
+
+    ``VolumeRegistry.__init__`` creates the store, and in the compose and
+    ``local://`` lanes that is the *first* creation of it (the k8s pod mounts
+    ``<store>`` as a subPath, so there it always exists before this runs).
+    Unwrapped, that failure was a bare ``PermissionError`` out of the registry's
+    constructor — i.e. at app startup, which is exactly the un-named shape the
+    create path was fixed for.
+    """
+    store = tmp_path / "_volumes"
+    from control_plane.registry import volumes as volumes_module
+    from control_plane.registry.volumes import VolumeRootNotOwnedError
+
+    real_mkdir = Path.mkdir
+
+    def refuse_only_the_store(self, *args, **kwargs):
+        if self == store:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", refuse_only_the_store)
+
+    with pytest.raises(VolumeRootNotOwnedError) as caught:
+        volumes_module.VolumeRegistry(store)
+
+    assert str(caught.value) == (
+        f"cannot create {store}: the volume store {store} is not writable by "
+        f"this control plane (uid {os.geteuid()}). The store has to belong to "
+        "that uid before a volume can be created in it or a record written "
+        "beside it: hand it over once, non-recursively (never `-R`, since the "
+        "directories below it are sandbox volume data owned by pooled sandbox "
+        f"uids): chown {os.geteuid()}:{os.geteuid()} \"{store}\" "
+        f'"{store}/_meta"'
     )
 
 

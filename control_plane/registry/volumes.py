@@ -75,7 +75,33 @@ class VolumeRootNotOwnedError(RuntimeError):
     named error that carries the exact command is what makes the pre-condition
     audible, and it is deliberately *not* a fallback: no privileged path is
     tried, because the plan's whole point is that the CP's A-class is empty.
+
+    The text is **shape-neutral on purpose** (review round 1, minor 3): this
+    module also runs in the separated compose stacks and in the ``local://``
+    lane, so it names *this process's* uid (whatever it is) and the one-time,
+    non-recursive hand-over rather than the k8s agent's node-level job — that
+    script's own log is where the k8s remedy belongs, and it says the same
+    thing in its own terms (``deploy/k8s/c3-agent.yaml``).
     """
+
+
+def _volume_store_refusal(*, store: Path, path: Path) -> VolumeRootNotOwnedError:
+    """The one wording for "this uid cannot write the store".
+
+    Two call sites raise it — the store's own creation at startup
+    (:meth:`VolumeRegistry.__init__`, which the compose and ``local://`` lanes
+    do go through) and a volume's directory in :meth:`VolumeRegistry.create`
+    (the A3 D24 recon narrowed to owner operations) — and they must not drift.
+    """
+    uid = os.geteuid()
+    return VolumeRootNotOwnedError(
+        f"cannot create {path}: the volume store {store} is not writable by "
+        f"this control plane (uid {uid}). The store has to belong to that uid "
+        "before a volume can be created in it or a record written beside it: "
+        "hand it over once, non-recursively (never `-R`, since the directories "
+        "below it are sandbox volume data owned by pooled sandbox uids): chown "
+        f'{uid}:{uid} "{store}" "{store}/_meta"'
+    )
 
 
 @dataclass
@@ -181,7 +207,21 @@ class VolumeRegistry:
         namespace: str = "e2b",
     ) -> None:
         self._base = Path(base_dir).resolve()
-        self._base.mkdir(parents=True, exist_ok=True)
+        try:
+            self._base.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # Review round 1 (minor 2): the *same* store creation, one layer
+            # earlier -- and the one the compose and `local://` lanes actually
+            # take, because only the k8s pod mounts `<store>` as a subPath (so
+            # there it always exists by the time this runs). Without the wrap a
+            # store this uid cannot write fails at *startup* with a bare
+            # `PermissionError`, which is the same un-named failure the create
+            # path was fixed for.
+            if exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+                raise _volume_store_refusal(
+                    store=self._base, path=self._base
+                ) from exc
+            raise
         self._volumes: dict[str, VolumeRecord] = {}
         self._lock = threading.Lock()
         self._token_ttl_seconds = token_ttl_seconds
@@ -249,14 +289,8 @@ class VolumeRegistry:
                 # be *its* directory and nothing else. Name the pre-condition
                 # instead of letting a bare EACCES escape (see the class).
                 if exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
-                    raise VolumeRootNotOwnedError(
-                        f"cannot create the volume directory {record.path}: the "
-                        f"volume store {self._base} is not writable by this "
-                        f"control plane (uid {os.geteuid()}). It is handed over "
-                        "once, non-recursively -- the directories below it are "
-                        "sandbox volume data owned by pooled sandbox uids -- by "
-                        "the agent's storage-init: chown 65534:65534 "
-                        f'"{self._base}" "{self._base}/_meta"'
+                    raise _volume_store_refusal(
+                        store=self._base, path=record.path
                     ) from exc
                 raise
             # E3.2 volume permission model: the volume root is shared across

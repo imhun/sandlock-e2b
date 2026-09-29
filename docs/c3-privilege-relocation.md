@@ -871,11 +871,22 @@ CP 的 uid（65534），CP 保留自己的 `mkdir` + `chmod 1777`。**
 
 - **非递归是这条不变量本身**：`_volumes` 下面挂着卷数据目录与每沙箱配额切片，属主是**池 uid**。
   `chown -R` 会在**每次 agent 滚动**（文档里的升级步骤就会滚它）把它们抢回 65534。
+- **它的能力集与面 B 逐条相同**（review round 1 的 minor 1）：`runAsUser: 0` +
+  `drop: [ALL]` + `add: [CHOWN, DAC_OVERRIDE, FOWNER]`。此前它是那 pod 里**唯一**带 runtime
+  默认能力集（含 `NET_RAW`）的容器，而判据 4 是按 pod 读的。三个里 `DAC_OVERRIDE` 是量出来的、
+  不是类比来的：`mkdir -p "<65534:0755 的目录>/_oci"`（幂等重跑或半初始化的缓存）在只有
+  `CHOWN`+`FOWNER` 时是 `EACCES`，`set -e` 会把一个健康部署变成 Init:Error。
 - **幂等且有名有姓**：交棒由 agent 的 `storage-init`（`deploy/k8s/c3-agent.yaml`，每个节点一次）
-  做，每条目标要么 `already belongs to uid 65534`（共享挂载上第二个节点落在这里）要么
-  `handed over`，并且**校验** `_volumes` 根最终的属主 —— NFS `root_squash` 拒绝交棒时 pod 停在
-  init 并打出那条一次性命令，而不是等到第一次建卷才在 CP 里报 EACCES。CP 侧对应的具名失败是
-  `control_plane.registry.volumes.VolumeRootNotOwnedError`（同一句命令）。
+  做，**每个目标各自一行状态**：`already belongs to uid 65534`（共享挂载上第二个节点落在这里）
+  或 `-> uid 65534 mode …`（本次交的）；`_meta` 不存在时是 `does not exist -- nothing to hand
+  over`（控制面以属主身份惰性建它）。**每个目标都各自校验**，不合格即 FATAL + `exit 1`，并在
+  `stderr` 点名**那一个**路径与一次性命令 —— 而不是等到第一次建卷才在 CP 里报 EACCES。
+  ⚠ **`_meta` 曾经是例外**（review round 1 的 Important）：它没有门、成功行还无条件打印，
+  于是被拒时"报成功"，失败推迟到 D24 复核发现的那**第二次写**（`_write_record` →
+  `write_text_atomically` 的惰性 `mkdir`/`os.open`，在 `VolumeRootNotOwnedError` 的包装**之外**）。
+  现在两条都过同一套校验，成功行在门**之后**。CP 侧的具名失败是
+  `control_plane.registry.volumes.VolumeRootNotOwnedError`（措辞**形态中立**：它说的是"这个 uid、
+  一次非递归交棒"，不是 k8s 的某个脚本 —— review round 1 的 minor 3）。
 - **判据改写**（brief 的第三条）："`_volumes` 的 `mkdir` 不在 CP 代码路径里" ⇒
   **"CP 拥有 `_volumes`，所以它的 `mkdir`/`chmod` 不需要特权"**，钉在
   `tests/unit/test_c3_cp_rootless.py`（清单 + 动词白名单 + 具名失败三处）。
@@ -935,9 +946,22 @@ CP 的 uid（65534），CP 保留自己的 `mkdir` + `chmod 1777`。**
    kubectl -n sandlock logs ds/e2b-c3-agent -c storage-init --tail=60
    ```
 
-   期望：`/var/lib/e2b-sandboxes/_images` 与 `/var/lib/e2b-sandboxes/_volumes` 各一行
-   `already belongs to uid 65534`（已交棒）或 `handed over`（本次交的），最后一行是
-   `... _volumes is owned by uid 65534`。**看到 `FATAL` 就停**：那条日志带着一次性命令。
+   期望：**四个目标各一行状态** —— `.../_images`、`.../_volumes`、`.../_volumes/_meta`
+   各是 `already belongs to uid 65534`（已交棒）、`-> uid 65534 mode …`（本次交的）或
+   `does not exist -- nothing to hand over`（`_meta` 允许这一种：控制面以属主身份惰性建它），
+   最后一行是 `.../_volumes is owned by uid 65534 (the volume data directories below it are
+   left alone)`。**`_volumes` 与 `_meta` 是两条独立的门**（review round 1 的 Important：`_meta`
+   从前没有门、且成功行无条件打印）；**看到 `FATAL` 就停** —— 它点名的是哪一个目标，并带着那条
+   一次性命令。
+
+   判别式（按脚本实际打印的字面量 grep）：
+
+   ```bash
+   kubectl -n sandlock logs ds/e2b-c3-agent -c storage-init --tail=60 |
+     grep -E '(owned by uid 65534|already belongs to uid 65534|-> uid 65534|does not exist -- nothing to hand over)'
+   ```
+
+   四个目标都命中即为交棒完成；出现 `FATAL:` 就是没完成（按它给的那条 `chown` 做一次）。
 
 3. **属主表复量**（本节那张表的 Task 5 版；判据"CP 侧 A 类清零"）：
 
