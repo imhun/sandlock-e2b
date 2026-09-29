@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Build the multi-arch images on this machine and push them to ACR.
 # Naming: image name distinguishes the service, tag distinguishes the version:
-#   <registry>/<ns>/e2b-sandlock-{control-plane-gateway,worker,autoscaler,quota-agent}:<VERSION>
+#   <registry>/<ns>/e2b-sandlock-{control-plane-gateway,worker,agent,autoscaler,quota-agent}:<VERSION>
 #   base image mirror: <registry>/<ns>/<BASE_IMAGE> (Docker Hub unreachable on the target)
 #
-# worker/autoscaler/quota-agent are built by build-images.sh (A6 added the
-# quota-agent there); control-plane-gateway and the base images are built below.
+# worker/agent/autoscaler/quota-agent are built by build-images.sh (A6 added the
+# quota-agent there, C3 Task 3 the agent); control-plane-gateway and the base
+# images are built below.
 #
 # Usage: ./deploy/scripts/build-and-push.sh
 # Env:   VERSION (default: <git describe>-<timestamp> so every dev build gets

@@ -383,6 +383,45 @@ kubectl apply -f deploy/k8s/seccomp-installer.yaml   # ① 档（先）
 rollout 后从两个 pod 各发一次节点作用域请求 → `kubectl -n sandlock logs deploy/control-plane` 里
 两行 `came from` 必须是**两个不同**的 pod IP）。**本行待该窗口完成后回填结果。**
 
+### 7.6 C3 Task 3 的 per-node agent（**仓库已落，集群未上线**）
+
+**现状（未变）**：集群跑的还是 §7 那一版 —— 没有 agent，worker 的 `E2B_SLOT_IDENTITY` 仍是
+代码默认 `spawn`（槽位身份由 worker 镜像里的 file-capability `e2b-slot-spawn` 授予）。
+
+**仓库现状（下一次上线会带什么）**：
+
+- `deploy/k8s/c3-agent.yaml`：**一个 DaemonSet、两个容器**，pod 级 `hostPID: true`。
+  面 A `agent` = 独立镜像 `e2b-sandlock-agent`（`USER 65534:65534`、BND 只声明
+  `SETUID`/`SETGID`、身份取自 `spec.nodeName`）；面 B `maint` = root + `drop:[ALL]` +
+  `CHOWN/DAC_OVERRIDE/FOWNER`（与 C1 broker 逐条相同），挂基线那个 `sandbox-shared` PVC 与
+  节点本地 `/var/lib/e2b-images`，**载荷属 Task 4**，现在不听端口。两者都在基线（不在
+  overlay 差异里），禁项逐条成立：无 `SYS_ADMIN`/`SYS_PTRACE`/`NET_RAW`/host 网络/特权容器，
+  且**没有**任何"禁止提权"式字段（那会让内核静默忽略 file capabilities）。
+- 同文件的 `NetworkPolicy e2b-c3-agent`：agent 的入口**只允许 control-plane pod**（同一端
+  49985）—— "只有两条通道"的连接层那一半，`worker ↔ agent` 在连接层就不存在。
+- 凭据 `E2B_C3_AGENT_TOKEN`：**只**出现在 control-plane 与 agent 两处（worker 清单/镜像里
+  一个字都没有，pin 在 `tests/unit/test_c3_internal_api_shape.py`），由
+  `deploy/k8s-k0s/secrets.sh` 与其他托管键一起生成（**上线前必须先跑它**，否则 agent pod 起不来）。
+- RBAC：control-plane 的 Role 从 `get pods` 扩到 `get,list pods`（寻址要按 label 列**本节点**
+  的 agent pod），范围不变（本命名空间的 pods）。
+- worker：`E2B_SLOT_IDENTITY=agent-grant`（回退 = 改回 `spawn`）；**没有** `hostPID`（它会把
+  槽位 pid 放进宿主 pid namespace，`NSpid` 判别值当场失效）。
+- 上线闸门：`deploy/k8s-k0s/apply.sh` 的 rollout 顺序变成 **broker → agent → worker**（agent 是
+  worker 的新上游，fail-closed 没有回落路径）。
+- 旋钮：`E2B_SLOT_IDENTITY`（worker，`spawn|agent-grant`）、`E2B_SLOT_IDENTITY_REPORT_TIMEOUT_S`、
+  `E2B_SLOT_IDENTITY_WAIT_TIMEOUT_S`、`E2B_SLOT_IDENTITY_UNSHARED_TIMEOUT_S`、
+  `E2B_C3_AGENT_URL`/`_NAMESPACE`/`_LABEL`/`_PORT`/`_TOKEN`/`_TIMEOUT_S`/`_MAX_CONCURRENCY`
+  （后者出厂 **64**，理由写在 `control_plane/config.py` 与清单注释里）。
+
+**⏳ 待部署窗口执行（判据 1/2/3/7 的 k8s 臂 + agent 上线 + `E2B_SLOT_IDENTITY` 切换）**：命令见
+C3 Task 3 slice B 报告 §4（`open-cluster-tunnel.sh` → `KUBECONFIG=tmp/k0s/kubeconfig` →
+`kubectl kustomize deploy/k8s-k0s | kubectl diff -f -` → 跑 `secrets.sh` → `apply.sh` → 真机复验
+`probe_c3_userns_map_handoff.py --role forker/agent`）。**本行待该窗口完成后回填结果。**
+
+> ⚠ 判据 13（`NSpid` + cgroup 双命中）与 16（并发建箱）**不要在 k8s 上验收**：这里是 1 节点 2
+> 副本 worker，两条都会"全绿但什么都没测到"。它们必须在
+> `deploy/compose/docker-compose.multinode.yml`（3 worker 同机，已加 `c3-agent` 服务）上跑。
+
 ## 8. 改部署的入口
 
 ```bash

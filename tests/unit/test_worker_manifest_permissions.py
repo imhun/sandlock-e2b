@@ -2104,6 +2104,21 @@ QUOTA_TABLE_ROW = (
     "记账。将来部署 agent 时必须**同时**设计双 token（列表 + 旧值窗口），别把这条留到上线"
     "当天 |"
 )
+#: C3 Task 3's credential (slice B). It is single-valued for the same reason the
+#: quota token is: one consumer hop, one comparison -- but unlike the quota
+#: token it *is* deployed in k8s now, so its blast radius is written down (the
+#: CP→agent hop is the only thing that fails, and no worker is restarted).
+AGENT_TOKEN_TABLE_ROW = (
+    "| `E2B_C3_AGENT_TOKEN` | ① 排维护窗口 ② `deploy/k8s-k0s/secrets.sh --rotate "
+    "E2B_C3_AGENT_TOKEN` ③ `kubectl -n sandlock rollout restart ds/e2b-c3-agent` ④ "
+    "`kubectl -n sandlock rollout restart deploy/control-plane`（③④ 连着做，不要停在中间） "
+    "| **没有双窗**：旧 token 从 ② 起对两边都不再是\"同一个值\"，③④ 之间 CP 与 agent 各持一半 "
+    "⇒ **这一跳的指令全部 401，建箱失败并点名**（`the agent ... refused the grant`）；**在跑的"
+    "沙箱不受影响**（槽位身份只在建箱时授予一次），**worker 也不需要滚**（它一个字都不读这个"
+    "凭据 —— 滚 worker 才会杀沙箱，见表 2 第 3 步）⇒ 爆炸半径就是\"窗口内建不了新箱\" | 若要"
+    "把这一段也消掉，就得给这一跳加**列表式双窗**（`E2B_C3_AGENT_TOKENS`，与表 1/2 同形）；"
+    "本轮裁定**不做**（只有一个消费者、一跳，代价与收益不成比例），要做就照表 1 的模板来 |"
+)
 
 
 def _k8s_redis_container() -> dict:
@@ -2202,11 +2217,13 @@ def test_the_runbook_carries_the_no_double_window_table() -> None:
     (`docs/production-deployment-requirements.md` §2.4.4 W4).
     """
     assert (
-        "### 表 3：无双窗的凭据（`E2B_REDIS_PASSWORD` / `E2B_QUOTA_AGENT_TOKEN`）"
+        "### 表 3：无双窗的凭据（`E2B_REDIS_PASSWORD` / `E2B_QUOTA_AGENT_TOKEN` / "
+        "`E2B_C3_AGENT_TOKEN`）"
         in RUNBOOK
     )
     assert REDIS_TABLE_ROW in RUNBOOK
     assert QUOTA_TABLE_ROW in RUNBOOK
+    assert AGENT_TOKEN_TABLE_ROW in RUNBOOK
     # Table 3 stays with the other two tables, and the ruling it encodes is
     # spelled out (the ACL shape is the alternative, not the main path).
     assert RUNBOOK.index("### 表 1：") < RUNBOOK.index("### 表 2：")

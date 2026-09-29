@@ -84,6 +84,10 @@ KUBECONFIG=... deploy/k8s-k0s/secrets.sh --fingerprint   # 每个键的 sha256(�
 
 另外基线自己已经按「节点本地」分开了两类镜像缓存（`deploy/k8s/worker.yaml`）：
 
+C3（Task 3）的 `e2b-c3-agent` DaemonSet 与 broker 同一处境：它**不在**这张 overlay 表里，
+因为 overlay 不需要为它改任何东西 —— 它的 PVC claim 就是基线那个 `sandbox-shared`，节点本地
+缓存的 hostPath 也是基线已有的 `/var/lib/e2b-images`（`deploy/k8s/c3-agent.yaml`）。
+
 * `E2B_IMAGE_CACHE_DIR=/var/lib/e2b-images` —— **解出来的 rootfs**，`hostPath` 节点本地。解到共享卷上
   要 61.4 秒、解到本地盘 0.26 秒（同一份 python-slim rootfs，2111 个文件，2026-09-17 实测）。
 * `E2B_IMAGE_OCI_DIR=/var/lib/e2b-sandboxes/_images` —— **OCI layout tar**，仍在共享卷上，因为那是

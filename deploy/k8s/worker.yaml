@@ -289,6 +289,29 @@ spec:
               value: socket
             - name: E2B_PRIV_HELPER_SOCKET
               value: /run/e2b-broker/broker.sock
+            # C3 (Task 3): route B's slot identity now comes from the per-node
+            # agent, not from a file-capability binary in this image.
+            #
+            # The worker forks the slot, lets it `unshare` a user namespace and
+            # reports `{sandbox_id, pid}` to the **control plane** (never to the
+            # agent: `worker <-> agent` does not exist, hard rule 5); the CP
+            # checks the report against its own records and instructs the agent
+            # with the uid. The child then polls `setresuid(X)` and execs the
+            # supervisor -- there is no "go ahead" step, and this pod still
+            # holds no capability (its `CapEff` is 0).
+            #
+            # `spawn` remains the shipped default in the code and is the
+            # rollback: set this key back to `spawn` and the worker uses the
+            # image's file-capability `e2b-slot-spawn` as before (Task 4 removes
+            # that binary; Task 7 removes the fallback).
+            #
+            # ⚠ Do **not** give this pod `hostPID`. The agent's reverse lookup
+            # discriminates two workers on one node by the slot child's `NSpid`
+            # chain, and a host-pid namespace collapses that chain to one entry
+            # -- the lookup would refuse every grant while the manifest still
+            # looked correct.
+            - name: E2B_SLOT_IDENTITY
+              value: agent-grant
             # N5/N10 closed (2026-09-17): this manifest now runs the same
             # per-sandbox namespace shape the compose stack has run in
             # production since 2026-09-16.

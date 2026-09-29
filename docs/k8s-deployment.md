@@ -34,6 +34,7 @@
 | `gateway.yaml` | Service `gateway`（49983 → 3000） | 保住 compose 时代的 DNS/入口契约 |
 | `k8s-k0s/gateway-nodeport.yaml` | Service `gateway-nodeport`（**NodePort 31907** → 3000） | **只在自建集群的 overlay 里**：托管集群由 SLB/ingress 承担同一角色，这里没有 LB，所以用固定 NodePort 给集群外一个不漂的入口（访问方式见 `deploy/k8s-k0s/README.md`） |
 | `priv-broker.yaml` | DaemonSet `e2b-priv-broker`（每节点一个 **root** 容器）+ socket hostPath + 3 个 init（其中两个是属主 init） | **C1 特权外置**：`chown`/`rm`/`walk` 由它经 unix socket `/run/e2b-broker/broker.sock` 做（所以 worker pod 里没有 root）；它跑**默认**运行时 profile（不需要 `sandlock-worker.json`）、挂与 worker 同一个 RWX PVC 与同一个 `/var/lib/e2b-images` hostPath；**在基线里**（不是 overlay 差异）—— 它对发行版/存储类型无差别 |
+| `c3-agent.yaml` | DaemonSet `e2b-c3-agent`（**每节点一个**、**两个容器**、pod 级 `hostPID: true`）+ NetworkPolicy | **C3 Task 3 的特权收敛**：面 A `agent` 是**独立镜像** `e2b-sandlock-agent`（`USER 65534:65534` + BND `SETUID/SETGID`）—— CP 把「哪个沙箱、哪个 uid、哪个 pid」发过来，它用宿主 `/proc` 把容器 pid 反查成宿主 pid 再写一次 `uid_map`；面 B `maint` 是 **root** + C1 的三条 cap（`chown`/`dac_override`/`fowner`），**载荷属 Task 4**。入口只允许 control-plane pod（NetworkPolicy）；它与 `priv-broker` 一样**在基线里**（它的 PVC claim 与 hostPath 都是基线已有的） |
 | `worker.yaml` | worker StatefulSet（2 副本 `e2b-worker-0/1`）+ headless Service + PDB | 非 root（镜像自带 `USER 65534:65534`，**不写 `runAsUser`**）+ `e2b-slot-spawn` 需要的 2 个 cap（`SETUID`/`SETGID`）+ `E2B_PRIV_HELPER_TRANSPORT=socket` 连每节点的 broker + `Localhost` seccomp profile；唯一的 initContainer 是**非 root** 的 `wait-for-broker` |
 | `autoscaler.yaml` | autoscaler（SA/Role/RoleBinding + Deployment） | `E2B_AS_BACKEND=k8s`，直接 scale `e2b-worker`，`MIN=1 / MAX=16` |
 | `seccomp-installer.yaml` | ConfigMap `sandlock-worker-seccomp` + DaemonSet `seccomp-installer` | 把 `deploy/seccomp/sandlock-worker.json` 写到**每个节点的** `/var/lib/kubelet/seccomp/sandlock-worker.json` |
@@ -65,7 +66,8 @@ kubectl apply -f deploy/k8s/pvc.yaml
 kubectl -n $NS create secret generic e2b-secrets \
   --from-literal=E2B_API_KEYS='<你的 API key>' \
   --from-literal=E2B_INTERNAL_API_KEY='<随机 internal key>' \
-  --from-literal=E2B_REDIS_PASSWORD='<随机 redis 口令>'
+  --from-literal=E2B_REDIS_PASSWORD='<随机 redis 口令>' \
+  --from-literal=E2B_C3_AGENT_TOKEN='<随机 CP→agent token>'
 
 # 3) 依赖服务
 kubectl apply -f deploy/k8s/redis.yaml
@@ -192,6 +194,7 @@ kubectl -n $NS rollout status sts/e2b-worker
 | `control-plane.yaml` | `E2B_API_KEYS: "local-key"`、`E2B_INTERNAL_API_KEY: "internal-key"` | `secretKeyRef` → `e2b-secrets` |
 | `worker.yaml` | `E2B_INTERNAL_API_KEY: "internal-key"` | 同上（worker↔控制面） |
 | `autoscaler.yaml` | `E2B_AS_INTERNAL_API_KEY: "internal-key"` | 同上 |
+| `control-plane.yaml` + `c3-agent.yaml` | `E2B_C3_AGENT_TOKEN` | `secretKeyRef` → `e2b-secrets`（**只这两处**：worker 清单与 worker 镜像里一个字都没有 —— 有就等于把 `worker ↔ agent` 这条不存在的通道造出来；pin 在 `tests/unit/test_c3_internal_api_shape.py::test_no_worker_shape_carries_the_agent_token`。轮换见 §4.5 表 3） |
 | `redis.yaml` + `control-plane.yaml` | ✅ 已落地（redis `--requirepass` 自 `917395b`，control-plane 的 URL 自 `91a59e8`）：`--requirepass "$(REDIS_PASSWORD)"` + `redis://:$(E2B_REDIS_PASSWORD)@redis:6379/0`，两边都读 `e2b-secrets` | 保持：**不再是"无口令 redis"**，认证只能来自 Secret（`tests/unit/test_worker_manifest_permissions.py::test_k8s_redis_auth_comes_from_the_secret_not_a_literal` 钉住清单里没有字面口令、也没有 ACL 文件） |
 | 各 Deployment | `image: ...:<版本>` | 当次构建的真实版本（§2） |
 
@@ -266,11 +269,13 @@ deploy/k8s-k0s/secrets.sh --fingerprint        # 逐键 sha256(前16)+长度；�
 kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data}' | wc -c   # 只报大小
 ```
 
-### 表 3：无双窗的凭据（`E2B_REDIS_PASSWORD` / `E2B_QUOTA_AGENT_TOKEN`）
+### 表 3：无双窗的凭据（`E2B_REDIS_PASSWORD` / `E2B_QUOTA_AGENT_TOKEN` / `E2B_C3_AGENT_TOKEN`）
 
-前两个表靠“列表里新旧并存”消掉中断，这两个凭据**没有双窗**：redis 只有一个
+前两个表靠“列表里新旧并存”消掉中断，这三个凭据**没有双窗**：redis 只有一个
 `--requirepass`（换口令就是换那一个值），quota-agent token 是单值、缺了就拒绝启动
-（`deploy/quota_agent/__main__.py:15-19`）—— 所以轮换**必然**经过一段不可用。
+（`deploy/quota_agent/__main__.py:15-19`），C3 的 CP→agent token 同样是单值、
+两边都必须逐字等于 Secret 里的那个值（`deploy/c3_agent/__main__.py` 起不来）—— 所以轮换
+**必然**经过一段（这一跳的）不可用。
 2026-09-26 的用户裁定（`docs/superpowers/plans/2026-09-26-decisions.md` 第 5 条 +
 《追加裁定（O3 第二轮）》）：**redis 接受 10–30 s 中断，不做 ACL 双用户**；ACL 版本只作**备选**记在表里，`deploy/k8s/redis.yaml` 不动。
 
@@ -278,6 +283,7 @@ kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data}' | wc -c   # 只
 |---|---|---|---|
 | `E2B_REDIS_PASSWORD` | ① 排维护窗口 ② `deploy/k8s-k0s/secrets.sh --rotate E2B_REDIS_PASSWORD` ③ `kubectl -n sandlock rollout restart deploy/redis` ④ `kubectl -n sandlock rollout restart deploy/control-plane deploy/autoscaler`（读 redis 的只有 control-plane；`autoscaler` 是控制面客户端，跟着滚是形状对齐）⑤ 从 Secret 里读新口令验收（见下） | **必然有 10–30 s 中断**：redis 带着新口令重启、到 control-plane 滚动完拿到新口令之间，共享后端（配额 / 节点视图 / 限流 / 单飞）不可用 ⇒ **建箱、路由、sandbox 记录查询全部失败**；沙箱进程本身不经过 redis，**不受影响**；`appendonly yes` ⇒ 重启从 AOF 装载，**数据不丢**。**窗口不可逆**：② 之后旧口令只活在仍在跑的 redis 进程内存里，要回去只能再轮换一次（表 3 没有 finalize 那种安全位） | **ACL 双用户**（2026-09-26 裁定**不采纳**，只作备选）：`ACL SETUSER` 建新用户 → control-plane 切到 `redis://<新用户>:<新口令>@...` → 滚动 → 删旧用户 ⇒ **零停机**。代价：要改 redis 的启动方式（`--aclfile` 或启动期 `ACL SETUSER`），且用户必须持久化，否则重启就丢 |
 | `E2B_QUOTA_AGENT_TOKEN` | 同时更新 worker 与 agent 的 Secret；**先重启 agent、再滚 worker**（顺序反了 worker 找不到 agent，但 worker 侧是降级的） | 单 token、启动即 fail-fast（`deploy/quota_agent/__main__.py:15-19`），**没有双窗**；worker 重启 = **杀沙箱**（同表 2 第 3 步） | ⚠ **k8s 形态今天没有部署 quota-agent**（`docs/production-deployment-requirements.md` §2.4.4 W4）⇒ 现在**没有影响面**，本轮只记账。将来部署 agent 时必须**同时**设计双 token（列表 + 旧值窗口），别把这条留到上线当天 |
+| `E2B_C3_AGENT_TOKEN` | ① 排维护窗口 ② `deploy/k8s-k0s/secrets.sh --rotate E2B_C3_AGENT_TOKEN` ③ `kubectl -n sandlock rollout restart ds/e2b-c3-agent` ④ `kubectl -n sandlock rollout restart deploy/control-plane`（③④ 连着做，不要停在中间） | **没有双窗**：旧 token 从 ② 起对两边都不再是"同一个值"，③④ 之间 CP 与 agent 各持一半 ⇒ **这一跳的指令全部 401，建箱失败并点名**（`the agent ... refused the grant`）；**在跑的沙箱不受影响**（槽位身份只在建箱时授予一次），**worker 也不需要滚**（它一个字都不读这个凭据 —— 滚 worker 才会杀沙箱，见表 2 第 3 步）⇒ 爆炸半径就是"窗口内建不了新箱" | 若要把这一段也消掉，就得给这一跳加**列表式双窗**（`E2B_C3_AGENT_TOKENS`，与表 1/2 同形）；本轮裁定**不做**（只有一个消费者、一跳，代价与收益不成比例），要做就照表 1 的模板来 |
 
 **那 10–30 s 的中断具体在哪、谁会看到什么**（`E2B_REDIS_PASSWORD`）：
 

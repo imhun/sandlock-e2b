@@ -24,5 +24,12 @@ resources:
   # file has to ship the broker that serves it -- `test_..._inseparable` renders
   # exactly that.
   - priv-broker.yaml
+  # C3 (Task 3): the per-node agent -- the only component that grants a slot its
+  # identity. It lives in the baseline with the broker for the same reason the
+  # broker does (nothing about it is a distribution or storage difference), and
+  # the k0s overlay inherits it unchanged: its one PVC claim is the base
+  # `sandbox-shared`, and its node-local cache is the same `/var/lib/e2b-images`
+  # hostPath the worker and the broker already share.
+  - c3-agent.yaml
   - worker.yaml
   - autoscaler.yaml

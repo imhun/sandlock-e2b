@@ -6,13 +6,24 @@ plane's instruction carries every parameter, including the pool uid to grant, so
 here there is no authorization table, no TTL and no ordering discipline. The
 only local decision is whether the instruction is addressed to *this* node.
 
+**The node id in the URL is this agent's own identity, and that identity is the
+host** (ruling D12): one agent per node, while a node may run several workers.
+In k8s it is ``spec.nodeName`` (the DaemonSet's downward API); in compose it is
+the agent's service name. The **worker's** identity -- its node id (== pod
+name), its pod UID and the pid namespace it recorded -- travels inside the
+instruction body, and that is what the reverse lookup matches against. There is
+deliberately no check of "does the body's worker match the URL": they name two
+different things, and the control plane -- not this service -- is the authority
+that paired them.
+
 Surface (all responses JSON objects):
 
 - ``POST /internal/nodes/{node_id}/agent/grant-slot``
   ``{"sandbox_id", "uid", "pid", "worker"}`` -> ``{"op", "sandboxID", "uid",
   "pid", "hostPid", "pidNamespace", "asUid"}``. ``pid`` is the pid the *worker*
   knows (its own pid namespace); ``worker`` is who the control plane says that
-  pid belongs to. The agent resolves the host pid first
+  pid belongs to. ``node_id`` in the path is *this host* (D12). The agent
+  resolves the host pid first
   (:mod:`deploy.c3_agent.lookup`), then runs ``as_uid --uid X --pid <host>``;
   the *only* accepted result is exit 0 with exactly the ``C3-ASUID-OK
   pid=N uid=X`` line on stdout and an empty stderr. Anything else is a ``502``
@@ -52,7 +63,7 @@ from deploy.c3_agent.lookup import (
     WorkerIdentity,
     missing_slot_pid_message,
 )
-from gateway_common.paths import validate_sandbox_id
+from gateway_common.paths import validate_node_id, validate_sandbox_id
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +77,10 @@ class AgentRefusal(Exception):
 
 class WorkerInstruction(BaseModel):
     """Who the control plane says the reported container pid belongs to.
+
+    ``node_id`` is the **worker's** identity -- its node id, which is the
+    StatefulSet pod name -- not the node this agent runs on (D12: the URL says
+    which host; this field says which worker *on* that host).
 
     ``pid_namespace`` is the worker's own reported identity (the one value that
     exists in both lanes and in both directions -- ruling D9.3); ``pod_uid`` is
@@ -221,19 +236,21 @@ def create_app(
             raise HTTPException(
                 status_code=404, detail={"error": f"unknown agent op {op!r}"}
             )
-        if body.worker.node_id != node_id:
-            # The instruction's "who" and its "for which node" must agree: the
-            # address the agent was dialled on and the worker the lookup will
-            # match are the same fact, and a pair that disagrees is refused
-            # rather than resolved against either half.
+        # D12: the path's node id is *this host* while `worker.node_id` is the
+        # worker pod that reported the pid -- two different names, so they are
+        # not compared. What is checked is that the worker identity is a shape
+        # that can be named in a log line at all; the proof that the pid really
+        # belongs to that worker is the pid namespace (and, in k8s, the pod UID
+        # -> cgroup) that the lookup matches, both of which come from the
+        # control plane.
+        if not validate_node_id(body.worker.node_id):
+            logger.warning(
+                "c3-agent refused grant-slot: the worker identity is not a "
+                "node id"
+            )
             raise HTTPException(
                 status_code=400,
-                detail={
-                    "error": (
-                        f"the instruction is addressed to node {node_id} but "
-                        f"names worker {body.worker.node_id}"
-                    )
-                },
+                detail={"error": "worker.node_id is not a valid node id"},
             )
         # Same shape rule the control plane uses: a hostile id must not reach a
         # log line (or a later path/lookup) verbatim. The message deliberately

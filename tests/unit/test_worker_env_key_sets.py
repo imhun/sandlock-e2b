@@ -218,6 +218,12 @@ KEY_CLASSES: dict[str, set[str]] = {
     # compose stacks ship no such daemon -- they keep the file-capability
     # shape (C1's `exec` transport) -- so both keys are k8s-only.
     "priv_broker_transport": {"E2B_PRIV_HELPER_TRANSPORT", "E2B_PRIV_HELPER_SOCKET"},
+    # C3 (Task 3): which path grants a route-B slot its identity. The k8s worker
+    # and the two separated production compose stacks (the ones that ship a
+    # `c3-agent` service) run `agent-grant`; the arm-lane fleet stack, the local
+    # pool, the single-machine example and the test runner have no agent and
+    # keep the code default (`spawn`, the rollback lever).
+    "slot_identity": {"E2B_SLOT_IDENTITY"},
     # Named template images (`docs/HANDOFF.md`: unset = the fixed set only).
     "template_images": {"E2B_TEMPLATE_IMAGES"},
     # Per-worker wiring: who the worker is and which control plane it dials.
@@ -318,6 +324,7 @@ _FLEET_STACK_MISSING = (
     | KEY_CLASSES["k8s_disk_enforcement"]
     | KEY_CLASSES["k8s_real_root_and_checkpoint"]
     | KEY_CLASSES["priv_broker_transport"]
+    | KEY_CLASSES["slot_identity"]
 )
 
 #: The compose example stacked with a control plane + Redis: it declares the
@@ -331,6 +338,11 @@ _COMPOSE_EXAMPLE_MISSING = (
     | KEY_CLASSES["priv_helpers"]
     | KEY_CLASSES["template_images"]
 )
+
+#: The two separated production stacks are the compose half of C3's coverage
+#: (Global Constraints): they ship the `c3-agent` service, so unlike the fleet
+#: stack above they *do* name the identity path instead of inheriting `spawn`.
+_C3_COMPOSE_MISSING = _COMPOSE_EXAMPLE_MISSING - KEY_CLASSES["slot_identity"]
 
 #: The local pool: the autoscaler builds the worker's `docker run` argv itself,
 #: so its env JSON is the worker's whole environment -- no workspace base, no
@@ -373,8 +385,8 @@ ALLOWED_MISSING: dict[str, set[str]] = {
     FLEET_STACK: _FLEET_STACK_MISSING,
     POOL_COMPOSE: _POOL_MISSING,
     POOL_BACKEND: _POOL_MISSING | KEY_CLASSES["base_image"],
-    COMPOSE_PROD: _COMPOSE_EXAMPLE_MISSING,
-    COMPOSE_MULTINODE: _COMPOSE_EXAMPLE_MISSING,
+    COMPOSE_PROD: _C3_COMPOSE_MISSING,
+    COMPOSE_MULTINODE: _C3_COMPOSE_MISSING,
     COMPOSE_DEMO: _DEMO_MISSING,
     COMPOSE_RUNNER: _RUNNER_MISSING,
 }

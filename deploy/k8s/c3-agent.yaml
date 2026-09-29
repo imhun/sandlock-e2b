@@ -1,0 +1,215 @@
+# C3（Task 3）：每节点一个 agent —— 槽位身份的**唯一授予者**。
+#
+# 它承接两件事，因此是**一个 DaemonSet、两个容器**（`plan §2.0` 定案）：
+#
+#   face A `agent` —— 身份授予。CP 把「哪个节点、哪个沙箱、哪个 uid、哪个 pid」发过来，
+#     它用宿主 `/proc` 把 worker 报的**容器 pid** 反查成**宿主 pid**（所以必须
+#     `hostPID: true`），再让镜像里那个面 A 原语写一次 `uid_map`。它以 **65534** 跑，
+#     容器 BND 里带上 `SETUID`/`SETGID` —— 这是**声明**不是授权：file capability 必须是
+#     容器 BND 的子集，否则内核在 `exec` 那一步就拒绝（非 root 进程的 `CapEff` 仍是 0）。
+#
+#   face B `maint` —— 文件操作面（C1 的 `e2b-maint` 原样搬进来，**复用
+#     `deploy/priv/priv_common.c` 的路径白名单纪律，不另写一套**）。它必须是 **root**：
+#     工作区在阿里云 NAS 上走 AUTH_SYS，`chown` 只有 uid 0 做得成（2026-09-17 实测，
+#     见 `deploy/k8s/priv-broker.yaml` 文件头）。**能力集与 C1 的 broker 逐条相同** ——
+#     本任务只搬家，不扩面。它的载荷（文件操作 verb）归 Task 4；在那之前这个容器只
+#     持有已评审的能力集与挂载，**不听任何端口**。
+#
+# ⚠ `hostPID` 是 **pod 级**字段 ⇒ face B 也会拿到它。这是 `plan §2.0` 明确点名接受的
+#   增量（face B 本来就是 root + `DAC_OVERRIDE`），不是顺手漏出来的。
+#
+# ⚠ **身份是「宿主/节点」的名字**（D12）：`E2B_C3_AGENT_NODE_ID` 取自
+#   `spec.nodeName`，**不是** pod 名。一个节点上可能同时有多个 worker（k8s 2 个副本；
+#   multinode compose 三个 worker 同机）——用 worker pod 名当身份会歧义。CP 侧的寻址器
+#   正是按"worker pod → `spec.nodeName`"解析的，worker 自己的身份（pod 名 + pod UID +
+#   它记的 pid namespace）随指令体一起下发。
+#
+# ⚠ **红线**（`plan §2.3`）在本文件里逐条成立：没有内核特权大件、没有 host 网络、没有
+#   特权容器、也**没有**任何"禁止提权"式的字段 —— 后者会让内核**静默忽略** file
+#   capabilities，face A 会像装好了却永远授不出身份（判据 11）。本文件里连这些词都
+#   不出现在注释里，免得文本级 pin 被自己的说明骗过。
+#
+# 暴露面：agent 只应答 **CP**（下面的 NetworkPolicy 是"只有两条通道"的连接层那一半；
+# 服务自己的 token 检查是第二半，不是替代）。`worker ↔ agent` 这条通道不存在。
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: e2b-c3-agent
+  namespace: sandlock
+  labels:
+    app: c3-agent
+spec:
+  selector:
+    matchLabels:
+      app: c3-agent
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: c3-agent
+    spec:
+      # face A 的反查要读**宿主**的进程表；这是它唯一的特权形态，且它不因此获得任何
+      # 能力（只影响可见性）。
+      hostPID: true
+      # 调度域与 worker/broker 完全一致：虚拟节点（ECI/任何 virtual-kubelet）跑不了
+      # 这个 pod，那里也没有 worker 需要它。
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: type
+                    operator: NotIn
+                    values:
+                      - virtual-kubelet
+      containers:
+        # ------------------------------------------------------------------
+        # face A：身份授予（非 root，两个 file capability）
+        # ------------------------------------------------------------------
+        - name: agent
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 49985
+          env:
+            # D12：身份 = **节点名**（不是 pod 名）。服务用它回答唯一那个本地问题
+            # "这条指令是发给我的吗？"。
+            - name: E2B_C3_AGENT_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # CP→agent 的唯一凭据。**它绝不出现在 worker 清单或 worker 镜像里**
+            # （`tests/unit/test_c3_internal_api_shape.py` 的 pin），由
+            # `deploy/k8s-k0s/secrets.sh` 与其他托管键一起生成。
+            - name: E2B_C3_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_C3_AGENT_TOKEN
+          securityContext:
+            # 65534 = worker 自己的 uid：写 uid_map 要求写者 euid == 目标 user
+            # namespace 的 owner，而那个 owner 就是"天生 65534"的 worker（§14.2.7）。
+            runAsUser: 65534
+            capabilities:
+              # BND 声明：`as_uid` 的 file capabilities 必须是它的子集，否则 `exec`
+              # EPERM。这两条对非 root 进程**不产生** CapEff。
+              add:
+                - SETUID
+                - SETGID
+          # 探针走 `exec`（容器内自连 127.0.0.1）：kubelet 的 httpGet 是从节点发起
+          # 的网络请求，会被下面那条"只许 CP 进"的 NetworkPolicy 挡在半路。
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import socket; socket.create_connection(('127.0.0.1', 49985), 2).close()"
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import socket; socket.create_connection(('127.0.0.1', 49985), 2).close()"
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              # 一次授予 = 一次 `/proc` 扫描 + 一个 `as_uid` 子进程；并发上限由
+              # CP 侧的 `E2B_C3_AGENT_MAX_CONCURRENCY` 管。这里是跑飞量的兜底。
+              cpu: "1"
+              memory: 256Mi
+        # ------------------------------------------------------------------
+        # face B：文件操作面（root + C1 的三条能力；载荷归 Task 4）
+        # ------------------------------------------------------------------
+        - name: maint
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          # Task 4 才会把它换成 `e2b-maint` 的 verb 服务。在那之前它只是**持有已评审
+          # 能力集与挂载**的空转容器：不听端口、不 exec 任何东西 —— 一个"root + 三条
+          # 能力却什么都不做"的容器，比一个"已经能删树但还没接客户端"的守护进程更
+          # 容易在评审里看清。
+          command:
+            - /bin/sh
+            - -c
+            - exec sleep infinity
+          env:
+            # 与 C1 broker 逐字相同的四个白名单根（`priv_common.c` 的纪律），
+            # 让 Task 4 的载荷一上来就落在已评审的边界里。
+            - name: E2B_WORKSPACE_BASE
+              value: /var/lib/e2b-sandboxes/workspaces
+            - name: E2B_STATE_BASE
+              value: /var/lib/e2b-sandboxes/state
+            - name: E2B_SHARED_VOLUME_ROOT
+              value: /var/lib/e2b-sandboxes
+            - name: E2B_IMAGE_CACHE_DIR
+              value: /var/lib/e2b-images
+          securityContext:
+            # NFS AUTH_SYS 只认凭据 uid：`chown` 给别人（比如池 uid 10000）只有 uid 0
+            # 做得成。`drop: [ALL]` 必须配 `add`，否则这里只是"在 root 默认集上追加"。
+            runAsUser: 0
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+          volumeMounts:
+            # 与 worker 同一个 RWX claim、同一个路径：白名单按解析后的路径比较，
+            # 属主/删除必须落在 worker 看得见的那些树上。
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
+            # 节点本地的解包缓存（第四个白名单根），与 worker/broker 同一个 hostPath。
+            - name: image-cache
+              mountPath: /var/lib/e2b-images
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: sandbox-shared
+        - name: image-cache
+          hostPath:
+            path: /var/lib/e2b-images
+            type: DirectoryOrCreate
+---
+# "只有两条通道"的连接层那一半：agent 只接受 **control-plane** pod 进来的连接，
+# 而且只在那一个端口上。worker 直接来敲会被网络层挡掉 —— 不靠 agent 自己判断
+# （判据 ⑥ 的"连接层就拒"）。
+#
+# `policyTypes: [Ingress]` 只管入口：agent 今天不发起任何网络连接（它读 `/proc`、写
+# 一次 uid_map），所以出口留给默认，不在这一条里做文章。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: e2b-c3-agent
+  namespace: sandlock
+spec:
+  podSelector:
+    matchLabels:
+      app: c3-agent
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: control-plane
+      ports:
+        - protocol: TCP
+          port: 49985

@@ -364,11 +364,19 @@ class Settings:
         default_factory=lambda: _env_float("E2B_C3_AGENT_TIMEOUT_S", 5.0)
     )
     #: How many CP→agent instructions may be in flight at once. ``0`` is
-    #: unbounded (today's behavior); slice B sizes the shipped default from the
-    #: concurrent-create arm, and the acceptance matrix's negative arm sets it
-    #: to 1 to prove the queueing it must *not* have.
+    #: unbounded; the shipped default is **64**, and the number is bounded on
+    #: both sides rather than picked to taste (D16): it must be at least the
+    #: largest number of outstanding slot starts one control plane can have
+    #: (the autoscaler's 16-replica ceiling; the create admission cap is 100, so
+    #: the semaphore must not be the first thing a create waits on), while the
+    #: agent is a **synchronous** FastAPI service whose handlers run on the
+    #: anyio threadpool (default 40) -- a limit above 40 buys no throughput
+    #: there, and one below it would queue grants the agent could have served in
+    #: parallel. 64 sits above the agent's own 40 and below the CP's 100. Slice
+    #: B2 measures the N-concurrent arm against this and forces 1 to prove the
+    #: queueing it must *not* show; this is the value it revises if so.
     c3_agent_max_concurrency: int = field(
-        default_factory=lambda: _env_int("E2B_C3_AGENT_MAX_CONCURRENCY", 0)
+        default_factory=lambda: _env_int("E2B_C3_AGENT_MAX_CONCURRENCY", 64)
     )
     # E5.4: secret-at-rest encryption. When E2B_SECRET_MASTER_KEY is unset
     # the secret registry degrades to the previous in-memory + plaintext

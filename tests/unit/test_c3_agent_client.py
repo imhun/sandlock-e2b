@@ -28,11 +28,16 @@ from control_plane.c3_agent_client import (
     C3AgentClient,
     ComposeAgentAddressResolver,
     K8sAgentAddressResolver,
+    StaticAgentAddressResolver,
     build_agent_address_resolver,
 )
 
 WORKER_POD_UID = "6d3cdd7b-3a5e-4a1f-9a6b-0c1d2e3f4a5b"
 NODE = "e2b-worker-0"
+#: Ruling D12: the agent is a per-node DaemonSet, so its address is the **host**
+#: the worker pod landed on -- not the worker pod's own name. The client
+#: addresses the agent by this name; the worker's name travels in the body.
+HOST = "k0s-worker-0"
 AGENT_IP = "10.244.1.7"
 NAMESPACE = "sandlock"
 AGENT_LABEL = "app=c3-agent"
@@ -77,7 +82,9 @@ def test_the_agent_is_found_through_the_workers_own_node() -> None:
 
     The pod UID rides back with the address: it is the proof the agent's lookup
     demands (D9.3), and the only place it can come from in this lane is the API
-    -- never the worker.
+    -- never the worker. D12: the target's own identity is that ``nodeName``
+    (the address the instruction will be sent to), while ``NODE`` -- the worker
+    pod -- stays the identity that goes into the instruction body.
     """
     seen: list[str] = []
 
@@ -95,7 +102,11 @@ def test_the_agent_is_found_through_the_workers_own_node() -> None:
         )
 
     target = _k8s_resolver(handler).resolve(NODE)
-    assert target == AgentTarget(url=f"http://{AGENT_IP}:49985", pod_uid=WORKER_POD_UID)
+    assert target == AgentTarget(
+        node_identity=HOST,
+        url=f"http://{AGENT_IP}:49985",
+        pod_uid=WORKER_POD_UID,
+    )
     assert seen[0].endswith(f"/api/v1/namespaces/{NAMESPACE}/pods/{NODE}")
     # The second lookup is scoped to the node the worker really runs on, and to
     # the agent label -- not to whatever the request may have said.
@@ -191,10 +202,15 @@ def test_a_hostile_node_id_never_reaches_the_api() -> None:
 
 
 def test_the_compose_agent_is_the_configured_service_name() -> None:
-    """Compose addresses the agent by service name; there is no pod UID there."""
+    """Compose addresses the agent by service name; there is no pod UID there.
+
+    The service name is also the agent's own identity (D12): the compose
+    manifests set ``E2B_C3_AGENT_NODE_ID`` to the URL host, so the name the
+    control plane dials and the name the agent believes it is are one value.
+    """
     resolver = ComposeAgentAddressResolver("http://c3-agent:49985/")
     assert resolver.resolve(NODE) == AgentTarget(
-        url="http://c3-agent:49985", pod_uid=None
+        node_identity="c3-agent", url="http://c3-agent:49985", pod_uid=None
     )
 
 
@@ -264,7 +280,15 @@ def _k8s_client(handler, *, transport=None) -> C3AgentClient:
     )
 
 
-def test_the_instruction_carries_the_records_and_nothing_from_the_caller() -> None:
+def test_the_instruction_addresses_the_host_and_names_the_worker_in_the_body() -> None:
+    """D12, on the wire: the two identities are carried in two places.
+
+    The URL says which **host**'s agent is being instructed (``spec.nodeName``,
+    resolved from the worker pod -- never from the request), and the body says
+    which **worker pod** reported the pid. Two workers on one host would be
+    indistinguishable if the URL carried the worker name instead, and the
+    agent's cgroup proof would have nothing to match against.
+    """
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -279,8 +303,11 @@ def test_the_instruction_carries_the_records_and_nothing_from_the_caller() -> No
     assert len(seen) == 1
     request = seen[0]
     assert str(request.url) == (
-        f"http://{AGENT_IP}:49985/internal/nodes/{NODE}/agent/grant-slot"
+        f"http://{AGENT_IP}:49985/internal/nodes/{HOST}/agent/grant-slot"
     )
+    # The URL carries the host; the body carries the worker. Neither is the
+    # other -- the assertion is the pair, not one value.
+    assert f"/internal/nodes/{NODE}/" not in str(request.url)
     assert request.headers["X-Internal-Key"] == TOKEN
     assert json.loads(request.content) == {
         "sandbox_id": "sbx_forward",
@@ -330,6 +357,10 @@ def test_the_real_agent_service_accepts_the_clients_instruction() -> None:
         def host_pid(self, container_pid, identity, *, sandbox_id: str):
             from deploy.c3_agent.lookup import SlotProcess
 
+            # D12: the service is addressed by its host, and the worker it is
+            # told about is a different name (`NODE`) -- the agent does not
+            # compare them, it matches the pid namespace/UID instead.
+            assert identity.node_id == NODE
             assert identity.pid_namespace == PID_NAMESPACE
             assert identity.pod_uid == WORKER_POD_UID
             return SlotProcess(
@@ -343,7 +374,7 @@ def test_the_real_agent_service_accepts_the_clients_instruction() -> None:
 
     runner = _Runner()
     agent_app = create_agent_app(
-        settings=AgentSettings(token=TOKEN, node_id=NODE),
+        settings=AgentSettings(token=TOKEN, node_id=HOST),
         runner=runner,
         lookup=_Lookup(),
     )
@@ -375,6 +406,37 @@ def test_an_unresolvable_agent_is_a_named_refusal() -> None:
         "instruct an agent the control plane cannot locate"
     )
     assert excinfo.value.status_code == 503
+
+
+def test_an_address_without_a_usable_agent_identity_is_refused() -> None:
+    """D12: the URL segment has to be a name, and it is checked before dialling.
+
+    A resolver that produced an address but no identity would otherwise send
+    the instruction to `/internal/nodes//agent/...`, which no agent would
+    recognise -- a dial to *some* agent with an address that means nothing.
+    """
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json={})
+
+    client = C3AgentClient(
+        resolver=StaticAgentAddressResolver(
+            {NODE: AgentTarget(node_identity="", url="http://10.0.0.9:49985")}
+        ),
+        token=TOKEN,
+        timeout_s=2.0,
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(AgentClientError) as excinfo:
+        _grant(client)
+    assert str(excinfo.value) == (
+        f"the agent address for node {NODE} carries no usable agent identity "
+        "(''): refusing"
+    )
+    assert excinfo.value.status_code == 503
+    assert calls == []
 
 
 def test_an_unconfigured_token_refuses_before_dialling() -> None:

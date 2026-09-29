@@ -57,6 +57,12 @@ printf '%s\n' "$rendered" | kubectl apply -f -
 # 两个都等完再往下；只等 worker 的话，这道闸门可能在一个从未收敛的 broker 上放行。
 echo "等待 broker DaemonSet 滚动完成" >&2
 kubectl -n "$NAMESPACE" rollout status ds/e2b-priv-broker --timeout=300s
+# C3（Task 3）：agent 是 worker 的**新上游**（`E2B_SLOT_IDENTITY=agent-grant`）：
+# worker 起一个槽位时要先由 CP 指令本节点的 agent 授予身份，agent 不在就没有
+# 回落路径（建箱直接失败并点名）。所以它和 broker 一样必须在 worker 之前收敛；
+# 只等 worker 的话，这道闸门可能在一个从未起来的 agent 上放行。
+echo "等待 C3 agent DaemonSet 滚动完成" >&2
+kubectl -n "$NAMESPACE" rollout status ds/e2b-c3-agent --timeout=300s
 echo "等待 worker 滚动完成" >&2
 kubectl -n "$NAMESPACE" rollout status statefulset/e2b-worker --timeout=300s
 

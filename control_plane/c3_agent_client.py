@@ -14,6 +14,15 @@ find it **from a trusted source**: never from a request body (the same rule
   instruction carries none; the worker's pid namespace identity is the proof
   (see ``deploy/c3_agent/lookup.py`` for why that is sound).
 
+**Two identities, and D12 is why they are two.** The agent is a *per-node*
+DaemonSet, so the identity the agent checks against itself -- and the one this
+client puts in the URL path -- is the **host**: ``spec.nodeName`` in k8s, the
+service name in compose. The identity of the *worker that reported the pid*
+travels in the instruction body (``worker.node_id`` + pod UID + pid namespace):
+with two worker pods on one node (three, in the multinode compose stack) a
+worker-pod-name identity would be wrong or ambiguous, and the agent could not
+tell which worker a candidate process belonged to.
+
 A lookup that cannot answer -- pod missing, no agent pod on the node, two agent
 pods, a k8s lane that somehow had no worker UID -- resolves to ``None``. The
 caller fails closed and names the node; nothing here ever picks a candidate "on
@@ -33,6 +42,7 @@ import logging
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -49,11 +59,17 @@ DEFAULT_AGENT_PORT = 49985
 class AgentTarget:
     """Where the agent is, and what the lookup learned about the worker.
 
+    ``node_identity`` is the agent's **own** identity -- the host it runs on
+    (``spec.nodeName`` in k8s; the service name in compose). The instruction is
+    addressed by it, and the agent compares it against the node it believes it
+    is (D12).
+
     ``pod_uid`` is the **worker pod's** UID, not the agent pod's: it is the
     k8s lane's proof that a candidate process in the agent's ``/proc`` scan
     belongs to the worker whose report the control plane is forwarding.
     """
 
+    node_identity: str
     url: str
     pod_uid: str | None = None
 
@@ -79,6 +95,12 @@ class ComposeAgentAddressResolver:
 
     Unconfigured means *no agent*, not "try something else": a shape that has
     not named one must refuse the grant by name rather than dial a guess.
+
+    The agent's self-identity is the **host of that URL** (``c3-agent``), and the
+    compose manifests set the agent's ``E2B_C3_AGENT_NODE_ID`` to the same name
+    -- the pair is pinned in ``tests/unit/test_c3_agent_manifest.py``. Deriving
+    it from the URL is deliberate: there is exactly one name, the one the
+    control plane actually dials, so the two halves cannot drift.
     """
 
     def __init__(self, url: str | None) -> None:
@@ -87,7 +109,10 @@ class ComposeAgentAddressResolver:
     def resolve(self, node_id: str) -> AgentTarget | None:
         if not self._url:
             return None
-        return AgentTarget(url=self._url, pod_uid=None)
+        identity = urlsplit(self._url).hostname or ""
+        if not validate_node_id(identity):
+            return None
+        return AgentTarget(node_identity=identity, url=self._url, pod_uid=None)
 
 
 class K8sAgentAddressResolver:
@@ -165,7 +190,12 @@ class K8sAgentAddressResolver:
             )
             return None
         return AgentTarget(
-            url=f"{self._scheme}://{candidates[0]}:{self._port}", pod_uid=pod_uid
+            # D12: the agent's identity is the *host*, not the worker pod that
+            # happened to report. This is what the instruction is addressed by,
+            # and it is the agent's own `E2B_C3_AGENT_NODE_ID` (spec.nodeName).
+            node_identity=node_name,
+            url=f"{self._scheme}://{candidates[0]}:{self._port}",
+            pod_uid=pod_uid,
         )
 
     def _get(self, path: str, params: dict[str, str] | None = None):
@@ -270,7 +300,13 @@ class C3AgentClient:
         uid: int,
         worker_pid_namespace: str,
     ) -> dict[str, Any]:
-        """Instruct the node's agent to hand ``uid`` to the slot's child."""
+        """Instruct the node's agent to hand ``uid`` to the slot's child.
+
+        ``node_id`` is the **worker's** identity (StatefulSet pod name). The
+        agent is addressed by the identity the resolver found for it -- the host
+        it runs on (D12) -- and the worker's identity rides in the body, where
+        the agent's reverse lookup needs it.
+        """
         if not validate_pid_namespace(worker_pid_namespace):
             raise AgentClientError(
                 f"node {node_id} has no usable pid namespace identity "
@@ -282,6 +318,12 @@ class C3AgentClient:
             raise AgentClientError(
                 f"cannot determine the agent address for node {node_id}: "
                 "refusing to instruct an agent the control plane cannot locate",
+                status_code=503,
+            )
+        if not validate_node_id(target.node_identity):
+            raise AgentClientError(
+                f"the agent address for node {node_id} carries no usable agent "
+                f"identity ({target.node_identity!r}): refusing",
                 status_code=503,
             )
         if target.pod_uid is not None and not validate_pod_uid(target.pod_uid):
@@ -300,6 +342,8 @@ class C3AgentClient:
             "pid": int(container_pid),
             "uid": int(uid),
             "worker": {
+                # The *worker's* identity (its node id == its pod name) travels
+                # here; the URL carries the **agent's** identity (its host).
                 "node_id": node_id,
                 "pid_namespace": worker_pid_namespace,
                 "pod_uid": target.pod_uid,
@@ -313,7 +357,10 @@ class C3AgentClient:
     async def _post(
         self, target: AgentTarget, node_id: str, body: dict[str, Any]
     ) -> dict[str, Any]:
-        url = f"{target.url}/internal/nodes/{node_id}/agent/grant-slot"
+        url = (
+            f"{target.url}/internal/nodes/{target.node_identity}"
+            "/agent/grant-slot"
+        )
         try:
             async with httpx.AsyncClient(
                 timeout=self._timeout_s, transport=self._transport

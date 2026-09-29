@@ -243,6 +243,11 @@ def test_the_k8s_control_plane_can_read_pods_and_nothing_else() -> None:
 
     Without it the mode fails closed (every node-scoped request 503s), so the
     grant is part of the shipped shape, not an operator extra.
+
+    C3 Task 3 (D13) extends it to `list`: the agent's address is the agent pod
+    **on the worker's node**, found with a label-scoped `list` -- `get` can only
+    answer "what is this worker pod's nodeName". The scope is unchanged (pods,
+    this namespace, nothing else).
     """
     docs = _load_all(K8S / "control-plane.yaml")
     by_kind = {}
@@ -253,7 +258,7 @@ def test_the_k8s_control_plane_can_read_pods_and_nothing_else() -> None:
     roles = by_kind.get("Role") or []
     assert len(roles) == 1
     assert roles[0]["rules"] == [
-        {"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}
+        {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]}
     ]
     bindings = by_kind.get("RoleBinding") or []
     assert len(bindings) == 1
@@ -302,18 +307,33 @@ def test_no_worker_shape_carries_the_agent_token() -> None:
     A worker that could read ``E2B_C3_AGENT_TOKEN`` would hold the agent's
     credential, and the ``CP→agent`` channel would be reachable from the
     (untrusted) data plane -- exactly the channel hard rule 5 says does not
-    exist. Task 3 owns the DaemonSet/NetworkPolicy; this pin keeps the token out
-    of every worker manifest and the worker image meanwhile.
+    exist.
+
+    Two shapes are checked, because the answer differs by file: manifest sets
+    that hold **only** worker-shaped services (the k8s worker StatefulSet, the
+    autoscaler's pool backend, the worker image, the arm-lane fleet stack) are
+    scanned as raw text, while the two separated compose stacks put the control
+    plane and its workers in one file -- there the token is legitimately the
+    *control plane's*, so the scan is per service and reads the worker services'
+    own env.
     """
-    worker_sources = [
+    worker_only_sources = [
         K8S / "worker.yaml",
         K8S / "autoscaler.yaml",
-        REPO / "deploy" / "compose" / "docker-compose.prod.yml",
-        REPO / "deploy" / "compose" / "docker-compose.multinode.yml",
         REPO / "deploy" / "compose" / "docker-compose.autoscale.yml",
         REPO / "deploy" / "stack" / "docker-compose.prod.yml",
         REPO / "deploy" / "docker" / "Dockerfile.envd",
         REPO / "autoscaler" / "backends" / "local.py",
     ]
-    for path in worker_sources:
+    for path in worker_only_sources:
         assert "E2B_C3_AGENT_TOKEN" not in path.read_text(encoding="utf-8"), path
+    for path in (
+        REPO / "deploy" / "compose" / "docker-compose.prod.yml",
+        REPO / "deploy" / "compose" / "docker-compose.multinode.yml",
+    ):
+        services = _compose(path)["services"]
+        workers = [name for name in services if name.startswith("worker")]
+        assert workers, path.name
+        for name in workers:
+            env = _compose_env(services[name])
+            assert "E2B_C3_AGENT_TOKEN" not in env, (path.name, name)

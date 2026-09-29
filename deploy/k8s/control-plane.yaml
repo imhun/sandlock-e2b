@@ -193,6 +193,46 @@ spec:
               value: k8s
             - name: E2B_NODE_ADDRESS_NAMESPACE
               value: sandlock
+            # C3 Task 3 (D12/D13): the CP→agent half of the two channels.
+            #
+            # The agent is a DaemonSet, so "the agent for this node" is only
+            # defined through the host: the resolver reads the worker pod's
+            # `spec.nodeName` and then the agent pod **on that host** by this
+            # label (hence the Role's `list`). The instruction is addressed by
+            # that node name (D12), and the worker's own identity travels in the
+            # body -- never the other way round.
+            - name: E2B_C3_AGENT_LABEL
+              value: app=c3-agent
+            - name: E2B_C3_AGENT_NAMESPACE
+              value: sandlock
+            # One credential for the CP→agent hop, shared with the agent's own
+            # pod and **nowhere else**: no worker manifest or worker image ever
+            # carries it (pinned in `tests/unit/test_c3_internal_api_shape.py`),
+            # because a worker that could read it would hold the agent's
+            # credential and `worker <-> agent` would exist in fact if not in
+            # design.
+            - name: E2B_C3_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_C3_AGENT_TOKEN
+            # D16: how many CP→agent instructions may be in flight at once.
+            #
+            # 64, and the reasoning is bounded on both sides rather than picked
+            # to taste: (a) it must be at least the largest number of slot
+            # starts one control plane can have outstanding -- the autoscaler's
+            # ceiling is 16 worker replicas, and the create admission cap is 100
+            # (`E2B_CREATE_QUEUE_MAX`), so the semaphore must not be the first
+            # thing a create waits on; (b) the agent is a **synchronous** FastAPI
+            # service, so its handlers run on the anyio threadpool (default 40)
+            # -- a limit above 40 buys no throughput at the agent, and a limit
+            # below it would queue grants the agent could have served in
+            # parallel. 64 sits above the agent's own 40 and below the CP's 100.
+            # Slice B2 measures N-concurrent creates against this number (and
+            # forces it to 1 to prove the queueing the limit must *not* show);
+            # this is the value it revises if that measurement says so.
+            - name: E2B_C3_AGENT_MAX_CONCURRENCY
+              value: "64"
             - name: E2B_ENABLE_LOCAL_NODE
               value: "false"
             # SECURITY: credentials come from the `e2b-secrets` Secret that the
@@ -447,7 +487,8 @@ spec:
     matchLabels:
       app: control-plane
 ---
-# C3 Task 2 (N49 / controller ruling D5): the control plane's identity source.
+# C3 Task 2/3 (N49 / controller rulings D5, D12, D13): the control plane's
+# identity source *and* its route to the node agent.
 #
 # The internal API binds a caller to a node by resolving that node's expected
 # address, and in this shape (`E2B_NODE_ADDRESS_MODE=k8s`) the resolver reads
@@ -457,6 +498,12 @@ spec:
 # Without it the resolver answers "cannot determine" and every node-scoped
 # request is refused (fail closed, named) -- which is the intended failure
 # shape, not a silent fallback to the caller's word.
+#
+# C3 Task 3 (D12/D13) adds `list`: the agent's address is found in two hops --
+# the worker pod's `spec.nodeName`, then the **agent pod on that host** by label
+# (`E2B_C3_AGENT_LABEL`, see `deploy/k8s/c3-agent.yaml`). The second hop is a
+# label-scoped `list`; `get` alone can only answer the first. Both verbs stay on
+# pods in this namespace, which is all the resolver ever reads.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -471,7 +518,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

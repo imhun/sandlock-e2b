@@ -23,8 +23,12 @@ class Settings:
     #: other half of "双向认证" -- both directions authenticated, no new PKI.
     token: str = field(default_factory=lambda: os.getenv("E2B_C3_AGENT_TOKEN", ""))
     #: The node this agent is (the only local decision it makes: "addressed to
-    #: me?"). Prefers the C3-specific name, then the worker's own E2B_NODE_ID
-    #: (the agent runs beside the worker's pod, so the identities coincide).
+    #: me?"). Under D12 this is the **host's** name, not a worker pod name: the
+    #: DaemonSet sets the C3-specific variable from `spec.nodeName`, and a
+    #: Compose shape sets it to the service name the control plane dials.
+    #: `E2B_NODE_ID` is only a fallback for an embedder that has nothing else
+    #: (in the shipped manifests the worker's own `E2B_NODE_ID` is its pod
+    #: name, which is a *different* fact from this one).
     node_id: str = field(
         default_factory=lambda: os.getenv("E2B_C3_AGENT_NODE_ID")
         or os.getenv("E2B_NODE_ID", "")

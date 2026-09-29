@@ -44,8 +44,13 @@ from deploy.c3_agent.lookup import (
 )
 
 TOKEN = "c3-agent-sekret"
-NODE = "e2b-worker-0"
-GRANT_URL = f"/internal/nodes/{NODE}/agent/grant-slot"
+#: Ruling D12 in this lane: the URL names the **host** the agent runs on (the
+#: DaemonSet's `spec.nodeName`), while the instruction body names the **worker
+#: pod** that reported the pid. The two are deliberately different values here,
+#: so a body/URL mix-up cannot pass unnoticed.
+HOST = "k0s-worker-0"
+WORKER = "e2b-worker-0"
+GRANT_URL = f"/internal/nodes/{HOST}/agent/grant-slot"
 #: The worker's own pid namespace identity, as the control plane carries it
 #: (Task 3 ruling D9.3: the candidate must live in exactly this namespace).
 PID_NAMESPACE = "pid:[4026532458]"
@@ -56,7 +61,7 @@ HOST_PID = 990425
 
 
 def _settings(**overrides) -> Settings:
-    defaults = dict(token=TOKEN, node_id=NODE)
+    defaults = dict(token=TOKEN, node_id=HOST)
     defaults.update(overrides)
     return Settings(**defaults)
 
@@ -76,7 +81,7 @@ def _body(**overrides) -> dict:
         "sandbox_id": "sbx_grant",
         "uid": 10007,
         "pid": 4242,
-        "worker": {"node_id": NODE, "pid_namespace": PID_NAMESPACE},
+        "worker": {"node_id": WORKER, "pid_namespace": PID_NAMESPACE},
     }
     payload.update(overrides)
     return payload
@@ -153,25 +158,26 @@ async def test_grant_slot_runs_as_uid_and_answers_the_instruction() -> None:
 
 
 @pytest.mark.asyncio
-async def test_an_instruction_for_another_node_is_refused_named() -> None:
-    """The agent may not be driven on behalf of a node it is not.
+async def test_an_instruction_for_another_host_is_refused_named() -> None:
+    """The agent may not be driven on behalf of a host it is not.
 
     This is the *only* local decision the stateless agent makes: "addressed to
-    me?". It is refused before the runner is consulted.
+    me?". The address is the **host** (D12), so a different node name is
+    refused before the runner is consulted.
     """
     runner = _StubRunner()
     app = create_app(settings=_settings(), runner=runner)
     async with _client(app) as client:
         resp = await client.post(
-            f"/internal/nodes/e2b-worker-1/agent/grant-slot",
+            "/internal/nodes/k0s-worker-1/agent/grant-slot",
             headers=_headers(),
             json=_body(),
         )
         assert resp.status_code == 403
         assert resp.json() == {
             "error": (
-                "request is addressed to node e2b-worker-1, but this agent "
-                "is node e2b-worker-0"
+                "request is addressed to node k0s-worker-1, but this agent "
+                "is node k0s-worker-0"
             )
         }
     assert runner.calls == []
@@ -204,7 +210,7 @@ async def test_an_unknown_op_is_refused_named() -> None:
     app = create_app(settings=_settings(), runner=_StubRunner())
     async with _client(app) as client:
         resp = await client.post(
-            f"/internal/nodes/{NODE}/agent/delete-tree",
+            f"/internal/nodes/{HOST}/agent/delete-tree",
             headers=_headers(),
             json=_body(),
         )
@@ -339,8 +345,15 @@ async def test_an_instruction_without_a_worker_identity_is_refused_named() -> No
 
 
 @pytest.mark.asyncio
-async def test_an_instruction_whose_worker_disagrees_with_its_node_is_refused() -> None:
-    """The instruction may not say "for node A" and "for worker B"."""
+async def test_a_worker_that_is_not_this_host_is_accepted() -> None:
+    """D12: the URL names the host, the body names the worker -- both can differ.
+
+    A node runs several workers (two pods in k8s, three in the multinode
+    compose stack), so "which worker" and "which host" are two different
+    questions and must not be compared with each other. What ties the
+    instruction to the right worker is the pid namespace (and, in k8s, the pod
+    UID the lookup matches against the candidate's cgroup), not a name match.
+    """
     runner = _StubRunner()
     app = create_app(settings=_settings(), runner=runner, lookup=_StubLookup())
     async with _client(app) as client:
@@ -348,16 +361,36 @@ async def test_an_instruction_whose_worker_disagrees_with_its_node_is_refused() 
             GRANT_URL,
             headers=_headers(),
             json=_body(
-                worker={"node_id": "e2b-worker-9", "pid_namespace": PID_NAMESPACE}
+                worker={"node_id": "e2b-worker-7", "pid_namespace": PID_NAMESPACE}
+            ),
+        )
+        assert resp.status_code == 200
+    assert runner.calls == [(10007, HOST_PID)]
+
+
+@pytest.mark.asyncio
+async def test_a_worker_identity_that_is_not_a_node_id_is_refused_named() -> None:
+    """The worker field is still shape-checked before it reaches a log line.
+
+    It is not security-relevant any more (the control plane is the authority
+    that paired the two names), but a hostile string must not be echoed into the
+    agent's log or a later lookup argument.
+    """
+    runner = _StubRunner()
+    app = create_app(settings=_settings(), runner=runner, lookup=_StubLookup())
+    async with _client(app) as client:
+        resp = await client.post(
+            GRANT_URL,
+            headers=_headers(),
+            json=_body(
+                worker={
+                    "node_id": "../../etc/passwd",
+                    "pid_namespace": PID_NAMESPACE,
+                }
             ),
         )
         assert resp.status_code == 400
-        assert resp.json() == {
-            "error": (
-                "the instruction is addressed to node e2b-worker-0 but names "
-                "worker e2b-worker-9"
-            )
-        }
+        assert resp.json() == {"error": "worker.node_id is not a valid node id"}
     assert runner.calls == []
 
 
@@ -493,6 +526,6 @@ async def test_a_non_ascii_token_is_a_401_not_a_500() -> None:
 def test_the_listen_host_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
     """The bind address is deliberate (Task 3 bounds it with a NetworkPolicy)."""
     monkeypatch.setenv("E2B_C3_AGENT_HOST", "127.0.0.1")
-    assert Settings(token=TOKEN, node_id=NODE).host == "127.0.0.1"
+    assert Settings(token=TOKEN, node_id=HOST).host == "127.0.0.1"
     monkeypatch.delenv("E2B_C3_AGENT_HOST")
-    assert Settings(token=TOKEN, node_id=NODE).host == "0.0.0.0"
+    assert Settings(token=TOKEN, node_id=HOST).host == "0.0.0.0"
