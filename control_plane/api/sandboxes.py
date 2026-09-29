@@ -2238,6 +2238,25 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
         try:
             if not shared:
                 tar_path = await _export_sandbox_archive(request, record, source)
+            # F1: re-point the record at the destination *before* the target
+            # provisions the tree. The target's provision runs the sandbox's
+            # ownership step through face B (worker create ->
+            # ``apply_sandbox_ownership`` -> ``POST .../file-op``), and that
+            # file-op is scoped by the record's node. With the source still on
+            # the record, the control plane refused the very operation it had
+            # just ordered (403 "belongs to node <source>, not <target>") and
+            # every cross-node migration failed.
+            #
+            # This is the control plane's own deliberate step -- the record is
+            # its own, only it may move it -- so the ordinary create/delete
+            # scoping stays exactly as strict as before (a worker still cannot
+            # touch a peer's sandbox: the check below is unchanged). It happens
+            # after the source is stopped (its own stop/reset file ops are still
+            # scoped to the source) and the rollback restores the old node
+            # *before* it re-provisions the source, so that hop is scoped
+            # correctly too.
+            record.node_id = target.node_id
+            registry.save(record)
             try:
                 if not shared:
                     await _import_sandbox_archive(request, record, target, tar_path)
@@ -2255,8 +2274,6 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
                         record.volume_mounts,
                         snapshot_id=None,
                     )
-                record.node_id = target.node_id
-                registry.save(record)
                 nodes.release_quota(old_node_id, **dims)
                 # The source workspace is released (non-shared) or kept
                 # (shared), but per-sandbox volume slices under a shared
@@ -2303,6 +2320,20 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
         # Migration failed: restore the source runtime stopped above so the
         # sandbox keeps serving from its original node, and undo any record
         # switch that was already persisted.
+        #
+        # F1: undo the record switch *first*. The re-point above moved the
+        # record to the destination before provisioning, so a failed migration
+        # whose recovery re-provisions the source must put the source back on
+        # the record first -- otherwise the source's own ownership step would
+        # be refused by the (unchanged) file-op scoping, exactly like the
+        # target's was before this change.
+        if (
+            record is not None
+            and old_node_id is not None
+            and record.node_id != old_node_id
+        ):
+            record.node_id = old_node_id
+            registry.save(record)
         if source_stopped and record is not None and source is not None:
             try:
                 if source.address == "local://":
@@ -2328,13 +2359,6 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
                     sandbox_id,
                     source.node_id,
                 )
-        if (
-            record is not None
-            and old_node_id is not None
-            and record.node_id != old_node_id
-        ):
-            record.node_id = old_node_id
-            registry.save(record)
         raise
     finally:
         registry.release_migration(sandbox_id, token)

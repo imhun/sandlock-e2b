@@ -35,6 +35,61 @@ logger = logging.getLogger(__name__)
 #: Where the worker reads its own identity from (Linux ``procfs``).
 DEFAULT_PROC_ROOT = Path("/proc")
 
+#: The in-cluster marker the control plane's own shape detector reads
+#: (``control_plane/node_address.py``): a mounted ServiceAccount token. Mirrored
+#: here, not imported, because ``envd_service`` does not depend on
+#: ``control_plane`` -- and the two must agree, or the worker would report (and
+#: warn about) an anchor its deployment does not use.
+_SERVICE_ACCOUNT_TOKEN = Path(
+    "/var/run/secrets/kubernetes.io/serviceaccount/token"
+)
+
+
+def _identity_shape() -> str:
+    """``"k8s"`` or ``"hostname"`` -- which identity source this shape uses.
+
+    The same switch the control plane reads (``E2B_NODE_ADDRESS_MODE``, an
+    explicit ``k8s``/``hostname``, else in-cluster detection). The worker's env
+    usually leaves it unset, so the default resolves the shape the same way the
+    control plane resolves its identity source.
+    """
+    mode = (os.getenv("E2B_NODE_ADDRESS_MODE", "") or "auto").strip().lower()
+    if mode == "auto":
+        mode = "k8s" if _SERVICE_ACCOUNT_TOKEN.is_file() else "hostname"
+    return mode
+
+
+def container_identity_anchor_expected() -> bool:
+    """Whether this deployment reports the container-id anchor (D25).
+
+    Only the **compose** shape does, and only it needs to: there the control
+    plane cannot read a pod spec, so the worker reports its hostname-as-
+    container-id and the agent confirms the claim against the worker's
+    host-side cgroup path. The **k8s** shape verifies the worker's identity from
+    the pod spec's ``runAsUser``/``runAsGroup`` instead, so it neither reports
+    nor needs the anchor -- and a k8s pod's hostname is its *pod name*
+    (``e2b-worker-1``), which can never be a container id, so probing for one
+    there can only emit the false warning that says this node will refuse every
+    file operation.
+    """
+    return _identity_shape() != "k8s"
+
+
+def reported_container_id() -> str | None:
+    """The container id to send to the control plane, or ``None``.
+
+    The gate lives here, not in :func:`worker_container_id` (which stays the
+    honest raw probe, warning when a shape that relies on the anchor has no
+    usable hostname): a k8s worker skips the probe entirely, so it neither sends
+    a container id the control plane would ignore nor logs the compose-only
+    advice -- while the k8s lane's *real* warning ("this pod pins no worker
+    identity") stays exactly where it belongs, on the control plane's
+    verification path.
+    """
+    if not container_identity_anchor_expected():
+        return None
+    return worker_container_id()
+
 
 def worker_pid_namespace(proc_root: Path | str = DEFAULT_PROC_ROOT) -> str | None:
     """``readlink /proc/self/ns/pid`` -- the worker's namespace identity.

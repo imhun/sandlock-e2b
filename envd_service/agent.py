@@ -17,6 +17,7 @@ import httpx
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from envd_service.agent_fileops import AgentFileOpsError
 from envd_service.config import Settings
 from envd_service.executors.factory import (
     sandlock_failure_detail,
@@ -44,7 +45,7 @@ from envd_service.uid_pool import (
     apply_sandbox_ownership,
 )
 from envd_service.worker_identity import (
-    worker_container_id,
+    reported_container_id,
     worker_identity_fields,
     worker_pid_namespace,
 )
@@ -291,14 +292,20 @@ def _register_payload(
     pid_namespace = worker_pid_namespace()
     if pid_namespace:
         payload["pidNamespace"] = pid_namespace
-    # C3 Task 4 / ruling D25: the container identity the *file operations*''
+    # C3 Task 4 / ruling D25: the container identity the *file operations*'
     # anchor is matched against -- the worker's hostname, which the runtime sets
     # to (a prefix of) the container id and which the agent can find in the
     # worker's host-side cgroup path (world-readable; face B needs no
     # ``CAP_SYS_PTRACE`` and no uid change to read that). Absent when this
     # platform has no container identity, or when a deployment overrode
     # ``hostname:`` -- the control plane then refuses those operations by name.
-    container_id = worker_container_id()
+    #
+    # F2: reported only by the shape whose anchor it *is* (compose). The k8s
+    # lane verifies the worker's identity from the pod spec, so its worker skips
+    # the probe -- its pod-name hostname can never be a container id, and
+    # warning about that told the operator a falsehood ("every C3 file operation
+    # will be refused") about a node where they all succeed.
+    container_id = reported_container_id()
     if container_id:
         payload["containerID"] = container_id
     # C3 Task 4: the worker's own uid/gid, for the same reason (and on the same
@@ -1918,7 +1925,7 @@ class NodeAgent:
                         self._platform_disk_report,
                         worker_pid_namespace(),
                         worker_identity_fields(),
-                        worker_container_id(),
+                        reported_container_id(),
                     ),
                     headers=headers,
                 )
@@ -3017,11 +3024,25 @@ async def agent_create_sandbox(request: Request) -> Response:
         # "failed to provision: <body>" names the real cause.
         logger.exception("agent create sandbox failed (permission)")
         return Response(status_code=500, content=str(e)[:500])
+    except AgentFileOpsError as e:
+        # F1: a face-B file operation (``chown-workspace`` &c.) the control
+        # plane refused, or could not be reached for. It is neither an auth
+        # fault nor a permission fault, and it used to fall through to the
+        # generic arm below -- a body-less 500 the control plane rendered as a
+        # bare "failed to provision: ". The module already named the refusal,
+        # so carry that name: the operator reads *why* the destination could
+        # not provision instead of an empty 502.
+        logger.exception("agent create sandbox failed (file operation)")
+        return Response(status_code=500, content=str(e)[:500])
     except (ValueError, json.JSONDecodeError) as e:
         return Response(status_code=400, content=str(e))
-    except Exception:
+    except Exception as e:
         logger.exception("agent create sandbox failed")
-        return Response(status_code=500)
+        # Never a silent 500 again: C3's "named, never silent" rule means the
+        # control plane must be able to read the reason (the route is
+        # internal-key authenticated, so the body is the platform's own
+        # diagnostic, not a leak to a sandbox).
+        return Response(status_code=500, content=(str(e) or type(e).__name__)[:500])
     return Response(status_code=201)
 
 
