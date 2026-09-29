@@ -1351,11 +1351,14 @@ def test_the_workers_upstream_is_the_agent_and_the_broker_stays_consistent(
     # C3 Task 4 slice B: the broker's binary now comes from the **agent** image
     # -- the worker image no longer ships `/var/lib/e2b-priv/e2b-maint`, so a
     # broker still pointing at it would crash-loop and take the worker's
-    # `wait-for-broker` gate down with it.
-    assert broker["image"] == (
-        "registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0"
-    )
-    assert all("e2b-sandlock-agent" in c["image"] for c in broker_pod["initContainers"])
+    # `wait-for-broker` gate down with it. Read against the agent DaemonSet's own
+    # image *in this render* rather than a literal, so the two can never drift
+    # (they are the same repository and the same tag by construction).
+    agent_face_b = {c["name"]: c for c in agents[0]["spec"]["template"]["spec"]["containers"]}[
+        "maint"
+    ]
+    assert broker["image"] == agent_face_b["image"]
+    assert all(c["image"] == agent_face_b["image"] for c in broker_pod["initContainers"])
     # The broker `serve`s on the very path the worker dials, from the same
     # hostPath -- one socket, one node, both pods -- plus the probe's health
     # socket (A4), which is deliberately **not** in that hostPath: it is the

@@ -120,6 +120,25 @@ if [ -n "$ENV_FILE" ] && [ "$FORCE_ENV" != "1" ]; then
     done
 fi
 
+# --- C3 agent 凭据补键（Task 4 片 B）---
+# `E2B_C3_AGENT_TOKEN` 是片 B 才进部署面的键：老 .env（或 --env-file 给的文件）里**根本没有
+# 这一行**，而上面那段 carry-over 只重写"存在但为空/占位符"的键 ⇒ 缺键时得补。先看远端有没有
+# 已部署的值（CP 与两个 agent 面必须同一个值，重部署不改它），没有再生成一把。三个 stack 服务
+# 故意不写默认值（缺凭据要响亮地失败），agent 侧 `__main__` 也会在没有 token 时直接退出。
+if [ -n "$ENV_FILE" ]; then
+    C3_TOKEN_BEFORE="$(env_file_value "$ENV_FILE" E2B_C3_AGENT_TOKEN)"
+    C3_TOKEN_REMOTE="$(remote_env_value E2B_C3_AGENT_TOKEN || true)"
+    ensure_c3_agent_token "$ENV_FILE" "$C3_TOKEN_REMOTE"
+    C3_TOKEN_AFTER="$(env_file_value "$ENV_FILE" E2B_C3_AGENT_TOKEN)"
+    if [ "$C3_TOKEN_BEFORE" != "$C3_TOKEN_AFTER" ]; then
+        if [ -n "$C3_TOKEN_REMOTE" ] && [ "$C3_TOKEN_AFTER" = "$C3_TOKEN_REMOTE" ]; then
+            say "已补上 E2B_C3_AGENT_TOKEN（沿用目标机已部署的值）"
+        else
+            say "已生成 E2B_C3_AGENT_TOKEN（新值；CP 与两个 agent 面本次一起换）"
+        fi
+    fi
+fi
+
 # --- internal key 轮换（E3.6）---
 # 轮换 = 生成新主 key 并把它追加到 E2B_INTERNAL_API_KEYS（旧 key 保留，
 # 轮换窗口内新旧 key 均可用）；finalize = 从列表移除旧 key（立即失效）。

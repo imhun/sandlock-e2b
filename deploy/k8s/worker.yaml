@@ -85,20 +85,25 @@ spec:
       # to chown the volume roots, and this pod is no longer allowed a root
       # container of any kind.
       #
-      # What is left is an ordering gate. `E2B_PRIV_HELPER_TRANSPORT=socket` is
-      # fail-closed: a worker that starts before the broker serves would refuse
-      # to start, and on a fresh node the DaemonSet and this StatefulSet are
-      # scheduled independently -- so without the gate the first worker pod
-      # would crash-loop for as long as the broker takes to come up. It waits
-      # for a successful `hello` round-trip, not merely for the socket file to
-      # exist: the daemon answers `ok:false` when the peer identity does not
-      # match (E2B_BROKER_PEER_UID/GID vs this pod's uid/gid), and that refusal
-      # is exactly the half-migration this gate must not paper over.
+      # What is left is an ordering gate. It belongs to the `socket` rollback
+      # (C1): that shape is fail-closed: a worker that starts before the broker
+      # serves would refuse to start, and on a fresh node the DaemonSet and this
+      # StatefulSet are scheduled independently -- so without the gate the first
+      # worker pod would crash-loop for as long as the broker takes to come up.
+      # It waits for a successful `hello` round-trip, not merely for the socket
+      # file to exist: the daemon answers `ok:false` when the peer identity does
+      # not match (E2B_BROKER_PEER_UID/GID vs this pod's uid/gid), and that
+      # refusal is exactly the half-migration this gate must not paper over.
+      # (C3 Task 4 slice B ships `E2B_PRIV_HELPER_TRANSPORT=agent`, so the gate
+      # is no longer on the shipped path -- it stays with the broker until Task
+      # 7 retires both, and a broker that cannot start still fails this gate
+      # loudly, which is what an operator rolling back to `socket` needs.)
       #
       # 30 x 2 s, then exit non-zero naming the socket: a visibly unready pod
       # (and a log line with the broker's own refusal) instead of a silently
       # privileged retry loop. No `runAsUser`: the image's 65534 is what the
-      # socket's group (0660 root:65534) was built for.
+      # socket's group (0660 root:65534) was built for (the worker container
+      # pins 65534 explicitly; this init does not need to).
       initContainers:
         - name: wait-for-broker
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
@@ -220,9 +225,10 @@ spec:
             # an in-process `os.chown` for a path the brokers do not cover,
             # which this pod's 65534 worker cannot do (EPERM, silent per-volume
             # degradation). C1 (wave 2) made that the live shape: the worker is
-            # no longer root and its E2B_PRIV_HELPER_TRANSPORT is `socket`, so
-            # the broker's whitelist is what decides whether a chown can happen
-            # at all. (Before C1 this line changed nothing on this cluster -- a
+            # no longer root and its file steps are performed elsewhere (C1: the
+            # broker over `socket`; C3 Task 4 slice B: the agent, over the CP's
+            # `agent` shape), so the privileged side's whitelist is what decides
+            # whether a chown can happen at all. (Before C1 this line changed nothing on this cluster -- a
             # root worker resolves no brokers, `resolve_priv_helpers()` returns
             # None on euid 0, so `helpers_cover()` stayed False and the
             # in-process path was used.) The two readers that do care are the A5

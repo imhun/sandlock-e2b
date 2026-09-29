@@ -100,6 +100,17 @@ class DockerPoolBackend:
             "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296",
             "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300",
             "E2B_IMAGE_CACHE_OWNER_UID": "65534",
+            # C3 Task 4 slice B / ruling D23: the docker pool has **no
+            # privileged file-operation capability, and says so**. The worker
+            # image no longer ships `/var/lib/e2b-priv/`, so `auto` would
+            # resolve no brokers, warn once and quietly keep the in-process
+            # (E5.1) shape -- no per-sandbox host uid, no route-B. `off` is the
+            # existing explicit value for "never use the brokers"; the pool is
+            # **excluded from C3's coverage by name** (like `local://`, see the
+            # C3 plan's coverage list and `docs/c3-privilege-relocation.md`
+            # §11.1 item 4), and the pool's compose JSON declares the same
+            # value.
+            "E2B_PRIV_HELPERS": "off",
             **dict(worker_env or {}),
         }
 

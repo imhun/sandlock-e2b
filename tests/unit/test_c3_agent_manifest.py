@@ -26,6 +26,7 @@ comment cannot whisper a capability in either.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -574,6 +575,44 @@ def test_the_local_shapes_are_untouched() -> None:
         assert "c3-agent" not in text, path.name
         assert "E2B_SLOT_IDENTITY" not in text, path.name
         assert "E2B_C3_AGENT_TOKEN" not in text, path.name
+
+
+def test_the_shapes_excluded_from_c3_declare_that_they_have_no_file_ops() -> None:
+    """D23: an excluded shape says so in its own manifest, not by silence.
+
+    The single-machine example and the autoscaler's docker pool both relied on
+    the worker image's file-capability binaries. Task 4 slice B removed them,
+    so `E2B_PRIV_HELPERS=auto` would now resolve nothing, log a single warning
+    and keep the in-process (E5.1) shape -- no per-sandbox host uid, no
+    route-B. For the example that is also a *downgrade in loudness*: its
+    default route-B root is outside the broker whitelist, so it used to refuse
+    to start.
+
+    Ruling D23: both are excluded from C3's coverage **by name** (like
+    `local://`), and each has to *declare* its absent file-operation capability
+    in its own manifest -- `off` is the value `E2B_PRIV_HELPERS` already has
+    for "never use the brokers". A reader can then answer "what does this shape
+    do for privileged file ops?" from the file alone.
+    """
+    # The single-machine example: a plain env key on its only worker.
+    demo = _compose(LOCAL_SHAPES[0])["services"]["envd"]
+    assert _compose_env(demo)["E2B_PRIV_HELPERS"] == "off"
+    # The pool: the declaration lives in the JSON the autoscaler hands every
+    # worker it spawns (the only place that shape's env is written).
+    pool = _compose(LOCAL_SHAPES[1])["services"]["autoscaler"]
+    assert json.loads(_compose_env(pool)["E2B_AS_WORKER_ENV"])["E2B_PRIV_HELPERS"] == "off"
+    # ...and neither shape smuggles in a C3 key that would imply a privileged
+    # path it does not have.
+    for path in LOCAL_SHAPES:
+        text = path.read_text(encoding="utf-8")
+        for key in (
+            "E2B_SLOT_IDENTITY",
+            "E2B_PRIV_HELPER_TRANSPORT",
+            "E2B_C3_AGENT_URL",
+            "E2B_C3_AGENT_MAINT_URL",
+            "E2B_C3_AGENT_TOKEN",
+        ):
+            assert key not in text, (path.name, key)
 
 
 # --------------------------------------------------- the images (D15) and pins

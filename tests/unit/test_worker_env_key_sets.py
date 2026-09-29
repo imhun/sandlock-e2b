@@ -327,6 +327,20 @@ EXTRA_CLASSES: dict[str, set[str]] = {
     },
 }
 
+#: What the **fleet stack** -- `deploy/stack/docker-compose.prod.yml`, the
+#: compose half of the shipped host (`FLEET_STACK` above) -- does *not* declare
+#: next to the k8s manifest. It is the reference the other compose stacks are
+#: compared against, so the two C3 keys it *does* name are deliberately absent
+#: from this set (Task 4 slice B):
+#:
+#: * `E2B_PRIV_HELPER_TRANSPORT=agent` (its workers run the agent shape; the
+#:   key is named on all three C3 compose stacks -- see `priv_helper_transport`
+#:   in `KEY_CLASSES`);
+#: * `E2B_SLOT_IDENTITY=agent-grant` (likewise, `slot_identity`).
+#:
+#: What is left is k8s-only: the state layout, the disk-enforcement knobs, the
+#: real-root/checkpoint switches, and (since C1) the broker's socket path --
+#: that one stays here because no compose shape runs a broker at all.
 _FLEET_STACK_MISSING = (
     KEY_CLASSES["k8s_state_layout"]
     | KEY_CLASSES["k8s_disk_enforcement"]
@@ -360,12 +374,23 @@ _C3_COMPOSE_MISSING = (
 #: The local pool: the autoscaler builds the worker's `docker run` argv itself,
 #: so its env JSON is the worker's whole environment -- no workspace base, no
 #: per-worker wiring (those are `-e` flags), no templates/brokers.
-_POOL_MISSING = _COMPOSE_EXAMPLE_MISSING | KEY_CLASSES["worker_wiring"] | {
-    "E2B_WORKSPACE_BASE",
-} | KEY_CLASSES["slot_identity"]
+#: ...and since ruling D23 it *does* declare `E2B_PRIV_HELPERS=off`: the worker
+#: image lost its file-capability binaries, and a shape with no agent has to
+#: say out loud that it has no privileged file operations (rather than letting
+#: `auto` resolve nothing and warn once).
+_POOL_MISSING = (
+    _COMPOSE_EXAMPLE_MISSING
+    | KEY_CLASSES["worker_wiring"]
+    | {"E2B_WORKSPACE_BASE"}
+    | KEY_CLASSES["slot_identity"]
+) - KEY_CLASSES["priv_helpers"]
 
 #: The single-machine build example (`docker-compose.yml`): one `envd`, no
 #: control-plane wiring, no node budget, cache-only env plus the shape switch.
+#: It declares its (absent) file-operation capability for the same reason the
+#: pool does (D23) -- and the key is an *upgrade* from silence: this example
+#: used to rely on the worker image's binaries and refused to start when its
+#: route-B root was outside their whitelist.
 _DEMO_MISSING = (
     _COMPOSE_EXAMPLE_MISSING
     | KEY_CLASSES["worker_wiring"]
@@ -375,7 +400,7 @@ _DEMO_MISSING = (
     | KEY_CLASSES["egress_switch"]
     | KEY_CLASSES["route_b_root"]
     | KEY_CLASSES["slot_identity"]
-)
+) - KEY_CLASSES["priv_helpers"]
 
 #: The test runner: it names only what the in-container suite needs to build
 #: sandboxes from this checkout (the workspace root, the base image, the pid

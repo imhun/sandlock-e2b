@@ -1,10 +1,19 @@
 # C1（特权外置）：每节点一个最小 root broker，worker pod 从此不再有 root。
 #
-# 为什么需要它：沙箱树是 `0770 owner=<池 uid> group=<worker gid>`，建箱/回收/记账
-# 三个特权动作（chown / rm / walk）必须由某个有 root 权限的东西来做。worker 侧把它
-# 们交给 unix socket 上的这个 daemon（`E2B_PRIV_HELPER_TRANSPORT=socket`），socket
-# 模式下 worker **必须**能完成 hello 握手，否则拒服（fail closed，绝不静默回落到
-# 镜像里的 file-capability 二进制）。
+# ⚠ **C3 Task 4 片 B（2026-09-29）之后，这个 DaemonSet 是 `socket` 回退形态的一部分，
+#   不再是出厂的上游。** 出厂 worker 跑 `E2B_PRIV_HELPER_TRANSPORT=agent`
+#   （文件操作与槽位身份都交给每节点的 `e2b-c3-agent`），本 DaemonSet 保留到 Task 7
+#   一起退役：① 它是 `socket` 回退（`E2B_PRIV_HELPER_TRANSPORT=socket`）的另一半；
+#   ② 它同时跑 **agent 镜像**（`e2b-sandlock-agent`）—— `/var/lib/e2b-priv/e2b-maint`
+#   已不在 worker 镜像里（判据 2/15），指回 worker 镜像就是 CrashLoop。
+#
+# 为什么需要它（以及为什么 agent 面 B 必须 root）：沙箱树是 `0770 owner=<池 uid>
+# group=<worker gid>`，建箱/回收/记账三个特权动作（chown / rm / walk）必须由某个有
+# root 权限的东西来做。C1 是 worker 把它们交给 unix socket 上的这个 daemon
+# （`E2B_PRIV_HELPER_TRANSPORT=socket`，socket 模式下 worker **必须**能完成 hello
+# 握手，否则拒服：fail closed，绝不静默回落到镜像里的 file-capability 二进制）；
+# C3 把同一件事交给每节点 agent 的面 B（`E2B_C3_AGENT_MAINT_URL`/`_MAINT_PORT`），
+# 能力集与白名单逐条相同。
 #
 # 为什么 broker 必须是 root：workspace 落在阿里云 NAS 上，NFS 走 AUTH_SYS，服务端
 # 只按凭据里的 uid 授权、不看客户端的能力 —— `CAP_CHOWN` 不过网。2026-09-17 实测：
@@ -21,7 +30,8 @@
 # ⚠ 三处同源（终审要求，改一处就得同时改另两处）：**worker pod 的 uid/gid** ==
 #   **E2B_BROKER_PEER_UID/GID** == **/run/e2b-broker 目录与 broker.sock 的属组**，
 #   三者都是 **65534**。它来自同一个事实：worker 镜像 `deploy/docker/Dockerfile.envd`
-#   的 `USER 65534:65534`（worker pod 不再覆盖它，见 deploy/k8s/worker.yaml）。
+#   的 `USER 65534:65534`（worker pod 现在**显式 pin** `runAsUser/runAsGroup: 65534`，
+#   C3 Task 4 片 B；见 deploy/k8s/worker.yaml —— CP 的可信身份来源读的就是 pod spec）。
 #   为什么必须同源：
 #     * daemon 把已鉴权对端的 uid/gid 当作"worker 身份"（`chown --worker` 与
 #       `--gid <worker gid>` 都靠它），并在 hello 里回 `peer_uid/peer_gid`；
@@ -41,9 +51,10 @@
 #   （`/run` 本身就是容器自己的可写目录，broker 容器没有 readOnlyRootFilesystem，也没把 `/run`
 #   整个挂进来，所以 `socket-dir-init` 与挂载都不用为此改动。）
 #
-# 上线顺序（终审要求）：**先 apply 这个 DaemonSet，再上新 worker 镜像**。新 Python +
-# 旧 daemon 会在握手期因缺 `peer_gid` fail closed（设计如此）；旧 Python + 新 daemon
-# 向前兼容。
+# 上线顺序（终审要求 + C3 Task 4 片 B）：**broker → agent → worker**（与 apply.sh 的 rollout
+# 闸门逐条一致）。broker 与 worker 仍是 socket 契约的两半：新 Python + 旧 daemon 会在握手期因缺
+# `peer_gid` fail closed（设计如此），旧 Python + 新 daemon 向前兼容；而 agent 是 worker 的**当前
+# 上游**，不在就没有回落（建箱与文件操作都具名失败）。
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
