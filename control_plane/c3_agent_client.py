@@ -362,6 +362,41 @@ def _nested_str(payload: dict, *path: str) -> str:
     return current if isinstance(current, str) else ""
 
 
+def _worker_body(
+    *,
+    node_id: str,
+    worker_uid: int,
+    worker_gid: int,
+    worker_pid_namespace: str | None,
+) -> dict[str, Any]:
+    """One instruction's ``worker`` block (face B's "who does this act as").
+
+    ``uid``/``gid`` are the control plane's own record for the node -- the value
+    it verified (k8s) or the claim the agent confirms (compose, D21 option 2).
+    ``pid_namespace`` is the anchor that makes the compose shape's confirmation
+    a *lookup*: it is present only when the shape defers to the kernel, and the
+    worker's own name travels with it so the agent's refusal can name who it was
+    asked about.
+
+    The anchor is shape-checked here as well as where it was recorded ("two
+    layers, neither replaces the other" -- the same rule the path discipline
+    follows): a value that cannot be a namespace identity must never reach the
+    agent's ``/proc`` walk, and this is the last hop that can say so.
+    """
+    body: dict[str, Any] = {"uid": int(worker_uid), "gid": int(worker_gid)}
+    if worker_pid_namespace is None:
+        return body
+    if not validate_pid_namespace(worker_pid_namespace):
+        raise AgentClientError(
+            f"the pid namespace anchor carried for node {node_id} is not a pid "
+            "namespace identity: refusing to instruct the agent",
+            status_code=503,
+        )
+    body["node_id"] = node_id
+    body["pid_namespace"] = worker_pid_namespace
+    return body
+
+
 def build_agent_address_resolver(settings) -> AgentAddressResolver:
     """The resolver for this deployment's shape.
 
@@ -505,6 +540,7 @@ class C3AgentClient:
         path: str,
         worker_uid: int,
         worker_gid: int,
+        worker_pid_namespace: str | None = None,
         uid: int | None = None,
         gid: int | None = None,
         recursive: bool = False,
@@ -518,13 +554,24 @@ class C3AgentClient:
         it is what the agent must write into ``E2B_BROKER_WORKER_UID/GID`` so
         that ``--worker`` and the group gate keep the meaning they have behind
         the worker's broker (see ``deploy/c3_agent/fileops.py``).
+
+        ``worker_pid_namespace`` is D21 option 2's anchor: present when this
+        deployment's shape could not verify the identity itself (compose), so
+        the agent reads it from the kernel and refuses a claim it does not
+        confirm. A shape that verified it (k8s) passes ``None`` and the
+        instruction is byte-for-byte what it always was.
         """
         body = {
             "sandbox_id": sandbox_id,
             "path": path,
             "recursive": bool(recursive),
             "worker_owned": bool(worker_owned),
-            "worker": {"uid": int(worker_uid), "gid": int(worker_gid)},
+            "worker": _worker_body(
+                node_id=node_id,
+                worker_uid=worker_uid,
+                worker_gid=worker_gid,
+                worker_pid_namespace=worker_pid_namespace,
+            ),
         }
         if uid is not None:
             body["uid"] = int(uid)
@@ -540,6 +587,7 @@ class C3AgentClient:
         path: str,
         worker_uid: int | None = None,
         worker_gid: int | None = None,
+        worker_pid_namespace: str | None = None,
         target: AgentTarget | None = None,
     ) -> dict[str, Any]:
         """Instruct the agent to run ``e2b-maint rm`` on a CP-derived path.
@@ -552,7 +600,12 @@ class C3AgentClient:
         """
         body: dict[str, Any] = {"sandbox_id": sandbox_id, "path": path}
         if worker_uid is not None and worker_gid is not None:
-            body["worker"] = {"uid": int(worker_uid), "gid": int(worker_gid)}
+            body["worker"] = _worker_body(
+                node_id=node_id,
+                worker_uid=worker_uid,
+                worker_gid=worker_gid,
+                worker_pid_namespace=worker_pid_namespace,
+            )
         return await self._file_op(node_id, "rm", body, target=target)
 
     async def walk(
@@ -563,12 +616,18 @@ class C3AgentClient:
         path: str,
         worker_uid: int,
         worker_gid: int,
+        worker_pid_namespace: str | None = None,
     ) -> dict[str, Any]:
         """Instruct the agent to run ``e2b-maint walk`` on a CP-derived path."""
         body = {
             "sandbox_id": sandbox_id,
             "path": path,
-            "worker": {"uid": int(worker_uid), "gid": int(worker_gid)},
+            "worker": _worker_body(
+                node_id=node_id,
+                worker_uid=worker_uid,
+                worker_gid=worker_gid,
+                worker_pid_namespace=worker_pid_namespace,
+            ),
         }
         return await self._file_op(node_id, "walk", body)
 

@@ -189,9 +189,31 @@ def _verified_worker_identity(
     not match it, or a shape with no source at all, stores **nothing** and says
     so; the node stays joined and every operation that needs the identity
     refuses by name (the fail-closed posture the ruling prescribes).
+
+    The compose lane is the ruling's second shape (D21 option 2), and it takes
+    the other branch below: this control plane cannot verify a report there, so
+    it stores the report **as a claim** and carries the worker's pid namespace
+    with every instruction, for the agent to confirm against the kernel. That is
+    not "trusting the report" -- the value is never used without the kernel's
+    answer (:meth:`_worker_identity_anchor`) -- and it is what lets the compose
+    lanes complete a create at all (the ownership hand-over is their first
+    privileged step).
     """
     source = getattr(request.app.state, "worker_identity_source", None)
     configured = bool(getattr(source, "configured", source is not None))
+    if getattr(source, "kernel_verified", False):
+        if claimed[0] is None or claimed[1] is None:
+            return None, None
+        _unverified_identity_reported.discard((node_id, "no-source"))
+        _unverified_identity_reported.discard((node_id, "no-pin"))
+        logger.debug(
+            "internal API: node %s's worker identity %s is recorded as a claim "
+            "this shape cannot verify (the agent confirms it against the "
+            "kernel); the pid namespace anchor travels with every instruction",
+            node_id,
+            claimed,
+        )
+        return claimed[0], claimed[1]
     trusted = source.identity_for(node_id) if source is not None else None
     claimed_uid, claimed_gid = claimed
     if claimed_uid is None and claimed_gid is None:
@@ -241,6 +263,32 @@ def _verified_worker_identity(
         _unverified_identity_reported.add((node_id, reason))
         logger.warning(message, *arguments)
     return None, None
+
+
+def _worker_identity_anchor(request: Request, node, node_id: str) -> str | None:
+    """The pid namespace the agent must confirm a claim against, or ``None``.
+
+    ``None`` has two readings, and both are correct: this deployment's shape
+    verifies the identity itself (k8s -- no anchor travels), or the shape defers
+    to the kernel but the node has recorded no pid namespace to defer *with*.
+    The second is a named refusal, not "send it anyway": an instruction the
+    agent cannot confirm is exactly the one that must not be sent.
+
+    The value is the control plane's own record (:meth:`_worker_pid_namespace`
+    shape-checked it at register/heartbeat) and never the request's, so a
+    file-op body still cannot name anything.
+    """
+    source = getattr(request.app.state, "worker_identity_source", None)
+    if not getattr(source, "kernel_verified", False):
+        return None
+    anchor = getattr(node, "pid_namespace", None)
+    if not validate_pid_namespace(anchor or ""):
+        raise OfficialError(
+            503,
+            f"node {node_id} has no pid namespace identity for the agent to "
+            "confirm its worker identity against: refusing to instruct the agent",
+        )
+    return anchor
 
 
 def _resolve_node(request: Request, node_id: str) -> NodeEndpoint | None:
@@ -834,6 +882,12 @@ async def node_file_op(node_id: str, request: Request) -> dict[str, Any]:
         "worker_uid": int(worker_uid),
         "worker_gid": int(worker_gid),
     }
+    # D21 option 2: a shape whose value is a claim the agent confirms carries
+    # the anchor the agent confirms it *against*. A shape that verified the
+    # value itself (k8s) sends nothing extra, exactly as before.
+    anchor = _worker_identity_anchor(request, node, node_id)
+    if anchor is not None:
+        common["worker_pid_namespace"] = anchor
     try:
         if spec.verb == "chown":
             answer = await client.chown(

@@ -30,11 +30,22 @@ Surface (all responses JSON objects):
   named fail-closed refusal (a half-applied grant must never read as success).
 - ``POST /internal/nodes/{node_id}/agent/{chown|rm|walk}`` (face B, Task 4)
   ``{"sandbox_id", "path", "uid"?, "gid"?, "recursive"?, "worker_owned"?,
-  "worker": {"uid", "gid"}}`` -> the verb's own answer. The **verb list is the
-  whitelist** (D18.2) and an unknown verb is refused by name; ``path`` and
-  ``uid`` are the control plane's values (hard rules 1/3 -- the worker never
-  names either), and the path discipline is ``e2b-maint``'s
-  (:mod:`deploy.c3_agent.fileops` execs that same binary with the same roots).
+  "worker": {"uid", "gid", "node_id"?, "pid_namespace"?}}`` -> the verb's own
+  answer. The **verb list is the whitelist** (D18.2) and an unknown verb is
+  refused by name; ``path`` and ``uid`` are the control plane's values (hard
+  rules 1/3 -- the worker never names either), and the path discipline is
+  ``e2b-maint``'s (:mod:`deploy.c3_agent.fileops` execs that same binary with
+  the same roots).
+
+  ``worker.pid_namespace`` is the compose lane's anchor (ruling D21 option 2):
+  when it is present the worker's uid/gid are read **from the kernel** for the
+  process(es) in that pid namespace
+  (:meth:`deploy.c3_agent.lookup.ProcLookup.worker_uid_gid`) and the values in
+  the body are only a claim to be confirmed. A claim the kernel does not confirm
+  -- or an anchor that names no process, or more than one -- is a named 502 and
+  no ``e2b-maint`` runs. The k8s lane sends no anchor: its value was verified by
+  the control plane against the worker pod's ``securityContext``, and it is used
+  exactly as sent.
 
 Auth: every request must carry ``X-Internal-Key`` equal to
 ``E2B_C3_AGENT_TOKEN`` (constant-time); the service refuses to answer when the
@@ -86,7 +97,9 @@ from deploy.c3_agent.fileops import (
 from deploy.c3_agent.lookup import (
     LookupRefusal,
     ProcLookup,
+    SubprocessWorkerIdentityResolver,
     WorkerIdentity,
+    WorkerIdentityResolver,
     missing_slot_pid_message,
 )
 from deploy.c3_agent.scan import InventoryScanner, scanner_for
@@ -137,10 +150,21 @@ class WorkerCredentials(BaseModel):
     ``getuid()``/``getgid()``: the agent is root, so its own identity would turn
     ``chown --worker`` into "hand the tree to root" (see
     :mod:`deploy.c3_agent.fileops`).
+
+    ``pid_namespace`` is present exactly when the control plane's shape could
+    not verify the claim itself (the compose lane: no pod spec to read) and is
+    therefore asking the agent to confirm it against the kernel (ruling D21
+    option 2). Its presence is what selects that path, so a k8s instruction --
+    whose value the control plane already verified -- carries none and behaves
+    exactly as it did before. ``node_id`` is the *worker's* name, carried only
+    so a kernel-side refusal can name it (the URL carries the agent's own
+    identity, which is a different fact -- D12).
     """
 
     uid: int = Field(ge=1)
     gid: int = Field(ge=1)
+    node_id: str | None = Field(default=None, min_length=1)
+    pid_namespace: str | None = Field(default=None, min_length=1)
 
 
 class FileOpBody(BaseModel):
@@ -259,6 +283,7 @@ def create_app(
     runner: AsUidRunner | None = None,
     maint_runner: MaintRunner | None = None,
     lookup: ProcLookup | None = None,
+    identity_resolver: WorkerIdentityResolver | None = None,
     inventory: Any = _UNSET,
 ) -> FastAPI:
     settings = settings or Settings()
@@ -275,6 +300,17 @@ def create_app(
     # The host's process table: face A runs with ``hostPID: true`` (Task 3's
     # DaemonSet), which is what makes the worker's container pid visible here.
     lookup = lookup or ProcLookup()
+    # The compose lane's worker identity (D21 option 2): read from the kernel by
+    # a child that runs as the workers' own identity, because the kernel only
+    # lets a process read the namespace of a process whose identity matches its
+    # own (and face B, deliberately, has neither the workers' uid nor
+    # ``CAP_SYS_PTRACE``). The k8s lane never reaches it -- its instructions
+    # carry no anchor.
+    identity_resolver = identity_resolver or SubprocessWorkerIdentityResolver(
+        uid=settings.resolver_uid,
+        gid=settings.resolver_gid,
+        timeout_s=settings.resolver_timeout_s,
+    )
     # Task 6's eyes: built from the container's own knobs unless the caller
     # injected one (tests, an embedder) -- and ``None`` means "this container
     # does not scan", which only the face that mounts the workspaces should be
@@ -319,6 +355,7 @@ def create_app(
     app.state.runner = runner
     app.state.maint_runner = maint_runner
     app.state.lookup = lookup
+    app.state.identity_resolver = identity_resolver
     app.state.inventory = inventory
 
     @app.exception_handler(HTTPException)
@@ -396,6 +433,7 @@ def create_app(
                 status_code=400,
                 detail={"error": "sandbox_id is not a valid sandbox id"},
             )
+        worker_uid, worker_gid = _worker_identity(op, body)
         instruction = FileOpInstruction(
             sandbox_id=body.sandbox_id,
             path=body.path,
@@ -403,8 +441,8 @@ def create_app(
             gid=body.gid,
             recursive=body.recursive,
             worker_owned=body.worker_owned,
-            worker_uid=body.worker.uid if body.worker is not None else None,
-            worker_gid=body.worker.gid if body.worker is not None else None,
+            worker_uid=worker_uid,
+            worker_gid=worker_gid,
         )
         try:
             return run_file_op(
@@ -415,6 +453,54 @@ def create_app(
             # plane sent a shape ``maint.c`` has no call for.
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         except AgentFileOpRefusal as exc:
+            logger.warning(
+                "c3-agent refused %s for sandbox %s: %s",
+                op,
+                body.sandbox_id,
+                exc,
+            )
+            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+
+    def _worker_identity(op: str, body: FileOpBody) -> tuple[int | None, int | None]:
+        """The identity ``maint.c`` must act as, kernel-confirmed when anchored.
+
+        Two shapes reach here, and the instruction itself says which:
+
+        * **no anchor** -- the k8s lane. The control plane verified the value
+          against the worker pod's ``securityContext``, so it is used as sent
+          (this is the pre-existing behaviour, unchanged);
+        * **an anchor** -- the compose lane (D21 option 2). The value sent is a
+          *claim*: the kernel's answer for the worker's own process is the
+          identity, and a claim the kernel does not confirm is refused **by
+          name**, before any ``chown``/``rm``/``walk`` is exec'd.
+
+        A refusal is a 502 with the kernel's own words, the same status a
+        refused ``e2b-maint`` step gets: the control plane must not read "the
+        identity could not be confirmed" as "the step happened".
+        """
+        if body.worker is None:
+            return None, None
+        anchor = body.worker.pid_namespace
+        if anchor is None:
+            return body.worker.uid, body.worker.gid
+        if body.worker.node_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": (
+                        "a kernel-anchored worker instruction must name the "
+                        "worker (worker.node_id): refusing"
+                    )
+                },
+            )
+        identity = WorkerIdentity(
+            node_id=body.worker.node_id, pid_namespace=anchor
+        )
+        try:
+            return identity_resolver.resolve(
+                identity, claimed=(body.worker.uid, body.worker.gid)
+            )
+        except LookupRefusal as exc:
             logger.warning(
                 "c3-agent refused %s for sandbox %s: %s",
                 op,

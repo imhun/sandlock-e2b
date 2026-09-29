@@ -25,11 +25,18 @@ source to answer; until it does (slice B), this lane records no identity and the
 file operations fail closed, which is the deliberate posture.
 
 The compose lane has no such object to read: the agent service is defined in a
-compose file the control plane never sees. It therefore uses
-``NoWorkerIdentitySource`` -- the same fail-closed posture -- and closing it
-(the agent deriving the identity from the kernel, which needs ``pid: host`` on
-face B) is recorded as a slice-B item in ``docs/c3-privilege-relocation.md``
-§11.2.1.
+compose file the control plane never sees. The ruling's second shape (D21
+option 2) is that it does not have to: the **agent** reads the worker's own
+process identity out of the kernel (face B runs with ``pid: host`` in the
+compose stacks), and the control plane's part is to carry the anchor that makes
+it a lookup -- the worker's recorded pid namespace -- with every instruction
+that acts as the worker. ``KernelWorkerIdentitySource`` is that shape: it keeps
+the reported uid/gid as the value the agent confirms, and the agent refuses by
+name when the kernel disagrees (``deploy/c3_agent/lookup.py``).
+
+``NoWorkerIdentitySource`` therefore remains for a shape that genuinely cannot
+answer -- an embedder, or a deployment whose agent has no ``pid: host`` at all
+-- and never as a fallback: a shape either names a source or records nothing.
 """
 
 from __future__ import annotations
@@ -49,6 +56,14 @@ class WorkerIdentitySource(Protocol):
     #: operator problems and are reported differently.
     configured: bool
 
+    #: Whether the answer this shape *stores* is a claim the agent confirms
+    #: against the kernel at use time (ruling D21 option 2: the compose lane,
+    #: whose face B runs ``pid: host``). True for exactly one shape, and the
+    #: file-operation path reads it to decide whether the anchor -- the worker's
+    #: pid namespace -- travels with the instruction. A shape that verifies its
+    #: own answer (k8s) carries no anchor and behaves as it always did.
+    kernel_verified: bool
+
     def identity_for(self, node_id: str) -> tuple[int, int] | None:
         """``(uid, gid)`` of the worker pod, or ``None`` when unknowable."""
         ...
@@ -62,6 +77,7 @@ class NoWorkerIdentitySource:
     """
 
     configured = False
+    kernel_verified = False
 
     def identity_for(self, node_id: str) -> tuple[int, int] | None:
         return None
@@ -71,6 +87,7 @@ class StaticWorkerIdentitySource:
     """A fixed table (tests, embedders, an operator-pinned fleet)."""
 
     configured = True
+    kernel_verified = False
 
     def __init__(self, identities: Mapping[str, tuple[int, int]]) -> None:
         self._identities = dict(identities)
@@ -94,6 +111,7 @@ class K8sWorkerIdentitySource:
         self._client = client or self._in_cluster_client()
 
     configured = True
+    kernel_verified = False
 
     @staticmethod
     def _in_cluster_client():
@@ -160,6 +178,35 @@ def _is_gid(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+class KernelWorkerIdentitySource:
+    """Compose: the agent reads the worker's identity from the kernel (D21②).
+
+    This shape has no pod spec for the control plane to read, so it cannot
+    answer *here* -- but it is not a shape that cannot answer at all. The answer
+    is the kernel's, produced by the agent when a file operation is executed:
+    the worker's own process identity, read from ``/proc/<pid>/status`` for the
+    process(es) in the pid namespace the control plane records for it
+    (:meth:`deploy.c3_agent.lookup.ProcLookup.worker_uid_gid`).
+
+    What that means for the stored value, and why it is not the hole D21 option
+    1 exists to close: the reported uid/gid is kept as the value the agent will
+    **confirm**, never as an answer the control plane acts on. Every instruction
+    that acts as the worker carries the anchor (the node's recorded pid
+    namespace) beside it, and the agent refuses by name when the kernel does not
+    agree -- so a worker that names another tenant's uid gets a refusal, not a
+    tree. The claim is carried; the kernel decides.
+
+    ``identity_for`` therefore answers ``None``: this class is the *deferral*,
+    and the value it defers to is produced on the other side of the hop.
+    """
+
+    configured = True
+    kernel_verified = True
+
+    def identity_for(self, node_id: str) -> tuple[int, int] | None:
+        return None
+
+
 def build_worker_identity_source(settings) -> WorkerIdentitySource:
     """The source for this deployment's shape.
 
@@ -176,6 +223,12 @@ def build_worker_identity_source(settings) -> WorkerIdentitySource:
         return K8sWorkerIdentitySource(
             namespace=getattr(settings, "node_address_namespace", "sandlock")
         )
+    if mode == "hostname":
+        # The compose shapes: no pod API, but a face B that runs with
+        # ``pid: host`` beside the workers, so the kernel can answer where the
+        # control plane cannot (D21 option 2). This is the *only* shape that
+        # defers, and it is not the same state as "no source at all".
+        return KernelWorkerIdentitySource()
     logger.info(
         "C3 file operations: this shape (%s) has no trusted source for the "
         "worker's own uid/gid, so the control plane records none and the "

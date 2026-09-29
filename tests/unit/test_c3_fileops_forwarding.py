@@ -26,6 +26,7 @@ from control_plane.registry.manager import SandboxRegistry
 from control_plane.registry.nodes import NodeRegistry
 from control_plane.registry.volumes import VolumeRegistry
 from control_plane.worker_identity_source import (
+    KernelWorkerIdentitySource,
     NoWorkerIdentitySource,
     StaticWorkerIdentitySource,
 )
@@ -179,7 +180,13 @@ def _client(app, *, source_ip: str = "10.0.0.1"):
     )
 
 
-async def _enroll(app, *, worker_identity: bool = True, host_uid: int | None = UID_X):
+async def _enroll(
+    app,
+    *,
+    worker_identity: bool = True,
+    host_uid: int | None = UID_X,
+    pid_namespace: bool = True,
+):
     """Register node A (with its worker identity) and put one sandbox on it."""
     registry = app.state.registry
     record = registry.create(
@@ -202,8 +209,9 @@ async def _enroll(app, *, worker_identity: bool = True, host_uid: int | None = U
         "totalCPUPercent": 100,
         "totalDiskMB": 1024,
         "totalProcesses": 64,
-        "pidNamespace": PID_NAMESPACE,
     }
+    if pid_namespace:
+        body["pidNamespace"] = PID_NAMESPACE
     if worker_identity:
         body["workerUID"] = WORKER_UID
         body["workerGID"] = WORKER_GID
@@ -1200,3 +1208,97 @@ async def test_a_control_plane_without_an_agent_client_refuses_by_name(
             "to run remove-workspace"
         ),
     }
+
+
+# ------------------------------- the compose lane's kernel-anchored source
+
+
+@pytest.mark.asyncio
+async def test_the_compose_shape_stores_the_claim_and_carries_the_anchor(
+    workspace,
+) -> None:
+    """D21 option 2: compose keeps the claim **and** hands the agent the anchor.
+
+    The compose shape has no pod spec to read, so the control plane cannot
+    answer here -- but it is not a shape that "cannot answer" either: the agent
+    reads the worker's own process identity out of the kernel, and the anchor
+    that lets it do so is the pid namespace this control plane already records.
+    So the node keeps the reported uid/gid as the value the agent will confirm,
+    and every instruction that acts as the worker carries the anchor.
+    """
+    shape = _C3Shape(workspace)
+    agent = _StubAgentClient()
+    app = _app(shape, client=agent, worker_identity=KernelWorkerIdentitySource())
+    await _enroll(app)
+    node = app.state.nodes.get(NODE_A)
+    assert (node.worker_uid, node.worker_gid) == (WORKER_UID, WORKER_GID)
+
+    resp = await _file_op(app, {"op": "chown-workspace", "sandbox_id": SANDBOX})
+
+    assert resp.status_code == 200
+    assert agent.calls == [
+        {
+            "node_id": NODE_A,
+            "sandbox_id": SANDBOX,
+            "path": str(shape.workspace_dir()),
+            "worker_uid": WORKER_UID,
+            "worker_gid": WORKER_GID,
+            "worker_pid_namespace": PID_NAMESPACE,
+            "verb": "chown",
+            "uid": UID_X,
+            "gid": WORKER_GID,
+            "recursive": True,
+            "worker_owned": False,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_compose_shape_refuses_an_instruction_it_cannot_anchor(
+    workspace,
+) -> None:
+    """No anchor ⇒ no kernel answer ⇒ the instruction is refused by name.
+
+    A worker that registers without a pid namespace (an older worker, or one
+    whose ``/proc`` carried no namespace identity) leaves nothing for the agent
+    to confirm the claim against. The control plane names that instead of
+    sending an instruction the agent would have to refuse anyway.
+    """
+    shape = _C3Shape(workspace)
+    agent = _StubAgentClient()
+    app = _app(shape, client=agent, worker_identity=KernelWorkerIdentitySource())
+    await _enroll(app, pid_namespace=False)
+    node = app.state.nodes.get(NODE_A)
+    assert (node.worker_uid, node.worker_gid) == (WORKER_UID, WORKER_GID)
+
+    resp = await _file_op(app, {"op": "chown-workspace", "sandbox_id": SANDBOX})
+
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "code": 503,
+        "message": (
+            f"node {NODE_A} has no pid namespace identity for the agent to "
+            "confirm its worker identity against: refusing to instruct the agent"
+        ),
+    }
+    assert agent.calls == []
+
+
+def test_the_k8s_shape_is_not_kernel_verified() -> None:
+    """The two shapes stay distinguishable: only compose defers to the kernel."""
+    assert KernelWorkerIdentitySource().configured is True
+    assert KernelWorkerIdentitySource().kernel_verified is True
+    assert NoWorkerIdentitySource().kernel_verified is False
+    assert StaticWorkerIdentitySource({}).kernel_verified is False
+
+
+def test_a_hostname_deployment_builds_the_kernel_verified_source() -> None:
+    """The switch is the node-address mode, exactly as the other lanes' is."""
+    from control_plane.worker_identity_source import build_worker_identity_source
+
+    source = build_worker_identity_source(_settings(node_address_mode="hostname"))
+
+    assert isinstance(source, KernelWorkerIdentitySource)
+    assert source.configured is True
+    # The compose shape answers *through the agent*, never from here.
+    assert source.identity_for(NODE_A) is None
