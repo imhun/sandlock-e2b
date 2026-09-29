@@ -223,7 +223,10 @@ def test_a_directory_that_cannot_be_handed_over_is_not_captured(
         # fail the same way. The contract under test is the caller's ("a
         # hand-off that raises is reported, never a capture that dies inside the
         # slot"), and it must not depend on who is running the test.
-        def broken(path, uid, *, recursive=False):
+        # C3 Task 4 added the sandbox id to this call: the agent shape derives
+        # the checkpoint path from the control plane's records, so the call site
+        # has to name which sandbox it means.
+        def broken(path, uid, *, recursive=False, sandbox_id=None):
             raise priv_helpers.PrivHelperError("no brokers on this worker")
 
         monkeypatch.setattr(checkpoint_store, "_hand_to_sandbox", broken)

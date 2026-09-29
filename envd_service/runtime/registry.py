@@ -413,7 +413,17 @@ class RuntimeRegistry:
             scanned_usage = self._incremental_dir_usage(record, dirty=dirty)
             entries: int | None = None
             if scanned_usage is None:
-                size = priv_helpers.dir_size(record.workspace_dir)
+                # C3 Task 4: in the agent shape the tree is measured by the
+                # agent's ``walk`` (``walk-workspace``), asked for by sandbox
+                # id -- the worker cannot reach a sandbox-owned tree with no
+                # file-capability binary, and it may not name the path anyway.
+                from envd_service import agent_fileops
+
+                client = agent_fileops.active()
+                if client is not None:
+                    size = client.workspace_bytes(record.sandbox_id)
+                else:
+                    size = priv_helpers.dir_size(record.workspace_dir)
                 if dirty:
                     self._dirty_stats["walk"] += 1
             else:

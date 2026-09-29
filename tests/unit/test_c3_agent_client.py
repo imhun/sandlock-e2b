@@ -43,6 +43,9 @@ NAMESPACE = "sandlock"
 AGENT_LABEL = "app=c3-agent"
 PID_NAMESPACE = "pid:[4026532458]"
 TOKEN = "c3-agent-sekret"
+#: Face B's paths are the *control plane's* (derived from its records); this
+#: lane only pins how they travel.
+WORKSPACE = "/var/lib/e2b-sandboxes/workspaces/sbx_forward"
 
 
 def _pod(
@@ -519,6 +522,174 @@ def test_an_answer_that_is_not_json_is_refused() -> None:
         f"the agent for node {NODE} answered with a non-JSON body"
     )
     assert excinfo.value.status_code == 502
+
+
+# ------------------------------------------------- face B: the file verbs
+
+
+def test_the_chown_instruction_names_the_verb_and_its_parameters() -> None:
+    """Face B rides the same addressing and the same token as face A.
+
+    The path is the control plane's (hard rule 3 / C3 §14.4) and so is the uid;
+    the *worker's* identity is carried beside them because the agent has to
+    write it into the child's ``E2B_BROKER_WORKER_UID/GID`` -- without it,
+    ``chown --worker`` exec'd by root would hand the tree to root.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"op": "chown", "path": WORKSPACE})
+
+    answer = asyncio.run(
+        _k8s_client(handler).chown(
+            node_id=NODE,
+            sandbox_id="sbx_forward",
+            path=WORKSPACE,
+            uid=10007,
+            gid=65534,
+            recursive=True,
+            worker_uid=65534,
+            worker_gid=65534,
+        )
+    )
+    assert answer == {"op": "chown", "path": WORKSPACE}
+    assert len(seen) == 1
+    request = seen[0]
+    assert str(request.url) == (
+        f"http://{AGENT_IP}:49985/internal/nodes/{HOST}/agent/chown"
+    )
+    assert request.headers["X-Internal-Key"] == TOKEN
+    assert json.loads(request.content) == {
+        "sandbox_id": "sbx_forward",
+        "path": WORKSPACE,
+        "uid": 10007,
+        "gid": 65534,
+        "recursive": True,
+        "worker_owned": False,
+        "worker": {"uid": 65534, "gid": 65534},
+    }
+
+
+def test_the_worker_owned_chown_carries_no_uid() -> None:
+    """The slot-document form: ``--worker`` replaces ``--uid``, never joins it."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"op": "chown"})
+
+    asyncio.run(
+        _client(handler).chown(
+            node_id=NODE,
+            sandbox_id="sbx_forward",
+            path=f"{WORKSPACE}/rb-sbx_forward/policy.json",
+            gid=10007,
+            worker_owned=True,
+            worker_uid=65534,
+            worker_gid=65534,
+        )
+    )
+    assert json.loads(seen[0].content) == {
+        "sandbox_id": "sbx_forward",
+        "path": f"{WORKSPACE}/rb-sbx_forward/policy.json",
+        "gid": 10007,
+        "recursive": False,
+        "worker_owned": True,
+        "worker": {"uid": 65534, "gid": 65534},
+    }
+
+
+def test_rm_and_walk_carry_the_path_and_the_worker_identity_only() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"op": "walk", "stdout": ""})
+
+    client = _client(handler)
+    asyncio.run(
+        client.rm(
+            node_id=NODE,
+            sandbox_id="sbx_forward",
+            path=WORKSPACE,
+            worker_uid=65534,
+            worker_gid=65534,
+        )
+    )
+    asyncio.run(
+        client.walk(
+            node_id=NODE,
+            sandbox_id="sbx_forward",
+            path=WORKSPACE,
+            worker_uid=65534,
+            worker_gid=65534,
+        )
+    )
+    assert [str(request.url) for request in seen] == [
+        "http://c3-agent:49985/internal/nodes/c3-agent/agent/rm",
+        "http://c3-agent:49985/internal/nodes/c3-agent/agent/walk",
+    ]
+    expected_body = {
+        "sandbox_id": "sbx_forward",
+        "path": WORKSPACE,
+        "worker": {"uid": 65534, "gid": 65534},
+    }
+    assert json.loads(seen[0].content) == expected_body
+    assert json.loads(seen[1].content) == expected_body
+
+
+def test_a_refused_file_op_names_its_own_verb() -> None:
+    """The refusal text says *which* verb was refused, not "the grant"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            502,
+            json={
+                "error": (
+                    f"e2b-maint rm refused (exit 77): e2b-maint: refused: "
+                    f"{WORKSPACE} is not under any privileged helper root"
+                )
+            },
+        )
+
+    with pytest.raises(AgentClientError) as excinfo:
+        asyncio.run(
+            _client(handler).rm(
+                node_id=NODE,
+                sandbox_id="sbx_forward",
+                path=WORKSPACE,
+                worker_uid=65534,
+                worker_gid=65534,
+            )
+        )
+    assert str(excinfo.value) == (
+        f"the agent for node {NODE} refused the rm: e2b-maint rm refused "
+        f"(exit 77): e2b-maint: refused: {WORKSPACE} is not under any "
+        "privileged helper root"
+    )
+    assert excinfo.value.status_code == 502
+
+
+def test_a_stuck_agent_on_a_file_op_is_a_504_naming_the_verb() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out")
+
+    with pytest.raises(AgentClientError) as excinfo:
+        asyncio.run(
+            _client(handler).walk(
+                node_id=NODE,
+                sandbox_id="sbx_forward",
+                path=WORKSPACE,
+                worker_uid=65534,
+                worker_gid=65534,
+            )
+        )
+    assert str(excinfo.value) == (
+        f"the agent for node {NODE} did not answer within 2.0s: refusing "
+        "(the walk instruction is fail-closed)"
+    )
+    assert excinfo.value.status_code == 504
 
 
 def test_the_concurrency_limit_is_the_knob_slice_b_sizes() -> None:

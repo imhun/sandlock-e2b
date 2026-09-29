@@ -1805,6 +1805,9 @@ def _remove_local_tree_confirming(state, sandbox_id: str) -> bool:
     failure (the record stays, the SDK sees 502).
     """
     tree = state.workspace_base / sandbox_id
+    runtime_dir = sandbox_runtime_dir(
+        state.workspace_base, sandbox_id, state_base=state.state_base
+    )
     try:
         from envd_service import priv_helpers
     except ImportError:  # pragma: no cover - separated control plane
@@ -1817,13 +1820,11 @@ def _remove_local_tree_confirming(state, sandbox_id: str) -> bool:
         else:
             shutil.rmtree(tree)
     except FileNotFoundError:
-        shutil.rmtree(
-            sandbox_runtime_dir(
-                state.workspace_base, sandbox_id, state_base=state.state_base
-            ),
-            ignore_errors=True,
+        # The tree is already gone; the platform's paired directory is not, and
+        # it is removed by the same confirming path below (A5).
+        return _remove_local_runtime_confirming(
+            state, sandbox_id, runtime_dir=runtime_dir, priv_helpers=priv_helpers
         )
-        return True
     except Exception as exc:
         logger.warning(
             "local delete: %s could not be removed in-process or through the "
@@ -1842,12 +1843,50 @@ def _remove_local_tree_confirming(state, sandbox_id: str) -> bool:
     # Paired收尾 (N12/N24): the platform's files live beside the tree now, so
     # they go with it -- and only with it, since the record is what the next
     # delete verifies against.
-    shutil.rmtree(
-        sandbox_runtime_dir(
-            state.workspace_base, sandbox_id, state_base=state.state_base
-        ),
-        ignore_errors=True,
+    return _remove_local_runtime_confirming(
+        state, sandbox_id, runtime_dir=runtime_dir, priv_helpers=priv_helpers
     )
+
+
+def _remove_local_runtime_confirming(
+    state, sandbox_id: str, *, runtime_dir: Path, priv_helpers
+) -> bool:
+    """Remove ``<state base>/_runtime/<id>`` and confirm it is really gone (A5).
+
+    This half used to be ``shutil.rmtree(..., ignore_errors=True)`` followed by
+    an unconditional ``return True`` -- the exact "silent half-delete reads as
+    success" shape review W7 removed from the tree half. It matters because the
+    directory is created ``0700`` owned by the *worker* (``_ensure_runtime_dir``
+    chowns it to ``geteuid``), so a control plane that is neither root nor that
+    uid -- which Task 5 makes it -- cannot delete it and used to say nothing
+    (reproduced on the cluster by
+    ``deploy/scripts/acceptance/probe_c3_a5_silent_rmtree.py``; docs §13.7).
+
+    ``False`` means the directory is still there, and the caller must report a
+    failure rather than a teardown that did not happen.
+    """
+    try:
+        if priv_helpers is not None:
+            priv_helpers.remove_tree(runtime_dir, on_error="raise")
+        else:
+            shutil.rmtree(runtime_dir)
+    except FileNotFoundError:
+        return True
+    except Exception as exc:
+        logger.warning(
+            "local delete: the platform state of %s could not be removed "
+            "in-process or through the broker: %s",
+            sandbox_id,
+            exc,
+        )
+        return False
+    if runtime_dir.exists() or runtime_dir.is_symlink():
+        logger.warning(
+            "local delete: the platform state of %s survived its removal; the "
+            "teardown did not happen",
+            sandbox_id,
+        )
+        return False
     return True
 
 

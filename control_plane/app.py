@@ -561,6 +561,7 @@ def create_app(
             resolver=build_agent_address_resolver(settings),
             token=settings.c3_agent_token,
             timeout_s=settings.c3_agent_timeout_s,
+            file_op_timeout_s=settings.c3_agent_file_op_timeout_s,
             max_concurrency=settings.c3_agent_max_concurrency,
         )
     app.state.c3_agent_client = c3_agent_client

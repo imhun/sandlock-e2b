@@ -30,12 +30,23 @@ async def envs(request: Request) -> dict[str, str]:
     return dict(runtime.env_vars)
 
 
-def _dir_size(path: Path) -> int:
+def _dir_size(path: Path, *, sandbox_id: str | None = None) -> int:
     # Track F / fix round 1 (c1): the workspace is `0770` owned by the
     # sandbox uid with the worker's gid, so the worker's group access walks it
     # in-process; priv_helpers falls back to e2b-maint for the trees that
     # access cannot reach. Either way this no longer silently reports 0.
-    from envd_service import priv_helpers
+    from envd_service import agent_fileops, priv_helpers
+
+    client = agent_fileops.active()
+    if client is not None:
+        # C3 Task 4: measured by the agent (``walk-workspace``); the sandbox id
+        # is the only thing this side names.
+        if sandbox_id is None:
+            raise priv_helpers.PrivHelperError(
+                "the C3 agent shape needs the sandbox id to measure "
+                f"{path}: the metrics call did not name one"
+            )
+        return client.workspace_bytes(sandbox_id)
 
     brokered = priv_helpers.dir_size(path)
     if brokered is not None:
@@ -75,7 +86,7 @@ async def metrics(request: Request) -> dict[str, Any]:
             "totalBytes": runtime.memory_mb * 1024 * 1024,
         },
         "disk": {
-            "usedBytes": _dir_size(workspace),
+            "usedBytes": _dir_size(workspace, sandbox_id=runtime.sandbox_id),
             "totalBytes": min(disk_usage.total, runtime.disk_mb * 1024 * 1024),
             "freeBytes": max(0, disk_usage.free),
         },

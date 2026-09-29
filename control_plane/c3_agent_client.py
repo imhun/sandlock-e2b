@@ -266,7 +266,14 @@ class AgentClientError(RuntimeError):
 
 
 class C3AgentClient:
-    """One instruction per slot start, fail-closed, with a concurrency bound."""
+    """One instruction per privileged step, fail-closed, with a concurrency bound.
+
+    Face A (``grant-slot``) is one instruction per slot start; face B
+    (``chown`` / ``rm`` / ``walk``) is one per file operation. They share the
+    addressing, the token, the timeout and the concurrency knob -- and, above
+    all, the refusal shape, so a hop that cannot be made reads the same way
+    whichever verb asked for it (a stuck agent is a 504, never a hung create).
+    """
 
     def __init__(
         self,
@@ -274,12 +281,21 @@ class C3AgentClient:
         resolver: AgentAddressResolver,
         token: str,
         timeout_s: float,
+        file_op_timeout_s: float | None = None,
         max_concurrency: int = 0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._resolver = resolver
         self._token = token or ""
         self._timeout_s = float(timeout_s)
+        # Face B's deadline is its own number: a tree walk or a teardown is
+        # bounded by the tree (``maint.c``'s own budgets are 300 s for chown/rm
+        # and larger for a walk), while a slot grant is a single ``write(2)``.
+        # Sharing one deadline would either hang a create for minutes or cut
+        # off a legitimate teardown at five seconds.
+        self._file_op_timeout_s = float(
+            timeout_s if file_op_timeout_s is None else file_op_timeout_s
+        )
         # ``0`` means "unbounded" (today's default); slice B sizes the real
         # number from the concurrent-create arm and the acceptance matrix's
         # negative arm (pool = 1 must reproduce queueing).
@@ -313,6 +329,112 @@ class C3AgentClient:
                 f"({worker_pid_namespace!r}): refusing to instruct the agent",
                 status_code=503,
             )
+        target = self._target(node_id)
+        body = {
+            "sandbox_id": sandbox_id,
+            "pid": int(container_pid),
+            "uid": int(uid),
+            "worker": {
+                # The *worker's* identity (its node id == its pod name) travels
+                # here; the URL carries the **agent's** identity (its host).
+                "node_id": node_id,
+                "pid_namespace": worker_pid_namespace,
+                "pod_uid": target.pod_uid,
+            },
+        }
+        return await self._instruct(
+            target,
+            node_id,
+            "grant-slot",
+            body,
+            refusal="refused the grant",
+            timeout_tail="the slot identity grant is fail-closed",
+        )
+
+    async def chown(
+        self,
+        *,
+        node_id: str,
+        sandbox_id: str,
+        path: str,
+        worker_uid: int,
+        worker_gid: int,
+        uid: int | None = None,
+        gid: int | None = None,
+        recursive: bool = False,
+        worker_owned: bool = False,
+    ) -> dict[str, Any]:
+        """Instruct the agent to run ``e2b-maint chown`` on a CP-derived path.
+
+        ``uid`` is the pooled uid the control plane's records named and
+        ``worker_owned`` selects ``--worker`` (the owner stays the worker; only
+        the group moves). The *worker's* own identity is carried beside them:
+        it is what the agent must write into ``E2B_BROKER_WORKER_UID/GID`` so
+        that ``--worker`` and the group gate keep the meaning they have behind
+        the worker's broker (see ``deploy/c3_agent/fileops.py``).
+        """
+        body = {
+            "sandbox_id": sandbox_id,
+            "path": path,
+            "recursive": bool(recursive),
+            "worker_owned": bool(worker_owned),
+            "worker": {"uid": int(worker_uid), "gid": int(worker_gid)},
+        }
+        if uid is not None:
+            body["uid"] = int(uid)
+        if gid is not None:
+            body["gid"] = int(gid)
+        return await self._file_op(node_id, "chown", body)
+
+    async def rm(
+        self,
+        *,
+        node_id: str,
+        sandbox_id: str,
+        path: str,
+        worker_uid: int,
+        worker_gid: int,
+    ) -> dict[str, Any]:
+        """Instruct the agent to run ``e2b-maint rm`` on a CP-derived path."""
+        body = {
+            "sandbox_id": sandbox_id,
+            "path": path,
+            "worker": {"uid": int(worker_uid), "gid": int(worker_gid)},
+        }
+        return await self._file_op(node_id, "rm", body)
+
+    async def walk(
+        self,
+        *,
+        node_id: str,
+        sandbox_id: str,
+        path: str,
+        worker_uid: int,
+        worker_gid: int,
+    ) -> dict[str, Any]:
+        """Instruct the agent to run ``e2b-maint walk`` on a CP-derived path."""
+        body = {
+            "sandbox_id": sandbox_id,
+            "path": path,
+            "worker": {"uid": int(worker_uid), "gid": int(worker_gid)},
+        }
+        return await self._file_op(node_id, "walk", body)
+
+    async def _file_op(
+        self, node_id: str, verb: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        target = self._target(node_id)
+        return await self._instruct(
+            target,
+            node_id,
+            verb,
+            body,
+            refusal=f"refused the {verb}",
+            timeout_tail=f"the {verb} instruction is fail-closed",
+        )
+
+    def _target(self, node_id: str) -> AgentTarget:
+        """The fail-closed preconditions every instruction shares."""
         target = self._resolver.resolve(node_id)
         if target is None:
             raise AgentClientError(
@@ -337,33 +459,49 @@ class C3AgentClient:
                 "E2B_C3_AGENT_TOKEN is not configured: refusing to instruct an agent",
                 status_code=503,
             )
-        body = {
-            "sandbox_id": sandbox_id,
-            "pid": int(container_pid),
-            "uid": int(uid),
-            "worker": {
-                # The *worker's* identity (its node id == its pod name) travels
-                # here; the URL carries the **agent's** identity (its host).
-                "node_id": node_id,
-                "pid_namespace": worker_pid_namespace,
-                "pod_uid": target.pod_uid,
-            },
-        }
+        return target
+
+    def _deadline_for(self, op: str) -> float:
+        """One deadline per instruction kind (see ``__init__``)."""
+        return self._timeout_s if op == "grant-slot" else self._file_op_timeout_s
+
+    async def _instruct(
+        self,
+        target: AgentTarget,
+        node_id: str,
+        op: str,
+        body: dict[str, Any],
+        *,
+        refusal: str,
+        timeout_tail: str,
+    ) -> dict[str, Any]:
         if self._semaphore is not None:
             async with self._semaphore:
-                return await self._post(target, node_id, body)
-        return await self._post(target, node_id, body)
+                return await self._post(
+                    target, node_id, op, body, refusal=refusal, timeout_tail=timeout_tail
+                )
+        return await self._post(
+            target, node_id, op, body, refusal=refusal, timeout_tail=timeout_tail
+        )
 
     async def _post(
-        self, target: AgentTarget, node_id: str, body: dict[str, Any]
+        self,
+        target: AgentTarget,
+        node_id: str,
+        op: str,
+        body: dict[str, Any],
+        *,
+        refusal: str,
+        timeout_tail: str,
     ) -> dict[str, Any]:
         url = (
             f"{target.url}/internal/nodes/{target.node_identity}"
-            "/agent/grant-slot"
+            f"/agent/{op}"
         )
+        deadline = self._deadline_for(op)
         try:
             async with httpx.AsyncClient(
-                timeout=self._timeout_s, transport=self._transport
+                timeout=deadline, transport=self._transport
             ) as client:
                 resp = await client.post(
                     url, json=body, headers={"X-Internal-Key": self._token}
@@ -371,8 +509,7 @@ class C3AgentClient:
         except httpx.TimeoutException as exc:
             raise AgentClientError(
                 f"the agent for node {node_id} did not answer within "
-                f"{self._timeout_s}s: refusing (the slot identity grant is "
-                "fail-closed)",
+                f"{self._deadline_for(op)}s: refusing ({timeout_tail})",
                 status_code=504,
             ) from exc
         except httpx.HTTPError as exc:
@@ -387,7 +524,7 @@ class C3AgentClient:
                 error = resp.json().get("error")
             detail = error if isinstance(error, str) and error else resp.text
             raise AgentClientError(
-                f"the agent for node {node_id} refused the grant: {detail}",
+                f"the agent for node {node_id} {refusal}: {detail}",
                 status_code=502,
             )
         try:

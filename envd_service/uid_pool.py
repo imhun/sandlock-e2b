@@ -225,7 +225,9 @@ def _chown_tree(path: Path, uid: int, gid: int) -> None:
                 os.lchown(Path(root) / name, uid, gid)
 
 
-def apply_sandbox_ownership(workspace_dir: str | Path, host_uid: int) -> None:
+def apply_sandbox_ownership(
+    workspace_dir: str | Path, host_uid: int, *, sandbox_id: str | None = None
+) -> None:
     """Chown a sandbox workspace to ``<sandbox uid>:<worker gid>`` at ``0770``.
 
     Fix round 1 (裁定 c1): the sandbox owns the tree, and the **worker's
@@ -255,6 +257,22 @@ def apply_sandbox_ownership(workspace_dir: str | Path, host_uid: int) -> None:
     path = Path(workspace_dir)
     from envd_service import priv_helpers
 
+    # C3 Task 4: in the agent shape the hand-over is the *agent's* step --
+    # ``e2b-maint chown --uid X --gid <worker gid>`` executed by face B, asked
+    # for as ``{sandbox_id, op}`` (no path, no uid from this side; hard rules
+    # 1/3). The mode pass above stays here: the worker still owns the tree at
+    # this point, and modes are not a privileged operation.
+    from envd_service import agent_fileops
+
+    client = agent_fileops.active()
+    if client is not None:
+        if sandbox_id is None:
+            raise priv_helpers.PrivHelperError(
+                "the C3 agent shape needs the sandbox id to hand a tree over: "
+                f"{path} was not named by one"
+            )
+        client.chown_workspace(sandbox_id, recursive=True)
+        return
     group = os.getegid()
     mode = priv_helpers.WORKSPACE_MODE
     # The mode pass must happen while the worker still owns the tree (chmod
@@ -363,7 +381,7 @@ def align_shared_uid_workspace(workspace_dir: str | Path) -> None:
         worker_euid=os.geteuid(), owner_uid=owner_uid
     )
     if uid is not None:
-        apply_sandbox_ownership(path, uid)
+        apply_sandbox_ownership(path, uid, sandbox_id=path.name)
 
 
 class UidPool:

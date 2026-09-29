@@ -58,3 +58,44 @@ class Settings:
     as_uid_timeout_s: float = field(
         default_factory=lambda: float(os.getenv("E2B_C3_AGENT_AS_UID_TIMEOUT_S", "5"))
     )
+    #: Face B's payload, ``e2b-maint`` (C3 Task 4). The agent image installs it
+    #: beside ``as_uid`` (``/var/lib/e2b-priv``), and the DaemonSet gives this
+    #: container the same four roots the worker's broker had -- the path
+    #: discipline itself stays in ``priv_common.c``, so nothing here resolves a
+    #: path; these values are only ``maint.c``'s own inputs.
+    maint_path: str = field(
+        default_factory=lambda: os.getenv(
+            "E2B_C3_AGENT_MAINT", "/var/lib/e2b-priv/e2b-maint"
+        )
+    )
+    #: How long one ``e2b-maint`` invocation may take. ``rm``/``chown`` of a
+    #: sandbox tree is bounded by the tree, not by this number; it is the
+    #: agent's own ceiling so a wedged walk cannot pin a handler forever.
+    maint_timeout_s: float = field(
+        default_factory=lambda: float(
+            os.getenv("E2B_C3_AGENT_MAINT_TIMEOUT_S", "300")
+        )
+    )
+    #: The whitelist roots and the uid pool, exactly as ``priv_common.c`` reads
+    #: them. Defaults mirror ``envd_service/config.py`` / the C defaults, so an
+    #: agent started without the DaemonSet's env is still the same shape.
+    workspace_base: str = field(
+        default_factory=lambda: os.getenv(
+            "E2B_WORKSPACE_BASE", "/var/lib/e2b-sandboxes"
+        )
+    )
+    #: Empty means "the workspace base itself" (``priv_state_base``'s rule); it
+    #: is written into the child's environment *resolved*, never empty.
+    state_base: str = field(default_factory=lambda: os.getenv("E2B_STATE_BASE", ""))
+    shared_volume_root: str = field(
+        default_factory=lambda: os.getenv("E2B_SHARED_VOLUME_ROOT", "")
+    )
+    image_cache_dir: str = field(
+        default_factory=lambda: os.getenv("E2B_IMAGE_CACHE_DIR", "")
+    )
+    uid_pool_start: int = field(
+        default_factory=lambda: _env_int("E2B_UID_POOL_START", 10000)
+    )
+    uid_pool_size: int = field(
+        default_factory=lambda: _env_int("E2B_UID_POOL_SIZE", 1000)
+    )

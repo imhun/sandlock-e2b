@@ -43,7 +43,7 @@ from envd_service.uid_pool import (
     align_shared_uid_workspace,
     apply_sandbox_ownership,
 )
-from envd_service.worker_identity import worker_pid_namespace
+from envd_service.worker_identity import worker_identity_fields, worker_pid_namespace
 from envd_service.xfs_quota import (
     ProjectDirectoryGone,
     ProjectQuotaError,
@@ -79,6 +79,20 @@ router = APIRouter()
 #: times instead of leaving the entry to manual review.
 _QUOTA_RECLAIM_ATTEMPTS = 3
 _QUOTA_RECLAIM_DELAY_S = 0.5
+
+
+def _agent_fileops():
+    """The C3 file-operation client, or ``None`` in every other shape.
+
+    One helper for the call sites that were broker-first before Task 4: in the
+    agent shape every privileged file step is asked of the control plane as
+    ``{sandbox_id, op}`` (no path and no uid -- hard rules 1/3), and in every
+    other shape this is ``None`` and the pre-C3 path runs unchanged.
+    """
+    from envd_service import agent_fileops
+
+    return agent_fileops.active()
+
 
 #: A disk sweep that had to be deferred because the fleet's records could not
 #: all be enumerated is retried on later heartbeats: doubling, capped, so a
@@ -195,6 +209,11 @@ def _register_payload(
     pid_namespace = worker_pid_namespace()
     if pid_namespace:
         payload["pidNamespace"] = pid_namespace
+    # C3 Task 4: the worker's own uid/gid, for the same reason (and on the same
+    # path): the agent's file operations need the identity a tree's group and
+    # ``--worker`` refer to, and the control plane may only take it from its own
+    # records (hard rule 3).
+    payload.update(worker_identity_fields())
     return payload
 
 
@@ -292,6 +311,7 @@ def _heartbeat_usage_payload(
     disk_report: dict[str, int] | None = None,
     platform_disk: dict[str, int] | None = None,
     pid_namespace: str | None = None,
+    worker_identity: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Disk usage + quota alerts + MCP port band carried by each heartbeat."""
     payload: dict[str, Any] = {}
@@ -302,6 +322,12 @@ def _heartbeat_usage_payload(
         # every slot grant on this node would be refused until it was forgotten
         # (the "node pinned" failure mode §11.1 item 9 warns about).
         payload["pidNamespace"] = pid_namespace
+    if worker_identity:
+        # C3 Task 4: refreshed with every heartbeat, exactly as the pid
+        # namespace is -- a restart under a different ``runAsGroup`` is a new
+        # gid under the same node id, and a stale one would put sandbox trees in
+        # a group the worker does not have.
+        payload.update(worker_identity)
     try:
         usage = shutil.disk_usage(settings.workspace_base)
         payload["diskUsedMB"] = usage.used // (1024 * 1024)
@@ -1377,7 +1403,16 @@ def _delete_sandbox_runtime(
         # broker is the fallback; when even it cannot remove the tree, the
         # caller has to see a failure rather than a 204.
         try:
-            priv_helpers.remove_tree(workspace_dir, on_error="raise")
+            agent_fileops_client = _agent_fileops()
+            if agent_fileops_client is not None:
+                # C3 Task 4: in the agent shape the removal is the agent's
+                # (``e2b-maint rm`` over the tree the control plane derived
+                # from the same records). The worker asks with
+                # ``{sandbox_id, op}`` -- no path -- and the disk's own answer
+                # still decides below.
+                agent_fileops_client.remove_workspace(sandbox_id)
+            else:
+                priv_helpers.remove_tree(workspace_dir, on_error="raise")
         except Exception as exc:
             # The in-process ``rmtree`` failed *and* the brokers were absent,
             # refused, or failed too (W7-4 is what makes the broker branch
@@ -1401,14 +1436,26 @@ def _delete_sandbox_runtime(
         # record is what the *next* delete verifies against, so it must not
         # outlive the tree it describes (nor be dropped while the tree stands,
         # which is why ``unregister`` leaves it alone).
-        shutil.rmtree(
-            sandbox_runtime_dir(
-                _registry_workspace_base(runtime_registry, settings),
-                sandbox_id,
-                state_base=_registry_state_base(runtime_registry, settings),
-            ),
-            ignore_errors=True,
+        runtime_dir = sandbox_runtime_dir(
+            _registry_workspace_base(runtime_registry, settings),
+            sandbox_id,
+            state_base=_registry_state_base(runtime_registry, settings),
         )
+        agent_fileops_client = _agent_fileops()
+        if agent_fileops_client is not None:
+            # The paired half goes through the agent too -- and, unlike the
+            # ``ignore_errors=True`` this replaces, a runtime dir that survives
+            # its removal is a failure the caller sees (the N12/N24 lesson:
+            # "recorded as removed" with the files still on disk is the shape
+            # no GC can ever reclaim).
+            agent_fileops_client.remove_runtime(sandbox_id)
+            if runtime_dir.exists():
+                raise SandboxTreeNotRemoved(
+                    f"the platform state of {sandbox_id} survived its teardown: "
+                    f"{runtime_dir} is still on disk"
+                )
+        else:
+            shutil.rmtree(runtime_dir, ignore_errors=True)
         # ...and the pure shape's synthesized root (N16), the third thing the
         # platform holds for this sandbox: ``<pure_rootfs_dir>/<id>`` is the
         # skeleton the sandbox's own mount namespace binds into. It goes with
@@ -1751,6 +1798,7 @@ class NodeAgent:
                         self._disk_report_for_heartbeat(),
                         self._platform_disk_report,
                         worker_pid_namespace(),
+                        worker_identity_fields(),
                     ),
                     headers=headers,
                 )
@@ -2714,7 +2762,7 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
                 # entry.
                 project_id = None
         if host_uid is not None:
-            apply_sandbox_ownership(workspace_dir, host_uid)
+            apply_sandbox_ownership(workspace_dir, host_uid, sandbox_id=sandbox_id)
         elif not settings.per_sandbox_uid:
             # FUP #6: legacy shared-uid shape under a root worker — every
             # sandlock shell runs as host uid 1000. The pure no-chroot
@@ -3576,7 +3624,13 @@ async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
         # files; the incoming archive is the full source of truth.
         from envd_service import priv_helpers
 
-        priv_helpers.remove_tree(workspace)
+        client = _agent_fileops()
+        if client is not None:
+            # C3 Task 4: same step, the agent's execution (and the same
+            # "no path in the request" rule).
+            client.remove_workspace(sandbox_id)
+        else:
+            priv_helpers.remove_tree(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
     migrate_dir = settings.workspace_base / "_migrate"
     migrate_dir.mkdir(parents=True, exist_ok=True)

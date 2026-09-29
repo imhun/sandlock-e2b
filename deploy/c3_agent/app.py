@@ -28,6 +28,13 @@ Surface (all responses JSON objects):
   the *only* accepted result is exit 0 with exactly the ``C3-ASUID-OK
   pid=N uid=X`` line on stdout and an empty stderr. Anything else is a ``502``
   named fail-closed refusal (a half-applied grant must never read as success).
+- ``POST /internal/nodes/{node_id}/agent/{chown|rm|walk}`` (face B, Task 4)
+  ``{"sandbox_id", "path", "uid"?, "gid"?, "recursive"?, "worker_owned"?,
+  "worker": {"uid", "gid"}}`` -> the verb's own answer. The **verb list is the
+  whitelist** (D18.2) and an unknown verb is refused by name; ``path`` and
+  ``uid`` are the control plane's values (hard rules 1/3 -- the worker never
+  names either), and the path discipline is ``e2b-maint``'s
+  (:mod:`deploy.c3_agent.fileops` execs that same binary with the same roots).
 
 Auth: every request must carry ``X-Internal-Key`` equal to
 ``E2B_C3_AGENT_TOKEN`` (constant-time); the service refuses to answer when the
@@ -54,9 +61,19 @@ from typing import Any, Protocol
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from deploy.c3_agent.config import Settings
+from deploy.c3_agent.errors import AgentRefusal
+from deploy.c3_agent.fileops import (
+    FILE_OP_VERBS,
+    AgentFileOpRefusal,
+    FileOpInstruction,
+    FileOpShapeRefusal,
+    MaintRunner,
+    SubprocessMaintRunner,
+    run_file_op,
+)
 from deploy.c3_agent.lookup import (
     LookupRefusal,
     ProcLookup,
@@ -69,10 +86,6 @@ logger = logging.getLogger(__name__)
 
 #: The one line ``as_uid`` prints on success (Task 1).
 AS_UID_OK_PREFIX = "C3-ASUID-OK"
-
-
-class AgentRefusal(Exception):
-    """A named, fail-closed refusal from the agent's privileged operation."""
 
 
 class WorkerInstruction(BaseModel):
@@ -100,6 +113,39 @@ class GrantSlotBody(BaseModel):
     uid: int = Field(ge=1)
     pid: int = Field(ge=1)
     worker: WorkerInstruction
+
+
+class WorkerCredentials(BaseModel):
+    """The worker's own identity, as the control plane's node record holds it.
+
+    Both halves are needed for face B and neither may come from the agent's own
+    ``getuid()``/``getgid()``: the agent is root, so its own identity would turn
+    ``chown --worker`` into "hand the tree to root" (see
+    :mod:`deploy.c3_agent.fileops`).
+    """
+
+    uid: int = Field(ge=1)
+    gid: int = Field(ge=1)
+
+
+class FileOpBody(BaseModel):
+    """One file-operation instruction (face B).
+
+    ``path`` is the **control plane's** value -- derived from its own records
+    and settings (hard rule 3 / C3 §14.4) -- and this service only shape-checks
+    it; ``uid`` is the pooled uid those records named. ``worker_owned`` selects
+    ``maint.c``'s ``--worker`` form (the slot documents: owner stays the
+    worker, only the group moves), which is why it is a separate field from
+    ``uid`` rather than a sentinel value.
+    """
+
+    sandbox_id: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    uid: int | None = Field(default=None, ge=1)
+    gid: int | None = Field(default=None, ge=1)
+    recursive: bool = False
+    worker_owned: bool = False
+    worker: WorkerCredentials
 
 
 class AsUidRunner(Protocol):
@@ -191,11 +237,19 @@ def create_app(
     *,
     settings: Settings | None = None,
     runner: AsUidRunner | None = None,
+    maint_runner: MaintRunner | None = None,
     lookup: ProcLookup | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     runner = runner or SubprocessAsUidRunner(
         settings.as_uid_path, timeout_s=settings.as_uid_timeout_s
+    )
+    # Face B: the same binary the worker's broker execs, judged the same strict
+    # way (``maint.c`` prints nothing on success, one entry line per node for
+    # ``walk``). The roots and the uid pool travel in the child's environment,
+    # so nothing here resolves a path.
+    maint_runner = maint_runner or SubprocessMaintRunner(
+        settings.maint_path, timeout_s=settings.maint_timeout_s
     )
     # The host's process table: face A runs with ``hostPID: true`` (Task 3's
     # DaemonSet), which is what makes the worker's container pid visible here.
@@ -211,6 +265,7 @@ def create_app(
     )
     app.state.settings = settings
     app.state.runner = runner
+    app.state.maint_runner = maint_runner
     app.state.lookup = lookup
 
     @app.exception_handler(HTTPException)
@@ -218,7 +273,7 @@ def create_app(
         return JSONResponse(status_code=exc.status_code, content=exc.detail)
 
     @app.post("/internal/nodes/{node_id}/agent/{op}")
-    def agent_op(node_id: str, op: str, request: Request, body: GrantSlotBody) -> dict[str, Any]:
+    async def agent_op(node_id: str, op: str, request: Request) -> dict[str, Any]:
         _require_key(request)
         # The agent's only local decision: is this instruction for *me*? It is
         # refused before the op vocabulary is even consulted.
@@ -232,10 +287,77 @@ def create_app(
                     )
                 },
             )
-        if op != "grant-slot":
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
             raise HTTPException(
-                status_code=404, detail={"error": f"unknown agent op {op!r}"}
+                status_code=400, detail={"error": "invalid JSON body"}
+            ) from None
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": f"the {op} instruction must be a JSON object"},
             )
+        # D18.2: a verb whitelist with explicitly named verbs. An unknown op is
+        # refused by name here, before any body is interpreted.
+        if op == "grant-slot":
+            return _grant_slot(_validated(GrantSlotBody, body))
+        if op in FILE_OP_VERBS:
+            return _file_op(op, _validated(FileOpBody, body))
+        raise HTTPException(
+            status_code=404, detail={"error": f"unknown agent op {op!r}"}
+        )
+
+    def _validated(model, body: dict[str, Any]):
+        """The per-op body model, or the 4xx the wire contract names.
+
+        A body that does not fit its op is a *shape* refusal, so a missing or
+        misspelled field answers 422 (what the single-op service answered when
+        FastAPI did this) instead of surfacing as an unhandled error.
+        """
+        try:
+            return model.model_validate(body)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": f"the instruction body does not fit {model.__name__}"},
+            ) from exc
+
+    def _file_op(op: str, body: FileOpBody) -> dict[str, Any]:
+        if not validate_sandbox_id(body.sandbox_id):
+            logger.warning("c3-agent refused %s: sandbox_id is not valid", op)
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "sandbox_id is not a valid sandbox id"},
+            )
+        instruction = FileOpInstruction(
+            sandbox_id=body.sandbox_id,
+            path=body.path,
+            uid=body.uid,
+            gid=body.gid,
+            recursive=body.recursive,
+            worker_owned=body.worker_owned,
+            worker_uid=body.worker.uid,
+            worker_gid=body.worker.gid,
+        )
+        try:
+            return run_file_op(
+                op, instruction, runner=maint_runner, settings=settings
+            )
+        except FileOpShapeRefusal as exc:
+            # A bad instruction, not a refused privileged step: the control
+            # plane sent a shape ``maint.c`` has no call for.
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except AgentFileOpRefusal as exc:
+            logger.warning(
+                "c3-agent refused %s for sandbox %s: %s",
+                op,
+                body.sandbox_id,
+                exc,
+            )
+            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+
+    def _grant_slot(body: GrantSlotBody) -> dict[str, Any]:
         # D12: the path's node id is *this host* while `worker.node_id` is the
         # worker pod that reported the pid -- two different names, so they are
         # not compared. What is checked is that the worker identity is a shape

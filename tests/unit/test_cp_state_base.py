@@ -77,7 +77,10 @@ def test_cp_state_base_env_is_resolved(monkeypatch, tmp_path):
 
 def test_every_runtime_dir_call_passes_a_state_base():
     calls = _calls(SANDBOXES_PY, "sandbox_runtime_dir")
-    assert len(calls) == 2
+    # C3 Task 4 (A5): the tree removal and its paired ``_runtime/<id>`` share
+    # one resolved path now, so the two call sites became one -- and it still
+    # passes the state base, which is what this pin is about.
+    assert len(calls) == 1
     for call in calls:
         assert _keyword_names(call) == ["state_base"]
 

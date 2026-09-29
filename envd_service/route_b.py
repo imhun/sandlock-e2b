@@ -656,7 +656,7 @@ class W1SlotPool:
         program_path = slot_dir / "program.json"
         self._write_slot_documents(self._tmp_root, uid_dir, slot_dir,
                                    policy_path, program_path, policy_json,
-                                   program, uid, slot_name)
+                                   program, uid, slot_name, sandbox_id)
         registered = self.transport == "path"
         sock_path = _registry_sock_path(uid, slot_name) if registered else None
 
@@ -798,6 +798,7 @@ class W1SlotPool:
         program: dict,
         uid: int,
         slot_name: str,
+        sandbox_id: str | None = None,
     ) -> None:
         """Publish the startup documents so **the slot can read them**.
 
@@ -828,8 +829,18 @@ class W1SlotPool:
             with open(path, "w", encoding="utf-8") as document:
                 document.write(payload)
             try:
-                self._scope_slot_document(path, uid)
+                self._scope_slot_document(path, uid, sandbox_id=sandbox_id)
             except (PermissionError, PrivHelperError):
+                from envd_service import agent_fileops
+
+                if agent_fileops.active() is not None:
+                    # C3 Task 4 / D18.1: in the agent shape a refusal is the
+                    # end of the line. The 0444 fallback below is *why* the
+                    # brief called this path out -- it leaves a policy document
+                    # carrying the egress-proxy credentials world-readable to
+                    # every tenant on the host, and the agent exists to make it
+                    # unnecessary. Fail closed instead.
+                    raise
                 # A worker that cannot chown (an unprivileged pool attached to
                 # an externally started fleet) has no way to scope the group;
                 # say so instead of shipping a silently world-readable policy.
@@ -847,7 +858,9 @@ class W1SlotPool:
                 os.chmod(path, 0o440)
 
     @staticmethod
-    def _scope_slot_document(path: Path, uid: int) -> None:
+    def _scope_slot_document(
+        path: Path, uid: int, *, sandbox_id: str | None = None
+    ) -> None:
         """Make a slot document readable by exactly one uid.
 
         Root worker: ``chown -1:<uid>`` (owner stays root, group is the slot).
@@ -857,8 +870,25 @@ class W1SlotPool:
         0440 "readable by the slot, closed to every other tenant" property,
         with the worker as owner instead of root.
         """
-        from envd_service import priv_helpers
+        from envd_service import agent_fileops, priv_helpers
 
+        client = agent_fileops.active()
+        if client is not None:
+            # C3 Task 4 (the brief's landmine 1): the per-slot documents carry
+            # the egress-proxy credentials, and this step is the only thing
+            # that makes them unreadable by every other tenant. It used to run
+            # ``e2b-maint chown --worker --gid <uid>`` from the worker's own
+            # privileged binary; it is now the agent's ``scope-slot-document``,
+            # asked for as ``{sandbox_id, op}`` -- the path (the control
+            # plane's route-B root / the slot's uid / ``rb-<id>``) is derived
+            # there, never reported from here.
+            if sandbox_id is None:
+                raise PrivHelperError(
+                    "the C3 agent shape needs the sandbox id to scope a slot "
+                    f"document: {path} was not named by one"
+                )
+            client.scope_slot_document(sandbox_id, path.name)
+            return
         if priv_helpers.helpers_cover(path):
             priv_helpers.broker_reclaim(path, recursive=False, gid=uid)
             return

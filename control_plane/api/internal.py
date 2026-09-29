@@ -68,6 +68,7 @@ from fastapi import APIRouter, Header, Request, Response
 from control_plane.api.errors import OfficialError
 from control_plane.auth import node_id_for_key, verify_internal_key
 from control_plane.c3_agent_client import AgentClientError
+from control_plane import file_ops
 from control_plane.node_address import NodeEndpoint
 from control_plane.registry.manager import UnknownSandboxError
 from gateway_common.paths import validate_sandbox_id
@@ -129,6 +130,25 @@ def _worker_pid_namespace(body: dict[str, Any]) -> str | None:
             "'pid:[4026532458]'",
         )
     return value
+
+
+def _worker_identity_fields(body: dict[str, Any]) -> tuple[int | None, int | None]:
+    """The worker's reported ``workerUID`` / ``workerGID``, or a named refusal.
+
+    C3 Task 4: face B's file operations act *as* the worker in two places
+    (``chown --worker`` and the group a sandbox tree is handed to), so the
+    control plane has to know the identity -- and it takes it from its own node
+    record, never from the file-op request itself (hard rule 3). Both halves
+    are reported together or not at all: half an identity is not one.
+    """
+    uid = body.get("workerUID")
+    gid = body.get("workerGID")
+    if uid is None and gid is None:
+        return None, None
+    for name, value in (("workerUID", uid), ("workerGID", gid)):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise OfficialError(400, f"{name} must be a positive integer")
+    return uid, gid
 
 
 def _resolve_node(request: Request, node_id: str) -> NodeEndpoint | None:
@@ -273,6 +293,7 @@ async def register_node(request: Request) -> dict[str, Any]:
         )
     address = endpoint.address
     pid_namespace = _worker_pid_namespace(body)
+    worker_uid, worker_gid = _worker_identity_fields(body)
     record = request.app.state.nodes.register(
         node_id=node_id,
         address=address,
@@ -283,6 +304,8 @@ async def register_node(request: Request) -> dict[str, Any]:
         images=body.get("images") or [],
         labels=body.get("labels") or {},
         pid_namespace=pid_namespace,
+        worker_uid=worker_uid,
+        worker_gid=worker_gid,
     )
     _rebuild_node_reservations(request, record)
     return {"nodeID": record.node_id}
@@ -338,6 +361,13 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
     pid_namespace = _worker_pid_namespace(body)
     if pid_namespace is not None:
         record.pid_namespace = pid_namespace
+    # C3 Task 4: same treatment for the worker's own uid/gid -- refreshed on
+    # every heartbeat (a restart can change them under a k8s ``runAsGroup``),
+    # and left alone when an older worker reports nothing.
+    worker_uid, worker_gid = _worker_identity_fields(body)
+    if worker_uid is not None and worker_gid is not None:
+        record.worker_uid = worker_uid
+        record.worker_gid = worker_gid
     record.update_usage(
         used_disk_mb=body.get("diskUsedMB"),
         disk_total_mb=body.get("diskTotalMB"),
@@ -542,6 +572,112 @@ async def node_slot_identity(node_id: str, request: Request) -> dict[str, Any]:
         "pid": pid,
         "agent": answer,
     }
+
+
+@router.post("/internal/nodes/{node_id}/file-op")
+async def node_file_op(node_id: str, request: Request) -> dict[str, Any]:
+    """Run one file operation for a worker, through that node's agent.
+
+    This is the second half of C3's face B and the reason the worker no longer
+    needs a privileged binary: the worker reports ``{sandbox_id, op}`` --
+    never a path and never a uid (hard rules 1/3, §14.4) -- and the control
+    plane, which holds the records, derives the target and instructs the
+    agent, which executes it (C3 §11.2: the agent *is* the executor; nothing
+    here hands an identity to a worker helper).
+
+    Every layer is named and fail-closed: the identity layer (①② + source IP)
+    from every node-scoped handler, the object check (③), the derivation's own
+    root check, and the agent hop's typed errors (504 stuck, 502 refused or
+    unreachable, 503 no client or no identity).
+    """
+    node_id, _endpoint = _require_node_identity(request, node_id)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise OfficialError(400, "Invalid JSON body")
+    if not isinstance(body, dict):
+        raise OfficialError(400, "Request body must be a JSON object")
+    try:
+        spec = file_ops.spec_for(body.get("op"))
+        file_ops.validate_params(spec, body)
+    except file_ops.FileOpRefusal as exc:
+        raise OfficialError(exc.status_code, str(exc)) from exc
+    sandbox_id = body.get("sandbox_id")
+    if not isinstance(sandbox_id, str) or not validate_sandbox_id(sandbox_id):
+        raise OfficialError(400, "sandbox_id must be a valid sandbox id")
+    try:
+        record = request.app.state.registry.get(sandbox_id)
+    except UnknownSandboxError:
+        raise OfficialError(404, f"Sandbox {sandbox_id} not found") from None
+    owner = record.node_id or "local"
+    if owner != node_id:
+        raise OfficialError(
+            403, f"Sandbox {sandbox_id} belongs to node {owner}, not {node_id}"
+        )
+    node = request.app.state.nodes.get(node_id)
+    if node is None:
+        raise OfficialError(404, f"Node {node_id} not found")
+    state = request.app.state
+    try:
+        paths = file_ops.control_paths(state, state.settings)
+        instruction = file_ops.derive(
+            spec,
+            body,
+            paths=paths,
+            host_uid=record.host_uid,
+            node_id=node_id,
+            worker_gid=getattr(node, "worker_gid", None),
+        )
+    except file_ops.FileOpRefusal as exc:
+        raise OfficialError(exc.status_code, str(exc)) from exc
+    if instruction.worker_owned or spec.verb == "chown":
+        if getattr(node, "worker_uid", None) is None:
+            raise OfficialError(
+                503,
+                f"node {node_id} has reported no worker identity: refusing to "
+                "instruct the agent without it",
+            )
+    client = getattr(state, "c3_agent_client", None)
+    if client is None:
+        raise OfficialError(
+            503,
+            "this control plane has no C3 agent client configured: refusing "
+            f"to run {spec.op}",
+        )
+    common = {
+        "node_id": node_id,
+        "sandbox_id": sandbox_id,
+        "path": instruction.path,
+        "worker_uid": int(node.worker_uid),
+        "worker_gid": int(node.worker_gid),
+    }
+    try:
+        if spec.verb == "chown":
+            answer = await client.chown(
+                **common,
+                uid=instruction.uid,
+                gid=instruction.gid,
+                recursive=instruction.recursive,
+                worker_owned=instruction.worker_owned,
+            )
+        elif spec.verb == "rm":
+            answer = await client.rm(**common)
+        else:
+            answer = await client.walk(**common)
+    except AgentClientError as exc:
+        raise OfficialError(exc.status_code, str(exc)) from exc
+    response = {
+        "nodeID": node_id,
+        "sandboxID": sandbox_id,
+        "op": spec.op,
+        "verb": spec.verb,
+        "path": instruction.path,
+        "agent": answer,
+    }
+    if spec.verb == "walk":
+        stdout = answer.get("stdout") if isinstance(answer, dict) else None
+        response["stdout"] = stdout if isinstance(stdout, str) else None
+    return response
 
 
 @router.get("/internal/fleet/sandboxes")

@@ -298,7 +298,10 @@ def test_provision_applies_the_volume_root_model_for_a_host_uid(
     monkeypatch.setattr(
         volumes,
         "_ensure_shared_volume_root",
-        lambda root, host_uid: seen.append((root, host_uid)),
+        # C3 Task 4 added the sandbox id and the volume name to this call: the
+        # agent shape derives the volume's host path from the control plane's
+        # registry, so the call site has to name which volume it means.
+        lambda root, host_uid, **kwargs: seen.append((root, host_uid)),
     )
     monkeypatch.setattr(volumes.os, "geteuid", lambda: 0)
 

@@ -55,6 +55,15 @@ class NodeRecord:
     #: runs several workers, and it is refreshed on every heartbeat because a
     #: restarted worker container has a new inode under the *same* node id.
     pid_namespace: str | None = None
+    #: C3 Task 4: the worker's own uid/gid, reported at register/heartbeat the
+    #: same way its pid namespace is. Face B's file operations need them --
+    #: ``e2b-maint chown --uid X --gid <worker gid>`` puts a sandbox tree in
+    #: the group the worker (the data-plane owner) reads it through, and
+    #: ``chown --worker`` keeps the owner as the worker itself. They come from
+    #: this record, never from the request (hard rule 3): a worker may not name
+    #: the identity a privileged step acts as.
+    worker_uid: int | None = None
+    worker_gid: int | None = None
     status: str = "healthy"
     heartbeat_at: float = field(default_factory=time.time)
     created_at: float = field(default_factory=time.time)
@@ -95,6 +104,8 @@ class NodeRecord:
             "images": list(self.images),
             "labels": dict(self.labels),
             "pid_namespace": self.pid_namespace,
+            "worker_uid": self.worker_uid,
+            "worker_gid": self.worker_gid,
             "status": self.status,
             "heartbeat_at": self.heartbeat_at,
             "created_at": self.created_at,
@@ -327,6 +338,8 @@ class NodeRegistry:
         images: list[str] | None = None,
         labels: dict[str, str] | None = None,
         pid_namespace: str | None = None,
+        worker_uid: int | None = None,
+        worker_gid: int | None = None,
     ) -> NodeRecord:
         with self._lock:
             record = self._load_locked(node_id) if node_id else None
@@ -343,6 +356,8 @@ class NodeRegistry:
                     images=list(images or []),
                     labels=dict(labels or {}),
                     pid_namespace=pid_namespace,
+                    worker_uid=worker_uid,
+                    worker_gid=worker_gid,
                     reserved_memory_mb=reserved.get("memory", 0),
                     reserved_cpu_percent=reserved.get("cpu", 0),
                     reserved_disk_mb=reserved.get("disk", 0),
@@ -363,6 +378,12 @@ class NodeRegistry:
                 # this node fail closed until the next register.
                 if pid_namespace is not None:
                     record.pid_namespace = pid_namespace
+                # Same rule as the pid namespace above: only ever *set* here,
+                # so a rollout of older workers does not erase an identity the
+                # record already holds.
+                if worker_uid is not None and worker_gid is not None:
+                    record.worker_uid = worker_uid
+                    record.worker_gid = worker_gid
                 record.draining = False
             record.heartbeat_at = time.time()
             record.status = "healthy"

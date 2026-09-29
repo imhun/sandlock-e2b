@@ -159,7 +159,7 @@ def _prepare_image_parent(
     os.chmod(parent, 0o700)
     owner = os.geteuid() if owner_uid is None else int(owner_uid)
     if owner != os.geteuid():
-        _hand_to_sandbox(parent, owner)
+        _hand_to_sandbox(parent, owner, sandbox_id=sandbox_id)
     else:
         try:
             os.chown(parent, owner, owner)
@@ -168,13 +168,31 @@ def _prepare_image_parent(
     return image
 
 
-def _hand_to_sandbox(path: Path, uid: int, *, recursive: bool = False) -> None:
+def _hand_to_sandbox(
+    path: Path, uid: int, *, recursive: bool = False, sandbox_id: str | None = None
+) -> None:
     """Give ``path`` to the pooled uid that will write it (raises on failure).
 
     Root does it directly; a non-root worker goes through ``e2b-maint``
     (``CAP_CHOWN``), which is the same broker the rest of the platform uses to
     move a path between the worker's identity and a sandbox's.
+
+    C3 Task 4: in the agent shape the step is asked of the control plane as
+    ``{sandbox_id, op}`` -- the checkpoint store's path is derived there from
+    the same ``<state base>/_runtime/.checkpoints/<id>`` convention -- and no
+    path leaves this process.
     """
+    from envd_service import agent_fileops, priv_helpers
+
+    client = agent_fileops.active()
+    if client is not None:
+        if sandbox_id is None:
+            raise priv_helpers.PrivHelperError(
+                "the C3 agent shape needs the sandbox id to hand a checkpoint "
+                f"image over: {path} was not named by one"
+            )
+        client.chown_checkpoint(sandbox_id, recursive=recursive)
+        return
     if os.geteuid() == 0:
         if not recursive:
             os.chown(path, uid, uid)
@@ -184,17 +202,29 @@ def _hand_to_sandbox(path: Path, uid: int, *, recursive: bool = False) -> None:
             for entry in (*dirs, *files):
                 os.chown(Path(root) / entry, uid, uid)
         return
-    from envd_service import priv_helpers
-
     priv_helpers.broker_chown(uid, path, recursive=recursive)
 
 
-def image_bytes(image: Path) -> int:
-    """Allocated bytes of one image, ``0`` when it is not there."""
-    from envd_service import priv_helpers
+def image_bytes(image: Path, *, sandbox_id: str | None = None) -> int:
+    """Allocated bytes of one image, ``0`` when it is not there.
+
+    The image is ``0700`` owned by the sandbox's own uid, so a non-root worker
+    needs the broker -- or, in the C3 agent shape, the agent's ``walk``
+    (``walk-checkpoint``), which the control plane derives from the sandbox id
+    for the same reason it derives every other path (hard rule 3).
+    """
+    from envd_service import agent_fileops, priv_helpers
 
     if not image.is_dir():
         return 0
+    client = agent_fileops.active()
+    if client is not None:
+        if sandbox_id is None:
+            raise priv_helpers.PrivHelperError(
+                "the C3 agent shape needs the sandbox id to measure a "
+                f"checkpoint image: {image} was not named by one"
+            )
+        return client.checkpoint_bytes(sandbox_id)
     size = priv_helpers.dir_size(image)
     return 0 if size is None else int(size)
 
@@ -299,10 +329,13 @@ def checkpoint_status(
         last = None
     if not isinstance(last, dict):
         last = None
+    image_mb = 0
+    if has_image:
+        image_mb = image_bytes(image, sandbox_id=sandbox_id) // _MIB
     return {
         "sandboxID": sandbox_id,
         "hasImage": has_image,
-        "imageMB": (image_bytes(image) // _MIB) if has_image else 0,
+        "imageMB": image_mb,
         "capturedAt": captured_at,
         "lastRestore": last,
     }
@@ -408,7 +441,7 @@ def capture_checkpoint_image(
             sandbox_id, False, reason, used=used_before, limit=limit
         )
 
-    written = image_bytes(image)
+    written = image_bytes(image, sandbox_id=sandbox_id)
     allowed, over = checkpoint_admission(
         used_bytes=used_before, incoming_bytes=written, limit_bytes=limit
     )
@@ -416,7 +449,7 @@ def capture_checkpoint_image(
         # The account is enforced on what was actually written: the size is only
         # knowable by capturing, so the image is removed again and the sandbox is
         # left exactly as it was found.
-        _remove_image(image)
+        _remove_image(image, sandbox_id=sandbox_id)
         _discard_empty_store(image)
         logger.warning(
             "sandbox %s: checkpoint image of %d MiB refused and removed: %s",
@@ -513,7 +546,9 @@ def restore_checkpoint_image(
         # or a legacy image taken before pooled uids.
         try:
             if image.stat().st_uid != int(owner_uid):
-                _hand_to_sandbox(image, int(owner_uid), recursive=True)
+                _hand_to_sandbox(
+                    image, int(owner_uid), recursive=True, sandbox_id=sandbox_id
+                )
         except Exception as exc:  # noqa: BLE001 - reported as "not restored"
             reason = (
                 "the checkpoint image could not be handed to the sandbox's uid "
@@ -591,7 +626,7 @@ def restore_checkpoint_image(
         len(skipped),
         skipped if skipped else "none",
     )
-    _remove_image(image)
+    _remove_image(image, sandbox_id=sandbox_id)
     return {
         "sandbox_id": sandbox_id,
         "restored": True,
@@ -607,15 +642,28 @@ def restore_checkpoint_image(
     }
 
 
-def _remove_image(image: Path) -> None:
+def _remove_image(image: Path, *, sandbox_id: str | None = None) -> None:
     """Delete one image tree, in-process first and through the broker on EACCES.
 
     The image is ``0700`` and owned by the sandbox's uid (see the module doc), so
     a *non-root* worker cannot walk into it: ``priv_helpers.remove_tree`` is the
     platform's own fallback for exactly that (`e2b-maint`, ``CAP_DAC_OVERRIDE``).
     A root worker removes it directly.
+
+    C3 Task 4: the agent shape asks the control plane for ``remove-checkpoint``,
+    which resolves to the same ``<state base>/_runtime/.checkpoints/<id>`` path.
     """
-    from envd_service import priv_helpers
+    from envd_service import agent_fileops, priv_helpers
+
+    client = agent_fileops.active()
+    if client is not None:
+        if sandbox_id is None:
+            raise priv_helpers.PrivHelperError(
+                "the C3 agent shape needs the sandbox id to remove a "
+                f"checkpoint image: {image} was not named by one"
+            )
+        client.remove_checkpoint(sandbox_id)
+        return
 
     priv_helpers.remove_tree(image)
 
@@ -633,7 +681,7 @@ def remove_checkpoint_images(
     store = sandbox_checkpoint_dir(workspace_base, sandbox_id, state_base=state_base)
     if not store.is_dir():
         return False
-    _remove_image(store)
+    _remove_image(store, sandbox_id=sandbox_id)
     return True
 
 
@@ -774,7 +822,7 @@ def consume_checkpoint_image(
     image = checkpoint_image_dir(workspace_base, sandbox_id, state_base=state_base)
     if not image.is_dir():
         return False
-    _remove_image(image)
+    _remove_image(image, sandbox_id=sandbox_id)
     return True
 
 

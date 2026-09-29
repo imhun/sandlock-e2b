@@ -91,3 +91,21 @@ def build_identity_reporter(
         )
 
     return _report
+
+
+def worker_identity_fields() -> dict[str, int]:
+    """The worker's own uid/gid, as the control-plane report spells them.
+
+    C3 Task 4: face B's file operations act *as* the worker in two places -- the
+    group a sandbox tree is handed to (``0770 owner=<sandbox uid> group=<worker
+    gid>``) and ``chown --worker`` for the slot documents -- so the control
+    plane has to know the identity. It takes it from its node record, which is
+    why this is reported on every register/heartbeat rather than read by the
+    agent from its own credentials (the agent is root; its own identity would
+    mean "hand the tree to root").
+
+    Reported, not *authorized*: the values are the worker's own process
+    identity, and hard rule 3 is about what a worker may **name** in a request
+    for a privileged step -- which is nothing.
+    """
+    return {"workerUID": os.geteuid(), "workerGID": os.getegid()}

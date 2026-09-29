@@ -363,6 +363,15 @@ class Settings:
     c3_agent_timeout_s: float = field(
         default_factory=lambda: _env_float("E2B_C3_AGENT_TIMEOUT_S", 5.0)
     )
+    #: Face B's deadline (Task 4). A teardown, a recursive chown or a tree walk
+    #: is bounded by the tree, not by a syscall: ``maint.c``'s own per-verb
+    #: budgets are 300 s (and its walk cap is larger), so the CP's wait has to
+    #: outlast them or a legitimate operation would be abandoned mid-flight --
+    #: which on this path is *not* harmless, because the instruction does not
+    #: stop when the CP stops waiting.
+    c3_agent_file_op_timeout_s: float = field(
+        default_factory=lambda: _env_float("E2B_C3_AGENT_FILE_OP_TIMEOUT_S", 600.0)
+    )
     #: How many CP→agent instructions may be in flight at once. ``0`` is
     #: unbounded; the shipped default is **64**, and the number is bounded on
     #: both sides rather than picked to taste (D16): it must be at least the
@@ -431,6 +440,18 @@ class Settings:
         return registry_host(self.image_registry)
     shared_volume_root: str | None = field(
         default_factory=lambda: os.getenv("E2B_SHARED_VOLUME_ROOT")
+    )
+    #: Route B's scratch root -- where the per-slot ``policy.json`` /
+    #: ``program.json`` documents live, and therefore the directory the C3
+    #: agent has to scope to each slot's uid (C3 Task 4's
+    #: ``scope-slot-document``). The *worker* names the same root with the same
+    #: variable (``E2B_ROUTE_B_TMP_ROOT``); the control plane has to know it
+    #: too, because the worker may not report a path (hard rule 3 / §14.4).
+    #: Unset means "this control plane cannot derive a slot document's path",
+    #: and that op then fails closed by name rather than guessing the worker's
+    #: layout -- the shipped manifests set it (Task 4 slice B).
+    route_b_tmp_root: str = field(
+        default_factory=lambda: os.getenv("E2B_ROUTE_B_TMP_ROOT", "")
     )
     # Tenant isolation (E3.1). When E2B_TENANTS is unset the control plane
     # runs in single-tenant compatible mode: all keys share every resource

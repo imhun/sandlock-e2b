@@ -2052,7 +2052,20 @@ class SandlockExecutor(Executor):
             # the tree over).
             identity = self._host_uid if self._per_sandbox_uid else None
             if identity is not None:
-                if os.geteuid() == 0:
+                from envd_service import agent_fileops
+
+                agent_client = agent_fileops.active()
+                if agent_client is not None:
+                    # C3 Task 4: the hand-over is the agent's step, asked for as
+                    # ``{sandbox_id, op}`` -- the secret path is derived from
+                    # the control plane's own settings there (hard rule 3).
+                    secret_sandbox_id = (
+                        self._sandbox_id
+                        if isinstance(self._sandbox_id, str)
+                        else Path(self._workspace_dir).name
+                    )
+                    agent_client.chown_secret(secret_sandbox_id, entry["name"])
+                elif os.geteuid() == 0:
                     with suppress(OSError):
                         os.chown(path, identity, -1)
                 else:

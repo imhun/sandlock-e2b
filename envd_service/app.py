@@ -293,12 +293,26 @@ def create_app(
     unavailable = priv_helpers.helpers_unavailable_reason(settings)
     if unavailable is not None:
         logger.warning("%s", unavailable)
+    from envd_service import agent_fileops
+
+    if agent_fileops.enabled(settings) and agent_fileops.active() is None:
+        # ``configure`` raises when the shape is asked for and cannot be wired;
+        # reaching here means ``E2B_PRIV_HELPERS=off`` and the agent shape were
+        # both configured, which cannot be one shape. Name it rather than
+        # silently keeping the privileged path (D18.1).
+        raise RuntimeError(
+            "E2B_PRIV_HELPER_TRANSPORT=agent cannot be combined with "
+            "E2B_PRIV_HELPERS=off: the worker has no way to perform its "
+            "privileged file steps"
+        )
     # E5.1: per-sandbox host uids need a privileged supervisor -- root /
     # CAP_SETUID + chown, or (Track F) the two file-capability brokers, which
     # are exactly how a non-root worker (uid 65534) gets those steps. Without
     # either, the switch is auto-disabled and the worker keeps the
     # fixed-identity + Landlock model instead of crash-looping on EPERM.
-    if settings.per_sandbox_uid and (os.geteuid() == 0 or brokers is not None):
+    if settings.per_sandbox_uid and (
+        os.geteuid() == 0 or priv_helpers.file_steps_available(settings)
+    ):
         # Fix round 1 (c1) hard guard: a sandbox tree is
         # `0770 owner=<sandbox uid> group=<worker gid>` and the worker is a
         # member of that group, so a sandbox allocated the worker's own uid or
@@ -371,8 +385,17 @@ def create_app(
         if (
             settings.per_sandbox_uid
             and settings.uid_reconcile_on_startup
-            and (os.geteuid() == 0 or priv_helpers.active_helpers() is not None)
+            and (os.geteuid() == 0 or priv_helpers.file_steps_available(settings))
             and runtime_registry.uid_pool is not None
+            # C3 Task 4 / Task 6: the worker's own orphan sweep *reclaims* trees
+            # (``chown --worker``) that it decided were ownerless -- exactly the
+            # authorization the new model removes (C3 §14.3's probe: any worker
+            # that can reclaim any tree can read it). In the agent shape the
+            # sweep does not run at all: the decision moves to the control plane
+            # (Task 6, "agent 巡检 → CP 决策 → agent 执行"). Until then an orphan
+            # tree stays on disk -- visible in the disk report -- rather than
+            # being handed to a worker with no right to take it.
+            and not agent_fileops.enabled(settings)
         ):
             uid_reconcile_task = asyncio.create_task(
                 _startup_uid_reconcile(runtime_registry.uid_pool)

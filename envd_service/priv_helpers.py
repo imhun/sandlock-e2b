@@ -122,7 +122,15 @@ HELPER_FILE_MODE = 0o750
 DEFAULT_BROKER_SOCKET = Path("/run/e2b-broker/broker.sock")
 BROKER_SOCKET_ENV = "E2B_PRIV_HELPER_SOCKET"
 TRANSPORT_ENV = "E2B_PRIV_HELPER_TRANSPORT"
-TRANSPORTS = ("auto", "exec", "socket")
+#: ``agent`` is C3's shape (Task 4): the maintenance verbs are not executed
+#: here at all -- every file operation travels to the control plane as
+#: ``{sandbox_id, op}`` and the agent executes it (hard rules 1/3, §14.4). It
+#: is a *shape*, not a transport in the argv sense: this module's argv builders
+#: and the file-capability binaries are simply not used in it, and
+#: :mod:`envd_service.agent_fileops` is the client instead.
+TRANSPORTS = ("auto", "exec", "socket", "agent")
+#: The transport value that selects the C3 shape.
+AGENT_TRANSPORT = "agent"
 
 #: The frozen wire version (Task 1's daemon and this side must agree on it).
 BROKER_PROTOCOL_VERSION = 1
@@ -1174,10 +1182,39 @@ _ACTIVE: list[PrivHelpers | None] = [None]
 
 
 def configure_priv_helpers(settings) -> PrivHelpers | None:
-    """Resolve + install the singleton the worker wires itself to."""
+    """Resolve + install the singleton the worker wires itself to.
+
+    Two singletons are resolved here, and exactly one of them is the live shape
+    (``E2B_PRIV_HELPER_TRANSPORT``): the file-capability brokers (``exec`` /
+    ``socket``) or C3's agent client (``agent``). ``agent`` installs **no**
+    ``PrivHelpers`` -- the argv builders and their binaries are not part of that
+    shape at all -- and :func:`file_steps_available` is what the call sites ask
+    instead of "are there brokers".
+    """
+    from envd_service import agent_fileops
+
+    if _transport_setting() == AGENT_TRANSPORT:
+        agent_fileops.configure(settings)
+        _ACTIVE[0] = None
+        return None
     helpers = resolve_priv_helpers(settings)
     _ACTIVE[0] = helpers
     return helpers
+
+
+def file_steps_available(settings=None) -> bool:
+    """Whether *some* shape can perform this worker's privileged file steps.
+
+    Either the file-capability brokers resolved (``auto``/``exec``/``socket``)
+    or C3's agent client did (``agent``). The call sites gate on this rather
+    than on :func:`active_helpers` alone: a worker in the agent shape has no
+    brokers and still has every step it needs -- routed elsewhere.
+    """
+    if _active() is not None:
+        return True
+    from envd_service import agent_fileops
+
+    return agent_fileops.active() is not None
 
 
 def active_helpers() -> PrivHelpers | None:
@@ -1330,7 +1367,15 @@ def helpers_unavailable_reason(settings) -> str | None:
 
     Only the "no brokers at all" case: a *partial* install is a deployment
     defect and fails closed in :func:`resolve_priv_helpers` instead.
+
+    C3's agent shape answers ``None``: a worker with no brokers is *not*
+    degraded there -- its privileged file steps are served by the agent -- so
+    the "keeping the in-process (E5.1) shape" warning would be wrong.
     """
+    from envd_service import agent_fileops
+
+    if agent_fileops.enabled(settings):
+        return None
     mode = str(getattr(settings, "priv_helpers", "auto") or "auto").lower()
     if mode == "off" or os.geteuid() == 0:
         return None
