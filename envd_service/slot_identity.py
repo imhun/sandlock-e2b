@@ -132,10 +132,34 @@ def _unshare_user_namespace() -> None:
 def _await_identity(
     uid: int, *, deadline_s: float, interval_s: float = POLL_INTERVAL_S
 ) -> bool:
-    """Poll ``setresuid(X)`` until the agent's mapping lands (or the deadline)."""
+    """Poll the identity until the agent's mapping lands (or the deadline).
+
+    **Both halves of the identity, and the gid half is not decoration.** A
+    slot's documents are ``owner=<worker>, group=X, mode 0440`` (``maint.c``'s
+    ``--worker`` form: the owner stays the worker so it can rewrite them, the
+    group moves to the slot), and ``sandlock-supervise`` reads ``policy.json``
+    before it does anything else -- so a child that took only the uid half
+    cannot start a slot at all: the read is ``EACCES``, the slot exits, and the
+    create fails with "policy read failed" (measured on the compose multinode
+    stack, 2026-09-29; the identity is set by ``as_uid``'s ``X X 1`` in
+    *both* maps, so the gid is mapped and settable).
+
+    The order is the one ``e2b-slot-spawn.c`` used (``setgid(X)`` then
+    ``setuid(X)``), with one deliberate difference: **no** ``setgroups``. The
+    agent's ``as_uid`` must write ``deny`` into ``/proc/<pid>/setgroups`` to be
+    allowed to write the gid map at all, and the kernel refuses ``setgroups``
+    for the rest of that namespace's life afterwards -- so the call would be an
+    ``EPERM`` the child could not recover from. The supplementary groups it
+    keeps are the worker's, which is what the old path started from too.
+
+    ``setresgid`` and ``setresuid`` are attempted together so a mapping that
+    lands one map at a time (``as_uid`` writes ``uid_map`` first) is retried as
+    a unit rather than half-applied.
+    """
     deadline = time.monotonic() + deadline_s
     while True:
         try:
+            os.setresgid(uid, uid, uid)
             os.setresuid(uid, uid, uid)
         except OSError:
             # EINVAL while the identity is unmapped, EPERM while the namespace

@@ -676,3 +676,67 @@ def test_the_agent_grant_pool_starts_the_child_with_the_unshare_helper(
     assert reports == [(SANDBOX_ID, CHILD_PID)]
     assert order == ["report", "stats"]
     assert handle.process.pid == CHILD_PID
+
+
+def test_the_child_takes_both_halves_of_its_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``setresgid(X)`` then ``setresuid(X)`` -- and never ``setgroups``.
+
+    The gid half is load-bearing on this path and has no witness anywhere else:
+    a slot's documents are ``owner=<worker>, group=X, mode 0440``
+    (``maint.c``'s ``--worker`` form) and ``sandlock-supervise`` opens
+    ``policy.json`` before it does anything else, so a child that took only the
+    uid half starts, cannot read its policy, and kills the create with "policy
+    read failed: Permission denied". Measured on the compose multinode stack
+    2026-09-29 through a real grant: ``Uid=10001 Gid=65534`` and not one of the
+    ``policy-<uid>.json`` probes readable; with the gid set, exactly the one
+    whose group is the slot's uid opens.
+
+    ``setgroups`` is pinned **absent** for the same reason it is absent in the
+    code: ``as_uid`` writes ``deny`` into ``/proc/<pid>/setgroups`` (it must, to
+    write the gid map unprivileged), and the kernel refuses ``setgroups`` for
+    the life of that namespace -- so a version that called it would hang on
+    EPERM and never reach the exec.
+
+    ``setresuid`` failing on the first attempt covers the other half of the
+    shape: ``as_uid`` writes ``uid_map`` before ``gid_map``, so a poll that sees
+    only the first must retry the pair rather than stop half-done.
+    """
+    calls: list[tuple[str, tuple[int, int, int]]] = []
+    attempts = {"uid": 0}
+
+    def _record(name: str):
+        def _call(real, want, extra) -> None:
+            calls.append((name, (real, want, extra)))
+
+        return _call
+
+    # ``raising=False``: ``setresgid``/``setresuid`` are Linux-only and this
+    # lane also runs on the macOS host -- what is under test is the *pair and
+    # the order*, not this platform's ``os``.
+    monkeypatch.setattr(
+        si.os, "setresgid", _record("setresgid"), raising=False
+    )
+
+    def _setresuid(real: int, want: int, extra: int) -> None:
+        calls.append(("setresuid", (real, want, extra)))
+        attempts["uid"] += 1
+        if attempts["uid"] == 1:
+            raise OSError(1, "not granted yet")
+
+    monkeypatch.setattr(si.os, "setresuid", _setresuid, raising=False)
+    monkeypatch.setattr(
+        si.os,
+        "setgroups",
+        lambda *_args: pytest.fail("the child must not call setgroups (deny)"),
+        raising=False,
+    )
+
+    assert si._await_identity(20001, deadline_s=1.0, interval_s=0.0) is True
+    assert calls == [
+        ("setresgid", (20001, 20001, 20001)),
+        ("setresuid", (20001, 20001, 20001)),
+        ("setresgid", (20001, 20001, 20001)),
+        ("setresuid", (20001, 20001, 20001)),
+    ]
