@@ -501,9 +501,18 @@ pod 里有一个 `runAsUser: 0` 的 `image-cache-init`，盘上 `_volumes` 是 *
 **⏳ 待部署窗口执行（判据 9：worker 崩溃不重启时盘上仍在 N 分钟内收敛）**：
 
 1. 先把 agent 滚上去（面 B 的新 env + NetworkPolicy），确认 `E2B_C3_AGENT_SCAN=on` 的那行启动日志
-   与 `c3-agent inventory:` 的周期行；若看到 `E2B_CONTROL_PLANE_URL is empty` 或
-   `the control plane refused the inventory report (status 403)`，先查 CNI 是否保留了源地址
-   （§11.1 第 9 项那两个前提）与 `E2B_C3_AGENT_TOKEN` 两边是否一致。
+   与 `c3-agent inventory:` 的周期行。**这一条要按下面三种失败分开读**（它们的修法不同）：
+   - `the control plane at http://control-plane:3000 is unreachable: … Name or service not known`
+     （或 `Temporary failure in name resolution`）⇒ **DNS 被出口策略挡了**。这条路径上 agent 主动发起的
+     出口只有两条：到 control-plane pod 的 3000，以及到 kube-system 集群 DNS 的 53（UDP+TCP）。
+     若集群 DNS 的 pod 标签不是标准的 `k8s-app: kube-dns`（例如换过发行版/改过 label），
+     就照它自己的 selector 改 `deploy/k8s/c3-agent.yaml` 的第 ② 条出口 —— **不要**改成放通全部出口。
+   - `… is unreachable: timed out`（解析没问题、连接不通）⇒ **策略或 Service 挡了**：先确认
+     NetworkPolicy 的第 ① 条与 `control-plane` Service 的 3000 端口，再看 CNI 是否在 agent 的节点上
+     真执行了 egress。
+   - `the control plane refused the inventory report (status 403)` ⇒ 凭据过了、**源 IP 不符**：查 CNI
+     是否保留了源地址（§11.1 第 9 项那两个前提）与 `E2B_C3_AGENT_TOKEN` 两边是否一致；
+     `401` 则是 token 不一致，`503` 是 CP 侧没配 agent 凭据或查不到这个节点的 agent。
 2. 造一棵"记录已不在、树还在"的孤儿（例如删掉 CP 记录后让 worker 停摆 / 直接造一棵无记录的
    `sbx_*` 树），**等 2–3 分钟**，断言树消失、CP 日志出现 `c3 self-heal: node=… removed the
    orphan tree …`。

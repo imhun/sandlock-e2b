@@ -168,14 +168,24 @@ services:
       # leaves the workers at the code default (10000/1000).
       E2B_UID_POOL_START: ${E2B_UID_POOL_START:-10000}
       E2B_UID_POOL_SIZE: ${E2B_UID_POOL_SIZE:-1000}
-      # C3 Task 6: the eyes, on face B (the container that mounts the
-      # workspaces). One agent per host, three workers on this host -- the
-      # report is ids only and the control plane decides.
-      E2B_C3_AGENT_SCAN: "on"
-      E2B_CONTROL_PLANE_URL: http://control-plane:3000
-      E2B_C3_AGENT_SCAN_INITIAL_DELAY_S: "30"
-      E2B_C3_AGENT_SCAN_INTERVAL_S: "120"
-      E2B_C3_AGENT_SCAN_BACKOFF_MAX_S: "600"
+      # C3 Task 6 (the self-heal scan) is **deliberately absent** here.
+      #
+      # This stack defines no Redis, so its control plane has no shared record
+      # store (`_record_store is None`) -- and the sweep's first gate is exactly
+      # that: a *process-local* record set cannot certify "no record anywhere
+      # claims this tree", which is the one shape that would delete live trees
+      # after a restart. Turning the scan on here would therefore report every
+      # 120s and be deferred every time: log noise that looks like self-healing.
+      #
+      # Trigger to enable it: give this stack a record store (the `redis`
+      # service `deploy/compose/docker-compose.prod.yml` and
+      # `deploy/stack/docker-compose.prod.yml` already carry, wired through
+      # `E2B_REDIS_URL`), then add the same four variables face B carries in
+      # those two files. Recorded in the Task 6 report's compose accounting.
+      #
+      # The pin that keeps this honest (both directions) is
+      # `tests/unit/test_c3_agent_manifest.py`: a stack whose control plane has
+      # no store may not enable the scan, and a stack that has one must.
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
     restart: unless-stopped

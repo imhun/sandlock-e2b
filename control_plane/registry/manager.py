@@ -1996,6 +1996,17 @@ class SandboxRegistry:
           tree. Counting them is what lets the caller defer instead.
 
         A tombstoned entry is not an unreadable one: "deleted" is an answer.
+
+        ⚠ **Why the two are told apart, and why the counter has to exist**
+        (do not "simplify" this into one ``if payload is None: continue``): a
+        record the store *lists* but cannot *answer* is invisible to the count
+        surface as well -- ``list()``/``_iter_stored_records`` skip it too, so
+        the sweep's id-count comparison against ``activeSandboxes`` cannot see
+        it (both sides are short by the same one). The only thing that can is
+        this counter. A tombstone, by contrast, is a *deletion* the store is
+        reporting correctly: it is absent from both surfaces on purpose, and
+        treating it as unreadable would defer the sweep forever on any
+        deployment that ever deleted a sandbox.
         """
         if self._record_store is None:
             with self._lock:

@@ -885,7 +885,13 @@ async def agent_inventory(node_id: str, request: Request) -> dict[str, Any]:
     refusal is 400/401/403/503, and a removal that the agent refused is
     reported in ``failed`` -- never as a removal that happened.
     """
-    target = _require_agent_identity(request, node_id)
+    # The identity step is a k8s pod listing (or a ``getaddrinfo`` in the
+    # compose lane) plus the source-IP compare: blocking I/O, so it runs off the
+    # event loop, the same discipline the path derivation below follows (a stall
+    # here stalls every sandbox API on this replica -- I-2 / the fourth review's
+    # ``/metrics`` lesson). The headers and app state it reads are immutable
+    # context, so a thread is safe.
+    target = await asyncio.to_thread(_require_agent_identity, request, node_id)
     try:
         body = await request.json()
     except json.JSONDecodeError:

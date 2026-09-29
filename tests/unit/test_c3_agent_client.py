@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import socket
 
 import httpx
 import pytest
@@ -227,6 +229,180 @@ def test_an_unconfigured_compose_agent_refuses_to_resolve() -> None:
     """A shape that has not named an agent has none -- fail closed, never guess."""
     assert ComposeAgentAddressResolver("").resolve(NODE) is None
     assert ComposeAgentAddressResolver(None).resolve(NODE) is None
+
+
+# ------------------------------ finding the agent by its own host (C3 Task 6)
+
+
+def test_a_node_whose_worker_pod_is_gone_still_resolves_its_agent() -> None:
+    """The sweep's reason to exist: no worker pod, and the agent still found.
+
+    ``resolve`` (worker-keyed) cannot answer that question -- it reads the
+    worker pod first, so a worker that crashed and never came back would make
+    its node unaddressable. The self-heal report is addressed by the **host**,
+    so the lookup goes to the agent pods themselves (their own label plus
+    ``fieldSelector spec.nodeName=<host>``). That the worker pod was never read
+    is asserted below, not just described: a lookup that fell back to it would
+    answer ``None`` here.
+    """
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if "/pods/" in request.url.path:
+            # The worker pod is *gone*: anything that reads it can only fail.
+            return httpx.Response(404, json={"kind": "Status", "code": 404})
+        assert dict(request.url.params)["fieldSelector"] == f"spec.nodeName={HOST}"
+        assert dict(request.url.params)["labelSelector"] == AGENT_LABEL
+        return httpx.Response(
+            200,
+            json=_pod_list(
+                _pod(
+                    "c3-agent-abc",
+                    uid="11111111-2222-3333-4444-555555555555",
+                    pod_ip=AGENT_IP,
+                )
+            ),
+        )
+
+    target = _k8s_resolver(handler).resolve_host(HOST)
+    assert target == AgentTarget(
+        node_identity=HOST,
+        url=f"http://{AGENT_IP}:49985",
+        # No worker pod is involved, so there is no worker pod UID to carry:
+        # `grant-slot`'s reverse lookup is that proof's only consumer.
+        pod_uid=None,
+        maint_url=f"http://{AGENT_IP}:49986",
+        source_ips=(AGENT_IP,),
+    )
+    assert seen == [
+        f"https://kubernetes.default.svc/api/v1/namespaces/{NAMESPACE}/pods"
+        f"?labelSelector=app%3Dc3-agent&fieldSelector=spec.nodeName%3D{HOST}"
+    ]
+
+
+def test_two_agent_pods_on_one_node_are_a_named_refusal(caplog) -> None:
+    """A stale DaemonSet revision is ambiguity, never a coin flip."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_pod_list(
+                _pod("c3-agent-a", pod_ip=AGENT_IP),
+                _pod("c3-agent-b", pod_ip="10.244.1.8"),
+            ),
+        )
+
+    with caplog.at_level(logging.WARNING, logger="control_plane.c3_agent_client"):
+        assert _k8s_resolver(handler).resolve_host(HOST) is None
+    assert [
+        record.message
+        for record in caplog.records
+        if record.name == "control_plane.c3_agent_client"
+    ] == [
+        f"c3 agent lookup: host {HOST} has 2 agent pods with an address; "
+        "refusing (fail closed)"
+    ]
+
+
+def test_the_compose_lane_resolves_its_own_host_and_nothing_else(monkeypatch) -> None:
+    """The claim must name the configured agent; DNS supplies the source IPs."""
+
+    def fake_getaddrinfo(host, *args, **kwargs):
+        assert host == "c3-agent"
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.44.0.7", 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fe80::1", 0, 0, 0)),
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    resolver = ComposeAgentAddressResolver(
+        "http://c3-agent:49985", "http://c3-agent-maint:49986"
+    )
+    assert resolver.resolve_host("c3-agent") == AgentTarget(
+        node_identity="c3-agent",
+        url="http://c3-agent:49985",
+        pod_uid=None,
+        maint_url="http://c3-agent-maint:49986",
+        source_ips=("10.44.0.7", "fe80::1"),
+    )
+    # Any other host: this lane names exactly one agent, so it answers for no
+    # one else (fail closed -- "probably that one" is how a lying report would
+    # get in).
+    assert resolver.resolve_host("some-other-host") is None
+
+
+def test_resolve_agent_is_fail_closed_at_every_way_it_can_fail() -> None:
+    """``resolve_agent`` (Task 6) has four named refusals and no fifth branch."""
+    target = AgentTarget(
+        node_identity=HOST,
+        url="http://agent:49985",
+        maint_url="http://agent:49986",
+        source_ips=(AGENT_IP,),
+    )
+    client = C3AgentClient(
+        resolver=StaticAgentAddressResolver({HOST: target}),
+        token=TOKEN,
+        timeout_s=1.0,
+    )
+    assert client.resolve_agent(HOST) == target
+
+    with pytest.raises(AgentClientError) as unknown:
+        client.resolve_agent("k0s-worker-9")
+    assert (unknown.value.status_code, str(unknown.value)) == (
+        503,
+        "cannot determine the address of the agent for node k0s-worker-9: "
+        "refusing (fail closed)",
+    )
+
+    class _Mismatched:
+        """A resolver that answers for the wrong host (a broken implementation)."""
+
+        def resolve(self, node_id: str) -> AgentTarget | None:
+            return None
+
+        def resolve_host(self, node_identity: str) -> AgentTarget | None:
+            return AgentTarget(node_identity="other-host", url="http://agent:49985")
+
+    with pytest.raises(AgentClientError) as mismatch:
+        C3AgentClient(
+            resolver=_Mismatched(), token=TOKEN, timeout_s=1.0
+        ).resolve_agent(HOST)
+    assert (mismatch.value.status_code, str(mismatch.value)) == (
+        503,
+        f"the agent lookup for node {HOST} answered for other-host: refusing",
+    )
+
+    with pytest.raises(AgentClientError) as unauthenticated:
+        C3AgentClient(
+            resolver=StaticAgentAddressResolver({HOST: target}),
+            token="",
+            timeout_s=1.0,
+        ).resolve_agent(HOST)
+    assert (unauthenticated.value.status_code, str(unauthenticated.value)) == (
+        503,
+        "E2B_C3_AGENT_TOKEN is not configured: refusing to instruct an agent",
+    )
+
+    # An agent with no face-B address cannot be asked to remove anything: the
+    # refusal names the knob, and it happens before any HTTP call.
+    face_a_only = C3AgentClient(
+        resolver=StaticAgentAddressResolver(
+            {HOST: AgentTarget(node_identity=HOST, url="http://agent:49985")}
+        ),
+        token=TOKEN,
+        timeout_s=1.0,
+    )
+    with pytest.raises(AgentClientError) as no_maint:
+        asyncio.run(
+            face_a_only.rm(node_id=HOST, sandbox_id="sbx_x", path=WORKSPACE)
+        )
+    assert (no_maint.value.status_code, str(no_maint.value)) == (
+        503,
+        f"cannot determine the file-operation agent address for node {HOST} "
+        "(E2B_C3_AGENT_MAINT_URL / E2B_C3_AGENT_MAINT_PORT): refusing to "
+        "instruct an agent the control plane cannot locate",
+    )
 
 
 def test_the_resolver_follows_the_deployments_address_mode(monkeypatch) -> None:

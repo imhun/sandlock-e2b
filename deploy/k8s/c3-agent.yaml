@@ -453,10 +453,10 @@ spec:
         - protocol: TCP
           port: 49986
   egress:
-    # C3 Task 6：巡检上报是 agent 主动发起的**唯一**连接，出口就写这一条。
-    # 端口是 control-plane Service 的 3000（`E2B_CONTROL_PLANE_URL` 指向的
-    # 就是它）；目的地只写 pod selector，不写 IP/DNS —— 它是 pod 级策略，
-    # 所以 agent 仍然够不到任何别的东西。
+    # C3 Task 6：巡检上报是 agent 主动发起的**唯一**连接，出口就写这两条。
+    #
+    # ① 目的地 = control-plane pod 的 3000 端口（`E2B_CONTROL_PLANE_URL` 指向的
+    #    那个 Service 解析出来的就是它）；只写 pod selector，不写 IP/DNS。
     - to:
         - podSelector:
             matchLabels:
@@ -464,3 +464,26 @@ spec:
       ports:
         - protocol: TCP
           port: 3000
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # ② **集群 DNS**。那个 URL 写的是 Service 名（`http://control-plane:3000`），
+    #    而这个 pod 没有 hostAliases / dnsConfig，也不在宿主网络命名空间里 ——
+    #    k8s 的**出口隔离是"列出即放行、其余全丢"**，所以只写 ① 的话 agent 连名字都解析不了：
+    #    上报会以 `the control plane at http://control-plane:3000 is unreachable`
+    #    永远重试，整个特性在 k8s 上静默失效。这是**被评审抓到的**一条阻断面，
+    #    不是顺手加宽：仍然只到 kube-system 里的集群 DNS pod、只到 53（UDP+TCP，
+    #    两者都要 —— 解析走 UDP，截断后的重试走 TCP）。
+    #
+    #    selector 用的是集群 DNS 的标准标签（`k8s-app: kube-dns`，CoreDNS 的
+    #    Deployment 也带它）。换过标签的集群要照它自己的改 —— 症状与 `deploy-clusters.md`
+    #    §7.8 第 1 步写的"解析失败"一致；改完把这条选择器同步过来即可。

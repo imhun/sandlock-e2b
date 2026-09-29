@@ -283,16 +283,46 @@ def test_the_agents_new_egress_is_one_narrow_named_rule() -> None:
 
     The agent is the eyes: it reports the trees it can see to the control plane
     (``POST /internal/nodes/<host>/agent/inventory``). The property that must not
-    quietly change is the *shape* of that new freedom -- one destination (the
-    control-plane pods), one port (3000, the Service the manifest points
-    ``E2B_CONTROL_PLANE_URL`` at), no IPs, no DNS, nothing else. A wildcard
-    egress rule would be the silent regression this pin exists for.
+    quietly change is the *shape* of that new freedom, and it is two clauses:
+
+    * the control-plane pods on 3000 (the Service ``E2B_CONTROL_PLANE_URL``
+      points at), and
+    * **cluster DNS** (UDP+TCP 53, ``kube-system``/``k8s-app: kube-dns``).
+
+    The second one is load-bearing, not decoration: the URL carries a Service
+    *name*, this pod has no ``hostAliases``/``dnsConfig``/``hostNetwork``, and
+    k8s egress isolation drops everything not listed -- including the resolver.
+    Drop the DNS clause and the feature is dead on any CNI that enforces the
+    ingress half this design relies on (measured review finding: the scan would
+    report ``the control plane ... is unreachable`` forever).
+
+    A wildcard egress rule would be the silent regression this pin exists for;
+    so would dropping the DNS clause, which is why the whole rule set is
+    asserted verbatim rather than "contains the control plane".
     """
     policy = _only(_load_all(AGENT_MANIFEST), "NetworkPolicy", "e2b-c3-agent")
     assert policy["spec"]["egress"] == [
         {
             "to": [{"podSelector": {"matchLabels": CONTROL_PLANE_LABEL}}],
             "ports": [{"protocol": "TCP", "port": 3000}],
+        },
+        {
+            # Both selectors in one entry: they AND together, so this names the
+            # cluster's DNS pods, not "anything in kube-system" and not "any
+            # pod labelled kube-dns".
+            "to": [
+                {
+                    "namespaceSelector": {
+                        "matchLabels": {"kubernetes.io/metadata.name": "kube-system"}
+                    },
+                    "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+                }
+            ],
+            # UDP is the query path; TCP is what a truncated answer retries over.
+            "ports": [
+                {"protocol": "UDP", "port": 53},
+                {"protocol": "TCP", "port": 53},
+            ],
         }
     ]
 
@@ -561,6 +591,18 @@ def test_each_compose_stack_runs_exactly_one_agent_facing_the_control_plane() ->
         # workspaces scans, and it reports to the control plane's own name.
         assert "E2B_C3_AGENT_SCAN" not in env
         assert "E2B_CONTROL_PLANE_URL" not in env
+        if path == COMPOSE_MULTINODE:
+            # This stack has no Redis, i.e. no shared record store -- and leg (a)
+            # of the staleness gate makes the sweep inert in that shape by
+            # design. Enabling the scan here would defer on every round (log
+            # noise that looks like self-healing), so the honest state is "off,
+            # with the trigger written down in the manifest". The pin checks the
+            # premise, not the spelling: no store, no scan.
+            assert "redis" not in compose["services"]
+            assert "E2B_REDIS_URL" not in _compose_env(compose["services"]["control-plane"])
+            assert "E2B_C3_AGENT_SCAN" not in b_env
+            assert "E2B_CONTROL_PLANE_URL" not in b_env
+            continue
         assert b_env["E2B_C3_AGENT_SCAN"] == "on"
         assert b_env["E2B_CONTROL_PLANE_URL"] in (
             "http://control-plane:3000",
