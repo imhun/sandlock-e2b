@@ -91,8 +91,9 @@ C3 的 `e2b-c3-agent` DaemonSet 与 broker 同一处境：它**不在**这张 ov
 **Task 4 片 B 后**，这个 DaemonSet 的两个容器都有载荷（面 A 是身份授予、面 B 是文件操作），
 它们用**两个端口**（49985/49986，D22 —— 两个进程的 uid 必须不同，共享 pod netns 下同端口会
 `EADDRINUSE`），NetworkPolicy 也从一条端口列表扩成两条。同一片还让** worker 显式 pin
-`runAsUser`/`runAsGroup: 65534`（CP 的可信身份来源读的就是 pod spec），并把 C1 的
-`e2b-priv-broker` 改跑 **agent 镜像**（`e2b-maint` 不再在 worker 镜像里）。
+`runAsUser`/`runAsGroup: 65534`（CP 的可信身份来源读的就是 pod spec）。**C3 Task 7** 之后它是这台
+节点上**唯一**的特权组件：C1 的 `e2b-priv-broker` 退役，它的两个属主 init 也搬进了这个 pod
+（`storage-init` + `workspace-root-init`，都 `runAsUser: 0`）。
 
 * `E2B_IMAGE_CACHE_DIR=/var/lib/e2b-images` —— **解出来的 rootfs**，`hostPath` 节点本地。解到共享卷上
   要 61.4 秒、解到本地盘 0.26 秒（同一份 python-slim rootfs，2111 个文件，2026-09-17 实测）。
@@ -233,12 +234,14 @@ control-plane 的 `:3000`，与基线那个 ClusterIP `gateway` 同一个后端�
 * **worker pod 里没有任何 root 容器**（C1 wave 2，2026-09-27；**C3 Task 4 片 B，2026-09-29 再收敛**）：
   worker 容器**显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（C3 的 CP 从 pod spec 取"这个
   worker 是谁"的可信答案），**没有任何 cap 声明**（BND 空集 —— 镜像里的 file-capability 二进制已
-  移出，见判据 2/15），唯一的 initContainer 是**非 root** 的 `wait-for-broker`（保留到 Task 7，
-  与 `E2B_PRIV_HELPER_SOCKET` 一起构成 `socket` 回退）。网络文件系统的 chown 确实只有 euid 0
+  移出，见判据 2/15），**也没有任何 initContainer**（C3 Task 7 把唯一的那个非 root
+  `wait-for-broker` 闸门与它服务的 `socket` 回退一起退役了）。网络文件系统的 chown 确实只有 euid 0
   做得到，但那个 euid 0 现在在 **`e2b-c3-agent` DaemonSet 的面 B**（基线；听 49986）里 —— worker
   通过 `E2B_PRIV_HELPER_TRANSPORT=agent` 把 `chown`/`rm`/`walk` 交给 CP，再由 CP 指令它；
-  C1 的 **`e2b-priv-broker`** DaemonSet 仍在基线里（保留到 Task 7，跑 agent 镜像），
-  它是 `socket` 回退的另一半。
+  C1 的 **`e2b-priv-broker`** DaemonSet **已由 C3 Task 7 退役**（连同 `E2B_PRIV_HELPER_SOCKET`、
+  worker 的 `wait-for-broker` 闸门与 `apply.sh` 的 broker rollout 闸门）；它原来的两个属主 init
+  搬进了 agent pod（`storage-init` + `workspace-root-init`），见
+  `docs/deploy-clusters.md` §7.9 与 `docs/production-deployment-requirements.md` §5.4(b)。
   * 历史口径（已作废，留档）：此前 worker 自己 `runAsUser: 0`、`runAsGroup: 65534` 读挂载上的树，
     会打 `E2B_PER_SANDBOX_UID … without CAP_SYS_PTRACE` 的告警，非 route-B 路径的模板沙箱可能
     因此受影响（见 backlog N18）；route B 与 per-sandbox host uid 在两种 transport 下都成立。
