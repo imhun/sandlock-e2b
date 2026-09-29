@@ -39,6 +39,10 @@ def verify_internal_key(provided: str | None, settings) -> bool:
     legacy single ``internal_api_key`` is the only credential. Workers and
     the gateway accept the same list, so a deploy can add the new key,
     roll the fleet, then drop the old key from the list.
+
+    ⚠ This proves "you are one of the components", **not** "you are worker-1":
+    the list is fleet-wide (N49). The per-node binding is
+    :func:`node_id_for_key`; a handler that acts for a node must consult it too.
     """
     if provided is None:
         return False
@@ -49,7 +53,70 @@ def verify_internal_key(provided: str | None, settings) -> bool:
         )
     if not keys:
         return False
-    return any(secrets.compare_digest(provided, key) for key in keys)
+    return any(_keys_match(provided, key) for key in keys)
+
+
+def verify_agent_key(provided: str | None, settings) -> bool:
+    """The C3 agent's **own** credential (``E2B_C3_AGENT_TOKEN``), and only that.
+
+    C3 Task 6 adds one direction this credential had never been used for: the
+    agent reports what it sees on the disk
+    (``POST /internal/nodes/{host}/agent/inventory``). It is deliberately *not*
+    added to :attr:`Settings.all_internal_api_keys` -- that list authenticates
+    every internal surface (register, heartbeat, reconcile, file-op, fleet
+    views), and an agent token that opened those would turn one compromised
+    agent into a fleet-wide internal credential. So the agent credential is
+    checked here, by name, on the surfaces that are the agent's.
+
+    ``False`` also means "nothing to compare against": a shape that names no
+    agent token cannot authenticate a report at all, and the caller says so
+    (a 503, not a 401 -- "not configured" and "wrong key" are different
+    deployment problems).
+    """
+    expected = getattr(settings, "c3_agent_token", "") or ""
+    if not expected or provided is None:
+        return False
+    return _keys_match(provided, expected)
+
+
+def _keys_match(provided: str, expected: str) -> bool:
+    """Constant-time compare that treats a non-ASCII header as a mismatch.
+
+    ``secrets.compare_digest`` raises ``TypeError`` for a ``str`` outside the
+    ASCII range (the constant-time path only exists for ASCII/bytes). A header
+    is attacker-controlled bytes decoded as latin-1, so a non-ASCII
+    ``X-Internal-Key`` used to turn "wrong credential" into a 500. It is a
+    mismatch, and nothing else.
+    """
+    try:
+        return secrets.compare_digest(provided, expected)
+    except TypeError:
+        return False
+
+
+def node_id_for_key(provided: str | None, settings) -> str | None:
+    """The node a credential is bound to, or ``None`` for a fleet credential.
+
+    C3 Task 2 / N49: this is step 1 of the internal API's three-step validation
+    -- the **only** trusted source of a caller's identity. The binding is
+    configuration (``E2B_INTERNAL_NODE_KEYS``), never the request: a mapping
+    learned from the request would let an attacker re-pin a node's credential to
+    themselves, which is exactly the hole the source-IP second factor exists to
+    close (``docs/c3-privilege-relocation.md`` §11.1 item 9 premise (a)).
+
+    ``None`` means the key carries no node identity (the legacy fleet key);
+    callers must make that path explicit and named, never treat it as "node
+    unknown, so allow anything". Compared in constant time so a timing oracle
+    cannot recover which keys are node-bound.
+    """
+    if provided is None:
+        return None
+    mapping = getattr(settings, "internal_node_keys", None) or {}
+    matched: str | None = None
+    for key, node_id in mapping.items():
+        if _keys_match(provided, key):
+            matched = node_id
+    return matched
 
 
 def tenant_of(request: Request) -> tuple[str | None, bool]:

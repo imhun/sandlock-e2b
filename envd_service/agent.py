@@ -13,12 +13,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote
-
 import httpx
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from envd_service.agent_fileops import AgentFileOpsError
 from envd_service.config import Settings
 from envd_service.executors.factory import (
     sandlock_failure_detail,
@@ -44,6 +43,11 @@ from envd_service.runtime.context import mcp_port_stats as _mcp_port_stats
 from envd_service.uid_pool import (
     align_shared_uid_workspace,
     apply_sandbox_ownership,
+)
+from envd_service.worker_identity import (
+    reported_container_id,
+    worker_identity_fields,
+    worker_pid_namespace,
 )
 from envd_service.xfs_quota import (
     ProjectDirectoryGone,
@@ -80,6 +84,98 @@ router = APIRouter()
 #: times instead of leaving the entry to manual review.
 _QUOTA_RECLAIM_ATTEMPTS = 3
 _QUOTA_RECLAIM_DELAY_S = 0.5
+
+
+def _agent_fileops():
+    """The C3 file-operation client, or ``None`` in every other shape.
+
+    One helper for the call sites that were broker-first before Task 4: in the
+    agent shape every privileged file step is asked of the control plane as
+    ``{sandbox_id, op}`` (no path and no uid -- hard rules 1/3), and in every
+    other shape this is ``None`` and the pre-C3 path runs unchanged.
+    """
+    from envd_service import agent_fileops
+
+    return agent_fileops.active()
+
+
+def _lexists(path: Path) -> bool:
+    """``True`` for anything on that path, including a dangling symlink."""
+    return path.exists() or path.is_symlink()
+
+
+def _remove_agent_half(
+    client,
+    sandbox_id: str,
+    *,
+    path: Path,
+    op: str,
+    what: str,
+) -> None:
+    """Remove one half of a teardown through the agent, idempotently (D19).
+
+    ``e2b-maint rm`` hard-refuses a path that is not there (``realpath`` →
+    NULL), while a *teardown* has to stay idempotent: the control plane retries
+    deletes, and a sandbox that never materialised its runtime directory has
+    nothing to remove in the first place. So "already absent" is **success** --
+    said out loud in the log, never inferred -- and everything else is
+    fail-closed and named:
+
+    * a refusal that leaves the path in place (a permission or IO error) is
+      re-raised as :class:`SandboxTreeNotRemoved`, so the endpoint answers 500
+      with the reason instead of a 204 that makes the control plane drop the
+      record of a tree still on the disk;
+    * the post-check is the disk's answer, not the agent's: a return that
+      leaves the path behind is a failure too.
+
+    The re-check after a refusal also covers the race where the path disappears
+    between the pre-check and the agent's ``rm`` -- the one case where the
+    refusal is correct about the mechanism and wrong about the outcome.
+
+    ⚠ **Recorded narrowness** (C3 Task 4 second review, N5): the absence this
+    checks is the *worker's* path, while the removal the agent performs is on
+    the path the *control plane* derived. A deployment whose two bases disagree
+    (``E2B_WORKSPACE_BASE``/``E2B_STATE_BASE`` named differently on the CP and
+    the worker) could therefore report success here while the tree still exists
+    where the CP looks. It is not a security hole -- the CP's derivation is
+    still the one that is (not) executed -- and a divergence of that kind is
+    already visible elsewhere (the disk report never sees the tree the worker
+    measures, and the sandbox's own files disappear from every API). Recording
+    it rather than adding a second round trip per teardown; the final review may
+    want a config-agreement check at registration instead.
+    """
+    if not _lexists(path):
+        logger.info(
+            "agent delete %s: the %s of %s is already absent; nothing to remove",
+            sandbox_id,
+            what,
+            sandbox_id,
+        )
+        return
+    try:
+        getattr(client, op)(sandbox_id)
+    except Exception as exc:
+        if not _lexists(path):
+            logger.info(
+                "agent delete %s: the %s of %s was already absent (%s: %s); "
+                "nothing to remove",
+                sandbox_id,
+                what,
+                sandbox_id,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        raise SandboxTreeNotRemoved(
+            f"the {what} of {sandbox_id} could not be removed ({path}): "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if _lexists(path):
+        raise SandboxTreeNotRemoved(
+            f"the {what} of {sandbox_id} survived its teardown: {path} is "
+            "still on disk"
+        )
+
 
 #: A disk sweep that had to be deferred because the fleet's records could not
 #: all be enumerated is retried on later heartbeats: doubling, capped, so a
@@ -169,9 +265,17 @@ def _node_type() -> str:
     return "physical"
 
 
-def _register_payload(settings: Settings) -> dict[str, Any]:
-    return {
-        "nodeID": os.getenv("E2B_NODE_ID"),
+def _register_payload(
+    settings: Settings, node_id: str | None = None
+) -> dict[str, Any]:
+    """The registration/heartbeat payload.
+
+    ``node_id`` lets an embedder (the test harness) declare a stable node id
+    instead of relying on ``E2B_NODE_ID`` in the process environment; production
+    leaves it ``None`` and reads the env, exactly as before.
+    """
+    payload = {
+        "nodeID": node_id or os.getenv("E2B_NODE_ID"),
         "address": os.getenv("E2B_NODE_ADDRESS"),
         "images": [i for i in (settings.base_image,) if i],
         "labels": {
@@ -179,6 +283,37 @@ def _register_payload(settings: Settings) -> dict[str, Any]:
         },
         **_node_resources(settings),
     }
+    # C3 Task 3 (ruling D9.3): the worker's own pid namespace identity. The
+    # control plane stores it and hands it to the agent, which is what makes the
+    # container-pid → host-pid lookup unambiguous when one host runs several
+    # workers. Absent on a platform without ``/proc/self/ns/pid`` (a macOS dev
+    # box): the control plane then refuses grants for this node by name instead
+    # of matching on the pid alone.
+    pid_namespace = worker_pid_namespace()
+    if pid_namespace:
+        payload["pidNamespace"] = pid_namespace
+    # C3 Task 4 / ruling D25: the container identity the *file operations*'
+    # anchor is matched against -- the worker's hostname, which the runtime sets
+    # to (a prefix of) the container id and which the agent can find in the
+    # worker's host-side cgroup path (world-readable; face B needs no
+    # ``CAP_SYS_PTRACE`` and no uid change to read that). Absent when this
+    # platform has no container identity, or when a deployment overrode
+    # ``hostname:`` -- the control plane then refuses those operations by name.
+    #
+    # F2: reported only by the shape whose anchor it *is* (compose). The k8s
+    # lane verifies the worker's identity from the pod spec, so its worker skips
+    # the probe -- its pod-name hostname can never be a container id, and
+    # warning about that told the operator a falsehood ("every C3 file operation
+    # will be refused") about a node where they all succeed.
+    container_id = reported_container_id()
+    if container_id:
+        payload["containerID"] = container_id
+    # C3 Task 4: the worker's own uid/gid, for the same reason (and on the same
+    # path): the agent's file operations need the identity a tree's group and
+    # ``--worker`` refer to, and the control plane may only take it from its own
+    # records (hard rule 3).
+    payload.update(worker_identity_fields())
+    return payload
 
 
 def _disk_enforce_interval_s() -> float:
@@ -252,7 +387,8 @@ def _measure_platform_account(workspace_base, state_base=None) -> dict[str, int]
     Two numbers, because a budget without its usage says nothing and usage
     without a budget reads as "unlimited". ``0`` for the budget is the honest
     encoding of unlimited (``E2B_PLATFORM_DISK_MB`` defaults to it), not a
-    missing value.
+    missing value. An *unmeasurable* usage is the other case and is **omitted**
+    (see below): a missing usage field is "no update", a 0 would be a claim.
     """
     from envd_service.runtime.platform_disk import (
         measure_platform_disk_bytes,
@@ -261,10 +397,16 @@ def _measure_platform_account(workspace_base, state_base=None) -> dict[str, int]
 
     used = measure_platform_disk_bytes(workspace_base, state_base=state_base)
     budget = platform_budget_bytes()
-    return {
-        "platformDiskUsedMB": used // _MIB,
-        "platformDiskBudgetMB": budget // _MIB,
-    }
+    payload = {"platformDiskBudgetMB": budget // _MIB}
+    if used is not None:
+        payload["platformDiskUsedMB"] = used // _MIB
+    # When the account could not be measured the key is **omitted**, not sent as
+    # 0 (C3 Task 4 third review, I-3): the control plane's ``update_usage``
+    # treats a missing field as "no update" and keeps the number it already has,
+    # while a 0 would assert "the platform stores nothing" -- the fail-open this
+    # account exists to prevent. The worker-side reason is logged by
+    # ``platform_disk`` where the unreadable tree is named.
+    return payload
 
 
 def _heartbeat_usage_payload(
@@ -274,9 +416,31 @@ def _heartbeat_usage_payload(
     port_provider: Callable[[], dict[str, int]] | None = None,
     disk_report: dict[str, int] | None = None,
     platform_disk: dict[str, int] | None = None,
+    pid_namespace: str | None = None,
+    worker_identity: dict[str, int] | None = None,
+    container_id: str | None = None,
 ) -> dict[str, Any]:
     """Disk usage + quota alerts + MCP port band carried by each heartbeat."""
     payload: dict[str, Any] = {}
+    if pid_namespace:
+        # C3 Task 3: refreshed with every heartbeat, because a restarted worker
+        # container is a *new* pid namespace under the same node id -- without
+        # this the control plane would keep handing the agent the dead inode and
+        # every slot grant on this node would be refused until it was forgotten
+        # (the "node pinned" failure mode §11.1 item 9 warns about).
+        payload["pidNamespace"] = pid_namespace
+    if worker_identity:
+        # C3 Task 4: refreshed with every heartbeat, exactly as the pid
+        # namespace is -- a restart under a different ``runAsGroup`` is a new
+        # gid under the same node id, and a stale one would put sandbox trees in
+        # a group the worker does not have.
+        payload.update(worker_identity)
+    if container_id:
+        # D25: refreshed with every heartbeat for the same reason the pid
+        # namespace is -- a recreated worker container is a *new* container id
+        # under the same node id, and a stale one would make the agent match a
+        # cgroup that no longer exists (every file operation refused by name).
+        payload["containerID"] = container_id
     try:
         usage = shutil.disk_usage(settings.workspace_base)
         payload["diskUsedMB"] = usage.used // (1024 * 1024)
@@ -1352,7 +1516,26 @@ def _delete_sandbox_runtime(
         # broker is the fallback; when even it cannot remove the tree, the
         # caller has to see a failure rather than a 204.
         try:
-            priv_helpers.remove_tree(workspace_dir, on_error="raise")
+            agent_fileops_client = _agent_fileops()
+            if agent_fileops_client is not None:
+                # C3 Task 4: in the agent shape the removal is the agent's
+                # (``e2b-maint rm`` over the tree the control plane derived
+                # from the same records). The worker asks with
+                # ``{sandbox_id, op}`` -- no path -- and the disk's own answer
+                # decides (including "already absent" = success, D19).
+                _remove_agent_half(
+                    agent_fileops_client,
+                    sandbox_id,
+                    path=workspace_dir,
+                    op="remove_workspace",
+                    what="tree",
+                )
+            else:
+                priv_helpers.remove_tree(workspace_dir, on_error="raise")
+        except SandboxTreeNotRemoved:
+            # Already named by the helper: re-wrap below would only hide the
+            # reason behind a second layer of the same sentence.
+            raise
         except Exception as exc:
             # The in-process ``rmtree`` failed *and* the brokers were absent,
             # refused, or failed too (W7-4 is what makes the broker branch
@@ -1376,14 +1559,29 @@ def _delete_sandbox_runtime(
         # record is what the *next* delete verifies against, so it must not
         # outlive the tree it describes (nor be dropped while the tree stands,
         # which is why ``unregister`` leaves it alone).
-        shutil.rmtree(
-            sandbox_runtime_dir(
-                _registry_workspace_base(runtime_registry, settings),
-                sandbox_id,
-                state_base=_registry_state_base(runtime_registry, settings),
-            ),
-            ignore_errors=True,
+        runtime_dir = sandbox_runtime_dir(
+            _registry_workspace_base(runtime_registry, settings),
+            sandbox_id,
+            state_base=_registry_state_base(runtime_registry, settings),
         )
+        agent_fileops_client = _agent_fileops()
+        if agent_fileops_client is not None:
+            # The paired half goes through the agent too, under the *same*
+            # named-error handling as the tree (D19): unlike the
+            # ``ignore_errors=True`` this replaces, a runtime dir that survives
+            # its removal is a failure the caller sees (the N12/N24 lesson:
+            # "recorded as removed" with the files still on disk is the shape no
+            # GC can ever reclaim) -- and "it was never there" is a success the
+            # log names.
+            _remove_agent_half(
+                agent_fileops_client,
+                sandbox_id,
+                path=runtime_dir,
+                op="remove_runtime",
+                what="platform state",
+            )
+        else:
+            shutil.rmtree(runtime_dir, ignore_errors=True)
         # ...and the pure shape's synthesized root (N16), the third thing the
         # platform holds for this sandbox: ``<pure_rootfs_dir>/<id>`` is the
         # skeleton the sandbox's own mount namespace binds into. It goes with
@@ -1520,6 +1718,7 @@ class NodeAgent:
         runtime_registry,
         control_plane_url: str | None,
         node_address: str | None,
+        node_id: str | None = None,
         metrics_provider: Callable[[], dict[str, Any]] | None = None,
         port_provider: Callable[[], dict[str, int]] | None = None,
     ) -> None:
@@ -1527,6 +1726,10 @@ class NodeAgent:
         self._runtime_registry = runtime_registry
         self._control_url = (control_plane_url or "").rstrip("/")
         self._node_address = node_address or ""
+        #: The id this worker declares when it registers. Production reads
+        #: ``E2B_NODE_ID`` (``_register_payload``); a harness sets this so the
+        #: control plane's resolver can be pointed at the worker's endpoint.
+        self._declared_node_id = node_id
         self._metrics_provider = metrics_provider
         #: N8: the MCP gateway port band's watermark, shipped with every
         #: heartbeat so the control plane's node view is the single place to
@@ -1678,7 +1881,7 @@ class NodeAgent:
         """One register-or-heartbeat exchange, then whatever round it triggers."""
         headers = {"X-Internal-Key": self._settings.internal_api_key}
         async with httpx.AsyncClient(timeout=10) as client:
-            payload = _register_payload(self._settings)
+            payload = _register_payload(self._settings, self._declared_node_id)
             payload["address"] = self._node_address
             if self._node_id is None:
                 resp = await client.post(
@@ -1695,6 +1898,21 @@ class NodeAgent:
                     # control plane may have orphaned what this worker still
                     # runs while it was away.
                     self._reconcile_pending = True
+                else:
+                    # Diagnosability (C3 Task 2): a worker whose registration is
+                    # refused used to say nothing at all locally -- every round
+                    # just retried. The named line is what makes "this worker
+                    # never joined" visible on the node; the most common cause
+                    # is the shape this identity layer requires: a *separated*
+                    # worker must declare ``E2B_NODE_ID`` (the control plane
+                    # verifies a node-scoped claim against the node's resolved
+                    # address, and cannot invent an identity from a shared key).
+                    logger.warning(
+                        "node agent: registration rejected by the control plane "
+                        "(HTTP %s): this worker will not join; a separated worker "
+                        "must declare E2B_NODE_ID",
+                        resp.status_code,
+                    )
             else:
                 resp = await client.post(
                     f"{self._control_url}/internal/nodes/{self._node_id}/heartbeat",
@@ -1705,6 +1923,9 @@ class NodeAgent:
                         self._port_provider,
                         self._disk_report_for_heartbeat(),
                         self._platform_disk_report,
+                        worker_pid_namespace(),
+                        worker_identity_fields(),
+                        reported_container_id(),
                     ),
                     headers=headers,
                 )
@@ -1712,6 +1933,16 @@ class NodeAgent:
                     # The control plane lost us (e.g. it restarted);
                     # re-register on the next cycle.
                     self._node_id = None
+                elif resp.status_code >= 300:
+                    # Same diagnosability rule for the heartbeat: a refusal the
+                    # control plane explains in its own log is otherwise
+                    # invisible from this node's side.
+                    logger.warning(
+                        "node agent: heartbeat for node %s rejected by the "
+                        "control plane (HTTP %s)",
+                        self._node_id,
+                        resp.status_code,
+                    )
         # Outside the pulse's client scope on purpose: the round owns its client
         # (this one is closed when the ``async with`` above exits, and a detached
         # round outlives it).
@@ -2436,34 +2667,37 @@ class NodeAgent:
         from the node registry, e.g. right after a control-plane restart while
         the other workers have not re-registered yet) makes the caller skip
         the sweep instead of deleting someone else's live tree.
+
+        D6/D7: the records come from the **fleet-scope**
+        ``/internal/fleet/sandboxes`` endpoint, not from one call per node.
+        Asking each node for its own list would make this sweep depend on
+        *every* node being resolvable — and a worker that is permanently gone
+        keeps its registry row (and its records) until its sandboxes' TTL, so
+        the per-node shape would stall reclamation fleet-wide exactly when a
+        node has died. The per-node endpoints stay identity-guarded; this sweep
+        was never speaking for another node.
+
+        The answer is attributed (``{"sandboxes": {node_id: [id, …]}}``, D7);
+        for the sweep the attribution is irrelevant and only the id set matters,
+        so it is flattened here. The completeness rule below (count vs
+        ``/internal/fleet/metrics``) is unchanged and deliberately strict.
         """
         try:
             resp = await client.get(
-                f"{self._control_url}/internal/nodes", headers=headers
+                f"{self._control_url}/internal/fleet/sandboxes", headers=headers
             )
             resp.raise_for_status()
-            node_list = resp.json()
-            if not isinstance(node_list, list):
-                raise ValueError("node list is not an array")
-            node_ids = [
-                str(node["nodeID"])
-                for node in node_list
-                if isinstance(node, dict) and node.get("nodeID")
-            ]
-            owned: set[str] = set()
-            for node_id in node_ids:
-                node_url = (
-                    f"{self._control_url}/internal/nodes/"
-                    f"{quote(node_id, safe='')}/sandboxes"
-                )
-                listed = await client.get(node_url, headers=headers)
-                listed.raise_for_status()
-                payload = listed.json()
-                if not isinstance(payload, dict):
-                    raise ValueError(
-                        f"sandbox list for {node_id} is not an object"
-                    )
-                owned.update(payload.get("sandboxIDs") or [])
+            payload = resp.json()
+            if not isinstance(payload, dict):
+                raise ValueError("fleet sandbox list is not an object")
+            by_node = payload.get("sandboxes")
+            if not isinstance(by_node, dict):
+                raise ValueError("fleet sandbox attribution is not an object")
+            owned = {
+                str(sid)
+                for node_ids in by_node.values()
+                for sid in (node_ids or [])
+            }
             metrics = await client.get(
                 f"{self._control_url}/internal/fleet/metrics", headers=headers
             )
@@ -2588,17 +2822,24 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
     existing = runtime_registry.get(sandbox_id)
     # E3.2: allocate the sandbox's host uid before materializing volumes so
     # per-sandbox volume slices can be chowned to it. Only a root worker -- or
-    # a non-root worker that resolved the file-capability brokers (Track F),
-    # which is what makes the chown possible there -- can put a sandbox under
-    # its own host uid; everything else keeps the fixed-uid + Landlock model
-    # and never allocates.
+    # a non-root worker that can ask *someone* for the chown: the
+    # file-capability brokers (Track F) or, in C3's shape, the agent
+    # (``priv_helpers.file_steps_available``) -- can put a sandbox under its own
+    # host uid; everything else keeps the fixed-uid + Landlock model and never
+    # allocates.
+    #
+    # ⚠ This gate is what makes the hand-over *reachable* at all: with it
+    # answered by ``active_helpers()`` alone, C3's agent shape (which installs no
+    # ``PrivHelpers``) left ``host_uid`` None, so ``apply_sandbox_ownership`` and
+    # every face-B ``chown`` were skipped in silence (review Task 4 slice A,
+    # Important 2).
     host_uid = None
     pool = getattr(runtime_registry, "uid_pool", None)
     from envd_service import priv_helpers
 
     if (
         settings.per_sandbox_uid
-        and (os.geteuid() == 0 or priv_helpers.active_helpers() is not None)
+        and (os.geteuid() == 0 or priv_helpers.file_steps_available(settings))
         and pool is not None
     ):
         # OBS-9: the control plane allocates the fleet-wide uid and passes it
@@ -2655,7 +2896,7 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
                 # entry.
                 project_id = None
         if host_uid is not None:
-            apply_sandbox_ownership(workspace_dir, host_uid)
+            apply_sandbox_ownership(workspace_dir, host_uid, sandbox_id=sandbox_id)
         elif not settings.per_sandbox_uid:
             # FUP #6: legacy shared-uid shape under a root worker — every
             # sandlock shell runs as host uid 1000. The pure no-chroot
@@ -2783,11 +3024,25 @@ async def agent_create_sandbox(request: Request) -> Response:
         # "failed to provision: <body>" names the real cause.
         logger.exception("agent create sandbox failed (permission)")
         return Response(status_code=500, content=str(e)[:500])
+    except AgentFileOpsError as e:
+        # F1: a face-B file operation (``chown-workspace`` &c.) the control
+        # plane refused, or could not be reached for. It is neither an auth
+        # fault nor a permission fault, and it used to fall through to the
+        # generic arm below -- a body-less 500 the control plane rendered as a
+        # bare "failed to provision: ". The module already named the refusal,
+        # so carry that name: the operator reads *why* the destination could
+        # not provision instead of an empty 502.
+        logger.exception("agent create sandbox failed (file operation)")
+        return Response(status_code=500, content=str(e)[:500])
     except (ValueError, json.JSONDecodeError) as e:
         return Response(status_code=400, content=str(e))
-    except Exception:
+    except Exception as e:
         logger.exception("agent create sandbox failed")
-        return Response(status_code=500)
+        # Never a silent 500 again: C3's "named, never silent" rule means the
+        # control plane must be able to read the reason (the route is
+        # internal-key authenticated, so the body is the platform's own
+        # diagnostic, not a leak to a sandbox).
+        return Response(status_code=500, content=(str(e) or type(e).__name__)[:500])
     return Response(status_code=201)
 
 
@@ -3517,7 +3772,29 @@ async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
         # files; the incoming archive is the full source of truth.
         from envd_service import priv_helpers
 
-        priv_helpers.remove_tree(workspace)
+        client = _agent_fileops()
+        if client is not None:
+            # C3 Task 4: same step, the agent's execution (and the same
+            # "no path in the request" rule). Idempotent for the same reason the
+            # teardown is: an import is retried, and "there was nothing there"
+            # is exactly what this branch is for.
+            #
+            # ⚠ Off the event loop (third review, I-2): this is a synchronous
+            # control-plane round trip whose read budget is the *file-op* one
+            # (minutes, because a whole tree is being removed). Inline it parked
+            # every heartbeat and every sandbox API on this worker -- the same
+            # class as ``/metrics``, and the reason the create/delete handlers
+            # already run their work in a thread.
+            await asyncio.to_thread(
+                _remove_agent_half,
+                client,
+                sandbox_id,
+                path=workspace,
+                op="remove_workspace",
+                what="tree",
+            )
+        else:
+            await asyncio.to_thread(priv_helpers.remove_tree, workspace)
     workspace.mkdir(parents=True, exist_ok=True)
     migrate_dir = settings.workspace_base / "_migrate"
     migrate_dir.mkdir(parents=True, exist_ok=True)
@@ -3593,7 +3870,10 @@ async def agent_health(request: Request) -> dict[str, Any]:
     except PermissionError:
         return Response(status_code=401)
     payload = _register_payload(settings)
-    payload["nodeID"] = os.getenv("E2B_NODE_ID")
+    agent = getattr(request.app.state, "node_agent", None)
+    payload["nodeID"] = getattr(agent, "_declared_node_id", None) or os.getenv(
+        "E2B_NODE_ID"
+    )
     return payload
 
 

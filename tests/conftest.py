@@ -30,6 +30,8 @@ from envd_service.gateway import create_gateway
 from envd_service.runtime.oci_registry import registry_mirrors
 from envd_service.runtime.registry import RuntimeRegistry
 from gateway_common.keepalive import uvicorn_keep_alive_kwargs
+from control_plane.node_address import NodeEndpoint, StaticAddressResolver
+from tests._c3_resolver import AnyNodeLoopbackResolver
 from tests._disk_projids import DISK_READ_BACKENDS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -556,6 +558,10 @@ def apps(workspace):
         settings=control_settings,
         runtime_registry=runtime_registry,
         workspace_base=workspace,
+        # C3 Task 2: every "node" in this lane is the in-process client, so the
+        # internal API's expected-address resolver answers loopback (production
+        # reads the k8s pod API / compose DNS).
+        node_address_resolver=AnyNodeLoopbackResolver(),
     )
     envd_app = create_envd_app(
         settings=envd_settings,
@@ -579,6 +585,7 @@ def make_apps(workspace):
             ),
             runtime_registry=runtime_registry,
             workspace_base=workspace,
+            node_address_resolver=AnyNodeLoopbackResolver(),
         )
         envd = create_envd_app(
             settings=envd_settings or EnvdSettings(executor="local"),
@@ -788,6 +795,17 @@ def _start_multinode(
     worker_ports = [port for port, _sock in worker_sockets]
 
     nodes = NodeRegistry(heartbeat_timeout=12)
+    # C3 Task 2 (D4/D5): the internal API derives each worker's expected
+    # address/IP from a resolver, never from the registration body, and refuses
+    # a node-scoped request whose claim does not resolve. The harness declares
+    # stable node ids (``worker-1``…) and hands the control plane their
+    # loopback endpoints, the same injection production gets from the k8s pod
+    # API / compose DNS.
+    worker_node_ids = [f"worker-{index + 1}" for index in range(worker_count)]
+    node_endpoints = {
+        node_id: NodeEndpoint(f"http://127.0.0.1:{port}", "127.0.0.1")
+        for node_id, port in zip(worker_node_ids, worker_ports)
+    }
     control_app = create_control_app(
         settings=ControlSettings(
             api_keys=("local-key",),
@@ -820,6 +838,7 @@ def _start_multinode(
         runtime_registry=RuntimeRegistry(shared_workspace_dir),
         workspace_base=shared_workspace_dir,
         nodes_registry=nodes,
+        node_address_resolver=StaticAddressResolver(node_endpoints),
     )
     # Force scheduling onto the registered remote workers.
     control_app.state.nodes.remove("local")
@@ -855,6 +874,7 @@ def _start_multinode(
                 workspace_base=worker_base,
                 control_plane_url=f"http://127.0.0.1:{control_port}",
                 node_address=f"http://127.0.0.1:{worker_port}",
+                node_id=worker_node_ids[index],
             )
         )
     gateway_app = create_gateway(

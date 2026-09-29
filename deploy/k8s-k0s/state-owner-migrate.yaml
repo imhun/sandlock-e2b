@@ -11,7 +11,8 @@
 # 为什么是 Job：这是一次 `chown -R`，跑完就该消失。
 # 为什么必须 runAsUser 0：这台 NFS 只认凭据里的 uid —— 读旧 root worker 写下的 0600/0700
 # 文件、把平台态让给 worker uid，都只有 uid 0 能做（同一条 NFS 语义的实测见
-# deploy/k8s/priv-broker.yaml：uid 65534 做 chown 是 EPERM，root 做同样的事成功）。
+# docs/production-deployment-requirements.md §5.4(b)：uid 65534 做 chown 是 EPERM，
+# root 做同样的事成功；承载它的节点特权组件 C3 Task 7 起是 agent 的面 B）。
 # 为什么 runAsGroup 65534：与 worker 同组，chown 之后属组不出现第三个数字。
 #
 # ⚠ 三处占位符是有意的 fail-closed（与 state-base-migrate.yaml 同形）：

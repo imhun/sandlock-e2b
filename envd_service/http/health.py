@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -11,6 +13,8 @@ from fastapi import APIRouter, Request, Response
 
 from envd_service.http.auth import HttpAuthError, require_http_sandbox
 from envd_service.runtime import brief_stat
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -30,12 +34,36 @@ async def envs(request: Request) -> dict[str, str]:
     return dict(runtime.env_vars)
 
 
-def _dir_size(path: Path) -> int:
+def _dir_size(path: Path, *, sandbox_id: str | None = None) -> int:
     # Track F / fix round 1 (c1): the workspace is `0770` owned by the
     # sandbox uid with the worker's gid, so the worker's group access walks it
     # in-process; priv_helpers falls back to e2b-maint for the trees that
     # access cannot reach. Either way this no longer silently reports 0.
-    from envd_service import priv_helpers
+    from envd_service import agent_fileops, priv_helpers
+
+    client = agent_fileops.active()
+    if client is not None:
+        # C3 Task 4: measured by the agent (``walk-workspace``); the sandbox id
+        # is the only thing this side names.
+        if sandbox_id is None:
+            raise priv_helpers.PrivHelperError(
+                "the C3 agent shape needs the sandbox id to measure "
+                f"{path}: the metrics call did not name one"
+            )
+        try:
+            return client.workspace_bytes(sandbox_id)
+        except Exception as exc:  # noqa: BLE001 - a metric may not raise
+            # N2's second half: this endpoint answers a *number*, and the
+            # pre-C3 shapes already answer "what the worker's own DAC can see"
+            # when nobody can be asked. Same here, with the reason on record --
+            # a metrics call is not the place to fail a sandbox's monitoring.
+            logger.warning(
+                "cannot measure %s through the agent: %s: %s; falling back to "
+                "the worker's own walk",
+                sandbox_id,
+                type(exc).__name__,
+                exc,
+            )
 
     brokered = priv_helpers.dir_size(path)
     if brokered is not None:
@@ -68,6 +96,13 @@ async def metrics(request: Request) -> dict[str, Any]:
     runtime = require_http_sandbox(request)
     workspace = Path(runtime.workspace_dir)
     disk_usage = shutil.disk_usage(workspace)
+    # Off the event loop (C3 Task 4 review, N2): in the agent shape this walk is
+    # a control-plane round trip, and its deadline is the *file-op* one (minutes)
+    # because a big tree legitimately takes that long. Awaiting it inline would
+    # park every heartbeat and every sandbox API behind a black-holed CP.
+    used_bytes = await asyncio.to_thread(
+        _dir_size, workspace, sandbox_id=runtime.sandbox_id
+    )
     return {
         "cpu": {"usedPercent": 0.0, "total": runtime.cpu_percent},
         "memory": {
@@ -75,7 +110,7 @@ async def metrics(request: Request) -> dict[str, Any]:
             "totalBytes": runtime.memory_mb * 1024 * 1024,
         },
         "disk": {
-            "usedBytes": _dir_size(workspace),
+            "usedBytes": used_bytes,
             "totalBytes": min(disk_usage.total, runtime.disk_mb * 1024 * 1024),
             "freeBytes": max(0, disk_usage.free),
         },

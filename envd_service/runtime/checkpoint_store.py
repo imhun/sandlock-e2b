@@ -83,6 +83,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from envd_service.runtime.platform_disk import (
+    UNKNOWN_ACCOUNT_REASON,
     checkpoint_admission,
     checkpoint_no_room_reason,
     measure_platform_disk_bytes,
@@ -159,7 +160,7 @@ def _prepare_image_parent(
     os.chmod(parent, 0o700)
     owner = os.geteuid() if owner_uid is None else int(owner_uid)
     if owner != os.geteuid():
-        _hand_to_sandbox(parent, owner)
+        _hand_to_sandbox(parent, owner, sandbox_id=sandbox_id)
     else:
         try:
             os.chown(parent, owner, owner)
@@ -168,13 +169,31 @@ def _prepare_image_parent(
     return image
 
 
-def _hand_to_sandbox(path: Path, uid: int, *, recursive: bool = False) -> None:
+def _hand_to_sandbox(
+    path: Path, uid: int, *, recursive: bool = False, sandbox_id: str | None = None
+) -> None:
     """Give ``path`` to the pooled uid that will write it (raises on failure).
 
     Root does it directly; a non-root worker goes through ``e2b-maint``
     (``CAP_CHOWN``), which is the same broker the rest of the platform uses to
     move a path between the worker's identity and a sandbox's.
+
+    C3 Task 4: in the agent shape the step is asked of the control plane as
+    ``{sandbox_id, op}`` -- the checkpoint store's path is derived there from
+    the same ``<state base>/_runtime/.checkpoints/<id>`` convention -- and no
+    path leaves this process.
     """
+    from envd_service import agent_fileops, priv_helpers
+
+    client = agent_fileops.active()
+    if client is not None:
+        if sandbox_id is None:
+            raise priv_helpers.PrivHelperError(
+                "the C3 agent shape needs the sandbox id to hand a checkpoint "
+                f"image over: {path} was not named by one"
+            )
+        client.chown_checkpoint(sandbox_id, recursive=recursive)
+        return
     if os.geteuid() == 0:
         if not recursive:
             os.chown(path, uid, uid)
@@ -184,17 +203,29 @@ def _hand_to_sandbox(path: Path, uid: int, *, recursive: bool = False) -> None:
             for entry in (*dirs, *files):
                 os.chown(Path(root) / entry, uid, uid)
         return
-    from envd_service import priv_helpers
-
     priv_helpers.broker_chown(uid, path, recursive=recursive)
 
 
-def image_bytes(image: Path) -> int:
-    """Allocated bytes of one image, ``0`` when it is not there."""
-    from envd_service import priv_helpers
+def image_bytes(image: Path, *, sandbox_id: str | None = None) -> int:
+    """Allocated bytes of one image, ``0`` when it is not there.
+
+    The image is ``0700`` owned by the sandbox's own uid, so a non-root worker
+    needs the broker -- or, in the C3 agent shape, the agent's ``walk``
+    (``walk-checkpoint``), which the control plane derives from the sandbox id
+    for the same reason it derives every other path (hard rule 3).
+    """
+    from envd_service import agent_fileops, priv_helpers
 
     if not image.is_dir():
         return 0
+    client = agent_fileops.active()
+    if client is not None:
+        if sandbox_id is None:
+            raise priv_helpers.PrivHelperError(
+                "the C3 agent shape needs the sandbox id to measure a "
+                f"checkpoint image: {image} was not named by one"
+            )
+        return client.checkpoint_bytes(sandbox_id)
     size = priv_helpers.dir_size(image)
     return 0 if size is None else int(size)
 
@@ -299,16 +330,37 @@ def checkpoint_status(
         last = None
     if not isinstance(last, dict):
         last = None
+    image_mb = 0
+    if has_image:
+        # Same "nothing to report" contract as the reads above (C3 Task 4
+        # review, N4): this is a *diagnostic*, and a transient control-plane
+        # outage in the agent shape used to turn it into a 500 -- while a
+        # half-written image two lines up is deliberately reported as absent.
+        # Unknown bytes therefore read as 0 (the convention ``image_bytes``
+        # already uses for a broker it cannot ask), with the reason on record.
+        try:
+            image_mb = image_bytes(image, sandbox_id=sandbox_id) // _MIB
+        except Exception as exc:  # noqa: BLE001 - a diagnostic may not raise
+            logger.warning(
+                "sandbox %s: cannot measure the checkpoint image: %s: %s",
+                sandbox_id,
+                type(exc).__name__,
+                exc,
+            )
+            image_mb = 0
     return {
         "sandboxID": sandbox_id,
         "hasImage": has_image,
-        "imageMB": (image_bytes(image) // _MIB) if has_image else 0,
+        "imageMB": image_mb,
         "capturedAt": captured_at,
         "lastRestore": last,
     }
 
 
-def _platform_numbers(workspace_base, state_base=None) -> tuple[int, int]:
+def _platform_numbers(
+    workspace_base, state_base=None
+) -> tuple[int | None, int]:
+    """``(used bytes or None, budget bytes)`` -- ``None`` is "cannot measure" (I-3)."""
     return (
         measure_platform_disk_bytes(workspace_base, state_base=state_base),
         platform_budget_bytes(),
@@ -350,6 +402,17 @@ def capture_checkpoint_image(
     sentence, never an empty string.
     """
     used_before, limit = _platform_numbers(workspace_base, state_base)
+    if used_before is None:
+        # I-3: an unmeasured account is not an empty one. Refusing here (before
+        # anything is written) is the same exit as "the account is full": the
+        # sandbox is left frozen in place, and the caller gets the reason.
+        reason = UNKNOWN_ACCOUNT_REASON.format(
+            decision="no image can be taken until the account can be measured"
+        )
+        logger.warning("sandbox %s: %s", sandbox_id, reason)
+        return _capture_reply(
+            sandbox_id, False, reason, used=None, limit=limit
+        )
     full = checkpoint_no_room_reason(used_bytes=used_before, limit_bytes=limit)
     if full is not None:
         # Refuse *before* writing: with no room at all there is nothing to learn
@@ -408,7 +471,7 @@ def capture_checkpoint_image(
             sandbox_id, False, reason, used=used_before, limit=limit
         )
 
-    written = image_bytes(image)
+    written = image_bytes(image, sandbox_id=sandbox_id)
     allowed, over = checkpoint_admission(
         used_bytes=used_before, incoming_bytes=written, limit_bytes=limit
     )
@@ -416,7 +479,7 @@ def capture_checkpoint_image(
         # The account is enforced on what was actually written: the size is only
         # knowable by capturing, so the image is removed again and the sandbox is
         # left exactly as it was found.
-        _remove_image(image)
+        _remove_image(image, sandbox_id=sandbox_id)
         _discard_empty_store(image)
         logger.warning(
             "sandbox %s: checkpoint image of %d MiB refused and removed: %s",
@@ -438,7 +501,9 @@ def capture_checkpoint_image(
         outcome.get("fds"),
         outcome.get("exe") or "<unknown>",
         list(outcome.get("argv") or []),
-        (used_before + written) // _MIB,
+        # ``used_before`` cannot be None here: an unmeasured account is refused
+        # before the capture (see the top of this function).
+        (int(used_before) + written) // _MIB,
         "an unlimited budget" if limit <= 0 else f"{limit // _MIB} MiB",
     )
     return _capture_reply(
@@ -458,7 +523,7 @@ def _capture_reply(
     captured: bool,
     reason: str,
     *,
-    used: int,
+    used: int | None,
     limit: int,
     image: Path | None = None,
     image_bytes: int = 0,
@@ -470,7 +535,10 @@ def _capture_reply(
         "reason": reason,
         "image": str(image) if image is not None else None,
         "imageMB": image_bytes // _MIB,
-        "platformDiskUsedMB": used // _MIB,
+        # ``None`` = the account could not be measured (I-3): the honest wire
+        # value, and the one the CP's ``update_usage`` keeps its previous number
+        # for. The *budget* still ships -- it is a configured number.
+        "platformDiskUsedMB": None if used is None else used // _MIB,
         "platformDiskBudgetMB": 0 if limit <= 0 else limit // _MIB,
     }
     if capture:
@@ -513,7 +581,9 @@ def restore_checkpoint_image(
         # or a legacy image taken before pooled uids.
         try:
             if image.stat().st_uid != int(owner_uid):
-                _hand_to_sandbox(image, int(owner_uid), recursive=True)
+                _hand_to_sandbox(
+                    image, int(owner_uid), recursive=True, sandbox_id=sandbox_id
+                )
         except Exception as exc:  # noqa: BLE001 - reported as "not restored"
             reason = (
                 "the checkpoint image could not be handed to the sandbox's uid "
@@ -591,7 +661,7 @@ def restore_checkpoint_image(
         len(skipped),
         skipped if skipped else "none",
     )
-    _remove_image(image)
+    _remove_image(image, sandbox_id=sandbox_id)
     return {
         "sandbox_id": sandbox_id,
         "restored": True,
@@ -607,15 +677,50 @@ def restore_checkpoint_image(
     }
 
 
-def _remove_image(image: Path) -> None:
+def _remove_image(image: Path, *, sandbox_id: str | None = None) -> None:
     """Delete one image tree, in-process first and through the broker on EACCES.
 
     The image is ``0700`` and owned by the sandbox's uid (see the module doc), so
     a *non-root* worker cannot walk into it: ``priv_helpers.remove_tree`` is the
     platform's own fallback for exactly that (`e2b-maint`, ``CAP_DAC_OVERRIDE``).
     A root worker removes it directly.
+
+    C3 Task 4: the agent shape asks the control plane for ``remove-checkpoint``,
+    which resolves to the same ``<state base>/_runtime/.checkpoints/<id>`` path.
+
+    ⚠ **A recorded drift, not an oversight** (review Task 4 slice A, Minor 6):
+    the callers pass the *image* (``<store>/latest``) while the op's target is
+    the **store** -- ``remove-checkpoint`` removes the sandbox's whole
+    checkpoint directory. That is exact rather than approximate because the
+    store holds exactly one image by construction ("one image per sandbox,
+    consumed on the way out", module doc), and the teardown's own hook
+    (:func:`remove_checkpoint_images`) does mean the store. Narrowing the op to
+    ``<store>/latest`` would leave an empty store behind after every consume --
+    which the orphan sweep is what collects, and that sweep is exactly what the
+    agent shape turns off. If a second image ever becomes legal here, this is
+    the line to revisit.
+
+    ⚠ **Also recorded** (C3 Task 4 second review, N6): unlike
+    :func:`envd_service.agent._remove_agent_half`, this branch has no
+    "already absent" arm -- ``e2b-maint rm`` refuses a path that is not there,
+    so an image that vanished between the caller's own ``is_dir()`` check and
+    the op raises instead of reading as "nothing to consume". Every caller
+    checks first (``remove_checkpoint_images``, ``_discard_empty_store``, and
+    the resume path's own guard), so the window is one syscall wide and the
+    outcome is a named refusal, not a silent skip; recorded here so the final
+    review can decide whether to fold this branch into ``_remove_agent_half``.
     """
-    from envd_service import priv_helpers
+    from envd_service import agent_fileops, priv_helpers
+
+    client = agent_fileops.active()
+    if client is not None:
+        if sandbox_id is None:
+            raise priv_helpers.PrivHelperError(
+                "the C3 agent shape needs the sandbox id to remove a "
+                f"checkpoint image: {image} was not named by one"
+            )
+        client.remove_checkpoint(sandbox_id)
+        return
 
     priv_helpers.remove_tree(image)
 
@@ -633,7 +738,7 @@ def remove_checkpoint_images(
     store = sandbox_checkpoint_dir(workspace_base, sandbox_id, state_base=state_base)
     if not store.is_dir():
         return False
-    _remove_image(store)
+    _remove_image(store, sandbox_id=sandbox_id)
     return True
 
 
@@ -774,7 +879,7 @@ def consume_checkpoint_image(
     image = checkpoint_image_dir(workspace_base, sandbox_id, state_base=state_base)
     if not image.is_dir():
         return False
-    _remove_image(image)
+    _remove_image(image, sandbox_id=sandbox_id)
     return True
 
 

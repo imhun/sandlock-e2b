@@ -31,6 +31,7 @@ from pathlib import Path
 
 from gateway_common.errors import ConnectError, unimplemented
 from gateway_common.network import NetworkUpdateConflictError
+from gateway_common.paths import route_b_instance_name
 from envd_service.executors.base import ExecConfig, Executor, RunningProcess
 from envd_service.uid_pool import (
     CAP_SETGID,
@@ -1441,12 +1442,11 @@ class SandlockExecutor(Executor):
             return None
 
     def _instance_name_for(self) -> str:
+        # The rule itself lives in ``gateway_common`` (D20): the control plane
+        # derives the slot documents' directory from the same function, so a
+        # slot the worker created is one the CP can address.
         sid = self._sandbox_id or Path(self._workspace_dir).name
-        if len(sid.encode()) <= 64:
-            return sid
-        import hashlib
-
-        return "sbx_" + hashlib.sha256(sid.encode()).hexdigest()[:16]
+        return route_b_instance_name(sid)
 
     # Warn-once switches for the shapes that decline a slot. The reason itself
     # comes from `_route_b_decline_reason` -- one decision, quoted verbatim by
@@ -1503,10 +1503,20 @@ class SandlockExecutor(Executor):
                 )
             return reason
         if not cfg.privileged_starter:
-            reason = (
-                f"this worker cannot start a slot as uid {self._host_uid} "
-                "(needs root / CAP_SETUID or an injected launcher spawner)"
-            )
+            if cfg.slot_identity == "agent-grant":
+                # C3 Task 3: nobody here changes an identity (the child unshares
+                # and the agent writes the map), so what is missing is the
+                # control-plane reporter, not a privileged starter.
+                reason = (
+                    "E2B_SLOT_IDENTITY=agent-grant needs the control-plane "
+                    "reporter, and this worker does not know where its control "
+                    "plane is (E2B_CONTROL_PLANE_URL and E2B_NODE_ID)"
+                )
+            else:
+                reason = (
+                    f"this worker cannot start a slot as uid {self._host_uid} "
+                    "(needs root / CAP_SETUID or an injected launcher spawner)"
+                )
             if forced:
                 raise RuntimeError("route B was requested but " + reason)
             if not type(self)._route_b_no_starter_warned:
@@ -2042,7 +2052,20 @@ class SandlockExecutor(Executor):
             # the tree over).
             identity = self._host_uid if self._per_sandbox_uid else None
             if identity is not None:
-                if os.geteuid() == 0:
+                from envd_service import agent_fileops
+
+                agent_client = agent_fileops.active()
+                if agent_client is not None:
+                    # C3 Task 4: the hand-over is the agent's step, asked for as
+                    # ``{sandbox_id, op}`` -- the secret path is derived from
+                    # the control plane's own settings there (hard rule 3).
+                    secret_sandbox_id = (
+                        self._sandbox_id
+                        if isinstance(self._sandbox_id, str)
+                        else Path(self._workspace_dir).name
+                    )
+                    agent_client.chown_secret(secret_sandbox_id, entry["name"])
+                elif os.geteuid() == 0:
                     with suppress(OSError):
                         os.chown(path, identity, -1)
                 else:

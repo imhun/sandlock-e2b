@@ -213,11 +213,25 @@ KEY_CLASSES: dict[str, set[str]] = {
     "rotation_window": {"E2B_INTERNAL_API_KEYS"},
     # Track F/route-B scratch root: the file-capability brokers.
     "priv_helpers": {"E2B_PRIV_HELPERS"},
-    # C1 (wave 2): the k8s worker dials the per-node broker DaemonSet over a
-    # unix socket instead of running the privileged binaries itself. The
-    # compose stacks ship no such daemon -- they keep the file-capability
-    # shape (C1's `exec` transport) -- so both keys are k8s-only.
-    "priv_broker_transport": {"E2B_PRIV_HELPER_TRANSPORT", "E2B_PRIV_HELPER_SOCKET"},
+    # C3 (Task 4 slice B): which shape performs the worker's privileged file
+    # steps. The worker image no longer ships the file-capability binaries, so
+    # `auto` would silently resolve none and degrade to the in-process E5.1
+    # shape; every worker that has an agent names `agent` in the same change as
+    # the binary removal -- the k8s pod and the three C3 compose stacks (the two
+    # separated examples and the target host's stack). The arm-lane fleet, the
+    # pool, the single-machine example and the test runner have no agent.
+    "priv_helper_transport": {"E2B_PRIV_HELPER_TRANSPORT"},
+    # C1 (wave 2) / Task 4 slice B: the socket rollback lever
+    # (`E2B_PRIV_HELPER_SOCKET` + the `wait-for-broker` gate) was the k8s
+    # worker's, and only the k8s worker's. C3 Task 7 retired it with the broker
+    # DaemonSet, so there is no key to classify any more -- the manifest pin
+    # that it stays gone lives in `test_c3_agent_manifest.py`.
+    # C3 (Task 3): which path grants a route-B slot its identity. The k8s worker
+    # and the two separated production compose stacks (the ones that ship a
+    # `c3-agent` service) run `agent-grant`; the arm-lane fleet stack, the local
+    # pool, the single-machine example and the test runner have no agent and
+    # keep the code default (`spawn`, the rollback lever).
+    "slot_identity": {"E2B_SLOT_IDENTITY"},
     # Named template images (`docs/HANDOFF.md`: unset = the fixed set only).
     "template_images": {"E2B_TEMPLATE_IMAGES"},
     # Per-worker wiring: who the worker is and which control plane it dials.
@@ -313,34 +327,69 @@ EXTRA_CLASSES: dict[str, set[str]] = {
     },
 }
 
+#: What the **fleet stack** -- `deploy/stack/docker-compose.prod.yml`, the
+#: compose half of the shipped host (`FLEET_STACK` above) -- does *not* declare
+#: next to the k8s manifest. It is the reference the other compose stacks are
+#: compared against, so the two C3 keys it *does* name are deliberately absent
+#: from this set (Task 4 slice B):
+#:
+#: * `E2B_PRIV_HELPER_TRANSPORT=agent` (its workers run the agent shape; the
+#:   key is named on all three C3 compose stacks -- see `priv_helper_transport`
+#:   in `KEY_CLASSES`);
+#: * `E2B_SLOT_IDENTITY=agent-grant` (likewise, `slot_identity`).
+#:
+#: What is left is k8s-only: the state layout, the disk-enforcement knobs and
+#: the real-root/checkpoint switches. (C1's broker socket path used to be in
+#: this set too; C3 Task 7 retired it with the DaemonSet.)
 _FLEET_STACK_MISSING = (
     KEY_CLASSES["k8s_state_layout"]
     | KEY_CLASSES["k8s_disk_enforcement"]
     | KEY_CLASSES["k8s_real_root_and_checkpoint"]
-    | KEY_CLASSES["priv_broker_transport"]
 )
 
 #: The compose example stacked with a control plane + Redis: it declares the
 #: worker's wiring, cache, capacity, shape and egress, but not the k8s-only
-#: classes above (state layout, disk enforcement, real-root/checkpoint, and the
-#: C1 broker socket), the rotation window, the broker opt-in (default `auto`)
-#: or named templates (default: none).
+#: classes above (state layout, disk enforcement, real-root/checkpoint), the
+#: rotation window, the broker opt-in (default `auto`) or named templates
+#: (default: none).
 _COMPOSE_EXAMPLE_MISSING = (
     _FLEET_STACK_MISSING
+    | KEY_CLASSES["priv_helper_transport"]
     | KEY_CLASSES["rotation_window"]
     | KEY_CLASSES["priv_helpers"]
     | KEY_CLASSES["template_images"]
 )
 
+#: The two separated production stacks are the compose half of C3's coverage
+#: (Global Constraints): they ship the `c3-agent` service, so unlike the fleet
+#: stack above they *do* name both the identity path (instead of inheriting
+#: `spawn`) and the transport (instead of inheriting the inert `auto`).
+_C3_COMPOSE_MISSING = (
+    _COMPOSE_EXAMPLE_MISSING
+    - KEY_CLASSES["slot_identity"]
+    - KEY_CLASSES["priv_helper_transport"]
+)
+
 #: The local pool: the autoscaler builds the worker's `docker run` argv itself,
 #: so its env JSON is the worker's whole environment -- no workspace base, no
 #: per-worker wiring (those are `-e` flags), no templates/brokers.
-_POOL_MISSING = _COMPOSE_EXAMPLE_MISSING | KEY_CLASSES["worker_wiring"] | {
-    "E2B_WORKSPACE_BASE",
-}
+#: ...and since ruling D23 it *does* declare `E2B_PRIV_HELPERS=off`: the worker
+#: image lost its file-capability binaries, and a shape with no agent has to
+#: say out loud that it has no privileged file operations (rather than letting
+#: `auto` resolve nothing and warn once).
+_POOL_MISSING = (
+    _COMPOSE_EXAMPLE_MISSING
+    | KEY_CLASSES["worker_wiring"]
+    | {"E2B_WORKSPACE_BASE"}
+    | KEY_CLASSES["slot_identity"]
+) - KEY_CLASSES["priv_helpers"]
 
 #: The single-machine build example (`docker-compose.yml`): one `envd`, no
 #: control-plane wiring, no node budget, cache-only env plus the shape switch.
+#: It declares its (absent) file-operation capability for the same reason the
+#: pool does (D23) -- and the key is an *upgrade* from silence: this example
+#: used to rely on the worker image's binaries and refused to start when its
+#: route-B root was outside their whitelist.
 _DEMO_MISSING = (
     _COMPOSE_EXAMPLE_MISSING
     | KEY_CLASSES["worker_wiring"]
@@ -349,7 +398,8 @@ _DEMO_MISSING = (
     | KEY_CLASSES["netns_pair"]
     | KEY_CLASSES["egress_switch"]
     | KEY_CLASSES["route_b_root"]
-)
+    | KEY_CLASSES["slot_identity"]
+) - KEY_CLASSES["priv_helpers"]
 
 #: The test runner: it names only what the in-container suite needs to build
 #: sandboxes from this checkout (the workspace root, the base image, the pid
@@ -363,6 +413,7 @@ _RUNNER_MISSING = (
     | KEY_CLASSES["netns_pair"]
     | KEY_CLASSES["egress_switch"]
     | KEY_CLASSES["route_b_root"]
+    | KEY_CLASSES["slot_identity"]
 )
 
 #: Per stack: the k8s keys it may not declare, and the keys it adds.
@@ -373,8 +424,8 @@ ALLOWED_MISSING: dict[str, set[str]] = {
     FLEET_STACK: _FLEET_STACK_MISSING,
     POOL_COMPOSE: _POOL_MISSING,
     POOL_BACKEND: _POOL_MISSING | KEY_CLASSES["base_image"],
-    COMPOSE_PROD: _COMPOSE_EXAMPLE_MISSING,
-    COMPOSE_MULTINODE: _COMPOSE_EXAMPLE_MISSING,
+    COMPOSE_PROD: _C3_COMPOSE_MISSING,
+    COMPOSE_MULTINODE: _C3_COMPOSE_MISSING,
     COMPOSE_DEMO: _DEMO_MISSING,
     COMPOSE_RUNNER: _RUNNER_MISSING,
 }
@@ -501,6 +552,21 @@ def test_the_pools_two_declarations_agree() -> None:
     # The shape keys are declared as literals, so they are covered above; spell
     # out that the list is not empty (an all-parameterised dict would vacate it).
     assert "E2B_PID_NS" in literals
+
+
+def test_the_pool_pins_off_and_does_not_merely_agree_with_itself() -> None:
+    """D23: `off` is the *value*, and it is pinned in both declarations.
+
+    `test_the_pools_two_declarations_agree` compares the backend dictionary
+    against the compose JSON -- so flipping **both** to `auto` would stay green
+    while the pool went back to "resolve no brokers, log one warning, keep the
+    E5.1 shape": exactly the silent downgrade D23 exists to prevent. These two
+    assertions are on the value itself, one per place the pool declares its
+    worker env (the JSON the autoscaler hands each spawned worker, and the
+    hand-built `DockerPoolBackend`).
+    """
+    assert _pool_compose_env()["E2B_PRIV_HELPERS"] == "off"
+    assert _unquote(_pool_backend_env()["E2B_PRIV_HELPERS"]) == "off"
 
 
 def test_the_three_multinode_workers_declare_the_same_env_keys() -> None:

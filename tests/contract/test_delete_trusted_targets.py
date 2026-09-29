@@ -39,6 +39,7 @@ from gateway_common.paths import sandbox_record_path
 
 import envd_service.agent as agent_mod
 import envd_service.xfs_quota as xfs_quota
+from tests._c3_resolver import loopback_resolver
 from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings as ControlSettings
 from control_plane.registry.manager import SandboxRegistry
@@ -499,6 +500,7 @@ def _control_stack(workspace: Path):
         registry=registry,
         nodes_registry=nodes,
         workspace_base=workspace,
+        node_address_resolver=loopback_resolver("node_a"),
     )
     # Force scheduling onto the registered remote worker, exactly like the
     # orphan-tree GC contracts next door.

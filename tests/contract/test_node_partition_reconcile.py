@@ -24,11 +24,28 @@ from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings as ControlSettings
 from control_plane.registry.manager import SandboxRegistry
 from control_plane.registry.nodes import NodeRegistry
+from control_plane.node_address import NodeEndpoint, StaticAddressResolver
 from envd_service.agent import NodeAgent
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
 from gateway_common.timeutil import utcnow
+
+
+def _c3_resolver() -> StaticAddressResolver:
+    """C3 Task 2 (D4/D5): the control plane's expected node endpoints.
+
+    The internal API never takes a node's address from the request and refuses a
+    node-scoped claim it cannot resolve, so this lane -- which speaks for
+    ``node_a``/``node_b`` over an in-process ASGI client (peer 127.0.0.1) --
+    hands the control plane their expected endpoints instead.
+    """
+    return StaticAddressResolver(
+        {
+            "node_a": NodeEndpoint("http://127.0.0.1:11111", "127.0.0.1"),
+            "node_b": NodeEndpoint("http://127.0.0.1:22222", "127.0.0.1"),
+        }
+    )
 
 
 def _register_node(nodes: NodeRegistry, node_id: str, address: str):
@@ -67,6 +84,7 @@ def _make_control(workspace) -> tuple[NodeRegistry, SandboxRegistry, object]:
         registry=registry,
         nodes_registry=nodes,
         workspace_base=workspace,
+        node_address_resolver=_c3_resolver(),
     )
     return nodes, registry, app
 
@@ -285,6 +303,7 @@ async def test_worker_reconcile_concurrent_create_not_killed(workspace):
         registry=registry,
         nodes_registry=control_nodes,
         workspace_base=workspace,
+        node_address_resolver=_c3_resolver(),
     )
     rec_keep = _sandbox_on(registry, "node_a", "sbx_race_keep")
     registry.mark_orphaned("node_a")
@@ -383,6 +402,7 @@ async def test_worker_reconcile_tears_down_orphan_runtime(workspace):
         registry=registry,
         nodes_registry=control_nodes,
         workspace_base=workspace,
+        node_address_resolver=_c3_resolver(),
     )
 
     runtime_registry = RuntimeRegistry(workspace)

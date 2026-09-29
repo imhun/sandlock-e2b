@@ -16,6 +16,7 @@ from __future__ import annotations
 import httpx
 
 import envd_service.agent as agent_module
+from envd_service.agent_fileops import AgentFileOpsError
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
@@ -25,6 +26,16 @@ from envd_service.runtime.registry import RuntimeRegistry
 PROVISION_REASON = (
     "cold volume /var/lib/e2b-sandboxes/sbx_perm is root-owned, uid 65534 "
     "has no write access (EACCES on mkdir)"
+)
+
+# The shape F1 exposed: the destination worker's create handler hands the tree
+# over through face B, the control plane's file-op scoping refuses it, and the
+# worker must carry *that* refusal back -- not answer a body-less 500 that the
+# control plane renders as a bare "failed to provision: ".
+FILE_OP_REASON = (
+    "the control plane refused chown-workspace for sandbox sbx_fileop "
+    "(HTTP 403): Sandbox sbx_fileop belongs to node e2b-worker-0, not "
+    "e2b-worker-1"
 )
 
 
@@ -212,3 +223,45 @@ async def test_a_failed_snapshot_copy_leaves_no_partial_payload(
 
     assert resp.status_code == 500
     assert not (settings.workspace_base / "_snapshots" / "snap_fail").exists()
+
+
+async def test_create_file_op_failure_is_500_with_reason(
+    workspace, monkeypatch
+) -> None:
+    """F1: a refused face-B file op names itself instead of an empty 502.
+
+    ``AgentFileOpsError`` is a ``RuntimeError``, so it used to fall through the
+    generic arm into ``Response(status_code=500)`` with no body -- which the
+    control plane's ``Node ... failed to provision: <resp.text>`` rendered as a
+    bare ``"Node ... failed to provision: "``. The same fault now travels named.
+    """
+    worker = _make_worker(workspace)
+    _app, settings = worker
+
+    def _boom(**_kwargs):
+        raise AgentFileOpsError(FILE_OP_REASON)
+
+    monkeypatch.setattr(agent_module, "build_volume_mounts", _boom)
+
+    resp = await _post_create(worker, settings.internal_api_key, "sbx_fileop")
+
+    assert resp.status_code == 500
+    assert resp.text == FILE_OP_REASON
+
+
+async def test_create_unexpected_fault_is_500_with_reason(
+    workspace, monkeypatch
+) -> None:
+    """No provisioning fault is silent again -- the generic arm carries it too."""
+    worker = _make_worker(workspace)
+    _app, settings = worker
+
+    def _boom(**_kwargs):
+        raise RuntimeError("a bare provisioning fault")
+
+    monkeypatch.setattr(agent_module, "build_volume_mounts", _boom)
+
+    resp = await _post_create(worker, settings.internal_api_key, "sbx_bare")
+
+    assert resp.status_code == 500
+    assert resp.text == "a bare provisioning fault"

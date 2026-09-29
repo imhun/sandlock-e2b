@@ -509,6 +509,25 @@ class Settings:
             os.getenv("E2B_ROUTE_B_TMP_ROOT", "/tmp/sandlock-route-b")
         ).resolve()
     )
+    # C3 Task 3 (ruling D9.1): how a slot gets its identity. ``spawn`` (the
+    # default, and the fallback until Task 4/7) is the privileged starter -- the
+    # worker or its file-capability broker performs the setuid. ``agent-grant``
+    # is the C3 path: the worker forks the child, the child unshares a user
+    # namespace, the worker reports {sandbox_id, pid} to the control plane, and
+    # the per-node agent writes the identity. The worker holds no privilege on
+    # that path at all.
+    slot_identity: str = field(
+        default_factory=lambda: os.getenv("E2B_SLOT_IDENTITY", "spawn").strip().lower()
+    )
+    # Deadline for one slot-identity report to the control plane. The control
+    # plane's own CP→agent deadline is inside this one, so the worker's bound is
+    # the outer of the two (both are named refusals -- a stuck hop must never
+    # look like "the create hangs").
+    slot_identity_timeout_s: float = field(
+        default_factory=lambda: _env_float(
+            "E2B_SLOT_IDENTITY_REPORT_TIMEOUT_S", 10.0
+        )
+    )
     # Quota maintenance (E2.4): periodic over-limit + disk watermark scans and
     # startup orphan project reconciliation.
     quota_monitor_interval_s: float = field(

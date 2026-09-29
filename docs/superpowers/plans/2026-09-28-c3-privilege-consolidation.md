@@ -164,6 +164,19 @@ CP 变 65534 之后它会从"静默失败"变成"硬失败"，**必须走 agent 
 且**不能**设 `allowPrivilegeEscalation: false`（rootlesskit 的 `newuidmap` 会死）。
 它**不是 root**，所以不违反口径，但它是 CP pod 里唯一保留宽 seccomp 的容器，**写进文档**。
 
+> **★ D24 修订（2026-09-29，Task 5）——第 2 步的实现方式改了**：第 2 步的**判据**（"CP 侧 A 类
+> 清零；卷根建得出来、`_runtime` 删得掉"）不变，但其中的 `_volumes` 卷根**不走 agent**：Task 5
+> 的复核发现 `_volumes` 不是 CP 在那里唯一的写（`_volumes/_meta/<id>.json` 也在同一个 `0:0 755`
+> 根里），于是**两条路都必须先做一次属主交棒**；交棒既然不可省，agent 路线的剩余增量就是
+> **给 root 的 `e2b-maint` 加一条 `mkdir` 动词** + 给共享存储的 op 定一条节点寻址规则 —— 而
+> **扩 root 文件面恰是 C3 要收的那张面**。故改走本节 ① 的第一条备选（"把 `_volumes` 迁给 CP 的
+> uid 后由 CP 自己做"，§13.2/§13.5 也把它列为备选）：**`_volumes`（含 `_meta`）一次性、非递归
+> 地交给 65534**，CP 保留自己的 `mkdir` + `chmod 1777` —— 交棒之后它们是**属主操作**。
+> 完整理由、硬性质（非递归 / 幂等 / 有名有姓 / 校验）与**部署窗口复验程序**见
+> `docs/c3-privilege-relocation.md` §13.6（裁定）与 §13.6.1（程序）。判据改写：brief 的
+> "`_volumes` 的 `mkdir` 不在 CP 代码路径里" ⇒ "**CP 拥有 `_volumes`，所以它的 `mkdir`/`chmod`
+> 不需要特权**"，钉在 `tests/unit/test_c3_cp_rootless.py`。
+
 ## 4. 不变量与硬规则（每个 task 的要求都隐含包含）
 
 1. **不变量**：*谁 `fork` 槽位，谁的进程树里必须有一个能变成池 uid X 的进程。*
@@ -239,6 +252,14 @@ CP 变 65534 之后它会从"静默失败"变成"硬失败"，**必须走 agent 
 - **agent 部署形态**：**一个 DaemonSet、两个容器**（面 A / 面 B）；**独立镜像**，**不复用 worker 镜像**。
 - **`NSpid` 反查**：必须**匹配整条链**（同一节点可能跑多个 worker），**不得只比最后一项**。
 - **覆盖范围**：k8s **与分离 compose 栈（含 `docker-compose.multinode.yml`）**；**只排除 `local://`**。
+  **按名字排除、且被排除者要自己声明"没有文件操作能力"（裁定 D23）**：`local://`（合体节点）、
+  autoscaler 的 docker pool（`deploy/compose/docker-compose.autoscale.yml` +
+  `autoscaler/backends/local.py`）、单机示例（`deploy/compose/docker-compose.yml`）——后两个在
+  各自清单里显式写 `E2B_PRIV_HELPERS=off`（"从不用 broker"），钉在
+  `tests/unit/test_c3_agent_manifest.py::test_the_shapes_excluded_from_c3_declare_that_they_have_no_file_ops`
+  与 `tests/unit/test_worker_env_key_sets.py`。**follow-up（带触发条件）**：给 pool 配 agent
+  需要先解决"CP 如何寻址一个 pooled worker 落在的**宿主**"（pool 的 worker 是 autoscaler 用
+  `docker run` 起的，没有 pod/nodeName）—— 触发条件是"pool 需要 per-sandbox uid 或 route-B"。
 - **CP 取值**：主容器 `runAsUser: 65534`。
 - **worker 取值**：镜像 `USER 65534:65534`；目标 BND **空集**（P3 完成后）。
 - **禁项**（worker / agent 面 A）：`SYS_ADMIN`、`SYS_PTRACE`、`NET_RAW`、`privileged`、
@@ -401,13 +422,24 @@ worker 镜像**不再含任何特权二进制**。
 
 **Deliverable:** 孤儿回收 = **agent 巡检 → CP 决策 → agent 执行**；worker 不再扫盘。
 
-- [ ] 写用例：① worker 崩溃且**不重启**时盘上仍在 N 分钟内收敛；
+- [x] 写用例：① worker 崩溃且**不重启**时盘上仍在 N 分钟内收敛；
   ② CP 滚动重启期间**不误删活沙箱**；③ CP 记录**过期**时整体推迟
   （把 `protected_elsewhere` 的语义在 CP 侧重做）。
-- [ ] 跑确认**红**。
-- [ ] 实现：agent 周期扫描 `<workspaces>/*` → 报 CP → CP 用权威记录判孤儿 → 指令 agent 删。
-- [ ] 跑确认**绿**；`multiworker_interference`。
-- [ ] Commit。
+- [x] 跑确认**红**（三档门各自一条"删掉即红"的臂，见 Task 6 报告）。
+- [x] 实现：agent 周期扫描 `<workspaces>/*` → 报 CP → CP 用权威记录判孤儿 → 指令 agent 删。
+- [x] 跑确认**绿**；`multiworker_interference` **跑不了**（要活集群 + e2b SDK，见报告），
+      改跑进程内车道（真 CP app + 真 agent app + `tmp/` 下真树）与既有孤儿契约。
+- [x] Commit。
+
+> **★ T6 裁定（2026-09-29，controller）**：1–4 项按提报的形状通过（触发/周期 30s + 120s、退避封顶
+> 10min；报告 = `POST /internal/nodes/{agent_node_id}/agent/inventory`，body 只有 `{"sandboxes":[…]}`；
+> 身份 = agent 自己的凭据 `E2B_C3_AGENT_TOKEN` + **主机键**寻址 + 源 IP 第二因子；三档门
+> （共享记录 / `unreadable == 0` / id 条数对 `/internal/fleet/metrics`））。另加两条：**NetworkPolicy
+> 的改动是刻意的、要可审**（同一提交里更新 pin `test_c3_agent_manifest.py`，注释写明 agent 为什么
+> 需要出口，并保持"没有别的入口"不变）；`multiworker_interference.py` 需要活集群是**可接受的缺口**，
+> 说清楚并改跑进程内车道，不伪造集群运行。**worker 键的寻址路径（grant-slot / file op）不得被削弱**
+> —— 新增的是 `resolve_host`，它读 agent pod 自己，`resolve` 一字未动（`test_c3_agent_client.py` 的
+> 既有 pin 原样通过）。
 
 ## Task 7: 退役 C1 与现场清理
 
@@ -431,7 +463,7 @@ worker 镜像**不再含任何特权二进制**。
 | # | 判据 | 在哪测 | 出处 |
 |---|---|---|---|
 | 1 | 槽位宿主 uid == X，且 `/proc/<pid>/cgroup` 与 worker 逐字相同 | 真机（Task 3） | §14.2.7 已预演 |
-| 2 | worker `CapEff=0` 且镜像里**没有**特权二进制 | 单测 + 真机 | §2.4 |
+| 2 | worker `CapEff=0` 且镜像里**没有**特权二进制 | 单测 pin（Task 4 片 B 已落：`test_c3_agent_manifest.py::test_the_worker_image_has_no_privileged_binary_and_the_agent_image_has_both`）+ 真机 | §2.4 |
 | 3 | agent 面 A 的 caps **恰为** `cap_setuid,cap_setgid+ep`，uid 65534 | 单测（`getcap` + `stat`） | §2.1 |
 | 4 | agent 面 B 的 caps **恰为** `0x0b` | 真机 `grep CapEff` | §2.2 |
 | 5 | 禁项（`SYS_ADMIN`/`SYS_PTRACE`/`NET_RAW`/`privileged`）不在 agent 与 worker 上 | 单测 pin | §2.3 |
@@ -444,7 +476,7 @@ worker 镜像**不再含任何特权二进制**。
 | 12 | **agent 面 A 的容器 BND 含 `SETUID`/`SETGID`**（否则 file caps 连 exec 都 EPERM） | 单测 pin | §2.1 |
 | 13 | **反查 = `NSpid` 命中 + worker pod 的 cgroup 命中**（两者都要）：同节点两个 worker 各有一个容器 pid 相同的子进程时，只认对的那个 | 单测 + 真机（**compose multinode**，Task 3） | §1 的 ⚠ |
 | 14 | **compose 分离栈（含 multinode）里有 agent 服务**，且 `local://` 形态未被改动 | 清单解析 pin | Global Constraints |
-| 15 | agent 用**独立镜像**：`Dockerfile.agent` 存在，且 **worker 镜像里没有 `/var/lib/e2b-priv/`** | 单测 pin | §2.0 |
+| 15 | agent 用**独立镜像**：`Dockerfile.agent` 存在，且 **worker 镜像里没有 `/var/lib/e2b-priv/`** | 单测 pin（Task 4 片 B 已落：`test_c3_agent_manifest.py::test_the_worker_image_has_no_privileged_binary_and_the_agent_image_has_both`） | §2.0 |
 | 16 | **并发建箱不因 CP 中转而串行化**：N 个 worker 同时建箱 ⇒ 全部成功、零队列超时、无超线性退化；**反面臂**（CP→agent 池压到 1）必须复现排队 | 真机（**compose multinode**，Task 3） | §4 规则 5 的代价 |
 
 > **⚠ 判据 13 与 16 的验收环境必须是"同机多 worker"**（`docker-compose.multinode.yml`，3 个 worker）。
@@ -458,6 +490,19 @@ worker 镜像**不再含任何特权二进制**。
 - **C3 双向可回退**：新树由 worker 建成、老代码（C1 的 broker）仍能 `chown` 接管 ——
   所以 P1–P5 期间两条路可以并存，直到 Task 7 才拆桥。
 - **顺序**：Task 7（拆桥）**必须**在所有真机验收通过之后。
+
+**⚠ Task 7 已执行（2026-09-29）—— 上面第二条的那半句话到此为止。** 桥拆了：`e2b-priv-broker`
+DaemonSet、`E2B_PRIV_HELPER_SOCKET`、worker 的 `wait-for-broker` 闸门与 `socket` transport 全部退役
+（`E2B_PRIV_HELPER_TRANSPORT=socket` 现在是启动期**具名拒绝**）。现行的回退面只有两条**单点**开关，
+再往前的形状都要整批 revert：
+
+- `E2B_SLOT_IDENTITY=spawn|agent-grant`（Task 2）—— **仍然可原地切**（agent 还得在，文件操作还走它）；
+- `E2B_PRIV_HELPER_TRANSPORT=agent|exec`（Task 4）—— 可切，但 `exec` **要求镜像里那两个
+  file-capability 二进制还在**（出厂 worker 镜像已不含它们）⇒ 只改 env 不改镜像 = 启动自检具名拒绝；
+- 退出到 **C1 的 broker 形状 / root worker**：**整批 revert 清单 + 镜像**，没有单开关。
+
+盘上数据不受影响（树仍是 `0770 owner=<池 uid> group=<worker gid>`，任何 root 进程都能接管）。
+完整口径见 `docs/c3-privilege-relocation.md` §14.8 与 `docs/k8s-deployment.md` §24.2。
 
 ## Self-Review
 

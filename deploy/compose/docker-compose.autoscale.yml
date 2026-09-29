@@ -62,6 +62,14 @@ services:
     environment:
       E2B_API_KEYS: ${E2B_API_KEYS:-local-key}
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
+      # C3 Task 2 (N49 / D5): spawned workers are named `e2b-worker-<ts>-<rand>`
+      # and joined to the `sandlock` network (see E2B_AS_DOCKER_NETWORK below),
+      # so the control plane resolves each node's expected address from its id
+      # (container name) via docker's embedded DNS. Explicit, never `auto`; an
+      # unresolvable node-scoped claim is refused. Per-node credentials
+      # (`E2B_INTERNAL_NODE_KEYS`) are not set here -- see `docs/open-issues.md`
+      # N49.
+      E2B_NODE_ADDRESS_MODE: hostname
       # Secret at-rest encryption + Redis persistence (E5.4).
       E2B_SECRET_MASTER_KEY: ${E2B_SECRET_MASTER_KEY:-}
       E2B_SECRET_MASTER_KEYS: ${E2B_SECRET_MASTER_KEYS:-}
@@ -163,7 +171,20 @@ services:
       # pooled sandbox's `/mcp` route was always a 503. It now defaults to the
       # MCP-capable image the control plane above uses (same variable, so one
       # `E2B_BASE_IMAGE=` in `.env` moves both sides together).
-      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-auto}", "E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", "E2B_PID_NS": "true", "E2B_ENABLE_NETWORK": "true", "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
+      # C3 Task 4 slice B / ruling D23: **`E2B_PRIV_HELPERS=off` is the
+      # pool's declaration that it has no privileged file-operation
+      # capability.** The workers this autoscaler spawns run the *worker*
+      # image, which no longer ships `/var/lib/e2b-priv/`; before this change
+      # `auto` would resolve no brokers quietly (one warning) and the pool
+      # would lose per-sandbox host uids and route-B without saying so. `off`
+      # is the existing explicit value for "never use the brokers": the pool
+      # keeps the in-process (E5.1) shape by declaration. The autoscaler's
+      # docker pool is **excluded from C3's coverage by name** (like
+      # `local://`; the coverage lists live in the C3 plan and
+      # `docs/c3-privilege-relocation.md` §11.1 item 4) -- giving it an agent
+      # would need a design for "how does the control plane address the *host*
+      # a pooled worker landed on", which is not built here.
+      E2B_AS_WORKER_ENV: '{"E2B_BASE_IMAGE": "${E2B_BASE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6}", "E2B_EXECUTOR": "${E2B_EXECUTOR:-auto}", "E2B_PRIV_HELPERS": "off", "E2B_ENABLE_NET_ISOLATION": "true", "E2B_FD_INJECT_CONNECT": "true", "E2B_PID_NS": "true", "E2B_ENABLE_NETWORK": "true", "E2B_ROUTE_B_TMP_ROOT": "/var/lib/e2b-sandboxes/.route-b", "E2B_IMAGE_CACHE_DIR": "/var/lib/e2b-sandboxes/_images", "E2B_IMAGE_CACHE_MAX_BYTES": "4294967296", "E2B_IMAGE_CACHE_EVICT_MIN_AGE_S": "300", "E2B_IMAGE_CACHE_OWNER_UID": "65534", "E2B_NODE_MEMORY_MB": "2048", "E2B_NODE_CPU_PERCENT": "200", "E2B_NODE_DISK_MB": "4096", "E2B_NODE_PROCESSES": "256"}'
       E2B_AS_POLL_S: ${E2B_AS_POLL_S:-5}
       E2B_AS_UTIL_THRESHOLD: ${E2B_AS_UTIL_THRESHOLD:-0.70}
       E2B_AS_SCALE_UP_COOLDOWN_S: ${E2B_AS_SCALE_UP_COOLDOWN_S:-60}

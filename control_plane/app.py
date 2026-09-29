@@ -25,8 +25,13 @@ from control_plane.api.snapshots import (
 )
 from control_plane.api.templates import router as templates_router
 from control_plane.api.volumes import router as volumes_router
+from control_plane.c3_agent_client import (
+    C3AgentClient,
+    build_agent_address_resolver,
+)
 from control_plane.config import Settings, local_node_quota_via_agent
 from control_plane.metrics import SlidingWindowCounter
+from control_plane.node_address import build_node_address_resolver
 from control_plane.queue import CreateQueue
 from control_plane.registry.manager import SandboxRegistry
 from control_plane.registry.ledger_alert import (
@@ -63,6 +68,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only (envd may be absent)
 
 
 logger = logging.getLogger(__name__)
+
+#: "The caller said nothing about the C3 agent client", as opposed to passing
+#: ``None`` -- which is a deployment that deliberately has none, and must make
+#: the slot-identity endpoint refuse by name rather than quietly build one.
+_UNSET = object()
 
 
 class _NoopRuntimeRegistry:
@@ -213,6 +223,9 @@ def create_app(
     snapshots_registry=None,
     nodes_registry=None,
     templates_registry=None,
+    node_address_resolver=None,
+    c3_agent_client=_UNSET,
+    worker_identity_source=_UNSET,
 ) -> FastAPI:
     settings = settings or Settings()
     redis_client = None
@@ -533,6 +546,37 @@ def create_app(
         redis_client=redis_client,
         heartbeat_timeout=settings.node_heartbeat_timeout_s,
     )
+    # C3 Task 2 / D4: where the internal API's *expected* node address and
+    # source IP come from. Injected by tests and embedders; otherwise built from
+    # ``E2B_NODE_ADDRESS_MODE`` (k8s pod API, or compose hostname resolution).
+    # Never learned from the request being validated (N49).
+    app.state.node_address_resolver = (
+        node_address_resolver or build_node_address_resolver(settings)
+    )
+    # C3 Task 3: the CP→agent instruction channel (the other half of the fleet's
+    # two channels). Built from the deployment's own shape; the token is what
+    # the agent demands, and an unset one is a named refusal per instruction
+    # rather than a silent unauthenticated call.
+    if c3_agent_client is _UNSET:
+        c3_agent_client = C3AgentClient(
+            resolver=build_agent_address_resolver(settings),
+            token=settings.c3_agent_token,
+            timeout_s=settings.c3_agent_timeout_s,
+            file_op_timeout_s=settings.c3_agent_file_op_timeout_s,
+            max_concurrency=settings.c3_agent_max_concurrency,
+        )
+    app.state.c3_agent_client = c3_agent_client
+    # Where a worker's own uid/gid may come from (C3 Task 4, fourth review ②):
+    # a trusted source, never the worker's own report. Unresolvable for a shape
+    # means "record no identity" -- and then every file operation that needs one
+    # refuses by name.
+    if worker_identity_source is _UNSET:
+        from control_plane.worker_identity_source import (
+            build_worker_identity_source,
+        )
+
+        worker_identity_source = build_worker_identity_source(settings)
+    app.state.worker_identity_source = worker_identity_source
     app.state.recent_failures = SlidingWindowCounter()
     app.state.templates = templates_registry or TemplateRegistry(
         platform_root / "_templates"

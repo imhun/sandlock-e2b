@@ -633,7 +633,13 @@ PYEOF" 2>&1 | tr -d '\r')"
             echo "      PER_UID_NONROOT_WARNING: $PU"
             echo "      XFS quota degradation warnings (must be 0): $XQ"
             echo "      $CAP"
-            ro "docker exec -u 0 $c getcap /var/lib/e2b-priv/e2b-slot-spawn /var/lib/e2b-priv/e2b-maint" | sed 's/^/      /'
+            # Task 4 slice B: the two file-capability binaries no longer live in
+            # the worker image (判据 2/15), so asking the *worker* for their caps
+            # only prints a `getcap` error now. The evidence moved: the worker is
+            # on the agent shape, and the binaries are in the agent's face-B
+            # container. Ask both, without letting either line fail the window.
+            ro "docker exec -u 0 $c getcap /var/lib/e2b-priv/e2b-maint" 2>&1 | sed 's/^/      worker(expect: no such file): /'
+            ro "docker exec -u 0 sandlock-c3-agent-maint-1 getcap /var/lib/e2b-priv/e2b-maint /var/lib/e2b-priv/as_uid" 2>&1 | sed 's/^/      agent face B: /'
             [ "${RB:-0}" -ge 1 ] 2>/dev/null || fail "$c: no route-B ready line since the restart"
             [ "${PU:-1}" = "0" ] || fail "$c: PER_UID_NONROOT_WARNING present"
             [ "${XQ:-1}" = "0" ] || fail "$c: still logging the XFS quota degradation warning"

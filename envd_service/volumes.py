@@ -42,6 +42,7 @@ import stat
 from pathlib import Path
 from typing import Any
 
+from envd_service.agent_fileops import AgentFileOpsError
 from envd_service.xfs_quota import (
     ProjectQuotaError,
     clear_project_limits,
@@ -111,7 +112,24 @@ def _ensure_traversable(path: Path) -> None:
                 )
 
 
-def _ensure_shared_volume_root(volume_root: Path, host_uid: int) -> None:
+def _volume_root_needs_handover(st) -> bool:
+    """Whether the shared volume root still belongs to root and must move (N3).
+
+    A seam as much as a rule: the hand-over only runs for a root-owned root
+    (the legacy layout the control-plane API used to create), and a test that
+    wants the branch has to force the predicate rather than depend on who owns
+    its fixture.
+    """
+    return st.st_uid == 0
+
+
+def _ensure_shared_volume_root(
+    volume_root: Path,
+    host_uid: int,
+    *,
+    sandbox_id: str | None = None,
+    volume: str | None = None,
+) -> None:
     """Apply the E3.2 shared-volume permission model to the volume root.
 
     A volume is shared across sandboxes with different host uids, so the root
@@ -157,11 +175,33 @@ def _ensure_shared_volume_root(volume_root: Path, host_uid: int) -> None:
             "cannot chmod volume root %s to %o: %s", volume_root, wanted, exc
         )
     try:
-        if st.st_uid == 0:
-            _chown_path(volume_root, host_uid)
+        if _volume_root_needs_handover(st):
+            _chown_path(
+                volume_root,
+                host_uid,
+                sandbox_id=sandbox_id,
+                volume=volume,
+                volume_root=True,
+            )
     except OSError as exc:
         logger.warning(
             "cannot hand volume root %s to uid %s: %s",
+            volume_root,
+            host_uid,
+            exc,
+        )
+    except AgentFileOpsError as exc:
+        # C3 Task 4 review, N3: the agent shape raises a ``RuntimeError`` (an
+        # ``AgentFileOpsError``), which the ``OSError`` arm above does not
+        # catch -- so a *documented best-effort* step would have aborted
+        # ``build_volume_mounts`` and therefore the sandbox create. Best-effort
+        # is kept, deliberately and for the same reason the OS arm keeps it:
+        # only a *root-owned* root is moved (a legacy-layout migration), and the
+        # sandbox's own mount view is its ``0770`` slice, which is handed over
+        # separately and still fails closed. So a refusal here degrades the
+        # shared root, not the mount -- named, never silent.
+        logger.warning(
+            "cannot hand volume root %s to uid %s through the agent: %s",
             volume_root,
             host_uid,
             exc,
@@ -180,7 +220,14 @@ def _ensure_shared_volume_root(volume_root: Path, host_uid: int) -> None:
         )
 
 
-def _chown_path(path: Path, host_uid: int) -> None:
+def _chown_path(
+    path: Path,
+    host_uid: int,
+    *,
+    sandbox_id: str | None = None,
+    volume: str | None = None,
+    volume_root: bool = False,
+) -> None:
     """chown one directory to a sandbox uid (broker-first on non-root workers).
 
     A non-root worker has no CAP_CHOWN of its own; the maintenance broker is
@@ -189,9 +236,26 @@ def _chown_path(path: Path, host_uid: int) -> None:
 
     The group is the worker's effective gid (fix round 1 / c1): the worker is
     the data-plane owner of the tree it manages.
-    """
-    from envd_service import priv_helpers
 
+    C3 Task 4: in the agent shape the step is the agent's
+    (``chown-volume-root`` / ``chown-volume-slice``), asked for as
+    ``{sandbox_id, op, volume}`` -- the control plane resolves the volume name
+    against its own registry, which is the only place that knows the host path.
+    """
+    from envd_service import agent_fileops, priv_helpers
+
+    client = agent_fileops.active()
+    if client is not None:
+        if sandbox_id is None or volume is None:
+            raise priv_helpers.PrivHelperError(
+                "the C3 agent shape needs the sandbox id and the volume name "
+                f"to hand {path} over: one of them was not named by the caller"
+            )
+        if volume_root:
+            client.chown_volume_root(sandbox_id, volume)
+        else:
+            client.chown_volume_slice(sandbox_id, volume)
+        return
     if priv_helpers.helpers_cover(path):
         priv_helpers.broker_chown(
             host_uid, path, recursive=False, gid=os.getegid()
@@ -201,10 +265,17 @@ def _chown_path(path: Path, host_uid: int) -> None:
 
 
 def _can_manage_sandbox_uid() -> bool:
-    """Whether this worker can put a path under a sandbox's own host uid."""
+    """Whether this worker can put a path under a sandbox's own host uid.
+
+    ``file_steps_available`` and not ``active_helpers``: C3's agent shape
+    installs no ``PrivHelpers`` -- its chowns travel to the agent -- so the
+    broker-only predicate answered "no" there and the whole volume ownership
+    model (the shared ``1777`` root and the slice's ``0770``) was skipped
+    silently (review Task 4 slice A, Important 2).
+    """
     from envd_service import priv_helpers
 
-    return os.geteuid() == 0 or priv_helpers.active_helpers() is not None
+    return os.geteuid() == 0 or priv_helpers.file_steps_available()
 
 
 def provision_sandbox_volume_mount(
@@ -236,7 +307,9 @@ def provision_sandbox_volume_mount(
     """
     volume_root = Path(volume_path)
     if host_uid is not None and _can_manage_sandbox_uid():
-        _ensure_shared_volume_root(volume_root, host_uid)
+        _ensure_shared_volume_root(
+            volume_root, host_uid, sandbox_id=sandbox_id, volume=volume_id
+        )
     if per_sandbox_quota_mb <= 0:
         return volume_root, None
     fs_mount = _volume_fs_mount(volume_root, fallback_mount_point)
@@ -251,7 +324,26 @@ def provision_sandbox_volume_mount(
 
             mode = priv_helpers.WORKSPACE_MODE
             group = os.getegid()
-            if priv_helpers.helpers_cover(sandbox_dir):
+            from envd_service import agent_fileops
+
+            agent_client = agent_fileops.active()
+            if agent_client is not None:
+                # C3 Task 4: mode first, while the worker still owns the slice
+                # (after the hand-over it would be EPERM), then the agent's
+                # chown -- asked for as ``{sandbox_id, op, volume}``.
+                try:
+                    os.chmod(sandbox_dir, mode)
+                except OSError as exc:
+                    logger.debug(
+                        "cannot set volume slice %s to %04o before chown: %s",
+                        sandbox_dir,
+                        mode,
+                        exc,
+                    )
+                agent_client.chown_volume_slice(
+                    sandbox_id, volume_id, recursive=True
+                )
+            elif priv_helpers.helpers_cover(sandbox_dir):
                 # chmod *before* chown: after the chown the worker is no longer
                 # the owner and chmod would be EPERM (the broker carries no
                 # CAP_FOWNER); the root shape hides the ordering, the non-root
@@ -431,6 +523,7 @@ def cleanup_volume_projects(
             continue
         sandbox_dir = entry.get("sandbox_dir")
         sandbox_id = entry.get("sandbox_id")
+        volume_id = entry.get("volume_id")
         projid = entry.get("projid")
         # Defensive: only ever remove a slice whose name matches the sandbox
         # id that owns it (a corrupted record must not delete arbitrary
@@ -469,9 +562,25 @@ def cleanup_volume_projects(
         # Fix round 1 / c1: the slice is `0770 <sandbox uid>:<worker gid>`, so
         # the worker's own group access can remove it in-process; e2b-maint is
         # the fallback for trees that access cannot reach.
-        from envd_service import priv_helpers
+        from envd_service import agent_fileops, priv_helpers
 
-        priv_helpers.remove_tree(sandbox_dir)
+        agent_client = agent_fileops.active()
+        if agent_client is not None:
+            # C3 Task 4: the agent removes the slice (``remove-volume-slice``);
+            # the volume name is what the control plane resolves against its own
+            # registry, and this call site has it from the mount payload.
+            if not isinstance(volume_id, str) or not volume_id:
+                # No name, no derivation: the control plane may not be handed a
+                # path instead (hard rule 3), so this is a refusal by name
+                # rather than a privileged removal this worker cannot do.
+                raise priv_helpers.PrivHelperError(
+                    f"the C3 agent shape cannot remove the slice of sandbox "
+                    f"{sandbox_id}: its volume name is not in the record "
+                    f"({entry!r})"
+                )
+            agent_client.remove_volume_slice(sandbox_id, volume_id)
+        else:
+            priv_helpers.remove_tree(sandbox_dir)
         if isinstance(projid, int) and projid > 0 and not sandbox_dir.exists():
             # N12, same shape as the workspace project: with the slice gone the
             # accounting is zero, so resetting the limits is what drops the row

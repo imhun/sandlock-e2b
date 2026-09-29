@@ -145,16 +145,19 @@ def test_an_absent_runtime_dir_measures_zero(tmp_path: Path) -> None:
     assert measure_platform_disk_bytes(tmp_path / "nothing-here") == 0
 
 
-def test_an_unlistable_runtime_dir_says_so_before_reporting_zero(
+def test_an_unlistable_runtime_dir_is_unknown_and_says_so(
     tmp_path: Path, monkeypatch, caplog
 ) -> None:
-    """``None`` becomes 0, and 0 reads as "the platform stores nothing".
+    """An unmeasurable account is ``None``, never 0 (C3 Task 4 review, I-3).
 
-    That number feeds the ledger alert *and* the checkpoint admission ("there is
-    room to try"), so the one path that turns a failed measurement into it must
-    not be silent -- the reachability is low (the broker's ``workspace-root-init``
-    chowns ``state/_runtime`` to the worker), but a silent 0 is exactly the
-    fail-open this log line exists to make visible.
+    This used to *be* 0, and 0 reads as "the platform stores nothing" to both the
+    ledger alert and the checkpoint admission ("there is room to try") -- the
+    fail-open this account exists to prevent. It is now the third answer, and the
+    line below is what an operator greps for when it starts happening. The
+    reachability is low in the pre-C3 shapes (the broker's
+    ``workspace-root-init`` chowns ``state/_runtime`` to the worker), but in
+    C3's agent shape the ``0700`` checkpoint stores are out of the worker's own
+    reach -- which is exactly when this must not read as "nothing".
     """
     state = tmp_path / "state"
     runtime = state / "_runtime"
@@ -170,7 +173,7 @@ def test_an_unlistable_runtime_dir_says_so_before_reporting_zero(
     monkeypatch.setattr(os, "scandir", refuse)
     with caplog.at_level(logging.WARNING, logger="envd_service.runtime.platform_disk"):
         measured = measure_platform_disk_bytes(tmp_path, state_base=state)
-    assert measured == 0
+    assert measured is None
     assert [record.levelname for record in caplog.records] == ["WARNING"]
     assert (
         caplog.records[0].getMessage().split(";", 1)[0]

@@ -1,0 +1,722 @@
+# C3（Task 3）：每节点一个 agent —— 槽位身份的**唯一授予者**。
+#
+# 它承接两件事，因此是**一个 DaemonSet、两个容器**（`plan §2.0` 定案）：
+#
+#   face A `agent` —— 身份授予。CP 把「哪个节点、哪个沙箱、哪个 uid、哪个 pid」发过来，
+#     它用宿主 `/proc` 把 worker 报的**容器 pid** 反查成**宿主 pid**（所以必须
+#     `hostPID: true`），再让镜像里那个面 A 原语写一次 `uid_map`。它以 **65534** 跑，
+#     容器 BND 里带上 `SETUID`/`SETGID` —— 这是**声明**不是授权：file capability 必须是
+#     容器 BND 的子集，否则内核在 `exec` 那一步就拒绝（非 root 进程的 `CapEff` 仍是 0）。
+#
+#   face B `maint` —— 文件操作面（C1 的 `e2b-maint` 原样搬进来，**复用
+#     `deploy/priv/priv_common.c` 的路径白名单纪律，不另写一套**）。它必须是 **root**：
+#     工作区在阿里云 NAS 上走 AUTH_SYS，`chown` 只有 uid 0 做得成（2026-09-17 实测，
+#     见 `docs/production-deployment-requirements.md` §5.4(b)；原记录在 C1 的
+#     `deploy/k8s/priv-broker.yaml` 文件头，该 DaemonSet 已由 C3 Task 7 退役）。
+#     **能力集与 C1 的 broker 逐条相同** —— 本任务只搬家，不扩面（C3 Task 7 之后
+#     它就是这个节点上**唯一**的 root 组件）。载荷是 **Task 4 片 B 装上的**：与面 A **同一个服务**
+#     （`python3 -m deploy.c3_agent`，一张 op 表），但听**自己的端口 49986**（裁定 D22）：
+#     两个容器共享 pod netns，都绑 49985 会 `EADDRINUSE`；而把 file op 送到 65534 的面 A
+#     上，NFS 上每个 chown 都会 `EPERM`（看起来像权限 bug 的失败）。控制面按
+#     `E2B_C3_AGENT_MAINT_PORT` 寻址它。
+#
+# ⚠ `hostPID` 是 **pod 级**字段 ⇒ face B 也会拿到它。这是 `plan §2.0` 明确点名接受的
+#   增量（face B 本来就是 root + `DAC_OVERRIDE`），不是顺手漏出来的。
+#
+# ⚠ **身份是「宿主/节点」的名字**（D12）：`E2B_C3_AGENT_NODE_ID` 取自
+#   `spec.nodeName`，**不是** pod 名。一个节点上可能同时有多个 worker（k8s 2 个副本；
+#   multinode compose 三个 worker 同机）——用 worker pod 名当身份会歧义。CP 侧的寻址器
+#   正是按"worker pod → `spec.nodeName`"解析的，worker 自己的身份（pod 名 + pod UID +
+#   它记的 pid namespace）随指令体一起下发。
+#
+# ⚠ **红线**（`plan §2.3`）在本文件里逐条成立：没有内核特权大件、没有 host 网络、没有
+#   特权容器、也**没有**任何"禁止提权"式的字段 —— 后者会让内核**静默忽略** file
+#   capabilities，face A 会像装好了却永远授不出身份（判据 11）。本文件里连这些词都
+#   不出现在注释里，免得文本级 pin 被自己的说明骗过。
+#
+# 暴露面：agent 只应答 **CP**（下面的 NetworkPolicy 是"只有两条通道"的连接层那一半；
+# 服务自己的 token 检查是第二半，不是替代）。`worker ↔ agent` 这条通道不存在。
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: e2b-c3-agent
+  namespace: sandlock
+  labels:
+    app: c3-agent
+spec:
+  selector:
+    matchLabels:
+      app: c3-agent
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: c3-agent
+    spec:
+      # face A 的反查要读**宿主**的进程表；这是它唯一的特权形态，且它不因此获得任何
+      # 能力（只影响可见性）。
+      hostPID: true
+      # 调度域与 worker/broker 完全一致：虚拟节点（ECI/任何 virtual-kubelet）跑不了
+      # 这个 pod，那里也没有 worker 需要它。
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: type
+                    operator: NotIn
+                    values:
+                      - virtual-kubelet
+      # C3 Task 5 (D24): the platform-storage ownership jobs, moved off the
+      # control-plane pod -- §3.2 step 3's `image-cache-init`, plus the volume
+      # store's hand-over that D24 added in its place.
+      #
+      # Both are "hand a directory on the shared mount to the uid that writes
+      # it", and both need uid 0 for the same reason face B does (`chown` on
+      # this NAS goes through AUTH_SYS, which honours only uid 0):
+      #
+      #   * `_images` -- the rootfs/OCI cache. The control plane (now 65534)
+      #     exports the template layout tars into `_images/_oci/` and the
+      #     workers extract from the same root, so it has to belong to 65534
+      #     before either writes. Moved verbatim from the control-plane pod:
+      #     the recursive form is safe *there* because the shared `_images`
+      #     holds only `_oci/` (per-sandbox secrets live in the node-local
+      #     `E2B_IMAGE_CACHE_DIR`, `/var/lib/e2b-images`, whose directories the
+      #     face B's sibling init owns -- C1's broker DaemonSet carried the same
+      #     init and C3 Task 7 retired it, so face B is the only copy left).
+      #   * `_volumes` -- the volume store. The control plane creates
+      #     `<store>/<volume_id>` and writes `<store>/_meta/<volume_id>.json`,
+      #     and with the CP at 65534 both are *owner* operations only if the
+      #     store belongs to it. D24: the hand-over is one `chown` of the store
+      #     itself, **non-recursive on purpose** -- the entries below it are the
+      #     sandbox volume data (`<id>/` and the per-sandbox quota slices),
+      #     which belong to pooled sandbox uids and must never be taken back by
+      #     a platform rollout. The recursive form is the regression this file
+      #     must not acquire.
+      #
+      # Idempotent and audible: every target is either "already belongs to uid
+      # 65534" (nothing to do -- the second node of a shared mount lands here)
+      # or "handed over", and the store's own ownership is *verified*, so an
+      # NFS `root_squash` that refuses the chown stops this pod with the exact
+      # one-time fix instead of failing later, at the first volume create,
+      # inside the control plane (which now names the same command --
+      # `control_plane.registry.volumes.VolumeRootNotOwnedError`).
+      initContainers:
+        - name: storage-init
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
+          securityContext:
+            runAsUser: 0
+            # Review round 1 (minor 1): this container used to run as root with
+            # the runtime's **default** capability set -- the only container in
+            # this pod with a broader set than the two reviewed faces (face B is
+            # `drop: [ALL]` + the three below). 判定 4 reads the pod, so that was
+            # a real widening of the surface the plan is shrinking.
+            #
+            # The set is face B's, verbatim, and it is *measured*, not copied by
+            # analogy: `mkdir -p "$dir/_oci"` in a directory that is already
+            # `65534:65534 0755` (the idempotent re-run, or a
+            # partially-initialised cache) needs `DAC_OVERRIDE` -- with only
+            # `CHOWN`+`FOWNER` it fails `EACCES` and `set -e` turns a healthy
+            # deployment into an Init:Error (measured: as uid 0 with
+            # `--cap-drop ALL --cap-add CHOWN --cap-add FOWNER`,
+            # `mkdir -p <65534-owned dir>/_oci` → `Permission denied`).
+            # `FOWNER` covers `chmod 0755 "$dir"` on a directory this process
+            # does not own; `CHOWN` covers the hand-over itself.
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+          command:
+            - /bin/sh
+            - -c
+            - |-
+              set -e
+              # 1. The two image caches, before the control plane or any worker
+              #    writes them (Z-F7 C1). Both halves came from the broker
+              #    DaemonSet's `image-cache-init`; C3 Task 5 moved the shared
+              #    one, Task 7 moved the node-local one when it retired the
+              #    DaemonSet -- this is the only copy left, so the *careful*
+              #    form is the one that had to survive:
+              #
+              #    * the top-level directory is handed over **non-recursively**
+              #      (the 65534 worker creates its lock files and staging trees
+              #      there) and `_oci/` recursively (the control plane's tars);
+              #    * `secrets/<sandbox_id>/<name>.secret` are **live sandbox
+              #      files** (0600, owned by that sandbox's pooled uid, handed
+              #      over by `envd_service/executors/sandlock.py`). A
+              #      `chown -R "$dir"` here would take them back to 65534 on
+              #      every agent rollout -- and the documented upgrade step
+              #      rolls this DaemonSet -- leaving running sandboxes unable
+              #      to read their own secrets. `-type d` is the contract, not
+              #      an optimization;
+              #    * `secrets/` itself and the directories below it *do* have to
+              #      belong to 65534, because the worker mkdirs/unlinks under
+              #      them and nothing else ever chowns them (the old root worker
+              #      left them root:0755 on the upgrade path).
+              for dir in $CACHE_DIRS; do
+                mkdir -p "$dir/_oci"
+                chmod 0755 "$dir" "$dir/_oci" 2>/dev/null || true
+                chown 65534:65534 "$dir" 2>/dev/null ||
+                  echo "storage-init: chown refused ($dir, NFS root_squash?) -- verifying the owner instead"
+                chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||
+                  echo "storage-init: chown refused ($dir/_oci, NFS root_squash?) -- verifying the owner instead"
+                if [ -d "$dir/secrets" ]; then
+                  chown 65534:65534 "$dir/secrets" 2>/dev/null || echo "storage-init: chown refused ($dir/secrets, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid 65534"
+                  find "$dir/secrets" -mindepth 1 -maxdepth 2 -type d -exec chown 65534:65534 {} + 2>/dev/null || echo "storage-init: chown refused ($dir/secrets -mindepth 1 -maxdepth 2, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid 65534"
+                  echo "storage-init: handed $dir/secrets (directories only; *.secret files stay with their sandbox uid) to uid 65534"
+                fi
+                owner="$(stat -c %u "$dir")"
+                if [ "$owner" != "65534" ]; then
+                  echo "storage-init: FATAL: $dir is owned by uid $owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
+                  echo "storage-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $dir && chown -R 65534:65534 $dir/_oci" >&2
+                  exit 1
+                fi
+                echo "storage-init: $dir is owned by uid 65534"
+              done
+              # 2. The volume store (D24). `hand_over` moves one directory's
+              #    owner and nothing else, and **verifies what it moved**: a
+              #    target that is not 65534 after the attempt is a FATAL for
+              #    *that* target (the caller exits 1). `_meta` is created lazily
+              #    by the control plane, so a missing one is the one no-op.
+              #
+              #    Review round 1 (Important): `_meta` used to be handed over
+              #    without a gate, and the success line printed unconditionally
+              #    -- so an NFS refusal on `_meta` read as success here and then
+              #    surfaced much later, un-named, on the *second* write D24's
+              #    recon found (`_write_record` → `write_text_atomically`'s lazy
+              #    `mkdir`/`os.open`, which is outside the control plane's own
+              #    `VolumeRootNotOwnedError` wrapper). Both targets now go
+              #    through the same verify, and the echo sits *below* it.
+              hand_over() {
+                target="$1"
+                if [ ! -e "$target" ]; then
+                  echo "storage-init: $target does not exist -- nothing to hand over (the control plane creates it under its own uid when it first needs it)"
+                  return 0
+                fi
+                owner="$(stat -c %u "$target")"
+                mode="$(stat -c %a "$target")"
+                if [ "$owner" = "65534" ]; then
+                  echo "storage-init: $target already belongs to uid 65534 (mode $mode) -- nothing to do"
+                  return 0
+                fi
+                chown 65534:65534 "$target" 2>/dev/null ||
+                  echo "storage-init: chown refused ($target, NFS root_squash?) -- the control plane (uid 65534) cannot create or record a volume until this is done once: chown 65534:65534 $target" >&2
+                owner="$(stat -c %u "$target")"
+                mode="$(stat -c %a "$target")"
+                if [ "$owner" != "65534" ]; then
+                  echo "storage-init: FATAL: $target is owned by uid $owner, not the control-plane uid 65534: the control plane creates every volume as <store>/<volume_id> and writes <store>/_meta/<volume_id>.json, so the first volume create would fail with EACCES" >&2
+                  echo "storage-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $target  (non-recursive: the volume data directories below it belong to pooled sandbox uids)" >&2
+                  return 1
+                fi
+                echo "storage-init: $target -> uid $owner mode $mode (a non-recursive hand-over; the sandbox volume data directories below it keep their pooled uids)"
+                return 0
+              }
+              volume_store="$SHARED_ROOT/_volumes"
+              if [ ! -e "$volume_store" ]; then
+                # It has to *exist* before the control plane pod starts (that
+                # pod mounts it as a subPath, and a missing subPath source
+                # leaves it in ContainerCreating), and the control plane cannot
+                # make it once it is uid 65534 unless the parent happens to be
+                # writable. C1's broker `workspace-root-init` used to create it;
+                # that DaemonSet is retired (C3 Task 7), so this is the only
+                # copy of the creator -- root mkdir, then the same hand-over.
+                mkdir -p "$volume_store"
+                echo "storage-init: created $volume_store (the platform's volume store)"
+              fi
+              # Both halves are gated, and both fail loudly for *their own*
+              # target -- the store root (the `mkdir` D24's A3 needs) and the
+              # record directory (the `_write_record` half found in recon).
+              hand_over "$volume_store" || exit 1
+              hand_over "$volume_store/_meta" || exit 1
+              # Reached only when both gates passed, so this line cannot claim a
+              # success that did not happen.
+              store_owner="$(stat -c %u "$volume_store")"
+              echo "storage-init: $volume_store is owned by uid $store_owner (the volume data directories below it are left alone)"
+          env:
+            - name: CACHE_DIRS
+              # Both caches, in the order they are created: the node-local one
+              # the worker unpacks into and the shared one whose `_oci/` the
+              # control plane writes tars into. (Verbatim from C1's
+              # `image-cache-init`, which C3 Task 7 retired with the broker.)
+              value: /var/lib/e2b-images /var/lib/e2b-sandboxes/_images
+            - name: SHARED_ROOT
+              value: /var/lib/e2b-sandboxes
+          volumeMounts:
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
+            - name: image-cache
+              mountPath: /var/lib/e2b-images
+        # C3 Task 7: the broker's `workspace-root-init`, moved here verbatim when
+        # its DaemonSet was retired. It is the *only* thing that creates the
+        # platform's own roots on a fresh volume, and two of its products are
+        # load-bearing before anything else starts:
+        #
+        #   * `<workspaces>` and `<state>` are `subPath` sources for the worker
+        #     and the control plane -- a missing subPath source keeps that pod
+        #     in `ContainerCreating` forever;
+        #   * `<state>` is where `uid_pool.acquire` opens
+        #     `<state>/.uid_pool.lock`, so a missing base turns the first
+        #     `Sandbox.create()` into ENOENT.
+        #
+        # It also repairs-once-then-verifies the ownership the 65534 worker
+        # needs (`<workspaces>/_snapshots`, `state/_runtime/.checkpoints`, and
+        # the two writable roots), stopping the pod by name instead of failing
+        # every create later. It runs as root for the same NFS reason face B
+        # does (AUTH_SYS only honours uid 0 for `chown`).
+        - name: workspace-root-init
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
+          securityContext:
+            runAsUser: 0
+            # Review round 2 (item 1): this container came over from the
+            # retired broker's `workspace-root-init` verbatim, `runAsUser: 0`
+            # and **no** `capabilities:` block -- i.e. the runtime's default
+            # bounding set, the same widening `storage-init` was fixed for in
+            # round 1. The set below is face B's, and it is what *this* script
+            # actually uses, one verb at a time:
+            #   * `CHOWN`        -- the hand-over itself (`chown 65534:65534`
+            #                       on `_snapshots` / `_runtime` / `.checkpoints`);
+            #   * `DAC_OVERRIDE` -- `mkdir -p` into a directory the process
+            #                       does not own on the idempotent re-run (a
+            #                       second node on the shared mount, or a
+            #                       half-initialised export). Measured the same
+            #                       way as `storage-init`: as uid 0 with only
+            #                       `CHOWN`+`FOWNER`, `mkdir -p <65534-owned
+            #                       dir>/<new>` is `EACCES`;
+            #   * `FOWNER`       -- `chmod 0755`/`0711`/`1777` on directories
+            #                       this process does not own.
+            # NNP is still absent (the kernel must not ignore face A's file
+            # capabilities), and the forbidden tokens stay off the file.
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+          command:
+            - /bin/sh
+            - -c
+            - |-
+              set -e
+              shared="$SHARED_ROOT"
+              base="$WORKSPACE_BASE"
+              state="$STATE_BASE"
+              # OBS-9: the control plane mounts these back on top of its
+              # read-only view of the shared volume (subPath mounts), and a
+              # subPath whose source does not exist keeps that pod in
+              # ContainerCreating. Creating them here -- the one init container
+              # that already runs as root with the volume mounted RW -- means a
+              # fresh install converges without a separate bootstrap step.
+              # They stay on the *export* root: they are the platform's own
+              # namespaces, not sandbox trees.
+              for dir in _builds _images _secrets _templates _snapshots _volumes; do
+                mkdir -p "$shared/$dir"
+              done
+              # N27: the sandbox trees sink one level (`<export>/workspaces/<id>`)
+              # and the platform's own state becomes their *sibling*
+              # (`<export>/state`), on this same mount -- that is what makes the
+              # migration a metadata-only `rename` and what puts the platform's
+              # files off the path a sandbox reaches by walking `..`. Two
+              # readers depend on both existing before the worker starts:
+              #   * `<state>`: `uid_pool.acquire` opens
+              #     `<state>/.uid_pool.lock` (and later
+              #     `<state>/_runtime/<id>/sandbox.json`) with the base it was
+              #     handed -- a missing base turns the first `Sandbox.create()`
+              #     into ENOENT instead of a uid. Nothing derives it from the
+              #     tree root, on purpose: a base the code made up out of band
+              #     would land with the wrong owner on NFS.
+              #   * `workspaces`: it is the worker's own tree root.
+              for dir in "$base" "$state"; do
+                mkdir -p "$dir"
+              done
+              # ...and one directory *inside* the tree root, `<workspaces>/_migrate`:
+              # the control plane's migration staging, and the only thing that pod
+              # is allowed to write under the tree root (its one writable subPath
+              # there -- sandbox trees stay EROFS for it, OBS-9). The worker's own
+              # migration endpoints use `<workspace_base>/_migrate` too
+              # (`envd_service/agent.py`), so both sides name one directory.
+              mkdir -p "$base/_migrate"
+              # ...and the *other* platform directory that lives inside the tree
+              # root: the **live snapshot payload store**. Its two roots are
+              # different, and *this* one is the worker's: the worker's snapshot
+              # endpoints hard-code their payload root at
+              # `<workspace_base>/_snapshots/<id>` (`envd_service/agent.py`'s
+              # copy/export/delete routes), so on this deployment that is
+              # `<export>/workspaces/_snapshots` -- one level below the *export*
+              # root. (The control plane's own records live on the other root,
+              # `<export>/_snapshots/<id>`: `SnapshotRegistry` is built on the
+              # shared export root, `control_plane/app.py`'s `platform_root` =
+              # `settings.shared_workspace_root`, see
+              # `control_plane/registry/snapshots.py`. Both roots are in the
+              # migration plan; only this one is under the tree root.)
+              # N27 sank the tree root to `<export>/workspaces` (no longer the
+              # export root), so after C1 -- when the worker runs as uid 65534 --
+              # this directory has to be handed to it: left as root:0755 (which is
+              # what it is on the cluster today), the 65534 worker's *first*
+              # snapshot create is EACCES. That is the silent kind: nothing fails
+              # until the first create_snapshot. Same failure semantics as the
+              # gate below -- chown, then verify, and refuse loudly instead of
+              # starting a worker that cannot snapshot.
+              #
+              # Mode **0755** (the existing convention for the platform's own
+              # top-level directories), *not* 1777: this root serves the worker,
+              # so it needs no cross-uid sharing and must not be staged like the
+              # sandbox tree root.
+              mkdir -p "$base/_snapshots"
+              chown 65534:65534 "$base/_snapshots" 2>/dev/null ||
+                echo "workspace-root-init: chown refused ($base/_snapshots, NFS root_squash?)"
+              chmod 0755 "$base/_snapshots" 2>/dev/null ||
+                echo "workspace-root-init: chmod refused ($base/_snapshots)"
+              snap_owner="$(stat -c %u "$base/_snapshots")"
+              snap_mode="$(stat -c %a "$base/_snapshots")"
+              echo "workspace-root-init: $base/_snapshots owner=$snap_owner mode=$snap_mode"
+              if [ "$snap_owner" != "65534" ]; then
+                echo "workspace-root-init: FATAL: $base/_snapshots is owned by uid $snap_owner, not the worker uid 65534: the worker's snapshot payload endpoints write every payload under it (envd_service/agent.py hard-codes <workspace_base>/_snapshots), so the first create_snapshot would fail with EACCES" >&2
+                echo "workspace-root-init: fix it once (on the node, or on the storage server): chown 65534:65534 $base/_snapshots" >&2
+                exit 1
+              fi
+              # The checkpoint store's gate. An image is written by the
+              # sandbox's *own* slot, so every level down to it has to be
+              # traversable by that pooled uid -- while nobody below the worker
+              # may list it: hence 0711 (traverse, no listing), the same
+              # convention `checkpoint_store._prepare_image_parent` sets when it
+              # gets there first. The directories below these (`_runtime/<id>`,
+              # `.checkpoints/<id>`) stay 0700 and are created by the worker and
+              # the slot. The worker owns all three, because it is the worker
+              # that creates the record and image directories under them.
+              mkdir -p "$state/_runtime/.checkpoints"
+              chown 65534:65534 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||
+                echo "workspace-root-init: chown refused ($state/_runtime, NFS root_squash?)"
+              chmod 0711 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||
+                echo "workspace-root-init: chmod refused ($state/_runtime)"
+              # The checkpoint store's gate has to belong to the worker for a
+              # second reason: a root-owned 0711 gate is *traversable* by the
+              # slot but the 65534 worker cannot create `.checkpoints/<id>`
+              # inside it, and that failure only shows up as an EACCES at the
+              # first pause. Say so here instead.
+              for target in "$state/_runtime" "$state/_runtime/.checkpoints"; do
+                owner="$(stat -c %u "$target")"
+                mode="$(stat -c %a "$target")"
+                echo "workspace-root-init: $target owner=$owner mode=$mode"
+                if [ "$owner" != "65534" ]; then
+                  echo "workspace-root-init: FATAL: $target is owned by uid $owner, not the worker uid 65534: the worker creates the record and checkpoint-image directories below it, so a captured image could never be written (EACCES at the first pause)" >&2
+                  echo "workspace-root-init: fix it once (on the node, or on the storage server): chown 65534:65534 $target && chmod 0711 $target" >&2
+                  exit 1
+                fi
+              done
+              # The two roots -- and the migration staging inside the tree root,
+              # which the worker itself writes a tar into and reads back
+              # (`envd_service/agent.py`'s export/import endpoints) -- get
+              # today's judgement, unchanged in shape: the worker creates
+              # top-level names in each of them directly (a sandbox tree under
+              # `workspaces`, the uid pool's lock and the runtime records under
+              # `state`), so each has to be writable by it -- owner 65534, or
+              # 1777 as the compose convention -- and a target that is neither
+              # stops the pod here with the one-time fix instead of failing
+              # every create.
+              for target in "$base" "$state" "$base/_migrate"; do
+                owner="$(stat -c %u "$target")"
+                mode="$(stat -c %a "$target")"
+                echo "workspace-root-init: $target owner=$owner mode=$mode"
+                if [ "$owner" != "65534" ]; then
+                  chmod 1777 "$target" 2>/dev/null ||
+                    echo "workspace-root-init: chmod refused (NFS root_squash?)"
+                  owner="$(stat -c %u "$target")"
+                  mode="$(stat -c %a "$target")"
+                fi
+                world_writable=0
+                case "$mode" in *2|*3|*6|*7) world_writable=1 ;; esac
+                if [ "$owner" != "65534" ] && [ "$world_writable" != "1" ]; then
+                  echo "workspace-root-init: FATAL: $target is mode $mode, owned by uid $owner -- the worker (uid 65534) cannot create the top-level names it owns there, so every Sandbox.create() would fail with EACCES" >&2
+                  echo "workspace-root-init: fix it once (on the node, or on the storage server): chmod 1777 $target  (or chown 65534:65534 $target)" >&2
+                  exit 1
+                fi
+                echo "workspace-root-init: $target is writable by uid 65534 (owner=$owner mode=$mode)"
+              done
+          env:
+            - name: SHARED_ROOT
+              value: /var/lib/e2b-sandboxes
+            - name: WORKSPACE_BASE
+              value: /var/lib/e2b-sandboxes/workspaces
+            - name: STATE_BASE
+              value: /var/lib/e2b-sandboxes/state
+          volumeMounts:
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
+      containers:
+        # ------------------------------------------------------------------
+        # face A：身份授予（非 root，两个 file capability）
+        # ------------------------------------------------------------------
+        - name: agent
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 49985
+          env:
+            # D12：身份 = **节点名**（不是 pod 名）。服务用它回答唯一那个本地问题
+            # "这条指令是发给我的吗？"。
+            - name: E2B_C3_AGENT_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # CP→agent 的唯一凭据。**它绝不出现在 worker 清单或 worker 镜像里**
+            # （`tests/unit/test_c3_internal_api_shape.py` 的 pin），由
+            # `deploy/k8s-k0s/secrets.sh` 与其他托管键一起生成。
+            - name: E2B_C3_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_C3_AGENT_TOKEN
+          securityContext:
+            # 65534 = worker 自己的 uid：写 uid_map 要求写者 euid == 目标 user
+            # namespace 的 owner，而那个 owner 就是"天生 65534"的 worker（§14.2.7）。
+            runAsUser: 65534
+            capabilities:
+              # BND 声明：`as_uid` 的 file capabilities 必须是它的子集，否则 `exec`
+              # EPERM。这两条对非 root 进程**不产生** CapEff。
+              add:
+                - SETUID
+                - SETGID
+          # 探针走 `exec`（容器内自连 127.0.0.1）：kubelet 的 httpGet 是从节点发起
+          # 的网络请求，会被下面那条"只许 CP 进"的 NetworkPolicy 挡在半路。
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import socket; socket.create_connection(('127.0.0.1', 49985), 2).close()"
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import socket; socket.create_connection(('127.0.0.1', 49985), 2).close()"
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              # 一次授予 = 一次 `/proc` 扫描 + 一个 `as_uid` 子进程；并发上限由
+              # CP 侧的 `E2B_C3_AGENT_MAX_CONCURRENCY` 管。这里是跑飞量的兜底。
+              cpu: "1"
+              memory: 256Mi
+        # ------------------------------------------------------------------
+        # face B：文件操作面（root + C1 的三条能力）—— Task 4 装上载荷
+        # ------------------------------------------------------------------
+        - name: maint
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          # Task 4 slice B: the payload. **The same service face A runs** --
+          # one app, one op table (`grant-slot` + `chown`/`rm`/`walk`), so the
+          # handler and the refusal shapes cannot drift between the faces. It
+          # listens on **its own port** (D22): the two containers share the pod
+          # netns, so a second listener on face A's 49985 would be
+          # `EADDRINUSE`, and the control plane addresses the file verbs at
+          # this one (`E2B_C3_AGENT_MAINT_PORT`).
+          env:
+            # D12: the same host identity face A carries. The control plane
+            # puts *this host's* name in the URL path of every instruction
+            # (face A's and face B's alike), and each face answers only for
+            # itself.
+            - name: E2B_C3_AGENT_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # The same CP→agent credential as face A; **neither face's copy
+            # ever appears on a worker** (`tests/unit/test_c3_internal_api_shape.py`).
+            - name: E2B_C3_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_C3_AGENT_TOKEN
+            # D22: face B's own port. Face A keeps 49985 (its `ports:` below
+            # and the control plane's `E2B_C3_AGENT_PORT` default).
+            - name: E2B_C3_AGENT_PORT
+              value: "49986"
+            # 与 C1 broker 逐字相同的四个白名单根（`priv_common.c` 的纪律）；
+            # `E2B_STATE_BASE` 与 k8s worker 的 N27 形态逐字一致（`.route-b`
+            # 与 `_runtime` 都在它下面）。
+            - name: E2B_WORKSPACE_BASE
+              value: /var/lib/e2b-sandboxes/workspaces
+            - name: E2B_STATE_BASE
+              value: /var/lib/e2b-sandboxes/state
+            - name: E2B_SHARED_VOLUME_ROOT
+              value: /var/lib/e2b-sandboxes
+            - name: E2B_IMAGE_CACHE_DIR
+              value: /var/lib/e2b-images
+            # The uid pool is an input of `priv_common.c` (`--uid` is refused
+            # outside `START..+SIZE`), and it must equal the worker it serves:
+            # the k8s worker follows the code default, 10000/1000.
+            - name: E2B_UID_POOL_START
+              value: "10000"
+            - name: E2B_UID_POOL_SIZE
+              value: "1000"
+            # ------------------------------------------------------------------
+            # C3 Task 6：自愈的"眼睛"。这是 agent 今天**唯一主动发起**的连接：
+            # 它周期扫描自己挂着的 `<workspaces>/*`，把看见的沙箱 id 报给控制面
+            # (`POST /internal/nodes/<本节点名>/agent/inventory`)，控制面用**权威
+            # 记录**判定哪些树真的没人认领，再指令**本节点**的 agent 用既有的
+            # `rm` 删掉。判据：worker 崩溃且**不重启**时盘上仍在 N 分钟内收敛 ——
+            # 30s 首扫 + 120s 周期 ⇒ **2–3 分钟**。
+            #
+            # 只挂在 face B 上：扫描要的是共享工作区挂载，只有这个容器有（face A
+            # 一个 volumeMount 都没有）。报的是 id 和别的什么也没有（没有 path、
+            # 没有 uid、没有"请删"）—— 目标一律由控制面推导（硬规则 3 / §14.4）。
+            - name: E2B_C3_AGENT_SCAN
+              value: "on"
+            # 与 worker/gateway 同一个变量、同一个语义（k8s 里就是 Service 名）。
+            - name: E2B_CONTROL_PLANE_URL
+              value: http://control-plane:3000
+            - name: E2B_C3_AGENT_SCAN_INITIAL_DELAY_S
+              value: "30"
+            - name: E2B_C3_AGENT_SCAN_INTERVAL_S
+              value: "120"
+            # 被控制面具名推迟的轮次按倍率退避，封顶 10 分钟：既不会变成整舰队的
+            # 轮询，也不会安静地停摆。
+            - name: E2B_C3_AGENT_SCAN_BACKOFF_MAX_S
+              value: "600"
+          # The CP dials this port; nothing else may (the NetworkPolicy below
+          # allows exactly the control plane's pod on the two agent ports).
+          ports:
+            - containerPort: 49986
+          # Probes go through `exec` and self-connect on loopback, the same
+          # reason face A's do: a kubelet `httpGet` is issued from the node and
+          # is refused by the ingress rule.
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import socket; socket.create_connection(('127.0.0.1', 49986), 2).close()"
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import socket; socket.create_connection(('127.0.0.1', 49986), 2).close()"
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            # NFS AUTH_SYS 只认凭据 uid：`chown` 给别人（比如池 uid 10000）只有 uid 0
+            # 做得成。`drop: [ALL]` 必须配 `add`，否则这里只是"在 root 默认集上追加"。
+            runAsUser: 0
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+          volumeMounts:
+            # 与 worker 同一个 RWX claim、同一个路径：白名单按解析后的路径比较，
+            # 属主/删除必须落在 worker 看得见的那些树上。
+            - name: shared
+              mountPath: /var/lib/e2b-sandboxes
+            # 节点本地的解包缓存（第四个白名单根），与 worker/broker 同一个 hostPath。
+            - name: image-cache
+              mountPath: /var/lib/e2b-images
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: sandbox-shared
+        - name: image-cache
+          hostPath:
+            path: /var/lib/e2b-images
+            type: DirectoryOrCreate
+---
+# "只有两条通道"的连接层：agent 只接受 **control-plane** pod 进来的连接（只在那两
+# 个端口上），worker 直接来敲会被网络层挡掉 —— 不靠 agent 自己判断（判据 ⑥ 的
+# "连接层就拒"）。
+#
+# `Egress`（C3 Task 6 加上）：agent 从"今天一个连接都不发起"变成**发起一个**——
+# 巡检上报（它是"眼睛"，`E2B_C3_AGENT_SCAN=on` 的那张报告）。这条出口写到最窄：
+# 只允许到 control-plane pod 的 3000 端口，别的目的地一律仍被挡（不是"出口放开"，
+# 是把那条具名的通道写出来）。控制面侧没有 NetworkPolicy（它本来就接收 worker 与
+# gateway 的 `/internal/**`），所以这里只收紧 agent 这一端。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: e2b-c3-agent
+  namespace: sandlock
+spec:
+  podSelector:
+    matchLabels:
+      app: c3-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: control-plane
+      ports:
+        # face A (`grant-slot`) ...
+        - protocol: TCP
+          port: 49985
+        # ...and face B (`chown`/`rm`/`walk`, D22). Both are still
+        # CP-only: the source pod selector above is one rule, and splitting the
+        # port list inside it does not widen who may connect -- a second `from`
+        # entry would.
+        - protocol: TCP
+          port: 49986
+  egress:
+    # C3 Task 6：巡检上报是 agent 主动发起的**唯一**连接，出口就写这两条。
+    #
+    # ① 目的地 = control-plane pod 的 3000 端口（`E2B_CONTROL_PLANE_URL` 指向的
+    #    那个 Service 解析出来的就是它）；只写 pod selector，不写 IP/DNS。
+    - to:
+        - podSelector:
+            matchLabels:
+              app: control-plane
+      ports:
+        - protocol: TCP
+          port: 3000
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # ② **集群 DNS**。那个 URL 写的是 Service 名（`http://control-plane:3000`），
+    #    而这个 pod 没有 hostAliases / dnsConfig，也不在宿主网络命名空间里 ——
+    #    k8s 的**出口隔离是"列出即放行、其余全丢"**，所以只写 ① 的话 agent 连名字都解析不了：
+    #    上报会以 `the control plane at http://control-plane:3000 is unreachable`
+    #    永远重试，整个特性在 k8s 上静默失效。这是**被评审抓到的**一条阻断面，
+    #    不是顺手加宽：仍然只到 kube-system 里的集群 DNS pod、只到 53（UDP+TCP，
+    #    两者都要 —— 解析走 UDP，截断后的重试走 TCP）。
+    #
+    #    selector 用的是集群 DNS 的标准标签（`k8s-app: kube-dns`，CoreDNS 的
+    #    Deployment 也带它）。换过标签的集群要照它自己的改 —— 症状与 `deploy-clusters.md`
+    #    §7.8 第 1 步写的"解析失败"一致；改完把这条选择器同步过来即可。

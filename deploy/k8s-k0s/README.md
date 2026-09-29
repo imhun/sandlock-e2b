@@ -50,6 +50,13 @@ KUBECONFIG=... deploy/k8s-k0s/apply.sh
 `deploy/scripts/cleanup-plaintext-secrets.py`（经 registry 重写为密文 + 清理残留明文副本 +
 校验；无主 key 时拒绝执行）。操作步骤见 `docs/k8s-deployment.md` §4.5.1。
 
+**C3 Task 2（N49）起不需要新的 Secret 键**：`control-plane` 改为用同名 ServiceAccount +
+一条**只读 pods**（`get`）的 namespaced Role/RoleBinding，按 `node_id`（= StatefulSet pod 名）
+查 pod 得到每个节点的**期望地址**（`E2B_NODE_ADDRESS_MODE=k8s`，都写在基线
+`deploy/k8s/control-plane.yaml` 里，随 `apply.sh` 一起 apply）。没有这个权限时解析失败
+⇒ node-scoped 内部请求**一律 503 点名**（fail closed），不会退回请求自陈的地址。
+registry 表在这件事上不变。
+
 ## 凭据轮换（k0s）
 
 `secrets.sh` 是唯一允许改值的入口：不点名 `--rotate <KEY>` 时，已有的键**一律不动**。
@@ -76,6 +83,17 @@ KUBECONFIG=... deploy/k8s-k0s/secrets.sh --fingerprint   # 每个键的 sha256(�
 | `worker-capacity.patch.yaml` | `E2B_NODE_*` → 4096/400/8192/1024；pod requests 500m/512Mi、limits 4/4Gi | 基线默认 2048/200 只放得下 1 个沙箱（README 的 F8 就是这条）；且基线 `limits` 无 `requests` 会被当成 requests=2 CPU，滚动更新无处安放 |
 
 另外基线自己已经按「节点本地」分开了两类镜像缓存（`deploy/k8s/worker.yaml`）：
+
+C3 的 `e2b-c3-agent` DaemonSet 与 broker 同一处境：它**不在**这张 overlay 表里，
+因为 overlay 不需要为它改任何东西 —— 它的 PVC claim 就是基线那个 `sandbox-shared`，节点本地
+缓存的 hostPath 也是基线已有的 `/var/lib/e2b-images`（`deploy/k8s/c3-agent.yaml`）。
+
+**Task 4 片 B 后**，这个 DaemonSet 的两个容器都有载荷（面 A 是身份授予、面 B 是文件操作），
+它们用**两个端口**（49985/49986，D22 —— 两个进程的 uid 必须不同，共享 pod netns 下同端口会
+`EADDRINUSE`），NetworkPolicy 也从一条端口列表扩成两条。同一片还让** worker 显式 pin
+`runAsUser`/`runAsGroup: 65534`（CP 的可信身份来源读的就是 pod spec）。**C3 Task 7** 之后它是这台
+节点上**唯一**的特权组件：C1 的 `e2b-priv-broker` 退役，它的两个属主 init 也搬进了这个 pod
+（`storage-init` + `workspace-root-init`，都 `runAsUser: 0`）。
 
 * `E2B_IMAGE_CACHE_DIR=/var/lib/e2b-images` —— **解出来的 rootfs**，`hostPath` 节点本地。解到共享卷上
   要 61.4 秒、解到本地盘 0.26 秒（同一份 python-slim rootfs，2111 个文件，2026-09-17 实测）。
@@ -213,13 +231,18 @@ control-plane 的 `:3000`，与基线那个 ClusterIP `gateway` 同一个后端�
 * 清单里原本**没有 buildkit**，`Template.build` 无从执行 ⇒ 按 compose 的形态补成
   control-plane 的 **sidecar**（unix socket 要同 pod 才能共享 emptyDir）；镜像
   `moby/buildkit:rootless` 在 Docker Hub ⇒ 已镜像到 ACR 的 `byteplan/buildkit:rootless`。
-* **worker pod 里没有任何 root 容器**（C1 wave 2，2026-09-27）：worker 容器不写
-  `runAsUser`（回落镜像 `deploy/docker/Dockerfile.envd` 的 `USER 65534:65534`），
-  `capabilities.add` 只剩 `SETUID`/`SETGID`（本地 file-capability `e2b-slot-spawn` 要的
-  两条 BND），唯一的 initContainer 是**非 root** 的 `wait-for-broker`。网络文件系统的
-  chown 确实只有 euid 0 做得到，但那个 euid 0 现在只在每节点一个的
-  **`e2b-priv-broker` DaemonSet**（基线）里 —— worker 通过 `E2B_PRIV_HELPER_TRANSPORT=socket`
-  把 `chown`/`rm`/`walk` 交给它。
+* **worker pod 里没有任何 root 容器**（C1 wave 2，2026-09-27；**C3 Task 4 片 B，2026-09-29 再收敛**）：
+  worker 容器**显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（C3 的 CP 从 pod spec 取"这个
+  worker 是谁"的可信答案），**只有 `capabilities.drop: [ALL]`、没有任何 `add`**（BND 空集，字面
+  成立 —— 收口评审把"省掉整块"改成显式 drop，否则继承的是 runtime 默认 BND；镜像里的
+  file-capability 二进制已移出，见判据 2/15），**也没有任何 initContainer**（C3 Task 7 把唯一的那个非 root
+  `wait-for-broker` 闸门与它服务的 `socket` 回退一起退役了）。网络文件系统的 chown 确实只有 euid 0
+  做得到，但那个 euid 0 现在在 **`e2b-c3-agent` DaemonSet 的面 B**（基线；听 49986）里 —— worker
+  通过 `E2B_PRIV_HELPER_TRANSPORT=agent` 把 `chown`/`rm`/`walk` 交给 CP，再由 CP 指令它；
+  C1 的 **`e2b-priv-broker`** DaemonSet **已由 C3 Task 7 退役**（连同 `E2B_PRIV_HELPER_SOCKET`、
+  worker 的 `wait-for-broker` 闸门与 `apply.sh` 的 broker rollout 闸门）；它原来的两个属主 init
+  搬进了 agent pod（`storage-init` + `workspace-root-init`），见
+  `docs/deploy-clusters.md` §7.9 与 `docs/production-deployment-requirements.md` §5.4(b)。
   * 历史口径（已作废，留档）：此前 worker 自己 `runAsUser: 0`、`runAsGroup: 65534` 读挂载上的树，
     会打 `E2B_PER_SANDBOX_UID … without CAP_SYS_PTRACE` 的告警，非 route-B 路径的模板沙箱可能
     因此受影响（见 backlog N18）；route B 与 per-sandbox host uid 在两种 transport 下都成立。

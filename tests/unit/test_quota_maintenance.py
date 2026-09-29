@@ -24,6 +24,8 @@ from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.quota_maintenance import QuotaMonitor
 from envd_service.runtime.registry import RuntimeRegistry
+from tests._c3_resolver import loopback_resolver
+from tests._fleet_view import ShortFleetView
 from envd_service.xfs_quota import (
     ProjectDirectoryGone,
     ProjectDirectoryUnreadable,
@@ -1400,6 +1402,9 @@ async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
         settings=ControlSettings(api_keys=("local-key",)),
         runtime_registry=RuntimeRegistry(tmp_path),
         workspace_base=tmp_path,
+        # C3 Task 2: a node-scoped request is only accepted from the address the
+        # resolver maps its claim to (the fleet key cannot vouch for the node).
+        node_address_resolver=loopback_resolver("node_a"),
     )
     headers = {"X-Internal-Key": "internal-key"}
     async with httpx.AsyncClient(
@@ -1409,6 +1414,7 @@ async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
             "/internal/nodes/register",
             headers=headers,
             json={
+                "nodeID": "node_a",
                 "address": "http://127.0.0.1:49983",
                 "totalMemoryMB": 1024,
                 "totalCPUPercent": 200,
@@ -1628,6 +1634,7 @@ async def _run_reconcile_round(
     *,
     records: dict[str, str] | None = None,
     nodes: tuple[str, ...] = ("node_a",),
+    fleet_view: dict[str, list[str]] | None = None,
 ) -> tuple[dict, agent.NodeAgent]:
     """One reconcile round of a worker on ``base``, plus that worker.
 
@@ -1637,6 +1644,11 @@ async def _run_reconcile_round(
     trust (M1), which is what fences both of its sweeps -- so a case can say
     "another node owns this" or "the fleet cannot be enumerated" and mean it,
     without patching anything.
+
+    ``fleet_view`` models the other half of M1: the ids the fleet list actually
+    carried, when that differs from the control plane's record set (D6 moved
+    the enumeration off the per-node endpoints, so a node-registry row is no
+    longer a way to make it short).
     """
     node_registry = NodeRegistry()
     registry = SandboxRegistry(ControlSettings(api_keys=("local-key",)))
@@ -1660,6 +1672,7 @@ async def _run_reconcile_round(
         registry=registry,
         nodes_registry=node_registry,
         workspace_base=base,
+        node_address_resolver=loopback_resolver(*nodes),
     )
     worker = agent.NodeAgent(
         settings=EnvdSettings(executor="local", workspace_base=base),
@@ -1668,8 +1681,9 @@ async def _run_reconcile_round(
         node_address="http://127.0.0.1:1",
     )
     worker._node_id = "node_a"
+    app = ShortFleetView(control, fleet_view) if fleet_view is not None else control
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=control), base_url="http://control"
+        transport=httpx.ASGITransport(app=app), base_url="http://control"
     ) as client:
         summary = await worker._reconcile_with_control_plane(
             client, {"X-Internal-Key": "internal-key"}
@@ -1741,14 +1755,18 @@ async def test_reconcile_leaves_images_alone_without_a_complete_fleet_record_set
 ) -> None:
     """M1 的纪律同样适用于图，而且这里更贵：读不到全舰队的记录就不动图。
 
-    ``node_b`` 还没重新注册（控制面重启后的常态）而它的记录还在：此时"没有任何
-    记录认领 sbx_elsewhere"是个假的结论。和树一样，这一轮跳过、报告、排重试。
+    舰队清单这一轮少带了一条记录（读完列表后又有 create 落库），而 metrics 的
+    计数仍然包含它：此时"没有任何记录认领 sbx_elsewhere"是个假的结论。和树一样，
+    这一轮跳过、报告、排重试。（D6 后清单不再依赖节点注册行，所以直接模拟"清单短"。）
     """
     base = tmp_path / "sandboxes"
     image = _leftover_image(base, "sbx_elsewhere")
 
     summary, worker = await _run_reconcile_round(
-        base, records={"sbx_elsewhere": "node_b"}, nodes=("node_a",)
+        base,
+        records={"sbx_elsewhere": "node_b"},
+        nodes=("node_a",),
+        fleet_view={},
     )
 
     assert summary["checkpointsReclaimed"] == []

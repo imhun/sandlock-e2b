@@ -54,6 +54,27 @@ class PathTraversalError(ValueError):
 
 _SANDBOX_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
+#: A node id is a StatefulSet pod name (k8s), a compose service / container
+#: name, or the in-process ``local`` node: leading alphanumeric, then dots,
+#: dashes and underscores. Deliberately a *shape* check, like
+#: :data:`_SANDBOX_ID_RE` -- what it has to stop is an id that changes the
+#: meaning of a path segment (``/``, ``..``), a DNS name, or a log line.
+#: ``\Z`` (not ``$``): this id is interpolated into an API path and a DNS
+#: lookup, where a trailing newline is a different name, not a formality.
+_NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+def validate_node_id(node_id: str) -> bool:
+    """Reject a node id that could not be a pod / service name.
+
+    Used before a node id is interpolated into a k8s API path
+    (``.../pods/<node_id>``) or handed to ``getaddrinfo``. Both are places
+    where an id carrying a slash, a scheme or a control character would change
+    the request's meaning; an id that fails this is "no address" (fail closed),
+    never an exception out of the resolver.
+    """
+    return bool(node_id) and bool(_NODE_ID_RE.match(node_id))
+
 
 def validate_sandbox_id(sandbox_id: str) -> bool:
     """Reject malicious sandbox IDs before they reach path or process lookups.
@@ -197,6 +218,38 @@ COMMAND_LOG_NAME = "command-logs.jsonl"
 #: The leading dot keeps it out of the sandbox-id namespace, exactly like
 #: :data:`UNTRUSTED_TREE_DIR`.
 CHECKPOINT_ROOT_NAME = ".checkpoints"
+
+#: How many bytes of a sandbox id may become a route-B **instance name**
+#: (:func:`route_b_instance_name`). Longer ids are replaced by their hash: a
+#: filename is bounded by ``NAME_MAX``, and the name is also the slot's
+#: unix-socket path component in the registered transport.
+ROUTE_B_INSTANCE_NAME_MAX_BYTES = 64
+
+
+def route_b_instance_name(sandbox_id: str) -> str:
+    """The route-B **instance name** for a sandbox -- one rule, two consumers.
+
+    It is the slot's identity in the pool (``W1SlotPool.acquire_sync``'s
+    ``name``) *and* the leaf of the directory that holds the slot's
+    ``policy.json`` / ``program.json`` (``<route-b root>/<uid>/<name>/``). Two
+    derivations of that one name existed until C3 Task 4's second review: the
+    worker's executor computed it here and the control plane guessed
+    ``rb-<sandbox_id>``, so the ``scope-slot-document`` op pointed at a
+    directory that does not exist -- on the document that carries the
+    egress-proxy credentials. Ruling D20: the rule lives here, in the module the
+    control plane and envd both already share (``gateway_common``), and both
+    sides call it.
+
+    The >``ROUTE_B_INSTANCE_NAME_MAX_BYTES`` case is part of the rule, not an
+    implementation detail of the worker: an id long enough to matter is replaced
+    by ``sbx_<sha256(id)[:16]>``, and a control plane that did not know that
+    would derive the wrong directory for exactly those sandboxes.
+    """
+    if len(sandbox_id.encode()) <= ROUTE_B_INSTANCE_NAME_MAX_BYTES:
+        return sandbox_id
+    import hashlib
+
+    return "sbx_" + hashlib.sha256(sandbox_id.encode()).hexdigest()[:16]
 
 
 def resolve_state_base(

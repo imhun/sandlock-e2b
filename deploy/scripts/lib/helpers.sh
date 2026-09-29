@@ -86,7 +86,7 @@ export BASTION_HOST BASTION_USER TARGET_HOST TARGET_SSH_USER DEPLOY_USER \
 #: deployed one and make the quota-agent refuse to start without auth.
 PRESERVED_REMOTE_SECRET_KEYS="E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_INTERNAL_API_KEYS \
 E2B_IMAGE_REGISTRY_PASSWORD E2B_REDIS_PASSWORD E2B_SECRET_MASTER_KEY \
-E2B_SECRET_MASTER_KEYS E2B_QUOTA_AGENT_TOKEN"
+E2B_SECRET_MASTER_KEYS E2B_QUOTA_AGENT_TOKEN E2B_C3_AGENT_TOKEN"
 
 say() { printf '\n==> %s\n' "$*"; }
 
@@ -147,6 +147,46 @@ set_env_file_value() {
     else
         printf '%s=%s\n' "$key" "$value" >> "$file"
     fi
+}
+
+# --- C3 agent credential (Task 3, back-filled by Task 4 slice B) ------------
+
+# ensure_c3_agent_token <env_file> [fallback_value]
+#
+# Writes `E2B_C3_AGENT_TOKEN` **only when the file has no usable value** for it
+# (add-if-missing), so a redeploy never rewrites a token the fleet is already
+# using. "No usable value" means: absent, empty, or still the
+# `__C3_AGENT_TOKEN__` placeholder of `deploy/stack/.env.example` (a shape that
+# shipped from an unsed-ed template would otherwise run with the placeholder as
+# the real credential -- same value on both sides, but a published literal).
+#
+# <fallback_value> is what to use when the key has to be written: upgrade.sh
+# passes the value already deployed on the target when it can read one (both
+# agent faces and the control plane must agree on it), and otherwise leaves it
+# empty so a fresh 24-byte secret is generated here. That keeps the "generate
+# vs preserve" decision in one place, and makes the behaviour testable without
+# a target host.
+#
+# The key itself is a slice-B arrival: `.env` files written before it exists do
+# not have the line at all, and the carry-over loop in upgrade.sh only rewrites
+# keys that are *present* -- so an untouched stack `.env` would leave both
+# agent faces exiting on `E2B_C3_AGENT_TOKEN is required` (they have no compose
+# default, deliberately: a missing credential must fail loudly, not silently
+# authenticate nothing).
+ensure_c3_agent_token() {
+    local file="${1:-}" fallback="${2:-}"
+    if [ -z "$file" ] || [ ! -f "$file" ]; then
+        return 0
+    fi
+    local current
+    current="$(env_file_value "$file" E2B_C3_AGENT_TOKEN)"
+    if [ -n "$current" ] && [ "$current" != "__C3_AGENT_TOKEN__" ]; then
+        return 0
+    fi
+    if [ -z "$fallback" ] || [ "$fallback" = "__C3_AGENT_TOKEN__" ]; then
+        fallback="$(openssl rand -hex 24)"
+    fi
+    set_env_file_value "$file" E2B_C3_AGENT_TOKEN "$fallback"
 }
 
 # --- quota-agent (A6) ------------------------------------------------------

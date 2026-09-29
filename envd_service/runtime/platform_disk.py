@@ -34,6 +34,17 @@ logger = logging.getLogger(__name__)
 #: MiB -> bytes, the unit the knob and every message below are written in.
 _MIB = 1024 * 1024
 
+#: One sentence for every "the account cannot be measured" decision, so the
+#: admission, the pre-capture check and the heartbeat cannot describe the same
+#: situation in three different ways. ``{decision}`` names what the caller does
+#: about it.
+UNKNOWN_ACCOUNT_REASON = (
+    "the platform's checkpoint account could not be measured on this worker "
+    "(a tree under <state>/_runtime is outside the worker's own reach and this "
+    "shape has nobody to ask for it); an unmeasured account is never read as "
+    "empty -- {decision}"
+)
+
 
 def platform_budget_bytes() -> int:
     """The platform's checkpoint account, in bytes.
@@ -49,16 +60,21 @@ def platform_budget_bytes() -> int:
 
 def measure_platform_disk_bytes(
     workspace_base: str | Path, state_base: str | Path | None = None
-) -> int:
+) -> int | None:
     """Allocated bytes under ``<state base>/_runtime``; 0 when it is absent.
 
     Measured with the same accounting the per-sandbox ledger uses
     (``priv_helpers.dir_size``: files plus every directory's own allocated size),
     so "the platform's number" and "the user's number" are comparable quantities
-    rather than two different definitions of usage. ``None`` from the walk means
-    the bytes could not be measured -- reported as 0 here, with the caller free to
-    decide what to do about it; the admission rule below never *grants* because a
-    measurement failed.
+    rather than two different definitions of usage.
+
+    ``None`` means **the bytes could not be measured** and is *returned as such*
+    -- never folded into 0 (C3 Task 4 third review, I-3). A worker in the agent
+    shape has nobody to ask for a ``0700`` checkpoint store it does not own, and
+    "the platform stores nothing" is exactly what 0 means to both the ledger
+    alert and the checkpoint admission: reading an unmeasurable account as empty
+    is the fail-open this account exists to prevent. ``0`` is still the answer
+    for an *absent* runtime dir -- there is genuinely nothing there.
 
     ``state_base`` defaults to the workspace base, i.e. the directory this
     measured before N27; with ``E2B_STATE_BASE`` set the account follows the
@@ -72,7 +88,7 @@ def measure_platform_disk_bytes(
     if not runtime_dir.is_dir():
         return 0
     size = _runtime_bytes_one_tree_at_a_time(runtime_dir)
-    return 0 if size is None else int(size)
+    return None if size is None else int(size)
 
 
 def _runtime_bytes_one_tree_at_a_time(runtime_dir: Path) -> int | None:
@@ -111,12 +127,12 @@ def _runtime_bytes_one_tree_at_a_time(runtime_dir: Path) -> int | None:
     except OSError:
         # Nothing to split on: an unsplit broker walk is the multi-tree answer
         # this exists to prevent, so report "unknown" rather than ask for it.
-        # Say so once per call: the caller turns ``None`` into 0, and 0 reads as
-        # "the platform uses nothing" to both the ledger alert and the
-        # checkpoint admission -- silence here is what makes that fail-open.
+        # Say so once per call: ``None`` is what the callers act on (the
+        # admission refuses an unknown account, the heartbeat omits the number),
+        # and this line is what an operator greps for when it starts happening.
         logger.warning(
             "cannot list %s to measure the platform disk one tree at a time; "
-            "reporting 0 (the caller's contract for an unmeasurable account)",
+            "reporting the account as unknown",
             runtime_dir,
         )
         return None
@@ -136,24 +152,47 @@ def _runtime_bytes_one_tree_at_a_time(runtime_dir: Path) -> int | None:
             except OSError:
                 continue
         if size is None:
+            # The silent half of I-3: a child the worker cannot read (a
+            # ``0700`` checkpoint store owned by a sandbox uid, with no broker
+            # in the agent shape) used to fall through to a 0 for the *whole*
+            # account. Name the child and let the caller treat the account as
+            # unknown.
+            logger.warning(
+                "cannot measure %s (a child of %s): reporting the platform "
+                "disk account as unknown",
+                entry.path,
+                runtime_dir,
+            )
             return None
         total += size
     return total
 
 
 def checkpoint_admission(
-    *, used_bytes: int, incoming_bytes: int, limit_bytes: int | None = None
+    *,
+    used_bytes: int | None,
+    incoming_bytes: int,
+    limit_bytes: int | None = None,
 ) -> tuple[bool, str]:
     """Whether an image of ``incoming_bytes`` fits the platform's account.
 
     Returns ``(allowed, reason)``; ``reason`` is empty when allowed and a sentence
     naming the numbers when not, because the caller has to say *why* a checkpoint
     was refused while the sandbox kept running.
+
+    ``used_bytes=None`` ("the account could not be measured") **never** grants:
+    an unmeasured account is not an empty one (I-3), and the refusal falls back
+    to the behaviour that already exists -- the sandbox is frozen in place
+    instead of the platform spending space it cannot account for.
     """
     if limit_bytes is None:
         limit_bytes = platform_budget_bytes()
     if limit_bytes <= 0:
         return True, ""
+    if used_bytes is None:
+        return False, UNKNOWN_ACCOUNT_REASON.format(
+            decision="no image can be taken until the account can be measured"
+        )
     used = max(0, int(used_bytes))
     incoming = max(0, int(incoming_bytes))
     if used + incoming <= limit_bytes:
@@ -171,7 +210,7 @@ def checkpoint_admission(
 
 
 def checkpoint_no_room_reason(
-    *, used_bytes: int, limit_bytes: int | None = None
+    *, used_bytes: int | None, limit_bytes: int | None = None
 ) -> str | None:
     """The sentence for "the account is already full", or ``None`` when it is not.
 
@@ -185,6 +224,13 @@ def checkpoint_no_room_reason(
         limit_bytes = platform_budget_bytes()
     if limit_bytes <= 0:
         return None
+    if used_bytes is None:
+        # Asked *before* a capture: "is there room to try?" cannot be answered
+        # for an unmeasured account, and guessing "yes" is the fail-open I-3
+        # removed. Refuse with the reason; the sandbox is left paused in place.
+        return UNKNOWN_ACCOUNT_REASON.format(
+            decision="no image can be taken until the account can be measured"
+        )
     used = max(0, int(used_bytes))
     if used < limit_bytes:
         return None

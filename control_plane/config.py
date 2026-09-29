@@ -310,6 +310,101 @@ class Settings:
     internal_api_keys: tuple[str, ...] = field(
         default_factory=lambda: _env_list("E2B_INTERNAL_API_KEYS", ())
     )
+    # C3 Task 2 / N49: the near-term per-node credential (design §11.1 item 9
+    # option (a)). A JSON object ``{"<key>": "<node_id>"}``; a key listed here
+    # is *node-bound* -- the node-scoped internal handlers require the request's
+    # self-declared node to equal this mapping and enforce the source-IP second
+    # factor against the resolver. Keys absent from this map (including the
+    # shared ``E2B_INTERNAL_API_KEY``) remain fleet credentials: they keep the
+    # pre-C3 behavior and log an explicit degradation once (see
+    # ``control_plane/api/internal.py``). Empty by default so an existing
+    # deployment is untouched until it opts in.
+    internal_node_keys: dict[str, str] = field(
+        default_factory=lambda: _env_json_dict("E2B_INTERNAL_NODE_KEYS")
+    )
+    # C3 Task 2 / D4: where the *expected* node address and source IP come from.
+    # ``k8s`` queries the pod API by node id (StatefulSet pod name) with the
+    # mounted ServiceAccount; ``hostname`` resolves the node id as a compose
+    # service name; ``auto`` picks k8s when a ServiceAccount is mounted and
+    # hostname otherwise. Never learned from the request (N49).
+    node_address_mode: str = field(
+        default_factory=lambda: os.getenv("E2B_NODE_ADDRESS_MODE", "auto")
+    )
+    node_address_port: int = field(
+        default_factory=lambda: _env_int("E2B_NODE_ADDRESS_PORT", 49983)
+    )
+    node_address_namespace: str = field(
+        default_factory=lambda: os.getenv("E2B_NODE_ADDRESS_NAMESPACE", "sandlock")
+    )
+    # C3 Task 3 (rulings D9.2/D9.4/D9.5): the CP→agent instruction channel.
+    # The agent is found the same way the node's own address is (k8s: the worker
+    # pod's spec.nodeName, then the agent pod on that host by label; compose:
+    # the configured service name) -- never from a request body.
+    c3_agent_url: str | None = field(
+        default_factory=lambda: os.getenv("E2B_C3_AGENT_URL")
+    )
+    c3_agent_namespace: str = field(
+        default_factory=lambda: os.getenv("E2B_C3_AGENT_NAMESPACE", "sandlock")
+    )
+    c3_agent_label: str = field(
+        default_factory=lambda: os.getenv("E2B_C3_AGENT_LABEL", "app=c3-agent")
+    )
+    c3_agent_port: int = field(
+        default_factory=lambda: _env_int("E2B_C3_AGENT_PORT", 49985)
+    )
+    #: Face B's own address (C3 Task 4 slice B, ruling D22). The two faces are
+    #: two processes by necessity -- face A must be a non-root uid 65534 for
+    #: the ``uid_map`` owner rule (§14.2.7), face B must be uid 0 for NFS
+    #: AUTH_SYS ``chown`` and is the only one with the four roots mounted -- so
+    #: they listen on **two** ports. A single address would either collide
+    #: (``EADDRINUSE``: both containers share the pod netns) or route a file
+    #: operation to the 65534 process, where every chown on NFS is ``EPERM``.
+    #:
+    #: compose names the face-B service outright (``c3-agent-maint``); k8s
+    #: derives it from the same lookup face A uses -- the *same node's* agent
+    #: pod, second port -- never from a request. An unset compose value is a
+    #: named 503 on every file operation, not a guess.
+    c3_agent_maint_url: str | None = field(
+        default_factory=lambda: os.getenv("E2B_C3_AGENT_MAINT_URL")
+    )
+    c3_agent_maint_port: int = field(
+        default_factory=lambda: _env_int("E2B_C3_AGENT_MAINT_PORT", 49986)
+    )
+    #: The credential the agent demands on every instruction. Unset means "no
+    #: agent instructions": the client refuses by name rather than dialling
+    #: without auth.
+    c3_agent_token: str = field(
+        default_factory=lambda: os.getenv("E2B_C3_AGENT_TOKEN", "")
+    )
+    #: One deadline per instruction. A stuck agent must never read as "the
+    #: sandbox create hangs" (D9.5); the refusal is a named 504.
+    c3_agent_timeout_s: float = field(
+        default_factory=lambda: _env_float("E2B_C3_AGENT_TIMEOUT_S", 5.0)
+    )
+    #: Face B's deadline (Task 4). A teardown, a recursive chown or a tree walk
+    #: is bounded by the tree, not by a syscall: ``maint.c``'s own per-verb
+    #: budgets are 300 s (and its walk cap is larger), so the CP's wait has to
+    #: outlast them or a legitimate operation would be abandoned mid-flight --
+    #: which on this path is *not* harmless, because the instruction does not
+    #: stop when the CP stops waiting.
+    c3_agent_file_op_timeout_s: float = field(
+        default_factory=lambda: _env_float("E2B_C3_AGENT_FILE_OP_TIMEOUT_S", 600.0)
+    )
+    #: How many CP→agent instructions may be in flight at once. ``0`` is
+    #: unbounded; the shipped default is **64**, and the number is bounded on
+    #: both sides rather than picked to taste (D16): it must be at least the
+    #: largest number of outstanding slot starts one control plane can have
+    #: (the autoscaler's 16-replica ceiling; the create admission cap is 100, so
+    #: the semaphore must not be the first thing a create waits on), while the
+    #: agent is a **synchronous** FastAPI service whose handlers run on the
+    #: anyio threadpool (default 40) -- a limit above 40 buys no throughput
+    #: there, and one below it would queue grants the agent could have served in
+    #: parallel. 64 sits above the agent's own 40 and below the CP's 100. Slice
+    #: B2 measures the N-concurrent arm against this and forces 1 to prove the
+    #: queueing it must *not* show; this is the value it revises if so.
+    c3_agent_max_concurrency: int = field(
+        default_factory=lambda: _env_int("E2B_C3_AGENT_MAX_CONCURRENCY", 64)
+    )
     # E5.4: secret-at-rest encryption. When E2B_SECRET_MASTER_KEY is unset
     # the secret registry degrades to the previous in-memory + plaintext
     # disk behavior with a startup warning and is never persisted to Redis.
@@ -363,6 +458,18 @@ class Settings:
         return registry_host(self.image_registry)
     shared_volume_root: str | None = field(
         default_factory=lambda: os.getenv("E2B_SHARED_VOLUME_ROOT")
+    )
+    #: Route B's scratch root -- where the per-slot ``policy.json`` /
+    #: ``program.json`` documents live, and therefore the directory the C3
+    #: agent has to scope to each slot's uid (C3 Task 4's
+    #: ``scope-slot-document``). The *worker* names the same root with the same
+    #: variable (``E2B_ROUTE_B_TMP_ROOT``); the control plane has to know it
+    #: too, because the worker may not report a path (hard rule 3 / §14.4).
+    #: Unset means "this control plane cannot derive a slot document's path",
+    #: and that op then fails closed by name rather than guessing the worker's
+    #: layout -- the shipped manifests set it (Task 4 slice B).
+    route_b_tmp_root: str = field(
+        default_factory=lambda: os.getenv("E2B_ROUTE_B_TMP_ROOT", "")
     )
     # Tenant isolation (E3.1). When E2B_TENANTS is unset the control plane
     # runs in single-tenant compatible mode: all keys share every resource
@@ -419,10 +526,18 @@ class Settings:
 
     @property
     def all_internal_api_keys(self) -> tuple[str, ...]:
-        """Active X-Internal-Key credentials (list first, single fallback)."""
+        """Active X-Internal-Key credentials (list first, single fallback).
+
+        C3 Task 2: the per-node keys (``E2B_INTERNAL_NODE_KEYS``) authenticate
+        ``X-Internal-Key`` like every other internal credential -- they are the
+        same mechanism, only *additionally* bound to a node (see
+        ``control_plane.auth.node_id_for_key``). Leaving them out here would
+        make a node-bound worker 401 before the binding was ever consulted.
+        """
         keys = list(self.internal_api_keys)
         if self.internal_api_key:
             keys.append(self.internal_api_key)
+        keys.extend(self.internal_node_keys)
         return tuple(dict.fromkeys(keys))
 
     @property

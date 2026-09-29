@@ -11,8 +11,11 @@ answers "yes" to everything and hides exactly the failures that matter):
 
   P0-a  what uid 0 can do to *another* uid's ``0600``/``0700`` tree on this NAS
         (read / traverse / delete / chown). Half of it is recorded -- uid 0
-        cannot override-read another uid's ``0600`` (2026-09-17, header of
-        ``deploy/k8s/priv-broker.yaml``) -- the traverse/delete halves are not.
+        cannot override-read another uid's ``0600`` (2026-09-17; the original
+        measurement was the header of ``deploy/k8s/priv-broker.yaml``, retired
+        by C3 Task 7 and re-recorded in
+        ``docs/production-deployment-requirements.md`` §5.4(b)) -- the
+        traverse/delete halves are not.
   P0-b  the sticky-bit and group-bit behaviour C2 leans on: a ``1777``+sticky
         parent must let X create and remove *its own* entries (C2's replacement
         for ``chown`` in shared directories), while ``0770 group=<worker gid>``

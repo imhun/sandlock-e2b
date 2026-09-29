@@ -93,9 +93,11 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 `autoscaler`（Deployment）、`e2b-worker`（StatefulSet，`e2b-worker-0/1` 各落一个节点）、
 `redis`（Deployment）、`seccomp-installer`（DaemonSet，2/2）、
 `gateway-nodeport`（NodePort **31907**）、`gateway` / `control-plane` / `redis` /
-`worker-headless`（ClusterIP）。（**C1 wave 2 起基线还会多一个 `e2b-priv-broker` DaemonSet**：
-每节点一个 root broker，`chown`/`rm`/`walk` 经 unix socket 代做 —— 见 §7 与
-`deploy/k8s/priv-broker.yaml`；本节上面的 pod 清单是 2026-09-25 的读数。）
+`worker-headless`（ClusterIP）。**（2026-09-29，C3 Task 7 起）**：基线的 DaemonSet 有两个 ——
+`e2b-c3-agent`（每节点一个，两个容器：非 root 的面 A + root 的面 B）与 `seccomp-installer`；
+C1 那个 `e2b-priv-broker`（每节点一个 root broker，`chown`/`rm`/`walk` 经 unix socket 代做）
+**已随 `socket` 形态一起退役**，现行的特权动作只在 agent 面 B 里（见 §7.9 与
+`docs/production-deployment-requirements.md` §5.4(b)）。本节上面的 pod 清单是 2026-09-25 的读数。
 
 镜像 tag 必须等于 `deploy/stack/.version`（`apply.sh` 就是拿它渲染的）。2026-09-25 实测
 两边都是 `0.1.0-440-g9b57736-20260922-191343`。
@@ -128,7 +130,13 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（2026-09-27 实测，改部署前先复核；最近一次发版记录见 §7.3）
+## 7. 当前部署状态（**最近一次：见 §7.10（2026-09-29，C3 收口评审）**；§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+
+> **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
+> 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
+> **动手前先读 §7.9 与 §7.10**：§7.9 是现役的 pod 清单、版本与"没有 `e2b-priv-broker`"的读数，
+> §7.10 是收口评审后重取的 worker/agent cap 读数（§7.9 表里 worker 的 `CapBnd` 已被它取代）；
+> §7.1–§7.8 保留为上线经过与当时判据。
 
 **版本**：`0.1.0-721-g01e4b72-20260927-231235`（= `deploy/stack/.version`；`apply.sh` 就是按它渲染的；
 C1 的三条尾项与「记账项批次」都在这一版）。2026-09-27 **三次上线**实测：`autoscaler` /
@@ -362,6 +370,260 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 kubectl apply -f deploy/k8s/seccomp-installer.yaml   # ① 档（先）
 # 等 DaemonSet ready，再动 worker 的 E2B_REAL_ROOT    ② 开关（后）
 ```
+
+### 7.5 C3 Task 2 的 internal API 身份绑定（**仓库已落，集群未上线**）
+
+**现状（未变）**：集群跑的还是 §7 那一版；`control_plane.yaml` 里**没有** `E2B_NODE_ADDRESS_MODE`，
+也没有控制面的 ServiceAccount/RBAC。也就是说线上此刻仍是"舰队共享 key + 自陈 node_id/address"。
+
+**下一次上线会带什么**（仓库现状，`docs/open-issues.md` N49 行有"关了哪些/没关哪些"的逐条说明）：
+
+- `deploy/k8s/control-plane.yaml` 显式 `E2B_NODE_ADDRESS_MODE=k8s` + 同名 ServiceAccount 与一条
+  **只读 pods**（`get`，namespaced Role/RoleBinding）；没有它解析器**取不到地址就拒**（503 点名），
+  不会退回自陈。
+- node-scoped 四个端点（`register` / `{id}/heartbeat` / `{id}/sandboxes` / `{id}/reconcile`）的自陈
+  直接用不了：解析不到的**自称**一律 503，注册地址不再取 `body["address"]`。
+- **没有** per-node key：仍是共享 key，所以"同一节点上的其它东西同时有该节点 IP 与 key"这档盲区
+  **仍在**（N49 的"未关闭"）。
+
+**⏳ 待部署窗口执行（判据 ③：两节点 worker 的请求在 CP 侧源 IP 不同）**：命令见 C3 Task 2 报告
+§7（`open-cluster-tunnel.sh` → `KUBECONFIG=tmp/k0s/kubeconfig` → 取两个 worker 的 pod IP →
+rollout 后从两个 pod 各发一次节点作用域请求 → `kubectl -n sandlock logs deploy/control-plane` 里
+两行 `came from` 必须是**两个不同**的 pod IP）。**本行待该窗口完成后回填结果。**
+
+### 7.6 C3 的 per-node agent（**仓库已落（Task 3 + Task 4 片 B），集群未上线**）
+
+**现状（未变）**：集群跑的还是 §7 那一版 —— 没有 agent，worker 的 `E2B_SLOT_IDENTITY` 仍是
+代码默认 `spawn`（槽位身份由 worker 镜像里的 file-capability `e2b-slot-spawn` 授予），
+`E2B_PRIV_HELPER_TRANSPORT` 仍是 `socket`。
+
+**仓库现状（下一次上线会带什么）**：
+
+- `deploy/k8s/c3-agent.yaml`：**一个 DaemonSet、两个容器**，pod 级 `hostPID: true`。
+  面 A `agent` = 独立镜像 `e2b-sandlock-agent`（`USER 65534:65534`、BND 只声明
+  `SETUID`/`SETGID`、身份取自 `spec.nodeName`）；面 B `maint` = root + `drop:[ALL]` +
+  `CHOWN/DAC_OVERRIDE/FOWNER`（与 C1 broker 逐条相同），挂基线那个 `sandbox-shared` PVC 与
+  节点本地 `/var/lib/e2b-images`，**载荷是 Task 4 片 B 装上的**：与面 A **同一个服务**
+  （一张 op 表：`grant-slot` + `chown`/`rm`/`walk`），但听**自己的端口 49986**（D22 ——
+  两个容器共享 pod netns，都绑 49985 会 `EADDRINUSE`；而 file op 落到 65534 的面 A 上，
+  NFS 每个 chown 都 `EPERM`）。两者都在基线（不在
+  overlay 差异里），禁项逐条成立：无 `SYS_ADMIN`/`SYS_PTRACE`/`NET_RAW`/host 网络/特权容器，
+  且**没有**任何"禁止提权"式字段（那会让内核静默忽略 file capabilities）。
+- 同文件的 `NetworkPolicy e2b-c3-agent`：agent 的入口**只允许 control-plane pod**（**两个
+  端口**：49985 面 A、49986 面 B，同一条规则的端口列表）—— "只有两条通道"的连接层那一半，
+  `worker ↔ agent` 在连接层就不存在。
+- **身份来源（D21 选项 1 的部署前提）**：`worker.yaml` 的 worker 容器现在**显式 pin**
+  `runAsUser: 65534`/`runAsGroup: 65534` —— CP 的可信来源读的就是 pod spec 的
+  `securityContext`，只靠镜像 `USER` 会读成"未知"⇒ 不记身份 ⇒ 每个需要身份的文件 op 具名 503。
+- **worker 镜像不再含 `/var/lib/e2b-priv/`**（判据 2/15）：`e2b-slot-spawn`/`e2b-maint` 只在
+  agent 镜像里；worker 的 BND 因此是**空集**（`SETUID`/`SETGID` 随二进制一起去掉），
+  `E2B_PRIV_HELPER_TRANSPORT=agent`。C1 的 `e2b-priv-broker` DaemonSet 保留到 Task 7，
+  但它现在跑 **agent 镜像**（`e2b-maint` 在那儿），这是 `socket` 回退与 worker 的
+  `wait-for-broker` 闸门还能成立的前提。
+- **CP 侧新增**：`E2B_ROUTE_B_TMP_ROOT`（`scope-slot-document` 的路径由 CP 推导，缺它该 op
+  具名 503）、`E2B_C3_AGENT_MAINT_PORT=49986`（面 B 端口）、`E2B_IMAGE_CACHE_DIR` 改为
+  fork 出 worker 的节点本地缓存路径 `/var/lib/e2b-images` 并显式设
+  `E2B_IMAGE_OCI_DIR=/var/lib/e2b-sandboxes/_images`（`chown-secret` 的路径必须与 worker
+  写 secret 的目录逐字一致，而 template 的 OCI tar 必须留在共享卷上）。
+- 凭据 `E2B_C3_AGENT_TOKEN`：**只**出现在 control-plane 与 agent 两处（worker 清单/镜像里
+  一个字都没有，pin 在 `tests/unit/test_c3_internal_api_shape.py`），由
+  `deploy/k8s-k0s/secrets.sh` 与其他托管键一起生成（**上线前必须先跑它**，否则 agent pod 起不来）。
+- RBAC：control-plane 的 Role 从 `get pods` 扩到 `get,list pods`（寻址要按 label 列**本节点**
+  的 agent pod），范围不变（本命名空间的 pods）。
+- worker：`E2B_SLOT_IDENTITY=agent-grant`（回退 = 改回 `spawn`）；**没有** `hostPID`（它会把
+  槽位 pid 放进宿主 pid namespace，`NSpid` 判别值当场失效）。
+- 上线闸门：`deploy/k8s-k0s/apply.sh` 的 rollout 顺序变成 **broker → agent → worker**（agent 是
+  worker 的新上游，fail-closed 没有回落路径）。
+- 旋钮：`E2B_SLOT_IDENTITY`（worker，`spawn|agent-grant`）、`E2B_SLOT_IDENTITY_REPORT_TIMEOUT_S`、
+  `E2B_SLOT_IDENTITY_WAIT_TIMEOUT_S`、`E2B_SLOT_IDENTITY_UNSHARED_TIMEOUT_S`、
+  `E2B_C3_AGENT_URL`/`_NAMESPACE`/`_LABEL`/`_PORT`/`_MAINT_URL`/`_MAINT_PORT`/`_TOKEN`/
+  `_TIMEOUT_S`/`_FILE_OP_TIMEOUT_S`/`_MAX_CONCURRENCY`（末者出厂 **64**，理由写在
+  `control_plane/config.py` 与清单注释里；k8s 只设 `_MAINT_PORT`，compose 设 `_MAINT_URL`）。
+
+**⏳ 待部署窗口执行（判据 1/2/3/7 的 k8s 臂 + agent 上线 + `E2B_SLOT_IDENTITY` 切换）**：命令见
+C3 Task 3 slice B 报告 §4（`open-cluster-tunnel.sh` → `KUBECONFIG=tmp/k0s/kubeconfig` →
+`kubectl kustomize deploy/k8s-k0s | kubectl diff -f -` → 跑 `secrets.sh` → `apply.sh` → 真机复验
+`probe_c3_userns_map_handoff.py --role forker/agent`）。**本行待该窗口完成后回填结果。**
+
+> ⚠ 判据 13（`NSpid` + cgroup 双命中）与 16（并发建箱）**不要在 k8s 上验收**：这里是 1 节点 2
+> 副本 worker，两条都会"全绿但什么都没测到"。它们必须在
+> `deploy/compose/docker-compose.multinode.yml`（3 worker 同机，已加 `c3-agent` 服务）上跑。
+
+### 7.7 C3 Task 5 的 CP 无 root（**仓库已落，集群未上线**）
+
+**现状（未变）**：集群上的 control-plane pod 仍是 §7 那一版 —— 主容器以 **`uid=0`** 跑，
+pod 里有一个 `runAsUser: 0` 的 `image-cache-init`，盘上 `_volumes` 是 **`0:0 755`**（§13.6
+那张表就是在这个形态下量的）。
+
+**仓库现状（下一次上线会带什么）**：
+
+- **CP 主容器 `runAsUser: 65534` + `runAsGroup: 65534`**（`deploy/k8s/control-plane.yaml`）。
+  取值是量出来的，不是对称：平台自己的目录已经是 65534、`state/.uid_pool.lock` 是
+  `65534:65534 0600`（换 uid 连开都开不了，而它在启动期就被碰）、镜像缓存的属主也是 65534。
+- **CP pod 里没有 root 容器了**：`initContainers` 为空，`image-cache-init` 搬到了 agent
+  自己的 pod（`deploy/k8s/c3-agent.yaml` 的 `storage-init`，root，与面 B 同一个理由：这台
+  NAS 的 `chown` 走 AUTH_SYS，只认 uid 0）。**`buildkit` sidecar 是点名保留的例外**：仍是
+  镜像的 uid 1000 + `seccompProfile: Unconfined`，且**不能**加
+  `allowPrivilegeEscalation: false`（rootlesskit 的 `newuidmap` 会死）。它不是 root，
+  不违反口径，但它是这个 pod 里唯一保留宽 profile 的容器。
+- **卷存储的属主交棒（裁定 D24）**：`storage-init` 在**每个节点**上做一次
+  `chown 65534:65534 _volumes`（以及已存在的 `_volumes/_meta`），**非递归**（它下面的卷数据
+  目录与每沙箱切片属于池 uid，`chown -R` 会在每次 agent 滚动时把它们抢回来），幂等且有名字
+  （`already belongs to uid 65534` / `-> uid 65534 mode …` / `_meta` 缺失时的
+  `does not exist -- nothing to hand over`），**两个目标各自校验**（`_meta` 单独一条门 ——
+  评审 round 1 的 Important，它从前没有门且成功行无条件打印），拒绝时 pod 停在 init 并打印
+  一次性命令。它的能力集与面 B 逐条相同（`drop: [ALL]` + `CHOWN/DAC_OVERRIDE/FOWNER`；
+  `DAC_OVERRIDE` 是量出来的，见 §13.6）。D24 的理由、偏离 §3.2 字面的说明与**部署窗口复验程序**写在
+  `docs/c3-privilege-relocation.md` §13.6（裁定）与 §13.6.1（程序）。
+- **CP 侧的具名失败**：`VolumeRegistry.create` 在属主不对时抛
+  `VolumeRootNotOwnedError`，消息里带同一条 `chown 65534:65534 ...`（不再是裸 `EACCES`）。
+- **compose 车道本任务未动**（记账项）：那两条栈的 control-plane 仍以 root 跑，它们的
+  `image-cache-init` 本来就是**独立服务**（§13.3 判定"形态已经是对的"），而 Task 5 的清单
+  判据是 **k8s 的 pod**。要让 compose 也收敛，是同一套交棒 + 同一条 `runAsUser` 的独立改动。
+
+**⏳ 待部署窗口执行（判据 8 的真机臂）**：**先把 agent 滚起来**（`storage-init` 把 `_volumes`
+交给 65534），**再滚 control-plane** —— 顺序反了也不会坏（交棒幂等、且 CP 只在**用户建卷**时
+才需要它），但反过来时第一次建卷可能撞上 `VolumeRootNotOwnedError`（有名有姓，按它给的命令
+处理即可）。随后跑 `docs/c3-privilege-relocation.md` §13.6.1 的六步复验，并把结果回填到本节
+与 §13.6 的那张表。**本行待该窗口完成后回填结果。**
+
+### 7.8 C3 Task 6 的自愈（**仓库已落，集群未上线**）
+
+**现状（未变）**：集群上的 agent 仍是 Task 4/5 那一版 —— 它不扫描、不主动发起任何连接
+（NetworkPolicy 是 `policyTypes: [Ingress]`），而 worker 的孤儿清扫在 agent 形状下被具名关掉
+（`E2B_PRIV_HELPER_TRANSPORT=agent` 的启动告警）。所以**今天的集群上，孤儿树没有人回收** ——
+这正是 Task 6 要补的那条可用性硬依赖。
+
+**仓库现状（下一次上线会带什么）**：
+
+- **面 B 多了一个周期巡检**（`E2B_C3_AGENT_SCAN=on`，只挂在挂了共享工作区的那个容器上）：
+  首扫 30s、之后每 120s 扫 `<workspaces>/*`，把**看见的沙箱 id** 报给控制面
+  `POST /internal/nodes/<宿主名>/agent/inventory`（body 只有 `{"sandboxes": […]}`），控制面用
+  **权威记录**判定孤儿后指令**同一节点**的 agent 用既有的 `rm` 删。
+- **一条新的出口**：`deploy/k8s/c3-agent.yaml` 的 NetworkPolicy 变成 `[Ingress, Egress]`，出口
+  只允许 `app: control-plane` 的 3000 端口（`E2B_CONTROL_PLANE_URL` 指向它）。控制面侧没有
+  NetworkPolicy，无需为这条新入口加规则。
+- **CP 侧的三档门**（记录不共享 / 有记录读不出来 / 枚举条数对不上 `activeSandboxes` 三者任一
+  ⇒ **整轮具名推迟**，什么都不删）写在 `control_plane/self_heal.py`，逐条有用例。
+
+**⏳ 待部署窗口执行（判据 9：worker 崩溃不重启时盘上仍在 N 分钟内收敛）**：
+
+1. 先把 agent 滚上去（面 B 的新 env + NetworkPolicy），确认 `E2B_C3_AGENT_SCAN=on` 的那行启动日志
+   与 `c3-agent inventory:` 的周期行。**这一条要按下面三种失败分开读**（它们的修法不同）：
+   - `the control plane at http://control-plane:3000 is unreachable: … Name or service not known`
+     （或 `Temporary failure in name resolution`）⇒ **DNS 被出口策略挡了**。这条路径上 agent 主动发起的
+     出口只有两条：到 control-plane pod 的 3000，以及到 kube-system 集群 DNS 的 53（UDP+TCP）。
+     若集群 DNS 的 pod 标签不是标准的 `k8s-app: kube-dns`（例如换过发行版/改过 label），
+     就照它自己的 selector 改 `deploy/k8s/c3-agent.yaml` 的第 ② 条出口 —— **不要**改成放通全部出口。
+   - `… is unreachable: timed out`（解析没问题、连接不通）⇒ **策略或 Service 挡了**：先确认
+     NetworkPolicy 的第 ① 条与 `control-plane` Service 的 3000 端口，再看 CNI 是否在 agent 的节点上
+     真执行了 egress。
+   - `the control plane refused the inventory report (status 403)` ⇒ 凭据过了、**源 IP 不符**：查 CNI
+     是否保留了源地址（§11.1 第 9 项那两个前提）与 `E2B_C3_AGENT_TOKEN` 两边是否一致；
+     `401` 则是 token 不一致，`503` 是 CP 侧没配 agent 凭据或查不到这个节点的 agent。
+2. 造一棵"记录已不在、树还在"的孤儿（例如删掉 CP 记录后让 worker 停摆 / 直接造一棵无记录的
+   `sbx_*` 树），**等 2–3 分钟**，断言树消失、CP 日志出现 `c3 self-heal: node=… removed the
+   orphan tree …`。
+3. 反向臂：留一棵**有记录**的树（活沙箱），确认它出现在 `protected` 里且**不**被删；再滚一次
+   control-plane 复做同一断言（Task 6 简报的用例②："滚动重启期间不误删活沙箱"）。
+4. 把结果回填到本节与 `docs/c3-privilege-relocation.md` §11.1 第 5 项。
+
+### 7.9 C3 Task 7 上线：退役 C1 的节点 broker（**2026-09-29，已执行**）
+
+> **这是现行的现状。§7.1–§7.8 里所有"仓库已落，集群未上线"的段落，到这一次为止都已上线。**
+
+**版本**：`0.1.0-764-g8776c67-20260929-215208`（= `deploy/stack/.version`，`apply.sh` 就是按它渲染的）。
+镜像：worker / agent / autoscaler / quota-agent / control-plane-gateway 都在这个 tag 上（ACR，
+arm64）。构建走的是 `PLATFORMS=linux/arm64 ./deploy/scripts/build-and-push.sh` + 逐个 `docker push`
+（单平台分支**只 `--load` 不推**，所以推是手动的）+ `docker manifest inspect` 逐个复核 —— 这是
+`tmp/wt-c3` 里上一轮用过的同一条路径。
+
+**动作**：`apply.sh`（渲染后 apply，8 个镜像引用 pin 到上面的 tag；等 `ds/e2b-c3-agent` → 等
+`sts/e2b-worker` → 预热 base image）→ **`kubectl delete daemonset e2b-priv-broker`**。
+⚠ `apply.sh` 不 prune：清单里删掉 `priv-broker.yaml` **不会**让集群上那个 DaemonSet 消失，
+它必须显式删（这是"退役"唯一一步不在清单里的事）。
+
+**pod（实测）**：`control-plane` 2 个副本各 `2/2`、`autoscaler 1/1`、`e2b-worker-0/1` 各 `1/1`、
+`e2b-c3-agent` 两个各 `2/2`、`seccomp-installer 2/2`、`redis 1/1`，
+**没有任何 `e2b-priv-broker` pod**（`kubectl -n sandlock get pods | grep -c broker` = 0）。
+
+**形状（实测，都是 pod spec / `/proc` 的读数）**：
+
+| 判据 | 读数 |
+|---|---|
+| worker 的 init | **没有**（`initContainers` 为空）—— `wait-for-broker` 随 broker 一起走了 |
+| worker 的 env | `E2B_PRIV_HELPER_TRANSPORT=agent`、`E2B_SLOT_IDENTITY=agent-grant`；**没有** `E2B_PRIV_HELPER_SOCKET` |
+| worker 的挂载 | 只剩 `shared`（PVC）与 `image-cache`（hostPath）；**没有** `broker-socket` / `/run/e2b-broker` |
+| worker 的 cap | `CapEff=0000000000000000`、`CapBnd=00000000a80425fb`（无 `capabilities` 块） |
+| agent 面 A | `runAsUser=65534`、`CapEff=0`、`CapBnd=00000000a80425fb`；`as_uid` = `cap_setgid,cap_setuid=ep` |
+| agent 面 B | `runAsUser=0`、**`CapEff=000000000000000b`**（恰好 `CHOWN`+`DAC_OVERRIDE`+`FOWNER`）；`e2b-maint` = `cap_chown,cap_dac_override=ep` |
+| 禁项（§2.3） | worker 与 agent 的 pod spec 里 `SYS_ADMIN`/`SYS_PTRACE`/`NET_RAW`/`privileged`/`hostNetwork`/`allowPrivilegeEscalation`/`no-new-privileges` **一个字都没有** |
+| broker 的属主 init 搬家后 | agent pod 的 `storage-init` 与 `workspace-root-init`（都 `runAsUser: 0`）各跑了一轮：日志见下 |
+
+```
+storage-init: /var/lib/e2b-images is owned by uid 65534
+storage-init: /var/lib/e2b-sandboxes/_images is owned by uid 65534
+storage-init: /var/lib/e2b-sandboxes/_volumes already belongs to uid 65534 (mode 755) -- nothing to do
+workspace-root-init: /var/lib/e2b-sandboxes/workspaces/_snapshots owner=65534 mode=755
+workspace-root-init: /var/lib/e2b-sandboxes/state/_runtime owner=65534 mode=711
+workspace-root-init: /var/lib/e2b-sandboxes/state/_runtime/.checkpoints owner=65534 mode=711
+workspace-root-init: /var/lib/e2b-sandboxes/workspaces owner=0 mode=1777
+workspace-root-init: /var/lib/e2b-sandboxes/state owner=65534 mode=1777
+workspace-root-init: /var/lib/e2b-sandboxes/workspaces/_migrate owner=65534 mode=1777
+```
+
+**N48（属主 0 的老树，判据 10）**：删 broker 前后各查一次，`workspaces/` **下没有 `owner=0` 的条目**
+（`find … -mindepth 1 -uid 0` = 0；两个 agent pod 上各测一次，见 `.superpowers/sdd/task-7-report.md` §1）。
+注意 `workspaces/` **目录本身**仍是 `0:65534 mode=1777`（粘滞位、world-writable）——那是卷根约定，
+不是残留，`workspace-root-init` 的 gate 也按"owner 不是 65534 但可写"放行。
+
+**冒烟**：`multinode_smoke.py` = `MULTI-NODE SMOKE OK`（4 箱 2+2、命令/文件/stdin、预留归零）；
+`deployment_smoke.py` 的 **C3 段全绿**（建箱 + 命令/文件过网关、跨节点迁移保文件、网络配置、
+远端卷挂载 + 兄弟卷隔离、预留归零），**卡在 Track Z 的模板构建那一段**：
+`e2b.exceptions.BuildException: buildkit build exited with code 1`，buildkit 日志是
+`dial tcp …: i/o timeout` / `mkdir /nonexistent: permission denied`，而 CP pod 里
+`registry-1.docker.io` **Network is unreachable**、ACR 可达 —— 模板构建要拉 Docker Hub 的
+`python:3.11-slim`。**这不是本次改动引入的**：上一轮（21:07，改动之前）的 `deployment_smoke` 日志
+在**同一步**以**同一个异常**失败（`tmp/build/deployment_smoke.log`）。
+
+**残留（无害，记在这里）**：节点上 `/run/e2b-broker/`（hostPath `DirectoryOrCreate` 建的）目录还在，
+但**没有任何组件挂它、也没有人读**（worker 的挂载已删）。要清就在节点上 `rmdir`；不清也不影响。
+
+> ⚠ **上表里 worker 的 `CapBnd=00000000a80425fb` 是收口评审修掉的那个点** —— 见 §7.10。
+
+### 7.10 收口评审：`workspace-root-init` 的能力集 + worker 的 BND（**2026-09-29，已执行**）
+
+收口评审的两条 must-fix 都落在 pod spec 上，所以各滚了一次栈（同一 tag，只换清单）。
+
+**版本**：`0.1.0-768-g17aa2fb-20260929-223205`（= `deploy/stack/.version`）。构建链与 §7.9 逐字相同：
+`PLATFORMS=linux/arm64 ./deploy/scripts/build-and-push.sh`（单平台分支只 `--load`）→ 四个
+`e2b-sandlock-{worker,agent,autoscaler,quota-agent}` 手动 `docker push` → 五个 tag 逐个
+`docker manifest inspect` 复核 → `apply.sh`（agent DaemonSet → worker StatefulSet → 预热）。
+
+**改了什么**：① `deploy/k8s/c3-agent.yaml` 的 init `workspace-root-init` 从"`runAsUser: 0` +
+无 `capabilities:` 块"改成 `drop: [ALL]` + `{CHOWN, DAC_OVERRIDE, FOWNER}`（与面 B/`storage-init`
+逐条相同，理由同 §7.9 的 `storage-init`）；② `deploy/k8s/worker.yaml` 的 worker 容器加
+`capabilities: {drop: [ALL]}`（此前省掉整块 ⇒ 继承的是 runtime 默认 BND）。
+
+**cap 读数（before → after，`CapBnd` / `CapEff`）**：
+
+| 容器 | before | after |
+|---|---|---|
+| worker `worker` | `0xa80425fb` / `0` | **`0` / `0`** ✔（判据 2/15 现在字面成立） |
+| agent 面 A `agent` | `0xa80425fb` / `0` | `0xa80425fb` / `0`（不动） |
+| agent 面 B `maint` | `0xb` / `0xb` | `0xb` / `0xb`（不动） |
+| agent init `storage-init` | `CHOWN,DAC_OVERRIDE,FOWNER` | 同（不动） |
+| agent init `workspace-root-init` | **运行时默认 14 条（含 `CAP_NET_RAW`）/ 同** | **`CHOWN,DAC_OVERRIDE,FOWNER` / 同** ✔ |
+
+**怎么读的（两个坑）**：① agent pod 是 pod 级 `hostPID: true`，所以 `kubectl exec … cat
+/proc/1/status` 读到的**是宿主机的 pid 1**（会显示满集），不是容器自己 —— 要读容器自己的进程得用
+`/proc/self/status`；② 两个 init 容器退出得比 `exec` 还快，所以它们的读数取自节点上
+`k0s ctr -n k8s.io c info <container-id>` 的 OCI `process.capabilities`（bounding/effective），
+两台节点各查一次。init 的日志在两台节点上都走完并全绿（`… is writable by uid 65534`），
+说明三条 cap 够 `chown`/`chmod`/`mkdir -p` 用 —— 这是 §7.9 `storage-init` 那条实测的现场复核。
+
+**冒烟**：`multinode_smoke.py` = **`MULTI-NODE SMOKE OK`**（4 箱 2+2、命令/文件/stdin 过网关、
+kill 后两个 worker 的预约都归 0）。
 
 ## 8. 改部署的入口
 

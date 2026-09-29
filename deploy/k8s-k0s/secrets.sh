@@ -4,14 +4,16 @@
 # `kubectl -n sandlock create secret generic ...`（docs/k8s-deployment.md §2 第 2 步
 # 那份手工命令的 k0s 版）。
 #
-# 它管四个键，加上轮换窗口那个列表键（只在点名 `--rotate-internal-key` /
-# `--finalize-internal-key-rotation` 时写）—— 正好是清单里 `secretKeyRef` 读的五个名字：
+# 它管五个键，加上轮换窗口那个列表键（只在点名 `--rotate-internal-key` /
+# `--finalize-internal-key-rotation` 时写）—— 正好是清单里 `secretKeyRef` 读的六个名字：
 #
 #   E2B_API_KEYS            外部 API key（可放多个，逗号分隔；见 control_plane/config.py）
 #   E2B_INTERNAL_API_KEY    worker / control-plane / autoscaler 之间的内部 key
 #   E2B_INTERNAL_API_KEYS   internal key 的双窗列表（窗口之外为空/不存在）
 #   E2B_REDIS_PASSWORD      redis `--requirepass` + CP 拼出的 redis URL
 #   E2B_SECRET_MASTER_KEY   `_secrets/**` 与 redis `e2b:secret:*` 的落盘加密主 key
+#   E2B_C3_AGENT_TOKEN      C3（Task 3）CP→agent 的凭据：只给 control-plane 与 agent
+#                           pod，绝不进 worker 清单/镜像（硬规则 5：worker↔agent 不存在）
 #
 # 为什么最后一个键是这条 task 的全部理由：没有它 `SecretRegistry` 退回"内存 +
 # 明文落盘"（只打一条启动告警，然后照常起），而 `<workspace_base>/_secrets/**`
@@ -54,7 +56,7 @@ NAMESPACE="${NAMESPACE:-sandlock}"
 SECRET_NAME="${SECRET_NAME:-e2b-secrets}"
 
 #: 本脚本负责创建的键，顺序 = 新 Secret 里的书写顺序。
-KEYS=(E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_REDIS_PASSWORD E2B_SECRET_MASTER_KEY)
+KEYS=(E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_REDIS_PASSWORD E2B_SECRET_MASTER_KEY E2B_C3_AGENT_TOKEN)
 
 #: 主 key 单独对待：换它是**不可逆**的两窗操作，本脚本拒绝就地换（见 die 那句）。
 MASTER_KEY=E2B_SECRET_MASTER_KEY

@@ -72,6 +72,35 @@ services:
     environment:
       E2B_API_KEYS: ${E2B_API_KEYS:-local-key}
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
+      # C3 Task 2 (N49 / controller ruling D5): the internal API resolves a
+      # node's *expected* address from its id -- which is the worker's compose
+      # service name (`worker-1`…), resolvable from this container over the
+      # project network. Explicit, never `auto`: a node-scoped claim that does
+      # not resolve is refused, and the address is never taken from the request
+      # body. Per-node credentials (`E2B_INTERNAL_NODE_KEYS`) are the design's
+      # near-term hardening and are not set here; see `docs/open-issues.md` N49.
+      E2B_NODE_ADDRESS_MODE: hostname
+      # C3 (Task 3, D12/D13/D14): the CP→agent half of the two channels.
+      #
+      # One agent per **host** (the multinode stack runs three workers on one
+      # host, so a worker-pod-name identity would be ambiguous): the CP dials
+      # this service name, and the agent's own identity is the same name (see
+      # the `c3-agent` service below). The token lives here and on the agent --
+      # never on a worker: a worker holding it would make `worker <-> agent`
+      # real, which hard rule 5 forbids.
+      E2B_C3_AGENT_URL: ${E2B_C3_AGENT_URL:-http://c3-agent:49985}
+      E2B_C3_AGENT_TOKEN: ${E2B_C3_AGENT_TOKEN:-c3-agent-token}
+      # D22 (Task 4 slice B): the file-operation face is its own service. Face
+      # A (`c3-agent`, above) grants slot identities as uid 65534; face B
+      # (`c3-agent-maint`, below) runs the file verbs as root and is the only
+      # one with the four roots mounted. `grant-slot` keeps the face-A URL;
+      # `chown`/`rm`/`walk` are addressed here.
+      E2B_C3_AGENT_MAINT_URL: ${E2B_C3_AGENT_MAINT_URL:-http://c3-agent-maint:49986}
+      # D16: instructions in flight at once. 64 is the shipped default and its
+      # reasoning is in `deploy/k8s/control-plane.yaml` / `control_plane/config.py`
+      # (>= the 16-replica autoscaler ceiling, >= the agent's own 40-thread
+      # handler pool, < the 100-create admission cap). Slice B2 measures it.
+      E2B_C3_AGENT_MAX_CONCURRENCY: ${E2B_C3_AGENT_MAX_CONCURRENCY:-64}
       # Secret at-rest encryption + Redis persistence (E5.4).
       E2B_SECRET_MASTER_KEY: ${E2B_SECRET_MASTER_KEY:-}
       E2B_SECRET_MASTER_KEYS: ${E2B_SECRET_MASTER_KEYS:-}
@@ -94,6 +123,12 @@ services:
       # only switches routes (no archive transfer).
       E2B_SHARED_WORKSPACE_ROOT: /var/lib/e2b-sandboxes
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # C3 (Task 4 slice B): route B's scratch root. The worker writes the
+      # per-slot `policy.json`/`program.json` here, but the *control plane*
+      # derives the path of the one the agent scopes to that slot's uid
+      # (`scope-slot-document`) -- the worker may not report a path. Unset,
+      # that op answers a named 503 and route-B slots never come up.
+      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       # Rootfs cache on the shared volume: persists across `up -d` and is
       # shared by every worker, instead of being re-pulled/re-extracted into
       # each container on every recreate (workspace base holds user files,
@@ -127,6 +162,92 @@ services:
       - ./tls:/tls:ro
     restart: unless-stopped
 
+  # C3 (Task 3, D14): the per-host agent. Compose has no pods, so the two faces
+  # that share one pod in k8s (`deploy/k8s/c3-agent.yaml`) are two services
+  # here -- one agent per host, however many workers that host runs (this stack
+  # has three).
+  #
+  # face A: the identity giver. It is the *only* thing allowed to reach the
+  # agent image's `as_uid`, and `pid: host` is what lets it turn the worker's
+  # container pid into a host pid through the host `/proc` (the same
+  # `hostPID: true` the DaemonSet sets at pod level).
+  c3-agent:
+    image: ${AGENT_IMAGE:-e2b-sandlock-agent:0.1.0}
+    # The agent joins the host's pid namespace; nothing else is widened.
+    pid: host
+    # Same uid as the worker -- that is what makes the target user namespace
+    # accept the `uid_map` write (its owner is the worker's 65534).
+    user: "65534:65534"
+    # The file capabilities on `as_uid` are refused at exec unless they are in
+    # the container's bounding set, so this is a BND declaration; a non-root
+    # process still gets no effective capability from it.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+    environment:
+      # D12: the agent's identity is the **host**, and the name above is the
+      # one the control plane dials it by (`E2B_C3_AGENT_URL`). `c3-agent` is
+      # also the service name, so both halves are one value by construction.
+      E2B_C3_AGENT_NODE_ID: c3-agent
+      E2B_C3_AGENT_TOKEN: ${E2B_C3_AGENT_TOKEN:-c3-agent-token}
+      E2B_C3_AGENT_PORT: "49985"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # face B: C1's file-operation face, moved (same capability set, same roots).
+  # Task 4 slice B gives it the payload: **the same service face A runs** (one
+  # app, one op table), on its **own** port (D22).
+  c3-agent-maint:
+    image: ${AGENT_IMAGE:-e2b-sandlock-agent:0.1.0}
+    # NFS AUTH_SYS only honours uid 0 for `chown`, exactly as the C1 broker.
+    user: "0:0"
+    # D22: face B's own pid namespace is *not* needed for the file verbs, but
+    # `pid: host` is the compose half of D21's option-2 route (the agent
+    # reading a worker process's uid/gid from the kernel). It is harmless for
+    # the file verbs and keeps the two faces' process views identical.
+    pid: host
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    environment:
+      # D12: the same host identity face A carries -- the control plane puts
+      # *this host's* name in the URL path of every instruction, and each face
+      # answers only for itself.
+      E2B_C3_AGENT_NODE_ID: c3-agent
+      E2B_C3_AGENT_TOKEN: ${E2B_C3_AGENT_TOKEN:-c3-agent-token}
+      # D22: face B's own port. Face A keeps 49985.
+      E2B_C3_AGENT_PORT: "49986"
+      # The four roots `deploy/priv/priv_common.c` validates against, matching
+      # this stack's worker env (one-base layout here: the tree root and the
+      # export root coincide).
+      E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_SHARED_VOLUME_ROOT: /var/lib/e2b-sandboxes
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
+      # `priv_common.c` refuses a `--uid` outside `START..+SIZE`, so the pool
+      # here has to equal the workers' (this stack leaves them at the code
+      # default, 10000/1000).
+      E2B_UID_POOL_START: ${E2B_UID_POOL_START:-10000}
+      E2B_UID_POOL_SIZE: ${E2B_UID_POOL_SIZE:-1000}
+      # C3 Task 6: the eyes. This is face B because it is the container that
+      # mounts the workspaces; the report is `{"sandboxes": [ids]}` and the
+      # control plane decides and instructs, exactly as in k8s. 30s + 120s ⇒ a
+      # worker that crashed and never restarts is converged in 2–3 minutes.
+      E2B_C3_AGENT_SCAN: "on"
+      E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}
+      E2B_C3_AGENT_SCAN_INITIAL_DELAY_S: ${E2B_C3_AGENT_SCAN_INITIAL_DELAY_S:-30}
+      E2B_C3_AGENT_SCAN_INTERVAL_S: ${E2B_C3_AGENT_SCAN_INTERVAL_S:-120}
+      E2B_C3_AGENT_SCAN_BACKOFF_MAX_S: ${E2B_C3_AGENT_SCAN_BACKOFF_MAX_S:-600}
+    volumes:
+      - sandbox-shared:/var/lib/e2b-sandboxes
+    restart: unless-stopped
+
   worker-1: &worker
     build:
       context: ../..
@@ -137,13 +258,20 @@ services:
     # existing root-owned volume once.
     #
     # E3.2 per-sandbox host uids are on by default (E2B_PER_SANDBOX_UID, plus
-    # route B's per-uid supervise slot), but a worker running as 65534 cannot
-    # map uids or chown, so it auto-disables them with one startup WARNING and
-    # keeps the fixed-identity + Landlock model -- i.e. this shape behaves
-    # exactly as before this default flipped. To get per-tenant host uids (and
-    # thus real 1777+sticky volume isolation): run the worker privileged enough
-    # to setuid+chown (root, or CAP_SETUID/CAP_SETGID/CAP_CHOWN) and set
-    # E2B_UID_POOL_START/E2B_UID_POOL_SIZE for the concurrent-sandbox budget.
+    # route B's per-uid supervise slot). They *used* to auto-disable themselves
+    # on a 65534 worker, because the worker's own `setuid`/`chown` are EPERM;
+    # under C3 the privileged steps are the **agent's** (the worker asks the
+    # control plane, which instructs the per-host `c3-agent-maint`), so a
+    # non-root worker keeps real per-tenant host uids. The pool range is
+    # declared on the face-B service above and must equal this one (the code
+    # default, 10000/1000).
+    # C3 Task 4 / ruling D25: this service's **hostname is its identity** --
+    # the worker reports it (the kernel's value, the runtime sets it to the
+    # container id's 12-character prefix) and the agent matches it against the
+    # cgroup path of the worker's own processes to learn the uid/gid the file
+    # operations act as. So: **do not set `hostname:` here** -- an overridden
+    # hostname is not a container id, which turns every file operation that
+    # needs the worker identity into a *named* refusal on this node.
     user: "65534:65534"
     depends_on:
       control-plane:
@@ -156,6 +284,19 @@ services:
       E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}
       E2B_NODE_ADDRESS: http://worker-1:49983
       E2B_NODE_ID: worker-1
+      # C3 (Task 3): route B's slot identity comes from the per-host agent, not
+      # from a file-capability binary in this image. The worker reports
+      # `{sandbox_id, pid}` to the **control plane** and never to the agent
+      # (`worker <-> agent` does not exist), and this container carries no agent
+      # address and no agent token. Rollback is `spawn` (the code default).
+      E2B_SLOT_IDENTITY: agent-grant
+      # C3 (Task 4 slice B): the file steps go to the agent too. The worker
+      # image no longer ships `/var/lib/e2b-priv/`, so `auto` would silently
+      # resolve no brokers and degrade to the in-process (E5.1) shape; `agent`
+      # is the shape this stack is built for, and it is set in the same change
+      # as the binary removal on purpose (a worker without the binaries and
+      # still on `auto`/`spawn` is the broken intermediate state).
+      E2B_PRIV_HELPER_TRANSPORT: agent
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY:-internal-key}
       # Per-sandbox network policies (allowOut/denyOut/egressProxy) are only
       # enforced when the platform switch is on.

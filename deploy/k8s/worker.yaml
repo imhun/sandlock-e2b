@@ -54,15 +54,19 @@ spec:
         app: e2b-worker
     spec:
       # A6/fix-1: the worker image builds with `USER 65534:65534`
-      # (deploy/docker/Dockerfile.envd) and this pod does NOT override it.
-      # C1 (wave 2) restored that: the privileged hand-over (chown / rm / walk)
-      # lives in the per-node `e2b-priv-broker` DaemonSet and this pod reaches
-      # it over a unix socket, so the pod carries no root container and no root
-      # override. What is left below are only the two capabilities the *local*
-      # file-capability `e2b-slot-spawn` needs in the container's bounding set;
-      # a non-root process gets no effective capabilities (Kubernetes has no
-      # ambient-capability semantics), so the declaration grants the pod
-      # nothing by itself.
+      # (deploy/docker/Dockerfile.envd) and this pod runs the same identity --
+      # but it now **pins it explicitly** on the worker container (Task 4
+      # slice B). That is not a restatement: the control plane's trusted source
+      # for the worker's own uid/gid reads the pod's `securityContext` through
+      # the pod API, and a pod spec that pins nothing reads as "unknown" (no
+      # identity stored, every identity-needing file op a named 503). The image
+      # `USER` alone is invisible to that lookup.
+      #
+      # There is no capability declaration any more either: the privileged
+      # hand-over moved off this pod entirely (C1 put chown/rm/walk in the
+      # per-node broker; C3 Task 4 gave the same verbs to the agent), and the
+      # image's file-capability binaries are gone, so the container's bounding
+      # set is the empty set.
       #
       # No `securityContext.sysctls` any more (N5, 2026-09-17). The pod-level
       # `net.ipv4.ip_unprivileged_port_start=0` window existed for exactly one
@@ -77,70 +81,19 @@ spec:
       # C1 (wave 2): the one init this pod still needs -- and it is *not* root.
       #
       # The two owner inits that used to live here (image-cache-init,
-      # workspace-root-init) moved to the `e2b-priv-broker` DaemonSet: they have
-      # to chown the volume roots, and this pod is no longer allowed a root
-      # container of any kind.
+      # workspace-root-init) moved to the per-node root DaemonSet in wave 2 --
+      # C1's `e2b-priv-broker`, whose owner inits now live in
+      # `deploy/k8s/c3-agent.yaml`'s face B, because this pod is not allowed a
+      # root container of any kind.
       #
-      # What is left is an ordering gate. `E2B_PRIV_HELPER_TRANSPORT=socket` is
-      # fail-closed: a worker that starts before the broker serves would refuse
-      # to start, and on a fresh node the DaemonSet and this StatefulSet are
-      # scheduled independently -- so without the gate the first worker pod
-      # would crash-loop for as long as the broker takes to come up. It waits
-      # for a successful `hello` round-trip, not merely for the socket file to
-      # exist: the daemon answers `ok:false` when the peer identity does not
-      # match (E2B_BROKER_PEER_UID/GID vs this pod's uid/gid), and that refusal
-      # is exactly the half-migration this gate must not paper over.
-      #
-      # 30 x 2 s, then exit non-zero naming the socket: a visibly unready pod
-      # (and a log line with the broker's own refusal) instead of a silently
-      # privileged retry loop. No `runAsUser`: the image's 65534 is what the
-      # socket's group (0660 root:65534) was built for.
-      initContainers:
-        - name: wait-for-broker
-          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
-          command:
-            - /bin/sh
-            - -c
-            - |-
-              set -eu
-              socket=/run/e2b-broker/broker.sock
-              attempt=1
-              while [ "$attempt" -le 30 ]; do
-                if python3 - "$socket" <<'PY'
-              import json
-              import socket
-              import sys
-
-              client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-              client.settimeout(2)
-              try:
-                  client.connect(sys.argv[1])
-                  client.sendall(b'{"v":1,"hello":true}\n')
-                  reply = json.loads(client.makefile("rb").readline() or b"{}")
-              except (OSError, ValueError) as exc:
-                  print("wait-for-broker: %s: %s" % (sys.argv[1], exc))
-                  sys.exit(1)
-              finally:
-                  client.close()
-              if not reply.get("ok"):
-                  print("wait-for-broker: the broker refused hello: %s" % reply.get("error"))
-                  sys.exit(1)
-              PY
-                then
-                  echo "wait-for-broker: $socket answered hello (attempt $attempt)"
-                  exit 0
-                fi
-                echo "wait-for-broker: $socket is not ready yet (attempt $attempt/30)"
-                attempt=$((attempt + 1))
-                sleep 2
-              done
-              echo "wait-for-broker: FATAL: $socket did not answer a hello within 60s -- the per-node e2b-priv-broker DaemonSet is not serving on this node (check that it is scheduled here and that the socket dir is 0710 root:65534)" >&2
-              exit 1
-          volumeMounts:
-            # Read-only: connect(2) is all this pod ever does with the socket.
-            - name: broker-socket
-              mountPath: /run/e2b-broker
-              readOnly: true
+      # C3 Task 7 retired C1's broker, and with it the `wait-for-broker`
+      # ordering gate that used to sit here: that gate belonged to the
+      # `socket` rollback shape (a worker that started before the per-node
+      # daemon would refuse to start, so it waited for a successful `hello`
+      # round-trip). There is no socket transport any more -- the worker runs
+      # `E2B_PRIV_HELPER_TRANSPORT=agent` and the agent DaemonSet is waited on
+      # by `deploy/k8s-k0s/apply.sh` *before* this StatefulSet rolls -- so this
+      # pod now has **no** init container at all.
       containers:
         - name: worker
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
@@ -216,9 +169,10 @@ spec:
             # an in-process `os.chown` for a path the brokers do not cover,
             # which this pod's 65534 worker cannot do (EPERM, silent per-volume
             # degradation). C1 (wave 2) made that the live shape: the worker is
-            # no longer root and its E2B_PRIV_HELPER_TRANSPORT is `socket`, so
-            # the broker's whitelist is what decides whether a chown can happen
-            # at all. (Before C1 this line changed nothing on this cluster -- a
+            # no longer root and its file steps are performed elsewhere (C1: the
+            # broker over `socket`; C3 Task 4 slice B: the agent, over the CP's
+            # `agent` shape), so the privileged side's whitelist is what decides
+            # whether a chown can happen at all. (Before C1 this line changed nothing on this cluster -- a
             # root worker resolves no brokers, `resolve_priv_helpers()` returns
             # None on euid 0, so `helpers_cover()` stayed False and the
             # in-process path was used.) The two readers that do care are the A5
@@ -278,17 +232,53 @@ spec:
             # this non-root pod; `off` keeps the in-process E5.1 shape.
             - name: E2B_PRIV_HELPERS
               value: "auto"
-            # C1 (wave 2): `socket` is a hard switch -- the worker dials the
-            # per-node `e2b-priv-broker` DaemonSet, and the Python resolver
-            # refuses to start if the handshake does not succeed (no silent
-            # fallback to the in-pod file-capability binaries: the whole point
-            # is that the worker pod no longer holds the capability that can
-            # hand a sandbox tree to a pooled uid). The socket is a hostPath
-            # shared with the DaemonSet; only connect(2) is ever needed here.
+            # C3 (Task 4 slice B): **the agent shape**. This worker holds no
+            # privileged binary at all any more -- the image no longer ships
+            # `/var/lib/e2b-priv/` -- so `auto` would silently resolve *no*
+            # brokers and fall back to the degraded in-process (E5.1) shape.
+            # `agent` is what routes every file step to the control plane
+            # (`{sandbox_id, op}`), which instructs this node's agent; it is
+            # part of the same change as removing the binaries, deliberately:
+            # a worker without them and still on `spawn`/`exec` is the broken
+            # intermediate state.
+            #
+            # C3 Task 7 retired the socket-era rollback lever
+            # (`E2B_PRIV_HELPER_TRANSPORT=socket` + its `E2B_PRIV_HELPER_SOCKET`
+            # path) together with the broker DaemonSet and the `wait-for-broker`
+            # gate: `agent` is now the shipped shape and the only one this
+            # manifest can express. The remaining values are `auto` and `exec`
+            # (the file-capability binaries, which this image no longer ships).
             - name: E2B_PRIV_HELPER_TRANSPORT
-              value: socket
-            - name: E2B_PRIV_HELPER_SOCKET
-              value: /run/e2b-broker/broker.sock
+              value: agent
+            # C3 (Task 3): route B's slot identity now comes from the per-node
+            # agent, not from a file-capability binary in this image.
+            #
+            # The worker forks the slot, lets it `unshare` a user namespace and
+            # reports `{sandbox_id, pid}` to the **control plane** (never to the
+            # agent: `worker <-> agent` does not exist, hard rule 5); the CP
+            # checks the report against its own records and instructs the agent
+            # with the uid. The child then polls `setresuid(X)` and execs the
+            # supervisor -- there is no "go ahead" step, and this pod still
+            # holds no capability (its `CapEff` is 0).
+            #
+            # `spawn` is still the code's default, and it is the rollback --
+            # but only with the file-capable worker image, exactly like the
+            # `socket` lever. `spawn` needs `helpers.slot_spawner`
+            # (`envd_service/route_b.py`), i.e. the file-capability
+            # `e2b-slot-spawn` binary that Task 4 removed from this image;
+            # without it `privileged_starter` is false and route B simply goes
+            # unavailable (`envd_service/executors/sandlock.py`) -- not the
+            # pre-C3 behaviour. So flipping this key alone is a *half* revert:
+            # the full revert is the manifest **and** the image, see
+            # `docs/c3-privilege-relocation.md` §14.8.
+            #
+            # ⚠ Do **not** give this pod `hostPID`. The agent's reverse lookup
+            # discriminates two workers on one node by the slot child's `NSpid`
+            # chain, and a host-pid namespace collapses that chain to one entry
+            # -- the lookup would refuse every grant while the manifest still
+            # looked correct.
+            - name: E2B_SLOT_IDENTITY
+              value: agent-grant
             # N5/N10 closed (2026-09-17): this manifest now runs the same
             # per-sandbox namespace shape the compose stack has run in
             # production since 2026-09-16.
@@ -406,8 +396,9 @@ spec:
             # nodes (NFSv4; NFSv3 + `nolock` is single-node only).
             #
             # ⚠ 改池（在这里补上 E2B_UID_POOL_START/SIZE，或改代码默认）必须**同时**改
-            # broker DaemonSet（deploy/k8s/priv-broker.yaml）里同名的那一对 env：池是启动
-            # 握手的一部分，两侧不一致时 worker 直接拒服并点名（设计如此，见该文件头）。
+            # agent 的面 B（deploy/k8s/c3-agent.yaml）：池是面 B 白名单校验的一部分，
+            # 两侧不一致时被拒的动作会点名（C1 时代那份 broker DaemonSet 已由 C3
+            # Task 7 退役，同一个"两侧同源"的要求现在落在 agent 上）。
             - name: E2B_BASE_IMAGE
               # Keep in step with control-plane.yaml (same digest-pinned ACR
               # mirror; Docker Hub is unreachable from the deployment hosts).
@@ -605,27 +596,42 @@ spec:
           # root-in-userns CAP_NET_BIND_SERVICE covers port 53 -- the pod-level
           # window was deleted in N5 (2026-09-17) and is not needed.
           securityContext:
+            # C3 (Task 4 slice B): the worker's bounding set is the **empty
+            # set**, and this is now *literally* true -- `drop: [ALL]` with
+            # nothing added, so `CapBnd=0`.
+            # Track F/C1 kept `SETUID`/`SETGID` here because the image's
+            # file-capability `e2b-slot-spawn` was refused at `exec` unless its
+            # caps were a subset of the container's bounding set. That binary
+            # is no longer in the image (nor is `e2b-maint`), and the slot's
+            # identity is now granted by the agent, so nothing in this worker
+            # needs a capability -- which is the property 判据 2/15 pin.
+            # (`SETUID`/`SETGID` are what `e2b-slot-spawn` needed; every other
+            # cap was already gone: CHOWN/DAC_OVERRIDE moved to the C1 broker in
+            # wave 2, NET_BIND_SERVICE had no user after N5 moved the :53 bind
+            # into each sandbox's own netns.)
+            #
+            # Review round 2 (item 4): the earlier shape was "no `capabilities:`
+            # block at all". That reads as a BND of zero in the *review text*
+            # but not on the node -- omitting the block inherits the runtime's
+            # **default** bounding set, and the cluster read `CapBnd=0x…a80425fb`
+            # (`docs/deploy-clusters.md` §7.9/§7.10). Declaring the drop makes
+            # the target and the reading agree (`CapEff` was already 0).
             capabilities:
-              # Track F (F1): the non-root worker's two file-capability brokers
-              # (/var/lib/e2b-priv/e2b-slot-spawn cap_setuid,cap_setgid+ep and
-              # e2b-maint cap_chown,cap_dac_override+ep) take their capability
-              # from the file xattr, but the exec is refused with EPERM unless
-              # those caps are in the container's *bounding* set (measured).
-              # `add` grants a non-root process nothing effective -- the worker
-              # still runs with CapEff=0 -- so this is a BND declaration, not a
-              # privilege grant. Never set an escalation-blocking field here:
-              # NNP=1 makes the kernel ignore file capabilities outright.
-              #
-              # C1 (wave 2): exactly two, because only `e2b-slot-spawn` is still
-              # the worker's own (a slot must be spawned in the worker's own
-              # namespaces). CHOWN and DAC_OVERRIDE -- the caps `e2b-maint`
-              # needs -- are gone from this pod: the chown/rm/walk verbs run in
-              # the root broker DaemonSet. NET_BIND_SERVICE is gone too; it had
-              # no user left once the :53 bind moved into each sandbox's own
-              # netns (N5), and there is no root override in this pod any more.
-              add:
-                - SETUID
-                - SETGID
+              drop:
+                - ALL
+            #
+            # The explicit, non-root identity below is **load-bearing for
+            # C3's file operations**, not a restatement of the image's `USER`:
+            # the control plane's trusted source for "what uid/gid is this
+            # worker?" (`control_plane/worker_identity_source.py`) reads the
+            # worker pod's `securityContext` through the pod API and returns
+            # `None` when the pod spec pins nothing. A `None` identity stores
+            # no worker uid/gid and every identity-needing operation then
+            # answers a named 503 -- the image's `USER` is invisible to that
+            # lookup. `runAsGroup` is not optional either: the tree's group is
+            # the worker's gid.
+            runAsUser: 65534
+            runAsGroup: 65534
             # Node-local state: the kubelet resolves a Localhost profile on the
             # host filesystem, so deploy/k8s/seccomp-installer.yaml (ConfigMap +
             # DaemonSet) installs deploy/seccomp/sandlock-worker.json into the
@@ -645,12 +651,6 @@ spec:
               mountPath: /var/lib/e2b-sandboxes
             - name: image-cache
               mountPath: /var/lib/e2b-images
-            # C1 (wave 2): the broker's unix socket, read-only -- this pod only
-            # connects to it (the mount namespace the mutations happen in is
-            # the DaemonSet's).
-            - name: broker-socket
-              mountPath: /run/e2b-broker
-              readOnly: true
       volumes:
         - name: shared
           persistentVolumeClaim:
@@ -664,17 +664,6 @@ spec:
         - name: image-cache
           hostPath:
             path: /var/lib/e2b-images
-            type: DirectoryOrCreate
-        # C1 (wave 2): one hostPath per node, shared with the
-        # `e2b-priv-broker` DaemonSet's container (different pods, different
-        # mount namespaces -- nothing but a hostPath lets both see one socket).
-        # DirectoryOrCreate matches the DaemonSet's own volume so the two
-        # manifests agree on who creates it; its 0710 root:65534 mode is set by
-        # the DaemonSet's socket-dir-init, which is guaranteed to have run
-        # before this pod's wait-for-broker gate lets the worker start.
-        - name: broker-socket
-          hostPath:
-            path: /run/e2b-broker
             type: DirectoryOrCreate
 ---
 apiVersion: v1
