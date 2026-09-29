@@ -255,30 +255,24 @@ def apply_sandbox_ownership(
     because root ignores ownership, the non-root shape does not.
     """
     path = Path(workspace_dir)
-    from envd_service import priv_helpers
+    from envd_service import agent_fileops, priv_helpers
 
-    # C3 Task 4: in the agent shape the hand-over is the *agent's* step --
-    # ``e2b-maint chown --uid X --gid <worker gid>`` executed by face B, asked
-    # for as ``{sandbox_id, op}`` (no path, no uid from this side; hard rules
-    # 1/3). The mode pass above stays here: the worker still owns the tree at
-    # this point, and modes are not a privileged operation.
-    from envd_service import agent_fileops
-
-    client = agent_fileops.active()
-    if client is not None:
-        if sandbox_id is None:
-            raise priv_helpers.PrivHelperError(
-                "the C3 agent shape needs the sandbox id to hand a tree over: "
-                f"{path} was not named by one"
-            )
-        client.chown_workspace(sandbox_id, recursive=True)
-        return
     group = os.getegid()
     mode = priv_helpers.WORKSPACE_MODE
-    # The mode pass must happen while the worker still owns the tree (chmod
-    # after the chown is EPERM). On a re-create of an existing sandbox the
-    # tree is already the sandbox's, i.e. already in this shape -- skipping is
+    # The mode pass comes **first**, in every shape: while the worker still owns
+    # the tree (``chmod`` after a hand-over the worker did not perform is EPERM),
+    # and because ``chown`` does not set modes -- ``e2b-maint``'s verb is an
+    # ownership change, nothing else. On a re-create of an existing sandbox the
+    # tree is already the sandbox's, i.e. already in this shape, so skipping is
     # correct and keeps the log quiet.
+    #
+    # ⚠ C3 Task 4 third review (I-1): the agent branch used to return *before*
+    # this pass, so a tree handed over by the agent kept whatever ``mkdir`` /
+    # ``copytree`` produced (0755) while the worker -- group member, no longer
+    # owner -- was left at best ``r-x`` on the tree it must write for the files
+    # API, snapshots and lifecycle. The slice path next door
+    # (``volumes.provision_sandbox_volume_mount``) does chmod-then-chown in
+    # exactly this order; this is the same rule.
     try:
         ours = path.is_dir() and not path.is_symlink() and (
             path.stat().st_uid == os.geteuid()
@@ -291,6 +285,20 @@ def apply_sandbox_ownership(
         logger.debug(
             "%s is not owned by this worker; keeping its existing modes", path
         )
+    # C3 Task 4: in the agent shape the hand-over is the *agent's* step --
+    # ``e2b-maint chown --uid X --gid <worker gid>`` executed by face B, asked
+    # for as ``{sandbox_id, op}`` (no path, no uid from this side; hard rules
+    # 1/3). It happens *after* the mode pass above, which is why that pass may
+    # not be skipped here.
+    client = agent_fileops.active()
+    if client is not None:
+        if sandbox_id is None:
+            raise priv_helpers.PrivHelperError(
+                "the C3 agent shape needs the sandbox id to hand a tree over: "
+                f"{path} was not named by one"
+            )
+        client.chown_workspace(sandbox_id, recursive=True)
+        return
     helpers = priv_helpers.active_helpers()
     if helpers is not None and priv_helpers.helpers_cover(path):
         helpers.chown(uid=host_uid, path=path, recursive=True, gid=group)

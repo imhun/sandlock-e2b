@@ -426,11 +426,6 @@ class RuntimeRegistry:
                     # control plane that cannot be reached must not take the
                     # heartbeat (or the caller) down with it (C3 Task 4 review,
                     # N4). Named, never silent.
-                    # Same contract as ``priv_helpers.dir_size`` below: ``None``
-                    # is "unknown", which every reader already models -- so a
-                    # control plane that cannot be reached must not take the
-                    # heartbeat (or the caller) down with it (C3 Task 4 review,
-                    # N4). Named, never silent.
                     try:
                         size = client.workspace_bytes(record.sandbox_id)
                     except Exception as exc:  # noqa: BLE001 - see above

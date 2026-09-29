@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import threading
 from pathlib import Path
 
@@ -147,6 +148,59 @@ async def test_a_failing_metrics_walk_still_answers_the_number_it_can(
     assert isinstance(resp.json()["disk"]["usedBytes"], int)
 
 
+async def test_the_import_removal_runs_off_the_event_loop(
+    tmp_path: Path, install_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-2: an import over an existing tree must not park the worker's loop.
+
+    ``agent_import_sandbox`` is ``async``, and the removal it does first is a
+    synchronous control-plane round trip whose read budget is the *file-op* one
+    (minutes: a whole tree comes off the disk). Inline it stopped heartbeats and
+    every sandbox API on the worker -- the same class as ``/metrics``, and the
+    reason the create and delete handlers already run their work in a thread.
+    """
+    import io
+    import tarfile
+
+    workspace_base = tmp_path / "workspaces"
+    existing = workspace_base / SANDBOX
+    existing.mkdir(parents=True)
+    (existing / "stale.txt").write_text("old", encoding="utf-8")
+
+    loop_thread = threading.current_thread()
+    threads: list[threading.Thread] = []
+
+    class _Recording:
+        def remove_workspace(self, sandbox_id: str) -> None:
+            threads.append(threading.current_thread())
+            shutil.rmtree(workspace_base / sandbox_id, ignore_errors=True)
+
+    install_client(_Recording())
+    app = create_envd_app(
+        settings=EnvdSettings(executor="local", workspace_base=workspace_base),
+        runtime_registry=RuntimeRegistry(workspace_base),
+    )
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w:gz") as tar:
+        data = b"restored"
+        info = tarfile.TarInfo("workspace/note.txt")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://worker"
+    ) as client:
+        resp = await client.post(
+            f"/agent/sandboxes/{SANDBOX}/import",
+            headers={"X-Internal-Key": "internal-key"},
+            content=payload.getvalue(),
+        )
+    assert resp.status_code == 204
+    assert len(threads) == 1
+    assert threads[0] is not loop_thread
+    assert (existing / "workspace" / "note.txt").read_text(encoding="utf-8") == "restored"
+
+
 # ------------------------------------------------------- N3: volume root hand-over
 
 
@@ -241,3 +295,158 @@ def test_the_tree_size_scan_reports_unknown_instead_of_raising(
         f"cannot measure {SANDBOX} through the agent: AgentFileOpsError: the "
         "control plane is unreachable for walk-workspace: connection refused",
     ]
+
+
+# ------------------------------------------------ I-3: the platform's own account
+
+
+def test_a_root_worker_reports_no_identity_and_says_so_once(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """m-1, worker side: a root worker stays joinable and the reason is logged.
+
+    ``0`` is not a worker identity (the uid-pool gate refuses it, and the CP
+    refuses the field by name), but registration and heartbeats are *not* file
+    operations: reporting ``0`` would make the whole node unjoinable for a fact
+    that only the file operations care about. So the pair is omitted -- every
+    operation that needs it then fails closed at the CP with its own named 503 --
+    and this line is what tells an operator why.
+    """
+    from envd_service import worker_identity
+
+    monkeypatch.setattr(worker_identity.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(worker_identity.os, "getegid", lambda: 0)
+    monkeypatch.setattr(worker_identity, "_ROOT_IDENTITY_DISCLOSED", False)
+    caplog.set_level(logging.WARNING, logger="envd_service.worker_identity")
+
+    assert worker_identity.worker_identity_fields() == {}
+    # ...and once, not on every heartbeat.
+    assert worker_identity.worker_identity_fields() == {}
+    assert [
+        record.message
+        for record in caplog.records
+        if record.name == "envd_service.worker_identity"
+    ] == [
+        "this worker runs as 0:0: it reports no worker identity (a non-zero "
+        "uid/gid is what a sandbox tree's group and the agent's `--worker` form "
+        "mean), so the control plane will refuse every C3 file operation on "
+        "this node by name -- run the worker as 65534:65534 (the shipped "
+        "image's USER) for the agent shape",
+    ]
+
+
+def test_a_normal_worker_still_reports_its_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from envd_service import worker_identity
+
+    monkeypatch.setattr(worker_identity.os, "geteuid", lambda: 65534)
+    monkeypatch.setattr(worker_identity.os, "getegid", lambda: 65534)
+    assert worker_identity.worker_identity_fields() == {
+        "workerUID": 65534,
+        "workerGID": 65534,
+    }
+
+
+def test_a_child_the_worker_cannot_read_makes_the_account_unknown_not_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """I-3's silent-0 guard: an unreadable child is *named*, never billed as 0.
+
+    ``<state>/_runtime/.checkpoints/<id>`` is ``0700`` owned by the sandbox uid.
+    Pre-C3 the worker reached it through the broker; in the agent shape it has
+    nobody to ask (routing that walk is a slice-B follow-up), and the walk's
+    ``None`` used to be folded into "the platform stores nothing" -- which is
+    what both the checkpoint admission and the ledger alert read as "there is
+    room". A test that lets 0 come back is a test that lets the fail-open back.
+    """
+    from envd_service import priv_helpers
+    from envd_service.runtime import platform_disk
+
+    state = tmp_path / "state"
+    runtime = state / "_runtime"
+    # The child the walk cannot finish: the ``.checkpoints`` gate, whose store
+    # (``.checkpoints/<id>``) is the ``0700`` directory owned by the sandbox.
+    gate = runtime / ".checkpoints"
+    store = gate / SANDBOX
+    store.mkdir(parents=True)
+    readable = runtime / "sbx_other"
+    readable.mkdir()
+    (readable / "sandbox.json").write_text("{}", encoding="utf-8")
+
+    real_dir_size = priv_helpers.dir_size
+
+    def _unreadable(path):
+        if Path(path) == gate:
+            return None  # what a walk the worker cannot make answers
+        return real_dir_size(path)
+
+    monkeypatch.setattr(priv_helpers, "dir_size", _unreadable)
+    caplog.set_level(logging.WARNING, logger="envd_service.runtime.platform_disk")
+
+    assert platform_disk.measure_platform_disk_bytes(tmp_path, state_base=state) is None
+    assert [
+        record.message
+        for record in caplog.records
+        if record.name == "envd_service.runtime.platform_disk"
+    ] == [
+        f"cannot measure {gate} (a child of {runtime}): reporting the platform "
+        "disk account as unknown",
+    ]
+    # ...and the absence of a runtime dir is still a real 0: nothing is there.
+    assert platform_disk.measure_platform_disk_bytes(tmp_path / "empty") == 0
+
+
+def test_admission_and_the_pre_capture_check_refuse_an_unknown_account() -> None:
+    """Unknown is never "there is room" (I-3), on both decisions."""
+    from envd_service.runtime.platform_disk import (
+        UNKNOWN_ACCOUNT_REASON,
+        checkpoint_admission,
+        checkpoint_no_room_reason,
+    )
+
+    limit = 100 * 1024 * 1024
+    decision = UNKNOWN_ACCOUNT_REASON.format(
+        decision="no image can be taken until the account can be measured"
+    )
+    assert checkpoint_admission(
+        used_bytes=None, incoming_bytes=1, limit_bytes=limit
+    ) == (False, decision)
+    assert checkpoint_no_room_reason(used_bytes=None, limit_bytes=limit) == decision
+
+
+def test_the_heartbeat_omits_an_unmeasurable_platform_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wire value: omit, do not assert 0 (I-3).
+
+    The CP's ``update_usage`` reads a missing field as "no update" and keeps the
+    number it already has; a 0 would be a claim that the platform stores
+    nothing.
+    """
+    from envd_service import agent as node_agent
+    from envd_service.runtime import platform_disk
+
+    monkeypatch.setattr(
+        platform_disk, "measure_platform_disk_bytes", lambda *a, **k: None
+    )
+    monkeypatch.setenv("E2B_PLATFORM_DISK_MB", "4096")
+    measured = node_agent._measure_platform_account(tmp_path)
+    assert measured == {"platformDiskBudgetMB": 4096}
+
+
+def test_a_measurable_account_still_reports_its_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other arm: nothing above may weaken the ordinary case."""
+    from envd_service import agent as node_agent
+    from envd_service.runtime import platform_disk
+
+    monkeypatch.setattr(
+        platform_disk,
+        "measure_platform_disk_bytes",
+        lambda *a, **k: 3 * 1024 * 1024,
+    )
+    monkeypatch.setenv("E2B_PLATFORM_DISK_MB", "4096")
+    measured = node_agent._measure_platform_account(tmp_path)
+    assert measured == {"platformDiskUsedMB": 3, "platformDiskBudgetMB": 4096}

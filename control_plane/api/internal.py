@@ -147,7 +147,17 @@ def _worker_identity_fields(body: dict[str, Any]) -> tuple[int | None, int | Non
         return None, None
     for name, value in (("workerUID", uid), ("workerGID", gid)):
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            raise OfficialError(400, f"{name} must be a positive integer")
+            # The shape rule and the *reason* are one message: this is what a
+            # worker that runs as root reports (``os.geteuid() == 0``), and the
+            # deployment has to be told that the condition -- not the spelling
+            # of one field -- is what it must fix (C3 Task 4 third review, m-1).
+            raise OfficialError(
+                400,
+                f"{name} must be a positive integer: a worker may not run as "
+                "root (uid 0) or report a non-identity, because the group a "
+                "sandbox tree is handed to and the `--worker` form both mean "
+                "*this* worker's own non-zero identity",
+            )
     return uid, gid
 
 

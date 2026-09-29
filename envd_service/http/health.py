@@ -100,10 +100,6 @@ async def metrics(request: Request) -> dict[str, Any]:
     # a control-plane round trip, and its deadline is the *file-op* one (minutes)
     # because a big tree legitimately takes that long. Awaiting it inline would
     # park every heartbeat and every sandbox API behind a black-holed CP.
-    # Off the event loop (C3 Task 4 review, N2): in the agent shape this walk is
-    # a control-plane round trip, and its deadline is the *file-op* one (minutes)
-    # because a big tree legitimately takes that long. Awaiting it inline would
-    # park every heartbeat and every sandbox API behind a black-holed CP.
     used_bytes = await asyncio.to_thread(
         _dir_size, workspace, sandbox_id=runtime.sandbox_id
     )

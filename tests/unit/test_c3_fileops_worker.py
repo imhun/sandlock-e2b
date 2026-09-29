@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 from pathlib import Path
 
 import httpx
@@ -361,6 +362,36 @@ def test_the_ownership_handover_needs_a_sandbox_id_in_the_agent_shape(
         f"{tree} was not named by one"
     )
     assert stub.calls == []
+
+
+def test_the_ownership_handover_sets_the_tree_modes_before_it_leaves(
+    tmp_path: Path, install_stub
+) -> None:
+    """The mode pass is part of the hand-over, not an alternative to it (I-1).
+
+    ``e2b-maint chown`` changes ownership and nothing else, and the worker is a
+    *group member* of the tree afterwards, not its owner: a tree left at
+    ``mkdir``'s 0755 would give the worker ``r-x`` on the workspace it must
+    write for the files API, snapshots and lifecycle. So the assertion is the
+    mode **on disk**, and the op is only half of it.
+    """
+    from envd_service import uid_pool
+
+    tree = tmp_path / "workspaces" / SANDBOX
+    (tree / "workspace").mkdir(parents=True)
+    (tree / "workspace" / "note.txt").write_text("x", encoding="utf-8")
+    for directory in (tree, tree / "workspace"):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o755  # the create's default
+    stub = install_stub(_RecordingStub())
+
+    uid_pool.apply_sandbox_ownership(tree, UID_X, sandbox_id=SANDBOX)
+
+    assert stub.calls == [("chown-workspace", SANDBOX, {"recursive": True})]
+    assert stat.S_IMODE(tree.stat().st_mode) == 0o770
+    assert stat.S_IMODE((tree / "workspace").stat().st_mode) == 0o770
+    # Files keep their own modes (the sandbox may need them readable; only
+    # directories need the group-writable bit for the worker).
+    assert stat.S_IMODE((tree / "workspace" / "note.txt").stat().st_mode) == 0o644
 
 
 def test_checkpoint_chown_walk_and_remove_go_to_the_agent(

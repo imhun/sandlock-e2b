@@ -216,8 +216,42 @@ def test_the_name_less_fallback_is_refused_in_the_agent_shape(
     with pytest.raises(priv_helpers.PrivHelperError) as excinfo:
         W1SlotPool._scope_slot_document(document, HOST_UID, sandbox_id="sbx_docs")
     assert str(excinfo.value) == (
-        "the route-B slot directory for sandbox sbx_docs is 'rb-sbx_docs', but the "
-        "shared naming rule says 'sbx_docs': the control plane derives the slot "
-        "documents' path from that rule, so this deployment would scope the "
-        "wrong path -- refusing"
+        f"the route-B slot directory for sandbox sbx_docs is "
+        f"{HOST_UID}/rb-sbx_docs, but this slot's identity is "
+        f"{HOST_UID}/sbx_docs: the control plane derives the slot documents' "
+        "path from the shared naming rule and the leased uid, so this "
+        "deployment would scope the wrong path -- refusing"
+    )
+
+
+def test_a_copy_under_another_uids_directory_is_refused_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m-2: the leaf alone is not the address -- the leased uid is part of it.
+
+    A stale copy of the same instance name under *another* uid's directory used
+    to pass the leaf check, so the agent would have been pointed at that copy
+    while the live document stayed unscoped: the same "wrong path, no error"
+    shape the shared rule was introduced to remove.
+    """
+    from envd_service import agent_fileops, priv_helpers
+
+    class _Stub:
+        calls: list = []
+
+        def scope_slot_document(self, sandbox_id, name):  # pragma: no cover
+            self.calls.append((sandbox_id, name))
+
+    monkeypatch.setattr(agent_fileops, "_ACTIVE", [_Stub()])
+    stale = _route_b_root(tmp_path) / str(HOST_UID + 1) / "sbx_docs" / "policy.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("{}", encoding="utf-8")
+    with pytest.raises(priv_helpers.PrivHelperError) as excinfo:
+        W1SlotPool._scope_slot_document(stale, HOST_UID, sandbox_id="sbx_docs")
+    assert str(excinfo.value) == (
+        f"the route-B slot directory for sandbox sbx_docs is "
+        f"{HOST_UID + 1}/sbx_docs, but this slot's identity is "
+        f"{HOST_UID}/sbx_docs: the control plane derives the slot documents' "
+        "path from the shared naming rule and the leased uid, so this "
+        "deployment would scope the wrong path -- refusing"
     )

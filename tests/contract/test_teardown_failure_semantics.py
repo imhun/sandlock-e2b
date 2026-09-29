@@ -37,7 +37,7 @@ import httpx
 import pytest
 from starlette.requests import Request
 
-from gateway_common.paths import sandbox_record_path
+from gateway_common.paths import sandbox_record_path, sandbox_runtime_dir
 
 import control_plane.api.sandboxes as sandboxes
 import envd_service.agent as agent_mod
@@ -1041,7 +1041,17 @@ async def test_the_local_teardown_passes_when_the_helper_removes_the_tree(
     response = await _delete_sandbox(app, "sbx_ok")
 
     assert response.status_code == 204
-    assert calls == [str(tree)]
+    # Two calls, not one (C3 Task 4 / A5): the tree *and* its paired platform
+    # directory (``<state base>/_runtime/<id>``) go through the same confirming
+    # removal. That directory is `0700` owned by the worker, so a control plane
+    # that is neither root nor its owner used to fail the generic
+    # ``rmtree(..., ignore_errors=True)`` silently and still report a teardown
+    # (docs/c3-privilege-relocation.md §13.7, reproduced by
+    # ``deploy/scripts/acceptance/probe_c3_a5_silent_rmtree.py``).
+    assert calls == [
+        str(tree),
+        str(sandbox_runtime_dir(workspace, "sbx_ok")),
+    ]
     assert tree.exists() is False
     assert runtime_registry.list() == []
     with pytest.raises(UnknownSandboxError):

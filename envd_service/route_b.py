@@ -906,13 +906,19 @@ class W1SlotPool:
             from gateway_common.paths import route_b_instance_name
 
             expected = route_b_instance_name(sandbox_id)
-            if path.parent.name != expected:
+            # Both components: the leaf names the *instance*, and the directory
+            # above it is the uid the slot was leased at (m-2). Comparing only
+            # the leaf would accept a stale copy under another uid's directory --
+            # scoping that one while the live document stays unscoped, which is
+            # the same "wrong path, no error" shape as the original defect.
+            if path.parent.name != expected or path.parent.parent.name != str(uid):
                 raise PrivHelperError(
                     f"the route-B slot directory for sandbox {sandbox_id} is "
-                    f"{path.parent.name!r}, but the shared naming rule says "
-                    f"{expected!r}: the control plane derives the slot "
-                    "documents' path from that rule, so this deployment would "
-                    "scope the wrong path -- refusing"
+                    f"{path.parent.parent.name}/{path.parent.name}, but this "
+                    f"slot's identity is {uid}/{expected}: the control plane "
+                    "derives the slot documents' path from the shared naming "
+                    "rule and the leased uid, so this deployment would scope "
+                    "the wrong path -- refusing"
                 )
             client.scope_slot_document(sandbox_id, path.name)
             return

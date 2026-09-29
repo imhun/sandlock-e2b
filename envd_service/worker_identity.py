@@ -20,10 +20,13 @@ than leaving a child polling for an identity that will never come.
 from __future__ import annotations
 
 import os
+import logging
 from pathlib import Path
 from typing import Any, Callable
 
 from gateway_common.worker_identity import validate_pid_namespace
+
+logger = logging.getLogger(__name__)
 
 #: Where the worker reads its own identity from (Linux ``procfs``).
 DEFAULT_PROC_ROOT = Path("/proc")
@@ -107,5 +110,38 @@ def worker_identity_fields() -> dict[str, int]:
     Reported, not *authorized*: the values are the worker's own process
     identity, and hard rule 3 is about what a worker may **name** in a request
     for a privileged step -- which is nothing.
+
+    **A root worker reports nothing** (third review, m-1). uid 0 is not a worker
+    identity -- ``maint.c``'s uid-pool gate refuses it, and the control plane's
+    own ``workerUID``/``workerGID`` validation refuses it by name -- so sending
+    ``0`` would make the whole node unjoinable (registration and heartbeats are
+    not file operations) for a fact that only matters to the file operations.
+    Omitting the pair keeps the node joinable and leaves every operation that
+    needs the identity to fail closed at the CP with its named 503; the reason
+    is said out loud here, once, so an operator greps for it instead of guessing.
     """
-    return {"workerUID": os.geteuid(), "workerGID": os.getegid()}
+    uid, gid = os.geteuid(), os.getegid()
+    if uid <= 0 or gid <= 0:
+        _disclose_root_identity(uid, gid)
+        return {}
+    return {"workerUID": uid, "workerGID": gid}
+
+
+def _disclose_root_identity(uid: int, gid: int) -> None:
+    """One named line for "this worker has no identity it may report"."""
+    global _ROOT_IDENTITY_DISCLOSED
+    if _ROOT_IDENTITY_DISCLOSED:
+        return
+    _ROOT_IDENTITY_DISCLOSED = True
+    logger.warning(
+        "this worker runs as %d:%d: it reports no worker identity (a non-zero "
+        "uid/gid is what a sandbox tree's group and the agent's `--worker` form "
+        "mean), so the control plane will refuse every C3 file operation on "
+        "this node by name -- run the worker as 65534:65534 (the shipped "
+        "image's USER) for the agent shape",
+        uid,
+        gid,
+    )
+
+
+_ROOT_IDENTITY_DISCLOSED = False

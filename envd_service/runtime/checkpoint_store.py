@@ -83,6 +83,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from envd_service.runtime.platform_disk import (
+    UNKNOWN_ACCOUNT_REASON,
     checkpoint_admission,
     checkpoint_no_room_reason,
     measure_platform_disk_bytes,
@@ -356,7 +357,10 @@ def checkpoint_status(
     }
 
 
-def _platform_numbers(workspace_base, state_base=None) -> tuple[int, int]:
+def _platform_numbers(
+    workspace_base, state_base=None
+) -> tuple[int | None, int]:
+    """``(used bytes or None, budget bytes)`` -- ``None`` is "cannot measure" (I-3)."""
     return (
         measure_platform_disk_bytes(workspace_base, state_base=state_base),
         platform_budget_bytes(),
@@ -398,6 +402,17 @@ def capture_checkpoint_image(
     sentence, never an empty string.
     """
     used_before, limit = _platform_numbers(workspace_base, state_base)
+    if used_before is None:
+        # I-3: an unmeasured account is not an empty one. Refusing here (before
+        # anything is written) is the same exit as "the account is full": the
+        # sandbox is left frozen in place, and the caller gets the reason.
+        reason = UNKNOWN_ACCOUNT_REASON.format(
+            decision="no image can be taken until the account can be measured"
+        )
+        logger.warning("sandbox %s: %s", sandbox_id, reason)
+        return _capture_reply(
+            sandbox_id, False, reason, used=None, limit=limit
+        )
     full = checkpoint_no_room_reason(used_bytes=used_before, limit_bytes=limit)
     if full is not None:
         # Refuse *before* writing: with no room at all there is nothing to learn
@@ -486,7 +501,9 @@ def capture_checkpoint_image(
         outcome.get("fds"),
         outcome.get("exe") or "<unknown>",
         list(outcome.get("argv") or []),
-        (used_before + written) // _MIB,
+        # ``used_before`` cannot be None here: an unmeasured account is refused
+        # before the capture (see the top of this function).
+        (int(used_before) + written) // _MIB,
         "an unlimited budget" if limit <= 0 else f"{limit // _MIB} MiB",
     )
     return _capture_reply(
@@ -506,7 +523,7 @@ def _capture_reply(
     captured: bool,
     reason: str,
     *,
-    used: int,
+    used: int | None,
     limit: int,
     image: Path | None = None,
     image_bytes: int = 0,
@@ -518,7 +535,10 @@ def _capture_reply(
         "reason": reason,
         "image": str(image) if image is not None else None,
         "imageMB": image_bytes // _MIB,
-        "platformDiskUsedMB": used // _MIB,
+        # ``None`` = the account could not be measured (I-3): the honest wire
+        # value, and the one the CP's ``update_usage`` keeps its previous number
+        # for. The *budget* still ships -- it is a configured number.
+        "platformDiskUsedMB": None if used is None else used // _MIB,
         "platformDiskBudgetMB": 0 if limit <= 0 else limit // _MIB,
     }
     if capture:

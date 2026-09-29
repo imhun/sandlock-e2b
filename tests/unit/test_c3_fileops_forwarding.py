@@ -243,7 +243,48 @@ async def test_a_half_identity_is_refused_at_registration(workspace) -> None:
     assert resp.status_code == 400
     assert resp.json() == {
         "code": 400,
-        "message": "workerGID must be a positive integer",
+        "message": (
+            "workerGID must be a positive integer: a worker may not run as "
+            "root (uid 0) or report a non-identity, because the group a "
+            "sandbox tree is handed to and the `--worker` form both mean "
+            "*this* worker's own non-zero identity"
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_root_worker_identity_is_refused_with_the_real_reason(
+    workspace,
+) -> None:
+    """m-1: a body that names uid 0 is refused, and the message says why.
+
+    The shipped worker no longer *sends* this (see
+    ``envd_service.worker_identity``: a root worker reports no identity at all,
+    so its node stays joinable), which makes this arm the hostile-input guard --
+    and the reason it names is the deployment fact an operator has to fix.
+    """
+    shape = _C3Shape(workspace)
+    app = _app(shape, client=_StubAgentClient())
+    async with _client(app) as client:
+        resp = await client.post(
+            "/internal/nodes/register",
+            headers={"X-Internal-Key": KEY_A},
+            json={
+                "nodeID": NODE_A,
+                "address": ENDPOINT_A.address,
+                "workerUID": 0,
+                "workerGID": 0,
+            },
+        )
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "code": 400,
+        "message": (
+            "workerUID must be a positive integer: a worker may not run as "
+            "root (uid 0) or report a non-identity, because the group a "
+            "sandbox tree is handed to and the `--worker` form both mean "
+            "*this* worker's own non-zero identity"
+        ),
     }
 
 

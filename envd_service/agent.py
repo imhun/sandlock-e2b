@@ -366,7 +366,8 @@ def _measure_platform_account(workspace_base, state_base=None) -> dict[str, int]
     Two numbers, because a budget without its usage says nothing and usage
     without a budget reads as "unlimited". ``0`` for the budget is the honest
     encoding of unlimited (``E2B_PLATFORM_DISK_MB`` defaults to it), not a
-    missing value.
+    missing value. An *unmeasurable* usage is the other case and is **omitted**
+    (see below): a missing usage field is "no update", a 0 would be a claim.
     """
     from envd_service.runtime.platform_disk import (
         measure_platform_disk_bytes,
@@ -375,10 +376,16 @@ def _measure_platform_account(workspace_base, state_base=None) -> dict[str, int]
 
     used = measure_platform_disk_bytes(workspace_base, state_base=state_base)
     budget = platform_budget_bytes()
-    return {
-        "platformDiskUsedMB": used // _MIB,
-        "platformDiskBudgetMB": budget // _MIB,
-    }
+    payload = {"platformDiskBudgetMB": budget // _MIB}
+    if used is not None:
+        payload["platformDiskUsedMB"] = used // _MIB
+    # When the account could not be measured the key is **omitted**, not sent as
+    # 0 (C3 Task 4 third review, I-3): the control plane's ``update_usage``
+    # treats a missing field as "no update" and keeps the number it already has,
+    # while a 0 would assert "the platform stores nothing" -- the fail-open this
+    # account exists to prevent. The worker-side reason is logged by
+    # ``platform_disk`` where the unreadable tree is named.
+    return payload
 
 
 def _heartbeat_usage_payload(
@@ -3728,7 +3735,15 @@ async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
             # "no path in the request" rule). Idempotent for the same reason the
             # teardown is: an import is retried, and "there was nothing there"
             # is exactly what this branch is for.
-            _remove_agent_half(
+            #
+            # ⚠ Off the event loop (third review, I-2): this is a synchronous
+            # control-plane round trip whose read budget is the *file-op* one
+            # (minutes, because a whole tree is being removed). Inline it parked
+            # every heartbeat and every sandbox API on this worker -- the same
+            # class as ``/metrics``, and the reason the create/delete handlers
+            # already run their work in a thread.
+            await asyncio.to_thread(
+                _remove_agent_half,
                 client,
                 sandbox_id,
                 path=workspace,
@@ -3736,7 +3751,7 @@ async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
                 what="tree",
             )
         else:
-            priv_helpers.remove_tree(workspace)
+            await asyncio.to_thread(priv_helpers.remove_tree, workspace)
     workspace.mkdir(parents=True, exist_ok=True)
     migrate_dir = settings.workspace_base / "_migrate"
     migrate_dir.mkdir(parents=True, exist_ok=True)
