@@ -3216,3 +3216,36 @@ push 之前），删 pod 后立即 Running；现全 workload 在新版本上。
   worker`。k8s 车道的身份走 **pod spec 的 runAsUser/runAsGroup**（那条路是通的，文件操作确实成功了），
   所以这条是 compose 车道的容器身份上报在 k8s 里也跑了的**误导性告警**。修法：只在 compose 车道做容器
   身份上报（按形态门控），并保留 k8s 侧"pod 没 pin 身份"那条真告警。
+
+---
+
+## C3 Task 7（退役 C1 的节点 broker + N48 收口）—— 2026-09-29，complete
+
+- **commit `8776c67`**（工作树 `tmp/wt-c3`，分支 `feat/c3-consolidation`；**未 push**）。
+- **退役面**：删 `deploy/k8s/priv-broker.yaml` + kustomization 条目；`apply.sh` 去掉 broker rollout 闸门
+  （只剩 agent → worker）；worker 去掉 `wait-for-broker` init、`E2B_PRIV_HELPER_SOCKET` env 与
+  `/run/e2b-broker` hostPath/挂载；`priv_helpers.py` 删掉整条 socket 客户端（`_run_socket`/`_broker_request`/
+  `hello`/`_require_broker_agreement`/wire 常量），`TRANSPORTS` 收成 `auto|exec|agent` —— `socket` 现在是
+  **启动期具名拒绝**。
+- **不做就会静默回归的那一步**：broker 的两个属主 init（`workspace-root-init`、`image-cache-init` 的
+  节点本地那一半）**逐字搬进 agent DaemonSet**（`storage-init` + 新 init `workspace-root-init`）；
+  线上两个 init 都跑了并逐条打印归属校验（见 `docs/deploy-clusters.md` §7.9）。
+- **钉子**：清单集里没有 `e2b-priv-broker`（渲染后按对象名断）；worker 与 agent 面 A 不含 §2.3 禁项、
+  `allowPrivilegeEscalation` 一个字都不出现（判据 5/11）；rollback-only env 消失
+  （`test_c3_agent_manifest.py::test_the_*`、`test_worker_manifest_permissions.py`）。
+- **单测**：`tests/unit` 失败集合与基线**逐条相同**（16 条，全是环境：`os.chown` 需 root、缺 redis、
+  macOS 平台项；**无新增**）。删掉的三份 socket 时代用例（`test_priv_broker_protocol.py`、
+  `test_broker_socket_identity.py`、以及被搬进 `test_c3_agent_manifest.py` 的清单钉）顺带消掉了
+  基线里 28 条因 `os.geteuid`/`DEFAULT_HELPER_DIR` monkeypatch 泄漏而红/顺序相关的失败。
+- **契约**：`tests/contract` = 361 passed / 65 skipped / 1 failed（`test_template_upload` 并发重名，
+  基线同红）+ `test_broker_socket_c.py` 的**收集期 ERROR**（那个文件要求一次性容器车道，基线同错）。
+- **集群**：版本 `0.1.0-764-g8776c67-20260929-215208`，`apply.sh` + `kubectl delete ds e2b-priv-broker`
+  （apply 不 prune，必须显式删）；之后**没有任何 broker pod**，worker/agent 全绿；
+  worker `CapEff=0`、面 A `CapEff=0` + `as_uid=cap_setgid,cap_setuid=ep`、面 B **`CapEff=0xb`** +
+  `e2b-maint=cap_chown,cap_dac_override=ep`。
+- **N48**：动手前逐棵 `stat` 时 5 棵属主 0 的老树**已不在盘上**（`find … -uid 0` = 0，两个 agent pod 各测一次）
+  ⇒ 判据 10 成立、Task 7 **没有删任何一棵树**；原文"永远回收不掉"只对 uid 池回收成立（按名字判定的孤儿树 GC
+  会删）。**N47** 随退役关闭（残余面挪 N49）。
+- **冒烟**：`MULTI-NODE SMOKE OK`；`deployment_smoke` 的 C3 段全绿（**含跨节点迁移保文件——F1 已修**），
+  卡在 Track Z 模板构建（buildkit 拉 `docker.io/python:3.11-slim`，CP pod 里 docker.io
+  `Network is unreachable`）——**改动之前那一轮同一步同一个异常**（`tmp/build/deployment_smoke.log`）。

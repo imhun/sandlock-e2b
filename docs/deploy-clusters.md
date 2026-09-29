@@ -527,6 +527,67 @@ pod 里有一个 `runAsUser: 0` 的 `image-cache-init`，盘上 `_volumes` 是 *
    control-plane 复做同一断言（Task 6 简报的用例②："滚动重启期间不误删活沙箱"）。
 4. 把结果回填到本节与 `docs/c3-privilege-relocation.md` §11.1 第 5 项。
 
+### 7.9 C3 Task 7 上线：退役 C1 的节点 broker（**2026-09-29，已执行**）
+
+> **这是现行的现状。§7.1–§7.8 里所有"仓库已落，集群未上线"的段落，到这一次为止都已上线。**
+
+**版本**：`0.1.0-764-g8776c67-20260929-215208`（= `deploy/stack/.version`，`apply.sh` 就是按它渲染的）。
+镜像：worker / agent / autoscaler / quota-agent / control-plane-gateway 都在这个 tag 上（ACR，
+arm64）。构建走的是 `PLATFORMS=linux/arm64 ./deploy/scripts/build-and-push.sh` + 逐个 `docker push`
+（单平台分支**只 `--load` 不推**，所以推是手动的）+ `docker manifest inspect` 逐个复核 —— 这是
+`tmp/wt-c3` 里上一轮用过的同一条路径。
+
+**动作**：`apply.sh`（渲染后 apply，8 个镜像引用 pin 到上面的 tag；等 `ds/e2b-c3-agent` → 等
+`sts/e2b-worker` → 预热 base image）→ **`kubectl delete daemonset e2b-priv-broker`**。
+⚠ `apply.sh` 不 prune：清单里删掉 `priv-broker.yaml` **不会**让集群上那个 DaemonSet 消失，
+它必须显式删（这是"退役"唯一一步不在清单里的事）。
+
+**pod（实测）**：`control-plane` 2 个副本各 `2/2`、`autoscaler 1/1`、`e2b-worker-0/1` 各 `1/1`、
+`e2b-c3-agent` 两个各 `2/2`、`seccomp-installer 2/2`、`redis 1/1`，
+**没有任何 `e2b-priv-broker` pod**（`kubectl -n sandlock get pods | grep -c broker` = 0）。
+
+**形状（实测，都是 pod spec / `/proc` 的读数）**：
+
+| 判据 | 读数 |
+|---|---|
+| worker 的 init | **没有**（`initContainers` 为空）—— `wait-for-broker` 随 broker 一起走了 |
+| worker 的 env | `E2B_PRIV_HELPER_TRANSPORT=agent`、`E2B_SLOT_IDENTITY=agent-grant`；**没有** `E2B_PRIV_HELPER_SOCKET` |
+| worker 的挂载 | 只剩 `shared`（PVC）与 `image-cache`（hostPath）；**没有** `broker-socket` / `/run/e2b-broker` |
+| worker 的 cap | `CapEff=0000000000000000`、`CapBnd=00000000a80425fb`（无 `capabilities` 块） |
+| agent 面 A | `runAsUser=65534`、`CapEff=0`、`CapBnd=00000000a80425fb`；`as_uid` = `cap_setgid,cap_setuid=ep` |
+| agent 面 B | `runAsUser=0`、**`CapEff=000000000000000b`**（恰好 `CHOWN`+`DAC_OVERRIDE`+`FOWNER`）；`e2b-maint` = `cap_chown,cap_dac_override=ep` |
+| 禁项（§2.3） | worker 与 agent 的 pod spec 里 `SYS_ADMIN`/`SYS_PTRACE`/`NET_RAW`/`privileged`/`hostNetwork`/`allowPrivilegeEscalation`/`no-new-privileges` **一个字都没有** |
+| broker 的属主 init 搬家后 | agent pod 的 `storage-init` 与 `workspace-root-init`（都 `runAsUser: 0`）各跑了一轮：日志见下 |
+
+```
+storage-init: /var/lib/e2b-images is owned by uid 65534
+storage-init: /var/lib/e2b-sandboxes/_images is owned by uid 65534
+storage-init: /var/lib/e2b-sandboxes/_volumes already belongs to uid 65534 (mode 755) -- nothing to do
+workspace-root-init: /var/lib/e2b-sandboxes/workspaces/_snapshots owner=65534 mode=755
+workspace-root-init: /var/lib/e2b-sandboxes/state/_runtime owner=65534 mode=711
+workspace-root-init: /var/lib/e2b-sandboxes/state/_runtime/.checkpoints owner=65534 mode=711
+workspace-root-init: /var/lib/e2b-sandboxes/workspaces owner=0 mode=1777
+workspace-root-init: /var/lib/e2b-sandboxes/state owner=65534 mode=1777
+workspace-root-init: /var/lib/e2b-sandboxes/workspaces/_migrate owner=65534 mode=1777
+```
+
+**N48（属主 0 的老树，判据 10）**：删 broker 前后各查一次，`workspaces/` **下没有 `owner=0` 的条目**
+（`find … -mindepth 1 -uid 0` = 0；两个 agent pod 上各测一次，见 `.superpowers/sdd/task-7-report.md` §1）。
+注意 `workspaces/` **目录本身**仍是 `0:65534 mode=1777`（粘滞位、world-writable）——那是卷根约定，
+不是残留，`workspace-root-init` 的 gate 也按"owner 不是 65534 但可写"放行。
+
+**冒烟**：`multinode_smoke.py` = `MULTI-NODE SMOKE OK`（4 箱 2+2、命令/文件/stdin、预留归零）；
+`deployment_smoke.py` 的 **C3 段全绿**（建箱 + 命令/文件过网关、跨节点迁移保文件、网络配置、
+远端卷挂载 + 兄弟卷隔离、预留归零），**卡在 Track Z 的模板构建那一段**：
+`e2b.exceptions.BuildException: buildkit build exited with code 1`，buildkit 日志是
+`dial tcp …: i/o timeout` / `mkdir /nonexistent: permission denied`，而 CP pod 里
+`registry-1.docker.io` **Network is unreachable**、ACR 可达 —— 模板构建要拉 Docker Hub 的
+`python:3.11-slim`。**这不是本次改动引入的**：上一轮（21:07，改动之前）的 `deployment_smoke` 日志
+在**同一步**以**同一个异常**失败（`tmp/build/deployment_smoke.log`）。
+
+**残留（无害，记在这里）**：节点上 `/run/e2b-broker/`（hostPath `DirectoryOrCreate` 建的）目录还在，
+但**没有任何组件挂它、也没有人读**（worker 的挂载已删）。要清就在节点上 `rmdir`；不清也不影响。
+
 ## 8. 改部署的入口
 
 ```bash
