@@ -58,6 +58,7 @@ of N49:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections import Counter
@@ -159,6 +160,53 @@ def _worker_identity_fields(body: dict[str, Any]) -> tuple[int | None, int | Non
                 "*this* worker's own non-zero identity",
             )
     return uid, gid
+
+
+def _verified_worker_identity(
+    request: Request, node_id: str, claimed: tuple[int | None, int | None]
+) -> tuple[int | None, int | None]:
+    """The worker identity to **store**, or ``(None, None)`` -- never the claim.
+
+    C3 Task 4's fourth review (②): in C1 the ``--worker`` identity came from
+    ``SO_PEERCRED`` and could not be forged; the first cut of the agent made it
+    worker-**reported**, so a compromised worker could have a tree -- or the
+    credential-bearing slot policy -- handed to another tenant's uid. The value
+    that reaches the agent now has to come from a trusted source
+    (:mod:`control_plane.worker_identity_source`): the worker pod's own
+    ``securityContext`` in k8s, which the worker cannot edit. A claim that does
+    not match it, or a shape with no source at all, stores **nothing** and says
+    so; the node stays joined and every operation that needs the identity
+    refuses by name (the fail-closed posture the ruling prescribes).
+    """
+    source = getattr(request.app.state, "worker_identity_source", None)
+    trusted = source.identity_for(node_id) if source is not None else None
+    claimed_uid, claimed_gid = claimed
+    if claimed_uid is None and claimed_gid is None:
+        # An older worker reports nothing; the trusted answer (when there is
+        # one) is still the deployment's fact and is what gets stored.
+        return trusted if trusted is not None else (None, None)
+    if trusted is None:
+        logger.warning(
+            "internal API: node %s reported worker identity %s, but this "
+            "control plane has no trusted source for it (the k8s lane reads the "
+            "worker pod's securityContext; other shapes have none): recording "
+            "no identity -- the file operations that need one will refuse by "
+            "name",
+            node_id,
+            (claimed_uid, claimed_gid),
+        )
+        return None, None
+    if trusted != (claimed_uid, claimed_gid):
+        logger.warning(
+            "internal API: node %s reported worker identity %s, but the "
+            "deployment pins %s: refusing the reported value (a worker does not "
+            "name the identity its privileged steps act as)",
+            node_id,
+            (claimed_uid, claimed_gid),
+            trusted,
+        )
+        return None, None
+    return trusted
 
 
 def _resolve_node(request: Request, node_id: str) -> NodeEndpoint | None:
@@ -303,7 +351,9 @@ async def register_node(request: Request) -> dict[str, Any]:
         )
     address = endpoint.address
     pid_namespace = _worker_pid_namespace(body)
-    worker_uid, worker_gid = _worker_identity_fields(body)
+    worker_uid, worker_gid = _verified_worker_identity(
+        request, node_id, _worker_identity_fields(body)
+    )
     record = request.app.state.nodes.register(
         node_id=node_id,
         address=address,
@@ -375,9 +425,12 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
     # every heartbeat (a restart can change them under a k8s ``runAsGroup``),
     # and left alone when an older worker reports nothing.
     worker_uid, worker_gid = _worker_identity_fields(body)
-    if worker_uid is not None and worker_gid is not None:
-        record.worker_uid = worker_uid
-        record.worker_gid = worker_gid
+    verified_uid, verified_gid = _verified_worker_identity(
+        request, node_id, (worker_uid, worker_gid)
+    )
+    if verified_uid is not None and verified_gid is not None:
+        record.worker_uid = verified_uid
+        record.worker_gid = verified_gid
     record.update_usage(
         used_disk_mb=body.get("diskUsedMB"),
         disk_total_mb=body.get("diskTotalMB"),
@@ -628,9 +681,10 @@ async def node_file_op(node_id: str, request: Request) -> dict[str, Any]:
     if node is None:
         raise OfficialError(404, f"Node {node_id} not found")
     state = request.app.state
-    try:
+
+    def _derive():
         paths = file_ops.control_paths(state, state.settings)
-        instruction = file_ops.derive(
+        return file_ops.derive(
             spec,
             body,
             paths=paths,
@@ -638,6 +692,14 @@ async def node_file_op(node_id: str, request: Request) -> dict[str, Any]:
             node_id=node_id,
             worker_gid=getattr(node, "worker_gid", None),
         )
+
+    try:
+        # Off the event loop (fourth review, minor): ``control_paths`` calls
+        # ``volumes.list()`` -- a directory glob plus one store read per
+        # candidate -- and ``derive`` resolves paths; both are blocking calls in
+        # an async handler, once per file operation. The work is small but it is
+        # I/O against the shared store, so it does not belong on the loop.
+        instruction = await asyncio.to_thread(_derive)
     except file_ops.FileOpRefusal as exc:
         raise OfficialError(exc.status_code, str(exc)) from exc
     # Every file op carries the worker's identity to the agent -- the

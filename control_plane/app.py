@@ -225,6 +225,7 @@ def create_app(
     templates_registry=None,
     node_address_resolver=None,
     c3_agent_client=_UNSET,
+    worker_identity_source=_UNSET,
 ) -> FastAPI:
     settings = settings or Settings()
     redis_client = None
@@ -565,6 +566,17 @@ def create_app(
             max_concurrency=settings.c3_agent_max_concurrency,
         )
     app.state.c3_agent_client = c3_agent_client
+    # Where a worker's own uid/gid may come from (C3 Task 4, fourth review ②):
+    # a trusted source, never the worker's own report. Unresolvable for a shape
+    # means "record no identity" -- and then every file operation that needs one
+    # refuses by name.
+    if worker_identity_source is _UNSET:
+        from control_plane.worker_identity_source import (
+            build_worker_identity_source,
+        )
+
+        worker_identity_source = build_worker_identity_source(settings)
+    app.state.worker_identity_source = worker_identity_source
     app.state.recent_failures = SlidingWindowCounter()
     app.state.templates = templates_registry or TemplateRegistry(
         platform_root / "_templates"

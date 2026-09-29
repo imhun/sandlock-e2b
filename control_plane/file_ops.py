@@ -270,6 +270,10 @@ def derive(
         path = _workspace(paths, sandbox_id) if spec.op == "chown-workspace" else _checkpoints(
             paths, sandbox_id
         )
+        if spec.op == "chown-checkpoint":
+            # Same alignment as ``chown-secret`` below: the pre-C3 shape handed
+            # the checkpoint store over as ``<uid>:<uid>``.
+            gid = host_uid
     elif spec.op in ("remove-workspace", "walk-workspace"):
         path = _workspace(paths, sandbox_id)
         recursive = False
@@ -288,6 +292,13 @@ def derive(
     elif spec.op == "chown-secret":
         path = _secret(paths, body, sandbox_id)
         recursive = False
+        # The pre-C3 hand-over for a secret file was ``chown <uid>:<uid>``
+        # (``executors/sandlock.py``), and the checkpoint path agrees
+        # (``checkpoint_store._hand_to_sandbox``). Only the *workspace tree*
+        # keeps the worker's gid as the group -- that group is what makes the
+        # worker the data-plane owner of the tree it must write (fourth review,
+        # minor: the two shapes used to disagree on owner metadata here).
+        gid = host_uid
     elif spec.op == "scope-slot-document":
         path = _slot_document(paths, body, sandbox_id, host_uid)
         recursive = False

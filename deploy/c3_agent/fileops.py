@@ -24,9 +24,18 @@ behaviour", and both are in :func:`maint_env`:
   request, which is what makes ``chown --worker`` mean "the worker" and what
   lets ``--gid <worker gid>`` pass the group gate. Exec'd directly by the
   agent, which is **root**, neither would be true: ``--worker`` would hand the
-  tree to *root*. The control plane therefore carries the worker's identity
-  (from its node record) and this module writes it into the child's
-  environment -- a request cannot forge it, exactly as with ``serve``.
+  tree to *root*. The control plane therefore carries the worker's identity and
+  this module writes it into the child's environment.
+
+  ⚠ **What that identity is -- and is not** (fourth review, ②): it is *not* the
+  worker's own claim. A worker reports one, but the control plane **verifies**
+  the claim against a trusted source (the worker pod's ``securityContext`` in
+  k8s; ``control_plane/worker_identity_source.py``) and stores nothing when it
+  cannot, so what arrives here is a deployment fact -- or the operation never
+  reaches this process (the file-op endpoint refuses by name for a node with no
+  identity). In C1 the same value came from ``SO_PEERCRED``; the frontier this
+  module must not widen is "a worker names the identity its privileged steps act
+  as", and the CP-side source is what keeps that closed.
 
 Judgement (``maint.c``'s own contract):
 
@@ -57,8 +66,14 @@ FILE_OP_VERBS: tuple[str, ...] = ("chown", "rm", "walk")
 #: the refusal text of a non-zero exit stays reproducible in tests.
 PRIV_EXIT_REFUSED = 77
 
-#: The entry kinds ``maint.c`` emits: directory, regular file, symlink.
-WALK_KINDS = ("d", "f", "l")
+#: The entry kinds ``maint.c`` emits: directory, regular file, symlink, and
+#: ``o`` for "other" -- a fifo, socket or device node. ``o`` is not decoration:
+#: a tree that holds one (a sandbox's unix socket, say) makes ``maint.c`` print
+#: that kind, and a judged-by-name whitelist that left it out would refuse the
+#: whole answer -- degrading ``/metrics`` and the per-sandbox accounting in the
+#: agent shape. The old ``priv_helpers`` parser accepted every kind it was given
+#: (fourth review, minor), so this is the same vocabulary.
+WALK_KINDS = ("d", "f", "l", "o")
 
 
 class AgentFileOpRefusal(AgentRefusal):

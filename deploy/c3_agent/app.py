@@ -54,6 +54,7 @@ DaemonSet drives the same code the lanes drive against a synthetic one.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import subprocess
@@ -300,10 +301,23 @@ def create_app(
             )
         # D18.2: a verb whitelist with explicitly named verbs. An unknown op is
         # refused by name here, before any body is interpreted.
+        #
+        # Both ops run their privileged work in a worker thread (fourth review,
+        # ①): the FastAPI handler is ``async`` only because reading the body is,
+        # and ``SubprocessAsUidRunner``/``SubprocessMaintRunner`` are synchronous
+        # ``subprocess.run`` calls -- 5 s for ``as_uid``, up to 300 s for a
+        # ``chown``/``rm``/``walk``. Inline they would run on uvicorn's single
+        # event loop, so one teardown or tree walk would stop the agent from
+        # accepting connections at all: concurrent slot grants would blow through
+        # the control plane's 5 s deadline as 504s, and the thread-pool premise
+        # written for ``E2B_C3_AGENT_MAX_CONCURRENCY`` (control_plane/config.py)
+        # would be false. ``to_thread`` is what keeps that reasoning true.
         if op == "grant-slot":
-            return _grant_slot(_validated(GrantSlotBody, body))
+            return await asyncio.to_thread(
+                _grant_slot, _validated(GrantSlotBody, body)
+            )
         if op in FILE_OP_VERBS:
-            return _file_op(op, _validated(FileOpBody, body))
+            return await asyncio.to_thread(_file_op, op, _validated(FileOpBody, body))
         raise HTTPException(
             status_code=404, detail={"error": f"unknown agent op {op!r}"}
         )

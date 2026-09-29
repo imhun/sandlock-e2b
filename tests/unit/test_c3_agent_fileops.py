@@ -22,6 +22,9 @@ What this lane pins:
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import httpx
 import pytest
 
@@ -231,6 +234,9 @@ async def test_walk_relays_the_entry_lines() -> None:
     stdout = (
         f"d {WORKER_UID} {WORKER_GID} 770 512 {WORKSPACE}\n"
         f"f {POOL_UID} {POOL_UID} 644 4096 {WORKSPACE}/note.txt\n"
+        # ``o`` -- a fifo/socket/device -- is part of the vocabulary too: a
+        # regular file, a directory and a symlink are not the whole tree.
+        f"o {POOL_UID} {POOL_UID} 644 0 {WORKSPACE}/agent.sock\n"
     )
     runner = _StubMaintRunner(stdout=stdout)
     settings = _settings()
@@ -490,6 +496,62 @@ def test_the_subprocess_runner_judges_every_exit_code() -> None:
         "under any root"
     )
     assert seen == [["/var/lib/e2b-priv/e2b-maint", "rm", "--path", WORKSPACE]]
+
+
+@pytest.mark.asyncio
+async def test_two_instructions_do_not_serialize_on_the_event_loop() -> None:
+    """Fourth review ①: the privileged exec runs off the agent's event loop.
+
+    ``agent_op`` is ``async`` (reading the body is), and both face A's
+    ``as_uid`` and face B's ``e2b-maint`` are *synchronous* ``subprocess.run``
+    calls -- up to 300 s for a teardown or a tree walk. Run inline they would
+    hold uvicorn's single loop, so the agent would stop accepting connections
+    for the whole operation: concurrent slot grants would miss the control
+    plane's 5 s deadline, and the thread-pool premise behind
+    ``E2B_C3_AGENT_MAX_CONCURRENCY`` would be false. The assertion is therefore
+    *overlap* of two concurrent instructions, measured where the privileged work
+    happens.
+    """
+    intervals: list[tuple[float, float]] = []
+
+    class _SlowRunner:
+        def run(self, argv, *, env):
+            started = time.monotonic()
+            time.sleep(0.2)
+            intervals.append((started, time.monotonic()))
+            return ""
+
+    app = create_app(settings=_settings(), maint_runner=_SlowRunner())
+    async with _client(app) as client:
+        first, second = await asyncio.gather(
+            client.post(
+                RM_URL,
+                headers=_headers(),
+                json={
+                    "sandbox_id": "sbx_fileops",
+                    "path": WORKSPACE,
+                    "worker": _worker(),
+                },
+            ),
+            client.post(
+                WALK_URL,
+                headers=_headers(),
+                json={
+                    "sandbox_id": "sbx_fileops",
+                    "path": WORKSPACE,
+                    "worker": _worker(),
+                },
+            ),
+        )
+    assert (first.status_code, second.status_code) == (200, 200)
+    assert len(intervals) == 2
+    # The two execs really ran at the same time: the later one started before
+    # the earlier one finished. Serialized (inline) execution would have the
+    # second start *after* the first end -- and, worse, no other request would
+    # even be read while the first was running.
+    started = sorted(interval[0] for interval in intervals)
+    finished = {interval[0]: interval[1] for interval in intervals}
+    assert started[1] < finished[started[0]]
 
 
 @pytest.mark.asyncio

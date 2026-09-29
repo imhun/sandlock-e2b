@@ -658,6 +658,18 @@ worker 侧的特权面并没有真的消失。**(d) 是唯一的例外，因为�
    `priv_helpers.active_helpers() is not None` 作为 per-sandbox uid 的前提 —— 与 Task 4 修掉的那两个门
    同型。它只是 `local://`（合体节点）车道，而 C3 明确不覆盖该形态（§11.1 第 4 项），
    所以这里**逐字不动**，记在此处以免后续评审把它当成漏改重新发现。
+5. **平台账里还剩两处"分量级"的静默 0**（第四轮评审 minor）：`measure_platform_disk_bytes` 现在把
+   "整账测不到"报成 unknown，但 `directory_cost(runtime_dir)` 失败仍被 `except OSError: pass` 吞掉、
+   非目录子项的 `entry_size` 失败仍 `continue` —— 都是给总和少算一块而不出声。量级小（是分量不是整账），
+   性质与 I-3 相同，记为后续项（要么也点名、要么让这两个分量用同一套 unknown 传播）。
+6. **worker 自己骨架目录的两处 `rmtree(ignore_errors=True)`**（第四轮评审 minor）：
+   `_delete_sandbox_runtime` 的 `_runtime/<id>` 非 agent 分支、以及 `<pure_rootfs_dir>/<id>` 的骨架。
+   与 A5 同形（静默半删），但目标都是 **worker 自己的目录**、不在特权面（CP 那条 A5 已修），
+   且它们是既有行为；记为已知缺口，若要收口就与 §11.2.1 第 3 条（平台态接回 agent）一并做。
+7. **仍有 async handler 内联做文件层重活**（第四轮评审 minor）：`agent_export_sandbox` 的
+   `tar.add(workspace, recursive=True)`（整棵树 + gzip）与 import 的 `write_bytes` +
+   `_extract_sandbox_archive`。它们**不触达 agent 层**、也不是 Task 4 引入的，但与 I-2/`/metrics`
+   同类；slice B 或 Task 7 的清扫可以顺手把它们移到 `asyncio.to_thread`。
 
 ## 12. 结论
 

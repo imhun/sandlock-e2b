@@ -25,6 +25,10 @@ from control_plane.node_address import NodeEndpoint, StaticAddressResolver
 from control_plane.registry.manager import SandboxRegistry
 from control_plane.registry.nodes import NodeRegistry
 from control_plane.registry.volumes import VolumeRegistry
+from control_plane.worker_identity_source import (
+    NoWorkerIdentitySource,
+    StaticWorkerIdentitySource,
+)
 from gateway_common.paths import route_b_instance_name
 
 KEY_A = "key-node-a"
@@ -146,7 +150,7 @@ class _C3Shape:
         )
 
 
-def _app(shape: _C3Shape, *, client) -> tuple:
+def _app(shape: _C3Shape, *, client, worker_identity=None) -> tuple:
     app = create_control_app(
         settings=shape.settings,
         registry=SandboxRegistry(shape.settings),
@@ -155,6 +159,15 @@ def _app(shape: _C3Shape, *, client) -> tuple:
         workspace_base=shape.workspace_base,
         node_address_resolver=StaticAddressResolver({NODE_A: ENDPOINT_A}),
         c3_agent_client=client,
+        # C3 Task 4, fourth review ②: the worker's own uid/gid is only ever
+        # taken from a trusted source. The default here is "the deployment pins
+        # exactly what the worker reports", i.e. the happy path; the tests that
+        # are *about* the verification pass their own source.
+        worker_identity_source=(
+            StaticWorkerIdentitySource({NODE_A: (WORKER_UID, WORKER_GID)})
+            if worker_identity is None
+            else worker_identity
+        ),
     )
     return app
 
@@ -289,9 +302,15 @@ async def test_a_root_worker_identity_is_refused_with_the_real_reason(
 
 
 @pytest.mark.asyncio
-async def test_a_heartbeat_refreshes_the_workers_identity(workspace) -> None:
+async def test_a_heartbeat_refreshes_a_verified_workers_identity(workspace) -> None:
     shape = _C3Shape(workspace)
-    app = _app(shape, client=_StubAgentClient())
+    # The deployment pins 65533 for this node, and the worker reports the same:
+    # a *verified* value is what gets refreshed.
+    app = _app(
+        shape,
+        client=_StubAgentClient(),
+        worker_identity=StaticWorkerIdentitySource({NODE_A: (65533, 65533)}),
+    )
     await _enroll(app)
     async with _client(app) as client:
         resp = await client.post(
@@ -302,6 +321,211 @@ async def test_a_heartbeat_refreshes_the_workers_identity(workspace) -> None:
     assert resp.status_code == 204
     node = app.state.nodes.get(NODE_A)
     assert (node.worker_uid, node.worker_gid) == (65533, 65533)
+
+
+# ------------------------------- ② the worker's claim is never the identity
+
+
+@pytest.mark.asyncio
+async def test_a_worker_claiming_another_identity_gets_nothing_stored(
+    workspace,
+) -> None:
+    """Fourth review ②: a claim that disagrees with the trusted source is dropped.
+
+    The identity face B uses is the one a tree (or a slot's credential-bearing
+    ``policy.json``) is handed to, and in C1 it came from ``SO_PEERCRED``. The
+    first cut of the agent took it from the worker's own register/heartbeat
+    body, so a compromised worker could name **another tenant's** uid and have
+    that tenant handed the file. Here the deployment pins
+    ``65534:65534`` (the shipped image's USER) and the worker claims
+    ``10007:10007``: the node records no identity at all, and the operation
+    refuses by name without ever dialling the agent.
+    """
+    shape = _C3Shape(workspace)
+    agent = _StubAgentClient()
+    app = _app(shape, client=agent)  # pins (WORKER_UID, WORKER_GID)
+    await _enroll(app)
+
+    # ...and now the worker "changes" its identity in a heartbeat.
+    async with _client(app) as client:
+        resp = await client.post(
+            f"/internal/nodes/{NODE_A}/heartbeat",
+            headers={"X-Internal-Key": KEY_A},
+            json={"workerUID": UID_X, "workerGID": UID_X},
+        )
+    assert resp.status_code == 204
+    node = app.state.nodes.get(NODE_A)
+    assert (node.worker_uid, node.worker_gid) == (WORKER_UID, WORKER_GID), (
+        "the forged claim must never replace a verified identity"
+    )
+
+    forged = _C3Shape(workspace)
+    agent2 = _StubAgentClient()
+    app2 = _app(forged, client=agent2)
+    # Registration itself with the wrong identity: nothing is stored.
+    async with _client(app2) as client:
+        registered = await client.post(
+            "/internal/nodes/register",
+            headers={"X-Internal-Key": KEY_A},
+            json={
+                "nodeID": NODE_A,
+                "address": ENDPOINT_A.address,
+                "pidNamespace": PID_NAMESPACE,
+                "workerUID": UID_X,
+                "workerGID": UID_X,
+            },
+        )
+    assert registered.status_code == 200
+    node = app2.state.nodes.get(NODE_A)
+    assert (node.worker_uid, node.worker_gid) == (None, None)
+
+    registry = app2.state.registry
+    record = registry.create(
+        template_id="base",
+        sandbox_id=SANDBOX,
+        timeout=300,
+        metadata={},
+        env_vars={},
+        secure=True,
+        allow_internet_access=False,
+        base_image=None,
+    )
+    record.node_id = NODE_A
+    record.host_uid = UID_X
+    registry.save(record)
+    resp = await _file_op(
+        app2,
+        {"op": "chown-workspace", "sandbox_id": SANDBOX},
+    )
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "code": 503,
+        "message": (
+            f"node {NODE_A} has not reported the worker's own gid: refusing "
+            "to hand a tree to a uid without the group it belongs to"
+        ),
+    }
+    # Nothing was handed to the claimed uid: the agent was never dialled.
+    assert agent2.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_shape_without_a_trusted_source_records_no_identity(
+    workspace,
+) -> None:
+    """The compose lane today: no source ⇒ no identity ⇒ named refusal.
+
+    A shape that cannot *verify* the claim is the one place the ruling allows to
+    be useless rather than unsafe: registration still succeeds (the node has
+    other work to do), the identity stays unset, and every file operation that
+    needs it refuses by name.
+    """
+    shape = _C3Shape(workspace)
+    agent = _StubAgentClient()
+    app = _app(shape, client=agent, worker_identity=NoWorkerIdentitySource())
+    resp = await _enroll(app)
+    assert resp.status_code == 200
+    node = app.state.nodes.get(NODE_A)
+    assert (node.worker_uid, node.worker_gid) == (None, None)
+
+    response = await _file_op(app, {"op": "remove-workspace", "sandbox_id": SANDBOX})
+    assert response.status_code == 503
+    assert response.json() == {
+        "code": 503,
+        "message": (
+            f"node {NODE_A} has reported no worker identity (workerUID/"
+            "workerGID): refusing to instruct the agent"
+        ),
+    }
+    assert agent.calls == []
+
+
+# ------------------------------- the k8s trusted source itself (②, option 1)
+
+
+def _pod_spec(security: dict | None, container_security: dict | None) -> dict:
+    spec: dict = {"containers": [{"name": "worker"}]}
+    if security is not None:
+        spec["securityContext"] = security
+    if container_security is not None:
+        spec["containers"][0]["securityContext"] = container_security
+    return {"kind": "Pod", "spec": spec}
+
+
+def _k8s_source(handler):
+    from control_plane.worker_identity_source import K8sWorkerIdentitySource
+
+    return K8sWorkerIdentitySource(
+        namespace="sandlock",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            base_url="https://kubernetes.default.svc",
+        ),
+    )
+
+
+def test_the_k8s_source_reads_the_pods_own_security_context() -> None:
+    """The trusted answer is the *deployment's* pin, not the worker's report."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json=_pod_spec({"runAsUser": 65534, "runAsGroup": 65534}, None))
+
+    assert _k8s_source(handler).identity_for(NODE_A) == (65534, 65534)
+    assert seen == [f"/api/v1/namespaces/sandlock/pods/{NODE_A}"]
+
+
+def test_the_k8s_source_reads_a_container_level_pin_too() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_pod_spec(None, {"runAsUser": 65534, "runAsGroup": 65533}),
+        )
+
+    assert _k8s_source(handler).identity_for(NODE_A) == (65534, 65533)
+
+
+def test_a_pod_that_pins_no_identity_has_no_trusted_answer() -> None:
+    """No pin ⇒ no identity (fail closed), never "trust the report"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_pod_spec(None, None))
+
+    assert _k8s_source(handler).identity_for(NODE_A) is None
+    # Half a pin is not a pin either.
+    def half(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_pod_spec({"runAsUser": 65534}, None))
+
+    assert _k8s_source(half).identity_for(NODE_A) is None
+
+
+def test_an_api_that_cannot_answer_is_not_a_trusted_answer() -> None:
+    def missing(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"kind": "Status"})
+
+    assert _k8s_source(missing).identity_for(NODE_A) is None
+
+    def broken(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to the API server")
+
+    assert _k8s_source(broken).identity_for(NODE_A) is None
+
+    def garbage(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="not json")
+
+    assert _k8s_source(garbage).identity_for(NODE_A) is None
+
+
+def test_a_hostile_node_id_never_reaches_the_api() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        seen.append(request.url.path)
+        return httpx.Response(200, json=_pod_spec({"runAsUser": 1, "runAsGroup": 1}, None))
+
+    assert _k8s_source(handler).identity_for("../../etc/passwd") is None
+    assert seen == []
 
 
 # ------------------------------------------------------------- the vocabulary
@@ -342,7 +566,10 @@ async def test_a_heartbeat_refreshes_the_workers_identity(workspace) -> None:
             {
                 "verb": "chown",
                 "uid": UID_X,
-                "gid": WORKER_GID,
+                # ``<uid>:<uid>``, matching the pre-C3 hand-over
+                # (``checkpoint_store._hand_to_sandbox``); only the workspace
+                # tree keeps the worker's gid as the group.
+                "gid": UID_X,
                 "recursive": True,
                 "worker_owned": False,
             },
@@ -403,7 +630,7 @@ async def test_a_heartbeat_refreshes_the_workers_identity(workspace) -> None:
             {
                 "verb": "chown",
                 "uid": UID_X,
-                "gid": WORKER_GID,
+                "gid": UID_X,
                 "recursive": False,
                 "worker_owned": False,
             },
@@ -708,7 +935,9 @@ async def test_a_node_without_a_worker_identity_refuses_a_chown(workspace) -> No
     """The group a tree is handed to comes from the node record or not at all."""
     shape = _C3Shape(workspace)
     agent = _StubAgentClient()
-    app = _app(shape, client=agent)
+    # No trusted source and no claim: the record keeps no identity (see
+    # ``test_a_shape_without_a_trusted_source_records_no_identity``).
+    app = _app(shape, client=agent, worker_identity=NoWorkerIdentitySource())
     await _enroll(app, worker_identity=False)
     resp = await _file_op(
         app, {"op": "chown-workspace", "sandbox_id": SANDBOX}
@@ -756,7 +985,7 @@ async def test_a_node_without_a_worker_identity_refuses_every_op(workspace) -> N
     """
     shape = _C3Shape(workspace)
     agent = _StubAgentClient()
-    app = _app(shape, client=agent)
+    app = _app(shape, client=agent, worker_identity=NoWorkerIdentitySource())
     await _enroll(app, worker_identity=False)
     resp = await _file_op(app, {"op": "remove-workspace", "sandbox_id": SANDBOX})
     assert resp.status_code == 503
