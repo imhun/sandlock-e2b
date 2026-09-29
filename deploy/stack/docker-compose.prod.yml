@@ -102,6 +102,19 @@ services:
       # (`E2B_INTERNAL_NODE_KEYS`) are the design's near-term hardening and are
       # not set here; `docs/open-issues.md` N49 says exactly what that leaves.
       E2B_NODE_ADDRESS_MODE: hostname
+      # C3 (Task 3, D12/D13/D14 + Task 4 slice B, D22): the CP→agent half of
+      # the two channels, **two** endpoints. `c3-agent` (face A) is the
+      # identity giver -- uid 65534, the `uid_map` owner rule; `c3-agent-maint`
+      # (face B) runs the file verbs as root (NFS AUTH_SYS only honours root
+      # for `chown`) and is the only one with the four roots mounted. The token
+      # lives here and on the two faces -- never on a worker: a worker holding
+      # it would make `worker <-> agent` real, which hard rule 5 forbids.
+      E2B_C3_AGENT_URL: ${E2B_C3_AGENT_URL:-http://c3-agent:49985}
+      E2B_C3_AGENT_MAINT_URL: ${E2B_C3_AGENT_MAINT_URL:-http://c3-agent-maint:49986}
+      E2B_C3_AGENT_TOKEN: ${E2B_C3_AGENT_TOKEN}
+      # D16: see `deploy/k8s/control-plane.yaml` / `control_plane/config.py`
+      # for the reasoning behind 64.
+      E2B_C3_AGENT_MAX_CONCURRENCY: ${E2B_C3_AGENT_MAX_CONCURRENCY:-64}
       # Secret at-rest encryption + Redis persistence (E5.4).
       E2B_SECRET_MASTER_KEY: ${E2B_SECRET_MASTER_KEY:-}
       E2B_SECRET_MASTER_KEYS: ${E2B_SECRET_MASTER_KEYS:-}
@@ -137,6 +150,12 @@ services:
       # registry configured it exports locally built template images as OCI
       # layout tars into ``_images/_oci/`` for the workers to resolve.
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
+      # C3 (Task 4 slice B): route B's scratch root. The worker writes each
+      # slot's `policy.json`/`program.json` under it, but the control plane is
+      # what derives the path of the one the agent scopes to that slot's uid
+      # (`scope-slot-document`) -- the worker may not report a path. Unset, that
+      # op answers a named 503 and route-B slots never come up.
+      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       # That directory is in the volume's *unlimited* project (``_images`` is a
       # reserved platform namespace, not a sandbox tree), so the resolver
       # bounds the cache itself: completed entries beyond this cap are evicted
@@ -181,6 +200,78 @@ services:
       - buildkit-data:/run/buildkit:ro
     restart: unless-stopped
 
+  # C3 (Task 3, D14 + Task 4 slice B, D22): the per-host agent. Compose has no
+  # pods, so the two faces that share one pod in k8s (`deploy/k8s/c3-agent.yaml`)
+  # are two services here -- one agent per host, however many workers it runs
+  # (this stack runs two).
+  #
+  # face A: the identity giver. It is the *only* thing allowed to run
+  # `as_uid`, and it runs as the worker's own uid 65534: that is the `uid_map`
+  # owner rule (§14.2.7 -- a non-owner writer gets EPERM without
+  # CAP_SYS_ADMIN).
+  c3-agent:
+    image: ${AGENT_IMAGE}
+    # The host's pid table is what the container-pid → host-pid reverse lookup
+    # reads (`hostPID: true` in the DaemonSet).
+    pid: host
+    # The file capabilities on `as_uid` are refused at exec unless they are in
+    # the container's bounding set, so this is a BND declaration; a non-root
+    # process still gets no effective capability from it.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+    user: "65534:65534"
+    environment:
+      # D12: the agent's identity is the **host**, and the name here is the one
+      # the control plane dials (`E2B_C3_AGENT_URL` host = the service name).
+      E2B_C3_AGENT_NODE_ID: c3-agent
+      E2B_C3_AGENT_TOKEN: ${E2B_C3_AGENT_TOKEN}
+      E2B_C3_AGENT_PORT: "49985"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # face B: C1's file-operation face, moved (same capability set, same roots).
+  # Task 4 slice B gives it the payload: the same service face A runs, on its
+  # **own** port (D22).
+  c3-agent-maint:
+    image: ${AGENT_IMAGE}
+    # NFS AUTH_SYS only honours uid 0 for `chown`, exactly as the C1 broker.
+    user: "0:0"
+    # D22: the compose half of D21's option-2 route (the agent reading a worker
+    # process's uid/gid from the kernel).
+    pid: host
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    environment:
+      E2B_C3_AGENT_NODE_ID: c3-agent
+      E2B_C3_AGENT_TOKEN: ${E2B_C3_AGENT_TOKEN}
+      E2B_C3_AGENT_PORT: "49986"
+      # The four roots `deploy/priv/priv_common.c` validates against, matching
+      # this stack's worker env (one-base layout: tree root and export root
+      # coincide).
+      E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      E2B_SHARED_VOLUME_ROOT: /var/lib/e2b-sandboxes
+      E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
+      # This stack ships per-worker uid pools (worker-1 keeps 10000..10999,
+      # worker-2 11000..11999 -- see the two worker services), and both are
+      # served by *this one* agent, so its pool has to cover both: 10000 with
+      # size 2000. `priv_common.c` refuses a `--uid` outside `START..+SIZE`, so
+      # a narrower pool here would make every worker-2 file step a named
+      # refusal at the agent.
+      E2B_UID_POOL_START: ${E2B_UID_POOL_START:-10000}
+      E2B_UID_POOL_SIZE: ${E2B_C3_AGENT_UID_POOL_SIZE:-2000}
+    volumes:
+      - sandbox-shared:/var/lib/e2b-sandboxes
+    restart: unless-stopped
+
   worker-1: &worker
     image: ${WORKER_IMAGE}
     # E5.1: non-root supervisor (uid 65534). The image pre-creates
@@ -200,6 +291,13 @@ services:
       E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}
       E2B_NODE_ADDRESS: http://worker-1:49983
       E2B_NODE_ID: worker-1
+      # C3 (Task 3 + Task 4 slice B): route B's slot identity comes from the
+      # per-host `c3-agent`, and so does every privileged file step -- the
+      # worker image no longer ships `/var/lib/e2b-priv/`, so `auto` would
+      # silently resolve no brokers and degrade. Rollback is the pair
+      # `spawn`/`socket` (plus a worker image that still has the binaries).
+      E2B_SLOT_IDENTITY: agent-grant
+      E2B_PRIV_HELPER_TRANSPORT: agent
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY}
       E2B_INTERNAL_API_KEYS: ${E2B_INTERNAL_API_KEYS:-}
       E2B_ENABLE_NETWORK: "true"
@@ -288,30 +386,22 @@ services:
       E2B_QUOTA_AGENT_URL: ${E2B_QUOTA_AGENT_URL:-}
       E2B_QUOTA_AGENT_TOKEN: ${E2B_QUOTA_AGENT_TOKEN:-}
       E2B_QUOTA_AGENT_TIMEOUT_S: ${E2B_QUOTA_AGENT_TIMEOUT_S:-5}
-      # Track F (F1): `auto` (default) uses the image's file-capability brokers
-      # (/var/lib/e2b-priv/e2b-slot-spawn, e2b-maint) on this non-root worker;
-      # `off` keeps the in-process E5.1 shape. See the cap_drop/cap_add block
-      # below -- the four caps must be in the bounding set or the broker exec
-      # is refused, and no-new-privileges must never be added.
+      # Track F (F1) / C1: the file-capability broker opt-in. It is **inert in
+      # the C3 agent shape** (`E2B_PRIV_HELPER_TRANSPORT=agent`, above --
+      # `configure_priv_helpers` never consults it there); it stays only as the
+      # rollback lever for a worker image that still ships the two binaries.
       E2B_PRIV_HELPERS: ${E2B_PRIV_HELPERS:-auto}
     volumes: &worker-volumes
       - sandbox-shared:/var/lib/e2b-sandboxes
-    # Track F / Task F1: the non-root worker's two file-capability brokers
-    # (/var/lib/e2b-priv/e2b-slot-spawn, e2b-maint) get their capability from
-    # the file xattr, but the kernel refuses the exec unless those caps are in
-    # the container's *bounding* set (measured: "file caps must be a subset of
-    # BND, otherwise even exec is EPERM"). `cap_add` alone grants a non-root
-    # process nothing effective -- the worker's own CapEff stays 0 -- so this is
-    # exactly the four caps the brokers use and nothing else. Never add a
-    # no-new-privileges security_opt: NNP=1 makes the kernel ignore file
-    # capabilities, so the brokers would stop working.
+    # C3 (Task 4 slice B): **the bounding set is empty.** Track F/F1 declared
+    # `SETUID`/`SETGID`/`CHOWN`/`DAC_OVERRIDE` here only so the image's
+    # file-capability brokers could be `exec`d (file caps must be a subset of
+    # BND); the worker image no longer ships them, and C3 moved both jobs to
+    # the agent. `cap_drop: [ALL]` without an `add` is that empty set (the
+    # worker's own `CapEff` was already 0 -- a non-root process gets no
+    # effective capability from `cap_add`).
     cap_drop:
       - ALL
-    cap_add:
-      - SETUID      # e2b-slot-spawn: setuid(X) on the pooled host uid
-      - SETGID      # e2b-slot-spawn: setgroups([]) + setgid(X)
-      - CHOWN       # e2b-maint: workspace/slice ownership + slot documents
-      - DAC_OVERRIDE  # e2b-maint: rm/walk fallback for trees group access misses
     # A6: the worker needs no SYS_ADMIN, and since both workers run
     # per-sandbox netns the container-level low-port sysctl is gone too. Its
     # only user was the wildcard-allowOut DNS gateway binding <127.0.1.x>:53:

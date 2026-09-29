@@ -205,6 +205,19 @@ spec:
               value: app=c3-agent
             - name: E2B_C3_AGENT_NAMESPACE
               value: sandlock
+            # D22 (Task 4 slice B): the file-operation face is its **own**
+            # endpoint. Face A (this port, 49985) hands out slot identities and
+            # must run as the worker's own uid 65534 (the `uid_map` owner rule,
+            # §14.2.7); face B runs as uid 0 (NFS AUTH_SYS only honours root
+            # for `chown`) and is the only container with the four whitelist
+            # roots mounted. One address could not serve both -- the two
+            # containers share the pod netns, so a second listener on 49985
+            # would be `EADDRINUSE`, and routing a file op to face A would fail
+            # every chown on this NAS with `EPERM`. The k8s lane derives this
+            # second port from the *same* worker-pod → node → agent-pod lookup,
+            # so it is still never an address the worker named.
+            - name: E2B_C3_AGENT_MAINT_PORT
+              value: "49986"
             # One credential for the CP→agent hop, shared with the agent's own
             # pod and **nowhere else**: no worker manifest or worker image ever
             # carries it (pinned in `tests/unit/test_c3_internal_api_shape.py`),
@@ -298,17 +311,49 @@ spec:
             # the workspace base, i.e. the old layout unchanged.
             - name: E2B_STATE_BASE
               value: /var/lib/e2b-sandboxes/state
-            # Track Z / Z-F7: same shared image cache as the workers. This
-            # deployment runs 2 replicas over the same RWX PVC at the same
-            # path, so with no E2B_IMAGE_REGISTRY configured Template.build
-            # exports the OCI layout tar into ``_images/_oci/`` where the
-            # workers (and the other replica) can resolve it; unset, each
-            # replica wrote its own copy inside its container and the workers
-            # could never see it. The per-image flock + atomic publish in
-            # envd_service/runtime/image_resolver.py is what makes the shared
-            # directory safe for two replicas, and E2B_IMAGE_CACHE_MAX_BYTES is
-            # what bounds it (docs/production-deployment-requirements.md §2.7).
+            # C3 Task 4 slice B: route B's scratch root, where each slot's
+            # `policy.json` / `program.json` live. The *worker* writes those
+            # documents, but the control plane is what derives the path of the
+            # one the agent has to scope to that slot's uid
+            # (`scope-slot-document`) -- the worker may not report a path (hard
+            # rule 3 / §14.4). Unset, that op answers a named 503 and route-B
+            # slots never come up; the value is the worker's own
+            # `E2B_ROUTE_B_TMP_ROOT` (N27 puts `.route-b` under the state base,
+            # which is why the privileged helpers grew that root).
+            - name: E2B_ROUTE_B_TMP_ROOT
+              value: /var/lib/e2b-sandboxes/state/.route-b
+            # Track Z / Z-F7 + C3 Task 4 slice B: the control plane's cache
+            # directory and the workers' OCI directory are **split**, exactly
+            # the way the worker splits them (``worker.yaml``: a node-local
+            # cache and a shared tar directory). Two reasons, and the second is
+            # why this is a control-plane-only change:
+            #
+            #   * the worker writes each sandbox's secret under
+            #     ``<its own E2B_IMAGE_CACHE_DIR>/secrets/<id>/`` -- on a k8s
+            #     node that is the *node-local* ``/var/lib/e2b-images``
+            #     (hostPath) -- and ``chown-secret`` is derived by the control
+            #     plane from *this* variable. The two must be spelled the same
+            #     or the op targets a path that does not exist (the agent then
+            #     refuses by name);
+            #   * ``image_cache_dir`` also doubles as the directory
+            #     ``Template.build`` exports its OCI layout tar into
+            #     (``control_plane/config.py``: ``image_oci_dir or
+            #     image_cache_dir``). That tar *must* stay on the shared volume,
+            #     because every worker on every node resolves from it -- so the
+            #     split has to be named here rather than inherited.
+            #
+            # The control plane never reads or writes this directory itself in
+            # the separated shape (the only consumer is the `local://` lane's
+            # resolver), so pointing it at the node-local path is a *naming*
+            # choice for the derived secret path.
             - name: E2B_IMAGE_CACHE_DIR
+              value: /var/lib/e2b-images
+            # ...and the tar directory stays on the shared volume (the
+            # per-image flock + atomic publish in
+            # envd_service/runtime/image_resolver.py is what makes the shared
+            # directory safe for two replicas, and E2B_IMAGE_CACHE_MAX_BYTES
+            # bounds it -- docs/production-deployment-requirements.md §2.7).
+            - name: E2B_IMAGE_OCI_DIR
               value: /var/lib/e2b-sandboxes/_images
             - name: E2B_IMAGE_CACHE_MAX_BYTES
               value: "4294967296"

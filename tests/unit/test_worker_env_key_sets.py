@@ -213,11 +213,19 @@ KEY_CLASSES: dict[str, set[str]] = {
     "rotation_window": {"E2B_INTERNAL_API_KEYS"},
     # Track F/route-B scratch root: the file-capability brokers.
     "priv_helpers": {"E2B_PRIV_HELPERS"},
-    # C1 (wave 2): the k8s worker dials the per-node broker DaemonSet over a
-    # unix socket instead of running the privileged binaries itself. The
-    # compose stacks ship no such daemon -- they keep the file-capability
-    # shape (C1's `exec` transport) -- so both keys are k8s-only.
-    "priv_broker_transport": {"E2B_PRIV_HELPER_TRANSPORT", "E2B_PRIV_HELPER_SOCKET"},
+    # C3 (Task 4 slice B): which shape performs the worker's privileged file
+    # steps. The worker image no longer ships the file-capability binaries, so
+    # `auto` would silently resolve none and degrade to the in-process E5.1
+    # shape; every worker that has an agent names `agent` in the same change as
+    # the binary removal -- the k8s pod and the three C3 compose stacks (the two
+    # separated examples and the target host's stack). The arm-lane fleet, the
+    # pool, the single-machine example and the test runner have no agent.
+    "priv_helper_transport": {"E2B_PRIV_HELPER_TRANSPORT"},
+    # C1 (wave 2) / Task 4 slice B: the k8s worker keeps the broker's unix
+    # socket path as the `socket` rollback lever (and its `wait-for-broker`
+    # gate) until Task 7 retires the DaemonSet. No compose stack runs a broker
+    # at all, so this one stays k8s-only.
+    "priv_broker_socket": {"E2B_PRIV_HELPER_SOCKET"},
     # C3 (Task 3): which path grants a route-B slot its identity. The k8s worker
     # and the two separated production compose stacks (the ones that ship a
     # `c3-agent` service) run `agent-grant`; the arm-lane fleet stack, the local
@@ -323,8 +331,7 @@ _FLEET_STACK_MISSING = (
     KEY_CLASSES["k8s_state_layout"]
     | KEY_CLASSES["k8s_disk_enforcement"]
     | KEY_CLASSES["k8s_real_root_and_checkpoint"]
-    | KEY_CLASSES["priv_broker_transport"]
-    | KEY_CLASSES["slot_identity"]
+    | KEY_CLASSES["priv_broker_socket"]
 )
 
 #: The compose example stacked with a control plane + Redis: it declares the
@@ -334,6 +341,7 @@ _FLEET_STACK_MISSING = (
 #: or named templates (default: none).
 _COMPOSE_EXAMPLE_MISSING = (
     _FLEET_STACK_MISSING
+    | KEY_CLASSES["priv_helper_transport"]
     | KEY_CLASSES["rotation_window"]
     | KEY_CLASSES["priv_helpers"]
     | KEY_CLASSES["template_images"]
@@ -341,15 +349,20 @@ _COMPOSE_EXAMPLE_MISSING = (
 
 #: The two separated production stacks are the compose half of C3's coverage
 #: (Global Constraints): they ship the `c3-agent` service, so unlike the fleet
-#: stack above they *do* name the identity path instead of inheriting `spawn`.
-_C3_COMPOSE_MISSING = _COMPOSE_EXAMPLE_MISSING - KEY_CLASSES["slot_identity"]
+#: stack above they *do* name both the identity path (instead of inheriting
+#: `spawn`) and the transport (instead of inheriting the inert `auto`).
+_C3_COMPOSE_MISSING = (
+    _COMPOSE_EXAMPLE_MISSING
+    - KEY_CLASSES["slot_identity"]
+    - KEY_CLASSES["priv_helper_transport"]
+)
 
 #: The local pool: the autoscaler builds the worker's `docker run` argv itself,
 #: so its env JSON is the worker's whole environment -- no workspace base, no
 #: per-worker wiring (those are `-e` flags), no templates/brokers.
 _POOL_MISSING = _COMPOSE_EXAMPLE_MISSING | KEY_CLASSES["worker_wiring"] | {
     "E2B_WORKSPACE_BASE",
-}
+} | KEY_CLASSES["slot_identity"]
 
 #: The single-machine build example (`docker-compose.yml`): one `envd`, no
 #: control-plane wiring, no node budget, cache-only env plus the shape switch.
@@ -361,6 +374,7 @@ _DEMO_MISSING = (
     | KEY_CLASSES["netns_pair"]
     | KEY_CLASSES["egress_switch"]
     | KEY_CLASSES["route_b_root"]
+    | KEY_CLASSES["slot_identity"]
 )
 
 #: The test runner: it names only what the in-container suite needs to build
@@ -375,6 +389,7 @@ _RUNNER_MISSING = (
     | KEY_CLASSES["netns_pair"]
     | KEY_CLASSES["egress_switch"]
     | KEY_CLASSES["route_b_root"]
+    | KEY_CLASSES["slot_identity"]
 )
 
 #: Per stack: the k8s keys it may not declare, and the keys it adds.

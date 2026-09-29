@@ -41,6 +41,10 @@ KUSTOMIZATION = K8S / "kustomization.yaml"
 
 COMPOSE_PROD = DEPLOY / "compose" / "docker-compose.prod.yml"
 COMPOSE_MULTINODE = DEPLOY / "compose" / "docker-compose.multinode.yml"
+#: In C3's coverage by ruling D17: the target host's stack relies on the
+#: privileged binary too, so leaving it out would break it silently.
+COMPOSE_STACK = DEPLOY / "stack" / "docker-compose.prod.yml"
+COMPOSE_STACKS = (COMPOSE_PROD, COMPOSE_MULTINODE, COMPOSE_STACK)
 #: The shapes C3 deliberately does *not* cover: the single-machine example and
 #: the autoscaler's local pool. `local://` is out of scope (Global
 #: Constraints), so the agent must not leak into them.
@@ -55,6 +59,10 @@ LOCAL_SHAPES = (
 AGENT_LABEL = {"app": "c3-agent"}
 CONTROL_PLANE_LABEL = {"app": "control-plane"}
 AGENT_PORT = 49985
+#: D22: face B's own port. The two faces are two processes (uid 65534 for the
+#: `uid_map` owner rule; uid 0 for NFS AUTH_SYS `chown`), so they are two
+#: listeners -- a shared address would collide on the pod netns.
+AGENT_MAINT_PORT = 49986
 AGENT_IMAGE = "registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0"
 
 #: The plan's forbidden set, verbatim (`plan §2.3`). Checked against the raw
@@ -170,6 +178,27 @@ def test_face_b_is_the_file_face_with_c1s_capability_set() -> None:
     assert env["E2B_STATE_BASE"]["value"] == "/var/lib/e2b-sandboxes/state"
     assert env["E2B_SHARED_VOLUME_ROOT"]["value"] == "/var/lib/e2b-sandboxes"
     assert env["E2B_IMAGE_CACHE_DIR"]["value"] == "/var/lib/e2b-images"
+    # Task 4 slice B: the payload. Face B runs **the same service** face A runs
+    # (one app, one op table) and holds every input `priv_common.c` reads: the
+    # two whitelist roots above plus the uid pool `--uid` is checked against
+    # (the k8s worker follows the code default).
+    assert "command" not in face_b
+    assert env["E2B_UID_POOL_START"]["value"] == "10000"
+    assert env["E2B_UID_POOL_SIZE"]["value"] == "1000"
+    # D12: the same host identity face A carries -- every instruction's URL
+    # path says which host it is for, and each face answers only for itself.
+    assert env["E2B_C3_AGENT_NODE_ID"] == {
+        "name": "E2B_C3_AGENT_NODE_ID",
+        "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}},
+    }
+    assert env["E2B_C3_AGENT_TOKEN"]["valueFrom"]["secretKeyRef"] == {
+        "name": "e2b-secrets",
+        "key": "E2B_C3_AGENT_TOKEN",
+    }
+    # D22: face B's own port -- the two containers share the pod netns, so a
+    # second listener on face A's 49985 would be `EADDRINUSE`.
+    assert env["E2B_C3_AGENT_PORT"]["value"] == "49986"
+    assert face_b["ports"] == [{"containerPort": 49986}]
     mounts = {m["name"]: m["mountPath"] for m in face_b["volumeMounts"]}
     assert mounts == {
         "shared": "/var/lib/e2b-sandboxes",
@@ -229,7 +258,13 @@ def test_the_networkpolicy_names_the_control_plane_as_the_only_ingress() -> None
     assert policy["spec"]["ingress"] == [
         {
             "from": [{"podSelector": {"matchLabels": CONTROL_PLANE_LABEL}}],
-            "ports": [{"protocol": "TCP", "port": AGENT_PORT}],
+            # D22: both faces, still from exactly one source. Two ports in one
+            # rule (rather than two rules) is what keeps the source list the
+            # thing that bounds who may connect.
+            "ports": [
+                {"protocol": "TCP", "port": AGENT_PORT},
+                {"protocol": "TCP", "port": AGENT_MAINT_PORT},
+            ],
         }
     ]
     # No wildcard rule: an empty `from` (or an empty `podSelector`) would allow
@@ -310,11 +345,50 @@ def test_the_control_plane_is_given_the_agent_channel_and_a_sized_limit() -> Non
     env = _env(container)
     assert env["E2B_C3_AGENT_LABEL"]["value"] == "app=c3-agent"
     assert env["E2B_C3_AGENT_NAMESPACE"]["value"] == "sandlock"
+    # D22: face B's own port. The k8s lane derives the address from the same
+    # worker-pod → node → agent-pod lookup face A uses, so this is the only
+    # thing the manifest has to name.
+    assert env["E2B_C3_AGENT_MAINT_PORT"]["value"] == "49986"
     assert env["E2B_C3_AGENT_MAX_CONCURRENCY"]["value"] == "64"
     assert env["E2B_C3_AGENT_TOKEN"]["valueFrom"]["secretKeyRef"] == {
         "name": "e2b-secrets",
         "key": "E2B_C3_AGENT_TOKEN",
     }
+
+
+def test_the_k8s_control_plane_names_route_b_and_splits_the_cache() -> None:
+    """Task 4 slice B's two CP-side values, both of which are file-op inputs.
+
+    `scope-slot-document`'s path is derived by the *control plane* (the worker
+    may not report one), so the CP has to know route B's scratch root: unset,
+    that op answers a named 503 and no route-B slot ever comes up.
+
+    The image cache is subtler. The worker writes each sandbox's secret under
+    `<its own E2B_IMAGE_CACHE_DIR>/secrets/<id>/` -- the **node-local**
+    `/var/lib/e2b-images` in this manifest set -- and `chown-secret` is derived
+    from the control plane's own `E2B_IMAGE_CACHE_DIR`, so the two have to be
+    spelled identically. But that same setting doubles as the OCI tar directory
+    (`image_oci_dir or image_cache_dir`), and the tar has to stay on the shared
+    volume every worker can read -- so the split is named explicitly instead of
+    inherited.
+    """
+    deployment = _only(_load_all(CONTROL_PLANE_MANIFEST), "Deployment", "control-plane")
+    env = _env(next(c for c in _containers(deployment).values()))
+    assert env["E2B_ROUTE_B_TMP_ROOT"]["value"] == "/var/lib/e2b-sandboxes/state/.route-b"
+    # ...and it is the same value the worker names, which is the whole point
+    # (`worker.yaml` is the manifest that writes the documents).
+    worker = _only(_load_all(WORKER_MANIFEST), "StatefulSet", "e2b-worker")
+    worker_env = _env(_containers(worker)["worker"])
+    assert env["E2B_ROUTE_B_TMP_ROOT"]["value"] == worker_env["E2B_ROUTE_B_TMP_ROOT"]["value"]
+    assert env["E2B_IMAGE_CACHE_DIR"]["value"] == worker_env["E2B_IMAGE_CACHE_DIR"]["value"]
+    assert env["E2B_IMAGE_OCI_DIR"]["value"] == worker_env["E2B_IMAGE_OCI_DIR"]["value"]
+    # ...and the split is real: the CP's cache is *not* its OCI directory here,
+    # which is the property "pointing the cache at the worker's node-local
+    # secrets root" would have silently broken.
+    assert (
+        env["E2B_IMAGE_CACHE_DIR"]["value"]
+        != env["E2B_IMAGE_OCI_DIR"]["value"]
+    )
 
 
 def test_the_clients_concurrency_default_is_a_named_decision(monkeypatch) -> None:
@@ -347,6 +421,17 @@ def test_the_worker_is_on_the_agent_grant_path_and_carries_no_agent_secret() -> 
     container = _containers(worker)["worker"]
     env = _env(container)
     assert env["E2B_SLOT_IDENTITY"]["value"] == "agent-grant"
+    # Task 4 slice B: the file steps are the agent's too. The two switches move
+    # together with the binary removal -- a worker without the binaries and
+    # still on the `spawn`/`socket` path is the broken intermediate state.
+    assert env["E2B_PRIV_HELPER_TRANSPORT"]["value"] == "agent"
+    # ...and the identity the control plane's trusted source reads (Task 4
+    # slice A's D21 option 1) has to be pinned *in the pod spec*: the CP reads
+    # `securityContext.runAsUser`/`runAsGroup` through the pod API, so the
+    # image's `USER 65534:65534` alone would leave it answering "unknown".
+    assert container["securityContext"]["runAsUser"] == 65534
+    assert container["securityContext"]["runAsGroup"] == 65534
+    assert "capabilities" not in container["securityContext"]
     assert "E2B_C3_AGENT_TOKEN" not in env
     assert "E2B_C3_AGENT_URL" not in env
     assert "E2B_C3_AGENT_TOKEN" not in WORKER_MANIFEST.read_text(encoding="utf-8")
@@ -374,19 +459,23 @@ def test_no_pod_other_than_the_agent_claims_the_agent_label() -> None:
 
 
 def test_each_compose_stack_runs_exactly_one_agent_facing_the_control_plane() -> None:
-    """D14: one agent per host; the multinode stack's three workers share it.
+    """D14 + D22: one agent per host, two faces, each with its own listener.
 
     Compose has no pods, so the two faces are two services. The agent's
     self-identity is the name the control plane dials it by (`c3-agent`), and
     the control plane's URL host must be that same name -- the pair is the
-    compose half of D12.
+    compose half of D12. Both faces carry that identity: the instruction's URL
+    *path* names the host for either endpoint.
     """
-    for path in (COMPOSE_PROD, COMPOSE_MULTINODE):
+    for path in COMPOSE_STACKS:
         compose = _compose(path)
         services = compose["services"]
         assert "c3-agent" in services, path.name
         face_a = services["c3-agent"]
-        assert face_a["image"] == "${AGENT_IMAGE:-e2b-sandlock-agent:0.1.0}"
+        assert face_a["image"] in (
+            "${AGENT_IMAGE:-e2b-sandlock-agent:0.1.0}",
+            "${AGENT_IMAGE}",
+        )
         # The host's pid table is what the reverse lookup reads.
         assert face_a["pid"] == "host"
         assert face_a["user"] == "65534:65534"
@@ -401,16 +490,46 @@ def test_each_compose_stack_runs_exactly_one_agent_facing_the_control_plane() ->
         assert face_b["user"] == "0:0"
         assert face_b["cap_drop"] == ["ALL"]
         assert face_b["cap_add"] == ["CHOWN", "DAC_OVERRIDE", "FOWNER"]
+        # Task 4 slice B: the payload is the same service, on its own port
+        # (D22), with the four roots and the pool `priv_common.c` reads.
+        assert "command" not in face_b, path.name
+        assert face_b["pid"] == "host"
+        b_env = _compose_env(face_b)
+        assert b_env["E2B_C3_AGENT_NODE_ID"] == "c3-agent"
+        assert b_env["E2B_C3_AGENT_TOKEN"] == env["E2B_C3_AGENT_TOKEN"]
+        assert b_env["E2B_C3_AGENT_PORT"] == "49986"
+        assert b_env["E2B_WORKSPACE_BASE"] == "/var/lib/e2b-sandboxes"
+        assert b_env["E2B_SHARED_VOLUME_ROOT"] == "/var/lib/e2b-sandboxes"
+        assert b_env["E2B_IMAGE_CACHE_DIR"] == "/var/lib/e2b-sandboxes/_images"
+        # The pool has to cover every worker this one agent serves. The stack
+        # is the one that ships two disjoint per-worker slices -- worker-1
+        # 10000..10999, worker-2 11000..11999 -- so its agent's pool is the
+        # union (start 10000, size 2000); the other two stacks leave the code
+        # default (10000/1000).
+        if path == COMPOSE_STACK:
+            assert b_env["E2B_UID_POOL_START"] == "${E2B_UID_POOL_START:-10000}"
+            assert b_env["E2B_UID_POOL_SIZE"] == (
+                "${E2B_C3_AGENT_UID_POOL_SIZE:-2000}"
+            )
+        else:
+            assert b_env["E2B_UID_POOL_START"] == "${E2B_UID_POOL_START:-10000}"
+            assert b_env["E2B_UID_POOL_SIZE"] == "${E2B_UID_POOL_SIZE:-1000}"
 
 
 def test_the_compose_control_plane_dials_the_agent_by_service_name() -> None:
-    """D14: the CP is pointed at the agent service name, token and all."""
-    for path in (COMPOSE_PROD, COMPOSE_MULTINODE):
+    """D14 + D22: the CP is pointed at both service names, token and all."""
+    for path in COMPOSE_STACKS:
         compose = _compose(path)
         control_plane = compose["services"]["control-plane"]
         env = _compose_env(control_plane)
         url = env["E2B_C3_AGENT_URL"]
-        assert url == "${E2B_C3_AGENT_URL:-http://c3-agent:49985}"
+        assert url == "${E2B_C3_AGENT_URL:-http://c3-agent:49985}", path.name
+        # ...and the file verbs are addressed at the *face-B* service (D22):
+        # a shared address could not serve both, and this is the variable the
+        # client reads for `chown`/`rm`/`walk`.
+        assert env["E2B_C3_AGENT_MAINT_URL"] == (
+            "${E2B_C3_AGENT_MAINT_URL:-http://c3-agent-maint:49986}"
+        ), path.name
         # The identity the agent checks is the URL host: both halves are one
         # name, so an instruction can never be addressed to a host the agent
         # does not believe it is.
@@ -418,6 +537,10 @@ def test_the_compose_control_plane_dials_the_agent_by_service_name() -> None:
         assert urlsplit(url.split(":-", 1)[1].rstrip("}")).hostname == (
             agent_env["E2B_C3_AGENT_NODE_ID"]
         )
+        # Both faces carry that same identity, so the path identity of a
+        # file-op instruction is the same name a grant carries.
+        maint_env = _compose_env(compose["services"]["c3-agent-maint"])
+        assert maint_env["E2B_C3_AGENT_NODE_ID"] == agent_env["E2B_C3_AGENT_NODE_ID"]
         assert "E2B_C3_AGENT_TOKEN" in env
         # `${E2B_C3_AGENT_MAX_CONCURRENCY:-64}`: the example's default is the
         # same factory default the k8s control plane names explicitly.
@@ -428,7 +551,7 @@ def test_the_compose_control_plane_dials_the_agent_by_service_name() -> None:
 
 def test_no_compose_worker_receives_the_agent_token_or_the_agent_identity() -> None:
     """Hard rule 5, manifest layer: the worker holds no agent credential."""
-    for path in (COMPOSE_PROD, COMPOSE_MULTINODE):
+    for path in COMPOSE_STACKS:
         services = _compose(path)["services"]
         workers = [name for name in services if name.startswith("worker")]
         assert workers, path.name
@@ -436,7 +559,12 @@ def test_no_compose_worker_receives_the_agent_token_or_the_agent_identity() -> N
             env = _compose_env(services[name])
             assert "E2B_C3_AGENT_TOKEN" not in env, (path.name, name)
             assert "E2B_C3_AGENT_URL" not in env, (path.name, name)
+            assert "E2B_C3_AGENT_MAINT_URL" not in env, (path.name, name)
             assert env["E2B_SLOT_IDENTITY"] == "agent-grant", (path.name, name)
+            # Task 4 slice B: the file steps moved to the agent in the same
+            # change as the binary removal -- a worker without the binaries and
+            # still on `auto` would silently degrade to the E5.1 shape.
+            assert env["E2B_PRIV_HELPER_TRANSPORT"] == "agent", (path.name, name)
 
 
 def test_the_local_shapes_are_untouched() -> None:
@@ -463,20 +591,50 @@ def test_the_agent_image_is_built_by_the_repos_own_scripts() -> None:
     assert image_repo.rsplit("/", 1)[1] == "e2b-sandlock-agent"
 
 
-def test_the_worker_image_still_carries_both_binaries_at_this_point() -> None:
-    """Task 4 owns the removal; pinning it here keeps that change deliberate.
+def test_the_worker_image_has_no_privileged_binary_and_the_agent_image_has_both() -> None:
+    """判据 2/15, the deferred D1 pins: the two copies live in different images.
 
-    Until Task 4 the worker image keeps `/var/lib/e2b-priv/{e2b-slot-spawn,
-    e2b-maint}` with their file capabilities -- the C1 shape, which the
-    `spawn` fallback still uses.
+    Task 4 slice B is where this lands. The worker image must not contain
+    `/var/lib/e2b-priv/` at all -- not the directory, not the two binaries, not
+    even a `setcap` line (a `COPY --from` would not carry the capability xattr,
+    so a leftover instruction would ship two unprivileged helpers that look
+    installed). That is why the agent got its *own* Dockerfile in Task 1: with
+    a shared image the property would be a statement about a build arg instead
+    of about a file.
+
+    Read as *directives*, not as substrings: the worker Dockerfile explains in
+    a comment why the block is gone, and a comment must not be able to satisfy
+    the pin in either direction.
     """
-    envd = (DEPLOY / "docker" / "Dockerfile.envd").read_text(encoding="utf-8")
+    envd_lines = [
+        line.strip()
+        for line in (DEPLOY / "docker" / "Dockerfile.envd")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+    worker_text = "\n".join(envd_lines)
+    assert "e2b-slot-spawn" not in worker_text
+    assert "e2b-maint" not in worker_text
+    assert "/var/lib/e2b-priv" not in worker_text
+    assert "setcap" not in worker_text
+    assert "libcap2-bin" not in worker_text
+    # The agent image is the one place they exist, with the same caps the
+    # C1 broker and Task 1's as_uid shipped.
+    agent_lines = [
+        line.strip()
+        for line in (DEPLOY / "docker" / "Dockerfile.agent")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+    agent_text = "\n".join(agent_lines)
     assert (
-        "COPY --from=builder /tmp/priv/e2b-slot-spawn /tmp/priv/e2b-maint "
-        "/var/lib/e2b-priv/" in envd
+        "COPY --from=builder /tmp/priv/as_uid /tmp/priv/e2b-maint "
+        "/var/lib/e2b-priv/" in agent_text
     )
-    assert "setcap cap_setuid,cap_setgid+ep /var/lib/e2b-priv/e2b-slot-spawn" in envd
-    assert "setcap cap_chown,cap_dac_override+ep /var/lib/e2b-priv/e2b-maint" in envd
+    assert "setcap cap_setuid,cap_setgid+ep /var/lib/e2b-priv/as_uid" in agent_text
+    assert "setcap cap_chown,cap_dac_override+ep /var/lib/e2b-priv/e2b-maint" in agent_text
 
 
 def test_the_build_and_push_script_names_the_agent_image() -> None:

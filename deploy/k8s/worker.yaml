@@ -54,15 +54,19 @@ spec:
         app: e2b-worker
     spec:
       # A6/fix-1: the worker image builds with `USER 65534:65534`
-      # (deploy/docker/Dockerfile.envd) and this pod does NOT override it.
-      # C1 (wave 2) restored that: the privileged hand-over (chown / rm / walk)
-      # lives in the per-node `e2b-priv-broker` DaemonSet and this pod reaches
-      # it over a unix socket, so the pod carries no root container and no root
-      # override. What is left below are only the two capabilities the *local*
-      # file-capability `e2b-slot-spawn` needs in the container's bounding set;
-      # a non-root process gets no effective capabilities (Kubernetes has no
-      # ambient-capability semantics), so the declaration grants the pod
-      # nothing by itself.
+      # (deploy/docker/Dockerfile.envd) and this pod runs the same identity --
+      # but it now **pins it explicitly** on the worker container (Task 4
+      # slice B). That is not a restatement: the control plane's trusted source
+      # for the worker's own uid/gid reads the pod's `securityContext` through
+      # the pod API, and a pod spec that pins nothing reads as "unknown" (no
+      # identity stored, every identity-needing file op a named 503). The image
+      # `USER` alone is invisible to that lookup.
+      #
+      # There is no capability declaration any more either: the privileged
+      # hand-over moved off this pod entirely (C1 put chown/rm/walk in the
+      # per-node broker; C3 Task 4 gave the same verbs to the agent), and the
+      # image's file-capability binaries are gone, so the container's bounding
+      # set is the empty set.
       #
       # No `securityContext.sysctls` any more (N5, 2026-09-17). The pod-level
       # `net.ipv4.ip_unprivileged_port_start=0` window existed for exactly one
@@ -278,15 +282,23 @@ spec:
             # this non-root pod; `off` keeps the in-process E5.1 shape.
             - name: E2B_PRIV_HELPERS
               value: "auto"
-            # C1 (wave 2): `socket` is a hard switch -- the worker dials the
-            # per-node `e2b-priv-broker` DaemonSet, and the Python resolver
-            # refuses to start if the handshake does not succeed (no silent
-            # fallback to the in-pod file-capability binaries: the whole point
-            # is that the worker pod no longer holds the capability that can
-            # hand a sandbox tree to a pooled uid). The socket is a hostPath
-            # shared with the DaemonSet; only connect(2) is ever needed here.
+            # C3 (Task 4 slice B): **the agent shape**. This worker holds no
+            # privileged binary at all any more -- the image no longer ships
+            # `/var/lib/e2b-priv/` -- so `auto` would silently resolve *no*
+            # brokers and fall back to the degraded in-process (E5.1) shape.
+            # `agent` is what routes every file step to the control plane
+            # (`{sandbox_id, op}`), which instructs this node's agent; it is
+            # part of the same change as removing the binaries, deliberately:
+            # a worker without them and still on `spawn`/`socket` is the broken
+            # intermediate state.
+            #
+            # The two socket-era declarations are kept because they are the
+            # rollback lever (`E2B_PRIV_HELPER_TRANSPORT=socket` puts the
+            # worker back on the C1 broker, which is why the broker DaemonSet
+            # and the `wait-for-broker` gate below are still here; Task 7
+            # retires both).
             - name: E2B_PRIV_HELPER_TRANSPORT
-              value: socket
+              value: agent
             - name: E2B_PRIV_HELPER_SOCKET
               value: /run/e2b-broker/broker.sock
             # C3 (Task 3): route B's slot identity now comes from the per-node
@@ -628,27 +640,30 @@ spec:
           # root-in-userns CAP_NET_BIND_SERVICE covers port 53 -- the pod-level
           # window was deleted in N5 (2026-09-17) and is not needed.
           securityContext:
-            capabilities:
-              # Track F (F1): the non-root worker's two file-capability brokers
-              # (/var/lib/e2b-priv/e2b-slot-spawn cap_setuid,cap_setgid+ep and
-              # e2b-maint cap_chown,cap_dac_override+ep) take their capability
-              # from the file xattr, but the exec is refused with EPERM unless
-              # those caps are in the container's *bounding* set (measured).
-              # `add` grants a non-root process nothing effective -- the worker
-              # still runs with CapEff=0 -- so this is a BND declaration, not a
-              # privilege grant. Never set an escalation-blocking field here:
-              # NNP=1 makes the kernel ignore file capabilities outright.
-              #
-              # C1 (wave 2): exactly two, because only `e2b-slot-spawn` is still
-              # the worker's own (a slot must be spawned in the worker's own
-              # namespaces). CHOWN and DAC_OVERRIDE -- the caps `e2b-maint`
-              # needs -- are gone from this pod: the chown/rm/walk verbs run in
-              # the root broker DaemonSet. NET_BIND_SERVICE is gone too; it had
-              # no user left once the :53 bind moved into each sandbox's own
-              # netns (N5), and there is no root override in this pod any more.
-              add:
-                - SETUID
-                - SETGID
+            # C3 (Task 4 slice B): **the BND declaration is gone entirely.**
+            # Track F/C1 kept `SETUID`/`SETGID` here because the image's
+            # file-capability `e2b-slot-spawn` was refused at `exec` unless its
+            # caps were a subset of the container's bounding set. That binary
+            # is no longer in the image (nor is `e2b-maint`), and the slot's
+            # identity is now granted by the agent, so the worker's BND is the
+            # empty set -- which is the property 判据 2/15 pin. (`SETUID`/
+            # `SETGID` are what `e2b-slot-spawn` needed; every other cap was
+            # already gone: CHOWN/DAC_OVERRIDE moved to the C1 broker in wave 2,
+            # NET_BIND_SERVICE had no user after N5 moved the :53 bind into each
+            # sandbox's own netns.)
+            #
+            # The explicit, non-root identity below is **load-bearing for
+            # C3's file operations**, not a restatement of the image's `USER`:
+            # the control plane's trusted source for "what uid/gid is this
+            # worker?" (`control_plane/worker_identity_source.py`) reads the
+            # worker pod's `securityContext` through the pod API and returns
+            # `None` when the pod spec pins nothing. A `None` identity stores
+            # no worker uid/gid and every identity-needing operation then
+            # answers a named 503 -- the image's `USER` is invisible to that
+            # lookup. `runAsGroup` is not optional either: the tree's group is
+            # the worker's gid.
+            runAsUser: 65534
+            runAsGroup: 65534
             # Node-local state: the kubelet resolves a Localhost profile on the
             # host filesystem, so deploy/k8s/seccomp-installer.yaml (ConfigMap +
             # DaemonSet) installs deploy/seccomp/sandlock-worker.json into the

@@ -12,8 +12,11 @@
 #     `deploy/priv/priv_common.c` 的路径白名单纪律，不另写一套**）。它必须是 **root**：
 #     工作区在阿里云 NAS 上走 AUTH_SYS，`chown` 只有 uid 0 做得成（2026-09-17 实测，
 #     见 `deploy/k8s/priv-broker.yaml` 文件头）。**能力集与 C1 的 broker 逐条相同** ——
-#     本任务只搬家，不扩面。它的载荷（文件操作 verb）归 Task 4；在那之前这个容器只
-#     持有已评审的能力集与挂载，**不听任何端口**。
+#     本任务只搬家，不扩面。载荷是 **Task 4 片 B 装上的**：与面 A **同一个服务**
+#     （`python3 -m deploy.c3_agent`，一张 op 表），但听**自己的端口 49986**（裁定 D22）：
+#     两个容器共享 pod netns，都绑 49985 会 `EADDRINUSE`；而把 file op 送到 65534 的面 A
+#     上，NFS 上每个 chown 都会 `EPERM`（看起来像权限 bug 的失败）。控制面按
+#     `E2B_C3_AGENT_MAINT_PORT` 寻址它。
 #
 # ⚠ `hostPID` 是 **pod 级**字段 ⇒ face B 也会拿到它。这是 `plan §2.0` 明确点名接受的
 #   增量（face B 本来就是 root + `DAC_OVERRIDE`），不是顺手漏出来的。
@@ -129,22 +132,41 @@ spec:
               cpu: "1"
               memory: 256Mi
         # ------------------------------------------------------------------
-        # face B：文件操作面（root + C1 的三条能力；载荷归 Task 4）
+        # face B：文件操作面（root + C1 的三条能力）—— Task 4 装上载荷
         # ------------------------------------------------------------------
         - name: maint
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
           imagePullPolicy: IfNotPresent
-          # Task 4 才会把它换成 `e2b-maint` 的 verb 服务。在那之前它只是**持有已评审
-          # 能力集与挂载**的空转容器：不听端口、不 exec 任何东西 —— 一个"root + 三条
-          # 能力却什么都不做"的容器，比一个"已经能删树但还没接客户端"的守护进程更
-          # 容易在评审里看清。
-          command:
-            - /bin/sh
-            - -c
-            - exec sleep infinity
+          # Task 4 slice B: the payload. **The same service face A runs** --
+          # one app, one op table (`grant-slot` + `chown`/`rm`/`walk`), so the
+          # handler and the refusal shapes cannot drift between the faces. It
+          # listens on **its own port** (D22): the two containers share the pod
+          # netns, so a second listener on face A's 49985 would be
+          # `EADDRINUSE`, and the control plane addresses the file verbs at
+          # this one (`E2B_C3_AGENT_MAINT_PORT`).
           env:
-            # 与 C1 broker 逐字相同的四个白名单根（`priv_common.c` 的纪律），
-            # 让 Task 4 的载荷一上来就落在已评审的边界里。
+            # D12: the same host identity face A carries. The control plane
+            # puts *this host's* name in the URL path of every instruction
+            # (face A's and face B's alike), and each face answers only for
+            # itself.
+            - name: E2B_C3_AGENT_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # The same CP→agent credential as face A; **neither face's copy
+            # ever appears on a worker** (`tests/unit/test_c3_internal_api_shape.py`).
+            - name: E2B_C3_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_C3_AGENT_TOKEN
+            # D22: face B's own port. Face A keeps 49985 (its `ports:` below
+            # and the control plane's `E2B_C3_AGENT_PORT` default).
+            - name: E2B_C3_AGENT_PORT
+              value: "49986"
+            # 与 C1 broker 逐字相同的四个白名单根（`priv_common.c` 的纪律）；
+            # `E2B_STATE_BASE` 与 k8s worker 的 N27 形态逐字一致（`.route-b`
+            # 与 `_runtime` 都在它下面）。
             - name: E2B_WORKSPACE_BASE
               value: /var/lib/e2b-sandboxes/workspaces
             - name: E2B_STATE_BASE
@@ -153,6 +175,40 @@ spec:
               value: /var/lib/e2b-sandboxes
             - name: E2B_IMAGE_CACHE_DIR
               value: /var/lib/e2b-images
+            # The uid pool is an input of `priv_common.c` (`--uid` is refused
+            # outside `START..+SIZE`), and it must equal the worker it serves:
+            # the k8s worker follows the code default, 10000/1000.
+            - name: E2B_UID_POOL_START
+              value: "10000"
+            - name: E2B_UID_POOL_SIZE
+              value: "1000"
+          # The CP dials this port; nothing else may (the NetworkPolicy below
+          # allows exactly the control plane's pod on the two agent ports).
+          ports:
+            - containerPort: 49986
+          # Probes go through `exec` and self-connect on loopback, the same
+          # reason face A's do: a kubelet `httpGet` is issued from the node and
+          # is refused by the ingress rule.
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import socket; socket.create_connection(('127.0.0.1', 49986), 2).close()"
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import socket; socket.create_connection(('127.0.0.1', 49986), 2).close()"
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
           securityContext:
             # NFS AUTH_SYS 只认凭据 uid：`chown` 给别人（比如池 uid 10000）只有 uid 0
             # 做得成。`drop: [ALL]` 必须配 `add`，否则这里只是"在 root 默认集上追加"。
@@ -211,5 +267,12 @@ spec:
             matchLabels:
               app: control-plane
       ports:
+        # face A (`grant-slot`) ...
         - protocol: TCP
           port: 49985
+        # ...and face B (`chown`/`rm`/`walk`, D22). Both are still
+        # CP-only: the source pod selector above is one rule, and splitting the
+        # port list inside it does not widen who may connect -- a second `from`
+        # entry would.
+        - protocol: TCP
+          port: 49986

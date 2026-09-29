@@ -76,9 +76,10 @@ def test_worker_pod_manifest_carries_no_net_raw() -> None:
 
     ``NET_RAW`` would let a compromised worker forge the source IP the control
     plane reads, defeating N49's second factor before the identity layer even
-    runs. The current set is the two file-capability bounding caps (``SETUID``,
-    ``SETGID``); Task 4 removes them, and this pin must then be re-narrowed --
-    never silently widened.
+    runs. Task 4 slice B did what this pin said it must: the worker's two
+    file-capability bounding caps are gone with the binaries they served, so
+    the reviewed set is now the **empty set** -- and 判据 2/15's "no privileged
+    binary, no BND" is what it means.
     """
     docs = _load_all(K8S / "worker.yaml")
     statefulset = next(d for d in docs if d.get("kind") == "StatefulSet")
@@ -86,7 +87,7 @@ def test_worker_pod_manifest_carries_no_net_raw() -> None:
     assert "NET_RAW" not in caps
     for forbidden in FORBIDDEN_CAPABILITY_TOKENS:
         assert forbidden not in caps
-    assert sorted(caps) == ["SETGID", "SETUID"]
+    assert sorted(caps) == []
 
 
 def test_every_compose_worker_service_carries_no_forbidden_privilege() -> None:
@@ -311,17 +312,17 @@ def test_no_worker_shape_carries_the_agent_token() -> None:
 
     Two shapes are checked, because the answer differs by file: manifest sets
     that hold **only** worker-shaped services (the k8s worker StatefulSet, the
-    autoscaler's pool backend, the worker image, the arm-lane fleet stack) are
-    scanned as raw text, while the two separated compose stacks put the control
-    plane and its workers in one file -- there the token is legitimately the
-    *control plane's*, so the scan is per service and reads the worker services'
-    own env.
+    autoscaler's pool backend, the worker image) are scanned as raw text, while
+    the compose stacks that put the control plane, the agent and the workers in
+    one file -- the two separated examples and, since Task 4 slice B (D17), the
+    target host's stack -- have the token legitimately as the *control plane's*
+    and the *two agent faces*'; there the scan is per service and reads the
+    worker services' own env.
     """
     worker_only_sources = [
         K8S / "worker.yaml",
         K8S / "autoscaler.yaml",
         REPO / "deploy" / "compose" / "docker-compose.autoscale.yml",
-        REPO / "deploy" / "stack" / "docker-compose.prod.yml",
         REPO / "deploy" / "docker" / "Dockerfile.envd",
         REPO / "autoscaler" / "backends" / "local.py",
     ]
@@ -330,6 +331,7 @@ def test_no_worker_shape_carries_the_agent_token() -> None:
     for path in (
         REPO / "deploy" / "compose" / "docker-compose.prod.yml",
         REPO / "deploy" / "compose" / "docker-compose.multinode.yml",
+        REPO / "deploy" / "stack" / "docker-compose.prod.yml",
     ):
         services = _compose(path)["services"]
         workers = [name for name in services if name.startswith("worker")]
@@ -337,3 +339,11 @@ def test_no_worker_shape_carries_the_agent_token() -> None:
         for name in workers:
             env = _compose_env(services[name])
             assert "E2B_C3_AGENT_TOKEN" not in env, (path.name, name)
+        # ...and the token *is* where it belongs (the faces that must
+        # authenticate the CP→agent hop), so the per-service scan above cannot
+        # pass by the key having been dropped from the file entirely.
+        for face in ("c3-agent", "c3-agent-maint"):
+            assert "E2B_C3_AGENT_TOKEN" in _compose_env(services[face]), (
+                path.name,
+                face,
+            )

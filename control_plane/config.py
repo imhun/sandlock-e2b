@@ -352,6 +352,24 @@ class Settings:
     c3_agent_port: int = field(
         default_factory=lambda: _env_int("E2B_C3_AGENT_PORT", 49985)
     )
+    #: Face B's own address (C3 Task 4 slice B, ruling D22). The two faces are
+    #: two processes by necessity -- face A must be a non-root uid 65534 for
+    #: the ``uid_map`` owner rule (§14.2.7), face B must be uid 0 for NFS
+    #: AUTH_SYS ``chown`` and is the only one with the four roots mounted -- so
+    #: they listen on **two** ports. A single address would either collide
+    #: (``EADDRINUSE``: both containers share the pod netns) or route a file
+    #: operation to the 65534 process, where every chown on NFS is ``EPERM``.
+    #:
+    #: compose names the face-B service outright (``c3-agent-maint``); k8s
+    #: derives it from the same lookup face A uses -- the *same node's* agent
+    #: pod, second port -- never from a request. An unset compose value is a
+    #: named 503 on every file operation, not a guess.
+    c3_agent_maint_url: str | None = field(
+        default_factory=lambda: os.getenv("E2B_C3_AGENT_MAINT_URL")
+    )
+    c3_agent_maint_port: int = field(
+        default_factory=lambda: _env_int("E2B_C3_AGENT_MAINT_PORT", 49986)
+    )
     #: The credential the agent demands on every instruction. Unset means "no
     #: agent instructions": the client refuses by name rather than dialling
     #: without auth.

@@ -97,7 +97,11 @@ spec:
         # root 探针用，而它会答出 daemon 的 roots/uid_pool，不该出现在节点共享的目录里。
         # 所以目录 0710 root:65534 保持原样：worker 能穿过目录、只能用业务 socket。
         - name: socket-dir-init
-          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
+          # C3 (Task 4 slice B): the agent image, not the worker image. The
+          # worker image no longer ships `/var/lib/e2b-priv/` (判据 2/15), and
+          # `e2b-maint` lives only in the agent image now; the three inits here
+          # only need `/bin/sh` + coreutils, which both images carry.
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
           securityContext:
             runAsUser: 0
           command:
@@ -127,7 +131,7 @@ spec:
         # its own cache" is not true once this container has run.
         # docs/production-deployment-requirements.md §2.7.1.
         - name: image-cache-init
-          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
           securityContext:
             runAsUser: 0
           command:
@@ -219,7 +223,7 @@ spec:
         # 过来之后 init 的顺序与依赖没变 —— DaemonSet 的 init 先跑完，broker 才监听，
         # worker 的 wait-for-broker 再放行，所以属主一定先于 worker 的开始建立。
         - name: workspace-root-init
-          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
           securityContext:
             runAsUser: 0
           command:
@@ -374,11 +378,14 @@ spec:
               mountPath: /var/lib/e2b-sandboxes
       containers:
         - name: broker
-          # Same image as the worker: it already carries
-          # /var/lib/e2b-priv/e2b-maint (the verb implementations and the path
-          # whitelist), and the DaemonSet is versioned with the worker on
-          # purpose -- the socket protocol is a contract between the two.
-          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0
+          # C3 (Task 4 slice B): the **agent** image. It is the only one that
+          # still carries `/var/lib/e2b-priv/e2b-maint` (the verb
+          # implementations and the path whitelist) -- the worker image lost
+          # it in this same change. The DaemonSet stays until Task 7 retires
+          # the C1 broker; it is what keeps the `socket` rollback
+          # (`E2B_PRIV_HELPER_TRANSPORT`) and the worker's `wait-for-broker`
+          # gate meaningful in the meantime.
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0
           imagePullPolicy: IfNotPresent
           # `serve` only ever execs *itself* (`/var/lib/e2b-priv/e2b-maint`,
           # verified against /proc/self/exe at startup) -- it is not a general

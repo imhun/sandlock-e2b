@@ -93,20 +93,17 @@ def test_stack_worker_has_no_cap_add_and_declares_the_low_port_window() -> None:
     worker = STACK_COMPOSE.split("\n  worker-1: &worker", 1)[1].split(
         "\n  worker-2:", 1
     )[0]
-    # No SYS_ADMIN (A6), and only the four file-capability-broker caps (Track
-    # F): the BND has to contain them for the brokers' file xattrs to survive
-    # exec, while a non-root worker's own CapEff stays 0.
+    # No SYS_ADMIN (A6), and since C3 Task 4 slice B **no capability at all**:
+    # Track F's four caps existed only so the image's file-capability brokers
+    # could be `exec`d (file caps must be a subset of BND). The worker image no
+    # longer ships them -- the slot identity and the file verbs are the agent's
+    # -- so `cap_drop: [ALL]` without an `add` is the shipped shape, and the
+    # empty bounding set is the property 判据 2/15 pin.
     assert "\n      - SYS_ADMIN\n" not in worker
-    assert (
-        "\n    cap_drop:\n"
-        "      - ALL\n"
-        "    cap_add:\n"
-        "      - SETUID      # e2b-slot-spawn: setuid(X) on the pooled host uid\n"
-        "      - SETGID      # e2b-slot-spawn: setgroups([]) + setgid(X)\n"
-        "      - CHOWN       # e2b-maint: workspace/slice ownership + slot documents\n"
-        "      - DAC_OVERRIDE  # e2b-maint: rm/walk fallback for trees group access misses\n"
-        in worker
-    )
+    assert "\n    cap_drop:\n      - ALL\n" in worker
+    assert "\n    cap_add:\n" not in worker
+    for cap in ("SETUID", "SETGID", "CHOWN", "DAC_OVERRIDE"):
+        assert f"\n      - {cap}\n" not in worker
     # Negative form: no NNP directive can be added to the security_opt list.
     assert "\n      - no-new-privileges" not in worker
     # The worker's syscall filter is the shipped profile, not `unconfined`
@@ -265,21 +262,24 @@ def test_stack_quota_agent_owns_the_capability_behind_a_profile() -> None:
 
 
 def test_k8s_worker_drops_sys_admin_and_declares_the_broker_caps() -> None:
+    """C3 Task 4 slice B: the worker's bounding set is **empty**.
+
+    Track F/C1 declared `SETUID`/`SETGID` here for one reason only: the image's
+    file-capability `e2b-slot-spawn` is refused at `exec` unless its caps are a
+    subset of the container's BND, and it was the worker's own binary (a slot
+    must be spawned in the worker's own namespaces). The worker image no longer
+    ships that binary -- nor `e2b-maint` -- and the slot identity is the
+    agent's, so the declaration is gone. `CHOWN`/`DAC_OVERRIDE` moved out in C1
+    (the per-node broker) and `NET_BIND_SERVICE` had no user after N5 moved the
+    `:53` bind into each sandbox's own netns.
+    """
     assert 'add: ["SYS_ADMIN"' not in K8S_WORKER
     assert "\n                - SYS_ADMIN\n" not in K8S_WORKER
-    # C1: two caps stay, because the *file-capability* brokers (a local
-    # `e2b-slot-spawn` is still the worker's own) refuse to exec without them
-    # in the container's bounding set.
-    assert (
-        "              add:\n"
-        "                - SETUID\n"
-        "                - SETGID\n"
-        in K8S_WORKER
-    )
-    # ...and nothing else: the chown/dac_override half moved to the per-node
-    # broker DaemonSet (deploy/k8s/priv-broker.yaml), and NET_BIND_SERVICE
-    # has had no user since the per-sandbox netns work (N5).
+    # No capabilities block at all -- not an empty `add:`, an absent one.
+    assert "capabilities:" not in K8S_WORKER
     for gone in (
+        "\n                - SETUID\n",
+        "\n                - SETGID\n",
         "\n                - NET_BIND_SERVICE\n",
         "\n                - CHOWN\n",
         "\n                - DAC_OVERRIDE\n",
@@ -289,18 +289,26 @@ def test_k8s_worker_drops_sys_admin_and_declares_the_broker_caps() -> None:
     # would silently turn the brokers back into unprivileged binaries.
     assert "allowPrivilegeEscalation: false" not in K8S_WORKER
     assert "no-new-privileges" not in K8S_WORKER
-    # The worker is told *how* to reach the privileged half: socket transport,
-    # and the path the DaemonSet's `serve` listens on. Socket mode is
-    # fail-closed in the Python resolver, so naming it is what makes a missing
-    # broker a startup failure instead of a silent in-pod fallback.
+    # The worker is told *how* to reach the privileged half: the C3 **agent**
+    # shape (`{sandbox_id, op}` to the control plane, which instructs this
+    # node's agent). It has to be named: with the binaries gone, `auto` would
+    # resolve no brokers and fall back to the degraded in-process (E5.1)
+    # shape. The socket pair stays as the rollback lever (Task 7 retires it),
+    # which is why the broker DaemonSet is still shipped.
     assert (
         "            - name: E2B_PRIV_HELPER_TRANSPORT\n"
-        "              value: socket\n" in K8S_WORKER
+        "              value: agent\n" in K8S_WORKER
     )
     assert (
         "            - name: E2B_PRIV_HELPER_SOCKET\n"
         "              value: /run/e2b-broker/broker.sock\n" in K8S_WORKER
     )
+    # ...and the identity the control plane's trusted source reads has to be
+    # pinned in the pod spec (Task 4 slice A's D21 option 1): the image's
+    # `USER` is invisible to the pod API, and an unpinned pod reads as
+    # "unknown" -- no identity stored, every identity-needing op a named 503.
+    assert "\n            runAsUser: 65534\n" in K8S_WORKER
+    assert "\n            runAsGroup: 65534\n" in K8S_WORKER
 
 
 def test_no_low_port_window_survives_anywhere() -> None:
@@ -702,9 +710,13 @@ def test_k0s_overlay_moves_the_seccomp_root_to_the_k0s_kubelet_dir() -> None:
     assert "    nodePort: 31907\n" in out
     assert "    port: 49983\n" in out
     assert "    targetPort: 3000\n" in out
-    # C1 (wave 2) is the inverse pin: the worker pod is *off* root again -- the
-    # old `worker-root.patch.yaml` is gone -- and the privileged hand-over is the
-    # per-node broker DaemonSet's job.
+    # C1 (wave 2) is the inverse pin: the worker pod is *off* root -- the old
+    # `worker-root.patch.yaml` is gone -- and the privileged hand-over is the
+    # per-node broker DaemonSet's job (C3 Task 4 moved it to the agent). Task 4
+    # slice B *pins the non-root identity on the container*: the control
+    # plane's trusted source reads `securityContext.runAsUser`/`runAsGroup`
+    # through the pod API, so the pod spec has to name 65534 -- the image's
+    # `USER` alone reads as "unknown" and blocks every identity-needing op.
     #
     # Read it off the *worker container*, not the rendered text: `runAsUser: 0`
     # is still spelled by other objects (control-plane, the seccomp installer,
@@ -714,26 +726,27 @@ def test_k0s_overlay_moves_the_seccomp_root_to_the_k0s_kubelet_dir() -> None:
     # container running as the image's 65534, and every create then failed with
     # `Permission denied: <base>/.uid_pool.lock` (a root-owned 0600 file the NAS
     # will not let 65534 open). The mirror-image failure is the one that matters
-    # now: a leftover patch, or a `runAsUser` added back to the baseline, would
-    # put a root container back in the worker pod.
+    # now: a `runAsUser: 0` in the pod spec would put root back in the worker
+    # pod.
     worker = _rendered_workload(out, "StatefulSet", "e2b-worker")
     pod_spec = worker["spec"]["template"]["spec"]
     container = pod_spec["containers"][0]
     security = container["securityContext"]
-    assert "runAsUser" not in security
-    assert "runAsGroup" not in security
+    assert security["runAsUser"] == 65534
+    assert security["runAsGroup"] == 65534
     # ...and at the pod level: Kubernetes resolves the uid from pod *and*
-    # container (`spec.securityContext` wins), so a pod-level `runAsUser` would
-    # put root back while the container-level assertions above stayed green.
+    # container (`spec.securityContext` wins), so a pod-level override could
+    # change the effective identity while the container-level assertion above
+    # stayed green.
     pod_security = pod_spec.get("securityContext", {})
     assert "runAsUser" not in pod_security
     assert "runAsGroup" not in pod_security
-    # Exactly the two caps the local file-capability `e2b-slot-spawn` needs in
-    # the bounding set -- not one more. CHOWN/DAC_OVERRIDE are the DaemonSet's
-    # now, and NET_BIND_SERVICE has had no user since N5.
-    assert set(security["capabilities"]["add"]) == {"SETUID", "SETGID"}
+    # C3 Task 4 slice B: no capability block at all -- the image's file-cap
+    # binaries are gone and both privileged jobs are the agent's, so the
+    # container's bounding set is the empty set (判据 2/15).
+    assert "capabilities" not in security
     env = {e["name"]: e.get("value") for e in container["env"]}
-    assert env["E2B_PRIV_HELPER_TRANSPORT"] == "socket"
+    assert env["E2B_PRIV_HELPER_TRANSPORT"] == "agent"
     assert env["E2B_PRIV_HELPER_SOCKET"] == "/run/e2b-broker/broker.sock"
     assert env["E2B_IMAGE_CACHE_DIR"] == "/var/lib/e2b-images"
 
@@ -1272,23 +1285,29 @@ def test_apply_waits_for_the_broker_daemonset_before_the_worker() -> None:
 
 @pytest.mark.parametrize("manifests", ["deploy/k8s", "deploy/k8s-k0s"])
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
-def test_socket_transport_and_its_broker_are_inseparable(manifests: str) -> None:
-    """C1 regression: the socket switch and the broker that serves it travel together.
+def test_the_workers_upstream_is_the_agent_and_the_broker_stays_consistent(
+    manifests: str,
+) -> None:
+    """Task 4 slice B: the worker's privileged upstream moved to the agent.
 
-    The switch lives in the shared baseline worker manifest, but the DaemonSet
-    first landed in the k0s overlay only -- so ``kubectl kustomize deploy/k8s``
-    (which docs/k8s-deployment.md treats as a deployable set, and which a managed
-    cluster on block/local disk is explicitly allowed to run non-root) emitted a
-    worker that dials ``/run/e2b-broker/broker.sock`` *and* whose two owner inits
-    had moved out, with no broker in the render at all. Its ``wait-for-broker``
-    gate then burned its 60s and left the pod in ``Init:Error``.
+    C1's pin was "the socket switch and the broker that serves it travel
+    together", because a worker dialling a socket nobody served burned its 60 s
+    gate and stayed in ``Init:Error``. Task 4 slice B changes the switch to
+    ``agent`` (the worker image lost its two file-capability binaries, so the
+    file steps go to the control plane), which means:
 
-    So this is not "the DaemonSet also exists": it is one render answering one
-    question -- if this manifest set ships the switch, this same manifest set has
-    to serve the socket. It reads both the baseline and the overlay, because
-    either one alone being broken is the regression. Everything is read off the
-    parsed render (never off either file), so moving the pair apart again, or
-    renaming the socket on one side only, fails here instead of on a cluster.
+    * the same render has to carry the **agent** DaemonSet the worker's new
+      upstream lives in -- a worker on the agent shape with no agent pod fails
+      every slot start and every file step by name;
+    * the C1 broker stays in the render *and stays consistent* until Task 7
+      retires it: the worker's ``wait-for-broker`` gate is still there and the
+      ``socket`` pair is still the rollback lever, so the broker must still
+      serve the socket the worker names, authenticate the worker's own gid, and
+      serve from an image that actually carries ``e2b-maint`` -- which is now
+      the **agent** image, because the worker image lost it in this change.
+
+    Read off the parsed render, like the pin it replaces, so the two manifests
+    (baseline and overlay) cannot disagree.
     """
     rendered = subprocess.run(
         [KUBECTL, "kustomize", str(REPO / manifests)],
@@ -1301,9 +1320,20 @@ def test_socket_transport_and_its_broker_are_inseparable(manifests: str) -> None
     pod = worker["spec"]["template"]["spec"]
     container = pod["containers"][0]
     env = {e["name"]: e.get("value") for e in container["env"]}
-    # The premise of the pin: this render really does dial the broker.
-    assert env["E2B_PRIV_HELPER_TRANSPORT"] == "socket"
+    # The premise of the pin: this render really runs the agent shape, and the
+    # socket it would fall back to is still named.
+    assert env["E2B_PRIV_HELPER_TRANSPORT"] == "agent"
     assert env["E2B_PRIV_HELPER_SOCKET"] == "/run/e2b-broker/broker.sock"
+    # The worker's upstream: one agent DaemonSet, in the same render (the
+    # agent's `grant-slot` is what hands the slot its uid, and `apply.sh`
+    # converges it before the worker for exactly this reason).
+    agents = [
+        doc
+        for doc in documents
+        if doc.get("kind") == "DaemonSet"
+        and doc.get("metadata", {}).get("name") == "e2b-c3-agent"
+    ]
+    assert len(agents) == 1, f"{manifests}: the worker runs the agent shape"
     socket_path = env["E2B_PRIV_HELPER_SOCKET"]
     socket_dir = socket_path.rsplit("/", 1)[0]
     brokers = [
@@ -1313,11 +1343,19 @@ def test_socket_transport_and_its_broker_are_inseparable(manifests: str) -> None
         and doc.get("metadata", {}).get("name") == "e2b-priv-broker"
     ]
     assert len(brokers) == 1, (
-        f"{manifests}: the worker dials {socket_path} but this render carries "
+        f"{manifests}: the rollback names {socket_path} but this render carries "
         f"{len(brokers)} e2b-priv-broker DaemonSets"
     )
     broker_pod = brokers[0]["spec"]["template"]["spec"]
     broker = broker_pod["containers"][0]
+    # C3 Task 4 slice B: the broker's binary now comes from the **agent** image
+    # -- the worker image no longer ships `/var/lib/e2b-priv/e2b-maint`, so a
+    # broker still pointing at it would crash-loop and take the worker's
+    # `wait-for-broker` gate down with it.
+    assert broker["image"] == (
+        "registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0"
+    )
+    assert all("e2b-sandlock-agent" in c["image"] for c in broker_pod["initContainers"])
     # The broker `serve`s on the very path the worker dials, from the same
     # hostPath -- one socket, one node, both pods -- plus the probe's health
     # socket (A4), which is deliberately **not** in that hostPath: it is the
@@ -1345,13 +1383,12 @@ def test_socket_transport_and_its_broker_are_inseparable(manifests: str) -> None
         "mountPath"
     ] == socket_dir
     # The identity the broker authenticates has to be the identity this worker
-    # runs as. The image is `USER 65534:65534` and neither pod nor container may
-    # override it -- a pod-level `runAsUser` would put root back just as surely
-    # as a container-level one, and the peer check would then fail closed.
+    # runs as: 65534, pinned explicitly on the container (Task 4 slice B) and
+    # not overridden at the pod level (a pod-level `runAsUser` would win).
+    assert container["securityContext"]["runAsUser"] == 65534
+    assert container["securityContext"]["runAsGroup"] == 65534
     assert "runAsUser" not in pod.get("securityContext", {})
     assert "runAsGroup" not in pod.get("securityContext", {})
-    assert "runAsUser" not in container["securityContext"]
-    assert "runAsGroup" not in container["securityContext"]
     broker_env = {e["name"]: e.get("value") for e in broker["env"]}
     assert broker_env["E2B_BROKER_PEER_UID"] == "65534"
     assert broker_env["E2B_BROKER_PEER_GID"] == "65534"
@@ -1594,6 +1631,26 @@ def _k8s_env_value(text: str, key: str) -> str:
     return value_line[len("value: ") :].strip().strip('"')
 
 
+def _stack_worker_route_b_root() -> str:
+    """The stack compose's `E2B_ROUTE_B_TMP_ROOT`, from its **worker** anchor.
+
+    Not a whole-file search: Task 4 slice B gave the stack's *control plane*
+    the same key (it derives `scope-slot-document` from it), so the file
+    contains it twice now and a bare substring lookup would be ambiguous --
+    and could silently pass on the CP's copy if the worker's were removed.
+    """
+    worker = STACK_COMPOSE.split("\n  worker-1: &worker", 1)[1].split(
+        "\n  worker-2:", 1
+    )[0]
+    found = [
+        line.strip().split(":", 1)[1].strip().strip('"')
+        for line in worker.splitlines()
+        if line.strip().startswith("E2B_ROUTE_B_TMP_ROOT:")
+    ]
+    assert len(found) == 1, found
+    return found[0]
+
+
 def _fleet_route_b_roots() -> dict[str, str]:
     """`E2B_ROUTE_B_TMP_ROOT` as each fleet manifest spells it.
 
@@ -1603,9 +1660,7 @@ def _fleet_route_b_roots() -> dict[str, str]:
     template is the manifest the cluster actually runs.
     """
     return {
-        "deploy/stack/docker-compose.prod.yml": _value_after_key(
-            STACK_COMPOSE, "E2B_ROUTE_B_TMP_ROOT", indent="      "
-        ),
+        "deploy/stack/docker-compose.prod.yml": _stack_worker_route_b_root(),
         "deploy/k8s/worker.yaml": _k8s_env_value(
             K8S_WORKER, "E2B_ROUTE_B_TMP_ROOT"
         ),

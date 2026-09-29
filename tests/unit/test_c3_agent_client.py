@@ -109,6 +109,9 @@ def test_the_agent_is_found_through_the_workers_own_node() -> None:
         node_identity=HOST,
         url=f"http://{AGENT_IP}:49985",
         pod_uid=WORKER_POD_UID,
+        # D22: face B is the *same* pod (the two containers share the pod
+        # netns) on its own port -- one lookup, two endpoints.
+        maint_url=f"http://{AGENT_IP}:49986",
     )
     assert seen[0].endswith(f"/api/v1/namespaces/{NAMESPACE}/pods/{NODE}")
     # The second lookup is scoped to the node the worker really runs on, and to
@@ -213,7 +216,10 @@ def test_the_compose_agent_is_the_configured_service_name() -> None:
     """
     resolver = ComposeAgentAddressResolver("http://c3-agent:49985/")
     assert resolver.resolve(NODE) == AgentTarget(
-        node_identity="c3-agent", url="http://c3-agent:49985", pod_uid=None
+        node_identity="c3-agent",
+        url="http://c3-agent:49985",
+        pod_uid=None,
+        maint_url=None,
     )
 
 
@@ -245,7 +251,11 @@ def test_the_resolver_follows_the_deployments_address_mode(monkeypatch) -> None:
 
 def _client(handler, **overrides) -> C3AgentClient:
     options = dict(
-        resolver=ComposeAgentAddressResolver("http://c3-agent:49985"),
+        # D22: the compose lane names both faces; the file verbs go to the
+        # maint service, so the file-op tests below are addressed there.
+        resolver=ComposeAgentAddressResolver(
+            "http://c3-agent:49985", "http://c3-agent-maint:49986"
+        ),
         token=TOKEN,
         timeout_s=2.0,
     )
@@ -557,7 +567,7 @@ def test_the_chown_instruction_names_the_verb_and_its_parameters() -> None:
     assert len(seen) == 1
     request = seen[0]
     assert str(request.url) == (
-        f"http://{AGENT_IP}:49985/internal/nodes/{HOST}/agent/chown"
+        f"http://{AGENT_IP}:49986/internal/nodes/{HOST}/agent/chown"
     )
     assert request.headers["X-Internal-Key"] == TOKEN
     assert json.loads(request.content) == {
@@ -627,8 +637,8 @@ def test_rm_and_walk_carry_the_path_and_the_worker_identity_only() -> None:
         )
     )
     assert [str(request.url) for request in seen] == [
-        "http://c3-agent:49985/internal/nodes/c3-agent/agent/rm",
-        "http://c3-agent:49985/internal/nodes/c3-agent/agent/walk",
+        "http://c3-agent-maint:49986/internal/nodes/c3-agent/agent/rm",
+        "http://c3-agent-maint:49986/internal/nodes/c3-agent/agent/walk",
     ]
     expected_body = {
         "sandbox_id": "sbx_forward",
@@ -690,6 +700,83 @@ def test_a_stuck_agent_on_a_file_op_is_a_504_naming_the_verb() -> None:
         "(the walk instruction is fail-closed)"
     )
     assert excinfo.value.status_code == 504
+
+
+def test_the_two_faces_are_two_endpoints_and_each_op_uses_its_own() -> None:
+    """D22: face A and face B are separate listeners, so they are separate URLs.
+
+    The two containers are one pod (k8s) / two services (compose). A single
+    address could not serve both -- `grant-slot` needs uid 65534 (the `uid_map`
+    owner rule) while `chown` needs uid 0 (NFS AUTH_SYS) -- and a shared port
+    would collide on the pod netns. This pins the routing: the grant goes to
+    the face-A URL and the file verbs to the face-B one, on one client.
+    """
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        body = json.loads(request.content)
+        if "pid" in body:
+            return httpx.Response(
+                200,
+                json={"op": "grant-slot", "hostPid": 99, "asUid": "ok"},
+            )
+        return httpx.Response(200, json={"op": "walk", "stdout": ""})
+
+    client = _client(handler)
+    _grant(client)
+    asyncio.run(
+        client.walk(
+            node_id=NODE,
+            sandbox_id="sbx_forward",
+            path=WORKSPACE,
+            worker_uid=65534,
+            worker_gid=65534,
+        )
+    )
+    assert seen == [
+        "http://c3-agent:49985/internal/nodes/c3-agent/agent/grant-slot",
+        "http://c3-agent-maint:49986/internal/nodes/c3-agent/agent/walk",
+    ]
+
+
+def test_a_shape_without_a_face_b_address_refuses_the_file_verbs_by_name() -> None:
+    """A compose shape that named only face A still grants, but never chowns.
+
+    Failing closed is the point (D22): routing the file verb to face A would
+    come back `EPERM` from the NAS on every chown, which reads like a
+    permission bug rather than a missing endpoint.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"op": "walk"})
+
+    client = C3AgentClient(
+        resolver=ComposeAgentAddressResolver("http://c3-agent:49985"),
+        token=TOKEN,
+        timeout_s=2.0,
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(AgentClientError) as excinfo:
+        asyncio.run(
+            client.rm(
+                node_id=NODE,
+                sandbox_id="sbx_forward",
+                path=WORKSPACE,
+                worker_uid=65534,
+                worker_gid=65534,
+            )
+        )
+    assert str(excinfo.value) == (
+        f"cannot determine the file-operation agent address for node {NODE} "
+        "(E2B_C3_AGENT_MAINT_URL / E2B_C3_AGENT_MAINT_PORT): refusing to "
+        "instruct an agent the control plane cannot locate"
+    )
+    assert excinfo.value.status_code == 503
+    # ...and nothing was dialled: the refusal is local, before any request.
+    assert seen == []
 
 
 def test_the_concurrency_limit_is_the_knob_slice_b_sizes() -> None:

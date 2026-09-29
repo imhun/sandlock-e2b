@@ -64,6 +64,11 @@ services:
       # token lives here and on the agent, never on a worker.
       E2B_C3_AGENT_URL: ${E2B_C3_AGENT_URL:-http://c3-agent:49985}
       E2B_C3_AGENT_TOKEN: ${E2B_C3_AGENT_TOKEN:-c3-agent-token}
+      # D22 (Task 4 slice B): the file-operation face is its own service
+      # (`c3-agent-maint`, below). Face A grants slot identities as uid 65534;
+      # face B runs the file verbs as root and is the only one with the four
+      # roots mounted. `grant-slot` keeps the face-A URL.
+      E2B_C3_AGENT_MAINT_URL: ${E2B_C3_AGENT_MAINT_URL:-http://c3-agent-maint:49986}
       # D16: see `deploy/k8s/control-plane.yaml` / `control_plane/config.py`
       # for the reasoning behind 64; slice B2 measures it on this stack.
       E2B_C3_AGENT_MAX_CONCURRENCY: ${E2B_C3_AGENT_MAX_CONCURRENCY:-64}
@@ -72,6 +77,10 @@ services:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_GATEWAY_URL: http://control-plane:3000
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
+      # C3 (Task 4 slice B): route B's scratch root, the path the control plane
+      # derives `scope-slot-document` from (the worker writes the documents but
+      # may not name a path).
+      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       # Bounded by the resolver itself (`_images` sits in the volume's
       # unlimited project) and owned by the worker uid, so both the root-run
@@ -132,14 +141,16 @@ services:
       E2B_C3_AGENT_PORT: "49985"
     restart: unless-stopped
 
-  # face B: C1's file-operation face, moved (same caps, same roots). Payload in
-  # Task 4; until then it holds the reviewed shape and listens on nothing. It
-  # mounts the **workers'** volume (`worker-data`), which is where the trees it
-  # will own live.
+  # face B: C1's file-operation face, moved (same caps, same roots). Task 4
+  # slice B gives it the payload: **the same service face A runs** (one app,
+  # one op table), on its **own** port (D22). It mounts the **workers'** volume
+  # (`worker-data`), which is where the trees it owns live.
   c3-agent-maint:
     image: ${AGENT_IMAGE:-e2b-sandlock-agent:0.1.0}
     user: "0:0"
-    command: ["/bin/sh", "-c", "exec sleep infinity"]
+    # D22: the compose half of D21's option-2 route (the agent reading a
+    # worker process's uid/gid from the kernel); harmless for the file verbs.
+    pid: host
     cap_drop:
       - ALL
     cap_add:
@@ -147,9 +158,16 @@ services:
       - DAC_OVERRIDE
       - FOWNER
     environment:
+      E2B_C3_AGENT_NODE_ID: c3-agent
+      E2B_C3_AGENT_TOKEN: ${E2B_C3_AGENT_TOKEN:-c3-agent-token}
+      E2B_C3_AGENT_PORT: "49986"
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       E2B_SHARED_VOLUME_ROOT: /var/lib/e2b-sandboxes
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
+      # `priv_common.c` refuses a `--uid` outside `START..+SIZE`; this stack
+      # leaves the workers at the code default (10000/1000).
+      E2B_UID_POOL_START: ${E2B_UID_POOL_START:-10000}
+      E2B_UID_POOL_SIZE: ${E2B_UID_POOL_SIZE:-1000}
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
     restart: unless-stopped
@@ -171,6 +189,9 @@ services:
       # C3 (Task 3): slot identity comes from the `c3-agent` service above, via
       # the control plane -- this container holds no agent address or token.
       E2B_SLOT_IDENTITY: agent-grant
+      # C3 (Task 4 slice B): the file steps go to the agent too; the worker
+      # image no longer ships the file-capability binaries.
+      E2B_PRIV_HELPER_TRANSPORT: agent
       E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
@@ -259,6 +280,7 @@ services:
       E2B_NODE_ADDRESS: http://worker-2:49983
       E2B_NODE_ID: worker-2
       E2B_SLOT_IDENTITY: agent-grant
+      E2B_PRIV_HELPER_TRANSPORT: agent
       E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
@@ -347,6 +369,7 @@ services:
       E2B_NODE_ADDRESS: http://worker-3:49983
       E2B_NODE_ID: worker-3
       E2B_SLOT_IDENTITY: agent-grant
+      E2B_PRIV_HELPER_TRANSPORT: agent
       E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes

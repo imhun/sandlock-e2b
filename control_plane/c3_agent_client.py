@@ -53,6 +53,10 @@ logger = logging.getLogger(__name__)
 
 #: The agent's own port (``E2B_C3_AGENT_PORT`` in ``deploy/c3_agent/config.py``).
 DEFAULT_AGENT_PORT = 49985
+#: Face B's port (ruling D22). The agent is one pod with two containers, so
+#: "the same node's face B" is the same address with this second port; compose
+#: names the face-B service outright instead (``E2B_C3_AGENT_MAINT_URL``).
+DEFAULT_AGENT_MAINT_PORT = 49986
 
 
 @dataclass(frozen=True)
@@ -67,11 +71,20 @@ class AgentTarget:
     ``pod_uid`` is the **worker pod's** UID, not the agent pod's: it is the
     k8s lane's proof that a candidate process in the agent's ``/proc`` scan
     belongs to the worker whose report the control plane is forwarding.
+
+    ``url`` is face A (``grant-slot``); ``maint_url`` is face B (``chown`` /
+    ``rm`` / ``walk``). They are two processes by necessity -- face A is uid
+    65534 (the ``uid_map`` owner rule) and face B is uid 0 (NFS AUTH_SYS
+    ``chown``) -- so they are two listeners, and the ruling (D22) is that face
+    B gets its own endpoint rather than sharing one. ``maint_url`` is ``None``
+    only for a shape that named none (compose without
+    ``E2B_C3_AGENT_MAINT_URL``), and a file operation then refuses by name.
     """
 
     node_identity: str
     url: str
     pod_uid: str | None = None
+    maint_url: str | None = None
 
 
 class AgentAddressResolver(Protocol):
@@ -101,10 +114,17 @@ class ComposeAgentAddressResolver:
     -- the pair is pinned in ``tests/unit/test_c3_agent_manifest.py``. Deriving
     it from the URL is deliberate: there is exactly one name, the one the
     control plane actually dials, so the two halves cannot drift.
+
+    Face B is a *second service* in this lane (compose has no pods, so the two
+    faces are two containers with two names): ``E2B_C3_AGENT_MAINT_URL`` names
+    it, and the path identity inside every instruction is still the face-A host
+    -- the agent's self-check is against the name the control plane addresses
+    it by, and both faces carry that same ``E2B_C3_AGENT_NODE_ID``.
     """
 
-    def __init__(self, url: str | None) -> None:
+    def __init__(self, url: str | None, maint_url: str | None = None) -> None:
         self._url = (url or "").strip().rstrip("/")
+        self._maint_url = (maint_url or "").strip().rstrip("/")
 
     def resolve(self, node_id: str) -> AgentTarget | None:
         if not self._url:
@@ -112,7 +132,21 @@ class ComposeAgentAddressResolver:
         identity = urlsplit(self._url).hostname or ""
         if not validate_node_id(identity):
             return None
-        return AgentTarget(node_identity=identity, url=self._url, pod_uid=None)
+        # A face-B URL the deployment named but that carries no usable host is
+        # not an address: drop it here (the file operation then fails closed
+        # naming the variable) rather than dialling a guess later.
+        maint_host = urlsplit(self._maint_url).hostname if self._maint_url else ""
+        maint_url = (
+            self._maint_url
+            if self._maint_url and maint_host and validate_node_id(maint_host)
+            else None
+        )
+        return AgentTarget(
+            node_identity=identity,
+            url=self._url,
+            pod_uid=None,
+            maint_url=maint_url,
+        )
 
 
 class K8sAgentAddressResolver:
@@ -130,12 +164,14 @@ class K8sAgentAddressResolver:
         namespace: str,
         label_selector: str,
         port: int = DEFAULT_AGENT_PORT,
+        maint_port: int = DEFAULT_AGENT_MAINT_PORT,
         scheme: str = "http",
         client: httpx.Client | None = None,
     ) -> None:
         self._namespace = namespace
         self._label_selector = label_selector
         self._port = int(port)
+        self._maint_port = int(maint_port)
         self._scheme = scheme
         self._client = client or self._in_cluster_client()
 
@@ -196,6 +232,11 @@ class K8sAgentAddressResolver:
             node_identity=node_name,
             url=f"{self._scheme}://{candidates[0]}:{self._port}",
             pod_uid=pod_uid,
+            # D22: face B is the *same* pod on the *same* node (the two
+            # containers share the pod netns), so it is the same address on its
+            # own port -- never a second lookup, and never anything the worker
+            # said.
+            maint_url=f"{self._scheme}://{candidates[0]}:{self._maint_port}",
         )
 
     def _get(self, path: str, params: dict[str, str] | None = None):
@@ -244,9 +285,15 @@ def build_agent_address_resolver(settings) -> AgentAddressResolver:
             namespace=getattr(settings, "c3_agent_namespace", "sandlock"),
             label_selector=getattr(settings, "c3_agent_label", "app=c3-agent"),
             port=int(getattr(settings, "c3_agent_port", DEFAULT_AGENT_PORT)),
+            maint_port=int(
+                getattr(settings, "c3_agent_maint_port", DEFAULT_AGENT_MAINT_PORT)
+            ),
         )
     if mode == "hostname":
-        return ComposeAgentAddressResolver(getattr(settings, "c3_agent_url", None))
+        return ComposeAgentAddressResolver(
+            getattr(settings, "c3_agent_url", None),
+            getattr(settings, "c3_agent_maint_url", None),
+        )
     raise ValueError(
         f"E2B_NODE_ADDRESS_MODE must be 'k8s', 'hostname' or 'auto' (got {mode!r})"
     )
@@ -347,6 +394,7 @@ class C3AgentClient:
             node_id,
             "grant-slot",
             body,
+            url=target.url,
             refusal="refused the grant",
             timeout_tail="the slot identity grant is fail-closed",
         )
@@ -424,11 +472,23 @@ class C3AgentClient:
         self, node_id: str, verb: str, body: dict[str, Any]
     ) -> dict[str, Any]:
         target = self._target(node_id)
+        # D22: the file verbs go to face B's own endpoint. A shape that named
+        # none (compose without `E2B_C3_AGENT_MAINT_URL`) refuses by name here
+        # rather than dialling face A -- where every chown on NFS would come
+        # back EPERM, i.e. a failure that looks like a permission bug.
+        if not target.maint_url:
+            raise AgentClientError(
+                f"cannot determine the file-operation agent address for node "
+                f"{node_id} (E2B_C3_AGENT_MAINT_URL / E2B_C3_AGENT_MAINT_PORT): "
+                "refusing to instruct an agent the control plane cannot locate",
+                status_code=503,
+            )
         return await self._instruct(
             target,
             node_id,
             verb,
             body,
+            url=target.maint_url,
             refusal=f"refused the {verb}",
             timeout_tail=f"the {verb} instruction is fail-closed",
         )
@@ -472,16 +532,29 @@ class C3AgentClient:
         op: str,
         body: dict[str, Any],
         *,
+        url: str,
         refusal: str,
         timeout_tail: str,
     ) -> dict[str, Any]:
         if self._semaphore is not None:
             async with self._semaphore:
                 return await self._post(
-                    target, node_id, op, body, refusal=refusal, timeout_tail=timeout_tail
+                    target,
+                    node_id,
+                    op,
+                    body,
+                    url=url,
+                    refusal=refusal,
+                    timeout_tail=timeout_tail,
                 )
         return await self._post(
-            target, node_id, op, body, refusal=refusal, timeout_tail=timeout_tail
+            target,
+            node_id,
+            op,
+            body,
+            url=url,
+            refusal=refusal,
+            timeout_tail=timeout_tail,
         )
 
     async def _post(
@@ -491,13 +564,14 @@ class C3AgentClient:
         op: str,
         body: dict[str, Any],
         *,
+        url: str,
         refusal: str,
         timeout_tail: str,
     ) -> dict[str, Any]:
-        url = (
-            f"{target.url}/internal/nodes/{target.node_identity}"
-            f"/agent/{op}"
-        )
+        # The path identity is the agent's own (the host, D12) on *both* faces:
+        # face B is a different address (D22) for the same node, and its
+        # `E2B_C3_AGENT_NODE_ID` is the same name face A carries.
+        url = f"{url}/internal/nodes/{target.node_identity}/agent/{op}"
         deadline = self._deadline_for(op)
         try:
             async with httpx.AsyncClient(

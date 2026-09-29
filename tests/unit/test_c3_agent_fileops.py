@@ -566,9 +566,17 @@ async def test_the_real_agent_service_accepts_the_clients_instruction() -> None:
     runner = _StubMaintRunner()
     app = create_app(settings=_settings(), maint_runner=runner)
     client = C3AgentClient(
-        resolver=StaticAgentAddressResolver(
-            {WORKER: AgentTarget(node_identity=HOST, url="http://agent")}
-        ),
+            resolver=StaticAgentAddressResolver(
+                {
+                    WORKER: AgentTarget(
+                        node_identity=HOST,
+                        url="http://agent",
+                        # D22: the file verbs go to face B's own endpoint; in
+                        # this lane both faces are the same test service.
+                        maint_url="http://agent",
+                    )
+                }
+            ),
         token=TOKEN,
         timeout_s=2.0,
         file_op_timeout_s=2.0,

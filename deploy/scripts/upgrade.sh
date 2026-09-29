@@ -92,10 +92,12 @@ if [ -z "$ENV_FILE" ]; then
         INTERNAL_KEY="$(openssl rand -hex 24)"
         REDIS_PASSWORD="$(openssl rand -hex 24)"
         SECRET_MASTER_KEY="$(openssl rand -hex 32)"
+        C3_AGENT_TOKEN="$(openssl rand -hex 24)"
         sed -e "s|__E2B_API_KEYS__|$API_KEY|" \
             -e "s|__E2B_INTERNAL_API_KEY__|$INTERNAL_KEY|" \
             -e "s|__E2B_REDIS_PASSWORD__|$REDIS_PASSWORD|" \
             -e "s|__E2B_SECRET_MASTER_KEY__|$SECRET_MASTER_KEY|" \
+            -e "s|__C3_AGENT_TOKEN__|$C3_AGENT_TOKEN|" \
             -e "s|__ACR_USERNAME__|$ACR_USERNAME|" \
             -e "s|__ACR_PASSWORD__|$ACR_PASSWORD|" \
             "$STACK_DIR/.env.example" > "$STACK_DIR/.env"
@@ -233,7 +235,7 @@ if [ "$KEEP_IMAGE_TAGS" != "1" ] && [ -n "$ENV_FILE" ]; then
     REGISTRY_URL="$ACR_REGISTRY/$ACR_NAMESPACE"
     # A6: QUOTA_AGENT_IMAGE is pinned too (and added when the .env predates it)
     # so the quota-agent image the worker points at is pullable on the target.
-    for entry in "CONTROL_PLANE_IMAGE:e2b-sandlock-control-plane-gateway" "WORKER_IMAGE:e2b-sandlock-worker" "QUOTA_AGENT_IMAGE:e2b-sandlock-quota-agent"; do
+    for entry in "CONTROL_PLANE_IMAGE:e2b-sandlock-control-plane-gateway" "WORKER_IMAGE:e2b-sandlock-worker" "AGENT_IMAGE:e2b-sandlock-agent" "QUOTA_AGENT_IMAGE:e2b-sandlock-quota-agent"; do
         key="${entry%%:*}"
         suffix="${entry#*:}"
         set_env_file_value "$ENV_FILE" "$key" "$REGISTRY_URL/$suffix:$VERSION"

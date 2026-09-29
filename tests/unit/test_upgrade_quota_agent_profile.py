@@ -223,13 +223,19 @@ def test_require_pinned_quota_agent_image_accepts_a_pinned_tag(tmp_path: Path) -
 
 
 def test_remote_secret_carry_over_includes_the_agent_token() -> None:
-    """A blank local E2B_QUOTA_AGENT_TOKEN must not clobber the deployed one
-    (the agent refuses to start without auth, so the next upgrade would fail)."""
+    """A blank local token must not clobber the deployed one.
+
+    Two credentials, two reasons: `E2B_QUOTA_AGENT_TOKEN` (the quota agent
+    refuses to start without auth, so the next upgrade would fail) and
+    `E2B_C3_AGENT_TOKEN` (C3 Task 4 slice B -- the CP→agent channel's only
+    credential; a redeploy that blanked it would 401 every file operation and
+    every slot grant).
+    """
     result = _bash('printf "%s" "$PRESERVED_REMOTE_SECRET_KEYS"')
     assert result.returncode == 0
     assert result.stdout == (
         "E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_INTERNAL_API_KEYS "
         "E2B_IMAGE_REGISTRY_PASSWORD E2B_REDIS_PASSWORD E2B_SECRET_MASTER_KEY "
-        "E2B_SECRET_MASTER_KEYS E2B_QUOTA_AGENT_TOKEN"
+        "E2B_SECRET_MASTER_KEYS E2B_QUOTA_AGENT_TOKEN E2B_C3_AGENT_TOKEN"
     )
     assert "for key in $PRESERVED_REMOTE_SECRET_KEYS; do" in UPGRADE
