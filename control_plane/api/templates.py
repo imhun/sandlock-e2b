@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import tarfile
+import tempfile
 import uuid
 from contextlib import suppress
 from pathlib import Path
@@ -122,11 +123,46 @@ def _extract_build_context(build_dir: Path) -> Path:
     return ctx_dir
 
 
+def _docker_config_dir() -> Path:
+    """The directory ``buildctl`` reads its Docker config from.
+
+    Deliberately **not** ``docker/cli``'s default ``$HOME/.docker``. The
+    control plane runs as uid 65534, whose home in this image is
+    ``/nonexistent`` (Debian's ``nobody``), and buildctl's auth provider seeds
+    its token cache with ``MkdirAll(config.Dir())`` **once per registry host**.
+    Measured on k0s 2026-09-30: every configured ``docker.io`` mirror ended in
+    ``mkdir /nonexistent: permission denied``, so the whole mirror chain was
+    dead before a single request went out and the build only fell through to
+    the origin, which the cluster cannot reach (``dial tcp 74.86.228.110:443:
+    i/o timeout``) -- a template build that reads as "no mirror is configured"
+    and is actually "the mirror list never got a turn". ``DOCKER_CONFIG`` wins
+    when it is set: that is the documented override, and buildctl reads it
+    directly.
+    """
+    override = os.environ.get("DOCKER_CONFIG")
+    if override:
+        return Path(override)
+    return Path(tempfile.gettempdir()) / "e2b-docker-config"
+
+
+def _buildctl_env() -> dict[str, str]:
+    """The environment every ``buildctl`` subprocess runs with.
+
+    ``DOCKER_CONFIG`` is the whole point: buildctl and the credentials this
+    module writes for it have to agree on one directory, and it has to be one
+    this uid can create (see :func:`_docker_config_dir`).
+    """
+    env = dict(os.environ)
+    env["DOCKER_CONFIG"] = str(_docker_config_dir())
+    return env
+
+
 async def _run_buildctl(*args: str) -> tuple[int, str]:
     """Run the buildkit CLI, returning (exit code, combined output)."""
     proc = await asyncio.create_subprocess_exec(
         "buildctl",
         *args,
+        env=_buildctl_env(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
@@ -138,9 +174,10 @@ async def _run_buildctl(*args: str) -> tuple[int, str]:
 def _write_docker_config(settings: Any) -> None:
     """Write registry credentials for buildctl's push auth.
 
-    buildctl resolves registry credentials from the Docker config file
-    (~/.docker/config.json); the buildkit daemon itself has no credential
-    config. The password never appears on a command line.
+    buildctl resolves registry credentials from its Docker config file
+    (``$DOCKER_CONFIG/config.json``, see :func:`_docker_config_dir`); the
+    buildkit daemon itself has no credential config. The password never appears
+    on a command line.
     """
     username = settings.image_registry_username
     password = settings.image_registry_password
@@ -153,7 +190,7 @@ def _write_docker_config(settings: Any) -> None:
     host = registry.split("/")[0]
     auth = base64.b64encode(f"{username}:{password}".encode()).decode()
     config = {"auths": {host: {"auth": auth}}}
-    path = Path.home() / ".docker" / "config.json"
+    path = _docker_config_dir() / "config.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config), encoding="utf-8")
 
@@ -265,6 +302,7 @@ async def _run_build(
             f"dockerfile={ctx_dir}",
             "--output",
             output,
+            env=_buildctl_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )

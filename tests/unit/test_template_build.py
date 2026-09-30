@@ -80,7 +80,7 @@ async def _run_build(
     monkeypatch: pytest.MonkeyPatch,
     settings: Settings,
     workspace: Path,
-) -> tuple[list, SimpleNamespace, SimpleNamespace, SimpleNamespace]:
+) -> tuple[dict, SimpleNamespace, SimpleNamespace, SimpleNamespace]:
     captured: dict = {}
 
     async def fake_exec(*args, **kwargs):  # noqa: ANN002, ANN003
@@ -95,7 +95,7 @@ async def _run_build(
     await tmpl._run_build(
         app, template, build, "FROM python:3.11-slim\n", workspace
     )
-    return captured["args"], build, template, app
+    return captured, build, template, app
 
 
 @pytest.mark.asyncio
@@ -108,7 +108,8 @@ async def test_buildctl_builds_and_pushes_to_registry(
         image_registry_username="user",
         image_registry_password="pass",
     )
-    args, build, template, app = await _run_build(monkeypatch, settings, tmp_path)
+    captured, build, template, app = await _run_build(monkeypatch, settings, tmp_path)
+    args = captured["args"]
 
     assert args[0] == "buildctl"
     assert "--addr" in args
@@ -135,7 +136,8 @@ async def test_buildctl_builds_without_registry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     settings = Settings(api_keys=("k",), image_registry="")
-    args, build, template, app = await _run_build(monkeypatch, settings, tmp_path)
+    captured, build, template, app = await _run_build(monkeypatch, settings, tmp_path)
+    args = captured["args"]
 
     output = args[args.index("--output") + 1]
     # Without a registry there is nothing to push to: buildkit exports an OCI
@@ -151,8 +153,8 @@ async def test_buildctl_builds_without_registry(
 
 
 def test_write_docker_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """buildctl resolves push credentials from ~/.docker/config.json."""
-    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    """buildctl resolves push credentials from $DOCKER_CONFIG/config.json."""
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "cfg"))
     settings = Settings(
         api_keys=("k",),
         image_registry="registry.cn-shanghai.aliyuncs.com/byteplan",
@@ -164,7 +166,7 @@ def test_write_docker_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     import base64
 
     config = json.loads(
-        (tmp_path / ".docker" / "config.json").read_text(encoding="utf-8")
+        (tmp_path / "cfg" / "config.json").read_text(encoding="utf-8")
     )
     auth = config["auths"]["registry.cn-shanghai.aliyuncs.com"]["auth"]
     assert base64.b64decode(auth).decode() == "user:pass"
@@ -173,10 +175,54 @@ def test_write_docker_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
 def test_write_docker_config_skips_without_creds(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "cfg"))
     settings = Settings(api_keys=("k",), image_registry="reg.example.com/e2b")
     tmpl._write_docker_config(settings)
-    assert not (tmp_path / ".docker" / "config.json").exists()
+    assert not (tmp_path / "cfg" / "config.json").exists()
+
+
+def test_docker_config_dir_never_needs_a_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pin for the k0s mirror outage (2026-09-30).
+
+    The control plane runs as uid 65534, whose home in this image is
+    ``/nonexistent`` (Debian's ``nobody``). buildctl's auth provider seeds its
+    token cache with ``MkdirAll(config.Dir())`` once per registry host, so the
+    default ``$HOME/.docker`` turned *both* configured ``docker.io`` mirrors
+    into ``mkdir /nonexistent: permission denied`` -- the mirror chain was dead
+    before a request went out, and the build then failed on the origin
+    timeout. The fallback must therefore not be derived from HOME.
+    """
+    monkeypatch.delenv("DOCKER_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", "/nonexistent")
+    monkeypatch.setattr(tmpl.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+
+    assert tmpl._docker_config_dir() == tmp_path / "tmp" / "e2b-docker-config"
+
+
+@pytest.mark.asyncio
+async def test_buildctl_build_is_handed_the_docker_config_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The directory buildctl reads has to be handed to it, not inherited.
+
+    ``docker/cli`` only consults ``DOCKER_CONFIG``; if the subprocess is left
+    with the container's own environment it falls back to ``$HOME/.docker``,
+    which is ``/nonexistent/.docker`` here and cannot be created.
+    """
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("DOCKER_CONFIG", str(cfg))
+    monkeypatch.setenv("HOME", "/nonexistent")
+    settings = Settings(api_keys=("k",), image_registry="")
+
+    captured, _build, _template, _app = await _run_build(
+        monkeypatch, settings, tmp_path
+    )
+
+    env = captured["kwargs"]["env"]
+    assert env["DOCKER_CONFIG"] == str(cfg)
+    assert env["HOME"] == "/nonexistent"
 
 
 def test_mark_file_uploaded_clears_token_idempotently():

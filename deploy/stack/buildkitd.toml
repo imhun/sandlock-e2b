@@ -17,6 +17,12 @@
 
 [registry."docker.io"]
   mirrors = ["https://docker.m.daocloud.io", "https://docker.1ms.run"]
+  # The mirrors only get a turn if the *client* can write its Docker config:
+  # `buildctl` seeds that cache with MkdirAll($DOCKER_CONFIG) once per host, and
+  # the control plane's uid 65534 has no writable $HOME. See `_docker_config_dir()`
+  # in `control_plane/api/templates.py` -- without it both mirrors die with
+  # `mkdir /nonexistent: permission denied` before a single request goes out
+  # (measured on k0s 2026-09-30).
 
 [registry."docker.m.daocloud.io"]
   http = false
