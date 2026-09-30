@@ -165,21 +165,19 @@ spec:
             # helpers/broker may touch. It used to be covered *by accident*
             # (the workspace base was the export root); now that the tree root
             # sinks under it, `_volumes` and `_images` would fall outside the
-            # whitelist unless this is set -- and `_chown_path()` falls back to
-            # an in-process `os.chown` for a path the brokers do not cover,
-            # which this pod's 65534 worker cannot do (EPERM, silent per-volume
-            # degradation). C1 (wave 2) made that the live shape: the worker is
-            # no longer root and its file steps are performed elsewhere (C1: the
-            # broker over `socket`; C3 Task 4 slice B: the agent, over the CP's
-            # `agent` shape), so the privileged side's whitelist is what decides
-            # whether a chown can happen at all. (Before C1 this line changed nothing on this cluster -- a
-            # root worker resolves no brokers, `resolve_priv_helpers()` returns
-            # None on euid 0, so `helpers_cover()` stayed False and the
-            # in-process path was used.) The two readers that do care are the A5
-            # startup probe (warning only) and
-            # `build_volume_mounts`' "volume hostPath must be under the shared
-            # root" check -- the CP derives every volume path from the same
-            # export root, so it holds by construction.
+            # set of roots the privileged side acts on unless this is set --
+            # and `_chown_path()` falls back to an in-process `os.chown` for a
+            # path nobody else can reach, which this pod's 65534 worker cannot
+            # do (EPERM, silent per-volume degradation). C1 (wave 2) made that
+            # the live shape: the worker is no longer root and its file steps
+            # are performed elsewhere (C1: the broker over `socket`, retired by
+            # C3 Task 7; C3 Task 4 slice B onward: the per-node agent, over the
+            # CP's `agent` shape), so the roots the agent is willing to act
+            # under are what decide whether a chown can happen at all. The two
+            # readers that care on this side are the A5 startup probe (warning
+            # only) and `build_volume_mounts`' "volume hostPath must be under
+            # the shared root" check -- the CP derives every volume path from
+            # the same export root, so it holds by construction.
             - name: E2B_SHARED_VOLUME_ROOT
               value: /var/lib/e2b-sandboxes
             # Track Z / Z-F7: the extracted image rootfs cache goes on the same
