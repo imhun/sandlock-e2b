@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """C1 broker 的**授权面**探针：确认它对"哪一个沙箱"没有任何概念。
 
-RUNNABLE=no（2026-09-29，C3 Task 7）：本探针的三个 phase 都要进
-``e2b-priv-broker`` pod，而那个 DaemonSet 已随 C1 的 socket 形态一起退役
+RUNNABLE=no（2026-09-29，C3 Task 7；2026-09-30 的 N52 更进一步）：本探针的三个
+phase 都要进 ``e2b-priv-broker`` pod，而那个 DaemonSet 已随 C1 的 socket 形态一起退役
 （它的"worker 侧越权尝试"还要求 worker 跑 `E2B_PRIV_HELPER_TRANSPORT=socket`，
-那个代码路径也删了）。**留着它是作为 N47 的现场证据，不是待跑的东西** ——
+那个代码路径也删了），**N52 之后连 worker 侧的 `priv_helpers` 客户端半（
+`active_helpers`/`broker_reclaim`）都删了 —— 所以这个文件按现在的代码跑连 import
+都过不去**。**留着它是作为 N47 的现场证据，不是待跑的东西** ——
 想复现这条链要在 C1 的镜像/清单上跑（git 历史里的 `deploy/k8s/priv-broker.yaml`）。
 
 问题（docs/c3-privilege-relocation.md §14.3）：

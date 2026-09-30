@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.21（2026-09-30，① 第一步：exec/socket 传输具名拒绝，当前版本 `0.1.0-816-g1c85e7c-20260930-213813`）**；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，当前版本 `0.1.0-814-gf8d1685-20260930-210628`）**；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，当前版本 `0.1.0-811-g071beb4-20260930-202337`）**；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.22（2026-09-30，① 第二步：删掉 worker 侧 file-capability 形态的残留，当前版本 `0.1.0-818-g7205fba-20260930-221244`）**；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1069,6 +1069,29 @@ pre-C3 的 root/no-agent 形态不再被支持 —— `route_b._spawn_slot` 与 
 **集群验收**：`deployment_smoke.py` ⇒ `DEPLOYMENT SMOKE OK`；`kubectl diff` **0 行**；`control-plane` 2/2、`e2b-worker` 2/2；worker 日志无 spawn/默认值告警。仓库侧 `tests/unit` 与基线逐条对比无新增失败。
 
 **仍未做（① 第二步）**：`PrivHelpers` 类及其 argv 构造、capability 解码/校验、`resolve_priv_helpers`/`_build_helpers`/`broker_*`/`helpers_cover` 等约 700 行现在是**不可达代码**，`E2B_PRIV_HELPERS` 旋钮与 4 份清单里的声明成了空转 —— 删它们 + 车道 phase 2 与约 20 条用例收尾。
+
+### 7.22 ① 第二步：删掉 worker 侧 file-capability 形态的残留（**2026-09-30，已上线 `0.1.0-818-g7205fba-20260930-221244`**）
+
+提交 `7205fba`。承接 §7.21 的行为面收口，这一步是**纯删死代码 + 清开关/清单声明**（无行为变化）：
+
+* `envd_service/priv_helpers.py` **1314 → 343 行**：`PrivHelpers` 类、argv 构造、file-capability 解码/校验、`resolve_priv_helpers`/`_build_helpers`/`_require_*`/`broker_*`/`helpers_cover`/`active_helpers` 全删。留下的是形态开关（`_transport_setting`/`RETIRED_TRANSPORTS`）、`PrivHelperError`、`WalkEntry`、`request_identity`、`remove_tree`/`dir_size`（worker 自己的进程内实现）、`helpers_unavailable_reason`、`file_steps_available`、`check_worker_identity_outside_pool`、`WORKSPACE_MODE`。
+* 8 个调用点收敛：非 root 且无 agent 的 worker 从"走 broker"改成**具名拒绝**（secret 交接、checkpoint 交接），其余是 root 自己的 `os.chown`；`provision_sandbox_volume_mount` 的三分支合成 chmod → agent/root 两分支。
+* `E2B_PRIV_HELPERS` 旋钮连同 4 处清单声明一起删除（`config.py` 字段、k8s worker、stack compose、demo compose 的 `off` 声明）。
+* 车道：`Dockerfile.test-runner` 不再构建 `e2b-maint`（它只存在于 agent 镜像）；`test-prod-shaped.sh` phase 2 由"uid 65534 + 四个 cap + brokers"改为"uid 65534、空 BND"的 E5.1 形态，并移除以 broker 为前提的 route-B 契约。
+
+**集群验收（`0.1.0-818`）**
+
+| 判据 | 读数 |
+|---|---|
+| worker 里没有任何本地特权件 | `exec e2b-worker-0 -- ls /var/lib/e2b-priv` ⇒ `No such file or directory`；StatefulSet 的 env 里 `E2B_PRIV_HELPERS` **0 处**（只剩 `E2B_PRIV_HELPER_TRANSPORT`） |
+| agent 那侧照旧 | `exec <agent> -c maint -- getcap /var/lib/e2b-priv/e2b-maint /var/lib/e2b-priv/as_uid` ⇒ `cap_chown,cap_dac_override=ep` / `cap_setgid,cap_setuid=ep` |
+| 退役传输在**线上**具名拒绝 | `E2B_PRIV_HELPER_TRANSPORT=exec python3 -c "…_transport_setting()"` 在 worker pod 里 ⇒ `REFUSED: E2B_PRIV_HELPER_TRANSPORT='exec' is retired (2026-09-30, open-issues N52) …` |
+| 未回归 | `MULTI-NODE SMOKE OK`（两 worker 各 2 沙箱、commands/files/health/stdin、kill 后预约 0）+ `DEPLOYMENT SMOKE OK`（含跨节点迁移保文件、远端卷隔离、模板构建→registry→worker→rootfs、MCP 网关） |
+| 仓库规格 ≡ 线上 | `DRY_RUN=1 apply.sh \| kubectl diff -f -` **0 行** |
+| 终态 | `control-plane` 2/2、`e2b-worker` 2/2、`e2b-c3-agent` 2/2、`redis` 1/1、`seccomp-installer` 就绪 |
+| 仓库侧测试 | `tests/unit` 2087 passed / 3 failed、`tests/contract` 378 passed / 3 failed —— 与改动前 HEAD 基线**逐条相同**（macOS 上的 `test_real_root_gate` dlopen 与两条 xfs_quotactl）；全量 2667 条 collection 干净 |
+
+**形态收敛后的"没有的东西"（点名）**：worker 侧 `exec` transport、两个 file-capability 二进制、`E2B_PRIV_HELPERS` 旋钮、`PrivHelpers` 这一整套 —— 都只在 git 历史里（需要时整批 revert）。今天 worker 的三条文件步骤路径只剩：**agent**（出厂形态）、**root**（worker 自己是 root 时）、以及**进程内 E5.1**（两者都没有，能力与隔离都降级并打一条 WARNING）。
 
 ## 8. 改部署的入口
 

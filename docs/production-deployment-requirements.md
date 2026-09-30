@@ -132,20 +132,23 @@ F1 探针当时判"userns 需要 `CAP_SYS_ADMIN`"，那是在**本机 OrbStack �
 | `e2b-maint` | `cap_chown,cap_dac_override+ep` | `chown --uid X [--gid G] [--recursive] --path P`、`chown --worker …`、`rm --path P`、`walk --path P`。P 必须经 `realpath` 落在**四根**之一之下：`E2B_WORKSPACE_BASE`、`E2B_STATE_BASE`（N27，平台自己的记录/日志/checkpoint/`.route-b` 在这）、`E2B_SHARED_VOLUME_ROOT`（导出根，`_volumes`/`_images` 在这）、`E2B_IMAGE_CACHE_DIR`（**仅当显式非空**，沙箱 secret 文件 `<image_cache_dir>/secrets/<id>/` 在那）；`..`/符号链接逃逸一律拒绝；`rm`/`chown` 还必须**严格在**根之下（不接受根本身）。 |
 
 两者共用一份校验模块（`c3_agent/priv/priv_common.c`）：uid 池范围、根白名单、参数
-形状各只有一处实现，避免「其中一份忘了检查」。**broker 的职责分工（c1 之后）**：
-route-B 的 `RouteBConfig.spawner` 指向 `e2b-slot-spawn`（唯一的"以池内 uid 起进程"原语）；
-`chown` 由 `e2b-maint` 保留（worker 是 `0770` 的**属组**而不是属主，自己 chown 不了）；
-`rm`/`walk` 只在 worker 自己的组访问够不到时兜底 —— 沙箱自建的 `0700` 子目录、
+形状各只有一处实现，避免「其中一份忘了检查」。**（2026-09-30，N52）**：这两个二进制
+**只在 agent 镜像里**，且 `e2b-slot-spawn` 已不再被任何东西启动 —— 槽位身份由 agent
+写 `uid_map` 授予（`E2B_SLOT_IDENTITY=agent-grant`，唯一取值）。worker 侧再也没有
+`spawner`、没有 `exec` transport、没有 `E2B_PRIV_HELPERS` 旋钮；**职责分工（c1 之后，
+现由 agent 承担）**：`chown` 由 `e2b-maint` 执行（worker 是 `0770` 的**属组**而不是属主，
+自己 chown 不了）；`rm`/`walk` 同样在 agent 那侧 —— 沙箱自建的 `0700` 子目录、
 `1777` 卷根、以及升级前遗留的 root 属主目录；日常数据面（files API、watcher、
-命令日志、快照、删除租户树）都是 worker 进程内的普通 I/O，不再经过 broker
-（`envd_service/priv_helpers.py`：`remove_tree`/`dir_size` 都是「先自己来、EACCES 才找 broker」）；
-`E2B_PRIV_HELPERS=auto|off` 是开关，启动自检验证「存在 + cap 正确 + 沙箱不可达 +
-路径正确」，半安装的 broker 对一律 fail closed 并点名。非 root 形态的
-`E2B_ROUTE_B_TMP_ROOT` 必须在白名单根之下（compose 设 `/var/lib/e2b-sandboxes/.route-b`；
+命令日志、快照、删除租户树）都是 worker 进程内的普通 I/O，不经过任何特权件
+（`envd_service/priv_helpers.py`：`remove_tree`/`dir_size` 都是 worker 自己的实现）。
+worker 的 `E2B_PRIV_HELPER_TRANSPORT` 只认 `auto|agent`（两者同义：文件步骤交给
+每节点 agent），`exec`/`socket` 是启动期**具名拒绝**；没有 agent 又不是 root 的 worker
+保持进程内 E5.1 形态并打一条 WARNING。非 root 形态的
+`E2B_ROUTE_B_TMP_ROOT` 必须在 agent 可作用的根之下（compose 设 `/var/lib/e2b-sandboxes/.route-b`；
 k8s 设 `deploy/k8s/worker.yaml` 里的 `/var/lib/e2b-sandboxes/state/.route-b`，N27 把它挪进了 state base）：
-槽位 policy/program 文档靠 `e2b-maint` 归到该槽位 uid（`0440`，
+槽位 policy/program 文档靠 agent 归到该槽位 uid（`0440`，
 owner=worker 以便 W1 重启重写），否则会退化成 world-readable（策略文档带 egress
-proxy 凭据），自检会按名字拒绝。**root worker 形态保持现状**（root 自己有这些
+proxy 凭据）。**root worker 形态保持现状**（root 自己有这些
 能力，route-B 继续用 `setpriv` 起槽位）。
 
 **为什么 worker 需要访问工作区（数据面所有者）**：files API、watcher、命令日志写入、
@@ -206,7 +209,7 @@ follow-up（一句，仍未做）：若将来出现"worker 必须**读成功**�
 
 | 项 | 说明 |
 |---|---|
-| 权限 | 分三层，**照抄会多给特权**（2026-09-10 实测，逐项见 §2.4.1）：**沙箱侧最小集 = `CAP_SETUID`+`CAP_SETGID`+`CAP_CHOWN`**；`CAP_DAC_OVERRIDE` 是**管理面**兜底需要（升级前遗留的 root 属主树、`1777` 卷根；c1 之后租户树是 `0770`、worker 走属组，日常数据面不再需要它）；`CAP_SYS_ADMIN` **在出厂镜像与清单形态下 worker 已不需要**（共享卷 bind 由 A4 删除、配额改由 quota-agent 提供、低端口 sysctl 由容器 spec 声明；代码里仍有两条非部署默认的路径需要它，见 §2.4.1 的限定），也**不是 E3.2 / route B 的前置**；`CAP_SYS_PTRACE` 只在走进程内 `RunAs` 时才需要。非 root worker 装了 F1 的两个 file-capability broker（出厂镜像都装）就同样建 uid 池并走 route B —— 非 root 现在是**目标形态**；只有**没有** broker 时才自动关闭 uid 池并保持「固定身份 + Landlock」（E5.1）、启动打一条 WARNING。**C1（2026-09-27）之后 k8s 基线就是这个非 root 形态**，**C3（Task 3 + Task 4 片 B）后 worker 显式 pin `runAsUser: 65534`/`runAsGroup: 65534`**（CP 的可信来源读的就是 pod spec；只靠镜像 `USER` 会被读成"未知"⇒ 不记身份、文件 op 具名 503），且**文件操作与槽位身份都由每节点一个 agent 代做**（`E2B_PRIV_HELPER_TRANSPORT=agent`、`E2B_SLOT_IDENTITY=agent-grant`，见 §5.4(b)）：worker 镜像**不再含** `/var/lib/e2b-priv/`，worker 的 BND 因此是**空集**；C1 的 `e2b-priv-broker` DaemonSet 曾保留到 Task 7 并改跑 **agent 镜像**（`e2b-maint` 只在那儿），**C3 Task 7 已把它退役**。**历史（已作废）**：2026-09-25 那轮审计写的是"线上实际是 root"（worker 自己 `runAsUser: 0` 读 NFS 上的树），那条口径已经被 C1 取代。 |
+| 权限 | 分三层，**照抄会多给特权**（2026-09-10 实测，逐项见 §2.4.1）：**沙箱侧最小集 = `CAP_SETUID`+`CAP_SETGID`+`CAP_CHOWN`**；`CAP_DAC_OVERRIDE` 是**管理面**兜底需要（升级前遗留的 root 属主树、`1777` 卷根；c1 之后租户树是 `0770`、worker 走属组，日常数据面不再需要它）；`CAP_SYS_ADMIN` **在出厂镜像与清单形态下 worker 已不需要**（共享卷 bind 由 A4 删除、配额改由 quota-agent 提供、低端口 sysctl 由容器 spec 声明；代码里仍有两条非部署默认的路径需要它，见 §2.4.1 的限定），也**不是 E3.2 / route B 的前置**；`CAP_SYS_PTRACE` 只在走进程内 `RunAs` 时才需要。非 root worker 现在靠**每节点 agent**（`E2B_PRIV_HELPER_TRANSPORT=agent`）建 uid 池并走 route B —— 非 root 是**目标形态**；F1 的两个 file-capability broker 与 `E2B_PRIV_HELPERS` 旋钮已在 N52（2026-09-30）删除。既不是 root、也没有 agent 的 worker 才自动关闭 uid 池并保持「固定身份 + Landlock」（E5.1）、启动打一条 WARNING。**C1（2026-09-27）之后 k8s 基线就是这个非 root 形态**，**C3（Task 3 + Task 4 片 B）后 worker 显式 pin `runAsUser: 65534`/`runAsGroup: 65534`**（CP 的可信来源读的就是 pod spec；只靠镜像 `USER` 会被读成"未知"⇒ 不记身份、文件 op 具名 503），且**文件操作与槽位身份都由每节点一个 agent 代做**（`E2B_PRIV_HELPER_TRANSPORT=agent`、`E2B_SLOT_IDENTITY=agent-grant`，见 §5.4(b)）：worker 镜像**不再含** `/var/lib/e2b-priv/`，worker 的 BND 因此是**空集**；C1 的 `e2b-priv-broker` DaemonSet 曾保留到 Task 7 并改跑 **agent 镜像**（`e2b-maint` 只在那儿），**C3 Task 7 已把它退役**。**历史（已作废）**：2026-09-25 那轮审计写的是"线上实际是 root"（worker 自己 `runAsUser: 0` 读 NFS 上的树），那条口径已经被 C1 取代。 |
 | 容量 | 并发沙箱数受 `E2B_UID_POOL_SIZE` 约束（默认 1000，起始 `E2B_UID_POOL_START=10000`）；池满即建箱失败。多 worker 共用同一 workspace 时必须配**互不重叠**的段。 |
 | 进程/内存 | chroot 形态每沙箱多一棵 supervise 进程树（supervise + sandlock-init + 停车 M0）。它在沙箱 cgroup **之外**，不计入 `max_memory`/`max_disk`，并在 `max_processes` 里占 1；容量表按「N 沙箱 = N 额外进程」重算。 |
 | 回收 | route-B 代次的结束由 envd 生命周期（TTL/idle eviction/删除 → `executor.close()`）决定，不再依赖 core 的 15 min idle；槽位进程退出前该 uid 不会被再次租出（W1）。 |

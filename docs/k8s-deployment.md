@@ -2807,9 +2807,10 @@ kubectl -n sandlock exec e2b-worker-0 -c worker -- sh -c '
 root 读 uid 65534 的文件本来就有权限。这与 §23 的 N27 迁移不同（那是 `rename` 数据，必须按 journal 反向改名）。
 卷上不会留下"看不懂的半成品"：七个目标目录的属主就是那次迁移的全部状态。
 
-> **⚠ C3 Task 7 之后，回退必须整批 revert（清单 + 镜像），不能再靠翻开关：**
+> **⚠ N52（2026-09-30）之后，三种旧形态都只剩"整批 revert（清单 + 镜像）"这一条路：**
 > C1 时代的回退姿势是"把 worker 切回 `E2B_PRIV_HELPER_TRANSPORT=socket`（broker 还在服务）或
-> `exec`（镜像里还有 file-capability 二进制）"。**两条都不存在了** —— `socket` 已被代码具名拒绝，
+> `exec`（镜像里还有 file-capability 二进制）"。**现在连 `exec` 也被启动自检具名拒绝** ——
+> `E2B_PRIV_HELPER_TRANSPORT` 只接受 `auto|agent`，`exec`/`socket` 进 `RETIRED_TRANSPORTS`；
 > 二进制也早已不在 worker 镜像里。**`E2B_SLOT_IDENTITY=spawn` 这把也不是"原地可切"**：它要的
 > `e2b-slot-spawn` 同样是被移出 worker 镜像的那个 file-capability 二进制（`helpers.slot_spawner`），
 > 没有它 `privileged_starter` 为假、route B 直接不可用 —— 与 `socket` 那把一样，**得配含

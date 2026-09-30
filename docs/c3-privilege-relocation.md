@@ -439,7 +439,7 @@ C3 之后 worker 不再有权扫盘/回收，必须三选一：
 
 | 选项 | 做法 | 代价 |
 |---|---|---|
-| **(a) 声明不支持** | C3 只覆盖**分离形态**（k8s + 分离 compose 栈）；`local://` 保留今天的形态 | 本地开发/smoke 与生产形态分叉；要在 lane 清单里点名。**Task 4 片 B 按 D23 把这条扩成"按名字排除"**：除 `local://` 外，autoscaler 的 docker pool（`deploy/compose/docker-compose.autoscale.yml` + `autoscaler/backends/local.py`）与单机示例（`deploy/compose/docker-compose.yml`）同样排除——两者在各自清单里显式写 `E2B_PRIV_HELPERS=off`（"没有文件操作能力"），因为它们也靠过 worker 镜像里的 file-capability 二进制，而 worker 镜像已不含它们 |
+| **(a) 声明不支持** | C3 只覆盖**分离形态**（k8s + 分离 compose 栈）；`local://` 保留今天的形态 | 本地开发/smoke 与生产形态分叉；要在 lane 清单里点名。**Task 4 片 B 按 D23 把这条扩成"按名字排除"**：除 `local://` 外，autoscaler 的 docker pool（`deploy/compose/docker-compose.autoscale.yml` + `autoscaler/backends/local.py`）与单机示例（`deploy/compose/docker-compose.yml`）同样排除——两者也靠过 worker 镜像里的 file-capability 二进制，而 worker 镜像已不含它们。**N52（2026-09-30）之后连"声明"都没有开关可写了**：`E2B_PRIV_HELPERS` 旋钮已删，这两个形状的"没有文件操作能力"由**不声明任何特权文件操作 key** + 清单里的说明性注释来表达（钉子在 `tests/unit/test_c3_agent_manifest.py::test_the_shapes_excluded_from_c3_declare_that_they_have_no_file_ops`） |
 | (b) 也在 local 里"走一遍 C3" | 同进程内走同一条"以 X"路径 | **等于自己给自己发指令，审计价值为零**（同一进程既是决策者又是执行者） |
 | (c) 让 local lane 消失 | 本地开发改起一个分离小栈 | compose 已经在这么做；但会动开发流程 |
 
@@ -1805,25 +1805,26 @@ agent 的白名单（复用 `priv_common.c` 的 `realpath` + 四根）只有在*
 「**哪个节点，在什么时候，请求了对哪个沙箱的什么动作；CP 依据哪条记录批准了；agent 实际做了
 哪一次系统调用**」。这是这个形状相对 C1/C2 最实在的好处，也是它值得写实施计划的原因。
 
-### 14.8 C3 的回退面（**C3 Task 7 之后**）
+### 14.8 C3 的回退面（**C3 Task 7 之后；N52 收尾之后**）
 
 Task 7 之前，C3 的回退故事有一条"两条路并存"的便利：新树由 worker 建成，**老代码（C1 的 broker）仍能
 `chown` 接管**，所以盘上的树在 C1 与 C3 之间是**双向可读**的（计划文件
 `docs/superpowers/plans/2026-09-28-c3-privilege-consolidation.md` 的「回退」段就是按这个写的）。
 **Task 7 拆掉了那座桥**（broker DaemonSet + `E2B_PRIV_HELPER_SOCKET` + worker 的 `wait-for-broker`
-闸门全部退役，`E2B_PRIV_HELPER_TRANSPORT=socket` 变成启动期具名拒绝），所以现在要说清楚**回退面剩什么**：
+闸门全部退役，`E2B_PRIV_HELPER_TRANSPORT=socket` 变成启动期具名拒绝），**N52（2026-09-30）又把
+剩下两条也收干净**（`exec` 同样具名拒绝、worker 侧的 `PrivHelpers`/`E2B_PRIV_HELPERS`/两个
+file-capability 二进制整段删除），所以现在要说清楚**回退面剩什么**：
 
 | 想退回到 | 怎么退 | 代价 |
 |---|---|---|
-| **Task 2 的"槽位身份不走 agent"**（`E2B_SLOT_IDENTITY=spawn`） | 改 env，**并且必须回到含 file-capability 二进制的 worker 镜像** | `spawn` 要的 `helpers.slot_spawner`（`envd_service/route_b.py`）就是 Task 4 从 worker 镜像移走的 `e2b-slot-spawn`。没有它 `privileged_starter` 为假、route B **直接不可用**（`envd_service/executors/sandlock.py`），**不是** C3 之前的行为 ⇒ 只改 env 是**半安装**，要退就得**清单 + 镜像同批**退（和 `socket` 那把杠杆一样） |
-| **Task 4 的"文件操作不走 agent"**（`E2B_PRIV_HELPER_TRANSPORT=exec`） | 改 env，**并且必须回到含 file-capability 二进制的 worker 镜像** | 出厂镜像里已经没有 `/var/lib/e2b-priv/` ⇒ 只改 env 是**半安装**（启动自检具名拒绝，不是静默降级）。要退就得**清单 + 镜像同批**退 |
+| **Task 2 的"槽位身份不走 agent"**（`E2B_SLOT_IDENTITY=spawn`） | **只能整批 revert（清单 + 镜像）** | `spawn` 现在是 `RouteBConfig`/`from_settings` 双双按名字拒绝的取值；它要的 `e2b-slot-spawn` 也早已不在 worker 镜像里（N52 连它的 Python 侧 `helpers.slot_spawner` 都删了）。要退就得退到含那个二进制与 `_spawn_slot` 的版本 |
+| **Task 4 的"文件操作不走 agent"**（`E2B_PRIV_HELPER_TRANSPORT=exec`） | **只能整批 revert（清单 + 镜像）** | N52 起 `exec` 不再是可取值（`TRANSPORTS` 只剩 `auto`/`agent`），启动自检具名拒绝；worker 侧的 broker 实现与 `E2B_PRIV_HELPERS` 旋钮已删，出厂镜像也没有 `/var/lib/e2b-priv/` |
 | **C1 的"节点 broker 做特权动作"**（`E2B_PRIV_HELPER_TRANSPORT=socket`） | **不再是原地可切的开关** | 代码路径已删（`TRANSPORTS` 不含 `socket`），DaemonSet 清单也删了。要退回这个形状只能**整批 revert 到 C1 那一版**（清单 + 镜像 + 那个 DaemonSet） |
 
-⇒ **一句话**：C3 的两个 env 开关 —— `E2B_SLOT_IDENTITY`（`spawn`）与
-`E2B_PRIV_HELPER_TRANSPORT`（`exec`）—— **都只在"含 file-capability 二进制的 worker 镜像"上才
-有效**，而出厂镜像已经把那些二进制移走了，所以两者都不是"翻一个 env 就回到从前"的杠杆，都得
-**清单 + 镜像同批**退。再往前的形状（root worker / C1 broker）更是"整批 revert 镜像 + 清单"。
-盘上的数据不受影响：树仍是
+⇒ **一句话**：C3 留下的两个"形态开关"（`E2B_SLOT_IDENTITY`、`E2B_PRIV_HELPER_TRANSPORT`）
+现在都只接受**出厂那一种形态**（`agent-grant` / `auto|agent`），三个旧形态（`spawn`、`exec`、
+`socket`）全部是**具名拒绝**而不是可切值 —— 它们都**只能整批 revert（清单 + 镜像）**，且都要把
+已经删掉的 file-capability 二进制一起带回来。盘上的数据不受影响：树仍是
 `0770 owner=<池 uid> group=<worker gid>`，**任何 root 进程都能接管它**（这正是 §5.4(b) 那条 NFS
 语义的另一面）——所以整批 revert 不会丢数据。运维口径与 `docs/k8s-deployment.md` §24.2 的回退节逐字一致。
 
