@@ -3512,5 +3512,32 @@ compose 车道同代码、同镜像、同 65534、`$HOME/.docker` 同样不可�
 两个面分别被调用 6 次 / 46 次。日志 `tmp/build-and-push-priv2.log`、`tmp/apply-priv.log`、
 `tmp/deployment-smoke-priv.log`、`tmp/multinode-priv.log`。
 
-**剩下的尾巴**：`quota_agent/` 仍是同型（自带镜像的服务），按同一口径也该搬；要搬说一声。
+**剩下的尾巴**：`deploy/quota_agent/` 仍是同型（自带镜像的服务），按同一口径也该搬 —— 下一条就做了。
 `docs/reports/**` 与 `.superpowers/sdd/task-*-report.md` 里的旧路径是当时的证据，未回改。
+
+## 2026-09-30 quota-agent 也搬到顶层，`deploy/` 从此不含 Python 包
+
+**起因**：上一条留的尾巴被用户点头（"也搬吧"）。
+
+**改动**（提交 `3a0ed5b`）：
+
+- `git mv deploy/quota_agent quota_agent`（4 个文件），`deploy.quota_agent` → `quota_agent`，
+  `Dockerfile.quota-agent` 的 `CMD ["python","-m","quota_agent"]`；
+- `Dockerfile.quota-agent` 原来是 `COPY deploy/ deploy/`（为一个包把整棵清单/脚本树拖进镜像）→
+  `COPY quota_agent/ quota_agent/`。实测镜像 `/app` = `quota_agent/ gateway_common/ envd_service/
+  requirements.txt`，`find_spec("deploy") is None`；
+- **删掉 `deploy/__init__.py`**：它只为 `deploy.quota_agent` 存在（docstring 里就写着），搬走后全仓
+  已无 `import deploy.*`（`-m deploy.scripts` 之类也一处都没有）⇒ `deploy/` 不再是 Python 包；
+- 两处逐字钉子同步改：`test_upgrade_quota_agent_profile.py`（helpers.sh 的报错文案）、
+  `test_worker_manifest_permissions.py`（k8s-deployment.md 的 token 表）；另有
+  `envd_service/quota_agent.py`、`c3_agent/config.py` 的"同形先例"引用与 5 份活文档改路径。
+
+**上线**：版本 `0.1.0-798-g3a0ed5b-20260930-141013`（照例补推四个 `--load` 镜像 + manifest 核对）→
+`apply.sh` **只 pin 8 处**：k8s 车道本来就不部署 quota-agent
+（`docs/production-deployment-requirements.md` §2.4.4 W4），那枚 tag 是给 compose/服务器侧用的。
+两个冒烟都绿：`tmp/deployment-smoke-quota.log`、`tmp/multinode-quota.log`、`tmp/apply-quota.log`、
+`tmp/build-and-push-quota.log`。测试：quota-agent + 钉子类 195 passed；全量 1934 passed（同数）。
+
+**收尾状态**：`deploy/` = `compose/ docker/ k8s/ k8s-k0s/ scripts/ seccomp/ stack/`（无 Python 包、
+无可被 import 的代码）；顶层服务目录 = `control_plane/ c3_agent/`（含 `priv/`）`quota_agent/
+autoscaler/ envd_service/ gateway_common/`。

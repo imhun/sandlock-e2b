@@ -130,7 +130,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.15（2026-09-30，`priv` 的 C 源码跟进搬到 `c3_agent/priv/`）**；§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.16（2026-09-30，quota-agent 搬到顶层 `quota_agent/`，`deploy/` 从此不含任何 Python 包）**；§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -906,6 +906,35 @@ worker/autoscaler/agent/quota-agent 四个 tag + `docker manifest inspect` 核�
 判据：`deployment_smoke` → **`DEPLOYMENT SMOKE OK`**、`multinode_smoke` → **`MULTI-NODE SMOKE OK`**；
 两个面这两轮分别被调用了 6 次（`POST /agent/grant-slot`）与 46 次（`POST /agent/{chown,rm,walk}`），
 即搬走的 C 在线上确实还在跑。
+
+### 7.16 quota-agent 搬到顶层 `quota_agent/`（**2026-09-30，已上线**）
+
+§7.14/§7.15 那条口径的最后一块：`deploy/quota_agent/` 也是"自带镜像的服务"，同样搬到顶层。
+提交 `3a0ed5b`：
+
+- `git mv deploy/quota_agent quota_agent`（4 个文件），模块名 `deploy.quota_agent` → `quota_agent`，
+  `Dockerfile.quota-agent` 的 `CMD ["python","-m","quota_agent"]`；
+- `Dockerfile.quota-agent` 原来是 **`COPY deploy/ deploy/`** —— 为了一个包把整棵清单/脚本树拖进镜像；
+  现在是 `COPY quota_agent/ quota_agent/`。镜像内实测 `/app` 只剩
+  `quota_agent/ gateway_common/ envd_service/ requirements.txt`（`envd_service` 是
+  `xfs_quota` 那个模块，本来就必需）；
+- **删除 `deploy/__init__.py`**：它的 docstring 当初就写着自己"只为 `deploy.quota_agent` 存在"，
+  搬走后全仓再无一处 `import deploy.*`，于是 `deploy/` 不再是 Python 包 —— 这才让"`deploy/` 只放
+  部署配置与脚本"字面成立；
+- 两处**逐字钉子**同步改（改一边就红）：`test_upgrade_quota_agent_profile.py`（比对
+  `deploy/scripts/lib/helpers.sh` 的报错文案）、`test_worker_manifest_permissions.py`（比对
+  `docs/k8s-deployment.md` 那张 token 表里的路径）。
+
+上线版本 **`0.1.0-798-g3a0ed5b-20260930-141013`**。**k8s 车道不部署 quota-agent**
+（`deploy/k8s/worker.yaml` 的注释 + `docs/production-deployment-requirements.md` §2.4.4 W4），
+所以 `apply.sh` 只 pin 了 8 处镜像引用，`quota-agent` 那枚 tag 是给 compose/服务器侧用的；
+对集群而言这次仍是"仓库与集群对齐"，功能零变化。
+
+判据：`deployment_smoke` → **`DEPLOYMENT SMOKE OK`**、`multinode_smoke` → **`MULTI-NODE SMOKE OK`**；
+quota-agent 相关 + 钉子类测试 195 passed，全量 `tests/unit` 1934 passed（与改前同数）。
+
+至此 `deploy/` 顶层只剩 `compose/ docker/ k8s/ k8s-k0s/ scripts/ seccomp/ stack/` —— 没有 Python 包，
+也没有会被 import 的代码。
 
 ## 8. 改部署的入口
 
