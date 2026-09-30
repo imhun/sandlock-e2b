@@ -3484,3 +3484,33 @@ compose 车道同代码、同镜像、同 65534、`$HOME/.docker` 同样不可�
 - `deployment_smoke` → **DEPLOYMENT SMOKE OK**、`multinode_smoke` → **MULTI-NODE SMOKE OK**
   （日志 `tmp/multinode-move.log`、`tmp/deployment-smoke-move.log`、`tmp/apply-move.log`、
   `tmp/build-and-push-move.log`）。
+
+## 2026-09-30 `priv` 的 C 源码跟进搬到 `c3_agent/priv/`
+
+**起因**：用户问"priv 现在线上还在用吗"，答案是**在用**（agent 镜像的两个 file-capability 二进制
+就是它编的，面 A 的 `grant-slot` 与面 B 的 `chown/rm/walk` 都在跑），随后拍板"移动到 agent 目录"。
+
+**改动**（提交 `0f75011`）：
+
+- `git mv deploy/priv c3_agent/priv`（`as_uid.c`、`maint.c`、`priv_common.{c,h}`、`slot_spawn.c`）；
+- `Dockerfile.agent` / `Dockerfile.test-runner` 各改一行 `COPY`；前者补"为什么在 c3_agent 下"的说明，
+  后者顺带修掉"worker 镜像也装这两个 broker"这条 Task-4 之后就不成立的注释；
+- 引用面：`c3_agent/{app,fileops}.py`、`envd_service/priv_helpers.py`、k8s DaemonSet 注释、两个
+  compose prod 栈、7 份活文档、9 个测试文件（其中 4 处是按目录拼源码路径：`test_priv_as_uid`、
+  `test_broker_socket_c`、`test_c3_cp_rootless`、`test_nonroot_route_b`）；
+- **顺带修掉上一轮（§7.14）漏掉的一处**：`tests/contract/test_c3_slot_identity_grant.py` 的 fixture
+  还在拼 `deploy/{__init__.py,c3_agent,priv}`，本机整模块 `skipif` 掩盖了它 —— 到了 Linux 车道
+  fixture 的 `docker build` 会因 `COPY c3_agent/` 找不到而失败。现在与 Dockerfile 的 COPY 一一对应；
+- 删掉 `tests/security/test_worker_nonroot.py` 里那份**无人消费**的 priv 上下文拷贝（`Dockerfile.envd`
+  自 Task 4 片 B 起没有任何 priv COPY，注释同步改成现状）；
+- 新增 pin：`test_the_worker_image_has_no_privileged_binary_and_the_agent_image_has_both` 里加
+  `COPY c3_agent/priv/ /tmp/priv/` 断言（搬回 `deploy/` 即红）。
+
+**实测（上线后）**：版本 `0.1.0-796-g0f75011-20260930-135415`；agent 镜像里
+`/var/lib/e2b-priv/{as_uid,e2b-maint}` 的 mtime 仍是 `03:55`、`getcap` 两条同前 —— **COPY 层哈希只认
+内容不认路径，所以产物逐字节没变**，这次重新上线纯属"仓库与集群对齐"；两个冒烟都绿，
+两个面分别被调用 6 次 / 46 次。日志 `tmp/build-and-push-priv2.log`、`tmp/apply-priv.log`、
+`tmp/deployment-smoke-priv.log`、`tmp/multinode-priv.log`。
+
+**剩下的尾巴**：`deploy/quota_agent/` 仍是同型（自带镜像的服务），按同一口径也该搬；要搬说一声。
+`docs/reports/**` 与 `.superpowers/sdd/task-*-report.md` 里的旧路径是当时的证据，未回改。

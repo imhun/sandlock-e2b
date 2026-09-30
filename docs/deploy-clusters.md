@@ -130,7 +130,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.14（2026-09-30，C3 agent 代码搬到顶层 `c3_agent/`）**；§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.15（2026-09-30，`priv` 的 C 源码跟进搬到 `c3_agent/priv/`）**；§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -880,6 +880,32 @@ worker/autoscaler/agent/quota-agent 四个 tag + `docker manifest inspect` 核�
   `python3 -m c3_agent`；日志 logger 名从 `deploy.c3_agent.scan` 变成 `c3_agent.scan`；
 - `deploy/scripts/deployment_smoke.py` → **`DEPLOYMENT SMOKE OK`**（agent 参与的段全过：槽位身份授予、
   文件操作、跨节点迁移、模板构建），`deploy/scripts/multinode_smoke.py` → **`MULTI-NODE SMOKE OK`**。
+
+### 7.15 `priv` 的 C 源码跟进搬到 `c3_agent/priv/`（**2026-09-30，已上线**）
+
+§7.14 的口径（`deploy/` 只放配置与脚本）对 `deploy/priv/` 同样成立：那 5 个 `.c/.h` 是
+**agent 镜像的编译输入**（`as_uid` / `e2b-maint` 两个 file-capability 二进制），所以跟着唯一的生产
+消费者走。提交 `0f75011`：
+
+- `git mv deploy/priv c3_agent/priv`；`Dockerfile.agent` 与 `Dockerfile.test-runner` 的
+  `COPY` 各改一行；`Dockerfile.agent` 文件头补一段"为什么在 `c3_agent` 下"，免得下一个人按
+  "`deploy/` 才放镜像输入"搬回去；
+- `Dockerfile.test-runner` 顺带修掉一条过期注释（它说"worker 镜像也装这两个 broker" ——
+  C3 Task 4 片 B 之后 worker 一个都不装，`e2b-slot-spawn` 只剩测试车道）；
+- **顺带修一个上一轮漏掉的 bug**：`tests/contract/test_c3_slot_identity_grant.py` 仍在拼
+  `deploy/{__init__.py,c3_agent,priv}` 的旧上下文 —— 本机整模块 `skipif` 所以没暴露，
+  Linux 车道会在 fixture 的 `docker build` 上失败（`COPY c3_agent/` 找不到）；
+- 删除 `tests/security/test_worker_nonroot.py` 里那份**已无人消费**的 priv 上下文拷贝；
+- 新增 pin：agent Dockerfile 必须 `COPY c3_agent/priv/`。
+
+上线版本 **`0.1.0-796-g0f75011-20260930-135415`**。值得记的一条实测：**agent 镜像的产物没变** ——
+重新构建后 `/var/lib/e2b-priv/{as_uid,e2b-maint}` 仍是同一个 COPY 层（镜像里 mtime 还是
+`Sep 30 03:55`，`getcap` 两条同前），因为 COPY 层的哈希只认文件内容，不认源路径。也就是说这次
+重新上线是"仓库与集群对齐"，功能上零变化。
+
+判据：`deployment_smoke` → **`DEPLOYMENT SMOKE OK`**、`multinode_smoke` → **`MULTI-NODE SMOKE OK`**；
+两个面这两轮分别被调用了 6 次（`POST /agent/grant-slot`）与 46 次（`POST /agent/{chown,rm,walk}`），
+即搬走的 C 在线上确实还在跑。
 
 ## 8. 改部署的入口
 
