@@ -69,7 +69,7 @@ sandlock-dev:latest sh scripts/test-all.sh`；该镜像 entrypoint 自动降到 
 | 发布 wheel（镜像装的就是它） | `./deploy/scripts/build-sandlock-wheels.sh` → fork 的 `python/build-wheels.sh` | `docker buildx` builder **`multiarch`**；`third_party/sandlock/python/wheel-builder/Dockerfile`；BASE_IMAGE **`quay.io/pypa/manylinux_2_34_x86_64`**（宿主 x86_64）/ **`..._aarch64`**（宿主 arm64），`--platform` 必须等于宿主架构；镜像内：rustup（`RUSTUP_DIST_SERVER=rsproxy.cn`）+ cp314 + `setuptools-rust` + `ziglang`（配合 `python/wheel-builder/zigcc` 与 `cargo-config.toml` 的 per-target linker）+ `auditwheel` | **`wheels/fork/`**（E2B 侧，`build-and-push.sh` 缺它就直接退出）：`*.whl`、`supervise/{x86_64,aarch64}/sandlock-supervise`、`restore-stub/*/restore-stub`、`SHA256SUMS.supervise`；staging context 在 `third_party/sandlock/tmp/wheel-context` |
 | fork 门禁（全套相位） | `deploy/scripts/fork-gate.sh`（`--one 'test_chroot::'` 单跑一族） | 镜像 **`sandlock-dev-f17:latest`**（本机装的是 E2B 测试镜像，脚本自己降权）；容器把**仓库根**挂成 `/src`，**cwd = `/src/third_party/sandlock`** | `CARGO_HOME`/`HOME`/`CARGO_TARGET_DIR` 全在 fork 内：`third_party/sandlock/{tmp/cargo-home,tmp/home,target-linux}`；日志 `tmp/k0s/fork-gate.log` |
 | 单点 cargo check/test | 见 A3 | `sandlock-dev-f17:latest`，`-v "$PWD/third_party/sandlock:/w" -w /w -e CARGO_TARGET_DIR=/tmp/ct` | 容器内 `/tmp/ct`（**必须显式给 `CARGO_TARGET_DIR`**，见 A2） |
-| aarch64 真内核车道 | `deploy/scripts/arm-lane/xbuild.sh` / `phase-run.sh` | 镜像 **`sandlock-zig-builder:local`** —— 它由**同一份** fork 配方建出来（`--target build`，见下） | 交叉产物 `/var/tmp/aarch64-target/<triple>`；`phase-run.sh` 再把它软链成 `/src/target-linux`（该车道的 `/src` = fork） |
+| aarch64 真内核车道 | `deploy/scripts/arm-lane/xbuild.sh` / `phase-run.sh`（**VM 怎么起见 A9**） | 镜像 **`sandlock-zig-builder:local`** —— 它由**同一份** fork 配方建出来（`--target build`，见下） | 交叉产物 `/var/tmp/aarch64-target/<triple>`；`phase-run.sh` 再把它软链成 `/src/target-linux`（该车道的 `/src` = fork） |
 
 **交叉编译的配置只有一份**：`third_party/sandlock/python/wheel-builder/`
 （`Dockerfile` + `cargo-config.toml` + `zigcc`）。它同时是两件事的来源：
@@ -126,6 +126,55 @@ docker run --privileged --rm --entrypoint sh -v "$PWD":/src -w /src/third_party/
 | `quay.io/pypa/manylinux_2_34_x86_64:latest` / `..._aarch64:latest` | wheel 构建的 BASE_IMAGE（宿主架构决定用哪个） | `third_party/sandlock/python/build-wheels.sh` 首次构建时自动 pull | 不用手动建；只是缓存 |
 | `e2b-sandlock-test:latest` | E2B 的**测试镜像**（烤进 `wheels/fork/*.whl`）：`test-prod-shaped.sh`、`tests/security` 的生产形态，`deploy/scripts/build-test-image.sh` 是它的 rebuild 入口 | `deploy/docker/Dockerfile.test-runner` | **只有 `wheels/fork/` 变了才重建** —— 不重建就是 B7（31 个 `TypeError: … unexpected keyword argument`）；它本地-only、不推 ACR |
 | `sandlock-e2b-{worker-1..3,control-plane,gateway}:latest` | 4 周前本地单机示例栈（`deploy/compose/docker-compose.yml` 的 `build:`）留下的 tag | compose build | 仓库里**已无任何引用**，属残留（可删） |
+
+**A9. arm64 真内核车道的入口：怎么起 VM、怎么跑、`tmp/` 被清之后先做什么。**
+（2026-09-30 立此条，与 A7/A8 同类：不是"新踩的坑"，是**口径卡** —— 这套东西散在 5 个文件里，
+没有这张卡就只能从头再推一遍。完整方案、lane 边界与基线数字在 `docs/cross-platform-lanes.md`
+§2/§5。）
+
+**为什么非要这条 lane**：QEMU 用户态会把 `ptrace`/`regset` 变成 ENOSYS，S0 那批结论在它下面不成立；
+syscall 号、结构体布局、字长相关的行为只有真 aarch64 内核才验得了（代价：TCG 比真机慢约 100×，
+所以**性能数字不要用这条 lane 取**）。
+
+**现役 VM（2026-09-30 实测）**：`sandlock-arm` —— `qemu` / `aarch64` / 6 vCPU / 8 GiB / 30 GiB，
+guest 是 Ubuntu 24.04.5 LTS、内核 `6.14.0-37-generic`，磁盘在 `~/.lima/sandlock-arm`。
+定义 = `deploy/scripts/arm-lane/vm.yaml`（**tracked 副本**，文件头写着"改仓路径要同步改"），
+驱动 = `deploy/scripts/arm-lane/lima-vm.sh`（`start|stop|shell|sync|run`）。
+
+```bash
+limactl list | grep sandlock-arm      # 现役状态（实测当天是 Stopped）
+limactl start sandlock-arm            # 起：qemu TCG，第一次要几分钟
+limactl stop  sandlock-arm            # 收工停回去
+```
+
+**每次改动后的循环**（= `docs/cross-platform-lanes.md` §5.2 那一套）：
+
+```bash
+deploy/scripts/arm-lane/xbuild.sh cargo test --no-run --target aarch64-unknown-linux-gnu \
+    -p sandlock-ffi -p sandlock-supervise      # 用 sandlock-zig-builder:local 交叉编译（A8）
+deploy/scripts/arm-lane/lima-vm.sh sync        # 源码走 tar-over-ssh、产物走 limactl copy（9p 只当窗口）
+limactl shell sandlock-arm -- bash -s < deploy/scripts/arm-lane/phase-run.sh   # guest 里跑相位
+deploy/scripts/arm-lane/e2b-sync.sh            # 只有改了 E2B 侧才需要
+```
+
+**`tmp/` 被清掉之后逐条对**（2026-09-30 清过一次）：
+
+- `tmp/arm-lane/target`（宿主侧交叉产物）**不用手动建**：`xbuild.sh` 的 `-v` 会自动建目录，跑一次上面
+  第一条就有；工具镜像 `sandlock-zig-builder:local` 是 A8 的保留项，所以代价只是编译时间；
+- `tmp/arm-vm/noble-arm64.img` **只有 `limactl create` 才需要**（`vm.yaml` 里那行 `file://…`）：
+  现役 VM 已存在 ⇒ `limactl start` 不受影响（2026-09-30 实测起过一次）；真要重建就按 §5.1 重新下载
+  noble arm64 cloud image；
+- `third_party/sandlock/tmp/cargo-home`（`--offline` 的 crate 缓存）只在跑 fork 门禁时用得上，
+  恢复命令在 A7。
+
+**从零重建 VM（只在 VM 丢了才做）**：`docs/cross-platform-lanes.md` §5.1 有完整三步（下载 cloud image →
+`limactl create --name sandlock-arm deploy/scripts/arm-lane/vm.yaml` → `limactl start`）。
+注意 `vm.yaml` 里两处**绝对路径**（基础镜像、`/lima-repo` 挂载点）是指向本 checkout 的。
+
+**这条 lane 的两条硬约束**（细节见 `docs/cross-platform-lanes.md` §3，别自己改）：
+`/src` 必须是 **bind mount、不能是符号链接**（否则注册控制套接字撞 `SUN_LEN`）；
+目标根必须是 `/var/tmp/aarch64-target`、**不能是 `/tmp`**（`CARGO_TARGET_TMPDIR` 被烘焙进测试二进制，
+而沙箱策略给 `/tmp` 开了 `fs_write` —— 夹具会落进写授权，五个 landlock named-unix 门禁变假绿）。
 
 ---
 

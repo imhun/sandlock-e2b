@@ -3635,3 +3635,27 @@ cargo / aarch64 车道的入口、镜像、产物落点；已作废的 `third_pa
 **验证**：新钉子 4 条绿；全量 `tests/unit` **1941 passed**（= 1937 + 4），16 个既有失败不变。
 顺带清掉两个 0 文件的空残留目录：`third_party/third_party/sandlock/tmp/wt-fix`、
 `third_party/sandlock/sandlock-src/python`。
+
+## 2026-09-30 arm64 真内核车道入口卡（A9）+ VM 名钉子
+
+**起因**：用户问"有记录用 `limactl` 启动 `sandlock-arm` 做 arm64 测试的内容吗"，确认记录存在后选
+"在 pitfalls 里补一节"。
+
+**做法**：`docs/build-test-deploy-pitfalls.md` 新增 **A9**（与 A7/A8 同类的口径卡）：
+为什么非要真内核（QEMU 用户态把 ptrace/regset 变 ENOSYS；性能数字不用这条 lane 取）、现役 VM 实测
+（`sandlock-arm`，qemu/aarch64/6c/8GiB/30GiB，guest Ubuntu 24.04.5 + 内核 6.14.0-37）、
+`limactl list|start|stop`、每次循环四条命令、**`tmp/` 被清后逐条对**（`tmp/arm-lane/target` 由
+`xbuild.sh` 自动重建；`tmp/arm-vm/noble-arm64.img` 只有 `limactl create` 才需要，现役 VM 的 start
+不受影响——当天实测起过一次；`tmp/cargo-home` 见 A7）、从零重建的三步（§5.1）、以及两条硬约束
+（`/src` 必须 bind mount；目标根必须 `/var/tmp/aarch64-target`）。A7 的 aarch64 行补了"VM 怎么起
+见 A9"的交叉引用。
+
+**钉子**：`tests/unit/test_arm_lane_entry_is_documented.py` —— VM 定义/驱动/相位脚本都在仓里；
+`lima-vm.sh` 与 `e2b-sync.sh` 里的 `name=` 必须与 A9 卡里写的**同一个** `sandlock-arm`；
+卡里必须保留那 7 条命令（`limactl start/stop/create`、`xbuild.sh`、`lima-vm.sh sync`、
+`phase-run.sh`、`e2b-sync.sh`）。反臂实测：只把 `e2b-sync.sh` 的名字改成 `sandlock-arm2` → 红并
+同时打出两侧的值；复原后绿。
+
+**当天实测**：`limactl start sandlock-arm` 成功（TCG，启动几分钟），guest 自检 `aarch64` /
+`6.14.0-37-generic` / `Ubuntu 24.04.5 LTS` / `/lima-repo` 挂载在位，与文档一字不差；跑完按原样停回。
+`third_party/sandlock/sandlock-src/python`。
