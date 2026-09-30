@@ -3278,3 +3278,35 @@ rmtree；compose 无策略层；`docker-compose.multinode.yml` 无 Redis 故该�
 N49 保留。**
 
 **恢复入口**：`git log --oneline`（HEAD = 本提交）；报告在 `.superpowers/sdd/task-*` 与 `c3-*`。
+
+---
+
+## ✅ C3 compose 车道收口（2026-09-30）
+
+三条**有意留开**的 compose 缺口全部关闭（`feat/c3-compose-gaps` → main `0526634`）：
+1. **三个 compose 栈的控制面从 root 收到 65534**，并补上 D24 的卷存储一次性交棒（非递归、幂等、具名，
+   与 k8s `storage-init` 逐字同形）；栈里 uid 0 只剩 `image-cache-init` 与 agent 面 B（都必需）。
+2. **新增 `agent-plane`（internal）**：只承载 CP 与两个 agent 面，worker 既解析不到也到不了；
+   `worker↔CP` 不受影响（worker 留在 default，CP 同时在两个网上）。
+3. **multinode 补 Redis** ⇒ 自愈门 (a) 不再恒推迟（该车道此前完全没有自愈）。
+
+**验收里又量出两个真缺陷并修掉**：compose 的自愈上报被源 IP 因子整条拒（三个栈的自愈其实全死——
+因为扫描器是面 B 而 resolver 只给面 A 的地址，改成两面地址的并集）；agent 入口不放开 INFO
+（健康轮次那行看不见）。
+
+**评审又抓到两个由降权引入的回归并修掉**（都在那个"报告自己承认没起过"的 stack 赛道，教训：**要起**）：
+- stack 的 rootless builder socket 是 `srw-rw---- 1000:1000`，65534 的 CP 连不上 ⇒ `Template.build` 死。
+  修法 `group_add: ["1000"]`（与 k8s 的 `fsGroup: 1000` 同理）；正臂 CP 自己的 `buildctl debug workers`
+  rc=0，反臂 `docker run -u 65534:65534` 复现 `permission denied`。
+- TLS 私钥原是 `0600` ⇒ 65534 的 CP 读不了、服务起不来（旧形实测 `PermissionError` exit=1 重启 6 次）。
+  生成器改 `0644`（与 `kubectl create secret tls` 在 pod 内的默认模式同形）⇒ `uvicorn https://0.0.0.0:3000`
+  + `curl -k /healthz` 200。
+
+**线上重新部署到 main**：`0.1.0-782-g0526634-20260930-103243`，k8s 10 pod 全 Ready，
+`multinode_smoke` = **OK**（4 箱 2+2、命令/文件/stdin、预约归零）；`deployment_smoke` 的 C3 段全绿
+（`OK: commands + files`、**`OK: migrated e2b-worker-1 -> e2b-worker-0, files kept`**、network config、
+volume isolated、kill 后预约归零），末段 `Template.build` 仍因集群内 buildkit 拉不到 docker.io 失败
+（改动前后同一步同因，环境问题）。
+
+**本轮唯一靠"组位"的权限点**：`deploy/stack` CP 的 `group_add: ["1000"]`（与 k8s `fsGroup` 同族）。
+本地测试栈已全部拆掉。报告在 `.superpowers/sdd/c3-compose-gaps-report.md`。
