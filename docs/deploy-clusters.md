@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.19（2026-09-30，C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，当前版本 `0.1.0-811-g071beb4-20260930-202337`）**；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.20（2026-09-30，回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，当前版本 `0.1.0-814-gf8d1685-20260930-210628`）**；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，当前版本 `0.1.0-811-g071beb4-20260930-202337`）**；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1033,6 +1033,29 @@ N52（`docs/open-issues.md`）：把 C1 时代剩下的死代码删掉（`maint.
 **没动的**（§7.18 结尾那份清单里属于"回退杆"而非垃圾的项）：`E2B_PRIV_HELPER_TRANSPORT=exec`
 与两个 file-capability 二进制仍留在**测试车道**（`Dockerfile.test-runner`）；`E2B_SLOT_IDENTITY=spawn`
 仍是无 agent 形态（单机示例、车道）的合法取值；`E2B_AS_K8S_KIND=deployment` 仍是 pre-N20 兼容。
+
+### 7.20 回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`（**2026-09-30，已上线 `0.1.0-814-gf8d1685-20260930-210628`**）
+
+用户裁定：「这几个都可以去掉了」/「现在只需要 agent grant 这个形态，真有需要的时候从 git 拿吧」。
+两轮提交：`05fa7c3`（③ 只缩 StatefulSet）、`f8d1685`（② 槽位身份只由 agent 授予）。
+
+**集群验收（`0.1.0-814`）**
+
+| 判据 | 读数 |
+|---|---|
+| 缩容只认 StatefulSet | 控制面 env 里 `E2B_AS_K8S_KIND` **0 处**；Role 只剩 `pods(get,list,patch,delete)` 与 `statefulsets,statefulsets/scale(get,update,patch)`（`deployments{,/scale}` 已删） |
+| 槽位身份只走 agent-grant | 两个 worker 的日志里 `spawn` / `E2B_SLOT_IDENTITY is unset` 相关行 **0 条**（清单显式写 `agent-grant`，代码也只接受它） |
+| 文件操作与路由未回归 | `MULTI-NODE SMOKE OK` + `DEPLOYMENT SMOKE OK`（含跨节点迁移保文件、远端卷隔离、模板构建、MCP 网关） |
+| 仓库规格 ≡ 线上 | `DRY_RUN=1 apply.sh \| kubectl diff -f -` **0 行** |
+| 终态 | `control-plane` 2/2、`e2b-worker` 2/2、`redis` 1/1、两个 DaemonSet 就绪；`fleet/sandboxes` = `{}` |
+
+**代价（点名，用户已接受）**：route B 的车道覆盖从"root + spawn"改为"agent-grant"（车道由
+`tests/security/conftest._lane_identity_reporter` 自己写 `uid_map`/`gid_map` 承接，即 agent 的那一步）；
+pre-C3 的 root/no-agent 形态不再被支持 —— `route_b._spawn_slot` 与 `c3_agent/priv/slot_spawn.c`
+都在 git 历史里。
+
+**仍剩第 ① 根**（见 N52 ⑤）：`E2B_PRIV_HELPER_TRANSPORT=exec` + 两个 file-capability 二进制 +
+`E2B_PRIV_HELPERS`（`envd_service/priv_helpers.py` 的本地实现半、车道 phase 2 与约 20 条用例）。
 
 ## 8. 改部署的入口
 
