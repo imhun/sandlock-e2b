@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.22（2026-09-30，① 第二步：删掉 worker 侧 file-capability 形态的残留，当前版本 `0.1.0-818-g7205fba-20260930-221244`）**；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.23（2026-10-01，沙箱第一档 syscall 加固 + clone3 命名空间位，当前版本 `0.1.0-824-gf2aec0b-20261001-073534`）**；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1092,6 +1092,43 @@ pre-C3 的 root/no-agent 形态不再被支持 —— `route_b._spawn_slot` 与 
 | 仓库侧测试 | `tests/unit` 2087 passed / 3 failed、`tests/contract` 378 passed / 3 failed —— 与改动前 HEAD 基线**逐条相同**（macOS 上的 `test_real_root_gate` dlopen 与两条 xfs_quotactl）；全量 2667 条 collection 干净 |
 
 **形态收敛后的"没有的东西"（点名）**：worker 侧 `exec` transport、两个 file-capability 二进制、`E2B_PRIV_HELPERS` 旋钮、`PrivHelpers` 这一整套 —— 都只在 git 历史里（需要时整批 revert）。今天 worker 的三条文件步骤路径只剩：**agent**（出厂形态）、**root**（worker 自己是 root 时）、以及**进程内 E5.1**（两者都没有，能力与隔离都降级并打一条 WARNING）。
+
+### 7.23 沙箱第一档 syscall 加固 + clone3 命名空间位（**2026-10-01，已上线 `0.1.0-824-gf2aec0b-20261001-073534`**）
+
+提交：fork `8973f8c`（黑名单 + `clone3`），主仓 `f2aec0b`（文档 + 子模块指针）。
+起因是一次「沙箱内还能摸到哪些危险 syscall」的审计：探针 `tmp/syscall-probe/probe.py`
+在真 worker pod 里逐条调用候选（故意非法参数，`EINVAL`/`EBADF`/返回 ≥0 = 到达内核），
+量出 26 条内层黑名单没拦、外层也不一定拦的调用。
+
+* `DEFAULT_BLOCKLIST_SYSCALLS` **+26 条**：mount API 全家（`fsopen`/`fsconfig`/`fsmount`/
+  `move_mount`/`fspick`/`mount_setattr`/`statmount`/`listmount`）、ptrace 类三条
+  （`process_madvise`/`process_mrelease`/`kcmp`）、`quotactl_fd`、`kexec_file_load`、
+  旧 AIO 五条、`memfd_secret`、`modify_ldt`（x86-only）、NUMA 六条。
+* `handle_fork` 的命名空间禁令从「只查 `clone`」改成走 `clone_flags()`，覆盖 `clone3`
+  （cBPF 读不到 `clone_args`，所以这条只能由 handler 管）。
+* `sys/path_surface.rs`：5 条由 `Open`/`Gated` 改 `Blocked`，待决策集合收敛到 7 条。
+
+**集群验收（`0.1.0-824`）**
+
+| 判据 | 读数 |
+|---|---|
+| 上线后沙箱内逐条复测 | **14 条从"到达内核"翻成 `EPERM`**：`fsconfig`/`mount_setattr`（原 `EINVAL`）、`statmount`/`listmount`（原 `ENOSYS`，只被外层挡）、`quotactl_fd`/`process_madvise`/`process_mrelease`/`kcmp`（原 `EBADF`/`ESRCH`）、`io_setup`/`io_submit`、`memfd_secret`（原**成功拿到 fd**）、`get_mempolicy`/`set_mempolicy`（原**返回 0**）、`mbind` |
+| 刻意留活的不受影响 | `memfd_create` 仍 `EFAULT`（到达内核）、`prlimit64` 仍成功、`rt_sigqueueinfo`/`rt_tgsigqueueinfo`/`adjtimex`/`clock_adjtime` 仍 `EFAULT`、`pidfd_open`/`pidfd_send_signal` 仍放行（in-sandbox init 要用） |
+| 未回归 | `MULTI-NODE SMOKE OK`（两 worker 各 2 沙箱、命令/文件/健康/stdin、kill 后预约 0）+ `DEPLOYMENT SMOKE OK`（跨 worker 迁移保文件、远端卷隔离、模板构建→registry→worker→rootfs、箱内 MCP 经代理） |
+| 终态 | `control-plane` 2/2、`e2b-worker` 2/2（新镜像 `0.1.0-824`）、`e2b-c3-agent` 2/2、`redis` 1/1、`seccomp-installer` 就绪；base image `peek cached=true` |
+| 仓库侧测试 | `--lib` **914 passed / 0 failed**；`--test integration` 与基线 `a21a507` 逐条 diff **无新增失败**（容器里 26~29 条环境性失败两侧同名，抽测单独运行均通过）；新增 `test_first_tier_blocklist_refused`（真沙箱内 26 条 `EPERM`）与 `test_clone3_namespace_flags_refused`（先红后绿：修前 `EINVAL`＝进内核，修后 `EPERM`，普通线程创建仍 OK） |
+
+**`clone3` 那条为什么不能靠外层 profile**：外层 `deploy/seccomp/sandlock-worker.json` 把
+`clone3` 整条 deny 成 `ENOSYS`，线上观测不到差异 —— 也就是说修前这条禁令实际是**容器
+profile 在承担**，换一个更宽 profile 的宿主就没了。修后由沙箱自己的 `handle_fork` 承担。
+不能改成"禁用 `clone3`"：glibc 2.34+ 的 `pthread_create` 走它（同批集成测试里那条线程
+对照就是这个用途）。
+
+**同批更正**：`deploy/seccomp/README.md` 里"mount/pivot_root/umount2 保持 gated、未放宽"
+是错的 —— 它们是 N35 真根那批加进去的**无条件 allow**（实测 worker 侧 `mount(NULL,…)`
+拿到 `EFAULT`＝到达内核，`open_tree`/`fsopen` 才是 `EPERM`）。同一个文件在 k8s pod 上与
+本地 `--cap-drop ALL` 容器上对 `caps:` 条件的解析还不一致（`fsconfig` 一边到内核一边被拒），
+结论：mount API 不能指望外层 profile 兜底。
 
 ## 8. 改部署的入口
 

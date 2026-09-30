@@ -594,6 +594,14 @@ sandlock 自己解析黑名单用的 `syscalls` crate —— worker 镜像没有
 `pidfd` 跨进程权限而在容器里必然失败）；`--test integration` 与改动前
 `a21a507` 基线逐条 diff：**新增失败 0**（基线 27 条环境性失败，改动后 26 条）。
 
+**上线后复测（`0.1.0-824-gf2aec0b-20261001-073534`，同一台集群、同一支探针）**：
+沙箱内 **14 条从"到达内核"翻成 `EPERM`** —— `fsconfig`/`mount_setattr`（原 `EINVAL`）、
+`statmount`/`listmount`（原只被外层挡的 `ENOSYS`）、`quotactl_fd`、`process_madvise`、
+`process_mrelease`、`kcmp`、`io_setup`、`io_submit`、`mbind`，以及上线前**真的成功**的
+`memfd_secret`（原返回 fd）与 `get_mempolicy`/`set_mempolicy`（原返回 0）。
+刻意留活的 `memfd_create`/`prlimit64`/`pidfd_open`/`rt_sigqueueinfo` 读数不变，
+`MULTI-NODE SMOKE OK` + `DEPLOYMENT SMOKE OK`（详见 `deploy-clusters.md` §7.23）。
+
 ### 同批发现、**未**在本轮修的两个问题
 
 1. **`clone3` 的命名空间位没有任何一层 sandlock 校验**。BPF 参数过滤只对
