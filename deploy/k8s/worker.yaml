@@ -639,8 +639,9 @@ spec:
             # the DaemonSet to be ready; a node without the file cannot start
             # this pod at all. Copying the file by hand still works for a
             # one-off node, but the DaemonSet is the reproducible path.
-            # The profile is the runtime default plus the two syscalls the
-            # sandbox-create path needs (`pidfd_getfd`, `unshare`) -- see
+            # The profile is the runtime default plus `pidfd_getfd` and a
+            # **narrowed** `unshare` (the argument mask keeps the namespace
+            # types this deployment builds and refuses the rest) -- see
             # deploy/seccomp/README.md. `Localhost` (not `Unconfined`) also keeps
             # this pod on the allowed side of the Pod Security "baseline" rule.
             seccompProfile:

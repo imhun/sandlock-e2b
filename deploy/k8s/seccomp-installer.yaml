@@ -33,7 +33,7 @@ metadata:
     app: seccomp-installer
 data:
   # Byte-for-byte the file at deploy/seccomp/sandlock-worker.json (pinned by
-  # tests/unit/test_worker_manifest_permissions.py); sha256 071486c06782c70d6764184493b104ed4418f77a244cb4198e14db70091ee27c
+  # tests/unit/test_worker_manifest_permissions.py); sha256 3dca226ec12fb6893321a112559494042d8db92345d9f0451f6e6e1bee270f0d
   #
   # `|` (keep), NOT `|-` (strip). The profile file ends with a newline, so `|-`
   # hands the node a payload one byte shorter than the very file this comment
@@ -438,7 +438,6 @@ data:
     				"uname",
     				"unlink",
     				"unlinkat",
-    				"unshare",
     				"utime",
     				"utimensat",
     				"utimensat_time64",
@@ -454,6 +453,22 @@ data:
     			"action": "SCMP_ACT_ALLOW",
     			"args": [],
     			"comment": "",
+    			"includes": {},
+    			"excludes": {}
+    		},
+    		{
+    			"names": [
+    				"unshare"
+    			],
+    			"action": "SCMP_ACT_ALLOW",
+    			"args": [
+    				{
+    					"index": 0,
+    					"value": 234881152,
+    					"op": "SCMP_CMP_MASKED_EQ"
+    				}
+    			],
+    			"comment": "C3: narrowed from unconditional. The mask is CLONE_NEWTIME|NEWCGROUP|NEWUTS|NEWIPC, so only the namespace types this deployment actually builds (user, net, pid, mount) are reachable -- a process that is root inside its own user namespace can no longer create a UTS/IPC/cgroup/time namespace. See deploy/seccomp/README.md.",
     			"includes": {},
     			"excludes": {}
     		},
@@ -933,7 +948,7 @@ spec:
         # sha256 of the profile payload. Bump it (with the ConfigMap) when the
         # profile changes: the pod template hash change is what rolls the
         # DaemonSet, and the test above fails until the two agree.
-        checksum/profile: "071486c06782c70d6764184493b104ed4418f77a244cb4198e14db70091ee27c"
+        checksum/profile: "3dca226ec12fb6893321a112559494042d8db92345d9f0451f6e6e1bee270f0d"
     spec:
       # Every node, including tainted control-plane nodes: a node without the
       # profile cannot run the worker pod at all.
