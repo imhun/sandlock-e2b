@@ -3578,3 +3578,26 @@ cargo / aarch64 车道的入口、镜像、产物落点；已作废的 `third_pa
 - 离线缓存恢复路径实测：`sandlock-dev-f17:latest` 里 `cargo fetch --locked` → **401 MB**（几分钟），
   `tmp/cargo-home` 删掉后第一次门禁要联网，命令已写进 A7；
 - 发布链路的输入没动：`wheels/fork/{*.whl,supervise/,restore-stub/,SHA256SUMS.supervise}` 都在。
+
+## 2026-09-30 两套交叉编译配置合流：只留 fork 的 `python/wheel-builder/`
+
+**起因**：用户看着"有 2 套交叉编译的配置"，问能不能合成一个。
+
+**核对结果**：`third_party/sandlock-wheel-builder/`（父仓）与
+`third_party/sandlock/python/wheel-builder/`（fork）**`cargo-config.toml` 与 `zigcc` 逐字节相同**，
+只有 Dockerfile 不同（父仓那份自己写着 SUPERSEDED，且少 F2b.5 的 supervise/restore-stub 构建）。
+`sandlock-zig-builder:local`（aarch64 车道用的工具镜像）本来就是用 **fork 那份** Dockerfile 的
+`build` 阶段建的 —— 也就是父仓那份副本**连一个消费者都没有**。
+
+**做法**：删除父仓副本（3 个文件）；A7 补上"交叉编译配置只有一份"+ `sandlock-zig-builder:local`
+的确切构建命令；`docs/HANDOFF.md` 与 `build-sandlock-wheels.sh` 的历史注记改成"已删除"；
+新增钉子 `tests/unit/test_one_sandlock_wheel_recipe.py`：
+
+- 退役目录不存在（且 `git ls-files` 里也没有——按工作树判，删了还没暂存时不会误红）；
+- 父仓不许再出现 `/zigcc`、`/cargo-config.toml`（子模块是 gitlink，`git ls-files` 天然看不到
+  fork 自己那份，所以这里出现的一定是"第二份"）；
+- `deploy/scripts/build-sandlock-wheels.sh` 必须委托 fork 的 `python/build-wheels.sh`，且**不许**
+  自己出现 `docker buildx build` / `wheel-builder/Dockerfile`。
+
+**验证**：钉子 3 条绿；反臂（把两个资产文件造回来 + `git add -f`）→ 2 条红并点名路径（可证伪）；
+全量 `tests/unit` **1937 passed**（= 之前 1934 + 新钉子 3），16 个失败仍是既有平台/缺 fakeredis 项。

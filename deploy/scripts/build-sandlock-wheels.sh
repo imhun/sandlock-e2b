@@ -11,13 +11,17 @@
 # checks against both copies. So this script only delegates, with the artifacts
 # landing here.
 #
-# It used to run its own buildx recipe (`third_party/sandlock-wheel-builder/`),
-# which predates F2b.5 and produces wheels *without* the supervise binary -- and
-# did so with exit code 0. Measured 2026-09-09: such a wheel installs fine but
+# It used to run its own buildx recipe. That recipe was a near-copy of the
+# fork's (`third_party/sandlock-wheel-builder/`, deleted 2026-09-30 -- its
+# `cargo-config.toml`/`zigcc` were byte-identical duplicates, so the only thing
+# it could still do was send the next reader to the wrong file), and its output
+# was *worse*: it predates F2b.5 and produces wheels *without* the supervise
+# binary -- with exit code 0. Measured 2026-09-09: such a wheel installs fine but
 # `sandlock/bin/sandlock-supervise` is missing, so route B quietly refuses to
 # start a slot and the worker keeps the in-process mediator (i.e. silently loses
 # the T5 ownership fix). Anything that can half-build the release must not be a
 # second code path; the fork's script also fails loudly if supervise is absent.
+# `tests/unit/test_one_sandlock_wheel_recipe.py` pins that there is exactly one.
 #
 # Usage:
 #   ./deploy/scripts/build-sandlock-wheels.sh

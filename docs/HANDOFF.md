@@ -716,8 +716,10 @@ handoff）**实现：route-B 槽位的凭证现在是**一条继承来的 unix �
   产出的 wheel **不含 `sandlock/bin/sandlock-supervise`**（本次实测 2.2 MB vs 正确 7.4 MB），
   而且**退出码 0**：装上后 route-B 只会静默退回进程内后端。现该脚本改为委托
   fork 的 `python/build-wheels.sh`（它同批 cross-build supervise、注入 wheel、
-  写 HEAD 钉住的 `SHA256SUMS.supervise`，缺任何一件**就地报错**），旧配方文件头标
-  SUPERSEDED。wheel 复验：`162 == 162` 双向符号相等、supervise 指纹与 manifest
+  写 HEAD 钉住的 `SHA256SUMS.supervise`，缺任何一件**就地报错**）。旧配方（E2B 侧的
+  `third_party/sandlock-wheel-builder/`）先标 SUPERSEDED、后于 **2026-09-30 删除**：
+  交叉编译配置现在只有 fork 的 `python/wheel-builder/` 一份（见
+  `docs/build-test-deploy-pitfalls.md` A7）。wheel 复验：`162 == 162` 双向符号相等、supervise 指纹与 manifest
   一致、mode 755、`--uid` 拒绝冒烟过。
 - **门禁（终态）**：fork 非 root 8 档 core_lib 841 / core_integ 534 / ffi 101 / cli 100 /
   supervise 42 / supervise_cost 3 / cli_build 0 / **python 461**；root 三档 oci 150 /

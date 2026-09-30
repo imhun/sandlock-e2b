@@ -69,11 +69,27 @@ sandlock-dev:latest sh scripts/test-all.sh`；该镜像 entrypoint 自动降到 
 | 发布 wheel（镜像装的就是它） | `./deploy/scripts/build-sandlock-wheels.sh` → fork 的 `python/build-wheels.sh` | `docker buildx` builder **`multiarch`**；`third_party/sandlock/python/wheel-builder/Dockerfile`；BASE_IMAGE **`quay.io/pypa/manylinux_2_34_x86_64`**（宿主 x86_64）/ **`..._aarch64`**（宿主 arm64），`--platform` 必须等于宿主架构；镜像内：rustup（`RUSTUP_DIST_SERVER=rsproxy.cn`）+ cp314 + `setuptools-rust` + `ziglang`（配合 `python/wheel-builder/zigcc` 与 `cargo-config.toml` 的 per-target linker）+ `auditwheel` | **`wheels/fork/`**（E2B 侧，`build-and-push.sh` 缺它就直接退出）：`*.whl`、`supervise/{x86_64,aarch64}/sandlock-supervise`、`restore-stub/*/restore-stub`、`SHA256SUMS.supervise`；staging context 在 `third_party/sandlock/tmp/wheel-context` |
 | fork 门禁（全套相位） | `deploy/scripts/fork-gate.sh`（`--one 'test_chroot::'` 单跑一族） | 镜像 **`sandlock-dev-f17:latest`**（本机装的是 E2B 测试镜像，脚本自己降权）；容器把**仓库根**挂成 `/src`，**cwd = `/src/third_party/sandlock`** | `CARGO_HOME`/`HOME`/`CARGO_TARGET_DIR` 全在 fork 内：`third_party/sandlock/{tmp/cargo-home,tmp/home,target-linux}`；日志 `tmp/k0s/fork-gate.log` |
 | 单点 cargo check/test | 见 A3 | `sandlock-dev-f17:latest`，`-v "$PWD/third_party/sandlock:/w" -w /w -e CARGO_TARGET_DIR=/tmp/ct` | 容器内 `/tmp/ct`（**必须显式给 `CARGO_TARGET_DIR`**，见 A2） |
-| aarch64 真内核车道 | `deploy/scripts/arm-lane/xbuild.sh` / `phase-run.sh` | 镜像 **`sandlock-zig-builder:local`** | 交叉产物 `/var/tmp/aarch64-target/<triple>`；`phase-run.sh` 再把它软链成 `/src/target-linux`（该车道的 `/src` = fork） |
+| aarch64 真内核车道 | `deploy/scripts/arm-lane/xbuild.sh` / `phase-run.sh` | 镜像 **`sandlock-zig-builder:local`** —— 它由**同一份** fork 配方建出来（`--target build`，见下） | 交叉产物 `/var/tmp/aarch64-target/<triple>`；`phase-run.sh` 再把它软链成 `/src/target-linux`（该车道的 `/src` = fork） |
 
-**已作废、不要用来出发布 wheel**：`third_party/sandlock-wheel-builder/`（2026-09-09 起 SUPERSEDED；
-它出的 wheel 不带 `sandlock-supervise`，install 正常但 route B 会静默拒绝起槽位，`build-sandlock-wheels.sh`
-头部记着这次实测）。现在只剩历史价值。
+**交叉编译的配置只有一份**：`third_party/sandlock/python/wheel-builder/`
+（`Dockerfile` + `cargo-config.toml` + `zigcc`）。它同时是两件事的来源：
+
+- 发布 wheel —— `python/build-wheels.sh` 用它 `-o type=local,dest=…`；
+- aarch64 车道的工具镜像 —— 同一份 Dockerfile 的 `build` 阶段（在 fork 根下跑）：
+
+```bash
+cd third_party/sandlock
+docker buildx build --builder multiarch --platform linux/amd64 \
+  --build-arg BASE_IMAGE=quay.io/pypa/manylinux_2_34_x86_64 \
+  --target build -t sandlock-zig-builder:local \
+  -f python/wheel-builder/Dockerfile --load .
+```
+
+父仓曾经还有一份**副本** `third_party/sandlock-wheel-builder/`（`Dockerfile` + `cargo-config.toml`
++ `zigcc`，其中后两个与 fork 的**逐字节相同**）。它 2026-09-09 就被标 SUPERSEDED（出的 wheel 不带
+`sandlock-supervise`，install 正常但 route B 静默拒绝起槽位 —— `build-sandlock-wheels.sh` 头部记着
+这次实测），**2026-09-30 已删除**：两份几乎相同的配方正是"下一个人照着错的那份跑"的来源，而
+`tests/unit/test_one_sandlock_wheel_recipe.py` 现在钉住"父仓里不许再出现第二份"。
 
 **符号链接的边界（两根都叫 `target`，别混）**：
 
