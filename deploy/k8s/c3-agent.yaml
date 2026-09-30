@@ -9,7 +9,7 @@
 #     容器 BND 的子集，否则内核在 `exec` 那一步就拒绝（非 root 进程的 `CapEff` 仍是 0）。
 #
 #   face B `maint` —— 文件操作面（C1 的 `e2b-maint` 原样搬进来，**复用
-#     `deploy/priv/priv_common.c` 的路径白名单纪律，不另写一套**）。它必须是 **root**：
+#     `c3_agent/priv/priv_common.c` 的路径白名单纪律，不另写一套**）。它必须是 **root**：
 #     工作区在阿里云 NAS 上走 AUTH_SYS，`chown` 只有 uid 0 做得成（2026-09-17 实测，
 #     见 `docs/production-deployment-requirements.md` §5.4(b)；原记录在 C1 的
 #     `deploy/k8s/priv-broker.yaml` 文件头，该 DaemonSet 已由 C3 Task 7 退役）。

@@ -16,7 +16,7 @@
 
 ## 已定位的落点（省下一次搜索）
 
-- **A**：目录块数字来自 **`deploy/priv/maint.c`** 的 `walk` 输出（C 程序，随 worker 镜像构建），
+- **A**：目录块数字来自 **`c3_agent/priv/maint.c`** 的 `walk` 输出（C 程序，随 worker 镜像构建），
   Python 侧两处求和是 `envd_service/runtime/dir_ledger.py::scan_subtree` 与
   `envd_service/priv_helpers.py::dir_size`（后者只取 `kind == "f"`）。契约测试在
   `tests/unit/test_dir_ledger.py`（逐字节等于 `dir_size`）。所以 A = 改 C + 两处求和 + 测试期望 + 重建镜像。

@@ -117,14 +117,12 @@ def _build_worker_image(build_ctx: Path) -> None:
         src = PROJECT_ROOT / name
         dst = build_ctx / name
         shutil.copytree(src, dst, symlinks=True)
-    # Track F (F1): the worker Dockerfile also compiles the two
-    # file-capability brokers from deploy/priv/, so the minimal context has to
-    # carry that directory too (a missing input fails the COPY, not the
-    # build's ability to run the image).
-    shutil.copytree(
-        PROJECT_ROOT / "deploy" / "priv", build_ctx / "deploy" / "priv",
-        symlinks=True,
-    )
+    # No `priv/` here: Track F's two file-capability brokers used to be compiled
+    # by this image, and the minimal context carried their source for that
+    # reason. C3 Task 4 slice B removed both the binaries and every COPY that
+    # built them from `Dockerfile.envd`, so the source would be a context entry
+    # no COPY consumes. It now lives at `c3_agent/priv/`, which is the *agent*
+    # image's build input (the test-runner image's too).
     arch = platform.machine()
     if arch == "x86_64":
         target_arch = "amd64"

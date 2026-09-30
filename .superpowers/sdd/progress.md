@@ -1257,7 +1257,7 @@ sdk 58P/6S/0F；无新增 skip/xfail/`--ignore`。
 5. **worker 与 control-plane/quota-agent 版本对齐**：worker 已到 `0.1.0-245-gde555f8`，control-plane 仍 `0.1.0-230-…`、
    quota-agent `0.1.0-236-…`。用同一个 tag 重建并推送这两个镜像，再滚动上线（一次窗口做完）。
 6. **worker 早于控制面就绪的降级告警** ⇒ 加启动重试（`envd_service/agent.py`）。
-7. **0700 目录读 projid 的根治**：给 `e2b-maint` 增加只读 projid op（`deploy/priv/maint.c` +
+7. **0700 目录读 projid 的根治**：给 `e2b-maint` 增加只读 projid op（`c3_agent/priv/maint.c` +
    `priv_helpers.py` + `xfs_quota.py` 消费点）。当前只做到"正确分类 + 保持 WARNING"。
 8. **0600/0700 沙箱私有条目 platform 侧读不到**：明确报错语义 + 写进部署文档（决策项，可能只改文档）。
 
@@ -2612,7 +2612,7 @@ BASE = `be00f74`（main 上的"C3 计划落盘"提交）。控制器：本会话
 
 - Task 1（面 A 原语 `as_uid` + 独立 agent 镜像）：派发中（implementer: Herschel）。
 - **Task 1: complete（commits be00f74..f3f93f2，review Approved）**
-  - 交付：`deploy/priv/as_uid.c`（写恒等 map、四条拒绝、`C3-ASUID-OK pid=N uid=X`）、
+  - 交付：`c3_agent/priv/as_uid.c`（写恒等 map、四条拒绝、`C3-ASUID-OK pid=N uid=X`）、
     `deploy/docker/Dockerfile.agent`（独立镜像，恰两个特权二进制 `as_uid`/`e2b-maint`，
     `0710 root:65534`/`0750`）、`tests/unit/test_priv_as_uid.py`、`tests/security/test_agent_image_privilege.py`。
   - 控制器复验（我自己跑，不是转述）：unit lane 9 passed；容器 lane 8 passed（含 getcap 逐字 +
@@ -2770,7 +2770,7 @@ Task 5、Task 6、Task 7、以及 Task 3/4 的真机验收（需部署窗口授�
     m6 记录漂移（未收窄 `remove_checkpoint_images`）、m7 `startswith` 断言改正。
   - 修复轮留下的两处交代（交最终评审判定）：① m6 只记录未收窄（收窄会留空 store，而清理它的扫描
     在本形状被关掉）；② m7 只记录：CP 的 `_inside()` 仍是手写第二道包含性规则，与 `priv_common.c`
-    的 `realpath` 纪律不共享实现（符号链接/ENOENT 两角可能有分歧；要收口应让 CP 复用 `deploy/priv/`
+    的 `realpath` 纪律不共享实现（符号链接/ENOENT 两角可能有分歧；要收口应让 CP 复用 `c3_agent/priv/`
     实现，而不是删掉它）。
   - **片 A 复审 = Needs fixes**（I1/I2/I3 + minors 4-7 全部确认已修，但抓到同类新缺陷 + 4 条新回归）：
     - **N1（必须修）**：`scope-slot-document` 推导 `rb-<id>`，而 worker 实际写 `<id>`（或长 id 的

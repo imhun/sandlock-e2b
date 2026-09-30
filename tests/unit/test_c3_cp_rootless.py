@@ -57,7 +57,7 @@ K8S = REPO / "deploy" / "k8s"
 CONTROL_PLANE_MANIFEST = K8S / "control-plane.yaml"
 AGENT_MANIFEST = K8S / "c3-agent.yaml"
 VOLUMES_SOURCE = REPO / "control_plane" / "registry" / "volumes.py"
-MAINT_C = REPO / "deploy" / "priv" / "maint.c"
+MAINT_C = REPO / "c3_agent" / "priv" / "maint.c"
 
 #: The control plane's uid. §13.6's三条 findings collapse to this one value:
 #: the platform's own directories are already 65534, `.uid_pool.lock` is

@@ -104,13 +104,16 @@ ENV E2B_TEST_STRICT_SKIPS=1
 COPY deploy/docker/entrypoint.test-runner.sh /usr/local/bin/entrypoint.test-runner.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.test-runner.sh"]
 
-# Track F (Task F1): the same two file-capability brokers the worker image
-# ships (see Dockerfile.envd for why they are compiled, why `setcap` has to run
-# in this stage, and why the directory is root-owned group 65534 mode 0710).
-# They are here so the unprivileged phase of deploy/scripts/test-prod-shaped.sh
-# -- uid 65534 with the four declared caps -- exercises the real non-root
-# shape instead of proving that file capabilities are unusable.
-COPY deploy/priv/ /tmp/priv/
+# Track F (Task F1): the two file-capability brokers, built here so the
+# unprivileged phase of deploy/scripts/test-prod-shaped.sh -- uid 65534 with the
+# four declared caps -- exercises the real non-root shape instead of proving
+# that file capabilities are unusable. Since C3 the *worker* image ships
+# neither of them; `e2b-maint` ships in the agent image
+# (`deploy/docker/Dockerfile.agent`, which also records why `setcap` has to run
+# in the final stage and why the directory is root-owned group 65534 mode 0710),
+# and `e2b-slot-spawn` is this lane's only remaining consumer. The source is
+# `c3_agent/priv/` -- C that belongs with the agent, not with `deploy/`.
+COPY c3_agent/priv/ /tmp/priv/
 RUN cc -O2 -Wall -Wextra -o /tmp/priv/e2b-slot-spawn \
         /tmp/priv/slot_spawn.c /tmp/priv/priv_common.c \
     && cc -O2 -Wall -Wextra -o /tmp/priv/e2b-maint \

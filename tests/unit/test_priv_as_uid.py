@@ -1,7 +1,7 @@
 """C3 Task 1 (面 A): ``as_uid`` -- the identity-granting primitive, off-Linux.
 
 ``as_uid`` is the ONE privileged thing face A of the C3 per-node agent ships
-(``deploy/priv/as_uid.c``, later driven by Task 2/3 from the control plane). It
+(``c3_agent/priv/as_uid.c``, later driven by Task 2/3 from the control plane). It
 writes one identity mapping ``X X 1`` into the ``uid_map``/``gid_map`` of a pid
 the worker has just ``unshare(CLONE_NEWUSER)``-ed, and it is deliberately not a
 general "write any map" tool: everything it may *choose* is decided by four
@@ -45,7 +45,7 @@ from pathlib import Path
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PRIV_DIR = PROJECT_ROOT / "deploy" / "priv"
+PRIV_DIR = PROJECT_ROOT / "c3_agent" / "priv"
 AS_UID_C = PRIV_DIR / "as_uid.c"
 
 #: The pool this file configures the C side with, explicitly: the default
@@ -165,13 +165,13 @@ def driver(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """``as_uid.c`` + ``priv_common.c`` built the way the image builds them.
 
     ``-Wall -Wextra`` clean and an empty ``stderr`` is the bar the other
-    ``deploy/priv`` lanes hold themselves to, and the build is what makes these
+    ``c3_agent/priv`` lanes hold themselves to, and the build is what makes these
     expectations test *this* revision instead of a copy of the rules.
     """
     cc = shutil.which("cc")
     if cc is None:
         raise RuntimeError(
-            "the face-A lane compiles deploy/priv/as_uid.c on the host and "
+            "the face-A lane compiles c3_agent/priv/as_uid.c on the host and "
             "needs a C compiler (`cc`); a skipped lane reads exactly like a "
             "passing one"
         )

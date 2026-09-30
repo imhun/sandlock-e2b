@@ -125,7 +125,7 @@ F1 探针当时判"userns 需要 `CAP_SYS_ADMIN`"，那是在**本机 OrbStack �
 | `e2b-slot-spawn` | `cap_setuid,cap_setgid+ep` | `spawn --uid X --gid X -- <sandlock-supervise 绝对路径> <args…>`；内部 `setgroups([])`→`setgid(X)`→`setuid(X)`→`execve`。`argv[0]` 钉死为 supervise 绝对路径、X 必须在已配 uid 池内，所以它不是「以任意 uid 跑任意程序」的通用工具；**不 shell、也不转手 exec 别的 setuid 工具**（实测那样 caps 会在 exec 时丢失：`setresuid failed: EPERM`）。槽位 exec 后自动零 cap（uid 变更清空 permitted/effective，supervise 自身无 file caps）。 |
 | `e2b-maint` | `cap_chown,cap_dac_override+ep` | `chown --uid X [--gid G] [--recursive] --path P`、`chown --worker …`、`rm --path P`、`walk --path P`。P 必须经 `realpath` 落在**四根**之一之下：`E2B_WORKSPACE_BASE`、`E2B_STATE_BASE`（N27，平台自己的记录/日志/checkpoint/`.route-b` 在这）、`E2B_SHARED_VOLUME_ROOT`（导出根，`_volumes`/`_images` 在这）、`E2B_IMAGE_CACHE_DIR`（**仅当显式非空**，沙箱 secret 文件 `<image_cache_dir>/secrets/<id>/` 在那）；`..`/符号链接逃逸一律拒绝；`rm`/`chown` 还必须**严格在**根之下（不接受根本身）。 |
 
-两者共用一份校验模块（`deploy/priv/priv_common.c`）：uid 池范围、根白名单、参数
+两者共用一份校验模块（`c3_agent/priv/priv_common.c`）：uid 池范围、根白名单、参数
 形状各只有一处实现，避免「其中一份忘了检查」。**broker 的职责分工（c1 之后）**：
 route-B 的 `RouteBConfig.spawner` 指向 `e2b-slot-spawn`（唯一的"以池内 uid 起进程"原语）；
 `chown` 由 `e2b-maint` 保留（worker 是 `0770` 的**属组**而不是属主，自己 chown 不了）；
@@ -258,7 +258,7 @@ cap**」。因此 broker 必须落在沙箱不可达的路径，且路径本身�
   uid 必须在池内（**永不接受 uid 0**）、`spawn` 的 program 钉死为 `sandlock-supervise`
   绝对路径、`maint` 的路径必须 `realpath` 落在白名单根之下（四根：`E2B_WORKSPACE_BASE`、
   `E2B_STATE_BASE`、`E2B_SHARED_VOLUME_ROOT`、`E2B_IMAGE_CACHE_DIR`（仅当显式非空）——
-  顺序与「仅当非空」的规则由 `deploy/priv/priv_common.c::priv_root_paths()` 与
+  顺序与「仅当非空」的规则由 `c3_agent/priv/priv_common.c::priv_root_paths()` 与
   `envd_service/priv_helpers.py::_root_paths()` 逐字钉住，两侧不一致 hello 握手就拒服）。
   沙箱若真能 exec broker 就等于拿到 `cap_setuid`——这是这条路线**接受**的风险，
   用上述四条把它压到「需要先突破 DAC + Landlock」的前提里。

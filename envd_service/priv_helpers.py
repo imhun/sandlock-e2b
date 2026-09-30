@@ -37,7 +37,7 @@ outside every sandbox mount view) and do the privileged step themselves:
   records live) or ``<shared_volume_root>/`` only (``realpath``, so ``..`` and
   symlinks cannot escape).
 
-Both link one shared validator (``deploy/priv/priv_common.c``) so the pool
+Both link one shared validator (``c3_agent/priv/priv_common.c``) so the pool
 range / root whitelist / argument shapes cannot drift apart.
 
 ``E2B_PRIV_HELPERS``:

@@ -244,8 +244,8 @@ signal number"*），由 supervisor 去杀它自己的孩子。
 
 - **接口要窄**：动词白名单（`mkdir`/`write`/`extract`/`chown`/`rm`/`walk` 按需取子集）+
   `realpath` + 路径白名单 + uid 必须落在池内。
-- **纪律复用，不要新写一套**：`deploy/priv/priv_common.c` 已经有 `realpath` + 四根白名单 +
-  `FTS_PHYSICAL` + `lchown`/`unlinkat`（符号链接永不跟随），并且 `deploy/priv/maint.c` 的 usage
+- **纪律复用，不要新写一套**：`c3_agent/priv/priv_common.c` 已经有 `realpath` + 四根白名单 +
+  `FTS_PHYSICAL` + `lchown`/`unlinkat`（符号链接永不跟随），并且 `c3_agent/priv/maint.c` 的 usage
   头已经把 `chown`/`rm`/`walk`/`serve`/`ping` 五种形态写全 —— **直连 CLI 形态就是 agent 要用的
   形态**。已有同形单测 `tests/unit/test_priv_helpers.py`。
 - **鉴权**：CP → agent 用 token / mTLS。仓库里有现成形态：`deploy/quota_agent/` 的
@@ -1833,7 +1833,7 @@ Task 7 之前，C3 的回退故事有一条"两条路并存"的便利：新树�
 - **CP 侧先例与协调**：`deploy/quota_agent/`（"worker 外包特权给服务端 agent"的现成形态，
   注意它在 k8s 里没部署）、`docs/control-plane-multi-replica.md`（Redis + `flock` 协调）、
   `docs/production-deployment-requirements.md` §2.4.4（W4）。
-- **路径纪律（要复用，不要重写）**：`deploy/priv/priv_common.c`、`deploy/priv/maint.c`
+- **路径纪律（要复用，不要重写）**：`c3_agent/priv/priv_common.c`、`c3_agent/priv/maint.c`
   （usage 头把 `chown`/`rm`/`walk`/`serve`/`ping` 五种形态写全了；直连形态就是 CP 侧作业要用的形态）。
 - **槽位身份的源码依据（§2.1 的更正）**：
   `third_party/sandlock/crates/sandlock-core/src/context.rs`（`unshare(CLONE_NEWUSER)`、

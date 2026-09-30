@@ -4,7 +4,7 @@ The deployed worker runs as uid 65534 with no effective capabilities. Route B
 still has to start one ``sandlock-supervise`` per sandbox *as that sandbox's
 own host uid*, and E3.2 still has to own the sandbox's ``0770`` workspace --
 which a non-root worker can only do through the two file-capability brokers
-(``envd_service/priv_helpers.py``, ``deploy/priv/``). This contract drives the
+(``envd_service/priv_helpers.py``, ``c3_agent/priv/``). This contract drives the
 real worker path (control plane create -> agent create -> first exec) and
 asserts, in the shape the process actually runs in:
 

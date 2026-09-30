@@ -12,7 +12,7 @@ Linux kernel with user namespaces, so it builds and runs
     docker run --rm -v "$PWD:/w" -w /w e2b-sandlock-test:latest \\
         sh -c 'python3 -m pytest tests/security/test_agent_image_privilege.py -q'
 
-The image is built from a minimal context (``deploy/priv/`` for the two
+The image is built from a minimal context (``c3_agent/priv/`` for the two
 binaries, the Dockerfile, and -- since Task 2 -- the ``c3_agent`` package
 the CMD runs plus its one ``gateway_common.env`` reader; the image needs nothing
 else), and the grant runs against a
@@ -149,9 +149,9 @@ def _run(*args: str, timeout: float | None = 600) -> subprocess.CompletedProcess
 def agent_image(tmp_path_factory: pytest.TempPathFactory) -> str:
     """``deploy/docker/Dockerfile.agent`` built from a minimal context.
 
-    The context carries exactly what the Dockerfile copies: ``deploy/priv/``
-    (the two binaries it compiles), the ``c3_agent`` package the CMD runs
-    (Task 2's control-plane channel), and the single ``gateway_common.env``
+    The context carries exactly what the Dockerfile copies: the ``c3_agent``
+    package (Task 2's control-plane channel -- CMD target -- plus ``priv/``, the
+    C it compiles into the two binaries) and the single ``gateway_common.env``
     reader it imports -- and nothing else, so a context that grew would hide a
     missing COPY behind a stray file.
     """
@@ -159,9 +159,6 @@ def agent_image(tmp_path_factory: pytest.TempPathFactory) -> str:
     shutil.copy2(
         PROJECT_ROOT / "deploy" / "docker" / "Dockerfile.agent",
         context / "Dockerfile",
-    )
-    shutil.copytree(
-        PROJECT_ROOT / "deploy" / "priv", context / "deploy" / "priv"
     )
     shutil.copytree(
         PROJECT_ROOT / "c3_agent", context / "c3_agent"

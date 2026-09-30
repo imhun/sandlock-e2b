@@ -334,4 +334,4 @@ gid" 依然成立，但理由要读对**：它服务的是 **worker（65534，�
   `envd_service/uid_pool.py::apply_sandbox_ownership`、`envd_service/volumes.py`、
   `envd_service/runtime/checkpoint_store.py::_hand_to_sandbox`、`envd_service/route_b.py`、
   `envd_service/executors/sandlock.py`、`envd_service/agent.py`、`control_plane/api/sandboxes.py`、
-  `deploy/priv/priv_common.c`。
+  `c3_agent/priv/priv_common.c`。

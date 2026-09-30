@@ -1128,6 +1128,10 @@ def test_the_worker_image_has_no_privileged_binary_and_the_agent_image_has_both(
         "COPY --from=builder /tmp/priv/as_uid /tmp/priv/e2b-maint "
         "/var/lib/e2b-priv/" in agent_text
     )
+    # ...and the source it compiles is `c3_agent/priv/`, not `deploy/priv/`
+    # (2026-09-30 move: `deploy/` holds deployment configuration and scripts,
+    # this C is build input for the agent).
+    assert "COPY c3_agent/priv/ /tmp/priv/" in agent_text
     assert "setcap cap_setuid,cap_setgid+ep /var/lib/e2b-priv/as_uid" in agent_text
     assert "setcap cap_chown,cap_dac_override+ep /var/lib/e2b-priv/e2b-maint" in agent_text
 

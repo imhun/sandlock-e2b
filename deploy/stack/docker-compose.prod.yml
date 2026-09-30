@@ -428,7 +428,7 @@ services:
       E2B_C3_AGENT_NODE_ID: c3-agent
       E2B_C3_AGENT_TOKEN: ${E2B_C3_AGENT_TOKEN}
       E2B_C3_AGENT_PORT: "49986"
-      # The four roots `deploy/priv/priv_common.c` validates against, matching
+      # The four roots `c3_agent/priv/priv_common.c` validates against, matching
       # this stack's worker env (one-base layout: tree root and export root
       # coincide).
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes

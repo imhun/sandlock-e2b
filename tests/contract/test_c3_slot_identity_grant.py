@@ -166,13 +166,10 @@ def agent_image(tmp_path_factory: pytest.TempPathFactory) -> str:
         PROJECT_ROOT / "deploy" / "docker" / "Dockerfile.agent",
         context / "Dockerfile",
     )
-    shutil.copytree(PROJECT_ROOT / "deploy" / "priv", context / "deploy" / "priv")
-    shutil.copy2(
-        PROJECT_ROOT / "deploy" / "__init__.py", context / "deploy" / "__init__.py"
-    )
-    shutil.copytree(
-        PROJECT_ROOT / "deploy" / "c3_agent", context / "deploy" / "c3_agent"
-    )
+    # The 2026-09-30 move: the package is top-level `c3_agent/` and its C source
+    # is `c3_agent/priv/`, so one copytree carries both -- exactly the two
+    # things the Dockerfile COPYs.
+    shutil.copytree(PROJECT_ROOT / "c3_agent", context / "c3_agent")
     shutil.copytree(PROJECT_ROOT / "gateway_common", context / "gateway_common")
     built = _run("docker", "build", "-t", AGENT_IMAGE, str(context))
     assert built.returncode == 0, f"{built.stdout}\n{built.stderr}"

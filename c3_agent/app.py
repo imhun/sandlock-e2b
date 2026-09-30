@@ -206,7 +206,7 @@ class AsUidRunner(Protocol):
 class SubprocessAsUidRunner:
     """The production runner: ``as_uid --uid X --pid N``, strictly judged.
 
-    Acceptance is the primitive's own contract (`deploy/priv/as_uid.c`): exit 0,
+    Acceptance is the primitive's own contract (`c3_agent/priv/as_uid.c`): exit 0,
     one exact line on stdout, empty stderr. The ``pid`` here is the **host** pid
     Task 3 resolved from the worker's container pid; Task 2 does not do that
     reverse lookup and never invents a pid.

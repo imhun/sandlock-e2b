@@ -15,14 +15,20 @@
 #
 #   /var/lib/e2b-priv/as_uid     face A: `cap_setuid,cap_setgid+ep`, runs as
 #                                65534. Writes the identity map of a pid the
-#                                worker just unshared (`deploy/priv/as_uid.c`;
+#                                worker just unshared (`c3_agent/priv/as_uid.c`;
 #                                the capability is what lets it name an id at
 #                                all, the 65534 is what makes the *target's*
 #                                namespace accept the write -- §14.2.7).
 #   /var/lib/e2b-priv/e2b-maint  face B: `cap_chown,cap_dac_override+ep`. The
-#                                same broker C1 shipped (`deploy/priv/maint.c`),
+#                                same broker C1 shipped (`c3_agent/priv/maint.c`),
 #                                moved to the agent's file face -- deliberately
 #                                unchanged, capability for capability.
+#
+# `c3_agent/priv/` (moved out of `deploy/` on 2026-09-30) is C source and not a
+# deployment asset; it sits next to its only production consumer. Its one other
+# consumer is the test-runner image (`deploy/docker/Dockerfile.test-runner`),
+# which compiles the retired-socket half -- `deploy/` holds configuration and
+# scripts, so neither copy belongs there.
 #
 # The directory is `0710 root:<agent gid>`, the binaries `0750`, exactly as
 # `docs/c3-privilege-relocation.md` §2 records: DAC (not Landlock) is the
@@ -43,7 +49,7 @@ RUN sed -i \
     && apt-get install -y --no-install-recommends gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY deploy/priv/ /tmp/priv/
+COPY c3_agent/priv/ /tmp/priv/
 RUN cc -O2 -Wall -Wextra -o /tmp/priv/as_uid \
         /tmp/priv/as_uid.c /tmp/priv/priv_common.c \
     && cc -O2 -Wall -Wextra -o /tmp/priv/e2b-maint \

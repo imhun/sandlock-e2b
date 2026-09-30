@@ -2196,7 +2196,7 @@ description），所以"现在多大"只差一次 `fdinfo` 读——现在 `is_e
 
 | 落点 | 变化 |
 |---|---|
-| `deploy/priv/maint.c` | `walk` 对目录输出 `st_blocks×512`；**每个条目只输出一次**（`FTS_D` 与 `FTS_DP` 曾让每个目录打印两行，`walk` 实测确认过；Python 侧一旦开始累加目录，这就会双计） |
+| `c3_agent/priv/maint.c` | `walk` 对目录输出 `st_blocks×512`；**每个条目只输出一次**（`FTS_D` 与 `FTS_DP` 曾让每个目录打印两行，`walk` 实测确认过；Python 侧一旦开始累加目录，这就会双计） |
 | `envd_service/runtime/dir_ledger.py` | `scan_subtree` 的每目录项 = `directory_cost(dir)` + 该目录下的文件 |
 | `envd_service/priv_helpers.py` | 模块级 `dir_size`（in-process）与 `PrivHelpers.dir_size`（broker，累加 `f`/`d`）同一口径 |
 | `envd_service/http/health.py` | `/metrics` 的兜底分支同口径（它只在前两条都读不到时才走到，但不能第三套定义） |

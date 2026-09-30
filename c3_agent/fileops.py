@@ -1,6 +1,6 @@
 """Face B: the agent's file-operation verbs (C3 Task 4, rulings D18.2/D18.3).
 
-``deploy/priv/maint.c`` already carries the three verbs the platform needs --
+``c3_agent/priv/maint.c`` already carries the three verbs the platform needs --
 ``chown`` / ``rm`` / ``walk`` -- and the whole path discipline behind them
 (``realpath`` + the four-root whitelist + the uid-pool gate, all in
 ``priv_common.c``). C3 does not re-implement any of that: this module is a

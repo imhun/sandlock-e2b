@@ -63,7 +63,7 @@ from typing import Any
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PRIV_DIR = PROJECT_ROOT / "deploy" / "priv"
+PRIV_DIR = PROJECT_ROOT / "c3_agent" / "priv"
 MAINT_C = (PRIV_DIR / "maint.c").read_text(encoding="utf-8")
 
 
@@ -393,7 +393,7 @@ def _restore(
 
 
 def _build_broker(binary: Path, *defines: str) -> None:
-    """Build ``deploy/priv`` the way the image does, with optional -D overrides.
+    """Build ``c3_agent/priv`` the way the image does, with optional -D overrides.
 
     ``-Wall -Wextra`` clean is the same bar the module fixture holds the
     shipped build to, so a test that compiles a second variant cannot smuggle a
@@ -442,7 +442,7 @@ def _installed_with_walk_cap(bytes_cap: int, tmp_path: Path):
 
 @pytest.fixture(scope="module")
 def broker_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """``deploy/priv`` built the way the image builds it, and installed.
+    """``c3_agent/priv`` built the way the image builds it, and installed.
 
     The empty ``stderr`` is part of the assertion: ``-Wall -Wextra`` clean is
     the bar the other brokers are held to. The binary then goes to the

@@ -1,7 +1,7 @@
 """Task F1 (Track F): the file-capability broker wiring, at the Python layer.
 
 The two production brokers are compiled C binaries
-(``deploy/priv/slot_spawn.c`` / ``deploy/priv/maint.c``) that run as uid 65534
+(``c3_agent/priv/slot_spawn.c`` / ``c3_agent/priv/maint.c``) that run as uid 65534
 and hold their capability **as a file capability** -- that is what lets a
 non-root worker start a route-B slot at an arbitrary pooled uid and manage
 sandbox-owned trees. Everything the worker *asks* of them is built and
