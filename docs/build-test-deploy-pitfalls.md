@@ -111,6 +111,22 @@ docker run --privileged --rm --entrypoint sh -v "$PWD":/src -w /src/third_party/
 
 （2026-09-30 实测：401 MB，几分钟。宿主 `~/.cargo/registry`（623 MB）也可以挂进去复用。）
 
+**A8. sandlock 相关镜像的清单：谁是谁、谁建的、什么时候才该重建。**
+这些镜像**不是每次构建都会产出的东西**，反复重建既费时，又会让"哪张才是规范形态"变得模糊。
+下表按「用途 → 出处 → 重建策略」记；`tests/unit/test_tool_images_are_documented.py` 钉住
+"脚本里默认用的工具镜像都必须出现在这一节里"（极少数由脚本自己在同轮现烤的 tag、或某轮的历史
+快照 tag，在钉子里按"带原因的白名单"单独记）。
+
+| 镜像 | 用途 | 出处（谁建的） | 重建策略 |
+|---|---|---|---|
+| `sandlock-dev:latest` | **fork 的规范开发/门禁镜像**（amd64、Debian trixie、`WORKDIR /workspace`、入口 `/usr/local/bin/docker-entrypoint.sh` 会把测试降到 uid 65534）—— `third_party/sandlock/scripts/test-all.sh` 注释里的 canonical 形态，`python/verify-wheel.sh` 也在它里面跑 | **配方不在本仓、也不在 fork 树里**（上游/维护者侧；本仓唯一的 Dockerfile 是 `python/wheel-builder/Dockerfile`） | **不要重建、不要删**：`cross-platform-lanes.md` §3 的门禁命令直接用它，本仓无法还原它 |
+| `sandlock-dev-f17:latest` | E2B 侧"dev 形态"：`deploy/scripts/fork-gate.sh` 的默认 `IMAGE`、pitfall A3 的 `cargo check` 用它 | **就是 `deploy/docker/Dockerfile.test-runner` 的产物**（entrypoint `/usr/local/bin/entrypoint.test-runner.sh`、`CMD pytest tests/unit tests/contract`；2026-09-09 建） | 需要时重建：`IMAGE=sandlock-dev-f17:latest ./deploy/scripts/build-test-image.sh`（同一 recipe；它不会自己降权，所以 `fork-gate.sh` 用 `setpriv` 补这一步） |
+| `sandlock-dev-e7:latest` | 2026-09-02 的 manylinux 版 dev 镜像（`manylinux-entrypoint`、`dnf`、`/opt/python/cp314`、rustup@rsproxy、iproute） | 早期手搓，配方不在本仓 | 历史，**不要再指向它**：`fork-gate.sh` 与各文档都已改用 `-f17`；缺了不影响任何 lane |
+| `sandlock-zig-builder:local` | **aarch64 真内核车道的工具镜像**（`deploy/scripts/arm-lane/{xbuild,xbuild-debug,lima-vm}.sh`） | **fork 的 `python/wheel-builder/Dockerfile` 的 `build` 阶段**（`--target build`，确切命令见本节上一段） | 缺了才建（几分钟，吃 buildx 缓存）；**wheel 构建不需要它** |
+| `quay.io/pypa/manylinux_2_34_x86_64:latest` / `..._aarch64:latest` | wheel 构建的 BASE_IMAGE（宿主架构决定用哪个） | `third_party/sandlock/python/build-wheels.sh` 首次构建时自动 pull | 不用手动建；只是缓存 |
+| `e2b-sandlock-test:latest` | E2B 的**测试镜像**（烤进 `wheels/fork/*.whl`）：`test-prod-shaped.sh`、`tests/security` 的生产形态，`deploy/scripts/build-test-image.sh` 是它的 rebuild 入口 | `deploy/docker/Dockerfile.test-runner` | **只有 `wheels/fork/` 变了才重建** —— 不重建就是 B7（31 个 `TypeError: … unexpected keyword argument`）；它本地-only、不推 ACR |
+| `sandlock-e2b-{worker-1..3,control-plane,gateway}:latest` | 4 周前本地单机示例栈（`deploy/compose/docker-compose.yml` 的 `build:`）留下的 tag | compose build | 仓库里**已无任何引用**，属残留（可删） |
+
 ---
 
 ## B. 跑测试 / lane

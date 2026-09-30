@@ -3601,3 +3601,37 @@ cargo / aarch64 车道的入口、镜像、产物落点；已作废的 `third_pa
 
 **验证**：钉子 3 条绿；反臂（把两个资产文件造回来 + `git add -f`）→ 2 条红并点名路径（可证伪）；
 全量 `tests/unit` **1937 passed**（= 之前 1934 + 新钉子 3），16 个失败仍是既有平台/缺 fakeredis 项。
+
+## 2026-09-30 sandlock 相关镜像立清单（A8）：谁是谁、谁建的、什么时候才该重建
+
+**起因**：用户要求"记录这些镜像，防止后面反复重建"。
+
+**做法**：`docs/build-test-deploy-pitfalls.md` 新增 **A8**，逐个记「用途 → 出处 → 重建策略」，
+全部按本机实测（镜像 id/入口/history + 建库时间）：
+
+- `sandlock-dev:latest` —— fork 的规范开发/门禁镜像（Debian trixie、`WORKDIR /workspace`、
+  入口 `/usr/local/bin/docker-entrypoint.sh` 把测试降到 65534）。**配方不在本仓、也不在 fork 树里**
+  （实查：fork 里唯一的 Dockerfile 是 `python/wheel-builder/Dockerfile`）⇒ **不要重建、不要删**；
+- `sandlock-dev-f17:latest` —— 实测**就是** `deploy/docker/Dockerfile.test-runner` 的产物
+  （entrypoint `entrypoint.test-runner.sh` + `CMD pytest tests/unit tests/contract`），
+  `fork-gate.sh` 的默认 `IMAGE`；重建 = `IMAGE=sandlock-dev-f17:latest ./deploy/scripts/build-test-image.sh`；
+- `sandlock-dev-e7:latest` —— 2026-09-02 的 manylinux 版手搓镜像（`manylinux-entrypoint`、`dnf`、
+  `/opt/python/cp314`、rustup@rsproxy、iproute），历史，别再指向；
+- `sandlock-zig-builder:local` —— aarch64 车道工具镜像，由 fork 的 wheel-builder Dockerfile 的
+  `build` 阶段建（A7 有确切命令）；
+- `quay.io/pypa/manylinux_2_34_{x86_64,aarch64}` —— wheel 构建的 BASE_IMAGE，首次构建自动 pull；
+- `e2b-sandlock-test:latest` —— E2B 测试镜像，**只有 `wheels/fork/` 变了才重建**（否则踩 B7 的
+  31 个 `TypeError`）；
+- `sandlock-e2b-{worker-1..3,control-plane,gateway}:latest` —— 4 周前单机示例栈残留，仓库已无引用。
+
+**钉子**：`tests/unit/test_tool_images_are_documented.py` —— 扫 `deploy/scripts/**/*.sh` 里出现的
+工具镜像名，必须能在 A8 里找到；"同脚本现烤的 tag""某轮快照 tag"走**带原因的白名单**（照
+`test_docs_only_point_at_repo_artifacts.py` 的形状）。它当场抓到两件真事：`e2b-sandlock-test:c4`
+（`c4-prjquota-window.sh` 用 Dockerfile heredoc 从目标机 worker 镜像现烤）、
+`e2b-sandlock-test:task12cur`（Task 12 那轮的快照 tag —— **已被本日的镜像清理删掉**，重跑要给
+`E2B_TEST_IMAGE=e2b-sandlock-test:latest`）；外加一个正则误报（`e2b-sandlock-quota-agent:latest`
+被当成 `sandlock-quota-agent`，已用 `(?<!e2b-)` 排除）。
+
+**验证**：新钉子 4 条绿；全量 `tests/unit` **1941 passed**（= 1937 + 4），16 个既有失败不变。
+顺带清掉两个 0 文件的空残留目录：`third_party/third_party/sandlock/tmp/wt-fix`、
+`third_party/sandlock/sandlock-src/python`。
