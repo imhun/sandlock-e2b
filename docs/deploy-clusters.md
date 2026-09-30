@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.17（2026-09-30，autoscaler 并入控制面、本地池退役，当前版本 `0.1.0-806-g4392042-20260930-171355`）**；§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.18（2026-09-30，N51 缩容目标修正，当前版本 `0.1.0-808-g1ca681e-20260930-175431`）**；§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -989,6 +989,27 @@ undeterminable: name must be provided"* —— replace 形态要求 body 自带 
 **残留**：见 `docs/open-issues.md` **N51** —— `pod-deletion-cost` 只被 ReplicaSet 控制器读，StatefulSet
 缩容永远删最高序号，所以"退出的是你 drain 的那个节点"只在两者一致时成立（本次验收里空闲的正是
 最新的 `-2`，所以走的是一致那条路）。修法两选一（未做），触发条件写在 N51 行。
+
+### 7.18 N51：缩容只许删"它真会删的那个 pod"（**2026-09-30，已上线 `0.1.0-808-g1ca681e-20260930-175431`**）
+
+§7.17 的残留。修法与理由见 `docs/open-issues.md` N51：`ScaleBackend.retire_victim(candidates)`
+由**后端**回答"这一轮缩容真会删谁"（Deployment = 循环的首选；StatefulSet = 最高序号，且必须
+在候选里，否则回 `None` = 谁都别删），循环在第 5 步与第 3 步都先过这一问，`None` 就什么都不做
+并打一条按节点去重的 `scale-down held` 告警；第 3 步顺带补上一直缺的 `current > min_replicas`。
+
+**集群验收（真构造出危险形状，不是推断）**
+
+| 步 | 动作 | 读数 |
+|---|---|---|
+| 准备 | 4 个沙箱铺满 `-0`/`-1`，`MIN=3` 扩容 ⇒ `e2b-worker-2` 起来；再建 1 个沙箱 —— 调度器按"剩余容量优先"把它放到最新的 `-2` | `fleet/sandboxes` = `{worker-2:[1], worker-1:[2], worker-0:[1]}` |
+| 造危险形状 | 杀掉 `-0`/`-1` 上的沙箱（两台空闲），只留 `-2` 上那一个 | `{"e2b-worker-2":["sbx_8885214d353aa856"]}` |
+| **必须拒绝** | 放回 `MIN=2`（清单值） | **120 s 内 `sts` 一直是 3/3**（远超 60 s 冷却），三个 pod 全在，**`-2` 上的沙箱照常 `exec`**；日志恰好一条（按节点去重）`scale-down held: ... would delete a different pod than the idle node e2b-worker-0 (it shrinks from the top)` |
+| **必须收它** | 杀掉 `-2` 上那个沙箱 ⇒ 最高序号变空闲 | 循环立刻 drain + retire，`sts` 3→2，日志 `retired drained node e2b-worker-2`（**是 `-2`**，不是它排序上的首选 `-0`） |
+| 收尾 | | `fleet/sandboxes` = `{}`；两节点 `reservedMemoryMB=0`；`kubectl diff` 与仓库规格 **0 行**；`control-plane` 2/2、`e2b-worker` 2/2、`redis` 1/1 |
+
+修前同一形状的行为（按代码推断，未再复现）：循环 drain `-0`（候选表按 node id 排序，`-0` 在前）、
+`remove_node` 打注解后整副本 -1 ⇒ **控制器删掉的是 `-2`，把上面那个活沙箱连同 pod 一起收走** ——
+而循环从没选过它。
 
 ## 8. 改部署的入口
 
