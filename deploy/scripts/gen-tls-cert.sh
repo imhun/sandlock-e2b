@@ -39,7 +39,23 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
     -subj "/CN=localhost" \
     -addext "subjectAltName=$(IFS=,; echo "${sans[*]}")" \
     -addext "extendedKeyUsage=serverAuth"
-chmod 600 "$key"
+
+# C3 Task 5: the control plane serves this pair, and it now runs as **uid
+# 65534** in every lane (the k8s Deployment's `runAsUser`, and `user:
+# "65534:65534"` on the compose stacks' `control-plane`). The pair is mounted
+# read-only (`./tls:/tls:ro`) and owned by whoever ran *this* script -- not by
+# 65534 -- so a `0600` key (and a `0600` cert, which is what `umask 077` gives
+# you) is unreadable to it and uvicorn dies at startup with
+# `PermissionError: [Errno 13] ... /tls/tls.key`. Measured 2026-09-30 on the
+# `deploy/stack` shape; both arms are in `docs/deploy-clusters.md` §7.12.
+#
+# Fixed by mode rather than by owner/group on purpose: this recipe is the
+# **local-verification, self-signed** one (see the header), a non-root operator
+# cannot `chown 65534` the key, and the k8s sibling delivers the same pair
+# through `kubectl create secret tls`, whose in-pod default mode is `0644`.
+# Production does not use this script: it terminates TLS at the ingress, or
+# ships a key whose owner/group the control plane actually carries.
+chmod 644 "$cert" "$key"
 
 echo "wrote $cert and $key"
 echo "SAN: $(IFS=,; echo "${sans[*]}")"

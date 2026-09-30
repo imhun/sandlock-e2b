@@ -130,7 +130,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.10（2026-09-29，C3 收口评审）**；§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.12（2026-09-30，compose 车道评审的两条回归）**；§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -624,6 +624,171 @@ workspace-root-init: /var/lib/e2b-sandboxes/workspaces/_migrate owner=65534 mode
 
 **冒烟**：`multinode_smoke.py` = **`MULTI-NODE SMOKE OK`**（4 箱 2+2、命令/文件/stdin 过网关、
 kill 后两个 worker 的预约都归 0）。
+
+### 7.11 compose 车道的三条缺口收口（**2026-09-30，分支 `feat/c3-compose-gaps`；未上线，只在本地栈实测**）
+
+§7.9/§7.10 的读数全在 k8s。这一轮补的是**三个分离 compose 栈**（`deploy/compose/docker-compose.prod.yml`、
+`deploy/compose/docker-compose.multinode.yml`、`deploy/stack/docker-compose.prod.yml`）里 C3 明知留下的
+三个缺口：compose CP 仍是 root、没有策略层、multinode 没有 Redis。前两个是"k8s 有、compose 没有"的
+等价物缺失，第三个让那条车道的孤儿巡检整条失效。改法与现场读数（全部来自本机 multinode 栈，
+镜像 = 本树构建的 `:c3-gaps`）：
+
+**① CP 收到 65534 + 属主交棒**
+
+三个栈的 `control-plane` 都加了 `user: "65534:65534"`（= k8s 的 `runAsUser/runAsGroup: 65534`）。
+栈里**只剩两个 root 服务**，两个都必需：`image-cache-init`（root one-shot，做属主交棒）与面 B
+`c3-agent-maint`（NAS 上 `chown` 只有 uid 0 做得成）。`image-cache-init` 现在同时承担 k8s
+`storage-init` 的活：D24 的卷存储交棒（**非递归**、幂等、逐目标校验、失败具名 FATAL，措辞与 k8s
+`storage-init` 同源）+ CP 自己写的平台命名空间 + "根是 65534 或 1777"那两条。
+
+```
+$ docker exec c3gaps-control-plane-1 id
+uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup)
+$ docker exec c3gaps-control-plane-1 sh -c 'grep -E "^(Uid|CapEff)" /proc/self/status'
+Uid:	65534	65534	65534	65534
+CapEff:	0000000000000000
+$ curl -sS -X POST http://127.0.0.1:3300/volumes -H 'X-API-Key: local-key' \
+      -H 'Content-Type: application/json' -d '{"name":"c3-gaps-store-probe"}'
+{"volumeID":"vol_329a97c908c8426f", …}                                    # HTTP 201
+$ docker exec c3gaps-control-plane-1 stat -c '%n %u:%g %a' /var/lib/e2b-sandboxes/_volumes{,_meta}
+/var/lib/e2b-sandboxes/_volumes 65534:65534 755
+/var/lib/e2b-sandboxes/_volumes/_meta 65534:65534 755
+```
+
+（CP 的 `CapBnd` 仍是 runtime 默认 `0xa80425fb` —— 与 k8s CP 主容器一致：那边也只钉
+`runAsUser/runAsGroup`，不写 `capabilities.drop`；非 root ⇒ `CapEff` 为 0。）
+
+**② agent 两面进专用网络 `agent-plane`**（k8s 的 NetworkPolicy 在 compose 的等价物）
+
+三个栈都是：`c3-agent` / `c3-agent-maint` **只**挂 `agent-plane`，`control-plane` 同时挂
+`default`（`worker ↔ CP` 那条不变）与 `agent-plane`，worker 全部留在默认网络。
+
+```
+$ docker inspect -f '{{.Name}} {{range $k,$v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}} {{end}}' \
+      c3gaps-c3-agent-1 c3gaps-control-plane-1 c3gaps-worker-1-1
+/c3gaps-c3-agent-1      c3gaps_agent-plane=192.168.117.2
+/c3gaps-control-plane-1 c3gaps_agent-plane=192.168.117.4 c3gaps_default=192.168.147.6
+/c3gaps-worker-1-1      c3gaps_default=192.168.147.5
+$ docker exec c3gaps-worker-1-1 python3 -c 'import socket; socket.gethostbyname("c3-agent")'
+gaierror: [Errno -2] Name or service not known      # worker 解析不到 agent 的两个服务名
+```
+
+⚠ **本机（OrbStack）证明不了这条的 IP 那一半**：OrbStack 的已知行为是不同 user-defined 网络之间
+仍可按 IP 互通（上游 issue orbstack#1944 / #2492），实测 worker 直连 `192.168.117.2:49985`
+**是通的**（标准 Docker daemon 会由 `DOCKER-ISOLATION-STAGE-2` 丢掉这条包；OrbStack 的 VM 里
+`iptables` 这个命令都不存在）。所以这条拒止在本机只到"名字 + 凭据"两层：worker 拿着 agent 的
+IP 打过去，agent 自己按 token 具名拒（实测 `POST …/agent/grant-slot` 无 token / 错 token 都是
+`401 {"error":"unauthorized"}`），而 **worker 侧没有 token 可用**（`E2B_C3_AGENT_TOKEN` 只在 CP
+与两个面上，`tests/unit/test_c3_agent_manifest.py` 三方都钉着）。**要 IP 层真拒止，目标机必须是
+实现了网络隔离的 Docker daemon**（本仓库的目标机 Rocky Linux + 原生 Docker 属于这一类）；
+本机验收的结论按"名字层 + 凭据层"读。
+
+反向那一半（agent 只出得去 CP）在本机是**真的**（`internal: true` 生效）：
+`docker exec c3gaps-c3-agent-1 python3 …` 连 `worker-1:49983` = `OSError: [Errno 101] Network is
+unreachable`，连 `control-plane:3000` = ok。
+
+**③ multinode 栈补 Redis，自愈真的活了**
+
+`deploy/compose/docker-compose.multinode.yml` 加了 `redis`（`redis:8-alpine` + `--requirepass
+${E2B_REDIS_PASSWORD:-local-redis-password}`，与另外两个栈同形），CP 加
+`E2B_REDIS_URL: redis://:…@redis:6379/0` + `depends_on: redis: service_healthy`，面 B 打开
+`E2B_C3_AGENT_SCAN=on`。门的读数（面 B 的日志，30s 首扫 + 120s 周期）：
+
+```
+INFO:deploy.c3_agent.scan:c3-agent inventory: node=c3-agent scanned=0 protected=0 orphans=0 removed=0 failed=0 deferred=-
+```
+
+手工放一棵沙箱形状的孤儿树（`/var/lib/e2b-sandboxes/sbx_<32 hex>/`，65534）后下一轮：
+`scanned=1 protected=0 orphans=1 removed=1 failed=0 deferred=-`，树消失 —— "CP 决策 + agent 执行"
+整条链路真跑过。
+
+⚠ **顺带量到并修掉的两个真缺陷**（详见 §11.2.1 第 14/15 条）：compose 的巡检上报原来被源 IP
+因子整条拒（面 B 上报、期望值却只取面 A 的地址 ⇒ 每轮 403），以及 agent 入口不放开 INFO ⇒
+**成功**轮次那一行看不见。前者是"给 Redis 就活了"这个前提本身不成立的原因，两者都已在同一分支修掉。
+
+**测试与验收**：本树 unit 相关文件 423 passed（C3/worker/compose/deploy 一组，与报告 §3.6 同一次运行）、
+`tests/contract/test_c3_worker_kernel_identity.py` 8 passed（真容器）；
+`multinode_smoke.py` = `MULTI-NODE SMOKE OK`（4 箱 2+1+1，命令/文件/stdin 过网关、kill 后预约归 0）；
+判据 13 `JUDGMENT 13: all assertions passed`、判据 16 `JUDGMENT 16: all assertions passed`
+（并发 in-flight 3 vs 反臂 1）。全部命令与原始输出见
+`.superpowers/sdd/c3-compose-gaps-report.md`。
+
+### 7.12 compose 车道评审：CP 变 65534 带出的两条回归（**2026-09-30，已修；只在本地栈实测**）
+
+§7.11 的 CP-uid 改动在**两个我上一轮没有起过的栈**上带出两条回归；这一节是它们的现场读数。
+两条都在 `deploy/stack` 形态（`-p c3stack`，镜像同样来自本树 `:c3-gaps`）上量的，因为那正是
+有 buildkit、也挂了 `./tls` 的那个栈。
+
+**① `deploy/stack` 的控制面读不到 buildkit 的 unix socket**
+
+rootless buildkitd 把 socket 建在 `buildkit-data` 卷里（`srw-rw---- 1000:1000`，builder 服务
+用它镜像自己的 uid 1000），而控制面是 65534、没有那 1000 组位；k8s 那份靠 **pod 级
+`fsGroup: 1000`** 拿到（§13.6 的 B5），compose 没有等价物 ⇒ `Template.build` 在这条车道上
+直接坏掉。修法是给该服务加 `group_add: ["1000"]`（只在这一个栈上加，另外两个栈没有 builder）。
+
+```console
+$ docker exec c3stack-control-plane-1 sh -c 'id; stat -c "%n %F %a %u:%g" /run/buildkit/buildkitd.sock'
+uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup),1000
+/run/buildkit/buildkitd.sock socket 660 1000:1000
+$ docker exec c3stack-control-plane-1 sh -c 'grep ^Groups /proc/self/status'
+Groups:	1000 65534
+$ docker exec c3stack-control-plane-1 buildctl --addr unix:///run/buildkit/buildkitd.sock debug workers
+ID                            PLATFORMS
+qaaf72gm7s2a34gq2xdk2lb0u     linux/amd64,linux/amd64/v2,…            # 控制面自己的 buildctl 通了
+$ # 反臂：同一个 buildctl，换成"我上一轮发出的那个形态"（uid 65534、没有那组）
+$ docker run --rm -u 65534:65534 -v c3stack_buildkit-data:/run/buildkit:ro \
+    --entrypoint buildctl e2b-sandlock-control-plane-gateway:c3-gaps \
+    --addr unix:///run/buildkit/buildkitd.sock debug workers
+error: failed to list workers: Unavailable: connection error: desc = "transport: Error while
+dialing: dial unix /run/buildkit/buildkitd.sock: connect: permission denied"
+```
+
+（`docker exec -u 65534:65534` **不能**当反臂：exec 会带上容器的 `GroupAdd`，`Groups: 1000 65534`、
+照样能连 —— 所以反臂用 `docker run -u 65534:65534` 且**不加** `--group-add` 重建那个形态。）
+
+**② 文档里的 TLS 配方现在会把控制面打死**：`gen-tls-cert.sh` 写 `0600` 的 key，而
+`deploy/stack`/`deploy/compose prod` 把 `./tls` 只读挂给 uid 65534 的 CP —— 它读不了不是自己的
+`0600` 文件。（bind mount 的属主在**原生 Linux** 上是宿主 uid；OrbStack 会把宿主 bind mount
+呈现成"容器自己的 uid"，所以本机要用**卷**来复现那个属主关系，见下面 `c3stack_tlsdata`。）
+
+```console
+$ docker run --rm -u 65534:65534 -v c3stack_tlsdata:/tls:ro alpine \
+    sh -c 'stat -c "%n %a %u:%g" /tls/tls.key; head -c1 /tls/tls.key >/dev/null && echo readable || echo "NOT readable"'
+/tls/tls.key 600 0:0
+NOT readable by 65534
+$ # 旧配方（root:root 0600）+ TLS 打开
+$ docker inspect c3stack-control-plane-1 --format 'status={{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}}'
+status=restarting exit=1 restarts=6
+$ docker logs c3stack-control-plane-1 | tail -3
+  File "/usr/local/lib/python3.14/site-packages/uvicorn/config.py", line 129, in create_ssl_context
+    ctx.load_cert_chain(certfile, keyfile, get_password)
+PermissionError: [Errno 13] Permission denied
+$ # 修好之后（生成器改成 0644，两个文件都是）
+$ docker run --rm -v c3stack_tlsdata:/tls alpine chmod 644 /tls/tls.key
+$ docker inspect c3stack-control-plane-1 --format 'status={{.State.Status}}'
+status=running
+$ docker logs c3stack-control-plane-1 | grep -i uvicorn | tail -1
+INFO:     Uvicorn running on https://0.0.0.0:3000 (Press CTRL+C to quit)
+$ curl -sS -k https://127.0.0.1:3400/healthz -w ' HTTP %{http_code}\n'
+{"status":"ok"} HTTP 200
+$ curl -sS http://127.0.0.1:3400/healthz -w ' HTTP %{http_code}\n'      # 同端口明文必须失败
+HTTP 000
+$ echo | openssl s_client -connect 127.0.0.1:3400 -servername control-plane 2>/dev/null | openssl x509 -noout -subject -ext subjectAltName
+subject=CN=localhost
+X509v3 Subject Alternative Name: DNS:localhost, IP Address:127.0.0.1, IP Address:::1, DNS:control-plane
+```
+
+修法选了**改模式**而不是改属主/组：这是**本地自签验证**配方（脚本头部就这么写），跑它的运维
+通常不是 root、`chown 65534` 做不到；而 k8s 那条同源交付走 `kubectl create secret tls`，Secret
+在 pod 内的默认模式本来就是 `0644`。生产不用这个脚本（TLS 在入口终结，或用属主/组与 CP 一致的
+证书）。⚠ 顺带记一条仍然成立的边界：这条车道把 TLS 打开之后，**worker 还要信任那张自签 CA**
+（`E2B_CONTROL_PLANE_URL` 也得改成 `https://`），那是配方注释里早就点明的一步，本轮没有替它做。
+
+**同批的另外三件（评审的 minor）**：`image-cache-init` 补上 k8s `storage-init` 的那套能力集
+（`drop: [ALL]` + `CHOWN/DAC_OVERRIDE/FOWNER`；实测 `0xb` 够、`0x9` 在 `mkdir -p <65534-owned>/_oci`
+就 `Permission denied`）；缓存交棒的非递归形补上钉子（行为臂看不到它）；两处会误导的注释
+（"k8s **control-plane pod** 的 init"其实是 **agent DaemonSet** 的；"Everything it needs to own"
+过宽 —— `state/`、`_runtime`、`.route-b` 是 CP 以根属主身份在可写根**之下**建的）。
 
 ## 8. 改部署的入口
 

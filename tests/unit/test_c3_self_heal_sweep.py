@@ -33,7 +33,11 @@ import httpx
 import pytest
 
 from control_plane.app import create_app as create_control_app
-from control_plane.c3_agent_client import AgentTarget, C3AgentClient
+from control_plane.c3_agent_client import (
+    AgentTarget,
+    C3AgentClient,
+    ComposeAgentAddressResolver,
+)
 from control_plane.config import Settings as ControlSettings
 from control_plane.node_address import NodeEndpoint, StaticAddressResolver
 from control_plane.registry.manager import SandboxRegistry
@@ -749,6 +753,82 @@ async def test_a_report_from_the_wrong_network_position_is_refused(
         "code": 403,
         "message": (
             f"a report for agent {HOST} came from 10.9.9.9, expected {AGENT_IP}"
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_compose_report_is_accepted_from_either_face(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compose lane's two faces are two containers, so two addresses.
+
+    Measured on the live multinode stack (2026-09-30): the scanner is face B
+    (the container that mounts the workspaces), so its report arrives from
+    ``c3-agent-maint``'s address while the instruction path is addressed by
+    ``c3-agent``'s. A resolver that named only face A refused every report --
+    ``a report for agent c3-agent came from 192.168.117.3, expected
+    192.168.117.2`` -- which is the shape that made the lane's self-heal inert
+    even with a shared record store. Both faces' addresses are this agent's;
+    the union is *not* a widening, and a third address is still refused.
+    """
+    cp = _shape(workspace)
+    orphan_path = cp.tree(ORPHAN)
+    hosts = {
+        "c3-agent": ("10.44.0.7",),
+        "c3-agent-maint": ("10.44.0.9",),
+    }
+    monkeypatch.setattr(
+        "control_plane.c3_agent_client._host_source_ips",
+        lambda host: hosts[host],
+    )
+    # The compose shape's agent: one name (`c3-agent`) that is both the URL host
+    # the control plane dials and the identity each face compares the
+    # instruction's path against (D12). Only the address differs between the
+    # two faces.
+    agent = create_agent_app(
+        settings=AgentSettings(
+            token=AGENT_TOKEN,
+            node_id="c3-agent",
+            maint_path=MAINT,
+            workspace_base=str(cp.workspace_base),
+            state_base=str(cp.state_base),
+        ),
+        maint_runner=cp.maint,
+    )
+    cp.app.state.c3_agent_client = C3AgentClient(
+        resolver=ComposeAgentAddressResolver(
+            "http://c3-agent:49985", "http://c3-agent-maint:49986"
+        ),
+        token=AGENT_TOKEN,
+        timeout_s=5.0,
+        file_op_timeout_s=30.0,
+        transport=httpx.ASGITransport(app=agent),
+    )
+
+    async def report(source_ip: str):
+        async with cp.client_for(source_ip=source_ip) as client:
+            return await client.post(
+                "/internal/nodes/c3-agent/agent/inventory",
+                headers={"X-Internal-Key": AGENT_TOKEN},
+                json={"sandboxes": [ORPHAN]},
+            )
+
+    # Face B's address -- the scanner's -- is accepted, and the orphan goes.
+    accepted = await report("10.44.0.9")
+    assert accepted.status_code == 200
+    assert accepted.json()["removed"] == [ORPHAN]
+    assert not orphan_path.exists()
+    # ...and so is face A's (either container is this agent).
+    assert (await report("10.44.0.7")).status_code == 200
+    # A third address is still refused, and the refusal names the whole union.
+    refused = await report("10.9.9.9")
+    assert refused.status_code == 403
+    assert refused.json() == {
+        "code": 403,
+        "message": (
+            "a report for agent c3-agent came from 10.9.9.9, expected one of "
+            "10.44.0.7, 10.44.0.9"
         ),
     }
 

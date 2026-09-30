@@ -832,6 +832,74 @@ worker 侧的特权面并没有真的消失。**(d) 是唯一的例外，因为�
     惰性的（清单注释里写了"给它一份记录存储就开"的触发条件，并双向 pin 住它保持关闭）。两条都与
     Task 5/6 记的"compose CP 还不是 65534"同批。
 
+    **已收口（2026-09-30，分支 `feat/c3-compose-gaps`；现场读数见
+    `docs/deploy-clusters.md` §7.11，逐条证据见 `.superpowers/sdd/c3-compose-gaps-report.md`）**
+    —— 连同同批的第三条"compose CP 还不是 65534"：
+
+    * **CP 收到 65534**：三个栈的 `control-plane` 服务都加 `user: "65534:65534"`，与 k8s 的
+      `runAsUser/runAsGroup: 65534` 同姿态；栈里剩下的 root 服务**恰好两个**，且都必需
+      （`image-cache-init` 与面 B `c3-agent-maint`，两者的 `chown` 在 NAS 上只有 uid 0 做得成）。
+      它需要**拥有**的东西由 `image-cache-init`（compose 车道对应 k8s `storage-init` 的那一个
+      root one-shot）准备：D24 的卷存储交棒 `_volumes` / `_volumes/_meta`（**非递归**、幂等、
+      逐目标校验、失败具名 FATAL，措辞与 k8s `storage-init` 逐字同源），加上 CP 自己写的
+      `_builds/_secrets/_snapshots/_templates` 与 `_snapshots/_migrate`、以及"根是 65534 或 1777"
+      那两条（k8s `workspace-root-init` 的纪律）。实测：卷创建 201，`_volumes` 与 `_meta` 都是
+      `65534:65534`。
+    * **策略层**：三个栈都加了 `agent-plane` 专用网络——**只有两个 agent 面和 CP 在上面**，
+      worker 仍留在项目默认网络（`worker ↔ CP` 那条不变，CP 同时在两张网上）。k8s 用
+      NetworkPolicy 表达的"只有 CP 能进 agent 的两个端口"，compose 车道改由**拓扑**表达
+      （agent 的两个服务名只存在于那张网，worker 连**名字都解析不到**）。
+      ⚠ **本机（OrbStack）证明不了 IP 那一半**：其文档记录的已知行为是不同 user-defined
+      网络之间仍可按 IP 互通（上游 issue #1944/#2492），实测从 worker 直连 agent 的
+      agent-plane 地址是**通的**（标准 Docker daemon 由 `DOCKER-ISOLATION-STAGE-2` 丢弃这条
+      包，OrbStack 的 VM 里连 iptables 都没有）。所以本车道的连接层拒止**依赖 daemon 实现**，
+      而凭据层（agent 的 token + 指令路径上的身份比对）仍然全量生效——它按 k8s 注释里那句
+      "第二半，不是替代"照旧拒掉任何真到了端口的 worker 请求（实测 401）。
+    * **multinode 的 Redis**：`deploy/compose/docker-compose.multinode.yml` 加了 `redis` 服务
+      （口令/URL 与另外两个栈逐字同形），CP 加 `E2B_REDIS_URL`，面 B 随之把 `E2B_C3_AGENT_SCAN`
+      打开——门 (a) 不再每轮推迟，那一行 `c3-agent inventory: … deferred=-` 就是现场读数。
+
+14. **compose 车道的自愈上报被源 IP 因子整条拒掉（做 §11.2.1 第 13 条的验收时量到的）**：
+    compose 的两个面是**两个容器**（k8s 是同一个 pod 的两个容器 ⇒ 共用一个 pod IP），而
+    Task 6 的巡检在**面 B**（挂工作区的那一个）。`ComposeAgentAddressResolver.resolve_host`
+    原来只取面 A（`E2B_C3_AGENT_URL` 的 host）解析出的地址做期望值，于是每个上报都是
+    `403 a report for agent c3-agent came from 192.168.117.3, expected 192.168.117.2` ——
+    三个 compose 栈的自愈**全部**因这条静默失效（实测于 multinode 栈；错误信息本身就是
+    现场读数）。第 13 条所说的"给它 Redis 就活了"因此**不成立**，这是同批的第二个真缺陷。
+    收口：期望地址取**两个面地址的并集**（`E2B_C3_AGENT_MAINT_URL` 的 host 一并解析），
+    没配面 B 的车道仍只有一条地址（不默认放宽）；钉子
+    `tests/unit/test_c3_agent_client.py::test_the_compose_lane_resolves_its_own_host_and_nothing_else`
+    与 `tests/unit/test_c3_self_heal_sweep.py::test_a_compose_report_is_accepted_from_either_face`。
+
+15. **agent 入口不放开 INFO ⇒"自愈轮次那一行"在健康态反而是看不见的那一行**：
+    worker（`envd_service.__main__`）与 CP（`control_plane.config.configure_logging`）都在
+    serve 之前 `basicConfig(level=E2B_LOG_LEVEL 或 INFO)`，agent 的入口没有 ⇒
+    `uvicorn.run` 只配 `uvicorn*` 的 logger，`deploy.c3_agent.*` 继承的根 logger 停在 WARNING：
+    **成功**的轮次（`c3-agent inventory: node=… scanned=… deferred=-`，INFO）不打印，而**被拒**
+    的轮次（WARNING）打印。收口：`deploy/c3_agent/__main__._configure_logging` 逐条照抄两个
+    兄弟入口（含未知级别回落 INFO），钉子 `tests/unit/test_c3_agent_logging.py`。
+
+16. **CP 收到 65534 在 `deploy/stack` 上打断了两条"靠 root 顺带成立"的依赖**（评审发现，
+    2026-09-30 已修，现场读数 `docs/deploy-clusters.md` §7.12）：
+    * **buildkit 的 unix socket**：rootless buildkitd 建出来的是 `srw-rw---- 1000:1000`，
+      k8s 那半靠 **pod 级 `fsGroup: 1000`** 拿组位（§13.6 的 B5 就是这么记的），compose 没有
+      `fsGroup` ⇒ 65534 的 CP 打开 socket 是 `PermissionError [Errno 13]`、`Template.build`
+      在该车道直接不可用。收口：`deploy/stack` 的 `control-plane` 加
+      `group_add: ["1000"]`（只有这个栈有 builder，另外两个栈加了就是白给一组组位，钉子
+      两个方向都写）；实测控制面自己的 `buildctl debug workers` 通、去掉那组就是
+      `connect: permission denied`。
+    * **TLS 配方**：`gen-tls-cert.sh` 写 `0600` 的 key，而 `./tls` 是只读挂给 65534 的 CP ⇒
+      uvicorn 在 `load_cert_chain` 就 `PermissionError [Errno 13]`、容器 restart-loop。
+      收口：配方**改模式**（证书与私钥都 `0644`），理由是这是**自签的本地验证**配方、跑它的
+      运维通常不是 root（`chown 65534` 做不到），而 k8s 那条同源交付是 `kubectl create secret
+      tls`，Secret 在 pod 内的默认模式本身就是 `0644`；生产不走这个脚本。实测：`0600` 时
+      CP `exit=1` / `restarts=6`，`0644` 时 `Uvicorn running on https://…`、`curl -k /healthz`
+      = 200、同端口明文 = 失败。
+    * 同批：compose 的 `image-cache-init` 补上 k8s `storage-init` 的能力集（`drop: [ALL]` +
+      `{CHOWN, DAC_OVERRIDE, FOWNER}`），并把缓存交棒的非递归形钉死（行为臂只覆盖卷存储，
+      看不到它）。两条都为"CP 零特权"服务：**CP 不再有 root 的 DAC_OVERRIDE 可以借**，
+      凡是它要读/要写的东西都得有一条不靠 root 的路径。
+
 ## 12. 结论
 
 - 读者目标的前半句「worker 不做任何特权操作」，**取决于 agent 放在哪一层**（§3.2）：
@@ -906,7 +974,7 @@ whose silent partial failure was indistinguishable from success."*
 | B2 | 快照 `copytree` / `rmtree` | `registry/snapshots.py:427,599,565` | 同上，是 CP 自己的树 |
 | B3 | 模板 build 目录、OCI tar | `api/templates.py:87,157,204,244,473` | 同上 |
 | B4 | secret 文件写入 | `registry/secrets.py` | 同上（**前提**：`_secrets` 的属主与 CP 一致；若要交给池 uid，则落回 A 类） |
-| B5 | 读 buildkit socket | pod 级 `fsGroup: 1000` | rootless buildkit 以 uid 1000 跑；**靠 fsGroup 就够，不需要 root** |
+| B5 | 读 buildkit socket | pod 级 `fsGroup: 1000` | rootless buildkit 以 uid 1000 跑；**靠 fsGroup 就够，不需要 root**。compose 车道没有 `fsGroup` ⇒ 等价物是给该服务加 `group_add: ["1000"]`（只有 `deploy/stack` 有 builder；2026-09-30 的评审就是漏了这一步，见 §11.2.1 第 16 条与 `docs/deploy-clusters.md` §7.12） |
 
 ⭐ **一条反转的现状**：上面这些目录**今天已经是 65534 属主，不是 root** —— C1 wave 2 的
 `deploy/scripts/migrate-state-owner.sh` 把 `PLATFORM_TARGETS` 那 8 条（`state`、
@@ -1136,6 +1204,10 @@ CP 的 uid（65534），CP 保留自己的 `mkdir` + `chmod 1777`。**
    `fsGroup: 1000` 给的**组位**（socket 由 rootless buildkitd 以 uid 1000 建在那个 emptyDir
    里）—— 从前 root 是靠 `CAP_DAC_OVERRIDE` 读的，现在 CP 是 65534，走的就是那条组位。
    socket 读不到时 `Template.build` 会直接失败（不是静默），所以这一格只需要有一条成功记录。
+   **compose 车道（2026-09-30 补）**：没有 pod 级 `fsGroup`，这一格靠 `deploy/stack` 的
+   `control-plane` 服务上的 `group_add: ["1000"]`；判据同样是"控制面自己的 `buildctl debug
+   workers` 通"，而不是"配置里写了组"（`docker exec -u 65534:65534` 会带上容器的 GroupAdd，
+   当不了反臂 —— 反臂要 `docker run -u 65534:65534` 且不加组）。
 
 6. 结果回填 `docs/deploy-clusters.md` §7（现状节 + 发版记录），与 §13.6 这张表逐项对照。
 

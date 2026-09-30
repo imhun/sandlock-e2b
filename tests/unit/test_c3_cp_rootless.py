@@ -571,3 +571,436 @@ def test_a_volume_store_the_control_plane_owns_is_created_without_the_agent(
     assert record.path.stat().st_uid == os.geteuid()
     # ...and the record's own directory, the second write D24's recon found.
     assert (store / "_meta" / f"{record.volume_id}.json").is_file()
+
+
+# ------------------------------------------------- the compose lane (gap 1)
+
+#: The three stacks whose control plane now runs as 65534 and whose
+#: `image-cache-init` is the root one-shot that prepares what it must own.
+COMPOSE_STACKS = (
+    REPO / "deploy" / "compose" / "docker-compose.prod.yml",
+    REPO / "deploy" / "compose" / "docker-compose.multinode.yml",
+    REPO / "deploy" / "stack" / "docker-compose.prod.yml",
+)
+
+#: The volume store, as every compose stack spells it inside its init container.
+#: Keyed by the path inside the repo: `deploy/compose` and `deploy/stack` both
+#: ship a `docker-compose.prod.yml`.
+VOLUME_STORE_ENV = {
+    "deploy/compose/docker-compose.prod.yml": "/var/lib/e2b-sandboxes/_volumes",
+    "deploy/compose/docker-compose.multinode.yml": "/cache/control/_volumes",
+    "deploy/stack/docker-compose.prod.yml": "/var/lib/e2b-sandboxes/_volumes",
+}
+
+#: The cache-hand-over half of the init, **exactly**: the careful form the k8s
+#: `storage-init` uses, adopted so that a `chown -R "$dir"` -- which takes live
+#: sandbox `secrets/<sandbox_id>/<name>.secret` files (0600, owned by that
+#: sandbox's pooled uid) back on every `up -d` -- cannot come back. Reverting it
+#: to the recursive form is what the review found unpinned; the arms of
+#: `_run_compose_init` cannot see it (they exercise the store), so this is the
+#: pin for it, and it is an exact list rather than a containment check.
+CACHE_HANDOVER_LINES = [
+    'for dir in $CACHE_DIRS; do',
+    'mkdir -p "$dir/_oci"',
+    'chmod 0755 "$dir" "$dir/_oci" 2>/dev/null || true',
+    # Non-recursive on the cache's own directory...
+    'chown 65534:65534 "$dir" 2>/dev/null ||',
+    'echo "image-cache-init: chown refused ($dir, NFS root_squash?) -- verifying the owner instead"',
+    # ...recursive only inside the control plane's `_oci/` sidecar...
+    'chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||',
+    'echo "image-cache-init: chown refused ($dir/_oci, NFS root_squash?) -- verifying the owner instead"',
+    # ...and `secrets/` **directories only**: the `*.secret` files stay with the
+    # sandbox uid that wrote them.
+    'if [ -d "$dir/secrets" ]; then',
+    'chown 65534:65534 "$dir/secrets" 2>/dev/null ||',
+    'echo "image-cache-init: chown refused ($dir/secrets, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid 65534"',
+    'find "$dir/secrets" -mindepth 1 -maxdepth 2 -type d -exec chown 65534:65534 {} + 2>/dev/null ||',
+    'echo "image-cache-init: chown refused ($dir/secrets -mindepth 1 -maxdepth 2, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid 65534"',
+    'echo "image-cache-init: handed $dir/secrets (directories only; *.secret files stay with their sandbox uid) to uid 65534"',
+    'fi',
+    'owner="$(stat -c %u "$dir")"',
+    'if [ "$owner" != "65534" ]; then',
+    'echo "image-cache-init: FATAL: $dir is owned by uid $owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2',
+    'echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $dir && chown -R 65534:65534 $dir/_oci" >&2',
+    "exit 1",
+    "fi",
+    'echo "image-cache-init: $dir is owned by uid 65534"',
+    "done",
+]
+
+#: The volume-store half (D24), **exactly**: one `chown` of the target itself,
+#: re-`stat`ed afterwards, with a FATAL that names the path and the one-time
+#: command. Same list for all three stacks (only the env values differ).
+STORE_HANDOVER_LINES = [
+    "hand_over() {",
+    'target="$1"',
+    'if [ ! -e "$target" ]; then',
+    'echo "image-cache-init: $target does not exist -- nothing to hand over (the control plane creates it under its own uid when it first needs it)"',
+    "return 0",
+    "fi",
+    'owner="$(stat -c %u "$target")"',
+    'mode="$(stat -c %a "$target")"',
+    'if [ "$owner" = "65534" ]; then',
+    'echo "image-cache-init: $target already belongs to uid 65534 (mode $mode) -- nothing to do"',
+    "return 0",
+    "fi",
+    'chown 65534:65534 "$target" 2>/dev/null ||',
+    'echo "image-cache-init: chown refused ($target, NFS root_squash?) -- the control plane (uid 65534) cannot create or record a volume until this is done once: chown 65534:65534 $target" >&2',
+    'owner="$(stat -c %u "$target")"',
+    'mode="$(stat -c %a "$target")"',
+    'if [ "$owner" != "65534" ]; then',
+    'echo "image-cache-init: FATAL: $target is owned by uid $owner, not the control-plane uid 65534: the control plane creates every volume as <store>/<volume_id> and writes <store>/_meta/<volume_id>.json, so the first volume create would fail with EACCES" >&2',
+    'echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $target  (non-recursive: the volume data directories below it belong to pooled sandbox uids)" >&2',
+    "return 1",
+    "fi",
+    'echo "image-cache-init: $target -> uid $owner mode $mode (a non-recursive hand-over; the sandbox volume data directories below it keep their pooled uids)"',
+    "return 0",
+    "}",
+    "for store in $VOLUME_STORES; do",
+    'if [ ! -e "$store" ]; then',
+    'mkdir -p "$store"',
+    'echo "image-cache-init: created $store (the platform\'s volume store)"',
+    "fi",
+    'hand_over "$store" || exit 1',
+    'hand_over "$store/_meta" || exit 1',
+    'store_owner="$(stat -c %u "$store")"',
+    'echo "image-cache-init: $store is owned by uid $store_owner (the volume data directories below it are left alone)"',
+    "done",
+]
+
+
+def _compose_init_lines(path: Path) -> list[str]:
+    """The init body's executable lines, compose's `$$` already unescaped.
+
+    Comments are dropped: this is what the *container* runs.
+    """
+    body = _compose_init_body(path).replace("$$", "$")
+    return [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def _slice(lines: list[str], first: str, last: str) -> list[str]:
+    """The lines from ``first`` through the *next* ``last`` (inclusive)."""
+    start = lines.index(first)
+    end = lines.index(last, start)
+    return lines[start : end + 1]
+
+
+def _compose_init(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))["services"]["image-cache-init"]
+
+
+def _compose_init_body(path: Path) -> str:
+    """The compose init's shell body, one entry point, exactly as it ships."""
+    command = _compose_init(path)["command"]
+    assert isinstance(command, list) and len(command) == 1, command
+    return command[0]
+
+
+def _compose_init_env(path: Path) -> dict[str, str]:
+    env = _compose_init(path)["environment"]
+    if isinstance(env, list):
+        return {k: v for k, v in (e.split("=", 1) for e in env if "=" in e)}
+    return env
+
+
+def test_each_compose_init_hands_the_volume_store_over_like_storage_init() -> None:
+    """Gap 1, the manifest half: the compose lane's `storage-init` discipline.
+
+    The k8s arm hands the store over in the agent pod's `storage-init` (D24).
+    The compose stacks have no pod, so the same job belongs to the root one-shot
+    that already prepares the volumes (`image-cache-init`) -- and it has to carry
+    the *same* properties, because the failure mode is identical: the control
+    plane now runs as 65534 and would otherwise hit `EACCES` on the first
+    volume create.
+
+    Pinned by text here and behaviourally below:
+
+    * the store and its record directory are handed over by name;
+    * **non-recursive** -- the volume data directories and quota slices below
+      the store belong to pooled sandbox uids and must survive a rollout;
+    * idempotent and audible (an already-owned target says so, and the run says
+      which of the three things happened);
+    * gated: each target is re-`stat`ed after the attempt, and a target that is
+      still not 65534 is a FATAL that names the path and the one-time command.
+
+    Also pinned here, exactly and separately: the **cache** half of the same
+    discipline (review item 4). Its non-recursion is what keeps live
+    `secrets/<sandbox_id>/<name>.secret` files with their sandbox uid -- and it
+    is invisible to the behavioural arms below, which exercise the store, so a
+    revert to `chown -R "$$dir"` has to fail *here*.
+    """
+    command_lists: list[list[str]] = []
+    for path in COMPOSE_STACKS:
+        body = _compose_init_body(path)
+        lines = _compose_init_lines(path)
+        command_lists.append(lines)
+        env = _compose_init_env(path)
+        store = VOLUME_STORE_ENV[path.relative_to(REPO).as_posix()]
+        assert env["VOLUME_STORES"].split() == [store], path.name
+        # Exact, ordered: the store's hand-over block, and the cache's.
+        assert (
+            _slice(lines, "hand_over() {", "done") == STORE_HANDOVER_LINES
+        ), path.name
+        assert (
+            _slice(lines, "for dir in $CACHE_DIRS; do", "done")
+            == CACHE_HANDOVER_LINES
+        ), path.name
+        # ...and the recursive form may not appear against either root: the
+        # store's data directories *and* the sandbox `*.secret` files below the
+        # cache both belong to pooled sandbox uids.
+        assert 'chown -R 65534:65534 "$store' not in body, path.name
+        assert 'chown -R 65534:65534 "$target' not in body, path.name
+        assert 'chown -R 65534:65534 "$dir"' not in body, path.name
+        # ...and the same service is where the rest of the ownership the 65534
+        # control plane needs is made true (the k8s `workspace-root-init`
+        # products), each verified by the same `stat` gate.
+        assert env["OWNED_DIRS"].split(), path.name
+        assert env["WRITABLE_ROOTS"].split(), path.name
+    # Three stacks, one script: the commands are byte-identical (only the
+    # `CACHE_DIRS`/`OWNED_DIRS`/`WRITABLE_ROOTS`/`VOLUME_STORES` values differ),
+    # so a change made in one lane cannot silently miss the other two.
+    assert command_lists[0] == command_lists[1] == command_lists[2]
+
+
+def test_each_compose_init_drops_to_the_three_verbs_the_script_uses() -> None:
+    """Review item 6: the root one-shot carries `storage-init`'s capability set.
+
+    Its k8s sibling was tightened in review round 1 (`drop: [ALL]` + exactly
+    `CHOWN`, `DAC_OVERRIDE`, `FOWNER`); the compose copies kept the runtime's
+    default 14-capability set, which is the same widening class in the same
+    class of container. The three are *measured* (`docs/deploy-clusters.md`
+    §7.12): with `CHOWN`+`FOWNER` only, the script's first
+    `mkdir -p "<65534-owned dir>/_oci"` is `EACCES` and `set -e` stops the
+    deployment; with all three the same script runs green.
+    """
+    k8s_init = _init_containers(
+        _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
+    )["storage-init"]
+    k8s_caps = k8s_init["securityContext"]["capabilities"]
+    assert k8s_caps == {
+        "drop": ["ALL"],
+        "add": ["CHOWN", "DAC_OVERRIDE", "FOWNER"],
+    }
+    for path in COMPOSE_STACKS:
+        init = _compose_init(path)
+        assert init["user"] == "0:0", path.name
+        assert init["cap_drop"] == ["ALL"], path.name
+        assert init["cap_add"] == ["CHOWN", "DAC_OVERRIDE", "FOWNER"], path.name
+
+
+@pytest.mark.parametrize("path", COMPOSE_STACKS, ids=lambda p: p.parent.name)
+def test_a_compose_store_that_hands_over_reports_success(
+    tmp_path: Path, path: Path
+) -> None:
+    """The control arm: the store really is handed over, and says so.
+
+    Run against a probe tree with the paths redirected through the script's own
+    environment, because the two properties at issue (the gate exists, and a
+    refusal cannot print a success line) are behavioural. The shims make the
+    script deterministic on any host: `stat -c %u` answers from a *stateful*
+    model of the two filesystems this script is written for (a target is
+    `65534` once its `chown` succeeded), and `chown` refuses exactly the paths
+    the arm asks it to.
+    """
+    result = _run_compose_init(
+        tmp_path,
+        path=path,
+        foreign=("_volumes", "_volumes/_meta"),
+    )
+
+    assert result.returncode == 0
+    shared = tmp_path / "shared"
+    assert result.stdout.splitlines() == [
+        f"image-cache-init: {shared}/_images is owned by uid 65534",
+        f"image-cache-init: {shared}/_secrets is owned by uid 65534",
+        f"image-cache-init: {shared} is writable by uid 65534 (owner=65534 mode=755)",
+        f"image-cache-init: {shared}/_volumes -> uid 65534 mode 755 (a "
+        "non-recursive hand-over; the sandbox volume data directories below it "
+        "keep their pooled uids)",
+        f"image-cache-init: {shared}/_volumes/_meta -> uid 65534 mode 755 (a "
+        "non-recursive hand-over; the sandbox volume data directories below it "
+        "keep their pooled uids)",
+        f"image-cache-init: {shared}/_volumes is owned by uid 65534 (the volume "
+        "data directories below it are left alone)",
+    ]
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("path", COMPOSE_STACKS, ids=lambda p: p.parent.name)
+def test_a_compose_store_already_owned_is_a_named_no_op(
+    tmp_path: Path, path: Path
+) -> None:
+    """Idempotence, in the direction a re-run of `up -d` takes.
+
+    The second node of a shared mount (and every subsequent `up -d`) must find
+    the store already handed over and say so, rather than re-chowning silently.
+    """
+    result = _run_compose_init(tmp_path, path=path, foreign=())
+
+    assert result.returncode == 0
+    shared = tmp_path / "shared"
+    assert result.stdout.splitlines() == [
+        f"image-cache-init: {shared}/_images is owned by uid 65534",
+        f"image-cache-init: {shared}/_secrets is owned by uid 65534",
+        f"image-cache-init: {shared} is writable by uid 65534 (owner=65534 mode=755)",
+        f"image-cache-init: {shared}/_volumes already belongs to uid 65534 "
+        "(mode 755) -- nothing to do",
+        f"image-cache-init: {shared}/_volumes/_meta already belongs to uid 65534 "
+        "(mode 755) -- nothing to do",
+        f"image-cache-init: {shared}/_volumes is owned by uid 65534 (the volume "
+        "data directories below it are left alone)",
+    ]
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("path", COMPOSE_STACKS, ids=lambda p: p.parent.name)
+def test_a_compose_record_directory_that_refuses_cannot_read_as_a_hand_over(
+    tmp_path: Path,
+    path: Path,
+) -> None:
+    """The gate: `_meta` refused is a FATAL, not a success line.
+
+    This is review round 1's Important from the k8s side, reproduced where the
+    compose lane can regress the same way -- `_meta` used to be handed over
+    without a gate, so an NFS `root_squash` refusal read as success *here* and
+    surfaced much later, un-named, on the control plane's second write
+    (`_write_record`). The store root still hands over in this arm, so a pin
+    that refused both would not show it.
+    """
+    result = _run_compose_init(
+        tmp_path, path=path, foreign=(), refuse=("_volumes/_meta",)
+    )
+
+    assert result.returncode == 1
+    shared = tmp_path / "shared"
+    # ...the store root's own state is still read and reported (here it is the
+    # shape a re-run on a healthy node has), the refused record directory
+    # printed **no** success line, and nothing else was printed either.
+    assert result.stdout.splitlines() == [
+        f"image-cache-init: {shared}/_images is owned by uid 65534",
+        f"image-cache-init: {shared}/_secrets is owned by uid 65534",
+        f"image-cache-init: {shared} is writable by uid 65534 (owner=65534 mode=755)",
+        f"image-cache-init: {shared}/_volumes already belongs to uid 65534 "
+        "(mode 755) -- nothing to do",
+    ]
+    assert result.stderr.splitlines() == [
+        f"image-cache-init: chown refused ({shared}/_volumes/_meta, NFS "
+        "root_squash?) -- the control plane (uid 65534) cannot create or record "
+        "a volume until this is done once: chown 65534:65534 "
+        f"{shared}/_volumes/_meta",
+        f"image-cache-init: FATAL: {shared}/_volumes/_meta is owned by uid 0, "
+        "not the control-plane uid 65534: the control plane creates every "
+        "volume as <store>/<volume_id> and writes "
+        "<store>/_meta/<volume_id>.json, so the first volume create would fail "
+        "with EACCES",
+        "image-cache-init: fix it once (as root on the node, or on the NFS "
+        f"server): chown 65534:65534 {shared}/_volumes/_meta  (non-recursive: "
+        "the volume data directories below it belong to pooled sandbox uids)",
+    ]
+
+
+def _run_compose_init(
+    tmp_path: Path,
+    *,
+    foreign: tuple[str, ...],
+    refuse: tuple[str, ...] = (),
+    path: Path = COMPOSE_STACKS[0],
+) -> subprocess.CompletedProcess:
+    """Run a compose `image-cache-init` body under `sh` against a probe tree.
+
+    The script is the compose lane's copy of the k8s `storage-init` discipline,
+    so it gets the same treatment `_run_storage_init` gives that one. Three
+    shims make it deterministic on any host (the script's own tools are
+    Linux-shaped, and macOS `stat` has no `-c`):
+
+    * ``stat -c %u|%a <path>`` -- the uid comes from a stateful model: a target
+      starts at ``65534`` unless it matches ``foreign``, and a successful
+      ``chown`` of it moves it to ``65534`` for good (a marker file), while a
+      ``refuse``d path stays at 0 and is never handed over;
+    * ``chown`` -- succeeds (and records the marker), except for ``refuse``.
+
+    ``foreign`` and ``refuse`` are matched as *path suffixes* so the arms can
+    name the store and its record directory without knowing the tmp path.
+    """
+    shared = tmp_path / "shared"
+    (shared / "_images" / "_oci").mkdir(parents=True)
+    (shared / "_secrets").mkdir()
+    (shared / "_volumes" / "_meta").mkdir(parents=True)
+    for directory in (
+        shared,
+        shared / "_images",
+        shared / "_secrets",
+        shared / "_volumes",
+        shared / "_volumes" / "_meta",
+    ):
+        directory.chmod(0o755)
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    # The ownership model both shims share: a path is 65534 unless the arm says
+    # it is `foreign`, and a successful `chown` of a foreign path moves it to
+    # 65534 for the rest of the run (the marker file).
+    model = (
+        "import os, sys\n"
+        "path = PATH_ARG\n"
+        "def matches(key):\n"
+        "    return [s for s in os.environ.get(key, '').split(':') if s and "
+        "path.endswith(s)]\n"
+        "marker = os.environ['PROBE_MARKERS'] + '/' + path.replace('/', '_')\n"
+        "def owned():\n"
+        "    if matches('PROBE_REFUSE'):\n"
+        "        return False\n"
+        "    return os.path.exists(marker) or not matches('PROBE_FOREIGN')\n"
+    )
+    _shim(
+        shims,
+        "stat",
+        "exec python3 - \"$2\" \"$3\" <<'PY'\n"
+        + model.replace("PATH_ARG", "sys.argv[2]")
+        + "fmt = sys.argv[1]\n"
+        "if '%u' in fmt:\n"
+        "    print(65534 if owned() else 0)\n"
+        "else:\n"
+        "    print(format(os.stat(path).st_mode & 0o7777, 'o'))\n"
+        "PY\n",
+    )
+    # `chown [-R] 65534:65534 <path>`: the last argument is the target, whether
+    # or not the recursive flag is present.
+    _shim(
+        shims,
+        "chown",
+        "exec python3 - \"$@\" <<'PY'\n"
+        + model.replace("PATH_ARG", "sys.argv[-1]")
+        + "if matches('PROBE_REFUSE'):\n"
+        "    sys.stderr.write('chown: Operation not permitted\\n')\n"
+        "    sys.exit(1)\n"
+        "open(marker, 'w').close()\n"
+        "PY\n",
+    )
+    script = tmp_path / "image-cache-init.sh"
+    # Compose's own escaping, applied the way `docker compose` does it when it
+    # renders this service's entrypoint (`$$` is one literal `$` in the
+    # container). Without it the shell would read `$$dir` as "the pid, then
+    # `dir`" and the run would be about something else entirely.
+    script.write_text(_compose_init_body(path).replace("$$", "$"), encoding="utf-8")
+    environment = dict(os.environ)
+    environment["PATH"] = f"{shims}{os.pathsep}{environment['PATH']}"
+    environment["CACHE_DIRS"] = str(shared / "_images")
+    environment["OWNED_DIRS"] = str(shared / "_secrets")
+    environment["WRITABLE_ROOTS"] = str(shared)
+    environment["VOLUME_STORES"] = str(shared / "_volumes")
+    environment["PROBE_MARKERS"] = str(markers)
+    environment["PROBE_FOREIGN"] = ":".join(foreign)
+    environment["PROBE_REFUSE"] = ":".join(refuse)
+    return subprocess.run(
+        ["sh", str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )

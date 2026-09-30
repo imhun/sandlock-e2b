@@ -22,28 +22,167 @@ services:
   # while leaving the cache root-owned is how every resolve on that host ends
   # up failing. Idempotent; see §2.7.1 of
   # docs/production-deployment-requirements.md.
+  #
+  # C3 Task 5 (D24) / the compose gaps: this service is also the compose lane's
+  # home for the ownership jobs the **k8s agent DaemonSet's** init containers do
+  # (`deploy/k8s/c3-agent.yaml`: `storage-init` ① ② and `workspace-root-init`)
+  # -- the *control-plane* pod deliberately carries **no** init container since
+  # C3 Task 5; those jobs moved to the agent's pod because it is the component
+  # that already holds the root file face, and compose has no pod to put them in
+  # so they land in this separate root one-shot. They are needed because the
+  # control plane below now runs as **uid 65534** and every directory it writes
+  # has to belong to that uid first:
+  #
+  #   * `CACHE_DIRS` -- the shared image cache. Handed over non-recursively, with
+  #     only `_oci/` recursive and `secrets/` directories-only, exactly as
+  #     `storage-init` does: `secrets/<sandbox_id>/<name>.secret` are live
+  #     sandbox files (0600, owned by that sandbox's pooled uid), so a
+  #     `chown -R` would take them back on every `up -d` and leave running
+  #     sandboxes unable to read their own secrets.
+  #   * `OWNED_DIRS` -- the platform's top-level namespaces the 65534 control
+  #     plane creates entries under.
+  #   * `WRITABLE_ROOTS` -- the roots a 65534 process creates top-level names in
+  #     (the k8s `workspace-root-init` rule: owner 65534, or `1777`).
+  #   * `VOLUME_STORES` -- D24's target. One `chown` of the store itself **and
+  #     nothing else**: the directories below it are sandbox volume data owned
+  #     by pooled uids, and a recursive form would take them back on every
+  #     platform rollout. Each target is verified, refuses by name (FATAL + the
+  #     exact one-time command) when the hand-over is refused, and says which of
+  #     the three things happened -- the same words, one path at a time, as the
+  #     k8s `storage-init`'s `hand_over`.
   image-cache-init:
     image: ${WORKER_IMAGE}
     user: "0:0"
+    # Same capability parity as the k8s sibling (`c3-agent.yaml`'s
+    # `storage-init`): root with `drop: [ALL]` + exactly the three verbs this
+    # script uses. The three are *measured*, not copied by analogy (round-1
+    # review, and §13.6's ④ note): `CHOWN` is the hand-over itself;
+    # `DAC_OVERRIDE` is `mkdir -p "<dir>/_oci"` / `mkdir -p "<owned dir>"` on
+    # the idempotent re-run (EACCES with only CHOWN+FOWNER); `FOWNER` is
+    # `chmod`/`chown` on a directory this process does not own. Without the drop
+    # this container carried the runtime's default 14-capability set (it is the
+    # one place in the stack that still did).
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |-
         set -e
+        # 1. the image caches (Z-F7 C1), in the careful form `storage-init` uses.
         for dir in $$CACHE_DIRS; do
           mkdir -p "$$dir/_oci"
           chmod 0755 "$$dir" "$$dir/_oci" 2>/dev/null || true
-          chown -R 65534:65534 "$$dir" 2>/dev/null ||
+          chown 65534:65534 "$$dir" 2>/dev/null ||
           echo "image-cache-init: chown refused ($$dir, NFS root_squash?) -- verifying the owner instead"
+          chown -R 65534:65534 "$$dir/_oci" 2>/dev/null ||
+          echo "image-cache-init: chown refused ($$dir/_oci, NFS root_squash?) -- verifying the owner instead"
+          if [ -d "$$dir/secrets" ]; then
+            chown 65534:65534 "$$dir/secrets" 2>/dev/null ||
+            echo "image-cache-init: chown refused ($$dir/secrets, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid 65534"
+            find "$$dir/secrets" -mindepth 1 -maxdepth 2 -type d -exec chown 65534:65534 {} + 2>/dev/null ||
+            echo "image-cache-init: chown refused ($$dir/secrets -mindepth 1 -maxdepth 2, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid 65534"
+            echo "image-cache-init: handed $$dir/secrets (directories only; *.secret files stay with their sandbox uid) to uid 65534"
+          fi
           owner="$$(stat -c %u "$$dir")"
           if [ "$$owner" != "65534" ]; then
             echo "image-cache-init: FATAL: $$dir is owned by uid $$owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
-            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown -R 65534:65534 $$dir" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $$dir && chown -R 65534:65534 $$dir/_oci" >&2
             exit 1
           fi
           echo "image-cache-init: $$dir is owned by uid 65534"
         done
+        # 2. the platform's own top-level namespaces (the k8s `workspace-root-init`
+        #    list: `_builds`/`_secrets`/`_templates`/`_snapshots` are written by
+        #    the 65534 control plane, `_snapshots`/`_migrate` by the workers).
+        for dir in $$OWNED_DIRS; do
+          mkdir -p "$$dir"
+          chmod 0755 "$$dir" 2>/dev/null || true
+          chown 65534:65534 "$$dir" 2>/dev/null ||
+          echo "image-cache-init: chown refused ($$dir, NFS root_squash?) -- verifying the owner instead"
+          owner="$$(stat -c %u "$$dir")"
+          if [ "$$owner" != "65534" ]; then
+            echo "image-cache-init: FATAL: $$dir is owned by uid $$owner, not uid 65534: the control plane and the workers create <namespace>/<id> entries directly under it, so their first write would fail with EACCES" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $$dir" >&2
+            exit 1
+          fi
+          echo "image-cache-init: $$dir is owned by uid 65534"
+        done
+        # 3. the roots a 65534 process creates top-level names in. Same judgement
+        #    as `workspace-root-init`: owner 65534, or world-writable.
+        for dir in $$WRITABLE_ROOTS; do
+          owner="$$(stat -c %u "$$dir")"
+          mode="$$(stat -c %a "$$dir")"
+          if [ "$$owner" != "65534" ]; then
+            chown 65534:65534 "$$dir" 2>/dev/null ||
+            echo "image-cache-init: chown refused ($$dir, NFS root_squash?)"
+            owner="$$(stat -c %u "$$dir")"
+            mode="$$(stat -c %a "$$dir")"
+          fi
+          world_writable=0
+          case "$$mode" in *2|*3|*6|*7) world_writable=1 ;; esac
+          if [ "$$owner" != "65534" ] && [ "$$world_writable" != "1" ]; then
+            chmod 1777 "$$dir" 2>/dev/null ||
+            echo "image-cache-init: chmod refused ($$dir, NFS root_squash?)"
+            owner="$$(stat -c %u "$$dir")"
+            mode="$$(stat -c %a "$$dir")"
+            world_writable=0
+            case "$$mode" in *2|*3|*6|*7) world_writable=1 ;; esac
+          fi
+          if [ "$$owner" != "65534" ] && [ "$$world_writable" != "1" ]; then
+            echo "image-cache-init: FATAL: $$dir is mode $$mode, owned by uid $$owner -- uid 65534 cannot create the top-level names it owns there, so every Sandbox.create() would fail with EACCES" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chmod 1777 $$dir  (or chown 65534:65534 $$dir)" >&2
+            exit 1
+          fi
+          echo "image-cache-init: $$dir is writable by uid 65534 (owner=$$owner mode=$$mode)"
+        done
+        # 4. the volume store (D24). `hand_over` moves one directory's owner and
+        #    nothing else, and **verifies what it moved**: a target that is not
+        #    65534 after the attempt is a FATAL for *that* target (the caller
+        #    exits 1). `_meta` is created lazily by the control plane, so a
+        #    missing one is the one no-op.
+        hand_over() {
+          target="$$1"
+          if [ ! -e "$$target" ]; then
+            echo "image-cache-init: $$target does not exist -- nothing to hand over (the control plane creates it under its own uid when it first needs it)"
+            return 0
+          fi
+          owner="$$(stat -c %u "$$target")"
+          mode="$$(stat -c %a "$$target")"
+          if [ "$$owner" = "65534" ]; then
+            echo "image-cache-init: $$target already belongs to uid 65534 (mode $$mode) -- nothing to do"
+            return 0
+          fi
+          chown 65534:65534 "$$target" 2>/dev/null ||
+            echo "image-cache-init: chown refused ($$target, NFS root_squash?) -- the control plane (uid 65534) cannot create or record a volume until this is done once: chown 65534:65534 $$target" >&2
+          owner="$$(stat -c %u "$$target")"
+          mode="$$(stat -c %a "$$target")"
+          if [ "$$owner" != "65534" ]; then
+            echo "image-cache-init: FATAL: $$target is owned by uid $$owner, not the control-plane uid 65534: the control plane creates every volume as <store>/<volume_id> and writes <store>/_meta/<volume_id>.json, so the first volume create would fail with EACCES" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $$target  (non-recursive: the volume data directories below it belong to pooled sandbox uids)" >&2
+            return 1
+          fi
+          echo "image-cache-init: $$target -> uid $$owner mode $$mode (a non-recursive hand-over; the sandbox volume data directories below it keep their pooled uids)"
+          return 0
+        }
+        for store in $$VOLUME_STORES; do
+          if [ ! -e "$$store" ]; then
+            mkdir -p "$$store"
+            echo "image-cache-init: created $$store (the platform's volume store)"
+          fi
+          hand_over "$$store" || exit 1
+          hand_over "$$store/_meta" || exit 1
+          store_owner="$$(stat -c %u "$$store")"
+          echo "image-cache-init: $$store is owned by uid $$store_owner (the volume data directories below it are left alone)"
+        done
     environment:
       CACHE_DIRS: /var/lib/e2b-sandboxes/_images
+      OWNED_DIRS: /var/lib/e2b-sandboxes/_builds /var/lib/e2b-sandboxes/_secrets /var/lib/e2b-sandboxes/_snapshots /var/lib/e2b-sandboxes/_templates /var/lib/e2b-sandboxes/_migrate
+      WRITABLE_ROOTS: /var/lib/e2b-sandboxes
+      VOLUME_STORES: /var/lib/e2b-sandboxes/_volumes
     volumes:
       - sandbox-shared:/var/lib/e2b-sandboxes
     restart: "no"
@@ -64,6 +203,15 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.control-plane-gateway
     image: ${CONTROL_PLANE_IMAGE:-e2b-sandlock-control-plane-gateway:0.1.0}
+    # C3 Task 5 (D24) / gap 1: the same posture the k8s control plane converged
+    # to (`deploy/k8s/control-plane.yaml`: `runAsUser`/`runAsGroup` 65534, no
+    # root container in the pod). 65534 is not arbitrary -- §13.6 collapses to
+    # it: the platform's own directories are 65534, `.uid_pool.lock` is
+    # `65534:65534 0600` (another uid cannot even open it), and the image cache
+    # owner is 65534 (another uid would lock itself out of what it creates).
+    # Everything it needs to *own* is prepared by `image-cache-init` above, which
+    # is also where the D24 volume-store hand-over lives.
+    user: "65534:65534"
     depends_on:
       image-cache-init:
         condition: service_completed_successfully
@@ -160,6 +308,12 @@ services:
       # mounted read-only; TLS only activates when E2B_TLS_CERT/E2B_TLS_KEY
       # are both set, so the default stack stays HTTP.
       - ./tls:/tls:ro
+    # Both channels terminate here: `default` carries `worker <-> CP` (the API
+    # and the gateway every worker dials), `agent-plane` carries `CP <-> agent`
+    # (see the `networks:` block at the bottom).
+    networks:
+      - default
+      - agent-plane
     restart: unless-stopped
 
   # C3 (Task 3, D14): the per-host agent. Compose has no pods, so the two faces
@@ -196,6 +350,11 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    # `agent-plane` only (see the `networks:` block): a worker must not be able
+    # to resolve or reach this face, and the control plane is the only other
+    # member of that network.
+    networks:
+      - agent-plane
     restart: unless-stopped
 
   # face B: C1's file-operation face, moved (same capability set, same roots).
@@ -246,6 +405,9 @@ services:
       E2B_C3_AGENT_SCAN_BACKOFF_MAX_S: ${E2B_C3_AGENT_SCAN_BACKOFF_MAX_S:-600}
     volumes:
       - sandbox-shared:/var/lib/e2b-sandboxes
+    # `agent-plane` only: this is the other half of the same two-channel split.
+    networks:
+      - agent-plane
     restart: unless-stopped
 
   worker-1: &worker
@@ -419,3 +581,29 @@ volumes:
   redis-data:
   sandbox-shared:
   registry-data:
+
+# C3 (hard rule 5: "只有两条通道"). k8s spells this as the NetworkPolicy in
+# `deploy/k8s/c3-agent.yaml` -- ingress to the agent only from the
+# `app=control-plane` pod, on 49985/49986. Compose has **no** policy layer, so
+# the same property is carried by the network topology instead:
+#
+#   * `default` (this project's network) is the `worker <-> CP` channel: the
+#     control plane, every worker, redis and the init that prepares the volume
+#     are on it, because a worker must keep reaching the control plane's
+#     API/gateway.
+#   * `agent-plane` is the `CP <-> agent` channel, and **nothing but the two
+#     agent faces and the control plane is on it**. The agent's two service
+#     names therefore do not resolve for a worker (docker's embedded DNS is
+#     per network) and there is no route to their addresses either -- a worker
+#     cannot reach the agent port even knowing its IP.
+#
+# The control plane is deliberately on both: it serves `worker <-> CP` on
+# `default` and dials the agent on `agent-plane`. `internal: true` closes the
+# third direction the k8s Egress rule closes -- the agent's only outbound is
+# the self-heal report back to `http://control-plane:3000`, which is reachable
+# on this network, so no external egress (and no DNS beyond the embedded
+# resolver) is needed.
+networks:
+  default:
+  agent-plane:
+    internal: true
