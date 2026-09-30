@@ -2814,8 +2814,10 @@ root 读 uid 65534 的文件本来就有权限。这与 §23 的 N27 迁移不�
 > `e2b-slot-spawn` 同样是被移出 worker 镜像的那个 file-capability 二进制（`helpers.slot_spawner`），
 > 没有它 `privileged_starter` 为假、route B 直接不可用 —— 与 `socket` 那把一样，**得配含
 > file-capability 二进制的 worker 镜像**。所以现在盘上没有"翻一个 env 就回到从前"的杠杆：要回到
-> "没有 agent 也行"的形状，就得**清单 + 镜像一起**退到 C1 那一版（`e2b-priv-broker` DaemonSet 的
-> 清单也一起回来）。完整口径见
+> "没有 agent 也行"的形状，就得**清单 + 镜像一起**退到 C1 那一版（`e2b-priv-broker` DaemonSet、
+> 它的 `e2b-maint serve`、以及 worker 的 `socket` transport —— 三样都已从清单与源码删除，
+> 只能从 git 历史取回：`deploy/k8s/priv-broker.yaml` 与 2026-09-30 之前的 `c3_agent/priv/maint.c`）。
+> 完整口径见
 > `docs/c3-privilege-relocation.md` §14.8 与计划文件 `## 回退`。
 
 ⚠ 两个常见坑：① 脚本拿不到镜像版本（`deploy/stack/.version` 不存在且没给 `VERSION=…`）会直接

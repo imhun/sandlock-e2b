@@ -29,10 +29,8 @@ the kernel-facing half is pinned where the kernel is.
 
 The host half compiles the **production** translation unit -- not a
 reimplementation of it -- through a tiny driver (``DRIVER_C`` below) that links
-``as_uid.c`` with ``AS_UID_NO_MAIN`` and exposes its pure entry points. A
-compile-time switch is what ``maint.c`` already does for ``A7``'s walk cap
-(``#ifndef PRIV_MAX_WALK_OUTPUT``): it exists for a lane and is absent from the
-shipped binary.
+``as_uid.c`` with ``AS_UID_NO_MAIN`` and exposes its pure entry points, so the
+lane exercises the same translation unit the agent image installs.
 """
 
 from __future__ import annotations

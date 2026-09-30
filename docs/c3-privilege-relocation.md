@@ -1696,6 +1696,7 @@ C1 今天就已经有一条更直接的路，而且**不需要 internal key** �
 broker 的授权**只有两条**：`priv_peer_allowed()`（peer uid/gid == 65534）与
 `priv_resolve_allowed_path()`（`realpath` 后落在**舰队级**的四个根之一）。
 **没有 per-sandbox、也没有 per-node 的判断。**
+（**2026-09-30 补注**：这条链的三件组成物都已退役/删除 —— `e2b-priv-broker` DaemonSet 随 C3 Task 7 下线，`priv_peer_allowed` 与 broker 的 `serve` 协议本身也已在同日从源码删除（`docs/open-issues.md` N47 的"源码卫生残留"一栏）。本节保留的是**当时的实测记录**，用来解释 C3 为什么要引入 `sandbox_id` 这个可授权对象。）
 
 探针在真集群上跑出的链（broker pod 建 fixture、worker pod 发起）：
 

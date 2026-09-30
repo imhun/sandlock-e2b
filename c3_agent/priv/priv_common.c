@@ -37,85 +37,12 @@ void priv_fail(const char *fmt, ...) {
     exit(PRIV_EXIT_REFUSED);
 }
 
-void priv_report_refused(const char *message) {
-    fprintf(stderr, "%s: refused: %s\n", priv_progname(), message);
-}
-
 void priv_usage(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     priv_vreport("usage", fmt, ap);
     va_end(ap);
     exit(PRIV_EXIT_USAGE);
-}
-
-static int priv_env_positive_long(const char *name, long fallback, long *out,
-                                  char *err, size_t errlen) {
-    const char *text = getenv(name);
-    long value;
-    if (text == NULL || *text == '\0') {
-        *out = fallback;
-        return 0;
-    }
-    if (priv_parse_uid(text, &value, err, errlen) != 0) {
-        return -1;
-    }
-    *out = value;
-    return 0;
-}
-
-/* The peer identity is the one place uid/gid 0 is legitimate (a root worker
- * exists in the compose/test shapes), so this is deliberately not
- * priv_parse_uid: "0" is a value here, not a refusal. */
-static int priv_env_peer_id(const char *name, long fallback, long *out, char *err,
-                            size_t errlen) {
-    const char *text = getenv(name);
-    char *end = NULL;
-    long value;
-    if (text == NULL) {
-        *out = fallback;
-        return 0;
-    }
-    errno = 0;
-    value = strtol(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0' || value < 0) {
-        snprintf(err, errlen, "%s must be a non-negative decimal integer (got '%s')",
-                 name, text);
-        return -1;
-    }
-    *out = value;
-    return 0;
-}
-
-void priv_peer_identity(long *uid, long *gid) {
-    long want_uid, want_gid;
-    char err[PRIV_ERR_LEN];
-    if (priv_env_peer_id("E2B_BROKER_PEER_UID", PRIV_DEFAULT_PEER_UID, &want_uid,
-                         err, sizeof(err)) != 0 ||
-        priv_env_peer_id("E2B_BROKER_PEER_GID", PRIV_DEFAULT_PEER_GID, &want_gid,
-                         err, sizeof(err)) != 0) {
-        /* A peer gate that cannot be read is a deployment defect, not a
-         * request-level refusal: name it and refuse to serve at all. */
-        priv_fail("invalid peer configuration: %s", err);
-    }
-    *uid = want_uid;
-    *gid = want_gid;
-}
-
-int priv_peer_allowed(long uid, long gid, char *err, size_t errlen) {
-    long want_uid, want_gid;
-    priv_peer_identity(&want_uid, &want_gid);
-    if (uid != want_uid) {
-        snprintf(err, errlen, "peer uid %ld does not match E2B_BROKER_PEER_UID=%ld",
-                 uid, want_uid);
-        return -1;
-    }
-    if (gid != want_gid) {
-        snprintf(err, errlen, "peer gid %ld does not match E2B_BROKER_PEER_GID=%ld",
-                 gid, want_gid);
-        return -1;
-    }
-    return 0;
 }
 
 int priv_parse_uid(const char *text, long *out, char *err, size_t errlen) {
@@ -133,6 +60,22 @@ int priv_parse_uid(const char *text, long *out, char *err, size_t errlen) {
     }
     if (value <= 0) {
         snprintf(err, errlen, "uid/gid must be positive (got %ld)", value);
+        return -1;
+    }
+    *out = value;
+    return 0;
+}
+
+/* A positive-integer env override, or ``fallback`` when unset/empty. */
+static int priv_env_positive_long(const char *name, long fallback, long *out,
+                                  char *err, size_t errlen) {
+    const char *text = getenv(name);
+    long value;
+    if (text == NULL || *text == '\0') {
+        *out = fallback;
+        return 0;
+    }
+    if (priv_parse_uid(text, &value, err, errlen) != 0) {
         return -1;
     }
     *out = value;
@@ -161,11 +104,11 @@ int priv_validate_uid(long uid, char *err, size_t errlen) {
     return 0;
 }
 
-/* See priv_worker_uid()/priv_worker_gid() in priv_common.h. A value the
- * daemon wrote is a decimal integer; 0 is legitimate (a root worker exists in
- * the compose and test shapes -- see priv_env_peer_id), anything else is a
- * deployment defect, and falling back to getuid()/getgid() there would mean
- * *root* behind `serve`, so this fails closed instead. */
+/* See priv_worker_uid()/priv_worker_gid() in priv_common.h. The override is a
+ * decimal integer; 0 is legitimate (a root worker exists in the compose and
+ * test shapes), anything else is a deployment defect, and falling back to
+ * getuid()/getgid() on one would silently mean *root* -- which is exactly the
+ * identity a `chown --worker` hands a tree to -- so this fails closed. */
 static long priv_env_worker_identity(const char *name, long fallback) {
     const char *text = getenv(name);
     char *end = NULL;
@@ -279,6 +222,8 @@ size_t priv_root_paths(const char **out, size_t max) {
     return count;
 }
 
+/* The roots, as "a" or "a, b, c" -- what the refusal for a path outside all of
+ * them names, so the operator sees which list to reconcile. */
 void priv_roots_text(char *out, size_t outlen) {
     const char *roots[PRIV_MAX_ROOTS];
     size_t count = priv_root_paths(roots, PRIV_MAX_ROOTS);
@@ -306,210 +251,15 @@ const char *priv_supervise_bin(void) {
     return (value != NULL && *value != '\0') ? value : PRIV_DEFAULT_SUPERVISE_BIN;
 }
 
-const char *priv_broker_socket(void) {
-    const char *value = getenv("E2B_PRIV_HELPER_SOCKET");
-    return (value != NULL && *value != '\0') ? value : PRIV_DEFAULT_BROKER_SOCKET;
-}
-
 /* The length of the sequence a lead byte starts, or 0 for a byte that cannot
  * start one (stranded continuation bytes, overlong leads, 5/6-byte forms). */
-static size_t priv_utf8_lead(unsigned char byte) {
-    if (byte < 0x80) {
-        return 1;
-    }
-    if (byte >= 0xc2 && byte <= 0xdf) {
-        return 2;
-    }
-    if (byte >= 0xe0 && byte <= 0xef) {
-        return 3;
-    }
-    if (byte >= 0xf0 && byte <= 0xf4) {
-        return 4;
-    }
-    return 0;
-}
 
 /* The length of the well-formed UTF-8 sequence at `data`, or 0 when the bytes
  * there are not one (RFC 3629: no overlongs, no surrogates, <= U+10FFFF). */
-static size_t priv_utf8_sequence(const char *data, size_t len) {
-    unsigned char lead = (unsigned char)data[0];
-    size_t need = priv_utf8_lead(lead);
-    size_t index;
-    if (need == 0 || len < need) {
-        return 0;
-    }
-    for (index = 1; index < need; index++) {
-        if (((unsigned char)data[index] & 0xc0) != 0x80) {
-            return 0;
-        }
-    }
-    if (need == 3) {
-        if (lead == 0xe0 && (unsigned char)data[1] < 0xa0) {
-            return 0; /* overlong */
-        }
-        if (lead == 0xed && (unsigned char)data[1] >= 0xa0) {
-            return 0; /* a surrogate is not a character */
-        }
-    }
-    if (need == 4) {
-        if (lead == 0xf0 && (unsigned char)data[1] < 0x90) {
-            return 0; /* overlong */
-        }
-        if (lead == 0xf4 && (unsigned char)data[1] > 0x8f) {
-            return 0; /* past U+10FFFF */
-        }
-    }
-    return need;
-}
-
-size_t priv_json_escape_boundary(const char *data, size_t len) {
-    size_t start = len;
-    size_t tail;
-    if (len == 0) {
-        return 0;
-    }
-    /* Step back over the continuation bytes of the last sequence to its lead. */
-    while (start > 0 && ((unsigned char)data[start - 1] & 0xc0) == 0x80) {
-        start--;
-    }
-    if (start == 0) {
-        /* Nothing but continuation bytes: every one of them is invalid on its
-         * own, so escaping them here is correct. */
-        return len;
-    }
-    tail = len - (start - 1);
-    if (priv_utf8_lead((unsigned char)data[start - 1]) > tail) {
-        /* The sequence continues in the next chunk: hand it over whole. When
-         * there is no earlier byte to stop at (the chunk *starts* with the
-         * sequence and the chunk is all that is left), the sequence is
-         * truncated by the end of the data -- consuming one byte keeps the
-         * caller moving and the escaper writes that byte the same way Python's
-         * surrogateescape writes a truncated sequence. Never 0: a streaming
-         * caller that gets 0 back would spin forever. */
-        return start > 1 ? start - 1 : 1;
-    }
-    return len;
-}
-
-size_t priv_json_escape(char *out, const char *data, size_t len) {
-    static const char *hex = "0123456789abcdef";
-    size_t index = 0, used = 0;
-    while (index < len) {
-        unsigned char c = (unsigned char)data[index];
-        size_t sequence;
-        if (c >= 0x80) {
-            sequence = priv_utf8_sequence(data + index, len - index);
-            if (sequence == 0) {
-                /* Not UTF-8: a Linux filename may be any byte but NUL and '/',
-                 * and JSON has to survive it. `\udcXX` is Python's
-                 * surrogateescape spelling of byte 0xXX, so the caller's
-                 * `json.loads` produces exactly the string `os.fsdecode()`
-                 * produced on the Python side -- the name stays matchable. */
-                unsigned int code = 0xdc00 + c;
-                out[used++] = '\\';
-                out[used++] = 'u';
-                out[used++] = hex[(code >> 12) & 0xf];
-                out[used++] = hex[(code >> 8) & 0xf];
-                out[used++] = hex[(code >> 4) & 0xf];
-                out[used++] = hex[code & 0xf];
-                index++;
-                continue;
-            }
-            /* A well-formed sequence goes through byte for byte: the protocol
-             * carries UTF-8, and re-encoding it would mean inventing a charset
-             * the caller did not ask for. */
-            memcpy(out + used, data + index, sequence);
-            used += sequence;
-            index += sequence;
-            continue;
-        }
-        switch (c) {
-        case '"':
-            out[used++] = '\\';
-            out[used++] = '"';
-            break;
-        case '\\':
-            out[used++] = '\\';
-            out[used++] = '\\';
-            break;
-        case '\b':
-        case '\f':
-        case '\n':
-        case '\r':
-        case '\t':
-            /* The short escapes, so a `walk` line stays readable on the wire. */
-            out[used++] = '\\';
-            out[used++] = c == '\b'   ? 'b'
-                          : c == '\f' ? 'f'
-                          : c == '\n' ? 'n'
-                          : c == '\r' ? 'r'
-                                      : 't';
-            break;
-        default:
-            if (c < 0x20) {
-                out[used++] = '\\';
-                out[used++] = 'u';
-                out[used++] = '0';
-                out[used++] = '0';
-                out[used++] = hex[(c >> 4) & 0xf];
-                out[used++] = hex[c & 0xf];
-            } else {
-                /* Anything else goes through byte for byte: the protocol
-                 * carries UTF-8, and re-encoding it here would mean inventing
-                 * a charset the caller did not ask for. */
-                out[used++] = (char)c;
-            }
-            break;
-        }
-        index++;
-    }
-    return used;
-}
 
 /* Append `text` to the buffer that ends at `out[outlen]`, or leave it as it
  * was when it does not fit (the caller sizes the buffer for the shape it
  * froze, so truncation is a bug, not a case to paper over). */
-static void priv_append_text(char *out, size_t outlen, size_t *used,
-                             const char *text) {
-    size_t text_len = strlen(text);
-    if (*used + text_len + 1 > outlen) {
-        return;
-    }
-    memcpy(out + *used, text, text_len);
-    *used += text_len;
-    out[*used] = '\0';
-}
-
-void priv_roots_json(char *out, size_t outlen) {
-    const char *roots[PRIV_MAX_ROOTS];
-    size_t count = priv_root_paths(roots, PRIV_MAX_ROOTS);
-    size_t index, used = 0;
-    /* A root is one path and the widest escape is 6 bytes per byte. */
-    char escaped[6 * PATH_MAX];
-    out[0] = '\0';
-    priv_append_text(out, outlen, &used, "[");
-    for (index = 0; index < count; index++) {
-        size_t root_len = strlen(roots[index]);
-        size_t escaped_len;
-        /* A root that cannot fit in PATH_MAX can never match a resolved path
-         * either (realpath() cannot produce one), so this is a deployment
-         * defect rather than a shape to squeeze: answer with an empty array
-         * instead of a truncated -- i.e. lying -- one. */
-        if (root_len >= sizeof(escaped) / 6) {
-            snprintf(out, outlen, "[]");
-            return;
-        }
-        escaped_len = priv_json_escape(escaped, roots[index], root_len);
-        escaped[escaped_len] = '\0';
-        if (index > 0) {
-            priv_append_text(out, outlen, &used, ",");
-        }
-        priv_append_text(out, outlen, &used, "\"");
-        priv_append_text(out, outlen, &used, escaped);
-        priv_append_text(out, outlen, &used, "\"");
-    }
-    priv_append_text(out, outlen, &used, "]");
-}
 
 /* len(prefix) == strlen(prefix); "equal or a proper subpath" test. */
 static int priv_is_within(const char *path, const char *root, int strict) {

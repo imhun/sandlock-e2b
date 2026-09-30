@@ -25,14 +25,8 @@
 #define PRIV_DEFAULT_UID_POOL_SIZE 1000L
 #define PRIV_DEFAULT_WORKSPACE_BASE "/var/lib/e2b-sandboxes"
 #define PRIV_DEFAULT_MAINT_BIN "/var/lib/e2b-priv/e2b-maint"
-#define PRIV_DEFAULT_BROKER_SOCKET "/run/e2b-broker/broker.sock"
 #define PRIV_DEFAULT_SUPERVISE_BIN \
     "/usr/local/lib/python3.14/site-packages/sandlock/bin/sandlock-supervise"
-
-/* C1: the socket broker is only ever talked to by the worker, which runs as
- * this identity in the non-root shape. */
-#define PRIV_DEFAULT_PEER_UID 65534L
-#define PRIV_DEFAULT_PEER_GID 65534L
 
 #define PRIV_MAX_ROOTS 4
 
@@ -43,11 +37,6 @@ void priv_set_progname(const char *name);
 /* Print "e2b-...: <fmt>" to stderr and exit(PRIV_EXIT_REFUSED). */
 void priv_fail(const char *fmt, ...) __attribute__((format(printf, 1, 2)))
     __attribute__((noreturn));
-
-/* Print "e2b-...: refused: <message>" to stderr and *stay up*: the socket
- * broker answers the refusal on the connection it came from and keeps
- * serving, so a single bad peer must not take the node's broker down. */
-void priv_report_refused(const char *message);
 
 /* Print "e2b-...: <fmt>" to stderr and exit(PRIV_EXIT_USAGE). */
 void priv_usage(const char *fmt, ...) __attribute__((format(printf, 1, 2)))
@@ -67,27 +56,15 @@ int priv_validate_uid(long uid, char *err, size_t errlen);
  * chgrp-to-own-gid is never a privilege widening. */
 int priv_gid_allowed(long gid, char *err, size_t errlen);
 
-/* C1: the identity to treat as "the worker's own", for `chown --worker` and
- * for the own-gid arm of `priv_gid_allowed` (and ``validate_chown_gid`` on the
- * Python side). Directly exec'd, the process *is* the worker and these are
- * ``getuid()`` / ``getgid()``. Behind ``serve`` the process is root, so the
- * daemon writes the **authenticated peer's** uid/gid into
- * ``E2B_BROKER_WORKER_UID`` / ``E2B_BROKER_WORKER_GID`` for every request it
- * forks for -- a request cannot forge them (the daemon overwrites them itself,
- * per connection), and with neither set this is exactly today's behaviour. */
+/* The identity to treat as "the worker's own", for `chown --worker` and for
+ * the own-gid arm of `priv_gid_allowed` (and ``validate_chown_gid`` on the
+ * Python side). The process *is* the worker, so these are ``getuid()`` /
+ * ``getgid()`` -- with ``E2B_BROKER_WORKER_UID`` / ``E2B_BROKER_WORKER_GID``
+ * as an explicit override for the shapes that run this binary as root (what
+ * C1's socket daemon used to write per connection; C3's face B runs it as root
+ * and leaves them unset, so the pair falls back to the real identity). */
 long priv_worker_uid(void);
 long priv_worker_gid(void);
-
-/* C1 (serve): the peer gate. The socket file mode cannot express "the worker
- * and nothing else" -- the sandboxes share the node's filesystem view -- so
- * the accepted connection's SO_PEERCRED uid and gid must both equal
- * E2B_BROKER_PEER_UID / E2B_BROKER_PEER_GID (default 65534). */
-int priv_peer_allowed(long uid, long gid, char *err, size_t errlen);
-
-/* The configured peer identity (default 65534), so `serve` can refuse to
- * start on a value it cannot read instead of answering every request with a
- * message the caller cannot act on. Does not return on a bad value. */
-void priv_peer_identity(long *uid, long *gid);
 
 /* N27: the platform state base -- `E2B_STATE_BASE` when the deployment names
  * one, the workspace base otherwise (one shape, one root). */
@@ -107,9 +84,6 @@ const char *priv_state_base(void);
  * Returns how many were written. */
 size_t priv_root_paths(const char **out, size_t max);
 
-/* The same roots as a JSON array, for the `hello` handshake. */
-void priv_roots_json(char *out, size_t outlen);
-
 /* realpath() + containment in the roots above.
  * `strict` additionally refuses the roots themselves (delete/chown must never
  * target a whole managed root). Returns 0 on success and writes the resolved
@@ -122,27 +96,5 @@ void priv_roots_text(char *out, size_t outlen);
 
 /* The pinned sandlock-supervise path (E2B_SUPERVISE_BIN or the build default). */
 const char *priv_supervise_bin(void);
-
-/* The broker socket path (E2B_PRIV_HELPER_SOCKET or the build default). */
-const char *priv_broker_socket(void);
-
-/* JSON-escape `len` bytes of `data` into `out`, which must hold at least
- * `6 * len` bytes (the widest escape is \uXXXX). Returns the bytes written.
- *
- * The bytes are validated as UTF-8. A well-formed sequence goes through
- * unchanged; a byte that is *not* UTF-8 is written the way Python's
- * `surrogateescape` writes it -- `\udcXX` for byte 0xXX -- because a Linux
- * filename may be any byte sequence, and the consumer compares these paths
- * against what `os.walk`/`os.fsdecode` saw. `\uFFFD` would be lossy: the name
- * could never be matched again, and one such file would cost the whole
- * response (JSON that is not UTF-8 parses as nothing at all). */
-size_t priv_json_escape(char *out, const char *data, size_t len);
-
-/* How many bytes of `data` may be escaped without splitting a UTF-8 sequence:
- * a streaming caller hands out chunks and must not cut one in half, or the
- * second half would look like invalid bytes. A non-empty chunk never yields 0
- * (a chunk of only continuation bytes is invalid anyway and is escaped byte by
- * byte). */
-size_t priv_json_escape_boundary(const char *data, size_t len);
 
 #endif /* E2B_PRIV_COMMON_H */

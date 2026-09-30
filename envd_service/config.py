@@ -143,6 +143,57 @@ def _network_deny_cidrs() -> tuple[str, ...]:
     return tuple(p.strip() for p in value.split(",") if p.strip())
 
 
+#: One line per process about a slot-identity default that came from the shape
+#: rather than from ``E2B_SLOT_IDENTITY``. ``Settings()`` is built hundreds of
+#: times per process (tests, embedders), so the line is latched.
+_slot_identity_default_reported = False
+
+
+def _agent_configured() -> bool:
+    """Whether this deployment routes privileged steps to a per-node agent.
+
+    One signal, and deliberately the only one this package may look at:
+    ``E2B_PRIV_HELPER_TRANSPORT=agent``, which **every** C3-shaped worker
+    declares (the k8s pod, the stack, both compose production examples) and
+    which means privileged steps are routed to an agent that therefore exists.
+    The agent's *address* is not a signal the worker is allowed to know --
+    ``tests/unit/test_route_b_slot_identity.py`` pins that ``envd_service/**``
+    never names its URL or port, because a worker that cannot name the agent
+    cannot dial it (C3 hard rule 5, the connection-layer refusal).
+    """
+    transport = (os.getenv("E2B_PRIV_HELPER_TRANSPORT") or "auto").strip().lower()
+    return transport == "agent"
+
+
+def _default_slot_identity() -> str:
+    """``E2B_SLOT_IDENTITY``, or this shape's own answer when it is unset.
+
+    Explicit stays explicit. Unset used to mean ``spawn`` unconditionally --
+    "the default, and the fallback until Task 4/7" -- which by now inverts the
+    product: C3 (``agent-grant``) is what every shipped manifest runs, so a
+    deployment that *has* an agent and forgot the key would silently grant slot
+    identities in-process instead. Resolving by shape fixes that without
+    breaking the shapes that genuinely have no agent (the single-machine
+    example, the test lane), which can only run ``spawn`` anyway.
+    """
+    raw = (os.getenv("E2B_SLOT_IDENTITY") or "").strip().lower()
+    if raw:
+        return raw
+    agent = _agent_configured()
+    chosen = "agent-grant" if agent else "spawn"
+    global _slot_identity_default_reported
+    if not _slot_identity_default_reported:
+        _slot_identity_default_reported = True
+        logger.warning(
+            "E2B_SLOT_IDENTITY is unset: using %r for this shape (%s). Every "
+            "shipped manifest names it explicitly -- set it too if this "
+            "deployment is meant to be the other shape.",
+            chosen,
+            "an agent is configured" if agent else "no agent is configured",
+        )
+    return chosen
+
+
 def _quota_via_agent_from_env() -> bool:
     """Whether the worker must route quota operations through quota-agent.
 
@@ -509,15 +560,20 @@ class Settings:
             os.getenv("E2B_ROUTE_B_TMP_ROOT", "/tmp/sandlock-route-b")
         ).resolve()
     )
-    # C3 Task 3 (ruling D9.1): how a slot gets its identity. ``spawn`` (the
-    # default, and the fallback until Task 4/7) is the privileged starter -- the
-    # worker or its file-capability broker performs the setuid. ``agent-grant``
-    # is the C3 path: the worker forks the child, the child unshares a user
-    # namespace, the worker reports {sandbox_id, pid} to the control plane, and
-    # the per-node agent writes the identity. The worker holds no privilege on
-    # that path at all.
+    # C3 Task 3 (ruling D9.1): how a slot gets its identity. ``spawn`` is the
+    # privileged starter -- the worker or its file-capability broker performs
+    # the setuid. ``agent-grant`` is the C3 path: the worker forks the child,
+    # the child unshares a user namespace, the worker reports {sandbox_id, pid}
+    # to the control plane, and the per-node agent writes the identity. The
+    # worker holds no privilege on that path at all.
+    #
+    # Unset is resolved by *shape*, not by a constant (see
+    # :func:`_default_slot_identity`): a deployment that has an agent gets the
+    # C3 path, a deployment that has none gets the only one it can run, and
+    # either way one line says so. Every shipped manifest sets the key
+    # explicitly -- this default is for the manifest somebody writes next.
     slot_identity: str = field(
-        default_factory=lambda: os.getenv("E2B_SLOT_IDENTITY", "spawn").strip().lower()
+        default_factory=lambda: _default_slot_identity()
     )
     # Deadline for one slot-identity report to the control plane. The control
     # plane's own CP→agent deadline is inside this one, so the worker's bound is
