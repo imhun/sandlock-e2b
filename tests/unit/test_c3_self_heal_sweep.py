@@ -43,10 +43,10 @@ from control_plane.node_address import NodeEndpoint, StaticAddressResolver
 from control_plane.registry.manager import SandboxRegistry
 from control_plane.registry.nodes import NodeRegistry
 from control_plane.worker_identity_source import StaticWorkerIdentitySource
-from deploy.c3_agent.app import create_app as create_agent_app
-from deploy.c3_agent.config import Settings as AgentSettings
-from deploy.c3_agent.fileops import AgentFileOpRefusal
-from deploy.c3_agent.scan import (
+from c3_agent.app import create_app as create_agent_app
+from c3_agent.config import Settings as AgentSettings
+from c3_agent.fileops import AgentFileOpRefusal
+from c3_agent.scan import (
     HttpInventoryReporter,
     InventoryScanner,
     ScanSchedule,
@@ -516,7 +516,7 @@ async def test_a_deferred_sweep_backs_off_and_logs_one_named_line(
     cp = _ControlPlane(workspace, store=None)
     cp.tree(ORPHAN)
     scanner = cp.scanner()
-    with caplog.at_level(logging.WARNING, logger="deploy.c3_agent.scan"):
+    with caplog.at_level(logging.WARNING, logger="c3_agent.scan"):
         first = await scanner.round()
     assert first.next_delay_s == 240.0
     # Scoped to this module's own logger: the control plane's warning (and the
@@ -524,7 +524,7 @@ async def test_a_deferred_sweep_backs_off_and_logs_one_named_line(
     assert [
         record.message
         for record in caplog.records
-        if record.name == "deploy.c3_agent.scan"
+        if record.name == "c3_agent.scan"
     ] == [
         "c3-agent inventory: the sweep was deferred by the control plane "
         "(1 tree(s) reported): this control plane's records are process-local "
@@ -550,9 +550,9 @@ def test_a_scan_that_cannot_be_configured_says_so_instead_of_polling(
     caplog,
 ) -> None:
     """A container asked to scan without a destination (or with a 0 cadence) is inert."""
-    from deploy.c3_agent.scan import scanner_for
+    from c3_agent.scan import scanner_for
 
-    with caplog.at_level(logging.WARNING, logger="deploy.c3_agent.scan"):
+    with caplog.at_level(logging.WARNING, logger="c3_agent.scan"):
         assert (
             scanner_for(
                 AgentSettings(token=AGENT_TOKEN, node_id=HOST, scan_enabled=True)
@@ -562,14 +562,14 @@ def test_a_scan_that_cannot_be_configured_says_so_instead_of_polling(
     assert [
         record.message
         for record in caplog.records
-        if record.name == "deploy.c3_agent.scan"
+        if record.name == "c3_agent.scan"
     ] == [
         "c3-agent inventory: E2B_C3_AGENT_SCAN is on but E2B_CONTROL_PLANE_URL "
         "is empty: this container cannot report what it sees, so the sweep is "
         "inert here"
     ]
     caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="deploy.c3_agent.scan"):
+    with caplog.at_level(logging.WARNING, logger="c3_agent.scan"):
         assert (
             scanner_for(
                 AgentSettings(
@@ -585,7 +585,7 @@ def test_a_scan_that_cannot_be_configured_says_so_instead_of_polling(
     assert [
         record.message
         for record in caplog.records
-        if record.name == "deploy.c3_agent.scan"
+        if record.name == "c3_agent.scan"
     ] == [
         "c3-agent inventory: E2B_C3_AGENT_SCAN_INTERVAL_S must be positive (got "
         "0.0): the sweep is inert here"
@@ -612,12 +612,12 @@ def test_a_missing_workspace_base_is_an_empty_scan_not_a_crash(
 ) -> None:
     cp = _shape(workspace)
     absent = str(workspace / "absent")
-    with caplog.at_level(logging.WARNING, logger="deploy.c3_agent.scan"):
+    with caplog.at_level(logging.WARNING, logger="c3_agent.scan"):
         assert cp.scanner(workspace_base=absent).scan_once() == []
     assert [
         record.message
         for record in caplog.records
-        if record.name == "deploy.c3_agent.scan"
+        if record.name == "c3_agent.scan"
     ] == [
         "c3-agent inventory: the workspace base "
         f"{absent} does not exist: nothing to report"

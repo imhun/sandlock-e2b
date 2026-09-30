@@ -28,9 +28,9 @@ import time
 import httpx
 import pytest
 
-from deploy.c3_agent.app import create_app
-from deploy.c3_agent.config import Settings
-from deploy.c3_agent.fileops import AgentFileOpRefusal, SubprocessMaintRunner
+from c3_agent.app import create_app
+from c3_agent.config import Settings
+from c3_agent.fileops import AgentFileOpRefusal, SubprocessMaintRunner
 from control_plane.c3_agent_client import (
     AgentTarget,
     C3AgentClient,

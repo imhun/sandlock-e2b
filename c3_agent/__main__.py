@@ -1,4 +1,4 @@
-"""Run the C3 per-node agent: ``python -m deploy.c3_agent`` (Task 2)."""
+"""Run the C3 per-node agent: ``python -m c3_agent`` (Task 2)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import sys
 
 import uvicorn
 
-from deploy.c3_agent.app import create_app
-from deploy.c3_agent.config import Settings
+from c3_agent.app import create_app
+from c3_agent.config import Settings
 
 
 def _configure_logging(settings: Settings) -> int:
@@ -18,7 +18,7 @@ def _configure_logging(settings: Settings) -> int:
     (``envd_service.__main__._configure_logging``,
     ``control_plane.config.configure_logging``) and for the same reason:
     ``uvicorn.run`` only configures the ``uvicorn*`` loggers, while
-    ``deploy.c3_agent.*`` inherits a root logger left at WARNING -- so the
+    ``c3_agent.*`` inherits a root logger left at WARNING -- so the
     self-heal round's one greppable line ("is the sweep alive?") never appeared,
     and ``E2B_LOG_LEVEL=DEBUG`` was a no-op. ``logging.basicConfig`` is a no-op
     when the root logger already has handlers (e.g. under pytest), so the level

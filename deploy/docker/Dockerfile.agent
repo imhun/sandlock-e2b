@@ -79,14 +79,15 @@ RUN chown root:65534 /var/lib/e2b-priv/as_uid /var/lib/e2b-priv/e2b-maint \
     && getcap /var/lib/e2b-priv/as_uid /var/lib/e2b-priv/e2b-maint
 
 # Task 2: the control-plane channel. The agent's service is a small FastAPI app
-# (`deploy/c3_agent`) -- the CP→agent half of C3's two channels (there is no
-# worker↔agent channel). Only what that service imports comes in: the pinned
-# web stack, `gateway_common.env` (one integer reader) and `deploy.c3_agent`
-# itself. Still deliberately *not* the sandbox runtime: no envd_service, no
-# sandlock wheel, no egress library.
+# (`c3_agent/`, a top-level package next to `control_plane/` and `autoscaler/`:
+# it is a service of its own, not a deployment asset) -- the CP→agent half of
+# C3's two channels (there is no worker↔agent channel). Only what that service
+# imports comes in: the pinned web stack, `gateway_common.env` (one integer
+# reader) and `c3_agent` itself. Still deliberately *not* the sandbox runtime:
+# no envd_service, no sandlock wheel, no egress library.
 #
 # `httpx` is part of that stack and not decoration: Task 6's inventory scan
-# (`deploy/c3_agent/scan.py`, imported by `app.py` unconditionally) uses it to
+# (`c3_agent/scan.py`, imported by `app.py` unconditionally) uses it to
 # report to the control plane. Measured 2026-09-29 on this tree: without it the
 # image does not even *import* (`ModuleNotFoundError: No module named 'httpx'`
 # at `app.py` line 105), so the service crash-loops and every grant refuses.
@@ -98,8 +99,7 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
         httpx==0.28.1 \
         pydantic==2.13.5
 
-COPY deploy/__init__.py /app/deploy/__init__.py
-COPY deploy/c3_agent/ /app/deploy/c3_agent/
+COPY c3_agent/ /app/c3_agent/
 COPY gateway_common/ /app/gateway_common/
 
 # Face A's identity. The agent DaemonSet overrides it per container (face B is
@@ -108,5 +108,5 @@ USER 65534:65534
 
 # Face A serves the control-plane channel; face B's file ops are a later task.
 # The service refuses to start without `E2B_C3_AGENT_TOKEN` and its own node id
-# (`deploy/c3_agent/__main__.py`), so an accidentally exposed port is inert.
-CMD ["python3", "-m", "deploy.c3_agent"]
+# (`c3_agent/__main__.py`), so an accidentally exposed port is inert.
+CMD ["python3", "-m", "c3_agent"]

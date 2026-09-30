@@ -13,7 +13,7 @@ Linux kernel with user namespaces, so it builds and runs
         sh -c 'python3 -m pytest tests/security/test_agent_image_privilege.py -q'
 
 The image is built from a minimal context (``deploy/priv/`` for the two
-binaries, the Dockerfile, and -- since Task 2 -- the ``deploy.c3_agent`` package
+binaries, the Dockerfile, and -- since Task 2 -- the ``c3_agent`` package
 the CMD runs plus its one ``gateway_common.env`` reader; the image needs nothing
 else), and the grant runs against a
 second container started from that same image with ``--pid=container:`` -- the
@@ -150,10 +150,10 @@ def agent_image(tmp_path_factory: pytest.TempPathFactory) -> str:
     """``deploy/docker/Dockerfile.agent`` built from a minimal context.
 
     The context carries exactly what the Dockerfile copies: ``deploy/priv/``
-    (the two binaries it compiles), the ``deploy.c3_agent`` package the CMD runs
-    (Task 2's control-plane channel), the ``deploy`` package marker, and the
-    single ``gateway_common.env`` reader it imports -- and nothing else, so a
-    context that grew would hide a missing COPY behind a stray file.
+    (the two binaries it compiles), the ``c3_agent`` package the CMD runs
+    (Task 2's control-plane channel), and the single ``gateway_common.env``
+    reader it imports -- and nothing else, so a context that grew would hide a
+    missing COPY behind a stray file.
     """
     context = tmp_path_factory.mktemp("c3-agent-context")
     shutil.copy2(
@@ -163,11 +163,8 @@ def agent_image(tmp_path_factory: pytest.TempPathFactory) -> str:
     shutil.copytree(
         PROJECT_ROOT / "deploy" / "priv", context / "deploy" / "priv"
     )
-    shutil.copy2(
-        PROJECT_ROOT / "deploy" / "__init__.py", context / "deploy" / "__init__.py"
-    )
     shutil.copytree(
-        PROJECT_ROOT / "deploy" / "c3_agent", context / "deploy" / "c3_agent"
+        PROJECT_ROOT / "c3_agent", context / "c3_agent"
     )
     shutil.copytree(
         PROJECT_ROOT / "gateway_common", context / "gateway_common"

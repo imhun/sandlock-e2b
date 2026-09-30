@@ -24,7 +24,7 @@ Surface (all responses JSON objects):
   knows (its own pid namespace); ``worker`` is who the control plane says that
   pid belongs to. ``node_id`` in the path is *this host* (D12). The agent
   resolves the host pid first
-  (:mod:`deploy.c3_agent.lookup`), then runs ``as_uid --uid X --pid <host>``;
+  (:mod:`c3_agent.lookup`), then runs ``as_uid --uid X --pid <host>``;
   the *only* accepted result is exit 0 with exactly the ``C3-ASUID-OK
   pid=N uid=X`` line on stdout and an empty stderr. Anything else is a ``502``
   named fail-closed refusal (a half-applied grant must never read as success).
@@ -34,7 +34,7 @@ Surface (all responses JSON objects):
   answer. The **verb list is the whitelist** (D18.2) and an unknown verb is
   refused by name; ``path`` and ``uid`` are the control plane's values (hard
   rules 1/3 -- the worker never names either), and the path discipline is
-  ``e2b-maint``'s (:mod:`deploy.c3_agent.fileops` execs that same binary with
+  ``e2b-maint``'s (:mod:`c3_agent.fileops` execs that same binary with
   the same roots).
 
   ``worker.container_id`` is the compose lane's anchor (rulings D21 option 2
@@ -42,7 +42,7 @@ Surface (all responses JSON objects):
   kernel** -- candidates matched by the container id that appears in their
   world-readable ``/proc/<pid>/cgroup``, the identity then read from
   ``/proc/<pid>/status``
-  (:meth:`deploy.c3_agent.lookup.ProcLookup.worker_uid_gid`) -- and the values
+  (:meth:`c3_agent.lookup.ProcLookup.worker_uid_gid`) -- and the values
   in the body are only a claim to be confirmed. A claim the kernel does not
   confirm -- or an anchor no process carries, or candidates whose identities
   disagree -- is a named 502 and no ``e2b-maint`` runs. No capability and no
@@ -56,7 +56,7 @@ Auth: every request must carry ``X-Internal-Key`` equal to
 token is unconfigured.
 
 Task 6 adds the one connection the agent *initiates*: the periodic inventory
-scan (:mod:`deploy.c3_agent.scan`) reports the sandbox-shaped trees it can see
+scan (:mod:`c3_agent.scan`) reports the sandbox-shaped trees it can see
 to ``POST /internal/nodes/{host}/agent/inventory``, and the control plane
 answers with its decision. The report carries ids and nothing else, the agent
 decides nothing, and it removes nothing on its own -- the removal is still one
@@ -70,7 +70,7 @@ allowing only CP→agent** and the rule that ``E2B_C3_AGENT_TOKEN`` never appear
 in a worker manifest or the worker image. Neither is built here.
 
 The container-pid → host-pid reverse lookup lives beside this module, in
-``deploy/c3_agent/lookup.py``: it is a pure function of a ``/proc`` tree so the
+``c3_agent/lookup.py``: it is a pure function of a ``/proc`` tree so the
 DaemonSet drives the same code the lanes drive against a synthetic one.
 """
 
@@ -87,9 +87,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from deploy.c3_agent.config import Settings
-from deploy.c3_agent.errors import AgentRefusal
-from deploy.c3_agent.fileops import (
+from c3_agent.config import Settings
+from c3_agent.errors import AgentRefusal
+from c3_agent.fileops import (
     FILE_OP_VERBS,
     AgentFileOpRefusal,
     FileOpInstruction,
@@ -98,7 +98,7 @@ from deploy.c3_agent.fileops import (
     SubprocessMaintRunner,
     run_file_op,
 )
-from deploy.c3_agent.lookup import (
+from c3_agent.lookup import (
     LookupRefusal,
     ProcLookup,
     ProcWorkerIdentityResolver,
@@ -107,7 +107,7 @@ from deploy.c3_agent.lookup import (
     WorkerIdentityResolver,
     missing_slot_pid_message,
 )
-from deploy.c3_agent.scan import InventoryScanner, scanner_for
+from c3_agent.scan import InventoryScanner, scanner_for
 from gateway_common.paths import validate_node_id, validate_sandbox_id
 
 logger = logging.getLogger(__name__)
@@ -154,7 +154,7 @@ class WorkerCredentials(BaseModel):
     Both halves are needed for face B and neither may come from the agent's own
     ``getuid()``/``getgid()``: the agent is root, so its own identity would turn
     ``chown --worker`` into "hand the tree to root" (see
-    :mod:`deploy.c3_agent.fileops`).
+    :mod:`c3_agent.fileops`).
 
     ``container_id`` is present exactly when the control plane's shape could
     not verify the claim itself (the compose lane: no pod spec to read) and is

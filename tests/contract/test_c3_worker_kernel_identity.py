@@ -20,7 +20,7 @@ What it covers, in the order the ruling argues it:
 * **the same face reads the cgroup and the status file fine** -- they are
   world-readable, so the *container-id* anchor needs no capability, no uid
   change, and (D2's resolution) no ``SETUID``/``SETGID`` in face B at all;
-* the production :class:`deploy.c3_agent.lookup.ProcWorkerIdentityResolver`
+* the production :class:`c3_agent.lookup.ProcWorkerIdentityResolver`
   resolving a real worker's anchor on a real host ``/proc``, plus each named
   refusal the brief asks for (a claim the kernel does not confirm, an anchor no
   process carries, candidates whose identities disagree), and the D4 relaxation
@@ -63,7 +63,7 @@ NOBODY_ID = "0123456789ab"
 READER_SCRIPT = r'''
 import json, os, sys
 
-from deploy.c3_agent.lookup import (
+from c3_agent.lookup import (
     LookupRefusal,
     ProcLookup,
     ProcWorkerIdentityResolver,

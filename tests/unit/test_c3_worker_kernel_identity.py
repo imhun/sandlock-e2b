@@ -45,9 +45,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from deploy.c3_agent.app import create_app as create_agent_app
-from deploy.c3_agent.config import Settings as AgentSettings
-from deploy.c3_agent.lookup import (
+from c3_agent.app import create_app as create_agent_app
+from c3_agent.config import Settings as AgentSettings
+from c3_agent.lookup import (
     LookupRefusal,
     ProcLookup,
     ProcWorkerIdentityResolver,

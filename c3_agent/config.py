@@ -1,4 +1,4 @@
-"""Configuration for the C3 per-node agent (``deploy/c3_agent``).
+"""Configuration for the C3 per-node agent (``c3_agent``).
 
 Same shape as ``deploy/quota_agent/config.py``: a tiny dataclass reading env,
 refusing to run without its token (``app``/``__main__`` enforce that), and with

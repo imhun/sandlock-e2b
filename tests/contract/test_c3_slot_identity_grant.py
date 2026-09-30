@@ -115,7 +115,7 @@ time.sleep(300)
 #: container and print what it resolved (or refused, by name).
 LOOKUP_DRIVER = '''
 import sys
-from deploy.c3_agent.lookup import LookupRefusal, ProcLookup, WorkerIdentity
+from c3_agent.lookup import LookupRefusal, ProcLookup, WorkerIdentity
 container_pid, pid_namespace, node_id, sandbox_id = sys.argv[1:5]
 try:
     slot = ProcLookup().host_pid(

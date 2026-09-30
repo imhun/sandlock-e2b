@@ -5,7 +5,7 @@
 (``realpath`` + the four-root whitelist + the uid-pool gate, all in
 ``priv_common.c``). C3 does not re-implement any of that: this module is a
 **thin, strict judgement of that binary's answer**, and the service around it
-(:mod:`deploy.c3_agent.app`) is what turns an instruction into one exec.
+(:mod:`c3_agent.app`) is what turns an instruction into one exec.
 
 Why the agent execs the binary at all, instead of the worker doing it: C3 §11.2
 -- the agent is the *executor* of file operations, never a component that hands
@@ -55,7 +55,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
-from deploy.c3_agent.errors import AgentRefusal
+from c3_agent.errors import AgentRefusal
 
 #: The verb whitelist (D18.2). Anything else is refused **by name** by the
 #: service before this module is consulted -- the same vocabulary ``maint.c``

@@ -32,7 +32,7 @@ compose stacks), and the control plane's part is to carry the anchor that makes
 it a lookup with every instruction that acts as the worker.
 ``KernelWorkerIdentitySource`` is that shape: it keeps the reported uid/gid as
 the value the agent confirms, and the agent refuses by name when the kernel
-disagrees (``deploy/c3_agent/lookup.py``).
+disagrees (``c3_agent/lookup.py``).
 
 Two anchors coexist, on purpose, and they are two different questions:
 
@@ -203,7 +203,7 @@ class KernelWorkerIdentitySource:
     the worker's own process identity, read from ``/proc/<pid>/status`` for the
     process(es) whose cgroup path contains the **container id** the control
     plane records for it (D25;
-    :meth:`deploy.c3_agent.lookup.ProcLookup.worker_uid_gid`). The pid namespace
+    :meth:`c3_agent.lookup.ProcLookup.worker_uid_gid`). The pid namespace
     is a *different* anchor -- the slot-grant one (see the module docstring) --
     and is not what travels here.
 

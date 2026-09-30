@@ -290,7 +290,7 @@ kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data}' | wc -c   # 只
 前两个表靠“列表里新旧并存”消掉中断，这三个凭据**没有双窗**：redis 只有一个
 `--requirepass`（换口令就是换那一个值），quota-agent token 是单值、缺了就拒绝启动
 （`deploy/quota_agent/__main__.py:15-19`），C3 的 CP→agent token 同样是单值、
-两边都必须逐字等于 Secret 里的那个值（`deploy/c3_agent/__main__.py` 起不来）—— 所以轮换
+两边都必须逐字等于 Secret 里的那个值（`c3_agent/__main__.py` 起不来）—— 所以轮换
 **必然**经过一段（这一跳的）不可用。
 2026-09-26 的用户裁定（`docs/superpowers/plans/2026-09-26-decisions.md` 第 5 条 +
 《追加裁定（O3 第二轮）》）：**redis 接受 10–30 s 中断，不做 ACL 双用户**；ACL 版本只作**备选**记在表里，`deploy/k8s/redis.yaml` 不动。

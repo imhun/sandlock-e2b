@@ -1,7 +1,7 @@
 """C3 Task 6: 孤儿回收的决策面 --- agent 巡检 → **CP 决策** → agent 执行.
 
 The agent is the eyes: it mounts the shared workspaces and reports the
-sandbox-shaped trees it can see (``deploy/c3_agent/scan.py``). This module is
+sandbox-shaped trees it can see (``c3_agent/scan.py``). This module is
 the brain, and it is the *only* place the question "may this tree go?" is
 answered -- the agent never decides, and it never acts on its own.
 

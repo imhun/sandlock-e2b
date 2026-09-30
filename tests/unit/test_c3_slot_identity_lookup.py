@@ -36,7 +36,7 @@ from pathlib import Path
 
 import pytest
 
-from deploy.c3_agent.lookup import (
+from c3_agent.lookup import (
     LookupRefusal,
     ProcLookup,
     SlotProcess,

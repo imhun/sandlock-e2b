@@ -695,7 +695,7 @@ ${E2B_REDIS_PASSWORD:-local-redis-password}`，与另外两个栈同形），CP 
 `E2B_C3_AGENT_SCAN=on`。门的读数（面 B 的日志，30s 首扫 + 120s 周期）：
 
 ```
-INFO:deploy.c3_agent.scan:c3-agent inventory: node=c3-agent scanned=0 protected=0 orphans=0 removed=0 failed=0 deferred=-
+INFO:c3_agent.scan:c3-agent inventory: node=c3-agent scanned=0 protected=0 orphans=0 removed=0 failed=0 deferred=-
 ```
 
 手工放一棵沙箱形状的孤儿树（`/var/lib/e2b-sandboxes/sbx_<32 hex>/`，65534）后下一轮：

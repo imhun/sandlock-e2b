@@ -739,8 +739,8 @@ worker 侧的特权面并没有真的消失。**(d) 是唯一的例外，因为�
    **锚点**；agent 侧 face B 在锚点存在时按锚点解出 worker 自己的进程、读内核的有效身份，
    **用它**做 `--worker`/`--gid`，声明与内核不一致即**具名拒**且不 exec 任何 `e2b-maint`
    （k8s 车道不动：它的指令不带锚点，值仍是 pod spec 校验过的那一个）。实现与用例：
-   `deploy/c3_agent/lookup.py`（`ProcLookup.worker_uid_gid`）、
-   `deploy/c3_agent/app.py`（`WorkerCredentials.container_id`）、
+   `c3_agent/lookup.py`（`ProcLookup.worker_uid_gid`）、
+   `c3_agent/app.py`（`WorkerCredentials.container_id`）、
    `control_plane/{worker_identity_source,api/internal,c3_agent_client}.py`；
    `tests/unit/test_c3_worker_kernel_identity.py`、
    `tests/unit/test_c3_fileops_forwarding.py`（compose 声明+锚点）、
@@ -874,9 +874,9 @@ worker 侧的特权面并没有真的消失。**(d) 是唯一的例外，因为�
 15. **agent 入口不放开 INFO ⇒"自愈轮次那一行"在健康态反而是看不见的那一行**：
     worker（`envd_service.__main__`）与 CP（`control_plane.config.configure_logging`）都在
     serve 之前 `basicConfig(level=E2B_LOG_LEVEL 或 INFO)`，agent 的入口没有 ⇒
-    `uvicorn.run` 只配 `uvicorn*` 的 logger，`deploy.c3_agent.*` 继承的根 logger 停在 WARNING：
+    `uvicorn.run` 只配 `uvicorn*` 的 logger，`c3_agent.*` 继承的根 logger 停在 WARNING：
     **成功**的轮次（`c3-agent inventory: node=… scanned=… deferred=-`，INFO）不打印，而**被拒**
-    的轮次（WARNING）打印。收口：`deploy/c3_agent/__main__._configure_logging` 逐条照抄两个
+    的轮次（WARNING）打印。收口：`c3_agent/__main__._configure_logging` 逐条照抄两个
     兄弟入口（含未知级别回落 INFO），钉子 `tests/unit/test_c3_agent_logging.py`。
 
 16. **CP 收到 65534 在 `deploy/stack` 上打断了两条"靠 root 顺带成立"的依赖**（评审发现，

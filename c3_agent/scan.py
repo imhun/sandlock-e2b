@@ -45,7 +45,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from deploy.c3_agent.config import Settings
+from c3_agent.config import Settings
 from gateway_common.paths import (
     is_reserved_platform_namespace,
     is_sandbox_workspace_dir,

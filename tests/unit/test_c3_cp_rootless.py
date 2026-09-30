@@ -434,7 +434,7 @@ def test_the_privileged_verb_vocabulary_was_not_widened_for_a3() -> None:
     agent), and it is exactly what D24 rules out: a new verb in the **root**
     file face for an operation the CP can perform as the store's owner.
     """
-    from deploy.c3_agent.fileops import FILE_OP_VERBS
+    from c3_agent.fileops import FILE_OP_VERBS
 
     assert FILE_OP_VERBS == ("chown", "rm", "walk")
     maint = MAINT_C.read_text(encoding="utf-8")

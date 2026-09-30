@@ -2,7 +2,7 @@
 
 `deploy/stack/docker-compose.prod.yml` gives its control plane and both agent
 faces no default for that credential (deliberately: a missing credential has to
-fail loudly), and `deploy/c3_agent/__main__.py` exits without one. But the key
+fail loudly), and `c3_agent/__main__.py` exits without one. But the key
 only arrived in slice B, so every `.env` written before it lacks the line --
 including the one `upgrade.sh` pulls off a target host on the next deploy. The
 carry-over loop there only rewrites keys that are *present* (blank or holding a

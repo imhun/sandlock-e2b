@@ -565,8 +565,8 @@ def test_the_real_agent_service_accepts_the_clients_instruction() -> None:
     (through an ASGI transport) and the agent's own models judge the request:
     a mismatch fails this test rather than a slot create on a live node.
     """
-    from deploy.c3_agent.app import create_app as create_agent_app
-    from deploy.c3_agent.config import Settings as AgentSettings
+    from c3_agent.app import create_app as create_agent_app
+    from c3_agent.config import Settings as AgentSettings
 
     class _Runner:
         def __init__(self) -> None:
@@ -578,7 +578,7 @@ def test_the_real_agent_service_accepts_the_clients_instruction() -> None:
 
     class _Lookup:
         def host_pid(self, container_pid, identity, *, sandbox_id: str):
-            from deploy.c3_agent.lookup import SlotProcess
+            from c3_agent.lookup import SlotProcess
 
             # D12: the service is addressed by its host, and the worker it is
             # told about is a different name (`NODE`) -- the agent does not

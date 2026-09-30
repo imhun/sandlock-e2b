@@ -12,7 +12,7 @@ find it **from a trusted source**: never from a request body (the same rule
 * ``hostname`` -- the compose shapes address the agent by its configured
   service name (``E2B_C3_AGENT_URL``). There is no pod UID in this lane, so the
   instruction carries none; the worker's pid namespace identity is the proof
-  (see ``deploy/c3_agent/lookup.py`` for why that is sound).
+  (see ``c3_agent/lookup.py`` for why that is sound).
 
 **Two identities, and D12 is why they are two.** The agent is a *per-node*
 DaemonSet, so the identity the agent checks against itself -- and the one this
@@ -55,7 +55,7 @@ from gateway_common.worker_identity import (
 
 logger = logging.getLogger(__name__)
 
-#: The agent's own port (``E2B_C3_AGENT_PORT`` in ``deploy/c3_agent/config.py``).
+#: The agent's own port (``E2B_C3_AGENT_PORT`` in ``c3_agent/config.py``).
 DEFAULT_AGENT_PORT = 49985
 #: Face B's port (ruling D22). The agent is one pod with two containers, so
 #: "the same node's face B" is the same address with this second port; compose
@@ -586,7 +586,7 @@ class C3AgentClient:
         the group moves). The *worker's* own identity is carried beside them:
         it is what the agent must write into ``E2B_BROKER_WORKER_UID/GID`` so
         that ``--worker`` and the group gate keep the meaning they have behind
-        the worker's broker (see ``deploy/c3_agent/fileops.py``).
+        the worker's broker (see ``c3_agent/fileops.py``).
 
         ``worker_container_id`` is the anchor (D21 option 2 as amended by
         **D25**): present when this deployment's shape could not verify the

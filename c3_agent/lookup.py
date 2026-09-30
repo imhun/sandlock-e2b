@@ -38,7 +38,7 @@ surviving candidates are refused as ambiguous.
 
 The module is deliberately free of FastAPI and of ``as_uid``: it is a pure
 function of a ``/proc`` tree, so the DaemonSet can drive it unchanged
-(``deploy/c3_agent/app.py``) and this lane can drive it against a synthetic one.
+(``c3_agent/app.py``) and this lane can drive it against a synthetic one.
 
 **The worker-identity half (D25).** The two faces ask different questions and
 read different files, and that is deliberate:
@@ -563,4 +563,4 @@ class ProcWorkerIdentityResolver:
 
 
 if __name__ == "__main__":  # pragma: no cover - there is nothing to run
-    raise SystemExit("deploy.c3_agent.lookup is a library: the agent imports it")
+    raise SystemExit("c3_agent.lookup is a library: the agent imports it")

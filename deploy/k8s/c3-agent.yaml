@@ -15,7 +15,7 @@
 #     `deploy/k8s/priv-broker.yaml` 文件头，该 DaemonSet 已由 C3 Task 7 退役）。
 #     **能力集与 C1 的 broker 逐条相同** —— 本任务只搬家，不扩面（C3 Task 7 之后
 #     它就是这个节点上**唯一**的 root 组件）。载荷是 **Task 4 片 B 装上的**：与面 A **同一个服务**
-#     （`python3 -m deploy.c3_agent`，一张 op 表），但听**自己的端口 49986**（裁定 D22）：
+#     （`python3 -m c3_agent`，一张 op 表），但听**自己的端口 49986**（裁定 D22）：
 #     两个容器共享 pod netns，都绑 49985 会 `EADDRINUSE`；而把 file op 送到 65534 的面 A
 #     上，NFS 上每个 chown 都会 `EPERM`（看起来像权限 bug 的失败）。控制面按
 #     `E2B_C3_AGENT_MAINT_PORT` 寻址它。

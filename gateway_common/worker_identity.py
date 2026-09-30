@@ -27,7 +27,7 @@ All three are shape-checked here for the same reason ``gateway_common.paths``
 checks ids: the value is interpolated into a ``/proc`` lookup and a cgroup
 substring match, and a value that is not of this shape is a *refusal*, never a
 looser match. Shape is not the security property -- the comparison in
-``deploy/c3_agent/lookup.py`` is -- but a value that cannot be a container id
+``c3_agent/lookup.py`` is -- but a value that cannot be a container id
 can never be silently treated as one.
 """
 

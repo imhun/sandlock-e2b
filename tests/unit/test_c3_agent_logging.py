@@ -1,4 +1,4 @@
-"""The agent entry point must let ``deploy.c3_agent.*`` INFO reach the log.
+"""The agent entry point must let ``c3_agent.*`` INFO reach the log.
 
 The worker (``envd_service.__main__._configure_logging``) and the control plane
 (``control_plane.config.configure_logging``) both raise the root logger before
@@ -23,10 +23,10 @@ import logging
 
 import pytest
 
-from deploy.c3_agent.__main__ import _configure_logging
-from deploy.c3_agent.config import Settings as AgentSettings
+from c3_agent.__main__ import _configure_logging
+from c3_agent.config import Settings as AgentSettings
 
-SCAN_LOGGER = "deploy.c3_agent.scan"
+SCAN_LOGGER = "c3_agent.scan"
 ROUND_LINE = (
     "c3-agent inventory: node=%s scanned=%d protected=%d orphans=%d removed=%d "
     "failed=%d deferred=-"

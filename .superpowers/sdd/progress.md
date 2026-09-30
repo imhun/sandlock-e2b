@@ -2635,7 +2635,7 @@ BASE = `be00f74`（main 上的"C3 计划落盘"提交）。控制器：本会话
   → 裁定 D6：新增 fleet-scope 的 `GET /internal/fleet/sandboxes`，worker 改走它（不放宽身份层）；第三轮修复中。
   - 复审判定"四个既有测试文件 + conftest 的改动全是补前置、0 行删除"，非改期望迁就实现。
 - **Task 2: complete（commits f3f93f2..2f849b3，四轮评审后 Approved）**
-  - 交付：CP→agent 指令通道（agent 侧 `deploy/c3_agent/`，无状态、token 未配置则拒绝启动、只认
+  - 交付：CP→agent 指令通道（agent 侧 `c3_agent/`，无状态、token 未配置则拒绝启动、只认
     `C3-ASUID-OK` 逐字 + 空 stderr）、internal API 三步校验 + 源 IP 第二因子、地址解析器
     （k8s/hostname 两模式，fail closed）、出厂清单显式 `E2B_NODE_ADDRESS_MODE` + CP SA 的 pods RBAC、
     fleet 作用域归属视图 `GET /internal/fleet/sandboxes`。
@@ -2651,7 +2651,7 @@ BASE = `be00f74`（main 上的"C3 计划落盘"提交）。控制器：本会话
 - Task 3（槽位身份由 CP 下发、由 agent 授予）：按控制器裁定拆两片执行。
   - **片 A（代码语义）**：commits `d555064`(agent 反查 NSpid+pidns) / `bf40772`(CP 转发 + agent 寻址客户端) /
     `378f7c7`(worker 零特权启动路径 `E2B_SLOT_IDENTITY=agent-grant`) / `4594b64`(容器 lane 复验)。
-    新增：`deploy/c3_agent/lookup.py`、`control_plane/c3_agent_client.py`、`envd_service/slot_identity.py`、
+    新增：`c3_agent/lookup.py`、`control_plane/c3_agent_client.py`、`envd_service/slot_identity.py`、
     `envd_service/worker_identity.py`、`gateway_common/worker_identity.py` + 4 个新测试文件。
   - 裁定 **D9.3 = pid namespace inode 判别**（compose worker 读不到自身 cgroup 但读得到 `readlink /proc/self/ns/pid`；
     hostPID 侧 agent 读得到候选的 `ns/pid`）；k8s lane 叠加 `pod<UID>` cgroup 命中；(A) 容器 id（会被
@@ -2850,7 +2850,7 @@ worker 开关与删二进制同批、DaemonSet face B 换载荷）。
   - **片 A 四评 = Needs fixes**。I-1/I-2/I-3 与 m-1…m-5 **全部确认已兑现**（模式 pass 顺序 + 磁盘 mode 钉、
     import 离循环、unknown 账链路、root worker 可入列且身份 op 具名 503、`<uid>` 组件比较、去重、§11.2.1 记录）；
     但抓到**本片自己写的 agent 载荷里的两条新 Important**：
-    - **①** `deploy/c3_agent/app.py:276` 的 `agent_op` 从 `def` 改成 `async def`（只为 `await request.json()`），
+    - **①** `c3_agent/app.py:276` 的 `agent_op` 从 `def` 改成 `async def`（只为 `await request.json()`），
       于是 300s 的 `e2b-maint` exec 变成**内联阻塞单个事件循环**（`__main__.py:36` 单进程 uvicorn）⇒ 一次
       `rm`/`walk` 期间不接受新连接、并发建箱撞上 CP 的 5s 死线变 504，并推翻 `control_plan/config.py:381-382`
       为 `max_concurrency=64` 写下的前提（"agent 是同步服务、handler 跑线程池"）。修法：`await asyncio.to_thread`。
@@ -2858,7 +2858,7 @@ worker 开关与删二进制同批、DaemonSet face B 换载荷）。
       C1 里它来自内核的 `SO_PEERCRED`（`maint.c:1144-1147`）不可伪造；`maint.c --worker` 把它当作**交棒的目标
       身份**（`maint.c:2196-2200`）⇒ 被攻破的 worker 报别人的 uid，即可让 `scope-slot-document` 把带
       egress-proxy 凭据的 `policy.json`（0440）交给该租户 = 同节点跨租户读凭据。正是 §14.3 要堵的面，而
-      `deploy/c3_agent/fileops.py` 模块注释还写着"不可伪造"。
+      `c3_agent/fileops.py` 模块注释还写着"不可伪造"。
       → 裁定 **D21**（按优先序，要求实现者说明选了哪条）：① 用可信源印证上报值（k8s 走已有 pod resolver 读
       pod spec 的 runAsUser/runAsGroup，比对失败则该节点**不记身份**，绝不采用上报值；无可信源的形态身份留空
       ⇒ 该 op fail closed）；② 由 agent 从内核推导（hostPID + 已有 pid 读 `/proc/<pid>` 属主）；③ 若本片内

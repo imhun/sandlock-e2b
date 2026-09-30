@@ -1,6 +1,6 @@
 """C3 Task 3 slice B: the deployment surface of the per-node agent.
 
-`deploy/c3_agent/` ships the *service*; this file pins the two deployment
+`c3_agent/` ships the *service*; this file pins the two deployment
 shapes that run it (`deploy/k8s/c3-agent.yaml` and the two separated compose
 stacks), because every property the plan relies on here is a *manifest*
 property -- the pod's `hostPID`, which container gets which capability, and

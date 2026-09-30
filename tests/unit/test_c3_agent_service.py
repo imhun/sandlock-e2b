@@ -1,6 +1,6 @@
 """C3 Task 2 (controller ruling D3): the per-node agent's instruction service.
 
-``deploy/c3_agent`` is the CP→agent half of C3's two channels (there is no
+``c3_agent`` is the CP→agent half of C3's two channels (there is no
 worker↔agent channel). It is **stateless by construction**: the control plane's
 instruction carries every parameter (including the uid), so the agent holds no
 authorization table, no TTL and no "push before send" ordering -- the only
@@ -34,9 +34,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from deploy.c3_agent.app import AgentRefusal, SubprocessAsUidRunner, create_app
-from deploy.c3_agent.config import Settings
-from deploy.c3_agent.lookup import (
+from c3_agent.app import AgentRefusal, SubprocessAsUidRunner, create_app
+from c3_agent.config import Settings
+from c3_agent.lookup import (
     LookupRefusal,
     ProcLookup,
     SlotProcess,
@@ -464,7 +464,7 @@ def test_subprocess_runner_refuses_a_missing_binary(tmp_path: Path) -> None:
 
 def test_the_service_refuses_to_start_without_its_own_identity() -> None:
     """The self-check needs a node id; starting without one is a hard error."""
-    from deploy.c3_agent.__main__ import _startup_error
+    from c3_agent.__main__ import _startup_error
 
     assert _startup_error(_settings(node_id="")) == (
         "E2B_C3_AGENT_NODE_ID (or E2B_NODE_ID) is required; the agent must "
