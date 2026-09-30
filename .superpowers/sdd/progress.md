@@ -3310,3 +3310,38 @@ volume isolated、kill 后预约归零），末段 `Template.build` 仍因集群
 
 **本轮唯一靠"组位"的权限点**：`deploy/stack` CP 的 `group_add: ["1000"]`（与 k8s `fsGroup` 同族）。
 本地测试栈已全部拆掉。报告在 `.superpowers/sdd/c3-compose-gaps-report.md`。
+
+---
+
+## 2026-09-30 seccomp 收窄（worker 的 `unshare`）
+
+**动机**：用户问 worker 的 seccomp 放开能否去掉。核完代码与实测后：整条**去不掉**（子进程要 `unshare(CLONE_NEWUSER)`，
+且 agent 的写 map 必须在 unshare 之后），但**可以收窄**。
+
+**改了什么**：`unshare` 原先在默认档那个大 allow 组里（无条件）。现在把它**拆出来单独成条**，加参数掩码
+`value=0x0E000080`（`CLONE_NEWTIME|NEWCGROUP|NEWUTS|NEWIPC`），`valueTwo` 默认 0 ⇒ 只有这四位都没置时才放行。
+本部署真正用到的四种仍放行：**user**（`slot_identity.py`、`context.rs`、`procfs.rs`、`serve.rs`）、
+**net**（`context.rs`）、**pid**（`procfs.rs`）、**mount**（`realroot.rs`、`executors/sandlock.py` 的 real-root 探针）。
+
+**实测（两臂，`--cap-drop ALL`、uid 65534、先 `unshare(NEWUSER)`+自映射拿到 userns 内的 root）**：
+出货档下 UTS/IPC/cgroup/time 在 userns 内**全是 ALLOW**；收窄后**四个全 EPERM**，user/net/pid/mount 仍 ALLOW。
+**并在 k0s 真集群的 worker pod 里复验**（`kubectl exec … python3 -` 跑同一探针）：结果与本地一致。
+收窄后 `multinode_smoke` 仍 **OK**（4 箱 2+2）。
+
+**顺带发现并修**：
+- `sync-seccomp-installer.py` 的 `MARKER` 写成 `|-` 而清单里是 `|` ⇒ 脚本一跑就 `IndexError`
+  （所以文档里说的"改完重跑脚本"其实一直是手工做的）。已对齐，并让它**连注释里的 sha256 一起更新**
+  —— 那条注释正是上次漂过的同一处。
+- 我一度直接把基线 `seccomp-installer.yaml` apply 到 k0s，**覆盖了 overlay 的三处路径补丁**
+  （seccomp 根从 `/var/lib/k0s/kubelet` 被改回 `/var/lib/kubelet`），导致新档写到了 kubelet 不读的路径、
+  第一次重启 worker 时容器读到的还是旧档。走 `deploy/k8s-k0s/apply.sh` 重新渲染后恢复；
+  两个节点上我写坏的那份 `/var/lib/kubelet/seccomp/sandlock-worker.json` 已删（节点1既有的 `probe-a.json` 保留）。
+  **教训：k0s 上任何清单改动都要走 overlay 渲染，不要 apply 基线单文件。**
+
+**为什么"agent 建好给 worker 用"不行（实测）**：加入需要 `setns`，而它在同一档里同样被 `CAP_SYS_ADMIN` 门控。
+两臂实测：出货档下调用者 euid 65534（== ns owner，owner 规则本该给它该能力）仍 `SETNS-REFUSED EPERM`；
+只把那条规则的 `includes` 去掉则 `SETNS-ALLOWED` ⇒ **seccomp 是静态 BPF，读不到 `cred->cap_effective`**，
+能力条件只能在建过滤器时按容器**声明的**能力解析，进 userns 也不改写它。
+
+pin：`test_worker_seccomp_profile_is_the_default_plus_pidfd_getfd_and_a_narrowed_unshare` 断言掩码本身，
+退回无条件即红（已实测）。
