@@ -16,7 +16,7 @@
 
 | 编号 | 严重度 | 一句话 | 状态 |
 |---|---|---|---|
-| SEC-K0S-003 | **高** | 命令输出上限只封回放缓冲、不封实时流；实测一条 `yes` 即可 OOM 掉 worker | 已确认，**含一次生产影响** |
+| SEC-K0S-003 | **高** | 命令输出的实时路径无背压（订阅队列无界）；实测一条 `yes` 即可 OOM 掉 worker | 已确认，**含一次生产影响** |
 | SEC-K0S-002 | 中 | 控制面 `/openapi.json`、`/docs` 无需认证即可拉取 47 条内部接口全图 | 已确认（信息泄露，非越权） |
 
 与既有审计（`docs/security-audit/findings.md`，2026-09-16）的关系：那轮测的是
@@ -109,12 +109,39 @@ C3 的**硬规则编号、信任边界位置、"worker 永不自报路径与 uid
 `/internal/nodes`、`/agent/untrusted`、`/agent/sandboxes`、`/agent/sandboxes/{id}/export`
 全部 401。**这是信息泄露，不是越权。**
 
-**建议修法**（一行，未实施）：`control_plane/app.py:459` 补
+**建议修法**（未实施，一行）：`control_plane/app.py:459` 补
 `docs_url=None, redoc_url=None, openapi_url=None`，与 `c3_agent/app.py` 对齐。
+
+**已实测验证**：把同样的 `FastAPI(...)` 构造两次（一次照仓库现状、一次加那三个
+kwarg），挂同一组路由后用 `TestClient` 对比（fastapi 0.141.1）：
+
+```
+path                         repo as-is         with the fix
+/openapi.json                200/1340B          404/22B
+/docs                        200/1035B          404/22B
+/redoc                       200/917B           404/22B
+/docs/oauth2-redirect        200/3012B          404/22B
+GET  /sandboxes              200/2B             200/2B          ← 不受影响
+POST /internal/nodes/x/file-op 200/31B          200/31B         ← 不受影响
+```
+
+即四个文档路由全部 200 → 404，真实路由行为不变。**这一行确实能关掉暴露面。**
+
+**C3 agent 侧已复核**（上一版那条 `wget` 测法把退出码吞进了 `2>/dev/null`，
+“空输出”不能当证据；这次用 `urllib` 读真实状态码）：
+
+```
+$ kubectl -n sandlock exec e2b-c3-agent-… -c agent -- python3 -c "…urllib…"
+/openapi.json  HTTP 404  22B
+/docs          HTTP 404  22B
+/redoc         HTTP 404  22B
+```
+
+即 C3 agent 确实已关，而控制面确实没关 —— 两者对比成立。
 
 ---
 
-### SEC-K0S-003（高）命令输出上限只管回放缓冲，不管实时流 —— 实测打崩 worker
+### SEC-K0S-003（高）命令输出的实时路径无背压（订阅队列无界）—— 实测打崩 worker
 
 **这不是"读码推断"，是实测打崩过一次 worker。** 见下方"披露"一节。
 
@@ -130,25 +157,40 @@ C3 的**硬规则编号、信任边界位置、"worker 永不自报路径与 uid
 
 **无一被截断。**
 
-**根因**（`envd_service/process/manager.py`，输出循环）：
+#### 根因：实时路径既无字节封顶，也无背压
+
+**根因**（`envd_service/process/manager.py`）：
 
 ```python
-408  async for kind, chunk in running.output():
-413      truncated_now = append_captured(proc, kind, chunk)   # ← 只封顶 proc.captured（回放缓冲）
-419      self._broadcast(proc, ("data", kind, chunk))          # ← 实时流无上限转发
+ 74  queue: asyncio.Queue = asyncio.Queue()        # ← 无 maxsize = 无界
+…
+413      truncated_now = append_captured(proc, kind, chunk)   # 只封 proc.captured（回放缓冲）
+419      self._broadcast(proc, ("data", kind, chunk))          # 实时流逐块转发
+…
+448  def _broadcast(proc, item):                      # staticmethod
+449      for queue in list(proc.subscribers):
+450          try:
+451              queue.put_nowait(item)               # 不阻塞
+452          except asyncio.QueueFull:  # pragma: no cover - unbounded queues
+453              pass
 ```
 
 `append_captured`（同文件 90-125 行）实现是正确的：它在 `capture_limit` 处
 截断并写入 `TRUNCATED_MARK`。`E2B_COMMAND_CAPTURE_LIMIT_MB` 默认 10
 （`envd_service/config.py:385-387`），worker env 未设置该项，所以取默认 10 MiB。
-但**第 419 行的 broadcast 在封顶之外**：每个 chunk 原样推给所有活跃订阅者。
+但它**只管回放缓冲**；实时路径既不数字节（第 419 行），也不阻塞
+（第 451 行 `put_nowait` + 无界队列），于是慢消费者（或干脆没人读）时，
+worker 的堆随沙箱输出量线性增长。注释 `# pragma: no cover - unbounded queues`
+说明这一点在写的时候是**已知的**。
 
 **实测影响：worker 进程被 OOM 杀死。** 把这条上限当成"缺失的护栏"来评估是不够的 ——
-它缺失的那一半路径**已经造成过一次真实的可用性事故**（详见"披露"）。
+它缺失的那一半路径**已经造成过一次真实的可用性事故**（详见下方"披露"）。
+根因是**无界订阅队列**，不是"忘了在 broadcast 之前数一下字节"—— 两者都能止血，
+但只有前者能在慢消费者场景下真正封住内存。见"内存长在哪"。
 
 #### 披露：本轮探针导致 `e2b-worker-0` OOMKilled（2026-09-30 15:06:00Z）
 
-在测量"回放路径是否被封顶"时，我用 `yes`（~1 GB/s 无限输出）让 worker 的
+在测量“回放路径是否被封顶”时，我用 `yes`（~1 GB/s 无限输出）让 worker 的
 捕获缓冲持续增长，**结果把 worker 的内存打爆了**：
 
 ```
@@ -158,15 +200,61 @@ exitCode=137
 finished=2026-09-30T15:06:00Z
 ```
 
-- 该 pod 的 limit 是 `memory: 4Gi`（`resources.limits`），单沙箱 `max_memory=1024M`，
-  而流式缓冲不计入任何一层封顶；
-- 触发后 StatefulSet 自动拉起新容器（当前 `1/1 Running`，restarts=2），
-  控制面 `/sandboxes` 终态 `[]`，C3 agent 的自愈扫描没有留下孤儿树；
-- **这是本轮唯一的生产影响事件，且是我造成的。** 报告如实记录，探针不再复现该负载。
+触发后 StatefulSet 自动拉起新容器（当前 `1/1 Running`，restarts=2），
+控制面 `/sandboxes` 终态 `[]`，C3 agent 的自愈扫描没有留下孤儿树。
+**这是本轮唯一的生产影响事件，且是我造成的。** 报告如实记录，探针不再复现该负载。
 
-这同时给出了一条比"理论上能打爆"强得多的证据：**单租户下任意一个沙箱，
-一条 `yes` 命令即可让承载它的 worker 进程重启**。重启期间该节点上所有沙箱
-的 exec/文件操作不可用（另一节点不受影响）。
+#### 内存长在哪：对照实验（这一点决定了修法）
+
+“打爆 worker”不是一句推论就够的话，它指向一个具体的、与沙箱自身上限**不同的**
+内存池。为此做了一次对照实验（`probe_k1_memory_scope.py`）：
+
+| 负载 | 谁死了 | worker 重启数变化 |
+|---|---|---|
+| 沙箱自己分配内存（逐页 touch，逼近 `max_memory=1024M`） | **沙箱**（exit 137，SIGKILL） | **无**（仍为 2） |
+| 沙箱只让 worker 缓冲输出（`yes`） | **worker 进程**（OOMKilled） | **+1** |
+
+即：**`max_memory` 确实在工作，但它管不到输出缓冲。** 看代码就知道为什么 ——
+`max_memory` 由 sandlock supervisor 通过 seccomp notif 统计
+**沙箱自己的匿名映射**（`mmap`/`brk`/`mremap`/`shmget`，
+`third_party/sandlock/crates/sandlock-core/src/resource.rs:791-830`），
+而真正增长的是 **worker 自己的 Python 堆**：
+
+- `ManagedProcess.subscribe()`（`envd_service/process/manager.py:74`）建的是
+  **`asyncio.Queue()`，没有 `maxsize`** —— 无界队列；
+- `_broadcast()`（同文件 448-453）用 `put_nowait` 逐块入队，**不会阻塞**，
+  代码里的注释已经写明了这个事实：
+  `# pragma: no cover - unbounded queues`（`except asyncio.QueueFull` 永远不会触发）。
+
+**所以这不是“上限算错了”，而是上限在边界的另一侧**：它统计的是 guest，
+而膨胀的是 host 进程里替 guest 保管字节的那个结构。
+
+#### 建议修法（未实施）
+
+`append_captured` 的封顶只作用于**回放缓冲**；实时路径要单独治。
+最小改法是给订阅队列加上界并丢弃/告警，而不是只做字节计数：
+
+```python
+# manager.py:74
+- queue: asyncio.Queue = asyncio.Queue()
++ queue: asyncio.Queue = asyncio.Queue(maxsize=<N>)   # N = 若干 MiB
+# manager.py:448-453
+- queue.put_nowait(item)
++ try:
++     queue.put_nowait(item)
++ except asyncio.QueueFull:
++     pass   # 丢弃本块（或向该订阅者发一次 TRUNCATED_MARK 后停止转发）
+```
+
+这样 `_broadcast` 里的 `except asyncio.QueueFull` 从“永不触发的 pragma”
+变成真正的背压，worker 堆不再随输出量线性增长。
+
+修复后应当这样钉（两条都要）：
+- **实时流**：跑一条 >上限 的输出命令，断言订阅者在上限处收到一次
+  `TRUNCATED_MARK` 且 worker RSS 不随之增长；
+- **回放**：跑一条有限输出的命令 → `commands.connect(pid)` 读回放 →
+  断言回放字节数 ≤ 上限且含 `TRUNCATED_MARK`（`probe_i1_replay.py` 已备好，
+  但**当前未能跑通**，见下方“未能证实”）。
 
 **与既有审计的关系**：`findings.md` 的 L4 表把"命令输出"记为
 "worker 侧 10 MiB 封顶（E4.1，`CAPTURE_LIMIT_DEFAULT`），非本轮改动" ——
@@ -181,11 +269,6 @@ finished=2026-09-30T15:06:00Z
 但那条 `yes` 负载先把节点打爆了（见上），**回放封顶至今是读码推断，不是观测**。
 修复后应当用"跑一条有限输出的命令 → 连接上去读回放 → 断言字节数 ≤ 10 MiB
 且含 `TRUNCATED_MARK`"来钉这条，探针留在 `tmp/audit/probe_i1_replay.py`。
-
-**建议修法**（未实施）：把封顶提到 broadcast 之前，即在第 419 行按流累计字节、
-超限后停止转发并只发一次 marker；`append_captured` 的语义（"回放缓冲"）
-与"流上限"应当是两个独立旋钮，或者明确把后者命名为 `E2B_STREAM_OUTPUT_LIMIT_MB`
-并给一个默认。
 
 ---
 
@@ -293,12 +376,11 @@ SEC-001 的四种写法（`127.0.0.1` / `0.0.0.0` / `0.0.0.1` / `::1`）全部�
 ## 遗留/建议（未实施，按性价比）
 
 1. **SEC-K0S-002 修法**：控制面关掉 OpenAPI（一行）。
-2. **SEC-K0S-003 修法**（优先级高于上一条）：把输出封顶提到 broadcast 之前；
-   或新增独立的流上限旋钮。**这条是本轮唯一造成过生产影响的项**，
-   而"修复"只需把已有的 `append_captured` 语义扩展到 broadcast 之前。
-   修完应当用 `tmp/audit/probe_i1_replay.py` 验证：有限输出的命令 → 连接读回放 →
-   断言回放字节数 ≤ 上限且含 `TRUNCATED_MARK`；再用一条高输出命令断言
-   **实时流**也在上限处收到 marker（当前收不到）。
+2. **SEC-K0S-003 修法**（优先级高于上一条）：见该条"建议修法"—— 给订阅队列加
+   `maxsize` 并处理 `QueueFull`，让 `_broadcast` 的背压真正生效。
+   **这条是本轮唯一造成过生产影响的项**（OOMKilled 一次）。若还想在语义上分开
+   "回放缓冲上限"与"流上限"，可以把后者独立命名为 `E2B_STREAM_OUTPUT_LIMIT_MB`。
+   修完的两条验收判据都写在 SEC-K0S-003 的"建议修法"末尾。
 3. **OBS-6 复核**：`E2B_TENANTS` / `E2B_ADMIN_API_KEYS` 在线上控制面 env 中
    **确实未设置**（实测 `kubectl get deploy control-plane` 的 env 全量核对），
    即当前是**单租户兼容模式**。这与 2026-09-22 的用户决定一致（有意不启用），
@@ -329,3 +411,5 @@ SEC-001 的四种写法（`127.0.0.1` / `0.0.0.0` / `0.0.0.1` / `::1`）全部�
 | `probe_g1_ratelimit.py` | 创建类端点限流（打到 429） |
 | `probe_h1_l4.py` / `probe_h2_output.py` | L4 资源上限（磁盘/进程/输出） |
 | `probe_i1_replay.py` | 回放路径封顶的验证（**当前未能跑通**，见 SEC-K0S-003“未能证实”） |
+| `probe_k1_memory_scope.py` | 对照实验：沙箱自身内存上限 vs worker 输出缓冲（谁死） |
+| `verify_openapi_fix.py` | 对照验证 SEC-K0S-002 的一行修法（docs 路由 200→404，真实路由不变） |
