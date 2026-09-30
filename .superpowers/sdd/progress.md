@@ -3402,3 +3402,53 @@ autoscaler `sha256:929faa01…`、agent `sha256:7c1369af…`、quota-agent `sha2
 `third_party/sandlock/target` 是指向容器路径 `/src/target-linux` 的符号链接，脚本要在容器里跑；用 `sh` 而不是
 `python3` 调），已按此跑通，日志 `tmp/pidfd-verify-wheel.log`、`tmp/pidfd-wheelbuild.log`、`tmp/pidfd-imagebuild.log`、
 `tmp/pidfd-probe-after.log`、`tmp/pidfd-allowance-after.log`、`tmp/pidfd-*-smoke.log`。
+
+## 2026-09-30 k0s 上线：`Template.build` 拉不到 docker.io 的真因（mirror 一次都没轮到）
+
+**用户的判断**是"该用国内镜像源"，方向对、结论不同：镜像源**早就配了**
+（`deploy/stack/buildkitd.toml` 与 `deploy/k8s/buildkit.yaml` 逐字相同、有 pin），坏的是**客户端那条腿**。
+
+**现象**：`deployment_smoke.py` 末段 `Template.build` 失败，buildkit 日志里两条
+`msg="trying next host" error="mkdir /nonexistent: permission denied"` + 一条 origin
+`dial tcp 74.86.228.110:443: i/o timeout`。两条 "trying next host" 正好是两个 mirror ——
+**它们在发出请求之前就死了**，构建只是回落到 origin 再超时（集群把 docker.io 解析到
+`2a03:2880:…` / `74.86.228.110`，没有出口）。现场读起来像"没配镜像源"，其实是镜子一次都没轮到。
+
+**定位过程**（哪几条路走不通也值得记）：
+
+- 本地同镜像 + 同 `buildkitd.toml` 复现：**不复现**（mirror 401 → token → 200 正常），差异在集群侧；
+- buildkit 源码与二进制里都**没有** `/nonexistent` 字面量（全树唯一的 `nonexistent` 是 vendored
+  jsonpointer 的 "nonexistent element"）⇒ 路径是运行时拼出来的；
+- 决定性一步是**让那次 mkdir 成功**：一次性探针 pod 把 `/nonexistent` 挂成可写 emptyDir
+  （`tmp/bk-probe-pod.yaml`，镜像与配置同 CP），构建立刻成功 ⇒ 卡点就是这个 mkdir；
+- 再回源码找调用点：`session/auth/authprovider/tokenseed.go::getSeed(host)` **每个 host**
+  `MkdirAll(ts.dir)`，而 `ts.dir = docker/cli 的 config.Dir()` = `$DOCKER_CONFIG` → 否则 `$HOME/.docker`；
+- 最后在 CP 容器里 `env | grep HOME` → **`HOME=/nonexistent`**（该镜像里 65534 是 Debian 的 `nobody`），对上。
+
+**对照实验（线上 CP 容器内，同一个 buildctl、同一份 Dockerfile）**：`HOME=/nonexistent buildctl …` →
+`mkdir /nonexistent: permission denied`；`HOME=/nonexistent DOCKER_CONFIG=/tmp/e2b-bkdcfg buildctl …` →
+构建成功，且该目录里生成 `.token_seed`（host 即 mirror）。
+
+**修法**：`control_plane/api/templates.py` 新增 `_docker_config_dir()` / `_buildctl_env()`，所有
+`buildctl` 子进程显式带 `DOCKER_CONFIG`，`_write_docker_config()` 写同一目录；默认
+`$TMPDIR/e2b-docker-config`（容器本地，**不落共享卷** —— 里面会写 registry 凭据）。提交 `77edfa8`。
+pin 两个：`test_docker_config_dir_never_needs_a_home`、`test_buildctl_build_is_handed_the_docker_config_dir`
+（旧代码上红：`KeyError: 'env'`）；`deploy/stack/buildkitd.toml` 与 `deploy/k8s/buildkit.yaml` 的 mirror
+段落各加了一句注释指向 `_docker_config_dir()`。
+
+**上线与判据**：版本 **`0.1.0-792-g77edfa8-20260930-131220`**（本轮同样踩到"单平台走 `--load` 不推送"，
+补推 worker/autoscaler/agent/quota-agent 四个 tag 并逐个 `docker manifest inspect`；CP 镜像
+`sha256:45bed84f…` 的 `COPY control_plane/` 未命中缓存，新代码确实在镜像里）；`./deploy/k8s-k0s/apply.sh`
+后 10 个 pod 全 Ready。
+
+- `deploy/scripts/deployment_smoke.py` → **`DEPLOYMENT SMOKE OK`**，含
+  `OK: template built -> registry push -> worker pull -> image rootfs`（§7.9 失败的就是这一段）；
+- `deploy/scripts/multinode_smoke.py` → **`MULTI-NODE SMOKE OK`**；
+- 新 CP pod 的 buildkit 日志 `mkdir /nonexistent` **0** 行、`trying next host` **0** 行；
+- 直接指纹：出力的那个副本 `/tmp/e2b-docker-config/.token_seed` 里唯一 host 是
+  **`docker.m.daocloud.io`** —— mirror 这次真的被用上，origin 一次都没到。
+
+compose 车道同代码、同镜像、同 65534、`$HOME/.docker` 同样不可写，修复一起生效，清单不用改。
+日志：`tmp/build-and-push.log`、`tmp/apply.log`、`tmp/deployment-smoke.log`；探针
+`tmp/bk/repro.sh`（本地复现，结论是不复现）、`tmp/bk/probe-in-pod.sh` + `tmp/bk-probe-pod.yaml`
+（集群探针，pod 已删）。

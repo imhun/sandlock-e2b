@@ -301,6 +301,17 @@ netns 开关与 `E2B_NET_BIND_INJECT` 都在 `deploy/stack/docker-compose.prod.y
 `upgrade.sh` 每轮都会把清单带过去，所以**改开关要改清单**，只改目标机 `.env` 会被下一轮覆盖。
 改完清单别忘同步 `deploy/stack/.env.example`（否则重建部署会静默回退到旧口径）。
 
+**C8. "镜像源配了却还是超时"要先看**客户端**能不能写它的 docker config。**
+症状：`Template.build` 报 `dial tcp 74.86.228.110:443: i/o timeout`，而 buildkit 日志里躺着两条
+`msg="trying next host" error="mkdir /nonexistent: permission denied"` —— 两条正好是两个 mirror，
+**它们在发出请求之前就死了**，构建只是回落到 origin 再超时。现场读起来像"没配镜像源"，其实镜子
+一次都没轮到。
+根因：uid 65534 在那个镜像里是 `nobody`、家目录 `/nonexistent`；buildkit 的 auth provider 在
+**客户端一侧**（`buildctl`）按 `$DOCKER_CONFIG` → `$HOME/.docker` 找目录，并且**每个 registry host
+都会 `MkdirAll` 一次**。
+做法：给 `buildctl` 显式 `DOCKER_CONFIG`（见 `control_plane/api/templates.py::_docker_config_dir()`）；
+排查顺序先"客户端能不能建那个目录"，再看 mirror 连通性。细节与实测见 `docs/deploy-clusters.md` §7.13。
+
 ---
 
 ## D. 探针方法论（沙箱内观测）
