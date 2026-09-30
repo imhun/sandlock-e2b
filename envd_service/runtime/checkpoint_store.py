@@ -174,9 +174,10 @@ def _hand_to_sandbox(
 ) -> None:
     """Give ``path`` to the pooled uid that will write it (raises on failure).
 
-    Root does it directly; a non-root worker goes through ``e2b-maint``
-    (``CAP_CHOWN``), which is the same broker the rest of the platform uses to
-    move a path between the worker's identity and a sandbox's.
+    Root does it itself. Every other shape asks the agent; a non-root worker
+    without one has no privileged file-step path left (the file-capability
+    broker that used to be the third shape is retired, open-issues N52) and
+    fails closed here rather than leaving the image worker-owned.
 
     C3 Task 4: in the agent shape the step is asked of the control plane as
     ``{sandbox_id, op}`` -- the checkpoint store's path is derived there from
@@ -203,7 +204,11 @@ def _hand_to_sandbox(
             for entry in (*dirs, *files):
                 os.chown(Path(root) / entry, uid, uid)
         return
-    priv_helpers.broker_chown(uid, path, recursive=recursive)
+    raise priv_helpers.PrivHelperError(
+        f"cannot hand {path} to sandbox uid {uid}: this worker has no "
+        "privileged file-step path (no per-node agent is configured, and it "
+        "is not root)"
+    )
 
 
 def image_bytes(image: Path, *, sandbox_id: str | None = None) -> int:

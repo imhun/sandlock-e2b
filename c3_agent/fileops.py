@@ -131,12 +131,12 @@ def maint_env(
     """The environment ``e2b-maint`` must see (see the module docstring).
 
     ``E2B_STATE_BASE`` is set unconditionally to the resolved state base, the
-    way :meth:`envd_service.priv_helpers.PrivHelpers.subprocess_env` does: the
-    binary reads one variable and falls back to the workspace base only for
-    want of a value, and "this deployment has no state base of its own" is
-    spelled as the workspace base itself. The other two roots are named only
-    when the deployment names them -- an unset image cache must not become a
-    whitelisted directory nobody meant.
+    way the worker's own file-step plumbing does: the binary reads one variable
+    and falls back to the workspace base only for want of a value, and "this
+    deployment has no state base of its own" is spelled as the workspace base
+    itself. The other two roots are named only when the deployment names them
+    -- an unset image cache must not become a whitelisted directory nobody
+    meant.
     """
     env = {
         "E2B_UID_POOL_START": str(settings.uid_pool_start),

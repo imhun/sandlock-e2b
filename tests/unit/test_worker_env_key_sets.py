@@ -178,8 +178,6 @@ KEY_CLASSES: dict[str, set[str]] = {
     },
     # The rotation window (E3.6): the examples name one internal key.
     "rotation_window": {"E2B_INTERNAL_API_KEYS"},
-    # Track F/route-B scratch root: the file-capability brokers.
-    "priv_helpers": {"E2B_PRIV_HELPERS"},
     # C3 (Task 4 slice B): which shape performs the worker's privileged file
     # steps. The worker image no longer ships the file-capability binaries, so
     # `auto` would silently resolve none and degrade to the in-process E5.1
@@ -315,13 +313,11 @@ _FLEET_STACK_MISSING = (
 #: The compose example stacked with a control plane + Redis: it declares the
 #: worker's wiring, cache, capacity, shape and egress, but not the k8s-only
 #: classes above (state layout, disk enforcement, real-root/checkpoint), the
-#: rotation window, the broker opt-in (default `auto`) or named templates
-#: (default: none).
+#: rotation window or named templates (default: none).
 _COMPOSE_EXAMPLE_MISSING = (
     _FLEET_STACK_MISSING
     | KEY_CLASSES["priv_helper_transport"]
     | KEY_CLASSES["rotation_window"]
-    | KEY_CLASSES["priv_helpers"]
     | KEY_CLASSES["template_images"]
 )
 
@@ -337,10 +333,9 @@ _C3_COMPOSE_MISSING = (
 
 #: The single-machine build example (`docker-compose.yml`): one `envd`, no
 #: control-plane wiring, no node budget, cache-only env plus the shape switch.
-#: It declares its (absent) file-operation capability for the same reason the
-#: retired pool did (D23) -- and the key is an *upgrade* from silence: this
-#: example used to rely on the worker image's binaries and refused to start
-#: when its route-B root was outside their whitelist.
+#: N52 made its (absent) file-operation capability an *absence*: the knobs that
+#: used to declare it are gone, and the example is the in-process (E5.1) shape
+#: it always was (D23, named in `test_c3_agent_manifest.py`).
 _DEMO_MISSING = (
     _COMPOSE_EXAMPLE_MISSING
     | KEY_CLASSES["worker_wiring"]
@@ -350,7 +345,7 @@ _DEMO_MISSING = (
     | KEY_CLASSES["egress_switch"]
     | KEY_CLASSES["route_b_root"]
     | KEY_CLASSES["slot_identity"]
-) - KEY_CLASSES["priv_helpers"]
+)
 
 #: The test runner: it names only what the in-container suite needs to build
 #: sandboxes from this checkout (the workspace root, the base image, the pid

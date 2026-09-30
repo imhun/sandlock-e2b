@@ -119,17 +119,14 @@ services:
       # C3 Task 4 slice B / ruling D23: **this shape has no privileged
       # file-operation capability, and says so.** Until the worker image lost
       # its file-capability binaries (Task 4 slice B) this example relied on
-      # them through `E2B_PRIV_HELPERS=auto` + `exec`; now `auto` would resolve
-      # *no* brokers, log one warning and keep the in-process (E5.1) shape --
-      # and the example's own default route-B root (`/tmp/sandlock-route-b`) is
-      # outside the broker whitelist, so before this change the example
-      # *refused to start* while after it, the failure would go quiet. `off` is
-      # the explicit "no brokers, no per-sandbox uid, no route-B" declaration:
-      # it is what this single-machine example is (a dev/eval shape, like
-      # `local://`, and **excluded from C3's coverage by name** -- the coverage
-      # list in `docs/superpowers/plans/2026-09-28-c3-privilege-consolidation.md`
-      # and `docs/c3-privilege-relocation.md` §11.1 item 4 name it).
-      E2B_PRIV_HELPERS: "off"
+      # them through the file-capability transport; Task 4 slice B removed the
+      # binaries and N52 (2026-09-30) retired the knobs themselves, so the
+      # declaration is now the *absence* of any privileged-file-op key. This is
+      # what the single-machine example is: the in-process (E5.1) shape, no
+      # per-sandbox host uid, no route-B -- a dev/eval shape, like `local://`,
+      # and **excluded from C3's coverage by name** (the coverage list in
+      # `docs/superpowers/plans/2026-09-28-c3-privilege-consolidation.md` and
+      # `docs/c3-privilege-relocation.md` §11.1 item 4 name it).
     ports:
       - "49983:49983"
     volumes:

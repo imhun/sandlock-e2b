@@ -2822,17 +2822,15 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
     existing = runtime_registry.get(sandbox_id)
     # E3.2: allocate the sandbox's host uid before materializing volumes so
     # per-sandbox volume slices can be chowned to it. Only a root worker -- or
-    # a non-root worker that can ask *someone* for the chown: the
-    # file-capability brokers (Track F) or, in C3's shape, the agent
-    # (``priv_helpers.file_steps_available``) -- can put a sandbox under its own
-    # host uid; everything else keeps the fixed-uid + Landlock model and never
-    # allocates.
+    # a non-root worker that can ask *someone* for the chown: C3's per-node
+    # agent (``priv_helpers.file_steps_available``) -- can put a sandbox under
+    # its own host uid; everything else keeps the fixed-uid + Landlock model
+    # and never allocates.
     #
-    # ⚠ This gate is what makes the hand-over *reachable* at all: with it
-    # answered by ``active_helpers()`` alone, C3's agent shape (which installs no
-    # ``PrivHelpers``) left ``host_uid`` None, so ``apply_sandbox_ownership`` and
-    # every face-B ``chown`` were skipped in silence (review Task 4 slice A,
-    # Important 2).
+    # ⚠ This gate is what makes the hand-over *reachable* at all: a predicate
+    # that asked only about a local privileged shape left ``host_uid`` None in
+    # the agent shape, so ``apply_sandbox_ownership`` and every face-B
+    # ``chown`` were skipped in silence (review Task 4 slice A, Important 2).
     host_uid = None
     pool = getattr(runtime_registry, "uid_pool", None)
     from envd_service import priv_helpers

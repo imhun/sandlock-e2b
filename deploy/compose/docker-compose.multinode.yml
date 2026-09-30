@@ -415,13 +415,11 @@ services:
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       # Route B's scratch root (the per-slot policy/program documents). The
       # fleet value, copied from deploy/stack/docker-compose.prod.yml:239 --
-      # these workers are uid 65534 like the fleet's, and the `e2b-maint`
-      # broker only touches roots under the workspace base, so the default
-      # (`/tmp/sandlock-route-b`) is refused by name at startup: every worker
-      # in this file crash-loops before it listens (N39, measured here
-      # 2026-09-26: all three `Restarting (1)` with `route-B scratch root
-      # /tmp/sandlock-route-b is outside the privileged helper roots
-      # (/var/lib/e2b-sandboxes)`).
+      # these workers are uid 65534 like the fleet's. The per-node agent scopes
+      # those documents to the slot's uid (0440) and only touches roots the
+      # deployment names (N52 retired the worker-side broker whose whitelist
+      # this used to be), so a default (`/tmp/sandlock-route-b`) outside them
+      # leaves the document world-readable instead of group-scoped.
       E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
@@ -504,13 +502,11 @@ services:
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       # Route B's scratch root (the per-slot policy/program documents). The
       # fleet value, copied from deploy/stack/docker-compose.prod.yml:239 --
-      # these workers are uid 65534 like the fleet's, and the `e2b-maint`
-      # broker only touches roots under the workspace base, so the default
-      # (`/tmp/sandlock-route-b`) is refused by name at startup: every worker
-      # in this file crash-loops before it listens (N39, measured here
-      # 2026-09-26: all three `Restarting (1)` with `route-B scratch root
-      # /tmp/sandlock-route-b is outside the privileged helper roots
-      # (/var/lib/e2b-sandboxes)`).
+      # these workers are uid 65534 like the fleet's. The per-node agent scopes
+      # those documents to the slot's uid (0440) and only touches roots the
+      # deployment names (N52 retired the worker-side broker whose whitelist
+      # this used to be), so a default (`/tmp/sandlock-route-b`) outside them
+      # leaves the document world-readable instead of group-scoped.
       E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
@@ -593,13 +589,11 @@ services:
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
       # Route B's scratch root (the per-slot policy/program documents). The
       # fleet value, copied from deploy/stack/docker-compose.prod.yml:239 --
-      # these workers are uid 65534 like the fleet's, and the `e2b-maint`
-      # broker only touches roots under the workspace base, so the default
-      # (`/tmp/sandlock-route-b`) is refused by name at startup: every worker
-      # in this file crash-loops before it listens (N39, measured here
-      # 2026-09-26: all three `Restarting (1)` with `route-B scratch root
-      # /tmp/sandlock-route-b is outside the privileged helper roots
-      # (/var/lib/e2b-sandboxes)`).
+      # these workers are uid 65534 like the fleet's. The per-node agent scopes
+      # those documents to the slot's uid (0440) and only touches roots the
+      # deployment names (N52 retired the worker-side broker whose whitelist
+      # this used to be), so a default (`/tmp/sandlock-route-b`) outside them
+      # leaves the document world-readable instead of group-scoped.
       E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}

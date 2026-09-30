@@ -485,9 +485,9 @@ services:
       E2B_NODE_ID: worker-1
       # C3 (Task 3 + Task 4 slice B): route B's slot identity comes from the
       # per-host `c3-agent`, and so does every privileged file step -- the
-      # worker image no longer ships `/var/lib/e2b-priv/`, so `auto` would
-      # silently resolve no brokers and degrade. Rollback is the pair
-      # `spawn`/`socket` (plus a worker image that still has the binaries).
+      # worker image no longer ships `/var/lib/e2b-priv/`. N52 (2026-09-30)
+      # retired the `exec`/`socket` transports and the `spawn` identity: those
+      # shapes live in git if a deployment ever needs them back.
       E2B_SLOT_IDENTITY: agent-grant
       E2B_PRIV_HELPER_TRANSPORT: agent
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY}
@@ -529,12 +529,12 @@ services:
       E2B_PER_SANDBOX_UID: ${E2B_PER_SANDBOX_UID:-true}
       E2B_UID_POOL_START: ${E2B_UID_POOL_START:-10000}
       E2B_UID_POOL_SIZE: ${E2B_UID_POOL_SIZE:-1000}
-      # Track F (F1): a non-root worker scopes each slot's policy/program
-      # documents to that slot's uid (0440) through e2b-maint, and the broker
-      # only touches paths under <workspace_base>/ or <shared_volume_root>/.
-      # Anywhere else the helpers self-check refuses the shape at startup by
-      # name -- the alternative is a world-readable 0444 policy document
-      # (it carries the egress-proxy credentials).
+      # Route B's scratch root (the per-slot policy/program documents). The
+      # per-node agent scopes those documents to the slot's uid (0440) and only
+      # touches roots the deployment names (N52 retired the worker-side broker
+      # whose whitelist this used to be); anywhere else the document could only
+      # fall back to a world-readable 0444 one that carries the egress-proxy
+      # credentials, so keep it under a named root.
       E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       # The registry host the pull credentials below belong to. Without it
       # registry_credential_host() returns None and the resolver stops scoping
@@ -578,11 +578,6 @@ services:
       E2B_QUOTA_AGENT_URL: ${E2B_QUOTA_AGENT_URL:-}
       E2B_QUOTA_AGENT_TOKEN: ${E2B_QUOTA_AGENT_TOKEN:-}
       E2B_QUOTA_AGENT_TIMEOUT_S: ${E2B_QUOTA_AGENT_TIMEOUT_S:-5}
-      # Track F (F1) / C1: the file-capability broker opt-in. It is **inert in
-      # the C3 agent shape** (`E2B_PRIV_HELPER_TRANSPORT=agent`, above --
-      # `configure_priv_helpers` never consults it there); it stays only as the
-      # rollback lever for a worker image that still ships the two binaries.
-      E2B_PRIV_HELPERS: ${E2B_PRIV_HELPERS:-auto}
     volumes: &worker-volumes
       - sandbox-shared:/var/lib/e2b-sandboxes
     # C3 (Task 4 slice B): **the bounding set is empty.** Track F/F1 declared

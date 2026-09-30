@@ -24,8 +24,8 @@ every reopen -- idle expiry, a dead machinery, a fresh ceiling -- fail at
 ``open``).
 
 The mode is also pinned to land while the worker is still the owner, and a
-refusal (a broker whitelist that does not cover the path) must not leave a
-umask-mode credential file behind.
+refusal (no agent and no root) must not leave a umask-mode credential file
+behind.
 
 Three more properties are pinned here. *Nothing lands on disk before every
 entry has resolved its value*: a later entry that cannot resolve (a missing IAM
@@ -51,7 +51,7 @@ from pathlib import Path
 
 import pytest
 
-from envd_service import priv_helpers
+from envd_service import agent_fileops, priv_helpers
 from envd_service.executors import sandlock as sandlock_module
 from envd_service.executors.sandlock import SandlockExecutor
 from gateway_common.network import sandlock_network_policy
@@ -80,10 +80,13 @@ class _Host:
     ``open(w)`` is ``EACCES`` (no ownership, no ``CAP_DAC_OVERRIDE``).
     """
 
-    def __init__(self, *, euid: int, covers: bool) -> None:
+    def __init__(self, *, euid: int, agent: bool) -> None:
         self.euid = euid
-        self.covers = covers
+        self.agent = agent
         self.events: list[tuple] = []
+        #: Where the agent would look for the secret (it derives the path
+        #: itself); set by ``_install``.
+        self.secrets_root: str = ""
         #: The one directory tree whose reported owner is *this* worker's: the
         #: emulated non-root worker is the one that creates it, while on disk
         #: it belongs to whoever runs the suite. Set by ``_install``.
@@ -160,25 +163,19 @@ class _Host:
         self._foreign.discard(str(path))
         return self._real_unlink(path)
 
-    # -------------------------------------------------------- brokers
+    # ---------------------------------------------------- the agent client
 
-    def helpers_cover(self, path: str | Path) -> bool:
-        return self.covers
-
-    def broker_chown(
-        self,
-        uid: int,
-        path: str | Path,
-        *,
-        recursive: bool = True,
-        gid: int | None = None,
-    ) -> None:
-        self.events.append(("broker_chown", uid, str(path), recursive))
-        self._foreign.add(str(path))
+    def chown_secret(self, sandbox_id: str, name: str) -> None:
+        """The node agent's step: the worker names the sandbox and the entry,
+        and the agent derives the path (no path crosses the wire)."""
+        path = f"{self.secrets_root}/{sandbox_id}/{name}.secret"
+        self.events.append(("chown_secret", sandbox_id, name))
+        self._foreign.add(path)
 
 
 def _install(monkeypatch, host: _Host, secrets_root: Path) -> None:
     host.owned_prefix = str(secrets_root)
+    host.secrets_root = str(secrets_root)
     monkeypatch.setattr(os, "geteuid", host.geteuid)
     monkeypatch.setattr(os, "chmod", host.chmod)
     monkeypatch.setattr(os, "chown", host.chown)
@@ -190,8 +187,14 @@ def _install(monkeypatch, host: _Host, secrets_root: Path) -> None:
     # through the executor's module globals as well, so a reverted
     # ``open(path, "w")`` still meets the kernel rules above.
     monkeypatch.setattr(sandlock_module, "open", host.open, raising=False)
-    monkeypatch.setattr(priv_helpers, "helpers_cover", host.helpers_cover)
-    monkeypatch.setattr(priv_helpers, "broker_chown", host.broker_chown)
+    # The shape the production worker runs in: the file-capability broker is
+    # gone (N52) and the privileged file step is the per-node agent's, asked
+    # for as ``{sandbox_id, op}``. A host built without an agent is the
+    # E5.1 in-process shape -- the one that has to refuse loudly rather than
+    # leave a worker-owned credential behind.
+    monkeypatch.setattr(
+        agent_fileops, "_ACTIVE", [host] if host.agent else [None]
+    )
 
 
 def _executor(
@@ -247,7 +250,7 @@ def _expected_secret_path(tmp_path: Path) -> Path:
 
 
 def test_nonroot_worker_sets_the_mode_then_hands_the_file_over(tmp_path, monkeypatch):
-    host = _Host(euid=WORKER_UID, covers=True)
+    host = _Host(euid=WORKER_UID, agent=True)
     _install(monkeypatch, host, tmp_path / "secrets")
 
     out = _executor(tmp_path)._materialize_http_inject(_http_inject_entries())
@@ -256,7 +259,7 @@ def test_nonroot_worker_sets_the_mode_then_hands_the_file_over(tmp_path, monkeyp
     assert host.events == [
         ("unlink", str(path)),
         ("open", str(path), 0o600),
-        ("broker_chown", SANDBOX_UID, str(path), False),
+        ("chown_secret", "sbx_1", "hdr_api_example_com_x_api_key"),
     ]
     assert oct(path.stat().st_mode & 0o777) == "0o600"
     assert out == [
@@ -279,7 +282,7 @@ def test_a_rebuilt_policy_rewrites_the_secret_it_handed_over(tmp_path, monkeypat
     so a worker that only knows how to ``open(w)`` it would die with EACCES on
     the first reopen -- one instance lifetime per sandbox.
     """
-    host = _Host(euid=WORKER_UID, covers=True)
+    host = _Host(euid=WORKER_UID, agent=True)
     _install(monkeypatch, host, tmp_path / "secrets")
     executor = _executor(tmp_path, network=_HEADER_NETWORK)
     path = _expected_secret_path(tmp_path)
@@ -289,7 +292,7 @@ def test_a_rebuilt_policy_rewrites_the_secret_it_handed_over(tmp_path, monkeypat
     assert host.events == [
         ("unlink", str(path)),
         ("open", str(path), 0o600),
-        ("broker_chown", SANDBOX_UID, str(path), False),
+        ("chown_secret", "sbx_1", "hdr_api_example_com_x_api_key"),
     ]
 
     host.events.clear()
@@ -298,14 +301,14 @@ def test_a_rebuilt_policy_rewrites_the_secret_it_handed_over(tmp_path, monkeypat
     assert host.events == [
         ("unlink", str(path)),
         ("open", str(path), 0o600),
-        ("broker_chown", SANDBOX_UID, str(path), False),
+        ("chown_secret", "sbx_1", "hdr_api_example_com_x_api_key"),
     ]
     assert path.read_text(encoding="utf-8") == "sk-literal"
     assert oct(path.stat().st_mode & 0o777) == "0o600"
 
 
 def test_root_worker_sets_the_mode_then_chowns(tmp_path, monkeypatch):
-    host = _Host(euid=0, covers=True)
+    host = _Host(euid=0, agent=False)
     _install(monkeypatch, host, tmp_path / "secrets")
 
     _executor(tmp_path)._materialize_http_inject(_http_inject_entries())
@@ -323,7 +326,7 @@ def test_root_worker_sets_the_mode_then_chowns(tmp_path, monkeypatch):
 def test_legacy_shared_uid_shape_only_sets_the_mode(tmp_path, monkeypatch):
     """No per-sandbox uid: no identity to hand the file to, as before."""
     worker_uid = os.geteuid()
-    host = _Host(euid=WORKER_UID, covers=True)
+    host = _Host(euid=WORKER_UID, agent=True)
     _install(monkeypatch, host, tmp_path / "secrets")
 
     _executor(tmp_path, host_uid=None)._materialize_http_inject(
@@ -338,16 +341,16 @@ def test_legacy_shared_uid_shape_only_sets_the_mode(tmp_path, monkeypatch):
     assert path.stat().st_uid == worker_uid
 
 
-def test_helpers_not_covering_the_path_fails_loudly(tmp_path, monkeypatch):
-    """A whitelist that does not reach the secret path must refuse the create.
+def test_a_worker_with_no_privileged_path_fails_loudly(tmp_path, monkeypatch):
+    """No agent and no root: the create must refuse, not leave the file behind.
 
     Silently skipping the hand-over is the defect: the file stays worker-owned
     and the sandbox dies later, at supervise, with a permission error naming
-    neither the path nor the missing whitelist root. A refusal also has to take
-    the credential file with it -- a 0644 (umask) leftover in the shared image
-    cache is readable by every other tenant on the host.
+    neither the path nor the reason. A refusal also has to take the credential
+    file with it -- a 0644 (umask) leftover in the shared image cache is
+    readable by every other tenant on the host.
     """
-    host = _Host(euid=WORKER_UID, covers=False)
+    host = _Host(euid=WORKER_UID, agent=False)
     _install(monkeypatch, host, tmp_path / "secrets")
 
     path = _expected_secret_path(tmp_path)
@@ -360,9 +363,9 @@ def test_helpers_not_covering_the_path_fails_loudly(tmp_path, monkeypatch):
         ("unlink", str(path)),  # ...and the refusal taking the file with it
     ]
     assert str(excinfo.value) == (
-        f"cannot hand {path} to sandbox uid {SANDBOX_UID} on a non-root "
-        "worker: the file-capability broker whitelist does not contain it "
-        "(E2B_IMAGE_CACHE_DIR must be one of the broker's roots)"
+        f"cannot hand {path} to sandbox uid {SANDBOX_UID}: this worker has no "
+        "privileged file-step path (no per-node agent is configured, and it "
+        "is not root)"
     )
     assert path.exists() is False
 
@@ -398,7 +401,7 @@ def test_a_later_entry_that_cannot_resolve_lands_nothing_on_disk(
     raised -- a credential left behind by a create that failed before the
     sandbox ever existed. The failure has to happen while nothing has landed.
     """
-    host = _Host(euid=WORKER_UID, covers=True)
+    host = _Host(euid=WORKER_UID, agent=True)
     _install(monkeypatch, host, tmp_path / "secrets")
     monkeypatch.delenv("E2B_IDENTITY_TOKEN_NOBODY", raising=False)
 
@@ -425,7 +428,7 @@ def test_the_secret_is_created_at_0600_without_a_umask_window(tmp_path, monkeypa
     removes the window: the mode is a creation argument, and the event list
     carries the create (with its mode) instead of a late ``chmod``.
     """
-    host = _Host(euid=WORKER_UID, covers=True)
+    host = _Host(euid=WORKER_UID, agent=True)
     _install(monkeypatch, host, tmp_path / "secrets")
 
     _executor(tmp_path)._materialize_http_inject(_http_inject_entries())
@@ -451,7 +454,7 @@ def test_a_parent_directory_owned_by_someone_else_refuses_the_reclaim(
     secret_dir = tmp_path / "secrets" / "sbx_1"
     secret_dir.mkdir(parents=True)
     secret_dir.chmod(0o755)
-    host = _Host(euid=WORKER_UID, covers=True)
+    host = _Host(euid=WORKER_UID, agent=True)
     _install(monkeypatch, host, tmp_path / "secrets")
     host.forced_dir_uid[str(secret_dir)] = 0
 
@@ -480,7 +483,7 @@ def test_a_sticky_parent_directory_refuses_the_reclaim(tmp_path, monkeypatch):
     secret_dir = tmp_path / "secrets" / "sbx_1"
     secret_dir.mkdir(parents=True)
     secret_dir.chmod(0o1777)
-    host = _Host(euid=WORKER_UID, covers=True)
+    host = _Host(euid=WORKER_UID, agent=True)
     _install(monkeypatch, host, tmp_path / "secrets")
 
     path = _expected_secret_path(tmp_path)
@@ -541,7 +544,7 @@ def test_env_and_file_entries_keep_their_input_order(tmp_path, monkeypatch):
     ``[env, env, file, file]`` -- the same values, in an order the caller did
     not ask for, so two rules for one matcher/header would flip which one wins.
     """
-    host = _Host(euid=WORKER_UID, covers=True)
+    host = _Host(euid=WORKER_UID, agent=True)
     _install(monkeypatch, host, tmp_path / "secrets")
     monkeypatch.setenv("E2B_IDENTITY_TOKEN_FIRST", "jwt-first")
     monkeypatch.setenv("E2B_IDENTITY_TOKEN_THIRD", "jwt-third")
@@ -588,8 +591,8 @@ def test_env_and_file_entries_keep_their_input_order(tmp_path, monkeypatch):
     assert host.events == [
         ("unlink", str(secret_dir / "hdr_1_file.secret")),
         ("open", str(secret_dir / "hdr_1_file.secret"), 0o600),
-        ("broker_chown", SANDBOX_UID, str(secret_dir / "hdr_1_file.secret"), False),
+        ("chown_secret", "sbx_1", "hdr_1_file"),
         ("unlink", str(secret_dir / "hdr_3_file.secret")),
         ("open", str(secret_dir / "hdr_3_file.secret"), 0o600),
-        ("broker_chown", SANDBOX_UID, str(secret_dir / "hdr_3_file.secret"), False),
+        ("chown_secret", "sbx_1", "hdr_3_file"),
     ]

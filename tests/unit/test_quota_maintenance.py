@@ -1521,16 +1521,13 @@ def test_create_app_nonroot_discloses_direct_quota_downgrade(
         # this test is about -- and since the local file-capability brokers went
         # (N52) that is also what it says out loud, one line before the quota
         # ones.
-        settings=EnvdSettings(
-            executor="local", workspace_base=tmp_path, priv_helpers="off"
-        ),
+        settings=EnvdSettings(executor="local", workspace_base=tmp_path),
         runtime_registry=RuntimeRegistry(tmp_path),
     )
     assert [r.message for r in caplog.records if r.name == "envd_service.app"] == [
-        "this worker has no privileged file-step path configured: neither "
-        "the agent transport nor a per-node agent is configured, so it keeps "
-        "the in-process (E5.1) shape (no per-sandbox host uids, no route-B "
-        "slots)",
+        "this worker has no privileged file-step path: no per-node agent is "
+        "configured, so it keeps the in-process (E5.1) shape (no per-sandbox "
+        "host uids, no route-B slots)",
         app_module.PER_UID_NONROOT_WARNING,
         f"{xfs_quota.NONROOT_DIRECT_QUOTA_REASON} (direct xfs_quota requires "
         "root/CAP_SYS_ADMIN; per-sandbox disk hard limits are disabled while "
@@ -1553,13 +1550,9 @@ def test_create_app_nonroot_with_sys_admin_cap_no_disclosure(
     )
     caplog.set_level(logging.WARNING)
     create_envd_app(
-        # The Track F brokers live in /var/lib/e2b-priv, outside this test's
-        # tmp_path workspace, so a simulated non-root worker would (correctly)
-        # refuse the broker shape here. These tests pin the non-root
-        # *in-process* disclosure, so they ask for it explicitly.
-        settings=EnvdSettings(
-            executor="local", workspace_base=tmp_path, priv_helpers="off"
-        ),
+        # A non-root worker with no agent is the in-process shape these tests
+        # pin (the local file-capability brokers went with N52).
+        settings=EnvdSettings(executor="local", workspace_base=tmp_path),
         runtime_registry=RuntimeRegistry(tmp_path),
     )
     assert [r for r in caplog.records if "磁盘配额不可用" in r.message] == []
@@ -1581,9 +1574,7 @@ def test_create_app_nonroot_non_xfs_host_no_disclosure(
     )
     caplog.set_level(logging.WARNING)
     create_envd_app(
-        settings=EnvdSettings(
-            executor="local", workspace_base=tmp_path, priv_helpers="off"
-        ),
+        settings=EnvdSettings(executor="local", workspace_base=tmp_path),
         runtime_registry=RuntimeRegistry(tmp_path),
     )
     assert [r for r in caplog.records if "磁盘配额不可用" in r.message] == []
@@ -1610,7 +1601,6 @@ def test_create_app_nonroot_via_agent_no_disclosure(tmp_path, monkeypatch, caplo
             executor="local",
             workspace_base=tmp_path,
             quota_via_agent=True,
-            priv_helpers="off",
         ),
         runtime_registry=RuntimeRegistry(tmp_path),
     )

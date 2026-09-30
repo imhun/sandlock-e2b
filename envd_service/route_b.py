@@ -803,13 +803,13 @@ class W1SlotPool:
         """Make a slot document readable by exactly one uid.
 
         Root worker: ``chown -1:<uid>`` (owner stays root, group is the slot).
-        Non-root worker: the maintenance broker cannot chown to ``-1``, so the
-        owner stays the **worker** (it has to be able to rewrite the lease on a
-        W1 restart) and only the group becomes the slot uid ``uid`` -- the same
-        0440 "readable by the slot, closed to every other tenant" property,
-        with the worker as owner instead of root.
+        The C3 shape asks the agent for the same step (``scope-slot-document``);
+        a non-root worker without an agent has no way to chown to ``-1`` at all
+        (the file-capability broker that used to do it is retired, open-issues
+        N52), so it fails closed at the ``os.chown`` below rather than shipping
+        a document every tenant can read.
         """
-        from envd_service import agent_fileops, priv_helpers
+        from envd_service import agent_fileops
 
         client = agent_fileops.active()
         if client is not None:
@@ -851,9 +851,6 @@ class W1SlotPool:
                     "the wrong path -- refusing"
                 )
             client.scope_slot_document(sandbox_id, path.name)
-            return
-        if priv_helpers.helpers_cover(path):
-            priv_helpers.broker_reclaim(path, recursive=False, gid=uid)
             return
         os.chown(path, -1, uid)
 
@@ -1909,13 +1906,12 @@ class RouteBConfig:
         documented default -- route B off unless its own switches say
         otherwise.
 
-        Track F (Task F1): when this worker resolved the file-capability
-        brokers at startup (``envd_service.priv_helpers``), the slot spawner
-        *is* the broker (``e2b-slot-spawn``), which is what lets a non-root
-        worker start a slot at another uid. A root worker gets no spawner here
-        and keeps the ``setpriv`` form in :func:`_spawn_slot`.
+        There is no privileged starter to resolve any more (C3 Task 7 retired
+        the file-capability spawner, open-issues N52): ``agent-grant`` starts
+        the unprivileged unshare-and-poll child and the per-node agent writes
+        its identity, so the pool is handed ``spawner=None`` and the only
+        question left is whether the child can *report* itself.
         """
-        from envd_service import priv_helpers
         from envd_service.worker_identity import build_identity_reporter
 
         raw_slot_identity = str(

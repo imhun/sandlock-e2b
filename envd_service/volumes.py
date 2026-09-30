@@ -228,11 +228,13 @@ def _chown_path(
     volume: str | None = None,
     volume_root: bool = False,
 ) -> None:
-    """chown one directory to a sandbox uid (broker-first on non-root workers).
+    """chown one directory to a sandbox uid (root, or through the agent).
 
-    A non-root worker has no CAP_CHOWN of its own; the maintenance broker is
-    what makes the E3.2 ownership model hold there. Outside the broker's
-    whitelist (or with no brokers) this falls back to the in-process call.
+    Only root holds ``CAP_CHOWN`` here; every other shape asks the agent, which
+    performs the same step as ``{sandbox_id, op, volume}``. There is no local
+    fallback on a non-root worker any more (the file-capability broker that
+    used to be one is retired, open-issues N52): ``os.chown`` below would be a
+    bare ``EPERM``, so the agent branch above is the whole non-root story.
 
     The group is the worker's effective gid (fix round 1 / c1): the worker is
     the data-plane owner of the tree it manages.
@@ -256,22 +258,18 @@ def _chown_path(
         else:
             client.chown_volume_slice(sandbox_id, volume)
         return
-    if priv_helpers.helpers_cover(path):
-        priv_helpers.broker_chown(
-            host_uid, path, recursive=False, gid=os.getegid()
-        )
-        return
     os.chown(path, host_uid, os.getegid())
 
 
 def _can_manage_sandbox_uid() -> bool:
     """Whether this worker can put a path under a sandbox's own host uid.
 
-    ``file_steps_available`` and not ``active_helpers``: C3's agent shape
-    installs no ``PrivHelpers`` -- its chowns travel to the agent -- so the
-    broker-only predicate answered "no" there and the whole volume ownership
-    model (the shared ``1777`` root and the slice's ``0770``) was skipped
-    silently (review Task 4 slice A, Important 2).
+    ``file_steps_available`` (root, or an agent client) and not "did a local
+    privileged shape resolve": C3's agent shape installs no local helper -- its
+    chowns travel to the agent -- so a broker-only predicate would answer "no"
+    there and the whole volume ownership model (the shared ``1777`` root and
+    the slice's ``0770``) would be skipped silently (review Task 4 slice A,
+    Important 2).
     """
     from envd_service import priv_helpers
 
@@ -327,49 +325,30 @@ def provision_sandbox_volume_mount(
             from envd_service import agent_fileops
 
             agent_client = agent_fileops.active()
+            # chmod *before* chown, in every shape: after the hand-over the
+            # worker is neither the owner nor CAP_FOWNER, so a chmod that ran
+            # after it would be EPERM (the root shape hides the ordering, the
+            # non-root one does not).
+            try:
+                os.chmod(sandbox_dir, mode)
+            except OSError as exc:
+                logger.debug(
+                    "cannot set volume slice %s to %04o before chown: %s",
+                    sandbox_dir,
+                    mode,
+                    exc,
+                )
             if agent_client is not None:
-                # C3 Task 4: mode first, while the worker still owns the slice
-                # (after the hand-over it would be EPERM), then the agent's
-                # chown -- asked for as ``{sandbox_id, op, volume}``.
-                try:
-                    os.chmod(sandbox_dir, mode)
-                except OSError as exc:
-                    logger.debug(
-                        "cannot set volume slice %s to %04o before chown: %s",
-                        sandbox_dir,
-                        mode,
-                        exc,
-                    )
+                # C3 Task 4: the hand-over is the agent's step, asked for as
+                # ``{sandbox_id, op, volume}``.
                 agent_client.chown_volume_slice(
                     sandbox_id, volume_id, recursive=True
                 )
-            elif priv_helpers.helpers_cover(sandbox_dir):
-                # chmod *before* chown: after the chown the worker is no longer
-                # the owner and chmod would be EPERM (the broker carries no
-                # CAP_FOWNER); the root shape hides the ordering, the non-root
-                # one does not.
-                try:
-                    os.chmod(sandbox_dir, mode)
-                except OSError as exc:
-                    logger.debug(
-                        "cannot set volume slice %s to %04o before chown: %s",
-                        sandbox_dir,
-                        mode,
-                        exc,
-                    )
-                priv_helpers.broker_chown(
-                    host_uid, sandbox_dir, recursive=True, gid=group
-                )
             else:
-                try:
-                    os.chmod(sandbox_dir, mode)
-                except OSError as exc:
-                    logger.debug(
-                        "cannot set volume slice %s to %04o before chown: %s",
-                        sandbox_dir,
-                        mode,
-                        exc,
-                    )
+                # Root's own step. A non-root worker without an agent cannot
+                # reach it at all (the file-capability broker is retired,
+                # open-issues N52); ``_can_manage_sandbox_uid`` is what keeps
+                # this branch from being taken there.
                 os.chown(sandbox_dir, host_uid, group)
         projid = provision_project(
             sandbox_id=volume_projid_key(sandbox_id, volume_id, mount_path),
@@ -560,8 +539,8 @@ def cleanup_volume_projects(
                     exc,
                 )
         # Fix round 1 / c1: the slice is `0770 <sandbox uid>:<worker gid>`, so
-        # the worker's own group access can remove it in-process; e2b-maint is
-        # the fallback for trees that access cannot reach.
+        # the worker's own group access can remove it in-process (root shape);
+        # the C3 agent shape removes it through the agent instead.
         from envd_service import agent_fileops, priv_helpers
 
         agent_client = agent_fileops.active()

@@ -1053,25 +1053,26 @@ def test_the_shapes_excluded_from_c3_declare_that_they_have_no_file_ops() -> Non
 
     The single-machine example (and the autoscaler's docker pool, until it was
     retired on 2026-09-30) relied on the worker image's file-capability
-    binaries. Task 4 slice B removed them, so `E2B_PRIV_HELPERS=auto` would now
-    resolve nothing, log a single warning and keep the in-process (E5.1) shape
-    -- no per-sandbox host uid, no route-B. For the example that is also a
-    *downgrade in loudness*: its default route-B root is outside the broker
-    whitelist, so it used to refuse to start.
+    binaries. Task 4 slice B removed them and N52 (2026-09-30) retired the
+    knobs that named them, so the example no longer declares any
+    privileged-file-op key at all: it runs the in-process (E5.1) shape -- no
+    per-sandbox host uid, no route-B.
 
-    Ruling D23: both were excluded from C3's coverage **by name** (like
-    `local://`), and each has to *declare* its absent file-operation capability
-    in its own manifest -- `off` is the value `E2B_PRIV_HELPERS` already has
-    for "never use the brokers". A reader can then answer "what does this shape
-    do for privileged file ops?" from the file alone.
+    Ruling D23: the shape is excluded from C3's coverage **by name** (like
+    `local://`), and has to *declare* its absent file-operation capability in
+    its own manifest. With the knobs gone the declaration is the absence of
+    every such key plus a comment that says what shape this is, so a reader can
+    still answer "what does this shape do for privileged file ops?" from the
+    file alone.
     """
     # The single-machine example: a plain env key on its only worker.
     demo = _compose(LOCAL_SHAPES[0])["services"]["envd"]
-    assert _compose_env(demo)["E2B_PRIV_HELPERS"] == "off"
+    assert "E2B_PRIV_HELPERS" not in _compose_env(demo)
     # ...and it does not smuggle in a C3 key that would imply a privileged path
     # it does not have.
     for path in LOCAL_SHAPES:
         text = path.read_text(encoding="utf-8")
+        assert "excluded from C3's coverage by name" in text, path.name
         for key in (
             "E2B_SLOT_IDENTITY",
             "E2B_PRIV_HELPER_TRANSPORT",

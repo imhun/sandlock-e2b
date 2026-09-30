@@ -217,37 +217,27 @@ spec:
             # docs/production-deployment-requirements.md §2.7.1.
             - name: E2B_IMAGE_CACHE_OWNER_UID
               value: "65534"
-            # Track F (F1): the non-root worker scopes each slot's
-            # policy/program documents to that slot's uid (0440) through
-            # e2b-maint, and the broker only touches paths under
-            # <workspace_base>/, <state_base>/ (N27) or <shared_volume_root>/.
-            # Anywhere else the helpers self-check refuses the shape at startup
-            # by name (the alternative is a world-readable 0444 policy document
-            # carrying the egress-proxy credentials). N27 moves `.route-b` under
-            # the state base with the rest of the platform's own files, which is
-            # exactly why the broker's whitelist grew that second root (Task 4).
+            # Route B's scratch root (the per-slot policy/program documents).
+            # N27 keeps `.route-b` under the state base with the rest of the
+            # platform's own files. The per-node agent scopes those documents
+            # to the slot's uid (0440), and it only touches roots this
+            # deployment names (N52 retired the worker-side broker whose
+            # whitelist this used to be); anywhere else the document could only
+            # fall back to a world-readable 0444 one carrying the egress-proxy
+            # credentials, so keep it under a named root.
             - name: E2B_ROUTE_B_TMP_ROOT
               value: /var/lib/e2b-sandboxes/state/.route-b
-            # Track F (F1): `auto` uses the image's file-capability brokers on
-            # this non-root pod; `off` keeps the in-process E5.1 shape.
-            - name: E2B_PRIV_HELPERS
-              value: "auto"
-            # C3 (Task 4 slice B): **the agent shape**. This worker holds no
-            # privileged binary at all any more -- the image no longer ships
-            # `/var/lib/e2b-priv/` -- so `auto` would silently resolve *no*
-            # brokers and fall back to the degraded in-process (E5.1) shape.
-            # `agent` is what routes every file step to the control plane
-            # (`{sandbox_id, op}`), which instructs this node's agent; it is
-            # part of the same change as removing the binaries, deliberately:
-            # a worker without them and still on `spawn`/`exec` is the broken
-            # intermediate state.
+            # C3 (Task 4 slice B): **the agent shape** -- this worker holds no
+            # privileged binary at all (the image ships no `/var/lib/e2b-priv/`)
+            # and `agent` is what routes every file step to the control plane
+            # (`{sandbox_id, op}`), which instructs this node's agent.
             #
             # C3 Task 7 retired the socket-era rollback lever
             # (`E2B_PRIV_HELPER_TRANSPORT=socket` + its `E2B_PRIV_HELPER_SOCKET`
-            # path) together with the broker DaemonSet and the `wait-for-broker`
-            # gate: `agent` is now the shipped shape and the only one this
-            # manifest can express. The remaining values are `auto` and `exec`
-            # (the file-capability binaries, which this image no longer ships).
+            # path) together with the broker DaemonSet; N52 (2026-09-30) retired
+            # the `exec` shape too. `agent` is the only value the code accepts
+            # (`auto` resolves to it); naming a retired one is a startup
+            # refusal by name, not a silent downgrade.
             - name: E2B_PRIV_HELPER_TRANSPORT
               value: agent
             # C3 (Task 3): route B's slot identity now comes from the per-node

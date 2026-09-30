@@ -156,19 +156,14 @@ def test_agent_grant_needs_a_reporter_rather_than_root(
 
 
 def test_the_pool_never_gets_a_broker_spawner(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The file-capability spawner is the *old* starter, and nothing wires it.
+    """There is no privileged starter left to wire (C3 / N52).
 
-    Even a worker that still resolved local helpers gets a pool with no spawner:
-    that spawner performs the setuid itself, which is exactly the privileged
-    step C3 replaced, and the child it starts never polls for a grant.
+    The file-capability spawner was the *old* starter: it performed the setuid
+    itself, which is exactly the privileged step C3 replaced. It is gone from
+    the worker (open-issues N52), so ``from_settings`` hands the pool no
+    spawner at all and the child it starts is the unprivileged one that polls
+    for its grant.
     """
-    from envd_service import priv_helpers
-
-    monkeypatch.setattr(
-        priv_helpers, "active_helpers", lambda: SimpleNamespace(
-            slot_spawner=lambda **kw: FakeProcess()
-        )
-    )
     monkeypatch.setenv("E2B_CONTROL_PLANE_URL", CONTROL_PLANE_URL)
     monkeypatch.setenv("E2B_NODE_ID", NODE_ID)
     agent_grant = RouteBConfig.from_settings(

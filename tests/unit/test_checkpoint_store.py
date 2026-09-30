@@ -173,37 +173,34 @@ def test_the_image_directory_is_handed_to_the_slot_that_will_write_it(
 
     Measured on the cluster (2026-09-25): the slot is started as the sandbox's
     pooled uid, so the engine captured the workload and then died writing it
-    ("checkpoint save failed: ... Permission denied"). The worker therefore
-    hands the directory over -- directly as root, through ``e2b-maint``
-    otherwise -- and this pins which uid it names.
+    ("checkpoint save failed: ... Permission denied"). The hand-off is therefore
+    a step of its own, and which uid it names is what this pins -- in the shape
+    that ships, the agent performs it, asked for by the sandbox id (no path
+    leaves the worker: hard rule 3).
     """
-    from envd_service import priv_helpers
+    from envd_service import agent_fileops
 
-    handed: list[tuple[int, str, bool]] = []
+    handed: list[tuple[str, bool]] = []
 
-    def record(uid, path, *, recursive=True, gid=None):
-        handed.append((uid, str(path), recursive))
+    class _Client:
+        def chown_checkpoint(self, sandbox_id: str, *, recursive: bool = True):
+            handed.append((sandbox_id, recursive))
 
-    monkeypatch.setattr(priv_helpers, "broker_chown", record)
+        def checkpoint_bytes(self, sandbox_id: str) -> int:
+            return 0
+
     base = tmp_path / "sandboxes"
     _sandbox_tree(base, "sbx_store")
     executor = _FakeExecutor()
 
+    monkeypatch.setattr(agent_fileops, "_ACTIVE", [_Client()])
     reply = capture_checkpoint_image(
         base, _ctx(executor), "sbx_store", owner_uid=20001
     )
 
-    image = checkpoint_image_dir(base, "sbx_store")
-    if os.geteuid() == 0:
-        # A root worker hands the directory over itself -- the broker is the
-        # non-root mechanism (`e2b-maint` with CAP_CHOWN). What both paths have
-        # to agree on is *which uid* ends up owning it, because that uid is who
-        # writes the image inside the slot; so the direct case pins the effect
-        # rather than a call the broker would have recorded.
-        assert handed == []
-        assert image.parent.stat().st_uid == 20001
-    else:
-        assert handed == [(20001, str(image.parent), False)]
+    # The sandbox id, not the path: the control plane derives
+    # `<state base>/_runtime/.checkpoints/<id>` from it.
+    assert handed == [("sbx_store", False)]
     assert reply["captured"] is True, f"a hand-off must not block the capture: {reply}"
 
 
@@ -213,23 +210,10 @@ def test_a_directory_that_cannot_be_handed_over_is_not_captured(
     """No hand-off, no capture: the save would fail inside the slot anyway."""
     from envd_service import priv_helpers
 
-    def refuse(uid, path, *, recursive=True, gid=None):
+    def broken(path, uid, *, recursive=False, sandbox_id=None):
         raise priv_helpers.PrivHelperError("no brokers on this worker")
 
-    monkeypatch.setattr(priv_helpers, "broker_chown", refuse)
-    if os.geteuid() == 0:
-        # As root the hand-off is the worker's own chown, so the broker above is
-        # never consulted: make the mechanism this privilege actually selects
-        # fail the same way. The contract under test is the caller's ("a
-        # hand-off that raises is reported, never a capture that dies inside the
-        # slot"), and it must not depend on who is running the test.
-        # C3 Task 4 added the sandbox id to this call: the agent shape derives
-        # the checkpoint path from the control plane's records, so the call site
-        # has to name which sandbox it means.
-        def broken(path, uid, *, recursive=False, sandbox_id=None):
-            raise priv_helpers.PrivHelperError("no brokers on this worker")
-
-        monkeypatch.setattr(checkpoint_store, "_hand_to_sandbox", broken)
+    monkeypatch.setattr(checkpoint_store, "_hand_to_sandbox", broken)
     base = tmp_path / "sandboxes"
     _sandbox_tree(base, "sbx_store")
     executor = _FakeExecutor()

@@ -85,21 +85,22 @@ def _route_b_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExec
     """The deployed identity shape for route B (§2.4.1, 决定 #1).
 
     **Host-side the sandbox runs at the pooled uid; inside its namespace it is
-    uid 0** (the fork's F18 self-map of the single-entry userns). A non-root
-    runner reaches that shape through the image's file-capability brokers --
-    the same wiring ``RouteBConfig.from_settings`` does in the worker -- while
-    a root runner uses the default ``setpriv`` starter.
+    uid 0** (the fork's F18 self-map of the single-entry userns). There is one
+    slot-identity shape left (C3, open-issues N52): the pool forks an
+    unprivileged child that unshares and polls, and the identity is *granted*
+    by writing that child's ``uid_map``/``gid_map`` -- the per-node agent's step
+    in production, performed in-process by this lane's reporter when it runs as
+    root.
     """
-    from envd_service import priv_helpers
     from envd_service.config import Settings as EnvdSettings
     from envd_service.route_b import RouteBConfig
     from envd_service.uid_pool import apply_sandbox_ownership
+    from tests.security.conftest import _lane_identity_reporter
 
     base = Path(workspace).parent
     scratch = base / "route-b"
     scratch.mkdir(parents=True, exist_ok=True)
-    settings = EnvdSettings(
-        priv_helpers="auto",
+    EnvdSettings(  # the shape the worker resolves at startup, named here too
         per_sandbox_uid=True,
         workspace_base=base,
         route_b="on",
@@ -107,10 +108,6 @@ def _route_b_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExec
         uid_pool_size=1,
         route_b_tmp_root=scratch,
     )
-    # Resolve + install the singleton exactly like the worker start-up does, so
-    # the slot documents are group-scoped through the broker on a non-root
-    # runner (a warning-free, production-shaped lease).
-    helpers = priv_helpers.configure_priv_helpers(settings)
     apply_sandbox_ownership(workspace, pooled_uid)
     return SandlockExecutor(
         workspace_dir=str(workspace),
@@ -132,7 +129,8 @@ def _route_b_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExec
             uid_start=pooled_uid,
             uid_size=1,
             tmp_root=scratch,
-            spawner=helpers.slot_spawner if helpers is not None else None,
+            slot_identity="agent-grant",
+            identity_reporter=_lane_identity_reporter(pooled_uid, 1),
         ),
     )
 
@@ -327,11 +325,11 @@ async def test_sandbox_child_runs_unprivileged():
     outside the workspace unwritable, so a uid-0 child cannot touch host root
     paths.
     """
-    from envd_service.config import Settings as EnvdSettings
-    from envd_service import priv_helpers
+    from tests.security.conftest import require_mediation_capable
 
     ws = str(sandbox_tmpdir(suffix="-identity", uid=POOLED_UID))
     executor = _route_b_identity_executor(Path(ws), POOLED_UID)
+    require_mediation_capable(executor)
     try:
         exit_code, out, err = await _run(
             executor, ws, "import os; print(os.getuid(), os.getgid())"

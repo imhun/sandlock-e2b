@@ -161,13 +161,12 @@ def uid_startup_disclosure() -> list[str]:
     contract that compares whole warning lists has to expect exactly the ones
     that fired here:
 
-    * Track F's broker resolution: a non-root worker with
-      ``E2B_PRIV_HELPERS=auto`` and no brokers installed says so once
-      (``priv_helpers.helpers_unavailable_reason``); a root worker, ``off``,
-      or an installed broker pair stays quiet;
-    * E5.1's per-sandbox uids: without root and without the brokers the switch
-      is auto-disabled with its own line; a root worker (or one that resolved
-      the brokers) builds the uid pool and stays quiet.
+    * the privileged-file-step shape: a non-root worker with no per-node agent
+      says so once (``priv_helpers.helpers_unavailable_reason``); a root
+      worker or an installed agent client stays quiet;
+    * E5.1's per-sandbox uids: without root and without a privileged file-step
+      path the switch is auto-disabled with its own line; a root worker (or one
+      with the agent wired) builds the uid pool and stays quiet.
 
     The suite runs in two shapes -- the root gate container (both silent) and
     an unprivileged dev box (the first line, then the second) -- so a helper
@@ -176,7 +175,7 @@ def uid_startup_disclosure() -> list[str]:
     """
     from envd_service import priv_helpers
 
-    if os.geteuid() == 0 or priv_helpers.active_helpers() is not None:
+    if os.geteuid() == 0 or priv_helpers.file_steps_available():
         return []
     unavailable = priv_helpers.helpers_unavailable_reason(EnvdSettings())
     return [

@@ -71,14 +71,14 @@ long priv_worker_gid(void);
 const char *priv_state_base(void);
 
 /* The whitelist, in the order -- and with the same conditional entries -- as
- * the Python side (PrivHelpers._root_paths): the workspace base, the state
+ * the fleet's deployments name them: the workspace base, the state
  * base only when it is a root of its own, the shared volume root whenever the
  * deployment names one, and the image cache (`E2B_IMAGE_CACHE_DIR`) only when
  * it is named and is not already one of them -- the last one because a
  * sandbox's secret file lives at
  * `<image_cache_dir>/secrets/<sandbox_id>/` and a non-root worker has to be
  * able to hand it to a pool uid. There is deliberately **no default** for it:
- * the Python side's unset value is *cwd-relative*, so a daemon whose cwd is
+ * an unset value is *cwd-relative* on the Python side, so a daemon whose cwd is
  * somewhere else would whitelist a directory nobody means -- and the two
  * sides' root lists would disagree, which is what the hello handshake refuses.
  * Returns how many were written. */

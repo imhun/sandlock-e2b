@@ -200,22 +200,13 @@ def _read_uid_marker(marker: Path) -> int | None:
 def _chown_tree(path: Path, uid: int, gid: int) -> None:
     """Recursively chown ``path`` (symlinks themselves, never their targets).
 
-    On a non-root worker the recursion happens **inside** ``e2b-maint``: the
-    worker cannot descend a tenant's tree (``0770`` gives it group access, but
-    it is not the owner, so it cannot change ownership back), and that is why
-    the maintenance broker keeps the chown verb. Handing a reclaimed orphan
-    back to the worker identity (``uid == os.geteuid()``) uses the broker's
-    ``--worker`` form, so the request can never name root.
+    The root shape's step: only root can descend a tenant's tree and change
+    ownership back (``0770`` gives the worker group access, but not ownership,
+    so it cannot chown it back). Every other shape reaches its hand-over by a
+    different route -- the agent performs the chown itself
+    (``agent_fileops``), and a non-root worker without one has no privileged
+    file-step path at all (open-issues N52).
     """
-    from envd_service import priv_helpers
-
-    helpers = priv_helpers.active_helpers()
-    if helpers is not None and priv_helpers.helpers_cover(path):
-        if uid == os.geteuid() and gid == os.getegid():
-            helpers.chown_worker(path=path, recursive=True)
-        else:
-            helpers.chown(uid=uid, path=path, recursive=True)
-        return
     os.lchown(path, uid, gid)
     if not path.is_symlink() and path.is_dir():
         for root, dirs, files in os.walk(path, topdown=False):
@@ -298,10 +289,6 @@ def apply_sandbox_ownership(
                 f"{path} was not named by one"
             )
         client.chown_workspace(sandbox_id, recursive=True)
-        return
-    helpers = priv_helpers.active_helpers()
-    if helpers is not None and priv_helpers.helpers_cover(path):
-        helpers.chown(uid=host_uid, path=path, recursive=True, gid=group)
         return
     _chown_tree(path, host_uid, group)
 

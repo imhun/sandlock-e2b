@@ -282,14 +282,14 @@ def create_app(
     platform_state_base = (
         getattr(runtime_registry, "state_base", None) or settings.state_base
     )
-    # Track F (Task F1): resolve the file-capability brokers once, before the
-    # uid pool / route-B decisions below depend on them. A half-installed
-    # broker pair raises here (named) instead of the worker quietly keeping a
-    # weaker shape; "no brokers at all" keeps today's model with one warning.
+    # The one shape that can perform this worker's privileged file steps now is
+    # C3's per-node agent -- installed by ``configure_priv_helpers`` above. A
+    # half-configured shape cannot exist any more (the file-capability brokers
+    # that used to fail closed here are retired, open-issues N52), so what is
+    # left is the warning for a worker that names no agent and is not root.
     from envd_service import priv_helpers
 
     priv_helpers.configure_priv_helpers(settings)
-    brokers = priv_helpers.active_helpers()
     unavailable = priv_helpers.helpers_unavailable_reason(settings)
     if unavailable is not None:
         logger.warning("%s", unavailable)
@@ -297,19 +297,17 @@ def create_app(
 
     if agent_fileops.enabled(settings) and agent_fileops.active() is None:
         # ``configure`` raises when the shape is asked for and cannot be wired;
-        # reaching here means ``E2B_PRIV_HELPERS=off`` and the agent shape were
-        # both configured, which cannot be one shape. Name it rather than
-        # silently keeping the privileged path (D18.1).
+        # reaching here means the agent shape was named but no client was
+        # installed. Name it rather than silently keeping a weaker path (D18.1).
         raise RuntimeError(
-            "E2B_PRIV_HELPER_TRANSPORT=agent cannot be combined with "
-            "E2B_PRIV_HELPERS=off: the worker has no way to perform its "
-            "privileged file steps"
+            "E2B_PRIV_HELPER_TRANSPORT=agent was named but this worker has no "
+            "agent client: it has no way to perform its privileged file steps"
         )
     # E5.1: per-sandbox host uids need a privileged supervisor -- root /
-    # CAP_SETUID + chown, or (Track F) the two file-capability brokers, which
-    # are exactly how a non-root worker (uid 65534) gets those steps. Without
-    # either, the switch is auto-disabled and the worker keeps the
-    # fixed-identity + Landlock model instead of crash-looping on EPERM.
+    # CAP_SETUID + chown, or (C3) the per-node agent, which performs those
+    # steps on a non-root worker's behalf. Without either, the switch is
+    # auto-disabled and the worker keeps the fixed-identity + Landlock model
+    # instead of crash-looping on EPERM.
     if settings.per_sandbox_uid and (
         os.geteuid() == 0 or priv_helpers.file_steps_available(settings)
     ):

@@ -182,10 +182,9 @@ static const char *priv_image_cache(void) {
 }
 
 size_t priv_root_paths(const char **out, size_t max) {
-    /* This is the Python side's list (PrivHelpers._root_paths) byte for byte,
-     * including *which* of its entries are conditional: a consumer that reads
-     * the diagnostic and one that walks the whitelist must not disagree, and
-     * the hello handshake compares the two lists. */
+    /* The roots, in the order -- and with the same conditional entries -- as
+     * the fleet's deployments name them: a consumer that reads the diagnostic
+     * and one that walks the whitelist must not disagree. */
     const char *workspace = priv_workspace_base();
     const char *state = priv_state_base();
     const char *shared = priv_shared_volume_root();

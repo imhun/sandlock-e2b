@@ -1,10 +1,12 @@
-"""Track F (Task F1): route B from a **non-root** worker, end to end.
+"""Route B from a **non-root** worker, end to end, in the C3 shape.
 
 The deployed worker runs as uid 65534 with no effective capabilities. Route B
 still has to start one ``sandlock-supervise`` per sandbox *as that sandbox's
-own host uid*, and E3.2 still has to own the sandbox's ``0770`` workspace --
-which a non-root worker can only do through the two file-capability brokers
-(``envd_service/priv_helpers.py``, ``c3_agent/priv/``). This contract drives the
+own host uid*, and E3.2 still has to own the sandbox's ``0770`` workspace. The
+one shape that does it now (C3, open-issues N52) is the identity **grant**: the
+pool forks an unprivileged child that unshares and polls, and the node's agent
+writes that child's ``uid_map``/``gid_map``. The file-capability brokers that
+used to do it from the worker itself are retired. This contract drives the
 real worker path (control plane create -> agent create -> first exec) and
 asserts, in the shape the process actually runs in:
 
@@ -17,11 +19,9 @@ asserts, in the shape the process actually runs in:
    with the sandbox's own identity;
 ⑤ the chroot shape's canonical cwd is ``/home/user``.
 
-Run as root it exercises the ``setpriv`` starter, run as uid 65534 with the
-brokers installed it exercises ``e2b-slot-spawn``; both must satisfy the same
-five assertions, which is exactly the point of the two brokers (a non-root
-worker is not a different behaviour, it is the same behaviour with the
-privileged step delegated).
+Run as root the lane stands in for the node's agent (it writes the child's
+map); a lane that is not root has no way to grant an identity at all, and
+``require_mediation_capable`` turns that into a skip rather than a false pass.
 """
 
 from __future__ import annotations
@@ -67,9 +67,10 @@ def _envd_settings(workspace: Path) -> EnvdSettings:
         uid_pool_start=POOL_START,
         uid_pool_size=POOL_SIZE,
         workspace_base=workspace,
-        # Track F: the slot's policy/program documents must live under the
-        # broker whitelist (workspace base / shared volume root), otherwise the
-        # worker refuses the broker shape at startup by name.
+        # The slot's policy/program documents live under the route-B scratch
+        # root; it is inside the workspace base so the node agent's whitelist
+        # (the same roots the worker's own file steps used to be scoped to)
+        # covers them when it scopes the documents to the slot's uid.
         route_b_tmp_root=workspace / ".route-b",
     )
 
@@ -90,8 +91,39 @@ def route_b_workspace() -> Path:
     return path
 
 
-def _make_apps(workspace: Path):
-    """Control plane + envd sharing one registry, like ``make_apps`` does."""
+def _require_lane_grant() -> None:
+    """The lane's stand-in for the node agent needs root.
+
+    Route B's identity is *granted*: someone privileged writes the forked
+    child's ``uid_map``/``gid_map``. In production that is the node's agent; in
+    this lane it is ``tests/security/conftest._lane_identity_reporter``, which
+    performs the identical write in-process -- and that needs euid 0.
+    """
+    if os.geteuid() != 0:
+        pytest.skip(
+            "route B's identity is granted by the node agent and this lane has "
+            "none: its in-process stand-in writes /proc/<pid>/uid_map, which "
+            "needs root"
+        )
+
+
+def _make_apps(workspace: Path, monkeypatch):
+    """Control plane + envd sharing one registry, like ``make_apps`` does.
+
+    The lane has no agent container, so the identity grant is performed
+    in-process by the same helper the security lane uses: only the *reporter*
+    is replaced. The worker still forks the child, reports its pid and waits
+    for the map to land; that write is the whole of what the node's agent does
+    in production.
+    """
+    from envd_service import worker_identity
+    from tests.security.conftest import _lane_identity_reporter
+
+    monkeypatch.setattr(
+        worker_identity,
+        "build_identity_reporter",
+        lambda settings, **kwargs: _lane_identity_reporter(POOL_START, POOL_SIZE),
+    )
     registry = RuntimeRegistry(workspace)
     control = create_control_app(
         # The control plane is the uid authority (OBS-9): it must hand out the
@@ -154,11 +186,12 @@ def _ready_fields(message: str) -> dict[str, str]:
 
 
 async def test_nonroot_worker_runs_route_b_with_pooled_uids(
-    route_b_workspace, caplog
+    route_b_workspace, caplog, monkeypatch
 ) -> None:
+    _require_lane_grant()
     workspace = route_b_workspace
     caplog.set_level(logging.INFO, logger=ROUTE_B_LOGGER)
-    control, envd = _make_apps(workspace)
+    control, envd = _make_apps(workspace, monkeypatch)
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=control), base_url="http://test"
@@ -327,51 +360,8 @@ async def test_nonroot_worker_runs_route_b_with_pooled_uids(
         assert argv[argv.index("--policy") + 1].startswith(str(workspace / ".route-b"))
 
 
-async def test_the_broker_step_is_real_when_this_worker_is_not_root(
-    route_b_workspace,
-) -> None:
-    """The same lease the contract above exercises, pinned at the broker.
-
-    Run as root this is the ``setpriv`` shape (no brokers resolved); run as uid
-    65534 with the image's brokers it is ``e2b-slot-spawn`` and the lease has
-    to come back with the pooled uid -- the non-root worker's whole route-B
-    capability in one assertion pair.
-    """
-    from envd_service import priv_helpers
-    from envd_service.route_b import RouteBConfig, W1SlotPool, default_supervise_bin
-
-    settings = _envd_settings(route_b_workspace)
-    priv_helpers.configure_priv_helpers(settings)
-    helpers = priv_helpers.active_helpers()
-    if os.geteuid() != 0:
-        assert helpers is not None, (
-            "a non-root worker in this image must resolve the file-capability "
-            "brokers (or be told why in the self-check)"
-        )
-    else:
-        assert helpers is None
-    config = RouteBConfig.from_settings(settings)
-    assert (config.spawner is not None) == (helpers is not None)
-
-    pool = W1SlotPool(
-        uid_start=POOL_START,
-        size=2,
-        tmp_root=Path(settings.route_b_tmp_root),
-        spawner=config.spawner,
-        supervise_bin=default_supervise_bin(),
-    )
-    handle = pool.acquire_sync("sbx_broker_probe", {}, name="broker-probe", uid=POOL_START)
-    try:
-        assert handle.uid == POOL_START
-        status = Path(f"/proc/{handle.process.pid}/status").read_text()
-        assert "Uid:\t%d\t%d\t%d\t%d" % ((POOL_START,) * 4) in status
-        assert "CapEff:\t0000000000000000" in status
-    finally:
-        pool.release_sync("sbx_broker_probe")
-
-
 async def test_route_b_restores_guest_root_with_and_without_pid_ns(
-    route_b_workspace,
+    route_b_workspace, monkeypatch
 ) -> None:
     """Guest uid stays 0 (host side stays the pooled slot uid) under pid_ns.
 
@@ -391,7 +381,8 @@ async def test_route_b_restores_guest_root_with_and_without_pid_ns(
     changes (apt-get, chown, ports below 1024).
     """
     workspace = route_b_workspace
-    control, envd = _make_apps(workspace)
+    _require_lane_grant()
+    control, envd = _make_apps(workspace, monkeypatch)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=control), base_url="http://test"
     ) as client:

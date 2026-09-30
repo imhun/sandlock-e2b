@@ -104,16 +104,13 @@ def install_stub(monkeypatch):
 def _isolate_singletons(monkeypatch):
     """No test in this file may leak the module-level singletons.
 
-    ``configure`` installs one, and both modules hold theirs in a module-global
-    list (that is the shape the worker uses at startup). A leaked one makes
-    *later* tests run in a shape they never asked for -- which is exactly how
-    this file's first version broke ``test_route_b_slot_identity`` when the two
-    were run in one session.
+    ``configure`` installs one, and the agent client holds its in a
+    module-global list (that is the shape the worker uses at startup). A leaked
+    one makes *later* tests run in a shape they never asked for -- which is
+    exactly how this file's first version broke ``test_route_b_slot_identity``
+    when the two were run in one session.
     """
-    from envd_service import priv_helpers
-
     monkeypatch.setattr(agent_fileops, "_ACTIVE", [None])
-    monkeypatch.setattr(priv_helpers, "_ACTIVE", [None])
 
 
 # ------------------------------------------------------------------- the wire
@@ -315,10 +312,10 @@ def test_the_shape_is_read_from_the_transport_variable(
     assert client is not None
     assert agent_fileops.enabled(_Settings()) is True
     # ...and the same variable is what ``priv_helpers`` reads, so the two
-    # halves of the shape cannot disagree.
+    # halves of the shape cannot disagree: the client it wires is the one the
+    # worker's file steps go through.
     from envd_service import priv_helpers
 
-    monkeypatch.setattr(priv_helpers, "_ACTIVE", [object()])
     agent_fileops.configure(_Settings())
     assert priv_helpers.configure_priv_helpers(_Settings()) is None
     assert agent_fileops.active() is not None
