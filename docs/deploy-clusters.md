@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.20（2026-09-30，回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，当前版本 `0.1.0-814-gf8d1685-20260930-210628`）**；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，当前版本 `0.1.0-811-g071beb4-20260930-202337`）**；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.21（2026-09-30，① 第一步：exec/socket 传输具名拒绝，当前版本 `0.1.0-816-g1c85e7c-20260930-213813`）**；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，当前版本 `0.1.0-814-gf8d1685-20260930-210628`）**；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，当前版本 `0.1.0-811-g071beb4-20260930-202337`）**；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1056,6 +1056,19 @@ pre-C3 的 root/no-agent 形态不再被支持 —— `route_b._spawn_slot` 与 
 
 **仍剩第 ① 根**（见 N52 ⑤）：`E2B_PRIV_HELPER_TRANSPORT=exec` + 两个 file-capability 二进制 +
 `E2B_PRIV_HELPERS`（`envd_service/priv_helpers.py` 的本地实现半、车道 phase 2 与约 20 条用例）。
+
+### 7.21 ① 第一步：`exec`/`socket` 传输具名拒绝（**2026-09-30，已上线 `0.1.0-816-g1c85e7c-20260930-213813`**）
+
+用户裁定「1,2 也去掉吧，现在只需要 agent grant 这个形态」。这一版只动**行为面**（未删死代码）：
+
+* `E2B_PRIV_HELPER_TRANSPORT` 只认 `auto|agent`；`exec` 与 C1 的 `socket` 进 `RETIRED_TRANSPORTS`，启动期按名字拒绝。
+* `configure_priv_helpers` 不再解析/安装本地 `PrivHelpers`：只在部署声明 agent 形态时 wire `agent_fileops`。
+* `file_steps_available` 收窄成"agent 客户端在不在"；启动警告改写为"没有特权文件操作路径"（旧文案让运维去装已经不存在的二进制）。
+* 安全钉子纠了一次：新文案不能出现 agent 的地址变量名（`envd_service/**` 硬规则 5）。
+
+**集群验收**：`deployment_smoke.py` ⇒ `DEPLOYMENT SMOKE OK`；`kubectl diff` **0 行**；`control-plane` 2/2、`e2b-worker` 2/2；worker 日志无 spawn/默认值告警。仓库侧 `tests/unit` 与基线逐条对比无新增失败。
+
+**仍未做（① 第二步）**：`PrivHelpers` 类及其 argv 构造、capability 解码/校验、`resolve_priv_helpers`/`_build_helpers`/`broker_*`/`helpers_cover` 等约 700 行现在是**不可达代码**，`E2B_PRIV_HELPERS` 旋钮与 4 份清单里的声明成了空转 —— 删它们 + 车道 phase 2 与约 20 条用例收尾。
 
 ## 8. 改部署的入口
 

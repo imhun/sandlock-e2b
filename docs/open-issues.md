@@ -67,7 +67,7 @@
 >
 > **④ 两根杆已删。** · **`E2B_AS_K8S_KIND` 整个去掉**（`05fa7c3`，已上线 `0.1.0-811`）：`KubernetesBackend` 只缩 `statefulsets`（常量，不再是旋钮），`retire_victim` 的 Deployment 分支消失，Role 去掉 `deployments{,/scale}`；钉子改钉"清单里没有这个 env 条目"。 · **`E2B_SLOT_IDENTITY=spawn` 整个去掉**：`agent-grant` 是唯一被接受的取值（`RouteBConfig.__post_init__` 与 `from_settings` 都按名字拒绝 `spawn`），`route_b._spawn_slot`（root + setpriv）与 `c3_agent/priv/slot_spawn.c` 删除，`privileged_starter` 收窄成"有没有 reporter"。**代价（点名并接受）**：route B 的覆盖从"root 车道 + spawn"改为"集群 + agent-grant"；车道里由 `tests/security/conftest._lane_identity_reporter`（root 车道自己写 uid_map，即 agent 的那一步）承接，pre-C3 的 root/no-agent 形态不再支持（需要时从 git 取）。
 >
-> **⑤ 仍未做**：`E2B_PRIV_HELPER_TRANSPORT=exec` + 两个 file-capability 二进制 + `E2B_PRIV_HELPERS`（`priv_helpers.py` 的整半、约 700 行，外加车道 phase 2 与 ~20 条用例）—— 单独一轮。
+> **⑤ ① 分两步走，第一步已上线（`0.1.0-816`，见 `docs/deploy-clusters.md` §7.21）**：`E2B_PRIV_HELPER_TRANSPORT` 只认 `auto|agent`，`exec`/`socket` 启动期**具名拒绝**；`configure_priv_helpers` 不再解析/安装本地 broker；启动警告改写为"没有特权文件操作路径"；`file_steps_available` 收窄成"agent 客户端在不在"。**第二步（未做）**：`PrivHelpers` 类与它的 argv 构造、capability 解码/校验、`resolve_priv_helpers`/`_build_helpers`/`broker_*`/`helpers_cover`（约 700 行不可达代码）、`E2B_PRIV_HELPERS` 旋钮与 4 份清单声明、车道 phase 2 与约 20 条用例 —— 纯删死代码，无行为变化。
 
 ## 二、fork（`third_party/sandlock`）
 
