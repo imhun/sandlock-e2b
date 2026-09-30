@@ -3345,3 +3345,60 @@ volume isolated、kill 后预约归零），末段 `Template.build` 仍因集群
 
 pin：`test_worker_seccomp_profile_is_the_default_plus_pidfd_getfd_and_a_narrowed_unshare` 断言掩码本身，
 退回无条件即红（已实测）。
+
+---
+
+## 2026-09-30 沙箱侧封掉 `pidfd_getfd`（fork `a21a507`）+ 线上重建 / 部署 / 实测
+
+**改动**：fork `third_party/sandlock` 提交 `a21a507` 把 `"pidfd_getfd"` 加进
+`DEFAULT_BLOCKLIST_SYSCALLS`（`crates/sandlock-core/src/sys/structs.rs`）。监督进程自己的
+`sandbox.rs::dup_child_fd` 在该过滤器之外，`NO_SUPERVISOR_BLOCKLIST_SYSCALLS` 照旧放行。
+
+**重建 wheel**：`./deploy/scripts/build-sandlock-wheels.sh`（cp314 / manylinux_2_34 / x86_64+aarch64）。
+
+- 两个 wheel 的 sha256 都变了：aarch64 `6fe2a9d6…` → `d21f0a1b…`，x86_64 `f52d265d…` → `e4056f2a…`。
+- 清单 `wheels/fork/SHA256SUMS.supervise` 的 `# HEAD=a21a507b2fb7d3392f470d8c24d5381ef49768bf` = fork tip。
+- `python/verify-wheel.sh`（在 `sandlock-dev:latest` 内，先 `cargo build --offline --release -p sandlock-ffi` 建 tip release lib）
+  **全绿**：两轮 FFI 动态符号集双向相等（167=167）；supervise 指纹三方一致（wheel 内 / 独立副本 / 清单，双架构）；
+  x86_64 `--uid` 拒绝冒烟 exit=1 且 stderr 同时点名两个 uid（aarch64 是异构 ELF，按脚本设计只做结构校验）。
+- 直接证据：旧 wheel 的 `.so` **没有** `…process_vm_writevpidfd_getfdopen_by_handle_at…` 这段常量，
+  新 wheel 的 aarch64 / x86_64 `.so` 都**有**；推送后的 worker 镜像里 `import sandlock` 后同一 `.so` 也命中。
+
+**镜像**：`PLATFORMS=linux/arm64 ./deploy/scripts/build-and-push.sh` → 版本
+**`0.1.0-788-g4b5a734-20260930-115027`**。踩中脚本那个坑：单平台走 `build-images.sh` 的 `--load`
+分支**不推送**，只把 worker/autoscaler/agent/quota-agent 装进本地 docker（gateway、`python:3.14-slim`
+镜像、`python-mcp:3.14` 由 build-and-push 自己 `--push`）。补推四个 tag 并逐个核对：`docker manifest
+inspect --verbose` 全部 `linux/arm64`，digest 见 `tmp/pidfd-imagepush.log`（worker `sha256:ec2039fd…`、
+autoscaler `sha256:929faa01…`、agent `sha256:7c1369af…`、quota-agent `sha256:a66fc333…`）。
+
+**部署**：`export KUBECONFIG=$PWD/tmp/k0s/kubeconfig; ./deploy/k8s-k0s/apply.sh`（走 overlay，没碰基线单文件）——
+8 个镜像引用 pin 到新 tag；agent → worker 闸门都过；base image 两个 worker 预热 `peek cached=true`。
+集群 **`v1.36.4+k0s`**、2 节点 arm64；10 个 pod 全 Ready，镜像已是新 tag。
+
+**实测（线上真沙箱，经 e2b API）**：
+
+- `tmp/sandbox-pidfd-probe.py`：`pidfd_open` 成功，但 `pidfd_getfd` 对 self 与 pid 1/2/3/7 **全是 EPERM**。
+  **before**（commit message 记，2026-09-30 同一集群）：`pidfd_getfd(self, stdout)` 返回 fd，还写进去了一行
+  （duplicating worked）。
+- `tmp/sandbox-allowance-probe.py` A 臂（沙箱内）：
+
+  | syscall | before | after |
+  |---|---|---|
+  | unshare NEWUSER / NEWNET / NEWNS / NEWUTS / NEWIPC / NEWCGROUP | err:EPERM | err:EPERM |
+  | setns | err:EPERM | err:EPERM |
+  | ptrace | err:EPERM | err:EPERM |
+  | process_vm_readv / process_vm_writev | err:EPERM | err:EPERM |
+  | mount | err:EPERM | err:EPERM |
+  | **pidfd_getfd** | **允许（可复制同沙箱进程的 fd）** | **err:EPERM** |
+
+- `deploy/scripts/multinode_smoke.py` → **`MULTI-NODE SMOKE OK`**（4 箱 2+2；命令/文件/health/stdin 经网关；kill 后预约归零）。
+- `deploy/scripts/deployment_smoke.py` C3 全过：`OK: commands + files`、`OK: migrated e2b-worker-1 -> e2b-worker-0, files kept`、
+  `OK: network config echo + atomic update`、`OK: volume mounted remotely + sibling volume isolated`、kill 后预约归零。
+  末段 `Template.build` 仍失败（环境，与改动无关）：buildkit `resolving docker.io/library/python:3.11-slim … dial tcp 74.86.228.110:443: i/o timeout`。
+- worker 自检：两个 worker 都打 `seccomp self-check: filter mode active, user namespaces allowed`；route-B 槽位正常
+  （`fd-handoff`、`pushed-append` 活），worker 日志里 `pidfd_getfd` 报错 **0** 行 —— 监督进程那条 pidfd_getfd 没被误伤。
+
+**没做到的 / 代价**：无外网阻塞项。`verify-wheel.sh` 不是现成入口，要点三条（先建 tip release lib；
+`third_party/sandlock/target` 是指向容器路径 `/src/target-linux` 的符号链接，脚本要在容器里跑；用 `sh` 而不是
+`python3` 调），已按此跑通，日志 `tmp/pidfd-verify-wheel.log`、`tmp/pidfd-wheelbuild.log`、`tmp/pidfd-imagebuild.log`、
+`tmp/pidfd-probe-after.log`、`tmp/pidfd-allowance-after.log`、`tmp/pidfd-*-smoke.log`。
