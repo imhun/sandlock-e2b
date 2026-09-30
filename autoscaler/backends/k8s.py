@@ -1,7 +1,5 @@
 """Kubernetes workload backend using the k8s REST API directly (no extra
-dependency). Scales the worker Deployment *or* StatefulSet and retires the
-drained pod by raising its pod-deletion-cost before scaling down, so the
-controller picks the safe pod to terminate.
+dependency). Scales the worker Deployment *or* StatefulSet.
 
 Both kinds are supported because the shape decides whether a worker's identity
 survives a restart: the baseline runs a StatefulSet so the node ids are stable
@@ -9,6 +7,18 @@ survives a restart: the baseline runs a StatefulSet so the node ids are stable
 cluster that only has the Deployment form (pre-N20 manifests) must stay
 scalable. ``has_node``/``remove_node`` are kind-agnostic either way: they work on
 pods, and the node id *is* the pod name.
+
+Where the two kinds differ is *who* dies on scale-down, and this module states
+it rather than assuming it (open-issues N51): :meth:`remove_node` raises the
+drained pod's ``pod-deletion-cost`` and then scales the workload down by one.
+The **ReplicaSet** controller honours that annotation, so a Deployment retires
+the pod the loop chose. A **StatefulSet** does not -- it always deletes the
+highest ordinal -- so on the baseline kind the annotation is inert and the
+*newest* worker is the one that goes. That is correct for the ordinary
+scale-down (the idle node after a scale-up *is* the newest one) and wrong when
+an older node is the idle candidate, which is why the loop's candidate order
+and this backend's retirement are worth reading together before changing
+either.
 """
 
 from __future__ import annotations
@@ -92,9 +102,22 @@ class KubernetesBackend:
         return resp.status_code == 200
 
     def scale_to(self, replicas: int) -> None:
-        resp = self._client.put(
+        """Set the workload's replica count through its scale subresource.
+
+        A **merge patch**, not a replace: the replace form of `.../scale`
+        requires the body to carry the object's own ``metadata.name``, and this
+        call has nothing to put there -- measured on k0s 2026-09-30, the PUT
+        answered ``400 BadRequest`` / *"the name of the object (e2b-worker based
+        on URL) was undeterminable: name must be provided"*, so the fleet never
+        grew while every tick logged `autoscaler tick failed`. The patch form
+        takes the name from the URL and needs no ``resourceVersion`` either
+        (no lost-update retry loop: replicas is an absolute count, and the loop
+        re-reads it with :meth:`current` on the next tick).
+        """
+        resp = self._client.patch(
             f"{self._deploy_url()}/scale",
             json={"spec": {"replicas": int(replicas)}},
+            headers={"Content-Type": "application/merge-patch+json"},
         )
         resp.raise_for_status()
         logger.info(

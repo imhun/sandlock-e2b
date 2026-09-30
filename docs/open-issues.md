@@ -56,6 +56,8 @@
 > 没有这个工作负载了（循环在 control-plane 内、`E2B_AS_ENABLED=true`），所以 **`deploy/k8s-k0s/apply.sh`
 > 下一次跑完，`deploy/autoscaler` 会消失、`deploy/control-plane` 会滚出新的一轮**；那之前集群上仍是旧形态。
 
+| N51 | **缩容"退出的是你 drain 的那个节点"只在 Deployment 上成立**（2026-09-30 上线 N50 时读代码得出，未实测触发）：`KubernetesBackend.remove_node` 给被 drain 的 pod 打 `pod-deletion-cost=1000` 再整副本 -1，注释写的是"让控制器挑安全的 pod 删"。**`pod-deletion-cost` 只被 ReplicaSet 控制器读**；**StatefulSet 缩容永远删最高序号**（fork 无关，k8s 语义），而基线跑的正是 StatefulSet（`E2B_AS_K8S_KIND=statefulset`）⇒ 注解是空转的。**可达路径**：候选表按 node id 排序（`RedisNodeStore.list` 是 `mget(sorted(keys))`）⇒ 全空闲时的 `candidates[0]` 是**最小**序号（`e2b-worker-0`）；若此时还有 `e2b-worker-2` 活着，循环 drain 的是 `-0`、被删的是 `-2` ⇒ `-0` 留在舰队里且 `draining: true`（调度不再放箱子），**并且下一轮第 3 步的"孤儿 drain 收尾"会再缩一次**（该分支不检查 `min_replicas`）⇒ 可掉到 MIN 以下。**为什么 N50 没触发**：正常缩容里空闲的那个恰好是最新扩出来的（最高序号），两者一致；验收时用两个带沙箱的 worker 把候选唯一化，正好走的是**一致**那条路（实测：`-2` 被 drain 且被删，见 N50 的验收记录）。**修法二选一**（未做，留给决策）：(a) 让循环按"后端会删谁"排序候选（StatefulSet ⇒ 最高序号优先），(b) `remove_node` 缩容后**校验**目标 pod 是否真的消失，没消失就按名字点名告警并**撤销 drain**（`undrain`），不要让它进下一轮的孤儿收尾。 | 本行；`autoscaler/backends/k8s.py` 的模块 docstring（已按事实改写）；`control_plane/registry/redis_backend.py::RedisNodeStore.list`（排序是候选顺序的来源）；N50 行的验收记录（一致路径的实测） |
+
 ## 二、fork（`third_party/sandlock`）
 
 | # | 问题 | 状态 | 下一步 | 出处 |

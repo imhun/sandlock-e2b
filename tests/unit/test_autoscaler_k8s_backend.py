@@ -5,9 +5,22 @@ the N20 fix), while a cluster still on the older Deployment manifests has to kee
 working. Getting the kind wrong is not a silent no-op: the collection URL simply
 404s on every tick, so the fleet never grows. These pin both paths and the
 rejection of a typo.
+
+The *verb* is pinned here too, and for the same reason (measured on k0s,
+2026-09-30, when the merged autoscaler first tried to grow a real fleet): a
+``PUT`` against the scale subresource with only ``{"spec": {"replicas": N}}``
+is answered ``400 BadRequest`` -- *"the name of the object (e2b-worker based on
+URL) was undeterminable: name must be provided"*. The replace form wants the
+object to carry its own ``metadata.name``; a merge patch does not, because the
+URL names it. The failure mode is quiet in the worst way: the loop logged
+``autoscaler tick failed`` once per interval and the fleet never grew (the
+warm-pool floor is only enforced when it is *below* the current count, so an
+idle 2/2 fleet hid it for as long as nobody raised the floor).
 """
 
 from __future__ import annotations
+
+import json
 
 import httpx
 import pytest
@@ -41,8 +54,13 @@ def test_statefulset_kind_reads_and_scales_the_statefulset() -> None:
     urls = [(request.method, request.url.path) for request in seen]
     assert urls == [
         ("GET", "/apis/apps/v1/namespaces/sandlock/statefulsets/e2b-worker"),
-        ("PUT", "/apis/apps/v1/namespaces/sandlock/statefulsets/e2b-worker/scale"),
+        ("PATCH", "/apis/apps/v1/namespaces/sandlock/statefulsets/e2b-worker/scale"),
     ]
+    scale = seen[-1]
+    assert scale.headers["content-type"] == "application/merge-patch+json"
+    # No `metadata`: the URL names the object, which is exactly what the
+    # replace form could not do (see the module docstring).
+    assert json.loads(scale.content) == {"spec": {"replicas": 4}}
 
 
 def test_the_default_kind_is_the_pre_n20_deployment() -> None:
@@ -56,8 +74,9 @@ def test_the_default_kind_is_the_pre_n20_deployment() -> None:
     urls = [(request.method, request.url.path) for request in seen]
     assert urls == [
         ("GET", "/apis/apps/v1/namespaces/sandlock/deployments/e2b-worker"),
-        ("PUT", "/apis/apps/v1/namespaces/sandlock/deployments/e2b-worker/scale"),
+        ("PATCH", "/apis/apps/v1/namespaces/sandlock/deployments/e2b-worker/scale"),
     ]
+    assert seen[-1].headers["content-type"] == "application/merge-patch+json"
 
 
 def test_an_unknown_kind_is_rejected_at_construction() -> None:
