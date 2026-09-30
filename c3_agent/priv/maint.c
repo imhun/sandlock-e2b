@@ -226,6 +226,14 @@ int main(int argc, char **argv) {
         priv_usage("expected chown|rm|walk");
     }
     verb = argv[1];
+    /* The verb is checked **before** the flags: with the C1 socket verbs gone,
+     * an unknown one (a stale caller, an operator probing the binary) must be
+     * named as unknown -- not reported as "--path is required", which is what
+     * the flag loop would say first. */
+    if (strcmp(verb, "chown") != 0 && strcmp(verb, "rm") != 0 &&
+        strcmp(verb, "walk") != 0) {
+        priv_usage("unknown verb '%s' (expected chown|rm|walk)", verb);
+    }
     for (index = 2; index < argc; index++) {
         const char *arg = argv[index];
         const char *value;
