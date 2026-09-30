@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import Any, Protocol
 
 from autoscaler.policy import (
@@ -80,16 +81,15 @@ class AutoscalerLoop:
         an idle fleet), so a no-op round costs no store round trip.
         """
         marks = self._state.read()
-        before = LoopMarks(
-            last_scale_up=marks.last_scale_up,
-            last_scale_down=marks.last_scale_down,
-            draining_node_id=marks.draining_node_id,
-        )
+        before = replace(marks)
         try:
             await self._reconcile(marks)
         finally:
             if marks != before:
-                self._state.write(marks)
+                # The difference, not the snapshot: a peer replica may have
+                # written its own marks while this tick was working (see
+                # `autoscaler/state.py`).
+                self._state.write(before, marks)
 
     async def _reconcile(self, marks: LoopMarks) -> None:
         payload = self._control.metrics()

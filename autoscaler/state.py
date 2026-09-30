@@ -21,6 +21,16 @@ Without Redis there is one process and :class:`InMemoryLoopState` is the whole
 fleet -- the same "one process is the winner" posture ``try_claim`` takes. The
 two are deliberately independent: the claim decides *who acts this interval*,
 the marks decide *what the fleet has already done*.
+
+**A tick writes the difference, not the snapshot.** The claim is per interval,
+so two replicas can still be inside overlapping ticks (a tick whose k8s calls
+outlast the TTL, or two ticks either side of a rollout), and a replica that
+read the marks *before* its peer scaled up would otherwise write that stale
+``last_scale_up = -inf`` back -- silently deleting the cooldown the store
+exists to share. Measured on the cluster 2026-09-30 (second acceptance cycle):
+the fleet grew to 3 and shrank to 2 again within one interval because of
+exactly that. :meth:`LoopState.write` therefore takes the marks the tick *read*
+and the marks it *did*, and stores only the fields that differ.
 """
 
 from __future__ import annotations
@@ -51,7 +61,7 @@ class LoopMarks:
 class LoopState(Protocol):
     def read(self) -> LoopMarks: ...
 
-    def write(self, marks: LoopMarks) -> None: ...
+    def write(self, before: LoopMarks, after: LoopMarks) -> None: ...
 
 
 @dataclass
@@ -63,8 +73,12 @@ class InMemoryLoopState:
     def read(self) -> LoopMarks:
         return replace(self._marks)
 
-    def write(self, marks: LoopMarks) -> None:
-        self._marks = replace(marks)
+    def write(self, before: LoopMarks, after: LoopMarks) -> None:
+        merged = replace(self._marks)
+        for name in _FIELDS:
+            if getattr(after, name) != getattr(before, name):
+                setattr(merged, name, getattr(after, name))
+        self._marks = merged
 
 
 class RedisLoopState:
@@ -97,22 +111,32 @@ class RedisLoopState:
             draining_node_id=_text(raw.get("draining_node_id")) or None,
         )
 
-    def write(self, marks: LoopMarks) -> None:
+    def write(self, before: LoopMarks, after: LoopMarks) -> None:
+        changed = {
+            "last_scale_up": repr(after.last_scale_up),
+            "last_scale_down": repr(after.last_scale_down),
+            "draining_node_id": after.draining_node_id or "",
+        }
+        mapping = {
+            name: value
+            for name, value in changed.items()
+            if getattr(after, name) != getattr(before, name)
+        }
+        if not mapping:
+            return
         try:
-            self._client.hset(
-                self._key,
-                mapping={
-                    "last_scale_up": repr(marks.last_scale_up),
-                    "last_scale_down": repr(marks.last_scale_down),
-                    "draining_node_id": marks.draining_node_id or "",
-                },
-            )
+            self._client.hset(self._key, mapping=mapping)
         except Exception:
             logger.warning(
                 "autoscaler state write failed; the next replica will not see "
                 "this tick's marks",
                 exc_info=True,
             )
+
+
+#: The three marks, by field name: one list so the two stores and the
+#: diff-only write above cannot drift from :class:`LoopMarks`.
+_FIELDS = ("last_scale_up", "last_scale_down", "draining_node_id")
 
 
 def _text(value: Any) -> str:
