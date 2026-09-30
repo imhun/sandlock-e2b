@@ -29,6 +29,16 @@ class _FakeScaleBackend:
     def has_node(self, node_id: str) -> bool:
         return True
 
+    def retire_victim(self, candidates: list[str]) -> str | None:
+        """This fake stands in for a backend that can retire what it chose.
+
+        A Deployment does (the ReplicaSet honours the deletion cost); the
+        StatefulSet's "only the top ordinal, or nobody" rule -- and the loop's
+        behaviour when the backend refuses -- is pinned in
+        `tests/unit/test_autoscaler_loop.py`.
+        """
+        return candidates[0] if candidates else None
+
     def scale_to(self, replicas: int) -> None:
         self.scaled.append(replicas)
         self.current_n = replicas

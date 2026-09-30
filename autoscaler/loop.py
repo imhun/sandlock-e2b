@@ -68,6 +68,10 @@ class AutoscalerLoop:
         self._poll_s = poll_s
         self._clock = clock
         self._state: LoopState = state or InMemoryLoopState()
+        #: Draining nodes we could not retire, already reported once (an
+        #: operator's drain on a node this workload cannot shrink from would
+        #: otherwise print once per interval, forever).
+        self._held_reported: set[str] = set()
 
     @property
     def control(self) -> FleetControl:
@@ -124,17 +128,31 @@ class AutoscalerLoop:
             marks.last_scale_up = now
             logger.info("scaled up to warm-pool floor %s -> %s", current, floor)
 
-        # 3) Reconcile orphaned drains (e.g. after an autoscaler restart the
-        #    in-memory drain state is lost): retire any healthy draining node
-        #    that no longer has sandboxes.
+        # 3) Reconcile drains this loop did not start: since the marks are
+        #    shared (autoscaler/state.py), a drain of ours survives a restart;
+        #    what lands here is a node an operator drained through the internal
+        #    API, or one whose mark was lost. Same two questions as step 5 --
+        #    can the fleet afford it, and is this node the one the backend can
+        #    actually retire -- because retiring the wrong node takes a pod the
+        #    loop did not choose (N51).
         for node in snapshot.nodes:
             if (
                 node.draining
                 and node.active_sandboxes == 0
                 and node.status == "healthy"
                 and node.node_id != marks.draining_node_id
-                and await asyncio.to_thread(self._backend.has_node, node.node_id)
             ):
+                if current <= self._policy.min_replicas:
+                    continue
+                if not await asyncio.to_thread(self._backend.has_node, node.node_id):
+                    continue
+                victim = await asyncio.to_thread(
+                    self._backend.retire_victim, [node.node_id]
+                )
+                if victim is None:
+                    self._report_held(node.node_id)
+                    continue
+                self._held_reported.discard(node.node_id)
                 logger.info("reconciling orphaned drained node %s", node.node_id)
                 await self._retire(node.node_id)
                 marks.last_scale_down = now
@@ -172,23 +190,47 @@ class AutoscalerLoop:
         ):
             candidates = scale_down_candidates(snapshot, self._policy)
             if candidates:
-                target = candidates[0]
-                result = self._control.drain(target.node_id)
-                marks.draining_node_id = target.node_id
-                if result.get("activeSandboxes", 0) == 0:
-                    await self._retire(target.node_id)
-                    marks.draining_node_id = None
-                    marks.last_scale_down = now
+                # Ask the backend which of them it can actually retire: with a
+                # StatefulSet the answer is "the highest ordinal, or nobody"
+                # (N51). None = shrinking now would take a pod the loop did not
+                # choose, so this interval does nothing.
+                victim = await asyncio.to_thread(
+                    self._backend.retire_victim,
+                    [candidate.node_id for candidate in candidates],
+                )
+                if victim is None:
+                    self._report_held(candidates[0].node_id)
                 else:
-                    logger.info(
-                        "draining node %s (%s active sandboxes)",
-                        target.node_id,
-                        result.get("activeSandboxes"),
-                    )
+                    self._held_reported.discard(victim)
+                    target = self._find(snapshot, victim)
+                    result = self._control.drain(target.node_id)
+                    marks.draining_node_id = target.node_id
+                    if result.get("activeSandboxes", 0) == 0:
+                        await self._retire(target.node_id)
+                        marks.draining_node_id = None
+                        marks.last_scale_down = now
+                    else:
+                        logger.info(
+                            "draining node %s (%s active sandboxes)",
+                            target.node_id,
+                            result.get("activeSandboxes"),
+                        )
 
     async def _retire(self, node_id: str) -> None:
         await asyncio.to_thread(self._backend.remove_node, node_id)
         logger.info("retired drained node %s", node_id)
+
+    def _report_held(self, node_id: str) -> None:
+        """Say once that a draining node cannot be retired right now (N51)."""
+        if node_id in self._held_reported:
+            return
+        self._held_reported.add(node_id)
+        logger.warning(
+            "scale-down held: this workload would delete a different pod than "
+            "the idle node %s (it shrinks from the top), so the fleet waits "
+            "instead of taking a worker the loop did not choose",
+            node_id,
+        )
 
     @staticmethod
     def _find(snapshot: FleetSnapshot, node_id: str):

@@ -25,10 +25,14 @@ class FakeControl:
 
 
 class FakeBackend:
-    def __init__(self, current: int = 2):
+    def __init__(self, current: int = 2, retire_pick: str = "first"):
         self.current_n = current
         self.scaled: list[int] = []
         self.removed: list[str] = []
+        #: ``"first"`` = the loop's own choice stands (a Deployment), ``"refuse"``
+        #: = this workload cannot take any of them (a StatefulSet whose top
+        #: ordinal is busy), or a node id = the victim the backend would take.
+        self.retire_pick = retire_pick
 
     def current(self):
         return self.current_n
@@ -40,6 +44,15 @@ class FakeBackend:
     def remove_node(self, node_id):
         self.removed.append(node_id)
         self.current_n -= 1
+
+    def retire_victim(self, candidates):
+        if not candidates:
+            return None
+        if self.retire_pick == "first":
+            return candidates[0]
+        if self.retire_pick == "refuse":
+            return None
+        return self.retire_pick if self.retire_pick in candidates else None
 
 
 def _loop(control, backend, **cfg):
@@ -254,4 +267,63 @@ async def test_an_in_flight_drain_is_shared_between_replicas():
     await second.tick()
 
     assert second_control.drained == []
+    assert backend.removed == []
+
+
+async def test_scale_down_waits_when_the_victim_would_be_another_pod():
+    """N51: the loop may only shrink when the backend can take *its* node.
+
+    The backend answers with the pod this workload's controller would actually
+    delete; `None` means "not one of the idle nodes" -- and then shrinking this
+    tick would kill a pod the loop never chose (on a StatefulSet: the highest
+    ordinal, which may be running sandboxes).
+    """
+    backend = FakeBackend(current=3, retire_pick="refuse")
+    control = FakeControl(
+        [_payload([_node("a"), _node("b"), _node("c")], fleet_util=0.1)]
+    )
+    loop = _loop(control, backend, min_replicas=1, scale_down_util=0.4)
+
+    await loop.tick()
+
+    assert control.drained == []
+    assert backend.removed == []
+    assert backend.current_n == 3
+
+
+async def test_the_drained_node_is_the_one_the_backend_would_delete():
+    """And when the backend names a different idle node, that is the one."""
+    backend = FakeBackend(current=3, retire_pick="c")
+    control = FakeControl(
+        [_payload([_node("a"), _node("b"), _node("c")], fleet_util=0.1)]
+    )
+    loop = _loop(control, backend, min_replicas=1, scale_down_util=0.4)
+
+    await loop.tick()
+
+    assert control.drained == ["c"]
+    assert backend.removed == ["c"]
+
+
+async def test_an_orphaned_drain_is_not_retired_below_the_warm_floor():
+    """The orphan sweep asks the same question the main branch does.
+
+    It used to retire any draining, idle, healthy node it found -- without
+    checking whether the fleet could afford to lose a replica (N51, second
+    half). An operator's `drain` on a fleet already at `min_replicas` shrank it
+    below the floor, and the floor branch grew it back on the next tick.
+    """
+
+    class NodeBackend(FakeBackend):
+        def has_node(self, node_id):
+            return True
+
+    backend = NodeBackend(current=1)
+    control = FakeControl(
+        [_payload([_node("zombie", draining=True), _node("ok")], fleet_util=0.1)]
+    )
+    loop = _loop(control, backend, min_replicas=1, scale_down_util=0.4)
+
+    await loop.tick()
+
     assert backend.removed == []

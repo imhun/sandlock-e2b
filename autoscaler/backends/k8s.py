@@ -8,17 +8,22 @@ cluster that only has the Deployment form (pre-N20 manifests) must stay
 scalable. ``has_node``/``remove_node`` are kind-agnostic either way: they work on
 pods, and the node id *is* the pod name.
 
-Where the two kinds differ is *who* dies on scale-down, and this module states
-it rather than assuming it (open-issues N51): :meth:`remove_node` raises the
-drained pod's ``pod-deletion-cost`` and then scales the workload down by one.
-The **ReplicaSet** controller honours that annotation, so a Deployment retires
-the pod the loop chose. A **StatefulSet** does not -- it always deletes the
-highest ordinal -- so on the baseline kind the annotation is inert and the
-*newest* worker is the one that goes. That is correct for the ordinary
-scale-down (the idle node after a scale-up *is* the newest one) and wrong when
-an older node is the idle candidate, which is why the loop's candidate order
-and this backend's retirement are worth reading together before changing
-either.
+Where the two kinds differ is *who* dies on scale-down, and that difference is
+enforced, not assumed (open-issues N51):
+
+* :meth:`remove_node` raises the drained pod's ``pod-deletion-cost`` and scales
+  the workload down by one. The **ReplicaSet** controller honours that
+  annotation, so a Deployment retires the pod the loop chose.
+* A **StatefulSet** does not honour it -- ``spec.replicas - 1`` deletes the
+  highest ordinal, full stop -- so on the baseline kind the annotation is inert
+  and the *top* pod is the one that goes.
+
+:meth:`retire_victim` is the seam that keeps the two honest: the loop asks which
+candidate a scale-down would actually take, and shrinks only when the answer is
+one of the nodes it may drain. Without that question the ordinary scale-down
+looks fine (the idle node after a scale-up *is* the newest one) right up to the
+case where a *busy* top ordinal holds live sandboxes and an older node is the
+idle candidate -- then scaling down would delete the busy one.
 """
 
 from __future__ import annotations
@@ -100,6 +105,65 @@ class KubernetesBackend:
             f"/api/v1/namespaces/{self._namespace}/pods/{node_id}"
         )
         return resp.status_code == 200
+
+    def retire_victim(self, candidates: list[str]) -> str | None:
+        """Which candidate a scale-down would really take (N51).
+
+        A **Deployment**'s pods are owned by a ReplicaSet, whose controller
+        reads the ``pod-deletion-cost`` :meth:`remove_node` sets -- so the loop's
+        own first choice is the pod that goes, and no API call is needed to say
+        so.
+
+        A **StatefulSet** shrinks from the top: ``spec.replicas - 1`` deletes
+        the highest ordinal, full stop. So the only node this backend may
+        retire is the top one, and only when the loop's candidate set contains
+        it -- otherwise the scale-down would kill a pod the loop never chose,
+        which on this fleet can be a worker holding live sandboxes. ``None``
+        then means "wait for the fleet to become shrinkable"; the loop retries
+        next interval.
+
+        The pod list is read from the API rather than derived from the naming
+        rule, because what matters is which pods *exist*: a crashed ordinal
+        that the controller has not recreated yet is not a pod that can be
+        deleted, and the node registry's rows outlive pods (they age out on
+        heartbeats).
+        """
+        if not candidates:
+            return None
+        if self._kind != "statefulset":
+            return candidates[0]
+        ordinals = self._statefulset_ordinals()
+        if not ordinals:
+            return None
+        top = max(ordinals, key=lambda name: ordinals[name])
+        return top if top in candidates else None
+
+    def _statefulset_ordinals(self) -> dict[str, int]:
+        """This StatefulSet's live pods, by name -> ordinal.
+
+        Scoped by ``ownerReferences`` rather than by a label, so nothing here
+        depends on a naming convention the manifest does not actually enforce.
+        A pod whose name does not end in an ordinal is skipped (it cannot be
+        what ``spec.replicas - 1`` deletes).
+        """
+        resp = self._client.get(f"/api/v1/namespaces/{self._namespace}/pods")
+        resp.raise_for_status()
+        prefix = f"{self._deployment}-"
+        found: dict[str, int] = {}
+        for pod in resp.json().get("items", []):
+            metadata = pod.get("metadata") or {}
+            owners = metadata.get("ownerReferences") or []
+            if not any(
+                owner.get("kind") == "StatefulSet"
+                and owner.get("name") == self._deployment
+                for owner in owners
+            ):
+                continue
+            name = metadata.get("name") or ""
+            tail = name[len(prefix) :] if name.startswith(prefix) else ""
+            if tail.isdigit():
+                found[name] = int(tail)
+        return found
 
     def scale_to(self, replicas: int) -> None:
         """Set the workload's replica count through its scale subresource.
