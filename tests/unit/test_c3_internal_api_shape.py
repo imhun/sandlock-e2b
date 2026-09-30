@@ -266,8 +266,6 @@ def test_the_k8s_control_plane_holds_exactly_the_grants_it_uses() -> None:
         {
             "apiGroups": ["apps"],
             "resources": [
-                "deployments",
-                "deployments/scale",
                 "statefulsets",
                 "statefulsets/scale",
             ],

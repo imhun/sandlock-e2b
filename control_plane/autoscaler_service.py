@@ -126,7 +126,6 @@ def build_loop(
         backend = KubernetesBackend(
             namespace=settings.autoscaler_k8s_namespace,
             deployment=settings.autoscaler_k8s_deployment,
-            kind=settings.autoscaler_k8s_kind,
         )
     if state_store is None:
         redis_client = getattr(app.state, "redis_client", None)

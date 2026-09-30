@@ -1,10 +1,11 @@
-"""The autoscaler must scale the workload *kind* the manifest actually deploys.
+"""The autoscaler scales the worker StatefulSet -- the only thing this repo deploys.
 
-The baseline runs the worker as a StatefulSet (stable pod names = stable node ids,
-the N20 fix), while a cluster still on the older Deployment manifests has to keep
-working. Getting the kind wrong is not a silent no-op: the collection URL simply
-404s on every tick, so the fleet never grows. These pin both paths and the
-rejection of a typo.
+It used to take an ``E2B_AS_K8S_KIND`` knob so a cluster still on the pre-N20
+Deployment manifests kept working; that knob went on 2026-09-30 (open-issues
+N52), together with the Deployment branch. The worker has been a StatefulSet
+since N20 -- stable pod names are stable node ids -- so there is one kind to get
+right, and getting it wrong is not a silent no-op: the URL 404s on every tick
+and the fleet never grows.
 
 The *verb* is pinned here too, and for the same reason (measured on k0s,
 2026-09-30, when the merged autoscaler first tried to grow a real fleet): a
@@ -23,8 +24,6 @@ from __future__ import annotations
 import json
 
 import httpx
-import pytest
-
 from autoscaler.backends.k8s import KubernetesBackend
 
 
@@ -38,12 +37,7 @@ def _pod(name: str, *, owner: str = "e2b-worker", kind: str = "StatefulSet") -> 
     }
 
 
-def _backend(
-    seen: list[httpx.Request],
-    *,
-    kind: str | None = None,
-    pods: tuple[dict, ...] = (),
-) -> KubernetesBackend:
+def _backend(seen: list[httpx.Request], *, pods: tuple[dict, ...] = ()) -> KubernetesBackend:
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
         if request.method == "GET" and request.url.path.endswith("/pods"):
@@ -55,15 +49,14 @@ def _backend(
     client = httpx.Client(
         transport=httpx.MockTransport(handler), base_url="https://kube.test"
     )
-    kwargs = {} if kind is None else {"kind": kind}
     return KubernetesBackend(
-        namespace="sandlock", deployment="e2b-worker", client=client, **kwargs
+        namespace="sandlock", deployment="e2b-worker", client=client
     )
 
 
-def test_statefulset_kind_reads_and_scales_the_statefulset() -> None:
+def test_it_reads_and_scales_the_worker_statefulset() -> None:
     seen: list[httpx.Request] = []
-    backend = _backend(seen, kind="statefulset")
+    backend = _backend(seen)
 
     assert backend.current() == 2
     backend.scale_to(4)
@@ -80,27 +73,18 @@ def test_statefulset_kind_reads_and_scales_the_statefulset() -> None:
     assert json.loads(scale.content) == {"spec": {"replicas": 4}}
 
 
-def test_the_default_kind_is_the_pre_n20_deployment() -> None:
-    """A cluster that has not switched yet must keep scaling what it has."""
+def test_the_pre_n20_deployment_path_is_gone() -> None:
+    """No kind argument, and no ``deployments`` URL to drift back to (N52)."""
+
     seen: list[httpx.Request] = []
     backend = _backend(seen)
-
-    assert backend.current() == 2
     backend.scale_to(3)
 
-    urls = [(request.method, request.url.path) for request in seen]
-    assert urls == [
-        ("GET", "/apis/apps/v1/namespaces/sandlock/deployments/e2b-worker"),
-        ("PATCH", "/apis/apps/v1/namespaces/sandlock/deployments/e2b-worker/scale"),
+    paths = [request.url.path for request in seen]
+    assert paths == [
+        "/apis/apps/v1/namespaces/sandlock/statefulsets/e2b-worker/scale",
     ]
-    assert seen[-1].headers["content-type"] == "application/merge-patch+json"
-
-
-def test_an_unknown_kind_is_rejected_at_construction() -> None:
-    """A typo must fail loudly here, not 404 once per tick in production."""
-    seen: list[httpx.Request] = []
-    with pytest.raises(ValueError, match="unsupported workload kind"):
-        _backend(seen, kind="statefulsets")
+    assert not [path for path in paths if "/deployments" in path]
 
 
 # --------------------------------------------------------------------------
@@ -121,7 +105,6 @@ def test_a_statefulset_can_only_retire_its_highest_ordinal() -> None:
     seen: list[httpx.Request] = []
     backend = _backend(
         seen,
-        kind="statefulset",
         pods=(_pod("e2b-worker-0"), _pod("e2b-worker-1"), _pod("e2b-worker-2")),
     )
 
@@ -139,7 +122,6 @@ def test_a_statefulset_refuses_when_the_top_ordinal_is_not_a_candidate() -> None
     seen: list[httpx.Request] = []
     backend = _backend(
         seen,
-        kind="statefulset",
         pods=(_pod("e2b-worker-0"), _pod("e2b-worker-1"), _pod("e2b-worker-2")),
     )
 
@@ -147,23 +129,11 @@ def test_a_statefulset_refuses_when_the_top_ordinal_is_not_a_candidate() -> None
     assert backend.retire_victim(["e2b-worker-0", "e2b-worker-1"]) is None
 
 
-def test_a_deployment_retires_the_node_the_loop_chose() -> None:
-    """The other kind keeps the old contract, and pays nothing for this guard."""
-    seen: list[httpx.Request] = []
-    backend = _backend(seen, kind="deployment")
-
-    assert backend.retire_victim(["e2b-worker-1", "e2b-worker-0"]) == "e2b-worker-1"
-    # No pod list: a ReplicaSet honours the deletion cost, so the loop's own
-    # choice is the one that goes.
-    assert [request.url.path for request in seen] == []
-
-
 def test_pods_owned_by_another_workload_are_not_the_victim() -> None:
     """The list is the namespace's; only this workload's pods count."""
     seen: list[httpx.Request] = []
     backend = _backend(
         seen,
-        kind="statefulset",
         pods=(
             _pod("e2b-worker-0"),
             _pod("somebody-else-9", owner="somebody-else"),
@@ -177,11 +147,11 @@ def test_pods_owned_by_another_workload_are_not_the_victim() -> None:
 def test_an_unreadable_pod_list_refuses_instead_of_guessing() -> None:
     """No pods (or an error) means "I cannot say what a scale-down would take"."""
     seen: list[httpx.Request] = []
-    backend = _backend(seen, kind="statefulset", pods=())
+    backend = _backend(seen, pods=())
 
     assert backend.retire_victim(["e2b-worker-0"]) is None
 
 
 def test_no_candidates_is_no_victim() -> None:
     seen: list[httpx.Request] = []
-    assert _backend(seen, kind="statefulset").retire_victim([]) is None
+    assert _backend(seen).retire_victim([]) is None

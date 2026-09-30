@@ -272,15 +272,12 @@ spec:
             - name: E2B_AS_K8S_NAMESPACE
               value: sandlock
             - name: E2B_AS_K8S_DEPLOYMENT
-              # The object's *name*; the kind is the next variable. (The name is
-              # historical: it scales whichever workload `E2B_AS_K8S_KIND` names.)
+              # The StatefulSet's *name*. There is no kind knob any more: the
+              # worker has been a StatefulSet since N20 (stable pod names are
+              # stable node ids), and the pre-N20 Deployment branch went on
+              # 2026-09-30 with the manifest's `E2B_AS_K8S_KIND` and the Role's
+              # `deployments` rules.
               value: e2b-worker
-            - name: E2B_AS_K8S_KIND
-              # The worker runs as a StatefulSet so its node ids survive restarts
-              # (N20): a Deployment gives every restart a new pod name, and the
-              # control plane then cannot route to the records the previous
-              # incarnation left behind. Keep this in step with worker.yaml.
-              value: statefulset
             - name: E2B_AS_MIN_REPLICAS
               # Two, like the compose stack: worker-1 and worker-2 always run. With
               # MIN=1 the autoscaler drains one of the two worker replicas as soon
@@ -630,14 +627,11 @@ rules:
     # `watch`, no `create`: the loop reads on demand and never creates a pod.
     verbs: ["get", "list", "patch", "delete"]
   - apiGroups: ["apps"]
-    # Both worker kinds: the baseline deploys the worker as a StatefulSet
-    # (stable pod names = stable node ids, N20), and `E2B_AS_K8S_KIND` selects
-    # which one is scaled. Keeping both here means the kind is a single value
-    # to change -- and a missing `statefulsets/scale` is a hard 403, not a
-    # silent no-op.
+    # The worker's kind, and only it: a StatefulSet (stable pod names = stable
+    # node ids, N20). The `deployments` pair went with `E2B_AS_K8S_KIND`
+    # (2026-09-30, open-issues N52) -- a missing `statefulsets/scale` is a hard
+    # 403, not a silent no-op, so this list is the whole grant.
     resources:
-      - deployments
-      - deployments/scale
       - statefulsets
       - statefulsets/scale
     verbs: ["get", "update", "patch"]

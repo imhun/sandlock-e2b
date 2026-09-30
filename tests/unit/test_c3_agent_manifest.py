@@ -558,8 +558,6 @@ def test_the_control_plane_role_may_read_and_list_pods() -> None:
         {
             "apiGroups": ["apps"],
             "resources": [
-                "deployments",
-                "deployments/scale",
                 "statefulsets",
                 "statefulsets/scale",
             ],

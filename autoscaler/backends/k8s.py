@@ -1,29 +1,22 @@
 """Kubernetes workload backend using the k8s REST API directly (no extra
-dependency). Scales the worker Deployment *or* StatefulSet.
+dependency). Scales the worker **StatefulSet** -- the only worker workload this
+repo deploys, and the one whose stable pod names are its stable node ids (N20).
 
-Both kinds are supported because the shape decides whether a worker's identity
-survives a restart: the baseline runs a StatefulSet so the node ids are stable
-(``e2b-worker-0``/``-1``, matching the compose stack's ``E2B_NODE_ID``), while a
-cluster that only has the Deployment form (pre-N20 manifests) must stay
-scalable. ``has_node``/``remove_node`` are kind-agnostic either way: they work on
-pods, and the node id *is* the pod name.
+It used to take an ``E2B_AS_K8S_KIND`` knob and scale a Deployment for clusters
+still on the pre-N20 manifests; that branch went on 2026-09-30 (open-issues
+N52), together with the manifest's ``E2B_AS_K8S_KIND`` and the Role's
+``deployments`` rules.
 
-Where the two kinds differ is *who* dies on scale-down, and that difference is
-enforced, not assumed (open-issues N51):
-
-* :meth:`remove_node` raises the drained pod's ``pod-deletion-cost`` and scales
-  the workload down by one. The **ReplicaSet** controller honours that
-  annotation, so a Deployment retires the pod the loop chose.
-* A **StatefulSet** does not honour it -- ``spec.replicas - 1`` deletes the
-  highest ordinal, full stop -- so on the baseline kind the annotation is inert
-  and the *top* pod is the one that goes.
-
-:meth:`retire_victim` is the seam that keeps the two honest: the loop asks which
-candidate a scale-down would actually take, and shrinks only when the answer is
-one of the nodes it may drain. Without that question the ordinary scale-down
-looks fine (the idle node after a scale-up *is* the newest one) right up to the
-case where a *busy* top ordinal holds live sandboxes and an older node is the
-idle candidate -- then scaling down would delete the busy one.
+What is left is the *StatefulSet-specific* half, and it is enforced rather than
+assumed (open-issues N51): :meth:`remove_node` raises the drained pod's
+``pod-deletion-cost`` and scales the workload down by one, but a StatefulSet
+ignores that annotation -- ``spec.replicas - 1`` deletes the highest ordinal,
+full stop. :meth:`retire_victim` is the seam that keeps the two honest: the loop
+asks which candidate a scale-down would actually take, and shrinks only when
+the answer is one of the nodes it may drain. Without that question the ordinary
+scale-down looks fine (the idle node after a scale-up *is* the newest one)
+right up to the case where a *busy* top ordinal holds live sandboxes and an
+older node is the idle candidate -- then scaling down would delete the busy one.
 """
 
 from __future__ import annotations
@@ -39,12 +32,10 @@ logger = logging.getLogger(__name__)
 
 _DELETION_COST = "controller.kubernetes.io/pod-deletion-cost"
 
-#: ``kind`` -> the REST path segment for it. Only these two are meaningful: the
-#: autoscaler scales worker replicas, not arbitrary workloads.
-_RESOURCE_FOR_KIND = {
-    "deployment": "deployments",
-    "statefulset": "statefulsets",
-}
+#: The REST path segment of the workload this backend scales. A constant, not a
+#: knob: the repo deploys a StatefulSet, and a second kind is a branch nobody
+#: tests in production (see the module docstring).
+_RESOURCE = "statefulsets"
 
 
 def _service_account_token() -> str | None:
@@ -60,19 +51,12 @@ class KubernetesBackend:
         *,
         namespace: str,
         deployment: str,
-        kind: str = "deployment",
         client: httpx.Client | None = None,
         in_cluster: bool = True,
     ) -> None:
         self._namespace = namespace
         self._deployment = deployment
-        self._kind = kind.strip().lower()
-        if self._kind not in _RESOURCE_FOR_KIND:
-            raise ValueError(
-                f"unsupported workload kind {kind!r}: expected one of "
-                f"{sorted(_RESOURCE_FOR_KIND)}"
-            )
-        self._resource = _RESOURCE_FOR_KIND[self._kind]
+        self._resource = _RESOURCE
         if client is not None:
             self._client = client
             return
@@ -109,18 +93,14 @@ class KubernetesBackend:
     def retire_victim(self, candidates: list[str]) -> str | None:
         """Which candidate a scale-down would really take (N51).
 
-        A **Deployment**'s pods are owned by a ReplicaSet, whose controller
-        reads the ``pod-deletion-cost`` :meth:`remove_node` sets -- so the loop's
-        own first choice is the pod that goes, and no API call is needed to say
-        so.
-
-        A **StatefulSet** shrinks from the top: ``spec.replicas - 1`` deletes
-        the highest ordinal, full stop. So the only node this backend may
-        retire is the top one, and only when the loop's candidate set contains
-        it -- otherwise the scale-down would kill a pod the loop never chose,
-        which on this fleet can be a worker holding live sandboxes. ``None``
-        then means "wait for the fleet to become shrinkable"; the loop retries
-        next interval.
+        A StatefulSet shrinks from the top: ``spec.replicas - 1`` deletes the
+        highest ordinal, full stop, and the ``pod-deletion-cost``
+        :meth:`remove_node` sets is ignored (that annotation is the ReplicaSet
+        controller's). So the only node this backend may retire is the top one,
+        and only when the loop's candidate set contains it -- otherwise the
+        scale-down would kill a pod the loop never chose, which on this fleet
+        can be a worker holding live sandboxes. ``None`` then means "wait for
+        the fleet to become shrinkable"; the loop retries next interval.
 
         The pod list is read from the API rather than derived from the naming
         rule, because what matters is which pods *exist*: a crashed ordinal
@@ -130,8 +110,6 @@ class KubernetesBackend:
         """
         if not candidates:
             return None
-        if self._kind != "statefulset":
-            return candidates[0]
         ordinals = self._statefulset_ordinals()
         if not ordinals:
             return None
@@ -184,9 +162,7 @@ class KubernetesBackend:
             headers={"Content-Type": "application/merge-patch+json"},
         )
         resp.raise_for_status()
-        logger.info(
-            "scaled %s %s to %s", self._kind, self._deployment, replicas
-        )
+        logger.info("scaled %s to %s", self._deployment, replicas)
 
     def remove_node(self, node_id: str) -> None:
         """Retire one specific pod: prefer deleting it on scale-down."""

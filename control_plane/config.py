@@ -474,17 +474,11 @@ class Settings:
     autoscaler_k8s_namespace: str = field(
         default_factory=lambda: os.getenv("E2B_AS_K8S_NAMESPACE", "default")
     )
-    #: The worker workload's *name*; the kind is the next field. (The name is
-    #: historical: it scales whichever workload ``autoscaler_k8s_kind`` names.)
+    #: The worker workload's name. The *kind* is not a knob any more: the repo
+    #: deploys a StatefulSet (stable pod names = stable node ids, N20), and the
+    #: pre-N20 Deployment branch went with `E2B_AS_K8S_KIND` on 2026-09-30.
     autoscaler_k8s_deployment: str = field(
         default_factory=lambda: os.getenv("E2B_AS_K8S_DEPLOYMENT", "e2b-worker")
-    )
-    #: ``deployment`` or ``statefulset``. The baseline runs the worker as a
-    #: StatefulSet so its node ids survive restarts (N20); a cluster still on
-    #: the older Deployment manifests selects ``deployment``. A value that is
-    #: neither is refused at startup rather than 404ing every tick.
-    autoscaler_k8s_kind: str = field(
-        default_factory=lambda: os.getenv("E2B_AS_K8S_KIND", "deployment")
     )
     redis_url: str | None = field(default_factory=lambda: os.getenv("E2B_REDIS_URL"))
     gateway_url: str | None = field(default_factory=lambda: os.getenv("E2B_GATEWAY_URL"))

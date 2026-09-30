@@ -426,11 +426,13 @@ def test_k8s_worker_is_a_statefulset_so_its_node_ids_survive_a_restart() -> None
     # StatefulSet, so leaving it behind would read as a guard that is not there.
     assert "    rollingUpdate:\n      maxSurge:" not in K8S_WORKER
     assert "\n  strategy:\n" not in K8S_WORKER
-    # The autoscaler has to scale the same kind, or it would 404 on every tick.
-    # It runs inside the control plane now (2026-09-30), so the kind it names is
-    # the one in *that* manifest -- still pinned against the StatefulSet above.
-    assert "name: E2B_AS_K8S_KIND\n" in K8S_CONTROL_PLANE
-    assert "value: statefulset\n" in K8S_CONTROL_PLANE
+    # The autoscaler scales *this* StatefulSet, and there is nothing left to
+    # name: the kind knob (`E2B_AS_K8S_KIND`) went with its Deployment branch on
+    # 2026-09-30 (open-issues N52), so the manifest has no second kind to be
+    # kept in step. Pinned as the absence of the *entry* -- a comment may name
+    # the retired knob to explain why it is gone -- so a future edit cannot
+    # reintroduce a value nobody runs.
+    assert "- name: E2B_AS_K8S_KIND" not in K8S_CONTROL_PLANE
 
 
 def test_k8s_control_plane_replicas_come_with_the_shape_that_makes_them_safe() -> None:
