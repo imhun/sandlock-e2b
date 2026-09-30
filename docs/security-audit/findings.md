@@ -617,3 +617,49 @@ sandlock 自己解析黑名单用的 `syscalls` crate —— worker 镜像没有
    "mount … 未放宽"。已在该 README 就地更正，并补上"同一个文件在不同引擎上对
    `caps:` 条件的解析不一致（`fsconfig` 一边被拒一边到内核）"这条实测 —— 结论是
    mount API 不能指望外层 profile 兜底，只能靠沙箱自己的黑名单。
+
+---
+
+## 2026-10-01 补测：kill 一族（信号）的实际边界（部署形态）
+
+第一档加固**刻意没有**把信号 familia 放进黑名单，这一节是"为什么"，实测于
+`0.1.0-824-gf2aec0b-20261001-073534`（k0s，`E2B_PID_NS=true`、
+`E2B_PER_SANDBOX_UID=true`、`E2B_REAL_ROOT=1`）。探针：
+`tmp/signal-probe/cross_sandbox_signal.py`、`tmp/signal-probe/inside_sandbox_blast.py`。
+
+**代码侧事实**：`kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`/`rt_tgsigqueueinfo`/
+`pidfd_send_signal` **既不在 `DEFAULT_BLOCKLIST_SYSCALLS`，也不在通知表**——沙箱对信号
+没有任何中介（`init/mod.rs` 顶部的注释写明：线上协议里**故意没有**按 pid 寻址的信号动词，
+只做实例级投递；"同类 uid 之间的 `kill(2)` 是内核边界，sandlock 不中介"）。
+
+**跨沙箱（A 拿 B 的 pid 打）**：全部够不到 ——
+
+| 从 A 发起 | 结果 |
+|---|---|
+| `kill(pidB, 0)` / `kill(pidB, SIGTERM)` / `tgkill(pidB,…)` | `ESRCH`（A 的 pid ns 里没有这个号） |
+| `pidfd_open(pidB)` | `ESRCH` |
+| 读 `/proc/pidB/status`、`/proc/pidB/cmdline` | `EACCES` |
+| `/proc` 里的数字目录数 | **0**（`ps` 都不存在） |
+| `kill(-1, 0)` / `kill(1, 0)` | `ok`，但只在本命名空间内 |
+
+**同沙箱内（自我杀伤半径）**：两条独立命令起的 `sleep`（pid 18/24），在第三条命令里
+`kill -9 -1` 之后**全部消失**，发起的命令自己也被杀（`exit_code=-1`），但**沙箱本身存活**
+（新命令照常执行、`is_running()=True`）——即沙箱的 PID 1 对来自命名空间内部的致命信号免疫，
+杀伤被关在自己租户里。这与 SECE-6/F1.7（每 child 独立进程组）是同一层结论。
+
+**结论与残留**：
+
+1. 部署形态下，"没禁"的代价是**仅限租户内的自伤** —— 跨租户/到宿主都够不到，边界由
+   **pid 命名空间 + 池化宿主 uid + procfs 虚拟化**三件事共同提供，而不是 seccomp。
+2. 换个形态就不同：`E2B_PID_NS=false` 时 `deploy/k8s/worker.yaml` 的注释已经写明代价 ——
+   沙箱能看到 pod 的 pid，`kill(pid, 0)` 对活进程答 `EPERM`、对死号答 `ESRCH`，
+   于是**存在性 oracle** 回来了（信息泄露）；若再叠上"共享宿主 uid"
+   （E5.1：非 root worker 无 agent，per-sandbox uid 自动关闭），内核 DAC 判定为同类 uid，
+   邻居就可以 `SIGKILL`/`SIGSTOP` 彼此，或用 `rt_sigqueueinfo`/`pidfd_send_signal` 注入
+   `siginfo` —— 那正是 C1 的 uid 池要消掉的东西。
+3. 因此这里正确的形态是"**别加黑名单，加边界**"：`kill`/`tgkill` 是承重载荷
+   （shell、`timeout`、`subprocess.kill`、glibc `pthread_cancel` 走 `tgkill`、Go/JVM
+   运行时投递信号），禁掉等于每个工作负载都坏。若将来真要策略化，必须是**中介整个
+   familia**（`kill`/`tkill`/`tgkill` + `rt_sigqueueinfo`/`rt_tgsigqueueinfo` +
+   `pidfd_send_signal`，必要时含 `pidfd_open`）—— 只给 `kill` 加 handler 会被另外四条
+   直接绕过，这正是本轮不动它的第二个理由。
