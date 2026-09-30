@@ -879,6 +879,27 @@ worker 侧的特权面并没有真的消失。**(d) 是唯一的例外，因为�
     的轮次（WARNING）打印。收口：`deploy/c3_agent/__main__._configure_logging` 逐条照抄两个
     兄弟入口（含未知级别回落 INFO），钉子 `tests/unit/test_c3_agent_logging.py`。
 
+16. **CP 收到 65534 在 `deploy/stack` 上打断了两条"靠 root 顺带成立"的依赖**（评审发现，
+    2026-09-30 已修，现场读数 `docs/deploy-clusters.md` §7.12）：
+    * **buildkit 的 unix socket**：rootless buildkitd 建出来的是 `srw-rw---- 1000:1000`，
+      k8s 那半靠 **pod 级 `fsGroup: 1000`** 拿组位（§13.6 的 B5 就是这么记的），compose 没有
+      `fsGroup` ⇒ 65534 的 CP 打开 socket 是 `PermissionError [Errno 13]`、`Template.build`
+      在该车道直接不可用。收口：`deploy/stack` 的 `control-plane` 加
+      `group_add: ["1000"]`（只有这个栈有 builder，另外两个栈加了就是白给一组组位，钉子
+      两个方向都写）；实测控制面自己的 `buildctl debug workers` 通、去掉那组就是
+      `connect: permission denied`。
+    * **TLS 配方**：`gen-tls-cert.sh` 写 `0600` 的 key，而 `./tls` 是只读挂给 65534 的 CP ⇒
+      uvicorn 在 `load_cert_chain` 就 `PermissionError [Errno 13]`、容器 restart-loop。
+      收口：配方**改模式**（证书与私钥都 `0644`），理由是这是**自签的本地验证**配方、跑它的
+      运维通常不是 root（`chown 65534` 做不到），而 k8s 那条同源交付是 `kubectl create secret
+      tls`，Secret 在 pod 内的默认模式本身就是 `0644`；生产不走这个脚本。实测：`0600` 时
+      CP `exit=1` / `restarts=6`，`0644` 时 `Uvicorn running on https://…`、`curl -k /healthz`
+      = 200、同端口明文 = 失败。
+    * 同批：compose 的 `image-cache-init` 补上 k8s `storage-init` 的能力集（`drop: [ALL]` +
+      `{CHOWN, DAC_OVERRIDE, FOWNER}`），并把缓存交棒的非递归形钉死（行为臂只覆盖卷存储，
+      看不到它）。两条都为"CP 零特权"服务：**CP 不再有 root 的 DAC_OVERRIDE 可以借**，
+      凡是它要读/要写的东西都得有一条不靠 root 的路径。
+
 ## 12. 结论
 
 - 读者目标的前半句「worker 不做任何特权操作」，**取决于 agent 放在哪一层**（§3.2）：
@@ -953,7 +974,7 @@ whose silent partial failure was indistinguishable from success."*
 | B2 | 快照 `copytree` / `rmtree` | `registry/snapshots.py:427,599,565` | 同上，是 CP 自己的树 |
 | B3 | 模板 build 目录、OCI tar | `api/templates.py:87,157,204,244,473` | 同上 |
 | B4 | secret 文件写入 | `registry/secrets.py` | 同上（**前提**：`_secrets` 的属主与 CP 一致；若要交给池 uid，则落回 A 类） |
-| B5 | 读 buildkit socket | pod 级 `fsGroup: 1000` | rootless buildkit 以 uid 1000 跑；**靠 fsGroup 就够，不需要 root** |
+| B5 | 读 buildkit socket | pod 级 `fsGroup: 1000` | rootless buildkit 以 uid 1000 跑；**靠 fsGroup 就够，不需要 root**。compose 车道没有 `fsGroup` ⇒ 等价物是给该服务加 `group_add: ["1000"]`（只有 `deploy/stack` 有 builder；2026-09-30 的评审就是漏了这一步，见 §11.2.1 第 16 条与 `docs/deploy-clusters.md` §7.12） |
 
 ⭐ **一条反转的现状**：上面这些目录**今天已经是 65534 属主，不是 root** —— C1 wave 2 的
 `deploy/scripts/migrate-state-owner.sh` 把 `PLATFORM_TARGETS` 那 8 条（`state`、
@@ -1183,6 +1204,10 @@ CP 的 uid（65534），CP 保留自己的 `mkdir` + `chmod 1777`。**
    `fsGroup: 1000` 给的**组位**（socket 由 rootless buildkitd 以 uid 1000 建在那个 emptyDir
    里）—— 从前 root 是靠 `CAP_DAC_OVERRIDE` 读的，现在 CP 是 65534，走的就是那条组位。
    socket 读不到时 `Template.build` 会直接失败（不是静默），所以这一格只需要有一条成功记录。
+   **compose 车道（2026-09-30 补）**：没有 pod 级 `fsGroup`，这一格靠 `deploy/stack` 的
+   `control-plane` 服务上的 `group_add: ["1000"]`；判据同样是"控制面自己的 `buildctl debug
+   workers` 通"，而不是"配置里写了组"（`docker exec -u 65534:65534` 会带上容器的 GroupAdd，
+   当不了反臂 —— 反臂要 `docker run -u 65534:65534` 且不加组）。
 
 6. 结果回填 `docs/deploy-clusters.md` §7（现状节 + 发版记录），与 §13.6 这张表逐项对照。
 

@@ -661,7 +661,9 @@ netns 灰度暴露 MCP 入站每请求 +390 ms，根因是 readiness 合成，fo
    **影响面**：每个卷 × 每个 worker 一条
    `cannot apply shared perms to volume root …: [Errno 1] Operation not permitted`
    WARNING（日志噪声）；**实测无功能影响**——卷根由控制面以 root 创建时就已经是
-   `1777`（`registry/volumes.py:191`），两个不同 uid 的沙箱仍都能写入同一卷。
+   `1777`（`registry/volumes.py:191`；当年那个创建者是 root，C3 Task 5 起控制面是 **65534**
+   —— 它仍以**属主**身份对自己的卷根 `chmod 1777`，所以这一句今天照样成立），两个不同 uid
+   的沙箱仍都能写入同一卷。
    **修法**：chmod 提到 chown 之前、且仅在 mode ≠ 1777 时才尝试；失败降级为 DEBUG，
    只有**最终** mode 仍不对才 WARNING（best-effort 语义不变，噪声消失、
    真故障仍会点名）。

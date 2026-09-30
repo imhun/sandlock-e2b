@@ -93,8 +93,9 @@ route-B 给了"每沙箱一个常驻 supervise 实例"之后，"`max_disk` 是�
 处置结果（口径见 `docs/production-deployment-requirements.md` §2.7）：生产形态把
 `E2B_IMAGE_CACHE_DIR` 显式指到共享卷 `/var/lib/e2b-sandboxes/_images`（compose 的
 worker-1/worker-2/control-plane 与 k8s 的 worker/control-plane 同源，且
-`E2B_IMAGE_CACHE_OWNER_UID=65534` 把缓存交给 worker uid，使 root 控制面与 65534 worker
-都能写、沙箱 uid 只能读；清单里的 `image-cache-init` 还会**校验**目录确实归 65534，不合格
+`E2B_IMAGE_CACHE_OWNER_UID=65534` 把缓存交给 worker uid，使 65534 的控制面与 65534 的 worker
+都能写、沙箱 uid 只能读 —— C3 Task 5 之前这两侧是"root 控制面 + 65534 worker"，现在都是
+65534；清单里的 `image-cache-init` 还会**校验**目录确实归 65534，不合格
 就失败并打印 `chown -R 65534:65534` 那条一次性修复）；因为 `_images` 属于
 **project 0（无限额）**，容量上界由解析器自己的按量 GC 承担（`E2B_IMAGE_CACHE_MAX_BYTES`，
 **默认不限、生产清单显式设 4 GiB**）——**没有**给 `_images` 单独建 project。

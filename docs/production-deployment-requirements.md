@@ -1382,13 +1382,15 @@ E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worke
   放进 workspace base **不会**被当成沙箱树（不会被 GC 扫成孤儿、不会进配额扫描）。
   解析器自己写的东西（`<image-slug>.lock`、`.…tmp-*` 暂存树）都落在 `_images/` **里面**，
   workspace base 顶层不新增任何名字（有单测钉住，见 2.7.5）。
-- **两个 uid 共享同一个 `_images`（必须设 `E2B_IMAGE_CACHE_OWNER_UID`）**：两套清单里
-  **控制面跑 root、worker 跑 65534**（k8s 的 worker pod 继承镜像的 `USER 65534:65534`，
-  控制面 pod 覆盖镜像的 root），而两者指向同一个目录。**C3 Task 5 之后 k8s 这一半变了**：
-  控制面主容器是 **65534**（`deploy/k8s/control-plane.yaml`，D24），于是它和 worker 是同一个
-  uid、"谁先建"不再是问题；compose 那两条栈仍是 root 控制面（记账项，见
-  `docs/deploy-clusters.md` §7.7）。下面这段是 root 控制面形态下的实测，仍然适用于 compose。
-  第一版就死在这里：root 先跑
+- **同一个 `_images` 由两个身份共享（`E2B_IMAGE_CACHE_OWNER_UID` 仍必须设）**：控制面与
+  worker 指向同一个目录，历史上是"**控制面跑 root、worker 跑 65534**"（k8s 的 worker pod 继承
+  镜像的 `USER 65534:65534`，控制面 pod 覆盖镜像的 root）。**C3 Task 5 起两边都是 65534**：
+  k8s 是 `deploy/k8s/control-plane.yaml` 的 `runAsUser/runAsGroup: 65534`（D24），三个 compose
+  栈是 `control-plane` 服务上的 `user: "65534:65534"`（`feat/c3-compose-gaps`，见
+  `docs/deploy-clusters.md` §7.11），于是"谁先建"不再是身份问题。
+  ⚠ **下面这段实测是 root 控制面时代（2026-09-13）的取证**：它的结论仍然决定今天的形态
+  （缓存必须归 worker uid、两套清单都必须有那次 init 交棒），但"root 先跑 / root 会 chown"这类
+  句子读作历史 —— 那个身份在**任何**车道上都已不存在。第一版就死在这里：root 先跑
   （不配 registry 时控制面导出模板 tar，**必然** root 先建 `_images`）⇒ `_images` 是
   `root:root 0755`，worker 连 `<image>.lock` 与暂存树都建不出来（`PermissionError` ⇒
   该镜像解析全量失败）；反向同理（哪一方先建了 `0600` 的锁文件，另一方**永远**打不开，
@@ -1402,20 +1404,23 @@ E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worke
   | 沙箱 uid（池内 10000+） | — | 只有 `r-x` | **一个字节都写不了** |
 
   解析器每次创建目录/文件都执行这条契约：`_ensure_shared_dir()` 建目录后强制 `0755`，
-  并以 root 身份把它 `chown` 给**缓存 owner**（也就是 worker uid，和
+  并在 `euid == 0` 时把它 `chown` 给**缓存 owner**（也就是 worker uid，和
   `deploy/scripts/upgrade.sh` 对卷根做的那次 `chown -R 65534` 同一个身份；
   `E2B_IMAGE_CACHE_OWNER_UID` 未设时取最近的**非 root 祖先**的 owner，即卷根
-  `/var/lib/e2b-sandboxes`）。root 进程发布条目时，整棵 rootfs 也会被交给该 uid
+  `/var/lib/e2b-sandboxes`）。⚠ 这一支今天不会触发：控制面自己就是 65534，
+  "**控制面是属主**，不需要 `CAP_CHOWN` 也不需要 DAC_OVERRIDE"（见 §13.6③）。
+  该 uid 发布条目时，整棵 rootfs 也会被交给缓存 owner
   （`lchown`，不跟随镜像里的符号链接）——否则 worker 之后写不进
   `<rootfs>/workspace` 与 MITM CA 文件（`sandlock.py` 的既有路径），那也是一种"被锁死"。
 
-  **谁先碰到缓存、以及谁有权改它（2026-09-13 实测，别把它当成"控制面会自愈"）**：
+  **谁先碰到缓存、以及谁有权改它**（2026-09-13 实测，**root 控制面时代的取证** ——
+  它解释的是今天那次 init 交棒为什么必须存在；别把它当成"控制面会自愈"）：
 
   | 路径 | 会不会把 `_images` 修回 worker uid |
   |---|---|
-  | 控制面导出模板 tar（`control_plane/api/templates.py`，`parent.mkdir(parents=True, exist_ok=True)` + `buildctl` 写文件） | **不会**。它不经过解析器，也不做 chown ⇒ 在空卷上**必然**留下 `root:root 0755` 的 `_images`（探针 `tmp/zf7tail-hints.log` 的 prep 就是照这条路径造的） |
+  | 控制面导出模板 tar（`control_plane/api/templates.py`，`parent.mkdir(parents=True, exist_ok=True)` + `buildctl` 写文件） | **不会**。它不经过解析器，也不做 chown ⇒ 在空卷上**必然**留下 `root:root 0755` 的 `_images`（探针 `tmp/zf7tail-hints.log` 的 prep 就是照这条路径造的；当年那个"root"就是控制面本身，今天由 `image-cache-init` 的交棒接替） |
   | 控制面的 Settings（`control_plane/config.py`） | **不会**。它只是 `Path(os.getenv(...)).resolve()`，没有 `ensure_shared_cache_dir()` 这道准备逻辑（只有 `envd_service/config.py` 里那一处调用它，那是 worker 侧） |
-  | root 身份跑解析器（控制面本地解析 registry 镜像） | **会**。`_ensure_shared_dir()` 在 `euid==0` 时把目录 `chown` 给缓存 owner；探针实测：root 解析一次后 `_images`、`_oci`、条目、`<rootfs>`、`.link` 全部变成 `65534`，随后 worker 复用同一 Inode 并在里面建挂载点（`tmp/zf7tail-hints.log` h2/h3） |
+  | root 身份跑解析器（当年控制面本地解析 registry 镜像） | **会**（**只在 euid==0 时**）。`_ensure_shared_dir()` 在 `euid==0` 时把目录 `chown` 给缓存 owner；探针实测：root 解析一次后 `_images`、`_oci`、条目、`<rootfs>`、`.link` 全部变成 `65534`，随后 worker 复用同一 Inode 并在里面建挂载点（`tmp/zf7tail-hints.log` h2/h3）。今天两侧都是 65534 ⇒ 这一格没有触发者 |
   | worker（65534）跑解析器 | **不能**。非 root 没有 `CAP_CHOWN`，`mkdir(exist_ok=True)` 对已存在的目录静默成功 ⇒ 碰到别人拥有的 `_images` 只能报错 |
 
   所以"root 侧下一次解析会自愈"只在**那条解析路径**上成立；单机无 registry 形态下恰恰是
@@ -1434,7 +1439,11 @@ E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worke
   明确报错"的分界（实测 5 种形态，见 `tmp/zf7tail-init-behaviour.log`）。**C3 Task 5 起
   k8s 的这份 init 不再在控制面 pod 里**：同一个脚本、同一个校验，搬到了 agent DaemonSet 的
   `storage-init`（`deploy/k8s/c3-agent.yaml`，它同时做 `_volumes` 的非递归交棒 —— 裁定 D24）；
-  compose 的那份仍是独立服务 `image-cache-init`：
+  compose 的那份仍是独立服务 `image-cache-init`，并且在 `feat/c3-compose-gaps` 之后与 k8s
+  逐条对齐：同样的 D24 卷存储交棒、同样的平台命名空间交棒，以及同样的能力集
+  （`drop: [ALL]` + `{CHOWN, DAC_OVERRIDE, FOWNER}` —— 三条都是量出来的，
+  见 `docs/deploy-clusters.md` §7.11/§7.12）；缓存目录本身也从 `chown -R` 改成
+  "目录非递归 + 只有 `_oci/` 递归 + `secrets/` 只动目录"（`*.secret` 是活沙箱的文件）：
 
   | 形态 | 结果 |
   |---|---|
@@ -1662,10 +1671,12 @@ E2B_IMAGE_CACHE_OWNER_UID: "65534"                             # 缓存归 worke
    `E2B_IMAGE_CACHE_OWNER_UID` **逐字同值**；
 2. 宿主上 `ls /var/lib/e2b-sandboxes/_images` 有 `_oci/` 与 `<image>-<digest>/rootfs/.complete`，
    且 `up -d` 重建后**不重新解压**（`grep "resolved base image" tmp/*.log` 不再出现同一条）；
-3. **两个 uid 各跑一次解析都成功**：控制面（root）先跑一次、worker（`docker exec -u
-   65534:65534`）再跑一次同一镜像，两边都拿到 `rootfs/.complete`，且 worker 能在该条目里
-   写（`mkdir <entry>/rootfs/workspace`）；反向顺序同样成立（探针
-   `tmp/zf7fix-uid.log`）；
+3. **两个身份各跑一次解析都成功**（**历史臂**，保留为"init 交棒有没有生效"的反向检查）：
+   该清单是在"控制面 root / worker 65534"那两个身份下写的 —— 控制面（当年是 root）先跑一次、
+   worker（`docker exec -u 65534:65534`）再跑一次同一镜像，两边都拿到 `rootfs/.complete`，且
+   worker 能在该条目里写（`mkdir <entry>/rootfs/workspace`）；反向顺序同样成立（探针
+   `tmp/zf7fix-uid.log`）。C3 Task 5 起两个身份**都是 65534**，所以今天这一格读作：控制面
+   （`docker exec -u 65534:65534`）与 worker 都能解析同一镜像，且 `_images` 仍归 65534；
 4. **沙箱 uid 写不进缓存**：以池内 uid（如 10001）尝试在 `_images`、`_oci`、条目 rootfs
    里建/改文件必须 `Permission denied`（探针 `tmp/zf7fix-uid.log`）；
 5. `du -s --block-size=1 /var/lib/e2b-sandboxes/_images`（**不是** `du -sb`，两个口径不等，
