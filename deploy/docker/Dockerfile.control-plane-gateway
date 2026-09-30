@@ -36,8 +36,11 @@ COPY envd_service/ envd_service/
 # root:root and every worker provision then fails with EACCES on
 # ``<workspace>/<sandbox-id>`` (measured; ``upgrade.sh`` can only repair it on
 # an existing host). Pre-creating the directory owned by 65534 makes a fresh
-# ``docker compose up`` work; the control plane itself runs as root and is
-# unaffected by the ownership.
+# ``docker compose up`` work. C3 Task 5: the control plane **is** that uid now
+# (every compose stack sets `user: "65534:65534"` on it, the k8s Deployment
+# `runAsUser/runAsGroup: 65534`), so this line is no longer just "make the
+# volume safe for the workers" -- it is the directory the CP itself creates its
+# own top-level names in.
 ENV E2B_WORKSPACE_BASE=/var/lib/e2b-sandboxes
 RUN mkdir -p /var/lib/e2b-sandboxes && chown 65534:65534 /var/lib/e2b-sandboxes
 EXPOSE 3000

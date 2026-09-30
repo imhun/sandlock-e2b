@@ -24,10 +24,14 @@ services:
   # docs/production-deployment-requirements.md.
   #
   # C3 Task 5 (D24) / the compose gaps: this service is also the compose lane's
-  # home for the ownership jobs the **k8s** control-plane pod's init containers
-  # do (`deploy/k8s/c3-agent.yaml`: `storage-init` ① ② and
-  # `workspace-root-init`), because the control plane below now runs as **uid
-  # 65534** and every directory it writes has to belong to that uid first:
+  # home for the ownership jobs the **k8s agent DaemonSet's** init containers do
+  # (`deploy/k8s/c3-agent.yaml`: `storage-init` ① ② and `workspace-root-init`)
+  # -- the *control-plane* pod deliberately carries **no** init container since
+  # C3 Task 5; those jobs moved to the agent's pod because it is the component
+  # that already holds the root file face, and compose has no pod to put them in
+  # so they land in this separate root one-shot. They are needed because the
+  # control plane below now runs as **uid 65534** and every directory it writes
+  # has to belong to that uid first:
   #
   #   * `CACHE_DIRS` -- the shared image cache. Handed over non-recursively, with
   #     only `_oci/` recursive and `secrets/` directories-only, exactly as
@@ -49,6 +53,21 @@ services:
   image-cache-init:
     image: ${WORKER_IMAGE}
     user: "0:0"
+    # Same capability parity as the k8s sibling (`c3-agent.yaml`'s
+    # `storage-init`): root with `drop: [ALL]` + exactly the three verbs this
+    # script uses. The three are *measured*, not copied by analogy (round-1
+    # review, and §13.6's ④ note): `CHOWN` is the hand-over itself;
+    # `DAC_OVERRIDE` is `mkdir -p "<dir>/_oci"` / `mkdir -p "<owned dir>"` on
+    # the idempotent re-run (EACCES with only CHOWN+FOWNER); `FOWNER` is
+    # `chmod`/`chown` on a directory this process does not own. Without the drop
+    # this container carried the runtime's default 14-capability set (it is the
+    # one place in the stack that still did).
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |-

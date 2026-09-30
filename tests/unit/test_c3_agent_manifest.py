@@ -772,6 +772,45 @@ def test_each_compose_stack_runs_exactly_one_agent_facing_the_control_plane() ->
         )
 
 
+def test_every_compose_record_store_is_wired_with_one_password() -> None:
+    """The CP's `E2B_REDIS_URL` password *is* the server's `--requirepass`.
+
+    Two independently-pinned literals could disagree and every assertion would
+    still pass while the control plane could never authenticate -- and with the
+    multinode stack's scan turned on, that failure is the self-heal going quiet
+    rather than a startup error. So the password is read out of the one place
+    the server takes it and required to appear, verbatim, in the client URL and
+    in the healthcheck that keeps `depends_on: service_healthy` honest.
+    """
+    for path in COMPOSE_STACKS:
+        services = _compose(path)["services"]
+        redis = services["redis"]
+        command = redis["command"]
+        assert command[:2] == ["redis-server", "--appendonly"], path.name
+        assert command[2] == "yes", path.name
+        assert command[3] == "--requirepass", path.name
+        password = command[4]
+        # The two spellings the stacks use (the production example carries a
+        # local default, the target-host stack requires the operator's value);
+        # whichever one a stack picks, all three sites must repeat it verbatim.
+        assert password in (
+            "${E2B_REDIS_PASSWORD:-local-redis-password}",
+            "${E2B_REDIS_PASSWORD}",
+        ), (path.name, password)
+        assert redis["healthcheck"]["test"] == [
+            "CMD",
+            "redis-cli",
+            "-a",
+            password,
+            "--no-auth-warning",
+            "ping",
+        ], path.name
+        cp_env = _compose_env(services["control-plane"])
+        assert cp_env["E2B_REDIS_URL"] == (
+            f"redis://:{password}@redis:6379/0"
+        ), (path.name, cp_env["E2B_REDIS_URL"])
+
+
 def test_the_compose_control_plane_dials_the_agent_by_service_name() -> None:
     """D14 + D22: the CP is pointed at both service names, token and all."""
     for path in COMPOSE_STACKS:
@@ -841,6 +880,38 @@ IMAGE_DEFAULT_USER_SERVICES = {
     "deploy/stack/docker-compose.prod.yml": {"buildkit", "redis", "quota-agent"},
 }
 
+#: Every service that declares a `user:`, by stack. Exact on purpose: a new
+#: service has to be added here (with a decision about its uid) rather than
+#: slipping in under a subset check.
+DECLARED_USERS = {
+    "deploy/compose/docker-compose.prod.yml": {
+        "image-cache-init": "0:0",
+        "control-plane": "65534:65534",
+        "c3-agent": "65534:65534",
+        "c3-agent-maint": "0:0",
+        "worker-1": "65534:65534",
+        "worker-2": "65534:65534",
+        "worker-3": "65534:65534",
+    },
+    "deploy/compose/docker-compose.multinode.yml": {
+        "image-cache-init": "0:0",
+        "control-plane": "65534:65534",
+        "c3-agent": "65534:65534",
+        "c3-agent-maint": "0:0",
+        "worker-1": "65534:65534",
+        "worker-2": "65534:65534",
+        "worker-3": "65534:65534",
+    },
+    "deploy/stack/docker-compose.prod.yml": {
+        "image-cache-init": "0:0",
+        "control-plane": "65534:65534",
+        "c3-agent": "65534:65534",
+        "c3-agent-maint": "0:0",
+        "worker-1": "65534:65534",
+        "worker-2": "65534:65534",
+    },
+}
+
 
 def test_every_compose_control_plane_runs_as_the_worker_uid() -> None:
     """Gap 1: the compose control planes reach the k8s posture (Task 5).
@@ -864,12 +935,12 @@ def test_every_compose_control_plane_runs_as_the_worker_uid() -> None:
         assert services["control-plane"]["user"] == "65534:65534", path.name
         root = {n for n, s in services.items() if s.get("user") == "0:0"}
         assert root == {"image-cache-init", "c3-agent-maint"}, (path.name, root)
+        key = path.relative_to(REPO).as_posix()
         declared = {n: s["user"] for n, s in services.items() if "user" in s}
-        assert set(declared.values()) <= {"65534:65534", "0:0"}, (path.name, declared)
+        assert declared == DECLARED_USERS[key], (path.name, declared)
         default_user = {n for n, s in services.items() if "user" not in s}
         # Both `deploy/compose` and `deploy/stack` ship a `docker-compose.prod.yml`,
         # so the key is the path inside the repo, not the file name.
-        key = path.relative_to(REPO).as_posix()
         expected = IMAGE_DEFAULT_USER_SERVICES[key]
         assert default_user == expected, (path.name, default_user, expected)
         # The two agent faces keep the uids/caps D22 settled: this change is
@@ -883,6 +954,30 @@ def test_every_compose_control_plane_runs_as_the_worker_uid() -> None:
         ], path.name
         for face in ("c3-agent", "c3-agent-maint"):
             assert services[face]["cap_drop"] == ["ALL"], (path.name, face)
+
+
+def test_only_the_stack_lane_joins_the_builders_group() -> None:
+    """Review item 1: `deploy/stack`'s CP needs the builder's group; the rest do not.
+
+    Rootless buildkitd creates its unix socket `srw-rw---- 1000:1000`, and the
+    control plane opens it for `Template.build`. The k8s arm gets the group from
+    the pod-level `fsGroup: 1000` (§13.6's B5); compose has no `fsGroup`, so the
+    *service* carries it. Only the stack shape ships a builder (its
+    `buildkit` service, mounting `buildkit-data` into the CP at `/run/buildkit`
+    read-only), so the other two stacks must **not** grow the group: a group
+    nobody needs is exactly the kind of widening this file exists to catch.
+    Measured both ways in `docs/deploy-clusters.md` §7.12.
+    """
+    stack = _compose(COMPOSE_STACK)["services"]
+    assert stack["buildkit"]["image"] == "moby/buildkit:rootless"
+    assert stack["buildkit"].get("user") is None  # image default: uid 1000
+    assert stack["control-plane"]["group_add"] == ["1000"]
+    mounts = stack["control-plane"]["volumes"]
+    assert "buildkit-data:/run/buildkit:ro" in mounts, mounts
+    for path in (COMPOSE_PROD, COMPOSE_MULTINODE):
+        services = _compose(path)["services"]
+        assert "buildkit" not in services, path.name
+        assert "group_add" not in services["control-plane"], path.name
 
 
 def test_the_compose_agent_channel_is_a_network_no_worker_joins() -> None:
@@ -912,10 +1007,13 @@ def test_the_compose_agent_channel_is_a_network_no_worker_joins() -> None:
         workers = [name for name in services if name.startswith("worker")]
         assert workers, path.name
         for name in workers:
-            assert AGENT_NETWORK not in (services[name].get("networks") or []), (
-                path.name,
-                name,
-            )
+            # Each worker stays on the channel the control plane serves it from
+            # -- the project's own network, where the CP has an address. Missing
+            # the key means the same thing (compose attaches such a service to
+            # `default`); naming anything else, or naming `agent-plane`, is the
+            # regression.
+            declared = services[name].get("networks") or ["default"]
+            assert declared == ["default"], (path.name, name, declared)
         # The property is *named* where a reader looks for it, and the agent's
         # own outbound (the self-heal report to the control plane) stays inside
         # the pair -- `internal: true` is what closes the third direction the

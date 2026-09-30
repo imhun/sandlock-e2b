@@ -16,11 +16,14 @@ services:
   # whatever path the same volume is mounted at in this container.
   #
   # C3 Task 5 (D24) + the compose gaps: this service is also the compose lane's
-  # home for the ownership jobs the **k8s** control-plane pod's init containers
-  # do (`deploy/k8s/c3-agent.yaml`: `storage-init` ① ② and
-  # `workspace-root-init`). The control plane in this file now runs as **uid
-  # 65534**, so every directory it writes has to *belong* to that uid before it
-  # starts -- the hand-over cannot be skipped, only moved:
+  # home for the ownership jobs the **k8s agent DaemonSet's** init containers do
+  # (`deploy/k8s/c3-agent.yaml`: `storage-init` ① ② and `workspace-root-init`)
+  # -- the *control-plane* pod deliberately carries **no** init container since
+  # C3 Task 5 (those jobs moved to the agent's pod, the component that already
+  # holds the root file face; compose has no pod, so they land in this separate
+  # root one-shot). The control plane in this file now runs as **uid 65534**, so
+  # every directory it writes has to *belong* to that uid before it starts --
+  # the hand-over cannot be skipped, only moved:
   #
   #   * `CACHE_DIRS` -- the image caches. The cache's own directory is handed
   #     over **non-recursively** and only `_oci/` recursively, exactly as
@@ -45,6 +48,21 @@ services:
   image-cache-init:
     image: ${WORKER_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-worker:0.1.0}
     user: "0:0"
+    # Same capability parity as the k8s sibling (`c3-agent.yaml`'s
+    # `storage-init`): root with `drop: [ALL]` + exactly the three verbs this
+    # script uses. The three are *measured*, not copied by analogy (round-1
+    # review, and §13.6's ④ note): `CHOWN` is the hand-over itself;
+    # `DAC_OVERRIDE` is `mkdir -p "<dir>/_oci"` / `mkdir -p "<owned dir>"` on
+    # the idempotent re-run (EACCES with only CHOWN+FOWNER); `FOWNER` is
+    # `chmod`/`chown` on a directory this process does not own. Without the drop
+    # this container carried the runtime's default 14-capability set (it is the
+    # one place in the stack that still did).
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |-
@@ -196,8 +214,14 @@ services:
     # it: the platform's own directories are 65534, `.uid_pool.lock` is
     # `65534:65534 0600` (another uid cannot even open it), and the image cache
     # owner is 65534 (another uid would lock itself out of what it creates).
-    # Everything it needs to *own* is prepared by `image-cache-init` above, which
-    # is also where the D24 volume-store hand-over lives.
+    # What it needs to *own* is prepared by `image-cache-init` above, which is
+    # also where the D24 volume-store hand-over lives -- namely the platform's
+    # top-level namespaces (`_builds`/`_secrets`/`_snapshots`/`_templates`/
+    # `_volumes`), the two the tree root carries (`_migrate`, and the workers'
+    # `_snapshots`) and the writable root itself. Not every path the CP writes is
+    # covered by that: `state`-shaped names it creates *under* the writable root
+    # (`_runtime/<id>`, `.uid_pool.lock`, `.route-b/`) are made by the CP as the
+    # root's owner, which is why the root itself is part of the hand-over.
     user: "65534:65534"
     depends_on:
       image-cache-init:
