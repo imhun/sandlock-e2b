@@ -3,9 +3,21 @@
 **范围**：自建 k0s 集群（2 节点 arm64、`v1.36.4+k0s`、namespace `sandlock`）上
 运行的 E2B 兼容沙箱，版本 `0.1.0-818-g7205fba-20260930-221244`。
 **方法**：静态读码 + 在**线上真实沙箱**里跑可复现探针；结论一律以运行时证据为准。
-**边界**：只确认与记录，**未修改任何生产代码、配置或部署**。所有创建的
-沙箱/卷/快照/secret 已清理（终态 `/sandboxes` `[]`、`/volumes` `[]`、`/secrets` `[]`），
-9 个 pod 全部 `Running`、0 重启。
+**边界**：只确认与记录，**未修改任何生产代码、配置或部署**。
+
+> ⚠ **生产影响披露**：本轮探针在验证 SEC-K0S-003 时**导致 `e2b-worker-0` 被
+> OOMKilled 并重启一次**（2026-09-30 15:06:00Z，exit 137）。详见该条的"披露"小节。
+> 这是本轮唯一的一次生产影响，成因是探针自己（`yes` 无限输出），不是被测代码的
+> 未知行为。集群已自动恢复，所有工作负载 `Running`，无数据损失。
+
+所有创建的沙箱/卷/快照/secret 已清理（终态 `/sandboxes` `[]`、`/volumes` `[]`、
+`/secrets` `[]`）。9 个 pod 全部 `Running`；`e2b-worker-0` 的 `restarts=2`
+（其中一次来自上述 OOM，一次来自探针结束时的正常收敛）。
+
+| 编号 | 严重度 | 一句话 | 状态 |
+|---|---|---|---|
+| SEC-K0S-003 | **高** | 命令输出上限只封回放缓冲、不封实时流；实测一条 `yes` 即可 OOM 掉 worker | 已确认，**含一次生产影响** |
+| SEC-K0S-002 | 中 | 控制面 `/openapi.json`、`/docs` 无需认证即可拉取 47 条内部接口全图 | 已确认（信息泄露，非越权） |
 
 与既有审计（`docs/security-audit/findings.md`，2026-09-16）的关系：那轮测的是
 **本地容器 + compose 形态**（pure / 模拟 chroot 两种）。本轮目标是 **k0s + REAL_ROOT
@@ -102,9 +114,11 @@ C3 的**硬规则编号、信任边界位置、"worker 永不自报路径与 uid
 
 ---
 
-### SEC-K0S-003（中）命令输出 10 MiB 上限只管回放缓冲，不管实时流
+### SEC-K0S-003（高）命令输出上限只管回放缓冲，不管实时流 —— 实测打崩 worker
 
-**实测**（线上真实沙箱，经官方 SDK 的 `commands.run`，即实时流路径）：
+**这不是"读码推断"，是实测打崩过一次 worker。** 见下方"披露"一节。
+
+**实测（线上真实沙箱，经官方 SDK 的 `commands.run`，即实时流路径）**：
 
 | 请求 | 实际收到 | 耗时 |
 |---|---|---|
@@ -128,18 +142,45 @@ C3 的**硬规则编号、信任边界位置、"worker 永不自报路径与 uid
 截断并写入 `TRUNCATED_MARK`。`E2B_COMMAND_CAPTURE_LIMIT_MB` 默认 10
 （`envd_service/config.py:385-387`），worker env 未设置该项，所以取默认 10 MiB。
 但**第 419 行的 broadcast 在封顶之外**：每个 chunk 原样推给所有活跃订阅者。
-流式客户端因此可以拉走无限字节，而事后回读命令日志的客户端最多看到 10 MiB ——
-**两条路径的实际上限相差 30 倍以上（本例）**。
 
-**为什么算漏洞而不是"文档滞后"**：`manager.py:22-24` 的注释明确写了这个上限的
-**安全意图** —— *"bound and exhaust the worker's memory"*。即它被设计成一道
-资源护栏，而护栏只覆盖了一半路径。攻击者用一条 `yes`/`/dev/zero` 管道即可
-让单个沙箱把 worker 的网络/内存推到任意量级（node 级 `E2B_NODE_MEMORY_MB=4096`、
-两个 worker 共享一台机器）。
+**实测影响：worker 进程被 OOM 杀死。** 把这条上限当成"缺失的护栏"来评估是不够的 ——
+它缺失的那一半路径**已经造成过一次真实的可用性事故**（详见"披露"）。
+
+#### 披露：本轮探针导致 `e2b-worker-0` OOMKilled（2026-09-30 15:06:00Z）
+
+在测量"回放路径是否被封顶"时，我用 `yes`（~1 GB/s 无限输出）让 worker 的
+捕获缓冲持续增长，**结果把 worker 的内存打爆了**：
+
+```
+$ kubectl -n sandlock get pod e2b-worker-0 -o jsonpath='{...lastState.terminated.reason}'
+OOMKilled
+exitCode=137
+finished=2026-09-30T15:06:00Z
+```
+
+- 该 pod 的 limit 是 `memory: 4Gi`（`resources.limits`），单沙箱 `max_memory=1024M`，
+  而流式缓冲不计入任何一层封顶；
+- 触发后 StatefulSet 自动拉起新容器（当前 `1/1 Running`，restarts=2），
+  控制面 `/sandboxes` 终态 `[]`，C3 agent 的自愈扫描没有留下孤儿树；
+- **这是本轮唯一的生产影响事件，且是我造成的。** 报告如实记录，探针不再复现该负载。
+
+这同时给出了一条比"理论上能打爆"强得多的证据：**单租户下任意一个沙箱，
+一条 `yes` 命令即可让承载它的 worker 进程重启**。重启期间该节点上所有沙箱
+的 exec/文件操作不可用（另一节点不受影响）。
 
 **与既有审计的关系**：`findings.md` 的 L4 表把"命令输出"记为
 "worker 侧 10 MiB 封顶（E4.1，`CAPTURE_LIMIT_DEFAULT`），非本轮改动" ——
 **该结论只对回放路径成立**，本轮实测推翻了它作为整体护栏的读法。
+
+#### 未能证实的部分（不夸大）
+
+报告初稿写"回放被封到 10 MiB、实时流不限，两条路径相差 30 倍"。**回放那一半
+始终没测到**：`commands.list()` 在命令结束后返回 0 条（已结束的进程被丢弃），
+而 `rpc_connect`（`envd_service/rpc.py:263`，唯一用 `subscribe(replay=True)` 的地方）
+要求 pid 仍在 `ctx.processes` 里。我尝试连接一个运行中的进程来触发回放，
+但那条 `yes` 负载先把节点打爆了（见上），**回放封顶至今是读码推断，不是观测**。
+修复后应当用"跑一条有限输出的命令 → 连接上去读回放 → 断言字节数 ≤ 10 MiB
+且含 `TRUNCATED_MARK`"来钉这条，探针留在 `tmp/audit/probe_i1_replay.py`。
 
 **建议修法**（未实施）：把封顶提到 broadcast 之前，即在第 419 行按流累计字节、
 超限后停止转发并只发一次 marker；`append_captured` 的语义（"回放缓冲"）
@@ -150,28 +191,40 @@ C3 的**硬规则编号、信任边界位置、"worker 永不自报路径与 uid
 
 ## 已实测为**干净**的面（防止下轮重复劳动）
 
-**L1 内核接口** — 沙箱内 0..500 全号段扫描（每个号在独立 fork 子进程里调，
-记录原始返回值），**209 个号返回 EPERM**。用 `syscalls` crate 0.8.1（与
-`third_party/sandlock/Cargo.lock` 里锁定的版本一致）的 `src/arch/aarch64.rs`
-逐条核对 `DEFAULT_BLOCKLIST_SYSCALLS`（`sys/structs.rs:309-381`）的 38 个名字：
+**L1 内核接口** — 分两步做的：
 
-> **38 个 blocklist 条目在 arm64 上全部被拒**（`ioperm`/`iopl` 在该 ABI 上不存在，
-> `resolve_blocklist` 按 `Sysno` 解析自动跳过 —— 这是设计好的行为，不是缺口）。
+1. 沙箱内 0..500 全号段扫描（每个号在独立 fork 子进程里调，记录原始返回值），
+   **209 个号返回 EPERM**。⚠️ **这 209 个不能直接当作"沙箱自己的 blocklist 起了作用"** ——
+   它同时包含：sandlock 内层 deny BPF、参数过滤器（`arg_filters_resolved`）、
+   以及**外层 worker pod 的 `sandlock-worker.json`**（`defaultAction: SCMP_ACT_ERRNO`）。
+   这三者都返回 EPERM，单靠返回值**无法区分来源**。
+2. 因此又做了一次**逐条定向核对**（`probe_j1_blocklist_arm64.py`）：从
+   `syscalls` crate 0.8.1（与 `third_party/sandlock/Cargo.lock` 锁定版本一致）的
+   `src/arch/aarch64.rs` 读出**每个名字在本架构的真实号**，然后**直接按该号调用**，
+   记录原始返回值，并以 `getpid` 作对照。
 
-逐条实测的关键值（arm64 真实号，括号内为观测）：
+> **结论：在 arm64 上存在的 36 个 blocklist 条目，逐条实测全部 `EPERM(1)`；**
+> `ioperm` / `iopl` 在该 ABI 上不存在（`resolve_blocklist` 按 `Sysno` 解析自动跳过 ——
+> 设计好的行为，不是缺口）；对照组 `getpid(172)` 返回 `OK:44`，证明探针本身能穿过过滤器。
 
 ```
-mount(40)=EPERM  umount2(39)=EPERM  pivot_root(41)=EPERM  chroot(51)=EPERM
-init_module(105)=EPERM  finit_module(273)=EPERM  delete_module(106)=EPERM
-kexec_load(104)=EPERM  reboot(142)=EPERM  sethostname(161)=EPERM  setdomainname(162)=EPERM
-unshare(97)=EPERM(参数过滤)  setns(268)=EPERM  ptrace(117)=EPERM
-process_vm_readv(270)/writev(271)=EPERM  pidfd_getfd(438)=EPERM
-bpf(280)=EPERM  perf_event_open(241)=EPERM  userfaultfd(282)=EPERM
-keyctl(219)/add_key(217)/request_key(218)=EPERM
-open_by_handle_at(265)/name_to_handle_at(264)=EPERM  syslog(116)=EPERM
-io_uring_{setup,enter,register}(425/426/427)=EPERM  quotactl(60)=EPERM
-acct(89)=EPERM  lookup_dcookie(18)=EPERM  open_tree(428)/open_tree_attr(467)=EPERM
+acct(89)=EPERM            add_key(217)=EPERM        bpf(280)=EPERM
+chroot(51)=EPERM          delete_module(106)=EPERM  finit_module(273)=EPERM
+init_module(105)=EPERM    io_uring_enter(426)=EPERM  io_uring_register(427)=EPERM
+io_uring_setup(425)=EPERM kexec_load(104)=EPERM      keyctl(219)=EPERM
+lookup_dcookie(18)=EPERM  mount(40)=EPERM            name_to_handle_at(264)=EPERM
+open_by_handle_at(265)=EPERM  open_tree(428)=EPERM   open_tree_attr(467)=EPERM
+perf_event_open(241)=EPERM personality(92)=EPERM     pidfd_getfd(438)=EPERM
+pivot_root(41)=EPERM      process_vm_readv(270)=EPERM  process_vm_writev(271)=EPERM
+ptrace(117)=EPERM         quotactl(60)=EPERM         reboot(142)=EPERM
+request_key(218)=EPERM    setdomainname(162)=EPERM   sethostname(161)=EPERM
+setns(268)=EPERM          swapoff(225)=EPERM         swapon(224)=EPERM
+umount2(39)=EPERM         unshare(97)=EPERM          userfaultfd(282)=EPERM
 ```
+
+（上一版报告把这一段写成"209 个号被拒 ⇒ blocklist 完整"，并附了一批**并未逐条观测**
+的读数；本节是修正后的版本：**38 个名字 → 36 个在本 ABI 存在 → 36 个实测 EPERM**。）
+
 `AF_PACKET`/`AF_VSOCK` 建不出来，`AF_INET+SOCK_RAW(ICMP)` = EPERM；
 唯一放行的 `AF_NETLINK` 只读路由信息（非逃逸，与 OBS-2 一致）。
 
@@ -207,12 +260,14 @@ SEC-001 的四种写法（`127.0.0.1` / `0.0.0.0` / `0.0.0.1` / `::1`）全部�
 多 1 字节：全部 401。API key **不能**访问 `/internal/*`（401）与 C3 agent 面。
 `/internal/nodes/{node_id}/file-op` 这类特权中继在控制面侧同样要 internal key。
 
-**L4 资源上限** — 磁盘 **真有限制**：`RLIMIT_FSIZE=1 GiB`，写满 1024 MiB 后
-返回 `EFBIG(27)`（比 2026-09-16 那轮"64 MiB 上限下写 192 MiB 无拒绝"有改善，
-N25/C 的 per-exec `RLIMIT_FSIZE` 已上线）。进程数 `RLIMIT_NPROC=30519`。
-**创建类端点限流真实生效**：连打 110 次 `POST /volumes` 后第 111 次起 429，
-且**按端点独立**（volume 预算耗尽后再打 volume 仍 429，但不影响 sandbox 创建）——
-OBS-8 的修复在线上是活的。
+**L4 资源上限** — 逐项重测，**输出是唯一失效的一项**：
+
+| 维度 | 实测 | 结论 |
+|---|---|---|
+| 磁盘 | `RLIMIT_FSIZE=1 GiB`，写满 1024 MiB 返回 `EFBIG(27)` | **真**（N25/C 已上线；比 2026-09-16 那轮“64 MiB 上限下写 192 MiB 无拒绝”有改善） |
+| 进程数 | `RLIMIT_NPROC=30519` | **真** |
+| 创建类限流 | 连打 110 次 `POST /volumes` 后第 111 次起 429，且**按端点独立** | **真**（OBS-8 修复在线上是活的） |
+| **命令输出** | 300 MiB 全量送达；`yes` 直接 OOM 掉 worker | **假**（见 SEC-K0S-003，高） |
 
 ---
 
@@ -238,7 +293,12 @@ OBS-8 的修复在线上是活的。
 ## 遗留/建议（未实施，按性价比）
 
 1. **SEC-K0S-002 修法**：控制面关掉 OpenAPI（一行）。
-2. **SEC-K0S-003 修法**：把输出封顶提到 broadcast 之前；或新增独立的流上限旋钮。
+2. **SEC-K0S-003 修法**（优先级高于上一条）：把输出封顶提到 broadcast 之前；
+   或新增独立的流上限旋钮。**这条是本轮唯一造成过生产影响的项**，
+   而"修复"只需把已有的 `append_captured` 语义扩展到 broadcast 之前。
+   修完应当用 `tmp/audit/probe_i1_replay.py` 验证：有限输出的命令 → 连接读回放 →
+   断言回放字节数 ≤ 上限且含 `TRUNCATED_MARK`；再用一条高输出命令断言
+   **实时流**也在上限处收到 marker（当前收不到）。
 3. **OBS-6 复核**：`E2B_TENANTS` / `E2B_ADMIN_API_KEYS` 在线上控制面 env 中
    **确实未设置**（实测 `kubectl get deploy control-plane` 的 env 全量核对），
    即当前是**单租户兼容模式**。这与 2026-09-22 的用户决定一致（有意不启用），
@@ -258,7 +318,8 @@ OBS-8 的修复在线上是活的。
 | 探针 | 覆盖 |
 |---|---|
 | `probe_a2_l1.py` | L1 内核接口 + 路径面（主力） |
-| `probe_a9_scan.py` | syscall 号 0..500 全扫描（EPERM 集合） |
+| `probe_a9_scan.py` | syscall 号 0..500 全扫描（EPERM 集合，**注意它无法区分 deny 来源**） |
+| `probe_j1_blocklist_arm64.py` | **逐条**按 arm64 真实号验证 blocklist（36/36 EPERM，getpid 对照） |
 | `probe_b1_verify8.py` | arg-filter 族逐条确认（`unshare`/`personality`/`reboot` 等） |
 | `verify_numbers.py` | 用 `syscalls` crate 0.8.1 的 aarch64 表核对 blocklist 覆盖 |
 | `probe_c1_l2.py` | L2 横向（宿主路径 / 遍历 / 符号链接 / `/proc` / 信号） |
@@ -267,3 +328,4 @@ OBS-8 的修复在线上是活的。
 | `probe_f1_cp.py` | 控制面全端点（`/openapi.json` 暴露由此发现） |
 | `probe_g1_ratelimit.py` | 创建类端点限流（打到 429） |
 | `probe_h1_l4.py` / `probe_h2_output.py` | L4 资源上限（磁盘/进程/输出） |
+| `probe_i1_replay.py` | 回放路径封顶的验证（**当前未能跑通**，见 SEC-K0S-003“未能证实”） |
