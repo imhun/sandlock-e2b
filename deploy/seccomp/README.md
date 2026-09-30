@@ -93,10 +93,13 @@ through a duplicated fd landed). Two things bound it: the kernel's
 `ptrace_may_access` gate is what decides the target set (same-uid siblings
 inside the sandbox; the supervisor is a different uid/userns and sets
 `PR_SET_DUMPABLE=0`), and the sandbox cannot even *name* what it stole —
-`/proc/self/fd/<n>` is denied by the sandbox's own fs mediation. So the reach is
-intra-sandbox, not an escape. It is still the same class `ptrace` is blocked
-for, and the one-line fix is to add `pidfd_getfd` to
-`DEFAULT_BLOCKLIST_SYSCALLS` (a fork change: wheel + images rebuild).
+`/proc/self/fd/<n>` is denied by the sandbox's own fs mediation. So the reach was
+intra-sandbox, not an escape — but it is the same class `ptrace` is blocked for,
+so `pidfd_getfd` was added to `DEFAULT_BLOCKLIST_SYSCALLS` (fork `a21a507`; wheel
+and images rebuilt). Re-measured after that deploy, same probe: `pidfd_getfd` is
+now **`EPERM`** as well, and the supervisor's own use is unaffected (it runs
+outside this filter — the worker's log shows no `pidfd_getfd` failure, and
+route-B slots still hand off their descriptor).
 
 `process_vm_writev` is the single candidate for going *below* the default
 (checkpoint restore is not part of what E2B exposes); that would be a deliberate
