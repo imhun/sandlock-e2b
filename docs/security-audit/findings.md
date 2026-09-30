@@ -532,3 +532,80 @@ mkdir: cannot create directory ...: Permission denied
    （redis / quota-agent / registry）。
 5. **`cargo-audit`**：在能访问 RustSec advisory-db 的环境对
    `third_party/sandlock/Cargo.lock`（253 crate）跑一次。
+
+---
+
+## 2026-09-30 加固：第一档危险 syscall 禁用（k0s 集群实测）
+
+### 怎么测的
+
+探针 `tmp/syscall-probe/probe.py`（探针自带两套 ABI 的 syscall 号表，取自
+sandlock 自己解析黑名单用的 `syscalls` crate —— worker 镜像没有内核头文件），
+每条候选都用**故意非法的参数**调用，因此"到达内核"与"被 seccomp 拒"可以区分：
+
+* `ENOSYS` ⇒ 外层 worker profile 的默认动作（该 profile 未列出的 syscall 一律 ENOSYS）；
+* 其它 errno（`EINVAL`/`EFAULT`/`EBADF`/`ESRCH`，或返回 ≥0）⇒ **到达内核**；
+* 列 `EPERM` 时要靠"worker 进程 vs 沙箱内"两列的差异判定是不是内层黑名单干的。
+
+三列对照：① unconfined 容器内的裸调用（内核真值）② worker profile 容器内的裸调用
+（外层）③ 真沙箱内（两层叠加）。**部署形态的结论来自 k0s 集群上的真 worker pod**
+（`e2b-worker-1`，arm64，`uid=65534`，`CapBnd/Eff=0`，`Seccomp: 2`，
+`kubectl exec` 进 pod 后 `python3 /tmp/probe/probe.py sandbox <前缀>`）。
+本地 OrbStack 只在 unconfined 容器里跑通了裸调用两列：带沙箱的那次把本地 VM 弄挂
+两次（`orb start` 恢复），所以部署形态一律以集群为准。
+
+### 实测：第一档候选在**沙箱内**能到内核（外层也放行）的
+
+| 调用（沙箱内） | 结果 | 说明 |
+|---|---|---|
+| `fsconfig` / `mount_setattr` | `EINVAL` | **参数解析跑到了**，说明确实进了内核；不是 cap 拦截 |
+| `fsopen` / `fsmount` / `move_mount` / `fspick` | `EPERM` | 停在内核的 `may_mount()` 能力检查上，即内层没拦 |
+| `process_madvise` / `process_mrelease` | `EBADF` | 与已禁的 `process_vm_readv/writev`、`pidfd_getfd` 同类 |
+| `kcmp` | `ESRCH` | 同上（PTRACE_MODE_READ 那一类） |
+| `quotactl_fd` | `EBADF` | worker 侧的配额实现（`envd_service/xfs_quota.py`）在过滤器之外，沙箱不需要 |
+| `kexec_file_load` | `EPERM` | 停在 `CAP_SYS_BOOT`；`kexec_load` 早已禁用 |
+| `io_setup` / `io_submit` | `EFAULT` / `EINVAL` | 旧 POSIX AIO，`io_uring` 的上一代 |
+| `memfd_secret` | **`ok(fd=3)`** | 沙箱内真的拿到了句柄 |
+| `get_mempolicy` / `set_mempolicy` | **`ok(0)`** | 非能力门控；`get_mempolicy` 还会泄露宿主 NUMA 拓扑 |
+| `mbind` / `move_pages` / `migrate_pages` | `EFAULT`/`EPERM` | 同一族 |
+
+对照组（内层黑名单**确实**拦下的，说明这套测法有效）：`mount`/`umount2`/`open_tree`
+（worker 侧 `EFAULT` ⇒ 沙箱内 `EPERM`）、`chroot`、`bpf`、`setns`、`perf_event_open`、
+`pidfd_getfd`、`process_vm_readv/writev`、`quotactl`、`open_by_handle_at`、
+`name_to_handle_at`。
+
+### 改了什么
+
+* `sys/structs.rs::DEFAULT_BLOCKLIST_SYSCALLS` 新增 26 条：mount API 全家
+  （`fsopen`/`fsconfig`/`fsmount`/`move_mount`/`fspick`/`mount_setattr`/`statmount`/`listmount`）、
+  ptrace 类（`process_madvise`/`process_mrelease`/`kcmp`）、`quotactl_fd`、
+  `kexec_file_load`、旧 AIO（`io_setup`/`io_submit`/`io_cancel`/`io_getevents`/`io_pgetevents`）、
+  `memfd_secret`、`modify_ldt`（x86-only，arm64 上自动跳过）、NUMA 六条。
+* `sys/path_surface.rs` 账本：`statmount`/`listmount` 从 `Open`、`move_mount`/`fspick`/
+  `mount_setattr` 从 `Gated` 改为 `Blocked`，`Open`（待决策）集合收敛到 7 条
+  （`fchmodat2` + 4 个 `*xattrat` + `file_getattr`/`file_setattr` —— 这几条按账本原判
+  **要中介不要拒绝**，glibc 已经在用 `fchmodat2`）。
+* 回归：`context::tests::test_first_tier_hardening_syscalls_are_blocklisted`（名字→号钉进
+  解析后的计划）与 `integration/test_seccomp_enforce.rs::test_first_tier_blocklist_refused`
+  （真沙箱内逐条断言 `EPERM(1)`，26 条）。
+
+验证数字：`cargo test -p sandlock-core --lib` **914 passed / 0 failed**（需
+`--privileged --security-opt seccomp=unconfined`，否则两条用例因 PID namespace /
+`pidfd` 跨进程权限而在容器里必然失败）；`--test integration` 与改动前
+`a21a507` 基线逐条 diff：**新增失败 0**（基线 27 条环境性失败，改动后 26 条）。
+
+### 同批发现、**未**在本轮修的两个问题
+
+1. **`clone3` 的命名空间位没有任何一层 sandlock 校验**。BPF 参数过滤只对
+   `SYS_clone` 发 `JSET CLONE_NS_FLAGS`（`seccomp_plan.rs` 的 `nr_clone` 一路），
+   `resource.rs::handle_fork` 也只检查 `nr == SYS_clone`，而那里的注释写着"clone3 由
+   BPF 参数过滤兜住"——并不成立。`clone_flags()` 已经会读 `clone_args`，所以修法是
+   在 `handle_fork` 里对 `clone3` 复用同一个判定。部署形态当下打不穿：外层 profile
+   把 `clone3` 整条 deny 成 `ENOSYS`（本轮实测确认），也就是这条禁令实际由容器
+   profile 承担，而不是 sandlock 自己。不能改成"禁用 `clone3`"——glibc 2.34+ 的
+   `pthread_create` 走它。
+2. **`deploy/seccomp/README.md` 的"变更表"与 profile 现状不符**：`mount`/
+   `pivot_root`/`umount2` 在文件里是**无条件 allow**（N35 真根那次加的），README 却写
+   "mount … 未放宽"。已在该 README 就地更正，并补上"同一个文件在不同引擎上对
+   `caps:` 条件的解析不一致（`fsconfig` 一边被拒一边到内核）"这条实测 —— 结论是
+   mount API 不能指望外层 profile 兜底，只能靠沙箱自己的黑名单。

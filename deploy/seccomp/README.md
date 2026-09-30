@@ -52,11 +52,41 @@ backend).
 | `unshare` | gated on `CAP_SYS_ADMIN` | allowed only for the namespace types this deployment builds | The worker builds a user namespace for the per-sandbox host uid (E3.2, and the route-B slot's F18 self-map), plus net/pid/mount namespaces for `E2B_ENABLE_NET_ISOLATION` / `pid_ns` / the real-root shapes. See "The `unshare` mask" below. |
 | `ptrace`, `process_vm_readv`, `process_vm_writev` | gated on `CAP_SYS_PTRACE` in older profile revisions | unconditional | Current daemons already allow these unconditionally (measured on the local engine with `CapEff` lacking `CAP_SYS_PTRACE`); kept aligned so this file matches the shape the deployment is verified against. |
 
-**Not** relaxed: `mount`, `keyctl`, `bpf`, `clone3`, `setns`, `open_tree`,
-`perf_event_open`, … — the capability-gated groups of the default profile are
-kept verbatim, so a deployment that does carry a capability (e.g. the
-quota-agent's `SYS_ADMIN`, or the test runner's) keeps exactly the access the
-kernel would have granted it anyway.
+**Not** relaxed: `keyctl`, `bpf`, `clone3`, `setns`, `perf_event_open`, … — the
+capability-gated groups of the default profile are kept verbatim, so a
+deployment that does carry a capability (e.g. the quota-agent's `SYS_ADMIN`, or
+the test runner's) keeps exactly the access the kernel would have granted it
+anyway.
+
+**Correction (2026-09-30): `mount`, `pivot_root` and `umount2` *are* relaxed**,
+and the earlier revision of this paragraph said otherwise. They are the three
+names of the N35 real-root work (`pivot_root` + `umount2(MNT_DETACH)` to drop
+the old root, `mount` for the bind mounts that build the new one, see
+`crates/sandlock-core/src/realroot.rs`), and they sit in an **unconditional**
+allow entry that wins over the `CAP_SYS_ADMIN` group holding the same names.
+Measured 2026-09-30 with a null path, so a capability failure is
+distinguishable from a path failure:
+
+| call | k8s worker pod (arm64, caps dropped ALL) | local docker, `--cap-drop ALL` |
+|---|---|---|
+| `mount(NULL, …)` | `EFAULT` → reached the kernel | `EFAULT` |
+| `umount2(NULL, 0)` | `EFAULT` → reached the kernel | `EFAULT` |
+| `pivot_root(NULL, NULL)` | `EPERM` (kernel's own `may_mount` check) | `EFAULT` |
+| `fsconfig` / `mount_setattr` | `EINVAL` → reached the kernel | `EPERM` (filtered) |
+| `fsopen` / `fsmount` / `move_mount` / `fspick` | `EPERM` (kernel's capability check) | `EPERM` (filtered) |
+| `open_tree` | `EPERM` (kernel; sandbox filter also refuses) | `EPERM` (filtered) |
+
+The `fsconfig`/`mount_setattr` row is the one to remember: the *same* file, with
+an empty capability set in both cases, refused those calls on one engine and let
+them through to the kernel (which then answered `EINVAL`) on the other. A
+`caps:` condition in this profile is resolved **when the engine builds the
+filter**, not at runtime, and engines do not agree on which set that condition
+is compared against. So for the mount API the outer profile is not a barrier to
+reason about — the sandbox's own blocklist is, and since 2026-09-30 it carries
+every entry point of that family (`mount`, `umount2`, `pivot_root`, `open_tree`,
+`open_tree_attr`, `fsopen`, `fsconfig`, `fsmount`, `move_mount`, `fspick`,
+`mount_setattr`, `statmount`, `listmount`; see
+`sys/structs.rs::DEFAULT_BLOCKLIST_SYSCALLS`).
 
 ### Which rows are deltas, and which are just the default
 
