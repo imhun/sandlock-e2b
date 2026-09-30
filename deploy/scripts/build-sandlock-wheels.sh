@@ -34,9 +34,13 @@ if [ ! -f "$FORK/python/build-wheels.sh" ]; then
     exit 1
 fi
 
-mkdir -p wheels/fork tmp
+# Build output stays inside the fork (`third_party/sandlock/`): the staging
+# context used to be `<repo>/tmp/wheel-context`, which is exactly the
+# "root directory" shape we do not want -- the fork's `.gitignore` owns
+# `tmp/`, the E2B repo root does not (`docs/build-test-deploy-pitfalls.md` A7).
+mkdir -p wheels/fork
 OUT_DIR="$PWD/wheels/fork" \
-CONTEXT_DIR="${CONTEXT_DIR:-$PWD/tmp/wheel-context}" \
+CONTEXT_DIR="${CONTEXT_DIR:-$PWD/third_party/sandlock/tmp/wheel-context}" \
     sh "$FORK/python/build-wheels.sh"
 
 echo "==> E2B wheel inputs refreshed in wheels/fork/:"

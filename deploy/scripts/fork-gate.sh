@@ -51,6 +51,7 @@ mkdir -p tmp/home && chmod a+rwx tmp/home
 exec setpriv --reuid 65534 --regid 65534 --clear-groups \
     env CARGO_HOME=/src/third_party/sandlock/tmp/cargo-home \
         HOME=/src/third_party/sandlock/tmp/home \
+        CARGO_TARGET_DIR=/src/third_party/sandlock/target-linux \
         PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin \
     cargo test -p sandlock-core --offline --test integration -- "$1" --test-threads=1
 ' ignored "$FILTER"
@@ -82,8 +83,13 @@ chmod -R a+rX /root/.cargo /root/.rustup 2>/dev/null || true
 chmod -R a+rwX tmp 2>/dev/null || true
 mkdir -p tmp/home && chmod a+rwx tmp/home
 # 4. 非 root 相位。HOME 指到可写处（规范镜像里 HOME=/root 是不可写的，脚本自己也会兜底）。
+#    `CARGO_TARGET_DIR` 必须显式指到 fork 里的 `target-linux/`：这个容器把**仓库根**挂在
+#    `/src`，而 fork 的 `target -> /src/target-linux` 是绝对路径 —— 不指的话 cargo 会把
+#    产物写到**仓库根**的 `target-linux/`（16 GB 就是这么攒出来的），而 fork 自己的
+#    `scripts/test-all.sh` 读的却是 `$PWD/target-linux/debug`。指到 fork 里两边才一致。
 exec setpriv --reuid 65534 --regid 65534 --clear-groups \
     env HOME=/src/third_party/sandlock/tmp/home \
+        CARGO_TARGET_DIR=/src/third_party/sandlock/target-linux \
         PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin \
     sh scripts/test-all.sh "$@"
 ' sh "$@" >"$LOG" 2>&1

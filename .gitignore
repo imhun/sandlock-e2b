@@ -30,11 +30,12 @@ envd_service/egress/*.so
 # graphify's generated graph (cache + html + report); the *config* that shapes it
 # (`.graphifyignore`) is committed, the 47M of output it produces is not.
 graphify-out/
-# A cargo build directory that only ever means anything inside the dev container:
-# it is a symlink to `/src/target-linux`. Committing it would be committing a
-# dangling link (see docs/build-test-deploy-pitfalls.md A2).
+# Cargo output never belongs at the repo root (2026-09-30: the root `target`
+# symlink and the 16 GB `target-linux/` it pointed at were both removed; builds
+# run in `third_party/sandlock` with an explicit CARGO_TARGET_DIR). The rules
+# stay so a stray root-cwd container build cannot dirty the tree.
+# See docs/build-test-deploy-pitfalls.md A2/A7.
 /target
-# The same build directory under the name the fork's `target` symlink uses
-# (`third_party/sandlock/target -> /src/target-linux`), i.e. the dev container's
-# cargo output. 5.8 GB after a test run, and never source.
+# Same directory under the name the fork's container-path symlink uses
+# (`third_party/sandlock/target -> /src/target-linux`). Never source.
 /target-linux/

@@ -160,6 +160,9 @@ sandlock wheel、worker 镜像不依赖 control_plane。`deploy/docker/Dockerfil
 
 `wheels/fork/` 是构建产物、不入库（fork 源码固定于 `third_party/sandlock`
 子模块）：构建镜像前先执行 `./deploy/scripts/build-sandlock-wheels.sh` 生成 wheel。
+sandlock 的构建与门禁**一律在 `third_party/sandlock` 里跑**，仓库根不再产出
+`target/`、`target-linux/`、`tmp/wheel-context`；入口、工具链镜像、产物落点与"清缓存之后怎么恢复"
+都记在 [docs/build-test-deploy-pitfalls.md](docs/build-test-deploy-pitfalls.md) A7。
 
 **构建（多架构）**：
 

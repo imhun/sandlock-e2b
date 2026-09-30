@@ -3541,3 +3541,40 @@ compose 车道同代码、同镜像、同 65534、`$HOME/.docker` 同样不可�
 **收尾状态**：`deploy/` = `compose/ docker/ k8s/ k8s-k0s/ scripts/ seccomp/ stack/`（无 Python 包、
 无可被 import 的代码）；顶层服务目录 = `control_plane/ c3_agent/`（含 `priv/`）`quota_agent/
 autoscaler/ envd_service/ gateway_common/`。
+
+## 2026-09-30 清 sandlock 构建产物（≈86 GB）+ 把构建口径写成 A7
+
+**起因**：用户要求清 `target-linux`（含 `third_party/sandlock` 的 `tmp` 与 `target`），并记录
+"sandlock 构建在 `third_party/sandlock` 里做、不要放根目录"、"记下用的构建工具与镜像，防止误用或从头再来"。
+
+**清掉的（≈86 GB）**：
+
+- 仓库根 `target-linux/` **16 GB** —— 容器把**仓库根**挂成 `/src` 时，fork 的
+  `target -> /src/target-linux`（绝对路径）把 cargo 产物写到根目录攒出来的；
+- `third_party/sandlock/target-linux/` **53 GB**（fork 自己的 cargo 产物）；
+- `third_party/sandlock/tmp/` **17 GB**（1533 项：三个 `incremental-stale-*` 就 16.6 GB，
+  另有 `cargo-home` 399 MB、`sdd`/`cbind-home`/`home`/`injsim*` 等夹具与日志）；
+- 仓库根的 `target` 符号链接。**保留** `third_party/sandlock/target`（aarch64 车道的相位靠它找
+  `<fork>/target/debug/...`）；
+- `wheels/fork/` **不删** —— 它是镜像构建的输入，`build-and-push.sh` 缺了直接退出。
+
+**改掉的两处接线**（"产物跑到根目录"的根因）：
+
+- `deploy/scripts/fork-gate.sh`：两个分支都显式加 `CARGO_TARGET_DIR=/src/third_party/sandlock/target-linux`。
+  它把仓库根挂成 `/src`、cwd 在 fork 里，不指的话产物落**根**；而 fork 自己的 `scripts/test-all.sh`
+  读的是 `$PWD/target-linux/debug`，指到 fork 里两边才一致。
+- `deploy/scripts/build-sandlock-wheels.sh`：staging context 从 `<repo>/tmp/wheel-context` 改到
+  `third_party/sandlock/tmp/wheel-context`（顺带不再在根 `mkdir tmp`）。
+
+**记录**：`docs/build-test-deploy-pitfalls.md` 新增 **A7**（四张入口：发布 wheel / fork 门禁 / 单点
+cargo / aarch64 车道的入口、镜像、产物落点；已作废的 `third_party/sandlock-wheel-builder/`；
+两根 `target` 符号链接的边界；清缓存后的恢复命令）+ `README.md` 一句指引 + `.gitignore` 注释更新。
+
+**实测**：
+
+- `sh -n` / `bash -n` 两脚本通过；用 `BUILDER=__no_such_builder__` 跑 wheel 入口 —— staging 落在
+  `third_party/sandlock/tmp/wheel-context`（9.7 MB），**根目录没有** `tmp/wheel-context`，只失败在
+  builder 名（预期）；
+- 离线缓存恢复路径实测：`sandlock-dev-f17:latest` 里 `cargo fetch --locked` → **401 MB**（几分钟），
+  `tmp/cargo-home` 删掉后第一次门禁要联网，命令已写进 A7；
+- 发布链路的输入没动：`wheels/fork/{*.whl,supervise/,restore-stub/,SHA256SUMS.supervise}` 都在。

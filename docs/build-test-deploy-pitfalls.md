@@ -60,6 +60,41 @@ sandlock-dev:latest sh scripts/test-all.sh`；该镜像 entrypoint 自动降到 
 编译那个 crate。做法：**新增字段时按"谁构造这个结构体"全局搜**（`rg -n "Req::RunExec \{" crates/`），
 而不是只搜 fork 自己那两棵 crate —— 上一条做法里那句 `rg` 要按字段所在的结构体改，不是照抄。
 
+**A7. sandlock 构建的唯一口径：在 `third_party/sandlock` 里跑，仓库根不再产出任何 target。**
+（2026-09-30 立此条：当天从根目录 + fork 里一共清掉 **86 GB** 构建产物，并把两个把产物写到根目录
+的接线改掉了。没有这条记录，下一个人只能从零把下面这些重新推一遍。）
+
+| 用途 | 入口 | 工具 / 镜像 | 产物落点 |
+|---|---|---|---|
+| 发布 wheel（镜像装的就是它） | `./deploy/scripts/build-sandlock-wheels.sh` → fork 的 `python/build-wheels.sh` | `docker buildx` builder **`multiarch`**；`third_party/sandlock/python/wheel-builder/Dockerfile`；BASE_IMAGE **`quay.io/pypa/manylinux_2_34_x86_64`**（宿主 x86_64）/ **`..._aarch64`**（宿主 arm64），`--platform` 必须等于宿主架构；镜像内：rustup（`RUSTUP_DIST_SERVER=rsproxy.cn`）+ cp314 + `setuptools-rust` + `ziglang`（配合 `python/wheel-builder/zigcc` 与 `cargo-config.toml` 的 per-target linker）+ `auditwheel` | **`wheels/fork/`**（E2B 侧，`build-and-push.sh` 缺它就直接退出）：`*.whl`、`supervise/{x86_64,aarch64}/sandlock-supervise`、`restore-stub/*/restore-stub`、`SHA256SUMS.supervise`；staging context 在 `third_party/sandlock/tmp/wheel-context` |
+| fork 门禁（全套相位） | `deploy/scripts/fork-gate.sh`（`--one 'test_chroot::'` 单跑一族） | 镜像 **`sandlock-dev-f17:latest`**（本机装的是 E2B 测试镜像，脚本自己降权）；容器把**仓库根**挂成 `/src`，**cwd = `/src/third_party/sandlock`** | `CARGO_HOME`/`HOME`/`CARGO_TARGET_DIR` 全在 fork 内：`third_party/sandlock/{tmp/cargo-home,tmp/home,target-linux}`；日志 `tmp/k0s/fork-gate.log` |
+| 单点 cargo check/test | 见 A3 | `sandlock-dev-f17:latest`，`-v "$PWD/third_party/sandlock:/w" -w /w -e CARGO_TARGET_DIR=/tmp/ct` | 容器内 `/tmp/ct`（**必须显式给 `CARGO_TARGET_DIR`**，见 A2） |
+| aarch64 真内核车道 | `deploy/scripts/arm-lane/xbuild.sh` / `phase-run.sh` | 镜像 **`sandlock-zig-builder:local`** | 交叉产物 `/var/tmp/aarch64-target/<triple>`；`phase-run.sh` 再把它软链成 `/src/target-linux`（该车道的 `/src` = fork） |
+
+**已作废、不要用来出发布 wheel**：`third_party/sandlock-wheel-builder/`（2026-09-09 起 SUPERSEDED；
+它出的 wheel 不带 `sandlock-supervise`，install 正常但 route B 会静默拒绝起槽位，`build-sandlock-wheels.sh`
+头部记着这次实测）。现在只剩历史价值。
+
+**符号链接的边界（两根都叫 `target`，别混）**：
+
+- `third_party/sandlock/target -> /src/target-linux` 是**容器路径**符号链接，**保留**：aarch64 车道的
+  相位靠它找 `<fork>/target/debug/...`（fork 挂成 `/src` 时它就指向 fork 自己的 `target-linux/`）；
+- 它也是 A2 那个坑的来源：容器把**仓库根**挂成 `/src` 时，它指向的是**仓库根**的 `target-linux/`。
+  `fork-gate.sh` 以前正是这样把 16 GB 产物写到根目录的，2026-09-30 已显式加上
+  `CARGO_TARGET_DIR=/src/third_party/sandlock/target-linux` 改正；仓库根那根 `target` 符号链接已删。
+- 结论：**在容器里跑 cargo 一律显式给 `CARGO_TARGET_DIR`**（指向 fork 内），别依赖这两根链接。
+
+**清干净之后的代价（已实测）**：`third_party/sandlock/tmp/cargo-home` 是 `--offline` 用的 crate 缓存
+（399 MB），随 `tmp/` 一起删掉后，**第一次门禁/构建要联网**重新拉：
+
+```bash
+docker run --privileged --rm --entrypoint sh -v "$PWD":/src -w /src/third_party/sandlock \
+  sandlock-dev-f17:latest -c 'export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin; \
+    CARGO_HOME=/src/third_party/sandlock/tmp/cargo-home cargo fetch --locked'
+```
+
+（2026-09-30 实测：401 MB，几分钟。宿主 `~/.cargo/registry`（623 MB）也可以挂进去复用。）
+
 ---
 
 ## B. 跑测试 / lane
