@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.18（2026-09-30，N51 缩容目标修正，当前版本 `0.1.0-808-g1ca681e-20260930-175431`）**；§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.19（2026-09-30，C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，当前版本 `0.1.0-811-g071beb4-20260930-202337`）**；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1010,6 +1010,29 @@ undeterminable: name must be provided"* —— replace 形态要求 body 自带 
 修前同一形状的行为（按代码推断，未再复现）：循环 drain `-0`（候选表按 node id 排序，`-0` 在前）、
 `remove_node` 打注解后整副本 -1 ⇒ **控制器删掉的是 `-2`，把上面那个活沙箱连同 pod 一起收走** ——
 而循环从没选过它。
+
+### 7.19 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认（**2026-09-30，已上线 `0.1.0-811-g071beb4-20260930-202337`**）
+
+N52（`docs/open-issues.md`）：把 C1 时代剩下的死代码删掉（`maint.c` 2267 → 344 行、
+`priv_common.c` 575 → 325 行、`tests/contract/test_broker_socket_c.py` 2038 行），并把
+`E2B_SLOT_IDENTITY` 未设时的默认从恒 `spawn` 改成**按形态解析**（有 agent ⇒ `agent-grant`，
+没有 ⇒ `spawn` + 一条 WARNING）。两次上线（`810` 删死代码、`811` 补"未知动词"的拒绝措辞），
+`build-and-push.sh` → `apply.sh` 各一次。
+
+**集群验收（`0.1.0-811`）**
+
+| 判据 | 读数 |
+|---|---|
+| 特权二进制里的 socket 入口没了 | 在 agent pod 的面 B 容器里 `e2b-maint serve` ⇒ `usage: unknown verb 'serve' (expected chown|rm|walk)`（exit 2）；无参数 ⇒ `expected chown|rm|walk`（用法文本里已不含 `serve`/`ping`） |
+| 能力集未动 | `getcap /var/lib/e2b-priv/e2b-maint` = `cap_chown,cap_dac_override=ep`；`as_uid` = `cap_setgid,cap_setuid=ep` |
+| 默认值路径不误报 | 两个 worker 的日志里 `E2B_SLOT_IDENTITY is unset` **0 行**（清单显式设了 `agent-grant`） |
+| 文件操作链路未回归 | 面 B 的 `chown/rm/walk` 仍可用：`multinode_smoke.py` ⇒ `MULTI-NODE SMOKE OK`；`deployment_smoke.py` ⇒ `DEPLOYMENT SMOKE OK`（含跨节点迁移保文件、远端卷隔离、模板构建→worker 拉取、MCP 网关） |
+| 仓库规格 ≡ 线上 | `DRY_RUN=1 apply.sh \| kubectl diff -f -` **0 行** |
+| 终态 | `control-plane` 2/2、`e2b-worker` 2/2、`redis` 1/1、两个 DaemonSet 就绪；`fleet/sandboxes` = `{}` |
+
+**没动的**（§7.18 结尾那份清单里属于"回退杆"而非垃圾的项）：`E2B_PRIV_HELPER_TRANSPORT=exec`
+与两个 file-capability 二进制仍留在**测试车道**（`Dockerfile.test-runner`）；`E2B_SLOT_IDENTITY=spawn`
+仍是无 agent 形态（单机示例、车道）的合法取值；`E2B_AS_K8S_KIND=deployment` 仍是 pre-N20 兼容。
 
 ## 8. 改部署的入口
 
