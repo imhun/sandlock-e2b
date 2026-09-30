@@ -5,8 +5,8 @@ from __future__ import annotations
 import httpx
 
 import envd_service.xfs_quota as xfs_quota
-from deploy.quota_agent.app import create_app
-from deploy.quota_agent.config import Settings
+from quota_agent.app import create_app
+from quota_agent.config import Settings
 from envd_service.xfs_quota import ProjectQuotaError, ProjectQuotaUsage
 
 KEY = "sekret"

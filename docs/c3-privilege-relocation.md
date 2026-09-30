@@ -248,7 +248,7 @@ signal number"*），由 supervisor 去杀它自己的孩子。
   `FTS_PHYSICAL` + `lchown`/`unlinkat`（符号链接永不跟随），并且 `c3_agent/priv/maint.c` 的 usage
   头已经把 `chown`/`rm`/`walk`/`serve`/`ping` 五种形态写全 —— **直连 CLI 形态就是 agent 要用的
   形态**。已有同形单测 `tests/unit/test_priv_helpers.py`。
-- **鉴权**：CP → agent 用 token / mTLS。仓库里有现成形态：`deploy/quota_agent/` 的
+- **鉴权**：CP → agent 用 token / mTLS。仓库里有现成形态：`quota_agent/` 的
   `E2B_QUOTA_AGENT_TOKEN`，调用侧一个 URL 开关（`E2B_QUOTA_AGENT_URL`）就把调用切过去。
   **但要读它的教训**：quota-agent 在 compose lane 部署了，**k8s manifest set 里一个都没有**，
   于是 k8s 默认落在 degraded 形态。C3 走同一条路，必须**一开始就决定 k8s lane 要不要它**，
@@ -1344,7 +1344,7 @@ worker ──① 上报──▶ CP ──② 指令──▶ agent
 | 链路 | 今天 | 需要 | 状态 |
 |---|---|---|---|
 | ① worker → CP（**上报**） | `/internal/**` + `X-Internal-Key` | **per-node 身份** | 通道已有，鉴权不够（§14.3） |
-| ② CP → agent（**指令**） | **不存在** | token / mTLS | 新建；先例 `deploy/quota_agent/` 的 `E2B_QUOTA_AGENT_TOKEN` |
+| ② CP → agent（**指令**） | **不存在** | token / mTLS | 新建；先例 `quota_agent/` 的 `E2B_QUOTA_AGENT_TOKEN` |
 | ③ CP → worker（建/拆箱） | `record.envd_access_token`（per-sandbox） | 保持 | ✔ 已有 |
 | ④ **worker → agent**（worker 发起） | — | — | 按规则**禁止**。⚠ **反向 `agent → worker` 是允许的**，而且它不是可有可无的 —— fd 反向交付走的就是它（§14.2.3） |
 
@@ -1830,7 +1830,7 @@ Task 7 之前，C3 的回退故事有一条"两条路并存"的便利：新树�
   `deploy/k8s/priv-broker.yaml`（文件头 + cap 集注释，记着 NAS/`CAP_CHOWN` 不过网与 peer 门实测）
   **已由 C3 Task 7 删除**：那些实测的现行落点是 `docs/production-deployment-requirements.md` §5.4(b)
   与 `docs/deploy-clusters.md` §7.3；要读原文就看 git 历史。
-- **CP 侧先例与协调**：`deploy/quota_agent/`（"worker 外包特权给服务端 agent"的现成形态，
+- **CP 侧先例与协调**：`quota_agent/`（"worker 外包特权给服务端 agent"的现成形态，
   注意它在 k8s 里没部署）、`docs/control-plane-multi-replica.md`（Redis + `flock` 协调）、
   `docs/production-deployment-requirements.md` §2.4.4（W4）。
 - **路径纪律（要复用，不要重写）**：`c3_agent/priv/priv_common.c`、`c3_agent/priv/maint.c`

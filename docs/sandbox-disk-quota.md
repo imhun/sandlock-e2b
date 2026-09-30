@@ -209,7 +209,7 @@ project id，定期清理。
 
 NFS 部署下 worker 只能看到 NFS 客户端挂载，真正的 XFS 文件系统在 NFS
 服务器上。worker 不直接跑 `xfs_quota`，而是把配额操作转发给部署在服务器
-侧的 quota-agent（小 HTTP 服务，`deploy/quota_agent`），由 agent 在服务器
+侧的 quota-agent（小 HTTP 服务，`quota_agent`），由 agent 在服务器
 本地执行 `xfs_quota`：
 
 - 请求面：`GET /detect?mount=`（服务端检测 facts）/ `POST /project_create`

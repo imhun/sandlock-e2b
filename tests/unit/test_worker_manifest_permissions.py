@@ -2031,7 +2031,7 @@ REDIS_TABLE_ROW = (
 QUOTA_TABLE_ROW = (
     "| `E2B_QUOTA_AGENT_TOKEN` | 同时更新 worker 与 agent 的 Secret；**先重启 agent、再滚 "
     "worker**（顺序反了 worker 找不到 agent，但 worker 侧是降级的） | 单 token、启动即 "
-    "fail-fast（`deploy/quota_agent/__main__.py:15-19`），**没有双窗**；worker 重启 = "
+    "fail-fast（`quota_agent/__main__.py:15-19`），**没有双窗**；worker 重启 = "
     "**杀沙箱**（同表 2 第 3 步） | ⚠ **k8s 形态今天没有部署 quota-agent**"
     "（`docs/production-deployment-requirements.md` §2.4.4 W4）⇒ 现在**没有影响面**，本轮只"
     "记账。将来部署 agent 时必须**同时**设计双 token（列表 + 旧值窗口），别把这条留到上线"

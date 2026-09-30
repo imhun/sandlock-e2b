@@ -97,7 +97,7 @@ def test_quota_agent_profile_args_fails_closed_without_token(tmp_path: Path) -> 
     assert result.stdout == ""
     assert result.stderr == (
         f"QUOTA_AGENT_PROFILE=1 但 {env_file} 缺 E2B_QUOTA_AGENT_TOKEN："
-        " quota-agent 拒绝无 auth 启动（deploy/quota_agent/__main__.py）\n"
+        " quota-agent 拒绝无 auth 启动（quota_agent/__main__.py）\n"
     )
 
 

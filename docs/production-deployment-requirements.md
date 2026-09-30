@@ -476,7 +476,7 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 `E2B_DISK_MAX_ENTRIES`，`docs/sandbox-disk-quota.md` §1.1）。agent 路径只是把**同一个口径**交给
 内核：建箱 `limit -p bhard=<disk_mb>M`（不是"还能写多少"的预算），删除后 `limit -p bsoft=0 bhard=0`
 把行**归还**给 XFS —— 少了后半句，行就变成高水位记录，正是 N30 否决的峰值口径。两条路径的语义必须
-一致：`envd_service/xfs_quota.py` 的 `provision_project(disk_mb=…)` 与 `deploy/quota_agent/app.py`
+一致：`envd_service/xfs_quota.py` 的 `provision_project(disk_mb=…)` 与 `quota_agent/app.py`
 的 `project_create`（`limit_mb` → `disk_mb=body.limit_mb`）各只有一处入参，钉子
 `tests/contract/test_xfs_project_quota.py::test_the_quota_row_is_a_position_boundary_not_a_write_budget`。
 **有配额行的两种形态下，沙箱看到的都是 `ENOSPC`（errno 28）**：本地 XFS 是内核把项目配额越界

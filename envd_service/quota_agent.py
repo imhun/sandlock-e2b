@@ -10,7 +10,7 @@ therefore needs root/effective CAP_SYS_ADMIN.
 
 The historical reason for this module is the NFS form: the worker only sees an
 NFS client mount, so the real filesystem lives on the server; this module talks
-to the server-side quota-agent (``deploy/quota_agent``), which executes
+to the server-side quota-agent (``quota_agent``), which executes
 ``xfs_quota`` locally and owns the privilege.
 
 Wire the module hooks (``xfs_quota.agent_query`` + ``xfs_quota.agent_ops``)

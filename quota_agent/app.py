@@ -42,7 +42,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import envd_service.xfs_quota as xfs_quota
-from deploy.quota_agent.config import Settings
+from quota_agent.config import Settings
 
 _PROJID_MAX = xfs_quota._PROJID_MAX
 

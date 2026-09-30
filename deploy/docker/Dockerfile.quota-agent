@@ -4,6 +4,12 @@
 # to it with the filesystem bind-mounted) and executes xfs_quota locally on
 # behalf of workers that only see the NFS client mount.
 #
+# The service itself is the top-level `quota_agent/` package (moved out of
+# `deploy/` on 2026-09-30: `deploy/` holds deployment configuration and
+# scripts, and this is a service with its own image, like `control_plane/`,
+# `c3_agent/` and `autoscaler/`). The `COPY` below used to be `deploy/`, which
+# dragged the whole manifest/script tree into the image for one package.
+#
 # The XFS filesystem must be mounted with prjquota + projid32bit. When the
 # container mounts the filesystem itself (loop device / direct device), run
 # it privileged with the device attached; when the host already mounts it,
@@ -26,10 +32,10 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r re
 
 COPY gateway_common/ gateway_common/
 COPY envd_service/ envd_service/
-COPY deploy/ deploy/
+COPY quota_agent/ quota_agent/
 
 ENV E2B_QUOTA_AGENT_HOST=0.0.0.0
 ENV E2B_QUOTA_AGENT_PORT=49984
 EXPOSE 49984
 
-CMD ["python", "-m", "deploy.quota_agent"]
+CMD ["python", "-m", "quota_agent"]

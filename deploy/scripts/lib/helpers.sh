@@ -210,7 +210,7 @@ quota_agent_profile_args() {
     fi
     if [ -z "$(env_file_value "$env_file" E2B_QUOTA_AGENT_TOKEN)" ]; then
         echo "QUOTA_AGENT_PROFILE=1 但 $env_file 缺 E2B_QUOTA_AGENT_TOKEN：" \
-            "quota-agent 拒绝无 auth 启动（deploy/quota_agent/__main__.py）" >&2
+            "quota-agent 拒绝无 auth 启动（quota_agent/__main__.py）" >&2
         return 1
     fi
     printf '%s' "--profile quota"

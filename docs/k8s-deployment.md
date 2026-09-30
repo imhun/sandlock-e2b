@@ -289,7 +289,7 @@ kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data}' | wc -c   # 只
 
 前两个表靠“列表里新旧并存”消掉中断，这三个凭据**没有双窗**：redis 只有一个
 `--requirepass`（换口令就是换那一个值），quota-agent token 是单值、缺了就拒绝启动
-（`deploy/quota_agent/__main__.py:15-19`），C3 的 CP→agent token 同样是单值、
+（`quota_agent/__main__.py:15-19`），C3 的 CP→agent token 同样是单值、
 两边都必须逐字等于 Secret 里的那个值（`c3_agent/__main__.py` 起不来）—— 所以轮换
 **必然**经过一段（这一跳的）不可用。
 2026-09-26 的用户裁定（`docs/superpowers/plans/2026-09-26-decisions.md` 第 5 条 +
@@ -298,7 +298,7 @@ kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data}' | wc -c   # 只
 | 凭据 | 步骤 | 影响面 / 不可逆窗口 | 备选 |
 |---|---|---|---|
 | `E2B_REDIS_PASSWORD` | ① 排维护窗口 ② `deploy/k8s-k0s/secrets.sh --rotate E2B_REDIS_PASSWORD` ③ `kubectl -n sandlock rollout restart deploy/redis` ④ `kubectl -n sandlock rollout restart deploy/control-plane deploy/autoscaler`（读 redis 的只有 control-plane；`autoscaler` 是控制面客户端，跟着滚是形状对齐）⑤ 从 Secret 里读新口令验收（见下） | **必然有 10–30 s 中断**：redis 带着新口令重启、到 control-plane 滚动完拿到新口令之间，共享后端（配额 / 节点视图 / 限流 / 单飞）不可用 ⇒ **建箱、路由、sandbox 记录查询全部失败**；沙箱进程本身不经过 redis，**不受影响**；`appendonly yes` ⇒ 重启从 AOF 装载，**数据不丢**。**窗口不可逆**：② 之后旧口令只活在仍在跑的 redis 进程内存里，要回去只能再轮换一次（表 3 没有 finalize 那种安全位） | **ACL 双用户**（2026-09-26 裁定**不采纳**，只作备选）：`ACL SETUSER` 建新用户 → control-plane 切到 `redis://<新用户>:<新口令>@...` → 滚动 → 删旧用户 ⇒ **零停机**。代价：要改 redis 的启动方式（`--aclfile` 或启动期 `ACL SETUSER`），且用户必须持久化，否则重启就丢 |
-| `E2B_QUOTA_AGENT_TOKEN` | 同时更新 worker 与 agent 的 Secret；**先重启 agent、再滚 worker**（顺序反了 worker 找不到 agent，但 worker 侧是降级的） | 单 token、启动即 fail-fast（`deploy/quota_agent/__main__.py:15-19`），**没有双窗**；worker 重启 = **杀沙箱**（同表 2 第 3 步） | ⚠ **k8s 形态今天没有部署 quota-agent**（`docs/production-deployment-requirements.md` §2.4.4 W4）⇒ 现在**没有影响面**，本轮只记账。将来部署 agent 时必须**同时**设计双 token（列表 + 旧值窗口），别把这条留到上线当天 |
+| `E2B_QUOTA_AGENT_TOKEN` | 同时更新 worker 与 agent 的 Secret；**先重启 agent、再滚 worker**（顺序反了 worker 找不到 agent，但 worker 侧是降级的） | 单 token、启动即 fail-fast（`quota_agent/__main__.py:15-19`），**没有双窗**；worker 重启 = **杀沙箱**（同表 2 第 3 步） | ⚠ **k8s 形态今天没有部署 quota-agent**（`docs/production-deployment-requirements.md` §2.4.4 W4）⇒ 现在**没有影响面**，本轮只记账。将来部署 agent 时必须**同时**设计双 token（列表 + 旧值窗口），别把这条留到上线当天 |
 | `E2B_C3_AGENT_TOKEN` | ① 排维护窗口 ② `deploy/k8s-k0s/secrets.sh --rotate E2B_C3_AGENT_TOKEN` ③ `kubectl -n sandlock rollout restart ds/e2b-c3-agent` ④ `kubectl -n sandlock rollout restart deploy/control-plane`（③④ 连着做，不要停在中间） | **没有双窗**：旧 token 从 ② 起对两边都不再是"同一个值"，③④ 之间 CP 与 agent 各持一半 ⇒ **这一跳的指令全部 401，建箱失败并点名**（`the agent ... refused the grant`）；**在跑的沙箱不受影响**（槽位身份只在建箱时授予一次），**worker 也不需要滚**（它一个字都不读这个凭据 —— 滚 worker 才会杀沙箱，见表 2 第 3 步）⇒ 爆炸半径就是"窗口内建不了新箱" | 若要把这一段也消掉，就得给这一跳加**列表式双窗**（`E2B_C3_AGENT_TOKENS`，与表 1/2 同形）；本轮裁定**不做**（只有一个消费者、一跳，代价与收益不成比例），要做就照表 1 的模板来 |
 
 **那 10–30 s 的中断具体在哪、谁会看到什么**（`E2B_REDIS_PASSWORD`）：

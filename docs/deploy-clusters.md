@@ -865,7 +865,7 @@ compose 车道是同一份代码、同一个镜像、同样 65534，`$HOME/.dock
 - `deploy/docker/Dockerfile.agent`：`COPY c3_agent/ /app/c3_agent/` + `CMD ["python3","-m","c3_agent"]`，
   并且**不再** COPY `deploy/__init__.py`（agent 镜像不再带 `deploy` 命名空间）；
 - 引用全局改名：`control_plane/*`、`gateway_common/worker_identity.py`、k8s 注释、14 个测试文件、
-  三份活文档与本文件的 §7.13 引用。`deploy/__init__.py` 现在只为 `deploy.quota_agent` 存在
+  三份活文档与本文件的 §7.13 引用。`deploy/__init__.py` 现在只为 `quota_agent` 存在
   （同型，本轮不动），docstring 写明这条口径；
 - **没回改**：`.superpowers/sdd/task-*-report.md` / `c3-*-report.md` 里的 `deploy/c3_agent` 是当时的
   实测记录（含 stack trace），改掉就等于篡改证据。
