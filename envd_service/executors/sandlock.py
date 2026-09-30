@@ -1503,20 +1503,15 @@ class SandlockExecutor(Executor):
                 )
             return reason
         if not cfg.privileged_starter:
-            if cfg.slot_identity == "agent-grant":
-                # C3 Task 3: nobody here changes an identity (the child unshares
-                # and the agent writes the map), so what is missing is the
-                # control-plane reporter, not a privileged starter.
-                reason = (
-                    "E2B_SLOT_IDENTITY=agent-grant needs the control-plane "
-                    "reporter, and this worker does not know where its control "
-                    "plane is (E2B_CONTROL_PLANE_URL and E2B_NODE_ID)"
-                )
-            else:
-                reason = (
-                    f"this worker cannot start a slot as uid {self._host_uid} "
-                    "(needs root / CAP_SETUID or an injected launcher spawner)"
-                )
+            # C3 Task 3 (the only shape left since N52): nobody here changes an
+            # identity -- the child unshares and the agent writes the map -- so
+            # what is missing is the control-plane reporter, not a privileged
+            # starter.
+            reason = (
+                "E2B_SLOT_IDENTITY=agent-grant needs the control-plane "
+                "reporter, and this worker does not know where its control "
+                "plane is (E2B_CONTROL_PLANE_URL and E2B_NODE_ID)"
+            )
             if forced:
                 raise RuntimeError("route B was requested but " + reason)
             if not type(self)._route_b_no_starter_warned:

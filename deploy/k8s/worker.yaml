@@ -261,16 +261,12 @@ spec:
             # supervisor -- there is no "go ahead" step, and this pod still
             # holds no capability (its `CapEff` is 0).
             #
-            # `spawn` is still the code's default, and it is the rollback --
-            # but only with the file-capable worker image, exactly like the
-            # `socket` lever. `spawn` needs `helpers.slot_spawner`
-            # (`envd_service/route_b.py`), i.e. the file-capability
-            # `e2b-slot-spawn` binary that Task 4 removed from this image;
-            # without it `privileged_starter` is false and route B simply goes
-            # unavailable (`envd_service/executors/sandlock.py`) -- not the
-            # pre-C3 behaviour. So flipping this key alone is a *half* revert:
-            # the full revert is the manifest **and** the image, see
-            # `docs/c3-privilege-relocation.md` §14.8.
+            # `spawn` (the worker performing the setuid itself, or its
+            # file-capability spawner doing it) is **gone** (2026-09-30,
+            # open-issues N52): `agent-grant` is the only mode the code accepts
+            # and every shipped manifest names it. The old starter -- and the
+            # `e2b-slot-spawn` binary it needed -- live in git if a deployment
+            # ever needs that shape back.
             #
             # ⚠ Do **not** give this pod `hostPID`. The agent's reverse lookup
             # discriminates two workers on one node by the slot child's `NSpid`

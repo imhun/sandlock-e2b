@@ -109,6 +109,9 @@ def _pool(tmp_path: Path) -> W1SlotPool:
                 "exec": {"child_id": 11, "pid": 5150},
             },
         ),
+        # The pool is built to exercise the *path naming* contract; the identity
+        # grant is a no-op stand-in -- agent-grant is the only mode left (N52).
+        identity_reporter=lambda *a: {},
         socket_timeout_s=2.0,
     )
 
@@ -134,6 +137,9 @@ def _executor(sandbox_id: str, tmp_path: Path):
             uid_start=HOST_UID,
             uid_size=2,
             tmp_root=_route_b_root(tmp_path),
+            # agent-grant is the only slot-identity mode left (N52); this case
+            # is about the slot's *path*, so the grant is a no-op stand-in.
+            identity_reporter=lambda *a: {},
         ),
     )
 

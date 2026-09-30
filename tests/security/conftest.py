@@ -186,6 +186,40 @@ def resolve_test_rootfs(image: str = "python:3.11-slim") -> Path:
     return resolve_image_rootfs(image, str(sandbox_tmpdir(suffix="-cache")))
 
 
+def _lane_identity_reporter(uid_start: int, uid_size: int):
+    """The per-node agent's write, performed in-process by the lane.
+
+    C3 grants a slot its identity by having the agent write the child's
+    ``uid_map``/``gid_map``. The one-shot lane has no agent, but its phase 1
+    runs as root -- the same capability the agent has -- so it can perform the
+    identical write on the child the pool forked. A non-root lane answers
+    ``None``: route B then declines with its named reason, exactly as a worker
+    whose agent is missing would (and `require_mediation_capable` turns that
+    into a skip rather than a false pass).
+
+    The mapping is a *range* (``uid_start .. uid_start+uid_size-1``) because the
+    reporter is handed ``(sandbox_id, pid)`` and not the uid the pool picked;
+    every uid the pool can hand out is mapped, and the sandbox's host identity
+    is the same number the pool reserved.
+    """
+    if os.geteuid() != 0:
+        return None
+
+    def report(sandbox_id: str, pid: int) -> dict:
+        mapping = f"{uid_start} {uid_start} {uid_size}\n"
+        Path(f"/proc/{pid}/uid_map").write_text(mapping, encoding="ascii")
+        try:
+            Path(f"/proc/{pid}/setgroups").write_text("deny\n", encoding="ascii")
+        except OSError:
+            # Already denied (the child or an earlier grant did it): the map
+            # below is what matters.
+            pass
+        Path(f"/proc/{pid}/gid_map").write_text(mapping, encoding="ascii")
+        return {"ok": True}
+
+    return report
+
+
 def route_b_sandbox(
     image: str | None,
     rootfs: Path | None,
@@ -261,6 +295,13 @@ def route_b_sandbox(
             uid_start=host_uid if host_uid is not None else SANDBOX_UID,
             uid_size=2,
             tmp_root=sandbox_tmpdir(suffix="-route-b"),
+            # C3 is the only slot-identity shape left (N52): every slot is
+            # granted by writing the child's map, and in this lane the root
+            # process performing the write stands in for the node's agent.
+            slot_identity="agent-grant",
+            identity_reporter=_lane_identity_reporter(
+                host_uid if host_uid is not None else SANDBOX_UID, 2
+            ),
         ),
     )
     fields.update(overrides)

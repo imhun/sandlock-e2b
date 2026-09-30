@@ -153,75 +153,6 @@ def default_supervise_bin() -> Path:
 
     return Path(sandlock.__file__).resolve().parent / "bin" / "sandlock-supervise"
 
-
-def _spawn_slot(
-    supervise_bin: Path,
-    uid: int,
-    policy_path: Path,
-    program_path: Path,
-    name: str,
-    token: str,
-    worker_uid: int,
-    stdout,
-    stderr,
-    control_fd: int | None = None,
-    events_fd: int | None = None,
-) -> subprocess.Popen:
-    if os.geteuid() != 0:
-        raise PermissionError(
-            "route-B slots need a privileged starter (root / CAP_SETUID); "
-            "a non-root worker cannot run sandlock-supervise at another uid "
-            "(route-A fixed-uid fallback applies)"
-        )
-    env = dict(os.environ)
-    # Force the per-uid default registry root (/tmp/sandlock-ctl-<uid>-registry)
-    # so the worker-side socket path formula is deterministic regardless of
-    # any inherited SANDBOX_CTL_ROOT test override.
-    env.pop("SANDBOX_CTL_ROOT", None)
-    setpriv = shutil.which("setpriv")
-    if setpriv is None:
-        raise RuntimeError("route-B slot spawn needs util-linux setpriv")
-    supervise, fd_list = _supervise_argv(
-        supervise_bin,
-        uid=uid,
-        policy_path=policy_path,
-        program_path=program_path,
-        name=name,
-        token=token,
-        worker_uid=worker_uid,
-        control_fd=control_fd,
-        events_fd=events_fd,
-    )
-    argv = [
-        setpriv,
-        "--reuid",
-        str(uid),
-        "--regid",
-        str(uid),
-        "--clear-groups",
-        "--",
-        *supervise,
-    ]
-    if fd_list:
-        return subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout,
-            stderr=stderr,
-            env=env,
-            # pass_fds clears CLOEXEC on exactly this descriptor and keeps the
-            # same number in the child, which is what --control-fd names.
-            pass_fds=tuple(fd_list),
-        )
-    return subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=stdout,
-        stderr=stderr,
-        env=env,
-    )
-
-
 def _supervise_argv(
     supervise_bin: Path,
     *,
@@ -504,7 +435,7 @@ class W1SlotPool:
         socket_timeout_s: float = 30.0,
         transport: str = "fd",
         verb_timeout_s: float = 15.0,
-        slot_identity: str = "spawn",
+        slot_identity: str = "agent-grant",
         identity_reporter: Callable[[str, int], object] | None = None,
     ) -> None:
         if transport not in ("fd", "path"):
@@ -513,11 +444,17 @@ class W1SlotPool:
                 "registry path and no token in the slot's argv) or 'path' "
                 "(a registered slot an external fleet started)"
             )
-        if slot_identity not in ("spawn", "agent-grant"):
+        if slot_identity != "agent-grant":
+            # 'spawn' -- the worker (or its file-capability spawner) performing
+            # the setuid itself -- was retired on 2026-09-30 (open-issues N52):
+            # the shipped shape is C3, where the child unshares and the
+            # per-node agent writes its identity, and nothing else. The old
+            # starter lives in this module's history if a deployment ever needs
+            # it back.
             raise ValueError(
-                "route-B slot identity must be 'spawn' (the worker starts the "
-                "slot at uid X itself) or 'agent-grant' (C3: the child "
-                "unshares and the per-node agent writes its identity)"
+                "route-B slot identity must be 'agent-grant' (C3: the child "
+                f"unshares and the per-node agent writes its identity); "
+                f"{slot_identity!r} is retired"
             )
         if slot_identity == "agent-grant" and identity_reporter is None:
             # A child whose identity nobody reports would poll setresuid until
@@ -536,15 +473,8 @@ class W1SlotPool:
         self._supervise_bin = supervise_bin or default_supervise_bin()
         if spawner is not None:
             self._spawner = spawner
-        elif slot_identity == "agent-grant":
-            self._spawner = lambda **kw: _spawn_slot_identity(
-                self._supervise_bin,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                **kw,
-            )
         else:
-            self._spawner = lambda **kw: _spawn_slot(
+            self._spawner = lambda **kw: _spawn_slot_identity(
                 self._supervise_bin,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -1943,17 +1873,32 @@ class RouteBConfig:
     transport: str = "fd"
     #: Per-verb response deadline on the slot channel (seconds).
     verb_timeout_s: float = 15.0
-    #: C3 Task 3: how a slot gets its identity. ``spawn`` (default, and the
-    #: fallback until Task 4/7) is the privileged starter above -- the worker (or
-    #: its broker) performs the ``setuid``. ``agent-grant`` is the C3 path: the
-    #: child unshares, the worker reports its pid, and the per-node agent writes
-    #: the identity. Selected by ``E2B_SLOT_IDENTITY``.
-    slot_identity: str = "spawn"
+    #: C3 Task 3: how a slot gets its identity -- and the only value left is
+    #: ``agent-grant``: the child unshares, the worker reports its pid, and the
+    #: per-node agent writes the identity. ``spawn`` (the worker, or its
+    #: file-capability broker, performing the ``setuid`` itself) was retired on
+    #: 2026-09-30 (open-issues N52) and is refused by name. Selected by
+    #: ``E2B_SLOT_IDENTITY``.
+    slot_identity: str = "agent-grant"
     #: The CP caller for ``agent-grant`` (``(sandbox_id, pid) -> answer``). It is
     #: resolved from settings/environment in production
     #: (``envd_service.worker_identity.build_identity_reporter``) and injected by
     #: tests; ``agent-grant`` without one is refused by the pool.
     identity_reporter: Callable[[str, int], object] | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse the retired mode by name -- for direct construction too.
+
+        ``from_settings`` validates as well, because a worker whose settings
+        object predates this field must not slip through; but a caller that
+        builds the config by hand (tests, embedders) is the other half.
+        """
+        if str(self.slot_identity).strip().lower() != "agent-grant":
+            raise ValueError(
+                "route-B slot identity must be 'agent-grant' (C3: the child "
+                "unshares and the per-node agent writes its identity); "
+                f"{self.slot_identity!r} is retired (open-issues N52)"
+            )
 
     @classmethod
     def from_settings(cls, settings) -> "RouteBConfig":
@@ -1973,15 +1918,15 @@ class RouteBConfig:
         from envd_service import priv_helpers
         from envd_service.worker_identity import build_identity_reporter
 
-        helpers = priv_helpers.active_helpers()
         raw_slot_identity = str(
             getattr(settings, "slot_identity", None)
-            or os.getenv("E2B_SLOT_IDENTITY", "spawn")
+            or os.getenv("E2B_SLOT_IDENTITY", "agent-grant")
         ).strip().lower()
-        if raw_slot_identity not in ("spawn", "agent-grant"):
+        if raw_slot_identity != "agent-grant":
             raise PrivHelperError(
-                "E2B_SLOT_IDENTITY must be 'spawn' or 'agent-grant' (got "
-                f"{raw_slot_identity!r})"
+                "E2B_SLOT_IDENTITY must be 'agent-grant' (the C3 shape: the "
+                "child unshares, the per-node agent writes its identity); "
+                f"{raw_slot_identity!r} is retired (open-issues N52)"
             )
         slot_identity = raw_slot_identity
         return cls(
@@ -1992,36 +1937,29 @@ class RouteBConfig:
             tmp_root=Path(
                 getattr(settings, "route_b_tmp_root", "/tmp/sandlock-route-b")
             ),
-            # Only the *spawn* path uses the broker: on ``agent-grant`` the
-            # starter is the unprivileged unshare-and-poll child, and handing
-            # the pool a broker spawner would quietly put the old privileged
-            # step back in front of the path C3 is replacing.
-            spawner=(
-                helpers.slot_spawner
-                if helpers is not None and slot_identity == "spawn"
-                else None
-            ),
+            # No broker spawner: ``agent-grant`` starts the unprivileged
+            # unshare-and-poll child, and a spawner here would put the retired
+            # privileged step back in front of it.
+            spawner=None,
             transport=str(getattr(settings, "route_b_transport", "fd")).lower(),
             verb_timeout_s=float(
                 getattr(settings, "route_b_verb_timeout_s", 15.0)
             ),
             slot_identity=slot_identity,
-            identity_reporter=(
-                build_identity_reporter(settings)
-                if slot_identity == "agent-grant"
-                else None
-            ),
+            identity_reporter=build_identity_reporter(settings),
         )
 
     @property
     def privileged_starter(self) -> bool:
-        """Can this worker start a slot at another uid?"""
-        if self.slot_identity == "agent-grant":
-            # Nobody here changes an identity: the child unshares and the agent
-            # writes the map. What the worker needs instead is a way to *report*
-            # the child -- without one the child would never be granted.
-            return self.identity_reporter is not None
-        return self.spawner is not None or os.geteuid() == 0
+        """Whether a slot can be started at all.
+
+        Nobody here changes an identity -- the child unshares and the agent
+        writes the map -- so what the pool needs is a way to *report* the child:
+        without one it would poll until its deadline and die. (The pre-C3 form
+        of this question was "is there a privileged starter: root, or a
+        file-capability spawner"; both are gone, open-issues N52.)
+        """
+        return self.identity_reporter is not None
 
 
 def reset_slot_pools() -> None:

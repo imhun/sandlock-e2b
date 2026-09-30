@@ -203,6 +203,12 @@ def _config(**over) -> RouteBConfig:
         "uid_start": 20000,
         "uid_size": 16,
         "tmp_root": Path("tmp/unit-route-b-registry"),
+        # C3 is the only slot-identity shape left (N52): the child unshares and
+        # a reporter writes its identity. These cases are about the slot
+        # machinery, so the reporter is a no-op -- the child's own polling is
+        # not what they exercise.
+        "slot_identity": "agent-grant",
+        "identity_reporter": lambda *args: {},
     }
     cfg.update(over)
     return RouteBConfig(**cfg)
@@ -303,28 +309,37 @@ def test_route_b_selection_matrix(monkeypatch, case) -> None:
     assert ex._route_b_active is case["want"]
 
 
-def test_non_root_auto_keeps_the_in_process_model_and_says_why(monkeypatch) -> None:
-    """A worker that cannot start a slot stays in-process -- with the reason on
-    record, not silently. It cannot opt into a mediation tier either: the fork
-    deleted that field (B3, 2026-09-11), so there is nothing to opt into."""
+def test_a_worker_without_a_reporter_stays_in_process_and_says_why(monkeypatch) -> None:
+    """No reporter, no slot -- and the reason is on record, not silent.
+
+    This replaced "a non-root worker without a privileged starter stays
+    in-process": with ``spawn`` retired (N52) there is no starter to lack --
+    every slot on every shape is granted by the agent, so the thing a worker
+    can lack is the *reporter*. It cannot opt into a mediation tier either:
+    the fork deleted that field (B3, 2026-09-11).
+    """
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     sl.SandlockExecutor._mediation_shape_disclosed = False
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, route_b=_config(mode="auto", identity_reporter=None))
     assert ex._route_b_active is False
-    assert "cannot start a slot as uid" in ex._route_b_decline
+    assert "needs the control-plane reporter" in ex._route_b_decline
     assert "mediation_run_as" not in ex._policy_ceiling()
+    # ...and the shape that *has* one is the production one: an unprivileged
+    # worker with no broker leases slots.
+    engaged = _executor(monkeypatch, route_b=_config(mode="auto"))
+    assert engaged._route_b_active is True
 
 
-def test_forced_route_b_without_a_privileged_starter_fails_loudly(monkeypatch) -> None:
+def test_forced_route_b_without_a_reporter_fails_loudly(monkeypatch) -> None:
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     with pytest.raises(
         RuntimeError,
-        match=(
-            r"^route B was requested but this worker cannot start a slot as uid "
-            r"20007 \(needs root / CAP_SETUID or an injected launcher spawner\)$"
-        ),
+        match=r"^route B was requested but E2B_SLOT_IDENTITY=agent-grant needs "
+        r"the control-plane reporter",
     ):
-        _executor(monkeypatch, route_b=_config(mode="on"))
+        _executor(
+            monkeypatch, route_b=_config(mode="on", identity_reporter=None)
+        )
 
 
 def test_agent_grant_engages_route_b_without_root_or_a_broker(monkeypatch) -> None:
@@ -332,27 +347,14 @@ def test_agent_grant_engages_route_b_without_root_or_a_broker(monkeypatch) -> No
 
     Nothing in this process changes an identity any more, so root is not the
     gate -- the *reporter* is. With one, a 65534 worker with no broker spawner
-    leases slots; without one, it says exactly what is missing rather than
-    forking a child nobody would ever grant.
+    leases slots; without one there is no pool at all (the sibling test above).
     """
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     engaged = _executor(
         monkeypatch,
-        route_b=_config(
-            mode="auto", slot_identity="agent-grant", identity_reporter=lambda *a: {}
-        ),
+        route_b=_config(mode="auto", identity_reporter=lambda *a: {}),
     )
     assert engaged._route_b_active is True
-
-    declined = _executor(
-        monkeypatch, route_b=_config(mode="auto", slot_identity="agent-grant")
-    )
-    assert declined._route_b_active is False
-    assert declined._route_b_decline == (
-        "E2B_SLOT_IDENTITY=agent-grant needs the control-plane reporter, and "
-        "this worker does not know where its control plane is "
-        "(E2B_CONTROL_PLANE_URL and E2B_NODE_ID)"
-    )
 
 
 def test_forced_route_b_without_a_host_uid_fails_loudly(monkeypatch) -> None:

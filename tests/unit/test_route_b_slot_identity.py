@@ -113,26 +113,31 @@ def _settings(**overrides) -> SimpleNamespace:
 # ----------------------------------------------------------- the worker's mode
 
 
-def test_the_slot_identity_mode_defaults_to_the_spawn_fallback(
+def test_the_only_slot_identity_mode_left_is_agent_grant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The broker path stays the default until Task 4/7 retire it."""
+    """C3 is the shape; the pre-C3 starter is a named refusal (N52)."""
     monkeypatch.delenv("E2B_SLOT_IDENTITY", raising=False)
-    assert Settings().slot_identity == "spawn"
+    assert Settings().slot_identity == "agent-grant"
     bare = _settings()
     del bare.slot_identity  # an embedder's settings object, not the worker's
-    assert RouteBConfig.from_settings(bare).slot_identity == "spawn"
     monkeypatch.setenv("E2B_SLOT_IDENTITY", "agent-grant")
     assert RouteBConfig.from_settings(bare).slot_identity == "agent-grant"
     # The worker's own resolved setting wins over the environment.
-    assert RouteBConfig.from_settings(_settings(slot_identity="spawn")).slot_identity == "spawn"
-    monkeypatch.setenv("E2B_SLOT_IDENTITY", "something-else")
-    with pytest.raises(PrivHelperError) as excinfo:
-        RouteBConfig.from_settings(bare)
-    assert str(excinfo.value) == (
-        "E2B_SLOT_IDENTITY must be 'spawn' or 'agent-grant' (got "
-        "'something-else')"
+    assert (
+        RouteBConfig.from_settings(_settings(slot_identity="agent-grant")).slot_identity
+        == "agent-grant"
     )
+    # Anything else -- including the retired `spawn` -- is named, not guessed.
+    for retired in ("spawn", "something-else"):
+        monkeypatch.setenv("E2B_SLOT_IDENTITY", retired)
+        with pytest.raises(PrivHelperError) as excinfo:
+            RouteBConfig.from_settings(bare)
+        assert "must be 'agent-grant'" in str(excinfo.value)
+        assert "retired" in str(excinfo.value)
+    with pytest.raises(ValueError) as excinfo:
+        RouteBConfig(slot_identity="spawn")
+    assert "retired" in str(excinfo.value)
 
 
 def test_agent_grant_needs_a_reporter_rather_than_root(
@@ -140,7 +145,6 @@ def test_agent_grant_needs_a_reporter_rather_than_root(
 ) -> None:
     """The whole point of the mode: no root, no broker -- only the CP."""
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
-    assert RouteBConfig(slot_identity="spawn").privileged_starter is False
     assert (
         RouteBConfig(slot_identity="agent-grant", identity_reporter=lambda *a: {})
         .privileged_starter
@@ -151,15 +155,12 @@ def test_agent_grant_needs_a_reporter_rather_than_root(
     ), "without a reporter the child could never be granted an identity"
 
 
-def test_agent_grant_never_hands_the_pool_the_broker_spawner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The broker is the *old* starter; on this path it must not be used.
+def test_the_pool_never_gets_a_broker_spawner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The file-capability spawner is the *old* starter, and nothing wires it.
 
-    ``RouteBConfig.from_settings`` wires ``helpers.slot_spawner`` when the worker
-    has the file-capability brokers. That spawner performs the setuid itself, so
-    on ``agent-grant`` it would put the privileged step back in front of the
-    path C3 is replacing -- and the child it starts never polls for a grant.
+    Even a worker that still resolved local helpers gets a pool with no spawner:
+    that spawner performs the setuid itself, which is exactly the privileged
+    step C3 replaced, and the child it starts never polls for a grant.
     """
     from envd_service import priv_helpers
 
@@ -170,7 +171,6 @@ def test_agent_grant_never_hands_the_pool_the_broker_spawner(
     )
     monkeypatch.setenv("E2B_CONTROL_PLANE_URL", CONTROL_PLANE_URL)
     monkeypatch.setenv("E2B_NODE_ID", NODE_ID)
-    assert RouteBConfig.from_settings(_settings(slot_identity="spawn")).spawner is not None
     agent_grant = RouteBConfig.from_settings(
         _settings(slot_identity="agent-grant")
     )
@@ -634,16 +634,6 @@ def test_a_report_the_control_plane_refuses_kills_the_child_and_refuses(
     # The uid came back with the refusal: W1 recycles it, never leaks it.
     assert pool.acquired_uid(SANDBOX_ID) is None
     assert pool.acquire_sync("sbx_after", {"ceiling": {}}, uid=20001).uid == 20001
-
-
-def test_the_spawn_fallback_reports_nothing(tmp_path: Path) -> None:
-    """The default mode is untouched: no reporter, no CP round trip."""
-    pool, _spawned, order, reports = _pool(
-        tmp_path, slot_identity="spawn", identity_reporter=None
-    )
-    pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001)
-    assert reports == []
-    assert order == ["stats"]
 
 
 def test_the_agent_grant_pool_starts_the_child_with_the_unshare_helper(

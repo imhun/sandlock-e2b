@@ -151,6 +151,10 @@ def _pool(tmp_path, *, replies=None, log=None, size=2, uid_start=20000, spawner=
         channel_factory=channel_factory or _factory,
         socket_timeout_s=socket_timeout_s,
         transport=transport,
+        # These cases are about the pool's own machinery (leases, verbs,
+        # transports); the identity grant is a no-op stand-in so the pool can
+        # be built at all -- agent-grant is the only mode left (N52).
+        identity_reporter=lambda *a: {},
     )
     return pool, spawned, log, channels
 
@@ -456,7 +460,15 @@ def test_slot_pools_are_cached_per_transport(tmp_path, monkeypatch):
         rb, "default_supervise_bin", lambda: tmp_path / "sandlock-supervise"
     )
     reset_slot_pools()
-    base = dict(uid_start=20000, uid_size=2, tmp_root=tmp_path / "reg")
+    base = dict(
+        uid_start=20000,
+        uid_size=2,
+        tmp_root=tmp_path / "reg",
+        # agent-grant is the only slot-identity mode left (N52), and the pool
+        # will not be built without a reporter; this case is about the *cache
+        # key*, so the grant itself is a no-op stand-in.
+        identity_reporter=lambda *a: {},
+    )
     fd_pool = slot_pool_for(RouteBConfig(**base, transport="fd"))
     path_pool = slot_pool_for(RouteBConfig(**base, transport="path"))
     assert fd_pool is not path_pool
@@ -690,6 +702,7 @@ def _instance(tmp_path, replies=None, log=None):
         tmp_root=tmp_path / "slots",
         supervise_bin=tmp_path / "bin",
         channel_factory=_factory,
+        identity_reporter=lambda *a: {},
     )
     inst = RouteBInstance(pool=pool, handle=handle, channel_factory=_factory)
     return inst, log, handle
