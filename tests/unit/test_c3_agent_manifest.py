@@ -754,18 +754,17 @@ def test_each_compose_stack_runs_exactly_one_agent_facing_the_control_plane() ->
         # workspaces scans, and it reports to the control plane's own name.
         assert "E2B_C3_AGENT_SCAN" not in env
         assert "E2B_CONTROL_PLANE_URL" not in env
-        if path == COMPOSE_MULTINODE:
-            # This stack has no Redis, i.e. no shared record store -- and leg (a)
-            # of the staleness gate makes the sweep inert in that shape by
-            # design. Enabling the scan here would defer on every round (log
-            # noise that looks like self-healing), so the honest state is "off,
-            # with the trigger written down in the manifest". The pin checks the
-            # premise, not the spelling: no store, no scan.
-            assert "redis" not in compose["services"]
-            assert "E2B_REDIS_URL" not in _compose_env(compose["services"]["control-plane"])
-            assert "E2B_C3_AGENT_SCAN" not in b_env
-            assert "E2B_CONTROL_PLANE_URL" not in b_env
-            continue
+        # ...and **every** one of the three stacks must carry both halves of it:
+        # the shared record store the sweep's leg (a) demands, and the scan that
+        # uses it. The multinode stack used to be the exception ("no Redis, no
+        # scan: leg (a) would defer every round"), which is what left that lane
+        # with no orphan reclamation at all; the pin is now the *premise* in
+        # both directions -- a stack with a store must run the scan, and a stack
+        # may not run it without one.
+        assert "redis" in compose["services"], path.name
+        cp_env = _compose_env(compose["services"]["control-plane"])
+        assert "E2B_REDIS_URL" in cp_env, path.name
+        assert cp_env["E2B_REDIS_URL"].startswith("redis://:"), path.name
         assert b_env["E2B_C3_AGENT_SCAN"] == "on"
         assert b_env["E2B_CONTROL_PLANE_URL"] in (
             "http://control-plane:3000",
@@ -822,6 +821,109 @@ def test_no_compose_worker_receives_the_agent_token_or_the_agent_identity() -> N
             # change as the binary removal -- a worker without the binaries and
             # still on `auto` would silently degrade to the E5.1 shape.
             assert env["E2B_PRIV_HELPER_TRANSPORT"] == "agent", (path.name, name)
+
+
+#: C3 hard rule 5's compose spelling: the network that carries `CP <-> agent`
+#: and nothing else. k8s carries the same property in
+#: `deploy/k8s/c3-agent.yaml`'s NetworkPolicy (`from: app=control-plane`, ports
+#: 49985/49986); compose has no policy engine, so the connection layer here is
+#: the *topology* -- the agent's service names exist only on this network, and
+#: no worker joins it.
+AGENT_NETWORK = "agent-plane"
+
+#: Services that declare no `user:` and therefore run as their image's user.
+#: Named so a new service cannot appear in one of these stacks without somebody
+#: deciding which uid it runs as. None of them is a C3 component, and the k8s
+#: redis Deployment pins no `runAsUser` either, so the lanes agree.
+IMAGE_DEFAULT_USER_SERVICES = {
+    "deploy/compose/docker-compose.prod.yml": {"redis", "registry"},
+    "deploy/compose/docker-compose.multinode.yml": {"redis"},
+    "deploy/stack/docker-compose.prod.yml": {"buildkit", "redis", "quota-agent"},
+}
+
+
+def test_every_compose_control_plane_runs_as_the_worker_uid() -> None:
+    """Gap 1: the compose control planes reach the k8s posture (Task 5).
+
+    `deploy/k8s/control-plane.yaml` runs its main container as `runAsUser` 65534
+    and carries no root container in the pod. The separated compose stacks ran
+    theirs as the image default (root) until this pin; 65534 is the same value
+    the k8s arm chose, for the reasons §13.6 collates (the platform's own
+    directories and the image-cache owner are 65534; `<state>/.uid_pool.lock` is
+    `0600` and another uid cannot even open it).
+
+    "No root container that does not need to be" is pinned as a *set*: exactly
+    two services in each stack may be uid 0, and both are load-bearing --
+    `image-cache-init`, the root one-shot that performs the ownership hand-over
+    (`chown` on this NAS honours uid 0 alone), and `c3-agent-maint`, face B,
+    whose `chown` of the sandbox trees has the same constraint. Everything else
+    is 65534 or an image default from the named list above.
+    """
+    for path in COMPOSE_STACKS:
+        services = _compose(path)["services"]
+        assert services["control-plane"]["user"] == "65534:65534", path.name
+        root = {n for n, s in services.items() if s.get("user") == "0:0"}
+        assert root == {"image-cache-init", "c3-agent-maint"}, (path.name, root)
+        declared = {n: s["user"] for n, s in services.items() if "user" in s}
+        assert set(declared.values()) <= {"65534:65534", "0:0"}, (path.name, declared)
+        default_user = {n for n, s in services.items() if "user" not in s}
+        # Both `deploy/compose` and `deploy/stack` ship a `docker-compose.prod.yml`,
+        # so the key is the path inside the repo, not the file name.
+        key = path.relative_to(REPO).as_posix()
+        expected = IMAGE_DEFAULT_USER_SERVICES[key]
+        assert default_user == expected, (path.name, default_user, expected)
+        # The two agent faces keep the uids/caps D22 settled: this change is
+        # about the control plane's posture, not theirs.
+        assert services["c3-agent"]["user"] == "65534:65534", path.name
+        assert services["c3-agent"]["cap_add"] == ["SETUID", "SETGID"], path.name
+        assert services["c3-agent-maint"]["cap_add"] == [
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+        ], path.name
+        for face in ("c3-agent", "c3-agent-maint"):
+            assert services[face]["cap_drop"] == ["ALL"], (path.name, face)
+
+
+def test_the_compose_agent_channel_is_a_network_no_worker_joins() -> None:
+    """Gap 2: hard rule 5's connection layer, carried by the network topology.
+
+    k8s admits only the `app=control-plane` pod to the agent's two ports. The
+    compose stacks have no NetworkPolicy, so the equivalent is that the agent's
+    two service names **only exist on `agent-plane`** -- docker's embedded DNS
+    is per network, so a worker cannot resolve `c3-agent`/`c3-agent-maint`, and
+    with no interface on that network it has no route to their addresses
+    either.
+
+    Two properties this pins could each be broken by a small edit: a worker
+    that grew `networks: [agent-plane]` would regain the channel, and a control
+    plane that dropped `default` would break `worker <-> CP`.
+    """
+    for path in COMPOSE_STACKS:
+        compose = _compose(path)
+        services = compose["services"]
+        assert compose["networks"][AGENT_NETWORK] == {"internal": True}, path.name
+        for face in ("c3-agent", "c3-agent-maint"):
+            assert services[face]["networks"] == [AGENT_NETWORK], (path.name, face)
+        assert services["control-plane"]["networks"] == [
+            "default",
+            AGENT_NETWORK,
+        ], path.name
+        workers = [name for name in services if name.startswith("worker")]
+        assert workers, path.name
+        for name in workers:
+            assert AGENT_NETWORK not in (services[name].get("networks") or []), (
+                path.name,
+                name,
+            )
+        # The property is *named* where a reader looks for it, and the agent's
+        # own outbound (the self-heal report to the control plane) stays inside
+        # the pair -- `internal: true` is what closes the third direction the
+        # k8s Egress rule closes.
+        text = path.read_text(encoding="utf-8")
+        assert "只有两条通道" in text, path.name
+        assert "CP <-> agent" in text, path.name
+        assert "worker <-> CP" in text, path.name
 
 
 def test_the_local_shapes_are_untouched() -> None:
