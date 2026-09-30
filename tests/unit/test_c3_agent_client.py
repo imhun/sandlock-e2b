@@ -306,14 +306,28 @@ def test_two_agent_pods_on_one_node_are_a_named_refusal(caplog) -> None:
 
 
 def test_the_compose_lane_resolves_its_own_host_and_nothing_else(monkeypatch) -> None:
-    """The claim must name the configured agent; DNS supplies the source IPs."""
+    """The claim must name the configured agent; DNS supplies the source IPs.
 
-    def fake_getaddrinfo(host, *args, **kwargs):
-        assert host == "c3-agent"
-        return [
+    **Both faces' addresses count as this agent's.** Compose runs the two faces
+    as two containers, so they have two addresses, and the report the check
+    exists for comes from *face B* (the scanner: it is the face that mounts the
+    workspaces). Resolving only the face-A host made every compose report a 403
+    naming the other IP, which is what the measured line on the multinode stack
+    said before this union was added.
+    """
+    by_host = {
+        "c3-agent": [
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.44.0.7", 0)),
             (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fe80::1", 0, 0, 0)),
-        ]
+        ],
+        "c3-agent-maint": [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.44.0.9", 0)),
+        ],
+    }
+
+    def fake_getaddrinfo(host, *args, **kwargs):
+        assert host in by_host, host
+        return by_host[host]
 
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
     resolver = ComposeAgentAddressResolver(
@@ -324,12 +338,32 @@ def test_the_compose_lane_resolves_its_own_host_and_nothing_else(monkeypatch) ->
         url="http://c3-agent:49985",
         pod_uid=None,
         maint_url="http://c3-agent-maint:49986",
-        source_ips=("10.44.0.7", "fe80::1"),
+        source_ips=("10.44.0.7", "fe80::1", "10.44.0.9"),
     )
     # Any other host: this lane names exactly one agent, so it answers for no
     # one else (fail closed -- "probably that one" is how a lying report would
     # get in).
     assert resolver.resolve_host("some-other-host") is None
+
+
+def test_a_compose_shape_without_a_second_face_states_only_face_as_addresses(
+    monkeypatch,
+) -> None:
+    """The union is exactly "the faces this deployment named".
+
+    A lane that names no face-B URL (``E2B_C3_AGENT_MAINT_URL`` unset) has one
+    listener, and the source-IP check stays one address wide: the composition
+    is derived from the manifest, never widened by default.
+    """
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, *a, **k: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.44.0.7", 0))
+        ],
+    )
+    resolver = ComposeAgentAddressResolver("http://c3-agent:49985")
+    assert resolver.resolve_host("c3-agent").source_ips == ("10.44.0.7",)
 
 
 def test_resolve_agent_is_fail_closed_at_every_way_it_can_fail() -> None:

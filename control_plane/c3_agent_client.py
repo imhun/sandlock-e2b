@@ -198,11 +198,33 @@ class ComposeAgentAddressResolver:
         that one". The expected source IPs come from the same name the control
         plane dials (``socket.getaddrinfo`` at request time, so a restarted
         container's new IP is followed -- §11.1 item 9's premise (b)).
+
+        **Both faces' addresses belong to this agent.** Compose has no pods, so
+        the two faces are two containers with two addresses, and the caller this
+        matters for is Task 6's self-heal report: the *scanner* is face B (it is
+        the container that mounts the workspaces), so the report arrives from
+        ``E2B_C3_AGENT_MAINT_URL``'s host, not from the face-A host the
+        instruction path is addressed by. Returning only face A's address made
+        every compose report a 403 naming the other IP (measured 2026-09-30 on
+        the multinode stack: "a report for agent c3-agent came from
+        192.168.117.3, expected 192.168.117.2"), i.e. the lane's self-heal was
+        inert for a reason the Redis gap only masked. k8s needs no union: its
+        two faces share one pod network namespace and therefore one IP.
         """
         target = self.resolve(node_identity)
         if target is None or target.node_identity != node_identity:
             return None
-        return replace(target, source_ips=_host_source_ips(node_identity))
+        hosts = [node_identity]
+        if target.maint_url:
+            maint_host = urlsplit(target.maint_url).hostname
+            if maint_host and maint_host != node_identity:
+                hosts.append(maint_host)
+        ips: list[str] = []
+        for host in hosts:
+            for ip in _host_source_ips(host):
+                if ip not in ips:
+                    ips.append(ip)
+        return replace(target, source_ips=tuple(ips))
 
 
 class K8sAgentAddressResolver:
