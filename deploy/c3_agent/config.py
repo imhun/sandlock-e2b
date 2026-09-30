@@ -44,6 +44,18 @@ class Settings:
     port: int = field(
         default_factory=lambda: _env_int("E2B_C3_AGENT_PORT", 49985)
     )
+    #: The agent's own log level (``E2B_LOG_LEVEL``), the same knob the worker
+    #: (``envd_service.config.Settings.log_level``) and the control plane
+    #: (``control_plane.config.Settings.log_level``) carry. Without it the
+    #: entry point leaves the root logger at WARNING, so every **successful**
+    #: self-heal round -- ``c3-agent inventory: node=… scanned=… protected=…
+    #: orphans=… removed=…`` -- is invisible while its *refusals* (WARNING) are
+    #: not: the one line an operator greps for "is the sweep alive?" would be
+    #: missing in exactly the case where it is alive. Measured 2026-09-30 on the
+    #: multinode stack.
+    log_level: str = field(
+        default_factory=lambda: os.getenv("E2B_LOG_LEVEL", "INFO")
+    )
     #: The Task 1 primitive. Face A is the only shipped payload of the agent
     #: image besides ``e2b-maint`` (face B, wired by a later task).
     as_uid_path: str = field(
