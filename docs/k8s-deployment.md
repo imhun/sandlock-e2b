@@ -36,7 +36,7 @@
 | ~~`priv-broker.yaml`~~ —— **已删除（C3 Task 7）** | 曾是 DaemonSet `e2b-priv-broker`（每节点一个 **root** 容器）+ socket hostPath + 3 个 init | **C1 特权外置**：`chown`/`rm`/`walk` 由它经 unix socket `/run/e2b-broker/broker.sock` 做（所以 worker pod 里没有 root）。**C3 Task 7 连同 socket 形态与 `wait-for-broker` 闸门一起退役**：同一批动作现在在 `c3-agent.yaml` 的面 B（见下一行），它的两个属主 init 与 `image-cache-init` 也搬到了那个 pod；本文里凡出现 `priv-broker.yaml` / `ds/e2b-priv-broker` 的步骤都已作废（历史保留）。（整份退役前的清单见 git 历史；能力集与客户端的对照见 `docs/c3-privilege-relocation.md` §14.5） |
 | `c3-agent.yaml` | DaemonSet `e2b-c3-agent`（**每节点一个**、**两个容器**、pod 级 `hostPID: true`）+ NetworkPolicy | **C3 的特权收敛**：面 A `agent` 是**独立镜像** `e2b-sandlock-agent`（`USER 65534:65534` + BND `SETUID/SETGID`）—— CP 把「哪个沙箱、哪个 uid、哪个 pid」发过来，它用宿主 `/proc` 把容器 pid 反查成宿主 pid 再写一次 `uid_map`；面 B `maint` 是 **root** + C1 的三条 cap（`chown`/`dac_override`/`fowner`），**Task 4 片 B 起装上了载荷**：与面 A 同一个服务，听**自己的端口 49986**（D22 —— 两个容器共享 pod netns，同端口会 `EADDRINUSE`；file op 送到 65534 的面 A 上则每个 chown 在 NAS 上 `EPERM`）。入口只允许 control-plane pod（NetworkPolicy，**两个端口**）；它与 `priv-broker` 一样**在基线里**（它的 PVC claim 与 hostPath 都是基线已有的）。**Task 5 加了 initContainer `storage-init`**（root，与面 B 同一理由）：把控制面 pod 里那份 `image-cache-init` 接过来，并按裁定 D24 把 `_volumes`（及 `_volumes/_meta`）**非递归、幂等**地交给 65534 |
 | `worker.yaml` | worker StatefulSet（2 副本 `e2b-worker-0/1`）+ headless Service + PDB | 非 root，且 **Task 4 片 B 起显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（CP 的可信身份来源读的就是 pod spec；只靠镜像 `USER` 会被读成"未知"）；**没有任何 `add`**，且 **`drop: [ALL]`**（BND 空集，字面成立 —— 镜像里的 file-capability 二进制已移出；早先省掉整个 `capabilities:` 块其实是继承了 runtime 默认 BND，收口评审改成显式 drop）；`E2B_PRIV_HELPER_TRANSPORT=agent`（文件操作与槽位身份都走每节点的 agent）+ `E2B_SLOT_IDENTITY=agent-grant` + `Localhost` seccomp profile；**没有 initContainer**（C1 那个 `wait-for-broker` 闸门已由 C3 Task 7 随 `socket` 形态一起退役） |
-| `autoscaler.yaml` | autoscaler（SA/Role/RoleBinding + Deployment） | `E2B_AS_BACKEND=k8s`，直接 scale `e2b-worker`，`MIN=1 / MAX=16` |
+| ~~`autoscaler.yaml`~~ —— **已删除（2026-09-30）** | 曾是 autoscaler（SA/Role/RoleBinding + Deployment），直接 scale `e2b-worker` | 现在它是 **control-plane 里的一个任务**（`control_plane/autoscaler_service.py`，`E2B_AS_ENABLED=true`，`E2B_AS_MIN/MAX_REPLICAS=2/16`，`E2B_AS_K8S_KIND=statefulset`）；它的 Role 两条规则并进了 `control-plane.yaml` 的 Role，那份 `E2B_AS_INTERNAL_API_KEY` 连同 Deployment 一起删掉（循环读的是进程内函数，不再是 HTTP 客户端）。形状与理由见 `docs/SCALING.md` §6.4 |
 | `seccomp-installer.yaml` | ConfigMap `sandlock-worker-seccomp` + DaemonSet `seccomp-installer` | 把 `deploy/seccomp/sandlock-worker.json` 写到**每个节点的** `/var/lib/kubelet/seccomp/sandlock-worker.json` |
 
 节点要求：
@@ -95,10 +95,10 @@ kubectl -n $NS rollout status ds/e2b-c3-agent         # 每个节点一个 Ready
 #    全新卷可以跳过。升级已存在的集群时顺序仍是 broker（6）→ agent（7）→ worker（8）。
 kubectl apply -f deploy/k8s/worker.yaml
 kubectl -n $NS rollout status sts/e2b-worker
-
-# 9) autoscaler（可选）
-kubectl apply -f deploy/k8s/autoscaler.yaml
 ```
+
+> **没有第 9 步了（2026-09-30）**：autoscaler 不再是单独下单的 Deployment —— 它是
+> control-plane 自己的一个任务，随第 4 步的 `control-plane.yaml` 一起起来（`E2B_AS_ENABLED`）。
 
 **第 5 步不能省、也不能并行**：kubelet 在**节点宿主**上解析 `Localhost` profile，节点上没有那个
 文件时 pod 根本起不来。**N4 已于 2026-09-17 在 main 集群验证**：安装器在 5 个真节点全部写入成功
@@ -124,7 +124,7 @@ agent 不在，建箱时 CP 的转发就拒（连建箱的第一步"属主交棒
 ### 镜像与升级
 
 清单里的镜像 tag 目前是占位的 `:0.1.0`。发布流程与 compose 同源：`build-and-push.sh` 把
-worker / control-plane-gateway / agent / autoscaler / quota-agent 推到 ACR，并**把版本写进
+worker / control-plane-gateway / agent / quota-agent 推到 ACR，并**把版本写进
 `deploy/stack/.version`（gitignored）**；compose 侧 `upgrade.sh` 直接读它来 pin tag，
 k8s 侧没有等价的自动机制，所以要显式把 tag 换成当次构建的版本。
 **2026-09-18 的最近一次发布**：**`0.1.0-350-g212850d-20260918-152008`**（N12/N19/N20/N21/N22-N24 与
@@ -143,9 +143,11 @@ k0s 集群都指到它，`deploy/stack/.version` 重新成为唯一权威 ——
 kubectl -n $NS set image ds/e2b-c3-agent agent=<REGISTRY>/byteplan/e2b-sandlock-agent:<VERSION> maint=<REGISTRY>/byteplan/e2b-sandlock-agent:<VERSION>
 kubectl -n $NS set image sts/e2b-worker worker=<REGISTRY>/byteplan/e2b-sandlock-worker:<VERSION>
 kubectl -n $NS set image deploy/control-plane control-plane=<REGISTRY>/byteplan/e2b-sandlock-control-plane-gateway:<VERSION>
-kubectl -n $NS set image deploy/autoscaler autoscaler=<REGISTRY>/byteplan/e2b-sandlock-autoscaler:<VERSION>
 kubectl -n $NS set image ds/seccomp-installer installer=<REGISTRY>/byteplan/e2b-sandlock-worker:<VERSION>
 ```
+
+（`deploy/autoscaler` 那一行随 2026-09-30 的合并删掉了：它没有自己的镜像，扩缩容循环烘在
+`control-plane-gateway` 里，跟着上一行走。）
 
 ⚠ **`e2b-c3-agent` 是 worker 的上游，且与 `e2b-worker` 是两个不同的仓库**。Task 4 片 B 之后
 `/var/lib/e2b-priv/e2b-maint` 只在 **agent 镜像**里（worker 镜像不再含它，判据 2/15）：
@@ -158,7 +160,7 @@ kubectl -n $NS set image ds/seccomp-installer installer=<REGISTRY>/byteplan/e2b-
 
 ⇒ 升级顺序是 **agent（`ds`）→ worker（`sts`）**，与 `deploy/k8s-k0s/apply.sh` 的 rollout 闸门一致。自查：
 `kubectl -n sandlock get deploy,sts,ds -o custom-columns='KIND:.kind,NAME:.metadata.name,IMAGES:.spec.template.spec.containers[*].image'`
-—— agent 的两个容器同 tag，worker/control-plane/autoscaler/seccomp-installer 各自一致。
+—— agent 的两个容器同 tag，worker/control-plane/seccomp-installer 各自一致。
 
 > **（C3 Task 7）撤 broker 的那一段（`/run/e2b-broker/broker.sock` 的残留、`E2B_PRIV_HELPER_SOCKET`
 > 的惰性文件）已经整段作废**：socket 形态退役了，k8s 清单里不再有那个 hostPath、那个 env 和那个
@@ -205,7 +207,6 @@ kubectl -n $NS rollout status sts/e2b-worker
 |---|---|---|
 | `control-plane.yaml` | `E2B_API_KEYS: "local-key"`、`E2B_INTERNAL_API_KEY: "internal-key"` | `secretKeyRef` → `e2b-secrets` |
 | `worker.yaml` | `E2B_INTERNAL_API_KEY: "internal-key"` | 同上（worker↔控制面） |
-| `autoscaler.yaml` | `E2B_AS_INTERNAL_API_KEY: "internal-key"` | 同上 |
 | `control-plane.yaml` + `c3-agent.yaml` | `E2B_C3_AGENT_TOKEN` | `secretKeyRef` → `e2b-secrets`（**只这两处**：worker 清单与 worker 镜像里一个字都没有 —— 有就等于把 `worker ↔ agent` 这条不存在的通道造出来；pin 在 `tests/unit/test_c3_internal_api_shape.py::test_no_worker_shape_carries_the_agent_token`。轮换见 §4.5 表 3） |
 | `redis.yaml` + `control-plane.yaml` | ✅ 已落地（redis `--requirepass` 自 `917395b`，control-plane 的 URL 自 `91a59e8`）：`--requirepass "$(REDIS_PASSWORD)"` + `redis://:$(E2B_REDIS_PASSWORD)@redis:6379/0`，两边都读 `e2b-secrets` | 保持：**不再是"无口令 redis"**，认证只能来自 Secret（`tests/unit/test_worker_manifest_permissions.py::test_k8s_redis_auth_comes_from_the_secret_not_a_literal` 钉住清单里没有字面口令、也没有 ACL 文件） |
 | 各 Deployment | `image: ...:<版本>` | 当次构建的真实版本（§2） |
@@ -234,13 +235,15 @@ worker pod 内部的进程，重启 worker 等于**杀光全部 running 沙箱**
 k8s Secret（k0s 上用 `deploy/k8s-k0s/secrets.sh`）。
 
 窗口能成立，靠的是消费者读"列表 ∪ 单值槽"（`control_plane/config.py::all_internal_api_keys`
-与 `envd_service/config.py::all_internal_api_keys` 同一语义），而且三个工作负载都拿到了那个
-列表键：`control-plane`、`e2b-worker`、`autoscaler` 各有一个 `optional: true` 的
+与 `envd_service/config.py::all_internal_api_keys` 同一语义），而且两个工作负载都拿到了那个
+列表键：`control-plane`、`e2b-worker` 各有一个 `optional: true` 的
 `E2B_INTERNAL_API_KEYS`（`secretKeyRef` → `e2b-secrets`），由
-`tests/unit/test_worker_manifest_permissions.py::test_all_three_workloads_can_accept_an_old_and_a_new_internal_key`
+`tests/unit/test_worker_manifest_permissions.py::test_both_workloads_can_accept_an_old_and_a_new_internal_key`
 钉住。`optional: true` 是必须的：窗口之外这个键根本不在 Secret 里。
-autoscaler 只是控制面的客户端（它发 `E2B_AS_INTERNAL_API_KEY` 的单值槽），窗口内它拿着旧值
-不会 401；列表键在它那里是为三处形状一致、并为以后的 server 端用途留位。
+**autoscaler 不再是第三处**（2026-09-30）：它已经是这个控制面自己的一个任务
+（`control_plane/autoscaler_service.py`，`E2B_AS_ENABLED=true`），读的是进程内函数而不是
+`E2B_AS_INTERNAL_API_KEY` 那条 HTTP 通道 —— 那份凭据连同 `deploy/k8s/autoscaler.yaml`
+一起删掉了，`docs/SCALING.md` §6.4 记了这次合并的形状。
 
 **凭据明文绝不出现**：脚本只打 `sha256(前16)`（长度顺手带上）。`--fingerprint` 打一遍全键，
 rotate 再逐成员打一遍窗口列表 —— finalize 的地址既可以是 key 本身，也可以是**那个指纹**
@@ -262,17 +265,19 @@ rotate 再逐成员打一遍窗口列表 —— finalize 的地址既可以是 k
 **不可恢复** —— 被摘掉的 key 的值已不在 Secret 里，脚本也从未打印过它；要换只能"再轮换一次"，
 走同一个窗口。验收：用新 key 跑 `deploy/scripts/deployment_smoke.py`；finalize 之后旧 key 应 401。
 
-### 表 2：`E2B_INTERNAL_API_KEY`（worker / control-plane / autoscaler 之间）
+### 表 2：`E2B_INTERNAL_API_KEY`（worker / control-plane 之间）
 
 | 步 | 动作 | 影响面 | 不可逆点 |
 |---|---|---|---|
 | 1 | `deploy/k8s-k0s/secrets.sh --rotate-internal-key`（旧 key 进列表，新 key 成主 key） | 无（列表里两个都认） | — |
 | 2 | `kubectl -n sandlock rollout restart deploy/control-plane` | CP 无感（滚动） | — |
 | 3 | `kubectl -n sandlock rollout restart statefulset/e2b-worker` | **杀掉全部 running 沙箱**（沙箱是 worker pod 内进程；树与卷数据保留）⇒ 必须低峰/窗口 | — |
-| 4 | `kubectl -n sandlock rollout restart deploy/autoscaler` | autoscaler 无感 | — |
-| 5 | `secrets.sh --finalize-internal-key-rotation sha256:<旧指纹>` + 滚动 CP | 旧 key 立即失效 | **finalize** |
+| 4 | `secrets.sh --finalize-internal-key-rotation sha256:<旧指纹>` + 滚动 CP | 旧 key 立即失效 | **finalize** |
 
-回滚：同表 1 —— 第 5 步之前回滚 = 不做（旧 key 仍在列表里生效）；第 5 步之后不可恢复，
+（2026-09-30 起没有"第 4 步滚 autoscaler"了：它不再是控制面的 HTTP 客户端，而是控制面里的一个
+任务，随第 2 步一起滚动。）
+
+回滚：同表 1 —— 第 4 步之前回滚 = 不做（旧 key 仍在列表里生效）；第 4 步之后不可恢复，
 只能再轮换一次。**第 3 步是窗口的代价**：其他步骤都能在工作时间做，只有它会让所有沙箱消失。
 
 对账（表 1–3 都用，不改任何东西、不回显明文；redis 口令也在 `--fingerprint` 的输出里。表 4 的
@@ -297,14 +302,14 @@ kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data}' | wc -c   # 只
 
 | 凭据 | 步骤 | 影响面 / 不可逆窗口 | 备选 |
 |---|---|---|---|
-| `E2B_REDIS_PASSWORD` | ① 排维护窗口 ② `deploy/k8s-k0s/secrets.sh --rotate E2B_REDIS_PASSWORD` ③ `kubectl -n sandlock rollout restart deploy/redis` ④ `kubectl -n sandlock rollout restart deploy/control-plane deploy/autoscaler`（读 redis 的只有 control-plane；`autoscaler` 是控制面客户端，跟着滚是形状对齐）⑤ 从 Secret 里读新口令验收（见下） | **必然有 10–30 s 中断**：redis 带着新口令重启、到 control-plane 滚动完拿到新口令之间，共享后端（配额 / 节点视图 / 限流 / 单飞）不可用 ⇒ **建箱、路由、sandbox 记录查询全部失败**；沙箱进程本身不经过 redis，**不受影响**；`appendonly yes` ⇒ 重启从 AOF 装载，**数据不丢**。**窗口不可逆**：② 之后旧口令只活在仍在跑的 redis 进程内存里，要回去只能再轮换一次（表 3 没有 finalize 那种安全位） | **ACL 双用户**（2026-09-26 裁定**不采纳**，只作备选）：`ACL SETUSER` 建新用户 → control-plane 切到 `redis://<新用户>:<新口令>@...` → 滚动 → 删旧用户 ⇒ **零停机**。代价：要改 redis 的启动方式（`--aclfile` 或启动期 `ACL SETUSER`），且用户必须持久化，否则重启就丢 |
+| `E2B_REDIS_PASSWORD` | ① 排维护窗口 ② `deploy/k8s-k0s/secrets.sh --rotate E2B_REDIS_PASSWORD` ③ `kubectl -n sandlock rollout restart deploy/redis` ④ `kubectl -n sandlock rollout restart deploy/control-plane`（读 redis 的只有 control-plane —— 它同时托管 autoscaler，这一步把扩缩容循环一并重起）⑤ 从 Secret 里读新口令验收（见下） | **必然有 10–30 s 中断**：redis 带着新口令重启、到 control-plane 滚动完拿到新口令之间，共享后端（配额 / 节点视图 / 限流 / 单飞，以及 2026-09-30 起 autoscaler 的 tick 单飞与冷却标记 `e2b:autoscaler:*`）不可用 ⇒ **建箱、路由、sandbox 记录查询全部失败**，扩缩容在这一段里每轮都按"无标记"决策（照常扩，但冷却会被忘，最坏多扩一次）；沙箱进程本身不经过 redis，**不受影响**；`appendonly yes` ⇒ 重启从 AOF 装载，**数据不丢**。**窗口不可逆**：② 之后旧口令只活在仍在跑的 redis 进程内存里，要回去只能再轮换一次（表 3 没有 finalize 那种安全位） | **ACL 双用户**（2026-09-26 裁定**不采纳**，只作备选）：`ACL SETUSER` 建新用户 → control-plane 切到 `redis://<新用户>:<新口令>@...` → 滚动 → 删旧用户 ⇒ **零停机**。代价：要改 redis 的启动方式（`--aclfile` 或启动期 `ACL SETUSER`），且用户必须持久化，否则重启就丢 |
 | `E2B_QUOTA_AGENT_TOKEN` | 同时更新 worker 与 agent 的 Secret；**先重启 agent、再滚 worker**（顺序反了 worker 找不到 agent，但 worker 侧是降级的） | 单 token、启动即 fail-fast（`quota_agent/__main__.py:15-19`），**没有双窗**；worker 重启 = **杀沙箱**（同表 2 第 3 步） | ⚠ **k8s 形态今天没有部署 quota-agent**（`docs/production-deployment-requirements.md` §2.4.4 W4）⇒ 现在**没有影响面**，本轮只记账。将来部署 agent 时必须**同时**设计双 token（列表 + 旧值窗口），别把这条留到上线当天 |
 | `E2B_C3_AGENT_TOKEN` | ① 排维护窗口 ② `deploy/k8s-k0s/secrets.sh --rotate E2B_C3_AGENT_TOKEN` ③ `kubectl -n sandlock rollout restart ds/e2b-c3-agent` ④ `kubectl -n sandlock rollout restart deploy/control-plane`（③④ 连着做，不要停在中间） | **没有双窗**：旧 token 从 ② 起对两边都不再是"同一个值"，③④ 之间 CP 与 agent 各持一半 ⇒ **这一跳的指令全部 401，建箱失败并点名**（`the agent ... refused the grant`）；**在跑的沙箱不受影响**（槽位身份只在建箱时授予一次），**worker 也不需要滚**（它一个字都不读这个凭据 —— 滚 worker 才会杀沙箱，见表 2 第 3 步）⇒ 爆炸半径就是"窗口内建不了新箱" | 若要把这一段也消掉，就得给这一跳加**列表式双窗**（`E2B_C3_AGENT_TOKENS`，与表 1/2 同形）；本轮裁定**不做**（只有一个消费者、一跳，代价与收益不成比例），要做就照表 1 的模板来 |
 
 **那 10–30 s 的中断具体在哪、谁会看到什么**（`E2B_REDIS_PASSWORD`）：
 
 - ② 之后、③ 之前：Secret 已是新口令、redis 进程内存里还是旧口令 —— **别在这时滚 CP**：新起的 pod 会拿着新口令连不上。②③ 连着做，不要停在中间。
-- ③ 之后、④ 滚完之前：redis 只认新口令，control-plane 内存里还是旧口令 ⇒ 共享后端认证失败，**这一段的时长就是那 10–30 s**（redis 重启 + control-plane 滚一轮；`autoscaler` 不读 redis，跟滚只是形状对齐）。
+- ③ 之后、④ 滚完之前：redis 只认新口令，control-plane 内存里还是旧口令 ⇒ 共享后端认证失败，**这一段的时长就是那 10–30 s**（redis 重启 + control-plane 滚一轮；hosted autoscaler 随它一起重起，扩缩容在这一段里拿不到冷却标记、也抢不到 tick 单飞 ⇒ 最坏多扩一次，不会漏扩）。
 - 这段窗口里谁会看到什么：`POST /sandboxes` 建箱失败、`GET /sandboxes/<id>` 等记录查询失败、路由查找失败（节点视图在 redis 里）、创建限流与单飞失效；沙箱**进程**本身照旧运行（不经过 redis），但控制面针对它的调用同样要等 redis 回来。
 - ④ 滚完之后恢复；⑤ 的 `PONG` 是收尾验收。
 
@@ -481,8 +486,8 @@ deploy/k8s-k0s/rotate-secret-master.sh finalize sha256:<rotate 打出来的旧�
 | 凭据 | 表 | 双窗？ | 要滚 worker？ | 不可逆点 | 回滚 | 验收 |
 |---|---|---|---|---|---|---|
 | `E2B_API_KEYS`（外部客户端持有的逗号列表） | §4.5 表 1 | ✅ 双窗（新旧 key 都在列表里） | ❌ 只滚 control-plane（客户端自己切） | 第 4 步 finalize 摘旧 key | finalize 之前**什么都不用做** | 新 key 跑 `deploy/scripts/deployment_smoke.py`；finalize 后旧 key 应 401 |
-| `E2B_INTERNAL_API_KEY`（worker / CP / autoscaler 之间） | §4.5 表 2 | ✅ 双窗（单值槽 + `E2B_INTERNAL_API_KEYS` 列表） | ✅ **重启 = 杀光全部 running 沙箱**（树与卷数据保留）⇒ 低峰/窗口 | 第 5 步 finalize | 同表 1（finalize 之前 = 不做） | 三处工作负载都带列表键（钉子 `test_all_three_workloads_can_accept_an_old_and_a_new_internal_key`）+ 两条冒烟 |
-| `E2B_REDIS_PASSWORD` | §4.5 表 3 | ❌ 单用户单口令（2026-09-26 裁定**接受 10–30 s 中断**，不做 ACL 双用户） | ❌ 只滚 redis + control-plane；`autoscaler` **不读 redis**，跟滚只是形状对齐 | `--rotate` 之后旧口令只剩在 redis 进程内存里 | 再轮换一次（这一类没有 finalize 那种安全位） | 带口令 `PONG`、不带口令 `NOAUTH`（命令见 §4.5 表 3 之后） |
+| `E2B_INTERNAL_API_KEY`（worker / CP 之间） | §4.5 表 2 | ✅ 双窗（单值槽 + `E2B_INTERNAL_API_KEYS` 列表） | ✅ **重启 = 杀光全部 running 沙箱**（树与卷数据保留）⇒ 低峰/窗口 | 第 4 步 finalize | 同表 1（finalize 之前 = 不做） | 两处工作负载都带列表键（钉子 `test_both_workloads_can_accept_an_old_and_a_new_internal_key`）+ 两条冒烟。**autoscaler 自 2026-09-30 起不是第三处**：它在 control-plane 内，读进程内函数 |
+| `E2B_REDIS_PASSWORD` | §4.5 表 3 | ❌ 单用户单口令（2026-09-26 裁定**接受 10–30 s 中断**，不做 ACL 双用户） | ❌ 只滚 redis + control-plane（托管 autoscaler 的也是它，循环随这一步重起） | `--rotate` 之后旧口令只剩在 redis 进程内存里 | 再轮换一次（这一类没有 finalize 那种安全位） | 带口令 `PONG`、不带口令 `NOAUTH`（命令见 §4.5 表 3 之后）。扩缩容的 `e2b:autoscaler:*` 也在这段窗口里降级（最坏多扩一次） |
 | `E2B_QUOTA_AGENT_TOKEN` | §4.5 表 3 | ❌ 单值、缺了就 fail-fast | k8s 形态**没有部署 agent** ⇒ 今天没有影响面；将来上 agent 时必须先补双 token 设计 | — | — | 本轮只记账，无验收 |
 | `E2B_SECRET_MASTER_KEY`（加密 `_secrets/**` 与 `e2b:secret:*`） | §4.6 | ✅ 三拍（rotate → 滚 CP → finalize），窗口用 `E2B_SECRET_MASTER_KEYS` | ❌ 只滚 control-plane | finalize 摘旧主 key：还在用它的记录**永久解不开** | finalize 之前 = 不做 | `rotate-secret-master.sh status` 的**三读三比**：deploy status / 每个 running 副本 `printenv` 的指纹 / CP pod 内扫 `_secrets/**` 与每条 `e2b:secret:*` 都 `encrypted:true` 且主 key 单独可解 |
 | ACR 推送凭据、跳板机 SSH 私钥/口令 | §4.5 表 4 | —（**不进** Secret） | — | 删旧凭据 / 移除旧公钥 | 再轮换一次 | **对账就是权限**：`deploy/scripts/{acr,bastion}.env` 必须是 `-rw-------`（600） |
@@ -578,9 +583,10 @@ wildcard-DNS 的 `:53`，而切了 netns 之后那个 bind 发生在沙箱自己
 `CAP_NET_BIND_SERVICE`（fork `context.rs`）。（`deploy/k8s/worker.yaml` 的注释与
 `tests/unit/test_worker_manifest_permissions.py` 都按"k8s 仍是共享 netns"钉住，切换时要一起改。）
 
-同一形态也是 `deploy/compose/docker-compose.prod.yml`、
-`deploy/compose/docker-compose.multinode.yml` 与本地池 `autoscaler/backends/local.py`
-的形态（2026-09-26 统一），四处的低端口窗口都因此不再需要。仓库里唯一还带窗口的地方是
+同一形态也是 `deploy/compose/docker-compose.prod.yml` 与
+`deploy/compose/docker-compose.multinode.yml` 的形态（2026-09-26 统一；同一批里还对
+齐了本地池 `autoscaler/backends/local.py`，那份池已在 2026-09-30 退役），各处的低端口窗口
+都因此不再需要。仓库里唯一还带窗口的地方是
 aarch64 lane 的共享 netns 套件（`deploy/scripts/arm-lane/guest-prep.sh`，lane-only）。
 
 **pid_ns（N10）**——加一条即可（没有配对守卫；pid_ns 不会让沙箱离线）：

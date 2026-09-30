@@ -64,6 +64,12 @@
 本文件里任何写死的版本号（含下面那张验收表）都只是**当天的留档**。当前状态与逐轮上线记录见
 `docs/deploy-clusters.md` §7（当前状态）+ §12（最近一次发版）。
 
+> **（2026-09-30，仓库侧变更）**：那"三个工作负载"里的 `autoscaler` **在仓库里已经没了** ——
+> 扩缩容循环现在是 control-plane 的一个后台任务（`control_plane/autoscaler_service.py`，
+> `E2B_AS_ENABLED`），它的 Role 并进了 control-plane 的 Role，镜像、清单与该 Deployment
+> 一起删除（`docs/open-issues.md` N50、`docs/SCALING.md` §6.4）。**集群要等下一次
+> `deploy/k8s-k0s/apply.sh` 才会变成这个形状**；在那之前它仍是本文实测的样子。
+
 ### 本轮的验收数字（下次拿它做对照）
 
 | 档 | 命令 | 结果 |

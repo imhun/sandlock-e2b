@@ -8,7 +8,7 @@
 # `--finalize-internal-key-rotation` 时写）—— 正好是清单里 `secretKeyRef` 读的六个名字：
 #
 #   E2B_API_KEYS            外部 API key（可放多个，逗号分隔；见 control_plane/config.py）
-#   E2B_INTERNAL_API_KEY    worker / control-plane / autoscaler 之间的内部 key
+#   E2B_INTERNAL_API_KEY    worker / control-plane 之间的内部 key
 #   E2B_INTERNAL_API_KEYS   internal key 的双窗列表（窗口之外为空/不存在）
 #   E2B_REDIS_PASSWORD      redis `--requirepass` + CP 拼出的 redis URL
 #   E2B_SECRET_MASTER_KEY   `_secrets/**` 与 redis `e2b:secret:*` 的落盘加密主 key
@@ -408,8 +408,8 @@ if [ "$mode" != "fingerprint" ]; then
         say "    1) kubectl -n $NAMESPACE rollout restart deploy/control-plane && kubectl -n $NAMESPACE rollout status deploy/control-plane"
         say "    2) kubectl -n $NAMESPACE rollout restart statefulset/e2b-worker"
         say "       （这一步会杀光全部 running 沙箱 —— 树与卷数据保留，但放低峰/窗口做）"
-        say "    3) kubectl -n $NAMESPACE rollout restart deploy/autoscaler"
-        say "    4) 三处都滚完后：deploy/k8s-k0s/secrets.sh --finalize-internal-key-rotation $(fp_label "$current_primary")"
+        say "    3) 两处都滚完后：deploy/k8s-k0s/secrets.sh --finalize-internal-key-rotation $(fp_label "$current_primary")"
+        say "       （autoscaler 自 2026-09-30 起是控制面里的一个任务，随第 1 步一起滚，没有第三次 rollout）"
     fi
 
     if [ -n "$finalize_internal" ]; then
@@ -489,8 +489,8 @@ if [ "$mode" != "fingerprint" ]; then
         say "  沙箱本身不经过 redis，不受影响；redis 是 appendonly yes ⇒ 数据不丢。"
         say "  步骤：① 排维护窗口 ② 本脚本 --rotate E2B_REDIS_PASSWORD"
         say "        ③ kubectl -n $NAMESPACE rollout restart deploy/redis"
-        say "        ④ kubectl -n $NAMESPACE rollout restart deploy/control-plane deploy/autoscaler"
-        say "           （autoscaler 不读 redis —— 它是控制面客户端，跟滚只是形状对齐，不在上面那段窗口里）"
+        say "        ④ kubectl -n $NAMESPACE rollout restart deploy/control-plane"
+        say "           （读 redis 的只有 control-plane —— 它同时托管 autoscaler，这一步把扩缩容循环一并重起）"
         say "        ⑤ redis-cli -u \"redis://:<新口令>@redis:6379\" ping 应为 PONG"
         say ""
     fi

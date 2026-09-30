@@ -575,7 +575,7 @@ def apps(workspace):
 def make_apps(workspace):
     """Factory for apps with custom control-plane settings."""
 
-    def _make(*, control_settings=None, envd_settings=None):
+    def _make(*, control_settings=None, envd_settings=None, control_kwargs=None):
         runtime_registry = RuntimeRegistry(workspace)
         control = create_control_app(
             settings=control_settings
@@ -586,6 +586,7 @@ def make_apps(workspace):
             runtime_registry=runtime_registry,
             workspace_base=workspace,
             node_address_resolver=AnyNodeLoopbackResolver(),
+            **(control_kwargs or {}),
         )
         envd = create_envd_app(
             settings=envd_settings or EnvdSettings(executor="local"),

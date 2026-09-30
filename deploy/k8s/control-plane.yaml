@@ -52,11 +52,10 @@ spec:
       # a request never lands on a replica that is already leaving.
       terminationGracePeriodSeconds: 60
       # C3 Task 2 (N49 / D5): the internal API resolves each node's *expected*
-      # address by reading that node's pod (`E2B_NODE_ADDRESS_MODE=k8s` below).
-      # This is the only API access the control plane needs -- `get` on pods in
-      # its own namespace (Role/RoleBinding at the bottom of this file) -- and
-      # it is what lets a node-scoped request be verified against the network
-      # position instead of the self-declared body.
+      # address by reading that node's pod (`E2B_NODE_ADDRESS_MODE=k8s` below),
+      # and since 2026-09-30 this pod also hosts the worker fleet's autoscaler,
+      # which scales the worker workload and retires a drained pod. Both are
+      # covered by the Role/RoleBinding at the bottom of this file.
       serviceAccountName: control-plane
       # With replicas=2 on a two-node cluster, "both replicas on one node" is a
       # single point of failure that looks like a HA setup. Required, not
@@ -249,6 +248,59 @@ spec:
               value: "64"
             - name: E2B_ENABLE_LOCAL_NODE
               value: "false"
+            # ------------------------------------------------------------------
+            # The worker fleet's autoscaler, hosted *by this app* since
+            # 2026-09-30 (it used to be the `autoscaler` Deployment + image; see
+            # `docs/k8s-deployment.md` §2 and §4.5).
+            #
+            # `E2B_AS_ENABLED` is the switch that did not exist before, and it
+            # is why dropping this Deployment is not just "one fewer manifest":
+            # exactly one control plane must reconcile the fleet, and the two
+            # replicas settle that per interval through the shared claim
+            # (`e2b:autoscaler:tick`), while the loop's cooldowns and its
+            # in-flight drain live in `e2b:autoscaler:state` -- both in the
+            # Redis above, which is what makes "one of two replicas got this
+            # interval" and "a rollout restarted the loop" safe.
+            #
+            # `E2B_AS_INTERNAL_API_KEY` is deliberately *not* here: the loop
+            # reads the fleet and asks for a drain through this app's own
+            # functions (`control_plane/fleet_view.py`), so there is no second
+            # caller of the internal API to give a credential to.
+            # ------------------------------------------------------------------
+            - name: E2B_AS_ENABLED
+              value: "true"
+            - name: E2B_AS_K8S_NAMESPACE
+              value: sandlock
+            - name: E2B_AS_K8S_DEPLOYMENT
+              # The object's *name*; the kind is the next variable. (The name is
+              # historical: it scales whichever workload `E2B_AS_K8S_KIND` names.)
+              value: e2b-worker
+            - name: E2B_AS_K8S_KIND
+              # The worker runs as a StatefulSet so its node ids survive restarts
+              # (N20): a Deployment gives every restart a new pod name, and the
+              # control plane then cannot route to the records the previous
+              # incarnation left behind. Keep this in step with worker.yaml.
+              value: statefulset
+            - name: E2B_AS_MIN_REPLICAS
+              # Two, like the compose stack: worker-1 and worker-2 always run. With
+              # MIN=1 the autoscaler drains one of the two worker replicas as soon
+              # as the fleet is idle, which is correct for an autoscaler but not the
+              # shape this manifest set is verified in (and a drained node keeps
+              # `draining: true` until it re-registers, so the next placement round
+              # silently loses half the fleet).
+              value: "2"
+            - name: E2B_AS_MAX_REPLICAS
+              # N13 closed 2026-09-17 (docs/k8s-deployment.md §13): two workers
+              # over one shared base were verified on a real cluster -- the
+              # reconciling worker protected every tree the fleet still owned
+              # (`protected_elsewhere=4`) and deleted none, the replicas were
+              # handed disjoint host uids, and the surviving worker's sandboxes
+              # kept working across a peer restart.
+              # ⚠ Precondition: the shared storage's locks must reach across
+              # nodes (NFSv4; NFSv3 + `nolock` is single-node only). The uid
+              # pool's flock is what makes two replicas safe together, and a
+              # cluster whose locks are local can hand out the same uid twice.
+              value: "16"
             # SECURITY: credentials come from the `e2b-secrets` Secret that the
             # deploy creates *before* applying this manifest set (the placeholders
             # that used to sit here are gone: a missing Secret now leaves the pod
@@ -563,12 +615,32 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
+  # Not just a pod reader since 2026-09-30: this app hosts the worker fleet's
+  # autoscaler (it used to be the `autoscaler` Deployment, whose Role carried
+  # exactly the two rules below), so the scale verbs have to live here now.
   name: control-plane-pod-reader
   namespace: sandlock
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list"]
+    # `get`/`list` are the C3 node-address resolver's (it reads each node's
+    # pod); `patch`/`delete` are the autoscaler's (`remove_node` raises one
+    # pod's pod-deletion-cost before scaling the workload down, so the
+    # controller terminates *that* pod rather than an arbitrary one). No
+    # `watch`, no `create`: the loop reads on demand and never creates a pod.
+    verbs: ["get", "list", "patch", "delete"]
+  - apiGroups: ["apps"]
+    # Both worker kinds: the baseline deploys the worker as a StatefulSet
+    # (stable pod names = stable node ids, N20), and `E2B_AS_K8S_KIND` selects
+    # which one is scaled. Keeping both here means the kind is a single value
+    # to change -- and a missing `statefulsets/scale` is a hard 403, not a
+    # silent no-op.
+    resources:
+      - deployments
+      - deployments/scale
+      - statefulsets
+      - statefulsets/scale
+    verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

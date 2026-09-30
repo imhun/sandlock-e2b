@@ -107,7 +107,7 @@ done
 ## 版本与回滚
 
 - 镜像命名：**名称区分服务、tag 区分版本**：
-  `e2b-sandlock-{control-plane-gateway,worker,autoscaler,quota-agent}:<VERSION>`
+  `e2b-sandlock-{control-plane-gateway,worker,agent,quota-agent}:<VERSION>`
   （redis 用 `redis:8-alpine`、基础镜像用 `python:3.14-slim`，本身即版本号）。
 - **每沙箱磁盘配额（可选）**：`upgrade.sh --with-quota-agent` 把
   `QUOTA_AGENT_IMAGE` 固定成 `<registry>/<ns>/e2b-sandlock-quota-agent:<VERSION>`

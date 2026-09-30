@@ -410,7 +410,11 @@ def test_rotate_redis_prints_the_accepted_window_and_the_rollout_steps(stub_clus
     )
     assert "        ③ kubectl -n sandlock rollout restart deploy/redis" in lines
     assert (
-        "        ④ kubectl -n sandlock rollout restart deploy/control-plane deploy/autoscaler"
+        "        ④ kubectl -n sandlock rollout restart deploy/control-plane"
+        in lines
+    )
+    assert (
+        "           （读 redis 的只有 control-plane —— 它同时托管 autoscaler，这一步把扩缩容循环一并重起）"
         in lines
     )
 
@@ -514,9 +518,9 @@ def test_rotate_internal_key_keeps_the_old_key_in_the_window_list(stub_cluster):
         "kubectl -n sandlock rollout status deploy/control-plane",
         "    2) kubectl -n sandlock rollout restart statefulset/e2b-worker",
         "       （这一步会杀光全部 running 沙箱 —— 树与卷数据保留，但放低峰/窗口做）",
-        "    3) kubectl -n sandlock rollout restart deploy/autoscaler",
-        "    4) 三处都滚完后：deploy/k8s-k0s/secrets.sh "
+        "    3) 两处都滚完后：deploy/k8s-k0s/secrets.sh "
         f"--finalize-internal-key-rotation {_fp('internal-old')}",
+        "       （autoscaler 自 2026-09-30 起是控制面里的一个任务，随第 1 步一起滚，没有第三次 rollout）",
         "保留 E2B_API_KEYS（已有值；要换值请显式 --rotate E2B_API_KEYS）",
         "保留 E2B_INTERNAL_API_KEY（已有值；要换值请显式 --rotate E2B_INTERNAL_API_KEY）",
         "保留 E2B_REDIS_PASSWORD（已有值；要换值请显式 --rotate E2B_REDIS_PASSWORD）",

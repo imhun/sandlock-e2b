@@ -180,10 +180,13 @@ PUSH=1 ./deploy/scripts/build-images.sh
 产出镜像，**名称区分服务、tag 区分版本**：
 `<registry>/e2b-sandlock-control-plane-gateway:<version>`（合并服务，见
 `deploy/scripts/build-and-push.sh`）、`<registry>/e2b-sandlock-worker:<version>`、
-`<registry>/e2b-sandlock-autoscaler:<version>`、
+`<registry>/e2b-sandlock-agent:<version>`、
 `<registry>/e2b-sandlock-quota-agent:<version>`（每沙箱磁盘配额的服务端 agent，
 `profiles: ["quota"]`；`./deploy/scripts/upgrade.sh --with-quota-agent` 会一并固定镜像
 与 `--profile quota`）。
+
+没有 autoscaler 镜像（2026-09-30 起）：worker 车队的扩缩容是**控制面自己的一个任务**
+（k8s 路径，`control_plane/autoscaler_service.py`），本地 Docker 池那条路已退役。
 
 **生产部署示例**（合并控制面/gateway + 多 worker + Redis 共享状态 + 可选本地
 镜像仓库）：
@@ -463,8 +466,7 @@ Redis WATCH 事务（原子，跨进程不超用），TTL 扫描跨副本一致�
 
   `E2B_IMAGE_CACHE_DIR` 控制 rootfs 解包缓存位置。**生产形态把它放在共享卷上**：
   `E2B_IMAGE_CACHE_DIR=/var/lib/e2b-sandboxes/_images`（`deploy/stack` 与 `deploy/compose`
-  的 prod/multinode/autoscale 清单都已显式设置；autoscale 还会把它放进 `E2B_AS_WORKER_ENV`，
-  否则孵化出来的 worker 拿不到）。这样缓存**跨 `up -d`、跨 worker 持久且共享**，
+  的 prod/multinode 清单都已显式设置）。这样缓存**跨 `up -d`、跨 worker 持久且共享**，
   重建 worker 不再重新拉取/解包整个 rootfs。默认值（未设 env）仍是相对路径
   `tmp/sandboxes/_images`，只适合本地开发。
 

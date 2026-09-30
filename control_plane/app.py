@@ -25,6 +25,7 @@ from control_plane.api.snapshots import (
 )
 from control_plane.api.templates import router as templates_router
 from control_plane.api.volumes import router as volumes_router
+from control_plane.autoscaler_service import build_service as build_autoscaler_service
 from control_plane.c3_agent_client import (
     C3AgentClient,
     build_agent_address_resolver,
@@ -226,6 +227,7 @@ def create_app(
     node_address_resolver=None,
     c3_agent_client=_UNSET,
     worker_identity_source=_UNSET,
+    autoscaler_backend=_UNSET,
 ) -> FastAPI:
     settings = settings or Settings()
     redis_client = None
@@ -412,6 +414,14 @@ def create_app(
         snapshot_reconcile_task = asyncio.create_task(
             snapshot_reconcile_loop(app)
         )
+        # The hosted autoscaler (k8s shape): one decision interval at a time
+        # fleet-wide (the claim inside the service), started and cancelled with
+        # this app so a rolling control plane never leaves a loop behind
+        # pointing at a process that already stopped serving.
+        if app.state.autoscaler is not None:
+            app.state.autoscaler_task = asyncio.create_task(
+                app.state.autoscaler.run_forever()
+            )
         app.state.node_health_task = health_task
         try:
             yield
@@ -433,6 +443,13 @@ def create_app(
                 await snapshot_reconcile_task
             except asyncio.CancelledError:
                 pass
+            autoscaler_task = app.state.autoscaler_task
+            if autoscaler_task is not None:
+                autoscaler_task.cancel()
+                try:
+                    await autoscaler_task
+                except asyncio.CancelledError:
+                    pass
         await sweeper.stop()
         await paused_sweeper.stop()
         await ledger_alerter.stop()
@@ -627,6 +644,17 @@ def create_app(
             total_processes=settings.max_total_processes,
         )
     app.state.select_node = app.state.nodes.select_and_reserve
+    # The autoscaler, when this deployment hosts it (the k8s shape): built
+    # here, started as a task by the lifespan below. `E2B_AS_ENABLED` is the
+    # switch -- a deployment that runs no autoscaler (a single-host compose
+    # stack, a test) leaves it off and never reaches for the k8s API.
+    app.state.autoscaler = None
+    app.state.autoscaler_task = None
+    if settings.autoscaler_enabled:
+        app.state.autoscaler = build_autoscaler_service(
+            app,
+            backend=None if autoscaler_backend is _UNSET else autoscaler_backend,
+        )
     app.add_exception_handler(OfficialError, official_error_handler)
     # Snapshots first so DELETE /templates/{snapshotID} wins over the
     # templates catch-all in the sandboxes router.

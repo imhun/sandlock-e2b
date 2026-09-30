@@ -1,12 +1,25 @@
-"""Reconcile loop: poll fleet metrics, decide, scale, drain and retire."""
+"""Reconcile loop: read fleet metrics, decide, scale, drain and retire.
+
+Since 2026-09-30 this loop is a task *of the control plane* on the k8s path
+(``control_plane/autoscaler_service.py``), not a Deployment of its own, so the
+same code now runs once per control-plane replica. Two things follow, and both
+are handled outside the decision logic:
+
+* who acts in an interval is settled by a shared claim (the control plane's
+  ``try_claim``), never by "I am the autoscaler pod";
+* what the fleet has already done -- cooldowns, the in-flight drain -- is
+  settled by :mod:`autoscaler.state`, read and written around each tick, so a
+  replica that has never ticked still honours its peer's cooldown and a
+  restarted loop still finishes the drain it started.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+from typing import Any, Protocol
 
-from autoscaler.control import ControlPlaneClient
 from autoscaler.policy import (
     FleetSnapshot,
     PolicyConfig,
@@ -15,57 +28,89 @@ from autoscaler.policy import (
     scale_down_candidates,
     scale_up_triggered,
 )
+from autoscaler.state import InMemoryLoopState, LoopMarks, LoopState
 
 logger = logging.getLogger(__name__)
+
+
+class FleetControl(Protocol):
+    """The loop's view of the fleet -- its only input, and its only action.
+
+    The standalone autoscaler satisfied this with HTTP calls to the control
+    plane; the merged one satisfies it with the control plane's own functions
+    (:class:`control_plane.autoscaler_service.InProcessFleetControl`). Two
+    methods, because the loop reads one view and asks for one thing.
+    """
+
+    def metrics(self) -> dict[str, Any]: ...
+
+    def drain(self, node_id: str) -> dict[str, Any]: ...
 
 
 class AutoscalerLoop:
     def __init__(
         self,
         *,
-        control: ControlPlaneClient,
+        control: FleetControl,
         backend,
         policy: PolicyConfig,
         poll_s: float = 5.0,
-        clock=time.monotonic,
+        # Epoch seconds, not ``time.monotonic``: the cooldowns are compared
+        # against marks another process wrote (``autoscaler.state``), and a
+        # monotonic clock has no meaning outside the process that read it.
+        clock=time.time,
+        state: LoopState | None = None,
     ) -> None:
         self._control = control
         self._backend = backend
         self._policy = policy
         self._poll_s = poll_s
         self._clock = clock
-        self._last_scale_up: float = float("-inf")
-        self._last_scale_down: float = float("-inf")
-        self._draining_node_id: str | None = None
+        self._state: LoopState = state or InMemoryLoopState()
 
-    async def run_forever(self) -> None:
-        while True:
-            try:
-                await self.tick()
-            except Exception:
-                logger.exception("autoscaler tick failed")
-            await asyncio.sleep(self._poll_s)
+    @property
+    def control(self) -> FleetControl:
+        """The fleet view and drain action this loop acts on (its only input)."""
+        return self._control
 
     async def tick(self) -> None:
+        """One reconcile round, with the marks read and written around it.
+
+        The write is skipped when the tick changed nothing (the common case on
+        an idle fleet), so a no-op round costs no store round trip.
+        """
+        marks = self._state.read()
+        before = LoopMarks(
+            last_scale_up=marks.last_scale_up,
+            last_scale_down=marks.last_scale_down,
+            draining_node_id=marks.draining_node_id,
+        )
+        try:
+            await self._reconcile(marks)
+        finally:
+            if marks != before:
+                self._state.write(marks)
+
+    async def _reconcile(self, marks: LoopMarks) -> None:
         payload = self._control.metrics()
         snapshot = parse_snapshot(payload)
         now = self._clock()
 
         # 1) Finish a pending drain: retire the node once it has no sandboxes.
-        if self._draining_node_id is not None:
-            node = self._find(snapshot, self._draining_node_id)
+        if marks.draining_node_id is not None:
+            node = self._find(snapshot, marks.draining_node_id)
             if node is None:
-                logger.info("drained node %s is gone", self._draining_node_id)
-                self._draining_node_id = None
-                self._last_scale_down = now
+                logger.info("drained node %s is gone", marks.draining_node_id)
+                marks.draining_node_id = None
+                marks.last_scale_down = now
             elif node.active_sandboxes == 0:
-                await self._retire(self._draining_node_id)
-                self._draining_node_id = None
-                self._last_scale_down = now
+                await self._retire(marks.draining_node_id)
+                marks.draining_node_id = None
+                marks.last_scale_down = now
             else:
                 logger.info(
                     "node %s draining, %s active sandboxes",
-                    self._draining_node_id,
+                    marks.draining_node_id,
                     node.active_sandboxes,
                 )
                 return
@@ -76,7 +121,7 @@ class AutoscalerLoop:
         floor = desired_for_demand(snapshot, self._policy)
         if current < floor:
             await asyncio.to_thread(self._backend.scale_to, floor)
-            self._last_scale_up = now
+            marks.last_scale_up = now
             logger.info("scaled up to warm-pool floor %s -> %s", current, floor)
 
         # 3) Reconcile orphaned drains (e.g. after an autoscaler restart the
@@ -87,19 +132,19 @@ class AutoscalerLoop:
                 node.draining
                 and node.active_sandboxes == 0
                 and node.status == "healthy"
-                and node.node_id != self._draining_node_id
+                and node.node_id != marks.draining_node_id
                 and await asyncio.to_thread(self._backend.has_node, node.node_id)
             ):
                 logger.info("reconciling orphaned drained node %s", node.node_id)
                 await self._retire(node.node_id)
-                self._last_scale_down = now
+                marks.last_scale_down = now
 
         current = self._backend.current()
 
         # 4) Scale up further on utilization / 503 pressure.
         if (
             scale_up_triggered(snapshot, self._policy)
-            and now - self._last_scale_up >= self._policy.scale_up_cooldown_s
+            and now - marks.last_scale_up >= self._policy.scale_up_cooldown_s
         ):
             desired = max(
                 current,
@@ -107,7 +152,7 @@ class AutoscalerLoop:
             )
             if desired > current:
                 await asyncio.to_thread(self._backend.scale_to, desired)
-                self._last_scale_up = now
+                marks.last_scale_up = now
                 logger.info(
                     "scaled up %s -> %s (util=%.2f, 503=%s)",
                     current,
@@ -121,19 +166,19 @@ class AutoscalerLoop:
         #    window) must not block scale-down once demand has cleared. The
         #    scale-up cooldown guard prevents same-tick scale-up + scale-down.
         if (
-            now - self._last_scale_down >= self._policy.scale_down_cooldown_s
-            and now - self._last_scale_up >= self._policy.scale_up_cooldown_s
+            now - marks.last_scale_down >= self._policy.scale_down_cooldown_s
+            and now - marks.last_scale_up >= self._policy.scale_up_cooldown_s
             and current > self._policy.min_replicas
         ):
             candidates = scale_down_candidates(snapshot, self._policy)
             if candidates:
                 target = candidates[0]
                 result = self._control.drain(target.node_id)
-                self._draining_node_id = target.node_id
+                marks.draining_node_id = target.node_id
                 if result.get("activeSandboxes", 0) == 0:
                     await self._retire(target.node_id)
-                    self._draining_node_id = None
-                    self._last_scale_down = now
+                    marks.draining_node_id = None
+                    marks.last_scale_down = now
                 else:
                     logger.info(
                         "draining node %s (%s active sandboxes)",

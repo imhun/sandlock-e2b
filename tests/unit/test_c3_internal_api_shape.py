@@ -119,13 +119,6 @@ def test_every_compose_worker_service_carries_no_forbidden_privilege() -> None:
     assert seen == 8  # worker-1..3 (prod, multinode) + worker-1..2 (stack)
 
 
-def test_the_autoscaler_never_cap_adds_net_raw() -> None:
-    """Workers the autoscaler launches must match the pinned compose shape."""
-    source = (REPO / "autoscaler" / "backends" / "local.py").read_text(encoding="utf-8")
-    assert "NET_RAW" not in source
-    assert "SYS_PTRACE" not in source
-
-
 def test_no_manifest_grants_a_proxy_sidecar_or_mesh_injection() -> None:
     """No k8s pod in this manifest set injects a proxy sidecar.
 
@@ -195,7 +188,6 @@ def test_compose_workers_dial_the_control_plane_directly() -> None:
     paths = [
         REPO / "deploy" / "compose" / "docker-compose.prod.yml",
         REPO / "deploy" / "compose" / "docker-compose.multinode.yml",
-        REPO / "deploy" / "compose" / "docker-compose.autoscale.yml",
         REPO / "deploy" / "stack" / "docker-compose.prod.yml",
     ]
     for path in paths:
@@ -239,16 +231,23 @@ def test_the_k8s_control_plane_pins_the_k8s_address_mode() -> None:
     assert _k8s_control_plane_env()["E2B_NODE_ADDRESS_NAMESPACE"] == "sandlock"
 
 
-def test_the_k8s_control_plane_can_read_pods_and_nothing_else() -> None:
-    """The `k8s` resolver needs `get pods`; the RBAC grants exactly that.
+def test_the_k8s_control_plane_holds_exactly_the_grants_it_uses() -> None:
+    """The control plane's RBAC is an exact list, and it grew by one rule set.
 
-    Without it the mode fails closed (every node-scoped request 503s), so the
-    grant is part of the shipped shape, not an operator extra.
+    Two readers use it, and the test spells out both so neither can grow
+    quietly:
 
-    C3 Task 3 (D13) extends it to `list`: the agent's address is the agent pod
-    **on the worker's node**, found with a label-scoped `list` -- `get` can only
-    answer "what is this worker pod's nodeName". The scope is unchanged (pods,
-    this namespace, nothing else).
+    * the `k8s` node-address resolver needs `get`/`list` on pods in this
+      namespace (without it the mode fails closed -- every node-scoped request
+      503s; C3 Task 3/D13 added `list` for the agent pod on the worker's node);
+    * since 2026-09-30 this pod also hosts the worker fleet's autoscaler, whose
+      `ScaleBackend` reads and scales the worker workload and retires a drained
+      pod -- the three rules below are the retired `autoscaler` Deployment's,
+      moved here verbatim (2026-09-30), so the *set* of grants is unchanged
+      even though the workload that holds them is not.
+
+    "Exactly" is the point: no wildcard verbs, no `create` (the loop only reads
+    and scales), no secrets, and no second namespace.
     """
     docs = _load_all(K8S / "control-plane.yaml")
     by_kind = {}
@@ -259,7 +258,21 @@ def test_the_k8s_control_plane_can_read_pods_and_nothing_else() -> None:
     roles = by_kind.get("Role") or []
     assert len(roles) == 1
     assert roles[0]["rules"] == [
-        {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]}
+        {
+            "apiGroups": [""],
+            "resources": ["pods"],
+            "verbs": ["get", "list", "patch", "delete"],
+        },
+        {
+            "apiGroups": ["apps"],
+            "resources": [
+                "deployments",
+                "deployments/scale",
+                "statefulsets",
+                "statefulsets/scale",
+            ],
+            "verbs": ["get", "update", "patch"],
+        },
     ]
     bindings = by_kind.get("RoleBinding") or []
     assert len(bindings) == 1
@@ -291,7 +304,6 @@ def test_every_production_compose_control_plane_pins_the_hostname_mode() -> None
     paths = [
         REPO / "deploy" / "compose" / "docker-compose.prod.yml",
         REPO / "deploy" / "compose" / "docker-compose.multinode.yml",
-        REPO / "deploy" / "compose" / "docker-compose.autoscale.yml",
         REPO / "deploy" / "stack" / "docker-compose.prod.yml",
     ]
     for path in paths:
@@ -312,19 +324,20 @@ def test_no_worker_shape_carries_the_agent_token() -> None:
 
     Two shapes are checked, because the answer differs by file: manifest sets
     that hold **only** worker-shaped services (the k8s worker StatefulSet, the
-    autoscaler's pool backend, the worker image) are scanned as raw text, while
-    the compose stacks that put the control plane, the agent and the workers in
-    one file -- the two separated examples and, since Task 4 slice B (D17), the
-    target host's stack -- have the token legitimately as the *control plane's*
-    and the *two agent faces*'; there the scan is per service and reads the
-    worker services' own env.
+    worker image) are scanned as raw text, while the compose stacks that put
+    the control plane, the agent and the workers in one file -- the two
+    separated examples and, since Task 4 slice B (D17), the target host's
+    stack -- have the token legitimately as the *control plane's* and the *two
+    agent faces*'; there the scan is per service and reads the worker
+    services' own env.
+
+    The autoscaler's local pool used to be a third raw-text source; it is
+    retired (2026-09-30) and the loop now runs inside the k8s control plane,
+    whose token surface the per-service scan of that stack already covers.
     """
     worker_only_sources = [
         K8S / "worker.yaml",
-        K8S / "autoscaler.yaml",
-        REPO / "deploy" / "compose" / "docker-compose.autoscale.yml",
         REPO / "deploy" / "docker" / "Dockerfile.envd",
-        REPO / "autoscaler" / "backends" / "local.py",
     ]
     for path in worker_only_sources:
         assert "E2B_C3_AGENT_TOKEN" not in path.read_text(encoding="utf-8"), path

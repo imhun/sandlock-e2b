@@ -1,12 +1,15 @@
 """Every worker-shaped stack declares the fleet's worker env keys (N45).
 
-`docs/open-issues.md` N45: the local pool's worker env never declared
-`E2B_PID_NS`, so a pooled sandbox shared the worker's PID namespace --
-`kill(1, 0)` answered `EPERM` for the worker's live PID 1, an existence oracle
-(measured: `getpid=81`, `kill1=EPERM`; with the key: `getpid=7`, `kill1=ok`).
-The fleet turns it on in both manifests (`deploy/k8s/worker.yaml`,
-`deploy/stack/docker-compose.prod.yml`), and the ruling on N36/N38 was "pool ==
-fleet" / "unify the shape".
+`docs/open-issues.md` N45: one stack's worker env never declared `E2B_PID_NS`,
+so its sandbox shared the worker's PID namespace -- `kill(1, 0)` answered
+`EPERM` for the worker's live PID 1, an existence oracle (measured: `getpid=81`,
+`kill1=EPERM`; with the key: `getpid=7`, `kill1=ok`). The fleet turns it on in
+both manifests (`deploy/k8s/worker.yaml`, `deploy/stack/docker-compose.prod.yml`),
+and the ruling on N36/N38 was "unify the shape".
+
+That stack was the autoscaler's local Docker pool; it is gone (2026-09-30 --
+the local compose autoscaler was retired and the loop now runs inside the k8s
+control plane), so the matrix below covers the stacks that still exist.
 
 The defect is not one key: it is that a *shape key* can be missing from a stack
 without anything going red. So this file pins the whole key set of every stack
@@ -39,8 +42,6 @@ REPO = Path(__file__).resolve().parent.parent.parent
 
 FLEET_K8S = "deploy/k8s/worker.yaml"
 FLEET_STACK = "deploy/stack/docker-compose.prod.yml"
-POOL_COMPOSE = "deploy/compose/docker-compose.autoscale.yml"
-POOL_BACKEND = "autoscaler/backends/local.py"
 COMPOSE_PROD = "deploy/compose/docker-compose.prod.yml"
 COMPOSE_MULTINODE = "deploy/compose/docker-compose.multinode.yml"
 COMPOSE_DEMO = "deploy/compose/docker-compose.yml"
@@ -98,38 +99,6 @@ def _compose_service_env(relative: str, service: str) -> dict[str, str]:
     return env
 
 
-def _pool_compose_env() -> dict[str, str]:
-    """The `E2B_AS_WORKER_ENV` JSON the autoscaler hands each spawned worker."""
-    text = (REPO / POOL_COMPOSE).read_text(encoding="utf-8")
-    lines = [
-        line for line in text.splitlines() if line.strip().startswith("E2B_AS_WORKER_ENV:")
-    ]
-    assert len(lines) == 1, lines
-    payload = lines[0].split(":", 1)[1].strip()
-    assert payload[0] == "'" and payload[-1] == "'", payload
-    return json.loads(payload[1:-1])
-
-
-def _pool_backend_env() -> dict[str, str]:
-    """The literal `self._env` dict in the local Docker backend.
-
-    This is the second place the pool declares the same shape (N38: the two
-    drifted once already). Constructor parameters (`"E2B_NODE_MEMORY_MB":
-    node_memory_mb`) are returned as the bare name; `_pool_declarations_agree`
-    only compares the quoted literals, which is where the shape keys live.
-    """
-    text = (REPO / POOL_BACKEND).read_text(encoding="utf-8")
-    start = text.index("self._env = {")
-    end = text.index("\n        }", start)
-    env: dict[str, str] = {}
-    for line in text[start:end].splitlines():
-        match = re.match(r'\s+"(E2B_[A-Z0-9_]+)":\s*(.+?),?\s*$', line)
-        if match:
-            env[match.group(1)] = match.group(2)
-    assert env, POOL_BACKEND
-    return env
-
-
 def _k8s_worker_env() -> dict[str, str]:
     """`deploy/k8s/worker.yaml`'s `- name: E2B_*` entries.
 
@@ -162,8 +131,6 @@ def _worker_envs() -> dict[str, dict[str, str]]:
     """Every stack's worker env, plus the fleet's own two declarations."""
     return {
         FLEET_STACK: _compose_service_env(FLEET_STACK, "worker-1"),
-        POOL_COMPOSE: _pool_compose_env(),
-        POOL_BACKEND: _pool_backend_env(),
         COMPOSE_PROD: _compose_service_env(COMPOSE_PROD, "worker-1"),
         COMPOSE_MULTINODE: _compose_service_env(COMPOSE_MULTINODE, "worker-1"),
         COMPOSE_DEMO: _compose_service_env(COMPOSE_DEMO, "envd"),
@@ -180,7 +147,7 @@ K8S_KEYS = set(_k8s_worker_env())
 KEY_CLASSES: dict[str, set[str]] = {
     # N27: the k8s manifest sinks the tree root and moves the platform's own
     # files under `E2B_STATE_BASE`; the compose stacks keep the one-base layout
-    # (`tests/unit/test_autoscaler_local_backend_shape.py::_k8s_env`).
+    # (`tests/unit/test_compose_base_image_shape.py::_k8s_env`).
     "k8s_state_layout": {
         "E2B_STATE_BASE",
         "E2B_SHARED_VOLUME_ROOT",
@@ -219,7 +186,7 @@ KEY_CLASSES: dict[str, set[str]] = {
     # shape; every worker that has an agent names `agent` in the same change as
     # the binary removal -- the k8s pod and the three C3 compose stacks (the two
     # separated examples and the target host's stack). The arm-lane fleet, the
-    # pool, the single-machine example and the test runner have no agent.
+    # single-machine example and the test runner have no agent.
     "priv_helper_transport": {"E2B_PRIV_HELPER_TRANSPORT"},
     # C1 (wave 2) / Task 4 slice B: the socket rollback lever
     # (`E2B_PRIV_HELPER_SOCKET` + the `wait-for-broker` gate) was the k8s
@@ -228,9 +195,9 @@ KEY_CLASSES: dict[str, set[str]] = {
     # that it stays gone lives in `test_c3_agent_manifest.py`.
     # C3 (Task 3): which path grants a route-B slot its identity. The k8s worker
     # and the two separated production compose stacks (the ones that ship a
-    # `c3-agent` service) run `agent-grant`; the arm-lane fleet stack, the local
-    # pool, the single-machine example and the test runner have no agent and
-    # keep the code default (`spawn`, the rollback lever).
+    # `c3-agent` service) run `agent-grant`; the arm-lane fleet stack, the
+    # single-machine example and the test runner have no agent and keep the
+    # code default (`spawn`, the rollback lever).
     "slot_identity": {"E2B_SLOT_IDENTITY"},
     # Named template images (`docs/HANDOFF.md`: unset = the fixed set only).
     "template_images": {"E2B_TEMPLATE_IMAGES"},
@@ -305,8 +272,6 @@ EXTRA_CLASSES: dict[str, set[str]] = {
     },
     # Legacy, accepted and ignored (the fork dropped per-sandbox veth/netns).
     "legacy_enable_netns": {"E2B_ENABLE_NETNS"},
-    # The pool chooses its executor (N38's rollback lever).
-    "pool_executor": {"E2B_EXECUTOR"},
     # N16's default flip (2026-09-27): `E2B_PURE_ROOTFS` is `synth` in the
     # product now, and the single-machine example is a *pure* stack (no base
     # image) run under Docker's own default seccomp profile -- which does not
@@ -370,26 +335,12 @@ _C3_COMPOSE_MISSING = (
     - KEY_CLASSES["priv_helper_transport"]
 )
 
-#: The local pool: the autoscaler builds the worker's `docker run` argv itself,
-#: so its env JSON is the worker's whole environment -- no workspace base, no
-#: per-worker wiring (those are `-e` flags), no templates/brokers.
-#: ...and since ruling D23 it *does* declare `E2B_PRIV_HELPERS=off`: the worker
-#: image lost its file-capability binaries, and a shape with no agent has to
-#: say out loud that it has no privileged file operations (rather than letting
-#: `auto` resolve nothing and warn once).
-_POOL_MISSING = (
-    _COMPOSE_EXAMPLE_MISSING
-    | KEY_CLASSES["worker_wiring"]
-    | {"E2B_WORKSPACE_BASE"}
-    | KEY_CLASSES["slot_identity"]
-) - KEY_CLASSES["priv_helpers"]
-
 #: The single-machine build example (`docker-compose.yml`): one `envd`, no
 #: control-plane wiring, no node budget, cache-only env plus the shape switch.
 #: It declares its (absent) file-operation capability for the same reason the
-#: pool does (D23) -- and the key is an *upgrade* from silence: this example
-#: used to rely on the worker image's binaries and refused to start when its
-#: route-B root was outside their whitelist.
+#: retired pool did (D23) -- and the key is an *upgrade* from silence: this
+#: example used to rely on the worker image's binaries and refused to start
+#: when its route-B root was outside their whitelist.
 _DEMO_MISSING = (
     _COMPOSE_EXAMPLE_MISSING
     | KEY_CLASSES["worker_wiring"]
@@ -422,8 +373,6 @@ _RUNNER_MISSING = (
 #: namespace is the one shape key every worker-shaped stack must carry (N45).
 ALLOWED_MISSING: dict[str, set[str]] = {
     FLEET_STACK: _FLEET_STACK_MISSING,
-    POOL_COMPOSE: _POOL_MISSING,
-    POOL_BACKEND: _POOL_MISSING | KEY_CLASSES["base_image"],
     COMPOSE_PROD: _C3_COMPOSE_MISSING,
     COMPOSE_MULTINODE: _C3_COMPOSE_MISSING,
     COMPOSE_DEMO: _DEMO_MISSING,
@@ -439,8 +388,6 @@ ALLOWED_EXTRA: dict[str, set[str]] = {
         | EXTRA_CLASSES["compose_template_defaults"]
         | EXTRA_CLASSES["legacy_enable_netns"]
     ),
-    POOL_COMPOSE: EXTRA_CLASSES["pool_executor"],
-    POOL_BACKEND: set(),
     COMPOSE_PROD: (
         EXTRA_CLASSES["compose_quota_agent"]
         | EXTRA_CLASSES["compose_registry_pull"]
@@ -528,45 +475,6 @@ def test_every_worker_stack_turns_on_the_per_sandbox_pid_namespace() -> None:
     # worker-2 (`E2B_PID_NS_WORKER2`), which the anchors above inherit.
     worker2 = _compose_service_env(FLEET_STACK, "worker-2")
     assert _effective_default(worker2["E2B_PID_NS"]) == fleet
-
-
-def test_the_pools_two_declarations_agree() -> None:
-    """The hand-built `DockerPoolBackend()` must not fall behind the JSON.
-
-    N38 was exactly this drift in reverse: the compose JSON was the entry
-    point, the backend's own dict was not, and the shape only held when an
-    operator used the former.
-    """
-    compose_env = _pool_compose_env()
-    backend_env = _pool_backend_env()
-    assert set(backend_env) <= set(compose_env), sorted(set(backend_env) - set(compose_env))
-    literals = {
-        key: value for key, value in backend_env.items() if value.startswith('"')
-    }
-    # Every quoted literal in the dict is the same string the JSON declares
-    # (the two unquoted ones are the constructor parameters for the node
-    # budget, pinned by `test_spawned_worker_argv_...` in the pool's own file).
-    assert {key: _unquote(value) for key, value in literals.items()} == {
-        key: compose_env[key] for key in literals
-    }
-    # The shape keys are declared as literals, so they are covered above; spell
-    # out that the list is not empty (an all-parameterised dict would vacate it).
-    assert "E2B_PID_NS" in literals
-
-
-def test_the_pool_pins_off_and_does_not_merely_agree_with_itself() -> None:
-    """D23: `off` is the *value*, and it is pinned in both declarations.
-
-    `test_the_pools_two_declarations_agree` compares the backend dictionary
-    against the compose JSON -- so flipping **both** to `auto` would stay green
-    while the pool went back to "resolve no brokers, log one warning, keep the
-    E5.1 shape": exactly the silent downgrade D23 exists to prevent. These two
-    assertions are on the value itself, one per place the pool declares its
-    worker env (the JSON the autoscaler hands each spawned worker, and the
-    hand-built `DockerPoolBackend`).
-    """
-    assert _pool_compose_env()["E2B_PRIV_HELPERS"] == "off"
-    assert _unquote(_pool_backend_env()["E2B_PRIV_HELPERS"]) == "off"
 
 
 def test_the_three_multinode_workers_declare_the_same_env_keys() -> None:

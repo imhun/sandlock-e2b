@@ -8,6 +8,12 @@
 > [`docs/reports/`](reports/)（原名不变）；`tmp/**.log` 一律是**原始日志**（会被清、可重跑，
 > 脚本见 `deploy/scripts/acceptance/`）。
 
+> **本地池已退役（2026-09-30）**：本文里凡以「本地池」为对象的要求（`autoscaler/backends/local.py`
+> 与 `deploy/compose/docker-compose.autoscale.yml`：seccomp 形态、`E2B_AS_WORKER_ENV` 的键集、
+> 池 worker 的 uid/路由形态…）都随这两个文件一起失效 —— 本地 compose 不再做 autoscaler，
+> k8s 路径的扩缩容循环已收进 control plane。判定与形状见 `docs/open-issues.md` N50 与
+> `docs/SCALING.md` §6.4/§7；下文保留原文作为历史记录。
+
 ## 1. 前置条件（已确认目标机满足）
 
 | 要求 | 目标机现状 | 达标 |

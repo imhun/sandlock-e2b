@@ -63,7 +63,7 @@ registry 表在这件事上不变。
 
 | 轮换的键 | 影响面 | 不可逆窗口 / 备注 |
 |---|---|---|
-| `E2B_REDIS_PASSWORD` | **10–30 s 中断**：redis 带着新口令重启、到 **control-plane** 滚动完拿到新口令之间，共享后端（配额/节点视图/限流/单飞）不可用 ⇒ 建箱与路由失败。沙箱本身不经过 redis，不受影响 | 2026-09-26 裁定**接受**这段中断，不做 ACL 双用户热轮换（`docs/superpowers/plans/2026-09-26-decisions.md` 第 5 条）。redis 是 `appendonly yes` ⇒ 数据不丢。顺序：`secrets.sh --rotate E2B_REDIS_PASSWORD` → `rollout restart deploy/redis` → `rollout restart deploy/control-plane deploy/autoscaler`（**`autoscaler` 不读 redis** —— 它是控制面客户端，跟滚只是形状对齐，不在那段中断里） |
+| `E2B_REDIS_PASSWORD` | **10–30 s 中断**：redis 带着新口令重启、到 **control-plane** 滚动完拿到新口令之间，共享后端（配额/节点视图/限流/单飞，以及 autoscaler 的 tick 单飞与冷却标记）不可用 ⇒ 建箱与路由失败。沙箱本身不经过 redis，不受影响 | 2026-09-26 裁定**接受**这段中断，不做 ACL 双用户热轮换（`docs/superpowers/plans/2026-09-26-decisions.md` 第 5 条）。redis 是 `appendonly yes` ⇒ 数据不丢。顺序：`secrets.sh --rotate E2B_REDIS_PASSWORD` → `rollout restart deploy/redis` → `rollout restart deploy/control-plane`（**读 redis 的只有 control-plane** —— 它同时托管 autoscaler，这一步把扩缩容循环一并重起） |
 | `E2B_API_KEYS` / `E2B_INTERNAL_API_KEY` | **双窗轮换**：新 key 与旧 key 并存 → 滚动 → finalize 摘旧 key，中间不断服。唯一掉东西的一步是 internal key 的 worker 滚动 = **杀光全部 running 沙箱**（树与卷数据保留） | `secrets.sh --rotate-api-keys` / `--rotate-internal-key`，完事用 `--finalize-api-key-rotation` / `--finalize-internal-key-rotation <旧 key 或它的 sha256 前 16 位>` 收口；两张表的 runbook 见 `docs/k8s-deployment.md` §4.5。⚠ `--rotate E2B_API_KEYS` / `--rotate E2B_INTERNAL_API_KEY` 仍是**单槽换值**（旧 key 立刻失效），要窗口别用它 |
 | `E2B_SECRET_MASTER_KEY` | 脚本**拒绝**就地轮换：旧 key 必须先留在 `E2B_SECRET_MASTER_KEYS`，否则既有 `_secrets/**` 与 redis `e2b:secret:*` 的密文永远解不开 | 两窗三拍（rotate → 滚 CP → finalize）由 `deploy/k8s-k0s/rotate-secret-master.sh` 承担；"全副本已滚动"的三条判据与 runbook 见 `docs/k8s-deployment.md` §4.6 |
 
@@ -260,8 +260,10 @@ worker、读 pod 日志）。
 | `deploy/scripts/multiworker_interference.py` | **N13**：两副本共用一份 base 不互相破坏（重启一个 worker 后断言树都在、`deleted=0`、幸存者的沙箱照常读写） | ~3.5 min |
 | `deploy/scripts/heartbeat_gaps.py` | 心跳空档：从控制面访问日志算每个节点的真实间隔，与配置的 `E2B_NODE_HEARTBEAT_TIMEOUT` 对比（空档打到窗口就说明活节点被判成 unhealthy）。定/改那个窗口前先跑它 | < 5 s |
 
-跑 N13 那个之前**先把 autoscaler 停掉**（`kubectl -n sandlock scale deploy/autoscaler
---replicas=0`），它会按需求缩容/扩容，与"重启一个 worker 再看结果"互相干扰。
+跑 N13 那个之前**先把 autoscaler 停掉**：`kubectl -n sandlock set env deploy/control-plane
+E2B_AS_ENABLED=false`（跑完再 `set env ... E2B_AS_ENABLED=true` —— 它自 2026-09-30 起是
+**control-plane 里的一个任务**，不再是独立的 `deploy/autoscaler`），因为它会按需求缩容/
+扩容，与"重启一个 worker 再看结果"互相干扰。
 
 ## 已知未完成项
 

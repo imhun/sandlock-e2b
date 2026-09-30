@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from autoscaler.control import ControlPlaneClient
 from autoscaler.loop import AutoscalerLoop
 from autoscaler.policy import PolicyConfig
+from autoscaler.state import InMemoryLoopState
 from tests.unit.test_autoscaler_policy import _node, _payload
 
 
@@ -43,10 +43,12 @@ class FakeBackend:
 
 
 def _loop(control, backend, **cfg):
+    state = cfg.pop("state", None)
     return AutoscalerLoop(
         control=control,
         backend=backend,
         policy=PolicyConfig(**cfg),
+        state=state,
     )
 
 
@@ -170,3 +172,86 @@ async def test_stale_503_latch_does_not_block_scale_down():
     await loop.tick()
     assert control.drained == ["a"]
     assert backend.removed == ["a"]
+
+
+async def test_cooldown_is_shared_between_replicas():
+    """Two control-plane replicas run two loops; the marks are not theirs.
+
+    The merged (k8s) shape hosts the loop in the control plane, so which
+    replica wins the tick claim changes from tick to tick. A replica that has
+    never ticked must still honour its peer's scale-up cooldown -- otherwise
+    the fleet grows once per replica per cooldown window.
+    """
+    payload = _payload([_node("a"), _node("b")], fleet_util=0.8, active=8)
+    store = InMemoryLoopState()
+    backend = FakeBackend(current=2)
+
+    first = _loop(
+        FakeControl([payload]),
+        backend,
+        warmup_buffer=1,
+        scale_up_cooldown_s=60,
+        state=store,
+    )
+    await first.tick()
+    second = _loop(
+        FakeControl([payload]),
+        backend,
+        warmup_buffer=1,
+        scale_up_cooldown_s=60,
+        state=store,
+    )
+    await second.tick()
+
+    assert backend.scaled == [3]
+
+
+async def test_an_in_flight_drain_is_shared_between_replicas():
+    """A drain the peer started must be finished, not duplicated.
+
+    The loop holds the fleet at one drain at a time by returning early while a
+    node drains (step 1). When the loop is restarted -- a control-plane
+    rollout, which the merged shape makes routine -- that in-memory "am I
+    draining" answer is gone, and the next tick would start draining a second
+    node while the first still holds live sandboxes.
+    """
+
+    class DelayedControl(FakeControl):
+        def drain(self, node_id):
+            self.drained.append(node_id)
+            return {"nodeID": node_id, "activeSandboxes": 3}
+
+    store = InMemoryLoopState()
+    backend = FakeBackend(current=3)
+    first_control = DelayedControl(
+        [_payload([_node("a"), _node("b"), _node("c")], fleet_util=0.1)]
+    )
+    first = _loop(
+        first_control,
+        backend,
+        min_replicas=1,
+        scale_down_util=0.4,
+        state=store,
+    )
+    await first.tick()
+    assert first_control.drained == ["a"]
+
+    second_control = DelayedControl(
+        [
+            _payload(
+                [_node("a", draining=True, active=3), _node("b"), _node("c")],
+                fleet_util=0.1,
+            )
+        ]
+    )
+    second = _loop(
+        second_control,
+        backend,
+        min_replicas=1,
+        scale_down_util=0.4,
+        state=store,
+    )
+    await second.tick()
+
+    assert second_control.drained == []
+    assert backend.removed == []

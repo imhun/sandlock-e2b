@@ -426,6 +426,66 @@ class Settings:
     enable_local_node: bool = field(
         default_factory=lambda: _env_bool("E2B_ENABLE_LOCAL_NODE", True)
     )
+    # ------------------------------------------------------------------
+    # The worker fleet's autoscaler (``E2B_AS_*``).
+    #
+    # It used to be a Deployment of its own, reading this control plane over
+    # ``GET /internal/fleet/metrics``; since 2026-09-30 the k8s path hosts the
+    # loop *in* this app (``control_plane/autoscaler_service.py``), so its
+    # knobs arrive here under the names ``deploy/k8s/autoscaler.yaml`` already
+    # used. ``E2B_AS_ENABLED`` is the one switch that did not exist before: it
+    # is what makes this control plane -- rather than a second pod -- the actor
+    # that reconciles the worker fleet.
+    #
+    # The Docker pool backend went with the standalone process (the local
+    # compose stack no longer autoscales), so the backend these coordinates
+    # name is the cluster's worker workload and nothing else.
+    # ------------------------------------------------------------------
+    autoscaler_enabled: bool = field(
+        default_factory=lambda: _env_bool("E2B_AS_ENABLED", False)
+    )
+    autoscaler_poll_s: int = field(
+        default_factory=lambda: _env_int("E2B_AS_POLL_S", 5)
+    )
+    autoscaler_min_replicas: int = field(
+        default_factory=lambda: _env_int("E2B_AS_MIN_REPLICAS", 1)
+    )
+    autoscaler_max_replicas: int = field(
+        default_factory=lambda: _env_int("E2B_AS_MAX_REPLICAS", 16)
+    )
+    autoscaler_util_threshold: float = field(
+        default_factory=lambda: _env_float("E2B_AS_UTIL_THRESHOLD", 0.70)
+    )
+    autoscaler_scale_up_cooldown_s: int = field(
+        default_factory=lambda: _env_int("E2B_AS_SCALE_UP_COOLDOWN_S", 60)
+    )
+    autoscaler_scale_down_cooldown_s: int = field(
+        default_factory=lambda: _env_int("E2B_AS_SCALE_DOWN_COOLDOWN_S", 600)
+    )
+    autoscaler_scale_down_util: float = field(
+        default_factory=lambda: _env_float("E2B_AS_SCALE_DOWN_UTIL", 0.40)
+    )
+    autoscaler_node_scale_down_util: float = field(
+        default_factory=lambda: _env_float("E2B_AS_NODE_SCALE_DOWN_UTIL", 0.0)
+    )
+    autoscaler_warmup_buffer: int = field(
+        default_factory=lambda: _env_int("E2B_AS_WARMUP_BUFFER", 1)
+    )
+    autoscaler_k8s_namespace: str = field(
+        default_factory=lambda: os.getenv("E2B_AS_K8S_NAMESPACE", "default")
+    )
+    #: The worker workload's *name*; the kind is the next field. (The name is
+    #: historical: it scales whichever workload ``autoscaler_k8s_kind`` names.)
+    autoscaler_k8s_deployment: str = field(
+        default_factory=lambda: os.getenv("E2B_AS_K8S_DEPLOYMENT", "e2b-worker")
+    )
+    #: ``deployment`` or ``statefulset``. The baseline runs the worker as a
+    #: StatefulSet so its node ids survive restarts (N20); a cluster still on
+    #: the older Deployment manifests selects ``deployment``. A value that is
+    #: neither is refused at startup rather than 404ing every tick.
+    autoscaler_k8s_kind: str = field(
+        default_factory=lambda: os.getenv("E2B_AS_K8S_KIND", "deployment")
+    )
     redis_url: str | None = field(default_factory=lambda: os.getenv("E2B_REDIS_URL"))
     gateway_url: str | None = field(default_factory=lambda: os.getenv("E2B_GATEWAY_URL"))
     buildkit_addr: str = field(

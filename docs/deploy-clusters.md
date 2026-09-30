@@ -94,6 +94,12 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 `redis`（Deployment）、`seccomp-installer`（DaemonSet，2/2）、
 `gateway-nodeport`（NodePort **31907**）、`gateway` / `control-plane` / `redis` /
 `worker-headless`（ClusterIP）。**（2026-09-29，C3 Task 7 起）**：基线的 DaemonSet 有两个 ——
+
+> **（2026-09-30，仓库侧变更；集群按这份实测照旧）**：`autoscaler` 这个 Deployment
+> **在仓库里已经不存在了** —— 扩缩容循环被 control-plane 收进去（`E2B_AS_ENABLED=true`，
+> 见 `docs/open-issues.md` N50 与 `docs/SCALING.md` §6.4）。所以本文里凡是"实测到
+> `autoscaler 1/1`"的记录都对，但**下一次 `deploy/k8s-k0s/apply.sh` 之后**，这里会少一个
+> Deployment、`control-plane` 会多一份 RBAC（scale/evict）；在那之前集群仍是旧形态。
 `e2b-c3-agent`（每节点一个，两个容器：非 root 的面 A + root 的面 B）与 `seccomp-installer`；
 C1 那个 `e2b-priv-broker`（每节点一个 root broker，`chown`/`rm`/`walk` 经 unix socket 代做）
 **已随 `socket` 形态一起退役**，现行的特权动作只在 agent 面 B 里（见 §7.9 与

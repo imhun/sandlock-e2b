@@ -48,13 +48,13 @@ COMPOSE_MULTINODE = DEPLOY / "compose" / "docker-compose.multinode.yml"
 #: privileged binary too, so leaving it out would break it silently.
 COMPOSE_STACK = DEPLOY / "stack" / "docker-compose.prod.yml"
 COMPOSE_STACKS = (COMPOSE_PROD, COMPOSE_MULTINODE, COMPOSE_STACK)
-#: The shapes C3 deliberately does *not* cover: the single-machine example and
-#: the autoscaler's local pool. `local://` is out of scope (Global
-#: Constraints), so the agent must not leak into them.
-LOCAL_SHAPES = (
-    DEPLOY / "compose" / "docker-compose.yml",
-    DEPLOY / "compose" / "docker-compose.autoscale.yml",
-)
+#: The shape C3 deliberately does *not* cover: the single-machine example.
+#: `local://` is out of scope (Global Constraints), so the agent must not leak
+#: into it. The autoscaler's local pool was the second entry; it is retired
+#: (2026-09-30 -- the local compose autoscaler is gone, and the k8s control
+#: plane hosts the loop), which is exactly why this tuple is now one file: a
+#: shape that no longer exists cannot be kept honest by a test.
+LOCAL_SHAPES = (DEPLOY / "compose" / "docker-compose.yml",)
 
 #: The agent's pod label. It is also the resolver's lookup key
 #: (`E2B_C3_AGENT_LABEL`), so it must exist on exactly one workload and never
@@ -541,13 +541,30 @@ def test_the_control_plane_role_may_read_and_list_pods() -> None:
 
     `get` alone could answer "what is worker pod X's nodeName" but not "which
     agent pod runs on that node": that is a label-scoped `list`. The Role stays
-    namespaced and reads pods and nothing else.
+    namespaced and reads pods -- and (since 2026-09-30, when it absorbed the
+    retired `autoscaler` Deployment's Role) the worker workload it scales.
+    `tests/unit/test_c3_internal_api_shape.py` makes the same list exact from
+    the other side.
     """
     docs = _load_all(CONTROL_PLANE_MANIFEST)
     roles = [doc for doc in docs if doc.get("kind") == "Role"]
     assert len(roles) == 1
     assert roles[0]["rules"] == [
-        {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]}
+        {
+            "apiGroups": [""],
+            "resources": ["pods"],
+            "verbs": ["get", "list", "patch", "delete"],
+        },
+        {
+            "apiGroups": ["apps"],
+            "resources": [
+                "deployments",
+                "deployments/scale",
+                "statefulsets",
+                "statefulsets/scale",
+            ],
+            "verbs": ["get", "update", "patch"],
+        },
     ]
 
 
@@ -1036,15 +1053,15 @@ def test_the_local_shapes_are_untouched() -> None:
 def test_the_shapes_excluded_from_c3_declare_that_they_have_no_file_ops() -> None:
     """D23: an excluded shape says so in its own manifest, not by silence.
 
-    The single-machine example and the autoscaler's docker pool both relied on
-    the worker image's file-capability binaries. Task 4 slice B removed them,
-    so `E2B_PRIV_HELPERS=auto` would now resolve nothing, log a single warning
-    and keep the in-process (E5.1) shape -- no per-sandbox host uid, no
-    route-B. For the example that is also a *downgrade in loudness*: its
-    default route-B root is outside the broker whitelist, so it used to refuse
-    to start.
+    The single-machine example (and the autoscaler's docker pool, until it was
+    retired on 2026-09-30) relied on the worker image's file-capability
+    binaries. Task 4 slice B removed them, so `E2B_PRIV_HELPERS=auto` would now
+    resolve nothing, log a single warning and keep the in-process (E5.1) shape
+    -- no per-sandbox host uid, no route-B. For the example that is also a
+    *downgrade in loudness*: its default route-B root is outside the broker
+    whitelist, so it used to refuse to start.
 
-    Ruling D23: both are excluded from C3's coverage **by name** (like
+    Ruling D23: both were excluded from C3's coverage **by name** (like
     `local://`), and each has to *declare* its absent file-operation capability
     in its own manifest -- `off` is the value `E2B_PRIV_HELPERS` already has
     for "never use the brokers". A reader can then answer "what does this shape
@@ -1053,12 +1070,8 @@ def test_the_shapes_excluded_from_c3_declare_that_they_have_no_file_ops() -> Non
     # The single-machine example: a plain env key on its only worker.
     demo = _compose(LOCAL_SHAPES[0])["services"]["envd"]
     assert _compose_env(demo)["E2B_PRIV_HELPERS"] == "off"
-    # The pool: the declaration lives in the JSON the autoscaler hands every
-    # worker it spawns (the only place that shape's env is written).
-    pool = _compose(LOCAL_SHAPES[1])["services"]["autoscaler"]
-    assert json.loads(_compose_env(pool)["E2B_AS_WORKER_ENV"])["E2B_PRIV_HELPERS"] == "off"
-    # ...and neither shape smuggles in a C3 key that would imply a privileged
-    # path it does not have.
+    # ...and it does not smuggle in a C3 key that would imply a privileged path
+    # it does not have.
     for path in LOCAL_SHAPES:
         text = path.read_text(encoding="utf-8")
         for key in (
@@ -1142,8 +1155,10 @@ def test_the_build_and_push_script_names_the_agent_image() -> None:
     # The naming convention line is the one place a reader looks for "which
     # images does this produce", so `agent` has to be in it -- that is what
     # makes the release flow's coverage of the new image assertable rather than
-    # a claim in a report.
+    # a claim in a report. (The `autoscaler` entry left this list on 2026-09-30
+    # with the image itself: the worker fleet's autoscaler is a task of the
+    # control plane now, so there is no third image to build.)
     assert (
-        "e2b-sandlock-{control-plane-gateway,worker,agent,autoscaler,quota-agent}"
+        "e2b-sandlock-{control-plane-gateway,worker,agent,quota-agent}"
         in text
     )

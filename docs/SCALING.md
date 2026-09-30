@@ -44,13 +44,18 @@
 
 ```
 请求 -> gateway -> control plane（调度 + 配额预留 + 预热预判）
-                     │  /internal/nodes（每节点 reserved/total）
+                     │  自己的节点/记录视图（每节点 reserved/total）
                      ▼
-         Autoscaler 决策循环（5~10s）
+         Autoscaler 决策循环（5~10s，**跑在 control plane 进程内**）
                      │  desired = f(利用率, 503 率, 冷却)
-                     ├── backend: local   （Docker Pool Manager）
-                     └── backend: k8s     （Deployment replicas）
+                     └── backend: k8s（StatefulSet / Deployment replicas）
 ```
+
+> **2026-09-30 的形态变更**：循环不再是独立进程，也不再通过
+> `GET /internal/fleet/metrics` 读控制面 —— 它就是控制面的一个后台任务（`E2B_AS_ENABLED`），
+> 直接调用 `control_plane/fleet_view.py` 里那两个 HTTP handler 也在用的函数；本地 Docker 池
+> 后端与它的 compose 栈（`deploy/compose/docker-compose.autoscale.yml`）一并退役。逐条理由见
+> §6.4，改成这样之后"fleet 视图"与"自动扩缩的依据"不可能再对不上。
 
 决策指标（"请求容量"语义）：
 
@@ -253,6 +258,31 @@ manifest 移除 `/var/run/docker.sock` 挂载。
 
 ## 6. Autoscaler 组件设计
 
+### 6.4 现状（2026-09-30）：循环在控制面里，池没了
+
+§6.1–§6.3 描述的是"独立 Deployment + HTTP 客户端"的形态，**已在 k8s 路径上落地为下面这个
+形状**（本地池那条路整体退役，见 §7 的说明）：
+
+| 原来的分离形态 | 现在 |
+|---|---|
+| 独立 `deploy/k8s/autoscaler.yaml`（SA/Role/RoleBinding + Deployment） | 删除；**`control_plane.yaml` 的 Role 收下它的三条 scale/evict 规则**，循环由 control plane 的 lifespan 起停（`app.state.autoscaler`） |
+| 独立镜像 `e2b-sandlock-autoscaler` | 删除；`autoscaler/` 作为库随 control-plane 镜像发布（两个 Dockerfile 都 `COPY autoscaler/`） |
+| `GET /internal/fleet/metrics` + `POST /internal/nodes/{id}/drain`（HTTP + `E2B_AS_INTERNAL_API_KEY`） | `control_plane/fleet_view.py::fleet_metrics_payload` / `drain_node`（进程内函数调用，HTTP 端点还在、给运维用，但读的是同一份实现） |
+| `E2B_AS_BACKEND=local|k8s` | 只有 k8s：`E2B_AS_K8S_{NAMESPACE,DEPLOYMENT,KIND}` |
+| 一进程一份冷却/在途 drain（`self._last_scale_up` 等） | `autoscaler/state.py`：`e2b:autoscaler:state`（哈希，Redis），跨副本、跨重启 |
+
+**为什么"多副本"与"重启"要专门处理**：控制面是 2 副本，每次发布都重启循环，所以
+
+* 每轮只有一个副本动手：`e2b:autoscaler:tick`（TTL = `E2B_AS_POLL_S`，沿用 TTL sweep 的单飞协议，
+  见 `control_plane/autoscaler_service.py`）；
+* 冷却与"正在 drain 哪个节点"落在 Redis 里：否则没轮到过的那个副本会再扩一次、重启后的循环会
+  在第一个节点还有活沙箱时就开始 drain 第二个；
+* 冷却时间戳因此是 **epoch 秒**（`time.time`），不再用 `time.monotonic` —— 单调时钟出了进程没有意义。
+
+代码落点：`autoscaler/{policy,loop,state,backends/k8s}.py` + `control_plane/autoscaler_service.py`；
+已删：`autoscaler/{__main__,config,control}.py`、`autoscaler/backends/local.py`、
+`deploy/{docker/Dockerfile.autoscaler,compose/docker-compose.autoscale.yml,k8s/autoscaler.yaml}`。
+
 ### 6.1 职责
 
 - 轮询控制面 `GET /internal/fleet/metrics`（新接口，见 9.3）；
@@ -285,10 +315,16 @@ class ScaleBackend(Protocol):
     def drain(self, node_id: str) -> None: ...
 ```
 
-- `local.py`：Docker Pool Manager（第 7 节）；
-- `k8s.py`：K8s API 改 Deployment replicas（第 8 节）。
+- ~~`local.py`：Docker Pool Manager（第 7 节）~~ —— **已退役（2026-09-30）**；
+- `k8s.py`：K8s API 改 StatefulSet / Deployment replicas（第 8 节）。
 
 ## 7. 本地容器扩容（backend: local）
+
+> **已退役（2026-09-30，用户裁定）**：本地 compose 不再做 autoscaler，本节整体只作历史记录。
+> 删掉的东西：`autoscaler/backends/local.py`、`deploy/compose/docker-compose.autoscale.yml`、
+> `deploy/docker/Dockerfile.autoscaler`、autoscaler 镜像与 `deploy/k8s/autoscaler.yaml`。
+> 顺带成立的一条：仓库里**再没有任何运行时组件要 Docker socket**（本节 §4 的强制前提 #1
+> 至此在代码与清单里都成立 —— 池是最后一处，见 `deploy/scripts/build-images.sh` 的头注）。
 
 ### 7.1 为什么不用 `docker compose --scale`
 
@@ -460,6 +496,9 @@ K8s 侧再叠加 `terminationGracePeriodSeconds`（如 120s）+ PDB
   worker pool 参数）；
 - 本机端到端验证：并发创建压到阈值 -> 自动起 worker -> 请求成功；空闲后
   自动回收。
+
+> **本阶段已作废（2026-09-30）**：本地后端与它的 compose 栈整体退役，上面三条只作历史记录；
+> 现在按 §6.4 的形态落地（循环在控制面内、只有 k8s 后端）。
 
 ### Phase 4：K8s 后端与 manifest
 

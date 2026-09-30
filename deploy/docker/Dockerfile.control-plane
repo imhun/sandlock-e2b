@@ -15,6 +15,11 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r re
 
 COPY gateway_common/ gateway_common/
 COPY control_plane/ control_plane/
+# The worker fleet's autoscaler is hosted by this app (k8s path, 2026-09-30):
+# the loop, its policy and the Kubernetes backend are imported at startup by
+# `control_plane.app`, so the package ships with the control plane. It adds no
+# dependency -- `autoscaler.backends.k8s` speaks the API with httpx.
+COPY autoscaler/ autoscaler/
 
 ENV E2B_WORKSPACE_BASE=/var/lib/e2b-sandboxes
 EXPOSE 3000

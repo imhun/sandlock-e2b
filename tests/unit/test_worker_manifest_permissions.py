@@ -377,9 +377,10 @@ def test_k8s_runs_the_verified_multi_replica_worker_shape() -> None:
     to zero. What this pins is that the manifests actually run that shape and do not
     creep back to a single replica with an autoscaler that cannot follow.
     """
-    autoscaler = (REPO / "deploy" / "k8s" / "autoscaler.yaml").read_text(
-        encoding="utf-8"
-    )
+    # Since 2026-09-30 the autoscaler is hosted by the control plane, so its
+    # settings live in the control plane's own manifest (the separate
+    # `autoscaler.yaml` and its Deployment are gone).
+    autoscaler = K8S_CONTROL_PLANE
     marker = "name: E2B_AS_MAX_REPLICAS"
     assert marker in autoscaler
     # The value sits a few comment lines below the name, so read forward rather
@@ -426,11 +427,10 @@ def test_k8s_worker_is_a_statefulset_so_its_node_ids_survive_a_restart() -> None
     assert "    rollingUpdate:\n      maxSurge:" not in K8S_WORKER
     assert "\n  strategy:\n" not in K8S_WORKER
     # The autoscaler has to scale the same kind, or it would 404 on every tick.
-    autoscaler = (REPO / "deploy" / "k8s" / "autoscaler.yaml").read_text(
-        encoding="utf-8"
-    )
-    assert "name: E2B_AS_K8S_KIND\n" in autoscaler
-    assert "value: statefulset\n" in autoscaler
+    # It runs inside the control plane now (2026-09-30), so the kind it names is
+    # the one in *that* manifest -- still pinned against the StatefulSet above.
+    assert "name: E2B_AS_K8S_KIND\n" in K8S_CONTROL_PLANE
+    assert "value: statefulset\n" in K8S_CONTROL_PLANE
 
 
 def test_k8s_control_plane_replicas_come_with_the_shape_that_makes_them_safe() -> None:
@@ -1532,10 +1532,11 @@ def _stack_worker_route_b_root() -> str:
 def _fleet_route_b_roots() -> dict[str, str]:
     """`E2B_ROUTE_B_TMP_ROOT` as each fleet manifest spells it.
 
-    Both manifests are read, not just the compose one: the pool's alignment
-    test learned that reading one leaves the other free to drift
-    (`tests/unit/test_autoscaler_local_backend_shape.py`), and the k8s pod
-    template is the manifest the cluster actually runs.
+    Both manifests are read, not just the compose one: the retired pool's
+    alignment test learned that reading one leaves the other free to drift
+    (`tests/unit/test_autoscaler_local_backend_shape.py`, deleted with the
+    pool on 2026-09-30), and the k8s pod template is the manifest the cluster
+    actually runs.
     """
     return {
         "deploy/stack/docker-compose.prod.yml": _stack_worker_route_b_root(),
@@ -1887,15 +1888,18 @@ def test_k8s_control_plane_hosts_no_sandboxes_so_the_flag_is_left_out() -> None:
     assert "\n            - name: E2B_ENABLE_NETWORK\n" not in K8S_CONTROL_PLANE
 
 
-#: The three workloads that must carry the internal key's rotation window.
-#: `control-plane` and the worker *verify* `X-Internal-Key` (the worker's
-#: gateway and its agent both read the list); the autoscaler only *sends* one,
-#: and it reads the single slot under its own `E2B_AS_*` name -- the pair is
-#: asserted together so a copy of the secret key cannot be dropped silently.
+#: The two workloads that must carry the internal key's rotation window.
+#: Both *verify* `X-Internal-Key` (the worker's gateway and its agent read the
+#: list too); the pair is asserted together so a copy of the secret key cannot
+#: be dropped silently. There used to be a third entry -- the standalone
+#: autoscaler, which only *sent* a key under `E2B_AS_INTERNAL_API_KEY`. Since
+#: 2026-09-30 it is a task of the control plane and sends nothing (its fleet
+#: reads and drains are in-process), so its credential is gone with the
+#: manifest; `E2B_AS_INTERNAL_API_KEY` appearing again would mean a second
+#: caller of the internal API was introduced without a rotation window.
 INTERNAL_KEY_WORKLOADS = (
     ("Deployment", "control-plane", "E2B_INTERNAL_API_KEY"),
     ("StatefulSet", "e2b-worker", "E2B_INTERNAL_API_KEY"),
-    ("Deployment", "autoscaler", "E2B_AS_INTERNAL_API_KEY"),
 )
 
 
@@ -1909,7 +1913,7 @@ def _env_of(workload: dict) -> dict:
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
-def test_all_three_workloads_can_accept_an_old_and_a_new_internal_key() -> None:
+def test_both_workloads_can_accept_an_old_and_a_new_internal_key() -> None:
     """O3 Task 3: the internal key rotates in two windows, so every reader of
     `X-Internal-Key` must carry `E2B_INTERNAL_API_KEYS` beside the single slot.
 
@@ -1969,11 +1973,12 @@ def _without_comment_lines(text: str) -> str:
 def test_only_the_arm_lane_keeps_a_low_port_window() -> None:
     """N36 closed 2026-09-26: the window survives in exactly one place.
 
-    The three deployment-ish sites (compose prod example, local pool, compose
-    multinode example) were aligned with the fleet; the aarch64 lane's
-    `guest-prep.sh` keeps its one-shot window because the Rust suites still run
-    the shared-netns shape as uid 501 and cannot drop it (measured; see that
-    file's comment and docs/open-issues.md N36).
+    The deployment-ish sites (compose prod example, compose multinode example,
+    and -- until it was retired on 2026-09-30 -- the autoscaler's local pool)
+    were aligned with the fleet; the aarch64 lane's `guest-prep.sh` keeps its
+    one-shot window because the Rust suites still run the shared-netns shape as
+    uid 501 and cannot drop it (measured; see that file's comment and
+    docs/open-issues.md N36).
 
     The three aligned files are read comment-stripped: the 2026-09-26
     measurement is written down *in* those files, so the knob's name survives
@@ -1982,11 +1987,9 @@ def test_only_the_arm_lane_keeps_a_low_port_window() -> None:
     lane = (REPO / "deploy" / "scripts" / "arm-lane" / "guest-prep.sh").read_text(
         encoding="utf-8"
     )
-    pool = (REPO / "autoscaler" / "backends" / "local.py").read_text(encoding="utf-8")
     assert "net.ipv4.ip_unprivileged_port_start=0" in lane
     assert "ip_unprivileged_port_start" not in _without_comment_lines(COMPOSE_PROD)
     assert "ip_unprivileged_port_start" not in _without_comment_lines(COMPOSE_MULTINODE)
-    assert "ip_unprivileged_port_start" not in _without_comment_lines(pool)
     # The k8s pod-level window is gone (N5) and must stay gone.
     assert POD_SYSCTL not in K8S_WORKER
 
@@ -2016,11 +2019,13 @@ RUNBOOK = (REPO / "docs" / "k8s-deployment.md").read_text(encoding="utf-8")
 REDIS_TABLE_ROW = (
     "| `E2B_REDIS_PASSWORD` | ① 排维护窗口 ② `deploy/k8s-k0s/secrets.sh --rotate "
     "E2B_REDIS_PASSWORD` ③ `kubectl -n sandlock rollout restart deploy/redis` "
-    "④ `kubectl -n sandlock rollout restart deploy/control-plane deploy/autoscaler`"
-    "（读 redis 的只有 control-plane；`autoscaler` 是控制面客户端，跟着滚是形状对齐）"
+    "④ `kubectl -n sandlock rollout restart deploy/control-plane`"
+    "（读 redis 的只有 control-plane —— 它同时托管 autoscaler，这一步把扩缩容循环一并重起）"
     "⑤ 从 Secret 里读新口令验收（见下） | **必然有 10–30 s 中断**：redis 带着新口令重启、到 "
-    "control-plane 滚动完拿到新口令之间，共享后端（配额 / 节点视图 / 限流 / 单飞）不可用 ⇒ "
-    "**建箱、路由、sandbox 记录查询全部失败**；沙箱进程本身不经过 redis，**不受影响**；"
+    "control-plane 滚动完拿到新口令之间，共享后端（配额 / 节点视图 / 限流 / 单飞，以及 "
+    "2026-09-30 起 autoscaler 的 tick 单飞与冷却标记 `e2b:autoscaler:*`）不可用 ⇒ "
+    "**建箱、路由、sandbox 记录查询全部失败**，扩缩容在这一段里每轮都按\"无标记\"决策"
+    "（照常扩，但冷却会被忘，最坏多扩一次）；沙箱进程本身不经过 redis，**不受影响**；"
     "`appendonly yes` ⇒ 重启从 AOF 装载，**数据不丢**。**窗口不可逆**：② 之后旧口令只活在仍"
     "在跑的 redis 进程内存里，要回去只能再轮换一次（表 3 没有 finalize 那种安全位） | "
     "**ACL 双用户**（2026-09-26 裁定**不采纳**，只作备选）：`ACL SETUSER` 建新用户 → "
@@ -2175,7 +2180,8 @@ def test_the_runbook_carries_the_no_double_window_table() -> None:
     assert (
         "- ③ 之后、④ 滚完之前：redis 只认新口令，control-plane 内存里还是旧口令 ⇒ 共享后端"
         "认证失败，**这一段的时长就是那 10–30 s**（redis 重启 + control-plane 滚一轮；"
-        "`autoscaler` 不读 redis，跟滚只是形状对齐）。" in RUNBOOK
+        "hosted autoscaler 随它一起重起，扩缩容在这一段里拿不到冷却标记、也抢不到 tick 单飞 "
+        "⇒ 最坏多扩一次，不会漏扩）。" in RUNBOOK
     )
     assert (
         "- 这段窗口里谁会看到什么：`POST /sandboxes` 建箱失败、`GET /sandboxes/<id>` 等记录"

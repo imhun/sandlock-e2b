@@ -28,6 +28,12 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r re
 COPY gateway_common/ gateway_common/
 COPY control_plane/ control_plane/
 COPY envd_service/ envd_service/
+# The worker fleet's autoscaler is hosted by this app (k8s path, 2026-09-30):
+# `control_plane.app` imports `control_plane.autoscaler_service`, which builds
+# the loop and the Kubernetes backend from `E2B_AS_*`. Nothing else in this
+# image reaches for it, and the compose stacks that run this image leave
+# `E2B_AS_ENABLED` unset (they do not autoscale).
+COPY autoscaler/ autoscaler/
 
 # E5.1: the shared workspace volume is mounted here and the *workers* run as
 # uid 65534. This image is the first to mount that volume (workers declare

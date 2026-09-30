@@ -1,5 +1,11 @@
 # C3 三角分工（控制面零特权 / agent 执行 / worker 跑沙箱）设计评估 —— **已实施（Task 1–7 上线）**
 
+> **一处形态更新（2026-09-30）**：本文按名字排除 C3 覆盖面的两个 `local://` 之外的形态里，
+> **autoscaler 的 docker pool 已退役**（`autoscaler/backends/local.py` +
+> `deploy/compose/docker-compose.autoscale.yml` 删除；k8s 路径的扩缩容循环收进 control plane，
+> 见 `docs/open-issues.md` N50）。§11.1 第 4 项与 D23 的排除清单里"池"那一行因此变成历史，
+> 单机示例（`deploy/compose/docker-compose.yml`）仍是现行被排除的形态。
+
 > **状态：设计已选（2026-09-28）；实现见 Task 1–7 的落地记录（§11.2.1、§14、Task 6 的验收小节），
 > 已于 2026-09-29 在 k0s 集群上线（`docs/deploy-clusters.md` §7.9）。** 下面标着"未实施""本次不做"
 > 的段落是**设计当时的原话**，保留为历史；现行口径以上线记录为准。

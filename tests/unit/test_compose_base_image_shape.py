@@ -11,17 +11,16 @@ shape-independent.
 
 Same approach as
 `tests/unit/test_autoscaler_local_backend_shape.py::test_the_pool_base_image_is_the_fleets_mcp_capable_one`
-(which pins the pool's two declarations): the value is *read* from the fleet
-manifests by `_fleet_base_image()`, not written here a third time. Bumping the
-fleet's digest pin without the stacks (or one stack without the fleet) fails
-these tests instead of silently splitting the two.
+(which pinned the pool's two declarations, until the pool was retired on
+2026-09-30): the value is *read* from the fleet manifests by
+`_fleet_base_image()`, not written here a third time. Bumping the fleet's
+digest pin without the stacks (or one stack without the fleet) fails these
+tests instead of silently splitting the two.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-
-from tests.unit.test_autoscaler_local_backend_shape import _fleet_base_images
 
 REPO = Path(__file__).resolve().parent.parent.parent
 
@@ -33,11 +32,12 @@ BASE_IMAGE_KEY = "E2B_BASE_IMAGE"
 #: behind "the known ones are green": prose in these files may name an old
 #: literal on purpose, a declaration may not.
 #:
-#: `deploy/compose/docker-compose.prod.yml` and `.../docker-compose.autoscale.yml`
-#: (the pool, pinned by its own test) spell it `E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-...}`,
-#: so the default is what a `.env`-less checkout runs; the dev/test/multinode
-#: files name the image outright. Either form is compared by the *value* it
-#: falls back to -- the form is not what this pin is about.
+#: `deploy/compose/docker-compose.prod.yml` spells it
+#: `E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-...}`, so the default is what a
+#: `.env`-less checkout runs; the dev/test/multinode files name the image
+#: outright. Either form is compared by the *value* it falls back to -- the
+#: form is not what this pin is about. (The retired autoscale stack was the
+#: other `${...:-...}` form here; it is gone as of 2026-09-30.)
 DEFAULTED_STACKS = {
     "deploy/compose/docker-compose.prod.yml": 2,
     "deploy/compose/docker-compose.multinode.yml": 4,
@@ -54,6 +54,43 @@ FLEET_STACK = "deploy/stack/docker-compose.prod.yml"
 #: fills in from `build-and-push.sh` (E6.2). Compared by substitution, so the
 #: template is still pinned to the fleet's MCP-capable repository *and* tag.
 STACK_DIGEST_PLACEHOLDER = "__E2B_BASE_IMAGE_DIGEST__"
+
+
+def _k8s_env(key: str, manifest: str) -> str:
+    """One k8s manifest's env value by name.
+
+    Moved here with the pool's retirement (2026-09-30): the fleet files that
+    name the base image in-tree are the two k8s manifests -- the fleet compose
+    stack carries a bare `${E2B_BASE_IMAGE}` whose value lives in the
+    node-local, untracked `deploy/stack/.env` -- and the worker manifest's own
+    comment says they have to keep in step. Reading both is what makes a
+    one-sided fleet drift red rather than silently the "known" value.
+    """
+    lines = [line.strip() for line in manifest.splitlines()]
+    marker = f"- name: {key}"
+    hits = [index for index, line in enumerate(lines) if line == marker]
+    assert len(hits) == 1, f"expected exactly one {key!r} env entry: {hits}"
+    # The value is the entry's business: some carry a comment block above it
+    # (the base image's digest pin explains itself there), so walk past those.
+    cursor = hits[0] + 1
+    while cursor < len(lines) and (lines[cursor] == "" or lines[cursor][0] == "#"):
+        cursor += 1
+    assert cursor < len(lines), f"no value line after {key!r}"
+    value_line = lines[cursor]
+    assert value_line.startswith("value: "), value_line
+    return value_line[len("value: ") :].strip().strip('"')
+
+
+def _fleet_base_images() -> dict[str, str]:
+    """The fleet's MCP-capable base image, as each manifest spells it."""
+    worker = (REPO / "deploy" / "k8s" / "worker.yaml").read_text(encoding="utf-8")
+    control = (REPO / "deploy" / "k8s" / "control-plane.yaml").read_text(
+        encoding="utf-8"
+    )
+    return {
+        "deploy/k8s/worker.yaml": _k8s_env(BASE_IMAGE_KEY, worker),
+        "deploy/k8s/control-plane.yaml": _k8s_env(BASE_IMAGE_KEY, control),
+    }
 
 
 def _fleet_base_image() -> str:
@@ -75,8 +112,10 @@ def _declared_base_images(path: Path) -> list[str]:
     Line-oriented on purpose: what this pin is about is a declaration
     (`E2B_BASE_IMAGE: <value>`), so a comment that mentions the key (these
     files explain themselves in prose) is skipped rather than mistaken for
-    one, and the JSON `E2B_AS_WORKER_ENV` blob -- whose key sits inside a
-    single-quoted value, never at the start of a line -- cannot match.
+    one. (The retired autoscale stack also carried the key inside its
+    single-quoted `E2B_AS_WORKER_ENV` JSON, never at the start of a line --
+    that form is gone with the pool, and the line-orientation is what kept it
+    from matching back then.)
     """
     values: list[str] = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -172,8 +211,8 @@ def _example_env_base_image(path: Path) -> str:
 def test_the_compose_example_env_defaults_to_the_fleets_mcp_capable_base_image() -> None:
     """The documented ``cp`` must not re-pin the stacks to a base without MCP.
 
-    `README.md` and the headers of `docker-compose.prod.yml` /
-    `docker-compose.autoscale.yml` all tell the operator to run
+    `README.md` and the header of `docker-compose.prod.yml` both tell the
+    operator to run
     ``cp deploy/compose/.env.example deploy/compose/.env``, and that `.env`
     *wins* over the compose files' own ``${E2B_BASE_IMAGE:-...}`` default. With
     the stale ``python:3.11-slim@sha256:d1e9ca7c...`` literal here, following
