@@ -74,12 +74,29 @@ the sandbox-create path:
 | `process_vm_readv` | seccomp-notif argument reads (`read_child_mem`), netlink struct reads (`netlink/handlers.rs`), checkpoint memory capture |
 | `process_vm_writev` | checkpoint restore (`checkpoint/restore_blob.rs`) — the only one not on a hot path |
 
-None of this reaches sandbox code: sandlock's own `DEFAULT_BLOCKLIST_SYSCALLS`
-lists `ptrace`, `process_vm_readv`, `process_vm_writev`, `unshare`, `setns`,
-`mount` and `bpf`, and a probe run **inside** a sandbox under this profile gets
-`EPERM` for every one of them (measured 2026-09-15,
-`tmp/seccomp-probe/sandbox_syscalls.py`). The container-level allowances are for
-the worker/supervisor only.
+Most of this does not reach sandbox code: sandlock's own
+`DEFAULT_BLOCKLIST_SYSCALLS` (`crates/sandlock-core/src/sys/structs.rs`) lists
+`ptrace`, `process_vm_readv`, `process_vm_writev`, `unshare`, `setns`, `mount`
+and `bpf`, and a probe run **inside** a sandbox under this profile gets `EPERM`
+for every one of them (measured 2026-09-15, `tmp/seccomp-probe/sandbox_syscalls.py`).
+The container-level allowances are for the worker/supervisor.
+
+**One measured exception (2026-09-30): `pidfd_getfd` is *not* in that
+blocklist**, so sandbox code can call it — re-measured inside a real sandbox on
+the k0s cluster (arm64) after the `unshare` narrowing: `unshare` (every type),
+`setns`, `ptrace`, `process_vm_*` and `mount` all returned `EPERM`, while
+`pidfd_getfd` returned `EBADF` for a deliberately-bad argument, i.e. seccomp let
+the call through and the kernel refused the arguments. With a real pidfd it
+succeeds: a sandbox process can `pidfd_open` + `pidfd_getfd` **its own**
+sandbox's processes (measured: pids 1/2/3/7 of its own command tree, and a write
+through a duplicated fd landed). Two things bound it: the kernel's
+`ptrace_may_access` gate is what decides the target set (same-uid siblings
+inside the sandbox; the supervisor is a different uid/userns and sets
+`PR_SET_DUMPABLE=0`), and the sandbox cannot even *name* what it stole —
+`/proc/self/fd/<n>` is denied by the sandbox's own fs mediation. So the reach is
+intra-sandbox, not an escape. It is still the same class `ptrace` is blocked
+for, and the one-line fix is to add `pidfd_getfd` to
+`DEFAULT_BLOCKLIST_SYSCALLS` (a fork change: wheel + images rebuild).
 
 `process_vm_writev` is the single candidate for going *below* the default
 (checkpoint restore is not part of what E2B exposes); that would be a deliberate
