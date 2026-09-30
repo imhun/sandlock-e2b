@@ -3452,3 +3452,35 @@ compose 车道同代码、同镜像、同 65534、`$HOME/.docker` 同样不可�
 日志：`tmp/build-and-push.log`、`tmp/apply.log`、`tmp/deployment-smoke.log`；探针
 `tmp/bk/repro.sh`（本地复现，结论是不复现）、`tmp/bk/probe-in-pod.sh` + `tmp/bk-probe-pod.yaml`
 （集群探针，pod 已删）。
+
+## 2026-09-30 C3 agent 代码从 `deploy/` 搬到顶层 `c3_agent/`
+
+**起因**：用户问"C3 agent 的代码为啥在 `deploy` 目录"，并给出口径 —— **`deploy/` 只放部署配置与
+脚本**。原来的位置是照抄 `deploy/quota_agent/`（同型先例），但 agent 是自带镜像的服务，和
+`control_plane/`、`autoscaler/` 同类，确实该按项目目录放。
+
+**改动**（提交 `117846f`）：
+
+- `git mv deploy/c3_agent c3_agent`（8 个文件），`deploy.c3_agent` → `c3_agent`；
+- `Dockerfile.agent`：`COPY c3_agent/ /app/c3_agent/` + `CMD ["python3","-m","c3_agent"]`，并**删掉**
+  原来的 `COPY deploy/__init__.py`（agent 镜像不再带 `deploy` 命名空间，这是个顺带的收获）；
+- 引用面：`control_plane/{self_heal,worker_identity_source,c3_agent_client}.py`、
+  `gateway_common/worker_identity.py`、`deploy/k8s/c3-agent.yaml` 注释、14 个测试文件、
+  `docs/{c3-privilege-relocation,k8s-deployment,deploy-clusters}.md`、本文件里**活**的引用；
+- `deploy/__init__.py` docstring 改写：现在它为 `deploy.quota_agent` 存在，并写明"`deploy/` 只放配置
+  与脚本"这条口径（quota_agent 同型，本轮没动 —— 要一起搬可以照这份清单再做一次）；
+- **没回改**：`.superpowers/sdd/task-*-report.md`、`c3-*-report.md` 里的 `deploy/c3_agent` 是当时的
+  实测证据（含 `File "/app/deploy/c3_agent/app.py"` 这类 stack trace），改掉就是篡改记录。
+
+**验证**：
+
+- C3 相关 15 个测试文件 **291 passed**；全量 `tests/unit` **1934 passed**（与改前同数；16 个既有失败
+  仍是 macOS 平台项 + 缺 fakeredis）；
+- `docker build -f deploy/docker/Dockerfile.agent` 成功；镜像内 `/app` 只有 `c3_agent`/`gateway_common`，
+  `find_spec("deploy") is None`，`import c3_agent.{app,scan,lookup,fileops}` 全通；
+- 上线版本 **`0.1.0-794-g117846f-20260930-133726`**（四个 `--load` 镜像照例补推 + manifest 核对）→
+  `apply.sh`；集群侧复核：两个 agent 容器的 `/proc/*/cmdline` 都是 `python3 -m c3_agent`，
+  日志 logger 名变成 `c3_agent.scan`；
+- `deployment_smoke` → **DEPLOYMENT SMOKE OK**、`multinode_smoke` → **MULTI-NODE SMOKE OK**
+  （日志 `tmp/multinode-move.log`、`tmp/deployment-smoke-move.log`、`tmp/apply-move.log`、
+  `tmp/build-and-push-move.log`）。

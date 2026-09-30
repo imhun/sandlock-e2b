@@ -130,7 +130,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.13（2026-09-30，k0s 上线：`Template.build` 的 mirror 链路修复）**；§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.14（2026-09-30，C3 agent 代码搬到顶层 `c3_agent/`）**；§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -854,6 +854,32 @@ compose 车道是同一份代码、同一个镜像、同样 65534，`$HOME/.dock
 `nobody`），所以这条修复对两条车道一起生效，清单不用改。`deploy/stack/buildkitd.toml` 与
 `deploy/k8s/buildkit.yaml` 的 mirror 段落各加了一句注释指向 `_docker_config_dir()`，免得下一个人
 再按"没配镜像源"排查一遍。
+
+### 7.14 C3 agent 代码搬到顶层 `c3_agent/`（**2026-09-30，已上线**）
+
+口径澄清：**`deploy/` 只放部署配置与脚本**。C3 的节点 agent 是自带镜像的**服务**（有自己的
+`Dockerfile.agent`、自己的 DaemonSet/两个 compose 服务、自己的 `CMD`），和 `control_plane/`、
+`autoscaler/` 同类，所以按项目目录放。提交 `117846f`：
+
+- `git mv deploy/c3_agent c3_agent`（8 个文件），模块名 `deploy.c3_agent` → `c3_agent`；
+- `deploy/docker/Dockerfile.agent`：`COPY c3_agent/ /app/c3_agent/` + `CMD ["python3","-m","c3_agent"]`，
+  并且**不再** COPY `deploy/__init__.py`（agent 镜像不再带 `deploy` 命名空间）；
+- 引用全局改名：`control_plane/*`、`gateway_common/worker_identity.py`、k8s 注释、14 个测试文件、
+  三份活文档与本文件的 §7.13 引用。`deploy/__init__.py` 现在只为 `deploy.quota_agent` 存在
+  （同型，本轮不动），docstring 写明这条口径；
+- **没回改**：`.superpowers/sdd/task-*-report.md` / `c3-*-report.md` 里的 `deploy/c3_agent` 是当时的
+  实测记录（含 stack trace），改掉就等于篡改证据。
+
+上线版本 **`0.1.0-794-g117846f-20260930-133726`**（照例：单平台走 `--load`，补推
+worker/autoscaler/agent/quota-agent 四个 tag + `docker manifest inspect` 核对）→ `./deploy/k8s-k0s/apply.sh`。
+
+判据：
+
+- 两个 agent 容器（面 A `agent` / 面 B `maint`）的 `/app` 里**只有** `c3_agent`、`gateway_common`，
+  且 `python3 -c "importlib.util.find_spec('deploy') is None"`；`/proc/*/cmdline` 里两个面都是
+  `python3 -m c3_agent`；日志 logger 名从 `deploy.c3_agent.scan` 变成 `c3_agent.scan`；
+- `deploy/scripts/deployment_smoke.py` → **`DEPLOYMENT SMOKE OK`**（agent 参与的段全过：槽位身份授予、
+  文件操作、跨节点迁移、模板构建），`deploy/scripts/multinode_smoke.py` → **`MULTI-NODE SMOKE OK`**。
 
 ## 8. 改部署的入口
 
