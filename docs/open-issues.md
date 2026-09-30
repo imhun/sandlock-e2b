@@ -51,10 +51,13 @@
 
 | N50 | **autoscaler 不再是一个独立工作负载：k8s 路径合进控制面，本地池整条退役**（2026-09-30，用户裁定「把 k8s 的路径合并吧」「本地 compose 不做 autoscaler 了，可以去掉」） | **✅ 已完成（2026-09-30）** | **形状**：① 循环成了控制面的后台任务（`control_plane/autoscaler_service.py`，开关 `E2B_AS_ENABLED`，随 lifespan 起停），读的是 `control_plane/fleet_view.py::fleet_metrics_payload` / `drain_node` —— 与 HTTP handler **同一份实现**，所以"API 报的 fleet"和"扩缩容依据的 fleet"不可能对不上；② 只剩 k8s 后端（`E2B_AS_K8S_{NAMESPACE,DEPLOYMENT,KIND}`）；删掉的是 `autoscaler/{__main__,config,control}.py`、`autoscaler/backends/local.py`、`deploy/docker/Dockerfile.autoscaler`、`deploy/compose/docker-compose.autoscale.yml`、`deploy/k8s/autoscaler.yaml`、独立镜像与 `E2B_AS_INTERNAL_API_KEY`，它的两条 RBAC 规则并进 `control-plane.yaml` 的 Role；③ 控制面 **2 副本**、且**每次发布都重启循环** ⇒ 需要两样东西补上网络原本提供的语义：tick 单飞 `e2b:autoscaler:tick`（TTL = poll），冷却与在途 drain 落 `e2b:autoscaler:state`（Redis 哈希，**epoch 秒**，`time.monotonic` 出了进程没有意义）；④ **代价（点名）**：redis 不可用的窗口里扩缩容每轮按"无标记"决策（照常扩、冷却会被忘，最坏多扩一次），已写进 `docs/k8s-deployment.md` §4.5 表 3。**本行同时覆盖**凡提到本地池的历史行（N36②/N38/N39/N40/N45）：那些行的实测与结论都是历史记录，池已不存在，别再按它们去池上复验 | 本行；`docs/SCALING.md` §6.4（形状与理由）、§7（池退役）、§3（架构图）；`docs/k8s-deployment.md` §2 清单表、§4.5 表 2/表 3、§4 镜像与升级；钉子 `tests/contract/test_scaling.py`（托管循环 7 条：默认关闭 / 暖池下限 / 与端点同一视图 / drain 落到 registry / 丢单飞不动手 / 两副本共享单飞 / 任务随 app 结束）、`tests/unit/test_autoscaler_state_store.py`（5 条，含 redis 降级）、`tests/unit/test_autoscaler_loop.py`（跨副本共享冷却与在途 drain）、`tests/unit/test_c3_internal_api_shape.py::test_the_k8s_control_plane_holds_exactly_the_grants_it_uses` |
 
-> **部署提示（2026-09-30，N50）**：上面的集群状态与 `docs/deploy-clusters.md` / `docs/HANDOFF.md`
-> 记的是**当时实测** —— 那份实测里 `autoscaler` 还是一个 1 副本的 Deployment。仓库从 2026-09-30 起
-> 没有这个工作负载了（循环在 control-plane 内、`E2B_AS_ENABLED=true`），所以 **`deploy/k8s-k0s/apply.sh`
-> 下一次跑完，`deploy/autoscaler` 会消失、`deploy/control-plane` 会滚出新的一轮**；那之前集群上仍是旧形态。
+> **（2026-09-30 晚间更新）N50 已上线**：集群现在跑 `0.1.0-806-g4392042-20260930-171355`，
+> `deploy/autoscaler`（Deployment/SA/Role/RoleBinding）**已经删除**，循环在 control-plane 内
+> （`E2B_AS_ENABLED=true`、`E2B_AS_K8S_KIND=statefulset`、MIN/MAX=2/16），
+> `kubectl diff` 与仓库规格 0 行。**上线过程本身逼出两个缺陷并已修**（`1e39d90` 的
+> `PUT .../scale` → merge patch；`4392042` 的冷却标记只写变化字段）—— 逐条读数见
+> `docs/deploy-clusters.md` §7.17。本文件上面那张"集群里有什么"的清单与
+> `docs/deploy-clusters.md` §7.9–§7.16 的历史记录仍写着旧的 `autoscaler` Deployment，那是**当时**的实测。
 
 | N51 | **缩容"退出的是你 drain 的那个节点"只在 Deployment 上成立**（2026-09-30 上线 N50 时读代码得出，未实测触发）：`KubernetesBackend.remove_node` 给被 drain 的 pod 打 `pod-deletion-cost=1000` 再整副本 -1，注释写的是"让控制器挑安全的 pod 删"。**`pod-deletion-cost` 只被 ReplicaSet 控制器读**；**StatefulSet 缩容永远删最高序号**（fork 无关，k8s 语义），而基线跑的正是 StatefulSet（`E2B_AS_K8S_KIND=statefulset`）⇒ 注解是空转的。**可达路径**：候选表按 node id 排序（`RedisNodeStore.list` 是 `mget(sorted(keys))`）⇒ 全空闲时的 `candidates[0]` 是**最小**序号（`e2b-worker-0`）；若此时还有 `e2b-worker-2` 活着，循环 drain 的是 `-0`、被删的是 `-2` ⇒ `-0` 留在舰队里且 `draining: true`（调度不再放箱子），**并且下一轮第 3 步的"孤儿 drain 收尾"会再缩一次**（该分支不检查 `min_replicas`）⇒ 可掉到 MIN 以下。**为什么 N50 没触发**：正常缩容里空闲的那个恰好是最新扩出来的（最高序号），两者一致；验收时用两个带沙箱的 worker 把候选唯一化，正好走的是**一致**那条路（实测：`-2` 被 drain 且被删，见 N50 的验收记录）。**修法二选一**（未做，留给决策）：(a) 让循环按"后端会删谁"排序候选（StatefulSet ⇒ 最高序号优先），(b) `remove_node` 缩容后**校验**目标 pod 是否真的消失，没消失就按名字点名告警并**撤销 drain**（`undrain`），不要让它进下一轮的孤儿收尾。 | 本行；`autoscaler/backends/k8s.py` 的模块 docstring（已按事实改写）；`control_plane/registry/redis_backend.py::RedisNodeStore.list`（排序是候选顺序的来源）；N50 行的验收记录（一致路径的实测） |
 

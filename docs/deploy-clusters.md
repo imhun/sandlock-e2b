@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.16（2026-09-30，quota-agent 搬到顶层 `quota_agent/`，`deploy/` 从此不含任何 Python 包）**；§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.17（2026-09-30，autoscaler 并入控制面、本地池退役，当前版本 `0.1.0-806-g4392042-20260930-171355`）**；§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -941,6 +941,54 @@ quota-agent 相关 + 钉子类测试 195 passed，全量 `tests/unit` 1934 passe
 
 至此 `deploy/` 顶层只剩 `compose/ docker/ k8s/ k8s-k0s/ scripts/ seccomp/ stack/` —— 没有 Python 包，
 也没有会被 import 的代码。
+
+### 7.17 autoscaler 并入控制面 + 本地池退役（**2026-09-30，分三次上线**）
+
+N50（`docs/open-issues.md`）：扩缩容循环从独立 Deployment 收进 control-plane，本地 Docker 池整条
+退役。仓库侧的判定与形状见 `docs/SCALING.md` §6.4；这里只记**集群上真实发生过的三次**与验收读数 ——
+其中前两次是验收本身逼出来的缺陷，值得单独读。
+
+**上线三步（每次都是 `build-and-push.sh` → `deploy/k8s-k0s/apply.sh`）**
+
+| 步骤 | 版本 | 集群动作 | 为什么不是一次 |
+|---|---|---|---|
+| ① 合并 | `0.1.0-804-g07f2cb5-20260930-164152` | 先 `kubectl delete deploy/sa/role/rolebinding autoscaler`（`kubectl apply` **不 prune**，清单里删掉的对象得手删；删除前留档 `tmp/k0s/autoscaler-removed-20260930.yaml`），再 apply（7 个镜像 pin；control-plane 拿到 `E2B_AS_*` 与 scale 规则；`kubectl diff` 与仓库规格一致后 0 行） | 第一次上线即被测出写路径缺陷，见下 |
+| ② 修 scale | `0.1.0-805-g1e39d90-20260930-170113` | 只改控制面镜像 | 见 ② 行 |
+| ③ 修冷却标记 | `0.1.0-806-g4392042-20260930-171355` | 只改控制面镜像 | 见 ③ 行 |
+
+**② 写路径：`PUT .../scale` 被 apiserver 判 400**（实测，从控制面 pod 用它自己的 SA token 打同一对请求）
+
+`KubernetesBackend.scale_to` 发的是 `PUT /apis/apps/v1/namespaces/sandlock/statefulsets/e2b-worker/scale`
++`{"spec":{"replicas":3}}`，apiserver 回 **400**：*"the name of the object (e2b-worker based on URL) was
+undeterminable: name must be provided"* —— replace 形态要求 body 自带 `metadata.name`。同一 URL 上
+`PATCH .../scale` + `application/merge-patch+json` ⇒ **200**，随后 `GET` 读到 `replicas=3`、
+`e2b-worker-2` 起来并注册。症状在集群上长这样：每轮一条 `autoscaler tick failed`，舰队**永不增长**
+（暖池下限只在低于当前副本数时才被判定，空闲的 2/2 把它藏了 12 天）。修法与钉子见提交 `1e39d90`。
+
+**③ 冷却标记被陈旧写覆盖**（实测，第一次 MIN 3→2 的验收）
+
+`e2b:autoscaler:state` 的 `last_scale_up` 在缩容后被写回 `-inf`。机制：单飞 TTL = poll（5s），两个 tick
+可以相邻或重叠；某个 tick 读到 `-inf` 之后被对端的扩缩容插了一刀，它再把自己那份**整快照**写回，
+就抹掉了对端刚写下的冷却 —— 而"共享冷却"正是这个 store 存在的全部理由（观测到的后果：3 副本在
+同一区间先扩后缩，冷却窗口形同不存在）。修法：`write(before, after)` 只写**两者不同**的字段
+（Redis 侧是部分 HSET，无变化不发命令），提交 `4392042`。
+
+**③ 之后的验收（`0.1.0-806`，全部实测）**
+
+| 判据 | 读数 |
+|---|---|
+| 集群规格 ≡ 仓库 | `DRY_RUN=1 apply.sh \| kubectl diff -f -` **0 行** |
+| 循环活着且在动 k8s API | `e2b:autoscaler:tick` 连续 5 次采样均存在；两个副本日志 `autoscaler tick failed` = **0** |
+| 扩：暖池下限 | `kubectl set env deploy/control-plane E2B_AS_MIN_REPLICAS=3` ⇒ `sts/e2b-worker` 2→3，`e2b-worker-2` 起来并注册（`/internal/nodes` 三个 healthy）；`last_scale_up=1790759746.04` 落盘并在后续 tick 保持 |
+| 缩：drain + retire | 放回 `MIN=2`（清单值）⇒ 循环挑中**唯一空闲**的 `e2b-worker-2`，drain → 0 沙箱 → `remove_node` → `sts` 3→2、pod 删除、`draining_node_id` 清空；`last_scale_down=1790759837.90` |
+| 冷却真的生效 | `1790759837.90 - 1790759746.04 = **91.9 s ≥ 60 s**`（修 ③ 之前同一序列是"同一区间先扩后缩"） |
+| 沙箱不受缩容影响 | 全程 3 个沙箱（两个 worker 各 ≥1）在扩缩容前后都能 `exec` 出 `alive-<hostname>`；收尾后 `/internal/fleet/sandboxes` = `{}`、两节点 `reservedMemoryMB=0` |
+| 官方冒烟 | `multinode_smoke.py` ⇒ `MULTI-NODE SMOKE OK`；`deployment_smoke.py` ⇒ `DEPLOYMENT SMOKE OK`（命令/文件、跨节点迁移保文件、网络配置、远端卷隔离、模板构建→registry→worker 拉取、MCP 网关）—— 都在 `0.1.0-806` 上重跑 |
+| 最终形态 | `control-plane` 2/2（`…control-plane-gateway:0.1.0-806-…`）、`e2b-worker` 2/2、`redis` 1/1；`autoscaler` 的 Deployment/SA/Role/RoleBinding **0 个** |
+
+**残留**：见 `docs/open-issues.md` **N51** —— `pod-deletion-cost` 只被 ReplicaSet 控制器读，StatefulSet
+缩容永远删最高序号，所以"退出的是你 drain 的那个节点"只在两者一致时成立（本次验收里空闲的正是
+最新的 `-2`，所以走的是一致那条路）。修法两选一（未做），触发条件写在 N51 行。
 
 ## 8. 改部署的入口
 
