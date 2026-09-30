@@ -6,6 +6,11 @@
   linux/amd64），镜像全部从**本树**构建（`:c3-gaps`）
 - 原始日志/读数：`tmp/wt-c3-compose/tmp/c3-compose-gaps/`（`evidence-*.txt`、`*.log`、`logs/`）
 
+> **评审轮（2026-09-30，同一分支）**：评审确认三条缺口与两个额外修复都落地，但**这一笔
+> CP-uid 改动**在我上一轮**没有起过**的 `deploy/stack` 上带出两条回归（buildkit 的 unix
+> socket 读不到、TLS 配方把 CP 打死），另有若干注释/文档/钉子问题。逐条收口与两条新的现场
+> 读数见 **§6**（本节 §0–§5 保留为上一轮的原始记录，里面的数字是那一次的读数）。
+
 ## 0. 结论
 
 | 缺口 | 结论 | 一句话 |
@@ -399,4 +404,165 @@ ERROR tests/unit/test_pause_quota.py    # ModuleNotFoundError: No module named '
    `storage-init` 的注释把递归形点名为"不许再获得的回归"；`upgrade.sh` 的一次性 `chown -R`
    仍在（迁移路径不变）。
 6. **`deploy/stack/.version` 与镜像 push 都没做**：本轮没有上线，也没有 push 任何镜像；
-   三个 `:c3-gaps` tag 只在本机。
+  三个 `:c3-gaps` tag 只在本机。
+
+## 6. 评审轮（2026-09-30，同一 worktree/分支）
+
+评审的结论：三条缺口与两个额外修复都落地、现场证据成立；问题出在**我上一轮没起过的
+`deploy/stack`**（两条回归），外加一条陈旧的文档现在时、一条缺失的钉子与若干注释/测试卫生。
+下面是逐条的收口与**两条新的现场读数**。原始输出：
+`tmp/c3-compose-gaps/evidence-1b-buildkit-*.txt`、`evidence-2-tls-*.txt`、
+`evidence-6-init-caps.txt`、`evidence-6-caps-arms.txt`、`stack-up.log`。
+
+### 6.1 提交
+
+| commit | 内容 |
+|---|---|
+| `200e7bf` | `fix(compose): CP 读得到 buildkit socket、init 收到 storage-init 的能力集` —— 第 1、5、6 条 + 钉子（含第 4、8 条） |
+| `949575d` | `fix(scripts): TLS 配方产出 65534 的控制面读得到的证书对` —— 第 2 条 + 单元/契约两条钉子 |
+| `5849398` | `docs(c3): CP 65534 带出的两条回归与收口记进账本` —— 第 3、7、9 条 |
+| `<本报告>` | `chore(c3): 追加评审轮的报告` |
+
+### 6.2 两条新回归的现场读数
+
+两个读数都取自 **`deploy/stack` 形态**（`-p c3stack`，镜像同样从本树构建的 `:c3-gaps`）——
+那正是有 buildkit、也挂了 `./tls` 的栈，也就是我上一轮没起的那一个。起法（新增一个本地
+override，只指镜像 + 把端口挪到 3400，避开 3100 上那个遗留的 `kubectl port-forward`）：
+
+```bash
+docker compose -f deploy/stack/docker-compose.prod.yml \
+  -f tmp/c3-compose-gaps/compose.stack.override.yml -p c3stack up -d --no-build
+```
+
+**① buildkit 的 unix socket（第 1 条）**
+
+```console
+$ docker exec c3stack-control-plane-1 sh -c 'id; stat -c "%n %F %a %u:%g" /run/buildkit/buildkitd.sock'
+uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup),1000
+/run/buildkit/buildkitd.sock socket 660 1000:1000
+$ docker exec c3stack-control-plane-1 sh -c 'grep ^Groups /proc/self/status'
+Groups:	1000 65534
+$ docker exec c3stack-control-plane-1 buildctl --addr unix:///run/buildkit/buildkitd.sock debug workers
+ID                            PLATFORMS
+qaaf72gm7s2a34gq2xdk2lb0u     linux/amd64,linux/amd64/v2,linux/amd64/v3,linux/arm64,…   # rc=0
+$ docker run --rm -u 65534:65534 -v c3stack_buildkit-data:/run/buildkit:ro \
+    --entrypoint buildctl e2b-sandlock-control-plane-gateway:c3-gaps \
+    --addr unix:///run/buildkit/buildkitd.sock debug workers
+error: failed to list workers: Unavailable: connection error: desc = "transport: Error while
+dialing: dial unix /run/buildkit/buildkitd.sock: connect: permission denied"     # ← 反臂：上一轮发出的形态
+$ docker run --rm -u 65534:65534 --group-add 1000 -v c3stack_buildkit-data:/run/buildkit:ro \
+    --entrypoint buildctl e2b-sandlock-control-plane-gateway:c3-gaps \
+    --addr unix:///run/buildkit/buildkitd.sock debug workers | head -2
+ID                            PLATFORMS                                                  # ← 加了组就通
+```
+
+（`docker exec -u 65534:65534` **当不了反臂**：exec 会带上容器的 `GroupAdd`，
+`Groups:` 仍是 `1000 65534`、照样连得上 —— 反臂必须用 `docker run -u` 且**不加**组重建那个
+形态。这一条同时写进了 `docs/c3-privilege-relocation.md` §13.6.1。）
+
+**② TLS 配方（第 2 条）**
+
+先在卷里摆出**原生 Linux 语义**的属主关系（`root:root 0600`）。之所以用命名卷而不是宿主
+bind mount：OrbStack 会把宿主 bind mount 呈现成"容器自己的 uid"（root 容器看到 `0:0`、65534
+容器看到 `65534:65534`，实测），**在 macOS 上根本复现不出**"不是自己的 0600"这个形状。
+
+```console
+$ docker run --rm -u 65534:65534 -v c3stack_tlsdata:/tls:ro alpine \
+    sh -c 'stat -c "%n %a %u:%g" /tls/tls.key; head -c1 /tls/tls.key >/dev/null && echo readable || echo "NOT readable"'
+/tls/tls.key 600 0:0
+NOT readable by 65534
+$ # 旧配方（0600）+ TLS 打开
+$ docker inspect c3stack-control-plane-1 --format 'status={{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}}'
+status=restarting exit=1 restarts=6
+$ docker logs c3stack-control-plane-1 | tail -3
+  File "/usr/local/lib/python3.14/site-packages/uvicorn/config.py", line 129, in create_ssl_context
+    ctx.load_cert_chain(certfile, keyfile, get_password)
+PermissionError: [Errno 13] Permission denied
+$ docker run --rm -v c3stack_tlsdata:/tls alpine chmod 644 /tls/tls.key      # 修好之后的模式
+$ docker inspect c3stack-control-plane-1 --format 'status={{.State.Status}}'
+status=running
+$ docker logs c3stack-control-plane-1 | grep -i "Uvicorn running" | tail -1
+INFO:     Uvicorn running on https://0.0.0.0:3000 (Press CTRL+C to quit)
+$ curl -sS -k https://127.0.0.1:3400/healthz -w ' HTTP %{http_code}\n'
+{"status":"ok"} HTTP 200
+$ curl -sS http://127.0.0.1:3400/healthz -w ' HTTP %{http_code}\n'             # 同端口明文必须失败
+HTTP 000
+$ echo | openssl s_client -connect 127.0.0.1:3400 -servername control-plane 2>/dev/null \
+    | openssl x509 -noout -subject -ext subjectAltName
+subject=CN=localhost
+X509v3 Subject Alternative Name: DNS:localhost, IP Address:127.0.0.1,
+    IP Address:0:0:0:0:0:0:0:1, DNS:control-plane
+```
+
+（跑完这两条现场后我把该栈的 CP 恢复成 HTTP 并确认 `{"status":"ok"}`，
+worker 重新注册；multinode 栈也按下面 §6.4 重跑了一遍。）
+
+### 6.3 能力集（第 6 条）的现场读数
+
+`image-cache-init` 现在与 k8s `storage-init` 逐条同形（`drop: [ALL]` + 三条）；
+用容器真跑那份脚本正文（`tmp/c3-compose-gaps/init-cache.sh`，取自清单本体）：
+
+```console
+$ docker inspect c3gaps-image-cache-init-1 --format 'user={{.Config.User}} cap_drop={{.HostConfig.CapDrop}} cap_add={{.HostConfig.CapAdd}}'
+user=0:0 cap_drop=[ALL] cap_add=[CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER]
+$ # 臂 1：清单那三条
+$ docker run --rm -u 0:0 --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+    -v c3caps_probe:/w -v "$PWD/tmp/c3-compose-gaps:/src:ro" \
+    -e CACHE_DIRS=/w/_images -e OWNED_DIRS=/w/_secrets -e WRITABLE_ROOTS=/w -e VOLUME_STORES=/w/_volumes \
+    --entrypoint sh e2b-sandlock-worker:c3-gaps -c 'grep -E "^Cap(Bnd|Eff)" /proc/self/status; sh /src/init-cache.sh'
+CapEff:	000000000000000b        # CHOWN|DAC_OVERRIDE|FOWNER
+CapBnd:	000000000000000b
+image-cache-init: /w/_images is owned by uid 65534
+… image-cache-init: /w/_volumes -> uid 65534 mode 755 (a non-recursive hand-over; …)
+$ # 臂 2（反臂）：只给 CHOWN+FOWNER
+CapEff:	0000000000000009
+mkdir: cannot create directory '/w/_images/_oci': Permission denied      # ← 三条里 DAC_OVERRIDE 的作用
+```
+
+### 6.4 第 1、4、5、6、7、8、9 条的收口与复跑
+
+* **第 1 条**：`deploy/stack` 的 `control-plane` 加 `group_add: ["1000"]`；钉子
+  `test_only_the_stack_lane_joins_the_builders_group` 两个方向都钉（该栈必须有；
+  另外两个栈没有 builder，**不得**有）。§6.2① 是现场读数。
+* **第 2 条**：生成器两个文件都 `0644` + 脚本注释写清"为什么是模式而不是属主/组"；
+  钉子 = 单元（真跑生成器 + 断言两个生产栈的挂载/环境变量，multinode 形态钉成"没有"）
+  + 契约（真容器 `load_cert_chain` 两条臂）。§6.2② 是现场读数。
+* **第 3 条**：`docs/production-deployment-requirements.md` 的现在时改写 + 那张 2026-09-13
+  的表/验收项标注为 root 时代的历史；顺带 `docs/task-backlog.md`、`docs/sandbox-disk-quota.md`
+  两处同源句子。§7.11/§11.2.1 已按本轮补齐（§11.2.1 第 16 条、§7.12）。
+* **第 4 条**：缓存交棒的**非递归**变成精确钉子 —— 单元里缓存那一半是**有序行列表**相等
+  （`CACHE_HANDOVER_LINES`），另加 `chown -R 65534:65534 "$dir"` 的禁项；改回 `-R` 现在
+  必红（评审前：一条都不会红）。
+* **第 5 条**：三个栈的注释改成"**agent DaemonSet 的** init；控制面 pod 自 C3 Task 5 起
+  **故意没有** init"；multinode 那句过宽的注释改成"可写根**之下**的 `state`/`_runtime`/
+  `.route-b` 由 CP 以根属主身份自己建，所以可写根也在交棒清单里"。
+* **第 6 条**：见 §6.3；钉子 `test_each_compose_init_drops_to_the_three_verbs_the_script_uses`
+  直接与 k8s `storage-init` 的能力集比较相等。
+* **第 7 条**：`Dockerfile.control-plane-gateway` 那句"the control plane itself runs as root"
+  改成"CP **就是**那个 65534（k8s `runAsUser` / 三个 compose 栈的 `user:`），所以这行不再只是
+  为 worker 铺路"。
+* **第 8 条**：`DECLARED_USERS` 从子集判断改成**精确字典**；redis 的
+  `E2B_REDIS_URL` 口令与服务的 `--requirepass`、healthcheck 的 `-a` 逐字绑定（新测试
+  `test_every_compose_record_store_is_wired_with_one_password`）；worker 那半补成
+  `declared == ["default"]`（原来只钉"不在 agent-plane"）；行为臂的三条 stdout 全部改成
+  **精确列表**（原来是 `in`/`startswith`）；另加"三个栈的 init 命令行逐字相同"。
+* **第 9 条**：§7.11 的 417 → **423**（与 §3.6 同一次运行）。
+* **复跑**（第 1/5/6 条改到的 multinode 清单会进冒烟，所以照规矩全跑）：相关 unit
+  **454 passed**；contract `10 passed, 11 skipped`（跳过的是 macOS 跑不了的真内核用例，
+  与 main 同态）；`multinode_smoke.py` = **`MULTI-NODE SMOKE OK`**（4 箱 2+1+1）；
+  判据 13 **all assertions passed**、判据 16 **all assertions passed**（并发 in-flight 3、
+  反臂 1）。三个 `docker compose config` 都 ok。
+
+### 6.5 这一轮剩下的顾虑
+
+1. **`deploy/compose/docker-compose.prod.yml` 仍只有静态/钉子覆盖**：它没有 buildkit（也就没有
+   组位问题），init 的改动与 stack/multinode 是**同一份命令行**（已钉"三栈逐字相同"），
+   TLS 那条则与 stack 同形（同一个 `./tls:/tls:ro` + 同样的 env）。要真机验收它，需要一个
+   registry profile 与 3 个 worker 的完整栈 —— 与本轮目标不成比例，我没有起。**但这一轮
+   的教训正面写了**：上一轮的 `deploy/stack` 就是"没起过"才漏掉的，所以这一轮**起了**
+   `deploy/stack`（§6.2 两条读数都来自它）。
+2. **TLS 打开之后 worker 还要信任自签 CA**（并把 `E2B_CONTROL_PLANE_URL` 指到 https）：这条
+   配方注释里早就写着，本轮只保证**控制面自己起得来**，没有替运维做那一步。
+3. **`group_add: ["1000"]` 是一个真实的组位**：CP 因此能读宿主/卷里"组 1000 可读"的文件。
+   它与 k8s 的 `fsGroup: 1000` 是同一个组、同一个理由（buildkit socket），不是新开口子；
+   但它是"CP 零特权"里唯一一处靠**组**而不是靠**属主**的权限，值得在下一次身份评审时一起看。
