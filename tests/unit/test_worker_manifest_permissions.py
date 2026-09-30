@@ -89,9 +89,11 @@ def test_stack_worker_has_no_cap_add_and_declares_the_low_port_window() -> None:
     # Negative form: no NNP directive can be added to the security_opt list.
     assert "\n      - no-new-privileges" not in worker
     # The worker's syscall filter is the shipped profile, not `unconfined`
-    # (2026-09-15): it is Docker's default profile plus exactly the two syscalls
-    # the sandbox-create path needs. The path is env-overridable because a host
-    # that keeps only this compose file has no `../seccomp/`.
+    # (2026-09-15): it is Docker's default profile plus `pidfd_getfd`, plus a
+    # **narrowed** `unshare` (2026-09-30 — the argument mask keeps the namespace
+    # types the deployment builds and drops the rest). The path is
+    # env-overridable because a host that keeps only this compose file has no
+    # `../seccomp/`.
     assert "\n      - seccomp=${E2B_SECCOMP_PROFILE:-../seccomp/sandlock-worker.json}\n" in worker
     # Netns shape: the anchor every worker inherits, and worker-2's own
     # override (kept so a single node can still be reverted). The pairing guard
@@ -152,18 +154,45 @@ def _unconditional_allowlists() -> list[set[str]]:
     return [set(entry["names"]) for entry in entries]
 
 
-def test_worker_seccomp_profile_is_the_default_plus_two_syscalls() -> None:
-    """The profile may only relax `pidfd_getfd` and `unshare` off the default.
+def test_worker_seccomp_profile_is_the_default_plus_pidfd_getfd_and_a_narrowed_unshare() -> None:
+    """The profile may only relax `pidfd_getfd`, plus a **masked** `unshare`.
 
     Anything else here is a syscall surface the worker did not have before
     2026-09-15, so it must be a conscious edit to this test as well. (The N35
     real-root additions are the other unconditional entry and have their own
     test: `test_worker_seccomp_profile_admits_the_pivot_pair_without_the_cap_gate`.)
+
+    2026-09-30: `unshare` is no longer unconditional. The measurement behind
+    that: on the shipped profile a process that is root *inside its own user
+    namespace* could create a UTS/IPC/cgroup/time namespace (all four measured
+    `ALLOW`), while the deployment only ever builds user, net, pid and mount
+    namespaces (`envd_service/slot_identity.py`,
+    `crates/sandlock-core/src/{context,procfs,realroot}.rs`,
+    `envd_service/executors/sandlock.py`). The mask below is
+    `CLONE_NEWTIME|NEWCGROUP|NEWUTS|NEWIPC`, so those four are now refused
+    (measured: all four `DENY errno=1`, the other four still `ALLOW`) and the
+    revert to an unconditional allow is what this test catches.
     """
     assert WORKER_SECCOMP["defaultAction"] == "SCMP_ACT_ERRNO"
     lists = _unconditional_allowlists()
     allowed = max(lists, key=len)
-    assert {"pidfd_getfd", "unshare"} <= allowed
+    assert "pidfd_getfd" in allowed
+    # `unshare` moved out of the unconditional list into its own masked entry.
+    assert "unshare" not in allowed
+    narrowed = [
+        entry
+        for entry in WORKER_SECCOMP["syscalls"]
+        if entry["action"] == "SCMP_ACT_ALLOW" and "unshare" in entry["names"]
+    ]
+    assert len(narrowed) == 1, "exactly one unshare entry"
+    assert narrowed[0]["names"] == ["unshare"], "and it names only unshare"
+    assert not narrowed[0].get("includes") and not narrowed[0].get("excludes")
+    # 234881152 == CLONE_NEWTIME|NEWCGROUP|NEWUTS|NEWIPC, i.e. the namespace
+    # types this deployment never creates; `valueTwo` defaults to 0, so the
+    # condition is "none of those bits are set".
+    assert narrowed[0]["args"] == [
+        {"index": 0, "value": 234881152, "op": "SCMP_CMP_MASKED_EQ"}
+    ]
     # ...and the other unconditional entry is exactly the N35 pair, nothing more.
     assert min(lists, key=len) == {"pivot_root", "umount2"}
     # Everything that was capability-gated in the upstream default profile must

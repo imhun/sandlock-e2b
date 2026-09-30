@@ -16,10 +16,11 @@ container, and the worker is the process that runs untrusted workloads.
   node. Apply the installer and wait for it to be ready *before* rolling the
   worker StatefulSet.
 
-The profile is **the Docker default profile plus exactly two syscalls** —
-nothing else is relaxed. Everything the sandbox itself needs (`seccomp` with
-`NEW_LISTENER`, `setgroups`, `pidfd_open`, `landlock_*`, `fork`/`clone`,
-`ioctl`, …) is already in the default allowlist.
+The profile is **the Docker default profile plus `pidfd_getfd`, plus a masked
+`unshare`** — nothing else is relaxed, and the `unshare` entry is not a blanket
+allow (see "The `unshare` mask" below). Everything the sandbox itself needs
+(`seccomp` with `NEW_LISTENER`, `setgroups`, `pidfd_open`, `landlock_*`,
+`fork`/`clone`, `ioctl`, …) is already in the default allowlist.
 
 ## The worker checks that it is actually running under this profile
 
@@ -48,7 +49,7 @@ backend).
 | syscall | upstream default | here | why |
 |---|---|---|---|
 | `pidfd_getfd` | gated on `CAP_SYS_PTRACE` | unconditional | sandlock picks up the child's seccomp-notification fd with it (`crates/sandlock-core/src/sandbox.rs::dup_child_fd`). Neither worker shape carries `CAP_SYS_PTRACE`, so the gate refused it and **the sandbox could not be created at all** (measured: create fails, exit `-1`, no child output). |
-| `unshare` | gated on `CAP_SYS_ADMIN` | unconditional | The worker builds a user namespace for the per-sandbox host uid (E3.2, and the route-B slot's F18 self-map), plus a net/pid namespace when `E2B_ENABLE_NET_ISOLATION` / `pid_ns` are on. |
+| `unshare` | gated on `CAP_SYS_ADMIN` | allowed only for the namespace types this deployment builds | The worker builds a user namespace for the per-sandbox host uid (E3.2, and the route-B slot's F18 self-map), plus net/pid/mount namespaces for `E2B_ENABLE_NET_ISOLATION` / `pid_ns` / the real-root shapes. See "The `unshare` mask" below. |
 | `ptrace`, `process_vm_readv`, `process_vm_writev` | gated on `CAP_SYS_PTRACE` in older profile revisions | unconditional | Current daemons already allow these unconditionally (measured on the local engine with `CapEff` lacking `CAP_SYS_PTRACE`); kept aligned so this file matches the shape the deployment is verified against. |
 
 **Not** relaxed: `mount`, `keyctl`, `bpf`, `clone3`, `setns`, `open_tree`,
@@ -85,6 +86,60 @@ the worker/supervisor only.
 deviation to argue for on its own merits, not something this file does silently.
 `ptrace` and `process_vm_readv` cannot be re-gated without breaking fork
 tracking and the notification path.
+
+### The `unshare` mask (2026-09-30)
+
+`unshare` used to be an unconditional allow. It is now one entry whose argument
+mask excludes the namespace types this deployment never builds:
+
+```json
+{"names": ["unshare"], "action": "SCMP_ACT_ALLOW",
+ "args": [{"index": 0, "value": 234881152, "op": "SCMP_CMP_MASKED_EQ"}]}
+```
+
+`234881152` is `0x0E000080` = `CLONE_NEWTIME|NEWCGROUP|CLONE_NEWUTS|CLONE_NEWIPC`,
+and `valueTwo` defaults to `0`, so the condition reads "none of those four bits
+are set". The four the deployment *does* build stay reachable: **user** (the
+per-sandbox host uid — `envd_service/slot_identity.py`,
+`crates/sandlock-core/src/context.rs`, `procfs.rs`, `supervise/src/serve.rs`),
+**net** (`context.rs`, when `E2B_ENABLE_NET_ISOLATION` is on), **pid**
+(`procfs.rs`, when `pid_ns` is on) and **mount** (`realroot.rs`, and the
+real-root probe in `envd_service/executors/sandlock.py`).
+
+**Why it was worth narrowing.** The container-level filter is the outer bound
+for everything in the worker pod, sandboxes included. Under the old
+unconditional entry, a process that is root *inside its own user namespace*
+could create any of the four dropped types. Measured in two arms, both
+`--cap-drop ALL`, uid 65534, `unshare(CLONE_NEWUSER)` + a self-map first so the
+probe really is root in a namespace:
+
+| namespace | shipped (before) | masked (now) |
+|---|---|---|
+| `NEWNS` / `NEWNET` / `NEWPID` | ALLOW | ALLOW |
+| `NEWUTS` / `NEWIPC` / `NEWCGROUP` / `NEWTIME` | **ALLOW** | **DENY `EPERM`** |
+
+**Why the entry cannot simply be dropped.** Two measurements say the relax is
+load-bearing and that no other arrangement removes it:
+
+* The *first* namespace has to be created by the unprivileged side. Writing
+  `/proc/<pid>/uid_map` presupposes an existing namespace — `as_uid` refuses a
+  target whose map is still the initial full range ("this pid has not unshared a
+  user namespace"), so the agent's grant necessarily comes *after* the worker's
+  child has unshared.
+* "Let the agent create it and hand it to the worker" does **not** help. The
+  joiner would need `setns`, which this profile (and the default) gates on
+  `CAP_SYS_ADMIN`. Measured: with the shipped profile the join is refused
+  (`VERDICT=SETNS-REFUSED`, `EPERM`) *even though the caller shares uid 65534
+  with the namespace's owner* — seccomp is static BPF and cannot read
+  `cred->cap_effective`, so a `caps:` condition is resolved when the runtime
+  builds the filter, from the container's **declared** capabilities, which the
+  worker deliberately has none of. Removing the `includes` from that one rule
+  flips the same probe to `SETNS-ALLOWED`, i.e. seccomp was the only thing in
+  the way. So the alternative buys a `setns` relax instead of an `unshare` one.
+
+The only arrangement that removes the relax is the one the C3 plan rejected:
+the agent forks the slot itself, which moves the slot out of the worker's
+process tree and cgroup.
 
 ## Evidence (measured 2026-09-15, Docker on x86_64)
 

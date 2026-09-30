@@ -26,7 +26,12 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 INSTALLER = REPO / "deploy" / "k8s" / "seccomp-installer.yaml"
 PROFILE = REPO / "deploy" / "seccomp" / "sandlock-worker.json"
-MARKER = "  sandlock-worker.json: |-\n"
+# The block scalar is `|` (clip), not `|-` (strip): the profile file ends with a
+# newline and the ConfigMap value has to carry it. The script said `|-` until
+# 2026-09-30, which made it raise IndexError instead of re-embedding -- the two
+# N35 edits it documents had been done by hand, so nobody noticed. The
+# round-trip self-check below is what proves the two sides agree again.
+MARKER = "  sandlock-worker.json: |\n"
 END = "\n---\napiVersion: apps/v1"
 INDENT = "    "
 
@@ -55,6 +60,22 @@ def with_checksum(installer_text: str, digest: str) -> str:
     return re.sub(
         r'(        checksum/profile: ")[0-9a-f]{64}(")',
         rf"\g<1>{digest}\g<2>",
+        installer_text,
+    )
+
+
+def with_comment_hash(installer_text: str, digest: str) -> str:
+    """Refresh the human-readable hash in the file's own header comment.
+
+    `tests/unit/test_worker_manifest_permissions.py` pins this line because it
+    drifted once already: the N35 resync bumped the payload and the annotation
+    but left the comment on the pre-N35 hash, so the one line a human reads
+    named a profile no manifest shipped. Updating it here is what keeps the two
+    in lockstep instead of relying on whoever runs the sync to remember.
+    """
+    return re.sub(
+        r"(# tests/unit/test_worker_manifest_permissions\.py\); sha256 )[0-9a-f]{64}",
+        rf"\g<1>{digest}",
         installer_text,
     )
 
@@ -99,7 +120,9 @@ def main() -> int:
     # the revision the installer was last in sync on: 8ea5909's profile text
     # hashes to the 0e0796... the annotation carried before this sync.
     digest = hashlib.sha256(profile.encode()).hexdigest()
-    updated = with_checksum(with_payload(installer, new_payload), digest)
+    updated = with_comment_hash(
+        with_checksum(with_payload(installer, new_payload), digest), digest
+    )
     if updated == installer:
         print("already in sync")
         return 0
