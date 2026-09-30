@@ -1517,16 +1517,20 @@ def test_create_app_nonroot_discloses_direct_quota_downgrade(
     )
     caplog.set_level(logging.WARNING)
     create_envd_app(
-        # E2B_PRIV_HELPERS=off pins the *non-root in-process* shape this test
-        # is about: with the Track F brokers installed, a non-root worker
-        # keeps per-sandbox uids and the E3.2 disclosure no longer applies
-        # (tests/unit/test_priv_helpers.py covers that shape).
+        # A non-root worker with no agent configured is the *in-process* shape
+        # this test is about -- and since the local file-capability brokers went
+        # (N52) that is also what it says out loud, one line before the quota
+        # ones.
         settings=EnvdSettings(
             executor="local", workspace_base=tmp_path, priv_helpers="off"
         ),
         runtime_registry=RuntimeRegistry(tmp_path),
     )
     assert [r.message for r in caplog.records if r.name == "envd_service.app"] == [
+        "this worker has no privileged file-step path configured: neither "
+        "the agent transport nor a per-node agent is configured, so it keeps "
+        "the in-process (E5.1) shape (no per-sandbox host uids, no route-B "
+        "slots)",
         app_module.PER_UID_NONROOT_WARNING,
         f"{xfs_quota.NONROOT_DIRECT_QUOTA_REASON} (direct xfs_quota requires "
         "root/CAP_SYS_ADMIN; per-sandbox disk hard limits are disabled while "

@@ -456,19 +456,21 @@ def test_walk_output_is_parsed_with_owner_and_size(tmp_path: Path) -> None:
 # -------------------------------------------------------------- self-check
 
 
-def test_missing_helpers_keep_the_worker_in_process_and_name_the_binary(
+def test_a_worker_with_no_agent_keeps_the_in_process_shape_and_says_so(
     tmp_path: Path, monkeypatch
 ) -> None:
+    """The one warning a non-root, agent-less worker gets (N52).
+
+    It used to name the missing file-capability binary; there is no binary to
+    ship any more -- the agent is the only privileged path -- so the line names
+    the model the worker is running instead.
+    """
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
-    monkeypatch.setattr(ph, "DEFAULT_HELPER_DIR", tmp_path / "e2b-priv")
     settings = _settings(tmp_path)
-    assert ph.resolve_priv_helpers(settings) is None
-    assert ph.helpers_unavailable_reason(settings) == (
-        f"E2B_PRIV_HELPERS=auto on a non-root worker, but "
-        f"{tmp_path / 'e2b-priv' / 'e2b-slot-spawn'} is missing: this worker "
-        "keeps the in-process (E5.1) shape; ship the file-capability brokers "
-        "to get per-sandbox host uids and route-B slots"
-    )
+    reason = ph.helpers_unavailable_reason(settings)
+    assert reason is not None
+    assert "no privileged file-step path configured" in reason
+    assert "E5.1" in reason
 
 
 def test_an_unknown_transport_is_refused(tmp_path: Path, monkeypatch) -> None:
@@ -487,16 +489,18 @@ def test_an_unknown_transport_is_refused(tmp_path: Path, monkeypatch) -> None:
         ph.resolve_priv_helpers(_settings(tmp_path))
 
     assert str(excinfo.value) == (
-        "E2B_PRIV_HELPER_TRANSPORT must be 'auto', 'exec' or 'agent' "
-        "(got 'telepathy')"
+        "E2B_PRIV_HELPER_TRANSPORT must be 'auto' or 'agent' (got 'telepathy')"
     )
     monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "socket")
     with pytest.raises(ph.PrivHelperError) as excinfo:
         ph.resolve_priv_helpers(_settings(tmp_path))
-    assert str(excinfo.value) == (
-        "E2B_PRIV_HELPER_TRANSPORT must be 'auto', 'exec' or 'agent' "
-        "(got 'socket')"
-    )
+    assert "retired" in str(excinfo.value)
+    assert "served by the per-node agent now" in str(excinfo.value)
+    # ...and the same for `exec`, the worker-side file-capability shape (N52).
+    monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "exec")
+    with pytest.raises(ph.PrivHelperError) as excinfo:
+        ph.resolve_priv_helpers(_settings(tmp_path))
+    assert "retired" in str(excinfo.value)
 
 
 def test_a_half_installed_broker_pair_fails_closed(

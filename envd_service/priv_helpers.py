@@ -121,7 +121,15 @@ TRANSPORT_ENV = "E2B_PRIV_HELPER_TRANSPORT"
 #: is a *shape*, not a transport in the argv sense: this module's argv builders
 #: and the file-capability binaries are simply not used in it, and
 #: :mod:`envd_service.agent_fileops` is the client instead.
-TRANSPORTS = ("auto", "exec", "agent")
+#: The transports this worker still has. ``auto`` resolves to ``agent`` -- the
+#: only shape that performs a privileged file step or grants a slot its
+#: identity (C3). ``exec`` (the worker running the file-capability binaries
+#: itself) and C1's ``socket`` were retired on 2026-09-30 (open-issues N52) and
+#: are refused **by name** rather than quietly resolving to something else.
+TRANSPORTS = ("auto", "agent")
+
+#: Named, so the refusal can say what it replaced.
+RETIRED_TRANSPORTS = ("exec", "socket")
 #: The transport value that selects the C3 shape.
 AGENT_TRANSPORT = "agent"
 
@@ -145,10 +153,16 @@ def _image_cache_root() -> Path | None:
 def _transport_setting() -> str:
     """``E2B_PRIV_HELPER_TRANSPORT`` (default ``auto``), validated by name."""
     value = str(os.environ.get(TRANSPORT_ENV, "auto") or "auto").lower()
+    if value in RETIRED_TRANSPORTS:
+        raise PrivHelperError(
+            f"E2B_PRIV_HELPER_TRANSPORT={value!r} is retired (2026-09-30, "
+            "open-issues N52): privileged file steps and slot identities are "
+            "served by the per-node agent now; that shape lives in git if a "
+            "deployment ever needs it back"
+        )
     if value not in TRANSPORTS:
         raise PrivHelperError(
-            "E2B_PRIV_HELPER_TRANSPORT must be 'auto', 'exec' or 'agent' "
-            f"(got {value!r})"
+            f"E2B_PRIV_HELPER_TRANSPORT must be 'auto' or 'agent' (got {value!r})"
         )
     return value
 
@@ -865,25 +879,26 @@ def _active() -> PrivHelpers | None:
 _ACTIVE: list[PrivHelpers | None] = [None]
 
 
-def configure_priv_helpers(settings) -> PrivHelpers | None:
-    """Resolve + install the singleton the worker wires itself to.
+def configure_priv_helpers(settings) -> None:
+    """Wire this worker's privileged file steps -- the agent client, and only it.
 
-    Two singletons are resolved here, and exactly one of them is the live shape
-    (``E2B_PRIV_HELPER_TRANSPORT``): the file-capability binaries (``exec`` /
-    ``auto``) or C3's agent client (``agent``). ``agent`` installs **no**
-    ``PrivHelpers`` -- the argv builders and their binaries are not part of that
-    shape at all -- and :func:`file_steps_available` is what the call sites ask
-    instead of "are there brokers".
+    One shape is left (2026-09-30, open-issues N52): the per-node agent performs
+    those steps, and this call installs the client that asks it
+    (``envd_service.agent_fileops``). ``E2B_PRIV_HELPER_TRANSPORT`` is still
+    read for one reason -- a deployment that names the retired ``exec`` or
+    ``socket`` must be *refused by name* rather than quietly run a shape it did
+    not ask for; the values it accepts (``auto``/``agent``) both mean "the
+    agent".
     """
     from envd_service import agent_fileops
 
-    if _transport_setting() == AGENT_TRANSPORT:
+    _transport_setting()
+    # Only wire the client when the deployment actually names the agent shape:
+    # a shape that names neither keeps whatever it installed (the unit lanes
+    # inject one), and the startup warning says which model it is running.
+    if agent_fileops.enabled(settings):
         agent_fileops.configure(settings)
-        _ACTIVE[0] = None
-        return None
-    helpers = resolve_priv_helpers(settings)
-    _ACTIVE[0] = helpers
-    return helpers
+    return None
 
 
 def file_steps_available(settings=None) -> bool:
@@ -1047,30 +1062,23 @@ def dir_size(path: str | Path) -> int | None:
 
 
 def helpers_unavailable_reason(settings) -> str | None:
-    """Why a non-root worker is *not* using the broker shape, or ``None``.
+    """Why a non-root worker has no privileged file-step path, or ``None``.
 
-    Only the "no brokers at all" case: a *partial* install is a deployment
-    defect and fails closed in :func:`resolve_priv_helpers` instead.
-
-    C3's agent shape answers ``None``: a worker with no brokers is *not*
-    degraded there -- its privileged file steps are served by the agent -- so
-    the "keeping the in-process (E5.1) shape" warning would be wrong.
+    One shape can perform those steps now -- C3's agent -- so this is the line
+    for the shapes that name neither: they keep the in-process (E5.1) model,
+    which means no per-sandbox host uid and no route-B slots, and the caller
+    logs it once at startup rather than letting the difference be discovered
+    from a sandbox that behaves differently.
     """
     from envd_service import agent_fileops
 
-    if agent_fileops.enabled(settings):
-        return None
-    mode = str(getattr(settings, "priv_helpers", "auto") or "auto").lower()
-    if mode == "off" or os.geteuid() == 0:
-        return None
-    slot = DEFAULT_HELPER_DIR / SLOT_SPAWN_NAME
-    maint = DEFAULT_HELPER_DIR / MAINT_NAME
-    if slot.exists() or maint.exists():
+    if agent_fileops.active() is not None or os.geteuid() == 0:
         return None
     return (
-        f"E2B_PRIV_HELPERS=auto on a non-root worker, but {slot} is missing: "
-        "this worker keeps the in-process (E5.1) shape; ship the "
-        "file-capability brokers to get per-sandbox host uids and route-B slots"
+        "this worker has no privileged file-step path configured: neither "
+        "the agent transport nor a per-node agent is configured, so it keeps "
+        "the in-process (E5.1) shape (no per-sandbox host uids, no route-B "
+        "slots)"
     )
 
 
