@@ -388,6 +388,130 @@ async def test_a_quota_volume_contributes_a_slice(workspace: Path) -> None:
 # ------------------------------------------------------------- the refusals
 
 
+async def _worker_hop_flag(app, shape, monkeypatch) -> list:
+    """Drive a create and report ``materialized`` as the *worker* saw it."""
+    hops: list = []
+
+    async def _fake(request, record, node, settings, snapshot, volume_mounts, **kw):
+        hops.append(kw.get("materialized"))
+
+    monkeypatch.setattr(sandboxes, "_provision_remote", _fake)
+    monkeypatch.setattr(sandboxes, "_await_inflight_create", _noop)
+    resp = await _create(app, shape.settings)
+    assert resp.status_code == 201, resp.text
+    return hops
+
+
+async def _noop(*args, **kwargs) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_without_an_agent_client_the_worker_is_told_to_build_the_tree(
+    workspace: Path, monkeypatch
+) -> None:
+    """The flag must never claim a tree nobody made (review C1).
+
+    ``_materialize_remote`` returns early in three shapes -- no agent client, no
+    verified worker identity, no allocated host uid. Saying ``materialized``
+    anyway has the worker skip both the tree and the hand-over, i.e. a sandbox
+    with no ``workspace`` answering 201.
+    """
+    shape = _Cp(workspace)
+    app = _app(shape, client=None)
+    app.state.c3_agent_client = None
+    await _register_node(app)
+
+    assert await _worker_hop_flag(app, shape, monkeypatch) == [False]
+
+
+@pytest.mark.asyncio
+async def test_without_a_verified_worker_identity_the_worker_builds_the_tree(
+    workspace: Path, monkeypatch
+) -> None:
+    """A node whose identity this control plane never verified (k8s said no)."""
+    shape = _Cp(workspace)
+    client = _StubClient()
+    app = _app(shape, client=client)
+    await _register_node(app)
+    # The register handler stores what the identity source returned; drop it, as
+    # a node whose pod spec pins no runAsUser/runAsGroup reports none.
+    node = app.state.nodes.get(WORKER)
+    node.worker_uid = None
+    node.worker_gid = None
+
+    assert await _worker_hop_flag(app, shape, monkeypatch) == [False]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_without_a_host_uid_the_worker_builds_the_tree(
+    workspace: Path, monkeypatch
+) -> None:
+    """``E2B_PER_SANDBOX_UID=false``: nothing to hand a tree to (review I4).
+
+    There is no uid for the plan to name, so the instruction cannot be derived
+    at all -- and this was a supported shape (the worker's own
+    ``align_shared_uid_workspace`` branch exists for it), not an error.
+    """
+    shape = _Cp(workspace)
+    shape.settings.per_sandbox_uid = False
+    client = _StubClient()
+    app = _app(shape, client=client)
+    await _register_node(app)
+
+    assert await _worker_hop_flag(app, shape, monkeypatch) == [False]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_agent_that_does_not_know_the_operation_falls_back(
+    workspace: Path, monkeypatch
+) -> None:
+    """A rolling upgrade: the agent's op whitelist has no ``materialize`` (I3).
+
+    The API answered by an older agent is a 404 naming the op it does not know.
+    That is "this deployment cannot take the instruction yet", so the create
+    degrades to the worker's own path -- it is not a create that failed.
+    """
+    shape = _Cp(workspace)
+    client = _StubClient(
+        refuse="the agent for node e2b-worker-0 refused the materialize (HTTP "
+        "404): unknown agent op 'materialize'",
+        status_code=404,
+    )
+    app = _app(shape, client=client)
+    await _register_node(app)
+
+    assert await _worker_hop_flag(app, shape, monkeypatch) == [False]
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_busy_agent_falls_back_to_the_worker(
+    workspace: Path, monkeypatch
+) -> None:
+    """The agent's named "busy" is a slow path, not a failed create (review I5).
+
+    Over ``E2B_C3_AGENT_MATERIALIZE_MAX`` the agent refuses rather than queueing
+    (design §4.6). Failing the create there would make the fifth concurrent
+    snapshot create on a node fail for the caller; the worker's own path is
+    slower and no less correct.
+    """
+    shape = _Cp(workspace)
+    client = _StubClient(
+        refuse="the agent for node e2b-worker-0 refused the materialize (HTTP "
+        "503): materialize is busy: 4 concurrent materializations are in flight "
+        "on this node",
+        status_code=503,
+    )
+    app = _app(shape, client=client)
+    await _register_node(app)
+
+    assert await _worker_hop_flag(app, shape, monkeypatch) == [False]
+    assert len(client.calls) == 1
+
+
 @pytest.mark.asyncio
 async def test_a_refused_instruction_fails_the_create(workspace: Path) -> None:
     """A materialization the agent refuses is a create that did not happen."""
@@ -398,7 +522,14 @@ async def test_a_refused_instruction_fails_the_create(workspace: Path) -> None:
 
     resp = await _create(app, shape.settings)
 
-    assert resp.status_code >= 500
+    # The agent's own status is forwarded, the way every relayed file op
+    # forwards it (``node_file_op``): a content refusal is the control plane's
+    # answer, not a bare 500. Until this task's import fix, this branch could
+    # never run -- ``except AgentClientError`` raised ``NameError``, which the
+    # handler below folded into ``500 Failed to provision ... name
+    # 'AgentClientError' is not defined``, hiding the agent's words.
+    assert resp.status_code == 400
+    assert resp.json()["message"] == "path-outside-roots: refusing"
     # The rollback every provisioning failure takes: the record is gone, and
     # with it the host uid the create had allocated.
     with pytest.raises(UnknownSandboxError):

@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 
 from control_plane.api.errors import OfficialError
 from control_plane import file_ops
+from control_plane.c3_agent_client import AgentClientError
 # The compose lane's identity anchor for the agent to confirm (D21/D25). One
 # implementation, shared with the relayed file ops -- a second copy could only
 # drift from the rule the agent's own gate is written against.
@@ -1272,7 +1273,7 @@ async def _create_sandbox_attempt(
             # plane to relay the ownership hand-over. A refusal is a create
             # that did not happen, and the rollback below is the same one every
             # other provisioning failure takes.
-            await _materialize_remote(
+            materialized = await _materialize_remote(
                 request,
                 record,
                 node,
@@ -1287,7 +1288,7 @@ async def _create_sandbox_attempt(
                 snapshot,
                 volume_mounts,
                 snapshot_id=snapshot.snapshot_id if snapshot else None,
-                materialized=True,
+                materialized=materialized,
             )
         if claim.abandoned:
             # A teardown waited, gave up, and removed what it found. Keeping
@@ -1499,7 +1500,7 @@ async def _await_inflight_create(request, sandbox_id: str) -> None:
         )
 
 
-async def _materialize_remote(request, record, node, settings, snapshot) -> None:
+async def _materialize_remote(request, record, node, settings, snapshot) -> bool:
     """Materialize one create's tree on its node, through that node's agent.
 
     The whole point of doing it *here* rather than in the worker (design v2):
@@ -1508,21 +1509,37 @@ async def _materialize_remote(request, record, node, settings, snapshot) -> None
     could tell it, and the worker (which is not allowed to run privileged file
     steps) never has to reach an agent at all.
 
-    Two shapes do **not** send an instruction, and both are correct rather than
-    degraded:
+    **The return value is the whole contract**: ``True`` only when the agent
+    really accepted the instruction and therefore the tree really exists. The
+    caller passes it to the worker as ``materialized``, and the worker believes
+    it -- so a ``True`` that is not backed by a tree is a sandbox with no
+    ``workspace`` answering 201 (review C1). Every path that does not send an
+    instruction, or sends one that is refused as "not mine", returns ``False``
+    and the worker builds the tree itself.
 
-    * a node with no agent client configured (an embedder, ``local://``);
+    That is deliberately wider than "no agent client configured". A shape that
+    cannot *express* the instruction degrades rather than failing:
+
+    * no agent client (an embedder);
     * a node whose worker identity this control plane never verified -- without
-      it there is no gid for ``maint.c``'s gate, so the worker's own path (which
-      refuses the same way, by name) is the only one that can run.
+      it there is no gid for ``maint.c``'s gate;
+    * a record with no host uid (``E2B_PER_SANDBOX_UID=false``) -- there is
+      nothing to hand the tree to, and the worker's own
+      ``align_shared_uid_workspace`` branch exists for exactly that shape;
+    * an **older agent** whose op whitelist has no ``materialize`` (a rolling
+      upgrade; the apply order alone would have made this window hit every
+      create on that node);
+    * an agent that answers its named "busy" -- refusing the create there would
+      turn the fifth concurrent snapshot create on a node into a failure.
 
-    Everything else fails the create: an agent that refuses the materialization
-    means the tree does not exist, and ``create_sandbox``'s rollback drops the
-    record (which also returns the host uid to the pool).
+    What still fails the create: an agent that refuses the *content* (a bad
+    path, a partial copy, a refused privileged step). Those mean the tree is not
+    there for a reason the operator has to see, and ``create_sandbox``'s
+    rollback drops the record (returning the host uid to the pool).
     """
     client = getattr(request.app.state, "c3_agent_client", None)
     if client is None:
-        return
+        return False
     worker_gid = getattr(node, "worker_gid", None)
     worker_uid = getattr(node, "worker_uid", None)
     if worker_uid is None or worker_gid is None:
@@ -1534,7 +1551,17 @@ async def _materialize_remote(request, record, node, settings, snapshot) -> None
             node.node_id,
             record.sandbox_id,
         )
-        return
+        return False
+    if getattr(record, "host_uid", None) is None:
+        # ``E2B_PER_SANDBOX_UID=false``: the plan has no uid to name (the derivation
+        # refuses that with a 503), and the worker's own path is the supported
+        # shape for it.
+        logger.warning(
+            "sandbox %s has no allocated host uid (per-sandbox uids off): the "
+            "worker will materialize it itself",
+            record.sandbox_id,
+        )
+        return False
     state = request.app.state
     paths = file_ops.control_paths(state, settings)
     plan = file_ops.derive_materialize(
@@ -1559,9 +1586,39 @@ async def _materialize_remote(request, record, node, settings, snapshot) -> None
             ),
         )
     except AgentClientError as exc:
+        if _is_unknown_op(exc):
+            logger.warning(
+                "the agent for node %s does not take a materialization "
+                "instruction yet (rolling upgrade): the worker will "
+                "materialize sandbox %s itself",
+                node.node_id,
+                record.sandbox_id,
+            )
+            return False
+        if exc.status_code == 503 and "busy" in str(exc):
+            logger.warning(
+                "the agent for node %s is at its materialization budget: the "
+                "worker will materialize sandbox %s itself (slower, same "
+                "result)",
+                node.node_id,
+                record.sandbox_id,
+            )
+            return False
         raise OfficialError(exc.status_code, str(exc)) from exc
     except file_ops.FileOpRefusal as exc:
         raise OfficialError(exc.status_code, str(exc)) from exc
+    return True
+
+
+#: The agent's own wording for "this op is not in my whitelist"
+#: (``c3_agent/app.py``'s unknown-op 404, pinned there by its own test). Matched
+#: on the text because that 404 carries no machine-readable field; if a second
+#: consumer ever needs this, give it one rather than matching twice.
+_UNKNOWN_OP_MARKER = "unknown agent op"
+
+
+def _is_unknown_op(exc: AgentClientError) -> bool:
+    return exc.status_code == 404 and _UNKNOWN_OP_MARKER in str(exc)
 
 
 async def _provision_remote(
