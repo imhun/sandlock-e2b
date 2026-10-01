@@ -335,6 +335,16 @@ async def test_a_delete_on_the_other_replica_does_not_resurrect_the_record(
     it and writes go through it, so with the shared check stubbed out this test
     goes red with the record **back** -- which is the reproduction review C2
     describes (a 204 for the client, and a sandbox that is still listed).
+
+    Measured, because an earlier pass recorded the opposite and stopped
+    looking (the harness that keeps this honest is
+    ``test_the_cross_replica_shape_resurrects_the_record_without_the_check``):
+    in this shape **nothing else answers 409 first**. With the check stubbed,
+    no ``OfficialError(409)`` is raised anywhere in the flow -- the attempt
+    reaches ``registry.save``, answers 201, and the record is back in the
+    shared store. With it real, the one and only 409 is the window branch in
+    ``control_plane/api/sandboxes.py``, which is why the assertion below pins
+    that branch's message rather than just the status code.
     """
     shape = _Cp(workspace)
     agent = _HeldMaterialize()
@@ -353,6 +363,11 @@ async def test_a_delete_on_the_other_replica_does_not_resurrect_the_record(
     agent.release.set()
     create_resp = await create
     assert create_resp.status_code == 409, create_resp.text
+    # The *branch* that decided, not merely "some 409": a teardown that landed
+    # between the materialization and the record has to be the reason.
+    assert create_resp.json()["message"] == (
+        f"Sandbox {SANDBOX} was deleted while it was being created"
+    )
     # The shared store is the authority in this shape, so that is where the
     # absence has to be read from.
     assert store.records == {}
@@ -365,6 +380,62 @@ async def test_a_delete_on_the_other_replica_does_not_resurrect_the_record(
     # ...and the runtime this create registered is taken down by the create
     # itself (review I6), not left for a sweep that only reclaims trees.
     assert worker_teardown == [(SANDBOX, False), (SANDBOX, True)]
+
+
+@pytest.mark.asyncio
+async def test_the_cross_replica_shape_resurrects_the_record_without_the_check(
+    workspace: Path, worker_teardown, monkeypatch
+) -> None:
+    """The negative control for the test above: disable the check, get the residue.
+
+    "The cross-replica test passes" is only evidence if the same shape *fails*
+    when the check is disabled, so this runs that shape with
+    ``_record_is_still_ours`` pinned to ``True`` and asserts the residue review
+    C2 describes: the delete was answered 204, the create went on to
+    ``registry.save`` anyway, answered 201, and the record -- the very same one,
+    by ``started_at`` -- is back in the shared store. The client has a sandbox
+    it was told was gone.
+
+    Two things this pins beyond the sibling test:
+
+    * the stub has to bind to the *call site* (the module-level name). An
+      earlier pass patched a symbol that was not the call site, applied
+      cleanly, changed nothing, and produced the opposite conclusion -- see
+      the docstring of the sibling test;
+    * the residue is reachable here at all, i.e. the shared store really does
+      write through (``_SharedRecordStore.put``), so the sibling test is not
+      green because the store quietly refuses the create's write.
+
+    If a future change adds a second defence and this control goes red, that is
+    the signal to re-measure -- not to weaken the sibling test.
+    """
+    monkeypatch.setattr(sandboxes, "_record_is_still_ours", lambda *a, **k: True)
+
+    shape = _Cp(workspace)
+    agent = _HeldMaterialize()
+    store = _SharedRecordStore()
+    registry = SandboxRegistry(shape.settings, record_store=store)
+    replica_a = _app(shape, agent=agent, registry=registry)
+    replica_b = _app(shape, agent=agent, registry=registry)
+    await _register(replica_a)
+    await _register(replica_b)
+
+    create = asyncio.create_task(_create(replica_a))
+    await asyncio.wait_for(agent.entered.wait(), 5)
+    created = store.records[SANDBOX]["started_at"]
+    assert (await _delete(replica_b)).status_code == 204
+    assert store.records == {}
+
+    agent.release.set()
+    create_resp = await create
+    assert create_resp.status_code == 201, create_resp.text
+    assert list(store.records) == [SANDBOX]
+    # The *same* record, not a fresh one: ``started_at`` is the nonce the check
+    # compares, and the create's own record is the one that came back.
+    assert store.records[SANDBOX]["started_at"] == created
+    assert registry.get(SANDBOX) is not None
+    # Nothing tore the runtime down: the branch that would have (I6) never ran.
+    assert worker_teardown == [(SANDBOX, False)]
 
 
 def test_the_shared_check_sees_a_record_someone_else_removed(workspace: Path) -> None:
