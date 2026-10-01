@@ -1,29 +1,91 @@
-# E2B-Sandlock 网关
+# sandlock-e2b
 
-本地 E2B 兼容层：官方 `e2b` Python/JS SDK 零代码修改，控制面复刻官方
-Sandbox REST API，envd 复刻官方 Connect-RPC 与文件 HTTP 契约，底层用
-Sandlock（Landlock + seccomp-bpf + seccomp user notification）执行用户代码。
+**E2B 兼容的沙箱服务端**：官方 `e2b` Python / JS SDK **零代码修改**即可接入，运行时用
+[Sandlock](https://github.com/imhun/sandlock)（Landlock + seccomp-bpf + seccomp user
+notification）在自己机器的 Linux 内核上跑用户代码 —— 不需要 Firecracker，也不需要虚拟化。
 
-详细方案见 [spec.md](spec.md)。
+- **兼容面**：`Sandbox.create/connect/kill`、`commands.run` + PTY/stdin、文件 API、
+  `health`、`metrics`、`logs`、Volume、Secret、`pause/resume`、`fork/snapshot`、
+  network 策略（`allowOut`/`denyOut`/`rules`/`egressProxy`）、模板本地构建、MCP 网关。
+- **不支持的 API 一律返回官方 Error JSON（501）**，不返回假成功。
+- 详细协议口径见 [spec.md](spec.md)；当前实现与 spec 的两处事实性偏差见文末。
 
-## 架构
+## 目录
+
+1. [架构](#1-架构)
+2. [仓库结构](#2-仓库结构)
+3. [快速开始](#3-快速开始)
+4. [核心概念](#4-核心概念)
+5. [配置](#5-配置)
+6. [测试与验收](#6-测试与验收)
+7. [构建与发布](#7-构建与发布)
+8. [文档索引](#8-文档索引)
+9. [已知边界](#9-已知边界)
+
+## 1. 架构
 
 ```text
-SDK (Python 2.46.x / JS 2.46.1)
-  |
-  | E2B_API_URL
-  v
-Control Plane :3000          -- 沙箱注册表 / TTL / 认证 / 资源准入
-  |
-  | E2B_SANDBOX_URL
-  v
-Envd Service :49983          -- Connect-RPC + /files /health /envs /metrics
-  |
-  v
-Executor                     -- Sandlock（Linux 6.12+）/ Local（开发回退）
+e2b SDK（本仓库验证版本：Python 2.46.0 / JS 2.46.1）
+   │  E2B_API_URL + E2B_SANDBOX_URL（生产里是同一个地址）
+   ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ control-plane + gateway  :3000        （Deployment，可多副本 + Redis）│
+│  · Sandbox REST API：注册表 / TTL / 资源准入 / 配额账本 / 调度        │
+│  · 按 E2b-Sandbox-Id 把 Connect-RPC 与 /files 原样透传给目标 worker   │
+│  · 自动扩缩容循环（autoscaler_service，按 pod-deletion-cost 缩 worker）│
+└──────────────────────────────────────────────────────────────────────┘
+   │  内部 API（X-Internal-Key）+ 节点身份校验（地址/源 IP）
+   ▼
+┌───────────────────────────┐        ┌──────────────────────────────────┐
+│ e2b-worker（StatefulSet）  │        │ e2b-c3-agent（DaemonSet，每节点）│
+│  envd_service :49983      │        │  face A :49985  uid 65534        │
+│  非 root（uid 65534）      │  ────► │   · 写槽位 uid_map（身份授予）    │
+│  · 沙箱生命周期/文件/命令  │        │  face B :49986  root             │
+│  · Sandlock 执行器         │        │   · chown / rm / walk（文件步骤）│
+│  · route B 槽位池          │        └──────────────────────────────────┘
+└───────────────────────────┘
 ```
 
-## 快速开始（macOS 开发，Local 执行器）
+一次 `Sandbox.create()` 的调用链（生产形态）：
+
+1. SDK → 控制面 `POST /sandboxes`；调度器选节点、预留配额、登记记录。
+2. 控制面 → 目标 worker 的 `POST /agent/sandboxes`（内部 key）；worker 建工作目录
+   （`0770 owner=<沙箱 uid> group=<worker gid>`）、挂卷、按需解包镜像 rootfs。
+3. 第一条命令触发 **route B 槽位**：worker fork 一个子进程 → 子进程 `unshare(CLONE_NEWUSER)`
+   → 把 `{sandbox_id, pid}` 报给控制面 → 控制面按自己的记录查出 uid 并指令本节点 agent
+   **写 `uid_map`/`gid_map`** → 子进程 `setresuid(X)` 后 exec `sandlock-supervise`。
+4. `sandlock-supervise` 在镜像 rootfs（chroot）里按 Landlock/seccomp 策略运行命令，
+   路径中介负责网络策略、文件注入、配额记账。
+
+三句话记住**谁有什么权限**（C3 硬规则，见 [docs/c3-privilege-relocation.md](docs/c3-privilege-relocation.md)）：
+
+- **worker 零特权**：uid 65534、容器 BND 空集、镜像里没有任何 file-capability 二进制；
+  它能动的是"自己作为属组的 `0770` 树"，和"点名一个 sandbox_id 请别人动手"。
+- **agent 是唯一的特权组件**：每节点一个 DaemonSet，面 A（65534，`SETUID/SETGID` 写在 BND 里）
+  只写 `uid_map`；面 B（root，`CHOWN/DAC_OVERRIDE`）只做 `chown`/`rm`/`walk`，
+  且路径必须落在部署显式声明的根之下。
+- **worker ↔ agent 不存在**：worker 只会拨控制面，控制面才会拨 agent。`envd_service/**`
+  里不许出现 agent 的地址/端口/令牌（有单元测试钉住）。
+
+## 2. 仓库结构
+
+| 目录 | 内容 |
+|---|---|
+| `control_plane/` | 控制面：官方 Sandbox REST API、注册表（内存/Redis）、调度、准入、配额账本、网络策略校验、C3 agent 客户端、自愈、自动扩缩容循环 |
+| `envd_service/` | 每节点 worker：Connect-RPC + 文件 HTTP 契约、沙箱生命周期、Sandlock 执行器、route B、卷/快照/检查点、MCP 网关、quota 监控 |
+| `c3_agent/` | 每节点特权 agent：面 A（身份授予）/ 面 B（文件操作）+ `priv/` 下的 C 原语（`as_uid`、`e2b-maint`） |
+| `quota_agent/` | 可选的配额服务端（在挂载 XFS 的机器上执行 `xfs_quota`，让非 root worker 也有每沙箱磁盘硬限） |
+| `autoscaler/` | 扩缩容库（策略 + 状态 + `backends/k8s.py`），由控制面的循环调用 |
+| `gateway_common/` | 控制面与 worker 共享的小工具：env、错误码、ID、keepalive、网络策略、路径、上传 |
+| `deploy/` | Dockerfile（`docker/`）、k8s 清单（`k8s/`）、k0s overlay 与 apply/upgrade（`k8s-k0s/`）、生产 compose 栈（`stack/`）、示例 compose（`compose/`）、脚本（`scripts/`） |
+| `tests/` | `unit/`（161 个文件）、`contract/`（65 个）、`sdk/{python,js}`、`security/`、`perf/` |
+| `docs/` | 设计与运维文档（索引见 [§8](#8-文档索引)）；`docs/reports/` 是历史任务报告 |
+| `third_party/sandlock` | sandlock 的 fork 子模块（构建 wheel 的源） |
+| `wheels/fork/` | 构建产物（**不入库**），由 `deploy/scripts/build-sandlock-wheels.sh` 生成 |
+
+## 3. 快速开始
+
+### 3.1 本地开发（macOS，Local 执行器）
 
 ```bash
 python3 -m venv tmp/venv
@@ -36,8 +98,6 @@ E2B_API_KEYS=local-key tmp/venv/bin/python -m control_plane
 E2B_EXECUTOR=local tmp/venv/bin/python -m envd_service
 ```
 
-官方 SDK 只设置三个环境变量即可接入：
-
 ```python
 import os
 os.environ["E2B_API_URL"] = "http://localhost:3000"
@@ -45,439 +105,201 @@ os.environ["E2B_SANDBOX_URL"] = "http://localhost:49983"
 os.environ["E2B_API_KEY"] = "local-key"
 
 from e2b import Sandbox
-
 sandbox = Sandbox.create()
-result = sandbox.commands.run("python3 -c 'print(1+1)'")
-assert result.stdout == "2\n"
+print(sandbox.commands.run("python3 -c 'print(1+1)'").stdout)   # 2
 sandbox.kill()
 ```
 
-## 测试
+macOS 上只能跑 Local 执行器（Landlock/seccomp 是 Linux 特性）：协议兼容性可以这样验，
+**隔离能力必须换 Linux**。合并形态下 `E2B_API_URL` 与 `E2B_SANDBOX_URL` 可以指向同一个端口
+（见下一条）。
+
+### 3.2 容器形态（compose）
+
+```bash
+cp deploy/compose/.env.example deploy/compose/.env      # 改密钥/端口/仓库
+docker compose -f deploy/compose/docker-compose.prod.yml up -d --build
+```
+
+> 跑冒烟前先把每 worker 容量抬起来（出厂 `E2B_NODE_PROCESSES=256` 与单沙箱默认相等，
+> 每个 worker 只能放 1 个沙箱，冒烟会报 `503 No resources available`）：
+> `E2B_NODE_MEMORY_MB=4096`、`E2B_NODE_CPU_PERCENT=400`、`E2B_NODE_DISK_MB=8192`、
+> `E2B_NODE_PROCESSES=1024`。
+
+```bash
+export E2B_API_URL=http://127.0.0.1:3000 E2B_SANDBOX_URL=http://127.0.0.1:3000 E2B_API_KEY=local-key
+python deploy/scripts/multinode_smoke.py      # 跨节点分布 + 命令/文件/stdin + kill 后配额释放
+python deploy/scripts/deployment_smoke.py     # 追加：跨 worker 迁移、共享卷隔离、模板构建→registry→worker
+```
+
+### 3.3 生产（k0s 集群）
+
+本仓库的目标集群是**自建 k0s**（2 节点全 arm64，namespace `sandlock`）。
+`deploy/scripts/open-cluster-tunnel.sh` 会建通道并自检集群身份：
+
+```bash
+deploy/scripts/open-cluster-tunnel.sh
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"      # 任何 kubectl 都要带！
+
+DRY_RUN=1 deploy/k8s-k0s/apply.sh 2>/dev/null | kubectl diff -f -   # 先看差异
+deploy/k8s-k0s/apply.sh                                             # 渲染 + apply + 预热 base image
+```
+
+⚠ 本机 `kubectl` 的默认 context **不是**这个集群（指向另一套阿里云 ACK），敲写操作前务必
+先跑上面的自检。集群身份、入口、上节点方式、现状与历次上线记录都在
+[docs/deploy-clusters.md](docs/deploy-clusters.md)。
+
+## 4. 核心概念
+
+**模板与镜像缓存.** `E2B_BASE_IMAGE` + `E2B_TEMPLATE_IMAGES` 决定模板的 rootfs；模板配置了镜像后，
+envd 用 Docker daemon 导出 rootfs 到 `E2B_IMAGE_CACHE_DIR`（缓存目录名带镜像 digest，
+tag 更新自动落新目录），沙箱在 chroot 里执行。生产把缓存放共享卷（两层 GC：按量逐出 + 悬空清理）。
+slim 镜像没有 `bash` 而官方 SDK 固定发 `/bin/bash`，执行器会自动回退 `/bin/sh`。
+
+**route B 与 per-sandbox uid.** 每个沙箱有自己的宿主机 uid（`E2B_UID_POOL_START` 起的池），
+工作区是 `0770 owner=<沙箱 uid> group=<worker gid>`：沙箱是属主，worker 靠属组做数据面
+（文件 API、watcher、命令日志、快照、生命周期）。沙箱不是 worker 的同组进程，跨沙箱隔离
+仍是内核 DAC。沙箱的路径中介（`sandlock-supervise`）由 route B 的槽位承载，槽位身份由
+agent 授予（`E2B_SLOT_IDENTITY=agent-grant`，唯一取值）。
+
+**暂停/恢复与检查点.** `pause` 冻结进程树（SIGSTOP/SIGCONT，不是内存快照）；
+`pause(checkpoint=true)` 走控制面的 checkpoint 服务，把镜像打到平台状态目录，
+换宿主机后仍能 `resume`。见 [docs/checkpoint-restore-e2b-half.md](docs/checkpoint-restore-e2b-half.md)。
+
+**快照与 fork.** 文件系统级快照（复制沙箱目录 + 元数据，捕获期临时冻结保证一致），等价官方
+`keep_memory=false` 的冷启动语义 —— **不保留运行中的进程/内存/socket**；`fork(count=N)`
+从同一快照建 N 个独立沙箱，逐项独立成败。
+
+**磁盘配额与记账.** 三条一起用：`E2B_MAX_TOTAL_DISK_MB`（控制面卷级台账 + 准入）、
+每沙箱 `diskMB`（中介侧的写入闸门，超限 = 不能写、不冻结）、以及可选 quota-agent
+（在挂载 XFS 的机器上执行 `xfs_quota`，给非 root worker 也能用的硬限）。
+见 [docs/sandbox-disk-quota.md](docs/sandbox-disk-quota.md)、[docs/disk-quota-options.md](docs/disk-quota-options.md)。
+
+**自动扩缩容.** 2026-09-30 起扩缩容是**控制面自己的一个任务**（`control_plane/autoscaler_service.py`，
+`autoscaler/` 变成库），只缩 worker 的 StatefulSet，且缩容前必须确认目标 pod 真的会被
+StatefulSet 删掉（只删最高序号且必须是"待淘汰候选"）。方案与阈值见 [docs/SCALING.md](docs/SCALING.md)。
+
+**网络策略.** `allowOut`/`denyOut`（IP/CIDR + 域名）、`rules`（80/443 透明 MITM 按域名 ACL，
+镜像 rootfs 模式下把临时 CA 拼进每沙箱信任副本）、`egressProxy`（fork sandlock 的 SOCKS5
+on-behalf 隧道，代理不可达即 ECONNREFUSED，绝不回退直连）、`maskRequestHost` 与
+`transform.headers`（改写 wire Host、注入凭据；secret 只落在 supervisor 侧）。
+通配域名经每沙箱 loopback DNS 网关解析为合成 IP 再由 supervisor 代连 + SSRF 二次校验。
+需要 worker 设 `E2B_ENABLE_NETWORK=true`。
+
+## 5. 配置
+
+最常用的一小撮（全量速查见 [docs/env-vars.md](docs/env-vars.md)，权威口径是各组件的
+`config.py` 与 [spec.md](spec.md) §7.2）：
+
+| 变量 | 作用 |
+|---|---|
+| `E2B_API_KEY` / `E2B_API_KEYS` | 控制面 API Key（`_KEYS` 是轮换窗口） |
+| `E2B_BASE_IMAGE` / `E2B_TEMPLATE_IMAGES` | 模板 rootfs（不配就跑纯 Sandlock 形态） |
+| `E2B_EXECUTOR` | `auto` / `sandlock` / `local`；`auto` 只在顶层包装不上时回落 `local` |
+| `E2B_WORKSPACE_BASE` / `E2B_STATE_BASE` | 沙箱树根 / 平台自己的状态根（N27 起分离） |
+| `E2B_PER_SANDBOX_UID` + `E2B_UID_POOL_START/_SIZE` | 每沙箱宿主机 uid 池（池必须避开 worker 自己的 uid/gid） |
+| `E2B_PRIV_HELPER_TRANSPORT` | 文件步骤走哪条路：只接受 `auto`/`agent`（两者都是 agent）；`exec`/`socket` 已退役、启动期具名拒绝 |
+| `E2B_ROUTE_B_TMP_ROOT` | 槽位文档（policy/program）所在根，**worker 与 CP 必须逐字一致** |
+| `E2B_INTERNAL_API_KEY(_S)` | 内部组件共享凭据（`X-Internal-Key`） |
+| `E2B_REDIS_URL` | 配了就多副本共享注册表/配额/迁移锁 |
+| `E2B_QUOTA_AGENT_URL` | 配了就启用服务端配额（否则降级并打警告） |
+| `E2B_IMAGE_REGISTRY`(+`_USERNAME`/`_PASSWORD`) | 模板镜像 push/pull 的仓库（不配则单机 OCI tar 形态） |
+| `E2B_MAX_TOTAL_*` / `E2B_NODE_*` | 全局与节点级准入上限 |
+
+## 6. 测试与验收
 
 | 层 | 命令 | 环境 |
-|----|------|------|
+|---|---|---|
 | L1 单元 + L2 契约 | `pytest tests/unit tests/contract` | macOS / Ubuntu |
-| L3 Python SDK | `pytest tests/sdk/python` | Linux test runner（Sandlock）；macOS 可用 Local 执行器跑通协议 |
-| L3 JS SDK | `pytest tests/sdk/js`（内部 `npm test`） | macOS / Linux；首次需 `cd tests/sdk/js && npm install` |
-| L4 安全 | `E2B_BASE_IMAGE=python:3.14-slim pytest tests/security` | 容器运行时 VM 需 Landlock ABI ≥6（内核 6.12+）+ Docker daemon |
-| L5 性能 | `E2B_BASE_IMAGE=python:3.14-slim pytest tests/perf --perf` | Linux + Docker；profile 写入 `tmp/perf/` |
+| L3 Python SDK | `pytest tests/sdk/python` | Linux test runner（Sandlock）；macOS 可用 Local 执行器验协议 |
+| L3 JS SDK | `pytest tests/sdk/js` | macOS / Linux（首次 `cd tests/sdk/js && npm install`） |
+| L4 安全 | `E2B_BASE_IMAGE=python:3.14-slim pytest tests/security` | 内核 ≥ 6.12（Landlock ABI ≥ 6）+ Docker |
+| L5 性能 | `E2B_BASE_IMAGE=python:3.14-slim pytest tests/perf --perf` | Linux + Docker，profile 落 `tmp/perf/` |
 
-本地直连远程部署实例跑 SDK 测试（无需起本地服务）：见
-[docs/remote-testing.md](docs/remote-testing.md)。
-
-部署：**以 k8s 为主**（2026-09-18 起；目标机 `.140` 上的 compose 栈已停用，卷保留）。
-k8s 清单（`deploy/k8s/`）的部署顺序、与 compose 的差异表、开关切换与验证清单见
-[docs/k8s-deployment.md](docs/k8s-deployment.md)，自建 k0s 集群的落法见
-[deploy/k8s-k0s/README.md](deploy/k8s-k0s/README.md)。
-compose 那条线（[deploy/scripts/README.md](deploy/scripts/README.md)）保留作参考与应急，
-除非必要不再运行；其中 `build-and-push.sh` 仍是镜像构建入口（k8s 按它写下的
-`deploy/stack/.version` pin tag）。
-
-跑 lane / 构建 wheel / 部署前先过一遍
-[docs/build-test-deploy-pitfalls.md](docs/build-test-deploy-pitfalls.md)：
-里面记的是"看起来像代码坏了、其实是环境/流程"的那些坑（镜像不重建、默认 seccomp 档拦
-`unshare`、缺 `CAP_SYS_PTRACE`、冷缓存 428、引号地狱、`rg -r` 等）。
-
-**公共镜像源（OCI 形态）**：默认走**多源回落**（`E2B_REGISTRY_MIRRORS`，`|` 分隔按顺序尝试、
-origin 最后兜底；未设置时用内置默认链 `registry-1.docker.io=docker.m.daocloud.io|docker.1ms.run`，
-与 `deploy/compose/.env.example` 同值；显式置空才是直连）。镜像站抖动时改用**本地源**：
-`registry:2` 起在 `127.0.0.1:5080` 并预置**全集**镜像（`library/python` 3.11/3.12/3.14-slim +
-`library/node:22-slim`），再
-`E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 E2B_BASE_IMAGE=python:3.11-slim ./deploy/scripts/test-prod-shaped.sh`。
-**本地源必须镜像全集**：404 按既有语义不重试（是「镜像不存在」的答案），缺 tag 直接失败、
-不会回落公共源。做法与退路（`<image>.digest` 侧车）见
-[docs/production-deployment-requirements.md §2.6](docs/production-deployment-requirements.md#26-公共镜像源与-oci-限流回落d2-口径2026-09-11)。
-
-Linux test runner：
+容器车道（复现部署形态，而不是用 `--privileged` 的"万能车道"）：
 
 ```bash
+# 部署形态车道：非 privileged + seccomp=unconfined（+ 第二相：uid 65534 的 E5.1 形态）
 docker compose -f deploy/compose/docker-compose.test.yml build
-docker compose -f deploy/compose/docker-compose.test.yml run --rm test-runner pytest tests/sdk/python
+./deploy/scripts/test-prod-shaped.sh
 ```
 
-全量验收直接跑容器，**非特权形态**：不挂 `--privileged`，改用
-`seccomp=unconfined`（sandlock 需要用户命名空间，Docker 默认 seccomp 会
-EPERM）+ `--cap-add NET_ADMIN`（仅通配域名本地 origin fixture 需要在 lo
-挂 198.18.0.99）。`--network host` 仅用于测试基础设施（registry/Redis 容器
-发布在宿主 localhost，Docker daemon 也只对 localhost 默认放行 HTTP
-registry），不是 sandlock 的需要：
+macOS 宿主只看**容器运行时 VM 的内核**：`python3 -c "import sandlock; print(sandlock.landlock_abi_version())"`
+必须 ≥ 6（OrbStack 实测 8；旧 Docker Desktop 常低于该值，那台机器就不能当 Sandlock 验收环境）。
+跨平台/交叉架构的车道见 [docs/cross-platform-lanes.md](docs/cross-platform-lanes.md)；
+直连远端部署跑 SDK 测试见 [docs/remote-testing.md](docs/remote-testing.md)。
+
+跑车道/构建/部署**之前**先看一遍
+[docs/build-test-deploy-pitfalls.md](docs/build-test-deploy-pitfalls.md)：里面是"看起来像代码坏了、
+其实是环境/流程"的那些坑（镜像没重建、默认 seccomp 拦 `unshare`、缺 `CAP_SYS_PTRACE`、
+冷缓存 428、引号地狱等）。
+
+## 7. 构建与发布
 
 ```bash
-docker run --rm --security-opt seccomp=unconfined --cap-add NET_ADMIN --network host \
-  -e E2B_BASE_IMAGE=python:3.14-slim \
-  -e E2B_HOST_PROJECT="$(pwd)" \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v "$(pwd):/workspace" -w /workspace \
-  e2b-sandlock-test:latest pytest tests --perf -p no:cacheprovider
+./deploy/scripts/build-sandlock-wheels.sh     # 先出 wheels/fork/*.whl（不入库）
+./deploy/scripts/build-and-push.sh            # 多架构构建 + 推 ACR，并把版本写进 deploy/stack/.version
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+deploy/k8s-k0s/apply.sh                       # 渲染 + apply + 等滚动 + 预热 base image
 ```
 
-`E2B_HOST_PROJECT` 让容器内执行的 docker CLI 能拿到宿主侧的项目路径
-（用于给带认证的 registry 挂载 htpasswd 文件）。
+- 版本戳 = `git describe --tags` + 时间戳，k8s 清单按它 pin 每个镜像 tag。
+- 镜像：`e2b-sandlock-control-plane-gateway`（控制面 + gateway 合并，单端口）、
+  `-worker`、`-agent`、`-quota-agent`（可选）。**没有 autoscaler 镜像**。
+- 升级顺序 **agent（DaemonSet）→ worker（StatefulSet）**，`apply.sh` 里有对应的 rollout 闸门；
+  详见 [docs/k8s-deployment.md](docs/k8s-deployment.md) 与 [deploy/k8s-k0s/README.md](deploy/k8s-k0s/README.md)。
+- 每次上线的版本、读数与当时的形态判定记录在 [docs/deploy-clusters.md](docs/deploy-clusters.md) §7。
 
-验收环境只看**容器运行时 VM 的内核**，不看宿主是 macOS 还是 Linux：
+## 8. 文档索引
 
-```bash
-docker run --rm --security-opt seccomp=unconfined e2b-sandlock-test:latest \
-  python3 -c "import sandlock; print(sandlock.landlock_abi_version())"   # 必须 >= 6
-```
+**入口与现状**
 
-- **>= 6 即可以此为 Sandlock 验收环境**（ABI v6 对应内核 6.12+）。本机实测：
-  OrbStack `7.0.14-orbstack` 容器内 **ABI = 8** ⇒ 隔离 / 网络 / exec / 记账面都能在本机容器验收；
-  历史上 E8.2/E8.3 的"Linux 容器全量"基线本来也都是通过 OrbStack 的 docker.sock 跑的
-  （见 `docs/HANDOFF.md` 的验证命令）。
-- **旧版 Docker Desktop 的 Linux VM 常低于该 ABI** ⇒ 那种机器上不得把本机当作 Sandlock 验收环境：
-  宿主 macOS 本身永远跑不了 sandlock（Landlock/seccomp 仅 Linux），此时 macOS 宿主只跑
-  不依赖 sandlock 的单元/契约测试，SDK 测试用 Local 执行器验证协议兼容性，隔离能力换真 Linux 验收。
-- **与运行时无关、本机一律不可用的**：XFS project quota 类用例（容器根是 overlay、无
-  `/dev/loop-control`，启动会打印 `XFS gates unavailable`）⇒ 属真机/运维项（`docs/sandbox-disk-quota.md`、
-  `docs/production-deployment-requirements.md`）。
+- [docs/deploy-clusters.md](docs/deploy-clusters.md) —— 目标集群怎么连、里面有什么、历次上线记录（改部署前必读）
+- [docs/k8s-deployment.md](docs/k8s-deployment.md) —— k8s 部署指南（清单逐项、升级/回退、能力集、故障）
+- [deploy/k8s-k0s/README.md](deploy/k8s-k0s/README.md) —— 自建 k0s 的差异与运维脚本
+- [docs/env-vars.md](docs/env-vars.md) —— 环境变量速查
+- [docs/open-issues.md](docs/open-issues.md) / [docs/task-backlog.md](docs/task-backlog.md) —— 未完成问题与总清单
 
-Dockerfile 使用清华 apt/pip 镜像源、JS SDK 测试使用 npmmirror 源，构建与安装
-走国内网络。test runner 容器需要 `privileged: true`（Docker 默认 seccomp
-profile 会拦截 sandlock 安装自己的 seccomp 过滤器，`deploy/compose/docker-compose.test.yml`
-已配置）。
+**设计与形态**
 
-## 容器镜像与部署
+- [docs/c3-privilege-relocation.md](docs/c3-privilege-relocation.md) —— 控制面零特权 / agent 执行 / worker 跑沙箱（已实施）
+- [docs/production-deployment-requirements.md](docs/production-deployment-requirements.md) —— 生产部署要求（能力集、存储、镜像源、配额）
+- [docs/chroot-workspace-exec.md](docs/chroot-workspace-exec.md) · [docs/pure-shape-decision.md](docs/pure-shape-decision.md) · [docs/n14-retire-the-emulation.md](docs/n14-retire-the-emulation.md) —— 执行形态的选择与代价
+- [docs/tenant-isolation.md](docs/tenant-isolation.md) · [docs/security-hardening.md](docs/security-hardening.md) —— 隔离与加固
+- [docs/checkpoint-restore-e2b-half.md](docs/checkpoint-restore-e2b-half.md) · [docs/resource-contention.md](docs/resource-contention.md) · [docs/control-plane-multi-replica.md](docs/control-plane-multi-replica.md) · [docs/SCALING.md](docs/SCALING.md)
 
-> **目标集群与连接方式见 [docs/deploy-clusters.md](docs/deploy-clusters.md)**：本机
-> `kubectl` 的默认 context 指的**不是**本项目的集群，任何 `kubectl` 都要显式带
-> `KUBECONFIG="$PWD/tmp/k0s/kubeconfig"`（自检：2 节点 / arm64 / `v1.36.4+k0s` /
-> namespace `sandlock`）。
+**磁盘与配额**
 
-**镜像**：
-- `deploy/docker/Dockerfile.control-plane-gateway` 打包**控制面 + envd gateway 合并镜像**
-  （`gateway_common` + `control_plane` + `envd_service`，单服务单端口
-  `:3000` 同时服务 API 与沙箱路由，`E2B_API_URL` 与 `E2B_SANDBOX_URL`
-  指向同一地址，不带 sandlock wheel）；
-- `deploy/docker/Dockerfile.envd` 只打包 worker（`gateway_common` + `envd_service`，含
-  **fork sandlock wheel**（`wheels/fork/`，按 TARGETARCH 选择；通配
-  allowOut / header 注入 / host 掩码 / SOCKS5 on-behalf）与 mcp-gateway）。
+- [docs/sandbox-disk-quota.md](docs/sandbox-disk-quota.md) · [docs/disk-quota-options.md](docs/disk-quota-options.md) · [docs/disk-accounting-dirty-dirs.md](docs/disk-accounting-dirty-dirs.md) · [docs/n25-remainder-plan.md](docs/n25-remainder-plan.md)
 
-控制面与 worker 在代码层已解耦（env 工具函数收敛到 `gateway_common.env`；
-控制面在分离模式下用 no-op runtime registry），所以合并镜像不依赖
-sandlock wheel、worker 镜像不依赖 control_plane。`deploy/docker/Dockerfile.control-plane`
-仅保留给单机本地构建示例（`deploy/compose/docker-compose.yml`）使用。
+**流程与历史**
 
-`wheels/fork/` 是构建产物、不入库（fork 源码固定于 `third_party/sandlock`
-子模块）：构建镜像前先执行 `./deploy/scripts/build-sandlock-wheels.sh` 生成 wheel。
-sandlock 的构建与门禁**一律在 `third_party/sandlock` 里跑**，仓库根不再产出
-`target/`、`target-linux/`、`tmp/wheel-context`；入口、工具链镜像、产物落点与"清缓存之后怎么恢复"
-都记在 [docs/build-test-deploy-pitfalls.md](docs/build-test-deploy-pitfalls.md) A7。
+- [docs/build-test-deploy-pitfalls.md](docs/build-test-deploy-pitfalls.md) · [docs/cross-platform-lanes.md](docs/cross-platform-lanes.md) · [docs/remote-testing.md](docs/remote-testing.md)
+- [docs/reports/](docs/reports) —— 各任务的验收报告；[docs/HANDOFF.md](docs/HANDOFF.md) 与
+  [docs/c2-ownership-frontload.md](docs/c2-ownership-frontload.md) 是历史/未实施的记录
 
-**构建（多架构）**：
+## 9. 已知边界
 
-```bash
-# 单平台加载到本地 docker
-REGISTRY=e2b-sandlock VERSION=1.0 PLATFORMS=linux/amd64 ./deploy/scripts/build-images.sh
-
-# 多架构（x86_64 + arm64）需推送到 registry
-REGISTRY=registry.example.com/e2b \
-VERSION=1.0 \
-PLATFORMS=linux/amd64,linux/arm64 \
-PUSH=1 ./deploy/scripts/build-images.sh
-```
-
-产出镜像，**名称区分服务、tag 区分版本**：
-`<registry>/e2b-sandlock-control-plane-gateway:<version>`（合并服务，见
-`deploy/scripts/build-and-push.sh`）、`<registry>/e2b-sandlock-worker:<version>`、
-`<registry>/e2b-sandlock-agent:<version>`、
-`<registry>/e2b-sandlock-quota-agent:<version>`（每沙箱磁盘配额的服务端 agent，
-`profiles: ["quota"]`；`./deploy/scripts/upgrade.sh --with-quota-agent` 会一并固定镜像
-与 `--profile quota`）。
-
-没有 autoscaler 镜像（2026-09-30 起）：worker 车队的扩缩容是**控制面自己的一个任务**
-（k8s 路径，`control_plane/autoscaler_service.py`），本地 Docker 池那条路已退役。
-
-**生产部署示例**（合并控制面/gateway + 多 worker + Redis 共享状态 + 可选本地
-镜像仓库）：
-
-```bash
-cp deploy/compose/.env.example deploy/compose/.env   # 修改密钥/端口/仓库
-docker compose -f deploy/compose/docker-compose.prod.yml up -d --build
-
-# 冒烟验证（沙箱跨节点分布、经 gateway 的命令/文件/stdin、kill 后配额释放）
-E2B_API_URL=http://127.0.0.1:3000 \
-E2B_SANDBOX_URL=http://127.0.0.1:3000 \
-E2B_API_KEY=local-key \
-python deploy/scripts/multinode_smoke.py
-
-# 部署级验证（追加：跨 worker 迁移 + 共享 workspace 文件保留 + network
-# 配置回显/原子更新，三 worker 分布）
-E2B_API_URL=http://127.0.0.1:3000 \
-E2B_SANDBOX_URL=http://127.0.0.1:3000 \
-E2B_API_KEY=local-key \
-python deploy/scripts/deployment_smoke.py
-```
-
-> **跑冒烟前先调容量（F8）**：`.env.example` 的出厂 `E2B_NODE_PROCESSES=256` 与单沙箱默认
-> `E2B_DEFAULT_MAX_PROCESSES=256` 相等，而 `can_fit` 按**整箱**预留 ⇒ 每个 worker 只能放
-> **1** 个沙箱，上面两个冒烟脚本会报 `503 No resources available`
-> （`multinode_smoke.py` 要 4 个沙箱并断言跨两节点分布、`deployment_smoke.py`
-> 同时最多 4 个：3 个 + network 用例）。
-> 跑之前把每 worker 容量抬到例如 `E2B_NODE_MEMORY_MB=4096`、`E2B_NODE_CPU_PERCENT=400`、
-> `E2B_NODE_DISK_MB=8192`、`E2B_NODE_PROCESSES=1024`（单沙箱上限不变；这是文档口径，
-> 产品默认值未改）。
-
-生产形态容器冒烟（非 privileged + `seccomp=unconfined`，验证沙箱创建 /
-rootfs chroot / SOCKS5 出口，与 compose 部署一致）：
-
-```bash
-./deploy/scripts/smoke-prod-worker.sh
-```
-
-要点：
-- worker 需要 `security_opt: [seccomp=unconfined]`（嵌套 seccomp 过滤器）与
-  Docker daemon socket（模板 rootfs 解析）；`E2B_ENABLE_NETWORK=true` 时
-  网络 API 策略才生效；
-- 控制面设置 `E2B_SHARED_WORKSPACE_ROOT` + worker 挂同一存储（示例用
-  named volume 模拟；跨机部署指向同一 NFS/CSI 挂载），迁移只切路由；
-- `E2B_REDIS_URL` 指向 Redis 后多控制面副本共享注册表/配额/迁移锁；
-- 模板镜像仓库（`E2B_IMAGE_REGISTRY`）留空时保持单机行为；启用本地
-  `registry` 服务（`--profile registry`）需把其地址加入 daemon
-  insecure-registries；
-- macOS 冒烟如遇宿主端口占用，通过 `.env` 的 `CONTROL_PLANE_PORT` /
-  `GATEWAY_PORT` 换端口；Docker Desktop/OrbStack 用户把 `DOCKER_SOCK`
-  指向本机 docker.sock。
-
-## 环境变量
-
-控制面与 envd 的全部配置见 spec §7.2，默认值与之一致。常用：
-
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `E2B_API_KEY` / `E2B_API_KEYS` | `local-key` | 控制面 API Key |
-| `E2B_WORKSPACE_BASE` | `tmp/sandboxes` | 沙箱工作目录 |
-| `E2B_BASE_IMAGE` | 未配置 | `base` 模板基础镜像；配置后启用镜像 rootfs |
-| `E2B_TEMPLATE_IMAGES` | `{}` | 模板 ID → 基础镜像 JSON 映射 |
-| `E2B_EXECUTOR` | `auto` | `auto`/`local`/`sandlock`；`auto` 只对**顶层包不存在**（`ModuleNotFoundError: No module named 'sandlock'`）回落 `local`，包在但坏（版本不匹配/缺符号/半升级树少 `sandlock.*` 子模块）一律 fail closed（B1 fix round 2/3） |
-| `E2B_PRIV_HELPERS` | **已移除（N52，2026-09-30）** | Track F 的本地 broker 开关：`auto` 让 uid 65534 的 worker 用镜像里 `/var/lib/e2b-priv/` 的两个 file-capability 二进制（`e2b-slot-spawn`、`e2b-maint`）完成"以池内 uid 起 route-B 槽位"和"把工作区/slice 交给沙箱 uid"两步，`off` 则保持进程内 E5.1 形态。**这个形态整体退役了**：二进制、`exec` transport、C1 的 `socket` broker 与这个开关都不再存在，worker 的特权文件步骤全部由每节点 agent 以 `{sandbox_id, op}` 代做（见 `E2B_PRIV_HELPER_TRANSPORT`）。旧的仓库里若还设着这个变量，它现在是**惰性**的（代码不再读它）；真需要那个形态时从 git 取回当时的清单 + 镜像。`e2b-maint` 只存在于 **agent 镜像**（`deploy/docker/Dockerfile.agent` 的 `/var/lib/e2b-priv/`），它的路径白名单仍是四根：`E2B_WORKSPACE_BASE`、`E2B_STATE_BASE`（N27）、`E2B_SHARED_VOLUME_ROOT`、以及仅当显式非空时的 `E2B_IMAGE_CACHE_DIR`（沙箱 secret 落在 `<image_cache_dir>/secrets/<id>/`）。容器 **BND**：worker 是**空集**，**绝不要加 no-new-privileges**（NNP=1 会让 agent 面 A 的 `as_uid` 的 file caps 静默失效）。 |
-| `E2B_PRIV_HELPER_TRANSPORT` | `auto`（出厂 manifest 显式 `agent`） | 文件操作走哪条路。`agent`（**C3 Task 4 片 B 起的出厂形态**）：worker 一个特权二进制都不 exec，每个文件步骤与槽位身份都以 `{sandbox_id, op}` 交给控制面，由控制面指令本节点的 agent 执行（`E2B_C3_AGENT_MAINT_URL`/`_MAINT_PORT`，见下）。`auto`：与 `agent` 等价（agent 是唯一剩下的特权形态）。**取值是闭列表**：`auto` / `agent`；`exec`（worker 自己 exec 镜像里的 file-capability 二进制）与 `socket`（C1 的每节点 root broker）**都已退役**（2026-09-30，N52；`socket` 更早随 C3 Task 7 的 DaemonSet 一起），现在被这个开关**具名拒绝**，不是静默回落。没有 agent 又不是 root 的 worker 保留进程内 E5.1 形态（无 per-sandbox host uid、无 route-B）并在启动时打一条 WARNING。运维含义：出厂形态是 `agent`；遗留的 `E2B_PRIV_HELPERS` 与 `E2B_PRIV_HELPER_SOCKET` 都是惰性残留。 |
-| `E2B_PRIV_HELPER_SOCKET` | **已移除（C3 Task 7）** | C1 的 `socket` transport 连的那个 unix socket（`/run/e2b-broker/broker.sock`，hostPath `/run/e2b-broker`）。它随 `e2b-priv-broker` DaemonSet 一起退役：worker 与节点组件之间不再有这条通道，k8s 清单里也不再有这个 hostPath、这个 env 和 `wait-for-broker` 闸门。**留这一行只为让旧配置有个解释**：现在把 `E2B_PRIV_HELPER_TRANSPORT` 设成 `socket` 会在启动时被点名拒绝。节点上若还留着 `/run/e2b-broker/` 空目录，那是历史残留（hostPath 是 `DirectoryOrCreate`），可随手删。 |
-| `E2B_C3_AGENT_URL` | 空（k8s 走 pod API；compose 默认 `http://c3-agent:49985`） | **C3 Task 3** 的 CP→agent 面 A 端点：`grant-slot`（写 `uid_map`）。k8s 不设（按 worker pod → `spec.nodeName` → 本节点 agent pod 的 label 查），compose 指向 agent 服务名，且该 URL 的**主机名就是 agent 自己的身份**（D12）。 |
-| `E2B_C3_AGENT_MAINT_URL` / `_MAINT_PORT` | 空 / `49986` | **C3 Task 4 片 B（裁定 D22）** 的**面 B 端点**：`chown`/`rm`/`walk`。两个面必须是两个进程（面 A 要 uid 65534 才写得进 `uid_map`；面 B 要 uid 0 才能在 NFS 上 `chown`，且只有它挂了四个根），因此是两个监听——k8s 用同一个 pod IP 的第二个端口（`_MAINT_PORT`，面 B 绑 49986），compose 用第二个服务名（`_MAINT_URL` → `c3-agent-maint:49986`）。compose 未设该变量时**每个文件 op 具名 503**（不回落面 A：那会变成"每个 chown 都 EPERM"的假权限 bug）。 |
-| `E2B_C3_AGENT_TOKEN` | 空（fail closed） | CP↔agent 的唯一凭据（`X-Internal-Key`）。**只**出现在控制面与 agent 两面；worker 清单/镜像里一个字都没有（有就等于把 `worker ↔ agent` 这条不存在的通道造出来）。轮换见 `docs/k8s-deployment.md` §4.5 表 3。 |
-| `E2B_SLOT_IDENTITY` | `spawn` | route-B 槽位身份的来源。`spawn`=worker 镜像里的 file-capability `e2b-slot-spawn`（**Task 4 片 B 后该二进制已移出镜像，这条只剩回退镜像时可用**）；`agent-grant`=worker fork+unshare 后把 `{sandbox_id, pid}` 报给 CP，CP 校验后带 uid 指令本节点 agent 写 map（出厂 k8s 与三个 C3 compose 栈都是这个值）。 |
-| `E2B_ROUTE_B_TMP_ROOT` | `/tmp/sandlock-route-b` | route-B 槽位的 `policy.json`/`program.json` 所在根。**worker 与 CP 两侧都要设**且逐字一致：worker 写文档，CP 推导"要交给哪个 uid"的那一条路径（`scope-slot-document`）；CP 未设时该 op 具名 503、槽位起不来。出厂值：k8s `/var/lib/e2b-sandboxes/state/.route-b`（N27 把平台状态下沉），compose `/var/lib/e2b-sandboxes/.route-b`。 |
-| `E2B_INTERNAL_API_KEY` / `E2B_INTERNAL_API_KEYS` | `internal-key` / 空 | worker、网关与 C3 agent 的 `X-Internal-Key`（**舰队共享**；`_KEYS` 是轮换窗口，见 `deploy/k8s-k0s/README.md`）。⚠️ 它证明"你是这类组件之一"，**不**证明"你是 worker-1"——节点的身份由下面两项绑 |
-| `E2B_NODE_ADDRESS_MODE` | `auto` | **C3 Task 2（N49）**：node-scoped 内部请求的**期望地址 / 源 IP** 从哪来。`k8s`=按 `node_id`（= StatefulSet pod 名）查 pod API（要控制面 SA 有 `get pods`，出厂 k8s 清单已给）；`hostname`=把 `node_id` 当 compose 服务名解析；`auto`=挂了 ServiceAccount 走 k8s、否则 hostname（**开发/合体默认**）。解析不到即 **503 点名**（fail closed），注册的 `address` **永不取**请求体；出厂 k8s/compose 清单都**显式**设它，不落 `auto`。配套 `E2B_NODE_ADDRESS_PORT`（49983）、`E2B_NODE_ADDRESS_NAMESPACE`（sandlock） |
-| `E2B_INTERNAL_NODE_KEYS` | 空 | **C3 Task 2** 的**近期**加固（机制已实现、出厂未接线）：JSON `{"<key>": "<node_id>"}`。列进来的 key 是**节点绑定**凭据——自称与它不一致即 403。未列（含上面的共享 key）只能靠"自称解析到的地址 + 源 IP"背书。没接线这一点写在 `docs/open-issues.md` N49 |
-| `E2B_MAX_TOTAL_*` | 见 spec | 宿主总资源上限，`0` 表示关闭该维度 |
+- **Linux only**：Landlock/seccomp 是 Linux 内核特性，macOS 上只能跑 Local 执行器（协议兼容性）；
+  验收环境看容器 VM 的内核（Landlock ABI ≥ 6，即内核 6.12+）。
+- **暂停/快照不是内存快照**：`pause` 冻结进程树；快照/`fork` 是文件系统级的冷启动语义，
+  运行中的进程、内存、socket 都不保留。
+- **共享卷上的配额靠甲方**：每沙箱磁盘硬限在 NFS 上要由服务端执行（quota-agent 跑在挂载 XFS
+  的机器上）；网络文件系统（NFS/CephFS）上的 `chown` 只能由 euid 0 做，所以这一步固定在 agent 面 B。
+- **控制面默认单写**：多副本要 `E2B_REDIS_URL`；否则注册表/配额在进程内存里。
+- **路由与迁移**：同一沙箱同一时刻只在一个节点运行（路由表保证）；迁移不搬运运行中的进程，
+  共享存储模式下只重建挂载与路由。
+- **仓库暂无 LICENSE 文件**：需要声明许可时请补一份（此前 GitHub 上的初始提交带过 Apache-2.0，
+  但那不在本仓库历史里）。
 
 ## 与 spec 的两处事实性偏差
 
-1. **`envdVersion` 使用 `0.6.4+sandlock`**：spec 原文为 `0.6.4-sandlock`，
-   但官方 SDK 用 `packaging.Version` 解析该字段，`0.6.4-sandlock` 不是合法
-   PEP 440 版本号，会在 `Sandbox.create()` 时抛 `InvalidVersion`。
-   `0.6.4+sandlock` 是合法的 PEP 440 local version，语义不变且 SDK 可解析。
-2. **PyPI 上 `e2b` 最高版本为 `2.46.0`**（`2.46.1` 不存在），测试按
-   `e2b==2.46.0` 安装；JS 侧 `e2b@2.46.1` 存在，按 spec 使用。
-
-## 实现说明
-
-- 双服务独立启动：`python -m control_plane` 与 `python -m envd_service`。
-- Sandlock 一个实例同一时刻只跑一个命令，Envd 进程管理器为每条命令创建独立
-  Sandlock 实例；沙箱目录通过 `fs_writable` 共享（非 COW），跨命令持久化。
-- 模板配置基础镜像时，envd 通过 Docker daemon 导出镜像 rootfs 并用 Sandlock
-  `chroot` + `fs_mount` 执行；未配置镜像时纯 Sandlock（无 Root/容器依赖）。
-- slim 基础镜像不含 `bash`，而官方 SDK 固定发送 `cmd=/bin/bash`；Sandlock
-  执行器在 rootfs 内无 bash 时自动回退 `/bin/sh`，保证命令语义。
-- PTY 已通过 spike 验收：Local 执行器用宿主 pty；Sandlock 执行器通过「沙箱内
-  pty 桥」实现（沙箱内创建真实 pty，命令挂到 slave，master 数据经 PIPED stdio
-  转发，resize 走带内控制帧）。限制：桥需要沙箱内有 Python 3 解释器
-  （python 系镜像与纯 Sandlock 环境满足；node 系镜像暂不支持）。
-- 不支持的 API（fork/snapshots/templates 等）一律返回官方 Error JSON
-  （`501`），不返回假成功。
-
-## v2.1 扩展功能说明与限制
-
-- **Volume**：`Volume.create/connect/list/get_info/destroy` + volumecontent
-  文件 API（`E2B_VOLUME_API_URL`，`Authorization: Bearer <token>`）+ 沙箱
-  挂载。**路径规则在所有执行器/模板下统一**：挂载路径按沙箱根规范化（前导
-  `/` 自动去掉，`/mnt/data` 与 `mnt/data` 等价），挂载点位于沙箱根内；命令
-  默认 cwd 即沙箱根，用相对路径访问（如 `cat mnt/data/x.txt`）。纯 Sandlock
-  用 symlink 实现（无 root 依赖），镜像 rootfs 模式映射到 chroot 内沙箱目录，
-  两种模式行为一致。
-- **Secret**：值只写不回读；`Sandbox.create(envs={"K": "${name}"})` 注入。
-- **Pause/Resume**：进程树 SIGSTOP/SIGCONT 冻结，不是 VM 内存快照；SDK 2.46
-  无独立 resume 方法，paused 沙箱通过 `Sandbox.connect` 自动恢复。
-- **Metrics/Logs**：`GET /sandboxes/{id}/metrics`（预留配额 + 沙箱目录用量
-  采样）；`GET /sandboxes/{id}/logs`（沙箱生命周期事件 + 命令输出日志：
-  envd 把每条命令的 stdout/stderr/PTY 输出按行追加到沙箱目录
-  `command-logs.jsonl`，控制面合并返回，格式为 `{timestamp, line}`，命令
-  起始行 `> cmd`、stderr 前缀 `stderr:`、结束行 `exit: N`；远程沙箱经
-  worker agent 拉取。单命令输出超 1MB 或日志文件超 16MB 自动截断）。
-- **MCP**：仅支持本地 stdio base server（`name/command/args/envs`），GitHub
-  server 返回 400。网关由 envd 以受限进程启动并随沙箱回收，要求沙箱内有
-  Python 3 + `mcp` 包（python 系镜像与纯 Sandlock 满足）。本地部署时
-  `get_mcp_url()` 返回云域名，客户端请连接 `http://127.0.0.1:50005/mcp`。
-- **Fork/Snapshot**：文件系统级快照（复制沙箱目录 + 元数据），等价官方
-  `keep_memory=false` 的冷启动语义——**不保留运行进程/内存/打开的 socket**。
-  捕获期间临时冻结沙箱进程树保证文件一致；快照独立于沙箱生命周期
-  （kill/TTL 不删快照），`create(template=snapshotID)` 从快照冷启动新沙箱，
-  `fork(count=N)` 从同一快照创建 N 个独立沙箱（逐项独立成败）。sandlock
-  的内存 checkpoint/restore 因与流式 popen 模型冲突、且 restore 在容器环境
-  实测失败，未采用。
-
-## 多节点调度（v3.0 Phase 1）
-
-控制面可管理多个计算节点（Docker 容器节点或物理 Linux 节点，同一套
-envd worker + agent 代码），SDK 零修改：
-
-```text
-SDK → Control Plane + Envd Gateway :3000（注册表 / 调度 / 准入 / 按
-      E2b-Sandbox-Id 路由代理，同端口）
-        ├── worker-1（Docker 容器节点）
-        ├── worker-2（物理 Linux 节点）
-        └── worker-3（…）
-```
-
-- **节点注册/心跳**：worker 启动时带 `E2B_CONTROL_PLANE_URL` 与
-  `E2B_NODE_ADDRESS`，自动注册并每 5s 心跳；超时节点标记 unhealthy，
-  不再调度新沙箱（运行中沙箱不迁移）。
-- **调度**：健康过滤 → 镜像亲和（节点已有 rootfs 优先）→ 剩余资源 best-fit
-  → 均衡；全局 `E2B_MAX_TOTAL_*` 与节点级配额双重准入，超限 `503`。
-- **路由代理**：Gateway 查询控制面路由表（缓存 30s），Connect 流式与
-  `/files` 等 HTTP 请求原样透传（`E2b-Sandbox-Id`、`X-Access-Token` 保留）。
-- **管理**：`docker compose -f deploy/compose/docker-compose.multinode.yml up` 起
-  1 控制面 + 1 gateway + 3 worker；物理节点在另一台 Linux 跑同一
-  `python -m envd_service`（agent 自动注册）。
-- **镜像仓库**：控制面设置 `E2B_IMAGE_REGISTRY`（如
-  `registry.example.com/e2b`）后，`Template.build` 构建完成会把镜像
-  push 到仓库，模板的沙箱镜像名改为 `{registry}/{templateID}`；worker
-  首次解析镜像时本地 daemon 没有该镜像会先 `docker pull` 再解包 rootfs，
-  因此多节点无需手动分发镜像。本地/自建仓库为 HTTP 时，daemon 需把该
-  地址加入 insecure-registries（127.0.0.1 默认允许）。未配置
-  `E2B_IMAGE_REGISTRY` 时保持单机行为（镜像只在控制面 daemon）。
-  **仓库认证**：私有仓库设置 `E2B_IMAGE_REGISTRY_USERNAME` 与
-  `E2B_IMAGE_REGISTRY_PASSWORD`（控制面与 worker 都要配，分别用于
-  push/pull）。凭据通过 `docker login --password-stdin` 传入，不出现
-  在命令行参数里；未配置凭据时按匿名仓库处理。
-- **节点迁移**：`POST /sandboxes/{id}/migrate`（可带 `{"nodeID": ...}`
-  指定目标节点）把沙箱工作目录从源节点导出（tar.gz）并在目标节点导入，
-  记录/路由/配额一并转移，gateway 路由缓存即时失效。运行中的进程不迁移
-  （沙箱在目标节点冷启动，文件系统内容保留）；源节点不可达时导出失败返回
-  502。迁移带 per-sandbox 锁（Redis 多副本下为 `SETNX` 标记 + TTL，单进程
-  为等价内存锁），同一沙箱并发 migrate 第二个请求返回 409，持有者崩溃时
-  锁按 TTL 自动过期；失败路径清理标记。迁移先停源节点 runtime（复用
-  `DELETE ?keepFiles=true` 的 unregister 路径，进程树被终止）再导出/导入，
-  关闭"路由已切换但旧节点进程还活着"的双活窗口；迁移失败会自动在源节点
-  重新 provision，沙箱保持可用。控制面通过 `E2B_GATEWAY_URL` 通知 gateway
-  失效旧路由。
-- **Network API**：`POST /sandboxes` 的 `network` 字段与
-  `PUT /sandboxes/{id}/network`（官方 `Sandbox.update_network`，原子替换、
-  省略字段清空）已支持：
-  - `allowOut` / `denyOut` — 出站白/黑名单（IP/CIDR/域名；`denyOut` 仅
-    IP/CIDR，与官方一致），映射到 Sandlock `net_allow`/`net_deny`；
-  - `allowPublicTraffic` — 为 true 时 envd HTTP/Connect 端点免
-    `X-Access-Token`（仍校验 `E2b-Sandbox-Id`）；
-  - `rules` — 注册域名并映射到 Sandlock `http_allow`（80/443 透明 MITM
-    按域名 ACL；镜像 rootfs 模式下把临时 CA 拼进每沙箱信任副本并注入
-    `SSL_CERT_FILE`，HTTPS 可用）。
-  - `egressProxy` — 支持：fork sandlock 的 SOCKS5 **on-behalf** 隧道
-    （R12–R14，替代早期 LD_PRELOAD 库）：allow/deny 过滤通过后由
-    supervisor 代连用户代理，通配目标走 ATYP=domain 远程 DNS，字面目标
-    IPv4/IPv6，RFC 1929 认证，fail closed（代理不可达 → ECONNREFUSED，
-    绝不回退直连）；代理端点由 supervisor 拨号、不进沙箱 allowlist。
-    控制面校验代理地址必须解析到公网 IPv4（拒绝私网/内网，防 SSRF）。
-  - `maskRequestHost` 与 `rules[].transform.headers` — 支持（fork wheel）：
-    映射到 sandlock 的 `host_mask`（改写 wire Host，`${PORT}` 替换）与
-    `http_inject`（credential 注入，secret 只存 supervisor；字面值落
-    supervisor-only 0600 文件，`${e2b.identity.tokens.*}` 映射
-    `E2B_IDENTITY_TOKEN_*` env；若沙箱注册了 `iam` 工作负载令牌
-    （`Sandbox.create(iam={"tokens": {...}})`），占位符会替换为签发的
-    JWT-SVID，签名密钥 `E2B_IAM_SIGNING_KEY`，默认本地开发密钥）。
-  - **通配域名**：普通模式（无需 egressProxy / netns）经每沙箱 loopback
-    DNS 网关（`127.0.1.x:53`；部署用的 per-sandbox netns 形态把该 bind 放进
-    沙箱自己的 netns、由 root-in-userns 覆盖，清单里因此没有低端口窗口 ——
-    仓库里只剩 arm lane 的 Rust 套件还跑共享 netns
-    （`deploy/scripts/arm-lane/guest-prep.sh`），那里的窗口是一次性的、实测必需；
-    部署形态（stack / k8s / `deploy/compose` 的两个示例 / 本地池）都不需要窗口）
-    把通配子域解析为合成 IP，connect 由
-    supervisor 代连并二次校验（SSRF 护栏拒绝私网/回环），静态/Go 应用
-    同样受限。fork 已切到上游 PR 的无 netns 版本（netns-free），
-    `E2B_ENABLE_NETNS` 仅作兼容保留、不再生效，全程无需 root /
-    `NET_ADMIN`。
-  - 注意：需 worker 设置 `E2B_ENABLE_NETWORK=true`（默认 false 时全局
-    拒绝出站，网络 API 策略不生效）；普通模式沙箱内 DNS 依赖 Sandlock 的
-    hostname pinning，`allowOut` 用域名形式（如 `example.com:443`）最可靠；
-    egressProxy 模式下 DNS 由代理侧解析（ATYP=domain）。
-- **共享工作目录**：所有节点把 `E2B_WORKSPACE_BASE` 指向同一共享挂载点
-  （NFS/CSI），并在控制面设置 `E2B_SHARED_WORKSPACE_ROOT` 后，迁移不再
-  打包传输——沙箱目录已在共享存储，只重新 provision 目标节点（runtime +
-  卷挂载）、切换记录/路由/配额，且**不删除**源节点上的目录（同一份存储）。
-  共享卷（`E2B_SHARED_VOLUME_ROOT`）数据始终不走迁移传输，两种模式下都只
-  重建挂载符号链接。注意：共享目录在 NFS 上受 root_squash/uid 映射影响，
-  命令文件 IO 走网络；同一沙箱同时只在一个节点运行（路由保证单点）。
-- **真实多节点验证**：compose 起来后运行
-  `E2B_API_URL=http://127.0.0.1:3100 E2B_SANDBOX_URL=http://127.0.0.1:3100
-  python deploy/scripts/multinode_smoke.py`，验证沙箱跨节点分布、经 gateway 的
-  命令/文件/stdin、以及 kill 后节点配额释放。worker 容器需要
-  `security_opt: [seccomp=unconfined]`（sandlock 需安装嵌套 seccomp 过滤器）
-  和 docker CLI（镜像 rootfs 解析）；多节点部署建议
-  `E2B_ENABLE_LOCAL_NODE=false` 关闭控制面本机节点，避免抢占调度。
-
-**Phase 1 限制**：卷/快照为控制面本地存储，远程节点创建暂不支持挂载卷
-（调度返回明确错误）；控制面单点（Phase 3 才多副本）。
-
-### Phase 2：亲和调度与故障细化
-
-- **卷亲和**：卷归属节点（默认 local），带卷挂载的沙箱强制调度到卷所在
-  节点。**共享卷模式**：设置 `E2B_SHARED_VOLUME_ROOT`（所有节点挂载同一
-  共享目录，如 NFS/CSI），卷数据对全部节点可见，带卷沙箱可调度到任意
-  节点；worker agent 校验挂载目标在共享根内后建立挂载点。未配置共享根时
-  保持卷亲和（卷在归属节点本地，多节点部署关闭 local 节点则无法挂卷）。
-- **远程快照**：worker agent 提供本地快照捕获/删除 API，远程沙箱的快照在
-  节点本地存储；从快照创建/fork 调度到快照所在节点，worker 本地展开。
-- **故障细化**：节点 unhealthy 时路由查询返回 502（SDK `is_running()` 得
-  False）；新增管理端点 `GET /nodes`、`DELETE /nodes/{id}`。
-
-### Phase 3：Redis 多副本（可选）
-
-设置 `E2B_REDIS_URL` 后，控制面副本共享沙箱/节点注册表，配额预留/释放走
-Redis WATCH 事务（原子，跨进程不超用），TTL 扫描跨副本一致；未配置时保持
-单进程内存模式。多副本部署启动多个控制面进程指向同一 Redis 即可；记录变更
-（node_id、TTL、暂停/恢复）实时写回共享存储，副本间删除/更新立即可见。
-真实 Redis e2e：`tests/contract/test_redis_multireplica_e2e.py`（自动起
-`redis:7` 容器，验证并发配额原子性、跨副本可见/删除、TTL 回收）。
-
-## Template 本地构建（v2.2）
-
-- `Template().from_dockerfile(...)` + `Template.build(template, name)` 走官方
-  API（POST /v3/templates → build trigger → status 轮询），控制面用本地
-  Docker daemon 构建镜像并注册为可创建沙箱的模板（`Sandbox.create(template=name)`）。
-- 支持 FROM/RUN/ENV/WORKDIR/USER/COPY 步骤。**COPY 文件上下文**：SDK 的
-  `Template().copy(src, dest)` / `from_dockerfile` 中的 COPY 会先按内容哈希
-  上传 tar 归档（`GET /templates/{id}/files/{hash}` 返回带 token 的上传
-  URL，SDK 直接 PUT），控制面解包进 build context 后 `docker build`；
-  同一哈希只上传一次。构建产物为 `e2b-local/{templateID}` 镜像，Sandlock
-  模式下沙箱在镜像 rootfs 内执行，COPY 的文件在镜像内可见。
-- **镜像分发**：配置 `E2B_IMAGE_REGISTRY` 后构建产物会 push 到仓库并把
-  模板镜像名切到 `{registry}/{templateID}`（这一步会**落盘**到模板记录），
-  worker 节点按需从仓库拉取（见多节点调度一节）。**改了 registry 之后，
-  之前构建的模板仍指向旧地址，需要重新构建。**
-- **公共镜像源**：`E2B_REGISTRY_MIRRORS=host=mirrorA|mirrorB,...`（如
-  `registry-1.docker.io=docker.m.daocloud.io`）让 worker 经镜像源解析公共镜像，
-  避免 Docker Hub 匿名配额（429）拖垮建沙箱；origin host 始终作为最后一个端点
-  兜底，`E2B_IMAGE_MANIFEST_TTL_S`（默认 60s）再压一层查询频率。
-- **不配 registry 的单机形态**：没有可 push 的目标，构建改为把
-  **OCI layout tar** 导出到 `E2B_IMAGE_CACHE_DIR/_oci/`，本节点的 worker
-  从该 tar 解析 rootfs（解析与 `warm` 探测都不需要 registry）。这条路径只
-  覆盖"建镜像的这台节点"——远端 worker 仍然必须有 `E2B_IMAGE_REGISTRY`。
-
-  `E2B_IMAGE_CACHE_DIR` 控制 rootfs 解包缓存位置。**生产形态把它放在共享卷上**：
-  `E2B_IMAGE_CACHE_DIR=/var/lib/e2b-sandboxes/_images`（`deploy/stack` 与 `deploy/compose`
-  的 prod/multinode 清单都已显式设置）。这样缓存**跨 `up -d`、跨 worker 持久且共享**，
-  重建 worker 不再重新拉取/解包整个 rootfs。默认值（未设 env）仍是相对路径
-  `tmp/sandboxes/_images`，只适合本地开发。
-
-  `_images` 属于基础设施命名空间：worker 的顶层扫描会排除它（不会当成沙箱树），
-  但它**不在任何 project 配额内** ⇒ 缓存自身有**按量 GC**（`prune_image_cache()`，
-  只逐出已完成的 rootfs 条目、最旧优先、且**剔除被任何沙箱记录引用或依赖清单不完整**的条目；
-  `E2B_IMAGE_CACHE_MAX_BYTES` 默认 **`0`=逐出关闭**，判的是总占用而不是逐条上限），
-  发布后这一趟跑在**独立维护线程**上（缓存大时它是 O(缓存) 的走查，不能占用沙箱首条命令的
-  60s 预算），
-  完整口径（含 `_oci` 的单独策略与"崩溃循环暂存 ≈1.7 GB"量级）见
-  `docs/production-deployment-requirements.md` §2.7。
-
-  缓存目录名包含镜像 digest（`{image}-{sha256 前缀}`），基础镜像 tag 更新
-  （如 `python:3.14-slim` 出新版）后自动落到新目录，不会误用旧 rootfs。
+1. **`envdVersion` 用 `0.6.4+sandlock`**：spec 原文是 `0.6.4-sandlock`，但官方 SDK 用
+   `packaging.Version` 解析该字段，`0.6.4-sandlock` 不是合法 PEP 440 版本号，会在 `Sandbox.create()`
+   时抛 `InvalidVersion`；`0.6.4+sandlock` 合法且语义不变。
+2. **SDK 版本**：本仓库按 spec 写定的版本测试 —— Python `e2b==2.46.0`
+   （[requirements-test.txt](requirements-test.txt)）、JS `e2b@2.46.1`
+   （[tests/sdk/js/package.json](tests/sdk/js/package.json)）。spec 提到的 Python `2.46.1` **在 PyPI
+   上不存在**（2.46.x 只有 2.46.0 / 2.46.4）。写这份 README 时（2026-10-01）PyPI 与 npm 上的最新版
+   都是 **2.51.0**，本仓库**未在 2.51 上验证**；换 SDK 版本前先跑 `tests/sdk/python` 与
+   `tests/sdk/js` 两套。
