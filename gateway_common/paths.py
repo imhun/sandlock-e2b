@@ -282,6 +282,36 @@ def sandbox_runtime_dir(
     )
 
 
+#: The create-in-flight marker's name, inside ``<state base>/_runtime/<id>``.
+#: A dot-file so no reader that enumerates the runtime directory mistakes it
+#: for a record, and so a ``sandbox.json`` reader can never see it as one.
+CREATING_MARKER_NAME = ".creating"
+
+
+def sandbox_creating_marker(
+    workspace_base: str | Path,
+    sandbox_id: str,
+    *,
+    state_base: str | Path | None = None,
+) -> Path:
+    """``<state base>/_runtime/<id>/.creating`` -- "a create is in flight".
+
+    Two invariants are readable off the disk because of this file, and they are
+    what makes moving the record write off the create's response path safe:
+
+    * the **marker** exists ⇒ a create is running (a teardown must wait);
+    * the **record** exists ⇒ that create finished (``register`` is the last
+      thing it does).
+
+    A crashed create leaves the marker and no record, which is exactly the
+    input the existing orphan path already reclaims.
+    """
+    return (
+        sandbox_runtime_dir(workspace_base, sandbox_id, state_base=state_base)
+        / CREATING_MARKER_NAME
+    )
+
+
 _DISK_STATS_NAME = "disk-stats"
 
 

@@ -542,6 +542,14 @@ class Settings:
         default_factory=lambda: _env_bool("E2B_QUOTA_RECONCILE_ON_STARTUP", True)
     )
     log_level: str = field(default_factory=lambda: os.getenv("E2B_LOG_LEVEL", "INFO"))
+    #: How long a ``DELETE`` waits for an in-flight create of the same sandbox
+    #: before treating the marker as abandoned (``_await_inflight_create``).
+    #: The create itself is bounded by the materialization (a snapshot copy on
+    #: the shared NAS can take tens of seconds), so this has to outlast one;
+    #: a marker *older* than this is reclaimed at once instead of waited on.
+    create_wait_s: int = field(
+        default_factory=lambda: int(_env_float("E2B_CREATE_WAIT_S", 60))
+    )
     internal_api_key: str = field(
         default_factory=lambda: os.getenv("E2B_INTERNAL_API_KEY", "internal-key")
     )

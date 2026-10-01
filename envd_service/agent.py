@@ -71,6 +71,7 @@ from gateway_common.paths import (
     is_sandbox_workspace_dir,
     sandbox_checkpoint_dir,
     sandbox_command_log_path,
+    sandbox_creating_marker,
     sandbox_runtime_dir,
     validate_sandbox_id,
 )
@@ -2871,6 +2872,84 @@ def _write_disk_stats(
         logger.warning("disk stats publish failed for %s", sandbox_id, exc_info=True)
 
 
+def _creating_marker(settings: Settings, sandbox_id: str) -> Path:
+    return sandbox_creating_marker(
+        settings.workspace_base, sandbox_id, state_base=settings.state_base
+    )
+
+
+def _write_creating_marker(settings: Settings, sandbox_id: str) -> Path:
+    """Announce that a create is in flight (design §4.5).
+
+    One byte, no ``fsync``: this is not a record -- it is a *presence*, and the
+    record that follows it is what says the create succeeded. A crash between
+    the two leaves "marker, no record", which the orphan path already reclaims.
+    """
+    marker = _creating_marker(settings, sandbox_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("", encoding="utf-8")
+    return marker
+
+
+def _clear_creating_marker(settings: Settings, sandbox_id: str) -> None:
+    _creating_marker(settings, sandbox_id).unlink(missing_ok=True)
+
+
+def _marker_age_s(marker: Path) -> float | None:
+    """Seconds since the marker was written, or ``None`` if it is not there."""
+    try:
+        return max(0.0, time.time() - marker.stat().st_mtime)
+    except FileNotFoundError:
+        return None
+
+
+def _await_inflight_create(
+    settings: Settings, sandbox_id: str, *, timeout_s: float | None = None
+) -> bool:
+    """Wait, bounded, for an in-flight create of ``sandbox_id`` to finish.
+
+    Returns ``True`` when there was nothing to wait for (or the wait
+    completed), ``False`` when the marker was still there after the bound --
+    the caller then reclaims the sandbox as an **unfinished** create (its tree
+    and its record are both disposable: the record of a create that did not
+    finish is exactly what the orphan path is for).
+
+    A marker older than the bound is treated as abandoned *immediately*
+    rather than after another full wait: a worker that crashed mid-create left
+    it, and no future create will ever clear it.
+    """
+    marker = _creating_marker(settings, sandbox_id)
+    bound = float(
+        settings.create_wait_s if timeout_s is None else timeout_s
+    )
+    age = _marker_age_s(marker)
+    if age is None:
+        return True
+    if age >= bound:
+        logger.warning(
+            "sandbox %s has a create marker %.0fs old (bound %.0fs): treating "
+            "it as an unfinished create and reclaiming",
+            sandbox_id,
+            age,
+            bound,
+        )
+        return False
+    deadline = time.monotonic() + bound
+    while time.monotonic() < deadline:
+        if _marker_age_s(marker) is None:
+            return True
+        # Short enough that a delete does not add a visible delay to a create
+        # that finished while it was arriving.
+        time.sleep(0.05)
+    logger.warning(
+        "sandbox %s still has a create marker after waiting %.0fs: treating it "
+        "as an unfinished create and reclaiming",
+        sandbox_id,
+        bound,
+    )
+    return False
+
+
 def _materialize_or_degrade(sandbox_id: str, snapshot_id: str | None) -> bool:
     """Try the agent's one-call materialization; degrade **by name** if it is absent.
 
@@ -2915,6 +2994,11 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
         raise ValueError("sandboxID is required")
     workspace_dir = workspace_base / sandbox_id
     snapshot_id = payload.get("snapshotID")
+    # §4.5: announce the create *before* anything is materialized, so a
+    # ``DELETE`` that arrives while this runs waits instead of tearing down a
+    # tree that is about to be written to (and, from the next task on, a record
+    # that is about to be written after the response).
+    _write_creating_marker(settings, sandbox_id)
     # The tree (and, for a snapshot create, the copy into it) is one signed
     # plan this worker carries to its own node's agent, which does the mkdir /
     # copy / chown in one call -- see ``docs/superpowers/specs/
@@ -3083,6 +3167,9 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
     # so other workers can reuse the free set without seeing a stale hold.
     if host_uid is not None and pool is not None:
         pool.commit(sandbox_id)
+    # Last: the record is on the disk, so "record exists ⇒ this create
+    # finished" now holds, and a waiting teardown may proceed.
+    _clear_creating_marker(settings, sandbox_id)
 
 
 async def _prime_runtime_context(request: Request, sandbox_id: str | None) -> None:
@@ -3204,6 +3291,10 @@ async def agent_delete_sandbox(
         return Response(status_code=401)
     runtime_registry = request.app.state.runtime_registry
     try:
+        # §4.5: a teardown must not race a create of the same sandbox. Bounded,
+        # and a marker older than the bound (a create that died) is reclaimed
+        # at once rather than waited on -- never a hang.
+        await asyncio.to_thread(_await_inflight_create, settings, sandbox_id)
         # Off the loop: this removes a whole sandbox tree, and on this
         # deployment that tree is on the shared NAS -- measured 17.4 s for a
         # 2000-file sandbox, during which the worker sent no heartbeats at all
