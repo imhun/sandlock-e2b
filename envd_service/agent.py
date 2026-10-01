@@ -3225,9 +3225,11 @@ def _agent_prepare_sandbox(request: Request, settings: Settings, payload: dict) 
     reservation, and the seed of the ``statfs(2)`` accounting.
 
     **It carries no state to the finalize half.** The payload is re-sent whole
-    and every value here is re-derivable from it plus the pool's own answer, so
-    a worker that restarts between the two hops finishes the create instead of
-    refusing it.
+    and every value here is re-derivable from it plus the pool's own answer --
+    and the split only ever happens for a create the control plane gave a
+    ``hostUID`` (a record without one is not splittable at all), so a worker
+    that restarts between the two hops finishes the create instead of refusing
+    it or handing it a second uid.
 
     On failure it takes its own half back (``_agent_cancel_sandbox``) rather
     than leaving a marker and a uid reservation for a create nobody will
