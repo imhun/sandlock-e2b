@@ -1142,6 +1142,7 @@ class RuntimeRegistry:
         network: dict | None = None,
         allow_public_traffic: bool = False,
         iam_tokens: dict[str, dict[str, str]] | None = None,
+        persist: bool = True,
     ) -> RuntimeSandbox:
         if not validate_sandbox_id(sandbox_id):
             raise ValueError(f"invalid sandbox id: {sandbox_id}")
@@ -1179,40 +1180,76 @@ class RuntimeRegistry:
             self._pushed_total.pop(sandbox_id, None)
             self._tightened.pop(sandbox_id, None)
             self._tightened_at.pop(sandbox_id, None)
-            try:
-                started = time.monotonic()
-                self._ensure_runtime_dir(sandbox_id)
-                path = self._record_path(sandbox_id)
-                # Atomic because the reader is a *different process*: another
-                # worker sharing this workspace reads the record to decide
-                # which host uids are taken (``uid_pool._recorded_uid``), and
-                # it reads a half-written file as "no record" -- i.e. as "this
-                # uid is free", which is how two sandboxes end up sharing one
-                # host uid with E3.2's isolation silently gone.
-                write_json_atomically(path, record.to_dict())
-                # The directory is traversable by name (0711) so the route-B
-                # slot can reach the disk-accounting file beside this one; the
-                # record itself carries the access token, so it is closed by
-                # its own mode rather than by the directory (`write_json_
-                # atomically` stages at `0o666 & ~umask`).
-                try:
-                    os.chmod(path, 0o600)
-                except OSError:  # pragma: no cover - best effort, as above
-                    pass
-                # The in-tree copy was the pre-split location and is still
-                # writable by the sandbox itself; once the authoritative copy
-                # exists outside the tree, drop it rather than leave a
-                # forgeable second version behind.
-                self._legacy_record_path(sandbox_id).unlink(missing_ok=True)
-            except OSError:
-                pass
-            else:
-                # The record write is one of the create path's named stages
-                # (see ``gateway_common.create_trace``): on the deployment's
-                # NAS it is a mkdir plus an fsync-ed atomic write, and it is
-                # the largest single piece of the worker's own file work.
-                create_trace.stage("record", sandbox_id, started)
+            if persist:
+                self._persist_locked(sandbox_id)
         return record
+
+    def persist(self, sandbox_id: str) -> bool:
+        """Write one registered sandbox's record to the disk. ``True`` on success.
+
+        Split out of :meth:`register` for the create path (design §4.5): the
+        record is the *last* thing a create does and on this deployment's NAS
+        it is the largest single piece of the worker's own file work (47 ms
+        measured 2026-10-01), so the create answers first and this runs after
+        -- and the marker it leaves behind until this returns ``True`` is what
+        keeps a teardown from racing it.
+
+        ``False`` is a real answer, not an exception: the caller has to keep
+        the marker (the disk then says "a create was in flight and did not
+        finish", which the orphan path reclaims) instead of reporting a create
+        that never became durable.
+        """
+        with self._lock:
+            if sandbox_id not in self._records:
+                return False
+            return self._persist_locked(sandbox_id)
+
+    def _persist_locked(self, sandbox_id: str) -> bool:
+        """Persist one record; caller holds ``self._lock`` and it must exist."""
+        record = self._records[sandbox_id]
+        started = time.monotonic()
+        try:
+            self._ensure_runtime_dir(sandbox_id)
+            path = self._record_path(sandbox_id)
+            # Atomic because the reader is a *different process*: another
+            # worker sharing this workspace reads the record to decide
+            # which host uids are taken (``uid_pool._recorded_uid``), and
+            # it reads a half-written file as "no record" -- i.e. as "this
+            # uid is free", which is how two sandboxes end up sharing one
+            # host uid with E3.2's isolation silently gone.
+            write_json_atomically(path, record.to_dict())
+            # The directory is traversable by name (0711) so the route-B
+            # slot can reach the disk-accounting file beside this one; the
+            # record itself carries the access token, so it is closed by
+            # its own mode rather than by the directory (`write_json_
+            # atomically` stages at `0o666 & ~umask`).
+            try:
+                os.chmod(path, 0o600)
+            except OSError:  # pragma: no cover - best effort, as above
+                pass
+            # The in-tree copy was the pre-split location and is still
+            # writable by the sandbox itself; once the authoritative copy
+            # exists outside the tree, drop it rather than leave a
+            # forgeable second version behind.
+            self._legacy_record_path(sandbox_id).unlink(missing_ok=True)
+        except OSError as exc:
+            # Named, and *not* swallowed (the pre-split code was a bare
+            # ``except OSError: pass``): a record that never landed is the
+            # difference between "this sandbox exists" and "this uid is free".
+            logger.warning(
+                "could not persist the runtime record for %s: %s: the sandbox "
+                "is registered in memory only, and its create marker stays "
+                "until the record is durable",
+                sandbox_id,
+                exc,
+            )
+            return False
+        # The record write is one of the create path's named stages
+        # (see ``gateway_common.create_trace``): on the deployment's
+        # NAS it is a mkdir plus an fsync-ed atomic write, and it is
+        # the largest single piece of the worker's own file work.
+        create_trace.stage("record", sandbox_id, started)
+        return True
 
     def get(self, sandbox_id: str) -> RuntimeSandbox | None:
         if not validate_sandbox_id(sandbox_id):

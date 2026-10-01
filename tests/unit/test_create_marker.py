@@ -21,6 +21,7 @@ import asyncio
 import os
 import shutil
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -165,6 +166,13 @@ async def test_the_marker_is_gone_once_the_create_succeeded(
     resp = await _create(app)
 
     assert resp.status_code == 201
+    # The record write is off the create's response path (the next task), so
+    # the marker comes off when the record is *durable*, not when the response
+    # is written: the invariant is "record on disk ⇒ marker gone", and this
+    # waits for that rather than for the HTTP response.
+    deadline = time.monotonic() + 5
+    while _marker(settings).exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
     assert _marker(settings).exists() is False
     assert app.state.runtime_registry.get(SANDBOX) is not None
 

@@ -2950,6 +2950,52 @@ def _await_inflight_create(
     return False
 
 
+def _schedule_record_persist(request: Request, sandbox_id: str | None) -> None:
+    """Hand the record write to the loop, off the create's response path (§4.5).
+
+    Scheduled (not awaited) on purpose: the create's contract is "the sandbox
+    exists" -- which ``register(persist=False)`` already made true for everyone
+    in this process -- while the disk copy exists for *other* processes, and
+    the marker is what keeps the two consistent in the meantime.
+    """
+    if not sandbox_id:
+        return
+    runtime_registry = request.app.state.runtime_registry
+    settings = request.app.state.settings
+    asyncio.create_task(
+        _persist_runtime_record(runtime_registry, settings, sandbox_id)
+    )
+
+
+async def _persist_runtime_record(
+    runtime_registry, settings: Settings, sandbox_id: str
+) -> None:
+    """Write the record, then -- only then -- let a teardown proceed.
+
+    ``persist`` is the registry's own file work, so it runs in a thread. On
+    success the two things that were held back release in order: the create
+    marker comes off (so a waiting ``DELETE`` may now tear the sandbox down),
+    and the uid reservation is committed (I1 -- the record now pins the uid for
+    every worker, so the transient marker is no longer needed).
+
+    On failure the marker **stays**: the disk then says "a create was in flight
+    and did not finish", which is exactly the input the orphan path reclaims,
+    and the uid stays reserved so another worker cannot hand the same uid to a
+    second sandbox.
+    """
+    try:
+        durable = await asyncio.to_thread(runtime_registry.persist, sandbox_id)
+    except Exception:  # pragma: no cover - defensive; persist already names
+        logger.exception("persisting the runtime record for %s failed", sandbox_id)
+        return
+    if not durable:
+        return
+    _clear_creating_marker(settings, sandbox_id)
+    pool = getattr(runtime_registry, "uid_pool", None)
+    if pool is not None:
+        pool.commit(sandbox_id)
+
+
 def _materialize_or_degrade(sandbox_id: str, snapshot_id: str | None) -> bool:
     """Try the agent's one-call materialization; degrade **by name** if it is absent.
 
@@ -3148,6 +3194,12 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
             volume_mounts=mount_paths,
             volume_projects=volume_projects,
             iam_tokens=payload.get("iamTokens"),
+            # §4.5: the record goes to the disk *after* the response. The entry
+            # is in memory from here on, so the RPC path (and the runtime
+            # context this route primes next) sees the sandbox immediately;
+            # what the caller would otherwise wait for is one atomic write plus
+            # an fsync (47 ms measured 2026-10-01).
+            persist=False,
         )
         # SEC-K0S-006: seed the `statfs(2)` accounting before the first scan
         # round runs, so a `df` immediately after create already reports the
@@ -3163,13 +3215,6 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
         if host_uid is not None and pool is not None:
             pool.release(sandbox_id)
         raise
-    # I1: the record is durable — drop the cross-process reservation marker
-    # so other workers can reuse the free set without seeing a stale hold.
-    if host_uid is not None and pool is not None:
-        pool.commit(sandbox_id)
-    # Last: the record is on the disk, so "record exists ⇒ this create
-    # finished" now holds, and a waiting teardown may proceed.
-    _clear_creating_marker(settings, sandbox_id)
 
 
 async def _prime_runtime_context(request: Request, sandbox_id: str | None) -> None:
@@ -3245,6 +3290,10 @@ async def agent_create_sandbox(request: Request) -> Response:
         started = time.monotonic()
         await asyncio.to_thread(_agent_create_sandbox, request, settings, payload)
         create_trace.stage("provision", sandbox_id, started)
+        # §4.5: the record write leaves the response path here. The marker
+        # written at the top of ``_agent_create_sandbox`` is what makes that
+        # safe -- it comes off only once the record is durable.
+        _schedule_record_persist(request, sandbox_id)
         started = time.monotonic()
         await _prime_runtime_context(request, sandbox_id)
         create_trace.stage("prime", sandbox_id, started)
