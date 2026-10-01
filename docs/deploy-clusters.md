@@ -1285,6 +1285,75 @@ agent→控制面→worker 一整圈（其中约 27-30 ms 是那一圈的固定�
 durability 约定**，且"建完立刻 kill"是常用姿势 —— 并行的写有可能在拆除之后落地，正是 N53 清理
 过的那类残留。两者都要先有设计再动手。
 
+### 7.27 建箱材料化改走控制面直送（载体 C）（**2026-10-01，已上线 `0.1.0-864-g3377ffc-20261001-204142`**）
+
+提交 `19ac378..3377ffc`。规范 `docs/superpowers/specs/2026-10-01-create-path-grant-design-v2.md`，
+计划 `docs/superpowers/plans/2026-10-01-create-path-grant-cp-direct.md`。
+
+**改了什么**：建箱的树 / 快照拷贝 / 卷切片 / 改属主改成**控制面在拨 worker 之前**，往**既有的**
+CP→agent 通道送一条 `materialize` 指令（`POST /internal/nodes/{host}/agent/materialize`，
+`X-Internal-Key`，与 `chown`/`rm`/`walk` 同一条路由、同一个 agent 自检），agent 一次做完；
+worker 的 payload 带 `materialized: true` 就跳过建树段与属主段。不新增通道：worker 侧仍然没有
+`E2B_C3_AGENT_TOKEN`（`tests/unit/test_c3_agent_manifest.py` 的钉子不动），清单一个字节不用改。
+载体 B（worker 领授权直连）整块删除：`gateway_common/create_grant.py`、
+`/internal/nodes/{node}/file-grant`、agent 的 `/internal/grants/file-op` + jti 表、
+`AgentFileOps.materialize`/`AgentMaterializeUnsupported`、`E2B_CREATE_GRANT_TTL_S`。
+`materialize-tree` 现在 `callers=frozenset()`：**任何请求面都问不到它**（worker 的 `/file-op`
+按名字 400 拒），只有控制面自己推导得出。
+
+**集群验收（`0.1.0-864`）**
+
+| 判据 | 读数 |
+|---|---|
+| 建箱、控制面 pod 内发起（n=10，三轮） | p50 **193 / 195 / 194 ms**（p95 204 / 290 / 249）—— §7.26 同口径基线 **191 ms** ⇒ **端到端没有变快** |
+| worker 逐段（`E2B_CREATE_TRACE=1`） | `provision` **173 → 76–79 ms**、`prime` **17 → 6 ms**；**建箱路径上 `fileop:chown-workspace` 0 行**（窗口里唯一那一行来自迁移路径，见"边界"） |
+| 新那一跳本身（控制面 pod 内直打 agent 的 49986，n=6） | `materialize` p50 **70.8 ms**；同一条连接上的空指令 **1.8 ms**、TCP connect **0.1 ms**、同一棵树的 `rm` **22.6 ms** ⇒ 那 ~70 ms 是 **agent 自己的活**（`mkdir` + `e2b-maint chown --recursive` 走 NAS），不是网络 |
+| 快照落点（生产形状） | 快照里 `workspace/kept.txt` ⇒ 新箱 `GET /files?path=workspace/kept.txt` = **200 `kept\n`**，而 `workspace/workspace/kept.txt` = **404** ⇒ 没有 v1 那样多下沉一层 |
+| 树真的建出来了（C1 的活体对照） | 建完立刻读盘：`<ws>/<id>` 与 `<ws>/<id>/workspace` 都是 **0770、属主 = 池 uid 10000、组 65534** |
+| 冒烟 | `MULTI-NODE SMOKE OK`（4 箱 2+2、命令/文件/stdin、预留归零）；`DEPLOYMENT SMOKE OK`（含跨节点迁移保文件、远端卷隔离、模板构建→worker 拉取→rootfs、MCP 网关） |
+| 未回归 | `DRY_RUN=1 apply.sh \| kubectl diff -f -` **0 行**；9 个 pod 全 Running；`GET /sandboxes` = 0、两 worker 的 `workspaces`/`_runtime` 无沙箱残留 |
+| 仓库侧 | `tests/unit` 与基线逐条相同（2170 passed / 12 skipped / 3 failed —— 3 条 macOS 固有，见 §7.9 起的口径） |
+
+**结论（诚实记）**：worker 那一段砍掉约 95 ms，但**新那一跳自己就要约 71 ms**，省下的与付出的
+大致相等，端到端 p50 191 → 193 ms。设计与计划里"省掉那一圈往返 ⇒ 145–150 ms"的预期**没有实现**：
+§7.26 记的那 71 ms 里，**大部分不是"一圈的固定开销"，而是 agent 在 NAS 上做递归 `lchown`
+本身的成本**。把同一件事从"经控制面转发"改成"控制面直送"，只是换了发起者，活一点没少
+（空指令同一跳 1.8 ms、同一棵树的 `rm` 22.6 ms 是旁证）。
+
+**要真正拿掉这 71 ms，得动的是"改属主"这件事本身**，不是谁发指令：例如把沙箱对树的权限
+从 ownership 换成组位/ACL（worker 与沙箱同组写入），或让树在创建时就以目标 uid 落盘
+（今天做不到：写入者只有 root 或 worker）。那是新设计，不在本轮。
+
+**边界（点名）**：**只有建箱**走这条指令。`_provision_remote` 另外三个调用点不带这个标志、
+仍走老路（worker 自建自交）：迁移（`control_plane/api/sandboxes.py:2460`、`:2536`）与
+fork（`control_plane/api/snapshots.py:943`）——所以迁移那一跳里仍能看到
+`fileop:chown-workspace`（本次实测 58.8 ms 一条）。`local://` 形态与 `_provision_local` 一行没动。
+
+**遗留（本轮独立评审打穿、尚未修）**：① `materialized` 在"控制面没能发出指令"的形状下
+仍被写死为 `True`（`_materialize_remote` 的两个提前返回被忽略）⇒ 那些形状会**静默建出没有
+workspace 的沙箱**（已用夹具复现；出厂 k8s 清单 pin 了 `runAsUser/runAsGroup: 65534`，
+所以本集群不在这个形状里）；② `_CreateClaim` 只活在**单个副本**的内存里，而控制面是
+`replicas: 2` ⇒ §4.5 那个窗口只在同副本内关闭（已用两个 app 共享一个 registry 复现：
+DELETE 在另一副本上 204 返回、在飞的建箱随后把记录写回去）。三条 Important：新 CP + 旧 agent
+的滚动窗口会让建箱 502（无降级）、`E2B_PER_SANDBOX_UID=false` 的旧形态每个远端建箱 503、
+agent 侧的具名"忙"（超过 `E2B_C3_AGENT_MATERIALIZE_MAX`）会让那次建箱直接失败。
+逐条出处见 `docs/open-issues.md` N56。
+
+**复跑**：
+
+```bash
+# ① 建箱延迟（控制面内）
+kubectl -n sandlock exec -i <cp-pod> -c control-plane -- python3 - --base http://127.0.0.1:3000 \
+    --key "$E2B_API_KEY" --n 10 < deploy/scripts/acceptance/create_latency_probe.py
+# ② 那新一跳自己多贵（控制面 pod 内直打 agent 的维护面；需要 agent token 与一个池内 uid）
+kubectl -n sandlock exec -i <cp-pod> -c control-plane -- python3 - "http://<agent-pod-ip>:49986" \
+    "<nodeName>" "$(kubectl -n sandlock get secret e2b-secrets -o jsonpath='{.data.E2B_C3_AGENT_TOKEN}' | base64 -d)"
+# ③ 逐段（开着 trace 跑一次 ①，再关掉）
+kubectl -n sandlock set env statefulset/e2b-worker E2B_CREATE_TRACE=1
+kubectl -n sandlock logs e2b-worker-0 --since=5m | grep "create trace:"
+kubectl -n sandlock set env statefulset/e2b-worker E2B_CREATE_TRACE-
+```
+
 ## 8. 改部署的入口
 
 ```bash

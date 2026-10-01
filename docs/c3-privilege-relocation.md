@@ -248,8 +248,11 @@ signal number"*），由 supervisor 去杀它自己的孩子。
 
 **这个组件的存在本身就是"CP 的 root 收窄"的实现方式**：CP 不进特权路径，agent 独占特权。
 
-- **接口要窄**：动词白名单（`mkdir`/`write`/`extract`/`chown`/`rm`/`walk` 按需取子集）+
-  `realpath` + 路径白名单 + uid 必须落在池内。
+- **接口要窄**：动词白名单（`mkdir`/`write`/`extract`/`chown`/`rm`/`walk` 按需取子集；**出厂形态
+  2026-10-01 起是 `chown`/`rm`/`walk`（面 B）+ `grant-slot`（面 A）+ `materialize`（面 B，
+  建箱材料化，载体 C）**）+ `realpath` + 路径白名单 + uid 必须落在池内。权威表是
+  `control_plane/file_ops.py::FILE_OPS`（每行带 `callers`）：`materialize-tree` 的 `callers` 是
+  **空集** —— 它没有请求面，只有控制面自己推导得出（N56）。
 - **纪律复用，不要新写一套**：`c3_agent/priv/priv_common.c` 已经有 `realpath` + 四根白名单 +
   `FTS_PHYSICAL` + `lchown`/`unlinkat`（符号链接永不跟随），并且 `c3_agent/priv/maint.c` 的 usage
   头已经把 `chown`/`rm`/`walk`/`serve`/`ping` 五种形态写全 —— **直连 CLI 形态就是 agent 要用的
@@ -679,7 +682,7 @@ agent 的定位从"执行特权操作"收紧成一句更有力的话**：
 | | 身份给谁 | 为什么 |
 |---|---|---|
 | **槽位**（(d)） | **给沙箱自己的进程** | 那就是沙箱的身份，本来就是它该有的 |
-| **文件操作**（建树 / 解包 / secret / 删树 / 卷切片 / 迁移导入） | **不给任何 worker 助手 —— agent 自己执行** | 若写成"授予 X 再让 worker 去干"，worker 拿到的是「**成为 X**」而不是「**做这件事**」，它接下来干什么就管不住了。**授权必须收窄到"做这件事"。** |
+| **文件操作**（建树 / 解包 / secret / 删树 / 卷切片 / 迁移导入 / **建箱材料化 `materialize`**） | **不给任何 worker 助手 —— agent 自己执行** | 若写成"授予 X 再让 worker 去干"，worker 拿到的是「**成为 X**」而不是「**做这件事**」，它接下来干什么就管不住了。**授权必须收窄到"做这件事"。** |
 
 **⚠ 推论（写给实施者）**：C3 里 agent 承接的那些文件操作**必须 agent 自己执行**，
 不能实现成"agent 发身份、worker 干活" —— 后者只是把 `e2b-slot-spawn` 换了个位置，
