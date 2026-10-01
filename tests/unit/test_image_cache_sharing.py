@@ -437,9 +437,14 @@ def test_a_fresh_process_reuses_the_shared_cache(registry: FakeRegistry, tmp_pat
     second = _collect(_spawn(_child_env(image=image, cache=cache, record=record)))
 
     assert second["rootfs"] == first["rootfs"]
-    # The manifest is re-resolved (that is how a moved tag self-invalidates the
-    # cache); the layer blobs and the extraction are not.
-    assert registry.manifest_requests > manifest_requests_after_first
+    # N54: the digest a previous process resolved is *persisted* next to the
+    # cache, so a fresh process inside the manifest TTL does not even re-resolve
+    # the tag -- that lookup was measured at ~0.5 s per create (auth + manifest
+    # round trips to the registry). Past the TTL it is resolved again, which is
+    # how a moved tag self-invalidates (see the TTL cases in
+    # ``test_oci_registry.py``); the layer blobs and the extraction are never
+    # repeated either way.
+    assert registry.manifest_requests == manifest_requests_after_first
     assert registry.blob_requests == blobs_after_first
     assert _extraction_pids(record) == [first["pid"]]
     assert (rootfs / ".complete").stat().st_mtime_ns == marker_mtime

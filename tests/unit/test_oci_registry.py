@@ -10,6 +10,7 @@ import os
 import posixpath
 import tarfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -756,3 +757,125 @@ def test_explicit_credential_host_overrides_the_environment(monkeypatch):
     )
     assert other._username is None
     assert other._password is None
+
+
+def test_the_resolved_digest_survives_the_process(monkeypatch, tmp_path):
+    """One resolution has to be enough for the *next* process too (N54).
+
+    The in-process cache below dies with the worker process -- and it is
+    per-process by construction, so two workers on one node each pay their own
+    lookup. Measured on the fleet 2026-10-01: every create still spent ~6 HTTPS
+    round trips (auth + manifest, ~0.5 s) resolving the *same* pinned base
+    image, because the answer only ever lived in memory. Warm the node once (or
+    let one create resolve it) and the result has to be on disk.
+    """
+    from envd_service.runtime import image_resolver
+
+    calls: list[str] = []
+
+    def fake_fetch(client):
+        calls.append(client._ref.reference)
+        return {"layers": []}, "sha256:aaaa"
+
+    monkeypatch.setattr(image_resolver, "fetch_platform_manifest", fake_fetch)
+    monkeypatch.setenv("E2B_IMAGE_MANIFEST_TTL_S", "60")
+    image_resolver._DIGEST_CACHE.clear()
+
+    assert (
+        image_resolver._platform_digest(
+            "python:3.11-slim",
+            registry_username=None,
+            registry_password=None,
+            cache_dir=tmp_path,
+        )
+        == "sha256:aaaa"
+    )
+    assert len(calls) == 1
+
+    # A fresh process (empty in-process cache) reads it from the cache dir.
+    image_resolver._DIGEST_CACHE.clear()
+    assert (
+        image_resolver._platform_digest(
+            "python:3.11-slim",
+            registry_username=None,
+            registry_password=None,
+            cache_dir=tmp_path,
+        )
+        == "sha256:aaaa"
+    )
+    assert len(calls) == 1, "the second lookup went to the registry again"
+
+    # Credentials still take part in the key -- a different lookup path must not
+    # be answered from the persisted one.
+    assert (
+        image_resolver._platform_digest(
+            "python:3.11-slim",
+            registry_username="u",
+            registry_password="p",
+            cache_dir=tmp_path,
+        )
+        == "sha256:aaaa"
+    )
+    assert len(calls) == 2
+    image_resolver._DIGEST_CACHE.clear()
+
+
+def test_an_extracted_rootfs_needs_no_manifest_lookup(monkeypatch, tmp_path):
+    """The digest on disk is enough for a resolve whose rootfs is already there.
+
+    ``resolve_image_rootfs`` used to fetch the platform manifest unconditionally
+    once the local/shared/tar paths missed -- which is the second half of the
+    per-create cost (the first half is the peek). With the digest persisted, an
+    extracted rootfs is found without asking the registry anything.
+    """
+    from envd_service.runtime import image_resolver
+
+    image = "python:3.11-slim"
+
+    def explode(*args, **kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("resolve must not look up the manifest")
+
+    monkeypatch.setattr(image_resolver, "fetch_platform_manifest", explode)
+    monkeypatch.setenv("E2B_IMAGE_MANIFEST_TTL_S", "60")
+    image_resolver._DIGEST_CACHE.clear()
+
+    # Seed what a warm would have left behind: the digest, and an extracted
+    # rootfs for it.
+    digest = "sha256:cccc"
+    image_resolver._write_digest_cache(tmp_path, image, None, None, digest)
+    rootfs = image_resolver._cache_rootfs(tmp_path, image, digest)
+    rootfs.mkdir(parents=True)
+    (rootfs / ".complete").write_text("", encoding="utf-8")
+
+    assert image_resolver.resolve_image_rootfs(image, tmp_path) == rootfs
+    image_resolver._DIGEST_CACHE.clear()
+
+
+def test_the_persisted_digest_cache_survives_a_prune(monkeypatch, tmp_path):
+    """The prune may not reclaim the digest cache it exists to keep (N54).
+
+    ``_cache_usage`` classifies *every* dot-prefixed child as a staging tree and
+    the prune reclaims those once they are older than the staleness window -- so
+    a persisted digest written by a warm would be deleted an hour later and
+    every create would go back to paying the registry round trips.
+    """
+    from envd_service.runtime import image_resolver
+
+    image = "python:3.11-slim"
+    image_resolver._write_digest_cache(tmp_path, image, None, None, "sha256:dddd")
+    key = image_resolver._digest_cache_key(image, None, None, None)
+    path = image_resolver._digest_cache_file(tmp_path, key)
+    assert path.is_file()
+
+    # Age it well past every staleness window the prune knows.
+    old = time.time() - 10_000
+    os.utime(path, (old, old))
+    os.utime(path.parent, (old, old))
+
+    image_resolver.prune_image_cache(tmp_path)
+
+    assert path.is_file(), "the prune reclaimed the persisted digest"
+    assert (
+        image_resolver._read_digest_cache(tmp_path, image, None, None)
+        == "sha256:dddd"
+    )

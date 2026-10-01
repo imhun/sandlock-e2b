@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -630,6 +631,17 @@ _DIGEST_CACHE: dict[str, tuple[float, str]] = {}
 _DIGEST_CACHE_LOCK = threading.Lock()
 _DEFAULT_MANIFEST_TTL_S = 60.0
 
+#: Where the *persisted* half of that cache lives, under the image cache dir.
+#:
+#: The in-process map above dies with the worker process, and it is per-process
+#: by construction -- so a node with two workers paid the lookup twice, and
+#: every restart paid it again. Measured on the fleet 2026-10-01: each create
+#: still spent ~6 HTTPS round trips (auth token + manifest, ~0.5 s) resolving
+#: the same pinned base image, because the answer only ever lived in memory.
+#: Warming the node once now writes it here, and every later peek/resolve on
+#: that node reads it back (N54).
+_DIGEST_CACHE_DIRNAME = ".digests"
+
 
 def _manifest_ttl_s() -> float:
     raw = os.environ.get("E2B_IMAGE_MANIFEST_TTL_S", "")
@@ -644,6 +656,81 @@ def _manifest_ttl_s() -> float:
         return _DEFAULT_MANIFEST_TTL_S
 
 
+def _digest_cache_key(
+    image: str,
+    registry_username: str | None,
+    credential_host: str | None,
+    scheme: str | None,
+) -> str:
+    """The lookup's identity: what is resolved must not answer for what is not."""
+    return f"{image}|{scheme or ''}|{registry_username or ''}|{credential_host or ''}"
+
+
+def _digest_cache_file(cache_dir: str | Path, key: str) -> Path:
+    name = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    return Path(cache_dir) / _DIGEST_CACHE_DIRNAME / f"{name}.json"
+
+
+def _read_digest_cache(
+    cache_dir: str | Path,
+    image: str,
+    registry_username: str | None,
+    credential_host: str | None,
+    *,
+    scheme: str | None = None,
+    ttl: float | None = None,
+) -> str | None:
+    """The persisted digest for this lookup, or ``None`` (missing/stale/broken).
+
+    Never raises: a cache directory that cannot be read is a cold cache, not a
+    failed resolution.
+    """
+    if cache_dir is None:
+        return None
+    ttl = _manifest_ttl_s() if ttl is None else ttl
+    if ttl <= 0:
+        return None
+    key = _digest_cache_key(image, registry_username, credential_host, scheme)
+    try:
+        payload = json.loads(
+            _digest_cache_file(cache_dir, key).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("key") != key:
+        return None
+    try:
+        resolved_at = float(payload["resolved_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if time.time() - resolved_at > ttl:
+        return None
+    digest = payload.get("digest")
+    return digest if isinstance(digest, str) and digest else None
+
+
+def _write_digest_cache(
+    cache_dir: str | Path,
+    image: str,
+    registry_username: str | None,
+    credential_host: str | None,
+    digest: str,
+    *,
+    scheme: str | None = None,
+) -> None:
+    """Persist one resolution; best effort (a read-only cache is not fatal)."""
+    key = _digest_cache_key(image, registry_username, credential_host, scheme)
+    path = _digest_cache_file(cache_dir, key)
+    payload = {"key": key, "digest": digest, "resolved_at": time.time()}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.debug("could not persist the resolved digest for %s: %s", image, exc)
+
+
 def _platform_digest(
     image: str,
     *,
@@ -651,17 +738,31 @@ def _platform_digest(
     registry_password: str | None,
     scheme: str | None = None,
     credential_host: str | None = None,
+    cache_dir: str | Path | None = None,
 ) -> str:
     ttl = _manifest_ttl_s()
     # Credentials and scheme are part of the key: re-authenticating or
     # switching registry endpoint must not be answered from the old lookup.
-    key = f"{image}|{scheme or ''}|{registry_username or ''}|{credential_host or ''}"
+    key = _digest_cache_key(image, registry_username, credential_host, scheme)
     now = time.monotonic()
     if ttl > 0:
         with _DIGEST_CACHE_LOCK:
             hit = _DIGEST_CACHE.get(key)
             if hit and now - hit[0] <= ttl:
                 return hit[1]
+    if cache_dir is not None:
+        persisted = _read_digest_cache(
+            cache_dir,
+            image,
+            registry_username,
+            credential_host,
+            scheme=scheme,
+            ttl=ttl,
+        )
+        if persisted is not None:
+            with _DIGEST_CACHE_LOCK:
+                _DIGEST_CACHE[key] = (now, persisted)
+            return persisted
     _ref, client = _client_for(
         image,
         registry_username=registry_username,
@@ -673,6 +774,15 @@ def _platform_digest(
     if ttl > 0:
         with _DIGEST_CACHE_LOCK:
             _DIGEST_CACHE[key] = (now, digest)
+        if cache_dir is not None:
+            _write_digest_cache(
+                cache_dir,
+                image,
+                registry_username,
+                credential_host,
+                digest,
+                scheme=scheme,
+            )
     return digest
 
 
@@ -1022,6 +1132,13 @@ def _cache_usage(cache: Path) -> dict[str, Any]:
     staging: dict[str, tuple[int, float]] = {}
     incomplete: dict[str, tuple[int, float]] = {}
     for child in sorted(cache.iterdir()):
+        if child.name == _DIGEST_CACHE_DIRNAME:
+            # The persisted ref -> digest map (N54). Counted like a plain file
+            # and never a reclaim candidate: the leftover pass below removes
+            # *every* aged dot-prefixed child, which would quietly delete the
+            # very cache this mechanism exists to keep.
+            usage["files"] = int(usage["files"]) + _tree_bytes(child)
+            continue
         if child.name.startswith("."):
             # Staging tree, quarantine tree or the aside-written sidecar; the
             # resolver only ever creates dot-prefixed names for the first two
@@ -1671,6 +1788,7 @@ def peek_image_warm(
             registry_password=registry_password,
             scheme=scheme,
             credential_host=credential_host,
+            cache_dir=Path(cache_dir),
         )
         rootfs = _cache_rootfs(Path(cache_dir), image, digest)
         return {"cached": (rootfs / ".complete").is_file(), "digest": digest}
@@ -1706,6 +1824,17 @@ def resolve_image_rootfs(
     shared_rootfs = _shared_cache_rootfs(image, cache)
     if shared_rootfs is not None:
         return shared_rootfs
+    # A persisted digest (written by an earlier warm or resolve on this node) is
+    # enough to find an already-extracted rootfs -- and that is the whole point
+    # of persisting it: the manifest lookup below is only needed when the rootfs
+    # actually has to be built (N54).
+    cached_digest = _read_digest_cache(
+        cache, image, registry_username, credential_host, scheme=scheme
+    )
+    if cached_digest is not None:
+        rootfs = _cache_rootfs(cache, image, cached_digest)
+        if (rootfs / ".complete").is_file():
+            return rootfs
     _ref, client = _client_for(
         image,
         registry_username=registry_username,
@@ -1717,6 +1846,17 @@ def resolve_image_rootfs(
         manifest, digest = fetch_platform_manifest(client)
     except RegistryError as e:
         raise ImageResolutionError(f"failed to resolve image {image}: {e}") from e
+    # Persist what this resolve paid for: the next peek/resolve on this node
+    # reads it instead of asking the registry again.
+    if _manifest_ttl_s() > 0:
+        _write_digest_cache(
+            cache,
+            image,
+            registry_username,
+            credential_host,
+            digest,
+            scheme=scheme,
+        )
 
     rootfs = _cache_rootfs(cache, image, digest)
     marker = rootfs / ".complete"
