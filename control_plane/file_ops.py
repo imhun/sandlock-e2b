@@ -264,6 +264,16 @@ def spec_for(op: Any, *, caller: str = "worker") -> FileOpSpec:
         # Named, not ignored: a worker asking for the sweep's removal would
         # otherwise either succeed (an unreviewable privilege) or be told the
         # op does not exist (which would be a lie about this table).
+        if not spec.callers:
+            # An op with no caller surface at all (the create path's
+            # materialization: the control plane derives it for itself and
+            # instructs the agent directly). Saying "it is in the  set" would be
+            # a hole where the reason should be.
+            raise FileOpRefusal(
+                f"{spec.op} has no request surface: it is derived and sent by "
+                "the control plane itself, so no caller may ask for it",
+                status_code=400,
+            )
         raise FileOpRefusal(
             f"the {caller} surface may not ask for {spec.op} (it is in the "
             + ", ".join(sorted(spec.callers))

@@ -1421,7 +1421,13 @@ class SandboxRegistry:
         can still tell whether the record held one (a paused sandbox already
         released its node quota in E9.2 and must not release it twice).
         """
-        if self._quota_store is not None:
+        # The record store, not the quota store: this is the shared copy of the
+        # record. They are set together for a Redis deployment, but the
+        # injection seam (``record_store=``) can be used on its own -- and then
+        # a delete that only touched this process's cache would leave the
+        # record in the shared store, i.e. a sandbox that answers 204 and is
+        # still listed (the shape a two-replica control plane makes routine).
+        if self._record_store is not None:
             self._record_store.delete(record.sandbox_id)
         with self._lock:
             self._sandboxes.pop(record.sandbox_id, None)

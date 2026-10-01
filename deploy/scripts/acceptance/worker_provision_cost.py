@@ -4,13 +4,18 @@
 ``create_latency_probe.py`` 量的是**客户端看到的**建箱；这个量的是其中
 **worker 自己那一跳**，用来回答"优化该往哪边使劲"。做法是**幂等重放**：
 
-1. 先在**控制面 pod 里**用真 API 建一个沙箱（于是控制面有记录，worker 后面的
-   ``chown-workspace`` 才会被授权——worker 直连建箱那条路被"控制面是唯一裁决者"
-   挡着，见 docs/c3-privilege-relocation.md）；
+1. 先在**控制面 pod 里**用真 API 建一个沙箱（于是控制面有记录、worker 认得这个
+   id）；
 2. 把同一份 provisioning payload **直接打给 worker 的 agent 端口**并计时——
    worker 认得这个 id（``runtime_registry.get(id)`` 非空），走的是幂等重放路径，
-   所以量到的就是 worker 的 provisioning 本身；
+   **且这份 payload 不带 ``materialized``**（见下），所以它量到的正是
+   "worker 自己建树 + 经控制面中继改属主"那条最慢的老路；
 3. 用真 API 删掉，不留沙箱。
+
+⚠ 从控制面直送（v2）之后，正常建箱的 payload 会带 ``"materialized": true``，
+worker 那一跳里已经没有建树/拷贝/改属主——**这个探针量的不再是出厂建箱**，而是
+它的对照面（老路 / 降级路 / 迁移与 fork 那几条调用点）。要量真实建箱，看
+``create_latency_probe.py`` 与 ``E2B_CREATE_TRACE=1`` 的 ``materialize`` 段。
 
     # 灌进控制面 pod 跑（要有 python3，不需要 e2b SDK）
     kubectl -n sandlock exec -i <control-plane-pod> -c control-plane -- \

@@ -66,6 +66,37 @@ class _HeldMaterialize:
         return {"op": "materialize"}
 
 
+class _SharedRecordStore:
+    """The Redis shape in a dict: two replicas share it, and reads go through it.
+
+    ``SandboxRegistry``'s injection seam (``record_store=``) exists so a lane
+    with no Redis can still be the *shared-store* shape: ``get`` reads the store
+    rather than the process cache (so a delete by "another replica" is visible
+    immediately) and ``save`` writes through to it (so a create that went on
+    would visibly resurrect the record -- which is what makes this the faithful
+    reproduction of review C2, not an in-process approximation).
+    """
+
+    def __init__(self) -> None:
+        self.records: dict[str, dict] = {}
+
+    def get(self, sandbox_id: str):
+        return self.records.get(sandbox_id)
+
+    def put(self, sandbox_id: str, payload: dict, ttl=None) -> None:
+        self.records[sandbox_id] = dict(payload)
+
+    def delete(self, sandbox_id: str) -> None:
+        self.records.pop(sandbox_id, None)
+
+    def record_key(self, sandbox_id: str) -> str:
+        return f"e2b:sandbox:{sandbox_id}"
+
+    def keys(self) -> list[str]:
+        """The ids in the store (``SandboxRegistry.list`` walks these)."""
+        return list(self.records)
+
+
 def _settings(**overrides) -> ControlSettings:
     defaults = dict(
         api_keys=(API_KEY,),
@@ -300,19 +331,15 @@ async def test_a_delete_on_the_other_replica_does_not_resurrect_the_record(
     create therefore confirms, before it keeps a record, that the record in
     that store is still the one it made.
 
-    ⚠ **This one is not the pin.** Measured: it passes with
-    ``_record_is_still_ours`` stubbed to ``True``, so something *else* in the
-    flow already answers 409 for this shape -- the shared check is the second
-    line of defence here, not the first, and this test cannot tell whether it
-    works. The pin for the check itself is
-    ``test_the_shared_check_sees_a_record_someone_else_removed`` below; what
-    still has to be found and written is the integration shape in which the
-    create really would have resurrected the record (a registry whose ``save``
-    writes through to a shared store the way Redis does).
+    The store here is the *shared* shape (``record_store=``): reads go through
+    it and writes go through it, so with the shared check stubbed out this test
+    goes red with the record **back** -- which is the reproduction review C2
+    describes (a 204 for the client, and a sandbox that is still listed).
     """
     shape = _Cp(workspace)
     agent = _HeldMaterialize()
-    registry = SandboxRegistry(shape.settings)
+    store = _SharedRecordStore()
+    registry = SandboxRegistry(shape.settings, record_store=store)
     replica_a = _app(shape, agent=agent, registry=registry)
     replica_b = _app(shape, agent=agent, registry=registry)
     await _register(replica_a)
@@ -326,8 +353,15 @@ async def test_a_delete_on_the_other_replica_does_not_resurrect_the_record(
     agent.release.set()
     create_resp = await create
     assert create_resp.status_code == 409, create_resp.text
-    assert _register_record(replica_a) is None
-    assert _register_record(replica_b) is None
+    # The shared store is the authority in this shape, so that is where the
+    # absence has to be read from.
+    assert store.records == {}
+    try:
+        assert registry.get(SANDBOX) is not None
+    except UnknownSandboxError:
+        pass
+    else:  # pragma: no cover - the failure this test exists to catch
+        raise AssertionError("the record was resurrected after the delete")
     # ...and the runtime this create registered is taken down by the create
     # itself (review I6), not left for a sweep that only reclaims trees.
     assert worker_teardown == [(SANDBOX, False), (SANDBOX, True)]

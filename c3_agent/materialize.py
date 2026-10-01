@@ -1,11 +1,12 @@
-"""Face B's create-path materialization (design §4.3).
+"""Face B's create-path materialization (design v2 §4.2/§4.3).
 
 The create path's materialization -- make the tree, copy a snapshot into it,
 hand it to the sandbox's uid, and make the volume slices -- used to be the
 **worker's** work plus one relayed ``chown-workspace`` per create. It is now
-one signed plan (:mod:`gateway_common.create_grant`) that the worker carries
-straight to its own node's agent, so the control plane stops *relaying* while
-it keeps *deciding*.
+one instruction the **control plane** sends on the existing authenticated
+CP→agent channel (the same one ``chown``/``rm``/``walk`` use): the control plane
+stops *relaying* while it keeps *deciding*, and the worker is handed a ready
+tree.
 
 Two rules shape this module, and both are about what it may **not** do:
 
