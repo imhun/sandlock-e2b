@@ -35,36 +35,26 @@ from envd_service.runtime.registry import RuntimeRegistry
 from gateway_common import paths
 
 SANDBOX = "sbx_marker"
+SNAPSHOT = "snap_0123456789abcdef"
 KEY = "internal-key"
 
 
 class _MarkerClient:
-    """The worker's file-operation client, with a create that can be held open.
+    """The worker's file-operation client, for a create that is held open.
 
-    ``materialize`` blocks on an event so a test can observe the in-flight
-    window, and performs the one thing the create needs to be deletable: the
-    sandbox's tree exists. The removals mirror the real client's shape (one op
-    each) and are tolerant of an absent path, because "the tree is already
-    gone" is a normal state for the stale-marker case rather than the fault
-    ``_AgentStub`` in the file-op lane models.
+    The hold itself lives on the worker's own tree step (a slow
+    ``shutil.copytree``, installed by the test) -- the marker is written before
+    that step, so blocking it is exactly "a create is in flight". The removals
+    mirror the real client's shape (one op each) and are tolerant of an absent
+    path, because "the tree is already gone" is a normal state for the
+    stale-marker case rather than the fault ``_AgentStub`` in the file-op lane
+    models.
     """
 
     def __init__(self, *, workspace_base: Path, state_base: Path) -> None:
         self.calls: list[tuple[str, str]] = []
-        self.entered = threading.Event()
-        self.release = threading.Event()
         self._workspace_base = workspace_base
         self._state_base = state_base
-        self.hold = False
-
-    def materialize(self, sandbox_id: str, snapshot_id: str | None = None) -> dict:
-        self.calls.append(("materialize", sandbox_id))
-        tree = self._workspace_base / sandbox_id
-        (tree / "workspace").mkdir(parents=True, exist_ok=True)
-        if self.hold:
-            self.entered.set()
-            self.release.wait(timeout=10)
-        return {"materialized": {"tree": {"path": str(tree)}}}
 
     def chown_workspace(self, sandbox_id: str, *, recursive: bool = True) -> None:
         self.calls.append(("chown-workspace", sandbox_id))
@@ -81,7 +71,39 @@ class _MarkerClient:
         return None
 
 
-def _worker(workspace: Path, monkeypatch, *, hold: bool = False, wait_s: int = 60):
+class _Hold:
+    """A create that can be held open, on the worker's own copy step."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        # Bound *before* the patch goes in: ``agent_module.shutil`` is the
+        # module itself, so calling ``shutil.copytree`` from here after the
+        # patch is a call to this method (a recursion, learned the hard way).
+        self._real = shutil.copytree
+        self._gated = False
+
+    def copytree(self, *args, **kwargs):
+        """The real copy, with a gate in front of the outermost call.
+
+        ``*args`` because ``shutil.copytree`` re-enters itself per directory --
+        and it re-enters *this* function, since the patch is on the module.
+        Only the first (outermost) call waits.
+        """
+        if not self._gated:
+            self._gated = True
+            self.entered.set()
+            self.release.wait(timeout=10)
+        return self._real(*args, **kwargs)
+
+
+def _worker(
+    workspace: Path,
+    monkeypatch,
+    *,
+    hold: _Hold | None = None,
+    wait_s: int = 60,
+):
     # ``create_app`` resolves the shape and installs the singleton when the
     # transport is the agent one -- on the *module's* list object unless it is
     # isolated first. A leaked one makes later tests dial a control plane that
@@ -107,8 +129,11 @@ def _worker(workspace: Path, monkeypatch, *, hold: bool = False, wait_s: int = 6
         runtime_registry=RuntimeRegistry(workspace_base, state_base=state_base),
     )
     client = _MarkerClient(workspace_base=workspace_base, state_base=state_base)
-    client.hold = hold
     monkeypatch.setattr(agent_fileops, "_ACTIVE", [client])
+    if hold is not None:
+        monkeypatch.setattr(agent_module.shutil, "copytree", hold.copytree)
+        snapshot = workspace_base / "_snapshots" / SNAPSHOT / "fs"
+        (snapshot / "workspace").mkdir(parents=True, exist_ok=True)
     return app, settings, client
 
 
@@ -127,10 +152,14 @@ def _client(app):
 
 
 async def _create(app):
+    return await _create_with(app)
+
+
+async def _create_with(app, **extra):
     async with _client(app) as client:
         return await client.post(
             "/agent/sandboxes",
-            json={"sandboxID": SANDBOX},
+            json={"sandboxID": SANDBOX, **extra},
             headers={"X-Internal-Key": KEY},
         )
 
@@ -146,13 +175,16 @@ async def _delete(app):
 async def test_the_marker_exists_while_a_create_is_in_flight(
     workspace, monkeypatch
 ) -> None:
-    app, settings, client = _worker(workspace, monkeypatch, hold=True)
+    hold = _Hold()
+    app, settings, _client_ = _worker(workspace, monkeypatch, hold=hold)
 
-    create = asyncio.create_task(_create(app))
-    await asyncio.to_thread(client.entered.wait, 5)
+    create = asyncio.create_task(
+        _create_with(app, snapshotID=SNAPSHOT)
+    )
+    await asyncio.to_thread(hold.entered.wait, 5)
 
     assert _marker(settings).is_file() is True
-    client.release.set()
+    hold.release.set()
     resp = await create
     assert resp.status_code == 201
 
@@ -181,11 +213,12 @@ async def test_the_marker_is_gone_once_the_create_succeeded(
 async def test_a_delete_waits_for_the_in_flight_create_and_removes_nothing_twice(
     workspace, monkeypatch
 ) -> None:
-    app, settings, client = _worker(workspace, monkeypatch, hold=True)
+    hold = _Hold()
+    app, settings, client = _worker(workspace, monkeypatch, hold=hold)
     runtime_dir = Path(settings.state_base) / "_runtime" / SANDBOX
 
-    create = asyncio.create_task(_create(app))
-    await asyncio.to_thread(client.entered.wait, 5)
+    create = asyncio.create_task(_create_with(app, snapshotID=SNAPSHOT))
+    await asyncio.to_thread(hold.entered.wait, 5)
     delete = asyncio.create_task(_delete(app))
     # Let the delete reach its wait before the create is allowed to finish: if
     # it did not wait, it would tear the tree down *while* the create is still
@@ -193,7 +226,7 @@ async def test_a_delete_waits_for_the_in_flight_create_and_removes_nothing_twice
     await asyncio.sleep(0.2)
     assert delete.done() is False
 
-    client.release.set()
+    hold.release.set()
     assert (await create).status_code == 201
     assert (await delete).status_code == 204
 

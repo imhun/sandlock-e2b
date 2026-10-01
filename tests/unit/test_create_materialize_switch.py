@@ -1,55 +1,45 @@
-"""Task 5: the worker's create uses the agent's materialization, and degrades by name.
+"""Task 4: the worker is handed a ready tree, or builds one itself.
 
-``_agent_create_sandbox`` used to make the tree itself (``mkdir``, or a
-``copytree`` of the snapshot) and then ask the control plane to relay the
-ownership hand-over. It now asks the control plane for **one plan** and hands
-it to the node's own agent, which does mkdir + copy + chown in a single call
-(design §4.3/§4.4).
+The control plane now materializes the tree on the node's agent **before** it
+dials the worker (design v2 §4.1), so the create payload says so: one boolean,
+``materialized``. ``True`` means "the tree exists and is already handed over --
+skip both the ``mkdir``/``copytree`` and the ownership step"; anything else
+means today's behaviour, byte for byte.
 
-Two shapes have to keep working, and both are pinned here:
+That "anything else" is the whole rolling-upgrade story, and it is why there is
+no exception type, no retry and no warning here (v1 had all three):
 
-* an agent that takes a plan -- the worker does **no** local tree work at all,
-  which is the whole point of the change;
-* an agent that cannot (a rolling upgrade, or a deployment shape without one)
-  -- the original steps still run, one WARNING names the sandbox and the
-  reason, and nothing is skipped in silence.
+* a new control plane + an old worker: the old worker does not know the key and
+  builds the tree itself;
+* an old control plane + a new worker: no key, so the worker builds it itself.
+
+Both directions are the old path, and the old path is the one that already
+works. Nothing here can be "unsupported".
 """
 
 from __future__ import annotations
 
-import logging
+from pathlib import Path
 
 import httpx
 import pytest
 
 from envd_service import agent as agent_module
 from envd_service import agent_fileops
-from envd_service.agent_fileops import AgentMaterializeUnsupported
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
 
 SANDBOX = "sbx_materialize"
 SNAPSHOT = "snap_0123456789abcdef"
-UNSUPPORTED_REASON = (
-    "the agent at http://10.0.0.1:49986 has no /internal/grants/file-op "
-    "(HTTP 404)"
-)
+KEY = "internal-key"
 
 
-class _StubAgentFileOps:
-    """Stands in for the worker's agent client; records the one call."""
+class _RelayStub:
+    """The worker's file-operation client: records the relayed steps."""
 
-    def __init__(self, *, unsupported: bool = False) -> None:
-        self.calls: list[tuple[str, str | None]] = []
+    def __init__(self) -> None:
         self.relayed: list[tuple[str, str, bool]] = []
-        self._unsupported = unsupported
-
-    def materialize(self, sandbox_id: str, snapshot_id: str | None = None) -> dict:
-        self.calls.append((sandbox_id, snapshot_id))
-        if self._unsupported:
-            raise AgentMaterializeUnsupported(UNSUPPORTED_REASON)
-        return {"materialized": {"tree": {"path": f"/derived/{sandbox_id}"}}}
 
     def chown_workspace(self, sandbox_id: str, *, recursive: bool = True) -> None:
         self.relayed.append(("chown-workspace", sandbox_id, recursive))
@@ -58,159 +48,140 @@ class _StubAgentFileOps:
         return None
 
 
-@pytest.fixture()
-def install_client(monkeypatch):
-    """Install a stub as the worker's active file-operation client."""
+@pytest.fixture(autouse=True)
+def _isolate_singletons(monkeypatch):
+    """``create_app`` installs the agent-shaped client when the transport says so.
 
-    def _install(stub) -> _StubAgentFileOps:
-        monkeypatch.setattr(agent_fileops, "_ACTIVE", [stub])
-        return stub
+    Isolated first, or that client lands on the module's own list object and
+    every later test in the suite dials a control plane that does not exist
+    (the lesson this file's sibling lane records).
+    """
+    monkeypatch.setattr(agent_fileops, "_ACTIVE", [None])
 
-    return _install
 
-
-def _worker(workspace):
-    settings = EnvdSettings(executor="local", workspace_base=workspace)
+def _worker(workspace: Path, monkeypatch, *, relay=None):
+    monkeypatch.setenv("E2B_PRIV_HELPER_TRANSPORT", "agent")
+    monkeypatch.setenv("E2B_CONTROL_PLANE_URL", "http://control-plane:3000")
+    monkeypatch.setenv("E2B_NODE_ID", "e2b-worker-0")
+    monkeypatch.delenv("E2B_PER_SANDBOX_UID", raising=False)
+    workspace_base = workspace / "workspaces"
+    state_base = workspace / "state"
+    settings = EnvdSettings(
+        executor="local",
+        workspace_base=workspace_base,
+        state_base=state_base,
+        shared_volume_root=None,
+        internal_api_key=KEY,
+    )
     app = create_envd_app(
         settings=settings,
-        runtime_registry=RuntimeRegistry(workspace),
-        workspace_base=workspace,
+        runtime_registry=RuntimeRegistry(workspace_base, state_base=state_base),
+        workspace_base=workspace_base,
     )
-    return app, settings
+    stub = relay if relay is not None else _RelayStub()
+    monkeypatch.setattr(agent_fileops, "_ACTIVE", [stub])
+    return app, settings, stub
 
 
-async def _create(app, settings, payload: dict):
+async def _create(app, settings, **extra):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://worker"
     ) as client:
         return await client.post(
             "/agent/sandboxes",
-            json=payload,
-            headers={"X-Internal-Key": settings.internal_api_key},
+            json={"sandboxID": SANDBOX, **extra},
+            headers={"X-Internal-Key": KEY},
         )
 
 
+def _snapshot(workspace: Path) -> Path:
+    fs = workspace / "workspaces" / "_snapshots" / SNAPSHOT / "fs"
+    (fs / "workspace").mkdir(parents=True, exist_ok=True)
+    (fs / "workspace" / "kept.txt").write_text("kept\n", encoding="utf-8")
+    return fs
+
+
+def _spy_volume_pass(monkeypatch) -> list[bool]:
+    """Record what the volume pass is told about the slices."""
+    seen: list[bool] = []
+
+    def _spy(**kwargs):
+        seen.append(kwargs["slices_materialized"])
+        return [], []
+
+    monkeypatch.setattr(agent_module, "build_volume_mounts", _spy)
+    return seen
+
+
 @pytest.mark.asyncio
-async def test_a_supported_agent_materializes_once_and_skips_the_workers_own_copy(
-    workspace, monkeypatch, install_client
+async def test_a_materialized_create_skips_the_tree_and_the_handover(
+    workspace: Path, monkeypatch
 ) -> None:
     """The change's whole point: the worker stops touching the tree."""
+    relay = _RelayStub()
     copies: list[tuple] = []
     monkeypatch.setattr(
         agent_module.shutil, "copytree", lambda *args, **kwargs: copies.append(args)
     )
-    snapshot_fs = workspace / "_snapshots" / SNAPSHOT / "fs"
-    snapshot_fs.mkdir(parents=True)
-    (snapshot_fs / "payload.txt").write_text("from the snapshot\n", encoding="utf-8")
-    stub = install_client(_StubAgentFileOps())
-    app, settings = _worker(workspace)
+    slices = _spy_volume_pass(monkeypatch)
+    _snapshot(workspace)
+    app, settings, _ = _worker(workspace, monkeypatch, relay=relay)
 
-    resp = await _create(app, settings, {"sandboxID": SANDBOX, "snapshotID": SNAPSHOT})
+    resp = await _create(
+        app, settings, snapshotID=SNAPSHOT, materialized=True
+    )
 
     assert resp.status_code == 201
-    assert stub.calls == [(SANDBOX, SNAPSHOT)]
     assert copies == []
-    # The agent's plan already did the hand-over: no relayed ``chown-workspace``
-    # follows it (that relay is the 71 ms this change exists to remove).
-    assert stub.relayed == []
+    # The agent's chown is the hand-over: a relayed one on top of it would be
+    # the 71 ms round trip this change exists to remove.
+    assert relay.relayed == []
+    # ...and the volume pass is told the slices are already made.
+    assert slices == [True]
 
 
 @pytest.mark.asyncio
-async def test_an_unsupported_agent_falls_back_to_the_old_path_and_warns(
-    workspace, monkeypatch, install_client, caplog
+async def test_a_plain_create_still_builds_the_tree_and_hands_it_over(
+    workspace: Path, monkeypatch
 ) -> None:
-    """A rolling upgrade must not break creates -- and must not hide the fallback."""
+    """No flag (an older control plane, or a shape that materializes itself)."""
+    relay = _RelayStub()
     copies: list[tuple] = []
     monkeypatch.setattr(
-        agent_module.shutil,
-        "copytree",
-        lambda *args, **kwargs: copies.append(args),
+        agent_module.shutil, "copytree", lambda *args, **kwargs: copies.append(args)
     )
-    snapshot_fs = workspace / "_snapshots" / SNAPSHOT / "fs"
-    snapshot_fs.mkdir(parents=True)
-    (snapshot_fs / "payload.txt").write_text("from the snapshot\n", encoding="utf-8")
-    stub = install_client(_StubAgentFileOps(unsupported=True))
-    app, settings = _worker(workspace)
+    slices = _spy_volume_pass(monkeypatch)
+    fs = _snapshot(workspace)
+    app, settings, _ = _worker(workspace, monkeypatch, relay=relay)
 
-    with caplog.at_level(logging.WARNING, logger=agent_module.logger.name):
-        resp = await _create(
-            app, settings, {"sandboxID": SANDBOX, "snapshotID": SNAPSHOT}
-        )
+    resp = await _create(app, settings, snapshotID=SNAPSHOT)
 
     assert resp.status_code == 201
-    assert stub.calls == [(SANDBOX, SNAPSHOT)]
-    assert copies == [(snapshot_fs, workspace / SANDBOX)]
-    # The fallback is complete, not partial: the ownership hand-over still
-    # happens, through the control plane's relay.
-    assert stub.relayed == [("chown-workspace", SANDBOX, True)]
-    assert [
-        record.getMessage()
-        for record in caplog.records
-        if record.name == agent_module.logger.name
-    ] == [
-        f"agent materialization is unavailable for sandbox {SANDBOX} "
-        f"({UNSUPPORTED_REASON}): falling back to the control plane's relay "
-        "(the create still happens, it is just slower)"
-    ]
+    # Into the tree **root**: ``fs/`` carries the root's contents (the shape
+    # the agent's own materialization reproduces).
+    assert copies == [(fs, settings.workspace_base / SANDBOX)]
+    assert relay.relayed == [("chown-workspace", SANDBOX, True)]
+    assert slices == [False]
 
 
 @pytest.mark.asyncio
-async def test_without_an_agent_client_the_worker_still_makes_the_tree(
-    workspace, install_client
+@pytest.mark.parametrize("flag", [None, False, "yes", 1])
+async def test_an_unknown_flag_value_is_treated_as_absent(
+    workspace: Path, monkeypatch, flag
 ) -> None:
-    """The pre-C3 shape (no agent transport at all) is untouched."""
-    install_client(None)
-    app, settings = _worker(workspace)
+    """Only a literal ``True`` means "already materialized"."""
+    relay = _RelayStub()
+    copies: list[tuple] = []
+    monkeypatch.setattr(
+        agent_module.shutil, "copytree", lambda *args, **kwargs: copies.append(args)
+    )
+    slices = _spy_volume_pass(monkeypatch)
+    _snapshot(workspace)
+    app, settings, _ = _worker(workspace, monkeypatch, relay=relay)
 
-    resp = await _create(app, settings, {"sandboxID": SANDBOX})
+    resp = await _create(app, settings, snapshotID=SNAPSHOT, materialized=flag)
 
     assert resp.status_code == 201
-    assert (workspace / SANDBOX / "workspace").is_dir()
-
-
-@pytest.mark.asyncio
-async def test_the_materialized_path_tells_the_volume_pass_the_slices_are_ready(
-    workspace, monkeypatch, install_client
-) -> None:
-    """Volume slices travel in the same plan, so the volume pass must not redo them.
-
-    ``build_volume_mounts`` still runs -- it is what provisions each slice's
-    quota (a node-side probe) and what places the sandbox's mount view -- but
-    the ``mkdir``/``chmod`` and the relayed ``chown-volume-slice`` inside it are
-    the plan's job now.
-    """
-    seen: list[bool] = []
-
-    def _spy(**kwargs):
-        seen.append(kwargs["slices_materialized"])
-        return [], []
-
-    monkeypatch.setattr(agent_module, "build_volume_mounts", _spy)
-    install_client(_StubAgentFileOps())
-    app, settings = _worker(workspace)
-
-    resp = await _create(app, settings, {"sandboxID": SANDBOX})
-
-    assert resp.status_code == 201
-    assert seen == [True]
-
-
-@pytest.mark.asyncio
-async def test_the_degraded_path_lets_the_volume_pass_build_its_own_slices(
-    workspace, monkeypatch, install_client
-) -> None:
-    """No plan means nothing made the slices: the volume pass keeps doing it."""
-    seen: list[bool] = []
-
-    def _spy(**kwargs):
-        seen.append(kwargs["slices_materialized"])
-        return [], []
-
-    monkeypatch.setattr(agent_module, "build_volume_mounts", _spy)
-    install_client(_StubAgentFileOps(unsupported=True))
-    app, settings = _worker(workspace)
-
-    resp = await _create(app, settings, {"sandboxID": SANDBOX})
-
-    assert resp.status_code == 201
-    assert seen == [False]
+    assert len(copies) == 1
+    assert relay.relayed == [("chown-workspace", SANDBOX, True)]
+    assert slices == [False]
