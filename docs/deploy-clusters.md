@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.23（2026-10-01，沙箱第一档 syscall 加固 + clone3 命名空间位，当前版本 `0.1.0-824-gf2aec0b-20261001-073534`）**；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.24（2026-10-01，N53：worker 丢掉"控制面不认的"运行时记录 —— 404 风暴根因，当前版本 `0.1.0-834-g8272b6c-20261001-100321`）**；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1129,6 +1129,29 @@ profile 在承担**，换一个更宽 profile 的宿主就没了。修后由沙�
 拿到 `EFAULT`＝到达内核，`open_tree`/`fsopen` 才是 `EPERM`）。同一个文件在 k8s pod 上与
 本地 `--cap-drop ALL` 容器上对 `caps:` 条件的解析还不一致（`fsconfig` 一边到内核一边被拒），
 结论：mount API 不能指望外层 profile 兜底。
+
+### 7.24 N53：worker 丢掉"控制面不认的"运行时记录（**2026-10-01，已上线 `0.1.0-834-g8272b6c-20261001-100321`**）
+
+提交 `8272b6c`。用户报的现象是"预热后建箱的时间花在哪"，量到一半先撞上这个：
+
+**现象（上线前实测）**：worker-0 在 120 s 内对控制面打了 **598 次** `POST /internal/nodes/e2b-worker-0/file-op` → **404**（worker-1 47 次），连续数小时；worker 日志被
+`WARNING envd_service.runtime.registry: cannot measure sbx_… through the agent: … (HTTP 404)` 淹没 —— 官方日志文件只有 10 MiB，**这次启动的日志行被挤出了容器日志**（`kubectl logs` 的第一行就是风暴行）。
+控制面侧 `GET /sandboxes` = **0**、`workspaces/` 下 **0 棵树**、`state/_runtime/` 61 个历史目录（只有 3 个还带 `sandbox.json`）⇒ 这些 id **只活在 worker 的内存里**。
+
+**根因两层**：① `AgentFileOpsError` 把「控制面 404 = 没这个沙箱」与「控制面不可达/超时」归成同一种错误，调用方唯一能做的就是重试 —— 而 404 是**确定**答案（硬规则 1/3：这个 id 上任何操作都不会再被授权）；② worker 的运行时记录是对该树的"声明"，声明一旦控制面不认，每一轮磁盘计量都会去 walk 一个不存在的沙箱（每 ~2 s 一轮）。
+
+**修法（TDD：先红后绿）**：新增 `AgentFileOpsUnknownSandbox`（`AgentFileOpsError` 子类，HTTP 404 时抛，消息逐字不变 ⇒ 现有 catch 全部照旧）；`RuntimeRegistry.disk_usage_snapshot` 捕获它 → 一条具名 WARNING + `unregister()`（丢掉声明，树留给控制面的 orphan-tree GC），传输类错误保持原样（可重试、记录保留）。
+
+**集群验收（`0.1.0-834`）**
+
+| 判据 | 上线前 | 上线后 |
+|---|---|---|
+| 整队 file-op 404 | worker-0 **598 次 / 120 s** | **0 次 / 60 s**（控制面侧整段没有任何 file-op 调用） |
+| `cannot measure … 404` 日志 | 每 ~2 s 一轮，淹没日志 | **0 行 / 60 s**（worker 启动行重新可见） |
+| 新行为：孤儿记录被丢弃 | —— | 复现：TTL 箱（`timeout=60`）过期 → 控制面先删记录（worker 拆除 500、树与 `sandbox.json` 残留）→ 用残留记录里的 token 直连 worker envd `GET /envs` 触发 `registry.get()` 复活记录 → **90 s 内出现** `the control plane has no record of sbx_2215b701f1215acf: dropping this worker's runtime record (AgentFileOpsUnknownSandbox: …)`，该 id 随后的 file-op 404 = **0**（修前是每 2 s 一次、永不停止） |
+| 仓库侧 | —— | `tests/unit` **2090 passed**；失败名单 = 基线 3 条（macOS 的 dlopen 与两条 xfs_quotactl）**+ 2 条与本次无关**的 `test_docs_only_point_at_repo_artifacts`（来自尚未入库的 `docs/security-audit/findings-k0s-2026-10-01.md` 里引用的一批 tmp/ 探针名） |
+
+**顺带点名、未修的上游缺口**（写进 N53 行，带触发）：TTL 到期时控制面**先**删自己的记录、**再**让 worker 拆除（`control_plane/registry/ttl.py`：`remove_expired()` → `on_expired`），于是 worker 的 `remove-workspace` 被自己的控制面以 404 拒绝，留下孤儿树 + `_runtime/<id>/sandbox.json`；后者仍可被后续 `get()` 复活 —— 本节修好的是"复活之后不再形成风暴"，不是"不再复活"。
 
 ## 8. 改部署的入口
 
