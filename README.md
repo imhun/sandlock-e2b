@@ -7,20 +7,24 @@ notification）在自己机器的 Linux 内核上跑用户代码 —— 不需�
 - **兼容面**：`Sandbox.create/connect/kill`、`commands.run` + PTY/stdin、文件 API、
   `health`、`metrics`、`logs`、Volume、Secret、`pause/resume`、`fork/snapshot`、
   network 策略（`allowOut`/`denyOut`/`rules`/`egressProxy`）、模板本地构建、MCP 网关。
+- **隔离模型**：每个沙箱一个 **userns（身份翻译）+ pidns（看不见宿主）+ netns（只有 loopback，
+  出口由 supervisor 代连）**，外面再套 Landlock 文件白名单与 seccomp 过滤器 —— 见
+  [§2](#2-隔离边界三种命名空间)。worker 自己零特权。
 - **不支持的 API 一律返回官方 Error JSON（501）**，不返回假成功。
 - 详细协议口径见 [spec.md](spec.md)；当前实现与 spec 的两处事实性偏差见文末。
 
 ## 目录
 
 1. [架构](#1-架构)
-2. [仓库结构](#2-仓库结构)
-3. [快速开始](#3-快速开始)
-4. [核心概念](#4-核心概念)
-5. [配置](#5-配置)
-6. [测试与验收](#6-测试与验收)
-7. [构建与发布](#7-构建与发布)
-8. [文档索引](#8-文档索引)
-9. [已知边界](#9-已知边界)
+2. [隔离边界：三种命名空间](#2-隔离边界三种命名空间)
+3. [仓库结构](#3-仓库结构)
+4. [快速开始](#4-快速开始)
+5. [核心概念](#5-核心概念)
+6. [配置](#6-配置)
+7. [测试与验收](#7-测试与验收)
+8. [构建与发布](#8-构建与发布)
+9. [文档索引](#9-文档索引)
+10. [已知边界](#10-已知边界)
 
 ## 1. 架构
 
@@ -67,7 +71,101 @@ e2b SDK（本仓库验证版本：Python 2.46.0 / JS 2.46.1）
 - **worker ↔ agent 不存在**：worker 只会拨控制面，控制面才会拨 agent。`envd_service/**`
   里不许出现 agent 的地址/端口/令牌（有单元测试钉住）。
 
-## 2. 仓库结构
+## 2. 隔离边界：三种命名空间
+
+沙箱不是一个容器、也不是一台 VM —— 它是**一个带 userns / pidns / netns 的进程**，
+外面再套两层过滤器（Landlock 文件系统白名单 + seccomp 过滤器）。内核负责隔离，
+平台只决定"谁在什么时候建哪个命名空间、谁有权写哪张映射"。
+
+| 命名空间 | 开关 | 谁创建 | 买到什么 |
+|---|---|---|---|
+| **userns** | 形态自带（`E2B_PER_SANDBOX_UID`） | route B 槽位的子进程自己 `unshare(CLONE_NEWUSER)` | 身份翻译：**箱内 uid 0 ↔ 宿主侧沙箱池 uid** |
+| **pidns** | `E2B_PID_NS`（部署清单全开，代码默认 `false`） | fork 的**中间进程**（先 userns，再 pidns） | 箱内看不见宿主与其他沙箱的 pid |
+| **netns** | `E2B_ENABLE_NET_ISOLATION` + `E2B_FD_INJECT_CONNECT`（**必须成对**） | fork | 箱内只有 `lo`；出口由 supervisor 代连 |
+
+### 2.1 userns：身份翻译，不是隔离
+
+每个沙箱一个用户命名空间，映射**只有一条**：箱内 `uid 0` ↔ 宿主侧**这个沙箱自己的池 uid**
+（fork 的 F18 自映射）。于是：
+
+- 箱内 `id -u` = `0`（官方 SDK 与用户代码都期望的"沙箱内是 root"）；
+- 它在宿主上写出的每个文件都属于那个池 uid，**不是** worker、更不是 root；
+- worker（uid 65534）只是那棵树的**属组**（`0770`），这就是它的数据面权限。
+
+**谁写映射是这套设计的核心。** 非 root 进程不允许把任意宿主 uid 映射进命名空间
+（内核只让映射"自己"），所以：
+
+1. worker fork 一个子进程，子进程自己 `unshare(CLONE_NEWUSER)` 并向控制面报
+   `{sandbox_id, pid}` —— 它**不知道也不需要知道** uid；
+2. 控制面按自己记录里的 `sandbox → host_uid` 查出 uid，指令**本节点 agent** 写
+   `uid_map`/`gid_map`（[envd_service/slot_identity.py](envd_service/slot_identity.py)）；
+3. 子进程轮询 `setresuid(X)` 直到成功，再 exec `sandlock-supervise`。
+
+这也是为什么 route B 的槽位身份只能是 `agent-grant`：worker 自己既没有 `CAP_SETUID`，
+也不该拥有"给一个进程安上任意身份"的能力。补充组在 `as_uid` 写 gid 映射时被
+`setgroups=deny` 关掉，所以槽位进程保留的是 worker 的补充组（与旧路径一致）。
+
+### 2.2 pidns：看不见别人，也看不见宿主
+
+`E2B_PID_NS=1` 时沙箱是自己 PID 命名空间的 1 号进程：
+
+- 宿主与其他沙箱的进程在箱内**不可见**；沙箱的 `ps` 只有自己；
+- 判据是 `kill(<worker 的 pid>, 0)`：共享 pid ns 时它返回 **EPERM**（存在性 oracle ——
+  能用来探到 worker 与别的沙箱活着），自有 pid ns 时返回 **ESRCH**；
+- pid 1 会承担孤儿进程的 reaper 职责。
+
+**实现约束**：非特权 `CLONE_NEWPID` 必须先有自己的 userns，所以 fork 会在**中间进程**里
+先建 userns 再建 pid ns。这也是 2026-09-16 那个缺陷的位置：中间进程一开始只认"特权 remap"
+和"自身身份"两种映射，route-B 箱在 pid_ns 下会掉回宿主槽位 uid（`id -u` = 21000），
+修法是让它按与 `confine_child` 同一套三选一挑映射（fork `5b16855`）。
+
+**代价**：pid_ns 打开后 fork 要拦 stat 族（`newfstatat`/`statx`/`faccessat`/`readlinkat`…）。
+部署形态（模板 rootfs + chroot 中介）里这些调用**本来就已经过 supervisor**，实测增量
+≤ 2 µs/次；只有"没有任何路径中介"的裸形态才看得见真实单价（+80~90 µs/次）。
+口径与实测表：[docs/production-deployment-requirements.md §2.4.10](docs/production-deployment-requirements.md)。
+
+### 2.3 netns：只留 loopback，出口由 supervisor 代做
+
+`E2B_ENABLE_NET_ISOLATION=1` + `E2B_FD_INJECT_CONNECT=1`（**两个必须一起给**）时，
+每个沙箱在自己的网络命名空间里起来，里面只有 `lo`：
+
+- **出站**：沙箱的 `connect()` 被 supervisor 接住，由 supervisor 在宿主侧建连，再把
+  **已连接的 fd 注入**到沙箱自己的 socket fd 上 —— 被接住的 `connect()` 返回 0，
+  CPython 的 socket 语义不变（不是靠 on-behalf 重写）。`allowOut`/`denyOut`/`rules`/
+  `egressProxy`/SSRF 护栏都在这一步判定。
+- **成对是硬要求**：只开 `E2B_ENABLE_NET_ISOLATION` 会让沙箱变成 loopback-only，
+  故障表现为"网络超时"而不是报错，所以 `create_app` 启动期直接拒绝（
+  `NET_ISOLATION_PAIRING_ERROR`）；确实想要不能出网的沙箱要显式声明
+  `E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY=1`。
+- **入站**：netns 里外部拨不进来，需要端口映射（`net_bind_inject`：把沙箱的 `bind()`
+  换成 supervisor 在宿主 loopback 上建的 socket），端口带 `61000–65535`（4536 个，
+  内部 MCP 网关用它，远大于单节点沙箱上限）。
+- **DNS / 通配域名**：每沙箱的 loopback DNS 网关（`127.0.1.x:53`）把通配子域解析成合成 IP，
+  再由 supervisor 代连并做二次校验。因为它 bind 在**沙箱自己的 netns** 里
+  （root-in-userns 自带 `CAP_NET_BIND_SERVICE`），清单里不再需要
+  `ip_unprivileged_port_start=0` 那种"低端口窗口"（k8s 2026-09-17 / compose 2026-09-16 撤掉）。
+- **代价**：短连接建立 p50 0.034 → 0.291 ms（约 8.5×，长连接/连接池无感）；
+  非阻塞 `connect_ex()` 直接返回 0（共享 netns 下是 `EINPROGRESS`）。
+  逐项实测见 [docs/production-deployment-requirements.md §2.4.6](docs/production-deployment-requirements.md)。
+- `E2B_ENABLE_NETNS` 是更早的 veth-pool 形态遗留旋钮，**默认关且对现在的形态不生效**；
+  worker 启动时那套 veth 池 NAT（[envd_service/netns.py](envd_service/netns.py)）只在旧形态下才需要。
+
+### 2.4 另外两层边界（不是命名空间）
+
+- **Landlock**：文件系统访问白名单（`fs_writable` / `fs_mount` 落到策略里），
+  这是"沙箱只能碰自己的树"的第一道；
+- **seccomp**：worker 与沙箱各自一份过滤器。worker 必须真的跑在我们发的 profile 下
+  （`E2B_REQUIRE_SECCOMP_FILTER` 会在启动时拒绝"没有过滤器"的容器），
+  因为沙箱是从 worker 继承 syscall 面的；
+- 另外，开启 `E2B_REAL_ROOT`（N35）时 fork 还会建一个沙箱自己的 **mount namespace**，
+  在 `pivot_root` 进去之后**丢掉 `CAP_SYS_ADMIN`**，让内核自己去解析 `#!` 脚本与静态二进制
+  （[docs/chroot-workspace-exec.md](docs/chroot-workspace-exec.md)）。
+
+一句话：**userns 管"我是谁"、pidns 管"我看得见谁"、netns 管"我能连谁"，
+Landlock/seccomp 管"我能碰什么、我能调什么"。** 四者叠加才是这个沙箱的边界；
+它们都由同一份部署清单显式声明，且每一项都有回退开关。
+
+## 3. 仓库结构
 
 | 目录 | 内容 |
 |---|---|
@@ -79,13 +177,13 @@ e2b SDK（本仓库验证版本：Python 2.46.0 / JS 2.46.1）
 | `gateway_common/` | 控制面与 worker 共享的小工具：env、错误码、ID、keepalive、网络策略、路径、上传 |
 | `deploy/` | Dockerfile（`docker/`）、k8s 清单（`k8s/`）、k0s overlay 与 apply/upgrade（`k8s-k0s/`）、生产 compose 栈（`stack/`）、示例 compose（`compose/`）、脚本（`scripts/`） |
 | `tests/` | `unit/`（161 个文件）、`contract/`（65 个）、`sdk/{python,js}`、`security/`、`perf/` |
-| `docs/` | 设计与运维文档（索引见 [§8](#8-文档索引)）；`docs/reports/` 是历史任务报告 |
+| `docs/` | 设计与运维文档（索引见 [§9](#9-文档索引)）；`docs/reports/` 是历史任务报告 |
 | `third_party/sandlock` | sandlock 的 fork 子模块（构建 wheel 的源） |
 | `wheels/fork/` | 构建产物（**不入库**），由 `deploy/scripts/build-sandlock-wheels.sh` 生成 |
 
-## 3. 快速开始
+## 4. 快速开始
 
-### 3.1 本地开发（macOS，Local 执行器）
+### 4.1 本地开发（macOS，Local 执行器）
 
 ```bash
 python3 -m venv tmp/venv
@@ -114,7 +212,7 @@ macOS 上只能跑 Local 执行器（Landlock/seccomp 是 Linux 特性）：协�
 **隔离能力必须换 Linux**。合并形态下 `E2B_API_URL` 与 `E2B_SANDBOX_URL` 可以指向同一个端口
 （见下一条）。
 
-### 3.2 容器形态（compose）
+### 4.2 容器形态（compose）
 
 ```bash
 cp deploy/compose/.env.example deploy/compose/.env      # 改密钥/端口/仓库
@@ -132,7 +230,7 @@ python deploy/scripts/multinode_smoke.py      # 跨节点分布 + 命令/文件/
 python deploy/scripts/deployment_smoke.py     # 追加：跨 worker 迁移、共享卷隔离、模板构建→registry→worker
 ```
 
-### 3.3 生产（k0s 集群）
+### 4.3 生产（k0s 集群）
 
 本仓库的目标集群是**自建 k0s**（2 节点全 arm64，namespace `sandlock`）。
 `deploy/scripts/open-cluster-tunnel.sh` 会建通道并自检集群身份：
@@ -149,7 +247,7 @@ deploy/k8s-k0s/apply.sh                                             # 渲染 + a
 先跑上面的自检。集群身份、入口、上节点方式、现状与历次上线记录都在
 [docs/deploy-clusters.md](docs/deploy-clusters.md)。
 
-## 4. 核心概念
+## 5. 核心概念
 
 **模板与镜像缓存.** `E2B_BASE_IMAGE` + `E2B_TEMPLATE_IMAGES` 决定模板的 rootfs；模板配置了镜像后，
 envd 用 Docker daemon 导出 rootfs 到 `E2B_IMAGE_CACHE_DIR`（缓存目录名带镜像 digest，
@@ -160,7 +258,7 @@ slim 镜像没有 `bash` 而官方 SDK 固定发 `/bin/bash`，执行器会自�
 工作区是 `0770 owner=<沙箱 uid> group=<worker gid>`：沙箱是属主，worker 靠属组做数据面
 （文件 API、watcher、命令日志、快照、生命周期）。沙箱不是 worker 的同组进程，跨沙箱隔离
 仍是内核 DAC。沙箱的路径中介（`sandlock-supervise`）由 route B 的槽位承载，槽位身份由
-agent 授予（`E2B_SLOT_IDENTITY=agent-grant`，唯一取值）。
+agent 授予（`E2B_SLOT_IDENTITY=agent-grant`，唯一取值）—— 身份翻译与命名空间的完整口径见 §2.1。
 
 **暂停/恢复与检查点.** `pause` 冻结进程树（SIGSTOP/SIGCONT，不是内存快照）；
 `pause(checkpoint=true)` 走控制面的 checkpoint 服务，把镜像打到平台状态目录，
@@ -186,7 +284,7 @@ on-behalf 隧道，代理不可达即 ECONNREFUSED，绝不回退直连）、`ma
 通配域名经每沙箱 loopback DNS 网关解析为合成 IP 再由 supervisor 代连 + SSRF 二次校验。
 需要 worker 设 `E2B_ENABLE_NETWORK=true`。
 
-## 5. 配置
+## 6. 配置
 
 最常用的一小撮（全量速查见 [docs/env-vars.md](docs/env-vars.md)，权威口径是各组件的
 `config.py` 与 [spec.md](spec.md) §7.2）：
@@ -206,7 +304,7 @@ on-behalf 隧道，代理不可达即 ECONNREFUSED，绝不回退直连）、`ma
 | `E2B_IMAGE_REGISTRY`(+`_USERNAME`/`_PASSWORD`) | 模板镜像 push/pull 的仓库（不配则单机 OCI tar 形态） |
 | `E2B_MAX_TOTAL_*` / `E2B_NODE_*` | 全局与节点级准入上限 |
 
-## 6. 测试与验收
+## 7. 测试与验收
 
 | 层 | 命令 | 环境 |
 |---|---|---|
@@ -234,7 +332,7 @@ macOS 宿主只看**容器运行时 VM 的内核**：`python3 -c "import sandloc
 其实是环境/流程"的那些坑（镜像没重建、默认 seccomp 拦 `unshare`、缺 `CAP_SYS_PTRACE`、
 冷缓存 428、引号地狱等）。
 
-## 7. 构建与发布
+## 8. 构建与发布
 
 ```bash
 ./deploy/scripts/build-sandlock-wheels.sh     # 先出 wheels/fork/*.whl（不入库）
@@ -250,7 +348,7 @@ deploy/k8s-k0s/apply.sh                       # 渲染 + apply + 等滚动 + 预
   详见 [docs/k8s-deployment.md](docs/k8s-deployment.md) 与 [deploy/k8s-k0s/README.md](deploy/k8s-k0s/README.md)。
 - 每次上线的版本、读数与当时的形态判定记录在 [docs/deploy-clusters.md](docs/deploy-clusters.md) §7。
 
-## 8. 文档索引
+## 9. 文档索引
 
 **入口与现状**
 
@@ -278,7 +376,7 @@ deploy/k8s-k0s/apply.sh                       # 渲染 + apply + 等滚动 + 预
 - [docs/reports/](docs/reports) —— 各任务的验收报告；[docs/HANDOFF.md](docs/HANDOFF.md) 与
   [docs/c2-ownership-frontload.md](docs/c2-ownership-frontload.md) 是历史/未实施的记录
 
-## 9. 已知边界
+## 10. 已知边界
 
 - **Linux only**：Landlock/seccomp 是 Linux 内核特性，macOS 上只能跑 Local 执行器（协议兼容性）；
   验收环境看容器 VM 的内核（Landlock ABI ≥ 6，即内核 6.12+）。
