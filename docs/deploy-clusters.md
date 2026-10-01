@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.25（2026-10-01，N54：镜像 digest 解析结果落盘缓存 —— 建箱 p50 0.66 s → 0.23 s，当前版本 `0.1.0-839-g4271c45-20261001-112409`）**；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，当前版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1221,6 +1221,69 @@ kubectl -n sandlock exec -i <worker-pod> -- python3 - \
 
 **两条边界**：缓存过 `E2B_IMAGE_MANIFEST_TTL_S` 仍会重解析（tag 挪动能自我失效，这是有意的）；
 `.digests/` 是纯缓存，删掉只多花一次解析，不会缺镜像。
+
+### 7.26 建箱再往下抠：三处白付往返 + 一个能在线量的阶段开关（**2026-10-01，已上线 `0.1.0-841-g0d7dc76-20261001-131547`**）
+
+提交 `0d7dc76`。§7.25 把建箱从 0.66 s 拉到 0.23 s 之后，问题是"还能不能继续"——先量，再改。
+
+**先切分**（幂等重放：控制面先真建一个沙箱拿到授权，再把同一份 payload 直打 worker 的 agent 口）：
+`POST /agent/sandboxes` 那一跳 **p50 203 ms / 整条 235 ms ≈ 85%**，控制面自己（准入、选节点、
+registry 落 Redis、peek、派发）只占十几毫秒。**所以优化面全在 worker 那一段**。
+
+**改掉的三处"白付"**（都不动语义）：
+
+1. `uid_pool.commit()`：控制面分配 uid 的出厂形态（`claim`）**根本不写 reservation marker**，
+   可旧代码仍先读一次 `_recorded_uid` 再删一次不存在的 marker —— 每次建箱白付一次 NFS 读 +
+   一次空 unlink。现在先看 marker 在不在，不在就直接返回；marker 存在时的行为逐字不变
+   （包括"记录不在盘上 ⇒ 保留 marker"的 fail-safe）。
+2. `AgentFileOps`：file-op **每次调用新建一个 `httpx.Client`**（新 TCP + 解析 `control-plane`
+   这个 Service 名）。同一时期实测：什么都不做的 `walk-workspace` 要 **27 ms**，而真走树的
+   `chown` 是 49 ms。改成每个 worker 一个常驻客户端（带锁，随 lifespan 关闭）。
+3. 控制面 `_provision_remote`：同样每次建箱 new 一个 `AsyncClient`。改用 `app.state.remote_http`。
+
+**新增的测量开关**：`E2B_CREATE_TRACE=1`（`gateway_common/create_trace.py`）——每次建箱按
+`provision` / `prime` / `record` / `commit` / `fileop:*` 各打一行 INFO，**不用重启就能用
+`kubectl set env statefulset/e2b-worker` 打开**（`_disk_trace` 的同款做法）。
+
+**集群验收（`0.1.0-841`）**
+
+| 判据 | 读数 |
+|---|---|
+| 建箱、控制面 pod 内发起（n=10） | **p50 191 ms**（p95 224）—— 改前同口径 **228 ms** |
+| 建箱里 worker 那一跳（幂等重放，n=6） | p50 **198 ms** ⇒ 剩下的时间几乎全在 worker |
+| 逐段（`E2B_CREATE_TRACE=1`，n=7） | `provision` **173 ms**（其中 `fileop:chown-workspace` **71 ms**、`record` **48 ms**，其余 ~54 ms 是两次 mkdir + 记录查找 + uid 认领 + 响应）、`prime` **17 ms** |
+| `commit` 段 | 两个 worker 上 **0 行** —— marker 优先的短路生效（出厂形态下它本来就是空操作） |
+| 未回归 | `DRY_RUN=1 apply.sh \| kubectl diff -f -` **0 行**；`MULTI-NODE`/`DEPLOYMENT` 冒烟见 §8 入口；10 个 pod 全 Running |
+| 不留残留 | `GET /sandboxes` = 0、两 worker `_runtime`/`workspaces` = 0（探针每轮自建自删） |
+| 仓库侧 | `tests/unit` **2115 passed / 8 failed** —— 8 条与改动前基线逐条相同（3 条 `test_disk_scan_offload` 来自尚未提交的 SEC-K0S-006、2 条 docs pin 来自未跟踪的 `docs/security-audit/…`、3 条 macOS/xfs 固有） |
+
+**量过但没做的**（省下两次白改）：`xfs_project_supported` 每次建箱只 **0.34 ms**（本地读
+`/proc/mounts`，出厂 `quota_via_agent=false`），缓存它没有收益；`resolve_image_rootfs` 命中
+缓存 **0.2 ms**、`create_executor` **0.3 ms** —— 也就是说 §7.25 里记在"预热运行时上下文"上的
+那笔账是错的，真正的 `prime` 是 17 ms（含 `SandboxRuntimeContext` 自己的构造）。
+
+**复跑**：
+
+```bash
+# ① 建箱延迟（控制面内 / 本机经隧道）
+kubectl -n sandlock exec -i <cp-pod> -c control-plane -- python3 - --base http://127.0.0.1:3000 \
+    --key "$E2B_API_KEY" --n 10 < deploy/scripts/acceptance/create_latency_probe.py
+# ② worker 那一跳占多少（幂等重放）
+kubectl -n sandlock exec -i <cp-pod> -c control-plane -- python3 - "$E2B_API_KEY" "$E2B_INTERNAL_API_KEY" \
+    < deploy/scripts/acceptance/worker_provision_cost.py
+# ③ worker 内部的逐段（开着 trace 跑一次 ①，再回来关掉）
+kubectl -n sandlock set env statefulset/e2b-worker E2B_CREATE_TRACE=1
+kubectl -n sandlock logs e2b-worker-0 --since=2m | grep "create trace:"
+kubectl -n sandlock set env statefulset/e2b-worker E2B_CREATE_TRACE-
+```
+
+**剩下的两块（要动设计，本轮没碰）**：`fileop:chown-workspace` **71 ms** 是 worker→控制面→
+agent→控制面→worker 一整圈（其中约 27-30 ms 是那一圈的固定开销，其余是 agent 在 NAS 上递归
+`lchown`）；`record` **48 ms** 是一次 mkdir + 一次带 fsync 的原子写。前者的省法（让 worker 拿
+一次性授权直连本节点 agent、或把"建树 + 改属主"合成一次 agent 操作）会动 **agent-grant 那条
+授权边界**；后者的省法（把落盘挪到响应之后或与 chown 并行）会动**"记录先于响应落盘"这条
+durability 约定**，且"建完立刻 kill"是常用姿势 —— 并行的写有可能在拆除之后落地，正是 N53 清理
+过的那类残留。两者都要先有设计再动手。
 
 ## 8. 改部署的入口
 

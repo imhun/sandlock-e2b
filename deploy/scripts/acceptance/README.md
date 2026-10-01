@@ -44,6 +44,7 @@
 | `cluster_run.py` | N37 cluster run: one command writing N files, on the deployed fleet. | —（头部无 Usage 行；见脚本 `--help`） |
 | `cpu_activity_acceptance.py` | Cluster acceptance for E9.1 blind spot 2: a CPU-only sandbox is not idle. | —（头部无 Usage 行；见脚本 `--help`） |
 | `create_latency_probe.py` | 建箱延迟（API 边界，纯标准库）：本机跑量"平台 + 网络"，灌进控制面 pod 跑量"只有平台"；预热那一行就是解析/解包基础镜像的代价（N54 用它验落盘 digest 缓存）。 | `python deploy/scripts/acceptance/create_latency_probe.py --base http://<入口>:3000 --key "$E2B_API_KEY" --n 10`（in-cluster 见脚本头部） |
+| `worker_provision_cost.py` | 建箱里 worker 那一跳单独多贵（幂等重放，灌进控制面 pod 跑）：先真建一个沙箱拿到授权，再把同一份 payload 直打 worker 的 agent 口计时 —— 用来切分"控制面 vs worker"，再配合 `E2B_CREATE_TRACE=1` 拆 worker 内部。 | `kubectl -n sandlock exec -i <control-plane-pod> -c control-plane -- python3 - "$E2B_API_KEY" "$E2B_INTERNAL_API_KEY" < deploy/scripts/acceptance/worker_provision_cost.py` |
 | `f11_direct_exec_probe.py` | Control experiment: pure-shape exec over the direct executor, low fd table. | —（头部无 Usage 行；见脚本 `--help`） |
 | `f11_fdcount_probe.py` | Does the standalone probe's stdout loss depend on the client's fd layout? | —（头部无 Usage 行；见脚本 `--help`） |
 | `f11_fup3_probe.py` | F11 E2B rerun probe: gateway+command boxed quota on the F11 tip wheel. | —（头部无 Usage 行；见脚本 `--help`） |
