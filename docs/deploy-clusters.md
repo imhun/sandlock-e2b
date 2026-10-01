@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，当前版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**当前版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，当前版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1352,6 +1352,89 @@ kubectl -n sandlock exec -i <cp-pod> -c control-plane -- python3 - "http://<agen
 kubectl -n sandlock set env statefulset/e2b-worker E2B_CREATE_TRACE=1
 kubectl -n sandlock logs e2b-worker-0 --since=5m | grep "create trace:"
 kubectl -n sandlock set env statefulset/e2b-worker E2B_CREATE_TRACE-
+```
+
+### 7.28 两跳并发（(b)）+ 一次把建箱全打没的回归（**2026-10-01，已上线 `0.1.0-877-ge15b77f-20261001-231822`**）
+
+提交 `af687cf`（(b) 实现）+ `befa910`，上线的是 `e15b77f`。规范
+`docs/superpowers/specs/2026-10-01-create-path-grant-design-v2.md`（§4.6 并发预算），
+计划 `docs/superpowers/plans/2026-10-01-create-path-grant-finish.md`（Task B 定形状、Task C 实现、
+Task E 上线）。
+
+**改了什么**：建箱从"先材料化、再拨 worker"的**串行**改成两跳**并发**。控制面同时发出
+agent 的 `materialize` 与 worker 的 `phase: "prepare"`，两条腿都回来之后再发一条
+`phase: "finalize"`。worker 那半拆成三相：
+
+| 相 | 内容 | 为什么在这相 |
+|---|---|---|
+| `prepare` | `.creating` 标记、uid 认领、`statfs` 记账种子 | 全都**不需要树**，所以能和材料化同时开始 |
+| `finalize` | 建树（仅未材料化时）、卷配额 + 挂载视图、树的项目配额、属主收口、`register` | 树依赖的部分只能等 |
+| `cancel` | 还 uid、删记账种子、摘标记 | 材料化失败/超时/内容被拒时的撤销；**已注册的沙箱绝不碰** |
+
+收口信号由 Task B 的实测定：**控制面补一条指令**（0.75 ms）而不是 agent 写完成标记
+（写 12.9 ms + worker 首次命中 6.8 ms，还会在沙箱树里留文件）。契约不变 —— 仍是同步：
+材料化失败或超时 ⇒ 建箱失败，且 worker 那一半在返回之前被收干净（超时是**具名 504**）。
+降级路（不带 `materialized`：旧 CP、迁移、fork）逐字不变，走同一次"prepare 然后 finalize"。
+
+**集群验收（`0.1.0-877`）**
+
+| 判据 | 读数 |
+|---|---|
+| 建箱、控制面 pod 内发起（n=10，三轮） | p50 **127 / 128 / 130 ms**（p95 171 / 139 / 147，mean 133 / 131 / 134）—— §7.27 同口径 **193–195 ms**、§7.26 基线 **191 ms** ⇒ **省下约 65 ms（约三分之一）** |
+| 同一时刻从本机**经入口**发起（n=10） | p50 **154 ms**（p95 161）—— 比控制面内多出约 25 ms，就是"客户端到入口"那一段（§7.27 时代同口径 330 ms，即减掉当时的平台时间 0.19 s 也是约 0.1 s；入口那一段本身这轮没动） |
+| 逐段（`E2B_CREATE_TRACE=1`，按沙箱归属） | `prepare` **72–74 ms**（与 agent 的 `materialize` 同时跑，所以不叠在关键路径上）、`finalize` **7.8–8.4 ms**、`prime` **5.3–5.8 ms**、`record` **47–49 ms**（延迟落盘，不在响应路径） |
+| 建箱路径上的 `fileop:*` | **0 行**。20 分钟窗口里 `fileop:chown-workspace` **0 行**（§7.26 记的那 71 ms 那一条彻底不在建箱路径上）；窗口里其余的 `fileop:*` 是别的阶段：`remove-workspace`/`remove-runtime` 各 13 行（= 13 次 DELETE），`walk-workspace` 637 行（每个沙箱每 10–15 s 一次的盘上用量记账，`AgentFileOps.walk_workspace`，与建箱无关） |
+| 快照建箱（与 plain 分开报，Task B 的告示） | `deploy/scripts/acceptance/snapshot_create_probe.py`：**1 个文件 p50 215 ms（n=3）**、**40 个文件 p50 1247 ms（n=2）** ⇒ **≈26 ms/条目**，与 Task B 的 25 ms/条目吻合。**两跳并发动不了它**：省下的约 78 ms 摊在 1.2 s（40 文件）上是 6%，摊在 Task B 的 202 条目 5.2 s 上是 1.5% |
+| 快照落点（生产形状，v1 的坑） | 快照里 `workspace/kept.txt` ⇒ 新箱读到 `'kept\n'`；`workspace/workspace/kept.txt` ⇒ **`FileNotFoundException`**（v1 曾把内容多下沉一层） |
+| 冒烟 | `MULTI-NODE SMOKE OK`（4 箱 **2+2**、命令/文件/health/stdin、kill 后两边预约归零）；`DEPLOYMENT SMOKE OK`（命令+文件、**跨节点迁移保文件**、网络配置、远端卷+兄弟卷隔离、模板构建→registry push→worker pull→rootfs、MCP 网关） |
+| 未回归 / 无残留 | `DRY_RUN=1 apply.sh \| kubectl diff -f -` **0 行**（除服务端自增的 `generation`）；9 个 pod 全 Running；`GET /sandboxes` = `[]`；两 worker 的 `workspaces/` 只剩 `_migrate`/`_snapshots`、`state/_runtime/` 只剩 `.checkpoints` |
+| 仓库侧 | `tests/unit` **3 failed / 2194 passed / 12 skipped** —— 3 条与基线逐条相同（macOS 固有，见 §7.9 起的口径）。⚠ 跑之前要 `env -u all_proxy -u http_proxy -u https_proxy`：带着代理变量会多出 53 条 httpx 连接类假失败 |
+
+**⚠ 这一次上线中间出过一次全站故障，记在这里免得重演。** 第一版上线的是 `0.1.0-876-gbefa910`，
+它带着 C2 的记录比对（`_record_is_still_ours`）：**每一次建箱都返回 409**
+`{"message": "Sandbox sbx_… was deleted while it was being created"}`，一条沙箱也建不出来。
+根因是这个比对拿内存里的 `started_at`（微秒）去比从共享存储读回来的那条 —— 而
+`to_storage_dict` 是用 `to_iso_z` 写的、**只到毫秒**，所以除了正好落在整毫秒的 1/1000，
+比较**恒为 False**（实测 200 次里 0 次精确往返）。**当场回滚到 `0.1.0-864` 恢复服务**，
+修在 `e15b77f`（改比"存储看得见的身份"：`to_iso_z(started_at)` + `envd_access_token`），
+再上线成 `0.1.0-877`。
+
+**为什么单测没抓住**：`tests/unit/test_cp_create_delete_window.py` 里**每一条期待建箱成功的用例**
+都把 registry 建在**没有 `record_store`** 的形状上 —— 那种形状下 `get` 把 create 自己那个对象
+原样还回来，截断根本不发生；唯一用共享存储的那条用例断言的是 **409**，而坏代码恰好也
+给 409。补的两条钉子（`test_the_shared_check_compares_the_stores_encoding_not_this_process_memory`、
+`test_a_plain_create_survives_a_store_that_encodes_the_record`）在还原成旧比较时都会红，
+已逐条验过。**教训**：一个"从存储读回来再比对"的检查，必须至少有一条走**会编码的**存储的用例。
+
+**§4.3.1 四条硬要求各自由谁承接**（快路/降级路共用同一份材料化实现）：
+
+| 要求 | 用例 |
+|---|---|
+| 源侧不解引用符号链接 | `test_a_symlink_in_the_snapshot_is_recreated_not_followed` |
+| 目标侧具名拒绝 | `test_a_symlinked_destination_segment_is_refused_named` |
+| 半棵树不报成功 | `test_a_partial_copy_is_reported_as_failure` |
+| 迁移保文件 | `deployment_smoke.py` 的 "migrated … files kept"（本次实跑已过） |
+
+另有本轮新增/改动的钉子：两跳并发的四条（`test_the_worker_starts_while_the_tree_is_still_being_made`、
+`test_a_failed_materialization_fails_the_create_and_undoes_the_worker`、
+`test_a_slow_materialization_is_bounded_and_named`、`test_a_plain_create_still_takes_the_old_path`）、
+C2 的跨副本（`test_a_delete_on_the_other_replica_does_not_resurrect_the_record` + 上面两条）、
+既有树里每个目录都到 0770（`test_a_leftover_directory_is_given_the_tree_mode`）。
+
+**复跑**：
+
+```bash
+# ① 建箱延迟（控制面内；三轮）
+kubectl -n sandlock exec -i <cp-pod> -c control-plane -- python3 - --base http://127.0.0.1:3000 \
+    --key "$E2B_API_KEY" --n 10 < deploy/scripts/acceptance/create_latency_probe.py
+# ② 逐段（开着 trace 跑一次 ①，再关掉；看的是 create 自己的相：prepare/finalize/prime/record）
+kubectl -n sandlock set env statefulset/e2b-worker E2B_CREATE_TRACE=1
+kubectl -n sandlock logs e2b-worker-0 --since=5m | grep "create trace:" | sort | uniq -c
+kubectl -n sandlock set env statefulset/e2b-worker E2B_CREATE_TRACE-
+# ③ 快照建箱（单独报；--files 放大拷贝那一段）
+E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000 \
+    E2B_API_KEY="$E2B_API_KEY" tmp/venv/bin/python \
+    deploy/scripts/acceptance/snapshot_create_probe.py --n 3 --files 1
 ```
 
 ## 8. 改部署的入口
