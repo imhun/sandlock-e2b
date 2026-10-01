@@ -5,8 +5,10 @@
 `fileop:chown-workspace` 占 **71 ms**（worker→CP→agent→CP→worker 一整圈）、`record` 占 **47 ms**。
 用户裁定：①worker 拿一次性授权直连本节点 agent；②把"建树+改属主"合成一次 agent 操作；
 ③记录带"建箱成功"含义的标记、拆除等建箱完成（防残留）；范围**只覆盖建箱期的临时操作**，
-即 `create-tree` 与 `chown-volume-slice` 两种；④**凭据只要够维持到 worker 向 agent 发起请求**，
-不需要等到建箱成功。
+即建树/拷贝/改属主与卷切片这一类**材料化**操作（授权里就是一条 `materialize-tree`，
+里面逐条列出这次要做的事）；④**凭据只要够维持到 worker 向 agent 发起请求**，
+不需要等到建箱成功；⑤**拷贝也由 agent 做**（"让 agent 自己拷贝最直接"，2026-10-01，
+它的代价与硬要求见 §4.3.1）。
 
 > **④ 是这一版改掉前一版的地方**：前一版把授权"随建箱 payload 一次下发"（载体 A），
 > 那样它的过期时间必须覆盖 **mint → 最后一次使用**之间的整段空档；而这段空档在建箱里
@@ -31,8 +33,8 @@
 
 ## 2. 目标与非目标
 
-**目标**：建箱期这两类特权文件操作不再由控制面**转发并等待执行**——控制面只签发一张
-单次授权，worker 拿它直连本节点 agent 执行；"建树+改属主"合成一次 agent 操作；
+**目标**：建箱期的**材料化**（建树、快照拷贝、改属主、卷切片）不再由控制面**转发并等待执行**
+——控制面只签发一张单次授权，worker 拿它直连本节点 agent，由 agent **一次做完**；
 并把记录写移出响应路径而**不**引入残留。
 
 **非目标（明说）**：
@@ -63,34 +65,38 @@
 
 ## 4. 设计
 
-### 4.1 授权 = 一次操作一张，用时现铸
+### 4.1 授权 = 一次"建箱材料化"计划，用时现铸
 
-worker 需要特权文件操作时，先向控制面**领一张**，再拿它直连 agent：
+worker 要材料化这次建箱的树与卷时，先向控制面**领一张计划**，再拿它直连 agent：
 
 ```
-worker ──① 领权 POST /internal/nodes/{node}/file-grant──▶ CP
-worker ◀──② {agent_url, grant} ──────────────────────────── CP
-worker ──③ POST {agent_url}/internal/grants/file-op {grant} ▶ agent(maint) ──▶ e2b-maint
+worker ──① 领权 POST /internal/nodes/{node}/file-grant ─────────▶ CP
+worker ◀──② {agent_url, grant} ─────────────────────────────────── CP
+worker ──③ POST {agent_url}/internal/grants/file-op {grant} ▶ 面 B ──▶ e2b-maint
 ```
 
-- **①的 body 与今天的 `file-op` 一字不差**：`{sandbox_id, op, ...params}`（`path`/`uid`
-  仍由控制面从自己的记录推导，§14.4 不破）。
-- **②的授权载荷**（单操作，逐字列出控制面推导出的路径与身份）：
+- **①的 body 只有 `{op: "materialize-tree", sandbox_id, snapshot_id?}`** —— 路径、uid
+  一律由控制面从自己的记录推导（§14.4 硬规则二不破）。
+- **②的授权载荷**（一条 op，里面逐条列出这次要做的每一件事）：
 
 ```json
 {
   "v": 1,
   "host": "<agent 自己的身份 = 该节点名>",
   "sandbox_id": "sbx_…",
-  "op": "create-tree",
-  "path": "<ws>/sbx_…", "subdir": "workspace",
-  "uid": 10000, "gid": 65534, "recursive": true,
-  "worker_uid": 65534, "worker_gid": 65534,
+  "op": "materialize-tree",
+  "tree": {
+    "path": "<ws>/sbx_…", "subdir": "workspace", "mode": "0770",
+    "uid": 10000, "gid": 65534,
+    "copy_from": "<ws>/_snapshots/<snap>/fs"
+  },
+  "slices": [{"volume": "data", "path": "<控制面推导>", "uid": 10000, "gid": 65534}],
   "jti": "<16 hex>", "iat": 1790832000, "exp": 1790832010
 }
 ```
 
   线格式：`base64url(payload) + "." + base64url(HMAC-SHA256(E2B_C3_AGENT_TOKEN, payload))`。
+  （`copy_from` 只在快照建箱时出现；`slices` 由记录的卷挂载列表推导。）
 - **③的 agent 地址由控制面解析**（与今天 `node_file_op` 里做的是同一次解析），
   worker 不自己寻址，也不缓存。
 
@@ -105,7 +111,8 @@ body 只有 `{grant}` —— 路径、uid、op 一律从授权里读，**agent �
 2. **host**：`payload.host` == 本 agent 自己的节点身份（D12）；
 3. **过期**（含上限）：`iat <= now <= exp`，且 `exp - iat <= 60 s`（§5）；
 4. **单次消费**：`jti` 用过即废，再拿来具名拒绝（`grant already used`）；
-5. **操作在允许集合内**：只有 `create-tree` 与 `chown-volume-slice` 两个 verb；
+5. **操作在允许集合内**：只有 `materialize-tree` 一个 verb（建树/拷贝/改属主/卷切片都在它里面，
+   逐条按授权里签好的条目做，多一条都不认）；
 6. **路径复核**：照旧 `realpath` + agent 自己的四根白名单 —— 与 CP 中转那条路径
    **同一段代码**，两道校验不互相替代。
 
@@ -115,35 +122,63 @@ body 只有 `{grant}` —— 路径、uid、op 一律从授权里读，**agent �
 > 拿到 `grant already used`。规则写死：**worker 重新领一张再试一次**（领权就是把 ① 再走一遍），
 > 绝不重放旧授权。两种操作都是幂等的，所以"重试一次"是安全的。
 
-### 4.3 合成操作 `create-tree`
+### 4.3 合成操作 `materialize-tree`：agent 建树 + 拷贝 + 改属主
 
-`c3_agent/priv/maint.c` 新增一个 verb：
+**用户裁定：拷贝也由 agent 做**（协议上最直接 —— 一条 op 做完，中间没有握手，
+worker 不再自己建树/拷贝/建卷切片）。`c3_agent/priv/maint.c` 新增一个 verb：
 
 ```
-e2b-maint create-tree --uid U --gid G --path <root> [--subdir workspace] [--mode 0770]
+e2b-maint materialize-tree --uid U --gid G --path <root> [--subdir workspace] [--mode 0770]
+                           [--copy-from <snapshot fs>] [--slice <path>]...
 ```
 
-语义：`mkdir -p <root>/<subdir>`（父目录按需创建），然后**一次 FTS 遍历**把整棵树 `lchown`
-成 U:G。它**不做任何路径推导**（路径是授权里签好的），失败按 `maint.c` 既有纪律：
-非零退出、带 stderr 具名失败。
+一次调用把四件事做完：① `mkdir -p <root>/<subdir>`（mode 0770，group = worker gid）；
+② 有 `--copy-from` 就递归拷贝（**不跟随符号链接**，源侧沿用本文件既有的 `FTS_PHYSICAL` 纪律）；
+③ 每条 `--slice` 建好；④ 一次 FTS 遍历把上述所有树 `lchown` 成 U:G。
+它**不做任何路径推导**（路径是授权里签好的），失败按 `maint.c` 既有纪律：非零退出、带 stderr 具名失败。
 
-> **顺序上的一处诚实说明**：带快照的建箱里，树必须先存在（worker 往里 `copytree`）、
-> 改属主必须在拷贝**之后**（否则拷进去的文件仍属于 worker 身份）。所以 `create-tree`
-> 覆盖的是"建树 + 空树改属主"这一段；拷完之后的属主仍由一次 `chown-volume-slice`/`chown`
-> 收尾 —— 两次都是**用时现铸**的短命授权，这正是本方案不需要长 TTL 的原因。
+于是 worker 的建箱路径不再碰树：领权 → 一条 op → 记录 → 响应。
 
-### 4.4 worker 侧收口：只改 `AgentFileOps` 一处
+#### 4.3.1 这是本设计最需要小心的一处（威胁模型变了）
 
-worker 的特权文件操作已经收口在 `envd_service/agent_fileops.py::AgentFileOps.request()`。
-它从"把 `{op,...}` POST 给控制面并等结果"改成：
+把递归拷贝从**无特权的 worker**（65534）搬进**root + `CHOWN,DAC_OVERRIDE,FOWNER` 的面 B**，
+搬的不是新特权（面 B 本来就是 uid 0 的 Python 服务，`maint` 容器实测
+`runAsUser=0` + 那三条 cap），而是**一条新的、吃租户输入的特权代码路径**：
 
-1. 向控制面**领权**（同一个 body）；
-2. 拿 `{agent_url, grant}` 直连 agent；
-3. 若 agent 说 `grant already used` ⇒ 重新领一张、重试一次；
-4. 若 agent **没有这条路由**（旧 agent，滚动升级中）⇒ **具名告警 + 退回今天的中转路径**
-   （控制面那条路是实时授权、更严不会更松；这不是静默跳过，步骤照样执行）。
+- 今天 `shutil.copytree(symlinks=True, dirs_exist_ok=True)` 跑在 worker 里，
+  就算被快照里的符号链接骗到，它能写的地方也就限于自己那些树；
+- 同一个洞在面 B 里就是 **root 级逃逸**；
+- 而且拷贝比 chown/rm **多一侧**：**目标侧**。`dirs_exist_ok` 的合并语义是有用的
+  （迁移/重建同一个 id 要保留既有文件 —— §6 的"跨节点迁移保文件"就是它），
+  但目标树里可能有**上一个化身留下的、沙箱自己能改的**东西：一个指向 `/etc` 的符号链接，
+  就足以把写操作引到根目录之外。
 
-调用方（建树、装卷）的签名与顺序**一个字不改**。
+所以这个 op 的硬要求（每条都要有用例，见 §6）：
+
+1. **源侧**：不跟随符号链接（`FTS_PHYSICAL` + 用 `symlink()` 重建，不是解引用后拷贝）；
+2. **目标侧**：合并写入时逐段 `O_NOFOLLOW`（或 `openat2(RESOLVE_BENEATH)`）打开；
+   目标是符号链接就**具名拒绝**，绝不顺着写；
+3. **失败具名**：拷到一半失败不得报成功，半棵树必须能被识别并交给孤儿路径；
+4. **不许丢既有性质**：跨节点迁移"文件还在"这条不能被这次改动破坏。
+
+### 4.4 worker 侧收口：`AgentFileOps` 上多一个 `materialize()`
+
+worker 的特权文件操作已经收口在 `envd_service/agent_fileops.py`。新增一个方法：
+
+```python
+client.materialize(sandbox_id, snapshot_id=None)   # 领权 → 直连面 B → 返回材料化结果
+```
+
+1. 向控制面**领权**（`{op:"materialize-tree", sandbox_id, snapshot_id}`）；
+2. 拿 `{agent_url, grant}` 直连面 B；
+3. 若面 B 说 `grant already used` ⇒ 重新领一张、重试一次；
+4. 若面 B **没有这条路由**（旧 agent，滚动升级中）⇒ **具名告警 + 退回今天的老路**
+   （worker 自己 mkdir/copytree + 经控制面中转 chown）：控制面那条路是实时授权、
+   更严不会更松，且**不是静默跳过** —— 步骤照样执行，只是慢。
+
+`_agent_create_sandbox` 里那三段（`workspace_dir.mkdir` / 快照 `copytree` /
+`build_volume_mounts` 的切片创建）随之消失，改成这一次调用；其余（uid 认领、
+`runtime_registry.register`、记录、建箱标记）**不动**。
 
 ### 4.5 记录先落"建箱中"标记，拆除等它
 
@@ -182,8 +217,10 @@ worker 先把树拆了，建箱随后继续写记录 / 写盘统计 ⇒ 留下�
 
 | 判据 | 怎么测 | 期望 |
 |---|---|---|
-| 建箱延迟 | `deploy/scripts/acceptance/create_latency_probe.py`（控制面内，n=10） | 191 ms → **P1 后 ~155 ms** → **P2 后 ~115 ms** |
-| 逐段 | `E2B_CREATE_TRACE=1` + `worker_provision_cost.py` | `fileop:*` 段从 71 ms 降到 ~50 ms；`record` 段离开响应路径 |
+| 建箱延迟 | `deploy/scripts/acceptance/create_latency_probe.py`（控制面内，n=10） | 191 ms → **P1 后 ~145–150 ms** → **P2 后 ~110–115 ms** |
+| 逐段 | `E2B_CREATE_TRACE=1` + `worker_provision_cost.py` | `fileop:*` 段整段消失（worker 不再建树/拷贝/改属主），只剩一次 `materialize`；`record` 段离开响应路径 |
+| **符号链接不得逃逸**（新） | 源侧：快照里放一个指向外部的符号链接 ⇒ 必须被**重建为符号链接**，不得解引用；目标侧：目标树里预置一个指向 `/etc` 的符号链接 ⇒ 必须**具名拒绝**，不得写穿 | 两条用例都绿，且拒绝时不留半棵树 |
+| **迁移保文件**（既有性质） | `deployment_smoke.py` 的"跨节点迁移保文件" | 仍绿（合并语义没被新 op 破坏） |
 | 授权负面 | 新用例：错签名 / 过期 / 超上限 / 换 host / 计划外 op / 重放 / 换 sandbox | **全部具名拒绝**，且不触达 `maint` |
 | 重试 | agent 已执行但响应丢失（注入） | worker 重新领权重试一次后成功；旧授权再拿来被拒 |
 | 竞态（P2） | 建箱中途发 DELETE：树与记录都不残留；带标记的记录**永不**被当活沙箱 | 0 残留 |
@@ -201,7 +238,7 @@ worker 先把树拆了，建箱随后继续写记录 / 写盘统计 ⇒ 留下�
 
 ### 7.2 "worker 一开头就发 op、agent 等文件就绪再改" —— 实测更慢，否掉
 
-这个变体的形状是：worker 在建箱**一开始**就把 `create-tree` 发给 agent，agent
+这个变体的形状是：worker 在建箱**一开始**就把这条 op 发给 agent，agent
 建好空树后**挂着等**一个"就绪"信号（然后一次 FTS 改属主），worker 在这期间完成
 `copytree` / 装卷，再写就绪信号，最后 join。直觉上它应该更快：尾段没有往返了。
 
@@ -222,19 +259,15 @@ worker 先把树拆了，建箱随后继续写记录 / 写盘统计 ⇒ 留下�
 > 这条实测也是整轮优化的注脚：**NFS 元数据往返 10–40 ms，集群内 HTTP 1–2 ms**。
 > 建箱的每一次"少一次落盘/多一次直连"都值十几毫秒，方向只有这一个。
 
-### 7.3 两个真能"尾段零往返"的变体（都没做，留给以后量）
+### 7.3 让 agent 自己拷贝 —— **已选定**（原为备选，用户 2026-10-01 裁定）
 
-如果以后要把尾段那一次领权（1.29 ms + 控制面自身 1–5 ms）也拿掉，有两条**不花 NFS** 的路：
+选定后 §4.3/§4.4 按它改写：worker 不再建树/拷贝/建卷切片，一条 op 做完，
+**中间没有任何握手**，也就没有 §7.2 那笔 NFS 开销。代价与硬要求见 §4.3.1。
 
-1. **把就绪信号放进那条已有的 HTTP 连接**：worker 用**分块请求体**发这条 op —— 先送 JSON 头，
-   `copytree` 完成后**结束 body**；agent 读到 EOF 就是"文件就绪"，随即一次 FTS 改属主。
-   信号零 NFS 成本，但要在两侧引入流式语义（请求体 = 就绪信号），并且这条 op 得占一条独立连接。
-2. **让 agent 自己拷贝**：一个 op 里做完 `mkdir + copytree + chown`，中间没有握手。
-   代价是把递归拷贝搬进特权组件（`maint.c` 加 C 递归拷贝，或给特权容器开一条 Python 路径），
-   实测收益比本方案再省 ~10–15 ms。
-
-两条都**没有**本轮的收益大（P1+P2 是 ~75 ms），且各自引入一层新协议或新职责，
-所以本轮不做；等 P1/P2 上线后拿 `create_latency_probe.py` 的复测结果再决定。
+剩下的唯一"再快一点"的变体（**本轮不做**）：把领权那一次控制面往返
+（1.29 ms + 控制面自身 1–5 ms）也省掉 —— 把就绪/参数放进那条已有的 HTTP 连接
+（分块请求体，EOF = 参数结束）。收益只有几毫秒，且要在两侧引入流式语义，
+不值得，留作记录。
 
 ## 8. 回退
 
