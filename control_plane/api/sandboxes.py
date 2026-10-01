@@ -16,6 +16,11 @@ from typing import Any, NamedTuple
 from fastapi import APIRouter, Depends, Query, Request, Response
 
 from control_plane.api.errors import OfficialError
+from control_plane import file_ops
+# The compose lane's identity anchor for the agent to confirm (D21/D25). One
+# implementation, shared with the relayed file ops -- a second copy could only
+# drift from the rule the agent's own gate is written against.
+from control_plane.api.internal import _worker_identity_anchor
 from control_plane.auth import (
     _require_owned,
     _require_related,
@@ -1255,6 +1260,19 @@ async def _create_sandbox_attempt(
                 request, record, snapshot, volume_mounts, settings
             )
         else:
+            # v2 §4.1: the tree is materialized **here**, by the node's agent,
+            # before the worker is told anything -- so the worker is handed a
+            # ready tree instead of building one and then asking the control
+            # plane to relay the ownership hand-over. A refusal is a create
+            # that did not happen, and the rollback below is the same one every
+            # other provisioning failure takes.
+            await _materialize_remote(
+                request,
+                record,
+                node,
+                settings,
+                snapshot,
+            )
             await _provision_remote(
                 request,
                 record,
@@ -1263,6 +1281,7 @@ async def _create_sandbox_attempt(
                 snapshot,
                 volume_mounts,
                 snapshot_id=snapshot.snapshot_id if snapshot else None,
+                materialized=True,
             )
         record.append_log("sandbox created")
         registry.save(record)
@@ -1398,8 +1417,80 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
         pool.commit(record.sandbox_id)
 
 
+async def _materialize_remote(request, record, node, settings, snapshot) -> None:
+    """Materialize one create's tree on its node, through that node's agent.
+
+    The whole point of doing it *here* rather than in the worker (design v2):
+    the control plane already holds the create and the record -- the node, the
+    host uid, the volume mounts -- so the derivation needs nothing the worker
+    could tell it, and the worker (which is not allowed to run privileged file
+    steps) never has to reach an agent at all.
+
+    Two shapes do **not** send an instruction, and both are correct rather than
+    degraded:
+
+    * a node with no agent client configured (an embedder, ``local://``);
+    * a node whose worker identity this control plane never verified -- without
+      it there is no gid for ``maint.c``'s gate, so the worker's own path (which
+      refuses the same way, by name) is the only one that can run.
+
+    Everything else fails the create: an agent that refuses the materialization
+    means the tree does not exist, and ``create_sandbox``'s rollback drops the
+    record (which also returns the host uid to the pool).
+    """
+    client = getattr(request.app.state, "c3_agent_client", None)
+    if client is None:
+        return
+    worker_gid = getattr(node, "worker_gid", None)
+    worker_uid = getattr(node, "worker_uid", None)
+    if worker_uid is None or worker_gid is None:
+        # The same named refusal the relayed file ops give: no verified worker
+        # identity means no instruction that acts as that worker.
+        logger.warning(
+            "node %s has reported no worker identity (workerUID/workerGID): "
+            "the worker will materialize sandbox %s itself",
+            node.node_id,
+            record.sandbox_id,
+        )
+        return
+    state = request.app.state
+    paths = file_ops.control_paths(state, settings)
+    plan = file_ops.derive_materialize(
+        record,
+        paths=paths,
+        node_id=node.node_id,
+        worker_gid=int(worker_gid),
+        snapshot_id=snapshot.snapshot_id if snapshot else None,
+    )
+    try:
+        await client.materialize(
+            node_id=node.node_id,
+            sandbox_id=record.sandbox_id,
+            tree=plan["tree"],
+            slices=plan["slices"],
+            worker_uid=int(worker_uid),
+            worker_gid=int(worker_gid),
+            # One rule, one implementation (D20's lesson): the same anchor the
+            # relayed file ops carry, from the same function.
+            worker_container_id=_worker_identity_anchor(
+                request, node, node.node_id
+            ),
+        )
+    except AgentClientError as exc:
+        raise OfficialError(exc.status_code, str(exc)) from exc
+    except file_ops.FileOpRefusal as exc:
+        raise OfficialError(exc.status_code, str(exc)) from exc
+
+
 async def _provision_remote(
-    request, record, node, settings, snapshot, volume_mounts, snapshot_id=None
+    request,
+    record,
+    node,
+    settings,
+    snapshot,
+    volume_mounts,
+    snapshot_id=None,
+    materialized=False,
 ) -> None:
     """Provision the sandbox on a remote worker through its agent API."""
     import httpx
@@ -1440,6 +1531,11 @@ async def _provision_remote(
         "iamTokens": record.iam_tokens,
         "snapshotTar": None,
         "snapshotID": snapshot_id,
+        # v2 §4.4: the worker is handed a tree the agent already made and
+        # handed over, so it skips both. Absent means "build it yourself" --
+        # which is what an older control plane says, and what this key makes
+        # the rolling-upgrade matrix free.
+        "materialized": bool(materialized),
     }
     internal_key = settings.internal_api_key
     # The client is the app's shared one (``app.state.remote_http``): building

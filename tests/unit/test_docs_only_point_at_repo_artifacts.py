@@ -317,6 +317,11 @@ BARE_NAME_ALLOWANCES = {
         "tests/unit/test_agent_materialize.py：两个建箱计划都在叙述这次改名，"
         "不是在让人去跑它（`git rm` 那条命令执行过后就不再存在）"
     ),
+    "test_file_grant_endpoint.py": (
+        "载体 B（2026-10-01）的 /file-grant 端点用例，随该端点一起被删"
+        "（载体 C 由控制面直接送指令，不再有票据端点）：两份建箱计划都在叙述"
+        "这次删除，不是在让人去跑它"
+    ),
 }
 
 #: The k0s white-box audit docs list their one-off probes as an *index* (a table

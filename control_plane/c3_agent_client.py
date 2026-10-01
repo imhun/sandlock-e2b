@@ -62,6 +62,12 @@ DEFAULT_AGENT_PORT = 49985
 #: names the face-B service outright instead (``E2B_C3_AGENT_MAINT_URL``).
 DEFAULT_AGENT_MAINT_PORT = 49986
 
+#: The create path's one-call materialization (design v2 §4.2). It rides face
+#: B -- the agent's privileged executor -- but it is **not** a file op: it is
+#: long (a snapshot copy is bounded by the tree), it is not part of the worker's
+#: op vocabulary, and it is exempt from the instruction semaphore below.
+MATERIALIZE_OP = "materialize"
+
 
 def _host_source_ips(host: str) -> tuple[str, ...]:
     """The IPs a host name resolves to, for the source-IP second factor.
@@ -495,6 +501,7 @@ class C3AgentClient:
         token: str,
         timeout_s: float,
         file_op_timeout_s: float | None = None,
+        materialize_timeout_s: float | None = None,
         max_concurrency: int = 0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
@@ -508,6 +515,14 @@ class C3AgentClient:
         # off a legitimate teardown at five seconds.
         self._file_op_timeout_s = float(
             timeout_s if file_op_timeout_s is None else file_op_timeout_s
+        )
+        #: The create path's materialization gets its own deadline, and it is
+        #: much shorter than face B's 600 s: it runs *inside* a create, whose
+        #: caller is an SDK request the platform bounds at 60 s
+        #: (``app.state.remote_http``), so waiting longer than that buys a
+        #: named 504 nobody is still there to read.
+        self._materialize_timeout_s = float(
+            timeout_s if materialize_timeout_s is None else materialize_timeout_s
         )
         # ``0`` means "unbounded" (today's default); slice B sizes the real
         # number from the concurrent-create arm and the acceptance matrix's
@@ -665,6 +680,73 @@ class C3AgentClient:
         }
         return await self._file_op(node_id, "walk", body)
 
+    async def materialize(
+        self,
+        *,
+        node_id: str,
+        sandbox_id: str,
+        tree: dict[str, Any],
+        slices: list[dict[str, Any]],
+        worker_uid: int,
+        worker_gid: int,
+        worker_container_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Instruct the node's agent to materialize one create's tree, once.
+
+        This is the create path's whole materialization -- tree, snapshot copy,
+        volume slices, ownership hand-over -- in a single instruction, sent
+        **before** the control plane dials the worker, so the worker is handed a
+        ready tree and never talks to an agent itself (design v2 §4.1).
+
+        ``tree`` and ``slices`` are ``control_plane.file_ops.derive_materialize``'s
+        output: the paths and uids are the control plane's own derivation, and
+        the agent re-resolves every one of them against its own roots (the two
+        layers do not replace each other, C3 §14.4).
+
+        Two deliberate differences from the relayed file ops:
+
+        * it resolves through ``_target`` (the **worker** key), not
+          ``resolve_agent``: the caller knows the node by its worker's identity
+          while the agent's own identity is the host it runs on (D12), and the
+          host-keyed lookup is the *agent's* own route (inventory), not this one;
+        * it is **exempt from the instruction semaphore**. Every other
+          instruction is milliseconds; this one is bounded by the tree (a
+          2 000-file snapshot took 17.4 s on the shared NAS and is not bounded
+          above). Behind a 64-slot semaphore it would become the first thing a
+          create waits on -- which is the exact failure the semaphore's own
+          sizing note warns about (``control_plane/config.py``:
+          ``c3_agent_max_concurrency``). The bound that matters here is the
+          deadline below and the agent's own materialization budget.
+        """
+        target = self._target(node_id)
+        if not target.maint_url:
+            raise AgentClientError(
+                f"cannot determine the materialization agent address for node "
+                f"{node_id} (E2B_C3_AGENT_MAINT_URL / E2B_C3_AGENT_MAINT_PORT): "
+                "refusing to instruct an agent the control plane cannot locate",
+                status_code=503,
+            )
+        body: dict[str, Any] = {
+            "sandbox_id": sandbox_id,
+            "worker": _worker_body(
+                node_id=node_id,
+                worker_uid=worker_uid,
+                worker_gid=worker_gid,
+                worker_container_id=worker_container_id,
+            ),
+            "tree": tree,
+            "slices": list(slices),
+        }
+        return await self._post(
+            target,
+            node_id,
+            MATERIALIZE_OP,
+            body,
+            url=target.maint_url,
+            refusal="refused the materialization",
+            timeout_tail="the create's materialization is fail-closed",
+        )
+
     async def _file_op(
         self,
         node_id: str,
@@ -754,7 +836,11 @@ class C3AgentClient:
 
     def _deadline_for(self, op: str) -> float:
         """One deadline per instruction kind (see ``__init__``)."""
-        return self._timeout_s if op == "grant-slot" else self._file_op_timeout_s
+        if op == "grant-slot":
+            return self._timeout_s
+        if op == MATERIALIZE_OP:
+            return self._materialize_timeout_s
+        return self._file_op_timeout_s
 
     async def _instruct(
         self,

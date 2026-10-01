@@ -376,16 +376,6 @@ class Settings:
     c3_agent_token: str = field(
         default_factory=lambda: os.getenv("E2B_C3_AGENT_TOKEN", "")
     )
-    #: How long a per-create ``materialize-tree`` grant stays valid. The grant
-    #: only has to cover "mint it → the worker's request reaches the agent",
-    #: which is one HTTP hop on the cluster network (measured 2026-10-01: 1.29 ms
-    #: for a control-plane round trip, ~16 ms two-node clock skew), so 10 s is
-    #: already a 600x margin. The agent refuses anything above
-    #: ``gateway_common.create_grant.MAX_TTL_S`` regardless, so a mis-set
-    #: environment variable cannot mint a long-lived credential (design §5).
-    create_grant_ttl_s: int = field(
-        default_factory=lambda: _env_int("E2B_CREATE_GRANT_TTL_S", 10)
-    )
     #: One deadline per instruction. A stuck agent must never read as "the
     #: sandbox create hangs" (D9.5); the refusal is a named 504.
     c3_agent_timeout_s: float = field(
@@ -399,6 +389,15 @@ class Settings:
     #: stop when the CP stops waiting.
     c3_agent_file_op_timeout_s: float = field(
         default_factory=lambda: _env_float("E2B_C3_AGENT_FILE_OP_TIMEOUT_S", 600.0)
+    )
+    #: The create path's materialization deadline. Much shorter than face B's
+    #: 600 s on purpose: it runs *inside* a create, and the caller on the other
+    #: end of that create is an SDK request the platform bounds at 60 s -- so
+    #: waiting longer than that only produces a named 504 nobody is there to
+    #: read, while the agent keeps copying. Defaulted to the same envelope as
+    #: the worker provisioning call (``app.state.remote_http`` timeout).
+    c3_agent_materialize_timeout_s: float = field(
+        default_factory=lambda: _env_float("E2B_C3_AGENT_MATERIALIZE_TIMEOUT_S", 60.0)
     )
     #: How many CP→agent instructions may be in flight at once. ``0`` is
     #: unbounded; the shipped default is **64**, and the number is bounded on

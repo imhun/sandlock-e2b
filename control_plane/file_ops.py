@@ -25,7 +25,7 @@ re-invented) and onto one target:
 | ``chown-secret`` | ``chown`` | ``<image cache>/secrets/<id>/<name>.secret`` |
 | ``scope-slot-document`` | ``chown`` | ``<route-B root>/<uid>/<instance name>/<name>``, where the leaf comes from :func:`gateway_common.paths.route_b_instance_name` -- the **same** function the worker's executor names the slot with (ruling D20) |
 | ``remove-orphan-workspace`` | ``rm`` | ``<workspace base>/<id>`` (**self-heal only**, C3 Task 6): the tree the control plane's records claim nowhere. It is the one op with no record to derive a uid from -- that is its definition -- and the worker surface refuses it by name. |
-| ``materialize-tree`` | ``materialize`` | ``<workspace base>/<id>`` (+ the snapshot copy source and the per-sandbox volume slices). The **create path's** one privileged step: a plan the control plane mints (``POST /internal/nodes/{node}/file-grant``) that the worker carries to its own node's agent, so the create stops paying a worker→CP→agent→CP→worker round trip per step. Its caller set is its own -- the worker's ``file-op`` surface answers one verb at a time and must never be handed a multi-step plan by name. |
+| ``materialize-tree`` | ``materialize`` | ``<workspace base>/<id>`` (+ the snapshot copy source and the per-sandbox volume slices). The **create path's** one privileged step, and the only row with **no caller surface at all**: the control plane derives it for itself (`control_plane/api/sandboxes.py::_materialize_remote`) and sends it to the node's agent directly, so no worker request can ever name it. The row lives here because this table is the complete list of what the platform may ask a node to do, and because :func:`derive_materialize` uses it for the root-check refusal. |
 
 The last row is the only op whose ``callers`` set is not ``{"worker"}``: it is
 the agent-shape sweep's removal (``control_plane/self_heal.py``), listed here
@@ -120,12 +120,15 @@ FILE_OPS: dict[str, FileOpSpec] = {
         "remove-orphan-workspace", "rm", callers=frozenset({"self-heal"})
     ),
     # The create path's single materialization (design §4.3): tree + snapshot
-    # copy + chown + volume slices, done in one agent call. Not in the worker's
-    # ``file-op`` vocabulary -- that surface forwards one verb at a time, and
-    # ``node_file_op`` would dispatch an unknown verb to ``walk`` -- so this op
-    # names its own caller and the worker's surface refuses it by name.
+    # copy + chown + volume slices, done in one agent call. `callers` is empty
+    # on purpose -- the control plane derives this for itself and instructs the
+    # agent (``c3_agent/materialize.py``); it is not reachable from any request
+    # surface, and an empty set is what says so (``spec_for`` refuses it for
+    # every caller). It is not in the worker's ``file-op`` vocabulary either:
+    # that surface forwards one verb at a time, and ``node_file_op`` would
+    # dispatch an unknown verb to ``walk``.
     "materialize-tree": FileOpSpec(
-        "materialize-tree", "materialize", callers=frozenset({"worker-grant"})
+        "materialize-tree", "materialize", callers=frozenset()
     ),
 }
 
@@ -141,12 +144,6 @@ SLOT_DOCUMENTS: frozenset[str] = frozenset({"policy.json", "program.json"})
 #: A secret file name is a policy entry's name. The same shape the executor's
 #: own paths accept (no separators, no traversal).
 _SECRET_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-
-#: The keys a *grant request* may carry. Deliberately a closed set, and
-#: deliberately not ``FileOpSpec.params``: ``snapshot_id`` is optional, while
-#: the file-op surface's parameters are all required. What both surfaces share
-#: is the rule that matters -- the path and the uid never come from the caller.
-GRANT_REQUEST_KEYS: frozenset[str] = frozenset({"op", "sandbox_id", "snapshot_id"})
 
 #: The create path's materialization shape (design §4.1). The sandbox's own
 #: files live one level down, in ``<tree>/workspace``, so that the mount view
@@ -300,43 +297,6 @@ def validate_params(spec: FileOpSpec, body: Mapping[str, Any]) -> None:
             raise FileOpRefusal(
                 f"a {spec.op} report must name {name}", status_code=400
             )
-
-
-def validate_grant_params(spec: FileOpSpec, body: Mapping[str, Any]) -> None:
-    """Refuse a grant request that names a target, or a key this surface has no use for.
-
-    The same two rules :func:`validate_params` enforces on the file-op surface,
-    against this surface's own (smaller) key set. ``snapshot_id`` is the one
-    optional key, so it is checked here rather than demanded there.
-    """
-    for key in FORBIDDEN_KEYS:
-        if key in body:
-            raise FileOpRefusal(
-                f"a {spec.op} report carries no {key}: the target comes from "
-                "the control plane's records",
-                status_code=400,
-            )
-    extra = set(body) - GRANT_REQUEST_KEYS
-    if extra:
-        raise FileOpRefusal(
-            f"a {spec.op} report carries no "
-            + ", ".join(sorted(extra))
-            + ": the target comes from the control plane's records",
-            status_code=400,
-        )
-    snapshot_id = body.get("snapshot_id")
-    if snapshot_id is not None and (
-        not isinstance(snapshot_id, str)
-        or not snapshot_id.startswith("snap_")
-        or not validate_sandbox_id(snapshot_id)
-    ):
-        # Shape only, like ``validate_sandbox_id``: the snapshot store's own
-        # namespace is ``snap_*``, and a caller-supplied name that is not one
-        # cannot be a snapshot on any node.
-        raise FileOpRefusal(
-            f"snapshot_id {snapshot_id!r} is not a snapshot id: refusing",
-            status_code=400,
-        )
 
 
 def derive_materialize(
