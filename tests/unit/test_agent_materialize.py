@@ -1,30 +1,27 @@
-"""Task 3: face B's grant entry -- six checks, then one materialization.
+"""Face B's one-call create materialization.
 
-The create path hands its own node's agent a signed plan
-(``POST /internal/grants/file-op``, body ``{"grant": ...}``) instead of paying
-a worker→CP→agent→CP→worker round trip per step. Routing the plan *around* the
-control plane is only safe because the plan is the control plane's own signed
-derivation, and because this route re-checks everything itself:
+The control plane sends **one** instruction and the agent does the whole
+materialization (tree, snapshot copy, volume slices, ownership hand-over), so
+the create stops paying a worker→CP→agent→CP→worker round trip per step. Two
+properties are the whole reason this is safe, and the tests below are organised
+around them:
 
-    ① signature over ``E2B_C3_AGENT_TOKEN``;
-    ② ``host`` == this agent's own node identity (D12);
-    ③ ``iat <= now <= exp``, with a hard lifetime ceiling;
-    ④ single use -- a ``jti`` is spent the moment it is accepted;
-    ⑤ the op is the one verb this route knows;
-    ⑥ every path re-resolves against this agent's own four roots.
+* the instruction arrives on the **existing** authenticated CP→agent channel
+  (the same one ``chown``/``rm``/``walk`` use) and is addressed to this agent's
+  own node (D12);
+* every path in it is the control plane's derivation, and this agent
+  re-resolves each one against its own four roots -- the same ``realpath``
+  discipline the relayed ops use, run independently (C3 §14.4: the two do not
+  replace each other).
 
-⑤ and ⑥ are what make the plan's *contents* trustworthy rather than merely
-authentic: ⑥ is the same ``realpath`` + four-root discipline the control-plane
-relay uses, run independently, and neither layer replaces the other (C3 §14.4).
-
-The tests below are ordered by that list: one happy path, then one refusal per
-way the entry could be made to accept something it should not.
+The copy is the dangerous part (design §4.3.1) and has its own section below.
 """
 
 from __future__ import annotations
 
 import os
 import secrets
+import shutil
 import stat
 import time
 from pathlib import Path
@@ -381,6 +378,85 @@ def _snapshot(agent: _Agent, entries: dict[str, Any]) -> Path:
     return fs
 
 
+def _relative_entries(root: Path) -> list[tuple[str, str]]:
+    """Every entry under ``root`` as ``(relative path, kind)``, sorted.
+
+    ``os.walk(followlinks=False)`` and not ``rglob``: the trees under test
+    contain links, and the comparison must not walk them.
+    """
+    found: list[tuple[str, str]] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        for name in dirnames + filenames:
+            path = base / name
+            if path.is_symlink():
+                kind = "link"
+            elif path.is_dir():
+                kind = "dir"
+            else:
+                kind = "file"
+            found.append((str(path.relative_to(root)), kind))
+    return sorted(found)
+
+
+@pytest.mark.asyncio
+async def test_a_snapshot_lands_at_the_tree_root(workspace: Path) -> None:
+    """``fs/`` is a copy of the tree **root**, so the merge lands there.
+
+    The snapshot side makes that true (``agent_create_snapshot`` copies
+    ``workspace_base/<id>`` into ``<snapshot>/fs``) and so does the control
+    plane's in-process shape (``expand_to(snapshot, workspace_dir)``). Copying
+    into ``<root>/<subdir>`` instead put the whole sandbox one level too deep
+    (``workspace/workspace/...``) -- a tree no other code path produces.
+    """
+    agent = _Agent(workspace)
+    _snapshot(agent, {"workspace": {"kept.txt": "kept\n"}})
+
+    resp = await _post(
+        agent,
+        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+    )
+
+    assert resp.status_code == 200
+    tree = agent.tree()
+    assert (tree / "workspace" / "kept.txt").read_text(encoding="utf-8") == "kept\n"
+    assert (tree / "workspace" / "workspace").exists() is False
+
+
+@pytest.mark.asyncio
+async def test_the_fast_path_and_the_fallback_produce_the_same_tree(
+    workspace: Path,
+) -> None:
+    """Same snapshot, same tree -- whichever side materializes it.
+
+    The fallback is ``shutil.copytree(snapshot_fs, tree, dirs_exist_ok=True,
+    symlinks=True)``: that call *is* the behavioural spec of the merge (it is
+    the worker's own path, unchanged by this work), so a tree this agent
+    produces has to match it entry for entry, links included.
+    """
+    agent = _Agent(workspace)
+    _snapshot(
+        agent,
+        {
+            "workspace": {"kept.txt": "kept\n"},
+            "link": "-> /etc/passwd",
+            "nested": {"deep.txt": "deep\n"},
+        },
+    )
+
+    resp = await _post(
+        agent,
+        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+    )
+
+    assert resp.status_code == 200
+    reference = workspace / "copytree"
+    shutil.copytree(
+        agent.snapshot_fs(), reference, dirs_exist_ok=True, symlinks=True
+    )
+    assert _relative_entries(agent.tree()) == _relative_entries(reference)
+
+
 @pytest.mark.asyncio
 async def test_a_symlink_in_the_snapshot_is_recreated_not_followed(
     workspace: Path,
@@ -407,7 +483,8 @@ async def test_a_symlink_in_the_snapshot_is_recreated_not_followed(
     )
 
     assert resp.status_code == 200
-    target = agent.tree() / "workspace"
+    # The merge target is the tree root: ``fs/`` carries the root's contents.
+    target = agent.tree()
     assert os.path.islink(target / "link") is True
     assert os.readlink(target / "link") == "/etc/passwd"
     assert os.path.islink(target / "escape") is True
@@ -425,7 +502,7 @@ async def test_a_symlinked_destination_segment_is_refused_named(
     agent = _Agent(workspace)
     outside = workspace / "outside"
     outside.mkdir()
-    target = agent.tree() / "workspace"
+    target = agent.tree()
     target.mkdir(parents=True)
     (target / "sub").symlink_to(outside)
     _snapshot(agent, {"sub": {"file": "payload\n"}})
@@ -447,7 +524,7 @@ async def test_a_symlinked_destination_segment_is_refused_named(
 async def test_an_ordinary_merge_keeps_existing_files(workspace: Path) -> None:
     """``dirs_exist_ok`` semantics survive (migration/rebuild keeps files)."""
     agent = _Agent(workspace)
-    target = agent.tree() / "workspace"
+    target = agent.tree()
     target.mkdir(parents=True)
     (target / "keep.txt").write_text("from the previous incarnation\n", encoding="utf-8")
     (target / "same.txt").write_text("stale\n", encoding="utf-8")
@@ -475,7 +552,7 @@ async def test_a_file_where_a_directory_belongs_is_refused_named(
 ) -> None:
     """A type conflict is refused, not resolved by deleting the sandbox's file."""
     agent = _Agent(workspace)
-    target = agent.tree() / "workspace"
+    target = agent.tree()
     target.mkdir(parents=True)
     (target / "sub").write_text("I am a file\n", encoding="utf-8")
     _snapshot(agent, {"sub": {"file": "payload\n"}})

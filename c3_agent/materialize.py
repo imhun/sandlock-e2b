@@ -185,7 +185,14 @@ def materialize_tree(
             raise MaterializeRefusal(
                 PARTIAL_COPY, f"the snapshot source {source} is not a directory"
             )
-        copy_tree(str(source), str(target), dir_mode=mode)
+        # Into the **tree root**, not ``<root>/<subdir>``: the snapshot store's
+        # ``fs/`` is a copy of the tree root itself (``agent_create_snapshot``
+        # copies ``workspace_base/<id>`` into it; the control plane's in-process
+        # shape expands it into ``workspace_dir`` the same way), so a merge one
+        # level down would put the whole sandbox at ``workspace/workspace/...``
+        # -- a tree no other path produces. ``subdir`` is only for the no-
+        # snapshot case, where the tree starts empty.
+        copy_tree(str(source), str(root), dir_mode=mode)
     # Every volume slice the plan names, made the same way and *before* any
     # privilege is spent: a slice is materialization too (design §4.3 step ③),
     # and the same two layers apply -- the control plane derived the path from

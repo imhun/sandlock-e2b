@@ -312,6 +312,11 @@ BARE_NAME_ALLOWANCES = {
     "verify-wheel.sh": "fork 子模块里的校验脚本（third_party/sandlock/python/verify-wheel.sh），同上",
     "connection_config.py": "上游 e2b SDK 的内部模块（只在 SCALING.md 里做来源说明，本仓与其子模块都没有这个文件）",
     "test_runtime_context_volumes.py": "A4 已删掉的历史测试（HANDOFF 在叙述那次改动，不是让人去跑）",
+    "test_agent_grant_route.py": (
+        "载体 B（2026-10-01）的 agent 授权路由用例，随该方向被否而改名成 "
+        "tests/unit/test_agent_materialize.py：两个建箱计划都在叙述这次改名，"
+        "不是在让人去跑它（`git rm` 那条命令执行过后就不再存在）"
+    ),
 }
 
 #: The k0s white-box audit docs list their one-off probes as an *index* (a table
