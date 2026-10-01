@@ -1035,9 +1035,16 @@ async def test_the_face_that_executes_a_removal_needs_no_worker_identity(
     assert rm.status_code == 200
     assert tree.exists() is False
     assert chown.status_code == 400
+    # The body names no worker at all, so the missing half is the group the
+    # binary gates ``--gid`` against. The message names *that* half rather than
+    # "the worker's own identity" because the two are no longer one
+    # precondition: a ``--gid``-carrying chown needs the gid, and only a
+    # ``--worker`` chown needs the uid the binary would write into the tree
+    # (``c3_agent.fileops.run_file_op``'s shape gate; the create path's
+    # ``materialize-tree`` is the ``chown --uid … --gid …`` shape).
     assert chown.json() == {
         "error": (
-            "a chown instruction needs the worker's own identity (it is the "
-            "--worker form and the group gate): refusing"
+            "a chown instruction needs the group it hands the tree to (the "
+            "binary checks --gid against the worker's own gid): refusing"
         )
     }

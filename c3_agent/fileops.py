@@ -144,13 +144,18 @@ def maint_env(
         "E2B_WORKSPACE_BASE": str(settings.workspace_base),
         "E2B_STATE_BASE": str(settings.state_base or settings.workspace_base),
     }
-    if worker_uid is not None and worker_gid is not None:
-        # Both halves or neither (the same rule the control plane applies to a
-        # worker's own report): behind ``serve`` these come from the
-        # authenticated peer, and exec'd directly the binary falls back to its
-        # own (root) identity -- which is why a step that acts as the worker
-        # must name one, and a step that acts as nobody must not.
+    # Each half is written when the instruction has it, and the binary reads
+    # exactly the one it needs: ``--worker`` writes ``priv_worker_uid()`` into
+    # the tree, while ``--gid`` is compared against ``priv_worker_gid()``. So a
+    # ``chown --uid U --gid G`` (the create path's materialization) needs the
+    # gid **without** needing a worker uid -- and that is safe precisely
+    # because the ``--worker`` form is unreachable without one (see
+    # :func:`run_file_op`'s shape gate): leaving ``E2B_BROKER_WORKER_UID``
+    # unset can only mean "this step never asks who the worker is", never
+    # "hand the tree to root".
+    if worker_uid is not None:
         env["E2B_BROKER_WORKER_UID"] = str(worker_uid)
+    if worker_gid is not None:
         env["E2B_BROKER_WORKER_GID"] = str(worker_gid)
     if settings.shared_volume_root:
         env["E2B_SHARED_VOLUME_ROOT"] = str(settings.shared_volume_root)
@@ -286,14 +291,25 @@ def run_file_op(
                 "chown needs one of uid (a pooled uid) or worker (the "
                 "worker's own identity): refusing"
             )
-        if instruction.worker_uid is None or instruction.worker_gid is None:
-            # ``--worker`` writes ``priv_worker_uid()`` (the child's
-            # environment) and ``--gid`` is checked against the worker's own
-            # gid; without that identity the first would name *root* and the
-            # second would be refused by the binary. Fail here, by shape.
+        if instruction.worker_gid is None:
+            # ``--gid`` is checked by the binary against ``priv_worker_gid()``
+            # (the child's environment), and that check is what keeps a chown
+            # from naming a group nobody vetted. Without the worker's gid the
+            # step would be refused a layer down, after a fork.
             raise FileOpShapeRefusal(
-                "a chown instruction needs the worker's own identity "
-                "(it is the --worker form and the group gate): refusing"
+                "a chown instruction needs the group it hands the tree to "
+                "(the binary checks --gid against the worker's own gid): "
+                "refusing"
+            )
+        if instruction.worker_owned and instruction.worker_uid is None:
+            # The symmetric half, and the one that must never be relaxed:
+            # ``--worker`` writes ``priv_worker_uid()`` into the tree, and
+            # without the environment that function falls back to the agent's
+            # own identity -- root.
+            raise FileOpShapeRefusal(
+                "a --worker chown needs the worker's own identity (it is what "
+                "--worker writes into the tree; without it the owner would be "
+                "root): refusing"
             )
     argv = build_maint_argv(verb, instruction, settings=settings)
     env = maint_env(

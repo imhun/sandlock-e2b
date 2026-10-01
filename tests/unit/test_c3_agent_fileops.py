@@ -30,7 +30,13 @@ import pytest
 
 from c3_agent.app import create_app
 from c3_agent.config import Settings
-from c3_agent.fileops import AgentFileOpRefusal, SubprocessMaintRunner
+from c3_agent.fileops import (
+    AgentFileOpRefusal,
+    FileOpInstruction,
+    FileOpShapeRefusal,
+    SubprocessMaintRunner,
+    run_file_op,
+)
 from control_plane.c3_agent_client import (
     AgentTarget,
     C3AgentClient,
@@ -201,6 +207,39 @@ async def test_chown_worker_form_names_no_uid() -> None:
             _expected_env(settings),
         )
     ]
+
+
+def test_a_worker_chown_without_a_worker_uid_is_refused() -> None:
+    """The half of the shape gate ``maint_env``'s gid-only case leans on.
+
+    ``--worker`` writes ``priv_worker_uid()`` -- read from
+    ``E2B_BROKER_WORKER_UID`` -- into the tree as its owner. That variable is
+    now written **only** when the instruction carries a uid, because the create
+    path's ``chown --uid … --gid …`` needs the group gate and no worker uid
+    (``c3_agent.materialize``). The two facts are safe together exactly as long
+    as ``--worker`` cannot run without a uid, so that is pinned here rather
+    than inferred from the HTTP surface, which cannot even express the shape
+    (``WorkerCredentials`` requires both halves).
+    """
+    instruction = FileOpInstruction(
+        sandbox_id="sbx_fileops",
+        path=RUNTIME,
+        gid=WORKER_GID,
+        recursive=True,
+        worker_owned=True,
+        worker_gid=WORKER_GID,
+    )
+    with pytest.raises(FileOpShapeRefusal) as excinfo:
+        run_file_op(
+            "chown",
+            instruction,
+            runner=_StubMaintRunner(),
+            settings=_settings(),
+        )
+    assert str(excinfo.value) == (
+        "a --worker chown needs the worker's own identity (it is what --worker "
+        "writes into the tree; without it the owner would be root): refusing"
+    )
 
 
 @pytest.mark.asyncio
