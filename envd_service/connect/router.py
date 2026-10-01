@@ -46,11 +46,11 @@ def _find_sandbox(request: Request) -> Any:
     if runtime is None:
         raise unauthenticated(f"Sandbox {sandbox_id} not found")
     token = request.headers.get("X-Access-Token")
-    if (
-        not runtime.allow_public_traffic
-        and runtime.access_token
-        and token != runtime.access_token
-    ):
+    # SEC-K0S-005 (2026-10-01): same unconditional token requirement as
+    # ``envd_service/http/auth.py`` -- this is the RPC half of the control
+    # surface (``process.Process/Start``, filesystem ops), and waiving it on
+    # ``allowPublicTraffic`` was an unauthenticated command-execution hole.
+    if runtime.access_token and token != runtime.access_token:
         raise unauthenticated("Invalid access token")
     # E9.1: an authenticated call is activity; the worker reports it to the
     # control plane on its next heartbeat (idle detection / eviction).

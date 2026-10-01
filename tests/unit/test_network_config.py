@@ -12,6 +12,7 @@ from gateway_common.network import (
     normalize_network_update,
     sandlock_network_policy,
 )
+from envd_service.config import DEFAULT_NETWORK_DENY_CIDRS
 
 
 def test_normalize_create_keeps_supported_fields():
@@ -201,18 +202,40 @@ def test_policy_internet_on_with_private_deny_uses_denylist():
     assert policy["net_deny"] == cidrs
 
 
-def test_policy_explicit_allowout_keeps_private_entries():
-    """Explicit allowOut grants are never filtered by the private denylist:
-    a caller that deliberately allows an internal service keeps it."""
+def test_policy_explicit_allowout_is_filtered_by_private_entries():
+    """SEC-K0S-004: the private denylist also bounds an explicit allowlist.
+
+    The connect is performed by the worker in its own netns, so an allowlist
+    entry naming a protected address is a route from untrusted sandbox code
+    into the control plane / the worker's own services. Public entries keep
+    working; private ones are dropped (deny precedence), in every spelling --
+    bare IP, ``host:port``, scheme-qualified and CIDR.
+    """
     policy = sandlock_network_policy(
-        {"allowOut": ["10.0.0.5:443", "8.8.8.8"]},
+        {
+            "allowOut": [
+                "10.0.0.5:443",
+                "10.0.0.0/8",
+                "tcp://10.244.140.26:49983",
+                "10.0.0.0/8:443",
+                "127.0.0.1",
+                "0.0.0.0/0",  # wider than the protected set: fails closed, dropped
+                "::/0",
+                "8.8.8.8",
+                "example.com",
+            ]
+        },
         allow_internet_access=True,
         enable_network=True,
-        private_deny_cidrs=["10.0.0.0/8", "127.0.0.0/8"],
+        # The deployment's own list (both families) -- the filter must behave
+        # the same for an entry that no single-protocol list would bound.
+        private_deny_cidrs=list(DEFAULT_NETWORK_DENY_CIDRS),
     )
-    assert "10.0.0.5:443" in policy["net_allow"]
-    assert "tcp://8.8.8.8:*" in policy["net_allow"]
-    assert policy["net_deny"] == []
+    assert policy["net_allow"] == ["tcp://8.8.8.8:*", "tcp://example.com:*"]
+    # The protected set is also handed to the fork as a deny filter, so a
+    # *domain* that resolves into a protected range is refused too (the
+    # allowlist matched the name, not the address).
+    assert policy["net_deny"] == list(DEFAULT_NETWORK_DENY_CIDRS)
 
 
 def test_policy_internet_on_with_rules_and_private_deny():

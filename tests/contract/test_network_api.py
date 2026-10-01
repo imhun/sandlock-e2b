@@ -253,9 +253,17 @@ async def test_network_sdk_round_trip(multinode_two_workers):
         sandbox.kill()
 
 
-async def test_network_allow_public_traffic_skips_token(multinode_two_workers):
-    """allowPublicTraffic=true lets envd HTTP endpoints serve without the
-    access token; the default keeps token auth."""
+async def test_network_allow_public_traffic_does_not_skip_token(
+    multinode_two_workers,
+):
+    """SEC-K0S-005: ``allowPublicTraffic`` must NOT waive the envd access token.
+
+    envd is the sandbox *control* surface (files / process / PTY), so an
+    unauthenticated request there is remote code execution, not "public
+    traffic" -- measured on the live cluster as a cross-sandbox
+    ``POST /process.Process/Start`` with no token. Both a public-traffic and a
+    default sandbox must answer 401 without the token and 200 with it.
+    """
     harness = multinode_two_workers
 
     async def _create(network) -> dict:
@@ -275,19 +283,32 @@ async def test_network_allow_public_traffic_skips_token(multinode_two_workers):
     public = await _create({"allowPublicTraffic": True})
     private = await _create({})
     try:
-        public_addr = await _route_address(public["sandboxID"])
-        private_addr = await _route_address(private["sandboxID"])
-        async with httpx.AsyncClient() as client:
-            public_resp = await client.get(
-                f"{public_addr}/envs",
-                headers={"E2b-Sandbox-Id": public["sandboxID"]},
-            )
-            private_resp = await client.get(
-                f"{private_addr}/envs",
-                headers={"E2b-Sandbox-Id": private["sandboxID"]},
-            )
-        assert public_resp.status_code == 200
-        assert private_resp.status_code == 401
+        for sandbox in (public, private):
+            address = await _route_address(sandbox["sandboxID"])
+            token = (await _detail(harness, sandbox["sandboxID"]))["envdAccessToken"]
+            assert token
+            async with httpx.AsyncClient() as client:
+                without = await client.get(
+                    f"{address}/envs",
+                    headers={"E2b-Sandbox-Id": sandbox["sandboxID"]},
+                )
+                wrong = await client.get(
+                    f"{address}/envs",
+                    headers={
+                        "E2b-Sandbox-Id": sandbox["sandboxID"],
+                        "X-Access-Token": "not-the-token",
+                    },
+                )
+                right = await client.get(
+                    f"{address}/envs",
+                    headers={
+                        "E2b-Sandbox-Id": sandbox["sandboxID"],
+                        "X-Access-Token": token,
+                    },
+                )
+            assert without.status_code == 401
+            assert wrong.status_code == 401
+            assert right.status_code == 200
     finally:
         async with httpx.AsyncClient(base_url=harness["api_url"]) as client:
             for sandbox_id in (public["sandboxID"], private["sandboxID"]):

@@ -39,3 +39,4 @@ graphify-out/
 # Same directory under the name the fork's container-path symlink uses
 # (`third_party/sandlock/target -> /src/target-linux`). Never source.
 /target-linux/
+.venv/

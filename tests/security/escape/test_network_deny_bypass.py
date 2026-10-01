@@ -143,3 +143,87 @@ print(json.dumps(out, sort_keys=True))
     finally:
         for sock in servers:
             sock.close()
+
+
+@pytest.mark.usefixtures("require_sandlock")
+def test_explicit_allowout_cannot_reach_a_protected_range():
+    """SEC-K0S-004: an explicit allowlist is bounded by the same protected set.
+
+    The allowlist branch is a *different* model from the implicit denylist, and
+    it used to be unfiltered -- so a tenant could name the cluster's own pod
+    CIDR (``allowOut: ["10.244.0.0/16"]``) or an internal address, and the
+    connect, which the worker performs in its **own** network namespace,
+    reached the control plane and the worker envd.
+
+    Two spellings are covered here, because they fail for different reasons:
+
+    * a literal (``127.0.0.1:PORT``) is dropped before the fork sees it;
+    * a **hostname** (``localhost:PORT``) is matched against the *name*, so
+      only the deny filter on the resolved address keeps it out -- the shape a
+      DNS name that answers with a protected address would take.
+    """
+    from tests.security.conftest import route_b_sandbox, run_sh, sandbox_tmpdir
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Ephemeral port: this file has another test that owns ``LISTEN_PORT``, and
+    # sharing it makes the pair order-dependent.
+    server.bind(("127.0.0.1", 0))
+    listen_port = server.getsockname()[1]
+    server.listen(8)
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            try:
+                conn.recv(64)
+                conn.sendall(b"WORKER-INTERNAL")
+            finally:
+                conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+
+    probe = """
+import json, socket
+PORT = %d
+out = {}
+for tag, host in (("literal", "127.0.0.1"), ("hostname", "localhost")):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(2.0)
+    try:
+        s.connect((host, PORT))
+        out[tag] = "REACHED"
+    except OSError:
+        out[tag] = "DENIED"
+    finally:
+        s.close()
+print(json.dumps(out, sort_keys=True))
+""" % listen_port
+
+    ws = Path(sandbox_tmpdir())
+    (ws / "allowlist_probe.py").write_text(probe)
+    executor, workspace = route_b_sandbox(
+        None,
+        None,
+        workspace=ws,
+        allow_internet_access=True,
+        enable_network=True,
+        # Both spellings name the same worker-local listener, and both are
+        # inside the protected set.
+        network={"allowOut": [f"127.0.0.1:{listen_port}", f"localhost:{listen_port}"]},
+        network_deny_cidrs=DEFAULT_NETWORK_DENY_CIDRS,
+    )
+    try:
+        code, out, err = asyncio.run(
+            run_sh(executor, workspace, "/usr/local/bin/python3 /workspace/allowlist_probe.py")
+        )
+        assert code == 0, err
+        assert json.loads(out.decode()) == {
+            "hostname": "DENIED",
+            "literal": "DENIED",
+        }, out.decode()
+    finally:
+        server.close()

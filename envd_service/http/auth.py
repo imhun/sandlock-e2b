@@ -57,11 +57,15 @@ def require_http_sandbox(
             raise HttpAuthError(502, f"Sandbox {sandbox_id} not found")
         raise HttpAuthError(404, f"Sandbox {sandbox_id} not found")
     token = request.headers.get("X-Access-Token")
-    if (
-        not runtime.allow_public_traffic
-        and runtime.access_token
-        and token != runtime.access_token
-    ):
+    # SEC-K0S-005 (2026-10-01): envd is the sandbox *control* surface (files,
+    # process, PTY), so the access token is required unconditionally. This
+    # used to be waived when ``allowPublicTraffic`` was set, which made one
+    # tenant-supplied boolean remove authentication from the whole surface --
+    # measured end to end: an unauthenticated ``POST /process.Process/Start``
+    # executed a command in another sandbox's host worker. Do not reintroduce
+    # ``allow_public_traffic`` into this condition; "public traffic" must never
+    # mean "public control plane".
+    if runtime.access_token and token != runtime.access_token:
         raise HttpAuthError(401, "Invalid access token")
     state = getattr(runtime, "state", "running")
     if mutating and state != "running":

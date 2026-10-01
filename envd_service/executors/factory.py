@@ -11,6 +11,7 @@ from envd_service.config import Settings, resolve_real_root
 from envd_service.executors.base import Executor
 from envd_service.executors.local import LocalExecutor
 from envd_service.runtime.image_resolver import resolve_image_rootfs
+from gateway_common.paths import sandbox_disk_stats_path
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +195,21 @@ def create_executor(
                 )
             return SandlockExecutor(
                 workspace_dir=workspace_dir,
+                # SEC-K0S-006: the sandbox's own disk accounting, so `statfs`
+                # reports its quota and what is left of it instead of the
+                # node's volume. The worker writes the file (it owns the quota
+                # and measures the tree); this only names the path.
+                disk_stats_path=(
+                    str(
+                        sandbox_disk_stats_path(
+                            settings.workspace_base,
+                            sandbox_id,
+                            state_base=settings.state_base,
+                        )
+                    )
+                    if sandbox_id
+                    else None
+                ),
                 base_image=base_image,
                 image_rootfs=image_rootfs,
                 # N16: the pure shape gets a synthesized root only when the

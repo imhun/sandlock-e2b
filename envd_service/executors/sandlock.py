@@ -796,6 +796,7 @@ class SandlockExecutor(Executor):
         memory_mb: int,
         cpu_percent: int,
         disk_mb: int,
+        disk_stats_path: str | None = None,
         max_file_size_mb: int | None = None,
         max_processes: int,
         max_open_files: int,
@@ -828,6 +829,9 @@ class SandlockExecutor(Executor):
         self._memory_mb = memory_mb
         self._cpu_percent = cpu_percent
         self._disk_mb = disk_mb
+        #: SEC-K0S-006 -- where the worker publishes this sandbox's disk
+        #: accounting for `statfs(2)`. Unset leaves `statfs` reporting the host.
+        self._disk_stats_path = disk_stats_path
         self._max_file_size_mb = max_file_size_mb
         self._max_processes = max_processes
         self._max_open_files = max_open_files
@@ -2506,6 +2510,11 @@ class SandlockExecutor(Executor):
             "max_open_files": self._max_open_files,
             "max_cpu": min(100, max(1, self._cpu_percent)),
             "max_disk": f"{self._disk_mb}M",
+            # SEC-K0S-006: `statfs(2)` reports the host's volume; point the
+            # sandbox at the platform's own accounting for it instead. The
+            # file is written by the worker (it owns the quota and measures
+            # the tree); the executor only names it.
+            "disk_stats_path": self._disk_stats_path,
             "max_file_size": self._max_file_size_bytes(),
             "notify_rate_limit": self._notify_rate_limit or None,
             "uid": sandbox_uid,
@@ -2750,6 +2759,7 @@ class SandlockExecutor(Executor):
             "max_open_files": self._max_open_files,
             "max_cpu": min(100, max(1, self._cpu_percent)),
             "max_disk": f"{self._disk_mb}M",
+            "disk_stats_path": self._disk_stats_path,
             "max_file_size": self._max_file_size_bytes(),
             "notify_rate_limit": self._notify_rate_limit or None,
             "clean_env": True,

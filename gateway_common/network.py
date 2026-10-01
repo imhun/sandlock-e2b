@@ -482,12 +482,18 @@ def sandlock_network_policy(
     are present the allowlist model wins and allow entries covered by a deny
     CIDR are dropped (deny precedence).
 
-    ``private_deny_cidrs`` only affects the *implicit* full-egress branch
-    (no explicit ``allowOut``/``denyOut`` with internet allowed): instead of
-    ``net_allow=["*:*"]`` the policy becomes a ``net_deny`` DenyList
-    (default-allow for the public internet, private/loopback/link-local
-    ranges refused). Explicit ``allowOut`` entries are never filtered here,
-    so a caller that deliberately grants a private IP/CIDR keeps it.
+    ``private_deny_cidrs`` applies to **both** egress models:
+
+    * implicit full egress (no explicit ``allowOut``/``denyOut`` with internet
+      allowed) becomes a ``net_deny`` DenyList instead of ``net_allow=["*:*"]``
+      -- default-allow for the public internet, private/loopback/link-local
+      ranges refused;
+    * an explicit ``allowOut`` list is filtered against the same set before it
+      reaches the fork (SEC-K0S-004): a literal IP/CIDR that falls inside a
+      protected range is dropped, because the worker performs the connect in
+      its own netns and an unfiltered allow entry is a route into the control
+      plane. Only literals can be judged here -- a *domain* entry is resolved
+      later by the fork, so it is not covered by this filter.
     """
     if not enable_network:
         return {
@@ -547,9 +553,27 @@ def sandlock_network_policy(
 
     egress_proxy = network.get("egressProxy")
     if allow_out is not None:
+        # SEC-K0S-004 (2026-10-01): the explicit allowlist branch is not a way
+        # around the private-range protection. Entries covered by the
+        # protected set are dropped here -- deny precedence, exactly as an
+        # explicit ``denyOut`` entry already drops them -- because the connect
+        # is performed by the worker in its *own* network namespace, so a
+        # tenant that names the cluster's pod/service CIDR reaches the control
+        # plane and the worker's envd from inside the sandbox. Measured on the
+        # live cluster before this fix: ``allowOut: ["10.244.0.0/16"]`` fetched
+        # ``/openapi.json`` from 10.244.140.28:3000.
+        protected = list(deny_out or []) + list(private_deny_cidrs or [])
         return {
-            "net_allow": _to_net_allow(allow_out, deny_out),
-            "net_deny": [],
+            "net_allow": _to_net_allow(allow_out, protected),
+            # ... and hand the fork the same protected set as a deny filter, so
+            # a destination that only exists *after* resolution is covered too:
+            # an allowlist entry may be a hostname, and the address that name
+            # finally answers with is chosen at connect time (measured before
+            # the fork grew this: ``allowOut: ["10.244.140.26.nip.io:49983"]``
+            # reached the worker's envd). The fork applies it with deny
+            # precedence; with an empty protected set this stays ``[]`` and the
+            # policy is a plain allowlist.
+            "net_deny": list(private_deny_cidrs or []),
             "http_allow": http_allow,
             "http_inject": http_inject,
             "host_mask": network.get("maskRequestHost"),
@@ -598,29 +622,76 @@ def sandlock_network_policy(
 def _to_net_allow(
     allow_out: list[str], deny_out: list[str] | None
 ) -> list[str]:
-    denied = [
-        ipaddress.ip_network(e.split(":", 1)[0], strict=False)
-        for e in (deny_out or [])
-    ]
+    denied = [net for e in (deny_out or []) if (net := _parse_network(e))]
     rules: list[str] = []
     for entry in allow_out:
-        host = entry.split(":", 1)[0]
-        if "/" in host:
-            try:
-                net = ipaddress.ip_network(host, strict=False)
-            except ValueError:
-                net = None
-            if net is not None and any(net.subnet_of(d) for d in denied):
-                continue
-        elif ":" not in entry:
-            try:
-                addr = ipaddress.ip_address(host)
-            except ValueError:
-                addr = None
-            if addr is not None and any(addr in d for d in denied):
-                continue
+        target = _parse_target(_allow_entry_host(entry))
+        if target is not None and any(_intersects(target, d) for d in denied):
+            continue
         rules.append(_net_entry(entry))
     return rules
+
+
+_SCHEME_PREFIXES = ("tcp://", "udp://", "icmp://")
+
+
+def _allow_entry_host(entry: str) -> str:
+    """The address/network an ``allowOut`` entry targets, without scheme/port.
+
+    ``10.0.0.0/8``, ``10.0.0.0/8:443``, ``tcp://10.1.2.3:80`` and ``[::1]:80``
+    all reduce to the address (or network) itself. Domains are returned as-is:
+    they are not literal destinations, so the literal deny filter cannot judge
+    them (see :func:`_to_net_allow`).
+    """
+    value = entry
+    for prefix in _SCHEME_PREFIXES:
+        if value.startswith(prefix):
+            value = value[len(prefix) :]
+            break
+    if value.startswith("["):  # bracketed IPv6 literal, optional :port
+        end = value.find("]")
+        if end != -1:
+            return value[1:end]
+    if "/" in value:  # CIDR, with an optional trailing :port
+        network, _, tail = value.partition("/")
+        length, sep, _port = tail.partition(":")
+        return f"{network}/{length}" if sep else value
+    if value.count(":") == 1:  # host:port
+        return value.split(":", 1)[0]
+    return value
+
+
+def _parse_network(value: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    try:
+        return ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return None
+
+
+def _parse_target(
+    value: str,
+) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """A single address as a /32 or /128 network, or ``None`` for a domain."""
+    try:
+        return ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return None
+
+
+def _intersects(
+    target: ipaddress.IPv4Network | ipaddress.IPv6Network,
+    denied: ipaddress.IPv4Network | ipaddress.IPv6Network,
+) -> bool:
+    """Whether ``target`` overlaps ``denied`` at all (family-exact, like the fork).
+
+    Overlap, not containment: an entry *wider* than a protected range (the
+    ``0.0.0.0/0`` case) also reaches it, and the tuple grammar has no way to
+    say "everything except the protected set". Dropping the entry fails
+    closed; keeping it would silently re-permit the cluster's own network.
+    """
+    if target.version != denied.version:
+        return False
+    return target.overlaps(denied)
 
 
 def _net_entry(entry: str) -> str:

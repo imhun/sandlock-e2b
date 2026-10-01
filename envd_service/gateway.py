@@ -160,7 +160,14 @@ def create_gateway(
         or control_url.startswith("https://localhost")
     )
 
-    app = FastAPI(title="E2B Sandlock Gateway - Envd Router")
+    # SEC-K0S-002 (2026-10-01): same reason as the control plane -- this
+    # service proxies sandbox traffic and must not advertise its own surface.
+    app = FastAPI(
+        title="E2B Sandlock Gateway - Envd Router",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     app.state.route_cache = routes
     app.state.route_subscriber = RouteInvalidationSubscriber(
         routes, redis_url=os.getenv("E2B_REDIS_URL")

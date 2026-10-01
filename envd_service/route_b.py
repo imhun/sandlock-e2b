@@ -1043,6 +1043,7 @@ SUPERVISE_POLICY_FIELDS: frozenset[str] = frozenset(
         "cwd",
         "deterministic_dirs",
         "disable",
+        "disk_stats_path",
         "egress_proxy",
         "env",
         "extra_allow_syscalls",

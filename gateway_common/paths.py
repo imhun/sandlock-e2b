@@ -282,6 +282,28 @@ def sandbox_runtime_dir(
     )
 
 
+_DISK_STATS_NAME = "disk-stats"
+
+
+def sandbox_disk_stats_path(
+    workspace_base: str | Path,
+    sandbox_id: str,
+    *,
+    state_base: str | Path | None = None,
+) -> Path:
+    """The host's disk accounting for one sandbox's ``statfs(2)``.
+
+    ``<state base>/_runtime/<id>/disk-stats`` holding ``<total_bytes>
+    <used_bytes>``. It lives beside the sandbox's record rather than in its
+    tree: the sandbox must not be able to write the numbers it is shown, and
+    the supervisor (which reads it on each ``statfs``) cannot reach the
+    sandbox's own mount namespace.
+    """
+    return sandbox_runtime_dir(
+        workspace_base, sandbox_id, state_base=state_base
+    ) / _DISK_STATS_NAME
+
+
 def sandbox_record_path(
     workspace_base: str | Path,
     sandbox_id: str,

@@ -2041,6 +2041,25 @@ class NodeAgent:
         """
         return self._maybe_scan_disk()
 
+    def _publish_disk_stats(self, report: dict[str, int]) -> None:
+        """Mirror a fresh disk report into each sandbox's ``statfs(2)`` file.
+
+        SEC-K0S-006: the quota is what the sandbox was sold (``diskMB`` at
+        create), the usage is what this round just measured. A sandbox with no
+        record (already gone) is skipped; ``_write_disk_stats`` never raises.
+        """
+        for sandbox_id, used in (report or {}).items():
+            record = self._runtime_registry.get(sandbox_id)
+            if record is None:
+                continue
+            total = int(getattr(record, "disk_mb", 0) or 0) * 1024 * 1024
+            _write_disk_stats(
+                self._settings,
+                sandbox_id,
+                total_bytes=total,
+                used_bytes=int(used or 0),
+            )
+
     async def _scan_disk_round(self) -> None:
         """Run one scan round off the loop and publish what it found."""
         # The cadence is claimed *before* the walk, so a failing or slow round
@@ -2078,6 +2097,12 @@ class NodeAgent:
             logger.warning("sandbox disk scan failed", exc_info=True)
             return
         self._disk_report = dict(report or {})
+        # SEC-K0S-006: mirror the fresh accounting into each sandbox's
+        # `statfs(2)` file, so `df` inside a sandbox shows its own quota and
+        # remainder rather than the node's volume. This round is the same
+        # measurement the platform's ledger uses, so the two cannot drift
+        # apart by more than the scan cadence.
+        self._publish_disk_stats(self._disk_report)
         if self._disk_trace:
             logger.info(
                 "disk trace: round=%s took=%.3fs got=%s",
@@ -2803,6 +2828,30 @@ class NodeAgent:
             setattr(self, attribute, None)
 
 
+def _write_disk_stats(
+    settings: Settings, sandbox_id: str, *, total_bytes: int, used_bytes: int
+) -> None:
+    """Publish one sandbox's disk accounting for the fork's ``statfs(2)``.
+
+    SEC-K0S-006: the sandbox's quota and what is left of it are the host's to
+    know, so the host writes them next to the sandbox's record (outside the
+    sandbox's own tree, which is what keeps them unforgeable) and the fork
+    reports them on each ``statfs``. Best effort on purpose: failing to publish
+    must never fail a create, and a missing file only means ``statfs`` falls
+    back to the kernel's answer.
+    """
+    from gateway_common.paths import sandbox_disk_stats_path, write_text_atomically
+
+    path = sandbox_disk_stats_path(
+        settings.workspace_base, sandbox_id, state_base=settings.state_base
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomically(path, f"{int(total_bytes)} {int(used_bytes)}\n")
+    except Exception:  # noqa: BLE001 - publish is best effort, never fatal
+        logger.warning("disk stats publish failed for %s", sandbox_id, exc_info=True)
+
+
 def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -> None:
     runtime_registry = request.app.state.runtime_registry
     workspace_base = settings.workspace_base
@@ -2938,6 +2987,13 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
             volume_mounts=mount_paths,
             volume_projects=volume_projects,
             iam_tokens=payload.get("iamTokens"),
+        )
+        # SEC-K0S-006: seed the `statfs(2)` accounting before the first scan
+        # round runs, so a `df` immediately after create already reports the
+        # quota instead of the node's volume. Usage starts at zero and the
+        # scan rounds keep it current.
+        _write_disk_stats(
+            settings, sandbox_id, total_bytes=disk_mb * 1024 * 1024, used_bytes=0
         )
     except BaseException:
         # I3: any failure between acquire and register (invalid volume

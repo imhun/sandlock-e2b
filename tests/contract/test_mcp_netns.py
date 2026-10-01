@@ -95,12 +95,14 @@ def _opts(harness):
     }
 
 
-@pytest.fixture()
-def wildcard_alias():
-    """198.18.0.x loopback address + /etc/hosts entry for a wildcard domain
-    (the SSRF-guard-allowed benchmark range), removed on teardown."""
-    hostname = "api.wild.test"
-    addr = None
+def _benchmark_loopback_address() -> str | None:
+    """A free ``198.18.x.y/32`` on ``lo``, or ``None`` without NET_ADMIN.
+
+    The benchmark range is the one the platform's private-range guard leaves
+    alone (``test_network_enforcement`` uses the same range), so it is how a
+    test reaches a hermetic local origin through an ``allowOut`` literal --
+    loopback itself is now refused as an egress target (SEC-K0S-004).
+    """
     for third in range(10, 20):
         for fourth in range(2, 254):
             candidate = f"198.18.{third}.{fourth}"
@@ -110,10 +112,35 @@ def wildcard_alias():
                 capture_output=True,
             )
             if add.returncode == 0:
-                addr = candidate
-                break
-        if addr is not None:
-            break
+                return candidate
+    return None
+
+
+@pytest.fixture()
+def origin_alias():
+    """A hermetic local-origin address that ``allowOut`` may name."""
+    addr = _benchmark_loopback_address()
+    if addr is None:
+        pytest.skip(
+            "local-origin fixture needs a free 198.18.x.x loopback address "
+            "(run with --cap-add NET_ADMIN)"
+        )
+    try:
+        yield addr
+    finally:
+        subprocess.run(
+            ["ip", "addr", "del", f"{addr}/32", "dev", "lo"],
+            check=False,
+            capture_output=True,
+        )
+
+
+@pytest.fixture()
+def wildcard_alias():
+    """198.18.0.x loopback address + /etc/hosts entry for a wildcard domain
+    (the SSRF-guard-allowed benchmark range), removed on teardown."""
+    hostname = "api.wild.test"
+    addr = _benchmark_loopback_address()
     if addr is None:
         pytest.skip(
             "wildcard local-origin fixture needs a free 198.18.x.x loopback "
@@ -223,7 +250,7 @@ def test_mcp_full_path_under_net_isolation(netns_servers):
         sandbox.kill()
 
 
-def test_cpython_connect_under_net_isolation(netns_servers):
+def test_cpython_connect_under_net_isolation(netns_servers, origin_alias):
     """E7.2: CPython socket.connect() inside a netns sandbox works on the
     fd-injection path (the supervisor returns 0 and swaps the child's own
     socket fd)."""
@@ -231,7 +258,10 @@ def test_cpython_connect_under_net_isolation(netns_servers):
 
     listener = socket.socket()
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", 0))
+    # Bound on the benchmark-range alias rather than loopback: the platform
+    # refuses loopback as an egress *target* (SEC-K0S-004), so a hermetic
+    # origin has to live on an address an `allowOut` literal can still name.
+    listener.bind((origin_alias, 0))
     listener.listen(1)
     port = listener.getsockname()[1]
     received: list[bytes] = []
@@ -248,14 +278,14 @@ def test_cpython_connect_under_net_isolation(netns_servers):
     thread.start()
 
     sandbox = Sandbox.create(
-        network={"allow_out": [f"127.0.0.1:{port}"]},
+        network={"allow_out": [f"{origin_alias}:{port}"]},
         **_opts(netns_servers),
     )
     try:
         code = (
             "import socket;"
             f"s=socket.socket();s.settimeout(5);"
-            f"s.connect((\"127.0.0.1\",{port}));"
+            f"s.connect((\"{origin_alias}\",{port}));"
             "s.sendall(b\"ping\");"
             "d=s.recv(4);"
             "print(\"RESULT:\"+d.decode());"
