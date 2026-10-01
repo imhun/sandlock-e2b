@@ -298,6 +298,16 @@ def sandbox_disk_stats_path(
     tree: the sandbox must not be able to write the numbers it is shown, and
     the supervisor (which reads it on each ``statfs``) cannot reach the
     sandbox's own mount namespace.
+
+    The **reader is not the writer**: in the route-B shape the supervisor is the
+    slot process at the sandbox's own host uid, while the file is written by the
+    worker. The directory therefore has to stay traversable by name (``0711``)
+    and the file readable (``0644``) -- see
+    :meth:`envd_service.runtime.registry.RuntimeRegistry._ensure_runtime_dir`
+    and ``envd_service.agent._write_disk_stats``, which pin both against the
+    ambient umask. A ``0700`` directory here looks stricter and is in fact a
+    silent outage: the supervisor's read fails and every ``statfs`` answers with
+    the node's volume again (measured 2026-10-01).
     """
     return sandbox_runtime_dir(
         workspace_base, sandbox_id, state_base=state_base

@@ -47,12 +47,48 @@ from tests.security.conftest import route_b_sandbox, run_sh, sandbox_tmpdir  # n
 PAYLOAD = r'''
 import ctypes, json, os, platform
 
+class _Statfs(ctypes.Structure):
+    _fields_ = [
+        ("f_type", ctypes.c_long),
+        ("f_bsize", ctypes.c_long),
+        ("f_blocks", ctypes.c_ulong),
+        ("f_bfree", ctypes.c_ulong),
+        ("f_bavail", ctypes.c_ulong),
+        ("f_files", ctypes.c_ulong),
+        ("f_ffree", ctypes.c_ulong),
+        ("f_fsid", ctypes.c_int * 2),
+        ("f_namelen", ctypes.c_long),
+        ("f_frsize", ctypes.c_long),
+        ("f_flags", ctypes.c_long),
+        ("f_spare", ctypes.c_long * 4),
+    ]
+
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 out = {"pid": os.getpid(), "ppid": os.getppid()}
 out["seccomp_mode"] = libc.prctl(21, 0, 0, 0, 0)  # PR_GET_SECCOMP
 
 st = os.statvfs("/")
 out["statvfs_root"] = [st.f_frsize, st.f_blocks, st.f_bfree, st.f_bavail]
+
+# The fd-based sibling: fstatfs(2) is a *different* syscall, so a handler
+# registered only for statfs(2) is not reached by `os.fstatvfs(fd)`.
+fd = os.open("/", os.O_RDONLY)
+fs = os.fstatvfs(fd)
+out["fstatvfs_root"] = [fs.f_frsize, fs.f_blocks, fs.f_bfree, fs.f_bavail]
+os.close(fd)
+
+# Raw statfs: what `df -T` would print as the filesystem type.
+raw = _Statfs()
+if libc.statfs(b"/", ctypes.byref(raw)) == 0:
+    out["statfs_root_f_type"] = hex(raw.f_type & 0xFFFFFFFF)
+    out["statfs_root_f_namelen"] = raw.f_namelen
+    out["statfs_root_f_files_eq_blocks"] = raw.f_files == raw.f_blocks
+try:
+    ws = _Statfs()
+    if libc.statfs(b"/workspace", ctypes.byref(ws)) == 0:
+        out["statfs_workspace_f_type"] = hex(ws.f_type & 0xFFFFFFFF)
+except Exception as exc:  # noqa: BLE001
+    out["statfs_workspace_err"] = str(exc)
 
 # Independent notif-mediated path syscall (Landlock has no inotify right).
 ifd = libc.inotify_init1(os.O_NONBLOCK)

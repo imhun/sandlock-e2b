@@ -72,3 +72,91 @@ def test_statfs_reports_the_published_accounting():
     )
     assert code == 0, err
     assert out.decode().strip() == "4096 2621440 262144 262144"
+
+
+@pytest.mark.usefixtures("require_sandlock")
+def test_the_numbers_the_worker_publishes_are_what_the_sandbox_sees():
+    """The production chain: worker publishes, *another uid* reads it.
+
+    The path is only half of the wiring. The worker writes as its own uid and
+    the route-B slot -- the process that answers `statfs` -- runs at the
+    sandbox's host uid, so the directory chain has to be traversable by name
+    and the file readable. Measured 2026-10-01: with the runtime directory at
+    its historical ``0700`` the slot's read failed with EACCES and every
+    `statfs` silently answered with the node's volume again, even though the
+    file existed and the handler was registered.
+    """
+    from envd_service.agent import _write_disk_stats
+    from envd_service.config import Settings
+    from gateway_common.paths import sandbox_disk_stats_path
+    from tests.security.conftest import (
+        make_sandbox_visible,
+        route_b_sandbox,
+        run_sh,
+        sandbox_tmpdir,
+    )
+
+    state = Path(sandbox_tmpdir(suffix="-state"))
+    # pytest's own tmp trees are 0700 root-owned; the slot would be stopped by
+    # those ancestors before it ever reached the modes under test, and the
+    # production state base is a 0755 volume.
+    make_sandbox_visible(state)
+    settings = Settings(workspace_base=str(state))
+    sandbox_id = "sbx_worker_published"
+    # The production order matters: the registry creates `_runtime/<id>` first
+    # (that is where its 0700 used to come from), and the scan round publishes
+    # the accounting into it afterwards.
+    from envd_service.runtime.registry import RuntimeRegistry
+
+    registry = RuntimeRegistry(settings.workspace_base, state_base=settings.state_base)
+    registry.register(
+        sandbox_id=sandbox_id,
+        access_token="token",
+        workspace_dir=str(state / sandbox_id),
+        disk_mb=10240,
+    )
+    _write_disk_stats(settings, sandbox_id, total_bytes=10 * 1024**3, used_bytes=4 * 1024**3)
+    stats = sandbox_disk_stats_path(
+        settings.workspace_base, sandbox_id, state_base=settings.state_base
+    )
+    # 10 GiB sold, 4 GiB used -> 6 GiB free, in 4 KiB blocks.
+    assert stats.read_text() == f"{10 * 1024**3} {4 * 1024**3}\n"
+
+    ws = Path(sandbox_tmpdir())
+    probe = (
+        "import os\n"
+        "s = os.statvfs('/')\n"
+        # Any handle the sandbox already holds will do -- the accounting is
+        # path-independent, and /etc is not in a pure sandbox's read set.
+        "fd = os.open('/workspace/statfs_probe.py', os.O_RDONLY)\n"
+        "f = os.fstatvfs(fd)\n"
+        "print(s.f_frsize, s.f_blocks, s.f_bfree, s.f_bavail)\n"
+        "print(f.f_frsize, f.f_blocks, f.f_bfree, f.f_bavail)\n"
+    )
+    (ws / "statfs_probe.py").write_text(probe)
+    executor, workspace = route_b_sandbox(None, None, workspace=ws, disk_stats_path=str(stats))
+    try:
+        code, out, err = asyncio.run(
+            run_sh(executor, workspace, "/usr/local/bin/python3 /workspace/statfs_probe.py")
+        )
+        assert code == 0, err
+        # Both spellings: `statvfs(path)` takes statfs(2), `fstatvfs(fd)` takes
+        # the fd-based sibling, which is a different syscall (measured
+        # 2026-10-01: without its own trap it answered the node's volume while
+        # the path call reported the ledger).
+        assert out.decode().strip() == (
+            "4096 2621440 1572864 1572864\n4096 2621440 1572864 1572864"
+        )
+
+        # The next scan round publishes fresh numbers to the same path; the
+        # sandbox must see them without being restarted.
+        _write_disk_stats(settings, sandbox_id, total_bytes=10 * 1024**3, used_bytes=9 * 1024**3)
+        code, out, err = asyncio.run(
+            run_sh(executor, workspace, "/usr/local/bin/python3 /workspace/statfs_probe.py")
+        )
+        assert code == 0, err
+        assert out.decode().strip() == (
+            "4096 2621440 262144 262144\n4096 2621440 262144 262144"
+        )
+    finally:
+        executor.close()

@@ -2839,6 +2839,17 @@ def _write_disk_stats(
     reports them on each ``statfs``. Best effort on purpose: failing to publish
     must never fail a create, and a missing file only means ``statfs`` falls
     back to the kernel's answer.
+
+    **The reader is not the writer.** In the route-B shape the mediator that
+    reads this file is the slot process, whose euid is the sandbox's host uid
+    (10000+) while the worker writes as 65534 -- so the modes cannot be left to
+    the ambient umask. They are the same rules the slot documents follow
+    (``route_b._write_slot_documents``): directories traversable by name
+    (``0711``, listable by nobody) and the file itself world-readable
+    (``0644``) -- these numbers are what the sandbox is *shown*, so there is
+    nothing to scope. Measured 2026-10-01: with the runtime directory at its
+    historical ``0700`` the slot's ``read`` failed with EACCES and every
+    ``statfs`` silently fell back to the node's numbers.
     """
     from gateway_common.paths import sandbox_disk_stats_path, write_text_atomically
 
@@ -2846,8 +2857,16 @@ def _write_disk_stats(
         settings.workspace_base, sandbox_id, state_base=settings.state_base
     )
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_dir = path.parent
+        state_dir = runtime_dir.parent
+        state_dir.mkdir(parents=True, exist_ok=True)
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(state_dir, 0o711)
+        os.chmod(runtime_dir, 0o711)
         write_text_atomically(path, f"{int(total_bytes)} {int(used_bytes)}\n")
+        # `write_text_atomically` stages at `0o666 & ~umask`, so say it again
+        # after the rename: the slot uid is neither the owner nor in its group.
+        os.chmod(path, 0o644)
     except Exception:  # noqa: BLE001 - publish is best effort, never fatal
         logger.warning("disk stats publish failed for %s", sandbox_id, exc_info=True)
 

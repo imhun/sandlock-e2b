@@ -211,7 +211,13 @@ def test_registry_persists_host_uid(tmp_path):
     payload = json.loads(record_path.read_text(encoding="utf-8"))
     assert payload["host_uid"] == POOL_START
     assert not (tmp_path / "sbx_a" / "sandbox.json").exists()
-    assert stat.S_IMODE(record_path.parent.stat().st_mode) == 0o700
+    # Traversable **by name** (0711), not listable: the sandbox's own uid is
+    # not the owner, so 0700 kept it out -- and also kept out the route-B slot
+    # that has to read the disk-accounting file beside this record. What closes
+    # the record is its own mode, not the directory (see
+    # ``test_disk_stats_publish.test_only_the_ledger_is_world_readable_in_the_runtime_dir``).
+    assert stat.S_IMODE(record_path.parent.stat().st_mode) == 0o711
+    assert stat.S_IMODE(record_path.stat().st_mode) == 0o600
     loaded = RuntimeRegistry(tmp_path).get("sbx_a")
     assert loaded is not None
     assert loaded.host_uid == POOL_START

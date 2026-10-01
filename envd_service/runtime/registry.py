@@ -1068,18 +1068,30 @@ class RuntimeRegistry:
     def _ensure_runtime_dir(self, sandbox_id: str) -> Path:
         """Create ``_runtime/<id>``, owned by the worker and closed to sandboxes.
 
-        ``0700`` on purpose: the per-sandbox host uid is not the owner and is
-        (by the E3.2 model) not in the worker's group either, so the sandbox
-        cannot traverse into it -- not to read the record, and not to delete
-        it. Ownership follows whoever runs the worker (root in the production
-        shape), never the sandbox uid.
+        ``0711``: traversable **by name only** (no listing) and, since the
+        files inside are what close it, closed to the sandbox either way --
+        the record and the command log are ``0600``
+        (:meth:`_write_record` / :class:`~envd_service.process.logs.CommandLogWriter`),
+        so the per-sandbox host uid cannot read them and (having no write bit)
+        cannot delete them. Ownership follows whoever runs the worker, never
+        the sandbox uid.
+
+        Why not ``0700``: the *disk accounting* file beside the record is read
+        by the route-B slot, whose euid is the sandbox's host uid -- a
+        different uid from the worker's -- so the directory has to be
+        traversable for that one read. Measured 2026-10-01: at ``0700`` the
+        slot's read failed with EACCES and every ``statfs`` in the sandbox
+        silently answered with the node's volume instead of the platform's
+        numbers. The parent is pinned too, so an operator umask of 077 cannot
+        decide this either.
         """
         path = sandbox_runtime_dir(
             self._workspace_base, sandbox_id, state_base=self._state_base
         )
         path.mkdir(parents=True, exist_ok=True)
         try:
-            os.chmod(path, 0o700)
+            for directory in (path.parent, path):
+                os.chmod(directory, 0o711)
             os.chown(path, os.geteuid(), os.getegid())
         except OSError:  # pragma: no cover - best effort, like the modes above
             pass
@@ -1178,6 +1190,15 @@ class RuntimeRegistry:
                 # uid is free", which is how two sandboxes end up sharing one
                 # host uid with E3.2's isolation silently gone.
                 write_json_atomically(path, record.to_dict())
+                # The directory is traversable by name (0711) so the route-B
+                # slot can reach the disk-accounting file beside this one; the
+                # record itself carries the access token, so it is closed by
+                # its own mode rather than by the directory (`write_json_
+                # atomically` stages at `0o666 & ~umask`).
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:  # pragma: no cover - best effort, as above
+                    pass
                 # The in-tree copy was the pre-split location and is still
                 # writable by the sandbox itself; once the authoritative copy
                 # exists outside the tree, drop it rather than leave a

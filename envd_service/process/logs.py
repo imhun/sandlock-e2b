@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -99,6 +100,12 @@ class CommandLogWriter:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with open(self._path, "ab") as f:
                 f.write(raw)
+            # The runtime directory is traversable by name so a route-B slot at
+            # another uid can read the disk accounting file that lives beside
+            # this log; the log's own content (command output) stays closed.
+            # Idempotent, and it also narrows a file an earlier version left at
+            # the umask's mode.
+            os.chmod(self._path, 0o600)
             self._file_bytes += len(raw)
         except OSError:
             self._file_full = True

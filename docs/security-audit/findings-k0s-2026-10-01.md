@@ -19,7 +19,7 @@ E2B 兼容沙箱，版本 `0.1.0-824-gf2aec0b-20261001-073534`。
 |---|---|---|---|
 | SEC-K0S-005 | **高** | `network.allowPublicTraffic=true` 关掉 **envd 整个表面**的访问令牌校验；实测**未认证** `process.Process/Start` 执行任意命令（exit 0、stdout 取回）。与 004 串联 ⇒ 跨沙箱未认证 RCE | 已确认，**未修** |
 | SEC-K0S-004 | **中高** | 租户可控的 `allowOut` 无私有/集群网段过滤：`allow_out=["10.244.0.0/16"]` 即可从**沙箱内**打到控制面 3000、worker envd 49983、redis 6379（协议级 200） | 已确认，**未修** |
-| SEC-K0S-006 | **中** | `sysinfo(2)`/`getcpu`/`statfs` 未命名空间化：监控过的 `/proc` 在"说谎"（1 GiB / load 0.00 / 4 进程），裸系统调用却是**宿主真值**（7.5 GiB / load 0.31 / 685 进程）+ 宿主运行时间。实测可观测**邻居沙箱**的进程数变化（686→701） | 已确认，**未修** |
+| SEC-K0S-006 | **中** | `sysinfo(2)`/`getcpu`/`statfs` 未命名空间化：监控过的 `/proc` 在"说谎"（1 GiB / load 0.00 / 4 进程），裸系统调用却是**宿主真值**（7.5 GiB / load 0.31 / 685 进程）+ 宿主运行时间。实测可观测**邻居沙箱**的进程数变化（686→701） | 已确认；`sysinfo`/`getcpu`/`statfs` 三项**已修**（statfs 见 §SEC-K0S-006 的"修复更正（第二轮）"） |
 | SEC-K0S-002 | 中 | 控制面 `/openapi.json`/`/docs`/`/redoc`（外加 `/`、`/healthz`）无需认证 —— 上一轮已记录，本轮**复核仍在**，且新增"沙箱内也能拉"（见 004） | 已确认，**未修** |
 
 ## 目标形态（先钉死）
@@ -248,6 +248,18 @@ freeram    : 215 - 242 MiB            ← 宿主空闲内存的抖动能反推�
 是同一类"Landlock 覆盖不到的带路径 syscall"）。注意 `sysinfo` 是 glibc/运行时常用的
 （`os.sysconf`、部分 GC/JIT），**优先做成"按受限值中介"而不是直接拒绝**，否则会表现为"工作负载坏了"。
 
+### 修复更正（2026-10-01，第二轮）：`statfs` 还有两条，都不是通知层的问题
+
+第一轮把 `statfs` 的失效归到了 SEC-K0S-007（"载荷收不到通知"，**已撤回**）。真正让它不生效的是三条**互不相干**的原因，逐条实测后都已修：
+
+| # | 原因（实测） | 现象 | 修法 |
+|---|---|---|---|
+| 1 | **handler 优先级**：`build_dispatch_table` 先注册 chroot 的 `SYS_statfs`（`dispatch.rs:600`），后注册 disk-stats（687），而链在第一个非 `Continue` 处停止 | `chroot="/"` 报宿主 72335360 块，去掉 chroot 报账本 2621440 块（同一 wheel） | fork `79c2527`：disk-stats 注册前移；回归 `test_procfs::test_statfs_accounting_wins_over_the_chroot_handler` |
+| 2 | **`fstatfs(2)` 没被拦**：它是另一个 syscall，`os.fstatvfs(fd)`、任何"对已打开的句柄取容量"的调用都走它 | 同一形状里 `statvfs("/")` = 2621440（账本），`fstatvfs(fd)` = 72335360（宿主） | fork `e8c6730`：`SYS_fstatfs` 一并注册（同一账本、从子进程的 fd 取 `f_type`/`f_namelen`）；测试两种拼写都断言 |
+| 3 | **E2B 侧的权限**：账本写在 `<state>/_runtime/<id>/`，而 registry 把该目录钉成 **0700**（"closed to sandboxes"）；route-B 的槽位是**另一个 uid**（沙箱 host uid 10000+），根本走不进去 | 文件在、handler 注册了，读却 `EACCES` ⇒ 每条 `statfs` 静默回退宿主数字（这正是"部署形态下不生效"在线上最可能的样子） | E2B：目录链改 **0711**（按名可穿、不可列），记录/命令日志各自 **0600** 关闭，账本 **0644**；记录一条跨 uid 单测 + 一条走 worker `_write_disk_stats` 的 route-B 端到端验收 |
+
+**已知残余（不修，记录在案）**：账本回答里 `f_type`/`f_namelen` 是从**监督器视角**的路径 seed 出来的（`libc::statfs(子进程给的路径)`），所以在 chroot/真根形态下它描述的是 worker 命名空间里的那个路径，可能不是沙箱看到的那个挂载类型；块数、剩余量、inode 计数都是平台的（`df` 不带 `-T` 时完全正确）。要精确到挂载类型得让 chroot 解析器参与 seed，那是另一件事。
+
 ---
 
 ## 复核：SEC-K0S-002 仍在（且新增"沙箱内可达"）
@@ -354,7 +366,7 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"     # 只有"从 worker pod 观测"�
 | SEC-K0S-004（IP/CIDR 形态） | **已修复（代码）** | `gateway_common/network.py::sandlock_network_policy` 的 allowlist 分支现在也用 `private_deny_cidrs`（= `E2B_NETWORK_DENY_CIDRS`，**与隐式分支同一把尺子**）做减法，deny 优先；判定用**重叠**而非包含（`0.0.0.0/0`、`::/0` 这类比保护段更宽的条目同样被丢，fail closed），并按协议族分别比较。同时修好 `_to_net_allow` 的条目解析——旧的 `entry.split(":", 1)[0]` 让 `tcp://…`、`host:port`、`CIDR:port` 三种写法**绕过**了 deny 减法。回归：`tests/unit/test_network_config.py::test_policy_explicit_allowout_is_filtered_by_private_entries`。受影响的本地源站用例改用仓库既有的 `198.18.x.y` 基准段（`tests/contract/test_mcp_netns.py` 的 `origin_alias`）。 |
 | SEC-K0S-004（**域名**形态） | **未修复 —— 需要 fork 侧改动** | 域名由 fork 在建连时解析，平台侧只做字面量判定 ⇒ `allow_out=["10.244.140.26.nip.io:49983"]` 这类**解析到内网的域名**仍然可达（实测过）。正确修法是让 fork 支持"allowlist + 硬拒集并存"（deny 优先）：`NetworkPolicy::AllowList` 增一个 denied 集合、`sandbox/builder.rs` 放开 `net_allow`/`net_deny` 互斥、E2B 侧把 `net_deny = protected` 与 `net_allow` 一起下发。改动落在 `third_party/sandlock`（子模块）+ 重新出轮子 + 重出镜像 + 滚集群，**本轮未做**。 |
 | SEC-K0S-006（`sysinfo`/`getcpu`） | **已修复（fork，见文末）** | fork 按"中介而非拒绝"合成：`sysinfo` 回沙箱预算、其余宿主态归零，`getcpu` 回 0。 |
-| SEC-K0S-006（`statfs`） | **已修复（2026-10-01 更正）** | 语义按用户裁定"配额 + 剩余"落地；原判"部署形态下不生效、根因是 SEC-K0S-007"**作废** —— 真根因是 fork 的 **handler 优先级**（chroot 的 `SYS_statfs` handler 先注册、先答），已把 disk-stats handler 的注册前移到 chroot 之前，并加回归 `test_procfs::test_statfs_accounting_wins_over_the_chroot_handler`。E2B 验收：`tests/security/escape/test_disk_stats_statfs.py` 摘掉 `xfail` 后在 route-B 形状转绿。 |
+| SEC-K0S-006（`statfs`） | **已修复（2026-10-01，两轮）** | 语义按用户裁定"配额 + 剩余"落地；原判"部署形态下不生效、根因是 SEC-K0S-007"**作废**。实测有三条互不相干的原因，全修：① fork 的 **handler 优先级**（chroot 的 `SYS_statfs` 先注册先答，`79c2527`）；② **`fstatfs(2)` 没拦**（`fstatvfs(fd)` 仍报宿主，`e8c6730`）；③ **E2B 权限**：账本在 `_runtime/<id>` 里而该目录钉死 `0700`，route-B 槽位是另一个 uid ⇒ 读 `EACCES` ⇒ 静默回退宿主数字（目录链改 0711、记录/日志 0600、账本 0644）。回归：fork `test_procfs::test_statfs_accounting_wins_over_the_chroot_handler`（+ 两种拼写）；E2B `tests/security/escape/test_disk_stats_statfs.py` 摘掉 `xfail` 并新增"worker 发布 → 槽位（另一个 uid）读到"的端到端用例；`tests/unit/test_disk_stats_publish.py` 用真实跨 uid 读一次（账本 OK / 记录 EACCES）。详见本报告 §SEC-K0S-006 的"修复更正（第二轮）"。 |
 | `clone3` 命名空间位 | **源码里已修** | 见文末更正。 |
 | ~~**SEC-K0S-007**~~ | ~~高~~ **已撤回（2026-10-01 同日复核）** | 原判"route-B 形态下载荷不产生任何 seccomp 通知 ⇒ 所有 notif 类中介失效"**不成立**：同一形状（`route_b_sandbox(None, None)` + route B）里载荷的 `statfs`/`openat` 通知都到监督器（trace `notif nr=137 pid=<载荷> -> return-value`），`uname` 主机名虚拟化、`/proc` 合成、`inotify_add_watch` 中介也都在载荷上生效。`statfs` 失效的真根因是 handler 优先级，已修并钉住。详见文末更正段。 |
 
@@ -364,7 +376,7 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"     # 只有"从 worker pod 观测"�
 |---|---|---|
 | SEC-K0S-004（域名形态） | **已修复（fork + E2B）** | fork 新增 **deny 优先**组合：`NetworkPolicy::AllowList` 增 `denied: DeniedDestinations`（`seccomp/notif.rs`），`allows()` 先查 deny 再查 allow；`sandbox/builder.rs` 放开 `net_allow`/`net_deny` 互斥；`sandbox.rs` 在两者并存时把解析后的 deny 集挂到同一协议的策略上（`network/rules.rs::denied_filter_from`）。E2B 侧 `sandlock_network_policy` 把 `private_deny_cidrs` **同时**下发为 `net_deny`，于是"域名解析到内网"也被拒。回归：fork 侧 `notif.rs` 新增 3 条组合单测（lib **917 passed / 0 failed**，基线 914）、`sandbox/tests.rs` 的互斥用例改为"可并存"；E2B 侧 `tests/security/escape/test_network_deny_bypass.py::test_explicit_allowout_cannot_reach_a_protected_range`（**字面量 + 主机名两种写法都必须 DENIED**，在 lane 里 **1 passed**）。 |
 | SEC-K0S-006（`sysinfo`/`getcpu`） | **已修复（fork）** | fork 新增 `procfs::handle_sysinfo` / `handle_getcpu`（沿用 `handle_uname` 那套"算完写回子进程内存"的原语 `write_child_mem`）：`sysinfo` 报**沙箱自己的内存预算**（与 `generate_meminfo` 同源，也即 `/proc/meminfo` 的那份值），`loads`/`procs`/`uptime`/swap 等平台不建模的量一律**归零而不是报宿主的**；`getcpu` 两个指针都写 0。注册条件与既有虚拟化对齐（`sysinfo` 挂 `memory_limit`，`getcpu` 挂 `virtual_cpu_count`），并在 `seccomp_plan` 里把两个号加进通知集。回归：fork `test_procfs.rs::test_sysinfo_virtualization`（真沙箱里 `sysinfo` 必须回 `256 MiB / load 0 / procs 0 / uptime 0`、`getcpu` 必须回 `cpu 0`）；`procfs` 一族 **12 passed**。E2B 侧无需改动（它只是消费 fork）。 |
-| SEC-K0S-006（`statfs`） | **已修复（2026-10-01）** | 语义按用户裁定："报沙箱的**配额和剩余空间**"。实现：fork 新增 `disk_stats_path` 选项（宿主维护 `<total_bytes> <used_bytes>`，handler 每次 `statfs` 现读合成 4 KiB 块、`f_type`/`f_namelen` 保留真值、文件缺失退内核）+ `SYS_statfs` 进通知集 + supervise 的 wire 字段/apply/示例；E2B 侧共享路径 helper（放在沙箱树之外，不可伪造）→ factory → executor → **agent 建时写 `total=disk_mb, used=0`、每轮磁盘扫描后刷新**。原判"部署形态下不生效、根因是通知层"**已更正**：真正的原因是 **handler 优先级** —— `build_dispatch_table` 先 `register_chroot_handlers`（注册 `SYS_statfs → handle_chroot_statfs`）再注册 disk-stats handler，而链在第一个非 `Continue` 处停止，于是每个带 chroot 根的形态（pure/合成根、镜像 rootfs、真根＝全部生产形态）都由 chroot handler 作答。修法：把 disk-stats 的注册前移；回归 `test_procfs::test_statfs_accounting_wins_over_the_chroot_handler`（修前 `4096 72335360 …`＝宿主 XFS，修后 `4096 2621440 1572864`＝账本），E2B 侧 `tests/security/escape/test_disk_stats_statfs.py` 由 `xfail` 转正向通过。 |
+| SEC-K0S-006（`statfs`） | **已修复（2026-10-01，两轮）** | 语义按用户裁定："报沙箱的**配额和剩余空间**"。实现：fork 新增 `disk_stats_path` 选项（宿主维护 `<total_bytes> <used_bytes>`，handler 每次 `statfs` 现读合成 4 KiB 块、`f_type`/`f_namelen` 保留真值、文件缺失退内核）+ `SYS_statfs`/`SYS_fstatfs` 进通知集 + supervise 的 wire 字段/apply/示例；E2B 侧共享路径 helper（放在沙箱树之外，不可伪造）→ factory → executor → **agent 建时写 `total=disk_mb, used=0`、每轮磁盘扫描后刷新**。原判"部署形态下不生效、根因是通知层"**已更正**，实测三条原因：① **handler 优先级**（chroot 的 `SYS_statfs` 先注册、先答 → 注册前移，`79c2527`）；② **`fstatfs(2)` 没拦**（`os.fstatvfs` 仍报宿主 → `SYS_fstatfs` 一并注册，`e8c6730`）；③ **E2B 的 `_runtime/<id>` 是 0700**，route-B 槽位（另一个 uid）读不到账本 ⇒ 静默回退（目录 0711 / 记录与日志 0600 / 账本 0644）。回归：fork `test_procfs::test_statfs_accounting_wins_over_the_chroot_handler`（修前 `4096 72335360 …`＝宿主，修后 `4096 2621440 1572864`＝账本，两种拼写都断言）+ `test_chroot` 52 passed；E2B `tests/security/escape/test_disk_stats_statfs.py` 由 `xfail` 转正向通过，另加"worker 发布 → 槽位读到"的端到端用例。 |
 | `clone3` 命名空间位 | **无需修（源码里已修）** | 更正上一轮的记述：当前 fork 源码 `resource.rs::handle_fork` 的命名空间检查**已经不限于 `SYS_clone`**（用 `clone_flags` 读 `clone_args`，对整族生效），注释里记着 2026-09-30 那次"外层 profile 在替沙箱兜底"的教训。实测与之一致：`clone3` 带 `NEWUSER/NEWNS/NEWPID/...` 全部 EPERM，裸 `clone3`/`clone` 正常。 |
 
 ---

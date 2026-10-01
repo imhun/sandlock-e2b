@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from types import SimpleNamespace
 
 
 import pytest
@@ -27,6 +28,17 @@ class _BlockingRegistry:
         self.release = release
         self.fail = fail
         self.calls = 0
+
+    def get(self, sandbox_id: str):
+        """The record the round publishes accounting for (SEC-K0S-006).
+
+        ``_publish_disk_stats`` reads the sandbox's ``diskMB`` off the record
+        for every id the scan reported; a fake without this turns the round
+        into an ``AttributeError`` rather than a report.
+        """
+        if sandbox_id not in ("sbx_a", "sbx_cross"):
+            return None
+        return SimpleNamespace(disk_mb=1024)
 
     def disk_usage_snapshot(
         self, *, budget_s: float | None = None, dirty: bool = False
