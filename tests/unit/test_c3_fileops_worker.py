@@ -905,3 +905,32 @@ async def test_the_disabled_orphan_sweep_is_named_at_startup(
         "reclaims them (Task 6). E2B_UID_RECONCILE_ON_STARTUP has no effect in "
         "this shape",
     ]
+
+
+def test_a_sandbox_the_control_plane_does_not_know_is_its_own_error() -> None:
+    """A 404 is not "the control plane is broken" -- it says the sandbox is gone.
+
+    The two used to be the same ``AgentFileOpsError``, so every caller could
+    only retry. For the *record* that is the wrong answer: a runtime record this
+    worker holds for a sandbox the control plane has forgotten can never be
+    used again (every op is authorized against the CP's records), and retrying
+    is what produced the measured storm -- see
+    ``tests/unit/test_c3_fileop_degradation.py::
+    test_a_record_the_control_plane_does_not_know_is_dropped``.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404, json={"message": f"Sandbox {SANDBOX} not found"}
+        )
+
+    client = _client(handler)
+    with pytest.raises(agent_fileops.AgentFileOpsUnknownSandbox) as excinfo:
+        client.workspace_bytes(SANDBOX)
+
+    assert str(excinfo.value) == (
+        f"the control plane refused walk-workspace for sandbox {SANDBOX} "
+        f"(HTTP 404): Sandbox {SANDBOX} not found"
+    )
+    # ...and it is still the failure every existing handler catches.
+    assert isinstance(excinfo.value, AgentFileOpsError)

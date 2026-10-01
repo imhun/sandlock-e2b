@@ -450,3 +450,80 @@ def test_a_measurable_account_still_reports_its_usage(
     monkeypatch.setenv("E2B_PLATFORM_DISK_MB", "4096")
     measured = node_agent._measure_platform_account(tmp_path)
     assert measured == {"platformDiskUsedMB": 3, "platformDiskBudgetMB": 4096}
+
+
+class _UnknownSandboxClient:
+    """An agent client the control plane answers with "no such sandbox"."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def workspace_bytes(self, sandbox_id: str):
+        self.calls.append(("walk-workspace", sandbox_id))
+        raise agent_fileops.AgentFileOpsUnknownSandbox(
+            f"the control plane refused walk-workspace for sandbox {sandbox_id} "
+            f"(HTTP 404): Sandbox {sandbox_id} not found"
+        )
+
+
+def _register_one_record(registry, workspace: Path) -> None:
+    workspace.mkdir(exist_ok=True)
+    registry.register(
+        sandbox_id=SANDBOX,
+        access_token="tok",
+        workspace_dir=str(workspace),
+        disk_mb=1024,
+    )
+
+
+def test_a_record_the_control_plane_does_not_know_is_dropped(
+    tmp_path: Path, install_client, caplog
+) -> None:
+    """A worker record must not outlive the control plane's record.
+
+    Measured on the fleet (2026-10-01): stale runtime records made *every* disk
+    round ask the control plane to walk a sandbox it had already forgotten --
+    ~5 requests/s of 404s on one worker, hours of it, and enough log volume to
+    push the worker's own startup lines out of the container log. A *definite*
+    "no such sandbox" is the one answer that must not be retried: nothing can
+    ever authorize an operation on that id again, and the tree (if it is still
+    there) belongs to the control plane's orphan GC, not to this record.
+    """
+    registry = RuntimeRegistry(tmp_path)
+    _register_one_record(registry, tmp_path / SANDBOX)
+    client = install_client(_UnknownSandboxClient())
+    caplog.set_level(logging.WARNING, logger="envd_service.runtime.registry")
+
+    assert registry.disk_usage_snapshot() == {}
+
+    assert [record.message for record in caplog.records if record.name == "envd_service.runtime.registry"] == [
+        f"the control plane has no record of {SANDBOX}: dropping this worker's "
+        "runtime record (AgentFileOpsUnknownSandbox: the control plane refused "
+        f"walk-workspace for sandbox {SANDBOX} (HTTP 404): Sandbox {SANDBOX} "
+        "not found); its tree, if any, is left to the control plane's "
+        "orphan-tree GC",
+    ]
+    # The claim is gone...
+    assert registry.list() == []
+    # ...and the next round does not ask again (that is the whole point: the
+    # 404 storm stops here instead of repeating every scan).
+    assert registry.disk_usage_snapshot() == {}
+    assert client.calls == [("walk-workspace", SANDBOX)]
+
+
+def test_a_control_plane_that_is_unreachable_keeps_the_record(
+    tmp_path: Path, install_client, caplog
+) -> None:
+    """The contrast: a transport failure is retryable, so the record stays.
+
+    Dropping a record because the control plane was briefly unreachable would
+    turn a network blip into data the worker can never reclaim.
+    """
+    registry = RuntimeRegistry(tmp_path)
+    _register_one_record(registry, tmp_path / SANDBOX)
+    client = install_client(_FailingClient())
+    caplog.set_level(logging.WARNING, logger="envd_service.runtime.registry")
+
+    assert registry.disk_usage_snapshot() == {}
+    assert [record.sandbox_id for record in registry.list()] == [SANDBOX]
+    assert client.calls == [("walk-workspace", (SANDBOX,), {})]

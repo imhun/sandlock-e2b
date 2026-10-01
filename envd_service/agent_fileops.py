@@ -50,6 +50,20 @@ class AgentFileOpsError(RuntimeError):
     """A named, fail-closed failure of one file operation."""
 
 
+class AgentFileOpsUnknownSandbox(AgentFileOpsError):
+    """The control plane has no record of this sandbox (HTTP 404).
+
+    Its own type because the two failure modes ask for opposite reactions:
+    an unreachable control plane is retryable, while a *definite* "no such
+    sandbox" means nothing will ever authorize an operation on that id again.
+    The worker's runtime record is its claim on a tree, and a claim the
+    control plane does not recognize can only produce work that cannot
+    succeed -- measured on the fleet 2026-10-01 as a 404 storm (every disk
+    round walking a forgotten sandbox, ~5 requests/s, for hours) that started
+    with exactly this answer being treated as a transient error.
+    """
+
+
 class AgentFileOps:
     """The worker's client for face B."""
 
@@ -121,10 +135,16 @@ class AgentFileOps:
             ) from exc
         if response.status_code >= 300:
             detail = _error_detail(response)
-            raise AgentFileOpsError(
+            message = (
                 f"the control plane refused {op} for sandbox {sandbox_id} "
                 f"(HTTP {response.status_code}): {detail}"
             )
+            if response.status_code == 404:
+                # "No such sandbox" is not "the control plane is broken": the
+                # caller that holds a *record* for it has to drop the record
+                # rather than retry (see the class docstring).
+                raise AgentFileOpsUnknownSandbox(message)
+            raise AgentFileOpsError(message)
         try:
             answer = response.json()
         except ValueError as exc:

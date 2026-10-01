@@ -428,6 +428,28 @@ class RuntimeRegistry:
                     # N4). Named, never silent.
                     try:
                         size = client.workspace_bytes(record.sandbox_id)
+                    except agent_fileops.AgentFileOpsUnknownSandbox as exc:
+                        # A *definite* "no such sandbox" (HTTP 404) is not a
+                        # transient failure: nothing will ever authorize an
+                        # operation on this id again, so the record has to go
+                        # instead of being retried every round. This is what
+                        # the storm was: stale records made each round ask the
+                        # control plane to walk a sandbox it had forgotten
+                        # (measured 2026-10-01: ~5 requests/s of 404s on one
+                        # worker, until the container log was full of them).
+                        # The tree -- if there is one -- is the control
+                        # plane's orphan-tree GC's problem, not this record's.
+                        logger.warning(
+                            "the control plane has no record of %s: dropping "
+                            "this worker's runtime record (%s: %s); its tree, "
+                            "if any, is left to the control plane's "
+                            "orphan-tree GC",
+                            record.sandbox_id,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        self.unregister(record.sandbox_id)
+                        size = None
                     except Exception as exc:  # noqa: BLE001 - see above
                         logger.warning(
                             "cannot measure %s through the agent: %s: %s",
