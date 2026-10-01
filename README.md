@@ -4,13 +4,37 @@
 [Sandlock](https://github.com/imhun/sandlock)（Landlock + seccomp-bpf + seccomp user
 notification）在自己机器的 Linux 内核上跑用户代码 —— 不需要 Firecracker，也不需要虚拟化。
 
+## 核心优势
+
+- **不需要虚拟化，也不需要 KVM。** 沙箱就是"一个带 userns / pidns / netns 的进程"（见
+  [§2](#2-隔离边界三种命名空间)），没有 guest 内核、没有 microVM 的启动路径与固定内存开销，
+  一台普通 Linux 机器就能跑（内核 ≥ 6.12，即 Landlock ABI ≥ 6）。本项目的生产集群是
+  2 节点 arm64 / Rocky Linux 10.2 / `6.12.0` / k0s —— 没有 GPU、没有嵌套虚拟化。
+- **官方 SDK 零代码修改。** 换三个环境变量（`E2B_API_URL` / `E2B_SANDBOX_URL` / `E2B_API_KEY`）
+  就能把现有 E2B 代码切过来，Python 与 JS 都用官方包（覆盖的 API 见下方清单）。
+- **权限面被压到最小。** worker 完全非 root（uid 65534、容器 BND 是空集、镜像里**没有任何
+  file-capability 二进制**），全部特权动作集中到每节点**一个 agent** 的两个面上；而且
+  **worker ↔ agent 之间没有通道** —— worker 只会拨控制面，控制面才会拨 agent，
+  "叫不出名字就拨不出去"。
+- **控制面自己闭环。** 调度 / 准入 / 磁盘配额台账 / 自愈 / 自动扩缩容（只缩 worker
+  StatefulSet，且缩容前确认目标 pod 真的会被删掉）都在本仓库里，没有外部服务依赖；
+  Redis 可选，不配就是单进程内存态。
+- **fail-closed 且可审计。** 不支持的 API 一律返回官方 Error JSON（501），不返回假成功；
+  半配置的形态在启动期**具名拒绝**而不是静默降级；"unknown" 从不被读成 `0`（磁盘/配额口径）；
+  每次上线都有版本戳与验收读数（[docs/deploy-clusters.md](docs/deploy-clusters.md) §7）。
+- **可自托管、可离线。** 镜像构建脚本、k8s 清单、k0s overlay、镜像源多源回落/本地源方案都在
+  仓库里，不依赖任何云厂商 API；开发机（macOS + Local 执行器）与生产共用同一套代码，
+  协议兼容性在本地就能验。
+
+> 先看代价：必须跑 Linux（Landlock/seccomp 是内核特性）、隔离强度依赖内核版本、暂停/快照不是
+> 内存快照 —— 完整清单见 [§10 已知边界](#10-已知边界)。
+
 - **兼容面**：`Sandbox.create/connect/kill`、`commands.run` + PTY/stdin、文件 API、
   `health`、`metrics`、`logs`、Volume、Secret、`pause/resume`、`fork/snapshot`、
   network 策略（`allowOut`/`denyOut`/`rules`/`egressProxy`）、模板本地构建、MCP 网关。
 - **隔离模型**：每个沙箱一个 **userns（身份翻译）+ pidns（看不见宿主）+ netns（只有 loopback，
   出口由 supervisor 代连）**，外面再套 Landlock 文件白名单与 seccomp 过滤器 —— 见
   [§2](#2-隔离边界三种命名空间)。worker 自己零特权。
-- **不支持的 API 一律返回官方 Error JSON（501）**，不返回假成功。
 - 详细协议口径见 [spec.md](spec.md)；当前实现与 spec 的两处事实性偏差见文末。
 
 ## 目录
