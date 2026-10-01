@@ -29,7 +29,9 @@ ran and failed and must never read as success (design §4.3.1 hard requirement
 
 from __future__ import annotations
 
+import errno
 import os
+import stat
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -155,25 +157,35 @@ def materialize_tree(
     gid = _plan_int(tree, "gid")
     mode = _plan_mode(tree)
     target = root / subdir
-    # ``realpath`` of a path whose parent does not exist yet is the lexical
-    # normalisation, so re-check the *joined* path: a ``root`` that is itself
-    # fine must not become a doorway.
-    resolve_inside(str(target), roots=roots)
+    copy_from = tree.get("copy_from")
     existed = root.is_dir()
     try:
         target.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise MaterializeRefusal(BAD_PLAN, f"cannot create {target}: {exc}") from exc
-    # Every *directory* in the tree carries the same mode (the worker's own
-    # ``apply_sandbox_ownership`` rule): the tree root, and the sandbox's
-    # ``workspace/`` one level down.
+    # ``mkdir`` follows a symlink, so the mode is set through a descriptor
+    # whose whole chain was opened ``O_NOFOLLOW``: a tree (or a ``workspace/``)
+    # that the previous incarnation left as a link is refused here rather than
+    # chmod-ed *through*. Both directories carry the same mode -- the worker's
+    # own ``apply_sandbox_ownership`` rule, which is why the sandbox can write
+    # its tree while the worker (the group) still can too.
     for directory in (root, target):
+        fd = _open_dir_chain(directory)
         try:
-            os.chmod(directory, mode)
+            os.fchmod(fd, mode)
         except OSError as exc:
             raise MaterializeRefusal(
                 BAD_PLAN, f"cannot set {directory} to {mode:04o}: {exc}"
             ) from exc
+        finally:
+            os.close(fd)
+    if copy_from is not None:
+        source = resolve_inside(str(copy_from), roots=roots)
+        if not source.is_dir():
+            raise MaterializeRefusal(
+                PARTIAL_COPY, f"the snapshot source {source} is not a directory"
+            )
+        copy_tree(str(source), str(target), dir_mode=mode)
     # Ownership goes through the audited binary (never ``os.chown``): the same
     # pool gate, the same realpath discipline, the same walk. ``worker_gid``
     # is what ``--gid`` is checked against in the child.
@@ -197,3 +209,223 @@ def materialize_tree(
         },
         "chown": answer,
     }
+
+
+# --------------------------------------------------------------- the copy
+
+#: Every directory this module opens is opened with all three: read-only, "it
+#: must be a directory", and "do not follow a symlink for the last component".
+#: The third is the whole destination-side discipline (design §4.3.1).
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _is_symlink(name: str, parent_fd: int) -> bool:
+    """``lstat`` one name relative to a descriptor, without following anything."""
+    try:
+        return stat.S_ISLNK(os.lstat(name, dir_fd=parent_fd).st_mode)
+    except OSError:
+        return False
+
+
+def _open_dir_at(name: str, parent_fd: int, *, where: str) -> int:
+    """Open one directory component no-follow; a link there is refused by name.
+
+    The errno a platform reports for "``O_NOFOLLOW`` met a symlink" is not
+    portable (Linux says ``ELOOP``, Darwin says ``ENOTDIR`` for the
+    ``O_DIRECTORY`` form), so the *meaning* is established with an explicit
+    ``lstat`` rather than inferred from a number: the caller's next move
+    depends on knowing this was a link, not merely that the open failed.
+    """
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        if _is_symlink(name, parent_fd):
+            raise MaterializeRefusal(
+                DESTINATION_IS_A_SYMLINK,
+                f"{where}: {name!r} is a symbolic link: refusing to write "
+                "through it",
+            ) from exc
+        raise
+
+
+def _open_dir_chain(path: Path) -> int:
+    """Open ``path`` as a directory fd, resolving **every** segment no-follow.
+
+    Built from the root down with each step relative to the previous
+    descriptor, so a component that is a symlink (or that is swapped for one
+    between two components) is an ``ELOOP`` rather than a step out of the tree.
+    The caller owns the returned descriptor.
+    """
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.parts[1:]:
+            child = _open_dir_at(part, fd, where=f"opening {path}")
+            os.close(fd)
+            fd = child
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _open_child_dir(name: str, parent_fd: int, mode: int) -> int:
+    """Open (or create, then open) ``name`` inside ``parent_fd``, no-follow."""
+    try:
+        return _open_dir_at(name, parent_fd, where="the destination tree")
+    except FileNotFoundError:
+        os.mkdir(name, mode, dir_fd=parent_fd)
+        return _open_dir_at(name, parent_fd, where="the destination tree")
+
+
+def _splice(src_fd: int, dst_fd: int) -> None:
+    """Copy one file's bytes between two descriptors."""
+    while True:
+        chunk = os.read(src_fd, 1 << 20)
+        if not chunk:
+            return
+        offset = 0
+        while offset < len(chunk):
+            offset += os.write(dst_fd, chunk[offset:])
+
+
+def _refusal_for(err: OSError, path: str, *, doing: str) -> MaterializeRefusal:
+    """Name the failure the way the caller has to branch on it."""
+    if err.errno == errno.ELOOP:
+        # ``O_NOFOLLOW`` on the last component, or a symlink somewhere in the
+        # chain: the destination already holds a link where this entry goes.
+        return MaterializeRefusal(
+            DESTINATION_IS_A_SYMLINK, f"{doing} {path}: {err.strerror}"
+        )
+    if err.errno in (errno.ENOTDIR, errno.EISDIR, errno.EEXIST):
+        return MaterializeRefusal(
+            ALREADY_EXISTS_AS_A_FILE, f"{doing} {path}: {err.strerror}"
+        )
+    # Everything else is "the step ran and did not finish". It must never read
+    # as success: a half-copied tree is handed to the orphan path instead
+    # (§4.3.1 requirement 3).
+    return MaterializeRefusal(PARTIAL_COPY, f"{doing} {path}: {err.strerror}")
+
+
+def _copy_regular_file(src: str, name: str, dst_fd: int) -> None:
+    """Copy one regular file into ``dst_fd``, following nothing on either side."""
+    src_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(src_fd)
+        if not stat.S_ISREG(info.st_mode):
+            # A race between ``scandir`` and this open (the source is the
+            # platform's own snapshot store, but "it changed under me" must be
+            # a refusal, not a surprise copy).
+            raise MaterializeRefusal(
+                ALREADY_EXISTS_AS_A_FILE, f"{src} is not a regular file"
+            )
+        try:
+            child_fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                stat.S_IMODE(info.st_mode),
+                dir_fd=dst_fd,
+            )
+        except OSError as exc:
+            if _is_symlink(name, dst_fd):
+                raise MaterializeRefusal(
+                    DESTINATION_IS_A_SYMLINK,
+                    f"{src} would be written through the link {name}: refusing",
+                ) from exc
+            raise
+        try:
+            # ``umask`` masks the mode above; the snapshot's own bits are what
+            # the worker's ``copytree`` used to reproduce, so set them exactly.
+            os.fchmod(child_fd, stat.S_IMODE(info.st_mode))
+            _splice(src_fd, child_fd)
+        finally:
+            os.close(child_fd)
+    finally:
+        os.close(src_fd)
+
+
+def _write_symlink(link: str, name: str, dst_fd: int) -> None:
+    """Recreate a link -- never dereference it.
+
+    A link already sitting at ``name`` is replaced (the snapshot is the newer
+    truth for that entry); anything else there is a type conflict and is
+    refused rather than deleted, because the tree being merged into belongs to
+    the sandbox.
+    """
+    try:
+        os.symlink(link, name, dir_fd=dst_fd)
+        return
+    except FileExistsError:
+        pass
+    info = os.lstat(name, dir_fd=dst_fd)
+    if not stat.S_ISLNK(info.st_mode):
+        raise MaterializeRefusal(
+            ALREADY_EXISTS_AS_A_FILE,
+            f"{name} exists and is not a symlink: refusing to replace it",
+        )
+    os.unlink(name, dir_fd=dst_fd)
+    os.symlink(link, name, dir_fd=dst_fd)
+
+
+def _copy_into(src_dir: Path, dst_fd: int, dir_mode: int) -> int:
+    """One directory level: recreate every entry inside ``dst_fd``."""
+    copied = 0
+    with os.scandir(src_dir) as entries:
+        ordered = sorted(entries, key=lambda entry: entry.name)
+    for entry in ordered:
+        name = entry.name
+        try:
+            if entry.is_symlink():
+                # Tested *first*: ``is_dir()`` would follow the link and a
+                # snapshot could then steer the copy anywhere.
+                _write_symlink(os.readlink(entry.path), name, dst_fd)
+            elif entry.is_dir(follow_symlinks=False):
+                child_fd = _open_child_dir(name, dst_fd, dir_mode)
+                try:
+                    os.fchmod(child_fd, dir_mode)
+                    copied += _copy_into(Path(entry.path), child_fd, dir_mode)
+                finally:
+                    os.close(child_fd)
+            else:
+                _copy_regular_file(entry.path, name, dst_fd)
+        except MaterializeRefusal:
+            raise
+        except OSError as exc:
+            raise _refusal_for(exc, entry.path, doing="copying") from exc
+        copied += 1
+    return copied
+
+
+def copy_tree(src: str, dst: str, *, dir_mode: int = 0o770) -> int:
+    """Recursively copy ``src`` into the existing directory ``dst``.
+
+    Returns the number of entries copied. Two disciplines, one per side, and
+    neither is optional (design §4.3.1):
+
+    * **source** -- symlinks are recreated with ``os.symlink`` and never
+      dereferenced (``is_symlink`` is tested before ``is_dir``);
+    * **destination** -- this directory is merged into, and the sandbox's
+      previous incarnation could write there, so every segment is opened
+      relative to a descriptor with ``O_NOFOLLOW`` (``dir_fd`` bookkeeping, no
+      ``os.path.join`` string building) and a link anywhere in the way is a
+      named refusal.
+
+    Directories are created with ``dir_mode`` (``0770``), the invariant the
+    worker's ``apply_sandbox_ownership`` keeps; files keep the snapshot's own
+    bits. Ownership is not this function's business -- the caller hands the
+    whole tree over once, after the copy.
+    """
+    source = Path(src)
+    if source.is_symlink() or not source.is_dir():
+        raise MaterializeRefusal(
+            PARTIAL_COPY, f"the copy source {src} is not a directory"
+        )
+    try:
+        dst_fd = _open_dir_chain(Path(dst))
+    except OSError as exc:
+        raise _refusal_for(exc, dst, doing="opening") from exc
+    try:
+        return _copy_into(source, dst_fd, dir_mode)
+    finally:
+        os.close(dst_fd)

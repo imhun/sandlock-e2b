@@ -33,6 +33,7 @@ from typing import Any, Mapping
 import httpx
 import pytest
 
+from c3_agent import materialize
 from c3_agent.app import create_app
 from c3_agent.config import Settings
 from c3_agent.fileops import AgentFileOpRefusal
@@ -44,6 +45,7 @@ UID_X = 10007
 WORKER_GID = 65534
 SANDBOX = "sbx_grant01"
 OTHER_SANDBOX = "sbx_grant02"
+SNAPSHOT = "snap_0123456789abcdef"
 
 
 class _RecordingRunner:
@@ -91,6 +93,9 @@ class _Agent:
 
     def tree(self, sandbox_id: str = SANDBOX) -> Path:
         return self.workspace_base / sandbox_id
+
+    def snapshot_fs(self, snapshot_id: str = SNAPSHOT) -> Path:
+        return self.workspace_base / "_snapshots" / snapshot_id / "fs"
 
 
 def _grant(
@@ -339,3 +344,170 @@ async def test_two_sandboxes_grants_do_not_interfere(workspace: Path) -> None:
     assert len(agent.runner.calls) == 2
     assert agent.runner.calls[0][-1] == str(agent.tree(SANDBOX))
     assert agent.runner.calls[1][-1] == str(agent.tree(OTHER_SANDBOX))
+
+
+# ------------------------------------------- the hardened recursive copy
+#
+# This is the design's most dangerous piece (§4.3.1). The copy runs with the
+# agent's privileges, and it has **two** sides a hostile tree can attack: the
+# snapshot it reads (a link must be recreated, never dereferenced) and the
+# destination it merges into (the previous incarnation of the sandbox could
+# write there, so a link in the target is a way out of the tree). Neither is a
+# new privilege -- it is a new privileged code path, which is why each rule
+# gets its own test rather than one "copy works" happy path.
+
+
+def _snapshot(agent: _Agent, entries: dict[str, Any]) -> Path:
+    """A snapshot payload: ``fs/`` with the given entries.
+
+    A ``bytes``/``str`` value is a file, ``"-> <target>"`` is a symlink, and a
+    dict is one nested directory level -- the three shapes the copy has to get
+    right on the source side.
+    """
+    fs = agent.snapshot_fs()
+    fs.mkdir(parents=True, exist_ok=True)
+    for name, value in entries.items():
+        path = fs / name
+        if isinstance(value, bytes):
+            path.write_bytes(value)
+        elif isinstance(value, str) and value.startswith("-> "):
+            path.symlink_to(value[3:])
+        elif isinstance(value, str):
+            path.write_text(value, encoding="utf-8")
+        else:  # a mapping: one nested directory level
+            path.mkdir(parents=True, exist_ok=True)
+            for child, child_value in value.items():
+                (path / child).write_text(child_value, encoding="utf-8")
+    return fs
+
+
+@pytest.mark.asyncio
+async def test_a_symlink_in_the_snapshot_is_recreated_not_followed(
+    workspace: Path,
+) -> None:
+    """The source side: a link is an entry to recreate, never a door to open."""
+    agent = _Agent(workspace)
+    outside = workspace / "outside"
+    outside.mkdir()
+    prey = outside / "prey.txt"
+    prey.write_text("untouched\n", encoding="utf-8")
+    before = (prey.read_text(encoding="utf-8"), os.stat(prey).st_mtime_ns)
+    _snapshot(
+        agent,
+        {
+            "link": "-> /etc/passwd",
+            "escape": f"-> {outside}",
+            "real": "hello\n",
+        },
+    )
+
+    resp = await _post(
+        agent,
+        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+    )
+
+    assert resp.status_code == 200
+    target = agent.tree() / "workspace"
+    assert os.path.islink(target / "link") is True
+    assert os.readlink(target / "link") == "/etc/passwd"
+    assert os.path.islink(target / "escape") is True
+    assert os.readlink(target / "escape") == str(outside)
+    # The link was *recreated*, not walked: the pointed-at tree is untouched.
+    assert (prey.read_text(encoding="utf-8"), os.stat(prey).st_mtime_ns) == before
+    assert (target / "real").read_text(encoding="utf-8") == "hello\n"
+
+
+@pytest.mark.asyncio
+async def test_a_symlinked_destination_segment_is_refused_named(
+    workspace: Path,
+) -> None:
+    """The destination side: the sandbox could have left a link in the tree."""
+    agent = _Agent(workspace)
+    outside = workspace / "outside"
+    outside.mkdir()
+    target = agent.tree() / "workspace"
+    target.mkdir(parents=True)
+    (target / "sub").symlink_to(outside)
+    _snapshot(agent, {"sub": {"file": "payload\n"}})
+
+    resp = await _post(
+        agent,
+        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+    )
+
+    assert resp.status_code == 400
+    assert "destination-is-a-symlink" in resp.json()["error"]
+    # Nothing was written through the link, and nothing was chowned either:
+    # a refused materialization must not leave a half-claimed tree.
+    assert sorted(os.listdir(outside)) == []
+    assert agent.runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_merge_keeps_existing_files(workspace: Path) -> None:
+    """``dirs_exist_ok`` semantics survive (migration/rebuild keeps files)."""
+    agent = _Agent(workspace)
+    target = agent.tree() / "workspace"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("from the previous incarnation\n", encoding="utf-8")
+    (target / "same.txt").write_text("stale\n", encoding="utf-8")
+    _snapshot(agent, {"same.txt": "fresh\n"})
+
+    resp = await _post(
+        agent,
+        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+    )
+
+    assert resp.status_code == 200
+    assert (target / "keep.txt").read_text(encoding="utf-8") == (
+        "from the previous incarnation\n"
+    )
+    assert (target / "same.txt").read_text(encoding="utf-8") == "fresh\n"
+    # Every directory in the tree stays ``0770`` (the worker's own
+    # ``apply_sandbox_ownership`` rule): the worker is the data-plane owner and
+    # must be able to write one level down.
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o770
+
+
+@pytest.mark.asyncio
+async def test_a_file_where_a_directory_belongs_is_refused_named(
+    workspace: Path,
+) -> None:
+    """A type conflict is refused, not resolved by deleting the sandbox's file."""
+    agent = _Agent(workspace)
+    target = agent.tree() / "workspace"
+    target.mkdir(parents=True)
+    (target / "sub").write_text("I am a file\n", encoding="utf-8")
+    _snapshot(agent, {"sub": {"file": "payload\n"}})
+
+    resp = await _post(
+        agent,
+        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+    )
+
+    assert resp.status_code == 400
+    assert "already-exists-as-a-file" in resp.json()["error"]
+    assert (target / "sub").read_text(encoding="utf-8") == "I am a file\n"
+
+
+@pytest.mark.asyncio
+async def test_a_partial_copy_is_reported_as_failure(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A half-copied tree must never read as success (§4.3.1 requirement 3)."""
+    agent = _Agent(workspace)
+    _snapshot(agent, {"one": "1\n", "two": "2\n"})
+
+    def _boom(src_fd: int, dst_fd: int) -> None:
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(materialize, "_splice", _boom)
+
+    resp = await _post(
+        agent,
+        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+    )
+
+    assert resp.status_code == 502
+    assert "partial-copy" in resp.json()["error"]
+    assert agent.runner.calls == []
