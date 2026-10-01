@@ -376,6 +376,16 @@ class Settings:
     c3_agent_token: str = field(
         default_factory=lambda: os.getenv("E2B_C3_AGENT_TOKEN", "")
     )
+    #: How long a per-create ``materialize-tree`` grant stays valid. The grant
+    #: only has to cover "mint it → the worker's request reaches the agent",
+    #: which is one HTTP hop on the cluster network (measured 2026-10-01: 1.29 ms
+    #: for a control-plane round trip, ~16 ms two-node clock skew), so 10 s is
+    #: already a 600x margin. The agent refuses anything above
+    #: ``gateway_common.create_grant.MAX_TTL_S`` regardless, so a mis-set
+    #: environment variable cannot mint a long-lived credential (design §5).
+    create_grant_ttl_s: int = field(
+        default_factory=lambda: _env_int("E2B_CREATE_GRANT_TTL_S", 10)
+    )
     #: One deadline per instruction. A stuck agent must never read as "the
     #: sandbox create hangs" (D9.5); the refusal is a named 504.
     c3_agent_timeout_s: float = field(

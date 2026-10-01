@@ -25,6 +25,7 @@ re-invented) and onto one target:
 | ``chown-secret`` | ``chown`` | ``<image cache>/secrets/<id>/<name>.secret`` |
 | ``scope-slot-document`` | ``chown`` | ``<route-B root>/<uid>/<instance name>/<name>``, where the leaf comes from :func:`gateway_common.paths.route_b_instance_name` -- the **same** function the worker's executor names the slot with (ruling D20) |
 | ``remove-orphan-workspace`` | ``rm`` | ``<workspace base>/<id>`` (**self-heal only**, C3 Task 6): the tree the control plane's records claim nowhere. It is the one op with no record to derive a uid from -- that is its definition -- and the worker surface refuses it by name. |
+| ``materialize-tree`` | ``materialize`` | ``<workspace base>/<id>`` (+ the snapshot copy source and the per-sandbox volume slices). The **create path's** one privileged step: a plan the control plane mints (``POST /internal/nodes/{node}/file-grant``) that the worker carries to its own node's agent, so the create stops paying a worker→CP→agent→CP→worker round trip per step. Its caller set is its own -- the worker's ``file-op`` surface answers one verb at a time and must never be handed a multi-step plan by name. |
 
 The last row is the only op whose ``callers`` set is not ``{"worker"}``: it is
 the agent-shape sweep's removal (``control_plane/self_heal.py``), listed here
@@ -118,6 +119,14 @@ FILE_OPS: dict[str, FileOpSpec] = {
     "remove-orphan-workspace": FileOpSpec(
         "remove-orphan-workspace", "rm", callers=frozenset({"self-heal"})
     ),
+    # The create path's single materialization (design §4.3): tree + snapshot
+    # copy + chown + volume slices, done in one agent call. Not in the worker's
+    # ``file-op`` vocabulary -- that surface forwards one verb at a time, and
+    # ``node_file_op`` would dispatch an unknown verb to ``walk`` -- so this op
+    # names its own caller and the worker's surface refuses it by name.
+    "materialize-tree": FileOpSpec(
+        "materialize-tree", "materialize", callers=frozenset({"worker-grant"})
+    ),
 }
 
 #: Keys a worker must never send: the whole point of the vocabulary is that
@@ -132,6 +141,26 @@ SLOT_DOCUMENTS: frozenset[str] = frozenset({"policy.json", "program.json"})
 #: A secret file name is a policy entry's name. The same shape the executor's
 #: own paths accept (no separators, no traversal).
 _SECRET_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+#: The keys a *grant request* may carry. Deliberately a closed set, and
+#: deliberately not ``FileOpSpec.params``: ``snapshot_id`` is optional, while
+#: the file-op surface's parameters are all required. What both surfaces share
+#: is the rule that matters -- the path and the uid never come from the caller.
+GRANT_REQUEST_KEYS: frozenset[str] = frozenset({"op", "sandbox_id", "snapshot_id"})
+
+#: The create path's materialization shape (design §4.1). The sandbox's own
+#: files live one level down, in ``<tree>/workspace``, so that the mount view
+#: (``/workspace``) is a directory rather than the tree's root.
+WORKSPACE_SUBDIR = "workspace"
+
+#: ``0770 <sandbox uid>:<worker gid>`` -- the same permission model
+#: ``envd_service.priv_helpers.WORKSPACE_MODE`` names: the sandbox owns the
+#: tree, the worker (the data-plane owner) is the group, and the ``other`` bits
+#: are 0 so cross-sandbox isolation stays a plain kernel DAC check.
+TREE_MODE = "0770"
+
+#: The snapshot store's own namespace under the workspace base.
+_SNAPSHOTS_DIR = "_snapshots"
 
 
 @dataclass(frozen=True)
@@ -150,6 +179,10 @@ class ControlPaths:
     shared_volume_root: Path | None = None
     route_b_tmp_root: Path | None = None
     volume_paths: Mapping[str, Path] = field(default_factory=dict)
+    #: Per-sandbox quota (MB) per volume id, read from the *same* records as
+    #: ``volume_paths``. :func:`derive_materialize` needs it: a volume with no
+    #: per-sandbox quota mounts its root, so it has no slice to create.
+    volume_quota_mb: Mapping[str, int] = field(default_factory=dict)
 
     def roots(self) -> tuple[Path, ...]:
         """The four-root discipline, in ``priv_common.c``'s order."""
@@ -185,6 +218,7 @@ def control_paths(state, settings) -> ControlPaths:
     state_base = Path(getattr(state, "state_base", None) or settings.state_base or workspace_base)
     volumes = getattr(state, "volumes", None)
     volume_paths: dict[str, Path] = {}
+    volume_quota_mb: dict[str, int] = {}
     if volumes is not None:
         for record in volumes.list():
             if record.path is None:  # pragma: no cover - defensive
@@ -196,6 +230,7 @@ def control_paths(state, settings) -> ControlPaths:
             # name could never resolve an op and 404'd every volume operation
             # (review Task 4 slice A, Important 1).
             volume_paths[record.volume_id] = Path(record.path)
+            volume_quota_mb[record.volume_id] = int(record.per_sandbox_quota_mb)
     shared = getattr(settings, "shared_volume_root", None) or getattr(
         settings, "shared_workspace_root", None
     )
@@ -209,6 +244,7 @@ def control_paths(state, settings) -> ControlPaths:
         shared_volume_root=Path(shared) if shared else None,
         route_b_tmp_root=Path(route_b) if route_b else None,
         volume_paths=volume_paths,
+        volume_quota_mb=volume_quota_mb,
     )
 
 
@@ -264,6 +300,147 @@ def validate_params(spec: FileOpSpec, body: Mapping[str, Any]) -> None:
             raise FileOpRefusal(
                 f"a {spec.op} report must name {name}", status_code=400
             )
+
+
+def validate_grant_params(spec: FileOpSpec, body: Mapping[str, Any]) -> None:
+    """Refuse a grant request that names a target, or a key this surface has no use for.
+
+    The same two rules :func:`validate_params` enforces on the file-op surface,
+    against this surface's own (smaller) key set. ``snapshot_id`` is the one
+    optional key, so it is checked here rather than demanded there.
+    """
+    for key in FORBIDDEN_KEYS:
+        if key in body:
+            raise FileOpRefusal(
+                f"a {spec.op} report carries no {key}: the target comes from "
+                "the control plane's records",
+                status_code=400,
+            )
+    extra = set(body) - GRANT_REQUEST_KEYS
+    if extra:
+        raise FileOpRefusal(
+            f"a {spec.op} report carries no "
+            + ", ".join(sorted(extra))
+            + ": the target comes from the control plane's records",
+            status_code=400,
+        )
+    snapshot_id = body.get("snapshot_id")
+    if snapshot_id is not None and (
+        not isinstance(snapshot_id, str)
+        or not snapshot_id.startswith("snap_")
+        or not validate_sandbox_id(snapshot_id)
+    ):
+        # Shape only, like ``validate_sandbox_id``: the snapshot store's own
+        # namespace is ``snap_*``, and a caller-supplied name that is not one
+        # cannot be a snapshot on any node.
+        raise FileOpRefusal(
+            f"snapshot_id {snapshot_id!r} is not a snapshot id: refusing",
+            status_code=400,
+        )
+
+
+def derive_materialize(
+    record,
+    *,
+    paths: ControlPaths,
+    node_id: str,
+    worker_gid: int | None,
+    snapshot_id: str | None = None,
+) -> dict[str, Any]:
+    """The one plan a create grant carries: the tree, and the volume slices.
+
+    Everything here is derived from the control plane's own record and settings
+    (§14.4 hard rule 2): the caller named a sandbox, never a path, never a uid.
+    The two root checks are this half of the "two layers, neither replaces the
+    other" discipline -- the agent re-derives and re-checks every path against
+    its own four roots before it touches anything.
+    """
+    spec = FILE_OPS["materialize-tree"]
+    sandbox_id = getattr(record, "sandbox_id", None)
+    if not isinstance(sandbox_id, str) or not validate_sandbox_id(sandbox_id):
+        raise FileOpRefusal("sandbox_id must be a valid sandbox id", status_code=400)
+    if is_reserved_platform_namespace(sandbox_id):
+        raise FileOpRefusal(
+            f"{sandbox_id!r} is one of the platform's own namespaces, not a "
+            "sandbox tree: refusing",
+            status_code=400,
+        )
+    host_uid = getattr(record, "host_uid", None)
+    if host_uid is None:
+        raise FileOpRefusal(
+            f"sandbox {sandbox_id} has no allocated host uid: refusing to "
+            "materialize a tree nothing owns",
+            status_code=503,
+        )
+    if worker_gid is None:
+        raise FileOpRefusal(
+            f"node {node_id} has not reported the worker's own gid: refusing "
+            "to hand a tree to a uid without the group it belongs to",
+            status_code=503,
+        )
+    tree_path = _workspace(paths, sandbox_id)
+    _require_in_roots(paths, tree_path, spec)
+    tree: dict[str, Any] = {
+        "path": str(tree_path),
+        "subdir": WORKSPACE_SUBDIR,
+        "mode": TREE_MODE,
+        "uid": int(host_uid),
+        "gid": int(worker_gid),
+    }
+    if snapshot_id is not None:
+        copy_from = paths.workspace_base / _SNAPSHOTS_DIR / snapshot_id / "fs"
+        _require_in_roots(paths, copy_from, spec)
+        tree["copy_from"] = str(copy_from)
+    return {"tree": tree, "slices": _volume_slices(paths, record, spec, sandbox_id, host_uid, worker_gid)}
+
+
+def _volume_slices(
+    paths: ControlPaths,
+    record,
+    spec: FileOpSpec,
+    sandbox_id: str,
+    host_uid: int,
+    worker_gid: int,
+) -> list[dict[str, Any]]:
+    """One slice per mounted volume that has a per-sandbox quota (E2.5).
+
+    A volume created with ``per_sandbox_quota_mb <= 0`` keeps the pre-E2.5
+    shape -- the sandbox mounts the *root* -- so there is no slice to create
+    and listing one would have the agent make a directory nothing mounts.
+    """
+    slices: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    for mount in getattr(record, "volume_mounts", None) or []:
+        name = mount.get("name") if isinstance(mount, Mapping) else None
+        if not isinstance(name, str):
+            continue
+        volume_path = paths.volume_paths.get(name)
+        if volume_path is None:
+            # Fail closed rather than skip: a mount this control plane cannot
+            # resolve is a record it cannot derive a target from, and silently
+            # materializing the rest would hide that.
+            raise FileOpRefusal(
+                f"sandbox {sandbox_id} mounts volume {name!r}, which this "
+                "control plane does not record: refusing to derive its slice",
+                status_code=503,
+            )
+        if int(paths.volume_quota_mb.get(name, 0)) <= 0:
+            continue
+        slice_path = volume_path / sandbox_id
+        if slice_path in seen:
+            continue
+        seen.add(slice_path)
+        _require_in_roots(paths, slice_path, spec)
+        slices.append(
+            {
+                "volume": name,
+                "path": str(slice_path),
+                "uid": int(host_uid),
+                "gid": int(worker_gid),
+            }
+        )
+    slices.sort(key=lambda entry: (entry["volume"], entry["path"]))
+    return slices
 
 
 @dataclass(frozen=True)
