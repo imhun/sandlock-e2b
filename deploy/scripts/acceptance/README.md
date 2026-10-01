@@ -43,6 +43,7 @@
 | `cluster_keepalive_probe.py` | N37 probes: is the cut an *idle* one, and does output hold the stream open? | —（头部无 Usage 行；见脚本 `--help`） |
 | `cluster_run.py` | N37 cluster run: one command writing N files, on the deployed fleet. | —（头部无 Usage 行；见脚本 `--help`） |
 | `cpu_activity_acceptance.py` | Cluster acceptance for E9.1 blind spot 2: a CPU-only sandbox is not idle. | —（头部无 Usage 行；见脚本 `--help`） |
+| `create_latency_probe.py` | 建箱延迟（API 边界，纯标准库）：本机跑量"平台 + 网络"，灌进控制面 pod 跑量"只有平台"；预热那一行就是解析/解包基础镜像的代价（N54 用它验落盘 digest 缓存）。 | `python deploy/scripts/acceptance/create_latency_probe.py --base http://<入口>:3000 --key "$E2B_API_KEY" --n 10`（in-cluster 见脚本头部） |
 | `f11_direct_exec_probe.py` | Control experiment: pure-shape exec over the direct executor, low fd table. | —（头部无 Usage 行；见脚本 `--help`） |
 | `f11_fdcount_probe.py` | Does the standalone probe's stdout loss depend on the client's fd layout? | —（头部无 Usage 行；见脚本 `--help`） |
 | `f11_fup3_probe.py` | F11 E2B rerun probe: gateway+command boxed quota on the F11 tip wheel. | —（头部无 Usage 行；见脚本 `--help`） |

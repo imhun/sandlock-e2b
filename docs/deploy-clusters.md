@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.24（2026-10-01，N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，当前版本 `0.1.0-836-g6d7532b-20261001-102113`）**；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.25（2026-10-01，N54：镜像 digest 解析结果落盘缓存 —— 建箱 p50 0.66 s → 0.23 s，当前版本 `0.1.0-839-g4271c45-20261001-112409`）**；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1168,6 +1168,59 @@ profile 在承担**，换一个更宽 profile 的宿主就没了。修后由沙�
 | 仓库侧 | —— | `tests/unit` **2091 passed**（失败 = 基线 3 + 2 条与本次无关的 docs pin）；`tests/contract` 的 TTL/配额三件（partition reconcile / pause-resume quota / redis 多副本）**17 passed** |
 
 > ⚠ 清理是**一次性**的：它删的是"控制面已经不认"的 `_runtime/<id>` 目录（守卫是控制面自己那份清单），不含 `.checkpoints`。以后不会再攒 —— TTL 拆除成功后 `_runtime/<id>` 随树一起走。
+
+### 7.25 N54：镜像 digest 解析结果落盘缓存（**2026-10-01，已上线 `0.1.0-839-g4271c45-20261001-112409`**）
+
+提交 `4271c45`。起因是那个问题——"预热以后建箱的时间主要花在什么地方"——上一轮的逐段实测
+（README §1）给出的答案是：**0.45–0.55 s 花在向镜像仓库解析基础镜像**，不是登记、也不是落盘。
+用户裁定「按 3 改」：把解析挪到预热阶段，并且**落盘**。
+
+**现象（上线前实测）**：一次建箱窗口里 worker 对
+`dockerauth.cn-hangzhou.aliyuncs.com/auth` + `registry.cn-shanghai.aliyuncs.com/v2/…/manifests/…`
+发约 **6 次 HTTPS（日志里约 620 ms 墙钟）**；直接测那条"镜像就绪探测"
+（`GET /agent/images/<ref>/warm`）：解析缓存**冷 430–482 ms、热 1 ms**。
+
+**根因两层**：① 解析结果只存在**进程内** 60 s 字典（`_DIGEST_CACHE`）—— 进程重启、同节点第二个
+worker、TTL 过期都要重付这笔钱；② `peek` 与 `resolve` 是两条路：后者直接
+`fetch_platform_manifest`，**完全不走缓存**。于是"预热过"只对同一个进程、60 s 之内成立。
+
+**修法（TDD：先红后绿）**：`_platform_digest(cache_dir=…)` 增加**落盘**缓存
+`<image cache>/.digests/<key>.json`（键含 image/scheme/username/credential_host，TTL =
+`E2B_IMAGE_MANIFEST_TTL_S`，原子写）；`peek_image_warm` 把 `cache_dir` 传下去；
+`resolve_image_rootfs` 先读盘上的 digest、命中已解包 rootfs 就直接返回（不再取 manifest）；
+`_cache_usage` 把 `.digests/` 排除出"点号前缀 = staging"那条规则，否则 `prune_image_cache`
+会在 staleness 窗口后把它删掉（这一条用例先红）。
+
+**集群验收（`0.1.0-839`）**
+
+| 判据 | 读数 |
+|---|---|
+| 建箱、**控制面 pod 内**发起（同一入口，只剩平台耗时） | **p50 228 ms**（n=10）；另两轮 n=4 / n=3 分别 **223 / 236 ms** —— 修前是 **0.66 s**（n=10，本机经入口） |
+| 建箱、本机经跳板隧道发起 | p50 **334 ms**（n=10）—— 与上一行差 ~100 ms 就是"客户端到入口"那一段网络 |
+| 冷热对照：把两个 worker 的 `.digests/*.json` 删掉再跑 | 预热那一发（必须重新解析 manifest）**652 ms** → 之后 **228 ms**；也就是解析本身 ≈ **0.41 s**，与修前逐段实测的 0.45–0.55 s 同量级 |
+| `GET /agent/images/<ref>/warm` 热态 | **0.9–1.0 ms**（两 worker × 两 ref × 5 次；482 ms 的峰值只出现在删过缓存的那次） |
+| 落盘缓存确实写下了 | 两 worker 的 `.digests/` 各 **2 条**（`python-mcp:3.14@sha256:…` 与 `python:3.11-slim`）；删掉后被下一次解析**自动重建** |
+| 建箱窗口内 worker→registry 请求 | **0 次**（正常建箱跑一遍、再按时间窗数日志：0 行；日志里那几发 6 次 HTTPS 的突发，只出现在我**故意删缓存**的窗口） |
+| 探针不留残留 | `GET /sandboxes` = **0**；两 worker `state/_runtime` = **0**、`workspaces/` = **0**（每次建完立刻 kill） |
+| 终态 | 10 个 pod 全 Running；CP/worker/agent 都 pin 在 `0.1.0-839-g4271c45-20261001-112409` |
+| 仓库侧 | 镜像/缓存车道 **81 passed**（`test_oci_registry.py`、`test_image_cache_sharing.py`、`test_image_rootfs_cache_split.py`、`test_worker_image_warm.py`、`test_local_oci_images.py`、`test_compose_base_image_shape.py`） |
+
+**复跑**：
+
+```bash
+# ① 控制面内（只有平台耗时）——探针是纯标准库的，直接灌进 pod 跑
+kubectl -n sandlock exec -i <control-plane-pod> -c control-plane -- \
+    python3 - --base http://127.0.0.1:3000 --key "$E2B_API_KEY" --n 10 \
+    < deploy/scripts/acceptance/create_latency_probe.py
+# ② 本机（平台 + 网络）
+python deploy/scripts/acceptance/create_latency_probe.py --base http://<入口>:3000 --key "$E2B_API_KEY" --n 10
+# ③ 解析缓存那一层（冷/热各测一次）
+kubectl -n sandlock exec -i <worker-pod> -- python3 - \
+    --image "<ref>" --key "$E2B_INTERNAL_API_KEY" < deploy/scripts/warm_base_image.py
+```
+
+**两条边界**：缓存过 `E2B_IMAGE_MANIFEST_TTL_S` 仍会重解析（tag 挪动能自我失效，这是有意的）；
+`.digests/` 是纯缓存，删掉只多花一次解析，不会缺镜像。
 
 ## 8. 改部署的入口
 

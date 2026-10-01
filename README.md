@@ -31,26 +31,32 @@ notification）在自己机器的 Linux 内核上跑用户代码 —— 不需�
 
 ### 轻量化到什么程度（实测）
 
-下面这组读数是 2026-10-01 在出厂集群（`0.1.0-824`，2 节点 arm64）上用
+下面这组读数是 2026-10-01 在出厂集群（2 节点 arm64）上现跑的 —— 一条命令就能复跑，
+每个数字都附了口径。**① 的修复后数字取自 `0.1.0-839`，其余取自 `0.1.0-824`**；建箱延迟用
 [deploy/scripts/acceptance/lightweight_metrics_probe.py](deploy/scripts/acceptance/lightweight_metrics_probe.py)
-现跑的 —— 一条命令就能复跑，每个数字都附了口径：
+（走 SDK 的完整路径），要把"平台耗时"和"客户端到入口的网络"分开量则用
+[create_latency_probe.py](deploy/scripts/acceptance/create_latency_probe.py)：
 
 **① 镜像预缓存后，建箱很快**
 
-- **建箱 p50 = 0.66 s、p95 = 0.73 s**（n=10；从开发机经入口实测，含 SDK 请求 → 控制面调度 →
-  worker 建工作目录 → 销毁。每轮建完立刻 kill，不占容量）。
+- **建箱 p50 = 0.66 s、p95 = 0.73 s**（n=10，**N54 修复前**；从开发机经入口实测，含 SDK 请求 →
+  控制面调度 → worker 建工作目录 → 销毁。每轮建完立刻 kill，不占容量。修复后见下面最后一条）。
 - 镜像没进缓存时也不贵：一次解包（2111 个文件的 python-slim rootfs）在**节点本地 0.26 s**
   —— 这也是方案刻意做的事：OCI tar 放共享卷、rootfs 解到节点本地缓存。冷节点用预热端点
   跑一次 **18.8 s**，之后一直命中。
 - 旁证：4 个沙箱跨 2 节点的端到端冒烟（建箱 + 命令 + 文件 + stdin）整轮 **8.7 s**；
   加上模板构建 → registry → worker 拉取 → 解 rootfs → MCP 的完整冒烟 **20.6 s**。
-- **这 0.66 s 花在哪**（2026-10-01 逐段实测）：客户端到入口的网络 **~40 ms**、控制面认证 +
+- **这 0.66 s 花在哪**（2026-10-01 逐段实测 + 当天的修复）：客户端到入口的网络 **~40 ms**、控制面认证 +
   记录查询（幂等建箱对照）**2 ms**、控制面→worker 一跳 **7 ms**、worker 建树 + 把树交给沙箱 uid +
-  写记录 **~120 ms**，而**约 0.45–0.55 s 是去镜像仓库解析基础镜像** —— 建箱时每个 worker 各自
-  发约 6 次 HTTPS（`dockerauth…/auth` + `registry…/v2/…/manifests/…`，日志里约 620 ms 墙钟），
-  直接测那条"镜像就绪探测"：解析缓存冷 **430–482 ms**、热 **1 ms**（缓存是进程内的
-  `E2B_IMAGE_MANIFEST_TTL_S`，默认 60 s）。**不是登记/落盘慢** —— 那是可优化项（跨进程缓存解析
-  结果，或由控制面解析一次把 digest 传给 worker）。
+  写记录 **~120 ms**，而**约 0.45–0.55 s 原本是去镜像仓库解析基础镜像** —— 建箱时每个 worker 各自
+  发约 6 次 HTTPS（`dockerauth…/auth` + `registry…/v2/…/manifests/…`）。**已修（N54）**：解析结果
+  改为**落盘缓存**在 `<image cache>/.digests/`（键含 image/scheme/username/credential_host，
+  TTL = `E2B_IMAGE_MANIFEST_TTL_S`），预热或任意一次建箱解析过之后，同一节点上的 `peek`/`resolve`
+  都读盘不再问 registry；缓存过 TTL 仍会重解析（tag 挪动能自我失效）。
+  **修后集群实测：建箱 p50 0.66 s → 0.23 s**（在控制面 pod 内发起，n=10；同一时刻从本机经
+  隧道量到 p50 **0.33 s** —— 这 0.1 s 就是"客户端到入口"那一段），`GET /agent/images/<ref>/warm`
+  热态 **0.9–1.0 ms**（把 `<image cache>/.digests/` 删掉再跑，第一发 **0.65 s**、之后回到 0.23 s
+  —— 也就是说重新解析 manifest 本身约 **0.41 s**，与上面 0.45–0.55 s 那段同量级）。
 
 **② 活动沙箱的额外内存很小**
 
