@@ -1268,27 +1268,18 @@ async def _create_sandbox_attempt(
             )
         else:
             # v2 §4.1: the tree is materialized **here**, by the node's agent,
-            # before the worker is told anything -- so the worker is handed a
-            # ready tree instead of building one and then asking the control
-            # plane to relay the ownership hand-over. A refusal is a create
-            # that did not happen, and the rollback below is the same one every
-            # other provisioning failure takes.
-            materialized = await _materialize_remote(
-                request,
-                record,
-                node,
-                settings,
-                snapshot,
-            )
-            await _provision_remote(
+            # before the worker is handed a ready tree. (b) (design §4.6) then
+            # fires the worker's tree-free half *beside* that materialization
+            # instead of behind it. A refusal is a create that did not happen,
+            # and the rollback below is the same one every other provisioning
+            # failure takes.
+            await _materialize_beside_the_worker(
                 request,
                 record,
                 node,
                 settings,
                 snapshot,
                 volume_mounts,
-                snapshot_id=snapshot.snapshot_id if snapshot else None,
-                materialized=materialized,
             )
         if not _record_is_still_ours(registry, record):
             # Someone tore this sandbox down while we were creating it -- on
@@ -1547,7 +1538,54 @@ async def _await_inflight_create(request, sandbox_id: str) -> None:
         )
 
 
-async def _materialize_remote(request, record, node, settings, snapshot) -> bool:
+def _materialize_plan(request, record, node):
+    """The inputs of the materialization instruction, or ``None``.
+
+    ``None`` means this shape cannot *express* the instruction at all, and the
+    worker's own path is the supported shape for it (review C1/I4):
+
+    * no agent client (an embedder);
+    * a node whose worker identity this control plane never verified -- without
+      it there is no gid for ``maint.c``'s gate;
+    * a record with no host uid (``E2B_PER_SANDBOX_UID=false``) -- there is
+      nothing to hand the tree to, and the worker's own
+      ``align_shared_uid_workspace`` branch exists for exactly that shape.
+
+    Split out of :func:`_materialize_remote` because the two-phase create has to
+    ask the question *before* it fires anything: "can this create be split?"
+    decides whether the worker's ``prepare`` half is sent beside the
+    materialization or whether the whole create goes over in one call, and an
+    answer that arrived later could not overlap anything (design §4.6 (b)).
+    """
+    client = getattr(request.app.state, "c3_agent_client", None)
+    if client is None:
+        return None
+    worker_gid = getattr(node, "worker_gid", None)
+    worker_uid = getattr(node, "worker_uid", None)
+    if worker_uid is None or worker_gid is None:
+        # The same named refusal the relayed file ops give: no verified worker
+        # identity means no instruction that acts as that worker.
+        logger.warning(
+            "node %s has reported no worker identity (workerUID/workerGID): "
+            "the worker will materialize sandbox %s itself",
+            node.node_id,
+            record.sandbox_id,
+        )
+        return None
+    if getattr(record, "host_uid", None) is None:
+        # ``E2B_PER_SANDBOX_UID=false``: the plan has no uid to name (the derivation
+        # refuses that with a 503), and the worker's own path is the supported
+        # shape for it.
+        logger.warning(
+            "sandbox %s has no allocated host uid (per-sandbox uids off): the "
+            "worker will materialize it itself",
+            record.sandbox_id,
+        )
+        return None
+    return client, int(worker_uid), int(worker_gid)
+
+
+async def _materialize_remote(request, record, node, settings, snapshot, plan=None) -> bool:
     """Materialize one create's tree on its node, through that node's agent.
 
     The whole point of doing it *here* rather than in the worker (design v2):
@@ -1584,34 +1622,14 @@ async def _materialize_remote(request, record, node, settings, snapshot) -> bool
     there for a reason the operator has to see, and ``create_sandbox``'s
     rollback drops the record (returning the host uid to the pool).
     """
-    client = getattr(request.app.state, "c3_agent_client", None)
-    if client is None:
-        return False
-    worker_gid = getattr(node, "worker_gid", None)
-    worker_uid = getattr(node, "worker_uid", None)
-    if worker_uid is None or worker_gid is None:
-        # The same named refusal the relayed file ops give: no verified worker
-        # identity means no instruction that acts as that worker.
-        logger.warning(
-            "node %s has reported no worker identity (workerUID/workerGID): "
-            "the worker will materialize sandbox %s itself",
-            node.node_id,
-            record.sandbox_id,
-        )
-        return False
-    if getattr(record, "host_uid", None) is None:
-        # ``E2B_PER_SANDBOX_UID=false``: the plan has no uid to name (the derivation
-        # refuses that with a 503), and the worker's own path is the supported
-        # shape for it.
-        logger.warning(
-            "sandbox %s has no allocated host uid (per-sandbox uids off): the "
-            "worker will materialize it itself",
-            record.sandbox_id,
-        )
-        return False
+    if plan is None:
+        plan = _materialize_plan(request, record, node)
+        if plan is None:
+            return False
+    client, worker_uid, worker_gid = plan
     state = request.app.state
     paths = file_ops.control_paths(state, settings)
-    plan = file_ops.derive_materialize(
+    instruction = file_ops.derive_materialize(
         record,
         paths=paths,
         node_id=node.node_id,
@@ -1622,8 +1640,8 @@ async def _materialize_remote(request, record, node, settings, snapshot) -> bool
         await client.materialize(
             node_id=node.node_id,
             sandbox_id=record.sandbox_id,
-            tree=plan["tree"],
-            slices=plan["slices"],
+            tree=instruction["tree"],
+            slices=instruction["slices"],
             worker_uid=int(worker_uid),
             worker_gid=int(worker_gid),
             # One rule, one implementation (D20's lesson): the same anchor the
@@ -1668,6 +1686,177 @@ def _is_unknown_op(exc: AgentClientError) -> bool:
     return exc.status_code == 404 and _UNKNOWN_OP_MARKER in str(exc)
 
 
+async def _materialize_beside_the_worker(
+    request, record, node, settings, snapshot, volume_mounts
+) -> bool:
+    """(b): fire the agent's materialization and the worker's prepare together.
+
+    The two legs do not need each other. The agent's materialization (p50
+    79.6 ms measured 2026-10-01) makes the tree; the worker's ``prepare`` half
+    (the ``.creating`` marker, the uid reservation, the accounting seed) needs
+    no tree at all. Run in sequence they add up; run together only the longer
+    one is on the create's critical path -- the win is
+    ``min(materialize, prepare)`` (design §4.6 (b), Task B's measurement).
+
+    The **contract does not change**: this coroutine returns only after the
+    worker's ``finalize`` half has answered 201, so a materialization that
+    fails or runs out of time is still a create that fails -- never "201, and
+    the first command explodes". The completion signal is the control plane's
+    own second instruction (measured 0.75 ms against a 12.9 ms marker write on
+    the shared NAS, and it keeps "the tree is ready" in one place).
+
+    Three endings, and each has to leave the node clean:
+
+    * the agent accepts -> one ``finalize``, carrying ``materialized``;
+    * the agent cannot take it this time (an older agent, or its named
+      "busy") -> the prepared half is cancelled and the create falls back to
+      the single call that has always built the tree, so there is exactly one
+      code path for "the worker builds it";
+    * the agent refuses the content, or does not answer in time -> the create
+      fails, after the prepared half is cancelled.
+    """
+    snapshot_id = snapshot.snapshot_id if snapshot else None
+    plan = _materialize_plan(request, record, node)
+    if plan is None:
+        # Nothing to overlap with: the worker does the whole create itself, in
+        # the one call it has always made (no ``phase`` in the body).
+        await _provision_remote(
+            request,
+            record,
+            node,
+            settings,
+            snapshot,
+            volume_mounts,
+            snapshot_id=snapshot_id,
+            materialized=False,
+        )
+        return False
+    deadline = float(
+        getattr(settings, "c3_agent_materialize_timeout_s", 60.0)
+    )
+    materialize_task = asyncio.ensure_future(
+        _materialize_remote(request, record, node, settings, snapshot, plan)
+    )
+    prepare_task = asyncio.ensure_future(
+        _provision_remote(
+            request,
+            record,
+            node,
+            settings,
+            snapshot,
+            volume_mounts,
+            snapshot_id=snapshot_id,
+            materialized=False,
+            phase="prepare",
+        )
+    )
+    try:
+        # The instruction has its own deadline (``C3AgentClient``'s is the same
+        # number); this one is the belt to that suspender -- a client that
+        # cannot enforce its own timeout must not become a create that hangs.
+        materialized = await asyncio.wait_for(materialize_task, timeout=deadline)
+    except asyncio.TimeoutError:
+        await _swallow(prepare_task)
+        await _cancel_worker_phase(request, record, node, settings)
+        raise OfficialError(
+            504,
+            f"the agent for node {node.node_id} did not answer within "
+            f"{deadline}s: refusing (the create's materialization is "
+            "fail-closed)",
+        ) from None
+    except BaseException:
+        await _swallow(prepare_task)
+        await _cancel_worker_phase(request, record, node, settings)
+        raise
+    # The prepare half's own failure is the create's failure -- it is what
+    # reserves the uid and publishes the accounting -- and it has already
+    # taken itself back on the worker.
+    await prepare_task
+    if not materialized:
+        await _cancel_worker_phase(request, record, node, settings)
+        await _provision_remote(
+            request,
+            record,
+            node,
+            settings,
+            snapshot,
+            volume_mounts,
+            snapshot_id=snapshot_id,
+            materialized=False,
+        )
+        return False
+    await _provision_remote(
+        request,
+        record,
+        node,
+        settings,
+        snapshot,
+        volume_mounts,
+        snapshot_id=snapshot_id,
+        materialized=True,
+        phase="finalize",
+    )
+    return True
+
+
+async def _swallow(task) -> None:
+    """Wait for a phase that was fired beside the materialization.
+
+    Ignoring how it went, because the caller is already handling a failure it
+    must not replace -- but it does have to let the worker's half *stop*, so
+    the cancel that follows is not racing it.
+    """
+    try:
+        await task
+    except BaseException:  # noqa: BLE001 - the caller owns the real failure
+        pass
+
+
+async def _cancel_worker_phase(request, record, node, settings) -> None:
+    """Tell the worker to take its prepared half back (design §4.6 (b)).
+
+    A cancel that cannot be delivered must not replace the reason the create
+    failed, so this is best effort and logs instead of raising. It is still
+    worth its one round trip: the prepared half is what a later ``DELETE`` of
+    this id would wait out a full create bound on.
+    """
+    import httpx
+
+    client = getattr(request.app.state, "remote_http", None)
+    owned = client is None
+    try:
+        if owned:
+            client = httpx.AsyncClient(timeout=10)
+        try:
+            resp = await client.post(
+                f"{node.address}/agent/sandboxes",
+                json={"sandboxID": record.sandbox_id, "phase": "cancel"},
+                headers={"X-Internal-Key": settings.internal_api_key},
+            )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "sandbox %s: could not tell node %s to take back the prepared "
+                "half of its create (%s); its marker will be reclaimed when a "
+                "teardown or the orphan sweep next looks at it",
+                record.sandbox_id,
+                node.node_id,
+                exc,
+            )
+            return
+        if resp.status_code >= 300:
+            logger.warning(
+                "sandbox %s: node %s refused to take back the prepared half of "
+                "its create (HTTP %s): %s",
+                record.sandbox_id,
+                node.node_id,
+                resp.status_code,
+                resp.text[:200],
+            )
+    finally:
+        if owned:
+            await client.aclose()
+
+
 async def _provision_remote(
     request,
     record,
@@ -1677,8 +1866,17 @@ async def _provision_remote(
     volume_mounts,
     snapshot_id=None,
     materialized=False,
+    phase=None,
 ) -> None:
-    """Provision the sandbox on a remote worker through its agent API."""
+    """Provision the sandbox on a remote worker through its agent API.
+
+    ``phase`` is the create's two-phase handshake (design §4.6 (b)):
+    ``"prepare"`` asks for the tree-free half -- which runs *beside* the node
+    agent's materialization -- and ``"finalize"`` closes the create once the
+    tree is there. ``None`` is the whole create in this one call, which is what
+    every existing caller (an older control plane, the migration path, the fork
+    path) sends and what the worker has always done.
+    """
     import httpx
 
     payload = {
@@ -1723,6 +1921,15 @@ async def _provision_remote(
         # the rolling-upgrade matrix free.
         "materialized": bool(materialized),
     }
+    if phase is not None:
+        payload["phase"] = phase
+        if phase == "prepare":
+            # The prepared half runs while the materialization it races is
+            # still unanswered, and it does no tree work either way -- so it
+            # carries no claim about the tree at all. Sending
+            # ``materialized: false`` here would be a claim the control plane
+            # does not yet have.
+            payload.pop("materialized", None)
     internal_key = settings.internal_api_key
     # The client is the app's shared one (``app.state.remote_http``): building
     # a fresh ``AsyncClient`` per create meant a new TCP connection, and a DNS

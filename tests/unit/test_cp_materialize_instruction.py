@@ -176,7 +176,15 @@ def _no_real_worker_hop(monkeypatch):
     async def _fake(request, record, node, settings, snapshot, volume_mounts, **kw):
         hops.append((record.sandbox_id, node.node_id, kw.get("materialized")))
 
+    async def _fake_cancel(request, record, node, settings) -> None:
+        # The undo of the prepared half (design §4.6 (b)) is a *second* hop to
+        # the same worker. It has its own lane (``test_create_two_phase.py``);
+        # here it only has to not reach the synthetic address this fixture
+        # registers.
+        return None
+
     monkeypatch.setattr(sandboxes, "_provision_remote", _fake)
+    monkeypatch.setattr(sandboxes, "_cancel_worker_phase", _fake_cancel)
     return hops
 
 
@@ -389,7 +397,12 @@ async def test_a_quota_volume_contributes_a_slice(workspace: Path) -> None:
 
 
 async def _worker_hop_flag(app, shape, monkeypatch) -> list:
-    """Drive a create and report ``materialized`` as the *worker* saw it."""
+    """Drive a create and report ``materialized`` as the *worker* saw it.
+
+    One entry per hop. A create the control plane cannot split has one (the
+    whole create in one call); the two-phase shape has two when it degrades --
+    the prepared half, then the single call that builds the tree.
+    """
     hops: list = []
 
     async def _fake(request, record, node, settings, snapshot, volume_mounts, **kw):
@@ -473,6 +486,10 @@ async def test_an_agent_that_does_not_know_the_operation_falls_back(
     The API answered by an older agent is a 404 naming the op it does not know.
     That is "this deployment cannot take the instruction yet", so the create
     degrades to the worker's own path -- it is not a create that failed.
+
+    Under (b) the degrade is: the prepared half is thrown away and the create
+    then goes over as the single call that builds the tree, so the *last* hop
+    is the one that says what the worker has to do.
     """
     shape = _Cp(workspace)
     client = _StubClient(
@@ -483,7 +500,7 @@ async def test_an_agent_that_does_not_know_the_operation_falls_back(
     app = _app(shape, client=client)
     await _register_node(app)
 
-    assert await _worker_hop_flag(app, shape, monkeypatch) == [False]
+    assert await _worker_hop_flag(app, shape, monkeypatch) == [False, False]
     assert len(client.calls) == 1
 
 
@@ -497,6 +514,9 @@ async def test_a_busy_agent_falls_back_to_the_worker(
     (design §4.6). Failing the create there would make the fifth concurrent
     snapshot create on a node fail for the caller; the worker's own path is
     slower and no less correct.
+
+    Same shape as the older-agent case above: prepared half cancelled, then the
+    single call that builds the tree.
     """
     shape = _Cp(workspace)
     client = _StubClient(
@@ -508,7 +528,7 @@ async def test_a_busy_agent_falls_back_to_the_worker(
     app = _app(shape, client=client)
     await _register_node(app)
 
-    assert await _worker_hop_flag(app, shape, monkeypatch) == [False]
+    assert await _worker_hop_flag(app, shape, monkeypatch) == [False, False]
     assert len(client.calls) == 1
 
 

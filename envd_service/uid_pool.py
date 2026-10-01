@@ -637,6 +637,13 @@ class UidPool:
         Raises :class:`UidPoolError` when the uid is outside the pool range --
         a control plane and a worker that disagree about the range would
         otherwise silently put two sandboxes on one uid.
+
+        The sandbox→uid pair is recorded too, exactly as :meth:`acquire` does
+        and as :meth:`reconcile` rebuilds it from the records on disk. Without
+        it the pool knows the uid is taken but not *whose* it is, so
+        :meth:`release` cannot give it back -- a failed create would leak the
+        slot in this worker's fallback allocator forever, and the two-phase
+        cancel (design §4.6 (b)) has nothing to undo.
         """
         if not validate_sandbox_id(sandbox_id):
             raise UidPoolError(f"invalid sandbox id: {sandbox_id!r}")
@@ -647,6 +654,7 @@ class UidPool:
             )
         with self._lock:
             self._allocated.add(uid)
+            self._by_sandbox[sandbox_id] = uid
         return uid
 
     def commit(self, sandbox_id: str) -> None:
@@ -700,6 +708,21 @@ class UidPool:
     def allocated_uids(self) -> set[int]:
         with self._lock:
             return set(self._allocated)
+
+    def held_uid(self, sandbox_id: str) -> int | None:
+        """The uid this process is holding for ``sandbox_id``, if any.
+
+        The create's two-phase handshake (design §4.6 (b)) asks twice -- once in
+        ``prepare``, once in ``finalize`` -- and the answer has to be the same
+        both times: the second call must not come back through
+        :meth:`acquire`, which would see the first reservation as *used* and
+        pick a different uid (two uids for one sandbox, and the tree owned by
+        one of them). In-process only, like the rest of the pool's live state:
+        a fresh process re-derives it from the payload or from the reservation
+        markers on disk.
+        """
+        with self._lock:
+            return self._by_sandbox.get(sandbox_id)
 
     def reconcile(self) -> dict[str, Any]:
         """Startup reconciliation: rebuild the in-memory used set and reclaim

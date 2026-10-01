@@ -2996,7 +2996,78 @@ async def _persist_runtime_record(
         pool.commit(sandbox_id)
 
 
-def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -> None:
+def _claim_host_uid(
+    settings: Settings,
+    runtime_registry,
+    payload: dict,
+    sandbox_id: str,
+    existing,
+) -> tuple[int | None, object | None]:
+    """The sandbox's host uid for this create, reserving it if this shape does.
+
+    E3.2: the uid is allocated before materializing volumes so per-sandbox
+    volume slices can be chowned to it. Only a root worker -- or a non-root
+    worker that can ask *someone* for the chown: C3's per-node agent
+    (``priv_helpers.file_steps_available``) -- can put a sandbox under its own
+    host uid; everything else keeps the fixed-uid + Landlock model and never
+    allocates.
+
+    ⚠ This gate is what makes the hand-over *reachable* at all: a predicate
+    that asked only about a local privileged shape left ``host_uid`` None in
+    the agent shape, so ``apply_sandbox_ownership`` and every face-B
+    ``chown`` were skipped in silence (review Task 4 slice A, Important 2).
+
+    Callable twice for one create -- ``prepare`` reserves it and ``finalize``
+    asks again -- so the pool's own answer wins when this process already holds
+    one (``UidPool.held_uid``). Without that, the second call would come back
+    through ``acquire`` and hand out a *different* uid (the first one is
+    reserved), i.e. two uids for one sandbox.
+    """
+    pool = getattr(runtime_registry, "uid_pool", None)
+    if pool is None:
+        return None, None
+    held = pool.held_uid(sandbox_id)
+    if held is not None:
+        return held, pool
+    from envd_service import priv_helpers
+
+    if not settings.per_sandbox_uid or not (
+        os.geteuid() == 0 or priv_helpers.file_steps_available(settings)
+    ):
+        return None, pool
+    # OBS-9: the control plane allocates the fleet-wide uid and passes it
+    # down; the worker's own pool is the fallback for payloads without one
+    # (an older control plane, or a deployment that never enabled it).
+    allocated = payload.get("hostUID")
+    if isinstance(allocated, int) and not isinstance(allocated, bool):
+        return pool.claim(sandbox_id, allocated), pool
+    return (
+        pool.acquire(
+            sandbox_id,
+            preferred=existing.host_uid if existing is not None else None,
+        ),
+        pool,
+    )
+
+
+def _agent_finalize_sandbox(request: Request, settings: Settings, payload: dict) -> None:
+    """The tree-dependent half of a create (design §4.6 (b)).
+
+    Everything here needs the tree to exist: building it (when the agent did
+    not), the volume mounts and the quota that only a node can decide, the
+    ownership hand-over, and the record.
+
+    ``materialized`` says the control plane's node agent already made the tree
+    and handed it over, so this worker does neither the tree nor the ownership
+    (design v2 §4.4). It is one payload field and not an exception path on
+    purpose: absent means "build it yourself", which is what an older control
+    plane sends -- so both directions of a rolling upgrade are the old
+    behaviour, with nothing to degrade and nothing to report.
+
+    Called either on its own (the control plane's ``phase: finalize``, after its
+    ``phase: prepare``) or right behind ``_agent_prepare_sandbox`` in one worker
+    thread (the single-shot route every existing caller uses).
+    """
     runtime_registry = request.app.state.runtime_registry
     workspace_base = settings.workspace_base
     sandbox_id = payload.get("sandboxID")
@@ -3004,18 +3075,6 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
         raise ValueError("sandboxID is required")
     workspace_dir = workspace_base / sandbox_id
     snapshot_id = payload.get("snapshotID")
-    # §4.5: announce the create *before* anything is materialized, so a
-    # ``DELETE`` that arrives while this runs waits instead of tearing down a
-    # tree that is about to be written to (and, from the next task on, a record
-    # that is about to be written after the response).
-    _write_creating_marker(settings, sandbox_id)
-    # The control plane materialized this tree on this node's agent *before*
-    # dialling us, so ``materialized`` says "the tree is ready and already
-    # handed over" and this worker does neither (design v2 §4.4). It is one
-    # payload field and not an exception path on purpose: absent means "build it
-    # yourself", which is what an older control plane sends -- so both
-    # directions of a rolling upgrade are the old behaviour, with nothing to
-    # degrade and nothing to report.
     materialized = payload.get("materialized") is True
     if not materialized:
         workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -3030,37 +3089,9 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
             (workspace_dir / "workspace").mkdir(parents=True, exist_ok=True)
     volume_mounts = payload.get("volumeMounts") or []
     existing = runtime_registry.get(sandbox_id)
-    # E3.2: allocate the sandbox's host uid before materializing volumes so
-    # per-sandbox volume slices can be chowned to it. Only a root worker -- or
-    # a non-root worker that can ask *someone* for the chown: C3's per-node
-    # agent (``priv_helpers.file_steps_available``) -- can put a sandbox under
-    # its own host uid; everything else keeps the fixed-uid + Landlock model
-    # and never allocates.
-    #
-    # ⚠ This gate is what makes the hand-over *reachable* at all: a predicate
-    # that asked only about a local privileged shape left ``host_uid`` None in
-    # the agent shape, so ``apply_sandbox_ownership`` and every face-B
-    # ``chown`` were skipped in silence (review Task 4 slice A, Important 2).
-    host_uid = None
-    pool = getattr(runtime_registry, "uid_pool", None)
-    from envd_service import priv_helpers
-
-    if (
-        settings.per_sandbox_uid
-        and (os.geteuid() == 0 or priv_helpers.file_steps_available(settings))
-        and pool is not None
-    ):
-        # OBS-9: the control plane allocates the fleet-wide uid and passes it
-        # down; the worker's own pool is the fallback for payloads without one
-        # (an older control plane, or a deployment that never enabled it).
-        allocated = payload.get("hostUID")
-        if isinstance(allocated, int) and not isinstance(allocated, bool):
-            host_uid = pool.claim(sandbox_id, allocated)
-        else:
-            host_uid = pool.acquire(
-                sandbox_id,
-                preferred=existing.host_uid if existing is not None else None,
-            )
+    host_uid, pool = _claim_host_uid(
+        settings, runtime_registry, payload, sandbox_id, existing
+    )
     try:
         mount_paths, volume_projects = build_volume_mounts(
             sandbox_id=sandbox_id,
@@ -3166,6 +3197,60 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
             # an fsync (47 ms measured 2026-10-01).
             persist=False,
         )
+        # The ``statfs(2)`` accounting seed lives in ``_agent_prepare_sandbox``
+        # now (design §4.6 (b)): it needs no tree, so it belongs to the half
+        # that runs *beside* the agent's materialization, not behind it.
+    except BaseException:
+        # I3: any failure between acquire and register (invalid volume
+        # mounts -> 400, quota/ownership errors -> 500) must return the
+        # reserved uid to the pool instead of leaking a slot.
+        if host_uid is not None and pool is not None:
+            pool.release(sandbox_id)
+        raise
+
+
+def _agent_prepare_sandbox(request: Request, settings: Settings, payload: dict) -> None:
+    """The half of a create that never needed the tree (design §4.6 (b)).
+
+    Under (b) the control plane sends this *beside* the node's agent
+    materialization, so the two overlap and only the longer one is on the
+    create's critical path. That is why nothing here may touch the tree -- not
+    the ``mkdir``/``copytree``, not the mount view, not the ownership hand-over
+    -- and why nothing here may register: a control plane that died between the
+    two hops would otherwise leave a record for a sandbox nobody finished,
+    which is exactly the residue design §4.5 closed.
+
+    What is left is the part that needs nothing but this node's own
+    bookkeeping: the ``.creating`` marker (the window's announcement), the uid
+    reservation, and the seed of the ``statfs(2)`` accounting.
+
+    **It carries no state to the finalize half.** The payload is re-sent whole
+    and every value here is re-derivable from it plus the pool's own answer, so
+    a worker that restarts between the two hops finishes the create instead of
+    refusing it.
+
+    On failure it takes its own half back (``_agent_cancel_sandbox``) rather
+    than leaving a marker and a uid reservation for a create nobody will
+    finish.
+    """
+    runtime_registry = request.app.state.runtime_registry
+    sandbox_id = payload.get("sandboxID")
+    if not sandbox_id:
+        raise ValueError("sandboxID is required")
+    # §4.5: announce the create *before* anything is materialized, so a
+    # ``DELETE`` that arrives while this runs waits instead of tearing down a
+    # tree that is about to be written to (and a record that is about to be
+    # written after the response).
+    _write_creating_marker(settings, sandbox_id)
+    try:
+        _claim_host_uid(
+            settings,
+            runtime_registry,
+            payload,
+            sandbox_id,
+            runtime_registry.get(sandbox_id),
+        )
+        disk_mb = int(payload.get("diskMB", settings.default_disk_mb))
         # SEC-K0S-006: seed the `statfs(2)` accounting before the first scan
         # round runs, so a `df` immediately after create already reports the
         # quota instead of the node's volume. Usage starts at zero and the
@@ -3174,12 +3259,113 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
             settings, sandbox_id, total_bytes=disk_mb * 1024 * 1024, used_bytes=0
         )
     except BaseException:
-        # I3: any failure between acquire and register (invalid volume
-        # mounts -> 400, quota/ownership errors -> 500) must return the
-        # reserved uid to the pool instead of leaking a slot.
-        if host_uid is not None and pool is not None:
-            pool.release(sandbox_id)
+        _agent_cancel_sandbox(request, settings, payload)
         raise
+
+
+def _agent_cancel_sandbox(request: Request, settings: Settings, payload: dict) -> None:
+    """Give back what ``_agent_prepare_sandbox`` took, and nothing else.
+
+    The control plane's own undo of the prepared half (design §4.6 (b)): the
+    instruction it was about to send did not happen, so the marker, the uid
+    reservation and the accounting seed have to go -- or the next ``DELETE`` of
+    that id waits out a full create bound on a create that will never finish,
+    and a host uid stays reserved for a sandbox nobody has.
+
+    **Never touches a registered sandbox.** The uid the pool remembers for an
+    id outlives the create (``register`` does not clear it; only ``commit``
+    drops the *on-disk* reservation marker), so releasing it here for a live
+    sandbox would hand the same host uid to a second sandbox -- two sandboxes
+    behind one isolation wall. A record means the prepared half was finalized
+    and there is nothing left to cancel.
+
+    The tree is deliberately not this half's to remove: when the control plane
+    could not send the instruction, nothing on this node made one -- and when it
+    could, the tree is the *agent's* work, reclaimed by the orphan sweep.
+    """
+    runtime_registry = request.app.state.runtime_registry
+    sandbox_id = payload.get("sandboxID")
+    if not sandbox_id:
+        return
+    if runtime_registry.get(sandbox_id) is not None:
+        return
+    pool = getattr(runtime_registry, "uid_pool", None)
+    if pool is not None:
+        pool.release(sandbox_id)
+    _discard_disk_stats(settings, sandbox_id)
+    _clear_creating_marker(settings, sandbox_id)
+
+
+def _discard_disk_stats(settings: Settings, sandbox_id: str) -> None:
+    """Undo the accounting seed: the file, then the directory if it is empty."""
+    from gateway_common.paths import sandbox_disk_stats_path
+
+    path = sandbox_disk_stats_path(
+        settings.workspace_base, sandbox_id, state_base=settings.state_base
+    )
+    try:
+        path.unlink(missing_ok=True)
+        path.parent.rmdir()
+    except OSError:
+        # Best effort, like the seed itself: a directory that is not empty is
+        # not this call's to remove.
+        pass
+
+
+def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -> None:
+    """One create, whole: the two halves in one call (design §4.6 (b)).
+
+    This is the shape every existing caller sends -- an older control plane, the
+    migration and fork paths -- and it is also what the worker does for a
+    control plane that could not split the create. The halves are the same two
+    functions the phased route calls, in the same order, so there is one
+    implementation of "how a sandbox is made" no matter who drives it.
+
+    Failure undoes the prepared half (I3): any failure between the uid
+    reservation and ``register`` (invalid volume mounts -> 400, quota or
+    ownership errors -> 500) returns the reserved uid to the pool instead of
+    leaking a slot, and takes the marker and the accounting seed with it.
+    """
+    try:
+        _agent_prepare_sandbox(request, settings, payload)
+        _agent_finalize_sandbox(request, settings, payload)
+    except BaseException:
+        _agent_cancel_sandbox(request, settings, payload)
+        raise
+
+
+#: The phases the create route understands. An absent phase is the whole create
+#: in one call -- the shape an older control plane, the migration path and the
+#: fork path all send, and the one this route has always had.
+_CREATE_PHASES = frozenset({"prepare", "finalize", "cancel"})
+
+
+def _run_create_phase(request: Request, settings: Settings, payload: dict) -> str:
+    """Run the phase this payload names and report which one that was.
+
+    The dispatch (and the undo) lives here rather than in the route so the
+    route only has to translate an answer into a status code -- and so the
+    single-shot shape stays literally "prepare, then finalize": one
+    implementation of how a sandbox is made, whoever drives it.
+    """
+    phase = payload.get("phase")
+    if phase == "cancel":
+        # Never raises: an undo that cannot run is not the control plane's
+        # problem to solve here, and it must not turn into a second failure.
+        _agent_cancel_sandbox(request, settings, payload)
+        return "cancel"
+    try:
+        if phase != "finalize":
+            _agent_prepare_sandbox(request, settings, payload)
+        if phase != "prepare":
+            _agent_finalize_sandbox(request, settings, payload)
+    except BaseException:
+        # Every failing shape takes the prepared half back -- including the
+        # finalize half, whose own ``except`` returns the uid but leaves the
+        # marker and the accounting seed for a create that did not happen.
+        _agent_cancel_sandbox(request, settings, payload)
+        raise
+    return phase or "create"
 
 
 async def _prime_runtime_context(request: Request, sandbox_id: str | None) -> None:
@@ -3251,10 +3437,35 @@ async def agent_create_sandbox(request: Request) -> Response:
         # ``fileop:*`` -- are logged by the code that does them), and ``prime``
         # is the runtime context, which is separate because it is an
         # optimisation of the first command rather than part of the contract.
+        #
+        # ``phase`` is the create's two-phase handshake (design §4.6 (b)): the
+        # control plane fires ``prepare`` beside the node agent's
+        # materialization and then closes with ``finalize``. Absent -- which is
+        # what every existing caller sends -- means the whole create in this one
+        # call, byte for byte what it always was.
         sandbox_id = payload.get("sandboxID")
+        phase = payload.get("phase")
+        if phase is not None and phase not in _CREATE_PHASES:
+            return Response(
+                status_code=400,
+                content=(
+                    f"unknown create phase {phase!r}: the phases are "
+                    + ", ".join(sorted(_CREATE_PHASES))
+                    + " (an absent phase means the whole create)"
+                ),
+            )
         started = time.monotonic()
-        await asyncio.to_thread(_agent_create_sandbox, request, settings, payload)
-        create_trace.stage("provision", sandbox_id, started)
+        done = await asyncio.to_thread(
+            _run_create_phase, request, settings, payload
+        )
+        create_trace.stage("provision" if done == "create" else done, sandbox_id, started)
+        if done == "prepare":
+            # The prepared half is done and nothing is registered: there is no
+            # record to persist and no runtime context to prime yet. Both
+            # belong to the finalize call (design §4.5).
+            return Response(status_code=200)
+        if done == "cancel":
+            return Response(status_code=204)
         # §4.5: the record write leaves the response path here. The marker
         # written at the top of ``_agent_create_sandbox`` is what makes that
         # safe -- it comes off only once the record is durable.
