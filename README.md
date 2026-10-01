@@ -28,6 +28,24 @@ notification）在自己机器的 Linux 内核上跑用户代码 —— 不需�
 - **失败可见，不做假成功。** 未实现的 API 明确报错而不是假装成功；危险的半配置在启动时就被拒绝
   并打印原因；测不到的数值如实报 `unknown` 而不是 `0` —— 安全与配额上不会给你一个"看起来正常"的绿色。
 
+### 轻量化到什么程度（下列读数都能在仓库文档里复核）
+
+| 指标 | 实测 | 口径 |
+|---|---|---|
+| 沙箱 rootfs 就绪（2111 个文件的 python-slim） | **0.26 s**（节点本地解包）／61.4 s（直接解到共享 NAS） | 方案把 OCI tar 放共享卷、rootfs 解到节点本地缓存；冷节点用预热端点一次 **18.8 s**，之后命中缓存 |
+| 端到端冒烟（4 个沙箱跨 2 节点，含命令/文件/stdin） | **8.7 s** | `multinode_smoke.py`，出厂集群实测 |
+| 端到端冒烟（建箱 → 模板构建 → registry → worker 拉取 → rootfs → MCP） | **20.6 s** | `deployment_smoke.py`，同一集群 |
+| 沙箱内文件系统调用（经 chroot 中介） | `open`+`close` 一对 ≈ **0.4 ms**，`stat` 族 ≈ **0.2 ms** | 这是路径中介的既有成本；**再加 pidns 只多 ≤2 µs/次**（没有任何路径中介的裸形态才看到 +80~90 µs/次） |
+| 网络隔离后的建连 | p50 **0.291 ms**（共享网络命名空间 0.034 ms） | 只有短连接受影响，长连接/连接池无感；入站 MCP 往返 p50 ≈ 29 ms，与未隔离形态持平 |
+| 磁盘用量记账（400 目录 / 2000 文件） | **2.34 ms**（整树重扫 1043.9 ms） | 446×；后台计量不占沙箱的命令时延 |
+| NFS 上取文件大小 | **0.01 ms**（普通 `stat` 会先回写脏页：1405 ms） | 指标采集不会把正在写的沙箱卡住；整树 walk 实测 2000 文件 10.9 ms、10000 文件 35.7 ms |
+| 密度上限由什么决定 | 每沙箱只多 1 个用户命名空间；目标机 `user.max_user_namespaces = 30519` | 不是虚拟化那类固定内存/CPU 开销，节点能放多少沙箱由资源预算（`E2B_NODE_*` / `E2B_MAX_SANDBOXES`）决定 |
+
+> 口径与原始读数：[docs/k8s-deployment.md](docs/k8s-deployment.md) §12/§22、
+> [docs/disk-quota-options.md](docs/disk-quota-options.md)、
+> [docs/production-deployment-requirements.md](docs/production-deployment-requirements.md) §2.4.6 / §2.4.10；
+> 每条都有对应探针脚本与日志，可自己复跑。
+
 > 适用范围：Linux（内核 6.12+，即 Landlock ABI ≥ 6）；暂停与快照是进程 / 文件系统级语义，
 > 不保留运行内存。完整清单见 [§10 已知边界](#10-已知边界)。
 
