@@ -33,6 +33,9 @@ import time
 from typing import Any
 
 from gateway_common import create_trace
+#: The create path's one op, spelled once (the control plane mints it, the
+#: agent executes it, and this client asks for it by name).
+from gateway_common.create_grant import OP as MATERIALIZE_OP
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,19 @@ class AgentFileOpsUnknownSandbox(AgentFileOpsError):
     succeed -- measured on the fleet 2026-10-01 as a 404 storm (every disk
     round walking a forgotten sandbox, ~5 requests/s, for hours) that started
     with exactly this answer being treated as a transient error.
+    """
+
+
+class AgentMaterializeUnsupported(AgentFileOpsError):
+    """This deployment's agent cannot take a materialization plan yet.
+
+    Raised for the two shapes a rolling upgrade produces -- an agent that does
+    not serve ``/internal/grants/file-op`` (HTTP 404), and one that cannot be
+    reached at all -- so the caller can degrade **by name**: the create keeps
+    working through the control plane's relay, which is slower and no less
+    strict (design §4.4). Deliberately a distinct type: "this agent is older
+    than this worker" is not a failure of the operation, and it must never be
+    read as one.
     """
 
 
@@ -265,6 +281,156 @@ class AgentFileOps:
 
     def scope_slot_document(self, sandbox_id: str, name: str) -> None:
         self.request("scope-slot-document", sandbox_id, name=name)
+
+    # ------------------------------------------------------ the create plan
+
+    def materialize(
+        self, sandbox_id: str, snapshot_id: str | None = None
+    ) -> dict[str, Any]:
+        """Materialize this sandbox's tree by handing a plan to its own agent.
+
+        Two hops, and the second one is the point: mint a signed plan from the
+        control plane (which derives every path and uid from its own record),
+        then POST it to the **node's own agent** instead of asking the control
+        plane to relay each step. The create stops paying
+        worker→CP→agent→CP→worker per materialization step (design §4.4).
+
+        One retry, and only one, and only for the shape that needs it: if the
+        agent ran the plan but the answer was lost, it answers
+        ``409 grant already used``. The rule is *mint a new one* -- never
+        replay the spent one (design §4.2), because single use is what makes a
+        leaked plan harmless. Both operations are idempotent, so one retry is
+        safe.
+
+        Raises :class:`AgentMaterializeUnsupported` when this deployment's
+        agent cannot take a plan at all, so the caller degrades by name.
+        """
+        import httpx
+
+        started = time.monotonic()
+        try:
+            for _attempt in (1, 2):
+                minted = self._mint_create_grant(sandbox_id, snapshot_id)
+                agent_url = str(minted["agentURL"]).rstrip("/")
+                url = f"{agent_url}/internal/grants/file-op"
+                try:
+                    # No ``X-Internal-Key``: the plan *is* the credential here
+                    # -- addressed to this host, expiring in seconds, single
+                    # use. The worker still never holds the agent token.
+                    response = self._http().post(url, json={"grant": minted["grant"]})
+                except httpx.HTTPError as exc:
+                    detail = str(exc) or type(exc).__name__
+                    raise AgentMaterializeUnsupported(
+                        f"the agent at {agent_url} cannot be reached for a "
+                        f"materialization of sandbox {sandbox_id} ({detail})"
+                    ) from exc
+                if response.status_code == 404:
+                    raise AgentMaterializeUnsupported(
+                        f"the agent at {agent_url} has no "
+                        "/internal/grants/file-op (HTTP 404)"
+                    )
+                if response.status_code == 409:
+                    detail = _error_detail(response)
+                    if detail == "grant already used":
+                        logger.warning(
+                            "the agent at %s already ran the materialization "
+                            "grant for sandbox %s and the answer was lost; "
+                            "minting a new one (never replaying the old)",
+                            agent_url,
+                            sandbox_id,
+                        )
+                        continue
+                    raise AgentFileOpsError(
+                        f"the agent refused to materialize sandbox {sandbox_id} "
+                        f"(HTTP 409): {detail}"
+                    )
+                if response.status_code >= 300:
+                    raise AgentFileOpsError(
+                        f"the agent refused to materialize sandbox {sandbox_id} "
+                        f"(HTTP {response.status_code}): {_error_detail(response)}"
+                    )
+                try:
+                    answer = response.json()
+                except ValueError as exc:
+                    raise AgentFileOpsError(
+                        "the agent answered the materialization of sandbox "
+                        f"{sandbox_id} with a non-JSON body"
+                    ) from exc
+                if not isinstance(answer, dict):
+                    raise AgentFileOpsError(
+                        "the agent answered the materialization of sandbox "
+                        f"{sandbox_id} with a {type(answer).__name__}, not an "
+                        "answer"
+                    )
+                return answer
+            # Both freshly minted plans were spent on arrival. That is not a
+            # race this client can win by minting a third: it means the agent
+            # is refusing everything the control plane signs, and the caller
+            # has to see it.
+            raise AgentFileOpsError(
+                "the agent spent two freshly minted materialization grants for "
+                f"sandbox {sandbox_id}: refusing to keep minting"
+            )
+        finally:
+            create_trace.stage("materialize", sandbox_id, started)
+
+    def _mint_create_grant(
+        self, sandbox_id: str, snapshot_id: str | None
+    ) -> dict[str, str]:
+        """One plan from the control plane: ``{agentURL, grant}``."""
+        import httpx
+
+        url = f"{self._url}/internal/nodes/{self._node_id}/file-grant"
+        body: dict[str, Any] = {"op": MATERIALIZE_OP, "sandbox_id": sandbox_id}
+        if snapshot_id is not None:
+            body["snapshot_id"] = snapshot_id
+        try:
+            response = self._http().post(
+                url, json=body, headers={"X-Internal-Key": self._internal_key}
+            )
+        except httpx.HTTPError as exc:
+            detail = str(exc) or type(exc).__name__
+            raise AgentFileOpsError(
+                "the control plane is unreachable for a materialization grant "
+                f"on sandbox {sandbox_id}: {detail}"
+            ) from exc
+        if response.status_code >= 300:
+            detail = _error_detail(response)
+            message = (
+                "the control plane refused a materialization grant for sandbox "
+                f"{sandbox_id} (HTTP {response.status_code}): {detail}"
+            )
+            if response.status_code == 404:
+                raise AgentFileOpsUnknownSandbox(message)
+            if response.status_code == 503:
+                # "The grant channel cannot serve this sandbox": no agent
+                # client, no worker identity, no allocated host uid, no agent
+                # address -- every one of them a *deployment* fact rather than
+                # a fault of this operation, and every one of them a shape the
+                # control plane's relay handles. Named degradation, not failure
+                # (design §4.4: "面 B 没有新路由或授权通道不可用时").
+                raise AgentMaterializeUnsupported(message)
+            raise AgentFileOpsError(message)
+        try:
+            answer = response.json()
+        except ValueError as exc:
+            raise AgentFileOpsError(
+                "the control plane answered a materialization grant for sandbox "
+                f"{sandbox_id} with a non-JSON body"
+            ) from exc
+        agent_url = answer.get("agentURL") if isinstance(answer, dict) else None
+        grant = answer.get("grant") if isinstance(answer, dict) else None
+        if (
+            not isinstance(agent_url, str)
+            or not agent_url
+            or not isinstance(grant, str)
+            or not grant
+        ):
+            raise AgentFileOpsError(
+                "the control plane's materialization grant for sandbox "
+                f"{sandbox_id} is not an {{agentURL, grant}} pair"
+            )
+        return {"agentURL": agent_url, "grant": grant}
 
     def _walk(self, op: str, sandbox_id: str) -> list[str]:
         answer = self.request(op, sandbox_id)

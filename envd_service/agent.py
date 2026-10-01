@@ -2871,6 +2871,42 @@ def _write_disk_stats(
         logger.warning("disk stats publish failed for %s", sandbox_id, exc_info=True)
 
 
+def _materialize_or_degrade(sandbox_id: str, snapshot_id: str | None) -> bool:
+    """Try the agent's one-call materialization; degrade **by name** if it is absent.
+
+    Returns ``True`` when the tree was made by the agent's
+    ``materialize-tree`` plan, ``False`` when the caller must fall back to the
+    original local ``mkdir``/``copytree``. The fallback is deliberately loud
+    (a WARNING naming the sandbox and the reason) and deliberately *complete*:
+    the same steps still run, just slower and through the control plane's
+    relay, which is no less strict -- the alternative, silently skipping the
+    tree, would be a create that reports success over a workspace that is not
+    there (design §4.4).
+
+    Any other failure propagates: a control plane that refuses the grant, or an
+    agent that refuses the plan, means the create must fail, not fall back to a
+    different code path that would hide it.
+    """
+    from envd_service import agent_fileops
+
+    client = agent_fileops.active()
+    if client is None:
+        # No agent transport at all: this deployment's shape, not a fault.
+        return False
+    try:
+        client.materialize(sandbox_id, snapshot_id)
+    except agent_fileops.AgentMaterializeUnsupported as exc:
+        logger.warning(
+            "agent materialization is unavailable for sandbox %s (%s): "
+            "falling back to the control plane's relay (the create still "
+            "happens, it is just slower)",
+            sandbox_id,
+            exc,
+        )
+        return False
+    return True
+
+
 def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -> None:
     runtime_registry = request.app.state.runtime_registry
     workspace_base = settings.workspace_base
@@ -2878,15 +2914,25 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
     if not sandbox_id:
         raise ValueError("sandboxID is required")
     workspace_dir = workspace_base / sandbox_id
-    workspace_dir.mkdir(parents=True, exist_ok=True)
     snapshot_id = payload.get("snapshotID")
-    if snapshot_id:
-        snapshot_fs = workspace_base / "_snapshots" / snapshot_id / "fs"
-        if not snapshot_fs.is_dir():
-            raise ValueError(f"Snapshot {snapshot_id} not found on this node")
-        shutil.copytree(snapshot_fs, workspace_dir, dirs_exist_ok=True, symlinks=True)
-    else:
-        (workspace_dir / "workspace").mkdir(parents=True, exist_ok=True)
+    # The tree (and, for a snapshot create, the copy into it) is one signed
+    # plan this worker carries to its own node's agent, which does the mkdir /
+    # copy / chown in one call -- see ``docs/superpowers/specs/
+    # 2026-10-01-create-path-grant-design.md`` §4.3. It is a *degradation*, not
+    # a switch: an agent that cannot take a plan (a rolling upgrade, or no
+    # agent at all) is named and the original local path runs unchanged.
+    materialized = _materialize_or_degrade(sandbox_id, snapshot_id)
+    if not materialized:
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        if snapshot_id:
+            snapshot_fs = workspace_base / "_snapshots" / snapshot_id / "fs"
+            if not snapshot_fs.is_dir():
+                raise ValueError(f"Snapshot {snapshot_id} not found on this node")
+            shutil.copytree(
+                snapshot_fs, workspace_dir, dirs_exist_ok=True, symlinks=True
+            )
+        else:
+            (workspace_dir / "workspace").mkdir(parents=True, exist_ok=True)
     volume_mounts = payload.get("volumeMounts") or []
     existing = runtime_registry.get(sandbox_id)
     # E3.2: allocate the sandbox's host uid before materializing volumes so
@@ -2962,7 +3008,14 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
                 # project, and delete would only leave an orphan quota table
                 # entry.
                 project_id = None
-        if host_uid is not None:
+        if materialized:
+            # The plan handed the tree over in the same call that made it
+            # (``chmod`` every directory to 0770 + one recursive ``chown``), so
+            # neither local branch applies. Doing ``apply_sandbox_ownership``
+            # here anyway would add the very round trip this change removes --
+            # measured 2026-10-01 at 71 ms for the relayed ``chown-workspace``.
+            pass
+        elif host_uid is not None:
             apply_sandbox_ownership(workspace_dir, host_uid, sandbox_id=sandbox_id)
         elif not settings.per_sandbox_uid:
             # FUP #6: legacy shared-uid shape under a root worker — every

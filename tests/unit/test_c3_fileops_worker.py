@@ -24,7 +24,11 @@ import httpx
 import pytest
 
 from envd_service import agent_fileops
-from envd_service.agent_fileops import AgentFileOps, AgentFileOpsError
+from envd_service.agent_fileops import (
+    AgentFileOps,
+    AgentFileOpsError,
+    AgentMaterializeUnsupported,
+)
 from gateway_common.paths import route_b_instance_name
 
 CP_URL = "http://control-plane:3000"
@@ -32,6 +36,9 @@ NODE = "e2b-worker-0"
 KEY = "internal-key"
 SANDBOX = "sbx_fileops"
 VOLUME = "data"
+AGENT_URL = "http://10.0.0.1:49986"
+AGENT_FILE_OP_ROUTE = f"{AGENT_URL}/internal/grants/file-op"
+GRANT_ROUTE = f"{CP_URL}/internal/nodes/{NODE}/file-grant"
 
 
 def _client(handler, **overrides) -> AgentFileOps:
@@ -600,6 +607,19 @@ class _AgentStub:
             )
         shutil.rmtree(path, ignore_errors=True)
 
+    def materialize(self, sandbox_id: str, snapshot_id: str | None = None) -> dict:
+        """This stub is an agent whose face B is reached through the relay.
+
+        The create path's one-call plan (design §4.3) is the *newer* route, so
+        the honest answer from this shape is "no such route" -- which is
+        exactly the named degradation the worker has to handle. Modelling it
+        that way keeps these cases about the relay they were written for
+        instead of silently turning them into materialize-path cases.
+        """
+        raise AgentMaterializeUnsupported(
+            "the agent has no /internal/grants/file-op (HTTP 404)"
+        )
+
 
 def _worker_app(workspace: Path, monkeypatch: pytest.MonkeyPatch):
     """A real envd app in the agent shape, with the stub installed after wiring.
@@ -975,6 +995,168 @@ def test_one_keep_alive_client_serves_every_operation(monkeypatch) -> None:
 
     assert len(created) == 1
     assert created[0] is client._client
+
+
+# ------------------------------------------------- the create path's grant
+
+
+def test_materialize_mints_then_calls_the_agent() -> None:
+    """Two hops: the plan comes from the control plane, the work from the agent.
+
+    The agent hop carries **no** ``X-Internal-Key`` -- the plan is the
+    credential there -- which is the mechanical shape of "the worker still has
+    no agent token" (design §2, non-goals).
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path.endswith("/file-grant"):
+            return httpx.Response(
+                200,
+                json={"agentURL": AGENT_URL, "grant": "plan-1", "expiresAt": 1790832010},
+            )
+        return httpx.Response(200, json={"materialized": {"tree": {"path": "/x"}}})
+
+    answer = _client(handler).materialize(SANDBOX)
+
+    assert [str(request.url) for request in seen] == [GRANT_ROUTE, AGENT_FILE_OP_ROUTE]
+    assert seen[0].headers["X-Internal-Key"] == KEY
+    assert json.loads(seen[0].content) == {
+        "op": "materialize-tree",
+        "sandbox_id": SANDBOX,
+    }
+    assert "X-Internal-Key" not in seen[1].headers
+    assert json.loads(seen[1].content) == {"grant": "plan-1"}
+    assert answer == {"materialized": {"tree": {"path": "/x"}}}
+
+
+def test_a_snapshot_create_asks_the_control_plane_for_the_copy() -> None:
+    """``snapshot_id`` is an id, not a path: the control plane derives ``copy_from``."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path.endswith("/file-grant"):
+            return httpx.Response(
+                200, json={"agentURL": AGENT_URL, "grant": "plan-1", "expiresAt": 1}
+            )
+        return httpx.Response(200, json={"materialized": {}})
+
+    _client(handler).materialize(SANDBOX, "snap_0123456789abcdef")
+
+    assert json.loads(seen[0].content) == {
+        "op": "materialize-tree",
+        "sandbox_id": SANDBOX,
+        "snapshot_id": "snap_0123456789abcdef",
+    }
+
+
+def test_an_already_used_grant_is_re_minted_once() -> None:
+    """The agent ran the plan and the answer was lost: mint, retry once, stop."""
+    mints: list[str] = []
+    agent_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/file-grant"):
+            mints.append(json.loads(request.content)["op"])
+            return httpx.Response(
+                200,
+                json={
+                    "agentURL": AGENT_URL,
+                    "grant": f"plan-{len(mints)}",
+                    "expiresAt": 1,
+                },
+            )
+        agent_calls.append(json.loads(request.content)["grant"])
+        if len(agent_calls) == 1:
+            return httpx.Response(409, json={"error": "grant already used"})
+        return httpx.Response(200, json={"materialized": {}})
+
+    _client(handler).materialize(SANDBOX)
+
+    assert agent_calls == ["plan-1", "plan-2"]
+    assert len(mints) == 2
+
+
+def test_an_agent_without_the_route_falls_back_named() -> None:
+    """A rolling upgrade's old agent: named degradation, never a silent skip."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/file-grant"):
+            return httpx.Response(
+                200, json={"agentURL": AGENT_URL, "grant": "plan-1", "expiresAt": 1}
+            )
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    with pytest.raises(AgentMaterializeUnsupported) as excinfo:
+        _client(handler).materialize(SANDBOX)
+    assert str(excinfo.value) == (
+        f"the agent at {AGENT_URL} has no /internal/grants/file-op (HTTP 404)"
+    )
+
+
+def test_an_unreachable_agent_falls_back_named() -> None:
+    """The same degradation for "there is no agent to dial" (no route in the deployment)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/file-grant"):
+            return httpx.Response(
+                200, json={"agentURL": AGENT_URL, "grant": "plan-1", "expiresAt": 1}
+            )
+        raise httpx.ConnectError("connection refused")
+
+    with pytest.raises(AgentMaterializeUnsupported) as excinfo:
+        _client(handler).materialize(SANDBOX)
+    assert str(excinfo.value) == (
+        f"the agent at {AGENT_URL} cannot be reached for a materialization of "
+        f"sandbox {SANDBOX} (connection refused)"
+    )
+
+
+def test_a_refused_grant_is_not_a_degradation() -> None:
+    """A control plane refusal is a failure, not "this agent is old"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={
+                "code": 403,
+                "message": "Sandbox sbx_fileops belongs to node other, not e2b-worker-0",
+            },
+        )
+
+    with pytest.raises(AgentFileOpsError) as excinfo:
+        _client(handler).materialize(SANDBOX)
+    assert isinstance(excinfo.value, AgentMaterializeUnsupported) is False
+    assert str(excinfo.value) == (
+        "the control plane refused a materialization grant for sandbox "
+        f"{SANDBOX} (HTTP 403): Sandbox sbx_fileops belongs to node other, "
+        "not e2b-worker-0"
+    )
+
+
+def test_a_control_plane_that_cannot_mint_falls_back_named() -> None:
+    """503 is "this deployment cannot mint a plan", which the relay still serves.
+
+    Every 503 on the grant surface is a *deployment* fact -- no agent client
+    configured, no worker identity, no allocated host uid, no agent address --
+    and each of them is a shape the control plane's own relay handles. Failing
+    the create instead would turn a rolling upgrade into an outage.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={"code": 503, "message": "sandbox sbx_fileops has no allocated host uid"},
+        )
+
+    with pytest.raises(AgentMaterializeUnsupported) as excinfo:
+        _client(handler).materialize(SANDBOX)
+    assert str(excinfo.value) == (
+        "the control plane refused a materialization grant for sandbox "
+        f"{SANDBOX} (HTTP 503): sandbox sbx_fileops has no allocated host uid"
+    )
 
 
 def test_closing_the_client_returns_the_connection(monkeypatch) -> None:
