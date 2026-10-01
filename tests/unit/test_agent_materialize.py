@@ -670,6 +670,35 @@ async def test_a_leftover_directory_is_given_the_tree_mode_without_a_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_the_mode_pass_does_not_chmod_through_a_link(workspace: Path) -> None:
+    """A link in the tree is skipped, exactly as the old walk skipped it.
+
+    The previous incarnation could write in this tree, so a link pointing
+    somewhere else is a real shape (``uid_pool._prepare_directory_modes``
+    tests ``is_symlink`` before every ``chmod`` at that level for this
+    reason). Following one here would let the sandbox name the tree the
+    *agent* sets modes on, outside its own four roots.
+    """
+    agent = _Agent(workspace)
+    outside = workspace / "outside"
+    outside.mkdir()
+    os.chmod(outside, 0o755)
+    escape = agent.tree() / "workspace" / "escape"
+    escape.parent.mkdir(parents=True)
+    escape.symlink_to(outside)
+    _snapshot(agent, {"workspace": {"kept.txt": "kept\n"}})
+
+    resp = await _post(
+        agent,
+        _instruction(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs()))),
+    )
+
+    assert resp.status_code == 200
+    assert escape.is_symlink()
+    assert stat.S_IMODE(os.stat(outside).st_mode) == 0o755
+
+
+@pytest.mark.asyncio
 async def test_a_file_where_a_directory_belongs_is_refused_named(
     workspace: Path,
 ) -> None:
