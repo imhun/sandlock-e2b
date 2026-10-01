@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.24（2026-10-01，N53：worker 丢掉"控制面不认的"运行时记录 —— 404 风暴根因，当前版本 `0.1.0-834-g8272b6c-20261001-100321`）**；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.24（2026-10-01，N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，当前版本 `0.1.0-836-g6d7532b-20261001-102113`）**；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1130,7 +1130,7 @@ profile 在承担**，换一个更宽 profile 的宿主就没了。修后由沙�
 本地 `--cap-drop ALL` 容器上对 `caps:` 条件的解析还不一致（`fsconfig` 一边到内核一边被拒），
 结论：mount API 不能指望外层 profile 兜底。
 
-### 7.24 N53：worker 丢掉"控制面不认的"运行时记录（**2026-10-01，已上线 `0.1.0-834-g8272b6c-20261001-100321`**）
+### 7.24 N53：worker 丢掉"控制面不认的"运行时记录（**2026-10-01，上半已上线 `0.1.0-834-g8272b6c-20261001-100321`；下半见同节末尾，`0.1.0-836-g6d7532b-20261001-102113`**）
 
 提交 `8272b6c`。用户报的现象是"预热后建箱的时间花在哪"，量到一半先撞上这个：
 
@@ -1151,7 +1151,23 @@ profile 在承担**，换一个更宽 profile 的宿主就没了。修后由沙�
 | 新行为：孤儿记录被丢弃 | —— | 复现：TTL 箱（`timeout=60`）过期 → 控制面先删记录（worker 拆除 500、树与 `sandbox.json` 残留）→ 用残留记录里的 token 直连 worker envd `GET /envs` 触发 `registry.get()` 复活记录 → **90 s 内出现** `the control plane has no record of sbx_2215b701f1215acf: dropping this worker's runtime record (AgentFileOpsUnknownSandbox: …)`，该 id 随后的 file-op 404 = **0**（修前是每 2 s 一次、永不停止） |
 | 仓库侧 | —— | `tests/unit` **2090 passed**；失败名单 = 基线 3 条（macOS 的 dlopen 与两条 xfs_quotactl）**+ 2 条与本次无关**的 `test_docs_only_point_at_repo_artifacts`（来自尚未入库的 `docs/security-audit/findings-k0s-2026-10-01.md` 里引用的一批 tmp/ 探针名） |
 
-**顺带点名、未修的上游缺口**（写进 N53 行，带触发）：TTL 到期时控制面**先**删自己的记录、**再**让 worker 拆除（`control_plane/registry/ttl.py`：`remove_expired()` → `on_expired`），于是 worker 的 `remove-workspace` 被自己的控制面以 404 拒绝，留下孤儿树 + `_runtime/<id>/sandbox.json`；后者仍可被后续 `get()` 复活 —— 本节修好的是"复活之后不再形成风暴"，不是"不再复活"。
+**顺带点名、同批已修的上游缺口**：TTL 到期时控制面**先**删自己的记录、**再**让 worker 拆除（`control_plane/registry/ttl.py`：`remove_expired()` → `on_expired`），于是 worker 的 `remove-workspace` 被自己的控制面以 404 拒绝，留下孤儿树 + `_runtime/<id>/sandbox.json`；后者还能被后续 `get()` 复活。
+
+### 7.24 下半：TTL 拆除顺序 + 历史残留清理（**2026-10-01，已上线 `0.1.0-836-g6d7532b-20261001-102113`**）
+
+提交 `6d7532b`。承接上一节点名的上游缺口 —— 它才是"孤儿树 + 可复活记录"的来源。
+
+**修法（TDD：先红后绿）**：`SandboxRegistry.expired_candidates()` 只回答"哪些记录到期了"、**不释放**（`remove_expired()` 改成它的薄包装，行为与调用点不变）；`TTLSweeper` 改成 `expired_candidates()` → `on_expired`（**此时记录仍在**，worker 的 `remove-workspace` 有授权）→ `registry.delete()`（拆除之后再释放；`UnknownSandboxError` 视为已被并发释放）→ `cleanup_workspace()`。窗口 = 拆除本身，代价也点名：这几秒里"已过期但仍在拆除中"的记录对 `X-Sandbox-Id` 幂等建箱可见。
+
+| 判据 | 修前 | 修后 |
+|---|---|---|
+| 先红 | `tests/unit/test_ttl.py` 的新用例：`on_expired` 里 `registry.get(id)` 抛 `UnknownSandboxError`（= worker 那条 404 的来源） | —— |
+| 集群：TTL 箱（`timeout=60`）到期 | `DELETE /agent/sandboxes/<id>` → **500**（`AgentFileOpsUnknownSandbox`），树与 `sandbox.json` 残留 | `DELETE …` → **204**；`_runtime/<id>` 与 `workspaces/<id>` **都不存在**（json=no / tree=no）；该 id 之后 0 次 404 |
+| 历史残留清理 | `state/_runtime/` 下 **63** 个孤儿目录（×2 探针 + 61 个 9 月遗留，329 KB；其中 5 个带 `sandbox.json`） | 用"控制面自报的节点沙箱清单"做守卫（当前 0 个）逐个删除：**removed 63 / kept 1**（只留基建目录 `.checkpoints`）；清理后 `dirs=0`、`du=1.0K` |
+| 清理后队列状态 | —— | CP 侧 file-op 调用 **0 / 60 s**、`cannot measure` **0–1 行 / 120 s**（平台盘扫描的良性竞态提示）、`kubectl diff` **0 行**、10 个 pod 全 Running |
+| 仓库侧 | —— | `tests/unit` **2091 passed**（失败 = 基线 3 + 2 条与本次无关的 docs pin）；`tests/contract` 的 TTL/配额三件（partition reconcile / pause-resume quota / redis 多副本）**17 passed** |
+
+> ⚠ 清理是**一次性**的：它删的是"控制面已经不认"的 `_runtime/<id>` 目录（守卫是控制面自己那份清单），不含 `.checkpoints`。以后不会再攒 —— TTL 拆除成功后 `_runtime/<id>` 随树一起走。
 
 ## 8. 改部署的入口
 
