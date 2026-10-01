@@ -6,36 +6,38 @@ notification）在自己机器的 Linux 内核上跑用户代码 —— 不需�
 
 ## 核心优势
 
-- **不需要虚拟化，也不需要 KVM。** 沙箱就是"一个带 userns / pidns / netns 的进程"（见
-  [§2](#2-隔离边界三种命名空间)），没有 guest 内核、没有 microVM 的启动路径与固定内存开销，
-  一台普通 Linux 机器就能跑（内核 ≥ 6.12，即 Landlock ABI ≥ 6）。本项目的生产集群是
-  2 节点 arm64 / Rocky Linux 10.2 / `6.12.0` / k0s —— 没有 GPU、没有嵌套虚拟化。
-- **官方 SDK 零代码修改。** 换三个环境变量（`E2B_API_URL` / `E2B_SANDBOX_URL` / `E2B_API_KEY`）
-  就能把现有 E2B 代码切过来，Python 与 JS 都用官方包（覆盖的 API 见下方清单）。
-- **权限面被压到最小。** worker 完全非 root（uid 65534、容器 BND 是空集、镜像里**没有任何
-  file-capability 二进制**），全部特权动作集中到每节点**一个 agent** 的两个面上；而且
-  **worker ↔ agent 之间没有通道** —— worker 只会拨控制面，控制面才会拨 agent，
-  "叫不出名字就拨不出去"。
-- **控制面自己闭环。** 调度 / 准入 / 磁盘配额台账 / 自愈 / 自动扩缩容（只缩 worker
-  StatefulSet，且缩容前确认目标 pod 真的会被删掉）都在本仓库里，没有外部服务依赖；
-  Redis 可选，不配就是单进程内存态。
-- **fail-closed 且可审计。** 不支持的 API 一律返回官方 Error JSON（501），不返回假成功；
-  半配置的形态在启动期**具名拒绝**而不是静默降级；"unknown" 从不被读成 `0`（磁盘/配额口径）；
-  每次上线都有版本戳与验收读数（[docs/deploy-clusters.md](docs/deploy-clusters.md) §7）。
-- **可自托管、可离线。** 镜像构建脚本、k8s 清单、k0s overlay、镜像源多源回落/本地源方案都在
-  仓库里，不依赖任何云厂商 API；开发机（macOS + Local 执行器）与生产共用同一套代码，
-  协议兼容性在本地就能验。
+> **一句话**：把 E2B 的开发者体验搬到你自己机房的普通 Linux 服务器上 ——
+> **比容器安全，比 microVM 轻，且不锁定任何云厂商。**
 
-> 先看代价：必须跑 Linux（Landlock/seccomp 是内核特性）、隔离强度依赖内核版本、暂停/快照不是
-> 内存快照 —— 完整清单见 [§10 已知边界](#10-已知边界)。
+- **无需虚拟化，比 microVM 更轻。** 不用 Firecracker 一类 microVM，也不需要 KVM、嵌套虚拟化或 GPU：
+  沙箱是内核原语（用户 / PID / 网络命名空间 + Landlock + seccomp）**纵深加固**的进程。没有 guest
+  内核、没有固定的虚拟化内存开销，一台普通 Linux 服务器就能跑，启动与密度都接近进程级 ——
+  却不像共享内核的容器那样只有一层薄边界。
+- **换三个环境变量就能迁过来。** 官方 `e2b` Python / JS SDK **零代码修改**：沙箱、命令与 PTY、
+  文件、卷、快照与 fork、暂停/恢复、网络策略、模板本地构建、MCP 网关全部兼容。现有 E2B 应用
+  把地址指过来即可，代码与 SDK 都不用动。
+- **默认最小权限，纵深防御。** 沙箱内是 root，落到宿主机上只是它**自己的隔离身份**，永远不是宿主
+  root；每个沙箱独立的 PID 与网络命名空间，看不见宿主、也看不见别的租户；文件访问由内核级白名单
+  约束；出站流量必须过策略（白/黑名单、域名 ACL、企业代理、SSRF 护栏），默认拒绝直连内网。
+- **平台自己也不能提权。** 执行节点以非特权身份运行、**不带任何特权二进制**；所有需要特权的动作
+  收拢到每节点一个受控组件，它只按平台的记录执行，**不接受调用方指定的路径或身份**；执行节点与
+  它之间没有任何通道 —— 攻下一个沙箱、甚至拿到执行节点的进程身份，都换不到别的租户。
+- **生产可用，不是 demo。** 多节点调度、资源与磁盘配额、暂停/恢复与检查点、快照与 fork、自愈、
+  自动扩缩容、指标与生命周期日志全部在仓库内闭环；纯自托管、可离线、可跑在现有 K8s 集群上，
+  没有"企业版才解锁"的开关。
+- **失败可见，不做假成功。** 未实现的 API 明确报错而不是假装成功；危险的半配置在启动时就被拒绝
+  并打印原因；测不到的数值如实报 `unknown` 而不是 `0` —— 安全与配额上不会给你一个"看起来正常"的绿色。
 
-- **兼容面**：`Sandbox.create/connect/kill`、`commands.run` + PTY/stdin、文件 API、
-  `health`、`metrics`、`logs`、Volume、Secret、`pause/resume`、`fork/snapshot`、
-  network 策略（`allowOut`/`denyOut`/`rules`/`egressProxy`）、模板本地构建、MCP 网关。
+> 适用范围：Linux（内核 6.12+，即 Landlock ABI ≥ 6）；暂停与快照是进程 / 文件系统级语义，
+> 不保留运行内存。完整清单见 [§10 已知边界](#10-已知边界)。
+
+- **兼容面速览**（协议细节见 [spec.md](spec.md)）：`Sandbox.create/connect/kill`、`commands.run` + PTY/stdin、
+  文件 API、`health`/`metrics`/`logs`、Volume、Secret、`pause/resume`、`fork/snapshot`、
+  network 策略（`allowOut`/`denyOut`/`rules`/`egressProxy`）、模板本地构建、MCP 网关；
+  当前实现与 spec 的两处事实性偏差见文末。
 - **隔离模型**：每个沙箱一个 **userns（身份翻译）+ pidns（看不见宿主）+ netns（只有 loopback，
   出口由 supervisor 代连）**，外面再套 Landlock 文件白名单与 seccomp 过滤器 —— 见
-  [§2](#2-隔离边界三种命名空间)。worker 自己零特权。
-- 详细协议口径见 [spec.md](spec.md)；当前实现与 spec 的两处事实性偏差见文末。
+  [§2](#2-隔离边界三种命名空间)。
 
 ## 目录
 
