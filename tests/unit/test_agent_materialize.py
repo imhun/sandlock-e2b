@@ -474,6 +474,15 @@ async def test_the_fast_path_and_the_fallback_produce_the_same_tree(
     symlinks=True)``: that call *is* the behavioural spec of the merge (it is
     the worker's own path, unchanged by this work), so a tree this agent
     produces has to match it entry for entry, links included.
+
+    **Layout only, deliberately.** Directory *modes* are not compared here:
+    ``copytree`` reproduces the snapshot's own directory modes (``copystat``),
+    while the create contract is that the tree ends at the plan's mode
+    (``0770``) -- the worker's ``apply_sandbox_ownership`` rule, which is not
+    something ``copytree`` ever did. Comparing modes against this reference
+    would assert the wrong side; that half of the contract is asserted by
+    ``test_a_leftover_directory_is_given_the_tree_mode`` and
+    ``test_an_ordinary_merge_keeps_existing_files`` instead.
     """
     agent = _Agent(workspace)
     _snapshot(
@@ -585,6 +594,79 @@ async def test_an_ordinary_merge_keeps_existing_files(workspace: Path) -> None:
     # ``apply_sandbox_ownership`` rule): the worker is the data-plane owner and
     # must be able to write one level down.
     assert stat.S_IMODE(os.stat(target).st_mode) == 0o770
+
+
+def _directory_modes(root: Path) -> dict[str, int]:
+    """Every directory under ``root`` as ``(relative path, mode)``, sorted.
+
+    ``os.walk(followlinks=False)``: a link is recreated as a link and its
+    target is never chmod-ed, so the tree under test must not be walked
+    through one.
+    """
+    modes: dict[str, int] = {".": stat.S_IMODE(os.stat(root).st_mode)}
+    for dirpath, dirnames, _filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        for name in dirnames:
+            if (base / name).is_symlink():
+                continue
+            path = base / name
+            modes[str(path.relative_to(root))] = stat.S_IMODE(os.stat(path).st_mode)
+    return dict(sorted(modes.items()))
+
+
+@pytest.mark.asyncio
+async def test_a_leftover_directory_is_given_the_tree_mode(workspace: Path) -> None:
+    """A directory an earlier incarnation left behind ends at ``0770`` too.
+
+    The worker is the *group* on this tree, not its owner, so a ``0755``
+    directory one level down leaves the data plane unable to write inside it
+    -- which is why the old worker path chmods **every** directory in the
+    tree (``uid_pool._prepare_directory_modes``), not only the ones it makes.
+    The merge visits the entries the snapshot carries, and this leftover is
+    not one of them: exactly the case that rule exists for.
+    """
+    agent = _Agent(workspace)
+    leftover = agent.tree() / "workspace" / "leftover"
+    leftover.mkdir(parents=True)
+    os.chmod(leftover, 0o755)
+    _snapshot(agent, {"workspace": {"kept.txt": "kept\n"}})
+
+    resp = await _post(
+        agent,
+        _instruction(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs()))),
+    )
+
+    assert resp.status_code == 200
+    assert _directory_modes(agent.tree()) == {
+        ".": 0o770,
+        "workspace": 0o770,
+        "workspace/leftover": 0o770,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_leftover_directory_is_given_the_tree_mode_without_a_snapshot(
+    workspace: Path,
+) -> None:
+    """The same rule holds when the create carries no snapshot to merge.
+
+    A re-create of an id whose tree is still there is the shape: nothing in
+    this op walks the tree (there is no ``copy_from``), and the leftover is a
+    data-plane write hole all the same.
+    """
+    agent = _Agent(workspace)
+    leftover = agent.tree() / "workspace" / "leftover"
+    leftover.mkdir(parents=True)
+    os.chmod(leftover, 0o755)
+
+    resp = await _post(agent, _instruction(tree=_plan_tree(agent)))
+
+    assert resp.status_code == 200
+    assert _directory_modes(agent.tree()) == {
+        ".": 0o770,
+        "workspace": 0o770,
+        "workspace/leftover": 0o770,
+    }
 
 
 @pytest.mark.asyncio

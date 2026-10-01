@@ -194,6 +194,19 @@ def materialize_tree(
         # -- a tree no other path produces. ``subdir`` is only for the no-
         # snapshot case, where the tree starts empty.
         copy_tree(str(source), str(root), dir_mode=mode)
+    # ``existed`` is the gate, not "did we copy something": a tree this op
+    # just created gets its mode from the two ``fchmod``s above and from the
+    # merge as it makes each directory, so there is nothing left over to fix
+    # -- and this is a second full walk of a tree that can be large. A tree
+    # that was already there can hold directories no snapshot names (the
+    # residue of a previous, failed attempt), which is exactly the hole
+    # ``uid_pool._prepare_directory_modes`` closes with its own ``os.walk``.
+    if existed:
+        root_fd = _open_dir_chain(root)
+        try:
+            _enforce_directory_modes(root_fd, mode)
+        finally:
+            os.close(root_fd)
     # Every volume slice the plan names, made the same way and *before* any
     # privilege is spent: a slice is materialization too (design §4.3 step ③),
     # and the same two layers apply -- the control plane derived the path from
@@ -472,6 +485,44 @@ def _copy_into(src_dir: Path, dst_fd: int, dir_mode: int) -> int:
             raise _refusal_for(exc, entry.path, doing="copying") from exc
         copied += 1
     return copied
+
+
+def _enforce_directory_modes(dst_fd: int, dir_mode: int) -> int:
+    """Give every real directory below ``dst_fd`` the tree's mode.
+
+    The worker is the *group* on the tree, never its owner, so the create
+    contract is "every directory in the tree is ``dir_mode``" -- the rule the
+    old worker path kept by walking the whole tree
+    (``uid_pool._prepare_directory_modes``); a ``0755`` one level down leaves
+    the data plane unable to write there. The merge above only visits the
+    entries the snapshot carries, so a directory an earlier incarnation left
+    behind is exactly what this pass is for.
+
+    Links are skipped, never followed: they are recreated as links, and
+    ``chmod`` would act on the target instead. Returns the number of
+    directories whose mode was set.
+    """
+    children: list[str] = []
+    with os.scandir(dst_fd) as entries:
+        for entry in entries:
+            # Tested inside the ``scandir`` on purpose: the entry's own
+            # cached stat is what decides, and a link must be skipped rather
+            # than opened (``_open_dir_at`` would refuse it by name).
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                continue
+            children.append(entry.name)
+    count = 0
+    for name in sorted(children):
+        child_fd = _open_dir_at(name, dst_fd, where="the destination tree")
+        try:
+            try:
+                os.fchmod(child_fd, dir_mode)
+            except OSError as exc:
+                raise _refusal_for(exc, name, doing="setting the mode of") from exc
+            count += 1 + _enforce_directory_modes(child_fd, dir_mode)
+        finally:
+            os.close(child_fd)
+    return count
 
 
 def copy_tree(src: str, dst: str, *, dir_mode: int = 0o770) -> int:
