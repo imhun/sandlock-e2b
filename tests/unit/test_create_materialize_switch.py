@@ -166,3 +166,51 @@ async def test_without_an_agent_client_the_worker_still_makes_the_tree(
 
     assert resp.status_code == 201
     assert (workspace / SANDBOX / "workspace").is_dir()
+
+
+@pytest.mark.asyncio
+async def test_the_materialized_path_tells_the_volume_pass_the_slices_are_ready(
+    workspace, monkeypatch, install_client
+) -> None:
+    """Volume slices travel in the same plan, so the volume pass must not redo them.
+
+    ``build_volume_mounts`` still runs -- it is what provisions each slice's
+    quota (a node-side probe) and what places the sandbox's mount view -- but
+    the ``mkdir``/``chmod`` and the relayed ``chown-volume-slice`` inside it are
+    the plan's job now.
+    """
+    seen: list[bool] = []
+
+    def _spy(**kwargs):
+        seen.append(kwargs["slices_materialized"])
+        return [], []
+
+    monkeypatch.setattr(agent_module, "build_volume_mounts", _spy)
+    install_client(_StubAgentFileOps())
+    app, settings = _worker(workspace)
+
+    resp = await _create(app, settings, {"sandboxID": SANDBOX})
+
+    assert resp.status_code == 201
+    assert seen == [True]
+
+
+@pytest.mark.asyncio
+async def test_the_degraded_path_lets_the_volume_pass_build_its_own_slices(
+    workspace, monkeypatch, install_client
+) -> None:
+    """No plan means nothing made the slices: the volume pass keeps doing it."""
+    seen: list[bool] = []
+
+    def _spy(**kwargs):
+        seen.append(kwargs["slices_materialized"])
+        return [], []
+
+    monkeypatch.setattr(agent_module, "build_volume_mounts", _spy)
+    install_client(_StubAgentFileOps(unsupported=True))
+    app, settings = _worker(workspace)
+
+    resp = await _create(app, settings, {"sandboxID": SANDBOX})
+
+    assert resp.status_code == 201
+    assert seen == [False]

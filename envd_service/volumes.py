@@ -35,6 +35,7 @@ quota-agent server-side (E2.6 wiring); unconfigured agent ops raise
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
@@ -287,6 +288,7 @@ def provision_sandbox_volume_mount(
     via_agent: bool,
     existing_projid: int | None = None,
     host_uid: int | None = None,
+    slice_ready: bool = False,
 ) -> tuple[Path, int | None]:
     """Return the sandbox's mount view plus its volume projid (or None).
 
@@ -302,6 +304,12 @@ def provision_sandbox_volume_mount(
     so the slice is kernel-isolated from other sandboxes while the worker --
     the data-plane owner -- can still reach it. ``None`` keeps the legacy
     single-uid ownership model (worker identity).
+
+    ``slice_ready`` says the *create plan* already made the slice directory and
+    handed it over (``c3_agent/materialize.py``; design §4.3 step ③). Then this
+    function does none of that -- no ``mkdir``, no ``chmod``, no relayed
+    ``chown-volume-slice`` -- and only the quota, which a node-side probe has to
+    decide. The directory is still what the mount view points at.
     """
     volume_root = Path(volume_path)
     if host_uid is not None and _can_manage_sandbox_uid():
@@ -313,11 +321,19 @@ def provision_sandbox_volume_mount(
     fs_mount = _volume_fs_mount(volume_root, fallback_mount_point)
     supported, _reason = xfs_project_supported(fs_mount, via_agent=via_agent)
     if not supported:
+        if slice_ready:
+            # The plan made a slice for a filesystem that cannot quota it, so
+            # nothing will mount it. Take back the empty directory the same way
+            # the failure path below does -- ``rmdir`` refuses a directory with
+            # anything in it, so data is never deleted here.
+            with contextlib.suppress(OSError):
+                (volume_root / sandbox_id).rmdir()
         return volume_root, None
     sandbox_dir = volume_root / sandbox_id
     try:
-        sandbox_dir.mkdir(parents=True, exist_ok=True)
-        if host_uid is not None and _can_manage_sandbox_uid():
+        if not slice_ready:
+            sandbox_dir.mkdir(parents=True, exist_ok=True)
+        if not slice_ready and host_uid is not None and _can_manage_sandbox_uid():
             from envd_service import priv_helpers
 
             mode = priv_helpers.WORKSPACE_MODE
@@ -400,6 +416,7 @@ def build_volume_mounts(
     via_agent: bool,
     existing_volume_projects: list[dict[str, Any]] | None = None,
     host_uid: int | None = None,
+    slices_materialized: bool = False,
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     """Materialize the sandbox-visible volume mounts and their quota state.
 
@@ -410,6 +427,11 @@ def build_volume_mounts(
     view, and ``volume_projects`` entries carry the quota lifecycle metadata.
     ``host_uid`` is passed through to the mount provisioning for the E3.2
     volume permission model (shared 1777 root + per-uid slices).
+
+    ``slices_materialized`` is the create plan's answer (design §4.3 step ③):
+    the slice directories already exist and are already handed over, so this
+    only provisions their quota. See
+    :func:`provision_sandbox_volume_mount`'s ``slice_ready``.
 
     Raises :class:`ValueError` on invalid mount configs (mirrors the worker
     agent contract); each caller maps it to its own error response.
@@ -449,6 +471,7 @@ def build_volume_mounts(
             via_agent=via_agent,
             existing_projid=_existing_projid(existing, volume_id, rel),
             host_uid=host_uid,
+            slice_ready=slices_materialized,
         )
         target = workspace / rel
         target.parent.mkdir(parents=True, exist_ok=True)

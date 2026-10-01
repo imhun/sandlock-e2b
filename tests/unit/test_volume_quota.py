@@ -106,6 +106,107 @@ def test_provision_quota_creates_subdir_and_provision_project(
     }
 
 
+def test_a_slice_the_agent_already_made_is_not_rebuilt_here(monkeypatch, tmp_path):
+    """``slice_ready``: the create plan materialized it, so this must not.
+
+    The slice directory (and its ``0770``) is part of the agent's one-call
+    materialization (``c3_agent/materialize.py``,
+    ``docs/superpowers/specs/2026-10-01-create-path-grant-design.md`` §4.3).
+    Re-doing ``mkdir`` + ``chmod`` here -- and, through the agent relay,
+    ``chown-volume-slice`` -- would be the per-step round trip the change
+    exists to remove. The *quota* is still this function's business: only the
+    node can tell whether the filesystem supports it.
+    """
+    volume_path = tmp_path / "vol_1"
+    volume_path.mkdir()
+    seen = {}
+
+    def fake_provision(**kwargs):
+        seen.update(kwargs)
+        return 4242
+
+    monkeypatch.setattr(volumes, "xfs_project_supported", _supported)
+    monkeypatch.setattr(volumes, "provision_project", fake_provision)
+    monkeypatch.setattr(volumes, "containing_mount_point", lambda _path: None)
+    view, projid = provision_sandbox_volume_mount(
+        sandbox_id="sbx_a",
+        volume_id="vol_1",
+        mount_path="mnt/data",
+        volume_path=volume_path,
+        per_sandbox_quota_mb=512,
+        fallback_mount_point="/srv",
+        via_agent=True,
+        slice_ready=True,
+    )
+
+    assert view == _sandbox_dir(volume_path, "sbx_a")
+    assert view.exists() is False
+    assert projid == 4242
+    assert seen["project_dir"] == view
+
+
+def test_a_slice_nothing_will_use_is_cleaned_up(monkeypatch, tmp_path):
+    """The agent made a slice for a filesystem that cannot quota it.
+
+    Today no slice directory is created at all in that shape (the mkdir comes
+    after the support probe). With the plan's slices the directory exists
+    before the probe, so this is where it is taken back -- and, like the
+    existing failure path, only when it is *empty*: a directory with data in it
+    is never deleted here.
+    """
+    volume_path = tmp_path / "vol_1"
+    volume_path.mkdir()
+    slice_dir = _sandbox_dir(volume_path, "sbx_a")
+    slice_dir.mkdir()
+    calls = []
+
+    monkeypatch.setattr(volumes, "xfs_project_supported", _unsupported)
+    monkeypatch.setattr(volumes, "provision_project", lambda **kw: calls.append(kw))
+    view, projid = provision_sandbox_volume_mount(
+        sandbox_id="sbx_a",
+        volume_id="vol_1",
+        mount_path="mnt/data",
+        volume_path=volume_path,
+        per_sandbox_quota_mb=512,
+        fallback_mount_point="/srv",
+        via_agent=True,
+        slice_ready=True,
+    )
+
+    assert view == volume_path
+    assert projid is None
+    assert slice_dir.exists() is False
+    assert calls == []
+
+
+def test_a_slice_with_data_is_left_alone_when_the_quota_probe_fails(
+    monkeypatch, tmp_path
+):
+    """The cleanup above only ever removes an empty directory."""
+    volume_path = tmp_path / "vol_1"
+    volume_path.mkdir()
+    slice_dir = _sandbox_dir(volume_path, "sbx_a")
+    slice_dir.mkdir()
+    (slice_dir / "keep.txt").write_text("data\n", encoding="utf-8")
+
+    monkeypatch.setattr(volumes, "xfs_project_supported", _unsupported)
+    monkeypatch.setattr(volumes, "provision_project", lambda **kw: None)
+    view, projid = provision_sandbox_volume_mount(
+        sandbox_id="sbx_a",
+        volume_id="vol_1",
+        mount_path="mnt/data",
+        volume_path=volume_path,
+        per_sandbox_quota_mb=512,
+        fallback_mount_point="/srv",
+        via_agent=True,
+        slice_ready=True,
+    )
+
+    assert view == volume_path
+    assert projid is None
+    assert (slice_dir / "keep.txt").read_text(encoding="utf-8") == "data\n"
+
+
 def test_provision_reuses_existing_projid(monkeypatch, tmp_path):
     volume_path = tmp_path / "vol_1"
     volume_path.mkdir()

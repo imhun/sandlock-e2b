@@ -511,3 +511,117 @@ async def test_a_partial_copy_is_reported_as_failure(
     assert resp.status_code == 502
     assert "partial-copy" in resp.json()["error"]
     assert agent.runner.calls == []
+
+
+# ------------------------------------------------------------- the slices
+#
+# A mounted volume with a per-sandbox quota gets its own slice directory
+# (``<volume root>/<sandbox id>``, ``0770 <sandbox uid>:<worker gid>``). It is
+# materialization like the tree is, so it travels in the same plan and is
+# created and handed over by the same call -- and, like every other path in
+# the plan, it is only ever the control plane's derivation: a path outside
+# this agent's roots is refused, and a slice the plan does not name is never
+# created.
+
+
+def _slice_entry(
+    agent: _Agent,
+    volume: str = "data",
+    *,
+    sandbox_id: str = SANDBOX,
+    path: str | None = None,
+    uid: int = UID_X,
+    gid: int = WORKER_GID,
+) -> dict[str, Any]:
+    root = agent.shared_root / volume
+    root.mkdir(parents=True, exist_ok=True)
+    return {
+        "volume": volume,
+        "path": str(path if path is not None else root / sandbox_id),
+        "uid": uid,
+        "gid": gid,
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_agent_creates_and_chowns_every_slice(workspace: Path) -> None:
+    agent = _Agent(workspace)
+    slices = [_slice_entry(agent, "data"), _slice_entry(agent, "media")]
+
+    resp = await _post(
+        agent, {"grant": _grant(tree=_plan_tree(agent), slices=slices)}
+    )
+
+    assert resp.status_code == 200
+    root = agent.tree()
+    for entry in slices:
+        assert Path(entry["path"]).is_dir()
+        assert stat.S_IMODE(os.stat(entry["path"]).st_mode) == 0o770
+    assert agent.runner.calls == [
+        [
+            agent.settings.maint_path,
+            "chown",
+            "--uid",
+            str(UID_X),
+            "--gid",
+            str(WORKER_GID),
+            "--recursive",
+            "--path",
+            str(root),
+        ],
+        [
+            agent.settings.maint_path,
+            "chown",
+            "--uid",
+            str(UID_X),
+            "--gid",
+            str(WORKER_GID),
+            "--recursive",
+            "--path",
+            slices[0]["path"],
+        ],
+        [
+            agent.settings.maint_path,
+            "chown",
+            "--uid",
+            str(UID_X),
+            "--gid",
+            str(WORKER_GID),
+            "--recursive",
+            "--path",
+            slices[1]["path"],
+        ],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_slice_path_outside_the_volume_root_is_refused_named(
+    workspace: Path,
+) -> None:
+    agent = _Agent(workspace)
+    outside = workspace / "elsewhere" / SANDBOX
+    slices = [_slice_entry(agent, "data", path=str(outside))]
+
+    resp = await _post(
+        agent, {"grant": _grant(tree=_plan_tree(agent), slices=slices)}
+    )
+
+    assert resp.status_code == 400
+    assert "path-outside-roots" in resp.json()["error"]
+    assert outside.exists() is False
+    assert agent.runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_slice_not_in_the_plan_is_never_created(workspace: Path) -> None:
+    """The op does what the plan says and nothing else -- no local derivation."""
+    agent = _Agent(workspace)
+    volume_root = agent.shared_root / "data"
+    volume_root.mkdir(parents=True)
+    (volume_root / "other-sandbox").mkdir()
+
+    resp = await _post(agent, {"grant": _grant(tree=_plan_tree(agent))})
+
+    assert resp.status_code == 200
+    assert sorted(os.listdir(volume_root)) == ["other-sandbox"]
+    assert len(agent.runner.calls) == 1

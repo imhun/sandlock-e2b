@@ -186,18 +186,31 @@ def materialize_tree(
                 PARTIAL_COPY, f"the snapshot source {source} is not a directory"
             )
         copy_tree(str(source), str(target), dir_mode=mode)
+    # Every volume slice the plan names, made the same way and *before* any
+    # privilege is spent: a slice is materialization too (design §4.3 step ③),
+    # and the same two layers apply -- the control plane derived the path from
+    # its volume records, and this agent re-checks it against its own roots.
+    slices = _plan_slices(plan, roots=roots, mode=mode)
     # Ownership goes through the audited binary (never ``os.chown``): the same
     # pool gate, the same realpath discipline, the same walk. ``worker_gid``
     # is what ``--gid`` is checked against in the child.
-    instruction = FileOpInstruction(
-        sandbox_id=str(plan.get("sandbox_id") or ""),
-        path=str(root),
-        uid=uid,
-        gid=gid,
-        recursive=True,
-        worker_gid=gid,
-    )
-    answer = run_file_op("chown", instruction, runner=runner, settings=settings)
+    sandbox_id = str(plan.get("sandbox_id") or "")
+    handed_over = [
+        run_file_op(
+            "chown",
+            FileOpInstruction(
+                sandbox_id=sandbox_id,
+                path=str(path),
+                uid=uid,
+                gid=gid,
+                recursive=True,
+                worker_gid=gid,
+            ),
+            runner=runner,
+            settings=settings,
+        )
+        for path in [root, *(entry["path"] for entry in slices)]
+    ]
     return {
         "tree": {
             "path": str(root),
@@ -207,8 +220,55 @@ def materialize_tree(
             "gid": gid,
             "created": not existed,
         },
-        "chown": answer,
+        "slices": slices,
+        "chown": handed_over,
     }
+
+
+def _plan_slices(
+    plan: Mapping[str, Any], *, roots: tuple[Path, ...], mode: int
+) -> list[dict[str, Any]]:
+    """Make the plan's volume slices; returns them resolved.
+
+    The plan's own order is kept (the control plane sorts it), so two creates
+    against the same volumes hand the trees over in the same order -- an
+    observable property that makes a stuck slice reproducible rather than
+    arbitrary.
+    """
+    entries = plan.get("slices") or []
+    if not isinstance(entries, list):
+        raise MaterializeRefusal(BAD_PLAN, "slices is not a list")
+    made: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise MaterializeRefusal(BAD_PLAN, "a slice is not an object")
+        path = resolve_inside(str(entry.get("path", "")), roots=roots)
+        uid = _plan_int(entry, "uid")
+        gid = _plan_int(entry, "gid")
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise MaterializeRefusal(
+                PARTIAL_COPY, f"cannot create the slice {path}: {exc}"
+            ) from exc
+        fd = _open_dir_chain(path)
+        try:
+            os.fchmod(fd, mode)
+        except OSError as exc:
+            raise MaterializeRefusal(
+                BAD_PLAN, f"cannot set {path} to {mode:04o}: {exc}"
+            ) from exc
+        finally:
+            os.close(fd)
+        made.append(
+            {
+                "volume": str(entry.get("volume") or ""),
+                "path": path,
+                "uid": uid,
+                "gid": gid,
+            }
+        )
+    return made
 
 
 # --------------------------------------------------------------- the copy

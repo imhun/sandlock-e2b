@@ -2978,6 +2978,11 @@ def _agent_create_sandbox(request: Request, settings: Settings, payload: dict) -
                 existing.volume_projects if existing is not None else []
             ),
             host_uid=host_uid,
+            # The create plan already made every slice and handed it over, so
+            # this pass only provisions quota -- the ``mkdir``/``chmod`` and the
+            # relayed ``chown-volume-slice`` are exactly what the plan removed
+            # (design §4.3 step ③).
+            slices_materialized=materialized,
         )
         disk_mb = int(payload.get("diskMB", settings.default_disk_mb))
         project_id = None
