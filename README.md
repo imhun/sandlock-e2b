@@ -11,8 +11,9 @@ notification）在自己机器的 Linux 内核上跑用户代码 —— 不需�
 
 - **无需虚拟化，比 microVM 更轻。** 不用 Firecracker 一类 microVM，也不需要 KVM、嵌套虚拟化或 GPU：
   沙箱是内核原语（用户 / PID / 网络命名空间 + Landlock + seccomp）**纵深加固**的进程。没有 guest
-  内核、没有固定的虚拟化内存开销，一台普通 Linux 服务器就能跑，启动与密度都接近进程级 ——
-  却不像共享内核的容器那样只有一层薄边界。
+  内核、没有固定的虚拟化内存开销，一台普通 Linux 服务器就能跑 —— 实测**镜像预缓存后建箱 p50 0.66 s、
+  每个活动沙箱额外内存 ≈16 MiB、命令往返 p50 0.10 s（内网侧 0.033 s）**，却不像共享内核的容器那样
+  只有一层薄边界（[见下方实测](#轻量化到什么程度实测)）。
 - **换三个环境变量就能迁过来。** 官方 `e2b` Python / JS SDK **零代码修改**：沙箱、命令与 PTY、
   文件、卷、快照与 fork、暂停/恢复、网络策略、模板本地构建、MCP 网关全部兼容。现有 E2B 应用
   把地址指过来即可，代码与 SDK 都不用动。
@@ -28,23 +29,48 @@ notification）在自己机器的 Linux 内核上跑用户代码 —— 不需�
 - **失败可见，不做假成功。** 未实现的 API 明确报错而不是假装成功；危险的半配置在启动时就被拒绝
   并打印原因；测不到的数值如实报 `unknown` 而不是 `0` —— 安全与配额上不会给你一个"看起来正常"的绿色。
 
-### 轻量化到什么程度（下列读数都能在仓库文档里复核）
+### 轻量化到什么程度（实测）
 
-| 指标 | 实测 | 口径 |
-|---|---|---|
-| 沙箱 rootfs 就绪（2111 个文件的 python-slim） | **0.26 s**（节点本地解包）／61.4 s（直接解到共享 NAS） | 方案把 OCI tar 放共享卷、rootfs 解到节点本地缓存；冷节点用预热端点一次 **18.8 s**，之后命中缓存 |
-| 端到端冒烟（4 个沙箱跨 2 节点，含命令/文件/stdin） | **8.7 s** | `multinode_smoke.py`，出厂集群实测 |
-| 端到端冒烟（建箱 → 模板构建 → registry → worker 拉取 → rootfs → MCP） | **20.6 s** | `deployment_smoke.py`，同一集群 |
-| 沙箱内文件系统调用（经 chroot 中介） | `open`+`close` 一对 ≈ **0.4 ms**，`stat` 族 ≈ **0.2 ms** | 这是路径中介的既有成本；**再加 pidns 只多 ≤2 µs/次**（没有任何路径中介的裸形态才看到 +80~90 µs/次） |
-| 网络隔离后的建连 | p50 **0.291 ms**（共享网络命名空间 0.034 ms） | 只有短连接受影响，长连接/连接池无感；入站 MCP 往返 p50 ≈ 29 ms，与未隔离形态持平 |
-| 磁盘用量记账（400 目录 / 2000 文件） | **2.34 ms**（整树重扫 1043.9 ms） | 446×；后台计量不占沙箱的命令时延 |
-| NFS 上取文件大小 | **0.01 ms**（普通 `stat` 会先回写脏页：1405 ms） | 指标采集不会把正在写的沙箱卡住；整树 walk 实测 2000 文件 10.9 ms、10000 文件 35.7 ms |
-| 密度上限由什么决定 | 每沙箱只多 1 个用户命名空间；目标机 `user.max_user_namespaces = 30519` | 不是虚拟化那类固定内存/CPU 开销，节点能放多少沙箱由资源预算（`E2B_NODE_*` / `E2B_MAX_SANDBOXES`）决定 |
+下面这组读数是 2026-10-01 在出厂集群（`0.1.0-824`，2 节点 arm64）上用
+[deploy/scripts/acceptance/lightweight_metrics_probe.py](deploy/scripts/acceptance/lightweight_metrics_probe.py)
+现跑的 —— 一条命令就能复跑，每个数字都附了口径：
 
-> 口径与原始读数：[docs/k8s-deployment.md](docs/k8s-deployment.md) §12/§22、
-> [docs/disk-quota-options.md](docs/disk-quota-options.md)、
-> [docs/production-deployment-requirements.md](docs/production-deployment-requirements.md) §2.4.6 / §2.4.10；
-> 每条都有对应探针脚本与日志，可自己复跑。
+**① 镜像预缓存后，建箱很快**
+
+- **建箱 p50 = 0.66 s、p95 = 0.73 s**（n=10；从开发机经入口实测，含 SDK 请求 → 控制面调度 →
+  worker 建工作目录 → 销毁。每轮建完立刻 kill，不占容量）。
+- 镜像没进缓存时也不贵：一次解包（2111 个文件的 python-slim rootfs）在**节点本地 0.26 s**
+  —— 这也是方案刻意做的事：OCI tar 放共享卷、rootfs 解到节点本地缓存。冷节点用预热端点
+  跑一次 **18.8 s**，之后一直命中。
+- 旁证：4 个沙箱跨 2 节点的端到端冒烟（建箱 + 命令 + 文件 + stdin）整轮 **8.7 s**；
+  加上模板构建 → registry → worker 拉取 → 解 rootfs → MCP 的完整冒烟 **20.6 s**。
+
+**② 活动沙箱的额外内存很小**
+
+- **≈16 MiB / 沙箱**：4 个沙箱各跑一条常驻命令时，按**沙箱自己的宿主 uid** 汇总
+  `/proc/*/VmRSS`，四个 uid 分别是 16 / 16 / 16 / 16 MiB，合计 **63 MiB**。
+- 这就是"沙箱是进程、不是 VM"的直接体现：**没有 guest 内核、没有虚拟化进程**——那两样在
+  microVM 方案里是每个沙箱都要付的固定内存。上面这个数只含该沙箱自己的进程
+  （supervisor + 沙箱内进程），共享的镜像页缓存不重复计。
+- 平台按 `memoryMB` 给每个沙箱做**准入预留**（默认 1 GiB，可调）：预留是配额口径，
+  不是上面的实测占用——实测占用由用户负载决定。
+
+**③ 沙箱内命令的执行延迟低**
+
+- SDK 一次 `commands.run('/bin/echo ok')` 的**端到端往返**：p50 **102 ms** / p95 **113 ms**
+  （n=20，从开发机经公网入口，含 SDK 的请求与流读回）；同一口径在**内网侧**实测
+  **p50 ≈ 33 ms**（[docs/production-deployment-requirements.md](docs/production-deployment-requirements.md) §2.4.7）。
+- 沙箱内一次 `stat`：镜像 rootfs 里的文件（节点本地）**30 µs** —— 这是"路径中介 + 内核"
+  的真实成本；工作区里的文件 **2.3 ms**，大头是 NAS 往返而不是中介（同一个文件在快照/记账
+  路径上用的是只取大小的 `statx`，实测 **0.01 ms**）。
+- 隔离本身几乎不加钱：开 per-sandbox 网络命名空间后**建连 p50 0.291 ms**（未隔离 0.034 ms，
+  只影响短连接）；在已部署的中介形态里再加 PID 命名空间，实测增量 **≤2 µs/次**。
+
+> 复跑：`python deploy/scripts/acceptance/lightweight_metrics_probe.py`（内存那段需要
+> `kubectl`，非 k8s 部署可加 `--no-memory`）。本次读数与探针输出：
+> `tmp/k0s/lightweight-metrics.log`；其它口径出处见
+> [docs/production-deployment-requirements.md](docs/production-deployment-requirements.md)
+> §2.4.6 / §2.4.10 与 [docs/k8s-deployment.md](docs/k8s-deployment.md) §12 / §22。
 
 > 适用范围：Linux（内核 6.12+，即 Landlock ABI ≥ 6）；暂停与快照是进程 / 文件系统级语义，
 > 不保留运行内存。完整清单见 [§10 已知边界](#10-已知边界)。
