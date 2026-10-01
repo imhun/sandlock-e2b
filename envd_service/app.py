@@ -438,6 +438,11 @@ def create_app(
         quota_agent_client = getattr(app.state, "quota_agent_client", None)
         if quota_agent_client is not None:
             quota_agent_client.close()
+        # The file-op client keeps its connection to the control plane alive
+        # between operations (``AgentFileOps._http``); close it with the rest
+        # of the transports rather than leaving the socket for the process
+        # exit.
+        agent_fileops.shutdown()
         for ctx in app.state.runtimes.values():
             ctx.shutdown()
         app.state.runtimes.clear()

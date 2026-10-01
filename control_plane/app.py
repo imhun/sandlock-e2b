@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import httpx
 from fastapi import FastAPI
 
 from control_plane.api.errors import OfficialError, official_error_handler
@@ -423,6 +424,11 @@ def create_app(
                 app.state.autoscaler.run_forever()
             )
         app.state.node_health_task = health_task
+        # One keep-alive client for the control plane's own calls to worker
+        # agents (the create provisioning POST, and anything else that talks to
+        # a node's agent). It used to be built per call -- a fresh TCP connect
+        # (and a DNS lookup of the worker's pod IP) on every sandbox create.
+        app.state.remote_http = httpx.AsyncClient(timeout=60)
         try:
             yield
         finally:
@@ -453,10 +459,31 @@ def create_app(
         await sweeper.stop()
         await paused_sweeper.stop()
         await ledger_alerter.stop()
+        remote_http = getattr(app.state, "remote_http", None)
+        if remote_http is not None:
+            # ``app.state.remote_http`` is "whatever shape is wired": this
+            # repo's tests (and an embedder) replace the client wholesale, so
+            # the teardown asks for the method rather than assuming it.
+            aclose = getattr(remote_http, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            app.state.remote_http = None
         if quota_agent_client is not None:
             quota_agent_client.close()
 
-    app = FastAPI(title="E2B Sandlock Gateway - Control Plane", lifespan=lifespan)
+    # SEC-K0S-002 (2026-10-01): no interactive surface. The tenant entrance is
+    # reachable (and, per SEC-K0S-004, reachable *from inside a sandbox*), so
+    # `/openapi.json` handed an unauthenticated caller the whole internal path
+    # inventory -- including the C3 `file-op` relay and the prose that spells
+    # out the trust model. The privileged C3 agent already closes these three
+    # for the same reason; the control plane must match.
+    app = FastAPI(
+        title="E2B Sandlock Gateway - Control Plane",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+    )
     app.state.settings = settings
     app.state.redis_client = redis_client
     app.state.quota_agent_client = quota_agent_client

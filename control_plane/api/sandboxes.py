@@ -1442,13 +1442,23 @@ async def _provision_remote(
         "snapshotID": snapshot_id,
     }
     internal_key = settings.internal_api_key
+    # The client is the app's shared one (``app.state.remote_http``): building
+    # a fresh ``AsyncClient`` per create meant a new TCP connection, and a DNS
+    # lookup of the worker's address, inside the create's critical path.
+    client = getattr(request.app.state, "remote_http", None)
+    owned = client is None
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        if owned:
+            client = httpx.AsyncClient(timeout=60)
+        try:
             resp = await client.post(
                 f"{node.address}/agent/sandboxes",
                 json=payload,
                 headers={"X-Internal-Key": internal_key},
             )
+        finally:
+            if owned:
+                await client.aclose()
     except httpx.HTTPError as e:
         raise OfficialError(502, f"Node {node.node_id} unavailable: {e}") from e
     if resp.status_code >= 300:

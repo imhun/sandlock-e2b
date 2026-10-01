@@ -27,6 +27,7 @@ from gateway_common.paths import (
     validate_sandbox_id,
     write_json_atomically,
 )
+from gateway_common import create_trace
 from envd_service.runtime.dir_ledger import DirLedger, DirLedgerUnknown
 
 logger = logging.getLogger(__name__)
@@ -1167,6 +1168,7 @@ class RuntimeRegistry:
             self._tightened.pop(sandbox_id, None)
             self._tightened_at.pop(sandbox_id, None)
             try:
+                started = time.monotonic()
                 self._ensure_runtime_dir(sandbox_id)
                 path = self._record_path(sandbox_id)
                 # Atomic because the reader is a *different process*: another
@@ -1183,6 +1185,12 @@ class RuntimeRegistry:
                 self._legacy_record_path(sandbox_id).unlink(missing_ok=True)
             except OSError:
                 pass
+            else:
+                # The record write is one of the create path's named stages
+                # (see ``gateway_common.create_trace``): on the deployment's
+                # NAS it is a mkdir plus an fsync-ed atomic write, and it is
+                # the largest single piece of the worker's own file work.
+                create_trace.stage("record", sandbox_id, started)
         return record
 
     def get(self, sandbox_id: str) -> RuntimeSandbox | None:

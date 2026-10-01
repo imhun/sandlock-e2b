@@ -63,6 +63,7 @@ from envd_service.xfs_quota import (
     xfs_project_supported,
 )
 from envd_service.volumes import build_volume_mounts, cleanup_volume_projects
+from gateway_common import create_trace
 from gateway_common.paths import (
     CHECKPOINT_ROOT_NAME,
     UNTRUSTED_TREE_DIR,
@@ -3014,8 +3015,19 @@ async def agent_create_sandbox(request: Request) -> Response:
         # and (for a snapshot-based create) a full copytree of the snapshot --
         # so it runs off the event loop. Inline it stalled heartbeats and every
         # other request on this worker for the length of the copy.
+        #
+        # Both halves are timed when ``E2B_CREATE_TRACE`` is on: ``provision``
+        # is the whole hand-over (its own stages -- ``record``, ``commit``,
+        # ``fileop:*`` -- are logged by the code that does them), and ``prime``
+        # is the runtime context, which is separate because it is an
+        # optimisation of the first command rather than part of the contract.
+        sandbox_id = payload.get("sandboxID")
+        started = time.monotonic()
         await asyncio.to_thread(_agent_create_sandbox, request, settings, payload)
-        await _prime_runtime_context(request, payload.get("sandboxID"))
+        create_trace.stage("provision", sandbox_id, started)
+        started = time.monotonic()
+        await _prime_runtime_context(request, sandbox_id)
+        create_trace.stage("prime", sandbox_id, started)
     except PermissionError as e:
         # A worker-side permission fault while provisioning, not an auth
         # failure: 500 with the reason so the control plane's

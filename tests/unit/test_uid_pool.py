@@ -617,3 +617,55 @@ def test_root_worker_without_sys_ptrace_says_so(tmp_path, monkeypatch, caplog) -
     # The pool itself is still built: the disclosure is about what the
     # in-process mediator can no longer do, not about allocation.
     assert app.state.runtime_registry is not None
+
+
+def test_commit_keeps_the_marker_when_the_record_is_not_durable(tmp_path):
+    """Fail-safe, pinned: no record on disk ⇒ the marker stays.
+
+    The marker is what keeps a uid out of every other worker's free set while
+    the record that is supposed to pin it is missing; dropping it there would
+    hand the same uid to the next create.
+    """
+    pool = _pool(tmp_path)
+    pool.acquire("sbx_a")
+    marker = pool._marker_path("sbx_a")
+    assert marker.is_file()
+    pool.commit("sbx_a")  # no record written yet
+    assert marker.is_file()
+
+
+def test_commit_drops_the_marker_the_acquire_path_wrote(tmp_path):
+    """The pre-existing behaviour, unchanged by the marker-first check."""
+    pool = _pool(tmp_path)
+    uid = pool.acquire("sbx_a")
+    _write_record(tmp_path, "sbx_a", uid)
+    marker = pool._marker_path("sbx_a")
+    assert marker.is_file()
+    pool.commit("sbx_a")
+    assert not marker.exists()
+
+
+def test_commit_does_not_read_the_record_when_there_is_no_marker(
+    tmp_path, monkeypatch
+):
+    """A control-plane-allocated uid has no marker, so commit is a no-op.
+
+    ``claim`` (OBS-9's path: the control plane allocated the uid and the record
+    is the fleet ledger's echo) writes no reservation marker, so there is
+    nothing for ``commit`` to drop. Asking the disk anyway cost every create
+    one NFS read plus one negative ``unlink`` -- measured 5-25 ms on the
+    deployment's NAS (2026-10-01). Pinned by refusing the read outright: if
+    the implementation goes back to reading first, this test fails.
+    """
+    pool = _pool(tmp_path)
+    pool.claim("sbx_a", POOL_START + 1)
+
+    def _forbidden(*args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError(
+            "commit() read the sandbox record although the uid came from the "
+            "control plane and no reservation marker exists"
+        )
+
+    monkeypatch.setattr(uid_pool, "_recorded_uid", _forbidden)
+    pool.commit("sbx_a")
+    assert not pool._marker_path("sbx_a").exists()

@@ -28,7 +28,11 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from typing import Any
+
+from gateway_common import create_trace
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +86,13 @@ class AgentFileOps:
         self._timeout_s = float(timeout_s)
         self._connect_timeout_s = min(DEFAULT_CONNECT_TIMEOUT_S, self._timeout_s)
         self._transport = transport
+        #: The keep-alive client, built on the first op (see :meth:`_http`).
+        self._client = None
+        #: One worker runs creates, teardowns and disk-scan rounds on several
+        #: threads at once, and they all come through here: the guard is what
+        #: keeps the lazy build from happening twice (the loser's socket would
+        #: simply be dropped, but nothing should build one it never uses).
+        self._client_lock = threading.Lock()
         #: Every op this client will send. Named here so the whitelist is
         #: readable in one place (and so a typo is a refusal, not a 400 from the
         #: far side that reads like a bug).
@@ -104,6 +115,51 @@ class AgentFileOps:
 
     # ------------------------------------------------------------- the wire
 
+    def _http(self):
+        """The one client every op on this worker goes through.
+
+        Built lazily and kept: this worker asks the control plane for a file
+        operation on *every* create (the ownership hand-over), on every
+        teardown, and on every disk-scan round, and the old shape built a
+        fresh ``httpx.Client`` per call -- a new TCP connection (and a DNS
+        lookup of the control plane's Service name) each time. Measured on the
+        fleet 2026-10-01: 27 ms for a ``walk-workspace`` that did nothing,
+        against 49 ms for the ``chown`` that actually walked the tree; the
+        difference is connection setup, not work.
+
+        The timeout is per request, so reusing the client cannot leak a
+        longer budget into one op than the code below asks for.
+        """
+        import httpx
+
+        client = self._client
+        if client is None:
+            with self._client_lock:
+                client = self._client
+                if client is None:
+                    # ``httpx.Timeout`` and not the bare float: the read phase
+                    # is the operation's budget, the connect phase is this
+                    # service's reachability (see ``DEFAULT_CONNECT_TIMEOUT_S``).
+                    client = httpx.Client(
+                        timeout=httpx.Timeout(
+                            self._timeout_s, connect=self._connect_timeout_s
+                        ),
+                        transport=self._transport,
+                    )
+                    self._client = client
+        return client
+
+    def close(self) -> None:
+        """Drop the keep-alive connection (shutdown path; idempotent)."""
+        with self._client_lock:
+            client = self._client
+            self._client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 - closing must never raise here
+                pass
+
     def request(self, op: str, sandbox_id: str, **params: Any) -> dict[str, Any]:
         """One op, one round trip; every failure named (D18.1)."""
         if op not in self.ops:
@@ -114,25 +170,19 @@ class AgentFileOps:
 
         url = f"{self._url}/internal/nodes/{self._node_id}/file-op"
         body = {"op": op, "sandbox_id": sandbox_id, **params}
+        started = time.monotonic()
         try:
-            with httpx.Client(
-                # ``httpx.Timeout`` and not the bare float: the read phase is the
-                # operation's budget, the connect phase is this service's
-                # reachability (see ``DEFAULT_CONNECT_TIMEOUT_S``).
-                timeout=httpx.Timeout(
-                    self._timeout_s, connect=self._connect_timeout_s
-                ),
-                transport=self._transport,
-            ) as client:
-                response = client.post(
-                    url, json=body, headers={"X-Internal-Key": self._internal_key}
-                )
+            response = self._http().post(
+                url, json=body, headers={"X-Internal-Key": self._internal_key}
+            )
         except httpx.HTTPError as exc:
             detail = str(exc) or type(exc).__name__
             raise AgentFileOpsError(
                 f"the control plane is unreachable for {op} on sandbox "
                 f"{sandbox_id}: {detail}"
             ) from exc
+        finally:
+            create_trace.stage(f"fileop:{op}", sandbox_id, started)
         if response.status_code >= 300:
             detail = _error_detail(response)
             message = (
@@ -323,3 +373,20 @@ def configure(
 
 def active() -> AgentFileOps | None:
     return _ACTIVE[0]
+
+
+def shutdown() -> None:
+    """Close the active client's keep-alive connection (idempotent).
+
+    Called from the worker's lifespan shutdown next to the other transport
+    teardowns; a client left open would hold a socket until the process exits,
+    which for a rolling restart is exactly the window that matters.
+
+    ``_ACTIVE`` is "whatever shape is wired" -- an embedder (and this repo's
+    tests) may put a stand-in there that is not an :class:`AgentFileOps` -- so
+    the teardown asks for ``close`` rather than assuming the whole interface.
+    """
+    client = _ACTIVE[0]
+    close = getattr(client, "close", None)
+    if close is not None:
+        close()

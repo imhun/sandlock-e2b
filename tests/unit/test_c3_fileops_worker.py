@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import stat
+import threading
 from pathlib import Path
 
 import httpx
@@ -934,3 +935,103 @@ def test_a_sandbox_the_control_plane_does_not_know_is_its_own_error() -> None:
     )
     # ...and it is still the failure every existing handler catches.
     assert isinstance(excinfo.value, AgentFileOpsError)
+
+
+def _counting_clients(monkeypatch) -> list:
+    """Record every ``httpx.Client`` this process builds, still really building it.
+
+    The change under test is *how many connections* an op costs, so the count
+    has to come from the transport's own class rather than from a stub that
+    replaces it.
+    """
+    created: list = []
+    real_client = httpx.Client
+
+    class _Counting(real_client):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(httpx, "Client", _Counting)
+    return created
+
+
+def test_one_keep_alive_client_serves_every_operation(monkeypatch) -> None:
+    """A create's ownership hand-over must not pay a fresh TCP connect.
+
+    Measured on the fleet 2026-10-01: a ``walk-workspace`` that did no work
+    cost 27 ms while the ``chown`` that actually walked the tree cost 49 ms --
+    the difference was this connection setup, paid once per op because each
+    call built its own ``httpx.Client``.
+    """
+    created = _counting_clients(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"stdout": ""})
+
+    client = _client(handler)
+    client.walk_workspace(SANDBOX)
+    client.request("chown-workspace", SANDBOX, recursive=True)
+
+    assert len(created) == 1
+    assert created[0] is client._client
+
+
+def test_closing_the_client_returns_the_connection(monkeypatch) -> None:
+    """``close()`` is the shutdown path: the next op dials again, on purpose."""
+    created = _counting_clients(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"stdout": ""})
+
+    client = _client(handler)
+    client.walk_workspace(SANDBOX)
+    client.close()
+    assert client._client is None
+    client.walk_workspace(SANDBOX)
+    assert len(created) == 2
+
+
+def test_the_singleton_shutdown_closes_the_active_client(monkeypatch) -> None:
+    """The worker's lifespan calls this; a client left open pins the socket."""
+    monkeypatch.setattr(agent_fileops, "_ACTIVE", [None])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"stdout": ""})
+
+    client = _client(handler)
+    agent_fileops._ACTIVE[0] = client
+    client.walk_workspace(SANDBOX)
+    assert client._client is not None
+
+    agent_fileops.shutdown()
+    assert client._client is None
+    agent_fileops.shutdown()  # idempotent
+
+
+def test_concurrent_ops_build_exactly_one_client(monkeypatch) -> None:
+    """One worker asks from several threads at once -- creates, teardowns and
+    the disk-scan rounds all come through this client.
+
+    Without the guard the first two ops to arrive each build one, and the
+    loser's connection is never used by anybody -- a socket nobody closes.
+    """
+    created = _counting_clients(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"stdout": ""})
+
+    client = _client(handler)
+    start = threading.Barrier(8)
+
+    def worker(worker_id: int) -> None:
+        start.wait(timeout=5)
+        client.request("chown-workspace", f"sbx_{worker_id:016x}", recursive=True)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(created) == 1

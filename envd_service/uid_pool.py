@@ -48,12 +48,14 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 import fcntl
 
 from envd_service import priv_helpers
+from gateway_common import create_trace
 from gateway_common.paths import (
     is_sandbox_workspace_dir,
     resolve_state_base,
@@ -655,10 +657,21 @@ class UidPool:
         transient marker is no longer needed. If the record is not on disk
         (persist failed), the marker is kept so another worker cannot reuse
         the uid — fail-safe. Idempotent.
+
+        A uid the **control plane** allocated leaves no marker behind
+        (:meth:`claim` only records the value in memory), so the common
+        deployment path has nothing to drop here. Asking the disk whether the
+        record exists before checking for a marker made every create pay for
+        one NFS read plus one negative ``unlink`` to learn that -- on the
+        deployment's NAS that was 5-25 ms of the create (2026-10-01). The
+        marker is now checked first: no marker, nothing to commit.
         """
         if not validate_sandbox_id(sandbox_id):
             return
         with self._lock:
+            started = time.monotonic()
+            if not self._marker_path(sandbox_id).exists():
+                return
             if (
                 _recorded_uid(
                     self._workspace_base, sandbox_id, state_base=self._state_base
@@ -667,6 +680,7 @@ class UidPool:
             ):
                 return
             self._remove_reservation(sandbox_id)
+        create_trace.stage("commit", sandbox_id, started)
 
     def release(self, sandbox_id: str) -> None:
         """Return the sandbox's uid to the pool (idempotent).
