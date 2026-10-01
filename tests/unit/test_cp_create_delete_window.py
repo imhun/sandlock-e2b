@@ -36,6 +36,7 @@ from control_plane.registry.manager import SandboxRegistry, UnknownSandboxError
 from control_plane.registry.nodes import NodeRegistry
 from control_plane.registry.volumes import VolumeRegistry
 from control_plane.worker_identity_source import StaticWorkerIdentitySource
+from gateway_common.timeutil import to_iso_z
 
 KEY = "key-node-a"
 API_KEY = "local-key"
@@ -482,3 +483,71 @@ def test_the_shared_check_sees_a_record_someone_else_removed(workspace: Path) ->
     assert replacement.started_at != record.started_at
     assert sandboxes._record_is_still_ours(registry, record) is False
     assert sandboxes._record_is_still_ours(registry, replacement) is True
+
+
+def test_the_shared_check_compares_the_stores_encoding_not_this_process_memory(
+    workspace: Path,
+) -> None:
+    """``started_at`` does **not** round-trip verbatim, and the check must know.
+
+    ``to_storage_dict`` writes the nonce with ``to_iso_z`` (milliseconds);
+    ``from_storage_dict`` reads it back at that precision. A registry built
+    without a ``record_store`` hands the caller's own object back, so the
+    truncation is invisible -- which is how a check that answered 409 to every
+    create on the real fleet shipped green. Here the store is real (it encodes
+    and re-reads) and the store's copy is asserted to be the encoded one, so
+    the pin fails if the comparison ever goes back to the in-memory datetimes.
+    """
+    shape = _Cp(workspace)
+    store = _SharedRecordStore()
+    registry = SandboxRegistry(shape.settings, record_store=store)
+    record = registry.create(
+        template_id="base",
+        sandbox_id=SANDBOX,
+        timeout=300,
+        metadata={},
+        env_vars={},
+        secure=True,
+        allow_internet_access=False,
+        base_image=None,
+    )
+
+    # Pin the clock to a sub-millisecond offset so the truncation is certain
+    # rather than 999-in-1000, then push the record the way the create path
+    # does (the store write is ``save``, not ``create``).
+    record.started_at = record.started_at.replace(microsecond=123456)
+    registry.save(record)
+
+    stored = registry.get(SANDBOX)
+    assert store.records[SANDBOX]["started_at"] == to_iso_z(record.started_at)
+    assert stored.started_at != record.started_at  # .123456 -> .123
+    assert to_iso_z(stored.started_at) == to_iso_z(record.started_at)
+
+    assert sandboxes._record_is_still_ours(registry, record) is True
+
+
+@pytest.mark.asyncio
+async def test_a_plain_create_survives_a_store_that_encodes_the_record(
+    workspace: Path,
+) -> None:
+    """A create through a *shared* store still returns 201.
+
+    The end-to-end half of the pin above: this is the shape the fleet runs
+    (``replicas: 2`` over Redis), and the shape the first release of the C2
+    check broke -- every create answered 409 "was deleted while it was being
+    created" because the record read back from the store never compared equal
+    to the one the create had just made.
+    """
+    shape = _Cp(workspace)
+    store = _SharedRecordStore()
+    registry = SandboxRegistry(shape.settings, record_store=store)
+    agent = _HeldMaterialize()
+    agent.release.set()
+    app = _app(shape, agent=agent, registry=registry)
+    await _register(app)
+
+    resp = await _create(app)
+
+    assert resp.status_code == 201, resp.text
+    assert _register_record(app) is not None
+    assert set(store.records) == {SANDBOX}

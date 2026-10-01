@@ -1479,19 +1479,29 @@ def _record_is_still_ours(registry, record) -> bool:
     ``registry.save`` it back: a record for a sandbox the client was told was
     gone.
 
-    ``started_at`` is the nonce: it is set once per record at create time and
-    round-trips through the store verbatim, so "the same record" and "another
-    record with the same id" are distinguishable. The read is the shared one
-    (``SandboxRegistry.get`` always reads the store when it has a backend, so a
-    deletion by another replica is visible immediately); a single-process
-    deployment has no second replica to race and keeps using the in-process
-    claim above.
+    The nonce is ``(started_at, envd_access_token)`` **as the store holds
+    them**, not as this process holds them. ``SandboxRecord`` keeps
+    ``started_at`` at microsecond precision, but ``to_storage_dict`` writes it
+    with ``to_iso_z`` -- milliseconds -- so the round trip through the store is
+    lossy and comparing the in-memory datetimes is False for essentially every
+    record (the first release of this check did exactly that and answered 409
+    to *every* create; the pins only used an in-process registry, where the
+    object is returned unchanged and the truncation never shows). Comparing the
+    encoded form is what "the same record" means to the store, and the access
+    token separates two records that share an id *and* a millisecond.
+
+    The read is the shared one (``SandboxRegistry.get`` always reads the store
+    when it has a backend, so a deletion by another replica is visible
+    immediately); a single-process deployment has no second replica to race and
+    keeps using the in-process claim above.
     """
     try:
         current = registry.get(record.sandbox_id)
     except UnknownSandboxError:
         return False
-    return current.started_at == record.started_at
+    return to_iso_z(current.started_at) == to_iso_z(record.started_at) and (
+        current.envd_access_token == record.envd_access_token
+    )
 
 
 #: Open-issues N53's shape, one level up: a create's rollback used to assume the
