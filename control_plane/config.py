@@ -263,6 +263,15 @@ class Settings:
     create_queue_max: int = field(
         default_factory=lambda: _env_int("E2B_CREATE_QUEUE_MAX", 100)
     )
+    #: How long a ``DELETE`` waits for an in-flight create of the same sandbox
+    #: before treating it as abandoned (design v2 §4.5). The window exists
+    #: because the control plane materializes the tree *before* it dials the
+    #: worker, so a teardown that arrives in between would otherwise tear down
+    #: a tree a live create is still finishing onto. Bounded, and a claim that
+    #: outlives the bound is abandoned rather than waited on forever.
+    create_window_wait_s: float = field(
+        default_factory=lambda: _env_float("E2B_CREATE_WINDOW_WAIT_S", 60.0)
+    )
     volume_token_ttl_s: int = field(
         default_factory=lambda: _env_int("E2B_VOLUME_TOKEN_TTL_S", 0)
     )

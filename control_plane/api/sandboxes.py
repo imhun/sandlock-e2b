@@ -1254,6 +1254,12 @@ async def _create_sandbox_attempt(
         record.host_uid = host_uid
         registry.save(record)
 
+    # v2 §4.5: this sandbox is now being created, and the tree may already
+    # exist on its node (the materialization below comes before the worker is
+    # dialled). A teardown that arrives now waits for this claim instead of
+    # racing it.
+    claim = _CreateClaim()
+    _creating_claims(request.app.state)[record.sandbox_id] = claim
     try:
         if node.address == "local://":
             workspace_dir = _provision_local(
@@ -1283,14 +1289,28 @@ async def _create_sandbox_attempt(
                 snapshot_id=snapshot.snapshot_id if snapshot else None,
                 materialized=True,
             )
+        if claim.abandoned:
+            # A teardown waited, gave up, and removed what it found. Keeping
+            # the record now is exactly the "record on disk, tree gone" residue
+            # -- the tree this create materialized is left to the orphan sweep,
+            # which is where an unfinished create already goes.
+            _forget_record(registry, record.sandbox_id)
+            raise OfficialError(
+                409,
+                f"Sandbox {record.sandbox_id} was deleted while it was being "
+                "created",
+            )
         record.append_log("sandbox created")
         registry.save(record)
     except OfficialError:
-        registry.delete(record.sandbox_id)
+        _forget_record(registry, record.sandbox_id)
         raise
     except Exception as e:
-        registry.delete(record.sandbox_id)
+        _forget_record(registry, record.sandbox_id)
         raise OfficialError(500, f"Failed to provision sandbox runtime: {e}") from e
+    finally:
+        _creating_claims(request.app.state).pop(record.sandbox_id, None)
+        claim.event.set()
 
     logger.info(
         "created sandbox %s (template=%s image=%s node=%s)",
@@ -1415,6 +1435,68 @@ def _provision_local(request, record, snapshot, volume_mounts, settings) -> None
     # I1: the record is durable — drop the cross-process reservation marker.
     if host_uid is not None and pool is not None:
         pool.commit(record.sandbox_id)
+
+
+class _CreateClaim:
+    """One in-flight create, so a teardown of the same id can see it (v2 §4.5).
+
+    ``event`` fires when the create is done with the sandbox -- whichever way it
+    went. ``abandoned`` is set by a teardown that waited longer than
+    ``create_window_wait_s``: the create then refuses to keep a record, because
+    the teardown has already removed what it found and a record would claim a
+    tree that is gone.
+    """
+
+    __slots__ = ("abandoned", "event")
+
+    def __init__(self) -> None:
+        self.event = asyncio.Event()
+        self.abandoned = False
+
+
+#: Open-issues N53's shape, one level up: a create's rollback used to assume the
+#: record it was cleaning up was still there. It is not -- a teardown that gave
+#: up waiting for this create has already removed it -- and ``registry.delete``
+#: raises on an unknown id, so the rollback has to say "make it not exist" rather
+#: than "delete this".
+def _forget_record(registry, sandbox_id: str) -> None:
+    try:
+        registry.delete(sandbox_id)
+    except UnknownSandboxError:
+        pass
+
+
+def _creating_claims(state) -> dict[str, _CreateClaim]:
+    claims = getattr(state, "creating_sandboxes", None)
+    if claims is None:
+        claims = {}
+        state.creating_sandboxes = claims
+    return claims
+
+
+async def _await_inflight_create(request, sandbox_id: str) -> None:
+    """Wait, bounded, for a create of ``sandbox_id`` to finish.
+
+    No claim means the ordinary case (a teardown of a sandbox nobody is
+    creating), and returns immediately. A claim that outlives the bound is
+    *abandoned* and the teardown proceeds: the alternative -- waiting forever
+    for a create that is stuck -- turns a slow create into an undeletable
+    sandbox.
+    """
+    claim = _creating_claims(request.app.state).get(sandbox_id)
+    if claim is None:
+        return
+    wait_s = float(getattr(request.app.state.settings, "create_window_wait_s", 60.0))
+    try:
+        await asyncio.wait_for(claim.event.wait(), timeout=wait_s)
+    except asyncio.TimeoutError:
+        claim.abandoned = True
+        logger.warning(
+            "sandbox %s is still being created after %.0fs: tearing it down as "
+            "an unfinished create (the create will not keep a record)",
+            sandbox_id,
+            wait_s,
+        )
 
 
 async def _materialize_remote(request, record, node, settings, snapshot) -> None:
@@ -1668,6 +1750,11 @@ async def kill_sandbox(
     mode), because it is not something a tenant's SDK call should turn on.
     """
     registry = _registry(request)
+    # v2 §4.5, before the record is even read: a teardown of a sandbox whose
+    # create is still in flight has to wait for it (bounded), or it would tear
+    # down a tree the create is still finishing onto -- and the create would
+    # then keep a record for it.
+    await _await_inflight_create(request, sandbox_id)
     try:
         record = registry.get(sandbox_id)
         _require_owned(request, record, resource_id=sandbox_id, label="Sandbox")
