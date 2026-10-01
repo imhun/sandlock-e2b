@@ -2065,19 +2065,32 @@ class SandboxRegistry:
         entry["diskMB"] += record.disk_size_mb
         entry["processes"] += record.max_processes
 
-    def remove_expired(self, now: datetime | None = None) -> list[SandboxRecord]:
-        """Reap sandboxes whose TTL elapsed and release their reservations."""
+    def expired_candidates(self, now: datetime | None = None) -> list[SandboxRecord]:
+        """Records whose TTL elapsed, **without releasing them** (N53).
+
+        The sweep has to tear a sandbox down on its worker before the record
+        goes: the worker's teardown asks the control plane to remove the tree
+        (``remove-workspace``), and that request is authorized against these
+        records -- freed first, it comes back 404 and the tree (plus the
+        worker's own runtime record) is left behind with nobody who may act on
+        it. ``remove_expired`` below is the one-shot form for callers that only
+        want the release; the sweeper takes the candidates, tears down, and
+        then :meth:`delete`\\ s each one.
+        """
         if self._record_store is not None:
-            expired = []
-            for record in self._iter_stored_records():
-                if self._ttl_reapable(record, now):
-                    expired.append(record)
-                    self._release(record)
-            return expired
+            return [
+                record
+                for record in self._iter_stored_records()
+                if self._ttl_reapable(record, now)
+            ]
         now = now or utcnow()
-        expired = [
+        return [
             r for r in list(self._sandboxes.values()) if self._ttl_reapable(r, now)
         ]
+
+    def remove_expired(self, now: datetime | None = None) -> list[SandboxRecord]:
+        """Reap sandboxes whose TTL elapsed and release their reservations."""
+        expired = self.expired_candidates(now)
         for record in expired:
             self._release(record)
         return expired

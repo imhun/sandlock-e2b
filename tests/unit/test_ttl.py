@@ -101,3 +101,38 @@ async def test_ttl_sweeper_awaits_an_async_callback():
     finally:
         await sweeper.stop()
     assert reaped == [record.sandbox_id]
+
+
+@pytest.mark.asyncio
+async def test_the_record_survives_the_teardown_it_authorizes():
+    """The worker's teardown must still be able to name the sandbox (N53).
+
+    The sweep tears the sandbox down on its worker *after* the record is gone,
+    and the worker's teardown asks the control plane to remove the tree
+    (``remove-workspace``) -- a request authorized against the control plane's
+    own records. Measured on the fleet 2026-10-01: freed first, the record made
+    that request come back 404, so the tree and the worker's runtime record
+    stayed on disk with nobody left who may act on them (and the worker then
+    re-asked every disk round: ~5 req/s of 404s per stale record).
+    """
+    registry = SandboxRegistry(_settings())
+    record = _create(registry, timeout=300)
+    record.end_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        seconds=1
+    )
+    seen: list[bool] = []
+    finished = asyncio.Event()
+
+    async def _on_expired(r) -> None:
+        seen.append(registry.get(r.sandbox_id) is not None)
+        finished.set()
+
+    sweeper = TTLSweeper(interval_seconds=0.05, on_expired=_on_expired)
+    sweeper.start(registry)
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=5)
+    finally:
+        await sweeper.stop()
+
+    assert seen == [True], "the teardown ran after its record was already released"
+    assert registry.count() == 0, "the record still has to go once the teardown ran"

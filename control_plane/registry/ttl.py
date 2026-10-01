@@ -7,6 +7,8 @@ import inspect
 import logging
 from typing import Callable
 
+from control_plane.registry.manager import UnknownSandboxError
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,7 +43,7 @@ class TTLSweeper:
                 if self._claim is not None and not self._claim():
                     await asyncio.sleep(self._interval)
                     continue
-                expired = registry.remove_expired()
+                expired = registry.expired_candidates()
                 for record in expired:
                     logger.info("TTL expired sandbox %s", record.sandbox_id)
                     if self._on_expired is not None:
@@ -56,6 +58,17 @@ class TTLSweeper:
                                 await result
                         except Exception:  # pragma: no cover - defensive
                             logger.exception("TTL cleanup failed for %s", record.sandbox_id)
+                    # N53: release the record only *after* the teardown ran.
+                    # The worker's teardown removes the tree through a
+                    # ``remove-workspace`` file operation, which the control
+                    # plane authorizes against these records; releasing first
+                    # answered it 404 and left the tree (and the worker's own
+                    # runtime record) behind. The window where an expired
+                    # record is still visible is the teardown itself.
+                    try:
+                        registry.delete(record.sandbox_id)
+                    except UnknownSandboxError:  # pragma: no cover - already gone
+                        pass
                     registry.cleanup_workspace(record)
             except asyncio.CancelledError:
                 raise
