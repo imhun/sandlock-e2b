@@ -102,10 +102,10 @@ class _Cp:
         self.volumes = VolumeRegistry(workspace / "_volumes_base")
 
 
-def _app(shape: _Cp, *, agent) -> object:
+def _app(shape: _Cp, *, agent, registry=None) -> object:
     return create_control_app(
         settings=shape.settings,
-        registry=SandboxRegistry(shape.settings),
+        registry=registry if registry is not None else SandboxRegistry(shape.settings),
         nodes_registry=NodeRegistry(heartbeat_timeout=600.0),
         volumes_registry=shape.volumes,
         workspace_base=shape.workspace_base,
@@ -172,10 +172,10 @@ def _register_record(app, sandbox_id: str = SANDBOX):
 @pytest.fixture()
 def worker_teardown(monkeypatch):
     """The control plane's hop to the *worker*: recorded instead of dialled."""
-    removed: list[str] = []
+    removed: list[tuple[str, bool]] = []
 
     async def _fake(request, record, node, *, force=False):
-        removed.append(record.sandbox_id)
+        removed.append((record.sandbox_id, force))
         return SimpleNamespace(acknowledged=True, deferred=False)
 
     monkeypatch.setattr(sandboxes, "_destroy_remote", _fake)
@@ -223,7 +223,7 @@ async def test_a_delete_during_materialization_waits_for_the_create_then_removes
     assert (await create).status_code == 201
     assert (await delete).status_code == 204
 
-    assert worker_teardown == [SANDBOX]
+    assert worker_teardown == [(SANDBOX, False)]
     assert _register_record(app) is None
 
 
@@ -256,6 +256,13 @@ async def test_a_delete_that_gives_up_leaves_no_record_and_no_tree(
     # what may not happen is a record for a tree the delete already removed.
     assert create_resp.status_code >= 200
     assert _register_record(app) is None
+    # ...and it must not leave a *running* sandbox behind either (review I6):
+    # the delete gave up before the create provisioned, so the worker has a
+    # runtime registered for a sandbox the control plane has forgotten. The
+    # orphan sweep only reclaims **trees** (``remove-orphan-workspace``), so the
+    # create has to take its own runtime down -- with ``force``, because by then
+    # the record it would be verified against is gone.
+    assert worker_teardown == [(SANDBOX, False), (SANDBOX, True)]
 
 
 @pytest.mark.asyncio
@@ -277,5 +284,96 @@ async def test_a_completed_create_is_never_removed_by_a_late_delete(
     resp = await _delete(app)
 
     assert resp.status_code == 204
-    assert worker_teardown == [SANDBOX]
+    assert worker_teardown == [(SANDBOX, False)]
     assert _register_record(app) is None
+
+
+@pytest.mark.asyncio
+async def test_a_delete_on_the_other_replica_does_not_resurrect_the_record(
+    workspace: Path, worker_teardown
+) -> None:
+    """The window has to be closed across replicas too (review C2).
+
+    The control plane ships ``replicas: 2`` and load-balances, so the delete
+    that races a create is usually answered by the *other* pod. The in-process
+    claim cannot see it -- what both replicas do share is the registry, and the
+    create therefore confirms, before it keeps a record, that the record in
+    that store is still the one it made.
+
+    ⚠ **This one is not the pin.** Measured: it passes with
+    ``_record_is_still_ours`` stubbed to ``True``, so something *else* in the
+    flow already answers 409 for this shape -- the shared check is the second
+    line of defence here, not the first, and this test cannot tell whether it
+    works. The pin for the check itself is
+    ``test_the_shared_check_sees_a_record_someone_else_removed`` below; what
+    still has to be found and written is the integration shape in which the
+    create really would have resurrected the record (a registry whose ``save``
+    writes through to a shared store the way Redis does).
+    """
+    shape = _Cp(workspace)
+    agent = _HeldMaterialize()
+    registry = SandboxRegistry(shape.settings)
+    replica_a = _app(shape, agent=agent, registry=registry)
+    replica_b = _app(shape, agent=agent, registry=registry)
+    await _register(replica_a)
+    await _register(replica_b)
+
+    create = asyncio.create_task(_create(replica_a))
+    await asyncio.wait_for(agent.entered.wait(), 5)
+    # The other replica knows nothing about the claim: it answers at once.
+    assert (await _delete(replica_b)).status_code == 204
+
+    agent.release.set()
+    create_resp = await create
+    assert create_resp.status_code == 409, create_resp.text
+    assert _register_record(replica_a) is None
+    assert _register_record(replica_b) is None
+    # ...and the runtime this create registered is taken down by the create
+    # itself (review I6), not left for a sweep that only reclaims trees.
+    assert worker_teardown == [(SANDBOX, False), (SANDBOX, True)]
+
+
+def test_the_shared_check_sees_a_record_someone_else_removed(workspace: Path) -> None:
+    """The pin for ``_record_is_still_ours`` itself.
+
+    Two facts have to hold for the cross-replica half of §4.5 to mean anything:
+    a record that a teardown removed is no longer ours (so the create does not
+    write it back), and the record we did create is ours (so an ordinary create
+    keeps it). The nonce is ``started_at``, which the store round-trips.
+    """
+    shape = _Cp(workspace)
+    registry = SandboxRegistry(shape.settings)
+    app = _app(shape, agent=_HeldMaterialize(), registry=registry)
+    _ = app
+    record = registry.create(
+        template_id="base",
+        sandbox_id=SANDBOX,
+        timeout=300,
+        metadata={},
+        env_vars={},
+        secure=True,
+        allow_internet_access=False,
+        base_image=None,
+    )
+
+    assert sandboxes._record_is_still_ours(registry, record) is True
+
+    registry.delete(SANDBOX)
+    assert sandboxes._record_is_still_ours(registry, record) is False
+
+    # Another record with the same id (a re-create) is not ours either: that is
+    # the difference ``started_at`` buys, and a bare "does it exist" check would
+    # miss it.
+    replacement = registry.create(
+        template_id="base",
+        sandbox_id=SANDBOX,
+        timeout=300,
+        metadata={},
+        env_vars={},
+        secure=True,
+        allow_internet_access=False,
+        base_image=None,
+    )
+    assert replacement.started_at != record.started_at
+    assert sandboxes._record_is_still_ours(registry, record) is False
+    assert sandboxes._record_is_still_ours(registry, replacement) is True

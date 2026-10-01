@@ -1290,11 +1290,34 @@ async def _create_sandbox_attempt(
                 snapshot_id=snapshot.snapshot_id if snapshot else None,
                 materialized=materialized,
             )
-        if claim.abandoned:
-            # A teardown waited, gave up, and removed what it found. Keeping
-            # the record now is exactly the "record on disk, tree gone" residue
-            # -- the tree this create materialized is left to the orphan sweep,
-            # which is where an unfinished create already goes.
+        if not _record_is_still_ours(registry, record):
+            # Someone tore this sandbox down while we were creating it -- on
+            # this replica (the claim above waited and gave up) or on the other
+            # one (the shared read is the only thing that sees it, review C2).
+            # Keeping the record now is the "record on disk, tree gone"
+            # residue; but the *tree* is not the only thing this create made:
+            # the worker hop above registered a **runtime**. The orphan sweep
+            # reclaims trees (``remove-orphan-workspace``), never runtimes, so
+            # this is the one place that has to take its own work down -- with
+            # ``force``, because the record a teardown would be verified
+            # against is the one being dropped.
+            logger.warning(
+                "sandbox %s was deleted while it was being created: not keeping "
+                "its record, and tearing down what this create registered",
+                record.sandbox_id,
+            )
+            if node is not None and node.address != "local://":
+                try:
+                    await _destroy_remote(request, record, node, force=True)
+                except Exception:  # noqa: BLE001 - reported, never masking the 409
+                    logger.exception(
+                        "sandbox %s: could not tear down the runtime this "
+                        "abandoned create registered on node %s",
+                        record.sandbox_id,
+                        node.node_id,
+                    )
+            elif node is not None:
+                _destroy_local(request.app.state, record, force=True)
             _forget_record(registry, record.sandbox_id)
             raise OfficialError(
                 409,
@@ -1442,17 +1465,42 @@ class _CreateClaim:
     """One in-flight create, so a teardown of the same id can see it (v2 §4.5).
 
     ``event`` fires when the create is done with the sandbox -- whichever way it
-    went. ``abandoned`` is set by a teardown that waited longer than
-    ``create_window_wait_s``: the create then refuses to keep a record, because
-    the teardown has already removed what it found and a record would claim a
-    tree that is gone.
+    went. It is **in this process only**, so it covers the common case (the
+    teardown lands on the replica that is creating) and nothing more: the
+    control plane ships ``replicas: 2``, and a claim object is not visible from
+    the other one. What closes the window for *that* half is
+    :func:`_record_is_still_ours` -- a read of the shared store, which is where
+    both replicas already agree on what exists.
     """
 
-    __slots__ = ("abandoned", "event")
+    __slots__ = ("event",)
 
     def __init__(self) -> None:
         self.event = asyncio.Event()
-        self.abandoned = False
+
+
+def _record_is_still_ours(registry, record) -> bool:
+    """Is the record in the shared store still the one this create made?
+
+    The cross-replica half of the §4.5 window (review C2). A teardown on the
+    *other* replica cannot see this process's claim, so it removes the record
+    and answers 204 -- and without this check the create would go on to
+    ``registry.save`` it back: a record for a sandbox the client was told was
+    gone.
+
+    ``started_at`` is the nonce: it is set once per record at create time and
+    round-trips through the store verbatim, so "the same record" and "another
+    record with the same id" are distinguishable. The read is the shared one
+    (``SandboxRegistry.get`` always reads the store when it has a backend, so a
+    deletion by another replica is visible immediately); a single-process
+    deployment has no second replica to race and keeps using the in-process
+    claim above.
+    """
+    try:
+        current = registry.get(record.sandbox_id)
+    except UnknownSandboxError:
+        return False
+    return current.started_at == record.started_at
 
 
 #: Open-issues N53's shape, one level up: a create's rollback used to assume the
@@ -1491,7 +1539,6 @@ async def _await_inflight_create(request, sandbox_id: str) -> None:
     try:
         await asyncio.wait_for(claim.event.wait(), timeout=wait_s)
     except asyncio.TimeoutError:
-        claim.abandoned = True
         logger.warning(
             "sandbox %s is still being created after %.0fs: tearing it down as "
             "an unfinished create (the create will not keep a record)",
