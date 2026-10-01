@@ -339,8 +339,8 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"     # 只有"从 worker pod 观测"�
    `process.*`/`filesystem.*` 收回来，并加"免令牌 Start 必须非 2xx"的回归。
 2. **SEC-K0S-004**：显式 `allowOut` 的 IP/CIDR 走与隐式分支同一套私有段判定（或强制叠 `net_deny`）。
 3. **SEC-K0S-002**：控制面关 OpenAPI/docs（一行）。
-4. **SEC-K0S-006**：`sysinfo`/`getcpu` 已按"中介而非拒绝"处理完；`statfs` 也已按"配额 + 剩余"实现，但**在部署形态下不生效** —— 先解决 SEC-K0S-007。
-5. **SEC-K0S-007（优先级高于 4）**：route-B 载荷不产生 seccomp 通知 ⇒ notif 类中介整体失效；先按文末那条修法让 exec 子进程落在 generation init 的过滤器下。
+4. **SEC-K0S-006**：`sysinfo`/`getcpu` 已按"中介而非拒绝"处理完；`statfs` 原判"在部署形态下不生效"**已更正并修好**（真根因是 fork 的 handler 优先级，见 §SEC-K0S-007 的更正段），E2B 验收用例已摘掉 `xfail` 并转绿。
+5. ~~**SEC-K0S-007（优先级高于 4）**：route-B 载荷不产生 seccomp 通知 ⇒ notif 类中介整体失效；先按文末那条修法让 exec 子进程落在 generation init 的过滤器下。~~ **同日复核实测后撤回**：route-B 载荷在过滤器下，也确实在产生通知；见 §SEC-K0S-007 的更正段。
 5. `clone3` 命名空间位在 `handle_fork` 里补齐校验（纵深，当前由外层 profile 兜着）。
 
 ---
@@ -354,9 +354,9 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"     # 只有"从 worker pod 观测"�
 | SEC-K0S-004（IP/CIDR 形态） | **已修复（代码）** | `gateway_common/network.py::sandlock_network_policy` 的 allowlist 分支现在也用 `private_deny_cidrs`（= `E2B_NETWORK_DENY_CIDRS`，**与隐式分支同一把尺子**）做减法，deny 优先；判定用**重叠**而非包含（`0.0.0.0/0`、`::/0` 这类比保护段更宽的条目同样被丢，fail closed），并按协议族分别比较。同时修好 `_to_net_allow` 的条目解析——旧的 `entry.split(":", 1)[0]` 让 `tcp://…`、`host:port`、`CIDR:port` 三种写法**绕过**了 deny 减法。回归：`tests/unit/test_network_config.py::test_policy_explicit_allowout_is_filtered_by_private_entries`。受影响的本地源站用例改用仓库既有的 `198.18.x.y` 基准段（`tests/contract/test_mcp_netns.py` 的 `origin_alias`）。 |
 | SEC-K0S-004（**域名**形态） | **未修复 —— 需要 fork 侧改动** | 域名由 fork 在建连时解析，平台侧只做字面量判定 ⇒ `allow_out=["10.244.140.26.nip.io:49983"]` 这类**解析到内网的域名**仍然可达（实测过）。正确修法是让 fork 支持"allowlist + 硬拒集并存"（deny 优先）：`NetworkPolicy::AllowList` 增一个 denied 集合、`sandbox/builder.rs` 放开 `net_allow`/`net_deny` 互斥、E2B 侧把 `net_deny = protected` 与 `net_allow` 一起下发。改动落在 `third_party/sandlock`（子模块）+ 重新出轮子 + 重出镜像 + 滚集群，**本轮未做**。 |
 | SEC-K0S-006（`sysinfo`/`getcpu`） | **已修复（fork，见文末）** | fork 按"中介而非拒绝"合成：`sysinfo` 回沙箱预算、其余宿主态归零，`getcpu` 回 0。 |
-| SEC-K0S-006（`statfs`） | **已实现但不生效（原因见 SEC-K0S-007）** | 语义已按用户裁定"配额 + 剩余"落地（宿主写账本、fork 每次现读），fork 内集成用例全绿；但部署形态下**中介本身不生效**，根因是 SEC-K0S-007 那条。 |
+| SEC-K0S-006（`statfs`） | **已修复（2026-10-01 更正）** | 语义按用户裁定"配额 + 剩余"落地；原判"部署形态下不生效、根因是 SEC-K0S-007"**作废** —— 真根因是 fork 的 **handler 优先级**（chroot 的 `SYS_statfs` handler 先注册、先答），已把 disk-stats handler 的注册前移到 chroot 之前，并加回归 `test_procfs::test_statfs_accounting_wins_over_the_chroot_handler`。E2B 验收：`tests/security/escape/test_disk_stats_statfs.py` 摘掉 `xfail` 后在 route-B 形状转绿。 |
 | `clone3` 命名空间位 | **源码里已修** | 见文末更正。 |
-| **SEC-K0S-007** | **高（新，2026-10-01 实测确证）** | **route-B 形态下载荷不产生任何 seccomp 通知** ⇒ 所有 notif 类中介对该形态载荷失效（`statfs` 是第一个被测到的；`uname`/`sched_getaffinity`/`/proc` 合成同类）。这不是本轮引入的，但它是 SEC-K0S-006（`statfs`）修不动的真正原因。详见文末。 |
+| ~~**SEC-K0S-007**~~ | ~~高~~ **已撤回（2026-10-01 同日复核）** | 原判"route-B 形态下载荷不产生任何 seccomp 通知 ⇒ 所有 notif 类中介失效"**不成立**：同一形状（`route_b_sandbox(None, None)` + route B）里载荷的 `statfs`/`openat` 通知都到监督器（trace `notif nr=137 pid=<载荷> -> return-value`），`uname` 主机名虚拟化、`/proc` 合成、`inotify_add_watch` 中介也都在载荷上生效。`statfs` 失效的真根因是 handler 优先级，已修并钉住。详见文末更正段。 |
 
 ### fork 侧（2026-10-01 第二轮，已做完）
 
@@ -364,16 +364,58 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"     # 只有"从 worker pod 观测"�
 |---|---|---|
 | SEC-K0S-004（域名形态） | **已修复（fork + E2B）** | fork 新增 **deny 优先**组合：`NetworkPolicy::AllowList` 增 `denied: DeniedDestinations`（`seccomp/notif.rs`），`allows()` 先查 deny 再查 allow；`sandbox/builder.rs` 放开 `net_allow`/`net_deny` 互斥；`sandbox.rs` 在两者并存时把解析后的 deny 集挂到同一协议的策略上（`network/rules.rs::denied_filter_from`）。E2B 侧 `sandlock_network_policy` 把 `private_deny_cidrs` **同时**下发为 `net_deny`，于是"域名解析到内网"也被拒。回归：fork 侧 `notif.rs` 新增 3 条组合单测（lib **917 passed / 0 failed**，基线 914）、`sandbox/tests.rs` 的互斥用例改为"可并存"；E2B 侧 `tests/security/escape/test_network_deny_bypass.py::test_explicit_allowout_cannot_reach_a_protected_range`（**字面量 + 主机名两种写法都必须 DENIED**，在 lane 里 **1 passed**）。 |
 | SEC-K0S-006（`sysinfo`/`getcpu`） | **已修复（fork）** | fork 新增 `procfs::handle_sysinfo` / `handle_getcpu`（沿用 `handle_uname` 那套"算完写回子进程内存"的原语 `write_child_mem`）：`sysinfo` 报**沙箱自己的内存预算**（与 `generate_meminfo` 同源，也即 `/proc/meminfo` 的那份值），`loads`/`procs`/`uptime`/swap 等平台不建模的量一律**归零而不是报宿主的**；`getcpu` 两个指针都写 0。注册条件与既有虚拟化对齐（`sysinfo` 挂 `memory_limit`，`getcpu` 挂 `virtual_cpu_count`），并在 `seccomp_plan` 里把两个号加进通知集。回归：fork `test_procfs.rs::test_sysinfo_virtualization`（真沙箱里 `sysinfo` 必须回 `256 MiB / load 0 / procs 0 / uptime 0`、`getcpu` 必须回 `cpu 0`）；`procfs` 一族 **12 passed**。E2B 侧无需改动（它只是消费 fork）。 |
-| SEC-K0S-006（`statfs`） | **已实现（fork + E2B），但部署形态下不生效** | 语义按用户裁定："报沙箱的**配额和剩余空间**"。实现：fork 新增 `disk_stats_path` 选项（宿主维护 `<total_bytes> <used_bytes>`，handler 每次 `statfs` 现读合成 4 KiB 块、`f_type`/`f_namelen` 保留真值、文件缺失退内核）+ `SYS_statfs` 进通知集 + supervise 的 wire 字段/apply/示例；E2B 侧共享路径 helper（放在沙箱树之外，不可伪造）→ factory → executor → **agent 建时写 `total=disk_mb, used=0`、每轮磁盘扫描后刷新**。fork 内两条用例（`Sandbox::run` 与 `SandboxInstance`+exec 子进程）全绿。**但部署形态（route-B）下不生效——根因不是这条，而是 SEC-K0S-007**：载荷根本不产生 seccomp 通知。 |
+| SEC-K0S-006（`statfs`） | **已修复（2026-10-01）** | 语义按用户裁定："报沙箱的**配额和剩余空间**"。实现：fork 新增 `disk_stats_path` 选项（宿主维护 `<total_bytes> <used_bytes>`，handler 每次 `statfs` 现读合成 4 KiB 块、`f_type`/`f_namelen` 保留真值、文件缺失退内核）+ `SYS_statfs` 进通知集 + supervise 的 wire 字段/apply/示例；E2B 侧共享路径 helper（放在沙箱树之外，不可伪造）→ factory → executor → **agent 建时写 `total=disk_mb, used=0`、每轮磁盘扫描后刷新**。原判"部署形态下不生效、根因是通知层"**已更正**：真正的原因是 **handler 优先级** —— `build_dispatch_table` 先 `register_chroot_handlers`（注册 `SYS_statfs → handle_chroot_statfs`）再注册 disk-stats handler，而链在第一个非 `Continue` 处停止，于是每个带 chroot 根的形态（pure/合成根、镜像 rootfs、真根＝全部生产形态）都由 chroot handler 作答。修法：把 disk-stats 的注册前移；回归 `test_procfs::test_statfs_accounting_wins_over_the_chroot_handler`（修前 `4096 72335360 …`＝宿主 XFS，修后 `4096 2621440 1572864`＝账本），E2B 侧 `tests/security/escape/test_disk_stats_statfs.py` 由 `xfail` 转正向通过。 |
 | `clone3` 命名空间位 | **无需修（源码里已修）** | 更正上一轮的记述：当前 fork 源码 `resource.rs::handle_fork` 的命名空间检查**已经不限于 `SYS_clone`**（用 `clone_flags` 读 `clone_args`，对整族生效），注释里记着 2026-09-30 那次"外层 profile 在替沙箱兜底"的教训。实测与之一致：`clone3` 带 `NEWUSER/NEWNS/NEWPID/...` 全部 EPERM，裸 `clone3`/`clone` 正常。 |
 
 ---
 
-## SEC-K0S-007（高）route-B 载荷不产生 seccomp 通知 ⇒ notif 类中介整体失效
+## SEC-K0S-007（**已撤回**）route-B 载荷不产生 seccomp 通知 ⇒ notif 类中介整体失效
+
+> **2026-10-01 同日复核：结论不成立，已撤回。** `statfs` 另有真根因（fork 的 handler 优先级），已在 `third_party/sandlock` 修掉并加了红/绿回归。下面先给更正后的实测与根因，原判原文留作对照。
+
+### 更正后的实测（本地测试镜像 `e2b-sandlock-test:latest`；形状＝`tests/security/conftest.py::route_b_sandbox(None, None)` ＋ route B，即 `statfs` 用例自己用的那个形状）
+
+| # | 观测 | 结果 |
+|---|---|---|
+| 1 | 监督器 trace（`SANLOCK_EVENT_TRACE=1`，`RouteBInstance.slot_stderr()` 取回） | 载荷**自己**的 syscall 在矩阵里：`notif nr=257/262/3/12/9/11 pid=<载荷>`，以及 **`notif nr=137 pid=<载荷> -> return-value`**（amd64 镜像；arm64 上 `statfs` 是 43） |
+| 2 | 载荷 `os.uname().nodename` | `sandbox-11-1`（虚拟名），宿主是 `orbstack` ⇒ `handle_uname` 在载荷上生效，也就是 `write_child_mem` 这条路可用 |
+| 3 | 载荷读 `/proc/meminfo` | `MemTotal: 524288 kB`（＝沙箱预算），宿主 `20554504 kB` ⇒ 中介合成生效（全仓只有 `procfs.rs` 产出这段文本，且只从 notif handler 可达） |
+| 4 | 同形状的 inotify 中介用例 | `test_path_surface_inotify.py::test_the_pure_shape_is_mediated_too_and_the_watch_stays_inside` **通过**（宿主目录被拒 —— Landlock 没有 inotify 权限位，只能是 notif 中介） |
+| 5 | 同一次跑的两条用例 | `1 passed, 1 xfailed`（后者即 `statfs`） |
+| 6 | 生产侧旁证（本报告 SEC-K0S-006） | 载荷读到中介合成的 `/proc/meminfo`、`/proc/mounts`（"sandlock" 设备名）⇒ 线上同样在通 |
+
+**原判两个依据为什么站不住**：
+
+* "载荷自报的 pid 一条都没有"：载荷报的是 **pid 命名空间里的 pid**（生产 `E2B_PID_NS=true`），矩阵里的 pid 是监督器命名空间（容器）的 pid，两者本来就不可比；
+* "`nr=137` 全程未出现"：`12/257/262/302/137` 是 **x86_64** 号（本地 amd64 镜像如此），而 k0s 车队是 arm64（`statfs`＝43、`openat`＝56、`newfstatat`＝79、`prlimit64`＝261）—— 拿 x86_64 号去 arm64 的矩阵里找 `statfs` 本身不成立；
+* 更要紧的是自相矛盾：SEC-K0S-006 那张表（载荷读到中介合成的 `/proc`）与"载荷收不到通知"不可能同时为真。
+
+### 真根因：`statfs` 的 handler 被 chroot 路径 handler 抢答（已修）
+
+`crates/sandlock-core/src/seccomp/dispatch.rs::build_dispatch_table` 的注册顺序是「chroot 在前、disk-stats 在后」（第 600 行调 `register_chroot_handlers`，第 687 行才注册 disk-stats），而 `DispatchTable::dispatch` 的规则是**第一个非 `Continue` 的结果生效**，`handle_chroot_statfs` 又总是作答（真实数字或 errno）。于是**每个带 chroot 根的形态**（pure/合成根、镜像 rootfs、真根 —— 即全部生产形态）里 `disk_stats_path` 都轮不到执行；fork 自己的集成用例不带 chroot，所以一直是绿的（"每段都成立、合起来不生效"的真正原因）。
+
+最小复现（同一 wheel、同一策略，只差 `chroot`）：
+
+```
+no-chroot : (4096, 4096, 2621440, 1572864)   ← 账本 10 GiB / 已用 4 GiB
+chroot=/  : (4096, 4096, 72335360, 52400913) ← 宿主 XFS，accounting handler 被抢
+```
+
+route-B 形状里还有一条只读判别：把账本路径换成**命名管道**，修复前载荷的 `statfs` 立刻返回宿主数字（说明 disk-stats handler 从未被调用），修复后会卡在管道读上（说明它确实被调用了）。
+
+**修法（已落）**：把 disk-stats 的注册移到 `register_chroot_handlers` 之前。`handle_statfs` 本来就与路径无关（账本是"卖了多少 / 用了多少"），所以它就是"配置了账本时所有 `statfs`"的正确答案。
+
+**回归与验收**：
+
+* fork：新增 `test_procfs::test_statfs_accounting_wins_over_the_chroot_handler`（`chroot("/")` ＋ 账本）—— 修前 `4096 72335360 …` 红，修后 `4096 2621440 1572864` 绿；同批 `test_procfs` 14 passed、`test_chroot` 52 passed、`--lib dispatch` 21 passed。
+* E2B：`tests/security/escape/test_disk_stats_statfs.py` 摘掉 `xfail(strict=True)` 后在 route-B 形状转绿（`df` 读到账本，改写账本后下一次调用即生效），同形状的 inotify 用例仍绿；`tests/security/escape` ＋ `tests/unit/test_route_b_wiring.py` 合计 43 passed。
+* 轮子/镜像按修复重建（`build-sandlock-wheels.sh` 两个架构 + `build-test-image.sh`）。
+
+### 原判（已撤回，保留对照）
 
 **这是为 SEC-K0S-006 的 `statfs` ver证时顺带凿出来的，比 006 本身严重。**
 
-### 事实（全部运行时证据；诊断代码已从 fork 清除）
+#### 事实（原判，全部运行时证据；诊断代码已从 fork 清除）
 
 在为 `statfs` 做中介时，链路的每一段各自都"成立"，但部署形态下就是不生效。逐段仪表化后得到：
 
@@ -387,19 +429,19 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"     # 只有"从 worker pod 观测"�
 
 载荷跑着 CPython（第 5 项说明它必然发 `openat`/`close`），却**一条通知都没有** ⇒ 它根本不在那层过滤器下。载荷里的 `Seccomp: 2` 来自 pod 自身的 seccomp profile，不是 sandlock 那层（`prctl(PR_GET_SECCOMP)` 只给"有没有过滤器"，给不出来源）。
 
-### 影响
+> 更正：第 3 项成立（`handle_statfs` 确实没被调用），但它说明的是**handler 被抢答**，不是"载荷不在过滤器下"；第 4/5 项是 arch 号与 pid 命名空间的误读，见上节。
 
-* **所有基于 seccomp-notify 的中介，对 route-B 形态的载荷都不生效** —— 已知消费方包括 `statfs`（本轮）、`uname` 主机名虚拟化、`sched_getaffinity`/`num_cpus`、`/proc` 合成的那些路径、以及依赖 notif 的网络/路径中介。
-* 该形态当前的隔离实际来自 **mount namespace/真根、uid 池、Landlock、pod 自身 profile**，而不是 sandlock 的 notif 层 —— 这是个**需要单独决策**的口径问题（哪些中介其实一直没在生效）。
-* **不是本轮引入的**：本轮只是把它测了出来；它也是 SEC-K0S-006（`statfs`）无论怎么接线都不会生效的原因。
+#### 影响（原判，已作废）
 
-### 修法方向（未实施）
+* ~~**所有基于 seccomp-notify 的中介，对 route-B 形态的载荷都不生效** —— 已知消费方包括 `statfs`（本轮）、`uname` 主机名虚拟化、`sched_getaffinity`/`num_cpus`、`/proc` 合成的那些路径、以及依赖 notif 的网络/路径中介。~~
+* ~~该形态当前的隔离实际来自 **mount namespace/真根、uid 池、Landlock、pod 自身 profile**，而不是 sandlock 的 notif 层 —— 这是个**需要单独决策**的口径问题。~~
+* 作废理由：上节第 2/3/4 项实测都在载荷上生效；该形态的 notif 层是活的。
 
-让 route-B 的 exec 子进程落在 **generation init 的过滤器**下：要么确保子进程由那个被 confine 的 init fork（`RunExec` 链路），要么在 fork 后按 generation 的 plan 重新 confine 一次。定位要害是**载荷的父进程是不是那个被 confine 的 init** —— 在载荷与 init 两侧各打一次 `prctl(PR_GET_SECCOMP)` + `getppid()` 即可判定。
+#### 修法方向（原判，已作废）
 
-**验收判据**：`tests/security/escape/test_disk_stats_statfs.py` 去掉 `xfail` 后必须绿（`os.statvfs("/")` 等于账本值，且改写账本后下一次调用即生效）—— 它现在是 `xfail(strict=True)`，被修好时会自动转红提醒摘标记。
+~~让 route-B 的 exec 子进程落在 **generation init 的过滤器**下：要么确保子进程由那个被 confine 的 init fork（`RunExec` 链路），要么在 fork 后按 generation 的 plan 重新 confine 一次。~~
 
-**登记**：`docs/open-issues.md` 的 fork 一节（"route-B 的 notif 层对载荷失效"）。
+作废理由：exec 子进程本来就是被 confine 的 init fork 出来的（`RunExec` → init fork → `execve`），照这条改不会修好 `statfs`。真正要改的是 handler 注册顺序。
 | 轮子/镜像 | **已重建** | `wheels/fork/` 两个架构（x86_64 + aarch64）都重新出了（`build-sandlock-wheels.sh`，zig 交叉编译，无 QEMU）；本地 `e2b-sandlock-test:latest` 已按新轮子重建（`build-test-image.sh`，这个镜像必须随之重建，否则仍是旧行为 —— 见 `build-test-deploy-pitfalls.md` §B7）。旧轮子里那句 `--net-allow and --net-deny are mutually exclusive` 已从 `.so` 中消失（唯一性检查仍在），可据此确认轮子确实带上了这次改动。 |
 
 **尚未部署**：以上代码改动只落在仓库里；`0.1.0-824-gf2aec0b-20261001-073534` 的集群上仍是修复前的行为。

@@ -191,6 +191,18 @@ ALLOWED_TMP_REFERENCES = {
     "tmp/prod-run.sh": "只读审计 wrapper：payload tmp/prod-audit{,2,3}.sh 不在文档引用清单内，单搬 wrapper 不成事",
     "tmp/security-probe2.py": "文件已不存在（历史），无法复现",
     "tmp/security-probe3.py": "文件已不存在（历史），无法复现",
+    # The k0s white-box audit probes (2026-09-30 / 2026-10-01 rounds). They are
+    # not reproducible from a checkout: every one of them needs the live cluster
+    # plus a control-plane API key, and the shape they were written against is
+    # the deployment of that day. Their conclusions are in
+    # `docs/security-audit/findings-k0s-*.md` (and, where they became
+    # contracts, in `tests/`).
+    "tmp/audit/probe_i1_replay.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings-k0s-2026-09-30.md",
+    "tmp/audit2/p21_cross_rce.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings-k0s-2026-10-01.md",
+    "tmp/probe/probe.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",
+    "tmp/signal-probe/cross_sandbox_signal.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",
+    "tmp/signal-probe/inside_sandbox_blast.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",
+    "tmp/syscall-probe/probe.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",
 }
 
 
@@ -301,6 +313,47 @@ BARE_NAME_ALLOWANCES = {
     "connection_config.py": "上游 e2b SDK 的内部模块（只在 SCALING.md 里做来源说明，本仓与其子模块都没有这个文件）",
     "test_runtime_context_volumes.py": "A4 已删掉的历史测试（HANDOFF 在叙述那次改动，不是让人去跑）",
 }
+
+#: The k0s white-box audit docs list their one-off probes as an *index* (a table
+#: of "probe name -> what it proved"), and an index entry is not an instruction
+#: to run it: every one of those probes needs the live cluster plus a
+#: control-plane API key, and the shape is the deployment of that day. They stay
+#: out of the repo on purpose (`docs/security-audit/findings-k0s-*.md` and
+#: `findings.md` hold the conclusions); the entries below are the audit-round
+#: filenames that index cites.
+for _audit_probe in (
+    "p01_recon.py",
+    "p02_hostinfo.py",
+    "p03_sidechannel.py",
+    "p11_public_and_cidr.py",
+    "p15_cp_paths.py",
+    "p16_syscalls.py",
+    "p17_clone3.py",
+    "p18_final.py",
+    "p19_pubtraffic_auth.py",
+    "p20_unauth_rce.py",
+    "p21_cross_rce.py",
+    "probe_a2_l1.py",
+    "probe_a9_scan.py",
+    "probe_b1_verify8.py",
+    "probe_c1_l2.py",
+    "probe_d1_l3.py",
+    "probe_d3_fileapi.py",
+    "probe_d_net.py",
+    "probe_f1_cp.py",
+    "probe_g1_ratelimit.py",
+    "probe_h1_l4.py",
+    "probe_h2_output.py",
+    "probe_i1_replay.py",
+    "probe_j1_blocklist_arm64.py",
+    "probe_k1_memory_scope.py",
+    "verify_numbers.py",
+    "verify_openapi_fix.py",
+):
+    BARE_NAME_ALLOWANCES[_audit_probe] = (
+        "线上 k0s 审计探针（2026-09/10 三轮），需集群 + API key；"
+        "审计报告只把它当索引引用，结论在 docs/security-audit/"
+    )
 
 
 def _bare_names() -> set[str]:

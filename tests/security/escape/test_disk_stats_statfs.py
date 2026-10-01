@@ -1,4 +1,4 @@
-"""SEC-K0S-006: `statfs(2)` inside a sandbox reports the host's accounting.
+"""SEC-K0S-006: `statfs(2)` inside a sandbox reports the platform's accounting.
 
 `df` and `shutil.disk_usage` go through `statfs`, which is not namespaced: the
 sandbox used to be shown the node's whole volume (99.7 GiB on `/`, and a 10 PiB
@@ -8,6 +8,25 @@ worker publishes both and the fork reports them on each call.
 
 This is the executor-side end of that: the path the platform hands the
 executor must reach the fork, and the numbers must come back through `df`.
+
+At first this case was `xfail(strict=True)` with the reading "a route-B payload
+receives no seccomp notifications at all, so no notif-based mediation can apply
+to it" (SEC-K0S-007, 2026-10-01). That reading was wrong, and the 2026-10-01
+re-measurement says what actually happened: the payload *is* notified in this
+shape (`uname` hostname virtualization, `/proc` synthesis and
+`inotify_add_watch` mediation all answer for it, and the fork's trace shows
+`notif nr=137 pid=<payload>`), but the *handler chain* answered the `statfs`
+with the node's numbers: `register_chroot_handlers` registered `SYS_statfs`
+before the accounting handler, and a chain stops at the first non-`Continue`
+result. Every deployment shape has a chroot root (pure/synth, image rootfs,
+real root), so the accounting was unreachable in production while it worked in
+the bare (no-chroot) fork test.
+
+Fixed in `third_party/sandlock` by registering the accounting handler before
+the chroot path handlers. Pinned by the fork's
+`test_procfs::test_statfs_accounting_wins_over_the_chroot_handler` (red before
+the fix with the node's numbers, green after) and by this case, which is the
+route-B end-to-end acceptance the audit named.
 """
 
 from __future__ import annotations
@@ -18,28 +37,6 @@ from pathlib import Path
 import pytest
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "SEC-K0S-006 residual -- ROOT CAUSE PROVEN: a route-B payload receives "
-        "NO seccomp notifications at all, so no notif-based mediation can apply "
-        "to it. Evidence (instrumented runs, diagnostics since removed): a "
-        "per-(pid,nr) notification matrix from the supervisor's dispatch point "
-        "shows notifications arriving for pids 60/62/65/68/80 (brk, openat, "
-        "close, newfstatat, prlimit64 ...) while the payload -- which reports "
-        "its own pid and runs CPython, so it must issue openat/close -- "
-        "produced none, and `nr=137` never appeared anywhere. Corroborating: "
-        "the confined child's plan does contain SYS_statfs "
-        "(`CTX notif branch ... statfs=true`), the handler IS registered "
-        "(`DISPATCH statfs handler registered`), the handler-entry log never "
-        "fires, and a raw syscall(137) from the payload returns the host's "
-        "numbers. So the payload is not running under that filter. Fix "
-        "direction: spawn/re-confine route-B exec children under the "
-        "generation's filter (the update needs its own acceptance, and it also "
-        "decides whether uname/affinity/proc synthesis are inert in this shape "
-        "for the same reason)."
-    ),
-)
 @pytest.mark.usefixtures("require_sandlock")
 def test_statfs_reports_the_published_accounting():
     from tests.security.conftest import route_b_sandbox, run_sh, sandbox_tmpdir
