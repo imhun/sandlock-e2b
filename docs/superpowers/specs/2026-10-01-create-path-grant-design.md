@@ -1,5 +1,12 @@
 # 建箱临时授权（per-op create grant）设计
 
+> **⚠ 已被取代（2026-10-01）。** 本文件选定的**载体 B（worker 领授权直连 agent）**经独立审查否决，
+> 现行为 [`2026-10-01-create-path-grant-design-v2.md`](2026-10-01-create-path-grant-design-v2.md)
+> （**载体 C：控制面直送**）。否决依据：出厂形态下控制面用 worker 身份去查按宿主身份的解析器
+> （每次建箱 503，已复现）、k8s/compose 清单并不放行 worker→agent、以及本文 §4.3 的拷贝落点
+> 比降级路多下沉一层。本文的 §1 实测、§4.3/§4.3.1 的合成 op 与四条硬要求、§4.5 的建箱标记
+> **仍然有效**，由 v2 继承。
+
 **状态：** 待评审（评审通过后交 writing-plans 出实施计划，再动代码）
 **触发：** 用户 2026-10-01 问"建箱时间还能继续优化吗"；§7.26 量出剩下 191 ms 里
 `fileop:chown-workspace` 占 **71 ms**（worker→CP→agent→CP→worker 一整圈）、`record` 占 **47 ms**。
