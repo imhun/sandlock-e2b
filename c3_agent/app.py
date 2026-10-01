@@ -109,18 +109,23 @@ from c3_agent.lookup import (
     missing_slot_pid_message,
 )
 from c3_agent.materialize import (
-    PARTIAL_COPY,
     MaterializeRefusal,
     materialize_tree,
+    PARTIAL_COPY,
 )
 from c3_agent.scan import InventoryScanner, scanner_for
-from gateway_common.create_grant import GrantRefusal, verify
 from gateway_common.paths import validate_node_id, validate_sandbox_id
 
 logger = logging.getLogger(__name__)
 
 #: The one line ``as_uid`` prints on success (Task 1).
 AS_UID_OK_PREFIX = "C3-ASUID-OK"
+
+#: The create path's materialization (design v2 §4.2). It rides the **existing**
+#: authenticated CP→agent channel, like ``chown``/``rm``/``walk``: the control
+#: plane is the only party that may name a path (§14.4), and this agent
+#: re-checks every path it is handed against its own four roots.
+MATERIALIZE_OP = "materialize"
 
 #: Distinguishes "the caller said nothing, build the default scanner" from
 #: "the caller says this container does not scan" (``None``) -- the same
@@ -202,6 +207,48 @@ class FileOpBody(BaseModel):
     #: tree no record claims, as nobody, and a worker that crashed and never
     #: came back has no identity to name.
     worker: WorkerCredentials | None = None
+
+
+class TreePlan(BaseModel):
+    """The one tree a create materializes, as the control plane derived it.
+
+    ``copy_from`` is present exactly for a snapshot create, and it names a copy
+    of the **tree root** (``<ws>/_snapshots/<snap>/fs``), which is why
+    ``c3_agent.materialize`` merges it into ``path`` and not into
+    ``path/subdir``.
+    """
+
+    path: str = Field(min_length=1)
+    subdir: str = Field(default="workspace", min_length=1)
+    mode: str = Field(default="0770", min_length=1)
+    uid: int = Field(ge=1)
+    gid: int = Field(ge=1)
+    copy_from: str | None = Field(default=None, min_length=1)
+
+
+class SlicePlan(BaseModel):
+    """One mounted volume's per-sandbox slice, as the control plane derived it."""
+
+    volume: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    uid: int = Field(ge=1)
+    gid: int = Field(ge=1)
+
+
+class MaterializeBody(BaseModel):
+    """The create path's whole materialization, in one instruction (v2 §4.2).
+
+    Not a ticket and not a signed plan: this arrives on the authenticated
+    CP→agent channel, so the credential is the same ``X-Internal-Key`` every
+    relayed op carries. What it may *contain* is the control plane's derived
+    paths and uids, which this service still re-resolves independently -- the
+    two layers do not replace each other (C3 §14.4).
+    """
+
+    sandbox_id: str = Field(min_length=1)
+    worker: WorkerCredentials
+    tree: TreePlan
+    slices: list[SlicePlan] = Field(default_factory=list)
 
 
 class AsUidRunner(Protocol):
@@ -413,6 +460,8 @@ def create_app(
             return await asyncio.to_thread(
                 _grant_slot, _validated(GrantSlotBody, body)
             )
+        if op == MATERIALIZE_OP:
+            return await _materialize(_validated(MaterializeBody, body))
         if op in FILE_OP_VERBS:
             return await asyncio.to_thread(_file_op, op, _validated(FileOpBody, body))
         raise HTTPException(
@@ -441,7 +490,7 @@ def create_app(
                 status_code=400,
                 detail={"error": "sandbox_id is not a valid sandbox id"},
             )
-        worker_uid, worker_gid = _worker_identity(op, body)
+        worker_uid, worker_gid = _worker_identity(op, body.worker, body.sandbox_id)
         instruction = FileOpInstruction(
             sandbox_id=body.sandbox_id,
             path=body.path,
@@ -469,7 +518,9 @@ def create_app(
             )
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
-    def _worker_identity(op: str, body: FileOpBody) -> tuple[int | None, int | None]:
+    def _worker_identity(
+        op: str, worker: WorkerCredentials | None, sandbox_id: str
+    ) -> tuple[int | None, int | None]:
         """The identity ``maint.c`` must act as, kernel-confirmed when anchored.
 
         Two shapes reach here, and the instruction itself says which:
@@ -486,12 +537,12 @@ def create_app(
         refused ``e2b-maint`` step gets: the control plane must not read "the
         identity could not be confirmed" as "the step happened".
         """
-        if body.worker is None:
+        if worker is None:
             return None, None
-        anchor = body.worker.container_id
+        anchor = worker.container_id
         if anchor is None:
-            return body.worker.uid, body.worker.gid
-        if body.worker.node_id is None:
+            return worker.uid, worker.gid
+        if worker.node_id is None:
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -502,17 +553,17 @@ def create_app(
                 },
             )
         identity = WorkerAnchor(
-            node_id=body.worker.node_id, container_id=anchor
+            node_id=worker.node_id, container_id=anchor
         )
         try:
             return identity_resolver.resolve(
-                identity, claimed=(body.worker.uid, body.worker.gid)
+                identity, claimed=(worker.uid, worker.gid)
             )
         except LookupRefusal as exc:
             logger.warning(
                 "c3-agent refused %s for sandbox %s: %s",
                 op,
-                body.sandbox_id,
+                sandbox_id,
                 exc,
             )
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
@@ -596,108 +647,73 @@ def create_app(
             "asUid": line,
         }
 
-    #: The single-use table: one entry per accepted ``jti``, dropped once the
-    #: grant it belongs to has expired (plus a margin, so two nodes' clocks do
-    #: not have to agree for a *replay* to be refused -- the TTL is already
-    #: over by then). Kept on ``state`` rather than the module so two apps in
-    #: one process (tests, an embedder) cannot spend each other's grants.
-    spent_grants: dict[str, float] = {}
-    app.state.spent_grants = spent_grants
+    #: How many materializations this agent runs at once (design §4.6). Its own
+    #: budget and not the control plane's instruction semaphore: a copy is
+    #: bounded by the tree (2 000 files took 17.4 s on the shared NAS, and it is
+    #: not bounded above) while most instructions are milliseconds, and face A's
+    #: ``grant-slot`` is answered from the same anyio thread pool this op holds.
+    materialize_slots = asyncio.Semaphore(
+        max(1, int(settings.materialize_max_concurrency))
+    )
+    app.state.materialize_slots = materialize_slots
 
-    @app.post("/internal/grants/file-op")
-    async def grant_file_op(request: Request) -> dict[str, Any]:
-        """Run one ``materialize-tree`` plan a worker carried here itself.
+    async def _materialize(body: MaterializeBody) -> dict[str, Any]:
+        """Run the whole create materialization the control plane derived.
 
-        This is the create path's shortcut around the control plane's relay
-        (design §4.1): the worker mints a plan from the control plane, then
-        delivers it to its **own** node's agent, so the expensive
-        worker→CP→agent→CP→worker loop happens once (the mint) instead of once
-        per step.
-
-        It deliberately does **not** reuse ``_require_key``: the plan *is* the
-        credential, and it is a better one than the fleet-wide key -- signed,
-        addressed to this host by name, short-lived, single-use, and valid for
-        exactly one op whose every path the control plane derived. The body
-        carries nothing else, so there is nothing for a caller to steer.
-
-        Every check is fail-closed and named, and the order matters: the
-        signature is checked before the payload is read, the host before the
-        clock, and the ``jti`` is spent **before** any privileged work starts
-        (so a replay during the first request's flight is refused rather than
-        racing it).
+        The one way this differs from a relayed ``chown``: it is *long* (a
+        snapshot copy is bounded by the tree), so it waits for a slot in its
+        own budget and, rather than queueing behind slow copies, answers a
+        named 503 when there is none (design §4.6). Nothing is created before
+        that answer, so a refusal never leaves a half-materialized tree.
         """
-        try:
-            body = await request.json()
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPException(
-                status_code=400, detail={"error": "invalid JSON body"}
-            ) from None
-        if not isinstance(body, dict):
+        if not validate_sandbox_id(body.sandbox_id):
+            logger.warning("c3-agent refused materialize: sandbox_id is not valid")
             raise HTTPException(
                 status_code=400,
-                detail={"error": "a grant instruction must be a JSON object"},
+                detail={"error": "sandbox_id is not a valid sandbox id"},
             )
-        extra = set(body) - {"grant"}
-        if extra:
-            # Refused by name: an ignored ``path`` would leave its author
-            # believing it had been considered (the same rule every other
-            # surface here uses).
+        # The worker's identity is the one ``maint.c``'s ``--gid`` gate compares
+        # against; resolving it here (rather than reading it from the tree plan)
+        # keeps this instruction shaped exactly like a relayed chown.
+        worker_uid, worker_gid = _worker_identity(
+            MATERIALIZE_OP, body.worker, body.sandbox_id
+        )
+        plan = {
+            "sandbox_id": body.sandbox_id,
+            "worker": {"uid": worker_uid, "gid": worker_gid},
+            "tree": body.tree.model_dump(),
+            "slices": [entry.model_dump() for entry in body.slices],
+        }
+        try:
+            await asyncio.wait_for(
+                materialize_slots.acquire(),
+                timeout=float(settings.materialize_busy_timeout_s),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "c3-agent refused to materialize sandbox %s: all %d slots are "
+                "busy",
+                body.sandbox_id,
+                settings.materialize_max_concurrency,
+            )
             raise HTTPException(
-                status_code=400,
+                status_code=503,
                 detail={
                     "error": (
-                        "a grant instruction carries only its grant: refusing "
-                        + ", ".join(sorted(extra))
+                        "materialize is busy: "
+                        f"{settings.materialize_max_concurrency} concurrent "
+                        "materializations are in flight on this node"
                     )
                 },
-            )
-        token = body.get("grant")
-        if not isinstance(token, str) or not token:
-            raise HTTPException(
-                status_code=400,
-                detail={"error": "a grant instruction must carry its grant"},
-            )
-        if not settings.token:
-            raise HTTPException(
-                status_code=500,
-                detail={"error": "c3-agent token not configured"},
-            )
-        try:
-            payload = verify(token, secret=settings.token, host=settings.node_id)
-        except GrantRefusal as exc:
-            logger.warning("c3-agent refused a create grant: %s", exc)
-            raise HTTPException(
-                status_code=_grant_status(exc.reason),
-                detail={"error": str(exc)},
-            ) from exc
-        jti = payload.get("jti")
-        exp = payload.get("exp")
-        if not isinstance(jti, str) or not jti:
-            raise HTTPException(
-                status_code=400, detail={"error": "the grant names no jti"}
-            )
-        now = time.time()
-        for spent in [key for key, deadline in spent_grants.items() if deadline < now]:
-            spent_grants.pop(spent, None)
-        if jti in spent_grants:
-            # Named, and actionable: the worker's rule is "mint a new one and
-            # retry once" -- never "replay this one" (design §4.2).
-            logger.warning(
-                "c3-agent refused a create grant for sandbox %s: already used",
-                payload.get("sandbox_id"),
-            )
-            raise HTTPException(
-                status_code=409, detail={"error": "grant already used"}
-            )
-        spent_grants[jti] = float(exp if isinstance(exp, (int, float)) else now)
+            ) from None
         try:
             answer = await asyncio.to_thread(
-                materialize_tree, payload, settings=settings, runner=maint_runner
+                materialize_tree, plan, settings=settings, runner=maint_runner
             )
         except MaterializeRefusal as exc:
             logger.warning(
                 "c3-agent refused to materialize sandbox %s: %s",
-                payload.get("sandbox_id"),
+                body.sandbox_id,
                 exc,
             )
             raise HTTPException(
@@ -710,30 +726,22 @@ def create_app(
             # tree is ready".
             logger.warning(
                 "c3-agent refused to materialize sandbox %s: %s",
-                payload.get("sandbox_id"),
+                body.sandbox_id,
                 exc,
             )
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
         except FileOpShapeRefusal as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        return {"materialized": answer}
+        finally:
+            materialize_slots.release()
+        return {
+            "op": MATERIALIZE_OP,
+            "sandboxID": body.sandbox_id,
+            "tree": answer["tree"],
+            "slices": answer["slices"],
+        }
 
     return app
-
-
-def _grant_status(reason: str) -> int:
-    """The status for one ``GrantRefusal`` reason.
-
-    ``wrong-host`` is an authorization answer (the credential is genuine but
-    belongs to another node), while everything else is the credential's
-    authenticity or validity -- 401. ``op-not-allowed`` is a bad *plan* (400),
-    not a bad credential.
-    """
-    if reason == "wrong-host":
-        return 403
-    if reason == "op-not-allowed":
-        return 400
-    return 401
 
 
 def _materialize_status(reason: str) -> int:

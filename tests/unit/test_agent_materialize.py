@@ -20,13 +20,13 @@ The copy is the dangerous part (design §4.3.1) and has its own section below.
 from __future__ import annotations
 
 import os
-import secrets
 import shutil
 import stat
-import time
+import threading
 from pathlib import Path
 from typing import Any, Mapping
 
+import asyncio
 import httpx
 import pytest
 
@@ -34,7 +34,6 @@ from c3_agent import materialize
 from c3_agent.app import create_app
 from c3_agent.config import Settings
 from c3_agent.fileops import AgentFileOpRefusal
-from gateway_common.create_grant import OP, VERSION, mint
 
 AGENT_TOKEN = "agent-token-0123456789"
 HOST = "node_a"
@@ -95,24 +94,22 @@ class _Agent:
         return self.workspace_base / "_snapshots" / snapshot_id / "fs"
 
 
-def _grant(
+def _instruction(
     *,
     sandbox_id: str = SANDBOX,
     tree: dict[str, Any] | None = None,
-    op: str = OP,
-    host: str = HOST,
-    jti: str | None = None,
-    iat: int | None = None,
-    exp: int | None = None,
+    worker: dict[str, int] | None = None,
     slices: list[dict[str, Any]] | None = None,
-) -> str:
-    """A signed plan, shaped exactly as the control plane mints one."""
-    now = int(time.time())
-    payload = {
-        "v": VERSION,
-        "host": host,
+) -> dict[str, Any]:
+    """One instruction, shaped exactly as the control plane sends it.
+
+    No ticket: the credential is the ``X-Internal-Key`` header every relayed
+    op already carries, and the *content* is the control plane's own
+    derivation -- which this agent re-checks (design §4.2).
+    """
+    return {
         "sandbox_id": sandbox_id,
-        "op": op,
+        "worker": worker if worker is not None else {"uid": 65534, "gid": WORKER_GID},
         "tree": tree
         if tree is not None
         else {
@@ -123,11 +120,7 @@ def _grant(
             "gid": WORKER_GID,
         },
         "slices": list(slices or []),
-        "jti": jti if jti is not None else secrets.token_hex(8),
-        "iat": now if iat is None else iat,
-        "exp": (now + 10) if exp is None else exp,
     }
-    return mint(payload, secret=AGENT_TOKEN)
 
 
 def _plan_tree(agent: _Agent, sandbox_id: str = SANDBOX, **overrides) -> dict[str, Any]:
@@ -146,25 +139,41 @@ async def _post(agent: _Agent, body: dict):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=agent.app), base_url="http://agent"
     ) as client:
-        return await client.post("/internal/grants/file-op", json=body)
+        return await client.post(
+            f"/internal/nodes/{HOST}/agent/materialize",
+            json=body,
+            headers={"X-Internal-Key": AGENT_TOKEN},
+        )
 
 
 # ---------------------------------------------------------------- happy path
 
 
 @pytest.mark.asyncio
-async def test_a_valid_grant_creates_and_chowns_the_tree(workspace: Path) -> None:
+async def test_a_valid_instruction_creates_and_chowns_the_tree(workspace: Path) -> None:
     agent = _Agent(workspace)
 
     resp = await _post(
-        agent, {"grant": _grant(tree=_plan_tree(agent))}
+        agent, _instruction(tree=_plan_tree(agent))
     )
 
     assert resp.status_code == 200
     root = agent.tree()
     assert root.is_dir()
     assert (root / "workspace").is_dir()
-    assert resp.json()["materialized"]["tree"]["path"] == str(root)
+    assert resp.json() == {
+        "op": "materialize",
+        "sandboxID": SANDBOX,
+        "tree": {
+            "path": str(root),
+            "subdir": "workspace",
+            "mode": "0770",
+            "uid": UID_X,
+            "gid": WORKER_GID,
+            "created": True,
+        },
+        "slices": [],
+    }
     assert agent.runner.calls == [
         [
             agent.settings.maint_path,
@@ -181,13 +190,19 @@ async def test_a_valid_grant_creates_and_chowns_the_tree(workspace: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_the_mode_and_group_come_from_the_plan(workspace: Path) -> None:
-    """Nothing here is the agent's own choice -- not the mode, not the gid."""
+async def test_the_worker_identity_reaches_the_child_environment(
+    workspace: Path,
+) -> None:
+    """The mode, the gid and the identity all come from the instruction."""
     agent = _Agent(workspace)
     plan_gid = 12345
 
     resp = await _post(
-        agent, {"grant": _grant(tree=_plan_tree(agent, gid=plan_gid))}
+        agent,
+        _instruction(
+            tree=_plan_tree(agent, gid=plan_gid),
+            worker={"uid": 65534, "gid": plan_gid},
+        ),
     )
 
     assert resp.status_code == 200
@@ -208,12 +223,12 @@ async def test_the_mode_and_group_come_from_the_plan(workspace: Path) -> None:
         ]
     ]
     # ``--gid`` is checked by the binary against the worker's own gid, so the
-    # child must be told the same number the plan names.
+    # child must be told the same number the instruction names.
     assert agent.runner.envs[0]["E2B_BROKER_WORKER_GID"] == str(plan_gid)
-    # ...and *only* the gid: the plan names no worker uid, and a step that
-    # never uses ``--worker`` must not be handed an identity it would never
-    # read (``c3_agent.fileops.maint_env``).
-    assert "E2B_BROKER_WORKER_UID" not in agent.runner.envs[0]
+    # ...and the uid too: unlike the relayed file ops, this instruction carries
+    # the worker's whole verified identity, so ``maint_env`` writes both halves
+    # (``c3_agent.fileops.maint_env``).
+    assert agent.runner.envs[0]["E2B_BROKER_WORKER_UID"] == "65534"
 
 
 # ----------------------------------------------------------------- refusals
@@ -225,7 +240,7 @@ async def test_a_path_outside_the_roots_is_refused_named(workspace: Path) -> Non
     outside = agent.workspace_base / ".." / ".." / "etc"
 
     resp = await _post(
-        agent, {"grant": _grant(tree=_plan_tree(agent, path=str(outside)))}
+        agent, _instruction(tree=_plan_tree(agent, path=str(outside)))
     )
 
     assert resp.status_code == 400
@@ -234,104 +249,130 @@ async def test_a_path_outside_the_roots_is_refused_named(workspace: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_a_grant_is_single_use(workspace: Path) -> None:
-    agent = _Agent(workspace)
-    token = _grant(tree=_plan_tree(agent))
-
-    first = await _post(agent, {"grant": token})
-    second = await _post(agent, {"grant": token})
-
-    assert first.status_code == 200
-    assert second.status_code == 409
-    assert second.json()["error"] == "grant already used"
-    assert len(agent.runner.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_a_bad_signature_is_refused(workspace: Path) -> None:
-    agent = _Agent(workspace)
-    token = _grant(tree=_plan_tree(agent))
-    head, signature = token.split(".")
-    tampered = f"{head}.{signature[:-2]}{'AB' if signature[-2:] != 'AB' else 'CD'}"
-
-    resp = await _post(agent, {"grant": tampered})
-
-    assert resp.status_code == 401
-    assert "bad-signature" in resp.json()["error"]
-    assert agent.runner.calls == []
-
-
-@pytest.mark.asyncio
-async def test_a_grant_for_another_host_is_refused(workspace: Path) -> None:
+async def test_an_instruction_for_another_host_is_refused_named(
+    workspace: Path,
+) -> None:
+    """The instruction is addressed to a node -- and this agent is not it."""
     agent = _Agent(workspace)
 
-    resp = await _post(
-        agent, {"grant": _grant(tree=_plan_tree(agent), host="node_b")}
-    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=agent.app), base_url="http://agent"
+    ) as client:
+        resp = await client.post(
+            "/internal/nodes/node_b/agent/materialize",
+            json=_instruction(tree=_plan_tree(agent)),
+            headers={"X-Internal-Key": AGENT_TOKEN},
+        )
 
     assert resp.status_code == 403
-    assert "wrong-host" in resp.json()["error"]
+    assert resp.json() == {
+        "error": (
+            "request is addressed to node node_b, but this agent is node node_a"
+        )
+    }
     assert agent.runner.calls == []
 
 
 @pytest.mark.asyncio
-async def test_an_expired_grant_is_refused(workspace: Path) -> None:
+async def test_an_unknown_op_is_still_refused_named(workspace: Path) -> None:
+    """The op whitelist did not get looser: ``materialize`` is a new entry."""
     agent = _Agent(workspace)
-    past = int(time.time()) - 100
 
-    resp = await _post(
-        agent,
-        {"grant": _grant(tree=_plan_tree(agent), iat=past, exp=past + 10)},
-    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=agent.app), base_url="http://agent"
+    ) as client:
+        resp = await client.post(
+            f"/internal/nodes/{HOST}/agent/materialize-everything",
+            json=_instruction(tree=_plan_tree(agent)),
+            headers={"X-Internal-Key": AGENT_TOKEN},
+        )
+
+    assert resp.status_code == 404
+    assert resp.json() == {"error": "unknown agent op 'materialize-everything'"}
+    assert agent.runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_instruction_without_the_token_is_refused(workspace: Path) -> None:
+    agent = _Agent(workspace)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=agent.app), base_url="http://agent"
+    ) as client:
+        resp = await client.post(
+            f"/internal/nodes/{HOST}/agent/materialize",
+            json=_instruction(tree=_plan_tree(agent)),
+        )
 
     assert resp.status_code == 401
-    assert "expired" in resp.json()["error"]
+    assert resp.json() == {"error": "unauthorized"}
     assert agent.runner.calls == []
 
 
 @pytest.mark.asyncio
-async def test_an_unknown_op_in_the_grant_is_refused(workspace: Path) -> None:
-    agent = _Agent(workspace)
+async def test_a_busy_agent_answers_busy_without_touching_the_tree(
+    workspace: Path,
+) -> None:
+    """Over its own budget, this op says so -- it does not queue in silence.
 
-    resp = await _post(
-        agent, {"grant": _grant(tree=_plan_tree(agent), op="chown-workspace")}
+    Materialization can take tens of seconds on the shared NAS, and the agent
+    answers face A's ``grant-slot`` from the same anyio thread pool, so an
+    unbounded number of copies would be a way to starve slot grants (design
+    §4.6). Over the budget: a named 503, before anything is created.
+    """
+    released = threading.Event()
+    entered = threading.Event()
+
+    class _SlowRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, argv: list[str], *, env: Mapping[str, str]) -> str:
+            self.calls += 1
+            entered.set()
+            released.wait(timeout=10)
+            return ""
+
+    runner = _SlowRunner()
+    agent = _Agent(workspace, runner=runner)
+    agent.settings.materialize_max_concurrency = 1
+    agent.settings.materialize_busy_timeout_s = 0.2
+    agent.app = create_app(
+        settings=agent.settings, maint_runner=runner, inventory=None
     )
 
-    assert resp.status_code == 400
-    assert "op-not-allowed" in resp.json()["error"]
-    assert agent.runner.calls == []
-
-
-@pytest.mark.asyncio
-async def test_a_body_with_more_than_the_grant_is_refused(workspace: Path) -> None:
-    """The plan is the only input: a caller may not add a path beside it."""
-    agent = _Agent(workspace)
-
-    resp = await _post(
-        agent,
-        {
-            "grant": _grant(tree=_plan_tree(agent)),
-            "path": "/etc",
-        },
+    first = asyncio.create_task(
+        _post(agent, _instruction(tree=_plan_tree(agent, "sbx_busy_a")))
     )
+    await asyncio.to_thread(entered.wait, 5)
+    second = await _post(
+        agent, _instruction(tree=_plan_tree(agent, "sbx_busy_b"))
+    )
+    released.set()
+    assert (await first).status_code == 200
 
-    assert resp.status_code == 400
-    assert "path" in resp.json()["error"]
-    assert agent.runner.calls == []
+    assert second.status_code == 503
+    assert "materialize is busy" in second.json()["error"]
+    # The refused instruction never reached the tree or the privileged step.
+    assert agent.tree("sbx_busy_b").exists() is False
+    assert runner.calls == 1
 
 
-# -------------------------------------------------------- two grants, one node
+# -------------------------------------------------------- two sandboxes, one node
 
 
 @pytest.mark.asyncio
-async def test_two_sandboxes_grants_do_not_interfere(workspace: Path) -> None:
+async def test_two_sandboxes_do_not_interfere(workspace: Path) -> None:
     agent = _Agent(workspace)
 
     first = await _post(
-        agent, {"grant": _grant(tree=_plan_tree(agent, SANDBOX))}
+        agent, _instruction(tree=_plan_tree(agent, SANDBOX))
     )
     second = await _post(
-        agent, {"grant": _grant(sandbox_id=OTHER_SANDBOX, tree=_plan_tree(agent, OTHER_SANDBOX))}
+        agent,
+        _instruction(
+            sandbox_id=OTHER_SANDBOX, tree=_plan_tree(agent, OTHER_SANDBOX)
+        ),
     )
 
     assert first.status_code == 200
@@ -414,7 +455,7 @@ async def test_a_snapshot_lands_at_the_tree_root(workspace: Path) -> None:
 
     resp = await _post(
         agent,
-        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+        _instruction(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs()))),
     )
 
     assert resp.status_code == 200
@@ -446,7 +487,7 @@ async def test_the_fast_path_and_the_fallback_produce_the_same_tree(
 
     resp = await _post(
         agent,
-        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+        _instruction(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs()))),
     )
 
     assert resp.status_code == 200
@@ -479,7 +520,7 @@ async def test_a_symlink_in_the_snapshot_is_recreated_not_followed(
 
     resp = await _post(
         agent,
-        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+        _instruction(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs()))),
     )
 
     assert resp.status_code == 200
@@ -509,7 +550,7 @@ async def test_a_symlinked_destination_segment_is_refused_named(
 
     resp = await _post(
         agent,
-        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+        _instruction(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs()))),
     )
 
     assert resp.status_code == 400
@@ -532,7 +573,7 @@ async def test_an_ordinary_merge_keeps_existing_files(workspace: Path) -> None:
 
     resp = await _post(
         agent,
-        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+        _instruction(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs()))),
     )
 
     assert resp.status_code == 200
@@ -559,7 +600,7 @@ async def test_a_file_where_a_directory_belongs_is_refused_named(
 
     resp = await _post(
         agent,
-        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+        _instruction(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs()))),
     )
 
     assert resp.status_code == 400
@@ -582,7 +623,7 @@ async def test_a_partial_copy_is_reported_as_failure(
 
     resp = await _post(
         agent,
-        {"grant": _grant(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs())))},
+        _instruction(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs()))),
     )
 
     assert resp.status_code == 502
@@ -626,7 +667,7 @@ async def test_the_agent_creates_and_chowns_every_slice(workspace: Path) -> None
     slices = [_slice_entry(agent, "data"), _slice_entry(agent, "media")]
 
     resp = await _post(
-        agent, {"grant": _grant(tree=_plan_tree(agent), slices=slices)}
+        agent, _instruction(tree=_plan_tree(agent), slices=slices)
     )
 
     assert resp.status_code == 200
@@ -680,7 +721,7 @@ async def test_a_slice_path_outside_the_volume_root_is_refused_named(
     slices = [_slice_entry(agent, "data", path=str(outside))]
 
     resp = await _post(
-        agent, {"grant": _grant(tree=_plan_tree(agent), slices=slices)}
+        agent, _instruction(tree=_plan_tree(agent), slices=slices)
     )
 
     assert resp.status_code == 400
@@ -697,7 +738,7 @@ async def test_a_slice_not_in_the_plan_is_never_created(workspace: Path) -> None
     volume_root.mkdir(parents=True)
     (volume_root / "other-sandbox").mkdir()
 
-    resp = await _post(agent, {"grant": _grant(tree=_plan_tree(agent))})
+    resp = await _post(agent, _instruction(tree=_plan_tree(agent)))
 
     assert resp.status_code == 200
     assert sorted(os.listdir(volume_root)) == ["other-sandbox"]

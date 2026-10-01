@@ -88,6 +88,29 @@ class Settings:
             os.getenv("E2B_C3_AGENT_MAINT_TIMEOUT_S", "300")
         )
     )
+    #: How many create materializations this agent will run at once.
+    #:
+    #: Two reasons it is its own number, and not the CP's instruction budget
+    #: (``E2B_C3_AGENT_MAX_CONCURRENCY``): a materialization is bounded by the
+    #: tree -- a snapshot copy on the shared NAS took 17.4 s for 2 000 files
+    #: and is not bounded above -- while most instructions are milliseconds, so
+    #: sharing one budget would let a burst of copies take all of it; and this
+    #: agent answers face A's ``grant-slot`` from the same anyio thread pool
+    #: (default 40), so copies that are merely *queued* here would otherwise
+    #: become slot grants that cannot be served.
+    materialize_max_concurrency: int = field(
+        default_factory=lambda: _env_int("E2B_C3_AGENT_MATERIALIZE_MAX", 4)
+    )
+    #: How long one instruction waits for a free materialization slot before
+    #: the agent answers a *named* 503 ("busy"). Deliberately short: the caller
+    #: is the control plane's create path, and a create that waits here is a
+    #: create whose caller is waiting too -- better a named refusal than a
+    #: silent pile-up behind slow copies.
+    materialize_busy_timeout_s: float = field(
+        default_factory=lambda: _env_float(
+            "E2B_C3_AGENT_MATERIALIZE_BUSY_TIMEOUT_S", 5.0
+        )
+    )
     #: Ruling **D25** removed the identity resolver's uid switch (and with it
     #: ``E2B_C3_AGENT_RESOLVER_UID/_GID/_TIMEOUT_S``): the file-operation
     #: anchor is the worker's container id, matched against the

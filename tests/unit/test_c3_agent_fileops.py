@@ -23,6 +23,7 @@ What this lane pins:
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 import httpx
@@ -240,6 +241,83 @@ def test_a_worker_chown_without_a_worker_uid_is_refused() -> None:
         "a --worker chown needs the worker's own identity (it is what --worker "
         "writes into the tree; without it the owner would be root): refusing"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_materialize_saturation_does_not_block_the_other_ops(
+    tmp_path,
+) -> None:
+    """A copy occupies its own budget, never the agent's whole capacity.
+
+    Materialization is bounded by the tree (tens of seconds on the shared NAS,
+    and not bounded above) while ``chown``/``rm``/``walk`` and face A's
+    ``grant-slot`` are what the control plane and the sandbox's first command
+    wait on. So saturation is refused *by name* at its own limit -- it does not
+    queue, and it does not serialize everything else the agent does
+    (``c3_agent/config.py``: ``materialize_max_concurrency``).
+    """
+    released = threading.Event()
+    entered = threading.Event()
+
+    class _BlockingRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, argv: list[str], *, env: dict[str, str]) -> str:
+            self.calls += 1
+            # Only the *materialization's* privileged step is slow; the relayed
+            # op that follows is a normal, fast one.
+            if self.calls == 1:
+                entered.set()
+                released.wait(timeout=10)
+            return ""
+
+    runner = _BlockingRunner()
+    settings = _settings(
+        workspace_base=str(tmp_path),
+        materialize_max_concurrency=1,
+        materialize_busy_timeout_s=0.2,
+    )
+    app = create_app(settings=settings, maint_runner=runner, inventory=None)
+
+    async with _client(app) as client:
+        hold = asyncio.create_task(
+            client.post(
+                f"/internal/nodes/{HOST}/agent/materialize",
+                headers=_headers(),
+                json={
+                    "sandbox_id": "sbx_fileops",
+                    "worker": _worker(),
+                    "tree": {
+                        "path": str(tmp_path / "sbx_fileops"),
+                        "uid": POOL_UID,
+                        "gid": WORKER_GID,
+                    },
+                    "slices": [],
+                },
+            )
+        )
+        await asyncio.to_thread(entered.wait, 5)
+
+        started = time.monotonic()
+        chown = await client.post(
+            CHOWN_URL,
+            headers=_headers(),
+            json={
+                "sandbox_id": "sbx_fileops",
+                "path": RUNTIME,
+                "uid": POOL_UID,
+                "worker": _worker(),
+            },
+        )
+        elapsed = time.monotonic() - started
+
+        released.set()
+        assert (await hold).status_code == 200
+
+    assert chown.status_code == 200
+    # The copy is still running; a relayed op must not be waiting behind it.
+    assert elapsed < 1.0
 
 
 @pytest.mark.asyncio

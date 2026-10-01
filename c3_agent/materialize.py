@@ -202,6 +202,14 @@ def materialize_tree(
     # pool gate, the same realpath discipline, the same walk. ``worker_gid``
     # is what ``--gid`` is checked against in the child.
     sandbox_id = str(plan.get("sandbox_id") or "")
+    # The instruction carries the worker's own verified identity (the CP→agent
+    # body's ``worker`` block). It is what the binary's ``--gid`` gate compares
+    # against, and it is deliberately *not* derived from the tree's gid -- the
+    # two happen to be equal today, and the day they are not, the gate must
+    # still see the worker.
+    worker = plan.get("worker") if isinstance(plan.get("worker"), Mapping) else {}
+    worker_uid = worker.get("uid") if isinstance(worker.get("uid"), int) else None
+    worker_gid = worker.get("gid") if isinstance(worker.get("gid"), int) else gid
     handed_over = [
         run_file_op(
             "chown",
@@ -211,7 +219,8 @@ def materialize_tree(
                 uid=uid,
                 gid=gid,
                 recursive=True,
-                worker_gid=gid,
+                worker_uid=worker_uid,
+                worker_gid=worker_gid,
             ),
             runner=runner,
             settings=settings,
