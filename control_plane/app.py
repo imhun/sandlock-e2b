@@ -57,6 +57,14 @@ from control_plane.registry.redis_backend import try_claim
 #: claim (F11 step 4): one replica per interval, no lock to release.
 _TTL_SWEEP_INTERVAL_S = 1.0
 
+#: N61: how long one replica may hold the TTL sweep's fleet-wide claim. This is
+#: *not* the cadence: a round is not one interval -- it lists the shared records
+#: and tears sandboxes down one at a time, and a single ``rmtree`` measured
+#: 17.1 s on the fleet. A claim TTL of one interval let the second replica
+#: start its own round while the first was still inside a tree, so the claim
+#: TTL is "the upper bound on one round", deliberately longer than the round.
+_TTL_SWEEP_CLAIM_TTL_S = 60
+
 #: E7's platform-account scan. Deliberately slower than the TTL sweep: the
 #: numbers only move when a worker heartbeats (every 5 s) or a capture lands,
 #: and the alert is a crossing, not a live gauge -- 30 s is well inside the
@@ -351,7 +359,7 @@ def create_app(
             # records, so every replica would otherwise expire the same
             # sandboxes (and call every teardown twice).
             claim=lambda: try_claim(
-                redis_client, "e2b:ttl:sweep", ttl_s=int(_TTL_SWEEP_INTERVAL_S)
+                redis_client, "e2b:ttl:sweep", ttl_s=_TTL_SWEEP_CLAIM_TTL_S
             ),
         )
         app.state.sweeper = sweeper
