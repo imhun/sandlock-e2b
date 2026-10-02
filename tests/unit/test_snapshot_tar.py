@@ -392,3 +392,134 @@ def test_the_payload_shape_helper_prefers_the_tar(workspace: Path) -> None:
 
     assert paths.snapshot_payload(entry) == ("tar", entry / "fs.tar")
     assert paths.snapshot_payload(_store_entry(workspace, "snap_none")) is None
+
+
+# --------------------------------------------- the containment guard's cost
+#
+# A guard that re-resolves every member is a metadata round trip per entry on
+# the shared NAS (a snapshot's payload is a tree of thousands of files), and the
+# restore leg is where a snapshot's cost lands. The measurement that caught it
+# (2026-10-02, one sandbox, 203 members, same NAS as the trees):
+#
+#   copytree (the pre-tar reader)                12.8 s
+#   stdlib extractall(filter="data")             11.0 s
+#   this module, resolving every member          13.0 s   <-- the regression
+#
+# The cached guard below is the fix, and the two cases after it pin the parts
+# the cache may **not** stop catching.
+
+
+def _many_members_tar(path: Path, *, directories: int = 1, files: int = 200) -> None:
+    with tarfile.open(path, "w") as tar:
+        for index in range(directories):
+            info = tarfile.TarInfo(f"dir-{index}/")
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o755
+            tar.addfile(info)
+        for index in range(files):
+            info = tarfile.TarInfo(f"dir-0/f-{index:03d}.txt")
+            info.size = 4
+            tar.addfile(info, io.BytesIO(b"data"))
+
+
+def test_the_parent_chain_is_checked_once_per_directory(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This module's guard costs one ``lstat`` per **directory**, not per member.
+
+    Counting every ``lstat`` in a real extraction cannot isolate this module:
+    ``tarfile``'s own ``data`` filter resolves each member against the
+    destination, so *its* cost is per-member no matter what we do (measured
+    2026-10-02 inside one sandbox: ``extractall(filter="data")`` took 11.0 s for
+    203 members). What our guard must not do is add a second per-member walk on
+    top -- which is exactly the ~2 ms/entry regression it shipped with (13.0 s
+    measured) and this test pins shut at the helper level: 200 members under one
+    directory pay **one** ``lstat``, the second directory pays one more, and a
+    third member under the first directory pays none.
+    """
+    dest = workspace / "dest"
+    (dest / "workspace").mkdir(parents=True)
+    (dest / "nested").mkdir()
+    counter = {"n": 0}
+    real_lstat = os.lstat
+
+    def _counting_lstat(path, *args, **kwargs):
+        counter["n"] += 1
+        return real_lstat(path, *args, **kwargs)
+
+    safe: set[str] = set()
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "lstat", _counting_lstat)
+        for index in range(200):
+            archive._guard_member(dest, f"workspace/f-{index:03d}.txt", safe)
+        assert counter["n"] == 1
+        archive._guard_member(dest, "nested/deep.txt", safe)
+        assert counter["n"] == 2
+        archive._guard_member(dest, "workspace/one-more.txt", safe)
+        assert counter["n"] == 2
+
+    # One entry per directory actually walked: a top-level member (no parent
+    # components) would add "." without any ``lstat`` at all.
+    assert safe == {"workspace", "nested"}
+
+
+def test_a_link_where_the_snapshot_wants_a_directory_is_refused_named(
+    workspace: Path,
+) -> None:
+    """A directory member's own path is checked, not just its parents."""
+    archive_path = workspace / "fs.tar"
+    with tarfile.open(archive_path, "w") as tar:
+        info = tarfile.TarInfo("workspace/")
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o755
+        tar.addfile(info)
+    dest = workspace / "dest"
+    outside = workspace / "outside"
+    outside.mkdir()
+    dest.mkdir()
+    (dest / "workspace").symlink_to(outside)
+
+    with pytest.raises(archive.ArchiveRefusal) as caught:
+        archive.extract_sandbox_archive(archive_path, dest)
+
+    assert caught.value.reason == archive.DESTINATION_IS_A_SYMLINK
+    assert sorted(os.listdir(outside)) == []
+
+
+def test_a_link_the_archive_itself_creates_is_still_caught(
+    workspace: Path,
+) -> None:
+    """The cache may not become the only check: the stdlib filter stays the backstop.
+
+    ``sub/`` is cached as a safe parent from the first member, and the archive
+    then carries a link member that walks out of the destination. Nothing in
+    this module re-checks that member's target (a link member is not a
+    directory member, and its parent chain is the cached one), so the refusal
+    has to come from ``tarfile``'s own ``data`` filter, translated by name --
+    the "two layers, neither replaces the other" rule (C3 §14.4). The link is
+    relative on purpose: an **absolute** link member is dropped by this
+    module's volume-mount rule before any extractor sees it.
+    """
+    archive_path = workspace / "fs.tar"
+    outside = workspace / "outside"
+    outside.mkdir()
+    with tarfile.open(archive_path, "w") as tar:
+        info = tarfile.TarInfo("sub/")
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o755
+        tar.addfile(info)
+        first = tarfile.TarInfo("sub/first.txt")
+        first.size = 4
+        tar.addfile(first, io.BytesIO(b"data"))
+        link = tarfile.TarInfo("sub")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "../outside"
+        tar.addfile(link)
+    dest = workspace / "dest"
+    dest.mkdir()
+
+    with pytest.raises(archive.ArchiveRefusal) as caught:
+        archive.extract_sandbox_archive(archive_path, dest)
+
+    assert caught.value.reason == archive.DESTINATION_IS_A_SYMLINK
+    assert sorted(os.listdir(outside)) == []

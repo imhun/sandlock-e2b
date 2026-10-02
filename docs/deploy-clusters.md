@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.29（2026-10-02，N58：根重切上线 —— `_snapshots` 合一、`_migrate` 上浮，建箱 p50 124 → 135/136 ms、逐段不变，**当前版本 `0.1.0-887-g7ef319b-20261002-100406`**；该次上线当场抓到"从快照建箱"的 502，已前滚修复 + 复验，详见该节）；§7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**当前版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，当前版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.30（2026-10-02，Task 2：快照载荷从爆炸式 `fs/` 目录改成 `fs.tar`，捕获每条目 39.7 → 9.0 ms、占块减半，从快照建箱 28.2 → 34.4 ms/条目（读侧每条目包含检查，Task 3 搬本地后消失），**当前版本 `0.1.0-892-g52044b8-20261002-125656`**；老 `fs/` 快照 4/4 仍可恢复，详见该节）；§7.29（2026-10-02，N58：根重切上线 —— `_snapshots` 合一、`_migrate` 上浮，建箱 p50 124 → 135/136 ms、逐段不变，**当前版本 `0.1.0-887-g7ef319b-20261002-100406`**；该次上线当场抓到"从快照建箱"的 502，已前滚修复 + 复验，详见该节）；§7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**当前版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，当前版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1531,49 +1531,95 @@ E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000 \
 这是 N27 下沉时留下的**数据**问题（记录是控制面在快照成功之后写的），迁移按设计原样留着并
 具名报告，没替它们编一份；Task 2 会把载荷换成 `fs.tar`、Task 3 才把树搬去节点本地盘。
 
-### 7.30 Task 2：快照载荷打成 `fs.tar`（**仓库已落，集群未上线 —— 待上线验收**）
+### 7.30 Task 2：快照载荷打成 `fs.tar`（**2026-10-02，已上线 `0.1.0-892-g52044b8-20261002-125656`**）
 
-**代码面**：写侧 `envd_service/agent.py::_write_snapshot_tar`（临时名 → `fsync` → `rename`
-→ `.complete` 最后，与 `.oci.tar` 同款纪律）；读侧 `c3_agent/materialize.py::_take_snapshot_payload`
-与 worker 降级路**两种形状都收**（`fs.tar` 逐成员解包 / 既有 `fs/` 目录合并；
-**数据**是流式的，**成员索引**仍由 stdlib 保留 ~430 B/成员 —— 成员数上限与 Task 3 的字节
-上限一起做，见 `gateway_common/archive.py` 的模块说明）；
-`control_plane/file_ops.py::derive_materialize` 的 `copy_from` 指向 `fs.tar`；
-加固（成员过滤 + `dest` 包含检查）只有**一份实现**：`gateway_common/archive.py`，
-控制面与两个 agent 一起 import 同一个函数对象（`tests/unit/test_snapshot_tar.py` 钉住）。
-两个**只读 store 探针**（`local_first_snapshot_verify.py`、`local_first_capacity_account.py`）
-原来写死 `fs`，本轮跟着改成 `gateway_common.paths.snapshot_payload`，每行多一个
-`payload_shape` —— 不改的话上线后它们会把每个新快照报成"record only"（§4.2 的数据缺陷类）。
-单测：新 `tests/unit/test_snapshot_tar.py` + 改 `test_agent_materialize.py` /
-`test_cp_materialize_instruction.py` / `test_agent_create_sandbox_auth.py`；`tests/unit`
-与基线逐条相同（3 条 macOS-only）。
+计划 `docs/superpowers/plans/2026-10-02-local-first-create.md` 的 Task 2；产品设计、两笔账与
+逐条裁定在 `docs/create-local-first-design.md` §3.2/§6。**这一轮只换载荷的容器**：一个快照
+从"一棵爆炸式 `fs/` 目录"变成"一个 `fs.tar`"，**读侧两种形状都收**（线上四个可恢复的老快照
+全是 `fs/`）。树、记录、卷都不动。
 
-**上线前实测（2026-10-02，`0.1.0-887`，旧形状 `fs/`）**：
-`snapshot_create_probe.py --files 1,40,202 --n 3 --keep`
+**两个提交**：`893da7e`（Task 2 本体）、`52044b8`（评审轮 1 的两条 Important：store 探针认
+tar、解包内存账说准）。**注意：本轮上线的是 `52044b8`**，它之后还有一个**只动读侧守卫**
+的修复没上线（见"上线后发现的一条"）。
 
-| 档 | 条目 | 快照捕获 | 从快照建箱 p50 | 每条目 | 载荷字节（`du -sb`） | 载荷占块（`du -s`） |
-|---|---|---|---|---|---|---|
-| 1 文件 | 2 | 180 ms | 248 ms | 124.2 ms | 5 B | 5 KiB |
-| 40 文件 | 41 | 1614 ms | 1190 ms | 29.0 ms | 385 B | 161 KiB |
-| 202 文件 | 203 | 8051 ms | 5725 ms | 28.2 ms | 2106 B | 809 KiB |
+**上了什么**
 
-⇒ 复现了 `docs/create-local-first-design.md` §1.4 的 ~26–29 ms/条目：`fs/` 形状是**一条目一次
-NAS 往返**（载荷本身也按条目占块，≈4 KiB/条目）。`METRIC … create_attempts=6`（202 档）
-就是 §4.3 那条"`create_snapshot` 返回、另一个副本还没看到记录"的窗口，本轮撞到两次。
+| 面 | 位置 | 形状 |
+|---|---|---|
+| 写 | `envd_service/agent.py::_write_snapshot_tar` | 整棵树一个 tar；临时名 → `fsync` → `rename` → `.complete` 最后；N29 的幂等判据改成"`fs.tar` 或老 `fs/` 已存在" |
+| 读（主路） | `c3_agent/materialize.py::_take_snapshot_payload` | tar ⇒ 逐成员解包进**树根**；目录 ⇒ 原合并；tar 缺席而兄弟 `fs/` 在 ⇒ 回落 |
+| 读（降级路） | `envd_service/agent.py`（控制面没材料化时 worker 自己建树） | 同上两条腿 |
+| 推导 | `control_plane/file_ops.py::derive_materialize` | `copy_from` = `…/_snapshots/<id>/fs.tar` |
+| 加固（唯一实现） | `gateway_common/archive.py` | 成员过滤（绝对链接成员丢弃）+ `dest` 包含检查 + 截断/特殊文件具名拒绝；控制面与两个 agent import **同一个函数对象** |
+| 只读 store 探针 | `local_first_snapshot_verify.py`、`local_first_capacity_account.py` | 按 `gateway_common.paths.snapshot_payload` 认载荷，每行多 `payload_shape`（不改会把每个新快照报成 "record only"） |
 
-**上线后还要跑的两件（本次没做，因为要先把新镜像部署上去）**：① 同一条命令的三档**后测**
-（tar 形状，看 `mb_per_s` 与捕获耗时）；② 老快照那条腿 ——
-`restore_snapshot_probe.py` 的四个 id 复跑（**新代码读旧形状**的钉子）。命令见
-`docs/create-local-first-design.md` §7.6。
+**验收（2026-10-02，`0.1.0-892-g52044b8`，上一版本 `0.1.0-887` 是前测基线）**
 
-**本次只读观测**（无写操作，除探针自建的箱与快照）：卷上仍是 8 个 id（与 §4.1 一致）；
-四个可恢复的老快照**逐条单独跑**各绿（`46dc`/`4bf1` = `workspace/kept.txt` `kept\n`、
-`ce90` = 2000 条目 `lease/f0000.bin`、`962c` = `big/f0000.bin`）；但四个 id **一次跑完**时
-后两条拿到**空 body**（`JSONDecodeError: Expecting value: line 1 column 1`，§7.29 记过的同型），
-单独重跑各自绿 ⇒ "每条检查一个进程"解决的是连接复用，解决不了这一段（两条 2000 条目恢复
-连跑时控制面/入口侧仍会空答一次）。另外：探针崩掉那一轮留下的 202 档快照，它自己的
-`delete_snapshot` 之后**载荷目录还在卷上**，按副本各再删一次才清掉 —— §4.3 那条行为的
-再一次现场（本轮自建的载荷与幻影记录已全部清理，卷回到原样 8 个 id、`GET /sandboxes` = `[]`）。
+| 判据 | 命令 | 读数 |
+|---|---|---|
+| 一卷上的形状 | `snapshot_create_probe.py --files 1,40,202 --n 3 --keep` + 卷上 `ls`/`stat` | 三档都是 `fs.tar` + `snapshot.json` + `.complete`，**没有** `fs/`；tar 成员是 `workspace/…`；字节 **10 KiB / 90 KiB / 410 KiB**（旧 `du -s`：5 / 161 / 809 KiB ⇒ 202 档**占块减半**） |
+| 三档成本（后测） | 同上 | 捕获 p50 **157 / 478 / 1817 ms**（旧 180 / 1614 / 8051）；建箱 p50 **263 / 1426 / 6984 ms**（旧 248 / 1190 / 5725）；每条目 **131.6 / 34.8 / 34.4 ms**（旧 124.2 / 29.0 / 28.2）；`create_attempts` 3 / 3 / 3（本轮 202 档**没有**撞到两副本窗口） |
+| 新快照往返 | `snapshot_tar_roundtrip_probe.py --modes` | `failures=0`：`workspace/kept.txt`=`kept\n`、`workspace/deep/nested.txt` 在、`workspace/workspace/…` **不存在**、链接仍是链接、目录 **0770**、文件 **0644**；`chmod 664/777` 的文件恢复成 **644/755** |
+| fifo | `snapshot_tar_roundtrip_probe.py --fifo --expect-fifo-refusal` | 捕获**成功**、恢复**具名拒绝**（`502 … partial-copy: …/snap_…/fs.tar`）—— 旧读侧在 fifo 上会永久阻塞 |
+| 老 `fs/` 快照 | `restore_snapshot_probe.py --check …`（四个 id，每条一个进程） | **4/4**：`46dc`/`4bf1` = `workspace/kept.txt` `kept\n`、`ce90` = `lease/f0000.bin` 512 B、`962c` = `big/f0000.bin` 512 B；`workspace/workspace/…` 四条都不在 |
+| 舰队状态 | `kubectl -n sandlock get pods`、`GET /sandboxes` | 9 pod Running、`GET /sandboxes` = `[]`、卷上回到原来 **8 个 id**、`<export>/workspaces` 空 |
+| 单测 | `tmp/venv/bin/python -m pytest tests/unit -q` | `3 failed / 2243 passed / 12 skipped`（三条红是基线 macOS-only） |
+
+**两笔账与那条"越深越慢"**：捕获 ×3–4、占块减半；建箱慢 ~20%。根因不是 tar，而是
+**读侧的包含检查**：沙箱内同一棵 203 条目的树、同一个 NAS 上，旧读侧 `copytree` 13.0–13.4 s，
+stdlib `extractall(filter="data")` 11.5 s、本仓解包器 11.7 s（目的地深度 1）；把目的地埋到
+生产深度（5 段）后 `copytree` 仍 13.0 s，而两个 tar 读法变成 **16.0 s** —— `tarfile` 的
+`data` filter 对**每个成员**做一次 `realpath`（逐组件 `lstat`），成本随路径深度走，
+`copy_tree` 的每条目成本与深度无关。**Task 3 把树搬到节点本地盘后这条自然消失**（同一次
+`lstat` 从 NAS 的 4.4 ms 掉到 0.002 ms），详细账见设计文档 §3.2。
+
+**上线后发现的一条（本轮未上线，等下一次窗口）**：读侧守卫**第一版对每个成员多调一次
+`Path.resolve()`**（同样是逐组件 `lstat`）——沙箱内实测 13.0 s vs stdlib 11.5 s（+1.5 s/203
+条目 ≈ +7 ms/条目），正是"上线后建箱慢 ~20%"里**属于本任务**的那一半。已改成"每个目录检查
+一次并缓存"（11.7 s，与 stdlib 持平，且比旧读侧 `copytree` 还快），用例
+`test_the_parent_chain_is_checked_once_per_directory` 钉住；**它要下一次 rollout 才生效**。
+两副本的记录不一致（§4.3）本轮又撞到两次：`create_snapshot` 返回后另一个副本短暂
+`400 Template … not found`（前测那轮记到 `create_attempts=6`），以及 `delete_snapshot`
+只摘当次副本的载荷目录 —— 都按副本各删一次清干净。
+
+**没做的（明说）**
+
+* **按字节上限**（`E2B_TREE_COPY_MAX_BYTES`）与拷贝窗口：brief 没收这一步，按设计文档 §3.1
+  的表归 **Task 3**（它的措辞是树的淘汰上限）。成员数上限（tar 索引 ~430 B/成员）同归 Task 3。
+* **§4.3 的两副本记录失效**：裁定只观测、不改，本轮照办。
+* **读侧守卫的缓存修复**：已提交、未上线（下一次 rollout 带上它，顺带复核本节那张表）。
+* 老快照那一轮**没有**再出现空 body（§7.29 记的"两条 2000 条目连跑空答"）；一次都没撞到，
+  所以它是"这次没复现"，不是"已修"。
+
+**复跑**（全部在 `deploy/scripts/acceptance/`，不指 `tmp/`）
+
+```bash
+deploy/scripts/open-cluster-tunnel.sh          # 通道 + 身份自检（2 节点 / arm64 / +k0s）
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+export E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000
+export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets \
+    -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d | cut -d, -f1)
+
+# 三档（前/后对照，两个口径）+ 载荷形状
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
+    deploy/scripts/acceptance/snapshot_create_probe.py --files 1,40,202 --n 3 --keep
+
+# 形状那一腿：往返 + 模式夹取（--modes）、fifo（--fifo）
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
+    deploy/scripts/acceptance/snapshot_tar_roundtrip_probe.py --modes
+
+# 老快照那一腿（每条一个进程）
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
+    deploy/scripts/acceptance/restore_snapshot_probe.py \
+    --check 'snap_46dc467759dbbfb7:workspace/kept.txt:kept\n' \
+    --check 'snap_4bf1225dfbf54e0c:workspace/kept.txt:kept\n' \
+    --check 'snap_ce90ef9852fc6809:lease/f0000.bin' \
+    --check 'snap_962c14802d6cbd50:big/f0000.bin'
+```
+
+**回退**：代码只认"两种形状都收"，所以回退镜像**不需要**回退数据 —— 老 `fs/` 快照在任何
+一侧都能恢复；反过来，`fs.tar` 的载荷只被新读侧认，回退到 `0.1.0-887` 之前的镜像会让这些
+新快照**不可恢复**（记录在案，别只回镜像不停手）。
 
 ## 8. 改部署的入口
 

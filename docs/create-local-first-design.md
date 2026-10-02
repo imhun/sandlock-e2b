@@ -328,6 +328,50 @@ id 会回落到读盘，所以这个窗口只有几百毫秒）。探针现在�
 | `E2B_SNAPSHOT_COPY_WINDOW_BYTES` | 拷贝按 N 字节分窗，每窗后 `posix_fadvise(POSIX_FADV_DONTNEED)` 丢掉源/目标缓存 | 默认 **64 MiB**：把峰值从"树大小 ×2.9"压到"窗口 + 在途脏页"，与 §7.1 里"每 64 MiB fsync"同一个手法（那次修正正是为了不把 `maint` 打 OOM） |
 | `maint` 的 `memory` limit | `deploy/k8s/c3-agent.yaml` | **512 MiB → ≥ 2 GiB**（`agent` face A 可以不动：它一个卷都没挂）。若不动限额，就必须把上面的 tree 上限压到 **≤ 256 MiB** —— 但没有哪个默认沙箱配额比 256 MiB 更小，所以现实里是"抬限额"（§3.0 已经 OOM 过一次） |
 
+### 3.2 Task 2 上线之后：载荷的形状与两笔账（**实测替换估算**，2026-10-02，`0.1.0-892-g52044b8`）
+
+计划里那一句"快照打成 tar ⇒ 每个条目的 NAS 往返换成一次顺序文件"**只对了一半**。实测
+（命令见 §7.6；旧形状的同一组读数是 §1.4 的基线）：
+
+| 档（文件数） | 载荷条目 | 捕获 p50：旧 `fs/` → 新 `fs.tar` | 从快照建箱 p50：旧 → 新 | 建箱每条目：旧 → 新 | 捕获每条目：旧 → 新 |
+|---|---|---|---|---|---|
+| 1 | 2 | 180 → **157** ms | 248 → **263** ms | 124.2 → 131.6 ms | 90.2 → **78.4** ms |
+| 40 | 41 | 1614 → **478** ms | 1190 → **1426** ms | 29.0 → 34.8 ms | 39.4 → **11.7** ms |
+| 202 | 203 | 8051 → **1817** ms | 5725 → **6984** ms | 28.2 → 34.4 ms | 39.7 → **9.0** ms |
+
+⇒ **捕获 ×3–4（每条目 39.7 → 9.0 ms），建箱慢 ~20%（28.2 → 34.4 ms/条目）**。三条实测把这笔
+账拆开：
+
+1. **形状**（卷上实测）：`<export>/_snapshots/<id>/` = `fs.tar` + `snapshot.json` + `.complete`，
+   **没有** `fs/`；tar 的成员就是树根下的相对路径（`workspace/…`，没有 `./` 包裹层）。
+   载荷 10 KiB / 90 KiB / 410 KiB（`tarfile` 的记录块下限 10 KiB —— 2 个成员的小 tar 也是
+   10 KiB），旧形状 `du -s` 是 5 KiB / 161 KiB / 809 KiB ⇒ **202 档占块减半**（旧形状每个条目
+   一个 4 KiB inode，再加目录块）。
+2. **读侧本身更快**：沙箱内同一棵树、同一个 NAS 上跑三种读法（203 条目，n=3，目的地深度 1）：
+   旧读侧 `shutil.copytree` **13.0–13.4 s**、stdlib `extractall(filter="data")` **11.5 s**、
+   本仓共享解包器 **11.7 s**。
+3. **但读侧的成本随"目的地路径深度"走**（建箱变慢的根因，本轮新发现）：把目的地埋到生产
+   深度（5 段，对应 `<export>/workspaces/<sbx>/workspace/`）之后，`copytree` 仍是 **13.0 s**，
+   而 `extractall(filter="data")` / 共享解包器变成 **16.0 s**。根因：`tarfile` 的 `data` filter
+   对**每个成员**把目的地与成员目标各解析一次（`realpath`，逐组件 `lstat`）；目录是热的
+   （属性缓存命中），所以付费的是"新叶子 × 路径深度"，而 `copy_tree` 的每条目成本是目标侧
+   一次 create/write、**与深度无关**。
+
+**结论（Task 3 的输入）**：tar 的收益全在**写**侧，代价是**读**侧每条目一次包含检查。
+Task 3 把树落到节点本地盘之后，同一次 `lstat` 从 NAS 的 4.4 ms 掉到 0.002 ms（§1.4 的表），
+这条代价会自然消失；**在那之前它是这笔交易明码标价的一部分**，不许当成"没测到"。
+
+同轮的另外三条实测（评审预测 (c)/(e) 的现场）：
+
+* **模式夹取**（预测 c）：沙箱内 `chmod 664 / 777` 的两个文件恢复后是 **644 / 755**；目录仍是
+  **0770**；符号链接仍是链接。写侧 `tar.add` 记的是真实位，夹取发生在读侧的 `data` filter
+  （`mode & 0o755`，普通文件再 `| 0o600`）。
+* **fifo**（预测 c 第二半）：**捕获成功、恢复具名拒绝**（`502 … partial-copy: …/fs.tar`）——
+  特殊文件正是 `data` filter 拒的类。对照：**旧读侧在 fifo 上会永久阻塞**（`shutil.copyfile`
+  打开 fifo 等写者），所以这是"从挂死变成具名拒绝"。
+* **四个老 `fs/` 快照 4/4 恢复**，两条 2000 条目的**没有**再出现空 body（§7.29 那条），
+  预测 (e) 未复现。
+
 ---
 
 ## 4. 复核：`_snapshots` 合一（Step 2）
@@ -437,7 +481,7 @@ Task 0 把两个命名空间合成一处之后，这里独立复核"**合并无�
 
 | 任务 | 这份文档给的约束 |
 |---|---|
-| Task 2（快照 tar） | 路径只有一个根：`<export>/_snapshots/<id>/{snapshot.json, fs.tar, .complete}`（§4.1）；"只有记录"的 `015f`/`1ca5` 是 `status: failed`，不得替它们造载荷（§4.2）；tar 通道要带 §3.1 的 `E2B_TREE_COPY_MAX_BYTES`（快照 ≤ 树上限 1 GiB）；**还要处理 §4.3 的副本间记录不一致**（删除/新增记录不会跨副本失效）<br>**Task 2 落地时按 brief 的裁定收窄了两条，在此点名**：① 按字节上限（`E2B_TREE_COPY_MAX_BYTES`）**没有**随这一步做，它和"拷贝窗口"一起归 Task 3（§3.1 那张表本来就是"三件一起做"，而它的措辞是"单次拷贝的在途量"）；② §4.3 的记录不一致**只观测、不改**（裁定 5/7：`.complete` 与记录不归 Task 2 动）——本轮撞到并记录，见 §7.6 与 `docs/deploy-clusters.md` §7.30。③ 读侧**两种形状都收**：`fs.tar` 解包 + 既有 `fs/` 合并（写侧只出 tar），加固只有一份实现（`gateway_common/archive.py`，三个调用方 import 同一个函数对象），"这是哪一形状"也只有一份实现（`gateway_common.paths.snapshot_payload`，两个读 store 的验收探针也走它）；前后对照的复跑命令见 §7.6<br>**④ 解包的内存账要分两半说（评审轮 1 修正）**：**成员数据**是流式的（逐成员过 tarfile 的 64 KiB 缓冲，不再整包——§3.0 那次 OOM 的驱动项）；**成员索引**仍由 stdlib 保留（`TarFile.next()` 无条件 `members.append`，实测 ~430 B/成员：20 万成员 ⇒ 85.7 MB），所以"全是极小成员"的病态 tar 仍按成员数付费。**成员数上限与 Task 3 的字节上限一起做**，本轮只把它写进 `gateway_common/archive.py` 的模块说明与 §7.6 |
+| Task 2（快照 tar） | 路径只有一个根：`<export>/_snapshots/<id>/{snapshot.json, fs.tar, .complete}`（§4.1）；"只有记录"的 `015f`/`1ca5` 是 `status: failed`，不得替它们造载荷（§4.2）；tar 通道要带 §3.1 的 `E2B_TREE_COPY_MAX_BYTES`（快照 ≤ 树上限 1 GiB）；**还要处理 §4.3 的副本间记录不一致**（删除/新增记录不会跨副本失效）<br>**Task 2 落地时按 brief 的裁定收窄了两条，在此点名**：① 按字节上限（`E2B_TREE_COPY_MAX_BYTES`）**没有**随这一步做，它和"拷贝窗口"一起归 Task 3（§3.1 那张表本来就是"三件一起做"，而它的措辞是"单次拷贝的在途量"）；② §4.3 的记录不一致**只观测、不改**（裁定 5/7：`.complete` 与记录不归 Task 2 动）——本轮撞到并记录，见 §7.6 与 `docs/deploy-clusters.md` §7.30。③ 读侧**两种形状都收**：`fs.tar` 解包 + 既有 `fs/` 合并（写侧只出 tar），加固只有一份实现（`gateway_common/archive.py`，三个调用方 import 同一个函数对象），"这是哪一形状"也只有一份实现（`gateway_common.paths.snapshot_payload`，两个读 store 的验收探针也走它）；前后对照的复跑命令见 §7.6<br>**④ 解包的内存账要分两半说（评审轮 1 修正）**：**成员数据**是流式的（逐成员过 tarfile 的 64 KiB 缓冲，不再整包——§3.0 那次 OOM 的驱动项）；**成员索引**仍由 stdlib 保留（`TarFile.next()` 无条件 `members.append`，实测 ~430 B/成员：20 万成员 ⇒ 85.7 MB），所以"全是极小成员"的病态 tar 仍按成员数付费。**成员数上限与 Task 3 的字节上限一起做**，本轮只把它写进 `gateway_common/archive.py` 的模块说明与 §7.6<br>**⑤ 上线后的两笔账（实测，§3.2）**：捕获 ×3–4、占块减半；建箱慢 ~20%，根因是 `tarfile` 的 `data` filter 每条目一次 `realpath`（成本随目的地路径深度走），**Task 3 把树搬本地后消失** —— 这笔代价是明码标价的，不是"没测到" |
 | Task 3（树本地） | 节点预算 8 GiB 树 + 4 GiB 镜像缓存 ≈ 12 GiB / 68–75 GiB 空闲（§2.3）；**大块顺序写会从 ≈488 MB/s 掉到 124.9–125.5 MB/s**（§1.2），元数据快 475×（§1.1）——验收必须用"运行时 I/O"（小文件）而不是建箱延迟立论；**淘汰上限 = `E2B_TREE_COPY_MAX_BYTES` + 拷贝窗口**（§3.1），因为恢复路径 900 MiB 已经把 `maint` 顶到 512.0 MiB 并且**真的 OOM 过一次**（§3.0） |
 | Task 4（state 分家） | 裁定 1/3：`command-logs.jsonl` 可以本地、`_runtime/<id>/sandbox.json` 留共享（§5.1）；容量上本节点 state 是小文件，不是容量项（§2.3） |
 
@@ -506,10 +550,10 @@ kubectl -n sandlock exec -i <cp-pod> -c control-plane -- python3 - \
   < deploy/scripts/acceptance/local_first_snapshot_verify.py
 ```
 
-### 7.6 Task 2 的 tar 前后对照（1/40/202 三档）
+### 7.6 Task 2 的验收（三档前后对照 + 形状 + 老快照）
 
-`snapshot_create_probe.py` 现在一次跑完三档，并把两个口径都打出来：`per_entry_ms`
-（旧形状的单位，Task B 的 ~25 ms/条目就是它）与 `mb_per_s`（新形状的单位）。
+**上线记录与三张验收表在 `docs/deploy-clusters.md` §7.30**；这一节是可以照着重跑的那套命令。
+2026-10-02 实跑，版本 `0.1.0-892-g52044b8`（前测在 `0.1.0-887-g7ef319b` 上）。
 
 ```bash
 export E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000
@@ -519,15 +563,28 @@ env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
   deploy/scripts/acceptance/snapshot_create_probe.py --files 1,40,202 --n 3 --keep
 ```
 
-* `--keep` 把每档的快照留在卷上并打印 id，载荷本身的字节数从外面量：旧形状
-  `du -sb <export>/_snapshots/<id>/fs`，新形状 `stat -c %s …/fs.tar`（探针走 SDK，
-  看不见存储）。量完要删：`Sandbox.delete_snapshot()` 只摘**当次服务副本**的记录
-  （§4.3），两个副本各删一次才清干净。
+* `snapshot_create_probe.py` 一次跑完三档，并把两个口径都打出来：`per_entry_ms`
+  （旧形状的单位，Task B 的 ~25 ms/条目就是它）与 `mb_per_s`（新形状的单位）。
+* `--keep` 把每档的快照留在卷上并打印 id，载荷本身的字节数从外面量：新形状
+  `stat -c %s <export>/_snapshots/<id>/fs.tar` 与 `ls`（应当只有 `fs.tar`、`snapshot.json`、
+  `.complete`），老形状 `du -sb …/fs`（探针走 SDK，看不见存储）。量完要删：
+  `Sandbox.delete_snapshot()` 只摘**当次服务副本**的记录（§4.3），两个副本各删一次才清干净。
 * `create_attempts` 是"`create_snapshot` 返回、另一个副本还没看到记录"的那个窗口
   （§4.3）——探针记录并打印每次重试，不把窗口藏进"重试到绿"。
-* 老快照那条腿用 `restore_snapshot_probe.py`：四个 id 逐条给一个 `ID:PATH[:EXPECT]`
-  （命令见 `docs/deploy-clusters.md` §7.29 的复跑段）。它是**新代码读旧形状**的钉子：
-  读侧必须同时认 `fs.tar` 与 `fs/`。
+* **形状那一腿**用 `snapshot_tar_roundtrip_probe.py`：新快照必须卷上是 `fs.tar`、建箱后
+  `workspace/kept.txt` 在树根、链接仍是链接；`--modes` 报恢复后的模式（§3.2 的夹取读数），
+  `--fifo --expect-fifo-refusal` 报 fifo 的"捕获成功 / 恢复具名拒绝"。
+
+```bash
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
+  deploy/scripts/acceptance/snapshot_tar_roundtrip_probe.py --modes
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
+  deploy/scripts/acceptance/snapshot_tar_roundtrip_probe.py --fifo --expect-fifo-refusal
+```
+
+* **老快照那条腿**用 `restore_snapshot_probe.py`：四个 id 逐条给一个 `ID:PATH[:EXPECT]`
+  （复跑命令在 `docs/deploy-clusters.md` §7.29；2026-10-02 在 `0.1.0-892` 上 **4/4**，读数见
+  §3.2）。它是**新代码读旧形状**的钉子：读侧必须同时认 `fs.tar` 与 `fs/`。
 * 两个**只读 store 探针**（§7.5 的 `local_first_snapshot_verify.py` 与 §7.3 的
   `local_first_capacity_account.py`）现在按 `gateway_common.paths.snapshot_payload` 认载荷，
   每行多一个 `payload_shape`（`"tar"` / `"dir"`）：Task 2 之前它们写死 `fs`，上线后会把每个

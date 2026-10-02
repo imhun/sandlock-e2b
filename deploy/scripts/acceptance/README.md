@@ -121,6 +121,7 @@
 | `sdkflake-cacheprobe.py` | Measure the image-cache maintenance walk that sits inside the first-command path. | `Usage: python tmp/sdkflake-cacheprobe.py [cache-dir]`（旧拼写） |
 | `sec-run-probe.sh` | Reusable runner: the prod-shaped capability set the sandlock create path needs. | —（头部无 Usage 行；见脚本头部） |
 | `slot_cap_probe.py` | 量一件事：route-B 槽位（=路径中介进程）与被 confine 的子进程各自持有哪些 cap。 | —（头部无 Usage 行；见脚本 `--help`） |
+| `snapshot_tar_roundtrip_probe.py` | Task 2 上线验收的"形状"那一腿：新快照卷上是 `fs.tar`、建箱回到树根、链接仍是链接；`--modes` 报恢复后的模式（`data` filter 的夹取读数）；`--fifo --expect-fifo-refusal` 报"捕获成功 / 恢复具名拒绝"。 | `tmp/venv/bin/python deploy/scripts/acceptance/snapshot_tar_roundtrip_probe.py --modes`（要 `E2B_API_URL`/`E2B_SANDBOX_URL`/`E2B_API_KEY`；`--keep` 留下快照） |
 | `sync-seccomp-installer.py` | Re-embed `deploy/seccomp/sandlock-worker.json` into the ConfigMap installer. | `python3 tmp/k0s/sync-seccomp-installer.py`（dry run）/ `… --write`（旧拼写） |
 | `t1-ownership-probe.py` | O1/T1 re-measurement on the live fleet: who owns a file the sandbox writes? | —（头部无 Usage 行；见脚本 `--help`） |
 | `task8_fup3_probe.py` | M4 Task 8 (FUP-E3) Step 1 probe: record the exact rejection shape. | —（头部无 Usage 行；见脚本 `--help`） |

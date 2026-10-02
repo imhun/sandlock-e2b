@@ -53,6 +53,7 @@ path.
 from __future__ import annotations
 
 import os
+import stat
 import tarfile
 from pathlib import PurePosixPath
 from pathlib import Path
@@ -66,14 +67,6 @@ ARCHIVE_IS_CORRUPT = "archive-is-corrupt"
 #: The caller's destination is not a directory to unpack into.
 PARTIAL_UNPACK = "partial-unpack"
 
-#: ``tarfile.FilterError`` is 3.12+; older interpreters only have ``TarError``.
-_FILTER_ERRORS: tuple[type[BaseException], ...] = tuple(
-    error
-    for error in (getattr(tarfile, "FilterError", None),)
-    if error is not None
-)
-
-
 class ArchiveRefusal(Exception):
     """A named, fail-closed refusal from one archive extraction."""
 
@@ -83,28 +76,118 @@ class ArchiveRefusal(Exception):
         self.detail = detail
 
 
-def _member_target(dest_resolved: Path, dest: Path, name: str) -> Path:
-    """Where one member lands, or a named refusal.
+def _guard_member(dest: Path, name: str, safe_parents: set[str]) -> None:
+    """Refuse a member whose *name* or whose *path* leaves the destination.
 
-    The two escapes are named apart on purpose: a member whose name walks out
-    is a broken archive, while a clean name that still resolves outside means
-    the destination itself holds a link on the way -- the failure the caller
-    has to be able to name (``materialize.py`` refuses a tree whose previous
-    incarnation left a link there).
+    The two escapes are named apart on purpose: a name that walks out (``..``,
+    an absolute path) is a broken archive, while a clean name whose parent
+    component is a symbolic link in the destination is the failure the caller
+    has to be able to name (``materialize.py`` turns it into its own
+    ``destination-is-a-symlink``, the §4.3.1 rule that a tree refusing to be
+    written through is not the same event as a corrupt payload).
+
+    **The parent check is cached per directory** and that cache is the whole
+    reason this is affordable. Resolving each member's own path against the
+    destination costs one ``lstat`` per component *per member*, and on the
+    shared NAS that is a metadata round trip: measured 2026-10-02 inside one
+    sandbox over 203 members, the shared extractor was **13.0 s** against
+    stdlib ``extractall(filter="data")``'s **11.0 s** -- ~2 ms per member of
+    pure re-checking, which would have made the whole tar task a regression on
+    the restore leg. With the cache the check is an ``lstat`` per *distinct
+    parent directory* (one, for a snapshot's ``workspace/``) plus a set lookup
+    per member. Parent components are only ever added to ``safe_parents`` after
+    every one of their own components was ``lstat``-ed and found not to be a
+    link, and the extraction has the tree to itself (the sandbox is frozen for
+    a capture and not yet running for a restore), so a cached decision cannot
+    be invalidated underneath us.
     """
     parts = PurePosixPath(name).parts
     if not name or name.startswith("/") or any(part == ".." for part in parts):
         raise ArchiveRefusal(
             MEMBER_ESCAPES, f"archive member {name!r} escapes the destination"
         )
-    target = (dest / name).resolve()
-    if not target.is_relative_to(dest_resolved):
+    parent = PurePosixPath(*parts[:-1])
+    key = str(parent)
+    if key in safe_parents:
+        return
+    probe = dest
+    for part in parts[:-1]:
+        probe = probe / part
+        try:
+            info = os.lstat(probe)
+        except FileNotFoundError:
+            # Nothing is there yet, so nothing can be a link: every component
+            # from here down is one this extraction makes itself.
+            break
+        except OSError as exc:
+            raise ArchiveRefusal(
+                PARTIAL_UNPACK, f"cannot inspect {probe}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ArchiveRefusal(
+                DESTINATION_IS_A_SYMLINK,
+                f"the destination holds a symbolic link at {part!r} on the "
+                f"way to {name!r}: refusing to write through it",
+            )
+    safe_parents.add(key)
+
+
+def _guard_directory(dest: Path, name: str) -> None:
+    """A directory member's *own* path may not be a link in the destination.
+
+    ``workspace/`` is one member out of a snapshot's thousands, so this check
+    costs one ``lstat`` per *directory* rather than per entry -- and it is the
+    one that matters most: writing a directory through a link puts a whole
+    subtree somewhere the tree never named. A **file** member whose own name is
+    a link in the destination is left to ``tarfile``'s own ``data`` filter: it
+    refuses any target that resolves outside the destination (which is what an
+    escape looks like), and a link that stays inside the destination lands the
+    bytes elsewhere *in the same tree*, which is a shape this module documents
+    rather than replicates. The directory-less copy path (``copy_tree``) is
+    stricter there; the difference is named in the module docstring.
+    """
+    try:
+        info = os.lstat(dest / name)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ArchiveRefusal(
+            PARTIAL_UNPACK, f"cannot inspect {dest / name}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(info.st_mode):
         raise ArchiveRefusal(
             DESTINATION_IS_A_SYMLINK,
-            f"the destination holds a symbolic link on the way to {name!r}: "
-            "refusing to write through it",
+            f"the destination holds a symbolic link at {name!r}: refusing to "
+            "write through it",
         )
-    return target
+
+
+def _named_filter(member, dest_path):
+    """``tarfile``'s ``data`` filter, with its refusals translated by name.
+
+    The stdlib filter is the **independent second layer**: every member is
+    resolved against the destination again, whoever else looked at it (the same
+    doctrine as the control plane's derivation plus the agent's own re-check).
+    Its errors are the shapes callers have to tell apart, so they are named
+    here instead of surfacing as one bare ``TarError`` -- and the (cheap)
+    classification runs on the error path only, so the happy path costs exactly
+    what stdlib's filter costs.
+    """
+    try:
+        return tarfile.data_filter(member, dest_path)
+    except tarfile.TarError as exc:
+        raise ArchiveRefusal(_reason_for_filter_error(exc), str(exc)) from exc
+
+
+def _reason_for_filter_error(exc: BaseException) -> str:
+    """Which named refusal one of stdlib's filter errors is."""
+    name = type(exc).__name__
+    if "LinkOutside" in name or "Outside" in name:
+        # "The path this member lands on resolves outside the destination" --
+        # a name that walks out is caught before we get here, so what is left
+        # is a link (the destination's or the archive's) on the way.
+        return DESTINATION_IS_A_SYMLINK
+    return MEMBER_ESCAPES
 
 
 def extract_sandbox_archive(archive_path: Path, dest: Path) -> int:
@@ -120,6 +203,7 @@ def extract_sandbox_archive(archive_path: Path, dest: Path) -> int:
             PARTIAL_UNPACK, f"the destination {destination} is not a directory"
         )
     written = 0
+    safe_parents: set[str] = set()
     try:
         with tarfile.open(Path(archive_path), "r:*") as tar:
             for member in tar:
@@ -127,17 +211,20 @@ def extract_sandbox_archive(archive_path: Path, dest: Path) -> int:
                     # A volume mount from the source node: the path does not
                     # exist here and provisioning re-creates it.
                     continue
-                _member_target(resolved_dest, destination, member.name)
+                _guard_member(destination, member.name, safe_parents)
+                if member.isdir():
+                    _guard_directory(destination, member.name)
                 try:
-                    tar.extract(member, destination, filter="data")
+                    tar.extract(member, destination, filter=_named_filter)
                 except TypeError:  # pragma: no cover - Python < 3.12
                     tar.extract(member, destination)
                 written += 1
+    except ArchiveRefusal:
+        raise
     except (tarfile.TarError, EOFError) as exc:
-        reason = (
-            MEMBER_ESCAPES if isinstance(exc, _FILTER_ERRORS) else ARCHIVE_IS_CORRUPT
-        )
-        raise ArchiveRefusal(reason, f"{archive_path}: {exc}") from exc
+        raise ArchiveRefusal(
+            ARCHIVE_IS_CORRUPT, f"{archive_path}: {exc}"
+        ) from exc
     except OSError as exc:
         raise ArchiveRefusal(PARTIAL_UNPACK, f"{archive_path}: {exc}") from exc
     return written
