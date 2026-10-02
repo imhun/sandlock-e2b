@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python（`control_plane/`、`c3_agent/`、`envd_service/`、`gateway_common/`）、k8s（k0s、arm64）、NFS（阿里云 NAS）+ 节点 ESSD、tar。
 
-## 当前进度（2026-10-02，**Task 0 已完成并上线**）
+## 当前进度（2026-10-02：**Task 0–5 已完成并上线**；Task 6 的验收跑过、修复待部署）
 
 **已完成 —— Task 0 全部（Step 1–8），线上版本 `0.1.0-887-g7ef319b-20261002-100406`**
 
@@ -26,7 +26,12 @@
 | 上线（Step 7 的停机那一半） | ✅ | `docs/deploy-clusters.md` §7.29。顺序：关自动扩缩器（新坑，见 §7.29）→ worker 缩 0 → 迁移 → apply → 起 worker；迁移 `done=14`，`GET /sandboxes`=`[]`，`DRY_RUN` diff 0 行 |
 | 上线当场抓到的一次回归 | ✅ 已前滚修 | `derive_materialize` 的 `copy_from` 指向树根 ⇒ 从快照建箱全 502；`7ef319b` 修 + 复验（4/4 老快照恢复）|
 
-**没做**：Task 1–6 全部未开始（介质翻转在 Task 3，快照 tar 在 Task 2）。
+**进度（2026-10-02 更新）**：**Task 0–5 已完成并上线**（版本线见 `docs/deploy-clusters.md`
+§7.33：`0.1.0-887` 根重切 → `0.1.0-892/895` 快照 tar → `0.1.0-900` 本节点 state →
+`0.1.0-905` 树本地化 → `0.1.0-908` 两条上线后修复），本节下方 Task 1–5 的勾选就是它们的
+落地记录。**Task 6（跨切面验收）**：冒烟先红后绿（N59/N60/N61 三个独立问题，见
+`docs/deploy-clusters.md` §7.33.4），N59 的代码修复 `32f3667` **尚未部署** —— 它的 Step
+在本轮上线之前保持未勾选。
 
 ⚠ **上线顺序已执行过一次**（`308b543` + `4ac410b` 同一次上线，2026-10-02）。下一个动到根的提交要照 §7.29 那套走：**先 `E2B_AS_ENABLED=false` 关掉抢副本的循环，再 worker 缩到 0 → 迁移（先 dry-run）→ apply 新清单 → 起 worker → 验证**。回退窗口仍然开着：`state/.state-base-migration.journal` + `migrate-state-base.sh --rollback --apply`，但**回退后必须同时回退镜像**。
 
