@@ -833,7 +833,8 @@ def test_k0s_overlay_sinks_the_tree_root_and_keeps_state_as_a_sibling() -> None:
     )
     # ...and the worker can actually reach it: naming a hostPath is not
     # mounting it, and an unmounted base is a pod whose first create dies on
-    # ENOENT for `<node_state>/.uid_pool.lock`.
+    # ENOENT for `<node_state>/_runtime/<id>/.creating` (N57: the pool's own
+    # `.uid_pool.lock` lives on the *shared* `E2B_STATE_BASE`, not here).
     pod = worker["spec"]["template"]["spec"]
     mounts = {m["name"]: m["mountPath"] for m in pod["containers"][0]["volumeMounts"]}
     assert mounts["node-state"] == env["E2B_NODE_STATE_BASE"]
@@ -944,9 +945,10 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
 
     Four failures this pins, all measured elsewhere in N27 (the fourth in N57):
 
-    * ``<state>`` missing -- ``uid_pool.acquire`` opens ``<state>/.uid_pool.lock``
-      with ``O_CREAT`` under the base it is handed, so the *first*
-      ``Sandbox.create()`` would die with ENOENT instead of handing out a uid;
+    * ``<state>`` (the shared base) missing -- ``uid_pool.acquire`` opens the
+      *shared* ``<state>/.uid_pool.lock`` with ``O_CREAT`` under the base it is
+      handed (N57), so the *first* ``Sandbox.create()`` would die with ENOENT
+      instead of handing out a uid;
     * ``.checkpoints`` at the wrong mode -- the store's gate has to be
       traversable by the pooled sandbox uid (the slot is what writes the image)
       and listable by nobody, which is ``0711``; ``0700`` there is the
@@ -1077,9 +1079,9 @@ def test_the_retired_brokers_owner_inits_moved_into_the_agent() -> None:
     * ``workspace-root-init`` created the platform's own roots on a fresh
       volume. Two of them are ``subPath`` sources (`<workspaces>` for the
       worker, `<state>` for the control plane) -- a missing source keeps that
-      pod in ``ContainerCreating`` forever -- and `<state>` is where
-      ``uid_pool.acquire`` opens ``<state>/.uid_pool.lock``, so a missing base
-      turns the first ``Sandbox.create()`` into ENOENT;
+      pod in ``ContainerCreating`` forever -- and the *shared* `<state>` (N57)
+      is where ``uid_pool.acquire`` opens ``<state>/.uid_pool.lock``, so a
+      missing base turns the first ``Sandbox.create()`` into ENOENT;
     * ``image-cache-init`` handed the two caches to uid 65534 (top-level
       non-recursive, ``_oci/`` recursive, ``secrets/`` directories only). A
       root-owned ``/var/lib/e2b-images`` is an EACCES at the first

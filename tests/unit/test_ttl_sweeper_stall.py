@@ -251,7 +251,7 @@ async def test_a_round_that_outlives_three_intervals_is_named(caplog):
     finally:
         await sweeper.stop()
     assert _messages(caplog, level=logging.WARNING) == [
-        "TTL sweep: a round took 4.00s (>= 3 x the 1.0s cadence) and reaped 1 "
+        "TTL sweep: a round took 4.00s (> 3.0x the 1.0s cadence) and reaped 1 "
         "record(s); the fleet-wide claim expired while it ran, so a peer may "
         "have started its own round too -- this round's teardown is not lost"
     ]

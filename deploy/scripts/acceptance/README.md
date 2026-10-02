@@ -76,7 +76,7 @@
 | `n42-egress-probe.py` | N42 acceptance on the live fleet: does `allow_internet_access=True` reach out? | —（头部无 Usage 行；见脚本 `--help`） |
 | `netns-node-compare.py` | Per-node comparison: SDK command RTT, MCP /mcp RTT, wildcard DNS. | —（头部无 Usage 行；见脚本 `--help`） |
 | `node-mmap-storage.sh` | Same kernel, four storages: does a mapped store past EOF extend the file? | —（头部无 Usage 行；见脚本头部） |
-| `node_state_split_local_probe.py` | Task 4 的**本地**尺子（不连集群）：在真 app 里跑一次 `phase: prepare`，用 `sys.addaudithook` 只数落在共享 `E2B_STATE_BASE` 下的路径操作，再开一个 `E2B_NODE_STATE_BASE` 对照。2026-10-02 本机读数：writes **14 → 0**、reads 2 → 2（只读的那两次是舰队 uid 账本的索引，必须留共享）。量的是机制，不是延迟。 | `PYTHONPATH=. tmp/venv/bin/python deploy/scripts/acceptance/node_state_split_local_probe.py` |
+| `node_state_split_local_probe.py` | Task 4 的**本地**尺子（不连集群）：在真 app 里跑一次 `phase: prepare`，用 `sys.addaudithook` 只数落在共享 `E2B_STATE_BASE` 下的路径操作，再开一个 `E2B_NODE_STATE_BASE` 对照。2026-10-03 本机读数（N57 修后复跑）：writes **`before=14 / after=4`** —— 那 4 笔正好是池自己的 `.uid_pool.lock` 与 `.uid_reservations/`（N57 把它们挪回共享 base 的代价，只在回落形状上付；`claim` 档 `pool-own writes=0/reads=0`）；reads 2 → 2（只读的那两次是舰队 uid 账本的索引，必须留共享）。量的是机制，不是延迟。 | `PYTHONPATH=. tmp/venv/bin/python deploy/scripts/acceptance/node_state_split_local_probe.py` |
 | `overlay-probe.sh` | 在不改云网络的前提下，验证封装型 overlay 能不能跨这两个节点工作。 | —（头部无 Usage 行；见脚本头部） |
 | `phase1-probe2.sh` | —（头部没写） | —（头部无 Usage 行；见脚本头部） |
 | `phase2.sh` | test-prod-shaped.sh's phase 2 (the unprivileged worker), runnable on its own. | `sh deploy/scripts/acceptance/phase2.sh <log>` |

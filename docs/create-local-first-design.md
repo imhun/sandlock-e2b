@@ -239,7 +239,7 @@ n = 10 个命名空间 + 8 个快照 id + 2 个节点）。命令见 §7.3。
 |---|---|---|
 | `<state>/_runtime/<id>/.creating`、`disk-stats` | 建箱 `prepare` 的 NFS 原子写 | 只有本节点读；**但它与 `sandbox.json` 同目录**，要拆先拆路径（Task 4 —— **已上线（`0.1.0-900`，读数 `docs/deploy-clusters.md` §7.31：`prepare` 72–76 → 7.4 ms）**：路径在 `E2B_NODE_STATE_BASE`，记录留共享） |
 | `<state>/.route-b/**` | slot 起停的小写 | 读者是本节点 slot 进程（沙箱 uid），权限要跟着走 |
-| `<state>/.uid_pool.lock`、`.uid_reservations/` | 池操作的 NFS 往返 | 全舰队口径来自 `sandbox.json`，不是这里 |
+| ~~`<state>/.uid_pool.lock`、`.uid_reservations/`~~ **不能本地化（N57 已反悔）** | （原以为能省）池操作的 NFS 往返 | Task 4 曾把它们挪到节点本地，但 `UidPool.acquire` 的"读记录 → 挑 uid → 写标记"临界区**必须跨节点互斥**，锁与预约标记就是那个串行点；N57（`12d8c43`+`bfab008`+`6b4b349`）已把它们挪回共享 `E2B_STATE_BASE`（`claim` 常态路径不碰它们，所以出厂路径不付这笔） |
 | `<state>/_runtime/<id>/command-logs.jsonl` | 日志写的往返 | 裁定 1：远程形态 CP 是**代理**读，直读只属 `local://` |
 | 卷切片 `<volume>/<id>` | 挂载/配额几步 | 卷已按 `volume_node_id` 把沙箱钉在节点上；本轮**不动** |
 | `_untrusted.trees/`、`_pure_rootfs/`、`_migrate` | 小 | 同节点；`_migrate` 已上浮（Task 0） |

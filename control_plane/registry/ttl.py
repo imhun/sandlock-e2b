@@ -100,12 +100,22 @@ class TTLSweeper:
             self._reaped += reaped
             self._last_round_s = seconds
             if seconds > self._overrun_after_s:
+                # N61 minor: the factor comes from the threshold itself, so a
+                # retuned ``overrun_after_s`` cannot make this sentence lie
+                # (there used to be a second truth source: a hardcoded "3 x").
+                # ``>`` matches the strict trigger above, not ``>=``.
+                factor = (
+                    self._overrun_after_s / self._interval
+                    if self._interval
+                    else 0.0
+                )
                 logger.warning(
-                    "TTL sweep: a round took %.2fs (>= 3 x the %.1fs cadence) "
+                    "TTL sweep: a round took %.2fs (> %.1fx the %.1fs cadence) "
                     "and reaped %d record(s); the fleet-wide claim expired "
                     "while it ran, so a peer may have started its own round "
                     "too -- this round's teardown is not lost",
                     seconds,
+                    factor,
                     self._interval,
                     reaped,
                 )

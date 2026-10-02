@@ -334,11 +334,14 @@ spec:
               # went looking with the old path.)
               mkdir -p "$state"
               # N57 / Task 4: the **node-local** half of that state. The worker
-              # opens `<node_state>/.uid_pool.lock` and writes the create's
-              # `.creating` marker and `disk-stats` seed under
-              # `<node_state>/_runtime/<id>/`, and the route-B slot documents
-              # go to `<node_state>/.route-b/...`. This is a hostPath on the
-              # node's own disk (the same one `E2B_IMAGE_CACHE_DIR` uses), so
+              # writes the create's `.creating` marker and `disk-stats` seed
+              # under `<node_state>/_runtime/<id>/`, and the route-B slot
+              # documents go to `<node_state>/.route-b/...`. (N57: the pool's
+              # own `.uid_pool.lock` / `.uid_reservations/` are *not* here --
+              # they live on the shared `E2B_STATE_BASE` so `acquire`'s
+              # critical section is mutually exclusive across nodes.) This is
+              # a hostPath on the node's own disk (the same one
+              # `E2B_IMAGE_CACHE_DIR` uses), so
               # NFS's root_squash rules do not apply -- the hand-over is a plain
               # local chown, and it is *this* container's job because it is the
               # one that runs as root with the volume mounted; unlike
@@ -348,9 +351,10 @@ spec:
               # Owner 65534, the worker's uid: it is the one root here the
               # non-root worker writes into, and a root-owned 0755 would make
               # the first `Sandbox.create()` fail with `Permission denied:
-              # <node_state>/.uid_pool.lock`. Verified right here (and strictly
-              # -- see below), so a node whose path is styled wrongly stops this
-              # pod with the one-time fix instead of failing every create.
+              # <node_state>/_runtime/<id>/.creating`. Verified right here (and
+              # strictly -- see below), so a node whose path is styled wrongly
+              # stops this pod with the one-time fix instead of failing every
+              # create.
               mkdir -p "$node_state"
               chown 65534:65534 "$node_state" 2>/dev/null ||
                 echo "workspace-root-init: chown refused ($node_state)"
@@ -365,7 +369,7 @@ spec:
               # root could fail to chown -- a node that cannot is broken, and a
               # world-writable state base would hide that instead of naming it.
               if [ "$node_state_owner" != "65534" ]; then
-                echo "workspace-root-init: FATAL: $node_state is owned by uid $node_state_owner, not the worker uid 65534: the worker opens .uid_pool.lock there and writes every create's marker and accounting seed under it, so every Sandbox.create() would fail with EACCES" >&2
+                echo "workspace-root-init: FATAL: $node_state is owned by uid $node_state_owner, not the worker uid 65534: the worker writes every create's marker and accounting seed under it (and the route-B slot documents), so every Sandbox.create() would fail with EACCES" >&2
                 echo "workspace-root-init: fix it once on the node: chown 65534:65534 $node_state" >&2
                 exit 1
               fi

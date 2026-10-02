@@ -5,9 +5,10 @@ was that the accounting was right the whole time: what held the quota were real
 sandbox records for sandboxes nobody ever killed (four from Task 3's acceptance
 window, four from a smoke loop whose ``kill()`` was cut short). On the
 node-local shape a leaked sandbox holds its node slot indefinitely, and
-``select_and_reserve`` gives up when the store refuses instead of trying the
-next candidate -- so the fleet went from "a few leftovers" to
-``503 No resources available`` everywhere.
+``select_and_reserve`` **used to** give up when the store refused instead of
+trying the next candidate (N60, fixed in this batch: it now walks the ranked
+candidates and only answers ``503`` when they are exhausted) -- so the fleet
+went from "a few leftovers" to ``503 No resources available`` everywhere.
 
 * the **view** half already healed when a worker re-registered
   (``NodeRegistry.set_reserved``, fed by ``_rebuild_node_reservations``);
