@@ -12,6 +12,9 @@
 set -euo pipefail
 
 . "$(cd "$(dirname "$0")" && pwd)/lib/helpers.sh"
+#: 自检 = `deploy/scripts/lib/cluster-guard.sh` 的 `require_target_cluster`（写侧脚本用的同一道
+#: 闸门；期望值只在那一个文件里）。这里只负责判定，建通道仍是本脚本的活。
+. "$SCRIPT_DIR/lib/cluster-guard.sh"
 
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONTROL_PLANE_IP="${K0S_CONTROL_PLANE_IP:-172.18.80.94}"
@@ -20,11 +23,6 @@ KUBECONFIG_PATH="${K0S_KUBECONFIG:-$REPO_ROOT/tmp/k0s/kubeconfig}"
 SOCK="${K0S_BASTION_SOCK:-/tmp/k0s-bastion-root.sock}"
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
-
-#: 目标集群的形状；自检拿它比对。宁可报错，也不要打在别人的集群上。
-EXPECTED_NODES=2
-EXPECTED_ARCH=arm64
-EXPECTED_VERSION_SUBSTR='+k0s'
 
 export K0S_BASTION_SOCK="$SOCK"
 
@@ -86,31 +84,8 @@ fi
 
 export KUBECONFIG="$KUBECONFIG_PATH"
 
-say "④ 自检：连到的是不是本项目的集群"
-json="$REPO_ROOT/tmp/k0s/.nodes-check.$$.json" # 临时文件放项目内 tmp/（不用系统 /tmp，见全局规范）
-mkdir -p "$(dirname "$json")"
-trap 'rm -f "$json"' EXIT
-kubectl get nodes -o json > "$json"
-python3 - "$json" "$EXPECTED_NODES" "$EXPECTED_ARCH" "$EXPECTED_VERSION_SUBSTR" <<'PY'
-import json, sys
-path, want_n, want_arch, want_ver = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
-items = json.load(open(path))["items"]
-nodes = [(i["metadata"]["name"], i["status"]["nodeInfo"]["architecture"],
-          i["status"]["nodeInfo"]["kubeletVersion"]) for i in items]
-bad = []
-if len(nodes) != want_n:
-    bad.append(f"节点数 {len(nodes)} != {want_n}")
-for name, arch, ver in nodes:
-    if arch != want_arch:
-        bad.append(f"{name}: 架构 {arch} != {want_arch}")
-    if want_ver not in ver:
-        bad.append(f"{name}: 版本 {ver} 不含 {want_ver}")
-for name, arch, ver in nodes:
-    print(f"   {name}  {arch}  {ver}")
-if bad:
-    sys.exit("✗ 这不像是本项目的集群（或它变了）：\n  - " + "\n  - ".join(bad))
-print(f"✓ {want_n} 节点 / {want_arch} / 含 {want_ver}")
-PY
+say "④ 自检：连到的是不是本项目的集群（require_target_cluster）"
+require_target_cluster "$KUBECONFIG_PATH"
 
 echo "   sandlock namespace: $(kubectl -n sandlock get pods --no-headers 2>/dev/null | wc -l | tr -d ' ') 个 pod"
 

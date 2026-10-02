@@ -11,6 +11,12 @@
 #   DRY_RUN=1 ... deploy/k8s-k0s/apply.sh             # 只渲染不 apply
 #   SKIP_WARM=1 ... deploy/k8s-k0s/apply.sh           # 不预热 base image
 #
+# **集群身份闸门（在任何 kubectl 之前，DRY_RUN 也要过）**：调用
+# `deploy/scripts/lib/cluster-guard.sh` 的 `require_target_cluster` —— KUBECONFIG 必须显式设置、
+# server 必须含 `+k0s`、节点必须是 2 × arm64 × `+k0s`，不符即 exit 2 并点名实际值。这是
+# 2026-10-02 那次「没带 KUBECONFIG 的 `apply.sh -h` 打到了默认 context 的 ACK 集群」的兜底
+# （docs/deploy-clusters.md §7.34.1）。
+#
 # **stdout 只放渲染结果，其余（进度、诊断、错误）一律 stderr。** 这样 DRY_RUN 的
 # 输出是可以直接喂给 kubectl 的数据流：
 #   DRY_RUN=1 deploy/k8s-k0s/apply.sh 2>/dev/null | kubectl apply --dry-run=server -f -
@@ -34,6 +40,10 @@ if [ -z "$VERSION" ]; then
 fi
 
 command -v kubectl >/dev/null || { echo "缺少 kubectl" >&2; exit 1; }
+
+#: 认集群：写操作（包括 DRY_RUN 的渲染）之前先断言目标集群的身份，不通过就 exit 2。
+. "$REPO_ROOT/deploy/scripts/lib/cluster-guard.sh"
+require_target_cluster
 
 # 只改 e2b-sandlock-* 的 tag；redis/基础镜像的 tag 是有意义的，不能跟着换。
 rendered="$(kubectl kustomize "$HERE" \

@@ -16,6 +16,21 @@
 > 自建 k0s 集群（清单 overlay + 集群怎么起 + 已知未完成项）见
 > [`deploy/k8s-k0s/README.md`](../k8s-k0s/README.md)。
 
+## 集群身份闸门（写侧脚本通用）
+
+写侧的 k8s 脚本在碰集群之前必须过 [`lib/cluster-guard.sh`](lib/cluster-guard.sh) 的
+`require_target_cluster`（`deploy/k8s-k0s/apply.sh` 连 **DRY_RUN 都算**）：`KUBECONFIG` 必须
+**显式设置**（且文件存在）、server `gitVersion` 必须含 `+k0s`、节点必须是 `E2B_TARGET_NODES`
+（默认 2）× `arm64` × `kubeletVersion` 含 `+k0s`；不符即 `exit 2` 并点名 context / server
+版本 / 每台节点的架构与版本。原因：本机 `kubectl` 的默认 context 指向**另一套阿里云 ACK
+集群**，不加 `KUBECONFIG` 的写操作会**安静地**打到那边 —— 2026-10-02 真的发生过一次，
+见 [`docs/deploy-clusters.md`](../../docs/deploy-clusters.md) §7.34.1。
+
+```bash
+cd <仓库根>
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"   # 没有就先跑 open-cluster-tunnel.sh
+```
+
 连接拓扑：本机 → 堡垒机 `root@172.18.74.236`（key `~/.ssh/id_pub` + 口令）→
 目标机 `root@172.18.80.140`（堡垒机免密）→ 应用用户 `deploy`（docker 组）。
 

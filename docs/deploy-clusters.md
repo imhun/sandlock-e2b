@@ -44,6 +44,15 @@ kubectl -n sandlock get pods
 **错的**：7 个节点、`v1.34.3-aliyun.1`、IP 是 `172.18.93.x`/`94.x`、`sandlock` 报
 `namespaces "sandlock" not found` ⇒ **一行写操作都不要做**，先修 kubeconfig。
 
+**写侧脚本自带闸门（2026-10-03 起）**：上面这套判断已经是代码 ——
+[`deploy/scripts/lib/cluster-guard.sh`](../deploy/scripts/lib/cluster-guard.sh) 的
+`require_target_cluster`。判据 = `KUBECONFIG` **显式设置**（且文件存在、不是路径列表）+
+`kubectl version -o json` 的 server `gitVersion` 含 `+k0s` + 节点数（默认 2，`E2B_TARGET_NODES`
+可覆盖）× `arm64` × `kubeletVersion` 含 `+k0s`。不符即 `exit 2` 并**点名实际值**
+（context / server 版本 / 每台节点的架构与版本）。`deploy/k8s-k0s/apply.sh` 在任何 kubectl
+之前调用它（**DRY_RUN 也要过闸**），`open-cluster-tunnel.sh` 的第 ④ 步自检也换成同一个助手
+—— 期望值只有这一个真相源。这道闸是哪次事故的兜底见 §7.34.1。
+
 ## 3. 怎么连（按这个顺序，已实测）
 
 API 只从跳板机可达，所以是「跳板机 ControlMaster + 本地端口转发」两段。**用脚本，别手敲**
@@ -2262,13 +2271,34 @@ Redis）由 `release_quota` 一次写。② 配额台账补上**注册时对账*
 
 #### 7.34.1 操作教训：`apply.sh` 没有 `-h` 分支，探用法只能读脚本头注释
 
-`deploy/k8s-k0s/apply.sh` **没有 `-h/--help` 分支**：传任何参数它都照走正常流程。上线准备阶段
-一位实现者为探它的用法跑了 `apply.sh -h`，而那条命令**没带 `KUBECONFIG`** ⇒ 对**默认 context
-的阿里云 ACK 集群**执行了真实 apply，在那边新建了 `sandlock` namespace（`2026-10-02T17:37:07Z`）
-与整套起不来的负载，外加一个 Bound 的 50Gi NAS PVC（`sandbox-shared`，SC
-`alibabacloud-cnfs-nas`）。**目标 k0s 集群未受影响**；ACK 侧的清理需要用户批准、不在本批范围。
+**① 事故与影响面。** `deploy/k8s-k0s/apply.sh` **没有 `-h/--help` 分支**：传任何参数它都照走
+正常流程。上线准备阶段一位实现者为探它的用法跑了 `apply.sh -h`，而那条命令**没带
+`KUBECONFIG`** ⇒ 对**默认 context 的阿里云 ACK 集群**执行了真实 apply，在那边新建了
+`sandlock` namespace（`2026-10-02T17:37:07Z`）与整套起不来的负载，外加一个 Bound 的 50Gi NAS
+PVC（`sandbox-shared`，SC `alibabacloud-cnfs-nas`）与一个手写的**静态** PV
+`sandlock-shared-nas`（`Retain`）。**目标 k0s 集群未受影响**；影响范围**只有新增** —— 没有修改
+或删除 ACK 上任何既有对象。**ACK 侧残留已在用户授权后由控制者清理完毕**（2026-10-03 记录）：
+`kubectl delete namespace sandlock`（35 个 namespace 级对象，含动态供给的 50Gi NAS PVC
+`sandbox-shared`，CSI 随删后 PV `nas-57e04207-…` 消失）+ `kubectl delete pv
+sandlock-shared-nas`（那张静态 PV，`Retain` ⇒ 服务端 NAS 内容未被删除；它指向的正是本项目那台
+NAS，一个字节都没写过）。核对：namespace `NotFound`、两张 PV 都不在、ACK 上没有 cluster-scoped
+残留。清理后重开通道复核目标集群：9/9 Running、镜像 tag == `deploy/stack/.version`。
 
-规则：**探用法只能读脚本头注释**；**任何 `kubectl` / `apply.sh` 调用都必须在同一条命令里带
+**② 根因两条（都要堵）。** 其一，写侧脚本假设调用者已经
+`export KUBECONFIG=tmp/k0s/kubeconfig` —— 没设时 `kubectl` 会**安静地**打到默认 context，而本机
+默认 context（`main`）是**另一套阿里云 ACK 集群**（7 节点、`v1.34.3-aliyun.1`、没有 `sandlock`
+namespace）。其二，目标集群的形状是**可判别**的（2 节点、全 arm64、`kubeletVersion` 含 `+k0s`），
+但除 `open-cluster-tunnel.sh` 之外没有任何写侧脚本去断言它。
+
+**③ 现在的兜底。** [`deploy/scripts/lib/cluster-guard.sh`](../deploy/scripts/lib/cluster-guard.sh)
+的 `require_target_cluster`：判据 = `KUBECONFIG` **显式设置**（且文件存在）+
+`kubectl version -o json` 的 `serverVersion.gitVersion` 含 `+k0s` + 节点数（默认 2，
+`E2B_TARGET_NODES` 可覆盖）× `arm64` × `kubeletVersion` 含 `+k0s`；不符即 `exit 2` 并点名
+context 名、server gitVersion、节点数与每台节点的架构/版本。`deploy/k8s-k0s/apply.sh` 在**任何
+kubectl 之前**调用它，且 **DRY_RUN 也要过闸**（还没 apply 也一样拒绝）；`open-cluster-tunnel.sh`
+的第 ④ 步自检也换成同一个助手（期望值只有这一个真相源）。
+
+规则（不变）：**探用法只能读脚本头注释**；**任何 `kubectl` / `apply.sh` 调用都必须在同一条命令里带
 `KUBECONFIG=$PWD/tmp/k0s/kubeconfig`**（写进命令里，不要靠 shell 已有的环境），否则会打到默认
 context 的 ACK 集群。本节所有命令示例都带这个前缀：
 
