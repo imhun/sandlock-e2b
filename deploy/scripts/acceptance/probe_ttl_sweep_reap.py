@@ -18,6 +18,14 @@ prints the three answers side by side:
    (or a holder that never released); a claim free the whole window is a
    sweeper that never even asked.
 
+   The claim's TTL stays *on the cadence* (N61 裁定 A): ``try_claim`` is
+   ``SET NX EX`` and nothing releases the key, so a longer TTL would make the
+   fleet-wide period that TTL (measured: the holder's own next round also
+   fails -- 1 s becomes 60 s). The consequence this probe can see is the other
+   side of it: a round longer than one second runs with an expired claim, so a
+   claim that is held across samples means a round is in flight (or wedged),
+   and the sweeper's own "轮次超时 WARNING" names it in the fleet log.
+
 **This probe is read-only.** It only reads records and the claim key; it never
 sets, expires or deletes a key and never tears a sandbox down. It needs
 ``E2B_REDIS_URL`` (the same one the control plane runs with) and refuses by

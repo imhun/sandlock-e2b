@@ -57,14 +57,6 @@ from control_plane.registry.redis_backend import try_claim
 #: claim (F11 step 4): one replica per interval, no lock to release.
 _TTL_SWEEP_INTERVAL_S = 1.0
 
-#: N61: how long one replica may hold the TTL sweep's fleet-wide claim. This is
-#: *not* the cadence: a round is not one interval -- it lists the shared records
-#: and tears sandboxes down one at a time, and a single ``rmtree`` measured
-#: 17.1 s on the fleet. A claim TTL of one interval let the second replica
-#: start its own round while the first was still inside a tree, so the claim
-#: TTL is "the upper bound on one round", deliberately longer than the round.
-_TTL_SWEEP_CLAIM_TTL_S = 60
-
 #: E7's platform-account scan. Deliberately slower than the TTL sweep: the
 #: numbers only move when a worker heartbeats (every 5 s) or a capture lands,
 #: and the alert is a crossing, not a live gauge -- 30 s is well inside the
@@ -358,8 +350,17 @@ def create_app(
             # F11 step 4: one replica per round. The deadlines live on shared
             # records, so every replica would otherwise expire the same
             # sandboxes (and call every teardown twice).
+            #
+            # N61 裁定 A（2026-10-03）：claim 的 TTL **留在节奏上**（1 s），
+            # 不是"一轮的上界"。``try_claim`` 是 ``SET key 1 NX EX ttl``、
+            # 全仓库没有释放路径，所以比节奏更长的 TTL 会让舰队级的扫描周期
+            # 等于那个 TTL —— 实测（真实 ``try_claim`` + 假 client，``ttl_s=60``）：
+            # A 第一轮 True、A 第二轮 False、B 也 False、key TTL=60 ⇒ 1 s 的节奏
+            # 变 60 s 的周期，是行为回退。代价（已知、本批不改）：一轮超过 1 s 时
+            # claim 会在轮内过期，peer 可能同时开一轮；这件事由 sweeper 的
+            # "轮次超时 WARNING" 具名（`control_plane/registry/ttl.py`）。
             claim=lambda: try_claim(
-                redis_client, "e2b:ttl:sweep", ttl_s=_TTL_SWEEP_CLAIM_TTL_S
+                redis_client, "e2b:ttl:sweep", ttl_s=int(_TTL_SWEEP_INTERVAL_S)
             ),
         )
         app.state.sweeper = sweeper

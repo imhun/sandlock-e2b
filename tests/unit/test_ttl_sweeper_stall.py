@@ -10,9 +10,16 @@ round that stays a bad round) and *non-blocking* (the Redis scan and the
 the live cluster.
 
 The nails below are that visibility: the two blocking ones go red on today's
-synchronous calls, the candidate line / watchdog / claim-TTL ones go red for
-not existing at all, the "one bad round" one is a guard that already held, and
-the last one pins the probe's refusal plus its read-only sampling.
+synchronous calls, the candidate line / overrun line / periodic summary ones go
+red for not existing at all, the "one bad round" one is a guard that already
+held, and the last one pins the probe's refusal plus its read-only sampling.
+
+Two signals were ruled in on 2026-10-03 (N61 裁定 B) after the first draft's
+starvation watchdog turned out to fire on a healthy fleet: ``try_claim`` is
+``SET NX`` and *nothing releases the key*, so "this replica never won a round"
+is the normal half of a healthy pair, not a fault. What is worth naming is a
+round that outlives its own claim, and what is worth saying periodically is
+whether this replica is sweeping at all -- both read-only.
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ from control_plane.registry.ttl import TTLSweeper
 
 SANDBOX_OK = "sb-ok"
 SANDBOX_AFTER_FAILURE = "sb-after-failure"
+SUMMARY_PREFIX = "TTL sweep: this replica ran "
 PROBE_PATH = (
     Path(__file__).resolve().parents[2]
     / "deploy"
@@ -40,18 +48,35 @@ PROBE_PATH = (
 )
 
 
-class _FakeClock:
-    """A monotonic clock the test moves by hand."""
+class _StepClock:
+    """A monotonic clock that advances a fixed step per read.
 
-    def __init__(self, start: float = 0.0) -> None:
-        self.now = start
+    Every measured duration is then a whole number of steps, so a message that
+    formats one (``%.2fs``) is asserted **verbatim** instead of "about a
+    fifth of a second".
+    """
+
+    def __init__(self, step: float) -> None:
+        self._step = step
+        self._reads = 0
 
     def __call__(self) -> float:
-        return self.now
+        value = self._reads * self._step
+        self._reads += 1
+        return value
 
-    def advance_to(self, value: float) -> None:
-        assert value >= self.now
-        self.now = value
+
+class _ScriptedClaim:
+    """A claim whose answers are scripted; the last answer repeats."""
+
+    def __init__(self, answers: list[bool]) -> None:
+        self._answers = list(answers)
+        self.calls = 0
+
+    def __call__(self) -> bool:
+        index = min(self.calls, len(self._answers) - 1)
+        self.calls += 1
+        return self._answers[index]
 
 
 class _BlockingRegistry:
@@ -117,6 +142,15 @@ async def _tick_until(done: asyncio.Event) -> int:
 
 def _messages(caplog, *, level: int) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.levelno == level]
+
+
+def _summaries(caplog) -> list[str]:
+    """The periodic summary lines, selected by their fixed opening."""
+    return [
+        message
+        for message in _messages(caplog, level=logging.INFO)
+        if message.startswith(SUMMARY_PREFIX)
+    ]
 
 
 def _load_probe():
@@ -192,58 +226,70 @@ async def test_the_candidate_line_names_the_ids_and_truncates(caplog):
 
 
 @pytest.mark.asyncio
-async def test_a_starved_claim_is_named_after_the_grace_period(caplog):
-    """A claim nobody releases has to be named, once, with how long it held.
+async def test_a_round_that_outlives_three_intervals_is_named(caplog):
+    """A round longer than 3 x the cadence is the suspect shape -- name it.
 
-    Two replicas run with a claim TTL that used to be *shorter* than a round
-    (1 s against 17.1 s of ``rmtree``): a peer can then hold the claim round
-    after round and every round this replica loses is silence -- the shape the
-    8 never-reaped records would produce if their sweeper never won a round.
-    The grace period is short here so the test does not wait 30 s.
+    The claim's TTL is the cadence on purpose (N61 裁定 A: ``try_claim`` has no
+    release, so a longer TTL slows the whole fleet down), so a round that runs
+    past 3 x the interval is running *without* a claim: a peer may have started
+    its own round in the meantime. Naming that pair -- the real duration, the
+    records this round reaped, and the fact that its own teardown still
+    completed -- is the direct evidence for the "long round + expired claim"
+    suspicion, without changing what the sweep does.
     """
-    clock = _FakeClock()
-    claimed = [False]
+    registry = _BlockingRegistry(records=[_record(SANDBOX_OK)])
     sweeper = TTLSweeper(
-        interval_seconds=0.01,
-        claim=lambda: claimed[0],
-        starve_after_s=0.05,
-        clock=clock,
+        interval_seconds=1.0, claim=lambda: True, clock=_StepClock(4.0)
     )
-    caplog.set_level(logging.INFO, logger="control_plane.registry.ttl")
-    sweeper.start(_BlockingRegistry())
+    caplog.set_level(logging.WARNING, logger="control_plane.registry.ttl")
+    sweeper.start(registry)
     try:
-        # Below the grace period: losing a round is normal (the peer is
-        # sweeping), and a line per second would be noise, not a signal.
-        await asyncio.sleep(0.05)
-        assert _messages(caplog, level=logging.WARNING) == []
-
-        clock.advance_to(0.2)
         for _ in range(200):
             if _messages(caplog, level=logging.WARNING):
                 break
-            await asyncio.sleep(0.01)
-        expected = (
-            "TTL sweep starved: the fleet-wide claim e2b:ttl:sweep has been "
-            "held for 0.2s; no expired record can be reaped while this lasts"
-        )
-        assert _messages(caplog, level=logging.WARNING) == [expected]
-
-        # Still starved, much longer: one line, not one per round.
-        clock.advance_to(60.0)
-        await asyncio.sleep(0.05)
-        assert _messages(caplog, level=logging.WARNING) == [expected]
-
-        claimed[0] = True
-        for _ in range(200):
-            if _messages(caplog, level=logging.INFO):
-                break
-            await asyncio.sleep(0.01)
-        assert _messages(caplog, level=logging.INFO) == [
-            "TTL sweep: the fleet-wide claim e2b:ttl:sweep is free again "
-            "after 60.0s; reaping resumes"
-        ]
+            await asyncio.sleep(0.005)
     finally:
         await sweeper.stop()
+    assert _messages(caplog, level=logging.WARNING) == [
+        "TTL sweep: a round took 4.00s (>= 3 x the 1.0s cadence) and reaped 1 "
+        "record(s); the fleet-wide claim expired while it ran, so a peer may "
+        "have started its own round too -- this round's teardown is not lost"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_periodic_summary_says_whether_this_replica_sweeps(caplog):
+    """One line per ~30 rounds that answers "did *this* replica sweep?".
+
+    Losing a round to the peer's claim is normal, so the number that matters is
+    not "how long since we won" but "how many of the last N rounds did we run,
+    how long was the last one, how many records did we reap". Two windows are
+    asserted, so the counters are pinned to *reset* rather than accumulate.
+    """
+    registry = _BlockingRegistry(records=[_record(SANDBOX_OK)])
+    sweeper = TTLSweeper(
+        interval_seconds=0.05,
+        claim=_ScriptedClaim([True, True, False, True, True, False]),
+        clock=_StepClock(0.25),
+        overrun_after_s=1000.0,
+        summary_every_rounds=3,
+        summary_every_s=1000.0,
+    )
+    caplog.set_level(logging.INFO, logger="control_plane.registry.ttl")
+    sweeper.start(registry)
+    try:
+        for _ in range(400):
+            if len(_summaries(caplog)) >= 2:
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        await sweeper.stop()
+    assert _summaries(caplog) == [
+        "TTL sweep: this replica ran 2 of the last 3 rounds; last round took "
+        "0.25s; 2 candidate(s) reaped",
+        "TTL sweep: this replica ran 2 of the last 3 rounds; last round took "
+        "0.25s; 2 candidate(s) reaped",
+    ]
 
 
 @pytest.mark.asyncio
@@ -272,20 +318,44 @@ async def test_the_sweep_still_reaps_after_a_candidate_scan_failure(caplog):
     assert registry.cleaned == [SANDBOX_AFTER_FAILURE]
 
 
-def test_the_sweep_claim_outlives_a_round_not_just_the_interval():
-    """The claim's TTL is bounded by a *round*, not by the cadence (N61).
+def test_the_sweep_claim_still_expires_with_the_cadence():
+    """N61 裁定 A（2026-10-03）：claim 的 TTL 不许超过节奏。
 
-    A round lists the shared records and tears sandboxes down one at a time --
-    one ``rmtree`` measured 17.1 s -- so a claim that expires with the 1 s
-    cadence lets the second replica start its own round inside the first one's
-    teardown (duplicated teardown calls, duplicated ``TTL expired`` lines).
-    The claim's TTL is the upper bound on a round and has to be longer than
-    the round it guards.
+    ``try_claim`` 是 ``SET key 1 NX EX ttl``，且全仓库**没有任何**释放路径
+    （``redis_backend.try_claim`` 自己的 docstring 写着 "there is no lock to
+    release"）。所以把 claim 的 TTL 设成比节奏长，舰队级扫描周期就变成那个
+    TTL —— 现场实测（真实 ``try_claim`` + 假 client，``ttl_s=60``）：A 第一轮
+    ``True``、A 第二轮 ``False``、B 也 ``False``、key 的 TTL = 60。1 s 的节奏
+    ⇒ 60 s 的周期，是行为回退。
+
+    长轮次（> 1 s）会让 claim 在轮内过期、peer 可能同时开一轮：这是**已知代价**，
+    不是本批要改的语义；要真正消除它需要带所有权校验的释放（要改
+    ``redis_backend.try_claim`` 的 token 形状），不在本任务写集内。
     """
-    from control_plane.app import _TTL_SWEEP_CLAIM_TTL_S, _TTL_SWEEP_INTERVAL_S
+    from control_plane import app
+    from control_plane.registry.redis_backend import try_claim
 
-    assert _TTL_SWEEP_CLAIM_TTL_S == 60
-    assert _TTL_SWEEP_CLAIM_TTL_S > _TTL_SWEEP_INTERVAL_S
+    assert app._TTL_SWEEP_INTERVAL_S == 1.0
+    assert not hasattr(app, "_TTL_SWEEP_CLAIM_TTL_S"), (
+        "claim 的 TTL 必须留在节奏上：没有释放路径，拉长就是让整个舰队变慢"
+    )
+
+    class _KeyValueStore:
+        def __init__(self) -> None:
+            self.entries: dict[str, int] = {}
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.entries:
+                return None
+            self.entries[key] = ex
+            return True
+
+    client = _KeyValueStore()
+    ttl_s = int(app._TTL_SWEEP_INTERVAL_S)
+    assert try_claim(client, "e2b:ttl:sweep", ttl_s=ttl_s) is True
+    # 持有者自己第二轮也拿不到；换成 60 就是 60 s 内整支舰队都拿不到。
+    assert try_claim(client, "e2b:ttl:sweep", ttl_s=ttl_s) is False
+    assert client.entries == {"e2b:ttl:sweep": 1}
 
 
 class _FakeClaimClient:
