@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次发版：见 §7.33（2026-10-02，建箱存储本地优先 **Task 0–5 的发版记录**，当前版本 `0.1.0-915-gfb8a74b-20261002-211709`；跨切面冒烟**先红后绿**（红灯那次：验收窗口留下的孤儿沙箱**真的占着名额**，再加上拒绝路径漏掉的那几份预约）—— 迁移"源节点不可达"拒绝路径泄漏目标节点配额，见该节与 N59；控制者清掉台账与 8 个孤儿沙箱之后**两条冒烟都通过**，N59 的修复已随本版 `32f3667` 上线）；上一版的细节：见 §7.31（2026-10-02，N57/Task 4：本节点 state 分家，`prepare` 72–76 → **7.4 ms**，Task 5 的目录链修复同船）；§7.30（2026-10-02，Task 2：快照载荷从爆炸式 `fs/` 目录改成 `fs.tar`，捕获每条目 39.7 → 9.0 ms、占块减半，从快照建箱 28.2 → 34.4 ms/条目（读侧每条目包含检查，Task 3 搬本地后消失；`942c5bd` 的守卫修复在 `0.1.0-895` 上线后重测 **30.4 ms/条目**），**该节版本 `0.1.0-900-g0079c84-20261002-161409`**；老 `fs/` 快照 4/4 仍可恢复，详见该节）；§7.29（2026-10-02，N58：根重切上线 —— `_snapshots` 合一、`_migrate` 上浮，建箱 p50 124 → 135/136 ms、逐段不变，**该节版本 `0.1.0-887-g7ef319b-20261002-100406`**；该次上线当场抓到"从快照建箱"的 502，已前滚修复 + 复验，详见该节）；§7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**该节版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，该节版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次发版：见 §7.34（2026-10-03，N57/N60/N61/N62/N63 收口，当前版本 `0.1.0-931-g4181bb4-20261003-013625`；四条收尾读数 + 两条冒烟全绿，两次非预期读数与操作教训见该节）；上一版：§7.33（2026-10-02，建箱存储本地优先 **Task 0–5 的发版记录**，版本 `0.1.0-915-gfb8a74b-20261002-211709`；跨切面冒烟**先红后绿**（红灯那次：验收窗口留下的孤儿沙箱**真的占着名额**，再加上拒绝路径漏掉的那几份预约）—— 迁移"源节点不可达"拒绝路径泄漏目标节点配额，见该节与 N59；控制者清掉台账与 8 个孤儿沙箱之后**两条冒烟都通过**，N59 的修复已随本版 `32f3667` 上线）；上一版的细节：见 §7.31（2026-10-02，N57/Task 4：本节点 state 分家，`prepare` 72–76 → **7.4 ms**，Task 5 的目录链修复同船）；§7.30（2026-10-02，Task 2：快照载荷从爆炸式 `fs/` 目录改成 `fs.tar`，捕获每条目 39.7 → 9.0 ms、占块减半，从快照建箱 28.2 → 34.4 ms/条目（读侧每条目包含检查，Task 3 搬本地后消失；`942c5bd` 的守卫修复在 `0.1.0-895` 上线后重测 **30.4 ms/条目**），**该节版本 `0.1.0-900-g0079c84-20261002-161409`**；老 `fs/` 快照 4/4 仍可恢复，详见该节）；§7.29（2026-10-02，N58：根重切上线 —— `_snapshots` 合一、`_migrate` 上浮，建箱 p50 124 → 135/136 ms、逐段不变，**该节版本 `0.1.0-887-g7ef319b-20261002-100406`**；该次上线当场抓到"从快照建箱"的 502，已前滚修复 + 复验，详见该节）；§7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**该节版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，该节版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1753,16 +1753,20 @@ worker/envd）。能给的是一段**算术**，而且它只在"两跳并发"模
 （~100 ms，仍在共享树根上），Task 3 才是动它的那一步**。这条是推论（有读数支撑），
 要坐实得给控制面那侧也加一段逐段 trace —— 本轮不改代码，记在这里。
 
-③ 的形状（判据，实测见下）：节点本地只出现 `_runtime/<id>/.creating`、`disk-stats`、
-`.route-b/**`、`.uid_pool.lock`、`.uid_reservations/`；共享 `<export>/state/_runtime/<id>/`
-里**没有** `.creating`、没有 `disk-stats`，只有 `sandbox.json` / `command-logs.jsonl`。
+③ 的形状（判据，实测见下；**2026-10-03 按 N57 更正，见 §7.34**）：节点本地只出现
+`_runtime/<id>/.creating`、`disk-stats`、`.route-b/**` 这三样；共享
+`<export>/state/_runtime/<id>/` 里**没有** `.creating`、没有 `disk-stats`，只有 `sandbox.json`
+/ `command-logs.jsonl`。（**池自己的 `.uid_pool.lock` / `.uid_reservations/` 不在节点本地** ——
+N57 已把它们搬回**共享** `E2B_STATE_BASE`，好让 `acquire` 的临界区跨节点互斥；下面第 1 条读数
+里它们出现在节点本地，那是 N57 **之前**的 Task 4 形状。）
 
 **③ 三个具体读数（2026-10-02）**
 
 1. **在飞的 `prepare`**（控制面 pod 打 worker-1 的 agent 口，`phase: prepare` 挂 30 s 再看，
    `phase: cancel` 收回）：节点本地 `_runtime/probe4chips082152/` 里 **`.creating`（0 B）+
    `disk-stats`（`1073741824 0`）**，根下还有 **`.uid_pool.lock`（0600, 0 B）+
-   `.uid_reservations/probe4chips082152`（`10000`）**（这条形状走 `acquire`，所以四个文件全在）；
+   `.uid_reservations/probe4chips082152`（`10000`）**（这条形状走 `acquire`，所以四个文件全在
+   —— **这两条锁/标记是 N57 之前的落点，现已回共享 base，见 §7.34**）；
    同一时刻共享 base 的 `.uid_pool.lock` 仍是 **09-26 10:02:39**、`.uid_reservations` 仍是
    **10-01 14:20:10**（都是改前的 mtime）、共享 `_runtime` 里没有 `probe4chips*`。`cancel`
    之后节点本地的 `_runtime/<id>` 与预留标记都消失（配对收尾按设计）。
@@ -1801,10 +1805,12 @@ wait
 ```
 
 **本地可先量的机制读数**（不用集群，`deploy/scripts/acceptance/node_state_split_local_probe.py`，
-量的是**回落形状**——它的 payload 不带 `hostUID`，所以 `14` 里含 `pool.acquire` 的锁与预留标记；
-已部署形状只写标记 + 种子）：一次 `prepare` 落在共享 base 上的路径操作 **writes 14 → 0**，
-只读的两次（`_runtime` 列举 + 邻居记录）留着 —— 那就是舰队账本的索引。这是**机制**读数
-（"共享 base 上的每一笔写都搬走了"），不是延迟读数，也不是"掉了多少"的分子。
+量的是**回落形状**——它的 payload 不带 `hostUID`，所以计数里含 `pool.acquire` 的锁与预留标记）：
+一次 `prepare` 落在共享 base 上的路径操作实测是 **`before=14 / after=4`**（**不是 14 → 0**，
+2026-10-03 按实测更正，见 §7.34），只读的两次（`_runtime` 列举 + 邻居记录）留着 —— 那就是
+舰队账本的索引。剩下那 **4 笔**正是回落 `acquire` 路径上的池文件写（锁 + 预留标记）：**N57 已
+把它们搬回共享 base**（跨节点互斥的代价只落在回落形状上；出厂 `claim` 路径 0 笔），所以不是
+"共享 base 上的每一笔写都搬走了"。这是**机制**读数，不是延迟读数，也不是"掉了多少"的分子。
 
 **回退**：把 `E2B_NODE_STATE_BASE` 从两份 k8s 清单里去掉（或把 worker/agent 的镜像退回），
 `prepare` 立刻回到共享 base 的写法；已经写在节点本地盘上的那几样是**可再生的残渣**
@@ -1932,7 +1938,7 @@ kubectl -n sandlock exec -i e2b-worker-0 -- python3 - \
 > `finally` 里复原到原副本数并等两个 pod Running 才算完；跑之前先确认舰队里没有别的活沙箱
 > 落在那一台上（本轮的 `GET /sandboxes` 是 `[]`）。
 
-### 7.33 发版：建箱存储本地优先（Task 0–5）（**2026-10-02，当前版本 `0.1.0-915-gfb8a74b-20261002-211709`**）
+### 7.33 发版：建箱存储本地优先（Task 0–5）（**2026-10-02，上线版本 `0.1.0-915-gfb8a74b-20261002-211709`（已被 §7.34 取代）**）
 
 > 本节是本批的**发版记录**：把 §7.29–§7.32 四节（Task 0 / Task 2 / Task 4+5 / Task 3）
 > 串成**一次上线**。各节的逐条命令与原始读数仍在原处，本节只给"一个版本、一张验收表、
@@ -2168,6 +2174,110 @@ Redis）由 `release_quota` 一次写。② 配额台账补上**注册时对账*
 * **Task 4 的本节点 state**：把 `E2B_NODE_STATE_BASE` 从两份清单里去掉（或退回 worker/agent
   镜像），`prepare` 立刻回到共享 base 的写法；节点本地盘上留下的那几样是**可再生的残渣**。
 
+### 7.34 发版：N57/N60/N61/N62/N63 收口（**2026-10-03，当前版本 `0.1.0-931-g4181bb4-20261003-013625`**）
+
+计划 `docs/superpowers/plans/2026-10-02-open-issues-fix.md`（Task 1–5 + 收尾）。本节是这一批的
+**发版记录**：一个版本、四条收尾读数、两条冒烟、两次非预期读数（含自愈前后）与一条操作教训。
+五条改动各自的设计与先红钉子仍在原位（`docs/open-issues.md` 的 N57 / N60 / N61 / N62 / N63
+行与各自的 task 报告），本节只记"它上线时现场看到了什么"。
+
+**版本线**（`deploy/stack/.version`；worker / control-plane-gateway / agent / quota-agent 四个
+镜像同 tag）：
+
+| 版本 | 内容 | 节 |
+|---|---|---|
+| `0.1.0-915-gfb8a74b-20261002-211709` | 上一批（建箱存储本地优先 + N59 修复）—— 本批的**基线** | §7.33 |
+| **`0.1.0-931-g4181bb4-20261003-013625`** | 本批收口（N57 uid 池回落分配器跨节点互斥 / N60 放置逐候选重试 / N61 TTL 可见性埋点 + 只读探针 / N62 快照记录跨副本可见 / N63 tar 成员数上限）—— **当前** | 本节 |
+
+**上线顺序（照命令实际发生的次序）**
+
+1. **通道 + 身份闸门**：`deploy/scripts/open-cluster-tunnel.sh` 自检必须报 2 节点 / arm64 /
+   含 `+k0s` / `sandlock` 9 pod（拒绝错集群）。**任何 `kubectl` / `apply.sh` 都在同一条命令里
+   带 `KUBECONFIG="$PWD/tmp/k0s/kubeconfig"`**（见 §7.34.1 的操作教训）。
+2. **四个镜像先在 ACR 就绪**：`build-and-push.sh` 的单平台分支恒用 `--load`（只有 `PLATFORMS`
+   含逗号才 `--push`），所以 `control-plane-gateway` 之外的三条（worker / agent / quota-agent）
+   这轮是**另行 `docker push` 补上去的**；四条都 `docker buildx imagetools inspect` 复核为
+   `linux/arm64` 之后才 apply。
+3. **apply**（唯一一条，无任何 flag）：
+   `KUBECONFIG="$PWD/tmp/k0s/kubeconfig" deploy/k8s-k0s/apply.sh` —— 7 个镜像引用 pin 到本版，
+   内建顺序 agent DaemonSet → worker StatefulSet，退出码 0。
+4. 补等 `control-plane` / `seccomp-installer` 的 rollout（`kubectl rollout status`，同样带前缀）。
+5. **两条冒烟**（`multinode_smoke.py` / `deployment_smoke.py`，调用形状与凭据取法见 §7.33.4 的
+   复跑命令块）。
+
+**四条收尾读数（全部只读）**
+
+| # | 读数 | 结果 |
+|---|---|---|
+| 1 | 三处镜像 tag ≡ `deploy/stack/.version` | ✅ `control-plane-gateway` / `agent` / `worker` 全是 `0.1.0-931-g4181bb4-20261003-013625`（redis 保持 `redis:8-alpine`、buildkit 保持 `buildkit:rootless`） |
+| 2 | `kubectl -n sandlock get pods` | ✅ **9/9 Running**：control-plane ×2（2/2）、e2b-c3-agent ×2（2/2）、e2b-worker-0/1（1/1）、redis（1/1）、seccomp-installer ×2（1/1） |
+| 3 | `GET /sandboxes` | ✅ **`[]`** |
+| 4 | `DRY_RUN=1 apply.sh \| kubectl diff -f - \| wc -l` | ✅ **0 行**（仓库规格 ≡ 线上） |
+
+**N61 的探针现场读数**（本节上线时，`deploy/scripts/acceptance/probe_ttl_sweep_reap.py`，只读）：
+舰队 **0 条记录** ⇒ record 侧空转；`e2b:ttl:sweep` 60 次采样 **59/60 被持有** ⇒ 扫描器确在运行，
+**排除"根本没在问"这一支**。那 8 条为什么没被收的**定因**仍留批 B。
+
+**两条冒烟**
+
+- `MULTI-NODE SMOKE OK`：4 箱 2+2、commands / files / health / stdin 全过，kill 后两边预约
+  **0/0**。
+- `DEPLOYMENT SMOKE OK`：六段全过（命令+文件、跨节点迁移保文件、网络配置、远端卷+兄弟卷隔离、
+  模板构建 → registry push → worker pull → rootfs、MCP 网关），
+  `after kill reservations: {'e2b-worker-0': 0, 'e2b-worker-1': 0}`。
+
+**两次非预期读数（都如实记，别抹掉）**
+
+1. **`deployment_smoke` 第 1 次卡在模板构建段**：`404: Template build bld_2e943c72adb355a3
+   not found`。这是 `docs/reports/fix-c-report.md` 记过的**跨副本 poll 形态**：两个控制面副本的
+   访问日志里 `logsOffset=0..31` 全部由 `…-r5nhz` 答 `200 OK`，唯一一次 `logsOffset=34` 落到
+   另一个副本 `…-k6cqz` 时答 `404 Not Found`；事后该 build 记录在**两个副本**上都完整
+   （14661 字节）⇒ 单次可见性/时序窗口，不是记录真丢。**重跑即过。**
+2. **第 1 次重跑的末条断言红**：`after kill reservations: {'e2b-worker-0': 1024,
+   'e2b-worker-1': 0}` —— 六段功能全过，但收尾"每节点预留归零"没满足。`e2b-worker-0` 的
+   **内存节点视图**（`GET /internal/nodes` 的 `reservedMemoryMB`）残留一份默认规格预留
+   （**1024 MB / 100 CPU / 1024 MB disk / 256 processes**）且持久不回落；而 Redis 台账
+   `e2b:node:quota:e2b-worker-0` **全 0**、`GET /sandboxes` **空** ⇒ **视图与台账漂移**，
+   没有活沙箱认领它。**走自愈路径**：
+   `KUBECONFIG="$PWD/tmp/k0s/kubeconfig" kubectl -n sandlock delete pod e2b-worker-0`
+   （StatefulSet 秒级重建、重新注册触发 `_rebuild_node_reservations` 的 `set_reserved`）后，
+   BEFORE **`1024/100/1024/256`** → AFTER **全 0**；`deployment_smoke` 重跑 **EXIT=0**、
+   末条 `0/0`、`DEPLOYMENT SMOKE OK`。
+
+**日志取证：未命中。** `release_quota … found no node record`、`quota store refused …` 等点名
+搜两个控制面副本 `--since=3h` **零命中**；两个 sandbox 都是完整的 `migrate 200 → DELETE 204`
+闭环，没有半截生命周期。**这条漂移在控制面日志里不留痕。**
+
+**怀疑机制（未证实，登记 N70）**：节点行是一个**共享 Redis 整行**（`_load_locked` 读整行 →
+改 → `_persist_locked` 整行 put，**无 CAS/版本号**），而配额台账是**另一个 key** 的原子
+`HINCRBY`（`e2b:node:quota:<node>`）。心跳（`heartbeat()` 的 load→改→persist）与 delete 的
+`release_quota` 并发时丢更新：副本 A 把台账 `HINCRBY -1024` → 0 并把行 put 为 `reserved=0`，
+副本 B 在 A 之前读到旧行、在 A 之后把**带着旧 `reserved=1024` 的整行** put 回去 ⇒ 行 = 1024、
+台账 = 0、**无 WARNING**、只有重注册时按活记录 `set_reserved` 能把它压回 0。**要坐实得按该
+时序做并发复现，或在 `_persist_locked` 上加版本/CAS —— 都超出本批范围，只登记。**
+
+**本批的缓解（N60）**：逐候选重试让"一个节点漂移"不再变成**全舰队 503** —— 被拒的候选只让
+那次放置**跳过该节点**并打具名 WARNING，另一台还有空位就能落地（§7.33.4 里那两次红灯正是
+"漂移 + 不换候选"叠出来的）。**但它没有治漂移本身**，那是 N70。
+
+#### 7.34.1 操作教训：`apply.sh` 没有 `-h` 分支，探用法只能读脚本头注释
+
+`deploy/k8s-k0s/apply.sh` **没有 `-h/--help` 分支**：传任何参数它都照走正常流程。上线准备阶段
+一位实现者为探它的用法跑了 `apply.sh -h`，而那条命令**没带 `KUBECONFIG`** ⇒ 对**默认 context
+的阿里云 ACK 集群**执行了真实 apply，在那边新建了 `sandlock` namespace（`2026-10-02T17:37:07Z`）
+与整套起不来的负载，外加一个 Bound 的 50Gi NAS PVC（`sandbox-shared`，SC
+`alibabacloud-cnfs-nas`）。**目标 k0s 集群未受影响**；ACK 侧的清理需要用户批准、不在本批范围。
+
+规则：**探用法只能读脚本头注释**；**任何 `kubectl` / `apply.sh` 调用都必须在同一条命令里带
+`KUBECONFIG=$PWD/tmp/k0s/kubeconfig`**（写进命令里，不要靠 shell 已有的环境），否则会打到默认
+context 的 ACK 集群。本节所有命令示例都带这个前缀：
+
+```bash
+KUBECONFIG="$PWD/tmp/k0s/kubeconfig" kubectl -n sandlock get pods
+KUBECONFIG="$PWD/tmp/k0s/kubeconfig" DRY_RUN=1 deploy/k8s-k0s/apply.sh 2>/dev/null \
+    | KUBECONFIG="$PWD/tmp/k0s/kubeconfig" kubectl diff -f - | wc -l   # 期望 0
+```
+
 ## 8. 改部署的入口
 
 ```bash
@@ -2189,7 +2299,7 @@ overlay 改了什么、为什么（NAS PV 必须 NFSv4.0、容量与 resources�
 `e2b-priv-broker` DaemonSet 里（§7）。集群层设计的全貌见 `docs/k8s-deployment.md` ——
 **读它时注意**：那份指南里 §13（N13 共用 base）与 §23.3/§24（N27 回退、C1 属主迁移）
 测的是**介质翻转之前**的形状，各自已经加了"历史记录 / 前提已被取代"的框；当前形态以本文件
-的 §7（含 §7.33）为准。
+的 §7（含 §7.34）为准。
 
 ---
 
