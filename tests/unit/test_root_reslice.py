@@ -239,7 +239,11 @@ def test_workspace_root_init_creates_both_namespaces_on_the_shared_export_root()
         'chown 65534:65534 "$shared/_snapshots" 2>/dev/null ||',
         'chmod 0755 "$shared/_snapshots" 2>/dev/null ||',
         'snap_owner="$(stat -c %u "$shared/_snapshots")"',
-        'for target in "$base" "$state" "$shared/_migrate"; do',
+        # Task 3: `$base`（树根）不再是共享挂载上的目标 —— 它是节点本地盘，
+        # 由它自己的严格块创建/校验（`chown 65534:65534 "$base"`），这里的
+        # 宽松回落（1777）只留给共享卷上的两个目标。
+        'for target in "$state" "$shared/_migrate"; do',
+        'chown 65534:65534 "$base" 2>/dev/null ||',
     ):
         assert expected in lines, expected
     # ...and the tree-root spellings are gone: an init that recreates
@@ -254,19 +258,22 @@ def test_the_control_plane_names_the_trees_shared_judge():
     """部署自己把判据写出来，而不是靠"共享根设着"这个推论。
 
     重切之后 `E2B_SHARED_WORKSPACE_ROOT` **仍然要设着**（它就是共享根），所以
-    `bool(shared_workspace_root)` 再也回答不了"树在哪"。清单里显式写 `1` 让这一行
+    `bool(shared_workspace_root)` 再也回答不了"树在哪"。清单里显式写出来让这一行
     可 grep、可评审，也让 Task 3 的翻转就是这一个字符。
+
+    **Task 3 已翻**：`0`（树在节点本地盘），并与 `E2B_WORKSPACE_BASE` 的指向
+    一起改。这不是把断言削弱：它现在同时钉住"判据翻转"和"共享根仍在"。
     """
     plane = _rendered_workload(_rendered(K8S_OVERLAY), "Deployment", "control-plane")
     env = {
         e["name"]: e.get("value")
         for e in plane["spec"]["template"]["spec"]["containers"][0]["env"]
     }
-    assert env["E2B_TREES_SHARED"] == "1"
+    assert env["E2B_TREES_SHARED"] == "0"
     # 判据与被判据的对象同时可见：共享根还在（它就是 `_snapshots` 的根），
-    # 而树根是它下面的一层。
+    # 而树根在**另一个介质**上（节点本地 hostPath，worker/face B 两份清单里）。
     assert env["E2B_SHARED_WORKSPACE_ROOT"] == "/var/lib/e2b-sandboxes"
-    assert env["E2B_WORKSPACE_BASE"] == "/var/lib/e2b-sandboxes/workspaces"
+    assert env["E2B_WORKSPACE_BASE"] == "/var/lib/e2b/workspaces"
 
 
 def test_every_compose_lane_already_owns_the_two_namespaces_at_its_own_root():

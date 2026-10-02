@@ -802,7 +802,11 @@ def test_k0s_overlay_sinks_the_tree_root_and_keeps_state_as_a_sibling() -> None:
         e["name"]: e.get("value")
         for e in worker["spec"]["template"]["spec"]["containers"][0]["env"]
     }
-    assert env["E2B_WORKSPACE_BASE"] == "/var/lib/e2b-sandboxes/workspaces"
+    # Task 3: the sandbox tree root is the **node's own disk** now, and the
+    # shared claim keeps only the platform's own namespaces. The mount is
+    # asserted below -- naming a hostPath is not mounting it, and an unmounted
+    # tree root is a first create that dies on ENOENT.
+    assert env["E2B_WORKSPACE_BASE"] == "/var/lib/e2b/workspaces"
     assert env["E2B_STATE_BASE"] == "/var/lib/e2b-sandboxes/state"
     # N57 / Task 4: the state base keeps the record and the checkpoint store;
     # the create's chips, `.route-b` and the uid pool's own files move to the
@@ -833,9 +837,14 @@ def test_k0s_overlay_sinks_the_tree_root_and_keeps_state_as_a_sibling() -> None:
     pod = worker["spec"]["template"]["spec"]
     mounts = {m["name"]: m["mountPath"] for m in pod["containers"][0]["volumeMounts"]}
     assert mounts["node-state"] == env["E2B_NODE_STATE_BASE"]
+    assert mounts["workspace-root"] == env["E2B_WORKSPACE_BASE"]
     volumes = {v["name"]: v for v in pod["volumes"]}
     assert volumes["node-state"]["hostPath"] == {
         "path": env["E2B_NODE_STATE_BASE"],
+        "type": "DirectoryOrCreate",
+    }
+    assert volumes["workspace-root"]["hostPath"] == {
+        "path": env["E2B_WORKSPACE_BASE"],
         "type": "DirectoryOrCreate",
     }
 
@@ -869,7 +878,11 @@ def test_k0s_overlay_control_plane_writes_only_the_migration_staging_and_state()
     container = plane["spec"]["template"]["spec"]["containers"][0]
     env = {e["name"]: e.get("value") for e in container["env"]}
     assert env["E2B_SHARED_WORKSPACE_ROOT"] == "/var/lib/e2b-sandboxes"
-    assert env["E2B_WORKSPACE_BASE"] == "/var/lib/e2b-sandboxes/workspaces"
+    # Task 3: the control plane *names* the node-local tree root so the paths
+    # it derives for the agents resolve on those nodes; it has no mount there
+    # (the shared subPath list below is the complete writable set).
+    assert env["E2B_WORKSPACE_BASE"] == "/var/lib/e2b/workspaces"
+    assert env["E2B_TREES_SHARED"] == "0"
     assert env["E2B_STATE_BASE"] == "/var/lib/e2b-sandboxes/state"
     shared = [m for m in container["volumeMounts"] if m["name"] == "shared"]
     # The whole volume, read-only, and nothing else on that volume without a
@@ -982,7 +995,9 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
     )
     assert {e["name"]: e.get("value") for e in init["env"]} == {
         "SHARED_ROOT": "/var/lib/e2b-sandboxes",
-        "WORKSPACE_BASE": "/var/lib/e2b-sandboxes/workspaces",
+        # Task 3: the tree root this init creates and hands over is the
+        # **node-local** one (hostPath), not a directory under the shared mount.
+        "WORKSPACE_BASE": "/var/lib/e2b/workspaces",
         "STATE_BASE": "/var/lib/e2b-sandboxes/state",
         # N57 / Task 4: the node-local base, created and handed to 65534 by
         # this same init (it is a hostPath, so no earlier step could have).
@@ -990,6 +1005,7 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
     }
     assert init["volumeMounts"] == [
         {"name": "shared", "mountPath": "/var/lib/e2b-sandboxes"},
+        {"name": "workspace-root", "mountPath": "/var/lib/e2b/workspaces"},
         {"name": "node-state", "mountPath": "/var/lib/e2b/state"},
     ]
     lines = [line.strip() for line in init["command"][2].splitlines()]
@@ -1001,10 +1017,11 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
         # The platform's own namespaces stay under the shared export root.
         "for dir in _builds _images _secrets _templates _snapshots _volumes; do",
         'mkdir -p "$shared/$dir"',
-        # ...and the two new roots are created (they are the subPath sources the
-        # control plane mounts, and the state base the uid pool needs).
-        'for dir in "$base" "$state"; do',
-        'mkdir -p "$dir"',
+        # ...and the shared state base is created (it is the subPath source the
+        # control plane mounts, and where the uid pool's records live). Task 3:
+        # the tree root is **not** here any more -- it is the node-local
+        # hostPath, created and handed over by its own block below.
+        'mkdir -p "$state"',
         # N57 / Task 4: the node-local half of the state. It is *not* on the
         # shared volume, so it is created here and handed to the worker (the
         # only root here uid 65534 writes into), and its ownership is verified
@@ -1033,9 +1050,16 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
         'if [ "$snap_owner" != "65534" ]; then',
         'mkdir -p "$state/_runtime/.checkpoints"',
         'chmod 0711 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||',
-        # base, state and the migration staging get the same "writable by the
-        # worker" judgement (the control plane stages a tar in `_migrate` too).
-        'for target in "$base" "$state" "$shared/_migrate"; do',
+        # Task 3: the tree root left this loop. It is the **node-local** base
+        # now, so it gets its own strict hand-over (`chown` + owner check, no
+        # world-writable fallback -- a local disk that cannot be chowned is a
+        # broken node, and 1777 would hide it). `state` and the migration
+        # staging (where the control plane stages a tar) keep the shared
+        # judgement.
+        'mkdir -p "$base"',
+        'chown 65534:65534 "$base" 2>/dev/null ||',
+        'if [ "$base_owner" != "65534" ]; then',
+        'for target in "$state" "$shared/_migrate"; do',
         'owner="$(stat -c %u "$target")"',
     ):
         assert expected in lines, expected
@@ -1094,12 +1118,16 @@ def test_the_retired_brokers_owner_inits_moved_into_the_agent() -> None:
     roots = inits["workspace-root-init"]
     assert {e["name"]: e.get("value") for e in roots["env"]} == {
         "SHARED_ROOT": "/var/lib/e2b-sandboxes",
-        "WORKSPACE_BASE": "/var/lib/e2b-sandboxes/workspaces",
+        # Task 3: the init creates and hands over the *node-local* tree root
+        # too (the worker makes `<root>/<id>` as uid 65534); the shared mount
+        # keeps `$state` and the platform namespaces.
+        "WORKSPACE_BASE": "/var/lib/e2b/workspaces",
         "STATE_BASE": "/var/lib/e2b-sandboxes/state",
         "NODE_STATE_BASE": "/var/lib/e2b/state",
     }
     assert roots["volumeMounts"] == [
         {"name": "shared", "mountPath": "/var/lib/e2b-sandboxes"},
+        {"name": "workspace-root", "mountPath": "/var/lib/e2b/workspaces"},
         {"name": "node-state", "mountPath": "/var/lib/e2b/state"},
     ]
     # The cache init owns the node-local cache too -- that half used to be the
@@ -1130,6 +1158,10 @@ def test_the_retired_brokers_owner_inits_moved_into_the_agent() -> None:
     }
     assert volumes["node-state"]["hostPath"] == {
         "path": "/var/lib/e2b/state",
+        "type": "DirectoryOrCreate",
+    }
+    assert volumes["workspace-root"]["hostPath"] == {
+        "path": "/var/lib/e2b/workspaces",
         "type": "DirectoryOrCreate",
     }
 

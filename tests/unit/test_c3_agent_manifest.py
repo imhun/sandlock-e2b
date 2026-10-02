@@ -195,7 +195,10 @@ def test_face_b_is_the_file_face_with_c1s_capability_set() -> None:
     # The fifth is N57 / Task 4's node-local base: `.route-b` (the one document
     # this face chowns, `scope-slot-document`) lives under it now.
     env = _env(face_b)
-    assert env["E2B_WORKSPACE_BASE"]["value"] == "/var/lib/e2b-sandboxes/workspaces"
+    # Task 3: the sandbox tree root is node-local now, and face B has to *mount*
+    # it (the whitelist compares resolved paths; an unmounted base is a path
+    # `e2b-maint` cannot reach).
+    assert env["E2B_WORKSPACE_BASE"]["value"] == "/var/lib/e2b/workspaces"
     assert env["E2B_STATE_BASE"]["value"] == "/var/lib/e2b-sandboxes/state"
     assert env["E2B_NODE_STATE_BASE"]["value"] == "/var/lib/e2b/state"
     assert env["E2B_SHARED_VOLUME_ROOT"]["value"] == "/var/lib/e2b-sandboxes"
@@ -225,6 +228,12 @@ def test_face_b_is_the_file_face_with_c1s_capability_set() -> None:
     assert mounts == {
         "shared": "/var/lib/e2b-sandboxes",
         "image-cache": "/var/lib/e2b-images",
+        # Task 3: the node-local sandbox tree root. Face B scans it (the
+        # orphan sweep's eyes), `e2b-maint` acts on it, and the migration
+        # export/import endpoints of this node's worker write it -- all four
+        # readers resolve the *same* resolved path, so this mount is what makes
+        # the whitelist answer yes.
+        "workspace-root": "/var/lib/e2b/workspaces",
         # ...and the node-local state base, so the path `priv_common.c`
         # resolves for a `.route-b` slot document is one this process can
         # actually open (`chown` walks the real path, not the variable).
@@ -235,18 +244,31 @@ def test_face_b_is_the_file_face_with_c1s_capability_set() -> None:
 def test_face_a_carries_no_mounts_and_the_pod_ships_only_the_three_it_needs() -> None:
     """§2.1: face A shares no path with the worker -- that channel is absent.
 
-    The agent's mounts are the shared PVC, the node-local image cache and (N57 /
-    Task 4) the node-local state base -- all three for face B; face A reads
-    `/proc` of the host through `hostPID` and needs nothing else.
+    The agent's mounts are the shared PVC, the node-local image cache, the
+    node-local state base (N57 / Task 4) and the node-local sandbox tree root
+    (Task 3) -- all four for face B; face A reads `/proc` of the host through
+    `hostPID` and needs nothing else.
     """
     agent = _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
     face_a = _containers(agent)["agent"]
     assert face_a.get("volumeMounts") in (None, [])
     volumes = {v["name"]: v for v in _pod_spec(agent)["volumes"]}
-    assert sorted(volumes) == ["image-cache", "node-state", "shared"]
+    assert sorted(volumes) == [
+        "image-cache",
+        "node-state",
+        "shared",
+        "workspace-root",
+    ]
     assert volumes["shared"]["persistentVolumeClaim"]["claimName"] == "sandbox-shared"
     assert volumes["node-state"]["hostPath"] == {
         "path": "/var/lib/e2b/state",
+        "type": "DirectoryOrCreate",
+    }
+    # Task 3: the tree root is node-local, and it is a *second* hostPath here --
+    # the shape that keeps face A mountless while giving face B the tree it has
+    # to scan, materialize into and export.
+    assert volumes["workspace-root"]["hostPath"] == {
+        "path": "/var/lib/e2b/workspaces",
         "type": "DirectoryOrCreate",
     }
 

@@ -182,6 +182,16 @@ KEY_CLASSES: dict[str, set[str]] = {
         "E2B_REAL_ROOT",
         "E2B_PAUSE_CHECKPOINT",
     },
+    # N57 / Task 3: the byte bound for one tree copy (a migration archive or a
+    # snapshot payload). The k8s fleet names it next to the image-cache bound
+    # it is shaped after; the compose stacks run the code default (1 GiB = one
+    # sandbox's quota, `docs/create-local-first-design.md` §3.1), which is the
+    # same value -- naming it there would be a second place to keep in step
+    # for no decision the lane makes differently.
+    "k8s_tree_copy_bound": {
+        "E2B_TREE_COPY_MAX_BYTES",
+        "E2B_TREE_COPY_WINDOW_BYTES",
+    },
     # The rotation window (E3.6): the examples name one internal key.
     "rotation_window": {"E2B_INTERNAL_API_KEYS"},
     # C3 (Task 4 slice B): which shape performs the worker's privileged file
@@ -314,6 +324,7 @@ _FLEET_STACK_MISSING = (
     KEY_CLASSES["k8s_state_layout"]
     | KEY_CLASSES["k8s_disk_enforcement"]
     | KEY_CLASSES["k8s_real_root_and_checkpoint"]
+    | KEY_CLASSES["k8s_tree_copy_bound"]
 )
 
 #: The compose example stacked with a control plane + Redis: it declares the

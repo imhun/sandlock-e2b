@@ -955,6 +955,39 @@ async def test_a_snapshot_with_no_payload_is_refused_named(workspace: Path) -> N
     assert agent.runner.calls == []
 
 
+@pytest.mark.asyncio
+async def test_a_payload_over_the_byte_cap_is_refused_by_name(
+    workspace: Path,
+) -> None:
+    """Task 3 §3.1: the tree copy has a byte cap and its own refusal name.
+
+    ``maint`` is the 512 MiB container the 900 MiB restore already OOMed
+    (``docs/create-local-first-design.md`` §3.0), and the design's cap table
+    says the alternative -- keeping 512 MiB and dropping the cap to <= 256 MiB
+    -- would refuse restores the product sells. So the cap is 1 GiB by default
+    and *here* it is whatever ``E2B_TREE_COPY_MAX_BYTES`` says; over it the
+    answer is ``tree-too-large``, before a single byte is unpacked.
+    """
+    agent = _Agent(workspace)
+    fs = agent.snapshot_fs()
+    (fs / "workspace").mkdir(parents=True, exist_ok=True)
+    (fs / "workspace" / "big.bin").write_bytes(os.urandom(64 * 1024))
+    payload = fs.parent / "fs.tar"
+    with tarfile.open(payload, "w") as tar:
+        tar.add(fs / "workspace", arcname="workspace")
+    agent.settings.tree_copy_max_bytes = 1024
+
+    resp = await _post(
+        agent, _instruction(tree=_plan_tree(agent, copy_from=str(payload)))
+    )
+
+    assert resp.status_code == 413
+    assert "tree-too-large" in resp.json()["error"]
+    assert "E2B_TREE_COPY_MAX_BYTES" in resp.json()["error"]
+    assert agent.runner.calls == []
+    assert not (agent.tree() / "workspace" / "big.bin").exists()
+
+
 # ------------------------------------------------------------- the slices
 #
 # A mounted volume with a per-sandbox quota gets its own slice directory

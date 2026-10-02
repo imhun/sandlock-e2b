@@ -112,6 +112,9 @@ async def test_create_snapshot_permission_error_is_500_with_reason(
     sandbox_dir = settings.workspace_base / "sbx_snap_src"
     (sandbox_dir / "workspace").mkdir(parents=True)
 
+    # ``**kwargs``: the writer's signature grew the Task 3 byte cap, and this
+    # double stands in for the real call site (the assertion is the 500, not
+    # the signature).
     def _boom(*_args, **_kwargs):
         raise PermissionError(PROVISION_REASON)
 
