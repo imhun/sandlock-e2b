@@ -328,6 +328,13 @@ id 会回落到读盘，所以这个窗口只有几百毫秒）。探针现在�
 | `E2B_SNAPSHOT_COPY_WINDOW_BYTES` | 拷贝按 N 字节分窗，每窗后 `posix_fadvise(POSIX_FADV_DONTNEED)` 丢掉源/目标缓存 | 默认 **64 MiB**：把峰值从"树大小 ×2.9"压到"窗口 + 在途脏页"，与 §7.1 里"每 64 MiB fsync"同一个手法（那次修正正是为了不把 `maint` 打 OOM） |
 | `maint` 的 `memory` limit | `deploy/k8s/c3-agent.yaml` | **512 MiB → ≥ 2 GiB**（`agent` face A 可以不动：它一个卷都没挂）。若不动限额，就必须把上面的 tree 上限压到 **≤ 256 MiB** —— 但没有哪个默认沙箱配额比 256 MiB 更小，所以现实里是"抬限额"（§3.0 已经 OOM 过一次） |
 
+> **Task 3 落地时的两处收窄/明确**（值以上面三行为依据，改动见 §8.2）：
+> ① `E2B_TREE_COPY_MAX_BYTES` 的默认取 **1.25 GiB**（= 1 GiB 配额 + 归档自身开销），
+> 理由见 §8.2 —— 卡在配额本身会把"装满的沙箱"这一唯一不该被拒的情形拒掉；
+> ② 第二个配置落地名字是 `E2B_TREE_COPY_WINDOW_BYTES`（本表写的
+> `E2B_SNAPSHOT_COPY_WINDOW_BYTES` 是同一件事的更早命名：它现在同时管迁移拷贝与快照
+> 拷贝，所以按"树拷贝"命名，见 §8.2）。
+
 ### 3.2 Task 2 上线之后：载荷的形状与两笔账（**实测替换估算**，2026-10-02，`0.1.0-892-g52044b8`）
 
 计划里那一句"快照打成 tar ⇒ 每个条目的 NAS 往返换成一次顺序文件"**只对了一半**。实测
@@ -482,7 +489,7 @@ Task 0 把两个命名空间合成一处之后，这里独立复核"**合并无�
 | 任务 | 这份文档给的约束 |
 |---|---|
 | Task 2（快照 tar） | 路径只有一个根：`<export>/_snapshots/<id>/{snapshot.json, fs.tar, .complete}`（§4.1）；"只有记录"的 `015f`/`1ca5` 是 `status: failed`，不得替它们造载荷（§4.2）；tar 通道要带 §3.1 的 `E2B_TREE_COPY_MAX_BYTES`（快照 ≤ 树上限 1 GiB）；**还要处理 §4.3 的副本间记录不一致**（删除/新增记录不会跨副本失效）<br>**Task 2 落地时按 brief 的裁定收窄了两条，在此点名**：① 按字节上限（`E2B_TREE_COPY_MAX_BYTES`）**没有**随这一步做，它和"拷贝窗口"一起归 Task 3（§3.1 那张表本来就是"三件一起做"，而它的措辞是"单次拷贝的在途量"）；② §4.3 的记录不一致**只观测、不改**（裁定 5/7：`.complete` 与记录不归 Task 2 动）——本轮撞到并记录，见 §7.6 与 `docs/deploy-clusters.md` §7.30。③ 读侧**两种形状都收**：`fs.tar` 解包 + 既有 `fs/` 合并（写侧只出 tar），加固只有一份实现（`gateway_common/archive.py`，三个调用方 import 同一个函数对象），"这是哪一形状"也只有一份实现（`gateway_common.paths.snapshot_payload`，两个读 store 的验收探针也走它）；前后对照的复跑命令见 §7.6<br>**④ 解包的内存账要分两半说（评审轮 1 修正）**：**成员数据**是流式的（逐成员过 tarfile 的 64 KiB 缓冲，不再整包——§3.0 那次 OOM 的驱动项）；**成员索引**仍由 stdlib 保留（`TarFile.next()` 无条件 `members.append`，实测 ~430 B/成员：20 万成员 ⇒ 85.7 MB），所以"全是极小成员"的病态 tar 仍按成员数付费。**成员数上限与 Task 3 的字节上限一起做**，本轮只把它写进 `gateway_common/archive.py` 的模块说明与 §7.6<br>**⑤ 上线后的两笔账（实测，§3.2）**：捕获 ×3–4、占块减半；建箱慢 ~20%，根因是 `tarfile` 的 `data` filter 每条目一次 `realpath`（成本随目的地路径深度走），**Task 3 把树搬本地后消失** —— 这笔代价是明码标价的，不是"没测到" |
-| Task 3（树本地） | 节点预算 8 GiB 树 + 4 GiB 镜像缓存 ≈ 12 GiB / 68–75 GiB 空闲（§2.3）；**大块顺序写会从 ≈488 MB/s 掉到 124.9–125.5 MB/s**（§1.2），元数据快 475×（§1.1）——验收必须用"运行时 I/O"（小文件）而不是建箱延迟立论；**淘汰上限 = `E2B_TREE_COPY_MAX_BYTES` + 拷贝窗口**（§3.1），因为恢复路径 900 MiB 已经把 `maint` 顶到 512.0 MiB 并且**真的 OOM 过一次**（§3.0） |
+| Task 3（树本地） | 节点预算 8 GiB 树 + 4 GiB 镜像缓存 ≈ 12 GiB / 68–75 GiB 空闲（§2.3）；**大块顺序写会从 ≈488 MB/s 掉到 124.9–125.5 MB/s**（§1.2），元数据快 475×（§1.1）——验收必须用"运行时 I/O"（小文件）而不是建箱延迟立论；**淘汰上限 = `E2B_TREE_COPY_MAX_BYTES` + 拷贝窗口**（§3.1），因为恢复路径 900 MiB 已经把 `maint` 顶到 512.0 MiB 并且**真的 OOM 过一次**（§3.0）。**已落地**（2026-10-02，待部署）：见 §8 —— 翻转、流式上限、两个具名错误、排水顺序、验收命令与自己那一份判断都在那里 |
 | Task 4（state 分家） | 裁定 1/3：`command-logs.jsonl` 可以本地、`_runtime/<id>/sandbox.json` 留共享（§5.1）；容量上本节点 state 是小文件，不是容量项（§2.3） |
 
 ---
@@ -597,3 +604,156 @@ env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
 > **§0 里有一处旧数，留给后续任务清**：§0 第 1 条写"元数据上快 480×（2627.2 ms vs
 > 5.5 ms）"，那是 Task 1 修正 `pct()` 之前的读数；§1.1 重测后是 **475×（2601.3 ms vs
 > 5.5 ms）**。本轮不动 §0（它与 §1.1 冲突这件事在这里点名，不静默留着）。
+
+---
+
+## 8. Task 3：树本地化的裁定与落地（2026-10-02，实现轮）
+
+这一节是 **Task 3 实现轮的产品**：代码、清单与文档里的裁定都在这里对齐。它**不是**
+上线记录 —— 集群由控制者在窗口里部署，验收（Step 5）在部署之后跑，命令见 §8.5。
+
+### 8.1 介质翻转：两行吞吐必须并列读
+
+`E2B_TREES_SHARED` 由 `1` 翻成 `0`，`E2B_WORKSPACE_BASE` 由
+`<export>/workspaces` 改指 **节点本地** `/var/lib/e2b/workspaces`
+（worker 与 face B 各挂一个 hostPath；控制面只**命名**它，不挂 —— 它派生给 agent 的
+路径必须解析在节点上）。共享根 `<export>` 一个字符不动：它仍然是 `_snapshots` /
+`_migrate` / `_volumes` / `_images` 的家。
+
+**判据换名字**（裁定 1）在 Task 0 已经做完（`Settings.trees_shared`），本轮只是把它
+翻过来，并把"只翻这一个值、迁移路上不许再出现 `bool(settings.shared_workspace_root)`"
+钉在 `tests/unit/test_root_reslice.py` 与 `tests/unit/test_tree_local_migration.py`。
+读错那个问题的后果不变：**不导出 → 改记录 → 目标节点建空树 → 源节点的树留下**，
+而源节点那棵树因为 id 还在记录里，孤儿回收只会判它 `protected`、永不回收。
+
+**Trade, not a win**（Task 1 的重测推翻了这个计划原来的立论）：
+
+| 负载 | 节点本地 | 共享 NAS | 倍率 |
+|---|---|---|---|
+| 写 200 × 64 B（`open`+`write`+`close`） | **0.0274 ms/个** | 13.136 ms/个 | 本地快 **475×** |
+| 256 / 1024 MiB 顺序写（稳态、带 `fsync` 窗口） | **124.9–125.5 MB/s** | **483–493 MB/s** | 本地慢 **≈3.9×** |
+
+**收益在元数据，不在带宽**。沙箱自己的 `/workspace` 就是这条树路径
+（`envd_service/executors/sandlock.py`），所以 `npm install` 形状（几万次
+create/write/close）赢很多，单次大顺序写在本地**更差**。§3.1 那条"本地 1027 MB/s"
+已在原地撤回（突发相位），**不要引用它**。
+
+**验收必须用元数据密集的负载立论**（裁定：Task 3 的验收不能只测大文件）。
+§8.5 的探针就按这个形状写：小文件写 + 大文件写两腿都跑、都报。
+
+### 8.2 在途上限与"淘汰策略"：一个具名上限 + 一个拷贝窗口
+
+节点盘是稀缺的那个，但容量账（§2.3）不支持"另造一个更小的树上限去提前淘汰"：
+每节点树 ≤ 8 GiB（`E2B_NODE_DISK_MB=8192` ÷ `E2B_DEFAULT_DISK_MB=1024`）+
+镜像缓存 4 GiB ≈ 12 GiB，对 68–75 GiB 空闲留 4–5 倍余量。**要压的是单次拷贝的
+在途量**，这就是本轮的"淘汰上限"落地：
+
+| 配置 | 形状 | 默认 / 线上值 | 越界处置 |
+|---|---|---|---|
+| `E2B_TREE_COPY_MAX_BYTES` | 一次树拷贝的字节上限，`0` = 不限；控制面、worker、face B **共读** | **1.25 GiB**（= 1 GiB 单沙箱配额 + 归档自身开销：tar 头 + gzip 封装，不可压数据不缩小。卡在配额本身会把"装满的沙箱"这一**唯一不该被拒**的情形拒掉） | 迁移/导入/快照捕获：**413 + 具名 `tree-copy-too-large`**；materialize：`MaterializeRefusal(reason="tree-too-large")` → 413 |
+| `E2B_TREE_COPY_WINDOW_BYTES` | 每 N 字节把源/目标的页缓存 `posix_fadvise(POSIX_FADV_DONTNEED)` 丢掉 | **64 MiB**（与 §7.1 探针每 64 MiB `fsync` 同一手法） | 只影响峰值，不影响正确性 |
+| `maint` 的 `memory` limit | `deploy/k8s/c3-agent.yaml` | **512 MiB → 2 GiB** | —— |
+
+为什么必须抬 `maint`（而不是只靠上限）：§3.0 的 900 MiB 恢复把
+`memory.current` 顶到 **512.0 MiB / 512 MiB（10/10 次）** 并**真的 OOMKilled 过一次**；
+§3.1 的结论是"若不动限额，tree 上限只能压到 ≤ 256 MiB —— 而没有哪个默认沙箱配额比
+256 MiB 更小"，所以现实里是抬限额。上限本身在 `c3_agent/materialize.py` 里执行
+（`tree_payload_bytes()` 量完再解包），因此**1 GiB 的合法树能装下，超过它具名拒绝**。
+
+内存那一半也改了形状：两端都不再整棵树进内存 —— 控制面用
+`BoundedTreeWriter` 逐块写/读（`httpx` 的流式 GET/POST，import 侧 `Transfer-Encoding:
+chunked` 是钉在测试里的），worker 的导入把 body 流式落到 `_migrate` 的暂存文件，
+face B 只按 `tree_payload_bytes()` 记账。三处都在 64 KiB–4 MiB 的块上走，不再有
+`resp.content` / `read_bytes()` / `await request.body()`。
+
+### 8.3 迁移路径与两个具名错误
+
+* **中转落点**：`<export>/_migrate`。控制面自己的那份拷贝放在
+  `<export>/_migrate/control-plane/<id>.tar.gz`（`paths.migrate_transfer_path`），
+  **不是**节点侧的 `<id>.tar.gz` —— 节点侧那个名字是源 agent 一边写一边流回来的文件，
+  控制面的流式写如果也用它，会在源节点还在读的时候把文件截断。两份都在共享根上，
+  目标节点读得到。
+* **源节点不可达 = 树不可达，而且是终局**（本地化之后导出端点在源节点上，节点没了
+  就无法事后迁出）：`source-node-unreachable`（`control_plane/api/errors.py`），
+  从"停止源运行时不确认"与"导出握手失败"两条路都抛这个名。它不是 502 泛化。
+* **记录指向的节点上没有树**：`tree-missing-on-recorded-node`（导出端点 404 时给出）。
+  这是一个**数据状态**，不是权限问题：树随那台节点的盘/进程消失，`/workspace` 不是
+  持久对象，**唯一的修复动作是把记录退役** —— 运营侧的名字
+  **`retire-stale-tree-record`**，命令就是 `DELETE /sandboxes/<id>`（SDK
+  `Sandbox.kill()`/`delete`）。要保住的数据只能在快照或卷里，`GET /sandboxes`
+  不该留着一个永远建不出树的记录。**不要**去"重建"一棵树：那会把一个数据丢失事件
+  变成一个静默的数据伪造。
+
+导入是**全有或全无**：body 先流式落到共享暂存，解到树根**同文件系统**的
+`.<id>.importing-<hex>` 目录（`_migrate` 与节点本地树根之间 `rename(2)` 会 EXDEV，
+所以暂存目录必须在树根旁边），成功了才 `rename(2)` 发布；失败时旧树原样不动、
+暂存目录删掉。半棵树在"源节点已经放手"之后是数据损坏的样子，不是中间状态。
+
+### 8.4 排水顺序与持久面（操作纪律 + 产品语义）
+
+**沙箱不是持久对象；持久面是快照与卷。**
+
+* `/workspace`（树）只存在于节点本地盘上，节点掉线即消失，这是**接受的语义**，
+  不是待修的缺陷；需要跨节点的数据走快照（`_snapshots`，共享）或卷
+  （`_volumes/<id>`，按 `volume_node_id` 钉在节点上）。
+* 因此排水的顺序是 **先迁走、再下线**：节点还健在时 `POST /sandboxes/<id>/migrate`
+  把沙箱迁到别的节点（导出 → `_migrate` → 目标导入 → 目标建树 → 源节点的树放手），
+  然后才排空/下线那台节点。**反过来没有兜底**：节点一旦掉线，它上面的树既读不到
+  也迁不走，只剩 `source-node-unreachable` 和 `retire-stale-tree-record` 两个名字。
+* 例行滚动升级（StatefulSet 逐 pod）在同一节点上重建 pod 不丢树（hostPath），但
+  **缩容 / 换机 / 排空节点**必须先迁走。
+* 快照仓不进节点盘：§2.3 的容量账算过（8 沙箱 × 1 GiB × 每天 1 个 × 留 7 天 = 56 GiB，
+  与树和镜像缓存相加 68 GiB 已经越界；每天 8 个则 448 GiB 不可能）。这也是 Task 2
+  "快照落共享"的容量理由。
+
+### 8.5 验收（部署之后由控制者窗口里跑；本节只写命令）
+
+```bash
+cd /Users/polus/project/ai/sandlock-e2b
+deploy/scripts/open-cluster-tunnel.sh          # 通道 + 集群身份自检（2 节点 / arm64 / k0s）
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+export E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000
+export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets \
+    -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d | cut -d, -f1)   # 不要打印
+
+# ① 两方向迁移冒烟（节点健在时迁走保文件；停掉源节点 worker 后必须具名拒绝）
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
+  deploy/scripts/acceptance/tree_local_migration_probe.py --directions both
+
+# ② 元数据密集 vs 大块顺序写（本地化之后两行都要量，见 §8.1）
+kubectl -n sandlock exec -i e2b-worker-0 -- python3 - \
+  --root local:/var/lib/e2b/workspaces --root nas:/var/lib/e2b-sandboxes \
+  --seq-mb 64,1024 --repeat 10 --small-n 200 \
+  < deploy/scripts/acceptance/local_first_storage_probe.py
+
+# ③ 舰队无残留：GET /sandboxes 应为 []（或只有你建的），两节点磁盘可解释
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python - <<'PY'
+import os, httpx
+r = httpx.get(os.environ["E2B_API_URL"] + "/sandboxes",
+              headers={"X-API-Key": os.environ["E2B_API_KEY"]})
+print(r.status_code, r.json())
+PY
+```
+
+**刚滚完就跑建箱会超时**（worker 在重新预热镜像）：先手工建一个沙箱预热，再跑上面
+三条。
+
+### 8.6 Task 3 的自我判断：翻转对真实负载是不是净亏？
+
+**不是净亏，但它的收益是"分负载"的**，而且有两个前提要说清楚：
+
+1. 产品形态是元数据密集的开发负载（`npm install`、`pip install`、git checkout、编辑器
+   写文件），沙箱自己的 `/workspace` 就是那条路径 —— 这条腿赢 475×，而且 §1.4 的表说
+   连 `mkdir`/`chmod`/`lstat`/`open_chain` 这些每个 install 都会付的钱都是 100–1000×。
+2. 大块顺序写（`dd` 一个 GB、视频/大数据落盘）在本地慢 ~3.9×。若这个部署的主要负载
+   是"写大文件"，翻转就是净亏 —— **本部署不是**：容量账里每个沙箱默认配额 1 GiB，
+   树里绝大多数条目是小文件（`_snapshots` 存量 8 个 id / 4055 个条目，
+   平均 ~500 B/条目）。
+
+还有一条**必须记在这里的代价**：本地化把"节点掉线 = 树没了"从"NAS 还在、可以人工取"
+变成"没有事后补救"（§8.4 的排水纪律 + §8.3 的具名错误）。裁定 6 明确接受它
+（持久面是快照与卷），但那是一个**产品语义**的选择，不是工程上的等价替换。
+
+最后一句留给控制者：如果 Task 6 上线前的验收（§8.5 ① 两条腿）显示真实负载里大文件
+占比高到把 475× 的元数据收益抵掉，那么回退就是翻回 `E2B_TREES_SHARED=1` 一个字符 ——
+代码路径、清单、验收探针都不需要改。
