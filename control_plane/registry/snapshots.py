@@ -546,9 +546,15 @@ class SnapshotRegistry:
             # in), so that one is re-read from the shared record instead of
             # served from this process's cache -- otherwise a poll that lands
             # on the "other" replica waits forever on a copy that finished
-            # (F11 step 3). Finished records never change, and stay cached.
+            # (F11 step 3). The other cross-replica change is a *deletion*
+            # (N62): the file is the truth, so a cache hit is only good while
+            # the record file is still there -- otherwise an id deleted by a
+            # peer stays visible here forever. Finished records never change in
+            # place, and otherwise stay cached.
             if record is not None and record.status != "creating":
-                return record
+                if self._record_path(snapshot_id)[0].is_file():
+                    return record
+                self._snapshots.pop(snapshot_id, None)
         path, fs_path = self._record_path(snapshot_id)
         if not path.is_file():
             raise UnknownSnapshotError(snapshot_id)
@@ -577,9 +583,17 @@ class SnapshotRegistry:
         offset: int = 0,
         tenant_id: str | None = None,
     ) -> list[SnapshotRecord]:
-        records = sorted(
-            self._snapshots.values(), key=lambda r: r.created_at, reverse=True
-        )
+        # The records live on the shared volume, not in this process (N62): two
+        # replicas must list the same set, and a peer's create/delete has to
+        # show up here. The in-memory dict is only a warm cache behind
+        # :meth:`get` -- same walk as :meth:`in_progress`.
+        records: list[SnapshotRecord] = []
+        for path in sorted(self._snapshots_root.glob("*/snapshot.json")):
+            try:
+                records.append(self.get(path.parent.name))
+            except UnknownSnapshotError:
+                continue
+        records.sort(key=lambda r: r.created_at, reverse=True)
         if tenant_id is not None:
             records = [r for r in records if r.tenant_id == tenant_id]
         if name:
