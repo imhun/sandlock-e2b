@@ -188,14 +188,18 @@ spec:
               value: /var/lib/e2b-sandboxes/state
             # N57 (Task 4): the **node-local** half of the platform's own
             # state -- the create's `.creating` marker, its `statfs(2)`
-            # accounting seed, `.route-b`'s slot documents and the uid pool's
-            # lock and reservation markers. All four are read by *this* node's
-            # processes only (the marker by a racing DELETE, the seed by the
-            # sandbox's own slot, the slot documents by the slot and the agent,
-            # the pool's files by this worker), while the *record*
+            # accounting seed and `.route-b`'s slot documents. All three are
+            # read by *this* node's processes only (the marker by a racing
+            # DELETE, the seed by the sandbox's own slot, the slot documents by
+            # the slot and the agent), while the *record*
             # (`<state>/_runtime/<id>/sandbox.json`) and the checkpoint images
             # stay on the shared base because the fleet-wide uid ledger and a
-            # migrating resume read them from other nodes.
+            # migrating resume read them from other nodes. The uid pool's own
+            # `.uid_pool.lock` / `.uid_reservations/` are **not** here either:
+            # N57 moved them back to the shared `E2B_STATE_BASE` so `acquire`'s
+            # read-record / pick-uid / write-marker critical section is mutually
+            # exclusive across nodes (the `claim` path -- the factory shape --
+            # never touches them).
             #
             # The point of the split is the create's `prepare` phase: on this
             # deployment every write under `<state>` is one NFS metadata round
@@ -723,8 +727,10 @@ spec:
             # creates it and hands it to uid 65534; `DirectoryOrCreate` is the
             # fallback for a node whose agent has not started yet -- kubelet
             # would then create it root-owned and the worker's first create
-            # would fail with a loud EACCES on `.uid_pool.lock` rather than
-            # writing into a directory nobody styled.
+            # would fail with a loud EACCES on `<node_state>/_runtime/<id>/.creating`
+            # (or `.route-b/**`) rather than writing into a directory nobody
+            # styled. (The pool's `.uid_pool.lock` / `.uid_reservations/` are
+            # *not* here -- N57 keeps them on the shared `E2B_STATE_BASE`.)
             - name: node-state
               mountPath: /var/lib/e2b/state
       volumes:
