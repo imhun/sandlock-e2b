@@ -138,6 +138,16 @@ def main() -> int:
     )
     parser.add_argument("--n", type=int, default=10)
     parser.add_argument("--disk-mb", type=int, default=1024)
+    parser.add_argument(
+        "--hold-s",
+        type=float,
+        default=0.0,
+        help=(
+            "sleep this long between each prepare and its cancel, so an operator "
+            "can look at the node-local chips while they exist (the .creating "
+            "marker only lives from prepare until the record is durable)"
+        ),
+    )
     args = parser.parse_args()
 
     worker = args.worker_url or _worker_address(
@@ -164,6 +174,17 @@ def main() -> int:
             payload=payload,
         )
         samples.append(prepare_ms)
+        if args.hold_s:
+            # Explicit, bounded pause: this is what makes the §7.31 step-③ check
+            # re-runnable -- the marker exists exactly in this window, and the
+            # cancel below is what takes it (and the seed, and the pool's own
+            # files) back off. Use `--n 1 --hold-s 25` for the inspection.
+            print(
+                f"holding {args.hold_s:.0f}s before cancel "
+                f"(sandboxID={sandbox_id})",
+                flush=True,
+            )
+            time.sleep(args.hold_s)
         # Undo the prepared half: release the uid, drop the marker and the
         # accounting seed. No record was written and no tree was built, so the
         # fleet is left exactly as it was found.

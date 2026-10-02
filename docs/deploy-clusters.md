@@ -1633,12 +1633,13 @@ env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
 一侧都能恢复；反过来，`fs.tar` 的载荷只被新读侧认，回退到 `0.1.0-887` 之前的镜像会让这些
 新快照**不可恢复**（记录在案，别只回镜像不停手）。
 
-### 7.31 N57（Task 4）：本节点 state 分家（**仓库已落，集群未上线**）
+### 7.31 N57（Task 4）：本节点 state 分家（**2026-10-02 已上线 `0.1.0-900-g0079c84-20261002-161409`**）
 
 计划 `docs/superpowers/plans/2026-10-02-local-first-create.md` 的 Task 4；介质归属、四个
 小件的清单与三条裁定在 `docs/create-local-first-design.md` §2.3/§2.4/§5，那一行的目标值在
-`docs/create-local-first-layout.md` §1。**这一节不含集群读数**：判据（本节的命令）要在
-Task 3 + Task 5 + 本节的镜像一起滚上去之后跑，本文只写"怎么量、期望什么"。
+`docs/create-local-first-layout.md` §1。本节的读数在**Task 5（`9a562ba`）+ Task 4
+（`7a90293`/`91ce91d`/`0079c84`）**的镜像上实测；**Task 3（树本地化）没上**，所以这里量到的
+是"prepare 不再当长杆"而不是整条的收益（见下面的读数表与"结论"）。
 
 **改了什么**：`prepare` 原先在共享 `E2B_STATE_BASE` 上写三样小东西 —— `.creating` 标记、
 uid 认领（`.uid_pool.lock` + `.uid_reservations/`）、`disk-stats` 种子。共享卷是 NFS，一次
@@ -1659,10 +1660,11 @@ uid 认领（`.uid_pool.lock` + `.uid_reservations/`）、`disk-stats` 种子。
 ```bash
 deploy/scripts/open-cluster-tunnel.sh && export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 
-# ① prepare 那一段本身（期望 ~10 ms）。⚠ 这个探针的 payload 不带 hostUID ⇒ 走的是**回落**
-#    形状（acquire，多付一笔锁 + 预留标记）；Task 1 的 72–76 ms 来自**已部署**形状（带 hostUID、
-#    走 claim）。前后对照请用 ② 的 trace `prepare`（同形状）；①只看"这一跳现在多快"——
-#    改动之后两种形状的这些写都在节点本地盘上，差的只是微秒级。
+# ① prepare 那一跳（HTTP 边界）。⚠ 这个探针的 payload 不带 hostUID ⇒ 走的是**回落**形状
+#    （acquire：多写锁 + 预留标记，还多读一次共享的舰队账本索引 `_recorded_uids`）；
+#    Task 1 的 72–76 ms 与本次的 trace `prepare` 都是**已部署**形状（带 hostUID、走 claim，
+#    不碰锁/标记/索引）。所以①只能读作"回落形状的 prepare 跳有多快"（实测 p50 18.8 ms），
+#    **不是**"掉了多少"，也不是（同形状下）prepare 本身的耗时——"掉了多少"看 ② 的 trace。
 CP=$(kubectl -n sandlock get pod -l app=control-plane -o jsonpath='{.items[0].metadata.name}')
 kubectl -n sandlock exec -i "$CP" -c control-plane -- \
     python3 - "$E2B_API_KEY" "$E2B_INTERNAL_API_KEY" --n 10 \
@@ -1682,14 +1684,79 @@ kubectl -n sandlock exec -i "$CP" -c control-plane -- \
     sh -c 'ls -la /var/lib/e2b-sandboxes/state/_runtime | head'
 ```
 
-**期望**：① `prepare` 这一跳的 p50 落到 **~10 ms** 量级（剩下的是一次 mkdir + 两个小写 +
-Python 开销，全在节点盘上）—— ①**不**与 72–76 ms 对比，那是**别的形状**的历史读数（见上面那段
-caveat：① 走回落 `acquire`，Task 1 的 72–76 ms 走已部署 `claim`）；**"掉了多少"看 ② 的 trace
-`prepare`**（同形状，before = 72–76 ms）。② 整条建箱的 p50 由 `max(materialize, prepare)` 决定，
-所以这一条**只有和 Task 3（树本地化）一起上线**才看得出来 —— 单上本节，长杆就是 `materialize`。
-③ 的形状：节点本地只出现 `_runtime/<id>/.creating`、`disk-stats`、`.route-b`、
-`.uid_pool.lock`、`.uid_reservations`；共享 `<export>/state/_runtime` 里**没有** `.creating`、
-没有 `disk-stats`，只有 `sandbox.json` / `command-logs.jsonl` / `.checkpoints`。
+**实测（2026-10-02，`0.1.0-900-g0079c84-20261002-161409`，控制面 pod 内 `--n 10`，先预热）**
+
+| 判据 | 改前（§7.29/§7.30 读数） | 改后 | 结论 |
+|---|---|---|---|
+| 整条建箱 p50（含预热后的 10 连跑） | 124–135 ms（p95 180–186） | **116 / 117 ms**（两轮；p95 128 / 137；trace 开着的那轮 118） | 只降了 ~8–19 ms —— **没有**按 prepare 省下的量整体下移 |
+| trace `prepare`（**已部署形状**：`claim`） | **72–76 ms** | **4.8 / 7.3–7.6 ms**（11 个样本，p50 ≈ **7.4**） | ✅ **长杆没了**：落到 ~10 ms 量级 |
+| trace `finalize` | 7.7–8.0 | 8.0–8.9 ms | 没动 |
+| trace `prime` | 5.3–11.3 | 3.2–3.5 ms（那一轮的预热样本 50.2） | 没动（略好） |
+| trace `record`（不在响应路径上） | ≈51 | 49.7–54.2 ms | 没动 |
+| ① prepare 跳（**回落形状**，`acquire`） | ——（未测过） | p50 **18.8 ms**（首样本 58.2 冷启动） | 这条形状比 `claim` 多两件事：写锁/预留标记（现在在节点盘上）+ **读一次共享的舰队账本索引**（按设计必须共享）——所以它不是 ~10 ms，也不该拿来对比 |
+
+**结论（要说清楚的一条）**：`prepare` 从 72–76 ms 掉到 **7.4 ms**，这一节的目标达成；
+但整条建箱的 p50 只动了 ~8–19 ms，因为 **worker 那一跳的三段相加现在只有 ~19 ms**
+（7.4 + 8.4 + 3.3），而 API 看到的建箱是 ~116–123 ms ⇒ **剩下 ~100 ms 落在 worker 的
+trace 之外**：控制面自己的活 + **与 `prepare` 并发的 agent `materialize` 那一跳**
+（`c3_agent` 的 `POST …/agent/materialize`，控制面 pod 的访问日志里每次建箱一条）。
+
+那 100 ms 里谁是大头，**我没有直接测到**（控制面侧没有逐段 trace：`create_trace` 只存在于
+worker/envd）。能给的是一段**算术**，而且它只在"两跳并发"模型下自洽（Task 7.28 的设计）：
+记 `m` 为 materialize、`s` 为 worker 三段之和、`c` 为控制面自己的活，
+则 `create ≈ max(prepare, m) + s' + c`。改前 `72–76 + 8 + 5..11 ≈ 86–95`，若两跳**串行**
+则 `m ≈ 124–135 − 86..95 − c ≈ 25–45`；改后 worker 只有 `≈19`，同一个 `m` 却要求
+`m ≈ 116–123 − 19 − c ≈ 97–104` —— **自相矛盾**。⇒ 两跳是并发的（`max`），且
+`m ≈ 100 ms` 在两次读数里是同一个值。所以：**prepare 不再是 floor，floor 是 materialize
+（~100 ms，仍在共享树根上），Task 3 才是动它的那一步**。这条是推论（有读数支撑），
+要坐实得给控制面那侧也加一段逐段 trace —— 本轮不改代码，记在这里。
+
+③ 的形状（判据，实测见下）：节点本地只出现 `_runtime/<id>/.creating`、`disk-stats`、
+`.route-b/**`、`.uid_pool.lock`、`.uid_reservations/`；共享 `<export>/state/_runtime/<id>/`
+里**没有** `.creating`、没有 `disk-stats`，只有 `sandbox.json` / `command-logs.jsonl`。
+
+**③ 三个具体读数（2026-10-02）**
+
+1. **在飞的 `prepare`**（控制面 pod 打 worker-1 的 agent 口，`phase: prepare` 挂 30 s 再看，
+   `phase: cancel` 收回）：节点本地 `_runtime/probe4chips082152/` 里 **`.creating`（0 B）+
+   `disk-stats`（`1073741824 0`）**，根下还有 **`.uid_pool.lock`（0600, 0 B）+
+   `.uid_reservations/probe4chips082152`（`10000`）**（这条形状走 `acquire`，所以四个文件全在）；
+   同一时刻共享 base 的 `.uid_pool.lock` 仍是 **09-26 10:02:39**、`.uid_reservations` 仍是
+   **10-01 14:20:10**（都是改前的 mtime）、共享 `_runtime` 里没有 `probe4chips*`。`cancel`
+   之后节点本地的 `_runtime/<id>` 与预留标记都消失（配对收尾按设计）。
+2. **活的沙箱**（`sbx_d396465479a045c6`，跑过一条命令）：节点本地
+   `_runtime/sbx_d396…/disk-stats` = `1073741824 1024`（quota 种子，周期扫描在更新它）；
+   共享 `_runtime/sbx_d396…/` 只有 **`sandbox.json`(679 B) + `command-logs.jsonl`(213 B)**，
+   `.creating` / `disk-stats` 两个 `ls` 都是 `No such file or directory`。删除之后节点本地
+   那一份消失、共享那一份随树一起消失。
+3. **`.route-b` 落点**（这条是对"清单约定 ≠ 真实落点"那半的直接检验）：在那条命令跑起来之后，
+   worker-1 节点本地出现 **`/var/lib/e2b/state/.route-b/10001/sbx_d396…/{policy.json,program.json}`**
+   （08:23:04）；共享 `<export>/state/.route-b/` 在最近 30 分钟里**没有任何**新条目
+   （`find -newermt "-30 minutes"` 为空；根下最新写入仍是 06:19 的 uid `10000`）。
+   ⇒ 清单里的 `E2B_ROUTE_B_TMP_ROOT=/var/lib/e2b/state/.route-b` 是**真的落点**，不是约定。
+   （沙箱杀掉之后那对 slot 文档仍留在节点本地 —— 与共享 `.route-b` 的历史行为一致：
+  按 `(uid, instance)` 留着，不随沙箱回收。）
+
+**"在飞的 `.creating`"怎么再看一次**：`prepare_phase_cost_probe.py --hold-s` 把每一轮
+`prepare` 挂住再 `cancel`（不落记录、不建树），于是四个小件在那几秒里是**能直接 `ls` 到**的
+（注意这条形状走 `acquire`，所以锁与预留标记也会在；挂住期间另一个终端看数据）：
+
+```bash
+WIP=$(kubectl -n sandlock get pod e2b-worker-1 -o jsonpath='{.status.podIP}')
+CP=$(kubectl -n sandlock get pod -l app=control-plane -o jsonpath='{.items[0].metadata.name}')
+kubectl -n sandlock exec -i "$CP" -c control-plane -- \
+    sh -c 'python3 - x "$E2B_INTERNAL_API_KEY" --worker-url '"http://$WIP:49983"' \
+           --n 1 --hold-s 25' \
+    < deploy/scripts/acceptance/prepare_phase_cost_probe.py &
+sleep 10
+kubectl -n sandlock exec -i "$CP" -c control-plane -- \
+    sh -c 'ls -la /var/lib/e2b-sandboxes/state/_runtime | grep -c probe4_ || true'   # 共享：0
+for p in e2b-worker-0 e2b-worker-1; do
+  kubectl -n sandlock exec "$p" -- sh -c \
+    'ls -la /var/lib/e2b/state/_runtime /var/lib/e2b/state/.uid_reservations 2>&1 | tail -6'
+done
+wait
+```
 
 **本地可先量的机制读数**（不用集群，`deploy/scripts/acceptance/node_state_split_local_probe.py`，
 量的是**回落形状**——它的 payload 不带 `hostUID`，所以 `14` 里含 `pool.acquire` 的锁与预留标记；
