@@ -1659,7 +1659,10 @@ uid 认领（`.uid_pool.lock` + `.uid_reservations/`）、`disk-stats` 种子。
 ```bash
 deploy/scripts/open-cluster-tunnel.sh && export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 
-# ① prepare 那一段本身（Task 1 基线 72–76 ms；期望 ~10 ms）
+# ① prepare 那一段本身（期望 ~10 ms）。⚠ 这个探针的 payload 不带 hostUID ⇒ 走的是**回落**
+#    形状（acquire，多付一笔锁 + 预留标记）；Task 1 的 72–76 ms 来自**已部署**形状（带 hostUID、
+#    走 claim）。前后对照请用 ② 的 trace `prepare`（同形状）；①只看"这一跳现在多快"——
+#    改动之后两种形状的这些写都在节点本地盘上，差的只是微秒级。
 CP=$(kubectl -n sandlock get pod -l app=control-plane -o jsonpath='{.items[0].metadata.name}')
 kubectl -n sandlock exec -i "$CP" -c control-plane -- \
     python3 - "$E2B_API_KEY" "$E2B_INTERNAL_API_KEY" --n 10 \

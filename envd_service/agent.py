@@ -1220,10 +1220,16 @@ def _park_refused_tree(
         # and it is dropped here for the same reason the shared half is: a
         # parked tree leaves nothing behind that describes a sandbox nobody can
         # act on. Its reader (this node's slot/worker) is gone with the tree.
-        try:
-            _node_runtime_dir(settings, sandbox_id).rmdir()
-        except OSError:  # pragma: no cover - absent, or not empty
-            pass
+        #
+        # It is an ``rmtree`` and not the ``rmdir`` the cancel path uses, and
+        # that is the whole point (fix round 1, review Important 1): a *parked*
+        # tree is a finished create, so this directory still holds the seed the
+        # create wrote (``.creating`` came off when the record went durable).
+        # ``rmdir`` therefore raises ``ENOTEMPTY`` -- and an ``except OSError:
+        # pass`` around it was a silent no-op that left one seed file per parked
+        # sandbox on the node's disk for ever. There is nothing here to keep:
+        # the marker and the seed are per-this-node live state, not evidence.
+        shutil.rmtree(_node_runtime_dir(settings, sandbox_id), ignore_errors=True)
         # The checkpoint images are evidence of the same kind and live in their
         # own store (``_runtime/.checkpoints/<id>`` -- the sandbox's slot is what
         # writes them, so they cannot sit under the worker-owned runtime dir).

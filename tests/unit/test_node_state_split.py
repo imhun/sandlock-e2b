@@ -190,6 +190,15 @@ async def _delete(app, sandbox_id: str = SANDBOX) -> httpx.Response:
         )
 
 
+async def _park(app, sandbox_id: str = SANDBOX) -> httpx.Response:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://worker"
+    ) as client:
+        return await client.post(
+            f"/agent/untrusted/{sandbox_id}/park", headers={"X-Internal-Key": KEY}
+        )
+
+
 @pytest.mark.asyncio
 async def test_the_create_marker_lives_on_the_node_local_base(tmp_path: Path) -> None:
     """The create's marker and the ``statfs`` seed are written node-local.
@@ -318,3 +327,42 @@ async def test_the_teardown_takes_the_node_local_chips_with_it(tmp_path: Path) -
 
     assert _node_dir(settings).exists() is False
     assert _shared_dir(settings).exists() is False
+
+
+@pytest.mark.asyncio
+async def test_the_park_path_drops_the_node_local_chips_too(tmp_path: Path) -> None:
+    """Park is the third exit, and it is the one that cannot be an ``rmdir``.
+
+    A parked tree is one the worker **refuses** to act on -- reached exactly
+    because its record contradicts the tree it was found next to, or because
+    there is no record at all (the eviction / TTL / unreachable-worker case
+    this route exists for). Either way it is a *completed* create: the shared
+    half is moved into ``_untrusted.trees/<id>`` entry by entry, and the
+    node-local half holds the ``statfs`` seed the create left behind (the
+    marker came off when the record went durable), so the directory is **not
+    empty**. An ``rmdir`` there raises ``ENOTEMPTY``; swallowing it -- which is
+    what this path did until fix round 1 -- leaves one seed file per parked
+    sandbox on the node's disk for ever, in a directory no scan covers.
+
+    Fix round 1 (review Important 1): the cleanup is an ``rmtree`` now, and
+    this test is the pin that was missing -- it builds precisely that shape
+    (``disk-stats`` alone in the node-local directory) so the regression cannot
+    pass as a "best effort".
+    """
+    app, settings, _registry = _worker(tmp_path)
+    tree = Path(settings.workspace_base) / SANDBOX
+    (tree / "workspace").mkdir(parents=True)
+    node_dir = _node_dir(settings)
+    node_dir.mkdir(parents=True)
+    (node_dir / "disk-stats").write_text("1024 0\n", encoding="utf-8")
+    # No record anywhere: the control plane released it (eviction / TTL / a
+    # worker that was unreachable), which is what makes this tree one the
+    # worker refuses -- and what an operator reaches for this route with.
+    assert _shared_dir(settings).exists() is False
+
+    assert (await _park(app)).status_code == 200
+
+    assert _node_dir(settings).exists() is False
+    assert _shared_dir(settings).exists() is False
+    # The tree is *kept* -- park moves it, never deletes it.
+    assert (Path(settings.workspace_base) / "_untrusted.trees" / SANDBOX).is_dir()
