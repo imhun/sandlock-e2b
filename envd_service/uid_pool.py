@@ -20,21 +20,24 @@ persist) — reclaims them and chowns the stale directories away from the pool
 so a later allocation cannot inherit foreign files.
 
 Cross-process safety (I1): ``acquire`` briefly takes an exclusive ``flock``
-on the pool's own state file ``<node state base>/.uid_pool.lock`` while it
+on the pool's own state file ``<state base>/.uid_pool.lock`` while it
 recomputes the free set and atomically writes a reservation marker
-(``<node state base>/.uid_reservations/<sandbox_id>``). Both are *platform*
-state, so they follow ``E2B_STATE_BASE`` out from under the tree root (N27) and,
-since Task 4, ``E2B_NODE_STATE_BASE`` out of the NAS: with neither base named
-they are the workspace base, exactly as before (N57). The marker makes the
-reservation visible to every other process of this node from the moment the uid
-is handed out — the acquire→register window (volume provisioning, recursive
+(``<state base>/.uid_reservations/<sandbox_id>``). Both are *platform*
+state, so they follow ``E2B_STATE_BASE`` out from under the tree root (N27) --
+and, unlike the create's node-local chips, they *stay* there (N57): what the
+critical section fences is the choice of a uid over the shared objects (volume
+slices, ``_snapshots`` payloads, image-cache secrets), so a fence only this
+node waits on lets two nodes pick one uid. With no base named they are the
+workspace base, exactly as before. The marker makes the reservation visible
+to every other worker -- on any node -- from the moment the uid is handed out
+— the acquire→register window (volume provisioning, recursive
 chown) can be long, so waiting for the record would leave a collision window.
 The caller persists the ``sandbox.json`` record and
 calls :meth:`UidPool.commit` to drop the marker, or abandons the allocation
 via :meth:`UidPool.release` (failed create / delete), which drops the marker
 and frees the uid. ``flock`` serializes the compute+marker-write critical
-section across processes; the marker keeps the picked uid out of every other
-*same-node* worker's view until the record is durable, and the record itself
+section across processes of every node; the marker keeps the picked uid out of
+every other worker's view until the record is durable, and the record itself
 is the fleet-wide statement (``_recorded_uids`` enumerates the shared records,
 so a cross-node peer sees the uid as taken as soon as the record lands; the
 deployment's authority for the uid is the control plane's allocation, OBS-9).
@@ -63,7 +66,6 @@ from gateway_common import create_trace
 from gateway_common.paths import (
     RUNTIME_DIR_NAME,
     is_sandbox_workspace_dir,
-    resolve_node_state_base,
     resolve_state_base,
     sandbox_record_path,
     validate_sandbox_id,
@@ -413,13 +415,14 @@ class UidPool:
 
     Correct across processes: allocation recomputes the used set from
     ``sandbox.json`` records **and** reservation markers on disk under a
-    cross-process ``flock``, so a separate-process worker sharing the
-    workspace never collides with an allocation another worker handed out
-    but has not persisted yet. ``acquire`` holds the reservation marker until
-    the caller persists the record (:meth:`commit`) or abandons the
-    allocation (:meth:`release`). Deployments that share one workspace
-    between multiple workers should still use disjoint ``E2B_UID_POOL_START``
-    ranges for the other shared state (quota tables, reconcile scans).
+    cross-node ``flock`` (the pool's own files live on the **shared** state
+    base, N57), so a worker on any node sharing the workspace never collides
+    with an allocation another worker handed out but has not persisted yet.
+    ``acquire`` holds the reservation marker until the caller persists the
+    record (:meth:`commit`) or abandons the allocation (:meth:`release`).
+    Deployments that share one workspace between multiple workers should still
+    use disjoint ``E2B_UID_POOL_START`` ranges for the other shared state
+    (quota tables, reconcile scans).
     """
 
     def __init__(
@@ -445,18 +448,17 @@ class UidPool:
         #: same base (``sandbox_record_path(..., state_base=...)``), while the
         #: directories it walks stay under the workspace base.
         self._state_base = resolve_state_base(self._workspace_base, state_base)
-        #: Where the pool's *own* files live -- the cross-process ``flock`` and
-        #: the reservation markers. Node-local since Task 4: the lock is only
-        #: ever waited on by processes of this node, and a marker written to
-        #: the NAS was one metadata round trip paid inside ``acquire`` (and
-        #: again inside ``commit``'s negative ``unlink``). The fleet-wide
-        #: ledger is *not* these files -- it is the shared records the index in
-        #: :func:`_recorded_uids` enumerates, which is why nothing here has to
-        #: be visible to another node. Unset, this is the state base, i.e.
-        #: exactly the pre-Task-4 layout.
-        self._local_base = resolve_node_state_base(
-            self._workspace_base, state_base, node_state_base
-        )
+        # ``node_state_base`` is still accepted because every caller names it
+        # (the deployment sets it for the create's node-local chips), but it no
+        # longer holds anything this pool owns: the lock and the reservation
+        # markers stay on the *shared* state base above (N57). ``acquire``'s
+        # critical section -- read the shared record index, pick a free uid,
+        # write the reservation -- decides over objects every node can see
+        # (volume slices, ``_snapshots`` payloads, image-cache secrets), so a
+        # fence only this node waits on hands the same uid to two nodes. The
+        # hot path is unaffected: ``claim`` (the control plane's allocation,
+        # OBS-9) touches neither file, so nothing pays the shared export for
+        # their return here.
         self._allocated: set[int] = set()
         self._by_sandbox: dict[str, int] = {}
         self._lock = threading.Lock()
@@ -472,7 +474,7 @@ class UidPool:
     @property
     def lock_path(self) -> Path:
         """Cross-process serialization point for the free-set computation."""
-        return self._local_base / ".uid_pool.lock"
+        return self._state_base / ".uid_pool.lock"
 
     def _open_reservation_lock(self) -> int:
         """Open and exclusively flock the pool's own lock file.
@@ -484,12 +486,8 @@ class UidPool:
         # The *workspace* base is ensured on demand (this pool's own scans read
         # it, and yesterday it was also the lock's parent). The state base is
         # not: it belongs to the deployment's init container, which owns its
-        # mode and ownership on the shared export -- and neither is the
-        # node-local base, which that same init container creates with the
-        # worker's ownership (it is a hostPath, so nothing else may style it
-        # either: NFS's root_squash rules do not apply, but a worker-created
-        # directory would still land with whatever umask the worker has). A
-        # missing base therefore fails loudly on the ``open`` below.
+        # mode and ownership on the shared export. A missing base therefore
+        # fails loudly on the ``open`` below.
         self._workspace_base.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
@@ -507,7 +505,7 @@ class UidPool:
             os.close(fd)
 
     def _marker_path(self, sandbox_id: str) -> Path:
-        return self._local_base / _RESERVATION_DIR / sandbox_id
+        return self._state_base / _RESERVATION_DIR / sandbox_id
 
     def _write_reservation(self, sandbox_id: str, uid: int) -> None:
         """Atomically persist the reservation marker (under the flock)."""
@@ -534,7 +532,7 @@ class UidPool:
         startup-only scan; the multi-worker concurrent-startup caveat is the
         documented one for orphan reclaim (report §5 / Concerns §3).
         """
-        marker_dir = self._local_base / _RESERVATION_DIR
+        marker_dir = self._state_base / _RESERVATION_DIR
         if not marker_dir.is_dir():
             return
         try:
@@ -550,7 +548,7 @@ class UidPool:
 
     def _reserved_uids(self) -> set[int]:
         """Pool-range uids held by reservation markers (cross-process)."""
-        marker_dir = self._local_base / _RESERVATION_DIR
+        marker_dir = self._state_base / _RESERVATION_DIR
         reserved: set[int] = set()
         if not marker_dir.is_dir():
             return reserved

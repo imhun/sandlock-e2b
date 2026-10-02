@@ -28,6 +28,27 @@ def _pool(workspace: Path) -> UidPool:
     return UidPool(start=POOL_START, size=POOL_SIZE, workspace_base=workspace)
 
 
+def _node_pool(
+    workspace: Path, state_base: Path, node_state_base: Path | None
+) -> UidPool:
+    """One worker's pool in the post-Task-4 shape: a shared state base (the
+    records, and -- since N57 -- the pool's own lock and markers) plus a
+    node-local base for the chips this node alone reads. Both bases are created
+    here the way the deploy's init container creates them: the pool's
+    ``open`` of the lock fails loudly on a missing base on purpose.
+    """
+    state_base.mkdir(parents=True, exist_ok=True)
+    if node_state_base is not None:
+        node_state_base.mkdir(parents=True, exist_ok=True)
+    return UidPool(
+        start=POOL_START,
+        size=POOL_SIZE,
+        workspace_base=workspace,
+        state_base=state_base,
+        node_state_base=node_state_base,
+    )
+
+
 def _write_record(workspace: Path, sandbox_id: str, host_uid: int | None) -> None:
     record = workspace / sandbox_id / "sandbox.json"
     record.parent.mkdir(parents=True, exist_ok=True)
@@ -211,6 +232,49 @@ def test_acquire_concurrent_across_pool_instances_no_collision(tmp_path):
     all_uids = uids_a + uids_b
     assert len(all_uids) == 6
     assert len(all_uids) == len(set(all_uids))
+
+
+def test_two_nodes_with_distinct_node_state_base_do_not_share_a_uid(tmp_path):
+    """N57: the fallback allocator's critical section has to be cross-node.
+
+    ``acquire`` is what runs when a create arrives without a control-plane
+    ``hostUID``: it recomputes the free set from the shared records and then
+    picks the lowest free uid, and that pick is only safe if every *node*
+    looks at the same picked-uids set. With the pool's lock and reservation
+    markers on the node-local base, two nodes in exactly this shape both see
+    "10000 is free" -- the shared objects (volume slices, snapshot payloads,
+    image-cache secrets) then become mutually readable and E3.2's isolation
+    wall is gone.
+    """
+    pool_a = _node_pool(
+        tmp_path / "workspaces", tmp_path / "state", tmp_path / "node-0-state"
+    )
+    pool_b = _node_pool(
+        tmp_path / "workspaces", tmp_path / "state", tmp_path / "node-1-state"
+    )
+    uid_a = pool_a.acquire("sbx_a")
+    uid_b = pool_b.acquire("sbx_b")
+    assert (uid_a, uid_b) == (POOL_START, POOL_START + 1)
+
+
+def test_the_pool_lock_and_markers_live_on_the_shared_state_base(tmp_path):
+    """N57: the pool's own files are platform state, not node-local chips.
+
+    The lock and the markers *are* the cross-node serialization of the
+    fallback allocator, so they belong on the base every node shares. What
+    makes that free is the hot path: ``claim`` (the control plane's
+    allocation, OBS-9) touches neither file, so ``prepare`` pays nothing for
+    their return to the shared export.
+    """
+    state_base = tmp_path / "state"
+    node_state_base = tmp_path / "node-state"
+    pool = _node_pool(tmp_path / "workspaces", state_base, node_state_base)
+    assert pool.lock_path == state_base / ".uid_pool.lock"
+    assert pool.acquire("sbx_a") == POOL_START
+    marker = state_base / ".uid_reservations" / "sbx_a"
+    assert marker.read_text(encoding="utf-8") == f"{POOL_START}\n"
+    assert (node_state_base / ".uid_reservations").is_dir() is False
+    assert (node_state_base / ".uid_pool.lock").is_file() is False
 
 
 def test_release_without_commit_frees_uid_for_other_pool(tmp_path):
