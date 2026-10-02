@@ -565,6 +565,9 @@ env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
 
 * `snapshot_create_probe.py` 一次跑完三档，并把两个口径都打出来：`per_entry_ms`
   （旧形状的单位，Task B 的 ~25 ms/条目就是它）与 `mb_per_s`（新形状的单位）。
+  **读 `mb_per_s` 要看清楚它的分子**：探针用的是**树内容字节**（三档 5 B / 385 B / 2106 B），
+  所以这三档它都打印 `0.000` —— 这些档证明的是"成本不再随条目数走"，不是一台吞吐计。
+  字节口径看 `--keep` 之后的载荷本身（`fs.tar` 10 KiB / 90 KiB / 410 KiB，见 §3.2）。
 * `--keep` 把每档的快照留在卷上并打印 id，载荷本身的字节数从外面量：新形状
   `stat -c %s <export>/_snapshots/<id>/fs.tar` 与 `ls`（应当只有 `fs.tar`、`snapshot.json`、
   `.complete`），老形状 `du -sb …/fs`（探针走 SDK，看不见存储）。量完要删：

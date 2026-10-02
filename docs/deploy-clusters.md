@@ -1558,7 +1558,7 @@ tar、解包内存账说准）。**注意：本轮上线的是 `52044b8`**，它
 | 判据 | 命令 | 读数 |
 |---|---|---|
 | 一卷上的形状 | `snapshot_create_probe.py --files 1,40,202 --n 3 --keep` + 卷上 `ls`/`stat` | 三档都是 `fs.tar` + `snapshot.json` + `.complete`，**没有** `fs/`；tar 成员是 `workspace/…`；字节 **10 KiB / 90 KiB / 410 KiB**（旧 `du -s`：5 / 161 / 809 KiB ⇒ 202 档**占块减半**） |
-| 三档成本（后测） | 同上 | 捕获 p50 **157 / 478 / 1817 ms**（旧 180 / 1614 / 8051）；建箱 p50 **263 / 1426 / 6984 ms**（旧 248 / 1190 / 5725）；每条目 **131.6 / 34.8 / 34.4 ms**（旧 124.2 / 29.0 / 28.2）；`create_attempts` 3 / 3 / 3（本轮 202 档**没有**撞到两副本窗口） |
+| 三档成本（后测） | 同上 | 捕获 p50 **157 / 478 / 1817 ms**（旧 180 / 1614 / 8051）；建箱 p50 **263 / 1426 / 6984 ms**（旧 248 / 1190 / 5725）；每条目 **131.6 / 34.8 / 34.4 ms**（旧 124.2 / 29.0 / 28.2）；`create_attempts` 3 / 3 / 3（本轮 202 档**没有**撞到两副本窗口）。探针的 `mb_per_s` 用**树内容字节**做分子（三档 5 B / 385 B / 2106 B），所以这三档都打印 `0.000` —— 字节口径看载荷本身（上一行），`mb_per_s` 要到 MB 级树才有意义 |
 | 新快照往返 | `snapshot_tar_roundtrip_probe.py --modes` | `failures=0`：`workspace/kept.txt`=`kept\n`、`workspace/deep/nested.txt` 在、`workspace/workspace/…` **不存在**、链接仍是链接、目录 **0770**、文件 **0644**；`chmod 664/777` 的文件恢复成 **644/755** |
 | fifo | `snapshot_tar_roundtrip_probe.py --fifo --expect-fifo-refusal` | 捕获**成功**、恢复**具名拒绝**（`502 … partial-copy: …/snap_…/fs.tar`）—— 旧读侧在 fifo 上会永久阻塞 |
 | 老 `fs/` 快照 | `restore_snapshot_probe.py --check …`（四个 id，每条一个进程） | **4/4**：`46dc`/`4bf1` = `workspace/kept.txt` `kept\n`、`ce90` = `lease/f0000.bin` 512 B、`962c` = `big/f0000.bin` 512 B；`workspace/workspace/…` 四条都不在 |
