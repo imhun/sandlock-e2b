@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.31（2026-10-02，N57/Task 4：本节点 state 分家，`prepare` 72–76 → **7.4 ms**，Task 5 的目录链修复同船）；§7.30（2026-10-02，Task 2：快照载荷从爆炸式 `fs/` 目录改成 `fs.tar`，捕获每条目 39.7 → 9.0 ms、占块减半，从快照建箱 28.2 → 34.4 ms/条目（读侧每条目包含检查，Task 3 搬本地后消失；`942c5bd` 的守卫修复在 `0.1.0-895` 上线后重测 **30.4 ms/条目**），**当前版本 `0.1.0-900-g0079c84-20261002-161409`**；老 `fs/` 快照 4/4 仍可恢复，详见该节）；§7.29（2026-10-02，N58：根重切上线 —— `_snapshots` 合一、`_migrate` 上浮，建箱 p50 124 → 135/136 ms、逐段不变，**当前版本 `0.1.0-887-g7ef319b-20261002-100406`**；该次上线当场抓到"从快照建箱"的 502，已前滚修复 + 复验，详见该节）；§7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**当前版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，当前版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次发版：见 §7.33（2026-10-02，建箱存储本地优先 **Task 0–5 的发版记录**，当前版本 `0.1.0-908-gd652148-20261002-184859`；⚠ 跨切面冒烟**红灯** —— 迁移"源节点不可达"拒绝路径泄漏目标节点配额，见该节与 N59）；上一版的细节：见 §7.31（2026-10-02，N57/Task 4：本节点 state 分家，`prepare` 72–76 → **7.4 ms**，Task 5 的目录链修复同船）；§7.30（2026-10-02，Task 2：快照载荷从爆炸式 `fs/` 目录改成 `fs.tar`，捕获每条目 39.7 → 9.0 ms、占块减半，从快照建箱 28.2 → 34.4 ms/条目（读侧每条目包含检查，Task 3 搬本地后消失；`942c5bd` 的守卫修复在 `0.1.0-895` 上线后重测 **30.4 ms/条目**），**该节版本 `0.1.0-900-g0079c84-20261002-161409`**；老 `fs/` 快照 4/4 仍可恢复，详见该节）；§7.29（2026-10-02，N58：根重切上线 —— `_snapshots` 合一、`_migrate` 上浮，建箱 p50 124 → 135/136 ms、逐段不变，**该节版本 `0.1.0-887-g7ef319b-20261002-100406`**；该次上线当场抓到"从快照建箱"的 502，已前滚修复 + 复验，详见该节）；§7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**该节版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，该节版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1810,7 +1810,7 @@ wait
 `prepare` 立刻回到共享 base 的写法；已经写在节点本地盘上的那几样是**可再生的残渣**
 （marker / stats / lock / reservations 都是临时件），不需要数据迁移。
 
-### 7.32 N57（Task 3）：沙箱树搬节点本地盘 —— 翻转 + 流式迁移 + 具名错误（**2026-10-02 已上线 `0.1.0-905-g7331364-20261002-174329`**）
+### 7.32 Task 3：沙箱树搬节点本地盘 —— 翻转 + 流式迁移 + 具名错误（**2026-10-02 已上线 `0.1.0-905-g7331364-20261002-174329`，修复随 `0.1.0-908` 生效**）
 
 计划 `docs/superpowers/plans/2026-10-02-local-first-create.md` 的 Task 3；裁定、上限与
 验收读数在 `docs/create-local-first-design.md` §8，介质地图在
@@ -1931,6 +1931,168 @@ kubectl -n sandlock exec -i e2b-worker-0 -- python3 - \
 > 注意：探针 `--directions down` 会**缩容一个 worker 副本**（这是唯一能测那条腿的办法），
 > `finally` 里复原到原副本数并等两个 pod Running 才算完；跑之前先确认舰队里没有别的活沙箱
 > 落在那一台上（本轮的 `GET /sandboxes` 是 `[]`）。
+
+### 7.33 发版：建箱存储本地优先（Task 0–5）（**2026-10-02，当前版本 `0.1.0-908-gd652148-20261002-184859`**）
+
+> 本节是本批的**发版记录**：把 §7.29–§7.32 四节（Task 0 / Task 2 / Task 4+5 / Task 3）
+> 串成**一次上线**。各节的逐条命令与原始读数仍在原处，本节只给"一个版本、一张验收表、
+> 两条硬约束、一份不做清单、一条回退路"。
+>
+> **⚠ 本批尚未闭合：跨切面冒烟是红灯**（见 §7.33.4）。根因是 Task 3 的"源节点不可达"
+> 拒绝路径**泄漏目标节点的配额**（已登记 **N59**）：worker-0 的配额台账因此虚高，
+> `MULTI-NODE` 与 `DEPLOYMENT` 两条冒烟都失败。**不要**把这一节读成"验收通过"。
+
+计划 `docs/superpowers/plans/2026-10-02-local-first-create.md`（Task 0–6）；设计权威
+`docs/create-local-first-design.md`；介质地图 `docs/create-local-first-layout.md`。
+**本批只改三件事**：
+
+1. **快照载荷** 从爆炸式 `fs/` 目录改成一个 `fs.tar`（共享卷上，读侧两种形状都收）—— Task 2；
+2. **沙箱树**从共享 NAS 搬到**节点本地盘**，跨节点迁移经 `<export>/_migrate` 中转
+   （流式 + 按字节上限 + 两个具名错误）—— Task 3；
+3. **建箱 `prepare` 的三样小件**（`.creating` 标记、uid 认领、`disk-stats` 种子）连同
+   `.route-b` 搬到**节点本地 state** —— Task 4。
+
+Task 0 先把"谁挂哪个根"与迁移判据 `E2B_TREES_SHARED` 显式化（默认行为逐字不变），
+Task 5 修 `c3_agent` 的目录链（建箱要走的 `<root>/workspace` 那条路）。
+
+**一条版本线**（`deploy/stack/.version`；worker / control-plane-gateway / agent 三个镜像同 tag）：
+
+| 版本 | 内容 | 节 |
+|---|---|---|
+| `0.1.0-887-g7ef319b-20261002-100406` | Task 0 根重切（`_snapshots` 合一、`_migrate` 上浮、`E2B_TREES_SHARED` 就位）+ `copy_from` 回归修复 | §7.29 |
+| `0.1.0-892-g52044b8-20261002-125656` / `0.1.0-895-gc478ca0-20261002-134406` | Task 2 快照载荷打成 `fs.tar` + 读侧守卫修复 | §7.30 |
+| `0.1.0-900-g0079c84-20261002-161409` | Task 4 本节点 state 分家（含 Task 5 目录链） | §7.31 / §7.30 末 |
+| `0.1.0-905-g7331364-20261002-174329` | Task 3 树本地化 + 流式迁移（**介质翻转**） | §7.32 |
+| **`0.1.0-908-gd652148-20261002-184859`** | Task 3 的两条上线后修复（源树释放改走 CP→agent；释放挪到成功路径最后一步）—— **当前** | §7.32 / 设计 §8.3.1 |
+
+**上线后现在真正的开关取值**（`kubectl -n sandlock get deploy control-plane` /
+`get statefulset e2b-worker` / `get ds e2b-c3-agent` 的 env）：
+
+| 开关 | 值 | 在哪 |
+|---|---|---|
+| `E2B_TREES_SHARED` | **`0`**（判据翻转；树不再共享） | control-plane |
+| `E2B_WORKSPACE_BASE` | `/var/lib/e2b/workspaces`（**节点本地 hostPath**，worker 与 face B 各挂一份；控制面只命名） | worker / agent / control-plane |
+| `E2B_NODE_STATE_BASE` | `/var/lib/e2b/state`（节点本地；`.creating`/`disk-stats`/`.route-b`/uid 池本地件） | worker / agent |
+| `E2B_STATE_BASE` | `/var/lib/e2b-sandboxes/state`（共享；记录 `_runtime/<id>/sandbox.json` 与 `.checkpoints/**`） | 全部 |
+| `E2B_TREE_COPY_MAX_BYTES` / `E2B_TREE_COPY_WINDOW_BYTES` | `1342177280`（1.25 GiB）/ `67108864`（64 MiB） | control-plane / worker / agent |
+| `E2B_IMAGE_CACHE_MAX_BYTES` | `4294967296`（4 GiB，镜像解包缓存，与树同盘） | worker / control-plane |
+| `maint` 的 `memory` limit | **2Gi**（Task 3 从 512Mi 抬上来；face A 仍 256Mi） | agent |
+
+共享根 `/var/lib/e2b-sandboxes` 一个字符没动：`_snapshots` / `_migrate` / `_volumes` /
+`_images` / `_secrets` 还在它下面，`<export>/workspaces` 成了一个**空**目录（旧树根）。
+
+#### 7.33.1 本批的验收表（Task 6 的复核；标"复用"的行**不是本轮重测**）
+
+测于 **2026-10-02，`0.1.0-908-gd652148-20261002-184859`**（隧道自检：2 节点 / arm64 /
+`v1.36.4+k0s` / sandlock 9 pod）。先手工建一个沙箱预热，再跑下面各条 —— 刚滚完的舰队
+第一个建箱会因 worker 重新预热镜像而超时。
+
+| 判据 | 读数 | 来源 |
+|---|---|---|
+| **plain 建箱 p50**（客户端边界，n=10 ×2 轮） | **70 / 71 ms**（p95 75 / 86，mean 71 / 74；预热那一发 611 ms） | **本轮实测** |
+| plain 建箱 p50（平台侧，控制面 pod 内回环，n=10） | **40 ms**（p95 49，mean 43） | **本轮实测** |
+| 平台外的那一段（客户端→入口） | 约 **30 ms**（70 − 40） | 本轮实测（两读数相减） |
+| 目标 **~60 ms** | **未达成**：客户端边界 70 ms 比目标高 ~10 ms；**平台侧 40 ms 在目标内** | — |
+| worker 自己那段（trace） | **未在本轮复测**（要 `E2B_CREATE_TRACE`，那是一次 worker 滚动、本任务未获授权）；复用 §7.31 在 `0.1.0-900` 上的逐段：`prepare` 7.4 + `finalize` 8.4 + `prime` 3.3 ≈ **19 ms** | **复用** |
+| ⇒ 平台侧"worker trace 之外"的部分 | ≈ **21 ms**（40 − 19）= 控制面自己的活 + 与 `prepare` 并发的 agent `materialize` 那一跳。对照 §7.31 的改前 ≈97 ms（116 − 19）：翻转主要动的就是这段 | 本轮实测 + 复用推断 |
+| **快照捕获每条目 / 每字节**（翻转前，202 档） | 捕获 **1703 ms**、建箱 p50 **6162 ms**、**30.354 ms/条目**（n=3，`0.1.0-895`，树仍在共享） | **复用**（§7.30） |
+| **快照捕获每条目 / 每字节**（翻转后，1 / 40 / 202 三档，n=3） | 捕获 **141 / 134 / 152 ms**；**从快照建箱 p50 87 / 123 / 154 ms**；**每条目 43.682 / 2.997 / 0.756 ms** | **本轮实测** |
+| **快照建箱（计划点名的 2000 文件档，n=3）** | 捕获 **419 ms**、**从快照建箱 p50 532 ms**（p95 1097、mean 719）、**0.266 ms/条目**；`kept='kept\n'`、`workspace/workspace/…` 不存在 | **本轮实测** |
+| 目标"**2000 文件 52 s → 亚秒**" | **达成（p50；p95 越过 1 s）**：同一档 p50 **532 ms**，p95 **1097 ms**（3 个样本里有一个 1097、另两个 528/532），mean 719（对照旧形状 28.2 ms/条目 × 2000 ≈ 56 s ≈ 计划里的 52 s） | — |
+| **迁移保文件**（节点健在，`worker-0 → worker-1`，200 文件） | **1047 ms**，迁后逐字读回 | **复用**（§7.32 / 设计 §8.5） |
+| 迁移保文件（本轮复跑，同 200 文件） | up 腿 **889 ms**（201 文件 + 1 目录，读回 `kept='kept\n'` / `last='199\n'`）；另一条独立流 **895 ms** | **本轮实测** |
+| 停掉源 worker 后的迁移**具名拒绝** | **502 `source-node-unreachable: … (it did not acknowledge the runtime stop)`**；缩容窗口 1.1 s；`replicas` 复原 2、两个 worker Running；`residue=[]` | **本轮实测** |
+| **迁移成功是否释放源节点的树**（`908` 的新修复） | **是**：源节点 tree root 上该 id **已消失**、目标节点有它；记录上**没有** `source tree retained`、控制面两副本日志里**没有** `was retained` 的 ERROR | **本轮实测**（复核 `39f28a9` 的泄漏修复） |
+| 元数据密集（沙箱内 200 × 64 B，翻转后） | **0.196 / 0.223 ms/个** vs 共享 NAS 同方法 **12.9986 ms/个** ⇒ **58–66×**；大块顺序写沙箱内 **146.9 MB/s**（慢约 3.3×） | **复用**（§7.32 / 设计 §8.5⑥） |
+
+**建箱那 ~60 ms 目标怎么读**：计划的目标写在**平台**这一侧（"建箱 127 → ~60 ms"，
+改前 §7.31 的读数 116–117 ms 也是控制面 pod 内量的）。本轮控制面 pod 内 **40 ms**
+已在目标内；**70 ms 是从这台开发机经入口量到的"用户可见"值**，其中约 30 ms 是客户端到
+入口那一段网络，与平台无关。两条都如实给出，**不要把 70 说成平台没达标，也不要把 40
+说成用户看到的是 40**。
+
+#### 7.33.2 两条硬约束与各自的上限配置
+
+1. **容量（节点盘）**：每节点可用盘约 **75 G**，且与约 4 GiB 的镜像解包缓存**同一块盘**。
+   调度上限是 `E2B_NODE_DISK_MB=8192` ÷ 每沙箱默认 `E2B_DEFAULT_DISK_MB=1024` ⇒
+   **8 个沙箱/节点**；树本地化之后这个数第一次与"节点盘"同源（在此之前心跳报的
+   `usedDiskMB` 是 NAS 的几十万 MB）。**上限配置**：`E2B_NODE_DISK_MB`（每节点可卖容量）、
+   `E2B_IMAGE_CACHE_MAX_BYTES=4294967296`（镜像缓存，`E2B_IMAGE_CACHE_EVICT_MIN_AGE_S=300`）。
+   快照仓**不进节点盘**（设计 §8.4 的容量账：8 沙箱 × 1 GiB × 每天 1 个 × 7 天 = 56 GiB
+   已越界），这也是 Task 2 让快照落共享的理由。
+2. **页缓存（容器内存）**：容器限额实测 worker **4 GiB**、控制面 **2 GiB**、agent face A **256 MiB**、
+   face B `maint` **2 GiB**（Task 3 从 **512 MiB** 抬上来 —— 抬之前一次 900 MiB 的恢复把
+   `memory.current` 顶到 **512.0/512 MiB（10/10 次）并真 OOMKilled 过一次**，设计 §3.0/§3.1）。
+   **上限配置**：`E2B_TREE_COPY_MAX_BYTES=1342177280`（一次树拷贝的字节上限，`0` = 不限；
+   卡在 1 GiB 配额本身会把"装满的沙箱"这一唯一不该被拒的情形拒掉）+
+   `E2B_TREE_COPY_WINDOW_BYTES=67108864`（每 64 MiB `posix_fadvise(DONTNEED)`，只影响峰值）+
+   `maint` 的 memory limit 2 GiB。两端都不再把整棵树读进内存（控制面 `BoundedTreeWriter`
+   流式、worker 落暂存文件、face B 只按 `tree_payload_bytes()` 记账）。
+
+#### 7.33.3 刻意不做（来自计划的 Self-Review，逐条照录）
+
+* 卷数据、`_volumes/_meta`、`_templates`、`_builds`、`_oci/*.oci.tar` **一律不动**；
+* `_cow` 保留名不删；
+* **checkpoint 本轮仍留共享** —— 它的"本地化"取决于是否禁止迁移 `paused` 沙箱，那条要单独立项；
+* **不做**"树本地 + 跨节点冗余"：节点掉线丢树由"沙箱不是持久对象"这条产品语义承担
+  （持久面是快照与卷），不靠代码兜底；代价是**排水顺序"先迁走、再下线"是操作纪律**；
+* Task 2 评审提出、Task 3 落地的两条**已知、可接受、但要点名**的行为：tar 解包走
+  `data` filter 会把文件模式**夹紧**（`0664/0777 → 644/755`，丢 setuid/setgid）；
+  `tarfile` 的成员索引约 **430 B/成员**（202 档照不出来，成员数上限归 Task 3 的字节上限那一族）。
+
+#### 7.33.4 冒烟与残留（**这一节是红灯**）
+
+复跑命令（凭据只从 Secret 取、不打印）：
+
+```bash
+deploy/scripts/open-cluster-tunnel.sh && export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+export E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000
+export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets \
+    -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d | cut -d, -f1)   # 不要打印
+export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets \
+    -o jsonpath='{.data.E2B_INTERNAL_API_KEY}' | base64 -d)
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python deploy/scripts/multinode_smoke.py
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python deploy/scripts/deployment_smoke.py
+```
+
+| 冒烟 / 残留 | 结果 | 证据 |
+|---|---|---|
+| `MULTI-NODE`（`deploy/scripts/multinode_smoke.py`） | **❌ 失败** | 建第 4 个沙箱时 `503: No resources available`（它 `finally` 里 `assert` 预约归零也失败）。根因见下：worker-0 的配额台账虚高 ⇒ 调度选中它时 `_quota_store.reserve` 拒绝，而 `select_and_reserve` **不换下一个候选** |
+| `DEPLOYMENT`（`deploy/scripts/deployment_smoke.py`） | **❌ 失败** | 3 个沙箱建成功、`NODE DISTRIBUTION` 两个节点都在、命令/文件段过；死在**迁移**那一步：`migrate → 503 {"code":503,"message":"Node e2b-worker-0 has no capacity or is unavailable"}`（目标节点 quota 满） |
+| `GET /sandboxes` | `[]` | 本轮实测 |
+| 舰队视图 `GET /internal/fleet/sandboxes` | `{}` | 本轮实测 |
+| 两节点树根 / 共享旧树根 | `e2b-worker-0` = 0 项、`e2b-worker-1` = 0 项、`<export>/workspaces` = 0 项 | 本轮实测 |
+| pod | 9 个全 Running（`e2b-worker` 2/2） | 本轮实测 |
+| `DRY_RUN=1 deploy/k8s-k0s/apply.sh \| kubectl diff -f -` | **0 行**（仓库规格 ≡ 线上） | 本轮实测 |
+| **节点配额台账（唯一的脏残留）** | worker-0：Redis `e2b:node:quota:e2b-worker-0` = memory **3072** / cpu 300 / disk 3072；同一刻 `/internal/nodes` 的 `reservedMemoryMB` = **1024**；而 `GET /sandboxes` = `[]`、fleet = `{}` ⇒ **两边都有虚高，且互相对不上**。worker-1 两边都是 0 | 本轮实测（Redis 只读） |
+
+**这条脏残留是新 bug（登记 N59）**：`POST /sandboxes/<id>/migrate` 在
+`_stop_source_runtime` 之前就 `nodes.reserve_node(target)`，而"源节点不可达"拒绝走的是
+外层 `except Exception` 回滚 —— 那条回滚**只把记录指回源节点、重建源的运行时，从不
+`release_quota(target)`**。于是**每一次具名拒绝都泄漏目标节点的一份配额**。
+（路径与回滚是读代码直接确认的；份数是推演：Redis 上 worker-0 的 3072 = 上一次 905 验收的
+**2 次**拒绝（2 × 1024，记在 Redis、后被 `0.1.0-908` 的滚动从内存台账里抹掉）+
+**本轮复跑 down 腿的 1 次**（1024，两边都记上；证据是 down 腿跑完当场 `/internal/nodes`
+就报 worker-0 = 1024，而它此前是 0）。这条泄漏还解释了为什么台账两边对不上：控制面
+**没有**按记录重建 Redis 台账的路径，而节点在**每次注册**时只按活记录重建**内存**那一半
+（`_rebuild_node_reservations`），Redis 那一半只增不减。
+**本轮没有清理它** —— 清 Redis 是一次集群写，不在本任务的授权范围内；也**不要**为此放宽
+"有记录认领的树不回收"那条保护。
+
+#### 7.33.5 回退
+
+* **介质翻转**（Task 3）的回退是**一个字符**：把控制面的 `E2B_TREES_SHARED` 从 `0` 翻回 `1`
+  （代码路径、清单、验收探针都不用改；这是设计 §8.6 的净亏条件成立时的出口）。
+  注意：翻回之后树仍在**节点本地**上（`E2B_WORKSPACE_BASE` 是另一根键），要连它一起改回
+  `<export>/workspaces` 才是 §7.29 之前的形状。
+* **Task 0 的根重切**回退：`state/.state-base-migration.journal`（0600）+
+  `deploy/scripts/migrate-state-base.sh --rollback --apply` 原路退回；**回退之后必须同时
+  回退镜像**（`308b543` 之后的代码只认新位置）。
+* **Task 2 的快照 tar**：读侧两种形状都收，回退镜像**不需要**回退数据（老 `fs/` 快照在
+  任何一侧都能恢复）；反过来，新写的 `fs.tar` 只被新读侧认，回退到 `0.1.0-887` 之前会让
+  这些新快照**不可恢复** —— 回退要一并停手。
+* **Task 4 的本节点 state**：把 `E2B_NODE_STATE_BASE` 从两份清单里去掉（或退回 worker/agent
+  镜像），`prepare` 立刻回到共享 base 的写法；节点本地盘上留下的那几样是**可再生的残渣**。
 
 ## 8. 改部署的入口
 
