@@ -2710,8 +2710,15 @@ async def _release_source_after_migration(
     node's agent, which is root and whose whitelist carries the tree root, does
     the removal. That is the same shape as the materialize and
     slot-document instructions, and it does not widen the worker-facing scoping
-    by one line. A deployment without the agent channel falls back to the
-    worker DELETE, and **its answer is checked**.
+    by one line.
+
+    The worker-DELETE fallback below is the ``local://`` source's own path and
+    the shape an embedder or a test gets by passing ``c3_agent_client=None``
+    explicitly -- **not** a deployment shape: ``create_app`` always builds a
+    ``C3AgentClient`` when it is not handed one (``control_plane/app.py``), so a
+    shipped fleet never takes it. It is kept because the worker DELETE is what
+    this release always used, and its answer is now **checked** rather than
+    assumed (a refusal is the named leak, not a silent success).
 
     Returns ``(released, detail)``; ``released=False`` is a bounded leak the
     caller records by name (``stale-tree-on-former-source``) rather than
@@ -3046,25 +3053,9 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
                         record.volume_mounts,
                         snapshot_id=None,
                     )
-                nodes.release_quota(old_node_id, **dims)
-                # The source workspace is released (non-shared) or kept
-                # (shared), but per-sandbox volume slices under a shared
-                # volume root are still mounted by the target sandbox:
-                # migration must never delete them (C1 E2.5 review).
-                released, release_detail = await _release_source_after_migration(
-                    request, record, source, shared=shared
-                )
                 note = f"migrated to node {target.node_id}"
                 if shared:
                     note += " (shared workspace)"
-                if not released:
-                    # A migration whose sandbox is already serving on the
-                    # target must not fail over cleanup, but a tree left on the
-                    # source is *invisible* to the orphan sweep (the record
-                    # still claims the id), so it is named on the record and in
-                    # the log rather than swallowed. See
-                    # docs/create-local-first-design.md §8.3.
-                    note += f"; source tree retained ({release_detail})"
                 record.append_log(note)
                 registry.save(record)
             except Exception:
@@ -3089,6 +3080,66 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
                         keep_volume_slices=True,
                     )
                 raise
+            # ---- the move is committed from here down ----------------------
+            #
+            # The record now names the target and the target's tree and runtime
+            # exist, so everything left is **source-side cleanup**, and it must
+            # not be able to reach the rollback above: that rollback destroys
+            # the *target's* tree and re-provisions the source with
+            # ``snapshot_id=None``, which is silent, total data loss if the
+            # source tree has already been released. Task 3's release is the
+            # step that deletes it, so the record write is deliberately *before*
+            # it and the release itself is wrapped: a refused or failed release
+            # is the named, bounded leak `stale-tree-on-former-source`
+            # (docs/create-local-first-design.md §8.3.1), never a rollback.
+            released = False
+            release_detail = f"stale-tree-on-former-source: {source.node_id}"
+            try:
+                # The source reservation is returned here rather than beside
+                # the provision: a failure above must leave *both* nodes'
+                # accounting as it found it (the rollback only releases the
+                # target's).
+                nodes.release_quota(old_node_id, **dims)
+                # The source workspace is released (non-shared) or kept
+                # (shared), but per-sandbox volume slices under a shared
+                # volume root are still mounted by the target sandbox:
+                # migration must never delete them (C1 E2.5 review).
+                released, release_detail = await _release_source_after_migration(
+                    request, record, source, shared=shared
+                )
+            except Exception as exc:  # noqa: BLE001 - cleanup never rolls back
+                logger.exception(
+                    "sandbox %s: the source-side cleanup on node %s failed; "
+                    "the migration stays committed and the source tree is "
+                    "reported as retained",
+                    sandbox_id,
+                    source.node_id,
+                )
+                release_detail = (
+                    f"stale-tree-on-former-source: {source.node_id}: {exc}"
+                )
+            if not released:
+                # A tree left on the source is *invisible* to the orphan sweep
+                # (the record still claims the id), so it is named on the record
+                # and in the log rather than swallowed.
+                logger.error(
+                    "sandbox %s: the source tree on node %s was retained (%s)",
+                    sandbox_id,
+                    source.node_id,
+                    release_detail,
+                )
+                try:
+                    record.append_log(f"source tree retained ({release_detail})")
+                    registry.save(record)
+                except Exception:
+                    # Best-effort record-keeping only: the migration is already
+                    # committed and the log line above carries the same fact.
+                    logger.exception(
+                        "sandbox %s: could not record the retained source tree "
+                        "on node %s",
+                        sandbox_id,
+                        source.node_id,
+                    )
         finally:
             if tar_path is not None:
                 _discard_transfer_copy(tar_path)

@@ -30,6 +30,7 @@ import yaml
 
 import control_plane.api.sandboxes as sandboxes
 from control_plane.app import create_app as create_control_app
+from control_plane.c3_agent_client import AgentClientError
 from control_plane.config import Settings as ControlSettings
 from control_plane.node_address import NodeEndpoint, StaticAddressResolver
 from control_plane.registry.manager import SandboxRegistry
@@ -122,11 +123,14 @@ class _NodeApps(httpx.AsyncBaseTransport):
 class _RecordingAgentClient:
     """The CP→agent file-op channel (``C3AgentClient``'s shape we use)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, refuse: str | None = None) -> None:
         self.calls: list[dict] = []
+        self.refuse = refuse
 
     async def rm(self, **kwargs) -> dict:
         self.calls.append({"op": "rm", **kwargs})
+        if self.refuse is not None:
+            raise AgentClientError(self.refuse)
         return {"op": "rm", "path": kwargs["path"]}
 
 
@@ -265,7 +269,12 @@ def _tree_binary(root: Path, name: str, size: int) -> None:
     path.write_bytes(os.urandom(size))
 
 
-def _install_node_hop(monkeypatch: pytest.MonkeyPatch, layout: dict[str, Path]) -> dict:
+def _install_node_hop(
+    monkeypatch: pytest.MonkeyPatch,
+    layout: dict[str, Path],
+    *,
+    destroy_acknowledged: bool = True,
+) -> dict:
     """The three worker-side hops this task does not test; record them."""
     seen: dict = {"provision": [], "destroy": [], "stop": []}
 
@@ -280,7 +289,7 @@ def _install_node_hop(monkeypatch: pytest.MonkeyPatch, layout: dict[str, Path]) 
         seen["destroy"].append({"node": node.node_id, "keep_files": keep_files})
         # The real hop returns a _TeardownOutcome; the source release checks it
         # (a refused teardown is a tree left behind, named on the record).
-        return sandboxes._TeardownOutcome(acknowledged=True)
+        return sandboxes._TeardownOutcome(acknowledged=destroy_acknowledged)
 
     monkeypatch.setattr(sandboxes, "_provision_remote", _provision)
     monkeypatch.setattr(sandboxes, "_stop_source_runtime", _stop)
@@ -622,6 +631,42 @@ async def test_a_source_whose_node_row_is_gone_is_refused_by_the_same_name(
 
 
 @pytest.mark.asyncio
+async def test_a_source_that_stops_but_cannot_export_is_refused_by_the_same_name(
+    workspace, monkeypatch
+) -> None:
+    """导出握手失败也必须走同一个名字（裁定第 3 条的另一半）。
+
+    源节点可以先应答"停运行时"，然后在**导出**那一步掉线（agent 在导出中途死掉、
+    或那台节点上根本没有能应答的 agent）。两条路说的是同一件事：树在那台机器的盘上、
+    够不着 —— 名字必须是同一个，目标节点一个字节都不许收到、记录不许动。
+    """
+    layout = _node_layout(workspace)
+    _tree(layout["a"] / SANDBOX, {"workspace/kept.txt": "hello"})
+    # No entry for HOST_A: the source's export GET is a connection error.
+    nodes = _NodeApps({HOST_B: _agent_app(layout["b"], layout["shared"])})
+    _install_transport(monkeypatch, nodes)
+    seen = _install_node_hop(monkeypatch, layout)
+    agent_client = _RecordingAgentClient()
+    app = _control_app(
+        workspace, layout, trees_shared=False, c3_agent_client=agent_client
+    )
+    await _register(app, node_id=NODE_A, key=KEY_A, source_ip=IP_A)
+    await _register(app, node_id=NODE_B, key=KEY_B, source_ip=IP_B)
+    _enroll(app)
+
+    resp = await _migrate(app)
+
+    assert resp.status_code == 502, resp.text
+    assert resp.json()["message"].startswith("source-node-unreachable")
+    # The stop was acknowledged (that hop did not fail); the export did.
+    assert seen["stop"] == [NODE_A]
+    assert app.state.registry.get(SANDBOX).node_id == NODE_A
+    assert not (layout["b"] / SANDBOX).exists()
+    assert agent_client.calls == []
+    assert _staging_leftovers(layout["shared"]) == []
+
+
+@pytest.mark.asyncio
 async def test_the_source_tree_is_released_through_that_nodes_agent(
     workspace, monkeypatch
 ) -> None:
@@ -674,6 +719,167 @@ async def test_the_source_tree_is_released_through_that_nodes_agent(
     # ...and the source's tree was *not* left to the worker DELETE (the hop the
     # control plane's own scoping refuses once the record names the target).
     assert seen["destroy"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_source_release_is_named_and_never_rolls_back(
+    workspace, monkeypatch
+) -> None:
+    """释放被拒 ⇒ 迁移仍然成功（沙箱已经在目标服务），但**必须具名**。
+
+    这是那条裁定的真正要点：释放失败 **不能** 静默成 200 —— 它要在记录里留下
+    `stale-tree-on-former-source`，让操作员知道旧节点上还有一棵不会被自愈回收的树
+    （记录还认领这个 id）。同时它绝不能走回滚：回滚会删掉**目标**的树并用
+    `snapshot_id=None` 重建源 —— 那正是"整棵树消失"的路径。
+    """
+    layout = _node_layout(workspace)
+    _tree(layout["a"] / SANDBOX, {"workspace/kept.txt": "hello"})
+    nodes = _NodeApps(
+        {
+            HOST_A: _agent_app(layout["a"], layout["shared"]),
+            HOST_B: _agent_app(layout["b"], layout["shared"]),
+        }
+    )
+    _install_transport(monkeypatch, nodes)
+    seen = _install_node_hop(monkeypatch, layout)
+    agent_client = _RecordingAgentClient(refuse="agent rm refused (test)")
+    app = _control_app(
+        workspace,
+        layout,
+        trees_shared=False,
+        c3_agent_client=agent_client,
+    )
+    await _register(app, node_id=NODE_A, key=KEY_A, source_ip=IP_A)
+    await _register(app, node_id=NODE_B, key=KEY_B, source_ip=IP_B)
+    _enroll(app)
+
+    resp = await _migrate(app)
+
+    assert resp.status_code == 200, resp.text
+    # The target really has the tree (the migration is committed)...
+    assert (layout["b"] / SANDBOX / "workspace" / "kept.txt").read_text() == "hello"
+    record = app.state.registry.get(SANDBOX)
+    assert record.node_id == NODE_B
+    # ...and the refusal is on the record, not swallowed.
+    lines = [entry["line"] for entry in record.logs]
+    assert any("migrated to node node_b" in line for line in lines), lines
+    assert any(
+        "source tree retained" in line
+        and "stale-tree-on-former-source" in line
+        and NODE_A in line
+        for line in lines
+    ), lines
+    # No rollback ran: the target was not torn down, and the worker DELETE (the
+    # hop that would 403) was never used for the source.
+    assert seen["destroy"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_write_failure_after_the_record_save_cannot_reach_the_release(
+    workspace, monkeypatch
+) -> None:
+    """成功路上的写失败**不能**跑在释放之后 —— 那是全量数据丢失的窗口。
+
+    顺序是：导入 → provision → 记录落盘（"migrated to node X"）→ 才释放源节点的树。
+    反过来（释放 → 记录落盘）时，落盘失败会触发回滚：回滚删掉**目标**的树、把记录指回
+    源节点、用 `snapshot_id=None` 重建源 —— 而源节点的树刚刚被释放步骤删掉，暂存的 tar
+    也在 `finally` 里丢掉 ⇒ 数据没了。这条用例让**成功路上的第二次 `registry.save` 抛错**，
+    断言：释放一次都没发生（agent rm 调用为空）、记录回到源节点、源节点的树还在。
+    """
+    layout = _node_layout(workspace)
+    _tree(layout["a"] / SANDBOX, {"workspace/kept.txt": "hello"})
+    nodes = _NodeApps(
+        {
+            HOST_A: _agent_app(layout["a"], layout["shared"]),
+            HOST_B: _agent_app(layout["b"], layout["shared"]),
+        }
+    )
+    _install_transport(monkeypatch, nodes)
+    _install_node_hop(monkeypatch, layout)
+    agent_client = _RecordingAgentClient()
+    app = _control_app(
+        workspace,
+        layout,
+        trees_shared=False,
+        c3_agent_client=agent_client,
+    )
+    await _register(app, node_id=NODE_A, key=KEY_A, source_ip=IP_A)
+    await _register(app, node_id=NODE_B, key=KEY_B, source_ip=IP_B)
+    _enroll(app)
+    # Give the source a real reservation, so "the rollback re-provisions the
+    # source but only releases the target's quota" is observable.
+    record = app.state.registry.get(SANDBOX)
+    app.state.nodes.reserve_node(
+        NODE_A,
+        memory_mb=record.memory_mb,
+        cpu_percent=record.cpu_count * 100,
+        disk_mb=record.disk_size_mb,
+        processes=record.max_processes,
+    )
+
+    real_save = app.state.registry.save
+    saves = {"n": 0}
+
+    def _save(record):
+        saves["n"] += 1
+        if saves["n"] == 2:  # the F1 re-point is #1; this is the commit write
+            raise RuntimeError("record save failed (test)")
+        return real_save(record)
+
+    monkeypatch.setattr(app.state.registry, "save", _save)
+
+    with pytest.raises(RuntimeError, match="record save failed"):
+        await _migrate(app)
+
+    # The release had not run when the write failed, so the source tree is
+    # untouched and the rollback path has something to fall back to.
+    assert agent_client.calls == []
+    assert (layout["a"] / SANDBOX / "workspace" / "kept.txt").read_text() == "hello"
+    assert app.state.registry.get(SANDBOX).node_id == NODE_A
+    # ...and the target's partial tree was cleaned up by the rollback.
+    assert not (layout["b"] / SANDBOX).exists()
+    # Accounting stays symmetric: the source reservation is only returned
+    # *after* the record write, so a failure before it leaves the source held.
+    assert app.state.nodes.get(NODE_A).reserved_memory_mb == record.memory_mb
+    assert app.state.nodes.get(NODE_B).reserved_memory_mb == 0
+
+
+@pytest.mark.asyncio
+async def test_the_worker_fallback_release_is_named_when_the_teardown_is_refused(
+    workspace, monkeypatch
+) -> None:
+    """没有 agent 通道时的回落：worker 的 DELETE **被拒也要具名**，不能当成功。
+
+    `create_app` 在真实部署里总会构造 `C3AgentClient`，所以这条回落是 `local://`
+    源与显式传 `c3_agent_client=None` 的嵌入/测试形状；它保留是因为 worker DELETE 正是
+    这次修复之前唯一用过的路径 —— 而现在它的回答是被**读**的。
+    """
+    layout = _node_layout(workspace)
+    _tree(layout["a"] / SANDBOX, {"workspace/kept.txt": "hello"})
+    nodes = _NodeApps(
+        {
+            HOST_A: _agent_app(layout["a"], layout["shared"]),
+            HOST_B: _agent_app(layout["b"], layout["shared"]),
+        }
+    )
+    _install_transport(monkeypatch, nodes)
+    seen = _install_node_hop(monkeypatch, layout, destroy_acknowledged=False)
+    app = _control_app(workspace, layout, trees_shared=False)  # no agent client
+    await _register(app, node_id=NODE_A, key=KEY_A, source_ip=IP_A)
+    await _register(app, node_id=NODE_B, key=KEY_B, source_ip=IP_B)
+    _enroll(app)
+
+    resp = await _migrate(app)
+
+    assert resp.status_code == 200, resp.text
+    assert seen["destroy"] == [{"node": NODE_A, "keep_files": False}]
+    record = app.state.registry.get(SANDBOX)
+    assert record.node_id == NODE_B
+    lines = [entry["line"] for entry in record.logs]
+    assert any(
+        "source tree retained" in line and "stale-tree-on-former-source" in line
+        for line in lines
+    ), lines
 
 
 # --------------------------------------------------------------------------
