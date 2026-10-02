@@ -148,8 +148,14 @@ KEY_CLASSES: dict[str, set[str]] = {
     # N27: the k8s manifest sinks the tree root and moves the platform's own
     # files under `E2B_STATE_BASE`; the compose stacks keep the one-base layout
     # (`tests/unit/test_compose_base_image_shape.py::_k8s_env`).
+    # N57 / Task 4 adds `E2B_NODE_STATE_BASE` to the same class: the node-local
+    # half of that state (the create's marker and accounting seed, `.route-b`
+    # and the uid pool's own files) is a k8s hostPath, and the compose stacks
+    # stay on the one-base layout precisely because naming no node-local base
+    # is byte-for-byte today's behaviour.
     "k8s_state_layout": {
         "E2B_STATE_BASE",
+        "E2B_NODE_STATE_BASE",
         "E2B_SHARED_VOLUME_ROOT",
         "E2B_IMAGE_OCI_DIR",
     },

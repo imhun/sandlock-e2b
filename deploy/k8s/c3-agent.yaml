@@ -305,6 +305,7 @@ spec:
               shared="$SHARED_ROOT"
               base="$WORKSPACE_BASE"
               state="$STATE_BASE"
+              node_state="$NODE_STATE_BASE"
               # OBS-9: the control plane mounts these back on top of its
               # read-only view of the shared volume (subPath mounts), and a
               # subPath whose source does not exist keeps that pod in
@@ -322,19 +323,55 @@ spec:
               # migration a metadata-only `rename` and what puts the platform's
               # files off the path a sandbox reaches by walking `..`. Two
               # readers depend on both existing before the worker starts:
-              #   * `<state>`: `uid_pool.acquire` opens
-              #     `<state>/.uid_pool.lock` (and later
-              #     `<state>/_runtime/<id>/sandbox.json`) with the base it was
-              #     handed -- a missing base turns the first `Sandbox.create()`
-              #     into ENOENT instead of a uid. Nothing derives it from the
-              #     tree root, on purpose: a base the code made up out of band
-              #     would land with the wrong owner on NFS.
+              #   * `<state>`: the worker writes
+              #     `<state>/_runtime/<id>/sandbox.json` (and the checkpoint
+              #     store beside it) with the base it was handed -- a missing
+              #     base turns the first `Sandbox.create()` into ENOENT instead
+              #     of a record. Nothing derives it from the tree root, on
+              #     purpose: a base the code made up out of band would land
+              #     with the wrong owner on NFS.
               #   * `workspaces`: it is the worker's own tree root.
               # (N58: `_migrate` and `_snapshots` are *not* created here -- they
               # are the platform's namespaces on the export root, below.)
               for dir in "$base" "$state"; do
                 mkdir -p "$dir"
               done
+              # N57 / Task 4: the **node-local** half of that state. The worker
+              # opens `<node_state>/.uid_pool.lock` and writes the create's
+              # `.creating` marker and `disk-stats` seed under
+              # `<node_state>/_runtime/<id>/`, and the route-B slot documents
+              # go to `<node_state>/.route-b/...`. This is a hostPath on the
+              # node's own disk (the same one `E2B_IMAGE_CACHE_DIR` uses), so
+              # NFS's root_squash rules do not apply -- the hand-over is a plain
+              # local chown, and it is *this* container's job because it is the
+              # one that runs as root with the volume mounted; unlike
+              # `_snapshots` below it does not exist on the shared volume at
+              # all, so no earlier step could have created it.
+              #
+              # Owner 65534, the worker's uid: it is the one root here the
+              # non-root worker writes into, and a root-owned 0755 would make
+              # the first `Sandbox.create()` fail with `Permission denied:
+              # <node_state>/.uid_pool.lock`. Verified right here (and strictly
+              # -- see below), so a node whose path is styled wrongly stops this
+              # pod with the one-time fix instead of failing every create.
+              mkdir -p "$node_state"
+              chown 65534:65534 "$node_state" 2>/dev/null ||
+                echo "workspace-root-init: chown refused ($node_state)"
+              chmod 0755 "$node_state" 2>/dev/null ||
+                echo "workspace-root-init: chmod refused ($node_state)"
+              node_state_owner="$(stat -c %u "$node_state")"
+              node_state_mode="$(stat -c %a "$node_state")"
+              echo "workspace-root-init: $node_state owner=$node_state_owner mode=$node_state_mode"
+              # Stricter than the shared-volume loop below, on purpose: there
+              # the `1777` fallback exists for an NFS server that refuses a
+              # chown (root_squash), while this path is a *local* disk only
+              # root could fail to chown -- a node that cannot is broken, and a
+              # world-writable state base would hide that instead of naming it.
+              if [ "$node_state_owner" != "65534" ]; then
+                echo "workspace-root-init: FATAL: $node_state is owned by uid $node_state_owner, not the worker uid 65534: the worker opens .uid_pool.lock there and writes every create's marker and accounting seed under it, so every Sandbox.create() would fail with EACCES" >&2
+                echo "workspace-root-init: fix it once on the node: chown 65534:65534 $node_state" >&2
+                exit 1
+              fi
               # N58: the migration staging goes on the **export root**, not inside
               # the tree root. N27 put it under `<workspaces>` because the tree
               # root was the only thing the worker's migration endpoints named;
@@ -450,9 +487,17 @@ spec:
               value: /var/lib/e2b-sandboxes/workspaces
             - name: STATE_BASE
               value: /var/lib/e2b-sandboxes/state
+            # N57 (Task 4): the node-local state base this init creates and
+            # hands to uid 65534 (see the script above). It is a hostPath, so
+            # it is mounted below like the image cache -- not a subPath of the
+            # shared claim, and not created by any earlier step.
+            - name: NODE_STATE_BASE
+              value: /var/lib/e2b/state
           volumeMounts:
             - name: shared
               mountPath: /var/lib/e2b-sandboxes
+            - name: node-state
+              mountPath: /var/lib/e2b/state
       containers:
         # ------------------------------------------------------------------
         # face A：身份授予（非 root，两个 file capability）
@@ -551,13 +596,19 @@ spec:
             # and the control plane's `E2B_C3_AGENT_PORT` default).
             - name: E2B_C3_AGENT_PORT
               value: "49986"
-            # 与 C1 broker 逐字相同的四个白名单根（`priv_common.c` 的纪律）；
-            # `E2B_STATE_BASE` 与 k8s worker 的 N27 形态逐字一致（`.route-b`
-            # 与 `_runtime` 都在它下面）。
+            # 与 C1 broker 同一份白名单纪律（`priv_common.c`），C1 时是四根；
+            # `E2B_STATE_BASE` 与 k8s worker 的 N27 形态逐字一致（`_runtime`
+            # 记录与 checkpoint 在它下面）。N57（Task 4）之后是**五根**：
+            # `E2B_NODE_STATE_BASE` 是节点本地的那一根，`.route-b` 与建箱的
+            # 两个小件（`.creating` / `disk-stats`）都在它下面 —— 面 B 要
+            # `chown` 那些 slot 文档，所以这一根必须在这里挂上、也必须在
+            # C 侧白名单里（`priv_common.c` 的 `priv_node_state_base`）。
             - name: E2B_WORKSPACE_BASE
               value: /var/lib/e2b-sandboxes/workspaces
             - name: E2B_STATE_BASE
               value: /var/lib/e2b-sandboxes/state
+            - name: E2B_NODE_STATE_BASE
+              value: /var/lib/e2b/state
             - name: E2B_SHARED_VOLUME_ROOT
               value: /var/lib/e2b-sandboxes
             - name: E2B_IMAGE_CACHE_DIR
@@ -639,6 +690,12 @@ spec:
             # 节点本地的解包缓存（第四个白名单根），与 worker/broker 同一个 hostPath。
             - name: image-cache
               mountPath: /var/lib/e2b-images
+            # 节点本地的 state（第五个白名单根，N57 / Task 4）：`scope-slot-
+            # document` 的目标（`<node_state>/.route-b/<uid>/<name>/`）在这里，
+            # 面 B 就是执行那个 `chown` 的进程 —— 不挂这一根它连路径都到不了
+            # （`priv_common.c` 按解析后的路径比较，挂在别处的同名目录不算）。
+            - name: node-state
+              mountPath: /var/lib/e2b/state
           resources:
             requests:
               cpu: 10m
@@ -653,6 +710,15 @@ spec:
         - name: image-cache
           hostPath:
             path: /var/lib/e2b-images
+            type: DirectoryOrCreate
+        # N57（Task 4）：节点本地 state。与 worker 同一个 hostPath —— 白名单按
+        # 解析后的路径比较，两侧必须指到节点上的同一个目录。目录由本 pod 的
+        # `workspace-root-init` 创建并交给 65534；`DirectoryOrCreate` 只是回落
+        # （kubelet 建出来是 root 属主，worker 的第一个建箱会在 `.uid_pool.lock`
+        # 上响亮地 EACCES，而不是写进一个没人管过属主的目录）。
+        - name: node-state
+          hostPath:
+            path: /var/lib/e2b/state
             type: DirectoryOrCreate
 ---
 # "只有两条通道"的连接层：agent 只接受 **control-plane** pod 进来的连接（只在那两

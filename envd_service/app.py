@@ -337,6 +337,7 @@ def create_app(
             size=settings.uid_pool_size,
             workspace_base=workspace_base or settings.workspace_base,
             state_base=platform_state_base,
+            node_state_base=settings.node_state_base,
         )
         runtime_registry.add_unregister_callback(
             runtime_registry.uid_pool.release

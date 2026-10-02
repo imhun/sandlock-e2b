@@ -1633,6 +1633,67 @@ env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
 一侧都能恢复；反过来，`fs.tar` 的载荷只被新读侧认，回退到 `0.1.0-887` 之前的镜像会让这些
 新快照**不可恢复**（记录在案，别只回镜像不停手）。
 
+### 7.31 N57（Task 4）：本节点 state 分家（**仓库已落，集群未上线**）
+
+计划 `docs/superpowers/plans/2026-10-02-local-first-create.md` 的 Task 4；介质归属、四个
+小件的清单与三条裁定在 `docs/create-local-first-design.md` §2.3/§2.4/§5，那一行的目标值在
+`docs/create-local-first-layout.md` §1。**这一节不含集群读数**：判据（本节的命令）要在
+Task 3 + Task 5 + 本节的镜像一起滚上去之后跑，本文只写"怎么量、期望什么"。
+
+**改了什么**：`prepare` 原先在共享 `E2B_STATE_BASE` 上写三样小东西 —— `.creating` 标记、
+uid 认领（`.uid_pool.lock` + `.uid_reservations/`）、`disk-stats` 种子。共享卷是 NFS，一次
+元数据往返 ~13 ms（§1.1），这就是 Task 1 量到的 `prepare` **72–76 ms** 的来源。Task 4 把
+它们（连 `.route-b/**` 一起）搬到**节点本地**的 `E2B_NODE_STATE_BASE`（k8s hostPath
+`/var/lib/e2b/state`，与 `/var/lib/e2b-images` 同一块盘），记录 `_runtime/<id>/sandbox.json`
+与 `.checkpoints/**` 留共享 —— 记录是**舰队级 uid 账本的索引**，Task 4 顺手把那个索引从
+"枚举树目录名"改成"枚举共享记录目录"（`uid_pool._recorded_uids`；树本地化之后前者只看得见
+一个节点）。`E2B_NODE_STATE_BASE` 不设 = 逐字节回到今天（compose / 测试 / `local://` 都不设）。
+
+**上线顺序**：`deploy/k8s-k0s/apply.sh` 先把 `e2b-c3-agent` 滚完（它的 `workspace-root-init`
+建 `/var/lib/e2b/state` 并 `chown 65534`），再滚 worker；控制面那条 `E2B_NODE_STATE_BASE`
+只进根白名单、不挂卷。`kubectl -n sandlock get pod -l app=c3-agent -o wide` 全 Ready 之后再
+看 worker。
+
+**判据与命令**（全部只读或公开 API 建/杀沙箱）：
+
+```bash
+deploy/scripts/open-cluster-tunnel.sh && export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+
+# ① prepare 那一段本身（Task 1 基线 72–76 ms；期望 ~10 ms）
+CP=$(kubectl -n sandlock get pod -l app=control-plane -o jsonpath='{.items[0].metadata.name}')
+kubectl -n sandlock exec -i "$CP" -c control-plane -- \
+    python3 - "$E2B_API_KEY" "$E2B_INTERNAL_API_KEY" --n 10 \
+    < deploy/scripts/acceptance/prepare_phase_cost_probe.py
+
+# ② 整条建箱的 p50 + 逐段（看长杆有没有换成 materialize —— 那是 Task 3/5 的腿）
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
+    deploy/scripts/acceptance/create_latency_probe.py \
+    --base http://172.18.78.49:3000 --key "$E2B_API_KEY" --n 10
+kubectl -n sandlock set env statefulset/e2b-worker E2B_CREATE_TRACE=1
+kubectl -n sandlock logs e2b-worker-0 --since=5m | grep "create trace:" | sort | uniq -c
+kubectl -n sandlock set env statefulset/e2b-worker E2B_CREATE_TRACE-   # 用完就关
+
+# ③ 四个小件真的落在节点本地、记录真的还在共享（两个 worker 各看一次）
+kubectl -n sandlock exec e2b-worker-0 -- ls -la /var/lib/e2b/state /var/lib/e2b/state/_runtime
+kubectl -n sandlock exec -i "$CP" -c control-plane -- \
+    sh -c 'ls -la /var/lib/e2b-sandboxes/state/_runtime | head'
+```
+
+**期望**：① `prepare` p50 从 **72–76 ms 掉到 ~10 ms**（剩下的是一次 mkdir + 两个小写 +
+Python 开销，全在节点盘上）；② 整条建箱的 p50 由 `max(materialize, prepare)` 决定，所以
+这一条**只有和 Task 3（树本地化）一起上线**才看得出来 —— 单上本节，长杆就是 `materialize`。
+③ 的形状：节点本地只出现 `_runtime/<id>/.creating`、`disk-stats`、`.route-b`、
+`.uid_pool.lock`、`.uid_reservations`；共享 `<export>/state/_runtime` 里**没有** `.creating`、
+没有 `disk-stats`，只有 `sandbox.json` / `command-logs.jsonl` / `.checkpoints`。
+
+**本地可先量的机制读数**（不用集群，`deploy/scripts/acceptance/node_state_split_local_probe.py`）：
+一次 `prepare` 落在共享 base 上的路径操作 **writes 14 → 0**，只读的两次（`_runtime` 列举 +
+邻居记录）留着 —— 那就是舰队账本的索引。
+
+**回退**：把 `E2B_NODE_STATE_BASE` 从两份 k8s 清单里去掉（或把 worker/agent 的镜像退回），
+`prepare` 立刻回到共享 base 的写法；已经写在节点本地盘上的那几样是**可再生的残渣**
+（marker / stats / lock / reservations 都是临时件），不需要数据迁移。
+
 ## 8. 改部署的入口
 
 ```bash

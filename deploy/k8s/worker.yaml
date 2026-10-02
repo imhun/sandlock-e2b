@@ -149,9 +149,11 @@ spec:
             - name: E2B_WORKSPACE_BASE
               value: /var/lib/e2b-sandboxes/workspaces
             # N27: the platform's own files (the runtime records, the command
-            # logs, the checkpoint images, `.route-b`, the uid pool's lock and
-            # reservations) live under a base of their own, a **sibling** of the
-            # sunk tree root and on the same mount. Both halves matter:
+            # logs, the checkpoint images) live under a base of their own, a
+            # **sibling** of the sunk tree root and on the same mount. (Its
+            # node-local half -- the marker, the accounting seed, `.route-b` and
+            # the uid pool's own files -- moved to `E2B_NODE_STATE_BASE` below
+            # in N57 / Task 4.) Both halves matter:
             # `rename(2)` stops at a mount point, so a second mount would make
             # every migration an EXDEV, and "platform state is not on the path a
             # sandbox reaches from its own tree" only holds if the state base is
@@ -161,6 +163,29 @@ spec:
             # pre-N27 one.
             - name: E2B_STATE_BASE
               value: /var/lib/e2b-sandboxes/state
+            # N57 (Task 4): the **node-local** half of the platform's own
+            # state -- the create's `.creating` marker, its `statfs(2)`
+            # accounting seed, `.route-b`'s slot documents and the uid pool's
+            # lock and reservation markers. All four are read by *this* node's
+            # processes only (the marker by a racing DELETE, the seed by the
+            # sandbox's own slot, the slot documents by the slot and the agent,
+            # the pool's files by this worker), while the *record*
+            # (`<state>/_runtime/<id>/sandbox.json`) and the checkpoint images
+            # stay on the shared base because the fleet-wide uid ledger and a
+            # migrating resume read them from other nodes.
+            #
+            # The point of the split is the create's `prepare` phase: on this
+            # deployment every write under `<state>` is one NFS metadata round
+            # trip (~13 ms measured), and `prepare` was paying it for each of
+            # these chips. A hostPath on the node's own disk (the same disk as
+            # `E2B_IMAGE_CACHE_DIR`) costs microseconds -- and a large-block
+            # write, where the local disk is the slower medium, never happens
+            # here: these are all tiny files.
+            #
+            # Unset -- what every other deployment does today -- is byte for
+            # byte the pre-Task-4 layout (the chips live under the state base).
+            - name: E2B_NODE_STATE_BASE
+              value: /var/lib/e2b/state
             # N27: name the export root as the third root the privileged
             # helpers/broker may touch. It used to be covered *by accident*
             # (the workspace base was the export root); now that the tree root
@@ -216,15 +241,24 @@ spec:
             - name: E2B_IMAGE_CACHE_OWNER_UID
               value: "65534"
             # Route B's scratch root (the per-slot policy/program documents).
-            # N27 keeps `.route-b` under the state base with the rest of the
-            # platform's own files. The per-node agent scopes those documents
-            # to the slot's uid (0440), and it only touches roots this
-            # deployment names (N52 retired the worker-side broker whose
-            # whitelist this used to be); anywhere else the document could only
-            # fall back to a world-readable 0444 one carrying the egress-proxy
-            # credentials, so keep it under a named root.
+            # N57 (Task 4) puts it under the **node-local** state base: the
+            # writer is this worker, the reader is this node's slot, and the
+            # only other process that touches a document is this node's agent
+            # (which scopes it to the slot's uid, 0440). Before Task 4 it sat
+            # under the shared state base, where slot start/stop paid an NFS
+            # round trip per document for no cross-node reader at all. The per-node
+            # agent only touches roots this deployment names (N52 retired the
+            # worker-side broker whose whitelist this used to be) -- so the
+            # value has to stay under `E2B_NODE_STATE_BASE` above; anywhere
+            # else the document could only fall back to a world-readable 0444
+            # one carrying the egress-proxy credentials.
+            #
+            # The **control plane** spells this value too (it derives
+            # `scope-slot-document`'s path; the worker may not report one), so
+            # `deploy/k8s/control-plane.yaml` has to carry the same string --
+            # `tests/unit/test_c3_agent_manifest.py` pins the two together.
             - name: E2B_ROUTE_B_TMP_ROOT
-              value: /var/lib/e2b-sandboxes/state/.route-b
+              value: /var/lib/e2b/state/.route-b
             # C3 (Task 4 slice B): **the agent shape** -- this worker holds no
             # privileged binary at all (the image ships no `/var/lib/e2b-priv/`)
             # and `agent` is what routes every file step to the control plane
@@ -636,6 +670,17 @@ spec:
               mountPath: /var/lib/e2b-sandboxes
             - name: image-cache
               mountPath: /var/lib/e2b-images
+            # N57 (Task 4): the node-local state base, the one root here the
+            # worker *writes* into that is not on the shared volume. The
+            # `workspace-root-init` container in `deploy/k8s/c3-agent.yaml`
+            # (this deployment's only file-capable component, and its upstream)
+            # creates it and hands it to uid 65534; `DirectoryOrCreate` is the
+            # fallback for a node whose agent has not started yet -- kubelet
+            # would then create it root-owned and the worker's first create
+            # would fail with a loud EACCES on `.uid_pool.lock` rather than
+            # writing into a directory nobody styled.
+            - name: node-state
+              mountPath: /var/lib/e2b/state
       volumes:
         - name: shared
           persistentVolumeClaim:
@@ -649,6 +694,17 @@ spec:
         - name: image-cache
           hostPath:
             path: /var/lib/e2b-images
+            type: DirectoryOrCreate
+        # Node-local platform state (N57 / Task 4): `/var/lib/e2b/state`, the
+        # same node disk as the cache above and *not* an emptyDir -- the
+        # create's chips and the pool's lock have to survive a pod restart
+        # (a marker that vanished with the pod would let a racing teardown into
+        # a create that is still running). ~75 GiB free here, shared with the
+        # 4 GiB image cache; this base holds only tiny files (see the
+        # `E2B_NODE_STATE_BASE` comment above).
+        - name: node-state
+          hostPath:
+            path: /var/lib/e2b/state
             type: DirectoryOrCreate
 ---
 apiVersion: v1

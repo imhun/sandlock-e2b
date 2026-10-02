@@ -20,20 +20,24 @@ persist) — reclaims them and chowns the stale directories away from the pool
 so a later allocation cannot inherit foreign files.
 
 Cross-process safety (I1): ``acquire`` briefly takes an exclusive ``flock``
-on the shared state file ``<state base>/.uid_pool.lock`` while it recomputes
-the free set and atomically writes a reservation marker
-(``<state base>/.uid_reservations/<sandbox_id>``). Both are *platform* state,
-so they follow ``E2B_STATE_BASE`` out from under the tree root (N27); with no
-state base configured they are the workspace base, exactly as before. The
-marker makes the reservation visible to every other worker sharing the
-workspace from the moment the uid is handed out — the acquire→register window
-(volume provisioning, recursive chown) can be long, so waiting for the record
-would leave a collision window. The caller persists the ``sandbox.json`` record and
+on the pool's own state file ``<node state base>/.uid_pool.lock`` while it
+recomputes the free set and atomically writes a reservation marker
+(``<node state base>/.uid_reservations/<sandbox_id>``). Both are *platform*
+state, so they follow ``E2B_STATE_BASE`` out from under the tree root (N27) and,
+since Task 4, ``E2B_NODE_STATE_BASE`` out of the NAS: with neither base named
+they are the workspace base, exactly as before (N57). The marker makes the
+reservation visible to every other process of this node from the moment the uid
+is handed out — the acquire→register window (volume provisioning, recursive
+chown) can be long, so waiting for the record would leave a collision window.
+The caller persists the ``sandbox.json`` record and
 calls :meth:`UidPool.commit` to drop the marker, or abandons the allocation
 via :meth:`UidPool.release` (failed create / delete), which drops the marker
 and frees the uid. ``flock`` serializes the compute+marker-write critical
 section across processes; the marker keeps the picked uid out of every other
-worker's view until the record is durable.
+*same-node* worker's view until the record is durable, and the record itself
+is the fleet-wide statement (``_recorded_uids`` enumerates the shared records,
+so a cross-node peer sees the uid as taken as soon as the record lands; the
+deployment's authority for the uid is the control plane's allocation, OBS-9).
 
 Independent per-sandbox uids require a privileged (root) supervisor: a
 non-root supervisor cannot map an arbitrary host uid (S1.2 fail-closed
@@ -57,7 +61,9 @@ import fcntl
 from envd_service import priv_helpers
 from gateway_common import create_trace
 from gateway_common.paths import (
+    RUNTIME_DIR_NAME,
     is_sandbox_workspace_dir,
+    resolve_node_state_base,
     resolve_state_base,
     sandbox_record_path,
     validate_sandbox_id,
@@ -167,24 +173,45 @@ def _recorded_uids(
     Records are the source of truth for "allocated": a uid referenced by any
     record (on any worker sharing the workspace) is never handed out again,
     and reconcile never treats it as an orphan.
+
+    The **index is the shared record directory** (``<state base>/_runtime``),
+    not the tree directories under the workspace base. That distinction is
+    review Focus 3 of Task 4: it used to list ``<workspace base>/*`` and read
+    each tree's record, which answered "which uids are in use fleet-wide" by
+    looking at *this node's* trees -- correct only while the trees themselves
+    were on the shared volume. Once they are node-local (Task 3) that index
+    sees one node's trees and nothing else, and the pool hands out a uid
+    another node's sandbox already holds: E3.2's per-sandbox isolation gone,
+    and only visible as two sandboxes that can read each other's files.
+
+    Enumerate the records instead -- they are what pins a uid, they are shared
+    by construction, and every node sees the same set. There is deliberately no
+    fallback to the tree-directory index: a fallback would keep answering
+    ``{this node's trees}`` on every node and hide the bug in exactly the shape
+    it must fail in. (A record that only exists in the pre-split in-tree
+    location is adopted by :meth:`RuntimeRegistry.adopt_legacy_records`; the
+    ledger deliberately does not walk trees to find it.)
     """
-    base = Path(workspace_base)
     used: set[int] = set()
-    if not base.is_dir():
+    runtime_dir = resolve_state_base(workspace_base, state_base) / RUNTIME_DIR_NAME
+    if not runtime_dir.is_dir():
         return used
     try:
-        entries = list(base.iterdir())
+        entries = list(runtime_dir.iterdir())
     except OSError:
         return used
     for entry in entries:
-        # The same shape predicate every other top-level workspace scan uses
-        # (quota orphan scan, worker GC): the ``_``/``snap_`` namespaces are
-        # separated by content, so a prefixed directory counts as a sandbox
-        # tree only when it carries its own record -- which is the only way
-        # this loop can contribute a uid at all.
-        if not is_sandbox_workspace_dir(entry):
+        # ``_runtime`` holds one directory per sandbox id plus the
+        # ``.checkpoints`` store, which is a dot-name (rejected by
+        # ``validate_sandbox_id``) and carries no record of its own -- so the
+        # record itself is the filter, exactly as the per-id reader below
+        # applies it. ``_recorded_uid`` keeps its pre-split in-tree fallback for
+        # the ids this index *did* find, which is what a rolling upgrade needs.
+        if not entry.is_dir() or entry.is_symlink():
             continue
-        uid = _recorded_uid(base, entry.name, state_base=state_base)
+        if not validate_sandbox_id(entry.name):
+            continue
+        uid = _recorded_uid(workspace_base, entry.name, state_base=state_base)
         if uid is not None and start <= uid < start + size:
             used.add(uid)
     return used
@@ -402,6 +429,7 @@ class UidPool:
         start: int = 10000,
         size: int = 1000,
         state_base: str | Path | None = None,
+        node_state_base: str | Path | None = None,
     ) -> None:
         if not isinstance(start, int) or start <= 0:
             raise UidPoolError(f"invalid uid pool start: {start!r}")
@@ -417,6 +445,18 @@ class UidPool:
         #: same base (``sandbox_record_path(..., state_base=...)``), while the
         #: directories it walks stay under the workspace base.
         self._state_base = resolve_state_base(self._workspace_base, state_base)
+        #: Where the pool's *own* files live -- the cross-process ``flock`` and
+        #: the reservation markers. Node-local since Task 4: the lock is only
+        #: ever waited on by processes of this node, and a marker written to
+        #: the NAS was one metadata round trip paid inside ``acquire`` (and
+        #: again inside ``commit``'s negative ``unlink``). The fleet-wide
+        #: ledger is *not* these files -- it is the shared records the index in
+        #: :func:`_recorded_uids` enumerates, which is why nothing here has to
+        #: be visible to another node. Unset, this is the state base, i.e.
+        #: exactly the pre-Task-4 layout.
+        self._local_base = resolve_node_state_base(
+            self._workspace_base, state_base, node_state_base
+        )
         self._allocated: set[int] = set()
         self._by_sandbox: dict[str, int] = {}
         self._lock = threading.Lock()
@@ -432,10 +472,10 @@ class UidPool:
     @property
     def lock_path(self) -> Path:
         """Cross-process serialization point for the free-set computation."""
-        return self._state_base / ".uid_pool.lock"
+        return self._local_base / ".uid_pool.lock"
 
     def _open_reservation_lock(self) -> int:
-        """Open and exclusively flock the shared state file.
+        """Open and exclusively flock the pool's own lock file.
 
         Blocks until any other worker's free-set recompute + marker write
         critical section finishes. The kernel drops the lock if the holder
@@ -444,9 +484,12 @@ class UidPool:
         # The *workspace* base is ensured on demand (this pool's own scans read
         # it, and yesterday it was also the lock's parent). The state base is
         # not: it belongs to the deployment's init container, which owns its
-        # mode and ownership on the shared export -- a worker that created it
-        # out of band would leave a platform directory nobody styled. A missing
-        # state base therefore fails loudly on the ``open`` below.
+        # mode and ownership on the shared export -- and neither is the
+        # node-local base, which that same init container creates with the
+        # worker's ownership (it is a hostPath, so nothing else may style it
+        # either: NFS's root_squash rules do not apply, but a worker-created
+        # directory would still land with whatever umask the worker has). A
+        # missing base therefore fails loudly on the ``open`` below.
         self._workspace_base.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
@@ -464,7 +507,7 @@ class UidPool:
             os.close(fd)
 
     def _marker_path(self, sandbox_id: str) -> Path:
-        return self._state_base / _RESERVATION_DIR / sandbox_id
+        return self._local_base / _RESERVATION_DIR / sandbox_id
 
     def _write_reservation(self, sandbox_id: str, uid: int) -> None:
         """Atomically persist the reservation marker (under the flock)."""
@@ -491,7 +534,7 @@ class UidPool:
         startup-only scan; the multi-worker concurrent-startup caveat is the
         documented one for orphan reclaim (report §5 / Concerns §3).
         """
-        marker_dir = self._state_base / _RESERVATION_DIR
+        marker_dir = self._local_base / _RESERVATION_DIR
         if not marker_dir.is_dir():
             return
         try:
@@ -507,7 +550,7 @@ class UidPool:
 
     def _reserved_uids(self) -> set[int]:
         """Pool-range uids held by reservation markers (cross-process)."""
-        marker_dir = self._state_base / _RESERVATION_DIR
+        marker_dir = self._local_base / _RESERVATION_DIR
         reserved: set[int] = set()
         if not marker_dir.is_dir():
             return reserved

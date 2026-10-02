@@ -364,13 +364,27 @@ spec:
               value: "1"
             # ...and the base the platform's own files live under: the runtime
             # records (`_runtime/<id>/sandbox.json`), the command logs, the
-            # checkpoint images, the uid pool's lock and reservations. A
-            # *sibling* of the sunk tree root and on the same mount, so a
-            # sandbox walking up from its own tree reaches the workspace root
-            # and never this. Unset (every deployment that predates N27) it is
-            # the workspace base, i.e. the old layout unchanged.
+            # checkpoint images. A *sibling* of the sunk tree root and on the
+            # same mount, so a sandbox walking up from its own tree reaches the
+            # workspace root and never this. Unset (every deployment that
+            # predates N27) it is the workspace base, i.e. the old layout
+            # unchanged. The create's marker/accounting seed, `.route-b` and
+            # the uid pool's own lock and markers are *not* here any more --
+            # N57 / Task 4 moved them to `E2B_NODE_STATE_BASE` (below), which is
+            # node-local.
             - name: E2B_STATE_BASE
               value: /var/lib/e2b-sandboxes/state
+            # N57 (Task 4): the node-local base, named here **only** so the
+            # control plane's root discipline agrees with the worker's about
+            # `.route-b`: `_slot_document` derives a slot document's path from
+            # `E2B_ROUTE_B_TMP_ROOT` and `_require_in_roots` refuses a path
+            # outside `ControlPaths.roots()` -- a named node-local base gives
+            # the derivation its root (the fifth one, Task 0). This pod never
+            # reads or writes anything under it (the worker writes the
+            # documents, this node's agent scopes them), so there is no volume
+            # here and no subPath: naming a path is not mounting it.
+            - name: E2B_NODE_STATE_BASE
+              value: /var/lib/e2b/state
             # C3 Task 4 slice B: route B's scratch root, where each slot's
             # `policy.json` / `program.json` live. The *worker* writes those
             # documents, but the control plane is what derives the path of the
@@ -378,10 +392,11 @@ spec:
             # (`scope-slot-document`) -- the worker may not report a path (hard
             # rule 3 / §14.4). Unset, that op answers a named 503 and route-B
             # slots never come up; the value is the worker's own
-            # `E2B_ROUTE_B_TMP_ROOT` (N27 puts `.route-b` under the state base,
-            # which is why the privileged helpers grew that root).
+            # `E2B_ROUTE_B_TMP_ROOT` (N57 / Task 4 puts `.route-b` under the
+            # *node-local* state base, which is why the privileged helpers grew
+            # that root; before Task 4 it was under the shared state base).
             - name: E2B_ROUTE_B_TMP_ROOT
-              value: /var/lib/e2b-sandboxes/state/.route-b
+              value: /var/lib/e2b/state/.route-b
             # Track Z / Z-F7 + C3 Task 4 slice B: the control plane's cache
             # directory and the workers' OCI directory are **split**, exactly
             # the way the worker splits them (``worker.yaml``: a node-local

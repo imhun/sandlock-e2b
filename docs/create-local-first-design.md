@@ -237,7 +237,7 @@ n = 10 个命名空间 + 8 个快照 id + 2 个节点）。命令见 §7.3。
 
 | 可以本地 | 省什么 | 前提 |
 |---|---|---|
-| `<state>/_runtime/<id>/.creating`、`disk-stats` | 建箱 `prepare` 的 NFS 原子写 | 只有本节点读；**但它与 `sandbox.json` 同目录**，要拆先拆路径（Task 4） |
+| `<state>/_runtime/<id>/.creating`、`disk-stats` | 建箱 `prepare` 的 NFS 原子写 | 只有本节点读；**但它与 `sandbox.json` 同目录**，要拆先拆路径（Task 4 —— **已落仓库，`docs/deploy-clusters.md` §7.31**：路径在 `E2B_NODE_STATE_BASE`，记录留共享） |
 | `<state>/.route-b/**` | slot 起停的小写 | 读者是本节点 slot 进程（沙箱 uid），权限要跟着走 |
 | `<state>/.uid_pool.lock`、`.uid_reservations/` | 池操作的 NFS 往返 | 全舰队口径来自 `sandbox.json`，不是这里 |
 | `<state>/_runtime/<id>/command-logs.jsonl` | 日志写的往返 | 裁定 1：远程形态 CP 是**代理**读，直读只属 `local://` |

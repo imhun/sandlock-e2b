@@ -76,11 +76,13 @@
 | `n42-egress-probe.py` | N42 acceptance on the live fleet: does `allow_internet_access=True` reach out? | —（头部无 Usage 行；见脚本 `--help`） |
 | `netns-node-compare.py` | Per-node comparison: SDK command RTT, MCP /mcp RTT, wildcard DNS. | —（头部无 Usage 行；见脚本 `--help`） |
 | `node-mmap-storage.sh` | Same kernel, four storages: does a mapped store past EOF extend the file? | —（头部无 Usage 行；见脚本头部） |
+| `node_state_split_local_probe.py` | Task 4 的**本地**尺子（不连集群）：在真 app 里跑一次 `phase: prepare`，用 `sys.addaudithook` 只数落在共享 `E2B_STATE_BASE` 下的路径操作，再开一个 `E2B_NODE_STATE_BASE` 对照。2026-10-02 本机读数：writes **14 → 0**、reads 2 → 2（只读的那两次是舰队 uid 账本的索引，必须留共享）。量的是机制，不是延迟。 | `PYTHONPATH=. tmp/venv/bin/python deploy/scripts/acceptance/node_state_split_local_probe.py` |
 | `overlay-probe.sh` | 在不改云网络的前提下，验证封装型 overlay 能不能跨这两个节点工作。 | —（头部无 Usage 行；见脚本头部） |
 | `phase1-probe2.sh` | —（头部没写） | —（头部无 Usage 行；见脚本头部） |
 | `phase2.sh` | test-prod-shaped.sh's phase 2 (the unprivileged worker), runnable on its own. | `sh deploy/scripts/acceptance/phase2.sh <log>` |
 | `pidns-cost-probe.py` | Probe: what does `pid_ns` cost on the syscalls it traps? | `Run in the prod-shaped lane, both shapes, same image:` |
 | `pidns-shape-probe.py` | Probe: which shape did a route-B sandbox actually get? | 头部示例（旧拼写）`./deploy/scripts/test-prod-shaped.sh tmp/pidns-shape-probe.py -k pidns_shape_probe` |
+| `prepare_phase_cost_probe.py` | Task 4：建箱 `prepare` 那一段单独多贵 —— 直打 worker 的 agent 口，`phase: prepare` 计时、`phase: cancel` 收回（不落记录、不建树、不留沙箱）。Task 1 的基线 72–76 ms，Task 4 之后期望 ~10 ms；比 `E2B_CREATE_TRACE=1` 好在不用改 statefulset，也比整条建箱更窄（floor 是 `max(materialize, prepare)`）。 | `kubectl -n sandlock exec -i <cp-pod> -c control-plane -- python3 - "$E2B_API_KEY" "$E2B_INTERNAL_API_KEY" --n 10 < deploy/scripts/acceptance/prepare_phase_cost_probe.py` |
 | `probe-pure-realroot.py` | pure 能不能走真根？把 pivot_root 的两种用法实测一遍。 | —（头部无 Usage 行；见脚本头部） |
 | `probe-pure-restore-synthroot.sh` | pure + 合成根下的 pause/resume：restore stub 从"根内"变成"根外"。 | `用法：probe-pure-restore-synthroot.sh <log>` |
 | `probe-pure-synth-root-plaindir.py` | 合成根在生产 cap 形状下能不能 pivot？以及 /dev、/proc 该怎么装。 | —（头部无 Usage 行；见脚本头部；由 `probe-pure-synth-root.sh <part>` 驱动） |

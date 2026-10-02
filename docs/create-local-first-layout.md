@@ -26,8 +26,8 @@
 | 变量 | 重切前的值 | 重切后的值 | 介质 | 谁写 | 谁读（跨节点？） |
 |---|---|---|---|---|---|
 | `E2B_WORKSPACE_BASE` | `<shared>/workspaces` | 同左（Task 3 才改指 `/var/lib/e2b/workspaces`） | 共享 → **Task 3 起节点本地** | worker / agent 建树；**沙箱自己**在其上读写 | ① 沙箱（同节点，bind mount）② worker files API（同节点）③ **迁移目标节点**（经裁定 2 的 tar 中转）④ agent 拍快照（同节点） |
-| `E2B_NODE_STATE_BASE`（新） | — | `/var/lib/e2b/state` | **节点本地** hostPath | Task 4 起：`.creating` / disk-stats / `.route-b/**` / uid 池本地件 | 只有本节点（同节点） |
-| `E2B_STATE_BASE` | `<shared>/state` | 同左 | 共享 | worker（`_runtime` 记录、命令日志）、沙箱 slot 进程（checkpoint） | ① 本节点 worker ② **别的节点的 worker**（`uid_pool._recorded_uids`）③ CP 只推路径，不直读（远程形态是代理） |
+| `E2B_NODE_STATE_BASE`（新） | — | `/var/lib/e2b/state` | **节点本地** hostPath | **Task 4 已落仓库（待上线）**：建箱 `prepare` 的 `.creating` / `disk-stats`、`.route-b/**` 的 slot 文档、uid 池自己的 `.uid_pool.lock` / `.uid_reservations/` | 只有本节点（同节点）：worker 写，本节点 slot / agent 读 |
+| `E2B_STATE_BASE` | `<shared>/state` | 同左 | 共享 | worker（`_runtime` 记录、命令日志）、沙箱 slot 进程（checkpoint） | ① 本节点 worker ② **别的节点的 worker**（`uid_pool._recorded_uids` —— Task 4 把它的索引从"树目录名"改成**枚举这个记录目录**，否则树本地化之后它只看得见自己节点的记录）③ CP 只推路径，不直读（远程形态是代理） |
 | `E2B_SHARED_VOLUME_ROOT` | `<shared>` | 同左（`_snapshots`、`_migrate` 搬进来） | 共享 | CP（`_builds`/`_templates`/`_volumes/_meta`/`_snapshots` 记录）、agent（`_snapshots` 载荷） | CP 两个副本之间；`_oci.tar` 是唯一的真·节点间交付面 |
 | `E2B_IMAGE_CACHE_DIR` | `/var/lib/e2b-images` | 同左 | **节点本地** hostPath | 本节点 worker（解包 rootfs） | 只有本节点 |
 

@@ -205,6 +205,7 @@ def create_executor(
                             settings.workspace_base,
                             sandbox_id,
                             state_base=settings.state_base,
+                            node_state_base=settings.node_state_base,
                         )
                     )
                     if sandbox_id

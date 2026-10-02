@@ -210,6 +210,23 @@ STATE_DIR_NAME = "state"
 #: (docs/pure-shape-decision.md §4, N27).
 STATE_BASE_ENV = "E2B_STATE_BASE"
 
+#: Environment variable naming the **node-local** base the platform's
+#: short-lived, same-node files live under -- the create's ``.creating``
+#: marker, the ``statfs(2)`` accounting seed, ``.route-b``'s slot documents
+#: and the uid pool's lock and reservation markers (N57 / Task 4).
+#:
+#: Why it is a *third* base rather than a second flavour of
+#: ``E2B_STATE_BASE``: the record (``_runtime/<id>/sandbox.json``) and the
+#: checkpoint store are read by **other nodes** -- every worker's uid ledger
+#: enumerates the records -- while those four chips are read by this node's
+#: own worker and slot processes only. On this deployment the shared base is
+#: NFS, where one metadata round trip measures ~13 ms, and the create's
+#: ``prepare`` phase paid it for each chip. Unset means "those files live
+#: under the state base", i.e. exactly the pre-Task-4 layout: every deployment
+#: that does not name this base (compose, tests, ``local://``) is byte-for-byte
+#: unchanged, the same rule every other base in this module follows.
+NODE_STATE_BASE_ENV = "E2B_NODE_STATE_BASE"
+
 #: The snapshot store's directory name, under the **platform namespace root**
 #: (:func:`platform_namespace_root`) -- one directory per snapshot id, holding
 #: the control plane's ``snapshot.json`` next to the agent-written payload
@@ -293,6 +310,31 @@ def resolve_state_base(
     workspace base.
     """
     return Path(state_base) if state_base else Path(workspace_base)
+
+
+def resolve_node_state_base(
+    workspace_base: str | Path,
+    state_base: str | Path | None = None,
+    node_state_base: str | Path | None = None,
+) -> Path:
+    """The base the platform's **node-local** files live under.
+
+    ``node_state_base`` when given (:data:`NODE_STATE_BASE_ENV`), the state
+    base otherwise -- and that in turn defaults to the workspace base. Unset is
+    therefore exactly the layout every deployment had until Task 4, which is
+    what makes naming the base the whole of the migration: no code path can end
+    up with a *different* answer about where a marker lives when the base is
+    not named.
+
+    Deliberately not folded into :func:`resolve_state_base`: the two answer
+    questions with different readers. The record and the checkpoint store under
+    the state base are read across nodes (the fleet-wide uid ledger), while the
+    marker, the accounting seed and the pool's own lock and markers are read by
+    this node only -- see :data:`NODE_STATE_BASE_ENV`.
+    """
+    if node_state_base:
+        return Path(node_state_base)
+    return resolve_state_base(workspace_base, state_base)
 
 
 def platform_namespace_root(
@@ -388,9 +430,34 @@ def sandbox_runtime_dir(
     )
 
 
-#: The create-in-flight marker's name, inside ``<state base>/_runtime/<id>``.
-#: A dot-file so no reader that enumerates the runtime directory mistakes it
-#: for a record, and so a ``sandbox.json`` reader can never see it as one.
+def sandbox_node_runtime_dir(
+    workspace_base: str | Path,
+    sandbox_id: str,
+    *,
+    state_base: str | Path | None = None,
+    node_state_base: str | Path | None = None,
+) -> Path:
+    """``<node state base>/_runtime/<id>`` -- the node-local half of a sandbox's
+    platform directory.
+
+    Same ``_runtime/<id>`` shape as :func:`sandbox_runtime_dir`, on the other
+    base: the record directory (``sandbox.json``, the command log) is shared,
+    and the two chips the create writes there for *this node's own readers* --
+    ``.creating`` and ``disk-stats`` -- are not. Keeping the same interior shape
+    is what lets every reader keep addressing ``_runtime/<id>/<name>`` instead
+    of learning a second layout; the base is the only thing that moved.
+    """
+    return (
+        resolve_node_state_base(workspace_base, state_base, node_state_base)
+        / RUNTIME_DIR_NAME
+        / sandbox_id
+    )
+
+
+#: The create-in-flight marker's name, inside the **node state base**'s
+#: ``_runtime/<id>`` (see :func:`sandbox_creating_marker`). A dot-file so no
+#: reader that enumerates a runtime directory mistakes it for a record, and so
+#: a ``sandbox.json`` reader can never see it as one.
 CREATING_MARKER_NAME = ".creating"
 
 
@@ -399,8 +466,9 @@ def sandbox_creating_marker(
     sandbox_id: str,
     *,
     state_base: str | Path | None = None,
+    node_state_base: str | Path | None = None,
 ) -> Path:
-    """``<state base>/_runtime/<id>/.creating`` -- "a create is in flight".
+    """``<node state base>/_runtime/<id>/.creating`` -- "a create is in flight".
 
     Two invariants are readable off the disk because of this file, and they are
     what makes moving the record write off the create's response path safe:
@@ -413,7 +481,12 @@ def sandbox_creating_marker(
     input the existing orphan path already reclaims.
     """
     return (
-        sandbox_runtime_dir(workspace_base, sandbox_id, state_base=state_base)
+        sandbox_node_runtime_dir(
+            workspace_base,
+            sandbox_id,
+            state_base=state_base,
+            node_state_base=node_state_base,
+        )
         / CREATING_MARKER_NAME
     )
 
@@ -426,14 +499,20 @@ def sandbox_disk_stats_path(
     sandbox_id: str,
     *,
     state_base: str | Path | None = None,
+    node_state_base: str | Path | None = None,
 ) -> Path:
     """The host's disk accounting for one sandbox's ``statfs(2)``.
 
-    ``<state base>/_runtime/<id>/disk-stats`` holding ``<total_bytes>
+    ``<node state base>/_runtime/<id>/disk-stats`` holding ``<total_bytes>
     <used_bytes>``. It lives beside the sandbox's record rather than in its
     tree: the sandbox must not be able to write the numbers it is shown, and
     the supervisor (which reads it on each ``statfs``) cannot reach the
     sandbox's own mount namespace.
+
+    Node-local, like the marker: the writer is this node's worker and the
+    reader is this node's slot process, so a shared-volume write here is one
+    NAS round trip bought for no cross-node reader (Task 4). The *record* it
+    sits next to stays shared -- that is the half the fleet reads.
 
     The **reader is not the writer**: in the route-B shape the supervisor is the
     slot process at the sandbox's own host uid, while the file is written by the
@@ -445,9 +524,15 @@ def sandbox_disk_stats_path(
     silent outage: the supervisor's read fails and every ``statfs`` answers with
     the node's volume again (measured 2026-10-01).
     """
-    return sandbox_runtime_dir(
-        workspace_base, sandbox_id, state_base=state_base
-    ) / _DISK_STATS_NAME
+    return (
+        sandbox_node_runtime_dir(
+            workspace_base,
+            sandbox_id,
+            state_base=state_base,
+            node_state_base=node_state_base,
+        )
+        / _DISK_STATS_NAME
+    )
 
 
 def sandbox_record_path(

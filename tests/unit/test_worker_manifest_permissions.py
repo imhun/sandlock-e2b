@@ -804,7 +804,13 @@ def test_k0s_overlay_sinks_the_tree_root_and_keeps_state_as_a_sibling() -> None:
     }
     assert env["E2B_WORKSPACE_BASE"] == "/var/lib/e2b-sandboxes/workspaces"
     assert env["E2B_STATE_BASE"] == "/var/lib/e2b-sandboxes/state"
-    assert env["E2B_ROUTE_B_TMP_ROOT"] == "/var/lib/e2b-sandboxes/state/.route-b"
+    # N57 / Task 4: the state base keeps the record and the checkpoint store;
+    # the create's chips, `.route-b` and the uid pool's own files move to the
+    # node-local base -- the shared state base is still named (it is where the
+    # records live) and no longer holds any of them.
+    assert env["E2B_NODE_STATE_BASE"] == "/var/lib/e2b/state"
+    assert env["E2B_ROUTE_B_TMP_ROOT"] == "/var/lib/e2b/state/.route-b"
+    assert env["E2B_STATE_BASE"] != env["E2B_NODE_STATE_BASE"]
     # N27 (Task 5 follow-up): the export root is named as the *third* broker
     # root, because the tree root no longer is it -- `_volumes`/`_images` would
     # otherwise fall outside the whitelist a non-root worker's brokers enforce.
@@ -815,6 +821,23 @@ def test_k0s_overlay_sinks_the_tree_root_and_keeps_state_as_a_sibling() -> None:
     assert env["E2B_IMAGE_OCI_DIR"] == "/var/lib/e2b-sandboxes/_images"
     # 反例：state 不得落在树根之下，否则沙箱的 `..` 又会到它
     assert not env["E2B_STATE_BASE"].startswith(env["E2B_WORKSPACE_BASE"])
+    # ...and the node-local base is *not* under either shared root: it is a
+    # hostPath on the node's own disk, so a value that pointed inside the
+    # shared export would silently put the create's writes back on the NAS.
+    assert not env["E2B_NODE_STATE_BASE"].startswith(
+        env["E2B_SHARED_VOLUME_ROOT"]
+    )
+    # ...and the worker can actually reach it: naming a hostPath is not
+    # mounting it, and an unmounted base is a pod whose first create dies on
+    # ENOENT for `<node_state>/.uid_pool.lock`.
+    pod = worker["spec"]["template"]["spec"]
+    mounts = {m["name"]: m["mountPath"] for m in pod["containers"][0]["volumeMounts"]}
+    assert mounts["node-state"] == env["E2B_NODE_STATE_BASE"]
+    volumes = {v["name"]: v for v in pod["volumes"]}
+    assert volumes["node-state"]["hostPath"] == {
+        "path": env["E2B_NODE_STATE_BASE"],
+        "type": "DirectoryOrCreate",
+    }
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
@@ -904,9 +927,9 @@ def test_k0s_overlay_control_plane_writes_only_the_migration_staging_and_state()
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
 def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
-    """The two roots and the checkpoint store's gate are an init container's job.
+    """The roots and the checkpoint store's gate are an init container's job.
 
-    Three failures this pins, all measured elsewhere in N27:
+    Four failures this pins, all measured elsewhere in N27 (the fourth in N57):
 
     * ``<state>`` missing -- ``uid_pool.acquire`` opens ``<state>/.uid_pool.lock``
       with ``O_CREAT`` under the base it is handed, so the *first*
@@ -918,6 +941,10 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
     * ``<export>/_migrate`` missing -- it is the *source* of the control
       plane's one writable subPath under the tree root, and a subPath whose
       source does not exist keeps that pod in ``ContainerCreating``.
+    * the **node-local** ``E2B_NODE_STATE_BASE`` missing or root-owned (N57 /
+      Task 4) -- it is a hostPath under `/var/lib/e2b/state`, the one root the
+      65534 worker writes into that is not on the shared volume, so nobody but
+      this root init can create it with the right owner.
 
     C1 moved the container out of the worker pod (it has to run as root to chown
     the volume roots, and that pod is no longer allowed a root container of any
@@ -957,15 +984,20 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
         "SHARED_ROOT": "/var/lib/e2b-sandboxes",
         "WORKSPACE_BASE": "/var/lib/e2b-sandboxes/workspaces",
         "STATE_BASE": "/var/lib/e2b-sandboxes/state",
+        # N57 / Task 4: the node-local base, created and handed to 65534 by
+        # this same init (it is a hostPath, so no earlier step could have).
+        "NODE_STATE_BASE": "/var/lib/e2b/state",
     }
     assert init["volumeMounts"] == [
-        {"name": "shared", "mountPath": "/var/lib/e2b-sandboxes"}
+        {"name": "shared", "mountPath": "/var/lib/e2b-sandboxes"},
+        {"name": "node-state", "mountPath": "/var/lib/e2b/state"},
     ]
     lines = [line.strip() for line in init["command"][2].splitlines()]
     for expected in (
         'shared="$SHARED_ROOT"',
         'base="$WORKSPACE_BASE"',
         'state="$STATE_BASE"',
+        'node_state="$NODE_STATE_BASE"',
         # The platform's own namespaces stay under the shared export root.
         "for dir in _builds _images _secrets _templates _snapshots _volumes; do",
         'mkdir -p "$shared/$dir"',
@@ -973,6 +1005,15 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
         # control plane mounts, and the state base the uid pool needs).
         'for dir in "$base" "$state"; do',
         'mkdir -p "$dir"',
+        # N57 / Task 4: the node-local half of the state. It is *not* on the
+        # shared volume, so it is created here and handed to the worker (the
+        # only root here uid 65534 writes into), and its ownership is verified
+        # strictly -- no 1777 fallback, because a *local* disk that cannot be
+        # chowned is a broken node, not an NFS quirk.
+        'mkdir -p "$node_state"',
+        'chown 65534:65534 "$node_state" 2>/dev/null ||',
+        'chmod 0755 "$node_state" 2>/dev/null ||',
+        'if [ "$node_state_owner" != "65534" ]; then',
         # ...plus the migration staging, on the *export* root since N58 (the
         # tree root is no longer the thing its reader can see).
         'mkdir -p "$shared/_migrate"',
@@ -1055,9 +1096,11 @@ def test_the_retired_brokers_owner_inits_moved_into_the_agent() -> None:
         "SHARED_ROOT": "/var/lib/e2b-sandboxes",
         "WORKSPACE_BASE": "/var/lib/e2b-sandboxes/workspaces",
         "STATE_BASE": "/var/lib/e2b-sandboxes/state",
+        "NODE_STATE_BASE": "/var/lib/e2b/state",
     }
     assert roots["volumeMounts"] == [
-        {"name": "shared", "mountPath": "/var/lib/e2b-sandboxes"}
+        {"name": "shared", "mountPath": "/var/lib/e2b-sandboxes"},
+        {"name": "node-state", "mountPath": "/var/lib/e2b/state"},
     ]
     # The cache init owns the node-local cache too -- that half used to be the
     # broker's, and dropping it would leave `/var/lib/e2b-images` root-owned on
@@ -1073,13 +1116,20 @@ def test_the_retired_brokers_owner_inits_moved_into_the_agent() -> None:
         "/var/lib/e2b-sandboxes",
         "/var/lib/e2b-images",
     }
-    # ...and the pod that runs them carries both volumes.
+    # ...and the pod that runs them carries every volume they hand over --
+    # since N57 / Task 4 that is the shared claim, the node-local image cache
+    # and the node-local state base (the hostPath the create's chips and the
+    # uid pool's own files live on).
     volumes = {v["name"]: v for v in pod["volumes"]}
     assert volumes["shared"]["persistentVolumeClaim"] == {
         "claimName": "sandbox-shared"
     }
     assert volumes["image-cache"]["hostPath"] == {
         "path": "/var/lib/e2b-images",
+        "type": "DirectoryOrCreate",
+    }
+    assert volumes["node-state"]["hostPath"] == {
+        "path": "/var/lib/e2b/state",
         "type": "DirectoryOrCreate",
     }
 
@@ -1597,14 +1647,18 @@ def test_compose_prod_worker_env_carries_the_fleets_route_b_root() -> None:
     assert _compose_prod_worker_route_b_root() == {
         "E2B_ROUTE_B_TMP_ROOT": fleet["deploy/stack/docker-compose.prod.yml"]
     }
-    # Two bases in the k8s manifest: `.route-b` is platform state, so it follows
-    # the state base -- and must *not* be under the tree root, which is the one
-    # directory a sandbox reaches by walking `..` (these documents carry the
-    # egress proxy's credentials).
+    # Three bases in the k8s manifest since N57 / Task 4: `.route-b` is platform
+    # state whose only readers are this node's worker, slot and agent, so it
+    # follows the **node-local** base -- and must be under neither the tree root
+    # (the one directory a sandbox reaches by walking `..`; these documents
+    # carry the egress proxy's credentials) nor the shared state base (where
+    # every slot start would pay an NFS round trip per document).
     state_base = _k8s_env_value(K8S_WORKER, "E2B_STATE_BASE")
+    node_state_base = _k8s_env_value(K8S_WORKER, "E2B_NODE_STATE_BASE")
     tree_root = _k8s_env_value(K8S_WORKER, "E2B_WORKSPACE_BASE")
-    assert fleet["deploy/k8s/worker.yaml"] == f"{state_base}/.route-b"
+    assert fleet["deploy/k8s/worker.yaml"] == f"{node_state_base}/.route-b"
     assert not fleet["deploy/k8s/worker.yaml"].startswith(f"{tree_root}/")
+    assert not fleet["deploy/k8s/worker.yaml"].startswith(f"{state_base}/")
     # ...and the two shapes really do differ, so copying either value into the
     # other manifest fails here.
     assert (

@@ -76,6 +76,7 @@ from gateway_common.paths import (
     sandbox_checkpoint_dir,
     sandbox_command_log_path,
     sandbox_creating_marker,
+    sandbox_node_runtime_dir,
     sandbox_runtime_dir,
     snapshot_payload_dir,
     validate_sandbox_id,
@@ -1213,6 +1214,16 @@ def _park_refused_tree(
                 runtime_dir.rmdir()
             except OSError:  # pragma: no cover - defensive
                 pass
+        # The node-local half of the same directory (N57 / Task 4) is *not*
+        # evidence of anything -- it holds the create's marker and its
+        # regenerable ``statfs`` seed -- so it is dropped rather than moved,
+        # and it is dropped here for the same reason the shared half is: a
+        # parked tree leaves nothing behind that describes a sandbox nobody can
+        # act on. Its reader (this node's slot/worker) is gone with the tree.
+        try:
+            _node_runtime_dir(settings, sandbox_id).rmdir()
+        except OSError:  # pragma: no cover - absent, or not empty
+            pass
         # The checkpoint images are evidence of the same kind and live in their
         # own store (``_runtime/.checkpoints/<id>`` -- the sandbox's slot is what
         # writes them, so they cannot sit under the worker-owned runtime dir).
@@ -1568,6 +1579,19 @@ def _delete_sandbox_runtime(
             )
         else:
             shutil.rmtree(runtime_dir, ignore_errors=True)
+        # ...and its **node-local** sibling (N57 / Task 4), where the create's
+        # ``.creating`` marker and its ``statfs`` accounting seed live once a
+        # deployment names ``E2B_NODE_STATE_BASE``. Nothing else collects that
+        # directory: the node-local base is not a sandbox-id namespace, so
+        # neither the orphan GC nor any scan walks it, and one directory per
+        # deleted sandbox would accumulate on the node's disk for ever. It is
+        # the worker's own file (the worker created it as 65534), so this is a
+        # plain local removal rather than a privileged file step -- and with no
+        # node base named it is the same path as the removal above, which is
+        # what keeps the one-base deployments byte-for-byte unchanged.
+        shutil.rmtree(
+            _node_runtime_dir(settings, sandbox_id), ignore_errors=True
+        )
         # ...and the pure shape's synthesized root (N16), the third thing the
         # platform holds for this sandbox: ``<pure_rootfs_dir>/<id>`` is the
         # skeleton the sandbox's own mount namespace binds into. It goes with
@@ -2839,7 +2863,10 @@ def _write_disk_stats(
     from gateway_common.paths import sandbox_disk_stats_path, write_text_atomically
 
     path = sandbox_disk_stats_path(
-        settings.workspace_base, sandbox_id, state_base=settings.state_base
+        settings.workspace_base,
+        sandbox_id,
+        state_base=settings.state_base,
+        node_state_base=settings.node_state_base,
     )
     try:
         runtime_dir = path.parent
@@ -2858,7 +2885,32 @@ def _write_disk_stats(
 
 def _creating_marker(settings: Settings, sandbox_id: str) -> Path:
     return sandbox_creating_marker(
-        settings.workspace_base, sandbox_id, state_base=settings.state_base
+        settings.workspace_base,
+        sandbox_id,
+        state_base=settings.state_base,
+        node_state_base=settings.node_state_base,
+    )
+
+
+def _node_runtime_dir(settings: Settings, sandbox_id: str) -> Path:
+    """The node-local half of ``_runtime/<id>``: the create's two chips.
+
+    Unset ``E2B_NODE_STATE_BASE`` makes this the *shared* runtime directory
+    again (``<state base>/_runtime/<id>``), which is what keeps every cleanup
+    below idempotent on the deployments that never name the base.
+
+    It reads the base from ``settings`` and not from the runtime registry on
+    purpose: the node-local base is a *deployment* input (it is what the init
+    container creates), and a registry handed a different workspace/state base
+    by an embedder does not make a second node-local one. When the node base is
+    named the two agree by construction; when it is not, the path is the shared
+    one and the extra cleanup is a no-op.
+    """
+    return sandbox_node_runtime_dir(
+        settings.workspace_base,
+        sandbox_id,
+        state_base=settings.state_base,
+        node_state_base=settings.node_state_base,
     )
 
 
@@ -3304,6 +3356,15 @@ def _agent_cancel_sandbox(request: Request, settings: Settings, payload: dict) -
         pool.release(sandbox_id)
     _discard_disk_stats(settings, sandbox_id)
     _clear_creating_marker(settings, sandbox_id)
+    # Both chips are gone, so the (now empty) node-local runtime directory has
+    # no reader left -- take it with them. Best effort, like the seed itself:
+    # ``_discard_disk_stats``' own ``rmdir`` runs while the marker is still
+    # there and therefore always fails, which is why this is a second attempt
+    # rather than a move.
+    try:
+        _node_runtime_dir(settings, sandbox_id).rmdir()
+    except OSError:
+        pass
 
 
 def _discard_disk_stats(settings: Settings, sandbox_id: str) -> None:
@@ -3311,7 +3372,10 @@ def _discard_disk_stats(settings: Settings, sandbox_id: str) -> None:
     from gateway_common.paths import sandbox_disk_stats_path
 
     path = sandbox_disk_stats_path(
-        settings.workspace_base, sandbox_id, state_base=settings.state_base
+        settings.workspace_base,
+        sandbox_id,
+        state_base=settings.state_base,
+        node_state_base=settings.node_state_base,
     )
     try:
         path.unlink(missing_ok=True)

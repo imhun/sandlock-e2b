@@ -37,6 +37,25 @@ def _write_record(workspace: Path, sandbox_id: str, host_uid: int | None) -> Non
     )
 
 
+def _write_platform_record(
+    workspace: Path, sandbox_id: str, host_uid: int | None
+) -> None:
+    """One record where the platform writes it: ``_runtime/<id>/sandbox.json``.
+
+    This is the location the fleet-wide ledger indexes (Task 4 / review Focus
+    3): the index used to be a walk over *tree* directory names, which stopped
+    seeing other nodes' records once the trees went node-local. The pre-split
+    in-tree copy (``_write_record`` above) is still a shape reconcile's orphan
+    scan has to know about, so the two helpers live side by side.
+    """
+    record = workspace / "_runtime" / sandbox_id / "sandbox.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(
+        json.dumps({"sandbox_id": sandbox_id, "host_uid": host_uid}),
+        encoding="utf-8",
+    )
+
+
 def _snapshot_store(base: Path, name: str) -> Path:
     """The shape ``SnapshotRegistry`` writes: ``snapshot.json`` + ``fs/``.
 
@@ -96,7 +115,16 @@ def test_acquire_allocates_sequential_and_exhausts(tmp_path):
 
 
 def test_acquire_skips_uids_referenced_by_records(tmp_path):
-    _write_record(tmp_path, "sbx_other", POOL_START + 1)
+    """The ledger reads the platform records, wherever those sandboxes live.
+
+    Updated for Task 4: the record is written to ``_runtime/<id>/sandbox.json``
+    rather than to the pre-split in-tree location, because that directory -- not
+    the tree names under the workspace base -- is what ``_recorded_uids``
+    indexes now (a tree-names index only ever sees *this* node's trees once they
+    are node-local). The behaviour under test is unchanged: a uid a record
+    references is never handed out again.
+    """
+    _write_platform_record(tmp_path, "sbx_other", POOL_START + 1)
     pool = _pool(tmp_path)
     assert pool.acquire("sbx_a") == POOL_START
     assert pool.acquire("sbx_b") == POOL_START + 2

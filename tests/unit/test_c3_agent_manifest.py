@@ -176,8 +176,11 @@ def test_face_a_is_the_unprivileged_identity_giver() -> None:
 def test_face_b_is_the_file_face_with_c1s_capability_set() -> None:
     """§2.2: root + `drop: [ALL]` + exactly C1's three capabilities.
 
-    Same three verbs, same three capabilities, same roots: the plan moves the
-    file face, it does not widen it.
+    Same three verbs, same three capabilities: the plan moves the file face, it
+    does not widen it. The root list grows by one at N57 / Task 4 (the
+    node-local state base the `.route-b` documents moved onto) -- a *narrower*
+    root than the shared export it replaced, which is why the pin below keeps
+    naming every entry instead of comparing a count.
     """
     agent = _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
     face_b = _containers(agent)["maint"]
@@ -188,10 +191,13 @@ def test_face_b_is_the_file_face_with_c1s_capability_set() -> None:
         "drop": ["ALL"],
         "add": ["CHOWN", "DAC_OVERRIDE", "FOWNER"],
     }
-    # The four whitelist roots the C side validates against (`priv_common.c`).
+    # The five whitelist roots the C side validates against (`priv_common.c`).
+    # The fifth is N57 / Task 4's node-local base: `.route-b` (the one document
+    # this face chowns, `scope-slot-document`) lives under it now.
     env = _env(face_b)
     assert env["E2B_WORKSPACE_BASE"]["value"] == "/var/lib/e2b-sandboxes/workspaces"
     assert env["E2B_STATE_BASE"]["value"] == "/var/lib/e2b-sandboxes/state"
+    assert env["E2B_NODE_STATE_BASE"]["value"] == "/var/lib/e2b/state"
     assert env["E2B_SHARED_VOLUME_ROOT"]["value"] == "/var/lib/e2b-sandboxes"
     assert env["E2B_IMAGE_CACHE_DIR"]["value"] == "/var/lib/e2b-images"
     # Task 4 slice B: the payload. Face B runs **the same service** face A runs
@@ -219,22 +225,30 @@ def test_face_b_is_the_file_face_with_c1s_capability_set() -> None:
     assert mounts == {
         "shared": "/var/lib/e2b-sandboxes",
         "image-cache": "/var/lib/e2b-images",
+        # ...and the node-local state base, so the path `priv_common.c`
+        # resolves for a `.route-b` slot document is one this process can
+        # actually open (`chown` walks the real path, not the variable).
+        "node-state": "/var/lib/e2b/state",
     }
 
 
-def test_face_a_carries_no_mounts_and_the_pod_ships_only_the_two_it_needs() -> None:
+def test_face_a_carries_no_mounts_and_the_pod_ships_only_the_three_it_needs() -> None:
     """§2.1: face A shares no path with the worker -- that channel is absent.
 
-    The agent's mounts are the shared PVC and the node-local cache (both for
-    face B); face A reads `/proc` of the host through `hostPID` and needs
-    nothing else.
+    The agent's mounts are the shared PVC, the node-local image cache and (N57 /
+    Task 4) the node-local state base -- all three for face B; face A reads
+    `/proc` of the host through `hostPID` and needs nothing else.
     """
     agent = _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
     face_a = _containers(agent)["agent"]
     assert face_a.get("volumeMounts") in (None, [])
     volumes = {v["name"]: v for v in _pod_spec(agent)["volumes"]}
-    assert sorted(volumes) == ["image-cache", "shared"]
+    assert sorted(volumes) == ["image-cache", "node-state", "shared"]
     assert volumes["shared"]["persistentVolumeClaim"]["claimName"] == "sandbox-shared"
+    assert volumes["node-state"]["hostPath"] == {
+        "path": "/var/lib/e2b/state",
+        "type": "DirectoryOrCreate",
+    }
 
 
 def test_the_agent_manifest_never_names_a_forbidden_privilege() -> None:
@@ -604,7 +618,12 @@ def test_the_k8s_control_plane_names_route_b_and_splits_the_cache() -> None:
     """
     deployment = _only(_load_all(CONTROL_PLANE_MANIFEST), "Deployment", "control-plane")
     env = _env(next(c for c in _containers(deployment).values()))
-    assert env["E2B_ROUTE_B_TMP_ROOT"]["value"] == "/var/lib/e2b-sandboxes/state/.route-b"
+    # N57 / Task 4: under the *node-local* state base, not the shared one --
+    # and the CP has to name that base too, because `_require_in_roots` refuses
+    # a derived path outside `ControlPaths.roots()` (naming a path is not
+    # mounting it: this pod never touches anything under it).
+    assert env["E2B_NODE_STATE_BASE"]["value"] == "/var/lib/e2b/state"
+    assert env["E2B_ROUTE_B_TMP_ROOT"]["value"] == "/var/lib/e2b/state/.route-b"
     # ...and it is the same value the worker names, which is the whole point
     # (`worker.yaml` is the manifest that writes the documents).
     worker = _only(_load_all(WORKER_MANIFEST), "StatefulSet", "e2b-worker")
@@ -612,6 +631,29 @@ def test_the_k8s_control_plane_names_route_b_and_splits_the_cache() -> None:
     assert env["E2B_ROUTE_B_TMP_ROOT"]["value"] == worker_env["E2B_ROUTE_B_TMP_ROOT"]["value"]
     assert env["E2B_IMAGE_CACHE_DIR"]["value"] == worker_env["E2B_IMAGE_CACHE_DIR"]["value"]
     assert env["E2B_IMAGE_OCI_DIR"]["value"] == worker_env["E2B_IMAGE_OCI_DIR"]["value"]
+    # ...and the *root discipline* accepts it: `_require_in_roots` compares the
+    # derived path against the roots this pod declares, so a route-B root under
+    # a base the control plane never names (the shape a half-moved `.route-b`
+    # produces, e.g. value moved but `E2B_NODE_STATE_BASE` forgotten) is a named
+    # 503 and no route-B slot ever comes up. Read the roots off the manifest
+    # itself rather than restating them, so the two cannot drift apart.
+    from control_plane.file_ops import ControlPaths
+
+    assert worker_env["E2B_NODE_STATE_BASE"]["value"] == (
+        env["E2B_NODE_STATE_BASE"]["value"]
+    )
+    shared_root = env.get("E2B_SHARED_VOLUME_ROOT") or env["E2B_SHARED_WORKSPACE_ROOT"]
+    roots = ControlPaths(
+        workspace_base=Path(env["E2B_WORKSPACE_BASE"]["value"]),
+        state_base=Path(env["E2B_STATE_BASE"]["value"]),
+        node_state_base=Path(env["E2B_NODE_STATE_BASE"]["value"]),
+        # The control plane names the export root as `E2B_SHARED_WORKSPACE_ROOT`
+        # (the worker's name for it is `E2B_SHARED_VOLUME_ROOT`); accept either.
+        shared_volume_root=Path(shared_root["value"]),
+        image_cache_dir=Path(env["E2B_IMAGE_CACHE_DIR"]["value"]),
+        route_b_tmp_root=Path(env["E2B_ROUTE_B_TMP_ROOT"]["value"]),
+    )
+    assert roots.contains(Path(env["E2B_ROUTE_B_TMP_ROOT"]["value"])) is True
     # ...and the split is real: the CP's cache is *not* its OCI directory here,
     # which is the property "pointing the cache at the worker's node-local
     # secrets root" would have silently broken.
