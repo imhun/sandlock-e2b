@@ -25,7 +25,7 @@
 
 | 变量 | 重切前的值 | 重切后的值 | 介质 | 谁写 | 谁读（跨节点？） |
 |---|---|---|---|---|---|
-| `E2B_WORKSPACE_BASE` | `<shared>/workspaces` | **Task 3 已改指 `/var/lib/e2b/workspaces`**（节点本地 hostPath） | 共享 → **节点本地（已上线代码，待部署）** | worker / agent 建树；**沙箱自己**在其上读写 | ① 沙箱（同节点，bind mount）② worker files API（同节点）③ **迁移目标节点**（经裁定 2 的 tar 中转）④ agent 拍快照（同节点） |
+| `E2B_WORKSPACE_BASE` | `<shared>/workspaces` | **Task 3 已改指 `/var/lib/e2b/workspaces`**（节点本地 hostPath） | 共享 → **节点本地（已上线 `0.1.0-905-g7331364-20261002-174329`，2026-10-02 17:43）** | worker / agent 建树；**沙箱自己**在其上读写 | ① 沙箱（同节点，bind mount）② worker files API（同节点）③ **迁移目标节点**（经裁定 2 的 tar 中转）④ agent 拍快照（同节点） |
 | `E2B_NODE_STATE_BASE`（新） | — | `/var/lib/e2b/state` | **节点本地** hostPath | **Task 4 已上线（2026-10-02，`0.1.0-900-g0079c84-20261002-161409`；读数 `docs/deploy-clusters.md` §7.31）**：建箱 `prepare` 的 `.creating` / `disk-stats`、`.route-b/**` 的 slot 文档、uid 池自己的 `.uid_pool.lock` / `.uid_reservations/` | 只有本节点（同节点）：worker 写，本节点 slot / agent 读 |
 | `E2B_STATE_BASE` | `<shared>/state` | 同左 | 共享 | worker（`_runtime` 记录、命令日志）、沙箱 slot 进程（checkpoint） | ① 本节点 worker ② **别的节点的 worker**（`uid_pool._recorded_uids` —— Task 4 把它的索引从"树目录名"改成**枚举这个记录目录**，否则树本地化之后它只看得见自己节点的记录）③ CP 只推路径，不直读（远程形态是代理） |
 | `E2B_SHARED_VOLUME_ROOT` | `<shared>` | 同左（`_snapshots`、`_migrate` 搬进来） | 共享 | CP（`_builds`/`_templates`/`_volumes/_meta`/`_snapshots` 记录）、agent（`_snapshots` 载荷） | CP 两个副本之间；`_oci.tar` 是唯一的真·节点间交付面 |
@@ -175,6 +175,13 @@ GC 判它是 `protected` 而不是 orphan）。这就是 Task 0 立 `E2B_TREES_S
 （`DELETE /sandboxes/<id>`：树已经没了，记录不该继续留着）。排水顺序、持久面语义与
 上限配置都在 **[`docs/create-local-first-design.md` §8](create-local-first-design.md)**
 （§8.3 错误名、§8.4 排水纪律、§8.2 上限、§8.6 对"本地 vs 共享"的自我判断）。
+
+**2026-10-02 17:43 已上线并验收**（`0.1.0-905-g7331364-20261002-174329`）：停掉源节点
+worker 之后发起的迁移确实收到 `source-node-unreachable`（不再静默建空树）；健在时的
+跨节点迁移保文件。上线当天还抓到第三个状态 **`stale-tree-on-former-source`**
+（成功的迁移在旧节点留下一整棵树，自愈按记录判它 `protected`）——
+根因、影响边界（沙箱 `kill` 后 ~90 s 由自愈收走）与修复见
+[`docs/create-local-first-design.md` §8.3.1](create-local-first-design.md)。
 
 **③ 迁移的数据在途：整棵树进控制面内存**
 

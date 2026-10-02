@@ -1810,6 +1810,128 @@ wait
 `prepare` 立刻回到共享 base 的写法；已经写在节点本地盘上的那几样是**可再生的残渣**
 （marker / stats / lock / reservations 都是临时件），不需要数据迁移。
 
+### 7.32 N57（Task 3）：沙箱树搬节点本地盘 —— 翻转 + 流式迁移 + 具名错误（**2026-10-02 已上线 `0.1.0-905-g7331364-20261002-174329`**）
+
+计划 `docs/superpowers/plans/2026-10-02-local-first-create.md` 的 Task 3；裁定、上限与
+验收读数在 `docs/create-local-first-design.md` §8，介质地图在
+`docs/create-local-first-layout.md` §1。三个镜像同 tag
+（worker / control-plane-gateway / agent，见
+`kubectl -n sandlock get statefulset/e2b-worker -o jsonpath='{.spec.template.spec.containers[0].image}'`），
+control-plane 滚动到 revision 147。
+
+**改了什么**
+
+* **判据翻转**：控制面 `E2B_TREES_SHARED=0`；三份清单的 `E2B_WORKSPACE_BASE` 都指
+  `/var/lib/e2b/workspaces`（节点本地 hostPath，worker 与 face B 各挂一份；控制面只命名）。
+  共享根 `/var/lib/e2b-sandboxes` 一个字符没动：`_snapshots` / `_migrate` / `_volumes` /
+  `_images` 还在它下面，`<export>/workspaces` 成了一个**空**目录（旧树根）。
+* **迁移在途流式 + 按字节上限**（`E2B_TREE_COPY_MAX_BYTES=1342177280`、
+  `E2B_TREE_COPY_WINDOW_BYTES=67108864`，控制面/worker/face B 都设）：控制面
+  `client.stream("GET")` 逐块落 `<export>/_migrate/control-plane/<id>.tar.gz`，
+  导入用异步生成器分块 POST；worker 的导出/导入/快照捕获都走同一个有界 writer；
+  face B 解包前按 `tree_payload_bytes()` 记账，超限 `tree-too-large` → 413。
+* **两个具名错误**：`source-node-unreachable`（源节点不回答 = 树不可达且无法事后迁出）
+  与 `tree-missing-on-recorded-node`（记录指着节点、那里没有树；修复动作
+  `retire-stale-tree-record`，见设计文档 §8.3）。
+* **`maint` 的 memory 512Mi → 2Gi**（设计文档 §3.1 的第三条：不动限额就得把上限压到
+  ≤256 MiB，比任何默认沙箱配额都小）。
+* 清单侧：`workspace-root-init` 建节点本地树根并 `chown 65534` + 严格校验；共享卷上的
+  `$workspace-root-init` 不再创建 `<export>/workspaces`（树搬走之后留一个永远空的
+  "第二个树根"只会误导后来者）。
+
+**上线顺序**：`deploy/scripts/build-and-push.sh` →
+`KUBECONFIG=… deploy/k8s-k0s/apply.sh`（agent 先滚，它的 `workspace-root-init` 建树根并
+交属主；然后 worker / control-plane）。上线后 9 pod Running、`e2b-worker` 2/2。
+
+**验收（2026-10-02 17:45–18:05，正是本节版本；先手工建一个沙箱预热）**
+
+| 判据 | 读数 | 判定 |
+|---|---|---|
+| 跨节点迁移**保文件**（两节点健在） | `e2b-worker-0` → `e2b-worker-1`，`200`，**1047 ms**（201 文件 + 1 目录），迁后逐字读回 `kept.txt` / `small-199.txt` | ✅ |
+| 停掉源 worker 后的迁移**具名拒绝** | `scale --replicas=1`（去掉 `e2b-worker-1`，1.8 s / 2 s 的窗口内）→ migrate = **502** `source-node-unreachable: … (it did not acknowledge the runtime stop)`；记录仍在 `e2b-worker-1`，目标节点零字节。**本轮 2/2** | ✅ |
+| 同一拒绝的确定性变体（`--remove-node`） | 摘掉节点注册行后立刻迁移：`0.1.0-905` 给 **`502 Node e2b-worker-1 not found`**（泛化 502，不是那个名字）——见下面的"两个入口缺口" | ❌/已修 |
+| 复原 | `replicas=2`，两个 worker Running，`GET /sandboxes` = `[]` | ✅ |
+| 介质归属（两节点各看一次） | `<id>` 只在记录指的那台节点的 `/var/lib/e2b/workspaces/<id>`（`0770 10000:65534`，各自 `/dev/nvme0n1p2`、inode 不同）；共享 `<export>/workspaces` 两节点都空 | ✅ |
+| **元数据密集**（裁定要求） | 沙箱内 200 × 64 B：**0.196 / 0.223 ms/个**（两次样本）vs 共享 NAS 同方法 **12.9986 ms/个** ⇒ **58–66×**；worker 容器同方法 本地 0.0276 vs NAS 12.9986 ⇒ 471×（解释见设计文档 §8.1.1：沙箱的路径中介给两边各加 ~0.13 ms/个的常数） | ✅ |
+| 大块顺序写（诚实记录代价） | 沙箱内 900 MiB ×3：**146.9 MB/s**（min 145.4 / max 147.9）vs 共享 NAS 483–493 MB/s ⇒ 慢 ~3.3× | ✅（预期内） |
+| 磁盘可解释 | 树盘 worker-0 `26G/74G free`、worker-1 `33G/68G`；镜像缓存各 3.8G；节点 state 100K/16K；共享 `_snapshots` 16M、`_images` 3.7G、`workspaces` 512 B | ✅ |
+| 孤儿回收看得见本地树 | 泄漏的那棵树在沙箱 `kill` 后由 agent 巡检 → 控制面判孤儿 → **~90 s** 内收走（17:57:52 → 17:59:23 两个树根都空） | ✅ |
+| **迁移释放源节点的树** | **失败**：见下 | ❌ |
+
+**上线当天抓到的新状态：`stale-tree-on-former-source`（设计文档 §8.3.1）**
+
+一次**成功**的迁移在源节点留下了一整棵树（`sbx_85d7e990562423fc`，
+`e2b-worker-0` → `e2b-worker-1`）：
+
+```
+# worker-0 日志
+agent delete … failed: the tree … could not be removed (/var/lib/e2b/workspaces/<id>):
+  AgentFileOpsError: the control plane refused remove-workspace … (HTTP 403):
+  Sandbox … belongs to node e2b-worker-1, not e2b-worker-0
+  "DELETE /agent/sandboxes/<id>?keepVolumeSlices=true" 500
+# 控制面日志
+node e2b-worker-0 refused the teardown (HTTP 500): … its files are kept
+migrated sandbox … from e2b-worker-0 to e2b-worker-1     "POST …/migrate" 200 OK
+# 另一个 CP 副本的自愈（90 s 后）
+c3 self-heal: 1 tree(s) reported by node … are claimed by a record and are left alone: <id>
+```
+
+根因：释放走**源 worker 的 DELETE**，它必须先向控制面申请 `remove-workspace` file-op，
+而那条作用域按**记录**判节点 —— F1 为了让目标节点的 provision 通过同一条作用域，早已把
+记录切到目标 ⇒ **控制面拒绝了自己刚下的指令**；迁移不检查返回值，于是照样 200，留下的
+树被自愈判 `protected`（"claimed by a record"）。影响：每个成功迁移在旧节点留一整棵树
+（旧节点按 8 个沙箱卖）；**不是永久泄漏** —— 沙箱 `kill` 之后 ~90 s 由自愈收走。
+
+**修复已提交、尚未上线**：源节点的释放改走 CP→agent 通道（控制面派生路径、指令那台节点
+的 agent 删，与 materialize / `scope-slot-document` 同一条），worker 侧作用域一个字符不动；
+释放失败时记录里写具名状态、日志 ERROR，迁移本身仍成功。钉子
+`tests/unit/test_tree_local_migration.py::test_the_source_tree_is_released_through_that_nodes_agent`。
+**`0.1.0-905` 上仍是旧行为**，下一次控制面 rollout 才生效。
+
+**同一个修复还收掉了具名错误的第二个入口缺口**：把源节点的**注册行**摘掉
+（`DELETE /nodes/<id>`，两个副本各清一遍）之后立刻迁移，`0.1.0-905` 回答
+`502 {"code":502,"message":"Node e2b-worker-1 not found"}` —— 对本地树来说，"节点行没了"
+与"节点不回答"是同一件事（树在那台机器的盘上、够不着），所以修复里那条
+`nodes.get(...) is None` 分支也走 `source-node-unreachable`
+（钉子：`…::test_a_source_whose_node_row_is_gone_is_refused_by_the_same_name`）。
+
+**down 腿的方法学（本轮实测的坑）**：`--stop-source`（缩容）的窗口只有 ~1–2 s
+（Autoscaler 的 warm-pool 地板 `E2B_AS_MIN_REPLICAS=2`，~1 s 就重建 pod，autoscaler 日志
+`scaled up to warm-pool floor 1 -> 2`），所以探针把轮询收紧到 0.25 s、在 pod 消失的当刻
+发迁移；`SIGSTOP` 那条路**走不通**（PID namespace 里的进程不能停 namespace 的 init，
+`kill -STOP 1` 返回 0 而 `/proc/1/stat` 仍是 `S`）；`--remove-node` 又要连发几次
+（节点注册表是**每个控制面副本各一份内存**，实测 `statuses=[204,204,404,404,404,404]`）。
+
+**复跑命令**（全部只读或公开 API 建/杀沙箱；down 腿要控制者授权缩容）：
+
+```bash
+deploy/scripts/open-cluster-tunnel.sh && export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+export E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000
+export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets \
+    -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d | cut -d, -f1)          # 不要打印
+export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets \
+    -o jsonpath='{.data.E2B_INTERNAL_API_KEY}' | base64 -d)
+
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
+  deploy/scripts/acceptance/tree_local_migration_probe.py --directions up --files 200
+
+# down 腿：目标沙箱必须落在会被缩掉的那台上（StatefulSet 只去最高序号 = e2b-worker-1）。
+# --prepare-source 自己造一个（--files 200）并把树放到那台上，跑完杀掉它。
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
+  deploy/scripts/acceptance/tree_local_migration_probe.py --directions down --files 200 \
+  --prepare-source e2b-worker-1 --stop-source e2b-worker-1   # 探针自己缩容并复原到 2
+
+# 元数据密集（两行都要量）：worker 容器内 NAS vs 本地
+kubectl -n sandlock exec -i e2b-worker-0 -- python3 - \
+  --root nas:/var/lib/e2b-sandboxes/workspaces --root local:/var/lib/e2b/workspaces \
+  --small-n 200 --skip-seq < deploy/scripts/acceptance/local_first_storage_probe.py
+# 沙箱内那一条：把同一个脚本写进沙箱跑 --root sandbox:/workspace
+```
+
+> 注意：探针 `--directions down` 会**缩容一个 worker 副本**（这是唯一能测那条腿的办法），
+> `finally` 里复原到原副本数并等两个 pod Running 才算完；跑之前先确认舰队里没有别的活沙箱
+> 落在那一台上（本轮的 `GET /sandboxes` 是 `[]`）。
+
 ## 8. 改部署的入口
 
 ```bash

@@ -489,7 +489,7 @@ Task 0 把两个命名空间合成一处之后，这里独立复核"**合并无�
 | 任务 | 这份文档给的约束 |
 |---|---|
 | Task 2（快照 tar） | 路径只有一个根：`<export>/_snapshots/<id>/{snapshot.json, fs.tar, .complete}`（§4.1）；"只有记录"的 `015f`/`1ca5` 是 `status: failed`，不得替它们造载荷（§4.2）；tar 通道要带 §3.1 的 `E2B_TREE_COPY_MAX_BYTES`（快照 ≤ 树上限 1 GiB）；**还要处理 §4.3 的副本间记录不一致**（删除/新增记录不会跨副本失效）<br>**Task 2 落地时按 brief 的裁定收窄了两条，在此点名**：① 按字节上限（`E2B_TREE_COPY_MAX_BYTES`）**没有**随这一步做，它和"拷贝窗口"一起归 Task 3（§3.1 那张表本来就是"三件一起做"，而它的措辞是"单次拷贝的在途量"）；② §4.3 的记录不一致**只观测、不改**（裁定 5/7：`.complete` 与记录不归 Task 2 动）——本轮撞到并记录，见 §7.6 与 `docs/deploy-clusters.md` §7.30。③ 读侧**两种形状都收**：`fs.tar` 解包 + 既有 `fs/` 合并（写侧只出 tar），加固只有一份实现（`gateway_common/archive.py`，三个调用方 import 同一个函数对象），"这是哪一形状"也只有一份实现（`gateway_common.paths.snapshot_payload`，两个读 store 的验收探针也走它）；前后对照的复跑命令见 §7.6<br>**④ 解包的内存账要分两半说（评审轮 1 修正）**：**成员数据**是流式的（逐成员过 tarfile 的 64 KiB 缓冲，不再整包——§3.0 那次 OOM 的驱动项）；**成员索引**仍由 stdlib 保留（`TarFile.next()` 无条件 `members.append`，实测 ~430 B/成员：20 万成员 ⇒ 85.7 MB），所以"全是极小成员"的病态 tar 仍按成员数付费。**成员数上限与 Task 3 的字节上限一起做**，本轮只把它写进 `gateway_common/archive.py` 的模块说明与 §7.6<br>**⑤ 上线后的两笔账（实测，§3.2）**：捕获 ×3–4、占块减半；建箱慢 ~20%，根因是 `tarfile` 的 `data` filter 每条目一次 `realpath`（成本随目的地路径深度走），**Task 3 把树搬本地后消失** —— 这笔代价是明码标价的，不是"没测到" |
-| Task 3（树本地） | 节点预算 8 GiB 树 + 4 GiB 镜像缓存 ≈ 12 GiB / 68–75 GiB 空闲（§2.3）；**大块顺序写会从 ≈488 MB/s 掉到 124.9–125.5 MB/s**（§1.2），元数据快 475×（§1.1）——验收必须用"运行时 I/O"（小文件）而不是建箱延迟立论；**淘汰上限 = `E2B_TREE_COPY_MAX_BYTES` + 拷贝窗口**（§3.1），因为恢复路径 900 MiB 已经把 `maint` 顶到 512.0 MiB 并且**真的 OOM 过一次**（§3.0）。**已落地**（2026-10-02，待部署）：见 §8 —— 翻转、流式上限、两个具名错误、排水顺序、验收命令与自己那一份判断都在那里 |
+| Task 3（树本地） | 节点预算 8 GiB 树 + 4 GiB 镜像缓存 ≈ 12 GiB / 68–75 GiB 空闲（§2.3）；**大块顺序写会从 ≈488 MB/s 掉到 124.9–125.5 MB/s**（§1.2），元数据快 475×（§1.1）——验收必须用"运行时 I/O"（小文件）而不是建箱延迟立论；**淘汰上限 = `E2B_TREE_COPY_MAX_BYTES` + 拷贝窗口**（§3.1），因为恢复路径 900 MiB 已经把 `maint` 顶到 512.0 MiB 并且**真的 OOM 过一次**（§3.0）。**已上线**（`0.1.0-905-g7331364-20261002-174329`，2026-10-02 17:43）**并已验收**：见 §8 —— 翻转、流式上限、具名错误、排水顺序、验收读数、**沙箱视角的实测倍率（58–66×）**、以及上线当天抓到的 `stale-tree-on-former-source` 泄漏与其修复（§8.3.1） |
 | Task 4（state 分家） | 裁定 1/3：`command-logs.jsonl` 可以本地、`_runtime/<id>/sandbox.json` 留共享（§5.1）；容量上本节点 state 是小文件，不是容量项（§2.3） |
 
 ---
@@ -607,10 +607,14 @@ env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
 
 ---
 
-## 8. Task 3：树本地化的裁定与落地（2026-10-02，实现轮）
+## 8. Task 3：树本地化的裁定与落地（2026-10-02，**已上线 `0.1.0-905-g7331364-20261002-174329`**）
 
-这一节是 **Task 3 实现轮的产品**：代码、清单与文档里的裁定都在这里对齐。它**不是**
-上线记录 —— 集群由控制者在窗口里部署，验收（Step 5）在部署之后跑，命令见 §8.5。
+这一节是 **Task 3 的产品**：代码、清单与文档里的裁定都在这里对齐。它在
+**2026-10-02 17:43** 随 `0.1.0-905-g7331364-20261002-174329` 上线（9 pod Running，
+两节点树根 `drwxr-xr-x 65534`，控制面 `E2B_TREES_SHARED=0`、上限
+`1342177280`/`67108864`，`maint` 2Gi），**同日跑完 Step 5 的两方向验收**（读数与
+一条实测发现见 §8.5）。上线记录（含部署顺序与逐条命令）在
+`docs/deploy-clusters.md` §7.32。
 
 ### 8.1 介质翻转：两行吞吐必须并列读
 
@@ -640,6 +644,30 @@ create/write/close）赢很多，单次大顺序写在本地**更差**。§3.1 �
 
 **验收必须用元数据密集的负载立论**（裁定：Task 3 的验收不能只测大文件）。
 §8.5 的探针就按这个形状写：小文件写 + 大文件写两腿都跑、都报。
+
+#### 8.1.1 上线当天实测（`0.1.0-905`，2026-10-02 17:45–18:05）
+
+同一个探针（`deploy/scripts/acceptance/local_first_storage_probe.py`，
+200 × 64 B `open(create)+write+close`，删 200 个）跑在三个位置，同一天、同一集群：
+
+| 位置 | 小文件 | 900 MiB 顺序写（`fsync`/64 MiB，n=3） |
+|---|---|---|
+| **沙箱内 `/workspace`**（用户真正感受到的那条，两次独立样本） | **0.196 / 0.223 ms/个**（≈4.5–5.1k 个/s） | **146.9 MB/s**（p50，min 145.4 / max 147.9） |
+| worker 容器：`/var/lib/e2b/workspaces`（节点本地） | 0.0276 ms/个 | 124.9–125.5 MB/s（§1.2） |
+| worker 容器：`/var/lib/e2b-sandboxes/workspaces`（共享 NAS，**翻转前的沙箱形状**） | 12.9986 ms/个 | 483–493 MB/s（§1.2） |
+| 沙箱内 vs 共享 NAS（跨位置同一方法） | **约 58–66×** | 约 **0.30×**（慢 3.3×） |
+| worker 容器内 本地 vs NAS | **471×** | 约 0.26× |
+
+**为什么沙箱内是 66× 而不是计划里的 466×（466× 与 §1.1 的 475× 是同一件事）**：
+466–475× 是"**介质 vs 介质**"（worker 容器里同一份代码写节点盘 vs 写 NAS），而沙箱自己的
+写要走沙箱的**路径中介**（`sandlock` 的 mediator：每个 `open`/`mkdir`/`unlink` 都要解析、
+记账、可能还要下发 tighten），那一层的固定开销是**加在两边**的常数，比值于是被压缩。
+本轮量到了那个常数：同样删 200 个文件，沙箱内 `rmtree` **27.1 / 29.9 ms（0.14–0.15 ms/个）**，
+worker 容器本地 `rmtree` **2.4 ms（0.012 ms/个）** —— 0.13 ms/个的差就是沙箱侧每操作
+的固定代价量级。把它加到 NAS 那一侧（13.0 + 0.13 ≈ 13.1 ms），再除以沙箱内的 0.196–0.223，
+就是实测的 58–66×。**两个数都对，只是回答的问题不同**：
+466× 回答"这块盘比那块盘快多少"，**66× 回答"沙箱里的用户快了多少"** ——
+产品验收用后者，容量/介质账用前者。
 
 ### 8.2 在途上限与"淘汰策略"：一个具名上限 + 一个拷贝窗口
 
@@ -689,6 +717,73 @@ face B 只按 `tree_payload_bytes()` 记账。三处都在 64 KiB–4 MiB 的块
 所以暂存目录必须在树根旁边），成功了才 `rename(2)` 发布；失败时旧树原样不动、
 暂存目录删掉。半棵树在"源节点已经放手"之后是数据损坏的样子，不是中间状态。
 
+#### 8.3.1 上线当天抓到的第三个状态：`stale-tree-on-former-source`
+
+**实测（2026-10-02 18:00 前后，`0.1.0-905`）**：一次成功的跨节点迁移
+（`sbx_85d7e990562423fc`，`e2b-worker-0` → `e2b-worker-1`）**留下了源节点那棵树**。
+证据链（`kubectl logs`）：
+
+```
+# worker-0（源）
+agent delete sbx_85d7e990562423fc failed: the tree ... could not be removed
+  (/var/lib/e2b/workspaces/sbx_85d7e990562423fc):
+  AgentFileOpsError: the control plane refused remove-workspace for sandbox
+  sbx_85d7e990562423fc (HTTP 403): Sandbox ... belongs to node e2b-worker-1, not e2b-worker-0
+  "DELETE /agent/sandboxes/sbx_85d7e990562423fc?keepVolumeSlices=true" 500
+# 控制面
+node e2b-worker-0 refused the teardown (HTTP 500): ... its files are kept
+migrated sandbox sbx_85d7e990562423fc from e2b-worker-0 to e2b-worker-1
+"POST /sandboxes/sbx_85d7e990562423fc/migrate" 200 OK
+# 自愈（另一个 CP 副本），90 秒后
+c3 self-heal: 1 tree(s) reported by node izuf697v12g31dyz4uvsjlz are claimed by a
+  record and are left alone: sbx_85d7e990562423fc
+```
+
+**根因**：迁移的释放步骤走的是**源 worker 的 DELETE**，而那个 worker 必须先向控制面申请
+`remove-workspace` file-op；file-op 的作用域按**记录**判节点，而 F1（为了让目标节点的
+provision 通过同一条作用域）早已把记录切到了目标 ⇒ **控制面拒绝了自己刚下的指令**。
+迁移不检查那个返回值，于是照样 `200 migrated`；留下的树因为 id 还在记录里，被自愈
+判定 `protected`（"claimed by a record"），**永不回收**。这正是裁定 1 点名的那一类
+静默故障，只是入口不是判据而是**释放路径**。
+
+**影响边界**：这棵树是"每个成功迁移留一整棵在旧节点"的量级 —— 旧节点 68–75 GiB 的盘上
+按 `E2B_NODE_DISK_MB=8192`（8 个沙箱）卖，泄漏会直接挤占它。**不是永久泄漏**：沙箱被
+`kill` 之后记录消失，同一台节点的自愈在 **~1.5–2 分钟**内把它收走（本轮实测：
+17:57:52 kill → 17:59:23 两个树根都空了）。
+
+**具名状态与修复动作**：
+
+* 状态名 **`stale-tree-on-former-source`**（控制面日志为 ERROR，记录里追加
+  `source tree retained (stale-tree-on-former-source: <node>: <detail>)`）；
+* 修复动作 **`release-stale-source-tree`**：在**那台**源节点上删掉它
+  （`kubectl -n sandlock exec <worker> -- rm -rf /var/lib/e2b/workspaces/<id>`；
+  树是 `0770 <sandbox uid>:65534`，worker 的 gid 就是 65534，所以它删得动），
+  或者直接 `DELETE /sandboxes/<id>` 让自愈在两分钟内收走。
+* **不要**等自愈在沙箱还活着的时候动手：它按设计**不会**碰"有记录认领的树"
+  （那条保护是"永不误删活沙箱"的地基，不许为了这个泄漏放宽）。
+
+**代码修复（已提交、随下一次控制面 rollout 生效）**：源节点的释放不再绕 worker 的
+DELETE，改为控制面**自己派生路径**、直接指令**那台节点的 agent**（root，白名单含树根）
+删 —— `_release_source_after_migration`，与 materialize / `scope-slot-document` 同一条
+CP→agent 通道，因此不动 worker 侧那套作用域一个字符（钉子：
+`tests/unit/test_tree_local_migration.py::test_the_source_tree_is_released_through_that_nodes_agent`）。
+目标侧（记录指着的那台）的清理仍走 worker DELETE。释放失败时迁移**不再静默**：
+记录里写具名状态、日志 ERROR，迁移本身仍然成功（沙箱已经在目标节点上服务了）。
+**`0.1.0-905` 上仍然是旧行为 —— 这条修复要等下一次 rollout。**
+
+**同一次验收还量到了具名错误的第二个入口缺口**（同一个修复一并解决）：把源节点的
+**注册行**摘掉（`DELETE /nodes/<id>`，两个副本各清一遍）之后立刻迁移，`0.1.0-905`
+回答的是
+
+```
+502 {"code":502,"message":"Node e2b-worker-1 not found"}
+```
+
+—— 泛化 502，而不是 `source-node-unreachable`。对本地树来说这两个时刻说的是同一件事
+（树在那台机器的盘上、够不着），所以修复里那条 `nodes.get(...) is None` 分支也走同一个名字
+（钉子：`…::test_a_source_whose_node_row_is_gone_is_refused_by_the_same_name`）。
+**`0.1.0-905` 上是旧行为。**
+
 ### 8.4 排水顺序与持久面（操作纪律 + 产品语义）
 
 **沙箱不是持久对象；持久面是快照与卷。**
@@ -706,7 +801,21 @@ face B 只按 `tree_payload_bytes()` 记账。三处都在 64 KiB–4 MiB 的块
   与树和镜像缓存相加 68 GiB 已经越界；每天 8 个则 448 GiB 不可能）。这也是 Task 2
   "快照落共享"的容量理由。
 
-### 8.5 验收（部署之后由控制者窗口里跑；本节只写命令）
+### 8.5 验收（**2026-10-02 已跑**：`0.1.0-905-g7331364-20261002-174329`）
+
+**结论：两条腿都按合同通过，另有第三个状态在 happy path 上被抓到（§8.3.1）。**
+
+| 判据 | 读数 | 判定 |
+|---|---|---|
+| ① 两节点健在时的跨节点迁移**保文件** | `e2b-worker-0` → `e2b-worker-1`，`200`，**1047 ms**（201 个文件 + 1 个目录），迁后 `kept.txt` / `small-199.txt` 逐字读回；`GET /sandboxes` 无残留 | ✅ |
+| ② 源节点 worker 停掉后的迁移**具名拒绝** | `kubectl scale statefulset/e2b-worker --replicas=1` 去掉 `e2b-worker-1`（**1.8 s / 2 s** 的窗口内）→ `POST /sandboxes/<id>/migrate` = **502**，body `source-node-unreachable: node e2b-worker-1 is not answering, so the sandbox tree it holds cannot be reached or moved (it did not acknowledge the runtime stop)`；记录仍在 `e2b-worker-1`，目标节点一个字节没收到。**本轮 2/2**（方法学的坑见本节末） | ✅ |
+| ③ 缩放复原 | `replicas` 回到 `2`，`e2b-worker-0/1` 都 Running（9 pod 全 Running），`GET /sandboxes` = `[]` | ✅ |
+| ④ 介质归属（两节点各看一次） | `<id>` 只在记录指的那台节点的 `/var/lib/e2b/workspaces/<id>`（`0770 10000:65534`）；共享的 `/var/lib/e2b-sandboxes/workspaces` **两节点都是空**；两份 `stat` 的 inode 不同（各自 `/dev/nvme0n1p2`） | ✅ |
+| ⑤ 磁盘可解释 | 树盘：worker-0 `26G used / 74G free`，worker-1 `33G / 68G`；镜像缓存各 3.8G；节点本地 state 100K/16K；共享 `_snapshots` 16M、`_images` 3.7G、`workspaces` 512 B（空目录） | ✅ |
+| ⑥ 元数据密集负载（裁定要求） | 沙箱内 200 × 64 B：**0.196 / 0.223 ms/个**（两次样本）vs 共享 NAS 同方法 **12.9986 ms/个** ⇒ **58–66×**；沙箱内 900 MiB 顺序写 **146.9 MB/s**（详见 §8.1.1） | ✅ |
+| ⑦ 孤儿回收仍看得见本地树 | 迁移泄漏的那棵树在沙箱 `kill` 后由 agent 巡检 → 控制面判孤儿 → **~90 s 内**被收走（17:57:52 → 17:59:23 两个树根都空） | ✅ |
+| ⑧ 迁移后源节点的树被释放 | **失败**：泄漏一整棵（§8.3.1）；修复已提交，随下一次控制面 rollout 生效 | ❌/已修 |
+| ⑨ 具名错误的第二个入口（节点行没了） | `--remove-node` 后立刻迁移：`0.1.0-905` 给 **`502 Node e2b-worker-1 not found`**（泛化）；修复后同一时刻走同一个名字（钉子 `…test_a_source_whose_node_row_is_gone_is_refused_by_the_same_name`） | ❌/已修 |
 
 ```bash
 cd /Users/polus/project/ai/sandlock-e2b
@@ -715,16 +824,27 @@ export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 export E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000
 export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets \
     -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d | cut -d, -f1)   # 不要打印
+export E2B_INTERNAL_API_KEY=$(kubectl -n sandlock get secret e2b-secrets \
+    -o jsonpath='{.data.E2B_INTERNAL_API_KEY}' | base64 -d)         # 舰队的 node→sandbox 归属
 
 # ① 两方向迁移冒烟（节点健在时迁走保文件；停掉源节点 worker 后必须具名拒绝）
 env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
-  deploy/scripts/acceptance/tree_local_migration_probe.py --directions both
+  deploy/scripts/acceptance/tree_local_migration_probe.py --directions up --files 200
+# down 腿要一个树落在"会被停掉的那台"上的沙箱（StatefulSet 缩放只去掉最高序号
+# e2b-worker-1）。--prepare-source 自己造一个并把树放到那台上，跑完杀掉：
+#   ... tree_local_migration_probe.py --directions down \
+#       --files 200 --prepare-source e2b-worker-1 --stop-source e2b-worker-1
+#   （探针自己缩容并在 finally 里复原到 2；也可先 --directions down --sandbox-id <id>
+#     复用已有的沙箱，此时必须自己确认它在 e2b-worker-1 上）
 
 # ② 元数据密集 vs 大块顺序写（本地化之后两行都要量，见 §8.1）
 kubectl -n sandlock exec -i e2b-worker-0 -- python3 - \
-  --root local:/var/lib/e2b/workspaces --root nas:/var/lib/e2b-sandboxes \
-  --seq-mb 64,1024 --repeat 10 --small-n 200 \
+  --root local:/var/lib/e2b/workspaces \
+  --root nas:/var/lib/e2b-sandboxes/workspaces \
+  --skip-seq --small-n 200 \
   < deploy/scripts/acceptance/local_first_storage_probe.py
+# 沙箱内那一条（用户真正感受到的）：把同一个脚本写进沙箱再跑
+#   python3 /home/user/lf_probe.py --root sandbox:/workspace --small-n 200 --skip-seq
 
 # ③ 舰队无残留：GET /sandboxes 应为 []（或只有你建的），两节点磁盘可解释
 env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python - <<'PY'
@@ -737,6 +857,26 @@ PY
 
 **刚滚完就跑建箱会超时**（worker 在重新预热镜像）：先手工建一个沙箱预热，再跑上面
 三条。
+
+**down 腿的方法学（本轮实测的坑，别再踩）**
+
+* `--stop-source`（缩容）的窗口只有 **~1–2 s**：Autoscaler 的 warm-pool 地板是
+  `E2B_AS_MIN_REPLICAS=2`，StatefulSet 控制器 ~1 s 内就把 pod 建回来（事件实测
+  `SuccessfulDelete … 2m19s` / `SuccessfulCreate … 2m18s`，Autoscaler 日志
+  `scaled up to warm-pool floor 1 -> 2`）。所以探针把轮询收紧到 **0.25 s**，并在
+  **pod 消失的当刻**发迁移（目标节点在开窗之前先算好）。本轮 **2/2** 都在窗口内拿到
+  具名拒绝（1.8 s / 2 s）；也出现过一次窗口关掉后的 200 —— 探针那时会点名"窗口已经关了、
+  请用 `--remove-node`"，不当绿报。
+* **`SIGSTOP` 那条路走不通**（别再试）：PID namespace 里的进程**不能**停 namespace 的
+  init；`kubectl exec … sh -c 'kill -STOP 1'` 返回 0，但 `/proc/1/stat` 仍是 `S`、
+  应用照答（2026-10-02 实测）。
+* `--remove-node` 是同一拒绝的**确定性**变体，但它顺带暴露了另一件事：**节点注册表是
+  每个控制面副本各一份内存**（Redis 只带一部分状态），`DELETE /nodes/<id>` 与 worker 的
+  心跳各自落在随机一个副本上 ⇒ 要清干净得连发几次（探针做 6 次，实测
+  `statuses=[204,204,404,404,404,404]`）。它测的是"节点行没了"，**不等于**"pod 停了"。
+* 所以 Step 5 ② 的正式判据是：**`--stop-source` 在窗口内拿到 `source-node-unreachable`**
+  （本轮 2/2）+ `--remove-node` 作为确定性复现（修好之后也应当是同一个名字；`0.1.0-905`
+  上它是 `Node … not found`，见 §8.3.1）。
 
 ### 8.6 Task 3 的自我判断：翻转对真实负载是不是净亏？
 
@@ -757,3 +897,11 @@ PY
 最后一句留给控制者：如果 Task 6 上线前的验收（§8.5 ① 两条腿）显示真实负载里大文件
 占比高到把 475× 的元数据收益抵掉，那么回退就是翻回 `E2B_TREES_SHARED=1` 一个字符 ——
 代码路径、清单、验收探针都不需要改。
+
+**上线当天（`0.1.0-905`）的实测支持这个判断，并把数字钉在"沙箱自己的视角"上**
+（§8.1.1）：沙箱内 200 × 64 B 是 **0.196 / 0.223 ms/个**，共享 NAS 同方法是
+**13.0 ms/个** ⇒ **58–66×**（不是容器视角的 466–475×）；沙箱内 900 MiB 顺序写
+**146.9 MB/s**，共享 NAS 是 483–493 MB/s ⇒ **慢约 3.3×**。**两个方向都没有被推翻**：
+元数据收益在沙箱里仍是几十倍量级，大块代价仍是三倍量级 —— 只是"多少倍"要按
+用户真正看到的那条路径说。所以 §8.6 的结论保持"不构成净亏"，回退条件也不变：
+真实负载要是以大文件顺序写为主，翻回 `E2B_TREES_SHARED=1` 仍是那一个字符。
