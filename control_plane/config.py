@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from gateway_common.env import registry_host
+from gateway_common.archive import DEFAULT_TREE_COPY_MAX_BYTES
 from gateway_common.env import (
     _env_bool,
     _env_float,
@@ -569,6 +570,28 @@ class Settings:
     #: keeps today's behaviour: the trees are shared exactly when a shared
     #: workspace root is named.
     trees_shared: bool | None = field(default_factory=_trees_shared_from_env)
+    #: Task 3: the byte cap for one tree copy through the control plane (the
+    #: migration archive it streams from a source node into a target one). A
+    #: tree is copied *through* this process, so the cap is what keeps "one
+    #: 1 GiB tree = one 2 GiB control plane" from being possible; crossing it
+    #: is the named refusal ``tree-copy-too-large`` (413), never a truncated
+    #: copy. ``0`` disables it. The default (1.25 GiB) is one sandbox's own
+    #: quota (``E2B_DEFAULT_DISK_MB`` = 1 GiB) plus the archive's own overhead:
+    #: a cap at exactly the quota would refuse the copy of a sandbox that is
+    #: merely full, which is the one case the cap must not catch
+    #: (``docs/create-local-first-design.md`` §3.1).
+    tree_copy_max_bytes: int = field(
+        default_factory=lambda: _env_int(
+            "E2B_TREE_COPY_MAX_BYTES", DEFAULT_TREE_COPY_MAX_BYTES
+        )
+    )
+    #: ...and how many bytes are streamed before that stretch of page cache is
+    #: dropped (``POSIX_FADV_DONTNEED``). ``0`` disables the windowed drop.
+    tree_copy_window_bytes: int = field(
+        default_factory=lambda: _env_int(
+            "E2B_TREE_COPY_WINDOW_BYTES", 64 * 1024 * 1024
+        )
+    )
     #: Node-local platform state (``E2B_NODE_STATE_BASE``) -- the create marker,
     #: the disk-stat seed, ``.route-b`` and the uid pool's local files. Named on
     #: the control plane because :meth:`ControlPaths.roots` is the list the

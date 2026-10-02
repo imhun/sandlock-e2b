@@ -53,6 +53,7 @@ path.
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import tarfile
 from pathlib import PurePosixPath
@@ -228,3 +229,234 @@ def extract_sandbox_archive(archive_path: Path, dest: Path) -> int:
     except OSError as exc:
         raise ArchiveRefusal(PARTIAL_UNPACK, f"{archive_path}: {exc}") from exc
     return written
+
+
+# ---------------------------------------------------------------------------
+# Task 3: moving a whole tree, bounded
+# ---------------------------------------------------------------------------
+#
+# Two operations, one shape: a **tree copies**, either out of a node or into
+# one, and the copy's size is the caller's business. The measurements behind
+# the numbers are in ``docs/create-local-first-design.md`` §3.0/§3.1:
+#
+# * the copy used to be unbounded in memory (``resp.content`` on the control
+#   plane, ``tar_path.read_bytes()`` on the wire, ``await request.body()`` in
+#   the receiving agent), and one 900 MiB restore already put the agent's
+#   ``maint`` container at 512.0 MiB / 512 MiB with zero headroom and OOMKilled
+#   it once (10/10 runs at the limit);
+# * the page cache is *the* memory item: a copy through this code drops each
+#   finished window with ``posix_fadvise(POSIX_FADV_DONTNEED)``, the same trick
+#   the sequential-write probe uses when it ``fsync``es every 64 MiB.
+#
+# The configured value is the **single-copy** bound, not a tree inventory
+# bound: the node's standing tree budget is already ``E2B_NODE_DISK_MB``, and
+# the design doc explicitly rules out inventing a smaller tree cap (there is
+# nothing in the capacity account that says 8 GiB of trees per node does not
+# fit). What does not fit, and what this refuses by name, is one copy that is
+# larger than one sandbox's own disk quota.
+
+#: The named refusal. Callers map it to their own surface (the control plane
+#: and the worker answer 413, ``materialize`` answers its own
+#: ``tree-too-large``), and the *name* is what an operator greps for.
+TREE_COPY_TOO_LARGE = "tree-copy-too-large"
+
+#: 1.25 GiB: the cap has to admit **a full sandbox**, and a full sandbox's
+#: archive is bigger than the tree it carries -- one sandbox's default quota is
+#: ``E2B_DEFAULT_DISK_MB`` = 1 GiB, and the archive adds tar headers plus
+#: gzip framing (and a tree of already-compressed data does not shrink). A cap
+#: of exactly the quota would refuse the copy of a sandbox that is merely
+#: *full*, which is the one case the cap must not catch (design §3.1).
+DEFAULT_TREE_COPY_MAX_BYTES = 1280 * 1024 * 1024
+
+#: How many bytes are copied before the page cache for that stretch is
+#: dropped. 64 MiB is the probe's own ``fsync`` window; it bounds the peak at
+#: "one window + in-flight dirty pages" instead of "the whole copy × 2.9".
+DEFAULT_TREE_COPY_WINDOW_BYTES = 64 * 1024 * 1024
+
+
+class TreeCopyTooLargeError(Exception):
+    """A tree copy crossed its byte-denominated cap; the name is the contract."""
+
+    reason = TREE_COPY_TOO_LARGE
+
+    def __init__(self, limit_bytes: int, written_bytes: int, path: str = "") -> None:
+        self.limit_bytes = limit_bytes
+        self.written_bytes = written_bytes
+        super().__init__(
+            f"{TREE_COPY_TOO_LARGE}: {path or 'the copy'} reached "
+            f"{written_bytes} bytes, over the {limit_bytes}-byte limit "
+            "(E2B_TREE_COPY_MAX_BYTES; 0 disables it)"
+        )
+
+
+def drop_page_cache(fd: int, length: int, *, offset: int = 0) -> None:
+    """Best-effort ``posix_fadvise(POSIX_FADV_DONTNEED)`` over one window.
+
+    Best-effort on purpose: not every filesystem/kernel combination supports
+    it (and ``os.posix_fadvise`` is missing on some platforms), and failing to
+    drop the cache is a memory-pressure problem, never a correctness one.
+    """
+    if length <= 0:
+        return
+    advice = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if advice is None or dontneed is None:  # pragma: no cover - platform gap
+        return
+    try:
+        advice(fd, offset, length, dontneed)
+    except OSError:  # pragma: no cover - some filesystems refuse the hint
+        pass
+
+
+class BoundedTreeWriter:
+    """A write-only file object for one tree copy: capped, and window-dropped.
+
+    Usable wherever a file object is (``tarfile.open(fileobj=…)``, a gzip
+    stream, or the loop that forwards HTTP chunks), so the copy never has to be
+    held whole to be measured. ``max_bytes=0`` disables the cap.
+    """
+
+    def __init__(
+        self,
+        fd: int,
+        *,
+        max_bytes: int = DEFAULT_TREE_COPY_MAX_BYTES,
+        window_bytes: int = DEFAULT_TREE_COPY_WINDOW_BYTES,
+        path: str = "",
+    ) -> None:
+        self._fd = fd
+        self.max_bytes = int(max_bytes)
+        self.window_bytes = max(0, int(window_bytes))
+        self.path = path
+        self.written = 0
+        self._window_start = 0
+
+    def write(self, data) -> int:
+        size = len(data)
+        if self.max_bytes and self.written + size > self.max_bytes:
+            raise TreeCopyTooLargeError(
+                self.max_bytes, self.written + size, self.path
+            )
+        view = memoryview(data)
+        while view:
+            n = os.write(self._fd, view)
+            view = view[n:]
+        self.written += size
+        if self.window_bytes and self.written - self._window_start >= (
+            self.window_bytes
+        ):
+            drop_page_cache(
+                self._fd, self.written - self._window_start,
+                offset=self._window_start,
+            )
+            self._window_start = self.written
+        return size
+
+    def flush(self) -> None:
+        """``GzipFile``/``TarFile`` may flush; the last window is dropped here."""
+        drop_page_cache(
+            self._fd, self.written - self._window_start, offset=self._window_start
+        )
+        self._window_start = self.written
+
+    def tell(self) -> int:
+        """The bytes written so far.
+
+        ``tarfile`` asks its file object for the offset when it was handed a
+        bare file object (rather than a path) and when it closes a ``"w"``
+        stream, so a write-only wrapper without ``tell`` cannot take a tar.
+        Every caller here writes from offset 0, which is what makes the byte
+        count the offset.
+        """
+        return self.written
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+
+def tree_payload_bytes(path: Path) -> int:
+    """The size of one snapshot payload, in either shape.
+
+    The tar shape is one ``stat``; the pre-tar ``fs/`` directory is a walk --
+    it is the shape whose *copy* also walks, so measuring it the same way costs
+    nothing the copy does not already pay.
+    """
+    source = Path(path)
+    if source.is_file():
+        return source.stat().st_size
+    if source.is_dir():
+        total = 0
+        for root, _dirs, files in os.walk(source):
+            for name in files:
+                try:
+                    total += os.lstat(os.path.join(root, name)).st_size
+                except OSError:  # pragma: no cover - raced away under us
+                    continue
+        return total
+    return 0
+
+
+def stage_tree_from_archive(
+    archive_path: Path,
+    tree_root: Path,
+    *,
+    max_bytes: int = DEFAULT_TREE_COPY_MAX_BYTES,
+    window_bytes: int = DEFAULT_TREE_COPY_WINDOW_BYTES,
+) -> tuple[Path, int]:
+    """Unpack ``archive_path`` beside ``tree_root`` and return the staging dir.
+
+    Beside, not in ``_migrate``: the staging has to be on the **same
+    filesystem** as the tree, because the publish step is a ``rename(2)`` --
+    and after the reslice the tree is on the node's own disk while the staging
+    area is the shared NAS (``EXDEV``). The name carries a leading dot, so no
+    workspace scan can read a half-extracted tree as a sandbox.
+    """
+    root = Path(tree_root)
+    root.parent.mkdir(parents=True, exist_ok=True)
+    staging = root.parent / f".{root.name}.importing-{os.urandom(6).hex()}"
+    staging.mkdir()
+    size = tree_payload_bytes(Path(archive_path))
+    if max_bytes and size > max_bytes:
+        staging.rmdir()
+        raise TreeCopyTooLargeError(max_bytes, size, str(archive_path))
+    try:
+        extract_sandbox_archive(Path(archive_path), staging)
+    except BaseException:
+        _rmtree_quietly(staging)
+        raise
+    return staging, size
+
+
+def _rmtree_quietly(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def publish_staged_tree(
+    staging: Path,
+    tree_root: Path,
+    *,
+    remove_existing=None,
+) -> None:
+    """Publish a staged tree at ``tree_root`` in one step.
+
+    ``remove_existing`` is the caller's own (audited) removal of the tree that
+    is already there -- the agent passes the one that goes through the control
+    plane's file-op channel -- and it runs only once the staged tree is
+    complete. A failure in either half leaves the old tree as it was and the
+    staging directory removed: there is no state in which ``tree_root`` holds
+    half of one tree.
+    """
+    root = Path(tree_root)
+    try:
+        if remove_existing is not None and (root.exists() or root.is_symlink()):
+            remove_existing()
+        os.replace(staging, root)
+    except BaseException:
+        _rmtree_quietly(Path(staging))
+        raise

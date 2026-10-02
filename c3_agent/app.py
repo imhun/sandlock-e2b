@@ -112,6 +112,7 @@ from c3_agent.materialize import (
     MaterializeRefusal,
     materialize_tree,
     PARTIAL_COPY,
+    TREE_TOO_LARGE,
 )
 from c3_agent.scan import InventoryScanner, scanner_for
 from gateway_common.paths import validate_node_id, validate_sandbox_id
@@ -751,8 +752,13 @@ def _materialize_status(reason: str) -> int:
 
     A half-applied copy is a *failed privileged step* (502: the caller must not
     read it as success), while a path outside the roots or a destination that
-    is a symlink is a plan this agent will not act on at all (400).
+    is a symlink is a plan this agent will not act on at all (400). A payload
+    over the byte cap (Task 3) is neither: the plan is fine and nothing was
+    applied, and the size is the whole refusal -- 413, the same status the
+    worker's snapshot capture and import answer.
     """
     if reason == PARTIAL_COPY:
         return 502
+    if reason == TREE_TOO_LARGE:
+        return 413
     return 400

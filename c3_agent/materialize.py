@@ -44,6 +44,7 @@ from c3_agent.fileops import (
 from gateway_common.archive import (
     ArchiveRefusal,
     extract_sandbox_archive,
+    tree_payload_bytes,
 )
 from gateway_common.archive import (
     DESTINATION_IS_A_SYMLINK as ARCHIVE_DESTINATION_IS_A_SYMLINK,
@@ -60,6 +61,12 @@ DESTINATION_IS_A_SYMLINK = "destination-is-a-symlink"
 PARTIAL_COPY = "partial-copy"
 ALREADY_EXISTS_AS_A_FILE = "already-exists-as-a-file"
 BAD_PLAN = "bad-plan"
+#: Task 3: the payload is over ``E2B_TREE_COPY_MAX_BYTES``. It has its own
+#: name because the caller's next move differs from a broken payload's:
+#: nothing is wrong with the archive, the *node* must not unpack a tree this
+#: big (the ``maint`` container is 512 MiB and the 900 MiB restore already
+#: OOMed it -- ``docs/create-local-first-design.md`` §3.0).
+TREE_TOO_LARGE = "tree-too-large"
 
 #: One archive refusal has a name of its own on this side too: a clean member
 #: name that lands outside the tree means the **destination** holds a link, and
@@ -216,7 +223,13 @@ def _materialize_tree(
             os.close(fd)
     if copy_from is not None:
         source = resolve_inside(str(copy_from), roots=roots)
-        _take_snapshot_payload(source, root, mode=mode, directories=directories)
+        _take_snapshot_payload(
+            source,
+            root,
+            mode=mode,
+            directories=directories,
+            max_bytes=int(getattr(settings, "tree_copy_max_bytes", 0) or 0),
+        )
     # ``existed`` is the gate, not "did we copy something": a tree this op
     # just created gets its mode from the two ``fchmod``s above and from the
     # merge as it makes each directory, so there is nothing left over to fix
@@ -284,6 +297,7 @@ def _take_snapshot_payload(
     *,
     mode: int,
     directories: _VerifiedDirectories,
+    max_bytes: int = 0,
 ) -> None:
     """Land one snapshot payload at the tree root, in either shape.
 
@@ -308,6 +322,14 @@ def _take_snapshot_payload(
         legacy = source.parent / SNAPSHOT_PAYLOAD_DIR_NAME
         if legacy.is_dir():
             directory = legacy
+    if max_bytes:
+        measured = tree_payload_bytes(directory)
+        if measured > max_bytes:
+            raise MaterializeRefusal(
+                TREE_TOO_LARGE,
+                f"{source} is {measured} bytes, over the {max_bytes}-byte "
+                "limit (E2B_TREE_COPY_MAX_BYTES; 0 disables it)",
+            )
     if directory.is_dir():
         copy_tree(
             str(directory), str(root), dir_mode=mode, directories=directories

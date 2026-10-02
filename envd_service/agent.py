@@ -64,7 +64,14 @@ from envd_service.xfs_quota import (
 )
 from envd_service.volumes import build_volume_mounts, cleanup_volume_projects
 from gateway_common import create_trace
-from gateway_common.archive import ArchiveRefusal, extract_sandbox_archive
+from gateway_common.archive import (
+    ArchiveRefusal,
+    BoundedTreeWriter,
+    TreeCopyTooLargeError,
+    extract_sandbox_archive,
+    publish_staged_tree,
+    stage_tree_from_archive,
+)
 from gateway_common.paths import (
     CHECKPOINT_ROOT_NAME,
     SNAPSHOT_PAYLOAD_DIR_NAME,
@@ -4289,7 +4296,15 @@ async def agent_update_sandbox_network(
 
 @router.get("/agent/sandboxes/{sandbox_id}/export")
 async def agent_export_sandbox(sandbox_id: str, request: Request) -> Response:
-    """Stream a tar.gz of the sandbox workspace for filesystem migration."""
+    """Stream a tar.gz of the sandbox workspace for filesystem migration.
+
+    Task 3: the tree only exists on this node, so this endpoint is the *only*
+    way it can be moved, and the tar is written through the shared byte cap
+    (:class:`gateway_common.archive.BoundedTreeWriter`) with its page-cache
+    window dropped every 64 MiB -- an unbounded tar of a 1 GiB tree is what the
+    ``maint`` OOM in ``docs/create-local-first-design.md`` §3.0 looks like from
+    this side.
+    """
     settings = request.app.state.settings
     try:
         _require_internal_key(request, settings)
@@ -4305,10 +4320,27 @@ async def agent_export_sandbox(sandbox_id: str, request: Request) -> Response:
     )
     migrate_dir.mkdir(parents=True, exist_ok=True)
     tar_path = migrate_dir / f"{sandbox_id}.tar.gz"
+    max_bytes = settings.tree_copy_max_bytes
+    window_bytes = settings.tree_copy_window_bytes
     try:
-        with tarfile.open(tar_path, "w:gz") as tar:
-            tar.add(workspace, arcname=".", recursive=True)
+        fd = os.open(tar_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            writer = BoundedTreeWriter(
+                fd,
+                max_bytes=max_bytes,
+                window_bytes=window_bytes,
+                path=str(tar_path),
+            )
+            with tarfile.open(fileobj=writer, mode="w:gz") as tar:
+                tar.add(workspace, arcname=".", recursive=True)
+            writer.flush()
+        finally:
+            os.close(fd)
+    except TreeCopyTooLargeError as e:
+        tar_path.unlink(missing_ok=True)
+        return Response(status_code=413, content=str(e))
     except OSError:
+        tar_path.unlink(missing_ok=True)
         return Response(status_code=500)
 
     def _stream():
@@ -4324,19 +4356,89 @@ async def agent_export_sandbox(sandbox_id: str, request: Request) -> Response:
 
 @router.post("/agent/sandboxes/{sandbox_id}/import", status_code=204)
 async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
-    """Restore a sandbox workspace from a raw tar.gz body."""
+    """Restore a sandbox workspace from a raw tar.gz body.
+
+    Task 3: the body is **streamed to the staging file under the byte cap**
+    (never ``await request.body()``), and the tree is published by ``rename(2)``
+    from a sibling staging directory -- so a copy that fails halfway leaves the
+    tree that was already there and no half-tree, which is the state a migration
+    from a released source node must never be able to produce.
+    """
+    import tarfile as _tarfile
+
     settings = request.app.state.settings
     try:
         _require_internal_key(request, settings)
     except PermissionError:
         return Response(status_code=401)
-    body = await request.body()
-    if not body:
-        return Response(status_code=400, content="Upload body is empty")
+    max_bytes = settings.tree_copy_max_bytes
+    window_bytes = settings.tree_copy_window_bytes
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and max_bytes and int(declared) > max_bytes:
+        return Response(
+            status_code=413,
+            content=(
+                f"tree-copy-too-large: the upload declares {declared} bytes, "
+                f"over the {max_bytes}-byte limit (E2B_TREE_COPY_MAX_BYTES)"
+            ),
+        )
     workspace = settings.workspace_base / sandbox_id
-    if workspace.exists():
+    # N57: same root as the export side -- this is the directory the control
+    # plane staged the archive into from the source node.
+    migrate_dir = migrate_staging_dir(
+        settings.workspace_base, shared_root=settings.shared_volume_root
+    )
+    migrate_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = migrate_dir / f"{sandbox_id}.tar.gz"
+    received = 0
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    writer = BoundedTreeWriter(
+        fd, max_bytes=max_bytes, window_bytes=window_bytes, path=str(tmp_path)
+    )
+    try:
+        async for chunk in request.stream():
+            if chunk:
+                writer.write(chunk)
+        writer.flush()
+        received = writer.written
+    except TreeCopyTooLargeError as e:
+        tmp_path.unlink(missing_ok=True)
+        return Response(status_code=413, content=str(e))
+    except OSError as e:  # pragma: no cover - local disk failure
+        logger.warning("import %s: staging write failed: %s", sandbox_id, e)
+        tmp_path.unlink(missing_ok=True)
+        return Response(status_code=500, content="staging write failed")
+    finally:
+        os.close(fd)
+    if not received:
+        tmp_path.unlink(missing_ok=True)
+        return Response(status_code=400, content="Upload body is empty")
+    logger.info("import %s: received %d bytes", sandbox_id, received)
+    try:
+        staging, _size = await asyncio.to_thread(
+            stage_tree_from_archive,
+            tmp_path,
+            workspace,
+            max_bytes=max_bytes,
+            window_bytes=window_bytes,
+        )
+    except TreeCopyTooLargeError as e:
+        tmp_path.unlink(missing_ok=True)
+        return Response(status_code=413, content=str(e))
+    except (ArchiveRefusal, OSError, ValueError) as e:
+        logger.warning("import %s failed: %s", sandbox_id, e, exc_info=True)
+        tmp_path.unlink(missing_ok=True)
+        return Response(status_code=400, content="Invalid tar archive")
+    except _tarfile.TarError as e:
+        logger.warning("import %s failed: %s", sandbox_id, e, exc_info=True)
+        tmp_path.unlink(missing_ok=True)
+        return Response(status_code=400, content="Invalid tar archive")
+
+    def _remove_existing_tree() -> None:
         # Retry-friendly: a previous failed migration may have left partial
-        # files; the incoming archive is the full source of truth.
+        # files; the incoming archive is the full source of truth. Runs only
+        # *after* the staged tree is complete, so a failed import never destroys
+        # the tree that is already there.
         from envd_service import priv_helpers
 
         client = _agent_fileops()
@@ -4345,15 +4447,7 @@ async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
             # "no path in the request" rule). Idempotent for the same reason the
             # teardown is: an import is retried, and "there was nothing there"
             # is exactly what this branch is for.
-            #
-            # ⚠ Off the event loop (third review, I-2): this is a synchronous
-            # control-plane round trip whose read budget is the *file-op* one
-            # (minutes, because a whole tree is being removed). Inline it parked
-            # every heartbeat and every sandbox API on this worker -- the same
-            # class as ``/metrics``, and the reason the create/delete handlers
-            # already run their work in a thread.
-            await asyncio.to_thread(
-                _remove_agent_half,
+            _remove_agent_half(
                 client,
                 sandbox_id,
                 path=workspace,
@@ -4361,28 +4455,24 @@ async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
                 what="tree",
             )
         else:
-            await asyncio.to_thread(priv_helpers.remove_tree, workspace)
-    workspace.mkdir(parents=True, exist_ok=True)
-    # N57: same root as the export side -- this is the directory the control
-    # plane staged the archive into from the source node.
-    migrate_dir = migrate_staging_dir(
-        settings.workspace_base, shared_root=settings.shared_volume_root
+            priv_helpers.remove_tree(workspace)
+
+    # ⚠ Off the event loop (third review, I-2): the publish is a synchronous
+    # control-plane round trip whose read budget is the *file-op* one (minutes,
+    # because a whole tree is being removed). Inline it parked every heartbeat
+    # and every sandbox API on this worker -- the same class as ``/metrics``,
+    # and the reason the create/delete handlers already run their work in a
+    # thread.
+    await asyncio.to_thread(
+        publish_staged_tree,
+        staging,
+        workspace,
+        remove_existing=_remove_existing_tree,
     )
-    migrate_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = migrate_dir / f"{sandbox_id}.tar.gz"
     try:
-        tmp_path.write_bytes(body)
-        logger.info(
-            "import %s: received %d bytes",
-            sandbox_id,
-            len(body),
-        )
-        extract_sandbox_archive(tmp_path, workspace)
-    except (ArchiveRefusal, OSError, tarfile.TarError) as e:
-        logger.warning("import %s failed: %s", sandbox_id, e, exc_info=True)
-        return Response(status_code=400, content="Invalid tar archive")
-    finally:
         tmp_path.unlink(missing_ok=True)
+    except OSError:  # pragma: no cover - already gone above
+        pass
     if not settings.per_sandbox_uid:
         # FUP #6: archive extraction with the ``data`` filter drops uid/gid
         # metadata, so the imported workspace is root-owned again — re-align
@@ -4448,7 +4538,13 @@ async def agent_health(request: Request) -> dict[str, Any]:
     return payload
 
 
-def _write_snapshot_tar(src: Path, dst: Path) -> None:
+def _write_snapshot_tar(
+    src: Path,
+    dst: Path,
+    *,
+    max_bytes: int = 1024 * 1024 * 1024,
+    window_bytes: int = 64 * 1024 * 1024,
+) -> None:
     """Write one tar of a sandbox tree root, aside -> fsync -> rename.
 
     The same discipline the ``_oci.tar`` payloads and every record file in this
@@ -4461,12 +4557,28 @@ def _write_snapshot_tar(src: Path, dst: Path) -> None:
     not a wrapper directory: the tar *is* the tree root, exactly as the
     exploded ``fs/`` directory was, which is what lets the reader unpack it
     straight into the sandbox's tree.
+
+    Task 3: written through the same bounded, window-dropping writer the
+    migration copy uses -- the capture side is where the page-cache account
+    (``docs/create-local-first-design.md`` §3.0: 900 MiB of tree ⇒ 2.6 GiB of
+    ``file`` cache on the worker) is paid, and where a tree larger than the cap
+    has to be refused by name instead of half-written.
     """
+    from gateway_common.archive import BoundedTreeWriter
+
     tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
     try:
-        with tarfile.open(tmp, "w") as tar:
-            for entry in sorted(src.iterdir(), key=lambda item: item.name):
-                tar.add(entry, arcname=entry.name, recursive=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            writer = BoundedTreeWriter(
+                fd, max_bytes=max_bytes, window_bytes=window_bytes, path=str(dst)
+            )
+            with tarfile.open(fileobj=writer, mode="w") as tar:
+                for entry in sorted(src.iterdir(), key=lambda item: item.name):
+                    tar.add(entry, arcname=entry.name, recursive=True)
+            writer.flush()
+        finally:
+            os.close(fd)
         fd = os.open(tmp, os.O_RDONLY)
         try:
             os.fsync(fd)
@@ -4549,7 +4661,13 @@ async def agent_create_snapshot(request: Request) -> Response:
             # us (the old ``copytree`` did it as a side effect of the
             # destination being the payload path).
             await asyncio.to_thread(snapshot_dir.mkdir, parents=True, exist_ok=True)
-            await asyncio.to_thread(_write_snapshot_tar, src, dst)
+            await asyncio.to_thread(
+                _write_snapshot_tar,
+                src,
+                dst,
+                max_bytes=settings.tree_copy_max_bytes,
+                window_bytes=settings.tree_copy_window_bytes,
+            )
             # Written last, and that is the whole point: until this line lands,
             # the payload is not a snapshot (see the 409 above).
             await asyncio.to_thread(marker.write_text, "complete\n", encoding="utf-8")
@@ -4566,6 +4684,11 @@ async def agent_create_snapshot(request: Request) -> Response:
                 True,
             )
             raise
+    except TreeCopyTooLargeError as e:
+        # Task 3: a tree over the cap is refused by name (413), not captured
+        # until the worker runs out of memory. The store directory is removed
+        # by the ``except BaseException`` arm above before this runs.
+        return Response(status_code=413, content=str(e))
     except PermissionError as e:
         logger.exception("agent create snapshot failed (permission)")
         return Response(status_code=500, content=str(e)[:500])

@@ -146,8 +146,31 @@ spec:
                   name: e2b-secrets
                   key: E2B_INTERNAL_API_KEYS
                   optional: true
+            # N57 / Task 3: the sandbox **trees** live on the node's own disk
+            # (`/var/lib/e2b/workspaces`, the hostPath below), not on the
+            # shared NAS. The premise is measured, not assumed, and it is two
+            # lines that must be read together
+            # (`docs/create-local-first-design.md` §1.1/§1.2):
+            #
+            #   * metadata -- 200 x 64 B files: **0.027 ms/file local vs
+            #     13.136 ms/file on the NAS (475x)**. A developer workload
+            #     (`npm install`: tens of thousands of create/write/close) is
+            #     the product this buys;
+            #   * large sequential bytes -- **124.9-125.5 MB/s local vs
+            #     483-493 MB/s NAS (local is ~3.9x slower)**. The flip is a
+            #     *trade*, not a win on every axis, and Task 1 retracted the old
+            #     "local 1027 MB/s" reading (it was a burst phase).
+            #
+            # The platform's own namespaces (`_snapshots`, `_migrate`,
+            # `_volumes`, `_images`) deliberately stay on the shared root
+            # (`E2B_SHARED_VOLUME_ROOT` below): their readers are other nodes
+            # and the other control-plane replica, and the capacity account
+            # (§2.3) says the snapshot store cannot live on a node's disk at
+            # all. The judge for every migration path is `E2B_TREES_SHARED`,
+            # which the **control plane** names (it is the only reader); it is
+            # `0` in `control-plane.yaml`.
             - name: E2B_WORKSPACE_BASE
-              value: /var/lib/e2b-sandboxes/workspaces
+              value: /var/lib/e2b/workspaces
             # N27: the platform's own files (the runtime records, the command
             # logs, the checkpoint images) live under a base of their own, a
             # **sibling** of the sunk tree root and on the same mount. (Its
@@ -231,6 +254,19 @@ spec:
               value: "4294967296"
             - name: E2B_IMAGE_CACHE_EVICT_MIN_AGE_S
               value: "300"
+            # Task 3: one tree copy's byte cap, shared by every component that
+            # moves a tree (this worker's migration export/import and snapshot
+            # payloads, the control plane's pass-through copy, face B's
+            # materialization). `0` = unlimited; the default is one sandbox's
+            # disk quota (1 GiB), because a cap below a legitimate sandbox's
+            # own size would refuse the restore the product sells
+            # (`docs/create-local-first-design.md` §3.1). Over it the answer is
+            # the named refusal `tree-copy-too-large` (413), never a truncated
+            # tree.
+            - name: E2B_TREE_COPY_MAX_BYTES
+              value: "1342177280"
+            - name: E2B_TREE_COPY_WINDOW_BYTES
+              value: "67108864"
             # The cache is written by two uids (the control-plane pod runs as
             # root, this pod as 65534), so the resolver hands every directory
             # and file it creates to the worker uid: the worker writes as the
@@ -668,6 +704,16 @@ spec:
           volumeMounts:
             - name: shared
               mountPath: /var/lib/e2b-sandboxes
+            # N57 / Task 3: the sandbox tree root, on the node's own disk. The
+            # `shared` claim below still carries `_snapshots` / `_migrate` /
+            # `_volumes` / `_images` -- everything whose reader is another node.
+            # `workspace-root-init` in `deploy/k8s/c3-agent.yaml` creates this
+            # directory and hands it to uid 65534 (this worker creates
+            # `<root>/<id>` as that uid); `DirectoryOrCreate` is the fallback
+            # for a node whose agent has not started yet, which would be
+            # root-owned and fail the first create with EACCES.
+            - name: workspace-root
+              mountPath: /var/lib/e2b/workspaces
             - name: image-cache
               mountPath: /var/lib/e2b-images
             # N57 (Task 4): the node-local state base, the one root here the
@@ -685,6 +731,19 @@ spec:
         - name: shared
           persistentVolumeClaim:
             claimName: sandbox-shared
+        # The sandbox tree root (N57 / Task 3): node-local, and *not* the shared
+        # claim. ~75 GiB free on this disk, shared with the 4 GiB image cache
+        # and the node-local state; the standing budget for the trees
+        # themselves is `E2B_NODE_DISK_MB` (8192 MiB = 8 sandboxes x 1 GiB),
+        # which is 16% of the free space (`docs/create-local-first-design.md`
+        # §2.3). hostPath rather than emptyDir: a pod restart must not lose the
+        # trees -- and with the trees node-local, "the node's disk" *is* the
+        # durability boundary (the sandbox is not a durable object; snapshots
+        # and volumes are).
+        - name: workspace-root
+          hostPath:
+            path: /var/lib/e2b/workspaces
+            type: DirectoryOrCreate
         # Node-local, and deliberately NOT the shared PVC: this is the extracted
         # image rootfs cache, and unpacking one onto the shared volume costs 240x
         # what it costs here (61.4s vs 0.26s for the same rootfs; N18). It is a

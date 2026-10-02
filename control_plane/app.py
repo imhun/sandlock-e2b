@@ -531,7 +531,17 @@ def create_app(
             )
         )
     app.state.workspace_base = workspace_base or settings.workspace_base
-    app.state.workspace_base.mkdir(parents=True, exist_ok=True)
+    # Task 3: only the process that *owns* a tree root may create it. In the
+    # shared shape (``trees_shared``) that path is on the shared volume and this
+    # mkdir keeps the pre-reslice behaviour; on the combined node
+    # (``enable_local_node``) this process is the tree's node; but a separated
+    # control plane whose trees are node-local has no mount at that path at
+    # all, and inventing one -- ``mkdir(parents=True)`` in its own container
+    # layer -- would hand it a fake tree root that no agent can ever see. The
+    # value stays named (paths it derives for the agents are resolved on those
+    # nodes); the directory is theirs to make.
+    if settings.trees_shared or settings.enable_local_node:
+        app.state.workspace_base.mkdir(parents=True, exist_ok=True)
     # N27: the base the platform's *own* files live under -- the sandboxes'
     # runtime records, their command logs, the checkpoint images. Same rule as
     # the worker's (``envd_service.app``): the *registry's* answer wins, because

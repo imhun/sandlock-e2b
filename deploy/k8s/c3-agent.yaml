@@ -317,25 +317,22 @@ spec:
               for dir in _builds _images _secrets _templates _snapshots _volumes; do
                 mkdir -p "$shared/$dir"
               done
-              # N27: the sandbox trees sink one level (`<export>/workspaces/<id>`)
-              # and the platform's own state becomes their *sibling*
-              # (`<export>/state`), on this same mount -- that is what makes the
-              # migration a metadata-only `rename` and what puts the platform's
-              # files off the path a sandbox reaches by walking `..`. Two
-              # readers depend on both existing before the worker starts:
-              #   * `<state>`: the worker writes
-              #     `<state>/_runtime/<id>/sandbox.json` (and the checkpoint
-              #     store beside it) with the base it was handed -- a missing
-              #     base turns the first `Sandbox.create()` into ENOENT instead
-              #     of a record. Nothing derives it from the tree root, on
-              #     purpose: a base the code made up out of band would land
-              #     with the wrong owner on NFS.
-              #   * `workspaces`: it is the worker's own tree root.
+              # N27: the platform's own state is a *sibling* of the tree root
+              # (`<export>/state`), on this same mount. One reader depends on it
+              # existing before the worker starts: the worker writes
+              # `<state>/_runtime/<id>/sandbox.json` (and the checkpoint store
+              # beside it) with the base it was handed -- a missing base turns
+              # the first `Sandbox.create()` into ENOENT instead of a record.
+              # Nothing derives it from the tree root, on purpose: a base the
+              # code made up out of band would land with the wrong owner on NFS.
               # (N58: `_migrate` and `_snapshots` are *not* created here -- they
-              # are the platform's namespaces on the export root, below.)
-              for dir in "$base" "$state"; do
-                mkdir -p "$dir"
-              done
+              # are the platform's namespaces on the export root, below.
+              # Task 3: neither is `<export>/workspaces` -- the sandbox trees
+              # moved off the shared mount entirely, to the node-local
+              # `$base` below, and leaving an empty `<export>/workspaces` behind
+              # would be a second, permanently empty tree root for anyone who
+              # went looking with the old path.)
+              mkdir -p "$state"
               # N57 / Task 4: the **node-local** half of that state. The worker
               # opens `<node_state>/.uid_pool.lock` and writes the create's
               # `.creating` marker and `disk-stats` seed under
@@ -370,6 +367,26 @@ spec:
               if [ "$node_state_owner" != "65534" ]; then
                 echo "workspace-root-init: FATAL: $node_state is owned by uid $node_state_owner, not the worker uid 65534: the worker opens .uid_pool.lock there and writes every create's marker and accounting seed under it, so every Sandbox.create() would fail with EACCES" >&2
                 echo "workspace-root-init: fix it once on the node: chown 65534:65534 $node_state" >&2
+                exit 1
+              fi
+              # Task 3: the **node-local tree root**, the other root this init
+              # owns that is not on the shared volume. Same reasoning as
+              # `$node_state` above, one step stronger: the worker creates and
+              # removes `<base>/<id>` as uid 65534 (and the sandbox's own uid
+              # afterwards), and `DirectoryOrCreate` would leave it root:0755.
+              # A tree root owned by the wrong uid is not a slow failure: the
+              # first `Sandbox.create()` cannot make its tree at all.
+              mkdir -p "$base"
+              chown 65534:65534 "$base" 2>/dev/null ||
+                echo "workspace-root-init: chown refused ($base)"
+              chmod 0755 "$base" 2>/dev/null ||
+                echo "workspace-root-init: chmod refused ($base)"
+              base_owner="$(stat -c %u "$base")"
+              base_mode="$(stat -c %a "$base")"
+              echo "workspace-root-init: $base owner=$base_owner mode=$base_mode"
+              if [ "$base_owner" != "65534" ]; then
+                echo "workspace-root-init: FATAL: $base is owned by uid $base_owner, not the worker uid 65534: the worker makes every sandbox tree there, so every Sandbox.create() would fail with EACCES" >&2
+                echo "workspace-root-init: fix it once on the node: chown 65534:65534 $base" >&2
                 exit 1
               fi
               # N58: the migration staging goes on the **export root**, not inside
@@ -450,18 +467,19 @@ spec:
                   exit 1
                 fi
               done
-              # The two roots -- and the migration staging on the export root,
-              # which the control plane stages a tar in and the target node's
-              # agent reads back (`envd_service/agent.py`'s export/import
-              # endpoints) -- get
-              # today's judgement, unchanged in shape: the worker creates
-              # top-level names in each of them directly (a sandbox tree under
-              # `workspaces`, the uid pool's lock and the runtime records under
-              # `state`), so each has to be writable by it -- owner 65534, or
-              # 1777 as the compose convention -- and a target that is neither
-              # stops the pod here with the one-time fix instead of failing
-              # every create.
-              for target in "$base" "$state" "$shared/_migrate"; do
+              # The **shared** roots the worker creates top-level names in --
+              # the uid pool's lock and the runtime records under `$state`, and
+              # the migration staging on the export root, which the control
+              # plane stages a tar in and the target node's agent reads back
+              # (`envd_service/agent.py`'s export/import endpoints) -- get
+              # today's judgement, unchanged in shape: each has to be writable
+              # by uid 65534 -- owner 65534, or 1777 as the compose convention
+              # -- and a target that is neither stops the pod here with the
+              # one-time fix instead of failing every create. The node-local
+              # tree root is deliberately **not** in this loop: it is a local
+              # disk, where the 1777 fallback would only hide a broken node, so
+              # it is verified strictly above (Task 3).
+              for target in "$state" "$shared/_migrate"; do
                 owner="$(stat -c %u "$target")"
                 mode="$(stat -c %a "$target")"
                 echo "workspace-root-init: $target owner=$owner mode=$mode"
@@ -484,7 +502,7 @@ spec:
             - name: SHARED_ROOT
               value: /var/lib/e2b-sandboxes
             - name: WORKSPACE_BASE
-              value: /var/lib/e2b-sandboxes/workspaces
+              value: /var/lib/e2b/workspaces
             - name: STATE_BASE
               value: /var/lib/e2b-sandboxes/state
             # N57 (Task 4): the node-local state base this init creates and
@@ -496,6 +514,8 @@ spec:
           volumeMounts:
             - name: shared
               mountPath: /var/lib/e2b-sandboxes
+            - name: workspace-root
+              mountPath: /var/lib/e2b/workspaces
             - name: node-state
               mountPath: /var/lib/e2b/state
       containers:
@@ -603,8 +623,12 @@ spec:
             # 两个小件（`.creating` / `disk-stats`）都在它下面 —— 面 B 要
             # `chown` 那些 slot 文档，所以这一根必须在这里挂上、也必须在
             # C 侧白名单里（`priv_common.c` 的 `priv_node_state_base`）。
+            # Task 3 之后**沙箱树根也是节点本地的那一根**：白名单按解析后的
+            # 路径比较，所以 worker 与面 B 必须指到节点上的同一个目录，并且
+            # 真的挂上（`scope-slot-document`、巡检、以及迁移的导出/导入都要
+            # 走到 `<workspaces>/<id>`）。
             - name: E2B_WORKSPACE_BASE
-              value: /var/lib/e2b-sandboxes/workspaces
+              value: /var/lib/e2b/workspaces
             - name: E2B_STATE_BASE
               value: /var/lib/e2b-sandboxes/state
             - name: E2B_NODE_STATE_BASE
@@ -613,6 +637,16 @@ spec:
               value: /var/lib/e2b-sandboxes
             - name: E2B_IMAGE_CACHE_DIR
               value: /var/lib/e2b-images
+            # Task 3: the byte cap one tree copy must respect. Face B is where
+            # a snapshot payload is unpacked into a tree
+            # (`c3_agent/materialize.py`), and the 900 MiB restore already put
+            # this container at 512.0 MiB / 512 MiB and OOMed it once
+            # (`docs/create-local-first-design.md` §3.0) -- so the cap is
+            # enforced *here*, by name (`tree-too-large`), before the unpack.
+            - name: E2B_TREE_COPY_MAX_BYTES
+              value: "1342177280"
+            - name: E2B_TREE_COPY_WINDOW_BYTES
+              value: "67108864"
             # The uid pool is an input of `priv_common.c` (`--uid` is refused
             # outside `START..+SIZE`), and it must equal the worker it serves:
             # the k8s worker follows the code default, 10000/1000.
@@ -687,6 +721,11 @@ spec:
             # 属主/删除必须落在 worker 看得见的那些树上。
             - name: shared
               mountPath: /var/lib/e2b-sandboxes
+            # Task 3: 节点本地的沙箱树根（第六个白名单根）。与 worker 同一个
+            # hostPath —— 白名单按解析后的路径比较，两侧必须指到节点上的同一个
+            # 目录；巡检看的就是这一个根。
+            - name: workspace-root
+              mountPath: /var/lib/e2b/workspaces
             # 节点本地的解包缓存（第四个白名单根），与 worker/broker 同一个 hostPath。
             - name: image-cache
               mountPath: /var/lib/e2b-images
@@ -702,11 +741,30 @@ spec:
               memory: 64Mi
             limits:
               cpu: "1"
-              memory: 512Mi
+              # Task 3: 512 MiB -> 2 GiB. The 900 MiB restore measured in
+              # `docs/create-local-first-design.md` §3.0 peaked at 454.1 MiB of
+              # `file` cache and 512.0 MiB of `memory.current` (10/10 runs at
+              # the limit) and OOMKilled this container once. The design's cap
+              # table (§3.1) is explicit about the trade: keep 512 MiB and the
+              # tree cap would have to be <= 256 MiB, which is *below every
+              # default sandbox quota* -- i.e. it would refuse the restores the
+              # product sells. The byte cap (1 GiB) is enforced in
+              # `c3_agent/materialize.py`; this limit is what makes unpacking
+              # one of those legitimate trees possible.
+              memory: 2Gi
       volumes:
         - name: shared
           persistentVolumeClaim:
             claimName: sandbox-shared
+        # Task 3: the node-local sandbox tree root, shared with the worker (the
+        # whitelist compares resolved paths, so the two containers must point at
+        # the same node directory). `workspace-root-init` creates it and hands
+        # it to uid 65534; `DirectoryOrCreate` is only the fallback for a node
+        # whose agent has not started yet.
+        - name: workspace-root
+          hostPath:
+            path: /var/lib/e2b/workspaces
+            type: DirectoryOrCreate
         - name: image-cache
           hostPath:
             path: /var/lib/e2b-images

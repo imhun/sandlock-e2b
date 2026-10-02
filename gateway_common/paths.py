@@ -256,6 +256,15 @@ SNAPSHOT_PAYLOAD_DIR_NAME = "fs"
 #: the target node cannot see another node's tree root.
 MIGRATE_STAGING_DIR_NAME = "_migrate"
 
+#: The control plane's own pass-through copy inside ``_migrate``. It is a
+#: **subdirectory** on purpose: the node-side landing is
+#: ``_migrate/<id>.tar.gz`` -- the source agent writes it and streams it back,
+#: the target agent writes the body it receives to the same name and unpacks it
+#: -- so a control plane that staged under the bare name would truncate the very
+#: file the source agent is still streaming (the copy became a stream-to-disk
+#: write in Task 3; before that it happened to be sequential and invisible).
+MIGRATE_TRANSFER_DIR_NAME = "control-plane"
+
 #: The sandbox's command output log (JSONL), written by the worker.
 COMMAND_LOG_NAME = "command-logs.jsonl"
 
@@ -411,6 +420,25 @@ def migrate_staging_dir(
     return (
         platform_namespace_root(workspace_base, shared_root=shared_root)
         / MIGRATE_STAGING_DIR_NAME
+    )
+
+
+def migrate_transfer_path(
+    workspace_base: str | Path,
+    sandbox_id: str,
+    *,
+    shared_root: str | Path | None = None,
+) -> Path:
+    """``<platform namespace root>/_migrate/control-plane/<id>.tar.gz``.
+
+    The control plane's copy of one migration's archive: it is what the export
+    streams into and what the import streams out of, and it is deliberately not
+    the node-side landing path (see :data:`MIGRATE_TRANSFER_DIR_NAME`).
+    """
+    return (
+        migrate_staging_dir(workspace_base, shared_root=shared_root)
+        / MIGRATE_TRANSFER_DIR_NAME
+        / f"{sandbox_id}.tar.gz"
     )
 
 

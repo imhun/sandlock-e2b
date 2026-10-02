@@ -14,6 +14,7 @@ import os
 from dataclasses import dataclass, field
 
 from gateway_common.env import _env_bool, _env_float, _env_int
+from gateway_common.archive import DEFAULT_TREE_COPY_MAX_BYTES
 
 
 @dataclass
@@ -140,6 +141,20 @@ class Settings:
     )
     image_cache_dir: str = field(
         default_factory=lambda: os.getenv("E2B_IMAGE_CACHE_DIR", "")
+    )
+    #: Task 3: the byte cap for one tree copy (the snapshot payload this face
+    #: unpacks into a tree). 0 = unlimited; the default is one sandbox's disk
+    #: quota plus the archive overhead, and over it the materialization refuses
+    #: by name rather than unpacking a tree the (formerly 512 MiB) ``maint``
+    #: container cannot hold
+    #: (``docs/create-local-first-design.md`` §3.0/§3.1).
+    tree_copy_max_bytes: int = field(
+        default_factory=lambda: _env_int(
+            "E2B_TREE_COPY_MAX_BYTES", DEFAULT_TREE_COPY_MAX_BYTES
+        )
+    )
+    tree_copy_window_bytes: int = field(
+        default_factory=lambda: _env_int("E2B_TREE_COPY_WINDOW_BYTES", 64 * 1024 * 1024)
     )
     uid_pool_start: int = field(
         default_factory=lambda: _env_int("E2B_UID_POOL_START", 10000)

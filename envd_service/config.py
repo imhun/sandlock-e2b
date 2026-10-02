@@ -18,6 +18,7 @@ from gateway_common.env import (
     _env_list,
 )
 from gateway_common.paths import PURE_ROOTFS_DIR_NAME
+from gateway_common.archive import DEFAULT_TREE_COPY_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -588,6 +589,21 @@ class Settings:
     )
     image_cache_dir: Path = field(
         default_factory=_image_cache_dir
+    )
+    #: Task 3: the byte cap for one tree copy (migration export/import, and the
+    #: snapshot payload this worker writes). 0 = unlimited. The default is one
+    #: sandbox's disk quota (1 GiB) plus the archive's own overhead -- a cap at
+    #: exactly the quota would refuse the copy of a full sandbox
+    #: (``docs/create-local-first-design.md`` §3.1).
+    tree_copy_max_bytes: int = field(
+        default_factory=lambda: _env_int(
+            "E2B_TREE_COPY_MAX_BYTES", DEFAULT_TREE_COPY_MAX_BYTES
+        )
+    )
+    #: ...and how many bytes are copied before that stretch of page cache is
+    #: dropped (``POSIX_FADV_DONTNEED``). 0 disables the windowed drop.
+    tree_copy_window_bytes: int = field(
+        default_factory=lambda: _env_int("E2B_TREE_COPY_WINDOW_BYTES", 64 * 1024 * 1024)
     )
 
     @property

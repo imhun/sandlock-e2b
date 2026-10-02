@@ -15,7 +15,11 @@ from typing import Any, NamedTuple
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 
-from control_plane.api.errors import OfficialError
+from control_plane.api.errors import (
+    TREE_MISSING_ON_RECORDED_NODE,
+    OfficialError,
+    source_node_unreachable,
+)
 from control_plane import file_ops
 from control_plane.c3_agent_client import AgentClientError
 # The compose lane's identity anchor for the agent to confirm (D21/D25). One
@@ -63,7 +67,17 @@ from gateway_common.upload import (
     read_json_body,
 )
 from gateway_common import GATEWAY_ROUTE_INVALIDATE_CHANNEL
-from gateway_common.archive import ArchiveRefusal, extract_sandbox_archive
+from gateway_common.archive import (
+    DEFAULT_TREE_COPY_MAX_BYTES,
+    TREE_COPY_TOO_LARGE,
+    ArchiveRefusal,
+    BoundedTreeWriter,
+    TreeCopyTooLargeError,
+    drop_page_cache,
+    extract_sandbox_archive,
+    publish_staged_tree,
+    stage_tree_from_archive,
+)
 from gateway_common.timeutil import to_iso_z
 from gateway_common.paths import (
     is_reserved_platform_namespace,
@@ -2558,75 +2572,226 @@ def _platform_namespace_shared_root(settings) -> str | None:
 
 
 async def _export_sandbox_archive(request, record, node) -> Path:
-    """Return a local tar.gz path containing the sandbox workspace."""
+    """Stream the sandbox tree out of its node and return the staged tar path.
+
+    Streaming, not "download then save" (Task 3): the tree is read out of the
+    node that really holds it -- after the reslice that is the *only* copy --
+    and the caller's process must never hold it whole. The cap is
+    node-addressable by name (``E2B_TREE_COPY_MAX_BYTES``, default 1 GiB = one
+    sandbox's disk quota; ``0`` disables it) and crossing it is
+    ``tree-copy-too-large``, not a truncated copy.
+    """
     # N57: the staging directory is read by the **target** node's agent
     # (``_import_sandbox_archive``), so it hangs off the platform namespace
     # root and not off the tree root -- once the trees are node-local, the
     # target cannot see another node's tree root at all.
-    migrate_dir = gateway_paths.migrate_staging_dir(
+    settings = request.app.state.settings
+    tar_path = gateway_paths.migrate_transfer_path(
         request.app.state.workspace_base,
-        shared_root=_platform_namespace_shared_root(request.app.state.settings),
+        record.sandbox_id,
+        shared_root=_platform_namespace_shared_root(settings),
     )
-    migrate_dir.mkdir(parents=True, exist_ok=True)
-    tar_path = migrate_dir / f"{record.sandbox_id}.tar.gz"
+    tar_path.parent.mkdir(parents=True, exist_ok=True)
+    max_bytes = getattr(settings, "tree_copy_max_bytes", None)
+    if max_bytes is None:
+        max_bytes = DEFAULT_TREE_COPY_MAX_BYTES
+    window_bytes = getattr(
+        settings, "tree_copy_window_bytes", None
+    ) or 64 * 1024 * 1024
     if node.address == "local://":
         workspace = request.app.state.workspace_base / record.sandbox_id
         if not workspace.is_dir():
             raise OfficialError(
                 404, f"Sandbox workspace not found on node {node.node_id}"
             )
-        with tarfile.open(tar_path, "w:gz") as tar:
-            tar.add(workspace, arcname=".", recursive=True)
+        fd = os.open(tar_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "wb", closefd=False) as raw:
+                writer = BoundedTreeWriter(
+                    raw.fileno(),
+                    max_bytes=max_bytes,
+                    window_bytes=window_bytes,
+                    path=str(tar_path),
+                )
+                with tarfile.open(fileobj=writer, mode="w:gz") as tar:
+                    tar.add(workspace, arcname=".", recursive=True)
+                writer.flush()
+        except TreeCopyTooLargeError as e:
+            _discard_transfer_copy(tar_path)
+            raise OfficialError(413, str(e)) from e
+        except BaseException:
+            _discard_transfer_copy(tar_path)
+            raise
+        finally:
+            os.close(fd)
         return tar_path
     import httpx
 
+    fd = os.open(tar_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    writer = BoundedTreeWriter(
+        fd, max_bytes=max_bytes, window_bytes=window_bytes, path=str(tar_path)
+    )
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.get(
+        async with httpx.AsyncClient(
+            timeout=_tree_copy_timeout_s(settings)
+        ) as client:
+            async with client.stream(
+                "GET",
                 f"{node.address}/agent/sandboxes/{record.sandbox_id}/export",
                 headers={
                     "X-Internal-Key": request.app.state.settings.internal_api_key
                 },
-            )
+            ) as resp:
+                if resp.status_code == 404:
+                    raise OfficialError(
+                        502,
+                        f"{TREE_MISSING_ON_RECORDED_NODE}: node {node.node_id} "
+                        f"has no tree for sandbox {record.sandbox_id}",
+                    )
+                if resp.status_code != 200:
+                    body = (await resp.aread())[:300]
+                    raise OfficialError(
+                        502,
+                        f"Node {node.node_id} failed to export: "
+                        f"{body.decode('utf-8', 'replace')}",
+                    )
+                async for chunk in resp.aiter_bytes(1024 * 1024):
+                    writer.write(chunk)
+        writer.flush()
+    except TreeCopyTooLargeError as e:
+        _discard_transfer_copy(tar_path)
+        raise OfficialError(413, str(e)) from e
     except httpx.HTTPError as e:
-        raise OfficialError(502, f"Node {node.node_id} unavailable: {e}") from e
-    if resp.status_code != 200:
-        raise OfficialError(
-            502, f"Node {node.node_id} failed to export: {resp.text}"
-        )
-    tar_path.write_bytes(resp.content)
+        _discard_transfer_copy(tar_path)
+        raise source_node_unreachable(node.node_id, e) from e
+    except BaseException:
+        _discard_transfer_copy(tar_path)
+        raise
+    finally:
+        os.close(fd)
     return tar_path
 
 
+def _discard_transfer_copy(tar_path: Path) -> None:
+    """Drop one staged control-plane copy, and the (empty) directory with it.
+
+    A failed migration must leave the shared staging area exactly as it found
+    it: the file is the transfer, and the ``control-plane/`` directory is only
+    ever created for one of these copies, so an empty one is this task's own
+    residue and nothing else.
+    """
+    tar_path.unlink(missing_ok=True)
+    try:
+        tar_path.parent.rmdir()
+    except OSError:
+        pass
+
+
 async def _import_sandbox_archive(request, record, node, tar_path) -> None:
-    """Restore the sandbox workspace on the target node from a tar.gz."""
+    """Stream the staged tar into the target node; it publishes all or nothing."""
+    settings = request.app.state.settings
+    max_bytes = getattr(settings, "tree_copy_max_bytes", None)
+    if max_bytes is None:
+        max_bytes = DEFAULT_TREE_COPY_MAX_BYTES
+    window_bytes = getattr(
+        settings, "tree_copy_window_bytes", None
+    ) or 64 * 1024 * 1024
+    try:
+        size = tar_path.stat().st_size
+    except OSError:  # pragma: no cover - the staging file is ours
+        raise
+    if max_bytes and size > max_bytes:
+        raise OfficialError(
+            413,
+            f"{TREE_COPY_TOO_LARGE}: {tar_path} is {size} bytes, over the "
+            f"{max_bytes}-byte limit (E2B_TREE_COPY_MAX_BYTES)",
+        )
     if node.address == "local://":
         workspace = request.app.state.workspace_base / record.sandbox_id
-        if workspace.exists():
-            shutil.rmtree(workspace, ignore_errors=True)
-        workspace.mkdir(parents=True, exist_ok=True)
         try:
-            extract_sandbox_archive(tar_path, workspace)
+            staging, _size = stage_tree_from_archive(
+                tar_path,
+                workspace,
+                max_bytes=max_bytes,
+                window_bytes=window_bytes,
+            )
+            publish_staged_tree(
+                staging,
+                workspace,
+                remove_existing=lambda: shutil.rmtree(workspace, ignore_errors=True),
+            )
+        except TreeCopyTooLargeError as e:
+            raise OfficialError(413, str(e)) from e
         except (ArchiveRefusal, tarfile.TarError, OSError, ValueError) as e:
             raise OfficialError(400, f"Invalid sandbox archive: {e}") from e
         return
     import httpx
 
+    chunk_bytes = 4 * 1024 * 1024
+
+    async def _chunks():
+        """Yield the staged archive in windows, dropping each window's cache.
+
+        The reads run off the event loop: the staging file is on the shared
+        volume, so a synchronous read here would park the control plane's loop
+        for the whole transfer -- the exact class of stall the copy is being
+        moved out of memory to avoid.
+        """
+        handle = await asyncio.to_thread(open, tar_path, "rb")
+        pending = 0
+        try:
+            while True:
+                chunk = await asyncio.to_thread(handle.read, chunk_bytes)
+                if not chunk:
+                    break
+                yield chunk
+                pending += len(chunk)
+                if window_bytes and pending >= window_bytes:
+                    await asyncio.to_thread(
+                        drop_page_cache, handle.fileno(), pending, offset=0
+                    )
+                    pending = 0
+        finally:
+            await asyncio.to_thread(handle.close)
+
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(
+            timeout=_tree_copy_timeout_s(settings)
+        ) as client:
             resp = await client.post(
                 f"{node.address}/agent/sandboxes/{record.sandbox_id}/import",
-                content=tar_path.read_bytes(),
+                content=_chunks(),
                 headers={
-                    "X-Internal-Key": request.app.state.settings.internal_api_key
+                    "X-Internal-Key": request.app.state.settings.internal_api_key,
+                    "Content-Type": "application/gzip",
                 },
             )
     except httpx.HTTPError as e:
         raise OfficialError(502, f"Node {node.node_id} unavailable: {e}") from e
+    if resp.status_code == 413:
+        raise OfficialError(
+            413, (resp.text or "").strip() or TREE_COPY_TOO_LARGE
+        )
     if resp.status_code != 204:
         raise OfficialError(
             502, f"Node {node.node_id} failed to import: {resp.text}"
         )
+
+
+#: How long one tree copy may take, in seconds. The old 120 s was sized for
+#: "about 4600 files at 13 ms each" on the shared NAS; the copy now runs on the
+#: node's own disk (fast) but the target's *extraction* is inside the same
+#: request, and a 1 GiB tree of many small files can legitimately take minutes.
+_TREE_COPY_TIMEOUT_ENV = "E2B_TREE_COPY_TIMEOUT_S"
+TREE_COPY_TIMEOUT_S = 600
+
+
+def _tree_copy_timeout_s(settings) -> int:
+    """``E2B_TREE_COPY_TIMEOUT_S`` (default 600 s), never below 60."""
+    raw = os.getenv(_TREE_COPY_TIMEOUT_ENV)
+    if raw and raw.strip().isdigit():
+        return max(60, int(raw.strip()))
+    return TREE_COPY_TIMEOUT_S
 
 
 async def _invalidate_gateway_route(request, sandbox_id) -> None:
@@ -2750,8 +2915,14 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
         # touched and the route switches. On failure the source is
         # re-provisioned below so the sandbox keeps serving from its node.
         if not await _stop_source_runtime(request, record, source):
-            raise OfficialError(
-                502, f"Node {source.node_id} failed to stop sandbox runtime"
+            # Task 3: with the trees on the node's own disk, "the source node
+            # did not answer" is not a generic node problem -- the tree is
+            # unreachable *and* the export endpoint that could move it lives
+            # there. Name it, so the operator reads the drain-order rule
+            # (move the sandbox off a node before taking the node down) and not
+            # a 502 they will retry forever.
+            raise source_node_unreachable(
+                source.node_id, "it did not acknowledge the runtime stop"
             )
         source_stopped = True
         try:
@@ -2834,7 +3005,7 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
                 raise
         finally:
             if tar_path is not None:
-                tar_path.unlink(missing_ok=True)
+                _discard_transfer_copy(tar_path)
     except Exception:
         # Migration failed: restore the source runtime stopped above so the
         # sandbox keeps serving from its original node, and undo any record

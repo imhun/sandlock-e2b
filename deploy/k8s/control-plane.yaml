@@ -346,12 +346,18 @@ spec:
               value: http://control-plane:3000
             - name: E2B_SHARED_WORKSPACE_ROOT
               value: /var/lib/e2b-sandboxes
-            # N27: the *tree* root, one level down (`<export>/workspaces/<id>`),
-            # while `E2B_SHARED_WORKSPACE_ROOT` above stays the export root the
-            # platform's own directories hang off (`_snapshots`, `_volumes`, …)
-            # and the worker's `workspace-root-init` creates them under.
+            # N57 / Task 3: the *tree* root now lives on each **node's own
+            # disk** (`/var/lib/e2b/workspaces`, the worker's and face B's
+            # hostPath). This pod has no mount there and never touches a tree:
+            # the value is named so the paths the control plane *derives* and
+            # hands to a node's agent (`remove_workspace`, `chown-workspace`,
+            # the materialize plan) resolve to the node's real directory.
+            # `E2B_SHARED_WORKSPACE_ROOT` above stays the export root the
+            # platform's own namespaces hang off (`_snapshots`, `_migrate`,
+            # `_volumes`, …), and `_migrate` is the only one of them this pod
+            # writes.
             - name: E2B_WORKSPACE_BASE
-              value: /var/lib/e2b-sandboxes/workspaces
+              value: /var/lib/e2b/workspaces
             # N57: 树**在不在共享存储上**的具名判据。重切之后
             # `E2B_SHARED_WORKSPACE_ROOT` 仍然要设着（它就是平台自己的命名空间
             # ——`_snapshots` / `_migrate` / `_volumes` / …——挂着的那个根），所以
@@ -360,8 +366,29 @@ spec:
             # 留不留），读错一个就是**静默建空树 + 源节点留一份永不回收的副本**。
             # 今天写 `1` = 与重切前逐字相同；把树搬去节点本地盘（Task 3）就是把这
             # 一个字符改成 `0`，与 `E2B_WORKSPACE_BASE` 的指向一起改。
+            #
+            # Task 3 已翻（2026-10-02）：`0`，与上面 `E2B_WORKSPACE_BASE` 一起
+            # 指到节点本地盘。理由与代价都是量出来的
+            # （`docs/create-local-first-design.md` §1.2/§2.3，两行必须一起读）：
+            # 元数据负载本地快 475×（沙箱自己的 `/workspace` 就是那条路径：
+            # 写 64 B 文件 0.027 ms vs 13.136 ms），大块顺序写本地反而慢 ~3.9×
+            # （124.9-125.5 vs 483-493 MB/s）。产品形态是元数据密集的开发负载，
+            # 所以采本地；但这不是"处处更快"，设计文档 §1.2 把两行并列写着。
             - name: E2B_TREES_SHARED
-              value: "1"
+              value: "0"
+            # Task 3: the in-flight bound for one tree copy. A migration moves
+            # a tree **through this process** in both directions, so the cap is
+            # what makes "one 1 GiB tree" stop meaning "one 2 GiB control
+            # plane" (the old code read the whole body into memory:
+            # `resp.content` on the way in, `read_bytes()` on the way out).
+            # Over it the answer is the named refusal `tree-copy-too-large`
+            # (413); `0` disables it. Default/live value is one sandbox's disk
+            # quota, because a smaller cap would refuse a legitimate full
+            # sandbox (`docs/create-local-first-design.md` §3.1).
+            - name: E2B_TREE_COPY_MAX_BYTES
+              value: "1342177280"
+            - name: E2B_TREE_COPY_WINDOW_BYTES
+              value: "67108864"
             # ...and the base the platform's own files live under: the runtime
             # records (`_runtime/<id>/sandbox.json`), the command logs, the
             # checkpoint images. A *sibling* of the sunk tree root and on the
