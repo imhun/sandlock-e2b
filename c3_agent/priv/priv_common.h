@@ -28,7 +28,7 @@
 #define PRIV_DEFAULT_SUPERVISE_BIN \
     "/usr/local/lib/python3.14/site-packages/sandlock/bin/sandlock-supervise"
 
-#define PRIV_MAX_ROOTS 4
+#define PRIV_MAX_ROOTS 5
 
 /* The program name used in every diagnostic. */
 const char *priv_progname(void);

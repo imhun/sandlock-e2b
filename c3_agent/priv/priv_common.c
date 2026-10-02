@@ -164,6 +164,20 @@ const char *priv_state_base(void) {
     return (value != NULL && *value != '\0') ? value : priv_workspace_base();
 }
 
+/* N57: the *node-local* platform state -- the create marker, the disk-stat
+ * seed, ``.route-b`` and the uid pool's local files. A root of its own because
+ * it is neither the shared state base (which the other node's worker reads) nor
+ * the tree root (which the sandbox itself reaches): with the trees on
+ * node-local disk the two are different media, and a path under this root would
+ * otherwise be refused as "outside every root the helper may act on".
+ *
+ * Unset means the deployment names none -- no extra root, exactly like
+ * ``E2B_SHARED_VOLUME_ROOT``. */
+static const char *priv_node_state_base(void) {
+    const char *value = getenv("E2B_NODE_STATE_BASE");
+    return (value != NULL && *value != '\0') ? value : NULL;
+}
+
 static const char *priv_shared_volume_root(void) {
     const char *value = getenv("E2B_SHARED_VOLUME_ROOT");
     return (value != NULL && *value != '\0') ? value : NULL;
@@ -186,12 +200,19 @@ size_t priv_root_paths(const char **out, size_t max) {
      * the fleet's deployments name them: a consumer that reads the diagnostic
      * and one that walks the whitelist must not disagree. */
     const char *workspace = priv_workspace_base();
+    const char *node_state = priv_node_state_base();
     const char *state = priv_state_base();
     const char *shared = priv_shared_volume_root();
     const char *cache = priv_image_cache();
     size_t count = 0, seen;
     if (count < max) {
         out[count++] = workspace;
+    }
+    /* N57: node-local platform state, right after the tree root. Compared
+     * against the tree root only -- statement for statement what the Python
+     * side's ``ControlPaths.roots`` does, so the two lists cannot drift. */
+    if (node_state != NULL && strcmp(node_state, workspace) != 0 && count < max) {
+        out[count++] = node_state;
     }
     /* A second root only when the state base *is* one: with no E2B_STATE_BASE
      * the two are the same directory, and naming one directory twice would

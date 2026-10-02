@@ -38,6 +38,29 @@ def _state_base_from_env() -> Path | None:
     return Path(raw).resolve() if raw else None
 
 
+#: The values ``E2B_TREES_SHARED`` reads as "on". Anything else non-empty --
+#: including ``0``, ``no``, ``off`` -- is off, so a typo cannot silently turn
+#: the trees local: the variable's *presence* is the claim, and only an
+#: explicit on-value keeps them shared.
+_TREES_SHARED_ON = frozenset({"1", "true", "yes", "on"})
+
+
+def _trees_shared_from_env() -> bool | None:
+    """``E2B_TREES_SHARED``, or ``None`` when the deployment does not name it.
+
+    ``None`` is not ``False``: it means "ask the old question"
+    (``bool(shared_workspace_root)``), which is what keeps every deployment
+    that predates this switch on exactly the shape it has today. An empty
+    value counts as unnamed -- the repo's rule for every other base
+    (``resolve_state_base``), and the reason a k8s ``value: ""`` cannot flip a
+    fleet's trees onto node-local disk.
+    """
+    raw = os.getenv("E2B_TREES_SHARED")
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().lower() in _TREES_SHARED_ON
+
+
 @dataclass
 class Settings:
     """All tunables of the control plane.
@@ -531,6 +554,29 @@ class Settings:
     shared_volume_root: str | None = field(
         default_factory=lambda: os.getenv("E2B_SHARED_VOLUME_ROOT")
     )
+    #: The reslice's named judge: whether the sandbox **trees** live on shared
+    #: storage. Deliberately *not* ``bool(shared_workspace_root)`` -- after the
+    #: reslice the shared root is still named (it holds ``_snapshots``,
+    #: ``_migrate``, ``_volumes``, …) while the trees sit on node-local disk, so
+    #: deriving this from that would answer "shared" for a deployment whose
+    #: trees are not. One variable decides three things on the migration path
+    #: (export or not, write the tree or not, keep the source's tree or not), and
+    #: reading the wrong one there builds an *empty* tree on the target and
+    #: leaves the source's tree behind unreclaimed.
+    #:
+    #: Unset, or empty (which is what the environment reads an unset variable as
+    #: -- the same rule :func:`gateway_common.paths.resolve_state_base` states),
+    #: keeps today's behaviour: the trees are shared exactly when a shared
+    #: workspace root is named.
+    trees_shared: bool | None = field(default_factory=_trees_shared_from_env)
+    #: Node-local platform state (``E2B_NODE_STATE_BASE``) -- the create marker,
+    #: the disk-stat seed, ``.route-b`` and the uid pool's local files. Named on
+    #: the control plane because :meth:`ControlPaths.roots` is the list the
+    #: privileged helper is asked to act under, and that list has to carry every
+    #: root an op can name. Unset = no such root (today's shape).
+    node_state_base: str | None = field(
+        default_factory=lambda: os.getenv("E2B_NODE_STATE_BASE")
+    )
     #: Route B's scratch root -- where the per-slot ``policy.json`` /
     #: ``program.json`` documents live, and therefore the directory the C3
     #: agent has to scope to each slot's uid (C3 Task 4's
@@ -570,6 +616,14 @@ class Settings:
         """
         if self.state_base is None:
             self.state_base = self.workspace_base
+        # N57: the trees' shared/not question, settled once. ``None`` means the
+        # deployment did not name it, so it keeps the old answer -- which is
+        # what makes the reslice a no-op for every deployment that has not been
+        # re-deployed. A named value wins outright, which is the whole point:
+        # after the reslice the shared root is *still* named while the trees are
+        # not, so the old question can no longer be asked.
+        if self.trees_shared is None:
+            self.trees_shared = bool(self.shared_workspace_root)
         normalized: dict[str, list[str]] = {}
         for tenant, keys in (self.tenant_map or {}).items():
             if not isinstance(keys, list):

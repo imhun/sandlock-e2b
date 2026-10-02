@@ -172,6 +172,12 @@ class ControlPaths:
 
     workspace_base: Path
     state_base: Path
+    #: Node-local platform state (``E2B_NODE_STATE_BASE``): the create marker,
+    #: the disk-stat seed, ``.route-b`` and the uid pool's local files. Named
+    #: here as its own root because it is *not* a reader of the shared volume --
+    #: a path under it must not be refused for being outside the shared root,
+    #: and a path under the shared root must not be mistaken for it.
+    node_state_base: Path | None = None
     image_cache_dir: Path | None = None
     shared_volume_root: Path | None = None
     route_b_tmp_root: Path | None = None
@@ -182,8 +188,20 @@ class ControlPaths:
     volume_quota_mb: Mapping[str, int] = field(default_factory=dict)
 
     def roots(self) -> tuple[Path, ...]:
-        """The four-root discipline, in ``priv_common.c``'s order."""
+        """The root discipline, in ``priv_common.c``'s order.
+
+        Five entries once a deployment names them all -- the tree root, the
+        node-local state base, the shared state base, the shared export root and
+        the node-local image cache. The dedupe rules are unchanged (each entry
+        is compared against the *tree root*, the shared root and the image cache
+        exactly as before), so every shape that predates the reslice keeps its
+        exact list -- and the C side in ``c3_agent/priv/priv_common.c`` mirrors
+        this loop statement for statement.
+        """
         roots: list[Path] = [self.workspace_base]
+        node_state = self.node_state_base
+        if node_state is not None and node_state != roots[0]:
+            roots.append(node_state)
         state = self.state_base
         if state != roots[0]:
             roots.append(state)
@@ -231,10 +249,14 @@ def control_paths(state, settings) -> ControlPaths:
     shared = getattr(settings, "shared_volume_root", None) or getattr(
         settings, "shared_workspace_root", None
     )
+    node_state = getattr(settings, "node_state_base", None) or getattr(
+        state, "node_state_base", None
+    )
     route_b = getattr(settings, "route_b_tmp_root", "") or ""
     return ControlPaths(
         workspace_base=workspace_base,
         state_base=state_base,
+        node_state_base=Path(node_state) if node_state else None,
         image_cache_dir=Path(settings.image_cache_dir)
         if getattr(settings, "image_cache_dir", None)
         else None,

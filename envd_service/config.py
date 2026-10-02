@@ -578,6 +578,14 @@ class Settings:
     shared_volume_root: str | None = field(
         default_factory=lambda: os.getenv("E2B_SHARED_VOLUME_ROOT")
     )
+    #: N57: the **node-local** platform state -- the create marker, the
+    #: disk-stat seed, ``.route-b`` and the uid pool's local files. Named here
+    #: so the field exists and the privileged helper's whitelist can carry it;
+    #: nothing derives a path from it yet (that split is the later task), which
+    #: is why unset still means "those files live under ``state_base``".
+    node_state_base: str | None = field(
+        default_factory=lambda: os.getenv("E2B_NODE_STATE_BASE")
+    )
     image_cache_dir: Path = field(
         default_factory=_image_cache_dir
     )

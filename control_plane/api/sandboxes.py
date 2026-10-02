@@ -42,6 +42,7 @@ from control_plane.registry.manager import (
     UnknownSandboxError,
     workspace_disk_refusal,
 )
+from gateway_common import paths as gateway_paths
 from control_plane.registry.secrets import SecretTenantMismatchError
 from control_plane.registry.snapshots import UnknownSnapshotError
 from control_plane.registry.templates import UnknownTemplateBuildError
@@ -2565,9 +2566,27 @@ def _extract_sandbox_archive(archive_path: Path, dest: Path) -> None:
             tar.extractall(dest, members=members)
 
 
+def _platform_namespace_shared_root(settings) -> str | None:
+    """The shared root the platform's own namespaces hang off, or ``None``.
+
+    ``E2B_SHARED_VOLUME_ROOT`` is the one every manifest names;
+    ``E2B_SHARED_WORKSPACE_ROOT`` is its pre-N27 twin and is still read, with
+    the same fallback order ``ControlPaths.roots`` uses, so a deployment that
+    only names the old one keeps working.
+    """
+    return settings.shared_volume_root or settings.shared_workspace_root
+
+
 async def _export_sandbox_archive(request, record, node) -> Path:
     """Return a local tar.gz path containing the sandbox workspace."""
-    migrate_dir = request.app.state.workspace_base / "_migrate"
+    # N57: the staging directory is read by the **target** node's agent
+    # (``_import_sandbox_archive``), so it hangs off the platform namespace
+    # root and not off the tree root -- once the trees are node-local, the
+    # target cannot see another node's tree root at all.
+    migrate_dir = gateway_paths.migrate_staging_dir(
+        request.app.state.workspace_base,
+        shared_root=_platform_namespace_shared_root(request.app.state.settings),
+    )
     migrate_dir.mkdir(parents=True, exist_ok=True)
     tar_path = migrate_dir / f"{record.sandbox_id}.tar.gz"
     if node.address == "local://":
@@ -2684,7 +2703,14 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
     if token is None:
         raise OfficialError(409, f"Sandbox {sandbox_id} is already being migrated")
     settings = request.app.state.settings
-    shared = bool(settings.shared_workspace_root)
+    # N57: the named judge, not the shared root's truthiness. One variable
+    # decides three things below -- export or not, provision the tree on the
+    # target or not, and keep the source's tree or not -- and after the reslice
+    # the shared root is *still* named while the trees are not. Reading the old
+    # question there builds an empty tree on the target and leaves the source's
+    # tree behind as a copy the orphan sweep must leave alone (its id is still
+    # in the records), which is exactly the silent degradation to avoid.
+    shared = settings.trees_shared
     nodes = request.app.state.nodes
     record = None
     source = None

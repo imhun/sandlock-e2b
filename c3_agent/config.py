@@ -129,6 +129,12 @@ class Settings:
     #: Empty means "the workspace base itself" (``priv_state_base``'s rule); it
     #: is written into the child's environment *resolved*, never empty.
     state_base: str = field(default_factory=lambda: os.getenv("E2B_STATE_BASE", ""))
+    #: N57: the *node-local* platform state. Empty means "this deployment names
+    #: none" -- which is today's shape, where those files live under the state
+    #: base -- so the privileged helper's whitelist gains no root.
+    node_state_base: str = field(
+        default_factory=lambda: os.getenv("E2B_NODE_STATE_BASE", "")
+    )
     shared_volume_root: str = field(
         default_factory=lambda: os.getenv("E2B_SHARED_VOLUME_ROOT", "")
     )

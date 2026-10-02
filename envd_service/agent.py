@@ -69,10 +69,12 @@ from gateway_common.paths import (
     UNTRUSTED_TREE_DIR,
     is_reserved_platform_namespace,
     is_sandbox_workspace_dir,
+    migrate_staging_dir,
     sandbox_checkpoint_dir,
     sandbox_command_log_path,
     sandbox_creating_marker,
     sandbox_runtime_dir,
+    snapshot_payload_dir,
     validate_sandbox_id,
 )
 
@@ -3079,7 +3081,17 @@ def _agent_finalize_sandbox(request: Request, settings: Settings, payload: dict)
     if not materialized:
         workspace_dir.mkdir(parents=True, exist_ok=True)
         if snapshot_id:
-            snapshot_fs = workspace_base / "_snapshots" / snapshot_id / "fs"
+            # N57: the store hangs off the platform namespace root (the shared
+            # export root), not off the tree root -- the record beside this
+            # payload is written there by the control plane.
+            snapshot_fs = (
+                snapshot_payload_dir(
+                    workspace_base,
+                    snapshot_id,
+                    shared_root=settings.shared_volume_root,
+                )
+                / "fs"
+            )
             if not snapshot_fs.is_dir():
                 raise ValueError(f"Snapshot {snapshot_id} not found on this node")
             shutil.copytree(
@@ -4196,7 +4208,11 @@ async def agent_export_sandbox(sandbox_id: str, request: Request) -> Response:
     workspace = settings.workspace_base / sandbox_id
     if not workspace.is_dir():
         return Response(status_code=404)
-    migrate_dir = settings.workspace_base / "_migrate"
+    # N57: the staging directory is read by the *target* node's agent, so it
+    # hangs off the platform namespace root rather than off the tree root.
+    migrate_dir = migrate_staging_dir(
+        settings.workspace_base, shared_root=settings.shared_volume_root
+    )
     migrate_dir.mkdir(parents=True, exist_ok=True)
     tar_path = migrate_dir / f"{sandbox_id}.tar.gz"
     try:
@@ -4257,7 +4273,11 @@ async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
         else:
             await asyncio.to_thread(priv_helpers.remove_tree, workspace)
     workspace.mkdir(parents=True, exist_ok=True)
-    migrate_dir = settings.workspace_base / "_migrate"
+    # N57: same root as the export side -- this is the directory the control
+    # plane staged the archive into from the source node.
+    migrate_dir = migrate_staging_dir(
+        settings.workspace_base, shared_root=settings.shared_volume_root
+    )
     migrate_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = migrate_dir / f"{sandbox_id}.tar.gz"
     try:
@@ -4354,7 +4374,11 @@ async def agent_create_snapshot(request: Request) -> Response:
         if not snapshot_id or not sandbox_id:
             return Response(status_code=400, content="snapshotID and sandboxID required")
         src = settings.workspace_base / sandbox_id
-        snapshot_dir = settings.workspace_base / "_snapshots" / snapshot_id
+        snapshot_dir = snapshot_payload_dir(
+            settings.workspace_base,
+            snapshot_id,
+            shared_root=settings.shared_volume_root,
+        )
         dst = snapshot_dir / "fs"
         marker = snapshot_dir / ".complete"
         if not src.is_dir():
@@ -4421,7 +4445,11 @@ async def agent_delete_snapshot(snapshot_id: str, request: Request) -> Response:
     # level down.
     await asyncio.to_thread(
         shutil.rmtree,
-        settings.workspace_base / "_snapshots" / snapshot_id,
+        snapshot_payload_dir(
+            settings.workspace_base,
+            snapshot_id,
+            shared_root=settings.shared_volume_root,
+        ),
         True,
     )
     return Response(status_code=204)

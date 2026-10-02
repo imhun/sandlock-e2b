@@ -210,6 +210,24 @@ STATE_DIR_NAME = "state"
 #: (docs/pure-shape-decision.md §4, N27).
 STATE_BASE_ENV = "E2B_STATE_BASE"
 
+#: The snapshot store's directory name, under the **platform namespace root**
+#: (:func:`platform_namespace_root`) -- one directory per snapshot id, holding
+#: the control plane's ``snapshot.json`` next to the agent-written payload
+#: (``fs/`` today, ``fs.tar`` after the tar task).
+#:
+#: It is spelled here because it is the one name two components write into from
+#: opposite ends (record side: ``control_plane``; payload side:
+#: ``envd_service.agent``), and before this constant they derived it from
+#: different bases -- which is how the store ended up as two namespaces holding
+#: the same ids.
+SNAPSHOT_STORE_DIR_NAME = "_snapshots"
+
+#: The migration staging directory, also under the platform namespace root. Its
+#: reader is the **target** node's agent (``_import_sandbox_archive``), which is
+#: exactly why it cannot live under the tree root once the trees are node-local:
+#: the target node cannot see another node's tree root.
+MIGRATE_STAGING_DIR_NAME = "_migrate"
+
 #: The sandbox's command output log (JSONL), written by the worker.
 COMMAND_LOG_NAME = "command-logs.jsonl"
 
@@ -264,6 +282,59 @@ def resolve_state_base(
     workspace base.
     """
     return Path(state_base) if state_base else Path(workspace_base)
+
+
+def platform_namespace_root(
+    workspace_base: str | Path,
+    *,
+    shared_root: str | Path | None = None,
+) -> Path:
+    """The base the platform's own *namespaces* hang off (``_snapshots``, ``_migrate``).
+
+    The shared root when the deployment names one, the workspace base otherwise
+    -- which is the pre-N57 shape, unchanged.
+
+    Why this is not the same question as "where do the sandbox trees live":
+
+    * the snapshot **record** is written by the control plane at the export root
+      (``control_plane/app.py``: ``platform_root``), not at the tree root;
+    * the snapshot **payload** is written by the agent, and the node that
+      restores it may be any node;
+    * the migration staging directory is read by the **target** node's agent.
+
+    All three readers are "not the tree's own node". Today the workspace base
+    happens to be a directory *under* the shared root, so deriving them from the
+    tree root worked by accident -- and that accident is what makes "move the
+    trees to node-local disk" quietly move these three with them. Naming the
+    root explicitly is what lets the two move independently.
+    """
+    return Path(shared_root) if shared_root else Path(workspace_base)
+
+
+def snapshot_payload_dir(
+    workspace_base: str | Path,
+    snapshot_id: str,
+    *,
+    shared_root: str | Path | None = None,
+) -> Path:
+    """``<platform namespace root>/_snapshots/<id>`` -- one snapshot, both halves."""
+    return (
+        platform_namespace_root(workspace_base, shared_root=shared_root)
+        / SNAPSHOT_STORE_DIR_NAME
+        / snapshot_id
+    )
+
+
+def migrate_staging_dir(
+    workspace_base: str | Path,
+    *,
+    shared_root: str | Path | None = None,
+) -> Path:
+    """``<platform namespace root>/_migrate`` -- the cross-node transfer's landing zone."""
+    return (
+        platform_namespace_root(workspace_base, shared_root=shared_root)
+        / MIGRATE_STAGING_DIR_NAME
+    )
 
 
 def sandbox_runtime_dir(

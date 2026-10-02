@@ -159,6 +159,11 @@ def maint_env(
         env["E2B_BROKER_WORKER_GID"] = str(worker_gid)
     if settings.shared_volume_root:
         env["E2B_SHARED_VOLUME_ROOT"] = str(settings.shared_volume_root)
+    # N57: written only when the deployment names one -- an unset node-state
+    # base must not become a whitelisted directory nobody meant, exactly the
+    # rule the two roots above follow.
+    if settings.node_state_base:
+        env["E2B_NODE_STATE_BASE"] = str(settings.node_state_base)
     if settings.image_cache_dir:
         env["E2B_IMAGE_CACHE_DIR"] = str(settings.image_cache_dir)
     return env
