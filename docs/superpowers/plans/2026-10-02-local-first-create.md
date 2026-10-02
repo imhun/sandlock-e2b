@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 按"**默认本地写、只有需要共享时才落共享**"改造建箱与快照的存储布局，把建箱从 **127 ms** 拉向 **~60 ms**、把快照从 **26 ms/条目** 拉向**按字节付费**。
+**Goal:** 按"**默认本地写、只有需要共享时才落共享**"改造存储布局，收益有两笔，**主笔是运行时 I/O 不是建箱**：① 沙箱里写一个小文件 **13.06 → 0.028 ms**（466×，这是用户每天感受得到的那笔）；② 建箱 **127 → ~60 ms** —— 但**只有 Task 3 + Task 4 同时到位才拿得到**（建箱地板是 `max(materialize, prepare)`，单独做任一条只值个位数毫秒）；③ 快照从 **26 ms/条目** 拉向**按字节付费**。
 
-**Architecture:** 三个对象换位置 —— ① 快照落成 **tar** 放共享（恢复任何节点都可做，不需要 p2p）；② 沙箱树搬**节点本地**，跨节点（迁移/fork）用既有 tar 通道经共享中转；③ `.creating`/disk-stats/route-B/uid 池本地件搬到**节点本地的 state**。共享侧只保留：运行时记录 `sandbox.json`、checkpoint、快照 tar 与记录、卷与 `_meta`、`_templates`/`_builds`/`_oci.tar`。
+**Architecture:** 三个对象换位置 —— ① 快照落成 **tar** 放共享（恢复任何节点都可做，不需要 p2p）；② 沙箱树搬**节点本地**，跨节点（迁移）经控制面/共享的 `_migrate` 中转；③ `.creating`/disk-stats/route-B/uid 池本地件搬到**节点本地的 state**。共享侧只保留：运行时记录 `sandbox.json`、checkpoint、快照 tar 与记录、卷与 `_meta`、`_templates`/`_builds`/`_oci.tar`。**逐条评估（含跨节点迁移的五个失效面）见 `docs/create-local-first-layout.md` §3。**
 
 **Tech Stack:** Python（`control_plane/`、`c3_agent/`、`envd_service/`、`gateway_common/`）、k8s（k0s、arm64）、NFS（阿里云 NAS）+ 节点 ESSD、tar。
 
@@ -24,7 +24,8 @@
 - **用户裁定 4（设计原则）**：**默认写本地；只有"有已知跨节点消费者"的对象才在写的时候落共享；"只是可能被跨节点读"的一律按需促升/按需取。**
 - **用户裁定 5**：**快照在生成时就打成 tar 落共享**（不是"爆炸式 `fs/` 目录落 NAS"）。
 - **不变（已逐条查实）**：卷数据与其切片（调度器按 `volume_node_id` 把沙箱钉在卷所属节点）、`_volumes/_meta`、`_templates`、`_builds`（都是**控制面副本间**的共享，worker 从不读）、`_oci/*.oci.tar`（唯一的真·节点间需求，且已是"共享放分发产物"的正确形状）。`_cow` 是空的保留名，保留名单不删。
-- **硬约束（实测）**：节点盘是阿里云 ESSD（**写 186 / 冷读 125 MB/s**，比 NAS 的 381 / 165 慢），每节点只剩 **75 G**；容器内存 **512 MiB**（agent 的 maint **256 MiB**），页缓存计入 cgroup —— 测 500 MB 本地写已经 OOM 过一次。`agent ↔ agent` 被 NetworkPolicy 挡住（只有 CP→agent）。
+- **硬约束（实测，2026-10-02 复核）**：每节点只剩 **75 G** 可用盘，且与 4 GiB 的镜像解包缓存**同盘**；`E2B_NODE_DISK_MB=8192` + 每沙箱默认 `E2B_DEFAULT_DISK_MB=1024` ⇒ **8 沙箱/节点**的调度上限（本地化后这个数才第一次与"节点盘"同源；今天心跳报的 `usedDiskMB` 是 NAS 的 566,766 MB）。容器限额：worker / 控制面各 **2 GiB**、agent 的 face A **256 MiB**、face B `maint` **512 MiB** —— 实测一次 500 MB 的本地写把 `maint` 打 OOMKilled 过一次。`agent ↔ agent` 被 NetworkPolicy 挡住（只有 CP→agent）。
+- ⚠ **作废的旧读数**：本计划早先引用的"节点 ESSD 写 186 / 冷读 125 MB/s，慢于 NAS 的 381 / 165"**不再作为判据**。2026-10-02 在 `e2b-worker-0` 重测：本地 **1027 MB/s** vs NAS 435 MB/s（`docs/create-local-first-layout.md` §3.1）。Task 1 Step 1 重测之前，任何以旧数为前提的推理都算未验证。
 - 断言精确匹配、禁 SKIP/xfail；编辑一律 `apply_patch`；每条"能失败"的钉子必须证明它会红。
 
 ## Review Focus
@@ -33,9 +34,11 @@
 2. **按需促升不能丢语义**：树本地之后，迁移/fork/快照/孤儿回收/磁盘扫描必须都能拿到数据；"取不到"要具名失败而不是静默降级。→ Task 3
 3. **共享记录的全舰队口径**：`sandbox.json` 留共享之后，`uid_pool._recorded_uids`（靠枚举**树目录名**当索引）会失去视野 —— 索引要改成共享的记录目录，不许降级 fallback。→ Task 4
 4. **快照完整性**：单 tar 意味着"写坏一半"看起来像个完整文件；沿用临时名 + fsync + rename + `.complete`。→ Task 2
-5. **本地盘的容量与页缓存**：树进 75 G 的节点盘、大文件写入更慢（186 vs 381）、页缓存计入 512 MiB。→ Task 1（前置测量）+ Task 3 的淘汰策略
+5. **本地盘的容量与页缓存**：树进 75 G 的节点盘（与 4 GiB 镜像缓存同盘）、`E2B_NODE_DISK_MB=8192` 只够 8 个沙箱、页缓存计入 worker 的 2 GiB / `maint` 的 512 MiB（已 OOM 过一次）。→ Task 1（前置测量）+ Task 3 的淘汰策略
 6. **介质归属必须显式，不能从路径推**：一根 `E2B_WORKSPACE_BASE` 同时决定树的介质、平台命名空间的位置和迁移判据，是"树搬本地"卡住的根因。→ Task 0
 7. **合并不能静默取一个**：`_snapshots` 两处合一，两边同名文件必须具名拒绝。→ Task 0 Step 6
+8. **一条从没跑过的分支要变成主路径**：`shared=False` 的迁移分支在本部署一次都没执行过，而且它的在途是"整棵树进控制面内存 + 固定 120 s 超时"。→ Task 3
+9. **"树在哪"与"判据取什么"必须分开命名**：一个 `shared` 同时决定导出/建树/留源，翻错一个值就是静默建空树。→ Task 0 + Task 3
 
 ---
 
@@ -94,7 +97,7 @@
 
 **Files:** Create `docs/create-local-first-design.md`；Modify `deploy/scripts/acceptance/`（只在需要新探针时）。
 
-- [ ] **Step 1: 三笔账**（集群实测，n≥10，写进设计文档）：① **沙箱里写大文件**：1 GB 顺序写在"树在本地"与"树在 NAS"两种形状下各多少 MB/s、多少秒（这决定树本地是不是对所有负载都划算）；② **容量账**：快照仓/树的日增量与保留窗口 → 每节点需要多少 G（当前 75 G）；③ **页缓存账**：一次建箱/快照的峰值页缓存 vs 512 MiB（agent 256 MiB）限额，给出上限配置（`E2B_IMAGE_*` 那种上限的同款做法）。
+- [ ] **Step 1: 三笔账 + 一笔复核**（集群实测，n≥10，写进设计文档）：⓪ **复核作废的吞吐读数** —— "本地 186 / NAS 381 MB/s" 已被 `docs/create-local-first-layout.md` §3.1 的实测推翻（本地 **1027** / NAS 435），用同款脚本按三种块大小重测并写死结论；① **沙箱里写大文件**：1 GB 顺序写在"树在本地"与"树在 NAS"两种形状下各多少 MB/s、多少秒（这决定树本地是不是对所有负载都划算）；② **容量账**：快照仓/树的日增量与保留窗口 → 每节点需要多少 G（当前 75 G，且与 4 GiB 镜像缓存同盘）；③ **页缓存账**：一次建箱/快照的峰值页缓存 vs worker 的 2 GiB 与 agent `maint` 的 512 MiB 限额，给出上限配置（`E2B_IMAGE_*` 那种上限的同款做法）。
 - [ ] **Step 2: `_snapshots` 两命名空间的**复核**（Task 0 已合并，这里只验）**：Task 0 Step 1 的实录 + Step 6 的迁移之后，`<shared>/_snapshots/<id>/` 应当同时有控制面的 `snapshot.json` 与 agent 的载荷（Task 2 之后是 `fs.tar` + `.complete`）。这里复核"合并无遗漏、重复 id 没有静默取一个"，并把结论写进设计文档。**这一步没复核过，Task 2 的路径推导就建在流沙上。**
 - [ ] **Step 3: 落文档**：把两份 tmp 报告（测量 + 盘点）的核心表与五条裁定搬进 `docs/create-local-first-design.md`，并指向 `tmp/` 里的原始读数。
 - [ ] **Step 4: 提交**（`docs(...)`）。
@@ -114,15 +117,24 @@
 
 ### Task 3: 沙箱树本地化 + 迁移经共享中转
 
-**Files:** Modify `deploy/k8s/{worker,c3-agent}.yaml`（节点本地卷 + 开关）、`control_plane/api/sandboxes.py`（`_export/_import_sandbox_archive` 的中转落点）、`envd_service/agent.py`；Test `tests/unit/test_tree_local_migration.py`（新）。
+**为什么做（理由换过了）**：主笔是**运行时 I/O** —— 沙箱自己的 `/workspace` 就是 bind mount 到那条 NAS 路径，写一个 64 B 文件实测 **13.06 ms**（本地 0.028 ms，466×），`npm install` 量级的负载是分钟级 vs 秒级。建箱只是次笔，而且**必须与 Task 4 一起到位**：地板是 `max(materialize, prepare)`，只本地化树 ⇒ 地板仍是 `prepare ≈73 ms`；只做 Task 4 ⇒ 地板仍是 `materialize ≈71 ms`。完整评估与跨节点逐条分析见 `docs/create-local-first-layout.md` §3。
 
-**Interfaces:** Consumes: Task 0 的 `E2B_TREES_SHARED` 判据与 Task 2 的 tar 通道。判据为 `0` 时走 `_export_sandbox_archive` / `_import_sandbox_archive` —— `control_plane/api/sandboxes.py:2752` / `:2774` 的 `if not shared:` 两个分支就是完整实现，只是今天 `E2B_SHARED_WORKSPACE_ROOT` 在清单里设着（`/var/lib/e2b-sandboxes`），判据恒为 `1`，那两条分支从没跑过。
+**Files:** Modify `deploy/k8s/{worker,c3-agent}.yaml`（节点本地卷 + 开关）、`control_plane/api/sandboxes.py`（`_export/_import_sandbox_archive` 的中转落点与在途上限）、`envd_service/agent.py`；Test `tests/unit/test_tree_local_migration.py`（新）；文档 `docs/create-local-first-layout.md`（排水顺序的裁定）。
 
-- [ ] **Step 1: 写失败用例**：`test_a_local_tree_is_not_visible_from_the_shared_volume`；`test_migration_moves_the_tree_through_the_shared_store`（源节点导出 tar → 共享暂存 → 目标节点导入，断言目标节点树的内容与源一致）；`test_a_failed_transfer_leaves_neither_a_half_tree_nor_a_record`；`test_the_orphan_sweep_still_sees_a_local_tree`。
+**Interfaces:** Consumes: Task 0 的 `E2B_TREES_SHARED` 判据与 Task 2 的 tar 通道。判据为 `0` 时走 `_export_sandbox_archive` / `_import_sandbox_archive` —— `control_plane/api/sandboxes.py:2752` / `:2774` 的 `if not shared:` 两个分支就是完整实现，只是今天判据恒为 `1`（`E2B_SHARED_WORKSPACE_ROOT` 在清单里设着），那两条分支**在本部署里从没跑过一次**。
+
+**跟着必须一起做的三件事**（否则 Task 3 会引入静默故障，不是"稍后再补"）：
+
+1. **判据必须换名字**：`shared` 一个变量今天同时决定"要不要导 tar / 源节点的树留不留"（`_destroy_on_node(..., keep_files=shared)`）。只把树搬本地而不换判据 ⇒ 迁移会**不导出 → 改记录 → 在目标建空树 → 源节点的树留下**，而源节点那棵树因为 id 还在记录里，GC 只会判它 `protected`、永不回收。→ Task 0 的 `E2B_TREES_SHARED`。
+2. **在途不能整棵树进内存**：现在两端都是 `resp.content` / `tar_path.read_bytes()`，控制面限额 **2 GiB**，两端各 `timeout=120`（按 13 ms/文件算约 4600 个文件就到顶）。改成流式 + 按字节的具名上限与超限拒绝。
+3. **"源节点不可达"要具名**：导出端点在**源节点**上，所以本地化后源节点掉线 = 树不可达且无法事后迁出。把它写成一个具名错误（不是 502 泛化），并在文档里定下排水顺序：**先迁走、再下线**。
+
+- [ ] **Step 1: 写失败用例**：`test_a_local_tree_is_not_visible_from_the_shared_volume`；`test_migration_moves_the_tree_through_the_shared_store`（源节点导出 tar → 中转暂存 → 目标节点导入，断言目标节点树的内容与源一致，**且源节点的那棵树被删掉**）；`test_the_migration_judge_is_not_the_shared_root`（`E2B_SHARED_WORKSPACE_ROOT` 设着 + `E2B_TREES_SHARED=0` ⇒ 必须走导出/导入）；`test_a_failed_transfer_leaves_neither_a_half_tree_nor_a_record`；`test_a_migration_from_an_unreachable_source_is_refused_by_name`；`test_the_orphan_sweep_still_sees_a_local_tree`。
 - [ ] **Step 2: 先红**。
-- [ ] **Step 3: 实现**：翻开关 + 迁移/fork 照裁定 2 经共享中转（复用既有 tar 代码，落点参数化）；淘汰策略按 Task 1 的容量账落地（至少要有上限与具名拒绝）。
-- [ ] **Step 4: 集群验收**：`MULTI-NODE`/`DEPLOYMENT` 冒烟（**必含跨节点迁移保文件**）、`GET /sandboxes` 无残留、两节点磁盘占用可解释。
-- [ ] **Step 5: 提交**。
+- [ ] **Step 3: 实现**：换判据；迁移经控制面/共享的 `_migrate` 中转（复用既有 tar 代码，落点参数化）；上面第 2、3 条的上限与具名拒绝；目标节点导入失败不留半棵树；淘汰策略按 Task 1 的容量账落地。
+- [ ] **Step 4: 裁定进文档**："沙箱不是持久对象、**持久面是快照**"（否则本地化必须给节点盘做冗余）；排水顺序"先迁走、再下线"；以及"记录指向的节点上没有树"这个状态的具名修复动作。
+- [ ] **Step 5: 集群验收**：`MULTI-NODE`/`DEPLOYMENT` 冒烟；**两个方向各一次** —— ① 节点健在时跨节点迁移**保文件**；② 停掉源节点 worker 后发起的迁移**具名拒绝**而不是静默建空树；`GET /sandboxes` 无残留、两节点磁盘占用可解释。
+- [ ] **Step 6: 提交**。
 
 ### Task 4: 本节点 state 分家（拿回 `prepare` 的 ~73 ms）
 
@@ -159,8 +171,8 @@
 
 **覆盖**：裁定 1 → Task 4（`command-logs` 留在原处即可，因为它的远程形态本来就是代理）；裁定 2 → Task 3（`_migrate` 上浮到共享根是它的前置，在 Task 0）；裁定 3 → Task 4（记录不搬）；裁定 4 → 全程，**出口是 Task 0 的根表**（介质归属显式化，不再从一根推），Task 2/3/4 各自只把"有已知跨节点消费者"的对象落共享；裁定 5 → Task 2。盘点里"不变"的那批 → 本计划不动它们（写进 Task 1 的文档）。
 
-**依赖与顺序**：Task 0 是一切的前置（目录与判据先定型，默认行为不变）；Task 1 的三笔账（容量 / 页缓存 / 大文件写）与 Task 0 并行；Task 2 独立且收益最大，可在 Task 0 之后先上；Task 3 依赖 Task 0 的判据 + Task 2 的 tar 通道；Task 4 依赖 Task 3（树本地之后 `prepare` 才是长杆）；Task 5 与全部并行；Task 6 最后。
+**依赖与顺序**：Task 0 是一切的前置（目录与判据先定型，默认行为不变）；Task 1 的三笔账（复核吞吐 / 容量 / 页缓存）与 Task 0 并行；Task 2 独立且收益最大，可在 Task 0 之后先上；Task 3 依赖 Task 0 的判据 + Task 2 的 tar 通道 + Task 1 的容量账（淘汰上限）；Task 4 什么都不依赖，但与 Task 3 **一起上线才拿得到建箱那 60 ms**（`max(materialize, prepare)`）；Task 5 与全部并行，只在"树仍走共享"的形状（Task 0 之后、Task 3 之前）有收益；Task 6 最后。
 
-**风险最高的四处**：Task 0 Step 6（合并 `_snapshots` 时同名文件被静默取一个 —— 那是**数据丢失**，不是格式问题）、Task 2 Step 4（解包的硬化与完整性）、Task 3 Step 3（促升/按需取的失败面）、Task 4 Step 1 的第三条（uid 索引改口径）。四处都先红后绿。
+**风险最高的五处**：Task 0 Step 6（合并 `_snapshots` 时同名文件被静默取一个 —— 那是**数据丢失**，不是格式问题）、Task 2 Step 4（解包的硬化与完整性）、Task 3 Step 3 的判据与在途上限（翻错判据 = 静默建空树 + 源节点留一份永不回收的副本；在途是整棵树进控制面 2 GiB 内存）、Task 3 的"源节点不可达"（本地化后的头号失效面，靠排水顺序而不是代码兜底）、Task 4 Step 1 的第三条（uid 索引改口径）。五处都先红后绿。
 
-**刻意不做**（记在文档里）：卷数据、`_volumes/_meta`、`_templates`、`_builds`、`_oci.tar` 一律不动；`_cow` 保留名不删；checkpoint 本轮仍留共享（它的"本地化"取决于是否禁止迁移 paused 沙箱，那条要单独立项）。
+**刻意不做**（记在文档里）：卷数据、`_volumes/_meta`、`_templates`、`_builds`、`_oci.tar` 一律不动；`_cow` 保留名不删；checkpoint 本轮仍留共享（它的"本地化"取决于是否禁止迁移 paused 沙箱，那条要单独立项）；**不做**"树本地 + 跨节点冗余"（节点掉线丢树这件事由 Task 3 Step 4 的裁定承担，不靠代码兜底）。
