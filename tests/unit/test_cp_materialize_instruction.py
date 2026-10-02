@@ -117,7 +117,12 @@ class _Cp:
         return self.workspace_base / SANDBOX
 
     def copy_from(self, snapshot_id: str = SNAPSHOT) -> Path:
-        return self.workspace_base / "_snapshots" / snapshot_id / "fs"
+        # N57/N58: the payload sits beside the control plane's own
+        # `snapshot.json` on the **platform namespace root** (the shared export
+        # root), not under the tree root. In this fixture the two are different
+        # directories -- the shape N27/N58 actually run -- so a derivation that
+        # still reads the tree root cannot pass by accident.
+        return self.shared_root / "_snapshots" / snapshot_id / "fs"
 
     def slice_path(self) -> Path:
         return Path(self.volume.path) / SANDBOX
@@ -367,6 +372,13 @@ async def test_a_snapshot_create_carries_copy_from(workspace: Path) -> None:
     )
 
     assert client.calls[1]["tree"]["copy_from"] == str(shape.copy_from())
+    # ...and it is *not* the tree-root spelling: N58 moved the live payloads
+    # there, so `<workspaces>/_snapshots/<id>/fs` is exactly the path that made
+    # a create-from-snapshot answer `502 partial-copy: … is not a directory` on
+    # the cluster (2026-10-02).
+    assert not str(client.calls[1]["tree"]["copy_from"]).startswith(
+        str(shape.workspace_base)
+    )
 
 
 @pytest.mark.asyncio

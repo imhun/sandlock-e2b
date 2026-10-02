@@ -150,6 +150,10 @@ PROMOTED_ENTRIES = (
     ("tmp/mcp-3way.py", "deploy/scripts/acceptance/mcp-3way.py"),
     ("tmp/mcp-512-size.py", "deploy/scripts/acceptance/mcp-512-size.py"),
     ("tmp/mem512-limit.py", "deploy/scripts/acceptance/mem512-limit.py"),
+    (
+        "tmp/n58-rehearsal/rehearse.py",
+        "deploy/scripts/acceptance/migrate_state_base_rehearsal.py",
+    ),
     ("tmp/n37/cluster_keepalive_probe.py", "deploy/scripts/acceptance/cluster_keepalive_probe.py"),
     ("tmp/n37/cluster_run.py", "deploy/scripts/acceptance/cluster_run.py"),
     ("tmp/n37/relay_probe.py", "deploy/scripts/acceptance/relay_probe.py"),

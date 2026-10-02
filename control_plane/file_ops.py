@@ -55,6 +55,7 @@ from gateway_common.paths import (
     route_b_instance_name,
     sandbox_checkpoint_dir,
     sandbox_runtime_dir,
+    snapshot_payload_dir,
     validate_sandbox_id,
 )
 
@@ -155,10 +156,6 @@ WORKSPACE_SUBDIR = "workspace"
 #: tree, the worker (the data-plane owner) is the group, and the ``other`` bits
 #: are 0 so cross-sandbox isolation stays a plain kernel DAC check.
 TREE_MODE = "0770"
-
-#: The snapshot store's own namespace under the workspace base.
-_SNAPSHOTS_DIR = "_snapshots"
-
 
 @dataclass(frozen=True)
 class ControlPaths:
@@ -380,7 +377,23 @@ def derive_materialize(
         "gid": int(worker_gid),
     }
     if snapshot_id is not None:
-        copy_from = paths.workspace_base / _SNAPSHOTS_DIR / snapshot_id / "fs"
+        # N57/N58: the payload lives under the **platform namespace root** (the
+        # shared export root), beside the control plane's own `snapshot.json`
+        # -- the same directory `envd_service/agent.py` writes it into through
+        # the helper below. Deriving it from the tree root is what put the
+        # record and the payload in two namespaces, and after N58 moved the
+        # live payloads it is the difference between a working restore and
+        # `502 partial-copy: the snapshot source … is not a directory`
+        # (measured on the cluster 2026-10-02, the first snapshot create after
+        # the reslice).
+        copy_from = (
+            snapshot_payload_dir(
+                paths.workspace_base,
+                snapshot_id,
+                shared_root=paths.shared_volume_root,
+            )
+            / "fs"
+        )
         _require_in_roots(paths, copy_from, spec)
         tree["copy_from"] = str(copy_from)
     return {"tree": tree, "slices": _volume_slices(paths, record, spec, sandbox_id, host_uid, worker_gid)}

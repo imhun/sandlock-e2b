@@ -825,8 +825,11 @@ async def delete_snapshot(snapshot_id: str, request: Request) -> Response:
     try:
         record = _snapshots(request).get(snapshot_id)
         _require_owned(request, record, resource_id=snapshot_id, label="Snapshot")
-        # The payload lives on the shared NAS tree (the control plane and the
-        # worker mount the same `_snapshots`), so this delete is an `rmtree`
+        # The payload lives on the platform namespace root -- `<export>/_snapshots`,
+        # the same directory the control plane's own `snapshot.json` sits in
+        # (one id, one directory since N58; the two used to be different roots,
+        # and the agent wrote the payload under the *tree* root), so this delete
+        # is an `rmtree`
         # over a whole sandbox tree: measured 17.1 s for 2000 files, and it
         # used to run here on the event loop -- the access log stopped for
         # exactly that long, which is the same "the control plane thinks its

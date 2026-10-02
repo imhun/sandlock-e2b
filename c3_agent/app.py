@@ -213,9 +213,10 @@ class TreePlan(BaseModel):
     """The one tree a create materializes, as the control plane derived it.
 
     ``copy_from`` is present exactly for a snapshot create, and it names a copy
-    of the **tree root** (``<ws>/_snapshots/<snap>/fs``), which is why
-    ``c3_agent.materialize`` merges it into ``path`` and not into
-    ``path/subdir``.
+    of the **tree root** (the snapshot store's ``fs/``, which lives on the
+    platform namespace root: ``<export>/_snapshots/<snap>/fs`` -- N58 moved it
+    out of the tree root), which is why ``c3_agent.materialize`` merges it into
+    ``path`` and not into ``path/subdir``.
     """
 
     path: str = Field(min_length=1)

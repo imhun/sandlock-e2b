@@ -21,7 +21,7 @@
 | Task 0 Step 6 迁移脚本 N58 | ✅ | 本批提交。`scan_uplift()`：上浮 + 合一 + 具名拒绝同名；`rmdir` 拆壳带 journal 与回退；判据加"兄弟层已是新布局" |
 | 回归 | ✅ | `tests/unit` **2211 passed / 12 skipped / 3 failed**，与基线（2194 + 新增 17）逐条对齐，3 条是已知 macOS-only。`tests/contract/test_migration.py` 的 6 条失败**在干净树上同样失败**（macOS 没有 container id），非本轮引入 |
 | 回归（本批） | ✅ | `tests/unit` **2221 passed / 12 skipped / 3 failed**（+10：本轮新增 11 条，多出的那一条 failed 是 `test_create_deferred_persist` 在满载下的时序抖动，单独跑绿）；3 条仍是那三条 macOS-only |
-| 彩排（本机） | ✅ | `tmp/n58-rehearsal/rehearse.py`：dry-run 不写、apply 后 inode 不变、再跑报「没有可搬的条目」、`--rollback --apply` 原样退回 |
+| 彩排（本机） | ✅ | `deploy/scripts/acceptance/migrate_state_base_rehearsal.py`：dry-run 不写、apply 后 inode 不变、再跑报「没有可搬的条目」、`--rollback --apply` 原样退回 |
 | 彩排（集群，**只读**） | ✅ | 在控制面 pod 里跑 `--mode plan`：`moves=9 dirs=3 todo=14`，无冲突（见 Step 7） |
 
 **没做（本次到此为止）**：Task 0 Step 7 里需要停机的那一半（把 `308b543` + 本轮清单与迁移上线，然后量建箱 p50 与 `_snapshots` 记录数的前后）；Task 1–6 全部未开始。
@@ -120,7 +120,7 @@
   - `scan_uplift()` 逐条算出「`_migrate` 上浮」+「`_snapshots` 合一」。目标 id 目录不存在 ⇒ 整条 `rename`；存在（有记录没载荷的 id）⇒ 逐条搬里面的条目；**两边同名 ⇒ 具名拒绝**（`合并不是覆盖：… 两边同名（先人工决定留哪一份，再重跑）`）。
   - 搬空之后用 `rmdir` 拆壳（**不递归**），journal 里记 `rmdir <rel> <mode>`，回退按原权限位重建。
   - 判据放宽了一条：`<export>/workspaces` 除了「有标记/是空的」以外，还接受「兄弟层 `state/` 已是新布局」——否则合一之后再想看一眼会被误判成"一棵碰巧叫 workspaces 的树"。
-  - 彩排（本机 `--root`，`tmp/n58-rehearsal/rehearse.py`）+ 集群只读计划都跑过：见下。
+  - 彩排（本机 `--root`，`deploy/scripts/acceptance/migrate_state_base_rehearsal.py`）+ 集群只读计划都跑过：见下。
 - [ ] **Step 7: 集群验收** —— **只读的一半已做**，需要停机的一半待上线窗口（见下方"当前进度"）：
   - ✅ 集群身份自检（2 节点 / arm64 / `v1.36.4+k0s` / `sandlock` 9 pod）
   - ✅ `GET /sandboxes` = `[]`
