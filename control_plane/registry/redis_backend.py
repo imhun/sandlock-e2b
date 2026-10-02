@@ -212,12 +212,15 @@ class RedisQuotaStore:
 
         Why this exists (N59's operational half): the ledger had **no
         reconciliation path at all** and no TTL, so a leaked reservation stayed
-        until an operator deleted the Redis hash by hand -- and because
-        ``select_and_reserve`` gives up when the store refuses instead of trying
-        the next candidate, a few leaked slots jammed the whole fleet with
-        ``503``. The in-memory view already healed on registration
-        (``NodeRegistry.set_reserved``); this is the same healing for the half
-        that is shared across replicas.
+        until an operator deleted the Redis hash by hand -- and a few leaked
+        slots jammed the whole fleet with ``503``. That jam was the *amplifier*
+        N60 removed: today an unpinned ``select_and_reserve`` hands the
+        placement to the next candidate when this store refuses, while a
+        volume-**pinned** one still answers ``503`` by design. Either way a
+        drifted row over-reports a node's usage and can refuse work the node
+        could take, so the row still has to heal. The in-memory view already
+        healed on registration (``NodeRegistry.set_reserved``); this is the
+        same healing for the half that is shared across replicas.
 
         The deltas are returned signed (negative = lowered) so the caller can
         name what it corrected instead of silently rewriting a ledger. A

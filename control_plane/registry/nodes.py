@@ -817,15 +817,17 @@ class NodeRegistry:
         stays visible, and every candidate being refused is named as such.
         Only the winner is reserved in memory (and published), never a skipped
         candidate.
+
+        A ``volume_node_id`` turns that off: a pin is a **requirement**, not a
+        preference (the caller wants the node the snapshot or the non-shared
+        volume lives on, and ``migrate`` passes one for the same reason), so a
+        store refusal on the pinned node keeps today's ``503`` -- it is named
+        as a *pinned* refusal instead of quietly placing the sandbox off its
+        volume.
         """
         with self._lock:
-            candidates = [
-                n
-                for n in self._placeable_candidates_locked(exclude_node_id)
-                if n.can_fit(memory_mb, cpu_percent, disk_mb, processes)
-            ]
             ranked = rank_candidates(
-                candidates,
+                self._placeable_candidates_locked(exclude_node_id),
                 base_image=base_image,
                 volume_node_id=volume_node_id,
                 memory_mb=memory_mb,
@@ -833,7 +835,13 @@ class NodeRegistry:
                 disk_mb=disk_mb,
                 processes=processes,
             )
-            for index, node in enumerate(ranked):
+            #: Without a pin, every ranked candidate is a legitimate answer, so
+            #: they are tried in order. With one, the only acceptable answer is
+            #: the pinned node (or, when the pin cannot fit at all, the same
+            #: single best candidate this function always used): the loop has
+            #: one iteration and no hand-over.
+            trial = ranked if volume_node_id is None else ranked[:1]
+            for index, node in enumerate(trial):
                 if self._quota_store is not None:
                     ok = self._quota_store.reserve(
                         node.node_id,
@@ -851,17 +859,31 @@ class NodeRegistry:
                         },
                     )
                     if not ok:
-                        logger.warning(
-                            "quota store refused node %s for memory=%s cpu=%s "
-                            "disk=%s processes=%s; trying the next candidate "
-                            "(%s left)",
-                            node.node_id,
-                            memory_mb,
-                            cpu_percent,
-                            disk_mb,
-                            processes,
-                            len(ranked) - index - 1,
-                        )
+                        if volume_node_id is None:
+                            logger.warning(
+                                "quota store refused node %s for memory=%s "
+                                "cpu=%s disk=%s processes=%s; trying the next "
+                                "candidate (%s left)",
+                                node.node_id,
+                                memory_mb,
+                                cpu_percent,
+                                disk_mb,
+                                processes,
+                                len(ranked) - index - 1,
+                            )
+                        else:
+                            logger.warning(
+                                "quota store refused node %s for memory=%s "
+                                "cpu=%s disk=%s processes=%s; this placement "
+                                "is pinned to volume node %s, so no other "
+                                "candidate is tried and it answers 503",
+                                node.node_id,
+                                memory_mb,
+                                cpu_percent,
+                                disk_mb,
+                                processes,
+                                volume_node_id,
+                            )
                         continue
                 node.reserve(memory_mb, cpu_percent, disk_mb, processes)
                 self._persist_locked(node)
@@ -873,8 +895,10 @@ class NodeRegistry:
             # line(s) alone -- no "every candidate" line -- and this line only
             # ever follows the last skip. ``ranked`` being empty is the other
             # way in, and that is "nothing fits", not "everyone refused", so it
-            # stays silent.
-            if ranked:
+            # stays silent; a *pinned* refusal never gets here either, because
+            # the other candidates were deliberately not tried and the refusal
+            # above already said so.
+            if volume_node_id is None and ranked:
                 logger.warning(
                     "quota store refused every candidate for memory=%s cpu=%s "
                     "disk=%s processes=%s; this placement answers 503",
