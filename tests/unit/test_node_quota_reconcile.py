@@ -189,3 +189,120 @@ def test_a_deployment_without_a_shared_ledger_is_a_no_op(workspace) -> None:
     assert nodes.reconcile_quota_ledger(
         NODE, memory_mb=1, cpu_percent=1, disk_mb=1, processes=1
     ) == {}
+
+
+def test_a_store_failure_during_reconciliation_is_reported_not_raised(
+    workspace, monkeypatch, caplog
+) -> None:
+    """A ledger the control plane cannot reach must not fail the registration.
+
+    ``reconcile_quota_ledger`` runs inside the worker's ``register`` call. A
+    store that is down (or that kept losing its WATCH race) leaves the row at
+    its old value -- the over-counting, safe direction -- and the next
+    re-registration tries again; the caller answers 200 either way. Same
+    discipline as ``_reserved_from_store`` / ``_persist_locked``.
+    """
+    fakeredis = pytest.importorskip("fakeredis")
+    registry = _registry(workspace)
+    _one_sandbox(registry)
+    nodes = NodeRegistry(heartbeat_timeout=600.0, redis_client=fakeredis.FakeRedis())
+    _register(nodes)
+    nodes._quota_store.reserve(
+        NODE,
+        {"memory": 65536, "cpu": 6400, "disk": 65536, "processes": 4096},
+        _dims(registry.get(SANDBOX)),
+    )
+    before = nodes._quota_store.get(NODE)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("redis is down")
+
+    monkeypatch.setattr(nodes._quota_store, "reconcile", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        # Must not raise: the registration path continues.
+        _rebuild_node_reservations(_request(nodes, registry), nodes.get(NODE))
+
+    assert nodes._quota_store.get(NODE) == before  # left at its old value
+    assert any(
+        "could not be reconciled" in r.message and "redis is down" in r.message
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    ), [r.message for r in caplog.records]
+
+
+def test_a_store_refusal_names_the_node_it_gives_up_on(
+    workspace, caplog
+) -> None:
+    """N60's amplifier, made visible: the store refused and no other node is tried.
+
+    The placement *policy* is unchanged (retrying the next candidate is its own
+    decision, N60); what changes here is that the refusal is named, with the
+    node and the dimensions, so an operator can see "503 with capacity left on
+    the other node" instead of an unexplained no-capacity.
+    """
+    fakeredis = pytest.importorskip("fakeredis")
+    nodes = NodeRegistry(heartbeat_timeout=600.0, redis_client=fakeredis.FakeRedis())
+    _register(nodes)
+    dims = {"memory": 1024, "cpu": 100, "disk": 1024, "processes": 256}
+    # Fill this node's ledger to its own limit, so the store refuses.
+    limits = {"memory": 8192, "cpu": 800, "disk": 16384, "processes": 512}
+    while nodes._quota_store.reserve(NODE, limits, dims):
+        pass
+
+    with caplog.at_level(logging.WARNING):
+        picked = nodes.select_and_reserve(
+            base_image=None,
+            memory_mb=dims["memory"],
+            cpu_percent=dims["cpu"],
+            disk_mb=dims["disk"],
+            processes=dims["processes"],
+        )
+
+    assert picked is None
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "quota store refused node node_b" in message
+        and "no other candidate is tried" in message
+        and "N60" in message
+        for message in warnings
+    ), warnings
+
+
+def test_releasing_quota_for_a_missing_node_is_named_and_leaves_the_ledger(
+    workspace, caplog
+) -> None:
+    """N59's only release point may not skip silently.
+
+    ``release_quota`` used to no-op when this replica has no row for the node --
+    a slot that never comes back, in the exact direction N59 is about. The row
+    is still left alone on purpose (crediting a node we cannot see would be the
+    under-counting direction), but the skip is named.
+    """
+    fakeredis = pytest.importorskip("fakeredis")
+    nodes = NodeRegistry(heartbeat_timeout=600.0, redis_client=fakeredis.FakeRedis())
+    _register(nodes)
+    dims = {"memory": 1024, "cpu": 100, "disk": 1024, "processes": 256}
+    nodes._quota_store.reserve(
+        NODE,
+        {"memory": 8192, "cpu": 800, "disk": 16384, "processes": 512},
+        dims,
+    )
+    before = nodes._quota_store.get(NODE)
+    nodes._nodes.pop(NODE)  # this replica lost the row
+
+    with caplog.at_level(logging.WARNING):
+        nodes.release_quota(
+            NODE,
+            memory_mb=dims["memory"],
+            cpu_percent=dims["cpu"],
+            disk_mb=dims["disk"],
+            processes=dims["processes"],
+        )
+
+    assert nodes._quota_store.get(NODE) == before
+    assert any(
+        "found no node record" in r.message and NODE in r.message
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    ), [r.message for r in caplog.records]

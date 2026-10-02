@@ -580,12 +580,13 @@ def _rebuild_node_reservations(request: Request, record) -> None:
     applied quietly -- a downward one (the leak direction) is the one worth
     reading.
 
-    Named residual: a create placed against this node in the instant between
-    "it looked healthy" and this rebuild has a reservation but no record yet,
-    and this drops it (over-sell by that one sandbox's dims). The window needs a
-    node that re-registers exactly while a create is being placed on it, and the
-    alternative -- a ledger that drifts up forever and jams placement -- is the
-    failure this heals.
+    Named residual (wider than "a create in flight"): what this aggregate
+    *cannot* see is any reservation that has no record **this replica can read
+    at this moment** -- a create or a migration placed on the node whose record
+    write has not landed (or has not propagated to this view), and any record
+    an older replica is still holding in memory. Those are dropped by the set
+    (over-sell by that sandbox's dims), and the alternative -- a ledger that
+    drifts up forever and jams placement -- is the failure this heals.
     """
     dims = {"memory": 0, "cpu": 0, "disk": 0, "processes": 0}
     for sandbox in request.app.state.registry.list():

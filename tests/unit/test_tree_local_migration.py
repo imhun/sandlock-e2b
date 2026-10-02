@@ -444,6 +444,12 @@ async def test_migration_moves_the_tree_through_the_shared_store(
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["nodeID"] == NODE_B
+    # ...and the success path must NOT give the target's reservation back: the
+    # sandbox serves there now, so N59's single release point is the *failure*
+    # path only. (A release here would be the under-counting direction.)
+    record = app.state.registry.get(SANDBOX)
+    assert record.node_id == NODE_B
+    assert app.state.nodes.get(NODE_B).reserved_memory_mb == record.memory_mb
     # 内容真的落在目标节点的本地盘上，且与源一致。
     assert (layout["b"] / SANDBOX / "workspace" / "kept.txt").read_text() == "hello"
     # 源节点的树被放手（keep_files=False），不是"改个记录、树留在原地"。

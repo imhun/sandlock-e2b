@@ -512,15 +512,30 @@ class NodeRegistry:
         """
         if self._quota_store is None:
             return {}
-        return self._quota_store.reconcile(
-            node_id,
-            {
-                "memory": max(0, memory_mb),
-                "cpu": max(0, cpu_percent),
-                "disk": max(0, disk_mb),
-                "processes": max(0, processes),
-            },
-        )
+        try:
+            return self._quota_store.reconcile(
+                node_id,
+                {
+                    "memory": max(0, memory_mb),
+                    "cpu": max(0, cpu_percent),
+                    "disk": max(0, disk_mb),
+                    "processes": max(0, processes),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            # Registration must not fail over the ledger (this runs inside the
+            # worker's ``register`` call): a store that is down, or that kept
+            # losing its WATCH race, leaves the row at its old value -- the
+            # over-counting (safe) direction -- and the next re-registration
+            # tries again. Same discipline as ``_reserved_from_store`` and
+            # ``_persist_locked``.
+            logger.warning(
+                "node %s re-registered but the shared quota ledger could not be "
+                "reconciled to the records (left at its old value): %s",
+                node_id,
+                exc,
+            )
+            return {}
 
     def get(self, node_id: str) -> NodeRecord | None:
         self._sweep_health()
@@ -827,6 +842,24 @@ class NodeRegistry:
                         },
                     )
                     if not ok:
+                        # N60 (open): the store refused this candidate and the
+                        # function gives up instead of trying the next one, so
+                        # one node's full ledger fails the whole placement even
+                        # when another node can fit. The policy is not changed
+                        # here (retrying candidates is its own decision), but
+                        # the refusal is no longer silent: it names the node the
+                        # store refused and why the caller is about to answer
+                        # 503 with capacity left elsewhere.
+                        logger.warning(
+                            "quota store refused node %s for memory=%s cpu=%s "
+                            "disk=%s processes=%s; no other candidate is tried "
+                            "(N60), so this placement answers 503",
+                            node.node_id,
+                            memory_mb,
+                            cpu_percent,
+                            disk_mb,
+                            processes,
+                        )
                         return None
                 node.reserve(memory_mb, cpu_percent, disk_mb, processes)
                 self._persist_locked(node)
@@ -883,16 +916,34 @@ class NodeRegistry:
     ) -> None:
         with self._lock:
             record = self._nodes.get(node_id)
-            if record is not None:
-                if self._quota_store is not None:
-                    self._quota_store.release(
-                        node_id,
-                        {
-                            "memory": memory_mb,
-                            "cpu": cpu_percent,
-                            "disk": disk_mb,
-                            "processes": processes,
-                        },
-                    )
-                record.release(memory_mb, cpu_percent, disk_mb, processes)
-                self._persist_locked(record)
+            if record is None:
+                # Named, not silent: this is now N59's *only* release point, so
+                # a skip lands in the over-counting direction (a slot that
+                # never comes back). The shared row is deliberately left
+                # alone: without the node record this replica cannot know
+                # whether the ledger entries under it are this sandbox's or a
+                # live one's, and crediting a node we cannot see is the
+                # under-counting direction that over-sells.
+                logger.warning(
+                    "release_quota for node %s found no node record: "
+                    "memory=%s cpu=%s disk=%s processes=%s stay reserved "
+                    "(the shared ledger row is left alone)",
+                    node_id,
+                    memory_mb,
+                    cpu_percent,
+                    disk_mb,
+                    processes,
+                )
+                return
+            if self._quota_store is not None:
+                self._quota_store.release(
+                    node_id,
+                    {
+                        "memory": memory_mb,
+                        "cpu": cpu_percent,
+                        "disk": disk_mb,
+                        "processes": processes,
+                    },
+                )
+            record.release(memory_mb, cpu_percent, disk_mb, processes)
+            self._persist_locked(record)
