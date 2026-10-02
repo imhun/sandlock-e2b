@@ -2061,48 +2061,55 @@ env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python deploy/scripts
 env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python deploy/scripts/deployment_smoke.py
 ```
 
-| 冒烟 / 残留 | 结果 | 证据 |
-|---|---|---|
-| `MULTI-NODE`（`deploy/scripts/multinode_smoke.py`） | **❌ 失败** | 建第 4 个沙箱时 `503: No resources available`（它 `finally` 里 `assert` 预约归零也失败）。根因见下：worker-0 的配额台账虚高 ⇒ 调度选中它时 `_quota_store.reserve` 拒绝，而 `select_and_reserve` **不换下一个候选** |
-| `DEPLOYMENT`（`deploy/scripts/deployment_smoke.py`） | **❌ 失败** | 3 个沙箱建成功、`NODE DISTRIBUTION` 两个节点都在、命令/文件段过；死在**迁移**那一步：`migrate → 503 {"code":503,"message":"Node e2b-worker-0 has no capacity or is unavailable"}`（目标节点 quota 满） |
-| `MULTI-NODE`（**控制者清理后复跑**，`0.1.0-908`） | **✅ `MULTI-NODE SMOKE OK`** | 4 箱 2+2、commands / files / health / stdin 全过、kill 后两边预约 **0/0** |
-| `DEPLOYMENT`（**控制者清理后复跑**，`0.1.0-908`） | **✅ `DEPLOYMENT SMOKE OK`** | 命令+文件、**跨节点迁移保文件**、网络配置、远端卷+兄弟卷隔离、模板构建 → registry push → worker pull → rootfs、MCP 网关全过；kill 后两边预约 **0/0** |
-| `GET /sandboxes` | `[]` | 本轮实测 |
-| 舰队视图 `GET /internal/fleet/sandboxes` | `{}` | 本轮实测 |
-| 两节点树根 / 共享旧树根 | `e2b-worker-0` = 0 项、`e2b-worker-1` = 0 项、`<export>/workspaces` = 0 项 | 本轮实测 |
-| pod | 9 个全 Running（`e2b-worker` 2/2） | 本轮实测 |
-| `DRY_RUN=1 deploy/k8s-k0s/apply.sh \| kubectl diff -f -` | **0 行**（仓库规格 ≡ 线上） | 本轮实测 |
-| **节点配额台账（唯一的脏残留）** | worker-0：Redis `e2b:node:quota:e2b-worker-0` = memory **3072** / cpu 300 / disk 3072；同一刻 `/internal/nodes` 的 `reservedMemoryMB` = **1024**；而 `GET /sandboxes` = `[]`、fleet = `{}` ⇒ **两边都有虚高，且互相对不上**。worker-1 两边都是 0 | 本轮实测（Redis 只读） |
+**下表按发生顺序读，四段共用同一根时间轴**（"时刻"列是判据的一部分）：**A**（本任务自己的
+验收窗口，处置之前）→ **T1 红灯**（控制者发现现场时）→ **T2 清理** → **T3 绿灯**（复跑）。
+`GET /sandboxes` **不按状态过滤**，所以"列着 8 条"与"`[]`"不可能同时成立 —— 它们分别是
+T1 与 T3 的读数（A 的 `[]` 更早：那时那 8 条还不存在）。
 
-**这条脏残留是新 bug（登记 N59）**：`POST /sandboxes/<id>/migrate` 在
+| 时刻 | 冒烟 / 残留 | 结果 | 证据 |
+|---|---|---|---|
+| **A**（本任务验收窗口：local 17:45–18:05 = UTC 09:45–10:05；**处置之前**，那 8 条还不存在） | `GET /sandboxes`、两节点树根 | `[]`；两节点树根 + 共享旧树根都 0 项 | 本轮实测（§7.33.1 的收尾） |
+| **T1 红灯**（控制者读数时约 UTC `12:5xZ` ≈ 本地 `20:5x`；此时已有 8 条没人 kill 的沙箱） | `MULTI-NODE` | **❌ 失败** | 建第 4 个沙箱时 `503: No resources available`（它 `finally` 里 `assert` 预约归零也失败）。根因见下：worker-0 的配额台账虚高 ⇒ 调度选中它时 `_quota_store.reserve` 拒绝，而 `select_and_reserve` **不换下一个候选**（N60） |
+| T1 | `DEPLOYMENT` | **❌ 失败** | 3 个沙箱建成功、`NODE DISTRIBUTION` 两个节点都在、命令/文件段过；死在**迁移**那一步：`migrate → 503 {"code":503,"message":"Node e2b-worker-0 has no capacity or is unavailable"}`（目标节点 quota 满） |
+| T1 | `GET /sandboxes` | **列着 8 条**，全部 `state: running`、`endAt` = UTC `2026-10-02T11:48:39Z`（另四条 `11:50:39Z`）⇒ 过期约 **65 分钟** | 控制者现场读数（也是他删它们的那条口径；N61 的本体） |
+| T1 | 两节点树根 | 各自还留着落在该节点的**活树** | 控制者现场读数 |
+| T1 | 节点配额台账 | worker-0：Redis `e2b:node:quota:e2b-worker-0` = memory **3072** / cpu 300 / disk 3072，而同一刻 `/internal/nodes` 的 `reservedMemoryMB` = **1024** ⇒ **两个数互相对不上**（N59 要治的漂移）；worker-1 两边都是 0 | 控制者现场读数（Redis 只读） |
+| **T2 清理**（T1 之后立刻，控制者执行） | 三步 | ① 删 `e2b:node:quota:*`（27 个陈旧 pod 名键 + 2 个 worker 键）；② `DELETE /sandboxes/<id>` ×8；③ 重启两个 worker 让 `_rebuild_node_reservations` 重算视图 | 见下"控制者的清理与复验" |
+| **T3 绿灯**（同一次窗口内复跑，`0.1.0-908`） | `MULTI-NODE` | **✅ `MULTI-NODE SMOKE OK`** | 4 箱 2+2、commands / files / health / stdin 全过、kill 后两边预约 **0/0** |
+| T3 | `DEPLOYMENT` | **✅ `DEPLOYMENT SMOKE OK`** | 命令+文件、**跨节点迁移保文件**、网络配置、远端卷+兄弟卷隔离、模板构建 → registry push → worker pull → rootfs、MCP 网关全过；kill 后两边预约 **0/0** |
+| T3 | `GET /sandboxes` / 舰队视图 / 两节点树根 | `[]`；`{}`；`e2b-worker-0` = 0 项、`e2b-worker-1` = 0 项、`<export>/workspaces` = 0 项 | 复跑后的读数 |
+| T3（与时刻无关） | pod / `DRY_RUN=1 deploy/k8s-k0s/apply.sh \| kubectl diff -f -` | 9 个全 Running（`e2b-worker` 2/2）；**0 行**（仓库规格 ≡ 线上） | 本轮实测 |
+
+**T1 的这条脏残留是新 bug（登记 N59）**：`POST /sandboxes/<id>/migrate` 在
 `_stop_source_runtime` 之前就 `nodes.reserve_node(target)`，而"源节点不可达"拒绝走的是
 外层 `except Exception` 回滚 —— 那条回滚**只把记录指回源节点、重建源的运行时，从不
 `release_quota(target)`**。于是**每一次具名拒绝都泄漏目标节点的一份配额**。
 （路径与回滚是读代码直接确认的；份数是推演：Redis 上 worker-0 的 3072 = 上一次 905 验收的
 **2 次**拒绝（2 × 1024，记在 Redis、后被 `0.1.0-908` 的滚动从内存台账里抹掉）+
-**本轮复跑 down 腿的 1 次**（1024，两边都记上；证据是 down 腿跑完当场 `/internal/nodes`
+**时刻 A 里复跑 down 腿的 1 次**（1024，两边都记上；证据是 down 腿跑完当场 `/internal/nodes`
 就报 worker-0 = 1024，而它此前是 0）。这条泄漏还解释了为什么台账两边对不上：控制面
 **没有**按记录重建 Redis 台账的路径，而节点在**每次注册**时只按活记录重建**内存**那一半
 （`_rebuild_node_reservations`），Redis 那一半只增不减 —— **本轮已补**：注册时
 `reconcile_quota_ledger` 把 Redis 那一行也设成同一个数（见下面的代码修法②）。
-**本轮没有清理它** —— 清 Redis 是一次集群写，不在本任务的授权范围内；也**不要**为此放宽
-"有记录认领的树不回收"那条保护。
+**当时（T1）实现者没有清理它** —— 清 Redis 是一次集群写，不在实现任务的授权范围内；
+**控制者在 T2 用自己的窗口清了**（见下）。无论谁来清，都**不要**为此放宽"有记录认领的
+树不回收"那条保护。
 
-**控制者的清理与复验（2026-10-02，当场记下顺序）**：现场不止是台账虚高，而且
+**T2：控制者的清理与 T3 复验（2026-10-02，当场记下顺序）**：现场不止是台账虚高，而且
 `GET /sandboxes` 里确实有**八个没人 kill 的沙箱**（Task 3 验收窗口四个 + 一次被中断的冒烟
 循环四个）。清的动作是：① 删掉 `e2b:node:quota:*` 里 27 个陈旧 pod 名键与两个 worker 键；
 ② 用 `DELETE /sandboxes/<id>` 杀掉那 8 个孤儿（两个树根随即又空、`GET /sandboxes` = `[]`）；
 ③ 重启两个 worker，让注册时的 `_rebuild_node_reservations` 重算视图。之后
 **`MULTI-NODE` / `DEPLOYMENT` 两条冒烟在 `0.1.0-908` 全绿**（见上表的复跑行）。
 
-**为什么"几个孤儿沙箱"会变成"整支舰队不能建箱"**：放大器是
+**T1 的红灯为什么"几个孤儿沙箱"会变成"整支舰队不能建箱"**：放大器是
 `select_and_reserve` 在配额台账拒绝时**不换下一个候选**、直接 `return None` ⇒ 只要调度
 挑中的那个节点满，建箱就是 `503`，哪怕另一台还有空位。这一条**本轮不改**（调度行为要
 自己的裁定与验收），登记为 **N60** —— 那一行同时记着它的代价、评审的反方论证（在候选集
 耗尽前重试严格更好，跳过时打具名 WARNING 就不会丢可见性）与提议的修法。本轮只做"不改放置
 的可见性"：被拒的节点现在会打一条具名 WARNING（含四个维度与"没有试别的候选"）。
 
-**这 8 条记录为什么一直没被自愈收走 —— 观测，不是机制**（登记 **N61**，本轮只更正记录）：
+**T1 的这 8 条记录为什么一直没被自愈收走 —— 观测，不是机制**（登记 **N61**，本轮只更正记录）：
 控制者清掉的记录当时是 **`state: running`**、`endAt` = UTC `2026-10-02T11:48:39Z`
 （另四条 `11:50:39Z`），读它们时墙钟约 `12:5xZ` ⇒ **过期约 65 分钟**；两节点树根上还有
 活树。而 TTL 扫描**无条件启动**、间隔 **1 s**（`app.py:347`），`_ttl_reapable` 只对
