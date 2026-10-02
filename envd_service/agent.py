@@ -1229,7 +1229,31 @@ def _park_refused_tree(
         # pass`` around it was a silent no-op that left one seed file per parked
         # sandbox on the node's disk for ever. There is nothing here to keep:
         # the marker and the seed are per-this-node live state, not evidence.
-        shutil.rmtree(_node_runtime_dir(settings, sandbox_id), ignore_errors=True)
+        #
+        # Guard, and it is load-bearing: with **no** node-local base named,
+        # ``_node_runtime_dir`` *is* ``runtime_dir`` -- the directory whose
+        # contents the loop above just preserved as evidence. An unconditional
+        # ``rmtree`` there would throw away exactly what park keeps whenever the
+        # entry-by-entry move failed (the EXDEV case this function's own comment
+        # names, a hostile entry, a full disk): the leftovers *are* the record.
+        # So this half only ever runs on a directory of its own -- the same
+        # "unset = today's shape" rule every other helper here follows.
+        node_runtime = _node_runtime_dir(settings, sandbox_id)
+        if node_runtime != runtime_dir and node_runtime.is_dir():
+            # ``onerror`` rather than ``ignore_errors=True`` (fix round 1,
+            # review nit): ``ignore_errors`` cannot report, and a removal that
+            # silently did nothing is precisely the shape that made this site a
+            # bug. Every other best-effort step in this function logs a warning;
+            # so does this one.
+            def _warn_unremoved(_func, path, exc_info) -> None:
+                logger.warning(
+                    "park: %s: could not remove its node-local %s",
+                    sandbox_id,
+                    path,
+                    exc_info=exc_info,
+                )
+
+            shutil.rmtree(node_runtime, onerror=_warn_unremoved)
         # The checkpoint images are evidence of the same kind and live in their
         # own store (``_runtime/.checkpoints/<id>`` -- the sandbox's slot is what
         # writes them, so they cannot sit under the worker-owned runtime dir).

@@ -1682,16 +1682,20 @@ kubectl -n sandlock exec -i "$CP" -c control-plane -- \
     sh -c 'ls -la /var/lib/e2b-sandboxes/state/_runtime | head'
 ```
 
-**期望**：① `prepare` p50 从 **72–76 ms 掉到 ~10 ms**（剩下的是一次 mkdir + 两个小写 +
-Python 开销，全在节点盘上）；② 整条建箱的 p50 由 `max(materialize, prepare)` 决定，所以
-这一条**只有和 Task 3（树本地化）一起上线**才看得出来 —— 单上本节，长杆就是 `materialize`。
+**期望**：① `prepare` 这一跳的 p50 落到 **~10 ms** 量级（剩下的是一次 mkdir + 两个小写 +
+Python 开销，全在节点盘上）—— ①**不**与 72–76 ms 对比，那是**别的形状**的历史读数（见上面那段
+caveat：① 走回落 `acquire`，Task 1 的 72–76 ms 走已部署 `claim`）；**"掉了多少"看 ② 的 trace
+`prepare`**（同形状，before = 72–76 ms）。② 整条建箱的 p50 由 `max(materialize, prepare)` 决定，
+所以这一条**只有和 Task 3（树本地化）一起上线**才看得出来 —— 单上本节，长杆就是 `materialize`。
 ③ 的形状：节点本地只出现 `_runtime/<id>/.creating`、`disk-stats`、`.route-b`、
 `.uid_pool.lock`、`.uid_reservations`；共享 `<export>/state/_runtime` 里**没有** `.creating`、
 没有 `disk-stats`，只有 `sandbox.json` / `command-logs.jsonl` / `.checkpoints`。
 
-**本地可先量的机制读数**（不用集群，`deploy/scripts/acceptance/node_state_split_local_probe.py`）：
-一次 `prepare` 落在共享 base 上的路径操作 **writes 14 → 0**，只读的两次（`_runtime` 列举 +
-邻居记录）留着 —— 那就是舰队账本的索引。
+**本地可先量的机制读数**（不用集群，`deploy/scripts/acceptance/node_state_split_local_probe.py`，
+量的是**回落形状**——它的 payload 不带 `hostUID`，所以 `14` 里含 `pool.acquire` 的锁与预留标记；
+已部署形状只写标记 + 种子）：一次 `prepare` 落在共享 base 上的路径操作 **writes 14 → 0**，
+只读的两次（`_runtime` 列举 + 邻居记录）留着 —— 那就是舰队账本的索引。这是**机制**读数
+（"共享 base 上的每一笔写都搬走了"），不是延迟读数，也不是"掉了多少"的分子。
 
 **回退**：把 `E2B_NODE_STATE_BASE` 从两份 k8s 清单里去掉（或把 worker/agent 的镜像退回），
 `prepare` 立刻回到共享 base 的写法；已经写在节点本地盘上的那几样是**可再生的残渣**

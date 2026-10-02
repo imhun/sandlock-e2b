@@ -26,6 +26,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from envd_service import agent as agent_module
 from envd_service import uid_pool
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
@@ -366,3 +367,103 @@ async def test_the_park_path_drops_the_node_local_chips_too(tmp_path: Path) -> N
     assert _shared_dir(settings).exists() is False
     # The tree is *kept* -- park moves it, never deletes it.
     assert (Path(settings.workspace_base) / "_untrusted.trees" / SANDBOX).is_dir()
+
+
+@pytest.mark.asyncio
+async def test_a_park_never_eats_the_evidence_in_the_one_base_shape(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No node-local base named ⇒ the two directories are the same one.
+
+    park keeps a refused tree's platform files as **evidence**: it moves them
+    into ``_untrusted.trees/<id>/`` entry by entry, and when a move fails the
+    leftover is exactly what an operator needs -- the record. (The function's
+    own comment names the EXDEV case: a deployment that gives the state base a
+    mount of its own.) The node-local cleanup Task 4 added must therefore only
+    ever run on a directory of *its own*: with the base unnamed it is the same
+    path, and an unconditional ``rmtree`` there destroys the evidence the loop
+    just declined to move. Same "unset = today's shape" rule as every other
+    helper in ``gateway_common.paths``.
+
+    The move is made to fail the way the deployment would: ``os.replace`` of a
+    state-base entry raises EXDEV.
+    """
+    workspace_base = tmp_path / "workspaces"
+    state_base = tmp_path / "export" / "state"
+    settings = EnvdSettings(
+        executor="local",
+        workspace_base=workspace_base,
+        state_base=state_base,
+        node_state_base=None,
+        shared_volume_root=None,
+        internal_api_key=KEY,
+    )
+    registry = RuntimeRegistry(workspace_base, state_base=state_base)
+    app = create_envd_app(
+        settings=settings, runtime_registry=registry, workspace_base=workspace_base
+    )
+    (workspace_base / SANDBOX / "workspace").mkdir(parents=True)
+    # ...and a record that contradicts it by pointing at another tree that
+    # really exists -- the W7 shape, and what makes this tree a refused one.
+    (workspace_base / "sbx_other" / "workspace").mkdir(parents=True)
+    record_dir = state_base / "_runtime" / SANDBOX
+    record_dir.mkdir(parents=True)
+    record = record_dir / "sandbox.json"
+    record_body = json.dumps(
+        {
+            "sandbox_id": SANDBOX,
+            "access_token": "tok",
+            "workspace_dir": str(workspace_base / "sbx_other"),
+        }
+    )
+    record.write_text(record_body, encoding="utf-8")
+
+    real_replace = agent_module.os.replace
+
+    def exdev_for_the_state_base(source, destination, *args, **kwargs):
+        if str(source).startswith(str(state_base)):
+            raise OSError(18, "Cross-device link", str(source))
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(agent_module.os, "replace", exdev_for_the_state_base)
+
+    assert (await _park(app)).status_code == 200
+
+    # The tree moved, the record did not -- and it is still there to be read.
+    assert (
+        workspace_base / "_untrusted.trees" / SANDBOX
+    ).is_dir()
+    assert record.read_text(encoding="utf-8") == record_body
+
+
+@pytest.mark.asyncio
+async def test_a_failed_node_local_cleanup_is_named_not_swallowed(
+    tmp_path: Path, caplog
+) -> None:
+    """The cleanup must not be able to go quiet again (review nit, round 1).
+
+    The bug this round fixed *was* a silent no-op, so the replacement may not
+    hide its own failure behind ``ignore_errors=True``: every other best-effort
+    step in the park path logs a warning, and so does this one. The failure is
+    injected the way a real one happens -- the node-local directory's parent is
+    read-only, so the final ``rmdir`` is ``EACCES`` -- rather than by mocking
+    ``shutil``.
+    """
+    app, settings, _registry = _worker(tmp_path)
+    (Path(settings.workspace_base) / SANDBOX / "workspace").mkdir(parents=True)
+    node_dir = _node_dir(settings)
+    node_dir.mkdir(parents=True)
+    (node_dir / "disk-stats").write_text("1024 0\n", encoding="utf-8")
+    parent = node_dir.parent
+    parent.chmod(0o500)
+    try:
+        assert (await _park(app)).status_code == 200
+    finally:
+        parent.chmod(0o755)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert [
+        message
+        for message in messages
+        if "could not remove its node-local" in message
+    ] != []
