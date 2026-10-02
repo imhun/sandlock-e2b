@@ -212,13 +212,16 @@ STATE_BASE_ENV = "E2B_STATE_BASE"
 
 #: Environment variable naming the **node-local** base the platform's
 #: short-lived, same-node files live under -- the create's ``.creating``
-#: marker, the ``statfs(2)`` accounting seed, ``.route-b``'s slot documents
-#: and the uid pool's lock and reservation markers (N57 / Task 4).
+#: marker, the ``statfs(2)`` accounting seed and ``.route-b``'s slot documents.
+#: (The uid pool's own lock and reservation markers were a fourth until N57
+#: moved them back to the shared state base: ``acquire``'s critical section has
+#: to be mutually exclusive across nodes, and ``claim`` -- the control plane's
+#: allocation, the common path -- neither writes nor locks them.)
 #:
 #: Why it is a *third* base rather than a second flavour of
 #: ``E2B_STATE_BASE``: the record (``_runtime/<id>/sandbox.json``) and the
 #: checkpoint store are read by **other nodes** -- every worker's uid ledger
-#: enumerates the records -- while those four chips are read by this node's
+#: enumerates the records -- while those three chips are read by this node's
 #: own worker and slot processes only. On this deployment the shared base is
 #: NFS, where one metadata round trip measures ~13 ms, and the create's
 #: ``prepare`` phase paid it for each chip. Unset means "those files live
@@ -337,9 +340,11 @@ def resolve_node_state_base(
 
     Deliberately not folded into :func:`resolve_state_base`: the two answer
     questions with different readers. The record and the checkpoint store under
-    the state base are read across nodes (the fleet-wide uid ledger), while the
-    marker, the accounting seed and the pool's own lock and markers are read by
-    this node only -- see :data:`NODE_STATE_BASE_ENV`.
+    the state base are read across nodes (the fleet-wide uid ledger); the create
+    marker and the accounting seed under the node state base are read by this
+    node only; and the uid pool's own lock and reservation markers stay on the
+    **shared** state base, because ``acquire``'s critical section has to be
+    mutually exclusive across nodes (N57) -- see :data:`NODE_STATE_BASE_ENV`.
     """
     if node_state_base:
         return Path(node_state_base)

@@ -14,7 +14,8 @@ The split has two halves that must not be confused, and each has a test here:
    *fallback* allocator (``UidPool.acquire``, the path a payload without
    ``hostUID`` takes), so a fence only this node waits on lets two nodes pick
    the same uid -- while the common path (``UidPool.claim``, the control
-   plane's allocation) touches neither file and pays nothing for their return;
+   plane's allocation) neither writes nor locks either file (its ``commit``
+   still ``stat``s one marker path, the check that makes it a no-op);
 2. the **record** (``_runtime/<id>/sandbox.json``) and the checkpoint store
    stay on the shared base, because the fleet-wide uid ledger enumerates them
    -- which is the third test, and the reason the ledger's index changes from
@@ -118,8 +119,9 @@ def test_the_uid_pools_own_files_live_on_the_shared_base(tmp_path: Path) -> None
     from the shared records and then picks the lowest free uid, so the
     picked-uids set has to be shared too. The pending ruling is that on the
     common path (``claim``, the control plane's allocation) neither file is
-    touched, so putting them back on the shared export costs ``prepare``
-    nothing.
+    written or locked -- there is one ``stat`` left in ``commit``, the check
+    that makes a claimed uid's ``commit`` a no-op -- so putting them back on
+    the shared export costs ``prepare`` nothing.
 
     What stays node-local is the other half of the split: the ``.creating``
     marker and the ``disk-stats`` seed (the next test), and what stays shared

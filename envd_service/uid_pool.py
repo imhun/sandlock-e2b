@@ -79,6 +79,25 @@ logger = logging.getLogger(__name__)
 #: reserved uid as decimal text.
 _RESERVATION_DIR = ".uid_reservations"
 
+#: How long a reservation marker may sit before a node's startup reconcile
+#: reclaims it (N57 review). The markers live on the **shared** state base, so
+#: "this node just started" is not a fleet-wide statement: another node can be
+#: inside its ``acquire`` -> ``register`` window right now -- marker written,
+#: record not yet durable, a window the module docstring calls long because
+#: volume provisioning and a recursive chown sit inside it. Reconcile
+#: therefore collects only markers *older* than this grace; the price is that
+#: a create that really crashed keeps its uid reserved until the next
+#: reconcile after the grace elapses, and the window that remains is "a create
+#: in flight longer than the grace while this node restarts".
+RESERVATION_RECLAIM_GRACE_S = 900.0
+
+#: Message of the WARNING that makes the deferral visible (N57 review): the
+#: markers kept because they are younger than the grace, and the threshold.
+RESERVATION_DEFERRAL_WARNING = (
+    "kept %d reservation marker(s) younger than %.1fs: another node's "
+    "create may be in flight (N57)"
+)
+
 #: Mode of a sandbox-owned directory (workspace root / volume slice):
 #: ``0770 owner=<sandbox uid> group=<worker gid>`` (fix round 1 / c1; the
 #: long-form rationale lives on :func:`apply_sandbox_ownership`). Re-exported
@@ -456,9 +475,11 @@ class UidPool:
         # write the reservation -- decides over objects every node can see
         # (volume slices, ``_snapshots`` payloads, image-cache secrets), so a
         # fence only this node waits on hands the same uid to two nodes. The
-        # hot path is unaffected: ``claim`` (the control plane's allocation,
-        # OBS-9) touches neither file, so nothing pays the shared export for
-        # their return here.
+        # common path is all but untouched: ``claim`` (the control plane's
+        # allocation, OBS-9) neither writes nor locks either file -- only
+        # ``commit``'s marker-existence check still asks the shared base about
+        # one path (a single ``stat``; it is what keeps ``commit`` a no-op on
+        # this path without reading the record).
         self._allocated: set[int] = set()
         self._by_sandbox: dict[str, int] = {}
         self._lock = threading.Lock()
@@ -523,14 +544,27 @@ class UidPool:
             pass
 
     def _clear_reservations(self) -> None:
-        """Drop every reservation marker (startup reconcile only).
+        """Drop the *stale* reservation markers (startup reconcile only).
 
-        At a clean startup no create is in flight, so every marker is either a
-        stale duplicate of a durable record (harmless) or the leftover of a
-        create that crashed between ``acquire`` and ``register`` — the same
-        class of orphan the reconcile scan reclaims. Reconcile is a
-        startup-only scan; the multi-worker concurrent-startup caveat is the
-        documented one for orphan reclaim (report §5 / Concerns §3).
+        The markers are shared state (N57), so a clean startup is not a
+        fleet-wide statement: a peer can be inside its ``acquire`` ->
+        ``register`` window at this very moment -- marker written, record not
+        yet durable -- and unlinking that marker would free a uid the peer has
+        already handed out. So this collects only markers older than
+        :data:`RESERVATION_RECLAIM_GRACE_S`; younger ones are kept, and the
+        count of them is said out loud in a WARNING so the deferral is visible
+        rather than silent. The residual window is "a create in flight for
+        longer than the grace while this node restarts" -- written down here
+        because it is the price of not being able to tell a peer's live create
+        from a crashed one any other way.
+
+        The crash case the sweep exists for is unchanged: a create that died
+        between ``acquire`` and ``register`` leaves a marker nobody refreshes,
+        it ages past the grace, and the next reconcile reclaims the uid.
+
+        The criterion is ``mtime``, never content: markers stay ``<uid>\\n``
+        (no format change), so a marker written by an older worker is judged
+        exactly like a fresh one.
         """
         marker_dir = self._state_base / _RESERVATION_DIR
         if not marker_dir.is_dir():
@@ -539,12 +573,22 @@ class UidPool:
             entries = list(marker_dir.iterdir())
         except OSError:
             return
+        now = time.time()
+        kept = 0
         for entry in entries:
             try:
-                if entry.is_file():
-                    entry.unlink()
+                if not entry.is_file():
+                    continue
+                if now - entry.stat().st_mtime <= RESERVATION_RECLAIM_GRACE_S:
+                    kept += 1
+                    continue
+                entry.unlink()
             except OSError:
                 continue
+        if kept:
+            logger.warning(
+                RESERVATION_DEFERRAL_WARNING, kept, RESERVATION_RECLAIM_GRACE_S
+            )
 
     def _reserved_uids(self) -> set[int]:
         """Pool-range uids held by reservation markers (cross-process)."""

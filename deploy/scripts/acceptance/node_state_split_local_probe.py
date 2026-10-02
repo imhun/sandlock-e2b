@@ -24,8 +24,11 @@ uid 池打开；``pool-own-file writes`` 只数 ``.uid_pool.lock`` 与 ``.uid_re
   ``.uid_reservations/``（mkdir + 写 + rename），共 **4 笔写**。这是裁定接受的代价，
   而且**只在回落形状**上付：payload 里没有 ``hostUID``（老控制面、老记录、别的调用
   方）时走 ``UidPool.acquire``，它"读共享记录索引 → 挑空闲 uid → 写预约标记"的临界
-  区必须跨节点互斥，锁与标记就是那个串行点。**出厂常态走 ``claim``（第三档）：两个
-  文件一次都不碰，``pool-own writes=0``**。
+  区必须跨节点互斥，锁与标记就是那个串行点。**出厂常态走 ``claim``（第三档）：既不
+  写也不锁这两个文件，``pool-own writes=0``**；唯一剩下的一次共享 base 访问是
+  ``commit`` 里那次标记存在性 ``stat``（本探针只统计 ``open``/``read``/``listdir``
+  这类事件，**不含 ``os.stat``**，所以 ``reads=0`` 是"没有 open/read 级访问"的口径，
+  不是"没有任何磁盘询问"）。
 * **reads** 是**故意留着的**：回落档的 2 笔是 ``<state>/_runtime`` 的列举 + 那条邻居
   记录 —— 舰队级 uid 账本的索引（``uid_pool._recorded_uids``，Review Focus 3），它
   必须共享而且是只读的；``claim`` 档连这个索引都不用读（控制面已经点好 uid），所以

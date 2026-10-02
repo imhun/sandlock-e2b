@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -257,14 +259,55 @@ def test_two_nodes_with_distinct_node_state_base_do_not_share_a_uid(tmp_path):
     assert (uid_a, uid_b) == (POOL_START, POOL_START + 1)
 
 
+def test_two_nodes_with_distinct_node_state_base_do_not_collide_concurrently(
+    tmp_path,
+):
+    """N57 review: the cross-node fence holds when the two nodes *race*.
+
+    The sequential nails above are satisfiable by a broken shape: markers on
+    the shared base but the ``flock`` back on the node-local one -- each node
+    serializes its own processes, both read the same free set, and whichever
+    writes its marker second wins the same uid. Racing the two pools through a
+    ``Barrier`` is what makes that shape fail: the shared lock is the thing
+    that has to serialize them, not the shared marker alone.
+    """
+    pool_a = _node_pool(
+        tmp_path / "workspaces", tmp_path / "state", tmp_path / "node-0-state"
+    )
+    pool_b = _node_pool(
+        tmp_path / "workspaces", tmp_path / "state", tmp_path / "node-1-state"
+    )
+    barrier = threading.Barrier(2)
+    uids: list[int] = []
+    errors: list[BaseException] = []
+
+    def worker(pool: UidPool, sandbox_id: str) -> None:
+        try:
+            barrier.wait(timeout=10)
+            uids.append(pool.acquire(sandbox_id))
+        except BaseException as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    ta = threading.Thread(target=worker, args=(pool_a, "sbx_a"))
+    tb = threading.Thread(target=worker, args=(pool_b, "sbx_b"))
+    ta.start()
+    tb.start()
+    ta.join(20)
+    tb.join(20)
+    assert not ta.is_alive() and not tb.is_alive()
+    assert errors == []
+    assert sorted(uids) == [POOL_START, POOL_START + 1]
+
+
 def test_the_pool_lock_and_markers_live_on_the_shared_state_base(tmp_path):
     """N57: the pool's own files are platform state, not node-local chips.
 
     The lock and the markers *are* the cross-node serialization of the
     fallback allocator, so they belong on the base every node shares. What
-    makes that free is the hot path: ``claim`` (the control plane's
-    allocation, OBS-9) touches neither file, so ``prepare`` pays nothing for
-    their return to the shared export.
+    keeps that cheap is the common path: ``claim`` (the control plane's
+    allocation, OBS-9) neither writes nor locks either file -- only ``commit``
+    still ``stat``s one marker path there, which is the check that lets a
+    claimed uid's ``commit`` do nothing without reading the record.
     """
     state_base = tmp_path / "state"
     node_state_base = tmp_path / "node-state"
@@ -439,15 +482,81 @@ def test_reconcile_then_delete_releases_preexisting_uid(tmp_path):
 
 def test_reconcile_clears_stale_reservation_markers(tmp_path):
     """A create that crashed between acquire and register leaves only a
-    reservation marker (no record): startup reconcile must free the uid."""
+    reservation marker (no record): startup reconcile must free the uid.
+
+    "Crashed" is a statement about *age* now, not about being present at
+    startup (N57 review): the markers are shared, so a marker written seconds
+    ago may be a peer's live create and is left alone. This test ages the real
+    ``acquire`` marker past the grace -- the local crash path end to end;
+    ``test_a_stale_reservation_marker_is_reclaimed`` covers the boundary for a
+    hand-written peer marker, and the fresh one is the third case.
+    """
     pool = _pool(tmp_path)
     assert pool.acquire("sbx_crashed") == POOL_START
     # Crash: no record is ever written, marker survives the process.
     marker_dir = tmp_path / ".uid_reservations"
     assert (marker_dir / "sbx_crashed").is_file()
+    stale = time.time() - uid_pool.RESERVATION_RECLAIM_GRACE_S - 60.0
+    os.utime(marker_dir / "sbx_crashed", (stale, stale))
     result = pool.reconcile()
     assert result["referenced"] == []
     assert not (marker_dir / "sbx_crashed").exists()
+    assert pool.acquire("sbx_new") == POOL_START
+
+
+def test_a_fresh_reservation_marker_from_another_node_is_not_cleared(
+    tmp_path, caplog
+):
+    """N57 review: reconcile must not reclaim a peer's in-flight reservation.
+
+    The markers are shared, so "this node just started" is not a fleet-wide
+    statement: node B can be inside its ``acquire`` -> ``register`` window --
+    marker written, record not yet durable, a window the module docstring
+    calls long because volume provisioning and a recursive chown sit inside it
+    -- while node A restarts. A reconcile that unlinks that marker hands B's
+    uid to the next ``acquire`` on either node, which is exactly the collision
+    N57 exists to prevent. The marker's mtime is the only criterion: content
+    stays ``<uid>\\n``, so markers written by older workers are judged too.
+    """
+    pool = _pool(tmp_path)
+    marker = tmp_path / ".uid_reservations" / "sbx_other_node"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{POOL_START}\n", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="envd_service.uid_pool"):
+        pool.reconcile()
+
+    assert marker.read_text(encoding="utf-8") == f"{POOL_START}\n"
+    # ...and the uid it holds is still out of every node's reach.
+    assert pool.acquire("sbx_a") == POOL_START + 1
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ] == [
+        "kept 1 reservation marker(s) younger than 900.0s: another node's "
+        "create may be in flight (N57)"
+    ]
+
+
+def test_a_stale_reservation_marker_is_reclaimed(tmp_path):
+    """The other half of the grace: a crashed create's marker still ages out.
+
+    A marker older than the grace cannot belong to a live create (the window
+    it protects is seconds long, not minutes), so reconcile reclaims it and
+    the uid becomes allocatable again -- the behaviour the sweep existed for.
+    Without this half, "never clear anything" would look like the fix.
+    """
+    pool = _pool(tmp_path)
+    marker = tmp_path / ".uid_reservations" / "sbx_crashed"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{POOL_START}\n", encoding="utf-8")
+    stale = time.time() - uid_pool.RESERVATION_RECLAIM_GRACE_S - 60.0
+    os.utime(marker, (stale, stale))
+
+    pool.reconcile()
+
+    assert marker.exists() is False
     assert pool.acquire("sbx_new") == POOL_START
 
 
