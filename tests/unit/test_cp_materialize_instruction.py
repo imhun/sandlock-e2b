@@ -21,8 +21,10 @@ Two things this file is really about:
 
 from __future__ import annotations
 
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Mapping
 
 import httpx
 import pytest
@@ -122,7 +124,12 @@ class _Cp:
         # root), not under the tree root. In this fixture the two are different
         # directories -- the shape N27/N58 actually run -- so a derivation that
         # still reads the tree root cannot pass by accident.
-        return self.shared_root / "_snapshots" / snapshot_id / "fs"
+        #
+        # Task 2: the payload is one ``fs.tar``. The reader keeps accepting the
+        # legacy ``fs/`` directory (``c3_agent.materialize`` falls back to it
+        # when the tar is absent), but the derivation names the shape the
+        # writer emits.
+        return self.shared_root / "_snapshots" / snapshot_id / "fs.tar"
 
     def slice_path(self) -> Path:
         return Path(self.volume.path) / SANDBOX
@@ -379,6 +386,96 @@ async def test_a_snapshot_create_carries_copy_from(workspace: Path) -> None:
     assert not str(client.calls[1]["tree"]["copy_from"]).startswith(
         str(shape.workspace_base)
     )
+
+
+class _RecordingRunner:
+    """The agent's ``e2b-maint`` seam: record the verb instead of exec'ing it."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def run(self, argv: list[str], *, env: Mapping[str, str]) -> str:
+        self.calls.append(list(argv))
+        return ""
+
+
+@pytest.mark.asyncio
+async def test_the_derivation_and_the_agent_unpack_agree(workspace: Path) -> None:
+    """End to end across the two halves: the derived path really lands the tree.
+
+    The control plane *derives* ``copy_from`` and a different module (in a
+    different image) *reads* it. On 2026-10-02 a drift between exactly those two
+    halves answered ``502 partial-copy: … is not a directory`` for 25 minutes and
+    no unit lane saw it, because each half was only ever checked against its own
+    fixture. Here the real ``C3AgentClient`` posts to the real agent app over an
+    ASGI transport, so one tar at the store has to survive: derivation ->
+    client -> agent -> unpack -> tree.
+    """
+    from c3_agent.app import create_app as create_agent_app
+    from c3_agent.config import Settings as AgentSettings
+
+    shape = _Cp(workspace)
+    # The payload in the shape the writer emits: one ``fs.tar`` holding the tree
+    # root (``workspace/kept.txt``), beside the path the derivation names.
+    stage = workspace / "stage"
+    (stage / "workspace").mkdir(parents=True)
+    (stage / "workspace" / "kept.txt").write_text("kept\n", encoding="utf-8")
+    payload_dir = shape.shared_root / "_snapshots" / SNAPSHOT
+    payload_dir.mkdir(parents=True)
+    with tarfile.open(payload_dir / "fs.tar", "w") as tar:
+        tar.add(stage / "workspace", arcname="workspace", recursive=True)
+
+    runner = _RecordingRunner()
+    agent_app = create_agent_app(
+        settings=AgentSettings(
+            token=AGENT_TOKEN,
+            node_id=HOST,
+            workspace_base=str(shape.workspace_base),
+            state_base=str(shape.state_base),
+            shared_volume_root=str(shape.shared_root),
+            image_cache_dir=str(shape.image_cache),
+            uid_pool_start=UID_X,
+            uid_pool_size=1000,
+            maint_path="/usr/lib/e2b-priv/e2b-maint",
+        ),
+        maint_runner=runner,
+        inventory=None,
+    )
+    client = C3AgentClient(
+        resolver=StaticAgentAddressResolver(
+            {
+                WORKER: AgentTarget(
+                    node_identity=HOST, url=AGENT_URL, maint_url=AGENT_MAINT_URL
+                )
+            }
+        ),
+        token=AGENT_TOKEN,
+        timeout_s=10.0,
+        transport=httpx.ASGITransport(app=agent_app),
+    )
+    app = _app(shape, client=client)
+    await _register_node(app)
+
+    assert await _instruct_directly(
+        app, shape, snapshot=SimpleNamespace(snapshot_id=SNAPSHOT)
+    ) is True
+
+    tree = shape.tree_path()
+    assert (tree / "workspace" / "kept.txt").read_text(encoding="utf-8") == "kept\n"
+    assert (tree / "workspace" / "workspace").exists() is False
+    assert runner.calls == [
+        [
+            "/usr/lib/e2b-priv/e2b-maint",
+            "chown",
+            "--uid",
+            str(UID_X),
+            "--gid",
+            str(WORKER_GID),
+            "--recursive",
+            "--path",
+            str(tree),
+        ]
+    ]
 
 
 @pytest.mark.asyncio

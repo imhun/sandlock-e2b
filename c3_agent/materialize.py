@@ -41,6 +41,17 @@ from c3_agent.fileops import (
     MaintRunner,
     run_file_op,
 )
+from gateway_common.archive import (
+    ArchiveRefusal,
+    extract_sandbox_archive,
+)
+from gateway_common.archive import (
+    DESTINATION_IS_A_SYMLINK as ARCHIVE_DESTINATION_IS_A_SYMLINK,
+)
+from gateway_common.paths import (
+    SNAPSHOT_PAYLOAD_DIR_NAME,
+    SNAPSHOT_PAYLOAD_TAR_NAME,
+)
 
 #: The refusal reasons callers branch on. Spelling them once keeps the agent's
 #: HTTP mapping and the tests' expectations from drifting apart.
@@ -49,6 +60,15 @@ DESTINATION_IS_A_SYMLINK = "destination-is-a-symlink"
 PARTIAL_COPY = "partial-copy"
 ALREADY_EXISTS_AS_A_FILE = "already-exists-as-a-file"
 BAD_PLAN = "bad-plan"
+
+#: One archive refusal has a name of its own on this side too: a clean member
+#: name that lands outside the tree means the **destination** holds a link, and
+#: the caller has to be able to see that. Everything else the shared extractor
+#: refuses is "the payload is not what it claims", which is a step that ran and
+#: failed (502), never a bad plan.
+_ARCHIVE_REFUSALS = {
+    ARCHIVE_DESTINATION_IS_A_SYMLINK: DESTINATION_IS_A_SYMLINK,
+}
 
 
 class MaterializeRefusal(Exception):
@@ -182,18 +202,7 @@ def materialize_tree(
             os.close(fd)
     if copy_from is not None:
         source = resolve_inside(str(copy_from), roots=roots)
-        if not source.is_dir():
-            raise MaterializeRefusal(
-                PARTIAL_COPY, f"the snapshot source {source} is not a directory"
-            )
-        # Into the **tree root**, not ``<root>/<subdir>``: the snapshot store's
-        # ``fs/`` is a copy of the tree root itself (``agent_create_snapshot``
-        # copies ``workspace_base/<id>`` into it; the control plane's in-process
-        # shape expands it into ``workspace_dir`` the same way), so a merge one
-        # level down would put the whole sandbox at ``workspace/workspace/...``
-        # -- a tree no other path produces. ``subdir`` is only for the no-
-        # snapshot case, where the tree starts empty.
-        copy_tree(str(source), str(root), dir_mode=mode)
+        _take_snapshot_payload(source, root, mode=mode)
     # ``existed`` is the gate, not "did we copy something": a tree this op
     # just created gets its mode from the two ``fchmod``s above and from the
     # merge as it makes each directory, so there is nothing left over to fix
@@ -253,6 +262,60 @@ def materialize_tree(
         "slices": slices,
         "chown": handed_over,
     }
+
+
+def _take_snapshot_payload(source: Path, root: Path, *, mode: int) -> None:
+    """Land one snapshot payload at the tree root, in either shape.
+
+    The writer emits ``fs.tar`` (one sequential file instead of one NAS round
+    trip per entry); **every** snapshot alive when that shipped was the
+    exploded ``fs/`` directory, and the control plane names the tar for every
+    create (``control_plane.file_ops.derive_materialize``). A reader that only
+    understood tars would therefore break every one of them -- the same
+    regression class that answered ``502 partial-copy: … is not a directory``
+    for 25 minutes on 2026-10-02. Both shapes are read; the tar is streamed in
+    through the one shared extractor, the directory is merged exactly as it was
+    before the tar existed (that merge *is* the behavioural reference here).
+
+    Either way the result lands in the **tree root**, not ``<root>/<subdir>``:
+    a payload is a copy of the tree root itself, so a merge one level down
+    would put the whole sandbox at ``workspace/workspace/...`` -- a tree no
+    other path produces. ``subdir`` is only for the no-snapshot case.
+    """
+    directory = source
+    if not directory.is_dir() and source.name == SNAPSHOT_PAYLOAD_TAR_NAME:
+        # A pre-tar snapshot: the plan names the tar, only the directory exists.
+        legacy = source.parent / SNAPSHOT_PAYLOAD_DIR_NAME
+        if legacy.is_dir():
+            directory = legacy
+    if directory.is_dir():
+        copy_tree(str(directory), str(root), dir_mode=mode)
+        return
+    if not source.is_file():
+        raise MaterializeRefusal(
+            PARTIAL_COPY,
+            f"the snapshot source {source} is not a tar or a directory",
+        )
+    try:
+        extract_sandbox_archive(source, root)
+    except ArchiveRefusal as exc:
+        raise MaterializeRefusal(
+            _ARCHIVE_REFUSALS.get(exc.reason, PARTIAL_COPY),
+            f"{source}: {exc.detail or exc.reason}",
+        ) from exc
+    except OSError as exc:
+        raise MaterializeRefusal(
+            PARTIAL_COPY, f"unpacking the snapshot {source}: {exc}"
+        ) from exc
+    # The merge above keeps the tree contract -- every directory below the root
+    # ends at the plan's mode, because the worker is the group and has to be
+    # able to write one level down -- by creating each directory itself. A tar
+    # carries the tree's own modes, so the same pass runs after the unpack.
+    root_fd = _open_dir_chain(root)
+    try:
+        _enforce_directory_modes(root_fd, mode)
+    finally:
+        os.close(root_fd)
 
 
 def _plan_slices(

@@ -106,7 +106,7 @@ async def test_create_missing_key_is_401_without_reason(workspace) -> None:
 async def test_create_snapshot_permission_error_is_500_with_reason(
     workspace, monkeypatch
 ) -> None:
-    """Same F6 shape on the snapshot route: copytree EACCES is not a 401."""
+    """Same F6 shape on the snapshot route: a write EACCES is not a 401."""
     worker = _make_worker(workspace)
     app, settings = worker
     sandbox_dir = settings.workspace_base / "sbx_snap_src"
@@ -115,7 +115,7 @@ async def test_create_snapshot_permission_error_is_500_with_reason(
     def _boom(*_args, **_kwargs):
         raise PermissionError(PROVISION_REASON)
 
-    monkeypatch.setattr(agent_module.shutil, "copytree", _boom)
+    monkeypatch.setattr(agent_module, "_write_snapshot_tar", _boom)
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://worker"
@@ -132,13 +132,17 @@ async def test_create_snapshot_permission_error_is_500_with_reason(
 
 
 async def test_snapshot_copy_runs_off_the_event_loop(workspace, monkeypatch) -> None:
-    """A snapshot copy must not stall the worker's loop.
+    """Writing a snapshot payload must not stall the worker's loop.
 
     Measured shape of the bug this pins: on the shared NAS a tree costs about
     16 ms per file to copy, so a few thousand files take longer than the entry
     proxy's timeout. Copying inline stopped every heartbeat and every other
     request on that worker for the duration -- which is what made a snapshot
     look like a worker outage.
+
+    Task 2 changed *what* is written (one ``fs.tar`` instead of an exploded
+    ``fs/`` tree); it did not change the rule that reading the sandbox's tree
+    and writing the payload happen off the loop.
     """
     import asyncio
     import time
@@ -149,16 +153,16 @@ async def test_snapshot_copy_runs_off_the_event_loop(workspace, monkeypatch) -> 
     (sandbox_dir / "workspace").mkdir(parents=True)
     (sandbox_dir / "payload.bin").write_bytes(b"x" * 32)
 
-    # Capture the real one *before* patching: ``agent_module.shutil`` is the
-    # module object, so delegating to ``shutil.copytree`` after the patch would
-    # call the stub again.
-    original_copytree = agent_module.shutil.copytree
+    # Capture the real one *before* patching: the module attribute is what the
+    # handler resolves, so delegating to it after the patch would call the stub
+    # again.
+    original_write = agent_module._write_snapshot_tar
 
-    def _slow_copytree(*args, **kwargs):
-        time.sleep(0.3)  # stands in for the NAS copy of a file-heavy tree
-        return original_copytree(*args, **kwargs)
+    def _slow_write(*args, **kwargs):
+        time.sleep(0.3)  # stands in for reading a file-heavy tree
+        return original_write(*args, **kwargs)
 
-    monkeypatch.setattr(agent_module.shutil, "copytree", _slow_copytree)
+    monkeypatch.setattr(agent_module, "_write_snapshot_tar", _slow_write)
 
     ticks = 0
 
@@ -203,14 +207,13 @@ async def test_a_failed_snapshot_copy_leaves_no_partial_payload(
     sandbox_dir = settings.workspace_base / "sbx_snap_fail"
     (sandbox_dir / "workspace").mkdir(parents=True)
 
-    def _half_copy(_src, dst, **_kwargs):
+    def _half_write(_src, dst, **_kwargs):
         # Die after the destination exists: the shape a full disk or a killed
         # worker leaves behind.
-        pathlib.Path(dst).mkdir(parents=True, exist_ok=True)
-        (pathlib.Path(dst) / "half.bin").write_bytes(b"half")
+        pathlib.Path(dst).write_bytes(b"half")
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(agent_module.shutil, "copytree", _half_copy)
+    monkeypatch.setattr(agent_module, "_write_snapshot_tar", _half_write)
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://worker"

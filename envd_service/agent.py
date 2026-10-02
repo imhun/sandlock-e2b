@@ -64,8 +64,11 @@ from envd_service.xfs_quota import (
 )
 from envd_service.volumes import build_volume_mounts, cleanup_volume_projects
 from gateway_common import create_trace
+from gateway_common.archive import ArchiveRefusal, extract_sandbox_archive
 from gateway_common.paths import (
     CHECKPOINT_ROOT_NAME,
+    SNAPSHOT_PAYLOAD_DIR_NAME,
+    SNAPSHOT_PAYLOAD_TAR_NAME,
     UNTRUSTED_TREE_DIR,
     is_reserved_platform_namespace,
     is_sandbox_workspace_dir,
@@ -201,27 +204,6 @@ _DISK_SCAN_BUDGET_S = 1.0
 # know the namespace too: a parked tree keeps the project id of the tree it
 # was renamed from, so a release that failed at park time still has a
 # directory the reconcile can find (review R2).
-
-
-def _extract_sandbox_archive(archive_path: Path, dest: Path) -> None:
-    """Extract a sandbox tar.gz, skipping absolute symlink members.
-
-    Volume mounts are archived as symlinks to host paths that only exist on
-    the source node; provisioning re-creates them on the target.
-    """
-    with tarfile.open(archive_path) as tar:
-        members = []
-        for member in tar.getmembers():
-            target = (dest / member.name).resolve()
-            if not target.is_relative_to(dest.resolve()):
-                raise ValueError(f"archive member escapes workspace: {member.name}")
-            if member.issym() and os.path.isabs(member.linkname):
-                continue
-            members.append(member)
-        try:
-            tar.extractall(dest, members=members, filter="data")
-        except TypeError:  # pragma: no cover - Python < 3.12
-            tar.extractall(dest, members=members)
 
 
 def _require_internal_key(request: Request, settings: Settings) -> None:
@@ -3084,19 +3066,33 @@ def _agent_finalize_sandbox(request: Request, settings: Settings, payload: dict)
             # N57: the store hangs off the platform namespace root (the shared
             # export root), not off the tree root -- the record beside this
             # payload is written there by the control plane.
-            snapshot_fs = (
-                snapshot_payload_dir(
-                    workspace_base,
-                    snapshot_id,
-                    shared_root=settings.shared_volume_root,
-                )
-                / "fs"
+            snapshot_dir = snapshot_payload_dir(
+                workspace_base,
+                snapshot_id,
+                shared_root=settings.shared_volume_root,
             )
-            if not snapshot_fs.is_dir():
-                raise ValueError(f"Snapshot {snapshot_id} not found on this node")
-            shutil.copytree(
-                snapshot_fs, workspace_dir, dirs_exist_ok=True, symlinks=True
-            )
+            snapshot_tar = snapshot_dir / SNAPSHOT_PAYLOAD_TAR_NAME
+            snapshot_fs = snapshot_dir / SNAPSHOT_PAYLOAD_DIR_NAME
+            # Task 2: the writer emits ``fs.tar``, and everything snapshot older
+            # than that is an exploded ``fs/`` directory -- this path (the
+            # control plane did *not* materialize the tree, so the worker does
+            # it) reads both, through the same shared extractor the agent's
+            # materialize instruction uses.
+            try:
+                if snapshot_tar.is_file():
+                    extract_sandbox_archive(snapshot_tar, workspace_dir)
+                elif snapshot_fs.is_dir():
+                    shutil.copytree(
+                        snapshot_fs, workspace_dir, dirs_exist_ok=True, symlinks=True
+                    )
+                else:
+                    raise ValueError(
+                        f"Snapshot {snapshot_id} not found on this node"
+                    )
+            except ArchiveRefusal as e:
+                raise ValueError(
+                    f"Snapshot {snapshot_id} is not readable: {e}"
+                ) from e
         else:
             (workspace_dir / "workspace").mkdir(parents=True, exist_ok=True)
     volume_mounts = payload.get("volumeMounts") or []
@@ -4287,8 +4283,8 @@ async def agent_import_sandbox(sandbox_id: str, request: Request) -> Response:
             sandbox_id,
             len(body),
         )
-        _extract_sandbox_archive(tmp_path, workspace)
-    except (OSError, tarfile.TarError) as e:
+        extract_sandbox_archive(tmp_path, workspace)
+    except (ArchiveRefusal, OSError, tarfile.TarError) as e:
         logger.warning("import %s failed: %s", sandbox_id, e, exc_info=True)
         return Response(status_code=400, content="Invalid tar archive")
     finally:
@@ -4358,6 +4354,43 @@ async def agent_health(request: Request) -> dict[str, Any]:
     return payload
 
 
+def _write_snapshot_tar(src: Path, dst: Path) -> None:
+    """Write one tar of a sandbox tree root, aside -> fsync -> rename.
+
+    The same discipline the ``_oci.tar`` payloads and every record file in this
+    repo keep, and for the same reason: a payload that is being written must
+    look like a temp file, never like a finished snapshot. The caller writes
+    ``.complete`` only after this returns, so the two together are what makes
+    "the directory exists" mean "the snapshot is complete" (N29).
+
+    The tar's members are the tree root's **own entries** (``workspace/…``),
+    not a wrapper directory: the tar *is* the tree root, exactly as the
+    exploded ``fs/`` directory was, which is what lets the reader unpack it
+    straight into the sandbox's tree.
+    """
+    tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
+    try:
+        with tarfile.open(tmp, "w") as tar:
+            for entry in sorted(src.iterdir(), key=lambda item: item.name):
+                tar.add(entry, arcname=entry.name, recursive=True)
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    # The rename itself has to reach the NAS, not just the page cache: the
+    # control plane writes the record (and asks the agent for the payload) from
+    # *another* node.
+    dir_fd = os.open(dst.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 @router.post("/agent/snapshots", status_code=201)
 async def agent_create_snapshot(request: Request) -> Response:
     settings = request.app.state.settings
@@ -4379,18 +4412,21 @@ async def agent_create_snapshot(request: Request) -> Response:
             snapshot_id,
             shared_root=settings.shared_volume_root,
         )
-        dst = snapshot_dir / "fs"
+        dst = snapshot_dir / SNAPSHOT_PAYLOAD_TAR_NAME
+        legacy = snapshot_dir / SNAPSHOT_PAYLOAD_DIR_NAME
         marker = snapshot_dir / ".complete"
         if not src.is_dir():
             return Response(status_code=404, content=f"Sandbox {sandbox_id} not found")
-        if dst.exists():
+        if dst.exists() or legacy.exists():
             # N29: idempotent **for a finished copy**. The control plane retries
             # the same id when its own client timed out, and paying a second
             # full copy of a large tree is exactly what that retry must not do.
             # The marker is what makes "the directory exists" mean "complete":
             # without it this is a crashed attempt, and 409 keeps the rule that
             # one id has one live copy (a concurrent duplicate is refused
-            # rather than interleaved).
+            # rather than interleaved). ``legacy`` is the pre-tar ``fs/``
+            # payload: an id that already has one is a snapshot this worker
+            # must not write a second payload beside.
             if marker.is_file():
                 return JSONResponse(
                     status_code=200,
@@ -4402,22 +4438,34 @@ async def agent_create_snapshot(request: Request) -> Response:
                     },
                 )
             return Response(status_code=409, content="snapshot already exists")
-        # Off the event loop: a snapshot is a full copy of the sandbox's tree
-        # and on the shared NAS that is ~16 ms per file (measured: 2 000 small
-        # files take longer than the entry proxy's timeout). Running it inline
+        # Off the event loop: a snapshot reads the whole sandbox tree and writes
+        # it to the shared NAS (measured 2026-10-02: 2000 small files cost
+        # ~26-29 ms *per entry* where each entry is an NFS round trip, which
+        # takes longer than the entry proxy's timeout). Running it inline
         # stalled every heartbeat and every other request on this worker for
         # the whole copy -- the loop stopped answering, which is what made a
         # snapshot look like a worker outage.
+        #
+        # Task 2: the payload is **one tar**. Reading the tree is still
+        # per-entry, but the write side becomes one sequential file, so the
+        # cost of the payload itself stops scaling with the entry count.
         try:
-            await asyncio.to_thread(shutil.copytree, src, dst, symlinks=True)
+            # The store directory is the agent's to make: the control plane
+            # writes the record *after* this returns, so nothing created it for
+            # us (the old ``copytree`` did it as a side effect of the
+            # destination being the payload path).
+            await asyncio.to_thread(snapshot_dir.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(_write_snapshot_tar, src, dst)
             # Written last, and that is the whole point: until this line lands,
             # the payload is not a snapshot (see the 409 above).
             await asyncio.to_thread(marker.write_text, "complete\n", encoding="utf-8")
         except BaseException:
-            # A failed or abandoned copy must not leave a half snapshot behind:
-            # the record is written by the control plane only on success, so a
-            # partial payload would be an orphan nothing ever reclaims (and the
-            # next attempt for the same id would answer 409 "already exists").
+            # A failed or abandoned write must not leave a half snapshot
+            # behind: the record is written by the control plane only on
+            # success, so a partial payload would be an orphan nothing ever
+            # reclaims (and the next attempt for the same id would answer 409
+            # "already exists"). The tar's own temp name has been removed by
+            # ``_write_snapshot_tar``; this removes the store directory.
             await asyncio.to_thread(
                 shutil.rmtree,
                 snapshot_dir,

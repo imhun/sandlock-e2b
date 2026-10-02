@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import tarfile
 import threading
 from pathlib import Path
 from typing import Any, Mapping
@@ -440,6 +441,22 @@ def _relative_entries(root: Path) -> list[tuple[str, str]]:
     return sorted(found)
 
 
+def _snapshot_tar(agent: _Agent, entries: dict[str, Any]) -> Path:
+    """A snapshot payload in the shape the writer now emits: one ``fs.tar``.
+
+    Built by taring the very tree ``_snapshot`` makes, so the two helpers
+    describe the same payload in the two shapes the reader accepts -- a
+    comparison between them is a comparison of the reader's two branches.
+    """
+    fs = _snapshot(agent, entries)
+    tar_path = fs.parent / "fs.tar"
+    with tarfile.open(tar_path, "w") as tar:
+        for child in sorted(fs.iterdir(), key=lambda item: item.name):
+            tar.add(child, arcname=child.name, recursive=True)
+    shutil.rmtree(fs)
+    return tar_path
+
+
 @pytest.mark.asyncio
 async def test_a_snapshot_lands_at_the_tree_root(workspace: Path) -> None:
     """``fs/`` is a copy of the tree **root**, so the merge lands there.
@@ -735,6 +752,202 @@ async def test_a_partial_copy_is_reported_as_failure(
     resp = await _post(
         agent,
         _instruction(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs()))),
+    )
+
+    assert resp.status_code == 502
+    assert "partial-copy" in resp.json()["error"]
+    assert agent.runner.calls == []
+
+
+# ------------------------------------------------------- the tar payloads
+#
+# Task 2 changed the payload from an exploded ``fs/`` directory to one
+# ``fs.tar`` (the writer side is pinned in ``test_snapshot_tar.py``). The
+# reader has to accept **both** -- every live snapshot on the day this shipped
+# was an ``fs/`` directory, and a reader that only knew tars would have broken
+# all of them -- so the four §4.3.1 rules are re-pinned on the unpack path, and
+# the legacy directory keeps its own case.
+
+
+@pytest.mark.asyncio
+async def test_a_restore_unpacks_the_tar_at_the_tree_root(workspace: Path) -> None:
+    """The tar carries the tree root, so the unpack lands at the root too."""
+    agent = _Agent(workspace)
+    payload = _snapshot_tar(agent, {"workspace": {"kept.txt": "kept\n"}})
+
+    resp = await _post(
+        agent, _instruction(tree=_plan_tree(agent, copy_from=str(payload)))
+    )
+
+    assert resp.status_code == 200
+    tree = agent.tree()
+    assert (tree / "workspace" / "kept.txt").read_text(encoding="utf-8") == "kept\n"
+    assert (tree / "workspace" / "workspace").exists() is False
+    # Every directory below the root ends at the tree mode, exactly as the
+    # directory merge did (the create contract: the worker is the group and
+    # must be able to write one level down).
+    assert stat.S_IMODE(os.stat(tree / "workspace").st_mode) == 0o770
+
+
+@pytest.mark.asyncio
+async def test_a_symlink_in_the_tar_is_recreated_not_followed(workspace: Path) -> None:
+    """§4.3.1 source side: a link member is an entry, never a door to open."""
+    agent = _Agent(workspace)
+    payload = _snapshot_tar(
+        agent, {"link": "-> prey.txt", "prey.txt": "untouched\n", "real": "hello\n"}
+    )
+
+    resp = await _post(
+        agent, _instruction(tree=_plan_tree(agent, copy_from=str(payload)))
+    )
+
+    assert resp.status_code == 200
+    tree = agent.tree()
+    assert os.path.islink(tree / "link") is True
+    assert os.readlink(tree / "link") == "prey.txt"
+    assert (tree / "prey.txt").read_text(encoding="utf-8") == "untouched\n"
+    assert (tree / "real").read_text(encoding="utf-8") == "hello\n"
+
+
+@pytest.mark.asyncio
+async def test_a_destination_symlink_segment_is_refused_named(workspace: Path) -> None:
+    """§4.3.1 destination side: a link in the tree is refused by name."""
+    agent = _Agent(workspace)
+    outside = workspace / "outside"
+    outside.mkdir()
+    target = agent.tree()
+    target.mkdir(parents=True)
+    (target / "sub").symlink_to(outside)
+    payload = _snapshot_tar(agent, {"sub": {"file": "payload\n"}})
+
+    resp = await _post(
+        agent, _instruction(tree=_plan_tree(agent, copy_from=str(payload)))
+    )
+
+    assert resp.status_code == 400
+    assert "destination-is-a-symlink" in resp.json()["error"]
+    assert sorted(os.listdir(outside)) == []
+    assert agent.runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_partial_unpack_is_reported_as_failure(workspace: Path) -> None:
+    """§4.3.1 requirement 3: a payload cut short must never read as success."""
+    agent = _Agent(workspace)
+    payload = _snapshot_tar(agent, {"big.bin": b"x" * (128 * 1024)})
+    raw = payload.read_bytes()
+    payload.write_bytes(raw[: len(raw) // 2])
+
+    resp = await _post(
+        agent, _instruction(tree=_plan_tree(agent, copy_from=str(payload)))
+    )
+
+    assert resp.status_code == 502
+    assert "partial-copy" in resp.json()["error"]
+    assert agent.runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_migrated_tree_keeps_its_files(workspace: Path) -> None:
+    """§4.3.1 requirement 4: the unpack merges, it does not replace the tree."""
+    agent = _Agent(workspace)
+    target = agent.tree()
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text(
+        "from the previous incarnation\n", encoding="utf-8"
+    )
+    (target / "same.txt").write_text("stale\n", encoding="utf-8")
+    payload = _snapshot_tar(
+        agent, {"same.txt": "fresh\n", "nested": {"deep.txt": "deep\n"}}
+    )
+
+    resp = await _post(
+        agent, _instruction(tree=_plan_tree(agent, copy_from=str(payload)))
+    )
+
+    assert resp.status_code == 200
+    assert (target / "keep.txt").read_text(encoding="utf-8") == (
+        "from the previous incarnation\n"
+    )
+    assert (target / "same.txt").read_text(encoding="utf-8") == "fresh\n"
+    assert (target / "nested" / "deep.txt").read_text(encoding="utf-8") == "deep\n"
+    assert stat.S_IMODE(os.stat(target / "nested").st_mode) == 0o770
+
+
+@pytest.mark.asyncio
+async def test_both_payload_shapes_produce_the_same_tree(workspace: Path) -> None:
+    """The tar and the exploded directory are two spellings of one payload.
+
+    The tar path is the new one, so its output is checked against the merge
+    that *is* the reference (the pre-tar behaviour): same entries, same kinds,
+    same file bytes, same directory modes. A reader that quietly changed the
+    tree -- a link turned into a file, a directory left at the unpack's own
+    mode -- shows up here instead of in the next sandbox that writes there.
+    """
+    entries = {
+        "workspace": {"kept.txt": "kept\n"},
+        "nested": {"deep.txt": "deep\n"},
+        "link": "-> workspace/kept.txt",
+        "real.txt": "hello\n",
+    }
+
+    tar_agent = _Agent(workspace / "tar")
+    payload = _snapshot_tar(tar_agent, entries)
+    tar_resp = await _post(
+        tar_agent, _instruction(tree=_plan_tree(tar_agent, copy_from=str(payload)))
+    )
+    fs_agent = _Agent(workspace / "fs")
+    fs = _snapshot(fs_agent, entries)
+    fs_resp = await _post(
+        fs_agent, _instruction(tree=_plan_tree(fs_agent, copy_from=str(fs)))
+    )
+
+    assert tar_resp.status_code == 200
+    assert fs_resp.status_code == 200
+    tar_entries = _relative_entries(tar_agent.tree())
+    assert tar_entries == _relative_entries(fs_agent.tree())
+    for relative, kind in tar_entries:
+        if kind == "file":
+            assert (tar_agent.tree() / relative).read_bytes() == (
+                fs_agent.tree() / relative
+            ).read_bytes()
+    assert _directory_modes(tar_agent.tree()) == _directory_modes(fs_agent.tree())
+
+
+@pytest.mark.asyncio
+async def test_the_reader_still_restores_a_legacy_fs_directory(workspace: Path) -> None:
+    """The writer emits ``fs.tar``; a snapshot with only ``fs/`` still restores.
+
+    This is the live shape on the day Task 2 shipped: four restorable
+    snapshots, every one of them an exploded ``fs/`` directory. The control
+    plane names the tar for every snapshot create (``derive_materialize``), so
+    the reader is what has to fall back.
+    """
+    agent = _Agent(workspace)
+    fs = _snapshot(agent, {"workspace": {"kept.txt": "kept\n"}})
+    tar_path = fs.parent / "fs.tar"
+    assert tar_path.exists() is False
+
+    resp = await _post(
+        agent, _instruction(tree=_plan_tree(agent, copy_from=str(tar_path)))
+    )
+
+    assert resp.status_code == 200
+    assert (agent.tree() / "workspace" / "kept.txt").read_text(
+        encoding="utf-8"
+    ) == "kept\n"
+
+
+@pytest.mark.asyncio
+async def test_a_snapshot_with_no_payload_is_refused_named(workspace: Path) -> None:
+    """A record with no payload (two live ids are exactly that) fails loudly."""
+    agent = _Agent(workspace)
+    snapshot_dir = agent.workspace_base / "_snapshots" / SNAPSHOT
+    snapshot_dir.mkdir(parents=True)
+
+    resp = await _post(
+        agent,
+        _instruction(tree=_plan_tree(agent, copy_from=str(snapshot_dir / "fs.tar"))),
     )
 
     assert resp.status_code == 502

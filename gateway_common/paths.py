@@ -222,6 +222,17 @@ STATE_BASE_ENV = "E2B_STATE_BASE"
 #: the same ids.
 SNAPSHOT_STORE_DIR_NAME = "_snapshots"
 
+#: The snapshot payload's two spellings inside ``_snapshots/<id>/``. The
+#: **writer** emits the tar (Task 2: one sequential file instead of one NAS
+#: round trip per entry); the **reader** still accepts the exploded directory,
+#: because every snapshot taken before the tar is one and a reader that only
+#: knew tars would break all of them. Both are spelled here because three
+#: modules (``envd_service.agent``, ``c3_agent.materialize``,
+#: ``control_plane.file_ops``) name them and a drift between two of them is
+#: a create-from-snapshot that answers "not a directory".
+SNAPSHOT_PAYLOAD_TAR_NAME = "fs.tar"
+SNAPSHOT_PAYLOAD_DIR_NAME = "fs"
+
 #: The migration staging directory, also under the platform namespace root. Its
 #: reader is the **target** node's agent (``_import_sandbox_archive``), which is
 #: exactly why it cannot live under the tree root once the trees are node-local:

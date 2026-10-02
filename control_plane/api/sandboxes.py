@@ -63,6 +63,7 @@ from gateway_common.upload import (
     read_json_body,
 )
 from gateway_common import GATEWAY_ROUTE_INVALIDATE_CHANNEL
+from gateway_common.archive import ArchiveRefusal, extract_sandbox_archive
 from gateway_common.timeutil import to_iso_z
 from gateway_common.paths import (
     is_reserved_platform_namespace,
@@ -2545,27 +2546,6 @@ def _migration_volume_node_id(request, record) -> str | None:
     return next(iter(node_ids)) if node_ids else None
 
 
-def _extract_sandbox_archive(archive_path: Path, dest: Path) -> None:
-    """Extract a sandbox tar.gz, skipping absolute symlink members.
-
-    Volume mounts are archived as symlinks to host paths that only exist on
-    the source node; provisioning re-creates them on the target.
-    """
-    with tarfile.open(archive_path) as tar:
-        members = []
-        for member in tar.getmembers():
-            target = (dest / member.name).resolve()
-            if not target.is_relative_to(dest.resolve()):
-                raise ValueError(f"archive member escapes workspace: {member.name}")
-            if member.issym() and os.path.isabs(member.linkname):
-                continue
-            members.append(member)
-        try:
-            tar.extractall(dest, members=members, filter="data")
-        except TypeError:  # pragma: no cover - Python < 3.12
-            tar.extractall(dest, members=members)
-
-
 def _platform_namespace_shared_root(settings) -> str | None:
     """The shared root the platform's own namespaces hang off, or ``None``.
 
@@ -2626,8 +2606,8 @@ async def _import_sandbox_archive(request, record, node, tar_path) -> None:
             shutil.rmtree(workspace, ignore_errors=True)
         workspace.mkdir(parents=True, exist_ok=True)
         try:
-            _extract_sandbox_archive(tar_path, workspace)
-        except (tarfile.TarError, OSError, ValueError) as e:
+            extract_sandbox_archive(tar_path, workspace)
+        except (ArchiveRefusal, tarfile.TarError, OSError, ValueError) as e:
             raise OfficialError(400, f"Invalid sandbox archive: {e}") from e
         return
     import httpx

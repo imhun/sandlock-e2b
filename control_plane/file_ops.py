@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from gateway_common.paths import (
+    SNAPSHOT_PAYLOAD_TAR_NAME,
     is_reserved_platform_namespace,
     route_b_instance_name,
     sandbox_checkpoint_dir,
@@ -386,13 +387,18 @@ def derive_materialize(
         # `502 partial-copy: the snapshot source … is not a directory`
         # (measured on the cluster 2026-10-02, the first snapshot create after
         # the reslice).
+        #
+        # Task 2: the payload is one ``fs.tar`` (the writer in
+        # ``envd_service/agent.py``). The agent reads it, and falls back to the
+        # pre-tar ``fs/`` directory when the tar is not there -- every live
+        # snapshot was an ``fs/`` directory on the day this shipped.
         copy_from = (
             snapshot_payload_dir(
                 paths.workspace_base,
                 snapshot_id,
                 shared_root=paths.shared_volume_root,
             )
-            / "fs"
+            / SNAPSHOT_PAYLOAD_TAR_NAME
         )
         _require_in_roots(paths, copy_from, spec)
         tree["copy_from"] = str(copy_from)

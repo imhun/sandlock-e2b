@@ -437,7 +437,7 @@ Task 0 把两个命名空间合成一处之后，这里独立复核"**合并无�
 
 | 任务 | 这份文档给的约束 |
 |---|---|
-| Task 2（快照 tar） | 路径只有一个根：`<export>/_snapshots/<id>/{snapshot.json, fs.tar, .complete}`（§4.1）；"只有记录"的 `015f`/`1ca5` 是 `status: failed`，不得替它们造载荷（§4.2）；tar 通道要带 §3.1 的 `E2B_TREE_COPY_MAX_BYTES`（快照 ≤ 树上限 1 GiB）；**还要处理 §4.3 的副本间记录不一致**（删除/新增记录不会跨副本失效） |
+| Task 2（快照 tar） | 路径只有一个根：`<export>/_snapshots/<id>/{snapshot.json, fs.tar, .complete}`（§4.1）；"只有记录"的 `015f`/`1ca5` 是 `status: failed`，不得替它们造载荷（§4.2）；tar 通道要带 §3.1 的 `E2B_TREE_COPY_MAX_BYTES`（快照 ≤ 树上限 1 GiB）；**还要处理 §4.3 的副本间记录不一致**（删除/新增记录不会跨副本失效）<br>**Task 2 落地时按 brief 的裁定收窄了两条，在此点名**：① 按字节上限（`E2B_TREE_COPY_MAX_BYTES`）**没有**随这一步做，它和"拷贝窗口"一起归 Task 3（§3.1 那张表本来就是"三件一起做"，而它的措辞是"单次拷贝的在途量"）；② §4.3 的记录不一致**只观测、不改**（裁定 5/7：`.complete` 与记录不归 Task 2 动）——本轮撞到并记录，见 §7.6 与 `docs/deploy-clusters.md` §7.30。③ 读侧**两种形状都收**：`fs.tar` 解包 + 既有 `fs/` 合并（写侧只出 tar），加固只有一份实现（`gateway_common/archive.py`，三个调用方 import 同一个函数对象）；前后对照的复跑命令见 §7.6 |
 | Task 3（树本地） | 节点预算 8 GiB 树 + 4 GiB 镜像缓存 ≈ 12 GiB / 68–75 GiB 空闲（§2.3）；**大块顺序写会从 ≈488 MB/s 掉到 124.9–125.5 MB/s**（§1.2），元数据快 475×（§1.1）——验收必须用"运行时 I/O"（小文件）而不是建箱延迟立论；**淘汰上限 = `E2B_TREE_COPY_MAX_BYTES` + 拷贝窗口**（§3.1），因为恢复路径 900 MiB 已经把 `maint` 顶到 512.0 MiB 并且**真的 OOM 过一次**（§3.0） |
 | Task 4（state 分家） | 裁定 1/3：`command-logs.jsonl` 可以本地、`_runtime/<id>/sandbox.json` 留共享（§5.1）；容量上本节点 state 是小文件，不是容量项（§2.3） |
 
@@ -505,3 +505,30 @@ env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
 kubectl -n sandlock exec -i <cp-pod> -c control-plane -- python3 - \
   < deploy/scripts/acceptance/local_first_snapshot_verify.py
 ```
+
+### 7.6 Task 2 的 tar 前后对照（1/40/202 三档）
+
+`snapshot_create_probe.py` 现在一次跑完三档，并把两个口径都打出来：`per_entry_ms`
+（旧形状的单位，Task B 的 ~25 ms/条目就是它）与 `mb_per_s`（新形状的单位）。
+
+```bash
+export E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000
+export E2B_API_KEY=$(kubectl -n sandlock get secret e2b-secrets \
+    -o jsonpath='{.data.E2B_API_KEYS}' | base64 -d | cut -d, -f1)
+env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
+  deploy/scripts/acceptance/snapshot_create_probe.py --files 1,40,202 --n 3 --keep
+```
+
+* `--keep` 把每档的快照留在卷上并打印 id，载荷本身的字节数从外面量：旧形状
+  `du -sb <export>/_snapshots/<id>/fs`，新形状 `stat -c %s …/fs.tar`（探针走 SDK，
+  看不见存储）。量完要删：`Sandbox.delete_snapshot()` 只摘**当次服务副本**的记录
+  （§4.3），两个副本各删一次才清干净。
+* `create_attempts` 是"`create_snapshot` 返回、另一个副本还没看到记录"的那个窗口
+  （§4.3）——探针记录并打印每次重试，不把窗口藏进"重试到绿"。
+* 老快照那条腿用 `restore_snapshot_probe.py`：四个 id 逐条给一个 `ID:PATH[:EXPECT]`
+  （命令见 `docs/deploy-clusters.md` §7.29 的复跑段）。它是**新代码读旧形状**的钉子：
+  读侧必须同时认 `fs.tar` 与 `fs/`。
+
+> **§0 里有一处旧数，留给后续任务清**：§0 第 1 条写"元数据上快 480×（2627.2 ms vs
+> 5.5 ms）"，那是 Task 1 修正 `pct()` 之前的读数；§1.1 重测后是 **475×（2601.3 ms vs
+> 5.5 ms）**。本轮不动 §0（它与 §1.1 冲突这件事在这里点名，不静默留着）。

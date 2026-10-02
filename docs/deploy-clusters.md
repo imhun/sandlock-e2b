@@ -1531,6 +1531,45 @@ E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000 \
 这是 N27 下沉时留下的**数据**问题（记录是控制面在快照成功之后写的），迁移按设计原样留着并
 具名报告，没替它们编一份；Task 2 会把载荷换成 `fs.tar`、Task 3 才把树搬去节点本地盘。
 
+### 7.30 Task 2：快照载荷打成 `fs.tar`（**仓库已落，集群未上线 —— 待上线验收**）
+
+**代码面**：写侧 `envd_service/agent.py::_write_snapshot_tar`（临时名 → `fsync` → `rename`
+→ `.complete` 最后，与 `.oci.tar` 同款纪律）；读侧 `c3_agent/materialize.py::_take_snapshot_payload`
+与 worker 降级路**两种形状都收**（`fs.tar` 流式解包 / 既有 `fs/` 目录合并）；
+`control_plane/file_ops.py::derive_materialize` 的 `copy_from` 指向 `fs.tar`；
+加固（成员过滤 + `dest` 包含检查）只有**一份实现**：`gateway_common/archive.py`，
+控制面与两个 agent 一起 import 同一个函数对象（`tests/unit/test_snapshot_tar.py` 钉住）。
+单测：新 `tests/unit/test_snapshot_tar.py` + 改 `test_agent_materialize.py` /
+`test_cp_materialize_instruction.py` / `test_agent_create_sandbox_auth.py`；`tests/unit`
+与基线逐条相同（3 条 macOS-only）。
+
+**上线前实测（2026-10-02，`0.1.0-887`，旧形状 `fs/`）**：
+`snapshot_create_probe.py --files 1,40,202 --n 3 --keep`
+
+| 档 | 条目 | 快照捕获 | 从快照建箱 p50 | 每条目 | 载荷字节（`du -sb`） | 载荷占块（`du -s`） |
+|---|---|---|---|---|---|---|
+| 1 文件 | 2 | 180 ms | 248 ms | 124.2 ms | 5 B | 5 KiB |
+| 40 文件 | 41 | 1614 ms | 1190 ms | 29.0 ms | 385 B | 161 KiB |
+| 202 文件 | 203 | 8051 ms | 5725 ms | 28.2 ms | 2106 B | 809 KiB |
+
+⇒ 复现了 `docs/create-local-first-design.md` §1.4 的 ~26–29 ms/条目：`fs/` 形状是**一条目一次
+NAS 往返**（载荷本身也按条目占块，≈4 KiB/条目）。`METRIC … create_attempts=6`（202 档）
+就是 §4.3 那条"`create_snapshot` 返回、另一个副本还没看到记录"的窗口，本轮撞到两次。
+
+**上线后还要跑的两件（本次没做，因为要先把新镜像部署上去）**：① 同一条命令的三档**后测**
+（tar 形状，看 `mb_per_s` 与捕获耗时）；② 老快照那条腿 ——
+`restore_snapshot_probe.py` 的四个 id 复跑（**新代码读旧形状**的钉子）。命令见
+`docs/create-local-first-design.md` §7.6。
+
+**本次只读观测**（无写操作，除探针自建的箱与快照）：卷上仍是 8 个 id（与 §4.1 一致）；
+四个可恢复的老快照**逐条单独跑**各绿（`46dc`/`4bf1` = `workspace/kept.txt` `kept\n`、
+`ce90` = 2000 条目 `lease/f0000.bin`、`962c` = `big/f0000.bin`）；但四个 id **一次跑完**时
+后两条拿到**空 body**（`JSONDecodeError: Expecting value: line 1 column 1`，§7.29 记过的同型），
+单独重跑各自绿 ⇒ "每条检查一个进程"解决的是连接复用，解决不了这一段（两条 2000 条目恢复
+连跑时控制面/入口侧仍会空答一次）。另外：探针崩掉那一轮留下的 202 档快照，它自己的
+`delete_snapshot` 之后**载荷目录还在卷上**，按副本各再删一次才清掉 —— §4.3 那条行为的
+再一次现场（本轮自建的载荷与幻影记录已全部清理，卷回到原样 8 个 id、`GET /sandboxes` = `[]`）。
+
 ## 8. 改部署的入口
 
 ```bash
