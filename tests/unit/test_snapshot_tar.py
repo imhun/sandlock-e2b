@@ -22,8 +22,11 @@ Two properties this file exists for, and neither is optional:
 
 from __future__ import annotations
 
+import importlib.util
 import io
+import json
 import os
+import sys
 import tarfile
 from pathlib import Path
 
@@ -41,6 +44,20 @@ from gateway_common import archive
 SANDBOX = "sbx_snap01"
 SNAPSHOT = "snap_0123456789abcdef"
 KEY = "internal-key-0123456789"
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+VERIFY_PROBE = REPO_ROOT / "deploy" / "scripts" / "acceptance" / "local_first_snapshot_verify.py"
+CAPACITY_PROBE = REPO_ROOT / "deploy" / "scripts" / "acceptance" / "local_first_capacity_account.py"
+
+
+def _load_probe(name: str, path: Path):
+    """Import one acceptance probe by path (the repo's own pattern)."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _worker(workspace: Path):
@@ -241,25 +258,137 @@ def test_a_member_that_escapes_the_destination_is_refused(workspace: Path) -> No
     assert (workspace / "outside.txt").exists() is False
 
 
-def test_the_unpack_streams_instead_of_listing_every_member(
+def test_the_unpack_never_builds_its_own_member_list(
     workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The unpack must not build the whole member list (``getmembers``).
+    """We walk the members ourselves; we never pre-list them.
 
-    A real snapshot is far larger than this fixture's, and the agent's
-    ``maint`` container was OOM-killed once during Task 1's measurement
-    (``docs/create-local-first-design.md`` §3.0): the reader walks the tar one
-    member at a time instead of materialising an index of it.
+    **What this can falsify**: our own second list. ``getmembers()`` (an index
+    in memory) plus ``extractall(members=...)`` (a second pass over it) is
+    exactly the shape the implementation this task replaced had, and both calls
+    raise here -- an author who restores that shape gets a red test.
+
+    **What it cannot falsify**, and ``gateway_common/archive.py`` now says so:
+    CPython's ``TarFile.next()`` appends every ``TarInfo`` to ``TarFile.members``
+    no matter who iterates, so the *index* is stdlib's and survives any caller
+    shape (review round 1, 2026-10-02: 20 万成员 ⇒ ``len(tar.members)`` 20 万、
+    峰值 88.8 MB ≈ 444 B/成员). What this task really changed is the member
+    **data**: it goes through tarfile's own 64 KiB buffer one member at a time
+    instead of the payload being walked/copied whole, which is the driver of
+    the OOM recorded in ``docs/create-local-first-design.md`` §3.0.
     """
     entries = {f"f-{i:03d}.txt": f"filler {i}\n" for i in range(64)}
     archive_path = _tar(workspace / "fs.tar", entries)
     dest = workspace / "dest"
     dest.mkdir()
 
-    def _boom(self):  # pragma: no cover - only reached by the defect
-        raise AssertionError("the unpack listed every member up front")
+    def _boom(*_args, **_kwargs):  # pragma: no cover - only reached by the defect
+        raise AssertionError("the unpack pre-listed its members")
 
     monkeypatch.setattr(tarfile.TarFile, "getmembers", _boom)
+    monkeypatch.setattr(tarfile.TarFile, "extractall", _boom)
 
     assert archive.extract_sandbox_archive(archive_path, dest) == len(entries)
     assert (dest / "f-063.txt").read_text(encoding="utf-8") == "filler 63\n"
+
+
+# ------------------------------------ the acceptance probes that read the store
+#
+# Task 2 changed the payload on disk from an exploded ``fs/`` directory to one
+# ``fs.tar``, and two read-only acceptance probes classify payload presence by
+# looking at the store directly. ``local_first_snapshot_verify.py`` is the one
+# ``docs/create-local-first-design.md`` §7.5 tells an operator to run after a
+# deploy; a probe that still named ``fs`` would file every *new* snapshot under
+# "record only" -- the §4.2 *data-defect* class -- and report
+# ``payload_bytes: null`` for a perfectly healthy store.
+
+
+def _store_entry(workspace: Path, name: str = "snap_tar") -> Path:
+    entry = workspace / "_snapshots" / name
+    entry.mkdir(parents=True)
+    return entry
+
+
+def _tar_member(entry: Path, *, name: str = "workspace/kept.txt") -> None:
+    with tarfile.open(entry / "fs.tar", "w") as tar:
+        info = tarfile.TarInfo(name)
+        payload = b"kept\n"
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+
+
+def test_the_store_verification_probe_reads_a_tar_payload(workspace: Path) -> None:
+    """A ``fs.tar`` snapshot is ``record+payload``, with its bytes counted."""
+    probe = _load_probe("local_first_snapshot_verify", VERIFY_PROBE)
+    entry = _store_entry(workspace)
+    (entry / "snapshot.json").write_text(
+        json.dumps({"status": "completed", "created_at": "2026-10-02T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    (entry / ".complete").write_text("complete\n", encoding="utf-8")
+    _tar_member(entry)
+
+    row = probe.classify(entry)
+
+    assert row["record"] is True
+    assert row["payload"] is True
+    assert row["payload_shape"] == "tar"
+    assert row["payload_entries"] == 1
+    assert row["payload_bytes"] == (entry / "fs.tar").stat().st_size
+    assert row["status"] == "completed"
+
+
+def test_the_store_verification_probe_still_reads_the_legacy_directory(
+    workspace: Path,
+) -> None:
+    """The pre-tar shape keeps its own reading (and its own name)."""
+    probe = _load_probe("local_first_snapshot_verify", VERIFY_PROBE)
+    entry = _store_entry(workspace, "snap_dir")
+    (entry / "fs" / "workspace").mkdir(parents=True)
+    (entry / "fs" / "workspace" / "kept.txt").write_text("kept\n", encoding="utf-8")
+
+    row = probe.classify(entry)
+
+    assert row["payload"] is True
+    assert row["payload_shape"] == "dir"
+    assert row["payload_entries"] == 2
+    assert row["payload_bytes"] == 5
+
+
+def test_the_capacity_account_reads_a_tar_payload(workspace: Path) -> None:
+    """The capacity probe's per-id rows see the tar too."""
+    probe = _load_probe("local_first_capacity_account", CAPACITY_PROBE)
+    entry = _store_entry(workspace)
+    _tar_member(entry)
+
+    rows = probe.snapshot_records(workspace)
+
+    assert rows == [
+        {
+            "id": "snap_tar",
+            "record": False,
+            "payload": True,
+            "payload_shape": "tar",
+            "created_at": None,
+            "status": None,
+            "payload_bytes": None,
+            "payload_mtime": int(entry.stat().st_mtime),
+        }
+    ]
+
+
+def test_the_payload_shape_helper_prefers_the_tar(workspace: Path) -> None:
+    """One place decides "which shape is this snapshot": tar first, then ``fs/``.
+
+    Both existing is not a shape the writer produces; the tar is the one it
+    *does* produce, and the control plane derives ``copy_from`` at it, so the
+    tar is the payload when the two are seen together.
+    """
+    from gateway_common import paths
+
+    entry = _store_entry(workspace, "snap_both")
+    (entry / "fs").mkdir()
+    _tar_member(entry)
+
+    assert paths.snapshot_payload(entry) == ("tar", entry / "fs.tar")
+    assert paths.snapshot_payload(_store_entry(workspace, "snap_none")) is None

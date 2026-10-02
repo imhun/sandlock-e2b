@@ -336,6 +336,30 @@ def snapshot_payload_dir(
     )
 
 
+def snapshot_payload(snapshot_dir: str | Path) -> tuple[str, Path] | None:
+    """``(shape, path)`` for one snapshot's payload, or ``None`` when it has none.
+
+    ``shape`` is ``"tar"`` for what the writer emits (``fs.tar``) and ``"dir"``
+    for the pre-tar exploded ``fs/`` directory. When both are on disk the tar
+    wins: it is the shape the writer produces and the one the create path's
+    ``copy_from`` names, so "both" means a leftover, not a second payload.
+
+    Here rather than in each reader because the two halves of this store are
+    read by code in three different images (the control plane, the per-node
+    agents, and the read-only acceptance probes); a fourth spelling of ``fs``
+    is how a probe ends up calling a healthy ``fs.tar`` snapshot "record only"
+    (review round 1, 2026-10-02).
+    """
+    directory = Path(snapshot_dir)
+    tar = directory / SNAPSHOT_PAYLOAD_TAR_NAME
+    if tar.is_file():
+        return "tar", tar
+    legacy = directory / SNAPSHOT_PAYLOAD_DIR_NAME
+    if legacy.is_dir():
+        return "dir", legacy
+    return None
+
+
 def migrate_staging_dir(
     workspace_base: str | Path,
     *,

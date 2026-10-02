@@ -437,7 +437,7 @@ Task 0 把两个命名空间合成一处之后，这里独立复核"**合并无�
 
 | 任务 | 这份文档给的约束 |
 |---|---|
-| Task 2（快照 tar） | 路径只有一个根：`<export>/_snapshots/<id>/{snapshot.json, fs.tar, .complete}`（§4.1）；"只有记录"的 `015f`/`1ca5` 是 `status: failed`，不得替它们造载荷（§4.2）；tar 通道要带 §3.1 的 `E2B_TREE_COPY_MAX_BYTES`（快照 ≤ 树上限 1 GiB）；**还要处理 §4.3 的副本间记录不一致**（删除/新增记录不会跨副本失效）<br>**Task 2 落地时按 brief 的裁定收窄了两条，在此点名**：① 按字节上限（`E2B_TREE_COPY_MAX_BYTES`）**没有**随这一步做，它和"拷贝窗口"一起归 Task 3（§3.1 那张表本来就是"三件一起做"，而它的措辞是"单次拷贝的在途量"）；② §4.3 的记录不一致**只观测、不改**（裁定 5/7：`.complete` 与记录不归 Task 2 动）——本轮撞到并记录，见 §7.6 与 `docs/deploy-clusters.md` §7.30。③ 读侧**两种形状都收**：`fs.tar` 解包 + 既有 `fs/` 合并（写侧只出 tar），加固只有一份实现（`gateway_common/archive.py`，三个调用方 import 同一个函数对象）；前后对照的复跑命令见 §7.6 |
+| Task 2（快照 tar） | 路径只有一个根：`<export>/_snapshots/<id>/{snapshot.json, fs.tar, .complete}`（§4.1）；"只有记录"的 `015f`/`1ca5` 是 `status: failed`，不得替它们造载荷（§4.2）；tar 通道要带 §3.1 的 `E2B_TREE_COPY_MAX_BYTES`（快照 ≤ 树上限 1 GiB）；**还要处理 §4.3 的副本间记录不一致**（删除/新增记录不会跨副本失效）<br>**Task 2 落地时按 brief 的裁定收窄了两条，在此点名**：① 按字节上限（`E2B_TREE_COPY_MAX_BYTES`）**没有**随这一步做，它和"拷贝窗口"一起归 Task 3（§3.1 那张表本来就是"三件一起做"，而它的措辞是"单次拷贝的在途量"）；② §4.3 的记录不一致**只观测、不改**（裁定 5/7：`.complete` 与记录不归 Task 2 动）——本轮撞到并记录，见 §7.6 与 `docs/deploy-clusters.md` §7.30。③ 读侧**两种形状都收**：`fs.tar` 解包 + 既有 `fs/` 合并（写侧只出 tar），加固只有一份实现（`gateway_common/archive.py`，三个调用方 import 同一个函数对象），"这是哪一形状"也只有一份实现（`gateway_common.paths.snapshot_payload`，两个读 store 的验收探针也走它）；前后对照的复跑命令见 §7.6<br>**④ 解包的内存账要分两半说（评审轮 1 修正）**：**成员数据**是流式的（逐成员过 tarfile 的 64 KiB 缓冲，不再整包——§3.0 那次 OOM 的驱动项）；**成员索引**仍由 stdlib 保留（`TarFile.next()` 无条件 `members.append`，实测 ~430 B/成员：20 万成员 ⇒ 85.7 MB），所以"全是极小成员"的病态 tar 仍按成员数付费。**成员数上限与 Task 3 的字节上限一起做**，本轮只把它写进 `gateway_common/archive.py` 的模块说明与 §7.6 |
 | Task 3（树本地） | 节点预算 8 GiB 树 + 4 GiB 镜像缓存 ≈ 12 GiB / 68–75 GiB 空闲（§2.3）；**大块顺序写会从 ≈488 MB/s 掉到 124.9–125.5 MB/s**（§1.2），元数据快 475×（§1.1）——验收必须用"运行时 I/O"（小文件）而不是建箱延迟立论；**淘汰上限 = `E2B_TREE_COPY_MAX_BYTES` + 拷贝窗口**（§3.1），因为恢复路径 900 MiB 已经把 `maint` 顶到 512.0 MiB 并且**真的 OOM 过一次**（§3.0） |
 | Task 4（state 分家） | 裁定 1/3：`command-logs.jsonl` 可以本地、`_runtime/<id>/sandbox.json` 留共享（§5.1）；容量上本节点 state 是小文件，不是容量项（§2.3） |
 
@@ -528,6 +528,11 @@ env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
 * 老快照那条腿用 `restore_snapshot_probe.py`：四个 id 逐条给一个 `ID:PATH[:EXPECT]`
   （命令见 `docs/deploy-clusters.md` §7.29 的复跑段）。它是**新代码读旧形状**的钉子：
   读侧必须同时认 `fs.tar` 与 `fs/`。
+* 两个**只读 store 探针**（§7.5 的 `local_first_snapshot_verify.py` 与 §7.3 的
+  `local_first_capacity_account.py`）现在按 `gateway_common.paths.snapshot_payload` 认载荷，
+  每行多一个 `payload_shape`（`"tar"` / `"dir"`）：Task 2 之前它们写死 `fs`，上线后会把每个
+  新快照分进"`record only`" —— 那正是 §4.2 的数据缺陷类。修正由
+  `tests/unit/test_snapshot_tar.py` 的两条用例钉住（tar 与目录各一条）。
 
 > **§0 里有一处旧数，留给后续任务清**：§0 第 1 条写"元数据上快 480×（2627.2 ms vs
 > 5.5 ms）"，那是 Task 1 修正 `pct()` 之前的读数；§1.1 重测后是 **475×（2601.3 ms vs

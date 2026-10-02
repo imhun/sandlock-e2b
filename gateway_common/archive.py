@@ -31,11 +31,23 @@ them: "the payload is hostile/broken" (502 on a create) is not "the plan is
 wrong" (400), and neither is "the destination holds a link" -- which is the
 §4.3.1 requirement that the *destination* side has its own name.
 
-The unpack **streams**: members are walked one at a time and never listed into
-memory up front (``getmembers()`` builds an index of the whole archive, and a
-real snapshot is far larger than the ones this was written against -- the
-agent's ``maint`` container was OOM-killed once during Task 1's measurement,
-``docs/create-local-first-design.md`` §3.0).
+The unpack **streams the member data**: members are walked one at a time and
+each one's bytes go through ``tarfile``'s own 64 KiB buffer, so the payload is
+never held whole (that is the driver of the OOM the agent's ``maint`` container
+hit during Task 1's measurement, ``docs/create-local-first-design.md`` §3.0:
+900 MiB of tree into a 512 MiB cgroup).
+
+It does **not** make the unpack index-free, and this module must not be read as
+claiming it does: CPython's ``TarFile.next()`` appends every ``TarInfo`` to
+``TarFile.members`` no matter who iterates, so a caller that avoids
+``getmembers()`` still pays ~430 B per member (measured on 3.12.13, 2026-10-02:
+200 000 members ⇒ ``len(tar.members)`` 200 000 and an 85.7 MB peak for a
+102.4 MB archive of empty members ⇒ 428.6 B/member; review round 1 measured
+88.8 MB ≈ 444 B/member for the same shape). A pathological archive of
+~2 000 000 empty members (~1 GiB of 512 B headers) therefore still costs the
+agent ~0.9 GB of index. Bounding *that* is a named follow-up (a member-count cap
+belongs beside Task 3's byte cap); what is asserted here today is only the data
+path.
 """
 
 from __future__ import annotations

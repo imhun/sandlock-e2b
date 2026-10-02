@@ -30,6 +30,20 @@ import sys
 import time
 from pathlib import Path
 
+#: The checkout root when this file is run *as a script* (``python3 <path>``
+#: puts the script's own directory on ``sys.path``, not the repo root). The
+#: documented invocation inside the pods -- ``python3 - < <this file>`` -- has
+#: no ``__file__`` and starts in ``/app``, which is the repo root already.
+_ROOT = Path(__file__).resolve().parents[3] if "__file__" in globals() else None
+if _ROOT is not None and str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+# The payload's shape is decided in one place (``gateway_common/paths.py``);
+# this probe runs inside the agent image's ``maint`` container, whose workdir is
+# ``/app``. A second spelling of ``fs`` here counted every Task 2 snapshot
+# (``fs.tar``) as having no payload at all.
+from gateway_common.paths import snapshot_payload
+
 KNOBS = (
     "E2B_SHARED_VOLUME_ROOT",
     "E2B_WORKSPACE_BASE",
@@ -101,10 +115,13 @@ def snapshot_records(root: Path) -> list[dict[str, object]]:
     for entry in sorted(store.iterdir()):
         if not entry.is_dir():
             continue
+        found = snapshot_payload(entry)
+        shape, _payload = found if found is not None else (None, None)
         row: dict[str, object] = {
             "id": entry.name,
             "record": (entry / "snapshot.json").is_file(),
-            "payload": (entry / "fs").is_dir(),
+            "payload": shape is not None,
+            "payload_shape": shape,
             "created_at": None,
             "status": None,
             "payload_bytes": None,

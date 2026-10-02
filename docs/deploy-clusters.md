@@ -1535,10 +1535,15 @@ E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000 \
 
 **代码面**：写侧 `envd_service/agent.py::_write_snapshot_tar`（临时名 → `fsync` → `rename`
 → `.complete` 最后，与 `.oci.tar` 同款纪律）；读侧 `c3_agent/materialize.py::_take_snapshot_payload`
-与 worker 降级路**两种形状都收**（`fs.tar` 流式解包 / 既有 `fs/` 目录合并）；
+与 worker 降级路**两种形状都收**（`fs.tar` 逐成员解包 / 既有 `fs/` 目录合并；
+**数据**是流式的，**成员索引**仍由 stdlib 保留 ~430 B/成员 —— 成员数上限与 Task 3 的字节
+上限一起做，见 `gateway_common/archive.py` 的模块说明）；
 `control_plane/file_ops.py::derive_materialize` 的 `copy_from` 指向 `fs.tar`；
 加固（成员过滤 + `dest` 包含检查）只有**一份实现**：`gateway_common/archive.py`，
 控制面与两个 agent 一起 import 同一个函数对象（`tests/unit/test_snapshot_tar.py` 钉住）。
+两个**只读 store 探针**（`local_first_snapshot_verify.py`、`local_first_capacity_account.py`）
+原来写死 `fs`，本轮跟着改成 `gateway_common.paths.snapshot_payload`，每行多一个
+`payload_shape` —— 不改的话上线后它们会把每个新快照报成"record only"（§4.2 的数据缺陷类）。
 单测：新 `tests/unit/test_snapshot_tar.py` + 改 `test_agent_materialize.py` /
 `test_cp_materialize_instruction.py` / `test_agent_create_sandbox_auth.py`；`tests/unit`
 与基线逐条相同（3 条 macOS-only）。

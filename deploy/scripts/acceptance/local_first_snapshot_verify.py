@@ -12,8 +12,10 @@ What it establishes, from the live volume and not from the migration's own
 report:
 
 * per id: which of ``snapshot.json`` (record), ``.complete`` (payload finished)
-  and ``fs/`` (payload) are present, plus the record's own ``status`` and
-  ``created_at`` -- so a "record only" id can be read as *why* it has no payload;
+  and the payload -- ``fs.tar`` (Task 2) or the pre-tar ``fs/`` directory, the
+  question ``gateway_common.paths.snapshot_payload`` answers in one place -- are
+  present, plus the record's own ``status`` and ``created_at`` -- so a "record
+  only" id can be read as *why* it has no payload;
 * every id has at most one record and at most one payload (no id was silently
   resolved to one of two copies);
 * the old payload root ``<workspaces>/_snapshots`` is gone and ``<workspaces>``
@@ -47,11 +49,26 @@ import argparse
 import json
 import os
 import sys
+import tarfile
 from pathlib import Path
+
+#: The checkout root when this file is run *as a script* (``python3 <path>``
+#: puts the script's own directory on ``sys.path``, not the repo root). The
+#: documented invocation inside the pods -- ``python3 - < <this file>`` -- has
+#: no ``__file__`` and starts in ``/app``, which is the repo root already.
+_ROOT = Path(__file__).resolve().parents[3] if "__file__" in globals() else None
+if _ROOT is not None and str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+# The store's two payload names and the "which shape is this snapshot" question
+# have exactly one home (``gateway_common/paths.py``): this probe runs inside
+# the platform's own images (``/app`` is the workdir on all three), and a
+# second spelling of ``fs`` here is how a healthy ``fs.tar`` snapshot gets
+# filed under "record only" -- the data-defect class -- after Task 2.
+from gateway_common.paths import snapshot_payload
 
 RECORD = "snapshot.json"
 MARKER = ".complete"
-PAYLOAD = "fs"
 
 #: The verbs the migration script writes. Anything else is reported by name --
 #: but as an *unknown line*, never as a "refusal": see the module docstring.
@@ -62,12 +79,14 @@ JOURNAL_HEADER = "# state-base-migration-journal"
 
 def classify(entry: Path) -> dict[str, object]:
     record = entry / RECORD
-    payload = entry / PAYLOAD
+    found = snapshot_payload(entry)
+    shape, payload = found if found is not None else (None, None)
     result: dict[str, object] = {
         "id": entry.name,
         "record": record.is_file(),
         "complete": (entry / MARKER).is_file(),
-        "payload_dir": payload.is_dir(),
+        "payload": shape is not None,
+        "payload_shape": shape,
         "payload_entries": None,
         "payload_bytes": None,
         "status": None,
@@ -85,7 +104,7 @@ def classify(entry: Path) -> dict[str, object]:
             result["created_at"] = data.get("created_at")
             result["sandbox_id"] = data.get("sandbox_id")
             result["node_id"] = data.get("node_id")
-    if result["payload_dir"]:
+    if shape == "dir":
         entries = 0
         total = 0
         for dirpath, dirnames, filenames in os.walk(payload):
@@ -97,6 +116,12 @@ def classify(entry: Path) -> dict[str, object]:
                     pass
         result["payload_entries"] = entries
         result["payload_bytes"] = total
+    elif shape == "tar":
+        # One tar, so "entries" is its member count and "bytes" the file's own
+        # size -- the numbers the design document's §4.1 table reports.
+        with tarfile.open(payload) as tar:
+            result["payload_entries"] = sum(1 for _ in tar)
+        result["payload_bytes"] = payload.stat().st_size
     return result
 
 
@@ -229,7 +254,7 @@ def main() -> int:
     classes = {"record+payload": [], "record only": [], "payload only": [], "empty": []}
     for entry in entries:
         has_record = bool(entry["record"])
-        has_payload = bool(entry["payload_dir"])
+        has_payload = bool(entry["payload"])
         key = {
             (True, True): "record+payload",
             (True, False): "record only",
