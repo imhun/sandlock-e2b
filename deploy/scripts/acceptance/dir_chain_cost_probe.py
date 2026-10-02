@@ -38,14 +38,19 @@ as it was found.
     env -u http_proxy -u https_proxy -u all_proxy tmp/venv/bin/python \
         deploy/scripts/acceptance/dir_chain_cost_probe.py --n 20
 
-2026-10-02 (`0.1.0-895-gc478ca0`, tree depth 5, one sandbox, ``--n 20``, p50 ms
-on each of the two agent pods):
+2026-10-02, tree depth 5, one sandbox, ``--n 20``, p50 ms on each of the two
+agent pods. The ``after`` half is **the shipped module** on
+``0.1.0-900-g0079c84`` (the probe reports ``candidate_is_the_shipped_module=True``
+when the checkout and ``/app/c3_agent/materialize.py`` are the same bytes); the
+``before`` half is that run's spelled-out walk, and the numbers the *deployed*
+walk gave on ``0.1.0-895-gc478ca0`` -- where it still existed -- sit in
+parentheses next to it:
 
-    before_one_walk             6.658 / 6.853   (5 components, ~1.33 ms each)
-    before_create              15.470 / 15.913  (the tree's chain, twice)
-    before_create_from_a_tar   22.148 / 22.937  (root, subdir, root again)
-    after_create                8.848 / 9.228   5 components + 1 re-checked leaf
-    after_create_from_a_tar    11.075 / 11.373  ~11 ms off one create
+    before_one_walk             6.537 / 6.840   (895: 6.658 / 6.853)
+    before_create              15.238 / 16.014  (895: 15.470 / 15.913)
+    before_create_from_a_tar   21.710 / 23.017  (895: 22.148 / 22.937)
+    after_create                8.734 / 9.238   5 components + 1 re-checked leaf
+    after_create_from_a_tar    10.873 / 11.541  ~11 ms off one create
     descriptors_name_the_same_directory=True
 
 The ``after`` side is not zero on purpose: the first walk of a chain still
@@ -58,6 +63,7 @@ the node-local disk) is what takes the remaining walk off the NAS.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -69,6 +75,7 @@ MODULE = REPO / "c3_agent" / "materialize.py"
 #: the candidate's own names (``_VerifiedDirectories``) are in scope while the
 #: deployed ``c3_agent.materialize`` is a second, independent module.
 SNIPPET = r'''
+import hashlib as _hashlib
 import os as _os
 import statistics as _statistics
 import sys as _sys
@@ -78,6 +85,7 @@ from pathlib import Path as _Path
 import c3_agent.materialize as _live
 
 _N = __N__  # substituted by the caller: `kubectl exec` does not forward its env
+_candidate_sha = __MODULE_SHA__
 _root = _Path(_sys.argv[1])
 _subdir = _root / "workspace"
 assert _subdir.is_dir(), f"{_subdir} is not a directory"
@@ -183,6 +191,11 @@ print(
     f"python={_sys.version.split()[0]} deployed={_live.__file__}"
     f" candidate=<the piped c3_agent/materialize.py> before_source={_before_source}"
 )
+_deployed_sha = _hashlib.sha256(_Path(_live.__file__).read_bytes()).hexdigest()
+print(
+    f"METRIC candidate_sha256={_candidate_sha} deployed_sha256={_deployed_sha}"
+    f" candidate_is_the_shipped_module={_candidate_sha == _deployed_sha}"
+)
 print(
     f"tree={_root} depth={len(_root.parts) - 1}"
     f" subdir_depth={len(_subdir.parts) - 1} n={_N}"
@@ -240,7 +253,10 @@ def _agent_pods(selector: str) -> list[str]:
 
 def _run_in_pod(pod: str, container: str, tree: str, n: int) -> str:
     """Pipe the candidate module + the probe snippet into the agent container."""
-    program = MODULE.read_text(encoding="utf-8") + SNIPPET.replace("__N__", str(n))
+    sha = hashlib.sha256(MODULE.read_bytes()).hexdigest()
+    program = MODULE.read_text(encoding="utf-8") + SNIPPET.replace("__N__", str(n)).replace(
+        "__MODULE_SHA__", repr(sha)
+    )
     completed = subprocess.run(
         [
             "kubectl",
