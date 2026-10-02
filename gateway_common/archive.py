@@ -46,8 +46,9 @@ claiming it does: CPython's ``TarFile.next()`` appends every ``TarInfo`` to
 88.8 MB ≈ 444 B/member for the same shape). A pathological archive of
 ~2 000 000 empty members (~1 GiB of 512 B headers) therefore still costs the
 agent ~0.9 GB of index. Bounding *that* is a named follow-up (a member-count cap
-belongs beside Task 3's byte cap); what is asserted here today is only the data
-path.
+belongs beside Task 3's byte cap) -- it is registered as **N63** in
+``docs/open-issues.md`` so the next reader finds the owner here instead of the
+orphan note; what is asserted here today is only the data path.
 """
 
 from __future__ import annotations

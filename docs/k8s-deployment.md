@@ -214,7 +214,8 @@ kubectl -n $NS rollout status sts/e2b-worker
 worker 侧关键 env（语义见 `deploy/stack/.env.example` 的同名键）：
 `E2B_WORKSPACE_BASE`、`E2B_IMAGE_CACHE_DIR/MAX_BYTES/EVICT_MIN_AGE_S/OWNER_UID`、
 `E2B_ROUTE_B_TMP_ROOT`（C3 Task 4 片 B 起**CP 也要设**：`scope-slot-document` 的路径由 CP 推导，两侧必须逐字一致；
-值在 `E2B_STATE_BASE` 之下，N27）、`E2B_PRIV_HELPER_TRANSPORT=agent`（**C3 出厂形态**：worker 一个特权二进制都不 exec）、
+值今天在 `E2B_NODE_STATE_BASE` 之下 —— N57 / Task 4 把它从 `E2B_STATE_BASE` 搬到了节点本地，
+因为写者与读者都只在本节点）、`E2B_PRIV_HELPER_TRANSPORT=agent`（**C3 出厂形态**：worker 一个特权二进制都不 exec）、
 `E2B_SLOT_IDENTITY=agent-grant`、
 `E2B_NODE_{MEMORY_MB,CPU_PERCENT,DISK_MB,PROCESSES}`（容量声明，autoscaler 与调度都看它）。
 （`E2B_PRIV_HELPER_SOCKET` **已不在 worker env 里**：C3 Task 7 把它连同 `socket` 形态与 broker 一起退役了。）
@@ -990,6 +991,13 @@ DEPLOYMENT SMOKE OK / MULTI-NODE SMOKE OK
 ---
 
 ## 13. 收口 N13：多副本 worker 共用一份 base 不互相破坏（2026-09-17）
+
+> **本节是历史记录：它测的那份形状今天已经不存在。** 2026-09-17 当时
+> `E2B_WORKSPACE_BASE` 是**所有 worker 副本共用**的一份存储；2026-10-02 的 Task 3 把沙箱树
+> 搬到**节点本地盘**（`E2B_TREES_SHARED=0`，见 `docs/deploy-clusters.md` §7.32），所以
+> "一份 base、每个副本都能走到别人建的树"这个前提不再成立 —— 下面的判据与读数按 2026-09-17
+> 的形状读，不要拿它当今天的行为依据。它证明过的结论（reconcile 不误删别人的活树）仍然有效，
+> 而且 `E2B_TREES_SHARED=1` 的回退形状（§7.33.5）会把它原样复活。
 
 ### 13.1 N13 到底在问什么
 
@@ -2688,6 +2696,14 @@ kubectl -n sandlock scale statefulset/e2b-worker --replicas=2
 
 ### 23.3 回退（原路退回 + 撤掉新清单里的 `E2B_STATE_BASE`）
 
+> **这一步测的是 N27 当天的两项改动；清单里另有两处此后又动过，照下面的清单改之前先读本框。**
+> N58 把控制面的迁移暂存 subPath 从 `workspaces/_migrate` 提到了 export 根的 `_migrate`；
+> N57 / Task 4 把 worker 的 `E2B_ROUTE_B_TMP_ROOT` 从 `E2B_STATE_BASE` 挪到了
+> `E2B_NODE_STATE_BASE`（节点本地）。所以下面第 3、4 条的**字符串**是 N27 当天的值，今天回退
+> 要在**当前**清单上做等价动作。另：本节的回退只退 N27；Task 3 的介质翻转（树在节点本地盘）
+> 有自己的一套（判据 + 四条 env + 一个数据步骤），见 `docs/deploy-clusters.md` §7.33.5 ——
+> 两件事不要混在一起做。
+
 脚本在卷上留了一份 **0600** 的映射表 `state/.state-base-migration.journal`（每搬一项就
 `fsync` 追加一行），回退就是拿它逐条反向改名：
 
@@ -2741,6 +2757,14 @@ kubectl -n sandlock exec e2b-worker-0 -c worker -- sh -c '
 
 ## 24. C1（2026-09-27）：平台态属主迁移（root worker → uid 65534）
 
+> **本节是 2026-09-27 当天的记录，其中两处前提此后被取代（读数与路径计划保留原样）**：
+> ① N58 把 worker 的快照 payload 根从 `<export>/workspaces/_snapshots` **搬到了 export 根的
+> `<export>/_snapshots`**（与 `SnapshotRegistry` 的根合并成一个；见
+> `gateway_common/paths.py::snapshot_payload_dir`）；② Task 3（2026-10-02）把沙箱树从共享卷
+> 搬到**节点本地盘**，所以「树根下」不再是共享卷上的目录。当时那份属主迁移已经跑完，存量数据
+> 不受影响；**照这节重跑之前先读 `docs/deploy-clusters.md` §7.33 与脚本自己的 `--print-plan`**，
+> 别把当时的路径串当成今天的。
+
 **为什么需要**：C1 wave 2 之后 worker 以 uid 65534 跑、pod 里没有任何 root 容器
 （`deploy/k8s/worker.yaml`），而**今天**卷上的平台态是 root worker 写下的（`0600`/`0700`）。
 不做迁移就上 worker 的话，uid 65534 的 worker 连自己的记录与 uid 池的锁都打不开 ⇒ 每个
@@ -2756,9 +2780,12 @@ fail closed —— 直接 apply 原文件不会 chown 任何东西。
 `_images`/`_secrets`/`_snapshots`/`_templates`/`_builds` 八条）—— **树根下恰放行
 `workspaces/_migrate` 与 `workspaces/_snapshots` 这两条**：前者是控制面的迁移暂存（N27 之后
 就在树根之下，`workspace-root-init` 建的是它，控制面唯一可写的 subPath 也是它）；后者是
-**worker 的快照 payload 根** —— `envd_service/agent.py` 把 copy/export/delete 三个路由硬编码
+**worker 的快照 payload 根** —— 当天 `envd_service/agent.py` 把 copy/export/delete 三个路由硬编码
 在 `<workspace_base>/_snapshots/<id>`，也就是 `<export>/workspaces/_snapshots`（2026-09-27
-真机预检发现它在树根下、属主 `root:0755`，C1 之后 65534 的 worker 写不进去）。快照的**两个
+真机预检发现它在树根下、属主 `root:0755`，C1 之后 65534 的 worker 写不进去）。
+**⚠ 这条已被 N58 取代**（2026-10-02）：三个路由改走 `gateway_common/paths.py::snapshot_payload_dir`，
+worker 的 payload 根与 `SnapshotRegistry` 合成一个，都在 export 根的 `<export>/_snapshots/<id>`；
+见本节开头的历史框与 `docs/deploy-clusters.md` §7.29。**当时**快照的**两个
 根**是不同的：控制面的 `SnapshotRegistry` 建在共享 export 根上（`control_plane/app.py` 的
 `platform_root` = `settings.shared_workspace_root` ⇒ `<export>/_snapshots/<id>`），worker 写
 那条在树根下；**两个根都在上面这 8 条计划里，所以谁写哪个根都被覆盖到**。树根下这两条平台

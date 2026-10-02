@@ -721,9 +721,9 @@ spec:
             # 属主/删除必须落在 worker 看得见的那些树上。
             - name: shared
               mountPath: /var/lib/e2b-sandboxes
-            # Task 3: 节点本地的沙箱树根（第六个白名单根）。与 worker 同一个
-            # hostPath —— 白名单按解析后的路径比较，两侧必须指到节点上的同一个
-            # 目录；巡检看的就是这一个根。
+            # Task 3: 节点本地的沙箱树根（白名单的第一根，`E2B_WORKSPACE_BASE`）。
+            # 与 worker 同一个 hostPath —— 白名单按解析后的路径比较，两侧必须指到
+            # 节点上的同一个目录；巡检看的就是这一个根。
             - name: workspace-root
               mountPath: /var/lib/e2b/workspaces
             # 节点本地的解包缓存（第四个白名单根），与 worker/broker 同一个 hostPath。

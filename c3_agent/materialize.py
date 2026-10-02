@@ -88,12 +88,18 @@ class MaterializeRefusal(Exception):
 
 
 def agent_roots(settings) -> tuple[Path, ...]:
-    """This agent's own four roots, resolved -- ``priv_common.c``'s order.
+    """The roots a materialize plan may name, resolved -- ``priv_common.c``'s
+    order, minus the node-local state base.
 
-    The same values :func:`c3_agent.fileops.maint_env` writes into the child's
-    environment, read from the same settings object: a path this module accepts
-    is a path the binary would accept, and a deployment that re-points one of
-    them moves both together.
+    Four entries, not the five the privileged side carries
+    (:func:`c3_agent.fileops.maint_env`'s child environment, ``priv_common.c``'s
+    whitelist, ``control_plane.file_ops.ControlPaths.roots``): the fifth,
+    ``E2B_NODE_STATE_BASE`` (N57 / Task 4), holds the create marker, the
+    disk-stat seed and ``.route-b``, and no materialize plan names a path under
+    it -- so it is deliberately absent here rather than forgotten. The four
+    that *are* here are read from the same settings object as the child's
+    environment, so a deployment that re-points one of them moves both
+    together.
     """
     roots: list[Path] = [Path(settings.workspace_base).resolve()]
     state = Path(settings.state_base or settings.workspace_base).resolve()
@@ -109,7 +115,7 @@ def agent_roots(settings) -> tuple[Path, ...]:
 
 
 def resolve_inside(path: str, *, roots: tuple[Path, ...]) -> Path:
-    """``realpath(path)``, or a named refusal when it leaves the four roots."""
+    """``realpath(path)``, or a named refusal when it leaves the roots."""
     if not isinstance(path, str) or not path.startswith("/"):
         raise MaterializeRefusal(
             PATH_OUTSIDE_ROOTS, f"{path!r} is not an absolute path"

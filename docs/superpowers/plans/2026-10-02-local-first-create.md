@@ -26,12 +26,12 @@
 | 上线（Step 7 的停机那一半） | ✅ | `docs/deploy-clusters.md` §7.29。顺序：关自动扩缩器（新坑，见 §7.29）→ worker 缩 0 → 迁移 → apply → 起 worker；迁移 `done=14`，`GET /sandboxes`=`[]`，`DRY_RUN` diff 0 行 |
 | 上线当场抓到的一次回归 | ✅ 已前滚修 | `derive_materialize` 的 `copy_from` 指向树根 ⇒ 从快照建箱全 502；`7ef319b` 修 + 复验（4/4 老快照恢复）|
 
-**进度（2026-10-02 更新）**：**Task 0–5 已完成并上线**（版本线见 `docs/deploy-clusters.md`
+**进度（2026-10-02 更新）**：**Task 0–6 已完成并上线**（版本线见 `docs/deploy-clusters.md`
 §7.33：`0.1.0-887` 根重切 → `0.1.0-892/895` 快照 tar → `0.1.0-900` 本节点 state →
-`0.1.0-905` 树本地化 → `0.1.0-908` 两条上线后修复），本节下方 Task 1–5 的勾选就是它们的
-落地记录。**Task 6（跨切面验收）**：冒烟先红后绿（N59/N60/N61 三个独立问题，见
-`docs/deploy-clusters.md` §7.33.4），N59 的代码修复 `32f3667` **尚未部署** —— 它的 Step
-在本轮上线之前保持未勾选。
+`0.1.0-905` 树本地化 → `0.1.0-908` 两条上线后修复 → `0.1.0-915` N59 修复），本节下方
+Task 1–6 的勾选就是它们的落地记录。**Task 6（跨切面验收）**：冒烟先红后绿（N59/N60/N61
+三个独立问题，见 `docs/deploy-clusters.md` §7.33.4），N59 的代码修复 `32f3667` **已随
+`0.1.0-915-gfb8a74b-20261002-211709` 上线**（上线与对账复验见 §7.33.4 的 T4）。
 
 ⚠ **上线顺序已执行过一次**（`308b543` + `4ac410b` 同一次上线，2026-10-02）。下一个动到根的提交要照 §7.29 那套走：**先 `E2B_AS_ENABLED=false` 关掉抢副本的循环，再 worker 缩到 0 → 迁移（先 dry-run）→ apply 新清单 → 起 worker → 验证**。回退窗口仍然开着：`state/.state-base-migration.journal` + `migrate-state-base.sh --rollback --apply`，但**回退后必须同时回退镜像**。
 
@@ -210,11 +210,17 @@
 
 **Files:** Modify `deploy/stack/.version`、`docs/deploy-clusters.md`（§7.29）、`docs/open-issues.md`（N57）、`README.md`。
 
-- [ ] **Step 1: 重建上线**（`screen` 里跑 `build-and-push.sh`；`DRY_RUN | kubectl diff` 只应有镜像 tag）。
-- [ ] **Step 2: 量三件事并分形状报**：plain 建箱 p50（目标 ~60 ms）、**快照建箱每条目/每字节**（目标：2000 文件 52 s → 亚秒）、迁移保文件。
-- [ ] **Step 3: 冒烟与残留**：`MULTI-NODE`/`DEPLOYMENT`、`GET /sandboxes` = `[]`、两节点无残树、pod 全 Running、`DRY_RUN` diff 0 行。
-- [ ] **Step 4: 写 §7.29 / N57 / README**，把每条判据与读数对上，并写明**两条硬约束**（容量、页缓存）各自的上限配置。
-- [ ] **Step 5: 提交**。
+- [x] **Step 1: 重建上线** —— 本批各任务各自上线（`0.1.0-887 → 892/895 → 900 → 905 → 908`），
+  最后 N59 的修复随 **`0.1.0-915-gfb8a74b-20261002-211709`** 上线（三个镜像同 tag，9 pod
+  Running）；版本线与 T4 见 `docs/deploy-clusters.md` §7.33 / §7.33.4。
+- [x] **Step 2: 量三件事并分形状报** —— 读数见 §7.33.1：plain 建箱 p50 **40 ms（平台侧）/
+  70–71 ms（客户端边界）**、2000 文件的快照建箱 **532 ms p50**、迁移保文件 **889/895 ms**。
+- [x] **Step 3: 冒烟与残留** —— 先红后绿，全过程见 §7.33.4（A → T1 红灯 → T2 控制者清理 →
+  T3 绿灯）；T3：两条冒烟 OK、`GET /sandboxes` = `[]`、两节点树根 0 项、9 pod Running、
+  `DRY_RUN | kubectl diff` 0 行。
+- [x] **Step 4: 写 §7.29 / N57 / README** —— §7.29–§7.33（含两条硬约束与各自的上限配置，
+  §7.33.2）、`docs/open-issues.md` 的 N57 行扩展、`README.md` §8.1。
+- [x] **Step 5: 提交** —— `ff2cfa5`（Task 6 交付）+ N59 收尾的 `32f3667`…`fb8a74b`。
 
 ---
 

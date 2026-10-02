@@ -19,6 +19,7 @@ works. Nothing here can be "unsupported".
 
 from __future__ import annotations
 
+import tarfile
 from pathlib import Path
 
 import httpx
@@ -101,6 +102,20 @@ def _snapshot(workspace: Path) -> Path:
     return fs
 
 
+def _snapshot_tar(workspace: Path) -> Path:
+    """The payload the writer emits today: one ``fs.tar`` at the store root."""
+    store = workspace / "workspaces" / "_snapshots" / SNAPSHOT
+    store.mkdir(parents=True, exist_ok=True)
+    archive_path = store / "fs.tar"
+    stage = workspace / "stage"
+    (stage / "workspace").mkdir(parents=True, exist_ok=True)
+    (stage / "workspace" / "kept.txt").write_text("kept\n", encoding="utf-8")
+    with tarfile.open(archive_path, "w") as tar:
+        for child in sorted(stage.iterdir(), key=lambda item: item.name):
+            tar.add(child, arcname=child.name, recursive=True)
+    return archive_path
+
+
 def _spy_volume_pass(monkeypatch) -> list[bool]:
     """Record what the volume pass is told about the slices."""
     seen: list[bool] = []
@@ -162,6 +177,38 @@ async def test_a_plain_create_still_builds_the_tree_and_hands_it_over(
     assert copies == [(fs, settings.workspace_base / SANDBOX)]
     assert relay.relayed == [("chown-workspace", SANDBOX, True)]
     assert slices == [False]
+
+
+@pytest.mark.asyncio
+async def test_a_plain_create_reads_the_tar_payload_too(
+    workspace: Path, monkeypatch
+) -> None:
+    """The degraded path reads **both** payload shapes (F7).
+
+    Task 2 changed what the writer leaves in the store from an exploded ``fs/``
+    to one ``fs.tar``. The reason this path landed without a pin of its own
+    ("Task 3 will replace it") stopped being true: compose/``local://`` and the
+    N56 degradations for old agents, ``per_sandbox_uid=false`` and a busy agent
+    all still reach it. The sibling test above pins the legacy ``fs/`` shape
+    (the ``copytree`` branch); this one pins the shape the writer emits today --
+    neither may quietly stop being read.
+    """
+    relay = _RelayStub()
+    copies: list[tuple] = []
+    monkeypatch.setattr(
+        agent_module.shutil, "copytree", lambda *args, **kwargs: copies.append(args)
+    )
+    _snapshot_tar(workspace)
+    app, settings, _ = _worker(workspace, monkeypatch, relay=relay)
+
+    resp = await _create(app, settings, snapshotID=SNAPSHOT)
+
+    assert resp.status_code == 201
+    # Unpacked, not copied: the tar shape never goes through ``copytree``.
+    assert copies == []
+    tree = settings.workspace_base / SANDBOX
+    assert (tree / "workspace" / "kept.txt").read_text(encoding="utf-8") == "kept\n"
+    assert relay.relayed == [("chown-workspace", SANDBOX, True)]
 
 
 @pytest.mark.asyncio
