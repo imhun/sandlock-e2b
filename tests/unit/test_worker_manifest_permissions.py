@@ -824,10 +824,13 @@ def test_k0s_overlay_control_plane_writes_only_the_migration_staging_and_state()
     The whole volume stays read-only, so a directory the control plane writes to
     is only writable if it is mounted back on top as a `subPath`. After N27
     there are two more of those: ``state`` (the platform's own files -- without
-    it every record write is EROFS) and ``workspaces/_migrate`` (the migration
-    staging, where a remote node's export tar is written).
+    it every record write is EROFS) and ``_migrate`` (the migration staging,
+    where a remote node's export tar is written).
 
-    `workspaces/_migrate` and **not** `workspaces`: OBS-9 measured "the control
+    N58 moved that staging **up** from ``workspaces/_migrate`` to the export
+    root, because its reader is the target node's agent -- with the trees on
+    node-local disk that node cannot see another node's tree root. `_migrate`
+    and **not** `workspaces`: OBS-9 measured "the control
     plane writing a sandbox tree is EROFS" (2026-09-18) and that property is
     kept -- mounting the tree root writable would hand it back. Missing either
     mount leaves the pod in ``ContainerCreating`` (no subPath source) or the
@@ -882,13 +885,14 @@ def test_k0s_overlay_control_plane_writes_only_the_migration_staging_and_state()
             "mountPath": "/var/lib/e2b-sandboxes/_volumes",
             "subPath": "_volumes",
         },
-        # The staging directory, *not* the tree root: sandbox trees stay EROFS
-        # for this pod (OBS-9). The key is the subPath, so a future edit that
-        # widened it to `workspaces` fails here.
-        "workspaces/_migrate": {
+        # The staging directory on the export root (N58 lifted it out of the
+        # tree root), and *not* the tree root: sandbox trees stay EROFS for this
+        # pod (OBS-9). The key is the subPath, so a future edit that widened it
+        # to `workspaces` -- or put the staging back under it -- fails here.
+        "_migrate": {
             "name": "shared",
-            "mountPath": "/var/lib/e2b-sandboxes/workspaces/_migrate",
-            "subPath": "workspaces/_migrate",
+            "mountPath": "/var/lib/e2b-sandboxes/_migrate",
+            "subPath": "_migrate",
         },
         "state": {
             "name": "shared",
@@ -911,7 +915,7 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
       traversable by the pooled sandbox uid (the slot is what writes the image)
       and listable by nobody, which is ``0711``; ``0700`` there is the
       measured EACCES that killed the first checkpoint capture (2026-09-25).
-    * ``<workspaces>/_migrate`` missing -- it is the *source* of the control
+    * ``<export>/_migrate`` missing -- it is the *source* of the control
       plane's one writable subPath under the tree root, and a subPath whose
       source does not exist keeps that pod in ``ContainerCreating``.
 
@@ -969,27 +973,28 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
         # control plane mounts, and the state base the uid pool needs).
         'for dir in "$base" "$state"; do',
         'mkdir -p "$dir"',
-        # ...plus the one directory inside the tree root the control plane is
-        # allowed to write (its migration staging).
-        'mkdir -p "$base/_migrate"',
+        # ...plus the migration staging, on the *export* root since N58 (the
+        # tree root is no longer the thing its reader can see).
+        'mkdir -p "$shared/_migrate"',
         # Task 8 preflight: the *live* snapshot store is the other platform
-        # directory under the tree root (`SnapshotRegistry`'s base IS the
-        # workspace base), and C1's 65534 worker writes snapshots into it. It is
-        # created and handed to the worker here; a root:0755 `<base>/_snapshots`
-        # is the silent "first create_snapshot is EACCES" failure. Dropping
+        # directory, and since N58 the agent's payloads and the control plane's
+        # records share one directory per id on the *shared export root*. It is
+        # created and handed to the worker here; a root:0755
+        # `<export>/_snapshots` is the silent "first create_snapshot is EACCES"
+        # failure. Dropping
         # either of these two lines must turn this test red.
-        'mkdir -p "$base/_snapshots"',
-        'chown 65534:65534 "$base/_snapshots" 2>/dev/null ||',
+        'mkdir -p "$shared/_snapshots"',
+        'chown 65534:65534 "$shared/_snapshots" 2>/dev/null ||',
         # ...and the mode stays the platform convention (0755), never the
         # sandbox-tree root's 1777 -- the snapshot store needs no cross-uid
         # sharing.
-        'chmod 0755 "$base/_snapshots" 2>/dev/null ||',
+        'chmod 0755 "$shared/_snapshots" 2>/dev/null ||',
         'if [ "$snap_owner" != "65534" ]; then',
         'mkdir -p "$state/_runtime/.checkpoints"',
         'chmod 0711 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||',
         # base, state and the migration staging get the same "writable by the
-        # worker" judgement (the worker stages a tar in `_migrate` too).
-        'for target in "$base" "$state" "$base/_migrate"; do',
+        # worker" judgement (the control plane stages a tar in `_migrate` too).
+        'for target in "$base" "$state" "$shared/_migrate"; do',
         'owner="$(stat -c %u "$target")"',
     ):
         assert expected in lines, expected

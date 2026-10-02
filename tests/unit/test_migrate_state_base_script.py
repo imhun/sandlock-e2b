@@ -380,7 +380,9 @@ def test_a_dry_run_plans_every_move_and_writes_nothing(
     assert [line for line in lines if line.startswith("MKDIR ")] == [
         "MKDIR state mode=1777",
         "MKDIR workspaces mode=1777",
-        "MKDIR workspaces/_migrate mode=1777",
+        # N58 把迁移暂存从树根下上浮到 export 根 —— 它仍然是控制面唯一可写的
+        # subPath 源，只是名字不再是 `workspaces/_migrate`。
+        "MKDIR _migrate mode=1777",
     ]
     assert "KEEP .uid_pool.lock kind=regular" in lines
     assert "LEAVE .uid_reservations kind=empty-dir（已确认空；只有 --delete-after 才删）" in lines
@@ -426,7 +428,7 @@ def test_apply_renames_every_tree_and_leaves_the_old_platform_alone(
     # The three directories this creates are the ones the worker's init would
     # style: 1777 for the roots the worker puts top-level names in, and the
     # checkpoint gate travels with `_runtime` unchanged.
-    for rel in (STATE_DIR, TREES_DIR, f"{TREES_DIR}/_migrate"):
+    for rel in (STATE_DIR, TREES_DIR, MIGRATE_DIR):
         assert stat.S_IMODE(os.lstat(export_root / rel).st_mode) == 0o1777, rel
     gate = export_root / STATE_DIR / "_runtime" / ".checkpoints"
     assert stat.S_IMODE(os.lstat(gate).st_mode) == 0o755
@@ -443,7 +445,7 @@ def test_apply_renames_every_tree_and_leaves_the_old_platform_alone(
     assert [line for line in journal if line.startswith("mkdir\t")] == [
         "mkdir\tstate",
         "mkdir\tworkspaces",
-        "mkdir\tworkspaces/_migrate",
+        "mkdir\t_migrate",
     ]
     assert not (tmp_path / "kubectl-was-called.log").exists()
 
@@ -796,3 +798,309 @@ def test_the_operator_path_carries_delete_after_into_the_job(tmp_path: Path) -> 
         "containers"
     ]
     assert container["args"] == ["--in-cluster", "--apply", "--delete-after"]
+
+
+# --- N58: `_snapshots` 合一 + `_migrate` 上浮 ---------------------------------
+#
+# N27 之后、N58 之前，两个平台命名空间挂在**树根**下
+# （`<export>/workspaces/_snapshots/<id>` 是 agent 的载荷、`<export>/workspaces/_migrate`
+# 是控制面的迁移暂存），而控制面的快照**记录**在 export 根
+# （`<export>/_snapshots/<id>/snapshot.json`）。记录与载荷被拆成两个命名空间正是
+# `registry/snapshots.py` 的注释说它们不是的那种形状。
+#
+# 这一阶段把载荷搬到记录旁边（一个 id 一个目录），并把迁移暂存上浮到 export 根
+# （它的读者是**另一个节点**的目标 agent）。两件事都是同挂载 `rename(2)`，与 N27
+# 同款：逐条 journal、可回退、inode 对账。
+
+
+MIGRATE_DIR = "_migrate"
+SNAPSHOT_DIR = "_snapshots"
+TREE_MIGRATE = f"{TREES_DIR}/{MIGRATE_DIR}"
+TREE_SNAPSHOTS = f"{TREES_DIR}/{SNAPSHOT_DIR}"
+
+
+def _node_counts(path: Path) -> tuple[int, int, int]:
+    """`counts_of` in the engine: a *non-directory* counts as (1, 0, size).
+
+    `_counts` walks the tree, so it answers (0, 0, 0) for a file -- which is the
+    wrong expectation for the merge entries (`.complete` and the snapshot
+    `sandbox.json` are single files).
+    """
+    if not path.is_dir():
+        return 1, 0, os.lstat(path).st_size
+    return _counts(path)
+
+
+@pytest.fixture()
+def uplift_root(tmp_path: Path) -> Path:
+    """A post-N27 export: the tree root has already sunk, both namespaces with it.
+
+    Mirrors the live shape (`docs/create-local-first-layout.md` §2.1) with two
+    of the three classes of live id:
+
+    * ``snap_aaa`` -- a **record and a payload on two different roots**
+      (``<export>/_snapshots/snap_aaa/snapshot.json`` written by the control
+      plane, ``<workspaces>/_snapshots/snap_aaa/{.complete,fs}`` by the agent).
+      The merge has to be per-entry: the target directory already exists.
+    * ``snap_bbb`` -- a **payload with no record**, so the whole directory moves
+      in one ``rename(2)`` (one inode, one journal line).
+
+    Plus the empty ``<workspaces>/_migrate`` and the things neither move
+    touches: the sunk tree, the platform state, and the six export-root
+    namespaces.
+    """
+    root = tmp_path / "export"
+    root.mkdir()
+    for name in STAY_AT_EXPORT_ROOT:
+        (root / name).mkdir()
+    (root / "_volumes" / "vol_1").mkdir()
+    (root / "_volumes" / "vol_1" / "data.bin").write_bytes(b"volume-data")
+    record = root / STATE_DIR / "_runtime" / "sbx_aaa"
+    record.mkdir(parents=True)
+    (record / "sandbox.json").write_text('{"sandbox_id": "sbx_aaa"}\n', encoding="utf-8")
+    (root / STATE_DIR / ".route-b" / "10000").mkdir(parents=True)
+    (root / TREES_DIR / "sbx_aaa" / "workspace").mkdir(parents=True)
+    (root / TREES_DIR / "sbx_aaa" / "workspace" / "hello.txt").write_text(
+        "hi\n", encoding="utf-8"
+    )
+    (root / TREES_DIR / "_migrate").mkdir()
+    (root / TREES_DIR / "_migrate").chmod(0o1777)
+    both = root / TREES_DIR / TREE_SNAPSHOTS.split("/", 1)[1] / "snap_aaa"
+    (both / "fs" / "workspace").mkdir(parents=True)
+    (both / "fs" / "workspace" / "kept.txt").write_text("kept\n", encoding="utf-8")
+    (both / "fs" / "sandbox.json").write_text(
+        '{"sandbox_id": "snap_aaa"}\n', encoding="utf-8"
+    )
+    (both / ".complete").write_text("", encoding="utf-8")
+    both.chmod(0o755)
+    (both.parent).chmod(0o755)
+    (root / SNAPSHOT_DIR / "snap_aaa").mkdir()
+    (root / SNAPSHOT_DIR / "snap_aaa" / "snapshot.json").write_text(
+        '{"snapshot_id": "snap_aaa"}\n', encoding="utf-8"
+    )
+    only_payload = root / TREES_DIR / "_snapshots" / "snap_bbb"
+    (only_payload / "fs").mkdir(parents=True)
+    (only_payload / ".complete").write_text("", encoding="utf-8")
+    (only_payload / "fs" / "sandbox.json").write_text(
+        '{"sandbox_id": "snap_bbb"}\n', encoding="utf-8"
+    )
+    only_payload.chmod(0o755)
+    return root
+
+
+def test_the_dry_run_plans_the_merge_and_the_uplift_and_writes_nothing(
+    uplift_root: Path, tmp_path: Path
+) -> None:
+    before = _inventory(uplift_root)
+    proc = _run(["--root", str(uplift_root)], env=_offline_env(tmp_path))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = proc.stdout.splitlines()
+    staging = _counts(uplift_root / TREE_MIGRATE)
+    marker = _node_counts(uplift_root / TREE_SNAPSHOTS / "snap_aaa" / ".complete")
+    payload = _counts(uplift_root / TREE_SNAPSHOTS / "snap_aaa" / "fs")
+    whole = _counts(uplift_root / TREE_SNAPSHOTS / "snap_bbb")
+    # 顺序：先上浮（它是控制面的 subPath 源，也是段更短的一条），再逐 id 合一；
+    # id 与条目都按名字排序，所以计划是确定的、可逐行钉的。
+    assert [line for line in lines if line.startswith("MOVE ")] == [
+        f"MOVE {TREE_MIGRATE} -> {MIGRATE_DIR} kind=uplift "
+        f"files={staging[0]} dirs={staging[1]} bytes={staging[2]}",
+        f"MOVE {TREE_SNAPSHOTS}/snap_aaa/.complete -> {SNAPSHOT_DIR}/snap_aaa/.complete "
+        f"kind=merge files={marker[0]} dirs={marker[1]} bytes={marker[2]}",
+        f"MOVE {TREE_SNAPSHOTS}/snap_aaa/fs -> {SNAPSHOT_DIR}/snap_aaa/fs "
+        f"kind=merge files={payload[0]} dirs={payload[1]} bytes={payload[2]}",
+        f"MOVE {TREE_SNAPSHOTS}/snap_bbb -> {SNAPSHOT_DIR}/snap_bbb "
+        f"kind=merge files={whole[0]} dirs={whole[1]} bytes={whole[2]}",
+    ]
+    # 三个目录里只有 `_migrate` 还不在（另外两个是 N27 建好的），
+    # 合一用的是既有的 `_snapshots/<id>`，不新建。
+    assert [line for line in lines if line.startswith("MKDIR ")] == [
+        "MKDIR state mode=1777",
+        "MKDIR workspaces mode=1777",
+        f"MKDIR {MIGRATE_DIR} mode=1777",
+    ]
+    # todo 的两处 rmdir 是搬空之后要拆掉的空壳（只 rmdir，不递归）。
+    assert "SUMMARY mode=plan moves=4 dirs=3 todo=7 done=0 unknown=0" in lines
+    assert [line for line in lines if line.startswith("STAY ")] == [
+        f"STAY {name}" for name in STAY_AT_EXPORT_ROOT
+    ]
+    assert _inventory(uplift_root) == before
+    assert not (tmp_path / "kubectl-was-called.log").exists()
+
+
+def test_apply_merges_the_store_and_lifts_the_staging(uplift_root: Path, tmp_path: Path) -> None:
+    before = _inventory(uplift_root)
+    proc = _run(["--root", str(uplift_root), "--apply"], env=_offline_env(tmp_path))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = proc.stdout.splitlines()
+    assert "SUMMARY mode=apply moves=4 dirs=3 todo=7 done=7 unknown=0" in lines
+    assert f"REMOVED {TREE_SNAPSHOTS}/snap_aaa mode=755" in lines
+    assert f"REMOVED {TREE_SNAPSHOTS} mode=755" in lines
+
+    after = _inventory(uplift_root)
+    # rename(2), not copy: 同一份 inode 出现在新位置 —— 包括整棵 `fs/` 子树。
+    assert after[f"{SNAPSHOT_DIR}/snap_aaa/fs"] == before[f"{TREE_SNAPSHOTS}/snap_aaa/fs"]
+    assert (
+        after[f"{SNAPSHOT_DIR}/snap_aaa/fs/workspace/kept.txt"]
+        == before[f"{TREE_SNAPSHOTS}/snap_aaa/fs/workspace/kept.txt"]
+    )
+    assert (
+        after[f"{SNAPSHOT_DIR}/snap_aaa/.complete"]
+        == before[f"{TREE_SNAPSHOTS}/snap_aaa/.complete"]
+    )
+    # ...记录一个字都没动，而且现在与载荷同处一个 id 目录。
+    assert (
+        after[f"{SNAPSHOT_DIR}/snap_aaa/snapshot.json"]
+        == before[f"{SNAPSHOT_DIR}/snap_aaa/snapshot.json"]
+    )
+    # 整条 id 目录是**一次** rename 过去的（连它自己的 inode 都还在）。
+    assert after[f"{SNAPSHOT_DIR}/snap_bbb"] == before[f"{TREE_SNAPSHOTS}/snap_bbb"]
+    assert after[MIGRATE_DIR] == before[TREE_MIGRATE]
+
+    # 树根下这两个命名空间不该剩下任何东西 —— 连空壳都不留（旧 init 会重建它们，
+    # 那就是"合掉了又长回来"）。
+    for gone in (
+        TREE_MIGRATE,
+        TREE_SNAPSHOTS,
+        f"{TREE_SNAPSHOTS}/snap_aaa",
+        f"{TREE_SNAPSHOTS}/snap_bbb",
+    ):
+        assert gone not in after, gone
+    # 沙箱树、平台状态、六个 export 根命名空间都没被碰过。
+    assert after[f"{TREES_DIR}/sbx_aaa"] == before[f"{TREES_DIR}/sbx_aaa"]
+    assert (
+        after[f"{STATE_DIR}/_runtime/sbx_aaa/sandbox.json"]
+        == before[f"{STATE_DIR}/_runtime/sbx_aaa/sandbox.json"]
+    )
+    for name in STAY_AT_EXPORT_ROOT:
+        if name == SNAPSHOT_DIR:
+            # `_snapshots` 自己**必然**变：合的合进来、整条 id 搬进来，目录里多出
+            # 条目。要钉的是它原来那份记录一个字都没动（上面那条断言）。
+            continue
+        assert after[name] == before[name], name
+    assert (
+        uplift_root / SNAPSHOT_DIR / "snap_aaa" / "fs" / "workspace" / "kept.txt"
+    ).read_text(encoding="utf-8") == "kept\n"
+
+    journal = (uplift_root / JOURNAL_REL).read_text(encoding="utf-8").splitlines()
+    assert [line for line in journal if line.startswith("move\t")] == [
+        f"move\t{TREE_MIGRATE}\t{MIGRATE_DIR}",
+        f"move\t{TREE_SNAPSHOTS}/snap_aaa/.complete\t{SNAPSHOT_DIR}/snap_aaa/.complete",
+        f"move\t{TREE_SNAPSHOTS}/snap_aaa/fs\t{SNAPSHOT_DIR}/snap_aaa/fs",
+        f"move\t{TREE_SNAPSHOTS}/snap_bbb\t{SNAPSHOT_DIR}/snap_bbb",
+    ]
+    assert [line for line in journal if line.startswith("mkdir\t")] == [
+        f"mkdir\t{MIGRATE_DIR}"
+    ]
+    # rmdir 的条目带着删之前的权限位：回退要把它按原样建回来。
+    assert [line for line in journal if line.startswith("rmdir\t")] == [
+        f"rmdir\t{TREE_SNAPSHOTS}/snap_aaa\t755",
+        f"rmdir\t{TREE_SNAPSHOTS}\t755",
+    ]
+    assert stat.S_IMODE(os.lstat(uplift_root / MIGRATE_DIR).st_mode) == 0o1777
+    assert not (tmp_path / "kubectl-was-called.log").exists()
+
+
+def test_rollback_puts_both_namespaces_back_at_their_old_inodes(
+    uplift_root: Path, tmp_path: Path
+) -> None:
+    before = _inventory(uplift_root)
+    env = _offline_env(tmp_path)
+    assert _run(["--root", str(uplift_root), "--apply"], env=env).returncode == 0
+    proc = _run(["--root", str(uplift_root), "--apply", "--rollback"], env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (
+        "SUMMARY mode=rollback moves=4 dirs=3 todo=7 done=7 unknown=0"
+        in proc.stdout.splitlines()
+    )
+    after = _inventory(uplift_root)
+    # 路径集合逐字相同：没有一个残留的壳，也没有多出来的目录（唯一那一条新增的是
+    # journal 自己 —— 它是证据不是状态，回退时从 `state/` 搬到 export 根）。
+    assert set(after) - set(before) == {".state-base-migration.journal.rolled-back"}
+    assert set(before) - set(after) == set()
+    # 每个**文件**都回到原来的 inode/size/mode/mtime（目录的 mtime 例外：被搬空又填回
+    # 来的那几层必然变过 —— `workspaces`、`_snapshots`、`_snapshots/snap_aaa`，以及
+    # 住着 journal 的 `state`）。
+    def _files(inventory: dict[str, tuple[int, int, int, int, int]]) -> dict:
+        return {
+            rel: stamp
+            for rel, stamp in inventory.items()
+            if not (uplift_root / rel).is_dir()
+            and rel != ".state-base-migration.journal.rolled-back"
+        }
+
+    before_files = _files(before)
+    after_files = _files(after)
+    assert after_files == before_files
+    # 整条被搬走的目录回到原 inode（反向也是 rename，不是重建）...
+    for rel in (
+        f"{TREES_DIR}/_migrate",
+        f"{TREES_DIR}/_snapshots/snap_bbb",
+    ):
+        assert after[rel][:2] == before[rel][:2], rel
+    # ...而**拆掉又建回来**的那两个空壳（`<workspaces>/_snapshots` 与它下面那个
+    # 逐条合一的 id 目录）inode 是新的 —— 它们搬完就是空的，回退按 journal 里记的
+    # 权限位重建。代价说清楚：壳的 inode/mtime 变了，**里面的文件一个都没变**
+    #（上面那条 `after_files == before_files`）。
+    assert after[f"{TREES_DIR}/_snapshots"][:2] != before[f"{TREES_DIR}/_snapshots"][:2]
+    # 迁移建的那一个目录回退之后不留；合一过去的载荷也回到树根下。
+    assert MIGRATE_DIR not in after
+    assert f"{SNAPSHOT_DIR}/snap_bbb" not in after
+    assert f"{TREE_SNAPSHOTS}/snap_bbb/.complete" in after
+
+
+def test_a_second_run_after_the_merge_is_a_no_op_rather_than_a_refusal(
+    uplift_root: Path, tmp_path: Path
+) -> None:
+    """合一之后树根下只剩沙箱树 —— 再看一眼必须是"没有可搬的条目"。
+
+    判据是 `state/_runtime`：`state` 这一层本身就是新布局的产物，所以它存在就说明
+    `<export>/workspaces` 是**树根**，而不是一棵碰巧叫这个名字的沙箱树。
+    """
+    env = _offline_env(tmp_path)
+    assert _run(["--root", str(uplift_root), "--apply"], env=env).returncode == 0
+    proc = _run(["--root", str(uplift_root)], env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = proc.stdout.splitlines()
+    assert "NOTE 没有可搬的条目（旧位置都空、新位置都在）——已经迁移过？" in lines
+    assert "SUMMARY mode=plan moves=0 dirs=3 todo=0 done=0 unknown=0" in lines
+
+
+def test_a_merge_that_would_overwrite_refuses_by_name(
+    uplift_root: Path, tmp_path: Path
+) -> None:
+    """两处同名文件是**数据问题**，不是格式问题：拒绝，不猜留哪一份。"""
+    (uplift_root / SNAPSHOT_DIR / "snap_aaa" / "fs").mkdir()
+    before = _inventory(uplift_root)
+    proc = _run(["--root", str(uplift_root), "--apply"], env=_offline_env(tmp_path))
+    assert proc.returncode == 3
+    assert proc.stderr.splitlines()[0] == (
+        f"REFUSE(3): 合并不是覆盖：{TREE_SNAPSHOTS}/snap_aaa/fs 与 "
+        f"{SNAPSHOT_DIR}/snap_aaa/fs 两边同名（先人工决定留哪一份，再重跑）"
+    )
+    assert _inventory(uplift_root) == before
+    assert not (uplift_root / MIGRATE_DIR).exists()
+
+
+def test_a_staging_directory_on_both_roots_refuses_rather_than_guessing(
+    uplift_root: Path, tmp_path: Path
+) -> None:
+    (uplift_root / MIGRATE_DIR).mkdir()
+    before = _inventory(uplift_root)
+    proc = _run(["--root", str(uplift_root), "--apply"], env=_offline_env(tmp_path))
+    assert proc.returncode == 3
+    assert proc.stderr.splitlines()[0] == (
+        f"REFUSE(3): 两边都有，拒绝猜：{TREE_MIGRATE} 与 {MIGRATE_DIR} 都存在"
+        "（上一次迁移中断？先人工看一眼）"
+    )
+    assert _inventory(uplift_root) == before
+
+
+def test_the_engine_never_removes_a_non_empty_directory(uplift_root: Path, tmp_path: Path) -> None:
+    """合一之后的空壳用 `rmdir` 拆 —— 非空就留着并点名，不递归删。"""
+    stray = uplift_root / TREE_SNAPSHOTS / "snap_bbb" / "extra"
+    stray.mkdir()
+    (stray / "payload.bin").write_bytes(b"kept")
+    proc = _run(["--root", str(uplift_root), "--apply"], env=_offline_env(tmp_path))
+    # `extra/` 在计划里，所以它跟着整条 id 目录一起搬走 —— 没有任何东西被留下。
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (uplift_root / SNAPSHOT_DIR / "snap_bbb" / "extra" / "payload.bin").read_bytes() == b"kept"

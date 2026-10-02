@@ -8,20 +8,25 @@
 
 **Tech Stack:** Python（`control_plane/`、`c3_agent/`、`envd_service/`、`gateway_common/`）、k8s（k0s、arm64）、NFS（阿里云 NAS）+ 节点 ESSD、tar。
 
-## 当前进度（2026-10-02，**停在这里定计划**）
+## 当前进度（2026-10-02，**Task 0 的仓库侧已完，卡在上线窗口**）
 
-**已完成 —— Task 0 的前半步**
+**已完成 —— Task 0 的 Step 1–6, 8（仓库侧全部）**
 
 | 项 | 状态 | 证据 |
 |---|---|---|
 | Task 0 Step 1 目录地图 + `_snapshots` 实录 | ✅ | `docs/create-local-first-layout.md`（含 §3 的本地 vs 共享逐条评估）。实测：写一个小文件 **共享 13.06 ms / 本地 0.028 ms（466×）**；顺序写 **NAS 435 / 本地 1027 MB/s**（旧的"本地 186"作废）。`_snapshots` 8 个 id：3 个两边都有、2 个只有记录、2 个只有载荷 |
 | Task 0 Step 2/3 失败用例 + 先红 | ✅ | `tests/unit/test_root_reslice.py` 17 条；先红 16 条（留 1 条绿的是"今天的根列表不许变"） |
 | Task 0 Step 4 实现 | ✅ | commit `308b543`。见下方 Step 4 的实现清单 |
+| Task 0 Step 5 清单 | ✅ | 本批提交。control-plane 的 `_migrate` subPath + `E2B_TREES_SHARED`；`workspace-root-init` 的两个根搬到 `$shared`；worker 与 compose 三份**核过不用改** |
+| Task 0 Step 6 迁移脚本 N58 | ✅ | 本批提交。`scan_uplift()`：上浮 + 合一 + 具名拒绝同名；`rmdir` 拆壳带 journal 与回退；判据加"兄弟层已是新布局" |
 | 回归 | ✅ | `tests/unit` **2211 passed / 12 skipped / 3 failed**，与基线（2194 + 新增 17）逐条对齐，3 条是已知 macOS-only。`tests/contract/test_migration.py` 的 6 条失败**在干净树上同样失败**（macOS 没有 container id），非本轮引入 |
+| 回归（本批） | ✅ | `tests/unit` **2221 passed / 12 skipped / 3 failed**（+10：本轮新增 11 条，多出的那一条 failed 是 `test_create_deferred_persist` 在满载下的时序抖动，单独跑绿）；3 条仍是那三条 macOS-only |
+| 彩排（本机） | ✅ | `tmp/n58-rehearsal/rehearse.py`：dry-run 不写、apply 后 inode 不变、再跑报「没有可搬的条目」、`--rollback --apply` 原样退回 |
+| 彩排（集群，**只读**） | ✅ | 在控制面 pod 里跑 `--mode plan`：`moves=9 dirs=3 todo=14`，无冲突（见 Step 7） |
 
-**没做（本次到此为止）**：Task 0 Step 5（三份清单 + k0s overlay + compose 的 env/volumeMounts/subPath/OWNED_DIRS）、Step 6（`migrate-state-base.sh` 的 N58 合并阶段 + 集群数据合并）、Step 7（集群验收）、Step 8（发布）；Task 1–6 全部未开始。
+**没做（本次到此为止）**：Task 0 Step 7 里需要停机的那一半（把 `308b543` + 本轮清单与迁移上线，然后量建箱 p50 与 `_snapshots` 记录数的前后）；Task 1–6 全部未开始。
 
-⚠ **上线顺序（Step 5 + Step 6 必须与 `308b543` 同一次上线）**：这个 commit 已经把 `_snapshots` / `_migrate` 的**根**改到共享根，而线上**数据还在旧位置**（`<workspaces>/_snapshots/<id>/fs`）。单独部署它，找不到载荷的快照会在合并之前恢复失败。顺序照 N27：**worker 缩到 0 → 跑迁移（先 dry-run）→ apply 新清单 → 起 worker → 验证**。
+⚠ **上线顺序（`308b543` + 本轮清单与迁移必须同一次上线）**：`308b543` 已经把 `_snapshots` / `_migrate` 的**根**改到共享根，而线上**数据还在旧位置**（`<workspaces>/_snapshots/<id>/fs`）。单独部署它，找不到载荷的快照会在合并之前恢复失败。顺序照 N27：**worker 缩到 0 → 跑迁移（先 dry-run）→ apply 新清单 → 起 worker → 验证**。这条顺序至今**没有执行过**，所以线上仍然是 `0.1.0-877-ge15b77f-20261001-231822`。
 
 **Task 0 先行（目录与介质归属）**：今天一根 `E2B_WORKSPACE_BASE` 同时决定三件事 —— 沙箱树在哪、平台共享命名空间（`_snapshots` / `_migrate`）挂在它下面的哪、以及"树是不是共享"这个迁移开关取什么值（`control_plane/api/sandboxes.py:2687` 的 `shared = bool(settings.shared_workspace_root)`）。三件事共用一根，所以"把树搬本地"不是改一个值的事：改了它，平台命名空间会一起被拖到节点本地盘。先拆成**五个具名根 + 一个具名判据**（见 Task 0 的表），顺手把 `_snapshots` 的两个命名空间合成一个、把 `_migrate` 上浮到共享根；**默认部署的行为逐字不变**（树仍在共享），介质翻转留到 Task 3 改两个值。
 
@@ -104,10 +109,25 @@
 - [x] **Step 2: 写失败用例** ✅ `tests/unit/test_root_reslice.py` 17 条。
 - [x] **Step 3: 先红** ✅ 16 红 1 绿（那条绿的是"今天的根列表逐字不变"）。
 - [x] **Step 4: 实现** ✅ `308b543` —— `gateway_common/paths.py` 加 `platform_namespace_root` / `snapshot_payload_dir` / `migrate_staging_dir` + `SNAPSHOT_STORE_DIR_NAME` / `MIGRATE_STAGING_DIR_NAME`；`envd_service/agent.py` 的 5 处（建箱恢复、导出、导入、快照生成、快照删除）与 `control_plane/api/sandboxes.py` 的 `_migrate` 全走 helper；`ControlPaths.node_state_base` 第五根（顺序 workspace → node state → state → shared → cache，去重规则逐字不变）＋ `priv_common.c` 镜像同一个循环、`PRIV_MAX_ROOTS 4 → 5`；`E2B_TREES_SHARED`（`_trees_shared_from_env`，空 = 未命名 = 沿用 `bool(E2B_SHARED_WORKSPACE_ROOT)`）与 `Settings.__post_init__` 的落定；三个 config 的 `node_state_base` 字段；`c3_agent/fileops.py` 的子进程 env 只在命名时写这一根。
-- [ ] **Step 5: 清单**：三份 k8s（worker / c3-agent / control-plane）的 env 与 volumeMounts（control-plane 的 `workspaces/_migrate` subPath 改 `_migrate`）、`workspace-root-init` 的创建清单（`workspaces/_migrate` → `_migrate`）、k0s overlay 的 patch、compose 两份的 `OWNED_DIRS`。
-- [ ] **Step 6: 迁移脚本 N58 阶段**：`migrate-state-base.sh` 加"合并 `_snapshots` + 上浮 `_migrate`"，沿用同款 journal / 回退 / inode 对账。**合并不是覆盖** —— 两边同名文件必须**具名拒绝**并留 journal，不许静默取一个。先 `--root` 彩排，再集群 dry-run。
-- [ ] **Step 7: 集群验收**：`GET /sandboxes` = `[]`、pod 全 Running、`DRY_RUN=1 apply.sh | kubectl diff -f -` 只有镜像 tag 行；建箱 p50 与 `_snapshots` 记录数**前后各量一次**，证明默认行为没变。
-- [ ] **Step 8: 提交**（`refactor(paths): 根重切 —— 五根 + 一个判据，_snapshots 合一、_migrate 上浮`）。
+- [x] **Step 5: 清单** ✅ —— 实际改到的是**两处**，不是四份清单：
+  - `control-plane.yaml`：`_migrate` 的 subPath 从 `workspaces/_migrate` 改成 export 根的 `_migrate`；显式加 `E2B_TREES_SHARED: "1"`（唯一读者就是控制面；Task 3 翻转就改这一个字符）。
+  - `c3-agent.yaml` 的 `workspace-root-init`：`$base/_migrate` → `$shared/_migrate`、`$base/_snapshots` → `$shared/_snapshots`（含 chown/verify 判据与 1777 白名单）。
+  - `worker.yaml` **不动**：它已经挂整卷，`_snapshots`/`_migrate` 都在同一挂载下，而 `E2B_TREES_SHARED` 不是它的输入。
+  - **compose 三份车道不动**：它们本来就把树根与平台命名空间根放在同一个目录（`E2B_WORKSPACE_BASE` = `E2B_SHARED_*_ROOT`），`OWNED_DIRS` 早就是重切后的形状 —— 改它反而会把属主交接指向不存在的路径。
+  - k0s overlay 的 patch **不动**：差异层里没有路径字面量，基线改了它自动跟上。
+  Review 手段：`tests/unit/test_root_reslice.py` 加 4 条（两条渲染 kustomize 的对象级钉子 + compose 三份的 `OWNED_DIRS` 逐条），`tests/unit/test_worker_manifest_permissions.py` 的两条 N27 钉子改成 N58 形状（先红后绿）。
+- [x] **Step 6: 迁移脚本 N58 阶段** ✅ `deploy/scripts/migrate-state-base.sh` 现在一次跑 N27+N58：
+  - `scan_uplift()` 逐条算出「`_migrate` 上浮」+「`_snapshots` 合一」。目标 id 目录不存在 ⇒ 整条 `rename`；存在（有记录没载荷的 id）⇒ 逐条搬里面的条目；**两边同名 ⇒ 具名拒绝**（`合并不是覆盖：… 两边同名（先人工决定留哪一份，再重跑）`）。
+  - 搬空之后用 `rmdir` 拆壳（**不递归**），journal 里记 `rmdir <rel> <mode>`，回退按原权限位重建。
+  - 判据放宽了一条：`<export>/workspaces` 除了「有标记/是空的」以外，还接受「兄弟层 `state/` 已是新布局」——否则合一之后再想看一眼会被误判成"一棵碰巧叫 workspaces 的树"。
+  - 彩排（本机 `--root`，`tmp/n58-rehearsal/rehearse.py`）+ 集群只读计划都跑过：见下。
+- [ ] **Step 7: 集群验收** —— **只读的一半已做**，需要停机的一半待上线窗口（见下方"当前进度"）：
+  - ✅ 集群身份自检（2 节点 / arm64 / `v1.36.4+k0s` / `sandlock` 9 pod）
+  - ✅ `GET /sandboxes` = `[]`
+  - ✅ `DRY_RUN=1 apply.sh | kubectl diff -f -`：只有**两个**对象变（c3-agent 的 init 脚本、control-plane 的 env + subPath），worker 与其余对象零差异；渲染用的版本与线上相同，所以没有镜像 tag 行
+  - ✅ 迁移的**集群只读计划**（在控制面 pod 里跑 `--mode plan`，不写一个字节）：`moves=9 dirs=3 todo=14` —— 1 条上浮 + 2 条整条 id 合一 + 3 条逐条合一（6 个文件）+ 3 个空壳 rmdir；2 个只有记录的 id 原地不动；**没有一条"两边同名"**
+  - ⏳ 建箱 p50 前后各量一次 + `_snapshots` 记录数前后各量一次 —— 需要先把 `308b543`+本轮的清单与迁移上线（worker 必须先缩到 0）
+- [ ] **Step 8: 提交** —— 已按计划的消息形状提交（见下）；**仍未上线**。
 
 ### Task 1: 前置测量与设计文档（与 Task 0 并行；它决定 Task 3 的淘汰上限）
 

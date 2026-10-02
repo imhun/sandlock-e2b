@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
-# N27 Task 6 —— 一次性把平台状态从「与树根同一个目录」搬到「树根下沉一级后的兄弟目录」。
+# N27 Task 6 + N58 —— 一次性把平台状态与平台命名空间搬到根重切之后的位置。
 #
-# 布局（2026-09-26 决策 1：同挂载 + 树根下沉）：
+# N27（2026-09-26 决策 1：同挂载 + 树根下沉）：
 #
 #   <export>/workspaces/<id>   ← <export>/<id>          沙箱树（逐条 rename）
 #   <export>/state/_runtime    ← <export>/_runtime      记录 + 命令日志 + .checkpoints
 #   <export>/state/.route-b    ← <export>/.route-b      route-B 槽位
 #   <export>/state/            （新建 1777）
-#   <export>/workspaces/       （新建 1777）+ 其中的 _migrate（1777）
+#   <export>/workspaces/       （新建 1777）
 #   <export>/.uid_reservations 确认空 → 留在原地（--delete-after 才 rmdir）
 #   <export>/.uid_pool.lock    不搬（锁文件，新位置按需重建）
 #   <export>/_builds … _volumes  六个平台命名空间留在 export 根
+#
+# N58（根重切的第二步：介质归属与命名空间归属分开命名）：
+#
+#   <export>/_snapshots/<id>/fs   ← <export>/workspaces/_snapshots/<id>/fs
+#   <export>/_snapshots/<id>/…    ← …/workspaces/_snapshots/<id>/…      逐条合一
+#   <export>/_migrate/            ← <export>/workspaces/_migrate/       上浮（整条 rename）
+#   <export>/_snapshots/          （需要时新建 0755）
+#   <export>/workspaces/_snapshots/  搬空后 rmdir（不递归）
+#
+# 为什么必须合一/上浮：快照的**记录**（控制面写，`SnapshotRegistry` 建在共享
+# export 根上）本来就在 `<export>/_snapshots/<id>/snapshot.json`，而**载荷**
+# （agent 写，`envd_service/agent.py`）在树根下 —— 同一批 id 两个命名空间，正是
+# `control_plane/registry/snapshots.py` 的注释说它们不是的形状。迁移暂存
+# `<workspaces>/_migrate` 的读者是**另一个节点**的目标 agent：树本地化之后那边
+# 根本看不到这棵树的根，所以它必须在共享根上（用户裁定 2：跨节点经共享中转）。
 #
 # 为什么主路径是 `rename(2)`：它的边界是**挂载点**，不是服务器上的同一个文件系统。
 # 这两棵新树与旧位置在同一个挂载里（deploy/k8s-k0s/storage-nas.yaml 的文件头解释了
@@ -29,7 +44,8 @@
 # 硬性质（tests/unit/test_migrate_state_base_script.py 逐行钉住）：
 #   * DRY_RUN=1 是默认；只有显式 --apply（以及 Job 里的 --in-cluster --apply）才写
 #   * 一切搬迁都是 rename，不 copy；删除只有 --delete-after 做的那两件：unlink 那个陈旧
-#     锁文件、rmdir 那几个空壳（没有任何递归删除）
+#     锁文件、rmdir 那几个空壳（没有任何递归删除）；N58 的合一搬空之后也用 rmdir 拆壳，
+#     非空就留着并点名
 #   * 自己创建的每一个文件 0600（umask 077 + journal 显式 chmod）——它创建在
 #     <export>/state 下，`_migrate` 那种 1777 目录里的东西一个都不碰
 #   * worker 不在 0 副本、或还有 worker pod 在跑，就拒绝
@@ -75,7 +91,7 @@ warn() {
 }
 
 usage() {
-    sed -n '2,39p' "$SCRIPT_PATH"
+    sed -n '2,55p' "$SCRIPT_PATH"
 }
 
 while [ $# -gt 0 ]; do
@@ -121,9 +137,11 @@ py_engine() {
 经 `kubectl exec -i` 送进控制面容器（它那份 export 是只读挂载，正好只够读计划），
 真迁移时由 Job 在容器里直接跑（`--root /shared`）。
 
-写操作只有三种：`os.mkdir`（三个目录）、`os.rename`（每一棵树/每一个状态目录）、
-以及 `--delete-after` 的 `os.unlink`（一个普通文件）/`os.rmdir`（空目录）。没有任何
-递归删除，也没有拷贝分支 —— 跨挂载（EXDEV）是拒绝，不是退化成整树拷贝。
+写操作只有四种：`os.mkdir`（三个目录，N58 起还要补 `<export>/_snapshots` 那几层）、
+`os.rename`（每一棵树 / 每一个状态目录 / N58 的每一条合一与上浮）、`os.rmdir`
+（N58 搬空之后的空壳，以及 `--delete-after` 的那两个），以及 `--delete-after` 的
+`os.unlink`（一个普通文件）。没有任何递归删除，也没有拷贝分支 —— 跨挂载（EXDEV）
+是拒绝，不是退化成整树拷贝。
 """
 
 from __future__ import annotations
@@ -163,22 +181,42 @@ RESERVATIONS = ".uid_reservations"
 #: 所以这个文件既不搬也不删，除非 --delete-after。
 STALE_LOCK = ".uid_pool.lock"
 
-#: 树根下的平台命名空间：这些是**相对树根**解析的（`_migrate` 是控制面的迁移暂存、
-#: `_pure_rootfs` 是纯形态的每沙箱骨架、`_cow`/`_untrusted.trees` 是保留名），
-#: 所以它们跟着树一起下沉。
-SINK_NAMESPACES = ("_migrate", "_pure_rootfs", "_cow", "_untrusted.trees")
+#: 树根下的平台命名空间：**相对树根**解析的那些（`_pure_rootfs` 是纯形态的每沙箱骨架、
+#: `_cow`/`_untrusted.trees` 是保留名），所以它们跟着树一起下沉。N58 之后
+#: `_migrate` 与 `_snapshots` 不在这一串里了 —— 见下面两个常量。
+SINK_NAMESPACES = ("_pure_rootfs", "_cow", "_untrusted.trees")
 SINK_PREFIXES = ("snap_",)
 
 STATE_DIR = "state"
 TREES_DIR = "workspaces"
 
+#: N58 的两个**平台命名空间**，在 export 根（`E2B_SHARED_VOLUME_ROOT`，
+#: `gateway_common/paths.py::platform_namespace_root`）：迁移暂存与快照仓。
+MIGRATE_DIR = "_migrate"
+SNAPSHOT_DIR = "_snapshots"
+
+#: N27 之后、N58 之前，这两个名字挂在**树根**之下（相对 `E2B_WORKSPACE_BASE`
+#: 解析）—— 迁移要从这里把它们搬上去。
+TREE_MIGRATE = TREES_DIR + "/" + MIGRATE_DIR
+TREE_SNAPSHOTS = TREES_DIR + "/" + SNAPSHOT_DIR
+
+#: N58 之后 export 根上多出来的平台命名空间。`_snapshots` 本来就在
+#: `STAY_NAMESPACES` 里（它一直是控制面的记录根）；`_migrate` 是本轮搬上来的，
+#: 名字却长得像个合法沙箱 id，所以不列出来就会被当成一棵树。
+UPLIFTED_NAMESPACES = (MIGRATE_DIR,)
+
 #: 迁移自己建的三层目录，顺序即创建顺序（state 先，因为状态目录要搬进去；
-#: workspaces/_migrate 最后，因为它是控制面唯一的可写 subPath 源）。
+#: `_migrate` 最后，因为它是控制面唯一的可写 subPath 源，也是 N58 上浮的目标）。
 NEW_DIRS = (
     (STATE_DIR, 0o1777),
     (TREES_DIR, 0o1777),
-    (TREES_DIR + "/_migrate", 0o1777),
+    (MIGRATE_DIR, 0o1777),
 )
+
+#: N58 合一 `_snapshots` 时新建的目录（`<export>/_snapshots` 与需要补的
+#: `<export>/_snapshots/<id>`）一律 0755 —— 与 `workspace-root-init` 对平台命名
+#: 空间的约定、以及 agent 自己给新快照 id `mkdir` 的默认位一致。
+SNAPSHOT_DIR_MODE = 0o755
 
 JOURNAL_NAME = ".state-base-migration.journal"
 JOURNAL_REL = STATE_DIR + "/" + JOURNAL_NAME
@@ -189,7 +227,11 @@ ROLLED_BACK_JOURNAL = ".state-base-migration.journal.rolled-back"
 #: 就拒绝，让人来看 —— 那很可能是一棵碰巧叫这个名字的沙箱树。
 NEW_LAYOUT_MARKERS = {
     STATE_DIR: ("_runtime", ".route-b", RESERVATIONS, JOURNAL_NAME),
-    TREES_DIR: ("_migrate",),
+    #: N58 之后 `_migrate`/`_snapshots` 都不再挂在树根下，所以稳态里的标记只能是
+    #: 剩下那几个平台命名空间（`_untrusted.trees` 带点，`SANDBOX_ID` 都匹配不上，
+    #: 但它是保留名，出现在这里就意味着"这确实是树根"）。一棵只有沙箱树的
+    #: `workspaces` 由 `STATE_DIR` 那一层的存在来认（见 `is_new_layout_layer`）。
+    TREES_DIR: SINK_NAMESPACES + (MIGRATE_DIR, SNAPSHOT_DIR),
 }
 
 #: 镜像 `gateway_common.paths.validate_sandbox_id`：线上这些树的名字由客户端挑，
@@ -301,6 +343,30 @@ def is_empty_dir(path):
         return next(entries, None) is None
 
 
+def is_new_layout_layer(root, name, path):
+    """`<export>/state`（或 `<export>/workspaces`）是不是新布局的那一层。
+
+    两个名字都是**合法沙箱 id**，所以不能只按名字判它们"不是树"：要么带着新布局
+    的标记，要么是空的。
+
+    N58 之后还多一条判据：`state/` 这一层本身就是根重切的产物，它带着
+    `_runtime`/`.route-b` 就说明整个 export 根已经是新布局了 —— 那时树根下只剩
+    沙箱树，一个平台命名空间都不剩，只按标记认会在"再跑一遍看一眼"时误报成
+    "这可能是一棵碰巧叫 workspaces 的树"。
+    """
+    if any(
+        os.path.lexists(os.path.join(path, marker))
+        for marker in NEW_LAYOUT_MARKERS[name]
+    ):
+        return True
+    if is_empty_dir(path):
+        return True
+    return any(
+        os.path.lexists(os.path.join(root, STATE_DIR, marker))
+        for marker in NEW_LAYOUT_MARKERS[STATE_DIR]
+    )
+
+
 def scan(root):
     tree_moves, unknown = [], []
     seen = set()
@@ -310,7 +376,7 @@ def scan(root):
         seen.add(name)
         path = os.path.join(root, name)
         st = os.lstat(path)
-        if name in STAY_NAMESPACES:
+        if name in STAY_NAMESPACES or name in UPLIFTED_NAMESPACES:
             if not stat.S_ISDIR(st.st_mode):
                 raise Refuse(EXIT_SHAPE, "平台命名空间 %s 不是目录" % name)
         elif name in STATE_MOVES:
@@ -325,21 +391,17 @@ def scan(root):
                 raise Refuse(EXIT_SHAPE, "%s 不是普通文件" % STALE_LOCK)
             stale = True
         elif name in (STATE_DIR, TREES_DIR):
-            # 新布局自己的两层目录。名字都是合法沙箱 id，所以不能只按名字判：要么带着
-            # 新布局的标记（state/_runtime、.route-b、journal、workspaces/_migrate…），
-            # 要么是空的；两个都不满足就拒绝 —— 那很可能是一棵碰巧叫这个名字的树。
+            # 新布局自己的两层目录。名字都是合法沙箱 id，所以不能只按名字判：判据见
+            # `is_new_layout_layer`（标记 / 空 / 兄弟那一层已经是新布局）；都不满足
+            # 就拒绝 —— 那很可能是一棵碰巧叫这个名字的树。
             if not stat.S_ISDIR(st.st_mode):
                 raise Refuse(EXIT_SHAPE, "%s 不是目录" % name)
-            has_marker = any(
-                os.path.lexists(os.path.join(path, marker))
-                for marker in NEW_LAYOUT_MARKERS[name]
-            )
-            if not has_marker and not is_empty_dir(path):
+            if not is_new_layout_layer(root, name, path):
                 raise Refuse(
                     EXIT_SHAPE,
-                    "顶层目录 %s 既没有新布局的标记、也不是空的 —— 无法判断它是新布局的"
-                    "一层、还是一棵碰巧叫这个名字的沙箱树。停下来让人看一眼（手工把它搬"
-                    "到确定的位置，或先清空）" % name,
+                    "顶层目录 %s 既没有新布局的标记、也不是空的、兄弟层也不是新布局 —— "
+                    "无法判断它是新布局的一层、还是一棵碰巧叫这个名字的沙箱树。停下来让人"
+                    "看一眼（手工把它搬到确定的位置，或先清空）" % name,
                 )
         elif stat.S_ISDIR(st.st_mode):
             if not SANDBOX_ID.match(name):
@@ -359,7 +421,9 @@ def scan(root):
         )
     # 输出顺序固定成声明顺序，而不是字母序：stay 按 STAY_NAMESPACES（与 worker 清单里
     # 那份列表同序），平台状态按 STATE_MOVES（先 _runtime，再 .route-b）。
-    ordered_stay = [name for name in STAY_NAMESPACES if name in seen]
+    ordered_stay = [
+        name for name in STAY_NAMESPACES + UPLIFTED_NAMESPACES if name in seen
+    ]
     state_moves = [
         Move("state", name, STATE_DIR + "/" + name)
         for name in STATE_MOVES
@@ -371,6 +435,86 @@ def scan(root):
         "stale": stale,
         "reservations": reservations,
     }
+
+
+def scan_uplift(root):
+    """N58：`_snapshots` 合一 + `_migrate` 上浮，逐条算出计划。
+
+    返回 `(moves, parents, shells)`：
+
+    * `moves` —— 搬迁条目。`kind=uplift` 是整条目录 rename（迁移暂存）；
+      `kind=merge` 是把树根下的快照载荷搬进记录旁边 —— 目标 id 目录**不存在**时
+      整条 id 目录一次 rename，已经存在（有记录没载荷的那些 id）时逐条搬里面的
+      条目。
+    * `parents` —— 这次要新建的目录（相对路径，顺序即创建顺序），journal 里记
+      `mkdir`、回退时 rmdir 掉。`<export>/_snapshots` 存在时一个都不建。
+    * `shells` —— 搬空之后要 `rmdir` 的**既有**目录（相对路径，顺序即删除顺序），
+      journal 里记 `rmdir` + 原权限位、回退时按原样建回来。
+
+    合并不是覆盖：两边同名一律**具名拒绝**（那是数据问题 —— 同一份快照有两份
+    载荷，得人来看留哪一份），不静默取一个。
+    """
+    moves, parents, shells = [], [], []
+
+    migrate_src = os.path.join(root, TREE_MIGRATE)
+    if os.path.lexists(migrate_src):
+        migrate_dst = os.path.join(root, MIGRATE_DIR)
+        if os.path.lexists(migrate_dst):
+            raise Refuse(
+                EXIT_SHAPE,
+                "两边都有，拒绝猜：%s 与 %s 都存在（上一次迁移中断？先人工看一眼）"
+                % (TREE_MIGRATE, MIGRATE_DIR),
+            )
+        if os.path.islink(migrate_src) or not stat.S_ISDIR(os.lstat(migrate_src).st_mode):
+            raise Refuse(EXIT_SHAPE, "%s 不是目录（迁移只搬目录）" % TREE_MIGRATE)
+        moves.append(Move("uplift", TREE_MIGRATE, MIGRATE_DIR))
+
+    snapshots_src = os.path.join(root, TREE_SNAPSHOTS)
+    if os.path.lexists(snapshots_src):
+        if os.path.islink(snapshots_src) or not stat.S_ISDIR(
+            os.lstat(snapshots_src).st_mode
+        ):
+            raise Refuse(EXIT_SHAPE, "%s 不是目录" % TREE_SNAPSHOTS)
+        ids = sorted(os.listdir(snapshots_src))
+        if ids and not os.path.isdir(os.path.join(root, SNAPSHOT_DIR)):
+            parents.append(SNAPSHOT_DIR)
+        for snapshot_id in ids:
+            if not SANDBOX_ID.match(snapshot_id):
+                raise Refuse(
+                    EXIT_SHAPE,
+                    "%s/%s 不是合法的快照 id —— 停下来让人看一眼"
+                    % (TREE_SNAPSHOTS, snapshot_id),
+                )
+            src_rel = TREE_SNAPSHOTS + "/" + snapshot_id
+            src_id = os.path.join(root, src_rel)
+            if os.path.islink(src_id) or not stat.S_ISDIR(os.lstat(src_id).st_mode):
+                raise Refuse(EXIT_SHAPE, "%s 不是目录（合并不搬目录以外的条目）" % src_rel)
+            dst_rel = SNAPSHOT_DIR + "/" + snapshot_id
+            dst_id = os.path.join(root, dst_rel)
+            if not os.path.lexists(dst_id):
+                # 目标还没有这个 id（只有载荷、没有记录的那些）—— 整条 rename 过去：
+                # 一个 inode、一条 journal，inode 对账也照常。
+                moves.append(Move("merge", src_rel, dst_rel))
+                continue
+            if os.path.islink(dst_id) or not stat.S_ISDIR(os.lstat(dst_id).st_mode):
+                raise Refuse(EXIT_SHAPE, "%s 不是目录" % dst_rel)
+            entries = sorted(os.listdir(src_id))
+            for entry in entries:
+                entry_src = src_rel + "/" + entry
+                entry_dst = dst_rel + "/" + entry
+                if os.path.lexists(os.path.join(root, entry_dst)):
+                    raise Refuse(
+                        EXIT_SHAPE,
+                        "合并不是覆盖：%s 与 %s 两边同名（先人工决定留哪一份，再重跑）"
+                        % (entry_src, entry_dst),
+                    )
+                moves.append(Move("merge", entry_src, entry_dst))
+            shells.append(src_rel)
+        # 整条 id 目录搬走之后 `<workspaces>/_snapshots` 也会空 —— 一起拆掉，
+        # 否则下一版 `workspace-root-init` 不会建它，它却会一直挂在那里。
+        shells.append(TREE_SNAPSHOTS)
+
+    return moves, parents, shells
 
 
 def resolve_moves(root, plan):
@@ -461,14 +605,18 @@ def parse_journal(journal_path):
             if parts[0] == "move" and len(parts) == 3:
                 entries.append(("move", parts[1], parts[2]))
             elif parts[0] == "mkdir" and len(parts) == 2:
-                entries.append(("mkdir", parts[1], parts[1]))
+                entries.append(("mkdir", parts[1], ""))
+            elif parts[0] == "rmdir" and len(parts) == 3:
+                # N58：合一之后拆掉的空壳 —— 回退要按原权限位把它建回来。
+                entries.append(("rmdir", parts[1], parts[2]))
             else:
                 raise Refuse(EXIT_SHAPE, "journal 有看不懂的行：%r" % line)
     if not entries:
         raise Refuse(EXIT_SHAPE, "journal 是空的：%s" % journal_path)
     # journal 是本脚本自己写的，可回退本身是破坏性动作 —— 路径形状再过一道闸门。
-    for _kind, src, dst in entries:
-        for rel in (src, dst):
+    for kind, src, dst in entries:
+        rels = (src, dst) if kind == "move" else (src,)
+        for rel in rels:
             if not rel or rel.startswith("/") or ".." in rel.split("/"):
                 raise Refuse(EXIT_SHAPE, "journal 里的路径不安全：%r" % rel)
     return entries
@@ -525,7 +673,13 @@ def forward(root, args):
     if not os.path.isdir(root):
         raise Refuse(EXIT_SHAPE, "--root 不是目录：%s" % root)
     plan = scan(root)
+    uplift_moves, uplift_parents, uplift_shells = scan_uplift(root)
     dirs_todo, todo = resolve_moves(root, plan)
+    moves = plan["moves"] + uplift_moves
+    dirs = len(NEW_DIRS) + len(uplift_parents)
+    # N58 的条目全部来自盘上实际看到的东西（`scan_uplift` 只报存在的源），
+    # 所以它们都是 todo；搬空之后要拆的空壳也算一件要做的事。
+    todo += len(uplift_moves) + len(uplift_shells)
     mount = mount_summary(root)
     check_reservations(root, plan)
     if todo == 0:
@@ -537,20 +691,24 @@ def forward(root, args):
             )
         emit("NOTE 没有可搬的条目（旧位置都空、新位置都在）——已经迁移过？")
 
-    emit("== state-base-migration(N27) ==")
+    emit("== state-base-migration(N27+N58) ==")
     emit("mode=%s root=%s dry_run=%d" % (mode, root, 1 if dry_run else 0))
     emit("MOUNT %s" % mount)
     for name in plan["stay"]:
         emit("STAY %s" % name)
-    for move in plan["moves"]:
+    for move in moves:
         where = move.src if move.todo else move.dst
-        files, dirs, nbytes = counts_of(os.path.join(root, where))
+        files, dir_count, nbytes = counts_of(os.path.join(root, where))
         emit(
             "MOVE %s -> %s kind=%s files=%d dirs=%d bytes=%d"
-            % (move.src, move.dst, move.kind, files, dirs, nbytes)
+            % (move.src, move.dst, move.kind, files, dir_count, nbytes)
         )
     for rel, dir_mode in NEW_DIRS:
         emit("MKDIR %s mode=%o" % (rel, dir_mode))
+    for rel in uplift_parents:
+        emit("MKDIR %s mode=%o" % (rel, SNAPSHOT_DIR_MODE))
+    for rel in uplift_shells:
+        emit("RMDIR %s" % rel)
     if plan["stale"]:
         emit("KEEP %s kind=regular" % STALE_LOCK)
     if plan["reservations"]:
@@ -561,36 +719,48 @@ def forward(root, args):
     if dry_run:
         if args.delete_after:
             delete_leftovers(root, plan, dry_run=True)
-        summary("plan", len(plan["moves"]), len(NEW_DIRS), todo, 0)
+        summary("plan", len(moves), dirs, todo, 0)
         return 0
 
     # 1) 先记下"搬之前"的 inode 与计数：搬完要比对（inode 不变 ⇒ 是 rename 不是 copy）
     before = {}
-    for move in plan["moves"]:
+    for move in moves:
         if not move.todo:
             continue
         st = os.lstat(os.path.join(root, move.src))
         before[move.src] = (st.st_dev, st.st_ino, counts_of(os.path.join(root, move.src)))
 
     checkpoints_before = None
-    for move in plan["moves"]:
+    for move in moves:
         if move.todo and move.src == "_runtime":
             checkpoints_before = counts_of(
                 os.path.join(root, "_runtime", ".checkpoints")
             )
 
-    samples = sample_files(root, [move.src for move in plan["moves"] if move.todo])
+    samples = sample_files(root, [move.src for move in moves if move.todo])
+    # `sample_files` 只走目录；合一的条目里有一半是**单个文件**（`.complete`、
+    # 快照根下的 `sandbox.json`），它们同样要证明"搬过去的是同一份字节"。
+    for move in uplift_moves:
+        if move.kind != "merge" or move.src in samples:
+            continue
+        path = os.path.join(root, move.src)
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode) and st.st_size <= SAMPLE_MAX_BYTES:
+            samples.append(move.src)
     sample_before = {}
     for rel in samples:
         st = os.lstat(os.path.join(root, rel))
         sample_before[rel] = (sha256_of(os.path.join(root, rel)), st.st_ino)
 
-    # 2) 三个目录（state / workspaces / workspaces/_migrate）。**先建目录再开 journal**：
+    # 2) 三个目录（state / workspaces / _migrate）＋ N58 需要补的快照目录。
+    #    **先建目录再开 journal**：
     #    journal 自己就住在 state/ 里。（若在这两步之间崩了，只是留下几个空目录，
     #    没有任何数据被碰过。）umask 077 只清位、不补位，所以 1777 要显式 chmod ——
     #    与 worker 的 workspace-root-init 对这三个目录的判据一致。
     created_dirs = []
-    for rel, dir_mode in NEW_DIRS:
+    for rel, dir_mode in tuple(NEW_DIRS) + tuple(
+        (rel, SNAPSHOT_DIR_MODE) for rel in uplift_parents
+    ):
         path = os.path.join(root, rel)
         if os.path.isdir(path):
             continue
@@ -612,7 +782,7 @@ def forward(root, args):
     done = len(created_dirs)
     try:
         # 3) 逐条 rename（平台状态先，沙箱树后 —— 与控制面读记录的时序一致）
-        for move in plan["moves"]:
+        for move in moves:
             if not move.todo:
                 continue
             src = os.path.join(root, move.src)
@@ -620,6 +790,26 @@ def forward(root, args):
             rename_or_refuse(src, dst)
             journal_append(journal_fd, "move\t%s\t%s" % (move.src, move.dst))
             emit("RENAME %s -> %s" % (move.src, move.dst))
+            done += 1
+        # ...然后拆掉合一留下的空壳。**只 rmdir**：非空就留着并点名，本脚本没有
+        # 任何递归删除。权限位记进 journal，回退要按原样建回来。
+        for rel in uplift_shells:
+            path = os.path.join(root, rel)
+            if not os.path.lexists(path):
+                emit("LEFTOVER %s（已经不在盘上 —— 上一次跑留下的一半？）" % rel)
+                continue
+            shell_mode = stat.S_IMODE(os.lstat(path).st_mode)
+            try:
+                os.rmdir(path)
+            except OSError as exc:
+                emit(
+                    "LEFTOVER %s（rmdir 拒绝 %s：非空或不可删 —— 这是有意的，"
+                    "本脚本没有任何递归删除）"
+                    % (rel, errno.errorcode.get(exc.errno, exc.errno))
+                )
+                continue
+            journal_append(journal_fd, "rmdir\t%s\t%o" % (rel, shell_mode))
+            emit("REMOVED %s mode=%o" % (rel, shell_mode))
             done += 1
     except BaseException:
         # 半途失败：journal 已经逐条落盘（含 fsync），把已搬的写清楚再退出。
@@ -632,10 +822,10 @@ def forward(root, args):
         raise
 
     # 4) 对账：inode 必须没变（rename 的证明）、文件计数必须一致、抽样 sha256 必须相同
-    for move in plan["moves"]:
+    for move in moves:
         if not move.todo:
             continue
-        dev, ino, (files, dirs, nbytes) = before[move.src]
+        dev, ino, (files, dir_count, nbytes) = before[move.src]
         st = os.lstat(os.path.join(root, move.dst))
         after = counts_of(os.path.join(root, move.dst))
         same_inode = (st.st_dev, st.st_ino) == (dev, ino)
@@ -652,20 +842,20 @@ def forward(root, args):
                 "yes" if src_gone else "NO",
                 files,
                 after[0],
-                dirs,
+                dir_count,
                 after[1],
                 nbytes,
                 after[2],
             )
         )
-        if not same_inode or not src_gone or after != (files, dirs, nbytes):
+        if not same_inode or not src_gone or after != (files, dir_count, nbytes):
             raise Refuse(
                 EXIT_MOVE,
                 "%s -> %s 对账不通过：inode 变了说明是拷贝不是 rename，计数不符说明搬漏了。"
                 "停下来查（journal 在 %s）" % (move.src, move.dst, journal_path),
             )
         if move.src == "_runtime":
-            emit("COUNT _runtime files=%d dirs=%d bytes=%d" % (files, dirs, nbytes))
+            emit("COUNT _runtime files=%d dirs=%d bytes=%d" % (files, dir_count, nbytes))
             if checkpoints_before is not None:
                 emit(
                     "COUNT _runtime/.checkpoints files=%d dirs=%d bytes=%d"
@@ -679,7 +869,7 @@ def forward(root, args):
 
     for rel in samples:
         sha_before, ino_before = sample_before[rel]
-        new_rel = relocate(rel, plan["moves"])
+        new_rel = relocate(rel, moves)
         path = os.path.join(root, new_rel)
         st = os.lstat(path)
         sha_after = sha256_of(path)
@@ -701,13 +891,13 @@ def forward(root, args):
     os.close(journal_fd)
     emit(
         "JOURNAL %s mode=0600 moves=%d mkdirs=%d"
-        % (journal_path, len([m for m in plan["moves"] if m.todo]), len(dirs_todo))
+        % (journal_path, len([m for m in moves if m.todo]), len(created_dirs))
     )
 
     if args.delete_after:
         delete_leftovers(root, plan, dry_run=False)
 
-    summary("apply", len(plan["moves"]), len(NEW_DIRS), todo, done)
+    summary("apply", len(moves), dirs, todo, done)
     return 0
 
 
@@ -721,6 +911,7 @@ def rollback(root, args):
     entries = parse_journal(journal_path)
     moves = [entry for entry in entries if entry[0] == "move"]
     mkdirs = [entry for entry in entries if entry[0] == "mkdir"]
+    rmdirs = [entry for entry in entries if entry[0] == "rmdir"]
 
     reversed_moves = []
     for _kind, src, dst in reversed(moves):
@@ -733,20 +924,33 @@ def rollback(root, args):
             raise Refuse(EXIT_SHAPE, "%s 已经又出现在旧位置了：拒绝覆盖" % src)
         reversed_moves.append((src, dst))
 
-    emit("== state-base-migration(N27) rollback ==")
+    emit("== state-base-migration(N27+N58) rollback ==")
     emit("mode=rollback root=%s dry_run=%d" % (root, 1 if args.dry_run else 0))
     emit("JOURNAL %s" % journal_path)
     for src, dst in reversed_moves:
         emit("REVERSE %s <- %s" % (src, dst))
+    # N58 拆掉的空壳先按原样建回来（journal 里是子先删、父后删，反过来建就是父先建），
+    # 否则反向搬回去的那几步没有父目录可落。
+    for _kind, rel, shell_mode in reversed(rmdirs):
+        emit("RESTORE %s mode=%s" % (rel, shell_mode))
     for _kind, rel, _dst in reversed(mkdirs):
         emit("RMDIR %s" % rel)
-    todo = len(reversed_moves) + len(mkdirs)
+    todo = len(reversed_moves) + len(mkdirs) + len(rmdirs)
 
     if args.dry_run:
-        summary("rollback", len(moves), len(mkdirs), todo, 0)
+        summary("rollback", len(moves), len(mkdirs) + len(rmdirs), todo, 0)
         return 0
 
     done = 0
+    for _kind, rel, shell_mode in reversed(rmdirs):
+        path = os.path.join(root, rel)
+        if os.path.lexists(path):
+            emit("LEFTOVER %s（回退要建它，但已经在了 —— 先人工看一眼）" % rel)
+            continue
+        os.mkdir(path, 0o700)
+        os.chmod(path, int(shell_mode, 8))
+        emit("RESTORED %s mode=%s" % (rel, shell_mode))
+        done += 1
     for src, dst in reversed_moves:
         rename_or_refuse(os.path.join(root, dst), os.path.join(root, src))
         emit("RESTORED %s <- %s" % (src, dst))
@@ -757,6 +961,12 @@ def rollback(root, args):
     for _kind, rel, _dst in reversed(mkdirs):
         path = os.path.join(root, rel)
         if not os.path.lexists(path):
+            # 它已经被上面某一步反向搬走了 —— N58 的 `_migrate` 就是这样：它既是我们
+            # 建的目录，又是上浮的目标，反向那一步把它搬回树根之后这里就没什么可删的。
+            # 目标状态已经达成，照样算这一件做完了（否则 SUMMARY 的 todo 与 done 会
+            # 在**成功**的回退里对不上，读起来像个失败）。
+            emit("UNMKDIR %s（已随反向搬迁腾空）" % rel)
+            done += 1
             continue
         try:
             os.rmdir(path)
@@ -769,7 +979,7 @@ def rollback(root, args):
         emit("UNMKDIR %s" % rel)
         done += 1
 
-    summary("rollback", len(moves), len(mkdirs), todo, done)
+    summary("rollback", len(moves), len(mkdirs) + len(rmdirs), todo, done)
     return 0
 
 

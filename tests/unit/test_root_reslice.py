@@ -16,9 +16,13 @@
 from __future__ import annotations
 
 import inspect
+import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from control_plane import api
 from control_plane.config import Settings as ControlPlaneSettings
@@ -34,6 +38,14 @@ NODE_STATE = Path("/ns")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SANDBOXES_PY = Path(inspect.getfile(api.sandboxes))
+KUBECTL = shutil.which("kubectl")
+K8S_BASE = REPO_ROOT / "deploy" / "k8s"
+K8S_OVERLAY = REPO_ROOT / "deploy" / "k8s-k0s"
+COMPOSE_LANES = (
+    REPO_ROOT / "deploy" / "compose" / "docker-compose.prod.yml",
+    REPO_ROOT / "deploy" / "compose" / "docker-compose.multinode.yml",
+    REPO_ROOT / "deploy" / "stack" / "docker-compose.prod.yml",
+)
 
 
 # --- 1. 平台命名空间根：共享根优先，没有共享根才回落到树根 -------------------
@@ -156,3 +168,129 @@ def test_the_migration_route_reads_the_named_judge_not_the_shared_root():
     source = SANDBOXES_PY.read_text(encoding="utf-8")
     assert "shared = bool(settings.shared_workspace_root)" not in source
     assert "shared = settings.trees_shared" in source
+
+
+# --- 4. 清单：`_snapshots` / `_migrate` 的落点跟着平台命名空间根 -------------
+#
+# 代码把这两条路径挂到平台命名空间根上只是前半步：根换了，**谁在那里建目录、
+# 谁把它挂成 subPath、谁保证属主**也都要跟着换。漏一处的形状是"一半写在共享、
+# 一半写在本地"，而它在单节点冒烟里看不出来（两边恰好是同一个目录）。
+
+
+def _rendered(overlay: Path) -> str:
+    proc = subprocess.run(
+        [KUBECTL, "kustomize", str(overlay)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout
+
+
+def _rendered_workload(rendered: str, kind: str, name: str) -> dict:
+    matches = [
+        doc
+        for doc in yaml.safe_load_all(rendered)
+        if isinstance(doc, dict)
+        and doc.get("kind") == kind
+        and doc.get("metadata", {}).get("name") == name
+    ]
+    assert len(matches) == 1, f"expected exactly one {kind}/{name}: {len(matches)}"
+    return matches[0]
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_the_control_plane_mounts_the_migration_staging_at_the_shared_root():
+    """控制面的那份写权限必须落在**平台命名空间根**上。
+
+    它的整卷是只读的（OBS-9），可写的每一处都是一条 subPath —— 而 subPath 的
+    源就是"这个目录在卷上的位置"。N58 之后 `_migrate` 在 export 根上，所以源也
+    只能是 `_migrate`：写成 `workspaces/_migrate` 会让 pod 停在
+    ContainerCreating（源不存在），或者更糟 —— 迁移暂存又回到节点本地的树根
+    命名空间里，目标节点看不见它。
+    """
+    plane = _rendered_workload(_rendered(K8S_OVERLAY), "Deployment", "control-plane")
+    container = plane["spec"]["template"]["spec"]["containers"][0]
+    shared = [m for m in container["volumeMounts"] if m["name"] == "shared"]
+    subs = {m["subPath"]: m for m in shared if "subPath" in m}
+    assert subs["_migrate"] == {
+        "name": "shared",
+        "mountPath": "/var/lib/e2b-sandboxes/_migrate",
+        "subPath": "_migrate",
+    }
+    assert [m for m in shared if m.get("subPath", "").startswith("workspaces")] == []
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_workspace_root_init_creates_both_namespaces_on_the_shared_export_root():
+    """`workspace-root-init` 是唯一在新卷上建这些根的容器。
+
+    两个失败它挡着：① `_migrate` 是控制面唯一可写 subPath 的**源**，缺了那个 pod
+    就停在 ContainerCreating；② `_snapshots` 的**属主**必须是 worker 的 65534 ——
+    载荷端点写它下面的每一个 id，root:0755 是"第一次建快照才 EACCES"的那种静默故障。
+    N58 之后两条都在 export 根上，所以判据也必须在 export 根上。
+    """
+    agent = _rendered_workload(_rendered(K8S_BASE), "DaemonSet", "e2b-c3-agent")
+    inits = {c["name"]: c for c in agent["spec"]["template"]["spec"]["initContainers"]}
+    lines = [line.strip() for line in inits["workspace-root-init"]["command"][2].splitlines()]
+    for expected in (
+        'mkdir -p "$shared/_migrate"',
+        'mkdir -p "$shared/_snapshots"',
+        'chown 65534:65534 "$shared/_snapshots" 2>/dev/null ||',
+        'chmod 0755 "$shared/_snapshots" 2>/dev/null ||',
+        'snap_owner="$(stat -c %u "$shared/_snapshots")"',
+        'for target in "$base" "$state" "$shared/_migrate"; do',
+    ):
+        assert expected in lines, expected
+    # ...and the tree-root spellings are gone: an init that recreates
+    # `<workspaces>/_snapshots` on every pod start would resurrect the second
+    # namespace the reslice just merged away.
+    assert [line for line in lines if '"$base/_snapshot' in line] == []
+    assert [line for line in lines if '"$base/_migrate' in line] == []
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_the_control_plane_names_the_trees_shared_judge():
+    """部署自己把判据写出来，而不是靠"共享根设着"这个推论。
+
+    重切之后 `E2B_SHARED_WORKSPACE_ROOT` **仍然要设着**（它就是共享根），所以
+    `bool(shared_workspace_root)` 再也回答不了"树在哪"。清单里显式写 `1` 让这一行
+    可 grep、可评审，也让 Task 3 的翻转就是这一个字符。
+    """
+    plane = _rendered_workload(_rendered(K8S_OVERLAY), "Deployment", "control-plane")
+    env = {
+        e["name"]: e.get("value")
+        for e in plane["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert env["E2B_TREES_SHARED"] == "1"
+    # 判据与被判据的对象同时可见：共享根还在（它就是 `_snapshots` 的根），
+    # 而树根是它下面的一层。
+    assert env["E2B_SHARED_WORKSPACE_ROOT"] == "/var/lib/e2b-sandboxes"
+    assert env["E2B_WORKSPACE_BASE"] == "/var/lib/e2b-sandboxes/workspaces"
+
+
+def test_every_compose_lane_already_owns_the_two_namespaces_at_its_own_root():
+    """compose 车道**不需要**跟着 N58 改，而且这条要能被失败。
+
+    三条 compose 车道今天就把树根与平台命名空间根放在同一个目录
+    （`E2B_WORKSPACE_BASE` = `E2B_SHARED_*_ROOT` = 那个挂载点），所以
+    `_snapshots`/`_migrate` 本来就在 export 根上 —— `OWNED_DIRS` 早就是重切后的
+    形状。把这条写下来是为了挡住"顺手把 compose 也改成 `workspaces/_migrate`"：
+    那会让属主交接去 chown 一个不存在的路径，而 compose 的 `image-cache-init`
+    对缺失条目是**新建**，不是报错。
+    """
+    for path in COMPOSE_LANES:
+        text = path.read_text(encoding="utf-8")
+        lines = [line for line in text.splitlines() if "OWNED_DIRS:" in line]
+        assert len(lines) == 1, path
+        dirs = lines[0].split("OWNED_DIRS:", 1)[1].split()
+        assert any(d.endswith("/_migrate") for d in dirs), (path, dirs)
+        assert any(d.endswith("/_snapshots") for d in dirs), (path, dirs)
+        assert [d for d in dirs if "workspaces/" in d] == [], (path, dirs)
+        # 每一份 `E2B_WORKSPACE_BASE` 都必须与某个 `E2B_SHARED_*_ROOT` 同根；
+        # 只有同根时"`_snapshots` 长在树根下"与"长在 export 根下"才是同一件事。
+        roots = re.findall(r"E2B_SHARED_(?:VOLUME|WORKSPACE)_ROOT:\s*(\S+)", text)
+        bases = re.findall(r"E2B_WORKSPACE_BASE:\s*(\S+)", text)
+        assert roots, path
+        for base in bases:
+            assert base == roots[0], (path, base, roots)

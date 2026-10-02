@@ -352,6 +352,16 @@ spec:
             # and the worker's `workspace-root-init` creates them under.
             - name: E2B_WORKSPACE_BASE
               value: /var/lib/e2b-sandboxes/workspaces
+            # N57: 树**在不在共享存储上**的具名判据。重切之后
+            # `E2B_SHARED_WORKSPACE_ROOT` 仍然要设着（它就是平台自己的命名空间
+            # ——`_snapshots` / `_migrate` / `_volumes` / …——挂着的那个根），所以
+            # `bool(shared_workspace_root)` 再也回答不了"树在哪"。这一个值同时决定
+            # 迁移路上的三件事（要不要导 tar / 要不要在目标节点建树 / 源节点的树
+            # 留不留），读错一个就是**静默建空树 + 源节点留一份永不回收的副本**。
+            # 今天写 `1` = 与重切前逐字相同；把树搬去节点本地盘（Task 3）就是把这
+            # 一个字符改成 `0`，与 `E2B_WORKSPACE_BASE` 的指向一起改。
+            - name: E2B_TREES_SHARED
+              value: "1"
             # ...and the base the platform's own files live under: the runtime
             # records (`_runtime/<id>/sandbox.json`), the command logs, the
             # checkpoint images, the uid pool's lock and reservations. A
@@ -466,26 +476,30 @@ spec:
             #   * `state` -- the platform's own files (runtime records, command
             #     logs, checkpoint images, the uid pool's lock). Without this
             #     mount every record write is EROFS.
-            #   * `workspaces/_migrate` -- the migration staging, and the **only**
-            #     thing this pod writes under the sunk tree root. Deliberately the
-            #     staging directory and not the tree root: OBS-9 measured
-            #     "the control plane writing a sandbox tree is EROFS" on
-            #     2026-09-18 and that property is wanted, so the tree root itself
-            #     stays read-only here.
+            #   * `_migrate` -- the migration staging. N27 put it under the sunk
+            #     tree root and N58 lifted it back to the export root, because its
+            #     reader is the **target** node's agent: with the trees on
+            #     node-local disk (Task 3) that node cannot see another node's
+            #     tree root at all. That is also why it is a subPath of its own and
+            #     not the tree root: OBS-9 measured "the control plane writing a
+            #     sandbox tree is EROFS" on 2026-09-18 and that property is
+            #     wanted, so the tree root itself stays read-only here.
             #
             # 为什么只到这里就够（逐条核过，见 `.superpowers/sdd/n27-task-5-report.md`
-            # §13）：控制面在 `<workspaces>` 下的写只有两处 —— 迁移暂存
+            # §13，N58 之后又复核过一遍）：控制面在 `<workspaces>` 下的写**一处都不剩**
+            # —— 迁移暂存
             # （`_export_sandbox_archive` 把远端节点的 tar 落到
-            # `<workspace_base>/_migrate`）和 `create_app` 的
+            # `platform_namespace_root() / "_migrate"`，即 export 根）和 `create_app` 的
             # `workspace_base.mkdir(exist_ok=True)`；后者在目录已存在时被
             # `exist_ok` 吞掉（`Path.mkdir` 对 EROFS 也走 `is_dir()` 复核那一条），
             # 而沙箱树本身只在 `node.address == "local://"` 的分支里被写过，
             # 本清单 `E2B_ENABLE_LOCAL_NODE=false`。真要在这种部署里开本地节点，
             # 写树会 EROFS 并在日志里响 —— 那时再谈要不要放宽。
             #
-            # ⚠ 上线顺序（N27 是一次迁移）：**worker 先缩到 0 → 跑迁移脚本 →
+            # ⚠ 上线顺序（N27/N58 都是一次迁移）：**worker 先缩到 0 → 跑迁移脚本 →
             # 再 apply 这份清单**。绝不能在迁移之前 apply：这两个 subPath 的源
-            # （`state/`、`workspaces/_migrate/`）还不存在，pod 会停在
+            # （`state/`、`_migrate/`）还不存在（`_migrate` 今天在
+            # `workspaces/_migrate/`，是 N58 把它搬上来的），pod 会停在
             # ContainerCreating；而 worker 换了 base 之后旧位置的树与新位置对不上。
             # The directories are pre-created by the worker's
             # `workspace-root-init` (a pod that needs a subPath source that does
@@ -513,8 +527,8 @@ spec:
               mountPath: /var/lib/e2b-sandboxes/_volumes
               subPath: _volumes
             - name: shared
-              mountPath: /var/lib/e2b-sandboxes/workspaces/_migrate
-              subPath: workspaces/_migrate
+              mountPath: /var/lib/e2b-sandboxes/_migrate
+              subPath: _migrate
             - name: shared
               mountPath: /var/lib/e2b-sandboxes/state
               subPath: state
