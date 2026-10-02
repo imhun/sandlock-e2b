@@ -14,6 +14,8 @@ else, so every assertion here is about what the shared record says.
 
 from __future__ import annotations
 
+import json
+import logging
 import shutil
 from pathlib import Path
 
@@ -30,14 +32,17 @@ def _write_record(
     created_at: str,
     names: list[str] | None = None,
     tenant_id: str | None = None,
+    legacy: bool = False,
 ) -> Path:
     """The on-disk shape ``SnapshotRegistry._write_record`` produces.
 
     A record is ``<base>/_snapshots/<id>/snapshot.json`` plus an ``fs/``
     payload directory; writing it directly is how a test can publish a record
     "from another replica" without that replica's process being here.
+    ``legacy=True`` writes the pre-OBS-9 layout instead: the record sits at
+    ``<base>/<id>/snapshot.json``, which ``_record_path`` still reads.
     """
-    entry = base / "_snapshots" / snapshot_id
+    entry = base / snapshot_id if legacy else base / "_snapshots" / snapshot_id
     (entry / "fs").mkdir(parents=True, exist_ok=True)
     path = entry / "snapshot.json"
     write_json_atomically(
@@ -100,6 +105,82 @@ def test_a_record_whose_payload_vanished_is_not_served_from_cache(tmp_path):
 
     with pytest.raises(UnknownSnapshotError):
         replica_a.get("snap_0000000000000a03")
+
+
+def test_a_legacy_layout_record_is_still_listed(tmp_path):
+    """A record ``get()`` can serve must not drop out of ``list()``.
+
+    ``_record_path`` still reads the pre-OBS-9 root-level layout, so a listing
+    that walks only ``_snapshots/`` would hide a snapshot this replica can
+    still hand out -- and the platform namespaces (``_runtime`` and friends)
+    are ``_``-prefixed directories that must not be mistaken for records.
+    """
+    base = tmp_path / "control"
+    registry = SnapshotRegistry(base)
+    _write_record(
+        base,
+        "snap_0000000000000d01",
+        created_at="2026-10-02T00:00:01Z",
+        legacy=True,
+    )
+    (base / "_templates").mkdir(parents=True)
+    (base / "_templates" / "snapshot.json").write_text("{}", encoding="utf-8")
+
+    # Cold: nothing has been get()-ed, so the file is the only witness.
+    assert _ids(registry.list()) == ["snap_0000000000000d01"]
+    assert registry.get("snap_0000000000000d01").snapshot_id == "snap_0000000000000d01"
+    # Warm too: the legacy record stays listed once it is in the cache.
+    assert _ids(registry.list()) == ["snap_0000000000000d01"]
+
+
+def test_a_record_in_both_layouts_is_listed_once(tmp_path):
+    base = tmp_path / "control"
+    registry = SnapshotRegistry(base)
+    _write_record(base, "snap_0000000000000d02", created_at="2026-10-02T00:00:01Z")
+    _write_record(
+        base,
+        "snap_0000000000000d02",
+        created_at="2026-10-02T00:00:02Z",
+        legacy=True,
+    )
+
+    assert _ids(registry.list()) == ["snap_0000000000000d02"]
+    # ``get()`` picks the current layout, so that is the record listed too.
+    assert registry.get("snap_0000000000000d02").created_at.isoformat() == (
+        "2026-10-02T00:00:01+00:00"
+    )
+
+
+def test_one_unreadable_record_does_not_take_out_the_listing(tmp_path, caplog):
+    base = tmp_path / "control"
+    registry = SnapshotRegistry(base)
+    _write_record(base, "snap_0000000000000e01", created_at="2026-10-02T00:00:01Z")
+    bad = _write_record(
+        base, "snap_0000000000000e02", created_at="2026-10-02T00:00:02Z"
+    )
+    torn = '{"snapshot_id": "snap_0000000000000e02", "names": ['
+    bad.write_text(torn, encoding="utf-8")
+    try:
+        json.loads(torn)
+    except json.JSONDecodeError as exc:
+        parse_error = str(exc)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="control_plane.registry.snapshots"):
+        assert _ids(registry.list()) == ["snap_0000000000000e01"]
+
+    assert len(caplog.records) == 1
+    warning = caplog.records[0]
+    assert warning.name == "control_plane.registry.snapshots"
+    assert warning.levelno == logging.WARNING
+    assert warning.args[0] == bad
+    assert warning.getMessage() == (
+        f"skipping unreadable snapshot record {bad}: {parse_error}"
+    )
+    # A corrupt record is still the *caller's* problem on the id path: the
+    # listing skips it, ``get()`` keeps raising what it always raised.
+    with pytest.raises(json.JSONDecodeError):
+        registry.get("snap_0000000000000e02")
 
 
 def test_listing_keeps_the_existing_filters(tmp_path):

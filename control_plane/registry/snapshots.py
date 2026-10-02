@@ -527,6 +527,26 @@ class SnapshotRegistry:
             if record.status == "creating":
                 yield record
 
+    def _record_files(self) -> list[Path]:
+        """Every record file on the shared volume, ``get()`` preference first.
+
+        Both layouts :meth:`_record_path` reads are walked: the current one
+        under ``<base>/_snapshots/`` and the pre-OBS-9 root-level one
+        (``<base>/<id>/snapshot.json``). A record ``get()`` can still serve
+        must not drop out of :meth:`list` -- N62 made listing read the volume,
+        and this is the other half of that: reading only one of the two places
+        the reader knows about. Root-level ``_``-prefixed directories are the
+        platform namespaces (``_runtime`` / ``_templates`` / ``_volumes`` /
+        ``_migrate`` / ...), not snapshots, and are skipped here.
+        """
+        files = sorted(self._snapshots_root.glob("*/snapshot.json"))
+        files += [
+            path
+            for path in sorted(self._base.glob("*/snapshot.json"))
+            if not path.parent.name.startswith("_")
+        ]
+        return files
+
     def _write_record(self, record: SnapshotRecord) -> None:
         # Atomic because the reader is another *process* by design: ``get()``
         # re-reads a ``creating`` record from this file precisely because the
@@ -586,12 +606,37 @@ class SnapshotRegistry:
         # The records live on the shared volume, not in this process (N62): two
         # replicas must list the same set, and a peer's create/delete has to
         # show up here. The in-memory dict is only a warm cache behind
-        # :meth:`get` -- same walk as :meth:`in_progress`.
+        # :meth:`get`.
         records: list[SnapshotRecord] = []
-        for path in sorted(self._snapshots_root.glob("*/snapshot.json")):
+        seen: set[str] = set()
+        for path in self._record_files():
+            snapshot_id = path.parent.name
+            # An id in both layouts is one record, and ``get()`` picks the
+            # current layout -- which the walk visits first.
+            if snapshot_id in seen:
+                continue
+            seen.add(snapshot_id)
             try:
-                records.append(self.get(path.parent.name))
+                records.append(self.get(snapshot_id))
             except UnknownSnapshotError:
+                # Deleted by a peer between the glob and the read.
+                continue
+            except (
+                json.JSONDecodeError,
+                OSError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                # One unreadable record must not take out the whole listing
+                # (the same discipline as ``SandboxRegistry._iter_stored_records``),
+                # and a silent skip would leave the id invisible with nothing
+                # to say why: name the file and the parse failure.
+                logger.warning(
+                    "skipping unreadable snapshot record %s: %s",
+                    path,
+                    exc,
+                )
                 continue
         records.sort(key=lambda r: r.created_at, reverse=True)
         if tenant_id is not None:
