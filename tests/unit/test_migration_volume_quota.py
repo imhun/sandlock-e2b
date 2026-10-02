@@ -244,6 +244,8 @@ async def test_migrate_success_preserves_volume_slices(
         async def _destroy(request, record, node, keep_files=False,
                            keep_volume_slices=False):
             destroyed.append((node.node_id, keep_files, keep_volume_slices))
+            # The real hop's answer; Task 3's source release reads it.
+            return sandboxes._TeardownOutcome(acknowledged=True)
 
         monkeypatch.setattr(sandboxes, "_stop_source_runtime", _stop)
         monkeypatch.setattr(sandboxes, "_export_sandbox_archive", _export)

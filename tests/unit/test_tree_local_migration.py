@@ -119,6 +119,17 @@ class _NodeApps(httpx.AsyncBaseTransport):
         return await httpx.ASGITransport(app=app).handle_async_request(request)
 
 
+class _RecordingAgentClient:
+    """The CP→agent file-op channel (``C3AgentClient``'s shape we use)."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def rm(self, **kwargs) -> dict:
+        self.calls.append({"op": "rm", **kwargs})
+        return {"op": "rm", "path": kwargs["path"]}
+
+
 class _HeaderRecorder:
     """Record the ASGI request headers of the (only) import call."""
 
@@ -168,7 +179,13 @@ def _node_layout(workspace: Path) -> dict[str, Path]:
     return {"a": disk_a, "b": disk_b, "shared": shared}
 
 
-def _control_app(workspace: Path, layout: dict[str, Path], *, trees_shared: bool):
+def _control_app(
+    workspace: Path,
+    layout: dict[str, Path],
+    *,
+    trees_shared: bool,
+    c3_agent_client=None,
+):
     settings = _control_settings(workspace, trees_shared=trees_shared)
     app = create_control_app(
         settings=settings,
@@ -179,6 +196,9 @@ def _control_app(workspace: Path, layout: dict[str, Path], *, trees_shared: bool
         node_address_resolver=StaticAddressResolver(
             {NODE_A: ENDPOINT_A, NODE_B: ENDPOINT_B}
         ),
+        # The node-agent channel the source release uses; a stub here (never the
+        # real resolver) because these tests have no cluster.
+        c3_agent_client=c3_agent_client,
         worker_identity_source=StaticWorkerIdentitySource(
             {
                 NODE_A: (WORKER_UID, WORKER_GID),
@@ -258,6 +278,9 @@ def _install_node_hop(monkeypatch: pytest.MonkeyPatch, layout: dict[str, Path]) 
 
     async def _destroy(request, record, node, keep_files=False, **kw):
         seen["destroy"].append({"node": node.node_id, "keep_files": keep_files})
+        # The real hop returns a _TeardownOutcome; the source release checks it
+        # (a refused teardown is a tree left behind, named on the record).
+        return sandboxes._TeardownOutcome(acknowledged=True)
 
     monkeypatch.setattr(sandboxes, "_provision_remote", _provision)
     monkeypatch.setattr(sandboxes, "_stop_source_runtime", _stop)
@@ -564,6 +587,93 @@ async def test_a_migration_from_an_unreachable_source_is_refused_by_name(
     assert seen["provision"] == []
     assert seen["destroy"] == []
     assert _staging_leftovers(layout["shared"]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_source_whose_node_row_is_gone_is_refused_by_the_same_name(
+    workspace, monkeypatch
+) -> None:
+    """同一个具名拒绝必须覆盖"节点行也没了"的时序。
+
+    源节点掉线先变成 ``unhealthy``（心跳窗口），再被"空且长期失联"的清理摘掉
+    （`NodeRegistry._prune_empty_unhealthy`）。两个时刻说的是同一件事 —— 树在
+    那台节点的盘上、够不着 —— 所以答案必须是同一个名字，而不是"节点未找到"那种
+    泛化 502：操作员靠这个名字决定是不是还要等节点回来。
+    """
+    layout = _node_layout(workspace)
+    _tree(layout["a"] / SANDBOX, {"workspace/kept.txt": "hello"})
+    nodes = _NodeApps({HOST_B: _agent_app(layout["b"], layout["shared"])})
+    _install_transport(monkeypatch, nodes)
+    seen = _install_node_hop(monkeypatch, layout)
+    app = _control_app(workspace, layout, trees_shared=False)
+    await _register(app, node_id=NODE_A, key=KEY_A, source_ip=IP_A)
+    await _register(app, node_id=NODE_B, key=KEY_B, source_ip=IP_B)
+    _enroll(app)
+    app.state.nodes.remove(NODE_A)
+
+    resp = await _migrate(app)
+
+    assert resp.status_code == 502, resp.text
+    assert resp.json()["message"].startswith("source-node-unreachable")
+    assert app.state.registry.get(SANDBOX).node_id == NODE_A
+    assert not (layout["b"] / SANDBOX).exists()
+    assert seen["provision"] == []
+    assert seen["destroy"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_source_tree_is_released_through_that_nodes_agent(
+    workspace, monkeypatch
+) -> None:
+    """迁移成功后**源节点的树必须真的消失**，而且要走 CP→agent 那条通道。
+
+    2026-10-02 的实测（`0.1.0-905`，见 task-3-report.md §10）抓到 happy path 泄漏：
+    F1 把记录先切到目标节点（那是为了让目标的 file-op 通过作用域检查），于是源节点
+    worker 的 DELETE 向控制面申请 `remove-workspace` 时，控制面按**记录**判它
+    "属于目标节点"，拒绝了自己刚下的指令（403）；迁移不检查那个返回值，照样
+    `200 migrated` —— 源节点的树原地留下，而孤儿回收按记录判它 `protected`，
+    永不回收（每个迁移留一整棵树在旧节点 68–75 GiB 的盘上）。
+
+    修法：源节点的释放不再绕 worker 的 DELETE，而是控制面**自己派生路径**、直接
+    指令那台节点的 agent（root，白名单含树根）删——与 materialize /
+    scope-slot-document 同一条通道。目标侧的清理仍走 worker（记录指着它）。
+    """
+    layout = _node_layout(workspace)
+    _tree(layout["a"] / SANDBOX, {"workspace/kept.txt": "hello"})
+    nodes = _NodeApps(
+        {
+            HOST_A: _agent_app(layout["a"], layout["shared"]),
+            HOST_B: _agent_app(layout["b"], layout["shared"]),
+        }
+    )
+    _install_transport(monkeypatch, nodes)
+    seen = _install_node_hop(monkeypatch, layout)
+    agent_client = _RecordingAgentClient()
+    app = _control_app(
+        workspace,
+        layout,
+        trees_shared=False,
+        c3_agent_client=agent_client,
+    )
+    await _register(app, node_id=NODE_A, key=KEY_A, source_ip=IP_A)
+    await _register(app, node_id=NODE_B, key=KEY_B, source_ip=IP_B)
+    _enroll(app)
+
+    resp = await _migrate(app)
+
+    assert resp.status_code == 200, resp.text
+    assert (layout["b"] / SANDBOX / "workspace" / "kept.txt").read_text() == "hello"
+    assert agent_client.calls == [
+        {
+            "op": "rm",
+            "node_id": NODE_A,
+            "sandbox_id": SANDBOX,
+            "path": str(app.state.workspace_base / SANDBOX),
+        }
+    ]
+    # ...and the source's tree was *not* left to the worker DELETE (the hop the
+    # control plane's own scoping refuses once the record names the target).
+    assert seen["destroy"] == []
 
 
 # --------------------------------------------------------------------------

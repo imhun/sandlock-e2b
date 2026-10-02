@@ -215,7 +215,10 @@ async def test_cross_node_migration_is_not_refused_by_the_file_op_scoping(
 
     async def _destroy(request, record, node, keep_files=False,
                        keep_volume_slices=False):
-        return None
+        # The real ``_destroy_on_node`` answers a ``_TeardownOutcome`` and the
+        # migration's source release reads it (Task 3: a refused teardown is a
+        # tree left on the source, which has to be named rather than swallowed).
+        return sandboxes._TeardownOutcome(acknowledged=True)
 
     monkeypatch.setattr(sandboxes, "_stop_source_runtime", _stop)
     monkeypatch.setattr(sandboxes, "_export_sandbox_archive", _export)

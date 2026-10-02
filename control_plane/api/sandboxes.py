@@ -2687,6 +2687,78 @@ def _discard_transfer_copy(tar_path: Path) -> None:
         pass
 
 
+async def _release_source_after_migration(
+    request, record, source, *, shared: bool
+) -> tuple[bool, str]:
+    """Release the source node's copy of a sandbox that has moved to a target.
+
+    ``shared=True`` is the pre-reslice shape: the tree is one directory on the
+    shared volume that both nodes see, the record now names the target, and the
+    only thing left is the source's own bookkeeping -- keep the files.
+
+    ``shared=False`` means the tree is on the **source node's own disk**, and
+    this is where the 2026-10-02 acceptance found the leak this function
+    exists to close: the worker's own DELETE would ask the control plane for a
+    ``remove-workspace`` file op, the control plane scopes file ops by the
+    *record* (which F1 already re-pointed at the target), so the control plane
+    refuses its own instruction (403) -- and a migration that ignores that
+    answer reports success while a whole tree stays on the old node, where the
+    orphan sweep must leave it alone (its id is still claimed).
+
+    So the removal goes over the **CP→agent** channel instead: the control
+    plane derives the path (nothing reports one -- hard rule 3) and the source
+    node's agent, which is root and whose whitelist carries the tree root, does
+    the removal. That is the same shape as the materialize and
+    slot-document instructions, and it does not widen the worker-facing scoping
+    by one line. A deployment without the agent channel falls back to the
+    worker DELETE, and **its answer is checked**.
+
+    Returns ``(released, detail)``; ``released=False`` is a bounded leak the
+    caller records by name (``stale-tree-on-former-source``) rather than
+    failing a migration whose sandbox is already serving on the target.
+    """
+    if shared:
+        outcome = await _destroy_on_node(
+            request, record, source, keep_files=True, keep_volume_slices=True
+        )
+        return outcome.acknowledged, "shared workspace: the tree stays on the shared volume"
+    tree_path = request.app.state.workspace_base / record.sandbox_id
+    client = getattr(request.app.state, "c3_agent_client", None)
+    if source.address != "local://" and client is not None:
+        try:
+            await client.rm(
+                node_id=source.node_id,
+                sandbox_id=record.sandbox_id,
+                path=str(tree_path),
+            )
+            return True, f"agent rm on {source.node_id}"
+        except AgentClientError as exc:
+            logger.error(
+                "sandbox %s: the source tree on node %s was NOT released "
+                "(agent rm refused: %s); it stays until an operator removes "
+                "%s on that node",
+                record.sandbox_id,
+                source.node_id,
+                exc,
+                tree_path,
+            )
+            return False, f"stale-tree-on-former-source: {source.node_id}: {exc}"
+    outcome = await _destroy_on_node(
+        request, record, source, keep_files=False, keep_volume_slices=True
+    )
+    if not outcome.acknowledged:
+        logger.error(
+            "sandbox %s: the source tree on node %s was NOT released (no agent "
+            "channel and the worker teardown was refused); it stays until an "
+            "operator removes %s on that node",
+            record.sandbox_id,
+            source.node_id,
+            tree_path,
+        )
+        return False, f"stale-tree-on-former-source: {source.node_id}"
+    return True, f"worker teardown on {source.node_id}"
+
+
 async def _import_sandbox_archive(request, record, node, tar_path) -> None:
     """Stream the staged tar into the target node; it publishes all or nothing."""
     settings = request.app.state.settings
@@ -2871,6 +2943,16 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
             raise OfficialError(404, f"Sandbox {sandbox_id} not found")
         source = nodes.get(record.node_id or "local")
         if source is None:
+            # Task 3: with the trees on each node's own disk, "the node row is
+            # gone" and "the node does not answer" are the same fact about the
+            # tree -- it is on that machine's disk and unreachable -- so they
+            # share one name. (A shared-workspace deployment keeps the old
+            # answer: there the tree is still on the NAS, and a missing node
+            # row really is just a missing node.)
+            if not settings.trees_shared:
+                raise source_node_unreachable(
+                    record.node_id or "local", "the node is no longer registered"
+                )
             raise OfficialError(502, f"Node {record.node_id} not found")
         try:
             body = await request.json()
@@ -2969,16 +3051,20 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
                 # (shared), but per-sandbox volume slices under a shared
                 # volume root are still mounted by the target sandbox:
                 # migration must never delete them (C1 E2.5 review).
-                await _destroy_on_node(
-                    request,
-                    record,
-                    source,
-                    keep_files=shared,
-                    keep_volume_slices=True,
+                released, release_detail = await _release_source_after_migration(
+                    request, record, source, shared=shared
                 )
                 note = f"migrated to node {target.node_id}"
                 if shared:
                     note += " (shared workspace)"
+                if not released:
+                    # A migration whose sandbox is already serving on the
+                    # target must not fail over cleanup, but a tree left on the
+                    # source is *invisible* to the orphan sweep (the record
+                    # still claims the id), so it is named on the record and in
+                    # the log rather than swallowed. See
+                    # docs/create-local-first-design.md §8.3.
+                    note += f"; source tree retained ({release_detail})"
                 record.append_log(note)
                 registry.save(record)
             except Exception:
