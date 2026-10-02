@@ -377,6 +377,37 @@ def test_the_capacity_account_reads_a_tar_payload(workspace: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "probe_path", [VERIFY_PROBE, CAPACITY_PROBE], ids=["verify", "capacity"]
+)
+def test_a_probe_survives_being_piped_into_the_interpreter(
+    probe_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The documented in-pod run is ``python3 - < <file>``; it may not raise.
+
+    Both probes add the checkout root to ``sys.path`` so ``python3 <path>``
+    works, and both have to survive the *other* shape. They did not: on
+    Python 3.14 (the platform images' interpreter) a piped script gets
+    ``__file__ == "<stdin>"`` **and** starts in a short cwd (``/app``), so
+    ``parents[3]`` raised ``IndexError`` and the probe died before printing a
+    single line -- hit on the cluster 2026-10-02, the first time these probes
+    were run after that guard was added.
+
+    Reproducing it needs both halves: the pseudo-``__file__`` and a cwd shallow
+    enough that ``parents[3]`` has nothing to index (this host's checkout path
+    is deep enough that the old guard survives it by accident, which is exactly
+    why it took a cluster run to find).
+    """
+    source = probe_path.read_text(encoding="utf-8")
+    namespace = {"__name__": "probe_under_test", "__file__": "<stdin>"}
+
+    with monkeypatch.context() as patch:
+        patch.chdir("/")
+        exec(compile(source, "<stdin>", "exec"), namespace)
+
+    assert namespace["_ROOT"] is None
+
+
 def test_the_payload_shape_helper_prefers_the_tar(workspace: Path) -> None:
     """One place decides "which shape is this snapshot": tar first, then ``fs/``.
 

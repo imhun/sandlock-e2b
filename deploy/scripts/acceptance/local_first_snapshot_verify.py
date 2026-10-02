@@ -52,11 +52,34 @@ import sys
 import tarfile
 from pathlib import Path
 
-#: The checkout root when this file is run *as a script* (``python3 <path>``
-#: puts the script's own directory on ``sys.path``, not the repo root). The
-#: documented invocation inside the pods -- ``python3 - < <this file>`` -- has
-#: no ``__file__`` and starts in ``/app``, which is the repo root already.
-_ROOT = Path(__file__).resolve().parents[3] if "__file__" in globals() else None
+def _repo_root() -> Path | None:
+    """The checkout root when this runs as a **file**, else ``None``.
+
+    The documented invocation inside the pods is ``python3 - < <this file>``:
+    there the interpreter starts in ``/app`` (the repo root) and puts the *cwd*
+    on ``sys.path``, so nothing is needed. Running it as ``python3 <path>``
+    puts the script's own directory on ``sys.path`` instead, which is why the
+    repo root is added here.
+
+    Both shapes have to be handled *and neither may raise*: on Python 3.12 a
+    piped script has no ``__file__`` at all, and on 3.14 it is defined as the
+    pseudo-name ``<stdin>`` -- where ``parents[3]`` raises ``IndexError``, and
+    the probe then dies before printing anything (hit on the cluster
+    2026-10-02, the first run of this probe after the guard was added).
+    """
+    try:
+        here = Path(__file__).resolve()  # noqa: F821 - defined when run as a file
+    except NameError:
+        return None
+    if here.name.startswith("<"):  # ``<stdin>``, ``<string>``, ``-c``
+        return None
+    try:
+        return here.parents[3]
+    except IndexError:
+        return None
+
+
+_ROOT = _repo_root()
 if _ROOT is not None and str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
