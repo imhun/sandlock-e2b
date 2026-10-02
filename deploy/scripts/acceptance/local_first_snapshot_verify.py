@@ -18,8 +18,21 @@ report:
   resolved to one of two copies);
 * the old payload root ``<workspaces>/_snapshots`` is gone and ``<workspaces>``
   now holds only sandbox trees;
-* the migration journal carries no refusal/collision line -- i.e. "merge, never
-  overwrite" never had to fire on this data.
+* the migration journal's **recorded plan is complete on disk**: every
+  platform-namespace ``move`` (``_snapshots/**``, ``_migrate``) has its target
+  present and its source gone, every ``rmdir`` shell is gone, and the *last*
+  run's entries all landed. That is the only honest way to read "merge, never
+  overwrite" never had to fire -- a collision raises ``Refuse`` during planning
+  (``deploy/scripts/migrate-state-base.sh``, ``build_plan``), **before the
+  journal is even opened**, so a refusal leaves no line to grep for. The
+  evidence is "the plan that was written down ran to completion", not "there is
+  no refusal line".
+
+  The journal holds **two** runs (N27's ``sandbox tree -> workspaces/<id>``
+  moves, and N58's ``_snapshots``/``_migrate`` merges). A sandbox tree that was
+  moved and whose sandbox was deleted afterwards is legitimately gone, so those
+  entries are reported separately (``tree_moves``) instead of being counted as
+  failures.
 
 Read-only. Run it where the shared volume is visible (control-plane or agent)::
 
@@ -40,9 +53,11 @@ RECORD = "snapshot.json"
 MARKER = ".complete"
 PAYLOAD = "fs"
 
-#: The journal is written by the migration script; anything that is not one of
-#: these verbs is a refusal or an unknown, and both are reported by name.
-JOURNAL_VERBS = ("mkdir", "move", "rmdir", "sample", "verify", "summary", "#")
+#: The verbs the migration script writes. Anything else is reported by name --
+#: but as an *unknown line*, never as a "refusal": see the module docstring.
+JOURNAL_VERBS = ("mkdir", "move", "rmdir")
+
+JOURNAL_HEADER = "# state-base-migration-journal"
 
 
 def classify(entry: Path) -> dict[str, object]:
@@ -85,32 +100,98 @@ def classify(entry: Path) -> dict[str, object]:
     return result
 
 
-def journal_report(path: Path) -> dict[str, object]:
+def journal_report(path: Path, root: Path) -> dict[str, object]:
     if not path.is_file():
         return {"present": False, "path": str(path)}
     verbs: dict[str, int] = {}
-    refusals: list[str] = []
-    duplicate_targets: list[str] = []
+    unknown_lines: list[str] = []
+    runs: list[dict[str, str]] = []
+    moves: list[tuple[str, str, int]] = []
+    rmdirs: list[tuple[str, int]] = []
     seen_targets: set[str] = set()
+    duplicate_targets: list[str] = []
+    run_index = -1
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not line.strip() or line.startswith("# state-base-migration-journal"):
+        if not line.strip():
+            continue
+        if line.startswith(JOURNAL_HEADER):
+            fields = dict(
+                part.split("=", 1) for part in line.split("\t")[1:] if "=" in part
+            )
+            runs.append(fields)
+            run_index += 1
             continue
         if line.startswith("#"):
             continue
         verb, _, rest = line.partition("\t")
+        parts = rest.split("\t")
         verbs[verb] = verbs.get(verb, 0) + 1
         if verb not in JOURNAL_VERBS:
-            refusals.append(line)
-        if verb == "move":
-            target = rest.split("\t")[-1]
-            if target in seen_targets:
-                duplicate_targets.append(target)
-            seen_targets.add(target)
+            unknown_lines.append(line)
+        elif verb == "move" and len(parts) >= 2:
+            moves.append((parts[0], parts[1], run_index))
+            if parts[1] in seen_targets:
+                duplicate_targets.append(parts[1])
+            seen_targets.add(parts[1])
+        elif verb == "rmdir" and parts:
+            rmdirs.append((parts[0], run_index))
+
+    # Two kinds of entry live in this journal and they cannot be judged the
+    # same way:
+    #
+    # * **platform-namespace** moves (`_snapshots/**`, `_migrate`) -- the N58
+    #   merge. Nothing deletes those out from under the check, so "the target
+    #   is not on disk" really is a half-done merge;
+    # * **sandbox-tree** moves (`sbx_*` -> `workspaces/sbx_*`, the N27 run) --
+    #   the tree's whole lifecycle is "the sandbox exists". A tree that was
+    #   deleted afterwards (the fleet is empty today) is expected to be gone,
+    #   so those are reported separately instead of counted as failures.
+    def is_tree(rel: str) -> bool:
+        return rel.startswith("workspaces/") and rel.rsplit("/", 1)[-1].startswith("sbx_")
+
+    platform_targets_missing = [
+        dst for _src, dst, _run in moves if not is_tree(dst) and not (root / dst).exists()
+    ]
+    sources_remaining = [src for src, _dst, _run in moves if (root / src).exists()]
+    shells_remaining = [rel for rel, _run in rmdirs if (root / rel).exists()]
+    tree_targets = [dst for _src, dst, _run in moves if is_tree(dst)]
+    tree_targets_present = [dst for dst in tree_targets if (root / dst).exists()]
+    last_run = len(runs) - 1
+    last_run_moves = [(src, dst) for src, dst, run in moves if run == last_run]
+    last_run_shells = [rel for rel, run in rmdirs if run == last_run]
+    last_missing = [dst for src, dst in last_run_moves if not (root / dst).exists()]
+    last_sources = [src for src, dst in last_run_moves if (root / src).exists()]
+    last_shells = [rel for rel in last_run_shells if (root / rel).exists()]
     return {
         "present": True,
         "path": str(path),
+        "runs": runs,
         "verbs": verbs,
-        "refusals": refusals,
+        "moves": len(moves),
+        "unknown_lines": unknown_lines,
+        "platform_namespace_targets_missing": platform_targets_missing,
+        "move_sources_remaining": sources_remaining,
+        "rmdir_shells_remaining": shells_remaining,
+        "tree_moves": {
+            "count": len(tree_targets),
+            "targets_present": len(tree_targets_present),
+            "note": (
+                "sandbox trees moved by the N27 run; a tree whose sandbox was deleted "
+                "afterwards is legitimately gone, so only the platform-namespace moves "
+                "and the last run are judged strictly"
+            ),
+        },
+        "last_run": {
+            "moves": len(last_run_moves),
+            "missing_targets": last_missing,
+            "sources_remaining": last_sources,
+            "shells_remaining": last_shells,
+        },
+        "recorded_plan_completed": bool(moves)
+        and not platform_targets_missing
+        and not sources_remaining
+        and not shells_remaining
+        and not unknown_lines,
         "duplicate_move_targets": duplicate_targets,
     }
 
@@ -135,7 +216,7 @@ def main() -> int:
         "workspaces_entries": sorted(p.name for p in workspaces.iterdir()) if workspaces.is_dir() else [],
         "entries": [],
         "classes": {},
-        "journal": journal_report(journal),
+        "journal": journal_report(journal, root),
     }
     if not snapshots.is_dir():
         json.dump(out, sys.stdout, indent=2)
@@ -169,7 +250,19 @@ def main() -> int:
     out["ids_in_both_roots"] = duplicates
     out["verdict"] = {
         "merge_lossless": bool(entries) and not duplicates and not leftovers,
-        "collision_refusal_fired": bool(out["journal"].get("refusals")),
+        # NOT "we found no refusal line": a collision raises Refuse while the
+        # plan is being built, before the journal is opened, so a refusal is
+        # invisible in the journal. What can be checked is that the plan the
+        # journal *does* record ran to completion on disk (every recorded
+        # rename landed, every recorded source is gone, every rmdir'd shell is
+        # gone) -- combined with the per-id classes above, that is the evidence
+        # that the merge had nothing to refuse.
+        "recorded_plan_completed": bool(out["journal"].get("recorded_plan_completed")),
+        "refusal_note": (
+            "a collision raises Refuse during build_plan and writes no journal "
+            "line, so 'no refusal' cannot be grepped for; it is established by "
+            "the recorded plan completing on disk plus the four-class id table"
+        ),
     }
     json.dump(out, sys.stdout, indent=2)
     print()

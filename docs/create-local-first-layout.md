@@ -92,33 +92,32 @@
 
 ## 3. `<workspace>` 本地 vs 共享：实测与逐条评估
 
-### 3.1 实测（2026-10-02，`e2b-worker-0` 内，串行，n=200；脚本见本节的复现命令）
+### 3.1 实测（2026-10-02，`e2b-worker-0` 内，串行，n=200）
 
 | 负载 | 节点本地（容器 `/tmp`，同一块 nvme） | 共享 NAS（`/var/lib/e2b-sandboxes`） | 倍率 |
 |---|---|---|---|
-| 写 200 个 64 B 文件（open+write+close） | 5.6 ms（**0.028 ms/个**） | 2612 ms（**13.06 ms/个**） | **466×** |
-| 64 MiB 顺序写（带 fsync） | **1027 MB/s** | 435 MB/s | 2.4× |
+| 写 200 个 64 B 文件（open+write+close） | 5.5 ms（**0.027 ms/个**） | 2601 ms（**13.01 ms/个**） | **475×** |
+| ~~64 MiB 顺序写（带 fsync）~~ | ~~1027 MB/s~~ | ~~435 MB/s~~ | **已撤回** |
 
-复现：
+> **⚠ 上表第二行已撤回（2026-10-02，Task 1 Step 1 ⓪）。** 那两个数来自**内联 heredoc 的
+> 一次性读数**，且用了**探针的 percentile bug**（`pct(q)` 把 `q` 当分数用，于是每个 "p50"
+> 实际是**最大值**）：`1027` 是本地 64 MiB 写的**突发相位**（逐窗口实测
+> `989 → 937 → 194 → 125.5 …`，前 ~128 MiB 是云盘突发额度），稳态是 **125 MB/s**；
+> 而 NAS 真实 p50 是 **483–493 MB/s**（n=10，三种块大小）。
+> 也就是说**大块顺序写本地比 NAS 慢约 3.9×**，不是快。
+> 完整读数与逐窗口序列见 **[`docs/create-local-first-design.md` §1.2](create-local-first-design.md)**
+> —— 那份文档是 Task 1 之后的权威。**本节的结论（元数据 466× 是真收益）不受影响**，
+> 受影响的是"本地也更快"这个印象。
 
-```
-kubectl -n sandlock exec -i e2b-worker-0 -- python3 - <<'PY'
-import os, shutil, time
-def bench(label, root, n=200, size=64):
-    d = os.path.join(root, "_bench.tmp.%d" % os.getpid())
-    try:
-        os.makedirs(d, exist_ok=True)
-        t = time.perf_counter()
-        for i in range(n):
-            with open(os.path.join(d, "f%04d" % i), "wb") as f:
-                f.write(b"x" * size)
-        dt = time.perf_counter() - t
-        print("%-28s %8.1f ms  %7.3f ms/file" % (label, dt*1000, dt/n*1000))
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
-bench("local", "/tmp")
-bench("nas", "/var/lib/e2b-sandboxes/workspaces")
-PY
+复现（升格后的固定工具，不再用内联 heredoc）：
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+kubectl -n sandlock exec -i e2b-worker-0 -- python3 - \
+  --root nas:/var/lib/e2b-sandboxes/workspaces \
+  --root local:/var/lib/e2b-images \
+  --seq-mb 64,256,1024 --repeat 10 --small-n 200 \
+  < deploy/scripts/acceptance/local_first_storage_probe.py
 ```
 
 **两条推论**：
@@ -127,10 +126,11 @@ PY
   的 RPC 往返（NFSv4 的 create/write/close-commit），挂载参数已经调过
   （`vers=4.0 / rsize=wsize=1M / hard`，见 `deploy/k8s-k0s/storage-nas.yaml`）
   且 v4.0 是锁语义的硬要求 —— 这不是调参能消掉的。
-* **计划里那条"节点 ESSD 写 186 / 冷读 125，慢于 NAS 381 / 165"的旧读数是错的**
-  （本机重测：本地 1027 / NAS 435）。那次本地数很可能测偏了（当时是 agent
-  `maint` 容器 512 MiB 限额下、刚 OOMKilled 重启之后）。**在 Task 1 Step 1 重测
-  之前，不拿它当判据。**
+* **计划里那条"节点 ESSD 写 186 / 冷读 125，慢于 NAS 381 / 165"的旧读数**在**量级上
+  是对的**，本轮 n=10 重测把它钉死（本地稳态 125、NAS 483–493）。**本行原先的反驳
+  （"本地 1027 / NAS 435"）已按上面的撤回作废** —— 那次本地数测的是突发相位
+  （当时也在 agent `maint` 512 MiB 限额下跑过，那是另一个混淆项）。
+  判据以 **[`docs/create-local-first-design.md` §1.2](create-local-first-design.md)** 为准。
 
 沙箱自己的 `/workspace` 就是 bind mount 到 worker 里的这条 NAS 路径
 （`envd_service/executors/sandlock.py:2226`），所以在共享形态下，沙箱里

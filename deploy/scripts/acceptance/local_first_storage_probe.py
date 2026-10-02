@@ -55,8 +55,20 @@ CHUNK = 8 << 20
 
 
 def pct(values: list[float], q: float) -> float:
+    """Nearest-rank percentile; ``q`` is 0–100 (the convention every sibling
+    probe in this directory uses).
+
+    This used to read ``round(q * (len - 1))`` while the callers passed ``50``,
+    so every "p50" it printed was the **maximum** of the samples. It is called
+    out here because the reading it produced (a local 64 MiB write at
+    1017 MB/s) is the burst value, not the median -- the exact confusion this
+    probe exists to settle.
+    """
+    if not values:
+        return 0.0
     ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, max(0, round(q * (len(ordered) - 1))))]
+    k = int(round(q / 100.0 * (len(ordered) - 1)))
+    return ordered[min(len(ordered) - 1, max(0, k))]
 
 
 def parse_root(spec: str) -> tuple[str, Path]:
@@ -149,6 +161,12 @@ def seq_write(
     finally:
         shutil.rmtree(d, ignore_errors=True)
     mbps = [mb / s for s in samples]
+    # The median *rate* and the median *time* are medians of two different
+    # arrays, so they are not each other's reciprocal. Report the median rate
+    # together with the seconds of the run that produced it, so a table can
+    # quote one run instead of two.
+    paired = sorted(zip(mbps, samples), key=lambda pair: pair[0])
+    median_run = paired[min(len(paired) - 1, max(0, int(round(0.5 * (len(paired) - 1)))))]
     out: dict[str, object] = {
         "op": "seq_write",
         "mb": mb,
@@ -156,6 +174,7 @@ def seq_write(
         "fsync_every_mb": fsync_every_mb,
         "seconds_p50": round(pct(samples, 50), 4),
         "mbps_p50": round(pct(mbps, 50), 1),
+        "mbps_p50_run_seconds": round(median_run[1], 4),
         "mbps_min": round(min(mbps), 1),
         "mbps_max": round(max(mbps), 1),
         "mbps_mean": round(statistics.fmean(mbps), 1),
