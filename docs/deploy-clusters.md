@@ -136,7 +136,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次：见 §7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**当前版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，当前版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次：见 §7.29（2026-10-02，N58：根重切上线 —— `_snapshots` 合一、`_migrate` 上浮，建箱 p50 124 → 135/136 ms、逐段不变，**当前版本 `0.1.0-887-g7ef319b-20261002-100406`**；该次上线当场抓到"从快照建箱"的 502，已前滚修复 + 复验，详见该节）；§7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**当前版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，当前版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -1436,6 +1436,100 @@ E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000 \
     E2B_API_KEY="$E2B_API_KEY" tmp/venv/bin/python \
     deploy/scripts/acceptance/snapshot_create_probe.py --n 3 --files 1
 ```
+
+### 7.29 N58：根重切上线（`_snapshots` 合一、`_migrate` 上浮）（**2026-10-02，已上线 `0.1.0-887-g7ef319b-20261002-100406`**）
+
+计划 `docs/superpowers/plans/2026-10-02-local-first-create.md` 的 Task 0 Step 5–8；
+介质归属的实测与逐条评估在 `docs/create-local-first-layout.md`。**这一轮不翻介质**：
+树仍在共享盘上，行为与重切前逐字相同，它只把"谁挂在哪个根下"写清楚 —— 为 Task 3
+（树搬节点本地）清出那一步。
+
+**三个提交**：`308b543`（Step 4 代码：平台命名空间根 helper、第五根 `E2B_NODE_STATE_BASE`、
+迁移判据 `E2B_TREES_SHARED`）、`4ac410b`（Step 5+6：清单 + N58 迁移阶段）、
+`7ef319b`（上线当场抓到的 `copy_from` 回归，见下）。前两个**必须同一次上线**：代码已经把
+`_snapshots`/`_migrate` 的根改到共享根，而线上数据还在旧位置。
+
+**窗口里多了一件事：先关自动扩缩器。** `E2B_AS_ENABLED=true` + `E2B_AS_MIN_REPLICAS=2`
+的 autoscaler 就在控制面里，它的第 2 步**无条件**把副本数拉回 floor
+（`autoscaler/loop.py:124`，5 秒一次 tick，`scale_to` 直接 patch `statefulset/e2b-worker`
+的 scale 子资源）。只 `scale --replicas=0` 会在迁移 Job 跑的中途被拉回来 —— 那正是
+「worker 起来了、旧位置的树与新位置对不上」。做法：`kubectl -n sandlock set env
+deploy/control-plane E2B_AS_ENABLED=false` → 等 rollout → 再缩 worker；`apply.sh`
+随后把清单里的 `true` 写回去。**N27 那轮没有这个坑（autoscaler 2026-09-30 才并进控制面）。**
+
+**执行顺序与读数**
+
+```
+kubectl -n sandlock set env deploy/control-plane E2B_AS_ENABLED=false   # 关掉抢副本的那个循环
+kubectl -n sandlock scale statefulset/e2b-worker --replicas=0           # 停写
+deploy/scripts/migrate-state-base.sh                                    # 只读计划（脚本自己的闸门：worker=0）
+deploy/scripts/migrate-state-base.sh --apply                            # ConfigMap + Job，跑完自动清理
+deploy/k8s-k0s/apply.sh                                                 # 新清单；先把 agent DS 滚完再滚 worker
+```
+
+| 判据 | 读数 |
+|---|---|
+| 迁移计划（dry-run，经控制面 pod） | `moves=9 dirs=3 todo=14 unknown=0`：1 条上浮 + 2 条整 id 合一 + 3 条逐条合一（6 个条目）+ 3 个空壳 rmdir；**没有一条"两边同名"** |
+| 迁移执行（Job） | `SUMMARY mode=apply moves=9 dirs=3 todo=14 done=14 unknown=0`；逐条 `VERIFY … same_inode=yes`、`src_gone=yes`；12 条 `SAMPLE … sha_same=yes`；journal `state/.state-base-migration.journal` 0600 1628 B；Job/ConfigMap 无残留 |
+| 卷上形状（控制面 pod 内只读复核） | `<export>/_snapshots` **8 个 id**：`46dc`/`4bf1`/`ce90`（记录+载荷合一）、`962c`（重切前就完整的那个）、`2bb1`/`a6e1`（**只有载荷**）、`015f`/`1ca5`（**只有记录**）；`<export>/_migrate` 1777 nobody；`<export>/workspaces` **空**（`_snapshots`/`_migrate` 都不在了） |
+| 建箱 p50（控制面内，n=10，两轮） | 上线前 **124 ms**（p95 137）→ 上线后 **135 / 136 ms**（p95 180 / 186）。逐段（`E2B_CREATE_TRACE=1`）**与 §7.28 逐条相同**：`prepare` 75–76、`finalize` 7.7–8.0、`prime` 5.3–11.3、`record` ≈51。⇒ 没有结构性回归；差的那 10 ms 是刚滚完的舰队的冷缓存（§7.28 的 127–130 是跑了很久的集群上的数） |
+| 快照建箱（新快照） | `snapshot_create_probe.py --n 3 --files 1`：**p50 208 ms**，`kept='kept\n'`，`workspace/workspace/kept.txt` = `FileNotFoundException`（v1 的坑不在了） |
+| **被迁移过的老快照**恢复 | `restore_snapshot_probe.py` **4/4**：`46dc`/`4bf1`（逐条合一，内容 `kept\n`）、`ce90`（2000 文件，`lease/f0000.bin` 512 B）、`962c`（2000 文件，`big/f0000.bin` 512 B） |
+| 冒烟与残留 | 9 个 pod 全 Running；`GET /sandboxes` = `[]`；`statefulset/e2b-worker` 2/2；`DRY_RUN=1 apply.sh \| kubectl diff -f -` **0 行** |
+
+**⚠ 上线当场抓到的一次回归（已前滚修复）。** 迁移 + 新清单上线后，`snapshot_create_probe.py`
+立刻报
+
+```
+502: the agent for node e2b-worker-0 refused the materialization: partial-copy:
+the snapshot source /var/lib/e2b-sandboxes/workspaces/_snapshots/snap_7ebb…/fs
+is not a directory
+```
+
+根因：`control_plane/file_ops.py::derive_materialize` 仍然从**树根**推导快照的复制源
+（`<workspace_base>/_snapshots/<id>/fs`），而 N58 已经把载荷合到 `<export>/_snapshots/<id>/fs`。
+于是"从快照建箱"**全部** 502 —— 建箱（plain）、建快照、删快照都不受影响，所以只有真的
+恢复一次才看得见。计划里 `control_plane/file_ops.py` 在 Task 0 的文件清单内，但 Step 4 只改了
+`node_state_base` 那一半；`derive_materialize` 的 `copy_from` 形状被记在 Task 2（改成指向 tar）
+名下，"指向合一后的 `_snapshots`"这一步从没写进任何 Step。
+
+修在 `7ef319b`：`copy_from` 改走 `gateway_common.paths.snapshot_payload_dir(…,
+shared_root=paths.shared_volume_root)`（与 agent 写载荷同一个 helper），钉子
+`tests/unit/test_cp_materialize_instruction.py::test_a_snapshot_create_carries_copy_from`
+的 fixture 把"树根"与"平台命名空间根"做成两个不同目录，改之前红的正是那条 502 路径。
+重建镜像（`0.1.0-887`）→ apply → 上面两个探针全绿。
+
+**复跑**
+
+```bash
+# ① 迁移的本机彩排（不连集群；造出 N27 之后的形状，跑到回退）
+tmp/venv/bin/python deploy/scripts/acceptance/migrate_state_base_rehearsal.py
+
+# ② 建箱延迟（控制面内；n=10）
+kubectl -n sandlock exec -i <cp-pod> -c control-plane -- python3 - \
+    --base http://127.0.0.1:3000 --key "$E2B_API_KEY" --n 10 \
+    < deploy/scripts/acceptance/create_latency_probe.py
+
+# ③ 新快照的往返
+E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000 \
+    E2B_API_KEY="$E2B_API_KEY" tmp/venv/bin/python \
+    deploy/scripts/acceptance/snapshot_create_probe.py --n 3 --files 1
+
+# ④ 被迁移过的老快照（每条检查一个进程，见工具自己的说明）
+E2B_API_URL=http://172.18.78.49:3000 E2B_SANDBOX_URL=http://172.18.78.49:3000 \
+    E2B_API_KEY="$E2B_API_KEY" tmp/venv/bin/python \
+    deploy/scripts/acceptance/restore_snapshot_probe.py \
+    --check 'snap_46dc467759dbbfb7:workspace/kept.txt:kept\n' \
+    --check 'snap_ce90ef9852fc6809:lease/f0000.bin'
+```
+
+**回退窗口（仍然开着）**：`state/.state-base-migration.journal`（0600）+ 
+`deploy/scripts/migrate-state-base.sh --rollback --apply` 原路退回。要注意**回退之后必须
+同时回退镜像**：`308b543` 之后的代码只认新位置。
+
+**这一轮没有解决的**（都在计划里）：`2bb1`/`a6e1` 有载荷没记录、`015f`/`1ca5` 有记录没载荷 ——
+这是 N27 下沉时留下的**数据**问题（记录是控制面在快照成功之后写的），迁移按设计原样留着并
+具名报告，没替它们编一份；Task 2 会把载荷换成 `fs.tar`、Task 3 才把树搬去节点本地盘。
 
 ## 8. 改部署的入口
 

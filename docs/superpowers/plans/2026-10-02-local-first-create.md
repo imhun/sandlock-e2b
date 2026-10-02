@@ -8,9 +8,9 @@
 
 **Tech Stack:** Python（`control_plane/`、`c3_agent/`、`envd_service/`、`gateway_common/`）、k8s（k0s、arm64）、NFS（阿里云 NAS）+ 节点 ESSD、tar。
 
-## 当前进度（2026-10-02，**Task 0 的仓库侧已完，卡在上线窗口**）
+## 当前进度（2026-10-02，**Task 0 已完成并上线**）
 
-**已完成 —— Task 0 的 Step 1–6, 8（仓库侧全部）**
+**已完成 —— Task 0 全部（Step 1–8），线上版本 `0.1.0-887-g7ef319b-20261002-100406`**
 
 | 项 | 状态 | 证据 |
 |---|---|---|
@@ -23,10 +23,12 @@
 | 回归（本批） | ✅ | `tests/unit` **2221 passed / 12 skipped / 3 failed**（+10：本轮新增 11 条，多出的那一条 failed 是 `test_create_deferred_persist` 在满载下的时序抖动，单独跑绿）；3 条仍是那三条 macOS-only |
 | 彩排（本机） | ✅ | `deploy/scripts/acceptance/migrate_state_base_rehearsal.py`：dry-run 不写、apply 后 inode 不变、再跑报「没有可搬的条目」、`--rollback --apply` 原样退回 |
 | 彩排（集群，**只读**） | ✅ | 在控制面 pod 里跑 `--mode plan`：`moves=9 dirs=3 todo=14`，无冲突（见 Step 7） |
+| 上线（Step 7 的停机那一半） | ✅ | `docs/deploy-clusters.md` §7.29。顺序：关自动扩缩器（新坑，见 §7.29）→ worker 缩 0 → 迁移 → apply → 起 worker；迁移 `done=14`，`GET /sandboxes`=`[]`，`DRY_RUN` diff 0 行 |
+| 上线当场抓到的一次回归 | ✅ 已前滚修 | `derive_materialize` 的 `copy_from` 指向树根 ⇒ 从快照建箱全 502；`7ef319b` 修 + 复验（4/4 老快照恢复）|
 
-**没做（本次到此为止）**：Task 0 Step 7 里需要停机的那一半（把 `308b543` + 本轮清单与迁移上线，然后量建箱 p50 与 `_snapshots` 记录数的前后）；Task 1–6 全部未开始。
+**没做**：Task 1–6 全部未开始（介质翻转在 Task 3，快照 tar 在 Task 2）。
 
-⚠ **上线顺序（`308b543` + 本轮清单与迁移必须同一次上线）**：`308b543` 已经把 `_snapshots` / `_migrate` 的**根**改到共享根，而线上**数据还在旧位置**（`<workspaces>/_snapshots/<id>/fs`）。单独部署它，找不到载荷的快照会在合并之前恢复失败。顺序照 N27：**worker 缩到 0 → 跑迁移（先 dry-run）→ apply 新清单 → 起 worker → 验证**。这条顺序至今**没有执行过**，所以线上仍然是 `0.1.0-877-ge15b77f-20261001-231822`。
+⚠ **上线顺序已执行过一次**（`308b543` + `4ac410b` 同一次上线，2026-10-02）。下一个动到根的提交要照 §7.29 那套走：**先 `E2B_AS_ENABLED=false` 关掉抢副本的循环，再 worker 缩到 0 → 迁移（先 dry-run）→ apply 新清单 → 起 worker → 验证**。回退窗口仍然开着：`state/.state-base-migration.journal` + `migrate-state-base.sh --rollback --apply`，但**回退后必须同时回退镜像**。
 
 **Task 0 先行（目录与介质归属）**：今天一根 `E2B_WORKSPACE_BASE` 同时决定三件事 —— 沙箱树在哪、平台共享命名空间（`_snapshots` / `_migrate`）挂在它下面的哪、以及"树是不是共享"这个迁移开关取什么值（`control_plane/api/sandboxes.py:2687` 的 `shared = bool(settings.shared_workspace_root)`）。三件事共用一根，所以"把树搬本地"不是改一个值的事：改了它，平台命名空间会一起被拖到节点本地盘。先拆成**五个具名根 + 一个具名判据**（见 Task 0 的表），顺手把 `_snapshots` 的两个命名空间合成一个、把 `_migrate` 上浮到共享根；**默认部署的行为逐字不变**（树仍在共享），介质翻转留到 Task 3 改两个值。
 
@@ -121,13 +123,15 @@
   - 搬空之后用 `rmdir` 拆壳（**不递归**），journal 里记 `rmdir <rel> <mode>`，回退按原权限位重建。
   - 判据放宽了一条：`<export>/workspaces` 除了「有标记/是空的」以外，还接受「兄弟层 `state/` 已是新布局」——否则合一之后再想看一眼会被误判成"一棵碰巧叫 workspaces 的树"。
   - 彩排（本机 `--root`，`deploy/scripts/acceptance/migrate_state_base_rehearsal.py`）+ 集群只读计划都跑过：见下。
-- [ ] **Step 7: 集群验收** —— **只读的一半已做**，需要停机的一半待上线窗口（见下方"当前进度"）：
+- [x] **Step 7: 集群验收** ✅ 上线窗口已跑（2026-10-02，版本 `0.1.0-887-g7ef319b-20261002-100406`，记录见 `docs/deploy-clusters.md` §7.29）：
   - ✅ 集群身份自检（2 节点 / arm64 / `v1.36.4+k0s` / `sandlock` 9 pod）
   - ✅ `GET /sandboxes` = `[]`
   - ✅ `DRY_RUN=1 apply.sh | kubectl diff -f -`：只有**两个**对象变（c3-agent 的 init 脚本、control-plane 的 env + subPath），worker 与其余对象零差异；渲染用的版本与线上相同，所以没有镜像 tag 行
   - ✅ 迁移的**集群只读计划**（在控制面 pod 里跑 `--mode plan`，不写一个字节）：`moves=9 dirs=3 todo=14` —— 1 条上浮 + 2 条整条 id 合一 + 3 条逐条合一（6 个文件）+ 3 个空壳 rmdir；2 个只有记录的 id 原地不动；**没有一条"两边同名"**
-  - ⏳ 建箱 p50 前后各量一次 + `_snapshots` 记录数前后各量一次 —— 需要先把 `308b543`+本轮的清单与迁移上线（worker 必须先缩到 0）
-- [ ] **Step 8: 提交** —— 已按计划的消息形状提交（见下）；**仍未上线**。
+  - ✅ 迁移执行：`apply moves=9 dirs=3 todo=14 done=14`、逐条 `same_inode=yes`、12 条抽样 `sha_same=yes`、journal 0600；卷上 `<export>/_snapshots` 8 个 id、`<export>/_migrate` 1777、`<export>/workspaces` 空
+  - ✅ 建箱 p50 前后各量一次：**124 → 135/136 ms**（逐段 `prepare`/`finalize`/`prime`/`record` 与 §7.28 逐条相同 ⇒ 无结构性回归）
+  - ✅ 上线当场抓到并前滚修掉**一次回归**：`control_plane/file_ops.py::derive_materialize` 的 `copy_from` 还指向树根 ⇒"从快照建箱"全 502（`7ef319b`；钉子 `test_a_snapshot_create_carries_copy_from` 先红后绿）。复验：新快照往返 p50 208 ms、**被迁移过的 4 个老快照 4/4 恢复成功**
+- [x] **Step 8: 提交** ✅ `4ac410b`（清单 + 迁移）+ `7ef319b`（`copy_from` 修复），已上线。
 
 ### Task 1: 前置测量与设计文档（与 Task 0 并行；它决定 Task 3 的淘汰上限）
 
