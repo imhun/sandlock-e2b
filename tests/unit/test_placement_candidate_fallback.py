@@ -11,6 +11,10 @@ These cases pin the hand-over itself, the visibility (node + all four
 dimensions, verbatim), the exhaustion line, and the deliberate exception:
 ``reserve_node`` names its target, so it must not shop around.
 
+Two more pin the two boundaries the refactor into ``rank_candidates`` could
+quietly have moved: an empty candidate set, and the volume-pinned node (it must
+lead the ranking *and* still be the exact object ``pick_best`` hands back).
+
 The fleet used here is two *identical* nodes, which leaves the ranking a tie;
 the sort is stable, so the candidate order is registration order and
 ``node_a`` is the first candidate.
@@ -21,6 +25,7 @@ from __future__ import annotations
 import logging
 
 from control_plane.registry.nodes import NodeRegistry
+from control_plane.scheduler import pick_best, rank_candidates
 
 _DIMS = {"memory_mb": 512, "cpu_percent": 100, "disk_mb": 1024, "processes": 64}
 
@@ -76,17 +81,28 @@ def _place(nodes: NodeRegistry):
     return nodes.select_and_reserve(base_image=None, **_DIMS)
 
 
-def test_a_refused_candidate_hands_the_placement_to_the_next_one() -> None:
+def test_a_refused_candidate_hands_the_placement_to_the_next_one(caplog) -> None:
     """The store refuses ``node_a``; ``node_b`` is empty and takes it."""
     nodes = _fleet("node_a", "node_b")
     nodes._quota_store = _RefusingStore("node_a")
 
-    picked = _place(nodes)
+    with caplog.at_level(logging.WARNING):
+        picked = _place(nodes)
 
     assert picked is not None
     assert picked.node_id == "node_b"
     assert picked.reserved_memory_mb == _DIMS["memory_mb"]
     assert nodes.get("node_a").reserved_memory_mb == 0
+    # The hand-over works, so the "every candidate" line must not be here: it
+    # belongs to an exhausted candidate set only.
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ] == [
+        "quota store refused node node_a for memory=512 cpu=100 disk=1024 "
+        "processes=64; trying the next candidate (1 left)"
+    ]
 
 
 def test_the_skip_names_the_node_and_the_dimensions(caplog) -> None:
@@ -153,3 +169,65 @@ def test_reserve_node_does_not_retry_a_named_target(caplog) -> None:
     ] == []
     assert nodes.get("node_a").reserved_memory_mb == 0
     assert nodes.get("node_b").reserved_memory_mb == 0
+
+
+def test_an_empty_candidate_set_ranks_to_nothing() -> None:
+    """No candidates at all, and no capable one, both rank to ``[]``.
+
+    ``rank_candidates`` answering ``[]`` is what keeps ``pick_best``'s ``None``
+    (and therefore ``select_node``'s) exactly where it was: a fleet that cannot
+    fit must stay a refusal, not become an ``IndexError`` or a stray element.
+    """
+    nodes = _fleet("node_a", "node_b")
+    for node in nodes.list():
+        node.reserve(8192, 800, 16384, 512)  # nothing fits any more
+
+    assert rank_candidates([], base_image=None, **_DIMS) == []
+    assert rank_candidates(nodes.list(), base_image=None, **_DIMS) == []
+    assert pick_best([], base_image=None, **_DIMS) is None
+    assert pick_best(nodes.list(), base_image=None, **_DIMS) is None
+
+
+def test_a_volume_pinned_node_leads_even_when_it_scores_worse() -> None:
+    """The pinned node is ``[0]``, and it is the same object ``pick_best`` returns.
+
+    ``node_a`` outranks ``node_b`` on image affinity here, so a ranking that
+    forgot the pin (or re-sorted it away) would hand back ``node_a`` -- and a
+    pin rebuilt by copying the record instead of moving it would hand back an
+    equal-but-different object, which the reservation then writes into the
+    wrong place.
+    """
+    nodes = _fleet("node_a", "node_b")
+    nodes.get("node_a").images = ["python:3.11-slim"]
+    candidates = nodes.list()
+
+    ranked = rank_candidates(
+        candidates,
+        base_image="python:3.11-slim",
+        volume_node_id="node_b",
+        **_DIMS,
+    )
+    picked = pick_best(
+        candidates,
+        base_image="python:3.11-slim",
+        volume_node_id="node_b",
+        **_DIMS,
+    )
+
+    assert [node.node_id for node in ranked] == ["node_b", "node_a"]
+    assert ranked[0] is nodes.get("node_b")
+    assert picked is nodes.get("node_b")
+
+    # ...and the pin *moves* the record instead of adding a second copy of it:
+    # a ranking that lists the pinned node twice would reserve the same node
+    # twice for one sandbox.
+    twins = _fleet("node_a", "node_b", "node_c")
+    twin_ranked = rank_candidates(
+        twins.list(), base_image=None, volume_node_id="node_b", **_DIMS
+    )
+
+    assert [node.node_id for node in twin_ranked] == ["node_b", "node_a", "node_c"]
+    assert twin_ranked[0] is twins.get("node_b")
+    assert sorted(id(node) for node in twin_ranked) == sorted(
+        id(node) for node in twins.list()
+    )

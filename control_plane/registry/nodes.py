@@ -866,6 +866,14 @@ class NodeRegistry:
                 node.reserve(memory_mb, cpu_percent, disk_mb, processes)
                 self._persist_locked(node)
                 return node
+            # Reached only when the loop above never returned, i.e. when the
+            # candidate set really is exhausted: a refusal that still has a
+            # candidate behind it ``continue``s and cannot fall through to
+            # here. So a placement that hands over successfully logs the skip
+            # line(s) alone -- no "every candidate" line -- and this line only
+            # ever follows the last skip. ``ranked`` being empty is the other
+            # way in, and that is "nothing fits", not "everyone refused", so it
+            # stays silent.
             if ranked:
                 logger.warning(
                     "quota store refused every candidate for memory=%s cpu=%s "
