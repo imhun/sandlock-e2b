@@ -1067,3 +1067,126 @@ async def test_a_slice_not_in_the_plan_is_never_created(workspace: Path) -> None
     assert resp.status_code == 200
     assert sorted(os.listdir(volume_root)) == ["other-sandbox"]
     assert len(agent.runner.calls) == 1
+
+
+# --------------------------------------------------------- the chain's cost
+#
+# Opening a directory costs one metadata round trip per *component* when the
+# tree is on the shared mount, and the create path asked for the same tree's
+# chain several times. This section is about that cost and nothing else -- the
+# §4.3.1 rules above still hold, and a cheaper chain is only worth having if it
+# checks the same thing. It is deliberately a *counting* case: the milliseconds
+# move on the NAS, the count does not move on any filesystem.
+
+
+def _root_walks(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record every ``open("/", …|O_DIRECTORY)`` this process makes, in order.
+
+    Starting at ``/`` *is* the walk every chain request used to pay from
+    scratch, so counting that one open counts "this create walked from the root
+    again" without depending on how the rest of the walk is spelled. ``flags``
+    is kept so a failure prints what was actually asked for.
+    """
+    walks: list[int] = []
+    real_open = os.open
+
+    def counting_open(path, flags, *args, **kwargs):
+        if flags & os.O_DIRECTORY and str(path) == "/":
+            walks.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(materialize.os, "open", counting_open)
+    return walks
+
+
+@pytest.mark.asyncio
+async def test_the_dir_chain_does_not_walk_from_the_root_every_time(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One create starts from ``/`` **once**, however often it wants the tree.
+
+    The criterion is the count of ``open("/")`` directory walks in one
+    materialization, per shape, and it is exactly ``1`` -- the tree's own
+    chain, walked from the root once. It is falsified by any code that reaches
+    the same directory by walking the absolute path again: the three shapes
+    below asked for 2, 3 and 3 walks before the chain cache (a fresh create
+    wants the root and then ``<root>/workspace``; a tree that is already there
+    adds the leftover mode pass; a create from a ``fs.tar`` adds the root again
+    for the mode pass after the unpack), and every extra walk re-pays one
+    round trip per component on the shared NAS.
+
+    The three shapes are here because they take different branches -- and the
+    third is the shape a live create has today (Task 2's payload), so a fix
+    that only helped the no-snapshot case would be red here.
+
+    What it proves: nothing below a directory already walked is walked from
+    ``/`` again -- the rest of the chain is opened relative to a descriptor the
+    walk below verified.
+
+    What it cannot see: **how long the one remaining walk is** (a create that
+    started at ``/`` once and still walked a needlessly deep path would pass),
+    and the per-component cost -- this is a count on a local filesystem, not a
+    timing; the NAS figures are in the task report, and Task 3 is what takes
+    that one walk off the shared mount for good. It also says nothing about
+    opens *below* a cached parent (``_open_dir_at`` relative to a descriptor),
+    which are cheap by construction and deliberately not counted.
+    """
+    walks = _root_walks(monkeypatch)
+    counts: dict[str, int] = {}
+
+    fresh = _Agent(workspace / "fresh")
+    resp = await _post(fresh, _instruction(tree=_plan_tree(fresh)))
+    assert resp.status_code == 200
+    counts["fresh"] = len(walks)
+
+    # The same create against a tree that is already there: this is the shape
+    # that pays the leftover mode pass, which is a third chain request.
+    existing = _Agent(workspace / "existing")
+    (existing.tree() / "workspace").mkdir(parents=True)
+    walks.clear()
+    resp = await _post(existing, _instruction(tree=_plan_tree(existing)))
+    assert resp.status_code == 200
+    counts["existing_tree"] = len(walks)
+
+    # ...and the live shape: a create whose tree comes from a tar payload, so
+    # the root is asked for once more after the unpack (its mode pass).
+    payload_agent = _Agent(workspace / "payload")
+    payload = _snapshot_tar(payload_agent, {"workspace": {"kept.txt": "kept\n"}})
+    walks.clear()
+    resp = await _post(
+        payload_agent,
+        _instruction(tree=_plan_tree(payload_agent, copy_from=str(payload))),
+    )
+    assert resp.status_code == 200
+    counts["from_a_tar_payload"] = len(walks)
+
+    assert counts == {"fresh": 1, "existing_tree": 1, "from_a_tar_payload": 1}
+
+
+@pytest.mark.asyncio
+async def test_a_cached_parent_still_refuses_a_symlinked_segment(
+    workspace: Path,
+) -> None:
+    """The chain cache must not answer for a component it never walked.
+
+    The cheaper walk would be a hole if it ever stopped checking: the root is
+    opened first (the ``fchmod`` loop), so every later request for
+    ``<root>/workspace`` is served *from the cache's parent* -- and if that
+    meant "the parent is trusted, so the rest is too", a link the previous
+    incarnation left at ``workspace/`` would be written through instead of
+    refused. The component the cache has not walked goes through the same
+    ``_open_dir_at`` as before, which is what this pins.
+    """
+    agent = _Agent(workspace)
+    outside = workspace / "outside"
+    outside.mkdir()
+    root = agent.tree()
+    root.mkdir(parents=True)
+    (root / "workspace").symlink_to(outside)
+
+    resp = await _post(agent, _instruction(tree=_plan_tree(agent)))
+
+    assert resp.status_code == 400
+    assert "destination-is-a-symlink" in resp.json()["error"]
+    assert sorted(os.listdir(outside)) == []
+    assert agent.runner.calls == []

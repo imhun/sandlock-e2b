@@ -166,6 +166,20 @@ def materialize_tree(
     ``chown``, the ordering this repo keeps everywhere it matters) before any
     privilege is spent on it.
     """
+    with _VerifiedDirectories() as directories:
+        return _materialize_tree(
+            plan, settings=settings, runner=runner, directories=directories
+        )
+
+
+def _materialize_tree(
+    plan: Mapping[str, Any],
+    *,
+    settings,
+    runner: MaintRunner,
+    directories: _VerifiedDirectories,
+) -> dict[str, Any]:
+    """The body of :func:`materialize_tree`, holding its chain cache."""
     if not isinstance(plan, Mapping):
         raise MaterializeRefusal(BAD_PLAN, "the plan is not an object")
     tree = plan.get("tree")
@@ -191,7 +205,7 @@ def materialize_tree(
     # own ``apply_sandbox_ownership`` rule, which is why the sandbox can write
     # its tree while the worker (the group) still can too.
     for directory in (root, target):
-        fd = _open_dir_chain(directory)
+        fd = directories.open_dir(directory)
         try:
             os.fchmod(fd, mode)
         except OSError as exc:
@@ -202,7 +216,7 @@ def materialize_tree(
             os.close(fd)
     if copy_from is not None:
         source = resolve_inside(str(copy_from), roots=roots)
-        _take_snapshot_payload(source, root, mode=mode)
+        _take_snapshot_payload(source, root, mode=mode, directories=directories)
     # ``existed`` is the gate, not "did we copy something": a tree this op
     # just created gets its mode from the two ``fchmod``s above and from the
     # merge as it makes each directory, so there is nothing left over to fix
@@ -211,7 +225,7 @@ def materialize_tree(
     # residue of a previous, failed attempt), which is exactly the hole
     # ``uid_pool._prepare_directory_modes`` closes with its own ``os.walk``.
     if existed:
-        root_fd = _open_dir_chain(root)
+        root_fd = directories.open_dir(root)
         try:
             _enforce_directory_modes(root_fd, mode)
         finally:
@@ -220,7 +234,7 @@ def materialize_tree(
     # privilege is spent: a slice is materialization too (design §4.3 step ③),
     # and the same two layers apply -- the control plane derived the path from
     # its volume records, and this agent re-checks it against its own roots.
-    slices = _plan_slices(plan, roots=roots, mode=mode)
+    slices = _plan_slices(plan, roots=roots, mode=mode, directories=directories)
     # Ownership goes through the audited binary (never ``os.chown``): the same
     # pool gate, the same realpath discipline, the same walk. ``worker_gid``
     # is what ``--gid`` is checked against in the child.
@@ -264,7 +278,13 @@ def materialize_tree(
     }
 
 
-def _take_snapshot_payload(source: Path, root: Path, *, mode: int) -> None:
+def _take_snapshot_payload(
+    source: Path,
+    root: Path,
+    *,
+    mode: int,
+    directories: _VerifiedDirectories,
+) -> None:
     """Land one snapshot payload at the tree root, in either shape.
 
     The writer emits ``fs.tar`` (one sequential file instead of one NAS round
@@ -289,7 +309,9 @@ def _take_snapshot_payload(source: Path, root: Path, *, mode: int) -> None:
         if legacy.is_dir():
             directory = legacy
     if directory.is_dir():
-        copy_tree(str(directory), str(root), dir_mode=mode)
+        copy_tree(
+            str(directory), str(root), dir_mode=mode, directories=directories
+        )
         return
     if not source.is_file():
         raise MaterializeRefusal(
@@ -311,7 +333,7 @@ def _take_snapshot_payload(source: Path, root: Path, *, mode: int) -> None:
     # ends at the plan's mode, because the worker is the group and has to be
     # able to write one level down -- by creating each directory itself. A tar
     # carries the tree's own modes, so the same pass runs after the unpack.
-    root_fd = _open_dir_chain(root)
+    root_fd = directories.open_dir(root)
     try:
         _enforce_directory_modes(root_fd, mode)
     finally:
@@ -319,7 +341,11 @@ def _take_snapshot_payload(source: Path, root: Path, *, mode: int) -> None:
 
 
 def _plan_slices(
-    plan: Mapping[str, Any], *, roots: tuple[Path, ...], mode: int
+    plan: Mapping[str, Any],
+    *,
+    roots: tuple[Path, ...],
+    mode: int,
+    directories: _VerifiedDirectories,
 ) -> list[dict[str, Any]]:
     """Make the plan's volume slices; returns them resolved.
 
@@ -344,7 +370,7 @@ def _plan_slices(
             raise MaterializeRefusal(
                 PARTIAL_COPY, f"cannot create the slice {path}: {exc}"
             ) from exc
-        fd = _open_dir_chain(path)
+        fd = directories.open_dir(path)
         try:
             os.fchmod(fd, mode)
         except OSError as exc:
@@ -403,6 +429,87 @@ def _open_dir_at(name: str, parent_fd: int, *, where: str) -> int:
         raise
 
 
+class _VerifiedDirectories:
+    """One materialization's already-walked, no-follow directory descriptors.
+
+    :func:`_open_dir_chain` builds every path from ``/`` down, and when the
+    trees are on the shared NAS -- the shape live today, ``E2B_TREES_SHARED=1``
+    -- **every component of that walk is a metadata round trip**. One create
+    asks for the same tree's chain two to three times: the root's ``fchmod``,
+    the ``subdir`` under it, the leftover mode pass, and the tree root again
+    while the payload lands. Measured on the live NAS 2026-10-02, one walk of a
+    production-depth tree (``/var/lib/e2b-sandboxes/workspaces/<id>``, five
+    components) is **~6.6 ms**, and a create from a ``fs.tar`` paid it three
+    times -- ~22 ms of the create is that walk, and it is already the slow path
+    on the shared mount.
+
+    This holds the descriptors one materialization has already verified and
+    serves each later request from the longest ancestor it has opened, so a
+    create walks from ``/`` once and opens the rest relative to that.
+
+    Two properties are load-bearing, and neither is optional:
+
+    * **a cached descriptor is the check's result, not a way around it.** Every
+      descriptor here was opened by :func:`_open_dir_at` -- one component at a
+      time, ``O_NOFOLLOW`` -- and a descriptor names an inode: a component that
+      is swapped for a symlink *after* the walk cannot steer an operation onto
+      its target, because the cached descriptor still names the directory the
+      walk accepted, inside the destination root. A component that has **not**
+      been walked yet goes through the very same ``_open_dir_at`` the uncached
+      code used, so ``destination-is-a-symlink`` is still raised by name, in
+      the same order, for the same component.
+    * **per materialization.** The cache lives no longer than one call (the
+      ``with`` in :func:`materialize_tree`), so no descriptor outlives the
+      request that opened it, nothing is shared between two creates, and there
+      is no cross-request lifetime to reason about.
+    """
+
+    def __init__(self) -> None:
+        self._fds: dict[tuple[str, ...], int] = {}
+
+    def __enter__(self) -> _VerifiedDirectories:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        for fd in self._fds.values():
+            os.close(fd)
+        self._fds.clear()
+
+    def open_dir(self, path: Path) -> int:
+        """A descriptor for ``path``, walking only the components not seen yet.
+
+        The caller owns the returned descriptor: it is a ``dup`` of the cached
+        one, so closing it (the shape every caller here already had) leaves the
+        cache usable.
+        """
+        if not path.is_absolute():
+            # ``resolve_inside`` never hands this module one, and walking
+            # ``parts[1:]`` of a relative path would quietly open ``/``.
+            raise MaterializeRefusal(
+                PATH_OUTSIDE_ROOTS, f"{path} is not an absolute path"
+            )
+        parts = path.parts
+        start = 1
+        fd = None
+        for cut in range(len(parts) - 1, 0, -1):
+            fd = self._fds.get(parts[:cut])
+            if fd is not None:
+                start = cut
+                break
+        if fd is None:
+            fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+            self._fds[parts[:1]] = fd
+        for index in range(start, len(parts)):
+            # No-follow, one component at a time -- the check itself, not a
+            # cached answer about it (see the class docstring).
+            fd = _open_dir_at(parts[index], fd, where=f"opening {path}")
+            self._fds[parts[: index + 1]] = fd
+        return os.dup(fd)
+
+
 def _open_dir_chain(path: Path) -> int:
     """Open ``path`` as a directory fd, resolving **every** segment no-follow.
 
@@ -410,17 +517,13 @@ def _open_dir_chain(path: Path) -> int:
     descriptor, so a component that is a symlink (or that is swapped for one
     between two components) is an ``ELOOP`` rather than a step out of the tree.
     The caller owns the returned descriptor.
+
+    A one-off walk, for a caller with nothing to reuse (:func:`copy_tree`).
+    The create path goes through :class:`_VerifiedDirectories` instead, which
+    is this walk without paying for a chain it has already opened.
     """
-    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        for part in path.parts[1:]:
-            child = _open_dir_at(part, fd, where=f"opening {path}")
-            os.close(fd)
-            fd = child
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
+    with _VerifiedDirectories() as directories:
+        return directories.open_dir(path)
 
 
 def _open_child_dir(name: str, parent_fd: int, mode: int) -> int:
@@ -588,7 +691,13 @@ def _enforce_directory_modes(dst_fd: int, dir_mode: int) -> int:
     return count
 
 
-def copy_tree(src: str, dst: str, *, dir_mode: int = 0o770) -> int:
+def copy_tree(
+    src: str,
+    dst: str,
+    *,
+    dir_mode: int = 0o770,
+    directories: _VerifiedDirectories | None = None,
+) -> int:
     """Recursively copy ``src`` into the existing directory ``dst``.
 
     Returns the number of entries copied. Two disciplines, one per side, and
@@ -606,6 +715,10 @@ def copy_tree(src: str, dst: str, *, dir_mode: int = 0o770) -> int:
     worker's ``apply_sandbox_ownership`` keeps; files keep the snapshot's own
     bits. Ownership is not this function's business -- the caller hands the
     whole tree over once, after the copy.
+
+    ``directories`` is the caller's chain cache when it has one
+    (:class:`_VerifiedDirectories`); a caller with nothing to reuse gets a
+    one-off walk of ``dst``. Either way the walk is the same no-follow walk.
     """
     source = Path(src)
     if source.is_symlink() or not source.is_dir():
@@ -613,7 +726,11 @@ def copy_tree(src: str, dst: str, *, dir_mode: int = 0o770) -> int:
             PARTIAL_COPY, f"the copy source {src} is not a directory"
         )
     try:
-        dst_fd = _open_dir_chain(Path(dst))
+        dst_fd = (
+            _open_dir_chain(Path(dst))
+            if directories is None
+            else directories.open_dir(Path(dst))
+        )
     except OSError as exc:
         raise _refusal_for(exc, dst, doing="opening") from exc
     try:
