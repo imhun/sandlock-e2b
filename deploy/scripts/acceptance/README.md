@@ -58,6 +58,12 @@
 | `guard_probe2.py` | Post-fix probe: the vacuity hole is now an assertion, not a silent green. | —（头部无 Usage 行；见脚本 `--help`） |
 | `ledger-arena-test.py` | Is the 72 MiB/thread cost glibc's per-thread malloc arena? | —（头部无 Usage 行；见脚本 `--help`） |
 | `ledger-thread-cost.py` | What does each kind of thing cost in the sandlock ledger, in a plain box? | —（头部无 Usage 行；见脚本 `--help`） |
+| `local_first_capacity_account.py` | Task 1 Step 1 ②：共享根逐命名空间的字节/文件数、节点本地盘 headroom、快照记录与日期（每节点容量账的输入）。 | `kubectl -n sandlock exec -i <agent-pod> -c maint -- python3 - < deploy/scripts/acceptance/local_first_capacity_account.py` |
+| `local_first_pagecache_acceptance.py` | Task 1 Step 1 ③：用公开 API 驱动建箱/快照/从快照建箱，同时在 worker 与 `maint` 容器内采样页缓存峰值（n≥10）。 | `tmp/venv/bin/python deploy/scripts/acceptance/local_first_pagecache_acceptance.py --repeat 10 --snapshot-repeat 3 --sampler-seconds 18 --restore-seconds 10`（要 `KUBECONFIG` + `E2B_*`） |
+| `local_first_pagecache_probe.py` | 采样**本容器** cgroup 的 `memory.stat:file` / `memory.current`（要跑在被测容器里，两边一共挂同一个 hostPath）。 | `kubectl -n sandlock exec -i e2b-worker-0 -c worker -- python3 - --seconds 45 --label worker-snapshot < deploy/scripts/acceptance/local_first_pagecache_probe.py` |
+| `local_first_sequential_write_probe.py` | Task 1 Step 1 ①：在**沙箱里**写 `--seq-mb` MiB（默认 900，1024 MiB 配额下的最大值），附一次 1024 MiB `dd` 的配额拒绝读数。 | `tmp/venv/bin/python deploy/scripts/acceptance/local_first_sequential_write_probe.py --seq-mb 900 --repeat 10`（要 `E2B_*`） |
+| `local_first_snapshot_verify.py` | Task 1 Step 2：只读复核合一后的 `<export>/_snapshots/<id>`（记录/载荷四分类、旧载荷根是否还在、迁移 journal 有无同名冲突）。 | `kubectl -n sandlock exec -i <cp-pod> -c control-plane -- python3 - < deploy/scripts/acceptance/local_first_snapshot_verify.py` |
+| `local_first_storage_probe.py` | Task 1 Step 1 ⓪/①：同一份负载在共享 NAS 与节点本地盘上的小文件 + 顺序写（三种块大小、n≥10、可选逐窗口速率）。 | `kubectl -n sandlock exec -i e2b-worker-0 -- python3 - --root nas:/var/lib/e2b-sandboxes/workspaces --root local:/var/lib/e2b-images --seq-mb 64,256,1024 --repeat 10 --chunk-log < deploy/scripts/acceptance/local_first_storage_probe.py` |
 | `mcp-3way.py` | Split an MCP call into forward path / server work / return path. | —（头部无 Usage 行；见脚本 `--help`） |
 | `mcp-512-size.py` | In a 512MB box: wait for the gateway, then find the largest stdio server. | —（头部无 Usage 行；见脚本 `--help`） |
 | `mem512-limit.py` | Live: is the 512MB box a hard limit, and what does an MCP gateway cost? | —（头部无 Usage 行；见脚本 `--help`） |
