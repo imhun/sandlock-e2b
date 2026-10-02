@@ -482,6 +482,46 @@ class NodeRegistry:
             self._persist_locked(record)
             return record
 
+    def reconcile_quota_ledger(
+        self,
+        node_id: str,
+        *,
+        memory_mb: int,
+        cpu_percent: int,
+        disk_mb: int,
+        processes: int,
+    ) -> dict[str, int]:
+        """Bring the **shared** quota ledger for one node back to the records.
+
+        :meth:`set_reserved` heals the in-memory view on re-registration; this
+        is the other half (N59): the Redis ledger the other replica also checks
+        had no reconciliation path and no TTL, so a leaked reservation could
+        only be cleared by hand -- and because ``select_and_reserve`` gives up
+        when the store refuses instead of trying the next candidate, a few
+        leaked slots turned into a fleet-wide ``503``. Both halves are now
+        rebuilt from the same aggregate, in the same call site
+        (``control_plane.api.internal._rebuild_node_reservations``).
+
+        Returns the signed per-dimension deltas the store applied ({} when the
+        ledger already agreed), so the caller can name a correction instead of
+        rewriting a ledger quietly.
+
+        Deliberately **not** merged into ``set_reserved``: that one runs for
+        paths that have no shared ledger (a deployment without Redis), and a
+        ``None`` store must stay a no-op rather than an error.
+        """
+        if self._quota_store is None:
+            return {}
+        return self._quota_store.reconcile(
+            node_id,
+            {
+                "memory": max(0, memory_mb),
+                "cpu": max(0, cpu_percent),
+                "disk": max(0, disk_mb),
+                "processes": max(0, processes),
+            },
+        )
+
     def get(self, node_id: str) -> NodeRecord | None:
         self._sweep_health()
         with self._lock:

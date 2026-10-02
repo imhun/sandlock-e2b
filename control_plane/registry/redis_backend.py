@@ -200,6 +200,61 @@ class RedisQuotaStore:
             for k, v in raw.items()
         }
 
+    def reconcile(self, name: str, dims: dict[str, int]) -> dict[str, int]:
+        """Make one ledger row equal ``dims``; return the deltas applied.
+
+        The one caller is a node **re-registration** (``_rebuild_node_reservations``):
+        the sandbox records are authoritative for that node at that instant --
+        its runtime has just been (re)created, and every reservation that is
+        serving a sandbox there has a record -- so the ledger is set to the
+        records' sum, in one WATCH/MULTI so a concurrent ``reserve`` cannot be
+        interleaved.
+
+        Why this exists (N59's operational half): the ledger had **no
+        reconciliation path at all** and no TTL, so a leaked reservation stayed
+        until an operator deleted the Redis hash by hand -- and because
+        ``select_and_reserve`` gives up when the store refuses instead of trying
+        the next candidate, a few leaked slots jammed the whole fleet with
+        ``503``. The in-memory view already healed on registration
+        (``NodeRegistry.set_reserved``); this is the same healing for the half
+        that is shared across replicas.
+
+        The deltas are returned signed (negative = lowered) so the caller can
+        name what it corrected instead of silently rewriting a ledger. A
+        *downward* correction is the direction worth reading: it can only drop
+        a reservation that no record accounts for, which at registration means
+        a leak (or, in a narrow window, a create in flight against a node that
+        is being re-registered -- named in ``_rebuild_node_reservations``).
+        """
+        key = self._key(name)
+        with self._client.pipeline() as pipe:
+            for _ in range(RELEASE_ONCE_MAX_ATTEMPTS):
+                try:
+                    pipe.watch(key)
+                    raw = pipe.hgetall(key)
+                    used = {
+                        (k.decode() if isinstance(k, bytes) else k): int(v)
+                        for k, v in raw.items()
+                    }
+                    deltas = {
+                        dim: int(want) - used.get(dim, 0)
+                        for dim, want in dims.items()
+                        if int(want) != used.get(dim, 0)
+                    }
+                    if not deltas:
+                        pipe.unwatch()
+                        return {}
+                    pipe.multi()
+                    for dim, delta in deltas.items():
+                        pipe.hincrby(key, dim, delta)
+                    pipe.execute()
+                    return deltas
+                except (redis.WatchError, redis.exceptions.WatchError):  # type: ignore[union-attr]
+                    continue
+        raise RuntimeError(  # pragma: no cover - defensive
+            f"quota reconciliation for {key} kept losing its WATCH race"
+        )
+
 
 class RedisRecordStore:
     """JSON records shared across replicas."""

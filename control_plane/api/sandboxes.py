@@ -2679,8 +2679,17 @@ def _discard_transfer_copy(tar_path: Path) -> None:
     it: the file is the transfer, and the ``control-plane/`` directory is only
     ever created for one of these copies, so an empty one is this task's own
     residue and nothing else.
+
+    Runs from a ``finally`` on the success path too, so it may not raise: an
+    exception here would unwind a *committed* migration into the rollback (which
+    releases the target's reservation and re-provisions the source while the
+    target is the live node). Cleanup that cannot be done is logged, not
+    propagated.
     """
-    tar_path.unlink(missing_ok=True)
+    try:
+        tar_path.unlink(missing_ok=True)
+    except OSError as exc:  # pragma: no cover - a read-only/unlinkable staging dir
+        logger.warning("could not remove the staged migration copy %s: %s", tar_path, exc)
     try:
         tar_path.parent.rmdir()
     except OSError:
@@ -2941,6 +2950,11 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
     target = None
     old_node_id = None
     source_stopped = False
+    #: N59: the target's reservation is taken *before* the source is touched, so
+    #: every failure between here and the commit has to give it back -- the
+    #: refusal paths (`source-node-unreachable`) included. Exactly one release
+    #: runs, from the single unwind point below.
+    target_reserved = False
     tar_path: Path | None = None
     try:
         try:
@@ -2997,6 +3011,7 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
             if target is None:
                 raise OfficialError(503, "No resources available for migration")
 
+        target_reserved = True
         old_node_id = record.node_id
 
         # Close the dual-active window: stop the source runtime (keeping its
@@ -3063,7 +3078,13 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
                 # files; the source workspace itself is untouched. With a
                 # shared workspace the target directory is the shared one, so
                 # never delete it -- only drop a partial runtime registration.
-                nodes.release_quota(target.node_id, **dims)
+                #
+                # The *reservation* is not released here: the unwind point at
+                # the bottom of this function is the one place that gives it
+                # back, so a failure that never reached this block (the export
+                # handshake refuses, the source node will not stop, the record
+                # re-point cannot be written) releases it too -- and no path can
+                # release it twice (N59: the refusal used to leak the slot).
                 if target.address == "local://":
                     _destroy_local(
                         request.app.state,
@@ -3148,6 +3169,21 @@ async def migrate_sandbox(sandbox_id: str, request: Request) -> dict[str, Any]:
         # sandbox keeps serving from its original node, and undo any record
         # switch that was already persisted.
         #
+        # N59: and give the **target's** reservation back. It was taken before
+        # the source was touched, so every failure short of the commit -- the
+        # named `source-node-unreachable` refusal included -- owes it back to
+        # both ledgers (`release_quota` writes the node view and the shared
+        # quota store). This is the *only* release site: the inner handler
+        # deliberately does not release, so nothing can double-return it.
+        if target_reserved and target is not None:
+            nodes.release_quota(target.node_id, **dims)
+            target_reserved = False
+            logger.info(
+                "sandbox %s: released the target reservation on node %s after a "
+                "failed migration",
+                sandbox_id,
+                target.node_id,
+            )
         # F1: undo the record switch *first*. The re-point above moved the
         # record to the destination before provisioning, so a failed migration
         # whose recovery re-provisions the source must put the source back on

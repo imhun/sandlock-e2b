@@ -189,12 +189,15 @@ def _control_app(
     *,
     trees_shared: bool,
     c3_agent_client=None,
+    redis_client=None,
 ):
     settings = _control_settings(workspace, trees_shared=trees_shared)
     app = create_control_app(
         settings=settings,
         registry=SandboxRegistry(settings),
-        nodes_registry=NodeRegistry(heartbeat_timeout=600.0),
+        nodes_registry=NodeRegistry(
+            heartbeat_timeout=600.0, redis_client=redis_client
+        ),
         volumes_registry=VolumeRegistry(workspace / "_volumes_base"),
         workspace_base=settings.workspace_base,
         node_address_resolver=StaticAddressResolver(
@@ -664,6 +667,74 @@ async def test_a_source_that_stops_but_cannot_export_is_refused_by_the_same_name
     assert not (layout["b"] / SANDBOX).exists()
     assert agent_client.calls == []
     assert _staging_leftovers(layout["shared"]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_named_refusal_gives_the_target_reservation_back(
+    workspace, monkeypatch
+) -> None:
+    """N59：具名拒绝必须把**目标节点的预约**还回去，两个台账都要。
+
+    2026-10-02 的现场（`0.1.0-905`/`908`）：`migrate` 在 `_stop_source_runtime`
+    **之前**就 `reserve_node(target)`（内存视图 + Redis 台账各记一份），而
+    `source-node-unreachable` 走外层回滚 —— 那条回滚只把记录指回源节点、重建源的运行时，
+    **从不 `release_quota(target)`**。于是每一次拒绝白留一个节点名额：worker-0 的 Redis
+    台账 **3072 MB = 3 × 1024**，`/internal/nodes` 的内存视图同样虚高，最后
+    `MULTI-NODE` / `DEPLOYMENT` 两条冒烟全在 `503`（控制者手工清台账 + 杀 8 个孤儿沙箱
+    之后才恢复）。
+
+    这里两个台账都在（节点注册表挂 fakeredis）：拒绝之后目标两边都必须是 0，源节点自己
+    的预约原样保留。
+    """
+    fakeredis = pytest.importorskip("fakeredis")
+    layout = _node_layout(workspace)
+    _tree(layout["a"] / SANDBOX, {"workspace/kept.txt": "hello"})
+    nodes = _NodeApps({HOST_B: _agent_app(layout["b"], layout["shared"])})
+    _install_transport(monkeypatch, nodes)
+    seen = _install_node_hop(monkeypatch, layout)
+
+    async def _stop_unreachable(request, record, node):
+        return False
+
+    monkeypatch.setattr(sandboxes, "_stop_source_runtime", _stop_unreachable)
+    app = _control_app(
+        workspace,
+        layout,
+        trees_shared=False,
+        redis_client=fakeredis.FakeRedis(),
+    )
+    await _register(app, node_id=NODE_A, key=KEY_A, source_ip=IP_A)
+    await _register(app, node_id=NODE_B, key=KEY_B, source_ip=IP_B)
+    _enroll(app)
+    record = app.state.registry.get(SANDBOX)
+    dims = {
+        "memory_mb": record.memory_mb,
+        "cpu_percent": record.cpu_count * 100,
+        "disk_mb": record.disk_size_mb,
+        "processes": record.max_processes,
+    }
+    app.state.nodes.reserve_node(NODE_A, **dims)
+
+    resp = await _migrate(app)
+
+    assert resp.status_code == 502, resp.text
+    assert resp.json()["message"].startswith("source-node-unreachable")
+    assert seen["provision"] == []
+    assert seen["destroy"] == []
+    # The target's reservation is back in **both** ledgers...
+    assert app.state.nodes.get(NODE_B).reserved_memory_mb == 0
+    assert app.state.nodes.get(NODE_B).reserved_cpu_percent == 0
+    assert app.state.nodes.get(NODE_B).reserved_disk_mb == 0
+    assert app.state.nodes.get(NODE_B).reserved_processes == 0
+    assert app.state.nodes._quota_store.get(NODE_B) == {
+        "memory": 0,
+        "cpu": 0,
+        "disk": 0,
+        "processes": 0,
+    }
+    # ...while the source keeps its own (the sandbox is still there).
+    assert app.state.nodes.get(NODE_A).reserved_memory_mb == record.memory_mb
+    assert app.state.nodes._quota_store.get(NODE_A)["memory"] == record.memory_mb
 
 
 @pytest.mark.asyncio

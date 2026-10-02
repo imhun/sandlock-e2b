@@ -569,6 +569,23 @@ def _rebuild_node_reservations(request: Request, record) -> None:
     reservations start at zero, so fleet utilization would be misreported
     (and nodes over-committed). Aggregating the node's records here keeps the
     two views consistent.
+
+    N59: "the two views" is exactly the problem -- the *shared* ledger
+    (``e2b:node:quota:<node>``) is the copy every replica checks, and it had no
+    reconciliation path at all, so a leaked reservation outlived every restart
+    until an operator deleted the key by hand. Both halves are now rebuilt from
+    this aggregate in one call. The aggregate is authoritative *here* because
+    the node's runtime has just been (re)created: every reservation serving a
+    sandbox on it has a record. A correction is named in the log rather than
+    applied quietly -- a downward one (the leak direction) is the one worth
+    reading.
+
+    Named residual: a create placed against this node in the instant between
+    "it looked healthy" and this rebuild has a reservation but no record yet,
+    and this drops it (over-sell by that one sandbox's dims). The window needs a
+    node that re-registers exactly while a create is being placed on it, and the
+    alternative -- a ledger that drifts up forever and jams placement -- is the
+    failure this heals.
     """
     dims = {"memory": 0, "cpu": 0, "disk": 0, "processes": 0}
     for sandbox in request.app.state.registry.list():
@@ -587,6 +604,21 @@ def _rebuild_node_reservations(request: Request, record) -> None:
         disk_mb=dims["disk"],
         processes=dims["processes"],
     )
+    deltas = request.app.state.nodes.reconcile_quota_ledger(
+        record.node_id,
+        memory_mb=dims["memory"],
+        cpu_percent=dims["cpu"],
+        disk_mb=dims["disk"],
+        processes=dims["processes"],
+    )
+    if deltas:
+        logger.warning(
+            "node %s re-registered: the shared quota ledger did not match the "
+            "sandbox records and was reconciled to them (deltas: %s; negative "
+            "values are the leaked reservations this heals)",
+            record.node_id,
+            deltas,
+        )
 
 
 @router.post("/internal/nodes/{node_id}/heartbeat")
