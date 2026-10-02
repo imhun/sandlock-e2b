@@ -8,6 +8,21 @@
 
 **Tech Stack:** Python（`control_plane/`、`c3_agent/`、`envd_service/`、`gateway_common/`）、k8s（k0s、arm64）、NFS（阿里云 NAS）+ 节点 ESSD、tar。
 
+## 当前进度（2026-10-02，**停在这里定计划**）
+
+**已完成 —— Task 0 的前半步**
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| Task 0 Step 1 目录地图 + `_snapshots` 实录 | ✅ | `docs/create-local-first-layout.md`（含 §3 的本地 vs 共享逐条评估）。实测：写一个小文件 **共享 13.06 ms / 本地 0.028 ms（466×）**；顺序写 **NAS 435 / 本地 1027 MB/s**（旧的"本地 186"作废）。`_snapshots` 8 个 id：3 个两边都有、2 个只有记录、2 个只有载荷 |
+| Task 0 Step 2/3 失败用例 + 先红 | ✅ | `tests/unit/test_root_reslice.py` 17 条；先红 16 条（留 1 条绿的是"今天的根列表不许变"） |
+| Task 0 Step 4 实现 | ✅ | commit `308b543`。见下方 Step 4 的实现清单 |
+| 回归 | ✅ | `tests/unit` **2211 passed / 12 skipped / 3 failed**，与基线（2194 + 新增 17）逐条对齐，3 条是已知 macOS-only。`tests/contract/test_migration.py` 的 6 条失败**在干净树上同样失败**（macOS 没有 container id），非本轮引入 |
+
+**没做（本次到此为止）**：Task 0 Step 5（三份清单 + k0s overlay + compose 的 env/volumeMounts/subPath/OWNED_DIRS）、Step 6（`migrate-state-base.sh` 的 N58 合并阶段 + 集群数据合并）、Step 7（集群验收）、Step 8（发布）；Task 1–6 全部未开始。
+
+⚠ **上线顺序（Step 5 + Step 6 必须与 `308b543` 同一次上线）**：这个 commit 已经把 `_snapshots` / `_migrate` 的**根**改到共享根，而线上**数据还在旧位置**（`<workspaces>/_snapshots/<id>/fs`）。单独部署它，找不到载荷的快照会在合并之前恢复失败。顺序照 N27：**worker 缩到 0 → 跑迁移（先 dry-run）→ apply 新清单 → 起 worker → 验证**。
+
 **Task 0 先行（目录与介质归属）**：今天一根 `E2B_WORKSPACE_BASE` 同时决定三件事 —— 沙箱树在哪、平台共享命名空间（`_snapshots` / `_migrate`）挂在它下面的哪、以及"树是不是共享"这个迁移开关取什么值（`control_plane/api/sandboxes.py:2687` 的 `shared = bool(settings.shared_workspace_root)`）。三件事共用一根，所以"把树搬本地"不是改一个值的事：改了它，平台命名空间会一起被拖到节点本地盘。先拆成**五个具名根 + 一个具名判据**（见 Task 0 的表），顺手把 `_snapshots` 的两个命名空间合成一个、把 `_migrate` 上浮到共享根；**默认部署的行为逐字不变**（树仍在共享），介质翻转留到 Task 3 改两个值。
 
 **这不是从零开始。** 本计划的输入是这三份东西（都不在版本库里，先把它们落成文档）：
@@ -85,10 +100,10 @@
 2. `<workspaces>/_migrate` → `<shared>/_migrate`（裁定 2：跨节点经共享中转 ⇒ 中转面必须在共享根）。读者是**另一个节点**的目标 agent，今天这个目录挂在树根命名空间下，目标节点看不到它。
 3. **不动**：`_images`、`_templates`、`_builds`、`_volumes`、`_secrets`、`state/`（已经在共享根），以及 `_cow`（保留名）。
 
-- [ ] **Step 1: 先量后写 —— 两处 `_snapshots` 的逐条实录**：在集群里把 `<shared>/_snapshots/` 与 `<workspaces>/_snapshots/` 各列两层（每个 id 两边分别有什么：`snapshot.json` / `fs/` / `.complete`，哪些 id 只有一边），连同重切前后的目录地图，写进 `docs/create-local-first-layout.md`（列：路径 · 介质 · 写者 · 读者 · 跨节点 · 今天/重切后）。**这份实录就是 Task 1 Step 2 的裁定书，也是 Step 6 合并脚本的输入。**
-- [ ] **Step 2: 写失败用例**（`tests/unit/test_root_reslice.py`）：`test_the_snapshot_payload_root_is_the_shared_volume_not_the_workspace_base`；`test_the_migrate_root_is_the_shared_volume`；`test_the_node_state_base_is_a_root_of_its_own`（`priv_root_paths` 的五项与顺序，用 `tests/unit/test_c3_agent_manifest.py` 同款读法）；`test_the_migration_decision_names_itself`（`E2B_TREES_SHARED=0` ⇒ 走 `_export/_import_sandbox_archive`；`=1` ⇒ 原地共享；**不许**再从 `shared_workspace_root` 的真假推）；`test_the_default_deployment_keeps_todays_paths`（默认 env 下五个根的解析结果与今天逐字相同）。
-- [ ] **Step 3: 先红**：逐条跑，并做负对照 —— 把实现改回今天的样子，那条必须重新变红。
-- [ ] **Step 4: 实现**：`_snapshots` / `_migrate` 的根从 `workspace_base` 改到 `shared_volume_root`（`envd_service/agent.py:4199/4260/4357/4424`、`control_plane/api/sandboxes.py:2570`、`control_plane/app.py:554` 一带）；`gateway_common/paths.py` 的 helper 与保留名；`ControlPaths.roots()` 加第五根；`priv_common.c` 的 `priv_root_paths` 加根（顺序：workspace → node state → state → shared → cache，去重规则不变）。
+- [x] **Step 1: 先量后写 —— 两处 `_snapshots` 的逐条实录** ✅ `docs/create-local-first-layout.md`（列：路径 · 介质 · 写者 · 读者 · 跨节点 · 今天/重切后；**这份实录是 Step 6 合并脚本的输入**）。
+- [x] **Step 2: 写失败用例** ✅ `tests/unit/test_root_reslice.py` 17 条。
+- [x] **Step 3: 先红** ✅ 16 红 1 绿（那条绿的是"今天的根列表逐字不变"）。
+- [x] **Step 4: 实现** ✅ `308b543` —— `gateway_common/paths.py` 加 `platform_namespace_root` / `snapshot_payload_dir` / `migrate_staging_dir` + `SNAPSHOT_STORE_DIR_NAME` / `MIGRATE_STAGING_DIR_NAME`；`envd_service/agent.py` 的 5 处（建箱恢复、导出、导入、快照生成、快照删除）与 `control_plane/api/sandboxes.py` 的 `_migrate` 全走 helper；`ControlPaths.node_state_base` 第五根（顺序 workspace → node state → state → shared → cache，去重规则逐字不变）＋ `priv_common.c` 镜像同一个循环、`PRIV_MAX_ROOTS 4 → 5`；`E2B_TREES_SHARED`（`_trees_shared_from_env`，空 = 未命名 = 沿用 `bool(E2B_SHARED_WORKSPACE_ROOT)`）与 `Settings.__post_init__` 的落定；三个 config 的 `node_state_base` 字段；`c3_agent/fileops.py` 的子进程 env 只在命名时写这一根。
 - [ ] **Step 5: 清单**：三份 k8s（worker / c3-agent / control-plane）的 env 与 volumeMounts（control-plane 的 `workspaces/_migrate` subPath 改 `_migrate`）、`workspace-root-init` 的创建清单（`workspaces/_migrate` → `_migrate`）、k0s overlay 的 patch、compose 两份的 `OWNED_DIRS`。
 - [ ] **Step 6: 迁移脚本 N58 阶段**：`migrate-state-base.sh` 加"合并 `_snapshots` + 上浮 `_migrate`"，沿用同款 journal / 回退 / inode 对账。**合并不是覆盖** —— 两边同名文件必须**具名拒绝**并留 journal，不许静默取一个。先 `--root` 彩排，再集群 dry-run。
 - [ ] **Step 7: 集群验收**：`GET /sandboxes` = `[]`、pod 全 Running、`DRY_RUN=1 apply.sh | kubectl diff -f -` 只有镜像 tag 行；建箱 p50 与 `_snapshots` 记录数**前后各量一次**，证明默认行为没变。
