@@ -133,14 +133,20 @@
   - ✅ 上线当场抓到并前滚修掉**一次回归**：`control_plane/file_ops.py::derive_materialize` 的 `copy_from` 还指向树根 ⇒"从快照建箱"全 502（`7ef319b`；钉子 `test_a_snapshot_create_carries_copy_from` 先红后绿）。复验：新快照往返 p50 208 ms、**被迁移过的 4 个老快照 4/4 恢复成功**
 - [x] **Step 8: 提交** ✅ `4ac410b`（清单 + 迁移）+ `7ef319b`（`copy_from` 修复），已上线。
 
-### Task 1: 前置测量与设计文档（与 Task 0 并行；它决定 Task 3 的淘汰上限）
+### Task 1: 前置测量与设计文档
+
+> **进度落账（2026-10-02，本批收尾时补记）**：Task 1–6 的代码/文档/上线都由 SDD 批次执行完毕，
+> 逐任务提交见 `.superpowers/sdd/2026-10-02-local-first-create/progress.md`，上线记录见
+> `docs/deploy-clusters.md` §7.29–§7.32。本项目里**ledger 是权威**，这一段勾选是回溯补的。
+
+（与 Task 0 并行；它决定 Task 3 的淘汰上限）
 
 **Files:** Create `docs/create-local-first-design.md`；Modify `deploy/scripts/acceptance/`（只在需要新探针时）。
 
-- [ ] **Step 1: 三笔账 + 一笔复核**（集群实测，n≥10，写进设计文档）：⓪ **复核作废的吞吐读数** —— "本地 186 / NAS 381 MB/s" 已被 `docs/create-local-first-layout.md` §3.1 的实测推翻（本地 **1027** / NAS 435），用同款脚本按三种块大小重测并写死结论；① **沙箱里写大文件**：1 GB 顺序写在"树在本地"与"树在 NAS"两种形状下各多少 MB/s、多少秒（这决定树本地是不是对所有负载都划算）；② **容量账**：快照仓/树的日增量与保留窗口 → 每节点需要多少 G（当前 75 G，且与 4 GiB 镜像缓存同盘）；③ **页缓存账**：一次建箱/快照的峰值页缓存 vs worker 的 2 GiB 与 agent `maint` 的 512 MiB 限额，给出上限配置（`E2B_IMAGE_*` 那种上限的同款做法）。
-- [ ] **Step 2: `_snapshots` 两命名空间的**复核**（Task 0 已合并，这里只验）**：Task 0 Step 1 的实录 + Step 6 的迁移之后，`<shared>/_snapshots/<id>/` 应当同时有控制面的 `snapshot.json` 与 agent 的载荷（Task 2 之后是 `fs.tar` + `.complete`）。这里复核"合并无遗漏、重复 id 没有静默取一个"，并把结论写进设计文档。**这一步没复核过，Task 2 的路径推导就建在流沙上。**
-- [ ] **Step 3: 落文档**：把两份 tmp 报告（测量 + 盘点）的核心表与五条裁定搬进 `docs/create-local-first-design.md`，并指向 `tmp/` 里的原始读数。
-- [ ] **Step 4: 提交**（`docs(...)`）。
+- [x] **Step 1: 三笔账 + 一笔复核**（集群实测，n≥10，写进设计文档）：⓪ **复核作废的吞吐读数** —— "本地 186 / NAS 381 MB/s" 已被 `docs/create-local-first-layout.md` §3.1 的实测推翻（本地 **1027** / NAS 435），用同款脚本按三种块大小重测并写死结论；① **沙箱里写大文件**：1 GB 顺序写在"树在本地"与"树在 NAS"两种形状下各多少 MB/s、多少秒（这决定树本地是不是对所有负载都划算）；② **容量账**：快照仓/树的日增量与保留窗口 → 每节点需要多少 G（当前 75 G，且与 4 GiB 镜像缓存同盘）；③ **页缓存账**：一次建箱/快照的峰值页缓存 vs worker 的 2 GiB 与 agent `maint` 的 512 MiB 限额，给出上限配置（`E2B_IMAGE_*` 那种上限的同款做法）。
+- [x] **Step 2: `_snapshots` 两命名空间的**复核**（Task 0 已合并，这里只验）**：Task 0 Step 1 的实录 + Step 6 的迁移之后，`<shared>/_snapshots/<id>/` 应当同时有控制面的 `snapshot.json` 与 agent 的载荷（Task 2 之后是 `fs.tar` + `.complete`）。这里复核"合并无遗漏、重复 id 没有静默取一个"，并把结论写进设计文档。**这一步没复核过，Task 2 的路径推导就建在流沙上。**
+- [x] **Step 3: 落文档**：把两份 tmp 报告（测量 + 盘点）的核心表与五条裁定搬进 `docs/create-local-first-design.md`，并指向 `tmp/` 里的原始读数。
+- [x] **Step 4: 提交**（`docs(...)`）。
 
 ### Task 2: 快照打成 tar 落共享（收益最大、与树无关）
 
@@ -148,12 +154,12 @@
 
 **Interfaces:** Produces: 快照载荷为 `<...>/_snapshots/<id>/fs.tar`（+ 既有 `.complete`）；`derive_materialize` 的 `copy_from` 指向该 tar；`materialize_tree` 新增"取 tar + 就地解包进树根"的路径。
 
-- [ ] **Step 1: 先量基线**：跑 `snapshot_create_probe.py` 的 1/40/202 三档，把今天的 `26 ms/条目` 复现并记下（这是前后对照的基准）。
-- [ ] **Step 2: 写失败用例**：`test_a_snapshot_is_one_tar`（生成后目录里只有一个 `fs.tar` + `.complete`，没有爆炸式 `fs/`）；`test_a_restore_unpacks_the_tar_at_the_tree_root`（生产形状 `fs/workspace/kept.txt` ⇒ 树根下 `workspace/kept.txt`）；**§4.3.1 四条**在解包路径上各一条：`test_a_symlink_in_the_tar_is_recreated_not_followed`、`test_a_destination_symlink_segment_is_refused_named`、`test_a_partial_unpack_is_reported_as_failure`、`test_a_migrated_tree_keeps_its_files`；`test_a_truncated_tar_is_refused`（完整性）；`test_an_absolute_link_member_is_dropped`（对齐既有 `_extract_sandbox_archive` 的成员过滤）。
-- [ ] **Step 3: 先红**。
-- [ ] **Step 4: 实现**：快照侧 `tarfile` 写到**临时名** → `fsync` → `rename` → 最后写 `.complete`（与 `.oci.tar` 同款纪律）；恢复侧在 agent 里解包（**复用** `_extract_sandbox_archive` 的成员过滤与 `dest` 包含检查，不许自己再写一份）。
-- [ ] **Step 5: 后量对照**：同一三档再跑一遍，把"按条目"换成"按字节"的口径一起报。
-- [ ] **Step 6: 提交**。
+- [x] **Step 1: 先量基线**：跑 `snapshot_create_probe.py` 的 1/40/202 三档，把今天的 `26 ms/条目` 复现并记下（这是前后对照的基准）。
+- [x] **Step 2: 写失败用例**：`test_a_snapshot_is_one_tar`（生成后目录里只有一个 `fs.tar` + `.complete`，没有爆炸式 `fs/`）；`test_a_restore_unpacks_the_tar_at_the_tree_root`（生产形状 `fs/workspace/kept.txt` ⇒ 树根下 `workspace/kept.txt`）；**§4.3.1 四条**在解包路径上各一条：`test_a_symlink_in_the_tar_is_recreated_not_followed`、`test_a_destination_symlink_segment_is_refused_named`、`test_a_partial_unpack_is_reported_as_failure`、`test_a_migrated_tree_keeps_its_files`；`test_a_truncated_tar_is_refused`（完整性）；`test_an_absolute_link_member_is_dropped`（对齐既有 `_extract_sandbox_archive` 的成员过滤）。
+- [x] **Step 3: 先红**。
+- [x] **Step 4: 实现**：快照侧 `tarfile` 写到**临时名** → `fsync` → `rename` → 最后写 `.complete`（与 `.oci.tar` 同款纪律）；恢复侧在 agent 里解包（**复用** `_extract_sandbox_archive` 的成员过滤与 `dest` 包含检查，不许自己再写一份）。
+- [x] **Step 5: 后量对照**：同一三档再跑一遍，把"按条目"换成"按字节"的口径一起报。
+- [x] **Step 6: 提交**。
 
 ### Task 3: 沙箱树本地化 + 迁移经共享中转
 
@@ -169,12 +175,12 @@
 2. **在途不能整棵树进内存**：现在两端都是 `resp.content` / `tar_path.read_bytes()`，控制面限额 **2 GiB**，两端各 `timeout=120`（按 13 ms/文件算约 4600 个文件就到顶）。改成流式 + 按字节的具名上限与超限拒绝。
 3. **"源节点不可达"要具名**：导出端点在**源节点**上，所以本地化后源节点掉线 = 树不可达且无法事后迁出。把它写成一个具名错误（不是 502 泛化），并在文档里定下排水顺序：**先迁走、再下线**。
 
-- [ ] **Step 1: 写失败用例**：`test_a_local_tree_is_not_visible_from_the_shared_volume`；`test_migration_moves_the_tree_through_the_shared_store`（源节点导出 tar → 中转暂存 → 目标节点导入，断言目标节点树的内容与源一致，**且源节点的那棵树被删掉**）；`test_the_migration_judge_is_not_the_shared_root`（`E2B_SHARED_WORKSPACE_ROOT` 设着 + `E2B_TREES_SHARED=0` ⇒ 必须走导出/导入）；`test_a_failed_transfer_leaves_neither_a_half_tree_nor_a_record`；`test_a_migration_from_an_unreachable_source_is_refused_by_name`；`test_the_orphan_sweep_still_sees_a_local_tree`。
-- [ ] **Step 2: 先红**。
-- [ ] **Step 3: 实现**：换判据；迁移经控制面/共享的 `_migrate` 中转（复用既有 tar 代码，落点参数化）；上面第 2、3 条的上限与具名拒绝；目标节点导入失败不留半棵树；淘汰策略按 Task 1 的容量账落地。
-- [ ] **Step 4: 裁定进文档**："沙箱不是持久对象、**持久面是快照**"（否则本地化必须给节点盘做冗余）；排水顺序"先迁走、再下线"；以及"记录指向的节点上没有树"这个状态的具名修复动作。
-- [ ] **Step 5: 集群验收**：`MULTI-NODE`/`DEPLOYMENT` 冒烟；**两个方向各一次** —— ① 节点健在时跨节点迁移**保文件**；② 停掉源节点 worker 后发起的迁移**具名拒绝**而不是静默建空树；`GET /sandboxes` 无残留、两节点磁盘占用可解释。
-- [ ] **Step 6: 提交**。
+- [x] **Step 1: 写失败用例**：`test_a_local_tree_is_not_visible_from_the_shared_volume`；`test_migration_moves_the_tree_through_the_shared_store`（源节点导出 tar → 中转暂存 → 目标节点导入，断言目标节点树的内容与源一致，**且源节点的那棵树被删掉**）；`test_the_migration_judge_is_not_the_shared_root`（`E2B_SHARED_WORKSPACE_ROOT` 设着 + `E2B_TREES_SHARED=0` ⇒ 必须走导出/导入）；`test_a_failed_transfer_leaves_neither_a_half_tree_nor_a_record`；`test_a_migration_from_an_unreachable_source_is_refused_by_name`；`test_the_orphan_sweep_still_sees_a_local_tree`。
+- [x] **Step 2: 先红**。
+- [x] **Step 3: 实现**：换判据；迁移经控制面/共享的 `_migrate` 中转（复用既有 tar 代码，落点参数化）；上面第 2、3 条的上限与具名拒绝；目标节点导入失败不留半棵树；淘汰策略按 Task 1 的容量账落地。
+- [x] **Step 4: 裁定进文档**："沙箱不是持久对象、**持久面是快照**"（否则本地化必须给节点盘做冗余）；排水顺序"先迁走、再下线"；以及"记录指向的节点上没有树"这个状态的具名修复动作。
+- [x] **Step 5: 集群验收**：`MULTI-NODE`/`DEPLOYMENT` 冒烟；**两个方向各一次** —— ① 节点健在时跨节点迁移**保文件**；② 停掉源节点 worker 后发起的迁移**具名拒绝**而不是静默建空树；`GET /sandboxes` 无残留、两节点磁盘占用可解释。
+- [x] **Step 6: 提交**。
 
 ### Task 4: 本节点 state 分家（拿回 `prepare` 的 ~73 ms）
 
@@ -182,18 +188,18 @@
 
 **Interfaces:** Produces: `E2B_NODE_STATE_BASE`（节点本地）持有 `.creating`、disk-stats、`.route-b/**`、uid 池本地件；`E2B_STATE_BASE`（共享）继续持有 `_runtime/<id>/sandbox.json` 与 `.checkpoints/**`。且 `uid_pool._recorded_uids` 的索引从"枚举**树目录名**"改成"枚举**共享记录目录**"（Review Focus 3）——否则树本地化之后它连自己的节点都数不全。
 
-- [ ] **Step 1: 写失败用例**：`test_the_create_marker_lives_on_the_node_local_base`；`test_the_record_stays_on_the_shared_base`；`test_the_uid_ledger_sees_every_nodes_records_from_the_shared_index`（这条是 Review Focus 3 的钉子，必须先红）。
-- [ ] **Step 2: 先红** → **实现** → **绿**。
-- [ ] **Step 3: 量**：建箱 p50 与 `prepare` 段（期望 `prepare` 73 → ~10，长杆换回 `materialize`，而后者已经本地化）。
-- [ ] **Step 4: 提交**。
+- [x] **Step 1: 写失败用例**：`test_the_create_marker_lives_on_the_node_local_base`；`test_the_record_stays_on_the_shared_base`；`test_the_uid_ledger_sees_every_nodes_records_from_the_shared_index`（这条是 Review Focus 3 的钉子，必须先红）。
+- [x] **Step 2: 先红** → **实现** → **绿**。
+- [x] **Step 3: 量**：建箱 p50 与 `prepare` 段（期望 `prepare` 73 → ~10，长杆换回 `materialize`，而后者已经本地化）。
+- [x] **Step 4: 提交**。
 
 ### Task 5: `open_dir_chain` 修复（与存储正交，可随时插）
 
 **Files:** Modify `c3_agent/materialize.py`；Test `tests/unit/test_agent_materialize.py`。
 
-- [ ] **Step 1: 失败用例**：`test_the_dir_chain_does_not_walk_from_the_root_every_time`（断言对同一棵树的开销与"从 `/` 逐段打开"不同 —— 具体判据由实现定：缓存父 fd 或从已知根起走）。
-- [ ] **Step 2: 先红 → 实现 → 绿**；量：NAS 上每棵树两次 ≈ 17.4 ms。
-- [ ] **Step 3: 提交。** 只在树仍走共享的形状（开关关着、`local://`）上有收益 —— 它是 Task 3 的**补救**而不是替代。
+- [x] **Step 1: 失败用例**：`test_the_dir_chain_does_not_walk_from_the_root_every_time`（断言对同一棵树的开销与"从 `/` 逐段打开"不同 —— 具体判据由实现定：缓存父 fd 或从已知根起走）。
+- [x] **Step 2: 先红 → 实现 → 绿**；量：NAS 上每棵树两次 ≈ 17.4 ms。
+- [x] **Step 3: 提交。** 只在树仍走共享的形状（开关关着、`local://`）上有收益 —— 它是 Task 3 的**补救**而不是替代。
 
 ### Task 6: 上线与文档
 
