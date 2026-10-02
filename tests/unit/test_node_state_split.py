@@ -1,15 +1,20 @@
-"""Task 4: the node-local half of the platform state (``E2B_NODE_STATE_BASE``).
+"""Task 4 / N57: the node-local half of the platform state (``E2B_NODE_STATE_BASE``).
 
-The create's ``prepare`` phase writes three small things that only this node
-ever reads -- the ``.creating`` marker, the ``statfs(2)`` accounting seed and
-the uid pool's lock and reservation markers. Until this task all three lived
-under the **shared** state base, so each one paid a NAS metadata round trip
-(~13 ms) inside the phase the create's latency floor is measured on.
+The create's ``prepare`` phase writes two small things that only this node ever
+reads -- the ``.creating`` marker and the ``statfs(2)`` accounting seed. Until
+Task 4 both lived under the **shared** state base, so each one paid a NAS
+metadata round trip (~13 ms) inside the phase the create's latency floor is
+measured on.
 
 The split has two halves that must not be confused, and each has a test here:
 
-1. the three chips move to ``<node state base>/_runtime/<id>/`` (and the pool's
-   own files to ``<node state base>/.uid_pool.lock`` / ``.uid_reservations/``);
+1. the two chips move to ``<node state base>/_runtime/<id>/``. The uid pool's
+   own lock and reservation markers were briefly the third chip and are **back
+   on the shared base** since N57: they are the cross-node serialization of the
+   *fallback* allocator (``UidPool.acquire``, the path a payload without
+   ``hostUID`` takes), so a fence only this node waits on lets two nodes pick
+   the same uid -- while the common path (``UidPool.claim``, the control
+   plane's allocation) touches neither file and pays nothing for their return;
 2. the **record** (``_runtime/<id>/sandbox.json``) and the checkpoint store
    stay on the shared base, because the fleet-wide uid ledger enumerates them
    -- which is the third test, and the reason the ledger's index changes from
@@ -104,19 +109,30 @@ def test_the_uid_ledger_sees_every_nodes_records_from_the_shared_index(
     assert pool.acquire("sbx_new") == POOL_START + 3
 
 
-def test_the_uid_pools_own_files_live_on_the_node_local_base(tmp_path: Path) -> None:
-    """The pool's lock and reservation markers move with the create's chips.
+def test_the_uid_pools_own_files_live_on_the_shared_base(tmp_path: Path) -> None:
+    """N57: the pool's lock and reservation markers are *shared* state.
 
-    ``acquire`` takes a ``flock`` and writes a marker inside the create's
-    ``prepare`` phase, so on this deployment both were NAS metadata round trips
-    (the lock's ``open``, the marker's write + rename, then ``commit``'s
-    negative ``unlink``). Both are read by *this node's* processes only: the
-    fleet-wide statement is the shared record the uid ends up in, which is what
-    ``_recorded_uids`` indexes. Unnamed, the pool is byte-for-byte what it was.
+    They were node-local between Task 4 and N57, and that is exactly what let
+    two nodes with one workspace hand out one uid: ``acquire`` -- the fallback
+    allocator, for a payload without ``hostUID`` -- recomputes the free set
+    from the shared records and then picks the lowest free uid, so the
+    picked-uids set has to be shared too. The pending ruling is that on the
+    common path (``claim``, the control plane's allocation) neither file is
+    touched, so putting them back on the shared export costs ``prepare``
+    nothing.
+
+    What stays node-local is the other half of the split: the ``.creating``
+    marker and the ``disk-stats`` seed (the next test), and what stays shared
+    is the record and the checkpoint store (the third). Unnamed, the pool is
+    byte-for-byte what it was.
     """
     trees = tmp_path / "workspaces"
     state = tmp_path / "export" / "state"
     node = tmp_path / "node" / "state"
+    # The deployment's init container creates and owns the *shared* base too
+    # (it is the shared export's platform tree); the pool only ever creates the
+    # workspace base on demand.
+    state.mkdir(parents=True)
     # The deployment's init container creates and owns the node-local base
     # (``workspace-root-init``); the pool deliberately does not.
     node.mkdir(parents=True)
@@ -128,14 +144,15 @@ def test_the_uid_pools_own_files_live_on_the_node_local_base(tmp_path: Path) -> 
         state_base=state,
         node_state_base=node,
     )
-    assert pool.lock_path == node / ".uid_pool.lock"
+    assert pool.lock_path == state / ".uid_pool.lock"
 
     assert pool.acquire("sbx_a") == POOL_START
 
-    assert (node / ".uid_reservations" / "sbx_a").read_text(
+    assert (state / ".uid_reservations" / "sbx_a").read_text(
         encoding="utf-8"
     ) == f"{POOL_START}\n"
-    assert (state / ".uid_reservations").exists() is False
+    assert (node / ".uid_pool.lock").exists() is False
+    assert (node / ".uid_reservations").exists() is False
     # ...and with no node state base named, the shared state base again.
     assert (
         uid_pool.UidPool(
