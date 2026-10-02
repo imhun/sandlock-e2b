@@ -45,29 +45,61 @@ def pick_best(
     Capacity checks and reservations are the caller's job (the node registry
     does them atomically under its lock); this function only picks.
     """
-    candidates = [
+    ranked = rank_candidates(
+        candidates,
+        base_image=base_image,
+        volume_node_id=volume_node_id,
+        memory_mb=memory_mb,
+        cpu_percent=cpu_percent,
+        disk_mb=disk_mb,
+        processes=processes,
+    )
+    return ranked[0] if ranked else None
+
+
+def rank_candidates(
+    candidates: list[NodeRecord],
+    *,
+    base_image: str | None,
+    volume_node_id: str | None = None,
+    memory_mb: int,
+    cpu_percent: int,
+    disk_mb: int,
+    processes: int,
+) -> list[NodeRecord]:
+    """The capable candidates, in the order placement should try them.
+
+    The order is the one ``pick_best`` has always produced -- the volume-pinned
+    node first, then the rest by ``(_image_affinity, _remaining_ratio,
+    -len(labels))`` descending -- spelled as a list so that a caller whose
+    *first* candidate is refused (the quota store said no, N60) can hand the
+    placement to the next one instead of failing the whole fleet.
+    """
+    capable = [
         n
         for n in candidates
         if n.can_fit(memory_mb, cpu_percent, disk_mb, processes)
     ]
-    if not candidates:
-        return None
-    if volume_node_id:
-        volume_node = next(
-            (n for n in candidates if n.node_id == volume_node_id), None
-        )
-        if volume_node is not None:
-            return volume_node
-    # Score: image affinity > remaining capacity > balance.
-    best = max(
-        candidates,
+    if not capable:
+        return []
+    ranked = sorted(
+        capable,
         key=lambda n: (
             _image_affinity(n, base_image),
             _remaining_ratio(n),
             -len(getattr(n, "labels", {}) or {}),  # stable tie-break by labels
         ),
+        reverse=True,
     )
-    return best
+    if volume_node_id:
+        pinned = next(
+            (i for i, n in enumerate(ranked) if n.node_id == volume_node_id), None
+        )
+        if pinned is not None:
+            # The pinned node wins outright, exactly as it did when this was a
+            # single pick: it is ranked by nothing else.
+            ranked.insert(0, ranked.pop(pinned))
+    return ranked
 
 
 def _image_affinity(node: NodeRecord, base_image: str | None) -> float:

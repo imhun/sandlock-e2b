@@ -234,12 +234,15 @@ def test_a_store_failure_during_reconciliation_is_reported_not_raised(
 def test_a_store_refusal_names_the_node_it_gives_up_on(
     workspace, caplog
 ) -> None:
-    """N60's amplifier, made visible: the store refused and no other node is tried.
+    """N60's amplifier, made visible: every skip is named, and so is giving up.
 
-    The placement *policy* is unchanged (retrying the next candidate is its own
-    decision, N60); what changes here is that the refusal is named, with the
-    node and the dimensions, so an operator can see "503 with capacity left on
-    the other node" instead of an unexplained no-capacity.
+    The refusal is named twice -- once per skipped candidate (node, all four
+    dimensions, how many candidates are left) and once when the candidate set
+    runs out -- so an operator can see "503 with capacity left on the other
+    node" instead of an unexplained no-capacity. Only ``node_b`` is placeable
+    here, so the hand-over has nowhere to go and the answer is still ``None``.
+    This case keeps the real ``RedisQuotaStore`` (fakeredis) under it: the
+    refusal has to come from a genuinely full ledger, not from a stub.
     """
     fakeredis = pytest.importorskip("fakeredis")
     nodes = NodeRegistry(heartbeat_timeout=600.0, redis_client=fakeredis.FakeRedis())
@@ -260,13 +263,14 @@ def test_a_store_refusal_names_the_node_it_gives_up_on(
         )
 
     assert picked is None
-    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-    assert any(
-        "quota store refused node node_b" in message
-        and "no other candidate is tried" in message
-        and "N60" in message
-        for message in warnings
-    ), warnings
+    assert [
+        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    ] == [
+        "quota store refused node node_b for memory=1024 cpu=100 disk=1024 "
+        "processes=256; trying the next candidate (0 left)",
+        "quota store refused every candidate for memory=1024 cpu=100 disk=1024 "
+        "processes=256; this placement answers 503",
+    ]
 
 
 def test_releasing_quota_for_a_missing_node_is_named_and_leaves_the_ledger(

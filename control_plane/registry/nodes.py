@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from control_plane.scheduler import pick_best
+from control_plane.scheduler import rank_candidates
 from gateway_common.ids import sandbox_id
 
 logger = logging.getLogger(__name__)
@@ -808,6 +808,15 @@ class NodeRegistry:
         The capacity check and the reservation happen under the registry lock,
         so concurrent create requests cannot both pass the check and
         over-commit a node.
+
+        The ranked candidates are tried **in order** (N60): a candidate the
+        quota store refuses hands the placement to the next one instead of
+        failing the whole fleet -- one node's full ledger used to answer
+        ``503 No resources available`` for every create while another node sat
+        empty. Each skip is named (node + all four dimensions) so the decision
+        stays visible, and every candidate being refused is named as such.
+        Only the winner is reserved in memory (and published), never a skipped
+        candidate.
         """
         with self._lock:
             candidates = [
@@ -815,7 +824,7 @@ class NodeRegistry:
                 for n in self._placeable_candidates_locked(exclude_node_id)
                 if n.can_fit(memory_mb, cpu_percent, disk_mb, processes)
             ]
-            node = pick_best(
+            ranked = rank_candidates(
                 candidates,
                 base_image=base_image,
                 volume_node_id=volume_node_id,
@@ -824,7 +833,7 @@ class NodeRegistry:
                 disk_mb=disk_mb,
                 processes=processes,
             )
-            if node is not None:
+            for index, node in enumerate(ranked):
                 if self._quota_store is not None:
                     ok = self._quota_store.reserve(
                         node.node_id,
@@ -842,28 +851,31 @@ class NodeRegistry:
                         },
                     )
                     if not ok:
-                        # N60 (open): the store refused this candidate and the
-                        # function gives up instead of trying the next one, so
-                        # one node's full ledger fails the whole placement even
-                        # when another node can fit. The policy is not changed
-                        # here (retrying candidates is its own decision), but
-                        # the refusal is no longer silent: it names the node the
-                        # store refused and why the caller is about to answer
-                        # 503 with capacity left elsewhere.
                         logger.warning(
                             "quota store refused node %s for memory=%s cpu=%s "
-                            "disk=%s processes=%s; no other candidate is tried "
-                            "(N60), so this placement answers 503",
+                            "disk=%s processes=%s; trying the next candidate "
+                            "(%s left)",
                             node.node_id,
                             memory_mb,
                             cpu_percent,
                             disk_mb,
                             processes,
+                            len(ranked) - index - 1,
                         )
-                        return None
+                        continue
                 node.reserve(memory_mb, cpu_percent, disk_mb, processes)
                 self._persist_locked(node)
-            return node
+                return node
+            if ranked:
+                logger.warning(
+                    "quota store refused every candidate for memory=%s cpu=%s "
+                    "disk=%s processes=%s; this placement answers 503",
+                    memory_mb,
+                    cpu_percent,
+                    disk_mb,
+                    processes,
+                )
+            return None
 
     def reserve_node(
         self,
