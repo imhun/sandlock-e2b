@@ -292,6 +292,99 @@ def test_the_unpack_never_builds_its_own_member_list(
     assert (dest / "f-063.txt").read_text(encoding="utf-8") == "filler 63\n"
 
 
+# ------------------------------------------------------------ the member cap
+#
+# The unpack streams the member **data** but never the member **index**:
+# CPython's ``TarFile.next()`` appends every ``TarInfo`` to ``TarFile.members``
+# no matter who iterates, so a payload of millions of tiny members costs memory
+# the byte cap cannot see -- 2 000 000 empty members is ~1 GiB of 512 B headers,
+# i.e. *inside* ``E2B_TREE_COPY_MAX_BYTES``, with ~0.9 GB of index beside it
+# (review round 1 measured 200 000 members ⇒ 88.8 MB ≈ 444 B/member). The cap
+# lives in the shared extractor and is on by default, so all three unpack call
+# sites are covered without touching one of them; ``max_members=0`` (or
+# ``E2B_ARCHIVE_MAX_MEMBERS=0``) is the documented way out.
+
+
+def test_an_archive_over_the_member_cap_is_refused_by_name(workspace: Path) -> None:
+    """One member past the cap is a named refusal, not a run to the OOM."""
+    archive_path = _tar(
+        workspace / "fs.tar", {"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n"}
+    )
+    dest = workspace / "dest"
+    dest.mkdir()
+
+    with pytest.raises(archive.ArchiveRefusal) as caught:
+        archive.extract_sandbox_archive(archive_path, dest, max_members=2)
+
+    assert caught.value.reason == "archive-too-many-members"
+    # Refused *before* the member that crosses the cap was written.
+    assert (dest / "a.txt").read_bytes() == b"a\n"
+    assert (dest / "b.txt").read_bytes() == b"b\n"
+    assert (dest / "c.txt").exists() is False
+
+
+def test_a_well_formed_archive_at_the_cap_still_unpacks(workspace: Path) -> None:
+    """The cap is a boundary, not an off-by-one: exactly N members still land."""
+    archive_path = _tar(
+        workspace / "fs.tar", {"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n"}
+    )
+    dest = workspace / "dest"
+    dest.mkdir()
+
+    written = archive.extract_sandbox_archive(archive_path, dest, max_members=3)
+
+    assert written == 3
+    assert (dest / "a.txt").read_bytes() == b"a\n"
+    assert (dest / "b.txt").read_bytes() == b"b\n"
+    assert (dest / "c.txt").read_bytes() == b"c\n"
+
+
+def test_the_cap_can_be_disabled(workspace: Path) -> None:
+    """``max_members=0`` is the way out (the byte cap's own discipline)."""
+    entries = {f"f-{index:02d}.txt": f"filler {index}\n" for index in range(10)}
+    archive_path = _tar(workspace / "fs.tar", entries)
+    dest = workspace / "dest"
+    dest.mkdir()
+
+    written = archive.extract_sandbox_archive(archive_path, dest, max_members=0)
+
+    assert written == 10
+    assert sorted(path.name for path in dest.iterdir()) == sorted(entries)
+
+
+def test_the_env_knob_is_read_and_zero_disables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``E2B_ARCHIVE_MAX_MEMBERS``: read at call time; garbage ⇒ the default."""
+    assert archive.DEFAULT_ARCHIVE_MAX_MEMBERS == 1_500_000
+
+    monkeypatch.setenv("E2B_ARCHIVE_MAX_MEMBERS", "5")
+    assert archive.resolve_member_max() == 5
+
+    monkeypatch.setenv("E2B_ARCHIVE_MAX_MEMBERS", "0")
+    assert archive.resolve_member_max() == 0
+
+    monkeypatch.delenv("E2B_ARCHIVE_MAX_MEMBERS")
+    assert archive.resolve_member_max() == archive.DEFAULT_ARCHIVE_MAX_MEMBERS
+
+
+def test_the_default_cap_guards_a_caller_that_passes_nothing(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The three real call sites pass no argument; the default is what guards."""
+    monkeypatch.setenv("E2B_ARCHIVE_MAX_MEMBERS", "2")
+    archive_path = _tar(
+        workspace / "fs.tar", {"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n"}
+    )
+    dest = workspace / "dest"
+    dest.mkdir()
+
+    with pytest.raises(archive.ArchiveRefusal) as caught:
+        archive.extract_sandbox_archive(archive_path, dest)
+
+    assert caught.value.reason == "archive-too-many-members"
+
+
 # ------------------------------------ the acceptance probes that read the store
 #
 # Task 2 changed the payload on disk from an exploded ``fs/`` directory to one

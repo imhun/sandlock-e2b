@@ -45,10 +45,12 @@ claiming it does: CPython's ``TarFile.next()`` appends every ``TarInfo`` to
 102.4 MB archive of empty members ⇒ 428.6 B/member; review round 1 measured
 88.8 MB ≈ 444 B/member for the same shape). A pathological archive of
 ~2 000 000 empty members (~1 GiB of 512 B headers) therefore still costs the
-agent ~0.9 GB of index. Bounding *that* is a named follow-up (a member-count cap
-belongs beside Task 3's byte cap) -- it is registered as **N63** in
-``docs/open-issues.md`` so the next reader finds the owner here instead of the
-orphan note; what is asserted here today is only the data path.
+agent ~0.9 GB of index. Bounding *that* is this module's own job and it is done
+here, next to Task 3's byte cap: :data:`DEFAULT_ARCHIVE_MAX_MEMBERS` with
+:func:`resolve_member_max` below, on by default so all three unpack call sites
+are covered without touching one of them. The numbers its value comes from are
+measured by ``deploy/scripts/acceptance/archive_member_index_memory.py`` and
+quoted at the constant.
 """
 
 from __future__ import annotations
@@ -68,6 +70,9 @@ DESTINATION_IS_A_SYMLINK = "destination-is-a-symlink"
 ARCHIVE_IS_CORRUPT = "archive-is-corrupt"
 #: The caller's destination is not a directory to unpack into.
 PARTIAL_UNPACK = "partial-unpack"
+#: The archive carries more members than the unpack may index (a pathological
+#: input, not a corrupt one: the member *index* is what grows with the count).
+TOO_MANY_MEMBERS = "archive-too-many-members"
 
 class ArchiveRefusal(Exception):
     """A named, fail-closed refusal from one archive extraction."""
@@ -76,6 +81,36 @@ class ArchiveRefusal(Exception):
         super().__init__(reason if not detail else f"{reason}: {detail}")
         self.reason = reason
         self.detail = detail
+
+
+#: The read-side member cap: what a payload may carry before the unpack refuses
+#: it, and the value is **measured** rather than picked. The unpack's member
+#: index is CPython's -- ``TarFile.members`` grows one ``TarInfo`` per member no
+#: matter who iterates -- so the cost is per-member and invisible to the byte
+#: cap: 2 000 000 empty members is ~1 GiB of 512 B headers, *inside*
+#: ``E2B_TREE_COPY_MAX_BYTES`` (1.25 GiB), while the ~0.6 GiB of index at
+#: 1 500 000 members is what has to fit the agent's 2 GiB ``maint`` limit
+#: (``deploy/k8s/c3-agent.yaml``). The scaled measurement is in
+#: ``deploy/scripts/acceptance/archive_member_index_memory.py``.
+DEFAULT_ARCHIVE_MAX_MEMBERS = 1_500_000
+
+
+def resolve_member_max() -> int:
+    """The member cap for this process, from ``E2B_ARCHIVE_MAX_MEMBERS``.
+
+    Module level, not a ``Settings`` field: unlike the byte cap this guards
+    against a pathological *input* rather than a capacity the replicas have to
+    agree on, so each of the three call sites may read its own environment and
+    none of them has to pass anything. Empty or unparsable falls back to
+    :data:`DEFAULT_ARCHIVE_MAX_MEMBERS`; ``0`` -- and only ``0`` -- disables
+    the cap (the same discipline as the byte knob's ``0``).
+    """
+    raw = os.environ.get("E2B_ARCHIVE_MAX_MEMBERS", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:  # unset, empty, or not a number: the default stands
+        return DEFAULT_ARCHIVE_MAX_MEMBERS
+    return value if value >= 0 else DEFAULT_ARCHIVE_MAX_MEMBERS
 
 
 def _guard_member(dest: Path, name: str, safe_parents: set[str]) -> None:
@@ -192,12 +227,19 @@ def _reason_for_filter_error(exc: BaseException) -> str:
     return MEMBER_ESCAPES
 
 
-def extract_sandbox_archive(archive_path: Path, dest: Path) -> int:
+def extract_sandbox_archive(
+    archive_path: Path, dest: Path, *, max_members: int | None = None
+) -> int:
     """Unpack ``archive_path`` into the existing directory ``dest``.
 
     Returns the number of members written. Raises :class:`ArchiveRefusal` (and
     never a bare ``tarfile``/``OSError``) so both callers translate one shape.
+
+    ``max_members`` defaults to :func:`resolve_member_max` (``None`` means "read
+    the environment"), so the cap is on for every caller that passes nothing;
+    ``0`` disables it.
     """
+    limit = resolve_member_max() if max_members is None else max_members
     destination = Path(dest)
     resolved_dest = destination.resolve()
     if not resolved_dest.is_dir():
@@ -205,10 +247,22 @@ def extract_sandbox_archive(archive_path: Path, dest: Path) -> int:
             PARTIAL_UNPACK, f"the destination {destination} is not a directory"
         )
     written = 0
+    seen = 0
     safe_parents: set[str] = set()
     try:
         with tarfile.open(Path(archive_path), "r:*") as tar:
             for member in tar:
+                seen += 1
+                if limit and seen > limit:
+                    # Before the member that crosses the cap is written: the
+                    # refusal is about the *index* the walk has already paid
+                    # for, so it has to land as early as that index does.
+                    raise ArchiveRefusal(
+                        TOO_MANY_MEMBERS,
+                        f"{archive_path} holds more than {limit} members "
+                        f"(seen {seen} so far; E2B_ARCHIVE_MAX_MEMBERS, "
+                        "0 disables it)",
+                    )
                 if member.issym() and os.path.isabs(member.linkname):
                     # A volume mount from the source node: the path does not
                     # exist here and provisioning re-creates it.
