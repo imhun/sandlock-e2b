@@ -163,9 +163,22 @@ def _check_metadata_envvars_size(settings, metadata: dict, env_vars: dict) -> No
             )
 
 
-def _release_node_quota(request, node, dims: tuple[int, int, int, int]) -> None:
+def _state_of(ctx):
+    """The control-plane app state behind ``ctx``.
+
+    The pause/resume chain is called from two places: the endpoints (which
+    hand it their ``Request``) and the background sweeps (which have no
+    request at all -- ``create_app``'s lifespan hands them ``app.state``).
+    Keeping that indirection in one accessor means the chain stays *one*
+    chain: a request-free copy that could drift from the endpoint's is
+    exactly the failure this avoids.
+    """
+    return getattr(getattr(ctx, "app", None), "state", ctx)
+
+
+def _release_node_quota(ctx, node, dims: tuple[int, int, int, int]) -> None:
     memory_mb, cpu, disk_mb, processes = dims
-    request.app.state.nodes.release_quota(
+    _state_of(ctx).nodes.release_quota(
         node.node_id,
         memory_mb=memory_mb,
         cpu_percent=cpu,
@@ -205,7 +218,7 @@ def _node_refusal_message(request, dims) -> str:
     )
 
 
-def _park_capacity(request, record) -> None:
+def _park_capacity(ctx, record) -> None:
     """Give back the node reservation of a sandbox that just paused (E9.2).
 
     The global/tenant ledger is handled by ``SandboxRegistry.pause``; the node
@@ -213,13 +226,13 @@ def _park_capacity(request, record) -> None:
     registry no longer knows about simply has nothing to release (the same
     tolerance the delete path has).
     """
-    node = request.app.state.nodes.get(record.node_id or "local")
+    node = _state_of(ctx).nodes.get(record.node_id or "local")
     if node is None:
         return
-    _release_node_quota(request, node, _record_quota_dims(record))
+    _release_node_quota(ctx, node, _record_quota_dims(record))
 
 
-def _resume_with_capacity(request, registry, record, *, timeout: int | None = None):
+def _resume_with_capacity(ctx, registry, record, *, timeout: int | None = None):
     """Re-book capacity for a paused sandbox, then resume it (E9.2).
 
     Node admission happens first (the workspace pins the sandbox to its node,
@@ -231,7 +244,7 @@ def _resume_with_capacity(request, registry, record, *, timeout: int | None = No
     Raises ``OfficialError`` 503 (no room; the sandbox stays paused) or 409
     (already running).
     """
-    nodes = request.app.state.nodes
+    nodes = _state_of(ctx).nodes
     node = nodes.get(record.node_id or "local")
     dims = _record_quota_dims(record)
     reserved_on: object | None = None
@@ -260,17 +273,17 @@ def _resume_with_capacity(request, registry, record, *, timeout: int | None = No
         resumed = registry.resume(record, timeout)
     except ResourceUnavailableError as e:
         if reserved_on is not None:
-            _release_node_quota(request, reserved_on, dims)
+            _release_node_quota(ctx, reserved_on, dims)
         raise OfficialError(503, str(e)) from e
     except SandboxStateConflictError as e:
         if reserved_on is not None:
-            _release_node_quota(request, reserved_on, dims)
+            _release_node_quota(ctx, reserved_on, dims)
         raise OfficialError(409, str(e)) from e
     return resumed
 
 
 async def _push_pause_state(
-    request: Request, record, *, paused: bool, reason: str | None = None
+    ctx, record, *, paused: bool, reason: str | None = None
 ) -> bool:
     """Push a pause/resume decision to the hosting worker agent (G1a).
 
@@ -294,7 +307,7 @@ async def _push_pause_state(
     shared-registry state callback instead (``local://`` node, or a missing
     node that was WARNINGed).
     """
-    node = request.app.state.nodes.get(record.node_id or "local")
+    node = _state_of(ctx).nodes.get(record.node_id or "local")
     if node is None:
         logger.warning(
             "node %s not found; %s for sandbox %s not pushed",
@@ -319,7 +332,7 @@ async def _push_pause_state(
             resp = await client.post(
                 f"{node.address}/agent/sandboxes/{record.sandbox_id}/{verb}",
                 headers={
-                    "X-Internal-Key": request.app.state.settings.internal_api_key
+                    "X-Internal-Key": _state_of(ctx).settings.internal_api_key
                 },
                 # N28/D: only a platform-initiated pause has a reason, and the
                 # worker needs it to answer "why can I not write?" with more
@@ -360,7 +373,7 @@ async def _push_pause_state(
     )
 
 
-def _rollback_pause(request: Request, registry, sandbox_id: str) -> str:
+def _rollback_pause(ctx, registry, sandbox_id: str) -> str:
     """Undo a pause whose worker push failed with an explicit error (G1a).
 
     The push-await window can overlap a concurrent delete/resume: by the
@@ -390,7 +403,7 @@ def _rollback_pause(request: Request, registry, sandbox_id: str) -> str:
         )
         return "skipped"
     try:
-        _resume_with_capacity(request, registry, record)
+        _resume_with_capacity(ctx, registry, record)
     except OfficialError as rollback_error:
         logger.error(
             "pause rollback failed for sandbox %s (%s); record stays paused",
@@ -398,11 +411,11 @@ def _rollback_pause(request: Request, registry, sandbox_id: str) -> str:
             rollback_error.message,
         )
         return "failed"
-    request.app.state.runtime_registry.set_state(sandbox_id, "running")
+    _state_of(ctx).runtime_registry.set_state(sandbox_id, "running")
     return "rolled_back"
 
 
-def _rollback_resume(request: Request, registry, sandbox_id: str) -> str:
+def _rollback_resume(ctx, registry, sandbox_id: str) -> str:
     """Undo a resume whose worker push failed with an explicit error (G1a).
 
     The push-await window can overlap a concurrent delete/pause: re-fetch the
@@ -438,9 +451,45 @@ def _rollback_resume(request: Request, registry, sandbox_id: str) -> str:
             record.state,
         )
         return "failed"
-    _park_capacity(request, record)
-    request.app.state.runtime_registry.set_state(sandbox_id, "paused")
+    _park_capacity(ctx, record)
+    _state_of(ctx).runtime_registry.set_state(sandbox_id, "paused")
     return "rolled_back"
+
+
+async def pause_record_for_platform(state, record, *, reason: str) -> str:
+    """Pause one sandbox the way ``POST /sandboxes/{id}/pause`` pauses it.
+
+    The idle->pause sweep runs from the lifespan, where there is no request
+    and no caller to answer. This is the request-free door into the *same*
+    chain, so "paused" cannot come to mean two different things depending on
+    who pressed the button.
+
+    ``reason`` is required: it is what stamps ``paused_at`` (the paused-TTL
+    sweep ages a park from that stamp) and what the sandbox's own log shows
+    the user about why it stopped on its own.
+
+    Returns ``"paused"``. A worker that answers with an explicit error is
+    rolled all the way back to ``running`` with its admission re-booked, and
+    the error is re-raised so the caller can name the sandbox it skipped.
+    """
+    registry = state.registry
+    registry.pause(record, reason)
+    _park_capacity(state, record)
+    try:
+        pushed = await _push_pause_state(state, record, paused=True, reason=reason)
+    except OfficialError:
+        logger.warning(
+            "platform pause push failed for sandbox %s; rolling back local state",
+            record.sandbox_id,
+        )
+        _rollback_pause(state, registry, record.sandbox_id)
+        raise
+    if not pushed:
+        # A ``local://`` node, or a node the registry no longer knows: the
+        # shared runtime-registry state callback is what freezes the
+        # in-process context (the same branch the endpoint takes).
+        state.runtime_registry.set_state(record.sandbox_id, "paused")
+    return "paused"
 
 
 async def _image_warm(request, node, base_image, settings) -> bool:
