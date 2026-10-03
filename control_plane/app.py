@@ -20,7 +20,7 @@ from control_plane.api.nodes import router as nodes_router
 from control_plane.api.sandboxes import router as sandboxes_router
 from control_plane.api.secrets import router as secrets_router
 from control_plane.api.snapshots import (
-    reconcile_pending_snapshots,
+    reconcile_pending_snapshots_or_report,
     router as snapshots_router,
     snapshot_reconcile_loop,
 )
@@ -481,7 +481,7 @@ def create_app(
         # and skips the ones whose shared claim a *live* peer still holds
         # (F11 step 3: those are that replica's copy, not an orphan).
         startup_snapshot_task = asyncio.create_task(
-            reconcile_pending_snapshots(app)
+            reconcile_pending_snapshots_or_report(app)
         )
         # N46: the startup pass above is not enough once ``creating`` records
         # can belong to a *live* owner. An unnamed async copy now holds a

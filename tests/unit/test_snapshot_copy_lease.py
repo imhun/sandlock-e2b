@@ -24,6 +24,7 @@ same lease against ``fakeredis`` where the timing is not the point.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Callable
 
@@ -33,6 +34,7 @@ from control_plane.api.snapshots import (
     SNAPSHOT_RECONCILE_INTERVAL_S,
     _refresh_copy_lease,
     reconcile_pending_snapshots,
+    reconcile_pending_snapshots_or_report,
 )
 from control_plane.registry.snapshots import (
     COPY_LEASE_REFRESH_S,
@@ -362,3 +364,90 @@ def test_the_lease_is_short_enough_to_be_a_lease():
     assert COPY_LEASE_TTL_S <= 60
     assert COPY_LEASE_REFRESH_S * 2 <= COPY_LEASE_TTL_S
     assert SNAPSHOT_RECONCILE_INTERVAL_S <= 60
+
+
+async def test_a_peer_deleting_the_record_mid_settle_is_named_not_raised(
+    tmp_path, monkeypatch, caplog
+):
+    """N74: the *reason* survives the record, and the pass does not blow up.
+
+    A peer's ``delete`` is the truth (its ``rmtree`` removes the very file this
+    pass is about to write the failure into) -- the same race ``_run_reserved_capture``
+    already names. The defect was that this call site let ``UnknownSnapshotError``
+    escape: the reason vanished with the record, and the exception only surfaced
+    at garbage-collection time in a fire-and-forget startup task.
+    """
+    now = [1000.0]
+    store = _ClockStore(lambda: now[0])
+    owner, scanner = _registries(tmp_path, store)
+    record = _reserve(owner, source="sbx_gone", name="gone")
+    assert (
+        owner.try_acquire_copy(
+            record.snapshot_id, ttl_s=COPY_LEASE_TTL_S, token="dead"
+        )
+        is True
+    )
+
+    def _peer_deletes_then_fails(*_args, **_kwargs):
+        scanner.delete(record.snapshot_id)
+        raise RuntimeError("no worker in this test")
+
+    monkeypatch.setattr(
+        "control_plane.api.snapshots._capture_reserved", _peer_deletes_then_fails
+    )
+
+    now[0] += COPY_LEASE_TTL_S + 1
+    with caplog.at_level(logging.WARNING, logger="control_plane.api.snapshots"):
+        assert await reconcile_pending_snapshots(_app_for(scanner)) == 1
+
+    messages = [log_record.getMessage() for log_record in caplog.records]
+    assert (
+        f"snapshot {record.snapshot_id}: interrupted by a restart: "
+        "no worker in this test"
+    ) in messages
+    assert (
+        f"snapshot {record.snapshot_id}: the record was deleted by another "
+        "replica before the interruption could be recorded"
+    ) in messages
+
+
+async def test_the_startup_wrapper_reports_a_failed_pass_and_swallows_it(
+    tmp_path, monkeypatch, caplog
+):
+    """N74: the one-shot startup task has nowhere to surface an exception.
+
+    It logs one instead. Nothing is lost by swallowing here: the periodic
+    ``snapshot_reconcile_loop`` is the retry, and it does not depend on this
+    pass having succeeded.
+    """
+    registry = SnapshotRegistry(tmp_path)
+    app = _app_for(registry)
+
+    def _boom():
+        raise RuntimeError("the record store is unreadable")
+
+    monkeypatch.setattr(registry, "in_progress", _boom)
+
+    with caplog.at_level(logging.ERROR, logger="control_plane.api.snapshots"):
+        assert await reconcile_pending_snapshots_or_report(app) == 0
+
+    assert [
+        log_record.getMessage()
+        for log_record in caplog.records
+        if log_record.levelno == logging.ERROR
+    ] == ["startup snapshot reconcile pass failed"]
+
+
+async def test_the_startup_wrapper_still_honours_cancellation(tmp_path, monkeypatch):
+    """N74: shutdown is not a failure, so ``CancelledError`` keeps going."""
+    app = _app_for(SnapshotRegistry(tmp_path))
+
+    async def _cancelled(_app):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        "control_plane.api.snapshots.reconcile_pending_snapshots", _cancelled
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await reconcile_pending_snapshots_or_report(app)

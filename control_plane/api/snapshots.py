@@ -711,10 +711,21 @@ async def reconcile_pending_snapshots(app) -> int:
             )
         except Exception as exc:  # noqa: BLE001 - recorded on the record
             detail = f"interrupted by a restart: {exc}"
-            await asyncio.to_thread(
-                app.state.snapshots.mark_failed, record.snapshot_id, detail
-            )
+            # N74: log the reason *before* trying to persist it. The record
+            # can be gone by the time this writes -- a peer's ``delete`` (its
+            # ``rmtree`` is the truth) is the same race ``_run_reserved_capture``
+            # names above -- and the reason must not vanish with the record.
             log.warning("snapshot %s: %s", record.snapshot_id, detail)
+            try:
+                await asyncio.to_thread(
+                    app.state.snapshots.mark_failed, record.snapshot_id, detail
+                )
+            except UnknownSnapshotError:
+                log.warning(
+                    "snapshot %s: the record was deleted by another replica "
+                    "before the interruption could be recorded",
+                    record.snapshot_id,
+                )
         finally:
             # Same shape as the request path: once the record itself carries the
             # answer (completed/failed), the claim has done its job. Holding it
@@ -732,6 +743,28 @@ async def reconcile_pending_snapshots(app) -> int:
     if resolved:
         log.info("reconciled %d ownerless snapshot copy(ies)", resolved)
     return resolved
+
+
+async def reconcile_pending_snapshots_or_report(app) -> int:
+    """The startup pass, with its failure made visible (N74).
+
+    :func:`reconcile_pending_snapshots` runs fire-and-forget at startup, so an
+    exception escaping it would surface only at garbage-collection time as
+    ``Task exception was never retrieved``: a reconcile pass that neither ran
+    nor said so. This wrapper is the startup task's whole body -- name the
+    failure and swallow it, because the periodic
+    :func:`snapshot_reconcile_loop` is the retry (it logs the same way and does
+    not depend on this pass having succeeded).
+
+    ``CancelledError`` is re-raised: shutdown is not a failure.
+    """
+    try:
+        return await reconcile_pending_snapshots(app)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - logged here, retried by the loop
+        logger.exception("startup snapshot reconcile pass failed")
+        return 0
 
 
 async def snapshot_reconcile_loop(
