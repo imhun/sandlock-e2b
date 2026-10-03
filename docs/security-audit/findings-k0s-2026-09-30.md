@@ -16,7 +16,7 @@
 
 | 编号 | 严重度 | 一句话 | 状态 |
 |---|---|---|---|
-| SEC-K0S-003 | **高** | 命令输出的实时路径无背压（订阅队列无界）；实测一条 `yes` 即可 OOM 掉 worker | 已确认，**含一次生产影响**；**2026-10-03 复核：仍未修**（见文末复核节） |
+| SEC-K0S-003 | **高** | 命令输出的实时路径无背压（订阅队列无界）；实测一条 `yes` 即可 OOM 掉 worker | **已修（2026-10-03，四跳全部封住 + 现场复验 `yes` 不再 OOM）**，见文末复核节 |
 | SEC-K0S-002 | 中 | 控制面 `/openapi.json`、`/docs` 无需认证即可拉取 47 条内部接口全图 | **已修（2026-10-01，2026-10-03 复核）** —— 三个 URL 都没挂载，见文末复核节 |
 
 与既有审计（`docs/security-audit/findings.md`，2026-09-16）的关系：那轮测的是
@@ -285,15 +285,29 @@ finished=2026-09-30T15:06:00Z
 * **线上**：租户入口 `http://172.18.78.49:3000` 与直连控制面 pod（`port-forward svc/control-plane:3000`）两条路径上，这三个 URL 都答 **401 `Missing E2b-Sandbox-Id header`**（combined 形态里网关那一段先接住），**带合法租户 key 也是 401**；同一条连接上 `GET /sandboxes` 带 key 是 200，证明请求确实到了应用、不是网络层挡的。
 * 2026-09-30 的读数（`/openapi.json` 200 + 52,803 B 的 47 条路径全图）**已不可复现**。
 
-**SEC-K0S-003 —— 仍未修，而且已经掉出所有追踪表**（`docs/open-issues.md` 里没有它的行；本节的"建议修法"从未落地）。当前代码形状逐字未变：
+**SEC-K0S-003 —— 已修（2026-10-03，`0.1.0-973-g77bf0cc-20261003-213534`）。** 修的过程比报告的"建议修法"多走三跳 —— 每一跳都是同一类 bug，只有把**所有**无界交接封住才真的止住内存。逐跳如下（跳 1 是真正的元凶）：
 
-```
-envd_service/process/manager.py:74    queue: asyncio.Queue = asyncio.Queue()      # 无 maxsize
-envd_service/process/manager.py:448   def _broadcast(proc, item): … queue.put_nowait(item)
-envd_service/process/manager.py:452     except asyncio.QueueFull:  # pragma: no cover - unbounded queues
-```
+| 跳 | 位置 | 修法 |
+|---|---|---|
+| ① 读线程 → 事件循环 | `executors/sandlock.py` 的 `_pump`：`loop.call_soon_threadsafe(queue.put_nowait, chunk)` —— **`call_soon_threadsafe` 本身就是队列**，回调（各带 64 KiB）堆在循环的就绪队列里，任何队列上限都看不见 | `stream_budget.ThreadHandoff`：线程侧的**字节闸门**，预算用尽时线程等待 ⇒ 它不再读命令的管道 ⇒ 管道满 ⇒ **命令自己的写阻塞**。真背压、**零丢失** |
+| ② 进程输出队列 | 同文件 `queue = asyncio.Queue()`（无界） | `ByteBudgetQueue`（字节 + 条数双界），满了丢块 + 一次 `TRUNCATED_MARK` + WARNING |
+| ③ 订阅者队列 | `process/manager.py::ManagedProcess.subscribers`（无界） | 同一个 `ByteBudgetQueue`（`SubscriberQueue`），控制项（end / marker）永不丢 |
+| ④ 中继 → ASGI | 队列有界**不等于**发出去的有界：uvicorn 的 transport 在被对端拖住时会一直收 | `rpc.py::_consume_stream` 按**已发送字节**封顶，切点打 marker，切完继续**抽干队列**（生产者不被阻塞），`end` 照常送达 |
 
-封顶的仍然只有**回放**缓冲（`capture_limit` = `E2B_COMMAND_CAPTURE_LIMIT_MB` 默认 10 MiB；worker 清单没设这个 env ⇒ 取默认），实时路径既无字节上限也无背压。今天这个部署的量化边界：`sts/e2b-worker` 的 `limits.memory=4Gi`，命令 `maxCommandTimeout` 默认 3600 s —— **时间上留了 1 小时窗口，而 `yes` 这类负载几秒就能吃满 4 GiB**（2026-09-30 那次 `OOMKilled` 就是这么发生的）。因此本节"建议修法"里的两条验收判据一个字都不过时。
+另外：本地执行器（`executors/local.py`）的队列改成有界 + `await put`（真背压，无需丢弃）；回放缓冲（`capture_limit`，10 MiB）本来就是对的，未动。新开关 `E2B_COMMAND_STREAM_LIMIT_MB`（默认 32；`0` = 不限）。
+
+**现场复验（同一台集群，同一个形状）**：
+
+| 时刻 | 版本 | `yes` + 冻结客户端的结果 |
+|---|---|---|
+| 2026-09-30（原始） | `0.1.0-818` | `e2b-worker-0` **OOMKilled**（exit 137） |
+| 2026-10-03 12:55Z（只修了跳③④） | `0.1.0-969` | 仍然 **OOMKilled** —— 这条把"只在订阅队列上加界不够"钉死了 |
+| 2026-10-03 13:33Z（跳②也修了） | `0.1.0-972` | 仍然 **OOMKilled**；预算日志**一条都没打** ⇒ 字节不在任何队列里 |
+| 2026-10-03 13:40Z（跳① 修完） | `0.1.0-973` | **存活、restarts=0**：worker 内存 `58.8 → 106.3 MiB 后走平`（20 s 无限输出），两跳以上无丢弃、无丢数据 |
+
+判据（本轮实际用的）：`anon` 走平而不是线性增长（`memory.stat`），restart 计数不动，且同一个客户端的下一轮验收（`probe_idle_pause.py` / `probe_stream_keepalive.py`）仍然通过。**仍未覆盖**：控制面侧的转发缓冲 —— 本轮实测控制面 `anon` 全程 67.2 → 67.6 MiB（不缓冲），所以没有为它加界；若将来前面的代理换成会缓冲的实现，这一跳要重测。
+
+**SEC-K0S-002（同一节内的另一半）** 见上文。
 
 ---
 
