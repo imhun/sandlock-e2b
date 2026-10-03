@@ -681,6 +681,20 @@ class NodeRegistry:
         before N20) left one behind for the life of the process.
         """
         with self._lock:
+            # The verdict is a function of the *shared* stamp, not of this
+            # replica's dict. A replica only learns a heartbeat when it
+            # happens to serve one (the worker's 5 s cadence is split across
+            # replicas), so judging from the cache alone declares a node dead
+            # the moment 30 s pass without *this* replica handling any of its
+            # heartbeats -- measured on the live cluster 2026-10-03: 30.6 s
+            # gap on the round's winner while the worker was heartbeating
+            # every 5 s into the shared row, and that node's live sandboxes
+            # were orphaned. ``get()``/``list()`` already read through the
+            # view (``_status_of`` is the same timeout on the same stamp);
+            # this is the one path that could disagree with them, and it is
+            # the destructive one.
+            for node_id in list(self._nodes):
+                self._load_locked(node_id)
             self._sweep_health_locked()
             node_ids = [
                 n.node_id

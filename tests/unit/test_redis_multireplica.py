@@ -244,6 +244,55 @@ def test_both_replicas_derive_the_same_health_from_the_shared_view():
     assert nodes_b.list()[0].status == "healthy"
 
 
+class _OrphanRecorder:
+    """The two calls ``reap_unhealthy`` makes on the sandbox registry."""
+
+    def __init__(self) -> None:
+        self.marked: list[str] = []
+
+    def mark_orphaned(self, node_id: str) -> list:
+        self.marked.append(node_id)
+        return []
+
+    def list_by_node(self, node_id: str) -> list:
+        return []
+
+
+def test_the_health_sweep_reads_the_shared_view_not_the_local_cache():
+    """The *destructive* verdict has to come from the shared row too.
+
+    Measured on the live cluster 2026-10-03 (two replicas, heartbeats every
+    5 s, ``E2B_NODE_HEARTBEAT_TIMEOUT=30``): the replica that won the sweep
+    round had gone 30.6 s without handling one of ``e2b-worker-1``'s
+    heartbeats -- they were all landing on its peer -- while the worker was
+    heartbeating into the shared row the whole time. The sweep judged it from
+    **its own dict**, declared the node dead and orphaned that node's live
+    sandboxes. ``get()``/``list()`` read through the view (pinned above); the
+    one path that decides whether a worker is dead did not.
+    """
+    server = fakeredis.FakeServer()
+    nodes_a = NodeRegistry(
+        heartbeat_timeout=0.05, redis_client=fakeredis.FakeRedis(server=server)
+    )
+    nodes_b = NodeRegistry(
+        heartbeat_timeout=0.05, redis_client=fakeredis.FakeRedis(server=server)
+    )
+    _register(nodes_a)
+    assert nodes_b.get("node_shared") is not None  # B has its own cached row
+    time.sleep(0.06)
+    # Only the peer keeps the shared row fresh -- exactly the live shape where
+    # every heartbeat landed on the other replica.
+    nodes_b.heartbeat("node_shared")
+
+    sandboxes = _OrphanRecorder()
+    nodes_a.reap_unhealthy(sandboxes)
+
+    assert sandboxes.marked == [], (
+        "the sweep orphaned a node whose shared row was fresh: "
+        f"{sandboxes.marked}"
+    )
+
+
 def test_the_view_is_written_with_an_expiry():
     """A worker that is gone for good retires its own row -- in Redis, once."""
     server = fakeredis.FakeServer()
