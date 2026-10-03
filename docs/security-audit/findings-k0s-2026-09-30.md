@@ -16,8 +16,8 @@
 
 | 编号 | 严重度 | 一句话 | 状态 |
 |---|---|---|---|
-| SEC-K0S-003 | **高** | 命令输出的实时路径无背压（订阅队列无界）；实测一条 `yes` 即可 OOM 掉 worker | 已确认，**含一次生产影响** |
-| SEC-K0S-002 | 中 | 控制面 `/openapi.json`、`/docs` 无需认证即可拉取 47 条内部接口全图 | 已确认（信息泄露，非越权） |
+| SEC-K0S-003 | **高** | 命令输出的实时路径无背压（订阅队列无界）；实测一条 `yes` 即可 OOM 掉 worker | 已确认，**含一次生产影响**；**2026-10-03 复核：仍未修**（见文末复核节） |
+| SEC-K0S-002 | 中 | 控制面 `/openapi.json`、`/docs` 无需认证即可拉取 47 条内部接口全图 | **已修（2026-10-01，2026-10-03 复核）** —— 三个 URL 都没挂载，见文末复核节 |
 
 与既有审计（`docs/security-audit/findings.md`，2026-09-16）的关系：那轮测的是
 **本地容器 + compose 形态**（pure / 模拟 chroot 两种）。本轮目标是 **k0s + REAL_ROOT
@@ -269,6 +269,31 @@ finished=2026-09-30T15:06:00Z
 但那条 `yes` 负载先把节点打爆了（见上），**回放封顶至今是读码推断，不是观测**。
 修复后应当用"跑一条有限输出的命令 → 连接上去读回放 → 断言字节数 ≤ 10 MiB
 且含 `TRUNCATED_MARK`"来钉这条，探针留在 `tmp/audit/probe_i1_replay.py`。
+
+---
+
+### 2026-10-03 复核（当前版本 `0.1.0-965-gb5f194a-20261003-193743`）
+
+**SEC-K0S-002 —— 已修，两层都关，实测无规范可拉。** 修法是"关掉"而不是"加鉴权"：
+
+- 控制面 `control_plane/app.py:592-598`：`FastAPI(..., docs_url=None, redoc_url=None, openapi_url=None)`（注释点名了 SEC-K0S-002 与 004 的放大关系）；
+- 网关 `envd_service/gateway.py:162-168`：同样三个置 `None`（同一理由：这个进程代理沙箱流量，不该自报家底）。
+
+复核证据：
+
+* **离线**（`create_app()` + `TestClient`）：`app.docs_url` / `redoc_url` / `openapi_url` **全是 `None`**；`GET /openapi.json`、`/docs`、`/redoc` 全部 **404** —— 没挂载，不是"鉴权之后才可见"。
+* **线上**：租户入口 `http://172.18.78.49:3000` 与直连控制面 pod（`port-forward svc/control-plane:3000`）两条路径上，这三个 URL 都答 **401 `Missing E2b-Sandbox-Id header`**（combined 形态里网关那一段先接住），**带合法租户 key 也是 401**；同一条连接上 `GET /sandboxes` 带 key 是 200，证明请求确实到了应用、不是网络层挡的。
+* 2026-09-30 的读数（`/openapi.json` 200 + 52,803 B 的 47 条路径全图）**已不可复现**。
+
+**SEC-K0S-003 —— 仍未修，而且已经掉出所有追踪表**（`docs/open-issues.md` 里没有它的行；本节的"建议修法"从未落地）。当前代码形状逐字未变：
+
+```
+envd_service/process/manager.py:74    queue: asyncio.Queue = asyncio.Queue()      # 无 maxsize
+envd_service/process/manager.py:448   def _broadcast(proc, item): … queue.put_nowait(item)
+envd_service/process/manager.py:452     except asyncio.QueueFull:  # pragma: no cover - unbounded queues
+```
+
+封顶的仍然只有**回放**缓冲（`capture_limit` = `E2B_COMMAND_CAPTURE_LIMIT_MB` 默认 10 MiB；worker 清单没设这个 env ⇒ 取默认），实时路径既无字节上限也无背压。今天这个部署的量化边界：`sts/e2b-worker` 的 `limits.memory=4Gi`，命令 `maxCommandTimeout` 默认 3600 s —— **时间上留了 1 小时窗口，而 `yes` 这类负载几秒就能吃满 4 GiB**（2026-09-30 那次 `OOMKilled` 就是这么发生的）。因此本节"建议修法"里的两条验收判据一个字都不过时。
 
 ---
 
