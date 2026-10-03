@@ -364,3 +364,52 @@ headroom 已关闭在 E2B 侧（FUP #3）：默认箱从 512 MiB 提到 1 GiB
 
 资源管理层增强，优先级低于安全修复（E1）与磁盘配额（E2）。排期见
 `docs/task-backlog.md`（新增项）。
+
+
+## 10. 2026-10-03 已实现：闲置即暂挂（idle → pause）
+
+§3.1 的空闲检测此前只喂给 §3.3 的**驱逐**（而且只在建箱挤不出配额时才点火，
+`E2B_EVICTION_PREFER_PAUSE` 默认 `false` ⇒ 牺牲品是被 kill 而不是被暂挂）。于是
+"沙箱闲着"这件事本身没有任何后果：它会一直 `running` 到 `end_at` 被 TTL 扫掉，
+这段时间里配额、uid、树都占着。本节是补上的那半条链 —— 闲置就暂挂，现场保留、
+配额立刻归还。
+
+**机制（代码）**：`control_plane/registry/idle_pause.py::IdlePauseSweeper`，由
+`control_plane/app.py` 的 lifespan 起停，15 s 一轮、跨副本单飞
+（`e2b:idle-pause:sweep`，与 TTL / paused / ledger 三个扫描同一套 `SET NX EX` 协议）。
+动作**不是**新的实行路径：`pause_record_for_platform`（`control_plane/api/sandboxes.py`）
+就是 `POST /sandboxes/{id}/pause` 那条链 —— `registry.pause`（归还 global/tenant）→
+`_park_capacity`（归还节点四维）→ 推 worker 做 SIGSTOP；worker 具名拒绝则整条回滚到
+`running` 并把准入重新占回。`Sandbox.connect` 自动 resume，重新占额。
+
+**"闲置"的判据是 worker 量出来的**，不是"控制面没看见请求"：命令 / 文件 / 代理流量、
+心跳上报（活跃时间戳写共享 store 每 `E2B_ACTIVITY_PERSIST_INTERVAL_S`=30 s 一次）、
+以及 CPU ≥ `E2B_CPU_ACTIVITY_PERCENT`（默认 5）。**开着的 exec 流持续算活跃**
+（`envd_service/connect/router.py`，流打开期间按 `ACTIVITY_COALESCE_S`=10 s 重新盖章），
+所以 `sleep 300` / 慢 `make` / 等外部 API 不会被冻结；只读轮询（info/metrics/logs）
+刻意**不算**（那是 §3.1 定的，别把它改成"有人看就算活跃"）。
+
+**不暂挂三种记录**：已过期（TTL 扫描的事，它有别的拆除顺序）、`end_at` 剩不到 60 s
+（暂挂完立刻拆，纯 churn）、`metadata["e2b_pause_on_idle"]` 为 `0/false/no/off`
+（长批任务的显式豁免）。
+
+**三个数必须一起出现**（k0s 出厂值，`deploy/k8s-k0s/control-plane-nfs.patch.yaml`）：
+
+| 变量 | 出厂值 | 为什么是这个数 |
+|---|---|---|
+| `E2B_IDLE_PAUSE_AFTER_S` | `300` | 远大于两个测量口径（心跳 5 s、活跃写盘 30 s）；1 分钟会贴着写盘延迟，读到的"闲置"可能比真实多 30 s |
+| `E2B_PAUSED_TTL_S` | `1800` | 暂挂归还了 **disk 台账**，但树还在盘上（每节点 75 G、8 沙箱/节点）⇒ 没有这条就是"槽位不占、磁盘占满" |
+| `E2B_ORPHAN_RECORD_TTL` | `300` | 孤儿（失联节点的记录）默认永不回收，也就永不归还配额；300 s 对着 `E2B_NODE_HEARTBEAT_TIMEOUT=30` 与 N32 实测的 76 s 停顿定。无 `orphaned_at` 戳的旧孤儿按 `end_at` 计龄（`manager.py::_ttl_reapable`，N61） |
+
+代码默认三者都是 **`0` = 关**（off 是 inert：不建任务、不取 claim），只有部署清单显式取值。
+
+**已知代价与本期不做的**：① resume 要**重新占额**，被钉住的节点满时仍是既有的
+`503 no resources`（不跨节点、不抢占本机闲置沙箱 —— 跨节点恢复等于"从快照重建"，
+丢内存态，是另一件事）；② 暂挂期间沙箱对用户是"冻结"而不是"可用"，
+所以这个策略假定"闲置 = 可以停"，与沙箱非持久对象的产品口径一致；
+③ `paused` 记录的计龄用 `paused_at`（平台发起的暂挂带 reason ⇒ 有戳）。
+
+**钉子**：`tests/unit/test_idle_pause_sweeper.py`（含开关两个方向与"一条坏记录不中断整轮"）、
+`tests/unit/test_stream_activity_keepalive.py`（开着的流算活跃）、
+`tests/unit/test_platform_pause_action.py`（归还配额 / 具名拒绝回滚 / 缺节点走共享运行时）。
+上线后的现场验收见 `docs/superpowers/plans/2026-10-03-idle-pause.md` 的"上线后验收"。
