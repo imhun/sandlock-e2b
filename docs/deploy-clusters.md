@@ -145,7 +145,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次发版：见 §7.34（2026-10-03，N57/N60/N61/N62/N63 收口，当前版本 `0.1.0-931-g4181bb4-20261003-013625`；四条收尾读数 + 两条冒烟全绿，两次非预期读数与操作教训见该节）；上一版：§7.33（2026-10-02，建箱存储本地优先 **Task 0–5 的发版记录**，版本 `0.1.0-915-gfb8a74b-20261002-211709`；跨切面冒烟**先红后绿**（红灯那次：验收窗口留下的孤儿沙箱**真的占着名额**，再加上拒绝路径漏掉的那几份预约）—— 迁移"源节点不可达"拒绝路径泄漏目标节点配额，见该节与 N59；控制者清掉台账与 8 个孤儿沙箱之后**两条冒烟都通过**，N59 的修复已随本版 `32f3667` 上线）；上一版的细节：见 §7.31（2026-10-02，N57/Task 4：本节点 state 分家，`prepare` 72–76 → **7.4 ms**，Task 5 的目录链修复同船）；§7.30（2026-10-02，Task 2：快照载荷从爆炸式 `fs/` 目录改成 `fs.tar`，捕获每条目 39.7 → 9.0 ms、占块减半，从快照建箱 28.2 → 34.4 ms/条目（读侧每条目包含检查，Task 3 搬本地后消失；`942c5bd` 的守卫修复在 `0.1.0-895` 上线后重测 **30.4 ms/条目**），**该节版本 `0.1.0-900-g0079c84-20261002-161409`**；老 `fs/` 快照 4/4 仍可恢复，详见该节）；§7.29（2026-10-02，N58：根重切上线 —— `_snapshots` 合一、`_migrate` 上浮，建箱 p50 124 → 135/136 ms、逐段不变，**该节版本 `0.1.0-887-g7ef319b-20261002-100406`**；该次上线当场抓到"从快照建箱"的 502，已前滚修复 + 复验，详见该节）；§7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**该节版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，该节版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次发版：见 §7.35（2026-10-03，批 B 收口：N64/N65/N66/N67/N68/N69/N70/N72，当前版本 `0.1.0-945-g01b9b51-20261003-124244`；四条收尾读数 + 两条冒烟全绿，`0.1.0-943` 那次卷段回归的往返见该节）；上一版：§7.34（2026-10-03，N57/N60/N61/N62/N63 收口，版本 `0.1.0-931-g4181bb4-20261003-013625`）；再上一版：§7.33（2026-10-02，建箱存储本地优先 **Task 0–5 的发版记录**，版本 `0.1.0-915-gfb8a74b-20261002-211709`；跨切面冒烟**先红后绿**（红灯那次：验收窗口留下的孤儿沙箱**真的占着名额**，再加上拒绝路径漏掉的那几份预约）—— 迁移"源节点不可达"拒绝路径泄漏目标节点配额，见该节与 N59；控制者清掉台账与 8 个孤儿沙箱之后**两条冒烟都通过**，N59 的修复已随本版 `32f3667` 上线）；上一版的细节：见 §7.31（2026-10-02，N57/Task 4：本节点 state 分家，`prepare` 72–76 → **7.4 ms**，Task 5 的目录链修复同船）；§7.30（2026-10-02，Task 2：快照载荷从爆炸式 `fs/` 目录改成 `fs.tar`，捕获每条目 39.7 → 9.0 ms、占块减半，从快照建箱 28.2 → 34.4 ms/条目（读侧每条目包含检查，Task 3 搬本地后消失；`942c5bd` 的守卫修复在 `0.1.0-895` 上线后重测 **30.4 ms/条目**），**该节版本 `0.1.0-900-g0079c84-20261002-161409`**；老 `fs/` 快照 4/4 仍可恢复，详见该节）；§7.29（2026-10-02，N58：根重切上线 —— `_snapshots` 合一、`_migrate` 上浮，建箱 p50 124 → 135/136 ms、逐段不变，**该节版本 `0.1.0-887-g7ef319b-20261002-100406`**；该次上线当场抓到"从快照建箱"的 502，已前滚修复 + 复验，详见该节）；§7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**该节版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，该节版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -2307,6 +2307,99 @@ KUBECONFIG="$PWD/tmp/k0s/kubeconfig" kubectl -n sandlock get pods
 KUBECONFIG="$PWD/tmp/k0s/kubeconfig" DRY_RUN=1 deploy/k8s-k0s/apply.sh 2>/dev/null \
     | KUBECONFIG="$PWD/tmp/k0s/kubeconfig" kubectl diff -f - | wc -l   # 期望 0
 ```
+
+### 7.35 发版：批 B 收口（**2026-10-03，当前版本 `0.1.0-945-g01b9b51-20261003-124244`**）
+
+计划 `docs/superpowers/plans/2026-10-02-open-issues-fix.md` 的批 B（Task 9–15 + 收尾）。
+本节是这一批的**发版记录**：一个版本上两次（`0.1.0-943` 上线后卷段红 → 回退 + 补 fork pin
+→ `0.1.0-945` 重上全绿）、四条收尾读数、两条冒烟、N72 的端到端验证、N61 的现场结论。
+各条改动的设计与先红钉子仍在 `docs/open-issues.md` 的 N64/N65/N66/N67/N68/N69/N70/N72 行与
+各 task 报告，本节只记"它上线时现场看到了什么"。
+
+**版本线**（`deploy/stack/.version`；worker / control-plane-gateway / agent / quota-agent
+四个镜像同 tag）：
+
+| 版本 | 内容 | 节 |
+|---|---|---|
+| `0.1.0-931-g4181bb4-20261003-013625` | 批 A（N57/N60/N61/N62/N63）—— 本批的**基线** | §7.34 |
+| `0.1.0-943-gc167338-20261003-121446` | 批 B 第一版（N64/N66/N67/N68/N69/N65/N70/N72）—— **已下线**（卷段红，见下） | 本节 |
+| **`0.1.0-945-g01b9b51-20261003-124244`** | 批 B 收口版：`943` + 两个热修（`6bec359` fork 不再产生 pin、`01b9b51` 回退 CP 清单那行 `E2B_SHARED_VOLUME_ROOT`）—— **当前** | 本节 |
+
+**上线顺序（照命令实际发生的次序）**
+
+1. **通道 + 身份闸门**：`deploy/scripts/open-cluster-tunnel.sh` 自检报 2 节点 / arm64 /
+   含 `+k0s` / `sandlock` 9 pod。**任何 `kubectl` / `apply.sh` 都在同一条命令里带
+   `KUBECONFIG="$PWD/tmp/k0s/kubeconfig"`**（§7.34.1 的操作教训）。
+2. **四个镜像先在 ACR 就绪**（`PLATFORMS=linux/arm64 PUSH=1 ./deploy/scripts/build-and-push.sh`
+   —— N72 修好后单平台也 `--push`），四条 `docker buildx imagetools inspect` /
+   `docker manifest inspect --verbose` 复核 `linux/arm64` 之后才 apply。
+3. **apply**（唯一一条，无任何 flag）：
+   `KUBECONFIG="$PWD/tmp/k0s/kubeconfig" deploy/k8s-k0s/apply.sh` —— 打印
+   `✓ target cluster: …`，7 个镜像引用 pin 到本版，内建顺序 agent DaemonSet → worker
+   StatefulSet；补等 `kubectl rollout status deployment/control-plane`。
+4. **两条冒烟**（`multinode_smoke.py` / `deployment_smoke.py`，本地 `port-forward
+   svc/control-plane 13000:3000`；`E2B_API_KEY` / `E2B_INTERNAL_API_KEY` 从
+   `secret/e2b-secrets` 取、不回显）。
+
+**四条收尾读数（全部只读，`0.1.0-945` 现场）**
+
+| # | 读数 | 结果 |
+|---|---|---|
+| 1 | 三处镜像 tag ≡ `deploy/stack/.version` | ✅ `control-plane-gateway` / `agent` / `worker` 全是 `0.1.0-945-g01b9b51-20261003-124244` |
+| 2 | `kubectl -n sandlock get pods` | ✅ **9/9 Running**（control-plane ×2 2/2、e2b-c3-agent ×2 2/2、e2b-worker-0/1 1/1、redis 1/1、seccomp-installer ×2 1/1） |
+| 3 | `GET /sandboxes` | ✅ **`[]`** |
+| 4 | `DRY_RUN=1 apply.sh \| kubectl diff -f - \| wc -l` | ✅ **0 行**（仓库规格 ≡ 线上） |
+
+**diff 里不再有那条 env。** `943` 的 apply 前 diff 里出现过 CP 的
+`E2B_SHARED_VOLUME_ROOT` 一行（N65/Task 13 加的）；`945` 的 apply 前 diff **只有**
+镜像 tag 行 + 服务端 `generation`/`deprecated.daemonset.template.generation`，外加那条 env
+的**删除**（`- E2B_SHARED_VOLUME_ROOT: /var/lib/e2b-sandboxes`），再无别的。
+
+**N72 的端到端验证（四条 imagetools）。** 单平台 `PUSH=1` 生效后，两次构建的四条
+`docker manifest inspect --verbose` 都能解析，平台都是 `linux/arm64`，且 digest 与构建日志里
+`pushing manifest for …@sha256:…` 逐字一致。`945` 的 digest：worker `sha256:cf11f5b0…`、
+agent `sha256:62fa9c94…`、quota-agent `sha256:5d5eab7b…`、
+control-plane-gateway `sha256:c948cf9a…`（CP 因 `6bec359` 的代码改动而变，另三条不变）。
+
+**N61 现场结论（一句话 + 指向）。** 只读探针 `deploy/scripts/acceptance/probe_ttl_sweep_reap.py`
+在本版现场读到**舰队 0 条记录**、claim `e2b:ttl:sweep` **58/60 被持有**（与 §7.34 的 59/60
+同形）⇒ 扫描器在发问；批 B 的主动复现**未复现**那条 8 条记录的现象（三个样本都在 `endAt` 后
+0.56–0.88 s 被回收），下一步是"存储侧 `orphaned` × 视图"的两副本实验 —— 全部写在
+`docs/open-issues.md` N61 行（出处 `.superpowers/sdd/2026-10-02-open-issues-fix/task-14-report.md`）。
+
+**两条冒烟（`0.1.0-945` 现场，都一次跑过）**
+
+- `MULTI-NODE SMOKE OK`：4 箱 **2+2**、commands / files / health / stdin 全过，kill 后两边
+  预约 **0/0**。
+- `DEPLOYMENT SMOKE OK`：六段全过（命令+文件、跨节点迁移保文件、网络配置、**远端卷 + 兄弟卷
+  隔离**、模板构建 → registry push → worker pull → rootfs、MCP 网关），
+  `after kill reservations: {'e2b-worker-0': 0, 'e2b-worker-1': 0}`。
+
+**`0.1.0-943` 的往返（如实记，别抹掉）**
+
+1. `943`（含 N65 那条 CP env）apply 后，`multinode_smoke` 绿；`deployment_smoke` 前三段绿，
+   到"远端卷"段红：`Volume.create` → `POST /volumes` **500**（body 是纯文本
+   `Internal Server Error`，e2b SDK 解析 JSON 时报 `JSONDecodeError`）。
+2. 控制面日志根因：`OSError: [Errno 30] Read-only file system:
+   '/var/lib/e2b-sandboxes/vol_…'` / `VolumeRootNotOwnedError: the volume store
+   /var/lib/e2b-sandboxes is not writable by this control plane (uid 65534)`。
+   只读复核 `kubectl exec … grep /proc/mounts`：CP 里 `/var/lib/e2b-sandboxes` 是 `ro`（rw 的是
+   `_volumes` 等 `_`-前缀子路径）。
+3. **根因**：`control_plane/app.py:587` 的
+   `volume_root = settings.shared_volume_root or platform_root / "_volumes"` 把
+   `E2B_SHARED_VOLUME_ROOT` 当**卷仓根本身**，而该变量的语义（`docs/env-vars.md:18`）是
+   **共享导出根** —— Task 13 往 CP 清单加它，就把卷仓顶到了只读挂载点上。双重语义另立
+   `docs/open-issues.md` **N73**。
+4. **热修**：`01b9b51` 回退 CP 清单那行（CP 不设它 ⇒ 回落 `platform_root/_volumes`，
+   N65 的判据有 `platform_root` 兜底，不受影响）；`6bec359` 补掉评审抓到的 N65 漏项
+   （`control_plane/api/snapshots.py:939` 的 `fork` 仍传 `volume_node_id=snapshot.node_id`
+   ⇒ 从快照 fork 会分叉出 pin、按"钉住被拒 ⇒ 503"在另一台空着时答 503）。
+5. 重新构建（`0.1.0-945`）→ 重新 apply → 两条冒烟全绿（卷段过、末条 `0/0`）。
+   **没有再走"删 worker pod 自愈"那条路** —— `945` 两次冒烟的 `after kill reservations`
+   都是 **0/0**，N70 的漂移没再出现。
+
+**这次留下的两条账**：N73（`E2B_SHARED_VOLUME_ROOT` 双重语义，登记；连 compose 形态一起核）
+与 N74/N75/N76（本轮登记的三条小账）。见 `docs/open-issues.md`。
 
 ## 8. 改部署的入口
 
