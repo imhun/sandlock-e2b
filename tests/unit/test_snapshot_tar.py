@@ -108,6 +108,22 @@ def _tar(path: Path, entries: dict[str, bytes | str]) -> Path:
     return path
 
 
+class _RecordingRunner:
+    """``materialize``'s privilege seam: records instead of exec'ing.
+
+    A refused materialization must not reach it at all, so ``calls`` is the
+    witness for "nothing was handed over" (``tests/unit/test_agent_materialize.py``
+    keeps the same seam for the same reason).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def run(self, argv: list[str], *, env) -> str:
+        self.calls.append(list(argv))
+        return ""
+
+
 # ------------------------------------------------------------------ the writer
 
 
@@ -355,7 +371,12 @@ def test_the_cap_can_be_disabled(workspace: Path) -> None:
 def test_the_env_knob_is_read_and_zero_disables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``E2B_ARCHIVE_MAX_MEMBERS``: read at call time; garbage ⇒ the default."""
+    """``E2B_ARCHIVE_MAX_MEMBERS``: read at call time.
+
+    ``0`` -- and only ``0`` -- disables the cap; an unset, negative or
+    unparsable value falls back to :data:`archive.DEFAULT_ARCHIVE_MAX_MEMBERS`
+    (``-1`` is not a smaller cap, it is the documented fallback).
+    """
     assert archive.DEFAULT_ARCHIVE_MAX_MEMBERS == 1_500_000
 
     monkeypatch.setenv("E2B_ARCHIVE_MAX_MEMBERS", "5")
@@ -363,6 +384,12 @@ def test_the_env_knob_is_read_and_zero_disables(
 
     monkeypatch.setenv("E2B_ARCHIVE_MAX_MEMBERS", "0")
     assert archive.resolve_member_max() == 0
+
+    monkeypatch.setenv("E2B_ARCHIVE_MAX_MEMBERS", "-1")
+    assert archive.resolve_member_max() == archive.DEFAULT_ARCHIVE_MAX_MEMBERS
+
+    monkeypatch.setenv("E2B_ARCHIVE_MAX_MEMBERS", "abc")
+    assert archive.resolve_member_max() == archive.DEFAULT_ARCHIVE_MAX_MEMBERS
 
     monkeypatch.delenv("E2B_ARCHIVE_MAX_MEMBERS")
     assert archive.resolve_member_max() == archive.DEFAULT_ARCHIVE_MAX_MEMBERS
@@ -383,6 +410,65 @@ def test_the_default_cap_guards_a_caller_that_passes_nothing(
         archive.extract_sandbox_archive(archive_path, dest)
 
     assert caught.value.reason == "archive-too-many-members"
+
+
+def test_materialize_surfaces_the_member_cap_under_its_own_name(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N69: the agent's own surface names the cap instead of folding it away.
+
+    ``materialize._ARCHIVE_REFUSALS`` maps the shared extractor's reasons onto
+    the reasons this agent's callers branch on. The member cap (Task 4 / N63)
+    keeps its own name there: ``partial-copy`` is "the payload is not what it
+    claims" (a step that ran and failed), while a payload over the *member*
+    cap is a capacity refusal an operator has to be able to grep for -- so the
+    outward reason is spelled exactly once, by the extractor's own constant.
+    """
+    from c3_agent import materialize
+    from c3_agent.config import Settings as AgentSettings
+
+    monkeypatch.setenv("E2B_ARCHIVE_MAX_MEMBERS", "2")
+    base = workspace / "workspaces"
+    base.mkdir()
+    # The payload lives where the store keeps one -- under the workspace base,
+    # one of this agent's four roots, so the refusal under test is the cap and
+    # not the root check that runs first.
+    store = base / "_snapshots" / SNAPSHOT
+    store.mkdir(parents=True)
+    payload = _tar(
+        store / "fs.tar", {"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n"}
+    )
+    settings = AgentSettings(
+        token="agent-token-0123456789",
+        node_id="node-a",
+        workspace_base=str(base),
+        state_base=str(workspace / "state"),
+        shared_volume_root=str(workspace / "volumes"),
+    )
+    plan = {
+        "sandbox_id": "sbx_cap",
+        "tree": {
+            "path": str(base / "sbx_cap"),
+            "subdir": "workspace",
+            "mode": "0770",
+            "uid": 10007,
+            "gid": 65534,
+            "copy_from": str(payload),
+        },
+        "slices": [],
+    }
+    runner = _RecordingRunner()
+
+    with pytest.raises(materialize.MaterializeRefusal) as caught:
+        materialize.materialize_tree(plan, settings=settings, runner=runner)
+
+    assert caught.value.reason == "archive-too-many-members"
+    # A refused materialization must not have spent any privilege on the tree.
+    assert runner.calls == []
+    # The mapping keys on the shared constant object, not on a second copy of
+    # its spelling -- the same "one implementation" rule the extractor test
+    # above pins.
+    assert materialize.ARCHIVE_TOO_MANY_MEMBERS is archive.TOO_MANY_MEMBERS
 
 
 # ------------------------------------ the acceptance probes that read the store

@@ -17,12 +17,16 @@ is a high-water mark that cannot be reset inside one process:
 * ``index``    -- open + walk the tar: the member index on its own (traced);
 * ``unpack``   -- ``gateway_common.archive.extract_sandbox_archive`` with the
   cap **disabled** (``max_members=0``): the real path a hostile payload takes;
-* ``unpack-no-trace`` -- the same unpack with the tracer off, and **this is the
-  row whose ``ru_maxrss`` is comparable to a cgroup limit**: ``tracemalloc``
+* ``unpack-no-trace`` -- the same unpack with the tracer off: ``tracemalloc``
   keeps its own tables in real RSS while ``get_traced_memory()`` does not count
   them (measured at 1 500 000 members: 1.64 GiB with the tracer, 0.77 GiB
   without), and the production path never runs a tracer. It is also ~2.5×
-  faster, which is what makes the largest size affordable.
+  faster, which is what makes the largest size affordable. **This row's
+  ``ru_maxrss`` is the process's own RSS and nothing else**: it does not carry
+  the kernel's inode/dentry slab or the page cache for the ~1.5 M files the
+  unpack just created, so a cgroup comparison has to read ``memory.current``
+  (the measure ``docs/create-local-first-design.md`` §3.0 uses), not the
+  limit.
 
 The numbers are raw -- members, archive bytes, ``tracemalloc`` peak, peak RSS,
 seconds -- and rows print as they land, so an aborted run still has its data.
@@ -78,10 +82,12 @@ from gateway_common.archive import extract_sandbox_archive  # noqa: E402
 
 #: ``index`` and ``unpack`` trace allocations (that is where the *index* bytes
 #: come from). The trailing ``unpack-no-trace`` is the row whose ``ru_maxrss``
-#: is comparable to a cgroup limit: ``tracemalloc`` keeps its own bookkeeping in
-#: real RSS, and at 285 000 members that was measured at 310 MiB of process RSS
-#: against a 124 MB traced index -- an observer that would have been reported as
-#: "the payload's memory".
+#: is the production path's own memory: ``tracemalloc`` keeps its own
+#: bookkeeping in real RSS, and at 285 000 members that was measured at 310 MiB
+#: of process RSS against a 124 MB traced index -- an observer that would have
+#: been reported as "the payload's memory". It is still only process RSS: the
+#: slab and the page cache the created files add are not in it, so compare it
+#: against the cgroup's ``memory.current``, never its limit.
 DEFAULT_PHASES = ("index", "unpack", "unpack-no-trace")
 DEFAULT_SIZES = (200_000, 1_500_000)
 DEFAULT_WORK_DIR = "tmp/archive-member-index-memory"
@@ -220,9 +226,11 @@ def _print_summary(
             f"\nat {count} members the index alone is {traced} traced bytes "
             f"({traced / count:.1f} B/member)"
         )
+    printed_unpack = False
     for row in sorted(rows, key=lambda row: (int(row["count"]), str(row["phase"]))):
         if not str(row["phase"]).startswith("unpack"):
             continue
+        printed_unpack = True
         rss = int(row["peak_rss_bytes"])
         print(
             f"at {row['count']} members {row['phase']} peaked at {rss} RSS "
@@ -230,6 +238,14 @@ def _print_summary(
             f"interpreter baseline, of the container's "
             f"{CONTAINER_LIMIT_BYTES / 1024**3:.0f} GiB "
             "(deploy/k8s/c3-agent.yaml)"
+        )
+    if printed_unpack:
+        print(
+            "RSS only: this peak is the child's own resident memory and does "
+            "not include the kernel's inode/dentry slab or the page cache for "
+            "the files the unpack created -- against a cgroup, read "
+            "memory.current (docs/create-local-first-design.md §3.0), not the "
+            f"{CONTAINER_LIMIT_BYTES / 1024**3:.0f} GiB memory.max above."
         )
 
 

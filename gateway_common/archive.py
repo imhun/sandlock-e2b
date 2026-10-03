@@ -252,6 +252,8 @@ def extract_sandbox_archive(
     try:
         with tarfile.open(Path(archive_path), "r:*") as tar:
             for member in tar:
+                # Must stay *before* the ``continue`` below: the cap counts the
+                # index the walk has already paid for, dropped members included.
                 seen += 1
                 if limit and seen > limit:
                     # Before the member that crosses the cap is written: the

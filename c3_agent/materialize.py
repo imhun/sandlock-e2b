@@ -48,6 +48,7 @@ from gateway_common.archive import (
 )
 from gateway_common.archive import (
     DESTINATION_IS_A_SYMLINK as ARCHIVE_DESTINATION_IS_A_SYMLINK,
+    TOO_MANY_MEMBERS as ARCHIVE_TOO_MANY_MEMBERS,
 )
 from gateway_common.paths import (
     SNAPSHOT_PAYLOAD_DIR_NAME,
@@ -67,14 +68,24 @@ BAD_PLAN = "bad-plan"
 #: big (the ``maint`` container is 2 GiB -- Task 3 raised it from the 512 MiB
 #: that the 900 MiB restore already OOMed; ``docs/create-local-first-design.md`` §3.0).
 TREE_TOO_LARGE = "tree-too-large"
+#: Task 4 (N63), surfaced by name here (N69): the payload carries more members
+#: than the unpack may index. It is not :data:`PARTIAL_COPY` -- that reason is
+#: "the payload is not what it claims", while this one is a *capacity* refusal
+#: over a well-formed archive, the same family as :data:`TREE_TOO_LARGE`, and
+#: the shared extractor already names it apart from its corrupt-payload
+#: reasons. The spelling is the extractor's own constant, so one string names
+#: the refusal on every image (an operator greps one word).
+TOO_MANY_MEMBERS = "archive-too-many-members"
 
-#: One archive refusal has a name of its own on this side too: a clean member
-#: name that lands outside the tree means the **destination** holds a link, and
-#: the caller has to be able to see that. Everything else the shared extractor
-#: refuses is "the payload is not what it claims", which is a step that ran and
-#: failed (502), never a bad plan.
+#: Two archive refusals have a name of their own on this side too. A clean
+#: member name that lands outside the tree means the **destination** holds a
+#: link, and the caller has to be able to see that; a payload over the member
+#: cap is a capacity refusal the operator has to be able to tell from a broken
+#: payload. Everything else the shared extractor refuses is "the payload is not
+#: what it claims", which is a step that ran and failed (502), never a bad plan.
 _ARCHIVE_REFUSALS = {
     ARCHIVE_DESTINATION_IS_A_SYMLINK: DESTINATION_IS_A_SYMLINK,
+    ARCHIVE_TOO_MANY_MEMBERS: TOO_MANY_MEMBERS,
 }
 
 
