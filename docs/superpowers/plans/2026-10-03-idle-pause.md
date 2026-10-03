@@ -49,7 +49,7 @@
 | `tests/unit/test_stream_activity_keepalive.py`（新） | Task 1 |
 | `tests/unit/test_platform_pause_action.py`（新） | Task 2 |
 | `tests/unit/test_idle_pause_sweeper.py`（新） | Task 3 |
-| `tests/unit/test_orphan_record_ttl_fallback.py`（新） | Task 5 |
+| `tests/unit/test_sandbox_registry.py`（改，贴在既有 N22 孤儿钉子旁） | Task 5 |
 
 ---
 
@@ -131,7 +131,7 @@ git commit -m "feat(envd): an open stream keeps the sandbox active (E9.1)"
 - Test: `tests/unit/test_platform_pause_action.py`
 
 **Interfaces:**
-- Produces: `async def pause_record_for_platform(state, record, *, reason: str) -> str` —— 返回 `"paused"` 或 `"rolled_back"`；抛 `OfficialError` 表示具名失败（与端点一致）
+- Produces: `async def pause_record_for_platform(state, record, *, reason: str) -> str` —— 成功返回 `"paused"`；worker 具名拒绝时**先回滚再抛** `OfficialError`（与端点一致），由调用方（sweeper）逐条 catch 并具名
 - Consumes: `SandboxRegistry.pause(record, reason) -> SandboxRecord`（释放 global/tenant 配额）、`NodeRegistry.release_quota(...)`、`RuntimeRegistry.set_state(...)`
 
 - [ ] **Step 1: Write the failing test**
@@ -164,7 +164,7 @@ Expected: FAIL —— `ImportError: cannot import name 'pause_record_for_platfor
 
 - [ ] **Step 3: Implement the refactor + `pause_record_for_platform`**
 
-机械替换六个 helper 的第一个参数 `request` → `state`，函数体内 `request.app.state.X` → `state.X`，同文件调用点传 `request.app.state`；`pause_record_for_platform` 只做端点里除 `registry.get` / 归属校验 / `record.touch()` 之外的三步：`registry.pause(record, reason)` → `_park_capacity(state, record)` → 推送失败时 `_rollback_pause(state, registry, record.sandbox_id)`；推送管道丢失（transport）仍是 best-effort WARNING（端点既有语义）。`_resume_with_capacity` 的节点拒绝分支补一条 WARNING（日志，**不动**响应文本）：节点 id + `node.blocking_dimension(*dims)` 的结果，让"恢复不了"能一眼看出是钉在哪个节点、哪个维度满。
+**实现时改了一个做法（已落地，记录在此）**：六个 helper 的第一个参数改名为 `ctx`，函数体里的 `request.app.state.X` 换成 `_state_of(ctx).X` —— 新增的 `_state_of` 一个访问器同时吃 `Request`（端点）与 `app.state`（后台任务），于是**同文件那 16 处调用点一个都不用动**（比原计划"逐处传 `request.app.state`"的 diff 小得多，也少一类"两处写法漂移"）。`pause_record_for_platform` 只做端点里除 `registry.get` / 归属校验 / `record.touch()` 之外的三步：`registry.pause(record, reason)` → `_park_capacity(state, record)` → 推送失败时 `_rollback_pause(state, registry, record.sandbox_id)`；推送管道丢失（transport）仍是 best-effort WARNING（端点既有语义）。`_resume_with_capacity` 的节点拒绝分支补一条 WARNING（日志，**不动**响应文本）：节点 id + `node.blocking_dimension(*dims)` 的结果，让"恢复不了"能一眼看出是钉在哪个节点、哪个维度满。
 
 - [ ] **Step 4: Run the new test plus every existing pause/resume test**
 
@@ -298,7 +298,7 @@ git commit -m "deploy(k0s): idle-pause 300s, paused TTL 1800s, orphan TTL 300s"
 
 **Files:**
 - Modify: `control_plane/registry/manager.py::_ttl_reapable`（orphaned 分支回落 `end_at`）
-- Test: `tests/unit/test_orphan_record_ttl_fallback.py`
+- Test: `tests/unit/test_sandbox_registry.py`（**实现时改到既有 N22 孤儿钉子旁边**，而不是原计划的独立文件：同一个机制、同一组 `_settings` / `_create` / `workspace` 夹具，分开放只会让读者多跑一处）
 
 **Interfaces:**
 - Produces: `orphaned` + `orphan_record_ttl_s > 0` + `orphaned_at is None` 时，按 `end_at + ttl` 判可回收；`orphan_record_ttl_s <= 0` 时行为逐字不变（永不回收）
@@ -318,20 +318,20 @@ def test_a_stamped_orphan_still_ages_from_its_own_stamp():
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `.venv/bin/python -m pytest tests/unit/test_orphan_record_ttl_fallback.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_sandbox_registry.py -k orphan -v`
 Expected: FAIL —— 第一条 `assert False is True`（无戳回落还没有）
 
 - [ ] **Step 3: Implement the fallback**（`orphaned_at or end_at` 作为计时起点，其余不动）
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `.venv/bin/python -m pytest tests/unit/test_orphan_record_ttl_fallback.py tests/unit/test_ttl.py tests/unit/test_ttl_sweeper_stall.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_sandbox_registry.py tests/unit/test_ttl.py tests/unit/test_ttl_sweeper_stall.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add control_plane/registry/manager.py tests/unit/test_orphan_record_ttl_fallback.py
+git add control_plane/registry/manager.py tests/unit/test_sandbox_registry.py
 git commit -m "fix(cp): a stampless orphan ages from end_at when the orphan TTL is set (N61)"
 ```
 
