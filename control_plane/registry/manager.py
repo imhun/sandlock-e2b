@@ -2121,20 +2121,26 @@ class SandboxRegistry:
         taken from the record's own transition (``orphaned_at``), so a record
         orphaned by an older build (no stamp) is only collected once a later
         outage stamps it.
+
+        **N61 (2026-10-03)**: "no stamp" used to mean "never collect", which
+        made the opt-in useless for exactly the records it was added for -- the
+        long-lived ones left by a build that did not stamp. A stampless orphan
+        now ages from its own ``end_at`` instead: the record's deadline is the
+        only age it has.
         """
         if record.state == "paused":
             return False
         if record.state == "orphaned":
             ttl = float(getattr(self._settings, "orphan_record_ttl_s", 0.0) or 0.0)
-            if ttl <= 0 or record.orphaned_at is None:
+            if ttl <= 0:
                 return False
             moment = now or utcnow()
             if moment.tzinfo is None:
                 moment = moment.replace(tzinfo=timezone.utc)
-            orphaned_at = record.orphaned_at
-            if orphaned_at.tzinfo is None:
-                orphaned_at = orphaned_at.replace(tzinfo=timezone.utc)
-            return (moment - orphaned_at).total_seconds() >= ttl
+            since = record.orphaned_at or record.end_at
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=timezone.utc)
+            return (moment - since).total_seconds() >= ttl
         return record.is_expired(now)
 
     def cleanup_workspace(self, record: SandboxRecord) -> None:

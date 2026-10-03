@@ -161,6 +161,55 @@ def test_the_default_keeps_the_promise_that_an_orphan_is_never_reaped(workspace)
     assert registry.get(record.sandbox_id).state == "orphaned"
 
 
+def _stampless_orphan(registry, *, age_s: float):
+    """An orphan the way an *older* build left one: no ``orphaned_at`` stamp.
+
+    ``mark_orphaned`` only stamps on the transition, so a record that was
+    already ``orphaned`` when the stamp was introduced never gets one -- and
+    the TTL branch used to read "no stamp" as "never collect this", which made
+    the opt-in switch silently useless for exactly the records it was added
+    for (N61).
+    """
+    from datetime import timedelta
+
+    record = _create(registry)
+    record.node_id = "node_a"
+    record.state = "orphaned"
+    record.orphaned_at = None
+    record.end_at = utcnow() - timedelta(seconds=age_s)
+    registry.save(record)
+    return record
+
+
+def test_a_stampless_orphan_is_collected_once_the_opt_in_grace_elapses(workspace):
+    registry = SandboxRegistry(_settings(orphan_record_ttl_s=300))
+    record = _stampless_orphan(registry, age_s=301)
+
+    assert [r.sandbox_id for r in registry.remove_expired()] == [record.sandbox_id]
+    assert registry.list() == []
+
+
+def test_a_stampless_orphan_survives_while_the_switch_is_off(workspace):
+    registry = SandboxRegistry(_settings())
+    _stampless_orphan(registry, age_s=365 * 24 * 3600)
+
+    assert registry.remove_expired() == []
+    assert registry.list()[0].state == "orphaned"
+
+
+def test_a_stamped_orphan_still_ages_from_its_own_stamp(workspace):
+    """The fallback must not hijack a record whose outage is younger than its TTL."""
+    from datetime import timedelta
+
+    registry = SandboxRegistry(_settings(orphan_record_ttl_s=300))
+    record = _stampless_orphan(registry, age_s=3600)
+    record.orphaned_at = utcnow() - timedelta(seconds=100)
+    registry.save(record)
+
+    assert registry.remove_expired() == []
+    assert registry.list()[0].state == "orphaned"
+
+
 def test_a_recovered_sandbox_loses_its_orphan_stamp(workspace):
     """Recovery clears the stamp, so the *next* outage gets its own grace.
 
