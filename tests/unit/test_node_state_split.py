@@ -150,9 +150,11 @@ def test_the_uid_pools_own_files_live_on_the_shared_base(tmp_path: Path) -> None
 
     assert pool.acquire("sbx_a") == POOL_START
 
-    assert (state / ".uid_reservations" / "sbx_a").read_text(
-        encoding="utf-8"
-    ) == f"{POOL_START}\n"
+    # ``<uid> <node_id> <unix_ts>`` since N66; this test only cares where the
+    # marker lands, so it pins the uid field and the location, not the author.
+    assert (
+        state / ".uid_reservations" / "sbx_a"
+    ).read_text(encoding="utf-8").split()[0] == str(POOL_START)
     assert (node / ".uid_pool.lock").exists() is False
     assert (node / ".uid_reservations").exists() is False
     # ...and with no node state base named, the shared state base again.

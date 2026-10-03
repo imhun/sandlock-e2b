@@ -76,9 +76,10 @@ def test_uid_pool_writes_its_marker_under_the_state_base(tmp_path: Path) -> None
     uid = pool.acquire("sbx_a")
 
     assert uid == 10000
-    assert (state / ".uid_reservations" / "sbx_a").read_text(
-        encoding="utf-8"
-    ) == "10000\n"
+    # The marker is ``<uid> <node_id> <unix_ts>`` since N66; this test only
+    # cares which base it lands under, so the uid field is what it pins.
+    marker = state / ".uid_reservations" / "sbx_a"
+    assert marker.read_text(encoding="utf-8").split()[0] == "10000"
     assert (workspace / ".uid_reservations").exists() is False
 
 

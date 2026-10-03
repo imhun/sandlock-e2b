@@ -123,6 +123,18 @@ def _pretend_owned(monkeypatch, owners: dict[Path, int]) -> None:
     monkeypatch.setattr(Path, "stat", fake_stat)
 
 
+def _parse_marker(marker: Path) -> tuple[int, str, float]:
+    """The three fields a reservation marker carries (N66).
+
+    ``<uid> <node_id> <unix_ts>`` exactly: the assertion on the field count is
+    what pins the write side, so a regression back to the legacy ``<uid>``
+    shape (or any other extra field) fails here instead of parsing silently.
+    """
+    fields = marker.read_text(encoding="utf-8").split()
+    assert len(fields) == 3, fields
+    return int(fields[0]), fields[1], float(fields[2])
+
+
 def test_acquire_allocates_sequential_and_exhausts(tmp_path):
     pool = _pool(tmp_path)
     assert [pool.acquire(f"sbx_{i}") for i in range(POOL_SIZE)] == [
@@ -315,7 +327,7 @@ def test_the_pool_lock_and_markers_live_on_the_shared_state_base(tmp_path):
     assert pool.lock_path == state_base / ".uid_pool.lock"
     assert pool.acquire("sbx_a") == POOL_START
     marker = state_base / ".uid_reservations" / "sbx_a"
-    assert marker.read_text(encoding="utf-8") == f"{POOL_START}\n"
+    assert _parse_marker(marker)[0] == POOL_START
     assert (node_state_base / ".uid_reservations").is_dir() is False
     assert (node_state_base / ".uid_pool.lock").is_file() is False
 
@@ -504,10 +516,57 @@ def test_reconcile_clears_stale_reservation_markers(tmp_path):
     assert pool.acquire("sbx_new") == POOL_START
 
 
-def test_a_fresh_reservation_marker_from_another_node_is_not_cleared(
-    tmp_path, caplog
+def test_a_reservation_marker_carries_the_uid_the_node_and_a_timestamp(
+    tmp_path, monkeypatch
 ):
-    """N57 review: reconcile must not reclaim a peer's in-flight reservation.
+    """N66: the marker has to name *who* picked the uid and *when*.
+
+    ``<uid>\\n`` alone leaves reconcile unable to tell "another node's create
+    is in flight" from "this node crashed between acquire and register": in
+    both shapes the file is the same and only its mtime says anything, and an
+    in-flight create that outlives the grace is then indistinguishable from
+    crash residue. The author and the timestamp are what make the two cases
+    tellable apart (and what lets the deferral WARNING name the peer count).
+    """
+    monkeypatch.setenv("E2B_NODE_ID", "e2b-worker-7")
+    pool = _pool(tmp_path)
+    before = time.time()
+    uid = pool.acquire("sbx_a")
+    after = time.time()
+    assert uid == POOL_START
+    marker = tmp_path / ".uid_reservations" / "sbx_a"
+    marker_uid, node_id, timestamp = _parse_marker(marker)
+    assert marker_uid == uid
+    assert node_id == "e2b-worker-7"
+    assert before <= timestamp <= after
+
+
+def test_a_legacy_marker_without_node_or_timestamp_is_still_honoured(tmp_path):
+    """N66: the pre-change shape keeps working, on both sides of the grace.
+
+    A rolling upgrade has old workers writing ``<uid>\\n`` markers while a new
+    worker reconciles, so the reader has to accept the two-field-less shape:
+    the uid still reserves its slot, and -- because no author is known -- the
+    mtime remains the only age signal, so it ages out exactly like a
+    three-field marker does.
+    """
+    pool = _pool(tmp_path)
+    marker = tmp_path / ".uid_reservations" / "sbx_legacy"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{POOL_START}\n", encoding="utf-8")
+
+    # The legacy marker still keeps its uid out of the free set.
+    assert pool.acquire("sbx_new") == POOL_START + 1
+
+    # ...and it is reclaimed once its mtime is past the grace.
+    stale = time.time() - uid_pool.RESERVATION_RECLAIM_GRACE_S - 60.0
+    os.utime(marker, (stale, stale))
+    pool.reconcile()
+    assert marker.exists() is False
+
+
+def test_a_fresh_marker_from_another_node_is_kept(tmp_path, caplog, monkeypatch):
+    """N57/N66: reconcile must not reclaim a peer's in-flight reservation.
 
     The markers are shared, so "this node just started" is not a fleet-wide
     statement: node B can be inside its ``acquire`` -> ``register`` window --
@@ -515,18 +574,20 @@ def test_a_fresh_reservation_marker_from_another_node_is_not_cleared(
     calls long because volume provisioning and a recursive chown sit inside it
     -- while node A restarts. A reconcile that unlinks that marker hands B's
     uid to the next ``acquire`` on either node, which is exactly the collision
-    N57 exists to prevent. The marker's mtime is the only criterion: content
-    stays ``<uid>\\n``, so markers written by older workers are judged too.
+    N57 exists to prevent. Freshness is judged by mtime, which works for the
+    three-field shape and for legacy markers alike.
     """
+    monkeypatch.delenv("E2B_NODE_ID", raising=False)
     pool = _pool(tmp_path)
     marker = tmp_path / ".uid_reservations" / "sbx_other_node"
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(f"{POOL_START}\n", encoding="utf-8")
+    marker_ts = time.time()
+    marker.write_text(f"{POOL_START} other-node {marker_ts}\n", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING, logger="envd_service.uid_pool"):
         pool.reconcile()
 
-    assert marker.read_text(encoding="utf-8") == f"{POOL_START}\n"
+    assert _parse_marker(marker) == (POOL_START, "other-node", marker_ts)
     # ...and the uid it holds is still out of every node's reach.
     assert pool.acquire("sbx_a") == POOL_START + 1
     assert [
@@ -534,23 +595,23 @@ def test_a_fresh_reservation_marker_from_another_node_is_not_cleared(
         for record in caplog.records
         if record.levelno == logging.WARNING
     ] == [
-        "kept 1 reservation marker(s) younger than 900.0s: another node's "
-        "create may be in flight (N57)"
+        "kept 1 unexpired reservation marker(s) (1 from other nodes), "
+        "grace 900.0s: another node's create may still be in flight (N57/N66)"
     ]
 
 
-def test_a_stale_reservation_marker_is_reclaimed(tmp_path):
-    """The other half of the grace: a crashed create's marker still ages out.
+def test_a_stale_marker_from_another_node_is_reclaimed(tmp_path):
+    """N66: the peer exemption is bounded by the grace, nothing more.
 
     A marker older than the grace cannot belong to a live create (the window
-    it protects is seconds long, not minutes), so reconcile reclaims it and
-    the uid becomes allocatable again -- the behaviour the sweep existed for.
-    Without this half, "never clear anything" would look like the fix.
+    it protects is seconds long, not minutes), so it is reclaimed regardless
+    of the author it names and the uid becomes allocatable again -- the
+    behaviour the sweep existed for.
     """
     pool = _pool(tmp_path)
-    marker = tmp_path / ".uid_reservations" / "sbx_crashed"
+    marker = tmp_path / ".uid_reservations" / "sbx_other_node"
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(f"{POOL_START}\n", encoding="utf-8")
+    marker.write_text(f"{POOL_START} other-node {time.time()}\n", encoding="utf-8")
     stale = time.time() - uid_pool.RESERVATION_RECLAIM_GRACE_S - 60.0
     os.utime(marker, (stale, stale))
 
@@ -558,6 +619,35 @@ def test_a_stale_reservation_marker_is_reclaimed(tmp_path):
 
     assert marker.exists() is False
     assert pool.acquire("sbx_new") == POOL_START
+
+
+def test_a_corrupt_marker_is_skipped_by_name(tmp_path, caplog):
+    """N66: one unparsable marker must not take the whole round down.
+
+    A truncated / garbage marker names no uid, so it reserves nothing and the
+    free-set scan has to walk past it -- while saying which file it ignored,
+    because a silent skip is indistinguishable from "the uid is free".
+    """
+    pool = _pool(tmp_path)
+    marker_dir = tmp_path / ".uid_reservations"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    corrupt = marker_dir / "sbx_corrupt"
+    garbage = "not-a-uid\n\x00garbage"
+    corrupt.write_text(garbage, encoding="utf-8")
+    good = marker_dir / "sbx_good"
+    good.write_text(f"{POOL_START + 1} other-node {time.time()}\n", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="envd_service.uid_pool"):
+        reserved = pool._reserved_uids()
+
+    assert reserved == {POOL_START + 1}
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ] == [
+        f"ignoring malformed reservation marker {corrupt}: {garbage!r}",
+    ]
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="chown requires root")

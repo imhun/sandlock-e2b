@@ -22,7 +22,8 @@ so a later allocation cannot inherit foreign files.
 Cross-process safety (I1): ``acquire`` briefly takes an exclusive ``flock``
 on the pool's own state file ``<state base>/.uid_pool.lock`` while it
 recomputes the free set and atomically writes a reservation marker
-(``<state base>/.uid_reservations/<sandbox_id>``). Both are *platform*
+(``<state base>/.uid_reservations/<sandbox_id>``, holding
+``<uid> <node_id> <unix_ts>`` since N66). Both are *platform*
 state, so they follow ``E2B_STATE_BASE`` out from under the tree root (N27) --
 and, unlike the create's node-local chips, they *stay* there (N57): what the
 critical section fences is the choice of a uid over the shared objects (volume
@@ -54,6 +55,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import threading
 import time
 from pathlib import Path
@@ -75,8 +77,10 @@ logger = logging.getLogger(__name__)
 
 #: Directory (under the **state base**) holding transient cross-process
 #: reservation markers written by ``acquire`` and removed by ``commit`` /
-#: ``release``. A marker file is named after the sandbox id and contains the
-#: reserved uid as decimal text.
+#: ``release``. A marker file is named after the sandbox id and holds
+#: ``<uid> <node_id> <unix_ts>`` since N66 -- the author and the time are
+#: what let a reconciling node tell a peer's in-flight reservation from its
+#: own crash residue. The legacy ``<uid>`` shape is still read.
 _RESERVATION_DIR = ".uid_reservations"
 
 #: How long a reservation marker may sit before a node's startup reconcile
@@ -84,18 +88,26 @@ _RESERVATION_DIR = ".uid_reservations"
 #: "this node just started" is not a fleet-wide statement: another node can be
 #: inside its ``acquire`` -> ``register`` window right now -- marker written,
 #: record not yet durable, a window the module docstring calls long because
-#: volume provisioning and a recursive chown sit inside it. Reconcile
-#: therefore collects only markers *older* than this grace; the price is that
-#: a create that really crashed keeps its uid reserved until the next
-#: reconcile after the grace elapses, and the window that remains is "a create
-#: in flight longer than the grace while this node restarts".
+#: volume provisioning and a recursive chown sit inside it. One threshold,
+#: deliberately: an **expired** marker is reclaimed no matter who wrote it
+#: (only age can show that its create is gone), and every marker younger than
+#: the grace is kept -- including one this node wrote, because "this node" is
+#: an identity, not a process: a second worker process on the same host may be
+#: inside its own acquire -> register window right now. The author and the
+#: timestamp do not change that decision; they make the deferral report name
+#: how many of the kept markers are a peer's. The price is that a create which
+#: really crashed keeps its uid reserved until the next reconcile after the
+#: grace elapses, and the window that remains is "a create in flight longer
+#: than the grace while this node restarts".
 RESERVATION_RECLAIM_GRACE_S = 900.0
 
-#: Message of the WARNING that makes the deferral visible (N57 review): the
-#: markers kept because they are younger than the grace, and the threshold.
+#: Message of the WARNING that makes the deferral visible (N57 review / N66):
+#: how many markers were kept because they are younger than the grace, how
+#: many of those name another node (the ones the grace actually protects),
+#: and the threshold itself.
 RESERVATION_DEFERRAL_WARNING = (
-    "kept %d reservation marker(s) younger than %.1fs: another node's "
-    "create may be in flight (N57)"
+    "kept %d unexpired reservation marker(s) (%d from other nodes), "
+    "grace %.1fs: another node's create may still be in flight (N57/N66)"
 )
 
 #: Mode of a sandbox-owned directory (workspace root / volume slice):
@@ -238,13 +250,72 @@ def _recorded_uids(
     return used
 
 
-def _read_uid_marker(marker: Path) -> int | None:
-    """The uid stored in a reservation marker, or None when malformed."""
+def _node_identity() -> str:
+    """This worker's identity for reservation markers (N66).
+
+    Priority, highest first:
+
+    1. ``E2B_NODE_ID`` -- the env var the deployment sets (the same name
+       ``deploy/k8s/worker.yaml`` exports, and the pod/service identity the
+       control plane knows this worker by);
+    2. ``socket.gethostname()`` -- a dev box or a harness that has no node id;
+    3. the literal ``"local"`` -- last resort, so a missing identity still
+       writes a parseable three-field marker instead of failing a create.
+    """
+    node_id = os.getenv("E2B_NODE_ID", "").strip()
+    if node_id:
+        return node_id
     try:
-        uid = int(marker.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+        hostname = socket.gethostname().strip()
+    except OSError:
+        hostname = ""
+    return hostname or "local"
+
+
+def _read_reservation_marker(
+    marker: Path,
+) -> tuple[int, str | None, float | None] | None:
+    """Parse a reservation marker into ``(uid, node_id, timestamp)``.
+
+    Three shapes are accepted, two of them on disk (N66):
+
+    * ``<uid> <node_id> <unix_ts>`` -- what :meth:`UidPool._write_reservation`
+      writes now;
+    * the legacy ``<uid>`` -- author and time unknown (``None``), so the
+      marker's mtime is the only age signal;
+    * anything else -- no uid to reserve: the caller skips it, and this
+      function says which file and what it held, because a silent skip is
+      indistinguishable from "that uid is free".
+
+    Never raises for one bad file: an unreadable or unparsable marker returns
+    ``None`` after a WARNING naming it, so a single corrupt file cannot take
+    down the free-set scan or the reconcile sweep.
+    """
+    try:
+        text = marker.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning(
+            "ignoring unreadable reservation marker %s: %s", marker, exc
+        )
         return None
-    return uid if uid > 0 else None
+    fields = text.split()
+    try:
+        uid = int(fields[0]) if fields else None
+    except ValueError:
+        uid = None
+    if uid is None or uid <= 0:
+        logger.warning(
+            "ignoring malformed reservation marker %s: %r", marker, text
+        )
+        return None
+    node_id = fields[1] if len(fields) >= 2 and fields[1] else None
+    timestamp: float | None = None
+    if len(fields) >= 3:
+        try:
+            timestamp = float(fields[2])
+        except ValueError:
+            timestamp = None
+    return uid, node_id, timestamp
 
 
 def _chown_tree(path: Path, uid: int, gid: int) -> None:
@@ -452,6 +523,7 @@ class UidPool:
         size: int = 1000,
         state_base: str | Path | None = None,
         node_state_base: str | Path | None = None,
+        node_id: str | None = None,
     ) -> None:
         if not isinstance(start, int) or start <= 0:
             raise UidPoolError(f"invalid uid pool start: {start!r}")
@@ -460,6 +532,15 @@ class UidPool:
         self._start = start
         self._size = size
         self._workspace_base = Path(workspace_base)
+        #: Identity this pool writes into every reservation marker (N66). Read
+        #: once, here, so all markers this process writes name the same author.
+        #: An explicit ``node_id`` wins (embedders / tests); otherwise the
+        #: priority is :func:`_node_identity`: ``E2B_NODE_ID`` ->
+        #: ``socket.gethostname()`` -> ``"local"``. Whitespace is stripped so
+        #: the marker always parses back into exactly three fields.
+        self._node_id = "".join(
+            (node_id if node_id is not None else _node_identity()).split()
+        ) or "local"
         #: The base the pool's own files live under: the cross-process lock and
         #: the reservation markers are *platform* state, not the sandbox's, so
         #: they follow ``E2B_STATE_BASE`` out from under the tree root (N27).
@@ -529,11 +610,20 @@ class UidPool:
         return self._state_base / _RESERVATION_DIR / sandbox_id
 
     def _write_reservation(self, sandbox_id: str, uid: int) -> None:
-        """Atomically persist the reservation marker (under the flock)."""
+        """Atomically persist the reservation marker (under the flock).
+
+        The marker is ``<uid> <node_id> <unix_ts>`` since N66: the uid alone
+        could not say *who* picked it or *when*, so a reconciling node could
+        not tell a peer's in-flight create from its own crash residue (the
+        mtime was the only clue). The reader still accepts the legacy
+        ``<uid>`` shape, so a rolling upgrade does not misread old markers.
+        """
         marker = self._marker_path(sandbox_id)
         marker.parent.mkdir(parents=True, exist_ok=True)
         tmp = marker.parent / f".{sandbox_id}.tmp"
-        tmp.write_text(f"{uid}\n", encoding="utf-8")
+        tmp.write_text(
+            f"{uid} {self._node_id} {time.time():.6f}\n", encoding="utf-8"
+        )
         os.replace(tmp, marker)
 
     def _remove_reservation(self, sandbox_id: str) -> None:
@@ -550,21 +640,28 @@ class UidPool:
         fleet-wide statement: a peer can be inside its ``acquire`` ->
         ``register`` window at this very moment -- marker written, record not
         yet durable -- and unlinking that marker would free a uid the peer has
-        already handed out. So this collects only markers older than
-        :data:`RESERVATION_RECLAIM_GRACE_S`; younger ones are kept, and the
-        count of them is said out loud in a WARNING so the deferral is visible
-        rather than silent. The residual window is "a create in flight for
-        longer than the grace while this node restarts" -- written down here
-        because it is the price of not being able to tell a peer's live create
-        from a crashed one any other way.
+        already handed out. The rule (N66) is one threshold: a marker
+        **older** than :data:`RESERVATION_RECLAIM_GRACE_S` is reclaimed
+        whatever author it names (only age can show its create is gone), and a
+        marker **younger** than the grace is kept whatever author it names --
+        including this node's own, because the identity names a node, not a
+        process, so a second worker process on the same host can be in flight.
+        The kept markers are reported in a WARNING, with the share of them
+        that name another node, so the deferral is visible rather than silent.
+        The residual window is "a create in flight for longer than the grace
+        while this node restarts" -- written down here because it is the price
+        of not being able to tell a peer's live create from a crashed one any
+        other way.
 
         The crash case the sweep exists for is unchanged: a create that died
         between ``acquire`` and ``register`` leaves a marker nobody refreshes,
         it ages past the grace, and the next reconcile reclaims the uid.
 
-        The criterion is ``mtime``, never content: markers stay ``<uid>\\n``
-        (no format change), so a marker written by an older worker is judged
-        exactly like a fresh one.
+        The age criterion is the marker's ``mtime`` -- also all the legacy
+        ``<uid>`` shape has, since its timestamp field does not exist -- so a
+        marker written by an older worker is judged exactly like a fresh one.
+        A marker that parses to no uid is skipped and named in a WARNING; it
+        never aborts the sweep.
         """
         marker_dir = self._state_base / _RESERVATION_DIR
         if not marker_dir.is_dir():
@@ -575,19 +672,30 @@ class UidPool:
             return
         now = time.time()
         kept = 0
+        other_nodes = 0
         for entry in entries:
             try:
                 if not entry.is_file():
                     continue
-                if now - entry.stat().st_mtime <= RESERVATION_RECLAIM_GRACE_S:
+                parsed = _read_reservation_marker(entry)
+                if parsed is None:
+                    continue
+                _uid, node_id, _ts = parsed
+                age = now - entry.stat().st_mtime
+                if age <= RESERVATION_RECLAIM_GRACE_S:
                     kept += 1
+                    if node_id != self._node_id:
+                        other_nodes += 1
                     continue
                 entry.unlink()
             except OSError:
                 continue
         if kept:
             logger.warning(
-                RESERVATION_DEFERRAL_WARNING, kept, RESERVATION_RECLAIM_GRACE_S
+                RESERVATION_DEFERRAL_WARNING,
+                kept,
+                other_nodes,
+                RESERVATION_RECLAIM_GRACE_S,
             )
 
     def _reserved_uids(self) -> set[int]:
@@ -603,11 +711,11 @@ class UidPool:
         for entry in entries:
             if not entry.is_file():
                 continue
-            uid = _read_uid_marker(entry)
-            if (
-                uid is not None
-                and self._start <= uid < self._start + self._size
-            ):
+            parsed = _read_reservation_marker(entry)
+            if parsed is None:
+                continue
+            uid, _node_id, _ts = parsed
+            if self._start <= uid < self._start + self._size:
                 reserved.add(uid)
         return reserved
 
