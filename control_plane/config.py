@@ -555,6 +555,19 @@ class Settings:
     shared_volume_root: str | None = field(
         default_factory=lambda: os.getenv("E2B_SHARED_VOLUME_ROOT")
     )
+    #: N73: the control plane's volume **store** root, named outright. Before
+    #: this variable existed the control plane read ``E2B_SHARED_VOLUME_ROOT``
+    #: as the store root *itself* -- but that name means the shared *export*
+    #: root everywhere else (worker, agent: ``_snapshots``/``_migrate``/
+    #: ``_volumes`` sit below it), and on k8s the export root is mounted
+    #: read-only, so a control plane that set it built failed volumes
+    #: (0.1.0-943, ``POST /volumes`` 500/``EROFS``). This variable is the one
+    #: authoritative store root; when it is unset the shared root is only a
+    #: judge to derive ``<shared_volume_root>/"_volumes"`` from. Unset *and*
+    #: no shared root keeps the pre-N73 default ``<platform_root>/"_volumes"``.
+    volume_store_root: str | None = field(
+        default_factory=lambda: os.getenv("E2B_VOLUME_STORE_ROOT")
+    )
     #: The reslice's named judge: whether the sandbox **trees** live on shared
     #: storage. Deliberately *not* ``bool(shared_workspace_root)`` -- after the
     #: reslice the shared root is still named (it holds ``_snapshots``,

@@ -77,6 +77,75 @@ logger = logging.getLogger(__name__)
 _UNSET = object()
 
 
+class LegacyVolumeLayoutError(RuntimeError):
+    """N73: old flat volumes would be hidden by the new volume store root.
+
+    ``E2B_SHARED_VOLUME_ROOT`` means the shared *export* root (the worker and
+    the per-node agent both read it that way), and since Task 20 the control
+    plane derives ``<shared_volume_root>/"_volumes"`` from it instead of using
+    it as the store root. A deployment that set it *before* Task 20 built its
+    volumes as flat ``<shared_volume_root>/vol_*`` directories; deriving the
+    subdirectory would leave those volumes invisible to the API. Starting is
+    refused by name so the operator migrates them (or names the old directory
+    outright with ``E2B_VOLUME_STORE_ROOT``) instead of silently losing them.
+    """
+
+
+def _legacy_flat_volumes(shared_root: Path) -> list[Path]:
+    """N73: the pre-Task-20 flat ``vol_*`` directories under a shared root."""
+    return sorted(path for path in shared_root.glob("vol_*") if path.is_dir())
+
+
+def _derive_volume_store_root(settings: Settings, platform_root: Path) -> Path:
+    """N73: the volume store root, from the dedicated name or the shared root.
+
+    ``E2B_VOLUME_STORE_ROOT`` (new) is the authority; otherwise a named
+    ``E2B_SHARED_VOLUME_ROOT`` is the *export* root and the store is
+    ``<shared_volume_root>/"_volumes"``; neither named keeps the pre-N73
+    default ``<platform_root>/"_volumes"`` (today's k8s shape, byte for byte).
+
+    The self-protection is the reason this is not a silent path move: the
+    compose stacks set ``E2B_SHARED_VOLUME_ROOT`` on the control plane today,
+    so a deployment whose volumes are the old flat ``<shared_volume_root>/
+    vol_*`` directories would lose them to the derived subdirectory. It refuses
+    by name instead (unless the derived root *is* that directory -- naming the
+    old root with ``E2B_VOLUME_STORE_ROOT`` keeps them in view).
+    """
+    # ``str(...)`` on purpose: embedders and tests pass ``Path`` here, and the
+    # fields are only typed ``str | None`` because that is how the env reads.
+    named_store = (
+        str(settings.volume_store_root).strip()
+        if settings.volume_store_root
+        else ""
+    )
+    shared = (
+        str(settings.shared_volume_root).strip()
+        if settings.shared_volume_root
+        else ""
+    )
+    shared_root = Path(shared).resolve() if shared else None
+    if named_store:
+        store_root = Path(named_store).resolve()
+    elif shared_root is not None:
+        store_root = shared_root / "_volumes"
+    else:
+        return platform_root / "_volumes"
+    if shared_root is not None:
+        legacy = _legacy_flat_volumes(shared_root)
+        if legacy and store_root != shared_root:
+            raise LegacyVolumeLayoutError(
+                "N73: found the legacy flat volume layout under the shared "
+                f"volume root {shared_root} (e.g. {legacy[0]}), while the "
+                f"control plane's volume store root is {store_root}. "
+                "E2B_SHARED_VOLUME_ROOT is the shared *export* root, so "
+                "starting would hide those volumes "
+                "(legacy-flat-volume-layout). Migrate them under "
+                f"{shared_root / '_volumes'}, or point E2B_VOLUME_STORE_ROOT "
+                f"at {shared_root} to keep the old location, then restart (N73)."
+            )
+    return store_root
+
+
 class _NoopRuntimeRegistry:
     """Empty runtime registry for the separated control-plane deployment.
 
@@ -584,9 +653,13 @@ def create_app(
     # "goes missing".
     logger.info("workspace base = %s", app.state.workspace_base)
     logger.info("platform state base = %s", app.state.state_base)
-    volume_root = settings.shared_volume_root or (
-        platform_root / "_volumes"
-    )
+    # N73: the store root and the shared *export* root are two names now.
+    # ``E2B_VOLUME_STORE_ROOT`` wins; a named ``E2B_SHARED_VOLUME_ROOT`` only
+    # derives ``<shared_volume_root>/"_volumes"`` from it (pre-N73 it *was* the
+    # store root, which pointed the store at the read-only export mount).
+    # Deriving over a deployment's old flat ``vol_*`` directories refuses to
+    # start by name rather than hiding them -- see the helper.
+    volume_root = _derive_volume_store_root(settings, platform_root)
     app.state.volumes = volumes_registry or VolumeRegistry(
         volume_root,
         redis_client=redis_client,
